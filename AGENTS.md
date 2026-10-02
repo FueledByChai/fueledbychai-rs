@@ -160,7 +160,8 @@ rather than guess.
 - Release: the owner tags `vMAJOR.MINOR.PATCH` on `main`; the consumer pins that tag as a git
   dependency (`fbc-core = { git = "https://github.com/FueledByChai/fueledbychai-rs", tag =
   "v0.0.1" }`). The first tag, `v0.0.1`, follows the workspace skeleton and `fbc-core`'s first
-  types. Nothing is published to crates.io (0008).
+  types. Nothing is published to crates.io (0008): every manifest, and `[workspace.package]`,
+  sets `publish = false`, and `crates/fbc-core/tests/manifests.rs` fails a manifest without it.
 
 ### The check
 

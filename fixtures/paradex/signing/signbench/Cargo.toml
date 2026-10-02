@@ -2,6 +2,7 @@
 name = "signbench"
 version = "0.1.0"
 edition = "2021"
+publish = false
 
 [dependencies]
 starknet-crypto = "0.8.1"
