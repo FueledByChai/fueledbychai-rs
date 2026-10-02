@@ -232,17 +232,19 @@ impl FromStr for PxExact {
             Some(j) => fraction.as_bytes()[j],
         };
         let len = whole.len() + fraction.len();
-        let mut exp = -i64::try_from(fraction.len()).map_err(|_| error())?;
+        // In i128, which holds any usize, so the exponent arithmetic below cannot overflow.
+        let mut exp = -(fraction.len() as i128);
         let Some(first) = (0..len).find(|&i| digit(i) != b'0') else {
             return Ok(PxExact {
                 mantissa: 0,
-                exp: i8::try_from(exp.max(i64::from(i8::MIN))).map_err(|_| error())?,
+                // exp <= 0 here, so only an exponent below i8::MIN fails; zero is exact there.
+                exp: i8::try_from(exp).unwrap_or(i8::MIN),
             });
         };
         let trailing_zeros = (first..len).rev().take_while(|&i| digit(i) == b'0').count();
         // Drop trailing zeros (raising the exponent) until at most 19 digits are left and the
         // exponent is at least i8::MIN; one more drop if 19 digits still overflow an i64.
-        let below_min_exp = usize::try_from(i64::from(i8::MIN) - exp).unwrap_or(0);
+        let below_min_exp = usize::try_from(i128::from(i8::MIN) - exp).unwrap_or(0);
         let mut dropped = (len - first).saturating_sub(19).max(below_min_exp);
         let mantissa = loop {
             if dropped > trailing_zeros {
@@ -256,7 +258,7 @@ impl FromStr for PxExact {
                 Err(_) => dropped += 1,
             }
         };
-        exp += i64::try_from(dropped).map_err(|_| error())?;
+        exp += dropped as i128;
         Ok(PxExact {
             mantissa,
             exp: i8::try_from(exp).map_err(|_| error())?,
