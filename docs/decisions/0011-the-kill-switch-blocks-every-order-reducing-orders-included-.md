@@ -1,6 +1,6 @@
 # 0011 — The kill switch blocks every order, reducing orders included; cancels always go through
 
-Status: accepted
+Status: superseded by 0012
 Date: 2026-10-02
 
 ## Context
