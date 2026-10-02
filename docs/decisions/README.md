@@ -1,0 +1,15 @@
+# Decisions
+
+One file per decision, never edited in place: a change is a new record that supersedes
+the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"` adds one.
+
+- [0001](0001-two-repositories-a-public-mit-library-and-a-private-consumer.md) Two repositories: a public MIT library and a private consumer, split at the line between connectivity and quoting — accepted
+- [0002](0002-venue-adapters-are-sans-io-codecs-driven-by-one-generic-runt.md) Venue adapters are sans-IO codecs driven by one generic runtime that proxies through SOCKS5 from day one — accepted
+- [0003](0003-venue-capabilities-are-data-and-every-field-is-mandatory.md) Venue capabilities are data and every field is mandatory — accepted
+- [0004](0004-ids-fees-time-prices-and-quantities-are-sealed-newtypes-and-.md) Ids, fees, time, prices and quantities are sealed newtypes, and a fee is positive when we paid it — accepted
+- [0005](0005-the-library-owns-order-truth-a-monotone-order-lattice-permit.md) The library owns order truth: a monotone order lattice, permits, and one ExecutionPlanner — accepted
+- [0006](0006-the-journal-records-everything-that-crosses-the-shard-bounda.md) The journal records everything that crosses the shard boundary and keeps a reserve so safety traffic never blocks — accepted
+- [0007](0007-venue-order-paradex-first-then-hibachi-with-binance-usd-m-fu.md) Venue order: Paradex first, then Hibachi, with Binance USD-M futures as reference market data — accepted
+- [0008](0008-pinned-toolchain-loop-kit-beads-queue-and-consumption-by-git.md) Pinned toolchain, loop kit, Beads queue, and consumption by git tag with no crates.io release yet — accepted
+- [0009](0009-secrets-and-private-data-never-enter-this-repository-and-sig.md) Secrets and private data never enter this repository, and signing and auth are the only review paths — accepted
+- [0010](0010-three-safety-rules-every-change-keeps-no-trading-after-a-res.md) Three safety rules every change keeps: no trading after a restart until Start, pre-trade caps on every order, one quoter per market — accepted

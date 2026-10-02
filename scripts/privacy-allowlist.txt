@@ -1,0 +1,3 @@
+# Public contract addresses the privacy check (scripts/privacy-check.sh, decision 0009) lets
+# through: 0x followed by exactly 40 hex digits, one per line. Above each, a comment line says
+# whose contract it is and where it is published. Never list an account address here.

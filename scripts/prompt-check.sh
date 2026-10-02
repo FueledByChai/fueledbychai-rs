@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# A prompt cannot be unit-tested, but the rules it carries can be asserted: this check fails
+# when a prompt no longer contains a phrase that states one of its rules, so an edit that
+# drops a rule fails the check instead of silently changing how agents behave. The other
+# half of a prompt's proof is a recorded real run in the pull request that changed it.
+#
+#   scripts/prompt-check.sh             check every prompt in loop/prompts (a project) or
+#                                       prompts (the kit itself)
+#   scripts/prompt-check.sh --self-test a copy with a phrase removed fails; intact copies pass
+set -euo pipefail
+SCRIPT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="${LOOP_ROOT:-$SCRIPT_ROOT}"
+
+# prompt file<TAB>phrase, one rule per line. A phrase is matched case-insensitively as a
+# fixed string with the prompt's whitespace collapsed, so a line break inside it is fine.
+RULES='next-ticket.md	Done when
+next-ticket.md	--claim
+next-ticket.md	Never push the default branch
+next-ticket.md	sprint
+next-ticket.md	respond-to-review.md
+next-ticket.md	waiting PRs do not rebase or request CI
+next-ticket.md	Git claim fails
+next-ticket.md	--if-assignee
+next-ticket.md	bd dolt pull
+next-ticket.md	bd dolt push
+next-ticket.md	bootstrap coordination
+next-ticket.md	github-v1 profile, skip legacy coordination bootstrap in step 1
+next-ticket.md	In legacy mode only, for a standalone
+next-ticket.md	loop:coordination
+next-ticket.md	selected candidate
+next-ticket.md	shadow plan is not admission
+respond-to-review.md	full head SHA
+respond-to-review.md	all pages
+respond-to-review.md	fix, dispute, or separate ticket
+respond-to-review.md	fixing commit and test evidence
+respond-to-review.md	if the project permits append-only review fixes
+respond-to-review.md	report the policy conflict
+respond-to-review.md	filing a ticket does not clear a blocker
+respond-to-review.md	the author must not resolve a disputed finding
+respond-to-review.md	do not assume a push triggers review
+respond-to-review.md	completed review
+respond-to-review.md	never post a passing review status
+respond-to-review.md	waiting PRs do not rebase or request CI
+respond-to-review.md	verified stopped
+grill-me.md	at least three rounds
+grill-me.md	proofs and edge cases
+grill-me.md	docs/decisions
+grill-me.md	superseding
+grill-me.md	without a named proof
+grill-me.md	wireframe
+grill-me.md	80 columns
+grill-me.md	sprint
+grill-me.md	comment above `sprint_label`
+grill-me.md	every open ticket, so an omission is a fault
+grill-me.md	"or none" only where that comment states the subset reading
+grill-me.md	--type epic
+grill-me.md	loop:coordination
+grill-me.md	merge order
+grill-me.md	N(N-1)/2
+grill-me.md	nine runs
+grill-me.md	ordering preferences are not implementation dependencies
+grill-me.md	single coordinator
+grill-me.md	waiting PRs do not rebase or request CI
+grill-me.md	--stories
+grill-me.md	settings file and the Beads queue
+grill-me.md	this repository, a new one, or a sibling
+review-prs.md	four questions
+review-prs.md	github-v1 skips legacy coordination and gate reconciliation
+review-prs.md	App selection replaces legacy coordinator selection
+review-prs.md	**Synchronize legacy coordination.** In legacy mode only
+review-prs.md	**Legacy bootstrap coordination when needed.** In legacy mode only
+review-prs.md	**Reconcile existing merge gates before reviewing.** In legacy mode only
+review-prs.md	**Legacy coordinator relay only.** In legacy mode only
+review-prs.md	one status per head commit
+review-prs.md	Never run `scripts/open-ticket-pr.sh --update-all`
+review-prs.md	completed Codex review on the full head SHA
+review-prs.md	acceptance is not merge authorization
+review-prs.md	default_branch
+review-prs.md	other-base PRs remain untouched
+review-prs.md	disable-auto
+review-prs.md	waiting or unselected
+review-prs.md	final-gate record
+review-prs.md	dependencies and labels
+review-prs.md	bd dolt pull
+review-prs.md	bd dolt push
+review-prs.md	synchronization failure blocks admission
+review-prs.md	claim the coordination
+review-prs.md	skip duplicate feedback
+review-prs.md	post-comment binding
+review-prs.md	CI changes alone
+review-prs.md	selected candidate
+review-prs.md	missing CI leaves the status unposted
+review-prs.md	same-head evidence changes
+review-prs.md	respond-to-review.md
+grill-project.md	in a sentence
+grill-project.md	Who and where
+grill-project.md	The data
+grill-project.md	Runtime and deploy
+grill-project.md	The UI
+grill-project.md	Non-negotiables
+grill-project.md	dated deferral
+grill-project.md	rust.sh
+grill-project.md	python.sh
+grill-project.md	node.sh
+grill-project.md	java.sh
+grill-project.md	go.sh
+grill-project.md	wireframe
+grill-project.md	toolchain'
+
+prompts_dir() {
+  if [ -d "$ROOT/loop/prompts" ]; then echo "$ROOT/loop/prompts"
+  elif [ -d "$ROOT/prompts" ]; then echo "$ROOT/prompts"
+  else echo "prompt-check: no prompts directory under $ROOT (loop/prompts or prompts)" >&2; return 1; fi
+}
+
+check() {
+  local d file phrase failed=0 checked=0
+  d="$(prompts_dir)"
+  while IFS=$'\t' read -r file phrase; do
+    [ -n "$file" ] || continue
+    if [ ! -f "$d/$file" ]; then echo "prompt-check: $file is missing from ${d#"$ROOT"/}" >&2; failed=1; continue; fi
+    if tr -s '[:space:]' ' ' < "$d/$file" | grep -qiF -- "$phrase"; then checked=$((checked + 1)); else echo "prompt-check: $file no longer says \"$phrase\"" >&2; failed=1; fi
+  done <<< "$RULES"
+  [ "$failed" = 0 ] || { echo "prompt-check: a prompt lost a rule it must carry (see above)" >&2; return 1; }
+  echo "prompt-check: $checked rule(s) present in ${d#"$ROOT"/}"
+}
+
+self_test() {
+  SELF_TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/prompt-check.XXXXXX")"
+  trap 'rm -rf "$SELF_TEST_DIR"' EXIT
+  local dir="$SELF_TEST_DIR" me="$SCRIPT_ROOT/scripts/prompt-check.sh" src out rc
+  src="$(prompts_dir)"
+  mkdir -p "$dir/loop/prompts"
+  cp "$src"/*.md "$dir/loop/prompts/"
+  export LOOP_ROOT="$dir"
+  out="$("$me")" && echo "$out" | grep -q 'rule(s) present' || { echo "self-test: intact copies should pass:"; echo "$out"; exit 1; }
+  # Remove one phrase: the check fails and names the file and the phrase.
+  sed -i.bak 's/at least three rounds/some rounds/' "$dir/loop/prompts/grill-me.md"; rm -f "$dir/loop/prompts/grill-me.md.bak"
+  rc=0; out="$("$me" 2>&1)" || rc=$?
+  [ "$rc" = 1 ] && echo "$out" | grep -q 'grill-me.md no longer says "at least three rounds"' || { echo "self-test: a removed phrase should fail naming it (rc $rc):"; echo "$out"; exit 1; }
+  # A missing prompt file fails too.
+  cp "$src/grill-me.md" "$dir/loop/prompts/grill-me.md"; rm "$dir/loop/prompts/review-prs.md"
+  rc=0; out="$("$me" 2>&1)" || rc=$?
+  [ "$rc" = 1 ] && echo "$out" | grep -q 'review-prs.md is missing' || { echo "self-test: a missing prompt should fail (rc $rc):"; echo "$out"; exit 1; }
+  cp "$src/review-prs.md" "$dir/loop/prompts/review-prs.md"
+  # The author handoff and its safety rules must be present in fresh installations too.
+  local file phrase
+  while IFS=$'\t' read -r file phrase; do
+    case "$file:$phrase" in
+      respond-to-review.md:*|next-ticket.md:*|review-prs.md:*|grill-me.md:loop:coordination|grill-me.md:--type*|grill-me.md:merge\ order|grill-me.md:N*|grill-me.md:nine*|grill-me.md:ordering*|grill-me.md:single*|grill-me.md:waiting*) ;;
+      *) continue ;;
+    esac
+    # Remove this phrase independent of capitalization or line wrapping.
+    tr -s '[:space:]' ' ' < "$src/$file" > "$dir/loop/prompts/$file"
+    PHRASE="$phrase" python3 - "$dir/loop/prompts/$file" <<'PY'
+import os, pathlib, re, sys
+p = pathlib.Path(sys.argv[1])
+s = p.read_text()
+rule = re.compile(re.escape(os.environ['PHRASE']), re.IGNORECASE)
+assert rule.search(s)
+p.write_text(rule.sub('removed rule', s))
+PY
+    rc=0; out="$("$me" 2>&1)" || rc=$?
+    [ "$rc" = 1 ] && echo "$out" | grep -qF "$file no longer says \"$phrase\"" || { echo "self-test: missing handoff or planning rule should fail: $phrase (rc $rc):"; echo "$out"; exit 1; }
+    cp "$src/$file" "$dir/loop/prompts/$file"
+  done <<< "$RULES"
+  rm "$dir/loop/prompts/respond-to-review.md"
+  rc=0; out="$("$me" 2>&1)" || rc=$?
+  [ "$rc" = 1 ] && echo "$out" | grep -q 'respond-to-review.md is missing' || { echo "self-test: missing author prompt should fail (rc $rc):"; echo "$out"; exit 1; }
+  unset LOOP_ROOT
+  echo "prompt-check self-test passed"
+}
+
+case "${1:-}" in
+  --self-test) self_test ;;
+  "") check ;;
+  *) echo "usage: scripts/prompt-check.sh [--self-test]" >&2; exit 2 ;;
+esac

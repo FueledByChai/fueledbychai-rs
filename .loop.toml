@@ -1,0 +1,84 @@
+# Settings for the ticket loop, read by scripts/loop-config.sh. Copy to .loop.toml at the
+# repository root: install.sh does that once and keeps what you then write. This file is the
+# kit's and is refreshed by scripts/loop-kit-sync.sh, so read it here and change .loop.toml
+# (LK-19). One flat table; strings double-quoted, arrays on one line; a missing key takes its
+# default. `scripts/loop-config.sh --all` shows the effective values. TOML is only the config
+# format: nothing here depends on the project's language.
+[loop]
+# The branch pull requests target and done is judged on.
+default_branch = "main"
+# The definition of done, and the cheaper check to run while iterating.
+check = "scripts/check.sh"
+check_fast = "scripts/check.sh --fast"
+# Changes under these paths (a file, a prefix, or a shell pattern) are the kind the checks
+# cannot judge: the PR is labelled needs-review and waits for a person instead of auto-merging.
+# This project (0009): signing and authentication only - venue signers and JWT/API-key
+# handling, planned at crates/venues/<venue>/src/sign* and, in any crate (a venue's exec code
+# or runtime header injection), src/auth* (file or directory). AGENTS.md requires credential
+# code to live there, and scripts/check.sh fails a venue crate that keeps it elsewhere.
+review_paths = ["crates/venues/*/src/sign", "crates/*/src/auth"]
+# Commits must end with a Co-Authored-By trailer naming the agent and model that did the work.
+trailer_required = true
+# The loop kit: a git URL and a tag, or a directory inside this checkout.
+# scripts/loop-kit-sync.sh --check fails when the copied scripts and prompts drift from it.
+kit = "https://github.com/FueledByChai/coding-agent-loop"
+kit_ref = "v0.22.0"
+# The proof gate (scripts/proof-gate.sh): a change under code_paths must come with a change
+# under proof_paths, or add a line matching proof_pattern (a test function beside the code),
+# or say why in the commit body: `No new test: <reason>`. Empty code_paths: gate off.
+# Rust: proof_pattern = "#\\[test\\]"; Java: "@Test"; Python: "def test_".
+# This project: a multi-crate workspace (0008), so every crate under crates/ is code.
+code_paths = ["crates/"]
+proof_paths = ["crates/*/tests/", "fixtures/"]
+proof_pattern = "#\\[test\\]|#\\[cfg\\(test\\)\\]"
+# The coverage ratchet (scripts/coverage-ratchet.sh): `coverage` is a command whose output
+# ends in one percentage (your tool, wrapped to print the figure); the check fails when it
+# is below the number in coverage_floor, and a ticket that raises coverage raises the floor
+# in the same commit with `scripts/coverage-ratchet.sh --set`. Empty: ratchet off.
+# This project: scripts/coverage.sh prints workspace line coverage from cargo-llvm-cov;
+# scripts/check.sh runs the ratchet once Cargo.toml exists (the first ticket sets the floor).
+coverage = "scripts/coverage.sh"
+coverage_floor = "coverage-floor.txt"
+# Points of run-to-run jitter the ratchet tolerates (an instrumented suite rarely covers
+# exactly the same lines twice): it fails only below floor minus slack, and suggests a raise
+# only above floor plus slack.
+# This project: 0.2 points, as in Tessera, for cargo-llvm-cov's run-to-run jitter.
+coverage_slack = "0.2"
+# The agent review (prompts/review-prs.md, scripts/review-status.sh): the commit status it
+# posts on each pull request's head; add it to the branch ruleset's required checks so a
+# merge waits for the review.
+review_context = "Agent review"
+# Decision records (scripts/decisions.sh): one file per decision, numbered, never edited in
+# place; grill-me reads them before asking and writes one when a story needs a decision.
+decisions = "docs/decisions"
+# The sprint: the Beads label that marks the tickets to work now. backlog-status.sh --next takes
+# the first ready labelled ticket, ordered by priority then id, before the unlabelled ones, and
+# --sprint shows their states; scripts/sprint.sh add|remove|set|clear edits the label. This is
+# the subset reading: what is not labelled is the pick list --open prints. A project that instead
+# means the sprint to hold every open ticket - so an omission is a fault, not a plan - labels
+# every open ticket and runs scripts/backlog-status.sh --sprint-check from its check, which fails
+# naming an open ticket the label omits (LK-15).
+sprint_label = "sprint"
+# The product backlog: the stories with their acceptance criteria that tickets say they serve
+# ("Serves BT-nnn"). backlog-status.sh --stories derives each story's status from those
+# tickets, and --show <id> prints a story or a ticket. "" when the project keeps none.
+stories = "docs/PRODUCT_BACKLOG.md"
+# A disposable synthetic database for a command that needs one (scripts/with-test-postgres.sh):
+# it starts a container, waits for it, runs your command with the URL in its environment, and
+# removes the container it created. Nothing here is used until a project names the script from
+# its own check; leave the values alone unless the stack needs another image or another URL
+# shape, and write the jdbc: form in test_db_url for a JDBC project.
+test_db_image = "postgres:17-bookworm"
+test_db_name = "test"
+test_db_user = "test"
+test_db_env = "TEST_DATABASE_URL"
+test_db_url = "postgres://{user}:{password}@{host}:{port}/{name}"
+# The Compose proof (scripts/compose-smoke.sh): the files the stack is made of, a command that
+# prints the KEY=VALUE lines a compose file reads from its environment, and a command that
+# proves the started stack. The proof runs with COMPOSE_PROJECT_NAME and COMPOSE_FILE exported
+# for the run's own project, so it can `docker compose exec` the same stack, or restart it, and
+# the script removes that project's containers and volumes either way. Empty compose_proof
+# proves only that the stack came up.
+compose_files = ["compose.yaml"]
+compose_env = ""
+compose_proof = ""
