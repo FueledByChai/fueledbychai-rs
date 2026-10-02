@@ -1,0 +1,11 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+ --> tests/ui_units/lots_negative.rs:4:13
+  |
+4 |     let _ = Lots(-5);
+  |             ^^^^
+  |
+note: constructor is not visible here due to private fields
+ --> src/units.rs
+  |
+  | pub struct Lots(i64);
+  |                 ^^^ private field

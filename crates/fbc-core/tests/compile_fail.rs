@@ -1,10 +1,18 @@
-//! Decision 0004: the four clocks cannot be mixed. Every cross-kind subtraction is a compile
-//! error, proven case by case by the files under `tests/ui/` and their expected `.stderr`.
-//! Regenerate the expected output with `TRYBUILD=overwrite cargo test -p fbc-core --test
-//! compile_fail` only when the pinned toolchain moves (0008).
+//! Decision 0004: the sealed types refuse misuse at compile time, proven case by case by the
+//! files under `tests/ui/` (the four clocks cannot be mixed) and `tests/ui_units/` (the unit
+//! seals) and their expected `.stderr`. Regenerate the expected output with
+//! `TRYBUILD=overwrite cargo test -p fbc-core --test compile_fail` only when the pinned
+//! toolchain moves (0008).
 
 #[test]
 fn cross_kind_time_subtraction_does_not_compile() {
     let cases = trybuild::TestCases::new();
     cases.compile_fail("tests/ui/*.rs");
+}
+
+/// A negative [`fbc_core::Lots`] cannot be built: its field is private.
+#[test]
+fn unit_seals_do_not_compile() {
+    let cases = trybuild::TestCases::new();
+    cases.compile_fail("tests/ui_units/*.rs");
 }
