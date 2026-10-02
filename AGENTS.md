@@ -116,6 +116,10 @@ rather than guess.
   - `crates/fbc-core`: the contract. Time, units, price grids and exact prices, sealed ids and
     the canonical client-id codec, `Fee`/`FeeBook`, `InstrumentSpec`, `VenueCaps`, events,
     commands, the codec and factory traits, `DecodeScope` and `EncodeCtx` (0003, 0004).
+    `Lots` is built only through `Lots::new`, which refuses a negative count, and `Ticks`,
+    `Lots` and `SignedLots` have checked arithmetic only (`checked_*` and `abs_lots` return
+    `None` rather than wrap; no `+`, `-` or unary `-`), so overflow behaves the same in every
+    build profile (the `units` module documents the policy).
   - `crates/fbc-runtime`: the one generic runtime: WebSocket, TLS and HTTP through SOCKS5,
     reconnects and connection epochs, subscription reconciliation, rate limits with a safety
     floor, kernel receive timestamps, the shard host (0002).

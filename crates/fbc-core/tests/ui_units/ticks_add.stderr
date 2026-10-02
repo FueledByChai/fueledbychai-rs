@@ -1,0 +1,13 @@
+error[E0369]: cannot add `Ticks` to `Ticks`
+ --> tests/ui_units/ticks_add.rs:4:22
+  |
+4 |     let _ = Ticks(1) + Ticks(2);
+  |             -------- ^ -------- Ticks
+  |             |
+  |             Ticks
+  |
+note: `Ticks` does not implement `Add`
+ --> src/units.rs
+  |
+  | pub struct Ticks(pub i64);
+  | ^^^^^^^^^^^^^^^^ `Ticks` is defined in another crate

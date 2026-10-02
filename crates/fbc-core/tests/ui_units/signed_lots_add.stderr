@@ -1,0 +1,13 @@
+error[E0369]: cannot add `SignedLots` to `SignedLots`
+ --> tests/ui_units/signed_lots_add.rs:4:27
+  |
+4 |     let _ = SignedLots(1) + SignedLots(2);
+  |             ------------- ^ ------------- SignedLots
+  |             |
+  |             SignedLots
+  |
+note: `SignedLots` does not implement `Add`
+ --> src/units.rs
+  |
+  | pub struct SignedLots(pub i64);
+  | ^^^^^^^^^^^^^^^^^^^^^ `SignedLots` is defined in another crate
