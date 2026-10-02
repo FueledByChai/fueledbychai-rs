@@ -13,3 +13,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0008](0008-pinned-toolchain-loop-kit-beads-queue-and-consumption-by-git.md) Pinned toolchain, loop kit, Beads queue, and consumption by git tag with no crates.io release yet — accepted
 - [0009](0009-secrets-and-private-data-never-enter-this-repository-and-sig.md) Secrets and private data never enter this repository, and signing and auth are the only review paths — accepted
 - [0010](0010-three-safety-rules-every-change-keeps-no-trading-after-a-res.md) Three safety rules every change keeps: no trading after a restart until Start, pre-trade caps on every order, one quoter per market — accepted
+- [0011](0011-the-kill-switch-blocks-every-order-reducing-orders-included-.md) The kill switch blocks every order, reducing orders included; cancels always go through — accepted
