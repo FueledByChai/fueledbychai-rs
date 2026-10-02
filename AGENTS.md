@@ -189,7 +189,7 @@ crate), the licence gate, and the golden-refresh flag (with `fbc-journal`).
 
 ### Rules
 
-The owner's non-negotiables (0010, 0011):
+The owner's non-negotiables (0010, 0012):
 
 - Never arm order entry except by an explicit call from the consumer: a new runtime starts
   disarmed, so a process restart leaves trading off until the owner presses Start. A reconnect
@@ -200,9 +200,8 @@ The owner's non-negotiables (0010, 0011):
   every order command (every place, amend or replace, and batch item, reducing orders
   included), in the one path every such command takes (`fbc-oms`); never add a path that
   bypasses them, never classify an order as reducing to skip a check, and never let a cap or
-  the kill switch block a cancel. While a market's kill switch is on, no place or amend is
-  built for it, flatten, force-close and wind-down exits included; cancels always go through,
-  and exiting means the owner lifts the switch and uses Flatten or Wind-down (0011).
+  the kill switch block a cancel. What the kill switch blocks, which rules a cancel still
+  obeys, and what lifting the switch does are decided in 0012; follow that record.
 - Never mint a client id without a held namespace lease; this prevents client-id collisions,
   not two quoters.
 - Always require a held market lease, plus the account lease when the venue's nonce scope is

@@ -161,10 +161,9 @@ first live order (design D9).
   scripts (reconnect storm, PENDING_CANCEL after CANCELED, fill before order event); I8 is
   tested in its library form (every raw order event reaches the audit sink in receive order
   before apply), and an order in `Unknown` is never resent (0005).
-- Order entry starts disarmed after any restart; no place or amend that would exceed the
-  resting cap or the inventory cap, or that arrives while the market's kill switch is on, is
-  ever built, reducing orders (flatten, force-close, wind-down exits) included; a cancel is
-  always built (0010, 0011).
+- Order entry starts disarmed after any restart, and no place or amend that would exceed the
+  resting cap or the inventory cap is ever built (0010); the kill switch passes the tests that
+  0012's Consequences name.
 - Arming order entry for a market requires the market lease, plus the account lease when the
   nonce scope is per account; a test shows a second holder of either lease is refused and
   cannot arm (0010, design §13.2).
