@@ -1,0 +1,7 @@
+error[E0308]: mismatched types
+ --> tests/ui/mono_minus_wall.rs:4:25
+  |
+4 |     let _ = MonoNs(5) - WallNs(3);
+  |             ---------   ^^^^^^^^^ expected `MonoNs`, found `WallNs`
+  |             |
+  |             expected because this is `MonoNs`

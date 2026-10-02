@@ -1,0 +1,5 @@
+# Decision 0008: stable Rust 1.97, pinned; moving it is a ticket of its own.
+[toolchain]
+channel = "1.97"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
