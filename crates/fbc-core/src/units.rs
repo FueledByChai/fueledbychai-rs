@@ -206,6 +206,15 @@ impl FromStr for PxExact {
     type Err = PxParseError;
 
     /// Parses a plain decimal (`-65432.123456789`) exactly; no exponent notation, no rounding.
+    ///
+    /// Accepts every value a `PxExact` can hold, so it reads back whatever [`Display`]
+    /// prints, for every exponent from `i8::MIN` to `i8::MAX` and every mantissa including
+    /// `i64::MIN`. The written precision is kept where it fits (`7.000` stays three decimals);
+    /// trailing zeros move into the exponent only when the mantissa or the exponent would not
+    /// otherwise fit. Zero is exact at any written precision. A value that needs a mantissa
+    /// beyond `i64` or an exponent outside `i8` is an error, never a rounded price.
+    ///
+    /// [`Display`]: fmt::Display
     fn from_str(text: &str) -> Result<PxExact, PxParseError> {
         let error = || PxParseError(text.to_owned());
         let (negative, unsigned) = match text.strip_prefix('-') {
@@ -217,17 +226,40 @@ impl FromStr for PxExact {
         if (whole.is_empty() && fraction.is_empty()) || !digits_ok(whole) || !digits_ok(fraction) {
             return Err(error());
         }
-        let exp = i8::try_from(fraction.len()).map_err(|_| error())?;
-        let mut mantissa: i64 = 0;
-        for digit in whole.bytes().chain(fraction.bytes()) {
-            mantissa = mantissa
-                .checked_mul(10)
-                .and_then(|m| m.checked_add(i64::from(digit - b'0')))
-                .ok_or_else(error)?;
-        }
+        // The value is `digits × 10^exp`, digits being the whole part then the fraction.
+        let digit = |i: usize| match i.checked_sub(whole.len()) {
+            None => whole.as_bytes()[i],
+            Some(j) => fraction.as_bytes()[j],
+        };
+        let len = whole.len() + fraction.len();
+        let mut exp = -i64::try_from(fraction.len()).map_err(|_| error())?;
+        let Some(first) = (0..len).find(|&i| digit(i) != b'0') else {
+            return Ok(PxExact {
+                mantissa: 0,
+                exp: i8::try_from(exp.max(i64::from(i8::MIN))).map_err(|_| error())?,
+            });
+        };
+        let trailing_zeros = (first..len).rev().take_while(|&i| digit(i) == b'0').count();
+        // Drop trailing zeros (raising the exponent) until at most 19 digits are left and the
+        // exponent is at least i8::MIN; one more drop if 19 digits still overflow an i64.
+        let below_min_exp = usize::try_from(i64::from(i8::MIN) - exp).unwrap_or(0);
+        let mut dropped = (len - first).saturating_sub(19).max(below_min_exp);
+        let mantissa = loop {
+            if dropped > trailing_zeros {
+                return Err(error());
+            }
+            let magnitude =
+                (first..len - dropped).fold(0i128, |acc, i| acc * 10 + i128::from(digit(i) - b'0'));
+            let signed = if negative { -magnitude } else { magnitude };
+            match i64::try_from(signed) {
+                Ok(mantissa) => break mantissa,
+                Err(_) => dropped += 1,
+            }
+        };
+        exp += i64::try_from(dropped).map_err(|_| error())?;
         Ok(PxExact {
-            mantissa: if negative { -mantissa } else { mantissa },
-            exp: -exp,
+            mantissa,
+            exp: i8::try_from(exp).map_err(|_| error())?,
         })
     }
 }
