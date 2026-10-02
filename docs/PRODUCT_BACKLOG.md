@@ -163,7 +163,8 @@ first live order (design D9).
   before apply), and an order in `Unknown` is never resent (0005).
 - Order entry starts disarmed after any restart; no place or amend that would exceed the
   resting cap or the inventory cap, or that arrives while the market's kill switch is on, is
-  ever built; a cancel is always built (0010).
+  ever built, reducing orders (flatten, force-close, wind-down exits) included; a cancel is
+  always built (0010, 0011).
 - Arming order entry for a market requires the market lease, plus the account lease when the
   nonce scope is per account; a test shows a second holder of either lease is refused and
   cannot arm (0010, design §13.2).
