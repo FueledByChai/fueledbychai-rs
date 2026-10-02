@@ -6,4 +6,10 @@ with one crate per venue. The Rust counterpart of
 
 First venues: Paradex, then Hibachi; Binance USD-M futures for reference market data.
 
-Status: design and scaffolding.
+Status: scaffolding. The Cargo workspace exists with one crate:
+
+| Crate | Status |
+| --- | --- |
+| `fbc-core` | Time kinds, units, exact prices (`PxExact`), money and price grids (fixed, significant-figure, banded) |
+
+No venue is supported yet.

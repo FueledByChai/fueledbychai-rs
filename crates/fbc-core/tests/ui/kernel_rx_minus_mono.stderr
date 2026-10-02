@@ -1,0 +1,7 @@
+error[E0308]: mismatched types
+ --> tests/ui/kernel_rx_minus_mono.rs:4:29
+  |
+4 |     let _ = KernelRxNs(5) - MonoNs(3);
+  |             -------------   ^^^^^^^^^ expected `KernelRxNs`, found `MonoNs`
+  |             |
+  |             expected because this is `KernelRxNs`

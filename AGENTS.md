@@ -109,8 +109,10 @@ rather than guess.
 
 ### Layout
 
-- A Cargo workspace, planned (0001, 0008); the first ticket creates it and none of these
-  crates exists yet:
+- A Cargo workspace (0001, 0008). Only `crates/fbc-core` exists so far, with time, units,
+  price grids and exact prices; the rest are planned. Members are the `crates/fbc-*` glob; the
+  first venue crate adds `crates/venues/fbc-*` (Cargo rejects a member glob that matches
+  nothing), and `fixtures/` is excluded from the workspace:
   - `crates/fbc-core`: the contract. Time, units, price grids and exact prices, sealed ids and
     the canonical client-id codec, `Fee`/`FeeBook`, `InstrumentSpec`, `VenueCaps`, events,
     commands, the codec and factory traits, `DecodeScope` and `EncodeCtx` (0003, 0004).
@@ -145,8 +147,7 @@ rather than guess.
 
 ### Build, run, and restart
 
-- Build and test (planned; they work once the workspace ticket lands): `cargo build --workspace`
-  and `cargo test --workspace`. The toolchain is pinned in `rust-toolchain.toml` (Rust 1.97,
+- Build and test: `cargo build --workspace` and `cargo test --workspace`. The toolchain is pinned in `rust-toolchain.toml` (Rust 1.97,
   edition 2024; 0008), so rustup installs the right compiler on first use.
 - Run and restart: nothing. This is a library with no binary and no service; the private
   consumer runs it.
