@@ -17,8 +17,12 @@ use rust_decimal::Decimal;
 pub struct Ticks(pub i64);
 
 /// A size as a count of the instrument's size step; never negative.
+///
+/// The field is private: [`Lots::new`] refuses a negative count, and every operation that
+/// returns a `Lots` keeps it non-negative, so a buy of any `Lots` is never a short position
+/// change ([`SignedLots::of`]).
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
-pub struct Lots(pub i64);
+pub struct Lots(i64);
 
 /// A position in size steps; positive is long.
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
@@ -42,14 +46,25 @@ impl Sub for Ticks {
     }
 }
 
-impl Add for Lots {
-    type Output = Lots;
-    fn add(self, rhs: Lots) -> Lots {
-        Lots(self.0 + rhs.0)
-    }
-}
-
 impl Lots {
+    /// No size.
+    pub const ZERO: Lots = Lots(0);
+
+    /// `lots` size steps, or `None` when `lots` is negative.
+    pub const fn new(lots: i64) -> Option<Lots> {
+        if lots >= 0 { Some(Lots(lots)) } else { None }
+    }
+
+    /// The count of size steps; never negative.
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+
+    /// `self + rhs`, or `None` when that overflows an `i64`.
+    pub fn checked_add(self, rhs: Lots) -> Option<Lots> {
+        self.0.checked_add(rhs.0).map(Lots)
+    }
+
     /// `self - rhs`, or `None` when that would be negative.
     pub fn checked_sub(self, rhs: Lots) -> Option<Lots> {
         self.0
@@ -413,16 +428,37 @@ mod tests {
     #[test]
     fn tick_lot_and_position_arithmetic() {
         assert_eq!(Ticks(5) + Ticks(3) - Ticks(10), Ticks(-2));
-        assert_eq!(Lots(2) + Lots(3), Lots(5));
-        assert_eq!(Lots(5).checked_sub(Lots(2)), Some(Lots(3)));
-        assert_eq!(Lots(2).checked_sub(Lots(5)), None);
-        let long = SignedLots::of(Side::Buy, Lots(4));
-        let short = SignedLots::of(Side::Sell, Lots(6));
+        assert_eq!(lots(5).checked_sub(lots(2)), Some(lots(3)));
+        let long = SignedLots::of(Side::Buy, lots(4));
+        let short = SignedLots::of(Side::Sell, lots(6));
         assert_eq!(long + short, SignedLots(-2));
         assert_eq!(long - short, SignedLots(10));
         assert_eq!(-long, SignedLots(-4));
-        assert_eq!(short.abs_lots(), Lots(6));
+        assert_eq!(short.abs_lots(), lots(6));
         assert!(Bps(1.5) > Bps(1.0));
+    }
+
+    fn lots(n: i64) -> Lots {
+        Lots::new(n).unwrap()
+    }
+
+    #[test]
+    fn lots_are_never_negative() {
+        assert_eq!(Lots::new(-1), None);
+        assert_eq!(Lots::new(i64::MIN), None);
+        assert_eq!(Lots::new(0), Some(Lots::ZERO));
+        assert_eq!(Lots::new(7).map(Lots::get), Some(7));
+        let max = lots(i64::MAX);
+        assert_eq!(max.get(), i64::MAX);
+        // Adding past i64::MAX is refused rather than wrapping to a negative count.
+        assert_eq!(max.checked_add(lots(1)), None);
+        assert_eq!(lots(2).checked_add(lots(3)), Some(lots(5)));
+        assert_eq!(lots(5).checked_sub(lots(5)), Some(Lots::ZERO));
+        assert_eq!(lots(2).checked_sub(lots(5)), None);
+        // So a buy is never a short position change, at any size.
+        assert_eq!(SignedLots::of(Side::Buy, max), SignedLots(i64::MAX));
+        assert_eq!(SignedLots::of(Side::Sell, max), SignedLots(-i64::MAX));
+        assert_eq!(SignedLots::of(Side::Buy, Lots::ZERO), SignedLots(0));
     }
 
     #[test]
