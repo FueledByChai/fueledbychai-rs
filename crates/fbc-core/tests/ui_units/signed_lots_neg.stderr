@@ -1,0 +1,11 @@
+error[E0600]: cannot apply unary operator `-` to type `SignedLots`
+ --> tests/ui_units/signed_lots_neg.rs:4:13
+  |
+4 |     let _ = -SignedLots(1);
+  |             ^^^^^^^^^^^^^^ cannot apply unary operator `-`
+  |
+note: `SignedLots` does not implement `Neg`
+ --> src/units.rs
+  |
+  | pub struct SignedLots(pub i64);
+  | ^^^^^^^^^^^^^^^^^^^^^ `SignedLots` is defined in another crate

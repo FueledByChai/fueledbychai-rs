@@ -10,7 +10,9 @@ fn cross_kind_time_subtraction_does_not_compile() {
     cases.compile_fail("tests/ui/*.rs");
 }
 
-/// A negative [`fbc_core::Lots`] cannot be built: its field is private.
+/// A negative [`fbc_core::Lots`] cannot be built (its field is private), and `Ticks`, `Lots`
+/// and `SignedLots` have no `+`, `-` or unary `-` operator that could wrap in a release build;
+/// their arithmetic is `checked_*` only.
 #[test]
 fn unit_seals_do_not_compile() {
     let cases = trybuild::TestCases::new();

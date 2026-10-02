@@ -1,0 +1,13 @@
+error[E0369]: cannot subtract `SignedLots` from `SignedLots`
+ --> tests/ui_units/signed_lots_sub.rs:4:27
+  |
+4 |     let _ = SignedLots(1) - SignedLots(2);
+  |             ------------- ^ ------------- SignedLots
+  |             |
+  |             SignedLots
+  |
+note: `SignedLots` does not implement `Sub`
+ --> src/units.rs
+  |
+  | pub struct SignedLots(pub i64);
+  | ^^^^^^^^^^^^^^^^^^^^^ `SignedLots` is defined in another crate

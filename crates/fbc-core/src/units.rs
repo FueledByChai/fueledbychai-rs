@@ -4,10 +4,20 @@
 //! [`Lots`] (an index on the size step) and positions are [`SignedLots`]. Off-grid prices such
 //! as mark, index and average entry are [`PxExact`] and are never rounded to ticks. Money is
 //! integer nanos of an asset. `f64` appears only in [`Bps`], which belongs to models.
+//!
+//! # Overflow
+//!
+//! Arithmetic on [`Ticks`], [`Lots`] and [`SignedLots`] is checked in every build profile:
+//! each operation (`checked_add`, `checked_sub`, `checked_neg`, [`SignedLots::abs_lots`])
+//! returns `None` when the exact result does not fit an `i64` (or, for `Lots`, would be
+//! negative). There are no `+`, `-` or unary `-` operators on them, because Rust's operators
+//! panic in debug builds and wrap silently in release builds, and a wrapped price index or
+//! position is a wrong order, not an error. Values are exact or refused, never rounded,
+//! saturated or wrapped (decision 0004); the caller decides what an unrepresentable result
+//! means. [`Money`] follows the same policy.
 
 use core::fmt;
 use core::hash::{Hash, Hasher};
-use core::ops::{Add, Neg, Sub};
 use core::str::FromStr;
 
 use rust_decimal::Decimal;
@@ -32,17 +42,15 @@ pub struct SignedLots(pub i64);
 #[derive(Copy, Clone, PartialEq, PartialOrd, Debug)]
 pub struct Bps(pub f64);
 
-impl Add for Ticks {
-    type Output = Ticks;
-    fn add(self, rhs: Ticks) -> Ticks {
-        Ticks(self.0 + rhs.0)
+impl Ticks {
+    /// `self + rhs`, or `None` when that overflows an `i64`.
+    pub fn checked_add(self, rhs: Ticks) -> Option<Ticks> {
+        self.0.checked_add(rhs.0).map(Ticks)
     }
-}
 
-impl Sub for Ticks {
-    type Output = Ticks;
-    fn sub(self, rhs: Ticks) -> Ticks {
-        Ticks(self.0 - rhs.0)
+    /// `self - rhs`, or `None` when that overflows an `i64`.
+    pub fn checked_sub(self, rhs: Ticks) -> Option<Ticks> {
+        self.0.checked_sub(rhs.0).map(Ticks)
     }
 }
 
@@ -75,35 +83,31 @@ impl Lots {
 }
 
 impl SignedLots {
-    /// The position change of a fill of `lots` on `side`.
+    /// The position change of a fill of `lots` on `side`. Never overflows: a `Lots` is at
+    /// most `i64::MAX`, whose negation fits.
     pub fn of(side: Side, lots: Lots) -> SignedLots {
         SignedLots(side.sign() * lots.0)
     }
 
-    /// The size of the position, whichever its direction.
-    pub fn abs_lots(self) -> Lots {
-        Lots(self.0.abs())
+    /// The size of the position, whichever its direction, or `None` for `i64::MIN`, whose
+    /// magnitude does not fit a `Lots`.
+    pub fn abs_lots(self) -> Option<Lots> {
+        self.0.checked_abs().map(Lots)
     }
-}
 
-impl Add for SignedLots {
-    type Output = SignedLots;
-    fn add(self, rhs: SignedLots) -> SignedLots {
-        SignedLots(self.0 + rhs.0)
+    /// `self + rhs`, or `None` when that overflows an `i64`.
+    pub fn checked_add(self, rhs: SignedLots) -> Option<SignedLots> {
+        self.0.checked_add(rhs.0).map(SignedLots)
     }
-}
 
-impl Sub for SignedLots {
-    type Output = SignedLots;
-    fn sub(self, rhs: SignedLots) -> SignedLots {
-        SignedLots(self.0 - rhs.0)
+    /// `self - rhs`, or `None` when that overflows an `i64`.
+    pub fn checked_sub(self, rhs: SignedLots) -> Option<SignedLots> {
+        self.0.checked_sub(rhs.0).map(SignedLots)
     }
-}
 
-impl Neg for SignedLots {
-    type Output = SignedLots;
-    fn neg(self) -> SignedLots {
-        SignedLots(-self.0)
+    /// The opposite position, or `None` for `i64::MIN`.
+    pub fn checked_neg(self) -> Option<SignedLots> {
+        self.0.checked_neg().map(SignedLots)
     }
 }
 
@@ -427,14 +431,19 @@ mod tests {
 
     #[test]
     fn tick_lot_and_position_arithmetic() {
-        assert_eq!(Ticks(5) + Ticks(3) - Ticks(10), Ticks(-2));
+        let ticks = Ticks(5).checked_add(Ticks(3));
+        assert_eq!(
+            ticks.and_then(|t| t.checked_sub(Ticks(10))),
+            Some(Ticks(-2))
+        );
         assert_eq!(lots(5).checked_sub(lots(2)), Some(lots(3)));
         let long = SignedLots::of(Side::Buy, lots(4));
         let short = SignedLots::of(Side::Sell, lots(6));
-        assert_eq!(long + short, SignedLots(-2));
-        assert_eq!(long - short, SignedLots(10));
-        assert_eq!(-long, SignedLots(-4));
-        assert_eq!(short.abs_lots(), lots(6));
+        assert_eq!(long.checked_add(short), Some(SignedLots(-2)));
+        assert_eq!(long.checked_sub(short), Some(SignedLots(10)));
+        assert_eq!(long.checked_neg(), Some(SignedLots(-4)));
+        assert_eq!(short.abs_lots(), Some(lots(6)));
+        assert_eq!(long.abs_lots(), Some(lots(4)));
         assert!(Bps(1.5) > Bps(1.0));
     }
 
@@ -459,6 +468,23 @@ mod tests {
         assert_eq!(SignedLots::of(Side::Buy, max), SignedLots(i64::MAX));
         assert_eq!(SignedLots::of(Side::Sell, max), SignedLots(-i64::MAX));
         assert_eq!(SignedLots::of(Side::Buy, Lots::ZERO), SignedLots(0));
+    }
+
+    #[test]
+    fn tick_and_position_arithmetic_refuses_overflow_in_every_build() {
+        assert_eq!(Ticks(i64::MAX).checked_add(Ticks(1)), None);
+        assert_eq!(Ticks(i64::MIN).checked_add(Ticks(-1)), None);
+        assert_eq!(Ticks(i64::MIN).checked_sub(Ticks(1)), None);
+        assert_eq!(Ticks(i64::MAX).checked_sub(Ticks(-1)), None);
+        assert_eq!(SignedLots(i64::MAX).checked_add(SignedLots(1)), None);
+        assert_eq!(SignedLots(i64::MIN).checked_sub(SignedLots(1)), None);
+        assert_eq!(SignedLots(i64::MIN).checked_neg(), None);
+        assert_eq!(SignedLots(i64::MIN).abs_lots(), None);
+        assert_eq!(SignedLots(-i64::MAX).abs_lots(), Lots::new(i64::MAX));
+        assert_eq!(
+            SignedLots(i64::MAX).checked_neg(),
+            Some(SignedLots(-i64::MAX))
+        );
     }
 
     #[test]

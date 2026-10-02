@@ -1,0 +1,13 @@
+error[E0369]: cannot add `Lots` to `Lots`
+ --> tests/ui_units/lots_add.rs:4:24
+  |
+4 |     let _ = Lots::ZERO + Lots::ZERO;
+  |             ---------- ^ ---------- Lots
+  |             |
+  |             Lots
+  |
+note: `Lots` does not implement `Add`
+ --> src/units.rs
+  |
+  | pub struct Lots(i64);
+  | ^^^^^^^^^^^^^^^ `Lots` is defined in another crate
