@@ -484,8 +484,11 @@ pub enum ExecEvent {
     },
     /// The resync snapshot is complete.
     ResyncEnd,
-    /// The answer to an order query; `found: None` when the venue does not know the order.
+    /// The answer to order query `rpc`; `found: None` when the venue does not know the order.
+    /// It names its request, as an [`ExecEvent::Outcome`] does, so the runtime clears the
+    /// request's deadline ([`ExecEvent::answers`]) and never times out an answered query.
     QueryResult {
+        rpc: RpcId,
         target: OrderRef,
         found: Option<VenueOrderSnapshot>,
     },
@@ -493,6 +496,26 @@ pub enum ExecEvent {
     FeeRates(Vec<(InstrumentId, Channel, Liquidity, FeeRate)>),
     /// An error that names no order or request.
     UncorrelatedError(Reject),
+}
+
+impl ExecEvent {
+    /// The request this event answers, if any: the runtime clears that request's deadline when
+    /// the event is pushed, so an answered request never reaches
+    /// [`ExecCodec::on_rpc_timeout`](crate::ExecCodec::on_rpc_timeout) and no `Unknown` follows
+    /// its answer. Every [`ExecEvent::Outcome`] answers its request except `Unknown`, which
+    /// says that no answer came; a [`ExecEvent::QueryResult`] answers its query. A codec
+    /// decodes a reply to a batch in one call that pushes every item's outcome (or nothing,
+    /// [`ExecSink`](crate::ExecSink)), so clearing on the first answer leaves no item waiting.
+    pub fn answers(&self) -> Option<RpcId> {
+        match self {
+            ExecEvent::Outcome {
+                outcome: SubmitOutcome::Unknown,
+                ..
+            } => None,
+            ExecEvent::Outcome { rpc, .. } | ExecEvent::QueryResult { rpc, .. } => Some(*rpc),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -524,6 +547,107 @@ mod tests {
         let bare = Envelope::new(stamp, VenueMeta::NONE, ExecEvent::ResyncEnd);
         assert_eq!((bare.exch_ts, bare.venue_seq), (None, None));
         assert_eq!(bare.exch_ts_kind, ExchTsKind::Unknown);
+    }
+
+    #[test]
+    fn an_answered_query_names_its_request_so_its_deadline_can_be_cleared() {
+        // Codex r4172917321: a query answer that names no request leaves the runtime waiting
+        // on its deadline, and on_rpc_timeout would then report Unknown after the answer.
+        let target = OrderRef::Client(ClientOrderId::new(crate::ids::Namespace::new(1), 1));
+        let answer = ExecEvent::QueryResult {
+            rpc: RpcId(11),
+            target,
+            found: None,
+        };
+        assert_eq!(answer.answers(), Some(RpcId(11)));
+        let ack = ExecEvent::Outcome {
+            rpc: RpcId(12),
+            item: Some(ItemRef {
+                idx: 0,
+                cid: None,
+                vid: None,
+            }),
+            outcome: SubmitOutcome::Accepted {
+                ack: crate::command::AckLevel::Final,
+            },
+        };
+        assert_eq!(ack.answers(), Some(RpcId(12)));
+        // A timeout is no answer, and events that name no request answer none.
+        let timeout = ExecEvent::Outcome {
+            rpc: RpcId(13),
+            item: None,
+            outcome: SubmitOutcome::Unknown,
+        };
+        assert_eq!(timeout.answers(), None);
+        // A refusal of the whole request answers it.
+        let refused = ExecEvent::Outcome {
+            rpc: RpcId(14),
+            item: None,
+            outcome: SubmitOutcome::NotSent(crate::command::NotSentReason::RateBudget),
+        };
+        assert_eq!(refused.answers(), Some(RpcId(14)));
+        assert_eq!(ExecEvent::ResyncEnd.answers(), None);
+    }
+
+    #[test]
+    fn a_fill_key_is_computed_from_the_one_copy_of_its_fields() {
+        // A fill without a venue fill id is keyed by its order's venue id and cumulative
+        // quantity after the fill; the event holds each once, so the key cannot disagree with
+        // the order and quantity the fill is applied to.
+        let (vid, fid, fee) = crate::scope::dispatch(
+            &crate::cid::ClientIdFormat::Uuid,
+            crate::ids::Namespace::new(1),
+            crate::fee::VenueFeeSign::PositiveIsCost,
+            |scope| {
+                let usd = crate::units::AssetSym::new("USD").unwrap();
+                (
+                    scope.venue_order_id("V-1").unwrap(),
+                    scope.fill_id("F-1").unwrap(),
+                    scope.fee(0, usd).unwrap(),
+                )
+            },
+        );
+        let lots = |n| Lots::new(n).unwrap();
+        let fill = |ident| FillEvent {
+            ident,
+            cid: None,
+            inst: InstrumentId::new(1),
+            side: Side::Sell,
+            px: Ticks(5),
+            qty: lots(1),
+            liquidity: Liquidity3::Unknown,
+            fee,
+            realized_pnl: None,
+            realized_funding: None,
+            replay: false,
+        };
+        let derived = fill(FillIdent::Derived {
+            vid: vid.clone(),
+            cum_after: lots(3),
+        });
+        let expected = FillKey::Derived {
+            vid: vid.clone(),
+            cum_after: lots(3),
+        };
+        assert_eq!(derived.key(), expected);
+        assert_eq!(
+            (derived.vid(), derived.cum_after()),
+            (Some(&vid), Some(lots(3)))
+        );
+        let full = fill(FillIdent::Venue {
+            fill: fid.clone(),
+            vid: Some(vid.clone()),
+            cum_after: Some(lots(4)),
+        });
+        assert_eq!(full.key(), FillKey::Venue(fid.clone()));
+        assert_eq!((full.vid(), full.cum_after()), (Some(&vid), Some(lots(4))));
+        let bare = fill(FillIdent::Venue {
+            fill: fid.clone(),
+            vid: None,
+            cum_after: None,
+        });
+        assert_eq!(bare.key(), FillKey::Venue(fid));
+        assert_eq!((bare.vid(), bare.cum_after()), (None, None));
     }
 
     #[test]

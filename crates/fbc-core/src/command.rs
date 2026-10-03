@@ -483,4 +483,82 @@ mod tests {
         let huge = vec![cancel; usize::from(u16::MAX) + 1];
         assert_eq!(VenueCommand::CancelMany(huge).items(), None);
     }
+
+    #[test]
+    fn a_command_is_safety_traffic_only_when_everything_in_it_reduces_or_protects() {
+        // On a venue without a reduce-only flag an exit goes out with reduce_only false; the
+        // OMS's own classification, `reducing`, keeps it on the safety floor. A reduce-only
+        // order is reducing too, and a batch is safety traffic only when every order is.
+        let vid = dispatch(
+            &ClientIdFormat::Uuid,
+            Namespace::new(1),
+            VenueFeeSign::PositiveIsCost,
+            |scope| scope.venue_order_id("V-1"),
+        )
+        .unwrap();
+        let order = |reducing, reduce_only| NewOrder {
+            cid: ClientOrderId::new(Namespace::new(1), 1),
+            inst: InstrumentId::new(1),
+            side: Side::Sell,
+            qty: Lots::new(1).unwrap(),
+            kind: OrderKind::Limit { px: Ticks(5) },
+            tif: TifTag::Gtc,
+            channel: Channel::Public,
+            post_only: true,
+            reduce_only,
+            reducing,
+        };
+        let (exit, flagged, plain) = (order(true, false), order(false, true), order(false, false));
+        let class = |cmd: VenueCommand| cmd.traffic_class();
+        let (safety, normal) = (TrafficClass::Safety, TrafficClass::Normal);
+        assert_eq!(class(VenueCommand::Place(exit.clone())), safety);
+        assert_eq!(class(VenueCommand::Place(flagged.clone())), safety);
+        assert_eq!(class(VenueCommand::Place(plain.clone())), normal);
+        let batch = VenueCommand::PlaceBatch(vec![exit.clone(), flagged]);
+        assert_eq!(class(batch), safety);
+        assert_eq!(class(VenueCommand::PlaceBatch(vec![exit, plain])), normal);
+        assert_eq!(class(VenueCommand::PlaceBatch(vec![])), normal);
+        let amend = |reducing, reduce_only| {
+            VenueCommand::Amend(AmendOrder {
+                target: OrderRef::Venue(vid.clone()),
+                inst: InstrumentId::new(1),
+                side: Side::Sell,
+                tif: TifTag::Gtc,
+                channel: Channel::Public,
+                post_only: true,
+                reduce_only,
+                reducing,
+                px: Ticks(5),
+                qty: Lots::new(10).unwrap(),
+                cum_filled: Lots::new(0).unwrap(),
+            })
+        };
+        assert_eq!(class(amend(true, false)), safety);
+        assert_eq!(class(amend(false, true)), safety);
+        assert_eq!(class(amend(false, false)), normal);
+        // Cancels, protection and the Unknown ladder's queries are safety traffic; a fee query
+        // is not.
+        let cancel = CancelOrder {
+            target: OrderRef::Venue(vid.clone()),
+            inst: InstrumentId::new(1),
+            side: Side::Sell,
+            placement_nonce: None,
+        };
+        let query = QueryOrder {
+            target: OrderRef::Venue(vid),
+            inst: InstrumentId::new(1),
+            placement_nonce: Some(3),
+        };
+        for cmd in [
+            VenueCommand::Cancel(cancel.clone()),
+            VenueCommand::CancelMany(vec![cancel]),
+            VenueCommand::CancelAll(CancelScope::Instrument(InstrumentId::new(1))),
+            VenueCommand::ArmCancelOnDisconnect(true),
+            VenueCommand::RefreshDeadMan,
+            VenueCommand::Query(query),
+        ] {
+            assert_eq!(cmd.traffic_class(), safety, "{cmd:?}");
+        }
+        assert_eq!(class(VenueCommand::FeeQuery), normal);
+    }
 }

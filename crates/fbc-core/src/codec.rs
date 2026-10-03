@@ -813,12 +813,12 @@ pub enum CtxCall {
 /// An order-entry codec for one account session. Deterministic given its inputs and prior
 /// state; it reads no clock and draws no nonce except through [`EncodeCtx`].
 pub trait ExecCodec: Send {
-    /// `stream` opened: authenticate and subscribe, as effects.
     /// How many nonces the runtime reserves into the [`EncodeCtx`] it passes to `call`, asked
     /// right before the call from the codec's current state; 0 when the call signs nothing.
     /// (For `encode` the count is [`VenueCommand::items`].) The runtime reserves and journals
     /// exactly that many, so replay hands the call the same context.
     fn nonces_for(&self, call: CtxCall) -> u16;
+    /// `stream` opened: authenticate and subscribe, as effects.
     fn on_open(&mut self, stream: StreamId, ctx: &EncodeCtx, fx: &mut Effects);
     /// Encode and sign `cmd` as request `rpc`. `Err` means not sent: no byte reached a socket
     /// buffer and no effect was pushed. Never retries.
@@ -856,7 +856,8 @@ pub trait ExecCodec: Send {
     /// A timer the codec set fired (token refresh, keepalive, dead-man refresh).
     fn on_timer(&mut self, tag: TimerTag, ctx: &EncodeCtx, fx: &mut Effects);
     /// Request `rpc`, sent as a frame ([`Effect::Send`]), timed out unanswered: report
-    /// `Outcome { item: None, Unknown }`.
+    /// `Outcome { item: None, Unknown }`. The runtime calls it only when no event answering
+    /// `rpc` ([`ExecEvent::answers`]) was pushed before the deadline.
     fn on_rpc_timeout(&mut self, rpc: RpcId, sink: &mut dyn ExecSink);
     /// Read the venue's open orders and positions (reads only), reported as the `Resync*`
     /// events.
@@ -1247,5 +1248,95 @@ mod tests {
     fn a_raw_frame_gives_its_bytes_whatever_its_kind() {
         assert_eq!(RawFrame::Text("ab").bytes(), b"ab");
         assert_eq!(RawFrame::Binary(&[1, 2]).bytes(), [1, 2]);
+    }
+
+    #[test]
+    fn a_url_keeps_its_credential_spans_and_never_shows_them() {
+        // A venue may put a credential in a URL's path; the URL keeps the span that holds it,
+        // as frames and headers do, so the journal can hash it, and Debug never prints it.
+        let secret = "SYNTHETIC-URL-TOKEN";
+        let text = format!("wss://venue.invalid/ws/{secret}/stream");
+        let start = u32::try_from("wss://venue.invalid/ws/".len()).unwrap();
+        let span = start..start + u32::try_from(secret.len()).unwrap();
+        let url = WireUrl::redacted(text.clone(), vec![span.clone()]).unwrap();
+        assert_eq!(
+            (url.as_str(), url.redactions()),
+            (text.as_str(), &[span][..])
+        );
+        assert!(url == text.as_str() && url == *text.as_str());
+        let shown = format!("{url:?}");
+        assert!(
+            !shown.contains(secret) && shown.contains("venue.invalid/ws/"),
+            "{shown}"
+        );
+        assert!(
+            WireUrl::plain("https://venue.invalid")
+                .redactions()
+                .is_empty()
+        );
+        // Spans lie inside the text, in order, on character boundaries.
+        let refused = |spans| WireUrl::redacted("https://é.invalid".to_owned(), spans);
+        assert_eq!(
+            refused(std::iter::once(0..99).collect()),
+            Err(RedactError::OutOfBounds)
+        );
+        assert_eq!(
+            refused(std::iter::once(9..10).collect()),
+            Err(RedactError::OutOfBounds)
+        );
+        assert_eq!(refused(vec![4..6, 2..3]), Err(RedactError::Unordered));
+    }
+
+    #[test]
+    fn a_url_span_over_a_delimiter_still_leaves_the_rest_of_the_url_hidden() {
+        // The query, fragment and user information are found in the URL as written, before
+        // any span is replaced: a span that swallows the `?`, `#` or `@` cannot expose what
+        // follows. The path is shown (only a span hides it); the query and fragment never are.
+        let cases = [
+            (
+                "https://venue.invalid/x?api_key=SECRET&other=TOKEN2",
+                "?api_key=SECRET",
+                0,
+            ),
+            ("https://venue.invalid/x#SECRET&TOKEN2", "#SECRET", 0),
+            (
+                "https://user:SECRET@venue.invalid/TOKEN2?TOKEN2",
+                ":SECRET@",
+                1,
+            ),
+        ];
+        for (text, marked, path_tokens) in cases {
+            let start = text.find(marked).unwrap();
+            let end = u32::try_from(start + marked.len()).unwrap();
+            let span = u32::try_from(start).unwrap()..end;
+            let url = WireUrl::redacted(text.to_owned(), vec![span]).unwrap();
+            let shown = format!("{url:?}");
+            assert!(
+                !shown.contains("SECRET") && shown.contains("venue.invalid"),
+                "{shown}"
+            );
+            assert_eq!(shown.matches("TOKEN2").count(), path_tokens, "{shown}");
+        }
+    }
+
+    #[test]
+    fn an_encode_receipt_holds_only_nonces_taken_from_the_context() {
+        // The OMS keeps a receipt's nonces as placement nonces; each comes from the reserved
+        // block, once per item, so a receipt cannot name a nonce the request did not use.
+        let ctx = EncodeCtx {
+            wall: WallNs(5),
+            mono: MonoNs(6),
+            nonces: NonceBlock::consecutive(700, 2).unwrap(),
+        };
+        let mut receipt = EncodeReceipt::new();
+        assert_eq!(receipt.use_nonce(&ctx, 1), Some(701));
+        assert_eq!(
+            receipt.use_nonce(&ctx, 1),
+            None,
+            "an item takes its nonce once"
+        );
+        assert_eq!(receipt.use_nonce(&ctx, 2), None, "past the reserved block");
+        assert_eq!(receipt.use_nonce(&ctx, 0), Some(700));
+        assert_eq!(receipt.nonces(), [(1, 701), (0, 700)]);
     }
 }
