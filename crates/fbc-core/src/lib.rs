@@ -77,5 +77,5 @@ pub use units::{
 };
 pub use venue::{
     ConfigError, ConfigScope, EndpointPlan, ExecEndpoint, FieldSpec, FieldUnit, ManagedGateway,
-    OrderGateway, SubmitHandle, VenueConfig, VenueError, VenueFactory,
+    MdTransport, OrderGateway, SubmitHandle, VenueConfig, VenueError, VenueFactory,
 };
