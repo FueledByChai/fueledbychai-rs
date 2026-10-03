@@ -85,7 +85,100 @@ pub struct WireSlice {
     redact: Vec<Range<u32>>,
 }
 
-/// Why a [`WireSlice`]'s redaction spans were refused.
+/// Checks redaction spans against content of `len` bytes: each non-empty, inside, after the
+/// one before it, and with both ends where `boundary` allows.
+fn check_spans(
+    len: usize,
+    redact: &[Range<u32>],
+    boundary: impl Fn(usize) -> bool,
+) -> Result<(), RedactError> {
+    let mut end = 0;
+    for span in redact {
+        let past = usize::try_from(span.end).map_or(true, |e| e > len);
+        if span.start >= span.end || past {
+            return Err(RedactError::OutOfBounds);
+        }
+        // In bounds, so both ends fit in usize.
+        if !boundary(span.start as usize) || !boundary(span.end as usize) {
+            return Err(RedactError::OutOfBounds);
+        }
+        if span.start < end {
+            return Err(RedactError::Unordered);
+        }
+        end = span.end;
+    }
+    Ok(())
+}
+
+/// A URL for the wire, with the spans that hold credentials (a key or token in the path,
+/// query or user information), so the journal stores those spans only as keyed hashes and
+/// replay compares URLs modulo them, as it does frames ([`WireSlice`]) and headers.
+///
+/// Its `Debug` shows the URL with every span replaced by `<redacted n bytes>`, and its user
+/// information, query and fragment only by length whatever the spans, so no log line or panic
+/// message that formats a request or an endpoint plan carries a credential (0009).
+#[derive(Clone, Eq, PartialEq, Hash)]
+pub struct WireUrl {
+    text: String,
+    redact: Vec<Range<u32>>,
+}
+
+impl WireUrl {
+    /// A URL holding no credential.
+    pub fn plain(text: impl Into<String>) -> WireUrl {
+        WireUrl {
+            text: text.into(),
+            redact: Vec::new(),
+        }
+    }
+
+    /// A URL whose `redact` spans hold credentials: each non-empty, inside the text, on
+    /// character boundaries, and after the one before it.
+    pub fn redacted(text: String, redact: Vec<Range<u32>>) -> Result<WireUrl, RedactError> {
+        check_spans(text.len(), &redact, |at| text.is_char_boundary(at))?;
+        Ok(WireUrl { text, redact })
+    }
+
+    /// The URL.
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    /// The spans holding credentials.
+    pub fn redactions(&self) -> &[Range<u32>] {
+        &self.redact
+    }
+}
+
+impl PartialEq<str> for WireUrl {
+    fn eq(&self, other: &str) -> bool {
+        self.text == other
+    }
+}
+
+impl PartialEq<&str> for WireUrl {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
+}
+
+impl fmt::Debug for WireUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut shown = String::with_capacity(self.text.len());
+        let mut at = 0;
+        for span in &self.redact {
+            // In bounds and on character boundaries: `WireUrl::redacted` checked every span.
+            let (start, end) = (span.start as usize, span.end as usize);
+            shown.push_str(&self.text[at..start]);
+            shown.push_str(&format!("<redacted {} bytes>", end - start));
+            at = end;
+        }
+        shown.push_str(&self.text[at..]);
+        fmt::Debug::fmt(&ShownUrl(&shown), f)
+    }
+}
+
+/// Why a [`WireSlice`]'s or [`WireUrl`]'s redaction spans were refused.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum RedactError {
     /// A span is empty, reversed or reaches past the end of the bytes.
@@ -159,17 +252,7 @@ impl WireSlice {
     /// Bytes whose `redact` spans hold credentials: each span non-empty, inside the bytes, and
     /// after the one before it.
     pub fn redacted(bytes: Vec<u8>, redact: Vec<Range<u32>>) -> Result<WireSlice, RedactError> {
-        let mut end = 0;
-        for span in &redact {
-            let past = usize::try_from(span.end).map_or(true, |e| e > bytes.len());
-            if span.start >= span.end || past {
-                return Err(RedactError::OutOfBounds);
-            }
-            if span.start < end {
-                return Err(RedactError::Unordered);
-            }
-            end = span.end;
-        }
+        check_spans(bytes.len(), &redact, |_| true)?;
         Ok(WireSlice { bytes, redact })
     }
 
@@ -224,7 +307,7 @@ impl fmt::Debug for Header {
 #[derive(Clone, Eq, PartialEq, Hash)]
 pub struct HttpRequest {
     pub method: HttpMethod,
-    pub url: String,
+    pub url: WireUrl,
     pub headers: Vec<Header>,
     pub body: WireSlice,
 }
@@ -233,7 +316,7 @@ impl fmt::Debug for HttpRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HttpRequest")
             .field("method", &self.method)
-            .field("url", &ShownUrl(&self.url))
+            .field("url", &self.url)
             .field("headers", &self.headers)
             .field("body", &self.body)
             .finish()
@@ -948,7 +1031,9 @@ mod tests {
         let body = WireSlice::redacted(frame, std::iter::once(start..end).collect()).unwrap();
         let req = HttpRequest {
             method: HttpMethod::Post,
-            url: format!("https://venue.invalid/auth?key={secret}&v=2#{secret}"),
+            url: WireUrl::plain(format!(
+                "https://venue.invalid/auth?key={secret}&v=2#{secret}"
+            )),
             headers: vec![
                 Header {
                     name: "Authorization",

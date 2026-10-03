@@ -15,7 +15,9 @@ use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::caps::VenueCaps;
-use crate::codec::{EncodeCtx, EncodeReceipt, ExecCodec, MdCodec, SpecTable, Subscription};
+use crate::codec::{
+    EncodeCtx, EncodeReceipt, ExecCodec, MdCodec, SpecTable, Subscription, WireUrl,
+};
 use crate::command::{NotSentReason, VenueCommand};
 use crate::event::{RpcId, StreamId};
 use crate::ids::{AccountKey, InstrumentId};
@@ -173,7 +175,7 @@ pub struct EndpointPlan {
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub enum MdTransport {
     /// A streaming connection the runtime opens at `url`; `on_open` is called when it is open.
-    Socket { url: String },
+    Socket { url: WireUrl },
     /// No connection: a venue that publishes these feeds only over REST
     /// ([`FeedSource::Poll`](crate::FeedSource::Poll)). The runtime opens nothing and calls
     /// `on_open` as soon as the codec is built; the codec gets its data only through the
@@ -181,7 +183,7 @@ pub enum MdTransport {
     /// own [`Effect::Timer`](crate::Effect::Timer)s. Its `keepalive` is `None`, and an
     /// [`Effect::Send`](crate::Effect::Send) or [`Effect::Reconnect`](crate::Effect::Reconnect)
     /// naming its stream is a codec defect the runtime refuses.
-    Poll { base_url: String },
+    Poll { base_url: WireUrl },
 }
 
 /// One order-entry connection the runtime opens for an account session; when it is open the
@@ -189,7 +191,7 @@ pub enum MdTransport {
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub struct ExecEndpoint {
     pub stream: StreamId,
-    pub url: String,
+    pub url: WireUrl,
 }
 
 /// The one value a venue crate exports.

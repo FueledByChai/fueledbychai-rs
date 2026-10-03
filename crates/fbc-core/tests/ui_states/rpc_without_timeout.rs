@@ -1,6 +1,6 @@
 // An order-entry request always has a deadline: an RPC without a timeout, and an HTTP request
 // without one, do not compile, so the OMS never waits forever to move an order to Unknown.
-use fbc_core::{Effect, HttpMethod, HttpRequest, HttpTag, RpcCall, RpcId, StreamId, TrafficClass, WireSlice};
+use fbc_core::{Effect, HttpMethod, HttpRequest, HttpTag, RpcCall, RpcId, StreamId, TrafficClass, WireSlice, WireUrl};
 
 fn main() {
     let _send = Effect::Send {
@@ -13,7 +13,7 @@ fn main() {
         tag: HttpTag(1),
         req: HttpRequest {
             method: HttpMethod::Post,
-            url: String::new(),
+            url: WireUrl::plain(""),
             headers: Vec::new(),
             body: WireSlice::plain(Vec::new()),
         },
