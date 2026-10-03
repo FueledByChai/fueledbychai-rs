@@ -124,7 +124,7 @@ rather than guess.
     reconnects and connection epochs, subscription reconciliation, rate limits with a safety
     floor, kernel receive timestamps, the shard host (0002).
   - `crates/fbc-book` (tick-indexed order book), `crates/fbc-oms` (order lattice, permits,
-    pre-trade caps, `ExecutionPlanner`; 0005, 0010), `crates/fbc-journal` (format, writer with
+    pre-trade caps, `ExecutionPlanner`; 0005, 0013), `crates/fbc-journal` (format, writer with
     safety reserve, reader; 0006), `crates/fbc-sim` (simulated venue and queue-position
     fill-model code, never calibrations), `crates/fbc-conformance` (adapter conformance kit and
     stub venue server).
@@ -189,16 +189,16 @@ crate), the licence gate, and the golden-refresh flag (with `fbc-journal`).
 
 ### Rules
 
-The owner's non-negotiables (0010, 0012):
+The owner's non-negotiables (0013, which supersedes 0010; the kill switch is 0012's):
 
 - Never arm order entry except by an explicit call from the consumer: a new runtime starts
   disarmed, so a process restart leaves trading off until the owner presses Start. The one
-  exception is 0012's: the owner's Flatten or Wind-down also arms a market after a restart,
-  straight into exit-only order entry (reducing orders that never cross zero, under every
-  cap), and never into quoting; only Start reaches quoting. A reconnect or resync never
-  re-places or resends an order by itself and never changes the armed state; only a process
-  start or an explicit disarm call leaves order entry disarmed. After a restart, open orders
-  and positions are re-read from the venue.
+  exception is 0013's rule 1, through 0012's Exit state: the owner's Flatten or Wind-down also
+  arms a market after a restart, straight into exit-only order entry (reducing orders that
+  never cross zero, under every cap), and never into quoting; only Start reaches quoting. A
+  reconnect or resync never re-places or resends an order by itself and never changes the
+  armed state; only a process start or an explicit disarm call leaves order entry disarmed.
+  After a restart, open orders and positions are re-read from the venue.
 - Always check the resting-order cap, the inventory cap and the per-market kill switch before
   every order command (every place, amend or replace, and batch item, reducing orders
   included), in the one path every such command takes (`fbc-oms`); never add a path that

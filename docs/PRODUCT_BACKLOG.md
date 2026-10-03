@@ -28,7 +28,7 @@ compile instead of reaching a venue.
   rounded (decision 0004, design §4.1).
 - `ClientOrderId` is minted only by `CidMint` under a held namespace lease, its sequence floor
   survives a restart, and the canonical codec round-trips every id it mints and reports ids
-  minted elsewhere as `Unparseable` (0004, 0010, design §4.3).
+  minted elsewhere as `Unparseable` (0004, 0013, design §4.3).
 - `Fee` is positive when we paid and negative for a rebate, with no public constructor, `abs`,
   negation or `f64` conversion; fee rates live in a `FeeBook` per account (0004, design §4.2).
 - `trybuild` compile-fail tests prove each seal: a `VenueOrderId`, `FillId` or `Fee` cannot be
@@ -162,11 +162,11 @@ first live order (design D9).
   tested in its library form (every raw order event reaches the audit sink in receive order
   before apply), and an order in `Unknown` is never resent (0005).
 - Order entry starts disarmed after any restart, and no place or amend that would exceed the
-  resting cap or the inventory cap is ever built (0010); the kill switch passes the tests that
+  resting cap or the inventory cap is ever built (0013); the kill switch passes the tests that
   0012's Consequences name.
 - Arming order entry for a market requires the market lease, plus the account lease when the
   nonce scope is per account; a test shows a second holder of either lease is refused and
-  cannot arm (0010, design §13.2).
+  cannot arm (0013, design §13.2).
 - `fbc-runtime` records kernel receive to write done for every protective cancel (design §5.3),
   and a Linux benchmark on a clustered-move fixture reports its p99. The 0.75 ms target on the
   shared deployment box is the consumer's deployment trigger, not this story's done line.
