@@ -1,0 +1,5 @@
+error[E0599]: no associated function or constant named `default` found for struct `VenueCaps` in the current scope
+ --> tests/ui_caps/venue_caps_default.rs:5:24
+  |
+5 |     let _ = VenueCaps::default();
+  |                        ^^^^^^^ associated function or constant not found in `VenueCaps`

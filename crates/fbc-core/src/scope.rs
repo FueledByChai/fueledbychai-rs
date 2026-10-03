@@ -1,14 +1,14 @@
-//! The decode scope: the only constructor of [`VenueOrderId`], [`FillId`] and [`Fee`] (decision
-//! 0004, design §4.2, §4.3).
+//! The decode scope: the only constructor of [`VenueOrderId`], [`FillId`], [`VenueSymbol`] and
+//! [`Fee`] (decision 0004, design §4.2, §4.3, §4.4).
 //!
 //! A [`DecodeScope`] cannot be built outside this crate. The core's [`dispatch`] makes one and
 //! lends it to a codec callback for the length of that callback; the callback cannot keep it.
-//! Adapters, and tests too (decision 0004: no back door), obtain venue ids and fees only
-//! through it.
+//! Adapters, and tests too (decision 0004: no back door), obtain venue ids, venue symbols and
+//! fees only through it.
 
 use crate::cid::{ClientIdFormat, decode_cid};
 use crate::fee::{Fee, FeeError, VenueFeeSign};
-use crate::ids::{CidMatch, FillId, IdError, Namespace, VenueOrderId};
+use crate::ids::{CidMatch, FillId, IdError, Namespace, VenueOrderId, VenueSymbol};
 use crate::units::AssetSym;
 
 /// What a codec callback decodes ids with. Lent by [`dispatch`]; never built elsewhere.
@@ -35,6 +35,12 @@ impl DecodeScope<'_> {
     /// [`MAX_VENUE_ID_LEN`](crate::MAX_VENUE_ID_LEN) bytes.
     pub fn fill_id(&self, wire: &str) -> Result<FillId, IdError> {
         FillId::from_wire(wire)
+    }
+
+    /// An instrument's symbol as the venue spells it: refused when empty or longer than
+    /// [`MAX_VENUE_ID_LEN`](crate::MAX_VENUE_ID_LEN) bytes.
+    pub fn venue_symbol(&self, wire: &str) -> Result<VenueSymbol, IdError> {
+        VenueSymbol::from_wire(wire)
     }
 
     /// A client id read off the wire, decoded with the venue's format against our namespace.

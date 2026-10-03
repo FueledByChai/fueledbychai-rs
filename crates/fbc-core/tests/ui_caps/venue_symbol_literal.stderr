@@ -1,0 +1,11 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+ --> tests/ui_caps/venue_symbol_literal.rs:5:13
+  |
+5 |     let _ = VenueSymbol("ETH-USD-PERP".into());
+  |             ^^^^^^^^^^^
+  |
+note: constructor is not visible here due to private fields
+ --> src/ids.rs
+  |
+  | pub struct VenueSymbol(CompactString);
+  |                        ^^^^^^^^^^^^^ private field

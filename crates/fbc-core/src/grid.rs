@@ -236,6 +236,73 @@ impl PriceGrid {
         }
     }
 
+    /// The greatest valid order price at or below `px`: where a bid quantizes to. `None` when
+    /// there is none (below a banded grid's first band) or it does not fit an `i64`.
+    ///
+    /// The grid valid at the result is the one that counts, so on a banded grid a price just
+    /// above a band start whose multiples miss that start falls through to the band below.
+    pub fn floor_valid(&self, px: Ticks) -> Option<Ticks> {
+        match self {
+            PriceGrid::Fixed(_) => Some(px),
+            // Steps are powers of ten that divide every decade boundary, so the multiple below
+            // `px` of the step at `px` is valid even when it lands in another decade.
+            PriceGrid::SigFigs(_) => floor_multiple(px.0, self.step_at(px).0).map(Ticks),
+            PriceGrid::Banded(grid) => {
+                // Bands starting at or below `px`; none means no valid price is that low.
+                let mut band = grid
+                    .bands
+                    .partition_point(|band| band.from_ticks <= px.0)
+                    .checked_sub(1)?;
+                let mut top = px.0;
+                loop {
+                    let Band {
+                        from_ticks, step, ..
+                    } = grid.bands[band];
+                    let candidate = floor_multiple(top, step)?;
+                    if candidate >= from_ticks {
+                        return Some(Ticks(candidate));
+                    }
+                    // Nothing valid in this band at or below `top`: the band below ends just
+                    // under this band's start.
+                    band = band.checked_sub(1)?;
+                    top = from_ticks.checked_sub(1)?;
+                }
+            }
+        }
+    }
+
+    /// The least valid order price at or above `px`: where an ask quantizes to. `None` only
+    /// when it does not fit an `i64`.
+    ///
+    /// On a banded grid a price below the first band rises to the first band, and a multiple
+    /// that would pass the next band's start moves into that band and takes its step.
+    pub fn ceil_valid(&self, px: Ticks) -> Option<Ticks> {
+        match self {
+            PriceGrid::Fixed(_) => Some(px),
+            PriceGrid::SigFigs(_) => ceil_multiple(px.0, self.step_at(px).0).map(Ticks),
+            PriceGrid::Banded(grid) => {
+                let mut band = grid
+                    .bands
+                    .partition_point(|band| band.from_ticks <= px.0)
+                    .saturating_sub(1);
+                let mut bottom = px.0;
+                loop {
+                    let Band {
+                        from_ticks, step, ..
+                    } = grid.bands[band];
+                    let candidate = ceil_multiple(bottom.max(from_ticks), step)?;
+                    match grid.bands.get(band + 1) {
+                        Some(next) if candidate >= next.from_ticks => {
+                            band += 1;
+                            bottom = next.from_ticks;
+                        }
+                        _ => return Some(Ticks(candidate)),
+                    }
+                }
+            }
+        }
+    }
+
     /// The tick index of `px` when it lies exactly on the finest grid; `None` otherwise. This
     /// never rounds: an off-grid mark stays a [`PxExact`].
     pub fn ticks_exact(&self, px: PxExact) -> Option<Ticks> {
@@ -252,6 +319,18 @@ impl PriceGrid {
     pub fn px_of(&self, ticks: Ticks) -> Option<PxExact> {
         PxExact::from_decimal(Decimal::from(ticks.0).checked_mul(self.finest())?)
     }
+}
+
+/// The greatest multiple of `step` (positive) at or below `x`, if it fits an `i64`.
+fn floor_multiple(x: i64, step: i64) -> Option<i64> {
+    let step = i128::from(step);
+    i64::try_from(i128::from(x).div_euclid(step) * step).ok()
+}
+
+/// The least multiple of `step` (positive) at or above `x`, if it fits an `i64`.
+fn ceil_multiple(x: i64, step: i64) -> Option<i64> {
+    let step = i128::from(step);
+    i64::try_from(-(-i128::from(x)).div_euclid(step) * step).ok()
 }
 
 /// A whole decimal as an `i64`; `None` when it has a fraction or does not fit.
@@ -403,6 +482,60 @@ mod tests {
         // Below the first band (0.50 = 10 ticks) nothing is valid; the step is the first band's.
         assert!(!grid.valid_at(Ticks(10)));
         assert_eq!(grid.step_at(Ticks(10)), Ticks(5));
+    }
+
+    /// The greatest valid price in `lowest..=px`, found by scanning every finest step.
+    fn scan_floor(grid: &PriceGrid, px: i64, lowest: i64) -> Option<Ticks> {
+        (lowest..=px).rev().map(Ticks).find(|&t| grid.valid_at(t))
+    }
+
+    /// The least valid price in `px..=highest`, found by scanning every finest step.
+    fn scan_ceil(grid: &PriceGrid, px: i64, highest: i64) -> Option<Ticks> {
+        (px..=highest).map(Ticks).find(|&t| grid.valid_at(t))
+    }
+
+    #[test]
+    fn floor_and_ceil_valid_agree_with_a_scan_on_every_kind_of_grid() {
+        let grids = [
+            PriceGrid::fixed(dec("0.5")).unwrap(),
+            // Two figures: the step is 1, 10 and 100 ticks in successive decades.
+            PriceGrid::sig_figs(2, 3, false).unwrap(),
+            // Integers (10 ticks) always valid, finer than the figure step from 1000 ticks.
+            PriceGrid::sig_figs(2, 1, true).unwrap(),
+            // A first band whose start (1 tick) is not a multiple of its step (2 ticks).
+            PriceGrid::banded(&[(dec("0.1"), dec("0.2")), (dec("1"), dec("0.1"))]).unwrap(),
+            // A second band whose start (11 ticks) is not a multiple of its step (2 ticks).
+            PriceGrid::banded(&[(dec("0"), dec("0.3")), (dec("1.05"), dec("0.2"))]).unwrap(),
+            // Below 13 ticks the band under it holds 12, above the band's own multiple 10.
+            PriceGrid::banded(&[(dec("0"), dec("0.3")), (dec("1.3"), dec("1"))]).unwrap(),
+            PriceGrid::banded(&[(dec("1"), dec("0.25")), (dec("10"), dec("0.1"))]).unwrap(),
+        ];
+        for grid in &grids {
+            for px in -2_500..=2_500 {
+                let floor = grid.floor_valid(Ticks(px));
+                let ceil = grid.ceil_valid(Ticks(px));
+                assert_eq!(floor, scan_floor(grid, px, -4_000), "{grid:?} floor {px}");
+                assert_eq!(ceil, scan_ceil(grid, px, 4_000), "{grid:?} ceil {px}");
+                if grid.valid_at(Ticks(px)) {
+                    assert_eq!((floor, ceil), (Some(Ticks(px)), Some(Ticks(px))));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn floor_and_ceil_valid_refuse_what_does_not_fit() {
+        let sig = PriceGrid::sig_figs(2, 3, false).unwrap();
+        assert_eq!(sig.floor_valid(Ticks(i64::MIN)), None);
+        assert_eq!(sig.ceil_valid(Ticks(i64::MAX)), None);
+        let fixed = PriceGrid::fixed(dec("0.5")).unwrap();
+        assert_eq!(fixed.floor_valid(Ticks(i64::MIN)), Some(Ticks(i64::MIN)));
+        assert_eq!(fixed.ceil_valid(Ticks(i64::MAX)), Some(Ticks(i64::MAX)));
+        // The last band steps by 3 finest ticks, and i64::MAX is not a multiple of 3.
+        let banded = PriceGrid::banded(&[(dec("0"), dec("0.2")), (dec("1"), dec("0.3"))]).unwrap();
+        assert_eq!(banded.ceil_valid(Ticks(i64::MAX)), None);
+        assert_eq!(banded.floor_valid(Ticks(-1)), None);
+        assert_eq!(banded.ceil_valid(Ticks(-1)), Some(Ticks(0)));
     }
 
     #[test]

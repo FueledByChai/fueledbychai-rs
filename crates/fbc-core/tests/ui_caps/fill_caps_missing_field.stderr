@@ -1,0 +1,5 @@
+error[E0063]: missing field `fee_sign` in initializer of `FillCaps`
+ --> tests/ui_caps/fill_caps_missing_field.rs:6:13
+  |
+6 |     let _ = FillCaps {
+  |             ^^^^^^^^ missing `fee_sign`

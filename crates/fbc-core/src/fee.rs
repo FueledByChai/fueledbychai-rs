@@ -94,6 +94,14 @@ impl Fee {
 #[derive(Copy, Clone, PartialEq, PartialOrd, Debug)]
 pub struct FeeRate(pub Bps);
 
+/// A venue's published maker and taker rates for an instrument: a prior, the last resort a
+/// [`FeeBook`] falls back to ([`FeeSource::PublicPrior`]), never an account's rate.
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub struct FeeSchedule {
+    pub maker: FeeRate,
+    pub taker: FeeRate,
+}
+
 /// What a fee rate applies to: one account's orders on one instrument, through one order
 /// channel, taking or making liquidity.
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
