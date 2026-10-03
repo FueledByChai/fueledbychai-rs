@@ -599,13 +599,17 @@ impl ExecCodec for ToyExec {
             VenueCommand::Amend(a) => {
                 let spec = specs.get(a.inst).ok_or(NotSentReason::Unencodable)?;
                 let nonce = ctx.nonce(0).ok_or(NotSentReason::Unencodable)?;
+                // The toy's amend quantity is the remaining quantity (its caps say so).
+                let qty = a
+                    .wire_qty(AmendQty::Remaining)
+                    .ok_or(NotSentReason::Unencodable)?;
                 let wire = AmendWire {
                     spec,
                     vid: a.target.venue(),
                     cid: None,
                     side: a.side,
                     px: a.px,
-                    qty: a.qty,
+                    qty,
                     tif: a.tif,
                     channel: a.channel,
                     post_only: a.post_only,
@@ -622,7 +626,7 @@ impl ExecCodec for ToyExec {
                 let frame = format!(
                     "amend|vid={vid}|px={}|qty={}|ts={}|nonce={nonce}|sig={}",
                     a.px.0,
-                    a.qty.get(),
+                    qty.get(),
                     ctx.wall.0,
                     hex(&sig)
                 );
@@ -789,7 +793,7 @@ fn toy_caps() -> VenueCaps {
                 reject_keeps_original: true,
                 keeps_venue_id: true,
                 ack: AmendAck::ReplacedEvent,
-                qty_semantics: AmendQty::TotalIncludingFilled,
+                qty_semantics: AmendQty::Remaining,
                 keeps_priority: None,
             }),
             cancel_refs: TagSet::of(&[RefKind::Venue]),
@@ -1461,24 +1465,34 @@ fn outcomes_amends_and_cancels_go_through_the_same_boundary() {
     assert_eq!(reject.kind, RejectKind::PostOnlyWouldCross);
     assert_eq!(reject.venue_code.as_deref(), Some("PO"));
 
-    // An amend carries the full order and is signed over the venue id; a cancel of a
-    // reducing kind is safety traffic.
-    let amend = VenueCommand::Amend(AmendOrder {
-        target: OrderRef::Both(cid, vid.clone()),
-        inst: INST,
-        side: Side::Buy,
-        tif: TifTag::Gtc,
-        channel: Channel::Public,
-        post_only: true,
-        reduce_only: false,
-        px: Ticks(130_860),
-        qty: Lots::new(25).unwrap(),
-    });
+    // An amend carries the full order and is signed over the venue id. The toy's wire takes
+    // the remaining quantity: a total of 25 with 5 filled goes out as 20, the resting quantity
+    // the OMS checked. An amend to the filled quantity is not sent. A cancel of a reducing
+    // kind is safety traffic.
+    let amend_to = |qty, cum_filled| {
+        VenueCommand::Amend(AmendOrder {
+            target: OrderRef::Both(cid, vid.clone()),
+            inst: INST,
+            side: Side::Buy,
+            tif: TifTag::Gtc,
+            channel: Channel::Public,
+            post_only: true,
+            reduce_only: false,
+            px: Ticks(130_860),
+            qty: Lots::new(qty).unwrap(),
+            cum_filled: Lots::new(cum_filled).unwrap(),
+        })
+    };
+    let amend = amend_to(25, 5);
     let text = String::from_utf8(encode_once(exec.as_mut(), &amend, &ctx(9, 4, 1))).unwrap();
     assert!(
-        text.starts_with("rpc=11\namend|vid=V-1|px=130860|qty=25|ts=9|nonce=4|sig="),
+        text.starts_with("rpc=11\namend|vid=V-1|px=130860|qty=20|ts=9|nonce=4|sig="),
         "{text}"
     );
+    let mut fx = Effects::new();
+    let filled = exec.encode(&amend_to(5, 5), RpcId(16), &specs(), &ctx(9, 4, 1), &mut fx);
+    assert_eq!(filled, Err(NotSentReason::Unencodable));
+    assert!(fx.is_empty());
     let cancel = VenueCommand::Cancel(CancelOrder {
         target: OrderRef::Venue(vid),
         inst: INST,
