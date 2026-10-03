@@ -1,13 +1,15 @@
 Synthetic signing fixtures (decision 0009). Nothing in this directory belongs to a funded account.
 
-- The Starknet account address in signbench/main.rs and ParadexHashOracle.java is the example
-  account printed in Paradex's public API documentation (the "Get JWT" page), not an owner
-  account.
+- The Starknet account address in signbench/main.rs, ParadexHashOracle.java and the header of
+  paradex-vectors.tsv is the example account printed in Paradex's public API documentation
+  (the "Get JWT" page), not an owner account.
 - The private key beside it is a test value chosen for the benchmark. It is not the key of that
   documented account or of any account the owner uses; it exists only so the hash and signature
   vectors are reproducible.
 - The chain id is Paradex's public mainnet chain id; the order fields (market, size, price,
-  timestamp) are made-up inputs.
+  timestamp, order id) and request fields are made-up inputs. paradex-vectors.tsv also holds
+  2,000 random intents drawn from java.util.Random with the seed in its header; the market
+  names in it are public Paradex symbols.
 - signbench/main.rs also benchmarks other venues' signers with public test values only: the
   secp256k1 keys are the well-known example key from the web3 documentation and the test key
   in the public Java library's GrvtEip712OrderSignerTest, and the Hyperliquid vectors are the
@@ -16,11 +18,15 @@ Synthetic signing fixtures (decision 0009). Nothing in this directory belongs to
   GRVT Python SDK's test_sign_order_table fixture values, also used in the public Java
   library's GrvtEip712OrderSignerTest; they are not an owner sub-account.
 - Every other long hex value here (order hashes, signature r and s, the derived client-id
-  hash) is computed from those inputs.
+  hash) is computed from those inputs. paradex-vectors.tsv repeats the account, the test key
+  and the chain id in its header so the Rust tests read them from here and no key-shaped value
+  sits in crates/.
 
 This marker covers fixtures/paradex/signing/ only. Recorded Paradex frames and journals go
 elsewhere under fixtures/paradex/, where the privacy check scans them.
 
 These files reproduce the golden vectors the Paradex signer is checked against: the Java
 library's hash and signature for the inputs above (ParadexHashOracle.java runs the Java
-signer), and the Rust benchmark that recovered the same values (signbench/).
+signer, run-oracle.sh compiles and runs it against a FueledByChaiTrading checkout and writes
+paradex-vectors.tsv, which crates/venues/fbc-venue-paradex/tests/ read), and the Rust benchmark
+that recovered the same values (signbench/).
