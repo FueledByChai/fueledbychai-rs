@@ -272,12 +272,17 @@ struct ToyExec {
 }
 
 impl ToyExec {
-    /// One order as a resync reports it; every field the caps promise is required.
+    /// One order as a resync reports it; every field the caps promise is required, and its
+    /// quantity includes its filled part.
     fn snapshot(
         f: &Frame<'_>,
         scope: &DecodeScope<'_>,
         specs: &SpecTable,
     ) -> Result<VenueOrderSnapshot, DecodeError> {
+        let (qty, cum_filled) = (f.lots("qty")?, f.lots("cum")?);
+        if cum_filled > qty {
+            return Err(DecodeError::Malformed("cum"));
+        }
         Ok(VenueOrderSnapshot {
             cid: Some(scope.client_order_id(f.get("cid")?)),
             vid: scope.venue_order_id(f.get("vid")?)?,
@@ -285,8 +290,8 @@ impl ToyExec {
             side: f.side()?,
             state: VenueOrderState::Open,
             px: Some(Ticks(f.num("px")?)),
-            qty: f.lots("qty")?,
-            cum_filled: f.lots("cum")?,
+            qty,
+            cum_filled,
             post_only: None,
             reduce_only: None,
         })
@@ -1019,8 +1024,8 @@ fn the_toy_decodes_market_data_frames_into_md_events() {
 
 #[test]
 fn a_frame_that_fails_to_decode_pushes_nothing() {
-    // A resync without its end, with a bad record, out of order, or for an instant other than
-    // the one requested; two records in one frame; a fill missing a field its caps promise
+    // A resync without its end, with a bad record, out of order, for an instant other than
+    // the one requested, or with an order filled past its quantity; two records in one frame; a fill missing a field its caps promise
     // (fill id, realized funding) or with a negative quantity. A resync that fails pushes no
     // begin without an end.
     let wire_cid = encode_cid(&CID_FORMAT, mint()).unwrap();
@@ -1032,6 +1037,13 @@ fn a_frame_that_fails_to_decode_pushes_nothing() {
         let kept: Vec<&str> = full.split('|').filter(|kv| !kv.starts_with(key)).collect();
         kept.join("|")
     };
+    // Codex r4173320335: a snapshot's quantity includes its filled part.
+    let order = |cum: u32| {
+        format!(
+            "rbegin|wm=900\nrorder|sym=TOY-PERP|vid=V-1|cid={wire_cid}|side=B|px=1|qty=1\
+             |cum={cum}\nrend"
+        )
+    };
     let bad = [
         "rbegin|wm=900\nrpos|sym=TOY-PERP|qty=0".to_owned(),
         "rbegin|wm=900\nrpos|sym=NOPE-PERP|qty=0\nrend".to_owned(),
@@ -1041,6 +1053,7 @@ fn a_frame_that_fails_to_decode_pushes_nothing() {
         without("fid="),
         without("fund="),
         full.replace("qty=3", "qty=-3"),
+        order(2),
     ];
     let bad: Vec<&str> = bad.iter().map(String::as_str).collect();
     let mut codec = exec_codec();
@@ -1050,7 +1063,7 @@ fn a_frame_that_fails_to_decode_pushes_nothing() {
     assert!(sink.0.is_empty());
     // The full fill and the requested resync decode, so each refusal above is the one thing it
     // changed; the same resync again, with none requested, is refused.
-    let good = ["rbegin|wm=900\nrend", &full, "rbegin|wm=900\nrend"];
+    let good = [&order(1), &full, "rbegin|wm=900\nrend"];
     let (results, _) = decode_exec(codec.as_mut(), &good);
     assert_eq!(
         results.iter().map(Result::is_ok).collect::<Vec<_>>(),
