@@ -26,13 +26,14 @@ use fbc_core::{
     InstrumentKind, InstrumentSpec, ItemRef, Keepalive, KeepaliveKind, Liquidity3, Lots, Lvl,
     MatchingCaps, MdCaps, MdCodec, MdEvent, MdSink, ModeScope, Money, MonoNs, Namespace,
     NamespaceLease, NewOrder, NonceBlock, NonceScope, NotSentReason, OrderCaps, OrderKind,
-    OrderKindTag, OrderRef, OrderSigner, OrderingKey, PlaceWire, PriceGrid, PxExact, QueryOrder,
-    QueueModelQuality, RawFrame, Readiness, RefKind, Reject, RejectKind, RpcId, SeqDomain, Side,
-    Sig, SignError, SignedLots, SizeStep, SnapshotSource, SpecTable, Stamp, StpScope, StreamId,
-    SubmitOutcome, Subscription, Support, TagSet, Ticks, TifTag, TimerTag, TouchSourceCaps,
-    TouchSourceId, TradeCaps, TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueCommand,
-    VenueConfig, VenueError, VenueFactory, VenueFeeSign, VenueId, VenueMeta, VenueMode,
-    VenueOrderSnapshot, VenueOrderState, WallNs, WireSlice, dispatch, encode_cid,
+    OrderKindTag, OrderRef, OrderSigner, OrderUpdate, OrderingKey, PlaceWire, PriceGrid, PxExact,
+    QueryOrder, QueueModelQuality, RawFrame, Readiness, RefKind, Reject, RejectKind, RpcId,
+    SeqDomain, Side, Sig, SignError, SignedLots, SizeStep, SnapshotSource, SpecTable, Stamp,
+    StpScope, StreamId, SubmitOutcome, Subscription, Support, TagSet, Ticks, TifTag, TimerTag,
+    TouchSourceCaps, TouchSourceId, TradeCaps, TradingStatus, TrafficClass, UnderlyingId,
+    VenueCaps, VenueCommand, VenueConfig, VenueError, VenueFactory, VenueFeeSign, VenueId,
+    VenueMeta, VenueMode, VenueOrderSnapshot, VenueOrderState, WallNs, WireSlice, dispatch,
+    encode_cid,
 };
 use fbc_core::{AmendAck, Batch, Effect, Effects};
 use rust_decimal::Decimal;
@@ -229,13 +230,14 @@ impl ToyMd {
                 let px = f.px_exact("px")?.ok_or(DecodeError::Malformed("px"))?;
                 sink.push(meta, MdEvent::Mark { inst, px });
             }
-            "gap" => sink.push(
-                meta,
-                MdEvent::Health {
-                    inst,
-                    h: FeedHealth::Gap,
-                },
-            ),
+            "gap" => {
+                let feed = match f.get("feed")? {
+                    "book" => Feed::Book(0),
+                    _ => Feed::Trades,
+                };
+                let h = FeedHealth::Gap;
+                sink.push(meta, MdEvent::Health { inst, feed, h });
+            }
             _ => return Err(DecodeError::Malformed("kind")),
         }
         Ok(())
@@ -526,6 +528,18 @@ impl ToyExec {
                 reduce_only: f.flag("ro"),
             }),
             "rend" => ExecEvent::ResyncEnd,
+            "ord" => ExecEvent::Order(OrderUpdate {
+                cid: f.opt("cid").map(|c| scope.client_order_id(c)),
+                vid: f.opt("vid").map(|v| scope.venue_order_id(v)).transpose()?,
+                inst: f.inst(specs)?,
+                side: f.side()?,
+                state: VenueOrderState::Open,
+                cum_filled: f.lots("cum")?,
+                px: f.opt_num("px")?.map(Ticks),
+                qty: f.opt_num("qty")?.and_then(Lots::new),
+                post_only: f.flag("po"),
+                reduce_only: f.flag("ro"),
+            }),
             "mode" => ExecEvent::Mode {
                 scope: match f.opt("sym") {
                     Some(_) => ModeScope::Instrument(f.inst(specs)?),
@@ -1339,7 +1353,8 @@ fn the_toy_decodes_market_data_frames_into_md_events() {
         "trade|ts=12|sym=TOY-PERP|id=99|aggr=S|px=130865|qty=4",
         "funding|ts=13|sym=TOY-PERP|rate=125000|every=3600|next=1759366800000000000",
         "mark|sym=TOY-PERP|px=65432.123456789",
-        "gap|sym=TOY-PERP",
+        "gap|sym=TOY-PERP|feed=book",
+        "gap|sym=TOY-PERP|feed=trades",
     ];
     with_scope(|scope| {
         for line in lines {
@@ -1409,8 +1424,15 @@ fn the_toy_decodes_market_data_frames_into_md_events() {
             inst: INST,
             px: PxExact::new(65_432_123_456_789, -9),
         },
+        // A gap names the feed it is on: the book is invalid, the trades are not.
         MdEvent::Health {
             inst: INST,
+            feed: Feed::Book(0),
+            h: FeedHealth::Gap,
+        },
+        MdEvent::Health {
+            inst: INST,
+            feed: Feed::Trades,
             h: FeedHealth::Gap,
         },
         MdEvent::BookSnapshotBegin {
@@ -1599,6 +1621,46 @@ fn an_event_without_a_client_id_says_none_rather_than_unparseable() {
         })
         .collect();
     assert_eq!(cids, [None, None, Some(CidMatch::Unparseable)]);
+}
+
+#[test]
+fn a_live_order_update_keeps_the_flags_the_venue_echoes() {
+    let [cid] = mint(1).try_into().unwrap();
+    let wire_cid = encode_cid(&CID_FORMAT, cid).unwrap();
+    let line =
+        format!("ord|sym=TOY-PERP|vid=V-1|cid={wire_cid}|side=B|px=130860|qty=25|cum=5|po=1|ro=0");
+    let sink = decode_exec(
+        exec_codec().as_mut(),
+        &[line.as_str(), "ord|sym=TOY-PERP|vid=V-1|side=B|cum=5"],
+    );
+    let vid = with_scope(|scope| scope.venue_order_id("V-1").unwrap());
+    let update = |cid, px, qty, post_only, reduce_only| {
+        ExecEvent::Order(OrderUpdate {
+            cid,
+            vid: Some(vid.clone()),
+            inst: INST,
+            side: Side::Buy,
+            state: VenueOrderState::Open,
+            cum_filled: Lots::new(5).unwrap(),
+            px,
+            qty,
+            post_only,
+            reduce_only,
+        })
+    };
+    assert_eq!(
+        sink.bodies(),
+        [
+            &update(
+                Some(CidMatch::Ours(cid)),
+                Some(Ticks(130_860)),
+                Lots::new(25),
+                Some(true),
+                Some(false)
+            ),
+            &update(None, None, None, None, None),
+        ]
+    );
 }
 
 #[test]

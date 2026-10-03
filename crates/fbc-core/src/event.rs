@@ -28,6 +28,7 @@
 use core::time::Duration;
 
 use crate::caps::OpKind;
+use crate::codec::Feed;
 use crate::command::{Reject, SubmitOutcome, TerminalReject};
 use crate::fee::{Fee, FeeRate};
 use crate::ids::{CidMatch, ClientOrderId, FillId, InstrumentId, OrderRef, VenueOrderId};
@@ -172,8 +173,12 @@ pub enum MdEvent {
         volume_24h_quote: Option<Money>,
         oi: Option<Lots>,
     },
-    /// The feed's health changed.
-    Health { inst: InstrumentId, h: FeedHealth },
+    /// One feed's health changed: a gap on the book says nothing about the trades.
+    Health {
+        inst: InstrumentId,
+        feed: Feed,
+        h: FeedHealth,
+    },
 }
 
 /// One request id: names a command's request from encode to its outcome or timeout.
@@ -288,6 +293,10 @@ pub struct OrderUpdate {
     pub px: Option<Ticks>,
     /// The order's total quantity (filled part included), when the event carries it.
     pub qty: Option<Lots>,
+    /// Post-only, when the venue echoes it ([`OrderCaps::events_echo_flags`](crate::OrderCaps)).
+    pub post_only: Option<bool>,
+    /// Reduce-only, when the venue echoes it.
+    pub reduce_only: Option<bool>,
 }
 
 /// The key a fill is deduplicated by (decision 0005, I3).
@@ -446,6 +455,7 @@ mod tests {
         };
         let health = MdEvent::Health {
             inst: InstrumentId::new(1),
+            feed: Feed::Trades,
             h: FeedHealth::Stale,
         };
         let env = Envelope::new(stamp, meta, health);
