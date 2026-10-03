@@ -2,7 +2,8 @@
 //! files under `tests/ui/` (the four clocks cannot be mixed), `tests/ui_units/` (the unit
 //! seals), `tests/ui_ids/` (the id seals), `tests/ui_fee/` (the fee seal), `tests/ui_caps/`
 //! (decision 0003: capabilities and specs with every field mandatory) and `tests/ui_states/`
-//! (decision 0005: no terminal state for an unknown order) and their expected
+//! (decision 0005: no terminal state for an unknown order, no request without a deadline) and
+//! their expected
 //! `.stderr`. Regenerate the expected output with
 //! `TRYBUILD=overwrite cargo test -p fbc-core --test compile_fail` only when the pinned
 //! toolchain moves (0008).
@@ -52,6 +53,8 @@ fn caps_and_specs_declare_every_field() {
 
 /// `VenueOrderState::Rejected` takes a `TerminalReject`, which refuses `RejectKind::NotFound`
 /// and cannot be built as a literal: not knowing an order is never terminal (decision 0005).
+/// An RPC frame and an HTTP request cannot be asked for without a timeout, so every
+/// order-entry request reaches Unknown when unanswered.
 #[test]
 fn a_not_found_rejection_is_not_a_terminal_state() {
     let cases = trybuild::TestCases::new();

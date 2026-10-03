@@ -42,8 +42,8 @@ pub use codec::{
     AmendWire, CancelWire, DecodeError, Effect, Effects, EncodeCtx, EncodeReceipt, ExecCodec,
     ExecSink, Feed, Header, HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag, Keepalive,
     KeepaliveKind, MAX_SIG_LEN, MdCodec, MdSink, NonceBlock, NonceSource, OrderSigner, PlaceWire,
-    RawFrame, RedactError, Sig, SignError, SpecTable, Subscription, TimerTag, TrafficClass,
-    WireSlice,
+    RawFrame, RedactError, RpcCall, Sig, SignError, SpecTable, Subscription, TimerTag,
+    TrafficClass, WireSlice,
 };
 pub use command::{
     AckLevel, AmendOrder, CancelOrder, CancelScope, NewOrder, NotAmendable, NotSentReason,

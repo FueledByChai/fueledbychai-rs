@@ -1,0 +1,11 @@
+error[E0063]: missing field `timeout` in initializer of `RpcCall`
+ --> tests/ui_states/rpc_without_timeout.rs:9:19
+  |
+9 |         rpc: Some(RpcCall { id: RpcId(1) }),
+  |                   ^^^^^^^ missing `timeout`
+
+error[E0063]: missing field `timeout` in initializer of `Effect`
+  --> tests/ui_states/rpc_without_timeout.rs:12:17
+   |
+12 |     let _http = Effect::Http {
+   |                 ^^^^^^^^^^^^ missing `timeout`
