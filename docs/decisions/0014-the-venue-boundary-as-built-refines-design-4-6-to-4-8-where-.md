@@ -8,7 +8,8 @@ Date: 2026-10-03
 0002 makes venue adapters sans-IO codecs and points at design §4.6–§4.8 (kept in the private
 consumer's repository) for the events, commands and traits. FBC-5 built that boundary in
 `fbc-core` (`event.rs`, `command.rs`, `codec.rs`, `venue.rs`) and proved it with a toy venue
-(`crates/fbc-core/tests/toy_venue.rs`). Where the design text, taken literally, left a codec
+(`crates/fbc-core/tests/toy_venue.rs`), which declares only what its codecs do; a venue that
+exercises every declared capability is FBC-z6v. Where the design text, taken literally, left a codec
 unable to do its job without a clock, an order registry or IO, or let a value contradict 0005 or
 0009, the build departed from it. The Codex review of pull request #8 (r4172231035) asked that
 those departures be recorded rather than left in commit prose, since the runtime (`fbc-runtime`),
@@ -46,7 +47,11 @@ stay sans-IO and deterministic:
    failed), so a codec can retry a snapshot or recover. An order sent over REST carries an
    `rpc` naming it, and its failure is its outcome: `NotSent`, or `Unknown`, never resent
    (0005). The traffic class keeps a REST cancel on the safety floor. The journal's outbound
-   HTTP record carries the `rpc` (0006).
+   HTTP record carries the `rpc` (0006). `ExecEvent::QueryResult` carries the `rpc` of the
+   query it answers, and `ExecEvent::answers()` names the request any event answers (every
+   `Outcome` but `Unknown`, and `QueryResult`): the runtime clears that request's deadline on
+   it, so an answered request never reaches `on_rpc_timeout` and no `Unknown` follows its
+   answer (Codex r4172917321).
 4. **Codecs get the spec table wherever they spell an instrument.** `on_http` (both codecs),
    `MdCodec::subscribe` and `VenueFactory::plan_md` take the `SpecTable`; `on_http`,
    `subscribe` and `plan_md` return `Result`, and `VenueError::UnknownInstrument` names an
@@ -145,7 +150,8 @@ a review path), `PathStamps` (FBC-ji6).
 ## Consequences
 
 - `fbc-runtime` must reserve and journal nonces per encode, stamp sink output, time out HTTP
-  requests that carry an `rpc`, and pass the spec table to planning and subscribing. It keeps
+  requests that carry an `rpc`, clear an RPC's deadline on the first event whose `answers()`
+  names it, and pass the spec table to planning and subscribing. It keeps
   one book per (instrument, `BookId`), deduplicates fills by `FillEvent::key()`, and drives a
   `Poll` endpoint without opening a connection.
 - The OMS supplies `cum_filled` on every amend and never sees a terminal `NotFound`.

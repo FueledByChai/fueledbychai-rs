@@ -2,41 +2,39 @@
 //! implements `MdCodec`, `ExecCodec` and `VenueFactory` over a hand-written text protocol. It
 //! decodes frames into `MdEvent` and `ExecEvent` only inside the `DecodeScope` the core's
 //! dispatch lends (decision 0004: venue ids, fill ids and fees come from nowhere else), encodes
-//! `VenueCommand`s taking time and nonces only from `EncodeCtx`, and does no IO: everything it
+//! a `VenueCommand` taking time and nonces only from `EncodeCtx`, and does no IO: everything it
 //! wants done comes back as `Effects`. Its protocol, symbols and values describe no real venue.
 //!
-//! Protocol: one frame per line, `kind|key=value|...`; `ts` is the venue's matching-engine time
+//! The toy proves FBC-5's done line; it is not a conformance suite, and its `VenueCaps` declare
+//! only what its codecs do. One socket carries the touch; one carries order entry (unsigned
+//! limit orders out; acks, account events, fills and a resync answered in one frame in). It has no
+//! book, trades or other feed, cancels, amends and queries nothing, reads no configuration, and
+//! asks for no HTTP, timer or keepalive.
+//!
+//! Protocol: one record per line, `kind|key=value|...`; `ts` is the venue's matching-engine time
 //! in nanoseconds and `seq` its sequence. Prices are ticks, sizes lots, money nanos of USDC.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use fbc_core::{
-    AckLevel, AckModel, Aggressor, AmendCaps, AmendOrder, AmendQty, AmendRef, AmendWire, AssetSym,
-    BookCaps, BookId, BookSide, Cadence, CancelOnDisconnect, CancelOrder, CancelRef, CancelWire,
-    Channel, Charset, CidMatch, CidMint, ClientIdFormat, ClientOrderId, ConfigError, ConfigScope,
-    ConnKey, ConnTopology, Continuity, CtxCall, DecodeError, DecodeScope, EncodeCtx, EncodeReceipt,
-    Encoding, EndpointPlan, Envelope, ExchNs, ExchTsKind, ExecCodec, ExecEndpoint, ExecEvent,
-    ExecSink, Feed, FeedHealth, FeedSource, FieldSpec, FieldUnit, FillCaps, FillEvent, FillIdent,
-    FillKey, FillSource, FundingCaps, FundingSpec, Header, HttpFailure, HttpMethod, HttpRequest,
+    AckLevel, AckModel, AssetSym, Cadence, CancelOnDisconnect, Channel, Charset, CidMatch, CidMint,
+    ClientIdFormat, ClientOrderId, ConfigError, ConnKey, ConnTopology, CtxCall, DecodeError,
+    DecodeScope, Effect, Effects, EncodeCtx, EncodeReceipt, Encoding, EndpointPlan, Envelope,
+    ExchNs, ExchTsKind, ExecCodec, ExecEndpoint, ExecEvent, ExecSink, Feed, FeedSource, FieldSpec,
+    FillCaps, FillEvent, FillIdent, FillSource, FundingCaps, FundingSpec, HttpFailure,
     HttpResponse, HttpTag, InstrumentId, InstrumentKind, InstrumentSpec, ItemRef, Keepalive,
-    KeepaliveKind, Liquidity3, Lots, Lvl, MatchingCaps, MdCaps, MdCodec, MdEvent, MdSink,
-    MdTransport, ModeScope, Money, MonoNs, Namespace, NamespaceLease, NewOrder, NonceBlock,
-    NonceScope, NotSentReason, OrderCaps, OrderKind, OrderKindTag, OrderRef, OrderSigner,
-    OrderUpdate, OrderingKey, PlaceWire, PriceGrid, PxExact, QueryOrder, QueueModelQuality,
-    RawFrame, Readiness, RefKind, Reject, RejectKind, RpcCall, RpcId, SeqDomain, Side, Sig,
-    SignError, SignedLots, SizeStep, SnapshotSource, SpecTable, Stamp, StpScope, StreamId,
+    Liquidity3, Lots, Lvl, MatchingCaps, MdCaps, MdCodec, MdEvent, MdSink, MdTransport, Money,
+    MonoNs, Namespace, NamespaceLease, NewOrder, NonceBlock, NonceScope, NotSentReason, OrderCaps,
+    OrderKind, OrderKindTag, OrderingKey, PriceGrid, PxExact, RawFrame, Readiness, RpcCall, RpcId,
+    SeqDomain, Side, SignedLots, SizeStep, SnapshotSource, SpecTable, Stamp, StpScope, StreamId,
     SubmitOutcome, Subscription, Support, TagSet, Ticks, TifTag, TimerTag, TouchSourceCaps,
     TouchSourceId, TradeCaps, TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueCommand,
-    VenueConfig, VenueError, VenueFactory, VenueFeeSign, VenueId, VenueMeta, VenueMode,
-    VenueOrderId, VenueOrderSnapshot, VenueOrderState, WallNs, WireSlice, WireUrl, decode_cid,
-    dispatch, encode_cid,
+    VenueConfig, VenueError, VenueFactory, VenueFeeSign, VenueId, VenueMeta, VenueOrderSnapshot,
+    VenueOrderState, WallNs, WireSlice, WireUrl, decode_cid, dispatch, encode_cid,
 };
-use fbc_core::{AmendAck, Batch, Effect, Effects};
 use rust_decimal::Decimal;
 
 // ---------------------------------------------------------------------------------------------
@@ -46,21 +44,12 @@ use rust_decimal::Decimal;
 const SYMBOL: &str = "TOY-PERP";
 const INST: InstrumentId = InstrumentId::new(7);
 const OWN_NS: Namespace = Namespace::new(5);
+const MD_STREAM: StreamId = StreamId(0);
 const EXEC_STREAM: StreamId = StreamId(1);
-const RESYNC_TAG: HttpTag = HttpTag(1);
-const PING_TAG: TimerTag = TimerTag(1);
-/// How often both codecs ping; each ping re-arms the timer for the next.
-const PING_EVERY: Duration = Duration::from_secs(15);
-const RESYNC_RETRY_TAG: TimerTag = TimerTag(2);
+/// The toy's endpoints: constants that carry no credential.
+const MD_URL: &str = "wss://toy.invalid/md";
+const EXEC_URL: &str = "wss://toy.invalid/exec";
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
-/// The most orders one placement batch carries.
-const MAX_BATCH: u16 = 4;
-/// The connectionless endpoint the toy's REST-only stats are polled on.
-const POLL_STREAM: StreamId = StreamId(2);
-const POLL_TAG: TimerTag = TimerTag(3);
-const STATS_TAG: HttpTag = HttpTag(3);
-const POLL_EVERY: Duration = Duration::from_secs(10);
-const URL_KEY: &str = "toy.url";
 /// The toy reports fees with a positive rebate, so the scope must flip their sign.
 const FEE_SIGN: VenueFeeSign = VenueFeeSign::PositiveIsRebate;
 const CID_FORMAT: ClientIdFormat = ClientIdFormat::Alnum {
@@ -72,7 +61,7 @@ fn usdc() -> AssetSym {
     AssetSym::new("USDC").unwrap()
 }
 
-/// One frame, split into its kind and its fields.
+/// One record, split into its kind and its fields.
 struct Frame<'a> {
     kind: &'a str,
     fields: Vec<(&'a str, &'a str)>,
@@ -98,27 +87,25 @@ impl<'a> Frame<'a> {
     }
 
     fn num<T: FromStr>(&self, key: &'static str) -> Result<T, DecodeError> {
-        self.get(key)?
-            .parse()
-            .map_err(|_| DecodeError::Malformed(key))
+        let bad = DecodeError::Malformed(key);
+        self.get(key)?.parse().map_err(|_| bad)
     }
 
     fn opt_num<T: FromStr>(&self, key: &'static str) -> Result<Option<T>, DecodeError> {
-        self.opt(key)
-            .map(|v| v.parse().map_err(|_| DecodeError::Malformed(key)))
-            .transpose()
+        self.opt(key).map(|_| self.num(key)).transpose()
     }
 
     fn meta(&self) -> Result<VenueMeta, DecodeError> {
         let exch_ts = self.opt_num::<i64>("ts")?.map(ExchNs);
+        let exch_ts_kind = match exch_ts {
+            Some(_) => ExchTsKind::MatchingEngine,
+            None => ExchTsKind::Unknown,
+        };
+        let venue_seq = self.opt_num("seq")?;
         Ok(VenueMeta {
             exch_ts,
-            exch_ts_kind: if exch_ts.is_some() {
-                ExchTsKind::MatchingEngine
-            } else {
-                ExchTsKind::Unknown
-            },
-            venue_seq: self.opt_num("seq")?,
+            exch_ts_kind,
+            venue_seq,
         })
     }
 
@@ -127,16 +114,13 @@ impl<'a> Frame<'a> {
         spec.map(|s| s.id).ok_or(DecodeError::UnknownInstrument)
     }
 
+    /// A required quantity; a negative one is malformed.
     fn lots(&self, key: &'static str) -> Result<Lots, DecodeError> {
         Lots::new(self.num(key)?).ok_or(DecodeError::Malformed(key))
     }
 
     fn usdc(&self, key: &'static str) -> Result<Money, DecodeError> {
         Ok(Money::new(self.num(key)?, usdc()))
-    }
-
-    fn opt_usdc(&self, key: &'static str) -> Result<Option<Money>, DecodeError> {
-        Ok(self.opt_num(key)?.map(|n| Money::new(n, usdc())))
     }
 
     fn side(&self) -> Result<Side, DecodeError> {
@@ -147,157 +131,68 @@ impl<'a> Frame<'a> {
         }
     }
 
-    fn px_exact(&self, key: &'static str) -> Result<Option<PxExact>, DecodeError> {
-        self.opt_num(key)
+    /// A position: instrument, signed quantity and, when sent, average entry price.
+    fn position(
+        &self,
+        specs: &SpecTable,
+    ) -> Result<(InstrumentId, SignedLots, Option<PxExact>), DecodeError> {
+        let qty = SignedLots(self.num("qty")?);
+        Ok((self.inst(specs)?, qty, self.opt_num("avg")?))
     }
 
-    fn flag(&self, key: &'static str) -> Option<bool> {
-        self.opt(key).map(|v| v == "1")
-    }
-
-    /// The book channel a book frame is on: `book=<index>`, 0 when absent.
-    fn book(&self) -> Result<BookId, DecodeError> {
-        Ok(BookId(self.opt_num("book")?.unwrap_or(0)))
-    }
-
-    /// `pxXqty`: one price level.
+    /// `pxXqty`: one price level, `None` for an empty side.
     fn level(&self, key: &'static str) -> Result<Option<Lvl>, DecodeError> {
         let Some(text) = self.opt(key) else {
             return Ok(None);
         };
         let bad = DecodeError::Malformed(key);
         let (px, qty) = text.split_once('x').ok_or(bad)?;
-        let px = px.parse().map_err(|_| bad)?;
+        let px = Ticks(px.parse().map_err(|_| bad)?);
         let qty = qty.parse().ok().and_then(Lots::new).ok_or(bad)?;
-        Ok(Some(Lvl { px: Ticks(px), qty }))
+        Ok(Some(Lvl { px, qty }))
     }
 }
 
-/// The toy's market-data codec.
-struct ToyMd {
-    pings: u32,
-}
-
-impl ToyMd {
-    fn decode_md(line: &str, specs: &SpecTable, sink: &mut dyn MdSink) -> Result<(), DecodeError> {
-        let f = Frame::parse(line)?;
-        let meta = f.meta()?;
-        let inst = f.inst(specs)?;
-        match f.kind {
-            "touch" => sink.push(
-                meta,
-                MdEvent::Touch {
-                    inst,
-                    bid: f.level("bid")?,
-                    ask: f.level("ask")?,
-                    source: TouchSourceId(0),
-                },
-            ),
-            "snap" => {
-                let epoch = f.num("epoch")?;
-                let book = f.book()?;
-                // Every level is read before the first push, so a bad one pushes nothing
-                // (MdSink: a call that returns Err has pushed nothing).
-                let mut levels = Vec::new();
-                for (key, side) in [("b", BookSide::Bid), ("a", BookSide::Ask)] {
-                    if let Some(lvl) = f.level(key)? {
-                        levels.push((side, lvl));
-                    }
-                }
-                sink.push(meta, MdEvent::BookSnapshotBegin { inst, book, epoch });
-                for (side, Lvl { px, qty }) in levels {
-                    let level = MdEvent::Level {
-                        inst,
-                        book,
-                        side,
-                        px,
-                        qty,
-                    };
-                    sink.push(meta, level);
-                }
-                sink.push(meta, MdEvent::BookSnapshotEnd { inst, book });
-            }
-            "trade" => {
-                let aggressor = match f.get("aggr")? {
-                    "B" => Aggressor::Buyer,
-                    "S" => Aggressor::Seller,
-                    _ => Aggressor::Unknown,
-                };
-                let (px, qty) = (Ticks(f.num("px")?), f.lots("qty")?);
-                let id = f.opt_num("id")?;
-                sink.push(
-                    meta,
-                    MdEvent::Trade {
-                        inst,
-                        id,
-                        aggressor,
-                        px,
-                        qty,
-                    },
-                );
-            }
-            "funding" => sink.push(
-                meta,
-                MdEvent::Funding {
-                    inst,
-                    rate_e12: f.num("rate")?,
-                    interval: f.opt_num("every")?.map(Duration::from_secs),
-                    next: f.opt_num("next")?.map(WallNs),
-                },
-            ),
-            "mark" => {
-                let px = f.px_exact("px")?.ok_or(DecodeError::Malformed("px"))?;
-                sink.push(meta, MdEvent::Mark { inst, px });
-            }
-            "gap" => {
-                let feed = match f.get("feed")? {
-                    "book" => Feed::Book(f.book()?),
-                    _ => Feed::Trades,
-                };
-                let h = FeedHealth::Gap;
-                sink.push(meta, MdEvent::Health { inst, feed, h });
-            }
-            _ => return Err(DecodeError::Malformed("kind")),
-        }
-        Ok(())
+/// The text of a text frame.
+fn text(f: RawFrame<'_>) -> Result<&str, DecodeError> {
+    match f {
+        RawFrame::Text(text) => Ok(text),
+        RawFrame::Binary(_) => Err(DecodeError::Malformed("binary frame")),
     }
 }
 
-/// Refuses a subscription to a feed the toy's caps do not offer.
-fn offered(sub: Subscription) -> Result<(), VenueError> {
-    let md = toy_caps().md;
-    let source = |s: FeedSource| s != FeedSource::None;
-    let ok = match sub.feed {
-        Feed::Touch(id) => usize::from(id.0) < md.touch_sources.len(),
-        Feed::Book(id) => usize::from(id.0) < md.books.len(),
-        Feed::Trades => source(md.trades.source),
-        Feed::Mark => source(md.mark),
-        Feed::Index => source(md.index),
-        Feed::Funding => source(md.funding.source),
-        Feed::Stats => source(md.stats),
-    };
-    if ok {
-        Ok(())
-    } else {
-        Err(VenueError::UnsupportedFeed(sub))
+/// Asks for `text` to be written to `stream`, with a deadline when it is request `rpc`.
+fn send(stream: StreamId, text: &str, rpc: Option<RpcId>, class: TrafficClass) -> Effect {
+    let frame = WireSlice::plain(text.as_bytes().to_vec());
+    let rpc = rpc.map(|id| RpcCall {
+        id,
+        timeout: RPC_TIMEOUT,
+    });
+    Effect::Send {
+        stream,
+        frame,
+        rpc,
+        class,
     }
 }
 
-/// The venue's spelling of `inst`, from the spec table.
-fn symbol_of(specs: &SpecTable, inst: InstrumentId) -> Result<&str, VenueError> {
-    specs
-        .get(inst)
-        .map(|spec| spec.venue_symbol.as_wire())
-        .ok_or(VenueError::UnknownInstrument(inst))
+/// Refuses a subscription to a feed the toy's caps do not offer, or an instrument missing from
+/// the spec table; otherwise the instrument's venue symbol.
+fn spell(specs: &SpecTable, sub: Subscription) -> Result<&str, VenueError> {
+    let touch_sources = toy_caps().md.touch_sources.len();
+    if !matches!(sub.feed, Feed::Touch(id) if usize::from(id.0) < touch_sources) {
+        return Err(VenueError::UnsupportedFeed(sub));
+    }
+    let spec = specs.get(sub.inst);
+    let spec = spec.ok_or(VenueError::UnknownInstrument(sub.inst))?;
+    Ok(spec.venue_symbol.as_wire())
 }
+
+/// The toy's market-data codec: one socket, nothing but frames.
+struct ToyMd;
 
 impl MdCodec for ToyMd {
-    fn on_open(&mut self, fx: &mut Effects) {
-        fx.push(Effect::Timer {
-            tag: PING_TAG,
-            after: PING_EVERY,
-        });
-    }
+    fn on_open(&mut self, _fx: &mut Effects) {}
 
     fn subscribe(
         &mut self,
@@ -306,23 +201,16 @@ impl MdCodec for ToyMd {
         specs: &SpecTable,
         fx: &mut Effects,
     ) -> Result<(), VenueError> {
-        // Every feed is checked and every instrument spelled before anything is pushed, so a
-        // refusal pushes nothing.
-        add.iter().try_for_each(|sub| offered(*sub))?;
+        // Everything is checked and spelled before the first push, so a refusal pushes nothing.
         let mut frames = Vec::new();
         for (verb, subs) in [("sub", add), ("unsub", remove)] {
             for sub in subs {
-                let symbol = symbol_of(specs, sub.inst)?;
+                let symbol = spell(specs, *sub)?;
                 frames.push(format!("{verb}|sym={symbol}|feed={:?}", sub.feed));
             }
         }
         for frame in frames {
-            fx.push(Effect::Send {
-                stream: StreamId(0),
-                frame: WireSlice::plain(frame.into_bytes()),
-                rpc: None,
-                class: TrafficClass::Normal,
-            });
+            fx.push(send(MD_STREAM, &frame, None, TrafficClass::Normal));
         }
         Ok(())
     }
@@ -335,537 +223,177 @@ impl MdCodec for ToyMd {
         sink: &mut dyn MdSink,
         _fx: &mut Effects,
     ) -> Result<(), DecodeError> {
-        let RawFrame::Text(line) = f else {
-            return Err(DecodeError::Malformed("binary frame"));
+        let f = Frame::parse(text(f)?)?;
+        if f.kind != "touch" {
+            return Err(DecodeError::Malformed("kind"));
+        }
+        // Everything is read before the push, so a frame that fails pushes nothing.
+        let (meta, inst) = (f.meta()?, f.inst(specs)?);
+        let (bid, ask, source) = (f.level("bid")?, f.level("ask")?, TouchSourceId(0));
+        let touch = MdEvent::Touch {
+            inst,
+            bid,
+            ask,
+            source,
         };
-        ToyMd::decode_md(line, specs, sink)
+        sink.push(meta, touch);
+        Ok(())
     }
 
     fn on_http(
         &mut self,
-        tag: HttpTag,
-        resp: Result<HttpResponse<'_>, HttpFailure>,
-        _scope: &DecodeScope<'_>,
-        specs: &SpecTable,
-        _sink: &mut dyn MdSink,
-        _fx: &mut Effects,
-    ) -> Result<(), DecodeError> {
-        // Every book frame is a whole snapshot (no book needs a REST anchor), so the socket
-        // codec asks for no HTTP and takes no response.
-        let _ = (tag, resp, specs);
-        Err(DecodeError::Malformed(
-            "the market-data socket asks for no HTTP",
-        ))
-    }
-
-    fn on_timer(&mut self, tag: TimerTag, _now: MonoNs, wall: WallNs, fx: &mut Effects) {
-        assert_eq!(tag, PING_TAG);
-        self.pings += 1;
-        let frame = format!("ping|n={}|at={}", self.pings, wall.0);
-        fx.push(Effect::Send {
-            stream: StreamId(0),
-            frame: WireSlice::plain(frame.into_bytes()),
-            rpc: None,
-            class: TrafficClass::Safety,
-        });
-        fx.push(Effect::Timer {
-            tag: PING_TAG,
-            after: PING_EVERY,
-        });
-    }
-
-    fn keepalive(&self) -> Option<Keepalive> {
-        Some(Keepalive {
-            interval: Duration::from_secs(15),
-            kind: KeepaliveKind::WsPing,
-        })
-    }
-}
-
-/// The toy's codec for its REST-only stats: no connection, only the polls it asks for.
-struct ToyPoll {
-    base_url: String,
-    symbols: BTreeSet<String>,
-}
-
-impl MdCodec for ToyPoll {
-    fn on_open(&mut self, fx: &mut Effects) {
-        fx.push(Effect::Timer {
-            tag: POLL_TAG,
-            after: POLL_EVERY,
-        });
-    }
-
-    fn subscribe(
-        &mut self,
-        add: &[Subscription],
-        remove: &[Subscription],
-        specs: &SpecTable,
-        _fx: &mut Effects,
-    ) -> Result<(), VenueError> {
-        // Check and spell everything first, so a refusal changes nothing; the next poll asks for
-        // the rest.
-        add.iter().try_for_each(|sub| offered(*sub))?;
-        let added = add.iter().map(|s| symbol_of(specs, s.inst));
-        let added = added.collect::<Result<Vec<_>, _>>()?;
-        let removed = remove.iter().map(|s| symbol_of(specs, s.inst));
-        let removed = removed.collect::<Result<Vec<_>, _>>()?;
-        self.symbols.extend(added.into_iter().map(str::to_owned));
-        removed.into_iter().for_each(|sym| {
-            self.symbols.remove(sym);
-        });
-        Ok(())
-    }
-
-    fn on_frame(
-        &mut self,
-        _f: RawFrame<'_>,
+        _tag: HttpTag,
+        _resp: Result<HttpResponse<'_>, HttpFailure>,
         _scope: &DecodeScope<'_>,
         _specs: &SpecTable,
         _sink: &mut dyn MdSink,
         _fx: &mut Effects,
     ) -> Result<(), DecodeError> {
-        Err(DecodeError::Malformed("a poll endpoint has no frames"))
+        Err(DecodeError::Malformed("the toy asks for no HTTP"))
     }
 
-    fn on_http(
-        &mut self,
-        tag: HttpTag,
-        resp: Result<HttpResponse<'_>, HttpFailure>,
-        _scope: &DecodeScope<'_>,
-        specs: &SpecTable,
-        sink: &mut dyn MdSink,
-        _fx: &mut Effects,
-    ) -> Result<(), DecodeError> {
-        let resp = match resp {
-            Ok(resp) if tag == STATS_TAG && resp.status == 200 => resp,
-            // No answer: the next poll is already scheduled.
-            Err(_) if tag == STATS_TAG => return Ok(()),
-            _ => return Err(DecodeError::Malformed("stats response")),
-        };
-        let body = std::str::from_utf8(resp.body).map_err(|_| DecodeError::Malformed("body"))?;
-        // Every line is decoded before the first push, so a bad one pushes nothing.
-        let mut events = Vec::new();
-        for line in body.lines() {
-            let f = Frame::parse(line)?;
-            let event = MdEvent::Stats {
-                inst: f.inst(specs)?,
-                volume_24h_quote: f.opt_usdc("vol")?,
-                oi: f.opt_num("oi")?.and_then(Lots::new),
-            };
-            events.push((f.meta()?, event));
-        }
-        events
-            .into_iter()
-            .for_each(|(meta, ev)| sink.push(meta, ev));
-        Ok(())
-    }
-
-    fn on_timer(&mut self, tag: TimerTag, _now: MonoNs, _wall: WallNs, fx: &mut Effects) {
-        assert_eq!(tag, POLL_TAG);
-        let symbols: Vec<&str> = self.symbols.iter().map(String::as_str).collect();
-        fx.push(Effect::Http {
-            tag: STATS_TAG,
-            req: HttpRequest {
-                method: HttpMethod::Get,
-                url: WireUrl::plain(format!(
-                    "{}/stats?symbols={}",
-                    self.base_url,
-                    symbols.join(",")
-                )),
-                headers: vec![],
-                body: WireSlice::plain(Vec::new()),
-            },
-            rpc: None,
-            timeout: RPC_TIMEOUT,
-            class: TrafficClass::Normal,
-        });
-        fx.push(Effect::Timer {
-            tag: POLL_TAG,
-            after: POLL_EVERY,
-        });
-    }
+    fn on_timer(&mut self, _tag: TimerTag, _now: MonoNs, _wall: WallNs, _fx: &mut Effects) {}
 
     fn keepalive(&self) -> Option<Keepalive> {
         None
     }
 }
 
-/// The toy's signer: a keyless FNV-1a digest of the signed fields, standing in for a real
-/// signature. It reads nothing but the wire view it is given.
-struct ToySigner;
-
-fn fnv(text: &str) -> Sig {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in text.bytes() {
-        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    Sig::new(&hash.to_be_bytes()).unwrap()
-}
-
-impl OrderSigner for ToySigner {
-    fn sign_place(&mut self, w: &PlaceWire<'_>) -> Result<Sig, SignError> {
-        let px = w
-            .kind
-            .limit_px()
-            .ok_or(SignError::Unsignable("market order"))?;
-        Ok(fnv(&format!(
-            "{}|{}|{:?}|{}|{}|{:?}|{:?}|{}|{}|{}|{:?}",
-            w.spec.venue_symbol.as_wire(),
-            w.cid,
-            w.side,
-            px.0,
-            w.qty.get(),
-            w.tif,
-            w.channel,
-            w.post_only,
-            w.reduce_only,
-            w.wall.0,
-            w.nonce
-        )))
-    }
-
-    fn sign_amend(&mut self, w: &AmendWire<'_>) -> Result<Sig, SignError> {
-        let AmendRef::Venue(vid) = w.target else {
-            return Err(SignError::Unsignable("venue order id"));
-        };
-        Ok(fnv(&format!(
-            "{}|{}|{:?}|{}|{}|{:?}|{:?}|{}|{}|{}|{:?}",
-            w.spec.venue_symbol.as_wire(),
-            vid.as_str(),
-            w.side,
-            w.px.0,
-            w.qty.get(),
-            w.tif,
-            w.channel,
-            w.post_only,
-            w.reduce_only,
-            w.wall.0,
-            w.nonce
-        )))
-    }
-
-    fn sign_cancel(&mut self, _w: &CancelWire<'_>) -> Result<Option<Sig>, SignError> {
-        Ok(None)
-    }
-}
-
-fn hex(sig: &Sig) -> String {
-    sig.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// The toy's order-entry codec. It keeps no order registry: every field it writes comes from
-/// the command, the spec table or the encode context. The one thing it remembers is the order
-/// each query in flight is for, since the venue's answer names only the request.
-struct ToyExec {
-    signer: Box<dyn OrderSigner>,
-    url: String,
-    queries: Vec<(RpcId, OrderRef)>,
-}
+/// The toy's order-entry codec. It keeps no state: every field it writes comes from the
+/// command, the spec table or the encode context.
+struct ToyExec;
 
 impl ToyExec {
-    fn new(url: &str) -> ToyExec {
-        ToyExec {
-            signer: Box::new(ToySigner),
-            url: url.to_owned(),
-            queries: Vec::new(),
-        }
-    }
-
-    fn send(fx: &mut Effects, frame: String, rpc: Option<RpcId>, class: TrafficClass) {
-        fx.push(Effect::Send {
-            stream: EXEC_STREAM,
-            frame: WireSlice::plain(frame.into_bytes()),
-            rpc: rpc.map(|id| RpcCall {
-                id,
-                timeout: RPC_TIMEOUT,
-            }),
-            class,
-        });
-    }
-
-    /// One `place` frame for item `idx`, signed, its nonce taken into `receipt`.
-    fn place_frame(
-        &mut self,
-        o: &NewOrder,
-        idx: u16,
-        specs: &SpecTable,
-        ctx: &EncodeCtx,
-        receipt: &mut EncodeReceipt,
-    ) -> Result<String, NotSentReason> {
-        let spec = specs.get(o.inst).ok_or(NotSentReason::Unencodable)?;
-        offers(o.tif, o.channel)?;
-        let nonce = receipt
-            .use_nonce(ctx, idx)
-            .ok_or(NotSentReason::Unencodable)?;
-        let cid = encode_cid(&CID_FORMAT, o.cid).map_err(|_| NotSentReason::Unencodable)?;
-        let px = o.kind.limit_px().ok_or(NotSentReason::Unsupported)?;
-        let wire = PlaceWire {
-            spec,
-            cid: &cid,
-            side: o.side,
-            kind: o.kind,
-            qty: o.qty,
-            tif: o.tif,
-            channel: o.channel,
-            post_only: o.post_only,
-            reduce_only: o.reduce_only,
-            wall: ctx.wall,
-            nonce: Some(nonce),
-        };
-        let sig = self
-            .signer
-            .sign_place(&wire)
-            .map_err(|_| NotSentReason::SignFailed)?;
-        let frame = format!(
-            "place|i={idx}|cid={cid}|sym={}|side={}|px={}|qty={}|tif={:?}|po={}|ro={}|ts={}|nonce={nonce}|sig={}",
-            spec.venue_symbol.as_wire(),
-            side_code(o.side),
-            px.0,
-            o.qty.get(),
-            o.tif,
-            u8::from(o.post_only),
-            u8::from(o.reduce_only),
-            ctx.wall.0,
-            hex(&sig)
-        );
-        Ok(frame)
-    }
-
-    /// One open or closed order as the venue reports it in a resync or a query answer.
+    /// One order as a resync reports it; every field the caps promise is required.
     fn snapshot(
         f: &Frame<'_>,
         scope: &DecodeScope<'_>,
         specs: &SpecTable,
     ) -> Result<VenueOrderSnapshot, DecodeError> {
         Ok(VenueOrderSnapshot {
-            cid: f.opt("cid").map(|c| scope.client_order_id(c)),
+            cid: Some(scope.client_order_id(f.get("cid")?)),
             vid: scope.venue_order_id(f.get("vid")?)?,
             inst: f.inst(specs)?,
             side: f.side()?,
-            state: match f.opt("state") {
-                None => VenueOrderState::Open,
-                Some("filled") => VenueOrderState::Filled,
-                Some("expired") => VenueOrderState::Expired,
-                Some(_) => return Err(DecodeError::Malformed("state")),
-            },
-            px: f.opt_num("px")?.map(Ticks),
+            state: VenueOrderState::Open,
+            px: Some(Ticks(f.num("px")?)),
             qty: f.lots("qty")?,
             cum_filled: f.lots("cum")?,
-            post_only: f.flag("po"),
-            reduce_only: f.flag("ro"),
+            post_only: None,
+            reduce_only: None,
         })
     }
 
-    /// Decodes one line into its event without pushing it, so a caller decoding several lines
-    /// pushes none of them when one fails. A query answer is matched to its query here, and
-    /// the query is let go only once its answer is pushed.
-    fn decode_exec(
-        &self,
-        line: &str,
+    /// A resync answer, one frame: `rbegin`, then `rorder` and `rpos` records, then `rend`.
+    /// The whole envelope is checked before anything is returned.
+    fn resync_frame(
+        lines: &[&str],
         scope: &DecodeScope<'_>,
         specs: &SpecTable,
-    ) -> Result<Decoded, DecodeError> {
-        let f = Frame::parse(line)?;
-        let meta = f.meta()?;
-        let mut answers = None;
-        let event = match f.kind {
-            "pos" | "rpos" => {
-                let (inst, qty) = (f.inst(specs)?, SignedLots(f.num("qty")?));
-                let avg_entry = f.px_exact("avg")?;
-                if f.kind == "pos" {
-                    ExecEvent::Position {
-                        inst,
-                        qty,
-                        avg_entry,
-                    }
-                } else {
+    ) -> Result<Vec<ExecEvent>, DecodeError> {
+        let [first, body @ .., last] = lines else {
+            return Err(DecodeError::Malformed("resync envelope"));
+        };
+        let begin = Frame::parse(first)?;
+        if begin.kind != "rbegin" || Frame::parse(last)?.kind != "rend" {
+            return Err(DecodeError::Malformed("resync envelope"));
+        }
+        let watermark = WallNs(begin.num("wm")?);
+        let mut events = vec![ExecEvent::ResyncBegin { watermark }];
+        for line in body {
+            let f = Frame::parse(line)?;
+            events.push(match f.kind {
+                "rorder" => ExecEvent::ResyncOrder(ToyExec::snapshot(&f, scope, specs)?),
+                "rpos" => {
+                    let (inst, qty, avg_entry) = f.position(specs)?;
                     ExecEvent::ResyncPosition {
                         inst,
                         qty,
                         avg_entry,
                     }
                 }
-            }
-            "bal" => ExecEvent::Balance {
-                equity: f.usdc("equity")?,
-                available: f.usdc("avail")?,
-            },
-            "fundpay" => ExecEvent::FundingPaid {
-                inst: f.inst(specs)?,
-                amount: f.usdc("amt")?,
-            },
-            "rbegin" => ExecEvent::ResyncBegin {
-                watermark: WallNs(f.num("wm")?),
-            },
-            "rorder" => ExecEvent::ResyncOrder(ToyExec::snapshot(&f, scope, specs)?),
-            // The answer to a query: the order, or none when `vid` is absent (not found).
-            "qres" => {
-                let rpc = RpcId(f.num("rpc")?);
-                let target = self.queries.iter().find(|(id, _)| *id == rpc);
-                let (_, target) = target.ok_or(DecodeError::Malformed("rpc"))?;
-                let found = match f.opt("vid") {
-                    Some(_) => Some(ToyExec::snapshot(&f, scope, specs)?),
-                    None => None,
-                };
-                answers = Some(rpc);
-                ExecEvent::QueryResult {
-                    target: target.clone(),
-                    found,
+                _ => return Err(DecodeError::Malformed("resync record")),
+            });
+        }
+        events.push(ExecEvent::ResyncEnd);
+        Ok(events)
+    }
+
+    fn event(
+        f: &Frame<'_>,
+        scope: &DecodeScope<'_>,
+        specs: &SpecTable,
+    ) -> Result<ExecEvent, DecodeError> {
+        Ok(match f.kind {
+            "pos" => {
+                let (inst, qty, avg_entry) = f.position(specs)?;
+                ExecEvent::Position {
+                    inst,
+                    qty,
+                    avg_entry,
                 }
             }
-            "rend" => ExecEvent::ResyncEnd,
-            "ord" => ExecEvent::Order(OrderUpdate {
-                cid: f.opt("cid").map(|c| scope.client_order_id(c)),
-                vid: f.opt("vid").map(|v| scope.venue_order_id(v)).transpose()?,
-                inst: f.inst(specs)?,
-                side: f.side()?,
-                state: match f.opt("state") {
-                    None => VenueOrderState::Open,
-                    Some("amended") => VenueOrderState::Amended {
-                        new_vid: f
-                            .opt("newvid")
-                            .map(|v| scope.venue_order_id(v))
-                            .transpose()?,
-                    },
-                    Some(_) => return Err(DecodeError::Malformed("state")),
-                },
-                cum_filled: f.lots("cum")?,
-                px: f.opt_num("px")?.map(Ticks),
-                qty: f.opt_num("qty")?.and_then(Lots::new),
-                post_only: f.flag("po"),
-                reduce_only: f.flag("ro"),
-            }),
-            "mode" => ExecEvent::Mode {
-                scope: match f.opt("sym") {
-                    Some(_) => ModeScope::Instrument(f.inst(specs)?),
-                    None => ModeScope::Account,
-                },
-                mode: match f.get("m")? {
-                    "halted" => VenueMode::Halted,
-                    "cancel_only" => VenueMode::CancelOnly,
-                    _ => return Err(DecodeError::Malformed("mode")),
-                },
-            },
+            "bal" => {
+                let (equity, available) = (f.usdc("equity")?, f.usdc("avail")?);
+                ExecEvent::Balance { equity, available }
+            }
+            "fundpay" => {
+                let (inst, amount) = (f.inst(specs)?, f.usdc("amt")?);
+                ExecEvent::FundingPaid { inst, amount }
+            }
+            // Every field the caps promise is required: fill id, client id, liquidity, realized
+            // P&L and realized funding.
             "fill" => ExecEvent::Fill(FillEvent {
-                ident: {
-                    let vid = f.opt("vid").map(|v| scope.venue_order_id(v)).transpose()?;
-                    let cum_after = f.opt_num("cum")?.and_then(Lots::new);
-                    // Every toy fill carries a fill id (FillCaps::fill_id); one without is
-                    // malformed.
-                    FillIdent::Venue {
-                        fill: scope.fill_id(f.get("fid")?)?,
-                        vid,
-                        cum_after,
-                    }
+                ident: FillIdent::Venue {
+                    fill: scope.fill_id(f.get("fid")?)?,
+                    vid: Some(scope.venue_order_id(f.get("vid")?)?),
+                    cum_after: Some(f.lots("cum")?),
                 },
-                cid: f.opt("cid").map(|c| scope.client_order_id(c)),
+                cid: Some(scope.client_order_id(f.get("cid")?)),
                 inst: f.inst(specs)?,
                 side: f.side()?,
                 px: Ticks(f.num("px")?),
                 qty: f.lots("qty")?,
-                liquidity: match f.opt("liq") {
-                    Some("M") => Liquidity3::Maker,
-                    Some("T") => Liquidity3::Taker,
-                    _ => Liquidity3::Unknown,
+                liquidity: match f.get("liq")? {
+                    "M" => Liquidity3::Maker,
+                    "T" => Liquidity3::Taker,
+                    _ => return Err(DecodeError::Malformed("liq")),
                 },
                 fee: scope.fee(f.num("fee")?, usdc())?,
-                realized_pnl: f.opt_usdc("pnl")?,
-                realized_funding: f.opt_usdc("fund")?,
-                replay: f.flag("replay").unwrap_or(false),
+                realized_pnl: Some(f.usdc("pnl")?),
+                realized_funding: Some(f.usdc("fund")?),
+                replay: false,
             }),
-            "ack" => ExecEvent::Outcome {
-                rpc: RpcId(f.num("rpc")?),
-                item: Some(ItemRef {
-                    idx: f.num("i")?,
+            // A placement accepted: the venue's id for it, stated once on the item.
+            "ack" => {
+                let vid = Some(scope.venue_order_id(f.get("vid")?)?);
+                let item = Some(ItemRef {
+                    idx: 0,
                     cid: None,
-                    vid: Some(scope.venue_order_id(f.get("vid")?)?),
-                }),
-                outcome: SubmitOutcome::Accepted {
+                    vid,
+                });
+                let outcome = SubmitOutcome::Accepted {
                     ack: AckLevel::Final,
-                },
-            },
-            "rej" => ExecEvent::Outcome {
-                rpc: RpcId(f.num("rpc")?),
-                item: Some(ItemRef {
-                    idx: f.num("i")?,
-                    cid: None,
-                    vid: None,
-                }),
-                outcome: SubmitOutcome::Rejected(Reject {
-                    kind: match f.get("code")? {
-                        "PO" => RejectKind::PostOnlyWouldCross,
-                        _ => RejectKind::Other,
-                    },
-                    venue_code: Some(f.get("code")?.into()),
-                    raw: Arc::from(line),
-                }),
-            },
+                };
+                let rpc = RpcId(f.num("rpc")?);
+                ExecEvent::Outcome { rpc, item, outcome }
+            }
             _ => return Err(DecodeError::Malformed("kind")),
-        };
-        Ok(Decoded {
-            meta,
-            event,
-            answers,
         })
-    }
-
-    /// Pushes a decoded event, letting go of the query it answers.
-    fn push(&mut self, sink: &mut dyn ExecSink, decoded: Decoded) {
-        if let Some(rpc) = decoded.answers {
-            self.queries.retain(|(id, _)| *id != rpc);
-        }
-        sink.push(decoded.meta, decoded.event);
-    }
-}
-
-/// One decoded exec line, not yet pushed.
-struct Decoded {
-    meta: VenueMeta,
-    event: ExecEvent,
-    /// The query this line answers, let go once it is pushed.
-    answers: Option<RpcId>,
-}
-
-/// Refuses a time in force or channel the toy's caps do not offer.
-fn offers(tif: TifTag, channel: Channel) -> Result<(), NotSentReason> {
-    let caps = toy_caps().order.expect("the toy takes orders");
-    if caps.tifs.contains(tif) && caps.channels.contains(channel) {
-        Ok(())
-    } else {
-        Err(NotSentReason::Unsupported)
-    }
-}
-
-fn side_code(side: Side) -> &'static str {
-    match side {
-        Side::Buy => "B",
-        Side::Sell => "S",
     }
 }
 
 impl ExecCodec for ToyExec {
-    fn nonces_for(&self, call: CtxCall) -> u16 {
-        match call {
-            // The hello frame carries one nonce; pings and the snapshot request carry none.
-            CtxCall::Open(_) => 1,
-            CtxCall::Timer(_) | CtxCall::Resync => 0,
-        }
+    fn nonces_for(&self, _call: CtxCall) -> u16 {
+        0
     }
 
     fn on_open(&mut self, stream: StreamId, ctx: &EncodeCtx, fx: &mut Effects) {
-        assert_eq!(stream, EXEC_STREAM);
-        let nonce = ctx
-            .nonce(0)
-            .expect("the runtime reserves the nonce nonces_for asks for");
-        let frame = format!("hello|ts={}|nonce={nonce}", ctx.wall.0);
-        ToyExec::send(fx, frame, None, TrafficClass::Safety);
-        fx.push(Effect::Timer {
-            tag: PING_TAG,
-            after: PING_EVERY,
-        });
+        let hello = format!("hello|ts={}", ctx.wall.0);
+        fx.push(send(stream, &hello, None, TrafficClass::Safety));
     }
 
+    /// Encodes a limit order, its time and nonce from `ctx` alone; the toy offers nothing else.
     fn encode(
         &mut self,
         cmd: &VenueCommand,
@@ -874,95 +402,31 @@ impl ExecCodec for ToyExec {
         ctx: &EncodeCtx,
         fx: &mut Effects,
     ) -> Result<EncodeReceipt, NotSentReason> {
-        let mut receipt = EncodeReceipt::new();
-        let frame = match cmd {
-            VenueCommand::Place(o) => self.place_frame(o, 0, specs, ctx, &mut receipt)?,
-            VenueCommand::PlaceBatch(orders) => {
-                // No more items than the caps declare (OrderCaps::batch_place).
-                if orders.len() > usize::from(MAX_BATCH) {
-                    return Err(NotSentReason::Unsupported);
-                }
-                let mut frames = Vec::new();
-                for (idx, o) in (0u16..).zip(orders) {
-                    frames.push(self.place_frame(o, idx, specs, ctx, &mut receipt)?);
-                }
-                frames.join("\n")
-            }
-            VenueCommand::Amend(a) => {
-                let spec = specs.get(a.inst).ok_or(NotSentReason::Unencodable)?;
-                // The toy amends by venue id only: an amend naming none has no target.
-                let vid = a.target.venue().ok_or(NotSentReason::Unsupported)?;
-                offers(a.tif, a.channel)?;
-                let nonce = receipt
-                    .use_nonce(ctx, 0)
-                    .ok_or(NotSentReason::Unencodable)?;
-                // The toy's amend quantity is the remaining quantity (its caps say so).
-                let qty = a
-                    .wire_qty(AmendQty::Remaining)
-                    .ok_or(NotSentReason::Unencodable)?;
-                let wire = AmendWire {
-                    spec,
-                    target: AmendRef::Venue(vid),
-                    side: a.side,
-                    px: a.px,
-                    qty,
-                    tif: a.tif,
-                    channel: a.channel,
-                    post_only: a.post_only,
-                    reduce_only: a.reduce_only,
-                    wall: ctx.wall,
-                    nonce: Some(nonce),
-                };
-                let sig = self
-                    .signer
-                    .sign_amend(&wire)
-                    .map_err(|_| NotSentReason::SignFailed)?;
-                let frame = format!(
-                    "amend|vid={}|px={}|qty={}|ts={}|nonce={nonce}|sig={}",
-                    vid.as_str(),
-                    a.px.0,
-                    qty.get(),
-                    ctx.wall.0,
-                    hex(&sig)
-                );
-                frame
-            }
-            VenueCommand::Cancel(c) => {
-                let spec = specs.get(c.inst).ok_or(NotSentReason::Unencodable)?;
-                // The toy cancels by venue id only; the signer sees that reference alone.
-                let vid = c.target.venue().ok_or(NotSentReason::Unsupported)?;
-                let wire = CancelWire {
-                    spec,
-                    target: CancelRef::Venue(vid),
-                    side: c.side,
-                    wall: ctx.wall,
-                    nonce: None,
-                };
-                let sig = self
-                    .signer
-                    .sign_cancel(&wire)
-                    .map_err(|_| NotSentReason::SignFailed)?;
-                assert!(sig.is_none(), "the toy's cancels are unsigned");
-                format!("cancel|vid={}|ts={}", vid.as_str(), ctx.wall.0)
-            }
-            VenueCommand::Query(q) => {
-                let spec = specs.get(q.inst).ok_or(NotSentReason::Unencodable)?;
-                let by = match (q.target.venue(), q.placement_nonce) {
-                    (Some(vid), _) => format!("vid={}", vid.as_str()),
-                    (None, Some(nonce)) => format!("nonce={nonce}"),
-                    (None, None) => return Err(NotSentReason::Unsupported),
-                };
-                format!("query|sym={}|{by}", spec.venue_symbol.as_wire())
-            }
-            _ => return Err(NotSentReason::Unsupported),
+        let VenueCommand::Place(o) = cmd else {
+            return Err(NotSentReason::Unsupported);
         };
-        // The class has one source: the command's own rule.
-        let class = cmd.traffic_class();
-        ToyExec::send(fx, format!("rpc={}\n{frame}", rpc.0), Some(rpc), class);
-        // A query is remembered until answered or timed out: the answer names only the rpc.
-        if let VenueCommand::Query(q) = cmd {
-            self.queries.push((rpc, q.target.clone()));
+        let spec = specs.get(o.inst).ok_or(NotSentReason::Unencodable)?;
+        let caps = toy_caps().order.expect("the toy takes orders");
+        if !(caps.tifs.contains(o.tif) && caps.channels.contains(o.channel)) {
+            return Err(NotSentReason::Unsupported);
         }
+        let px = o.kind.limit_px().ok_or(NotSentReason::Unsupported)?;
+        let cid = encode_cid(&CID_FORMAT, o.cid).map_err(|_| NotSentReason::Unencodable)?;
+        let mut receipt = EncodeReceipt::new();
+        let nonce = receipt.use_nonce(ctx, 0);
+        let nonce = nonce.ok_or(NotSentReason::Unencodable)?;
+        let frame = format!(
+            "rpc={}\nplace|cid={cid}|sym={}|side={}|px={}|qty={}|po={}|ro={}|ts={}|nonce={nonce}",
+            rpc.0,
+            spec.venue_symbol.as_wire(),
+            if o.side == Side::Buy { "B" } else { "S" },
+            px.0,
+            o.qty.get(),
+            u8::from(o.post_only),
+            u8::from(o.reduce_only),
+            ctx.wall.0,
+        );
+        fx.push(send(EXEC_STREAM, &frame, Some(rpc), cmd.traffic_class()));
         Ok(receipt)
     }
 
@@ -975,101 +439,47 @@ impl ExecCodec for ToyExec {
         sink: &mut dyn ExecSink,
         _fx: &mut Effects,
     ) -> Result<(), DecodeError> {
-        let text = std::str::from_utf8(f.bytes()).map_err(|_| DecodeError::Malformed("utf-8"))?;
-        let decoded = self.decode_exec(text, scope, specs)?;
-        self.push(sink, decoded);
+        let lines: Vec<&str> = text(f)?.lines().collect();
+        let first = Frame::parse(lines.first().copied().unwrap_or(""))?;
+        let (meta, events) = match lines.len() {
+            _ if first.kind == "rbegin" => {
+                let events = ToyExec::resync_frame(&lines, scope, specs)?;
+                (VenueMeta::NONE, events)
+            }
+            1 => (first.meta()?, vec![ToyExec::event(&first, scope, specs)?]),
+            _ => return Err(DecodeError::Malformed("one record per frame")),
+        };
+        events.into_iter().for_each(|ev| sink.push(meta, ev));
         Ok(())
     }
 
     fn on_http(
         &mut self,
-        tag: HttpTag,
-        resp: Result<HttpResponse<'_>, HttpFailure>,
-        scope: &DecodeScope<'_>,
-        specs: &SpecTable,
-        sink: &mut dyn ExecSink,
-        fx: &mut Effects,
+        _tag: HttpTag,
+        _resp: Result<HttpResponse<'_>, HttpFailure>,
+        _scope: &DecodeScope<'_>,
+        _specs: &SpecTable,
+        _sink: &mut dyn ExecSink,
+        _fx: &mut Effects,
     ) -> Result<(), DecodeError> {
-        let resp = match resp {
-            Ok(resp) if tag == RESYNC_TAG && resp.status == 200 => resp,
-            // No snapshot came: ask again in a second.
-            Err(_) if tag == RESYNC_TAG => {
-                fx.push(Effect::Timer {
-                    tag: RESYNC_RETRY_TAG,
-                    after: Duration::from_secs(1),
-                });
-                return Ok(());
-            }
-            _ => return Err(DecodeError::Malformed("resync response")),
-        };
-        let body = std::str::from_utf8(resp.body).map_err(|_| DecodeError::Malformed("body"))?;
-        // Every line is decoded before the first push, so a bad one pushes nothing.
-        let lines = body
-            .lines()
-            .map(|line| self.decode_exec(line, scope, specs));
-        let decoded = lines.collect::<Result<Vec<_>, _>>()?;
-        decoded.into_iter().for_each(|d| self.push(sink, d));
-        Ok(())
+        Err(DecodeError::Malformed("the toy asks for no HTTP"))
     }
 
-    fn on_timer(&mut self, tag: TimerTag, ctx: &EncodeCtx, fx: &mut Effects) {
-        if tag == RESYNC_RETRY_TAG {
-            return self.resync(ctx, fx);
-        }
-        assert_eq!(tag, PING_TAG);
-        ToyExec::send(
-            fx,
-            format!("ping|ts={}", ctx.wall.0),
-            None,
-            TrafficClass::Safety,
-        );
-        fx.push(Effect::Timer {
-            tag: PING_TAG,
-            after: PING_EVERY,
-        });
-    }
+    fn on_timer(&mut self, _tag: TimerTag, _ctx: &EncodeCtx, _fx: &mut Effects) {}
 
     fn on_rpc_timeout(&mut self, rpc: RpcId, sink: &mut dyn ExecSink) {
-        // A query that timed out takes no late answer.
-        self.queries.retain(|(id, _)| *id != rpc);
-        let outcome = SubmitOutcome::Unknown;
-        let item = None;
+        let (item, outcome) = (None, SubmitOutcome::Unknown);
         sink.push(VenueMeta::NONE, ExecEvent::Outcome { rpc, item, outcome });
     }
 
     fn resync(&mut self, ctx: &EncodeCtx, fx: &mut Effects) {
-        fx.push(Effect::Http {
-            tag: RESYNC_TAG,
-            req: HttpRequest {
-                method: HttpMethod::Get,
-                url: WireUrl::plain(format!("{}/snapshot?at={}", self.url, ctx.wall.0)),
-                headers: vec![Header {
-                    name: "Accept",
-                    value: "text/plain".to_owned(),
-                    redact: false,
-                }],
-                body: WireSlice::plain(Vec::new()),
-            },
-            rpc: None,
-            timeout: RPC_TIMEOUT,
-            class: TrafficClass::Safety,
-        });
+        let request = format!("snapshot|ts={}", ctx.wall.0);
+        fx.push(send(EXEC_STREAM, &request, None, TrafficClass::Safety));
     }
 }
 
-/// The toy venue's factory.
+/// The toy venue's factory. The toy reads no configuration.
 struct ToyFactory;
-
-static SCHEMA: [FieldSpec; 1] = [FieldSpec {
-    key: URL_KEY,
-    scope: ConfigScope::Account,
-    unit: FieldUnit::Dimensionless,
-    doc: "Base URL of the toy venue.",
-}];
-
-fn url(cfg: &VenueConfig) -> Result<&str, ConfigError> {
-    cfg.get(URL_KEY).ok_or(ConfigError::Missing(URL_KEY))
-}
 
 impl VenueFactory for ToyFactory {
     fn id(&self) -> &'static str {
@@ -1077,83 +487,50 @@ impl VenueFactory for ToyFactory {
     }
 
     fn config_schema(&self) -> &'static [FieldSpec] {
-        &SCHEMA
+        &[]
     }
 
-    fn caps(&self, cfg: &VenueConfig) -> Result<VenueCaps, ConfigError> {
-        url(cfg)?;
+    fn caps(&self, _cfg: &VenueConfig) -> Result<VenueCaps, ConfigError> {
         Ok(toy_caps())
     }
 
     fn plan_md(
         &self,
-        cfg: &VenueConfig,
+        _cfg: &VenueConfig,
         specs: &SpecTable,
         subs: &BTreeSet<Subscription>,
     ) -> Result<Vec<EndpointPlan>, VenueError> {
-        let base = url(cfg)?;
-        let mut symbols = BTreeSet::new();
-        for sub in subs {
-            offered(*sub)?;
-            symbols.insert(symbol_of(specs, sub.inst)?);
+        subs.iter()
+            .try_for_each(|sub| spell(specs, *sub).map(drop))?;
+        if subs.is_empty() {
+            return Ok(Vec::new());
         }
-        // Stats are REST-only (MdCaps::stats is Poll): they go on a connectionless endpoint.
-        let (polled, streamed): (Vec<Subscription>, Vec<Subscription>) =
-            subs.iter().partition(|s| s.feed == Feed::Stats);
-        let symbols: Vec<&str> = symbols.into_iter().collect();
-        let mut url = format!("{base}/md");
-        if !symbols.is_empty() {
-            url = format!("{url}?symbols={}", symbols.join(","));
-        }
-        // A socket only for streamed feeds: a plan of poll-only feeds opens none.
-        let mut plan = Vec::new();
-        if !streamed.is_empty() {
-            plan.push(EndpointPlan {
-                stream: StreamId(0),
-                transport: MdTransport::Socket {
-                    url: WireUrl::plain(url),
-                },
-                subs: streamed,
-            });
-        }
-        if !polled.is_empty() {
-            plan.push(EndpointPlan {
-                stream: POLL_STREAM,
-                transport: MdTransport::Poll {
-                    base_url: WireUrl::plain(base),
-                },
-                subs: polled,
-            });
-        }
-        Ok(plan)
-    }
-
-    fn plan_exec(&self, cfg: &VenueConfig) -> Result<Vec<ExecEndpoint>, VenueError> {
-        Ok(vec![ExecEndpoint {
-            stream: EXEC_STREAM,
-            url: WireUrl::plain(format!("{}/exec", url(cfg)?)),
+        let url = WireUrl::plain(MD_URL);
+        Ok(vec![EndpointPlan {
+            stream: MD_STREAM,
+            transport: MdTransport::Socket { url },
+            subs: subs.iter().copied().collect(),
         }])
     }
 
-    fn md_codec(&self, _cfg: &VenueConfig, ep: &EndpointPlan) -> Box<dyn MdCodec> {
-        match &ep.transport {
-            MdTransport::Socket { .. } => Box::new(ToyMd { pings: 0 }),
-            MdTransport::Poll { base_url } => Box::new(ToyPoll {
-                base_url: base_url.as_str().to_owned(),
-                symbols: BTreeSet::new(),
-            }),
-        }
+    fn md_codec(&self, _cfg: &VenueConfig, _ep: &EndpointPlan) -> Box<dyn MdCodec> {
+        Box::new(ToyMd)
     }
 
-    fn exec_codec(&self, cfg: &VenueConfig) -> Option<Result<Box<dyn ExecCodec>, VenueError>> {
-        Some(
-            url(cfg)
-                .map(|url| Box::new(ToyExec::new(url)) as Box<dyn ExecCodec>)
-                .map_err(VenueError::from),
-        )
+    fn plan_exec(&self, _cfg: &VenueConfig) -> Result<Vec<ExecEndpoint>, VenueError> {
+        let url = WireUrl::plain(EXEC_URL);
+        Ok(vec![ExecEndpoint {
+            stream: EXEC_STREAM,
+            url,
+        }])
+    }
+
+    fn exec_codec(&self, _cfg: &VenueConfig) -> Option<Result<Box<dyn ExecCodec>, VenueError>> {
+        Some(Ok(Box::new(ToyExec)))
     }
 }
 
+/// What the toy does, and nothing more.
 fn toy_caps() -> VenueCaps {
     VenueCaps {
         order: Some(OrderCaps {
@@ -1163,24 +540,12 @@ fn toy_caps() -> VenueCaps {
             post_only: true,
             reduce_only: true,
             flag_conflicts: vec![],
-            amend: Some(AmendCaps {
-                price: true,
-                qty: true,
-                flags: false,
-                when_partially_filled: true,
-                reject_keeps_original: true,
-                keeps_venue_id: true,
-                ack: AmendAck::ReplacedEvent,
-                qty_semantics: AmendQty::Remaining,
-                keeps_priority: None,
-            }),
-            cancel_refs: TagSet::of(&[RefKind::Venue]),
-            query_refs: TagSet::of(&[RefKind::Venue, RefKind::PlacementNonce]),
+            amend: None,
+            cancel_refs: TagSet::none(),
+            query_refs: TagSet::none(),
             cancel_before_ack: false,
             cancel_is_signed: false,
-            batch_place: Some(Batch {
-                max_items: MAX_BATCH,
-            }),
+            batch_place: None,
             batch_cancel: None,
             cancel_all_account: Support::Unsupported,
             cancel_all_instrument: Support::Unsupported,
@@ -1191,8 +556,8 @@ fn toy_caps() -> VenueCaps {
             nonce_scope: NonceScope::PerAccountMonotonic,
             ordering_key: OrderingKey::VenueSeq,
             snapshot_source: SnapshotSource::Trustworthy,
-            events_echo_flags: true,
-            sign_cost_hint_us: 1,
+            events_echo_flags: false,
+            sign_cost_hint_us: 0,
         }),
         fills: FillCaps {
             source: FillSource::Native,
@@ -1214,45 +579,23 @@ fn toy_caps() -> VenueCaps {
             touch_sources: vec![TouchSourceCaps {
                 channel: "touch",
                 cadence: Cadence::Realtime,
-                seq_domain: SeqDomain::SharedWithBook,
+                seq_domain: SeqDomain::Own,
                 ts_kind: ExchTsKind::MatchingEngine,
                 includes_channels: TagSet::of(&[Channel::Public]),
             }],
-            books: vec![
-                BookCaps {
-                    channel: "snap",
-                    max_depth: 1,
-                    cadence: Cadence::Realtime,
-                    continuity: Continuity::PlusOne,
-                    windowed: false,
-                    rest_anchor: false,
-                    includes_channels: TagSet::of(&[Channel::Public]),
-                    queue_model: QueueModelQuality::BracketOnly,
-                },
-                // A second, slower book channel (index 1) on the same connection.
-                BookCaps {
-                    channel: "snap_slow",
-                    max_depth: 1,
-                    cadence: Cadence::Pulsed(Duration::from_millis(100)),
-                    continuity: Continuity::PlusOne,
-                    windowed: false,
-                    rest_anchor: false,
-                    includes_channels: TagSet::of(&[Channel::Public]),
-                    queue_model: QueueModelQuality::BracketOnly,
-                },
-            ],
+            books: vec![],
             trades: TradeCaps {
-                source: FeedSource::Stream,
-                aggressor: true,
-                trade_id: true,
+                source: FeedSource::None,
+                aggressor: false,
+                trade_id: false,
             },
             funding: FundingCaps {
-                source: FeedSource::Stream,
-                interval_reported: true,
-                next_time_reported: true,
+                source: FeedSource::None,
+                interval_reported: false,
+                next_time_reported: false,
             },
-            stats: FeedSource::Poll,
-            mark: FeedSource::Stream,
+            stats: FeedSource::None,
+            mark: FeedSource::None,
             index: FeedSource::None,
             ts_precision: Duration::from_nanos(1),
             topology: ConnTopology::Shared {
@@ -1279,29 +622,23 @@ const STAMP: Stamp = Stamp {
 };
 
 /// A sink that stamps what a codec reports, as the runtime does.
-struct Collect<B> {
-    out: Vec<Envelope<B>>,
-}
+struct Collect<B>(Vec<Envelope<B>>);
 
 impl<B> Collect<B> {
-    fn new() -> Collect<B> {
-        Collect { out: Vec::new() }
-    }
-
     fn bodies(&self) -> Vec<&B> {
-        self.out.iter().map(|e| &e.body).collect()
+        self.0.iter().map(|e| &e.body).collect()
     }
 }
 
 impl MdSink for Collect<MdEvent> {
     fn push(&mut self, meta: VenueMeta, ev: MdEvent) {
-        self.out.push(Envelope::new(STAMP, meta, ev));
+        self.0.push(Envelope::new(STAMP, meta, ev));
     }
 }
 
 impl ExecSink for Collect<ExecEvent> {
     fn push(&mut self, meta: VenueMeta, ev: ExecEvent) {
-        self.out.push(Envelope::new(STAMP, meta, ev));
+        self.0.push(Envelope::new(STAMP, meta, ev));
     }
 }
 
@@ -1310,8 +647,9 @@ fn with_scope<R>(f: impl for<'s> FnOnce(&'s DecodeScope<'s>) -> R) -> R {
     dispatch(&CID_FORMAT, OWN_NS, FEE_SIGN, f)
 }
 
-fn toy_spec() -> InstrumentSpec {
-    InstrumentSpec {
+fn specs() -> SpecTable {
+    let mut table = SpecTable::new();
+    table.insert(InstrumentSpec {
         id: INST,
         venue: VenueId::new(9),
         venue_symbol: with_scope(|scope| scope.venue_symbol(SYMBOL)).unwrap(),
@@ -1335,73 +673,58 @@ fn toy_spec() -> InstrumentSpec {
         status: TradingStatus::Trading,
         version: 1,
         fetched_at: WallNs(0),
-    }
-}
-
-fn specs() -> SpecTable {
-    let mut table = SpecTable::new();
-    table.insert(toy_spec());
+    });
     table
 }
 
-fn config() -> VenueConfig {
-    let mut cfg = VenueConfig::new();
-    cfg.insert(URL_KEY, "https://toy.invalid");
-    cfg
-}
-
 fn exec_codec() -> Box<dyn ExecCodec> {
-    ToyFactory.exec_codec(&config()).unwrap().unwrap()
+    ToyFactory.exec_codec(&VenueConfig::new()).unwrap().unwrap()
 }
 
-/// Decodes `lines`, one frame each, through the toy's exec codec inside the decode scope.
-fn decode_exec(codec: &mut dyn ExecCodec, lines: &[&str]) -> Collect<ExecEvent> {
-    let (specs, mut sink, mut fx) = (specs(), Collect::new(), Effects::new());
-    with_scope(|scope| {
-        for line in lines {
-            let frame = RawFrame::Text(line);
-            let decoded = codec.on_frame(EXEC_STREAM, frame, scope, &specs, &mut sink, &mut fx);
-            decoded.unwrap();
-        }
+/// Decodes `frames` through `codec` inside the decode scope: each result and what was pushed.
+fn decode_exec(
+    codec: &mut dyn ExecCodec,
+    frames: &[&str],
+) -> (Vec<Result<(), DecodeError>>, Collect<ExecEvent>) {
+    let (specs, mut sink, mut fx) = (specs(), Collect(Vec::new()), Effects::new());
+    let results = with_scope(|scope| {
+        let mut decode = |f| codec.on_frame(EXEC_STREAM, f, scope, &specs, &mut sink, &mut fx);
+        frames.iter().map(|f| decode(RawFrame::Text(f))).collect()
     });
     assert!(fx.is_empty(), "decoding asked for effects: {fx:?}");
-    sink
+    (results, sink)
 }
 
-/// A directory for namespace leases, removed when dropped.
-struct LockDir(PathBuf);
-
-impl LockDir {
-    fn new() -> LockDir {
-        static N: AtomicU32 = AtomicU32::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("fbc-toy-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        LockDir(dir)
-    }
+/// Decodes `frames` through the market-data codec: each result and what was pushed.
+fn decode_md(frames: &[RawFrame<'_>]) -> (Vec<Result<(), DecodeError>>, Collect<MdEvent>) {
+    let (specs, mut sink, mut fx) = (specs(), Collect(Vec::new()), Effects::new());
+    let results = with_scope(|scope| {
+        let mut decode = |f| ToyMd.on_frame(f, scope, &specs, &mut sink, &mut fx);
+        frames.iter().map(|f| decode(*f)).collect()
+    });
+    assert!(fx.is_empty(), "decoding asked for effects: {fx:?}");
+    (results, sink)
 }
 
-impl Drop for LockDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
+/// A client id minted in the toy's namespace, under a lease in a fresh directory.
+fn mint() -> ClientOrderId {
+    static N: AtomicU32 = AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("fbc-toy-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let lease = NamespaceLease::acquire(&dir, fbc_core::AccountKey::new(1), OWN_NS).unwrap();
+    let cid = CidMint::new(lease, 0, 0, WallNs(1_759_363_200_000_000_000)).mint();
+    let _ = std::fs::remove_dir_all(&dir);
+    cid.unwrap()
 }
 
-/// `n` client ids minted in the toy's namespace.
-fn mint(n: usize) -> Vec<ClientOrderId> {
-    let dir = LockDir::new();
-    let lease = NamespaceLease::acquire(&dir.0, fbc_core::AccountKey::new(1), OWN_NS).unwrap();
-    let mut mint = CidMint::new(lease, 0, 0, WallNs(1_759_363_200_000_000_000));
-    (0..n).map(|_| mint.mint().unwrap()).collect()
-}
-
-fn order(cid: ClientOrderId, px: i64) -> NewOrder {
+fn order(cid: ClientOrderId) -> NewOrder {
     NewOrder {
         cid,
         inst: INST,
         side: Side::Buy,
         qty: Lots::new(25).unwrap(),
-        kind: OrderKind::Limit { px: Ticks(px) },
+        kind: OrderKind::Limit { px: Ticks(130_865) },
         tif: TifTag::Gtc,
         channel: Channel::Public,
         post_only: true,
@@ -1410,21 +733,30 @@ fn order(cid: ClientOrderId, px: i64) -> NewOrder {
     }
 }
 
-fn ctx(wall: i64, first_nonce: u64, len: u16) -> EncodeCtx {
-    EncodeCtx {
-        wall: WallNs(wall),
-        mono: MonoNs(77),
-        nonces: NonceBlock::consecutive(first_nonce, len).unwrap(),
-    }
+fn ctx(wall: i64, nonces: &[u64]) -> EncodeCtx {
+    let (wall, mono) = (WallNs(wall), MonoNs(77));
+    let nonces = NonceBlock::new(nonces.to_vec());
+    EncodeCtx { wall, mono, nonces }
 }
 
-/// Encodes `cmd` and returns the bytes of its one frame.
-fn encode_once(codec: &mut dyn ExecCodec, cmd: &VenueCommand, ctx: &EncodeCtx) -> Vec<u8> {
+/// Encodes `cmd` as request 11 with a fresh codec: the receipt and the effects asked for, or
+/// why it was not sent (and then nothing was asked for).
+fn encode(
+    cmd: &VenueCommand,
+    ctx: &EncodeCtx,
+) -> Result<(EncodeReceipt, Vec<Effect>), NotSentReason> {
     let mut fx = Effects::new();
-    codec
-        .encode(cmd, RpcId(11), &specs(), ctx, &mut fx)
-        .unwrap();
-    match fx.take().as_slice() {
+    let receipt = exec_codec().encode(cmd, RpcId(11), &specs(), ctx, &mut fx);
+    assert!(
+        receipt.is_ok() || fx.is_empty(),
+        "a command not sent pushed {fx:?}"
+    );
+    Ok((receipt?, fx.take()))
+}
+
+/// The bytes of the one frame `cmd` encodes to under `ctx`.
+fn bytes(cmd: &VenueCommand, ctx: &EncodeCtx) -> Vec<u8> {
+    match encode(cmd, ctx).unwrap().1.as_slice() {
         [Effect::Send { frame, .. }] => frame.bytes().to_vec(),
         other => panic!("expected one frame, got {other:?}"),
     }
@@ -1436,48 +768,56 @@ fn encode_once(codec: &mut dyn ExecCodec, cmd: &VenueCommand, ctx: &EncodeCtx) -
 
 #[test]
 fn the_toy_decodes_account_events_a_full_resync_and_a_fill_into_their_exec_events() {
-    let [cid] = mint(1).try_into().unwrap();
+    let cid = mint();
     let wire_cid = encode_cid(&CID_FORMAT, cid).unwrap();
-    let mut codec = exec_codec();
+    let resync = format!(
+        "rbegin|wm=1759363200050000000\n\
+         rorder|sym=TOY-PERP|vid=V-1|cid={wire_cid}|side=B|px=130865|qty=25|cum=5\n\
+         rpos|sym=TOY-PERP|qty=-25|avg=65432.125\n\
+         rend"
+    );
+    let fill = format!(
+        "fill|ts=1759363200200000000|seq=4|sym=TOY-PERP|fid=F-9|vid=V-1|cid={wire_cid}\
+         |side=B|px=130865|qty=3|cum=8|liq=M|fee=150|pnl=2500000|fund=-30000"
+    );
     let frames = [
-        "pos|ts=1759363200100000000|seq=1|sym=TOY-PERP|qty=-25|avg=65432.125".to_owned(),
-        "bal|ts=1759363200100000001|seq=2|equity=1250000000000|avail=900000000000".to_owned(),
-        "fundpay|ts=1759363200100000002|seq=3|sym=TOY-PERP|amt=-1250000".to_owned(),
-        "rbegin|wm=1759363200050000000".to_owned(),
-        format!("rorder|sym=TOY-PERP|vid=V-1|cid={wire_cid}|side=B|px=130865|qty=25|cum=5|po=1"),
-        "rpos|sym=TOY-PERP|qty=-25|avg=65432.125".to_owned(),
-        "rend".to_owned(),
-        format!(
-            "fill|ts=1759363200200000000|seq=4|sym=TOY-PERP|fid=F-9|vid=V-1|cid={wire_cid}\
-             |side=B|px=130865|qty=3|cum=8|liq=M|fee=150|pnl=2500000|fund=-30000"
-        ),
+        "pos|ts=1759363200100000000|seq=1|sym=TOY-PERP|qty=-25|avg=65432.125",
+        "bal|ts=1759363200100000001|seq=2|equity=1250000000000|avail=900000000000",
+        "fundpay|ts=1759363200100000002|seq=3|sym=TOY-PERP|amt=-1250000",
+        &resync,
+        &fill,
     ];
-    let lines: Vec<&str> = frames.iter().map(String::as_str).collect();
-    let sink = decode_exec(codec.as_mut(), &lines);
+    let (results, sink) = decode_exec(exec_codec().as_mut(), &frames);
+    assert!(results.iter().all(Result::is_ok), "{results:?}");
 
     let (vid, fid, fee) = with_scope(|scope| {
+        let vid = scope.venue_order_id("V-1").unwrap();
         (
-            scope.venue_order_id("V-1").unwrap(),
+            vid,
             scope.fill_id("F-9").unwrap(),
             scope.fee(150, usdc()).unwrap(),
         )
     });
     // The toy reports a 150-nano rebate as +150; the scope applied its declared sign.
     assert_eq!(fee.cost(), Money::new(-150, usdc()));
-    let avg = Some("65432.125".parse::<PxExact>().unwrap());
+    let (lots, money) = (|n| Lots::new(n).unwrap(), |n| Money::new(n, usdc()));
+    let (qty, avg_entry) = (
+        SignedLots(-25),
+        Some("65432.125".parse::<PxExact>().unwrap()),
+    );
     let expected = [
         ExecEvent::Position {
             inst: INST,
-            qty: SignedLots(-25),
-            avg_entry: avg,
+            qty,
+            avg_entry,
         },
         ExecEvent::Balance {
-            equity: Money::new(1_250_000_000_000, usdc()),
-            available: Money::new(900_000_000_000, usdc()),
+            equity: money(1_250_000_000_000),
+            available: money(900_000_000_000),
         },
         ExecEvent::FundingPaid {
             inst: INST,
-            amount: Money::new(-1_250_000, usdc()),
+            amount: money(-1_250_000),
         },
         ExecEvent::ResyncBegin {
             watermark: WallNs(1_759_363_200_050_000_000),
@@ -1489,32 +829,32 @@ fn the_toy_decodes_account_events_a_full_resync_and_a_fill_into_their_exec_event
             side: Side::Buy,
             state: VenueOrderState::Open,
             px: Some(Ticks(130_865)),
-            qty: Lots::new(25).unwrap(),
-            cum_filled: Lots::new(5).unwrap(),
-            post_only: Some(true),
+            qty: lots(25),
+            cum_filled: lots(5),
+            post_only: None,
             reduce_only: None,
         }),
         ExecEvent::ResyncPosition {
             inst: INST,
-            qty: SignedLots(-25),
-            avg_entry: avg,
+            qty,
+            avg_entry,
         },
         ExecEvent::ResyncEnd,
         ExecEvent::Fill(FillEvent {
             ident: FillIdent::Venue {
                 fill: fid,
                 vid: Some(vid),
-                cum_after: Some(Lots::new(8).unwrap()),
+                cum_after: Some(lots(8)),
             },
             cid: Some(CidMatch::Ours(cid)),
             inst: INST,
             side: Side::Buy,
             px: Ticks(130_865),
-            qty: Lots::new(3).unwrap(),
+            qty: lots(3),
             liquidity: Liquidity3::Maker,
             fee,
-            realized_pnl: Some(Money::new(2_500_000, usdc())),
-            realized_funding: Some(Money::new(-30_000, usdc())),
+            realized_pnl: Some(money(2_500_000)),
+            realized_funding: Some(money(-30_000)),
             replay: false,
         }),
     ];
@@ -1522,1687 +862,252 @@ fn the_toy_decodes_account_events_a_full_resync_and_a_fill_into_their_exec_event
 
     // Every envelope carries the runtime's stamp; the venue's time and sequence are kept as
     // sent, and a frame without them gets none (exchange time is never synthesized).
-    assert!(sink.out.iter().all(|e| e.stamp == STAMP));
-    let fill = sink.out.last().unwrap();
-    assert_eq!(fill.exch_ts, Some(ExchNs(1_759_363_200_200_000_000)));
-    assert_eq!(fill.exch_ts_kind, ExchTsKind::MatchingEngine);
-    assert_eq!(fill.venue_seq, Some(4));
-    assert_eq!(sink.out[3].meta(), VenueMeta::NONE);
+    assert!(sink.0.iter().all(|e| e.stamp == STAMP));
+    let fill = sink.0.last().unwrap();
+    let meta = (fill.exch_ts, fill.exch_ts_kind, fill.venue_seq);
+    let ts = Some(ExchNs(1_759_363_200_200_000_000));
+    assert_eq!(meta, (ts, ExchTsKind::MatchingEngine, Some(4)));
+    assert_eq!(sink.0[3].meta(), VenueMeta::NONE);
 }
 
 #[test]
 fn encoding_the_same_command_with_the_same_encode_ctx_twice_gives_identical_bytes() {
-    let [a, b] = mint(2).try_into().unwrap();
-    let place = VenueCommand::Place(order(a, 130_865));
-    let batch = VenueCommand::PlaceBatch(vec![order(a, 130_865), order(b, 130_864)]);
-    let ctx = ctx(1_759_363_200_300_000_000, 9_000, 2);
-    for cmd in [&place, &batch] {
-        let mut codec = exec_codec();
-        let first = encode_once(codec.as_mut(), cmd, &ctx);
-        // The same codec again, and a fresh one: codec state does not leak into the bytes.
-        assert_eq!(encode_once(codec.as_mut(), cmd, &ctx), first);
-        assert_eq!(encode_once(exec_codec().as_mut(), cmd, &ctx), first);
-    }
+    let cmd = VenueCommand::Place(order(mint()));
+    let at = ctx(1_759_363_200_300_000_000, &[9_000]);
+    let mut codec = exec_codec();
+    let twice = [0, 1].map(|_| {
+        let mut fx = Effects::new();
+        codec
+            .encode(&cmd, RpcId(11), &specs(), &at, &mut fx)
+            .unwrap();
+        fx.take()
+    });
+    // The same codec twice, and a fresh one: codec state does not leak into the bytes.
+    assert_eq!(twice[0], twice[1]);
+    assert_eq!(twice[0], encode(&cmd, &at).unwrap().1);
 }
 
 #[test]
 fn encode_takes_time_and_nonces_only_from_the_encode_ctx() {
-    let [a, b] = mint(2).try_into().unwrap();
-    let place = VenueCommand::Place(order(a, 130_865));
-    let at = ctx(1_759_363_200_300_000_000, 9_000, 1);
-    let text = String::from_utf8(encode_once(exec_codec().as_mut(), &place, &at)).unwrap();
-    let wire_cid = encode_cid(&CID_FORMAT, a).unwrap();
-    assert!(
-        text.starts_with(&format!(
-            "rpc=11\nplace|i=0|cid={wire_cid}|sym=TOY-PERP|side=B|px=130865|qty=25|tif=Gtc|po=1\
-             |ro=0|ts=1759363200300000000|nonce=9000|sig="
-        )),
-        "{text}"
+    let cid = mint();
+    let cmd = VenueCommand::Place(order(cid));
+    let at = ctx(1_759_363_200_300_000_000, &[9_000]);
+    let (receipt, effects) = encode(&cmd, &at).unwrap();
+    let wire_cid = encode_cid(&CID_FORMAT, cid).unwrap();
+    let frame = format!(
+        "rpc=11\nplace|cid={wire_cid}|sym=TOY-PERP|side=B|px=130865|qty=25|po=1|ro=0\
+         |ts=1759363200300000000|nonce=9000"
     );
+    // One frame with its deadline and its command's traffic class; the receipt names the
+    // nonce the context reserved, for the OMS to keep.
+    let rpc = Some(RpcId(11));
+    assert_eq!(
+        effects,
+        [send(EXEC_STREAM, &frame, rpc, TrafficClass::Normal)]
+    );
+    assert_eq!(receipt.nonces(), [(0, 9_000)]);
 
     // Another wall time or nonce changes the bytes; another monotonic time does not, since
     // nothing in the payload is a monotonic instant.
-    let mut codec = exec_codec();
-    let bytes = encode_once(codec.as_mut(), &place, &at);
-    let later = EncodeCtx {
-        wall: WallNs(at.wall.0 + 1),
-        ..at.clone()
-    };
-    let next_nonce = ctx(at.wall.0, 9_001, 1);
+    let same = bytes(&cmd, &at);
+    assert_ne!(bytes(&cmd, &ctx(at.wall.0 + 1, &[9_000])), same);
+    assert_ne!(bytes(&cmd, &ctx(at.wall.0, &[9_001])), same);
     let other_mono = EncodeCtx {
         mono: MonoNs(1),
-        ..at
+        ..at.clone()
     };
-    assert_ne!(encode_once(codec.as_mut(), &place, &later), bytes);
-    assert_ne!(encode_once(codec.as_mut(), &place, &next_nonce), bytes);
-    assert_eq!(encode_once(codec.as_mut(), &place, &other_mono), bytes);
+    assert_eq!(bytes(&cmd, &other_mono), same);
 
-    // A batch takes one nonce per item from the block, and the receipt reports each.
-    let batch = VenueCommand::PlaceBatch(vec![order(a, 130_865), order(b, 130_864)]);
-    assert_eq!(batch.items(), Some(2));
-    let mut fx = Effects::new();
-    let receipt = codec
-        .encode(&batch, RpcId(12), &specs(), &ctx(5, 700, 2), &mut fx)
-        .unwrap();
-    assert_eq!(receipt.nonces(), [(0, 700), (1, 701)]);
-    let [
-        Effect::Send {
-            frame,
-            rpc,
-            class,
-            stream,
-        },
-    ] = fx.as_slice()
-    else {
-        panic!("expected one frame: {fx:?}");
-    };
-    // An RPC frame always carries its deadline.
-    let call = RpcCall {
-        id: RpcId(12),
-        timeout: RPC_TIMEOUT,
-    };
-    assert_eq!(
-        (*stream, *rpc, *class),
-        (EXEC_STREAM, Some(call), TrafficClass::Normal)
-    );
-    assert!(frame.redactions().is_empty());
-
-    // A batch of reducing orders only is safety traffic, like a single reducing order; a batch
-    // that mixes in a non-reducing order is normal traffic (TrafficClass).
-    let reducing = |cid, px| NewOrder {
-        reduce_only: true,
-        ..order(cid, px)
-    };
-    let class_of = |cmd: &VenueCommand| {
-        let mut fx = Effects::new();
-        exec_codec()
-            .encode(cmd, RpcId(12), &specs(), &ctx(5, 700, 2), &mut fx)
-            .unwrap();
-        match fx.as_slice() {
-            [Effect::Send { class, .. }] => *class,
-            other => panic!("{other:?}"),
-        }
-    };
-    let all_reducing = VenueCommand::PlaceBatch(vec![reducing(a, 130_866), reducing(b, 130_867)]);
-    let mixed = VenueCommand::PlaceBatch(vec![reducing(a, 130_866), order(b, 130_864)]);
-    assert_eq!(class_of(&all_reducing), TrafficClass::Safety);
-    assert_eq!(class_of(&mixed), TrafficClass::Normal);
-
-    // Nonces need not be consecutive (a venue whose NonceScope is Random): each item takes the
-    // value reserved for it, whatever the others are.
-    let random = EncodeCtx {
-        nonces: NonceBlock::new(vec![0x9e37_79b9_7f4a_7c15, 13]),
-        ..ctx(5, 0, 0)
-    };
-    let mut fx = Effects::new();
-    let receipt = codec
-        .encode(&batch, RpcId(12), &specs(), &random, &mut fx)
-        .unwrap();
-    assert_eq!(receipt.nonces(), [(0, 0x9e37_79b9_7f4a_7c15), (1, 13)]);
-
-    // Without enough nonces in the context the command is not sent, and nothing is pushed.
-    let mut fx = Effects::new();
-    let short = codec.encode(&batch, RpcId(13), &specs(), &ctx(5, 700, 1), &mut fx);
-    assert_eq!(short, Err(NotSentReason::Unencodable));
-    assert!(fx.is_empty());
+    // Without the nonce in the context the command is not sent, nor is a command or a time in
+    // force the toy does not offer; nothing is pushed for any of them.
+    let ioc = VenueCommand::Place(NewOrder {
+        tif: TifTag::Ioc,
+        ..order(cid)
+    });
+    let unsupported = Some(NotSentReason::Unsupported);
+    let unencodable = Some(NotSentReason::Unencodable);
+    assert_eq!(encode(&cmd, &ctx(1, &[])).err(), unencodable);
+    assert_eq!(encode(&ioc, &at).err(), unsupported);
+    assert_eq!(encode(&VenueCommand::FeeQuery, &at).err(), unsupported);
 }
 
 // ---------------------------------------------------------------------------------------------
-// The rest of the boundary.
+// The rest of the boundary the toy uses.
 // ---------------------------------------------------------------------------------------------
 
 #[test]
 fn the_toy_decodes_market_data_frames_into_md_events() {
-    let mut codec = ToyFactory.md_codec(
-        &config(),
-        &ToyFactory
-            .plan_md(
-                &config(),
-                &specs(),
-                &[Subscription {
-                    inst: INST,
-                    feed: Feed::Trades,
-                }]
-                .into_iter()
-                .collect(),
-            )
-            .unwrap()[0],
-    );
-    let (specs, mut sink, mut fx) = (specs(), Collect::new(), Effects::new());
-    let lines = [
-        "touch|ts=10|seq=5|sym=TOY-PERP|bid=130865x12|ask=130866x7",
-        "touch|ts=11|seq=6|sym=TOY-PERP|ask=130866x7",
-        "trade|ts=12|sym=TOY-PERP|id=99|aggr=S|px=130865|qty=4",
-        "funding|ts=13|sym=TOY-PERP|rate=125000|every=3600|next=1759366800000000000",
-        "mark|sym=TOY-PERP|px=65432.123456789",
-        "gap|sym=TOY-PERP|feed=book",
-        "gap|sym=TOY-PERP|feed=trades",
-        "snap|seq=7|sym=TOY-PERP|epoch=3|b=130865x12|a=130866x7",
-    ];
-    with_scope(|scope| {
-        for line in lines {
-            codec
-                .on_frame(RawFrame::Text(line), scope, &specs, &mut sink, &mut fx)
-                .unwrap();
-        }
-        // The socket codec asks for no HTTP, so a response that reaches it is refused.
-        let lost = codec.on_http(
-            HttpTag(9),
-            Err(HttpFailure::Lost),
-            scope,
-            &specs,
-            &mut sink,
-            &mut fx,
-        );
-        assert!(lost.is_err());
-        // A frame naming an instrument the table lacks, or no kind, is refused.
-        let unknown = RawFrame::Text("touch|sym=NOPE-PERP");
-        let refused = codec.on_frame(unknown, scope, &specs, &mut sink, &mut fx);
-        assert_eq!(refused, Err(DecodeError::UnknownInstrument));
-        let binary = RawFrame::Binary(b"\x00\x01");
-        let refused = codec.on_frame(binary, scope, &specs, &mut sink, &mut fx);
-        assert_eq!(refused, Err(DecodeError::Malformed("binary frame")));
-    });
-    assert!(fx.is_empty());
+    let (results, sink) = decode_md(&[
+        RawFrame::Text("touch|ts=10|seq=5|sym=TOY-PERP|bid=130865x12|ask=130866x7"),
+        RawFrame::Text("touch|sym=TOY-PERP|ask=130866x7"),
+        // Refused, pushing nothing: a bad level, an unknown instrument or kind, binary.
+        RawFrame::Text("touch|sym=TOY-PERP|bid=130865x12|ask=130866x-7"),
+        RawFrame::Text("touch|sym=NOPE-PERP"),
+        RawFrame::Text("trade|sym=TOY-PERP"),
+        RawFrame::Binary(b"\x00"),
+    ]);
+    let ok = results.iter().map(Result::is_ok);
+    assert_eq!(Vec::from_iter(ok), [true, true, false, false, false, false]);
     let lvl = |px, qty| Lvl {
         px: Ticks(px),
         qty: Lots::new(qty).unwrap(),
     };
-    let expected = vec![
+    let (bid, ask) = (Some(lvl(130_865, 12)), Some(lvl(130_866, 7)));
+    let (inst, source) = (INST, TouchSourceId(0));
+    let expected = [
         MdEvent::Touch {
-            inst: INST,
-            bid: Some(lvl(130_865, 12)),
-            ask: Some(lvl(130_866, 7)),
-            source: TouchSourceId(0),
+            inst,
+            bid,
+            ask,
+            source,
         },
         MdEvent::Touch {
-            inst: INST,
+            inst,
             bid: None,
-            ask: Some(lvl(130_866, 7)),
-            source: TouchSourceId(0),
-        },
-        MdEvent::Trade {
-            inst: INST,
-            id: Some(99),
-            aggressor: Aggressor::Seller,
-            px: Ticks(130_865),
-            qty: Lots::new(4).unwrap(),
-        },
-        MdEvent::Funding {
-            inst: INST,
-            rate_e12: 125_000,
-            interval: Some(Duration::from_secs(3_600)),
-            next: Some(WallNs(1_759_366_800_000_000_000)),
-        },
-        MdEvent::Mark {
-            inst: INST,
-            px: PxExact::new(65_432_123_456_789, -9),
-        },
-        // A gap names the feed it is on: the book is invalid, the trades are not.
-        MdEvent::Health {
-            inst: INST,
-            feed: Feed::Book(BookId(0)),
-            h: FeedHealth::Gap,
-        },
-        MdEvent::Health {
-            inst: INST,
-            feed: Feed::Trades,
-            h: FeedHealth::Gap,
-        },
-        MdEvent::BookSnapshotBegin {
-            inst: INST,
-            book: BookId(0),
-            epoch: 3,
-        },
-        MdEvent::Level {
-            inst: INST,
-            book: BookId(0),
-            side: BookSide::Bid,
-            px: Ticks(130_865),
-            qty: Lots::new(12).unwrap(),
-        },
-        MdEvent::Level {
-            inst: INST,
-            book: BookId(0),
-            side: BookSide::Ask,
-            px: Ticks(130_866),
-            qty: Lots::new(7).unwrap(),
-        },
-        MdEvent::BookSnapshotEnd {
-            inst: INST,
-            book: BookId(0),
+            ask,
+            source,
         },
     ];
     assert_eq!(sink.bodies(), expected.iter().collect::<Vec<_>>());
-    assert_eq!(sink.out[0].venue_seq, Some(5));
-    assert_eq!(sink.out[4].exch_ts, None);
+    let meta = [&sink.0[0], &sink.0[1]].map(|e| (e.exch_ts, e.venue_seq));
+    assert_eq!(meta, [(Some(ExchNs(10)), Some(5)), (None, None)]);
+}
+
+#[test]
+fn a_frame_that_fails_to_decode_pushes_nothing() {
+    // A resync without its end, with a bad record, or out of order; two records in one frame;
+    // a fill missing a field its caps promise (fill id, realized funding) or with a negative
+    // quantity. A resync that fails pushes no begin without an end.
+    let wire_cid = encode_cid(&CID_FORMAT, mint()).unwrap();
+    let full = format!(
+        "fill|sym=TOY-PERP|fid=F-1|vid=V-1|cid={wire_cid}|side=B|px=1|qty=3|cum=3|liq=M|fee=1\
+         |pnl=0|fund=0"
+    );
+    let without = |key: &str| {
+        let kept: Vec<&str> = full.split('|').filter(|kv| !kv.starts_with(key)).collect();
+        kept.join("|")
+    };
+    let bad = [
+        "rbegin|wm=900\nrpos|sym=TOY-PERP|qty=0".to_owned(),
+        "rbegin|wm=900\nrpos|sym=NOPE-PERP|qty=0\nrend".to_owned(),
+        "rbegin|wm=900\nrend\nrpos|sym=TOY-PERP|qty=0".to_owned(),
+        "pos|sym=TOY-PERP|qty=0\nbal|equity=1|avail=1".to_owned(),
+        without("fid="),
+        without("fund="),
+        full.replace("qty=3", "qty=-3"),
+    ];
+    let bad: Vec<&str> = bad.iter().map(String::as_str).collect();
+    let (results, sink) = decode_exec(exec_codec().as_mut(), &bad);
+    assert!(results.iter().all(Result::is_err), "{results:?}");
+    assert!(sink.0.is_empty());
+    // The full fill decodes, so each refusal above is the one field it changed.
+    assert_eq!(decode_exec(exec_codec().as_mut(), &[&full]).0, [Ok(())]);
 }
 
 #[test]
 fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
-    let factory: &dyn VenueFactory = &ToyFactory;
+    let (factory, cfg): (&dyn VenueFactory, _) = (&ToyFactory, VenueConfig::new());
     assert_eq!(factory.id(), "TOY");
-    assert_eq!(factory.config_schema()[0].key, URL_KEY);
-    assert_eq!(factory.caps(&config()), Ok(toy_caps()));
-    let empty = VenueConfig::new();
-    assert_eq!(factory.caps(&empty), Err(ConfigError::Missing(URL_KEY)));
-    let refused = factory.exec_codec(&empty).unwrap().err();
-    assert_eq!(
-        refused,
-        Some(VenueError::Config(ConfigError::Missing(URL_KEY)))
-    );
+    assert!(factory.config_schema().is_empty());
+    assert_eq!(factory.caps(&cfg), Ok(toy_caps()));
 
-    let subs: BTreeSet<Subscription> = [Feed::Book(BookId(0)), Feed::Touch(TouchSourceId(0))]
-        .into_iter()
-        .map(|feed| Subscription { inst: INST, feed })
-        .collect();
-    // Planning and subscribing see the spec table, so the venue's own symbol goes on the wire
-    // (in the URL and in the subscription frames), not the library's instrument id.
-    let plan = factory.plan_md(&config(), &specs(), &subs).unwrap();
-    assert_eq!(plan.len(), 1);
+    // Planning and subscribing see the spec table, so the venue's own symbol goes on the wire.
+    let touch = Subscription {
+        inst: INST,
+        feed: Feed::Touch(TouchSourceId(0)),
+    };
+    let plan = factory
+        .plan_md(&cfg, &specs(), &BTreeSet::from([touch]))
+        .unwrap();
+    let url = WireUrl::plain(MD_URL);
     assert_eq!(
-        plan[0].transport,
-        MdTransport::Socket {
-            url: WireUrl::plain("https://toy.invalid/md?symbols=TOY-PERP")
-        }
+        (plan.len(), plan[0].stream, &plan[0].subs),
+        (1, MD_STREAM, &vec![touch])
     );
-    let mut md = factory.md_codec(&config(), &plan[0]);
+    assert_eq!(plan[0].transport, MdTransport::Socket { url });
+    let none = factory.plan_md(&cfg, &specs(), &BTreeSet::new());
+    assert_eq!(none, Ok(vec![]));
+    let mut md = factory.md_codec(&cfg, &plan[0]);
     let mut fx = Effects::new();
     md.on_open(&mut fx);
-    md.subscribe(&plan[0].subs, &[], &specs(), &mut fx).unwrap();
-    md.on_timer(PING_TAG, MonoNs(5), WallNs(6), &mut fx);
-    let sent: Vec<&[u8]> = fx
-        .as_slice()
-        .iter()
-        .filter_map(|e| match e {
-            Effect::Send { frame, .. } => Some(frame.bytes()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        sent,
-        [
-            b"sub|sym=TOY-PERP|feed=Touch(TouchSourceId(0))".as_slice(),
-            b"sub|sym=TOY-PERP|feed=Book(BookId(0))",
-            b"ping|n=1|at=6"
-        ]
-    );
-    assert!(matches!(
-        fx.as_slice()[0],
-        Effect::Timer { tag: PING_TAG, .. }
-    ));
-    assert_eq!(md.keepalive().map(|k| k.kind), Some(KeepaliveKind::WsPing));
-
-    // An instrument missing from the spec table cannot be spelled: planning and subscribing
-    // refuse it by id, and subscribing pushes nothing, not even for the instruments it knows.
-    let stranger = Subscription {
-        inst: InstrumentId::new(99),
-        feed: Feed::Trades,
-    };
-    let unknown = Err(VenueError::UnknownInstrument(InstrumentId::new(99)));
-    let mixed: BTreeSet<Subscription> = subs.iter().copied().chain([stranger]).collect();
-    assert_eq!(factory.plan_md(&config(), &specs(), &mixed), unknown);
-    let mut fx = Effects::new();
-    let refused = md.subscribe(&plan[0].subs, &[stranger], &specs(), &mut fx);
-    assert_eq!(
-        refused,
-        Err(VenueError::UnknownInstrument(InstrumentId::new(99)))
-    );
-    assert!(fx.is_empty());
-
-    // The factory plans the order-entry connection the runtime opens before on_open, so the
-    // runtime needs no venue knowledge to reach order entry.
-    let exec_plan = factory.plan_exec(&config()).unwrap();
-    assert_eq!(
-        exec_plan,
-        [ExecEndpoint {
-            stream: EXEC_STREAM,
-            url: WireUrl::plain("https://toy.invalid/exec")
-        }]
-    );
-    assert_eq!(
-        factory.plan_exec(&empty),
-        Err(VenueError::Config(ConfigError::Missing(URL_KEY)))
-    );
-
-    // The client-id format has one source, the capabilities: the runtime decodes with it, and
-    // what the exec codec puts on the wire decodes under it as ours.
-    let format = factory.caps(&config()).unwrap().order.unwrap().client_id;
-    let [cid] = mint(1).try_into().unwrap();
-    let text = String::from_utf8(encode_once(
-        exec_codec().as_mut(),
-        &VenueCommand::Place(order(cid, 130_865)),
-        &ctx(1, 1, 1),
-    ))
-    .unwrap();
-    let wire = text
-        .split('|')
-        .find_map(|kv| kv.strip_prefix("cid="))
-        .unwrap();
-    assert_eq!(decode_cid(&format, OWN_NS, wire), CidMatch::Ours(cid));
-
-    // The exec codec opens, pings and resyncs by asking for effects (opening and each ping
-    // also arm the next ping), and decodes the resync response it asked for.
-    let mut exec = exec_codec();
-    let mut fx = Effects::new();
-    let at = ctx(1_000, 1, 1);
-    exec.on_open(EXEC_STREAM, &at, &mut fx);
-    exec.on_timer(PING_TAG, &at, &mut fx);
-    exec.resync(&at, &mut fx);
-    let effects = fx.take();
-    assert!(fx.is_empty());
-    assert_eq!(effects.len(), 5);
-    let Effect::Http {
-        tag, req, class, ..
-    } = &effects[4]
-    else {
-        panic!("expected the resync request: {effects:?}");
-    };
-    assert_eq!((*tag, *class), (RESYNC_TAG, TrafficClass::Safety));
-    assert_eq!(req.url, "https://toy.invalid/snapshot?at=1000");
-    let body = b"rbegin|wm=900\nrpos|sym=TOY-PERP|qty=0\nrend";
-    let resp = HttpResponse {
-        status: 200,
-        headers: &[],
-        body,
-    };
-    let (specs, mut sink) = (specs(), Collect::new());
-    with_scope(|scope| {
-        exec.on_http(RESYNC_TAG, Ok(resp), scope, &specs, &mut sink, &mut fx)
-            .unwrap();
+    md.subscribe(&[touch], &[touch], &specs(), &mut fx).unwrap();
+    let sent = ["sub", "unsub"].map(|verb| {
+        let frame = format!("{verb}|sym=TOY-PERP|feed=Touch(TouchSourceId(0))");
+        send(MD_STREAM, &frame, None, TrafficClass::Normal)
     });
-    assert_eq!(
-        sink.bodies(),
-        [
-            &ExecEvent::ResyncBegin {
-                watermark: WallNs(900)
-            },
-            &ExecEvent::ResyncPosition {
-                inst: INST,
-                qty: SignedLots(0),
-                avg_entry: None
-            },
-            &ExecEvent::ResyncEnd,
-        ]
-    );
+    assert_eq!(fx.take(), sent);
+    assert_eq!(md.keepalive(), None);
 
-    // A snapshot request that times out (or never went out) comes back to the codec, which
-    // asks for a retry; the retry timer requests the snapshot again. Nothing is decoded.
-    for failure in [
-        HttpFailure::TimedOut,
-        HttpFailure::NotSent,
-        HttpFailure::Lost,
-    ] {
-        let (mut sink, mut fx) = (Collect::new(), Effects::new());
-        with_scope(|scope| {
-            exec.on_http(RESYNC_TAG, Err(failure), scope, &specs, &mut sink, &mut fx)
-                .unwrap();
-        });
-        assert!(sink.out.is_empty());
-        assert_eq!(
-            fx.as_slice(),
-            [Effect::Timer {
-                tag: RESYNC_RETRY_TAG,
-                after: Duration::from_secs(1)
-            }]
-        );
-        exec.on_timer(RESYNC_RETRY_TAG, &ctx(2_000, 1, 1), &mut fx);
-        assert!(matches!(
-            &fx.as_slice()[1],
-            Effect::Http { tag: RESYNC_TAG, req, .. } if req.url.as_str().ends_with("at=2000")
-        ));
-    }
-}
-
-#[test]
-fn an_event_without_a_client_id_says_none_rather_than_unparseable() {
-    // A venue that does not echo client ids on events (OrderCaps::cid_echoed_on_events false)
-    // gives no client id: that is None, not Unparseable (a non-canonical id that was present).
-    let sink = decode_exec(
-        exec_codec().as_mut(),
-        &[
-            "fill|sym=TOY-PERP|fid=F-1|vid=V-1|side=S|px=130865|qty=1|fee=0",
-            "rorder|sym=TOY-PERP|vid=V-1|side=S|px=130865|qty=2|cum=1",
-            "fill|sym=TOY-PERP|fid=F-2|vid=V-1|cid=java-1759363200123|side=S|px=130865|qty=1|fee=0",
-        ],
-    );
-    let cids: Vec<Option<CidMatch>> = sink
-        .bodies()
-        .into_iter()
-        .map(|ev| match ev {
-            ExecEvent::Fill(fill) => fill.cid,
-            ExecEvent::ResyncOrder(order) => order.cid,
-            other => panic!("{other:?}"),
-        })
-        .collect();
-    assert_eq!(cids, [None, None, Some(CidMatch::Unparseable)]);
-}
-
-#[test]
-fn a_live_order_update_keeps_the_flags_the_venue_echoes() {
-    let [cid] = mint(1).try_into().unwrap();
-    let wire_cid = encode_cid(&CID_FORMAT, cid).unwrap();
-    let line =
-        format!("ord|sym=TOY-PERP|vid=V-1|cid={wire_cid}|side=B|px=130860|qty=25|cum=5|po=1|ro=0");
-    let sink = decode_exec(
-        exec_codec().as_mut(),
-        &[line.as_str(), "ord|sym=TOY-PERP|vid=V-1|side=B|cum=5"],
-    );
-    let vid = with_scope(|scope| scope.venue_order_id("V-1").unwrap());
-    let update = |cid, px, qty, post_only, reduce_only| {
-        ExecEvent::Order(OrderUpdate {
-            cid,
-            vid: Some(vid.clone()),
-            inst: INST,
-            side: Side::Buy,
-            state: VenueOrderState::Open,
-            cum_filled: Lots::new(5).unwrap(),
-            px,
-            qty,
-            post_only,
-            reduce_only,
-        })
-    };
-    assert_eq!(
-        sink.bodies(),
-        [
-            &update(
-                Some(CidMatch::Ours(cid)),
-                Some(Ticks(130_860)),
-                Lots::new(25),
-                Some(true),
-                Some(false)
-            ),
-            &update(None, None, None, None, None),
-        ]
-    );
-}
-
-#[test]
-fn a_venue_mode_names_the_market_it_applies_to_or_the_whole_account() {
-    let sink = decode_exec(
-        exec_codec().as_mut(),
-        &["mode|m=halted", "mode|sym=TOY-PERP|m=cancel_only"],
-    );
-    assert_eq!(
-        sink.bodies(),
-        [
-            &ExecEvent::Mode {
-                scope: ModeScope::Account,
-                mode: VenueMode::Halted,
-            },
-            &ExecEvent::Mode {
-                scope: ModeScope::Instrument(INST),
-                mode: VenueMode::CancelOnly,
-            },
-        ]
-    );
-}
-
-#[test]
-fn outcomes_amends_and_cancels_go_through_the_same_boundary() {
-    let [cid] = mint(1).try_into().unwrap();
-    let mut exec = exec_codec();
-
-    // An unanswered request is Unknown for every item; it is never resent.
-    let mut sink = Collect::new();
-    exec.on_rpc_timeout(RpcId(11), &mut sink);
-    assert_eq!(
-        sink.bodies(),
-        [&ExecEvent::Outcome {
-            rpc: RpcId(11),
-            item: None,
-            outcome: SubmitOutcome::Unknown
-        }]
-    );
-
-    // Per-item acks and rejects.
-    let sink = decode_exec(
-        exec.as_mut(),
-        &[
-            "ack|rpc=11|i=0|vid=V-1",
-            "rej|rpc=11|i=1|code=PO|msg=would cross",
-        ],
-    );
-    let vid = with_scope(|scope| scope.venue_order_id("V-1").unwrap());
-    let ExecEvent::Outcome { outcome, item, .. } = &sink.out[0].body else {
-        panic!("{:?}", sink.out[0]);
-    };
-    // The accepted order's venue id is stated once, on the item.
-    assert_eq!(
-        item.as_ref(),
-        Some(&ItemRef {
-            idx: 0,
-            cid: None,
-            vid: Some(vid.clone())
-        })
-    );
-    assert_eq!(
-        outcome,
-        &SubmitOutcome::Accepted {
-            ack: AckLevel::Final
-        }
-    );
-    let ExecEvent::Outcome {
-        outcome: SubmitOutcome::Rejected(reject),
-        ..
-    } = &sink.out[1].body
-    else {
-        panic!("{:?}", sink.out[1]);
-    };
-    assert_eq!(reject.kind, RejectKind::PostOnlyWouldCross);
-    assert_eq!(reject.venue_code.as_deref(), Some("PO"));
-
-    // An amend carries the full order and is signed over the venue id. The toy's wire takes
-    // the remaining quantity: a total of 25 with 5 filled goes out as 20, the resting quantity
-    // the OMS checked. An amend to the filled quantity is not sent. A cancel of a reducing
-    // kind is safety traffic.
-    let amend_to = |qty, cum_filled| {
-        VenueCommand::Amend(AmendOrder {
-            target: OrderRef::Both(cid, vid.clone()),
-            inst: INST,
-            side: Side::Buy,
-            tif: TifTag::Gtc,
-            channel: Channel::Public,
-            post_only: true,
-            reduce_only: false,
-            reducing: false,
-            px: Ticks(130_860),
-            qty: Lots::new(qty).unwrap(),
-            cum_filled: Lots::new(cum_filled).unwrap(),
-        })
-    };
-    let amend = amend_to(25, 5);
-    let text = String::from_utf8(encode_once(exec.as_mut(), &amend, &ctx(9, 4, 1))).unwrap();
-    assert!(
-        text.starts_with("rpc=11\namend|vid=V-1|px=130860|qty=20|ts=9|nonce=4|sig="),
-        "{text}"
-    );
-    let mut fx = Effects::new();
-    let filled = exec.encode(&amend_to(5, 5), RpcId(16), &specs(), &ctx(9, 4, 1), &mut fx);
-    assert_eq!(filled, Err(NotSentReason::Unencodable));
-    assert!(fx.is_empty());
-    let cancel = VenueCommand::Cancel(CancelOrder {
-        target: OrderRef::Venue(vid.clone()),
-        inst: INST,
-        side: Side::Buy,
-        placement_nonce: Some(4),
-    });
-    let mut fx = Effects::new();
-    let receipt = exec
-        .encode(&cancel, RpcId(14), &specs(), &ctx(9, 5, 1), &mut fx)
-        .unwrap();
-    assert!(receipt.nonces().is_empty());
-    let [Effect::Send { frame, class, .. }] = fx.as_slice() else {
-        panic!("{fx:?}");
-    };
-    assert_eq!(*class, TrafficClass::Safety);
-    assert_eq!(frame.bytes(), b"rpc=14\ncancel|vid=V-1|ts=9");
-
-    // A query for an order the venue never acknowledged (no venue id yet: the Unknown ladder)
-    // names it by the nonce it was placed with, which the command carries.
-    let query = VenueCommand::Query(QueryOrder {
-        target: OrderRef::Client(cid),
-        inst: INST,
-        placement_nonce: Some(4),
-    });
-    let text = String::from_utf8(encode_once(exec.as_mut(), &query, &ctx(9, 6, 1))).unwrap();
-    assert_eq!(text, "rpc=11\nquery|sym=TOY-PERP|nonce=4");
-    let by_vid = VenueCommand::Query(QueryOrder {
-        target: OrderRef::Both(cid, vid.clone()),
-        inst: INST,
-        placement_nonce: Some(4),
-    });
-    let text = String::from_utf8(encode_once(exec.as_mut(), &by_vid, &ctx(9, 6, 1))).unwrap();
-    assert_eq!(text, "rpc=11\nquery|sym=TOY-PERP|vid=V-1");
-    let neither = VenueCommand::Query(QueryOrder {
-        target: OrderRef::Client(cid),
-        inst: INST,
-        placement_nonce: None,
-    });
-    let mut fx = Effects::new();
-    let refused = exec.encode(&neither, RpcId(17), &specs(), &ctx(9, 6, 1), &mut fx);
-    assert_eq!(refused, Err(NotSentReason::Unsupported));
-    assert!(fx.is_empty());
-
-    // What the toy does not offer is not sent, with no effect pushed.
-    let mut fx = Effects::new();
-    let unsupported = exec.encode(
-        &VenueCommand::FeeQuery,
-        RpcId(15),
-        &specs(),
-        &ctx(9, 6, 1),
-        &mut fx,
-    );
-    assert_eq!(unsupported, Err(NotSentReason::Unsupported));
-    assert!(fx.is_empty());
-}
-
-#[test]
-fn the_toy_declares_the_query_references_its_codec_encodes() {
-    // The toy queries by venue id or, before an ack, by placement nonce: the caps say both, so
-    // the capability-driven Unknown ladder reaches the nonce query.
-    let caps = toy_caps().order.unwrap();
-    assert!(caps.query_refs.contains(RefKind::Venue));
-    assert!(caps.query_refs.contains(RefKind::PlacementNonce));
-    assert!(!caps.query_refs.contains(RefKind::Client));
-}
-
-#[test]
-fn planning_market_data_without_a_url_is_refused() {
-    let subs: BTreeSet<Subscription> = [Subscription {
-        inst: INST,
-        feed: Feed::Trades,
-    }]
-    .into_iter()
-    .collect();
-    let refused = Err(VenueError::Config(ConfigError::Missing(URL_KEY)));
-    for subs in [BTreeSet::new(), subs] {
-        assert_eq!(
-            ToyFactory.plan_md(&VenueConfig::new(), &specs(), &subs),
-            refused
-        );
-    }
-}
-
-#[test]
-fn an_amend_naming_the_order_only_by_client_id_is_not_sent() {
-    // The toy amends by venue id only (its caps); an amend that names no venue id has no
-    // encodable target, so it is not sent and nothing is pushed.
-    let [cid] = mint(1).try_into().unwrap();
-    let amend = VenueCommand::Amend(AmendOrder {
-        target: OrderRef::Client(cid),
-        inst: INST,
-        side: Side::Buy,
-        tif: TifTag::Gtc,
-        channel: Channel::Public,
-        post_only: true,
-        reduce_only: false,
-        reducing: false,
-        px: Ticks(130_860),
-        qty: Lots::new(25).unwrap(),
-        cum_filled: Lots::new(5).unwrap(),
-    });
-    let mut fx = Effects::new();
-    let refused = exec_codec().encode(&amend, RpcId(18), &specs(), &ctx(9, 4, 1), &mut fx);
-    assert_eq!(refused, Err(NotSentReason::Unsupported));
-    assert!(fx.is_empty());
-}
-
-#[test]
-fn a_poll_only_feed_is_planned_without_a_connection_and_polled_over_http() {
-    // The toy publishes stats only over REST (MdCaps::stats is Poll). Its plan puts them on an
-    // endpoint the runtime opens no connection for; the codec built for it gets its data only
-    // through the HTTP requests it asks for, driven by its own timer.
-    let factory: &dyn VenueFactory = &ToyFactory;
-    assert_eq!(factory.caps(&config()).unwrap().md.stats, FeedSource::Poll);
+    // A feed the caps do not offer, or an instrument missing from the spec table, is refused
+    // by planning and by subscribing, and nothing goes on the wire.
     let book = Subscription {
         inst: INST,
-        feed: Feed::Book(BookId(0)),
+        feed: Feed::Book(fbc_core::BookId(0)),
     };
-    let stats = Subscription {
-        inst: INST,
-        feed: Feed::Stats,
+    let stranger = Subscription {
+        inst: InstrumentId::new(99),
+        ..touch
     };
-    let subs: BTreeSet<Subscription> = [book, stats].into_iter().collect();
-    let plan = factory.plan_md(&config(), &specs(), &subs).unwrap();
-    assert_eq!(
-        plan,
-        [
-            EndpointPlan {
-                stream: StreamId(0),
-                transport: MdTransport::Socket {
-                    url: WireUrl::plain("https://toy.invalid/md?symbols=TOY-PERP")
-                },
-                subs: vec![book],
-            },
-            EndpointPlan {
-                stream: POLL_STREAM,
-                transport: MdTransport::Poll {
-                    base_url: WireUrl::plain("https://toy.invalid")
-                },
-                subs: vec![stats],
-            },
-        ]
-    );
-
-    let mut poll = factory.md_codec(&config(), &plan[1]);
-    assert_eq!(poll.keepalive(), None);
-    let mut fx = Effects::new();
-    poll.on_open(&mut fx);
-    poll.subscribe(&plan[1].subs, &[], &specs(), &mut fx)
-        .unwrap();
-    poll.on_timer(POLL_TAG, MonoNs(5), WallNs(6), &mut fx);
-    let effects = fx.take();
-    // Nothing is ever sent as a frame: the endpoint has no connection.
-    assert!(
-        !effects
-            .iter()
-            .any(|e| matches!(e, Effect::Send { .. } | Effect::Reconnect { .. })),
-        "{effects:?}"
-    );
-    let first_timer = Effect::Timer {
-        tag: POLL_TAG,
-        after: POLL_EVERY,
-    };
-    assert_eq!(effects[0], first_timer);
-    let Effect::Http { tag, req, .. } = &effects[1] else {
-        panic!("expected the stats poll: {effects:?}");
-    };
-    assert_eq!(*tag, STATS_TAG);
-    assert_eq!(req.url, "https://toy.invalid/stats?symbols=TOY-PERP");
-    assert_eq!(effects[2], first_timer, "the next poll is scheduled");
-
-    let (specs, mut sink) = (specs(), Collect::new());
-    with_scope(|scope| {
-        let resp = HttpResponse {
-            status: 200,
-            headers: &[],
-            body: b"stats|sym=TOY-PERP|vol=987000000000|oi=4200",
-        };
-        poll.on_http(STATS_TAG, Ok(resp), scope, &specs, &mut sink, &mut fx)
-            .unwrap();
-        // A poll that got no answer decodes nothing; the timer already asked for the next.
-        poll.on_http(
-            STATS_TAG,
-            Err(HttpFailure::TimedOut),
-            scope,
-            &specs,
-            &mut sink,
-            &mut fx,
-        )
-        .unwrap();
-        // A poll endpoint has no frames, and a response it did not ask for is refused.
-        let frame = poll.on_frame(RawFrame::Text("x"), scope, &specs, &mut sink, &mut fx);
-        assert!(frame.is_err());
-        let stray = poll.on_http(
-            HttpTag(9),
-            Err(HttpFailure::Lost),
-            scope,
-            &specs,
-            &mut sink,
-            &mut fx,
-        );
-        assert_eq!(stray, Err(DecodeError::Malformed("stats response")));
-    });
-    assert!(fx.is_empty());
-    // Unsubscribing drops the symbol from the next poll.
-    poll.subscribe(&[], &plan[1].subs, &specs, &mut fx).unwrap();
-    poll.on_timer(POLL_TAG, MonoNs(7), WallNs(8), &mut fx);
-    assert!(matches!(
-        &fx.as_slice()[0],
-        Effect::Http { req, .. } if req.url == "https://toy.invalid/stats?symbols="
-    ));
-    assert_eq!(
-        sink.bodies(),
-        [&MdEvent::Stats {
-            inst: INST,
-            volume_24h_quote: Some(Money::new(987_000_000_000, usdc())),
-            oi: Lots::new(4_200),
-        }]
-    );
-}
-
-#[test]
-fn a_fill_key_is_computed_from_the_one_copy_of_its_fields() {
-    // A fill without a venue fill id is keyed by its order's venue id and cumulative quantity
-    // after the fill; the event holds each once, so the key cannot disagree with the order and
-    // quantity the fill is applied to. Every toy fill carries a fill id, so the first one here
-    // is the second decoded with its fill id taken away, as a venue without fill ids sends it.
-    let sink = decode_exec(
-        exec_codec().as_mut(),
-        &[
-            "fill|sym=TOY-PERP|fid=F-0|vid=V-1|side=S|px=130865|qty=1|cum=3|fee=0",
-            "fill|sym=TOY-PERP|fid=F-1|vid=V-1|side=S|px=130865|qty=1|cum=4|fee=0",
-            "fill|sym=TOY-PERP|fid=F-2|side=S|px=130865|qty=1|fee=0",
-        ],
-    );
-    let (vid, f1, f2) = with_scope(|scope| {
-        (
-            scope.venue_order_id("V-1").unwrap(),
-            scope.fill_id("F-1").unwrap(),
-            scope.fill_id("F-2").unwrap(),
-        )
-    });
-    let lots = |n| Lots::new(n).unwrap();
-    let mut fills: Vec<FillEvent> = sink
-        .bodies()
-        .into_iter()
-        .map(|ev| match ev {
-            ExecEvent::Fill(fill) => fill.clone(),
-            other => panic!("{other:?}"),
-        })
-        .collect();
-    fills[0].ident = FillIdent::Derived {
-        vid: vid.clone(),
-        cum_after: lots(3),
-    };
-    assert_eq!(
-        fills[0].ident,
-        FillIdent::Derived {
-            vid: vid.clone(),
-            cum_after: lots(3)
-        }
-    );
-    assert_eq!(
-        fills[0].key(),
-        FillKey::Derived {
-            vid: vid.clone(),
-            cum_after: lots(3)
-        }
-    );
-    assert_eq!(fills[1].key(), FillKey::Venue(f1));
-    assert_eq!(
-        (fills[1].vid(), fills[1].cum_after()),
-        (Some(&vid), Some(lots(4)))
-    );
-    assert_eq!(fills[2].key(), FillKey::Venue(f2));
-    assert_eq!((fills[2].vid(), fills[2].cum_after()), (None, None));
-    assert_eq!(
-        (fills[0].vid(), fills[0].cum_after()),
-        (Some(&vid), Some(lots(3)))
-    );
-
-    // Without a fill id (which the toy's caps promise on every fill), a fill is refused.
-    let mut codec = exec_codec();
-    let (specs, mut sink, mut fx) = (specs(), Collect::new(), Effects::new());
-    with_scope(|scope| {
-        for line in [
-            "fill|sym=TOY-PERP|side=S|px=130865|qty=1|cum=3|fee=0",
-            "fill|sym=TOY-PERP|vid=V-1|side=S|px=130865|qty=1|fee=0",
-        ] {
-            let decoded = codec.on_frame(
-                EXEC_STREAM,
-                RawFrame::Text(line),
-                scope,
-                &specs,
-                &mut sink,
-                &mut fx,
-            );
-            assert!(decoded.is_err(), "{line}");
-        }
-    });
-    assert!(sink.out.is_empty());
-}
-
-#[test]
-fn two_book_channels_of_one_instrument_on_one_connection_stay_apart() {
-    // A recorder can subscribe one instrument to two book channels sharing a connection (the
-    // shadow records both a public and an interactive book, design §10). Every book event names
-    // its channel, so the two books never merge.
-    assert_eq!(toy_caps().md.books.len(), 2);
-    let plan = ToyFactory
-        .plan_md(
-            &config(),
-            &specs(),
-            &[BookId(0), BookId(1)]
-                .into_iter()
-                .map(|b| Subscription {
-                    inst: INST,
-                    feed: Feed::Book(b),
-                })
-                .collect(),
-        )
-        .unwrap();
-    assert_eq!(plan.len(), 1, "both channels share the connection");
-    let mut codec = ToyFactory.md_codec(&config(), &plan[0]);
-    let (specs, mut sink, mut fx) = (specs(), Collect::new(), Effects::new());
-    with_scope(|scope| {
-        for line in [
-            "snap|sym=TOY-PERP|epoch=1|b=130865x12",
-            "snap|sym=TOY-PERP|book=1|epoch=1|b=130865x40",
-            "gap|sym=TOY-PERP|feed=book|book=1",
-        ] {
-            codec
-                .on_frame(RawFrame::Text(line), scope, &specs, &mut sink, &mut fx)
-                .unwrap();
-        }
-    });
-    let level = |book, qty| MdEvent::Level {
-        inst: INST,
-        book: BookId(book),
-        side: BookSide::Bid,
-        px: Ticks(130_865),
-        qty: Lots::new(qty).unwrap(),
-    };
-    let begin = |book| MdEvent::BookSnapshotBegin {
-        inst: INST,
-        book: BookId(book),
-        epoch: 1,
-    };
-    let end = |book| MdEvent::BookSnapshotEnd {
-        inst: INST,
-        book: BookId(book),
-    };
-    assert_eq!(
-        sink.bodies(),
-        [
-            &begin(0),
-            &level(0, 12),
-            &end(0),
-            &begin(1),
-            &level(1, 40),
-            &end(1),
-            &MdEvent::Health {
-                inst: INST,
-                feed: Feed::Book(BookId(1)),
-                h: FeedHealth::Gap,
-            },
-        ]
-    );
-    let window = |book| MdEvent::Window {
-        inst: INST,
-        book: BookId(book),
-        lo: Ticks(1),
-        hi: Ticks(2),
-    };
-    assert_ne!(window(0), window(1));
-}
-
-#[test]
-fn a_batch_longer_than_the_declared_maximum_is_not_sent() {
-    let max = toy_caps().order.unwrap().batch_place.unwrap().max_items;
-    let cids = mint(usize::from(max) + 1);
-    let orders = |n: usize| {
-        let px = (0i64..).map(|i| 130_800 + i);
-        cids[..n]
-            .iter()
-            .zip(px)
-            .map(|(c, px)| order(*c, px))
-            .collect::<Vec<_>>()
-    };
-    let len = u16::try_from(cids.len()).unwrap();
-    let mut codec = exec_codec();
-    let mut fx = Effects::new();
-    let full = VenueCommand::PlaceBatch(orders(usize::from(max)));
-    codec
-        .encode(&full, RpcId(20), &specs(), &ctx(5, 1, len), &mut fx)
-        .unwrap();
-    assert_eq!(fx.take().len(), 1);
-    let over = VenueCommand::PlaceBatch(orders(cids.len()));
-    let refused = codec.encode(&over, RpcId(21), &specs(), &ctx(5, 1, len), &mut fx);
-    assert_eq!(refused, Err(NotSentReason::Unsupported));
-    assert!(fx.is_empty());
-}
-
-#[test]
-fn an_order_that_reduces_is_safety_traffic_whether_or_not_it_carries_the_venue_flag() {
-    // On a venue without a reduce-only flag (OrderCaps::reduce_only false) an exit sized not to
-    // cross zero goes out with reduce_only false; the OMS's own classification, `reducing`, is
-    // what keeps it on the safety floor. A reduce-only order is reducing too.
-    let [a, b] = mint(2).try_into().unwrap();
-    let exit = |cid, px| NewOrder {
-        reducing: true,
-        ..order(cid, px)
-    };
-    let flagged = |cid, px| NewOrder {
-        reduce_only: true,
-        ..order(cid, px)
-    };
-    let class_of = |cmd: &VenueCommand| {
-        let mut fx = Effects::new();
-        exec_codec()
-            .encode(cmd, RpcId(30), &specs(), &ctx(5, 700, 2), &mut fx)
-            .unwrap();
-        match fx.as_slice() {
-            [Effect::Send { class, .. }] => (*class, cmd.traffic_class()),
-            other => panic!("{other:?}"),
-        }
-    };
-    let safety = (TrafficClass::Safety, TrafficClass::Safety);
-    let normal = (TrafficClass::Normal, TrafficClass::Normal);
-    assert_eq!(class_of(&VenueCommand::Place(exit(a, 130_870))), safety);
-    assert_eq!(class_of(&VenueCommand::Place(flagged(a, 130_870))), safety);
-    assert_eq!(class_of(&VenueCommand::Place(order(a, 130_870))), normal);
-    let batch = VenueCommand::PlaceBatch(vec![exit(a, 130_870), flagged(b, 130_871)]);
-    assert_eq!(class_of(&batch), safety);
-    let mixed = VenueCommand::PlaceBatch(vec![exit(a, 130_870), order(b, 130_871)]);
-    assert_eq!(class_of(&mixed), normal);
-    let vid = with_scope(|scope| scope.venue_order_id("V-1").unwrap());
-    let amend = |reducing| {
-        VenueCommand::Amend(AmendOrder {
-            target: OrderRef::Venue(vid.clone()),
-            inst: INST,
-            side: Side::Sell,
-            tif: TifTag::Gtc,
-            channel: Channel::Public,
-            post_only: true,
-            reduce_only: false,
-            reducing,
-            px: Ticks(130_870),
-            qty: Lots::new(10).unwrap(),
-            cum_filled: Lots::new(0).unwrap(),
-        })
-    };
-    assert_eq!(class_of(&amend(true)), safety);
-    assert_eq!(class_of(&amend(false)), normal);
-    // The rest of the commands, by kind: cancels, protection and the Unknown ladder's queries
-    // are safety traffic; a fee query is not, and neither is an empty batch.
-    let cancel = CancelOrder {
-        target: OrderRef::Venue(vid.clone()),
-        inst: INST,
-        side: Side::Sell,
-        placement_nonce: None,
-    };
-    for cmd in [
-        VenueCommand::Cancel(cancel.clone()),
-        VenueCommand::CancelMany(vec![cancel]),
-        VenueCommand::CancelAll(fbc_core::CancelScope::Account),
-        VenueCommand::ArmCancelOnDisconnect(true),
-        VenueCommand::RefreshDeadMan,
-        VenueCommand::Query(QueryOrder {
-            target: OrderRef::Venue(vid.clone()),
-            inst: INST,
-            placement_nonce: None,
-        }),
+    let unknown = VenueError::UnknownInstrument(stranger.inst);
+    for (sub, err) in [
+        (book, VenueError::UnsupportedFeed(book)),
+        (stranger, unknown),
     ] {
-        assert_eq!(cmd.traffic_class(), TrafficClass::Safety, "{cmd:?}");
-    }
-    assert_eq!(VenueCommand::FeeQuery.traffic_class(), TrafficClass::Normal);
-    assert_eq!(
-        VenueCommand::PlaceBatch(vec![]).traffic_class(),
-        TrafficClass::Normal
-    );
-}
-
-/// A signer that records which reference each cancel it was asked to sign names.
-struct RecordingSigner(Arc<std::sync::Mutex<Vec<String>>>);
-
-impl OrderSigner for RecordingSigner {
-    fn sign_place(&mut self, w: &PlaceWire<'_>) -> Result<Sig, SignError> {
-        ToySigner.sign_place(w)
-    }
-
-    fn sign_amend(&mut self, w: &AmendWire<'_>) -> Result<Sig, SignError> {
-        let named = match w.target {
-            AmendRef::Venue(vid) => format!("amend venue:{}", vid.as_str()),
-            AmendRef::Client(cid) => format!("amend client:{cid}"),
-        };
-        self.0.lock().unwrap().push(named);
-        ToySigner.sign_amend(w)
-    }
-
-    fn sign_cancel(&mut self, w: &CancelWire<'_>) -> Result<Option<Sig>, SignError> {
-        let named = match w.target {
-            CancelRef::Venue(vid) => format!("venue:{}", vid.as_str()),
-            CancelRef::Client(cid) => format!("client:{cid}"),
-            CancelRef::PlacementNonce(nonce) => format!("nonce:{nonce}"),
-        };
-        self.0.lock().unwrap().push(named);
-        Ok(None)
-    }
-}
-
-#[test]
-fn a_cancel_signer_sees_only_the_reference_the_request_encodes() {
-    // The command names the order every way it can (client id, venue id, placement nonce); the
-    // codec picks the one its wire carries, and the signer is handed that one alone, so the two
-    // cannot pick different identifiers.
-    let [cid] = mint(1).try_into().unwrap();
-    let vid = with_scope(|scope| scope.venue_order_id("V-1").unwrap());
-    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut codec = ToyExec {
-        signer: Box::new(RecordingSigner(seen.clone())),
-        url: "https://toy.invalid".to_owned(),
-        queries: Vec::new(),
-    };
-    let cancel = VenueCommand::Cancel(CancelOrder {
-        target: OrderRef::Both(cid, vid),
-        inst: INST,
-        side: Side::Buy,
-        placement_nonce: Some(4),
-    });
-    let text = String::from_utf8(encode_once(&mut codec, &cancel, &ctx(9, 5, 1))).unwrap();
-    assert_eq!(text, "rpc=11\ncancel|vid=V-1|ts=9");
-    assert_eq!(*seen.lock().unwrap(), ["venue:V-1"]);
-}
-
-#[test]
-fn an_amended_order_states_its_new_price_and_total_once() {
-    // The amended price and total travel in the update's own px and qty; the state says only
-    // that the order was amended (and under which id), so the two cannot disagree. A venue that
-    // does not echo them gives None, never a value the codec made up.
-    let sink = decode_exec(
-        exec_codec().as_mut(),
-        &[
-            "ord|sym=TOY-PERP|vid=V-1|side=B|state=amended|px=130860|qty=20|cum=5|newvid=V-2",
-            "ord|sym=TOY-PERP|vid=V-2|side=B|state=amended|cum=5",
-        ],
-    );
-    let (v1, v2) = with_scope(|scope| {
-        (
-            scope.venue_order_id("V-1").unwrap(),
-            scope.venue_order_id("V-2").unwrap(),
-        )
-    });
-    let update = |vid: &VenueOrderId, new_vid, px, qty| {
-        ExecEvent::Order(OrderUpdate {
-            cid: None,
-            vid: Some(vid.clone()),
-            inst: INST,
-            side: Side::Buy,
-            state: VenueOrderState::Amended { new_vid },
-            cum_filled: Lots::new(5).unwrap(),
-            px,
-            qty,
-            post_only: None,
-            reduce_only: None,
-        })
-    };
-    assert_eq!(
-        sink.bodies(),
-        [
-            &update(&v1, Some(v2.clone()), Some(Ticks(130_860)), Lots::new(20)),
-            &update(&v2, None, None, None),
-        ]
-    );
-}
-
-#[test]
-fn an_amend_signer_sees_only_the_reference_the_request_encodes() {
-    let [cid] = mint(1).try_into().unwrap();
-    let vid = with_scope(|scope| scope.venue_order_id("V-1").unwrap());
-    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut codec = ToyExec {
-        signer: Box::new(RecordingSigner(seen.clone())),
-        url: "https://toy.invalid".to_owned(),
-        queries: Vec::new(),
-    };
-    let amend = VenueCommand::Amend(AmendOrder {
-        target: OrderRef::Both(cid, vid),
-        inst: INST,
-        side: Side::Buy,
-        tif: TifTag::Gtc,
-        channel: Channel::Public,
-        post_only: true,
-        reduce_only: false,
-        reducing: false,
-        px: Ticks(130_860),
-        qty: Lots::new(25).unwrap(),
-        cum_filled: Lots::new(5).unwrap(),
-    });
-    let text = String::from_utf8(encode_once(&mut codec, &amend, &ctx(9, 4, 1))).unwrap();
-    assert!(text.starts_with("rpc=11\namend|vid=V-1|"), "{text}");
-    assert_eq!(*seen.lock().unwrap(), ["amend venue:V-1"]);
-}
-
-#[test]
-fn a_feed_the_caps_do_not_offer_is_refused_by_planning_and_subscribing() {
-    // The toy publishes no index (MdCaps::index None) and has one touch channel and two book
-    // channels: anything else is refused by name, and nothing goes on the wire for it.
-    let refused = [
-        Feed::Index,
-        Feed::Touch(TouchSourceId(1)),
-        Feed::Book(BookId(2)),
-    ];
-    let mut md = ToyFactory.md_codec(
-        &config(),
-        &ToyFactory
-            .plan_md(
-                &config(),
-                &specs(),
-                &[Subscription {
-                    inst: INST,
-                    feed: Feed::Trades,
-                }]
-                .into_iter()
-                .collect(),
-            )
-            .unwrap()[0],
-    );
-    for feed in refused {
-        let sub = Subscription { inst: INST, feed };
-        let err = VenueError::UnsupportedFeed(sub);
-        let subs: BTreeSet<Subscription> = [sub].into_iter().collect();
-        assert_eq!(ToyFactory.plan_md(&config(), &specs(), &subs), Err(err));
+        let both = BTreeSet::from([touch, sub]);
+        assert_eq!(factory.plan_md(&cfg, &specs(), &both), Err(err));
         let mut fx = Effects::new();
-        let trades = Subscription {
-            inst: INST,
-            feed: Feed::Trades,
-        };
-        assert_eq!(
-            md.subscribe(&[trades, sub], &[], &specs(), &mut fx),
-            Err(err)
-        );
-        assert!(fx.is_empty());
+        let refused = md.subscribe(&[touch, sub], &[], &specs(), &mut fx);
+        assert_eq!((refused, fx.is_empty()), (Err(err), true));
     }
-    assert_eq!(
-        VenueError::UnsupportedFeed(Subscription {
-            inst: INST,
-            feed: Feed::Index
-        })
-        .to_string(),
-        "instrument 7 has no Index feed on this venue"
-    );
-}
 
-#[test]
-fn an_exec_codec_states_how_many_nonces_each_callback_needs() {
-    // The runtime reserves nonces for an encode by VenueCommand::items(); for the other
-    // callbacks the codec says how many, and the runtime reserves exactly that many into the
-    // EncodeCtx it passes. The toy's hello frame carries one nonce; its pings and resync none.
+    // The order-entry connection, and what the exec codec asks for on it: a hello on open and
+    // a snapshot request on resync, both from the context's wall time and needing no nonce.
+    let url = WireUrl::plain(EXEC_URL);
+    let stream = EXEC_STREAM;
+    assert_eq!(
+        factory.plan_exec(&cfg),
+        Ok(vec![ExecEndpoint { stream, url }])
+    );
     let mut exec = exec_codec();
-    assert_eq!(exec.nonces_for(CtxCall::Open(EXEC_STREAM)), 1);
-    assert_eq!(exec.nonces_for(CtxCall::Timer(PING_TAG)), 0);
-    assert_eq!(exec.nonces_for(CtxCall::Timer(RESYNC_RETRY_TAG)), 0);
+    assert_eq!(exec.nonces_for(CtxCall::Open(EXEC_STREAM)), 0);
     assert_eq!(exec.nonces_for(CtxCall::Resync), 0);
-    let reserved = exec.nonces_for(CtxCall::Open(EXEC_STREAM));
     let mut fx = Effects::new();
-    exec.on_open(EXEC_STREAM, &ctx(1_000, 42, reserved), &mut fx);
-    let [Effect::Send { frame, .. }, Effect::Timer { .. }] = fx.as_slice() else {
-        panic!("{fx:?}");
+    exec.on_open(EXEC_STREAM, &ctx(1_000, &[]), &mut fx);
+    exec.resync(&ctx(2_000, &[]), &mut fx);
+    // An ack answers its request, so the runtime clears that deadline (ExecEvent::answers);
+    // a request that times out unanswered is reported Unknown, which answers nothing.
+    let (results, mut sink) = decode_exec(exec.as_mut(), &["ack|rpc=11|vid=V-2"]);
+    assert_eq!(results, [Ok(())]);
+    exec.on_rpc_timeout(RpcId(12), &mut sink);
+    let vid = Some(with_scope(|scope| scope.venue_order_id("V-2").unwrap()));
+    let ack = SubmitOutcome::Accepted {
+        ack: AckLevel::Final,
     };
-    assert_eq!(frame.bytes(), b"hello|ts=1000|nonce=42");
-}
-
-#[test]
-fn a_url_carries_its_credential_spans_and_never_shows_them() {
-    // A venue may put a credential in a URL's path, query or user information. The URL keeps
-    // the spans that hold it, as frames and headers do, so the journal can hash them; and no
-    // Debug of a request or an endpoint plan prints them.
-    let secret = "SYNTHETIC-URL-TOKEN";
-    let text = format!("wss://venue.invalid/ws/{secret}/stream");
-    let start = u32::try_from("wss://venue.invalid/ws/".len()).unwrap();
-    let span = start..start + u32::try_from(secret.len()).unwrap();
-    let url = WireUrl::redacted(text.clone(), std::iter::once(span.clone()).collect()).unwrap();
-    assert_eq!(url.as_str(), text);
-    assert_eq!(url.redactions(), [span]);
-    assert_eq!(url, text.as_str());
-    let plain = WireUrl::plain(format!("https://u:{secret}@venue.invalid/x?key={secret}"));
-    assert!(plain.redactions().is_empty());
-
-    let exec = ExecEndpoint {
-        stream: EXEC_STREAM,
-        url: url.clone(),
-    };
-    let md = EndpointPlan {
-        stream: StreamId(0),
-        transport: MdTransport::Socket { url: plain.clone() },
-        subs: vec![],
-    };
-    let poll = MdTransport::Poll {
-        base_url: url.clone(),
-    };
-    let req = HttpRequest {
-        method: HttpMethod::Get,
-        url: url.clone(),
-        headers: vec![],
-        body: WireSlice::plain(Vec::new()),
-    };
-    for shown in [
-        format!("{exec:?}"),
-        format!("{md:?}"),
-        format!("{poll:?}"),
-        format!("{req:?}"),
-        format!("{plain:?}"),
-    ] {
-        assert!(!shown.contains(secret), "{shown}");
-        assert!(shown.contains("venue.invalid"), "{shown}");
-    }
-
-    // Spans must lie inside the text, in order, on character boundaries.
-    let refused =
-        |spans: Vec<std::ops::Range<u32>>| WireUrl::redacted("https://é.invalid".to_owned(), spans);
-    assert_eq!(
-        refused(std::iter::once(0..99).collect()),
-        Err(fbc_core::RedactError::OutOfBounds)
-    );
-    assert_eq!(
-        refused(std::iter::once(9..10).collect()),
-        Err(fbc_core::RedactError::OutOfBounds)
-    );
-    assert_eq!(
-        refused(vec![4..6, 2..3]),
-        Err(fbc_core::RedactError::Unordered)
-    );
-}
-
-#[test]
-fn an_encode_receipt_holds_only_nonces_taken_from_the_context() {
-    // The OMS keeps a receipt's nonces as placement nonces; each comes from the reserved block,
-    // once per item, so a receipt cannot name a nonce the request did not use.
-    let at = ctx(5, 700, 2);
-    let mut receipt = EncodeReceipt::new();
-    assert_eq!(receipt.use_nonce(&at, 1), Some(701));
-    assert_eq!(
-        receipt.use_nonce(&at, 1),
-        None,
-        "an item takes its nonce once"
-    );
-    assert_eq!(receipt.use_nonce(&at, 2), None, "past the reserved block");
-    assert_eq!(receipt.use_nonce(&at, 0), Some(700));
-    assert_eq!(receipt.nonces(), [(1, 701), (0, 700)]);
-}
-
-#[test]
-fn a_venue_config_debug_shows_keys_and_value_lengths_only() {
-    // A consumer's configuration can hold a credential-bearing URL or an account address; a
-    // diagnostic that formats it shows which keys are set, not what they hold.
-    let secret = "SYNTHETIC-CONFIG-SECRET";
-    let mut cfg = VenueConfig::new();
-    cfg.insert(URL_KEY, &format!("https://{secret}@toy.invalid"));
-    cfg.insert_market(INST, "toy.account", secret);
-    let shown = format!("{cfg:?}");
-    assert!(!shown.contains(secret), "{shown}");
-    assert!(
-        shown.contains(URL_KEY) && shown.contains("toy.account"),
-        "{shown}"
-    );
-    assert!(
-        shown.contains(&format!("<{} bytes>", secret.len())),
-        "{shown}"
-    );
-}
-
-#[test]
-fn a_url_span_over_a_delimiter_still_leaves_the_rest_of_the_query_hidden() {
-    // The query, fragment and user information are found in the URL as written, before any
-    // span is replaced: a span that swallows the `?`, `#` or `@` cannot expose what follows.
-    let cases = [
-        (
-            "https://venue.invalid/x?api_key=SECRET&other=TOKEN2",
-            "?api_key=SECRET",
-        ),
-        ("https://venue.invalid/x#SECRET&TOKEN2", "#SECRET"),
-        (
-            "https://user:SECRET@venue.invalid/TOKEN2?TOKEN2",
-            ":SECRET@",
-        ),
-    ];
-    for (text, marked) in cases {
-        let start = text.find(marked).unwrap();
-        let span = u32::try_from(start).unwrap()..u32::try_from(start + marked.len()).unwrap();
-        let url = WireUrl::redacted(text.to_owned(), std::iter::once(span).collect()).unwrap();
-        let shown = format!("{url:?}");
-        assert!(!shown.contains("SECRET"), "{shown}");
-        // The path is shown (only a span hides it); the query and fragment never are.
-        let path_token = text.contains('@');
-        assert_eq!(
-            shown.matches("TOKEN2").count(),
-            usize::from(path_token),
-            "{shown}"
-        );
-        assert!(shown.contains("venue.invalid"), "{shown}");
-    }
-}
-
-#[test]
-fn an_order_with_a_time_in_force_or_channel_the_caps_do_not_offer_is_not_sent() {
-    // The toy offers GTC on the public book only (OrderCaps::tifs, channels).
-    let [a, b] = mint(2).try_into().unwrap();
-    let ioc = NewOrder {
-        tif: TifTag::Ioc,
-        ..order(a, 130_865)
-    };
-    let rpi = NewOrder {
-        channel: Channel::Rpi,
-        ..order(a, 130_865)
-    };
-    let fok_in_batch = VenueCommand::PlaceBatch(vec![
-        order(a, 130_865),
-        NewOrder {
-            tif: TifTag::Fok,
-            ..order(b, 130_864)
-        },
-    ]);
-    let vid = with_scope(|scope| scope.venue_order_id("V-1").unwrap());
-    let amend_ioc = VenueCommand::Amend(AmendOrder {
-        target: OrderRef::Venue(vid),
-        inst: INST,
-        side: Side::Buy,
-        tif: TifTag::Ioc,
-        channel: Channel::Public,
-        post_only: true,
-        reduce_only: false,
-        reducing: false,
-        px: Ticks(130_860),
-        qty: Lots::new(25).unwrap(),
-        cum_filled: Lots::new(5).unwrap(),
-    });
-    for cmd in [
-        VenueCommand::Place(ioc),
-        VenueCommand::Place(rpi),
-        fok_in_batch,
-        amend_ioc,
-    ] {
-        let mut fx = Effects::new();
-        let refused = exec_codec().encode(&cmd, RpcId(40), &specs(), &ctx(5, 1, 2), &mut fx);
-        assert_eq!(refused, Err(NotSentReason::Unsupported), "{cmd:?}");
-        assert!(fx.is_empty());
-    }
-}
-
-#[test]
-fn a_plan_of_poll_only_feeds_opens_no_socket() {
-    let stats: BTreeSet<Subscription> = [Subscription {
-        inst: INST,
-        feed: Feed::Stats,
-    }]
-    .into_iter()
-    .collect();
-    let plan = ToyFactory.plan_md(&config(), &specs(), &stats).unwrap();
-    assert_eq!(plan.len(), 1, "{plan:?}");
-    assert!(matches!(plan[0].transport, MdTransport::Poll { .. }));
-    assert_eq!(
-        ToyFactory.plan_md(&config(), &specs(), &BTreeSet::new()),
-        Ok(vec![])
-    );
-}
-
-#[test]
-fn the_toy_answers_an_order_query_with_a_query_result() {
-    // The caps say the toy queries by venue id and by placement nonce, so its codec decodes the
-    // answer. The answer names the request; the codec remembers which order each query in
-    // flight was for, so even a nonce query for an order the venue never heard of names it.
-    let [cid] = mint(1).try_into().unwrap();
-    let vid = with_scope(|scope| scope.venue_order_id("V-1").unwrap());
-    let mut exec = exec_codec();
-    let mut query = |rpc: u64, target: OrderRef| {
-        let cmd = VenueCommand::Query(QueryOrder {
-            target,
-            inst: INST,
-            placement_nonce: Some(4),
-        });
-        let mut fx = Effects::new();
-        exec.encode(&cmd, RpcId(rpc), &specs(), &ctx(9, 6, 1), &mut fx)
-            .unwrap();
-    };
-    query(21, OrderRef::Client(cid));
-    query(22, OrderRef::Both(cid, vid.clone()));
-    query(23, OrderRef::Venue(vid.clone()));
-    let sink = decode_exec(
-        exec.as_mut(),
-        &[
-            "qres|seq=9|rpc=21|vid=V-1|sym=TOY-PERP|side=B|px=130865|qty=25|cum=5|po=1|ro=0",
-            "qres|rpc=22|vid=V-1|sym=TOY-PERP|side=B|px=130865|qty=25|cum=25|state=filled",
-            "qres|rpc=23",
-        ],
-    );
-    let snapshot = |cum, state| VenueOrderSnapshot {
+    let item = Some(ItemRef {
+        idx: 0,
         cid: None,
-        vid: vid.clone(),
-        inst: INST,
-        side: Side::Buy,
-        state,
-        px: Some(Ticks(130_865)),
-        qty: Lots::new(25).unwrap(),
-        cum_filled: Lots::new(cum).unwrap(),
-        post_only: Some(true),
-        reduce_only: Some(false),
-    };
-    let mut filled = snapshot(25, VenueOrderState::Filled);
-    (filled.post_only, filled.reduce_only) = (None, None);
+        vid,
+    });
+    let expected = [
+        (RpcId(11), item, ack),
+        (RpcId(12), None, SubmitOutcome::Unknown),
+    ]
+    .map(|(rpc, item, outcome)| ExecEvent::Outcome { rpc, item, outcome });
+    assert_eq!(sink.bodies(), expected.iter().collect::<Vec<_>>());
+    let answers = expected.iter().map(ExecEvent::answers);
+    assert_eq!(Vec::from_iter(answers), [Some(RpcId(11)), None]);
+    let safety = |text| send(EXEC_STREAM, text, None, TrafficClass::Safety);
+    assert_eq!(fx.take(), ["hello|ts=1000", "snapshot|ts=2000"].map(safety));
+
+    // The client-id format has one source, the capabilities: what the exec codec puts on the
+    // wire decodes under it as ours.
+    let format = factory.caps(&cfg).unwrap().order.unwrap().client_id;
+    let cid = mint();
+    let place = VenueCommand::Place(order(cid));
+    let text = String::from_utf8(bytes(&place, &ctx(1, &[1]))).unwrap();
+    let wire = text.split('|').find_map(|kv| kv.strip_prefix("cid="));
     assert_eq!(
-        sink.bodies(),
-        [
-            &ExecEvent::QueryResult {
-                target: OrderRef::Client(cid),
-                found: Some(snapshot(5, VenueOrderState::Open)),
-            },
-            &ExecEvent::QueryResult {
-                target: OrderRef::Both(cid, vid.clone()),
-                found: Some(filled),
-            },
-            &ExecEvent::QueryResult {
-                target: OrderRef::Venue(vid.clone()),
-                found: None,
-            },
-        ]
+        decode_cid(&format, OWN_NS, wire.unwrap()),
+        CidMatch::Ours(cid)
     );
-    assert_eq!(sink.out[0].venue_seq, Some(9));
-
-    // An answer is taken once; one to a query that timed out, or that was never asked, names
-    // no request in flight and is refused.
-    let mut exec = exec_codec();
-    let cmd = VenueCommand::Query(QueryOrder {
-        target: OrderRef::Venue(vid.clone()),
-        inst: INST,
-        placement_nonce: None,
-    });
-    let mut fx = Effects::new();
-    exec.encode(&cmd, RpcId(31), &specs(), &ctx(9, 6, 1), &mut fx)
-        .unwrap();
-    exec.encode(&cmd, RpcId(32), &specs(), &ctx(9, 6, 1), &mut fx)
-        .unwrap();
-    let mut timeouts = Collect::new();
-    exec.on_rpc_timeout(RpcId(31), &mut timeouts);
-    decode_exec(exec.as_mut(), &["qres|rpc=32"]);
-    let (specs, mut sink, mut fx) = (specs(), Collect::new(), Effects::new());
-    with_scope(|scope| {
-        for line in ["qres|rpc=31", "qres|rpc=32", "qres|rpc=99", "qres|vid=V-1"] {
-            let frame = RawFrame::Text(line);
-            let refused = exec.on_frame(EXEC_STREAM, frame, scope, &specs, &mut sink, &mut fx);
-            assert!(refused.is_err(), "{line}");
-        }
-        // A malformed answer is refused and leaves the query in flight for a good one.
-        let mut exec = exec_codec();
-        let mut ffx = Effects::new();
-        let q = VenueCommand::Query(QueryOrder {
-            target: OrderRef::Venue(vid.clone()),
-            inst: INST,
-            placement_nonce: None,
-        });
-        exec.encode(&q, RpcId(41), &specs, &ctx(9, 6, 1), &mut ffx)
-            .unwrap();
-        let bad = RawFrame::Text("qres|rpc=41|vid=V-1|sym=TOY-PERP|side=X|qty=1|cum=0");
-        let refused = exec.on_frame(EXEC_STREAM, bad, scope, &specs, &mut sink, &mut fx);
-        assert_eq!(refused, Err(DecodeError::Malformed("side")));
-        let good = RawFrame::Text("qres|rpc=41");
-        exec.on_frame(EXEC_STREAM, good, scope, &specs, &mut sink, &mut fx)
-            .unwrap();
-    });
-    assert_eq!(
-        sink.bodies(),
-        [&ExecEvent::QueryResult {
-            target: OrderRef::Venue(vid.clone()),
-            found: None,
-        }]
-    );
-}
-
-#[test]
-fn a_frame_or_response_that_fails_to_decode_pushes_nothing() {
-    // The sink contract (MdSink, ExecSink): a call that returns Err has pushed no event, so a
-    // bad level cannot leave a snapshot begun and never ended, and a bad line in a response
-    // cannot leave half of it applied.
-    let (specs, mut fx) = (specs(), Effects::new());
-    let mut md = ToyMd { pings: 0 };
-    let mut poll = ToyPoll {
-        base_url: "https://toy.invalid".to_owned(),
-        symbols: BTreeSet::new(),
-    };
-    let mut exec = exec_codec();
-    with_scope(|scope| {
-        let mut sink = Collect::new();
-        for line in [
-            "snap|sym=TOY-PERP|epoch=3|b=130865x12|a=bad",
-            "snap|sym=TOY-PERP|epoch=3|b=bad|a=130866x7",
-        ] {
-            let refused = md.on_frame(RawFrame::Text(line), scope, &specs, &mut sink, &mut fx);
-            assert!(refused.is_err(), "{line}");
-        }
-        let stats = HttpResponse {
-            status: 200,
-            headers: &[],
-            body: b"stats|sym=TOY-PERP|vol=1|oi=2\nstats|sym=NOPE-PERP|vol=1",
-        };
-        let refused = poll.on_http(STATS_TAG, Ok(stats), scope, &specs, &mut sink, &mut fx);
-        assert_eq!(refused, Err(DecodeError::UnknownInstrument));
-        assert!(sink.out.is_empty(), "{:?}", sink.bodies());
-
-        let mut sink = Collect::new();
-        let resync = HttpResponse {
-            status: 200,
-            headers: &[],
-            body: b"rbegin|wm=900\nrpos|sym=TOY-PERP|qty=0\nrpos|sym=TOY-PERP",
-        };
-        let refused = exec.on_http(RESYNC_TAG, Ok(resync), scope, &specs, &mut sink, &mut fx);
-        assert_eq!(refused, Err(DecodeError::Malformed("qty")));
-        assert!(sink.out.is_empty(), "{:?}", sink.bodies());
-    });
-    assert!(fx.is_empty());
-}
-
-#[test]
-fn both_codecs_keep_their_ping_timers_armed() {
-    // Each ping re-arms its timer, so pings go on for the life of the connection; the exec
-    // session arms its first one when it opens, as the market-data codec does.
-    let mut exec = exec_codec();
-    let mut fx = Effects::new();
-    let at = ctx(1_000, 1, 1);
-    exec.on_open(EXEC_STREAM, &at, &mut fx);
-    let ping = Effect::Timer {
-        tag: PING_TAG,
-        after: Duration::from_secs(15),
-    };
-    assert!(matches!(&fx.as_slice()[0], Effect::Send { .. }));
-    assert_eq!(fx.as_slice()[1..], *std::slice::from_ref(&ping));
-    let mut fx = Effects::new();
-    exec.on_timer(PING_TAG, &ctx(2_000, 1, 0), &mut fx);
-    assert!(matches!(&fx.as_slice()[0], Effect::Send { .. }));
-    assert_eq!(fx.as_slice()[1..], *std::slice::from_ref(&ping));
-
-    let mut md = ToyMd { pings: 0 };
-    let mut fx = Effects::new();
-    md.on_timer(PING_TAG, MonoNs(5), WallNs(6), &mut fx);
-    assert!(matches!(&fx.as_slice()[0], Effect::Send { .. }));
-    assert_eq!(fx.as_slice()[1..], [ping]);
-}
-
-#[test]
-fn the_toy_refuses_a_fill_without_the_fill_id_its_caps_promise() {
-    // The caps say every fill carries a venue fill id (FillCaps::fill_id), so a fill without
-    // one is malformed, not keyed some other way.
-    assert!(toy_caps().fills.fill_id);
-    let mut codec = exec_codec();
-    let (specs, mut sink, mut fx) = (specs(), Collect::new(), Effects::new());
-    with_scope(|scope| {
-        let line = "fill|sym=TOY-PERP|vid=V-1|side=S|px=130865|qty=1|cum=3|fee=0";
-        let frame = RawFrame::Text(line);
-        let refused = codec.on_frame(EXEC_STREAM, frame, scope, &specs, &mut sink, &mut fx);
-        assert_eq!(refused, Err(DecodeError::Malformed("fid")));
-    });
-    assert!(sink.out.is_empty());
-}
-
-#[test]
-fn the_toy_declares_only_what_its_market_data_codec_does() {
-    // Its book channels are whole snapshots on the socket: none needs a REST anchor, and the
-    // socket codec asks for no HTTP, so it takes no response.
-    let md = toy_caps().md;
-    assert!(md.books.iter().all(|b| !b.rest_anchor), "{:?}", md.books);
-    let mut codec = ToyMd { pings: 0 };
-    let (specs, mut sink, mut fx) = (specs(), Collect::new(), Effects::new());
-    with_scope(|scope| {
-        let resp = HttpResponse {
-            status: 200,
-            headers: &[],
-            body: b"snap|sym=TOY-PERP|epoch=3|b=130865x12",
-        };
-        let refused = codec.on_http(HttpTag(2), Ok(resp), scope, &specs, &mut sink, &mut fx);
-        assert!(refused.is_err());
-    });
-    assert!(sink.out.is_empty());
-    // Its frames are pipe-delimited text, which is what the caps say.
-    assert_eq!(md.encoding, Encoding::Text);
 }
