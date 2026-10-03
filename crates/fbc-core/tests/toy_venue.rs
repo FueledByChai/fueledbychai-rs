@@ -33,8 +33,8 @@ use fbc_core::{
     SubmitOutcome, Subscription, Support, TagSet, Ticks, TifTag, TimerTag, TouchSourceCaps,
     TouchSourceId, TradeCaps, TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueCommand,
     VenueConfig, VenueError, VenueFactory, VenueFeeSign, VenueId, VenueMeta, VenueMode,
-    VenueOrderId, VenueOrderSnapshot, VenueOrderState, WallNs, WireSlice, decode_cid, dispatch,
-    encode_cid,
+    VenueOrderId, VenueOrderSnapshot, VenueOrderState, WallNs, WireSlice, WireUrl, decode_cid,
+    dispatch, encode_cid,
 };
 use fbc_core::{AmendAck, Batch, Effect, Effects};
 use rust_decimal::Decimal;
@@ -455,7 +455,11 @@ impl MdCodec for ToyPoll {
             tag: STATS_TAG,
             req: HttpRequest {
                 method: HttpMethod::Get,
-                url: format!("{}/stats?symbols={}", self.base_url, symbols.join(",")),
+                url: WireUrl::plain(format!(
+                    "{}/stats?symbols={}",
+                    self.base_url,
+                    symbols.join(",")
+                )),
                 headers: vec![],
                 body: WireSlice::plain(Vec::new()),
             },
@@ -945,7 +949,7 @@ impl ExecCodec for ToyExec {
             tag: RESYNC_TAG,
             req: HttpRequest {
                 method: HttpMethod::Get,
-                url: format!("{}/snapshot?at={}", self.url, ctx.wall.0),
+                url: WireUrl::plain(format!("{}/snapshot?at={}", self.url, ctx.wall.0)),
                 headers: vec![Header {
                     name: "Accept",
                     value: "text/plain".to_owned(),
@@ -1010,14 +1014,16 @@ impl VenueFactory for ToyFactory {
         }
         let mut plan = vec![EndpointPlan {
             stream: StreamId(0),
-            transport: MdTransport::Socket { url },
+            transport: MdTransport::Socket {
+                url: WireUrl::plain(url),
+            },
             subs: streamed,
         }];
         if !polled.is_empty() {
             plan.push(EndpointPlan {
                 stream: POLL_STREAM,
                 transport: MdTransport::Poll {
-                    base_url: base.to_owned(),
+                    base_url: WireUrl::plain(base),
                 },
                 subs: polled,
             });
@@ -1028,7 +1034,7 @@ impl VenueFactory for ToyFactory {
     fn plan_exec(&self, cfg: &VenueConfig) -> Result<Vec<ExecEndpoint>, VenueError> {
         Ok(vec![ExecEndpoint {
             stream: EXEC_STREAM,
-            url: format!("{}/exec", url(cfg)?),
+            url: WireUrl::plain(format!("{}/exec", url(cfg)?)),
         }])
     }
 
@@ -1036,7 +1042,7 @@ impl VenueFactory for ToyFactory {
         match &ep.transport {
             MdTransport::Socket { .. } => Box::new(ToyMd { pings: 0 }),
             MdTransport::Poll { base_url } => Box::new(ToyPoll {
-                base_url: base_url.clone(),
+                base_url: base_url.as_str().to_owned(),
                 symbols: BTreeSet::new(),
             }),
         }
@@ -1698,7 +1704,7 @@ fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
     assert_eq!(
         plan[0].transport,
         MdTransport::Socket {
-            url: "https://toy.invalid/md?symbols=TOY-PERP".to_owned()
+            url: WireUrl::plain("https://toy.invalid/md?symbols=TOY-PERP")
         }
     );
     let mut md = factory.md_codec(&config(), &plan[0]);
@@ -1752,7 +1758,7 @@ fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
         exec_plan,
         [ExecEndpoint {
             stream: EXEC_STREAM,
-            url: "https://toy.invalid/exec".to_owned()
+            url: WireUrl::plain("https://toy.invalid/exec")
         }]
     );
     assert_eq!(
@@ -1844,7 +1850,7 @@ fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
         exec.on_timer(RESYNC_RETRY_TAG, &ctx(2_000, 1, 1), &mut fx);
         assert!(matches!(
             &fx.as_slice()[1],
-            Effect::Http { tag: RESYNC_TAG, req, .. } if req.url.ends_with("at=2000")
+            Effect::Http { tag: RESYNC_TAG, req, .. } if req.url.as_str().ends_with("at=2000")
         ));
     }
 }
@@ -2140,14 +2146,14 @@ fn a_poll_only_feed_is_planned_without_a_connection_and_polled_over_http() {
             EndpointPlan {
                 stream: StreamId(0),
                 transport: MdTransport::Socket {
-                    url: "https://toy.invalid/md?symbols=TOY-PERP".to_owned()
+                    url: WireUrl::plain("https://toy.invalid/md?symbols=TOY-PERP")
                 },
                 subs: vec![book],
             },
             EndpointPlan {
                 stream: POLL_STREAM,
                 transport: MdTransport::Poll {
-                    base_url: "https://toy.invalid".to_owned()
+                    base_url: WireUrl::plain("https://toy.invalid")
                 },
                 subs: vec![stats],
             },
@@ -2665,4 +2671,66 @@ fn an_exec_codec_states_how_many_nonces_each_callback_needs() {
         panic!("{fx:?}");
     };
     assert_eq!(frame.bytes(), b"hello|ts=1000|nonce=42");
+}
+
+#[test]
+fn a_url_carries_its_credential_spans_and_never_shows_them() {
+    // A venue may put a credential in a URL's path, query or user information. The URL keeps
+    // the spans that hold it, as frames and headers do, so the journal can hash them; and no
+    // Debug of a request or an endpoint plan prints them.
+    let secret = "SYNTHETIC-URL-TOKEN";
+    let text = format!("wss://venue.invalid/ws/{secret}/stream");
+    let start = u32::try_from("wss://venue.invalid/ws/".len()).unwrap();
+    let span = start..start + u32::try_from(secret.len()).unwrap();
+    let url = WireUrl::redacted(text.clone(), std::iter::once(span.clone()).collect()).unwrap();
+    assert_eq!(url.as_str(), text);
+    assert_eq!(url.redactions(), [span]);
+    assert_eq!(url, text.as_str());
+    let plain = WireUrl::plain(format!("https://u:{secret}@venue.invalid/x?key={secret}"));
+    assert!(plain.redactions().is_empty());
+
+    let exec = ExecEndpoint {
+        stream: EXEC_STREAM,
+        url: url.clone(),
+    };
+    let md = EndpointPlan {
+        stream: StreamId(0),
+        transport: MdTransport::Socket { url: plain.clone() },
+        subs: vec![],
+    };
+    let poll = MdTransport::Poll {
+        base_url: url.clone(),
+    };
+    let req = HttpRequest {
+        method: HttpMethod::Get,
+        url: url.clone(),
+        headers: vec![],
+        body: WireSlice::plain(Vec::new()),
+    };
+    for shown in [
+        format!("{exec:?}"),
+        format!("{md:?}"),
+        format!("{poll:?}"),
+        format!("{req:?}"),
+        format!("{plain:?}"),
+    ] {
+        assert!(!shown.contains(secret), "{shown}");
+        assert!(shown.contains("venue.invalid"), "{shown}");
+    }
+
+    // Spans must lie inside the text, in order, on character boundaries.
+    let refused =
+        |spans: Vec<std::ops::Range<u32>>| WireUrl::redacted("https://é.invalid".to_owned(), spans);
+    assert_eq!(
+        refused(std::iter::once(0..99).collect()),
+        Err(fbc_core::RedactError::OutOfBounds)
+    );
+    assert_eq!(
+        refused(std::iter::once(9..10).collect()),
+        Err(fbc_core::RedactError::OutOfBounds)
+    );
+    assert_eq!(
+        refused(vec![4..6, 2..3]),
+        Err(fbc_core::RedactError::Unordered)
+    );
 }
