@@ -258,9 +258,9 @@ pub enum SubmitOutcome {
     Unknown,
 }
 
-/// A venue's refusal. Its `Debug` shows the kind and the venue's code, and the venue's message
-/// by length only: a venue can echo a key or an authorization value in an error message, and
-/// nothing marks it (0009).
+/// A venue's refusal. Its `Debug` shows the kind, and the venue's code and message by length
+/// only: the venue writes both, it can echo a key or an authorization value in either, and
+/// nothing marks it (0009). The kind is what the code maps to, so it says what a log needs.
 #[derive(Clone, PartialEq)]
 pub struct Reject {
     /// What kind of refusal it is.
@@ -275,9 +275,18 @@ impl fmt::Debug for Reject {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Reject")
             .field("kind", &self.kind)
-            .field("venue_code", &self.venue_code)
-            .field("raw", &format_args!("<{} bytes>", self.raw.len()))
+            .field("venue_code", &self.venue_code.as_deref().map(ByLength))
+            .field("raw", &ByLength(&self.raw))
             .finish()
+    }
+}
+
+/// Venue text a `Debug` shows by its length only.
+struct ByLength<'a>(&'a str);
+
+impl fmt::Debug for ByLength<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<{} bytes>", self.0.len())
     }
 }
 
@@ -425,10 +434,13 @@ mod tests {
 
     #[test]
     fn debug_never_shows_the_text_a_venue_sent_with_a_reject() {
+        // The venue writes both the message and the code (Codex r4173243254): either can echo
+        // a key, so Debug shows each by length only.
         let secret = "SYNTHETIC-ECHOED-KEY";
+        let code = "SYNTHETIC-CODE-KEY";
         let reject = Reject {
             kind: RejectKind::Other,
-            venue_code: Some(CompactString::from("E401")),
+            venue_code: Some(CompactString::from(code)),
             raw: Arc::from(format!("bad signature for key {secret}")),
         };
         let shown = [
@@ -441,9 +453,16 @@ mod tests {
         ];
         for text in &shown {
             assert!(!text.contains(secret), "venue text reached Debug: {text}");
-            assert!(text.contains("Other") && text.contains("E401"), "{text}");
+            assert!(!text.contains(code), "venue code reached Debug: {text}");
+            assert!(text.contains("Other"), "{text}");
         }
         assert!(shown[0].contains(&format!("<{} bytes>", reject.raw.len())));
+        assert!(shown[0].contains(&format!("Some(<{} bytes>)", code.len())));
+        let bare = Reject {
+            venue_code: None,
+            ..reject.clone()
+        };
+        assert!(format!("{bare:?}").contains("venue_code: None"));
         // The text itself stays available to the code that maps it.
         assert!(reject.raw.contains(secret));
     }

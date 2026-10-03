@@ -891,8 +891,12 @@ pub trait ExecCodec: Send {
     /// A timer the codec set fired (token refresh, keepalive, dead-man refresh).
     fn on_timer(&mut self, tag: TimerTag, ctx: &EncodeCtx, fx: &mut Effects);
     /// Request `rpc`, sent as a frame ([`Effect::Send`]), timed out unanswered: report
-    /// `Outcome { item: None, Unknown }`. The runtime calls it only when no event answering
-    /// `rpc` ([`ExecEvent::answers`]) was pushed before the deadline.
+    /// `Unknown` for every item still unanswered, and keep every answer already decoded. That is
+    /// `Outcome { item: None, Unknown }` when the codec holds no item outcome for `rpc`. For a
+    /// batch whose items the venue answers in separate frames, the codec has held the outcomes
+    /// it decoded (the one-call contract, [`ExecEvent::answers`]): it pushes those, then
+    /// `Unknown` for each other item by its index, so an acknowledged item keeps its venue id.
+    /// The runtime calls it only when no event answering `rpc` was pushed before the deadline.
     fn on_rpc_timeout(&mut self, rpc: RpcId, sink: &mut dyn ExecSink);
     /// Read the venue's open orders and positions (reads only), reported as the `Resync*`
     /// events.

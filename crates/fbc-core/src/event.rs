@@ -485,16 +485,16 @@ pub enum ExecEvent {
     },
     /// The resync snapshot is complete.
     ResyncEnd,
-    /// The answer to order query `rpc`; `found: None` when the venue does not know the order.
-    /// It names its request, as an [`ExecEvent::Outcome`] does, so the runtime clears the
-    /// request's deadline ([`ExecEvent::answers`]) and never times out an answered query.
-    QueryResult {
-        rpc: RpcId,
-        target: OrderRef,
-        found: Option<VenueOrderSnapshot>,
+    /// The answer to an order query, which names its request and never reports another order
+    /// than the one queried ([`QueryAnswer`]).
+    QueryResult(QueryAnswer),
+    /// The account's fee rates: `rpc` names the fee query they answer, as an
+    /// [`ExecEvent::Outcome`] does, so the runtime clears its deadline
+    /// ([`ExecEvent::answers`]); `None` for rates the venue pushed unasked.
+    FeeRates {
+        rpc: Option<RpcId>,
+        rates: Vec<(InstrumentId, Channel, Liquidity, FeeRate)>,
     },
-    /// The account's fee rates.
-    FeeRates(Vec<(InstrumentId, Channel, Liquidity, FeeRate)>),
     /// An error that names no order or request.
     UncorrelatedError(Reject),
 }
@@ -504,18 +504,81 @@ impl ExecEvent {
     /// the event is pushed, so an answered request never reaches
     /// [`ExecCodec::on_rpc_timeout`](crate::ExecCodec::on_rpc_timeout) and no `Unknown` follows
     /// its answer. Every [`ExecEvent::Outcome`] answers its request except `Unknown`, which
-    /// says that no answer came; a [`ExecEvent::QueryResult`] answers its query. A codec
-    /// decodes a reply to a batch in one call that pushes every item's outcome (or nothing,
-    /// [`ExecSink`](crate::ExecSink)), so clearing on the first answer leaves no item waiting.
+    /// says that no answer came; a [`ExecEvent::QueryResult`] answers its query and
+    /// [`ExecEvent::FeeRates`] with an `rpc` its fee query.
+    ///
+    /// The first answer clears the whole request's deadline, so a batch's item outcomes are
+    /// pushed together, in one call (the one-call contract, record 0014): a codec decodes a
+    /// reply to a batch in one call that pushes every item's outcome (or nothing,
+    /// [`ExecSink`](crate::ExecSink)). A venue that answers a batch's items in separate
+    /// frames gets the same: the codec holds the item outcomes it has decoded and pushes none
+    /// until every item is answered, and if the deadline comes first,
+    /// [`ExecCodec::on_rpc_timeout`](crate::ExecCodec::on_rpc_timeout) pushes the held
+    /// outcomes and `Unknown` for each item still unanswered. No item waits after its
+    /// request's deadline is cleared, and no acknowledged item's venue id is lost.
     pub fn answers(&self) -> Option<RpcId> {
         match self {
             ExecEvent::Outcome {
                 outcome: SubmitOutcome::Unknown,
                 ..
             } => None,
-            ExecEvent::Outcome { rpc, .. } | ExecEvent::QueryResult { rpc, .. } => Some(*rpc),
+            ExecEvent::Outcome { rpc, .. } => Some(*rpc),
+            ExecEvent::QueryResult(answer) => Some(answer.rpc),
+            ExecEvent::FeeRates { rpc, .. } => *rpc,
             _ => None,
         }
+    }
+}
+
+/// The answer to order query `rpc` for `target`; `found: None` when the venue does not know
+/// the order. It names its request, as an [`ExecEvent::Outcome`] does, so the runtime clears
+/// the request's deadline ([`ExecEvent::answers`]) and never times out an answered query. Its
+/// fields are private: [`QueryAnswer::new`] refuses a snapshot that names another order, so
+/// the OMS never resolves one order's Unknown state with another's snapshot.
+#[derive(Clone, Eq, PartialEq, Debug)]
+pub struct QueryAnswer {
+    rpc: RpcId,
+    target: OrderRef,
+    found: Option<VenueOrderSnapshot>,
+}
+
+impl QueryAnswer {
+    /// The answer to query `rpc` for `target`, or `None` when `found` is a snapshot of
+    /// another order: every identifier both carry must agree. A target's venue id must be
+    /// the snapshot's; a target's client id must be the snapshot's client id when the
+    /// snapshot carries one, which must then be ours ([`CidMatch::Ours`]). A codec that gets
+    /// `None` returns a [`DecodeError`](crate::DecodeError) for the reply.
+    pub fn new(
+        rpc: RpcId,
+        target: OrderRef,
+        found: Option<VenueOrderSnapshot>,
+    ) -> Option<QueryAnswer> {
+        if let Some(snap) = &found {
+            let vid_agrees = target.venue().is_none_or(|vid| *vid == snap.vid);
+            let cid_agrees = match (target.client(), snap.cid) {
+                (Some(cid), Some(seen)) => seen == CidMatch::Ours(cid),
+                _ => true,
+            };
+            if !(vid_agrees && cid_agrees) {
+                return None;
+            }
+        }
+        Some(QueryAnswer { rpc, target, found })
+    }
+
+    /// The query this answers.
+    pub fn rpc(&self) -> RpcId {
+        self.rpc
+    }
+
+    /// The order the query asked about.
+    pub fn target(&self) -> &OrderRef {
+        &self.target
+    }
+
+    /// The order as the venue reports it; `None` when the venue does not know it.
+    pub fn found(&self) -> Option<&VenueOrderSnapshot> {
+        self.found.as_ref()
     }
 }
 
@@ -555,12 +618,20 @@ mod tests {
         // Codex r4172917321: a query answer that names no request leaves the runtime waiting
         // on its deadline, and on_rpc_timeout would then report Unknown after the answer.
         let target = OrderRef::Client(ClientOrderId::new(crate::ids::Namespace::new(1), 1));
-        let answer = ExecEvent::QueryResult {
-            rpc: RpcId(11),
-            target,
-            found: None,
-        };
+        let answer = ExecEvent::QueryResult(QueryAnswer::new(RpcId(11), target, None).unwrap());
         assert_eq!(answer.answers(), Some(RpcId(11)));
+        // Codex r4173243255: so does a fee query's answer; rates the venue pushed unasked
+        // answer none.
+        let rates = ExecEvent::FeeRates {
+            rpc: Some(RpcId(15)),
+            rates: Vec::new(),
+        };
+        assert_eq!(rates.answers(), Some(RpcId(15)));
+        let pushed = ExecEvent::FeeRates {
+            rpc: None,
+            rates: Vec::new(),
+        };
+        assert_eq!(pushed.answers(), None);
         let ack = ExecEvent::Outcome {
             rpc: RpcId(12),
             item: Some(ItemRef {
@@ -588,6 +659,70 @@ mod tests {
         };
         assert_eq!(refused.answers(), Some(RpcId(14)));
         assert_eq!(ExecEvent::ResyncEnd.answers(), None);
+    }
+
+    #[test]
+    fn a_query_answer_refuses_a_snapshot_of_another_order() {
+        // Codex r4173243256: a snapshot that names another order than the query's target
+        // must not resolve the target's Unknown state.
+        let ns = crate::ids::Namespace::new(1);
+        let (cid, other_cid) = (ClientOrderId::new(ns, 1), ClientOrderId::new(ns, 2));
+        let (vid, other_vid) = crate::scope::dispatch(
+            &crate::cid::ClientIdFormat::Uuid,
+            ns,
+            crate::fee::VenueFeeSign::PositiveIsCost,
+            |scope| {
+                (
+                    scope.venue_order_id("V-1").unwrap(),
+                    scope.venue_order_id("V-2").unwrap(),
+                )
+            },
+        );
+        let snap = |cid: Option<CidMatch>, vid: &VenueOrderId| VenueOrderSnapshot {
+            cid,
+            vid: vid.clone(),
+            inst: InstrumentId::new(1),
+            side: Side::Buy,
+            state: VenueOrderState::Open,
+            px: Some(Ticks(5)),
+            qty: Lots::new(2).unwrap(),
+            cum_filled: Lots::new(0).unwrap(),
+            post_only: None,
+            reduce_only: None,
+        };
+        let answer = |target: OrderRef, found| QueryAnswer::new(RpcId(1), target, found);
+        let by_cid = OrderRef::Client(cid);
+        let by_vid = OrderRef::Venue(vid.clone());
+        let by_both = OrderRef::Both(cid, vid.clone());
+        let ours = Some(CidMatch::Ours(cid));
+        // Every identifier the target and the snapshot both carry agrees: accepted, as is an
+        // answer that found nothing.
+        for (target, found) in [
+            (by_cid.clone(), snap(ours, &other_vid)),
+            (by_cid.clone(), snap(None, &other_vid)),
+            (by_vid.clone(), snap(Some(CidMatch::Unparseable), &vid)),
+            (by_both.clone(), snap(ours, &vid)),
+            (by_both.clone(), snap(None, &vid)),
+        ] {
+            let accepted = answer(target.clone(), Some(found.clone())).unwrap();
+            assert_eq!(accepted.rpc(), RpcId(1));
+            assert_eq!(
+                (accepted.target(), accepted.found()),
+                (&target, Some(&found))
+            );
+        }
+        assert_eq!(answer(by_cid.clone(), None).unwrap().found(), None);
+        // A snapshot whose venue id or client id differs from the target's is refused.
+        for (target, found) in [
+            (by_cid.clone(), snap(Some(CidMatch::Ours(other_cid)), &vid)),
+            (by_cid.clone(), snap(Some(CidMatch::Foreign(ns)), &vid)),
+            (by_cid, snap(Some(CidMatch::Unparseable), &vid)),
+            (by_vid, snap(ours, &other_vid)),
+            (by_both.clone(), snap(ours, &other_vid)),
+            (by_both, snap(Some(CidMatch::Ours(other_cid)), &vid)),
+        ] {
+            assert_eq!(answer(target, Some(found)), None);
+        }
     }
 
     #[test]

@@ -48,10 +48,17 @@ stay sans-IO and deterministic:
    `rpc` naming it, and its failure is its outcome: `NotSent`, or `Unknown`, never resent
    (0005). The traffic class keeps a REST cancel on the safety floor. The journal's outbound
    HTTP record carries the `rpc` (0006). `ExecEvent::QueryResult` carries the `rpc` of the
-   query it answers, and `ExecEvent::answers()` names the request any event answers (every
-   `Outcome` but `Unknown`, and `QueryResult`): the runtime clears that request's deadline on
-   it, so an answered request never reaches `on_rpc_timeout` and no `Unknown` follows its
-   answer (Codex r4172917321). An encode's effects must carry its request:
+   query it answers, `ExecEvent::FeeRates` the `rpc` of the fee query it answers (`None` for
+   rates pushed unasked), and `ExecEvent::answers()` names the request any event answers
+   (every `Outcome` but `Unknown`, `QueryResult`, and `FeeRates` with an `rpc`): the runtime
+   clears that request's deadline on it, so an answered request never reaches
+   `on_rpc_timeout` and no `Unknown` follows its answer (Codex r4172917321, r4173243255).
+   The first answer clears the whole request's deadline, so a batch's item outcomes are
+   pushed in one call (the one-call contract): a venue that answers a batch's items in
+   separate frames has its codec hold the decoded item outcomes until every item is
+   answered, and if the deadline comes first `on_rpc_timeout` pushes the held outcomes and
+   `Unknown` only for the items still unanswered, so an acknowledged item keeps its venue id
+   (Codex r4173243266; a venue that exercises it is FBC-z6v). An encode's effects must carry its request:
    `Effects::carry_request(rpc, class)` holds when there is a frame or HTTP request and every
    one names the encode's `rpc` and carries the command's `traffic_class()`; the runtime
    executes an encode's effects only then, and otherwise writes nothing and reports
@@ -79,6 +86,10 @@ stay sans-IO and deterministic:
    `RejectKind` recursive); `VenueOrderState::Rejected` takes a `TerminalReject`, which refuses
    `RejectKind::NotFound` and the refusals of an operation on an existing order that leave it
    as it was (`AlreadyTerminal`, `NotAmendable`, `NoChange`; Codex r4173187115).
+   `ExecEvent::QueryResult` holds a `QueryAnswer` with private fields: `QueryAnswer::new`
+   refuses a snapshot whose venue id or client id differs from the query's target, so one
+   order's Unknown state is never resolved with another order's snapshot (Codex
+   r4173243256).
 7. **Events say what they do and do not know.** `MdEvent::Health` names the `Feed` whose health
    changed; `OrderUpdate` carries the `post_only` and `reduce_only` flags a venue echoes. `ExecEvent::Mode { scope, mode }` names the market
    (`ModeScope::Instrument`) or the whole account a venue mode applies to; `OrderUpdate`,
@@ -104,7 +115,10 @@ stay sans-IO and deterministic:
    reject text by length only. URLs are `WireUrl`s (`HttpRequest.url`, `ExecEndpoint.url`,
    `MdTransport`'s URLs) carrying credential spans like `WireSlice`, so the journal can hash
    a key in a path or query; their `Debug` finds user information, query and fragment in the
-   URL as written, shows them by length, and redacts spans inside what it shows.
+   URL as written, shows them by length, and redacts spans inside what it shows. A
+   `Reject` shows the venue's error code by length too: the venue writes it as it writes the
+   message, and either can echo a key (Codex r4173243254); its `RejectKind` says what a log
+   needs.
    `VenueConfig`'s `Debug` shows keys and value lengths only.
 9. **Configuration, connections and traffic class.** `VenueConfig` keeps market-scoped keys per
    instrument (`insert_market`, `get_market`). `VenueFactory::plan_exec` returns the order-entry
