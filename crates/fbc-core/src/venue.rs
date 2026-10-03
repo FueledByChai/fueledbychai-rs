@@ -55,10 +55,15 @@ pub struct FieldSpec {
     pub doc: &'static str,
 }
 
-/// A venue's configuration, as text values by key; the consumer supplies it.
+/// A venue's configuration, as text values by key; the consumer supplies it. Account- and
+/// process-scoped keys hold one value each ([`insert`](VenueConfig::insert)); market-scoped
+/// keys ([`ConfigScope::Market`]) hold one value per instrument
+/// ([`insert_market`](VenueConfig::insert_market)), so markets sharing a connection keep
+/// their own settings.
 #[derive(Clone, Eq, PartialEq, Hash, Debug, Default)]
 pub struct VenueConfig {
     values: BTreeMap<String, String>,
+    markets: BTreeMap<InstrumentId, BTreeMap<String, String>>,
 }
 
 impl VenueConfig {
@@ -75,6 +80,19 @@ impl VenueConfig {
     /// The value of `key`.
     pub fn get(&self, key: &str) -> Option<&str> {
         self.values.get(key).map(String::as_str)
+    }
+
+    /// Sets market-scoped `key` to `value` for `inst` alone, returning the value it replaced.
+    pub fn insert_market(&mut self, inst: InstrumentId, key: &str, value: &str) -> Option<String> {
+        self.markets
+            .entry(inst)
+            .or_default()
+            .insert(key.to_owned(), value.to_owned())
+    }
+
+    /// The value of market-scoped `key` for `inst`.
+    pub fn get_market(&self, inst: InstrumentId, key: &str) -> Option<&str> {
+        self.markets.get(&inst)?.get(key).map(String::as_str)
     }
 }
 
@@ -199,6 +217,26 @@ mod tests {
         assert_eq!(cfg.insert("a", "1"), None);
         assert_eq!(cfg.insert("a", "2"), Some("1".to_owned()));
         assert_eq!(cfg.get("a"), Some("2"));
+    }
+
+    #[test]
+    fn market_scoped_values_are_kept_per_instrument() {
+        let (btc, eth) = (InstrumentId::new(1), InstrumentId::new(2));
+        let mut cfg = VenueConfig::new();
+        assert_eq!(cfg.insert_market(btc, "book", "deltas"), None);
+        assert_eq!(cfg.insert_market(eth, "book", "interactive_deltas"), None);
+        // The second market's value does not overwrite the first's.
+        assert_eq!(cfg.get_market(btc, "book"), Some("deltas"));
+        assert_eq!(cfg.get_market(eth, "book"), Some("interactive_deltas"));
+        assert_eq!(
+            cfg.insert_market(btc, "book", "snapshots"),
+            Some("deltas".to_owned())
+        );
+        assert_eq!(cfg.get_market(btc, "book"), Some("snapshots"));
+        // A market value is not an account value, and a market without one has none.
+        assert_eq!(cfg.get("book"), None);
+        assert_eq!(cfg.get_market(InstrumentId::new(3), "book"), None);
+        assert_eq!(cfg.get_market(btc, "other"), None);
     }
 
     #[test]
