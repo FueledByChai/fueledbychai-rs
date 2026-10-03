@@ -9,7 +9,8 @@
 //! only what its codecs do. One socket carries the touch; one carries order entry (unsigned
 //! limit orders out; acks, account events, fills and a resync answered in one frame in). It has
 //! no book, trades or other feed, cancels, amends and queries nothing, reads no configuration,
-//! and asks for no HTTP or keepalive; its one timer asks again for an unanswered resync.
+//! and asks for no HTTP or keepalive; it keeps one resync in flight, and its one timer asks
+//! for that resync again while it is unanswered.
 //!
 //! Protocol: one record per line, `kind|key=value|...`; `ts` is the venue's matching-engine time
 //! in nanoseconds and `seq` its sequence. Prices are ticks, sizes lots, money nanos of USDC.
@@ -291,6 +292,17 @@ impl ToyExec {
         })
     }
 
+    /// Asks for the resync of instant `at`, and again after `RPC_TIMEOUT` unless answered.
+    fn ask_resync(at: WallNs, fx: &mut Effects) {
+        let request = format!("snapshot|ts={}", at.0);
+        fx.push(send(EXEC_STREAM, &request, None, TrafficClass::Safety));
+        let after = RPC_TIMEOUT;
+        fx.push(Effect::Timer {
+            tag: RESYNC_TAG,
+            after,
+        });
+    }
+
     /// A resync answer, one frame: `rbegin`, then `rorder` and `rpos` records, then `rend`.
     /// The whole envelope is checked before anything is returned, and the answer must echo the
     /// instant of the resync asked for, `requested`, which is its watermark.
@@ -478,10 +490,10 @@ impl ExecCodec for ToyExec {
         Err(DecodeError::Malformed("the toy asks for no HTTP"))
     }
 
-    /// The resync timer: a resync still unanswered is asked for again, at the new instant.
-    fn on_timer(&mut self, tag: TimerTag, ctx: &EncodeCtx, fx: &mut Effects) {
-        if tag == RESYNC_TAG && self.resync_at.is_some() {
-            self.resync(ctx, fx);
+    /// The resync timer: a resync still unanswered is asked for again, with the same instant.
+    fn on_timer(&mut self, tag: TimerTag, _ctx: &EncodeCtx, fx: &mut Effects) {
+        if let (RESYNC_TAG, Some(at)) = (tag, self.resync_at) {
+            ToyExec::ask_resync(at, fx);
         }
     }
 
@@ -490,15 +502,12 @@ impl ExecCodec for ToyExec {
         sink.push(VenueMeta::NONE, ExecEvent::Outcome { rpc, item, outcome });
     }
 
+    /// One resync in flight: while one is unanswered, its timer chain asks again.
     fn resync(&mut self, ctx: &EncodeCtx, fx: &mut Effects) {
-        self.resync_at = Some(ctx.wall);
-        let request = format!("snapshot|ts={}", ctx.wall.0);
-        fx.push(send(EXEC_STREAM, &request, None, TrafficClass::Safety));
-        let after = RPC_TIMEOUT;
-        fx.push(Effect::Timer {
-            tag: RESYNC_TAG,
-            after,
-        });
+        if self.resync_at.is_none() {
+            self.resync_at = Some(ctx.wall);
+            ToyExec::ask_resync(ctx.wall, fx);
+        }
     }
 }
 
@@ -1119,8 +1128,11 @@ fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
     let mut fx = Effects::new();
     exec.on_open(EXEC_STREAM, &ctx(1_000, &[]), &mut fx);
     exec.resync(&ctx(2_000, &[]), &mut fx);
-    // An unanswered resync is asked for again when its timer fires, at the new instant; once a
-    // resync is answered, the timer asks for nothing.
+    // One resync is in flight at a time (Codex r4173243261): asking again while one is
+    // unanswered starts no second request or timer. Its timer asks for the same resync again,
+    // with the same instant, so a slow reply to either copy still matches; once a resync is
+    // answered, the timer asks for nothing.
+    exec.resync(&ctx(5_000, &[]), &mut fx);
     assert_eq!(exec.nonces_for(CtxCall::Timer(RESYNC_TAG)), 0);
     exec.on_timer(RESYNC_TAG, &ctx(9_000, &[]), &mut fx);
     let safety = |text| send(EXEC_STREAM, text, None, TrafficClass::Safety);
@@ -1128,16 +1140,16 @@ fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
         tag: RESYNC_TAG,
         after: RPC_TIMEOUT,
     };
-    let (hello, first, again) = ("hello|ts=1000", "snapshot|ts=2000", "snapshot|ts=9000");
+    let (hello, asked) = ("hello|ts=1000", "snapshot|ts=2000");
     let expected = [
         safety(hello),
-        safety(first),
+        safety(asked),
         retry.clone(),
-        safety(again),
+        safety(asked),
         retry,
     ];
     assert_eq!(fx.take(), expected);
-    let (results, _) = decode_exec(exec.as_mut(), &["rbegin|wm=9000\nrend"]);
+    let (results, _) = decode_exec(exec.as_mut(), &["rbegin|wm=2000\nrend"]);
     assert_eq!(results, [Ok(())]);
     exec.on_timer(RESYNC_TAG, &ctx(16_000, &[]), &mut fx);
     assert!(fx.is_empty());
