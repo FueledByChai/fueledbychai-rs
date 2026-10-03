@@ -272,6 +272,15 @@ impl PriceGrid {
         }
     }
 
+    /// The lowest valid order price: `Some` on a banded grid, which accepts nothing below its
+    /// first band; `None` on grids valid at every magnitude.
+    pub fn lowest_valid(&self) -> Option<Ticks> {
+        match self {
+            PriceGrid::Banded(grid) => self.ceil_valid(Ticks(grid.bands[0].from_ticks)),
+            PriceGrid::Fixed(_) | PriceGrid::SigFigs(_) => None,
+        }
+    }
+
     /// The least valid order price at or above `px`: where an ask quantizes to. `None` only
     /// when it does not fit an `i64`.
     ///

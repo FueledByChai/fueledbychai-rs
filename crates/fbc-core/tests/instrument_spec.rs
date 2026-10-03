@@ -307,6 +307,12 @@ fn notional_is_price_times_size_times_multiplier_in_quote_nanos() {
         Some(Money::new(2, usd()))
     );
     assert_eq!(half.notional(Ticks(i64::MAX), lots(i64::MAX)), None);
+    // Far below a nano (1e-56 USD), the notional is zero.
+    let tiny = InstrumentSpec {
+        size_step: SizeStep::new(dec("0.0000000000000000000000000001")).unwrap(),
+        ..fixed("0.0000000000000000000000000001")
+    };
+    assert_eq!(tiny.notional(Ticks(1), lots(1)), Some(Money::new(0, usd())));
 }
 
 #[test]
@@ -387,5 +393,58 @@ fn a_notional_beyond_decimal_nanos_still_fits_money() {
     assert_eq!(
         unit.notional(Ticks(10_000_000_000), Lots::new(10_000_000_000).unwrap()),
         Some(Money::new(100_000_000_000_000_000_000_000_000_000, usd()))
+    );
+}
+
+#[test]
+fn a_notional_whose_intermediate_product_is_beyond_a_decimal_still_fits() {
+    // A price of 1e28 (1e18 ticks of 1e10) times 100 lots of 1 is past a Decimal, but the
+    // 0.0001 multiplier brings the notional to 1e26 USD, 1e35 nanos.
+    let huge = InstrumentSpec {
+        size_step: SizeStep::new(dec("1")).unwrap(),
+        multiplier: dec("0.0001"),
+        ..fixed("10000000000")
+    };
+    assert_eq!(
+        huge.notional(Ticks(1_000_000_000_000_000_000), Lots::new(100).unwrap()),
+        Some(Money::new(10_i128.pow(35), usd()))
+    );
+    // Mantissas whose product passes i128 fall back to Decimal arithmetic, which rounds at
+    // 28 significant digits but still answers.
+    let wide = InstrumentSpec {
+        size_step: SizeStep::new(dec("0.123")).unwrap(),
+        multiplier: dec("1.2345"),
+        ..fixed("0.000000001")
+    };
+    let money = wide
+        .notional(
+            Ticks(123_456_789_012_345_678),
+            Lots::new(1_000_000_000_000_000_000).unwrap(),
+        )
+        .unwrap();
+    // 123456789.012345678 USD a unit times 1e18 lots of 0.123 times 1.2345, in nanos.
+    let expected = 123_456_789.012_345_7 * 1e18 * 0.123 * 1.2345 * 1e9;
+    assert!(
+        ((money.nanos as f64) / expected - 1.0).abs() < 1e-12,
+        "{money:?}"
+    );
+}
+
+#[test]
+fn a_maker_safe_price_past_the_end_of_i64_is_out_of_range() {
+    // Two figures, integer finest step: 9.21e18 fits an i64, but the ask's grid price 9.3e18
+    // does not; that is out of range, not "no valid price".
+    let two = spec(PriceGrid::sig_figs(2, 0, false).unwrap());
+    assert_eq!(
+        two.quantize(Side::Sell, 9.21e18),
+        Err(QuantizeError::OutOfRange)
+    );
+    assert_eq!(
+        two.quantize(Side::Buy, -9.21e18),
+        Err(QuantizeError::OutOfRange)
+    );
+    assert_eq!(
+        two.quantize(Side::Buy, 9.21e18),
+        Ok(Ticks(9_200_000_000_000_000_000))
     );
 }
