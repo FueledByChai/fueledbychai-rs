@@ -24,7 +24,6 @@ use std::collections::BTreeMap;
 use arrayvec::ArrayVec;
 use compact_str::CompactString;
 
-use crate::cid::ClientIdFormat;
 use crate::command::{NotSentReason, OrderKind, Tif, VenueCommand};
 use crate::event::{ExecEvent, MdEvent, RpcId, StreamId, TouchSourceId, VenueMeta};
 use crate::fee::FeeError;
@@ -702,8 +701,6 @@ pub trait ExecCodec: Send {
     /// Read the venue's open orders and positions (reads only), reported as the `Resync*`
     /// events.
     fn resync(&mut self, ctx: &EncodeCtx, fx: &mut Effects);
-    /// How the venue spells our client ids.
-    fn client_id_format(&self) -> &ClientIdFormat;
 }
 
 /// The most bytes a [`Sig`] holds.
@@ -807,6 +804,7 @@ pub trait OrderSigner: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cid::ClientIdFormat;
     use crate::fee::VenueFeeSign;
     use crate::grid::PriceGrid;
     use crate::ids::{Namespace, UnderlyingId, VenueId};

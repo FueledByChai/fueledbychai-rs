@@ -20,9 +20,9 @@ use fbc_core::{
     BookSide, Cadence, CancelOnDisconnect, CancelOrder, CancelWire, Channel, Charset, CidMatch,
     CidMint, ClientIdFormat, ClientOrderId, ConfigError, ConfigScope, ConnKey, ConnTopology,
     Continuity, DecodeError, DecodeScope, EncodeCtx, EncodeReceipt, Encoding, EndpointPlan,
-    Envelope, ExchNs, ExchTsKind, ExecCodec, ExecEvent, ExecSink, Feed, FeedHealth, FeedSource,
-    FieldSpec, FieldUnit, FillCaps, FillEvent, FillKey, FillSource, FundingCaps, FundingSpec,
-    Header, HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag, InstrumentId,
+    Envelope, ExchNs, ExchTsKind, ExecCodec, ExecEndpoint, ExecEvent, ExecSink, Feed, FeedHealth,
+    FeedSource, FieldSpec, FieldUnit, FillCaps, FillEvent, FillKey, FillSource, FundingCaps,
+    FundingSpec, Header, HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag, InstrumentId,
     InstrumentKind, InstrumentSpec, ItemRef, Keepalive, KeepaliveKind, Liquidity3, Lots, Lvl,
     MatchingCaps, MdCaps, MdCodec, MdEvent, MdSink, ModeScope, Money, MonoNs, Namespace,
     NamespaceLease, NewOrder, NonceBlock, NonceScope, NotSentReason, OrderCaps, OrderKind,
@@ -32,8 +32,8 @@ use fbc_core::{
     StpScope, StreamId, SubmitOutcome, Subscription, Support, TagSet, Ticks, TifTag, TimerTag,
     TouchSourceCaps, TouchSourceId, TradeCaps, TradingStatus, TrafficClass, UnderlyingId,
     VenueCaps, VenueCommand, VenueConfig, VenueError, VenueFactory, VenueFeeSign, VenueId,
-    VenueMeta, VenueMode, VenueOrderSnapshot, VenueOrderState, WallNs, WireSlice, dispatch,
-    encode_cid,
+    VenueMeta, VenueMode, VenueOrderSnapshot, VenueOrderState, WallNs, WireSlice, decode_cid,
+    dispatch, encode_cid,
 };
 use fbc_core::{AmendAck, Batch, Effect, Effects};
 use rust_decimal::Decimal;
@@ -792,10 +792,6 @@ impl ExecCodec for ToyExec {
             class: TrafficClass::Safety,
         });
     }
-
-    fn client_id_format(&self) -> &ClientIdFormat {
-        &CID_FORMAT
-    }
 }
 
 /// The toy venue's factory.
@@ -845,6 +841,13 @@ impl VenueFactory for ToyFactory {
             stream: StreamId(0),
             url,
             subs: subs.iter().copied().collect(),
+        }])
+    }
+
+    fn plan_exec(&self, cfg: &VenueConfig) -> Result<Vec<ExecEndpoint>, VenueError> {
+        Ok(vec![ExecEndpoint {
+            stream: EXEC_STREAM,
+            url: format!("{}/exec", url(cfg)?),
         }])
     }
 
@@ -1524,10 +1527,40 @@ fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
     );
     assert!(fx.is_empty());
 
+    // The factory plans the order-entry connection the runtime opens before on_open, so the
+    // runtime needs no venue knowledge to reach order entry.
+    let exec_plan = factory.plan_exec(&config()).unwrap();
+    assert_eq!(
+        exec_plan,
+        [ExecEndpoint {
+            stream: EXEC_STREAM,
+            url: "https://toy.invalid/exec".to_owned()
+        }]
+    );
+    assert_eq!(
+        factory.plan_exec(&empty),
+        Err(VenueError::Config(ConfigError::Missing(URL_KEY)))
+    );
+
+    // The client-id format has one source, the capabilities: the runtime decodes with it, and
+    // what the exec codec puts on the wire decodes under it as ours.
+    let format = factory.caps(&config()).unwrap().order.unwrap().client_id;
+    let [cid] = mint(1).try_into().unwrap();
+    let text = String::from_utf8(encode_once(
+        exec_codec().as_mut(),
+        &VenueCommand::Place(order(cid, 130_865)),
+        &ctx(1, 1, 1),
+    ))
+    .unwrap();
+    let wire = text
+        .split('|')
+        .find_map(|kv| kv.strip_prefix("cid="))
+        .unwrap();
+    assert_eq!(decode_cid(&format, OWN_NS, wire), CidMatch::Ours(cid));
+
     // The exec codec opens, pings and resyncs by asking for effects, and decodes the resync
     // response it asked for.
     let mut exec = exec_codec();
-    assert_eq!(exec.client_id_format(), &CID_FORMAT);
     let mut fx = Effects::new();
     let at = ctx(1_000, 1, 1);
     exec.on_open(EXEC_STREAM, &at, &mut fx);
