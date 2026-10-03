@@ -252,6 +252,25 @@ pub enum RejectKind {
     Other,
 }
 
+/// A refusal that ends an order: any [`RejectKind`] but [`RejectKind::NotFound`], which moves an
+/// order to Unknown and is never terminal (decision 0005). It is what
+/// [`VenueOrderState::Rejected`](crate::VenueOrderState::Rejected) carries, so an order state
+/// cannot report an order as rejected for being unknown.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct TerminalReject(RejectKind);
+
+impl TerminalReject {
+    /// `kind` as an order-ending refusal, or `None` for [`RejectKind::NotFound`].
+    pub fn new(kind: RejectKind) -> Option<TerminalReject> {
+        (kind != RejectKind::NotFound).then_some(TerminalReject(kind))
+    }
+
+    /// What kind of refusal it is.
+    pub fn kind(self) -> RejectKind {
+        self.0
+    }
+}
+
 /// The terminal state a venue says an order already reached, when it says which.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum TerminalHint {
@@ -327,6 +346,18 @@ mod tests {
         assert_eq!(amend(4, 4).wire_qty(AmendQty::Remaining), None);
         assert_eq!(amend(3, 4).wire_qty(AmendQty::Remaining), None);
         assert_eq!(amend(3, 4).wire_qty(AmendQty::TotalIncludingFilled), None);
+    }
+
+    #[test]
+    fn a_terminal_reject_is_any_kind_but_not_found() {
+        assert_eq!(TerminalReject::new(RejectKind::NotFound), None);
+        let margin = TerminalReject::new(RejectKind::Margin).unwrap();
+        assert_eq!(margin.kind(), RejectKind::Margin);
+        let mode = RejectKind::VenueMode(crate::event::VenueMode::Halted);
+        assert_eq!(
+            TerminalReject::new(mode).map(TerminalReject::kind),
+            Some(mode)
+        );
     }
 
     #[test]

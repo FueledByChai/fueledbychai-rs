@@ -28,7 +28,7 @@
 use core::time::Duration;
 
 use crate::caps::OpKind;
-use crate::command::{Reject, RejectKind, SubmitOutcome};
+use crate::command::{Reject, SubmitOutcome, TerminalReject};
 use crate::fee::{Fee, FeeRate};
 use crate::ids::{CidMatch, ClientOrderId, FillId, InstrumentId, OrderRef, VenueOrderId};
 use crate::time::{ExchNs, ExchTsKind, Stamp, WallNs};
@@ -260,7 +260,8 @@ pub enum VenueOrderState {
     Open,
     Filled,
     Canceled(CancelReason),
-    Rejected(RejectKind),
+    /// Refused for good; never for not knowing the order ([`TerminalReject`]).
+    Rejected(TerminalReject),
     Expired,
     /// Amended to `px` and `qty` (total, filled part included), under `new_vid` where the
     /// venue issues a new order id for the amended order.

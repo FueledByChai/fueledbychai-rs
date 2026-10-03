@@ -1,7 +1,8 @@
 //! Decision 0004: the sealed types refuse misuse at compile time, proven case by case by the
 //! files under `tests/ui/` (the four clocks cannot be mixed), `tests/ui_units/` (the unit
-//! seals), `tests/ui_ids/` (the id seals), `tests/ui_fee/` (the fee seal) and `tests/ui_caps/`
-//! (decision 0003: capabilities and specs with every field mandatory) and their expected
+//! seals), `tests/ui_ids/` (the id seals), `tests/ui_fee/` (the fee seal), `tests/ui_caps/`
+//! (decision 0003: capabilities and specs with every field mandatory) and `tests/ui_states/`
+//! (decision 0005: no terminal state for an unknown order) and their expected
 //! `.stderr`. Regenerate the expected output with
 //! `TRYBUILD=overwrite cargo test -p fbc-core --test compile_fail` only when the pinned
 //! toolchain moves (0008).
@@ -47,4 +48,12 @@ fn fee_seal_does_not_compile() {
 fn caps_and_specs_declare_every_field() {
     let cases = trybuild::TestCases::new();
     cases.compile_fail("tests/ui_caps/*.rs");
+}
+
+/// `VenueOrderState::Rejected` takes a `TerminalReject`, which refuses `RejectKind::NotFound`
+/// and cannot be built as a literal: not knowing an order is never terminal (decision 0005).
+#[test]
+fn a_not_found_rejection_is_not_a_terminal_state() {
+    let cases = trybuild::TestCases::new();
+    cases.compile_fail("tests/ui_states/*.rs");
 }

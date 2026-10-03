@@ -47,7 +47,8 @@ pub use codec::{
 };
 pub use command::{
     AckLevel, AmendOrder, CancelOrder, CancelScope, NewOrder, NotAmendable, NotSentReason,
-    OrderKind, QueryOrder, Reject, RejectKind, SubmitOutcome, TerminalHint, Tif, VenueCommand,
+    OrderKind, QueryOrder, Reject, RejectKind, SubmitOutcome, TerminalHint, TerminalReject, Tif,
+    VenueCommand,
 };
 pub use event::{
     CancelReason, ConnState, Envelope, ExecEvent, FeedHealth, FillEvent, FillKey, ItemRef,
