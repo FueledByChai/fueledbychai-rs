@@ -283,11 +283,10 @@ pub enum VenueOrderState {
     /// Refused for good; never for not knowing the order ([`TerminalReject`]).
     Rejected(TerminalReject),
     Expired,
-    /// Amended to `px` and `qty` (total, filled part included), under `new_vid` where the
-    /// venue issues a new order id for the amended order.
+    /// Amended, under `new_vid` where the venue issues a new order id for the amended order.
+    /// The new price and total (filled part included) are the event's own `px` and `qty`,
+    /// stated once there; `None` where the venue does not echo them.
     Amended {
-        px: Ticks,
-        qty: Lots,
         new_vid: Option<VenueOrderId>,
     },
 }
