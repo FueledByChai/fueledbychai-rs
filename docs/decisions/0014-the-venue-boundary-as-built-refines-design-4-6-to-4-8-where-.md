@@ -41,18 +41,27 @@ stay sans-IO and deterministic:
    instrument missing from the table (a refused `subscribe` pushes nothing).
 5. **Commands carry what a stateless codec needs.** `AmendOrder` has no `kind` (an amend targets
    a resting limit order) and carries `cum_filled`, so `AmendOrder::wire_qty` gives the
-   remaining quantity a venue with `AmendQty::Remaining` expects: exactly the resting quantity
-   the OMS checked.
+   remaining quantity a venue with `AmendQty::Remaining` expects: the resting quantity the OMS
+   checked. Fills the OMS has not seen can reach the venue first, so the OMS counts such an
+   amend's resting as the wire quantity it sent until the venue reports the order's total
+   (FBC-w5n). `QueryOrder` carries `placement_nonce`, as `CancelOrder` does, for venues that
+   query by it.
 6. **Values that would contradict 0005 are unrepresentable.** `RejectKind::AlreadyTerminal`
    takes a payload-free `TerminalHint` (the design's `TerminalKind(RejectKind)` would make
    `RejectKind` recursive); `VenueOrderState::Rejected` takes a `TerminalReject`, which refuses
    `RejectKind::NotFound`.
-7. **`ExecEvent::Mode { scope, mode }`** names the market (`ModeScope::Instrument`) or the whole
-   account a venue mode applies to.
-8. **`Debug` never shows a credential (0009).** `WireSlice`, `Header`, `HttpResponse` and
-   `RawFrame` format redaction spans, redacted header values, response bodies and inbound frames
-   by length only.
-9. `Vec` stands where the design has `SmallVec` or `Bytes`, to add no dependency yet.
+7. **Events say what they do not know.** `ExecEvent::Mode { scope, mode }` names the market
+   (`ModeScope::Instrument`) or the whole account a venue mode applies to; `OrderUpdate`,
+   `FillEvent` and `VenueOrderSnapshot` carry `cid: Option<CidMatch>`, `None` when the venue
+   echoes no client id (not `Unparseable`, which means a non-canonical id was present).
+8. **`Debug` never shows a credential (0009).** `WireSlice`, `Header`, `HttpRequest`,
+   `HttpResponse`, `RawFrame` and `Reject` format redaction spans, redacted header values, a
+   URL's user information, query and fragment, response bodies, inbound frames and a venue's
+   reject text by length only.
+9. **Configuration and traffic class.** `VenueConfig` keeps market-scoped keys per instrument
+   (`insert_market`, `get_market`). A request is `Safety` only when every item is: a batch of
+   reducing orders is `Safety`, a mixed batch `Normal`.
+10. `Vec` stands where the design has `SmallVec` or `Bytes`, to add no dependency yet.
 
 Calls the design lists but FBC-5 left out each have a ticket: `discover` and
 `parse_fbc_common_symbol` (FBC-ahf), credentials for `exec_codec` and `test_connection` (FBC-b3b,
