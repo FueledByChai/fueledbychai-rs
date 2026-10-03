@@ -51,6 +51,8 @@ const ANCHOR_TAG: HttpTag = HttpTag(2);
 const PING_TAG: TimerTag = TimerTag(1);
 const RESYNC_RETRY_TAG: TimerTag = TimerTag(2);
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
+/// The most orders one placement batch carries.
+const MAX_BATCH: u16 = 4;
 /// The connectionless endpoint the toy's REST-only stats are polled on.
 const POLL_STREAM: StreamId = StreamId(2);
 const POLL_TAG: TimerTag = TimerTag(3);
@@ -758,6 +760,10 @@ impl ExecCodec for ToyExec {
                 (frame, ToyExec::class(o.reduce_only))
             }
             VenueCommand::PlaceBatch(orders) => {
+                // No more items than the caps declare (OrderCaps::batch_place).
+                if orders.len() > usize::from(MAX_BATCH) {
+                    return Err(NotSentReason::Unsupported);
+                }
                 let mut frames = Vec::new();
                 for (idx, o) in (0u16..).zip(orders) {
                     let (frame, nonce) = self.place_frame(o, idx, specs, ctx)?;
@@ -1033,7 +1039,9 @@ fn toy_caps() -> VenueCaps {
             query_refs: TagSet::of(&[RefKind::Venue, RefKind::PlacementNonce]),
             cancel_before_ack: false,
             cancel_is_signed: false,
-            batch_place: Some(Batch { max_items: 4 }),
+            batch_place: Some(Batch {
+                max_items: MAX_BATCH,
+            }),
             batch_cancel: None,
             cancel_all_account: Support::Unsupported,
             cancel_all_instrument: Support::Unsupported,
@@ -2333,4 +2341,30 @@ fn two_book_channels_of_one_instrument_on_one_connection_stay_apart() {
         hi: Ticks(2),
     };
     assert_ne!(window(0), window(1));
+}
+
+#[test]
+fn a_batch_longer_than_the_declared_maximum_is_not_sent() {
+    let max = toy_caps().order.unwrap().batch_place.unwrap().max_items;
+    let cids = mint(usize::from(max) + 1);
+    let orders = |n: usize| {
+        let px = (0i64..).map(|i| 130_800 + i);
+        cids[..n]
+            .iter()
+            .zip(px)
+            .map(|(c, px)| order(*c, px))
+            .collect::<Vec<_>>()
+    };
+    let len = u16::try_from(cids.len()).unwrap();
+    let mut codec = exec_codec();
+    let mut fx = Effects::new();
+    let full = VenueCommand::PlaceBatch(orders(usize::from(max)));
+    codec
+        .encode(&full, RpcId(20), &specs(), &ctx(5, 1, len), &mut fx)
+        .unwrap();
+    assert_eq!(fx.take().len(), 1);
+    let over = VenueCommand::PlaceBatch(orders(cids.len()));
+    let refused = codec.encode(&over, RpcId(21), &specs(), &ctx(5, 1, len), &mut fx);
+    assert_eq!(refused, Err(NotSentReason::Unsupported));
+    assert!(fx.is_empty());
 }
