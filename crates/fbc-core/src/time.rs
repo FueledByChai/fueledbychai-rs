@@ -75,7 +75,7 @@ pub struct ConnKey {
 }
 
 /// Where and when a frame arrived, recorded before it is decoded.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct Stamp {
     /// Shard-global consumption order, which is also replay order.
     pub ingest_seq: u64,
