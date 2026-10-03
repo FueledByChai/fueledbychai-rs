@@ -627,7 +627,9 @@ impl ExecCodec for ToyExec {
                     frames.push(frame);
                     receipt.nonces.push((idx, nonce));
                 }
-                (frames.join("\n"), TrafficClass::Normal)
+                // Safety only when every item is reducing.
+                let reducing = orders.iter().all(|o| o.reduce_only);
+                (frames.join("\n"), ToyExec::class(reducing))
             }
             VenueCommand::Amend(a) => {
                 let spec = specs.get(a.inst).ok_or(NotSentReason::Unencodable)?;
@@ -1277,6 +1279,27 @@ fn encode_takes_time_and_nonces_only_from_the_encode_ctx() {
         )
     );
     assert!(frame.redactions().is_empty());
+
+    // A batch of reducing orders only is safety traffic, like a single reducing order; a batch
+    // that mixes in a non-reducing order is normal traffic (TrafficClass).
+    let reducing = |cid, px| NewOrder {
+        reduce_only: true,
+        ..order(cid, px)
+    };
+    let class_of = |cmd: &VenueCommand| {
+        let mut fx = Effects::new();
+        exec_codec()
+            .encode(cmd, RpcId(12), &specs(), &ctx(5, 700, 2), &mut fx)
+            .unwrap();
+        match fx.as_slice() {
+            [Effect::Send { class, .. }] => *class,
+            other => panic!("{other:?}"),
+        }
+    };
+    let all_reducing = VenueCommand::PlaceBatch(vec![reducing(a, 130_866), reducing(b, 130_867)]);
+    let mixed = VenueCommand::PlaceBatch(vec![reducing(a, 130_866), order(b, 130_864)]);
+    assert_eq!(class_of(&all_reducing), TrafficClass::Safety);
+    assert_eq!(class_of(&mixed), TrafficClass::Normal);
 
     // Nonces need not be consecutive (a venue whose NonceScope is Random): each item takes the
     // value reserved for it, whatever the others are.

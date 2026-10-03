@@ -306,6 +306,9 @@ pub enum HttpFailure {
 
 /// Which traffic a frame is: safety traffic (cancels, reducing orders, keepalives,
 /// authentication) keeps flowing at a rate scope's safety floor when normal traffic stops.
+/// A request is safety traffic only when every item in it is: a batch of reducing orders is
+/// `Safety`, a batch that mixes in one non-reducing order is `Normal`, so the planner keeps
+/// reducing orders out of mixed batches rather than let normal orders ride the safety floor.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum TrafficClass {
     Safety,
