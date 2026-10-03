@@ -9,7 +9,7 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0004](0004-ids-fees-time-prices-and-quantities-are-sealed-newtypes-and-.md) Ids, fees, time, prices and quantities are sealed newtypes, and a fee is positive when we paid it — accepted
 - [0005](0005-the-library-owns-order-truth-a-monotone-order-lattice-permit.md) The library owns order truth: a monotone order lattice, permits, and one ExecutionPlanner — accepted
 - [0006](0006-the-journal-records-everything-that-crosses-the-shard-bounda.md) The journal records everything that crosses the shard boundary and keeps a reserve so safety traffic never blocks — accepted
-- [0007](0007-venue-order-paradex-first-then-hibachi-with-binance-usd-m-fu.md) Venue order: Paradex first, then Hibachi, with Binance USD-M futures as reference market data — accepted
+- [0007](0007-venue-order-paradex-first-then-hibachi-with-binance-usd-m-fu.md) Venue order: Paradex first, then Hibachi, with Binance USD-M futures as reference market data — superseded by 0016
 - [0008](0008-pinned-toolchain-loop-kit-beads-queue-and-consumption-by-git.md) Pinned toolchain, loop kit, Beads queue, and consumption by git tag with no crates.io release yet — accepted
 - [0009](0009-secrets-and-private-data-never-enter-this-repository-and-sig.md) Secrets and private data never enter this repository, and signing and auth are the only review paths — accepted
 - [0010](0010-three-safety-rules-every-change-keeps-no-trading-after-a-res.md) Three safety rules every change keeps: no trading after a restart until Start, pre-trade caps on every order, one quoter per market — superseded by 0013
@@ -18,3 +18,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0013](0013-three-safety-rules-every-change-keeps-nothing-sent-after-a-r.md) Three safety rules every change keeps: nothing sent after a restart until Start, Flatten or Wind-down, pre-trade caps on every order, one quoter per market — accepted, supersedes 0010
 - [0014](0014-the-venue-boundary-as-built-refines-design-4-6-to-4-8-where-.md) The venue boundary as built refines design 4.6 to 4.8 where a sans-IO codec needs more than the design text gives it — accepted
 - [0015](0015-order-and-fill-capabilities-fold-into-one-optional-exec-bloc.md) Order and fill capabilities fold into one optional exec block, so a venue cannot claim fills without orders or orders without fills — accepted
+- [0016](0016-venue-order-paradex-first-its-signer-offline-before-market-d.md) Venue order: Paradex first, its signer offline before market data, then order entry; then Hibachi; Binance USD-M as reference — accepted, supersedes 0007

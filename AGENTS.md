@@ -137,7 +137,7 @@ rather than guess.
     `crates/venues/fbc-venue-binance-usdm` (market data only), `crates/venues/fbc-venue-paradex`
     (so far its signer: the SNIP-12 revision 0 hash and Stark-curve signature, tested against
     `fixtures/paradex/signing/paradex-vectors.tsv`), later `crates/venues/fbc-venue-hibachi`
-    (0007).
+    (0016).
   - Dependency direction (design §3): `fbc-core`, `fbc-book`, `fbc-oms`, `fbc-journal` and
     `fbc-sim` never depend on a venue crate; a venue crate depends on `fbc-core` and protocol
     crates only. Nothing here depends on the private consumer.
