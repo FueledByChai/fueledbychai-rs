@@ -109,6 +109,9 @@ stay sans-IO and deterministic:
    event's own `px` and `qty`, stated once (`None` where the venue does not echo them).
    `SubmitOutcome::Accepted` carries only `ack`: the accepted order's venue id is the item's
    `ItemRef::vid`, stated once.
+   `MdCodec::on_timer` takes an `MdSink`, so a codec that times a feed's cadence reports a
+   feed that went silent on an open socket as `MdEvent::Health { h: Stale }` (Codex
+   r4173389311).
 8. **`Debug` never shows a credential (0009).** `WireSlice`, `Header`, `HttpRequest`,
    `HttpResponse`, `RawFrame` and `Reject` format redaction spans, redacted header values, a
    URL's user information, query and fragment, response bodies, inbound frames and a venue's
@@ -124,7 +127,9 @@ stay sans-IO and deterministic:
 9. **Configuration, connections and traffic class.** `VenueConfig` keeps market-scoped keys per
    instrument (`insert_market`, `get_market`). `VenueFactory::plan_exec` returns the order-entry
    connections (`ExecEndpoint`) the runtime opens before `ExecCodec::on_open`. The client-id
-   format has one source, `OrderCaps::client_id`: `ExecCodec` has no `client_id_format`. A request is `Safety` only when every item is: a batch of
+   format has one source, `OrderCaps::client_id`: `ExecCodec` has no `client_id_format`.
+   Turning cancel-on-disconnect off is `Normal`: it removes protection, so it does not ride
+   the safety floor (Codex r4173389313). A request is `Safety` only when every item is: a batch of
    reducing orders is `Safety`, a mixed batch `Normal`. "Reducing" is the OMS's
    classification, `NewOrder::reducing` and `AmendOrder::reducing`, kept apart from the
    venue's `reduce_only` flag (a venue without the flag still gets its exits on the safety
