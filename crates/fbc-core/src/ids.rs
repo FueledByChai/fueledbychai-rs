@@ -219,6 +219,8 @@ impl std::error::Error for IdError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cid::ClientIdFormat;
+    use crate::scope::{DecodeScope, dispatch};
 
     #[test]
     fn numbers_round_trip() {
@@ -228,29 +230,38 @@ mod tests {
         assert_eq!((cid.namespace(), cid.seq()), (Namespace::new(9), 42));
     }
 
+    // Venue ids come only from the decode scope, in tests as well (decision 0004);
+    // tests/no_back_door.rs fails if anything else calls `from_wire`.
+    fn in_scope<R>(callback: impl for<'s> FnOnce(&'s DecodeScope<'s>) -> R) -> R {
+        dispatch(&ClientIdFormat::Uuid, Namespace::new(1), callback)
+    }
+
     #[test]
     fn venue_ids_keep_the_wire_text_and_refuse_empty_or_overlong() {
-        let vid = VenueOrderId::from_wire("1759363200000201030").unwrap();
-        assert_eq!(vid.as_str(), "1759363200000201030");
-        let fid = FillId::from_wire("f-1").unwrap();
-        assert_eq!(fid.as_str(), "f-1");
-        let longest = "x".repeat(MAX_VENUE_ID_LEN);
-        assert!(VenueOrderId::from_wire(&longest).is_ok());
-        let over = "x".repeat(MAX_VENUE_ID_LEN + 1);
-        assert_eq!(
-            VenueOrderId::from_wire(&over),
-            Err(IdError::TooLong {
-                len: 97,
-                max: MAX_VENUE_ID_LEN
-            })
-        );
-        assert_eq!(FillId::from_wire(""), Err(IdError::Empty));
+        in_scope(|scope| {
+            let vid = scope.venue_order_id("1759363200000201030").unwrap();
+            assert_eq!(vid.as_str(), "1759363200000201030");
+            let fid = scope.fill_id("f-1").unwrap();
+            assert_eq!(fid.as_str(), "f-1");
+            let longest = "x".repeat(MAX_VENUE_ID_LEN);
+            assert!(scope.venue_order_id(&longest).is_ok());
+            assert!(scope.fill_id(&longest).is_ok());
+            let over = "x".repeat(MAX_VENUE_ID_LEN + 1);
+            assert_eq!(
+                scope.venue_order_id(&over),
+                Err(IdError::TooLong {
+                    len: 97,
+                    max: MAX_VENUE_ID_LEN
+                })
+            );
+            assert_eq!(scope.fill_id(""), Err(IdError::Empty));
+        });
     }
 
     #[test]
     fn an_order_ref_yields_the_ids_it_carries() {
         let cid = ClientOrderId::new(Namespace::new(1), 2);
-        let vid = VenueOrderId::from_wire("v").unwrap();
+        let vid = in_scope(|scope| scope.venue_order_id("v")).unwrap();
         assert_eq!(OrderRef::Client(cid).client(), Some(cid));
         assert_eq!(OrderRef::Client(cid).venue(), None);
         assert_eq!(OrderRef::Venue(vid.clone()).client(), None);
