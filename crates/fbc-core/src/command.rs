@@ -10,6 +10,7 @@
 //! socket buffer), accepted, rejected, or `Unknown` (sent with no answer), which the OMS
 //! resolves through its Unknown ladder and never resends (decision 0005).
 
+use core::fmt;
 use core::time::Duration;
 use std::sync::Arc;
 
@@ -207,15 +208,27 @@ pub enum SubmitOutcome {
     Unknown,
 }
 
-/// A venue's refusal.
-#[derive(Clone, PartialEq, Debug)]
+/// A venue's refusal. Its `Debug` shows the kind and the venue's code, and the venue's message
+/// by length only: a venue can echo a key or an authorization value in an error message, and
+/// nothing marks it (0009).
+#[derive(Clone, PartialEq)]
 pub struct Reject {
     /// What kind of refusal it is.
     pub kind: RejectKind,
     /// The venue's error code, when it sends one; reject maps key on this, not on text.
     pub venue_code: Option<CompactString>,
-    /// The venue's message as received.
+    /// The venue's message as received, for the code that maps it; never logged as is.
     pub raw: Arc<str>,
+}
+
+impl fmt::Debug for Reject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Reject")
+            .field("kind", &self.kind)
+            .field("venue_code", &self.venue_code)
+            .field("raw", &format_args!("<{} bytes>", self.raw.len()))
+            .finish()
+    }
 }
 
 /// What kind of refusal a venue reject is.
@@ -346,6 +359,31 @@ mod tests {
         assert_eq!(amend(4, 4).wire_qty(AmendQty::Remaining), None);
         assert_eq!(amend(3, 4).wire_qty(AmendQty::Remaining), None);
         assert_eq!(amend(3, 4).wire_qty(AmendQty::TotalIncludingFilled), None);
+    }
+
+    #[test]
+    fn debug_never_shows_the_text_a_venue_sent_with_a_reject() {
+        let secret = "SYNTHETIC-ECHOED-KEY";
+        let reject = Reject {
+            kind: RejectKind::Other,
+            venue_code: Some(CompactString::from("E401")),
+            raw: Arc::from(format!("bad signature for key {secret}")),
+        };
+        let shown = [
+            format!("{reject:?}"),
+            format!("{:?}", SubmitOutcome::Rejected(reject.clone())),
+            format!(
+                "{:#?}",
+                crate::event::ExecEvent::UncorrelatedError(reject.clone())
+            ),
+        ];
+        for text in &shown {
+            assert!(!text.contains(secret), "venue text reached Debug: {text}");
+            assert!(text.contains("Other") && text.contains("E401"), "{text}");
+        }
+        assert!(shown[0].contains(&format!("<{} bytes>", reject.raw.len())));
+        // The text itself stays available to the code that maps it.
+        assert!(reject.raw.contains(secret));
     }
 
     #[test]

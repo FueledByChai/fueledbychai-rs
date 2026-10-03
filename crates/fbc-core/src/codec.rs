@@ -219,13 +219,56 @@ impl fmt::Debug for Header {
     }
 }
 
-/// An HTTP request for the runtime to make, through the consumer's proxy (decision 0002).
-#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+/// An HTTP request for the runtime to make, through the consumer's proxy (decision 0002). Its
+/// `Debug` shows the URL's scheme, host and path, but its user information, query and fragment
+/// only by length, since a venue may take a key there.
+#[derive(Clone, Eq, PartialEq, Hash)]
 pub struct HttpRequest {
     pub method: HttpMethod,
     pub url: String,
     pub headers: Vec<Header>,
     pub body: WireSlice,
+}
+
+impl fmt::Debug for HttpRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HttpRequest")
+            .field("method", &self.method)
+            .field("url", &ShownUrl(&self.url))
+            .field("headers", &self.headers)
+            .field("body", &self.body)
+            .finish()
+    }
+}
+
+/// A URL with its user information, query and fragment shown by length only.
+struct ShownUrl<'a>(&'a str);
+
+impl fmt::Debug for ShownUrl<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let url = self.0;
+        let (head, tail) = match url.find(['?', '#']) {
+            Some(at) => url.split_at(at),
+            None => (url, ""),
+        };
+        f.write_str("\"")?;
+        let after_scheme = head.find("://").map_or(0, |at| at + 3);
+        let authority_end = head[after_scheme..]
+            .find('/')
+            .map_or(head.len(), |at| after_scheme + at);
+        match head[after_scheme..authority_end].rfind('@') {
+            Some(at) => {
+                write!(f, "{}", head[..after_scheme].escape_debug())?;
+                write!(f, "<redacted {at} bytes>")?;
+                write!(f, "{}", head[after_scheme + at..].escape_debug())?;
+            }
+            None => write!(f, "{}", head.escape_debug())?,
+        }
+        if let Some(sep) = tail.chars().next() {
+            write!(f, "{sep}<redacted {} bytes>", tail.len() - 1)?;
+        }
+        f.write_str("\"")
+    }
 }
 
 /// An HTTP response, handed back to the codec that asked for it. Its `Debug` shows the status,
@@ -840,7 +883,7 @@ mod tests {
         let body = WireSlice::redacted(frame, std::iter::once(start..end).collect()).unwrap();
         let req = HttpRequest {
             method: HttpMethod::Post,
-            url: "https://venue.invalid/auth".to_owned(),
+            url: format!("https://venue.invalid/auth?key={secret}&v=2#{secret}"),
             headers: vec![
                 Header {
                     name: "Authorization",
@@ -897,12 +940,25 @@ mod tests {
         // What is not a credential is still shown, so the output stays useful.
         assert!(shown[0].contains("auth|token=") && shown[0].contains("|end"));
         assert!(shown[0].contains("Authorization") && shown[0].contains("application/json"));
+        // A URL shows its scheme, host and path; its query and fragment only by length.
+        assert!(shown[0].contains("https://venue.invalid/auth?<redacted 61 bytes>"));
         assert!(shown[0].contains("redacted"));
         assert!(shown[3].contains("200") && shown[3].contains("Set-Cookie"));
         assert!(shown[4].contains(&echoed.len().to_string()));
         // Bytes that are not UTF-8 are escaped one by one.
         let binary = format!("{:?}", WireSlice::plain(vec![b'a', 0xff, b'"']));
         assert!(binary.contains(r#""a\xff\"""#), "{binary}");
+        // User information in a URL is a credential too; a URL without a query shows whole.
+        let shown = |url: &str| format!("{:?}", ShownUrl(url));
+        assert_eq!(
+            shown("wss://user:pw@venue.invalid/ws#frag"),
+            r#""wss://<redacted 7 bytes>@venue.invalid/ws#<redacted 4 bytes>""#
+        );
+        assert_eq!(
+            shown("https://venue.invalid/a/b"),
+            r#""https://venue.invalid/a/b""#
+        );
+        assert_eq!(shown("no-scheme?q=1"), r#""no-scheme?<redacted 3 bytes>""#);
     }
 
     #[test]
