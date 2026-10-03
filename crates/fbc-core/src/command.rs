@@ -119,6 +119,10 @@ pub struct CancelOrder {
 pub struct QueryOrder {
     pub target: OrderRef,
     pub inst: InstrumentId,
+    /// The nonce the order was placed with, for venues that query by it
+    /// ([`RefKind::PlacementNonce`](crate::RefKind::PlacementNonce)): an order in Unknown may
+    /// have no venue id yet, and the query is how the Unknown ladder resolves it (0005).
+    pub placement_nonce: Option<u64>,
 }
 
 /// What a cancel-all covers. An instrument cancel-all is never widened to the account.
