@@ -227,8 +227,10 @@ impl MdCodec for ToyMd {
         if f.kind != "touch" {
             return Err(DecodeError::Malformed("kind"));
         }
-        // Everything is read before the push, so a frame that fails pushes nothing.
+        // Everything is read before the push, so a frame that fails pushes nothing. The touch
+        // channel's own sequence is required (SeqDomain::Own).
         let (meta, inst) = (f.meta()?, f.inst(specs)?);
+        meta.venue_seq.ok_or(DecodeError::Malformed("seq"))?;
         let (bid, ask, source) = (f.level("bid")?, f.level("ask")?, TouchSourceId(0));
         let touch = MdEvent::Touch {
             inst,
@@ -259,9 +261,12 @@ impl MdCodec for ToyMd {
     }
 }
 
-/// The toy's order-entry codec. It keeps no state: every field it writes comes from the
-/// command, the spec table or the encode context.
-struct ToyExec;
+/// The toy's order-entry codec. Every field it writes comes from the command, the spec table or
+/// the encode context. It keeps one value: the instant of the resync it asked for, which is the
+/// resync's watermark (record 0014), since the venue's echo of it cannot be trusted alone.
+struct ToyExec {
+    resync_at: Option<WallNs>,
+}
 
 impl ToyExec {
     /// One order as a resync reports it; every field the caps promise is required.
@@ -285,9 +290,11 @@ impl ToyExec {
     }
 
     /// A resync answer, one frame: `rbegin`, then `rorder` and `rpos` records, then `rend`.
-    /// The whole envelope is checked before anything is returned.
+    /// The whole envelope is checked before anything is returned, and the answer must echo the
+    /// instant of the resync asked for, `requested`, which is its watermark.
     fn resync_frame(
         lines: &[&str],
+        requested: Option<WallNs>,
         scope: &DecodeScope<'_>,
         specs: &SpecTable,
     ) -> Result<Vec<ExecEvent>, DecodeError> {
@@ -298,7 +305,10 @@ impl ToyExec {
         if begin.kind != "rbegin" || Frame::parse(last)?.kind != "rend" {
             return Err(DecodeError::Malformed("resync envelope"));
         }
-        let watermark = WallNs(begin.num("wm")?);
+        let watermark = requested.ok_or(DecodeError::Malformed("no resync asked for"))?;
+        if WallNs(begin.num("wm")?) != watermark {
+            return Err(DecodeError::Malformed("resync for another request"));
+        }
         let mut events = vec![ExecEvent::ResyncBegin { watermark }];
         for line in body {
             let f = Frame::parse(line)?;
@@ -443,7 +453,8 @@ impl ExecCodec for ToyExec {
         let first = Frame::parse(lines.first().copied().unwrap_or(""))?;
         let (meta, events) = match lines.len() {
             _ if first.kind == "rbegin" => {
-                let events = ToyExec::resync_frame(&lines, scope, specs)?;
+                let events = ToyExec::resync_frame(&lines, self.resync_at, scope, specs)?;
+                self.resync_at = None;
                 (VenueMeta::NONE, events)
             }
             1 => (first.meta()?, vec![ToyExec::event(&first, scope, specs)?]),
@@ -473,6 +484,7 @@ impl ExecCodec for ToyExec {
     }
 
     fn resync(&mut self, ctx: &EncodeCtx, fx: &mut Effects) {
+        self.resync_at = Some(ctx.wall);
         let request = format!("snapshot|ts={}", ctx.wall.0);
         fx.push(send(EXEC_STREAM, &request, None, TrafficClass::Safety));
     }
@@ -526,7 +538,7 @@ impl VenueFactory for ToyFactory {
     }
 
     fn exec_codec(&self, _cfg: &VenueConfig) -> Option<Result<Box<dyn ExecCodec>, VenueError>> {
-        Some(Ok(Box::new(ToyExec)))
+        Some(Ok(Box::new(ToyExec { resync_at: None })))
     }
 }
 
@@ -787,7 +799,10 @@ fn the_toy_decodes_account_events_a_full_resync_and_a_fill_into_their_exec_event
         &resync,
         &fill,
     ];
-    let (results, sink) = decode_exec(exec_codec().as_mut(), &frames);
+    // The resync was asked for at the watermark instant; the reply echoes it.
+    let mut codec = exec_codec();
+    codec.resync(&ctx(1_759_363_200_050_000_000, &[]), &mut Effects::new());
+    let (results, sink) = decode_exec(codec.as_mut(), &frames);
     assert!(results.iter().all(Result::is_ok), "{results:?}");
 
     let (vid, fid, fee) = with_scope(|scope| {
@@ -906,6 +921,9 @@ fn encode_takes_time_and_nonces_only_from_the_encode_ctx() {
         [send(EXEC_STREAM, &frame, rpc, TrafficClass::Normal)]
     );
     assert_eq!(receipt.nonces(), [(0, 9_000)]);
+    let mut fx = Effects::new();
+    effects.iter().cloned().for_each(|e| fx.push(e));
+    assert!(fx.carry_request(RpcId(11)));
 
     // Another wall time or nonce changes the bytes; another monotonic time does not, since
     // nothing in the payload is a monotonic instant.
@@ -939,15 +957,20 @@ fn encode_takes_time_and_nonces_only_from_the_encode_ctx() {
 fn the_toy_decodes_market_data_frames_into_md_events() {
     let (results, sink) = decode_md(&[
         RawFrame::Text("touch|ts=10|seq=5|sym=TOY-PERP|bid=130865x12|ask=130866x7"),
-        RawFrame::Text("touch|sym=TOY-PERP|ask=130866x7"),
+        RawFrame::Text("touch|seq=6|sym=TOY-PERP|ask=130866x7"),
         // Refused, pushing nothing: a bad level, an unknown instrument or kind, binary.
-        RawFrame::Text("touch|sym=TOY-PERP|bid=130865x12|ask=130866x-7"),
-        RawFrame::Text("touch|sym=NOPE-PERP"),
+        RawFrame::Text("touch|seq=8|sym=TOY-PERP|bid=130865x12|ask=130866x-7"),
+        RawFrame::Text("touch|seq=7|sym=NOPE-PERP"),
+        // The touch channel's own sequence (SeqDomain::Own) is required.
+        RawFrame::Text("touch|sym=TOY-PERP|ask=130866x7"),
         RawFrame::Text("trade|sym=TOY-PERP"),
         RawFrame::Binary(b"\x00"),
     ]);
     let ok = results.iter().map(Result::is_ok);
-    assert_eq!(Vec::from_iter(ok), [true, true, false, false, false, false]);
+    assert_eq!(
+        Vec::from_iter(ok),
+        [true, true, false, false, false, false, false]
+    );
     let lvl = |px, qty| Lvl {
         px: Ticks(px),
         qty: Lots::new(qty).unwrap(),
@@ -970,14 +993,15 @@ fn the_toy_decodes_market_data_frames_into_md_events() {
     ];
     assert_eq!(sink.bodies(), expected.iter().collect::<Vec<_>>());
     let meta = [&sink.0[0], &sink.0[1]].map(|e| (e.exch_ts, e.venue_seq));
-    assert_eq!(meta, [(Some(ExchNs(10)), Some(5)), (None, None)]);
+    assert_eq!(meta, [(Some(ExchNs(10)), Some(5)), (None, Some(6))]);
 }
 
 #[test]
 fn a_frame_that_fails_to_decode_pushes_nothing() {
-    // A resync without its end, with a bad record, or out of order; two records in one frame;
-    // a fill missing a field its caps promise (fill id, realized funding) or with a negative
-    // quantity. A resync that fails pushes no begin without an end.
+    // A resync without its end, with a bad record, out of order, or for an instant other than
+    // the one requested; two records in one frame; a fill missing a field its caps promise
+    // (fill id, realized funding) or with a negative quantity. A resync that fails pushes no
+    // begin without an end.
     let wire_cid = encode_cid(&CID_FORMAT, mint()).unwrap();
     let full = format!(
         "fill|sym=TOY-PERP|fid=F-1|vid=V-1|cid={wire_cid}|side=B|px=1|qty=3|cum=3|liq=M|fee=1\
@@ -991,17 +1015,26 @@ fn a_frame_that_fails_to_decode_pushes_nothing() {
         "rbegin|wm=900\nrpos|sym=TOY-PERP|qty=0".to_owned(),
         "rbegin|wm=900\nrpos|sym=NOPE-PERP|qty=0\nrend".to_owned(),
         "rbegin|wm=900\nrend\nrpos|sym=TOY-PERP|qty=0".to_owned(),
+        "rbegin|wm=901\nrend".to_owned(),
         "pos|sym=TOY-PERP|qty=0\nbal|equity=1|avail=1".to_owned(),
         without("fid="),
         without("fund="),
         full.replace("qty=3", "qty=-3"),
     ];
     let bad: Vec<&str> = bad.iter().map(String::as_str).collect();
-    let (results, sink) = decode_exec(exec_codec().as_mut(), &bad);
+    let mut codec = exec_codec();
+    codec.resync(&ctx(900, &[]), &mut Effects::new());
+    let (results, sink) = decode_exec(codec.as_mut(), &bad);
     assert!(results.iter().all(Result::is_err), "{results:?}");
     assert!(sink.0.is_empty());
-    // The full fill decodes, so each refusal above is the one field it changed.
-    assert_eq!(decode_exec(exec_codec().as_mut(), &[&full]).0, [Ok(())]);
+    // The full fill and the requested resync decode, so each refusal above is the one thing it
+    // changed; the same resync again, with none requested, is refused.
+    let good = ["rbegin|wm=900\nrend", &full, "rbegin|wm=900\nrend"];
+    let (results, _) = decode_exec(codec.as_mut(), &good);
+    assert_eq!(
+        results.iter().map(Result::is_ok).collect::<Vec<_>>(),
+        [true, true, false]
+    );
 }
 
 #[test]
