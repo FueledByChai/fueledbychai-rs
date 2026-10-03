@@ -568,16 +568,19 @@ impl ToyExec {
         });
     }
 
-    /// One `place` frame for item `idx`, signed, with its nonce.
+    /// One `place` frame for item `idx`, signed, its nonce taken into `receipt`.
     fn place_frame(
         &mut self,
         o: &NewOrder,
         idx: u16,
         specs: &SpecTable,
         ctx: &EncodeCtx,
-    ) -> Result<(String, u64), NotSentReason> {
+        receipt: &mut EncodeReceipt,
+    ) -> Result<String, NotSentReason> {
         let spec = specs.get(o.inst).ok_or(NotSentReason::Unencodable)?;
-        let nonce = ctx.nonce(idx).ok_or(NotSentReason::Unencodable)?;
+        let nonce = receipt
+            .use_nonce(ctx, idx)
+            .ok_or(NotSentReason::Unencodable)?;
         let cid = encode_cid(&CID_FORMAT, o.cid).map_err(|_| NotSentReason::Unencodable)?;
         let px = o.kind.limit_px().ok_or(NotSentReason::Unsupported)?;
         let wire = PlaceWire {
@@ -609,7 +612,7 @@ impl ToyExec {
             ctx.wall.0,
             hex(&sig)
         );
-        Ok((frame, nonce))
+        Ok(frame)
     }
 
     fn decode_exec(
@@ -794,13 +797,9 @@ impl ExecCodec for ToyExec {
         ctx: &EncodeCtx,
         fx: &mut Effects,
     ) -> Result<EncodeReceipt, NotSentReason> {
-        let mut receipt = EncodeReceipt::default();
+        let mut receipt = EncodeReceipt::new();
         let frame = match cmd {
-            VenueCommand::Place(o) => {
-                let (frame, nonce) = self.place_frame(o, 0, specs, ctx)?;
-                receipt.nonces.push((0, nonce));
-                frame
-            }
+            VenueCommand::Place(o) => self.place_frame(o, 0, specs, ctx, &mut receipt)?,
             VenueCommand::PlaceBatch(orders) => {
                 // No more items than the caps declare (OrderCaps::batch_place).
                 if orders.len() > usize::from(MAX_BATCH) {
@@ -808,9 +807,7 @@ impl ExecCodec for ToyExec {
                 }
                 let mut frames = Vec::new();
                 for (idx, o) in (0u16..).zip(orders) {
-                    let (frame, nonce) = self.place_frame(o, idx, specs, ctx)?;
-                    frames.push(frame);
-                    receipt.nonces.push((idx, nonce));
+                    frames.push(self.place_frame(o, idx, specs, ctx, &mut receipt)?);
                 }
                 frames.join("\n")
             }
@@ -818,7 +815,9 @@ impl ExecCodec for ToyExec {
                 let spec = specs.get(a.inst).ok_or(NotSentReason::Unencodable)?;
                 // The toy amends by venue id only: an amend naming none has no target.
                 let vid = a.target.venue().ok_or(NotSentReason::Unsupported)?;
-                let nonce = ctx.nonce(0).ok_or(NotSentReason::Unencodable)?;
+                let nonce = receipt
+                    .use_nonce(ctx, 0)
+                    .ok_or(NotSentReason::Unencodable)?;
                 // The toy's amend quantity is the remaining quantity (its caps say so).
                 let qty = a
                     .wire_qty(AmendQty::Remaining)
@@ -840,7 +839,6 @@ impl ExecCodec for ToyExec {
                     .signer
                     .sign_amend(&wire)
                     .map_err(|_| NotSentReason::SignFailed)?;
-                receipt.nonces.push((0, nonce));
                 let frame = format!(
                     "amend|vid={}|px={}|qty={}|ts={}|nonce={nonce}|sig={}",
                     vid.as_str(),
@@ -1486,7 +1484,7 @@ fn encode_takes_time_and_nonces_only_from_the_encode_ctx() {
     let receipt = codec
         .encode(&batch, RpcId(12), &specs(), &ctx(5, 700, 2), &mut fx)
         .unwrap();
-    assert_eq!(receipt.nonces, vec![(0, 700), (1, 701)]);
+    assert_eq!(receipt.nonces(), [(0, 700), (1, 701)]);
     let [
         Effect::Send {
             frame,
@@ -1540,7 +1538,7 @@ fn encode_takes_time_and_nonces_only_from_the_encode_ctx() {
     let receipt = codec
         .encode(&batch, RpcId(12), &specs(), &random, &mut fx)
         .unwrap();
-    assert_eq!(receipt.nonces, vec![(0, 0x9e37_79b9_7f4a_7c15), (1, 13)]);
+    assert_eq!(receipt.nonces(), [(0, 0x9e37_79b9_7f4a_7c15), (1, 13)]);
 
     // Without enough nonces in the context the command is not sent, and nothing is pushed.
     let mut fx = Effects::new();
@@ -2026,7 +2024,7 @@ fn outcomes_amends_and_cancels_go_through_the_same_boundary() {
     let receipt = exec
         .encode(&cancel, RpcId(14), &specs(), &ctx(9, 5, 1), &mut fx)
         .unwrap();
-    assert!(receipt.nonces.is_empty());
+    assert!(receipt.nonces().is_empty());
     let [Effect::Send { frame, class, .. }] = fx.as_slice() else {
         panic!("{fx:?}");
     };
@@ -2733,4 +2731,21 @@ fn a_url_carries_its_credential_spans_and_never_shows_them() {
         refused(vec![4..6, 2..3]),
         Err(fbc_core::RedactError::Unordered)
     );
+}
+
+#[test]
+fn an_encode_receipt_holds_only_nonces_taken_from_the_context() {
+    // The OMS keeps a receipt's nonces as placement nonces; each comes from the reserved block,
+    // once per item, so a receipt cannot name a nonce the request did not use.
+    let at = ctx(5, 700, 2);
+    let mut receipt = EncodeReceipt::new();
+    assert_eq!(receipt.use_nonce(&at, 1), Some(701));
+    assert_eq!(
+        receipt.use_nonce(&at, 1),
+        None,
+        "an item takes its nonce once"
+    );
+    assert_eq!(receipt.use_nonce(&at, 2), None, "past the reserved block");
+    assert_eq!(receipt.use_nonce(&at, 0), Some(700));
+    assert_eq!(receipt.nonces(), [(1, 701), (0, 700)]);
 }
