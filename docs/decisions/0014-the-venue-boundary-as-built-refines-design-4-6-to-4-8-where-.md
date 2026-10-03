@@ -52,10 +52,13 @@ stay sans-IO and deterministic:
    `Outcome` but `Unknown`, and `QueryResult`): the runtime clears that request's deadline on
    it, so an answered request never reaches `on_rpc_timeout` and no `Unknown` follows its
    answer (Codex r4172917321). An encode's effects must carry its request:
-   `Effects::carry_request(rpc)` holds when there is a frame or HTTP request and every one names
-   the encode's `rpc`; the runtime executes an encode's effects only then, and otherwise writes
-   nothing and reports `NotSent(Unencodable)`, so no order is sent without a deadline (Codex
-   r4173031192).
+   `Effects::carry_request(rpc, class)` holds when there is a frame or HTTP request and every
+   one names the encode's `rpc` and carries the command's `traffic_class()`; the runtime
+   executes an encode's effects only then, and otherwise writes nothing and reports
+   `NotSent(Unencodable)`, so no order is sent without a deadline or on the wrong class (Codex
+   r4173031192, r4173103646). For an order-entry HTTP request, `on_http` always reports the
+   request's outcome: a response the codec cannot decode is `Unknown`, pushed with `Ok`, since
+   the request's timeout is spent (Codex r4173103639).
 4. **Codecs get the spec table wherever they spell an instrument.** `on_http` (both codecs),
    `MdCodec::subscribe` and `VenueFactory::plan_md` take the `SpecTable`; `on_http`,
    `subscribe` and `plan_md` return `Result`, and `VenueError::UnknownInstrument` names an
