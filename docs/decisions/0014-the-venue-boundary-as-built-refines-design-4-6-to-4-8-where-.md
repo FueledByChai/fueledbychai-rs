@@ -49,6 +49,9 @@ stay sans-IO and deterministic:
    amend's resting as the wire quantity it sent until the venue reports the order's total
    (FBC-w5n). `QueryOrder` carries `placement_nonce`, as `CancelOrder` does, for venues that
    query by it.
+   A cancel signer gets only the reference the request carries: `CancelWire.target` is a
+   `CancelRef` (`Venue`, wire-format `Client`, or `PlacementNonce`) the codec chose, not the
+   command's whole `OrderRef` and nonce, so the signed and the sent identifier cannot differ.
 6. **Values that would contradict 0005 are unrepresentable.** `RejectKind::AlreadyTerminal`
    takes a payload-free `TerminalHint` (the design's `TerminalKind(RejectKind)` would make
    `RejectKind` recursive); `VenueOrderState::Rejected` takes a `TerminalReject`, which refuses
@@ -76,7 +79,10 @@ stay sans-IO and deterministic:
    instrument (`insert_market`, `get_market`). `VenueFactory::plan_exec` returns the order-entry
    connections (`ExecEndpoint`) the runtime opens before `ExecCodec::on_open`. The client-id
    format has one source, `OrderCaps::client_id`: `ExecCodec` has no `client_id_format`. A request is `Safety` only when every item is: a batch of
-   reducing orders is `Safety`, a mixed batch `Normal`.
+   reducing orders is `Safety`, a mixed batch `Normal`. "Reducing" is the OMS's
+   classification, `NewOrder::reducing` and `AmendOrder::reducing`, kept apart from the
+   venue's `reduce_only` flag (a venue without the flag still gets its exits on the safety
+   floor), and `VenueCommand::traffic_class` is the one rule codecs label requests with.
    `EndpointPlan` carries `transport: MdTransport` in place of a `url`: `Socket { url }`, a
    connection the runtime opens, or `Poll { base_url }`, for feeds a venue offers only over
    REST (`FeedSource::Poll`): the runtime opens nothing, calls `on_open` as soon as the codec
