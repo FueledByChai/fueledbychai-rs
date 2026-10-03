@@ -599,12 +599,26 @@ pub trait NonceSource: Send {
 
 /// Receives the market-data events a codec decodes; the runtime stamps each one into an
 /// [`Envelope`](crate::Envelope).
+///
+/// **A call that returns `Err` has pushed nothing.** A codec decodes the whole frame or response
+/// before its first push, so the runtime never receives part of one: no snapshot begun and never
+/// ended, no half-applied resync. The failed input is then lost to decoding as a whole. Effects
+/// the call asked for still stand, so a failing codec can ask for recovery (a resync, an anchor,
+/// a reconnect). Replay feeds the journaled input (D7) to the same codec and gets the same error
+/// and, again, no events.
 pub trait MdSink {
     fn push(&mut self, meta: VenueMeta, ev: MdEvent);
 }
 
 /// Receives the execution events a codec decodes; the runtime stamps each one into an
 /// [`Envelope`](crate::Envelope).
+///
+/// **A call that returns `Err` has pushed nothing.** A codec decodes the whole frame or response
+/// before its first push, so the runtime never receives part of one: no snapshot begun and never
+/// ended, no half-applied resync. The failed input is then lost to decoding as a whole. Effects
+/// the call asked for still stand, so a failing codec can ask for recovery (a resync, an anchor,
+/// a reconnect). Replay feeds the journaled input (D7) to the same codec and gets the same error
+/// and, again, no events.
 pub trait ExecSink {
     fn push(&mut self, meta: VenueMeta, ev: ExecEvent);
 }
@@ -758,7 +772,7 @@ pub trait MdCodec: Send {
         specs: &SpecTable,
         fx: &mut Effects,
     ) -> Result<(), VenueError>;
-    /// Decode one frame.
+    /// Decode one frame. `Err` means nothing was pushed ([`MdSink`]).
     fn on_frame(
         &mut self,
         f: RawFrame<'_>,
@@ -768,7 +782,8 @@ pub trait MdCodec: Send {
         fx: &mut Effects,
     ) -> Result<(), DecodeError>;
     /// Decode the response to an HTTP request the codec asked for (a book anchor, a stats
-    /// poll), or learn why none came, to retry or recover by asking for effects.
+    /// poll), or learn why none came, to retry or recover by asking for effects. `Err` means
+    /// nothing was pushed ([`MdSink`]).
     fn on_http(
         &mut self,
         tag: HttpTag,
@@ -815,7 +830,7 @@ pub trait ExecCodec: Send {
         ctx: &EncodeCtx,
         fx: &mut Effects,
     ) -> Result<EncodeReceipt, NotSentReason>;
-    /// Decode one frame from `stream`.
+    /// Decode one frame from `stream`. `Err` means nothing was pushed ([`ExecSink`]).
     fn on_frame(
         &mut self,
         stream: StreamId,
@@ -827,7 +842,8 @@ pub trait ExecCodec: Send {
     ) -> Result<(), DecodeError>;
     /// Decode the response to an HTTP request the codec asked for, or learn why none came. For
     /// an order-entry request (one with an `rpc`), a failure is that request's outcome:
-    /// [`HttpFailure::NotSent`] is `NotSent`, the others are `Unknown` and never resent.
+    /// [`HttpFailure::NotSent`] is `NotSent`, the others are `Unknown` and never resent. `Err`
+    /// means nothing was pushed ([`ExecSink`]).
     fn on_http(
         &mut self,
         tag: HttpTag,
