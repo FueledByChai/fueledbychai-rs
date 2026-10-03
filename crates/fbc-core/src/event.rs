@@ -197,7 +197,16 @@ pub enum ConnState {
     Closed,
 }
 
-/// A mode the venue puts the whole account or market into.
+/// What a venue mode applies to.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum ModeScope {
+    /// Every market on the account.
+    Account,
+    /// One market; the account's other markets are unaffected.
+    Instrument(InstrumentId),
+}
+
+/// A mode the venue puts the whole account, or one market, into ([`ModeScope`]).
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum VenueMode {
     /// Orders of every kind are accepted.
@@ -385,8 +394,8 @@ pub enum ExecEvent {
     Balance { equity: Money, available: Money },
     /// A funding payment: P&L, positive when we received funding and negative when we paid.
     FundingPaid { inst: InstrumentId, amount: Money },
-    /// The venue's mode changed.
-    Mode(VenueMode),
+    /// The venue's mode changed, for the whole account or for one market.
+    Mode { scope: ModeScope, mode: VenueMode },
     /// A stream's state changed.
     Conn { stream: StreamId, state: ConnState },
     /// A resync begins; the snapshot reflects the venue at `watermark` (venue-clock aligned).

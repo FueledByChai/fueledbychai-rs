@@ -24,15 +24,15 @@ use fbc_core::{
     FieldSpec, FieldUnit, FillCaps, FillEvent, FillKey, FillSource, FundingCaps, FundingSpec,
     Header, HttpMethod, HttpRequest, HttpResponse, HttpTag, InstrumentId, InstrumentKind,
     InstrumentSpec, ItemRef, Keepalive, KeepaliveKind, Liquidity3, Lots, Lvl, MatchingCaps, MdCaps,
-    MdCodec, MdEvent, MdSink, Money, MonoNs, Namespace, NamespaceLease, NewOrder, NonceBlock,
-    NonceScope, NotSentReason, OrderCaps, OrderKind, OrderKindTag, OrderRef, OrderSigner,
-    OrderingKey, PlaceWire, PriceGrid, PxExact, QueueModelQuality, RawFrame, Readiness, RefKind,
-    Reject, RejectKind, RpcId, SeqDomain, Side, Sig, SignError, SignedLots, SizeStep,
-    SnapshotSource, SpecTable, Stamp, StpScope, StreamId, SubmitOutcome, Subscription, Support,
-    TagSet, Ticks, TifTag, TimerTag, TouchSourceCaps, TouchSourceId, TradeCaps, TradingStatus,
-    TrafficClass, UnderlyingId, VenueCaps, VenueCommand, VenueConfig, VenueError, VenueFactory,
-    VenueFeeSign, VenueId, VenueMeta, VenueOrderSnapshot, VenueOrderState, WallNs, WireSlice,
-    dispatch, encode_cid,
+    MdCodec, MdEvent, MdSink, ModeScope, Money, MonoNs, Namespace, NamespaceLease, NewOrder,
+    NonceBlock, NonceScope, NotSentReason, OrderCaps, OrderKind, OrderKindTag, OrderRef,
+    OrderSigner, OrderingKey, PlaceWire, PriceGrid, PxExact, QueueModelQuality, RawFrame,
+    Readiness, RefKind, Reject, RejectKind, RpcId, SeqDomain, Side, Sig, SignError, SignedLots,
+    SizeStep, SnapshotSource, SpecTable, Stamp, StpScope, StreamId, SubmitOutcome, Subscription,
+    Support, TagSet, Ticks, TifTag, TimerTag, TouchSourceCaps, TouchSourceId, TradeCaps,
+    TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueCommand, VenueConfig, VenueError,
+    VenueFactory, VenueFeeSign, VenueId, VenueMeta, VenueMode, VenueOrderSnapshot, VenueOrderState,
+    WallNs, WireSlice, dispatch, encode_cid,
 };
 use fbc_core::{AmendAck, Batch, Effect, Effects};
 use rust_decimal::Decimal;
@@ -524,6 +524,17 @@ impl ToyExec {
                 reduce_only: f.flag("ro"),
             }),
             "rend" => ExecEvent::ResyncEnd,
+            "mode" => ExecEvent::Mode {
+                scope: match f.opt("sym") {
+                    Some(_) => ModeScope::Instrument(f.inst(specs)?),
+                    None => ModeScope::Account,
+                },
+                mode: match f.get("m")? {
+                    "halted" => VenueMode::Halted,
+                    "cancel_only" => VenueMode::CancelOnly,
+                    _ => return Err(DecodeError::Malformed("mode")),
+                },
+            },
             "fill" => ExecEvent::Fill(FillEvent {
                 key: FillKey::Venue(scope.fill_id(f.get("fid")?)?),
                 cid: scope.client_order_id(f.get("cid")?),
@@ -1478,6 +1489,27 @@ fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
                 avg_entry: None
             },
             &ExecEvent::ResyncEnd,
+        ]
+    );
+}
+
+#[test]
+fn a_venue_mode_names_the_market_it_applies_to_or_the_whole_account() {
+    let sink = decode_exec(
+        exec_codec().as_mut(),
+        &["mode|m=halted", "mode|sym=TOY-PERP|m=cancel_only"],
+    );
+    assert_eq!(
+        sink.bodies(),
+        [
+            &ExecEvent::Mode {
+                scope: ModeScope::Account,
+                mode: VenueMode::Halted,
+            },
+            &ExecEvent::Mode {
+                scope: ModeScope::Instrument(INST),
+                mode: VenueMode::CancelOnly,
+            },
         ]
     );
 }
