@@ -24,7 +24,9 @@ stay sans-IO and deterministic:
    time and nonce source an encode sees. `NonceBlock` states one value per item (consecutive
    for a monotonic `NonceScope`, independent for `Random`); `NonceSource::reserve(len)` replaces
    `next()`, the runtime reserves `VenueCommand::items()` nonces per encode and journals the
-   values, and `exec_codec` takes no `NonceSource`.
+   values, and `exec_codec` takes no `NonceSource`. For the other calls that take an
+   `EncodeCtx` (`on_open`, `on_timer`, `resync`) the codec states the count:
+   `ExecCodec::nonces_for(CtxCall)`, asked right before the call.
 2. **Codecs report, the runtime stamps.** `MdSink`/`ExecSink` take `(VenueMeta, body)`; the
    runtime builds the `Envelope` with its `Stamp`, so a decoder cannot forge receive time or
    ingest order.
@@ -49,9 +51,10 @@ stay sans-IO and deterministic:
    amend's resting as the wire quantity it sent until the venue reports the order's total
    (FBC-w5n). `QueryOrder` carries `placement_nonce`, as `CancelOrder` does, for venues that
    query by it.
-   A cancel signer gets only the reference the request carries: `CancelWire.target` is a
-   `CancelRef` (`Venue`, wire-format `Client`, or `PlacementNonce`) the codec chose, not the
-   command's whole `OrderRef` and nonce, so the signed and the sent identifier cannot differ.
+   A signer gets only the reference the request carries: `CancelWire.target` is a
+   `CancelRef` (`Venue`, wire-format `Client`, or `PlacementNonce`) and `AmendWire.target` an
+   `AmendRef` (`Venue` or wire-format `Client`) the codec chose, not the command's whole
+   `OrderRef` and nonce, so the signed and the sent identifier cannot differ.
 6. **Values that would contradict 0005 are unrepresentable.** `RejectKind::AlreadyTerminal`
    takes a payload-free `TerminalHint` (the design's `TerminalKind(RejectKind)` would make
    `RejectKind` recursive); `VenueOrderState::Rejected` takes a `TerminalReject`, which refuses
@@ -71,10 +74,15 @@ stay sans-IO and deterministic:
    `Derived { vid, cum_after }`), instead of a `key: FillKey` beside separate `vid` and
    `cum_after` fields; `FillEvent::key()` computes the design's `FillKey` from it, so the
    dedup key (I3) cannot disagree with the order and quantity the fill is applied to.
+   `VenueOrderState::Amended` carries only `new_vid`: the amended price and total are the
+   event's own `px` and `qty`, stated once (`None` where the venue does not echo them).
 8. **`Debug` never shows a credential (0009).** `WireSlice`, `Header`, `HttpRequest`,
    `HttpResponse`, `RawFrame` and `Reject` format redaction spans, redacted header values, a
    URL's user information, query and fragment, response bodies, inbound frames and a venue's
-   reject text by length only.
+   reject text by length only. URLs are `WireUrl`s (`HttpRequest.url`, `ExecEndpoint.url`,
+   `MdTransport`'s URLs) carrying credential spans like `WireSlice`, so the journal can hash
+   a key in a path or query; their `Debug` redacts the spans and shows user information,
+   query and fragment by length.
 9. **Configuration, connections and traffic class.** `VenueConfig` keeps market-scoped keys per
    instrument (`insert_market`, `get_market`). `VenueFactory::plan_exec` returns the order-entry
    connections (`ExecEndpoint`) the runtime opens before `ExecCodec::on_open`. The client-id
@@ -88,7 +96,8 @@ stay sans-IO and deterministic:
    REST (`FeedSource::Poll`): the runtime opens nothing, calls `on_open` as soon as the codec
    is built, and the codec gets its data only from the HTTP requests it asks for, paced by its
    own timers. `MdCaps` gains mandatory `mark` and `index` sources, since `Feed::Mark` and
-   `Feed::Index` are subscribable (0003).
+   `Feed::Index` are subscribable (0003). Planning or subscribing to a feed the caps do not
+   offer is refused with `VenueError::UnsupportedFeed`, and nothing goes on the wire for it.
 10. `Vec` stands where the design has `SmallVec` or `Bytes`, to add no dependency yet.
 
 Calls the design lists but FBC-5 left out each have a ticket: `discover` and
