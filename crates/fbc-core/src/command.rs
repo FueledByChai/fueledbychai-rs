@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use compact_str::CompactString;
 
-use crate::caps::{Feature, OrderKindTag, TifTag};
+use crate::caps::{AmendQty, Feature, OrderKindTag, TifTag};
 use crate::event::VenueMode;
 use crate::ids::{ClientOrderId, InstrumentId, OrderRef, VenueOrderId};
 use crate::units::{Channel, Lots, Side, Ticks};
@@ -77,9 +77,30 @@ pub struct AmendOrder {
     pub reduce_only: bool,
     /// The new limit price.
     pub px: Ticks,
-    /// The new total quantity, filled part included (codecs convert where the venue's wire
-    /// means the remaining quantity; [`AmendQty`](crate::AmendQty)).
+    /// The new total quantity, filled part included.
     pub qty: Lots,
+    /// The order's cumulative filled quantity in the OMS's record when it built the amend. A
+    /// venue whose amend quantity is the remaining quantity ([`AmendQty::Remaining`]) is sent
+    /// `qty - cum_filled` ([`AmendOrder::wire_qty`]): exactly the resting quantity the OMS
+    /// checked against its caps, even if fills the OMS has not seen yet have arrived at the
+    /// venue.
+    pub cum_filled: Lots,
+}
+
+impl AmendOrder {
+    /// The quantity the venue's wire carries under `semantics`: the total, or the total less
+    /// the filled quantity. `None` when the total is at or below the filled quantity, which
+    /// leaves nothing to rest: that is a cancel, not an amend, and a codec does not send it.
+    pub fn wire_qty(&self, semantics: AmendQty) -> Option<Lots> {
+        let remaining = self.qty.checked_sub(self.cum_filled)?;
+        if remaining.get() == 0 {
+            return None;
+        }
+        Some(match semantics {
+            AmendQty::TotalIncludingFilled => self.qty,
+            AmendQty::Remaining => remaining,
+        })
+    }
 }
 
 /// A cancel of one order.
@@ -258,6 +279,7 @@ pub enum NotAmendable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::caps::AmendQty;
     use crate::cid::ClientIdFormat;
     use crate::fee::VenueFeeSign;
     use crate::ids::Namespace;
@@ -275,6 +297,36 @@ mod tests {
             (market.tag(), market.limit_px()),
             (OrderKindTag::Market, None)
         );
+    }
+
+    #[test]
+    fn an_amend_carries_the_fill_a_remaining_quantity_wire_needs() {
+        let lots = |n| Lots::new(n).unwrap();
+        let amend = |qty, cum_filled| AmendOrder {
+            target: OrderRef::Client(ClientOrderId::new(Namespace::new(1), 1)),
+            inst: InstrumentId::new(1),
+            side: Side::Buy,
+            tif: TifTag::Gtc,
+            channel: Channel::Public,
+            post_only: true,
+            reduce_only: false,
+            px: Ticks(100),
+            qty: lots(qty),
+            cum_filled: lots(cum_filled),
+        };
+        // 4 lots filled, total amended to 10: a total-quantity wire sends 10, a
+        // remaining-quantity wire sends 6, so the venue rests what the OMS checked.
+        let partly = amend(10, 4);
+        assert_eq!(
+            partly.wire_qty(AmendQty::TotalIncludingFilled),
+            Some(lots(10))
+        );
+        assert_eq!(partly.wire_qty(AmendQty::Remaining), Some(lots(6)));
+        assert_eq!(amend(10, 0).wire_qty(AmendQty::Remaining), Some(lots(10)));
+        // Amending to the filled quantity or below leaves nothing to rest: not an amend.
+        assert_eq!(amend(4, 4).wire_qty(AmendQty::Remaining), None);
+        assert_eq!(amend(3, 4).wire_qty(AmendQty::Remaining), None);
+        assert_eq!(amend(3, 4).wire_qty(AmendQty::TotalIncludingFilled), None);
     }
 
     #[test]
