@@ -21,6 +21,17 @@ pub struct WallNs(pub i64);
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub struct ExchNs(pub i64);
 
+/// Which instant a venue's timestamp marks.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum ExchTsKind {
+    /// When the matching engine processed the event.
+    MatchingEngine,
+    /// When the venue published the message.
+    Publish,
+    /// The venue does not say.
+    Unknown,
+}
+
 /// Kernel receive timestamp of the last packet of a frame (`SO_TIMESTAMPNS`, realtime clock).
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub struct KernelRxNs(pub i64);

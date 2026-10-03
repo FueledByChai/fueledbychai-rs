@@ -70,6 +70,62 @@ impl InstrumentId {
     }
 }
 
+/// A venue as the core numbers it.
+///
+/// Only a number: nothing outside the venue crates and the registry branches on which venue
+/// it names (decision 0003); what a venue can do is its [`VenueCaps`](crate::VenueCaps).
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd, Debug)]
+pub struct VenueId(u16);
+
+impl VenueId {
+    /// The venue with this number.
+    pub const fn new(n: u16) -> VenueId {
+        VenueId(n)
+    }
+
+    /// Its number.
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+}
+
+/// What an instrument is a contract on (BTC, XAU, EUR), the same on every venue that lists it,
+/// so instruments on different venues can be netted against each other.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd, Debug)]
+pub struct UnderlyingId(u32);
+
+impl UnderlyingId {
+    /// The underlying with this number.
+    pub const fn new(n: u32) -> UnderlyingId {
+        UnderlyingId(n)
+    }
+
+    /// Its number.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// An instrument's name on its venue's wire (`ETH-USD-PERP`, `ETHUSDT`), exactly as the venue
+/// spells it.
+///
+/// Opaque for construction: only an adapter builds one, through
+/// [`DecodeScope::venue_symbol`](crate::DecodeScope::venue_symbol); everyone may read it for
+/// display and compatibility output.
+#[derive(Clone, Eq, PartialEq, Hash, Ord, PartialOrd, Debug)]
+pub struct VenueSymbol(CompactString);
+
+impl VenueSymbol {
+    pub(crate) fn from_wire(wire: &str) -> Result<VenueSymbol, IdError> {
+        check_venue_id(wire).map(|()| VenueSymbol(CompactString::new(wire)))
+    }
+
+    /// The symbol as the venue spells it.
+    pub fn as_wire(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Our id for an order: a namespace and a sequence number.
 ///
 /// The fields are private and there is no public constructor: one is minted by
@@ -97,7 +153,7 @@ impl ClientOrderId {
     }
 }
 
-/// The longest venue order id or fill id accepted, in bytes.
+/// The longest venue order id, fill id or venue symbol accepted, in bytes.
 pub const MAX_VENUE_ID_LEN: usize = 96;
 
 /// A venue's id for an order, exactly as the venue sent it.
@@ -198,9 +254,9 @@ pub enum IdError {
         /// Characters the format allows.
         max: usize,
     },
-    /// A venue order id or fill id is empty.
+    /// A venue order id, fill id or symbol is empty.
     Empty,
-    /// A venue order id or fill id is longer than [`MAX_VENUE_ID_LEN`].
+    /// A venue order id, fill id or symbol is longer than [`MAX_VENUE_ID_LEN`].
     TooLong {
         /// Its length in bytes.
         len: usize,
@@ -244,6 +300,8 @@ mod tests {
         assert_eq!(Namespace::new(65_535).get(), 65_535);
         assert_eq!(AccountKey::new(3).get(), 3);
         assert_eq!(InstrumentId::new(4_000_000_000).get(), 4_000_000_000);
+        assert_eq!(VenueId::new(7).get(), 7);
+        assert_eq!(UnderlyingId::new(4_000_000_001).get(), 4_000_000_001);
         let cid = ClientOrderId::new(Namespace::new(9), 42);
         assert_eq!((cid.namespace(), cid.seq()), (Namespace::new(9), 42));
     }
@@ -278,6 +336,14 @@ mod tests {
                 })
             );
             assert_eq!(scope.fill_id(""), Err(IdError::Empty));
+            let symbol = scope.venue_symbol("ETH-USD-PERP").unwrap();
+            assert_eq!(symbol.as_wire(), "ETH-USD-PERP");
+            assert!(scope.venue_symbol(&longest).is_ok());
+            assert_eq!(scope.venue_symbol(""), Err(IdError::Empty));
+            assert!(matches!(
+                scope.venue_symbol(&over),
+                Err(IdError::TooLong { len: 97, .. })
+            ));
         });
     }
 

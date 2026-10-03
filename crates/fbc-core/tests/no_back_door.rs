@@ -1,9 +1,9 @@
-//! Decision 0004: a `VenueOrderId`, a `FillId` or a `Fee` is built only through the
-//! `DecodeScope` the core's dispatch lends, and there is no back door for tests either. The
-//! crate-private constructors (`from_wire`, `Fee::from_declared`) are reachable from anywhere
-//! inside `fbc-core`, including its unit tests, so the compiler alone cannot hold the line;
-//! these tests read the crate's sources and fail if anything but `scope.rs` calls them, or if
-//! anything builds the tuple structs other than those constructors' bodies.
+//! Decision 0004: a `VenueOrderId`, a `FillId`, a `VenueSymbol` or a `Fee` is built only
+//! through the `DecodeScope` the core's dispatch lends, and there is no back door for tests
+//! either. The crate-private constructors (`from_wire`, `Fee::from_declared`) are reachable
+//! from anywhere inside `fbc-core`, including its unit tests, so the compiler alone cannot
+//! hold the line; these tests read the crate's sources and fail if anything but `scope.rs`
+//! calls them, or if anything builds the tuple structs other than those constructors' bodies.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -39,9 +39,13 @@ fn only_the_decode_scope_calls_the_venue_id_constructors() {
     let mut calls = Vec::new();
     for (name, text) in crate_sources() {
         for (n, line) in text.lines().enumerate() {
-            let is_call = ["VenueOrderId::from_wire(", "FillId::from_wire("]
-                .iter()
-                .any(|pat| line.contains(pat));
+            let is_call = [
+                "VenueOrderId::from_wire(",
+                "FillId::from_wire(",
+                "VenueSymbol::from_wire(",
+            ]
+            .iter()
+            .any(|pat| line.contains(pat));
             if is_call && name != "scope.rs" {
                 calls.push(format!("{name}:{}: {}", n + 1, line.trim()));
             }
@@ -60,7 +64,11 @@ fn only_from_wire_builds_the_venue_id_structs() {
     for (name, text) in crate_sources() {
         // The `pub struct` lines declare the types; every other occurrence builds one.
         for line in text.lines().filter(|line| !line.contains("pub struct")) {
-            for pat in ["VenueOrderId(CompactString", "FillId(CompactString"] {
+            for pat in [
+                "VenueOrderId(CompactString",
+                "FillId(CompactString",
+                "VenueSymbol(CompactString",
+            ] {
                 builds.extend(line.matches(pat).map(|_| format!("{name}: {pat}")));
             }
         }
@@ -70,7 +78,8 @@ fn only_from_wire_builds_the_venue_id_structs() {
         builds,
         [
             "ids.rs: FillId(CompactString",
-            "ids.rs: VenueOrderId(CompactString"
+            "ids.rs: VenueOrderId(CompactString",
+            "ids.rs: VenueSymbol(CompactString"
         ],
         "a venue id struct is built somewhere other than its from_wire body (0004)"
     );

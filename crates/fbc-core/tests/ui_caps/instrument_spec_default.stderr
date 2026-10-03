@@ -1,0 +1,5 @@
+error[E0599]: no associated function or constant named `default` found for struct `InstrumentSpec` in the current scope
+ --> tests/ui_caps/instrument_spec_default.rs:5:29
+  |
+5 |     let _ = InstrumentSpec::default();
+  |                             ^^^^^^^ associated function or constant not found in `InstrumentSpec`
