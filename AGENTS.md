@@ -109,13 +109,13 @@ rather than guess.
 
 ### Layout
 
-- A Cargo workspace (0001, 0008). Only `crates/fbc-core` exists so far, with time, units,
+- A Cargo workspace (0001, 0008). `crates/fbc-core` exists, with time, units,
   price grids, exact prices, sealed ids, the client-id codec, `NamespaceLease`, `CidMint`,
   `Fee`/`FeeBook`, `DecodeScope`, `InstrumentSpec` (maker-safe `quantize`), `VenueCaps`,
   the market-data and execution events, venue commands, and the codec, signer, nonce and
-  factory traits with `Effects` and `EncodeCtx`; the rest are planned. Members are the `crates/fbc-*` glob; the
-  first venue crate adds `crates/venues/fbc-*` (Cargo rejects a member glob that matches
-  nothing), and `fixtures/` is excluded from the workspace:
+  factory traits with `Effects` and `EncodeCtx`, and `crates/venues/fbc-venue-paradex` with
+  only its signer (`src/sign`); the rest are planned. Members are the `crates/fbc-*` and
+  `crates/venues/fbc-*` globs, and `fixtures/` is excluded from the workspace:
   - `crates/fbc-core`: the contract. Time, units, price grids and exact prices, sealed ids and
     the canonical client-id codec, `Fee`/`FeeBook`, `InstrumentSpec`, `VenueCaps`, events,
     commands, the codec and factory traits, `DecodeScope` and `EncodeCtx` (0003, 0004).
@@ -132,8 +132,10 @@ rather than guess.
     fill-model code, never calibrations), `crates/fbc-conformance` (adapter conformance kit and
     stub venue server).
   - `crates/venues/fbc-venues` (the registry, the only crate that sees concrete venues),
-    `crates/venues/fbc-venue-binance-usdm` (market data only), `crates/venues/fbc-venue-paradex`,
-    later `crates/venues/fbc-venue-hibachi` (0007).
+    `crates/venues/fbc-venue-binance-usdm` (market data only), `crates/venues/fbc-venue-paradex`
+    (so far its signer: the SNIP-12 revision 0 hash and Stark-curve signature, tested against
+    `fixtures/paradex/signing/paradex-vectors.tsv`), later `crates/venues/fbc-venue-hibachi`
+    (0007).
   - Dependency direction (design §3): `fbc-core`, `fbc-book`, `fbc-oms`, `fbc-journal` and
     `fbc-sim` never depend on a venue crate; a venue crate depends on `fbc-core` and protocol
     crates only. Nothing here depends on the private consumer.
