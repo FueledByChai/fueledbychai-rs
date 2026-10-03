@@ -1,5 +1,5 @@
 //! A venue as a whole: its factory, its configuration schema, and the gateway traits
-//! (decisions 0002 and 0003, design §4.7, §4.8).
+//! (decisions 0002, 0003 and 0014, design §4.7, §4.8).
 //!
 //! A [`VenueFactory`] is the one value a venue crate exports. From the consumer's
 //! configuration it states the venue's capabilities, plans market-data connections, and builds
@@ -174,6 +174,11 @@ pub struct SubmitHandle {
 }
 
 /// Submits commands for accounts: the live gateway, the simulated venue, a managed gateway.
+///
+/// Every order command reaches a gateway only through `fbc-oms`, after its caps and the kill
+/// switch (0013 rule 2, 0012). Nothing implements this trait yet; FBC-ob2 makes that path the
+/// only one (an OMS-issued authorization, or a gateway built only inside `fbc-oms`) before a
+/// live gateway exists.
 pub trait OrderGateway {
     fn submit(&mut self, acct: AccountKey, cmd: VenueCommand, ctx: &EncodeCtx) -> SubmitHandle;
 }
