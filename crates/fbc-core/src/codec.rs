@@ -490,22 +490,32 @@ impl Effects {
         self.buf.is_empty()
     }
 
-    /// Whether these effects, asked for by an encode of request `rpc`, send it as a request the
-    /// runtime can time out: at least one [`Effect::Send`] or [`Effect::Http`], and every one
-    /// naming `rpc` (a `Send` with an [`RpcCall`] for `rpc`, an `Http` with `rpc: Some(rpc)`).
-    /// The runtime executes an encode's effects only when this holds; otherwise it writes
-    /// nothing and the command is `NotSent(Unencodable)`, a codec defect, so no order is ever
-    /// sent outside the Unknown ladder (0005).
-    pub fn carry_request(&self, rpc: RpcId) -> bool {
+    /// Whether these effects, asked for by an encode of request `rpc` whose command's class is
+    /// `class` ([`VenueCommand::traffic_class`]), send it as a request the runtime can time out
+    /// and rate-limit rightly: at least one [`Effect::Send`] or [`Effect::Http`], every one
+    /// naming `rpc` (a `Send` with an [`RpcCall`] for `rpc`, an `Http` with `rpc: Some(rpc)`)
+    /// and labelled `class`. The runtime executes an encode's effects only when this holds;
+    /// otherwise it writes nothing and the command is `NotSent(Unencodable)`, a codec defect, so
+    /// no order is sent outside the Unknown ladder (0005) and no request rides the wrong
+    /// traffic class.
+    pub fn carry_request(&self, rpc: RpcId, class: TrafficClass) -> bool {
         let mut requests = self.buf.iter().filter_map(|effect| match effect {
-            Effect::Send { rpc: call, .. } => Some(call.map(|c| c.id)),
-            Effect::Http { rpc: call, .. } => Some(*call),
+            Effect::Send {
+                rpc: call,
+                class: labelled,
+                ..
+            } => Some((call.map(|c| c.id), *labelled)),
+            Effect::Http {
+                rpc: call,
+                class: labelled,
+                ..
+            } => Some((*call, *labelled)),
             Effect::Timer { .. } | Effect::Reconnect { .. } => None,
         });
         let mut any = false;
         let all = requests.all(|named| {
             any = true;
-            named == Some(rpc)
+            named == (Some(rpc), class)
         });
         any && all
     }
@@ -843,7 +853,7 @@ pub trait ExecCodec: Send {
     /// Encode and sign `cmd` as request `rpc`. `Err` means not sent: no byte reached a socket
     /// buffer and no effect was pushed. `Ok` effects carry the request
     /// ([`Effects::carry_request`]): every frame or HTTP request names `rpc`, so it has a
-    /// deadline. Never retries.
+    /// deadline, and is labelled with `cmd`'s traffic class. Never retries.
     fn encode(
         &mut self,
         cmd: &VenueCommand,
@@ -863,9 +873,12 @@ pub trait ExecCodec: Send {
         fx: &mut Effects,
     ) -> Result<(), DecodeError>;
     /// Decode the response to an HTTP request the codec asked for, or learn why none came. For
-    /// an order-entry request (one with an `rpc`), a failure is that request's outcome:
-    /// [`HttpFailure::NotSent`] is `NotSent`, the others are `Unknown` and never resent. `Err`
-    /// means nothing was pushed ([`ExecSink`]).
+    /// an order-entry request (one with an `rpc`), the call always reports that request's
+    /// outcome: a failure is [`HttpFailure::NotSent`] for `NotSent`, the others `Unknown`, never
+    /// resent; and a response the codec cannot decode is `Unknown` too (the venue may have
+    /// acted), pushed with `Ok`, since the request's timeout is spent and nothing else will
+    /// settle it. `Err` means nothing was pushed ([`ExecSink`]), and is only for a response to a
+    /// request without an `rpc`.
     fn on_http(
         &mut self,
         tag: HttpTag,
@@ -1224,7 +1237,7 @@ mod tests {
                 id,
                 timeout: Duration::from_secs(1),
             }),
-            class: TrafficClass::Normal,
+            class: TrafficClass::Safety,
         };
         let http = |call: Option<RpcId>| Effect::Http {
             tag: HttpTag(1),
@@ -1236,7 +1249,7 @@ mod tests {
             },
             rpc: call,
             timeout: Duration::from_secs(1),
-            class: TrafficClass::Normal,
+            class: TrafficClass::Safety,
         };
         let timer = Effect::Timer {
             tag: TimerTag(1),
@@ -1245,7 +1258,7 @@ mod tests {
         let carries = |effects: Vec<Effect>| {
             let mut fx = Effects::new();
             effects.into_iter().for_each(|e| fx.push(e));
-            fx.carry_request(rpc)
+            fx.carry_request(rpc, TrafficClass::Safety)
         };
         assert!(carries(vec![frame(Some(rpc))]));
         assert!(carries(vec![http(Some(rpc)), timer.clone()]));
@@ -1256,6 +1269,12 @@ mod tests {
         assert!(!carries(vec![frame(Some(rpc)), frame(None)]));
         assert!(!carries(vec![timer]));
         assert!(!carries(vec![]));
+        // Codex r4173103646: every request effect is labelled with the command's own class
+        // (VenueCommand::traffic_class), so a cancel is never rate-limited as normal traffic
+        // and a normal order never rides the safety floor.
+        let mut fx = Effects::new();
+        fx.push(frame(Some(rpc)));
+        assert!(!fx.carry_request(rpc, TrafficClass::Normal));
     }
 
     #[test]
