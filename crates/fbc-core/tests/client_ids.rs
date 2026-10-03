@@ -353,7 +353,7 @@ fn the_decode_scope_tells_ours_from_foreign() {
         encode_cid(&fmt, ours).unwrap(),
         encode_cid(&fmt, theirs).unwrap(),
     );
-    fbc_core::dispatch(&fmt, OWN, |scope| {
+    fbc_core::dispatch(&fmt, OWN, fbc_core::VenueFeeSign::PositiveIsCost, |scope| {
         assert_eq!(scope.client_order_id(&ours_wire), CidMatch::Ours(ours));
         assert_eq!(
             scope.client_order_id(&theirs_wire),

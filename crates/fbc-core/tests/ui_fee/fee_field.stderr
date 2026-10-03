@@ -1,0 +1,5 @@
+error[E0616]: field `0` of struct `Fee` is private
+ --> tests/ui_fee/fee_field.rs:5:9
+  |
+5 |     fee.0.nanos = 1;
+  |         ^ private field

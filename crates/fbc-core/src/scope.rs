@@ -1,18 +1,22 @@
-//! The decode scope: the only constructor of [`VenueOrderId`] and [`FillId`] (decision 0004,
-//! design §4.3).
+//! The decode scope: the only constructor of [`VenueOrderId`], [`FillId`] and [`Fee`] (decision
+//! 0004, design §4.2, §4.3).
 //!
 //! A [`DecodeScope`] cannot be built outside this crate. The core's [`dispatch`] makes one and
 //! lends it to a codec callback for the length of that callback; the callback cannot keep it.
-//! Adapters, and tests too (decision 0004: no back door), obtain venue ids only through it.
+//! Adapters, and tests too (decision 0004: no back door), obtain venue ids and fees only
+//! through it.
 
 use crate::cid::{ClientIdFormat, decode_cid};
+use crate::fee::{Fee, FeeError, VenueFeeSign};
 use crate::ids::{CidMatch, FillId, IdError, Namespace, VenueOrderId};
+use crate::units::AssetSym;
 
 /// What a codec callback decodes ids with. Lent by [`dispatch`]; never built elsewhere.
 #[derive(Debug)]
 pub struct DecodeScope<'a> {
     fmt: &'a ClientIdFormat,
     own: Namespace,
+    fee_sign: VenueFeeSign,
     _seal: Seal,
 }
 
@@ -37,21 +41,31 @@ impl DecodeScope<'_> {
     pub fn client_order_id(&self, wire: &str) -> CidMatch {
         decode_cid(self.fmt, self.own, wire)
     }
+
+    /// The fee `raw_nanos` of `asset` means under the venue's declared fee sign, as a cost to
+    /// us: positive when we paid, negative for a rebate. Refused only for `i128::MIN` nanos,
+    /// which has no negation.
+    pub fn fee(&self, raw_nanos: i128, asset: AssetSym) -> Result<Fee, FeeError> {
+        Fee::from_declared(raw_nanos, asset, self.fee_sign)
+    }
 }
 
 /// The core's dispatch: runs `callback` with a [`DecodeScope`] for a venue whose client ids use
-/// `fmt`, in the engine namespace `own`, and returns what the callback returns.
+/// `fmt` and whose fees are reported under `fee_sign`, in the engine namespace `own`, and
+/// returns what the callback returns.
 ///
 /// The scope is lent for any lifetime the callback must accept, so the callback cannot return
 /// or store it.
 pub fn dispatch<R>(
     fmt: &ClientIdFormat,
     own: Namespace,
+    fee_sign: VenueFeeSign,
     callback: impl for<'s> FnOnce(&'s DecodeScope<'s>) -> R,
 ) -> R {
     let scope = DecodeScope {
         fmt,
         own,
+        fee_sign,
         _seal: Seal,
     };
     callback(&scope)

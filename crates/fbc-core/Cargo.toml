@@ -1,6 +1,6 @@
 [package]
 name = "fbc-core"
-description = "The fueledbychai-rs contract: time, units, price grids, exact prices and sealed ids."
+description = "The fueledbychai-rs contract: time, units, price grids, exact prices, sealed ids and fees."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

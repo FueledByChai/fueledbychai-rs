@@ -54,6 +54,22 @@ impl AccountKey {
     }
 }
 
+/// An instrument as the core numbers it, the same on every venue that lists it.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd, Debug)]
+pub struct InstrumentId(u32);
+
+impl InstrumentId {
+    /// The instrument with this number.
+    pub const fn new(n: u32) -> InstrumentId {
+        InstrumentId(n)
+    }
+
+    /// Its number.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
 /// Our id for an order: a namespace and a sequence number.
 ///
 /// The fields are private and there is no public constructor: one is minted by
@@ -220,12 +236,14 @@ impl std::error::Error for IdError {}
 mod tests {
     use super::*;
     use crate::cid::ClientIdFormat;
+    use crate::fee::VenueFeeSign;
     use crate::scope::{DecodeScope, dispatch};
 
     #[test]
     fn numbers_round_trip() {
         assert_eq!(Namespace::new(65_535).get(), 65_535);
         assert_eq!(AccountKey::new(3).get(), 3);
+        assert_eq!(InstrumentId::new(4_000_000_000).get(), 4_000_000_000);
         let cid = ClientOrderId::new(Namespace::new(9), 42);
         assert_eq!((cid.namespace(), cid.seq()), (Namespace::new(9), 42));
     }
@@ -233,7 +251,12 @@ mod tests {
     // Venue ids come only from the decode scope, in tests as well (decision 0004);
     // tests/no_back_door.rs fails if anything else calls `from_wire`.
     fn in_scope<R>(callback: impl for<'s> FnOnce(&'s DecodeScope<'s>) -> R) -> R {
-        dispatch(&ClientIdFormat::Uuid, Namespace::new(1), callback)
+        dispatch(
+            &ClientIdFormat::Uuid,
+            Namespace::new(1),
+            VenueFeeSign::PositiveIsCost,
+            callback,
+        )
     }
 
     #[test]

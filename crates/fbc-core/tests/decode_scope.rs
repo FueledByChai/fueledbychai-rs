@@ -1,7 +1,12 @@
-//! Decision 0004: venue order ids and fill ids are built only through the `DecodeScope` the
-//! core's dispatch lends to a codec callback; tests use the same scope.
+//! Decision 0004: venue order ids, fill ids and fees are built only through the `DecodeScope`
+//! the core's dispatch lends to a codec callback; tests use the same scope.
 
-use fbc_core::{Charset, CidMatch, ClientIdFormat, IdError, MAX_VENUE_ID_LEN, Namespace, dispatch};
+use fbc_core::{
+    AssetSym, Charset, CidMatch, ClientIdFormat, IdError, MAX_VENUE_ID_LEN, Money, Namespace,
+    VenueFeeSign, dispatch,
+};
+
+const COST: VenueFeeSign = VenueFeeSign::PositiveIsCost;
 
 const HIBACHI_LIKE: ClientIdFormat = ClientIdFormat::Alnum {
     max_len: 32,
@@ -10,7 +15,7 @@ const HIBACHI_LIKE: ClientIdFormat = ClientIdFormat::Alnum {
 
 #[test]
 fn the_scope_builds_venue_ids_from_the_wire_text() {
-    let (vid, fid) = dispatch(&HIBACHI_LIKE, Namespace::new(3), |scope| {
+    let (vid, fid) = dispatch(&HIBACHI_LIKE, Namespace::new(3), COST, |scope| {
         (
             scope.venue_order_id("1759363200000201030"),
             scope.fill_id("8812"),
@@ -23,7 +28,7 @@ fn the_scope_builds_venue_ids_from_the_wire_text() {
 #[test]
 fn the_scope_refuses_empty_and_overlong_venue_ids() {
     let over = "7".repeat(MAX_VENUE_ID_LEN + 1);
-    dispatch(&HIBACHI_LIKE, Namespace::new(3), |scope| {
+    dispatch(&HIBACHI_LIKE, Namespace::new(3), COST, |scope| {
         assert_eq!(scope.venue_order_id(""), Err(IdError::Empty));
         assert_eq!(scope.fill_id(""), Err(IdError::Empty));
         assert!(matches!(
@@ -36,7 +41,7 @@ fn the_scope_refuses_empty_and_overlong_venue_ids() {
 
 #[test]
 fn the_scope_decodes_client_ids_against_its_namespace() {
-    dispatch(&ClientIdFormat::Uuid, Namespace::new(3), |scope| {
+    dispatch(&ClientIdFormat::Uuid, Namespace::new(3), COST, |scope| {
         assert_eq!(
             scope.client_order_id("f47ac10b-58cc-4372-a567-0e02b2c3d479"),
             CidMatch::Unparseable
@@ -47,4 +52,18 @@ fn the_scope_decodes_client_ids_against_its_namespace() {
         );
         assert!(format!("{scope:?}").contains("DecodeScope"));
     });
+}
+
+#[test]
+fn the_scope_applies_the_fee_sign_dispatch_was_given() {
+    let usdc = AssetSym::new("USDC").unwrap();
+    for (sign, cost) in [
+        (VenueFeeSign::PositiveIsCost, 3_000),
+        (VenueFeeSign::PositiveIsRebate, -3_000),
+    ] {
+        let fee = dispatch(&HIBACHI_LIKE, Namespace::new(3), sign, |scope| {
+            scope.fee(3_000, usdc)
+        });
+        assert_eq!(fee.unwrap().cost(), Money::new(cost, usdc), "{sign:?}");
+    }
 }

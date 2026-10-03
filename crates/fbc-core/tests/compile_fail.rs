@@ -1,6 +1,7 @@
 //! Decision 0004: the sealed types refuse misuse at compile time, proven case by case by the
 //! files under `tests/ui/` (the four clocks cannot be mixed), `tests/ui_units/` (the unit
-//! seals) and `tests/ui_ids/` (the id seals) and their expected `.stderr`. Regenerate the expected output with
+//! seals), `tests/ui_ids/` (the id seals) and `tests/ui_fee/` (the fee seal) and their expected
+//! `.stderr`. Regenerate the expected output with
 //! `TRYBUILD=overwrite cargo test -p fbc-core --test compile_fail` only when the pinned
 //! toolchain moves (0008).
 
@@ -27,4 +28,13 @@ fn unit_seals_do_not_compile() {
 fn id_seals_do_not_compile() {
     let cases = trybuild::TestCases::new();
     cases.compile_fail("tests/ui_ids/*.rs");
+}
+
+/// A `Fee` cannot be built outside `fbc-core` (not from a `Money`, not through the crate-private
+/// constructor `DecodeScope::fee` uses), cannot be edited, and has no `abs`, no negation and no
+/// conversion from `f64` (decision 0004, design §4.2).
+#[test]
+fn fee_seal_does_not_compile() {
+    let cases = trybuild::TestCases::new();
+    cases.compile_fail("tests/ui_fee/*.rs");
 }

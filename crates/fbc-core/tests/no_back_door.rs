@@ -1,9 +1,9 @@
-//! Decision 0004: a `VenueOrderId` or a `FillId` is built only through the `DecodeScope` the
-//! core's dispatch lends, and there is no back door for tests either. The crate-private
-//! `from_wire` constructors are reachable from anywhere inside `fbc-core`, including its unit
-//! tests, so the compiler alone cannot hold the line; this test reads the crate's sources and
-//! fails if anything but `scope.rs` calls them, or if anything builds the tuple structs other
-//! than the two `from_wire` bodies.
+//! Decision 0004: a `VenueOrderId`, a `FillId` or a `Fee` is built only through the
+//! `DecodeScope` the core's dispatch lends, and there is no back door for tests either. The
+//! crate-private constructors (`from_wire`, `Fee::from_declared`) are reachable from anywhere
+//! inside `fbc-core`, including its unit tests, so the compiler alone cannot hold the line;
+//! these tests read the crate's sources and fail if anything but `scope.rs` calls them, or if
+//! anything builds the tuple structs other than those constructors' bodies.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -73,5 +73,37 @@ fn only_from_wire_builds_the_venue_id_structs() {
             "ids.rs: VenueOrderId(CompactString"
         ],
         "a venue id struct is built somewhere other than its from_wire body (0004)"
+    );
+}
+
+#[test]
+fn only_the_decode_scope_calls_the_fee_constructor() {
+    let mut calls = Vec::new();
+    for (name, text) in crate_sources() {
+        for (n, line) in text.lines().enumerate() {
+            if line.contains("Fee::from_declared(") && name != "scope.rs" {
+                calls.push(format!("{name}:{}: {}", n + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        calls.is_empty(),
+        "fees built outside DecodeScope (0004):\n{}",
+        calls.join("\n")
+    );
+}
+
+#[test]
+fn only_from_declared_builds_the_fee_struct() {
+    let mut builds = Vec::new();
+    for (name, text) in crate_sources() {
+        for line in text.lines().filter(|line| !line.contains("pub struct")) {
+            builds.extend(line.matches("Fee(Money").map(|_| name.clone()));
+        }
+    }
+    assert_eq!(
+        builds,
+        ["fee.rs"],
+        "a Fee is built somewhere other than Fee::from_declared (0004)"
     );
 }
