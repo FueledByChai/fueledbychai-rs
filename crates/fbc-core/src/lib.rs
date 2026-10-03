@@ -39,10 +39,10 @@ pub use caps::{
 
 pub use cid::{Charset, ClientIdFormat, MAX_WIRE_LEN, WireCid, decode_cid, encode_cid};
 pub use codec::{
-    AmendWire, CancelWire, DecodeError, Effect, Effects, EncodeCtx, EncodeReceipt, ExecCodec,
-    ExecSink, Feed, Header, HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag, Keepalive,
-    KeepaliveKind, MAX_SIG_LEN, MdCodec, MdSink, NonceBlock, NonceSource, OrderSigner, PlaceWire,
-    RawFrame, RedactError, RpcCall, Sig, SignError, SpecTable, Subscription, TimerTag,
+    AmendWire, CancelRef, CancelWire, DecodeError, Effect, Effects, EncodeCtx, EncodeReceipt,
+    ExecCodec, ExecSink, Feed, Header, HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag,
+    Keepalive, KeepaliveKind, MAX_SIG_LEN, MdCodec, MdSink, NonceBlock, NonceSource, OrderSigner,
+    PlaceWire, RawFrame, RedactError, RpcCall, Sig, SignError, SpecTable, Subscription, TimerTag,
     TrafficClass, WireSlice,
 };
 pub use command::{
