@@ -767,10 +767,8 @@ pub struct PlaceWire<'a> {
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub struct AmendWire<'a> {
     pub spec: &'a InstrumentSpec,
-    /// The venue's order id, when the target names it.
-    pub vid: Option<&'a VenueOrderId>,
-    /// The client id in the venue's wire format, when the target names it.
-    pub cid: Option<&'a str>,
+    /// The reference the request carries, and only that one.
+    pub target: AmendRef<'a>,
     pub side: Side,
     pub px: Ticks,
     /// The quantity as the venue's wire means it: [`AmendOrder::wire_qty`](crate::AmendOrder::wire_qty)
@@ -782,6 +780,16 @@ pub struct AmendWire<'a> {
     pub reduce_only: bool,
     pub wall: WallNs,
     pub nonce: Option<u64>,
+}
+
+/// The one reference an amend request names its order by, as the codec chose it from the
+/// command's [`OrderRef`](crate::OrderRef): the signer signs exactly what is sent.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum AmendRef<'a> {
+    /// The venue's order id.
+    Venue(&'a VenueOrderId),
+    /// Our client id, already in the venue's wire format.
+    Client(&'a str),
 }
 
 /// The one reference a cancel request names its order by, as the codec chose it from the

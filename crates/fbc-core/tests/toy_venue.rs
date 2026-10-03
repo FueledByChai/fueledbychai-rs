@@ -16,13 +16,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use fbc_core::{
-    AckLevel, AckModel, Aggressor, AmendCaps, AmendOrder, AmendQty, AmendWire, AssetSym, BookCaps,
-    BookId, BookSide, Cadence, CancelOnDisconnect, CancelOrder, CancelRef, CancelWire, Channel,
-    Charset, CidMatch, CidMint, ClientIdFormat, ClientOrderId, ConfigError, ConfigScope, ConnKey,
-    ConnTopology, Continuity, DecodeError, DecodeScope, EncodeCtx, EncodeReceipt, Encoding,
-    EndpointPlan, Envelope, ExchNs, ExchTsKind, ExecCodec, ExecEndpoint, ExecEvent, ExecSink, Feed,
-    FeedHealth, FeedSource, FieldSpec, FieldUnit, FillCaps, FillEvent, FillIdent, FillKey,
-    FillSource, FundingCaps, FundingSpec, Header, HttpFailure, HttpMethod, HttpRequest,
+    AckLevel, AckModel, Aggressor, AmendCaps, AmendOrder, AmendQty, AmendRef, AmendWire, AssetSym,
+    BookCaps, BookId, BookSide, Cadence, CancelOnDisconnect, CancelOrder, CancelRef, CancelWire,
+    Channel, Charset, CidMatch, CidMint, ClientIdFormat, ClientOrderId, ConfigError, ConfigScope,
+    ConnKey, ConnTopology, Continuity, DecodeError, DecodeScope, EncodeCtx, EncodeReceipt,
+    Encoding, EndpointPlan, Envelope, ExchNs, ExchTsKind, ExecCodec, ExecEndpoint, ExecEvent,
+    ExecSink, Feed, FeedHealth, FeedSource, FieldSpec, FieldUnit, FillCaps, FillEvent, FillIdent,
+    FillKey, FillSource, FundingCaps, FundingSpec, Header, HttpFailure, HttpMethod, HttpRequest,
     HttpResponse, HttpTag, InstrumentId, InstrumentKind, InstrumentSpec, ItemRef, Keepalive,
     KeepaliveKind, Liquidity3, Lots, Lvl, MatchingCaps, MdCaps, MdCodec, MdEvent, MdSink,
     MdTransport, ModeScope, Money, MonoNs, Namespace, NamespaceLease, NewOrder, NonceBlock,
@@ -485,12 +485,13 @@ impl OrderSigner for ToySigner {
     }
 
     fn sign_amend(&mut self, w: &AmendWire<'_>) -> Result<Sig, SignError> {
-        let vid = w.vid.ok_or(SignError::Unsignable("venue order id"))?;
+        let AmendRef::Venue(vid) = w.target else {
+            return Err(SignError::Unsignable("venue order id"));
+        };
         Ok(fnv(&format!(
-            "{}|{}|{:?}|{:?}|{}|{}|{:?}|{:?}|{}|{}|{}|{:?}",
+            "{}|{}|{:?}|{}|{}|{:?}|{:?}|{}|{}|{}|{:?}",
             w.spec.venue_symbol.as_wire(),
             vid.as_str(),
-            w.cid,
             w.side,
             w.px.0,
             w.qty.get(),
@@ -785,8 +786,7 @@ impl ExecCodec for ToyExec {
                     .ok_or(NotSentReason::Unencodable)?;
                 let wire = AmendWire {
                     spec,
-                    vid: Some(vid),
-                    cid: None,
+                    target: AmendRef::Venue(vid),
                     side: a.side,
                     px: a.px,
                     qty,
@@ -2461,6 +2461,11 @@ impl OrderSigner for RecordingSigner {
     }
 
     fn sign_amend(&mut self, w: &AmendWire<'_>) -> Result<Sig, SignError> {
+        let named = match w.target {
+            AmendRef::Venue(vid) => format!("amend venue:{}", vid.as_str()),
+            AmendRef::Client(cid) => format!("amend client:{cid}"),
+        };
+        self.0.lock().unwrap().push(named);
         ToySigner.sign_amend(w)
     }
 
@@ -2537,4 +2542,31 @@ fn an_amended_order_states_its_new_price_and_total_once() {
             &update(&v2, None, None, None),
         ]
     );
+}
+
+#[test]
+fn an_amend_signer_sees_only_the_reference_the_request_encodes() {
+    let [cid] = mint(1).try_into().unwrap();
+    let vid = with_scope(|scope| scope.venue_order_id("V-1").unwrap());
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut codec = ToyExec {
+        signer: Box::new(RecordingSigner(seen.clone())),
+        url: "https://toy.invalid".to_owned(),
+    };
+    let amend = VenueCommand::Amend(AmendOrder {
+        target: OrderRef::Both(cid, vid),
+        inst: INST,
+        side: Side::Buy,
+        tif: TifTag::Gtc,
+        channel: Channel::Public,
+        post_only: true,
+        reduce_only: false,
+        reducing: false,
+        px: Ticks(130_860),
+        qty: Lots::new(25).unwrap(),
+        cum_filled: Lots::new(5).unwrap(),
+    });
+    let text = String::from_utf8(encode_once(&mut codec, &amend, &ctx(9, 4, 1))).unwrap();
+    assert!(text.starts_with("rpc=11\namend|vid=V-1|"), "{text}");
+    assert_eq!(*seen.lock().unwrap(), ["amend venue:V-1"]);
 }
