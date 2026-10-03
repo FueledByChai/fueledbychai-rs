@@ -200,7 +200,7 @@ pub enum QtyError {
     Negative,
     /// The size, in size steps, does not fit an `i64`.
     OutOfRange,
-    /// The size floors to `lots`, below the venue's minimum `min_size`.
+    /// The size floors to `lots`, below the venue's minimum `min_size`, or to zero lots.
     BelowMinSize {
         /// The size floored onto the size step.
         lots: Lots,
@@ -247,7 +247,8 @@ impl InstrumentSpec {
     }
 
     /// The order size for a model size `q`, floored onto the size step, or refused when it is
-    /// below [`min_size`](InstrumentSpec::min_size).
+    /// below [`min_size`](InstrumentSpec::min_size) or is zero lots (never an order, even where
+    /// the declared minimum is zero).
     pub fn floor_qty(&self, q: f64) -> Result<Lots, QtyError> {
         if !q.is_finite() {
             return Err(QtyError::NotFinite);
@@ -258,7 +259,7 @@ impl InstrumentSpec {
         let lots = index_of(q, self.size_step.get(), Round::Down)
             .and_then(Lots::new)
             .ok_or(QtyError::OutOfRange)?;
-        if lots < self.min_size {
+        if lots < self.min_size || lots == Lots::ZERO {
             return Err(QtyError::BelowMinSize {
                 lots,
                 min_size: self.min_size,

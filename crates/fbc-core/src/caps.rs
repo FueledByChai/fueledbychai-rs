@@ -507,7 +507,12 @@ macro_rules! cap_tags {
         impl CapTag for $ty {
             const ALL: &'static [Self] = &[$($variant),+];
             fn bit(self) -> u32 {
-                1 << (self as u32)
+                // Exhaustive over the listed variants: a variant added to the enum but left out
+                // of the list does not compile, so `ALL` (and `iter`, `Debug`) cannot fall
+                // behind `bit`.
+                match self {
+                    $($variant)|+ => 1 << (self as u32),
+                }
             }
         }
     };

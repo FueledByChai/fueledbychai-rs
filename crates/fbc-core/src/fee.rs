@@ -94,12 +94,38 @@ impl Fee {
 #[derive(Copy, Clone, PartialEq, PartialOrd, Debug)]
 pub struct FeeRate(pub Bps);
 
-/// A venue's published maker and taker rates for an instrument: a prior, the last resort a
-/// [`FeeBook`] falls back to ([`FeeSource::PublicPrior`]), never an account's rate.
+/// A venue's published rates for an instrument, per order channel: a prior, the last resort a
+/// [`FeeBook`] falls back to ([`FeeSource::PublicPrior`]), never an account's rate. Rates are
+/// kept per channel, as [`FeeKey`] keys them, so an RPI rate is never borrowed from the public
+/// book's.
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub struct FeeSchedule {
+    /// The public book's rates.
+    pub public: PublishedRates,
+    /// The RPI channel's rates, `None` where the venue publishes none.
+    pub rpi: Option<PublishedRates>,
+}
+
+/// One channel's published maker and taker rates.
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub struct PublishedRates {
     pub maker: FeeRate,
     pub taker: FeeRate,
+}
+
+impl FeeSchedule {
+    /// The published rate for `channel` and `liquidity`, `None` where the venue publishes none
+    /// for that channel.
+    pub fn rate(&self, channel: Channel, liquidity: Liquidity) -> Option<FeeRate> {
+        let rates = match channel {
+            Channel::Public => self.public,
+            Channel::Rpi => self.rpi?,
+        };
+        Some(match liquidity {
+            Liquidity::Maker => rates.maker,
+            Liquidity::Taker => rates.taker,
+        })
+    }
 }
 
 /// What a fee rate applies to: one account's orders on one instrument, through one order

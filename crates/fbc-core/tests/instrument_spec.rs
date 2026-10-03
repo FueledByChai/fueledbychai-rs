@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use fbc_core::{
     AssetSym, Bps, ClientIdFormat, FeeRate, FeeSchedule, FundingSpec, InstrumentId, InstrumentKind,
-    InstrumentSpec, Lots, Money, Namespace, PriceGrid, QtyError, QuantizeError, Side, SizeStep,
-    Ticks, TradingStatus, UnderlyingId, VenueFeeSign, VenueId, VenueNativeId, WallNs, dispatch,
+    InstrumentSpec, Lots, Money, Namespace, PriceGrid, PublishedRates, QtyError, QuantizeError,
+    Side, SizeStep, Ticks, TradingStatus, UnderlyingId, VenueFeeSign, VenueId, VenueNativeId,
+    WallNs, dispatch,
 };
 use rust_decimal::Decimal;
 
@@ -54,8 +55,11 @@ fn spec(grid: PriceGrid) -> InstrumentSpec {
             cap: None,
         },
         public_fees: Some(FeeSchedule {
-            maker: FeeRate(Bps(-0.5)),
-            taker: FeeRate(Bps(2.0)),
+            public: PublishedRates {
+                maker: FeeRate(Bps(-0.5)),
+                taker: FeeRate(Bps(2.0)),
+            },
+            rpi: None,
         }),
         status: TradingStatus::Trading,
         version: 1,
@@ -241,6 +245,19 @@ fn floor_qty_floors_onto_the_size_step_and_rejects_a_size_below_min_size() {
         ..fixed("0.5")
     };
     assert_eq!(tenth_step.floor_qty(0.3), Ok(lots(3)));
+    // Zero lots is never an order, even where the declared minimum is zero.
+    let no_minimum = InstrumentSpec {
+        min_size: lots(0),
+        ..fixed("0.5")
+    };
+    assert_eq!(no_minimum.floor_qty(0.001), Ok(lots(1)));
+    assert_eq!(
+        no_minimum.floor_qty(0.0009),
+        Err(QtyError::BelowMinSize {
+            lots: lots(0),
+            min_size: lots(0)
+        })
+    );
     assert_eq!(spec.floor_qty(-0.01), Err(QtyError::Negative));
     assert_eq!(spec.floor_qty(f64::NAN), Err(QtyError::NotFinite));
     assert_eq!(spec.floor_qty(1e300), Err(QtyError::OutOfRange));
