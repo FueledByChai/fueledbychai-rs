@@ -17,6 +17,7 @@ use std::sync::Arc;
 use compact_str::CompactString;
 
 use crate::caps::{AmendQty, Feature, OrderKindTag, TifTag};
+use crate::codec::TrafficClass;
 use crate::event::VenueMode;
 use crate::ids::{ClientOrderId, InstrumentId, OrderRef, VenueOrderId};
 use crate::units::{Channel, Lots, Side, Ticks};
@@ -62,7 +63,20 @@ pub struct NewOrder {
     pub tif: Tif,
     pub channel: Channel,
     pub post_only: bool,
+    /// The venue's reduce-only flag, sent on the wire where the venue has one
+    /// ([`OrderCaps::reduce_only`](crate::OrderCaps)).
     pub reduce_only: bool,
+    /// The OMS's own classification: this order can only reduce the position (sized not to
+    /// cross zero), whether or not it carries the venue flag. It makes the order safety traffic
+    /// ([`VenueCommand::traffic_class`]) on a venue without a reduce-only flag.
+    pub reducing: bool,
+}
+
+impl NewOrder {
+    /// The order can only reduce the position: the OMS says so, or the venue enforces it.
+    pub fn reduces(&self) -> bool {
+        self.reducing || self.reduce_only
+    }
 }
 
 /// An amend of a resting limit order, with the FULL post-amend values: venues that sign
@@ -75,7 +89,11 @@ pub struct AmendOrder {
     pub tif: Tif,
     pub channel: Channel,
     pub post_only: bool,
+    /// The venue's reduce-only flag.
     pub reduce_only: bool,
+    /// The OMS's classification of the amended order as one that can only reduce the position,
+    /// as on [`NewOrder::reducing`].
+    pub reducing: bool,
     /// The new limit price.
     pub px: Ticks,
     /// The new total quantity, filled part included.
@@ -156,6 +174,33 @@ pub enum VenueCommand {
 }
 
 impl VenueCommand {
+    /// The traffic class of the command's request: `Safety` for cancels, cancel-on-disconnect
+    /// and dead-man protection, order queries (the Unknown ladder) and orders or amends that
+    /// can only reduce the position ([`NewOrder::reduces`]); a batch is `Safety` only when it
+    /// has items and every one reduces. Everything else is `Normal`. A codec labels its effects
+    /// with this, so the rule has one source.
+    pub fn traffic_class(&self) -> TrafficClass {
+        let safety = match self {
+            VenueCommand::Place(o) => o.reduces(),
+            VenueCommand::PlaceBatch(orders) => {
+                !orders.is_empty() && orders.iter().all(NewOrder::reduces)
+            }
+            VenueCommand::Amend(a) => a.reducing || a.reduce_only,
+            VenueCommand::Cancel(_)
+            | VenueCommand::CancelMany(_)
+            | VenueCommand::CancelAll(_)
+            | VenueCommand::ArmCancelOnDisconnect(_)
+            | VenueCommand::RefreshDeadMan
+            | VenueCommand::Query(_) => true,
+            VenueCommand::FeeQuery => false,
+        };
+        if safety {
+            TrafficClass::Safety
+        } else {
+            TrafficClass::Normal
+        }
+    }
+
     /// The number of items the command's request carries: the batch length for a batch, one
     /// otherwise. The runtime reserves this many nonces for its encode
     /// ([`NonceSource`](crate::NonceSource)); `None` for a batch longer than `u16::MAX` items,
@@ -349,6 +394,7 @@ mod tests {
             channel: Channel::Public,
             post_only: true,
             reduce_only: false,
+            reducing: false,
             px: Ticks(100),
             qty: lots(qty),
             cum_filled: lots(cum_filled),
@@ -430,6 +476,7 @@ mod tests {
             channel: Channel::Public,
             post_only: false,
             reduce_only: true,
+            reducing: true,
         };
         assert_eq!(VenueCommand::Cancel(cancel.clone()).items(), Some(1));
         assert_eq!(VenueCommand::FeeQuery.items(), Some(1));

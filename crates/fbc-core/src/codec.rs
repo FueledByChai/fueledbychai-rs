@@ -308,6 +308,8 @@ pub enum HttpFailure {
 /// A request is safety traffic only when every item in it is: a batch of reducing orders is
 /// `Safety`, a batch that mixes in one non-reducing order is `Normal`, so the planner keeps
 /// reducing orders out of mixed batches rather than let normal orders ride the safety floor.
+/// "Reducing" is the fact the OMS states ([`NewOrder::reducing`](crate::NewOrder::reducing)),
+/// not only the venue's reduce-only flag; [`VenueCommand::traffic_class`] is the one rule.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum TrafficClass {
     Safety,

@@ -538,14 +538,6 @@ impl ToyExec {
         });
     }
 
-    fn class(reducing: bool) -> TrafficClass {
-        if reducing {
-            TrafficClass::Safety
-        } else {
-            TrafficClass::Normal
-        }
-    }
-
     /// One `place` frame for item `idx`, signed, with its nonce.
     fn place_frame(
         &mut self,
@@ -753,11 +745,11 @@ impl ExecCodec for ToyExec {
         fx: &mut Effects,
     ) -> Result<EncodeReceipt, NotSentReason> {
         let mut receipt = EncodeReceipt::default();
-        let (frame, class) = match cmd {
+        let frame = match cmd {
             VenueCommand::Place(o) => {
                 let (frame, nonce) = self.place_frame(o, 0, specs, ctx)?;
                 receipt.nonces.push((0, nonce));
-                (frame, ToyExec::class(o.reduce_only))
+                frame
             }
             VenueCommand::PlaceBatch(orders) => {
                 // No more items than the caps declare (OrderCaps::batch_place).
@@ -770,9 +762,7 @@ impl ExecCodec for ToyExec {
                     frames.push(frame);
                     receipt.nonces.push((idx, nonce));
                 }
-                // Safety only when every item is reducing.
-                let reducing = orders.iter().all(|o| o.reduce_only);
-                (frames.join("\n"), ToyExec::class(reducing))
+                frames.join("\n")
             }
             VenueCommand::Amend(a) => {
                 let spec = specs.get(a.inst).ok_or(NotSentReason::Unencodable)?;
@@ -810,7 +800,7 @@ impl ExecCodec for ToyExec {
                     ctx.wall.0,
                     hex(&sig)
                 );
-                (frame, ToyExec::class(a.reduce_only))
+                frame
             }
             VenueCommand::Cancel(c) => {
                 let spec = specs.get(c.inst).ok_or(NotSentReason::Unencodable)?;
@@ -828,8 +818,7 @@ impl ExecCodec for ToyExec {
                     .map_err(|_| NotSentReason::SignFailed)?;
                 assert!(sig.is_none(), "the toy's cancels are unsigned");
                 let vid = c.target.venue().ok_or(NotSentReason::Unsupported)?;
-                let frame = format!("cancel|vid={}|ts={}", vid.as_str(), ctx.wall.0);
-                (frame, TrafficClass::Safety)
+                format!("cancel|vid={}|ts={}", vid.as_str(), ctx.wall.0)
             }
             VenueCommand::Query(q) => {
                 let spec = specs.get(q.inst).ok_or(NotSentReason::Unencodable)?;
@@ -838,11 +827,12 @@ impl ExecCodec for ToyExec {
                     (None, Some(nonce)) => format!("nonce={nonce}"),
                     (None, None) => return Err(NotSentReason::Unsupported),
                 };
-                let frame = format!("query|sym={}|{by}", spec.venue_symbol.as_wire());
-                (frame, TrafficClass::Safety)
+                format!("query|sym={}|{by}", spec.venue_symbol.as_wire())
             }
             _ => return Err(NotSentReason::Unsupported),
         };
+        // The class has one source: the command's own rule.
+        let class = cmd.traffic_class();
         ToyExec::send(fx, format!("rpc={}\n{frame}", rpc.0), Some(rpc), class);
         Ok(receipt)
     }
@@ -1266,6 +1256,7 @@ fn order(cid: ClientOrderId, px: i64) -> NewOrder {
         channel: Channel::Public,
         post_only: true,
         reduce_only: false,
+        reducing: false,
     }
 }
 
@@ -1957,6 +1948,7 @@ fn outcomes_amends_and_cancels_go_through_the_same_boundary() {
             channel: Channel::Public,
             post_only: true,
             reduce_only: false,
+            reducing: false,
             px: Ticks(130_860),
             qty: Lots::new(qty).unwrap(),
             cum_filled: Lots::new(cum_filled).unwrap(),
@@ -2068,6 +2060,7 @@ fn an_amend_naming_the_order_only_by_client_id_is_not_sent() {
         channel: Channel::Public,
         post_only: true,
         reduce_only: false,
+        reducing: false,
         px: Ticks(130_860),
         qty: Lots::new(25).unwrap(),
         cum_filled: Lots::new(5).unwrap(),
@@ -2367,4 +2360,84 @@ fn a_batch_longer_than_the_declared_maximum_is_not_sent() {
     let refused = codec.encode(&over, RpcId(21), &specs(), &ctx(5, 1, len), &mut fx);
     assert_eq!(refused, Err(NotSentReason::Unsupported));
     assert!(fx.is_empty());
+}
+
+#[test]
+fn an_order_that_reduces_is_safety_traffic_whether_or_not_it_carries_the_venue_flag() {
+    // On a venue without a reduce-only flag (OrderCaps::reduce_only false) an exit sized not to
+    // cross zero goes out with reduce_only false; the OMS's own classification, `reducing`, is
+    // what keeps it on the safety floor. A reduce-only order is reducing too.
+    let [a, b] = mint(2).try_into().unwrap();
+    let exit = |cid, px| NewOrder {
+        reducing: true,
+        ..order(cid, px)
+    };
+    let flagged = |cid, px| NewOrder {
+        reduce_only: true,
+        ..order(cid, px)
+    };
+    let class_of = |cmd: &VenueCommand| {
+        let mut fx = Effects::new();
+        exec_codec()
+            .encode(cmd, RpcId(30), &specs(), &ctx(5, 700, 2), &mut fx)
+            .unwrap();
+        match fx.as_slice() {
+            [Effect::Send { class, .. }] => (*class, cmd.traffic_class()),
+            other => panic!("{other:?}"),
+        }
+    };
+    let safety = (TrafficClass::Safety, TrafficClass::Safety);
+    let normal = (TrafficClass::Normal, TrafficClass::Normal);
+    assert_eq!(class_of(&VenueCommand::Place(exit(a, 130_870))), safety);
+    assert_eq!(class_of(&VenueCommand::Place(flagged(a, 130_870))), safety);
+    assert_eq!(class_of(&VenueCommand::Place(order(a, 130_870))), normal);
+    let batch = VenueCommand::PlaceBatch(vec![exit(a, 130_870), flagged(b, 130_871)]);
+    assert_eq!(class_of(&batch), safety);
+    let mixed = VenueCommand::PlaceBatch(vec![exit(a, 130_870), order(b, 130_871)]);
+    assert_eq!(class_of(&mixed), normal);
+    let vid = with_scope(|scope| scope.venue_order_id("V-1").unwrap());
+    let amend = |reducing| {
+        VenueCommand::Amend(AmendOrder {
+            target: OrderRef::Venue(vid.clone()),
+            inst: INST,
+            side: Side::Sell,
+            tif: TifTag::Gtc,
+            channel: Channel::Public,
+            post_only: true,
+            reduce_only: false,
+            reducing,
+            px: Ticks(130_870),
+            qty: Lots::new(10).unwrap(),
+            cum_filled: Lots::new(0).unwrap(),
+        })
+    };
+    assert_eq!(class_of(&amend(true)), safety);
+    assert_eq!(class_of(&amend(false)), normal);
+    // The rest of the commands, by kind: cancels, protection and the Unknown ladder's queries
+    // are safety traffic; a fee query is not, and neither is an empty batch.
+    let cancel = CancelOrder {
+        target: OrderRef::Venue(vid.clone()),
+        inst: INST,
+        side: Side::Sell,
+        placement_nonce: None,
+    };
+    for cmd in [
+        VenueCommand::Cancel(cancel.clone()),
+        VenueCommand::CancelMany(vec![cancel]),
+        VenueCommand::CancelAll(fbc_core::CancelScope::Account),
+        VenueCommand::ArmCancelOnDisconnect(true),
+        VenueCommand::RefreshDeadMan,
+        VenueCommand::Query(QueryOrder {
+            target: OrderRef::Venue(vid.clone()),
+            inst: INST,
+            placement_nonce: None,
+        }),
+    ] {
+        assert_eq!(cmd.traffic_class(), TrafficClass::Safety, "{cmd:?}");
+    }
+    assert_eq!(VenueCommand::FeeQuery.traffic_class(), TrafficClass::Normal);
+    assert_eq!(
+        VenueCommand::PlaceBatch(vec![]).traffic_class(),
+        TrafficClass::Normal
+    );
 }
