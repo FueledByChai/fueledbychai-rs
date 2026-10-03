@@ -34,13 +34,26 @@ use crate::scope::DecodeScope;
 use crate::time::{MonoNs, WallNs};
 use crate::units::{Channel, Lots, Side, Ticks};
 
-/// A frame as it came off a stream.
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+/// A frame as it came off a stream. Its `Debug` shows the kind and length only, since a venue
+/// can echo a credential back in a frame.
+#[derive(Copy, Clone, Eq, PartialEq)]
 pub enum RawFrame<'a> {
     /// A text frame.
     Text(&'a str),
     /// A binary frame.
     Binary(&'a [u8]),
+}
+
+impl fmt::Debug for RawFrame<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            RawFrame::Text(_) => "Text",
+            RawFrame::Binary(_) => "Binary",
+        };
+        f.debug_struct(kind)
+            .field("len", &self.bytes().len())
+            .finish()
+    }
 }
 
 impl<'a> RawFrame<'a> {
@@ -63,7 +76,10 @@ pub struct TimerTag(pub u64);
 
 /// Bytes for the wire, with the spans that hold credentials (a bearer token, an API key) so the
 /// journal stores those spans only as keyed hashes and replay compares bytes modulo them.
-#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+///
+/// Its `Debug` shows the bytes as text with every span replaced by `<redacted n bytes>`, so a
+/// log line or panic message that formats an [`Effect`] never carries a credential (0009).
+#[derive(Clone, Eq, PartialEq, Hash)]
 pub struct WireSlice {
     bytes: Vec<u8>,
     redact: Vec<Range<u32>>,
@@ -88,6 +104,48 @@ impl fmt::Display for RedactError {
 }
 
 impl std::error::Error for RedactError {}
+
+impl fmt::Debug for WireSlice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WireSlice")
+            .field("len", &self.bytes.len())
+            .field("bytes", &Shown(self))
+            .field("redact", &self.redact)
+            .finish()
+    }
+}
+
+/// A [`WireSlice`]'s bytes as escaped text, each redaction span replaced by its length.
+struct Shown<'a>(&'a WireSlice);
+
+impl fmt::Debug for Shown<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let bytes = &self.0.bytes;
+        let mut at = 0;
+        f.write_str("\"")?;
+        for span in &self.0.redact {
+            // In bounds and ordered: `WireSlice::redacted` checked every span.
+            let (start, end) = (span.start as usize, span.end as usize);
+            write_escaped(f, &bytes[at..start])?;
+            write!(f, "<redacted {} bytes>", end - start)?;
+            at = end;
+        }
+        write_escaped(f, &bytes[at..])?;
+        f.write_str("\"")
+    }
+}
+
+/// Writes `bytes` as escaped text: valid UTF-8 escaped as `str`'s `Debug` does, any other byte
+/// as `\xNN`.
+fn write_escaped(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
+    for chunk in bytes.utf8_chunks() {
+        write!(f, "{}", chunk.valid().escape_debug())?;
+        for byte in chunk.invalid() {
+            write!(f, "\\x{byte:02x}")?;
+        }
+    }
+    Ok(())
+}
 
 impl WireSlice {
     /// Bytes holding no credential.
@@ -135,12 +193,29 @@ pub enum HttpMethod {
     Delete,
 }
 
-/// One HTTP header; `redact` marks a credential the journal keeps only as a keyed hash.
-#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+/// One HTTP header; `redact` marks a credential the journal keeps only as a keyed hash. Its
+/// `Debug` never shows a redacted value.
+#[derive(Clone, Eq, PartialEq, Hash)]
 pub struct Header {
     pub name: &'static str,
     pub value: String,
     pub redact: bool,
+}
+
+impl fmt::Debug for Header {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut d = f.debug_struct("Header");
+        d.field("name", &self.name);
+        if self.redact {
+            d.field(
+                "value",
+                &format_args!("<redacted {} bytes>", self.value.len()),
+            );
+        } else {
+            d.field("value", &self.value);
+        }
+        d.field("redact", &self.redact).finish()
+    }
 }
 
 /// An HTTP request for the runtime to make, through the consumer's proxy (decision 0002).
@@ -152,12 +227,25 @@ pub struct HttpRequest {
     pub body: WireSlice,
 }
 
-/// An HTTP response, handed back to the codec that asked for it.
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+/// An HTTP response, handed back to the codec that asked for it. Its `Debug` shows the status,
+/// the header names and the body's length only: a response can carry a credential (a JWT in
+/// the body, a cookie in a header) that nothing marks.
+#[derive(Copy, Clone, Eq, PartialEq)]
 pub struct HttpResponse<'a> {
     pub status: u16,
     pub headers: &'a [(&'a str, &'a str)],
     pub body: &'a [u8],
+}
+
+impl fmt::Debug for HttpResponse<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names: Vec<&str> = self.headers.iter().map(|(name, _)| *name).collect();
+        f.debug_struct("HttpResponse")
+            .field("status", &self.status)
+            .field("header_names", &names)
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 /// Which traffic a frame is: safety traffic (cancels, reducing orders, keepalives,
@@ -574,6 +662,8 @@ pub struct AmendWire<'a> {
     pub cid: Option<&'a str>,
     pub side: Side,
     pub px: Ticks,
+    /// The quantity as the venue's wire means it: [`AmendOrder::wire_qty`](crate::AmendOrder::wire_qty)
+    /// under the venue's [`AmendQty`](crate::AmendQty).
     pub qty: Lots,
     pub tif: Tif,
     pub channel: Channel,
@@ -699,6 +789,80 @@ mod tests {
         assert!(WireSlice::plain(b"x".to_vec()).redactions().is_empty());
         assert!(RedactError::OutOfBounds.to_string().contains("outside"));
         assert!(RedactError::Unordered.to_string().contains("order"));
+    }
+
+    #[test]
+    fn debug_output_never_shows_a_credential() {
+        let secret = "SYNTHETIC-CREDENTIAL-VALUE";
+        let start = u32::try_from("auth|token=".len()).unwrap();
+        let end = start + u32::try_from(secret.len()).unwrap();
+        let frame = format!("auth|token={secret}|end").into_bytes();
+        let body = WireSlice::redacted(frame, std::iter::once(start..end).collect()).unwrap();
+        let req = HttpRequest {
+            method: HttpMethod::Post,
+            url: "https://venue.invalid/auth".to_owned(),
+            headers: vec![
+                Header {
+                    name: "Authorization",
+                    value: format!("Bearer {secret}"),
+                    redact: true,
+                },
+                Header {
+                    name: "Content-Type",
+                    value: "application/json".to_owned(),
+                    redact: false,
+                },
+            ],
+            body: body.clone(),
+        };
+        let effects = [
+            Effect::Http {
+                tag: HttpTag(1),
+                req,
+                rpc: None,
+                timeout: None,
+                class: TrafficClass::Safety,
+            },
+            Effect::Send {
+                stream: StreamId(0),
+                frame: body.clone(),
+                rpc: None,
+                timeout: None,
+                class: TrafficClass::Safety,
+            },
+        ];
+        let mut fx = Effects::new();
+        effects.iter().cloned().for_each(|e| fx.push(e));
+        let keepalive = Keepalive {
+            interval: Duration::from_secs(1),
+            kind: KeepaliveKind::Frame(body),
+        };
+        let echoed = format!("{{\"jwt\":\"{secret}\"}}");
+        let resp = HttpResponse {
+            status: 200,
+            headers: &[("Set-Cookie", secret)],
+            body: echoed.as_bytes(),
+        };
+        let shown = [
+            format!("{fx:?}"),
+            format!("{effects:#?}"),
+            format!("{keepalive:?}"),
+            format!("{resp:?}"),
+            format!("{:?}", RawFrame::Text(&echoed)),
+            format!("{:?}", RawFrame::Binary(echoed.as_bytes())),
+        ];
+        for text in &shown {
+            assert!(!text.contains(secret), "a credential reached Debug: {text}");
+        }
+        // What is not a credential is still shown, so the output stays useful.
+        assert!(shown[0].contains("auth|token=") && shown[0].contains("|end"));
+        assert!(shown[0].contains("Authorization") && shown[0].contains("application/json"));
+        assert!(shown[0].contains("redacted"));
+        assert!(shown[3].contains("200") && shown[3].contains("Set-Cookie"));
+        assert!(shown[4].contains(&echoed.len().to_string()));
+        // Bytes that are not UTF-8 are escaped one by one.
+        let binary = format!("{:?}", WireSlice::plain(vec![b'a', 0xff, b'"']));
+        assert!(binary.contains(r#""a\xff\"""#), "{binary}");
     }
 
     #[test]
