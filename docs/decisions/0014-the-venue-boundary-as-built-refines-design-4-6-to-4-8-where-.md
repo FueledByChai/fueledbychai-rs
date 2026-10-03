@@ -32,7 +32,11 @@ stay sans-IO and deterministic:
    request did not use.
 2. **Codecs report, the runtime stamps.** `MdSink`/`ExecSink` take `(VenueMeta, body)`; the
    runtime builds the `Envelope` with its `Stamp`, so a decoder cannot forge receive time or
-   ingest order.
+   ingest order. A decode call that returns `Err` has pushed nothing: the codec decodes the
+   whole frame or response before its first push, so no snapshot is left begun and never
+   ended and no resync half applied. Effects it asked for still stand, so it can ask for
+   recovery. The rule is the codec's, not a runtime buffer, so the runtime forwards pushes as
+   they come; replay of the journaled input (D7) gives the same error and again no events.
 3. **Every request has a deadline, and every HTTP request comes back.** An RPC frame's `rpc`
    is an `RpcCall { id, timeout }`, both mandatory, and every `Effect::Http` has a mandatory
    `timeout`, so an unanswered order-entry request always reaches Unknown. `Effect::Http`
@@ -104,6 +108,8 @@ stay sans-IO and deterministic:
    own timers. `MdCaps` gains mandatory `mark` and `index` sources, since `Feed::Mark` and
    `Feed::Index` are subscribable (0003). Planning or subscribing to a feed the caps do not
    offer is refused with `VenueError::UnsupportedFeed`, and nothing goes on the wire for it.
+   `Encoding` (design §4.5 names the field, not its values) has `Text` beside `Json`, `Sbe`
+   and `Protobuf`, for delimited `key=value` text such as FIX tag=value.
 10. `Vec` stands where the design has `SmallVec` or `Bytes`, to add no dependency yet.
 
 Calls the design lists but FBC-5 left out each have a ticket: `discover` and
@@ -125,6 +131,10 @@ a review path), `PathStamps` (FBC-ji6).
   the events (item 7).
 - `FillKey::Derived` beside its own copies of `vid` and `cum_after` (design §4.6 as written,
   Codex r4172456292): rejected, since nothing could make the copies agree.
+- The runtime buffering each decode call's events and dropping them on `Err` (Codex
+  r4172835744): not taken. It would put a copy on the hot path of every frame to guard
+  against a codec bug that a per-codec test catches; the codec validating first costs only
+  the frames that carry several events.
 - Inbound redaction spans and rate-limit tags on effects now (Codex r4172367659,
   r4172367663): not taken in FBC-5, since neither the journal nor the limiter exists yet;
   FBC-7lm and FBC-hof extend the boundary with them, each with a record of its own.
