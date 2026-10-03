@@ -299,12 +299,29 @@ pub struct OrderUpdate {
     pub reduce_only: Option<bool>,
 }
 
-/// The key a fill is deduplicated by (decision 0005, I3).
+/// The key a fill is deduplicated by (decision 0005, I3). It is computed from a fill's
+/// [`FillIdent`] by [`FillEvent::key`], never stated beside it, so it cannot disagree with the
+/// order and quantity the fill is applied to.
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub enum FillKey {
     /// The venue's fill id.
     Venue(FillId),
     /// No fill id: the venue order id and the cumulative quantity after the fill.
+    Derived { vid: VenueOrderId, cum_after: Lots },
+}
+
+/// What a fill names about itself and its order, each stated once.
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+pub enum FillIdent {
+    /// The venue's fill id, with the order's venue id and cumulative filled quantity after the
+    /// fill when the venue sends them.
+    Venue {
+        fill: FillId,
+        vid: Option<VenueOrderId>,
+        cum_after: Option<Lots>,
+    },
+    /// No fill id ([`FillCaps::fill_id`](crate::FillCaps::fill_id) false): the order's venue id
+    /// and cumulative filled quantity after the fill, both required, which key the fill.
     Derived { vid: VenueOrderId, cum_after: Lots },
 }
 
@@ -331,18 +348,17 @@ impl Liquidity3 {
 /// One fill of one of the account's orders.
 #[derive(Clone, PartialEq, Debug)]
 pub struct FillEvent {
-    /// What the fill is deduplicated by.
-    pub key: FillKey,
+    /// The fill id or, without one, the order id and cumulative quantity that key the fill;
+    /// read through [`key`](FillEvent::key), [`vid`](FillEvent::vid) and
+    /// [`cum_after`](FillEvent::cum_after).
+    pub ident: FillIdent,
     /// The client id read off the wire; `None` when the fill carries none.
     pub cid: Option<CidMatch>,
-    pub vid: Option<VenueOrderId>,
     pub inst: InstrumentId,
     pub side: Side,
     pub px: Ticks,
     /// The quantity of THIS fill (incremental).
     pub qty: Lots,
-    /// The order's cumulative filled quantity after this fill, when the venue reports it.
-    pub cum_after: Option<Lots>,
     pub liquidity: Liquidity3,
     /// The fee, as a cost to us (decision 0004).
     pub fee: Fee,
@@ -354,6 +370,36 @@ pub struct FillEvent {
     /// A fill the venue sent again (a snapshot or a replay after reconnect): it only
     /// reconciles, never moves inventory twice (decision 0005, I3).
     pub replay: bool,
+}
+
+impl FillEvent {
+    /// What the fill is deduplicated by: the venue's fill id, or the order id and cumulative
+    /// quantity after the fill.
+    pub fn key(&self) -> FillKey {
+        match &self.ident {
+            FillIdent::Venue { fill, .. } => FillKey::Venue(fill.clone()),
+            FillIdent::Derived { vid, cum_after } => FillKey::Derived {
+                vid: vid.clone(),
+                cum_after: *cum_after,
+            },
+        }
+    }
+
+    /// The order's venue id, when the fill names it.
+    pub fn vid(&self) -> Option<&VenueOrderId> {
+        match &self.ident {
+            FillIdent::Venue { vid, .. } => vid.as_ref(),
+            FillIdent::Derived { vid, .. } => Some(vid),
+        }
+    }
+
+    /// The order's cumulative filled quantity after this fill, when the venue reports it.
+    pub fn cum_after(&self) -> Option<Lots> {
+        match &self.ident {
+            FillIdent::Venue { cum_after, .. } => *cum_after,
+            FillIdent::Derived { cum_after, .. } => Some(*cum_after),
+        }
+    }
 }
 
 /// One order as a venue snapshot or query reports it.
