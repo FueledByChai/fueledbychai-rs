@@ -26,7 +26,7 @@ use fbc_core::{
     InstrumentKind, InstrumentSpec, ItemRef, Keepalive, KeepaliveKind, Liquidity3, Lots, Lvl,
     MatchingCaps, MdCaps, MdCodec, MdEvent, MdSink, ModeScope, Money, MonoNs, Namespace,
     NamespaceLease, NewOrder, NonceBlock, NonceScope, NotSentReason, OrderCaps, OrderKind,
-    OrderKindTag, OrderRef, OrderSigner, OrderingKey, PlaceWire, PriceGrid, PxExact,
+    OrderKindTag, OrderRef, OrderSigner, OrderingKey, PlaceWire, PriceGrid, PxExact, QueryOrder,
     QueueModelQuality, RawFrame, Readiness, RefKind, Reject, RejectKind, RpcId, SeqDomain, Side,
     Sig, SignError, SignedLots, SizeStep, SnapshotSource, SpecTable, Stamp, StpScope, StreamId,
     SubmitOutcome, Subscription, Support, TagSet, Ticks, TifTag, TimerTag, TouchSourceCaps,
@@ -682,6 +682,16 @@ impl ExecCodec for ToyExec {
                 assert!(sig.is_none(), "the toy's cancels are unsigned");
                 let vid = c.target.venue().ok_or(NotSentReason::Unsupported)?;
                 let frame = format!("cancel|vid={}|ts={}", vid.as_str(), ctx.wall.0);
+                (frame, TrafficClass::Safety)
+            }
+            VenueCommand::Query(q) => {
+                let spec = specs.get(q.inst).ok_or(NotSentReason::Unencodable)?;
+                let by = match (q.target.venue(), q.placement_nonce) {
+                    (Some(vid), _) => format!("vid={}", vid.as_str()),
+                    (None, Some(nonce)) => format!("nonce={nonce}"),
+                    (None, None) => return Err(NotSentReason::Unsupported),
+                };
+                let frame = format!("query|sym={}|{by}", spec.venue_symbol.as_wire());
                 (frame, TrafficClass::Safety)
             }
             _ => return Err(NotSentReason::Unsupported),
@@ -1641,7 +1651,7 @@ fn outcomes_amends_and_cancels_go_through_the_same_boundary() {
     assert_eq!(filled, Err(NotSentReason::Unencodable));
     assert!(fx.is_empty());
     let cancel = VenueCommand::Cancel(CancelOrder {
-        target: OrderRef::Venue(vid),
+        target: OrderRef::Venue(vid.clone()),
         inst: INST,
         side: Side::Buy,
         placement_nonce: Some(4),
@@ -1656,6 +1666,32 @@ fn outcomes_amends_and_cancels_go_through_the_same_boundary() {
     };
     assert_eq!(*class, TrafficClass::Safety);
     assert_eq!(frame.bytes(), b"rpc=14\ncancel|vid=V-1|ts=9");
+
+    // A query for an order the venue never acknowledged (no venue id yet: the Unknown ladder)
+    // names it by the nonce it was placed with, which the command carries.
+    let query = VenueCommand::Query(QueryOrder {
+        target: OrderRef::Client(cid),
+        inst: INST,
+        placement_nonce: Some(4),
+    });
+    let text = String::from_utf8(encode_once(exec.as_mut(), &query, &ctx(9, 6, 1))).unwrap();
+    assert_eq!(text, "rpc=11\nquery|sym=TOY-PERP|nonce=4");
+    let by_vid = VenueCommand::Query(QueryOrder {
+        target: OrderRef::Both(cid, vid.clone()),
+        inst: INST,
+        placement_nonce: Some(4),
+    });
+    let text = String::from_utf8(encode_once(exec.as_mut(), &by_vid, &ctx(9, 6, 1))).unwrap();
+    assert_eq!(text, "rpc=11\nquery|sym=TOY-PERP|vid=V-1");
+    let neither = VenueCommand::Query(QueryOrder {
+        target: OrderRef::Client(cid),
+        inst: INST,
+        placement_nonce: None,
+    });
+    let mut fx = Effects::new();
+    let refused = exec.encode(&neither, RpcId(17), &specs(), &ctx(9, 6, 1), &mut fx);
+    assert_eq!(refused, Err(NotSentReason::Unsupported));
+    assert!(fx.is_empty());
 
     // What the toy does not offer is not sent, with no effect pushed.
     let mut fx = Effects::new();
