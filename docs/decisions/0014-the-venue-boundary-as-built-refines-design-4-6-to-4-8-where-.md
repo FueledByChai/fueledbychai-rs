@@ -58,6 +58,16 @@ stay sans-IO and deterministic:
    (`ModeScope::Instrument`) or the whole account a venue mode applies to; `OrderUpdate`,
    `FillEvent` and `VenueOrderSnapshot` carry `cid: Option<CidMatch>`, `None` when the venue
    echoes no client id (not `Unparseable`, which means a non-canonical id was present).
+   Every book event (`BookSnapshotBegin`, `BookSnapshotEnd`, `Level`, `Window`) carries
+   `book: BookId`, and `Feed::Book` takes a `BookId`: one instrument may be subscribed to
+   several book channels on one connection (design §10 has the shadow record `deltas` and
+   `interactive_deltas` together), and their levels must never merge. Which channel is the
+   trading book stays the configuration choice of design §7.2.
+   `FillEvent` states its fill id, venue order id and cumulative quantity after the fill once,
+   in `ident: FillIdent` (`Venue { fill, vid: Option, cum_after: Option }` or
+   `Derived { vid, cum_after }`), instead of a `key: FillKey` beside separate `vid` and
+   `cum_after` fields; `FillEvent::key()` computes the design's `FillKey` from it, so the
+   dedup key (I3) cannot disagree with the order and quantity the fill is applied to.
 8. **`Debug` never shows a credential (0009).** `WireSlice`, `Header`, `HttpRequest`,
    `HttpResponse`, `RawFrame` and `Reject` format redaction spans, redacted header values, a
    URL's user information, query and fragment, response bodies, inbound frames and a venue's
@@ -67,6 +77,12 @@ stay sans-IO and deterministic:
    connections (`ExecEndpoint`) the runtime opens before `ExecCodec::on_open`. The client-id
    format has one source, `OrderCaps::client_id`: `ExecCodec` has no `client_id_format`. A request is `Safety` only when every item is: a batch of
    reducing orders is `Safety`, a mixed batch `Normal`.
+   `EndpointPlan` carries `transport: MdTransport` in place of a `url`: `Socket { url }`, a
+   connection the runtime opens, or `Poll { base_url }`, for feeds a venue offers only over
+   REST (`FeedSource::Poll`): the runtime opens nothing, calls `on_open` as soon as the codec
+   is built, and the codec gets its data only from the HTTP requests it asks for, paced by its
+   own timers. `MdCaps` gains mandatory `mark` and `index` sources, since `Feed::Mark` and
+   `Feed::Index` are subscribable (0003).
 10. `Vec` stands where the design has `SmallVec` or `Bytes`, to add no dependency yet.
 
 Calls the design lists but FBC-5 left out each have a ticket: `discover` and
@@ -82,9 +98,12 @@ a review path), `PathStamps` (FBC-ji6).
   OMS compares it with a fill's `exch_ts` through the per-connection `ClockSkewEstimate`, the
   one bridge between the clocks (design §4.1). The next funding time is a calendar instant of
   the venue's schedule, used against the local wall clock, not the stamp of a venue event.
-- A book-channel index on every book event (Codex r4172231010): not taken. An instrument
-  subscribes to one book channel, chosen by configuration and treated as a strategy change
-  (design §7.2); FBC-nij makes the runtime refuse a second one.
+- Book events that name only the instrument, with the runtime refusing a second book channel
+  per instrument (Codex r4172231010, first answered that way): rejected in review. Design §10
+  subscribes one instrument to two book channels on one connection, so the channel goes on
+  the events (item 7).
+- `FillKey::Derived` beside its own copies of `vid` and `cum_after` (design §4.6 as written,
+  Codex r4172456292): rejected, since nothing could make the copies agree.
 - Inbound redaction spans and rate-limit tags on effects now (Codex r4172367659,
   r4172367663): not taken in FBC-5, since neither the journal nor the limiter exists yet;
   FBC-7lm and FBC-hof extend the boundary with them, each with a record of its own.
@@ -95,7 +114,9 @@ a review path), `PathStamps` (FBC-ji6).
 ## Consequences
 
 - `fbc-runtime` must reserve and journal nonces per encode, stamp sink output, time out HTTP
-  requests that carry an `rpc`, and pass the spec table to planning and subscribing.
+  requests that carry an `rpc`, and pass the spec table to planning and subscribing. It keeps
+  one book per (instrument, `BookId`), deduplicates fills by `FillEvent::key()`, and drives a
+  `Poll` endpoint without opening a connection.
 - The OMS supplies `cum_filled` on every amend and never sees a terminal `NotFound`.
 - A later change to any of these items is a new record that supersedes this one.
 
