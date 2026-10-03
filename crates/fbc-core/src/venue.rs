@@ -342,4 +342,58 @@ mod tests {
             "instrument 9 is not in the spec table"
         );
     }
+
+    #[test]
+    fn a_venue_config_debug_shows_keys_and_value_lengths_only() {
+        // A consumer's configuration can hold a credential-bearing URL or an account address;
+        // a diagnostic that formats it shows which keys are set, not what they hold.
+        let secret = "SYNTHETIC-CONFIG-SECRET";
+        let mut cfg = VenueConfig::new();
+        cfg.insert("x.url", &format!("https://{secret}@venue.invalid"));
+        cfg.insert_market(InstrumentId::new(7), "x.account", secret);
+        let shown = format!("{cfg:?}");
+        assert!(!shown.contains(secret), "{shown}");
+        assert!(
+            shown.contains("x.url") && shown.contains("x.account"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains(&format!("<{} bytes>", secret.len())),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn endpoint_plans_never_show_a_credential_in_their_urls() {
+        let secret = "SYNTHETIC-URL-TOKEN";
+        let plain = WireUrl::plain(format!("https://u:{secret}@venue.invalid/x?key={secret}"));
+        let start = u32::try_from("wss://venue.invalid/".len()).unwrap();
+        let span = start..start + u32::try_from(secret.len()).unwrap();
+        let text = format!("wss://venue.invalid/{secret}");
+        let spanned = WireUrl::redacted(text, vec![span]).unwrap();
+        let exec = ExecEndpoint {
+            stream: StreamId(1),
+            url: spanned.clone(),
+        };
+        let md = EndpointPlan {
+            stream: StreamId(0),
+            transport: MdTransport::Socket { url: plain },
+            subs: vec![],
+        };
+        let poll = MdTransport::Poll { base_url: spanned };
+        for shown in [format!("{exec:?}"), format!("{md:?}"), format!("{poll:?}")] {
+            assert!(!shown.contains(secret), "{shown}");
+            assert!(shown.contains("venue.invalid"), "{shown}");
+        }
+    }
+
+    #[test]
+    fn an_unsupported_feed_names_the_instrument_and_the_feed() {
+        let sub = Subscription {
+            inst: InstrumentId::new(7),
+            feed: crate::codec::Feed::Index,
+        };
+        let shown = VenueError::UnsupportedFeed(sub).to_string();
+        assert_eq!(shown, "instrument 7 has no Index feed on this venue");
+    }
 }
