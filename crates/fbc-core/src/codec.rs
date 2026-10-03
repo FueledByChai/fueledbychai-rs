@@ -1,0 +1,775 @@
+//! The sans-IO codec boundary every venue adapter implements (decision 0002, design §4.7).
+//!
+//! An adapter owns no socket, thread, queue or clock. Its codecs take bytes, HTTP results and
+//! timer firings in, and give normalized events (to a sink) and [`Effect`]s out: send a frame,
+//! make an HTTP request, set a timer, reconnect. The runtime executes and journals the effects.
+//!
+//! - [`MdCodec`] decodes market data; [`ExecCodec`] encodes and signs [`VenueCommand`]s and
+//!   decodes an account's order-entry traffic. Both decode only inside a
+//!   [`DecodeScope`](crate::DecodeScope), which alone builds venue order ids, fill ids, venue
+//!   symbols and fees (decision 0004).
+//! - [`EncodeCtx`] is the only source of wall time and nonces an encode sees. It is a value the
+//!   runtime fills (from its clock and its [`NonceSource`]) and journals, and replay reads back,
+//!   so the same command encoded under the same context gives the same bytes at any real time.
+//! - [`OrderSigner`] signs the normalized wire view of an order ([`PlaceWire`], [`AmendWire`],
+//!   [`CancelWire`]); a venue's signer lives in its `src/sign` (decision 0009).
+//! - Frames carry redaction spans ([`WireSlice`]) and HTTP headers a redaction flag, so the
+//!   journal can keep credentials only as keyed hashes (decision 0006).
+
+use core::fmt;
+use core::ops::Range;
+use core::time::Duration;
+use std::collections::BTreeMap;
+
+use arrayvec::ArrayVec;
+use compact_str::CompactString;
+
+use crate::cid::ClientIdFormat;
+use crate::command::{NotSentReason, OrderKind, Tif, VenueCommand};
+use crate::event::{ExecEvent, MdEvent, RpcId, StreamId, TouchSourceId, VenueMeta};
+use crate::fee::FeeError;
+use crate::ids::{IdError, InstrumentId, OrderRef, VenueOrderId};
+use crate::instrument::InstrumentSpec;
+use crate::scope::DecodeScope;
+use crate::time::{MonoNs, WallNs};
+use crate::units::{Channel, Lots, Side, Ticks};
+
+/// A frame as it came off a stream.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum RawFrame<'a> {
+    /// A text frame.
+    Text(&'a str),
+    /// A binary frame.
+    Binary(&'a [u8]),
+}
+
+impl<'a> RawFrame<'a> {
+    /// The frame's bytes, whatever its kind.
+    pub fn bytes(&self) -> &'a [u8] {
+        match *self {
+            RawFrame::Text(text) => text.as_bytes(),
+            RawFrame::Binary(bytes) => bytes,
+        }
+    }
+}
+
+/// A tag a codec puts on an HTTP request to recognize its response.
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+pub struct HttpTag(pub u64);
+
+/// A tag a codec puts on a timer to recognize its firing.
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+pub struct TimerTag(pub u64);
+
+/// Bytes for the wire, with the spans that hold credentials (a bearer token, an API key) so the
+/// journal stores those spans only as keyed hashes and replay compares bytes modulo them.
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+pub struct WireSlice {
+    bytes: Vec<u8>,
+    redact: Vec<Range<u32>>,
+}
+
+/// Why a [`WireSlice`]'s redaction spans were refused.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum RedactError {
+    /// A span is empty, reversed or reaches past the end of the bytes.
+    OutOfBounds,
+    /// Two spans overlap, or the spans are not in ascending order.
+    Unordered,
+}
+
+impl fmt::Display for RedactError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            RedactError::OutOfBounds => "a redaction span lies outside the frame",
+            RedactError::Unordered => "redaction spans overlap or are out of order",
+        })
+    }
+}
+
+impl std::error::Error for RedactError {}
+
+impl WireSlice {
+    /// Bytes holding no credential.
+    pub fn plain(bytes: Vec<u8>) -> WireSlice {
+        WireSlice {
+            bytes,
+            redact: Vec::new(),
+        }
+    }
+
+    /// Bytes whose `redact` spans hold credentials: each span non-empty, inside the bytes, and
+    /// after the one before it.
+    pub fn redacted(bytes: Vec<u8>, redact: Vec<Range<u32>>) -> Result<WireSlice, RedactError> {
+        let mut end = 0;
+        for span in &redact {
+            let past = usize::try_from(span.end).map_or(true, |e| e > bytes.len());
+            if span.start >= span.end || past {
+                return Err(RedactError::OutOfBounds);
+            }
+            if span.start < end {
+                return Err(RedactError::Unordered);
+            }
+            end = span.end;
+        }
+        Ok(WireSlice { bytes, redact })
+    }
+
+    /// The bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The spans holding credentials.
+    pub fn redactions(&self) -> &[Range<u32>] {
+        &self.redact
+    }
+}
+
+/// An HTTP method.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum HttpMethod {
+    Get,
+    Post,
+    Put,
+    Delete,
+}
+
+/// One HTTP header; `redact` marks a credential the journal keeps only as a keyed hash.
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+pub struct Header {
+    pub name: &'static str,
+    pub value: String,
+    pub redact: bool,
+}
+
+/// An HTTP request for the runtime to make, through the consumer's proxy (decision 0002).
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+pub struct HttpRequest {
+    pub method: HttpMethod,
+    pub url: String,
+    pub headers: Vec<Header>,
+    pub body: WireSlice,
+}
+
+/// An HTTP response, handed back to the codec that asked for it.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub struct HttpResponse<'a> {
+    pub status: u16,
+    pub headers: &'a [(&'a str, &'a str)],
+    pub body: &'a [u8],
+}
+
+/// Which traffic a frame is: safety traffic (cancels, reducing orders, keepalives,
+/// authentication) keeps flowing at a rate scope's safety floor when normal traffic stops.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum TrafficClass {
+    Safety,
+    Normal,
+}
+
+/// Something a codec asks the runtime to do. The codec does none of it itself.
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+pub enum Effect {
+    /// Write `frame` to `stream`; with `rpc`, the runtime reports `timeout` passing without an
+    /// answer to [`ExecCodec::on_rpc_timeout`].
+    Send {
+        stream: StreamId,
+        frame: WireSlice,
+        rpc: Option<RpcId>,
+        timeout: Option<Duration>,
+        class: TrafficClass,
+    },
+    /// Make `req`, handing the response to the codec's `on_http` with `tag`; with `rpc`, as for
+    /// [`Effect::Send`].
+    Http {
+        tag: HttpTag,
+        req: HttpRequest,
+        rpc: Option<RpcId>,
+        timeout: Option<Duration>,
+        class: TrafficClass,
+    },
+    /// Call the codec's `on_timer` with `tag` after `after`.
+    Timer { tag: TimerTag, after: Duration },
+    /// Close `stream` and open it again, under a new connection epoch.
+    Reconnect {
+        stream: StreamId,
+        reason: &'static str,
+    },
+}
+
+/// The effects one codec call asked for, in order.
+#[derive(Clone, Eq, PartialEq, Hash, Debug, Default)]
+pub struct Effects {
+    buf: Vec<Effect>,
+}
+
+impl Effects {
+    /// No effects.
+    pub fn new() -> Effects {
+        Effects::default()
+    }
+
+    /// Asks for `effect`, after those already asked for.
+    pub fn push(&mut self, effect: Effect) {
+        self.buf.push(effect);
+    }
+
+    /// The effects asked for, in order.
+    pub fn as_slice(&self) -> &[Effect] {
+        &self.buf
+    }
+
+    /// Takes the effects asked for, in order, leaving none.
+    pub fn take(&mut self) -> Vec<Effect> {
+        core::mem::take(&mut self.buf)
+    }
+
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+}
+
+/// A block of `len` consecutive nonces starting at `first`, reserved for one encode.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct NonceBlock {
+    pub first: u64,
+    pub len: u16,
+}
+
+impl NonceBlock {
+    /// No nonces.
+    pub const EMPTY: NonceBlock = NonceBlock { first: 0, len: 0 };
+
+    /// The nonce for item `item`, or `None` past the block (or past `u64::MAX`).
+    pub fn get(self, item: u16) -> Option<u64> {
+        if item < self.len {
+            self.first.checked_add(u64::from(item))
+        } else {
+            None
+        }
+    }
+}
+
+/// The wall time, monotonic time and nonces for one encode: the only time and nonces a codec
+/// sees. In live trading the runtime fills it from its clock and its [`NonceSource`] and
+/// journals it; in replay it is read back from the journal. Every timestamp, expiry, deadline
+/// and nonce in a payload comes from here.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct EncodeCtx {
+    pub wall: WallNs,
+    pub mono: MonoNs,
+    pub nonces: NonceBlock,
+}
+
+impl EncodeCtx {
+    /// The nonce for item `item` of the command, or `None` past the reserved block.
+    pub fn nonce(&self, item: u16) -> Option<u64> {
+        self.nonces.get(item)
+    }
+}
+
+/// The nonces an encode used, per item, for the OMS to keep as each order's placement nonce.
+#[derive(Clone, Eq, PartialEq, Hash, Debug, Default)]
+pub struct EncodeReceipt {
+    pub nonces: Vec<(u16, u64)>,
+}
+
+/// Where the runtime gets nonces, scoped as the venue's
+/// [`NonceScope`](crate::NonceScope) says; every reservation is journaled.
+pub trait NonceSource: Send {
+    /// Reserves `len` consecutive nonces, all above any reserved before.
+    fn reserve(&mut self, len: u16) -> NonceBlock;
+}
+
+/// Receives the market-data events a codec decodes; the runtime stamps each one into an
+/// [`Envelope`](crate::Envelope).
+pub trait MdSink {
+    fn push(&mut self, meta: VenueMeta, ev: MdEvent);
+}
+
+/// Receives the execution events a codec decodes; the runtime stamps each one into an
+/// [`Envelope`](crate::Envelope).
+pub trait ExecSink {
+    fn push(&mut self, meta: VenueMeta, ev: ExecEvent);
+}
+
+/// Why a frame or response could not be decoded. It names what was wrong, never the frame's
+/// content, so no credential echoed by a venue reaches a log through it.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum DecodeError {
+    /// The frame is not what the protocol says; names the part.
+    Malformed(&'static str),
+    /// The frame names an instrument missing from the spec table.
+    UnknownInstrument,
+    /// A venue order id, fill id or symbol was refused.
+    IdRefused(IdError),
+    /// A fee was refused.
+    FeeRefused(FeeError),
+}
+
+impl fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DecodeError::Malformed(what) => write!(f, "malformed frame: {what}"),
+            DecodeError::UnknownInstrument => f.write_str("the frame names an unknown instrument"),
+            DecodeError::IdRefused(err) => write!(f, "venue id refused: {err:?}"),
+            DecodeError::FeeRefused(err) => write!(f, "fee refused: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for DecodeError {}
+
+impl From<IdError> for DecodeError {
+    fn from(err: IdError) -> DecodeError {
+        DecodeError::IdRefused(err)
+    }
+}
+
+impl From<FeeError> for DecodeError {
+    fn from(err: FeeError) -> DecodeError {
+        DecodeError::FeeRefused(err)
+    }
+}
+
+/// The instrument specs a codec decodes and encodes against, by id and by venue symbol.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct SpecTable {
+    specs: BTreeMap<InstrumentId, InstrumentSpec>,
+    by_symbol: BTreeMap<CompactString, InstrumentId>,
+}
+
+impl SpecTable {
+    /// An empty table.
+    pub fn new() -> SpecTable {
+        SpecTable::default()
+    }
+
+    /// Adds `spec`, replacing (and returning) the spec it shares an id with. A spec already
+    /// holding its venue symbol under another id is removed too, so a symbol names one spec.
+    pub fn insert(&mut self, spec: InstrumentSpec) -> Option<InstrumentSpec> {
+        let (id, symbol) = (spec.id, CompactString::from(spec.venue_symbol.as_wire()));
+        if let Some(other) = self.by_symbol.get(&symbol).copied()
+            && other != id
+        {
+            self.specs.remove(&other);
+        }
+        let old = self.specs.insert(id, spec);
+        if let Some(old) = &old {
+            self.by_symbol.remove(old.venue_symbol.as_wire());
+        }
+        self.by_symbol.insert(symbol, id);
+        old
+    }
+
+    /// The spec with id `id`.
+    pub fn get(&self, id: InstrumentId) -> Option<&InstrumentSpec> {
+        self.specs.get(&id)
+    }
+
+    /// The spec the venue spells `wire`.
+    pub fn by_symbol(&self, wire: &str) -> Option<&InstrumentSpec> {
+        self.by_symbol.get(wire).and_then(|id| self.specs.get(id))
+    }
+
+    /// Every spec, by id.
+    pub fn iter(&self) -> impl Iterator<Item = &InstrumentSpec> {
+        self.specs.values()
+    }
+
+    pub fn len(&self) -> usize {
+        self.specs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.specs.is_empty()
+    }
+}
+
+/// A kind of market data for one instrument.
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+pub enum Feed {
+    /// The best bid and offer from one touch channel.
+    Touch(TouchSourceId),
+    /// One book channel: an index into [`MdCaps::books`](crate::MdCaps::books).
+    Book(u8),
+    Trades,
+    Mark,
+    Index,
+    Funding,
+    Stats,
+}
+
+/// One market-data subscription.
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+pub struct Subscription {
+    pub inst: InstrumentId,
+    pub feed: Feed,
+}
+
+/// How a stream is kept alive.
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+pub enum KeepaliveKind {
+    /// A WebSocket ping.
+    WsPing,
+    /// A frame of the venue's own.
+    Frame(WireSlice),
+}
+
+/// A keepalive the runtime sends every `interval`.
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+pub struct Keepalive {
+    pub interval: Duration,
+    pub kind: KeepaliveKind,
+}
+
+/// A market-data codec: one per connection epoch. Deterministic given its inputs (frames,
+/// responses, the times passed to it) and its prior state.
+pub trait MdCodec: Send {
+    /// The stream opened.
+    fn on_open(&mut self, fx: &mut Effects);
+    /// Subscribe to `add` and unsubscribe from `remove`.
+    fn subscribe(&mut self, add: &[Subscription], remove: &[Subscription], fx: &mut Effects);
+    /// Decode one frame.
+    fn on_frame(
+        &mut self,
+        f: RawFrame<'_>,
+        scope: &DecodeScope<'_>,
+        specs: &SpecTable,
+        sink: &mut dyn MdSink,
+        fx: &mut Effects,
+    ) -> Result<(), DecodeError>;
+    /// Decode the response to an HTTP request the codec asked for (a book anchor, a stats
+    /// poll).
+    fn on_http(
+        &mut self,
+        tag: HttpTag,
+        resp: HttpResponse<'_>,
+        scope: &DecodeScope<'_>,
+        specs: &SpecTable,
+        sink: &mut dyn MdSink,
+        fx: &mut Effects,
+    ) -> Result<(), DecodeError>;
+    /// A timer the codec set fired at `now` (`wall` on the wall clock).
+    fn on_timer(&mut self, tag: TimerTag, now: MonoNs, wall: WallNs, fx: &mut Effects);
+    /// How the stream is kept alive, or `None` where the venue needs nothing.
+    fn keepalive(&self) -> Option<Keepalive>;
+}
+
+/// An order-entry codec for one account session. Deterministic given its inputs and prior
+/// state; it reads no clock and draws no nonce except through [`EncodeCtx`].
+pub trait ExecCodec: Send {
+    /// `stream` opened: authenticate and subscribe, as effects.
+    fn on_open(&mut self, stream: StreamId, ctx: &EncodeCtx, fx: &mut Effects);
+    /// Encode and sign `cmd` as request `rpc`. `Err` means not sent: no byte reached a socket
+    /// buffer and no effect was pushed. Never retries.
+    fn encode(
+        &mut self,
+        cmd: &VenueCommand,
+        rpc: RpcId,
+        specs: &SpecTable,
+        ctx: &EncodeCtx,
+        fx: &mut Effects,
+    ) -> Result<EncodeReceipt, NotSentReason>;
+    /// Decode one frame from `stream`.
+    fn on_frame(
+        &mut self,
+        stream: StreamId,
+        f: RawFrame<'_>,
+        scope: &DecodeScope<'_>,
+        specs: &SpecTable,
+        sink: &mut dyn ExecSink,
+        fx: &mut Effects,
+    ) -> Result<(), DecodeError>;
+    /// Decode the response to an HTTP request the codec asked for.
+    fn on_http(
+        &mut self,
+        tag: HttpTag,
+        resp: HttpResponse<'_>,
+        scope: &DecodeScope<'_>,
+        specs: &SpecTable,
+        sink: &mut dyn ExecSink,
+        fx: &mut Effects,
+    ) -> Result<(), DecodeError>;
+    /// A timer the codec set fired (token refresh, keepalive, dead-man refresh).
+    fn on_timer(&mut self, tag: TimerTag, ctx: &EncodeCtx, fx: &mut Effects);
+    /// Request `rpc` timed out unanswered: report `Outcome { item: None, Unknown }`.
+    fn on_rpc_timeout(&mut self, rpc: RpcId, sink: &mut dyn ExecSink);
+    /// Read the venue's open orders and positions (reads only), reported as the `Resync*`
+    /// events.
+    fn resync(&mut self, ctx: &EncodeCtx, fx: &mut Effects);
+    /// How the venue spells our client ids.
+    fn client_id_format(&self) -> &ClientIdFormat;
+}
+
+/// The most bytes a [`Sig`] holds.
+pub const MAX_SIG_LEN: usize = 128;
+
+/// A signature, as the venue's wire carries it.
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+pub struct Sig(ArrayVec<u8, MAX_SIG_LEN>);
+
+impl Sig {
+    /// The signature `bytes`, or `None` when longer than [`MAX_SIG_LEN`].
+    pub fn new(bytes: &[u8]) -> Option<Sig> {
+        ArrayVec::try_from(bytes).ok().map(Sig)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Why a signer did not sign. It never carries key material.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum SignError {
+    /// The order cannot be expressed in the venue's signed message; names the part.
+    Unsignable(&'static str),
+    /// The signing backend failed; names how.
+    Backend(&'static str),
+}
+
+impl fmt::Display for SignError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SignError::Unsignable(what) => write!(f, "cannot sign: {what}"),
+            SignError::Backend(what) => write!(f, "signer failed: {what}"),
+        }
+    }
+}
+
+impl std::error::Error for SignError {}
+
+/// A new order as it goes on the wire: what a signer signs.
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub struct PlaceWire<'a> {
+    pub spec: &'a InstrumentSpec,
+    /// The client id in the venue's wire format.
+    pub cid: &'a str,
+    pub side: Side,
+    pub kind: OrderKind,
+    pub qty: Lots,
+    pub tif: Tif,
+    pub channel: Channel,
+    pub post_only: bool,
+    pub reduce_only: bool,
+    /// The signature time, from [`EncodeCtx`].
+    pub wall: WallNs,
+    /// The order's nonce, from [`EncodeCtx`], where the venue uses one.
+    pub nonce: Option<u64>,
+}
+
+/// An amend as it goes on the wire: the full post-amend order.
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub struct AmendWire<'a> {
+    pub spec: &'a InstrumentSpec,
+    /// The venue's order id, when the target names it.
+    pub vid: Option<&'a VenueOrderId>,
+    /// The client id in the venue's wire format, when the target names it.
+    pub cid: Option<&'a str>,
+    pub side: Side,
+    pub px: Ticks,
+    pub qty: Lots,
+    pub tif: Tif,
+    pub channel: Channel,
+    pub post_only: bool,
+    pub reduce_only: bool,
+    pub wall: WallNs,
+    pub nonce: Option<u64>,
+}
+
+/// A cancel as it goes on the wire.
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub struct CancelWire<'a> {
+    pub spec: &'a InstrumentSpec,
+    pub target: &'a OrderRef,
+    pub side: Side,
+    pub placement_nonce: Option<u64>,
+    pub wall: WallNs,
+    pub nonce: Option<u64>,
+}
+
+/// Signs orders for one venue account. Implemented in a venue crate's `src/sign`, reviewed by
+/// the owner (decision 0009).
+pub trait OrderSigner: Send {
+    fn sign_place(&mut self, w: &PlaceWire<'_>) -> Result<Sig, SignError>;
+    fn sign_amend(&mut self, w: &AmendWire<'_>) -> Result<Sig, SignError>;
+    /// `None` for a venue whose cancels are not signed.
+    fn sign_cancel(&mut self, w: &CancelWire<'_>) -> Result<Option<Sig>, SignError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fee::VenueFeeSign;
+    use crate::grid::PriceGrid;
+    use crate::ids::{Namespace, UnderlyingId, VenueId};
+    use crate::instrument::{FundingSpec, InstrumentKind, SizeStep, TradingStatus};
+    use crate::scope::dispatch;
+    use crate::units::AssetSym;
+    use rust_decimal::Decimal;
+
+    fn spec(id: u32, symbol: &str) -> InstrumentSpec {
+        let venue_symbol = dispatch(
+            &ClientIdFormat::Uuid,
+            Namespace::new(1),
+            VenueFeeSign::PositiveIsCost,
+            |scope| scope.venue_symbol(symbol),
+        )
+        .unwrap();
+        let usd = AssetSym::new("USD").unwrap();
+        InstrumentSpec {
+            id: InstrumentId::new(id),
+            venue: VenueId::new(1),
+            venue_symbol,
+            native_id: None,
+            underlying: UnderlyingId::new(1),
+            kind: InstrumentKind::Perpetual,
+            price_grid: PriceGrid::fixed(Decimal::ONE).unwrap(),
+            quote_grid: None,
+            size_step: SizeStep::new(Decimal::ONE).unwrap(),
+            min_size: Lots::new(1).unwrap(),
+            min_notional: None,
+            max_order_size: None,
+            position_limit: None,
+            price_band: None,
+            max_open_orders: None,
+            multiplier: Decimal::ONE,
+            quote_ccy: usd,
+            settle_ccy: usd,
+            funding: FundingSpec::Unknown,
+            public_fees: None,
+            status: TradingStatus::Trading,
+            version: 1,
+            fetched_at: WallNs(0),
+        }
+    }
+
+    #[test]
+    fn a_spec_table_finds_specs_by_id_and_by_symbol() {
+        let mut table = SpecTable::new();
+        assert!(table.is_empty());
+        assert_eq!(table.insert(spec(1, "A-PERP")), None);
+        assert_eq!(table.insert(spec(2, "B-PERP")), None);
+        assert_eq!(table.len(), 2);
+        assert_eq!(
+            table
+                .get(InstrumentId::new(2))
+                .unwrap()
+                .venue_symbol
+                .as_wire(),
+            "B-PERP"
+        );
+        assert_eq!(table.by_symbol("A-PERP").unwrap().id, InstrumentId::new(1));
+        assert!(table.by_symbol("C-PERP").is_none());
+
+        // A new spec for an id replaces the old one and its symbol.
+        let old = table.insert(spec(1, "A2-PERP")).unwrap();
+        assert_eq!(old.venue_symbol.as_wire(), "A-PERP");
+        assert!(table.by_symbol("A-PERP").is_none());
+        assert_eq!(table.by_symbol("A2-PERP").unwrap().id, InstrumentId::new(1));
+
+        // A symbol moving to another id leaves one spec under it.
+        assert_eq!(table.insert(spec(3, "B-PERP")), None);
+        assert!(table.get(InstrumentId::new(2)).is_none());
+        assert_eq!(table.by_symbol("B-PERP").unwrap().id, InstrumentId::new(3));
+        let ids: Vec<u32> = table.iter().map(|s| s.id.get()).collect();
+        assert_eq!(ids, [1, 3]);
+    }
+
+    #[test]
+    fn redaction_spans_must_lie_inside_the_frame_in_order() {
+        let bytes = b"auth|token=SYNTHETIC|end".to_vec();
+        let ok = WireSlice::redacted(bytes.clone(), vec![11..20, 21..24]).unwrap();
+        assert_eq!(ok.redactions(), [11..20, 21..24]);
+        assert_eq!(ok.bytes(), bytes.as_slice());
+        let past = WireSlice::redacted(bytes.clone(), std::iter::once(20..25).collect());
+        assert_eq!(past, Err(RedactError::OutOfBounds));
+        let empty = WireSlice::redacted(bytes.clone(), std::iter::once(3..3).collect());
+        assert_eq!(empty, Err(RedactError::OutOfBounds));
+        let overlap = WireSlice::redacted(bytes.clone(), vec![2..6, 5..8]);
+        assert_eq!(overlap, Err(RedactError::Unordered));
+        let reversed = WireSlice::redacted(bytes, vec![10..12, 2..4]);
+        assert_eq!(reversed, Err(RedactError::Unordered));
+        assert!(WireSlice::plain(b"x".to_vec()).redactions().is_empty());
+        assert!(RedactError::OutOfBounds.to_string().contains("outside"));
+        assert!(RedactError::Unordered.to_string().contains("order"));
+    }
+
+    #[test]
+    fn effects_keep_their_order_until_taken() {
+        let mut fx = Effects::new();
+        assert!(fx.is_empty());
+        let timer = |n| Effect::Timer {
+            tag: TimerTag(n),
+            after: Duration::from_millis(n),
+        };
+        fx.push(timer(1));
+        fx.push(Effect::Reconnect {
+            stream: StreamId(2),
+            reason: "stale",
+        });
+        assert_eq!(fx.len(), 2);
+        assert_eq!(fx.as_slice()[0], timer(1));
+        let taken = fx.take();
+        assert_eq!(taken.len(), 2);
+        assert!(fx.is_empty());
+    }
+
+    #[test]
+    fn a_nonce_block_gives_one_nonce_per_item_and_none_past_it() {
+        let ctx = EncodeCtx {
+            wall: WallNs(1),
+            mono: MonoNs(2),
+            nonces: NonceBlock { first: 10, len: 2 },
+        };
+        assert_eq!(
+            (ctx.nonce(0), ctx.nonce(1), ctx.nonce(2)),
+            (Some(10), Some(11), None)
+        );
+        assert_eq!(NonceBlock::EMPTY.get(0), None);
+        let top = NonceBlock {
+            first: u64::MAX,
+            len: 2,
+        };
+        assert_eq!((top.get(0), top.get(1)), (Some(u64::MAX), None));
+    }
+
+    #[test]
+    fn errors_name_what_was_wrong_and_nothing_else() {
+        assert_eq!(
+            DecodeError::Malformed("px").to_string(),
+            "malformed frame: px"
+        );
+        assert!(
+            DecodeError::UnknownInstrument
+                .to_string()
+                .contains("unknown")
+        );
+        let id: DecodeError = IdError::Empty.into();
+        assert_eq!(id, DecodeError::IdRefused(IdError::Empty));
+        assert!(id.to_string().contains("Empty"));
+        let fee: DecodeError = FeeError::OutOfRange.into();
+        assert!(fee.to_string().starts_with("fee refused"));
+        assert_eq!(SignError::Unsignable("px").to_string(), "cannot sign: px");
+        assert_eq!(SignError::Backend("rng").to_string(), "signer failed: rng");
+    }
+
+    #[test]
+    fn a_signature_holds_at_most_max_sig_len_bytes() {
+        let sig = Sig::new(&[7; MAX_SIG_LEN]).unwrap();
+        assert_eq!(sig.as_bytes().len(), MAX_SIG_LEN);
+        assert_eq!(Sig::new(&[7; MAX_SIG_LEN + 1]), None);
+    }
+
+    #[test]
+    fn a_raw_frame_gives_its_bytes_whatever_its_kind() {
+        assert_eq!(RawFrame::Text("ab").bytes(), b"ab");
+        assert_eq!(RawFrame::Binary(&[1, 2]).bytes(), [1, 2]);
+    }
+}
