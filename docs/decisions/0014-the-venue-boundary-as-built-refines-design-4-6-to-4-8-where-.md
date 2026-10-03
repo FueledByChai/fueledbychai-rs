@@ -28,7 +28,10 @@ stay sans-IO and deterministic:
 2. **Codecs report, the runtime stamps.** `MdSink`/`ExecSink` take `(VenueMeta, body)`; the
    runtime builds the `Envelope` with its `Stamp`, so a decoder cannot forge receive time or
    ingest order.
-3. **`Effect::Http` carries `rpc`, `timeout` and `class`, and every HTTP request comes back.**
+3. **Every request has a deadline, and every HTTP request comes back.** An RPC frame's `rpc`
+   is an `RpcCall { id, timeout }`, both mandatory, and every `Effect::Http` has a mandatory
+   `timeout`, so an unanswered order-entry request always reaches Unknown. `Effect::Http`
+   carries `rpc` and `class` too.
    `on_http` takes `Result<HttpResponse, HttpFailure>`: a request that got no response returns
    to its codec as `NotSent` (no byte written), `TimedOut` or `Lost` (written, connection
    failed), so a codec can retry a snapshot or recover. An order sent over REST carries an
@@ -50,7 +53,8 @@ stay sans-IO and deterministic:
    takes a payload-free `TerminalHint` (the design's `TerminalKind(RejectKind)` would make
    `RejectKind` recursive); `VenueOrderState::Rejected` takes a `TerminalReject`, which refuses
    `RejectKind::NotFound`.
-7. **Events say what they do not know.** `ExecEvent::Mode { scope, mode }` names the market
+7. **Events say what they do and do not know.** `MdEvent::Health` names the `Feed` whose health
+   changed; `OrderUpdate` carries the `post_only` and `reduce_only` flags a venue echoes. `ExecEvent::Mode { scope, mode }` names the market
    (`ModeScope::Instrument`) or the whole account a venue mode applies to; `OrderUpdate`,
    `FillEvent` and `VenueOrderSnapshot` carry `cid: Option<CidMatch>`, `None` when the venue
    echoes no client id (not `Unparseable`, which means a non-canonical id was present).
@@ -58,8 +62,10 @@ stay sans-IO and deterministic:
    `HttpResponse`, `RawFrame` and `Reject` format redaction spans, redacted header values, a
    URL's user information, query and fragment, response bodies, inbound frames and a venue's
    reject text by length only.
-9. **Configuration and traffic class.** `VenueConfig` keeps market-scoped keys per instrument
-   (`insert_market`, `get_market`). A request is `Safety` only when every item is: a batch of
+9. **Configuration, connections and traffic class.** `VenueConfig` keeps market-scoped keys per
+   instrument (`insert_market`, `get_market`). `VenueFactory::plan_exec` returns the order-entry
+   connections (`ExecEndpoint`) the runtime opens before `ExecCodec::on_open`. The client-id
+   format has one source, `OrderCaps::client_id`: `ExecCodec` has no `client_id_format`. A request is `Safety` only when every item is: a batch of
    reducing orders is `Safety`, a mixed batch `Normal`.
 10. `Vec` stands where the design has `SmallVec` or `Bytes`, to add no dependency yet.
 
@@ -79,6 +85,9 @@ a review path), `PathStamps` (FBC-ji6).
 - A book-channel index on every book event (Codex r4172231010): not taken. An instrument
   subscribes to one book channel, chosen by configuration and treated as a strategy change
   (design §7.2); FBC-nij makes the runtime refuse a second one.
+- Inbound redaction spans and rate-limit tags on effects now (Codex r4172367659,
+  r4172367663): not taken in FBC-5, since neither the journal nor the limiter exists yet;
+  FBC-7lm and FBC-hof extend the boundary with them, each with a record of its own.
 - An authorization parameter on `OrderGateway::submit` now (Codex r4172231026): not taken in
   FBC-5. The trait is declared as design §4.8 has it and nothing implements it yet; FBC-ob2
   makes order entry reachable only through `fbc-oms` (0013 rule 2) before a live gateway exists.
