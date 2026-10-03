@@ -1,6 +1,6 @@
 # 0010 — Three safety rules every change keeps: no trading after a restart until Start, pre-trade caps on every order, one quoter per market
 
-Status: accepted
+Status: superseded by 0013
 Date: 2026-10-02
 
 ## Context
