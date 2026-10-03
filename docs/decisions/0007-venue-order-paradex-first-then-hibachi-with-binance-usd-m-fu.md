@@ -1,6 +1,6 @@
 # 0007 — Venue order: Paradex first, then Hibachi, with Binance USD-M futures as reference market data
 
-Status: accepted
+Status: superseded by 0016
 Date: 2026-10-02
 
 ## Context

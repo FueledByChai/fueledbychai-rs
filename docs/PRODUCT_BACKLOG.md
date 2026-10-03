@@ -1,10 +1,10 @@
 # Product backlog
 
-The stories fueledbychai-rs builds first, in the venue order of decision 0007. Stories are
-intent with acceptance criteria; the tickets that build them live in Beads and name the story
-they serve (`story:BT-nnn`). The decisions they rest on are in `docs/decisions/`; "design §n"
-is a section of the approved architecture design (0001). The user throughout is a trading
-program built on this library, written and run by the owner.
+The stories fueledbychai-rs builds first, in the venue order of decision 0016 (which
+supersedes 0007). Stories are intent with acceptance criteria; the tickets that build them live
+in Beads and name the story they serve (`story:BT-nnn`). The decisions they rest on are in
+`docs/decisions/`; "design §n" is a section of the approved architecture design (0001). The
+user throughout is a trading program built on this library, written and run by the owner.
 
 Build order follows design D9 (recorder, then shadow, then the first live order): Epic E
 (simulation and conformance) comes before Paradex order entry (BT-402), and BT-201's
@@ -109,7 +109,7 @@ trust and can tell when it is stale or broken.
 **Acceptance criteria:**
 
 - `fbc-venue-binance-usdm` decodes `bookTicker`, partial depth and diff depth, and anchors the
-  diff-depth book on a REST snapshot; it never sends an order (0007, design §6).
+  diff-depth book on a REST snapshot; it never sends an order (0016, design §6).
 - A gap in the diff-depth update ids is detected and resynced from a new snapshot; recorded
   fixtures with a gap, a duplicate and out-of-order updates prove it.
 - Decoder replay of a recorded journal rebuilds the book byte-identically (0006).
@@ -126,7 +126,7 @@ so that every quote rests on a correct book.
 **Acceptance criteria:**
 
 - The SBE decoder is gated on the schema's block length and handles fixtures from both schema
-  versions; `bbo`, book deltas and `trades` decode to normalized events (0007, design §6, §15).
+  versions; `bbo`, book deltas and `trades` decode to normalized events (0016, design §6, §15).
 - Every `seq_no` discontinuity is detected and resynced (design §14 M0).
 - REST `/orderbook` snapshots match the delta-built book at the same `seq_no` for the top 15
   levels exactly, and the unthrottled `bbo` channel agrees with the delta-built touch in at
@@ -150,7 +150,7 @@ first live order (design D9).
   market orders, a modify (which signs the order id), the auth `Request`, and random decimal
   intents with more than eight decimal places, so the decimal-to-felt ×1e8 truncation is
   compared with Java's own scaling; the recovered benchmark (`fixtures/paradex/signing/signbench`)
-  seeds the port (0007, 0009, design §6 `signing_golden`, §15).
+  seeds the port (0016, 0009, design §6 `signing_golden`, §15).
 - JWT authentication lives in the venue crate's `src/auth.rs` or `src/auth/` (a review path),
   and `exec.rs` only calls it; it runs as effects through the runtime, and no token appears in
   a log, an error or the journal (0009).
