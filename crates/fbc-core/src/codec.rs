@@ -823,8 +823,17 @@ pub trait MdCodec: Send {
         sink: &mut dyn MdSink,
         fx: &mut Effects,
     ) -> Result<(), DecodeError>;
-    /// A timer the codec set fired at `now` (`wall` on the wall clock).
-    fn on_timer(&mut self, tag: TimerTag, now: MonoNs, wall: WallNs, fx: &mut Effects);
+    /// A timer the codec set fired at `now` (`wall` on the wall clock). It can report events:
+    /// a codec that times a feed's cadence pushes `MdEvent::Health { h: Stale, .. }` for a
+    /// feed that went silent while its socket stayed open.
+    fn on_timer(
+        &mut self,
+        tag: TimerTag,
+        now: MonoNs,
+        wall: WallNs,
+        sink: &mut dyn MdSink,
+        fx: &mut Effects,
+    );
     /// How the stream is kept alive, or `None` where the venue needs nothing.
     fn keepalive(&self) -> Option<Keepalive>;
 }

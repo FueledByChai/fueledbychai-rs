@@ -281,8 +281,12 @@ pub enum VenueOrderState {
     Open,
     Filled,
     Canceled(CancelReason),
-    /// Refused for good; never for not knowing the order, nor for a refused operation on it
-    /// ([`TerminalReject`]).
+    /// The venue reports the order itself refused, so it never rested; never for not knowing
+    /// the order ([`TerminalReject`]). A refused operation on an existing order (a cancel, an
+    /// amend) is not an order state, whatever its kind: it is an [`ExecEvent::AsyncReject`]
+    /// naming its `op`, or a [`SubmitOutcome::Rejected`] outcome of its request. Where a
+    /// refused amend ends the original order (`AmendCaps::reject_keeps_original` false), the
+    /// codec reports the state the venue gives the order.
     Rejected(TerminalReject),
     Expired,
     /// Amended, under `new_vid` where the venue issues a new order id for the amended order.

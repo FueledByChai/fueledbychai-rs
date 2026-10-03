@@ -257,7 +257,15 @@ impl MdCodec for ToyMd {
         Err(DecodeError::Malformed("the toy asks for no HTTP"))
     }
 
-    fn on_timer(&mut self, _tag: TimerTag, _now: MonoNs, _wall: WallNs, _fx: &mut Effects) {}
+    fn on_timer(
+        &mut self,
+        _tag: TimerTag,
+        _now: MonoNs,
+        _wall: WallNs,
+        _sink: &mut dyn MdSink,
+        _fx: &mut Effects,
+    ) {
+    }
 
     fn keepalive(&self) -> Option<Keepalive> {
         None
@@ -1104,6 +1112,12 @@ fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
     });
     assert_eq!(fx.take(), sent);
     assert_eq!(md.keepalive(), None);
+    // A market-data timer gets a sink, so a codec can report a silent feed Stale when its
+    // cadence is missed (Codex r4173389311); the toy sets no such timer, so one firing reports
+    // and asks for nothing.
+    let mut sink = Collect(Vec::new());
+    md.on_timer(TimerTag(9), MonoNs(1), WallNs(1), &mut sink, &mut fx);
+    assert!(sink.0.is_empty() && fx.is_empty());
 
     // A feed the caps do not offer, or an instrument missing from the spec table, is refused
     // by planning and by subscribing, and nothing goes on the wire.

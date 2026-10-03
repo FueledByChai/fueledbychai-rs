@@ -174,8 +174,9 @@ pub enum VenueCommand {
 }
 
 impl VenueCommand {
-    /// The traffic class of the command's request: `Safety` for cancels, cancel-on-disconnect
-    /// and dead-man protection, order queries (the Unknown ladder) and orders or amends that
+    /// The traffic class of the command's request: `Safety` for cancels, turning
+    /// cancel-on-disconnect on (turning it off removes protection, so it is `Normal`), dead-man
+    /// refreshes, order queries (the Unknown ladder) and orders or amends that
     /// can only reduce the position ([`NewOrder::reduces`]); a batch is `Safety` only when it
     /// has items and every one reduces. Everything else is `Normal`. A codec labels its effects
     /// with this, so the rule has one source.
@@ -189,10 +190,10 @@ impl VenueCommand {
             VenueCommand::Cancel(_)
             | VenueCommand::CancelMany(_)
             | VenueCommand::CancelAll(_)
-            | VenueCommand::ArmCancelOnDisconnect(_)
+            | VenueCommand::ArmCancelOnDisconnect(true)
             | VenueCommand::RefreshDeadMan
             | VenueCommand::Query(_) => true,
-            VenueCommand::FeeQuery => false,
+            VenueCommand::ArmCancelOnDisconnect(false) | VenueCommand::FeeQuery => false,
         };
         if safety {
             TrafficClass::Safety
@@ -603,5 +604,8 @@ mod tests {
             assert_eq!(cmd.traffic_class(), safety, "{cmd:?}");
         }
         assert_eq!(class(VenueCommand::FeeQuery), normal);
+        // Turning cancel-on-disconnect off removes protection, so it does not ride the safety
+        // floor (Codex r4173389313).
+        assert_eq!(class(VenueCommand::ArmCancelOnDisconnect(false)), normal);
     }
 }
