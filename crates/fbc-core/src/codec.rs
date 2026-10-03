@@ -489,6 +489,26 @@ impl Effects {
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
     }
+
+    /// Whether these effects, asked for by an encode of request `rpc`, send it as a request the
+    /// runtime can time out: at least one [`Effect::Send`] or [`Effect::Http`], and every one
+    /// naming `rpc` (a `Send` with an [`RpcCall`] for `rpc`, an `Http` with `rpc: Some(rpc)`).
+    /// The runtime executes an encode's effects only when this holds; otherwise it writes
+    /// nothing and the command is `NotSent(Unencodable)`, a codec defect, so no order is ever
+    /// sent outside the Unknown ladder (0005).
+    pub fn carry_request(&self, rpc: RpcId) -> bool {
+        let mut requests = self.buf.iter().filter_map(|effect| match effect {
+            Effect::Send { rpc: call, .. } => Some(call.map(|c| c.id)),
+            Effect::Http { rpc: call, .. } => Some(*call),
+            Effect::Timer { .. } | Effect::Reconnect { .. } => None,
+        });
+        let mut any = false;
+        let all = requests.all(|named| {
+            any = true;
+            named == Some(rpc)
+        });
+        any && all
+    }
 }
 
 /// The nonces reserved for one encode, one per item in item order. The values are whatever the
@@ -821,7 +841,9 @@ pub trait ExecCodec: Send {
     /// `stream` opened: authenticate and subscribe, as effects.
     fn on_open(&mut self, stream: StreamId, ctx: &EncodeCtx, fx: &mut Effects);
     /// Encode and sign `cmd` as request `rpc`. `Err` means not sent: no byte reached a socket
-    /// buffer and no effect was pushed. Never retries.
+    /// buffer and no effect was pushed. `Ok` effects carry the request
+    /// ([`Effects::carry_request`]): every frame or HTTP request names `rpc`, so it has a
+    /// deadline. Never retries.
     fn encode(
         &mut self,
         cmd: &VenueCommand,
@@ -1187,6 +1209,53 @@ mod tests {
         let taken = fx.take();
         assert_eq!(taken.len(), 2);
         assert!(fx.is_empty());
+    }
+
+    #[test]
+    fn an_encode_is_sent_only_as_a_request_the_runtime_can_time_out() {
+        // Codex r4173031192: an encode that sends its command with no RpcCall would leave the
+        // order outside the Unknown ladder. Its effects carry the request only when there is a
+        // frame or HTTP request and every one names the encode's rpc.
+        let (rpc, other) = (RpcId(7), RpcId(8));
+        let frame = |call: Option<RpcId>| Effect::Send {
+            stream: StreamId(1),
+            frame: WireSlice::plain(b"x".to_vec()),
+            rpc: call.map(|id| RpcCall {
+                id,
+                timeout: Duration::from_secs(1),
+            }),
+            class: TrafficClass::Normal,
+        };
+        let http = |call: Option<RpcId>| Effect::Http {
+            tag: HttpTag(1),
+            req: HttpRequest {
+                method: HttpMethod::Post,
+                url: WireUrl::plain("https://venue.invalid/order"),
+                headers: vec![],
+                body: WireSlice::plain(Vec::new()),
+            },
+            rpc: call,
+            timeout: Duration::from_secs(1),
+            class: TrafficClass::Normal,
+        };
+        let timer = Effect::Timer {
+            tag: TimerTag(1),
+            after: Duration::from_secs(1),
+        };
+        let carries = |effects: Vec<Effect>| {
+            let mut fx = Effects::new();
+            effects.into_iter().for_each(|e| fx.push(e));
+            fx.carry_request(rpc)
+        };
+        assert!(carries(vec![frame(Some(rpc))]));
+        assert!(carries(vec![http(Some(rpc)), timer.clone()]));
+        assert!(carries(vec![frame(Some(rpc)), frame(Some(rpc))]));
+        assert!(!carries(vec![frame(None)]));
+        assert!(!carries(vec![http(None)]));
+        assert!(!carries(vec![frame(Some(rpc)), frame(Some(other))]));
+        assert!(!carries(vec![frame(Some(rpc)), frame(None)]));
+        assert!(!carries(vec![timer]));
+        assert!(!carries(vec![]));
     }
 
     #[test]
