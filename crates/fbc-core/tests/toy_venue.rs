@@ -259,6 +259,26 @@ impl ToyMd {
     }
 }
 
+/// Refuses a subscription to a feed the toy's caps do not offer.
+fn offered(sub: Subscription) -> Result<(), VenueError> {
+    let md = toy_caps().md;
+    let source = |s: FeedSource| s != FeedSource::None;
+    let ok = match sub.feed {
+        Feed::Touch(id) => usize::from(id.0) < md.touch_sources.len(),
+        Feed::Book(id) => usize::from(id.0) < md.books.len(),
+        Feed::Trades => source(md.trades.source),
+        Feed::Mark => source(md.mark),
+        Feed::Index => source(md.index),
+        Feed::Funding => source(md.funding.source),
+        Feed::Stats => source(md.stats),
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(VenueError::UnsupportedFeed(sub))
+    }
+}
+
 /// The venue's spelling of `inst`, from the spec table.
 fn symbol_of(specs: &SpecTable, inst: InstrumentId) -> Result<&str, VenueError> {
     specs
@@ -282,7 +302,9 @@ impl MdCodec for ToyMd {
         specs: &SpecTable,
         fx: &mut Effects,
     ) -> Result<(), VenueError> {
-        // Every instrument is spelled before anything is pushed, so a refusal pushes nothing.
+        // Every feed is checked and every instrument spelled before anything is pushed, so a
+        // refusal pushes nothing.
+        add.iter().try_for_each(|sub| offered(*sub))?;
         let mut frames = Vec::new();
         for (verb, subs) in [("sub", add), ("unsub", remove)] {
             for sub in subs {
@@ -373,7 +395,9 @@ impl MdCodec for ToyPoll {
         specs: &SpecTable,
         _fx: &mut Effects,
     ) -> Result<(), VenueError> {
-        // Spell everything first, so a refusal changes nothing; the next poll asks for the rest.
+        // Check and spell everything first, so a refusal changes nothing; the next poll asks for
+        // the rest.
+        add.iter().try_for_each(|sub| offered(*sub))?;
         let added = add.iter().map(|s| symbol_of(specs, s.inst));
         let added = added.collect::<Result<Vec<_>, _>>()?;
         let removed = remove.iter().map(|s| symbol_of(specs, s.inst));
@@ -962,6 +986,7 @@ impl VenueFactory for ToyFactory {
         let base = url(cfg)?;
         let mut symbols = BTreeSet::new();
         for sub in subs {
+            offered(*sub)?;
             symbols.insert(symbol_of(specs, sub.inst)?);
         }
         // Stats are REST-only (MdCaps::stats is Poll): they go on a connectionless endpoint.
@@ -2569,4 +2594,45 @@ fn an_amend_signer_sees_only_the_reference_the_request_encodes() {
     let text = String::from_utf8(encode_once(&mut codec, &amend, &ctx(9, 4, 1))).unwrap();
     assert!(text.starts_with("rpc=11\namend|vid=V-1|"), "{text}");
     assert_eq!(*seen.lock().unwrap(), ["amend venue:V-1"]);
+}
+
+#[test]
+fn a_feed_the_caps_do_not_offer_is_refused_by_planning_and_subscribing() {
+    // The toy publishes no index (MdCaps::index None) and has one touch channel and two book
+    // channels: anything else is refused by name, and nothing goes on the wire for it.
+    let refused = [
+        Feed::Index,
+        Feed::Touch(TouchSourceId(1)),
+        Feed::Book(BookId(2)),
+    ];
+    let mut md = ToyFactory.md_codec(
+        &config(),
+        &ToyFactory
+            .plan_md(&config(), &specs(), &BTreeSet::new())
+            .unwrap()[0],
+    );
+    for feed in refused {
+        let sub = Subscription { inst: INST, feed };
+        let err = VenueError::UnsupportedFeed(sub);
+        let subs: BTreeSet<Subscription> = [sub].into_iter().collect();
+        assert_eq!(ToyFactory.plan_md(&config(), &specs(), &subs), Err(err));
+        let mut fx = Effects::new();
+        let trades = Subscription {
+            inst: INST,
+            feed: Feed::Trades,
+        };
+        assert_eq!(
+            md.subscribe(&[trades, sub], &[], &specs(), &mut fx),
+            Err(err)
+        );
+        assert!(fx.is_empty());
+    }
+    assert_eq!(
+        VenueError::UnsupportedFeed(Subscription {
+            inst: INST,
+            feed: Feed::Index
+        })
+        .to_string(),
+        "instrument 7 has no Index feed on this venue"
+    );
 }
