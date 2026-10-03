@@ -82,9 +82,12 @@ pub struct AmendOrder {
     pub qty: Lots,
     /// The order's cumulative filled quantity in the OMS's record when it built the amend. A
     /// venue whose amend quantity is the remaining quantity ([`AmendQty::Remaining`]) is sent
-    /// `qty - cum_filled` ([`AmendOrder::wire_qty`]): exactly the resting quantity the OMS
-    /// checked against its caps, even if fills the OMS has not seen yet have arrived at the
-    /// venue.
+    /// `qty - cum_filled` ([`AmendOrder::wire_qty`]): the resting quantity the OMS checked
+    /// against its caps. Fills the OMS has not seen yet may still reach the venue first; they
+    /// come out of the old resting quantity, and the venue then rests the whole wire quantity.
+    /// So the OMS counts the order's resting as the wire quantity it sent (less fills reported
+    /// after the amend's acknowledgement) until the venue reports the order's total, never as
+    /// `qty - cum_filled` recomputed after later fills (FBC-w5n).
     pub cum_filled: Lots,
 }
 
