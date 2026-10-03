@@ -912,8 +912,9 @@ pub trait ExecCodec: Send {
     fn resync(&mut self, ctx: &EncodeCtx, fx: &mut Effects);
 }
 
-/// The most bytes a [`Sig`] holds.
-pub const MAX_SIG_LEN: usize = 128;
+/// The most bytes a [`Sig`] holds: room for the longest wire form a planned venue sends,
+/// Paradex's `["r","s"]` with r and s in decimal (up to 76 digits each, 159 bytes).
+pub const MAX_SIG_LEN: usize = 160;
 
 /// A signature, as the venue's wire carries it.
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]

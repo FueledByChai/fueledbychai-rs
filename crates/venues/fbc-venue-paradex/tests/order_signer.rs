@@ -14,7 +14,6 @@ use fbc_core::{
     PlaceWire, PriceGrid, Side, Sig, SignError, SizeStep, Ticks, Tif, TradingStatus, UnderlyingId,
     VenueFeeSign, VenueId, VenueOrderId, WallNs, dispatch,
 };
-use fbc_venue_paradex::sign::StarkSig;
 use rust_decimal::Decimal;
 
 fn dec(text: &str) -> Decimal {
@@ -79,12 +78,11 @@ fn wall(row: &Row) -> WallNs {
     WallNs(i64::try_from(row.u64("timestamp")).unwrap() * 1_000_000)
 }
 
+/// The signature as Paradex's wire carries it and the Java signer writes it
+/// (`ParadexTypedDataSigner.toParadexArray`): `["r","s"]`, both in decimal.
 fn expected(row: &Row) -> Sig {
-    StarkSig {
-        r: row.felt("r"),
-        s: row.felt("s"),
-    }
-    .to_sig()
+    let wire = format!(r#"["{}","{}"]"#, row.felt("r"), row.felt("s"));
+    Sig::new(wire.as_bytes()).unwrap()
 }
 
 fn place<'a>(
