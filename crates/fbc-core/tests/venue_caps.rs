@@ -2,7 +2,10 @@
 //! venue below declares every field of `VenueCaps` and of each type it is made of, by name; it
 //! compiles only because nothing is left out, since no capability type has a `Default` to fill
 //! a gap (`tests/ui_caps/` proves a literal missing a field, and `VenueCaps::default()`, do not
-//! compile). Its values describe no real venue.
+//! compile). Its values describe no real venue. Order and fill capabilities come together in
+//! one `exec` block (decision 0015); the market-data-only venue below declares `exec: None` and
+//! nothing about fills, and `tests/ui_caps/` proves neither half can be written without the
+//! other.
 
 use std::fs;
 use std::path::Path;
@@ -11,72 +14,74 @@ use std::time::Duration;
 use fbc_core::{
     AckModel, AmendAck, AmendCaps, AmendQty, AssetSym, Batch, BookCaps, Cadence,
     CancelOnDisconnect, Channel, Charset, ClientIdFormat, ConnTopology, Continuity, Encoding,
-    ExchTsKind, Feature, FeedSource, FillCaps, FillSource, FundingCaps, LimitScope, MatchingCaps,
-    MdCaps, Money, Namespace, NonceScope, OpKind, OrderCaps, OrderKindTag, OrderingKey,
-    QueueModelQuality, RateLimit, Readiness, RefKind, SeqDomain, SnapshotSource, SpeedBump,
-    SpeedBumpScope, StpScope, Support, TagSet, TifTag, TouchSourceCaps, TradeCaps, VenueCaps,
-    VenueFeeSign, dispatch,
+    ExchTsKind, ExecCaps, Feature, FeedSource, FillCaps, FillSource, FundingCaps, LimitScope,
+    MatchingCaps, MdCaps, Money, Namespace, NonceScope, OpKind, OrderCaps, OrderKindTag,
+    OrderingKey, QueueModelQuality, RateLimit, Readiness, RefKind, SeqDomain, SnapshotSource,
+    SpeedBump, SpeedBumpScope, StpScope, Support, TagSet, TifTag, TouchSourceCaps, TradeCaps,
+    VenueCaps, VenueFeeSign, dispatch,
 };
 
 /// A synthetic venue that declares every capability field.
 fn synthetic_caps() -> VenueCaps {
     VenueCaps {
-        order: Some(OrderCaps {
-            kinds: TagSet::of(&[OrderKindTag::Limit, OrderKindTag::Market]),
-            tifs: TagSet::of(&[TifTag::Gtc, TifTag::Ioc]),
-            channels: TagSet::of(&[Channel::Public, Channel::Rpi]),
-            post_only: true,
-            reduce_only: true,
-            flag_conflicts: vec![
-                (Feature::PostOnly, Feature::ReduceOnly),
-                (Feature::Rpi, Feature::ReduceOnly),
-            ],
-            amend: Some(AmendCaps {
-                price: true,
-                qty: true,
-                flags: false,
-                when_partially_filled: false,
-                reject_keeps_original: true,
-                keeps_venue_id: true,
-                ack: AmendAck::RpcReplyOnly,
-                qty_semantics: AmendQty::TotalIncludingFilled,
-                keeps_priority: None,
-            }),
-            cancel_refs: TagSet::of(&[RefKind::Venue, RefKind::Client]),
-            query_refs: TagSet::of(&[RefKind::Client]),
-            cancel_before_ack: false,
-            cancel_is_signed: false,
-            batch_place: Some(Batch { max_items: 10 }),
-            batch_cancel: None,
-            cancel_all_account: Support::Native,
-            cancel_all_instrument: Support::Unsupported,
-            cancel_on_disconnect: CancelOnDisconnect::PerConnection {
-                rearm_on_reconnect: true,
+        exec: Some(ExecCaps {
+            order: OrderCaps {
+                kinds: TagSet::of(&[OrderKindTag::Limit, OrderKindTag::Market]),
+                tifs: TagSet::of(&[TifTag::Gtc, TifTag::Ioc]),
+                channels: TagSet::of(&[Channel::Public, Channel::Rpi]),
+                post_only: true,
+                reduce_only: true,
+                flag_conflicts: vec![
+                    (Feature::PostOnly, Feature::ReduceOnly),
+                    (Feature::Rpi, Feature::ReduceOnly),
+                ],
+                amend: Some(AmendCaps {
+                    price: true,
+                    qty: true,
+                    flags: false,
+                    when_partially_filled: false,
+                    reject_keeps_original: true,
+                    keeps_venue_id: true,
+                    ack: AmendAck::RpcReplyOnly,
+                    qty_semantics: AmendQty::TotalIncludingFilled,
+                    keeps_priority: None,
+                }),
+                cancel_refs: TagSet::of(&[RefKind::Venue, RefKind::Client]),
+                query_refs: TagSet::of(&[RefKind::Client]),
+                cancel_before_ack: false,
+                cancel_is_signed: false,
+                batch_place: Some(Batch { max_items: 10 }),
+                batch_cancel: None,
+                cancel_all_account: Support::Native,
+                cancel_all_instrument: Support::Unsupported,
+                cancel_on_disconnect: CancelOnDisconnect::PerConnection {
+                    rearm_on_reconnect: true,
+                },
+                ack: AckModel::TwoPhase {
+                    risk_reject_window: Duration::from_millis(250),
+                },
+                client_id: ClientIdFormat::Alnum {
+                    max_len: 32,
+                    charset: Charset::Alphanumeric,
+                },
+                cid_echoed_on_events: true,
+                nonce_scope: NonceScope::PerAccountMonotonic,
+                ordering_key: OrderingKey::VenueSeq,
+                snapshot_source: SnapshotSource::Trustworthy,
+                events_echo_flags: false,
+                sign_cost_hint_us: 150,
             },
-            ack: AckModel::TwoPhase {
-                risk_reject_window: Duration::from_millis(250),
+            fills: FillCaps {
+                source: FillSource::Native,
+                liquidity_flag: true,
+                realized_pnl: true,
+                realized_funding: false,
+                fee_sign: VenueFeeSign::PositiveIsRebate,
+                fee_asset_reported: true,
+                fill_id: true,
+                replays_fills_on_reconnect: false,
             },
-            client_id: ClientIdFormat::Alnum {
-                max_len: 32,
-                charset: Charset::Alphanumeric,
-            },
-            cid_echoed_on_events: true,
-            nonce_scope: NonceScope::PerAccountMonotonic,
-            ordering_key: OrderingKey::VenueSeq,
-            snapshot_source: SnapshotSource::Trustworthy,
-            events_echo_flags: false,
-            sign_cost_hint_us: 150,
         }),
-        fills: FillCaps {
-            source: FillSource::Native,
-            liquidity_flag: true,
-            realized_pnl: true,
-            realized_funding: false,
-            fee_sign: VenueFeeSign::PositiveIsRebate,
-            fee_asset_reported: true,
-            fill_id: true,
-            replays_fills_on_reconnect: false,
-        },
         matching: MatchingCaps {
             speed_bump: Some(SpeedBump {
                 delay: Duration::from_millis(25),
@@ -155,10 +160,11 @@ fn synthetic_caps() -> VenueCaps {
 #[test]
 fn the_synthetic_venue_declares_every_capability() {
     let caps = synthetic_caps();
-    let order = caps
-        .order
+    let exec = caps
+        .exec
         .as_ref()
         .expect("the synthetic venue takes orders");
+    let order = &exec.order;
     assert!(order.kinds.contains(OrderKindTag::Market));
     assert!(!order.tifs.contains(TifTag::Fok));
     assert!(order.channels.contains(Channel::Rpi));
@@ -199,27 +205,42 @@ fn the_synthetic_venue_declares_every_capability() {
 #[test]
 fn the_declared_fee_sign_and_client_id_format_drive_the_decode_scope() {
     let caps = synthetic_caps();
-    let order = caps.order.as_ref().unwrap();
+    let exec = caps.exec.as_ref().unwrap();
     let usdc = AssetSym::new("USDC").unwrap();
     // The synthetic venue reports a rebate as a positive amount; as a Fee it is a negative cost.
     let fee = dispatch(
-        &order.client_id,
+        &exec.order.client_id,
         Namespace::new(2),
-        caps.fills.fee_sign,
+        exec.fills.fee_sign,
         |scope| scope.fee(150_000, usdc),
     );
     assert_eq!(fee.unwrap().cost(), Money::new(-150_000, usdc));
 }
 
-#[test]
-fn a_market_data_only_venue_states_it_takes_no_orders() {
-    let md_only = VenueCaps {
-        order: None,
+/// A market-data-only test venue (decision 0015): `exec: None` is all it says about order entry,
+/// so it declares no order capability, no fill source and no fee sign for an account feed it does
+/// not have. Its market data, matching engine, limits and ceiling are the synthetic venue's.
+fn market_data_only_caps() -> VenueCaps {
+    VenueCaps {
+        exec: None,
         readiness_ceiling: Readiness::Record,
         ..synthetic_caps()
-    };
-    assert!(md_only.order.is_none());
+    }
+}
+
+#[test]
+fn a_market_data_only_venue_declares_no_order_or_fill_capability() {
+    let md_only = market_data_only_caps();
+    assert!(md_only.exec.is_none());
     assert_ne!(md_only, synthetic_caps());
+    // Nothing about fills or fees survives anywhere in the declaration.
+    let printed = format!("{md_only:?}");
+    for claim in ["fills", "fee_sign", "FillSource", "PositiveIs", "client_id"] {
+        assert!(!printed.contains(claim), "{claim} in {printed}");
+    }
+    // What it does declare is still stated in full.
+    assert_eq!(md_only.md, synthetic_caps().md);
+    assert_eq!(md_only.matching, synthetic_caps().matching);
     assert!(Readiness::Record < Readiness::Shadow);
     assert!(Readiness::Shadow < Readiness::Paper);
     assert!(Readiness::Paper < Readiness::Live);

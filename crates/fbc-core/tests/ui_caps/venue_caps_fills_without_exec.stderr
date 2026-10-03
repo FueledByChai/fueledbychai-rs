@@ -1,0 +1,7 @@
+error[E0560]: struct `VenueCaps` has no field named `fills`
+ --> tests/ui_caps/venue_caps_fills_without_exec.rs:8:9
+  |
+8 |         fills,
+  |         ^^^^^ `VenueCaps` does not have this field
+  |
+  = note: all struct fields are already assigned

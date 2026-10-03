@@ -44,7 +44,8 @@ fn fee_seal_does_not_compile() {
 
 /// A `VenueCaps` (or `FillCaps`) literal missing one field does not compile, `VenueCaps` and
 /// `InstrumentSpec` have no `default()`, and a `VenueSymbol` cannot be built outside `fbc-core`
-/// (decision 0003, design §4.4, §4.5).
+/// (decision 0003, design §4.4, §4.5). Order capabilities without fill capabilities, and fill
+/// capabilities without an exec block, cannot be written (decision 0015).
 #[test]
 fn caps_and_specs_declare_every_field() {
     let cases = trybuild::TestCases::new();
