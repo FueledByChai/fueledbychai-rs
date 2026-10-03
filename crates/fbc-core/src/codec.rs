@@ -33,6 +33,7 @@ use crate::instrument::InstrumentSpec;
 use crate::scope::DecodeScope;
 use crate::time::{MonoNs, WallNs};
 use crate::units::{Channel, Lots, Side, Ticks};
+use crate::venue::VenueError;
 
 /// A frame as it came off a stream. Its `Debug` shows the kind and length only, since a venue
 /// can echo a credential back in a frame.
@@ -549,8 +550,15 @@ pub struct Keepalive {
 pub trait MdCodec: Send {
     /// The stream opened.
     fn on_open(&mut self, fx: &mut Effects);
-    /// Subscribe to `add` and unsubscribe from `remove`.
-    fn subscribe(&mut self, add: &[Subscription], remove: &[Subscription], fx: &mut Effects);
+    /// Subscribe to `add` and unsubscribe from `remove`, spelling each instrument as `specs`
+    /// says. `Err` names an instrument missing from `specs`; nothing is pushed then.
+    fn subscribe(
+        &mut self,
+        add: &[Subscription],
+        remove: &[Subscription],
+        specs: &SpecTable,
+        fx: &mut Effects,
+    ) -> Result<(), VenueError>;
     /// Decode one frame.
     fn on_frame(
         &mut self,
