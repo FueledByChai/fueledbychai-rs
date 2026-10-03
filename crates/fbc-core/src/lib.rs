@@ -51,9 +51,9 @@ pub use command::{
     VenueCommand,
 };
 pub use event::{
-    CancelReason, ConnState, Envelope, ExecEvent, FeedHealth, FillEvent, FillKey, ItemRef,
-    Liquidity3, Lvl, MdEvent, ModeScope, OrderUpdate, RpcId, StreamId, TouchSourceId, VenueMeta,
-    VenueMode, VenueOrderSnapshot, VenueOrderState,
+    CancelReason, ConnState, Envelope, ExecEvent, FeedHealth, FillEvent, FillIdent, FillKey,
+    ItemRef, Liquidity3, Lvl, MdEvent, ModeScope, OrderUpdate, RpcId, StreamId, TouchSourceId,
+    VenueMeta, VenueMode, VenueOrderSnapshot, VenueOrderState,
 };
 pub use fee::{
     Fee, FeeBook, FeeEntry, FeeError, FeeKey, FeeLookup, FeeRate, FeeSchedule, FeeSource,

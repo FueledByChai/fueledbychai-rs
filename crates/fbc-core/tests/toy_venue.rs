@@ -21,11 +21,11 @@ use fbc_core::{
     CidMint, ClientIdFormat, ClientOrderId, ConfigError, ConfigScope, ConnKey, ConnTopology,
     Continuity, DecodeError, DecodeScope, EncodeCtx, EncodeReceipt, Encoding, EndpointPlan,
     Envelope, ExchNs, ExchTsKind, ExecCodec, ExecEndpoint, ExecEvent, ExecSink, Feed, FeedHealth,
-    FeedSource, FieldSpec, FieldUnit, FillCaps, FillEvent, FillKey, FillSource, FundingCaps,
-    FundingSpec, Header, HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag, InstrumentId,
-    InstrumentKind, InstrumentSpec, ItemRef, Keepalive, KeepaliveKind, Liquidity3, Lots, Lvl,
-    MatchingCaps, MdCaps, MdCodec, MdEvent, MdSink, MdTransport, ModeScope, Money, MonoNs,
-    Namespace, NamespaceLease, NewOrder, NonceBlock, NonceScope, NotSentReason, OrderCaps,
+    FeedSource, FieldSpec, FieldUnit, FillCaps, FillEvent, FillIdent, FillKey, FillSource,
+    FundingCaps, FundingSpec, Header, HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag,
+    InstrumentId, InstrumentKind, InstrumentSpec, ItemRef, Keepalive, KeepaliveKind, Liquidity3,
+    Lots, Lvl, MatchingCaps, MdCaps, MdCodec, MdEvent, MdSink, MdTransport, ModeScope, Money,
+    MonoNs, Namespace, NamespaceLease, NewOrder, NonceBlock, NonceScope, NotSentReason, OrderCaps,
     OrderKind, OrderKindTag, OrderRef, OrderSigner, OrderUpdate, OrderingKey, PlaceWire, PriceGrid,
     PxExact, QueryOrder, QueueModelQuality, RawFrame, Readiness, RefKind, Reject, RejectKind,
     RpcCall, RpcId, SeqDomain, Side, Sig, SignError, SignedLots, SizeStep, SnapshotSource,
@@ -655,14 +655,27 @@ impl ToyExec {
                 },
             },
             "fill" => ExecEvent::Fill(FillEvent {
-                key: FillKey::Venue(scope.fill_id(f.get("fid")?)?),
+                ident: {
+                    let vid = f.opt("vid").map(|v| scope.venue_order_id(v)).transpose()?;
+                    let cum_after = f.opt_num("cum")?.and_then(Lots::new);
+                    match f.opt("fid") {
+                        Some(fid) => FillIdent::Venue {
+                            fill: scope.fill_id(fid)?,
+                            vid,
+                            cum_after,
+                        },
+                        // No fill id: the order id and cumulative quantity key the fill.
+                        None => FillIdent::Derived {
+                            vid: vid.ok_or(DecodeError::Malformed("vid"))?,
+                            cum_after: cum_after.ok_or(DecodeError::Malformed("cum"))?,
+                        },
+                    }
+                },
                 cid: f.opt("cid").map(|c| scope.client_order_id(c)),
-                vid: f.opt("vid").map(|v| scope.venue_order_id(v)).transpose()?,
                 inst: f.inst(specs)?,
                 side: f.side()?,
                 px: Ticks(f.num("px")?),
                 qty: f.lots("qty")?,
-                cum_after: f.opt_num("cum")?.and_then(Lots::new),
                 liquidity: match f.opt("liq") {
                     Some("M") => Liquidity3::Maker,
                     Some("T") => Liquidity3::Taker,
@@ -1319,14 +1332,16 @@ fn the_toy_decodes_account_events_a_full_resync_and_a_fill_into_their_exec_event
         },
         ExecEvent::ResyncEnd,
         ExecEvent::Fill(FillEvent {
-            key: FillKey::Venue(fid),
+            ident: FillIdent::Venue {
+                fill: fid,
+                vid: Some(vid),
+                cum_after: Some(Lots::new(8).unwrap()),
+            },
             cid: Some(CidMatch::Ours(cid)),
-            vid: Some(vid),
             inst: INST,
             side: Side::Buy,
             px: Ticks(130_865),
             qty: Lots::new(3).unwrap(),
-            cum_after: Some(Lots::new(8).unwrap()),
             liquidity: Liquidity3::Maker,
             fee,
             realized_pnl: Some(Money::new(2_500_000, usdc())),
@@ -2141,4 +2156,81 @@ fn a_poll_only_feed_is_planned_without_a_connection_and_polled_over_http() {
             oi: Lots::new(4_200),
         }]
     );
+}
+
+#[test]
+fn a_fill_key_is_computed_from_the_one_copy_of_its_fields() {
+    // A fill without a venue fill id is keyed by its order's venue id and cumulative quantity
+    // after the fill; the event holds each once, so the key cannot disagree with the order and
+    // quantity the fill is applied to.
+    let sink = decode_exec(
+        exec_codec().as_mut(),
+        &[
+            "fill|sym=TOY-PERP|vid=V-1|side=S|px=130865|qty=1|cum=3|fee=0",
+            "fill|sym=TOY-PERP|fid=F-1|vid=V-1|side=S|px=130865|qty=1|cum=4|fee=0",
+            "fill|sym=TOY-PERP|fid=F-2|side=S|px=130865|qty=1|fee=0",
+        ],
+    );
+    let (vid, f1, f2) = with_scope(|scope| {
+        (
+            scope.venue_order_id("V-1").unwrap(),
+            scope.fill_id("F-1").unwrap(),
+            scope.fill_id("F-2").unwrap(),
+        )
+    });
+    let fills: Vec<&FillEvent> = sink
+        .bodies()
+        .into_iter()
+        .map(|ev| match ev {
+            ExecEvent::Fill(fill) => fill,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    let lots = |n| Lots::new(n).unwrap();
+    assert_eq!(
+        fills[0].ident,
+        FillIdent::Derived {
+            vid: vid.clone(),
+            cum_after: lots(3)
+        }
+    );
+    assert_eq!(
+        fills[0].key(),
+        FillKey::Derived {
+            vid: vid.clone(),
+            cum_after: lots(3)
+        }
+    );
+    assert_eq!(fills[1].key(), FillKey::Venue(f1));
+    assert_eq!(
+        (fills[1].vid(), fills[1].cum_after()),
+        (Some(&vid), Some(lots(4)))
+    );
+    assert_eq!(fills[2].key(), FillKey::Venue(f2));
+    assert_eq!((fills[2].vid(), fills[2].cum_after()), (None, None));
+    assert_eq!(
+        (fills[0].vid(), fills[0].cum_after()),
+        (Some(&vid), Some(lots(3)))
+    );
+
+    // Without a fill id, a fill missing its order id or cumulative quantity has no key: refused.
+    let mut codec = exec_codec();
+    let (specs, mut sink, mut fx) = (specs(), Collect::new(), Effects::new());
+    with_scope(|scope| {
+        for line in [
+            "fill|sym=TOY-PERP|side=S|px=130865|qty=1|cum=3|fee=0",
+            "fill|sym=TOY-PERP|vid=V-1|side=S|px=130865|qty=1|fee=0",
+        ] {
+            let decoded = codec.on_frame(
+                EXEC_STREAM,
+                RawFrame::Text(line),
+                scope,
+                &specs,
+                &mut sink,
+                &mut fx,
+            );
+            assert!(decoded.is_err(), "{line}");
+        }
+    });
+    assert!(sink.out.is_empty());
 }
