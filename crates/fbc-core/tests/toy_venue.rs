@@ -514,7 +514,7 @@ impl ToyExec {
                 watermark: WallNs(f.num("wm")?),
             },
             "rorder" => ExecEvent::ResyncOrder(VenueOrderSnapshot {
-                cid: scope.client_order_id(f.get("cid")?),
+                cid: f.opt("cid").map(|c| scope.client_order_id(c)),
                 vid: scope.venue_order_id(f.get("vid")?)?,
                 inst: f.inst(specs)?,
                 side: f.side()?,
@@ -539,7 +539,7 @@ impl ToyExec {
             },
             "fill" => ExecEvent::Fill(FillEvent {
                 key: FillKey::Venue(scope.fill_id(f.get("fid")?)?),
-                cid: scope.client_order_id(f.get("cid")?),
+                cid: f.opt("cid").map(|c| scope.client_order_id(c)),
                 vid: f.opt("vid").map(|v| scope.venue_order_id(v)).transpose()?,
                 inst: f.inst(specs)?,
                 side: f.side()?,
@@ -1155,7 +1155,7 @@ fn the_toy_decodes_account_events_a_full_resync_and_a_fill_into_their_exec_event
             watermark: WallNs(1_759_363_200_050_000_000),
         },
         ExecEvent::ResyncOrder(VenueOrderSnapshot {
-            cid: CidMatch::Ours(cid),
+            cid: Some(CidMatch::Ours(cid)),
             vid: vid.clone(),
             inst: INST,
             side: Side::Buy,
@@ -1174,7 +1174,7 @@ fn the_toy_decodes_account_events_a_full_resync_and_a_fill_into_their_exec_event
         ExecEvent::ResyncEnd,
         ExecEvent::Fill(FillEvent {
             key: FillKey::Venue(fid),
-            cid: CidMatch::Ours(cid),
+            cid: Some(CidMatch::Ours(cid)),
             vid: Some(vid),
             inst: INST,
             side: Side::Buy,
@@ -1552,6 +1552,30 @@ fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
             Effect::Http { tag: RESYNC_TAG, req, .. } if req.url.ends_with("at=2000")
         ));
     }
+}
+
+#[test]
+fn an_event_without_a_client_id_says_none_rather_than_unparseable() {
+    // A venue that does not echo client ids on events (OrderCaps::cid_echoed_on_events false)
+    // gives no client id: that is None, not Unparseable (a non-canonical id that was present).
+    let sink = decode_exec(
+        exec_codec().as_mut(),
+        &[
+            "fill|sym=TOY-PERP|fid=F-1|vid=V-1|side=S|px=130865|qty=1|fee=0",
+            "rorder|sym=TOY-PERP|vid=V-1|side=S|px=130865|qty=2|cum=1",
+            "fill|sym=TOY-PERP|fid=F-2|vid=V-1|cid=java-1759363200123|side=S|px=130865|qty=1|fee=0",
+        ],
+    );
+    let cids: Vec<Option<CidMatch>> = sink
+        .bodies()
+        .into_iter()
+        .map(|ev| match ev {
+            ExecEvent::Fill(fill) => fill.cid,
+            ExecEvent::ResyncOrder(order) => order.cid,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(cids, [None, None, Some(CidMatch::Unparseable)]);
 }
 
 #[test]

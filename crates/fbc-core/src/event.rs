@@ -275,8 +275,9 @@ pub enum VenueOrderState {
 /// An order event.
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub struct OrderUpdate {
-    /// The client id read off the wire: ours, another namespace's, or not canonical.
-    pub cid: CidMatch,
+    /// The client id read off the wire: ours, another namespace's, or not canonical; `None`
+    /// when the event carries none ([`OrderCaps::cid_echoed_on_events`](crate::OrderCaps)).
+    pub cid: Option<CidMatch>,
     pub vid: Option<VenueOrderId>,
     pub inst: InstrumentId,
     pub side: Side,
@@ -323,7 +324,8 @@ impl Liquidity3 {
 pub struct FillEvent {
     /// What the fill is deduplicated by.
     pub key: FillKey,
-    pub cid: CidMatch,
+    /// The client id read off the wire; `None` when the fill carries none.
+    pub cid: Option<CidMatch>,
     pub vid: Option<VenueOrderId>,
     pub inst: InstrumentId,
     pub side: Side,
@@ -348,7 +350,8 @@ pub struct FillEvent {
 /// One order as a venue snapshot or query reports it.
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub struct VenueOrderSnapshot {
-    pub cid: CidMatch,
+    /// The client id read off the wire; `None` when the snapshot carries none.
+    pub cid: Option<CidMatch>,
     pub vid: VenueOrderId,
     pub inst: InstrumentId,
     pub side: Side,
