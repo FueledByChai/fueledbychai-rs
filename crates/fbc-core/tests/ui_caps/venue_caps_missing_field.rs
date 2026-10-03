@@ -46,6 +46,8 @@ fn main() {
                 next_time_reported: false,
             },
             stats: FeedSource::None,
+            mark: FeedSource::Stream,
+            index: FeedSource::None,
             ts_precision: Duration::from_millis(1),
             topology: ConnTopology::PerChannel,
             max_conn_lifetime: None,

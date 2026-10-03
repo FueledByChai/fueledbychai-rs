@@ -240,6 +240,10 @@ pub struct MdCaps {
     pub funding: FundingCaps,
     /// Where volume and open interest come from.
     pub stats: FeedSource,
+    /// Where the mark price ([`Feed::Mark`](crate::Feed::Mark)) comes from.
+    pub mark: FeedSource,
+    /// Where the index price ([`Feed::Index`](crate::Feed::Index)) comes from.
+    pub index: FeedSource,
     /// The resolution of the venue's timestamps.
     pub ts_precision: Duration,
     /// How subscriptions spread over connections.
