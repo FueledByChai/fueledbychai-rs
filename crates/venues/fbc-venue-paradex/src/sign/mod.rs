@@ -70,8 +70,7 @@ impl fmt::Debug for StarkKey {
     }
 }
 
-/// A Stark-curve signature. Paradex's wire carries it as `["r","s"]` in decimal; as a
-/// [`Sig`] it is r then s, each 32 bytes big-endian.
+/// A Stark-curve signature.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct StarkSig {
     pub r: Felt,
@@ -79,12 +78,13 @@ pub struct StarkSig {
 }
 
 impl StarkSig {
-    /// The 64 bytes r || s.
+    /// The signature as Paradex's wire carries it (the `signature` field of an order, and the
+    /// auth header): `["r","s"]` with both in decimal, as the Java signer writes it
+    /// (`ParadexTypedDataSigner.toParadexArray`). At most 159 bytes, within
+    /// [`fbc_core::MAX_SIG_LEN`].
     pub fn to_sig(&self) -> Sig {
-        let mut bytes = [0u8; 64];
-        bytes[..32].copy_from_slice(&self.r.to_bytes_be());
-        bytes[32..].copy_from_slice(&self.s.to_bytes_be());
-        Sig::new(&bytes).expect("64 bytes fit a Sig")
+        let wire = format!(r#"["{}","{}"]"#, self.r, self.s);
+        Sig::new(wire.as_bytes()).expect("a Stark signature's wire form fits a Sig")
     }
 }
 
@@ -279,17 +279,24 @@ mod tests {
     }
 
     #[test]
-    fn a_signature_is_r_then_s_big_endian() {
+    fn a_signature_is_the_paradex_decimal_array() {
         let sig = StarkSig {
             r: Felt::from(1u8),
-            s: Felt::from(2u8),
-        }
-        .to_sig();
-        let bytes = sig.as_bytes();
-        assert_eq!(bytes.len(), 64);
-        assert_eq!((bytes[31], bytes[63]), (1, 2));
-        assert!(bytes[..31].iter().chain(&bytes[32..63]).all(|b| *b == 0));
+            s: Felt::from(20u8),
+        };
+        assert_eq!(sig.to_sig().as_bytes(), br#"["1","20"]"#);
+        // The longest: r and s just below the curve order, 76 digits each, 159 bytes.
+        let top = Felt::from_dec_str(EC_ORDER).unwrap() - Felt::ONE;
+        let longest = StarkSig { r: top, s: top }.to_sig();
+        assert_eq!(longest.as_bytes().len(), 159);
+        assert_eq!(
+            longest.as_bytes(),
+            format!(r#"["{EC_ORDER_MINUS_ONE}","{EC_ORDER_MINUS_ONE}"]"#).as_bytes()
+        );
     }
+
+    const EC_ORDER_MINUS_ONE: &str =
+        "3618502788666131213697322783095070105526743751716087489154079457884512865582";
 
     #[test]
     fn a_hash_past_2_251_is_a_backend_refusal() {
