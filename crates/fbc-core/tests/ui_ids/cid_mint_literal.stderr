@@ -1,0 +1,12 @@
+error: cannot construct `CidMint` with struct literal syntax due to private fields
+ --> tests/ui_ids/cid_mint_literal.rs:5:20
+  |
+5 |     let mut mint = CidMint { last: 0 };
+  |                    ^^^^^^^   ------- private field
+  |
+  = note: ...and other private field `lease` that was not provided
+help: you might have meant to use the `new` associated function
+  |
+5 -     let mut mint = CidMint { last: 0 };
+5 +     let mut mint = CidMint::new(_, _, _, _);
+  |

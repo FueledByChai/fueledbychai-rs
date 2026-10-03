@@ -19,5 +19,7 @@ repository = "https://github.com/FueledByChai/fueledbychai-rs"
 publish = false
 
 [workspace.dependencies]
+arrayvec = { version = "0.7", default-features = false }
+compact_str = { version = "0.10", default-features = false }
 rust_decimal = { version = "1", default-features = false, features = ["std"] }
 trybuild = "1"

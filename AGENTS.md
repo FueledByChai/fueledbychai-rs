@@ -110,7 +110,8 @@ rather than guess.
 ### Layout
 
 - A Cargo workspace (0001, 0008). Only `crates/fbc-core` exists so far, with time, units,
-  price grids and exact prices; the rest are planned. Members are the `crates/fbc-*` glob; the
+  price grids, exact prices, sealed ids, the client-id codec, `NamespaceLease`, `CidMint` and
+  `DecodeScope`; the rest are planned. Members are the `crates/fbc-*` glob; the
   first venue crate adds `crates/venues/fbc-*` (Cargo rejects a member glob that matches
   nothing), and `fixtures/` is excluded from the workspace:
   - `crates/fbc-core`: the contract. Time, units, price grids and exact prices, sealed ids and

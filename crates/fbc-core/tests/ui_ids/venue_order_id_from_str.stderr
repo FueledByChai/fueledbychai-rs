@@ -1,0 +1,7 @@
+error[E0277]: the trait bound `VenueOrderId: From<&str>` is not satisfied
+ --> tests/ui_ids/venue_order_id_from_str.rs:4:49
+  |
+4 |     let _: VenueOrderId = "1759363200000201030".into();
+  |                                                 ^^^^ the trait `From<&str>` is not implemented for `VenueOrderId`
+  |
+  = note: required for `&str` to implement `Into<VenueOrderId>`

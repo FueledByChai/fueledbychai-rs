@@ -1,0 +1,11 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+ --> tests/ui_ids/venue_order_id_literal.rs:4:13
+  |
+4 |     let _ = VenueOrderId("1759363200000201030".into());
+  |             ^^^^^^^^^^^^
+  |
+note: constructor is not visible here due to private fields
+ --> src/ids.rs
+  |
+  | pub struct VenueOrderId(CompactString);
+  |                         ^^^^^^^^^^^^^ private field

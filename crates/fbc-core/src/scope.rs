@@ -1,0 +1,58 @@
+//! The decode scope: the only constructor of [`VenueOrderId`] and [`FillId`] (decision 0004,
+//! design §4.3).
+//!
+//! A [`DecodeScope`] cannot be built outside this crate. The core's [`dispatch`] makes one and
+//! lends it to a codec callback for the length of that callback; the callback cannot keep it.
+//! Adapters, and tests too (decision 0004: no back door), obtain venue ids only through it.
+
+use crate::cid::{ClientIdFormat, decode_cid};
+use crate::ids::{CidMatch, FillId, IdError, Namespace, VenueOrderId};
+
+/// What a codec callback decodes ids with. Lent by [`dispatch`]; never built elsewhere.
+#[derive(Debug)]
+pub struct DecodeScope<'a> {
+    fmt: &'a ClientIdFormat,
+    own: Namespace,
+    _seal: Seal,
+}
+
+/// Keeps [`DecodeScope`] unconstructible outside this crate even if its other fields go public.
+#[derive(Debug)]
+struct Seal;
+
+impl DecodeScope<'_> {
+    /// The venue's order id as sent: refused when empty or longer than
+    /// [`MAX_VENUE_ID_LEN`](crate::MAX_VENUE_ID_LEN) bytes.
+    pub fn venue_order_id(&self, wire: &str) -> Result<VenueOrderId, IdError> {
+        VenueOrderId::from_wire(wire)
+    }
+
+    /// The venue's fill id as sent: refused when empty or longer than
+    /// [`MAX_VENUE_ID_LEN`](crate::MAX_VENUE_ID_LEN) bytes.
+    pub fn fill_id(&self, wire: &str) -> Result<FillId, IdError> {
+        FillId::from_wire(wire)
+    }
+
+    /// A client id read off the wire, decoded with the venue's format against our namespace.
+    pub fn client_order_id(&self, wire: &str) -> CidMatch {
+        decode_cid(self.fmt, self.own, wire)
+    }
+}
+
+/// The core's dispatch: runs `callback` with a [`DecodeScope`] for a venue whose client ids use
+/// `fmt`, in the engine namespace `own`, and returns what the callback returns.
+///
+/// The scope is lent for any lifetime the callback must accept, so the callback cannot return
+/// or store it.
+pub fn dispatch<R>(
+    fmt: &ClientIdFormat,
+    own: Namespace,
+    callback: impl for<'s> FnOnce(&'s DecodeScope<'s>) -> R,
+) -> R {
+    let scope = DecodeScope {
+        fmt,
+        own,
+        _seal: Seal,
+    };
+    callback(&scope)
+}
