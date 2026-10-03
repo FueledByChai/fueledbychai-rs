@@ -33,7 +33,8 @@ use fbc_core::{
     SubmitOutcome, Subscription, Support, TagSet, Ticks, TifTag, TimerTag, TouchSourceCaps,
     TouchSourceId, TradeCaps, TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueCommand,
     VenueConfig, VenueError, VenueFactory, VenueFeeSign, VenueId, VenueMeta, VenueMode,
-    VenueOrderSnapshot, VenueOrderState, WallNs, WireSlice, decode_cid, dispatch, encode_cid,
+    VenueOrderId, VenueOrderSnapshot, VenueOrderState, WallNs, WireSlice, decode_cid, dispatch,
+    encode_cid,
 };
 use fbc_core::{AmendAck, Batch, Effect, Effects};
 use rust_decimal::Decimal;
@@ -637,7 +638,16 @@ impl ToyExec {
                 vid: f.opt("vid").map(|v| scope.venue_order_id(v)).transpose()?,
                 inst: f.inst(specs)?,
                 side: f.side()?,
-                state: VenueOrderState::Open,
+                state: match f.opt("state") {
+                    None => VenueOrderState::Open,
+                    Some("amended") => VenueOrderState::Amended {
+                        new_vid: f
+                            .opt("newvid")
+                            .map(|v| scope.venue_order_id(v))
+                            .transpose()?,
+                    },
+                    Some(_) => return Err(DecodeError::Malformed("state")),
+                },
                 cum_filled: f.lots("cum")?,
                 px: f.opt_num("px")?.map(Ticks),
                 qty: f.opt_num("qty")?.and_then(Lots::new),
@@ -2486,4 +2496,45 @@ fn a_cancel_signer_sees_only_the_reference_the_request_encodes() {
     let text = String::from_utf8(encode_once(&mut codec, &cancel, &ctx(9, 5, 1))).unwrap();
     assert_eq!(text, "rpc=11\ncancel|vid=V-1|ts=9");
     assert_eq!(*seen.lock().unwrap(), ["venue:V-1"]);
+}
+
+#[test]
+fn an_amended_order_states_its_new_price_and_total_once() {
+    // The amended price and total travel in the update's own px and qty; the state says only
+    // that the order was amended (and under which id), so the two cannot disagree. A venue that
+    // does not echo them gives None, never a value the codec made up.
+    let sink = decode_exec(
+        exec_codec().as_mut(),
+        &[
+            "ord|sym=TOY-PERP|vid=V-1|side=B|state=amended|px=130860|qty=20|cum=5|newvid=V-2",
+            "ord|sym=TOY-PERP|vid=V-2|side=B|state=amended|cum=5",
+        ],
+    );
+    let (v1, v2) = with_scope(|scope| {
+        (
+            scope.venue_order_id("V-1").unwrap(),
+            scope.venue_order_id("V-2").unwrap(),
+        )
+    });
+    let update = |vid: &VenueOrderId, new_vid, px, qty| {
+        ExecEvent::Order(OrderUpdate {
+            cid: None,
+            vid: Some(vid.clone()),
+            inst: INST,
+            side: Side::Buy,
+            state: VenueOrderState::Amended { new_vid },
+            cum_filled: Lots::new(5).unwrap(),
+            px,
+            qty,
+            post_only: None,
+            reduce_only: None,
+        })
+    };
+    assert_eq!(
+        sink.bodies(),
+        [
+            &update(&v1, Some(v2.clone()), Some(Ticks(130_860)), Lots::new(20)),
+            &update(&v2, None, None, None),
+        ]
+    );
 }
