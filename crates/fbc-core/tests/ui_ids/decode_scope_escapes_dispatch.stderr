@@ -1,0 +1,8 @@
+error: lifetime may not live long enough
+ --> tests/ui_ids/decode_scope_escapes_dispatch.rs:6:59
+  |
+6 |     let scope = dispatch(&fmt, Namespace::new(1), |scope| scope);
+  |                                                    ------ ^^^^^ returning this value requires that `'1` must outlive `'2`
+  |                                                    |    |
+  |                                                    |    return type of closure is &'2 DecodeScope<'_>
+  |                                                    has type `&'1 DecodeScope<'1>`

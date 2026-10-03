@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/ui_ids/mint_without_lease.rs:5:33
+  |
+5 |     let mut mint = CidMint::new(Namespace::new(1), 0, 0, WallNs(0));
+  |                    ------------ ^^^^^^^^^^^^^^^^^ expected `NamespaceLease`, found `Namespace`
+  |                    |
+  |                    arguments to this function are incorrect
+  |
+note: associated function defined here
+ --> src/mint.rs
+  |
+  |     pub fn new(
+  |            ^^^

@@ -10,6 +10,6 @@ Status: scaffolding. The Cargo workspace exists with one crate:
 
 | Crate | Status |
 | --- | --- |
-| `fbc-core` | Time kinds, units, exact prices (`PxExact`), money and price grids (fixed, significant-figure, banded) |
+| `fbc-core` | Time kinds, units, exact prices (`PxExact`), money and price grids (fixed, significant-figure, banded); sealed order and fill ids, the canonical client-id codec, restart-safe minting under a namespace lease, and `DecodeScope` |
 
 No venue is supported yet.

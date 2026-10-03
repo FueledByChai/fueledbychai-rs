@@ -1,6 +1,6 @@
 [package]
 name = "fbc-core"
-description = "The fueledbychai-rs contract: time, units, price grids and exact prices."
+description = "The fueledbychai-rs contract: time, units, price grids, exact prices and sealed ids."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,6 +9,8 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+arrayvec.workspace = true
+compact_str.workspace = true
 rust_decimal.workspace = true
 
 [dev-dependencies]

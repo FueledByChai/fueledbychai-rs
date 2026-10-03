@@ -1,0 +1,9 @@
+error: cannot construct `NamespaceLease` with struct literal syntax due to private fields
+ --> tests/ui_ids/namespace_lease_literal.rs:5:17
+  |
+5 |     let lease = NamespaceLease { account: AccountKey::new(1), ns: Namespace::new(1) };
+  |                 ^^^^^^^^^^^^^^   ---------------------------  --------------------- private field
+  |                                  |
+  |                                  private field
+  |
+  = note: ...and other private field `_file` that was not provided
