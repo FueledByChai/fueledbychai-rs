@@ -24,16 +24,16 @@ use fbc_core::{
     FeedSource, FieldSpec, FieldUnit, FillCaps, FillEvent, FillKey, FillSource, FundingCaps,
     FundingSpec, Header, HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag, InstrumentId,
     InstrumentKind, InstrumentSpec, ItemRef, Keepalive, KeepaliveKind, Liquidity3, Lots, Lvl,
-    MatchingCaps, MdCaps, MdCodec, MdEvent, MdSink, ModeScope, Money, MonoNs, Namespace,
-    NamespaceLease, NewOrder, NonceBlock, NonceScope, NotSentReason, OrderCaps, OrderKind,
-    OrderKindTag, OrderRef, OrderSigner, OrderUpdate, OrderingKey, PlaceWire, PriceGrid, PxExact,
-    QueryOrder, QueueModelQuality, RawFrame, Readiness, RefKind, Reject, RejectKind, RpcCall,
-    RpcId, SeqDomain, Side, Sig, SignError, SignedLots, SizeStep, SnapshotSource, SpecTable, Stamp,
-    StpScope, StreamId, SubmitOutcome, Subscription, Support, TagSet, Ticks, TifTag, TimerTag,
-    TouchSourceCaps, TouchSourceId, TradeCaps, TradingStatus, TrafficClass, UnderlyingId,
-    VenueCaps, VenueCommand, VenueConfig, VenueError, VenueFactory, VenueFeeSign, VenueId,
-    VenueMeta, VenueMode, VenueOrderSnapshot, VenueOrderState, WallNs, WireSlice, decode_cid,
-    dispatch, encode_cid,
+    MatchingCaps, MdCaps, MdCodec, MdEvent, MdSink, MdTransport, ModeScope, Money, MonoNs,
+    Namespace, NamespaceLease, NewOrder, NonceBlock, NonceScope, NotSentReason, OrderCaps,
+    OrderKind, OrderKindTag, OrderRef, OrderSigner, OrderUpdate, OrderingKey, PlaceWire, PriceGrid,
+    PxExact, QueryOrder, QueueModelQuality, RawFrame, Readiness, RefKind, Reject, RejectKind,
+    RpcCall, RpcId, SeqDomain, Side, Sig, SignError, SignedLots, SizeStep, SnapshotSource,
+    SpecTable, Stamp, StpScope, StreamId, SubmitOutcome, Subscription, Support, TagSet, Ticks,
+    TifTag, TimerTag, TouchSourceCaps, TouchSourceId, TradeCaps, TradingStatus, TrafficClass,
+    UnderlyingId, VenueCaps, VenueCommand, VenueConfig, VenueError, VenueFactory, VenueFeeSign,
+    VenueId, VenueMeta, VenueMode, VenueOrderSnapshot, VenueOrderState, WallNs, WireSlice,
+    decode_cid, dispatch, encode_cid,
 };
 use fbc_core::{AmendAck, Batch, Effect, Effects};
 use rust_decimal::Decimal;
@@ -51,6 +51,11 @@ const ANCHOR_TAG: HttpTag = HttpTag(2);
 const PING_TAG: TimerTag = TimerTag(1);
 const RESYNC_RETRY_TAG: TimerTag = TimerTag(2);
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
+/// The connectionless endpoint the toy's REST-only stats are polled on.
+const POLL_STREAM: StreamId = StreamId(2);
+const POLL_TAG: TimerTag = TimerTag(3);
+const STATS_TAG: HttpTag = HttpTag(3);
+const POLL_EVERY: Duration = Duration::from_secs(10);
 const URL_KEY: &str = "toy.url";
 /// The toy reports fees with a positive rebate, so the scope must flip their sign.
 const FEE_SIGN: VenueFeeSign = VenueFeeSign::PositiveIsRebate;
@@ -334,6 +339,104 @@ impl MdCodec for ToyMd {
             interval: Duration::from_secs(15),
             kind: KeepaliveKind::WsPing,
         })
+    }
+}
+
+/// The toy's codec for its REST-only stats: no connection, only the polls it asks for.
+struct ToyPoll {
+    base_url: String,
+    symbols: BTreeSet<String>,
+}
+
+impl MdCodec for ToyPoll {
+    fn on_open(&mut self, fx: &mut Effects) {
+        fx.push(Effect::Timer {
+            tag: POLL_TAG,
+            after: POLL_EVERY,
+        });
+    }
+
+    fn subscribe(
+        &mut self,
+        add: &[Subscription],
+        remove: &[Subscription],
+        specs: &SpecTable,
+        _fx: &mut Effects,
+    ) -> Result<(), VenueError> {
+        // Spell everything first, so a refusal changes nothing; the next poll asks for the rest.
+        let added = add.iter().map(|s| symbol_of(specs, s.inst));
+        let added = added.collect::<Result<Vec<_>, _>>()?;
+        let removed = remove.iter().map(|s| symbol_of(specs, s.inst));
+        let removed = removed.collect::<Result<Vec<_>, _>>()?;
+        self.symbols.extend(added.into_iter().map(str::to_owned));
+        removed.into_iter().for_each(|sym| {
+            self.symbols.remove(sym);
+        });
+        Ok(())
+    }
+
+    fn on_frame(
+        &mut self,
+        _f: RawFrame<'_>,
+        _scope: &DecodeScope<'_>,
+        _specs: &SpecTable,
+        _sink: &mut dyn MdSink,
+        _fx: &mut Effects,
+    ) -> Result<(), DecodeError> {
+        Err(DecodeError::Malformed("a poll endpoint has no frames"))
+    }
+
+    fn on_http(
+        &mut self,
+        tag: HttpTag,
+        resp: Result<HttpResponse<'_>, HttpFailure>,
+        _scope: &DecodeScope<'_>,
+        specs: &SpecTable,
+        sink: &mut dyn MdSink,
+        _fx: &mut Effects,
+    ) -> Result<(), DecodeError> {
+        let resp = match resp {
+            Ok(resp) if tag == STATS_TAG && resp.status == 200 => resp,
+            // No answer: the next poll is already scheduled.
+            Err(_) if tag == STATS_TAG => return Ok(()),
+            _ => return Err(DecodeError::Malformed("stats response")),
+        };
+        let body = std::str::from_utf8(resp.body).map_err(|_| DecodeError::Malformed("body"))?;
+        for line in body.lines() {
+            let f = Frame::parse(line)?;
+            let event = MdEvent::Stats {
+                inst: f.inst(specs)?,
+                volume_24h_quote: f.opt_usdc("vol")?,
+                oi: f.opt_num("oi")?.and_then(Lots::new),
+            };
+            sink.push(f.meta()?, event);
+        }
+        Ok(())
+    }
+
+    fn on_timer(&mut self, tag: TimerTag, _now: MonoNs, _wall: WallNs, fx: &mut Effects) {
+        assert_eq!(tag, POLL_TAG);
+        let symbols: Vec<&str> = self.symbols.iter().map(String::as_str).collect();
+        fx.push(Effect::Http {
+            tag: STATS_TAG,
+            req: HttpRequest {
+                method: HttpMethod::Get,
+                url: format!("{}/stats?symbols={}", self.base_url, symbols.join(",")),
+                headers: vec![],
+                body: WireSlice::plain(Vec::new()),
+            },
+            rpc: None,
+            timeout: RPC_TIMEOUT,
+            class: TrafficClass::Normal,
+        });
+        fx.push(Effect::Timer {
+            tag: POLL_TAG,
+            after: POLL_EVERY,
+        });
+    }
+
+    fn keepalive(&self) -> Option<Keepalive> {
+        None
     }
 }
 
@@ -830,20 +933,34 @@ impl VenueFactory for ToyFactory {
         specs: &SpecTable,
         subs: &BTreeSet<Subscription>,
     ) -> Result<Vec<EndpointPlan>, VenueError> {
+        let base = url(cfg)?;
         let mut symbols = BTreeSet::new();
         for sub in subs {
             symbols.insert(symbol_of(specs, sub.inst)?);
         }
+        // Stats are REST-only (MdCaps::stats is Poll): they go on a connectionless endpoint.
+        let (polled, streamed): (Vec<Subscription>, Vec<Subscription>) =
+            subs.iter().partition(|s| s.feed == Feed::Stats);
         let symbols: Vec<&str> = symbols.into_iter().collect();
-        let mut url = format!("{}/md", url(cfg)?);
+        let mut url = format!("{base}/md");
         if !symbols.is_empty() {
             url = format!("{url}?symbols={}", symbols.join(","));
         }
-        Ok(vec![EndpointPlan {
+        let mut plan = vec![EndpointPlan {
             stream: StreamId(0),
-            url,
-            subs: subs.iter().copied().collect(),
-        }])
+            transport: MdTransport::Socket { url },
+            subs: streamed,
+        }];
+        if !polled.is_empty() {
+            plan.push(EndpointPlan {
+                stream: POLL_STREAM,
+                transport: MdTransport::Poll {
+                    base_url: base.to_owned(),
+                },
+                subs: polled,
+            });
+        }
+        Ok(plan)
     }
 
     fn plan_exec(&self, cfg: &VenueConfig) -> Result<Vec<ExecEndpoint>, VenueError> {
@@ -853,8 +970,14 @@ impl VenueFactory for ToyFactory {
         }])
     }
 
-    fn md_codec(&self, _cfg: &VenueConfig, _ep: &EndpointPlan) -> Box<dyn MdCodec> {
-        Box::new(ToyMd { pings: 0 })
+    fn md_codec(&self, _cfg: &VenueConfig, ep: &EndpointPlan) -> Box<dyn MdCodec> {
+        match &ep.transport {
+            MdTransport::Socket { .. } => Box::new(ToyMd { pings: 0 }),
+            MdTransport::Poll { base_url } => Box::new(ToyPoll {
+                base_url: base_url.clone(),
+                symbols: BTreeSet::new(),
+            }),
+        }
     }
 
     fn exec_codec(&self, cfg: &VenueConfig) -> Option<Result<Box<dyn ExecCodec>, VenueError>> {
@@ -947,7 +1070,7 @@ fn toy_caps() -> VenueCaps {
                 interval_reported: true,
                 next_time_reported: true,
             },
-            stats: FeedSource::None,
+            stats: FeedSource::Poll,
             mark: FeedSource::Stream,
             index: FeedSource::None,
             ts_precision: Duration::from_nanos(1),
@@ -1486,7 +1609,12 @@ fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
     // (in the URL and in the subscription frames), not the library's instrument id.
     let plan = factory.plan_md(&config(), &specs(), &subs).unwrap();
     assert_eq!(plan.len(), 1);
-    assert_eq!(plan[0].url, "https://toy.invalid/md?symbols=TOY-PERP");
+    assert_eq!(
+        plan[0].transport,
+        MdTransport::Socket {
+            url: "https://toy.invalid/md?symbols=TOY-PERP".to_owned()
+        }
+    );
     let mut md = factory.md_codec(&config(), &plan[0]);
     let mut fx = Effects::new();
     md.on_open(&mut fx);
@@ -1899,4 +2027,118 @@ fn an_amend_naming_the_order_only_by_client_id_is_not_sent() {
     let refused = exec_codec().encode(&amend, RpcId(18), &specs(), &ctx(9, 4, 1), &mut fx);
     assert_eq!(refused, Err(NotSentReason::Unsupported));
     assert!(fx.is_empty());
+}
+
+#[test]
+fn a_poll_only_feed_is_planned_without_a_connection_and_polled_over_http() {
+    // The toy publishes stats only over REST (MdCaps::stats is Poll). Its plan puts them on an
+    // endpoint the runtime opens no connection for; the codec built for it gets its data only
+    // through the HTTP requests it asks for, driven by its own timer.
+    let factory: &dyn VenueFactory = &ToyFactory;
+    assert_eq!(factory.caps(&config()).unwrap().md.stats, FeedSource::Poll);
+    let book = Subscription {
+        inst: INST,
+        feed: Feed::Book(0),
+    };
+    let stats = Subscription {
+        inst: INST,
+        feed: Feed::Stats,
+    };
+    let subs: BTreeSet<Subscription> = [book, stats].into_iter().collect();
+    let plan = factory.plan_md(&config(), &specs(), &subs).unwrap();
+    assert_eq!(
+        plan,
+        [
+            EndpointPlan {
+                stream: StreamId(0),
+                transport: MdTransport::Socket {
+                    url: "https://toy.invalid/md?symbols=TOY-PERP".to_owned()
+                },
+                subs: vec![book],
+            },
+            EndpointPlan {
+                stream: POLL_STREAM,
+                transport: MdTransport::Poll {
+                    base_url: "https://toy.invalid".to_owned()
+                },
+                subs: vec![stats],
+            },
+        ]
+    );
+
+    let mut poll = factory.md_codec(&config(), &plan[1]);
+    assert_eq!(poll.keepalive(), None);
+    let mut fx = Effects::new();
+    poll.on_open(&mut fx);
+    poll.subscribe(&plan[1].subs, &[], &specs(), &mut fx)
+        .unwrap();
+    poll.on_timer(POLL_TAG, MonoNs(5), WallNs(6), &mut fx);
+    let effects = fx.take();
+    // Nothing is ever sent as a frame: the endpoint has no connection.
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::Send { .. } | Effect::Reconnect { .. })),
+        "{effects:?}"
+    );
+    let first_timer = Effect::Timer {
+        tag: POLL_TAG,
+        after: POLL_EVERY,
+    };
+    assert_eq!(effects[0], first_timer);
+    let Effect::Http { tag, req, .. } = &effects[1] else {
+        panic!("expected the stats poll: {effects:?}");
+    };
+    assert_eq!(*tag, STATS_TAG);
+    assert_eq!(req.url, "https://toy.invalid/stats?symbols=TOY-PERP");
+    assert_eq!(effects[2], first_timer, "the next poll is scheduled");
+
+    let (specs, mut sink) = (specs(), Collect::new());
+    with_scope(|scope| {
+        let resp = HttpResponse {
+            status: 200,
+            headers: &[],
+            body: b"stats|sym=TOY-PERP|vol=987000000000|oi=4200",
+        };
+        poll.on_http(STATS_TAG, Ok(resp), scope, &specs, &mut sink, &mut fx)
+            .unwrap();
+        // A poll that got no answer decodes nothing; the timer already asked for the next.
+        poll.on_http(
+            STATS_TAG,
+            Err(HttpFailure::TimedOut),
+            scope,
+            &specs,
+            &mut sink,
+            &mut fx,
+        )
+        .unwrap();
+        // A poll endpoint has no frames, and a response it did not ask for is refused.
+        let frame = poll.on_frame(RawFrame::Text("x"), scope, &specs, &mut sink, &mut fx);
+        assert!(frame.is_err());
+        let stray = poll.on_http(
+            ANCHOR_TAG,
+            Err(HttpFailure::Lost),
+            scope,
+            &specs,
+            &mut sink,
+            &mut fx,
+        );
+        assert_eq!(stray, Err(DecodeError::Malformed("stats response")));
+    });
+    assert!(fx.is_empty());
+    // Unsubscribing drops the symbol from the next poll.
+    poll.subscribe(&[], &plan[1].subs, &specs, &mut fx).unwrap();
+    poll.on_timer(POLL_TAG, MonoNs(7), WallNs(8), &mut fx);
+    assert!(matches!(
+        &fx.as_slice()[0],
+        Effect::Http { req, .. } if req.url == "https://toy.invalid/stats?symbols="
+    ));
+    assert_eq!(
+        sink.bodies(),
+        [&MdEvent::Stats {
+            inst: INST,
+            volume_24h_quote: Some(Money::new(987_000_000_000, usdc())),
+            oi: Lots::new(4_200),
+        }]
+    );
 }

@@ -149,12 +149,30 @@ impl From<ConfigError> for VenueError {
     }
 }
 
-/// One market-data connection the runtime opens: its stream, its URL and what it carries.
+/// One market-data endpoint: its stream, how its data arrives, and what it carries. The runtime
+/// builds one [`MdCodec`] per endpoint (per connection epoch for a socket), calls its `on_open`
+/// once the endpoint is ready, then `subscribe` with `subs`.
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub struct EndpointPlan {
+    /// Names the endpoint in effects, the journal and the codec's timers and requests.
     pub stream: StreamId,
-    pub url: String,
+    pub transport: MdTransport,
     pub subs: Vec<Subscription>,
+}
+
+/// How a market-data endpoint's data arrives.
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+pub enum MdTransport {
+    /// A streaming connection the runtime opens at `url`; `on_open` is called when it is open.
+    Socket { url: String },
+    /// No connection: a venue that publishes these feeds only over REST
+    /// ([`FeedSource::Poll`](crate::FeedSource::Poll)). The runtime opens nothing and calls
+    /// `on_open` as soon as the codec is built; the codec gets its data only through the
+    /// [`Effect::Http`](crate::Effect::Http) requests it asks for under `base_url`, paced by its
+    /// own [`Effect::Timer`](crate::Effect::Timer)s. Its `keepalive` is `None`, and an
+    /// [`Effect::Send`](crate::Effect::Send) or [`Effect::Reconnect`](crate::Effect::Reconnect)
+    /// naming its stream is a codec defect the runtime refuses.
+    Poll { base_url: String },
 }
 
 /// One order-entry connection the runtime opens for an account session; when it is open the
@@ -177,15 +195,17 @@ pub trait VenueFactory: Sync + 'static {
     fn config_schema(&self) -> &'static [FieldSpec];
     /// What the venue can do under `cfg`.
     fn caps(&self, cfg: &VenueConfig) -> Result<VenueCaps, ConfigError>;
-    /// How `subs` spread over connections, with each instrument spelled as `specs` says (a
-    /// venue may put its symbols in the URL). `Err` names an instrument missing from `specs`.
+    /// How `subs` spread over endpoints: connections, and for feeds the venue offers only over
+    /// REST, connectionless poll endpoints ([`MdTransport`]). Each instrument is spelled as
+    /// `specs` says (a venue may put its symbols in the URL). `Err` names an instrument missing
+    /// from `specs`, or the configuration refused.
     fn plan_md(
         &self,
         cfg: &VenueConfig,
         specs: &SpecTable,
         subs: &BTreeSet<Subscription>,
     ) -> Result<Vec<EndpointPlan>, VenueError>;
-    /// A market-data codec for one connection epoch of `ep`.
+    /// A market-data codec for `ep`: for a socket, one connection epoch of it.
     fn md_codec(&self, cfg: &VenueConfig, ep: &EndpointPlan) -> Box<dyn MdCodec>;
     /// The order-entry connections to open under `cfg`; empty for a venue whose order entry is
     /// HTTP only, or that has none.
