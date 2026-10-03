@@ -128,6 +128,9 @@ pub enum VenueError {
     Config(ConfigError),
     /// The instrument is missing from the spec table, so the venue cannot spell it.
     UnknownInstrument(InstrumentId),
+    /// The venue does not offer this feed ([`MdCaps`](crate::MdCaps) says so): nothing is
+    /// planned or sent for it.
+    UnsupportedFeed(Subscription),
 }
 
 impl fmt::Display for VenueError {
@@ -137,6 +140,12 @@ impl fmt::Display for VenueError {
             VenueError::UnknownInstrument(inst) => {
                 write!(f, "instrument {} is not in the spec table", inst.get())
             }
+            VenueError::UnsupportedFeed(sub) => write!(
+                f,
+                "instrument {} has no {:?} feed on this venue",
+                sub.inst.get(),
+                sub.feed
+            ),
         }
     }
 }
