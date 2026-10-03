@@ -2769,3 +2769,35 @@ fn a_venue_config_debug_shows_keys_and_value_lengths_only() {
         "{shown}"
     );
 }
+
+#[test]
+fn a_url_span_over_a_delimiter_still_leaves_the_rest_of_the_query_hidden() {
+    // The query, fragment and user information are found in the URL as written, before any
+    // span is replaced: a span that swallows the `?`, `#` or `@` cannot expose what follows.
+    let cases = [
+        (
+            "https://venue.invalid/x?api_key=SECRET&other=TOKEN2",
+            "?api_key=SECRET",
+        ),
+        ("https://venue.invalid/x#SECRET&TOKEN2", "#SECRET"),
+        (
+            "https://user:SECRET@venue.invalid/TOKEN2?TOKEN2",
+            ":SECRET@",
+        ),
+    ];
+    for (text, marked) in cases {
+        let start = text.find(marked).unwrap();
+        let span = u32::try_from(start).unwrap()..u32::try_from(start + marked.len()).unwrap();
+        let url = WireUrl::redacted(text.to_owned(), std::iter::once(span).collect()).unwrap();
+        let shown = format!("{url:?}");
+        assert!(!shown.contains("SECRET"), "{shown}");
+        // The path is shown (only a span hides it); the query and fragment never are.
+        let path_token = text.contains('@');
+        assert_eq!(
+            shown.matches("TOKEN2").count(),
+            usize::from(path_token),
+            "{shown}"
+        );
+        assert!(shown.contains("venue.invalid"), "{shown}");
+    }
+}

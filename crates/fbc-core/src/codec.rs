@@ -164,17 +164,13 @@ impl PartialEq<&str> for WireUrl {
 
 impl fmt::Debug for WireUrl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut shown = String::with_capacity(self.text.len());
-        let mut at = 0;
-        for span in &self.redact {
-            // In bounds and on character boundaries: `WireUrl::redacted` checked every span.
-            let (start, end) = (span.start as usize, span.end as usize);
-            shown.push_str(&self.text[at..start]);
-            shown.push_str(&format!("<redacted {} bytes>", end - start));
-            at = end;
-        }
-        shown.push_str(&self.text[at..]);
-        fmt::Debug::fmt(&ShownUrl(&shown), f)
+        fmt::Debug::fmt(
+            &ShownUrl {
+                url: &self.text,
+                redact: &self.redact,
+            },
+            f,
+        )
     }
 }
 
@@ -323,16 +319,36 @@ impl fmt::Debug for HttpRequest {
     }
 }
 
-/// A URL with its user information, query and fragment shown by length only.
-struct ShownUrl<'a>(&'a str);
+/// A URL with its user information, query and fragment shown by length only, and its
+/// redaction spans replaced inside what is shown. The structure is found in the URL as written,
+/// before any span is replaced, so a span covering a `?`, `#` or `@` cannot expose what follows.
+struct ShownUrl<'a> {
+    url: &'a str,
+    redact: &'a [Range<u32>],
+}
+
+impl ShownUrl<'_> {
+    /// Writes `url[from..to]` escaped, with every span's part inside it redacted. `from` and
+    /// `to` are character boundaries (ASCII delimiters or the ends), and so is every span end.
+    fn write_part(&self, f: &mut fmt::Formatter<'_>, from: usize, to: usize) -> fmt::Result {
+        let mut at = from;
+        for span in self.redact {
+            let (start, end) = ((span.start as usize).max(from), (span.end as usize).min(to));
+            if start < end {
+                write!(f, "{}", self.url[at..start].escape_debug())?;
+                write!(f, "<redacted {} bytes>", end - start)?;
+                at = end;
+            }
+        }
+        write!(f, "{}", self.url[at..to].escape_debug())
+    }
+}
 
 impl fmt::Debug for ShownUrl<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let url = self.0;
-        let (head, tail) = match url.find(['?', '#']) {
-            Some(at) => url.split_at(at),
-            None => (url, ""),
-        };
+        let url = self.url;
+        let tail_at = url.find(['?', '#']).unwrap_or(url.len());
+        let head = &url[..tail_at];
         f.write_str("\"")?;
         let after_scheme = head.find("://").map_or(0, |at| at + 3);
         let authority_end = head[after_scheme..]
@@ -340,14 +356,14 @@ impl fmt::Debug for ShownUrl<'_> {
             .map_or(head.len(), |at| after_scheme + at);
         match head[after_scheme..authority_end].rfind('@') {
             Some(at) => {
-                write!(f, "{}", head[..after_scheme].escape_debug())?;
+                self.write_part(f, 0, after_scheme)?;
                 write!(f, "<redacted {at} bytes>")?;
-                write!(f, "{}", head[after_scheme + at..].escape_debug())?;
+                self.write_part(f, after_scheme + at, tail_at)?;
             }
-            None => write!(f, "{}", head.escape_debug())?,
+            None => self.write_part(f, 0, tail_at)?,
         }
-        if let Some(sep) = tail.chars().next() {
-            write!(f, "{sep}<redacted {} bytes>", tail.len() - 1)?;
+        if let Some(sep) = url[tail_at..].chars().next() {
+            write!(f, "{sep}<redacted {} bytes>", url.len() - tail_at - 1)?;
         }
         f.write_str("\"")
     }
@@ -1124,7 +1140,7 @@ mod tests {
         let binary = format!("{:?}", WireSlice::plain(vec![b'a', 0xff, b'"']));
         assert!(binary.contains(r#""a\xff\"""#), "{binary}");
         // User information in a URL is a credential too; a URL without a query shows whole.
-        let shown = |url: &str| format!("{:?}", ShownUrl(url));
+        let shown = |url: &str| format!("{:?}", WireUrl::plain(url));
         assert_eq!(
             shown("wss://user:pw@venue.invalid/ws#frag"),
             r#""wss://<redacted 7 bytes>@venue.invalid/ws#<redacted 4 bytes>""#
