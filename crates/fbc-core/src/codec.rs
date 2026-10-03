@@ -541,9 +541,35 @@ impl EncodeCtx {
 }
 
 /// The nonces an encode used, per item, for the OMS to keep as each order's placement nonce.
+/// A codec fills it only through [`use_nonce`](EncodeReceipt::use_nonce), which takes each
+/// value from the [`EncodeCtx`], once per item, so a receipt never names a nonce the context
+/// did not reserve for that item.
 #[derive(Clone, Eq, PartialEq, Hash, Debug, Default)]
 pub struct EncodeReceipt {
-    pub nonces: Vec<(u16, u64)>,
+    nonces: Vec<(u16, u64)>,
+}
+
+impl EncodeReceipt {
+    /// No nonces used.
+    pub fn new() -> EncodeReceipt {
+        EncodeReceipt::default()
+    }
+
+    /// Takes item `item`'s nonce from `ctx`, records it, and returns it for the payload;
+    /// `None` past the reserved block or when `item` already took its nonce.
+    pub fn use_nonce(&mut self, ctx: &EncodeCtx, item: u16) -> Option<u64> {
+        if self.nonces.iter().any(|(used, _)| *used == item) {
+            return None;
+        }
+        let nonce = ctx.nonce(item)?;
+        self.nonces.push((item, nonce));
+        Some(nonce)
+    }
+
+    /// The nonces used, as `(item, nonce)` in the order they were taken.
+    pub fn nonces(&self) -> &[(u16, u64)] {
+        &self.nonces
+    }
 }
 
 /// Where the runtime gets nonces, scoped as the venue's
