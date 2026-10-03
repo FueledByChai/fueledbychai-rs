@@ -292,6 +292,18 @@ impl fmt::Debug for HttpResponse<'_> {
     }
 }
 
+/// Why an HTTP request got no response.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum HttpFailure {
+    /// No byte of the request was written (connect, TLS or proxy failure): the venue never saw
+    /// it.
+    NotSent,
+    /// The request was written and its timeout passed with no response.
+    TimedOut,
+    /// The connection failed after the request was written: the venue may have acted on it.
+    Lost,
+}
+
 /// Which traffic a frame is: safety traffic (cancels, reducing orders, keepalives,
 /// authentication) keeps flowing at a rate scope's safety floor when normal traffic stops.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
@@ -312,8 +324,10 @@ pub enum Effect {
         timeout: Option<Duration>,
         class: TrafficClass,
     },
-    /// Make `req`, handing the response to the codec's `on_http` with `tag`; with `rpc`, as for
-    /// [`Effect::Send`].
+    /// Make `req`, handing the codec's `on_http` the response with `tag`, or the
+    /// [`HttpFailure`] when none came: `timeout` passing without a response is
+    /// [`HttpFailure::TimedOut`]. `rpc` names an order-entry request (journal and rate scope);
+    /// unlike [`Effect::Send`], its timeout comes back to `on_http`, not `on_rpc_timeout`.
     Http {
         tag: HttpTag,
         req: HttpRequest,
@@ -616,11 +630,11 @@ pub trait MdCodec: Send {
         fx: &mut Effects,
     ) -> Result<(), DecodeError>;
     /// Decode the response to an HTTP request the codec asked for (a book anchor, a stats
-    /// poll).
+    /// poll), or learn why none came, to retry or recover by asking for effects.
     fn on_http(
         &mut self,
         tag: HttpTag,
-        resp: HttpResponse<'_>,
+        resp: Result<HttpResponse<'_>, HttpFailure>,
         scope: &DecodeScope<'_>,
         specs: &SpecTable,
         sink: &mut dyn MdSink,
@@ -657,11 +671,13 @@ pub trait ExecCodec: Send {
         sink: &mut dyn ExecSink,
         fx: &mut Effects,
     ) -> Result<(), DecodeError>;
-    /// Decode the response to an HTTP request the codec asked for.
+    /// Decode the response to an HTTP request the codec asked for, or learn why none came. For
+    /// an order-entry request (one with an `rpc`), a failure is that request's outcome:
+    /// [`HttpFailure::NotSent`] is `NotSent`, the others are `Unknown` and never resent.
     fn on_http(
         &mut self,
         tag: HttpTag,
-        resp: HttpResponse<'_>,
+        resp: Result<HttpResponse<'_>, HttpFailure>,
         scope: &DecodeScope<'_>,
         specs: &SpecTable,
         sink: &mut dyn ExecSink,
@@ -669,7 +685,8 @@ pub trait ExecCodec: Send {
     ) -> Result<(), DecodeError>;
     /// A timer the codec set fired (token refresh, keepalive, dead-man refresh).
     fn on_timer(&mut self, tag: TimerTag, ctx: &EncodeCtx, fx: &mut Effects);
-    /// Request `rpc` timed out unanswered: report `Outcome { item: None, Unknown }`.
+    /// Request `rpc`, sent as a frame ([`Effect::Send`]), timed out unanswered: report
+    /// `Outcome { item: None, Unknown }`.
     fn on_rpc_timeout(&mut self, rpc: RpcId, sink: &mut dyn ExecSink);
     /// Read the venue's open orders and positions (reads only), reported as the `Resync*`
     /// events.

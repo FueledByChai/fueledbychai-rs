@@ -28,10 +28,13 @@ stay sans-IO and deterministic:
 2. **Codecs report, the runtime stamps.** `MdSink`/`ExecSink` take `(VenueMeta, body)`; the
    runtime builds the `Envelope` with its `Stamp`, so a decoder cannot forge receive time or
    ingest order.
-3. **`Effect::Http` carries `rpc`, `timeout` and `class`, as `Effect::Send` does.** An order
-   sent over REST needs a request id so an unanswered request becomes `Outcome { item: None,
-   Unknown }` through `on_rpc_timeout` and is never resent (0005), and a traffic class so a REST
-   cancel keeps the safety floor. The journal's outbound HTTP record carries the `rpc` (0006).
+3. **`Effect::Http` carries `rpc`, `timeout` and `class`, and every HTTP request comes back.**
+   `on_http` takes `Result<HttpResponse, HttpFailure>`: a request that got no response returns
+   to its codec as `NotSent` (no byte written), `TimedOut` or `Lost` (written, connection
+   failed), so a codec can retry a snapshot or recover. An order sent over REST carries an
+   `rpc` naming it, and its failure is its outcome: `NotSent`, or `Unknown`, never resent
+   (0005). The traffic class keeps a REST cancel on the safety floor. The journal's outbound
+   HTTP record carries the `rpc` (0006).
 4. **Codecs get the spec table wherever they spell an instrument.** `on_http` (both codecs),
    `MdCodec::subscribe` and `VenueFactory::plan_md` take the `SpecTable`; `on_http`,
    `subscribe` and `plan_md` return `Result`, and `VenueError::UnknownInstrument` names an

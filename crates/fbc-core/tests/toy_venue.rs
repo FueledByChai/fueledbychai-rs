@@ -22,17 +22,17 @@ use fbc_core::{
     Continuity, DecodeError, DecodeScope, EncodeCtx, EncodeReceipt, Encoding, EndpointPlan,
     Envelope, ExchNs, ExchTsKind, ExecCodec, ExecEvent, ExecSink, Feed, FeedHealth, FeedSource,
     FieldSpec, FieldUnit, FillCaps, FillEvent, FillKey, FillSource, FundingCaps, FundingSpec,
-    Header, HttpMethod, HttpRequest, HttpResponse, HttpTag, InstrumentId, InstrumentKind,
-    InstrumentSpec, ItemRef, Keepalive, KeepaliveKind, Liquidity3, Lots, Lvl, MatchingCaps, MdCaps,
-    MdCodec, MdEvent, MdSink, ModeScope, Money, MonoNs, Namespace, NamespaceLease, NewOrder,
-    NonceBlock, NonceScope, NotSentReason, OrderCaps, OrderKind, OrderKindTag, OrderRef,
-    OrderSigner, OrderingKey, PlaceWire, PriceGrid, PxExact, QueueModelQuality, RawFrame,
-    Readiness, RefKind, Reject, RejectKind, RpcId, SeqDomain, Side, Sig, SignError, SignedLots,
-    SizeStep, SnapshotSource, SpecTable, Stamp, StpScope, StreamId, SubmitOutcome, Subscription,
-    Support, TagSet, Ticks, TifTag, TimerTag, TouchSourceCaps, TouchSourceId, TradeCaps,
-    TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueCommand, VenueConfig, VenueError,
-    VenueFactory, VenueFeeSign, VenueId, VenueMeta, VenueMode, VenueOrderSnapshot, VenueOrderState,
-    WallNs, WireSlice, dispatch, encode_cid,
+    Header, HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag, InstrumentId,
+    InstrumentKind, InstrumentSpec, ItemRef, Keepalive, KeepaliveKind, Liquidity3, Lots, Lvl,
+    MatchingCaps, MdCaps, MdCodec, MdEvent, MdSink, ModeScope, Money, MonoNs, Namespace,
+    NamespaceLease, NewOrder, NonceBlock, NonceScope, NotSentReason, OrderCaps, OrderKind,
+    OrderKindTag, OrderRef, OrderSigner, OrderingKey, PlaceWire, PriceGrid, PxExact,
+    QueueModelQuality, RawFrame, Readiness, RefKind, Reject, RejectKind, RpcId, SeqDomain, Side,
+    Sig, SignError, SignedLots, SizeStep, SnapshotSource, SpecTable, Stamp, StpScope, StreamId,
+    SubmitOutcome, Subscription, Support, TagSet, Ticks, TifTag, TimerTag, TouchSourceCaps,
+    TouchSourceId, TradeCaps, TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueCommand,
+    VenueConfig, VenueError, VenueFactory, VenueFeeSign, VenueId, VenueMeta, VenueMode,
+    VenueOrderSnapshot, VenueOrderState, WallNs, WireSlice, dispatch, encode_cid,
 };
 use fbc_core::{AmendAck, Batch, Effect, Effects};
 use rust_decimal::Decimal;
@@ -48,6 +48,7 @@ const EXEC_STREAM: StreamId = StreamId(1);
 const RESYNC_TAG: HttpTag = HttpTag(1);
 const ANCHOR_TAG: HttpTag = HttpTag(2);
 const PING_TAG: TimerTag = TimerTag(1);
+const RESYNC_RETRY_TAG: TimerTag = TimerTag(2);
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const URL_KEY: &str = "toy.url";
 /// The toy reports fees with a positive rebate, so the scope must flip their sign.
@@ -301,15 +302,16 @@ impl MdCodec for ToyMd {
     fn on_http(
         &mut self,
         tag: HttpTag,
-        resp: HttpResponse<'_>,
+        resp: Result<HttpResponse<'_>, HttpFailure>,
         _scope: &DecodeScope<'_>,
         specs: &SpecTable,
         sink: &mut dyn MdSink,
         _fx: &mut Effects,
     ) -> Result<(), DecodeError> {
-        if tag != ANCHOR_TAG || resp.status != 200 {
-            return Err(DecodeError::Malformed("anchor response"));
-        }
+        let resp = match resp {
+            Ok(resp) if tag == ANCHOR_TAG && resp.status == 200 => resp,
+            _ => return Err(DecodeError::Malformed("anchor response")),
+        };
         let body = std::str::from_utf8(resp.body).map_err(|_| DecodeError::Malformed("body"))?;
         ToyMd::decode_md(body, specs, sink)
     }
@@ -704,21 +706,33 @@ impl ExecCodec for ToyExec {
     fn on_http(
         &mut self,
         tag: HttpTag,
-        resp: HttpResponse<'_>,
+        resp: Result<HttpResponse<'_>, HttpFailure>,
         scope: &DecodeScope<'_>,
         specs: &SpecTable,
         sink: &mut dyn ExecSink,
-        _fx: &mut Effects,
+        fx: &mut Effects,
     ) -> Result<(), DecodeError> {
-        if tag != RESYNC_TAG || resp.status != 200 {
-            return Err(DecodeError::Malformed("resync response"));
-        }
+        let resp = match resp {
+            Ok(resp) if tag == RESYNC_TAG && resp.status == 200 => resp,
+            // No snapshot came: ask again in a second.
+            Err(_) if tag == RESYNC_TAG => {
+                fx.push(Effect::Timer {
+                    tag: RESYNC_RETRY_TAG,
+                    after: Duration::from_secs(1),
+                });
+                return Ok(());
+            }
+            _ => return Err(DecodeError::Malformed("resync response")),
+        };
         let body = std::str::from_utf8(resp.body).map_err(|_| DecodeError::Malformed("body"))?;
         body.lines()
             .try_for_each(|line| ToyExec::decode_exec(line, scope, specs, sink))
     }
 
     fn on_timer(&mut self, tag: TimerTag, ctx: &EncodeCtx, fx: &mut Effects) {
+        if tag == RESYNC_RETRY_TAG {
+            return self.resync(ctx, fx);
+        }
         assert_eq!(tag, PING_TAG);
         ToyExec::send(
             fx,
@@ -1307,8 +1321,18 @@ fn the_toy_decodes_market_data_frames_into_md_events() {
             body: b"snap|seq=7|sym=TOY-PERP|epoch=3|b=130865x12|a=130866x7",
         };
         codec
-            .on_http(ANCHOR_TAG, resp, scope, &specs, &mut sink, &mut fx)
+            .on_http(ANCHOR_TAG, Ok(resp), scope, &specs, &mut sink, &mut fx)
             .unwrap();
+        // A request that got no response comes back too, with why.
+        let lost = codec.on_http(
+            ANCHOR_TAG,
+            Err(HttpFailure::Lost),
+            scope,
+            &specs,
+            &mut sink,
+            &mut fx,
+        );
+        assert_eq!(lost, Err(DecodeError::Malformed("anchor response")));
         // A frame naming an instrument the table lacks, or no kind, is refused.
         let unknown = RawFrame::Text("touch|sym=NOPE-PERP");
         let refused = codec.on_frame(unknown, scope, &specs, &mut sink, &mut fx);
@@ -1474,7 +1498,7 @@ fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
     };
     let (specs, mut sink) = (specs(), Collect::new());
     with_scope(|scope| {
-        exec.on_http(RESYNC_TAG, resp, scope, &specs, &mut sink, &mut fx)
+        exec.on_http(RESYNC_TAG, Ok(resp), scope, &specs, &mut sink, &mut fx)
             .unwrap();
     });
     assert_eq!(
@@ -1491,6 +1515,33 @@ fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
             &ExecEvent::ResyncEnd,
         ]
     );
+
+    // A snapshot request that times out (or never went out) comes back to the codec, which
+    // asks for a retry; the retry timer requests the snapshot again. Nothing is decoded.
+    for failure in [
+        HttpFailure::TimedOut,
+        HttpFailure::NotSent,
+        HttpFailure::Lost,
+    ] {
+        let (mut sink, mut fx) = (Collect::new(), Effects::new());
+        with_scope(|scope| {
+            exec.on_http(RESYNC_TAG, Err(failure), scope, &specs, &mut sink, &mut fx)
+                .unwrap();
+        });
+        assert!(sink.out.is_empty());
+        assert_eq!(
+            fx.as_slice(),
+            [Effect::Timer {
+                tag: RESYNC_RETRY_TAG,
+                after: Duration::from_secs(1)
+            }]
+        );
+        exec.on_timer(RESYNC_RETRY_TAG, &ctx(2_000, 1, 1), &mut fx);
+        assert!(matches!(
+            &fx.as_slice()[1],
+            Effect::Http { tag: RESYNC_TAG, req, .. } if req.url.ends_with("at=2000")
+        ));
+    }
 }
 
 #[test]
