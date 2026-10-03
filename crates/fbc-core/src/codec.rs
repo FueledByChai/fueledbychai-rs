@@ -370,8 +370,9 @@ impl fmt::Debug for ShownUrl<'_> {
 }
 
 /// An HTTP response, handed back to the codec that asked for it. Its `Debug` shows the status,
-/// the header names and the body's length only: a response can carry a credential (a JWT in
-/// the body, a cookie in a header) that nothing marks.
+/// the number of headers and the body's length only: a response can carry a credential (a JWT
+/// in the body, a cookie in a header value, a key a proxy echoes in a header name) that
+/// nothing marks.
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub struct HttpResponse<'a> {
     pub status: u16,
@@ -381,10 +382,9 @@ pub struct HttpResponse<'a> {
 
 impl fmt::Debug for HttpResponse<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let names: Vec<&str> = self.headers.iter().map(|(name, _)| *name).collect();
         f.debug_struct("HttpResponse")
             .field("status", &self.status)
-            .field("header_names", &names)
+            .field("headers", &self.headers.len())
             .field("body_len", &self.body.len())
             .finish()
     }
@@ -1168,9 +1168,11 @@ mod tests {
             kind: KeepaliveKind::Frame(body),
         };
         let echoed = format!("{{\"jwt\":\"{secret}\"}}");
+        // A header name is venue text too (Codex r4173320331): a proxy can echo a key in one.
+        let echoed_name = format!("X-{secret}");
         let resp = HttpResponse {
             status: 200,
-            headers: &[("Set-Cookie", secret)],
+            headers: &[("Set-Cookie", secret), (&echoed_name, "1")],
             body: echoed.as_bytes(),
         };
         let shown = [
@@ -1190,7 +1192,7 @@ mod tests {
         // A URL shows its scheme, host and path; its query and fragment only by length.
         assert!(shown[0].contains("https://venue.invalid/auth?<redacted 61 bytes>"));
         assert!(shown[0].contains("redacted"));
-        assert!(shown[3].contains("200") && shown[3].contains("Set-Cookie"));
+        assert!(shown[3].contains("status: 200") && shown[3].contains("headers: 2"));
         assert!(shown[4].contains(&echoed.len().to_string()));
         // Bytes that are not UTF-8 are escaped one by one.
         let binary = format!("{:?}", WireSlice::plain(vec![b'a', 0xff, b'"']));

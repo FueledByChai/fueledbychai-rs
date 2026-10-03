@@ -112,7 +112,8 @@ stay sans-IO and deterministic:
 8. **`Debug` never shows a credential (0009).** `WireSlice`, `Header`, `HttpRequest`,
    `HttpResponse`, `RawFrame` and `Reject` format redaction spans, redacted header values, a
    URL's user information, query and fragment, response bodies, inbound frames and a venue's
-   reject text by length only. URLs are `WireUrl`s (`HttpRequest.url`, `ExecEndpoint.url`,
+   reject text by length only; an `HttpResponse` shows its status and the number of headers,
+   since a proxy can echo a key in a header name (Codex r4173320331). URLs are `WireUrl`s (`HttpRequest.url`, `ExecEndpoint.url`,
    `MdTransport`'s URLs) carrying credential spans like `WireSlice`, so the journal can hash
    a key in a path or query; their `Debug` finds user information, query and fragment in the
    URL as written, shows them by length, and redacts spans inside what it shows. A
