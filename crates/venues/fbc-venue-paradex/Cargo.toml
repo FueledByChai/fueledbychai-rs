@@ -1,0 +1,19 @@
+[package]
+name = "fbc-venue-paradex"
+description = "The Paradex venue adapter. So far only its signer: the SNIP-12 revision 0 typed-data hash and Stark-curve signature."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+fbc-core = { path = "../../fbc-core" }
+rust_decimal.workspace = true
+starknet-crypto.workspace = true
+sha3.workspace = true
+
+[dev-dependencies]
+starknet-core.workspace = true
+serde_json.workspace = true
