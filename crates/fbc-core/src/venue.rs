@@ -15,10 +15,10 @@ use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::caps::VenueCaps;
-use crate::codec::{EncodeCtx, EncodeReceipt, ExecCodec, MdCodec, Subscription};
+use crate::codec::{EncodeCtx, EncodeReceipt, ExecCodec, MdCodec, SpecTable, Subscription};
 use crate::command::{NotSentReason, VenueCommand};
 use crate::event::{RpcId, StreamId};
-use crate::ids::AccountKey;
+use crate::ids::{AccountKey, InstrumentId};
 
 /// Where a configuration key lives.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
@@ -103,17 +103,22 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// Why a venue could not build a codec.
+/// Why a venue could not plan connections, subscribe or build a codec.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum VenueError {
     /// The configuration was refused.
     Config(ConfigError),
+    /// The instrument is missing from the spec table, so the venue cannot spell it.
+    UnknownInstrument(InstrumentId),
 }
 
 impl fmt::Display for VenueError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             VenueError::Config(err) => write!(f, "venue configuration refused: {err}"),
+            VenueError::UnknownInstrument(inst) => {
+                write!(f, "instrument {} is not in the spec table", inst.get())
+            }
         }
     }
 }
@@ -146,8 +151,14 @@ pub trait VenueFactory: Sync + 'static {
     fn config_schema(&self) -> &'static [FieldSpec];
     /// What the venue can do under `cfg`.
     fn caps(&self, cfg: &VenueConfig) -> Result<VenueCaps, ConfigError>;
-    /// How `subs` spread over connections.
-    fn plan_md(&self, cfg: &VenueConfig, subs: &BTreeSet<Subscription>) -> Vec<EndpointPlan>;
+    /// How `subs` spread over connections, with each instrument spelled as `specs` says (a
+    /// venue may put its symbols in the URL). `Err` names an instrument missing from `specs`.
+    fn plan_md(
+        &self,
+        cfg: &VenueConfig,
+        specs: &SpecTable,
+        subs: &BTreeSet<Subscription>,
+    ) -> Result<Vec<EndpointPlan>, VenueError>;
     /// A market-data codec for one connection epoch of `ep`.
     fn md_codec(&self, cfg: &VenueConfig, ep: &EndpointPlan) -> Box<dyn MdCodec>;
     /// An order-entry codec, or `None` for a market-data-only venue.
@@ -201,6 +212,10 @@ mod tests {
         assert_eq!(
             venue.to_string(),
             "venue configuration refused: invalid configuration key ttl: not a duration"
+        );
+        assert_eq!(
+            VenueError::UnknownInstrument(InstrumentId::new(9)).to_string(),
+            "instrument 9 is not in the spec table"
         );
     }
 }

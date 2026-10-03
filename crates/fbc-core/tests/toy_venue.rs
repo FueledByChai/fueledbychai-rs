@@ -241,6 +241,14 @@ impl ToyMd {
     }
 }
 
+/// The venue's spelling of `inst`, from the spec table.
+fn symbol_of(specs: &SpecTable, inst: InstrumentId) -> Result<&str, VenueError> {
+    specs
+        .get(inst)
+        .map(|spec| spec.venue_symbol.as_wire())
+        .ok_or(VenueError::UnknownInstrument(inst))
+}
+
 impl MdCodec for ToyMd {
     fn on_open(&mut self, fx: &mut Effects) {
         fx.push(Effect::Timer {
@@ -249,19 +257,31 @@ impl MdCodec for ToyMd {
         });
     }
 
-    fn subscribe(&mut self, add: &[Subscription], remove: &[Subscription], fx: &mut Effects) {
+    fn subscribe(
+        &mut self,
+        add: &[Subscription],
+        remove: &[Subscription],
+        specs: &SpecTable,
+        fx: &mut Effects,
+    ) -> Result<(), VenueError> {
+        // Every instrument is spelled before anything is pushed, so a refusal pushes nothing.
+        let mut frames = Vec::new();
         for (verb, subs) in [("sub", add), ("unsub", remove)] {
             for sub in subs {
-                let frame = format!("{verb}|inst={}|feed={:?}", sub.inst.get(), sub.feed);
-                fx.push(Effect::Send {
-                    stream: StreamId(0),
-                    frame: WireSlice::plain(frame.into_bytes()),
-                    rpc: None,
-                    timeout: None,
-                    class: TrafficClass::Normal,
-                });
+                let symbol = symbol_of(specs, sub.inst)?;
+                frames.push(format!("{verb}|sym={symbol}|feed={:?}", sub.feed));
             }
         }
+        for frame in frames {
+            fx.push(Effect::Send {
+                stream: StreamId(0),
+                frame: WireSlice::plain(frame.into_bytes()),
+                rpc: None,
+                timeout: None,
+                class: TrafficClass::Normal,
+            });
+        }
+        Ok(())
     }
 
     fn on_frame(
@@ -755,12 +775,26 @@ impl VenueFactory for ToyFactory {
         Ok(toy_caps())
     }
 
-    fn plan_md(&self, cfg: &VenueConfig, subs: &BTreeSet<Subscription>) -> Vec<EndpointPlan> {
-        vec![EndpointPlan {
+    fn plan_md(
+        &self,
+        cfg: &VenueConfig,
+        specs: &SpecTable,
+        subs: &BTreeSet<Subscription>,
+    ) -> Result<Vec<EndpointPlan>, VenueError> {
+        let mut symbols = BTreeSet::new();
+        for sub in subs {
+            symbols.insert(symbol_of(specs, sub.inst)?);
+        }
+        let symbols: Vec<&str> = symbols.into_iter().collect();
+        let mut url = format!("{}/md", url(cfg).unwrap_or_default());
+        if !symbols.is_empty() {
+            url = format!("{url}?symbols={}", symbols.join(","));
+        }
+        Ok(vec![EndpointPlan {
             stream: StreamId(0),
-            url: format!("{}/md", url(cfg).unwrap_or_default()),
+            url,
             subs: subs.iter().copied().collect(),
-        }]
+        }])
     }
 
     fn md_codec(&self, _cfg: &VenueConfig, _ep: &EndpointPlan) -> Box<dyn MdCodec> {
@@ -1236,7 +1270,9 @@ fn encode_takes_time_and_nonces_only_from_the_encode_ctx() {
 fn the_toy_decodes_market_data_frames_into_md_events() {
     let mut codec = ToyFactory.md_codec(
         &config(),
-        &ToyFactory.plan_md(&config(), &BTreeSet::new())[0],
+        &ToyFactory
+            .plan_md(&config(), &specs(), &BTreeSet::new())
+            .unwrap()[0],
     );
     let (specs, mut sink, mut fx) = (specs(), Collect::new(), Effects::new());
     let lines = [
@@ -1350,13 +1386,15 @@ fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
         .into_iter()
         .map(|feed| Subscription { inst: INST, feed })
         .collect();
-    let plan = factory.plan_md(&config(), &subs);
+    // Planning and subscribing see the spec table, so the venue's own symbol goes on the wire
+    // (in the URL and in the subscription frames), not the library's instrument id.
+    let plan = factory.plan_md(&config(), &specs(), &subs).unwrap();
     assert_eq!(plan.len(), 1);
-    assert_eq!(plan[0].url, "https://toy.invalid/md");
+    assert_eq!(plan[0].url, "https://toy.invalid/md?symbols=TOY-PERP");
     let mut md = factory.md_codec(&config(), &plan[0]);
     let mut fx = Effects::new();
     md.on_open(&mut fx);
-    md.subscribe(&plan[0].subs, &[], &mut fx);
+    md.subscribe(&plan[0].subs, &[], &specs(), &mut fx).unwrap();
     md.on_timer(PING_TAG, MonoNs(5), WallNs(6), &mut fx);
     let sent: Vec<&[u8]> = fx
         .as_slice()
@@ -1369,8 +1407,8 @@ fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
     assert_eq!(
         sent,
         [
-            b"sub|inst=7|feed=Touch(TouchSourceId(0))".as_slice(),
-            b"sub|inst=7|feed=Book(0)",
+            b"sub|sym=TOY-PERP|feed=Touch(TouchSourceId(0))".as_slice(),
+            b"sub|sym=TOY-PERP|feed=Book(0)",
             b"ping|n=1|at=6"
         ]
     );
@@ -1379,6 +1417,23 @@ fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
         Effect::Timer { tag: PING_TAG, .. }
     ));
     assert_eq!(md.keepalive().map(|k| k.kind), Some(KeepaliveKind::WsPing));
+
+    // An instrument missing from the spec table cannot be spelled: planning and subscribing
+    // refuse it by id, and subscribing pushes nothing, not even for the instruments it knows.
+    let stranger = Subscription {
+        inst: InstrumentId::new(99),
+        feed: Feed::Trades,
+    };
+    let unknown = Err(VenueError::UnknownInstrument(InstrumentId::new(99)));
+    let mixed: BTreeSet<Subscription> = subs.iter().copied().chain([stranger]).collect();
+    assert_eq!(factory.plan_md(&config(), &specs(), &mixed), unknown);
+    let mut fx = Effects::new();
+    let refused = md.subscribe(&plan[0].subs, &[stranger], &specs(), &mut fx);
+    assert_eq!(
+        refused,
+        Err(VenueError::UnknownInstrument(InstrumentId::new(99)))
+    );
+    assert!(fx.is_empty());
 
     // The exec codec opens, pings and resyncs by asking for effects, and decodes the resync
     // response it asked for.
