@@ -62,10 +62,47 @@ pub struct FieldSpec {
 /// keys ([`ConfigScope::Market`]) hold one value per instrument
 /// ([`insert_market`](VenueConfig::insert_market)), so markets sharing a connection keep
 /// their own settings.
-#[derive(Clone, Eq, PartialEq, Hash, Debug, Default)]
+///
+/// Its `Debug` shows each key and its value's length only: a value can be a credential-bearing
+/// URL or a private account id (0009).
+#[derive(Clone, Eq, PartialEq, Hash, Default)]
 pub struct VenueConfig {
     values: BTreeMap<String, String>,
     markets: BTreeMap<InstrumentId, BTreeMap<String, String>>,
+}
+
+/// Configuration values by key, each shown by its length only.
+struct ShownValues<'a>(&'a BTreeMap<String, String>);
+
+/// A value's length, standing in for the value.
+struct Len(usize);
+
+impl fmt::Debug for Len {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<{} bytes>", self.0)
+    }
+}
+
+impl fmt::Debug for ShownValues<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map()
+            .entries(self.0.iter().map(|(key, value)| (key, Len(value.len()))))
+            .finish()
+    }
+}
+
+impl fmt::Debug for VenueConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let markets: BTreeMap<&InstrumentId, ShownValues<'_>> = self
+            .markets
+            .iter()
+            .map(|(inst, values)| (inst, ShownValues(values)))
+            .collect();
+        f.debug_struct("VenueConfig")
+            .field("values", &ShownValues(&self.values))
+            .field("markets", &markets)
+            .finish()
+    }
 }
 
 impl VenueConfig {

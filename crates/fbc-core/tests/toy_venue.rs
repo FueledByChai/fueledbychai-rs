@@ -2749,3 +2749,23 @@ fn an_encode_receipt_holds_only_nonces_taken_from_the_context() {
     assert_eq!(receipt.use_nonce(&at, 0), Some(700));
     assert_eq!(receipt.nonces(), [(1, 701), (0, 700)]);
 }
+
+#[test]
+fn a_venue_config_debug_shows_keys_and_value_lengths_only() {
+    // A consumer's configuration can hold a credential-bearing URL or an account address; a
+    // diagnostic that formats it shows which keys are set, not what they hold.
+    let secret = "SYNTHETIC-CONFIG-SECRET";
+    let mut cfg = VenueConfig::new();
+    cfg.insert(URL_KEY, &format!("https://{secret}@toy.invalid"));
+    cfg.insert_market(INST, "toy.account", secret);
+    let shown = format!("{cfg:?}");
+    assert!(!shown.contains(secret), "{shown}");
+    assert!(
+        shown.contains(URL_KEY) && shown.contains("toy.account"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains(&format!("<{} bytes>", secret.len())),
+        "{shown}"
+    );
+}
