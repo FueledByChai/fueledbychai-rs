@@ -1,0 +1,7 @@
+error[E0277]: the trait bound `Fee: From<f64>` is not satisfied
+ --> tests/ui_fee/fee_from_f64.rs:5:28
+  |
+5 |     let _: Fee = 0.0125f64.into();
+  |                            ^^^^ the trait `From<f64>` is not implemented for `Fee`
+  |
+  = note: required for `f64` to implement `Into<Fee>`

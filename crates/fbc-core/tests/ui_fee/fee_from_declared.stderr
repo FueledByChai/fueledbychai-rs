@@ -1,0 +1,14 @@
+error[E0624]: associated function `from_declared` is private
+ --> tests/ui_fee/fee_from_declared.rs:5:18
+  |
+5 |       let _ = Fee::from_declared(1, AssetSym::new("USDC").unwrap(), VenueFeeSign::PositiveIsCost);
+  |                    ^^^^^^^^^^^^^ private associated function
+  |
+ ::: src/fee.rs
+  |
+  | /     pub(crate) fn from_declared(
+  | |         raw_nanos: i128,
+  | |         asset: AssetSym,
+  | |         sign: VenueFeeSign,
+  | |     ) -> Result<Fee, FeeError> {
+  | |______________________________- private associated function defined here

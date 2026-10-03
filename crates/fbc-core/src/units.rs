@@ -396,6 +396,21 @@ pub enum Aggressor {
     Unknown,
 }
 
+/// The channel an order goes through: the public book, or the venue's retail price
+/// improvement (RPI) book where it has one.
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+pub enum Channel {
+    Public,
+    Rpi,
+}
+
+/// Whether one of our orders made liquidity (rested and was hit) or took it.
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+pub enum Liquidity {
+    Maker,
+    Taker,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

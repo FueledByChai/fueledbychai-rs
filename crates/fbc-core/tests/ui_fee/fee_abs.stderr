@@ -1,0 +1,5 @@
+error[E0599]: no method named `abs` found for struct `Fee` in the current scope
+ --> tests/ui_fee/fee_abs.rs:5:17
+  |
+5 |     let _ = fee.abs();
+  |                 ^^^ method not found in `Fee`

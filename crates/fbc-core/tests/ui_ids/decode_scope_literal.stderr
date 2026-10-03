@@ -6,4 +6,4 @@ error: cannot construct `DecodeScope<'_>` with struct literal syntax due to priv
   |                               |
   |                               private field
   |
-  = note: ...and other private field `_seal` that was not provided
+  = note: ...and other private fields `fee_sign` and `_seal` that were not provided

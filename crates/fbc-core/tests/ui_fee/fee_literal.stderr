@@ -1,0 +1,11 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+ --> tests/ui_fee/fee_literal.rs:5:13
+  |
+5 |     let _ = Fee(Money::new(1, AssetSym::new("USDC").unwrap()));
+  |             ^^^
+  |
+note: constructor is not visible here due to private fields
+ --> src/fee.rs
+  |
+  | pub struct Fee(Money);
+  |                ^^^^^ private field
