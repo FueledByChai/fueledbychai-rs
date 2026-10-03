@@ -322,24 +322,50 @@ impl Effects {
     }
 }
 
-/// A block of `len` consecutive nonces starting at `first`, reserved for one encode.
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+/// The nonces reserved for one encode, one per item in item order. The values are whatever the
+/// venue's [`NonceScope`](crate::NonceScope) needs: increasing for a monotonic scope,
+/// independent for a random one. They are stated one by one, so the journal and replay carry
+/// them exactly.
+#[derive(Clone, Eq, PartialEq, Hash, Debug, Default)]
 pub struct NonceBlock {
-    pub first: u64,
-    pub len: u16,
+    values: Vec<u64>,
 }
 
 impl NonceBlock {
     /// No nonces.
-    pub const EMPTY: NonceBlock = NonceBlock { first: 0, len: 0 };
+    pub const EMPTY: NonceBlock = NonceBlock { values: Vec::new() };
 
-    /// The nonce for item `item`, or `None` past the block (or past `u64::MAX`).
-    pub fn get(self, item: u16) -> Option<u64> {
-        if item < self.len {
-            self.first.checked_add(u64::from(item))
-        } else {
-            None
+    /// `values`, the nonce for item `i` at index `i`.
+    pub fn new(values: Vec<u64>) -> NonceBlock {
+        NonceBlock { values }
+    }
+
+    /// `len` consecutive nonces from `first`, or `None` when they would pass `u64::MAX`.
+    pub fn consecutive(first: u64, len: u16) -> Option<NonceBlock> {
+        if len > 0 {
+            first.checked_add(u64::from(len) - 1)?;
         }
+        Some(NonceBlock::new(
+            (0..u64::from(len)).map(|i| first + i).collect(),
+        ))
+    }
+
+    /// The nonce for item `item`, or `None` past the block.
+    pub fn get(&self, item: u16) -> Option<u64> {
+        self.values.get(usize::from(item)).copied()
+    }
+
+    /// Every nonce, in item order.
+    pub fn as_slice(&self) -> &[u64] {
+        &self.values
+    }
+
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
     }
 }
 
@@ -347,7 +373,7 @@ impl NonceBlock {
 /// sees. In live trading the runtime fills it from its clock and its [`NonceSource`] and
 /// journals it; in replay it is read back from the journal. Every timestamp, expiry, deadline
 /// and nonce in a payload comes from here.
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub struct EncodeCtx {
     pub wall: WallNs,
     pub mono: MonoNs,
@@ -370,7 +396,9 @@ pub struct EncodeReceipt {
 /// Where the runtime gets nonces, scoped as the venue's
 /// [`NonceScope`](crate::NonceScope) says; every reservation is journaled.
 pub trait NonceSource: Send {
-    /// Reserves `len` consecutive nonces, all above any reserved before.
+    /// Reserves `len` nonces, one per item of a command, as the venue's scope needs: for a
+    /// monotonic scope each above every nonce reserved before and increasing in item order;
+    /// for a random scope each drawn independently.
     fn reserve(&mut self, len: u16) -> NonceBlock;
 }
 
@@ -890,18 +918,27 @@ mod tests {
         let ctx = EncodeCtx {
             wall: WallNs(1),
             mono: MonoNs(2),
-            nonces: NonceBlock { first: 10, len: 2 },
+            nonces: NonceBlock::consecutive(10, 2).unwrap(),
         };
         assert_eq!(
             (ctx.nonce(0), ctx.nonce(1), ctx.nonce(2)),
             (Some(10), Some(11), None)
         );
+        assert_eq!(ctx.nonces.as_slice(), [10, 11]);
         assert_eq!(NonceBlock::EMPTY.get(0), None);
-        let top = NonceBlock {
-            first: u64::MAX,
-            len: 2,
-        };
+        assert!(NonceBlock::EMPTY.is_empty());
+        assert_eq!(NonceBlock::consecutive(3, 0), Some(NonceBlock::EMPTY));
+        // A consecutive block that would pass u64::MAX is refused, not wrapped.
+        let top = NonceBlock::consecutive(u64::MAX, 1).unwrap();
         assert_eq!((top.get(0), top.get(1)), (Some(u64::MAX), None));
+        assert_eq!(NonceBlock::consecutive(u64::MAX, 2), None);
+        // Random nonces are independent values, one per item.
+        let random = NonceBlock::new(vec![u64::MAX, 7, 7_000]);
+        assert_eq!(random.len(), 3);
+        assert_eq!(
+            (random.get(0), random.get(1), random.get(2), random.get(3)),
+            (Some(u64::MAX), Some(7), Some(7_000), None)
+        );
     }
 
     #[test]

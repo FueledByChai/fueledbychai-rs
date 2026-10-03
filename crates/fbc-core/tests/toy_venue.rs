@@ -1017,10 +1017,7 @@ fn ctx(wall: i64, first_nonce: u64, len: u16) -> EncodeCtx {
     EncodeCtx {
         wall: WallNs(wall),
         mono: MonoNs(77),
-        nonces: NonceBlock {
-            first: first_nonce,
-            len,
-        },
+        nonces: NonceBlock::consecutive(first_nonce, len).unwrap(),
     }
 }
 
@@ -1170,7 +1167,7 @@ fn encode_takes_time_and_nonces_only_from_the_encode_ctx() {
     let bytes = encode_once(codec.as_mut(), &place, &at);
     let later = EncodeCtx {
         wall: WallNs(at.wall.0 + 1),
-        ..at
+        ..at.clone()
     };
     let next_nonce = ctx(at.wall.0, 9_001, 1);
     let other_mono = EncodeCtx {
@@ -1211,6 +1208,18 @@ fn encode_takes_time_and_nonces_only_from_the_encode_ctx() {
         )
     );
     assert!(frame.redactions().is_empty());
+
+    // Nonces need not be consecutive (a venue whose NonceScope is Random): each item takes the
+    // value reserved for it, whatever the others are.
+    let random = EncodeCtx {
+        nonces: NonceBlock::new(vec![0x9e37_79b9_7f4a_7c15, 13]),
+        ..ctx(5, 0, 0)
+    };
+    let mut fx = Effects::new();
+    let receipt = codec
+        .encode(&batch, RpcId(12), &specs(), &random, &mut fx)
+        .unwrap();
+    assert_eq!(receipt.nonces, vec![(0, 0x9e37_79b9_7f4a_7c15), (1, 13)]);
 
     // Without enough nonces in the context the command is not sent, and nothing is pushed.
     let mut fx = Effects::new();
