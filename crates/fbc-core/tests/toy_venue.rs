@@ -48,8 +48,9 @@ const INST: InstrumentId = InstrumentId::new(7);
 const OWN_NS: Namespace = Namespace::new(5);
 const EXEC_STREAM: StreamId = StreamId(1);
 const RESYNC_TAG: HttpTag = HttpTag(1);
-const ANCHOR_TAG: HttpTag = HttpTag(2);
 const PING_TAG: TimerTag = TimerTag(1);
+/// How often both codecs ping; each ping re-arms the timer for the next.
+const PING_EVERY: Duration = Duration::from_secs(15);
 const RESYNC_RETRY_TAG: TimerTag = TimerTag(2);
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 /// The most orders one placement batch carries.
@@ -195,21 +196,24 @@ impl ToyMd {
             "snap" => {
                 let epoch = f.num("epoch")?;
                 let book = f.book()?;
-                sink.push(meta, MdEvent::BookSnapshotBegin { inst, book, epoch });
+                // Every level is read before the first push, so a bad one pushes nothing
+                // (MdSink: a call that returns Err has pushed nothing).
+                let mut levels = Vec::new();
                 for (key, side) in [("b", BookSide::Bid), ("a", BookSide::Ask)] {
                     if let Some(lvl) = f.level(key)? {
-                        let (px, qty) = (lvl.px, lvl.qty);
-                        sink.push(
-                            meta,
-                            MdEvent::Level {
-                                inst,
-                                book,
-                                side,
-                                px,
-                                qty,
-                            },
-                        );
+                        levels.push((side, lvl));
                     }
+                }
+                sink.push(meta, MdEvent::BookSnapshotBegin { inst, book, epoch });
+                for (side, Lvl { px, qty }) in levels {
+                    let level = MdEvent::Level {
+                        inst,
+                        book,
+                        side,
+                        px,
+                        qty,
+                    };
+                    sink.push(meta, level);
                 }
                 sink.push(meta, MdEvent::BookSnapshotEnd { inst, book });
             }
@@ -291,7 +295,7 @@ impl MdCodec for ToyMd {
     fn on_open(&mut self, fx: &mut Effects) {
         fx.push(Effect::Timer {
             tag: PING_TAG,
-            after: Duration::from_secs(15),
+            after: PING_EVERY,
         });
     }
 
@@ -343,15 +347,15 @@ impl MdCodec for ToyMd {
         resp: Result<HttpResponse<'_>, HttpFailure>,
         _scope: &DecodeScope<'_>,
         specs: &SpecTable,
-        sink: &mut dyn MdSink,
+        _sink: &mut dyn MdSink,
         _fx: &mut Effects,
     ) -> Result<(), DecodeError> {
-        let resp = match resp {
-            Ok(resp) if tag == ANCHOR_TAG && resp.status == 200 => resp,
-            _ => return Err(DecodeError::Malformed("anchor response")),
-        };
-        let body = std::str::from_utf8(resp.body).map_err(|_| DecodeError::Malformed("body"))?;
-        ToyMd::decode_md(body, specs, sink)
+        // Every book frame is a whole snapshot (no book needs a REST anchor), so the socket
+        // codec asks for no HTTP and takes no response.
+        let _ = (tag, resp, specs);
+        Err(DecodeError::Malformed(
+            "the market-data socket asks for no HTTP",
+        ))
     }
 
     fn on_timer(&mut self, tag: TimerTag, _now: MonoNs, wall: WallNs, fx: &mut Effects) {
@@ -363,6 +367,10 @@ impl MdCodec for ToyMd {
             frame: WireSlice::plain(frame.into_bytes()),
             rpc: None,
             class: TrafficClass::Safety,
+        });
+        fx.push(Effect::Timer {
+            tag: PING_TAG,
+            after: PING_EVERY,
         });
     }
 
@@ -436,6 +444,8 @@ impl MdCodec for ToyPoll {
             _ => return Err(DecodeError::Malformed("stats response")),
         };
         let body = std::str::from_utf8(resp.body).map_err(|_| DecodeError::Malformed("body"))?;
+        // Every line is decoded before the first push, so a bad one pushes nothing.
+        let mut events = Vec::new();
         for line in body.lines() {
             let f = Frame::parse(line)?;
             let event = MdEvent::Stats {
@@ -443,8 +453,11 @@ impl MdCodec for ToyPoll {
                 volume_24h_quote: f.opt_usdc("vol")?,
                 oi: f.opt_num("oi")?.and_then(Lots::new),
             };
-            sink.push(f.meta()?, event);
+            events.push((f.meta()?, event));
         }
+        events
+            .into_iter()
+            .for_each(|(meta, ev)| sink.push(meta, ev));
         Ok(())
     }
 
@@ -542,10 +555,12 @@ fn hex(sig: &Sig) -> String {
 }
 
 /// The toy's order-entry codec. It keeps no order registry: every field it writes comes from
-/// the command, the spec table or the encode context.
+/// the command, the spec table or the encode context. The one thing it remembers is the order
+/// each query in flight is for, since the venue's answer names only the request.
 struct ToyExec {
     signer: Box<dyn OrderSigner>,
     url: String,
+    queries: Vec<(RpcId, OrderRef)>,
 }
 
 impl ToyExec {
@@ -553,6 +568,7 @@ impl ToyExec {
         ToyExec {
             signer: Box::new(ToySigner),
             url: url.to_owned(),
+            queries: Vec::new(),
         }
     }
 
@@ -616,14 +632,43 @@ impl ToyExec {
         Ok(frame)
     }
 
+    /// One open or closed order as the venue reports it in a resync or a query answer.
+    fn snapshot(
+        f: &Frame<'_>,
+        scope: &DecodeScope<'_>,
+        specs: &SpecTable,
+    ) -> Result<VenueOrderSnapshot, DecodeError> {
+        Ok(VenueOrderSnapshot {
+            cid: f.opt("cid").map(|c| scope.client_order_id(c)),
+            vid: scope.venue_order_id(f.get("vid")?)?,
+            inst: f.inst(specs)?,
+            side: f.side()?,
+            state: match f.opt("state") {
+                None => VenueOrderState::Open,
+                Some("filled") => VenueOrderState::Filled,
+                Some("expired") => VenueOrderState::Expired,
+                Some(_) => return Err(DecodeError::Malformed("state")),
+            },
+            px: f.opt_num("px")?.map(Ticks),
+            qty: f.lots("qty")?,
+            cum_filled: f.lots("cum")?,
+            post_only: f.flag("po"),
+            reduce_only: f.flag("ro"),
+        })
+    }
+
+    /// Decodes one line into its event without pushing it, so a caller decoding several lines
+    /// pushes none of them when one fails. A query answer is matched to its query here, and
+    /// the query is let go only once its answer is pushed.
     fn decode_exec(
+        &self,
         line: &str,
         scope: &DecodeScope<'_>,
         specs: &SpecTable,
-        sink: &mut dyn ExecSink,
-    ) -> Result<(), DecodeError> {
+    ) -> Result<Decoded, DecodeError> {
         let f = Frame::parse(line)?;
         let meta = f.meta()?;
+        let mut answers = None;
         let event = match f.kind {
             "pos" | "rpos" => {
                 let (inst, qty) = (f.inst(specs)?, SignedLots(f.num("qty")?));
@@ -653,18 +698,22 @@ impl ToyExec {
             "rbegin" => ExecEvent::ResyncBegin {
                 watermark: WallNs(f.num("wm")?),
             },
-            "rorder" => ExecEvent::ResyncOrder(VenueOrderSnapshot {
-                cid: f.opt("cid").map(|c| scope.client_order_id(c)),
-                vid: scope.venue_order_id(f.get("vid")?)?,
-                inst: f.inst(specs)?,
-                side: f.side()?,
-                state: VenueOrderState::Open,
-                px: f.opt_num("px")?.map(Ticks),
-                qty: f.lots("qty")?,
-                cum_filled: f.lots("cum")?,
-                post_only: f.flag("po"),
-                reduce_only: f.flag("ro"),
-            }),
+            "rorder" => ExecEvent::ResyncOrder(ToyExec::snapshot(&f, scope, specs)?),
+            // The answer to a query: the order, or none when `vid` is absent (not found).
+            "qres" => {
+                let rpc = RpcId(f.num("rpc")?);
+                let target = self.queries.iter().find(|(id, _)| *id == rpc);
+                let (_, target) = target.ok_or(DecodeError::Malformed("rpc"))?;
+                let found = match f.opt("vid") {
+                    Some(_) => Some(ToyExec::snapshot(&f, scope, specs)?),
+                    None => None,
+                };
+                answers = Some(rpc);
+                ExecEvent::QueryResult {
+                    target: target.clone(),
+                    found,
+                }
+            }
             "rend" => ExecEvent::ResyncEnd,
             "ord" => ExecEvent::Order(OrderUpdate {
                 cid: f.opt("cid").map(|c| scope.client_order_id(c)),
@@ -702,17 +751,12 @@ impl ToyExec {
                 ident: {
                     let vid = f.opt("vid").map(|v| scope.venue_order_id(v)).transpose()?;
                     let cum_after = f.opt_num("cum")?.and_then(Lots::new);
-                    match f.opt("fid") {
-                        Some(fid) => FillIdent::Venue {
-                            fill: scope.fill_id(fid)?,
-                            vid,
-                            cum_after,
-                        },
-                        // No fill id: the order id and cumulative quantity key the fill.
-                        None => FillIdent::Derived {
-                            vid: vid.ok_or(DecodeError::Malformed("vid"))?,
-                            cum_after: cum_after.ok_or(DecodeError::Malformed("cum"))?,
-                        },
+                    // Every toy fill carries a fill id (FillCaps::fill_id); one without is
+                    // malformed.
+                    FillIdent::Venue {
+                        fill: scope.fill_id(f.get("fid")?)?,
+                        vid,
+                        cum_after,
                     }
                 },
                 cid: f.opt("cid").map(|c| scope.client_order_id(c)),
@@ -759,9 +803,28 @@ impl ToyExec {
             },
             _ => return Err(DecodeError::Malformed("kind")),
         };
-        sink.push(meta, event);
-        Ok(())
+        Ok(Decoded {
+            meta,
+            event,
+            answers,
+        })
     }
+
+    /// Pushes a decoded event, letting go of the query it answers.
+    fn push(&mut self, sink: &mut dyn ExecSink, decoded: Decoded) {
+        if let Some(rpc) = decoded.answers {
+            self.queries.retain(|(id, _)| *id != rpc);
+        }
+        sink.push(decoded.meta, decoded.event);
+    }
+}
+
+/// One decoded exec line, not yet pushed.
+struct Decoded {
+    meta: VenueMeta,
+    event: ExecEvent,
+    /// The query this line answers, let go once it is pushed.
+    answers: Option<RpcId>,
 }
 
 /// Refuses a time in force or channel the toy's caps do not offer.
@@ -797,6 +860,10 @@ impl ExecCodec for ToyExec {
             .expect("the runtime reserves the nonce nonces_for asks for");
         let frame = format!("hello|ts={}|nonce={nonce}", ctx.wall.0);
         ToyExec::send(fx, frame, None, TrafficClass::Safety);
+        fx.push(Effect::Timer {
+            tag: PING_TAG,
+            after: PING_EVERY,
+        });
     }
 
     fn encode(
@@ -892,6 +959,10 @@ impl ExecCodec for ToyExec {
         // The class has one source: the command's own rule.
         let class = cmd.traffic_class();
         ToyExec::send(fx, format!("rpc={}\n{frame}", rpc.0), Some(rpc), class);
+        // A query is remembered until answered or timed out: the answer names only the rpc.
+        if let VenueCommand::Query(q) = cmd {
+            self.queries.push((rpc, q.target.clone()));
+        }
         Ok(receipt)
     }
 
@@ -905,7 +976,9 @@ impl ExecCodec for ToyExec {
         _fx: &mut Effects,
     ) -> Result<(), DecodeError> {
         let text = std::str::from_utf8(f.bytes()).map_err(|_| DecodeError::Malformed("utf-8"))?;
-        ToyExec::decode_exec(text, scope, specs, sink)
+        let decoded = self.decode_exec(text, scope, specs)?;
+        self.push(sink, decoded);
+        Ok(())
     }
 
     fn on_http(
@@ -930,8 +1003,13 @@ impl ExecCodec for ToyExec {
             _ => return Err(DecodeError::Malformed("resync response")),
         };
         let body = std::str::from_utf8(resp.body).map_err(|_| DecodeError::Malformed("body"))?;
-        body.lines()
-            .try_for_each(|line| ToyExec::decode_exec(line, scope, specs, sink))
+        // Every line is decoded before the first push, so a bad one pushes nothing.
+        let lines = body
+            .lines()
+            .map(|line| self.decode_exec(line, scope, specs));
+        let decoded = lines.collect::<Result<Vec<_>, _>>()?;
+        decoded.into_iter().for_each(|d| self.push(sink, d));
+        Ok(())
     }
 
     fn on_timer(&mut self, tag: TimerTag, ctx: &EncodeCtx, fx: &mut Effects) {
@@ -945,9 +1023,15 @@ impl ExecCodec for ToyExec {
             None,
             TrafficClass::Safety,
         );
+        fx.push(Effect::Timer {
+            tag: PING_TAG,
+            after: PING_EVERY,
+        });
     }
 
     fn on_rpc_timeout(&mut self, rpc: RpcId, sink: &mut dyn ExecSink) {
+        // A query that timed out takes no late answer.
+        self.queries.retain(|(id, _)| *id != rpc);
         let outcome = SubmitOutcome::Unknown;
         let item = None;
         sink.push(VenueMeta::NONE, ExecEvent::Outcome { rpc, item, outcome });
@@ -1125,7 +1209,8 @@ fn toy_caps() -> VenueCaps {
             stp_scope: StpScope::Account,
         },
         md: MdCaps {
-            encoding: Encoding::Json,
+            // Pipe-delimited `key=value` text (the protocol at the top of this file).
+            encoding: Encoding::Text,
             touch_sources: vec![TouchSourceCaps {
                 channel: "touch",
                 cadence: Cadence::Realtime,
@@ -1140,7 +1225,7 @@ fn toy_caps() -> VenueCaps {
                     cadence: Cadence::Realtime,
                     continuity: Continuity::PlusOne,
                     windowed: false,
-                    rest_anchor: true,
+                    rest_anchor: false,
                     includes_channels: TagSet::of(&[Channel::Public]),
                     queue_model: QueueModelQuality::BracketOnly,
                 },
@@ -1592,6 +1677,7 @@ fn the_toy_decodes_market_data_frames_into_md_events() {
         "mark|sym=TOY-PERP|px=65432.123456789",
         "gap|sym=TOY-PERP|feed=book",
         "gap|sym=TOY-PERP|feed=trades",
+        "snap|seq=7|sym=TOY-PERP|epoch=3|b=130865x12|a=130866x7",
     ];
     with_scope(|scope| {
         for line in lines {
@@ -1599,25 +1685,16 @@ fn the_toy_decodes_market_data_frames_into_md_events() {
                 .on_frame(RawFrame::Text(line), scope, &specs, &mut sink, &mut fx)
                 .unwrap();
         }
-        // The book anchor arrives over HTTP and decodes into a snapshot.
-        let resp = HttpResponse {
-            status: 200,
-            headers: &[("content-type", "text/plain")],
-            body: b"snap|seq=7|sym=TOY-PERP|epoch=3|b=130865x12|a=130866x7",
-        };
-        codec
-            .on_http(ANCHOR_TAG, Ok(resp), scope, &specs, &mut sink, &mut fx)
-            .unwrap();
-        // A request that got no response comes back too, with why.
+        // The socket codec asks for no HTTP, so a response that reaches it is refused.
         let lost = codec.on_http(
-            ANCHOR_TAG,
+            HttpTag(9),
             Err(HttpFailure::Lost),
             scope,
             &specs,
             &mut sink,
             &mut fx,
         );
-        assert_eq!(lost, Err(DecodeError::Malformed("anchor response")));
+        assert!(lost.is_err());
         // A frame naming an instrument the table lacks, or no kind, is refused.
         let unknown = RawFrame::Text("touch|sym=NOPE-PERP");
         let refused = codec.on_frame(unknown, scope, &specs, &mut sink, &mut fx);
@@ -1804,8 +1881,8 @@ fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
         .unwrap();
     assert_eq!(decode_cid(&format, OWN_NS, wire), CidMatch::Ours(cid));
 
-    // The exec codec opens, pings and resyncs by asking for effects, and decodes the resync
-    // response it asked for.
+    // The exec codec opens, pings and resyncs by asking for effects (opening and each ping
+    // also arm the next ping), and decodes the resync response it asked for.
     let mut exec = exec_codec();
     let mut fx = Effects::new();
     let at = ctx(1_000, 1, 1);
@@ -1814,10 +1891,10 @@ fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
     exec.resync(&at, &mut fx);
     let effects = fx.take();
     assert!(fx.is_empty());
-    assert_eq!(effects.len(), 3);
+    assert_eq!(effects.len(), 5);
     let Effect::Http {
         tag, req, class, ..
-    } = &effects[2]
+    } = &effects[4]
     else {
         panic!("expected the resync request: {effects:?}");
     };
@@ -2239,7 +2316,7 @@ fn a_poll_only_feed_is_planned_without_a_connection_and_polled_over_http() {
         let frame = poll.on_frame(RawFrame::Text("x"), scope, &specs, &mut sink, &mut fx);
         assert!(frame.is_err());
         let stray = poll.on_http(
-            ANCHOR_TAG,
+            HttpTag(9),
             Err(HttpFailure::Lost),
             scope,
             &specs,
@@ -2270,11 +2347,12 @@ fn a_poll_only_feed_is_planned_without_a_connection_and_polled_over_http() {
 fn a_fill_key_is_computed_from_the_one_copy_of_its_fields() {
     // A fill without a venue fill id is keyed by its order's venue id and cumulative quantity
     // after the fill; the event holds each once, so the key cannot disagree with the order and
-    // quantity the fill is applied to.
+    // quantity the fill is applied to. Every toy fill carries a fill id, so the first one here
+    // is the second decoded with its fill id taken away, as a venue without fill ids sends it.
     let sink = decode_exec(
         exec_codec().as_mut(),
         &[
-            "fill|sym=TOY-PERP|vid=V-1|side=S|px=130865|qty=1|cum=3|fee=0",
+            "fill|sym=TOY-PERP|fid=F-0|vid=V-1|side=S|px=130865|qty=1|cum=3|fee=0",
             "fill|sym=TOY-PERP|fid=F-1|vid=V-1|side=S|px=130865|qty=1|cum=4|fee=0",
             "fill|sym=TOY-PERP|fid=F-2|side=S|px=130865|qty=1|fee=0",
         ],
@@ -2286,15 +2364,19 @@ fn a_fill_key_is_computed_from_the_one_copy_of_its_fields() {
             scope.fill_id("F-2").unwrap(),
         )
     });
-    let fills: Vec<&FillEvent> = sink
+    let lots = |n| Lots::new(n).unwrap();
+    let mut fills: Vec<FillEvent> = sink
         .bodies()
         .into_iter()
         .map(|ev| match ev {
-            ExecEvent::Fill(fill) => fill,
+            ExecEvent::Fill(fill) => fill.clone(),
             other => panic!("{other:?}"),
         })
         .collect();
-    let lots = |n| Lots::new(n).unwrap();
+    fills[0].ident = FillIdent::Derived {
+        vid: vid.clone(),
+        cum_after: lots(3),
+    };
     assert_eq!(
         fills[0].ident,
         FillIdent::Derived {
@@ -2321,7 +2403,7 @@ fn a_fill_key_is_computed_from_the_one_copy_of_its_fields() {
         (Some(&vid), Some(lots(3)))
     );
 
-    // Without a fill id, a fill missing its order id or cumulative quantity has no key: refused.
+    // Without a fill id (which the toy's caps promise on every fill), a fill is refused.
     let mut codec = exec_codec();
     let (specs, mut sink, mut fx) = (specs(), Collect::new(), Effects::new());
     with_scope(|scope| {
@@ -2562,6 +2644,7 @@ fn a_cancel_signer_sees_only_the_reference_the_request_encodes() {
     let mut codec = ToyExec {
         signer: Box::new(RecordingSigner(seen.clone())),
         url: "https://toy.invalid".to_owned(),
+        queries: Vec::new(),
     };
     let cancel = VenueCommand::Cancel(CancelOrder {
         target: OrderRef::Both(cid, vid),
@@ -2623,6 +2706,7 @@ fn an_amend_signer_sees_only_the_reference_the_request_encodes() {
     let mut codec = ToyExec {
         signer: Box::new(RecordingSigner(seen.clone())),
         url: "https://toy.invalid".to_owned(),
+        queries: Vec::new(),
     };
     let amend = VenueCommand::Amend(AmendOrder {
         target: OrderRef::Both(cid, vid),
@@ -2705,7 +2789,7 @@ fn an_exec_codec_states_how_many_nonces_each_callback_needs() {
     let reserved = exec.nonces_for(CtxCall::Open(EXEC_STREAM));
     let mut fx = Effects::new();
     exec.on_open(EXEC_STREAM, &ctx(1_000, 42, reserved), &mut fx);
-    let [Effect::Send { frame, .. }] = fx.as_slice() else {
+    let [Effect::Send { frame, .. }, Effect::Timer { .. }] = fx.as_slice() else {
         panic!("{fx:?}");
     };
     assert_eq!(frame.bytes(), b"hello|ts=1000|nonce=42");
@@ -2903,4 +2987,222 @@ fn a_plan_of_poll_only_feeds_opens_no_socket() {
         ToyFactory.plan_md(&config(), &specs(), &BTreeSet::new()),
         Ok(vec![])
     );
+}
+
+#[test]
+fn the_toy_answers_an_order_query_with_a_query_result() {
+    // The caps say the toy queries by venue id and by placement nonce, so its codec decodes the
+    // answer. The answer names the request; the codec remembers which order each query in
+    // flight was for, so even a nonce query for an order the venue never heard of names it.
+    let [cid] = mint(1).try_into().unwrap();
+    let vid = with_scope(|scope| scope.venue_order_id("V-1").unwrap());
+    let mut exec = exec_codec();
+    let mut query = |rpc: u64, target: OrderRef| {
+        let cmd = VenueCommand::Query(QueryOrder {
+            target,
+            inst: INST,
+            placement_nonce: Some(4),
+        });
+        let mut fx = Effects::new();
+        exec.encode(&cmd, RpcId(rpc), &specs(), &ctx(9, 6, 1), &mut fx)
+            .unwrap();
+    };
+    query(21, OrderRef::Client(cid));
+    query(22, OrderRef::Both(cid, vid.clone()));
+    query(23, OrderRef::Venue(vid.clone()));
+    let sink = decode_exec(
+        exec.as_mut(),
+        &[
+            "qres|seq=9|rpc=21|vid=V-1|sym=TOY-PERP|side=B|px=130865|qty=25|cum=5|po=1|ro=0",
+            "qres|rpc=22|vid=V-1|sym=TOY-PERP|side=B|px=130865|qty=25|cum=25|state=filled",
+            "qres|rpc=23",
+        ],
+    );
+    let snapshot = |cum, state| VenueOrderSnapshot {
+        cid: None,
+        vid: vid.clone(),
+        inst: INST,
+        side: Side::Buy,
+        state,
+        px: Some(Ticks(130_865)),
+        qty: Lots::new(25).unwrap(),
+        cum_filled: Lots::new(cum).unwrap(),
+        post_only: Some(true),
+        reduce_only: Some(false),
+    };
+    let mut filled = snapshot(25, VenueOrderState::Filled);
+    (filled.post_only, filled.reduce_only) = (None, None);
+    assert_eq!(
+        sink.bodies(),
+        [
+            &ExecEvent::QueryResult {
+                target: OrderRef::Client(cid),
+                found: Some(snapshot(5, VenueOrderState::Open)),
+            },
+            &ExecEvent::QueryResult {
+                target: OrderRef::Both(cid, vid.clone()),
+                found: Some(filled),
+            },
+            &ExecEvent::QueryResult {
+                target: OrderRef::Venue(vid.clone()),
+                found: None,
+            },
+        ]
+    );
+    assert_eq!(sink.out[0].venue_seq, Some(9));
+
+    // An answer is taken once; one to a query that timed out, or that was never asked, names
+    // no request in flight and is refused.
+    let mut exec = exec_codec();
+    let cmd = VenueCommand::Query(QueryOrder {
+        target: OrderRef::Venue(vid.clone()),
+        inst: INST,
+        placement_nonce: None,
+    });
+    let mut fx = Effects::new();
+    exec.encode(&cmd, RpcId(31), &specs(), &ctx(9, 6, 1), &mut fx)
+        .unwrap();
+    exec.encode(&cmd, RpcId(32), &specs(), &ctx(9, 6, 1), &mut fx)
+        .unwrap();
+    let mut timeouts = Collect::new();
+    exec.on_rpc_timeout(RpcId(31), &mut timeouts);
+    decode_exec(exec.as_mut(), &["qres|rpc=32"]);
+    let (specs, mut sink, mut fx) = (specs(), Collect::new(), Effects::new());
+    with_scope(|scope| {
+        for line in ["qres|rpc=31", "qres|rpc=32", "qres|rpc=99", "qres|vid=V-1"] {
+            let frame = RawFrame::Text(line);
+            let refused = exec.on_frame(EXEC_STREAM, frame, scope, &specs, &mut sink, &mut fx);
+            assert!(refused.is_err(), "{line}");
+        }
+        // A malformed answer is refused and leaves the query in flight for a good one.
+        let mut exec = exec_codec();
+        let mut ffx = Effects::new();
+        let q = VenueCommand::Query(QueryOrder {
+            target: OrderRef::Venue(vid.clone()),
+            inst: INST,
+            placement_nonce: None,
+        });
+        exec.encode(&q, RpcId(41), &specs, &ctx(9, 6, 1), &mut ffx)
+            .unwrap();
+        let bad = RawFrame::Text("qres|rpc=41|vid=V-1|sym=TOY-PERP|side=X|qty=1|cum=0");
+        let refused = exec.on_frame(EXEC_STREAM, bad, scope, &specs, &mut sink, &mut fx);
+        assert_eq!(refused, Err(DecodeError::Malformed("side")));
+        let good = RawFrame::Text("qres|rpc=41");
+        exec.on_frame(EXEC_STREAM, good, scope, &specs, &mut sink, &mut fx)
+            .unwrap();
+    });
+    assert_eq!(
+        sink.bodies(),
+        [&ExecEvent::QueryResult {
+            target: OrderRef::Venue(vid.clone()),
+            found: None,
+        }]
+    );
+}
+
+#[test]
+fn a_frame_or_response_that_fails_to_decode_pushes_nothing() {
+    // The sink contract (MdSink, ExecSink): a call that returns Err has pushed no event, so a
+    // bad level cannot leave a snapshot begun and never ended, and a bad line in a response
+    // cannot leave half of it applied.
+    let (specs, mut fx) = (specs(), Effects::new());
+    let mut md = ToyMd { pings: 0 };
+    let mut poll = ToyPoll {
+        base_url: "https://toy.invalid".to_owned(),
+        symbols: BTreeSet::new(),
+    };
+    let mut exec = exec_codec();
+    with_scope(|scope| {
+        let mut sink = Collect::new();
+        for line in [
+            "snap|sym=TOY-PERP|epoch=3|b=130865x12|a=bad",
+            "snap|sym=TOY-PERP|epoch=3|b=bad|a=130866x7",
+        ] {
+            let refused = md.on_frame(RawFrame::Text(line), scope, &specs, &mut sink, &mut fx);
+            assert!(refused.is_err(), "{line}");
+        }
+        let stats = HttpResponse {
+            status: 200,
+            headers: &[],
+            body: b"stats|sym=TOY-PERP|vol=1|oi=2\nstats|sym=NOPE-PERP|vol=1",
+        };
+        let refused = poll.on_http(STATS_TAG, Ok(stats), scope, &specs, &mut sink, &mut fx);
+        assert_eq!(refused, Err(DecodeError::UnknownInstrument));
+        assert!(sink.out.is_empty(), "{:?}", sink.bodies());
+
+        let mut sink = Collect::new();
+        let resync = HttpResponse {
+            status: 200,
+            headers: &[],
+            body: b"rbegin|wm=900\nrpos|sym=TOY-PERP|qty=0\nrpos|sym=TOY-PERP",
+        };
+        let refused = exec.on_http(RESYNC_TAG, Ok(resync), scope, &specs, &mut sink, &mut fx);
+        assert_eq!(refused, Err(DecodeError::Malformed("qty")));
+        assert!(sink.out.is_empty(), "{:?}", sink.bodies());
+    });
+    assert!(fx.is_empty());
+}
+
+#[test]
+fn both_codecs_keep_their_ping_timers_armed() {
+    // Each ping re-arms its timer, so pings go on for the life of the connection; the exec
+    // session arms its first one when it opens, as the market-data codec does.
+    let mut exec = exec_codec();
+    let mut fx = Effects::new();
+    let at = ctx(1_000, 1, 1);
+    exec.on_open(EXEC_STREAM, &at, &mut fx);
+    let ping = Effect::Timer {
+        tag: PING_TAG,
+        after: Duration::from_secs(15),
+    };
+    assert!(matches!(&fx.as_slice()[0], Effect::Send { .. }));
+    assert_eq!(fx.as_slice()[1..], *std::slice::from_ref(&ping));
+    let mut fx = Effects::new();
+    exec.on_timer(PING_TAG, &ctx(2_000, 1, 0), &mut fx);
+    assert!(matches!(&fx.as_slice()[0], Effect::Send { .. }));
+    assert_eq!(fx.as_slice()[1..], *std::slice::from_ref(&ping));
+
+    let mut md = ToyMd { pings: 0 };
+    let mut fx = Effects::new();
+    md.on_timer(PING_TAG, MonoNs(5), WallNs(6), &mut fx);
+    assert!(matches!(&fx.as_slice()[0], Effect::Send { .. }));
+    assert_eq!(fx.as_slice()[1..], [ping]);
+}
+
+#[test]
+fn the_toy_refuses_a_fill_without_the_fill_id_its_caps_promise() {
+    // The caps say every fill carries a venue fill id (FillCaps::fill_id), so a fill without
+    // one is malformed, not keyed some other way.
+    assert!(toy_caps().fills.fill_id);
+    let mut codec = exec_codec();
+    let (specs, mut sink, mut fx) = (specs(), Collect::new(), Effects::new());
+    with_scope(|scope| {
+        let line = "fill|sym=TOY-PERP|vid=V-1|side=S|px=130865|qty=1|cum=3|fee=0";
+        let frame = RawFrame::Text(line);
+        let refused = codec.on_frame(EXEC_STREAM, frame, scope, &specs, &mut sink, &mut fx);
+        assert_eq!(refused, Err(DecodeError::Malformed("fid")));
+    });
+    assert!(sink.out.is_empty());
+}
+
+#[test]
+fn the_toy_declares_only_what_its_market_data_codec_does() {
+    // Its book channels are whole snapshots on the socket: none needs a REST anchor, and the
+    // socket codec asks for no HTTP, so it takes no response.
+    let md = toy_caps().md;
+    assert!(md.books.iter().all(|b| !b.rest_anchor), "{:?}", md.books);
+    let mut codec = ToyMd { pings: 0 };
+    let (specs, mut sink, mut fx) = (specs(), Collect::new(), Effects::new());
+    with_scope(|scope| {
+        let resp = HttpResponse {
+            status: 200,
+            headers: &[],
+            body: b"snap|sym=TOY-PERP|epoch=3|b=130865x12",
+        };
+        let refused = codec.on_http(HttpTag(2), Ok(resp), scope, &specs, &mut sink, &mut fx);
+        assert!(refused.is_err());
+    });
+    assert!(sink.out.is_empty());
+    // Its frames are pipe-delimited text, which is what the caps say.
+    assert_eq!(md.encoding, Encoding::Text);
 }
