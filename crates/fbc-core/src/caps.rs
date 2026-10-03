@@ -260,6 +260,8 @@ pub enum Encoding {
     /// Simple Binary Encoding.
     Sbe,
     Protobuf,
+    /// Delimited text that is not JSON: `key=value` fields, as FIX tag=value is.
+    Text,
 }
 
 /// A channel that carries the best bid and offer.
