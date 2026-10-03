@@ -315,17 +315,28 @@ pub enum RejectKind {
     Other,
 }
 
-/// A refusal that ends an order: any [`RejectKind`] but [`RejectKind::NotFound`], which moves an
-/// order to Unknown and is never terminal (decision 0005). It is what
-/// [`VenueOrderState::Rejected`](crate::VenueOrderState::Rejected) carries, so an order state
-/// cannot report an order as rejected for being unknown.
+/// A refusal that ends an order: a refusal of the order itself, which therefore never rests.
+/// It is what [`VenueOrderState::Rejected`](crate::VenueOrderState::Rejected) carries, so an
+/// order state cannot report an order as rejected for a refusal that leaves it as it was:
+/// [`RejectKind::NotFound`] moves an order to Unknown and is never terminal (decision 0005), and
+/// [`RejectKind::AlreadyTerminal`], [`RejectKind::NotAmendable`] and [`RejectKind::NoChange`]
+/// refuse an operation on an existing order (a cancel, an amend) that stays as it was; those
+/// are command outcomes ([`SubmitOutcome::Rejected`]), never an order's state.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct TerminalReject(RejectKind);
 
 impl TerminalReject {
-    /// `kind` as an order-ending refusal, or `None` for [`RejectKind::NotFound`].
+    /// `kind` as an order-ending refusal, or `None` for a refusal that does not end an order
+    /// (`NotFound`, `AlreadyTerminal`, `NotAmendable`, `NoChange`).
     pub fn new(kind: RejectKind) -> Option<TerminalReject> {
-        (kind != RejectKind::NotFound).then_some(TerminalReject(kind))
+        let leaves_order = matches!(
+            kind,
+            RejectKind::NotFound
+                | RejectKind::AlreadyTerminal(_)
+                | RejectKind::NotAmendable(_)
+                | RejectKind::NoChange
+        );
+        (!leaves_order).then_some(TerminalReject(kind))
     }
 
     /// What kind of refusal it is.
@@ -438,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn a_terminal_reject_is_any_kind_but_not_found() {
+    fn a_terminal_reject_is_only_a_refusal_that_ends_the_order() {
         assert_eq!(TerminalReject::new(RejectKind::NotFound), None);
         let margin = TerminalReject::new(RejectKind::Margin).unwrap();
         assert_eq!(margin.kind(), RejectKind::Margin);
@@ -446,6 +457,19 @@ mod tests {
         assert_eq!(
             TerminalReject::new(mode).map(TerminalReject::kind),
             Some(mode)
+        );
+        // Codex r4173187115: a refusal of an operation on an existing order (an amend that
+        // changes nothing or cannot be made, a cancel of an order already closed) leaves that
+        // order as it was, so it is never the reason an order is Rejected.
+        let not_amendable = RejectKind::NotAmendable(NotAmendable::PartiallyFilled);
+        let closed = RejectKind::AlreadyTerminal(TerminalHint::Filled);
+        for kind in [RejectKind::NoChange, not_amendable, closed] {
+            assert_eq!(TerminalReject::new(kind), None, "{kind:?}");
+        }
+        let limited = RejectKind::RateLimited { retry_after: None };
+        assert!(
+            TerminalReject::new(limited).is_some(),
+            "a placement refused never rested"
         );
     }
 

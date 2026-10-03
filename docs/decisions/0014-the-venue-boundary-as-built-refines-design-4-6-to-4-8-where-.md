@@ -77,7 +77,8 @@ stay sans-IO and deterministic:
 6. **Values that would contradict 0005 are unrepresentable.** `RejectKind::AlreadyTerminal`
    takes a payload-free `TerminalHint` (the design's `TerminalKind(RejectKind)` would make
    `RejectKind` recursive); `VenueOrderState::Rejected` takes a `TerminalReject`, which refuses
-   `RejectKind::NotFound`.
+   `RejectKind::NotFound` and the refusals of an operation on an existing order that leave it
+   as it was (`AlreadyTerminal`, `NotAmendable`, `NoChange`; Codex r4173187115).
 7. **Events say what they do and do not know.** `MdEvent::Health` names the `Feed` whose health
    changed; `OrderUpdate` carries the `post_only` and `reduce_only` flags a venue echoes. `ExecEvent::Mode { scope, mode }` names the market
    (`ModeScope::Instrument`) or the whole account a venue mode applies to; `OrderUpdate`,
