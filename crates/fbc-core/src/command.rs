@@ -19,7 +19,7 @@ use compact_str::CompactString;
 use crate::caps::{AmendQty, Feature, OrderKindTag, TifTag};
 use crate::codec::TrafficClass;
 use crate::event::VenueMode;
-use crate::ids::{ClientOrderId, InstrumentId, OrderRef, VenueOrderId};
+use crate::ids::{ClientOrderId, InstrumentId, OrderRef};
 use crate::units::{Channel, Lots, Side, Ticks};
 
 /// A time in force.
@@ -249,11 +249,9 @@ pub enum NotSentReason {
 pub enum SubmitOutcome {
     /// Never sent: nothing reached a socket buffer.
     NotSent(NotSentReason),
-    /// Accepted, with the venue's order id when the reply carries it.
-    Accepted {
-        vid: Option<VenueOrderId>,
-        ack: AckLevel,
-    },
+    /// Accepted. The venue's order id, when the reply carries it, is the item's
+    /// ([`ItemRef::vid`](crate::ItemRef::vid)), stated once there.
+    Accepted { ack: AckLevel },
     /// Refused by the venue.
     Rejected(Reject),
     /// Sent with no answer: resolved by the Unknown ladder and never resent (decision 0005).

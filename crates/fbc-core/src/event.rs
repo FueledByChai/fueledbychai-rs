@@ -248,7 +248,8 @@ pub struct ItemRef {
     pub idx: u16,
     /// Its client id, when the reply names it.
     pub cid: Option<ClientOrderId>,
-    /// Its venue order id, when the reply names it.
+    /// Its venue order id, when the reply names it: for an accepted placement, the id the
+    /// venue assigned (the outcome does not repeat it).
     pub vid: Option<VenueOrderId>,
 }
 

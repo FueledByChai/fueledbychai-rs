@@ -734,10 +734,9 @@ impl ToyExec {
                 item: Some(ItemRef {
                     idx: f.num("i")?,
                     cid: None,
-                    vid: None,
+                    vid: Some(scope.venue_order_id(f.get("vid")?)?),
                 }),
                 outcome: SubmitOutcome::Accepted {
-                    vid: Some(scope.venue_order_id(f.get("vid")?)?),
                     ack: AckLevel::Final,
                 },
             },
@@ -1967,11 +1966,18 @@ fn outcomes_amends_and_cancels_go_through_the_same_boundary() {
     let ExecEvent::Outcome { outcome, item, .. } = &sink.out[0].body else {
         panic!("{:?}", sink.out[0]);
     };
-    assert_eq!(item.as_ref().map(|i| i.idx), Some(0));
+    // The accepted order's venue id is stated once, on the item.
+    assert_eq!(
+        item.as_ref(),
+        Some(&ItemRef {
+            idx: 0,
+            cid: None,
+            vid: Some(vid.clone())
+        })
+    );
     assert_eq!(
         outcome,
         &SubmitOutcome::Accepted {
-            vid: Some(vid.clone()),
             ack: AckLevel::Final
         }
     );
