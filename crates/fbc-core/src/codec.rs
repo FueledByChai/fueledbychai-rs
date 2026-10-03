@@ -315,27 +315,35 @@ pub enum TrafficClass {
     Normal,
 }
 
+/// A request that awaits an answer, and how long the runtime waits for it. An RPC always has a
+/// deadline, so an unanswered order-entry request always reaches Unknown (0005).
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct RpcCall {
+    pub id: RpcId,
+    pub timeout: Duration,
+}
+
 /// Something a codec asks the runtime to do. The codec does none of it itself.
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub enum Effect {
-    /// Write `frame` to `stream`; with `rpc`, the runtime reports `timeout` passing without an
-    /// answer to [`ExecCodec::on_rpc_timeout`].
+    /// Write `frame` to `stream`; with `rpc`, the runtime reports its timeout passing without
+    /// an answer to [`ExecCodec::on_rpc_timeout`].
     Send {
         stream: StreamId,
         frame: WireSlice,
-        rpc: Option<RpcId>,
-        timeout: Option<Duration>,
+        rpc: Option<RpcCall>,
         class: TrafficClass,
     },
     /// Make `req`, handing the codec's `on_http` the response with `tag`, or the
-    /// [`HttpFailure`] when none came: `timeout` passing without a response is
-    /// [`HttpFailure::TimedOut`]. `rpc` names an order-entry request (journal and rate scope);
-    /// unlike [`Effect::Send`], its timeout comes back to `on_http`, not `on_rpc_timeout`.
+    /// [`HttpFailure`] when none came: `timeout`, which every request has, passing without a
+    /// response is [`HttpFailure::TimedOut`]. `rpc` names an order-entry request (journal and
+    /// rate scope); unlike [`Effect::Send`], its timeout comes back to `on_http`, not
+    /// `on_rpc_timeout`.
     Http {
         tag: HttpTag,
         req: HttpRequest,
         rpc: Option<RpcId>,
-        timeout: Option<Duration>,
+        timeout: Duration,
         class: TrafficClass,
     },
     /// Call the codec's `on_timer` with `tag` after `after`.
@@ -923,14 +931,13 @@ mod tests {
                 tag: HttpTag(1),
                 req,
                 rpc: None,
-                timeout: None,
+                timeout: Duration::from_secs(5),
                 class: TrafficClass::Safety,
             },
             Effect::Send {
                 stream: StreamId(0),
                 frame: body.clone(),
                 rpc: None,
-                timeout: None,
                 class: TrafficClass::Safety,
             },
         ];

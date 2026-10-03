@@ -27,8 +27,8 @@ use fbc_core::{
     MatchingCaps, MdCaps, MdCodec, MdEvent, MdSink, ModeScope, Money, MonoNs, Namespace,
     NamespaceLease, NewOrder, NonceBlock, NonceScope, NotSentReason, OrderCaps, OrderKind,
     OrderKindTag, OrderRef, OrderSigner, OrderUpdate, OrderingKey, PlaceWire, PriceGrid, PxExact,
-    QueryOrder, QueueModelQuality, RawFrame, Readiness, RefKind, Reject, RejectKind, RpcId,
-    SeqDomain, Side, Sig, SignError, SignedLots, SizeStep, SnapshotSource, SpecTable, Stamp,
+    QueryOrder, QueueModelQuality, RawFrame, Readiness, RefKind, Reject, RejectKind, RpcCall,
+    RpcId, SeqDomain, Side, Sig, SignError, SignedLots, SizeStep, SnapshotSource, SpecTable, Stamp,
     StpScope, StreamId, SubmitOutcome, Subscription, Support, TagSet, Ticks, TifTag, TimerTag,
     TouchSourceCaps, TouchSourceId, TradeCaps, TradingStatus, TrafficClass, UnderlyingId,
     VenueCaps, VenueCommand, VenueConfig, VenueError, VenueFactory, VenueFeeSign, VenueId,
@@ -280,7 +280,6 @@ impl MdCodec for ToyMd {
                 stream: StreamId(0),
                 frame: WireSlice::plain(frame.into_bytes()),
                 rpc: None,
-                timeout: None,
                 class: TrafficClass::Normal,
             });
         }
@@ -326,7 +325,6 @@ impl MdCodec for ToyMd {
             stream: StreamId(0),
             frame: WireSlice::plain(frame.into_bytes()),
             rpc: None,
-            timeout: None,
             class: TrafficClass::Safety,
         });
     }
@@ -420,8 +418,10 @@ impl ToyExec {
         fx.push(Effect::Send {
             stream: EXEC_STREAM,
             frame: WireSlice::plain(frame.into_bytes()),
-            rpc,
-            timeout: rpc.map(|_| RPC_TIMEOUT),
+            rpc: rpc.map(|id| RpcCall {
+                id,
+                timeout: RPC_TIMEOUT,
+            }),
             class,
         });
     }
@@ -788,7 +788,7 @@ impl ExecCodec for ToyExec {
                 body: WireSlice::plain(Vec::new()),
             },
             rpc: None,
-            timeout: Some(RPC_TIMEOUT),
+            timeout: RPC_TIMEOUT,
             class: TrafficClass::Safety,
         });
     }
@@ -1275,7 +1275,6 @@ fn encode_takes_time_and_nonces_only_from_the_encode_ctx() {
         Effect::Send {
             frame,
             rpc,
-            timeout,
             class,
             stream,
         },
@@ -1283,14 +1282,14 @@ fn encode_takes_time_and_nonces_only_from_the_encode_ctx() {
     else {
         panic!("expected one frame: {fx:?}");
     };
+    // An RPC frame always carries its deadline.
+    let call = RpcCall {
+        id: RpcId(12),
+        timeout: RPC_TIMEOUT,
+    };
     assert_eq!(
-        (*stream, *rpc, *timeout, *class),
-        (
-            EXEC_STREAM,
-            Some(RpcId(12)),
-            Some(RPC_TIMEOUT),
-            TrafficClass::Normal
-        )
+        (*stream, *rpc, *class),
+        (EXEC_STREAM, Some(call), TrafficClass::Normal)
     );
     assert!(frame.redactions().is_empty());
 
