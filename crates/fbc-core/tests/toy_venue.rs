@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use fbc_core::{
     AckLevel, AckModel, Aggressor, AmendCaps, AmendOrder, AmendQty, AmendWire, AssetSym, BookCaps,
-    BookId, BookSide, Cadence, CancelOnDisconnect, CancelOrder, CancelWire, Channel, Charset,
-    CidMatch, CidMint, ClientIdFormat, ClientOrderId, ConfigError, ConfigScope, ConnKey,
+    BookId, BookSide, Cadence, CancelOnDisconnect, CancelOrder, CancelRef, CancelWire, Channel,
+    Charset, CidMatch, CidMint, ClientIdFormat, ClientOrderId, ConfigError, ConfigScope, ConnKey,
     ConnTopology, Continuity, DecodeError, DecodeScope, EncodeCtx, EncodeReceipt, Encoding,
     EndpointPlan, Envelope, ExchNs, ExchTsKind, ExecCodec, ExecEndpoint, ExecEvent, ExecSink, Feed,
     FeedHealth, FeedSource, FieldSpec, FieldUnit, FillCaps, FillEvent, FillIdent, FillKey,
@@ -804,11 +804,12 @@ impl ExecCodec for ToyExec {
             }
             VenueCommand::Cancel(c) => {
                 let spec = specs.get(c.inst).ok_or(NotSentReason::Unencodable)?;
+                // The toy cancels by venue id only; the signer sees that reference alone.
+                let vid = c.target.venue().ok_or(NotSentReason::Unsupported)?;
                 let wire = CancelWire {
                     spec,
-                    target: &c.target,
+                    target: CancelRef::Venue(vid),
                     side: c.side,
-                    placement_nonce: c.placement_nonce,
                     wall: ctx.wall,
                     nonce: None,
                 };
@@ -817,7 +818,6 @@ impl ExecCodec for ToyExec {
                     .sign_cancel(&wire)
                     .map_err(|_| NotSentReason::SignFailed)?;
                 assert!(sig.is_none(), "the toy's cancels are unsigned");
-                let vid = c.target.venue().ok_or(NotSentReason::Unsupported)?;
                 format!("cancel|vid={}|ts={}", vid.as_str(), ctx.wall.0)
             }
             VenueCommand::Query(q) => {
@@ -2440,4 +2440,50 @@ fn an_order_that_reduces_is_safety_traffic_whether_or_not_it_carries_the_venue_f
         VenueCommand::PlaceBatch(vec![]).traffic_class(),
         TrafficClass::Normal
     );
+}
+
+/// A signer that records which reference each cancel it was asked to sign names.
+struct RecordingSigner(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl OrderSigner for RecordingSigner {
+    fn sign_place(&mut self, w: &PlaceWire<'_>) -> Result<Sig, SignError> {
+        ToySigner.sign_place(w)
+    }
+
+    fn sign_amend(&mut self, w: &AmendWire<'_>) -> Result<Sig, SignError> {
+        ToySigner.sign_amend(w)
+    }
+
+    fn sign_cancel(&mut self, w: &CancelWire<'_>) -> Result<Option<Sig>, SignError> {
+        let named = match w.target {
+            CancelRef::Venue(vid) => format!("venue:{}", vid.as_str()),
+            CancelRef::Client(cid) => format!("client:{cid}"),
+            CancelRef::PlacementNonce(nonce) => format!("nonce:{nonce}"),
+        };
+        self.0.lock().unwrap().push(named);
+        Ok(None)
+    }
+}
+
+#[test]
+fn a_cancel_signer_sees_only_the_reference_the_request_encodes() {
+    // The command names the order every way it can (client id, venue id, placement nonce); the
+    // codec picks the one its wire carries, and the signer is handed that one alone, so the two
+    // cannot pick different identifiers.
+    let [cid] = mint(1).try_into().unwrap();
+    let vid = with_scope(|scope| scope.venue_order_id("V-1").unwrap());
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut codec = ToyExec {
+        signer: Box::new(RecordingSigner(seen.clone())),
+        url: "https://toy.invalid".to_owned(),
+    };
+    let cancel = VenueCommand::Cancel(CancelOrder {
+        target: OrderRef::Both(cid, vid),
+        inst: INST,
+        side: Side::Buy,
+        placement_nonce: Some(4),
+    });
+    let text = String::from_utf8(encode_once(&mut codec, &cancel, &ctx(9, 5, 1))).unwrap();
+    assert_eq!(text, "rpc=11\ncancel|vid=V-1|ts=9");
+    assert_eq!(*seen.lock().unwrap(), ["venue:V-1"]);
 }

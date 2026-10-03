@@ -27,7 +27,7 @@ use compact_str::CompactString;
 use crate::command::{NotSentReason, OrderKind, Tif, VenueCommand};
 use crate::event::{BookId, ExecEvent, MdEvent, RpcId, StreamId, TouchSourceId, VenueMeta};
 use crate::fee::FeeError;
-use crate::ids::{IdError, InstrumentId, OrderRef, VenueOrderId};
+use crate::ids::{IdError, InstrumentId, VenueOrderId};
 use crate::instrument::InstrumentSpec;
 use crate::scope::DecodeScope;
 use crate::time::{MonoNs, WallNs};
@@ -784,13 +784,25 @@ pub struct AmendWire<'a> {
     pub nonce: Option<u64>,
 }
 
+/// The one reference a cancel request names its order by, as the codec chose it from the
+/// command's [`OrderRef`](crate::OrderRef) and placement nonce: the signer signs exactly what is sent.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum CancelRef<'a> {
+    /// The venue's order id.
+    Venue(&'a VenueOrderId),
+    /// Our client id, already in the venue's wire format.
+    Client(&'a str),
+    /// The nonce the order was placed with.
+    PlacementNonce(u64),
+}
+
 /// A cancel as it goes on the wire.
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub struct CancelWire<'a> {
     pub spec: &'a InstrumentSpec,
-    pub target: &'a OrderRef,
+    /// The reference the request carries, and only that one.
+    pub target: CancelRef<'a>,
     pub side: Side,
-    pub placement_nonce: Option<u64>,
     pub wall: WallNs,
     pub nonce: Option<u64>,
 }
