@@ -7,9 +7,9 @@
 //!
 //! The toy proves FBC-5's done line; it is not a conformance suite, and its `VenueCaps` declare
 //! only what its codecs do. One socket carries the touch; one carries order entry (unsigned
-//! limit orders out; acks, account events, fills and a resync answered in one frame in). It has no
-//! book, trades or other feed, cancels, amends and queries nothing, reads no configuration, and
-//! asks for no HTTP, timer or keepalive.
+//! limit orders out; acks, account events, fills and a resync answered in one frame in). It has
+//! no book, trades or other feed, cancels, amends and queries nothing, reads no configuration,
+//! and asks for no HTTP or keepalive; its one timer asks again for an unanswered resync.
 //!
 //! Protocol: one record per line, `kind|key=value|...`; `ts` is the venue's matching-engine time
 //! in nanoseconds and `seq` its sequence. Prices are ticks, sizes lots, money nanos of USDC.
@@ -50,6 +50,8 @@ const EXEC_STREAM: StreamId = StreamId(1);
 const MD_URL: &str = "wss://toy.invalid/md";
 const EXEC_URL: &str = "wss://toy.invalid/exec";
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
+/// The timer that asks again for a resync left unanswered for `RPC_TIMEOUT`.
+const RESYNC_TAG: TimerTag = TimerTag(1);
 /// The toy reports fees with a positive rebate, so the scope must flip their sign.
 const FEE_SIGN: VenueFeeSign = VenueFeeSign::PositiveIsRebate;
 const CID_FORMAT: ClientIdFormat = ClientIdFormat::Alnum {
@@ -476,7 +478,12 @@ impl ExecCodec for ToyExec {
         Err(DecodeError::Malformed("the toy asks for no HTTP"))
     }
 
-    fn on_timer(&mut self, _tag: TimerTag, _ctx: &EncodeCtx, _fx: &mut Effects) {}
+    /// The resync timer: a resync still unanswered is asked for again, at the new instant.
+    fn on_timer(&mut self, tag: TimerTag, ctx: &EncodeCtx, fx: &mut Effects) {
+        if tag == RESYNC_TAG && self.resync_at.is_some() {
+            self.resync(ctx, fx);
+        }
+    }
 
     fn on_rpc_timeout(&mut self, rpc: RpcId, sink: &mut dyn ExecSink) {
         let (item, outcome) = (None, SubmitOutcome::Unknown);
@@ -487,6 +494,11 @@ impl ExecCodec for ToyExec {
         self.resync_at = Some(ctx.wall);
         let request = format!("snapshot|ts={}", ctx.wall.0);
         fx.push(send(EXEC_STREAM, &request, None, TrafficClass::Safety));
+        let after = RPC_TIMEOUT;
+        fx.push(Effect::Timer {
+            tag: RESYNC_TAG,
+            after,
+        });
     }
 }
 
@@ -923,7 +935,7 @@ fn encode_takes_time_and_nonces_only_from_the_encode_ctx() {
     assert_eq!(receipt.nonces(), [(0, 9_000)]);
     let mut fx = Effects::new();
     effects.iter().cloned().for_each(|e| fx.push(e));
-    assert!(fx.carry_request(RpcId(11)));
+    assert!(fx.carry_request(RpcId(11), cmd.traffic_class()));
 
     // Another wall time or nonce changes the bytes; another monotonic time does not, since
     // nothing in the payload is a monotonic instant.
@@ -1107,6 +1119,28 @@ fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
     let mut fx = Effects::new();
     exec.on_open(EXEC_STREAM, &ctx(1_000, &[]), &mut fx);
     exec.resync(&ctx(2_000, &[]), &mut fx);
+    // An unanswered resync is asked for again when its timer fires, at the new instant; once a
+    // resync is answered, the timer asks for nothing.
+    assert_eq!(exec.nonces_for(CtxCall::Timer(RESYNC_TAG)), 0);
+    exec.on_timer(RESYNC_TAG, &ctx(9_000, &[]), &mut fx);
+    let safety = |text| send(EXEC_STREAM, text, None, TrafficClass::Safety);
+    let retry = Effect::Timer {
+        tag: RESYNC_TAG,
+        after: RPC_TIMEOUT,
+    };
+    let (hello, first, again) = ("hello|ts=1000", "snapshot|ts=2000", "snapshot|ts=9000");
+    let expected = [
+        safety(hello),
+        safety(first),
+        retry.clone(),
+        safety(again),
+        retry,
+    ];
+    assert_eq!(fx.take(), expected);
+    let (results, _) = decode_exec(exec.as_mut(), &["rbegin|wm=9000\nrend"]);
+    assert_eq!(results, [Ok(())]);
+    exec.on_timer(RESYNC_TAG, &ctx(16_000, &[]), &mut fx);
+    assert!(fx.is_empty());
     // An ack answers its request, so the runtime clears that deadline (ExecEvent::answers);
     // a request that times out unanswered is reported Unknown, which answers nothing.
     let (results, mut sink) = decode_exec(exec.as_mut(), &["ack|rpc=11|vid=V-2"]);
@@ -1129,8 +1163,6 @@ fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
     assert_eq!(sink.bodies(), expected.iter().collect::<Vec<_>>());
     let answers = expected.iter().map(ExecEvent::answers);
     assert_eq!(Vec::from_iter(answers), [Some(RpcId(11)), None]);
-    let safety = |text| send(EXEC_STREAM, text, None, TrafficClass::Safety);
-    assert_eq!(fx.take(), ["hello|ts=1000", "snapshot|ts=2000"].map(safety));
 
     // The client-id format has one source, the capabilities: what the exec codec puts on the
     // wire decodes under it as ours.
