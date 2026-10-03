@@ -234,16 +234,24 @@ impl InstrumentSpec {
         if !px.is_finite() {
             return Err(QuantizeError::NotFinite);
         }
-        let finest = self.price_grid.finest();
-        let ticks = match side {
-            Side::Buy => index_of(px, finest, Round::Down)
-                .map(|ticks| self.price_grid.floor_valid(Ticks(ticks))),
-            Side::Sell => index_of(px, finest, Round::Up)
-                .map(|ticks| self.price_grid.ceil_valid(Ticks(ticks))),
+        let grid = &self.price_grid;
+        let round = match side {
+            Side::Buy => Round::Down,
+            Side::Sell => Round::Up,
         };
-        ticks
-            .ok_or(QuantizeError::OutOfRange)?
-            .ok_or(QuantizeError::NoValidPrice)
+        let ticks = Ticks(index_of(px, grid.finest(), round).ok_or(QuantizeError::OutOfRange)?);
+        match side {
+            // A bid finds nothing below a banded grid's lowest price; any other failure is
+            // the maker-safe price passing the end of an i64.
+            Side::Buy => grid.floor_valid(ticks).ok_or_else(|| {
+                if grid.lowest_valid().is_some_and(|lowest| ticks < lowest) {
+                    QuantizeError::NoValidPrice
+                } else {
+                    QuantizeError::OutOfRange
+                }
+            }),
+            Side::Sell => grid.ceil_valid(ticks).ok_or(QuantizeError::OutOfRange),
+        }
     }
 
     /// The order size for a model size `q`, floored onto the size step, or refused when it is
@@ -269,20 +277,18 @@ impl InstrumentSpec {
     }
 
     /// The notional of `q` at `px` in the quote currency, multiplier included, to the nearest
-    /// nano (half to even). `None` when it does not fit a [`Money`], or when the notional
-    /// itself is beyond a `Decimal` (about 7.9e28 quote units).
+    /// nano (half to even). Exact while the product of the factors' decimal mantissas fits an
+    /// `i128`; past that, Decimal arithmetic (28 significant digits). `None` when the result
+    /// does not fit a [`Money`], or when neither way can hold it.
     pub fn notional(&self, px: Ticks, q: Lots) -> Option<Money> {
-        let price = Decimal::from(px.0).checked_mul(self.price_grid.finest())?;
-        let size = Decimal::from(q.get()).checked_mul(self.size_step.get())?;
-        let value = price
-            .checked_mul(size)?
-            .checked_mul(self.multiplier)?
-            .round_dp_with_strategy(9, RoundingStrategy::MidpointNearestEven);
-        // Scale to nanos in i128, which holds more than a Decimal: value = mantissa × 10^−scale
-        // with scale ≤ 9 after rounding.
-        let nanos = value
-            .mantissa()
-            .checked_mul(10_i128.pow(9 - value.scale()))?;
+        let factors = [
+            Decimal::from(px.0),
+            self.price_grid.finest(),
+            Decimal::from(q.get()),
+            self.size_step.get(),
+            self.multiplier,
+        ];
+        let nanos = exact_nanos(&factors).or_else(|| decimal_nanos(&factors))?;
         Some(Money::new(nanos, self.quote_ccy))
     }
 
@@ -294,6 +300,39 @@ impl InstrumentSpec {
         let step = self.price_grid.step_at(ref_px).0 as f64;
         Some(Bps(step / ref_px.0.unsigned_abs() as f64 * 10_000.0))
     }
+}
+
+/// The product of `factors` in nanos, half to even, computed on their mantissas in `i128`;
+/// `None` when the mantissas' product overflows.
+fn exact_nanos(factors: &[Decimal]) -> Option<i128> {
+    let (mut mantissa, mut scale) = (1_i128, 0_u32);
+    for factor in factors {
+        let factor = factor.normalize();
+        mantissa = mantissa.checked_mul(factor.mantissa())?;
+        scale += factor.scale();
+    }
+    // nanos = mantissa × 10^(9 − scale).
+    if scale <= 9 {
+        return mantissa.checked_mul(10_i128.pow(9 - scale));
+    }
+    let Some(divisor) = 10_i128.checked_pow(scale - 9) else {
+        // The divisor is beyond i128 and so beyond twice the mantissa: under half a nano.
+        return Some(0);
+    };
+    let (quotient, rem) = (mantissa.div_euclid(divisor), mantissa.rem_euclid(divisor));
+    let rest = divisor - rem;
+    let up = rem > rest || (rem == rest && quotient % 2 != 0);
+    Some(quotient + i128::from(up))
+}
+
+/// The product of `factors` in nanos through Decimal arithmetic, half to even.
+fn decimal_nanos(factors: &[Decimal]) -> Option<i128> {
+    let value = factors
+        .iter()
+        .try_fold(Decimal::ONE, |acc, factor| acc.checked_mul(*factor))?
+        .round_dp_with_strategy(9, RoundingStrategy::MidpointNearestEven);
+    // value = mantissa × 10^−scale with scale ≤ 9 after rounding.
+    value.mantissa().checked_mul(10_i128.pow(9 - value.scale()))
 }
 
 /// Above this magnitude no index fits an `i64`, whichever way it rounds.
