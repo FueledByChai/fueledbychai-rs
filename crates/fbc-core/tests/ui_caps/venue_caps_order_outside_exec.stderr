@@ -1,0 +1,7 @@
+error[E0560]: struct `VenueCaps` has no field named `order`
+ --> tests/ui_caps/venue_caps_order_outside_exec.rs:8:9
+  |
+8 |         order: Some(order),
+  |         ^^^^^ `VenueCaps` does not have this field
+  |
+  = note: available fields are: `exec`

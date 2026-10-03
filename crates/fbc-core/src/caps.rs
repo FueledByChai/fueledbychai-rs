@@ -12,6 +12,11 @@
 //! them as numbers and flags. A behaviour these types cannot express grows them with a new
 //! mandatory field and a decision record.
 //!
+//! Order and fill capabilities come together in one [`ExecCaps`] block, `None` for a
+//! market-data-only venue (decision 0015, amending design §4.5's separate `order` and `fills`):
+//! a venue cannot declare orders without saying how it reports fills, nor fill claims (a fill
+//! source, a fee sign) for an account feed it does not have.
+//!
 //! Sets of flags are [`TagSet`]s, built by listing their members ([`TagSet::of`]) or stated
 //! empty ([`TagSet::none`]).
 
@@ -24,13 +29,12 @@ use crate::fee::VenueFeeSign;
 use crate::time::ExchTsKind;
 use crate::units::Channel;
 
-/// Everything a venue can do. `None` for [`order`](VenueCaps::order) means market data only.
+/// Everything a venue can do. `None` for [`exec`](VenueCaps::exec) means market data only.
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub struct VenueCaps {
-    /// Order entry, or `None` for a market-data-only venue.
-    pub order: Option<OrderCaps>,
-    /// What the venue reports about fills.
-    pub fills: FillCaps,
+    /// Order entry and the fills it reports, or `None` for a market-data-only venue, which then
+    /// declares no order capability, fill source or fee sign (decision 0015).
+    pub exec: Option<ExecCaps>,
     /// How the venue matches.
     pub matching: MatchingCaps,
     /// What market data the venue publishes, and how.
@@ -39,6 +43,16 @@ pub struct VenueCaps {
     pub limits: Vec<RateLimit>,
     /// The furthest this adapter may be promoted: recording, shadow, paper or live.
     pub readiness_ceiling: Readiness,
+}
+
+/// What a venue with order entry can do: its orders and the fills they report, declared
+/// together so neither half exists without the other (decision 0015).
+#[derive(Clone, Eq, PartialEq, Debug)]
+pub struct ExecCaps {
+    /// What order entry the venue offers.
+    pub order: OrderCaps,
+    /// What the venue reports about fills.
+    pub fills: FillCaps,
 }
 
 /// What order entry a venue offers.

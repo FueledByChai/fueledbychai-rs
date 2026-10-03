@@ -1,0 +1,5 @@
+error[E0063]: missing field `fills` in initializer of `ExecCaps`
+ --> tests/ui_caps/exec_caps_order_without_fills.rs:6:5
+  |
+6 |     ExecCaps { order }
+  |     ^^^^^^^^ missing `fills`

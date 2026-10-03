@@ -119,6 +119,8 @@ rather than guess.
   - `crates/fbc-core`: the contract. Time, units, price grids and exact prices, sealed ids and
     the canonical client-id codec, `Fee`/`FeeBook`, `InstrumentSpec`, `VenueCaps`, events,
     commands, the codec and factory traits, `DecodeScope` and `EncodeCtx` (0003, 0004).
+    `VenueCaps` keeps order and fill capabilities together in `exec: Option<ExecCaps>`,
+    `None` for a market-data-only venue, which declares no fill source or fee sign (0015).
     `Lots` is built only through `Lots::new`, which refuses a negative count, and `Ticks`,
     `Lots` and `SignedLots` have checked arithmetic only (`checked_*` and `abs_lots` return
     `None` rather than wrap; no `+`, `-` or unary `-`), so overflow behaves the same in every
@@ -243,7 +245,9 @@ Design rules the records fix:
   consumer configures applies; never write a proxy address into code (0002).
 - Never branch on a venue name outside the venue crates and the registry; a behaviour the
   capability model cannot express grows `VenueCaps` with a new mandatory field and a record
-  (0003). Never give a capability type a `Default` or `#[non_exhaustive]`.
+  (0003). Never give a capability type a `Default` or `#[non_exhaustive]`. Order and fill
+  capabilities are declared together in `VenueCaps::exec` or not at all (0015); read them as
+  `caps.exec.order.*` and `caps.exec.fills.*`, never as a fill claim of a market-data-only venue.
 - Never create a `VenueOrderId`, `FillId` or `Fee` outside `DecodeScope`, and never take the
   absolute value or negation of a fee: a fee is positive when we paid it (0004).
 - Never resend an order in `Unknown`; it counts as resting until the Unknown ladder resolves it,

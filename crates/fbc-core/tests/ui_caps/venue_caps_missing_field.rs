@@ -1,26 +1,15 @@
 use std::time::Duration;
 
 use fbc_core::{
-    Cadence, ConnTopology, Encoding, ExchTsKind, FeedSource, FillCaps, FillSource,
-    FundingCaps, MatchingCaps, MdCaps, SeqDomain, StpScope, TagSet, TouchSourceCaps, TradeCaps,
-    VenueCaps, VenueFeeSign,
+    Cadence, ConnTopology, Encoding, ExchTsKind, FeedSource, FundingCaps, MatchingCaps, MdCaps,
+    SeqDomain, StpScope, TagSet, TouchSourceCaps, TradeCaps, VenueCaps,
 };
 
 fn main() {
     // Every field but readiness_ceiling is declared; with no Default to fill it, this does not
     // compile (decision 0003).
     let _ = VenueCaps {
-        order: None,
-        fills: FillCaps {
-            source: FillSource::Native,
-            liquidity_flag: true,
-            realized_pnl: true,
-            realized_funding: true,
-            fee_sign: VenueFeeSign::PositiveIsCost,
-            fee_asset_reported: true,
-            fill_id: true,
-            replays_fills_on_reconnect: false,
-        },
+        exec: None,
         matching: MatchingCaps {
             speed_bump: None,
             stp_scope: StpScope::None,

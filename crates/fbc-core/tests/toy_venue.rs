@@ -24,8 +24,8 @@ use fbc_core::{
     AckLevel, AckModel, AssetSym, Cadence, CancelOnDisconnect, Channel, Charset, CidMatch, CidMint,
     ClientIdFormat, ClientOrderId, ConfigError, ConnKey, ConnTopology, CtxCall, DecodeError,
     DecodeScope, Effect, Effects, EncodeCtx, EncodeReceipt, Encoding, EndpointPlan, Envelope,
-    ExchNs, ExchTsKind, ExecCodec, ExecEndpoint, ExecEvent, ExecSink, Feed, FeedSource, FieldSpec,
-    FillCaps, FillEvent, FillIdent, FillSource, FundingCaps, FundingSpec, HttpFailure,
+    ExchNs, ExchTsKind, ExecCaps, ExecCodec, ExecEndpoint, ExecEvent, ExecSink, Feed, FeedSource,
+    FieldSpec, FillCaps, FillEvent, FillIdent, FillSource, FundingCaps, FundingSpec, HttpFailure,
     HttpResponse, HttpTag, InstrumentId, InstrumentKind, InstrumentSpec, ItemRef, Keepalive,
     Liquidity3, Lots, Lvl, MatchingCaps, MdCaps, MdCodec, MdEvent, MdSink, MdTransport, Money,
     MonoNs, Namespace, NamespaceLease, NewOrder, NonceBlock, NonceScope, NotSentReason, OrderCaps,
@@ -443,7 +443,7 @@ impl ExecCodec for ToyExec {
             return Err(NotSentReason::Unsupported);
         };
         let spec = specs.get(o.inst).ok_or(NotSentReason::Unencodable)?;
-        let caps = toy_caps().order.expect("the toy takes orders");
+        let caps = toy_caps().exec.expect("the toy takes orders").order;
         if !(caps.tifs.contains(o.tif) && caps.channels.contains(o.channel)) {
             return Err(NotSentReason::Unsupported);
         }
@@ -579,42 +579,44 @@ impl VenueFactory for ToyFactory {
 /// What the toy does, and nothing more.
 fn toy_caps() -> VenueCaps {
     VenueCaps {
-        order: Some(OrderCaps {
-            kinds: TagSet::of(&[OrderKindTag::Limit]),
-            tifs: TagSet::of(&[TifTag::Gtc]),
-            channels: TagSet::of(&[Channel::Public]),
-            post_only: true,
-            reduce_only: true,
-            flag_conflicts: vec![],
-            amend: None,
-            cancel_refs: TagSet::none(),
-            query_refs: TagSet::none(),
-            cancel_before_ack: false,
-            cancel_is_signed: false,
-            batch_place: None,
-            batch_cancel: None,
-            cancel_all_account: Support::Unsupported,
-            cancel_all_instrument: Support::Unsupported,
-            cancel_on_disconnect: CancelOnDisconnect::None,
-            ack: AckModel::SinglePhase,
-            client_id: CID_FORMAT,
-            cid_echoed_on_events: true,
-            nonce_scope: NonceScope::PerAccountMonotonic,
-            ordering_key: OrderingKey::VenueSeq,
-            snapshot_source: SnapshotSource::Trustworthy,
-            events_echo_flags: false,
-            sign_cost_hint_us: 0,
+        exec: Some(ExecCaps {
+            order: OrderCaps {
+                kinds: TagSet::of(&[OrderKindTag::Limit]),
+                tifs: TagSet::of(&[TifTag::Gtc]),
+                channels: TagSet::of(&[Channel::Public]),
+                post_only: true,
+                reduce_only: true,
+                flag_conflicts: vec![],
+                amend: None,
+                cancel_refs: TagSet::none(),
+                query_refs: TagSet::none(),
+                cancel_before_ack: false,
+                cancel_is_signed: false,
+                batch_place: None,
+                batch_cancel: None,
+                cancel_all_account: Support::Unsupported,
+                cancel_all_instrument: Support::Unsupported,
+                cancel_on_disconnect: CancelOnDisconnect::None,
+                ack: AckModel::SinglePhase,
+                client_id: CID_FORMAT,
+                cid_echoed_on_events: true,
+                nonce_scope: NonceScope::PerAccountMonotonic,
+                ordering_key: OrderingKey::VenueSeq,
+                snapshot_source: SnapshotSource::Trustworthy,
+                events_echo_flags: false,
+                sign_cost_hint_us: 0,
+            },
+            fills: FillCaps {
+                source: FillSource::Native,
+                liquidity_flag: true,
+                realized_pnl: true,
+                realized_funding: true,
+                fee_sign: FEE_SIGN,
+                fee_asset_reported: false,
+                fill_id: true,
+                replays_fills_on_reconnect: false,
+            },
         }),
-        fills: FillCaps {
-            source: FillSource::Native,
-            liquidity_flag: true,
-            realized_pnl: true,
-            realized_funding: true,
-            fee_sign: FEE_SIGN,
-            fee_asset_reported: false,
-            fill_id: true,
-            replays_fills_on_reconnect: false,
-        },
         matching: MatchingCaps {
             speed_bump: None,
             stp_scope: StpScope::Account,
@@ -1205,7 +1207,7 @@ fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
 
     // The client-id format has one source, the capabilities: what the exec codec puts on the
     // wire decodes under it as ours.
-    let format = factory.caps(&cfg).unwrap().order.unwrap().client_id;
+    let format = factory.caps(&cfg).unwrap().exec.unwrap().order.client_id;
     let cid = mint();
     let place = VenueCommand::Place(order(cid));
     let text = String::from_utf8(bytes(&place, &ctx(1, &[1]))).unwrap();

@@ -1,5 +1,5 @@
 error[E0063]: missing field `readiness_ceiling` in initializer of `VenueCaps`
-  --> tests/ui_caps/venue_caps_missing_field.rs:12:13
+  --> tests/ui_caps/venue_caps_missing_field.rs:11:13
    |
-12 |     let _ = VenueCaps {
+11 |     let _ = VenueCaps {
    |             ^^^^^^^^^ missing `readiness_ceiling`
