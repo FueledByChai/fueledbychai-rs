@@ -1,5 +1,5 @@
 //! Normalized events: what a venue adapter's codecs turn bytes and HTTP results into
-//! (decisions 0002 and 0005, design §4.6).
+//! (decisions 0002, 0005 and 0014, design §4.6).
 //!
 //! Every event travels in an [`Envelope`]: the runtime's [`Stamp`] (where and when the frame
 //! arrived, recorded before decode) and what the venue said about it (exchange time and its

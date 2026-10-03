@@ -16,3 +16,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0011](0011-the-kill-switch-blocks-every-order-reducing-orders-included-.md) The kill switch blocks every order, reducing orders included; cancels always go through — superseded by 0012
 - [0012](0012-the-kill-switch-blocks-every-place-and-amend-cancels-go-thro.md) The kill switch blocks every place and amend; cancels go through within 0005's guards; lifting it leaves the market cancel-only — accepted, supersedes 0011
 - [0013](0013-three-safety-rules-every-change-keeps-nothing-sent-after-a-r.md) Three safety rules every change keeps: nothing sent after a restart until Start, Flatten or Wind-down, pre-trade caps on every order, one quoter per market — accepted, supersedes 0010
+- [0014](0014-the-venue-boundary-as-built-refines-design-4-6-to-4-8-where-.md) The venue boundary as built refines design 4.6 to 4.8 where a sans-IO codec needs more than the design text gives it — accepted

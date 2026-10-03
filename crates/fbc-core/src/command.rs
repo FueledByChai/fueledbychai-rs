@@ -1,4 +1,4 @@
-//! Venue commands and what becomes of them (decisions 0002, 0004 and 0005, design §4.6).
+//! Venue commands and what becomes of them (decisions 0002, 0004, 0005 and 0014, design §4.6).
 //!
 //! A [`VenueCommand`] carries every field the venue needs to encode and sign it: the OMS
 //! resolves each one from its order record, and codecs hold no order registry, so an amend,

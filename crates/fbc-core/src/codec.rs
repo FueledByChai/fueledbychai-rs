@@ -1,4 +1,4 @@
-//! The sans-IO codec boundary every venue adapter implements (decision 0002, design §4.7).
+//! The sans-IO codec boundary every venue adapter implements (decisions 0002 and 0014, design §4.7).
 //!
 //! An adapter owns no socket, thread, queue or clock. Its codecs take bytes, HTTP results and
 //! timer firings in, and give normalized events (to a sink) and [`Effect`]s out: send a frame,
@@ -513,7 +513,11 @@ impl SpecTable {
 pub enum Feed {
     /// The best bid and offer from one touch channel.
     Touch(TouchSourceId),
-    /// One book channel: an index into [`MdCaps::books`](crate::MdCaps::books).
+    /// One book channel: an index into [`MdCaps::books`](crate::MdCaps::books). An instrument
+    /// subscribes to at most one book channel: which one is a configuration choice recorded in
+    /// the journal header and treated as a strategy change (design §7.2, `includes_channels`),
+    /// so the book events ([`MdEvent::Level`](crate::MdEvent::Level) and the rest) name the
+    /// instrument and not the channel.
     Book(u8),
     Trades,
     Mark,
