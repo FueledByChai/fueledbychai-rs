@@ -578,6 +578,7 @@ impl ToyExec {
         receipt: &mut EncodeReceipt,
     ) -> Result<String, NotSentReason> {
         let spec = specs.get(o.inst).ok_or(NotSentReason::Unencodable)?;
+        offers(o.tif, o.channel)?;
         let nonce = receipt
             .use_nonce(ctx, idx)
             .ok_or(NotSentReason::Unencodable)?;
@@ -763,6 +764,16 @@ impl ToyExec {
     }
 }
 
+/// Refuses a time in force or channel the toy's caps do not offer.
+fn offers(tif: TifTag, channel: Channel) -> Result<(), NotSentReason> {
+    let caps = toy_caps().order.expect("the toy takes orders");
+    if caps.tifs.contains(tif) && caps.channels.contains(channel) {
+        Ok(())
+    } else {
+        Err(NotSentReason::Unsupported)
+    }
+}
+
 fn side_code(side: Side) -> &'static str {
     match side {
         Side::Buy => "B",
@@ -814,6 +825,7 @@ impl ExecCodec for ToyExec {
                 let spec = specs.get(a.inst).ok_or(NotSentReason::Unencodable)?;
                 // The toy amends by venue id only: an amend naming none has no target.
                 let vid = a.target.venue().ok_or(NotSentReason::Unsupported)?;
+                offers(a.tif, a.channel)?;
                 let nonce = receipt
                     .use_nonce(ctx, 0)
                     .ok_or(NotSentReason::Unencodable)?;
@@ -1009,13 +1021,17 @@ impl VenueFactory for ToyFactory {
         if !symbols.is_empty() {
             url = format!("{url}?symbols={}", symbols.join(","));
         }
-        let mut plan = vec![EndpointPlan {
-            stream: StreamId(0),
-            transport: MdTransport::Socket {
-                url: WireUrl::plain(url),
-            },
-            subs: streamed,
-        }];
+        // A socket only for streamed feeds: a plan of poll-only feeds opens none.
+        let mut plan = Vec::new();
+        if !streamed.is_empty() {
+            plan.push(EndpointPlan {
+                stream: StreamId(0),
+                transport: MdTransport::Socket {
+                    url: WireUrl::plain(url),
+                },
+                subs: streamed,
+            });
+        }
         if !polled.is_empty() {
             plan.push(EndpointPlan {
                 stream: POLL_STREAM,
@@ -1555,7 +1571,16 @@ fn the_toy_decodes_market_data_frames_into_md_events() {
     let mut codec = ToyFactory.md_codec(
         &config(),
         &ToyFactory
-            .plan_md(&config(), &specs(), &BTreeSet::new())
+            .plan_md(
+                &config(),
+                &specs(),
+                &[Subscription {
+                    inst: INST,
+                    feed: Feed::Trades,
+                }]
+                .into_iter()
+                .collect(),
+            )
             .unwrap()[0],
     );
     let (specs, mut sink, mut fx) = (specs(), Collect::new(), Effects::new());
@@ -2629,7 +2654,16 @@ fn a_feed_the_caps_do_not_offer_is_refused_by_planning_and_subscribing() {
     let mut md = ToyFactory.md_codec(
         &config(),
         &ToyFactory
-            .plan_md(&config(), &specs(), &BTreeSet::new())
+            .plan_md(
+                &config(),
+                &specs(),
+                &[Subscription {
+                    inst: INST,
+                    feed: Feed::Trades,
+                }]
+                .into_iter()
+                .collect(),
+            )
             .unwrap()[0],
     );
     for feed in refused {
@@ -2806,4 +2840,67 @@ fn a_url_span_over_a_delimiter_still_leaves_the_rest_of_the_query_hidden() {
         );
         assert!(shown.contains("venue.invalid"), "{shown}");
     }
+}
+
+#[test]
+fn an_order_with_a_time_in_force_or_channel_the_caps_do_not_offer_is_not_sent() {
+    // The toy offers GTC on the public book only (OrderCaps::tifs, channels).
+    let [a, b] = mint(2).try_into().unwrap();
+    let ioc = NewOrder {
+        tif: TifTag::Ioc,
+        ..order(a, 130_865)
+    };
+    let rpi = NewOrder {
+        channel: Channel::Rpi,
+        ..order(a, 130_865)
+    };
+    let fok_in_batch = VenueCommand::PlaceBatch(vec![
+        order(a, 130_865),
+        NewOrder {
+            tif: TifTag::Fok,
+            ..order(b, 130_864)
+        },
+    ]);
+    let vid = with_scope(|scope| scope.venue_order_id("V-1").unwrap());
+    let amend_ioc = VenueCommand::Amend(AmendOrder {
+        target: OrderRef::Venue(vid),
+        inst: INST,
+        side: Side::Buy,
+        tif: TifTag::Ioc,
+        channel: Channel::Public,
+        post_only: true,
+        reduce_only: false,
+        reducing: false,
+        px: Ticks(130_860),
+        qty: Lots::new(25).unwrap(),
+        cum_filled: Lots::new(5).unwrap(),
+    });
+    for cmd in [
+        VenueCommand::Place(ioc),
+        VenueCommand::Place(rpi),
+        fok_in_batch,
+        amend_ioc,
+    ] {
+        let mut fx = Effects::new();
+        let refused = exec_codec().encode(&cmd, RpcId(40), &specs(), &ctx(5, 1, 2), &mut fx);
+        assert_eq!(refused, Err(NotSentReason::Unsupported), "{cmd:?}");
+        assert!(fx.is_empty());
+    }
+}
+
+#[test]
+fn a_plan_of_poll_only_feeds_opens_no_socket() {
+    let stats: BTreeSet<Subscription> = [Subscription {
+        inst: INST,
+        feed: Feed::Stats,
+    }]
+    .into_iter()
+    .collect();
+    let plan = ToyFactory.plan_md(&config(), &specs(), &stats).unwrap();
+    assert_eq!(plan.len(), 1, "{plan:?}");
+    assert!(matches!(plan[0].transport, MdTransport::Poll { .. }));
+    assert_eq!(
+        ToyFactory.plan_md(&config(), &specs(), &BTreeSet::new()),
+        Ok(vec![])
+    );
 }
