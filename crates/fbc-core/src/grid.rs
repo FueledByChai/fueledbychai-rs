@@ -258,8 +258,9 @@ impl PriceGrid {
                     let Band {
                         from_ticks, step, ..
                     } = grid.bands[band];
-                    let candidate = floor_multiple(top, step)?;
-                    if candidate >= from_ticks {
+                    // A multiple that overflows lies below i64::MIN, so below this band too.
+                    if let Some(candidate) = floor_multiple(top, step).filter(|&c| c >= from_ticks)
+                    {
                         return Some(Ticks(candidate));
                     }
                     // Nothing valid in this band at or below `top`: the band below ends just
@@ -290,13 +291,15 @@ impl PriceGrid {
                     let Band {
                         from_ticks, step, ..
                     } = grid.bands[band];
-                    let candidate = ceil_multiple(bottom.max(from_ticks), step)?;
+                    // A multiple that overflows lies above i64::MAX, so past any next band's
+                    // start: that band may still hold a valid price.
+                    let candidate = ceil_multiple(bottom.max(from_ticks), step);
                     match grid.bands.get(band + 1) {
-                        Some(next) if candidate >= next.from_ticks => {
+                        Some(next) if candidate.is_none_or(|c| c >= next.from_ticks) => {
                             band += 1;
                             bottom = next.from_ticks;
                         }
-                        _ => return Some(Ticks(candidate)),
+                        _ => return candidate.map(Ticks),
                     }
                 }
             }
@@ -536,6 +539,26 @@ mod tests {
         assert_eq!(banded.ceil_valid(Ticks(i64::MAX)), None);
         assert_eq!(banded.floor_valid(Ticks(-1)), None);
         assert_eq!(banded.ceil_valid(Ticks(-1)), Some(Ticks(0)));
+    }
+
+    #[test]
+    fn a_multiple_past_the_end_of_i64_moves_on_to_the_next_band() {
+        // Steps of 10 up to i64::MAX - 5, then steps of 1. From i64::MAX - 6 the first band's
+        // next multiple overflows, but the second band's start is valid and above it.
+        let start = i64::MAX - 5;
+        let grid =
+            PriceGrid::banded(&[(dec("0"), dec("10")), (Decimal::from(start), dec("1"))]).unwrap();
+        assert_eq!(grid.ceil_valid(Ticks(start - 1)), Some(Ticks(start)));
+        // Below zero the mirror case: steps of 1 from i64::MIN, then steps of 10 from
+        // i64::MIN + 5. From i64::MIN + 6 the second band's multiple below overflows, but the
+        // first band holds i64::MIN + 4.
+        let low = i64::MIN + 5;
+        let grid = PriceGrid::banded(&[
+            (Decimal::from(i64::MIN), dec("1")),
+            (Decimal::from(low), dec("10")),
+        ])
+        .unwrap();
+        assert_eq!(grid.floor_valid(Ticks(low + 1)), Some(Ticks(low - 1)));
     }
 
     #[test]

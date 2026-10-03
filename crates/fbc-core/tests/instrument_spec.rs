@@ -349,3 +349,43 @@ fn a_spec_states_every_field_and_a_size_step_is_positive() {
     assert_eq!(dated.funding, FundingSpec::NotApplicable);
     assert_ne!(FundingSpec::Unknown, FundingSpec::NotApplicable);
 }
+
+#[test]
+fn a_high_precision_unit_does_not_overflow_an_index_that_fits() {
+    // A 28-digit tick and size step: 1e11 / 0.1234567890123456789012345678 is
+    // 810_000_007_290.00006..., far inside an i64.
+    let unit = dec("0.1234567890123456789012345678");
+    let precise = InstrumentSpec {
+        size_step: SizeStep::new(unit).unwrap(),
+        min_size: Lots::new(1).unwrap(),
+        ..spec(PriceGrid::fixed(unit).unwrap())
+    };
+    assert_eq!(
+        precise.floor_qty(1e11),
+        Ok(Lots::new(810_000_007_290).unwrap())
+    );
+    assert_eq!(
+        quote(&precise, 1e11),
+        (Ticks(810_000_007_290), Ticks(810_000_007_291))
+    );
+    assert_eq!(
+        quote(&precise, -1e11),
+        (Ticks(-810_000_007_291), Ticks(-810_000_007_290))
+    );
+    // Exactly on the grid, both sides keep the index.
+    assert_eq!(quote(&precise, 0.0), (Ticks(0), Ticks(0)));
+}
+
+#[test]
+fn a_notional_beyond_decimal_nanos_still_fits_money() {
+    // 1e10 ticks of 1 times 1e10 lots of 1 is 1e20 USD, 1e29 nanos: past a Decimal, inside
+    // an i128.
+    let unit = InstrumentSpec {
+        size_step: SizeStep::new(dec("1")).unwrap(),
+        ..fixed("1")
+    };
+    assert_eq!(
+        unit.notional(Ticks(10_000_000_000), Lots::new(10_000_000_000).unwrap()),
+        Some(Money::new(100_000_000_000_000_000_000_000_000_000, usd()))
+    );
+}

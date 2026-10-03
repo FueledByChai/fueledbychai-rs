@@ -269,16 +269,21 @@ impl InstrumentSpec {
     }
 
     /// The notional of `q` at `px` in the quote currency, multiplier included, to the nearest
-    /// nano (half to even). `None` when it does not fit a [`Money`].
+    /// nano (half to even). `None` when it does not fit a [`Money`], or when the notional
+    /// itself is beyond a `Decimal` (about 7.9e28 quote units).
     pub fn notional(&self, px: Ticks, q: Lots) -> Option<Money> {
         let price = Decimal::from(px.0).checked_mul(self.price_grid.finest())?;
         let size = Decimal::from(q.get()).checked_mul(self.size_step.get())?;
-        let nanos = price
+        let value = price
             .checked_mul(size)?
             .checked_mul(self.multiplier)?
-            .checked_mul(Decimal::from(1_000_000_000_u32))?
-            .round_dp_with_strategy(0, RoundingStrategy::MidpointNearestEven);
-        Some(Money::new(i128::try_from(nanos).ok()?, self.quote_ccy))
+            .round_dp_with_strategy(9, RoundingStrategy::MidpointNearestEven);
+        // Scale to nanos in i128, which holds more than a Decimal: value = mantissa × 10^−scale
+        // with scale ≤ 9 after rounding.
+        let nanos = value
+            .mantissa()
+            .checked_mul(10_i128.pow(9 - value.scale()))?;
+        Some(Money::new(nanos, self.quote_ccy))
     }
 
     /// The grid step at `ref_px` in basis points of `ref_px`; `None` at a zero price.
@@ -290,6 +295,9 @@ impl InstrumentSpec {
         Some(Bps(step / ref_px.0.unsigned_abs() as f64 * 10_000.0))
     }
 }
+
+/// Above this magnitude no index fits an `i64`, whichever way it rounds.
+const INDEX_LIMIT: i128 = 1 << 63;
 
 /// Which way [`index_of`] rounds.
 #[derive(Copy, Clone)]
@@ -317,39 +325,42 @@ fn index_of(x: f64, unit: Decimal, round: Round) -> Option<i64> {
         digits = digits * 10 + i128::from(byte - b'0');
     }
     // x = ±digits × 10^(exp − frac digits) and unit = mantissa × 10^(−scale), so
-    // x / unit = ±digits × 10^power / mantissa.
+    // |x / unit| = digits × 10^power / mantissa. Find its whole part and whether it is exact.
     let unit = unit.normalize();
+    let den = unit.mantissa();
     let power = exp - frac.len() as i32 + unit.scale() as i32;
-    let (mut num, den) = if power >= 0 {
-        // An overflow here means a quotient above i128::MAX / mantissa, which is beyond i64
-        // for every unit whose normalized mantissa is below 10^19 (every real tick and step).
-        (
-            digits.checked_mul(10_i128.checked_pow(power.unsigned_abs())?)?,
-            unit.mantissa(),
-        )
+    let (magnitude, inexact) = if power >= 0 {
+        // Long division, one decimal digit of 10^power at a time, so no intermediate exceeds
+        // ten times the divisor however many digits the unit has.
+        let (mut quotient, mut rem) = (digits / den, digits % den);
+        for _ in 0..power {
+            if quotient > INDEX_LIMIT {
+                return None;
+            }
+            quotient = quotient * 10 + rem * 10 / den;
+            rem = rem * 10 % den;
+        }
+        (quotient, rem != 0)
     } else {
         match 10_i128
             .checked_pow(power.unsigned_abs())
-            .and_then(|scale| unit.mantissa().checked_mul(scale))
+            .and_then(|scale| den.checked_mul(scale))
         {
-            Some(den) => (digits, den),
+            Some(den) => (digits / den, digits % den != 0),
             // The divisor is beyond i128 while the digits (not zero: zero prints as "0e0",
             // which takes the branch above) are below 10^17, so 0 < |x / unit| < 1.
-            None => {
-                return Some(match (round, negative) {
-                    (Round::Down, false) | (Round::Up, true) => 0,
-                    (Round::Down, true) => -1,
-                    (Round::Up, false) => 1,
-                });
-            }
+            None => (0, true),
         }
     };
-    if negative {
-        num = -num;
+    if magnitude > INDEX_LIMIT {
+        return None;
     }
-    let quotient = match round {
-        Round::Down => num.div_euclid(den),
-        Round::Up => -(-num).div_euclid(den),
+    let up = i128::from(inexact);
+    let index = match (round, negative) {
+        (Round::Down, false) => magnitude,
+        (Round::Up, false) => magnitude + up,
+        (Round::Down, true) => -(magnitude + up),
+        (Round::Up, true) => -magnitude,
     };
-    i64::try_from(quotient).ok()
+    i64::try_from(index).ok()
 }
