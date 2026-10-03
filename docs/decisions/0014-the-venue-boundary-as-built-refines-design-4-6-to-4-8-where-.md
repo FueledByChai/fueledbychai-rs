@@ -26,7 +26,10 @@ stay sans-IO and deterministic:
    `next()`, the runtime reserves `VenueCommand::items()` nonces per encode and journals the
    values, and `exec_codec` takes no `NonceSource`. For the other calls that take an
    `EncodeCtx` (`on_open`, `on_timer`, `resync`) the codec states the count:
-   `ExecCodec::nonces_for(CtxCall)`, asked right before the call.
+   `ExecCodec::nonces_for(CtxCall)`, asked right before the call. An `EncodeReceipt` has no
+   public fields: a codec fills it only through `use_nonce(ctx, item)`, which takes each
+   value from the context once per item, so the OMS never keeps a placement nonce the
+   request did not use.
 2. **Codecs report, the runtime stamps.** `MdSink`/`ExecSink` take `(VenueMeta, body)`; the
    runtime builds the `Envelope` with its `Stamp`, so a decoder cannot forge receive time or
    ingest order.
@@ -76,13 +79,16 @@ stay sans-IO and deterministic:
    dedup key (I3) cannot disagree with the order and quantity the fill is applied to.
    `VenueOrderState::Amended` carries only `new_vid`: the amended price and total are the
    event's own `px` and `qty`, stated once (`None` where the venue does not echo them).
+   `SubmitOutcome::Accepted` carries only `ack`: the accepted order's venue id is the item's
+   `ItemRef::vid`, stated once.
 8. **`Debug` never shows a credential (0009).** `WireSlice`, `Header`, `HttpRequest`,
    `HttpResponse`, `RawFrame` and `Reject` format redaction spans, redacted header values, a
    URL's user information, query and fragment, response bodies, inbound frames and a venue's
    reject text by length only. URLs are `WireUrl`s (`HttpRequest.url`, `ExecEndpoint.url`,
    `MdTransport`'s URLs) carrying credential spans like `WireSlice`, so the journal can hash
-   a key in a path or query; their `Debug` redacts the spans and shows user information,
-   query and fragment by length.
+   a key in a path or query; their `Debug` finds user information, query and fragment in the
+   URL as written, shows them by length, and redacts spans inside what it shows.
+   `VenueConfig`'s `Debug` shows keys and value lengths only.
 9. **Configuration, connections and traffic class.** `VenueConfig` keeps market-scoped keys per
    instrument (`insert_market`, `get_market`). `VenueFactory::plan_exec` returns the order-entry
    connections (`ExecEndpoint`) the runtime opens before `ExecCodec::on_open`. The client-id
