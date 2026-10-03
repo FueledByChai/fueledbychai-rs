@@ -281,7 +281,8 @@ pub enum VenueOrderState {
     Open,
     Filled,
     Canceled(CancelReason),
-    /// Refused for good; never for not knowing the order ([`TerminalReject`]).
+    /// Refused for good; never for not knowing the order, nor for a refused operation on it
+    /// ([`TerminalReject`]).
     Rejected(TerminalReject),
     Expired,
     /// Amended, under `new_vid` where the venue issues a new order id for the amended order.
