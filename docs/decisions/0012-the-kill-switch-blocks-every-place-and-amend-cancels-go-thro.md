@@ -32,9 +32,11 @@ is exited deliberately, by the owner. 0011 recorded that answer.
 
 Records are never edited in place, so this record supersedes 0011. It keeps the owner's
 decision as it was given and corrects the three faults in the rule itself; the fourth is fixed
-in the documents that cite it. 0010 stays accepted and unedited: its "cancels are never blocked
+in the documents that cite it. 0010 stays accepted and its text is not edited, but this record
+changes how two of its rules are read, and says so below. Rule 2's "cancels are never blocked
 by a cap or by the kill switch" stands, and this record states which other rules a cancel
-still obeys.
+still obeys. Rule 1's "trading is off after any restart until the owner presses Start" is
+widened to let the owner exit without quoting first (see "How this reads 0010's rule 1").
 
 The question is real because the design gives reducing orders privileges elsewhere. Invariant
 I6 (0005; design §4.9) admits an order that genuinely reduces the position, and the
@@ -70,14 +72,15 @@ timer, moves a market toward Exit or Quoting on its own. Start, Flatten and Wind
 one explicit consumer call made on the owner's action, and each is refused for a Killed market.
 
 0010's armed state keeps 0010's meaning, and a place or amend is built only for a market that
-is both armed and in Exit or Quoting. Arming is part of these three calls, so "Start" means the
-same here as in 0010 and there is no arm call that leaves a market in Cancel-only:
+is both armed and in Exit or Quoting. Arming is part of these three calls, and there is no arm
+call that leaves a market in Cancel-only:
 
 - **Start** is 0010's Start. On a disarmed market it arms the market (with 0010's leases) and
-  moves it to Quoting in one call; on an armed market it moves it to Quoting.
-- **Flatten** and **Wind-down** on a disarmed market arm it and move it to Exit in one call,
-  so an exit after a restart never passes through Quoting; on an armed market they move it to
-  Exit.
+  moves it to Quoting in one call; on an armed market it moves it to Quoting. Start is the only
+  call that reaches Quoting.
+- **Flatten** and **Wind-down** on a disarmed market arm it (with the same leases) and move it
+  to Exit in one call, so an exit after a restart never passes through Quoting; on an armed
+  market they move it to Exit.
 - A call refused for want of a lease changes neither the armed state nor the market's state.
 
 A disarmed market is always in Killed or Cancel-only. A new runtime starts every market
@@ -85,6 +88,30 @@ disarmed (0010, rule 1) and in Cancel-only, and an explicit disarm call moves a 
 or Quoting to Cancel-only, so arming again always takes Start, Flatten or Wind-down. Whether a
 kill switch survives a restart is the consumer's; if it does, the consumer turns it on before
 any of those calls.
+
+### How this reads 0010's rule 1
+
+Taken literally, 0010's rule 1 lets only Start arm a market after a restart, and its falsifier
+is "any order sent after a restart before the owner pressed Start". Under that reading the
+owner could exit after a restart only by pressing Start first, which reaches Quoting and lets
+the quote loop add exposure before the exit: the gap this record exists to close. So this
+record changes how rule 1 is read, without editing 0010:
+
+- After a restart, an order may be built only once the owner has pressed Start, Flatten or
+  Wind-down for that market. Each is one explicit consumer call made on the owner's action, so
+  rule 1's purpose holds: nothing resumes order entry by itself, and a crash loop never trades
+  unattended.
+- Before the owner presses Start, the only orders that may be built are Exit's: on the side
+  that reduces the position, never crossing zero, and under every cap. Quoting after a restart
+  still takes Start, exactly as 0010 says.
+- 0010's falsifier is read accordingly: any order sent after a restart before the owner pressed
+  Start, Flatten or Wind-down, or any order other than an Exit order sent after a restart
+  before the owner pressed Start, breaks rule 1.
+
+This is how this record applies the owner's 2026-10-02 decision "trading off after restart":
+quoting stays off until Start, and an exit happens only when the owner asks for it. If the
+owner reads rule 1 as forbidding even an owner's exit before Start, a new record drops this
+path and supersedes this one.
 
 Cancels go through in every state: no cap and no kill switch blocks a cancel or a cancel-many.
 Every cancel still obeys 0005: own-namespace orders are cancelled by explicit reference (I4),
@@ -122,10 +149,13 @@ position is frozen.
   0010 lets only a process start or an explicit disarm call disarm order entry, and lifting the
   switch is neither; a Cancel-only state gives the same protection without changing what 0010's
   armed state means.
-- A separate arm call before Flatten or Wind-down: rejected. In 0010 arming is the owner's
-  Start, and a Start that reached Quoting before the exit would let the quote loop add
-  exposure first; an arm call that left the market in Cancel-only would give "Start" two
-  meanings. Flatten and Wind-down arm straight into Exit instead.
+- Keep 0010's rule 1 literal, so only Start arms after a restart and Flatten or Wind-down on a
+  disarmed market is refused: rejected. Start reaches Quoting, so the owner could exit after a
+  restart only by letting the quote loop add exposure first.
+- A separate arm call before Flatten or Wind-down: rejected. A Start that reached Quoting
+  before the exit has the same gap, and an arm call that left the market in Cancel-only would
+  give "Start" two meanings. Flatten and Wind-down arm straight into Exit instead, and this
+  record says outright that it reads 0010's rule 1 that way.
 - One call that lifts the switch and starts an exit together: not needed. The consumer may
   present the two steps as one confirmation, and because Cancel-only sits between them, no
   ordinary order is admissible at any moment.
@@ -158,7 +188,9 @@ position is frozen.
   a killed market as flat is wrong until every order is terminal and the position is zero.
 - A position in a killed market stays open until the owner acts, and can still change through
   fills that race the cancels. That exposure is accepted.
-- 0011 is superseded. 0010 stays accepted and unedited.
+- 0011 is superseded. 0010 stays accepted and its text is not edited; its rule 1 and its
+  falsifier are read as "How this reads 0010's rule 1" says, and AGENTS.md, which restates
+  rule 1, cites this record for an exit after a restart.
 
 ## What would show this was wrong
 
@@ -167,9 +199,12 @@ position is frozen.
   switch also corrupting that exit.
 - The owner routinely going Killed, Cancel-only, Flatten in quick succession under stress and
   finding the extra step slower than the exposure it guards against.
+- The owner reading 0010's rule 1 as forbidding any order after a restart before Start, an
+  owner's Flatten or Wind-down included.
 - Any place or amend built for a market in Killed or Cancel-only, any ordinary order built in
-  Exit, any ordinary order built between a restart and the owner's Flatten or Wind-down, any
-  order built after the switch was lifted but before the owner chose Start, Flatten or
-  Wind-down, any cancel that a cap or the kill switch blocked, any cancel-all built without the
-  I7 lease, any non-terminal remainder that stopped counting against the caps, or any
-  own-namespace fill that did not move inventory because the market was killed.
+  Exit, any order built after a restart before the owner's Start, Flatten or Wind-down, any
+  order other than an Exit order built after a restart before the owner's Start, any order
+  built after the switch was lifted but before the owner chose Start, Flatten or Wind-down, any
+  cancel that a cap or the kill switch blocked, any cancel-all built without the I7 lease, any
+  non-terminal remainder that stopped counting against the caps, or any own-namespace fill that
+  did not move inventory because the market was killed.
