@@ -647,6 +647,8 @@ impl ExecCodec for ToyExec {
             }
             VenueCommand::Amend(a) => {
                 let spec = specs.get(a.inst).ok_or(NotSentReason::Unencodable)?;
+                // The toy amends by venue id only: an amend naming none has no target.
+                let vid = a.target.venue().ok_or(NotSentReason::Unsupported)?;
                 let nonce = ctx.nonce(0).ok_or(NotSentReason::Unencodable)?;
                 // The toy's amend quantity is the remaining quantity (its caps say so).
                 let qty = a
@@ -654,7 +656,7 @@ impl ExecCodec for ToyExec {
                     .ok_or(NotSentReason::Unencodable)?;
                 let wire = AmendWire {
                     spec,
-                    vid: a.target.venue(),
+                    vid: Some(vid),
                     cid: None,
                     side: a.side,
                     px: a.px,
@@ -671,9 +673,9 @@ impl ExecCodec for ToyExec {
                     .sign_amend(&wire)
                     .map_err(|_| NotSentReason::SignFailed)?;
                 receipt.nonces.push((0, nonce));
-                let vid = wire.vid.map(|v| v.as_str()).unwrap_or_default();
                 let frame = format!(
-                    "amend|vid={vid}|px={}|qty={}|ts={}|nonce={nonce}|sig={}",
+                    "amend|vid={}|px={}|qty={}|ts={}|nonce={nonce}|sig={}",
+                    vid.as_str(),
                     a.px.0,
                     qty.get(),
                     ctx.wall.0,
@@ -833,7 +835,7 @@ impl VenueFactory for ToyFactory {
             symbols.insert(symbol_of(specs, sub.inst)?);
         }
         let symbols: Vec<&str> = symbols.into_iter().collect();
-        let mut url = format!("{}/md", url(cfg).unwrap_or_default());
+        let mut url = format!("{}/md", url(cfg)?);
         if !symbols.is_empty() {
             url = format!("{url}?symbols={}", symbols.join(","));
         }
@@ -885,7 +887,7 @@ fn toy_caps() -> VenueCaps {
                 keeps_priority: None,
             }),
             cancel_refs: TagSet::of(&[RefKind::Venue]),
-            query_refs: TagSet::of(&[RefKind::Venue]),
+            query_refs: TagSet::of(&[RefKind::Venue, RefKind::PlacementNonce]),
             cancel_before_ack: false,
             cancel_is_signed: false,
             batch_place: Some(Batch { max_items: 4 }),
@@ -1844,5 +1846,55 @@ fn outcomes_amends_and_cancels_go_through_the_same_boundary() {
         &mut fx,
     );
     assert_eq!(unsupported, Err(NotSentReason::Unsupported));
+    assert!(fx.is_empty());
+}
+
+#[test]
+fn the_toy_declares_the_query_references_its_codec_encodes() {
+    // The toy queries by venue id or, before an ack, by placement nonce: the caps say both, so
+    // the capability-driven Unknown ladder reaches the nonce query.
+    let caps = toy_caps().order.unwrap();
+    assert!(caps.query_refs.contains(RefKind::Venue));
+    assert!(caps.query_refs.contains(RefKind::PlacementNonce));
+    assert!(!caps.query_refs.contains(RefKind::Client));
+}
+
+#[test]
+fn planning_market_data_without_a_url_is_refused() {
+    let subs: BTreeSet<Subscription> = [Subscription {
+        inst: INST,
+        feed: Feed::Trades,
+    }]
+    .into_iter()
+    .collect();
+    let refused = Err(VenueError::Config(ConfigError::Missing(URL_KEY)));
+    for subs in [BTreeSet::new(), subs] {
+        assert_eq!(
+            ToyFactory.plan_md(&VenueConfig::new(), &specs(), &subs),
+            refused
+        );
+    }
+}
+
+#[test]
+fn an_amend_naming_the_order_only_by_client_id_is_not_sent() {
+    // The toy amends by venue id only (its caps); an amend that names no venue id has no
+    // encodable target, so it is not sent and nothing is pushed.
+    let [cid] = mint(1).try_into().unwrap();
+    let amend = VenueCommand::Amend(AmendOrder {
+        target: OrderRef::Client(cid),
+        inst: INST,
+        side: Side::Buy,
+        tif: TifTag::Gtc,
+        channel: Channel::Public,
+        post_only: true,
+        reduce_only: false,
+        px: Ticks(130_860),
+        qty: Lots::new(25).unwrap(),
+        cum_filled: Lots::new(5).unwrap(),
+    });
+    let mut fx = Effects::new();
+    let refused = exec_codec().encode(&amend, RpcId(18), &specs(), &ctx(9, 4, 1), &mut fx);
+    assert_eq!(refused, Err(NotSentReason::Unsupported));
     assert!(fx.is_empty());
 }
