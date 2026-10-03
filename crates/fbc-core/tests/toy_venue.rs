@@ -948,6 +948,8 @@ fn toy_caps() -> VenueCaps {
                 next_time_reported: true,
             },
             stats: FeedSource::None,
+            mark: FeedSource::Stream,
+            index: FeedSource::None,
             ts_precision: Duration::from_nanos(1),
             topology: ConnTopology::Shared {
                 max_subscriptions: None,

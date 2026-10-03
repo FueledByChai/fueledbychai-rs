@@ -126,6 +126,8 @@ fn synthetic_caps() -> VenueCaps {
                 next_time_reported: false,
             },
             stats: FeedSource::None,
+            mark: FeedSource::Stream,
+            index: FeedSource::Poll,
             ts_precision: Duration::from_micros(1),
             topology: ConnTopology::Shared {
                 max_subscriptions: Some(200),
@@ -180,6 +182,11 @@ fn the_synthetic_venue_declares_every_capability() {
         Some(SpeedBumpScope::TakersOnly)
     );
     assert_eq!(caps.md.books.len(), 2);
+    // Mark and index are subscribable feeds, so the caps say where each comes from.
+    assert_eq!(
+        (caps.md.mark, caps.md.index),
+        (FeedSource::Stream, FeedSource::Poll)
+    );
     assert!(caps.md.books[1].includes_channels.contains(Channel::Rpi));
     assert!(!caps.md.books[0].includes_channels.contains(Channel::Rpi));
     assert_eq!(caps.limits[0].ops.iter().count(), 3);
