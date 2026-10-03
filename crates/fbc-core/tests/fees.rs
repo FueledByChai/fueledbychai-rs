@@ -4,8 +4,8 @@
 
 use fbc_core::{
     AccountKey, AssetSym, Bps, Channel, ClientIdFormat, Fee, FeeBook, FeeEntry, FeeError, FeeKey,
-    FeeLookup, FeeRate, FeeSource, InstrumentId, Liquidity, Money, Namespace, VenueFeeSign, WallNs,
-    dispatch,
+    FeeLookup, FeeRate, FeeSchedule, FeeSource, InstrumentId, Liquidity, Money, Namespace,
+    PublishedRates, VenueFeeSign, WallNs, dispatch,
 };
 
 fn usdc() -> AssetSym {
@@ -260,4 +260,44 @@ fn instrument_ids_channels_and_liquidity_are_plain_values() {
     assert!(InstrumentId::new(1) < InstrumentId::new(2));
     assert_ne!(Channel::Public, Channel::Rpi);
     assert_ne!(Liquidity::Maker, Liquidity::Taker);
+}
+
+#[test]
+fn a_public_fee_schedule_keeps_its_rates_per_channel() {
+    let public = PublishedRates {
+        maker: FeeRate(Bps(-0.5)),
+        taker: FeeRate(Bps(2.0)),
+    };
+    let rpi = PublishedRates {
+        maker: FeeRate(Bps(0.0)),
+        taker: FeeRate(Bps(1.0)),
+    };
+    let both = FeeSchedule {
+        public,
+        rpi: Some(rpi),
+    };
+    assert_eq!(
+        both.rate(Channel::Public, Liquidity::Maker),
+        Some(FeeRate(Bps(-0.5)))
+    );
+    assert_eq!(
+        both.rate(Channel::Public, Liquidity::Taker),
+        Some(FeeRate(Bps(2.0)))
+    );
+    assert_eq!(
+        both.rate(Channel::Rpi, Liquidity::Maker),
+        Some(FeeRate(Bps(0.0)))
+    );
+    assert_eq!(
+        both.rate(Channel::Rpi, Liquidity::Taker),
+        Some(FeeRate(Bps(1.0)))
+    );
+    // A venue that publishes no RPI rate has none: the public rate is not reused for it.
+    let public_only = FeeSchedule { public, rpi: None };
+    assert_eq!(public_only.rate(Channel::Rpi, Liquidity::Maker), None);
+    assert_eq!(public_only.rate(Channel::Rpi, Liquidity::Taker), None);
+    assert_eq!(
+        public_only.rate(Channel::Public, Liquidity::Taker),
+        Some(FeeRate(Bps(2.0)))
+    );
 }

@@ -30,7 +30,7 @@ pub use caps::{
 pub use cid::{Charset, ClientIdFormat, MAX_WIRE_LEN, WireCid, decode_cid, encode_cid};
 pub use fee::{
     Fee, FeeBook, FeeEntry, FeeError, FeeKey, FeeLookup, FeeRate, FeeSchedule, FeeSource,
-    VenueFeeSign,
+    PublishedRates, VenueFeeSign,
 };
 pub use grid::{GridError, PriceGrid};
 pub use ids::{
