@@ -1,9 +1,8 @@
 [workspace]
 resolver = "3"
-# Members live under crates/ and, from the first venue crate on, crates/venues/ (AGENTS.md
-# Layout). Cargo rejects a member glob that matches nothing, so the ticket that adds the first
-# venue crate also adds "crates/venues/fbc-*" here; "crates/*" would match crates/venues itself.
-members = ["crates/fbc-*"]
+# Members live under crates/ and crates/venues/ (AGENTS.md Layout); "crates/*" would match
+# crates/venues itself.
+members = ["crates/fbc-*", "crates/venues/fbc-*"]
 # fixtures/ holds standalone tools (fixtures/paradex/signing/signbench, with its own manifest)
 # that must never become workspace members.
 exclude = ["fixtures"]
@@ -23,3 +22,28 @@ arrayvec = { version = "0.7", default-features = false }
 compact_str = { version = "0.10", default-features = false }
 rust_decimal = { version = "1", default-features = false, features = ["std"] }
 trybuild = "1"
+# The Paradex signer (FBC-6): exact pins, since a silent change here changes signatures. The
+# owner reviews any move (0009). starknet-core is a test oracle only (TypedData message hash).
+starknet-crypto = { version = "=0.8.1", default-features = false, features = ["std"] }
+starknet-core = "=0.16.0"
+sha3 = { version = "=0.10.8", default-features = false }
+serde_json = "1"
+
+# Stark-curve arithmetic is unusably slow unoptimized; the signer's tests sign thousands of
+# vectors. Optimizing these dependencies in test builds changes no result, only the time.
+[profile.dev.package.starknet-crypto]
+opt-level = 3
+[profile.dev.package.starknet-curve]
+opt-level = 3
+[profile.dev.package.starknet-types-core]
+opt-level = 3
+[profile.dev.package.lambdaworks-math]
+opt-level = 3
+[profile.dev.package.crypto-bigint]
+opt-level = 3
+[profile.dev.package.num-bigint]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.hmac]
+opt-level = 3
