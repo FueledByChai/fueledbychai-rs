@@ -19,7 +19,7 @@ use fbc_core::{
     AckLevel, AckModel, Aggressor, AmendCaps, AmendOrder, AmendQty, AmendRef, AmendWire, AssetSym,
     BookCaps, BookId, BookSide, Cadence, CancelOnDisconnect, CancelOrder, CancelRef, CancelWire,
     Channel, Charset, CidMatch, CidMint, ClientIdFormat, ClientOrderId, ConfigError, ConfigScope,
-    ConnKey, ConnTopology, Continuity, DecodeError, DecodeScope, EncodeCtx, EncodeReceipt,
+    ConnKey, ConnTopology, Continuity, CtxCall, DecodeError, DecodeScope, EncodeCtx, EncodeReceipt,
     Encoding, EndpointPlan, Envelope, ExchNs, ExchTsKind, ExecCodec, ExecEndpoint, ExecEvent,
     ExecSink, Feed, FeedHealth, FeedSource, FieldSpec, FieldUnit, FillCaps, FillEvent, FillIdent,
     FillKey, FillSource, FundingCaps, FundingSpec, Header, HttpFailure, HttpMethod, HttpRequest,
@@ -765,9 +765,20 @@ fn side_code(side: Side) -> &'static str {
 }
 
 impl ExecCodec for ToyExec {
+    fn nonces_for(&self, call: CtxCall) -> u16 {
+        match call {
+            // The hello frame carries one nonce; pings and the snapshot request carry none.
+            CtxCall::Open(_) => 1,
+            CtxCall::Timer(_) | CtxCall::Resync => 0,
+        }
+    }
+
     fn on_open(&mut self, stream: StreamId, ctx: &EncodeCtx, fx: &mut Effects) {
         assert_eq!(stream, EXEC_STREAM);
-        let frame = format!("hello|ts={}|nonce={:?}", ctx.wall.0, ctx.nonce(0));
+        let nonce = ctx
+            .nonce(0)
+            .expect("the runtime reserves the nonce nonces_for asks for");
+        let frame = format!("hello|ts={}|nonce={nonce}", ctx.wall.0);
         ToyExec::send(fx, frame, None, TrafficClass::Safety);
     }
 
@@ -2635,4 +2646,23 @@ fn a_feed_the_caps_do_not_offer_is_refused_by_planning_and_subscribing() {
         .to_string(),
         "instrument 7 has no Index feed on this venue"
     );
+}
+
+#[test]
+fn an_exec_codec_states_how_many_nonces_each_callback_needs() {
+    // The runtime reserves nonces for an encode by VenueCommand::items(); for the other
+    // callbacks the codec says how many, and the runtime reserves exactly that many into the
+    // EncodeCtx it passes. The toy's hello frame carries one nonce; its pings and resync none.
+    let mut exec = exec_codec();
+    assert_eq!(exec.nonces_for(CtxCall::Open(EXEC_STREAM)), 1);
+    assert_eq!(exec.nonces_for(CtxCall::Timer(PING_TAG)), 0);
+    assert_eq!(exec.nonces_for(CtxCall::Timer(RESYNC_RETRY_TAG)), 0);
+    assert_eq!(exec.nonces_for(CtxCall::Resync), 0);
+    let reserved = exec.nonces_for(CtxCall::Open(EXEC_STREAM));
+    let mut fx = Effects::new();
+    exec.on_open(EXEC_STREAM, &ctx(1_000, 42, reserved), &mut fx);
+    let [Effect::Send { frame, .. }] = fx.as_slice() else {
+        panic!("{fx:?}");
+    };
+    assert_eq!(frame.bytes(), b"hello|ts=1000|nonce=42");
 }

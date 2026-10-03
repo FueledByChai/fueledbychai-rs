@@ -659,10 +659,26 @@ pub trait MdCodec: Send {
     fn keepalive(&self) -> Option<Keepalive>;
 }
 
+/// An [`ExecCodec`] callback other than `encode` that takes an [`EncodeCtx`].
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum CtxCall {
+    /// [`ExecCodec::on_open`] for this stream.
+    Open(StreamId),
+    /// [`ExecCodec::on_timer`] for this tag.
+    Timer(TimerTag),
+    /// [`ExecCodec::resync`].
+    Resync,
+}
+
 /// An order-entry codec for one account session. Deterministic given its inputs and prior
 /// state; it reads no clock and draws no nonce except through [`EncodeCtx`].
 pub trait ExecCodec: Send {
     /// `stream` opened: authenticate and subscribe, as effects.
+    /// How many nonces the runtime reserves into the [`EncodeCtx`] it passes to `call`, asked
+    /// right before the call from the codec's current state; 0 when the call signs nothing.
+    /// (For `encode` the count is [`VenueCommand::items`].) The runtime reserves and journals
+    /// exactly that many, so replay hands the call the same context.
+    fn nonces_for(&self, call: CtxCall) -> u16;
     fn on_open(&mut self, stream: StreamId, ctx: &EncodeCtx, fx: &mut Effects);
     /// Encode and sign `cmd` as request `rpc`. `Err` means not sent: no byte reached a socket
     /// buffer and no effect was pushed. Never retries.
