@@ -106,6 +106,13 @@ pub struct Lvl {
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub struct TouchSourceId(pub u8);
 
+/// Which of a venue's book channels an event came from: an index into
+/// [`MdCaps::books`](crate::MdCaps::books). One instrument can be subscribed to several book
+/// channels at once (a recorder keeping a public and an interactive book), so every book event
+/// names its channel and two channels never merge into one book.
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+pub struct BookId(pub u8);
+
 /// The state of one instrument's market-data feed, as its codec sees it.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum FeedHealth {
@@ -128,20 +135,28 @@ pub enum MdEvent {
         ask: Option<Lvl>,
         source: TouchSourceId,
     },
-    /// A book snapshot begins: the levels that follow replace the book, under `epoch`.
-    BookSnapshotBegin { inst: InstrumentId, epoch: u32 },
-    /// The book snapshot is complete.
-    BookSnapshotEnd { inst: InstrumentId },
-    /// One level set to `qty` (zero removes it), in a snapshot or as a delta.
+    /// A snapshot of book channel `book` begins: the levels that follow replace that book,
+    /// under `epoch`.
+    BookSnapshotBegin {
+        inst: InstrumentId,
+        book: BookId,
+        epoch: u32,
+    },
+    /// The snapshot of book channel `book` is complete.
+    BookSnapshotEnd { inst: InstrumentId, book: BookId },
+    /// One level of book channel `book` set to `qty` (zero removes it), in a snapshot or as a
+    /// delta.
     Level {
         inst: InstrumentId,
+        book: BookId,
         side: BookSide,
         px: Ticks,
         qty: Lots,
     },
-    /// A windowed channel's levels now cover `lo..=hi`; anything outside is unknown.
+    /// Windowed book channel `book`'s levels now cover `lo..=hi`; anything outside is unknown.
     Window {
         inst: InstrumentId,
+        book: BookId,
         lo: Ticks,
         hi: Ticks,
     },

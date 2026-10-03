@@ -17,23 +17,23 @@ use std::time::Duration;
 
 use fbc_core::{
     AckLevel, AckModel, Aggressor, AmendCaps, AmendOrder, AmendQty, AmendWire, AssetSym, BookCaps,
-    BookSide, Cadence, CancelOnDisconnect, CancelOrder, CancelWire, Channel, Charset, CidMatch,
-    CidMint, ClientIdFormat, ClientOrderId, ConfigError, ConfigScope, ConnKey, ConnTopology,
-    Continuity, DecodeError, DecodeScope, EncodeCtx, EncodeReceipt, Encoding, EndpointPlan,
-    Envelope, ExchNs, ExchTsKind, ExecCodec, ExecEndpoint, ExecEvent, ExecSink, Feed, FeedHealth,
-    FeedSource, FieldSpec, FieldUnit, FillCaps, FillEvent, FillIdent, FillKey, FillSource,
-    FundingCaps, FundingSpec, Header, HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag,
-    InstrumentId, InstrumentKind, InstrumentSpec, ItemRef, Keepalive, KeepaliveKind, Liquidity3,
-    Lots, Lvl, MatchingCaps, MdCaps, MdCodec, MdEvent, MdSink, MdTransport, ModeScope, Money,
-    MonoNs, Namespace, NamespaceLease, NewOrder, NonceBlock, NonceScope, NotSentReason, OrderCaps,
-    OrderKind, OrderKindTag, OrderRef, OrderSigner, OrderUpdate, OrderingKey, PlaceWire, PriceGrid,
-    PxExact, QueryOrder, QueueModelQuality, RawFrame, Readiness, RefKind, Reject, RejectKind,
-    RpcCall, RpcId, SeqDomain, Side, Sig, SignError, SignedLots, SizeStep, SnapshotSource,
-    SpecTable, Stamp, StpScope, StreamId, SubmitOutcome, Subscription, Support, TagSet, Ticks,
-    TifTag, TimerTag, TouchSourceCaps, TouchSourceId, TradeCaps, TradingStatus, TrafficClass,
-    UnderlyingId, VenueCaps, VenueCommand, VenueConfig, VenueError, VenueFactory, VenueFeeSign,
-    VenueId, VenueMeta, VenueMode, VenueOrderSnapshot, VenueOrderState, WallNs, WireSlice,
-    decode_cid, dispatch, encode_cid,
+    BookId, BookSide, Cadence, CancelOnDisconnect, CancelOrder, CancelWire, Channel, Charset,
+    CidMatch, CidMint, ClientIdFormat, ClientOrderId, ConfigError, ConfigScope, ConnKey,
+    ConnTopology, Continuity, DecodeError, DecodeScope, EncodeCtx, EncodeReceipt, Encoding,
+    EndpointPlan, Envelope, ExchNs, ExchTsKind, ExecCodec, ExecEndpoint, ExecEvent, ExecSink, Feed,
+    FeedHealth, FeedSource, FieldSpec, FieldUnit, FillCaps, FillEvent, FillIdent, FillKey,
+    FillSource, FundingCaps, FundingSpec, Header, HttpFailure, HttpMethod, HttpRequest,
+    HttpResponse, HttpTag, InstrumentId, InstrumentKind, InstrumentSpec, ItemRef, Keepalive,
+    KeepaliveKind, Liquidity3, Lots, Lvl, MatchingCaps, MdCaps, MdCodec, MdEvent, MdSink,
+    MdTransport, ModeScope, Money, MonoNs, Namespace, NamespaceLease, NewOrder, NonceBlock,
+    NonceScope, NotSentReason, OrderCaps, OrderKind, OrderKindTag, OrderRef, OrderSigner,
+    OrderUpdate, OrderingKey, PlaceWire, PriceGrid, PxExact, QueryOrder, QueueModelQuality,
+    RawFrame, Readiness, RefKind, Reject, RejectKind, RpcCall, RpcId, SeqDomain, Side, Sig,
+    SignError, SignedLots, SizeStep, SnapshotSource, SpecTable, Stamp, StpScope, StreamId,
+    SubmitOutcome, Subscription, Support, TagSet, Ticks, TifTag, TimerTag, TouchSourceCaps,
+    TouchSourceId, TradeCaps, TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueCommand,
+    VenueConfig, VenueError, VenueFactory, VenueFeeSign, VenueId, VenueMeta, VenueMode,
+    VenueOrderSnapshot, VenueOrderState, WallNs, WireSlice, decode_cid, dispatch, encode_cid,
 };
 use fbc_core::{AmendAck, Batch, Effect, Effects};
 use rust_decimal::Decimal;
@@ -151,6 +151,11 @@ impl<'a> Frame<'a> {
         self.opt(key).map(|v| v == "1")
     }
 
+    /// The book channel a book frame is on: `book=<index>`, 0 when absent.
+    fn book(&self) -> Result<BookId, DecodeError> {
+        Ok(BookId(self.opt_num("book")?.unwrap_or(0)))
+    }
+
     /// `pxXqty`: one price level.
     fn level(&self, key: &'static str) -> Result<Option<Lvl>, DecodeError> {
         let Some(text) = self.opt(key) else {
@@ -186,7 +191,8 @@ impl ToyMd {
             ),
             "snap" => {
                 let epoch = f.num("epoch")?;
-                sink.push(meta, MdEvent::BookSnapshotBegin { inst, epoch });
+                let book = f.book()?;
+                sink.push(meta, MdEvent::BookSnapshotBegin { inst, book, epoch });
                 for (key, side) in [("b", BookSide::Bid), ("a", BookSide::Ask)] {
                     if let Some(lvl) = f.level(key)? {
                         let (px, qty) = (lvl.px, lvl.qty);
@@ -194,6 +200,7 @@ impl ToyMd {
                             meta,
                             MdEvent::Level {
                                 inst,
+                                book,
                                 side,
                                 px,
                                 qty,
@@ -201,7 +208,7 @@ impl ToyMd {
                         );
                     }
                 }
-                sink.push(meta, MdEvent::BookSnapshotEnd { inst });
+                sink.push(meta, MdEvent::BookSnapshotEnd { inst, book });
             }
             "trade" => {
                 let aggressor = match f.get("aggr")? {
@@ -237,7 +244,7 @@ impl ToyMd {
             }
             "gap" => {
                 let feed = match f.get("feed")? {
-                    "book" => Feed::Book(0),
+                    "book" => Feed::Book(f.book()?),
                     _ => Feed::Trades,
                 };
                 let h = FeedHealth::Gap;
@@ -1063,16 +1070,29 @@ fn toy_caps() -> VenueCaps {
                 ts_kind: ExchTsKind::MatchingEngine,
                 includes_channels: TagSet::of(&[Channel::Public]),
             }],
-            books: vec![BookCaps {
-                channel: "snap",
-                max_depth: 1,
-                cadence: Cadence::Realtime,
-                continuity: Continuity::PlusOne,
-                windowed: false,
-                rest_anchor: true,
-                includes_channels: TagSet::of(&[Channel::Public]),
-                queue_model: QueueModelQuality::BracketOnly,
-            }],
+            books: vec![
+                BookCaps {
+                    channel: "snap",
+                    max_depth: 1,
+                    cadence: Cadence::Realtime,
+                    continuity: Continuity::PlusOne,
+                    windowed: false,
+                    rest_anchor: true,
+                    includes_channels: TagSet::of(&[Channel::Public]),
+                    queue_model: QueueModelQuality::BracketOnly,
+                },
+                // A second, slower book channel (index 1) on the same connection.
+                BookCaps {
+                    channel: "snap_slow",
+                    max_depth: 1,
+                    cadence: Cadence::Pulsed(Duration::from_millis(100)),
+                    continuity: Continuity::PlusOne,
+                    windowed: false,
+                    rest_anchor: false,
+                    includes_channels: TagSet::of(&[Channel::Public]),
+                    queue_model: QueueModelQuality::BracketOnly,
+                },
+            ],
             trades: TradeCaps {
                 source: FeedSource::Stream,
                 aggressor: true,
@@ -1571,7 +1591,7 @@ fn the_toy_decodes_market_data_frames_into_md_events() {
         // A gap names the feed it is on: the book is invalid, the trades are not.
         MdEvent::Health {
             inst: INST,
-            feed: Feed::Book(0),
+            feed: Feed::Book(BookId(0)),
             h: FeedHealth::Gap,
         },
         MdEvent::Health {
@@ -1581,21 +1601,27 @@ fn the_toy_decodes_market_data_frames_into_md_events() {
         },
         MdEvent::BookSnapshotBegin {
             inst: INST,
+            book: BookId(0),
             epoch: 3,
         },
         MdEvent::Level {
             inst: INST,
+            book: BookId(0),
             side: BookSide::Bid,
             px: Ticks(130_865),
             qty: Lots::new(12).unwrap(),
         },
         MdEvent::Level {
             inst: INST,
+            book: BookId(0),
             side: BookSide::Ask,
             px: Ticks(130_866),
             qty: Lots::new(7).unwrap(),
         },
-        MdEvent::BookSnapshotEnd { inst: INST },
+        MdEvent::BookSnapshotEnd {
+            inst: INST,
+            book: BookId(0),
+        },
     ];
     assert_eq!(sink.bodies(), expected.iter().collect::<Vec<_>>());
     assert_eq!(sink.out[0].venue_seq, Some(5));
@@ -1616,7 +1642,7 @@ fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
         Some(VenueError::Config(ConfigError::Missing(URL_KEY)))
     );
 
-    let subs: BTreeSet<Subscription> = [Feed::Book(0), Feed::Touch(TouchSourceId(0))]
+    let subs: BTreeSet<Subscription> = [Feed::Book(BookId(0)), Feed::Touch(TouchSourceId(0))]
         .into_iter()
         .map(|feed| Subscription { inst: INST, feed })
         .collect();
@@ -1647,7 +1673,7 @@ fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
         sent,
         [
             b"sub|sym=TOY-PERP|feed=Touch(TouchSourceId(0))".as_slice(),
-            b"sub|sym=TOY-PERP|feed=Book(0)",
+            b"sub|sym=TOY-PERP|feed=Book(BookId(0))",
             b"ping|n=1|at=6"
         ]
     );
@@ -2053,7 +2079,7 @@ fn a_poll_only_feed_is_planned_without_a_connection_and_polled_over_http() {
     assert_eq!(factory.caps(&config()).unwrap().md.stats, FeedSource::Poll);
     let book = Subscription {
         inst: INST,
-        feed: Feed::Book(0),
+        feed: Feed::Book(BookId(0)),
     };
     let stats = Subscription {
         inst: INST,
@@ -2233,4 +2259,78 @@ fn a_fill_key_is_computed_from_the_one_copy_of_its_fields() {
         }
     });
     assert!(sink.out.is_empty());
+}
+
+#[test]
+fn two_book_channels_of_one_instrument_on_one_connection_stay_apart() {
+    // A recorder can subscribe one instrument to two book channels sharing a connection (the
+    // shadow records both a public and an interactive book, design §10). Every book event names
+    // its channel, so the two books never merge.
+    assert_eq!(toy_caps().md.books.len(), 2);
+    let plan = ToyFactory
+        .plan_md(
+            &config(),
+            &specs(),
+            &[BookId(0), BookId(1)]
+                .into_iter()
+                .map(|b| Subscription {
+                    inst: INST,
+                    feed: Feed::Book(b),
+                })
+                .collect(),
+        )
+        .unwrap();
+    assert_eq!(plan.len(), 1, "both channels share the connection");
+    let mut codec = ToyFactory.md_codec(&config(), &plan[0]);
+    let (specs, mut sink, mut fx) = (specs(), Collect::new(), Effects::new());
+    with_scope(|scope| {
+        for line in [
+            "snap|sym=TOY-PERP|epoch=1|b=130865x12",
+            "snap|sym=TOY-PERP|book=1|epoch=1|b=130865x40",
+            "gap|sym=TOY-PERP|feed=book|book=1",
+        ] {
+            codec
+                .on_frame(RawFrame::Text(line), scope, &specs, &mut sink, &mut fx)
+                .unwrap();
+        }
+    });
+    let level = |book, qty| MdEvent::Level {
+        inst: INST,
+        book: BookId(book),
+        side: BookSide::Bid,
+        px: Ticks(130_865),
+        qty: Lots::new(qty).unwrap(),
+    };
+    let begin = |book| MdEvent::BookSnapshotBegin {
+        inst: INST,
+        book: BookId(book),
+        epoch: 1,
+    };
+    let end = |book| MdEvent::BookSnapshotEnd {
+        inst: INST,
+        book: BookId(book),
+    };
+    assert_eq!(
+        sink.bodies(),
+        [
+            &begin(0),
+            &level(0, 12),
+            &end(0),
+            &begin(1),
+            &level(1, 40),
+            &end(1),
+            &MdEvent::Health {
+                inst: INST,
+                feed: Feed::Book(BookId(1)),
+                h: FeedHealth::Gap,
+            },
+        ]
+    );
+    let window = |book| MdEvent::Window {
+        inst: INST,
+        book: BookId(book),
+        lo: Ticks(1),
+        hi: Ticks(2),
+    };
+    assert_ne!(window(0), window(1));
 }

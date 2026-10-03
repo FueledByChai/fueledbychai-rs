@@ -25,7 +25,7 @@ use arrayvec::ArrayVec;
 use compact_str::CompactString;
 
 use crate::command::{NotSentReason, OrderKind, Tif, VenueCommand};
-use crate::event::{ExecEvent, MdEvent, RpcId, StreamId, TouchSourceId, VenueMeta};
+use crate::event::{BookId, ExecEvent, MdEvent, RpcId, StreamId, TouchSourceId, VenueMeta};
 use crate::fee::FeeError;
 use crate::ids::{IdError, InstrumentId, OrderRef, VenueOrderId};
 use crate::instrument::InstrumentSpec;
@@ -580,12 +580,13 @@ impl SpecTable {
 pub enum Feed {
     /// The best bid and offer from one touch channel.
     Touch(TouchSourceId),
-    /// One book channel: an index into [`MdCaps::books`](crate::MdCaps::books). An instrument
-    /// subscribes to at most one book channel: which one is a configuration choice recorded in
-    /// the journal header and treated as a strategy change (design §7.2, `includes_channels`),
-    /// so the book events ([`MdEvent::Level`](crate::MdEvent::Level) and the rest) name the
-    /// instrument and not the channel.
-    Book(u8),
+    /// One book channel ([`BookId`]: an index into [`MdCaps::books`](crate::MdCaps::books)).
+    /// An instrument may be subscribed to several at once, on one connection (a recorder keeps
+    /// both a public and an interactive book, design §10); every book event
+    /// ([`MdEvent::Level`] and the rest) names its channel. Which channel
+    /// is the trading book stays a configuration choice recorded in the journal header and
+    /// treated as a strategy change (design §7.2).
+    Book(BookId),
     Trades,
     Mark,
     Index,
