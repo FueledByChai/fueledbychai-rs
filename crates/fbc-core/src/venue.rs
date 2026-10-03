@@ -157,6 +157,14 @@ pub struct EndpointPlan {
     pub subs: Vec<Subscription>,
 }
 
+/// One order-entry connection the runtime opens for an account session; when it is open the
+/// runtime calls [`ExecCodec::on_open`] with its stream.
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+pub struct ExecEndpoint {
+    pub stream: StreamId,
+    pub url: String,
+}
+
 /// The one value a venue crate exports.
 ///
 /// Instrument discovery and the legacy-symbol hook (FBC-ahf), and the credential-bearing calls
@@ -179,7 +187,12 @@ pub trait VenueFactory: Sync + 'static {
     ) -> Result<Vec<EndpointPlan>, VenueError>;
     /// A market-data codec for one connection epoch of `ep`.
     fn md_codec(&self, cfg: &VenueConfig, ep: &EndpointPlan) -> Box<dyn MdCodec>;
-    /// An order-entry codec, or `None` for a market-data-only venue.
+    /// The order-entry connections to open under `cfg`; empty for a venue whose order entry is
+    /// HTTP only, or that has none.
+    fn plan_exec(&self, cfg: &VenueConfig) -> Result<Vec<ExecEndpoint>, VenueError>;
+    /// An order-entry codec, or `None` for a market-data-only venue. It writes client ids in
+    /// the format its capabilities declare ([`OrderCaps::client_id`](crate::OrderCaps)), the one
+    /// source the runtime also decodes with.
     fn exec_codec(&self, cfg: &VenueConfig) -> Option<Result<Box<dyn ExecCodec>, VenueError>>;
 }
 

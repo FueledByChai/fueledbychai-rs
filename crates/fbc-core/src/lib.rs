@@ -76,6 +76,6 @@ pub use units::{
     Ticks,
 };
 pub use venue::{
-    ConfigError, ConfigScope, EndpointPlan, FieldSpec, FieldUnit, ManagedGateway, OrderGateway,
-    SubmitHandle, VenueConfig, VenueError, VenueFactory,
+    ConfigError, ConfigScope, EndpointPlan, ExecEndpoint, FieldSpec, FieldUnit, ManagedGateway,
+    OrderGateway, SubmitHandle, VenueConfig, VenueError, VenueFactory,
 };
