@@ -24,8 +24,9 @@ passes before anything was written, and how a changed plan reaches running conne
   snapshot asked for before a reconnect never anchors the new epoch's book. Requests keep
   going while a frame's write waits on the peer; a result that comes back meanwhile is
   stamped and goes to the codec as it comes, so the handler gets the shard's events in ingest
-  order, and the effects it asks for are executed after the rest of that write's batch (Codex
-  r4177481297, r4177547758, r4177698441). Requests still in flight when a session stops are
+  order; a request it asks for then starts at once, its timeout running from then, and its
+  other effects are executed after the rest of that write's batch (Codex r4177481297,
+  r4177547758, r4177698441, r4177887264). Requests still in flight when a session stops are
   dropped.
 - **Classification.** The request's mandatory `timeout` runs from when the codec asked for it
   and bounds the whole call; a timeout past the end of the clock bounds nothing, so the
@@ -39,8 +40,9 @@ passes before anything was written, and how a changed plan reaches running conne
   as the codec is built, `subscribe` takes the reconciler's difference as for a socket, and an
   `Effect::Send` or `Effect::Reconnect` naming the endpoint is refused and counted.
 - **A dropped control comes first.** A session whose control has already dropped builds no
-  codec, poll or socket, so nothing is sent or asked for after the drop, and a drop wins over
-  a handshake that completes at the same time (Codex r4177698436, r4177790164).
+  codec, poll or socket, so nothing is sent or asked for after the drop; a drop wins over a
+  handshake that completes at the same time, and over a frame, timer or HTTP result that is
+  ready with it, which then reaches no codec (Codex r4177698436, r4177790164, r4177887269).
 - **Plans.** `MdVenueControl::set_desired` calls `plan_md` with the spec table at once and
   returns a refusal (`UnknownInstrument`, `UnsupportedFeed`, configuration), a stream named
   twice, or a socket URL no attempt could open as a `PlanError`; nothing opens or closes for a

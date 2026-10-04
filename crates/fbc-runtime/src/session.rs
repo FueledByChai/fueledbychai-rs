@@ -446,6 +446,12 @@ impl<H: MdHandler> MdSession<H> {
                 Some(done) = self.http.next() => Wake::Http(self.stamp_http(done)),
                 r = self.desired.changed() => Wake::Desired(r.is_ok()),
             };
+            // The control first: what woke with its drop reaches no codec (Codex r4177887269).
+            let wake = if self.stop.has_changed().is_err() {
+                Wake::Desired(false)
+            } else {
+                wake
+            };
             open = match wake {
                 Wake::Frame(Some(Ok(message))) => {
                     let mut fx = Effects::new();
@@ -615,8 +621,9 @@ impl<H: MdHandler> MdSession<H> {
                     let message = text.unwrap_or_else(|_| Message::binary(bytes.to_vec()));
                     // Requests in flight keep going while the write waits. A result that comes
                     // back meanwhile reaches the codec at once, so the handler gets its events
-                    // in the shard's ingest order (Codex r4177698441); what the codec asks for
-                    // then is executed after the rest of this batch.
+                    // in the shard's ingest order (Codex r4177698441). A request the codec asks
+                    // for then starts at once, its timeout running from now (Codex
+                    // r4177887264); its other effects wait for the rest of this batch.
                     let send = ws.send(message);
                     tokio::pin!(send);
                     open = loop {
@@ -630,7 +637,14 @@ impl<H: MdHandler> MdSession<H> {
                         if let Some((stamp, done)) = self.admit_http(done)? {
                             let mut more = Effects::new();
                             self.answer(codec, stamp, done, &mut more);
-                            effects.extend(more.take());
+                            for effect in more.take() {
+                                match effect {
+                                    Effect::Http {
+                                        tag, req, timeout, ..
+                                    } => self.ask(epoch, tag, req, timeout),
+                                    other => effects.push_back(other),
+                                }
+                            }
                         }
                     };
                 }
