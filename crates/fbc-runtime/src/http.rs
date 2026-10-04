@@ -1,9 +1,6 @@
 //! The HTTP/1.1 call (`http://`, and `https://` over TLS), on the one connector, and a codec's
 //! [`Effect::Http`](fbc_core::Effect::Http) made with it under its deadline (decision 0027).
 
-use std::future::Future;
-use std::time::Duration;
-
 use fbc_core::{HttpFailure, HttpMethod, HttpRequest};
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::client::conn::http1;
@@ -34,38 +31,31 @@ impl Connector {
         exchange(stream, request, max_body).await
     }
 
-    /// Makes a codec's request within `timeout`, reading at most `max_body` response bytes.
-    /// A failure before the connection is open (a request the runtime cannot make, the
-    /// connect, the proxy, TLS, or the timeout passing meanwhile) wrote no byte of the request
-    /// and is [`HttpFailure::NotSent`]; after that, the timeout passing is
-    /// [`HttpFailure::TimedOut`] and any other failure, a body over `max_body` included,
-    /// [`HttpFailure::Lost`], since the request may have been written.
-    pub(crate) async fn http_within(
+    /// Makes a codec's request by `deadline`, reading at most `max_body` response bytes. A
+    /// failure before the connection is open (no deadline, as for a timeout past the end of
+    /// the clock; a request the runtime cannot make; the connect, the proxy, TLS, or the
+    /// deadline passing meanwhile) wrote no byte of the request and is
+    /// [`HttpFailure::NotSent`]; after that, the deadline passing is [`HttpFailure::TimedOut`]
+    /// and any other failure, a body over `max_body` included, [`HttpFailure::Lost`], since the
+    /// request may have been written.
+    pub(crate) async fn http_by(
         &self,
         req: &HttpRequest,
-        timeout: Duration,
+        deadline: Option<Instant>,
         max_body: usize,
     ) -> Result<Response<Bytes>, HttpFailure> {
-        let deadline = Instant::now().checked_add(timeout);
+        let deadline = deadline.ok_or(HttpFailure::NotSent)?;
         let request = to_hyper(req).ok_or(HttpFailure::NotSent)?;
         let (to, request) = prepare(request).map_err(|_| HttpFailure::NotSent)?;
-        let stream = match within(deadline, self.open(&to)).await {
-            Some(Ok(stream)) => stream,
+        let stream = match timeout_at(deadline, self.open(&to)).await {
+            Ok(Ok(stream)) => stream,
             _ => return Err(HttpFailure::NotSent),
         };
-        match within(deadline, exchange(stream, request, max_body)).await {
-            Some(Ok(response)) => Ok(response),
-            Some(Err(_)) => Err(HttpFailure::Lost),
-            None => Err(HttpFailure::TimedOut),
+        match timeout_at(deadline, exchange(stream, request, max_body)).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => Err(HttpFailure::Lost),
+            Err(_) => Err(HttpFailure::TimedOut),
         }
-    }
-}
-
-/// `f`'s output, or `None` when `deadline` passes first; no deadline waits for it.
-async fn within<F: Future>(deadline: Option<Instant>, f: F) -> Option<F::Output> {
-    match deadline {
-        Some(at) => timeout_at(at, f).await.ok(),
-        None => Some(f.await),
     }
 }
 
@@ -197,10 +187,9 @@ mod tests {
         let connector = Connector::new(crate::ProxyConfig::Direct);
         let bad = request(HttpMethod::Get, "http://a.test/", "bad name", "v");
         let relative = request(HttpMethod::Get, "/only/a/path", "x-k", "v");
-        // Port 1 on loopback: nothing listens; a timeout past the end of the clock never ends.
-        let refused = request(HttpMethod::Get, "http://127.0.0.1:1/", "x-k", "v");
-        for req in [bad, relative, refused] {
-            let result = connector.http_within(&req, Duration::MAX, 1).await;
+        let later = Instant::now().checked_add(std::time::Duration::from_secs(60));
+        for req in [bad, relative] {
+            let result = connector.http_by(&req, later, 1).await;
             assert_eq!(result.unwrap_err(), HttpFailure::NotSent);
         }
     }

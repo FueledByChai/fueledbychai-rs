@@ -9,8 +9,8 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
 
-use common::ScriptedWs;
 use common::toy::{self, ToyVenue};
+use common::{ScriptedWs, hanging};
 use fbc_core::{
     ConnKey, Envelope, Feed, InstrumentId, MdEvent, StreamId, Subscription, VenueConfig, VenueError,
 };
@@ -169,4 +169,18 @@ fn a_venue_needs_a_configuration_it_accepts() {
     cfg.cfg.insert(toy::REFUSE, "yes");
     let err = MdVenue::new(cfg, |_| {}).err().unwrap();
     assert!(matches!(err, SessionError::Config(_)));
+}
+
+#[tokio::test]
+async fn a_plan_published_just_before_the_control_drops_opens_nothing() {
+    let (addr, mut accepts) = hanging().await;
+    let url = format!("ws://{addr}/md");
+    // One connection number for two endpoints: applying this plan would stop the venue with
+    // NoConnectionLeft, so a clean stop shows it was never applied (Codex r4177481301).
+    let (mut venue, control) = MdVenue::new(config(&[url.clone(), url], 1..2), |_| {}).unwrap();
+    control.set_desired(subs(&[1, 2, 3])).unwrap();
+    drop(control);
+    venue.run().await.unwrap();
+    tokio::time::sleep(ms(50)).await;
+    assert!(accepts.try_recv().is_err());
 }

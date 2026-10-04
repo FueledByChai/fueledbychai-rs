@@ -182,6 +182,9 @@ impl<H: MdHandler + 'static> MdVenue<H> {
         loop {
             tokio::select! {
                 changed = self.plan.changed() => match changed {
+                    // A plan published just before the control dropped is not applied: the
+                    // drop stops the venue rather than opening anything.
+                    Ok(()) if self.plan.has_changed().is_err() => return Ok(()),
                     Ok(()) => {
                         let plan = self.plan.borrow_and_update().clone();
                         self.apply(plan)?;
