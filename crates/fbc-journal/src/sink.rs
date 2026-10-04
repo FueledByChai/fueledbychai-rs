@@ -84,7 +84,8 @@ pub trait JournalSink {
     /// Journals the record `make` builds, as [`record`](JournalSink::record) does, when the
     /// record's encoding holds at least `payload` bytes (a frame's or a body's): a sink that can
     /// tell such a record has no room drops and counts it without calling `make`, so a large
-    /// payload is not copied only to be refused (FBC-f3w). By default it builds and records it.
+    /// payload is not copied only to be refused (FBC-f3w); `usize::MAX` stands for a record the
+    /// format refuses whatever the room. By default it builds and records it.
     fn record_with(
         &mut self,
         class: TrafficClass,
@@ -183,6 +184,16 @@ struct Ring {
     gap_wall: AtomicU64,
     /// The writer thread, set by the thread itself before it can park.
     writer: OnceLock<Thread>,
+}
+
+/// Ends the sink's busy span when dropped: armed only while a record builder runs, so one that
+/// panics cannot leave the writer waiting on a push that will never come.
+struct BusyGuard<'a>(&'a AtomicBool);
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, SeqCst);
+    }
 }
 
 /// The words an entry with a body of `len` bytes takes.
@@ -335,7 +346,10 @@ impl JournalSink for QueueSink {
         self.ring.busy.store(true, SeqCst);
         let open = !self.ring.closed.load(SeqCst);
         let recorded = if open && fits(self.ring.used(), need, limit) {
+            // A builder that panics ends the busy span as it unwinds (Codex r4178802729).
+            let unwinding = BusyGuard(&self.ring.busy);
             let record = make();
+            std::mem::forget(unwinding);
             self.settle(class, now, Some(&record), open)
         } else {
             self.settle(class, now, None, open)
@@ -450,9 +464,6 @@ impl QueueSink {
 impl Drop for QueueSink {
     fn drop(&mut self) {
         self.ring.closed.store(true, SeqCst);
-        // A sink dropped pushes nothing more, even one unwinding out of its busy span from a
-        // record builder that panicked: the writer must not wait on it.
-        self.ring.busy.store(false, SeqCst);
         self.ring.wake();
     }
 }
@@ -646,7 +657,9 @@ mod tests {
     }
 
     #[test]
-    fn a_sink_dropped_as_a_record_builder_panics_lets_the_writer_close() {
+    fn a_record_builder_that_panics_leaves_the_sink_usable_and_the_writer_free_to_close() {
+        // Codex r4178802729: a caller that catches the builder's panic keeps the sink, so the
+        // busy span must end as the builder unwinds, not when the sink is dropped.
         let root =
             std::env::temp_dir().join(format!("fbc-journal-sink-unwind-{}", std::process::id()));
         let (mut sink, drain) = journal_queue(
@@ -660,13 +673,28 @@ mod tests {
         let writer = drain
             .spawn(JournalWriter::create(&root, 1, key()).unwrap())
             .unwrap();
-        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             sink.record_with(TrafficClass::Normal, WallNs(0), 0, &mut || {
                 panic!("builder")
             })
         }));
         assert!(unwound.is_err());
+        assert!(
+            !sink.ring.busy.load(SeqCst),
+            "busy left set by an unwinding builder"
+        );
+        let recovered = Record::Marker(Marker::Recovered);
+        assert_eq!(
+            sink.record(TrafficClass::Normal, WallNs(0), &recovered),
+            Recorded::Ok
+        );
         writer.close().unwrap();
+        let read: Vec<Record> = crate::JournalReader::open(&root, 1)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(read, [recovered]);
+        drop(sink);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
