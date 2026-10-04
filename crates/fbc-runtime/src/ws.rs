@@ -26,6 +26,16 @@ impl Connector {
     }
 }
 
+/// Refuses, before any connection, a URL no attempt could open: not a `ws://` or `wss://` URL,
+/// no usable host, or a `wss://` host that is not a TLS server name.
+pub(crate) fn check_url(url: &str) -> Result<(), NetError> {
+    let to = target::target(&target::parse(url)?, "ws", "wss")?;
+    if to.tls {
+        crate::tls::server_name(&to.host)?;
+    }
+    Ok(())
+}
+
 fn upgrade_error(e: tungstenite::Error) -> NetError {
     let cause = match e {
         tungstenite::Error::Http(response) => Cause::Status(response.status().as_u16()),

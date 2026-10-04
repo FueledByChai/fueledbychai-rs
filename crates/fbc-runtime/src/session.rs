@@ -33,9 +33,10 @@ use tokio::time::{Instant, sleep_until};
 
 use crate::connector::Connector;
 use crate::epoch::{Admit, EpochError, Epochs, Input};
+use crate::error::NetError;
 use crate::pacing::{Pacer, ReconnectPacing};
 use crate::reconcile::{ReconcileError, Reconciler, SubscribeCall};
-use crate::ws::{Message, WebSocket};
+use crate::ws::{self, Message, WebSocket};
 
 /// Where the consumer receives a session's events: called once per event, in ingest order, on
 /// the thread that drives the session, before the next frame is read (decision 0023).
@@ -111,6 +112,8 @@ pub enum SessionError {
     Config(ConfigError),
     /// The endpoint is not a socket (polling is FBC-klr's).
     NotASocket,
+    /// No attempt could open the endpoint's URL; the error names the step, never the URL.
+    Url(NetError),
     /// The connection has no epoch left to open.
     Epoch(EpochError),
     /// The reconciler refused a call the session made: a session defect.
@@ -122,6 +125,7 @@ impl fmt::Display for SessionError {
         match self {
             SessionError::Config(e) => write!(f, "venue configuration refused: {e}"),
             SessionError::NotASocket => f.write_str("the endpoint is not a socket"),
+            SessionError::Url(e) => write!(f, "the endpoint cannot be opened: {e}"),
             SessionError::Epoch(e) => write!(f, "{e}"),
             SessionError::Reconcile(e) => write!(f, "{e}"),
         }
@@ -161,7 +165,7 @@ impl MdControl {
 pub struct MdCounters {
     /// Connection attempts started.
     pub attempts: u64,
-    /// Attempts that did not open.
+    /// Attempts that did not open, by their deadline or at all.
     pub failed_attempts: u64,
     /// Frames the codec could not decode.
     pub decode_errors: u64,
@@ -223,6 +227,7 @@ impl<H: MdHandler> MdSession<H> {
             return Err(SessionError::NotASocket);
         };
         let url = url.as_str().to_owned();
+        ws::check_url(&url).map_err(SessionError::Url)?;
         let caps = config
             .venue
             .caps(&config.cfg)
@@ -273,7 +278,7 @@ impl<H: MdHandler> MdSession<H> {
             let at = self.pacer.next_attempt(Instant::now());
             loop {
                 let idle = tokio::select! {
-                    _ = sleep_until(at) => Idle::Attempt,
+                    _ = sleep_or_never(at) => Idle::Attempt,
                     _ = sleep_or_never(self.next_deadline()) => Idle::Timer,
                     r = self.desired.changed() => Idle::Desired(r.is_ok()),
                 };
@@ -282,13 +287,7 @@ impl<H: MdHandler> MdSession<H> {
                     // Only an ended epoch's timers wait while disconnected: each fires into
                     // nothing.
                     Idle::Timer => {
-                        if let Some(Reverse((_, _, epoch, _))) = self.timers.pop() {
-                            let key = ConnKey {
-                                epoch,
-                                ..self.current()
-                            };
-                            self.epochs.admit(Input::Timer, key)?;
-                        }
+                        let _ = self.take_timer()?;
                     }
                     Idle::Desired(false) => return Ok(()),
                     Idle::Desired(true) => {
@@ -299,13 +298,16 @@ impl<H: MdHandler> MdSession<H> {
             }
             self.pacer.attempted(Instant::now());
             self.counters.attempts += 1;
-            // A connect is stopped by the control's drop, and keeps the desired set current.
+            // A connect fails at its deadline, is stopped by the control's drop, and keeps the
+            // desired set current.
+            let deadline = Instant::now().checked_add(self.pacer.deadline());
             let opened = {
                 let connect = self.connector.websocket(&self.url);
                 tokio::pin!(connect);
                 loop {
                     tokio::select! {
-                        opened = &mut connect => break opened,
+                        opened = &mut connect => break opened.ok(),
+                        _ = sleep_or_never(deadline) => break None,
                         r = self.desired.changed() => match r {
                             Ok(()) => {
                                 let subs = self.desired.borrow_and_update().clone();
@@ -316,7 +318,7 @@ impl<H: MdHandler> MdSession<H> {
                     }
                 }
             };
-            let Ok(ws) = opened else {
+            let Some(ws) = opened else {
                 self.counters.failed_attempts += 1;
                 self.pacer.failed(Instant::now());
                 continue;
@@ -336,7 +338,12 @@ impl<H: MdHandler> MdSession<H> {
     /// stops.
     async fn connected(&mut self, mut ws: WebSocket) -> Result<End, SessionError> {
         let key = self.current();
-        let mut codec = self.venue.md_codec(&self.cfg, &self.plan);
+        // The epoch's plan carries the subscriptions wanted now, not the first ones.
+        let plan = EndpointPlan {
+            subs: self.rec.desired().iter().copied().collect(),
+            ..self.plan.clone()
+        };
+        let mut codec = self.venue.md_codec(&self.cfg, &plan);
         let mut fx = Effects::new();
         codec.on_open(&mut fx);
         let call = self.rec.opened(key)?;
@@ -355,7 +362,7 @@ impl<H: MdHandler> MdSession<H> {
                     self.execute(&mut ws, fx).await
                 }
                 Wake::Frame(_) => false,
-                Wake::Timer => self.fire(&mut ws, codec.as_mut(), key).await?,
+                Wake::Timer => self.fire(&mut ws, codec.as_mut()).await?,
                 Wake::Desired(true) => {
                     let subs = self.desired.borrow_and_update().clone();
                     let call = self.rec.set_desired(subs);
@@ -404,13 +411,9 @@ impl<H: MdHandler> MdSession<H> {
         &mut self,
         ws: &mut WebSocket,
         codec: &mut dyn MdCodec,
-        key: ConnKey,
     ) -> Result<bool, SessionError> {
         let mut open = true;
-        if let Some(Reverse((_, _, epoch, tag))) = self.timers.pop()
-            && self.epochs.admit(Input::Timer, ConnKey { epoch, ..key })? == Admit::Current
-        {
-            let stamp = self.clock.stamp(key);
+        if let Some((stamp, tag)) = self.take_timer()? {
             let mut sink = Sink {
                 handler: &mut self.handler,
                 epochs: &mut self.epochs,
@@ -477,6 +480,24 @@ impl<H: MdHandler> MdSession<H> {
             }
         }
         open
+    }
+
+    /// Takes the earliest timer and stamps its firing under the epoch that set it, so it takes
+    /// its place in ingest order even when dropped; its stamp and tag when that epoch is
+    /// current, `None` when it ended (dropped and counted).
+    fn take_timer(&mut self) -> Result<Option<(Stamp, TimerTag)>, SessionError> {
+        let mut current = None;
+        if let Some(Reverse((_, _, epoch, tag))) = self.timers.pop() {
+            let key = ConnKey {
+                epoch,
+                ..self.current()
+            };
+            let stamp = self.clock.stamp(key);
+            if self.epochs.admit(Input::Timer, key)? == Admit::Current {
+                current = Some((stamp, tag));
+            }
+        }
+        Ok(current)
     }
 
     fn next_deadline(&self) -> Option<Instant> {
