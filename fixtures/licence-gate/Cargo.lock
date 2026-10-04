@@ -7,8 +7,13 @@ name = "gpl-dep"
 version = "0.0.0"
 
 [[package]]
+name = "gpl-dev-dep"
+version = "0.0.0"
+
+[[package]]
 name = "licence-gate-app"
 version = "0.0.0"
 dependencies = [
  "gpl-dep",
+ "gpl-dev-dep",
 ]

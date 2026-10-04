@@ -10,6 +10,11 @@ publish = false
 [dependencies]
 gpl-dep = { path = "gpl-dep" }
 
+[dev-dependencies]
+gpl-dev-dep = { path = "gpl-dev-dep" }
+
 [workspace]
 resolver = "3"
-members = ["gpl-dep"]
+# The GPL crates are path dependencies only, never members: a member is a root of the graph
+# and would be checked as one, which would hide whether the gate follows dev-dependencies.
+exclude = ["gpl-dep", "gpl-dev-dep"]

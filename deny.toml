@@ -15,6 +15,9 @@ all-features = true
 # in use yet (ISC, Zlib and CDLA-Permissive-2.0 arrive with the network stack), so an unused
 # entry is not reported.
 unused-allowed-license = "allow"
+# Dev-dependencies are held to the same list: cargo-deny skips them by default, and a test-only
+# crate is still in this repository's graph and in every contributor's build.
+include-dev = true
 allow = [
   "MIT",
   "Apache-2.0",

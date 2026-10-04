@@ -187,8 +187,9 @@ exists, `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D
 check (a venue crate's source outside `src/sign*` and `src/auth*` that names a JWT, bearer
 token, API key, authorization header or private key fails; 0009), then the licence gate
 (`scripts/licence-check.sh --self-test`, which proves the gate refuses the GPL-3.0-only path
-crate in `fixtures/licence-gate` and names it, then `cargo deny check licenses` on the workspace
-against `deny.toml`'s permissive allowlist; 0017), then the coverage
+crates in `fixtures/licence-gate`, a normal and a dev-only dependency, and names them, then
+`cargo deny check licenses` on the workspace, dev-dependencies included, against `deny.toml`'s
+permissive allowlist; 0017), then the coverage
 ratchet (`scripts/coverage.sh`, workspace line coverage from cargo-llvm-cov, against
 `coverage-floor.txt` with 0.2 points of slack; the workspace ticket records the first floor
 with `scripts/coverage-ratchet.sh --set`). `scripts/check.sh --fast` skips the ratchet. On the
