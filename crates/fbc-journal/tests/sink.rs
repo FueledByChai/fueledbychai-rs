@@ -322,6 +322,53 @@ fn close_ends_with_a_busy_sink_and_refuses_what_comes_after() {
 }
 
 #[test]
+fn a_gap_still_open_at_shutdown_is_marked_last() {
+    // Codex r4176902253: records dropped and no record after them before shutdown; the
+    // journal must still say so. Once by closing the writer, once by dropping the sink.
+    for (name, by_close) in [("sink_gap_close", true), ("sink_gap_drop", false)] {
+        let root = fresh_dir(name);
+        let (mut sink, drain) = journal_queue(SinkConfig {
+            budget_bytes: 512,
+            soft_limit_pct: 50,
+        })
+        .unwrap();
+        let mut kept = Vec::new();
+        let mut seq = 0;
+        let first_drop = loop {
+            if sink.record(TrafficClass::Normal, NOW, &timer(seq)) == Recorded::DroppedCounted {
+                break seq;
+            }
+            kept.push(timer(seq));
+            seq += 1;
+        };
+        assert_eq!(
+            sink.record(TrafficClass::Normal, NOW, &timer(seq + 1)),
+            Recorded::DroppedCounted
+        );
+        let writer = drain
+            .spawn(JournalWriter::create(&root, 1).unwrap())
+            .unwrap();
+        if by_close {
+            writer.close().unwrap();
+            // Drops after close are counted, not journaled.
+            assert_eq!(
+                sink.record(TrafficClass::Safety, NOW, &timer(seq + 2)),
+                Recorded::DroppedCounted
+            );
+            assert_eq!(sink.dropped(TrafficClass::Safety), 1);
+        } else {
+            drop(sink);
+            writer.close().unwrap();
+        }
+        kept.push(Record::Marker(Marker::Degraded {
+            from_seq: first_drop,
+            dropped: 2,
+        }));
+        assert_eq!(read_all(&root, 1), kept, "{name}");
+    }
+}
+
+#[test]
 fn a_record_the_queue_or_the_format_cannot_hold_is_dropped_and_counted() {
     let root = fresh_dir("sink_unholdable");
     let (mut sink, drain) = journal_queue(SinkConfig {

@@ -20,7 +20,9 @@
 //! that record both fit under the soft limit: [`Marker::Degraded`] `{ from_seq, dropped }` is
 //! written first, naming the first dropped record's number and how many were dropped since,
 //! then the record. Safety records admitted from the reserve while the gap is open come before
-//! the marker. Markers the sink writes take no number.
+//! the marker. Markers the sink writes take no number. A gap still open when the sink closes
+//! ([`WriterThread::close`], or the sink dropped) is marked by the writer as the journal's last
+//! record; records offered after that are dropped and counted, not marked.
 //!
 //! **The queue** is hand-written and has no `unsafe` (decision 0021): a ring of `AtomicU64`
 //! words whose read and write positions only the consumer and only the producer advance. An
@@ -106,6 +108,9 @@ pub fn journal_queue(config: SinkConfig) -> Result<(QueueSink, JournalDrain), Jo
         parked: AtomicBool::new(false),
         closed: AtomicBool::new(false),
         busy: AtomicBool::new(false),
+        gap_from: AtomicU64::new(NO_GAP),
+        gap_dropped: AtomicU64::new(0),
+        gap_wall: AtomicU64::new(0),
         writer: OnceLock::new(),
     });
     let sink = QueueSink {
@@ -136,6 +141,13 @@ struct Ring {
     /// `SeqCst`, a writer that sees `closed` and then `busy` clear knows no record it has not
     /// seen will be pushed.
     busy: AtomicBool,
+    /// The sink's open gap, copied for the writer to mark at shutdown: the first dropped
+    /// record's number ([`NO_GAP`] when none), how many were dropped, and the first drop's
+    /// wall time. The sink changes them only inside `busy` and only before it closes, so the
+    /// writer's look after waiting `busy` out is final.
+    gap_from: AtomicU64,
+    gap_dropped: AtomicU64,
+    gap_wall: AtomicU64,
     /// The writer thread, set by the thread itself before it can park.
     writer: OnceLock<Thread>,
 }
@@ -215,7 +227,13 @@ impl Ring {
 struct Gap {
     from_seq: u64,
     dropped: u64,
+    /// When the first record was dropped: the marker the writer writes at shutdown is filed
+    /// under it.
+    wall: WallNs,
 }
+
+/// `Ring::gap_from` when no gap is open.
+const NO_GAP: u64 = u64::MAX;
 
 /// The producer end of the journal queue: the [`JournalSink`] the shard records into.
 /// Dropping it lets the writer finish what is queued and stop.
@@ -260,21 +278,28 @@ impl JournalSink for QueueSink {
         let seq = self.next_seq;
         self.next_seq += 1;
         self.ring.busy.store(true, SeqCst);
-        let recorded = if self.ring.closed.load(SeqCst) {
-            Recorded::DroppedCounted
-        } else {
+        let open = !self.ring.closed.load(SeqCst);
+        let recorded = if open {
             self.admit(class, now, record)
+        } else {
+            Recorded::DroppedCounted
         };
-        self.ring.busy.store(false, SeqCst);
         if recorded == Recorded::DroppedCounted {
             self.dropped[class_index(class)] += 1;
-            self.gap
-                .get_or_insert(Gap {
-                    from_seq: seq,
-                    dropped: 0,
-                })
-                .dropped += 1;
-        } else {
+            let gap = self.gap.get_or_insert(Gap {
+                from_seq: seq,
+                dropped: 0,
+                wall: now,
+            });
+            gap.dropped += 1;
+            if open {
+                self.ring.gap_from.store(gap.from_seq, Relaxed);
+                self.ring.gap_dropped.store(gap.dropped, Relaxed);
+                self.ring.gap_wall.store(gap.wall.0 as u64, Relaxed);
+            }
+        }
+        self.ring.busy.store(false, SeqCst);
+        if recorded == Recorded::Ok {
             self.ring.wake();
         }
         recorded
@@ -309,6 +334,7 @@ impl QueueSink {
         if fits(used, marker.saturating_add(need), self.soft) {
             if self.gap.take().is_some() {
                 self.ring.push(now, &self.marker);
+                self.ring.gap_from.store(NO_GAP, Relaxed);
             }
             self.ring.push(now, &self.body);
         } else if class == TrafficClass::Safety && fits(used, need, self.ring.words.len()) {
@@ -366,10 +392,18 @@ fn run(ring: &Ring, mut writer: JournalWriter) -> Result<(), JournalError> {
             writer.append_body(wall, &body)?;
             continue;
         }
-        writer.flush()?;
         if closing {
-            return Ok(());
+            // The sink pushes nothing more and its gap is final: mark one still open.
+            let from_seq = ring.gap_from.load(Relaxed);
+            if from_seq != NO_GAP {
+                let dropped = ring.gap_dropped.load(Relaxed);
+                let wall = WallNs(ring.gap_wall.load(Relaxed) as i64);
+                let degraded = Record::Marker(Marker::Degraded { from_seq, dropped });
+                writer.append(wall, &degraded)?;
+            }
+            return writer.flush();
         }
+        writer.flush()?;
         ring.parked.store(true, SeqCst);
         if ring.used() == 0 && !ring.closed.load(SeqCst) {
             thread::park();
@@ -385,9 +419,9 @@ pub struct WriterThread {
 }
 
 impl WriterThread {
-    /// Closes the sink, writes what it accepted, flushes, and stops the thread. The sink drops
-    /// and counts every record offered after this. Returns the write error that stopped the
-    /// thread, if one did.
+    /// Closes the sink, writes what it accepted and then the marker of a gap still open,
+    /// flushes, and stops the thread. The sink drops and counts every record offered after
+    /// this. Returns the write error that stopped the thread, if one did.
     pub fn close(self) -> Result<(), JournalError> {
         self.ring.closed.store(true, SeqCst);
         self.handle.thread().unpark();
