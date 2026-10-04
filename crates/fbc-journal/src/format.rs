@@ -374,12 +374,16 @@ impl Enc<'_> {
     fn spanned(&mut self, bytes: &[u8], spans: &[Range<u32>]) -> Result<(), JournalError> {
         self.u32(len32(bytes.len())?);
         self.u32(len32(spans.len())?);
+        // Counted first, stopping at the first span past MAX_REDACTED, so a record that
+        // redacts too much writes no descriptor.
+        for span in spans {
+            self.redact(u64::from(span.end - span.start))?;
+        }
         for span in spans {
             self.u32(span.start);
             self.u32(span.end);
             self.within()?;
         }
-        self.redact(spans.iter().map(|s| u64::from(s.end - s.start)).sum())?;
         let mut at = 0;
         for span in spans {
             self.put(&bytes[at..span.start as usize]);
@@ -1073,8 +1077,8 @@ mod tests {
 
     #[test]
     fn encoding_stops_at_the_limit_instead_of_walking_the_rest() {
-        // Codex r4176902248: past the limit, no later element is visited. A secret header or
-        // a span list after the limit would count redacted bytes if it were.
+        // Codex r4176902248: past the limit, no later element is written. A secret header
+        // after the limit would count redacted bytes if it were visited.
         let mut out = Vec::new();
         let mut e = Enc {
             out: &mut out,
@@ -1109,7 +1113,10 @@ mod tests {
             e.spanned(&[b'a'; 128], &spans),
             Err(JournalError::TooLarge)
         ));
-        assert_eq!(e.redacted, 0);
+        // The spans are counted against MAX_REDACTED first (no copy); their descriptors stop
+        // at the limit.
+        assert_eq!(e.redacted, 64);
+        assert!(e.out.len() <= 16);
 
         let mut out = Vec::new();
         let mut e = Enc {
@@ -1157,5 +1164,27 @@ mod tests {
         assert_eq!(body_end(0, usize::MAX), u32::MAX as usize);
         assert_eq!(body_end(10, usize::MAX), 10 + u32::MAX as usize);
         assert_eq!(body_end(10, 64), 74);
+    }
+
+    #[test]
+    fn too_much_redaction_is_refused_before_any_span_is_written() {
+        // Codex r4176960480: spans redacting more than MAX_REDACTED in all are refused before
+        // their descriptors are written, however much room the limit leaves.
+        let mut out = Vec::new();
+        let mut e = Enc {
+            out: &mut out,
+            redacted: 0,
+            end: usize::MAX,
+            over: false,
+        };
+        let span = MAX_REDACTED as u32 / 4;
+        let bytes = vec![b'a'; span as usize * 8];
+        let spans: Vec<Range<u32>> = (0..8).map(|i| i * span..(i + 1) * span).collect();
+        assert!(matches!(
+            e.spanned(&bytes, &spans),
+            Err(JournalError::TooLarge)
+        ));
+        // Only the two lengths: no span descriptor.
+        assert_eq!(e.out.len(), 8);
     }
 }
