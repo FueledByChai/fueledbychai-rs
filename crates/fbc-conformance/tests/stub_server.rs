@@ -230,3 +230,31 @@ async fn the_http_endpoint_answers_fixed_responses_by_path_and_refuses_what_it_c
     }
     assert_eq!(server.http_requests().len(), 5);
 }
+
+#[tokio::test]
+async fn dropping_the_stub_closes_a_connection_whose_push_waits_on_a_client_not_reading() {
+    // On the wall clock: the push waits on real socket buffers (Codex r4177657008).
+    let push = Step::Push {
+        conn: 0,
+        frame: Frame::Binary(vec![0; 32 << 20]),
+    };
+    let server = stub(vec![Step::Accept, push]).await;
+    let addr = server.ws_url("").trim_start_matches("ws://").to_owned();
+    let mut raw = TcpStream::connect(addr).await.unwrap();
+    let upgrade = "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+                   Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    raw.write_all(upgrade.as_bytes()).await.unwrap();
+    // The client never reads, so the push fills the socket buffers and waits.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(server.live(), 1);
+    drop(server);
+    // Once the stub let go of the socket, the client's writes fail; until then they would fill
+    // the buffers of a peer that is not reading and wait.
+    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+        while raw.write_all(&[0; 1024]).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "the stub kept the connection open");
+}

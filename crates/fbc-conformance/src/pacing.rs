@@ -45,20 +45,24 @@ impl fmt::Display for PacingBreach {
 
 impl std::error::Error for PacingBreach {}
 
-/// Checks the start instants of a client's connection attempts, in order, against `pacing`.
+/// Checks the start instants of a client's connection attempts, in order, against `pacing`,
+/// attempt by attempt, so the breach returned is the earliest; at one attempt the floor is
+/// checked before the budget.
 pub fn check_pacing(starts: &[Instant], pacing: &ReconnectPacing) -> Result<(), PacingBreach> {
-    for (attempt, pair) in (1..).zip(starts.windows(2)) {
-        let gap = pair[1].saturating_duration_since(pair[0]);
-        if gap < pacing.floor() {
-            return Err(PacingBreach::Floor { attempt, gap });
-        }
-    }
     let budget = pacing.budget();
     let span = usize::try_from(budget).unwrap_or(usize::MAX);
-    for (first, window) in starts.windows(span.saturating_add(1)).enumerate() {
-        if window[span].saturating_duration_since(window[0]) < pacing.window() {
+    for (attempt, start) in starts.iter().enumerate() {
+        if let Some(last) = attempt.checked_sub(1) {
+            let gap = start.saturating_duration_since(starts[last]);
+            if gap < pacing.floor() {
+                return Err(PacingBreach::Floor { attempt, gap });
+            }
+        }
+        if let Some(first) = attempt.checked_sub(span)
+            && start.saturating_duration_since(starts[first]) < pacing.window()
+        {
             return Err(PacingBreach::Budget {
-                attempt: first + span,
+                attempt,
                 first,
                 budget,
             });
@@ -108,6 +112,16 @@ mod tests {
         assert_eq!(
             budget.to_string(),
             "attempt 4 is past the budget of 2 in the window of attempt 2"
+        );
+
+        // A budget breach at attempt 2 comes before the floor breach at attempt 3.
+        assert_eq!(
+            check_pacing(&at(&[0, 1, 2, 2]), &pacing),
+            Err(PacingBreach::Budget {
+                attempt: 2,
+                first: 0,
+                budget: 2
+            })
         );
     }
 }
