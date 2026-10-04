@@ -1053,8 +1053,9 @@ fn request_bytes(req: &HttpRequest) -> usize {
     }
 }
 
-/// The bytes of a response the journal keeps verbatim: its body, its header names and the
-/// values of headers that are not secret, each at the length it is kept read lossily.
+/// The bytes of a response the journal keeps: its body, its header names, the values of
+/// headers that are not secret, each at the length it is kept read lossily, and the digest
+/// each secret value is journaled as (Codex r4178988952).
 fn response_bytes(r: &Response<Bytes>) -> usize {
     let headers: usize = r
         .headers()
@@ -1062,7 +1063,7 @@ fn response_bytes(r: &Response<Bytes>) -> usize {
         .map(|(n, v)| {
             n.as_str().len()
                 + if is_secret_header(n.as_str()) {
-                    0
+                    fbc_journal::redact::DIGEST_LEN
                 } else {
                     lossy_len(v.as_bytes())
                 }
@@ -1163,16 +1164,20 @@ mod tests {
                 hyper::header::HeaderValue::from_bytes(&[b'a', 0xFF, 0xFE, b'b']).unwrap(),
             )
             .header("x-ok", "fine")
+            .header("set-cookie", "sid=a-long-session-credential")
             .body(Bytes::from_static(b"body"))
             .unwrap();
         let rec = response_rec(&response);
         let kept: usize = rec
             .headers
             .iter()
+            .filter(|h| !h.secret())
             .map(|h| h.name.len() + h.value.len())
             .sum();
         assert_eq!(kept, "x-raw".len() + 8 + "x-ok".len() + "fine".len());
-        assert_eq!(response_bytes(&response), kept + rec.body.0.len());
+        // Codex r4178988952: a secret header's value is journaled as its digest.
+        let secret = "set-cookie".len() + fbc_journal::redact::DIGEST_LEN;
+        assert_eq!(response_bytes(&response), kept + secret + rec.body.0.len());
     }
 
     /// Codex r4178802722: a request redacting more than the journal format takes is refused by
