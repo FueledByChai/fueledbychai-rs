@@ -3,17 +3,20 @@
 //!
 //! 1. From its subscription, a book buffers its events. The first event asks for the snapshot,
 //!    `GET /fapi/v1/depth?symbol=<SYMBOL>&limit=<limit>`, as an [`Effect::Http`] with the
-//!    configured timeout and the limit's documented weight against the REST budget.
-//! 2. The response pushes `BookSnapshotBegin` under the book's next epoch, the snapshot's levels
-//!    and `BookSnapshotEnd`, then the buffered events and those that follow as `Level` deltas:
-//!    an event whose `u` is below the snapshot's `lastUpdateId` is dropped; the first applied
-//!    must straddle it (`U <= lastUpdateId <= u`); each one after must name the last applied
-//!    `u` as its `pu`.
+//!    configured timeout and the limit's documented weight against the REST budget. (The
+//!    runtime's `MdSession` does not make HTTP requests yet: FBC-moe.)
+//! 2. The response is held until an event bridges it: an event whose `u` is below the
+//!    snapshot's `lastUpdateId` is dropped; the first one after must straddle it
+//!    (`U <= lastUpdateId <= u`). That event publishes `BookSnapshotBegin` under the book's next
+//!    epoch, the snapshot's levels and `BookSnapshotEnd`, then its own levels as `Level`
+//!    deltas; the buffered and following events follow as deltas, each naming the last applied
+//!    `u` as its `pu`. A snapshot older than the first event after it is never published, so no
+//!    consumer sees it valid (Codex r4177522988): it is retried as a failed request is,
+//!    buffering from that event.
 //! 3. An event whose `u` is not above the last applied `u` was already applied: it is ignored as
-//!    a duplicate. Any other break (a gap, events out of order, a snapshot older than the first
-//!    event after it) pushes `Health { feed: Book(BOOK_DIFF), h: Gap }` with that event's
-//!    metadata, asks for a new snapshot at once, and buffers from that event: a fresh anchor
-//!    under a new epoch.
+//!    a duplicate. Any other break in the `pu` chain (a gap, events out of order) pushes
+//!    `Health { feed: Book(BOOK_DIFF), h: Gap }` with that event's metadata, asks for a new
+//!    snapshot at once, and buffers from that event: a fresh anchor under a new epoch.
 //! 4. A request that fails (no response, or a response that is refused or cannot be read) asks
 //!    for a timer of the configured retry interval, which asks again. The buffer is emptied on
 //!    a failure, since the next snapshot is taken after the events it held; it holds at most what
@@ -159,9 +162,10 @@ enum Anchor {
         timer: TimerTag,
         buffer: Vec<DiffEvent>,
     },
-    /// Anchored: `last` is the last applied `u`, or the snapshot's `lastUpdateId` while
-    /// `fresh` (no event applied since it).
-    Live { last: u64, fresh: bool },
+    /// A snapshot no event has bridged yet: held, not published.
+    Held(Snapshot),
+    /// Published: `last` is the last applied `u`.
+    Live { last: u64 },
 }
 
 /// One instrument's diff-depth book on this connection.
@@ -184,26 +188,22 @@ pub(crate) struct DiffBooks {
     tags: u64,
 }
 
-/// What a book needs to ask for its snapshot.
-struct Asker<'a> {
+/// What one book's anchor needs from around it: where and how to ask for its snapshot, the
+/// codec's tags, and the instrument's epoch.
+struct Cx<'a> {
     inst: InstrumentId,
     url: &'a str,
     cfg: &'a SnapshotSettings,
+    tags: &'a mut u64,
+    epoch: &'a mut u32,
 }
 
-impl<'a> Asker<'a> {
-    fn of(inst: InstrumentId, book: &'a Book) -> Asker<'a> {
-        Asker {
-            inst,
-            url: &book.url,
-            cfg: &book.cfg,
-        }
-    }
-
-    /// Asks for the snapshot under the next tag.
-    fn ask(&self, tags: &mut u64, fx: &mut Effects) -> HttpTag {
-        *tags += 1;
-        let tag = HttpTag(*tags);
+impl Cx<'_> {
+    /// Asks for the snapshot under the next tag: the anchor that waits for it, buffering
+    /// `buffer`.
+    fn ask(&mut self, buffer: Vec<DiffEvent>, fx: &mut Effects) -> Anchor {
+        *self.tags += 1;
+        let tag = HttpTag(*self.tags);
         fx.push(Effect::Http {
             tag,
             req: HttpRequest {
@@ -221,7 +221,27 @@ impl<'a> Asker<'a> {
                 weight: self.cfg.weight,
             },
         });
-        tag
+        Anchor::Requested { tag, buffer }
+    }
+
+    /// Asks for the retry timer: the anchor that waits for it, buffering `buffer`.
+    fn retry(&mut self, buffer: Vec<DiffEvent>, fx: &mut Effects) -> Anchor {
+        *self.tags += 1;
+        let timer = TimerTag(*self.tags);
+        fx.push(Effect::Timer {
+            tag: timer,
+            after: self.cfg.retry,
+        });
+        Anchor::Retrying { timer, buffer }
+    }
+
+    /// Publishes `snapshot` whole under the instrument's next epoch.
+    fn publish(&mut self, snapshot: &Snapshot, sink: &mut dyn MdSink) {
+        *self.epoch = self.epoch.wrapping_add(1);
+        let (inst, book, epoch, meta) = (self.inst, BOOK_DIFF, *self.epoch, snapshot.meta);
+        sink.push(meta, MdEvent::BookSnapshotBegin { inst, book, epoch });
+        push_levels(inst, meta, &snapshot.levels, sink);
+        sink.push(meta, MdEvent::BookSnapshotEnd { inst, book });
     }
 }
 
@@ -246,55 +266,48 @@ fn push_levels(
     }
 }
 
-/// Applies `ev` to `anchor`: buffers it, applies it, drops it, or breaks the anchor.
+/// Applies `ev` to `anchor`: buffers it, publishes the held snapshot it bridges, applies it,
+/// drops it, or breaks the anchor.
 fn apply(
     anchor: &mut Anchor,
-    asker: &Asker<'_>,
-    tags: &mut u64,
+    cx: &mut Cx<'_>,
     ev: DiffEvent,
     sink: &mut dyn MdSink,
     fx: &mut Effects,
 ) {
-    let (last, fresh) = match anchor {
-        Anchor::Subscribed => {
-            let tag = asker.ask(tags, fx);
-            *anchor = Anchor::Requested {
-                tag,
-                buffer: vec![ev],
-            };
-            return;
+    match anchor {
+        Anchor::Subscribed => *anchor = cx.ask(vec![ev], fx),
+        Anchor::Requested { buffer, .. } | Anchor::Retrying { buffer, .. } => buffer.push(ev),
+        Anchor::Held(snapshot) => {
+            if ev.last < snapshot.id {
+                // Before the snapshot: already in it.
+                return;
+            }
+            if ev.first > snapshot.id {
+                // The snapshot is older than the first event after it: never published, it is
+                // retried like a failed request, keeping this event for the next.
+                *anchor = cx.retry(vec![ev], fx);
+                return;
+            }
+            cx.publish(snapshot, sink);
+            push_levels(cx.inst, ev.meta, &ev.levels, sink);
+            *anchor = Anchor::Live { last: ev.last };
         }
-        Anchor::Requested { buffer, .. } | Anchor::Retrying { buffer, .. } => {
-            buffer.push(ev);
-            return;
+        Anchor::Live { last } => {
+            if ev.last <= *last {
+                // Already applied: a duplicate.
+                return;
+            }
+            if ev.prev == *last {
+                push_levels(cx.inst, ev.meta, &ev.levels, sink);
+                *last = ev.last;
+                return;
+            }
+            let (inst, feed, h) = (cx.inst, Feed::Book(BOOK_DIFF), FeedHealth::Gap);
+            sink.push(ev.meta, MdEvent::Health { inst, feed, h });
+            *anchor = cx.ask(vec![ev], fx);
         }
-        Anchor::Live { last, fresh } => (last, fresh),
-    };
-    let follows = if *fresh {
-        if ev.last < *last {
-            // Before the snapshot: already in it.
-            return;
-        }
-        ev.first <= *last
-    } else {
-        if ev.last <= *last {
-            // Already applied: a duplicate.
-            return;
-        }
-        ev.prev == *last
-    };
-    if follows {
-        push_levels(asker.inst, ev.meta, &ev.levels, sink);
-        (*last, *fresh) = (ev.last, false);
-        return;
     }
-    let (inst, feed, h) = (asker.inst, Feed::Book(BOOK_DIFF), FeedHealth::Gap);
-    sink.push(ev.meta, MdEvent::Health { inst, feed, h });
-    let tag = asker.ask(tags, fx);
-    *anchor = Anchor::Requested {
-        tag,
-        buffer: vec![ev],
-    };
 }
 
 impl DiffBooks {
@@ -324,14 +337,23 @@ impl DiffBooks {
         sink: &mut dyn MdSink,
         fx: &mut Effects,
     ) {
-        if let Some(book) = self.books.get_mut(&inst) {
-            let Book { url, cfg, anchor } = book;
-            let asker = Asker { inst, url, cfg };
-            apply(anchor, &asker, &mut self.tags, ev, sink, fx);
+        if let Some(Book { url, cfg, anchor }) = self.books.get_mut(&inst) {
+            let epoch = self.epochs.entry(inst).or_insert(0);
+            let tags = &mut self.tags;
+            let mut cx = Cx {
+                inst,
+                url,
+                cfg,
+                tags,
+                epoch,
+            };
+            apply(anchor, &mut cx, ev, sink, fx);
         }
     }
 
-    /// The response to snapshot request `tag`, or why none came.
+    /// The response to snapshot request `tag`, or why none came. A snapshot is held until an
+    /// event bridges it (`U <= lastUpdateId <= u`), so one the events show stale is never
+    /// published.
     pub fn on_http(
         &mut self,
         tag: HttpTag,
@@ -343,12 +365,20 @@ impl DiffBooks {
         let waiting = self.books.iter_mut().find(
             |(_, book)| matches!(book.anchor, Anchor::Requested { tag: out, .. } if out == tag),
         );
-        let Some((&inst, book)) = waiting else {
+        let Some((&inst, Book { url, cfg, anchor })) = waiting else {
             return Err(DecodeError::Malformed(
                 "a response to no pending snapshot request",
             ));
         };
-        let Book { url, cfg, anchor } = book;
+        let epoch = self.epochs.entry(inst).or_insert(0);
+        let tags = &mut self.tags;
+        let mut cx = Cx {
+            inst,
+            url,
+            cfg,
+            tags,
+            epoch,
+        };
         // A failure is retried: with `Ok` when no response came, with the error when one came
         // and was refused or could not be read.
         let snapshot = match resp {
@@ -359,55 +389,25 @@ impl DiffBooks {
             Ok(resp) => specs
                 .get(inst)
                 .ok_or(DecodeError::UnknownInstrument)
-                .and_then(|spec| decode_snapshot(spec, resp.body, cfg.limit))
+                .and_then(|spec| decode_snapshot(spec, resp.body, cx.cfg.limit))
                 .map_err(Err),
         };
         let snapshot = match snapshot {
             Ok(snapshot) => snapshot,
             Err(result) => {
-                self.tags += 1;
-                let timer = TimerTag(self.tags);
-                fx.push(Effect::Timer {
-                    tag: timer,
-                    after: cfg.retry,
-                });
-                *anchor = Anchor::Retrying {
-                    timer,
-                    buffer: Vec::new(),
-                };
+                // Nothing tells which buffered events the next snapshot needs; it is taken
+                // after them, so they are dropped.
+                *anchor = cx.retry(Vec::new(), fx);
                 return result;
             }
         };
-        let epoch = self.epochs.entry(inst).or_insert(0);
-        *epoch = epoch.wrapping_add(1);
-        let (book_id, epoch, meta) = (BOOK_DIFF, *epoch, snapshot.meta);
-        sink.push(
-            meta,
-            MdEvent::BookSnapshotBegin {
-                inst,
-                book: book_id,
-                epoch,
-            },
-        );
-        push_levels(inst, meta, &snapshot.levels, sink);
-        sink.push(
-            meta,
-            MdEvent::BookSnapshotEnd {
-                inst,
-                book: book_id,
-            },
-        );
+        let held = Anchor::Held(snapshot);
         let mut buffer = Vec::new();
-        if let Anchor::Requested { buffer: held, .. } = anchor {
-            buffer = core::mem::take(held);
+        if let Anchor::Requested { buffer: kept, .. } = core::mem::replace(anchor, held) {
+            buffer = kept;
         }
-        *anchor = Anchor::Live {
-            last: snapshot.id,
-            fresh: true,
-        };
-        let asker = Asker { inst, url, cfg };
         for ev in buffer {
-            apply(anchor, &asker, &mut self.tags, ev, sink, fx);
+            apply(anchor, &mut cx, ev, sink, fx);
         }
         Ok(())
     }
@@ -417,14 +417,19 @@ impl DiffBooks {
         let retrying = self.books.iter_mut().find(
             |(_, book)| matches!(book.anchor, Anchor::Retrying { timer, .. } if timer == tag),
         );
-        if let Some((&inst, book)) = retrying {
-            let request = Asker::of(inst, book).ask(&mut self.tags, fx);
-            if let Anchor::Retrying { buffer, .. } = &mut book.anchor {
+        if let Some((&inst, Book { url, cfg, anchor })) = retrying {
+            let epoch = self.epochs.entry(inst).or_insert(0);
+            let tags = &mut self.tags;
+            let mut cx = Cx {
+                inst,
+                url,
+                cfg,
+                tags,
+                epoch,
+            };
+            if let Anchor::Retrying { buffer, .. } = anchor {
                 let buffer = core::mem::take(buffer);
-                book.anchor = Anchor::Requested {
-                    tag: request,
-                    buffer,
-                };
+                *anchor = cx.ask(buffer, fx);
             }
         }
     }
