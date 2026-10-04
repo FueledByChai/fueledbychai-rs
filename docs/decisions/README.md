@@ -27,3 +27,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0022](0022-a-paradex-book-s-seq-no-advances-by-one-per-frame-bbo-shares.md) A Paradex book's seq_no advances by one per frame, bbo shares it, and a break resyncs by reconnecting the book's stream — accepted
 - [0023](0023-a-market-data-session-hands-each-event-to-the-consumer-s-han.md) A market-data session hands each event to the consumer's handler inline and paces reconnects by consumer-configured backoff and attempt budget — accepted
 - [0024](0024-the-journal-hashes-each-redacted-span-with-hmac-sha-256-unde.md) The journal hashes each redacted span with HMAC-SHA-256 under a consumer key, using hmac 0.12.1 and sha2 0.10.9 pinned — accepted
+- [0025](0025-conformance-fault-scripts-are-typed-rust-values-played-by-a-.md) Conformance fault scripts are typed Rust values played by a public stub server; a text script format is deferred — accepted

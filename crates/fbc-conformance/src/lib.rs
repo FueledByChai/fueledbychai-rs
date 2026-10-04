@@ -1,0 +1,24 @@
+//! The adapter conformance kit (design §6): the failures that hurt the Java stack, played
+//! against the runtime and the venue crates in their tests, on the loopback interface only.
+//!
+//! So far (FBC-jcy):
+//!
+//! - [`StubServer`], a stub venue on two 127.0.0.1 ephemeral ports: a WebSocket endpoint that
+//!   plays a [`WsScript`] (accept, read, push, close, go silent; each step names its connection)
+//!   and records every connection and data frame, and an HTTP/1.1 endpoint that answers fixed
+//!   responses by path, for a venue's REST anchor. Venue crates take this crate as a
+//!   dev-dependency instead of writing servers of their own (design §6 step 12).
+//! - Scripts are typed Rust values; a text format is deferred (decision 0025).
+//! - [`reconnect_storm`], the storm of [`STORM_RECONNECTS`] forced reconnects, and
+//!   [`check_pacing`], which holds the attempts a stub saw to the client's reconnect pacing.
+//!
+//! Not here yet: the duplicate-ack and silence scripts (FBC-53c), the named conformance suite
+//! and its macro, and the full conformance venue.
+
+mod pacing;
+mod script;
+mod server;
+
+pub use pacing::{PacingBreach, check_pacing};
+pub use script::{Frame, STORM_RECONNECTS, Step, WsScript, reconnect_storm};
+pub use server::{ConnRecord, HttpReply, HttpRoutes, ScriptError, StubServer};
