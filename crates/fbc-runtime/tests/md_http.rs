@@ -291,6 +291,21 @@ async fn a_poll_endpoint_opens_no_socket_delivers_what_it_polls_and_refuses_fram
 }
 
 #[tokio::test]
+async fn a_poll_session_whose_control_has_dropped_builds_no_codec_and_asks_for_nothing() {
+    let venue = ToyVenue::leak();
+    let poll = MdTransport::Poll {
+        base_url: WireUrl::plain(format!("http://127.0.0.1:{}", closed_port().await)),
+    };
+    let (mut session, control) = MdSession::new(session(venue, poll), |_| {}).unwrap();
+    // Dropped before the session first runs, as when a venue drains a session it has just
+    // started: no codec is built, so its first poll is never asked for (Codex r4177698436).
+    drop(control);
+    session.run().await.unwrap();
+    assert_eq!(venue.codecs(), 0);
+    assert!(venue.http_log().is_empty());
+}
+
+#[tokio::test]
 async fn a_result_that_comes_back_during_a_write_keeps_its_place_in_the_shards_ingest_order() {
     let (mut ws1, mut ws2) = (ScriptedWs::start().await, ScriptedWs::start().await);
     let mut http = ScriptedHttp::start().await;
@@ -342,6 +357,9 @@ async fn a_result_that_comes_back_during_a_write_keeps_its_place_in_the_shards_i
         )
     );
     assert!(answer.stamp.ingest_seq < frame.stamp.ingest_seq);
+    // The shared handler gets them in that order too (Codex r4177698441).
+    let order: Vec<_> = seen.iter().map(|e| e.stamp.ingest_seq).collect();
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
 }
 
 #[tokio::test]
