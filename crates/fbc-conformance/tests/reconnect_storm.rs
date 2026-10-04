@@ -48,8 +48,9 @@ async fn a_session_rides_out_the_340_reconnect_storm_subscribed_once_per_epoch_a
     let pacing = ReconnectPacing::new(secs(1), secs(8), 10, secs(60), Duration::MAX).unwrap();
     let seen: Rc<RefCell<Vec<Envelope<MdEvent>>>> = Rc::default();
     let keep = seen.clone();
+    let venue = ToyVenue::leak();
     let config = MdSessionConfig {
-        venue: ToyVenue::leak(),
+        venue,
         cfg: VenueConfig::new(),
         plan: EndpointPlan {
             stream: toy::STREAM,
@@ -65,6 +66,7 @@ async fn a_session_rides_out_the_340_reconnect_storm_subscribed_once_per_epoch_a
         // The toy asks for no HTTP here; any bound would do.
         http_max_body: 64 * 1024,
         conn: CONN,
+        limiter: venue.limiter(0),
     };
     let (mut session, control) =
         MdSession::new(config, move |env| keep.borrow_mut().push(env)).unwrap();

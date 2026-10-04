@@ -28,35 +28,43 @@ impl Connector {
     ) -> Result<Response<Bytes>, NetError> {
         let (to, request) = prepare(request)?;
         let stream = self.open(&to).await?;
-        exchange(stream, request, max_body).await
+        exchange(stream, request, max_body, &mut ignore_status).await
     }
 
-    /// Makes a codec's request by `deadline`, reading at most `max_body` response bytes. A
-    /// failure before the connection is open (no deadline, as for a timeout past the end of
-    /// the clock; a request the runtime cannot make; the connect, the proxy, TLS, or the
-    /// deadline passing meanwhile) wrote no byte of the request and is
+    /// Makes a codec's request, made ready by [`ready`], by `deadline`, reading at most
+    /// `max_body` response bytes. A failure before the connection is open (the connect, the
+    /// proxy, TLS, or the deadline passing meanwhile) wrote no byte of the request and is
     /// [`HttpFailure::NotSent`]; after that, the deadline passing is [`HttpFailure::TimedOut`]
     /// and any other failure, a body over `max_body` included, [`HttpFailure::Lost`], since the
-    /// request may have been written.
+    /// request may have been written. `on_status` hears the response's status as it arrives,
+    /// before its body is read, so a body that fails does not hide it.
     pub(crate) async fn http_by(
         &self,
-        req: &HttpRequest,
-        deadline: Option<Instant>,
+        Ready(to, request): Ready,
+        deadline: Instant,
         max_body: usize,
+        on_status: &mut dyn FnMut(StatusCode),
     ) -> Result<Response<Bytes>, HttpFailure> {
-        let deadline = deadline.ok_or(HttpFailure::NotSent)?;
-        let request = to_hyper(req).ok_or(HttpFailure::NotSent)?;
-        let (to, request) = prepare(request).map_err(|_| HttpFailure::NotSent)?;
         let stream = match timeout_at(deadline, self.open(&to)).await {
             Ok(Ok(stream)) => stream,
             _ => return Err(HttpFailure::NotSent),
         };
-        match timeout_at(deadline, exchange(stream, request, max_body)).await {
+        match timeout_at(deadline, exchange(stream, request, max_body, on_status)).await {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(_)) => Err(HttpFailure::Lost),
             Err(_) => Err(HttpFailure::TimedOut),
         }
     }
+}
+
+/// A codec's request the runtime can make: where it goes, and the request in origin form.
+pub(crate) struct Ready(target::Target, Request<Full<Bytes>>);
+
+/// `req` made ready to send, or `None` for one the runtime cannot make (a URL, header name or
+/// value it refuses), which is [`HttpFailure::NotSent`] before anything is charged or opened.
+pub(crate) fn ready(req: &HttpRequest) -> Option<Ready> {
+    let (to, request) = prepare(to_hyper(req)?).ok()?;
+    Some(Ready(to, request))
 }
 
 /// A codec's request as hyper's, or `None` for a URL, header name or value hyper refuses.
@@ -89,11 +97,12 @@ fn prepare(request: Request<Bytes>) -> Result<(target::Target, Request<Full<Byte
 }
 
 /// Sends `request` on the open `stream` and reads the whole response, at most `max_body`
-/// bytes of body.
+/// bytes of body, telling `on_status` the status before the body is read.
 async fn exchange(
     stream: crate::transport::Transport,
     request: Request<Full<Bytes>>,
     max_body: usize,
+    on_status: &mut dyn FnMut(StatusCode),
 ) -> Result<Response<Bytes>, NetError> {
     let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
         .await
@@ -101,6 +110,7 @@ async fn exchange(
     let exchange = async move {
         let response = sender.send_request(request).await.map_err(http_error)?;
         let (parts, body) = response.into_parts();
+        on_status(parts.status);
         let body = Limited::new(body, max_body);
         let body = body.collect().await.map_err(body_error)?.to_bytes();
         Ok(Response::from_parts(parts, body))
@@ -109,6 +119,9 @@ async fn exchange(
     let (result, _) = tokio::join!(exchange, connection);
     result
 }
+
+/// A caller that does not need the status before the body.
+fn ignore_status(_: StatusCode) {}
 
 const BAD_HOST: &str = "the host is not a valid Host header";
 
@@ -182,15 +195,13 @@ mod tests {
         assert!(to_hyper(&request(HttpMethod::Get, "http://a test/", "x-k", "v")).is_none());
     }
 
-    #[tokio::test]
-    async fn a_request_the_runtime_cannot_make_is_not_sent() {
-        let connector = Connector::new(crate::ProxyConfig::Direct);
+    #[test]
+    fn a_request_the_runtime_cannot_make_is_never_ready() {
         let bad = request(HttpMethod::Get, "http://a.test/", "bad name", "v");
         let relative = request(HttpMethod::Get, "/only/a/path", "x-k", "v");
-        let later = Instant::now().checked_add(std::time::Duration::from_secs(60));
         for req in [bad, relative] {
-            let result = connector.http_by(&req, later, 1).await;
-            assert_eq!(result.unwrap_err(), HttpFailure::NotSent);
+            assert!(ready(&req).is_none());
         }
+        assert!(ready(&request(HttpMethod::Get, "http://a.test/", "x-k", "v")).is_some());
     }
 }

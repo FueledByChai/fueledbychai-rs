@@ -19,10 +19,19 @@
 //! runs, its codec gets data only through the HTTP requests it asks for, and a frame or a
 //! reconnect it names its stream in is a codec defect, refused and counted.
 //!
+//! Every frame, HTTP request and connection attempt is charged to the session's
+//! [`RateLimiter`] first (decision 0030). A connection attempt the buckets refuse waits for
+//! them; a subscribe call's frames they refuse wait, together and with the call outstanding in
+//! the reconciler, until they have room for all of them (one by one only when they never can);
+//! an HTTP request they refuse (it and the connection it opens) comes back to `on_http` as
+//! [`HttpFailure::NotSent`]; any other frame they refuse is not written. The pong the
+//! WebSocket layer sends for each ping is charged too, and a venue's HTTP 429 or 418 is counted
+//! under the scopes its request, not its connection, was charged to.
+//!
 //! One thread drives a session (design §5.1): [`MdSession::run`] spawns no task, so the read,
 //! the decode and the handler's call run in one call stack on the caller's current-thread
 //! runtime. Not here yet: keepalive, rotation and silence (FBC-djl), kernel timestamps
-//! (FBC-2y3) and rate limits (FBC-bel).
+//! (FBC-2y3).
 //!
 //! **The journal (0006).** With a [`Journal`] set ([`MdSession::set_journal`]), the session
 //! records everything that crosses the shard boundary as it happens, so replay can call each
@@ -56,13 +65,13 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use fbc_core::{
-    ConfigError, ConnKey, Effect, Effects, EndpointPlan, Envelope, HttpFailure, HttpRequest,
-    HttpResponse, HttpTag, MdCodec, MdEvent, MdSink, MdTransport, MonoNs, RawFrame, RpcId,
+    ConfigError, ConnKey, Effect, Effects, EndpointPlan, Envelope, HttpFailure, HttpResponse,
+    HttpTag, MdCodec, MdEvent, MdSink, MdTransport, MonoNs, OpKind, RateCharge, RawFrame,
     SpecTable, Stamp, StreamId, Subscription, TimerTag, TrafficClass, VenueCaps, VenueConfig,
-    VenueFactory, VenueMeta, WallNs, dispatch_market_data,
+    VenueFactory, VenueMeta, Via, WallNs, dispatch_market_data,
 };
 use fbc_journal::{ControlEvent, Record, RecordRef, ResponseRef, WriteRes, is_secret_header};
 use futures_util::stream::FuturesUnordered;
@@ -73,9 +82,10 @@ use tokio::time::{Instant, sleep_until};
 use crate::connector::Connector;
 use crate::epoch::{Admit, EpochError, Epochs, Input};
 use crate::error::NetError;
-use crate::http::{Bytes, Response};
+use crate::http::{self, Bytes, Response, StatusCode};
 use crate::journal::Journal;
 use crate::pacing::{Pacer, ReconnectPacing};
+use crate::ratelimit::{RateError, RateLimiter, Refused, Request};
 use crate::reconcile::{ReconcileError, Reconciler, SubscribeCall};
 use crate::ws::{self, Message, WebSocket};
 
@@ -156,6 +166,9 @@ pub struct MdSessionConfig {
     pub http_max_body: usize,
     /// The connection number stamped on this session's inputs, unique on its shard.
     pub conn: u16,
+    /// The buckets of the venue's declared limits, shared with every session that counts
+    /// against the same ones; built for exactly the venue's limits.
+    pub limiter: RateLimiter,
 }
 
 /// Why a session could not start, or stopped.
@@ -171,6 +184,8 @@ pub enum SessionError {
     Epoch(EpochError),
     /// The reconciler refused a call the session made: a session defect.
     Reconcile(ReconcileError),
+    /// The venue's rate limits cannot be counted, or the limiter is not theirs.
+    Rates(RateError),
 }
 
 impl fmt::Display for SessionError {
@@ -183,6 +198,7 @@ impl fmt::Display for SessionError {
             SessionError::Url(e) => write!(f, "the endpoint cannot be opened: {e}"),
             SessionError::Epoch(e) => write!(f, "{e}"),
             SessionError::Reconcile(e) => write!(f, "{e}"),
+            SessionError::Rates(e) => write!(f, "{e}"),
         }
     }
 }
@@ -192,6 +208,12 @@ impl std::error::Error for SessionError {}
 impl From<EpochError> for SessionError {
     fn from(e: EpochError) -> Self {
         SessionError::Epoch(e)
+    }
+}
+
+impl From<RateError> for SessionError {
+    fn from(e: RateError) -> Self {
+        SessionError::Rates(e)
     }
 }
 
@@ -259,6 +281,12 @@ pub struct MdSession<H> {
     http: FuturesUnordered<Pending>,
     http_max_body: usize,
     counters: MdCounters,
+    rates: RateLimiter,
+    /// A subscribe call one of whose frames the buckets refused, with the effects its codec
+    /// asked for that have not gone yet, outstanding until they have room; and when to try
+    /// again.
+    waiting: Option<(SubscribeCall, VecDeque<Effect>)>,
+    rate_retry: Option<Instant>,
     journal: Option<Journal>,
     /// The session has carried a credential: nothing it receives is journaled (until FBC-7lm).
     credentialed: Cell<bool>,
@@ -319,6 +347,7 @@ impl<H: MdHandler> MdSession<H> {
             .venue
             .caps(&config.cfg)
             .map_err(SessionError::Config)?;
+        config.limiter.check(&caps.limits)?;
         let epochs = Epochs::new(config.conn);
         let mut rec = Reconciler::new(epochs.current());
         let first: BTreeSet<_> = config.plan.subs.iter().copied().collect();
@@ -344,6 +373,9 @@ impl<H: MdHandler> MdSession<H> {
             http: FuturesUnordered::new(),
             http_max_body: config.http_max_body,
             counters: MdCounters::default(),
+            rates: config.limiter,
+            waiting: None,
+            rate_retry: None,
             journal: None,
             credentialed: Cell::new(credentialed),
             withheld: Cell::new(0),
@@ -422,8 +454,9 @@ impl<H: MdHandler> MdSession<H> {
 
     async fn run_socket(&mut self) -> Result<(), SessionError> {
         loop {
-            let at = self.pacer.next_attempt(Instant::now());
-            loop {
+            let mut at = self.pacer.next_attempt(Instant::now());
+            let mut waiting = true;
+            while waiting {
                 // The control first: once it has dropped, no attempt starts, even one that fell
                 // due at the same time.
                 let timer = self.next_deadline();
@@ -439,7 +472,12 @@ impl<H: MdHandler> MdSession<H> {
                     }
                 };
                 match idle {
-                    Idle::Attempt => break,
+                    // A connection the buckets refuse waits for them (decision 0030).
+                    Idle::Attempt => {
+                        let refused = self.rates.connect(Instant::now()).err();
+                        at = refused.map_or(at, |r| r.ready_at);
+                        waiting = refused.is_some();
+                    }
                     // Only an ended epoch's timers and requests wait while disconnected: each
                     // comes back into nothing.
                     Idle::Timer => {
@@ -492,7 +530,11 @@ impl<H: MdHandler> MdSession<H> {
                 continue;
             };
             self.pacer.opened();
-            let end = self.connected(Some(ws)).await?;
+            // The ended connection's buckets are forgotten even when the epoch ended in an
+            // error (Codex r4179720972).
+            let end = self.connected(Some(ws)).await;
+            self.rates.closed(self.current());
+            let end = end?;
             self.pacer.dropped(Instant::now());
             if let End::Stop = end {
                 return Ok(());
@@ -541,12 +583,15 @@ impl<H: MdHandler> MdSession<H> {
         let mut fx = Effects::new();
         codec.on_open(&mut fx);
         let call = self.rec.opened(key)?;
-        let mut open = self.execute(&mut ws, codec.as_mut(), fx).await?
+        (self.waiting, self.rate_retry) = (None, None);
+        let mut open = self.execute(&mut ws, codec.as_mut(), fx, false).await?
             && self.subscribe(&mut ws, codec.as_mut(), call).await?;
         while open {
             let wake = tokio::select! {
                 frame = next_frame(&mut ws) => Wake::Frame(frame),
                 _ = sleep_or_never(self.next_deadline()) => Wake::Timer,
+                // A subscribe call waiting for the buckets tries again as if the set changed.
+                _ = sleep_or_never(self.rate_retry) => Wake::Desired(true),
                 Some(done) = self.http.next() => Wake::Http(self.stamp_http(done)),
                 r = self.desired.changed() => Wake::Desired(r.is_ok()),
             };
@@ -571,7 +616,7 @@ impl<H: MdHandler> MdSession<H> {
                 Wake::Frame(Some(Ok(message))) => {
                     let mut fx = Effects::new();
                     self.decode(codec.as_mut(), key, &message, &mut fx);
-                    self.execute(&mut ws, codec.as_mut(), fx).await?
+                    self.execute(&mut ws, codec.as_mut(), fx, false).await?
                 }
                 Wake::Frame(_) => false,
                 Wake::Timer => self.fire(&mut ws, codec.as_mut()).await?,
@@ -579,7 +624,7 @@ impl<H: MdHandler> MdSession<H> {
                     Some((stamp, done)) => {
                         let mut fx = Effects::new();
                         self.answer(codec.as_mut(), stamp, done, &mut fx);
-                        self.execute(&mut ws, codec.as_mut(), fx).await?
+                        self.execute(&mut ws, codec.as_mut(), fx, false).await?
                     }
                     None => true,
                 },
@@ -590,7 +635,7 @@ impl<H: MdHandler> MdSession<H> {
                 }
                 Wake::Desired(false) => {
                     if let Some(ws) = ws.as_mut() {
-                        close(ws);
+                        close(ws, &self.rates, key);
                     }
                     return Ok(End::Stop);
                 }
@@ -605,12 +650,18 @@ impl<H: MdHandler> MdSession<H> {
 
     /// Stamps one message of epoch `key` and journals it; its stamp and data frame, when it
     /// carries data. Pings, pongs and close frames take their place in ingest order but carry
-    /// no data.
+    /// no data; a ping or a close is charged for the answer the WebSocket layer sends to it.
     fn take_in<'m>(&mut self, key: ConnKey, message: &'m Message) -> Option<(Stamp, RawFrame<'m>)> {
         let stamp = self.clock.stamp(key);
         let raw = match message {
             Message::Text(text) => RawFrame::Text(text.as_str()),
             Message::Binary(bytes) => RawFrame::Binary(bytes.as_ref()),
+            // The WebSocket layer answers a ping with a pong of its own, and a close with a
+            // close (decision 0030, Codex r4179720976).
+            Message::Ping(_) | Message::Close(_) => {
+                self.rates.record(Instant::now(), key, CONTROL);
+                return None;
+            }
             _ => return None,
         };
         // Offered borrowed, so a full journal refuses it before it is copied (Codex
@@ -681,12 +732,19 @@ impl<H: MdHandler> MdSession<H> {
             };
             let mut fx = Effects::new();
             codec.on_timer(tag, stamp.recv_mono, stamp.recv_wall, &mut sink, &mut fx);
-            open = self.execute(ws, codec, fx).await?;
+            open = self.execute(ws, codec, fx, false).await?;
         }
         Ok(open)
     }
 
-    /// Sends `call` and every call the reconciler yields after it; false when the epoch ended.
+    /// Sends `call` and every call the reconciler yields after it, after the call waiting for
+    /// the buckets, if any; false when the epoch ended. The codec is asked once per call, and
+    /// its frames are charged together: when the buckets refuse them, the call stays
+    /// outstanding in the reconciler (its subscriptions pending, a change made meanwhile held
+    /// for the call after it) and its effects wait, unexecuted, until the buckets have room
+    /// (decision 0030), so the codec's state never runs ahead of what the venue was sent. Only
+    /// frames that can never fit together go one by one, so a call too large for the buckets
+    /// at once still goes.
     async fn subscribe(
         &mut self,
         ws: &mut Option<WebSocket>,
@@ -694,6 +752,9 @@ impl<H: MdHandler> MdSession<H> {
         mut call: Option<SubscribeCall>,
     ) -> Result<bool, SessionError> {
         let mut open = true;
+        if let Some((this, fx)) = self.waiting.take() {
+            (open, call) = self.send_call(ws, codec, this, fx).await?;
+        }
         while open && let Some(this) = call.take() {
             // Offered borrowed, so a full journal refuses it before the sets are copied (Codex
             // r4178567381).
@@ -710,32 +771,96 @@ impl<H: MdHandler> MdSession<H> {
             }
             let mut fx = Effects::new();
             let asked = codec.subscribe(this.add(), this.remove(), &self.specs, &mut fx);
-            open = self.execute(ws, &mut *codec, fx).await?;
-            call = match asked {
-                Ok(()) => self.rec.sent(this)?,
+            // A call the codec refused pushed nothing and waits for a retry, a change or an
+            // epoch.
+            (open, call) = match asked {
+                Ok(()) => {
+                    self.send_call(ws, &mut *codec, this, fx.take().into())
+                        .await?
+                }
                 Err(_) => {
                     self.counters.refused_subscribes += 1;
-                    self.rec.refused(this)?
+                    (true, self.rec.refused(this)?)
                 }
             };
         }
         Ok(open)
     }
 
+    /// Executes `effects`, which the codec asked for `call`, in order, and settles the call as
+    /// sent, yielding the next call; or, when its frames must wait, keeps the call and what is
+    /// left of its effects waiting. The frames left go together once the buckets have room for
+    /// all of them (Codex r4179558357); only when they never can, each goes once the buckets
+    /// have room for it (Codex r4179474176), and a frame that can never fit ends the session
+    /// with [`RateError::NeverFits`]. False when the epoch ended.
+    async fn send_call(
+        &mut self,
+        ws: &mut Option<WebSocket>,
+        codec: &mut dyn MdCodec,
+        call: SubscribeCall,
+        mut effects: VecDeque<Effect>,
+    ) -> Result<(bool, Option<SubscribeCall>), SessionError> {
+        let (key, own) = (self.current(), self.plan.stream);
+        self.rate_retry = None;
+        let socket = ws.is_some();
+        let frames: Vec<Request> = effects
+            .iter()
+            .filter_map(|e| frame_of(e, own, socket))
+            .collect();
+        match self.rates.charge(Instant::now(), key, &frames) {
+            Ok(_) => {
+                let mut all = Effects::new();
+                effects.into_iter().for_each(|e| all.push(e));
+                return match self.execute(ws, codec, all, true).await? {
+                    true => Ok((true, self.rec.sent(call)?)),
+                    false => Ok((false, None)),
+                };
+            }
+            Err(Refused { ready_at: Some(at) }) => {
+                (self.waiting, self.rate_retry) = (Some((call, effects)), Some(at));
+                return Ok((true, None));
+            }
+            Err(Refused { ready_at: None }) => {}
+        }
+        loop {
+            let socket = ws.is_some();
+            let effect = match next_of_call(&mut effects, &self.rates, key, own, socket)? {
+                CallStep::Run(effect) => effect,
+                CallStep::Wait(at) => {
+                    (self.waiting, self.rate_retry) = (Some((call, effects)), Some(at));
+                    return Ok((true, None));
+                }
+                CallStep::Done => return Ok((true, self.rec.sent(call)?)),
+            };
+            let mut one = Effects::new();
+            one.push(effect);
+            if !self.execute(ws, codec, one, true).await? {
+                return Ok((false, None));
+            }
+        }
+    }
+
     /// Executes `fx` of `codec` in order; false when the socket failed or a reconnect was asked
     /// for, which ends the epoch and leaves the rest unexecuted. A poll endpoint (`ws` is
-    /// `None`) refuses every frame and reconnect.
+    /// `None`) refuses every frame and reconnect. Each frame is charged as its turn comes,
+    /// unless `charged` says `fx`'s were already, and one the buckets refuse is not written;
+    /// effects asked for meanwhile are charged as theirs come.
     async fn execute(
         &mut self,
         ws: &mut Option<WebSocket>,
         codec: &mut dyn MdCodec,
         mut fx: Effects,
+        charged: bool,
     ) -> Result<bool, SessionError> {
-        let epoch = self.current().epoch;
+        let key = self.current();
+        let epoch = key.epoch;
         let own = self.plan.stream;
-        let mut effects: VecDeque<Effect> = fx.take().into();
+        let mut effects: VecDeque<(Effect, bool)> =
+            fx.take().into_iter().map(|e| (e, charged)).collect();
         let mut open = true;
-        while open && let Some(effect) = effects.pop_front() {
+        while open
+            && let Some(effect) = next_admitted(&mut effects, &self.rates, key, own, ws.is_some())
+        {
             match (effect, ws.as_mut()) {
                 (
                     Effect::Send {
@@ -782,19 +907,12 @@ impl<H: MdHandler> MdSession<H> {
                         if let Some((stamp, done)) = self.admit_http(done)? {
                             let mut more = Effects::new();
                             self.answer(codec, stamp, done, &mut more);
-                            let mut ends = effects.iter().any(|e| ends_epoch(e, own));
+                            let mut ends = effects.iter().any(|(e, _)| ends_epoch(e, own));
                             for effect in more.take() {
                                 ends |= ends_epoch(&effect, own);
                                 match effect {
-                                    Effect::Http {
-                                        tag,
-                                        req,
-                                        rpc,
-                                        timeout,
-                                        class,
-                                        ..
-                                    } if !ends => self.ask(epoch, tag, req, rpc, timeout, class),
-                                    other => effects.push_back(other),
+                                    ask @ Effect::Http { .. } if !ends => self.ask(epoch, ask),
+                                    other => effects.push_back((other, false)),
                                 }
                             }
                         }
@@ -817,20 +935,10 @@ impl<H: MdHandler> MdSession<H> {
                     }
                 }
                 (Effect::Reconnect { stream, .. }, Some(ws)) if stream == own => {
-                    close(ws);
+                    close(ws, &self.rates, key);
                     open = false;
                 }
-                (
-                    Effect::Http {
-                        tag,
-                        req,
-                        rpc,
-                        timeout,
-                        class,
-                        ..
-                    },
-                    _,
-                ) => self.ask(epoch, tag, req, rpc, timeout, class),
+                (ask @ Effect::Http { .. }, _) => self.ask(epoch, ask),
                 (Effect::Send { .. } | Effect::Reconnect { .. }, _) => {
                     self.counters.refused_effects += 1;
                 }
@@ -839,56 +947,54 @@ impl<H: MdHandler> MdSession<H> {
         Ok(open)
     }
 
-    /// Starts `req` for the codec of `epoch`; it runs beside the session until it is answered,
-    /// fails or times out. Its timeout runs from now, when the codec asked; one past the end
-    /// of the clock bounds nothing, so the request is not sent.
-    /// The request is journaled as it starts, under `class` and the epoch that asked.
-    fn ask(
-        &mut self,
-        epoch: u32,
-        tag: HttpTag,
-        req: HttpRequest,
-        rpc: Option<RpcId>,
-        timeout: Duration,
-        class: TrafficClass,
-    ) {
+    /// Starts the HTTP request `ask` for the codec of `epoch` ([`start_http`]), journaled as it
+    /// starts, under its class and the epoch that asked.
+    fn ask(&mut self, epoch: u32, ask: Effect) {
         // The timeout runs from the ask, so journaling the request counts against it (Codex
         // r4178197281).
-        let deadline = Instant::now().checked_add(timeout);
-        let conn = ConnKey {
+        let now = Instant::now();
+        let key = ConnKey {
             epoch,
             ..self.current()
         };
-        let secret = |h: &fbc_core::Header| h.redact || is_secret_header(h.name);
-        if !req.url.redactions().is_empty()
-            || !req.body.redactions().is_empty()
-            || req.headers.iter().any(secret)
+        if let Effect::Http {
+            tag,
+            req,
+            rpc,
+            class,
+            ..
+        } = &ask
         {
-            self.credentialed.set(true);
-        }
-        let (at, now) = self.clock.now();
-        // Offered borrowed, so a full journal refuses it before it is cloned (Codex
-        // r4178287660).
-        if let Some(journal) = &self.journal {
-            let ask = RecordRef::HttpRequest {
-                at,
-                conn,
-                tag,
-                rpc,
-                req: &req,
-            };
-            journal.record_ref(class, now, ask);
-        }
-        let (connector, max_body) = (self.connector.clone(), self.http_max_body);
-        self.http.push(Box::pin(async move {
-            let result = connector.http_by(&req, deadline, max_body).await;
-            Answered {
-                epoch,
-                tag,
-                class,
-                result,
+            let secret = |h: &fbc_core::Header| h.redact || is_secret_header(h.name);
+            if !req.url.redactions().is_empty()
+                || !req.body.redactions().is_empty()
+                || req.headers.iter().any(secret)
+            {
+                self.credentialed.set(true);
             }
-        }));
+            let (at, wall) = self.clock.now();
+            // Offered borrowed, so a full journal refuses it before it is cloned (Codex
+            // r4178287660).
+            if let Some(journal) = &self.journal {
+                let record = RecordRef::HttpRequest {
+                    at,
+                    conn: key,
+                    tag: *tag,
+                    rpc: *rpc,
+                    req,
+                };
+                journal.record_ref(*class, wall, record);
+            }
+        }
+        let (rates, connector) = (&self.rates, &self.connector);
+        self.http.extend(start_http(
+            ask,
+            key,
+            now,
+            rates,
+            connector,
+            self.http_max_body,
+        ));
     }
 
     /// Stamps an HTTP result as it comes back, under the epoch that asked for it, so it takes
@@ -998,10 +1104,147 @@ fn ends_epoch(effect: &Effect, own: StreamId) -> bool {
     matches!(effect, Effect::Reconnect { stream, .. } if *stream == own)
 }
 
-/// Sends a close frame if the socket takes it now, without waiting on a peer that stopped
-/// reading; the socket closes when it is dropped either way.
-fn close(ws: &mut WebSocket) {
-    let _ = ws.close(None).now_or_never();
+/// What a pong or a close frame is charged: a control frame, which safety traffic may send
+/// from the reserve (decision 0030).
+const CONTROL: Request = Request {
+    charge: RateCharge::one(OpKind::Control, None),
+    via: Via::Frame,
+    class: TrafficClass::Safety,
+};
+
+/// The request of `effect` when it is a frame on stream `own` of a socket endpoint, which the
+/// buckets charge; `None` for any other effect.
+fn frame_of(effect: &Effect, own: StreamId, socket: bool) -> Option<Request> {
+    let frame = socket && matches!(effect, Effect::Send { stream, .. } if *stream == own);
+    Request::of(effect).filter(|_| frame)
+}
+
+/// What a subscribe call does next with its effects.
+enum CallStep {
+    /// Execute this effect; a frame of it is charged already.
+    Run(Effect),
+    /// The next frame waits for the buckets until then.
+    Wait(Instant),
+    /// Every effect has gone.
+    Done,
+}
+
+/// The next of a subscribe call's `effects`: a frame on stream `own` of a socket endpoint is
+/// charged on connection `key` on its own, and waits, back at the front, while the buckets
+/// refuse it. One that can never fit is an error: the call could never go, and settling it as
+/// sent would leave the reconciler believing what the venue was never told (decision 0030,
+/// Codex r4179682238).
+fn next_of_call(
+    effects: &mut VecDeque<Effect>,
+    rates: &RateLimiter,
+    key: ConnKey,
+    own: StreamId,
+    socket: bool,
+) -> Result<CallStep, SessionError> {
+    let Some(effect) = effects.pop_front() else {
+        return Ok(CallStep::Done);
+    };
+    let Some(request) = frame_of(&effect, own, socket) else {
+        return Ok(CallStep::Run(effect));
+    };
+    match rates.charge(Instant::now(), key, &[request]) {
+        Ok(_) => Ok(CallStep::Run(effect)),
+        Err(Refused { ready_at: Some(at) }) => {
+            effects.push_front(effect);
+            Ok(CallStep::Wait(at))
+        }
+        Err(Refused { ready_at: None }) => Err(RateError::NeverFits(request.charge).into()),
+    }
+}
+
+/// The next of `effects` to execute: a frame on stream `own` of a socket endpoint is charged
+/// on connection `key` as its turn comes, unless it was already, and one the buckets refuse
+/// is dropped unwritten (decision 0030).
+fn next_admitted(
+    effects: &mut VecDeque<(Effect, bool)>,
+    rates: &RateLimiter,
+    key: ConnKey,
+    own: StreamId,
+    socket: bool,
+) -> Option<Effect> {
+    std::iter::from_fn(|| effects.pop_front()).find_map(|(effect, charged)| {
+        let request = frame_of(&effect, own, socket).filter(|_| !charged);
+        let admitted = request.is_none_or(|r| rates.charge(Instant::now(), key, &[r]).is_ok());
+        admitted.then_some(effect)
+    })
+}
+
+/// The request of the HTTP effect `ask`, for the codec of epoch `key`, as it runs beside the
+/// session until it is answered, fails or times out. Its timeout runs from `now`, when the
+/// codec asked; one past the end of the clock bounds nothing, so the request is not sent, nor is one
+/// the runtime cannot make, both before anything is charged (Codex r4179682244), nor one the
+/// buckets refuse (decision 0030): each comes back as [`HttpFailure::NotSent`]. A 429 or 418
+/// to it is counted under the scopes it was charged to. `None` for any other effect.
+fn start_http(
+    ask: Effect,
+    key: ConnKey,
+    now: Instant,
+    rates: &RateLimiter,
+    connector: &Connector,
+    max_body: usize,
+) -> Option<Pending> {
+    let request = Request::of(&ask);
+    let Effect::Http {
+        tag,
+        req,
+        timeout,
+        class,
+        ..
+    } = ask
+    else {
+        return None;
+    };
+    let epoch = key.epoch;
+    let deadline = now.checked_add(timeout);
+    // The request opens a connection of its own, which a limit on new connections counts too
+    // (Codex r4179474175); both are charged or neither. A 429 or 418 answers the request, so it
+    // is counted under the request's scopes alone (Codex r4179558360).
+    let connect = request.map(|r| Request {
+        charge: RateCharge::one(OpKind::Connect, None),
+        ..r
+    });
+    let ready = deadline.zip(http::ready(&req));
+    let go = ready.zip(request.zip(connect)).and_then(|(ready, (r, c))| {
+        let charged = rates.charge(now, key, &[r, c]).ok();
+        charged.map(|_| (ready, rates.scopes(key, &r)))
+    });
+    let (rates, connector) = (rates.clone(), connector.clone());
+    Some(Box::pin(async move {
+        let result = match go {
+            Some(((deadline, ready), charged)) => {
+                // Counted as the status arrives, before a body that may fail is read.
+                let mut on_status = |status: StatusCode| {
+                    if let 429 | 418 = status.as_u16() {
+                        rates.rejected(charged);
+                    }
+                };
+                connector
+                    .http_by(ready, deadline, max_body, &mut on_status)
+                    .await
+            }
+            None => Err(HttpFailure::NotSent),
+        };
+        Answered {
+            epoch,
+            tag,
+            class,
+            result,
+        }
+    }))
+}
+
+/// Sends a close frame on connection `key` if the buckets admit it, charged as a control
+/// frame (Codex r4179720976), and the socket takes it now, without waiting on a peer that
+/// stopped reading; the socket closes when it is dropped either way.
+fn close(ws: &mut WebSocket, rates: &RateLimiter, key: ConnKey) {
+    if rates.charge(Instant::now(), key, &[CONTROL]).is_ok() {
+        let _ = ws.close(None).now_or_never();
+    }
 }
 
 /// The next message on the socket; a poll endpoint has none, ever.
@@ -1041,6 +1284,66 @@ impl<H: MdHandler> MdSink for Sink<'_, H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ratelimit::SafetyReserve;
+    use fbc_core::{LimitScope, RateLimit, TagSet, WireSlice};
+    use std::num::NonZeroU32;
+    use std::time::Duration;
+
+    #[test]
+    fn a_calls_frames_go_each_as_it_fits_wait_at_the_front_or_end_the_session_when_one_never_fits()
+    {
+        // Two subscribe units per 10 s on a connection, one kept for safety traffic.
+        let limits = [RateLimit {
+            scope: LimitScope::Connection,
+            ops: TagSet::of(&[OpKind::Subscribe]),
+            per: Duration::from_secs(10),
+            units: 2,
+        }];
+        let rates = RateLimiter::new(&limits, SafetyReserve::percent(50).unwrap()).unwrap();
+        let (key, own) = (ConnKey { conn: 1, epoch: 0 }, StreamId(0));
+        let frame = |weight| Effect::Send {
+            stream: own,
+            frame: WireSlice::plain(Vec::new()),
+            rpc: None,
+            class: TrafficClass::Normal,
+            charge: RateCharge {
+                weight: NonZeroU32::new(weight).unwrap(),
+                ..RateCharge::one(OpKind::Subscribe, None)
+            },
+        };
+        let timer = Effect::Timer {
+            tag: TimerTag(0),
+            after: Duration::ZERO,
+        };
+        let mut effects = VecDeque::from([timer, frame(1), frame(1)]);
+        let mut next = |socket| next_of_call(&mut effects, &rates, key, own, socket);
+        assert!(matches!(
+            next(true),
+            Ok(CallStep::Run(Effect::Timer { .. }))
+        ));
+        assert!(matches!(next(true), Ok(CallStep::Run(Effect::Send { .. }))));
+        // The last waits, back at the front, until the first charge expires.
+        assert!(matches!(next(true), Ok(CallStep::Wait(_))));
+        // A poll endpoint's frame is charged nothing (a session refuses it).
+        assert!(matches!(
+            next(false),
+            Ok(CallStep::Run(Effect::Send { .. }))
+        ));
+        assert!(matches!(next(false), Ok(CallStep::Done)));
+        // Two units never fit under the normal cap of one: the call can never go, and the
+        // session ends saying so rather than settle it as sent (Codex r4179682238).
+        let mut heavy = VecDeque::from([frame(2)]);
+        let err = next_of_call(&mut heavy, &rates, key, own, true).err();
+        let Some(SessionError::Rates(RateError::NeverFits(charge))) = err else {
+            panic!("{err:?}");
+        };
+        assert_eq!((charge.op, charge.weight.get()), (OpKind::Subscribe, 2));
+        assert_eq!(
+            SessionError::Rates(RateError::NeverFits(charge)).to_string(),
+            "a subscribe call's frame of Subscribe weighs 2, more than its buckets ever admit"
+        );
+        assert_eq!(rates.counts().refused.connection, 2);
+    }
 
     #[test]
     fn clones_of_a_clock_share_one_ingest_sequence() {

@@ -76,8 +76,9 @@ fn channel(ev: &MdEvent) -> Option<BookId> {
 async fn two_book_channels_of_one_instrument_on_one_connection_stay_separate_and_the_configured_one_trades()
  {
     let mut server = ScriptedWs::start().await;
+    let venue = ToyVenue::leak();
     let config = MdSessionConfig {
-        venue: ToyVenue::leak(),
+        venue,
         cfg: VenueConfig::new(),
         plan: EndpointPlan {
             stream: toy::STREAM,
@@ -93,6 +94,7 @@ async fn two_book_channels_of_one_instrument_on_one_connection_stay_separate_and
         clock: IngestClock::new(),
         http_max_body: 1024,
         conn: 3,
+        limiter: venue.limiter(0),
     };
     // The interactive channel is the configured trading book of instrument A.
     let trading = TradingBooks::new([(inst(A), INTERACTIVE)]).unwrap();

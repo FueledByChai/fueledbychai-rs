@@ -78,6 +78,7 @@ fn session(venue: &'static ToyVenue, url: String) -> MdSessionConfig {
         clock: IngestClock::new(),
         http_max_body: 64 * 1024,
         conn: CONN,
+        limiter: venue.limiter(0),
     }
 }
 
@@ -400,8 +401,9 @@ async fn every_endpoint_a_venue_opens_records_into_its_one_journal() {
     let mut cfg = VenueConfig::new();
     cfg.insert("toy.url.0", &s0.url());
     cfg.insert("toy.url.1", &s1.url());
+    let toy_venue = ToyVenue::leak();
     let config = MdVenueConfig {
-        venue: ToyVenue::leak(),
+        venue: toy_venue,
         cfg,
         specs: toy::specs(),
         connector: Connector::new(ProxyConfig::Direct),
@@ -409,6 +411,7 @@ async fn every_endpoint_a_venue_opens_records_into_its_one_journal() {
         clock: IngestClock::new(),
         http_max_body: 1024,
         conns: 10..20,
+        limiter: toy_venue.limiter(0),
     };
     let (mut venue, control) = MdVenue::new(config, |_| {}).unwrap();
     let kept = Rc::new(RefCell::new(Kept::default()));

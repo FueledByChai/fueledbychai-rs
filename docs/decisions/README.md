@@ -32,3 +32,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0027](0027-a-codec-s-http-request-runs-beside-its-session-with-its-time.md) A codec's HTTP request runs beside its session with its timeout and comes back only to the epoch that asked; a venue's plan is applied by stream — accepted
 - [0028](0028-codecs-name-the-credentials-in-inbound-frames-and-http-respo.md) Codecs name the credentials in inbound frames and HTTP responses, and the journal hashes them in format version 4, augmenting 0014 — accepted
 - [0029](0029-the-websocket-opening-handshake-is-the-runtime-s-own-over-hy.md) The WebSocket opening handshake is the runtime's own over hyper, with a token-aware Connection check — accepted
+- [0030](0030-rate-buckets-are-sliding-windows-per-declared-limit-and-scop.md) Rate buckets are sliding windows per declared limit and scope key, with a consumer-configured safety reserve; what each refusal does — accepted

@@ -53,6 +53,7 @@ fn session(
         clock: IngestClock::new(),
         http_max_body: 1024,
         conn: CONN,
+        limiter: venue.limiter(0),
     }
 }
 

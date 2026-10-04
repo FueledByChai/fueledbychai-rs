@@ -23,6 +23,13 @@
 //! on that channel, and until its next `begin` the channel's records are dropped.
 //! Anything else, and every binary frame, is malformed.
 //!
+//! Rate charges (FBC-bel): `hello` is one `Control` unit, and each `sub` one `Subscribe` unit,
+//! counted against its instrument when the call names one. `say` and `get` take optional
+//! `op=<place|cancel|rest|control>`, `sym=<A>`, `w=<weight>` and `class=safety` fields for
+//! theirs (by default one `Control` unit of normal traffic, no instrument), and `say` with
+//! `id=<x>` sends `said|id=<x>`. The venue declares the limits it is built with
+//! ([`ToyVenue::with_limits`]), none by default.
+//!
 //! Every `on_http` is logged as `<codec>/<tag>:<status>:<x-toy header>` or
 //! `<codec>/<tag>:<failure>`, and a response body's lines are read as frames. On a poll
 //! endpoint the codec sends nothing: its first subscribe asks for
@@ -30,6 +37,7 @@
 //! firing asks again.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -41,16 +49,20 @@ use fbc_core::{
     Header, HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag, Inbound, InboundSpans,
     InstrumentId, InstrumentKind, InstrumentSpec, Keepalive, Lots, MatchingCaps, MdCaps, MdCodec,
     MdEvent, MdSink, MdTransport, MonoNs, OpKind, PriceGrid, QueueModelQuality, RateCharge,
-    RawFrame, Readiness, SizeStep, SpecTable, StpScope, StreamId, Subscription, TagSet, Ticks,
-    TimerTag, TradeCaps, TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueConfig,
+    RateLimit, RawFrame, Readiness, SizeStep, SpecTable, StpScope, StreamId, Subscription, TagSet,
+    Ticks, TimerTag, TradeCaps, TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueConfig,
     VenueError, VenueFactory, VenueId, VenueMeta, WallNs, WireSlice, WireUrl, dispatch_market_data,
 };
+use fbc_runtime::{RateLimiter, SafetyReserve};
 use rust_decimal::Decimal;
 
 /// The toy's one stream.
 pub const STREAM: StreamId = StreamId(0);
 /// The configuration key that makes the toy refuse its configuration.
 pub const REFUSE: &str = "toy.refuse";
+/// The configuration key that makes the toy's subscribe calls send one frame per instrument,
+/// each of the weight it names, or of one.
+pub const SPLIT: &str = "toy.split";
 /// The configuration key that makes the toy name every endpoint of a plan stream 0.
 pub const ONE_STREAM: &str = "toy.one_stream";
 /// The toy's instruments, by id: 1 is `A`, 2 is `B`, 3 is `C`.
@@ -61,6 +73,8 @@ const SYMBOLS: [&str; 3] = ["A", "B", "C"];
 pub struct ToyVenue {
     codecs: AtomicU32,
     http: Arc<Mutex<Vec<String>>>,
+    subscribes: Arc<AtomicU32>,
+    limits: Vec<RateLimit>,
 }
 
 impl ToyVenue {
@@ -69,9 +83,28 @@ impl ToyVenue {
         Box::leak(Box::default())
     }
 
+    /// A venue of the test's own that declares `limits`.
+    pub fn with_limits(limits: Vec<RateLimit>) -> &'static ToyVenue {
+        Box::leak(Box::new(ToyVenue {
+            limits,
+            ..ToyVenue::default()
+        }))
+    }
+
+    /// A limiter for its limits, keeping `percent` of each bucket for safety traffic.
+    pub fn limiter(&self, percent: u8) -> RateLimiter {
+        let reserve = SafetyReserve::percent(percent).unwrap();
+        RateLimiter::new(&self.limits, reserve).unwrap()
+    }
+
     /// How many codecs it has built.
     pub fn codecs(&self) -> u32 {
         self.codecs.load(Ordering::SeqCst)
+    }
+
+    /// How many subscribe calls its codecs had.
+    pub fn subscribe_calls(&self) -> u32 {
+        self.subscribes.load(Ordering::SeqCst)
     }
 
     /// Every `on_http` call its codecs had, in order.
@@ -203,7 +236,10 @@ impl VenueFactory for ToyVenue {
                 key: REFUSE,
                 reason: "refused",
             }),
-            None => Ok(caps()),
+            None => Ok(VenueCaps {
+                limits: self.limits.clone(),
+                ..caps()
+            }),
         }
     }
 
@@ -239,7 +275,7 @@ impl VenueFactory for ToyVenue {
         Ok(plans)
     }
 
-    fn md_codec(&self, _: &VenueConfig, ep: &EndpointPlan) -> Box<dyn MdCodec> {
+    fn md_codec(&self, cfg: &VenueConfig, ep: &EndpointPlan) -> Box<dyn MdCodec> {
         let n = self.codecs.fetch_add(1, Ordering::SeqCst);
         let plan = ep.subs.iter().map(|s| s.inst.get().to_string());
         let plan = plan.collect::<Vec<_>>().join(",");
@@ -256,6 +292,8 @@ impl VenueFactory for ToyVenue {
             polling: false,
             log: self.http.clone(),
             books: BTreeMap::new(),
+            subscribes: self.subscribes.clone(),
+            split: cfg.get(SPLIT).map(|w| w.parse().unwrap_or(1)),
         })
     }
 
@@ -280,6 +318,10 @@ struct ToyMd {
     log: Arc<Mutex<Vec<String>>>,
     /// Each anchored book channel's last seq; a channel absent waits for its next `begin`.
     books: BTreeMap<(InstrumentId, BookId), i64>,
+    subscribes: Arc<AtomicU32>,
+    /// One frame per instrument of a subscribe call, each charged this weight to its
+    /// instrument.
+    split: Option<u32>,
 }
 
 const CONTROL: RateCharge = RateCharge::one(OpKind::Control, None);
@@ -289,13 +331,49 @@ fn send(stream: StreamId, text: String) -> Effect {
 }
 
 fn send_as(class: TrafficClass, stream: StreamId, text: String) -> Effect {
+    charged(stream, text, (CONTROL, class))
+}
+
+fn charged(stream: StreamId, text: String, (charge, class): (RateCharge, TrafficClass)) -> Effect {
     Effect::Send {
         stream,
         frame: WireSlice::plain(text.into_bytes()),
         rpc: None,
         class,
-        charge: CONTROL,
+        charge,
     }
+}
+
+/// The charge and class a record's `op`, `sym`, `w` and `class` fields name.
+fn charge_of(
+    fields: &[(&str, &str)],
+    specs: &SpecTable,
+) -> Result<(RateCharge, TrafficClass), DecodeError> {
+    let op = match field(fields, "op").unwrap_or("control") {
+        "place" => OpKind::Place,
+        "cancel" => OpKind::Cancel,
+        "rest" => OpKind::Rest,
+        "control" => OpKind::Control,
+        _ => return Err(DecodeError::Malformed("op")),
+    };
+    let inst = match field(fields, "sym") {
+        Ok(sym) => Some(
+            specs
+                .by_symbol(sym)
+                .ok_or(DecodeError::UnknownInstrument)?
+                .id,
+        ),
+        Err(_) => None,
+    };
+    let weight = match field(fields, "w") {
+        Ok(_) => NonZeroU32::new(num(fields, "w")? as u32).ok_or(DecodeError::Malformed("w"))?,
+        Err(_) => NonZeroU32::MIN,
+    };
+    let class = match field(fields, "class") {
+        Ok("safety") => TrafficClass::Safety,
+        _ => TrafficClass::Normal,
+    };
+    Ok((RateCharge { op, inst, weight }, class))
 }
 
 fn field<'a>(fields: &[(&'a str, &'a str)], key: &'static str) -> Result<&'a str, DecodeError> {
@@ -310,6 +388,15 @@ fn num(fields: &[(&str, &str)], key: &'static str) -> Result<i64, DecodeError> {
 }
 
 fn get(tag: u64, url: String, timeout: Duration) -> Effect {
+    get_charged(tag, url, timeout, (CONTROL, TrafficClass::Normal))
+}
+
+fn get_charged(
+    tag: u64,
+    url: String,
+    timeout: Duration,
+    (charge, class): (RateCharge, TrafficClass),
+) -> Effect {
     Effect::Http {
         tag: HttpTag(tag),
         req: HttpRequest {
@@ -320,8 +407,8 @@ fn get(tag: u64, url: String, timeout: Duration) -> Effect {
         },
         rpc: None,
         timeout,
-        class: TrafficClass::Normal,
-        charge: CONTROL,
+        class,
+        charge,
     }
 }
 
@@ -341,6 +428,8 @@ impl MdCodec for ToyMd {
         specs: &SpecTable,
         fx: &mut Effects,
     ) -> Result<(), VenueError> {
+        self.subscribes.fetch_add(1, Ordering::SeqCst);
+        let (add_subs, remove_subs) = (add, remove);
         let spell = |subs: &[Subscription]| -> Result<Vec<&str>, VenueError> {
             let spec = |s: &Subscription| {
                 specs
@@ -351,6 +440,10 @@ impl MdCodec for ToyMd {
                 .map(|s| Ok(spec(s)?.venue_symbol.as_wire()))
                 .collect()
         };
+        // A call of one instrument counts against it where a limit is per pair.
+        let mut insts = add.iter().chain(remove).map(|s| s.inst);
+        let inst = insts.next().filter(|first| insts.all(|i| i == *first));
+        let charge = RateCharge::one(OpKind::Subscribe, inst);
         let (add, remove) = (spell(add)?, spell(remove)?);
         if let Some(base) = &self.poll {
             self.syms.retain(|s| !remove.contains(&s.as_str()));
@@ -361,13 +454,25 @@ impl MdCodec for ToyMd {
             }
             return Ok(());
         }
+        if let Some(weight) = self.split.and_then(NonZeroU32::new) {
+            for (part, subs) in [("add", add_subs), ("remove", remove_subs)] {
+                for sub in subs {
+                    let sym = spell(std::slice::from_ref(sub))?.join("");
+                    let one = RateCharge::one(OpKind::Subscribe, Some(sub.inst));
+                    let charge = RateCharge { weight, ..one };
+                    let text = format!("sub|{part}={sym}");
+                    fx.push(charged(self.stream, text, (charge, TrafficClass::Normal)));
+                }
+            }
+            return Ok(());
+        }
         let mut text = String::from("sub");
         for (part, syms) in [("add", add), ("remove", remove)] {
             if !syms.is_empty() {
                 text += &format!("|{part}={}", syms.join(","));
             }
         }
-        fx.push(send(self.stream, text));
+        fx.push(charged(self.stream, text, (charge, TrafficClass::Normal)));
         Ok(())
     }
 
@@ -506,7 +611,13 @@ impl ToyMd {
                 stream: self.stream,
                 reason: "bye",
             }),
-            "say" => fx.push(send(self.stream, "said".into())),
+            "say" => {
+                let text = match field(&fields, "id") {
+                    Ok(id) => format!("said|id={id}"),
+                    Err(_) => "said".into(),
+                };
+                fx.push(charged(self.stream, text, charge_of(&fields, specs)?));
+            }
             "auth" => {
                 let text = "auth|key=toy-secret";
                 let span = "auth|key=".len() as u32..text.len() as u32;
@@ -532,7 +643,8 @@ impl ToyMd {
                     _ => Duration::from_millis(num(&fields, "ms")? as u64),
                 };
                 let url = field(&fields, "url")?.to_owned();
-                let mut get = get(tag as u64, url, timeout);
+                let charge = charge_of(&fields, specs)?;
+                let mut get = get_charged(tag as u64, url, timeout, charge);
                 if let (Ok(_), Effect::Http { req, .. }) = (field(&fields, "auth"), &mut get) {
                     req.headers.push(Header {
                         name: "Authorization",

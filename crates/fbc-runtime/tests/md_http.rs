@@ -47,6 +47,7 @@ fn session(venue: &'static ToyVenue, transport: MdTransport) -> MdSessionConfig 
         clock: IngestClock::new(),
         http_max_body: 64 * 1024,
         conn: CONN,
+        limiter: venue.limiter(0),
     }
 }
 
