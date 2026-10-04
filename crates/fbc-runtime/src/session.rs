@@ -22,7 +22,23 @@
 //! One thread drives a session (design §5.1): [`MdSession::run`] spawns no task, so the read,
 //! the decode and the handler's call run in one call stack on the caller's current-thread
 //! runtime. Not here yet: keepalive, rotation and silence (FBC-djl), kernel timestamps
-//! (FBC-2y3), rate limits (FBC-bel) and journaling (FBC-f3w).
+//! (FBC-2y3) and rate limits (FBC-bel).
+//!
+//! **The journal (0006).** With a [`Journal`] set ([`MdSession::set_journal`]), the session
+//! records everything that crosses the shard boundary as it happens, so replay can call each
+//! epoch's codec where the live session did: each data frame with its stamp, before it is
+//! decoded; each frame it writes, with its connection epoch, rpc and redaction spans, and then
+//! `Written` once the write completed; each HTTP request as it starts, by the epoch whose codec
+//! asked, and its result with headers or its [`HttpFailure`], one that comes back to an ended
+//! epoch included; each timer firing, an ended epoch's included; and a connection's opening and
+//! closing by [`ConnKey`] and each `subscribe` call. A record goes under the traffic class of
+//! what it records (a frame or request under its effect's, everything else Normal), and nothing
+//! waits on the journal: a record the sink has no room for is dropped and counted there, and
+//! the frame is written all the same. A write that failed, or that the control's drop
+//! interrupted, has no write result: whether any of it reached the venue is unknown, and the
+//! connection's `Closed` follows. Pings, pongs and close frames carry no data and are not
+//! journaled. Until FBC-7lm, inbound frames and response bodies are journaled verbatim, so only
+//! public market-data sessions take a journal.
 
 use std::cell::Cell;
 use std::cmp::Reverse;
@@ -35,9 +51,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fbc_core::{
     ConfigError, ConnKey, Effect, Effects, EndpointPlan, Envelope, HttpFailure, HttpRequest,
-    HttpResponse, HttpTag, MdCodec, MdEvent, MdSink, MdTransport, MonoNs, RawFrame, SpecTable,
-    Stamp, StreamId, Subscription, TimerTag, VenueCaps, VenueConfig, VenueFactory, VenueMeta,
-    WallNs, dispatch_market_data,
+    HttpResponse, HttpTag, MdCodec, MdEvent, MdSink, MdTransport, MonoNs, RawFrame, RpcId,
+    SpecTable, Stamp, StreamId, Subscription, TimerTag, TrafficClass, VenueCaps, VenueConfig,
+    VenueFactory, VenueMeta, WallNs, dispatch_market_data,
+};
+use fbc_journal::{
+    ControlEvent, HeaderRec, HttpRequestRec, HttpResponseRec, Opaque, Record, WriteRes,
 };
 use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt, SinkExt, StreamExt};
@@ -48,6 +67,7 @@ use crate::connector::Connector;
 use crate::epoch::{Admit, EpochError, Epochs, Input};
 use crate::error::NetError;
 use crate::http::{Bytes, Response};
+use crate::journal::Journal;
 use crate::pacing::{Pacer, ReconnectPacing};
 use crate::reconcile::{ReconcileError, Reconciler, SubscribeCall};
 use crate::ws::{self, Message, WebSocket};
@@ -91,17 +111,26 @@ impl IngestClock {
     fn stamp(&self, conn: ConnKey) -> Stamp {
         let ingest_seq = self.next.get();
         self.next.set(ingest_seq.wrapping_add(1));
+        let (recv_mono, recv_wall) = self.now();
+        Stamp {
+            ingest_seq,
+            kernel_rx: None,
+            recv_mono,
+            recv_wall,
+            conn,
+        }
+    }
+
+    /// Now, on the monotonic clock from the origin and on the wall clock.
+    fn now(&self) -> (MonoNs, WallNs) {
         let mono = Instant::now().duration_since(self.origin).as_nanos();
         let wall = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
-        Stamp {
-            ingest_seq,
-            kernel_rx: None,
-            recv_mono: MonoNs(u64::try_from(mono).unwrap_or(u64::MAX)),
-            recv_wall: WallNs(i64::try_from(wall).unwrap_or(i64::MAX)),
-            conn,
-        }
+        (
+            MonoNs(u64::try_from(mono).unwrap_or(u64::MAX)),
+            WallNs(i64::try_from(wall).unwrap_or(i64::MAX)),
+        )
     }
 }
 
@@ -220,16 +249,19 @@ pub struct MdSession<H> {
     http: FuturesUnordered<Pending>,
     http_max_body: usize,
     counters: MdCounters,
+    journal: Option<Journal>,
     handler: H,
 }
 
 /// An HTTP request in flight.
 type Pending = Pin<Box<dyn Future<Output = Answered>>>;
 
-/// An HTTP request's result, with the epoch and tag of the codec call that asked for it.
+/// An HTTP request's result, with the epoch and tag of the codec call that asked for it and
+/// the request's traffic class.
 struct Answered {
     epoch: u32,
     tag: HttpTag,
+    class: TrafficClass,
     result: Result<Response<Bytes>, HttpFailure>,
 }
 
@@ -298,6 +330,7 @@ impl<H: MdHandler> MdSession<H> {
             http: FuturesUnordered::new(),
             http_max_body: config.http_max_body,
             counters: MdCounters::default(),
+            journal: None,
             handler,
         };
         let control = MdControl {
@@ -319,6 +352,28 @@ impl<H: MdHandler> MdSession<H> {
 
     pub fn counters(&self) -> MdCounters {
         self.counters
+    }
+
+    /// Records everything the session sends and receives into `journal` from now on (0006);
+    /// the module docs say what is recorded.
+    pub fn set_journal(&mut self, journal: Journal) {
+        self.journal = Some(journal);
+    }
+
+    /// Offers the record `make` builds, if the session has a journal, under `class`.
+    fn journal(&self, class: TrafficClass, now: WallNs, make: impl FnOnce() -> Record) {
+        if let Some(journal) = &self.journal {
+            journal.record(class, now, &make());
+        }
+    }
+
+    /// Records a connection change or a subscribe call.
+    fn control(&self, ev: impl FnOnce() -> ControlEvent) {
+        let (at, now) = self.clock.now();
+        self.journal(TrafficClass::Normal, now, || Record::Control {
+            at,
+            ev: ev(),
+        });
     }
 
     /// Connects, reconnects as paced, and delivers events until the [`MdControl`] is dropped;
@@ -417,7 +472,7 @@ impl<H: MdHandler> MdSession<H> {
 
     /// One epoch on the open socket `ws`, or of a poll endpoint (`None`), with a fresh codec,
     /// until it drops or the session stops.
-    async fn connected(&mut self, mut ws: Option<WebSocket>) -> Result<End, SessionError> {
+    async fn connected(&mut self, ws: Option<WebSocket>) -> Result<End, SessionError> {
         // A control that has already dropped stops the session before a codec is built, so
         // nothing is sent or asked for after it; a socket just opened is dropped unused (Codex
         // r4177698436, r4177790164).
@@ -425,6 +480,18 @@ impl<H: MdHandler> MdSession<H> {
             return Ok(End::Stop);
         }
         let key = self.current();
+        self.control(|| ControlEvent::Opened(key));
+        let end = self.epoch(ws, key).await;
+        self.control(|| ControlEvent::Closed(key));
+        end
+    }
+
+    /// The epoch `key`, opened on `ws`, until it drops or the session stops.
+    async fn epoch(
+        &mut self,
+        mut ws: Option<WebSocket>,
+        key: ConnKey,
+    ) -> Result<End, SessionError> {
         // The epoch's plan carries the subscriptions wanted now, not the first ones, including a
         // change that arrived as the connection opened.
         let subs = self.desired.borrow_and_update().clone();
@@ -503,6 +570,9 @@ impl<H: MdHandler> MdSession<H> {
             Message::Binary(bytes) => RawFrame::Binary(bytes.as_ref()),
             _ => return,
         };
+        self.journal(TrafficClass::Normal, stamp.recv_wall, || {
+            Record::inbound(stamp, raw)
+        });
         let mut sink = Sink {
             handler: &mut self.handler,
             epochs: &mut self.epochs,
@@ -586,6 +656,11 @@ impl<H: MdHandler> MdSession<H> {
     ) -> Result<bool, SessionError> {
         let mut open = true;
         while open && let Some(this) = call.take() {
+            self.control(|| ControlEvent::Subscribe {
+                conn: self.current(),
+                add: this.add().to_vec(),
+                remove: this.remove().to_vec(),
+            });
             let mut fx = Effects::new();
             let asked = codec.subscribe(this.add(), this.remove(), &self.specs, &mut fx);
             open = self.execute(ws, &mut *codec, fx).await?;
@@ -615,10 +690,27 @@ impl<H: MdHandler> MdSession<H> {
         let mut open = true;
         while open && let Some(effect) = effects.pop_front() {
             match (effect, ws.as_mut()) {
-                (Effect::Send { stream, frame, .. }, Some(ws)) if stream == own => {
+                (
+                    Effect::Send {
+                        stream,
+                        frame,
+                        rpc,
+                        class,
+                        ..
+                    },
+                    Some(ws),
+                ) if stream == own => {
                     let bytes = frame.bytes();
                     let text = std::str::from_utf8(bytes).map(Message::text);
                     let message = text.unwrap_or_else(|_| Message::binary(bytes.to_vec()));
+                    let (conn, rpc) = (self.current(), rpc.map(|call| call.id));
+                    let (at, now) = self.clock.now();
+                    self.journal(class, now, || Record::Outbound {
+                        at,
+                        conn,
+                        rpc,
+                        frame,
+                    });
                     // Requests in flight keep going while the write waits. A result that comes
                     // back meanwhile reaches the codec at once, so the handler gets its events
                     // in the shard's ingest order (Codex r4177698441). A request the codec asks
@@ -645,13 +737,27 @@ impl<H: MdHandler> MdSession<H> {
                                 ends |= ends_epoch(&effect, own);
                                 match effect {
                                     Effect::Http {
-                                        tag, req, timeout, ..
-                                    } if !ends => self.ask(epoch, tag, req, timeout),
+                                        tag,
+                                        req,
+                                        rpc,
+                                        timeout,
+                                        class,
+                                        ..
+                                    } if !ends => self.ask(epoch, tag, req, rpc, timeout, class),
                                     other => effects.push_back(other),
                                 }
                             }
                         }
                     };
+                    if open {
+                        let (at, now) = self.clock.now();
+                        self.journal(class, now, || Record::WriteResult {
+                            at,
+                            conn,
+                            rpc,
+                            result: WriteRes::Written,
+                        });
+                    }
                 }
                 (Effect::Timer { tag, after }, _) => {
                     // A timer past the end of the clock never fires.
@@ -666,10 +772,15 @@ impl<H: MdHandler> MdSession<H> {
                 }
                 (
                     Effect::Http {
-                        tag, req, timeout, ..
+                        tag,
+                        req,
+                        rpc,
+                        timeout,
+                        class,
+                        ..
                     },
                     _,
-                ) => self.ask(epoch, tag, req, timeout),
+                ) => self.ask(epoch, tag, req, rpc, timeout, class),
                 (Effect::Send { .. } | Effect::Reconnect { .. }, _) => {
                     self.counters.refused_effects += 1;
                 }
@@ -681,23 +792,55 @@ impl<H: MdHandler> MdSession<H> {
     /// Starts `req` for the codec of `epoch`; it runs beside the session until it is answered,
     /// fails or times out. Its timeout runs from now, when the codec asked; one past the end
     /// of the clock bounds nothing, so the request is not sent.
-    fn ask(&mut self, epoch: u32, tag: HttpTag, req: HttpRequest, timeout: Duration) {
+    /// The request is journaled as it starts, under `class` and the epoch that asked.
+    fn ask(
+        &mut self,
+        epoch: u32,
+        tag: HttpTag,
+        req: HttpRequest,
+        rpc: Option<RpcId>,
+        timeout: Duration,
+        class: TrafficClass,
+    ) {
+        let conn = ConnKey {
+            epoch,
+            ..self.current()
+        };
+        let (at, now) = self.clock.now();
+        self.journal(class, now, || Record::HttpRequest {
+            at,
+            conn,
+            tag,
+            rpc,
+            req: HttpRequestRec::from(&req),
+        });
         let (connector, max_body) = (self.connector.clone(), self.http_max_body);
         let deadline = Instant::now().checked_add(timeout);
         self.http.push(Box::pin(async move {
             let result = connector.http_by(&req, deadline, max_body).await;
-            Answered { epoch, tag, result }
+            Answered {
+                epoch,
+                tag,
+                class,
+                result,
+            }
         }));
     }
 
     /// Stamps an HTTP result as it comes back, under the epoch that asked for it, so it takes
-    /// its place in the shard's ingest order even when it is dropped.
+    /// its place in the shard's ingest order even when it is dropped, and journals it there.
     fn stamp_http(&self, done: Answered) -> (Stamp, Answered) {
         let key = ConnKey {
             epoch: done.epoch,
             ..self.current()
         };
-        (self.clock.stamp(key), done)
+        let stamp = self.clock.stamp(key);
+        self.journal(done.class, stamp.recv_wall, || Record::HttpResult {
+            stamp,
+            tag: done.tag,
+            result: done.result.as_ref().map(response_rec).map_err(|e| *e),
+        });
+        (stamp, done)
     }
 
     /// A stamped HTTP result, when the epoch that asked is current; `None` when it ended
@@ -721,6 +864,10 @@ impl<H: MdHandler> MdSession<H> {
                 ..self.current()
             };
             let stamp = self.clock.stamp(key);
+            self.journal(TrafficClass::Normal, stamp.recv_wall, || Record::Timer {
+                stamp,
+                tag,
+            });
             if self.epochs.admit(Input::Timer, key)? == Admit::Current {
                 current = Some((stamp, tag));
             }
@@ -730,6 +877,24 @@ impl<H: MdHandler> MdSession<H> {
 
     fn next_deadline(&self) -> Option<Instant> {
         self.timers.peek().map(|Reverse((at, ..))| *at)
+    }
+}
+
+/// A response as the journal keeps it: its status, its headers in order (a value that is not
+/// UTF-8 read lossily, as the codec gets it) and its body.
+fn response_rec(response: &Response<Bytes>) -> HttpResponseRec {
+    HttpResponseRec {
+        status: response.status().as_u16(),
+        headers: response
+            .headers()
+            .iter()
+            .map(|(name, value)| HeaderRec {
+                name: name.as_str().to_owned(),
+                value: String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                redact: false,
+            })
+            .collect(),
+        body: Opaque(response.body().to_vec()),
     }
 }
 

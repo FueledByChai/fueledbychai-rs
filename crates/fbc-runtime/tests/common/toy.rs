@@ -12,7 +12,9 @@
 //! `bye` asks for a reconnect; `say` asks to send `said`; `get|tag=<n>|ms=<t>|url=<u>` asks for
 //! a GET of `u` with a `t` ms timeout (and, with `|kb=<k>`, then a `k` KiB frame, and with
 //! `|bye=1`, then a reconnect); `get` with `ms=max` asks for a timeout past the end of the clock;
-//! `odd` asks for a frame and a reconnect on another stream, which a session refuses.
+//! `odd` asks for a frame and a reconnect on another stream, which a session refuses;
+//! `cancel|id=<n>` asks to send the cancel-shaped frame `cancel|id=<n>` as Safety traffic (FBC-f3w:
+//! the runtime treats a write by its class, not its content).
 //! Book channel `b` of instrument `A`: `begin|sym=A|book=<b>|epoch=<e>|seq=<n>` begins a
 //! snapshot and anchors the channel's sequence; `lvl|sym=A|book=<b>|side=bid|px=<ticks>|qty=<lots>|seq=<n>`
 //! sets a level (in the snapshot or as a delta) and `end|sym=A|book=<b>|seq=<n>` ends the
@@ -282,11 +284,15 @@ struct ToyMd {
 const CONTROL: RateCharge = RateCharge::one(OpKind::Control, None);
 
 fn send(stream: StreamId, text: String) -> Effect {
+    send_as(TrafficClass::Normal, stream, text)
+}
+
+fn send_as(class: TrafficClass, stream: StreamId, text: String) -> Effect {
     Effect::Send {
         stream,
         frame: WireSlice::plain(text.into_bytes()),
         rpc: None,
-        class: TrafficClass::Normal,
+        class,
         charge: CONTROL,
     }
 }
@@ -500,6 +506,11 @@ impl ToyMd {
                 reason: "bye",
             }),
             "say" => fx.push(send(self.stream, "said".into())),
+            "cancel" => {
+                let id = num(&fields, "id")?;
+                let text = format!("cancel|id={id}");
+                fx.push(send_as(TrafficClass::Safety, self.stream, text));
+            }
             "get" => {
                 let tag = num(&fields, "tag")?;
                 let timeout = match field(&fields, "ms")? {

@@ -1,0 +1,440 @@
+//! FBC-f3w's done line: a journaled toy-venue session against local servers reads back, in
+//! order, every inbound frame with its stamp, outbound frame, HTTP request and result with
+//! headers, timer firing and connection change it saw; and with the journal filled past its
+//! soft limit and then its reserve, a Safety-class frame the toy codec emits is still written
+//! to the server, the dropped records are counted, and a `Degraded` marker is written once
+//! space returns (0006). A venue's endpoints all record into its one journal.
+
+mod common;
+
+use std::cell::RefCell;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
+
+use common::toy::{self, ToyVenue};
+use common::{ScriptedHttp, ScriptedWs};
+use fbc_core::{
+    ConnKey, EndpointPlan, Envelope, MdEvent, MdTransport, Stamp, TrafficClass, VenueConfig,
+    WallNs, WireUrl,
+};
+use fbc_journal::{
+    BLANK, ControlEvent, HeaderRec, JournalReader, JournalSink, JournalWriter, Marker, QueueSink,
+    Record, Recorded, RedactionKey, SinkConfig, journal_queue,
+};
+use fbc_runtime::{
+    Connector, IngestClock, Input, Journal, MdSession, MdSessionConfig, MdVenue, MdVenueConfig,
+    ProxyConfig, ReconnectPacing,
+};
+
+type Seen = Rc<RefCell<Vec<Envelope<MdEvent>>>>;
+
+fn keep(seen: &Seen) -> impl FnMut(Envelope<MdEvent>) + use<> {
+    let seen = seen.clone();
+    move |env| seen.borrow_mut().push(env)
+}
+
+const CONN: u16 = 5;
+const SHARD: u16 = 2;
+
+fn ms(n: u64) -> Duration {
+    Duration::from_millis(n)
+}
+
+fn key() -> Arc<RedactionKey> {
+    Arc::new(RedactionKey::new(&[3; 32]).unwrap())
+}
+
+fn fresh_dir(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = fs::remove_dir_all(&dir);
+    dir
+}
+
+fn read_all(root: &Path) -> Vec<Record> {
+    JournalReader::open(root, SHARD)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// A session of `venue` at `url`, wanting trades on instrument 1.
+fn session(venue: &'static ToyVenue, url: String) -> MdSessionConfig {
+    MdSessionConfig {
+        venue,
+        cfg: VenueConfig::new(),
+        plan: EndpointPlan {
+            stream: toy::STREAM,
+            transport: MdTransport::Socket {
+                url: WireUrl::plain(url),
+            },
+            subs: vec![toy::sub(1)],
+        },
+        specs: toy::specs(),
+        connector: Connector::new(ProxyConfig::Direct),
+        pacing: ReconnectPacing::new(ms(10), ms(100), 100, ms(60_000), ms(5_000)).unwrap(),
+        clock: IngestClock::new(),
+        http_max_body: 64 * 1024,
+        conn: CONN,
+    }
+}
+
+async fn until(done: impl Fn() -> bool) {
+    while !done() {
+        tokio::time::sleep(ms(2)).await;
+    }
+}
+
+fn text(bytes: &[u8]) -> &str {
+    std::str::from_utf8(bytes).unwrap()
+}
+
+/// A record as one line, its stamp and times left out: what the session did, in order.
+fn line(record: &Record) -> String {
+    match record {
+        Record::Control { ev, .. } => match ev {
+            ControlEvent::Opened(k) => format!("open {}", k.epoch),
+            ControlEvent::Closed(k) => format!("close {}", k.epoch),
+            ControlEvent::Subscribe { conn, add, remove } => {
+                let ids = |s: &[fbc_core::Subscription]| {
+                    s.iter()
+                        .map(|s| s.inst.get().to_string())
+                        .collect::<Vec<_>>()
+                };
+                format!(
+                    "subscribe {} +{:?} -{:?}",
+                    conn.epoch,
+                    ids(add),
+                    ids(remove)
+                )
+            }
+        },
+        Record::Inbound { stamp, bytes, .. } => {
+            format!("in {} {}", stamp.conn.epoch, text(&bytes.0))
+        }
+        Record::Outbound { conn, frame, .. } => {
+            format!("out {} {}", conn.epoch, text(frame.bytes()))
+        }
+        Record::WriteResult { conn, result, .. } => format!("write {} {result:?}", conn.epoch),
+        Record::HttpRequest { conn, tag, req, .. } => {
+            let path = req.url.as_str().rsplit_once('/').unwrap().1;
+            format!("request {} {} {:?} /{path}", conn.epoch, tag.0, req.method)
+        }
+        Record::HttpResult { stamp, tag, result } => match result {
+            Ok(resp) => format!("result {} {} {}", stamp.conn.epoch, tag.0, resp.status),
+            Err(failure) => format!("result {} {} {failure:?}", stamp.conn.epoch, tag.0),
+        },
+        Record::Timer { stamp, tag } => format!("timer {} {}", stamp.conn.epoch, tag.0),
+        Record::Marker(Marker::Degraded { .. }) => "degraded".into(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// The stamp of a record that carries one.
+fn stamp_of(record: &Record) -> Option<Stamp> {
+    match record {
+        Record::Inbound { stamp, .. }
+        | Record::HttpResult { stamp, .. }
+        | Record::Timer { stamp, .. } => Some(*stamp),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn a_journaled_session_reads_back_every_input_output_and_connection_change_in_order() {
+    let root = fresh_dir("md_journal_session");
+    let config = SinkConfig {
+        budget_bytes: 1 << 20,
+        soft_limit_pct: 85,
+    };
+    let (sink, drain) = journal_queue(config, key()).unwrap();
+    let writer = drain
+        .spawn(JournalWriter::create(&root, SHARD, key()).unwrap())
+        .unwrap();
+    let sink = Rc::new(RefCell::new(sink));
+    let (mut ws, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
+    let seen = Seen::default();
+    let venue = ToyVenue::leak();
+    let (mut session, control) = MdSession::new(session(venue, ws.url()), keep(&seen)).unwrap();
+    session.set_journal(Journal::new(sink.clone()));
+    let (snap, late) = (http.url("/snap"), http.url("/late"));
+    let watch = seen.clone();
+    let script = async move {
+        let mut first = ws.accept().await;
+        assert_eq!(first.recv().await, "hello|codec=0|plan=1");
+        assert_eq!(first.recv().await, "sub|add=A");
+        first.send("trade|sym=A|px=100|qty=1|seq=1");
+        until(|| watch.borrow().len() == 1).await;
+        first.send("arm|sym=A|ms=20");
+        until(|| watch.borrow().len() == 2).await;
+        first.send(&format!("get|tag=1|ms=5000|url={snap}"));
+        let head = "HTTP/1.1 200 OK\r\nX-Toy: yes\r\nSet-Cookie: s=secret";
+        http.request().await.answer(head, "say").await;
+        assert_eq!(first.recv().await, "said");
+        // A request with no deadline is not sent: its failure is journaled as its result.
+        first.send(&format!("get|tag=3|ms=max|url={snap}"));
+        until(|| venue.http_log().len() == 2).await;
+        // A request whose answer comes after its stream reconnected.
+        first.send(&format!("get|tag=2|ms=5000|url={late}|bye=1"));
+        let held = http.request().await;
+        assert_eq!(first.next().await, None);
+        let mut second = ws.accept().await;
+        assert_eq!(second.recv().await, "hello|codec=1|plan=1");
+        assert_eq!(second.recv().await, "sub|add=A");
+        held.answer("HTTP/1.1 200 OK", "").await;
+        second.send("trade|sym=A|px=101|qty=1|seq=2");
+        until(|| watch.borrow().len() == 3).await;
+        drop(control);
+        assert_eq!(second.next().await, None);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    assert_eq!(session.stale(Input::Http), 1);
+    writer.close().unwrap();
+    assert_eq!(sink.borrow().dropped(TrafficClass::Normal), 0);
+
+    let records = read_all(&root);
+    let lines: Vec<String> = records.iter().map(line).collect();
+    // The late result was answered after the second epoch subscribed and taken before it closed;
+    // where it falls among the second epoch's frames is the scheduler's.
+    let late_at = lines.iter().position(|l| l == "result 0 2 200").unwrap();
+    let subscribed = lines.iter().position(|l| l == "out 1 sub|add=A").unwrap();
+    assert!(
+        subscribed < late_at && late_at < lines.len() - 1,
+        "{lines:#?}"
+    );
+    let mut rest = lines.clone();
+    rest.remove(late_at);
+    let snap_get = "in 0 get|tag=1|ms=5000|url=".to_owned() + &http_url(&records, "/snap");
+    let unsent_get = "in 0 get|tag=3|ms=max|url=".to_owned() + &http_url(&records, "/snap");
+    let late_get =
+        "in 0 get|tag=2|ms=5000|url=".to_owned() + &http_url(&records, "/late") + "|bye=1";
+    let expected = [
+        "open 0",
+        "out 0 hello|codec=0|plan=1",
+        "write 0 Written",
+        "subscribe 0 +[\"1\"] -[]",
+        "out 0 sub|add=A",
+        "write 0 Written",
+        "in 0 trade|sym=A|px=100|qty=1|seq=1",
+        "in 0 arm|sym=A|ms=20",
+        "timer 0 1",
+        &snap_get,
+        "request 0 1 Get /snap",
+        "result 0 1 200",
+        "out 0 said",
+        "write 0 Written",
+        &unsent_get,
+        "request 0 3 Get /snap",
+        "result 0 3 NotSent",
+        &late_get,
+        "request 0 2 Get /late",
+        "close 0",
+        "open 1",
+        "out 1 hello|codec=1|plan=1",
+        "write 1 Written",
+        "subscribe 1 +[\"1\"] -[]",
+        "out 1 sub|add=A",
+        "write 1 Written",
+        "in 1 trade|sym=A|px=101|qty=1|seq=2",
+        "close 1",
+    ];
+    assert_eq!(rest, expected);
+
+    // Every stamped input took its place in ingest order, and the events the handler got carry
+    // the stamps of the inputs journaled for them.
+    let stamps: Vec<Stamp> = records.iter().filter_map(stamp_of).collect();
+    assert!(stamps.windows(2).all(|w| w[0].ingest_seq < w[1].ingest_seq));
+    let seen = seen.borrow();
+    for env in seen.iter() {
+        assert!(stamps.contains(&env.stamp), "{:?}", env.stamp);
+    }
+    let conns: Vec<ConnKey> = stamps.iter().map(|s| s.conn).collect();
+    assert_eq!(
+        conns.first(),
+        Some(&ConnKey {
+            conn: CONN,
+            epoch: 0
+        })
+    );
+    // The result carries its headers; a secret one reads back blanked at its length.
+    let Some(Record::HttpResult {
+        result: Ok(resp), ..
+    }) = records.iter().find(|r| line(r) == "result 0 1 200")
+    else {
+        panic!("no result");
+    };
+    let header = |name: &str| resp.headers.iter().find(|h| h.name == name).cloned();
+    let toy = HeaderRec {
+        name: "x-toy".into(),
+        value: "yes".into(),
+        redact: false,
+    };
+    assert_eq!(header("x-toy"), Some(toy));
+    let cookie = header("set-cookie").unwrap();
+    assert!(cookie.redact && cookie.value.bytes().all(|b| b == BLANK));
+    assert_eq!(cookie.value.len(), "s=secret".len());
+    assert_eq!(text(&resp.body.0), "say");
+    fs::remove_dir_all(&root).unwrap();
+}
+
+/// The URL of the journaled request whose path is `path`.
+fn http_url(records: &[Record], path: &str) -> String {
+    records
+        .iter()
+        .find_map(|r| match r {
+            Record::HttpRequest { req, .. } if req.url.as_str().ends_with(path) => {
+                Some(req.url.as_str().to_owned())
+            }
+            _ => None,
+        })
+        .unwrap()
+}
+
+/// How many records of `class` the sink dropped.
+fn dropped(sink: &RefCell<QueueSink>, class: TrafficClass) -> u64 {
+    sink.borrow().dropped(class)
+}
+
+#[tokio::test]
+async fn a_full_journal_never_holds_back_a_safety_frame_and_marks_the_gap_once_space_returns() {
+    let root = fresh_dir("md_journal_reserve");
+    // Nothing drains the queue until the writer is spawned: a stalled writer.
+    let config = SinkConfig {
+        budget_bytes: 2048,
+        soft_limit_pct: 50,
+    };
+    let (sink, drain) = journal_queue(config, key()).unwrap();
+    let sink = Rc::new(RefCell::new(sink));
+    let mut ws = ScriptedWs::start().await;
+    let seen = Seen::default();
+    let (mut session, control) =
+        MdSession::new(session(ToyVenue::leak(), ws.url()), keep(&seen)).unwrap();
+    session.set_journal(Journal::new(sink.clone()));
+    let (watch, queue) = (seen.clone(), sink.clone());
+    let script = async move {
+        let mut peer = ws.accept().await;
+        assert_eq!(peer.recv().await, "hello|codec=0|plan=1");
+        assert_eq!(peer.recv().await, "sub|add=A");
+        // Each cancel's inbound frame is Normal and its outbound frame and write result Safety:
+        // the Normal records fill the soft limit, then the Safety ones the reserve.
+        let mut n = 0;
+        while dropped(&queue, TrafficClass::Safety) == 0 {
+            n += 1;
+            assert!(n < 1_000, "the reserve was never spent");
+            peer.send(&format!("cancel|id={n}"));
+            assert_eq!(peer.recv().await, format!("cancel|id={n}"));
+        }
+        assert!(dropped(&queue, TrafficClass::Normal) > 0);
+        // The reserve is spent: the next cancel's records are dropped, and it is still sent.
+        let before = dropped(&queue, TrafficClass::Safety);
+        peer.send("cancel|id=999");
+        assert_eq!(peer.recv().await, "cancel|id=999");
+        assert_eq!(dropped(&queue, TrafficClass::Safety), before + 2);
+        // The writer resumes and drains the queue; the next record is preceded by the marker.
+        let writer = drain
+            .spawn(JournalWriter::create(&root, SHARD, key()).unwrap())
+            .unwrap();
+        until(|| queue.borrow().queued_bytes() == 0).await;
+        peer.send("trade|sym=A|px=100|qty=1|seq=1");
+        until(|| watch.borrow().len() == 1).await;
+        drop(control);
+        assert_eq!(peer.next().await, None);
+        (root, writer)
+    };
+    let (run, (root, writer)) = tokio::join!(session.run(), script);
+    run.unwrap();
+    writer.close().unwrap();
+    let drops = dropped(&sink, TrafficClass::Normal) + dropped(&sink, TrafficClass::Safety);
+
+    let records = read_all(&root);
+    let lines: Vec<String> = records.iter().map(line).collect();
+    let markers: Vec<(usize, u64, u64)> = records
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| match r {
+            Record::Marker(Marker::Degraded { from_seq, dropped }) => {
+                Some((i, *from_seq, *dropped))
+            }
+            _ => None,
+        })
+        .collect();
+    let [(at, from_seq, count)] = markers[..] else {
+        panic!("{lines:#?}");
+    };
+    assert_eq!(count, drops);
+    assert!(from_seq as usize <= at);
+    assert_eq!(lines[at + 1], "in 0 trade|sym=A|px=100|qty=1|seq=1");
+    assert_eq!(lines[at + 2..], ["close 0"]);
+    // Past the soft limit, a cancel's Safety records were kept from the reserve while its
+    // Normal inbound frame was dropped; the last cancel's were dropped too.
+    let kept_from_reserve = (1..1_000).any(|k| {
+        let out = format!("out 0 cancel|id={k}");
+        lines.contains(&out) && !lines.contains(&format!("in 0 cancel|id={k}"))
+    });
+    assert!(kept_from_reserve, "{lines:#?}");
+    assert!(!lines.iter().any(|l| l.ends_with("cancel|id=999")));
+    fs::remove_dir_all(&root).unwrap();
+}
+
+/// A sink that keeps every record it is offered, in memory.
+#[derive(Default)]
+struct Kept(Vec<Record>);
+
+impl JournalSink for Kept {
+    fn record(&mut self, _: TrafficClass, _: WallNs, record: &Record) -> Recorded {
+        self.0.push(record.clone());
+        Recorded::Ok
+    }
+}
+
+#[tokio::test]
+async fn every_endpoint_a_venue_opens_records_into_its_one_journal() {
+    let (mut s0, mut s1) = (ScriptedWs::start().await, ScriptedWs::start().await);
+    let mut cfg = VenueConfig::new();
+    cfg.insert("toy.url.0", &s0.url());
+    cfg.insert("toy.url.1", &s1.url());
+    let config = MdVenueConfig {
+        venue: ToyVenue::leak(),
+        cfg,
+        specs: toy::specs(),
+        connector: Connector::new(ProxyConfig::Direct),
+        pacing: ReconnectPacing::new(ms(10), ms(100), 100, ms(60_000), ms(5_000)).unwrap(),
+        clock: IngestClock::new(),
+        http_max_body: 1024,
+        conns: 10..20,
+    };
+    let (mut venue, control) = MdVenue::new(config, |_| {}).unwrap();
+    let kept = Rc::new(RefCell::new(Kept::default()));
+    venue.set_journal(Journal::new(kept.clone()));
+    // Two per endpoint: three subscriptions open two.
+    control.set_desired([1, 2, 3].map(toy::sub)).unwrap();
+    let script = async move {
+        let (mut a, mut b) = (s0.accept().await, s1.accept().await);
+        assert_eq!(a.recv().await, "hello|codec=0|plan=1,2");
+        assert_eq!(b.recv().await, "hello|codec=1|plan=3");
+        assert_eq!(a.recv().await, "sub|add=A,B");
+        assert_eq!(b.recv().await, "sub|add=C");
+        drop(control);
+        assert_eq!((a.next().await, b.next().await), (None, None));
+    };
+    let (run, ()) = tokio::join!(venue.run(), script);
+    run.unwrap();
+    let lines: Vec<String> = kept
+        .borrow()
+        .0
+        .iter()
+        .filter_map(|r| match r {
+            Record::Control { ev, .. } => Some(format!("{ev:?}")),
+            _ => None,
+        })
+        .collect();
+    for conn in [10, 11] {
+        let key = ConnKey { conn, epoch: 0 };
+        for ev in [ControlEvent::Opened(key), ControlEvent::Closed(key)] {
+            assert!(lines.contains(&format!("{ev:?}")), "{lines:#?}");
+        }
+    }
+}

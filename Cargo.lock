@@ -470,6 +470,7 @@ version = "0.0.1"
 dependencies = [
  "fbc-book",
  "fbc-core",
+ "fbc-journal",
  "futures-util",
  "http-body-util",
  "hyper",
