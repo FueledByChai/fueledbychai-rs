@@ -529,7 +529,11 @@ impl<'a> Value<'a> {
     fn chunks(self) -> impl Iterator<Item = &'a [u8]> {
         let (text, raw): (&[u8], &[u8]) = match self {
             Value::Text(text) => (text.as_bytes(), &[]),
-            Value::Lossy(raw) => (&[], raw),
+            Value::Lossy(raw) => {
+                #[cfg(test)]
+                LOSSY_SCANS.with(|n| n.set(n.get() + 1));
+                (&[], raw)
+            }
         };
         let lossy = raw.utf8_chunks().flat_map(|c| {
             let bad: &[u8] = if c.invalid().is_empty() {
@@ -542,10 +546,32 @@ impl<'a> Value<'a> {
         core::iter::once(text).chain(lossy)
     }
 
+    /// The fewest bytes the value's UTF-8 can take, known without reading it: a lossy one's is
+    /// never shorter than its raw bytes, as each invalid sequence becomes a 3-byte U+FFFD.
+    fn min_len(self) -> usize {
+        match self {
+            Value::Text(text) => text.len(),
+            Value::Lossy(raw) => raw.len(),
+        }
+    }
+
     /// The length of the value's UTF-8.
     fn len(self) -> usize {
         self.chunks().map(<[u8]>::len).sum()
     }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// The lossy reads of raw header values this thread has made, so a test can tell a value
+    /// was refused unscanned.
+    static LOSSY_SCANS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// The lossy reads of raw header values this test thread has made.
+#[cfg(test)]
+fn lossy_scans() -> usize {
+    LOSSY_SCANS.with(core::cell::Cell::get)
 }
 
 /// A span's descriptor: its start and end (`u32`) and its keyed hash.
@@ -586,6 +612,15 @@ impl Enc<'_> {
             }
             self.at += v.len();
         }
+    }
+
+    /// Fails, and stops the body, unless `n` more bytes fit before the limit.
+    fn fits(&mut self, n: usize) -> Result<(), JournalError> {
+        if n > self.room() {
+            self.over = true;
+            return Err(JournalError::TooLarge);
+        }
+        Ok(())
     }
 
     /// The keyed hash of `chunks`, concatenated; a measuring pass hashes nothing and counts
@@ -723,8 +758,9 @@ impl Enc<'_> {
     /// A secret header's name or value: its length and its keyed hash. The length and the
     /// digest must fit before the value is counted or hashed (Codex r4179310271).
     fn hashed(&mut self, v: Value<'_>) -> Result<(), JournalError> {
-        if 4 + DIGEST_LEN > self.room() {
-            self.over = true;
+        self.fits(4 + DIGEST_LEN)?;
+        // Nor is a value read that the redaction bound refuses unread (Codex r4179673227).
+        if self.redacted.saturating_add(v.min_len() as u64) > MAX_REDACTED {
             return Err(JournalError::TooLarge);
         }
         let len = v.len();
@@ -757,7 +793,11 @@ impl Enc<'_> {
                 Hide::Nothing => {
                     self.u8(0);
                     self.bytes(name.as_bytes())?;
+                    // The length and the value must fit before it is read, and then before
+                    // its UTF-8 is copied (Codex r4179673227).
+                    self.fits(4usize.saturating_add(value.min_len()))?;
                     let len = value.len();
+                    self.fits(4usize.saturating_add(len))?;
                     self.u32(len32(len)?);
                     for chunk in value.chunks() {
                         self.put(chunk);
@@ -1707,6 +1747,69 @@ mod tests {
         assert!(out.is_empty());
         encode_within(view, &key(), &mut out, usize::MAX).unwrap();
         assert_eq!(crate::redact::digests_taken(), before + 3);
+    }
+
+    /// Codex r4179673227: a header value that cannot fit is refused before its raw bytes are
+    /// read lossily, whether the room runs out before its length, before its UTF-8, or (a
+    /// secret one) past the redaction bound; one that fits is read.
+    #[test]
+    fn a_header_value_that_cannot_fit_is_refused_before_it_is_scanned() {
+        let raw = vec![0xff_u8; 1 << 16];
+        let k = key();
+        // (room after the count, the flag, the name's length and the name; whether secret).
+        let cases = [(3, Hide::Nothing), (4 + 100, Hide::Nothing)];
+        for (room, hide) in cases {
+            let mut out = Vec::new();
+            let mut e = Enc {
+                out: &mut out,
+                key: &k,
+                redacted: 0,
+                end: 4 + 1 + 4 + "x-big".len() + room,
+                over: false,
+                at: 0,
+                write: true,
+            };
+            let before = lossy_scans();
+            let headers = [("x-big", Value::Lossy(&raw), hide)].into_iter();
+            assert!(matches!(e.headers(headers), Err(JournalError::TooLarge)));
+            assert_eq!(
+                lossy_scans(),
+                before,
+                "scanned a value that cannot fit ({room})"
+            );
+        }
+        // A secret value past the redaction bound: refused unscanned, whatever the room.
+        let past = vec![0xff_u8; MAX_REDACTED as usize + 1];
+        let mut out = Vec::new();
+        let mut e = Enc {
+            out: &mut out,
+            key: &k,
+            redacted: 0,
+            end: usize::MAX,
+            over: false,
+            at: 0,
+            write: true,
+        };
+        let before = lossy_scans();
+        let headers = [("cookie", Value::Lossy(&past), Hide::Value)].into_iter();
+        assert!(matches!(e.headers(headers), Err(JournalError::TooLarge)));
+        assert_eq!(lossy_scans(), before, "scanned a secret past the bound");
+        // One that fits is read: its length, then its UTF-8.
+        let mut out = Vec::new();
+        let mut e = Enc {
+            out: &mut out,
+            key: &k,
+            redacted: 0,
+            end: usize::MAX,
+            over: false,
+            at: 0,
+            write: true,
+        };
+        let before = lossy_scans();
+        let headers = [("x-big", Value::Lossy(&raw[..2]), Hide::Nothing)].into_iter();
+        e.headers(headers).unwrap();
+        assert_eq!(lossy_scans(), before + 2);
+        assert!(out.ends_with("\u{FFFD}\u{FFFD}".as_bytes()));
     }
 
     /// Codex r4179310271: a secret header whose length and digest cannot fit after its flag
