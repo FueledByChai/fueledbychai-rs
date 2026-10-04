@@ -16,8 +16,9 @@
 //!
 //! Every `on_http` is logged as `<codec>/<tag>:<status>:<x-toy header>` or
 //! `<codec>/<tag>:<failure>`, and a response body's lines are read as frames. On a poll
-//! endpoint the codec sends nothing: `on_open` sets a 10 ms timer whose firing asks for
-//! `<base_url>/poll?syms=<subscribed>`, and each answer sets it again.
+//! endpoint the codec sends nothing: its first subscribe asks for
+//! `<base_url>/poll?syms=<subscribed>` at once, and each answer sets a 10 ms timer whose
+//! firing asks again.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -56,6 +57,11 @@ impl ToyVenue {
     /// A venue of the test's own, with its codec count at zero.
     pub fn leak() -> &'static ToyVenue {
         Box::leak(Box::default())
+    }
+
+    /// How many codecs it has built.
+    pub fn codecs(&self) -> u32 {
+        self.codecs.load(Ordering::SeqCst)
     }
 
     /// Every `on_http` call its codecs had, in order.
@@ -214,6 +220,7 @@ impl VenueFactory for ToyVenue {
             stream: ep.stream,
             poll,
             syms: Vec::new(),
+            polling: false,
             log: self.http.clone(),
         })
     }
@@ -235,6 +242,7 @@ struct ToyMd {
     stream: StreamId,
     poll: Option<String>,
     syms: Vec<String>,
+    polling: bool,
     log: Arc<Mutex<Vec<String>>>,
 }
 
@@ -280,10 +288,6 @@ fn get(tag: u64, url: String, timeout: Duration) -> Effect {
 impl MdCodec for ToyMd {
     fn on_open(&mut self, fx: &mut Effects) {
         if self.poll.is_some() {
-            fx.push(Effect::Timer {
-                tag: POLL,
-                after: Duration::from_millis(10),
-            });
             return;
         }
         let hello = format!("hello|codec={}|plan={}", self.n, self.plan);
@@ -308,9 +312,13 @@ impl MdCodec for ToyMd {
                 .collect()
         };
         let (add, remove) = (spell(add)?, spell(remove)?);
-        if self.poll.is_some() {
+        if let Some(base) = &self.poll {
             self.syms.retain(|s| !remove.contains(&s.as_str()));
             self.syms.extend(add.iter().map(|s| s.to_string()));
+            if !self.polling {
+                self.polling = true;
+                fx.push(self.poll_get(base));
+            }
             return Ok(());
         }
         let mut text = String::from("sub");
@@ -383,8 +391,7 @@ impl MdCodec for ToyMd {
         fx: &mut Effects,
     ) {
         if let (POLL, Some(base)) = (tag, &self.poll) {
-            let url = format!("{base}/poll?syms={}", self.syms.join(","));
-            fx.push(get(0, url, Duration::from_secs(1)));
+            fx.push(self.poll_get(base));
             return;
         }
         let inst = InstrumentId::new(tag.0 as u32);
@@ -405,6 +412,12 @@ impl MdCodec for ToyMd {
 }
 
 impl ToyMd {
+    /// The poll of the subscribed symbols.
+    fn poll_get(&self, base: &str) -> Effect {
+        let url = format!("{base}/poll?syms={}", self.syms.join(","));
+        get(0, url, Duration::from_secs(1))
+    }
+
     /// One record of the toy's protocol, from a frame or a response body.
     fn line(
         &mut self,

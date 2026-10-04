@@ -218,9 +218,6 @@ pub struct MdSession<H> {
     timer_seq: u64,
     /// HTTP requests in flight, each with the epoch that asked.
     http: FuturesUnordered<Pending>,
-    /// HTTP results that came back while a write waited, stamped as they came, in order, for
-    /// the codec after it.
-    answered: VecDeque<(Stamp, Answered)>,
     http_max_body: usize,
     counters: MdCounters,
     handler: H,
@@ -299,7 +296,6 @@ impl<H: MdHandler> MdSession<H> {
             timers: BinaryHeap::new(),
             timer_seq: 0,
             http: FuturesUnordered::new(),
-            answered: VecDeque::new(),
             http_max_body: config.http_max_body,
             counters: MdCounters::default(),
             handler,
@@ -330,11 +326,13 @@ impl<H: MdHandler> MdSession<H> {
     pub async fn run(&mut self) -> Result<(), SessionError> {
         let ran = match self.plan.transport {
             MdTransport::Socket { .. } => self.run_socket().await,
+            // A control already dropped stops a poll endpoint before its codec is built, so
+            // nothing it would ask for is sent (Codex r4177698436).
+            MdTransport::Poll { .. } if self.stop.has_changed().is_err() => Ok(()),
             // Nothing drops a poll endpoint's one epoch: it ends only when the session stops.
             MdTransport::Poll { .. } => self.connected(None).await.map(|_| ()),
         };
         self.http.clear();
-        self.answered.clear();
         ran
     }
 
@@ -414,10 +412,6 @@ impl<H: MdHandler> MdSession<H> {
             }
             let key = self.epochs.advance()?;
             self.rec.begin_epoch(key)?;
-            // Results that came back during the ended epoch's last write come back into nothing.
-            while let Some(done) = self.answered.pop_front() {
-                let _ = self.admit_http(done)?;
-            }
         }
     }
 
@@ -437,23 +431,20 @@ impl<H: MdHandler> MdSession<H> {
         let mut fx = Effects::new();
         codec.on_open(&mut fx);
         let call = self.rec.opened(key)?;
-        let mut open = self.execute(&mut ws, fx).await
+        let mut open = self.execute(&mut ws, codec.as_mut(), fx).await?
             && self.subscribe(&mut ws, codec.as_mut(), call).await?;
         while open {
-            let wake = match self.answered.pop_front() {
-                Some(done) => Wake::Http(done),
-                None => tokio::select! {
-                    frame = next_frame(&mut ws) => Wake::Frame(frame),
-                    _ = sleep_or_never(self.next_deadline()) => Wake::Timer,
-                    Some(done) = self.http.next() => Wake::Http(self.stamp_http(done)),
-                    r = self.desired.changed() => Wake::Desired(r.is_ok()),
-                },
+            let wake = tokio::select! {
+                frame = next_frame(&mut ws) => Wake::Frame(frame),
+                _ = sleep_or_never(self.next_deadline()) => Wake::Timer,
+                Some(done) = self.http.next() => Wake::Http(self.stamp_http(done)),
+                r = self.desired.changed() => Wake::Desired(r.is_ok()),
             };
             open = match wake {
                 Wake::Frame(Some(Ok(message))) => {
                     let mut fx = Effects::new();
                     self.decode(codec.as_mut(), key, &message, &mut fx);
-                    self.execute(&mut ws, fx).await
+                    self.execute(&mut ws, codec.as_mut(), fx).await?
                 }
                 Wake::Frame(_) => false,
                 Wake::Timer => self.fire(&mut ws, codec.as_mut()).await?,
@@ -461,7 +452,7 @@ impl<H: MdHandler> MdSession<H> {
                     Some((stamp, done)) => {
                         let mut fx = Effects::new();
                         self.answer(codec.as_mut(), stamp, done, &mut fx);
-                        self.execute(&mut ws, fx).await
+                        self.execute(&mut ws, codec.as_mut(), fx).await?
                     }
                     None => true,
                 },
@@ -569,7 +560,7 @@ impl<H: MdHandler> MdSession<H> {
             };
             let mut fx = Effects::new();
             codec.on_timer(tag, stamp.recv_mono, stamp.recv_wall, &mut sink, &mut fx);
-            open = self.execute(ws, fx).await;
+            open = self.execute(ws, codec, fx).await?;
         }
         Ok(open)
     }
@@ -585,7 +576,7 @@ impl<H: MdHandler> MdSession<H> {
         while open && let Some(this) = call.take() {
             let mut fx = Effects::new();
             let asked = codec.subscribe(this.add(), this.remove(), &self.specs, &mut fx);
-            open = self.execute(ws, fx).await;
+            open = self.execute(ws, &mut *codec, fx).await?;
             call = match asked {
                 Ok(()) => self.rec.sent(this)?,
                 Err(_) => {
@@ -597,33 +588,43 @@ impl<H: MdHandler> MdSession<H> {
         Ok(open)
     }
 
-    /// Executes `fx` in order; false when the socket failed or a reconnect was asked for, which
-    /// ends the epoch and leaves the rest unexecuted. A poll endpoint (`ws` is `None`) refuses
-    /// every frame and reconnect.
-    async fn execute(&mut self, ws: &mut Option<WebSocket>, mut fx: Effects) -> bool {
+    /// Executes `fx` of `codec` in order; false when the socket failed or a reconnect was asked
+    /// for, which ends the epoch and leaves the rest unexecuted. A poll endpoint (`ws` is
+    /// `None`) refuses every frame and reconnect.
+    async fn execute(
+        &mut self,
+        ws: &mut Option<WebSocket>,
+        codec: &mut dyn MdCodec,
+        mut fx: Effects,
+    ) -> Result<bool, SessionError> {
         let epoch = self.current().epoch;
         let own = self.plan.stream;
-        let mut effects = fx.take().into_iter();
+        let mut effects: VecDeque<Effect> = fx.take().into();
         let mut open = true;
-        while open && let Some(effect) = effects.next() {
+        while open && let Some(effect) = effects.pop_front() {
             match (effect, ws.as_mut()) {
                 (Effect::Send { stream, frame, .. }, Some(ws)) if stream == own => {
                     let bytes = frame.bytes();
                     let text = std::str::from_utf8(bytes).map(Message::text);
                     let message = text.unwrap_or_else(|_| Message::binary(bytes.to_vec()));
-                    // Requests in flight keep going while the write waits; their results wait
-                    // for the codec until it is done.
+                    // Requests in flight keep going while the write waits. A result that comes
+                    // back meanwhile reaches the codec at once, so the handler gets its events
+                    // in the shard's ingest order (Codex r4177698441); what the codec asks for
+                    // then is executed after the rest of this batch.
                     let send = ws.send(message);
                     tokio::pin!(send);
                     open = loop {
-                        tokio::select! {
+                        let done = tokio::select! {
                             biased;
                             sent = &mut send => break sent.is_ok(),
                             _ = self.stop.changed() => break false,
-                            Some(done) = self.http.next() => {
-                                let done = self.stamp_http(done);
-                                self.answered.push_back(done);
-                            }
+                            Some(done) = self.http.next() => done,
+                        };
+                        let done = self.stamp_http(done);
+                        if let Some((stamp, done)) = self.admit_http(done)? {
+                            let mut more = Effects::new();
+                            self.answer(codec, stamp, done, &mut more);
+                            effects.extend(more.take());
                         }
                     };
                 }
@@ -649,7 +650,7 @@ impl<H: MdHandler> MdSession<H> {
                 }
             }
         }
-        open
+        Ok(open)
     }
 
     /// Starts `req` for the codec of `epoch`; it runs beside the session until it is answered,
@@ -665,7 +666,7 @@ impl<H: MdHandler> MdSession<H> {
     }
 
     /// Stamps an HTTP result as it comes back, under the epoch that asked for it, so it takes
-    /// its place in the shard's ingest order even when it waits for a write or is dropped.
+    /// its place in the shard's ingest order even when it is dropped.
     fn stamp_http(&self, done: Answered) -> (Stamp, Answered) {
         let key = ConnKey {
             epoch: done.epoch,
