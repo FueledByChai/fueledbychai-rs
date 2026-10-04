@@ -25,8 +25,9 @@ The owner accepted the permissive allowlist and the on-every-machine rule on 202
   Moving the version is a ticket, like the toolchain (0008).
 - **Where it runs.** In the full and the fast check on every machine, as
   `scripts/licence-check.sh` inside `scripts/check.sh`: it fails when cargo-deny is missing or
-  another version, and its self-test proves the gate refuses a GPL-3.0-only path crate in
-  `fixtures/licence-gate` and names it, and that CI pins the same version.
+  another version, and its self-test proves the gate refuses GPL-3.0-only path crates in `fixtures/licence-gate`,
+  one a normal and one a dev-only dependency, and names them, and that CI pins the same
+  version. Dev-dependencies are checked (`include-dev`, off by default in cargo-deny).
 - **Scope.** Only `cargo deny check licenses`. Advisories, bans and sources are not checked by
   this record.
 

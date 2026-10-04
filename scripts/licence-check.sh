@@ -3,8 +3,9 @@
 # graph carries a licence outside the allowlist in deny.toml, naming the crate and its licence.
 #
 #   scripts/licence-check.sh              `cargo deny check licenses` on this workspace
-#   scripts/licence-check.sh --self-test  prove the gate refuses a GPL-3.0-only path crate
-#                                         (fixtures/licence-gate) and names it
+#   scripts/licence-check.sh --self-test  prove the gate refuses GPL-3.0-only path crates,
+#                                         a normal and a dev-only dependency
+#                                         (fixtures/licence-gate), and names them
 #
 # cargo-deny is required wherever the check runs, as cargo-llvm-cov is: install the pinned
 # version once with `cargo install cargo-deny --version 0.20.2 --locked`. CI installs the same
@@ -45,17 +46,20 @@ self_test() {
   if [ "$rc" = 0 ]; then
     echo "licence self-test: the gate passed a GPL-3.0-only dependency" >&2; echo "$out" >&2; exit 1
   fi
-  for want in "gpl-dep v0.0.0" "GPL-3.0-only" "license is not explicitly allowed"; do
+  # gpl-dev-dep is only a dev-dependency: test-only crates are held to the same allowlist.
+  for want in "gpl-dep v0.0.0" "gpl-dev-dep v0.0.0" "GPL-3.0-only" \
+    "license is not explicitly allowed"; do
     case "$out" in *"$want"*) ;; *)
       echo "licence self-test: the gate failed without naming '$want'" >&2; echo "$out" >&2; exit 1 ;;
     esac
   done
-  # The same graph without that crate passes, so the failure above is its licence and not a
-  # broken fixture or config.
+  # The same graph without those crates passes, so the failure above is their licence and not
+  # a broken fixture or config.
   cargo deny --manifest-path "$FIXTURE/Cargo.toml" --config deny.toml --frozen \
-    --exclude gpl-dep check licenses >/dev/null 2>&1 ||
-    { echo "licence self-test: the fixture fails even without gpl-dep" >&2; exit 1; }
-  echo "licence self-test: ok (refused gpl-dep, GPL-3.0-only; passed without it)"
+    --exclude gpl-dep --exclude gpl-dev-dep check licenses >/dev/null 2>&1 ||
+    { echo "licence self-test: the fixture fails even without its GPL crates" >&2; exit 1; }
+  echo "licence self-test: ok (refused gpl-dep and dev-only gpl-dev-dep, GPL-3.0-only;" \
+    "passed without them)"
 }
 
 case "${1:-}" in
