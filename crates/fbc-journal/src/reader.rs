@@ -1,14 +1,14 @@
 //! The reader: one shard's records in write order, across its segments and days.
 
 use std::collections::VecDeque;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use crate::JournalError;
 use crate::format::{self, MAGIC, VERSION};
 use crate::record::Record;
-use crate::writer::segment_seq;
+use crate::writer::list_segments;
 
 /// Reads one shard's records in the order they were written: the day directories in date
 /// order, each day's segments in sequence order, each segment from its start. Directories
@@ -25,32 +25,10 @@ pub struct JournalReader {
 impl JournalReader {
     /// A reader of `shard`'s segments under `root`, listed now.
     pub fn open(root: impl AsRef<Path>, shard: u16) -> Result<JournalReader, JournalError> {
-        let mut days = Vec::new();
-        for entry in fs::read_dir(root)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let is_day = name.len() == 8 && name.to_str().is_some_and(is_digits);
-            if is_day && entry.file_type()?.is_dir() {
-                days.push(entry.path());
-            }
-        }
-        days.sort();
-        let mut segments = VecDeque::new();
-        for day in days {
-            let mut found = Vec::new();
-            for entry in fs::read_dir(&day)? {
-                let entry = entry?;
-                let seq = entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|n| segment_seq(n, shard));
-                if let Some(seq) = seq {
-                    found.push((seq, entry.path()));
-                }
-            }
-            found.sort();
-            segments.extend(found.into_iter().map(|(_, path)| path));
-        }
+        let segments = list_segments(root.as_ref(), shard)?
+            .into_iter()
+            .map(|(.., path)| path)
+            .collect();
         Ok(JournalReader {
             segments,
             open: None,
@@ -128,10 +106,6 @@ impl Iterator for JournalReader {
         }
         None
     }
-}
-
-fn is_digits(s: &str) -> bool {
-    s.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Reads until `buf` is full or the file ends; how many bytes were read.

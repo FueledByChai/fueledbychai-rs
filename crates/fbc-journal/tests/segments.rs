@@ -79,6 +79,34 @@ fn a_clock_stepping_back_across_midnight_stays_in_the_later_day() {
 }
 
 #[test]
+fn a_writer_restarted_on_a_clock_behind_the_journal_stays_in_the_latest_day() {
+    // Codex r4176373442: the shard already has a segment under the later day, and the process
+    // restarts with the wall clock back in the earlier one.
+    let root = fresh_dir("restart_clock_back");
+    let mut first = JournalWriter::create(&root, 1).unwrap();
+    first.append(DAY2, &timer(1)).unwrap();
+    drop(first);
+    // Another shard's later day does not hold this shard back.
+    let mut other = JournalWriter::create(&root, 2).unwrap();
+    other
+        .append(WallNs(DAY2.0 + 86_400 * SEC), &timer(9))
+        .unwrap();
+    drop(other);
+    let mut second = JournalWriter::create(&root, 1).unwrap();
+    second.append(DAY1, &timer(2)).unwrap();
+    second.append(DAY2, &timer(3)).unwrap();
+    drop(second);
+
+    assert_eq!(names(&root), ["20261004", "20261005"]);
+    assert_eq!(
+        names(&root.join("20261004")),
+        ["1-000000.fbcj", "1-000001.fbcj"]
+    );
+    let read: Vec<Record> = read_all(&root, 1).into_iter().map(Result::unwrap).collect();
+    assert_eq!(read, [timer(1), timer(2), timer(3)]);
+}
+
+#[test]
 fn the_reader_passes_over_other_shards_and_files_that_are_not_segments() {
     let root = fresh_dir("strays");
     let mut one = JournalWriter::create(&root, 1).unwrap();

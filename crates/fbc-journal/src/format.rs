@@ -8,7 +8,8 @@
 //! Redacted content is never written. A [`WireSlice`] or [`WireUrl`] is its total length, its
 //! span count, each span's start and end (`u32`), and then only the bytes outside the spans;
 //! a secret header is its name, a flag byte, and its value's length alone. The reader puts
-//! [`BLANK`] where the spans were.
+//! [`BLANK`] where the spans were. A record redacts at most [`MAX_REDACTED`] bytes, so a
+//! damaged length cannot make the reader allocate more than that for blanks.
 
 use core::ops::Range;
 
@@ -27,6 +28,10 @@ use crate::record::{
 pub const MAGIC: [u8; 4] = *b"FBCJ";
 /// The format version this crate writes and reads.
 pub const VERSION: u16 = 1;
+/// The most bytes one record may redact, its spans and secret header values together.
+/// Credentials are short; the bound keeps a damaged length from making the reader allocate
+/// gigabytes of blanks. The writer refuses a record over it ([`JournalError::TooLarge`]).
+pub const MAX_REDACTED: u64 = 1 << 20;
 
 const INBOUND: u8 = 1;
 const OUTBOUND: u8 = 2;
@@ -104,7 +109,7 @@ fn len32(n: usize) -> Result<u32, JournalError> {
 
 /// Appends a record's body (kind and fields) to `out`.
 pub(crate) fn encode(record: &Record, out: &mut Vec<u8>) -> Result<(), JournalError> {
-    let mut e = Enc(out);
+    let mut e = Enc(out, 0);
     match record {
         Record::Inbound {
             stamp,
@@ -231,7 +236,8 @@ pub(crate) fn encode(record: &Record, out: &mut Vec<u8>) -> Result<(), JournalEr
     Ok(())
 }
 
-struct Enc<'a>(&'a mut Vec<u8>);
+/// The output, and the bytes redacted so far.
+struct Enc<'a>(&'a mut Vec<u8>, u64);
 
 impl Enc<'_> {
     fn u8(&mut self, v: u8) {
@@ -257,6 +263,15 @@ impl Enc<'_> {
     fn bytes(&mut self, v: &[u8]) -> Result<(), JournalError> {
         self.u32(len32(v.len())?);
         self.0.extend_from_slice(v);
+        Ok(())
+    }
+
+    /// Counts `n` more redacted bytes against [`MAX_REDACTED`].
+    fn redact(&mut self, n: u64) -> Result<(), JournalError> {
+        self.1 += n;
+        if self.1 > MAX_REDACTED {
+            return Err(JournalError::TooLarge);
+        }
         Ok(())
     }
 
@@ -297,6 +312,7 @@ impl Enc<'_> {
             self.u32(span.start);
             self.u32(span.end);
         }
+        self.redact(spans.iter().map(|s| u64::from(s.end - s.start)).sum())?;
         let mut at = 0;
         for span in spans {
             self.0.extend_from_slice(&bytes[at..span.start as usize]);
@@ -312,6 +328,7 @@ impl Enc<'_> {
         for h in headers {
             self.bytes(h.name.as_bytes())?;
             if h.secret() {
+                self.redact(h.value.len() as u64)?;
                 self.u8(1);
                 self.u32(len32(h.value.len())?);
             } else {
@@ -351,7 +368,11 @@ pub(crate) type Bad = &'static str;
 
 /// Reads one record body, which must be consumed exactly.
 pub(crate) fn decode(body: &[u8]) -> Result<Record, Bad> {
-    let mut d = Dec { buf: body, at: 0 };
+    let mut d = Dec {
+        buf: body,
+        at: 0,
+        blanked: 0,
+    };
     let record = match d.u8()? {
         INBOUND => Record::Inbound {
             stamp: d.stamp()?,
@@ -450,6 +471,8 @@ pub(crate) fn decode(body: &[u8]) -> Result<Record, Bad> {
 struct Dec<'a> {
     buf: &'a [u8],
     at: usize,
+    /// Blank bytes put in so far.
+    blanked: u64,
 }
 
 impl<'a> Dec<'a> {
@@ -483,6 +506,15 @@ impl<'a> Dec<'a> {
 
     fn i64(&mut self) -> Result<i64, Bad> {
         Ok(i64::from_le_bytes(self.array()?))
+    }
+
+    /// Counts `n` more blank bytes against [`MAX_REDACTED`], before they are allocated.
+    fn blank(&mut self, n: u64) -> Result<(), Bad> {
+        self.blanked += n;
+        if self.blanked > MAX_REDACTED {
+            return Err("redacted length");
+        }
+        Ok(())
     }
 
     fn pick<T: Copy>(&mut self, table: &[T], what: Bad) -> Result<T, Bad> {
@@ -547,6 +579,7 @@ impl<'a> Dec<'a> {
         let mut at = 0;
         for span in &spans {
             out.extend_from_slice(self.take((span.start - at) as usize)?);
+            self.blank(u64::from(span.end - span.start))?;
             out.resize(span.end as usize, BLANK);
             at = span.end;
         }
@@ -561,8 +594,9 @@ impl<'a> Dec<'a> {
             let name = self.text()?;
             let redact = self.flag("header flag")?;
             let value = if redact {
-                let len = self.u32()? as usize;
-                String::from_utf8(vec![BLANK; len]).expect("BLANK is ASCII")
+                let len = self.u32()?;
+                self.blank(u64::from(len))?;
+                String::from_utf8(vec![BLANK; len as usize]).expect("BLANK is ASCII")
             } else {
                 self.text()?
             };
@@ -772,6 +806,74 @@ mod tests {
         for (body, want) in cases {
             assert_eq!(decode(&body), Err(want), "{body:?}");
         }
+    }
+
+    #[test]
+    fn a_record_redacts_at_most_max_redacted_bytes() {
+        let outbound = |len: u64| Record::Outbound {
+            at: MonoNs(1),
+            conn: conn(),
+            rpc: None,
+            frame: WireSlice::redacted(vec![7; len as usize + 2], vec![0..1, 2..len as u32 + 1])
+                .unwrap(),
+        };
+        let at_limit = outbound(MAX_REDACTED);
+        assert_eq!(round_trip(&at_limit), at_limit.blanked());
+        let mut body = Vec::new();
+        assert!(matches!(
+            encode(&outbound(MAX_REDACTED + 1), &mut body),
+            Err(JournalError::TooLarge)
+        ));
+        // Spans and secret header values count together.
+        let mut headers = vec![HeaderRec {
+            name: "Cookie".into(),
+            value: "c".repeat(MAX_REDACTED as usize),
+            redact: false,
+        }];
+        let result = |headers: Vec<HeaderRec>| Record::HttpResult {
+            at: MonoNs(1),
+            conn: conn(),
+            tag: HttpTag(1),
+            result: Ok(HttpResponseRec {
+                status: 200,
+                headers,
+                body: Opaque(Vec::new()),
+            }),
+        };
+        assert_eq!(
+            round_trip(&result(headers.clone())),
+            result(headers.clone()).blanked()
+        );
+        headers.push(HeaderRec {
+            name: "X-Key".into(),
+            value: "k".into(),
+            redact: true,
+        });
+        assert!(matches!(
+            encode(&result(headers), &mut body),
+            Err(JournalError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn a_damaged_redacted_length_is_refused_before_it_is_allocated() {
+        // A span over the whole of a u32::MAX-byte frame, in a record of a few bytes.
+        let huge = outbound_with(&words(&[u32::MAX, 1, 0, u32::MAX]));
+        assert_eq!(decode(&huge), Err("redacted length"));
+        // A secret response header claiming a u32::MAX-byte value.
+        let header = [
+            &[HTTP_RESULT][..],
+            &[0; 8],
+            &[0; 6],
+            &[0; 8],
+            &[0, 200, 0],
+            &words(&[1, 1]),
+            b"a",
+            &[1],
+            &words(&[u32::MAX]),
+        ]
+        .concat();
+        assert_eq!(decode(&header), Err("redacted length"));
     }
 
     /// An HTTP request body from its method on.
