@@ -9,7 +9,8 @@
 //! keeps its connection and gets the difference through its reconciler, a new one (or one whose
 //! transport changed) opens under the next connection number of the venue's range, and one no
 //! longer planned is closed. Every session runs in the one task that runs the venue, and all of
-//! them hand their events to the consumer's one handler.
+//! them hand their events to the consumer's one handler and record into its one [`Journal`],
+//! when it set one ([`MdVenue::set_journal`]).
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -29,6 +30,7 @@ use tokio::sync::watch;
 
 use crate::connector::Connector;
 use crate::error::NetError;
+use crate::journal::Journal;
 use crate::pacing::ReconnectPacing;
 use crate::session::{IngestClock, MdControl, MdHandler, MdSession, MdSessionConfig, SessionError};
 use crate::ws;
@@ -134,6 +136,7 @@ pub struct MdVenue<H> {
     /// The open endpoints: their transport and their session's control.
     open: BTreeMap<StreamId, (MdTransport, MdControl)>,
     running: FuturesUnordered<Running>,
+    journal: Option<Journal>,
 }
 
 impl<H: MdHandler + 'static> MdVenue<H> {
@@ -160,8 +163,14 @@ impl<H: MdHandler + 'static> MdVenue<H> {
             plan,
             open: BTreeMap::new(),
             running: FuturesUnordered::new(),
+            journal: None,
         };
         Ok((venue, control))
+    }
+
+    /// Journals every endpoint opened from now on into `journal` ([`MdSession::set_journal`]).
+    pub fn set_journal(&mut self, journal: Journal) {
+        self.journal = Some(journal);
     }
 
     /// Applies each plan the control accepts until the control is dropped, then stops every
@@ -235,6 +244,9 @@ impl<H: MdHandler + 'static> MdVenue<H> {
             conn,
         };
         let (mut session, control) = MdSession::new(config, Shared(self.handler.clone()))?;
+        if let Some(journal) = &self.journal {
+            session.set_journal(journal.clone());
+        }
         self.running
             .push(Box::pin(async move { session.run().await }));
         self.open.insert(stream, (transport, control));

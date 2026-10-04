@@ -40,7 +40,10 @@
 //! timeouts and come back only to the epoch that asked, and a poll endpoint opens no connection
 //! (FBC-klr, decision 0027). [`MdVenue`] runs a venue's endpoints as
 //! [`VenueFactory::plan_md`](fbc_core::VenueFactory::plan_md) spreads the desired subscriptions
-//! over them, opening, keeping and closing endpoints as the plan changes.
+//! over them, opening, keeping and closing endpoints as the plan changes. With a [`Journal`]
+//! set on either, every session records what crosses the shard boundary into the consumer's
+//! [`fbc_journal::JournalSink`], each record under the traffic class of what it records, and
+//! never waits on it (FBC-f3w, decision 0006).
 //!
 //! [`MdBooks`] keeps one book per (instrument, book channel) from the events a session hands on,
 //! routing each book event by its `BookId`, and exposes each instrument's configured trading
@@ -56,6 +59,7 @@ mod connector;
 mod epoch;
 mod error;
 pub mod http;
+mod journal;
 mod md_venue;
 mod pacing;
 mod reconcile;
@@ -70,6 +74,7 @@ pub use books::{BookHandler, BookKeeper, MdBooks, TradingBookConflict, TradingBo
 pub use connector::{Connector, ProxyConfig};
 pub use epoch::{Admit, EpochError, Epochs, Input};
 pub use error::{Cause, NetError, Step};
+pub use journal::Journal;
 pub use md_venue::{MdVenue, MdVenueConfig, MdVenueControl, PlanError};
 pub use pacing::{PacingError, ReconnectPacing};
 pub use reconcile::{ReconcileError, Reconciler, SubscribeCall};

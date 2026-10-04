@@ -117,7 +117,7 @@ rather than guess.
   format, day-grouped segment writer rolled hourly with zstd-compressed closed segments, in-order reader and never-blocking sink, `crates/fbc-runtime` with its first
   slices (the connector, SOCKS5 CONNECT, WebSocket and HTTP/1.1, plain or TLS, 0019 and 0020, the WebSocket handshake its own, 0029;
   connection epochs and the subscription reconciler; the market-data session, 0023; HTTP
-  effects, poll endpoints and plans, 0027), `crates/fbc-conformance` with its stub venue server (0025),
+  effects, poll endpoints and plans, 0027; journaling, 0006), `crates/fbc-conformance` with its stub venue server (0025),
   `crates/venues/fbc-venue-paradex` with its signer (`src/sign`), SBE market data (`src/md`: bbo,
   trades and the order book) and its factory (`src/factory.rs`, market data only),
   and `crates/venues/fbc-venue-binance-usdm` with its market-data-only factory and codec; the
@@ -157,6 +157,8 @@ rather than guess.
     `MdBooks` (fed by the `BookKeeper` handler) keeps one `fbc-book` book per (instrument,
     `BookId`), routing each book event by its channel, and exposes each instrument's trading
     book as the consumer's `TradingBooks` configures it (FBC-nij);
+    a `Journal` (the consumer's `fbc-journal` sink) set on a session or venue records every input,
+    output and connection change under its traffic class and is never waited on (0006);
     `tests/common/toy.rs` is the toy market-data venue later runtime tests reuse.
   - `crates/fbc-book` (it depends on `fbc-core` only: one tick-indexed L2 book per
     instrument and `BookId`, built from book events the same live and in replay, with
