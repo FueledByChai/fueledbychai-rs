@@ -326,9 +326,6 @@ impl<H: MdHandler> MdSession<H> {
     pub async fn run(&mut self) -> Result<(), SessionError> {
         let ran = match self.plan.transport {
             MdTransport::Socket { .. } => self.run_socket().await,
-            // A control already dropped stops a poll endpoint before its codec is built, so
-            // nothing it would ask for is sent (Codex r4177698436).
-            MdTransport::Poll { .. } if self.stop.has_changed().is_err() => Ok(()),
             // Nothing drops a poll endpoint's one epoch: it ends only when the session stops.
             MdTransport::Poll { .. } => self.connected(None).await.map(|_| ()),
         };
@@ -372,23 +369,17 @@ impl<H: MdHandler> MdSession<H> {
             self.pacer.attempted(Instant::now());
             self.counters.attempts += 1;
             // A connect fails at its deadline, is stopped by the control's drop, keeps the
-            // desired set current and fires an ended epoch's timers as they fall due.
+            // desired set current and fires an ended epoch's timers as they fall due. The
+            // control first: a drop wins over a handshake that completed at the same time.
             let deadline = Instant::now().checked_add(self.pacer.deadline());
             let opened = {
                 let (connector, url) = (self.connector.clone(), self.url.clone());
                 let connect = connector.websocket(&url);
                 tokio::pin!(connect);
                 loop {
+                    let timer = self.next_deadline();
                     tokio::select! {
-                        opened = &mut connect => break opened.ok(),
-                        _ = sleep_or_never(deadline) => break None,
-                        _ = sleep_or_never(self.next_deadline()) => {
-                            let _ = self.take_timer()?;
-                        }
-                        Some(done) = self.http.next() => {
-                            let done = self.stamp_http(done);
-                            let _ = self.admit_http(done)?;
-                        }
+                        biased;
                         r = self.desired.changed() => match r {
                             Ok(()) => {
                                 let subs = self.desired.borrow_and_update().clone();
@@ -396,6 +387,15 @@ impl<H: MdHandler> MdSession<H> {
                             }
                             Err(_) => return Ok(()),
                         },
+                        opened = &mut connect => break opened.ok(),
+                        _ = sleep_or_never(deadline) => break None,
+                        _ = sleep_or_never(timer) => {
+                            let _ = self.take_timer()?;
+                        }
+                        Some(done) = self.http.next() => {
+                            let done = self.stamp_http(done);
+                            let _ = self.admit_http(done)?;
+                        }
                     }
                 }
             };
@@ -418,6 +418,12 @@ impl<H: MdHandler> MdSession<H> {
     /// One epoch on the open socket `ws`, or of a poll endpoint (`None`), with a fresh codec,
     /// until it drops or the session stops.
     async fn connected(&mut self, mut ws: Option<WebSocket>) -> Result<End, SessionError> {
+        // A control that has already dropped stops the session before a codec is built, so
+        // nothing is sent or asked for after it; a socket just opened is dropped unused (Codex
+        // r4177698436, r4177790164).
+        if self.stop.has_changed().is_err() {
+            return Ok(End::Stop);
+        }
         let key = self.current();
         // The epoch's plan carries the subscriptions wanted now, not the first ones, including a
         // change that arrived as the connection opened.

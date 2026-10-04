@@ -15,6 +15,7 @@ use fbc_core::{ConnKey, EndpointPlan, Envelope, MdEvent, MdTransport, VenueConfi
 use fbc_runtime::{
     Connector, IngestClock, Input, MdSession, MdSessionConfig, ProxyConfig, ReconnectPacing,
 };
+use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 type Seen = Rc<RefCell<Vec<Envelope<MdEvent>>>>;
@@ -303,6 +304,70 @@ async fn a_poll_session_whose_control_has_dropped_builds_no_codec_and_asks_for_n
     session.run().await.unwrap();
     assert_eq!(venue.codecs(), 0);
     assert!(venue.http_log().is_empty());
+}
+
+/// A WebSocket server for one connection: it reads the upgrade request, reports it on `asked`,
+/// answers it only once `answer` fires, then returns every byte the client sends until it
+/// closes.
+async fn held_handshake(
+    asked: oneshot::Sender<()>,
+    answer: oneshot::Receiver<()>,
+) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/md", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut tcp, _) = listener.accept().await.unwrap();
+        let (mut head, mut chunk) = (Vec::new(), [0u8; 1024]);
+        while !head.ends_with(b"\r\n\r\n") {
+            let n = tcp.read(&mut chunk).await.unwrap();
+            assert!(n > 0);
+            head.extend_from_slice(&chunk[..n]);
+        }
+        let head = String::from_utf8(head).unwrap();
+        let key = head.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("sec-websocket-key")
+                .then(|| value.trim().to_owned())
+        });
+        asked.send(()).unwrap();
+        answer.await.unwrap();
+        let accept = derive_accept_key(key.unwrap().as_bytes());
+        let reply = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\
+             Upgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+        );
+        tcp.write_all(reply.as_bytes()).await.unwrap();
+        let mut after = Vec::new();
+        let _ = tcp.read_to_end(&mut after).await;
+        after
+    });
+    (url, server)
+}
+
+#[tokio::test]
+async fn a_control_dropped_as_the_handshake_completes_sends_nothing_on_the_new_socket() {
+    use futures_util::FutureExt;
+    for _ in 0..20 {
+        let (asked_tx, mut asked) = oneshot::channel();
+        let (answer, held) = oneshot::channel();
+        let (url, server) = held_handshake(asked_tx, held).await;
+        let config = session(ToyVenue::leak(), socket(url));
+        let (mut session, control) = MdSession::new(config, |_| {}).unwrap();
+        let mut run = Box::pin(session.run());
+        // Polled until its upgrade request is in; the answer then waits for the session while
+        // the control drops (Codex r4177790164).
+        while asked.try_recv().is_err() {
+            assert!((&mut run).now_or_never().is_none());
+            tokio::time::sleep(ms(1)).await;
+        }
+        answer.send(()).unwrap();
+        tokio::time::sleep(ms(20)).await;
+        drop(control);
+        run.await.unwrap();
+        assert_eq!(server.await.unwrap(), b"");
+    }
 }
 
 #[tokio::test]
