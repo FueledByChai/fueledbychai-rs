@@ -51,7 +51,7 @@ rcgen = { version = "=0.14.10", default-features = false, features = ["ring"] }
 # through the Paradex signer's tree.
 hmac = { version = "=0.12.1", default-features = false }
 sha2 = { version = "=0.10.9", default-features = false }
-# The journal's closed segments are zstd-compressed (FBC-g67, decision 0025): pinned exactly,
+# The journal's closed segments are zstd-compressed (FBC-g67, decision 0026): pinned exactly,
 # default features off (no legacy formats, no dictionary builder). zstd-safe and zstd-sys are
 # BSD-3-Clause; zstd-sys builds the bundled C libzstd (BSD-3-Clause).
 zstd = { version = "=0.13.3", default-features = false }

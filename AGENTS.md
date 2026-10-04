@@ -159,7 +159,7 @@ rather than guess.
     `fbc-core`, and `hmac` and `sha2` for its keyed hashes and `zstd` for its closed segments, only: the records the runtime writes, length-prefixed in a hand-written
     little-endian format with a version, a writer of one subdirectory per UTC day with segments
     named `<shard>-<seq>.fbcj` and time from the caller, rolled at every UTC hour, each closed
-    segment compressed into `<shard>-<seq>.fbcj.zst` (0025), a reader in write order of both forms, and no byte of
+    segment compressed into `<shard>-<seq>.fbcj.zst` (0026), a reader in write order of both forms, and no byte of
     a redaction span or secret header written but each as its HMAC-SHA-256 under the
     consumer's `RedactionKey` (`src/redact.rs`, 0024; signatures kept verbatim), and a
     `JournalSink` that never blocks: a hand-written queue of atomic words (0021) with a consumer-configured byte budget, a soft
