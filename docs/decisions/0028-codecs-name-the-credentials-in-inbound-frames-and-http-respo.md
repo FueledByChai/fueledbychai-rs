@@ -42,6 +42,13 @@ This augments 0014 (it supersedes nothing there):
    spans blanked, so a codec must decode the same events and effects whatever bytes the spans
    hold (a token it keeps for later requests is kept blanked, and outbound bytes that carry it
    compare modulo their own spans).
+5. **The blank byte is the ASCII digit `2`.** The reader fills every span with it, outbound
+   spans included (0024 fixed no value; FBC-aen used NUL). NUL is illegal inside a JSON
+   string, so a codec parsing a replayed body with `serde_json` would refuse what it parsed
+   live (Codex r4179231677). `2` is valid where a credential stands in every text form seen
+   so far: a JSON string or number, an HTTP header value, a URL, and the decimal, hex, base32,
+   base58 and base64 alphabets. Where a span was blanked is told by the record's spans, not by
+   the bytes.
 
 The runtime asking `redact_inbound` for each frame and response it journals is FBC-s69, a
 follow-up ticket; it is not part of this record's boundary change.
@@ -57,6 +64,11 @@ follow-up ticket; it is not part of this record's boundary change.
 - Marking header names with a separate list rather than a per-header mark: two lists to keep
   in step for one header, and a name redacted without its value would leave a credential's
   context readable.
+- Keeping NUL as the blank byte: replayed JSON, and header values, would no longer parse.
+- `*` or another punctuation byte: invalid in a JSON number and in the base-N alphabets a
+  codec might decode a token with; a letter such as `x` fails hex and base58.
+- Letting each codec choose its blank byte: another field to carry in every record for a
+  choice one byte serves.
 - Spans relative to a codec-parsed structure (a JSON path): the journal would need a parser per
   encoding; byte spans are what `WireSlice` already uses.
 

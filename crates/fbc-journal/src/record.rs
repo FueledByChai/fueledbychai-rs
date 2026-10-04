@@ -21,8 +21,13 @@ use fbc_core::{
 
 /// The byte a redaction span reads back as. A span's bytes are never written (its keyed hash
 /// is, [`Record::digests`]); the record keeps the span's place and length, and the reader
-/// fills it with this byte. It is ASCII, so a blanked URL or header value stays text.
-pub const BLANK: u8 = 0;
+/// fills it with this byte. It is the ASCII digit `2`, which every text form a credential
+/// takes accepts in its place: a JSON string or number, an HTTP header value, a URL, and the
+/// decimal, hex, base32, base58 and base64 alphabets. So a codec that parses a replayed
+/// response or frame (with `serde_json`, a header parser) accepts what it accepted live
+/// (decision 0028). It is not distinctive: the record's spans, not its bytes, say what was
+/// blanked.
+pub const BLANK: u8 = b'2';
 
 /// The headers whose values are credentials whatever the codec marked: their values are
 /// written as keyed hashes and read back blanked, in requests and results alike (design §9; a venue behind a CDN sets
