@@ -731,7 +731,7 @@ impl<H: MdHandler> MdSession<H> {
             // Offered with the least its subscriptions encode to, so a full journal refuses it
             // before the sets are copied (Codex r4178567381).
             let (at, now) = self.clock.now();
-            let payload = || SUB_BYTES * (this.add().len() + this.remove().len());
+            let payload = || subscriptions_bytes(this.add()) + subscriptions_bytes(this.remove());
             let make = || subscribe_rec(at, self.current(), &this);
             self.journal_with(TrafficClass::Normal, now, payload, make);
             let mut fx = Effects::new();
@@ -997,8 +997,16 @@ fn response_rec(response: &Response<Bytes>) -> HttpResponseRec {
     }
 }
 
-/// The least one subscription encodes to in the journal: its instrument id and feed tag.
-const SUB_BYTES: usize = 5;
+/// The bytes `subs` encode to in the journal: each its 4-byte instrument id and its feed's tag,
+/// with a touch source's or book's id after it (Codex r4178860511).
+fn subscriptions_bytes(subs: &[Subscription]) -> usize {
+    subs.iter()
+        .map(|s| match s.feed {
+            fbc_core::Feed::Touch(_) | fbc_core::Feed::Book(_) => 6,
+            _ => 5,
+        })
+        .sum()
+}
 
 /// The record of a subscribe call made on `conn`.
 fn subscribe_rec(at: MonoNs, conn: ConnKey, call: &SubscribeCall) -> Record {
@@ -1012,23 +1020,30 @@ fn subscribe_rec(at: MonoNs, conn: ConnKey, call: &SubscribeCall) -> Record {
     }
 }
 
-/// The bytes of a request the journal keeps verbatim: its URL and body outside their redacted
-/// spans, and its header names and the values of headers that are not secret. `usize::MAX`
-/// when it redacts more than the format takes, which refuses it whatever the room (Codex
-/// r4178802722).
+/// The bytes a request is journaled in, at least: its URL and body outside their redacted
+/// spans, its header names and the values of headers that are not secret, and the digest each
+/// secret value and each span (with its 8-byte range) is journaled as (Codex r4178860509).
+/// `usize::MAX` when it redacts more than the format takes, which refuses it whatever the room
+/// (Codex r4178802722).
 fn request_bytes(req: &HttpRequest) -> usize {
+    use fbc_journal::redact::DIGEST_LEN;
     let secret = |h: &fbc_core::Header| h.redact || is_secret_header(h.name);
     let (mut kept, mut hidden) = (0, 0);
     for h in &req.headers {
         kept += h.name.len();
-        *if secret(h) { &mut hidden } else { &mut kept } += h.value.len();
+        if secret(h) {
+            kept += DIGEST_LEN;
+            hidden += h.value.len();
+        } else {
+            kept += h.value.len();
+        }
     }
     for (len, spans) in [
         (req.url.as_str().len(), req.url.redactions()),
         (req.body.bytes().len(), req.body.redactions()),
     ] {
         let spanned = redacted(spans);
-        kept += len - spanned;
+        kept += len - spanned + spans.len() * (8 + DIGEST_LEN);
         hidden += spanned;
     }
     if hidden as u64 > fbc_journal::format::MAX_REDACTED {
@@ -1182,9 +1197,54 @@ mod tests {
         let at_limit = request(limit - 4);
         assert_eq!(
             request_bytes(&at_limit),
-            "https://toy/x".len() + "x-sig".len() + 2
+            // The header's and the span's digests, the span's range, and the 2 kept bytes.
+            "https://toy/x".len() + "x-sig".len() + 2 * fbc_journal::redact::DIGEST_LEN + 8 + 2
         );
         assert_eq!(request_bytes(&request(limit - 3)), usize::MAX);
+    }
+
+    /// Codex r4178860509: each redacted span is journaled as an 8-byte range and a digest, and
+    /// a secret header's value as a digest, so a request of many small spans counts them.
+    #[test]
+    fn a_request_counts_the_digest_each_redaction_is_journaled_as() {
+        let digest = fbc_journal::redact::DIGEST_LEN;
+        let request = HttpRequest {
+            method: fbc_core::HttpMethod::Post,
+            url: fbc_core::WireUrl::redacted("https://toy/x".into(), Vec::new()).unwrap(),
+            headers: vec![
+                fbc_core::Header {
+                    name: "x-sig",
+                    value: "abcd".into(),
+                    redact: true,
+                },
+                fbc_core::Header {
+                    name: "accept",
+                    value: "json".into(),
+                    redact: false,
+                },
+            ],
+            body: fbc_core::WireSlice::redacted(vec![b'k'; 10], vec![0..1, 4..5, 8..9]).unwrap(),
+        };
+        let header = "x-sig".len() + digest + "accept".len() + "json".len();
+        let body = (10 - 3) + 3 * (8 + digest);
+        assert_eq!(
+            request_bytes(&request),
+            "https://toy/x".len() + header + body
+        );
+    }
+
+    /// Codex r4178860511: a touch or book subscription encodes its feed in two bytes, the other
+    /// feeds in one, each after a 4-byte instrument id.
+    #[test]
+    fn a_subscription_counts_the_bytes_its_feed_encodes_to() {
+        let inst = fbc_core::InstrumentId::new(1);
+        let sub = |feed| Subscription { inst, feed };
+        let subs = [
+            sub(fbc_core::Feed::Touch(fbc_core::TouchSourceId(0))),
+            sub(fbc_core::Feed::Book(fbc_core::BookId(0))),
+            sub(fbc_core::Feed::Trades),
+        ];
+        assert_eq!(subscriptions_bytes(&subs), 6 + 6 + 5);
     }
 
     #[test]

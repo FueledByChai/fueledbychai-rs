@@ -656,7 +656,8 @@ async fn an_interrupted_write_is_journaled_without_a_write_result() {
     );
 }
 
-/// The least a subscribe call for one subscription encodes to: its instrument id and feed tag.
+/// What a subscribe call for the toy's one trades subscription encodes to: its instrument id
+/// and feed tag.
 const SUB_ONE: usize = 5;
 
 /// A sink that refuses every record offered lazily without building it, keeping the payload
@@ -837,9 +838,9 @@ async fn http_requests_are_offered_lazily_with_their_size() {
     run.unwrap();
     // The subscribe call, the inbound frame and the request: its URL and its one header's name
     // (the toy's body is empty). The Authorization value is journaled as a fixed-size digest,
-    // so it does not count (Codex r4178567377). The result is withheld unoffered, as the
-    // request carried a credential.
-    let header = "Authorization".len();
+    // so it counts as that digest, whatever its length (Codex r4178567377, r4178860509). The
+    // result is withheld unoffered, as the request carried a credential.
+    let header = "Authorization".len() + fbc_journal::redact::DIGEST_LEN;
     assert_eq!(sizes.borrow().0, [SUB_ONE, get_len, url.len() + header]);
 }
 
