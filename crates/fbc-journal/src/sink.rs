@@ -329,12 +329,18 @@ impl JournalSink for QueueSink {
             TrafficClass::Normal => (self.marker_words() + entry_words(payload), self.soft),
             TrafficClass::Safety => (entry_words(payload), self.ring.words.len()),
         };
+        // Busy from the look at `closed` through the build and the push, so a writer closing
+        // meanwhile waits for the record instead of it being built only to be dropped (Codex
+        // r4178725028).
+        self.ring.busy.store(true, SeqCst);
         let open = !self.ring.closed.load(SeqCst);
-        if open && fits(self.ring.used(), need, limit) {
-            self.offer(class, now, Some(&make()))
+        let recorded = if open && fits(self.ring.used(), need, limit) {
+            let record = make();
+            self.settle(class, now, Some(&record), open)
         } else {
-            self.offer(class, now, None)
-        }
+            self.settle(class, now, None, open)
+        };
+        self.end_busy(recorded)
     }
 
     fn omit(&mut self, class: TrafficClass, now: WallNs) -> Recorded {
@@ -346,10 +352,23 @@ impl QueueSink {
     /// Offers `record`, numbering it; `None` stands for a record already known not to fit,
     /// which is dropped and counted like any other.
     fn offer(&mut self, class: TrafficClass, now: WallNs, record: Option<&Record>) -> Recorded {
-        let seq = self.next_seq;
-        self.next_seq += 1;
         self.ring.busy.store(true, SeqCst);
         let open = !self.ring.closed.load(SeqCst);
+        let recorded = self.settle(class, now, record, open);
+        self.end_busy(recorded)
+    }
+
+    /// Numbers `record` and admits it, or drops and counts it, with the sink already busy and
+    /// `open` what it saw of `closed` once busy.
+    fn settle(
+        &mut self,
+        class: TrafficClass,
+        now: WallNs,
+        record: Option<&Record>,
+        open: bool,
+    ) -> Recorded {
+        let seq = self.next_seq;
+        self.next_seq += 1;
         let recorded = match record {
             Some(record) if open => self.admit(class, now, record),
             _ => Recorded::DroppedCounted,
@@ -368,6 +387,11 @@ impl QueueSink {
                 self.ring.gap_wall.store(gap.wall.0 as u64, Relaxed);
             }
         }
+        recorded
+    }
+
+    /// Ends the sink's busy span, waking the writer for a record pushed in it.
+    fn end_busy(&self, recorded: Recorded) -> Recorded {
         self.ring.busy.store(false, SeqCst);
         if recorded == Recorded::Ok {
             self.ring.wake();
@@ -426,6 +450,9 @@ impl QueueSink {
 impl Drop for QueueSink {
     fn drop(&mut self) {
         self.ring.closed.store(true, SeqCst);
+        // A sink dropped pushes nothing more, even one unwinding out of its busy span from a
+        // record builder that panicked: the writer must not wait on it.
+        self.ring.busy.store(false, SeqCst);
         self.ring.wake();
     }
 }
@@ -591,6 +618,56 @@ mod tests {
         });
         assert_eq!(refused, Recorded::DroppedCounted);
         assert_eq!(sink.dropped(TrafficClass::Normal), 2);
+    }
+
+    #[test]
+    fn a_record_built_lazily_is_kept_though_the_sink_closes_while_it_is_built() {
+        // Codex r4178725028: the sink is busy from its look at `closed` until its push ends,
+        // so a writer closing while the record is built waits for it rather than leaving a
+        // record built only to be dropped.
+        let (mut sink, _drain) = journal_queue(
+            SinkConfig {
+                budget_bytes: 256,
+                soft_limit_pct: 50,
+            },
+            key(),
+        )
+        .unwrap();
+        let ring = Arc::clone(&sink.ring);
+        let kept = sink.record_with(TrafficClass::Normal, WallNs(0), 0, &mut || {
+            assert!(ring.busy.load(SeqCst), "built outside the sink's busy span");
+            ring.closed.store(true, SeqCst);
+            Record::Marker(Marker::Recovered)
+        });
+        assert_eq!(kept, Recorded::Ok);
+        assert!(!ring.busy.load(SeqCst));
+        assert_ne!(ring.used(), 0);
+        assert_eq!(sink.dropped(TrafficClass::Normal), 0);
+    }
+
+    #[test]
+    fn a_sink_dropped_as_a_record_builder_panics_lets_the_writer_close() {
+        let root =
+            std::env::temp_dir().join(format!("fbc-journal-sink-unwind-{}", std::process::id()));
+        let (mut sink, drain) = journal_queue(
+            SinkConfig {
+                budget_bytes: 256,
+                soft_limit_pct: 50,
+            },
+            key(),
+        )
+        .unwrap();
+        let writer = drain
+            .spawn(JournalWriter::create(&root, 1, key()).unwrap())
+            .unwrap();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            sink.record_with(TrafficClass::Normal, WallNs(0), 0, &mut || {
+                panic!("builder")
+            })
+        }));
+        assert!(unwound.is_err());
+        writer.close().unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

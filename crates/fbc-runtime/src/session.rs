@@ -1020,7 +1020,7 @@ fn request_bytes(req: &HttpRequest) -> usize {
 }
 
 /// The bytes of a response the journal keeps verbatim: its body, its header names and the
-/// values of headers that are not secret.
+/// values of headers that are not secret, each at the length it is kept read lossily.
 fn response_bytes(r: &Response<Bytes>) -> usize {
     let headers: usize = r
         .headers()
@@ -1030,11 +1030,20 @@ fn response_bytes(r: &Response<Bytes>) -> usize {
                 + if is_secret_header(n.as_str()) {
                     0
                 } else {
-                    v.len()
+                    lossy_len(v.as_bytes())
                 }
         })
         .sum();
     r.body().len() + headers
+}
+
+/// The length of `bytes` read lossily as UTF-8, without building it: each invalid sequence
+/// becomes one U+FFFD, 3 bytes (Codex r4178725031).
+fn lossy_len(bytes: &[u8]) -> usize {
+    bytes
+        .utf8_chunks()
+        .map(|c| c.valid().len() + if c.invalid().is_empty() { 0 } else { 3 })
+        .sum()
 }
 
 /// The bytes of content `len` long that the journal keeps verbatim: all but its redacted spans,
@@ -1110,6 +1119,28 @@ mod tests {
     fn only_bytes_outside_redacted_spans_count_as_kept_verbatim() {
         assert_eq!(verbatim(10, &[]), 10);
         assert_eq!(verbatim(4096, &[4..4000, 4010..4090]), 4 + 10 + 6);
+    }
+
+    /// Codex r4178725031: a header value that is not UTF-8 is kept lossily, each bad sequence
+    /// as a 3-byte U+FFFD, so it counts at the length the journal keeps.
+    #[test]
+    fn a_response_counts_at_the_size_its_record_keeps() {
+        let response = Response::builder()
+            .header(
+                "x-raw",
+                hyper::header::HeaderValue::from_bytes(&[b'a', 0xFF, 0xFE, b'b']).unwrap(),
+            )
+            .header("x-ok", "fine")
+            .body(Bytes::from_static(b"body"))
+            .unwrap();
+        let rec = response_rec(&response);
+        let kept: usize = rec
+            .headers
+            .iter()
+            .map(|h| h.name.len() + h.value.len())
+            .sum();
+        assert_eq!(kept, "x-raw".len() + 8 + "x-ok".len() + "fine".len());
+        assert_eq!(response_bytes(&response), kept + rec.body.0.len());
     }
 
     #[test]
