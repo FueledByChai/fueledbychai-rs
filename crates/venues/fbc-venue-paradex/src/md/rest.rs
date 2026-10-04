@@ -6,7 +6,9 @@
 //! `last_updated_at` (milliseconds), and `bids` and `asks`, each a list of `[price, size]`
 //! decimal strings; the `best_*` fields are not read.
 
-use fbc_core::{DecodeError, ExchNs, InstrumentId, InstrumentSpec, Lvl, PxExact, SpecTable};
+use fbc_core::{
+    Channel, DecodeError, ExchNs, InstrumentId, InstrumentSpec, Lvl, PxExact, SpecTable,
+};
 use rust_decimal::Decimal;
 use serde_json::{Map, Value};
 
@@ -14,6 +16,12 @@ use super::{lots_of, market};
 
 /// The depth asked for: the 15 levels per side the `@15` book channels carry.
 pub const ORDERBOOK_DEPTH: usize = 15;
+
+/// The order channels the response's `bids` and `asks` show: the public book. The response
+/// names the interactive book's best levels apart (`best_bid_interactive`,
+/// `best_ask_interactive`), so the RPI liquidity the `interactive_deltas` channel includes is
+/// not in them.
+pub const ORDERBOOK_CHANNELS: &[Channel] = &[Channel::Public];
 
 /// The request path and query of the order book of the market spelled `symbol`.
 pub fn orderbook_path(symbol: &str) -> String {

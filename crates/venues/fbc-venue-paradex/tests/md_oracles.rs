@@ -96,7 +96,7 @@ fn the_rest_snapshot_matches_the_book_built_from_the_fixture_deltas_at_its_seq_n
     let snap = decode_orderbook(rest_text().as_bytes(), &specs()).unwrap();
     let book = delta_book(&FRAMES_TO_2002);
     assert_eq!(book.seq(), Some(2002));
-    assert_eq!(check_snapshot(&book, &snap), Ok(()));
+    assert_eq!(check_snapshot(&caps().md, &book, &snap), Ok(()));
 }
 
 #[test]
@@ -105,7 +105,7 @@ fn a_response_with_one_altered_level_is_reported_naming_that_level() {
     let text = rest_text().replace(r#"["61997.5", "0.6"]"#, r#"["61997.5", "0.7"]"#);
     let snap = decode_orderbook(text.as_bytes(), &specs()).unwrap();
     let book = delta_book(&FRAMES_TO_2002);
-    let err = check_snapshot(&book, &snap).unwrap_err();
+    let err = check_snapshot(&caps().md, &book, &snap).unwrap_err();
     let diff = LevelDiff {
         side: BookSide::Bid,
         rank: 6,
@@ -127,7 +127,7 @@ fn a_response_with_one_altered_level_is_reported_naming_that_level() {
         left: None,
         right: Some(lvl(620_080, 1_600)),
     };
-    let err = check_snapshot(&book, &snap).unwrap_err();
+    let err = check_snapshot(&caps().md, &book, &snap).unwrap_err();
     assert_eq!(err, BookMismatch::Differs { seq_no: 2002, diff });
 }
 
@@ -136,7 +136,7 @@ fn the_book_check_refuses_a_book_at_another_seq_no_another_market_or_not_valid()
     let snap = decode_orderbook(rest_text().as_bytes(), &specs()).unwrap();
     // One delta short of the snapshot's seq_no.
     let book = delta_book(&FRAMES_TO_2002[..2]);
-    let err = check_snapshot(&book, &snap).unwrap_err();
+    let err = check_snapshot(&caps().md, &book, &snap).unwrap_err();
     assert_eq!(
         err,
         BookMismatch::NotAtSeq {
@@ -150,7 +150,7 @@ fn the_book_check_refuses_a_book_at_another_seq_no_another_market_or_not_valid()
     );
     // A book of another market.
     let other = DeltaBook::new(ETH, DELTAS);
-    let err = check_snapshot(&other, &snap).unwrap_err();
+    let err = check_snapshot(&caps().md, &other, &snap).unwrap_err();
     assert_eq!(err, BookMismatch::OtherInstrument);
     assert_eq!(
         err.to_string(),
@@ -158,7 +158,7 @@ fn the_book_check_refuses_a_book_at_another_seq_no_another_market_or_not_valid()
     );
     // No frame yet: no seq_no.
     let empty = DeltaBook::new(BTC, DELTAS);
-    let err = check_snapshot(&empty, &snap).unwrap_err();
+    let err = check_snapshot(&caps().md, &empty, &snap).unwrap_err();
     let none = BookMismatch::NotAtSeq {
         seq_no: 2002,
         book: None,
@@ -170,19 +170,39 @@ fn the_book_check_refuses_a_book_at_another_seq_no_another_market_or_not_valid()
         .frame(Some((BTC, 2002)), &[(meta(Some(2002)), gap())])
         .unwrap();
     let awaiting = BookError::NotValid(BookState::AwaitingSnapshot);
-    let err = check_snapshot(&empty, &snap).unwrap_err();
+    let err = check_snapshot(&caps().md, &empty, &snap).unwrap_err();
     assert_eq!(err, BookMismatch::NotValid(awaiting));
     // A gap at the snapshot's seq_no invalidates the book.
     let mut book = delta_book(&FRAMES_TO_2002);
     book.frame(Some((BTC, 2002)), &[(meta(Some(2002)), gap())])
         .unwrap();
-    let err = check_snapshot(&book, &snap).unwrap_err();
+    let err = check_snapshot(&caps().md, &book, &snap).unwrap_err();
     let not_valid = BookError::NotValid(BookState::Gapped);
     assert_eq!(err, BookMismatch::NotValid(not_valid));
     assert_eq!(
         err.to_string(),
         "delta-built book cannot be read: book is not valid: Gapped"
     );
+}
+
+#[test]
+fn the_book_check_refuses_a_book_of_other_order_channels_or_undeclared() {
+    // The REST bids and asks are the public book (the response names the interactive book's
+    // best levels apart), so the interactive book, which includes RPI, is refused
+    // (Codex r4177915521).
+    let snap = decode_orderbook(rest_text().as_bytes(), &specs()).unwrap();
+    let md = caps().md;
+    let interactive = DeltaBook::new(BTC, INTERACTIVE_DELTAS);
+    let err = check_snapshot(&md, &interactive, &snap).unwrap_err();
+    assert_eq!(err, BookMismatch::OtherChannels);
+    assert_eq!(
+        err.to_string(),
+        "delta-built book shows other order channels than the REST snapshot"
+    );
+    let undeclared = DeltaBook::new(BTC, fbc_core::BookId(2));
+    let err = check_snapshot(&md, &undeclared, &snap).unwrap_err();
+    assert_eq!(err, BookMismatch::Undeclared);
+    assert_eq!(err.to_string(), "book channel not declared");
 }
 
 fn gap() -> MdEvent {
@@ -461,7 +481,7 @@ fn a_delta_with_no_levels_advances_the_book_to_its_seq_no() {
     assert_eq!(book.seq(), Some(2003));
     let text = rest_text().replace(r#""seq_no": 2002"#, r#""seq_no": 2003"#);
     let snap = decode_orderbook(text.as_bytes(), &specs()).unwrap();
-    assert_eq!(check_snapshot(&book, &snap), Ok(()));
+    assert_eq!(check_snapshot(&caps().md, &book, &snap), Ok(()));
     let touch = bbo_at(Some(2003), Some(snap.bids[0]), Some(snap.asks[0]));
     let agreement = touch_agreement(&caps().md, BBO, &book, &[touch]).unwrap();
     assert_eq!(agreement.agreeing(), 1);
@@ -511,6 +531,13 @@ fn a_bbo_sample_with_no_book_at_its_seq_no_disagrees() {
     // No samples: nothing to agree with.
     let agreement = touch_agreement(&md, BBO, &book, &[]).unwrap();
     assert_eq!(agreement.percent(), 0.0);
+    // The percent is truncated, never rounded up past a threshold: 9,986 of 10,000 is 99.8
+    // (Codex r4177915514).
+    let near = oracle::Agreement {
+        samples: 10_000,
+        disagreements: vec![unmatched(0, None); 14],
+    };
+    assert_eq!(near.percent(), 99.8);
 }
 
 #[test]

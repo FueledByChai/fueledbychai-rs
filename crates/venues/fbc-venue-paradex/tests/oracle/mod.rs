@@ -14,8 +14,10 @@ use core::fmt;
 use std::collections::BTreeMap;
 
 use fbc_book::{BookError, BookState, Books, L2Book, LevelDiff, Top, Touch};
-use fbc_core::{BookId, InstrumentId, MdCaps, MdEvent, SeqDomain, TouchSourceId, VenueMeta};
-use fbc_venue_paradex::md::rest::{ORDERBOOK_DEPTH, OrderbookSnapshot};
+use fbc_core::{
+    BookId, InstrumentId, MdCaps, MdEvent, SeqDomain, TagSet, TouchSourceId, VenueMeta,
+};
+use fbc_venue_paradex::md::rest::{ORDERBOOK_CHANNELS, ORDERBOOK_DEPTH, OrderbookSnapshot};
 
 /// One market's book channel built from its decoded frames, the seq_no of the last frame, and
 /// the touch after each frame's seq_no (`None` where the book could not be read).
@@ -82,6 +84,10 @@ impl DeltaBook {
 /// Why a REST snapshot does not match the delta-built book.
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub enum BookMismatch {
+    /// The caps declare no such book channel.
+    Undeclared,
+    /// The book shows other order channels than the REST snapshot's public book.
+    OtherChannels,
     /// The snapshot and the book are of different markets.
     OtherInstrument,
     /// The book is not at the snapshot's seq_no.
@@ -95,6 +101,10 @@ pub enum BookMismatch {
 impl fmt::Display for BookMismatch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            BookMismatch::Undeclared => f.write_str("book channel not declared"),
+            BookMismatch::OtherChannels => {
+                f.write_str("delta-built book shows other order channels than the REST snapshot")
+            }
             BookMismatch::OtherInstrument => {
                 f.write_str("REST snapshot and delta-built book are of different markets")
             }
@@ -113,9 +123,19 @@ impl fmt::Display for BookMismatch {
     }
 }
 
-/// Compares `snap`'s levels with the top [`ORDERBOOK_DEPTH`] of `book`, which must stand at the
-/// snapshot's seq_no: equal, or the first differing level named.
-pub fn check_snapshot(book: &DeltaBook, snap: &OrderbookSnapshot) -> Result<(), BookMismatch> {
+/// Compares `snap`'s levels with the top [`ORDERBOOK_DEPTH`] of `book`, which must be a declared
+/// book channel showing the snapshot's order channels ([`ORDERBOOK_CHANNELS`]; Codex
+/// r4177915521) and stand at the snapshot's seq_no: equal, or the first differing level named.
+pub fn check_snapshot(
+    md: &MdCaps,
+    book: &DeltaBook,
+    snap: &OrderbookSnapshot,
+) -> Result<(), BookMismatch> {
+    let book_caps = md.books.get(usize::from(book.book.0));
+    let book_caps = book_caps.ok_or(BookMismatch::Undeclared)?;
+    if book_caps.includes_channels != TagSet::of(ORDERBOOK_CHANNELS) {
+        return Err(BookMismatch::OtherChannels);
+    }
     if snap.inst != book.inst {
         return Err(BookMismatch::OtherInstrument);
     }
@@ -162,7 +182,8 @@ impl Agreement {
         self.samples - self.disagreements.len()
     }
 
-    /// The agreeing share in percent, rounded to a tenth; 0 with no samples.
+    /// The agreeing share in percent, truncated to a tenth so it never overstates the share
+    /// against a threshold (9,986 of 10,000 is 99.8, not 99.9); 0 with no samples.
     pub fn percent(&self) -> f64 {
         let per_mille = (self.agreeing() * 1000).checked_div(self.samples);
         per_mille.map_or(0.0, |p| p as f64 / 10.0)
