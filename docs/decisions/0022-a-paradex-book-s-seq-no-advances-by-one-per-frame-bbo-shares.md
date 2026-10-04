@@ -47,9 +47,17 @@ names its market but not its channel.
    book channel it is on: `plan_md` puts a market's second book channel on a second connection,
    and the codec's `subscribe` refuses a second book channel of a market on its connection with
    `VenueError::UnsupportedFeed`, sending nothing. A frame's book is the one its market holds
-   on the connection; a frame for a market with none is skipped.
+   on the connection; a frame for a market with none is skipped. A market's book channel on a
+   connection is fixed by its first book subscription there and kept after an unsubscribe, so
+   a swap to another channel is refused too: the old channel's frames still in flight would
+   be taken for the new one's (Codex r4176866128). A swap takes a new connection or epoch.
+5. **The capability model states it** (0003): `ConnTopology` gains
+   `SharedOneBookPerInstrument { max_subscriptions }`, sharing like `Shared` but with at most
+   one book channel per instrument and connection, and Paradex declares it, so code reading
+   `VenueCaps` sees the constraint (Codex r4176866133).
 
-This augments 0014 with a resync path; it changes none of 0014's items.
+This augments 0014 with a resync path and 0003's capability model with a topology; it changes
+none of 0014's items.
 
 ## Alternatives
 

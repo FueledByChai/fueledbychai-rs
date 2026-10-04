@@ -12,7 +12,7 @@
 pub mod book;
 pub mod sbe;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use fbc_core::{
     Aggressor, BookId, DecodeError, DecodeScope, Effect, Effects, ExchNs, ExchTsKind, Feed,
@@ -80,7 +80,11 @@ pub struct ParadexMd {
     next_id: u64,
     /// Requests sent and not yet answered, by JSON-RPC id.
     pending: BTreeMap<u64, Request>,
-    /// The one book channel each market holds on this connection, and its sequence.
+    /// The one book channel each market may have on this connection: its first book
+    /// subscription here fixes it, and an unsubscribe keeps it, since frames of the old channel
+    /// can still arrive and name only their market.
+    channel_of: BTreeMap<InstrumentId, BookId>,
+    /// The books subscribed now, and their sequences.
     books: BTreeMap<InstrumentId, BookFeed>,
 }
 
@@ -91,34 +95,38 @@ impl ParadexMd {
             stream,
             next_id: 1,
             pending: BTreeMap::new(),
+            channel_of: BTreeMap::new(),
             books: BTreeMap::new(),
         }
     }
 
-    /// The book channel each market holds once `add` and `remove` are taken: at most one per
-    /// market, since a frame names its market and not its channel. A second is refused as a
-    /// feed this connection cannot carry.
+    /// Each market's book channel, and the markets with a book subscribed, once `add` (sent
+    /// first) and `remove` are taken. A market has at most one book channel on a connection,
+    /// since a frame names its market and not its channel: another is refused as a feed this
+    /// connection cannot carry, even after the first is removed (Codex r4176866128).
     fn books_after(
         &self,
         add: &[Subscription],
         remove: &[Subscription],
-    ) -> Result<BTreeMap<InstrumentId, BookId>, VenueError> {
-        let mut books: BTreeMap<_, _> = self.books.iter().map(|(i, f)| (*i, f.book())).collect();
+    ) -> Result<(BTreeMap<InstrumentId, BookId>, BTreeSet<InstrumentId>), VenueError> {
+        let mut channel_of = self.channel_of.clone();
+        let mut active: BTreeSet<_> = self.books.keys().copied().collect();
+        for sub in add {
+            if let Feed::Book(book) = sub.feed {
+                if *channel_of.entry(sub.inst).or_insert(book) != book {
+                    return Err(VenueError::UnsupportedFeed(*sub));
+                }
+                active.insert(sub.inst);
+            }
+        }
         for sub in remove {
             if let Feed::Book(book) = sub.feed
-                && books.get(&sub.inst) == Some(&book)
+                && channel_of.get(&sub.inst) == Some(&book)
             {
-                books.remove(&sub.inst);
+                active.remove(&sub.inst);
             }
         }
-        for sub in add {
-            if let Feed::Book(book) = sub.feed
-                && *books.entry(sub.inst).or_insert(book) != book
-            {
-                return Err(VenueError::UnsupportedFeed(*sub));
-            }
-        }
-        Ok(books)
+        Ok((channel_of, active))
     }
 
     /// Consumes a JSON-RPC text frame: an acknowledgement is consumed; an error is returned,
@@ -164,14 +172,15 @@ impl MdCodec for ParadexMd {
                 frames.push((request, channel(*sub, specs)?, sub.inst));
             }
         }
-        let books = self.books_after(add, remove)?;
-        self.books
-            .retain(|inst, feed| books.get(inst) == Some(&feed.book()));
-        for (inst, book) in books {
+        let (channel_of, active) = self.books_after(add, remove)?;
+        self.books.retain(|inst, _| active.contains(inst));
+        for inst in active {
+            let book = channel_of[&inst];
             self.books
                 .entry(inst)
                 .or_insert_with(|| BookFeed::new(book));
         }
+        self.channel_of = channel_of;
         for (request, channel, inst) in frames {
             let (id, method) = (self.next_id, request_method(request));
             self.next_id += 1;

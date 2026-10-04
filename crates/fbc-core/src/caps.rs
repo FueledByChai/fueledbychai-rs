@@ -402,6 +402,15 @@ pub enum ConnTopology {
         /// The most subscriptions one connection carries, `None` where there is no cap.
         max_subscriptions: Option<u32>,
     },
+    /// As `Shared`, except that a connection carries at most one book channel
+    /// ([`Feed::Book`](crate::Feed::Book)) per instrument: the venue's book frames name their
+    /// instrument but not their channel, so two book channels of one instrument on one
+    /// connection could not be told apart (decision 0022). A second book channel of an
+    /// instrument goes on another connection.
+    SharedOneBookPerInstrument {
+        /// The most subscriptions one connection carries, `None` where there is no cap.
+        max_subscriptions: Option<u32>,
+    },
     /// One connection per instrument.
     PerInstrument,
     /// One connection per channel.

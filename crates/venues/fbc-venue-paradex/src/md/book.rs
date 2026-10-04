@@ -130,10 +130,6 @@ impl BookFeed {
         }
     }
 
-    pub(crate) fn book(&self) -> BookId {
-        self.book
-    }
-
     /// Applies `frame`: a snapshot, a delta that follows the last seq_no, or a gap.
     pub(crate) fn apply(
         &mut self,
