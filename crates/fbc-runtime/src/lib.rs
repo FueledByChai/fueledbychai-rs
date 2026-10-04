@@ -33,19 +33,24 @@
 //!   is never sent twice, a new epoch subscribes the desired set once, and one that could not
 //!   be sent stays pending until it is.
 //!
-//! [`MdSession`] drives one market-data socket of a venue's plan over these (FBC-ku8): a fresh
+//! [`MdSession`] drives one market-data endpoint of a venue's plan over these (FBC-ku8): a fresh
 //! codec per epoch, events stamped into envelopes and handed to the consumer's [`MdHandler`] in
 //! ingest order, the codec's effects executed, and reconnects paced by the consumer's
-//! [`ReconnectPacing`] (decision 0023).
+//! [`ReconnectPacing`] (decision 0023). The HTTP requests a codec asks for run with their
+//! timeouts and come back only to the epoch that asked, and a poll endpoint opens no connection
+//! (FBC-klr, decision 0027). [`MdVenue`] runs a venue's endpoints as
+//! [`VenueFactory::plan_md`](fbc_core::VenueFactory::plan_md) spreads the desired subscriptions
+//! over them, opening, keeping and closing endpoints as the plan changes.
 //!
-//! Not here yet: order-entry sessions, HTTP effects, keepalives, client certificates and
-//! certificate pinning. No call here has a deadline of its own; the caller
-//! bounds one with its own timer.
+//! Not here yet: order-entry sessions, keepalives, client certificates and certificate pinning.
+//! Apart from a codec's HTTP request, no call here has a deadline of its own; the caller bounds
+//! one with its own timer.
 
 mod connector;
 mod epoch;
 mod error;
 pub mod http;
+mod md_venue;
 mod pacing;
 mod reconcile;
 mod session;
@@ -58,6 +63,7 @@ pub mod ws;
 pub use connector::{Connector, ProxyConfig};
 pub use epoch::{Admit, EpochError, Epochs, Input};
 pub use error::{Cause, NetError, Step};
+pub use md_venue::{MdVenue, MdVenueConfig, MdVenueControl, PlanError};
 pub use pacing::{PacingError, ReconnectPacing};
 pub use reconcile::{ReconcileError, Reconciler, SubscribeCall};
 pub use session::{

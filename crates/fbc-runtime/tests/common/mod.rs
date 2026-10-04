@@ -3,7 +3,8 @@
 //! table, a WebSocket echo server, and an HTTP/1.1 server that answers with the request line it
 //! saw, each of the two servers plain or behind TLS with a certificate from a CA the test
 //! generates ([`tls`]); a WebSocket server each test scripts connection by connection
-//! ([`ScriptedWs`]), one that refuses every connection and reports when ([`refusing`]), and a toy
+//! ([`ScriptedWs`]), one that refuses every connection and reports when ([`refusing`]), an HTTP
+//! server whose answers the test scripts request by request ([`ScriptedHttp`]), and a toy
 //! market-data venue ([`toy`]). Nothing here reaches the internet. Later runtime tickets reuse and extend
 //! these only as their own done lines need.
 
@@ -20,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -514,4 +515,99 @@ pub async fn refusing() -> (SocketAddr, mpsc::UnboundedReceiver<Instant>) {
         }
     });
     (addr, rx)
+}
+
+/// An HTTP/1.1 server whose requests the test answers one by one, each as an [`Exchange`].
+pub struct ScriptedHttp {
+    pub addr: SocketAddr,
+    connections: Arc<AtomicUsize>,
+    exchanges: mpsc::UnboundedReceiver<Exchange>,
+}
+
+/// One request the server read, waiting for the test: answer it, hold it unanswered, or drop it,
+/// which closes the connection without an answer.
+pub struct Exchange {
+    /// The request line's method and target, e.g. `GET /poll?syms=A`.
+    pub line: String,
+    reply: oneshot::Sender<(String, oneshot::Sender<()>)>,
+}
+
+impl Exchange {
+    /// Answers with `head` (status line and headers, without the final blank line) and `body`,
+    /// and returns once the client has closed the connection.
+    pub async fn answer(self, head: &str, body: &str) {
+        let response = format!(
+            "{head}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (done, closed) = oneshot::channel();
+        let _ = self.reply.send((response, done));
+        let _ = closed.await;
+    }
+}
+
+impl ScriptedHttp {
+    pub async fn start() -> Self {
+        let (listener, addr) = listen().await;
+        let connections = Arc::new(AtomicUsize::new(0));
+        let count = connections.clone();
+        let (tx, exchanges) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                count.fetch_add(1, Ordering::SeqCst);
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut seen = Vec::new();
+                    while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let mut chunk = [0u8; 1024];
+                        match stream.read(&mut chunk).await {
+                            Ok(n) if n > 0 => seen.extend_from_slice(&chunk[..n]),
+                            _ => return,
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&seen);
+                    let line = head.split("\r\n").next().unwrap_or_default();
+                    let line = line.rsplit_once(' ').map_or(line, |(l, _)| l).to_owned();
+                    let (reply, answer) = oneshot::channel();
+                    let _ = tx.send(Exchange { line, reply });
+                    if let Ok((response, done)) = answer.await {
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        let mut rest = [0u8; 1024];
+                        while let Ok(n) = stream.read(&mut rest).await {
+                            if n == 0 {
+                                break;
+                            }
+                        }
+                        let _ = done.send(());
+                    }
+                });
+            }
+        });
+        ScriptedHttp {
+            addr,
+            connections,
+            exchanges,
+        }
+    }
+
+    /// `http://<addr><path>`.
+    pub fn url(&self, path: &str) -> String {
+        format!("http://{}{path}", self.addr)
+    }
+
+    /// Connections accepted so far.
+    pub fn connections(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
+    }
+
+    /// The next request the server read.
+    pub async fn request(&mut self) -> Exchange {
+        self.exchanges.recv().await.unwrap()
+    }
+
+    /// A request the server read that the test has not taken yet.
+    pub fn try_request(&mut self) -> Option<Exchange> {
+        self.exchanges.try_recv().ok()
+    }
 }

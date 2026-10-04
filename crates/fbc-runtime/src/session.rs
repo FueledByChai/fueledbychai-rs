@@ -1,5 +1,5 @@
-//! A market-data session: drives one [`MdTransport::Socket`] endpoint of a venue's plan through
-//! connection epochs and the subscription reconciler (decisions 0002, 0014, 0023).
+//! A market-data session: drives one endpoint of a venue's plan through connection epochs and
+//! the subscription reconciler (decisions 0002, 0014, 0023, 0027).
 //!
 //! Each epoch is one life of the connection, with a fresh [`MdCodec`] from
 //! [`VenueFactory::md_codec`]: the session opens the endpoint through the [`Connector`], calls
@@ -10,23 +10,36 @@
 //! asked for them: frames are written, timers set and a reconnect closes the connection and opens
 //! the next epoch. A timer of an older epoch fires into nothing: it is dropped and counted.
 //!
+//! An HTTP request the codec asks for runs beside the session's reads with its own timeout, and
+//! its response, or the [`HttpFailure`] that stands for one, goes to `on_http` of the codec that
+//! asked, and only while its epoch is current: one that comes back after a reconnect is dropped
+//! and counted, so a snapshot asked for before it never anchors the new epoch's book (0027).
+//!
+//! A [`MdTransport::Poll`] endpoint opens no connection: its one epoch begins as the session
+//! runs, its codec gets data only through the HTTP requests it asks for, and a frame or a
+//! reconnect it names its stream in is a codec defect, refused and counted.
+//!
 //! One thread drives a session (design §5.1): [`MdSession::run`] spawns no task, so the read,
 //! the decode and the handler's call run in one call stack on the caller's current-thread
-//! runtime. Not here yet: HTTP effects and planning (FBC-klr), keepalive, rotation and silence
-//! (FBC-djl), kernel timestamps (FBC-2y3), rate limits (FBC-bel) and journaling (FBC-f3w).
+//! runtime. Not here yet: keepalive, rotation and silence (FBC-djl), kernel timestamps
+//! (FBC-2y3), rate limits (FBC-bel) and journaling (FBC-f3w).
 
 use std::cell::Cell;
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, BinaryHeap};
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fbc_core::{
-    ConfigError, ConnKey, Effect, Effects, EndpointPlan, Envelope, MdCodec, MdEvent, MdSink,
-    MdTransport, MonoNs, RawFrame, SpecTable, Stamp, Subscription, TimerTag, VenueCaps,
-    VenueConfig, VenueFactory, VenueMeta, WallNs, dispatch_market_data,
+    ConfigError, ConnKey, Effect, Effects, EndpointPlan, Envelope, HttpFailure, HttpRequest,
+    HttpResponse, HttpTag, MdCodec, MdEvent, MdSink, MdTransport, MonoNs, RawFrame, SpecTable,
+    Stamp, Subscription, TimerTag, VenueCaps, VenueConfig, VenueFactory, VenueMeta, WallNs,
+    dispatch_market_data,
 };
+use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use tokio::sync::watch;
 use tokio::time::{Instant, sleep_until};
@@ -34,6 +47,7 @@ use tokio::time::{Instant, sleep_until};
 use crate::connector::Connector;
 use crate::epoch::{Admit, EpochError, Epochs, Input};
 use crate::error::NetError;
+use crate::http::{Bytes, Response};
 use crate::pacing::{Pacer, ReconnectPacing};
 use crate::reconcile::{ReconcileError, Reconciler, SubscribeCall};
 use crate::ws::{self, Message, WebSocket};
@@ -101,6 +115,9 @@ pub struct MdSessionConfig {
     pub connector: Connector,
     pub pacing: ReconnectPacing,
     pub clock: IngestClock,
+    /// The most response-body bytes an HTTP request the codec asks for may read; a longer
+    /// body is [`HttpFailure::Lost`].
+    pub http_max_body: usize,
     /// The connection number stamped on this session's inputs, unique on its shard.
     pub conn: u16,
 }
@@ -110,8 +127,8 @@ pub struct MdSessionConfig {
 pub enum SessionError {
     /// The venue refused the configuration.
     Config(ConfigError),
-    /// The endpoint is not a socket (polling is FBC-klr's).
-    NotASocket,
+    /// A venue's endpoint could not be given a connection number: its range is spent.
+    NoConnectionLeft,
     /// No attempt could open the endpoint's URL; the error names the step, never the URL.
     Url(NetError),
     /// The connection has no epoch left to open.
@@ -124,7 +141,9 @@ impl fmt::Display for SessionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SessionError::Config(e) => write!(f, "venue configuration refused: {e}"),
-            SessionError::NotASocket => f.write_str("the endpoint is not a socket"),
+            SessionError::NoConnectionLeft => {
+                f.write_str("the venue has no connection number left for an endpoint")
+            }
             SessionError::Url(e) => write!(f, "the endpoint cannot be opened: {e}"),
             SessionError::Epoch(e) => write!(f, "{e}"),
             SessionError::Reconcile(e) => write!(f, "{e}"),
@@ -174,8 +193,8 @@ pub struct MdCounters {
     pub decode_errors: u64,
     /// Subscribe calls the codec refused; their subscriptions stay pending.
     pub refused_subscribes: u64,
-    /// Effects refused as codec defects: a frame or reconnect for another stream, or an HTTP
-    /// request (FBC-klr).
+    /// Effects refused as codec defects: a frame or reconnect for another stream, or for a
+    /// poll endpoint's own.
     pub refused_effects: u64,
 }
 
@@ -197,8 +216,21 @@ pub struct MdSession<H> {
     /// Pending timers: deadline, order set, epoch, tag.
     timers: BinaryHeap<Reverse<(Instant, u64, u32, TimerTag)>>,
     timer_seq: u64,
+    /// HTTP requests in flight, each with the epoch that asked.
+    http: FuturesUnordered<Pending>,
+    http_max_body: usize,
     counters: MdCounters,
     handler: H,
+}
+
+/// An HTTP request in flight.
+type Pending = Pin<Box<dyn Future<Output = Answered>>>;
+
+/// An HTTP request's result, with the epoch and tag of the codec call that asked for it.
+struct Answered {
+    epoch: u32,
+    tag: HttpTag,
+    result: Result<Response<Bytes>, HttpFailure>,
 }
 
 /// How a connected epoch ended.
@@ -207,10 +239,12 @@ enum End {
     Dropped,
 }
 
-/// What woke a disconnected session: the pacer, a timer, or the control (false: dropped).
+/// What woke a disconnected session: the pacer, a timer, an ended epoch's HTTP result, or the
+/// control (false: dropped).
 enum Idle {
     Attempt,
     Timer,
+    Http(Answered),
     Desired(bool),
 }
 
@@ -218,6 +252,7 @@ enum Idle {
 enum Wake {
     Frame(Option<Result<Message, tokio_tungstenite::tungstenite::Error>>),
     Timer,
+    Http(Answered),
     Desired(bool),
 }
 
@@ -227,11 +262,13 @@ impl<H: MdHandler> MdSession<H> {
         config: MdSessionConfig,
         handler: H,
     ) -> Result<(MdSession<H>, MdControl), SessionError> {
-        let MdTransport::Socket { url } = &config.plan.transport else {
-            return Err(SessionError::NotASocket);
+        let url = match &config.plan.transport {
+            MdTransport::Socket { url } => {
+                ws::check_url(url.as_str()).map_err(SessionError::Url)?;
+                url.as_str().to_owned()
+            }
+            MdTransport::Poll { .. } => String::new(),
         };
-        let url = url.as_str().to_owned();
-        ws::check_url(&url).map_err(SessionError::Url)?;
         let caps = config
             .venue
             .caps(&config.cfg)
@@ -258,6 +295,8 @@ impl<H: MdHandler> MdSession<H> {
             stop,
             timers: BinaryHeap::new(),
             timer_seq: 0,
+            http: FuturesUnordered::new(),
+            http_max_body: config.http_max_body,
             counters: MdCounters::default(),
             handler,
         };
@@ -282,22 +321,37 @@ impl<H: MdHandler> MdSession<H> {
         self.counters
     }
 
-    /// Connects, reconnects as paced, and delivers events until the [`MdControl`] is dropped.
+    /// Connects, reconnects as paced, and delivers events until the [`MdControl`] is dropped;
+    /// a poll endpoint opens nothing. HTTP requests still in flight when it ends are dropped.
     pub async fn run(&mut self) -> Result<(), SessionError> {
+        let ran = match self.plan.transport {
+            MdTransport::Socket { .. } => self.run_socket().await,
+            // Nothing drops a poll endpoint's one epoch: it ends only when the session stops.
+            MdTransport::Poll { .. } => self.connected(None).await.map(|_| ()),
+        };
+        self.http.clear();
+        ran
+    }
+
+    async fn run_socket(&mut self) -> Result<(), SessionError> {
         loop {
             let at = self.pacer.next_attempt(Instant::now());
             loop {
                 let idle = tokio::select! {
                     _ = sleep_or_never(at) => Idle::Attempt,
                     _ = sleep_or_never(self.next_deadline()) => Idle::Timer,
+                    Some(done) = self.http.next() => Idle::Http(done),
                     r = self.desired.changed() => Idle::Desired(r.is_ok()),
                 };
                 match idle {
                     Idle::Attempt => break,
-                    // Only an ended epoch's timers wait while disconnected: each fires into
-                    // nothing.
+                    // Only an ended epoch's timers and requests wait while disconnected: each
+                    // comes back into nothing.
                     Idle::Timer => {
                         let _ = self.take_timer()?;
+                    }
+                    Idle::Http(done) => {
+                        let _ = self.take_http(done)?;
                     }
                     Idle::Desired(false) => return Ok(()),
                     Idle::Desired(true) => {
@@ -322,6 +376,9 @@ impl<H: MdHandler> MdSession<H> {
                         _ = sleep_or_never(self.next_deadline()) => {
                             let _ = self.take_timer()?;
                         }
+                        Some(done) = self.http.next() => {
+                            let _ = self.take_http(done)?;
+                        }
                         r = self.desired.changed() => match r {
                             Ok(()) => {
                                 let subs = self.desired.borrow_and_update().clone();
@@ -338,7 +395,7 @@ impl<H: MdHandler> MdSession<H> {
                 continue;
             };
             self.pacer.opened();
-            let end = self.connected(ws).await?;
+            let end = self.connected(Some(ws)).await?;
             self.pacer.dropped(Instant::now());
             if let End::Stop = end {
                 return Ok(());
@@ -348,9 +405,9 @@ impl<H: MdHandler> MdSession<H> {
         }
     }
 
-    /// One epoch on the open socket `ws`, with a fresh codec, until it drops or the session
-    /// stops.
-    async fn connected(&mut self, mut ws: WebSocket) -> Result<End, SessionError> {
+    /// One epoch on the open socket `ws`, or of a poll endpoint (`None`), with a fresh codec,
+    /// until it drops or the session stops.
+    async fn connected(&mut self, mut ws: Option<WebSocket>) -> Result<End, SessionError> {
         let key = self.current();
         // The epoch's plan carries the subscriptions wanted now, not the first ones, including a
         // change that arrived as the connection opened.
@@ -368,8 +425,9 @@ impl<H: MdHandler> MdSession<H> {
             && self.subscribe(&mut ws, codec.as_mut(), call).await?;
         while open {
             let wake = tokio::select! {
-                frame = ws.next() => Wake::Frame(frame),
+                frame = next_frame(&mut ws) => Wake::Frame(frame),
                 _ = sleep_or_never(self.next_deadline()) => Wake::Timer,
+                Some(done) = self.http.next() => Wake::Http(done),
                 r = self.desired.changed() => Wake::Desired(r.is_ok()),
             };
             open = match wake {
@@ -380,13 +438,23 @@ impl<H: MdHandler> MdSession<H> {
                 }
                 Wake::Frame(_) => false,
                 Wake::Timer => self.fire(&mut ws, codec.as_mut()).await?,
+                Wake::Http(done) => match self.take_http(done)? {
+                    Some((stamp, done)) => {
+                        let mut fx = Effects::new();
+                        self.answer(codec.as_mut(), stamp, done, &mut fx);
+                        self.execute(&mut ws, fx).await
+                    }
+                    None => true,
+                },
                 Wake::Desired(true) => {
                     let subs = self.desired.borrow_and_update().clone();
                     let call = self.rec.set_desired(subs);
                     self.subscribe(&mut ws, codec.as_mut(), call).await?
                 }
                 Wake::Desired(false) => {
-                    close(&mut ws);
+                    if let Some(ws) = ws.as_mut() {
+                        close(ws);
+                    }
                     return Ok(End::Stop);
                 }
             };
@@ -427,11 +495,50 @@ impl<H: MdHandler> MdSession<H> {
         }
     }
 
+    /// Hands a current epoch's HTTP result to the codec that asked for it, under `stamp`.
+    fn answer(&mut self, codec: &mut dyn MdCodec, stamp: Stamp, done: Answered, fx: &mut Effects) {
+        let headers: Vec<(String, String)> = match &done.result {
+            Ok(response) => response
+                .headers()
+                .iter()
+                .map(|(name, value)| {
+                    let value = String::from_utf8_lossy(value.as_bytes()).into_owned();
+                    (name.as_str().to_owned(), value)
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        let headers: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let resp = match &done.result {
+            Ok(response) => Ok(HttpResponse {
+                status: response.status().as_u16(),
+                headers: &headers,
+                body: response.body(),
+            }),
+            Err(failure) => Err(*failure),
+        };
+        let mut sink = Sink {
+            handler: &mut self.handler,
+            epochs: &mut self.epochs,
+            stamp,
+        };
+        let specs = &self.specs;
+        let decoded = dispatch_market_data(&self.caps, |scope| {
+            codec.on_http(done.tag, resp, scope, specs, &mut sink, fx)
+        });
+        if decoded.is_err() {
+            self.counters.decode_errors += 1;
+        }
+    }
+
     /// Fires the earliest timer, which is due: an ended epoch's into nothing, the current
     /// epoch's into the codec. The next due timer wakes the session again at once.
     async fn fire(
         &mut self,
-        ws: &mut WebSocket,
+        ws: &mut Option<WebSocket>,
         codec: &mut dyn MdCodec,
     ) -> Result<bool, SessionError> {
         let mut open = true;
@@ -451,7 +558,7 @@ impl<H: MdHandler> MdSession<H> {
     /// Sends `call` and every call the reconciler yields after it; false when the epoch ended.
     async fn subscribe(
         &mut self,
-        ws: &mut WebSocket,
+        ws: &mut Option<WebSocket>,
         codec: &mut dyn MdCodec,
         mut call: Option<SubscribeCall>,
     ) -> Result<bool, SessionError> {
@@ -472,14 +579,16 @@ impl<H: MdHandler> MdSession<H> {
     }
 
     /// Executes `fx` in order; false when the socket failed or a reconnect was asked for, which
-    /// ends the epoch and leaves the rest unexecuted.
-    async fn execute(&mut self, ws: &mut WebSocket, mut fx: Effects) -> bool {
+    /// ends the epoch and leaves the rest unexecuted. A poll endpoint (`ws` is `None`) refuses
+    /// every frame and reconnect.
+    async fn execute(&mut self, ws: &mut Option<WebSocket>, mut fx: Effects) -> bool {
         let epoch = self.current().epoch;
+        let own = self.plan.stream;
         let mut effects = fx.take().into_iter();
         let mut open = true;
         while open && let Some(effect) = effects.next() {
-            match effect {
-                Effect::Send { stream, frame, .. } if stream == self.plan.stream => {
+            match (effect, ws.as_mut()) {
+                (Effect::Send { stream, frame, .. }, Some(ws)) if stream == own => {
                     let bytes = frame.bytes();
                     let text = std::str::from_utf8(bytes).map(Message::text);
                     let message = text.unwrap_or_else(|_| Message::binary(bytes.to_vec()));
@@ -489,23 +598,52 @@ impl<H: MdHandler> MdSession<H> {
                         _ = self.stop.changed() => false,
                     };
                 }
-                Effect::Timer { tag, after } => {
+                (Effect::Timer { tag, after }, _) => {
                     // A timer past the end of the clock never fires.
                     if let Some(at) = Instant::now().checked_add(after) {
                         self.timer_seq += 1;
                         self.timers.push(Reverse((at, self.timer_seq, epoch, tag)));
                     }
                 }
-                Effect::Reconnect { stream, .. } if stream == self.plan.stream => {
+                (Effect::Reconnect { stream, .. }, Some(ws)) if stream == own => {
                     close(ws);
                     open = false;
                 }
-                Effect::Send { .. } | Effect::Reconnect { .. } | Effect::Http { .. } => {
+                (
+                    Effect::Http {
+                        tag, req, timeout, ..
+                    },
+                    _,
+                ) => self.ask(epoch, tag, req, timeout),
+                (Effect::Send { .. } | Effect::Reconnect { .. }, _) => {
                     self.counters.refused_effects += 1;
                 }
             }
         }
         open
+    }
+
+    /// Starts `req` for the codec of `epoch`; it runs beside the session until it is answered,
+    /// fails or times out.
+    fn ask(&mut self, epoch: u32, tag: HttpTag, req: HttpRequest, timeout: Duration) {
+        let (connector, max_body) = (self.connector.clone(), self.http_max_body);
+        self.http.push(Box::pin(async move {
+            let result = connector.http_within(&req, timeout, max_body).await;
+            Answered { epoch, tag, result }
+        }));
+    }
+
+    /// Stamps an HTTP result under the epoch that asked for it, so it takes its place in ingest
+    /// order even when dropped; it and its stamp when that epoch is current, `None` when it
+    /// ended (dropped and counted).
+    fn take_http(&mut self, done: Answered) -> Result<Option<(Stamp, Answered)>, SessionError> {
+        let key = ConnKey {
+            epoch: done.epoch,
+            ..self.current()
+        };
+        let stamp = self.clock.stamp(key);
+        let current = self.epochs.admit(Input::Http, key)? == Admit::Current;
+        Ok(current.then_some((stamp, done)))
     }
 
     /// Takes the earliest timer and stamps its firing under the epoch that set it, so it takes
@@ -535,6 +673,16 @@ impl<H: MdHandler> MdSession<H> {
 /// reading; the socket closes when it is dropped either way.
 fn close(ws: &mut WebSocket) {
     let _ = ws.close(None).now_or_never();
+}
+
+/// The next message on the socket; a poll endpoint has none, ever.
+async fn next_frame(
+    ws: &mut Option<WebSocket>,
+) -> Option<Result<Message, tokio_tungstenite::tungstenite::Error>> {
+    match ws {
+        Some(ws) => ws.next().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Sleeps until `at`, or forever when there is no deadline.

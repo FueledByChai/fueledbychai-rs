@@ -51,6 +51,7 @@ fn session(
         connector: Connector::new(ProxyConfig::Direct),
         pacing,
         clock: IngestClock::new(),
+        http_max_body: 1024,
         conn: CONN,
     }
 }
@@ -194,7 +195,7 @@ async fn a_refused_subscribe_stays_pending_stray_effects_are_refused_and_bye_rec
     run.unwrap();
     let counters = session.counters();
     assert_eq!(counters.refused_subscribes, 1);
-    assert_eq!(counters.refused_effects, 3);
+    assert_eq!(counters.refused_effects, 2);
     assert_eq!(session.stale(Input::Timer), 1);
     assert_eq!(session.current(), key(1));
 }
@@ -332,15 +333,7 @@ async fn a_refusing_server_sees_attempts_spaced_by_the_backoff_and_within_the_bu
 }
 
 #[test]
-fn a_session_needs_a_socket_endpoint_and_a_configuration_the_venue_accepts() {
-    let mut config = session(ToyVenue::leak(), "ws://127.0.0.1:1/".into(), &[], quick());
-    config.plan.transport = MdTransport::Poll {
-        base_url: WireUrl::plain("http://127.0.0.1:1/"),
-    };
-    let err = MdSession::new(config, |_| {}).err().unwrap();
-    assert_eq!(err, SessionError::NotASocket);
-    assert_eq!(err.to_string(), "the endpoint is not a socket");
-
+fn a_session_needs_a_socket_url_it_can_open_and_a_configuration_the_venue_accepts() {
     let config = session(ToyVenue::leak(), "http://127.0.0.1:1/".into(), &[], quick());
     let err = MdSession::new(config, |_| {}).err().unwrap();
     assert!(matches!(&err, SessionError::Url(e) if e.step() == Step::Url));
