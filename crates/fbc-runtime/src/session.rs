@@ -387,6 +387,20 @@ impl<H: MdHandler> MdSession<H> {
         }
     }
 
+    /// Offers the record `make` builds, if the session has a journal, under `class`, telling
+    /// the sink first that it holds `payload` bytes, so a sink with no room refuses it unbuilt.
+    fn journal_with(
+        &self,
+        class: TrafficClass,
+        now: WallNs,
+        payload: usize,
+        make: impl FnOnce() -> Record,
+    ) {
+        if let Some(journal) = &self.journal {
+            journal.record_with(class, now, payload, make);
+        }
+    }
+
     /// Offers the record of an input `make` builds, holding `payload` bytes the input carries,
     /// unless the session has carried a credential, in which case the input is withheld,
     /// counted, and omitted at the sink, which marks the gap (Codex r4178287664). The sink is told the payload's size first, so one with no room for it refuses it
@@ -699,11 +713,12 @@ impl<H: MdHandler> MdSession<H> {
     ) -> Result<bool, SessionError> {
         let mut open = true;
         while open && let Some(this) = call.take() {
-            self.control(|| ControlEvent::Subscribe {
-                conn: self.current(),
-                add: this.add().to_vec(),
-                remove: this.remove().to_vec(),
-            });
+            // Offered with the least its subscriptions encode to, so a full journal refuses it
+            // before the sets are copied (Codex r4178567381).
+            let (at, now) = self.clock.now();
+            let payload = SUB_BYTES * (this.add().len() + this.remove().len());
+            let make = || subscribe_rec(at, self.current(), &this);
+            self.journal_with(TrafficClass::Normal, now, payload, make);
             let mut fx = Effects::new();
             let asked = codec.subscribe(this.add(), this.remove(), &self.specs, &mut fx);
             open = self.execute(ws, &mut *codec, fx).await?;
@@ -863,23 +878,17 @@ impl<H: MdHandler> MdSession<H> {
             self.credentialed.set(true);
         }
         let (at, now) = self.clock.now();
-        // Offered with its size, headers included, so a full journal refuses it before it is
-        // cloned (Codex r4178287660, r4178427394).
-        if let Some(journal) = &self.journal {
-            let headers: usize = req
-                .headers
-                .iter()
-                .map(|h| h.name.len() + h.value.len())
-                .sum();
-            let payload = req.url.as_str().len() + req.body.bytes().len() + headers;
-            journal.record_with(class, now, payload, || Record::HttpRequest {
-                at,
-                conn,
-                tag,
-                rpc,
-                req: HttpRequestRec::from(&req),
-            });
-        }
+        // Offered with the bytes it keeps verbatim, headers included, so a full journal refuses
+        // it before it is cloned (Codex r4178287660, r4178427394). Redacted spans and secret
+        // header values are journaled as fixed-size digests, so they do not count (Codex
+        // r4178567377).
+        self.journal_with(class, now, request_bytes(&req), || Record::HttpRequest {
+            at,
+            conn,
+            tag,
+            rpc,
+            req: HttpRequestRec::from(&req),
+        });
         let (connector, max_body) = (self.connector.clone(), self.http_max_body);
         self.http.push(Box::pin(async move {
             let result = connector.http_by(&req, deadline, max_body).await;
@@ -902,14 +911,7 @@ impl<H: MdHandler> MdSession<H> {
         let stamp = self.clock.stamp(key);
         // Its body and headers, so a full journal refuses it before it is copied (Codex
         // r4178427394).
-        let payload = done.result.as_ref().map_or(0, |r| {
-            let headers: usize = r
-                .headers()
-                .iter()
-                .map(|(n, v)| n.as_str().len() + v.len())
-                .sum();
-            r.body().len() + headers
-        });
+        let payload = done.result.as_ref().map_or(0, response_bytes);
         self.journal_input(done.class, stamp.recv_wall, payload, || {
             Record::HttpResult {
                 stamp,
@@ -975,6 +977,60 @@ fn response_rec(response: &Response<Bytes>) -> HttpResponseRec {
     }
 }
 
+/// The least one subscription encodes to in the journal: its instrument id and feed tag.
+const SUB_BYTES: usize = 5;
+
+/// The record of a subscribe call made on `conn`.
+fn subscribe_rec(at: MonoNs, conn: ConnKey, call: &SubscribeCall) -> Record {
+    Record::Control {
+        at,
+        ev: ControlEvent::Subscribe {
+            conn,
+            add: call.add().to_vec(),
+            remove: call.remove().to_vec(),
+        },
+    }
+}
+
+/// The bytes of a request the journal keeps verbatim: its URL and body outside their redacted
+/// spans, and its header names and the values of headers that are not secret.
+fn request_bytes(req: &HttpRequest) -> usize {
+    let secret = |h: &fbc_core::Header| h.redact || is_secret_header(h.name);
+    let headers: usize = req
+        .headers
+        .iter()
+        .map(|h| h.name.len() + if secret(h) { 0 } else { h.value.len() })
+        .sum();
+    verbatim(req.url.as_str().len(), req.url.redactions())
+        + verbatim(req.body.bytes().len(), req.body.redactions())
+        + headers
+}
+
+/// The bytes of a response the journal keeps verbatim: its body, its header names and the
+/// values of headers that are not secret.
+fn response_bytes(r: &Response<Bytes>) -> usize {
+    let headers: usize = r
+        .headers()
+        .iter()
+        .map(|(n, v)| {
+            n.as_str().len()
+                + if is_secret_header(n.as_str()) {
+                    0
+                } else {
+                    v.len()
+                }
+        })
+        .sum();
+    r.body().len() + headers
+}
+
+/// The bytes of content `len` long that the journal keeps verbatim: all but its redacted spans,
+/// each of which it writes as a fixed-size digest.
+fn verbatim(len: usize, spans: &[std::ops::Range<u32>]) -> usize {
+    let redacted: usize = spans.iter().map(|s| (s.end - s.start) as usize).sum();
+    len - redacted
+}
+
 /// Whether `effect` asks a socket endpoint of stream `own` to reconnect, which ends its epoch.
 fn ends_epoch(effect: &Effect, own: StreamId) -> bool {
     matches!(effect, Effect::Reconnect { stream, .. } if *stream == own)
@@ -1033,6 +1089,14 @@ mod tests {
         assert_eq!(seqs.map(|s| s.ingest_seq), [0, 1, 2]);
         assert!(seqs.iter().all(|s| s.conn == conn && s.kernel_rx.is_none()));
         assert!(seqs[0].recv_mono <= seqs[2].recv_mono);
+    }
+
+    /// Codex r4178567377: a redacted span is journaled as a fixed-size digest, so a long
+    /// credential does not count towards the bytes a request is offered to the journal with.
+    #[test]
+    fn only_bytes_outside_redacted_spans_count_as_kept_verbatim() {
+        assert_eq!(verbatim(10, &[]), 10);
+        assert_eq!(verbatim(4096, &[4..4000, 4010..4090]), 4 + 10 + 6);
     }
 
     #[test]
