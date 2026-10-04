@@ -180,6 +180,73 @@ async fn a_request_goes_out_and_times_out_while_a_write_waits_on_a_stalled_peer(
 }
 
 #[tokio::test]
+async fn a_request_asked_for_by_a_result_that_comes_back_during_a_write_starts_at_once() {
+    let (mut ws, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
+    let venue = ToyVenue::leak();
+    let (mut session, control) = MdSession::new(session(venue, socket(ws.url())), |_| {}).unwrap();
+    let script = async move {
+        let mut peer = ws.accept().await;
+        assert_eq!(peer.recv().await, "hello|codec=0|plan=1");
+        assert_eq!(peer.recv().await, "sub|add=A");
+        // A GET, then a 64 MiB frame the stalled peer holds back for 1000 ms. The GET's answer
+        // asks for a second GET with a 150 ms timeout that is never answered (Codex
+        // r4177887264).
+        peer.send(&format!(
+            "get|tag=9|ms=5000|kb=65536|url={}",
+            http.url("/during")
+        ));
+        peer.stall_for(ms(1000));
+        let start = Instant::now();
+        let nested = format!("get|tag=5|ms=150|url={}", http.url("/nested"));
+        http.request()
+            .await
+            .answer("HTTP/1.1 200 OK", &nested)
+            .await;
+        let held = tokio::time::timeout(ms(500), http.request()).await;
+        let held = held.expect("the second request goes out while the write waits");
+        until(|| venue.http_log().len() == 2).await;
+        // Its deadline ran from when the codec asked for it, not from when the write ended.
+        assert!(start.elapsed() < ms(1000), "{:?}", start.elapsed());
+        drop((held, control));
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    assert_eq!(venue.http_log(), ["0/9:200:-", "0/5:TimedOut"]);
+}
+
+#[tokio::test]
+async fn a_result_that_is_ready_as_the_control_drops_reaches_no_codec() {
+    let (mut ws, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
+    for _ in 0..20 {
+        let (venue, seen) = (ToyVenue::leak(), Seen::default());
+        let config = session(venue, socket(ws.url()));
+        let (mut session, control) = MdSession::new(config, keep(&seen)).unwrap();
+        let mut run = Box::pin(session.run());
+        let script = async {
+            let mut peer = ws.accept().await;
+            assert_eq!(peer.recv().await, "hello|codec=0|plan=1");
+            assert_eq!(peer.recv().await, "sub|add=A");
+            peer.send(&format!("get|tag=4|ms=5000|url={}", http.url("/ready")));
+            (peer, http.request().await)
+        };
+        let (peer, exchange) = tokio::select! {
+            _ = &mut run => panic!("the session stopped"),
+            got = script => got,
+        };
+        // The answer is in before the session runs again, and the control drops with it
+        // (Codex r4177887269).
+        let body = "trade|sym=A|px=1|qty=1|seq=1";
+        tokio::spawn(exchange.answer("HTTP/1.1 200 OK", body));
+        tokio::time::sleep(ms(20)).await;
+        drop(control);
+        run.await.unwrap();
+        drop(peer);
+        assert!(venue.http_log().is_empty(), "{:?}", venue.http_log());
+        assert!(seen.borrow().is_empty());
+    }
+}
+
+#[tokio::test]
 async fn a_response_that_arrives_after_its_stream_reconnected_is_dropped_and_counted() {
     let (mut ws, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
     let venue = ToyVenue::leak();
