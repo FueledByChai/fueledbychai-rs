@@ -28,8 +28,9 @@
 //! otherwise; an HTTP result in between is held and answered once the codec is built, before
 //! that call, as live. Format version 4 cannot tell that opening call from a change of an
 //! empty desired set made before any frame or timer, nor show the subscriptions of an epoch
-//! whose opening write failed; and a frame or timer the session took as its control dropped
-//! is journaled but was never decoded, which replay cannot tell from one that was (FBC-11m).
+//! whose opening write failed (FBC-11m). A frame, timer firing or HTTP result the session took
+//! as its control dropped reached no codec; it is journaled after the epoch's `Closed`, so
+//! replay feeds it to none.
 //! Records the sink dropped leave a `Degraded` marker, counted as a gap: a replay across one
 //! is not exact.
 
