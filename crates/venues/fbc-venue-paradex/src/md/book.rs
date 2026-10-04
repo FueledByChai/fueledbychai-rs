@@ -110,6 +110,22 @@ fn book_level(spec: &fbc_core::InstrumentSpec, entry: &Block<'_>) -> Result<Lvl,
     })
 }
 
+/// The market and seq_no of a `BookEvent` frame, or `None` for a frame of another template;
+/// refused as the codec would refuse it. A frame's seq_no is there even when it decodes to no
+/// event (a delta with no levels), which an offline check aligning the book with a snapshot
+/// or a bbo sample by seq_no needs.
+pub fn frame_seq(
+    frame: &[u8],
+    specs: &SpecTable,
+) -> Result<Option<(InstrumentId, u64)>, DecodeError> {
+    let msg = Message::parse(frame)?;
+    if msg.header().template_id != super::TEMPLATE_BOOK {
+        return Ok(None);
+    }
+    let frame = decode_book(&msg, specs)?;
+    Ok(Some((frame.inst, frame.seq)))
+}
+
 /// One market's book channel on a connection, and where its sequence stands.
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub(crate) struct BookFeed {

@@ -29,6 +29,7 @@ that file describes for versions below 2.
 | `book15-snapshot-2000.sbe.txt` | A SNAPSHOT at seq 2000: 15 bids (62000.0 down by 0.5) and 15 asks (62000.5 up by 0.5) |
 | `book15-delta-2001.sbe.txt` | A DELTA at seq 2001: one bid changed, one ask removed, one ask added below the 15th |
 | `book15-delta-2002.sbe.txt` | A DELTA at seq 2002: a new best bid, the worst bid removed |
+| `book15-delta-2003-empty.sbe.txt` | A DELTA at seq 2003 with no levels: the book unchanged, the sequence advanced |
 
 The snapshot and the deltas at 1001, 1002 and 1003 are a continuous sequence; 1004 after 1002
 is a skipped seq_no, and 1001 or 1002 after 1002 a backwards one (`tests/md_book.rs`).
