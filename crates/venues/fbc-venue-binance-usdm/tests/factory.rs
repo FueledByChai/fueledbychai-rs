@@ -36,9 +36,10 @@ fn the_factory_declares_market_data_only_with_no_exec_codec_or_endpoint() {
     assert_eq!(BinanceUsdm.id(), "BINANCE_FUTURES");
     // Never promoted past recording: it is the reference feed, not a traded venue.
     assert_eq!(caps.readiness_ceiling, Readiness::Record);
-    // Orders placed without selfTradePreventionMode get the documented default, NONE.
+    // STP prevents matching within one account or the accounts of one tradeGroupId (Codex
+    // r4176739116): the owner's scope, though an order opts into it.
     assert_eq!(caps.matching.speed_bump, None);
-    assert_eq!(caps.matching.stp_scope, StpScope::None);
+    assert_eq!(caps.matching.stp_scope, StpScope::Owner);
 }
 
 #[test]
@@ -186,6 +187,21 @@ fn a_missing_or_invalid_key_is_refused_by_caps_and_plan_md() {
     for (key, value) in [
         (KEY_WS_BASE_URL, "https://fstream.binance.com"),
         (KEY_WS_BASE_URL, "wss://"),
+        // Codex r4176739112: only an origin, scheme://host[:port], is a base URL.
+        (KEY_WS_BASE_URL, "ws://host:abc"),
+        (KEY_WS_BASE_URL, "ws://bad host"),
+        (KEY_WS_BASE_URL, "wss://host?x=1"),
+        (KEY_WS_BASE_URL, "wss://host#x"),
+        (KEY_WS_BASE_URL, "wss://host/ws"),
+        (KEY_WS_BASE_URL, "wss://user@host"),
+        (KEY_WS_BASE_URL, "wss://host:"),
+        (KEY_WS_BASE_URL, "wss://host:0"),
+        (KEY_WS_BASE_URL, "wss://host:65536"),
+        (KEY_WS_BASE_URL, "wss://:443"),
+        (KEY_WS_BASE_URL, "ws://[::1"),
+        (KEY_WS_BASE_URL, "ws://[]:80"),
+        (KEY_WS_BASE_URL, "ws://[::1]x"),
+        (KEY_WS_BASE_URL, "ws://[g::1]:80"),
         (KEY_DEPTH_LEVELS, "50"),
         (KEY_DEPTH_SPEED, "1s"),
     ] {
@@ -195,6 +211,20 @@ fn a_missing_or_invalid_key_is_refused_by_caps_and_plan_md() {
             Err(ConfigError::Invalid { key: named, .. }) => assert_eq!(named, key),
             other => panic!("{key}={value}: {other:?}"),
         }
+    }
+    // An origin with a port, by name or address, is a base URL.
+    for base in [
+        "ws://127.0.0.1:9000",
+        "ws://[::1]:9000",
+        "wss://fstream.binance.com:443",
+    ] {
+        let mut cfg = config();
+        cfg.insert(KEY_WS_BASE_URL, base);
+        let plans = BinanceUsdm.plan_md(&cfg, &specs(), &subs).unwrap();
+        let MdTransport::Socket { url } = &plans[0].transport else {
+            panic!("a socket")
+        };
+        assert_eq!(url.as_str(), format!("{base}/public/stream"));
     }
     // A trailing slash on the base URL is not doubled.
     let plans = BinanceUsdm
