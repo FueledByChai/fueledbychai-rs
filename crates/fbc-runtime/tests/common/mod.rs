@@ -5,7 +5,8 @@
 //! generates ([`tls`]); a WebSocket server each test scripts connection by connection
 //! ([`ScriptedWs`]), one that refuses every connection and reports when ([`refusing`]), an HTTP
 //! server whose answers the test scripts request by request ([`ScriptedHttp`]), and a toy
-//! market-data venue ([`toy`]). Nothing here reaches the internet. Later runtime tickets reuse and extend
+//! market-data venue ([`toy`]), and a WebSocket server whose upgrade response the test writes
+//! ([`upgrading`]). Nothing here reaches the internet. Later runtime tickets reuse and extend
 //! these only as their own done lines need.
 
 #![allow(dead_code)]
@@ -635,4 +636,54 @@ impl ScriptedHttp {
     pub fn try_request(&mut self) -> Option<Exchange> {
         self.exchanges.try_recv().ok()
     }
+}
+
+/// A WebSocket server on a 127.0.0.1 ephemeral port that answers each upgrade request by hand:
+/// `101`, `Upgrade: websocket`, the given `Connection` header value and the right
+/// `Sec-WebSocket-Accept`, with an unmasked text frame `greeting` in the same write, then echoes
+/// every text and binary message.
+pub async fn upgrading(connection: &'static str, greeting: &'static str) -> SocketAddr {
+    use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+    let (listener, addr) = listen().await;
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut seen = Vec::new();
+                while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let mut byte = [0u8; 1];
+                    stream.read_exact(&mut byte).await.unwrap();
+                    seen.push(byte[0]);
+                }
+                let head = String::from_utf8(seen).unwrap();
+                let key = head
+                    .split("\r\n")
+                    .find_map(|l| {
+                        l.split_once(':')
+                            .filter(|(k, _)| k.eq_ignore_ascii_case("sec-websocket-key"))
+                    })
+                    .map(|(_, v)| v.trim().to_owned())
+                    .unwrap();
+                let mut out = format!(
+                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                     Connection: {connection}\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+                    derive_accept_key(key.as_bytes())
+                )
+                .into_bytes();
+                out.extend_from_slice(&[0x81, greeting.len() as u8]);
+                out.extend_from_slice(greeting.as_bytes());
+                stream.write_all(&out).await.unwrap();
+                let ws =
+                    tokio_tungstenite::WebSocketStream::from_raw_socket(stream, Role::Server, None);
+                let mut ws = ws.await;
+                while let Some(Ok(message)) = ws.next().await {
+                    if message.is_text() || message.is_binary() {
+                        ws.send(message).await.unwrap();
+                    }
+                }
+            });
+        }
+    });
+    addr
 }

@@ -113,7 +113,7 @@ async fn exchange(
 const BAD_HOST: &str = "the host is not a valid Host header";
 
 /// `host[:port]` as the URL wrote it, without user information.
-fn host_header(uri: &Uri) -> Result<HeaderValue, NetError> {
+pub(crate) fn host_header(uri: &Uri) -> Result<HeaderValue, NetError> {
     let host = uri.host().unwrap_or_default();
     let value = match uri.port() {
         Some(port) => format!("{host}:{port}"),
