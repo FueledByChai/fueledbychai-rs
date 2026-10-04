@@ -14,6 +14,10 @@
 //!   `<shard>-<seq>.fbcj`. Time comes from the caller.
 //! - [`JournalReader`], which returns one shard's records in write order across segments
 //!   and days.
+//! - [`JournalSink`], what the shard journals through, which never blocks (0006): a
+//!   [`QueueSink`] feeds a bounded queue with a soft limit for Normal records and a Safety
+//!   reserve, counts what it drops by class and marks the gap with `Degraded` once space
+//!   returns; a [`WriterThread`] drains the queue into a [`JournalWriter`] ([`journal_queue`]).
 //!
 //! **Format.** Length-prefixed records after a header holding the format version, in a
 //! hand-written little-endian encoding ([`format`]). There is no serialization dependency:
@@ -38,6 +42,7 @@ mod error;
 pub mod format;
 mod reader;
 mod record;
+mod sink;
 mod writer;
 
 pub use error::JournalError;
@@ -45,5 +50,8 @@ pub use reader::JournalReader;
 pub use record::{
     BLANK, ControlEvent, HeaderRec, HttpRequestRec, HttpResponseRec, Marker, Opaque, Opcode,
     Record, SECRET_HEADERS, WriteRes, is_secret_header,
+};
+pub use sink::{
+    JournalDrain, JournalSink, QueueSink, Recorded, SinkConfig, WriterThread, journal_queue,
 };
 pub use writer::{JournalWriter, SEGMENT_EXT};

@@ -114,7 +114,7 @@ rather than guess.
   `Fee`/`FeeBook`, `DecodeScope`, `InstrumentSpec` (maker-safe `quantize`), `VenueCaps`,
   the market-data and execution events, venue commands, and the codec, signer, nonce and
   factory traits with `Effects` and `EncodeCtx`, `crates/fbc-book` with its L2 book, `crates/fbc-journal` with its record
-  format, day-grouped segment writer and in-order reader, `crates/fbc-runtime` with its first
+  format, day-grouped segment writer, in-order reader and never-blocking sink, `crates/fbc-runtime` with its first
   slices (the connector, SOCKS5 CONNECT, WebSocket and HTTP/1.1, plain or TLS, 0019 and 0020;
   connection epochs and the subscription reconciler), and
   `crates/venues/fbc-venue-paradex` with its signer (`src/sign`), SBE market data (`src/md`: bbo,
@@ -153,9 +153,12 @@ rather than guess.
     `fbc-core` only: the records the runtime writes, length-prefixed in a hand-written
     little-endian format with a version, a writer of one subdirectory per UTC day with segments
     named `<shard>-<seq>.fbcj` and time from the caller, a reader in write order, and no byte of
-    a redaction span or secret header written; still planned: keyed hashes in `src/redact*`,
-    the nonce, encode-context and cycle records, compression and the hourly roll, and the
-    never-blocking sink with its safety reserve), `crates/fbc-sim` (simulated venue and queue-position
+    a redaction span or secret header written, and a `JournalSink` that never blocks: a
+    hand-written queue of atomic words (0021) with a consumer-configured byte budget, a soft
+    limit for Normal records and a Safety reserve, drops counted by class, a `Degraded` marker
+    once space returns, and a writer thread draining it; still planned: keyed hashes in
+    `src/redact*`, the nonce, encode-context and cycle records, and compression and the hourly
+    roll), `crates/fbc-sim` (simulated venue and queue-position
     fill-model code, never calibrations), `crates/fbc-conformance` (adapter conformance kit and
     stub venue server).
   - `crates/venues/fbc-venues` (the registry, the only crate that sees concrete venues),

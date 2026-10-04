@@ -15,6 +15,8 @@ pub enum JournalError {
     /// A record the format cannot hold as it is (`what` says why), such as a text frame that
     /// is not UTF-8.
     Unencodable(&'static str),
+    /// A [`SinkConfig`](crate::SinkConfig) the journal queue cannot use (`what` says why).
+    Config(&'static str),
     /// A segment does not start with the journal's magic bytes.
     BadMagic { segment: PathBuf },
     /// A segment is in a format version this reader does not know.
@@ -41,6 +43,9 @@ impl fmt::Display for JournalError {
             JournalError::TooLarge => f.write_str("a journal record is too large for its format"),
             JournalError::Unencodable(what) => {
                 write!(f, "a journal record cannot be written: {what}")
+            }
+            JournalError::Config(what) => {
+                write!(f, "a journal sink cannot use its configuration: {what}")
             }
             JournalError::BadMagic { segment } => {
                 write!(f, "{} is not a journal segment", segment.display())

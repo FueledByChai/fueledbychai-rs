@@ -1,6 +1,6 @@
 [package]
 name = "fbc-journal"
-description = "The journal of everything that crosses the shard boundary: its record format, a day-grouped segment writer and an in-order reader."
+description = "The journal of everything that crosses the shard boundary: its record format, a day-grouped segment writer, an in-order reader and a sink that never blocks."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
