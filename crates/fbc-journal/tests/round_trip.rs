@@ -48,6 +48,17 @@ fn conn(epoch: u32) -> ConnKey {
     ConnKey { conn: 3, epoch }
 }
 
+/// The stamp of a result or timer firing after midnight: ingest sequence and mono time.
+fn after(ingest_seq: u64, mono: u64) -> Stamp {
+    Stamp {
+        ingest_seq,
+        kernel_rx: None,
+        recv_mono: MonoNs(mono),
+        recv_wall: WallNs(AFTER_MIDNIGHT.0 + mono as i64),
+        conn: conn(1),
+    }
+}
+
 struct Session {
     /// (wall time of the append, record), in write order.
     records: Vec<(WallNs, Record)>,
@@ -243,8 +254,7 @@ fn session() -> Session {
     records.push((
         AFTER_MIDNIGHT,
         Record::HttpResult {
-            at: MonoNs(21),
-            conn: conn(1),
+            stamp: after(3, 21),
             tag: HttpTag(9),
             result: Ok(HttpResponseRec::from(&resp)),
         },
@@ -252,8 +262,7 @@ fn session() -> Session {
     records.push((
         AFTER_MIDNIGHT,
         Record::HttpResult {
-            at: MonoNs(22),
-            conn: conn(1),
+            stamp: after(4, 22),
             tag: HttpTag(10),
             result: Err(HttpFailure::TimedOut),
         },
@@ -280,8 +289,7 @@ fn session() -> Session {
     records.push((
         AFTER_MIDNIGHT,
         Record::Timer {
-            fired: MonoNs(30),
-            conn: conn(1),
+            stamp: after(5, 30),
             tag: TimerTag(2),
         },
     ));

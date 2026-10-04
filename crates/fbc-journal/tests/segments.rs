@@ -3,8 +3,9 @@
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use fbc_core::{ConnKey, MonoNs, TimerTag, WallNs};
+use fbc_core::{ConnKey, MonoNs, Stamp, TimerTag, WallNs};
 use fbc_journal::format::{MAGIC, VERSION};
 use fbc_journal::{JournalError, JournalReader, JournalWriter, Marker, Record};
 
@@ -21,8 +22,13 @@ fn fresh_dir(name: &str) -> PathBuf {
 
 fn timer(n: u64) -> Record {
     Record::Timer {
-        fired: MonoNs(n),
-        conn: ConnKey { conn: 1, epoch: 1 },
+        stamp: Stamp {
+            ingest_seq: n,
+            kernel_rx: None,
+            recv_mono: MonoNs(n),
+            recv_wall: WallNs(DAY1.0 + n as i64),
+            conn: ConnKey { conn: 1, epoch: 1 },
+        },
         tag: TimerTag(n),
     }
 }
@@ -130,6 +136,27 @@ fn the_reader_passes_over_other_shards_and_files_that_are_not_segments() {
 }
 
 #[test]
+fn a_directory_named_like_no_real_date_is_not_a_day() {
+    // Codex r4176409194: a shard-shaped segment under an impossible date must neither hold the
+    // writer at that "day" nor be read.
+    let root = fresh_dir("not_a_day");
+    for name in ["99999999", "20260230", "22620412"] {
+        fs::create_dir_all(root.join(name)).unwrap();
+        fs::write(
+            root.join(name).join("1-000000.fbcj"),
+            segment_bytes(&[timer(9)]),
+        )
+        .unwrap();
+    }
+    let mut w = JournalWriter::create(&root, 1).unwrap();
+    w.append(DAY1, &timer(1)).unwrap();
+    drop(w);
+    assert_eq!(names(&root.join("20261003")), ["1-000000.fbcj"]);
+    let read: Vec<Record> = read_all(&root, 1).into_iter().map(Result::unwrap).collect();
+    assert_eq!(read, [timer(1)]);
+}
+
+#[test]
 fn a_directory_that_cannot_be_made_is_an_io_error() {
     let root = fresh_dir("blocked");
     fs::create_dir_all(&root).unwrap();
@@ -167,7 +194,12 @@ fn damaged(name: &str, segments: &[(&str, Vec<u8>)]) -> PathBuf {
 
 /// A good segment holding `records`.
 fn segment_bytes(records: &[Record]) -> Vec<u8> {
-    let root = fresh_dir("scratch-segment");
+    // Tests run in parallel: each call gets its own scratch directory.
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let root = fresh_dir(&format!(
+        "scratch-segment-{}",
+        CALLS.fetch_add(1, Ordering::Relaxed)
+    ));
     let mut w = JournalWriter::create(&root, 1).unwrap();
     for r in records {
         w.append(DAY1, r).unwrap();
@@ -253,11 +285,16 @@ fn each_damaged_segment_is_reported_once_and_reading_goes_on() {
 }
 
 #[test]
-fn a_record_too_large_for_the_format_says_so() {
+fn a_record_the_format_cannot_hold_says_why() {
     let e = JournalError::TooLarge;
     assert_eq!(
         e.to_string(),
         "a journal record is too large for its format"
     );
     assert!(e.source().is_none());
+    let e = JournalError::Unencodable("a text frame that is not UTF-8");
+    assert_eq!(
+        e.to_string(),
+        "a journal record cannot be written: a text frame that is not UTF-8"
+    );
 }
