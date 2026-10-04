@@ -1,0 +1,15 @@
+# A standalone workspace of its own (fixtures/ is excluded from the main one): the
+# dependency-direction check's self-test fixture (README.md beside this file). It mirrors the
+# main workspace's layout, since the check tells a venue crate by its path under crates/venues/.
+# The root package is here only because every manifest in the repository is a package that says
+# publish = false (crates/fbc-core/tests/manifests.rs); it has no dependencies.
+[package]
+name = "dep-direction-root"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace]
+resolver = "3"
+members = ["crates/fbc-*", "crates/venues/fbc-*"]

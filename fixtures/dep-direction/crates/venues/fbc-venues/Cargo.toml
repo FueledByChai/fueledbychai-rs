@@ -1,0 +1,11 @@
+[package]
+name = "fbc-venues"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# Allowed: the registry is the one crate that sees concrete venues.
+[dependencies]
+fbc-venue-a = { path = "../fbc-venue-a" }
+fbc-venue-b = { path = "../fbc-venue-b" }

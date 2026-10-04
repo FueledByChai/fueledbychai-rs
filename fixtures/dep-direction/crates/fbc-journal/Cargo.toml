@@ -1,0 +1,10 @@
+[package]
+name = "fbc-journal"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# Allowed: a dev-dependency on a venue crate is not checked.
+[dev-dependencies]
+fbc-venue-a = { path = "../venues/fbc-venue-a" }
