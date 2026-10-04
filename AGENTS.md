@@ -115,7 +115,7 @@ rather than guess.
   the market-data and execution events, venue commands, and the codec, signer, nonce and
   factory traits with `Effects` and `EncodeCtx`, `crates/fbc-book` with its L2 book, `crates/fbc-journal` with its record
   format, day-grouped segment writer and in-order reader, `crates/fbc-runtime` with its first
-  slice (the connector, SOCKS5 CONNECT, `ws://` and HTTP/1.1; 0019), and
+  slice (the connector, SOCKS5 CONNECT, WebSocket and HTTP/1.1, plain or TLS; 0019, 0020), and
   `crates/venues/fbc-venue-paradex` with only its signer (`src/sign`); the rest are planned. Members are the `crates/fbc-*` and
   `crates/venues/fbc-*` globs, and `fixtures/` is excluded from the workspace:
   - `crates/fbc-core`: the contract. Time, units, price grids and exact prices, sealed ids and
@@ -131,10 +131,14 @@ rather than guess.
     reconnects and connection epochs, subscription reconciliation, rate limits with a safety
     floor, kernel receive timestamps, the shard host (0002). So far `ProxyConfig` (`Direct` or
     `Socks5 { host, port }`, no credentials), `Connector` (every TCP connection, directly or
-    through a hand-written SOCKS5 CONNECT that sends the target's host name), a `ws://` client
-    and an `http://` HTTP/1.1 call over it, and `NetError` naming the failed step; its network
-    dependencies are pinned exactly (0019). `tests/common/` holds the SOCKS5 stub, WebSocket
-    server and HTTP server on 127.0.0.1 ephemeral ports that later runtime tests reuse.
+    through a hand-written SOCKS5 CONNECT that sends the target's host name), TLS on that stream
+    (rustls with the ring provider, webpki-roots plus `Connector::add_trust_anchor`, hostname
+    verification always on; 0020), a WebSocket client (`ws://`, `wss://`) and an HTTP/1.1 call
+    (`http://`, `https://`) over it, and `NetError` naming the failed step; its network
+    dependencies are pinned exactly (0019, 0020). `tests/common/` holds the SOCKS5 stub,
+    WebSocket server and HTTP server on 127.0.0.1 ephemeral ports, each server plain or behind
+    TLS with a certificate from a CA the test generates in memory, that later runtime tests
+    reuse.
   - `crates/fbc-book` (it depends on `fbc-core` only: one tick-indexed L2 book per
     instrument and `BookId`, built from book events the same live and in replay, with
     snapshots, deltas, windows and gap invalidation, touch, top-n, an exact top-n comparison

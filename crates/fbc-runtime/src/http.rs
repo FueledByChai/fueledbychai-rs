@@ -1,4 +1,4 @@
-//! The HTTP/1.1 call (`http://`), on the one connector.
+//! The HTTP/1.1 call (`http://`, and `https://` over TLS), on the one connector.
 
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::client::conn::http1;
@@ -13,8 +13,8 @@ use crate::error::{Cause, NetError, Step};
 use crate::target;
 
 impl Connector {
-    /// Sends `request`, whose URI is an absolute `http://` URL, on a new connection through
-    /// this connector, and reads the whole response, failing once its body passes `max_body`
+    /// Sends `request`, whose URI is an absolute `http://` or `https://` URL, on a new
+    /// connection through this connector, and reads the whole response, failing once its body passes `max_body`
     /// bytes (the caller's limit, so a large or unending body cannot exhaust memory). The
     /// request goes in origin form (path and query) with a Host header from the URL unless the
     /// caller set one; user information in the URL is never sent.
@@ -24,7 +24,7 @@ impl Connector {
         max_body: usize,
     ) -> Result<Response<Bytes>, NetError> {
         let (mut parts, body) = request.into_parts();
-        let to = target::target(&parts.uri, "http")?;
+        let to = target::target(&parts.uri, "http", "https")?;
         if !parts.headers.contains_key(HOST) {
             parts.headers.insert(HOST, host_header(&parts.uri)?);
         }
@@ -32,7 +32,7 @@ impl Connector {
         parts.uri = target::parse(path)?;
         let request = Request::from_parts(parts, Full::new(body));
 
-        let stream = self.connect(&to.host, to.port).await?;
+        let stream = self.open(&to).await?;
         let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
             .await
             .map_err(http_error)?;

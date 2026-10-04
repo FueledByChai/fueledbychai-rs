@@ -1,10 +1,13 @@
 //! Local servers the runtime's integration tests run against, each on a 127.0.0.1 ephemeral
 //! port: a SOCKS5 stub that records every CONNECT target and resolves host names from its own
 //! table, a WebSocket echo server, and an HTTP/1.1 server that answers with the request line it
-//! saw. Nothing here reaches the internet. Later runtime tickets reuse and extend these only as
-//! their own done lines need.
+//! saw, each of the two servers plain or behind TLS with a certificate from a CA the test
+//! generates ([`tls`]). Nothing here reaches the internet. Later runtime tickets reuse and extend
+//! these only as their own done lines need.
 
 #![allow(dead_code)]
+
+pub mod tls;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -12,8 +15,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+use tls::TlsServer;
 
 const LOCAL: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
@@ -154,6 +159,15 @@ pub struct WsServer {
 
 impl WsServer {
     pub async fn start() -> Self {
+        Self::run(None).await
+    }
+
+    /// The same server behind TLS (`wss://`).
+    pub async fn start_tls(tls: TlsServer) -> Self {
+        Self::run(Some(tls)).await
+    }
+
+    async fn run(tls: Option<TlsServer>) -> Self {
         let (listener, addr) = listen().await;
         let connections = Arc::new(AtomicUsize::new(0));
         let count = connections.clone();
@@ -161,11 +175,14 @@ impl WsServer {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
                 count.fetch_add(1, Ordering::SeqCst);
+                let tls = tls.clone();
                 tokio::spawn(async move {
-                    let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-                    while let Some(Ok(message)) = ws.next().await {
-                        if message.is_text() || message.is_binary() {
-                            ws.send(message).await.unwrap();
+                    match tls {
+                        None => serve_ws(stream).await,
+                        Some(tls) => {
+                            if let Some(stream) = tls.accept(stream).await {
+                                serve_ws(stream).await;
+                            }
                         }
                     }
                 });
@@ -176,6 +193,15 @@ impl WsServer {
 
     pub fn connections(&self) -> usize {
         self.connections.load(Ordering::SeqCst)
+    }
+}
+
+async fn serve_ws<S: AsyncRead + AsyncWrite + Unpin>(stream: S) {
+    let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+    while let Some(Ok(message)) = ws.next().await {
+        if message.is_text() || message.is_binary() {
+            ws.send(message).await.unwrap();
+        }
     }
 }
 
@@ -199,14 +225,19 @@ pub struct HttpServer {
 
 impl HttpServer {
     pub async fn start() -> Self {
-        Self::run(true).await
+        Self::run(true, None).await
+    }
+
+    /// The same server behind TLS (`https://`).
+    pub async fn start_tls(tls: TlsServer) -> Self {
+        Self::run(true, Some(tls)).await
     }
 
     pub async fn silent() -> Self {
-        Self::run(false).await
+        Self::run(false, None).await
     }
 
-    async fn run(answers: bool) -> Self {
+    async fn run(answers: bool, tls: Option<TlsServer>) -> Self {
         let (listener, addr) = listen().await;
         let connections = Arc::new(AtomicUsize::new(0));
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -215,9 +246,20 @@ impl HttpServer {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
                 count.fetch_add(1, Ordering::SeqCst);
-                if answers {
-                    tokio::spawn(serve_http(stream, log.clone()));
+                if !answers {
+                    continue;
                 }
+                let (log, tls) = (log.clone(), tls.clone());
+                tokio::spawn(async move {
+                    match tls {
+                        None => serve_http(stream, log).await,
+                        Some(tls) => {
+                            if let Some(stream) = tls.accept(stream).await {
+                                serve_http(stream, log).await;
+                            }
+                        }
+                    }
+                });
             }
         });
         HttpServer {
@@ -236,7 +278,10 @@ impl HttpServer {
     }
 }
 
-async fn serve_http(mut stream: TcpStream, log: Arc<Mutex<Vec<SeenRequest>>>) {
+async fn serve_http<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    log: Arc<Mutex<Vec<SeenRequest>>>,
+) {
     let mut seen = Vec::new();
     let head_end = loop {
         let mut chunk = [0u8; 1024];
