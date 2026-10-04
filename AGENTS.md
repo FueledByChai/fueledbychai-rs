@@ -201,7 +201,9 @@ rather than guess.
     (0016).
   - Dependency direction (design §3): `fbc-core`, `fbc-book`, `fbc-oms`, `fbc-journal` and
     `fbc-sim` never depend on a venue crate; a venue crate depends on `fbc-core` and protocol
-    crates only. Nothing here depends on the private consumer.
+    crates only. Nothing here depends on the private consumer. `scripts/check-deps.sh` holds
+    every crate outside `crates/venues/` (`fbc-runtime` and `fbc-conformance` included) to the
+    first rule, in normal and build dependencies (not dev-dependencies, which venue tests use).
 - Tests: unit tests beside the code (`#[cfg(test)]`), integration and property tests in
   `crates/<crate>/tests/`, `trybuild` compile-fail tests for the seals in `fbc-core`'s tests.
 - Fixtures in `fixtures/<venue>/`: recorded frames, journals and signing vectors. Synthetic
@@ -215,7 +217,9 @@ rather than guess.
   in Paradex's documented shape. `fixtures/binance-usdm/` holds hand-written frames (`md/`) and REST
   responses (`rest/`) in Binance's documented shapes, its README citing the pages.
   `fixtures/licence-gate/` is a standalone two-crate workspace the licence gate's self-test
-  runs against (0017). `fixtures/journal/` holds journals `fbc-journal` wrote in an older
+  runs against (0017); `fixtures/dep-direction/` a standalone workspace of empty crates in this
+  layout, with three forbidden edges, that the dependency-direction check's self-test runs
+  against. `fixtures/journal/` holds journals `fbc-journal` wrote in an older
   format version, from synthetic records, which later readers must still read; its README says
   how each was written.
 - Docs: `docs/decisions/` (records, index in its `README.md`; cite by number, never restate one
@@ -256,7 +260,13 @@ token, API key, authorization header or private key fails; 0009), then the licen
 (`scripts/licence-check.sh --self-test`, which proves the gate refuses the GPL-3.0-only path
 crates in `fixtures/licence-gate`, a normal and a dev-only dependency, and names them, then
 `cargo deny check licenses` on the workspace, dev-dependencies included, against `deny.toml`'s
-permissive allowlist; 0017), then the coverage
+permissive allowlist; 0017), then the dependency-direction check
+(`scripts/check-deps.sh --self-test`, which proves the check fails naming each forbidden edge
+in the `fixtures/dep-direction` workspace and refuses a workspace with no venue crate, then
+`scripts/check-deps.sh` on the workspace: from `cargo metadata`, no crate outside
+`crates/venues/` has a normal or build dependency on a venue crate, and a concrete venue crate
+depends on no workspace crate but `fbc-core`; dev-dependencies are not checked; design §3),
+then the coverage
 ratchet (`scripts/coverage.sh`, workspace line coverage from cargo-llvm-cov, against
 `coverage-floor.txt` with 0.2 points of slack; the workspace ticket records the first floor
 with `scripts/coverage-ratchet.sh --set`). `scripts/check.sh --fast` skips the ratchet. On the
@@ -267,10 +277,9 @@ same version itself, and moving it is a ticket, like the toolchain. cargo-deny i
 same way on every machine that runs the check, fast or full (0017): install it once by hand
 with `cargo install cargo-deny --version 0.20.2 --locked`; CI installs the same version, the
 licence step fails naming the install command when it is missing or another version, and
-moving it is a ticket. Planned steps still marked TODO in the script: the dependency-direction
-check (with the first venue crate) and the golden-refresh flag. The golden-refresh TODO stays
-open now that `fbc-journal` exists: exact-replay goldens compare outbound bytes, which need the
-exec path (BT-402).
+moving it is a ticket. The one planned step still marked TODO in the script is the
+golden-refresh flag. It stays open now that `fbc-journal` exists: exact-replay goldens compare
+outbound bytes, which need the exec path (BT-402).
 
 ### Rules
 

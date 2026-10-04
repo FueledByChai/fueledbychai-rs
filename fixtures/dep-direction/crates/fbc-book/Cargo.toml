@@ -1,0 +1,11 @@
+[package]
+name = "fbc-book"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# Forbidden: a build-dependency is held to the same rule as a normal one; the registry
+# fbc-venues is a venue crate too.
+[build-dependencies]
+fbc-venues = { path = "../venues/fbc-venues" }

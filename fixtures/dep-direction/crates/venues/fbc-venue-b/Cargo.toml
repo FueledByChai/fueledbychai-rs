@@ -1,0 +1,12 @@
+[package]
+name = "fbc-venue-b"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+# Allowed: fbc-core.
+fbc-core = { path = "../../fbc-core" }
+# Forbidden: a venue crate depends on fbc-core and protocol crates only, not on another venue.
+fbc-venue-a = { path = "../fbc-venue-a" }

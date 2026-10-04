@@ -1,0 +1,10 @@
+[package]
+name = "fbc-core"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# Forbidden: a crate outside crates/venues/ depends on a venue crate. The rename must not hide it.
+[dependencies]
+venue = { package = "fbc-venue-a", path = "../venues/fbc-venue-a" }

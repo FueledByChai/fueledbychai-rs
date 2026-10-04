@@ -49,9 +49,13 @@ if [ -f Cargo.toml ]; then
   step "licence gate"
   scripts/licence-check.sh --self-test
   scripts/licence-check.sh
-  # TODO: dependency rules (design §3): fbc-core, fbc-book, fbc-oms, fbc-journal and fbc-sim
-  # never depend on a venue crate; only crates/venues/fbc-venues sees concrete venues. Waits on:
-  # the first venue crate (scripts/check-deps.sh reading `cargo metadata` lands with it).
+  # Dependency direction (design §3): no crate outside crates/venues/ depends on a venue crate,
+  # and a concrete venue crate depends on fbc-core (and protocol crates) only, so only
+  # crates/venues/fbc-venues sees concrete venues; dev-dependencies are not checked. The
+  # self-test proves the check fails naming each forbidden edge in fixtures/dep-direction.
+  step "dependency direction"
+  scripts/check-deps.sh --self-test
+  scripts/check-deps.sh
   # TODO: exact-replay and signing goldens run as cargo tests; a refresh flag is needed only if
   # a golden must be regenerated. Waits on: the exec path (BT-402), since exact-replay goldens
   # compare outbound bytes; fbc-journal exists (0006), but nothing yet replays exec traffic.

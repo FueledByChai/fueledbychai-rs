@@ -1,0 +1,10 @@
+[package]
+name = "fbc-venue-a"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# Allowed: a venue crate dev-depends on core crates (its tests use the conformance kit).
+[dev-dependencies]
+fbc-journal = { path = "../../fbc-journal" }
