@@ -22,8 +22,9 @@ passes before anything was written, and how a changed plan reaches running conne
   `SpecTable`, inside the venue's decode scope, and the effects it asks for are executed; once
   the stream has moved to a newer epoch it is dropped and counted (`Input::Http`), so a
   snapshot asked for before a reconnect never anchors the new epoch's book. Requests keep
-  going while a frame's write waits on the peer; a result that comes back meanwhile waits for
-  the codec until the write is done (Codex r4177481297). Requests still in flight when a
+  going while a frame's write waits on the peer; a result that comes back meanwhile is
+  stamped as it comes, so it keeps its place in the shard's ingest order, and waits for the
+  codec until the write is done (Codex r4177481297, r4177547758). Requests still in flight when a
   session stops are dropped.
 - **Classification.** The request's mandatory `timeout` runs from when the codec asked for it
   and bounds the whole call; a timeout past the end of the clock bounds nothing, so the
@@ -40,7 +41,9 @@ passes before anything was written, and how a changed plan reaches running conne
   returns a refusal (`UnknownInstrument`, `UnsupportedFeed`, configuration), a stream named
   twice, or a socket URL no attempt could open as a `PlanError`; nothing opens or closes for a
   refused plan and the last accepted plan stands. Dropping the control stops the venue; a plan
-  published just before the drop is not applied (Codex r4177481301). `MdVenue::run` applies the latest accepted
+  published just before the drop is not applied, the venue sees the drop before it polls any
+  session again, and a session sees its own control's drop before it starts an attempt that
+  fell due at the same time (Codex r4177481301, r4177547754). `MdVenue::run` applies the latest accepted
   plan by `StreamId`: an endpoint planned again with the same transport keeps its connection
   and its reconciler sends the difference; a new endpoint, or one whose transport changed,
   opens a fresh session under the next connection number of the consumer's range for the

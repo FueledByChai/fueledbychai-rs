@@ -180,7 +180,10 @@ impl<H: MdHandler + 'static> MdVenue<H> {
 
     async fn drive(&mut self) -> Result<(), SessionError> {
         loop {
+            // The control first: once it has dropped, no session is polled again before the
+            // venue stops, even one a plan applied just before the drop started.
             tokio::select! {
+                biased;
                 changed = self.plan.changed() => match changed {
                     // A plan published just before the control dropped is not applied: the
                     // drop stops the venue rather than opening anything.

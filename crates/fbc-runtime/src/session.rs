@@ -218,8 +218,9 @@ pub struct MdSession<H> {
     timer_seq: u64,
     /// HTTP requests in flight, each with the epoch that asked.
     http: FuturesUnordered<Pending>,
-    /// HTTP results that came back while a write waited, in order, for the codec after it.
-    answered: VecDeque<Answered>,
+    /// HTTP results that came back while a write waited, stamped as they came, in order, for
+    /// the codec after it.
+    answered: VecDeque<(Stamp, Answered)>,
     http_max_body: usize,
     counters: MdCounters,
     handler: H,
@@ -241,12 +242,12 @@ enum End {
     Dropped,
 }
 
-/// What woke a disconnected session: the pacer, a timer, an ended epoch's HTTP result, or the
-/// control (false: dropped).
+/// What woke a disconnected session: the pacer, a timer, an ended epoch's HTTP result (already
+/// dropped and counted), or the control (false: dropped).
 enum Idle {
     Attempt,
     Timer,
-    Http(Answered),
+    Http,
     Desired(bool),
 }
 
@@ -254,7 +255,7 @@ enum Idle {
 enum Wake {
     Frame(Option<Result<Message, tokio_tungstenite::tungstenite::Error>>),
     Timer,
-    Http(Answered),
+    Http((Stamp, Answered)),
     Desired(bool),
 }
 
@@ -341,11 +342,19 @@ impl<H: MdHandler> MdSession<H> {
         loop {
             let at = self.pacer.next_attempt(Instant::now());
             loop {
+                // The control first: once it has dropped, no attempt starts, even one that fell
+                // due at the same time.
+                let timer = self.next_deadline();
                 let idle = tokio::select! {
-                    _ = sleep_or_never(at) => Idle::Attempt,
-                    _ = sleep_or_never(self.next_deadline()) => Idle::Timer,
-                    Some(done) = self.http.next() => Idle::Http(done),
+                    biased;
                     r = self.desired.changed() => Idle::Desired(r.is_ok()),
+                    _ = sleep_or_never(at) => Idle::Attempt,
+                    _ = sleep_or_never(timer) => Idle::Timer,
+                    Some(done) = self.http.next() => {
+                        let done = self.stamp_http(done);
+                        let _ = self.admit_http(done)?;
+                        Idle::Http
+                    }
                 };
                 match idle {
                     Idle::Attempt => break,
@@ -354,9 +363,7 @@ impl<H: MdHandler> MdSession<H> {
                     Idle::Timer => {
                         let _ = self.take_timer()?;
                     }
-                    Idle::Http(done) => {
-                        let _ = self.take_http(done)?;
-                    }
+                    Idle::Http => {}
                     Idle::Desired(false) => return Ok(()),
                     Idle::Desired(true) => {
                         let subs = self.desired.borrow_and_update().clone();
@@ -381,7 +388,8 @@ impl<H: MdHandler> MdSession<H> {
                             let _ = self.take_timer()?;
                         }
                         Some(done) = self.http.next() => {
-                            let _ = self.take_http(done)?;
+                            let done = self.stamp_http(done);
+                            let _ = self.admit_http(done)?;
                         }
                         r = self.desired.changed() => match r {
                             Ok(()) => {
@@ -408,7 +416,7 @@ impl<H: MdHandler> MdSession<H> {
             self.rec.begin_epoch(key)?;
             // Results that came back during the ended epoch's last write come back into nothing.
             while let Some(done) = self.answered.pop_front() {
-                let _ = self.take_http(done)?;
+                let _ = self.admit_http(done)?;
             }
         }
     }
@@ -437,7 +445,7 @@ impl<H: MdHandler> MdSession<H> {
                 None => tokio::select! {
                     frame = next_frame(&mut ws) => Wake::Frame(frame),
                     _ = sleep_or_never(self.next_deadline()) => Wake::Timer,
-                    Some(done) = self.http.next() => Wake::Http(done),
+                    Some(done) = self.http.next() => Wake::Http(self.stamp_http(done)),
                     r = self.desired.changed() => Wake::Desired(r.is_ok()),
                 },
             };
@@ -449,7 +457,7 @@ impl<H: MdHandler> MdSession<H> {
                 }
                 Wake::Frame(_) => false,
                 Wake::Timer => self.fire(&mut ws, codec.as_mut()).await?,
-                Wake::Http(done) => match self.take_http(done)? {
+                Wake::Http(done) => match self.admit_http(done)? {
                     Some((stamp, done)) => {
                         let mut fx = Effects::new();
                         self.answer(codec.as_mut(), stamp, done, &mut fx);
@@ -612,7 +620,10 @@ impl<H: MdHandler> MdSession<H> {
                             biased;
                             sent = &mut send => break sent.is_ok(),
                             _ = self.stop.changed() => break false,
-                            Some(done) = self.http.next() => self.answered.push_back(done),
+                            Some(done) = self.http.next() => {
+                                let done = self.stamp_http(done);
+                                self.answered.push_back(done);
+                            }
                         }
                     };
                 }
@@ -653,16 +664,23 @@ impl<H: MdHandler> MdSession<H> {
         }));
     }
 
-    /// Stamps an HTTP result under the epoch that asked for it, so it takes its place in ingest
-    /// order even when dropped; it and its stamp when that epoch is current, `None` when it
-    /// ended (dropped and counted).
-    fn take_http(&mut self, done: Answered) -> Result<Option<(Stamp, Answered)>, SessionError> {
+    /// Stamps an HTTP result as it comes back, under the epoch that asked for it, so it takes
+    /// its place in the shard's ingest order even when it waits for a write or is dropped.
+    fn stamp_http(&self, done: Answered) -> (Stamp, Answered) {
         let key = ConnKey {
             epoch: done.epoch,
             ..self.current()
         };
-        let stamp = self.clock.stamp(key);
-        let current = self.epochs.admit(Input::Http, key)? == Admit::Current;
+        (self.clock.stamp(key), done)
+    }
+
+    /// A stamped HTTP result, when the epoch that asked is current; `None` when it ended
+    /// (dropped and counted).
+    fn admit_http(
+        &mut self,
+        (stamp, done): (Stamp, Answered),
+    ) -> Result<Option<(Stamp, Answered)>, SessionError> {
+        let current = self.epochs.admit(Input::Http, stamp.conn)? == Admit::Current;
         Ok(current.then_some((stamp, done)))
     }
 
