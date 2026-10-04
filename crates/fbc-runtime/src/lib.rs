@@ -33,15 +33,22 @@
 //!   is never sent twice, a new epoch subscribes the desired set once, and one that could not
 //!   be sent stays pending until it is.
 //!
-//! Not here yet: the sessions that drive codecs, effects and reconnects over these, client
-//! certificates and certificate pinning. No call here has a deadline of its own; the caller
+//! [`MdSession`] drives one market-data socket of a venue's plan over these (FBC-ku8): a fresh
+//! codec per epoch, events stamped into envelopes and handed to the consumer's [`MdHandler`] in
+//! ingest order, the codec's effects executed, and reconnects paced by the consumer's
+//! [`ReconnectPacing`] (decision 0023).
+//!
+//! Not here yet: order-entry sessions, HTTP effects, keepalives, client certificates and
+//! certificate pinning. No call here has a deadline of its own; the caller
 //! bounds one with its own timer.
 
 mod connector;
 mod epoch;
 mod error;
 pub mod http;
+mod pacing;
 mod reconcile;
+mod session;
 mod socks5;
 mod target;
 mod tls;
@@ -51,5 +58,9 @@ pub mod ws;
 pub use connector::{Connector, ProxyConfig};
 pub use epoch::{Admit, EpochError, Epochs, Input};
 pub use error::{Cause, NetError, Step};
+pub use pacing::{PacingError, ReconnectPacing};
 pub use reconcile::{ReconcileError, Reconciler, SubscribeCall};
+pub use session::{
+    IngestClock, MdControl, MdCounters, MdHandler, MdSession, MdSessionConfig, SessionError,
+};
 pub use transport::Transport;

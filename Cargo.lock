@@ -456,6 +456,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rcgen",
+ "rust_decimal",
  "rustls",
  "tokio",
  "tokio-rustls",

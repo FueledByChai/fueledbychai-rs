@@ -2,12 +2,15 @@
 //! port: a SOCKS5 stub that records every CONNECT target and resolves host names from its own
 //! table, a WebSocket echo server, and an HTTP/1.1 server that answers with the request line it
 //! saw, each of the two servers plain or behind TLS with a certificate from a CA the test
-//! generates ([`tls`]). Nothing here reaches the internet. Later runtime tickets reuse and extend
+//! generates ([`tls`]); a WebSocket server each test scripts connection by connection
+//! ([`ScriptedWs`]), one that refuses every connection and reports when ([`refusing`]), and a toy
+//! market-data venue ([`toy`]). Nothing here reaches the internet. Later runtime tickets reuse and extend
 //! these only as their own done lines need.
 
 #![allow(dead_code)]
 
 pub mod tls;
+pub mod toy;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -17,6 +20,9 @@ use std::sync::{Arc, Mutex};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
+use tokio::time::Instant;
+use tokio_tungstenite::tungstenite::Message;
 
 use tls::TlsServer;
 
@@ -344,4 +350,128 @@ pub async fn closed_port() -> u16 {
     let (listener, addr) = listen().await;
     drop(listener);
     addr.port()
+}
+
+/// A WebSocket server whose connections the test drives one by one, each as a [`Peer`].
+pub struct ScriptedWs {
+    pub addr: SocketAddr,
+    peers: mpsc::UnboundedReceiver<Peer>,
+}
+
+/// What a [`Peer`] asks its connection to do.
+enum Out {
+    Send(Message),
+    Drop,
+}
+
+/// One accepted connection: the text frames the client sent, in order, and a way to answer.
+pub struct Peer {
+    from_client: mpsc::UnboundedReceiver<String>,
+    to_client: mpsc::UnboundedSender<Out>,
+}
+
+impl ScriptedWs {
+    pub async fn start() -> Self {
+        let (listener, addr) = listen().await;
+        let (tx, peers) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (heard, from_client) = mpsc::unbounded_channel();
+                let (to_client, mut out) = mpsc::unbounded_channel();
+                let _ = tx.send(Peer {
+                    from_client,
+                    to_client,
+                });
+                tokio::spawn(async move {
+                    let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    loop {
+                        tokio::select! {
+                            msg = ws.next() => match msg {
+                                Some(Ok(Message::Text(text))) => {
+                                    let _ = heard.send(text.as_str().to_owned());
+                                }
+                                Some(Ok(_)) => {}
+                                _ => break,
+                            },
+                            cmd = out.recv() => match cmd {
+                                Some(Out::Send(message)) => ws.send(message).await.unwrap(),
+                                _ => {
+                                    let _ = ws.close(None).await;
+                                    break;
+                                }
+                            },
+                        }
+                    }
+                });
+            }
+        });
+        ScriptedWs { addr, peers }
+    }
+
+    pub fn url(&self) -> String {
+        format!("ws://{}/md", self.addr)
+    }
+
+    /// The next connection the server accepted.
+    pub async fn accept(&mut self) -> Peer {
+        self.peers.recv().await.unwrap()
+    }
+}
+
+impl Peer {
+    /// The next text frame from the client, or `None` once the connection closed.
+    pub async fn next(&mut self) -> Option<String> {
+        self.from_client.recv().await
+    }
+
+    /// The next text frame from the client, which must come.
+    pub async fn recv(&mut self) -> String {
+        self.next().await.expect("the client closed the connection")
+    }
+
+    pub fn send(&self, text: &str) {
+        let _ = self.to_client.send(Out::Send(Message::text(text)));
+    }
+
+    pub fn send_binary(&self, bytes: &[u8]) {
+        let _ = self
+            .to_client
+            .send(Out::Send(Message::binary(bytes.to_vec())));
+    }
+
+    /// Closes the connection.
+    pub fn drop_conn(&self) {
+        let _ = self.to_client.send(Out::Drop);
+    }
+}
+
+/// A server on a 127.0.0.1 ephemeral port that accepts connections and never answers on them,
+/// reporting each accept.
+pub async fn hanging() -> (SocketAddr, mpsc::UnboundedReceiver<()>) {
+    let (listener, addr) = listen().await;
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            held.push(listener.accept().await.unwrap().0);
+            let _ = tx.send(());
+        }
+    });
+    (addr, rx)
+}
+
+/// A server on a 127.0.0.1 ephemeral port that accepts every connection and closes it at once,
+/// reporting the (tokio) instant of each accept.
+pub async fn refusing() -> (SocketAddr, mpsc::UnboundedReceiver<Instant>) {
+    let (listener, addr) = listen().await;
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = tx.send(Instant::now());
+            drop(stream);
+        }
+    });
+    (addr, rx)
 }
