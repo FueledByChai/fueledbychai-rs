@@ -321,13 +321,15 @@ impl JournalSink for QueueSink {
         make: &mut dyn FnMut() -> Record,
     ) -> Recorded {
         // An entry holding `payload` bytes needs at least this many words; one that exceeds the
-        // room its class has even before an open gap's marker is refused unbuilt. Otherwise the
-        // record is built and admitted exactly.
+        // room its class has even before an open gap's marker is refused unbuilt, and so is any
+        // record once the writer is closed (Codex r4178427389). Otherwise the record is built
+        // and admitted exactly.
         let limit = match class {
             TrafficClass::Normal => self.soft,
             TrafficClass::Safety => self.ring.words.len(),
         };
-        if fits(self.ring.used(), entry_words(payload), limit) {
+        let open = !self.ring.closed.load(SeqCst);
+        if open && fits(self.ring.used(), entry_words(payload), limit) {
             self.offer(class, now, Some(&make()))
         } else {
             self.offer(class, now, None)

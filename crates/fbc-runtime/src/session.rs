@@ -863,10 +863,15 @@ impl<H: MdHandler> MdSession<H> {
             self.credentialed.set(true);
         }
         let (at, now) = self.clock.now();
-        // Offered with its size, so a full journal refuses it before it is cloned (Codex
-        // r4178287660).
+        // Offered with its size, headers included, so a full journal refuses it before it is
+        // cloned (Codex r4178287660, r4178427394).
         if let Some(journal) = &self.journal {
-            let payload = req.url.as_str().len() + req.body.bytes().len();
+            let headers: usize = req
+                .headers
+                .iter()
+                .map(|h| h.name.len() + h.value.len())
+                .sum();
+            let payload = req.url.as_str().len() + req.body.bytes().len() + headers;
             journal.record_with(class, now, payload, || Record::HttpRequest {
                 at,
                 conn,
@@ -895,7 +900,16 @@ impl<H: MdHandler> MdSession<H> {
             ..self.current()
         };
         let stamp = self.clock.stamp(key);
-        let payload = done.result.as_ref().map_or(0, |r| r.body().len());
+        // Its body and headers, so a full journal refuses it before it is copied (Codex
+        // r4178427394).
+        let payload = done.result.as_ref().map_or(0, |r| {
+            let headers: usize = r
+                .headers()
+                .iter()
+                .map(|(n, v)| n.as_str().len() + v.len())
+                .sum();
+            r.body().len() + headers
+        });
         self.journal_input(done.class, stamp.recv_wall, payload, || {
             Record::HttpResult {
                 stamp,

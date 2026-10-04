@@ -603,3 +603,26 @@ fn a_record_offered_lazily_is_not_built_when_its_payload_cannot_fit() {
     assert_eq!(read_all(&root, 1), [timer(0), degraded, timer(4)]);
     fs::remove_dir_all(&root).unwrap();
 }
+
+/// Codex r4178427389 (FBC-f3w): once the writer is closed, a record offered lazily is refused
+/// and counted without being built, however small, so a sink a live session still holds never
+/// copies a record it is bound to drop.
+#[test]
+fn a_closed_sink_never_builds_a_record_offered_lazily() {
+    let root = fresh_dir("sink_lazy_closed");
+    let config = SinkConfig {
+        budget_bytes: 1024,
+        soft_limit_pct: 50,
+    };
+    let (mut sink, drain) = journal_queue(config, key()).unwrap();
+    let writer = drain
+        .spawn(JournalWriter::create(&root, 1, key()).unwrap())
+        .unwrap();
+    writer.close().unwrap();
+    for class in [TrafficClass::Normal, TrafficClass::Safety] {
+        let refused = sink.record_with(class, NOW, 8, &mut || panic!("built after close"));
+        assert_eq!(refused, Recorded::DroppedCounted);
+        assert_eq!(sink.dropped(class), 1);
+    }
+    fs::remove_dir_all(&root).unwrap();
+}

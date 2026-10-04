@@ -709,8 +709,10 @@ async fn inbound_frames_and_responses_are_offered_lazily_with_their_size() {
     let (run, ()) = tokio::join!(session.run(), script);
     run.unwrap();
     let sink = sink.borrow();
-    // The frame, the request it asked for (its URL; the toy's body is empty) and the response.
-    assert_eq!(sink.lazy, [get.len(), snap.len(), "say".len()]);
+    // The frame, the request it asked for (its URL; the toy's body and headers are empty) and
+    // the response: its body and every header name and value (Codex r4178427394).
+    let headers = "content-length".len() + "3".len() + "connection".len() + "close".len();
+    assert_eq!(sink.lazy, [get.len(), snap.len(), "say".len() + headers]);
     assert!(
         !sink
             .built
@@ -807,7 +809,8 @@ impl JournalSink for RequestSizes {
 }
 
 /// Codex r4178287660: an HTTP request is offered lazily too, with its URL and body size, so a
-/// full journal refuses it before it is cloned.
+/// full journal refuses it before it is cloned; its header names and values count too (Codex
+/// r4178427394).
 #[tokio::test]
 async fn http_requests_are_offered_lazily_with_their_size() {
     let (mut ws, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
@@ -816,7 +819,8 @@ async fn http_requests_are_offered_lazily_with_their_size() {
     let sizes = Rc::new(RefCell::new(RequestSizes::default()));
     session.set_journal(Journal::new(sizes.clone()));
     let url = http.url("/snap");
-    let get = format!("get|tag=1|ms=5000|url={url}");
+    let get = format!("get|tag=1|ms=5000|auth=1|url={url}");
+    let get_len = get.len();
     let script = async move {
         let mut peer = ws.accept().await;
         assert_eq!(peer.recv().await, "hello|codec=0|plan=1");
@@ -828,7 +832,8 @@ async fn http_requests_are_offered_lazily_with_their_size() {
     };
     let (run, ()) = tokio::join!(session.run(), script);
     run.unwrap();
-    // The inbound frame, the request (its URL; the toy's body is empty) and the empty result.
-    let get_len = format!("get|tag=1|ms=5000|url={url}").len();
-    assert_eq!(sizes.borrow().0, [get_len, url.len(), 0]);
+    // The inbound frame and the request: its URL and its one header (the toy's body is empty).
+    // The result is withheld unoffered, as the request carried a credential.
+    let header = "Authorization".len() + "toy-token".len();
+    assert_eq!(sizes.borrow().0, [get_len, url.len() + header]);
 }
