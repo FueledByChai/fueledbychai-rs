@@ -263,10 +263,20 @@ async fn serve_ws(
                         Frame::Text(text) => Message::text(text),
                         Frame::Binary(bytes) => Message::binary(bytes),
                     };
-                    let _ = sent.send(ws.send(message).await.is_ok());
+                    // A write waiting on a client that is not reading still ends when the
+                    // stub is dropped (Codex r4177657008).
+                    let ok = tokio::select! {
+                        r = ws.send(message) => r.is_ok(),
+                        _ = stop.changed() => break,
+                    };
+                    let _ = sent.send(ok);
                 }
                 Some(Cmd::Close(sent)) => {
-                    let _ = sent.send(ws.close(None).await.is_ok());
+                    let ok = tokio::select! {
+                        r = ws.close(None) => r.is_ok(),
+                        _ = stop.changed() => break,
+                    };
+                    let _ = sent.send(ok);
                 }
                 Some(Cmd::Silent(sent)) => {
                     let _ = sent.send(true);
