@@ -3,31 +3,39 @@
 //! subscribe requests, their acknowledgements and errors stay JSON).
 //!
 //! [`ParadexMd`] subscribes with one JSON-RPC `subscribe` text frame per channel
-//! (`bbo.{market}`, `trades.{market}`), and decodes `BboEvent` (template 2) into
-//! [`MdEvent::Touch`] and `TradeEvent` (template 1) into [`MdEvent::Trade`]. Heartbeats
+//! (`bbo.{market}`, `trades.{market}`, `order_book.{market}.{feed_type}@15@50ms`), and decodes
+//! `BboEvent` (template 2) into [`MdEvent::Touch`], `TradeEvent` (template 1) into
+//! [`MdEvent::Trade`] and `BookEvent` (template 3) into book events ([`book`]). Heartbeats
 //! (template 40) and templates it does not decode are skipped. A subscribe acknowledgement is
 //! consumed; a subscribe error is returned as the frame's error and never retried.
 
+pub mod book;
 pub mod sbe;
 
 use std::collections::BTreeMap;
 
 use fbc_core::{
-    Aggressor, DecodeError, DecodeScope, Effect, Effects, ExchNs, ExchTsKind, Feed, HttpFailure,
-    HttpResponse, HttpTag, InstrumentSpec, Keepalive, Lots, Lvl, MdCodec, MdEvent, MdSink, MonoNs,
-    OpKind, PxExact, RateCharge, RawFrame, SpecTable, StreamId, Subscription, Ticks, TimerTag,
-    TouchSourceId, TrafficClass, VenueError, VenueMeta, WallNs, WireSlice,
+    Aggressor, BookId, DecodeError, DecodeScope, Effect, Effects, ExchNs, ExchTsKind, Feed,
+    HttpFailure, HttpResponse, HttpTag, InstrumentId, InstrumentSpec, Keepalive, Lots, Lvl,
+    MdCodec, MdEvent, MdSink, MonoNs, OpKind, PxExact, RateCharge, RawFrame, SpecTable, StreamId,
+    Subscription, Ticks, TimerTag, TouchSourceId, TrafficClass, VenueError, VenueMeta, WallNs,
+    WireSlice,
 };
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde_json::{Value, json};
 
+use book::{BookFeed, decode_book};
 use sbe::{Block, Message, NULL_I64};
+
+pub use book::{DELTAS, INTERACTIVE_DELTAS};
 
 /// `TradeEvent`'s template id.
 pub const TEMPLATE_TRADE: u16 = 1;
 /// `BboEvent`'s template id.
 pub const TEMPLATE_BBO: u16 = 2;
+/// `BookEvent`'s template id.
+pub const TEMPLATE_BOOK: u16 = 3;
 /// `HeartbeatEvent`'s template id: skipped.
 pub const TEMPLATE_HEARTBEAT: u16 = 40;
 
@@ -40,15 +48,22 @@ const EXP: i8 = -8;
 /// The channel a subscription is to, as Paradex names it; refused for a feed this adapter does
 /// not decode, or an instrument missing from `specs`.
 pub fn channel(sub: Subscription, specs: &SpecTable) -> Result<String, VenueError> {
+    let unsupported = VenueError::UnsupportedFeed(sub);
     let prefix = match sub.feed {
-        Feed::Touch(BBO) => "bbo",
-        Feed::Trades => "trades",
-        _ => return Err(VenueError::UnsupportedFeed(sub)),
+        Feed::Touch(BBO) => Some("bbo"),
+        Feed::Trades => Some("trades"),
+        Feed::Book(book) if book::book_channel(book, "").is_some() => None,
+        _ => return Err(unsupported),
     };
     let spec = specs
         .get(sub.inst)
         .ok_or(VenueError::UnknownInstrument(sub.inst))?;
-    Ok(format!("{prefix}.{}", spec.venue_symbol.as_wire()))
+    let symbol = spec.venue_symbol.as_wire();
+    match (prefix, sub.feed) {
+        (Some(prefix), _) => Ok(format!("{prefix}.{symbol}")),
+        (None, Feed::Book(book)) => book::book_channel(book, symbol).ok_or(unsupported),
+        (None, _) => Err(unsupported),
+    }
 }
 
 /// What a JSON-RPC request this codec sent asked for.
@@ -65,6 +80,8 @@ pub struct ParadexMd {
     next_id: u64,
     /// Requests sent and not yet answered, by JSON-RPC id.
     pending: BTreeMap<u64, Request>,
+    /// The one book channel each market holds on this connection, and its sequence.
+    books: BTreeMap<InstrumentId, BookFeed>,
 }
 
 impl ParadexMd {
@@ -74,7 +91,34 @@ impl ParadexMd {
             stream,
             next_id: 1,
             pending: BTreeMap::new(),
+            books: BTreeMap::new(),
         }
+    }
+
+    /// The book channel each market holds once `add` and `remove` are taken: at most one per
+    /// market, since a frame names its market and not its channel. A second is refused as a
+    /// feed this connection cannot carry.
+    fn books_after(
+        &self,
+        add: &[Subscription],
+        remove: &[Subscription],
+    ) -> Result<BTreeMap<InstrumentId, BookId>, VenueError> {
+        let mut books: BTreeMap<_, _> = self.books.iter().map(|(i, f)| (*i, f.book())).collect();
+        for sub in remove {
+            if let Feed::Book(book) = sub.feed
+                && books.get(&sub.inst) == Some(&book)
+            {
+                books.remove(&sub.inst);
+            }
+        }
+        for sub in add {
+            if let Feed::Book(book) = sub.feed
+                && *books.entry(sub.inst).or_insert(book) != book
+            {
+                return Err(VenueError::UnsupportedFeed(*sub));
+            }
+        }
+        Ok(books)
     }
 
     /// Consumes a JSON-RPC text frame: an acknowledgement is consumed; an error is returned,
@@ -112,12 +156,21 @@ impl MdCodec for ParadexMd {
         specs: &SpecTable,
         fx: &mut Effects,
     ) -> Result<(), VenueError> {
-        // Every channel is spelled before the first push, so a refusal pushes nothing.
+        // Every channel is spelled, and the books checked, before the first push, so a refusal
+        // pushes nothing and changes nothing.
         let mut frames = Vec::new();
         for (request, subs) in [(Request::Subscribe, add), (Request::Unsubscribe, remove)] {
             for sub in subs {
                 frames.push((request, channel(*sub, specs)?, sub.inst));
             }
+        }
+        let books = self.books_after(add, remove)?;
+        self.books
+            .retain(|inst, feed| books.get(inst) == Some(&feed.book()));
+        for (inst, book) in books {
+            self.books
+                .entry(inst)
+                .or_insert_with(|| BookFeed::new(book));
         }
         for (request, channel, inst) in frames {
             let (id, method) = (self.next_id, request_method(request));
@@ -146,7 +199,7 @@ impl MdCodec for ParadexMd {
         _scope: &DecodeScope<'_>,
         specs: &SpecTable,
         sink: &mut dyn MdSink,
-        _fx: &mut Effects,
+        fx: &mut Effects,
     ) -> Result<(), DecodeError> {
         let frame = match f {
             RawFrame::Text(text) => return self.on_text(text),
@@ -156,6 +209,15 @@ impl MdCodec for ParadexMd {
         let (meta, event) = match msg.header().template_id {
             TEMPLATE_BBO => decode_bbo(&msg, specs)?,
             TEMPLATE_TRADE => decode_trade(&msg, specs)?,
+            TEMPLATE_BOOK => {
+                let frame = decode_book(&msg, specs)?;
+                // A market with no book on this connection (unsubscribed, the frame in flight)
+                // has nothing to apply it to.
+                if let Some(feed) = self.books.get_mut(&frame.inst()) {
+                    feed.apply(frame, self.stream, sink, fx);
+                }
+                return Ok(());
+            }
             // Heartbeats, and every template this adapter does not decode, are skipped: the
             // schema's versioning policy says unknown template ids must be.
             _ => return Ok(()),
@@ -205,7 +267,7 @@ fn request_method(request: Request) -> &'static str {
 /// `BboEvent`: ts@0, seq@8, bidPrice@16, bidSize@24, askPrice@32, askSize@40, then `market`.
 fn decode_bbo(msg: &Message<'_>, specs: &SpecTable) -> Result<(VenueMeta, MdEvent), DecodeError> {
     let block = msg.block();
-    let spec = market(msg, specs)?;
+    let spec = frame_market(msg, specs)?;
     let bid = level(spec, &block, 16, "bbo bid")?;
     let ask = level(spec, &block, 32, "bbo ask")?;
     let meta = VenueMeta {
@@ -227,7 +289,7 @@ fn decode_bbo(msg: &Message<'_>, specs: &SpecTable) -> Result<(VenueMeta, MdEven
 /// Paradex's 28-digit trade id.
 fn decode_trade(msg: &Message<'_>, specs: &SpecTable) -> Result<(VenueMeta, MdEvent), DecodeError> {
     let block = msg.block();
-    let spec = market(msg, specs)?;
+    let spec = frame_market(msg, specs)?;
     let aggressor = match block.u8_at(24) {
         Some(1) => Aggressor::Buyer,
         Some(2) => Aggressor::Seller,
@@ -253,10 +315,17 @@ fn decode_trade(msg: &Message<'_>, specs: &SpecTable) -> Result<(VenueMeta, MdEv
     Ok((meta, event))
 }
 
-/// The spec of the frame's `market`, the first variable-length field of both messages.
-fn market<'s>(msg: &Message<'_>, specs: &'s SpecTable) -> Result<&'s InstrumentSpec, DecodeError> {
+/// The spec of a bbo or trade frame's `market`, the first variable-length field of both.
+fn frame_market<'s>(
+    msg: &Message<'_>,
+    specs: &'s SpecTable,
+) -> Result<&'s InstrumentSpec, DecodeError> {
     let symbol = msg.tail().var_str()?;
-    let symbol = symbol.ok_or(DecodeError::Malformed("SBE market"))?;
+    market(symbol.ok_or(DecodeError::Malformed("SBE market"))?, specs)
+}
+
+/// The spec of the market spelled `symbol`.
+fn market<'s>(symbol: &str, specs: &'s SpecTable) -> Result<&'s InstrumentSpec, DecodeError> {
     specs
         .by_symbol(symbol)
         .ok_or(DecodeError::UnknownInstrument)

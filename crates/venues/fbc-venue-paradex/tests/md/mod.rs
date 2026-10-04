@@ -32,6 +32,14 @@ pub fn frame(name: &str) -> Vec<u8> {
         .collect()
 }
 
+/// The bytes of binary fixture `name`, as captured.
+pub fn raw(name: &str) -> Vec<u8> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../fixtures/paradex/md")
+        .join(name);
+    fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
 /// A perpetual spelled `symbol` on a 0.1 price tick and a 0.001 size step.
 pub fn spec(id: InstrumentId, symbol: &str) -> InstrumentSpec {
     let venue_symbol = dispatch_market_data(&caps(), |scope| scope.venue_symbol(symbol)).unwrap();

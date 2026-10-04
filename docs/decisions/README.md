@@ -23,3 +23,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0018](0018-every-frame-and-http-request-carries-its-rate-charge-and-lim.md) Every frame and HTTP request carries its rate charge, and limits gain a per-connection scope and a connect operation — accepted
 - [0019](0019-the-runtime-s-network-stack-tokio-tokio-tungstenite-and-hype.md) The runtime's network stack: tokio, tokio-tungstenite and hyper over one connector with a hand-written SOCKS5 CONNECT, each pinned — accepted
 - [0020](0020-tls-runs-on-the-connector-s-stream-with-rustls-and-the-ring-.md) TLS runs on the connector's stream with rustls and the ring provider, trusting webpki-roots plus consumer anchors — accepted
+- [0022](0022-a-paradex-book-s-seq-no-advances-by-one-per-frame-bbo-shares.md) A Paradex book's seq_no advances by one per frame, bbo shares it, and a break resyncs by reconnecting the book's stream — accepted

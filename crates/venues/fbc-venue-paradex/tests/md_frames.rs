@@ -121,8 +121,7 @@ fn a_frame_shorter_than_its_declared_block_is_refused_with_nothing_pushed() {
 fn a_heartbeat_and_an_unknown_template_are_skipped_without_error() {
     let mut unknown = frame("heartbeat.sbe.txt");
     unknown[2..4].copy_from_slice(&99u16.to_le_bytes());
-    let book = frame("book-longer-entries.sbe.txt");
-    for bytes in [frame("heartbeat.sbe.txt"), unknown, book] {
+    for bytes in [frame("heartbeat.sbe.txt"), unknown] {
         let out = decode(&bytes);
         assert_eq!(out.result, Ok(()));
         assert!(out.events.is_empty() && out.fx.is_empty());
