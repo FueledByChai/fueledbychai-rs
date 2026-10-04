@@ -396,7 +396,7 @@ fn a_codec_whose_depth_configuration_was_refused_reads_no_depth_frame() {
 }
 
 #[test]
-fn the_codec_asks_for_no_http_and_its_timers_do_nothing() {
+fn without_a_diff_depth_book_no_http_is_awaited_and_timers_do_nothing() {
     let mut codec = subscribed();
     let caps = BinanceUsdm.caps(&config()).unwrap();
     let (mut sink, mut fx) = (Sink::default(), Effects::new());
@@ -412,7 +412,9 @@ fn the_codec_asks_for_no_http_and_its_timers_do_nothing() {
     });
     assert_eq!(
         result,
-        Err(DecodeError::Malformed("this codec asks for no HTTP"))
+        Err(DecodeError::Malformed(
+            "a response to no pending snapshot request"
+        ))
     );
     codec.on_timer(TimerTag(1), MonoNs(1), WallNs(1), &mut sink, &mut fx);
     assert!(sink.0.is_empty() && fx.is_empty());

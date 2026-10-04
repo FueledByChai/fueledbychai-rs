@@ -1,5 +1,6 @@
 //! The market-data codec: live subscriptions on a combined-stream connection, `bookTicker`
-//! touches and partial-depth snapshots (decisions 0002, 0014).
+//! touches, partial-depth snapshots and the diff-depth book anchored on a REST snapshot
+//! (`diff.rs`; decisions 0002, 0014).
 //!
 //! Every frame is decoded whole before anything is pushed, so a frame that fails pushes nothing
 //! (`MdSink`'s contract). Prices must lie on the instrument's grid and quantities on its size
@@ -17,8 +18,10 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde_json::{Map, Value};
 
+use crate::caps::DIFF_CHANNEL;
 use crate::config::Settings;
-use crate::{BOOK_PARTIAL, TOUCH_BOOK_TICKER};
+use crate::diff::{DiffBooks, decode_event};
+use crate::{BOOK_DIFF, BOOK_PARTIAL, TOUCH_BOOK_TICKER};
 
 /// One SUBSCRIBE or UNSUBSCRIBE request: a message on the connection, counted against its
 /// incoming-message limit. It names no single instrument, and Binance counts no limit per pair.
@@ -34,6 +37,7 @@ pub(crate) fn stream_name(
     let channel = match sub.feed {
         Feed::Touch(TOUCH_BOOK_TICKER) => "bookTicker",
         Feed::Book(BOOK_PARTIAL) => settings.depth.name,
+        Feed::Book(BOOK_DIFF) => DIFF_CHANNEL,
         _ => return Err(VenueError::UnsupportedFeed(sub)),
     };
     let spec = specs
@@ -69,6 +73,17 @@ pub(crate) struct BinanceUsdmMd {
     pending: BTreeMap<u64, Method>,
     /// The epoch of each instrument's last partial-depth snapshot.
     epochs: BTreeMap<InstrumentId, u32>,
+    /// The diff-depth books subscribed.
+    diff: DiffBooks,
+}
+
+/// What a stream carries.
+#[derive(Copy, Clone)]
+enum Kind {
+    Ticker,
+    /// Partial depth, at most this many levels per side.
+    Partial(u16),
+    Diff,
 }
 
 impl BinanceUsdmMd {
@@ -79,6 +94,7 @@ impl BinanceUsdmMd {
             next_id: 1,
             pending: BTreeMap::new(),
             epochs: BTreeMap::new(),
+            diff: DiffBooks::default(),
         }
     }
 
@@ -148,15 +164,19 @@ impl BinanceUsdmMd {
         data: &Map<String, Value>,
         specs: &SpecTable,
         sink: &mut dyn MdSink,
+        fx: &mut Effects,
     ) -> Result<(), DecodeError> {
         let (symbol, channel) = stream
             .split_once('@')
             .ok_or(DecodeError::Malformed("stream"))?;
         let depth = self.settings.as_ref().ok().map(|s| s.depth);
-        let (event, levels) = match channel {
-            "bookTicker" => ("bookTicker", None),
+        let (event, kind) = match channel {
+            "bookTicker" => ("bookTicker", Kind::Ticker),
+            DIFF_CHANNEL => ("depthUpdate", Kind::Diff),
             _ => match depth {
-                Some(depth) if channel == depth.name => ("depthUpdate", Some(depth.levels)),
+                Some(depth) if channel == depth.name => {
+                    ("depthUpdate", Kind::Partial(depth.levels))
+                }
                 _ => {
                     return Err(DecodeError::Malformed(
                         "a stream this codec did not subscribe",
@@ -178,8 +198,12 @@ impl BinanceUsdmMd {
             return Err(DecodeError::Malformed("the stream names another symbol"));
         }
         let meta = meta(data)?;
-        match levels {
-            None => {
+        match kind {
+            Kind::Diff => {
+                let ev = decode_event(spec, data, meta)?;
+                self.diff.on_event(spec.id, ev, sink, fx);
+            }
+            Kind::Ticker => {
                 let touch = MdEvent::Touch {
                     inst: spec.id,
                     bid: touch_side(spec, data, "b", "B")?,
@@ -188,7 +212,7 @@ impl BinanceUsdmMd {
                 };
                 sink.push(meta, touch);
             }
-            Some(max) => {
+            Kind::Partial(max) => {
                 let bids = side(spec, data, "b", max)?;
                 let asks = side(spec, data, "a", max)?;
                 let epoch = self.epochs.entry(spec.id).or_insert(0);
@@ -296,6 +320,16 @@ fn side(
             _ => "a: more levels than the channel carries",
         }));
     }
+    level_list(spec, levels, key)
+}
+
+/// A list of levels, `[["price","qty"], ...]`, each on `spec`'s grid and size step exactly;
+/// a fault names `key`.
+pub(crate) fn level_list(
+    spec: &InstrumentSpec,
+    levels: &[Value],
+    key: &'static str,
+) -> Result<Vec<Lvl>, DecodeError> {
     levels
         .iter()
         .map(|level| match level.as_array().map(Vec::as_slice) {
@@ -303,7 +337,7 @@ fn side(
                 px: price(spec, Some(px), key)?,
                 qty: quantity(spec, Some(qty), key)?,
             }),
-            _ => Err(bad),
+            _ => Err(DecodeError::Malformed(key)),
         })
         .collect()
 }
@@ -328,6 +362,17 @@ impl MdCodec for BinanceUsdmMd {
             .map_err(|err| VenueError::Config(*err))?;
         let adds = Self::names(settings, specs, add)?;
         let removes = Self::names(settings, specs, remove)?;
+        // Every name is checked, so every instrument is in `specs`.
+        let diff = |sub: &&Subscription| sub.feed == Feed::Book(BOOK_DIFF);
+        for sub in add.iter().filter(diff) {
+            if let Some(spec) = specs.get(sub.inst) {
+                let symbol = spec.venue_symbol.as_wire();
+                self.diff.subscribe(sub.inst, symbol, &settings.snapshot);
+            }
+        }
+        for sub in remove.iter().filter(diff) {
+            self.diff.unsubscribe(sub.inst);
+        }
         for (method, names) in [(Method::Subscribe, adds), (Method::Unsubscribe, removes)] {
             if !names.is_empty() {
                 self.request(method, names, fx);
@@ -343,7 +388,7 @@ impl MdCodec for BinanceUsdmMd {
         _scope: &DecodeScope<'_>,
         specs: &SpecTable,
         sink: &mut dyn MdSink,
-        _fx: &mut Effects,
+        fx: &mut Effects,
     ) -> Result<(), DecodeError> {
         let RawFrame::Text(text) = f else {
             return Err(DecodeError::Malformed("a binary frame"));
@@ -358,34 +403,35 @@ impl MdCodec for BinanceUsdmMd {
                 let stream = stream.as_str().ok_or(DecodeError::Malformed("stream"))?;
                 let data = frame.get("data").and_then(Value::as_object);
                 let data = data.ok_or(DecodeError::Malformed("data"))?;
-                self.on_data(stream, data, specs, sink)
+                self.on_data(stream, data, specs, sink, fx)
             }
             None => self.on_reply(&frame),
         }
     }
 
-    /// This codec asks for no HTTP.
+    /// The response to a diff-depth book's snapshot request, or why none came.
     fn on_http(
         &mut self,
-        _tag: HttpTag,
-        _resp: Result<HttpResponse<'_>, HttpFailure>,
+        tag: HttpTag,
+        resp: Result<HttpResponse<'_>, HttpFailure>,
         _scope: &DecodeScope<'_>,
-        _specs: &SpecTable,
-        _sink: &mut dyn MdSink,
-        _fx: &mut Effects,
+        specs: &SpecTable,
+        sink: &mut dyn MdSink,
+        fx: &mut Effects,
     ) -> Result<(), DecodeError> {
-        Err(DecodeError::Malformed("this codec asks for no HTTP"))
+        self.diff.on_http(tag, resp, specs, sink, fx)
     }
 
-    /// This codec sets no timer.
+    /// A diff-depth book's retry timer: it asks for its snapshot again.
     fn on_timer(
         &mut self,
-        _tag: TimerTag,
+        tag: TimerTag,
         _now: MonoNs,
         _wall: WallNs,
         _sink: &mut dyn MdSink,
-        _fx: &mut Effects,
+        fx: &mut Effects,
     ) {
+        self.diff.on_timer(tag, fx);
     }
 
     /// None: Binance pings the connection every 3 minutes and the WebSocket layer answers with
