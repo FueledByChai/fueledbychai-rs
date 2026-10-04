@@ -45,6 +45,9 @@ pub enum FeeError {
     /// The raw amount was `i128::MIN` nanos, the one value whose negation does not exist, so
     /// it cannot be held as an exact cost and P&L pair under either convention.
     OutOfRange,
+    /// The venue declares `exec: None` (decision 0015): with no exec block it has no fee sign,
+    /// so its scope refuses to decode a fee rather than guess one.
+    NoExecBlock,
 }
 
 impl fmt::Display for FeeError {
@@ -53,6 +56,9 @@ impl fmt::Display for FeeError {
             FeeError::OutOfRange => {
                 f.write_str("fee amount out of range: i128::MIN nanos has no negation")
             }
+            FeeError::NoExecBlock => f.write_str(
+                "no fee decoded: the venue declares no exec block (exec: None), so it has no fee sign",
+            ),
         }
     }
 }
@@ -243,14 +249,14 @@ impl FeeBook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cid::ClientIdFormat;
+    use crate::caps::testing::exec_caps;
     use crate::ids::Namespace;
     use crate::scope::dispatch;
 
     // Fees come only from the decode scope, in unit tests as well (decision 0004).
     fn fee(sign: VenueFeeSign, raw: i128) -> Fee {
         let usdc = AssetSym::new("USDC").unwrap();
-        dispatch(&ClientIdFormat::Uuid, Namespace::new(1), sign, |scope| {
+        dispatch(&exec_caps(sign), Namespace::new(1), |scope| {
             scope.fee(raw, usdc)
         })
         .unwrap()

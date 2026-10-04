@@ -1034,8 +1034,7 @@ pub trait OrderSigner: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cid::ClientIdFormat;
-    use crate::fee::VenueFeeSign;
+    use crate::caps::testing::caps;
     use crate::grid::PriceGrid;
     use crate::ids::{Namespace, UnderlyingId, VenueId};
     use crate::instrument::{FundingSpec, InstrumentKind, SizeStep, TradingStatus};
@@ -1044,12 +1043,9 @@ mod tests {
     use rust_decimal::Decimal;
 
     fn spec(id: u32, symbol: &str) -> InstrumentSpec {
-        let venue_symbol = dispatch(
-            &ClientIdFormat::Uuid,
-            Namespace::new(1),
-            VenueFeeSign::PositiveIsCost,
-            |scope| scope.venue_symbol(symbol),
-        )
+        let venue_symbol = dispatch(&caps(), Namespace::new(1), |scope| {
+            scope.venue_symbol(symbol)
+        })
         .unwrap();
         let usd = AssetSym::new("USD").unwrap();
         InstrumentSpec {

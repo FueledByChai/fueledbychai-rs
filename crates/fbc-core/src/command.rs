@@ -383,8 +383,7 @@ pub enum NotAmendable {
 mod tests {
     use super::*;
     use crate::caps::AmendQty;
-    use crate::cid::ClientIdFormat;
-    use crate::fee::VenueFeeSign;
+    use crate::caps::testing::caps;
     use crate::ids::Namespace;
     use crate::scope::dispatch;
 
@@ -495,12 +494,9 @@ mod tests {
 
     #[test]
     fn a_command_counts_one_item_or_its_batch_length() {
-        let vid = dispatch(
-            &ClientIdFormat::Uuid,
-            Namespace::new(1),
-            VenueFeeSign::PositiveIsCost,
-            |scope| scope.venue_order_id("V-1"),
-        )
+        let vid = dispatch(&caps(), Namespace::new(1), |scope| {
+            scope.venue_order_id("V-1")
+        })
         .unwrap();
         let cancel = CancelOrder {
             target: OrderRef::Venue(vid),
@@ -533,12 +529,9 @@ mod tests {
         // On a venue without a reduce-only flag an exit goes out with reduce_only false; the
         // OMS's own classification, `reducing`, keeps it on the safety floor. A reduce-only
         // order is reducing too, and a batch is safety traffic only when every order is.
-        let vid = dispatch(
-            &ClientIdFormat::Uuid,
-            Namespace::new(1),
-            VenueFeeSign::PositiveIsCost,
-            |scope| scope.venue_order_id("V-1"),
-        )
+        let vid = dispatch(&caps(), Namespace::new(1), |scope| {
+            scope.venue_order_id("V-1")
+        })
         .unwrap();
         let order = |reducing, reduce_only| NewOrder {
             cid: ClientOrderId::new(Namespace::new(1), 1),
