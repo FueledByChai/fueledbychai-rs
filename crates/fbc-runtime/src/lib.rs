@@ -43,7 +43,10 @@
 //! over them, opening, keeping and closing endpoints as the plan changes. With a [`Journal`]
 //! set on either, every session records what crosses the shard boundary into the consumer's
 //! [`fbc_journal::JournalSink`], each record under the traffic class of what it records, and
-//! never waits on it (FBC-f3w, decision 0006).
+//! never waits on it (FBC-f3w, decision 0006). [`MdReplay`] feeds one session's journal back
+//! to the venue's current decoders through the same calls, with the recorded stamps, so a
+//! recorded day rebuilds the same envelopes (decoder replay, FBC-3kz, design §10.1); the caller
+//! supplies the configuration and spec table the session ran with.
 //!
 //! [`MdBooks`] keeps one book per (instrument, book channel) from the events a session hands on,
 //! routing each book event by its `BookId`, and exposes each instrument's configured trading
@@ -69,6 +72,7 @@ mod md_venue;
 mod pacing;
 mod ratelimit;
 mod reconcile;
+mod replay;
 mod session;
 mod socks5;
 mod target;
@@ -88,6 +92,7 @@ pub use ratelimit::{
     ScopeCounts,
 };
 pub use reconcile::{ReconcileError, Reconciler, SubscribeCall};
+pub use replay::{MdReplay, MdReplayConfig, MdReplayCounters, ReplayError};
 pub use session::{
     IngestClock, MdControl, MdCounters, MdHandler, MdSession, MdSessionConfig, SessionError,
 };
