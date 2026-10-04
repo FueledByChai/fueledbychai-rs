@@ -116,7 +116,7 @@ rather than guess.
   factory traits with `Effects` and `EncodeCtx`, `crates/fbc-book` with its L2 book, `crates/fbc-journal` with its record
   format, day-grouped segment writer, in-order reader and never-blocking sink, `crates/fbc-runtime` with its first
   slices (the connector, SOCKS5 CONNECT, WebSocket and HTTP/1.1, plain or TLS, 0019 and 0020;
-  connection epochs and the subscription reconciler; the market-data session, 0023),
+  connection epochs and the subscription reconciler; the market-data session, 0023), `crates/fbc-conformance` with its stub venue server (0025),
   `crates/venues/fbc-venue-paradex` with its signer (`src/sign`), SBE market data (`src/md`: bbo,
   trades and the order book) and its factory (`src/factory.rs`, market data only),
   and `crates/venues/fbc-venue-binance-usdm` with its market-data-only factory and codec; the
@@ -165,8 +165,14 @@ rather than guess.
     limit for Normal records and a Safety reserve, drops counted by class, a `Degraded` marker
     once space returns, and a writer thread draining it; still planned: the nonce,
     encode-context and cycle records, and compression and the hourly roll), `crates/fbc-sim` (simulated venue and queue-position
-    fill-model code, never calibrations), `crates/fbc-conformance` (adapter conformance kit and
-    stub venue server).
+    fill-model code, never calibrations), `crates/fbc-conformance` (the adapter conformance kit,
+    0025; it depends on `fbc-runtime`, and on `fbc-core` in its tests, never on a venue crate: so
+    far a public stub venue server on 127.0.0.1 ephemeral ports, a WebSocket endpoint that plays
+    a fault script of typed steps and records every connection and data frame, and an HTTP/1.1
+    endpoint with fixed responses by path; the reconnect-storm script and a check of connection
+    attempts against `ReconnectPacing`; venue crates take it as a dev-dependency instead of
+    writing their own servers; still planned: the duplicate-ack and silence scripts, the named
+    suite and its macro, and the full conformance venue).
   - `crates/venues/fbc-venues` (the registry, the only crate that sees concrete venues),
     `crates/venues/fbc-venue-binance-usdm` (market data only:
     `exec: None` caps citing Binance's USD-M pages, `plan_md` on the `/public` combined-stream

@@ -430,6 +430,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fbc-conformance"
+version = "0.0.1"
+dependencies = [
+ "fbc-core",
+ "fbc-runtime",
+ "futures-util",
+ "rust_decimal",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
 name = "fbc-core"
 version = "0.0.1"
 dependencies = [
