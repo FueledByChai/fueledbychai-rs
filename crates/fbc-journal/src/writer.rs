@@ -103,7 +103,7 @@ pub(crate) struct Listed {
 
 /// One shard's segments under `root` in write order: the day directories (`YYYYMMDD`,
 /// [`parse_day`]) in date order, each day's segments in sequence order. Anything else is
-/// passed over. A segment found both compressed and not (a writer stopped between writing the
+/// passed over, and so is a directory, whatever its name. A segment found both compressed and not (a writer stopped between writing the
 /// compressed form and removing the other) is listed once, compressed: the compressed form is
 /// complete before it takes its name.
 pub(crate) fn list_segments(root: &Path, shard: u16) -> io::Result<Vec<Listed>> {
@@ -116,9 +116,13 @@ pub(crate) fn list_segments(root: &Path, shard: u16) -> io::Result<Vec<Listed>> 
         };
         for file in fs::read_dir(entry.path())? {
             let file = file?;
-            if let Some((seq, compressed)) = file
-                .file_name()
-                .to_str()
+            // A directory is never a segment, whatever its name (one at a compressed
+            // segment's name must not hide the uncompressed segment).
+            let named = file.file_type().is_ok_and(|t| !t.is_dir());
+            if let Some((seq, compressed)) = named
+                .then(|| file.file_name())
+                .as_ref()
+                .and_then(|n| n.to_str())
                 .and_then(|n| segment_seq(n, shard))
             {
                 found.push((day, seq, !compressed, file.path()));
@@ -161,7 +165,7 @@ fn compress(plain: &Path) -> io::Result<()> {
 }
 
 /// `path` with `.ext` appended to its name.
-fn with_ext(path: &Path, ext: &str) -> PathBuf {
+pub(crate) fn with_ext(path: &Path, ext: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(".");
     name.push(ext);
