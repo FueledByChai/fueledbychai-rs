@@ -27,7 +27,7 @@ use fbc_core::{
     MdTransport, MonoNs, RawFrame, SpecTable, Stamp, Subscription, TimerTag, VenueCaps,
     VenueConfig, VenueFactory, VenueMeta, WallNs, dispatch_market_data,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use tokio::sync::watch;
 use tokio::time::{Instant, sleep_until};
 
@@ -146,10 +146,13 @@ impl From<ReconcileError> for SessionError {
     }
 }
 
-/// Changes a running session's desired subscriptions; dropping it stops the session.
+/// Changes a running session's desired subscriptions; dropping it stops the session, even while
+/// a write waits on a peer that stopped reading.
 #[derive(Debug)]
 pub struct MdControl {
     desired: watch::Sender<BTreeSet<Subscription>>,
+    /// Never sent on: its drop is the stop signal a pending write observes.
+    _stop: watch::Sender<()>,
 }
 
 impl MdControl {
@@ -190,6 +193,7 @@ pub struct MdSession<H> {
     epochs: Epochs,
     rec: Reconciler,
     desired: watch::Receiver<BTreeSet<Subscription>>,
+    stop: watch::Receiver<()>,
     /// Pending timers: deadline, order set, epoch, tag.
     timers: BinaryHeap<Reverse<(Instant, u64, u32, TimerTag)>>,
     timer_seq: u64,
@@ -237,6 +241,7 @@ impl<H: MdHandler> MdSession<H> {
         let first: BTreeSet<_> = config.plan.subs.iter().copied().collect();
         let _ = rec.set_desired(first.iter().copied());
         let (tx, desired) = watch::channel(first);
+        let (stop_tx, stop) = watch::channel(());
         let session = MdSession {
             venue: config.venue,
             cfg: config.cfg,
@@ -250,12 +255,17 @@ impl<H: MdHandler> MdSession<H> {
             epochs,
             rec,
             desired,
+            stop,
             timers: BinaryHeap::new(),
             timer_seq: 0,
             counters: MdCounters::default(),
             handler,
         };
-        Ok((session, MdControl { desired: tx }))
+        let control = MdControl {
+            desired: tx,
+            _stop: stop_tx,
+        };
+        Ok((session, control))
     }
 
     /// The current connection epoch.
@@ -338,7 +348,10 @@ impl<H: MdHandler> MdSession<H> {
     /// stops.
     async fn connected(&mut self, mut ws: WebSocket) -> Result<End, SessionError> {
         let key = self.current();
-        // The epoch's plan carries the subscriptions wanted now, not the first ones.
+        // The epoch's plan carries the subscriptions wanted now, not the first ones, including a
+        // change that arrived as the connection opened.
+        let subs = self.desired.borrow_and_update().clone();
+        let _ = self.rec.set_desired(subs);
         let plan = EndpointPlan {
             subs: self.rec.desired().iter().copied().collect(),
             ..self.plan.clone()
@@ -369,7 +382,7 @@ impl<H: MdHandler> MdSession<H> {
                     self.subscribe(&mut ws, codec.as_mut(), call).await?
                 }
                 Wake::Desired(false) => {
-                    let _ = ws.close(None).await;
+                    close(&mut ws);
                     return Ok(End::Stop);
                 }
             };
@@ -461,7 +474,11 @@ impl<H: MdHandler> MdSession<H> {
                     let bytes = frame.bytes();
                     let text = std::str::from_utf8(bytes).map(Message::text);
                     let message = text.unwrap_or_else(|_| Message::binary(bytes.to_vec()));
-                    open = ws.send(message).await.is_ok();
+                    open = tokio::select! {
+                        biased;
+                        sent = ws.send(message) => sent.is_ok(),
+                        _ = self.stop.changed() => false,
+                    };
                 }
                 Effect::Timer { tag, after } => {
                     // A timer past the end of the clock never fires.
@@ -471,7 +488,7 @@ impl<H: MdHandler> MdSession<H> {
                     }
                 }
                 Effect::Reconnect { stream, .. } if stream == self.plan.stream => {
-                    let _ = ws.close(None).await;
+                    close(ws);
                     open = false;
                 }
                 Effect::Send { .. } | Effect::Reconnect { .. } | Effect::Http { .. } => {
@@ -503,6 +520,12 @@ impl<H: MdHandler> MdSession<H> {
     fn next_deadline(&self) -> Option<Instant> {
         self.timers.peek().map(|Reverse((at, ..))| *at)
     }
+}
+
+/// Sends a close frame if the socket takes it now, without waiting on a peer that stopped
+/// reading; the socket closes when it is dropped either way.
+fn close(ws: &mut WebSocket) {
+    let _ = ws.close(None).now_or_never();
 }
 
 /// Sleeps until `at`, or forever when there is no deadline.
