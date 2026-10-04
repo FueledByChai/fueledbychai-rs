@@ -291,8 +291,7 @@ impl std::error::Error for IdError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cid::ClientIdFormat;
-    use crate::fee::VenueFeeSign;
+    use crate::caps::testing::caps;
     use crate::scope::{DecodeScope, dispatch};
 
     #[test]
@@ -309,12 +308,7 @@ mod tests {
     // Venue ids come only from the decode scope, in tests as well (decision 0004);
     // tests/no_back_door.rs fails if anything else calls `from_wire`.
     fn in_scope<R>(callback: impl for<'s> FnOnce(&'s DecodeScope<'s>) -> R) -> R {
-        dispatch(
-            &ClientIdFormat::Uuid,
-            Namespace::new(1),
-            VenueFeeSign::PositiveIsCost,
-            callback,
-        )
+        dispatch(&caps(), Namespace::new(1), callback)
     }
 
     #[test]

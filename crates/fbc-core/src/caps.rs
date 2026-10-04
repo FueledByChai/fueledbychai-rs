@@ -691,3 +691,88 @@ mod tests {
         assert_ne!(none, TagSet::of(&[Channel::Public]));
     }
 }
+
+/// Synthetic capabilities for the crate's unit tests, which get venue ids and fees only from a
+/// [`DecodeScope`](crate::DecodeScope) lent for a venue's caps (decision 0004). The values
+/// describe no real venue.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+
+    /// A synthetic venue with order entry: UUID client ids and fees reported under `fee_sign`.
+    pub(crate) fn exec_caps(fee_sign: VenueFeeSign) -> VenueCaps {
+        VenueCaps {
+            exec: Some(ExecCaps {
+                order: OrderCaps {
+                    kinds: TagSet::of(&[OrderKindTag::Limit]),
+                    tifs: TagSet::of(&[TifTag::Gtc]),
+                    channels: TagSet::of(&[Channel::Public]),
+                    post_only: true,
+                    reduce_only: true,
+                    flag_conflicts: Vec::new(),
+                    amend: None,
+                    cancel_refs: TagSet::of(&[RefKind::Venue]),
+                    query_refs: TagSet::none(),
+                    cancel_before_ack: false,
+                    cancel_is_signed: false,
+                    batch_place: None,
+                    batch_cancel: None,
+                    cancel_all_account: Support::Unsupported,
+                    cancel_all_instrument: Support::Unsupported,
+                    cancel_on_disconnect: CancelOnDisconnect::None,
+                    ack: AckModel::SinglePhase,
+                    client_id: ClientIdFormat::Uuid,
+                    cid_echoed_on_events: true,
+                    nonce_scope: NonceScope::None,
+                    ordering_key: OrderingKey::None,
+                    snapshot_source: SnapshotSource::None,
+                    events_echo_flags: false,
+                    sign_cost_hint_us: 0,
+                },
+                fills: FillCaps {
+                    source: FillSource::Native,
+                    liquidity_flag: true,
+                    realized_pnl: false,
+                    realized_funding: false,
+                    fee_sign,
+                    fee_asset_reported: true,
+                    fill_id: true,
+                    replays_fills_on_reconnect: false,
+                },
+            }),
+            matching: MatchingCaps {
+                speed_bump: None,
+                stp_scope: StpScope::None,
+            },
+            md: MdCaps {
+                encoding: Encoding::Json,
+                touch_sources: Vec::new(),
+                books: Vec::new(),
+                trades: TradeCaps {
+                    source: FeedSource::None,
+                    aggressor: false,
+                    trade_id: false,
+                },
+                funding: FundingCaps {
+                    source: FeedSource::None,
+                    interval_reported: false,
+                    next_time_reported: false,
+                },
+                stats: FeedSource::None,
+                mark: FeedSource::None,
+                index: FeedSource::None,
+                ts_precision: Duration::from_millis(1),
+                topology: ConnTopology::PerInstrument,
+                max_conn_lifetime: None,
+            },
+            limits: Vec::new(),
+            readiness_ceiling: Readiness::Record,
+        }
+    }
+
+    /// The same venue as a cost-signed [`exec_caps`], which is all a test that only needs
+    /// venue ids cares about.
+    pub(crate) fn caps() -> VenueCaps {
+        exec_caps(VenueFeeSign::PositiveIsCost)
+    }
+}

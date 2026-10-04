@@ -7,9 +7,13 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+mod common;
+
+use common::{exec_caps, market_data_only_caps, uuid_caps};
 use fbc_core::{
     AccountKey, Charset, CidMatch, CidMint, ClientIdFormat, ClientOrderId, IdError, LeaseError,
-    Namespace, NamespaceLease, WallNs, decode_cid, encode_cid,
+    Namespace, NamespaceLease, VenueFeeSign, WallNs, decode_cid, dispatch, dispatch_market_data,
+    encode_cid,
 };
 
 /// A fresh lock directory per test, removed when dropped. The library names no path; the caller
@@ -353,7 +357,7 @@ fn the_decode_scope_tells_ours_from_foreign() {
         encode_cid(&fmt, ours).unwrap(),
         encode_cid(&fmt, theirs).unwrap(),
     );
-    fbc_core::dispatch(&fmt, OWN, fbc_core::VenueFeeSign::PositiveIsCost, |scope| {
+    dispatch(&uuid_caps(), OWN, |scope| {
         assert_eq!(scope.client_order_id(&ours_wire), CidMatch::Ours(ours));
         assert_eq!(
             scope.client_order_id(&theirs_wire),
@@ -365,6 +369,53 @@ fn the_decode_scope_tells_ours_from_foreign() {
             CidMatch::Ours(ours)
         );
     });
+}
+
+#[test]
+fn the_decode_scope_reads_client_ids_in_the_format_the_caps_declare() {
+    // FBC-75u: the format comes from caps.exec.order.client_id, so an id is ours only in the
+    // format the venue declares; the same id spelled in any other format is not.
+    let dir = LockDir::new();
+    let ours = mint_all(&dir, OWN, 0, 0, 1)[0];
+    for declared in formats() {
+        let caps = exec_caps(declared, VenueFeeSign::PositiveIsCost);
+        for spelled in formats() {
+            let wire = encode_cid(&spelled, ours).unwrap();
+            let read = dispatch(&caps, OWN, |scope| scope.client_order_id(&wire));
+            let expected = if spelled == declared {
+                CidMatch::Ours(ours)
+            } else {
+                CidMatch::Unparseable
+            };
+            assert_eq!(read, expected, "declared {declared:?}, spelled {spelled:?}");
+        }
+    }
+}
+
+#[test]
+fn without_an_exec_block_or_a_namespace_no_client_id_is_read() {
+    // FBC-75u: a market-data-only venue (exec: None) declares no client-id format, so even an
+    // id that is canonical in every format reads as Unparseable; and market-data dispatch holds
+    // no namespace, so it reads none of an exec venue's ids as ours either.
+    let dir = LockDir::new();
+    let ours = mint_all(&dir, OWN, 0, 0, 1)[0];
+    let md_only = market_data_only_caps();
+    for fmt in formats() {
+        let wire = encode_cid(&fmt, ours).unwrap();
+        let exec = exec_caps(fmt, VenueFeeSign::PositiveIsCost);
+        assert_eq!(
+            dispatch(&md_only, OWN, |scope| scope.client_order_id(&wire)),
+            CidMatch::Unparseable,
+            "{fmt:?}"
+        );
+        for caps in [&md_only, &exec] {
+            assert_eq!(
+                dispatch_market_data(caps, |scope| scope.client_order_id(&wire)),
+                CidMatch::Unparseable,
+                "{fmt:?}"
+            );
+        }
+    }
 }
 
 /// Wire text comes from the venue: no input may panic the decoder, whatever its length or

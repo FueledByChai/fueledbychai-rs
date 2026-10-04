@@ -9,10 +9,11 @@ use std::time::Duration;
 
 use common::{Row, Vectors};
 use fbc_core::{
-    AmendRef, AmendWire, AssetSym, CancelRef, CancelWire, Channel, ClientIdFormat, FundingSpec,
-    InstrumentId, InstrumentKind, InstrumentSpec, Lots, Namespace, OrderKind, OrderSigner,
-    PlaceWire, PriceGrid, Side, Sig, SignError, SizeStep, Ticks, Tif, TradingStatus, UnderlyingId,
-    VenueFeeSign, VenueId, VenueOrderId, WallNs, dispatch,
+    AmendRef, AmendWire, AssetSym, CancelRef, CancelWire, Channel, ConnTopology, Encoding,
+    FeedSource, FundingCaps, FundingSpec, InstrumentId, InstrumentKind, InstrumentSpec, Lots,
+    MatchingCaps, MdCaps, OrderKind, OrderSigner, PlaceWire, PriceGrid, Readiness, Side, Sig,
+    SignError, SizeStep, StpScope, Ticks, Tif, TradeCaps, TradingStatus, UnderlyingId, VenueCaps,
+    VenueId, VenueOrderId, WallNs, dispatch_market_data,
 };
 use rust_decimal::Decimal;
 
@@ -22,13 +23,8 @@ fn dec(text: &str) -> Decimal {
 
 /// BTC-USD-PERP on a `tick` grid with a 0.00001 size step.
 fn spec_on(tick: &str) -> InstrumentSpec {
-    let venue_symbol = dispatch(
-        &ClientIdFormat::Uuid,
-        Namespace::new(1),
-        VenueFeeSign::PositiveIsCost,
-        |scope| scope.venue_symbol("BTC-USD-PERP"),
-    )
-    .unwrap();
+    let venue_symbol =
+        dispatch_market_data(&decode_caps(), |scope| scope.venue_symbol("BTC-USD-PERP")).unwrap();
     let usd = AssetSym::new("USD").unwrap();
     InstrumentSpec {
         id: InstrumentId::new(1),
@@ -60,18 +56,48 @@ fn spec_on(tick: &str) -> InstrumentSpec {
     }
 }
 
+/// What the tests decode venue symbols and order ids under. A `DecodeScope` is lent only for a
+/// venue's caps; these are synthetic and market-data-only, since the signer tests decode no
+/// client id or fee. They are not Paradex's declaration, which lands with its codecs.
+fn decode_caps() -> VenueCaps {
+    VenueCaps {
+        exec: None,
+        matching: MatchingCaps {
+            speed_bump: None,
+            stp_scope: StpScope::None,
+        },
+        md: MdCaps {
+            encoding: Encoding::Json,
+            touch_sources: vec![],
+            books: vec![],
+            trades: TradeCaps {
+                source: FeedSource::None,
+                aggressor: false,
+                trade_id: false,
+            },
+            funding: FundingCaps {
+                source: FeedSource::None,
+                interval_reported: false,
+                next_time_reported: false,
+            },
+            stats: FeedSource::None,
+            mark: FeedSource::None,
+            index: FeedSource::None,
+            ts_precision: Duration::from_millis(1),
+            topology: ConnTopology::PerInstrument,
+            max_conn_lifetime: None,
+        },
+        limits: vec![],
+        readiness_ceiling: Readiness::Record,
+    }
+}
+
 fn spec() -> InstrumentSpec {
     spec_on("0.1")
 }
 
 fn venue_id(text: &str) -> VenueOrderId {
-    dispatch(
-        &ClientIdFormat::Uuid,
-        Namespace::new(1),
-        VenueFeeSign::PositiveIsCost,
-        |scope| scope.venue_order_id(text),
-    )
-    .unwrap()
+    dispatch_market_data(&decode_caps(), |scope| scope.venue_order_id(text)).unwrap()
 }
 
 fn wall(row: &Row) -> WallNs {

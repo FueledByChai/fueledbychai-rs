@@ -671,17 +671,12 @@ mod tests {
         // must not resolve the target's Unknown state.
         let ns = crate::ids::Namespace::new(1);
         let (cid, other_cid) = (ClientOrderId::new(ns, 1), ClientOrderId::new(ns, 2));
-        let (vid, other_vid) = crate::scope::dispatch(
-            &crate::cid::ClientIdFormat::Uuid,
-            ns,
-            crate::fee::VenueFeeSign::PositiveIsCost,
-            |scope| {
-                (
-                    scope.venue_order_id("V-1").unwrap(),
-                    scope.venue_order_id("V-2").unwrap(),
-                )
-            },
-        );
+        let (vid, other_vid) = crate::scope::dispatch(&crate::caps::testing::caps(), ns, |scope| {
+            (
+                scope.venue_order_id("V-1").unwrap(),
+                scope.venue_order_id("V-2").unwrap(),
+            )
+        });
         let snap = |cid: Option<CidMatch>, vid: &VenueOrderId| VenueOrderSnapshot {
             cid,
             vid: vid.clone(),
@@ -735,9 +730,8 @@ mod tests {
         // quantity after the fill; the event holds each once, so the key cannot disagree with
         // the order and quantity the fill is applied to.
         let (vid, fid, fee) = crate::scope::dispatch(
-            &crate::cid::ClientIdFormat::Uuid,
+            &crate::caps::testing::caps(),
             crate::ids::Namespace::new(1),
-            crate::fee::VenueFeeSign::PositiveIsCost,
             |scope| {
                 let usd = crate::units::AssetSym::new("USD").unwrap();
                 (

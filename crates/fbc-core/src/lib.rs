@@ -70,7 +70,7 @@ pub use instrument::{
     VenueNativeId,
 };
 pub use mint::{CidMint, LeaseError, LeaseIo, NamespaceLease};
-pub use scope::{DecodeScope, dispatch};
+pub use scope::{DecodeScope, dispatch, dispatch_market_data};
 pub use time::{ConnKey, ExchNs, ExchTsKind, KernelRxNs, MonoNs, Stamp, WallNs};
 pub use units::{
     Aggressor, AssetSym, BookSide, Bps, Channel, Liquidity, Lots, Money, PxExact, Side, SignedLots,

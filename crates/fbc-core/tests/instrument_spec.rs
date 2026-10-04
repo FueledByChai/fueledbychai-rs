@@ -5,11 +5,13 @@
 
 use std::time::Duration;
 
+mod common;
+
+use common::market_data_only_caps;
 use fbc_core::{
-    AssetSym, Bps, ClientIdFormat, FeeRate, FeeSchedule, FundingSpec, InstrumentId, InstrumentKind,
-    InstrumentSpec, Lots, Money, Namespace, PriceGrid, PublishedRates, QtyError, QuantizeError,
-    Side, SizeStep, Ticks, TradingStatus, UnderlyingId, VenueFeeSign, VenueId, VenueNativeId,
-    WallNs, dispatch,
+    AssetSym, Bps, FeeRate, FeeSchedule, FundingSpec, InstrumentId, InstrumentKind, InstrumentSpec,
+    Lots, Money, PriceGrid, PublishedRates, QtyError, QuantizeError, Side, SizeStep, Ticks,
+    TradingStatus, UnderlyingId, VenueId, VenueNativeId, WallNs, dispatch_market_data,
 };
 use rust_decimal::Decimal;
 
@@ -24,12 +26,9 @@ fn usd() -> AssetSym {
 /// A synthetic perpetual on `grid`: size step 0.001, minimum 10 lots.
 fn spec(grid: PriceGrid) -> InstrumentSpec {
     // A venue symbol comes only from the decode scope, in tests as well (decision 0004).
-    let venue_symbol = dispatch(
-        &ClientIdFormat::Uuid,
-        Namespace::new(1),
-        VenueFeeSign::PositiveIsCost,
-        |scope| scope.venue_symbol("SYN-USD-PERP"),
-    )
+    let venue_symbol = dispatch_market_data(&market_data_only_caps(), |scope| {
+        scope.venue_symbol("SYN-USD-PERP")
+    })
     .unwrap();
     InstrumentSpec {
         id: InstrumentId::new(1),

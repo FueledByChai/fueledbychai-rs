@@ -2,6 +2,9 @@
 //! rebate) whatever sign the venue reports in, it comes only from `DecodeScope::fee` applying
 //! the venue's declared sign, and fee rates belong to accounts in a `FeeBook`.
 
+mod common;
+
+use common::exec_caps;
 use fbc_core::{
     AccountKey, AssetSym, Bps, Channel, ClientIdFormat, Fee, FeeBook, FeeEntry, FeeError, FeeKey,
     FeeLookup, FeeRate, FeeSchedule, FeeSource, InstrumentId, Liquidity, Money, Namespace,
@@ -14,7 +17,8 @@ fn usdc() -> AssetSym {
 
 /// What the scope of a venue declaring `sign` makes of a raw fee amount.
 fn decode(sign: VenueFeeSign, raw_nanos: i128) -> Result<Fee, FeeError> {
-    dispatch(&ClientIdFormat::Uuid, Namespace::new(1), sign, |scope| {
+    let caps = exec_caps(ClientIdFormat::Uuid, sign);
+    dispatch(&caps, Namespace::new(1), |scope| {
         scope.fee(raw_nanos, usdc())
     })
 }

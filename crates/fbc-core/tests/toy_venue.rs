@@ -690,9 +690,9 @@ impl ExecSink for Collect<ExecEvent> {
     }
 }
 
-/// Runs `f` with the decode scope the core's dispatch lends for the toy venue.
+/// Runs `f` with the decode scope the core's dispatch lends for the toy venue's caps.
 fn with_scope<R>(f: impl for<'s> FnOnce(&'s DecodeScope<'s>) -> R) -> R {
-    dispatch(&CID_FORMAT, OWN_NS, FEE_SIGN, f)
+    dispatch(&toy_caps(), OWN_NS, f)
 }
 
 fn specs() -> SpecTable {
