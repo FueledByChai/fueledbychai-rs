@@ -15,6 +15,12 @@
 //! [`BookKeeper`] is an [`MdHandler`]: it applies each envelope to its books, then hands it to
 //! the consumer's [`BookHandler`] with the books as they now are, in the same call stack
 //! (decision 0023).
+//!
+//! Not here yet (FBC-crh): a connection's end does not invalidate the books it fed. The handler
+//! sees only events (decision 0023), and a session opens its next epoch without one, so a book
+//! stays [`Valid`](fbc_book::BookState::Valid), with its last levels, from a drop until the new
+//! epoch's snapshot ends, unless its codec reports a gap. Until FBC-crh lands, a book's validity
+//! says only that no gap was reported, not that its connection is still up.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -123,6 +129,7 @@ impl MdBooks {
 
     /// The book of `inst`'s configured trading channel, once an event about it has arrived:
     /// never another channel's book, whatever state either is in.
+    /// Its state does not yet reflect a dropped connection (FBC-crh; see the module docs).
     pub fn trading_book(&self, inst: InstrumentId) -> Option<&L2Book> {
         self.book(inst, self.trading.get(inst)?)
     }
