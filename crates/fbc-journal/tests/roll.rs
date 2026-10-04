@@ -421,3 +421,37 @@ fn a_segment_compressed_after_the_reader_listed_it_is_read_compressed() {
         "{read:?}"
     );
 }
+
+#[test]
+fn only_the_two_forms_of_one_name_are_merged() {
+    // Codex r4177765900: two spellings of one sequence number are two segments, both read.
+    let root = fresh_dir("spellings");
+    let mut w = JournalWriter::create(&root, 1, key()).unwrap();
+    w.append(at(1, 0), &timer(1)).unwrap();
+    w.append(at(2, 0), &timer(2)).unwrap();
+    drop(w);
+    let day = root.join("20261003");
+    fs::copy(day.join("1-000000.fbcj.zst"), day.join("1-0.fbcj.zst")).unwrap();
+    fs::copy(day.join("1-000001.fbcj"), day.join("1-01.fbcj")).unwrap();
+    assert_eq!(read_ok(&root, 1), [timer(1), timer(1), timer(2), timer(2)]);
+}
+
+#[test]
+fn a_writer_restarted_on_an_earlier_hour_of_the_latest_day_keeps_write_order() {
+    // Codex r4177765907: a restart recovers the latest day, not the latest hour. The earlier
+    // hour gets a segment of its own after the ones on disk, so reading is still in write
+    // order, at the cost of one more roll.
+    let root = fresh_dir("restart_hour_back");
+    let mut first = JournalWriter::create(&root, 1, key()).unwrap();
+    first.append(at(9, 0), &timer(1)).unwrap();
+    drop(first);
+    let mut second = JournalWriter::create(&root, 1, key()).unwrap();
+    second.append(at(8, 0), &timer(2)).unwrap();
+    second.append(at(9, 0), &timer(3)).unwrap();
+    drop(second);
+    assert_eq!(
+        names(&root.join("20261003")),
+        ["1-000000.fbcj", "1-000001.fbcj.zst", "1-000002.fbcj"]
+    );
+    assert_eq!(read_ok(&root, 1), [timer(1), timer(2), timer(3)]);
+}

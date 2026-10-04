@@ -129,16 +129,23 @@ pub(crate) fn list_segments(root: &Path, shard: u16) -> io::Result<Vec<Listed>> 
                 continue;
             };
             if !file.file_type()?.is_dir() {
-                found.push((day, seq, !compressed, file.path()));
+                let path = file.path();
+                // The two forms of one segment share the uncompressed name.
+                let plain = match compressed {
+                    true => path.with_extension(""),
+                    false => path.clone(),
+                };
+                found.push((day, seq, plain, !compressed, path));
             }
         }
     }
-    // The compressed form of a sequence number sorts first and is the one kept.
+    // The compressed form of a segment sorts first and is the one kept; only the two forms
+    // of one name are merged, never two spellings of a sequence number (`1-1`, `1-000001`).
     found.sort();
-    found.dedup_by(|later, kept| (later.0, later.1) == (kept.0, kept.1));
+    found.dedup_by(|later, kept| (later.0, &later.2) == (kept.0, &kept.2));
     Ok(found
         .into_iter()
-        .map(|(day, _, plain, path)| Listed {
+        .map(|(day, .., plain, path)| Listed {
             day,
             compressed: !plain,
             path,
@@ -208,7 +215,11 @@ struct Segment {
 /// hour written, so reading the days in order is reading in write order. That holds across
 /// restarts: a new writer starts from the latest day that holds one of the shard's segments,
 /// and a new segment takes the next sequence number after the shard's existing segments in
-/// its day, so a restarted writer never overwrites one.
+/// its day, so a restarted writer never overwrites one. A restart recovers the latest day
+/// from the directory names but not the latest hour: a restarted writer whose clock is an
+/// hour behind the last segment starts a new segment in that day under the earlier hour.
+/// Segments of a day are read in sequence order, so write order holds; it costs at most an
+/// extra roll.
 ///
 /// Each segment the writer closes is compressed with zstd into `<shard>-<seq>.fbcj.zst`
 /// ([`COMPRESSED_EXT`]) and the uncompressed file removed, on the thread that appends (the
