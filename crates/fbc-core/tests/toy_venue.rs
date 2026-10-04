@@ -9,13 +9,18 @@
 //! only what its codecs do. One socket carries the touch; one carries order entry (unsigned
 //! limit orders out; acks, account events, fills and a resync answered in one frame in). It has
 //! no book, trades or other feed, cancels, amends and queries nothing, reads no configuration,
-//! and asks for no HTTP or keepalive; it keeps one resync in flight, and its one timer asks
-//! for that resync again while it is unanswered.
+//! and asks for no HTTP; it keeps one resync in flight, and its one timer asks for that resync
+//! again while it is unanswered. Its market-data socket is kept alive with a ping frame.
+//!
+//! Every frame it asks for, and its ping, carries the rate charge its declared limits count
+//! (decision 0018): orders per instrument, a resync as a weighted query against the account,
+//! and subscriptions, its hello and its pings against the connection they are written on.
 //!
 //! Protocol: one record per line, `kind|key=value|...`; `ts` is the venue's matching-engine time
 //! in nanoseconds and `seq` its sequence. Prices are ticks, sizes lots, money nanos of USDC.
 
 use std::collections::BTreeSet;
+use std::num::NonZeroU32;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -27,13 +32,14 @@ use fbc_core::{
     ExchNs, ExchTsKind, ExecCaps, ExecCodec, ExecEndpoint, ExecEvent, ExecSink, Feed, FeedSource,
     FieldSpec, FillCaps, FillEvent, FillIdent, FillSource, FundingCaps, FundingSpec, HttpFailure,
     HttpResponse, HttpTag, InstrumentId, InstrumentKind, InstrumentSpec, ItemRef, Keepalive,
-    Liquidity3, Lots, Lvl, MatchingCaps, MdCaps, MdCodec, MdEvent, MdSink, MdTransport, Money,
-    MonoNs, Namespace, NamespaceLease, NewOrder, NonceBlock, NonceScope, NotSentReason, OrderCaps,
-    OrderKind, OrderKindTag, OrderingKey, PriceGrid, PxExact, RawFrame, Readiness, RpcCall, RpcId,
-    SeqDomain, Side, SignedLots, SizeStep, SnapshotSource, SpecTable, Stamp, StpScope, StreamId,
-    SubmitOutcome, Subscription, Support, TagSet, Ticks, TifTag, TimerTag, TouchSourceCaps,
-    TouchSourceId, TradeCaps, TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueCommand,
-    VenueConfig, VenueError, VenueFactory, VenueFeeSign, VenueId, VenueMeta, VenueOrderSnapshot,
+    KeepaliveKind, LimitScope, Liquidity3, Lots, Lvl, MatchingCaps, MdCaps, MdCodec, MdEvent,
+    MdSink, MdTransport, Money, MonoNs, Namespace, NamespaceLease, NewOrder, NonceBlock,
+    NonceScope, NotSentReason, OpKind, OrderCaps, OrderKind, OrderKindTag, OrderingKey, PriceGrid,
+    PxExact, RateCharge, RateLimit, RawFrame, Readiness, RpcCall, RpcId, SeqDomain, Side,
+    SignedLots, SizeStep, SnapshotSource, SpecTable, Stamp, StpScope, StreamId, SubmitOutcome,
+    Subscription, Support, TagSet, Ticks, TifTag, TimerTag, TouchSourceCaps, TouchSourceId,
+    TradeCaps, TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueCommand, VenueConfig,
+    VenueError, VenueFactory, VenueFeeSign, VenueId, VenueMeta, VenueOrderSnapshot,
     VenueOrderState, WallNs, WireSlice, WireUrl, decode_cid, dispatch, encode_cid,
 };
 use rust_decimal::Decimal;
@@ -59,6 +65,16 @@ const CID_FORMAT: ClientIdFormat = ClientIdFormat::Alnum {
     max_len: 32,
     charset: Charset::Alphanumeric,
 };
+/// The hello on open and the keepalive ping: control frames, counted on their connection.
+const CONTROL: RateCharge = RateCharge::one(OpKind::Control, None);
+/// A resync: a query of the whole account, weighted against the account's query budget.
+const RESYNC_CHARGE: RateCharge = RateCharge {
+    op: OpKind::Query,
+    inst: None,
+    weight: NonZeroU32::new(5).unwrap(),
+};
+/// How often the market-data socket is pinged.
+const PING_EVERY: Duration = Duration::from_secs(30);
 
 fn usdc() -> AssetSym {
     AssetSym::new("USDC").unwrap()
@@ -164,8 +180,15 @@ fn text(f: RawFrame<'_>) -> Result<&str, DecodeError> {
     }
 }
 
-/// Asks for `text` to be written to `stream`, with a deadline when it is request `rpc`.
-fn send(stream: StreamId, text: &str, rpc: Option<RpcId>, class: TrafficClass) -> Effect {
+/// Asks for `text` to be written to `stream`, with a deadline when it is request `rpc`, charged
+/// to the venue's rate limits as `charge`.
+fn send(
+    stream: StreamId,
+    text: &str,
+    rpc: Option<RpcId>,
+    class: TrafficClass,
+    charge: RateCharge,
+) -> Effect {
     let frame = WireSlice::plain(text.as_bytes().to_vec());
     let rpc = rpc.map(|id| RpcCall {
         id,
@@ -176,6 +199,7 @@ fn send(stream: StreamId, text: &str, rpc: Option<RpcId>, class: TrafficClass) -
         frame,
         rpc,
         class,
+        charge,
     }
 }
 
@@ -209,11 +233,12 @@ impl MdCodec for ToyMd {
         for (verb, subs) in [("sub", add), ("unsub", remove)] {
             for sub in subs {
                 let symbol = spell(specs, *sub)?;
-                frames.push(format!("{verb}|sym={symbol}|feed={:?}", sub.feed));
+                let frame = format!("{verb}|sym={symbol}|feed={:?}", sub.feed);
+                frames.push((frame, RateCharge::one(OpKind::Subscribe, Some(sub.inst))));
             }
         }
-        for frame in frames {
-            fx.push(send(MD_STREAM, &frame, None, TrafficClass::Normal));
+        for (frame, charge) in frames {
+            fx.push(send(MD_STREAM, &frame, None, TrafficClass::Normal, charge));
         }
         Ok(())
     }
@@ -267,8 +292,13 @@ impl MdCodec for ToyMd {
     ) {
     }
 
+    /// A ping frame, counted against the connection like any other control frame.
     fn keepalive(&self) -> Option<Keepalive> {
-        None
+        Some(Keepalive {
+            interval: PING_EVERY,
+            kind: KeepaliveKind::Frame(WireSlice::plain(b"ping".to_vec())),
+            charge: CONTROL,
+        })
     }
 }
 
@@ -308,7 +338,14 @@ impl ToyExec {
     /// Asks for the resync of instant `at`, and again after `RPC_TIMEOUT` unless answered.
     fn ask_resync(at: WallNs, fx: &mut Effects) {
         let request = format!("snapshot|ts={}", at.0);
-        fx.push(send(EXEC_STREAM, &request, None, TrafficClass::Safety));
+        let charge = RESYNC_CHARGE;
+        fx.push(send(
+            EXEC_STREAM,
+            &request,
+            None,
+            TrafficClass::Safety,
+            charge,
+        ));
         let after = RPC_TIMEOUT;
         fx.push(Effect::Timer {
             tag: RESYNC_TAG,
@@ -427,7 +464,7 @@ impl ExecCodec for ToyExec {
 
     fn on_open(&mut self, stream: StreamId, ctx: &EncodeCtx, fx: &mut Effects) {
         let hello = format!("hello|ts={}", ctx.wall.0);
-        fx.push(send(stream, &hello, None, TrafficClass::Safety));
+        fx.push(send(stream, &hello, None, TrafficClass::Safety, CONTROL));
     }
 
     /// Encodes a limit order, its time and nonce from `ctx` alone; the toy offers nothing else.
@@ -463,7 +500,10 @@ impl ExecCodec for ToyExec {
             u8::from(o.reduce_only),
             ctx.wall.0,
         );
-        fx.push(send(EXEC_STREAM, &frame, Some(rpc), cmd.traffic_class()));
+        // An order counts against its instrument's limit.
+        let charge = RateCharge::one(OpKind::Place, Some(o.inst));
+        let class = cmd.traffic_class();
+        fx.push(send(EXEC_STREAM, &frame, Some(rpc), class, charge));
         Ok(receipt)
     }
 
@@ -651,7 +691,27 @@ fn toy_caps() -> VenueCaps {
             },
             max_conn_lifetime: None,
         },
-        limits: vec![],
+        // Each limit counts traffic the toy sends (decision 0018).
+        limits: vec![
+            RateLimit {
+                scope: LimitScope::Pair,
+                ops: TagSet::of(&[OpKind::Place]),
+                per: Duration::from_secs(1),
+                units: 10,
+            },
+            RateLimit {
+                scope: LimitScope::Account,
+                ops: TagSet::of(&[OpKind::Query]),
+                per: Duration::from_secs(60),
+                units: 100,
+            },
+            RateLimit {
+                scope: LimitScope::Connection,
+                ops: TagSet::of(&[OpKind::Subscribe, OpKind::Control]),
+                per: Duration::from_secs(1),
+                units: 5,
+            },
+        ],
         readiness_ceiling: Readiness::Record,
     }
 }
@@ -951,10 +1011,10 @@ fn encode_takes_time_and_nonces_only_from_the_encode_ctx() {
     );
     // One frame with its deadline and its command's traffic class; the receipt names the
     // nonce the context reserved, for the OMS to keep.
-    let rpc = Some(RpcId(11));
+    let (rpc, charge) = (Some(RpcId(11)), RateCharge::one(OpKind::Place, Some(INST)));
     assert_eq!(
         effects,
-        [send(EXEC_STREAM, &frame, rpc, TrafficClass::Normal)]
+        [send(EXEC_STREAM, &frame, rpc, TrafficClass::Normal, charge)]
     );
     assert_eq!(receipt.nonces(), [(0, 9_000)]);
     let mut fx = Effects::new();
@@ -983,6 +1043,69 @@ fn encode_takes_time_and_nonces_only_from_the_encode_ctx() {
     assert_eq!(encode(&cmd, &ctx(1, &[])).err(), unencodable);
     assert_eq!(encode(&ioc, &at).err(), unsupported);
     assert_eq!(encode(&VenueCommand::FeeQuery, &at).err(), unsupported);
+}
+
+#[test]
+fn the_toy_charges_its_encode_resync_keepalive_and_subscribe_traffic() {
+    // FBC-hof, decision 0018: every frame the toy asks for, and its ping, carries the charge its
+    // venue counts it as, including traffic it sends on its own (the hello, a resync and its
+    // retry), so the runtime can charge each to the right bucket.
+    let mut fx = Effects::new();
+    let place = VenueCommand::Place(order(mint()));
+    exec_codec()
+        .encode(&place, RpcId(11), &specs(), &ctx(1, &[1]), &mut fx)
+        .unwrap();
+    let touch = Subscription {
+        inst: INST,
+        feed: Feed::Touch(TouchSourceId(0)),
+    };
+    ToyMd
+        .subscribe(&[touch], &[touch], &specs(), &mut fx)
+        .unwrap();
+    let mut exec = exec_codec();
+    exec.on_open(EXEC_STREAM, &ctx(1_000, &[]), &mut fx);
+    exec.resync(&ctx(2_000, &[]), &mut fx);
+    exec.on_timer(RESYNC_TAG, &ctx(9_000, &[]), &mut fx);
+    let mut charges: Vec<RateCharge> = fx
+        .as_slice()
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Send { charge, .. } | Effect::Http { charge, .. } => Some(*charge),
+            Effect::Timer { .. } | Effect::Reconnect { .. } => None,
+        })
+        .collect();
+    charges.push(ToyMd.keepalive().unwrap().charge);
+
+    // The order names its instrument, the resync costs its weight, and the subscriptions, hello
+    // and ping are counted on their connection.
+    let subscribe = RateCharge::one(OpKind::Subscribe, Some(INST));
+    let expected = [
+        RateCharge::one(OpKind::Place, Some(INST)),
+        subscribe,
+        subscribe,
+        CONTROL,
+        RESYNC_CHARGE,
+        RESYNC_CHARGE,
+        CONTROL,
+    ];
+    assert_eq!(charges, expected);
+    assert_eq!(RESYNC_CHARGE.weight.get(), 5);
+
+    // Each charge is counted by a declared limit, and by every limit that lists its operation:
+    // a per-pair limit never misses one for want of its instrument. Each limit counts some of
+    // the toy's traffic, so the declaration is no wider than what the codecs send.
+    let limits = toy_caps().limits;
+    for charge in &charges {
+        assert!(limits.iter().any(|l| l.counts(charge)), "{charge:?}");
+        for limit in limits.iter().filter(|l| l.ops.contains(charge.op)) {
+            assert!(limit.counts(charge), "{limit:?} misses {charge:?}");
+        }
+    }
+    for limit in &limits {
+        assert!(charges.iter().any(|c| limit.counts(c)), "{limit:?}");
+    }
+    let unkeyed = RateCharge::one(OpKind::Place, None);
+    assert!(!limits[0].counts(&unkeyed));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1110,10 +1233,14 @@ fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
     md.subscribe(&[touch], &[touch], &specs(), &mut fx).unwrap();
     let sent = ["sub", "unsub"].map(|verb| {
         let frame = format!("{verb}|sym=TOY-PERP|feed=Touch(TouchSourceId(0))");
-        send(MD_STREAM, &frame, None, TrafficClass::Normal)
+        let charge = RateCharge::one(OpKind::Subscribe, Some(INST));
+        send(MD_STREAM, &frame, None, TrafficClass::Normal, charge)
     });
     assert_eq!(fx.take(), sent);
-    assert_eq!(md.keepalive(), None);
+    let ping = md
+        .keepalive()
+        .expect("the toy pings its market-data socket");
+    assert_eq!((ping.interval, ping.charge), (PING_EVERY, CONTROL));
     // A market-data timer gets a sink, so a codec can report a silent feed Stale when its
     // cadence is missed (Codex r4173389311); the toy sets no such timer, so one firing reports
     // and asks for nothing.
@@ -1164,17 +1291,17 @@ fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
     exec.resync(&ctx(5_000, &[]), &mut fx);
     assert_eq!(exec.nonces_for(CtxCall::Timer(RESYNC_TAG)), 0);
     exec.on_timer(RESYNC_TAG, &ctx(9_000, &[]), &mut fx);
-    let safety = |text| send(EXEC_STREAM, text, None, TrafficClass::Safety);
+    let safety = |text, charge| send(EXEC_STREAM, text, None, TrafficClass::Safety, charge);
     let retry = Effect::Timer {
         tag: RESYNC_TAG,
         after: RPC_TIMEOUT,
     };
     let (hello, asked) = ("hello|ts=1000", "snapshot|ts=2000");
     let expected = [
-        safety(hello),
-        safety(asked),
+        safety(hello, CONTROL),
+        safety(asked, RESYNC_CHARGE),
         retry.clone(),
-        safety(asked),
+        safety(asked, RESYNC_CHARGE),
         retry,
     ];
     assert_eq!(fx.take(), expected);

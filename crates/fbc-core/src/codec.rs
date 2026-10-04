@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 use arrayvec::ArrayVec;
 use compact_str::CompactString;
 
+use crate::caps::RateCharge;
 use crate::command::{NotSentReason, OrderKind, Tif, VenueCommand};
 use crate::event::{BookId, ExecEvent, MdEvent, RpcId, StreamId, TouchSourceId, VenueMeta};
 use crate::fee::FeeError;
@@ -423,7 +424,10 @@ pub struct RpcCall {
     pub timeout: Duration,
 }
 
-/// Something a codec asks the runtime to do. The codec does none of it itself.
+/// Something a codec asks the runtime to do. The codec does none of it itself. Every frame and
+/// HTTP request carries its [`RateCharge`]: the operation, the instrument a per-pair limit
+/// counts it against, and its weight, which the runtime charges to every limit that counts it
+/// (decision 0018).
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub enum Effect {
     /// Write `frame` to `stream`; with `rpc`, the runtime reports its timeout passing without
@@ -433,6 +437,7 @@ pub enum Effect {
         frame: WireSlice,
         rpc: Option<RpcCall>,
         class: TrafficClass,
+        charge: RateCharge,
     },
     /// Make `req`, handing the codec's `on_http` the response with `tag`, or the
     /// [`HttpFailure`] when none came: `timeout`, which every request has, passing without a
@@ -445,6 +450,7 @@ pub enum Effect {
         rpc: Option<RpcId>,
         timeout: Duration,
         class: TrafficClass,
+        charge: RateCharge,
     },
     /// Call the codec's `on_timer` with `tag` after `after`.
     Timer { tag: TimerTag, after: Duration },
@@ -781,11 +787,13 @@ pub enum KeepaliveKind {
     Frame(WireSlice),
 }
 
-/// A keepalive the runtime sends every `interval`.
+/// A keepalive the runtime sends every `interval`, charged `charge` each time, since a venue
+/// that caps the messages on a connection counts its pings too (decision 0018).
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub struct Keepalive {
     pub interval: Duration,
     pub kind: KeepaliveKind,
+    pub charge: RateCharge,
 }
 
 /// A market-data codec: one per connection epoch. Deterministic given its inputs (frames,
@@ -862,7 +870,8 @@ pub trait ExecCodec: Send {
     /// Encode and sign `cmd` as request `rpc`. `Err` means not sent: no byte reached a socket
     /// buffer and no effect was pushed. `Ok` effects carry the request
     /// ([`Effects::carry_request`]): every frame or HTTP request names `rpc`, so it has a
-    /// deadline, and is labelled with `cmd`'s traffic class. Never retries.
+    /// deadline, and is labelled with `cmd`'s traffic class; each carries the [`RateCharge`]
+    /// the venue counts it as. Never retries.
     fn encode(
         &mut self,
         cmd: &VenueCommand,
@@ -1034,6 +1043,7 @@ pub trait OrderSigner: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::caps::OpKind;
     use crate::caps::testing::caps;
     use crate::grid::PriceGrid;
     use crate::ids::{Namespace, UnderlyingId, VenueId};
@@ -1159,12 +1169,14 @@ mod tests {
                 rpc: None,
                 timeout: Duration::from_secs(5),
                 class: TrafficClass::Safety,
+                charge: RateCharge::one(OpKind::Rest, None),
             },
             Effect::Send {
                 stream: StreamId(0),
                 frame: body.clone(),
                 rpc: None,
                 class: TrafficClass::Safety,
+                charge: RateCharge::one(OpKind::Control, None),
             },
         ];
         let mut fx = Effects::new();
@@ -1172,6 +1184,7 @@ mod tests {
         let keepalive = Keepalive {
             interval: Duration::from_secs(1),
             kind: KeepaliveKind::Frame(body),
+            charge: RateCharge::one(OpKind::Control, None),
         };
         let echoed = format!("{{\"jwt\":\"{secret}\"}}");
         // A header name is venue text too (Codex r4173320331): a proxy can echo a key in one.
@@ -1250,6 +1263,7 @@ mod tests {
                 timeout: Duration::from_secs(1),
             }),
             class: TrafficClass::Safety,
+            charge: RateCharge::one(OpKind::Cancel, None),
         };
         let http = |call: Option<RpcId>| Effect::Http {
             tag: HttpTag(1),
@@ -1262,6 +1276,7 @@ mod tests {
             rpc: call,
             timeout: Duration::from_secs(1),
             class: TrafficClass::Safety,
+            charge: RateCharge::one(OpKind::Cancel, None),
         };
         let timer = Effect::Timer {
             tag: TimerTag(1),
