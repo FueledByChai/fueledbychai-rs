@@ -581,19 +581,25 @@ fn a_record_offered_lazily_is_not_built_when_its_payload_cannot_fit() {
         assert_eq!(refused, Recorded::DroppedCounted);
         assert_eq!(sink.dropped(class), 1);
     }
+    // A record the caller withholds is counted and numbered into the same gap.
+    assert_eq!(
+        sink.omit(TrafficClass::Normal, NOW),
+        Recorded::DroppedCounted
+    );
+    assert_eq!(sink.dropped(TrafficClass::Normal), 2);
     let writer = drain
         .spawn(JournalWriter::create(&root, 1, key()).unwrap())
         .unwrap();
     until_drained(&sink);
     assert_eq!(
-        sink.record(TrafficClass::Normal, NOW, &timer(3)),
+        sink.record(TrafficClass::Normal, NOW, &timer(4)),
         Recorded::Ok
     );
     writer.close().unwrap();
     let degraded = Record::Marker(Marker::Degraded {
         from_seq: 1,
-        dropped: 2,
+        dropped: 3,
     });
-    assert_eq!(read_all(&root, 1), [timer(0), degraded, timer(3)]);
+    assert_eq!(read_all(&root, 1), [timer(0), degraded, timer(4)]);
     fs::remove_dir_all(&root).unwrap();
 }

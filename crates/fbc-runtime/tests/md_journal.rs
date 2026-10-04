@@ -388,6 +388,9 @@ impl JournalSink for Kept {
         self.0.push(record.clone());
         Recorded::Ok
     }
+    fn omit(&mut self, _: TrafficClass, _: WallNs) -> Recorded {
+        Recorded::DroppedCounted
+    }
 }
 
 #[tokio::test]
@@ -534,6 +537,9 @@ impl JournalSink for SlowRequests {
         }
         Recorded::Ok
     }
+    fn omit(&mut self, _: TrafficClass, _: WallNs) -> Recorded {
+        Recorded::DroppedCounted
+    }
 }
 
 /// Codex r4178197281: a request's timeout runs from when the codec asked, so time spent
@@ -543,7 +549,7 @@ async fn journaling_a_request_counts_against_its_timeout() {
     let (mut ws, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
     let venue = ToyVenue::leak();
     let (mut session, control) = MdSession::new(session(venue, ws.url()), |_| {}).unwrap();
-    let slow = SlowRequests { pause: ms(400) };
+    let slow = SlowRequests { pause: ms(1_000) };
     session.set_journal(Journal::new(Rc::new(RefCell::new(slow))));
     let slow_url = http.url("/slow");
     let script = async move {
@@ -551,7 +557,7 @@ async fn journaling_a_request_counts_against_its_timeout() {
         assert_eq!(peer.recv().await, "hello|codec=0|plan=1");
         assert_eq!(peer.recv().await, "sub|add=A");
         let start = std::time::Instant::now();
-        peer.send(&format!("get|tag=2|ms=500|url={slow_url}"));
+        peer.send(&format!("get|tag=2|ms=1500|url={slow_url}"));
         let _held = http.request().await;
         until(|| venue.http_log().len() == 1).await;
         let took = start.elapsed();
@@ -561,8 +567,8 @@ async fn journaling_a_request_counts_against_its_timeout() {
     let (run, took) = tokio::join!(session.run(), script);
     run.unwrap();
     assert_eq!(venue.http_log(), ["0/2:TimedOut"]);
-    // 500 ms from the ask, not 400 ms of journaling and then 500 more.
-    assert!(took >= ms(500) && took < ms(800), "{took:?}");
+    // 1.5 s from the ask, not 1 s of journaling and then 1.5 s more.
+    assert!(took >= ms(1_500) && took < ms(2_200), "{took:?}");
 }
 
 /// A request carrying a secret header makes the session credentialed: its response is withheld.
@@ -613,6 +619,9 @@ impl JournalSink for Kinds {
         };
         self.0.push(kind);
         Recorded::Ok
+    }
+    fn omit(&mut self, _: TrafficClass, _: WallNs) -> Recorded {
+        Recorded::DroppedCounted
     }
 }
 
@@ -671,6 +680,9 @@ impl JournalSink for Unbuilt {
         self.lazy.push(payload);
         Recorded::DroppedCounted
     }
+    fn omit(&mut self, _: TrafficClass, _: WallNs) -> Recorded {
+        Recorded::DroppedCounted
+    }
 }
 
 /// Codex r4178252055: inbound frames and response bodies are offered lazily, with their size,
@@ -682,7 +694,8 @@ async fn inbound_frames_and_responses_are_offered_lazily_with_their_size() {
     let (mut session, control) = MdSession::new(session(venue, ws.url()), |_| {}).unwrap();
     let sink = Rc::new(RefCell::new(Unbuilt::default()));
     session.set_journal(Journal::new(sink.clone()));
-    let get = format!("get|tag=1|ms=5000|url={}", http.url("/snap"));
+    let snap = http.url("/snap");
+    let get = format!("get|tag=1|ms=5000|url={snap}");
     let frame = get.clone();
     let script = async move {
         let mut peer = ws.accept().await;
@@ -696,11 +709,126 @@ async fn inbound_frames_and_responses_are_offered_lazily_with_their_size() {
     let (run, ()) = tokio::join!(session.run(), script);
     run.unwrap();
     let sink = sink.borrow();
-    assert_eq!(sink.lazy, [get.len(), "say".len()]);
+    // The frame, the request it asked for (its URL; the toy's body is empty) and the response.
+    assert_eq!(sink.lazy, [get.len(), snap.len(), "say".len()]);
     assert!(
         !sink
             .built
             .iter()
             .any(|l| l.starts_with("in ") || l.starts_with("result "))
     );
+}
+
+/// Codex r4178287664: an input a credentialed session withholds leaves a gap the journal marks,
+/// so a recording of it never reads as complete.
+#[tokio::test]
+async fn withheld_inputs_leave_a_gap_the_journal_marks() {
+    let root = fresh_dir("md_journal_withheld");
+    let config = SinkConfig {
+        budget_bytes: 1 << 20,
+        soft_limit_pct: 85,
+    };
+    let (sink, drain) = journal_queue(config, key()).unwrap();
+    let writer = drain
+        .spawn(JournalWriter::create(&root, SHARD, key()).unwrap())
+        .unwrap();
+    let sink = Rc::new(RefCell::new(sink));
+    let mut ws = ScriptedWs::start().await;
+    let seen = Seen::default();
+    let (mut session, control) =
+        MdSession::new(session(ToyVenue::leak(), ws.url()), keep(&seen)).unwrap();
+    session.set_journal(Journal::new(sink.clone()));
+    let watch = seen.clone();
+    let script = async move {
+        let mut peer = ws.accept().await;
+        assert_eq!(peer.recv().await, "hello|codec=0|plan=1");
+        assert_eq!(peer.recv().await, "sub|add=A");
+        peer.send("auth");
+        assert_eq!(peer.recv().await, "auth|key=toy-secret");
+        peer.send("trade|sym=A|px=2|qty=1|seq=2|echo=toy-secret");
+        until(|| watch.borrow().len() == 1).await;
+        peer.send("say");
+        assert_eq!(peer.recv().await, "said");
+        drop(control);
+        assert_eq!(peer.next().await, None);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    writer.close().unwrap();
+    assert_eq!(session.counters().journal_withheld, 2);
+    let records = read_all(&root);
+    let lines: Vec<String> = records.iter().map(line).collect();
+    let tail: Vec<&str> = lines[lines.len() - 5..]
+        .iter()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        tail,
+        [
+            "write 0 Written",
+            "degraded",
+            "out 0 said",
+            "write 0 Written",
+            "close 0"
+        ],
+        "{lines:#?}"
+    );
+    let marker = &records[records.len() - 4];
+    assert!(matches!(
+        marker,
+        Record::Marker(Marker::Degraded { dropped: 2, .. })
+    ));
+    fs::remove_dir_all(&root).unwrap();
+}
+
+/// A sink that keeps the size each request was offered with, refusing it unbuilt.
+#[derive(Default)]
+struct RequestSizes(Vec<usize>);
+
+impl JournalSink for RequestSizes {
+    fn record(&mut self, _: TrafficClass, _: WallNs, _: &Record) -> Recorded {
+        Recorded::Ok
+    }
+
+    fn record_with(
+        &mut self,
+        _: TrafficClass,
+        _: WallNs,
+        payload: usize,
+        _: &mut dyn FnMut() -> Record,
+    ) -> Recorded {
+        self.0.push(payload);
+        Recorded::DroppedCounted
+    }
+
+    fn omit(&mut self, _: TrafficClass, _: WallNs) -> Recorded {
+        Recorded::DroppedCounted
+    }
+}
+
+/// Codex r4178287660: an HTTP request is offered lazily too, with its URL and body size, so a
+/// full journal refuses it before it is cloned.
+#[tokio::test]
+async fn http_requests_are_offered_lazily_with_their_size() {
+    let (mut ws, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
+    let venue = ToyVenue::leak();
+    let (mut session, control) = MdSession::new(session(venue, ws.url()), |_| {}).unwrap();
+    let sizes = Rc::new(RefCell::new(RequestSizes::default()));
+    session.set_journal(Journal::new(sizes.clone()));
+    let url = http.url("/snap");
+    let get = format!("get|tag=1|ms=5000|url={url}");
+    let script = async move {
+        let mut peer = ws.accept().await;
+        assert_eq!(peer.recv().await, "hello|codec=0|plan=1");
+        assert_eq!(peer.recv().await, "sub|add=A");
+        peer.send(&get);
+        http.request().await.answer("HTTP/1.1 200 OK", "").await;
+        until(|| venue.http_log().len() == 1).await;
+        drop(control);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    // The inbound frame, the request (its URL; the toy's body is empty) and the empty result.
+    let get_len = format!("get|tag=1|ms=5000|url={url}").len();
+    assert_eq!(sizes.borrow().0, [get_len, url.len(), 0]);
 }

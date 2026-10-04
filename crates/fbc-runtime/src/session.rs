@@ -41,8 +41,11 @@
 //! frames and responses would be journaled verbatim: a session that carries a credential (its
 //! endpoint URL has a redaction span, or it has sent a frame or HTTP request with one, or with a
 //! header the codec marked or one of the journal's secret headers) journals none of what it
-//! receives from then on, counting each withheld input instead (Codex r4178197275). What it
-//! sends is still journaled, its spans as keyed hashes.
+//! receives from then on, counting each withheld input instead (Codex r4178197275) and omitting
+//! it at the sink, which counts it as dropped and marks the gap with a `Degraded` marker (Codex
+//! r4178287664). What it sends is still journaled, its spans as keyed hashes. Inbound frames,
+//! HTTP requests and HTTP results are offered with their size, so a sink with no room refuses
+//! them before they are copied.
 
 use std::cell::Cell;
 use std::cmp::Reverse;
@@ -385,8 +388,8 @@ impl<H: MdHandler> MdSession<H> {
     }
 
     /// Offers the record of an input `make` builds, holding `payload` bytes the input carries,
-    /// unless the session has carried a credential, in which case the input is withheld and
-    /// counted. The sink is told the payload's size first, so one with no room for it refuses it
+    /// unless the session has carried a credential, in which case the input is withheld,
+    /// counted, and omitted at the sink, which marks the gap (Codex r4178287664). The sink is told the payload's size first, so one with no room for it refuses it
     /// before it is copied (Codex r4178252055).
     fn journal_input(
         &self,
@@ -400,6 +403,7 @@ impl<H: MdHandler> MdSession<H> {
         };
         if self.credentialed.get() {
             self.withheld.set(self.withheld.get() + 1);
+            journal.omit(class, now);
         } else {
             journal.record_with(class, now, payload, make);
         }
@@ -859,13 +863,18 @@ impl<H: MdHandler> MdSession<H> {
             self.credentialed.set(true);
         }
         let (at, now) = self.clock.now();
-        self.journal(class, now, || Record::HttpRequest {
-            at,
-            conn,
-            tag,
-            rpc,
-            req: HttpRequestRec::from(&req),
-        });
+        // Offered with its size, so a full journal refuses it before it is cloned (Codex
+        // r4178287660).
+        if let Some(journal) = &self.journal {
+            let payload = req.url.as_str().len() + req.body.bytes().len();
+            journal.record_with(class, now, payload, || Record::HttpRequest {
+                at,
+                conn,
+                tag,
+                rpc,
+                req: HttpRequestRec::from(&req),
+            });
+        }
         let (connector, max_body) = (self.connector.clone(), self.http_max_body);
         self.http.push(Box::pin(async move {
             let result = connector.http_by(&req, deadline, max_body).await;
