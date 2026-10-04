@@ -20,6 +20,9 @@
 //! - [INFO] `market-data/rest-api/Exchange-Information`: `rateLimits` holds `REQUEST_WEIGHT`,
 //!   interval MINUTE, intervalNum 1, limit 2400; general-info: the limits are per IP.
 //! - [STP] `trade/rest-api` (New Order): `selfTradePreventionMode` defaults to `NONE`.
+//! - [CHANGES] `https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/change-log`,
+//!   2023-08-29: Self-Trade Prevention prevents matching within one account or the accounts of
+//!   one `tradeGroupId`; effective 2023-09-05.
 
 use core::num::NonZeroU32;
 use core::time::Duration;
@@ -58,8 +61,11 @@ pub(crate) fn caps(settings: &Settings) -> VenueCaps {
         matching: MatchingCaps {
             // No delay on incoming orders is documented.
             speed_bump: None,
-            // An order without selfTradePreventionMode gets NONE [STP].
-            stp_scope: StpScope::None,
+            // STP "will prevent orders from matching with orders from the same account, or
+            // accounts under the same tradeGroupId" [CHANGES, 2023-08-29]: the owner's scope.
+            // An order opts in (selfTradePreventionMode defaults to NONE [STP]); this library
+            // places none here.
+            stp_scope: StpScope::Owner,
         },
         md: MdCaps {
             encoding: Encoding::Json,
