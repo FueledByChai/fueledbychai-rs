@@ -37,8 +37,12 @@
 //! the frame is written all the same. A write that failed, or that the control's drop
 //! interrupted, has no write result: whether any of it reached the venue is unknown, and the
 //! connection's `Closed` follows. Pings, pongs and close frames carry no data and are not
-//! journaled. Until FBC-7lm, inbound frames and response bodies are journaled verbatim, so only
-//! public market-data sessions take a journal.
+//! journaled. Until FBC-7lm, nothing a codec receives carries redaction spans, so inbound
+//! frames and responses would be journaled verbatim: a session that carries a credential (its
+//! endpoint URL has a redaction span, or it has sent a frame or HTTP request with one, or with a
+//! header the codec marked or one of the journal's secret headers) journals none of what it
+//! receives from then on, counting each withheld input instead (Codex r4178197275). What it
+//! sends is still journaled, its spans as keyed hashes.
 
 use std::cell::Cell;
 use std::cmp::Reverse;
@@ -57,6 +61,7 @@ use fbc_core::{
 };
 use fbc_journal::{
     ControlEvent, HeaderRec, HttpRequestRec, HttpResponseRec, Opaque, Record, WriteRes,
+    is_secret_header,
 };
 use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt, SinkExt, StreamExt};
@@ -225,6 +230,9 @@ pub struct MdCounters {
     /// Effects refused as codec defects: a frame or reconnect for another stream, or for a
     /// poll endpoint's own.
     pub refused_effects: u64,
+    /// Inbound frames and HTTP responses not journaled because the session carries a
+    /// credential (until FBC-7lm).
+    pub journal_withheld: u64,
 }
 
 /// One market-data endpoint, driven by [`MdSession::run`].
@@ -250,6 +258,10 @@ pub struct MdSession<H> {
     http_max_body: usize,
     counters: MdCounters,
     journal: Option<Journal>,
+    /// The session has carried a credential: nothing it receives is journaled (until FBC-7lm).
+    credentialed: Cell<bool>,
+    /// Inputs withheld from the journal since ([`MdCounters::journal_withheld`]).
+    withheld: Cell<u64>,
     handler: H,
 }
 
@@ -294,12 +306,12 @@ impl<H: MdHandler> MdSession<H> {
         config: MdSessionConfig,
         handler: H,
     ) -> Result<(MdSession<H>, MdControl), SessionError> {
-        let url = match &config.plan.transport {
+        let (url, credentialed) = match &config.plan.transport {
             MdTransport::Socket { url } => {
                 ws::check_url(url.as_str()).map_err(SessionError::Url)?;
-                url.as_str().to_owned()
+                (url.as_str().to_owned(), !url.redactions().is_empty())
             }
-            MdTransport::Poll { .. } => String::new(),
+            MdTransport::Poll { base_url } => (String::new(), !base_url.redactions().is_empty()),
         };
         let caps = config
             .venue
@@ -331,6 +343,8 @@ impl<H: MdHandler> MdSession<H> {
             http_max_body: config.http_max_body,
             counters: MdCounters::default(),
             journal: None,
+            credentialed: Cell::new(credentialed),
+            withheld: Cell::new(0),
             handler,
         };
         let control = MdControl {
@@ -351,7 +365,10 @@ impl<H: MdHandler> MdSession<H> {
     }
 
     pub fn counters(&self) -> MdCounters {
-        self.counters
+        MdCounters {
+            journal_withheld: self.withheld.get(),
+            ..self.counters
+        }
     }
 
     /// Records everything the session sends and receives into `journal` from now on (0006);
@@ -364,6 +381,16 @@ impl<H: MdHandler> MdSession<H> {
     fn journal(&self, class: TrafficClass, now: WallNs, make: impl FnOnce() -> Record) {
         if let Some(journal) = &self.journal {
             journal.record(class, now, &make());
+        }
+    }
+
+    /// Offers the record of an input `make` builds, unless the session has carried a
+    /// credential, in which case the input is withheld and counted.
+    fn journal_input(&self, class: TrafficClass, now: WallNs, make: impl FnOnce() -> Record) {
+        if self.journal.is_some() && self.credentialed.get() {
+            self.withheld.set(self.withheld.get() + 1);
+        } else {
+            self.journal(class, now, make);
         }
     }
 
@@ -570,7 +597,7 @@ impl<H: MdHandler> MdSession<H> {
             Message::Binary(bytes) => RawFrame::Binary(bytes.as_ref()),
             _ => return,
         };
-        self.journal(TrafficClass::Normal, stamp.recv_wall, || {
+        self.journal_input(TrafficClass::Normal, stamp.recv_wall, || {
             Record::inbound(stamp, raw)
         });
         let mut sink = Sink {
@@ -704,6 +731,9 @@ impl<H: MdHandler> MdSession<H> {
                     let text = std::str::from_utf8(bytes).map(Message::text);
                     let message = text.unwrap_or_else(|_| Message::binary(bytes.to_vec()));
                     let (conn, rpc) = (self.current(), rpc.map(|call| call.id));
+                    if !frame.redactions().is_empty() {
+                        self.credentialed.set(true);
+                    }
                     let (at, now) = self.clock.now();
                     self.journal(class, now, || Record::Outbound {
                         at,
@@ -802,10 +832,20 @@ impl<H: MdHandler> MdSession<H> {
         timeout: Duration,
         class: TrafficClass,
     ) {
+        // The timeout runs from the ask, so journaling the request counts against it (Codex
+        // r4178197281).
+        let deadline = Instant::now().checked_add(timeout);
         let conn = ConnKey {
             epoch,
             ..self.current()
         };
+        let secret = |h: &fbc_core::Header| h.redact || is_secret_header(h.name);
+        if !req.url.redactions().is_empty()
+            || !req.body.redactions().is_empty()
+            || req.headers.iter().any(secret)
+        {
+            self.credentialed.set(true);
+        }
         let (at, now) = self.clock.now();
         self.journal(class, now, || Record::HttpRequest {
             at,
@@ -815,7 +855,6 @@ impl<H: MdHandler> MdSession<H> {
             req: HttpRequestRec::from(&req),
         });
         let (connector, max_body) = (self.connector.clone(), self.http_max_body);
-        let deadline = Instant::now().checked_add(timeout);
         self.http.push(Box::pin(async move {
             let result = connector.http_by(&req, deadline, max_body).await;
             Answered {
@@ -835,7 +874,7 @@ impl<H: MdHandler> MdSession<H> {
             ..self.current()
         };
         let stamp = self.clock.stamp(key);
-        self.journal(done.class, stamp.recv_wall, || Record::HttpResult {
+        self.journal_input(done.class, stamp.recv_wall, || Record::HttpResult {
             stamp,
             tag: done.tag,
             result: done.result.as_ref().map(response_rec).map_err(|e| *e),
