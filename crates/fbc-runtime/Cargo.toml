@@ -1,6 +1,6 @@
 [package]
 name = "fbc-runtime"
-description = "The one generic runtime: so far a connector that opens TCP directly or through a SOCKS5 proxy, with WebSocket and HTTP/1.1 over it, plain or TLS, and connection epochs with a subscription reconciler."
+description = "The one generic runtime: so far a connector that opens TCP directly or through a SOCKS5 proxy, with WebSocket and HTTP/1.1 over it, plain or TLS, connection epochs with a subscription reconciler, and a market-data session that drives a venue codec over them with paced reconnects."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,8 +10,9 @@ publish = false
 
 [dependencies]
 fbc-core = { path = "../fbc-core" }
-tokio = { workspace = true, features = ["rt", "net", "io-util", "macros"] }
+tokio = { workspace = true, features = ["rt", "net", "io-util", "macros", "sync", "time"] }
 tokio-tungstenite.workspace = true
+futures-util = { workspace = true, features = ["sink", "std"] }
 hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
@@ -20,7 +21,7 @@ tokio-rustls.workspace = true
 webpki-roots.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "net", "io-util", "macros"] }
+tokio = { workspace = true, features = ["rt", "net", "io-util", "macros", "sync", "time", "test-util"] }
 tokio-tungstenite.workspace = true
-futures-util = { workspace = true, features = ["sink", "std"] }
+rust_decimal.workspace = true
 rcgen.workspace = true

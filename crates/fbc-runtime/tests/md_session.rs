@@ -1,0 +1,269 @@
+//! FBC-ku8's done line: a market-data session drives the toy venue's codec against a local
+//! WebSocket server, delivers stamped events in ingest order, opens a fresh epoch after a drop
+//! with each subscription sent once, fires an old epoch's timer into nothing, sends only the
+//! difference when the desired set changes, and paces attempts against a refusing server.
+
+mod common;
+
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::thread::{self, ThreadId};
+use std::time::Duration;
+
+use common::toy::{self, REFUSE, ToyVenue};
+use common::{ScriptedWs, hanging, refusing};
+use fbc_core::{ConnKey, Envelope, Feed, FeedHealth, InstrumentId, MdEvent, MdTransport, WireUrl};
+use fbc_core::{EndpointPlan, VenueConfig};
+use fbc_runtime::{
+    Connector, IngestClock, Input, MdCounters, MdSession, MdSessionConfig, ProxyConfig,
+    ReconnectPacing, SessionError,
+};
+
+type Seen = Rc<RefCell<Vec<(ThreadId, Envelope<MdEvent>)>>>;
+
+/// A handler that keeps every envelope and the thread it arrived on.
+fn keep(seen: &Seen) -> impl FnMut(Envelope<MdEvent>) + use<> {
+    let seen = seen.clone();
+    move |env| seen.borrow_mut().push((thread::current().id(), env))
+}
+
+/// The connection number the tests stamp the toy's session with.
+const CONN: u16 = 7;
+
+/// A session of `venue` at `url` wanting trades on `subs`, directly, paced by `pacing`.
+fn session(
+    venue: &'static ToyVenue,
+    url: String,
+    subs: &[u32],
+    pacing: ReconnectPacing,
+) -> MdSessionConfig {
+    MdSessionConfig {
+        venue,
+        cfg: VenueConfig::new(),
+        plan: EndpointPlan {
+            stream: toy::STREAM,
+            transport: MdTransport::Socket {
+                url: WireUrl::plain(url),
+            },
+            subs: subs.iter().copied().map(toy::sub).collect(),
+        },
+        specs: toy::specs(),
+        connector: Connector::new(ProxyConfig::Direct),
+        pacing,
+        clock: IngestClock::new(),
+        conn: CONN,
+    }
+}
+
+fn ms(n: u64) -> Duration {
+    Duration::from_millis(n)
+}
+
+/// A fast floor, so a drop reconnects at once in real time.
+fn quick() -> ReconnectPacing {
+    ReconnectPacing::new(ms(10), ms(100), 100, Duration::from_secs(60)).unwrap()
+}
+
+/// Waits, in real time, until `done` holds.
+async fn until(done: impl Fn() -> bool) {
+    while !done() {
+        tokio::time::sleep(ms(2)).await;
+    }
+}
+
+fn key(epoch: u32) -> ConnKey {
+    ConnKey { conn: CONN, epoch }
+}
+
+#[tokio::test]
+async fn events_arrive_stamped_in_ingest_order_and_a_drop_opens_a_fresh_epoch_subscribed_once() {
+    let mut server = ScriptedWs::start().await;
+    let seen = Seen::default();
+    let config = session(ToyVenue::leak(), server.url(), &[1, 2], quick());
+    let (mut session, control) = MdSession::new(config, keep(&seen)).unwrap();
+    let watch = seen.clone();
+    let script = async move {
+        let mut first = server.accept().await;
+        assert_eq!(first.recv().await, "hello|codec=0");
+        assert_eq!(first.recv().await, "sub|add=A,B");
+        first.send("trade|sym=A|px=100|qty=1|seq=1");
+        first.send("arm|sym=A|ms=150");
+        first.send_binary(b"\xff");
+        first.send("trade|sym=B|px=200|qty=2|seq=2");
+        until(|| watch.borrow().len() == 2).await;
+        first.drop_conn();
+
+        let mut second = server.accept().await;
+        assert_eq!(second.recv().await, "hello|codec=1");
+        assert_eq!(second.recv().await, "sub|add=A,B");
+        second.send("arm|sym=B|ms=300");
+        second.send("trade|sym=A|px=101|qty=3|seq=3");
+        until(|| watch.borrow().len() == 4).await;
+        drop(control);
+        // The session closed the connection having sent nothing more: each subscription once.
+        assert_eq!(second.next().await, None);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+
+    let seen = seen.borrow();
+    let here = thread::current().id();
+    assert!(seen.iter().all(|(thread, _)| *thread == here));
+    let envs: Vec<_> = seen.iter().map(|(_, env)| env).collect();
+    let conns: Vec<_> = envs.iter().map(|e| e.stamp.conn).collect();
+    assert_eq!(conns, [key(0), key(0), key(1), key(1)]);
+    assert!(
+        envs.windows(2)
+            .all(|w| w[0].stamp.ingest_seq < w[1].stamp.ingest_seq)
+    );
+    assert!(
+        envs.windows(2)
+            .all(|w| w[0].stamp.recv_mono <= w[1].stamp.recv_mono)
+    );
+    assert!(envs.iter().all(|e| e.stamp.kernel_rx.is_none()));
+    let seqs: Vec<_> = envs.iter().map(|e| e.venue_seq).collect();
+    assert_eq!(seqs, [Some(1), Some(2), Some(3), None]);
+    // The old epoch's timer (instrument A) fired into nothing; only the current one's reported.
+    let stale_b = MdEvent::Health {
+        inst: InstrumentId::new(2),
+        feed: Feed::Trades,
+        h: FeedHealth::Stale,
+    };
+    assert_eq!(envs[3].body, stale_b);
+    assert_eq!(session.stale(Input::Timer), 1);
+    assert_eq!(session.stale(Input::Event), 0);
+    assert_eq!(session.current(), key(1));
+    let counters = session.counters();
+    assert_eq!((counters.attempts, counters.failed_attempts), (2, 0));
+    assert_eq!(counters.decode_errors, 1);
+}
+
+#[tokio::test]
+async fn adding_and_removing_subscriptions_while_connected_sends_only_the_difference() {
+    let mut server = ScriptedWs::start().await;
+    let config = session(ToyVenue::leak(), server.url(), &[1], quick());
+    let (mut session, control) = MdSession::new(config, |_| {}).unwrap();
+    let script = async move {
+        let mut peer = server.accept().await;
+        assert_eq!(peer.recv().await, "hello|codec=0");
+        assert_eq!(peer.recv().await, "sub|add=A");
+        control.set_desired([1, 2].map(toy::sub));
+        assert_eq!(peer.recv().await, "sub|add=B");
+        control.set_desired([2].map(toy::sub));
+        assert_eq!(peer.recv().await, "sub|remove=A");
+        // Re-adding what is active sends nothing; the next change is the next frame.
+        control.set_desired([2].map(toy::sub));
+        control.set_desired([2, 3].map(toy::sub));
+        assert_eq!(peer.recv().await, "sub|add=C");
+        drop(control);
+        assert_eq!(peer.next().await, None);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    assert_eq!(session.counters().refused_subscribes, 0);
+}
+
+#[tokio::test]
+async fn a_refused_subscribe_stays_pending_stray_effects_are_refused_and_bye_reconnects() {
+    let mut server = ScriptedWs::start().await;
+    // Instrument 9 is not in the spec table, so the toy refuses the whole call.
+    let slow = ReconnectPacing::new(ms(200), ms(200), 100, Duration::from_secs(60)).unwrap();
+    let config = session(ToyVenue::leak(), server.url(), &[1, 9], slow);
+    let (mut session, control) = MdSession::new(config, |_| {}).unwrap();
+    let script = async move {
+        let mut first = server.accept().await;
+        assert_eq!(first.recv().await, "hello|codec=0");
+        control.set_desired([1].map(toy::sub));
+        assert_eq!(first.recv().await, "sub|add=A");
+        first.send("odd");
+        first.send("arm|sym=A|ms=50");
+        first.send("bye");
+        assert_eq!(first.next().await, None);
+        // While disconnected, the timer fires into nothing and a change waits for the epoch.
+        control.set_desired([1, 2].map(toy::sub));
+        let mut second = server.accept().await;
+        assert_eq!(second.recv().await, "hello|codec=1");
+        assert_eq!(second.recv().await, "sub|add=A,B");
+        drop(control);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    let counters = session.counters();
+    assert_eq!(counters.refused_subscribes, 1);
+    assert_eq!(counters.refused_effects, 3);
+    assert_eq!(session.stale(Input::Timer), 1);
+    assert_eq!(session.current(), key(1));
+}
+
+#[tokio::test]
+async fn dropping_the_control_stops_a_session_whose_connect_hangs() {
+    let (addr, mut accepts) = hanging().await;
+    let config = session(ToyVenue::leak(), format!("ws://{addr}/md"), &[1], quick());
+    let (mut session, control) = MdSession::new(config, |_| {}).unwrap();
+    let script = async move {
+        accepts.recv().await.unwrap();
+        control.set_desired([1, 2].map(toy::sub));
+        tokio::task::yield_now().await;
+        drop(control);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    assert_eq!(session.counters().attempts, 1);
+    assert_eq!(session.counters().failed_attempts, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refusing_server_sees_attempts_spaced_by_the_backoff_and_within_the_budget() {
+    let (addr, mut accepts) = refusing().await;
+    let pacing = ReconnectPacing::new(ms(1_000), ms(4_000), 3, ms(10_000)).unwrap();
+    let config = session(ToyVenue::leak(), format!("ws://{addr}/md"), &[1], pacing);
+    let (mut session, control) = MdSession::new(config, |_| {}).unwrap();
+    let script = async move {
+        let mut at = Vec::new();
+        while at.len() < 7 {
+            at.push(accepts.recv().await.unwrap());
+        }
+        drop(control);
+        at
+    };
+    let (run, at) = tokio::join!(session.run(), script);
+    run.unwrap();
+    let since: Vec<_> = at.iter().map(|t| t.duration_since(at[0])).collect();
+    // Backoff 1, 2, then 4 s, held to 10 s by a budget of 3 per 10 s, then 4 s at the ceiling.
+    assert_eq!(
+        since,
+        [0, 1_000, 3_000, 10_000, 14_000, 18_000, 22_000].map(ms)
+    );
+    assert!(
+        at.windows(4)
+            .all(|w| w[3].duration_since(w[0]) >= ms(10_000))
+    );
+    let MdCounters {
+        attempts,
+        failed_attempts,
+        ..
+    } = session.counters();
+    // The seventh may still be failing when the control drops.
+    assert_eq!(attempts, 7);
+    assert!(failed_attempts >= 6);
+}
+
+#[test]
+fn a_session_needs_a_socket_endpoint_and_a_configuration_the_venue_accepts() {
+    let mut config = session(ToyVenue::leak(), "ws://127.0.0.1:1/".into(), &[], quick());
+    config.plan.transport = MdTransport::Poll {
+        base_url: WireUrl::plain("http://127.0.0.1:1/"),
+    };
+    let err = MdSession::new(config, |_| {}).err().unwrap();
+    assert_eq!(err, SessionError::NotASocket);
+    assert_eq!(err.to_string(), "the endpoint is not a socket");
+
+    let mut config = session(ToyVenue::leak(), "ws://127.0.0.1:1/".into(), &[], quick());
+    config.cfg.insert(REFUSE, "yes");
+    let err = MdSession::new(config, |_| {}).err().unwrap();
+    assert!(matches!(err, SessionError::Config(_)));
+    assert_eq!(
+        err.to_string(),
+        "venue configuration refused: invalid configuration key toy.refuse: refused"
+    );
+}
