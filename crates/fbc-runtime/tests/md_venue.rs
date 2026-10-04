@@ -30,8 +30,9 @@ fn config(urls: &[String], conns: Range<u16>) -> MdVenueConfig {
     for (n, url) in urls.iter().enumerate() {
         cfg.insert(&format!("toy.url.{n}"), url);
     }
+    let venue = ToyVenue::leak();
     MdVenueConfig {
-        venue: ToyVenue::leak(),
+        venue,
         cfg,
         specs: toy::specs(),
         connector: Connector::new(ProxyConfig::Direct),
@@ -39,6 +40,7 @@ fn config(urls: &[String], conns: Range<u16>) -> MdVenueConfig {
         clock: IngestClock::new(),
         http_max_body: 64 * 1024,
         conns,
+        limiter: venue.limiter(0),
     }
 }
 

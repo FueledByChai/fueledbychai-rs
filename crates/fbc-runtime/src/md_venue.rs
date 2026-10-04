@@ -32,6 +32,7 @@ use crate::connector::Connector;
 use crate::error::NetError;
 use crate::journal::Journal;
 use crate::pacing::ReconnectPacing;
+use crate::ratelimit::RateLimiter;
 use crate::session::{IngestClock, MdControl, MdHandler, MdSession, MdSessionConfig, SessionError};
 use crate::ws;
 
@@ -49,6 +50,9 @@ pub struct MdVenueConfig {
     /// The connection numbers this venue's endpoints take, in order, one per endpoint opened;
     /// disjoint from every other connection's on the shard.
     pub conns: Range<u16>,
+    /// The buckets of the venue's declared limits, which every endpoint charges (decision
+    /// 0030); built for exactly the venue's limits.
+    pub limiter: RateLimiter,
 }
 
 /// Why a desired set was not planned; nothing was opened or closed for it.
@@ -145,10 +149,11 @@ impl<H: MdHandler + 'static> MdVenue<H> {
         config: MdVenueConfig,
         handler: H,
     ) -> Result<(MdVenue<H>, MdVenueControl), SessionError> {
-        config
+        let caps = config
             .venue
             .caps(&config.cfg)
             .map_err(SessionError::Config)?;
+        config.limiter.check(&caps.limits)?;
         let (tx, plan) = watch::channel(Vec::new());
         let control = MdVenueControl {
             venue: config.venue,
@@ -242,6 +247,7 @@ impl<H: MdHandler + 'static> MdVenue<H> {
             clock: c.clock.clone(),
             http_max_body: c.http_max_body,
             conn,
+            limiter: c.limiter.clone(),
         };
         let (mut session, control) = MdSession::new(config, Shared(self.handler.clone()))?;
         if let Some(journal) = &self.journal {

@@ -50,6 +50,11 @@
 //! book ([`TradingBooks`]); [`BookKeeper`] is the [`MdHandler`] that feeds it and then the
 //! consumer's [`BookHandler`] (FBC-nij).
 //!
+//! A [`RateLimiter`] keeps a bucket per declared rate limit and scope key, charged by each
+//! frame's, HTTP request's and connection attempt's rate charge, with a [`SafetyReserve`] that
+//! normal traffic stops at, and counts refusals and a venue's 429 and 418 by scope (FBC-bel,
+//! decision 0030); every session charges it before it writes, asks or connects.
+//!
 //! Not here yet: order-entry sessions, keepalives, client certificates and certificate pinning.
 //! Apart from a codec's HTTP request, no call here has a deadline of its own; the caller bounds
 //! one with its own timer.
@@ -62,6 +67,7 @@ pub mod http;
 mod journal;
 mod md_venue;
 mod pacing;
+mod ratelimit;
 mod reconcile;
 mod session;
 mod socks5;
@@ -77,6 +83,10 @@ pub use error::{Cause, NetError, Step};
 pub use journal::Journal;
 pub use md_venue::{MdVenue, MdVenueConfig, MdVenueControl, PlanError};
 pub use pacing::{PacingError, ReconnectPacing};
+pub use ratelimit::{
+    BucketKey, Charged, RateCounts, RateError, RateLimiter, Refused, Request, SafetyReserve,
+    ScopeCounts,
+};
 pub use reconcile::{ReconcileError, Reconciler, SubscribeCall};
 pub use session::{
     IngestClock, MdControl, MdCounters, MdHandler, MdSession, MdSessionConfig, SessionError,
