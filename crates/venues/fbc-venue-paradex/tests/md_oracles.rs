@@ -13,13 +13,14 @@ use std::collections::BTreeMap;
 use fbc_book::{BookError, BookState, LevelDiff, Touch};
 use fbc_core::{
     Aggressor, BookSide, DecodeError, ExchNs, ExchTsKind, Lots, Lvl, MdCodec, MdEvent, RawFrame,
-    SeqDomain, StreamId, Subscription, Ticks, VenueMeta,
+    SeqDomain, StreamId, Subscription, Ticks, TouchSourceId, VenueMeta,
 };
 use fbc_venue_paradex::factory::caps;
+use fbc_venue_paradex::md::book::frame_seq;
 use fbc_venue_paradex::md::rest::{
     ORDERBOOK_DEPTH, OrderbookSnapshot, decode_orderbook, orderbook_path,
 };
-use fbc_venue_paradex::md::{BBO, DELTAS, ParadexMd};
+use fbc_venue_paradex::md::{BBO, DELTAS, INTERACTIVE_DELTAS, ParadexMd};
 use md::{BTC, ETH, decode_with, frame, specs};
 use oracle::{BookMismatch, DeltaBook, Disagreement, OracleError, check_snapshot, touch_agreement};
 
@@ -52,9 +53,8 @@ fn delta_book(names: &[&str]) -> DeltaBook {
         let out = decode_with(&mut codec, RawFrame::Binary(&frame(name)));
         assert_eq!(out.result, Ok(()), "{name}");
         assert!(out.fx.is_empty(), "{name}: {:?}", out.fx);
-        for (meta, ev) in &out.events {
-            book.apply(meta, ev).unwrap();
-        }
+        let at = frame_seq(&frame(name), &specs()).unwrap();
+        book.frame(at, &out.events).unwrap();
     }
     book
 }
@@ -166,13 +166,16 @@ fn the_book_check_refuses_a_book_at_another_seq_no_another_market_or_not_valid()
     assert_eq!(err, none);
     // A gap reported before any snapshot leaves no book to read.
     let mut empty = DeltaBook::new(BTC, DELTAS);
-    empty.apply(&meta(Some(2002)), &gap()).unwrap();
+    empty
+        .frame(Some((BTC, 2002)), &[(meta(Some(2002)), gap())])
+        .unwrap();
     let awaiting = BookError::NotValid(BookState::AwaitingSnapshot);
     let err = check_snapshot(&empty, &snap).unwrap_err();
     assert_eq!(err, BookMismatch::NotValid(awaiting));
     // A gap at the snapshot's seq_no invalidates the book.
     let mut book = delta_book(&FRAMES_TO_2002);
-    book.apply(&meta(Some(2002)), &gap()).unwrap();
+    book.frame(Some((BTC, 2002)), &[(meta(Some(2002)), gap())])
+        .unwrap();
     let err = check_snapshot(&book, &snap).unwrap_err();
     let not_valid = BookError::NotValid(BookState::Gapped);
     assert_eq!(err, BookMismatch::NotValid(not_valid));
@@ -198,7 +201,7 @@ fn the_delta_book_refuses_a_snapshot_end_without_a_begin() {
         book: DELTAS,
     };
     assert_eq!(
-        book.apply(&meta(Some(1)), &end),
+        book.frame(Some((BTC, 1)), &[(meta(Some(1)), end)]),
         Err(BookError::NoSnapshotInProgress)
     );
 }
@@ -368,19 +371,23 @@ impl Gen {
 fn touch_agreement_over_1000_generated_bbo_samples_reports_99_9_percent_and_names_the_planted_one()
 {
     // bbo shares the book's sequence (0022), so a sample is compared at its equal seq_no.
-    let domain = caps().md.touch_sources[usize::from(BBO.0)].seq_domain;
-    assert_eq!(domain, SeqDomain::SharedWithBook);
+    let md = caps().md;
+    assert_eq!(
+        md.touch_sources[usize::from(BBO.0)].seq_domain,
+        SeqDomain::SharedWithBook
+    );
 
     let snap = decode_orderbook(rest_text().as_bytes(), &specs()).unwrap();
     let mut book = delta_book(&FRAMES_TO_2002);
     let mut generator = Gen::new(&snap);
     let mut bbo = Vec::new();
     for seq in 2003..3003 {
-        let (meta, ev) = generator.delta(seq);
-        book.apply(&meta, &ev).unwrap();
+        let delta = generator.delta(seq);
+        book.frame(Some((BTC, seq)), &[delta]).unwrap();
         bbo.push(generator.bbo(seq));
     }
-    // A trade on the bbo connection is not a sample.
+    // Not samples: a trade, an ETH touch and a touch of an undeclared source, each at a seq_no
+    // whose BTC touch they do not match (Codex r4177861131).
     let trade = MdEvent::Trade {
         inst: BTC,
         id: None,
@@ -388,10 +395,18 @@ fn touch_agreement_over_1000_generated_bbo_samples_reports_99_9_percent_and_name
         px: Ticks(620_005),
         qty: Lots::new(1).unwrap(),
     };
+    let other = |inst, source| MdEvent::Touch {
+        inst,
+        bid: None,
+        ask: None,
+        source,
+    };
     bbo.insert(10, (meta(Some(2012)), trade));
+    bbo.insert(11, (meta(Some(2012)), other(ETH, BBO)));
+    bbo.insert(12, (meta(Some(2012)), other(BTC, TouchSourceId(1))));
     // The planted disagreement: sample 617 (seq_no 2620) reports one lot more on its bid.
     let planted = 617;
-    let (meta_617, mut ev) = bbo[planted + 1];
+    let (meta_617, mut ev) = bbo[planted + 3];
     let MdEvent::Touch { bid, .. } = &mut ev else {
         unreachable!()
     };
@@ -401,9 +416,9 @@ fn touch_agreement_over_1000_generated_bbo_samples_reports_99_9_percent_and_name
         qty: l.qty.checked_add(Lots::new(1).unwrap()).unwrap(),
     });
     *bid = more;
-    bbo[planted + 1] = (meta_617, ev);
+    bbo[planted + 3] = (meta_617, ev);
 
-    let agreement = touch_agreement(domain, &book, &bbo).unwrap();
+    let agreement = touch_agreement(&md, BBO, &book, &bbo).unwrap();
     assert_eq!(agreement.samples, 1000);
     assert_eq!(agreement.agreeing(), 999);
     assert_eq!(agreement.percent(), 99.9);
@@ -425,51 +440,105 @@ fn touch_agreement_over_1000_generated_bbo_samples_reports_99_9_percent_and_name
     );
 }
 
-#[test]
-fn a_bbo_sample_with_no_book_at_its_seq_no_disagrees_and_other_domains_are_refused() {
-    let book = delta_book(&FRAMES_TO_2002);
-    let touch = |seq| {
-        let ev = MdEvent::Touch {
-            inst: BTC,
-            bid: None,
-            ask: None,
-            source: BBO,
-        };
-        (meta(seq), ev)
+/// A bbo sample of BTC at `seq` with this touch.
+fn bbo_at(seq: Option<u64>, bid: Option<Lvl>, ask: Option<Lvl>) -> (VenueMeta, MdEvent) {
+    let ev = MdEvent::Touch {
+        inst: BTC,
+        bid,
+        ask,
+        source: BBO,
     };
+    (meta(seq), ev)
+}
+
+#[test]
+fn a_delta_with_no_levels_advances_the_book_to_its_seq_no() {
+    // The codec accepts the empty delta at 2003 and pushes no event; its seq_no still counts
+    // (Codex r4177861136).
+    let mut names = FRAMES_TO_2002.to_vec();
+    names.push("book15-delta-2003-empty.sbe.txt");
+    let book = delta_book(&names);
+    assert_eq!(book.seq(), Some(2003));
+    let text = rest_text().replace(r#""seq_no": 2002"#, r#""seq_no": 2003"#);
+    let snap = decode_orderbook(text.as_bytes(), &specs()).unwrap();
+    assert_eq!(check_snapshot(&book, &snap), Ok(()));
+    let touch = bbo_at(Some(2003), Some(snap.bids[0]), Some(snap.asks[0]));
+    let agreement = touch_agreement(&caps().md, BBO, &book, &[touch]).unwrap();
+    assert_eq!(agreement.agreeing(), 1);
+    // A frame of another market, or not a book frame, leaves this book's seq_no alone.
+    let mut book = book;
+    book.frame(Some((ETH, 2004)), &[]).unwrap();
+    book.frame(None, &[]).unwrap();
+    assert_eq!(book.seq(), Some(2003));
+    assert_eq!(frame_seq(&frame("bbo.sbe.txt"), &specs()), Ok(None));
+    assert_eq!(
+        frame_seq(&frame("book15-delta-2003-empty.sbe.txt")[..4], &specs()),
+        Err(DecodeError::Malformed("SBE frame shorter than its header"))
+    );
+}
+
+#[test]
+fn a_bbo_sample_with_no_book_at_its_seq_no_disagrees() {
+    let book = delta_book(&FRAMES_TO_2002);
+    let md = caps().md;
     // Before the book's first seq_no, and with no seq_no at all.
-    let samples = [touch(Some(1999)), touch(None)];
-    let agreement = touch_agreement(SeqDomain::SharedWithBook, &book, &samples).unwrap();
+    let samples = [bbo_at(Some(1999), None, None), bbo_at(None, None, None)];
+    let agreement = touch_agreement(&md, BBO, &book, &samples).unwrap();
     assert_eq!(agreement.agreeing(), 0);
     assert_eq!(agreement.percent(), 0.0);
     let none = Touch {
         bid: None,
         ask: None,
     };
+    let unmatched = |sample, seq_no| Disagreement {
+        sample,
+        seq_no,
+        bbo: none,
+        book: None,
+    };
     assert_eq!(
         agreement.disagreements,
-        [
-            Disagreement {
-                sample: 0,
-                seq_no: Some(1999),
-                bbo: none,
-                book: None
-            },
-            Disagreement {
-                sample: 1,
-                seq_no: None,
-                bbo: none,
-                book: None
-            },
-        ]
+        [unmatched(0, Some(1999)), unmatched(1, None)]
     );
+    // A gap leaves no book to agree with at its seq_no.
+    let mut gapped = delta_book(&FRAMES_TO_2002);
+    gapped
+        .frame(Some((BTC, 2003)), &[(meta(Some(2003)), gap())])
+        .unwrap();
+    let sample = [bbo_at(Some(2003), None, None)];
+    let agreement = touch_agreement(&md, BBO, &gapped, &sample).unwrap();
+    assert_eq!(agreement.disagreements, [unmatched(0, Some(2003))]);
     // No samples: nothing to agree with.
-    let agreement = touch_agreement(SeqDomain::SharedWithBook, &book, &[]).unwrap();
+    let agreement = touch_agreement(&md, BBO, &book, &[]).unwrap();
     assert_eq!(agreement.percent(), 0.0);
+}
+
+#[test]
+fn touch_agreement_refuses_an_undeclared_source_or_book_other_channels_or_another_domain() {
+    let md = caps().md;
+    let book = delta_book(&FRAMES_TO_2002);
+    let check = |md: &fbc_core::MdCaps, source, book: &DeltaBook| {
+        touch_agreement(md, source, book, &[]).unwrap_err()
+    };
+    assert_eq!(check(&md, TouchSourceId(1), &book), OracleError::Undeclared);
+    let undeclared = DeltaBook::new(BTC, fbc_core::BookId(2));
+    assert_eq!(check(&md, BBO, &undeclared), OracleError::Undeclared);
+    assert_eq!(
+        OracleError::Undeclared.to_string(),
+        "touch source or book channel not declared"
+    );
+    // The interactive book includes RPI liquidity that bbo does not show (Codex r4177861133).
+    let interactive = DeltaBook::new(BTC, INTERACTIVE_DELTAS);
+    assert_eq!(check(&md, BBO, &interactive), OracleError::ChannelsDiffer);
+    assert_eq!(
+        OracleError::ChannelsDiffer.to_string(),
+        "touch source and book show different order channels"
+    );
     // A bbo with its own sequence, or none, has no sample point in the book's.
     for domain in [SeqDomain::Own, SeqDomain::None] {
-        let err = touch_agreement(domain, &book, &samples).unwrap_err();
-        assert_eq!(err, OracleError::NoSamplePoint(domain));
+        let mut md = md.clone();
+        md.touch_sources[usize::from(BBO.0)].seq_domain = domain;
+        assert_eq!(check(&md, BBO, &book), OracleError::NoSamplePoint(domain));
     }
     assert_eq!(
         OracleError::NoSamplePoint(SeqDomain::Own).to_string(),

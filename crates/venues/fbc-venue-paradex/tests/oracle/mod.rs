@@ -14,17 +14,21 @@ use core::fmt;
 use std::collections::BTreeMap;
 
 use fbc_book::{BookError, BookState, Books, L2Book, LevelDiff, Top, Touch};
-use fbc_core::{BookId, Feed, InstrumentId, MdEvent, SeqDomain, VenueMeta};
+use fbc_core::{BookId, InstrumentId, MdCaps, MdEvent, SeqDomain, TouchSourceId, VenueMeta};
 use fbc_venue_paradex::md::rest::{ORDERBOOK_DEPTH, OrderbookSnapshot};
 
-/// One market's book channel built from its decoded book events, the seq_no of the last frame
-/// applied, and the touch after each seq_no at which the book was valid.
+/// One market's book channel built from its decoded frames, the seq_no of the last frame, and
+/// the touch after each frame's seq_no (`None` where the book could not be read).
+///
+/// The seq_no comes from the frame itself ([`frame_seq`](fbc_venue_paradex::md::book::frame_seq)),
+/// not from the events it decoded to: a delta with no levels decodes to no event, yet the codec
+/// accepts it and its seq_no advances the book's sequence (Codex r4177861136).
 pub struct DeltaBook {
     inst: InstrumentId,
     book: BookId,
     books: Books,
     seq: Option<u64>,
-    touch_at: BTreeMap<u64, Touch>,
+    touch_at: BTreeMap<u64, Option<Touch>>,
 }
 
 impl DeltaBook {
@@ -39,26 +43,20 @@ impl DeltaBook {
         }
     }
 
-    /// Applies one decoded event; an event about this book moves its seq_no to the event's.
-    pub fn apply(&mut self, meta: &VenueMeta, ev: &MdEvent) -> Result<(), BookError> {
-        self.books.apply(ev)?;
-        let about = match *ev {
-            MdEvent::BookSnapshotBegin { inst, book, .. }
-            | MdEvent::BookSnapshotEnd { inst, book }
-            | MdEvent::Level { inst, book, .. }
-            | MdEvent::Window { inst, book, .. }
-            | MdEvent::Health {
-                inst,
-                feed: Feed::Book(book),
-                ..
-            } => (inst, book) == (self.inst, self.book),
-            _ => false,
-        };
-        if let (true, Some(seq)) = (about, meta.venue_seq) {
+    /// Applies the events one frame decoded to; `at` is the frame's market and seq_no when it
+    /// is a book frame, and a frame of this market moves the book's seq_no to its own.
+    pub fn frame(
+        &mut self,
+        at: Option<(InstrumentId, u64)>,
+        events: &[(VenueMeta, MdEvent)],
+    ) -> Result<(), BookError> {
+        for (_, ev) in events {
+            self.books.apply(ev)?;
+        }
+        if let Some((_, seq)) = at.filter(|&(inst, _)| inst == self.inst) {
             self.seq = Some(seq);
-            if let Ok(touch) = self.l2().and_then(L2Book::touch) {
-                self.touch_at.insert(seq, touch);
-            }
+            let touch = self.l2().and_then(L2Book::touch).ok();
+            self.touch_at.insert(seq, touch);
         }
         Ok(())
     }
@@ -68,9 +66,9 @@ impl DeltaBook {
         self.seq
     }
 
-    /// The touch after the frame at `seq`, if the book was valid there.
+    /// The touch after the frame at `seq`, if there was one and the book could be read.
     pub fn touch_at(&self, seq: u64) -> Option<Touch> {
-        self.touch_at.get(&seq).copied()
+        self.touch_at.get(&seq).copied().flatten()
     }
 
     /// The book as it stands, refused when no book event has reached it (a gap reported
@@ -184,32 +182,58 @@ impl fmt::Display for Agreement {
 /// Why the touch agreement cannot be checked.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum OracleError {
+    /// The caps declare no such touch source or book channel.
+    Undeclared,
+    /// The touch source and the book show different order channels (the interactive book
+    /// includes RPI liquidity, bbo does not), so their touches need not agree.
+    ChannelsDiffer,
     /// A bbo in this sequence domain has no sample point in the book's sequence.
     NoSamplePoint(SeqDomain),
 }
 
 impl fmt::Display for OracleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let OracleError::NoSamplePoint(domain) = self;
-        write!(
-            f,
-            "no sample point in the book's sequence for a bbo in {domain:?}"
-        )
+        match self {
+            OracleError::Undeclared => f.write_str("touch source or book channel not declared"),
+            OracleError::ChannelsDiffer => {
+                f.write_str("touch source and book show different order channels")
+            }
+            OracleError::NoSamplePoint(domain) => write!(
+                f,
+                "no sample point in the book's sequence for a bbo in {domain:?}"
+            ),
+        }
     }
 }
 
-/// Compares every bbo touch in `samples` (other events are not samples) with `book`'s touch at
-/// the sample point `domain` gives: the equal seq_no for [`SeqDomain::SharedWithBook`].
+/// Compares every touch of `source` on `book`'s market in `samples` (other events, markets and
+/// sources are not samples; Codex r4177861131) with `book`'s touch at the sample point the
+/// source's sequence domain gives: the equal seq_no for [`SeqDomain::SharedWithBook`]. The
+/// source and the book must show the same order channels (Codex r4177861133).
 pub fn touch_agreement(
-    domain: SeqDomain,
+    md: &MdCaps,
+    source: TouchSourceId,
     book: &DeltaBook,
     samples: &[(VenueMeta, MdEvent)],
 ) -> Result<Agreement, OracleError> {
-    if domain != SeqDomain::SharedWithBook {
-        return Err(OracleError::NoSamplePoint(domain));
+    let touch_caps = md.touch_sources.get(usize::from(source.0));
+    let book_caps = md.books.get(usize::from(book.book.0));
+    let (Some(touch_caps), Some(book_caps)) = (touch_caps, book_caps) else {
+        return Err(OracleError::Undeclared);
+    };
+    if touch_caps.includes_channels != book_caps.includes_channels {
+        return Err(OracleError::ChannelsDiffer);
+    }
+    if touch_caps.seq_domain != SeqDomain::SharedWithBook {
+        return Err(OracleError::NoSamplePoint(touch_caps.seq_domain));
     }
     let touches = samples.iter().filter_map(|(meta, ev)| match *ev {
-        MdEvent::Touch { bid, ask, .. } => Some((meta.venue_seq, Touch { bid, ask })),
+        MdEvent::Touch {
+            inst,
+            bid,
+            ask,
+            source: from,
+        } if (inst, from) == (book.inst, source) => Some((meta.venue_seq, Touch { bid, ask })),
         _ => None,
     });
     let mut agreement = Agreement {
