@@ -13,10 +13,13 @@
 //!   real time; `u` is the order book update id, `E` the event time, `T` the transaction time.
 //! - [PARTIAL] `websocket-market-streams/Partial-Book-Depth-Streams`: `<symbol>@depth<levels>`,
 //!   `@depth<levels>@500ms`, `@depth<levels>@100ms`; levels 5, 10 or 20; 250, 500 or 100 ms.
-//!
-//! Only the book channel the codec decodes is declared: the diff-depth channel (`depth@100ms`)
-//! and its REST anchor come with their codec (FBC-tfb).
-//!
+//! - [DIFF] `websocket-market-streams/Diff-Book-Depth-Streams`: `<symbol>@depth`,
+//!   `@depth@500ms`, `@depth@100ms`; each event carries `U` (first update id), `u` (final
+//!   update id) and `pu` (the previous event's `u`); quantities are absolute, 0 removes a level.
+//! - [LOCAL] `websocket-market-streams/How-to-manage-a-local-order-book-correctly`: buffer the
+//!   stream, anchor on `GET /fapi/v1/depth`, drop events whose `u` is below its `lastUpdateId`,
+//!   start from the event with `U <= lastUpdateId <= u`, and require each `pu` to be the previous
+//!   event's `u`, anchoring again otherwise.
 //! - [DEPTH] `market-data/rest-api/Order-Book`: `GET /fapi/v1/depth`, weight 2 for limits 5, 10,
 //!   20 and 50, 5 for 100, 10 for 500, 20 for 1000.
 //! - [INFO] `market-data/rest-api/Exchange-Information`: `rateLimits` holds `REQUEST_WEIGHT`,
@@ -36,6 +39,9 @@ use fbc_core::{
 };
 
 use crate::config::Settings;
+
+/// The diff-depth channel's stream-name suffix [DIFF].
+pub(crate) const DIFF_CHANNEL: &str = "depth@100ms";
 
 /// The most streams one connection carries [CONNECT].
 pub(crate) const MAX_STREAMS: usize = 1024;
@@ -82,19 +88,36 @@ pub(crate) fn caps(settings: &Settings) -> VenueCaps {
                 // The public book; no retail-price-improvement stream is decoded here.
                 includes_channels: TagSet::of(&[Channel::Public]),
             }],
-            books: vec![BookCaps {
-                channel: depth.name,
-                max_depth: depth.levels,
-                // Published every 100, 250 or 500 ms [PARTIAL].
-                cadence: Cadence::Pulsed(depth.speed),
-                // Each message is the top `levels` per side: nothing to chain.
-                continuity: Continuity::Windowed,
-                windowed: true,
-                rest_anchor: false,
-                includes_channels: TagSet::of(&[Channel::Public]),
-                // Aggregated top-of-book snapshots: brackets only.
-                queue_model: QueueModelQuality::BracketOnly,
-            }],
+            books: vec![
+                BookCaps {
+                    channel: depth.name,
+                    max_depth: depth.levels,
+                    // Published every 100, 250 or 500 ms [PARTIAL].
+                    cadence: Cadence::Pulsed(depth.speed),
+                    // Each message is the top `levels` per side: nothing to chain.
+                    continuity: Continuity::Windowed,
+                    windowed: true,
+                    rest_anchor: false,
+                    includes_channels: TagSet::of(&[Channel::Public]),
+                    // Aggregated top-of-book snapshots: brackets only.
+                    queue_model: QueueModelQuality::BracketOnly,
+                },
+                // BOOK_DIFF: the diff-depth channel, anchored on a REST snapshot [LOCAL].
+                BookCaps {
+                    channel: DIFF_CHANNEL,
+                    // The snapshot's levels per side; deltas then change any level [DEPTH].
+                    max_depth: settings.snapshot.limit,
+                    // `@100ms`: published every 100 ms [DIFF].
+                    cadence: Cadence::Pulsed(Duration::from_millis(100)),
+                    // Each event's `pu` is the previous event's `u` [DIFF], [LOCAL].
+                    continuity: Continuity::PrevId,
+                    windowed: false,
+                    rest_anchor: true,
+                    includes_channels: TagSet::of(&[Channel::Public]),
+                    // Aggregated levels every 100 ms, no orders: brackets only.
+                    queue_model: QueueModelQuality::BracketOnly,
+                },
+            ],
             // Published by Binance but not decoded by this adapter.
             trades: TradeCaps {
                 source: FeedSource::None,

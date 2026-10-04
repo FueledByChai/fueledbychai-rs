@@ -1,7 +1,8 @@
 //! FBC-z0l's done line, the factory half: Binance USD-M is declared market data only
 //! (`exec: None`, no exec codec, no exec endpoint) with the rate limits FBC-hof models, and
 //! `plan_md` puts touch and partial-depth subscriptions for two instruments on one endpoint
-//! whose subscribe frame names each stream once.
+//! whose subscribe frame names each stream once. FBC-tfb adds the diff-depth book's caps
+//! (PrevId continuity, a REST anchor, the snapshot's depth) and its configuration.
 
 mod common;
 
@@ -9,7 +10,7 @@ use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 use std::time::Duration;
 
-use common::{BTC, ETH, SOL, config, specs};
+use common::{BTC, CONFIG, ETH, SOL, config, specs};
 use fbc_core::{
     BookId, Cadence, ConfigError, ConfigScope, ConnTopology, Continuity, Effect, Effects, Encoding,
     ExchTsKind, Feed, FeedSource, FieldUnit, LimitScope, MdTransport, OpKind, QueueModelQuality,
@@ -17,7 +18,8 @@ use fbc_core::{
     TrafficClass, VenueConfig, VenueError, VenueFactory,
 };
 use fbc_venue_binance_usdm::{
-    BOOK_PARTIAL, BinanceUsdm, KEY_DEPTH_LEVELS, KEY_DEPTH_SPEED, KEY_WS_BASE_URL,
+    BOOK_DIFF, BOOK_PARTIAL, BinanceUsdm, KEY_DEPTH_LEVELS, KEY_DEPTH_SPEED, KEY_REST_BASE_URL,
+    KEY_SNAPSHOT_LIMIT, KEY_SNAPSHOT_RETRY, KEY_SNAPSHOT_TIMEOUT, KEY_WS_BASE_URL,
     TOUCH_BOOK_TICKER, rest_depth_weight,
 };
 use serde_json::Value;
@@ -102,9 +104,16 @@ fn the_factory_declares_its_market_data_with_each_feed_it_does_not_decode_none()
     assert_eq!(partial.continuity, Continuity::Windowed);
     assert!(partial.windowed && !partial.rest_anchor);
     assert_eq!(partial.queue_model, QueueModelQuality::BracketOnly);
-    // Only the channel the codec decodes is declared (Codex r4176771984): the diff-depth book
-    // and its REST anchor are declared with their codec (FBC-tfb).
-    assert_eq!(md.books.len(), 1);
+    // The diff-depth book, anchored on a REST snapshot whose limit sets its depth (FBC-tfb).
+    assert_eq!(BOOK_DIFF, BookId(1));
+    let diff = md.books[usize::from(BOOK_DIFF.0)];
+    assert_eq!(diff.channel, "depth@100ms");
+    assert_eq!(diff.max_depth, 1000);
+    assert_eq!(diff.cadence, Cadence::Pulsed(Duration::from_millis(100)));
+    assert_eq!(diff.continuity, Continuity::PrevId);
+    assert!(diff.rest_anchor && !diff.windowed);
+    assert_eq!(diff.queue_model, QueueModelQuality::BracketOnly);
+    assert_eq!(md.books.len(), 2);
 
     assert_eq!(md.trades.source, FeedSource::None);
     assert_eq!(md.funding.source, FeedSource::None);
@@ -154,6 +163,10 @@ fn the_config_schema_names_the_base_url_and_the_stream_choices() {
             (KEY_WS_BASE_URL, FieldUnit::Dimensionless),
             (KEY_DEPTH_LEVELS, FieldUnit::Count),
             (KEY_DEPTH_SPEED, FieldUnit::Duration),
+            (KEY_REST_BASE_URL, FieldUnit::Dimensionless),
+            (KEY_SNAPSHOT_LIMIT, FieldUnit::Count),
+            (KEY_SNAPSHOT_TIMEOUT, FieldUnit::Duration),
+            (KEY_SNAPSHOT_RETRY, FieldUnit::Duration),
         ]
     );
     assert!(schema.iter().all(|f| f.scope == ConfigScope::Process));
@@ -164,19 +177,19 @@ fn the_config_schema_names_the_base_url_and_the_stream_choices() {
 fn a_missing_or_invalid_key_is_refused_by_caps_and_plan_md() {
     let without = |key| {
         let mut cfg = VenueConfig::new();
-        for (k, v) in [
-            (KEY_WS_BASE_URL, "wss://fstream.binance.com/"),
-            (KEY_DEPTH_LEVELS, "5"),
-            (KEY_DEPTH_SPEED, "100ms"),
-        ] {
+        for (k, v) in CONFIG {
             if k != key {
                 cfg.insert(k, v);
             }
         }
+        // A trailing slash on the base URL is not doubled.
+        if key != KEY_WS_BASE_URL {
+            cfg.insert(KEY_WS_BASE_URL, "wss://fstream.binance.com/");
+        }
         cfg
     };
     let subs = BTreeSet::from([sub(BTC, Feed::Touch(TOUCH_BOOK_TICKER))]);
-    for key in [KEY_WS_BASE_URL, KEY_DEPTH_LEVELS, KEY_DEPTH_SPEED] {
+    for (key, _) in CONFIG {
         let cfg = without(key);
         assert_eq!(BinanceUsdm.caps(&cfg), Err(ConfigError::Missing(key)));
         let planned = BinanceUsdm.plan_md(&cfg, &specs(), &subs);
@@ -205,6 +218,17 @@ fn a_missing_or_invalid_key_is_refused_by_caps_and_plan_md() {
         (KEY_WS_BASE_URL, "ws://[1:2:3:4:5:6:7:8:9]:80"),
         (KEY_DEPTH_LEVELS, "50"),
         (KEY_DEPTH_SPEED, "1s"),
+        (KEY_REST_BASE_URL, "wss://fapi.binance.com"),
+        (KEY_REST_BASE_URL, "https://fapi.binance.com/fapi"),
+        (KEY_REST_BASE_URL, "https://"),
+        (KEY_SNAPSHOT_LIMIT, "25"),
+        (KEY_SNAPSHOT_LIMIT, "x"),
+        (KEY_SNAPSHOT_TIMEOUT, "5s"),
+        (KEY_SNAPSHOT_TIMEOUT, "ms"),
+        (KEY_SNAPSHOT_TIMEOUT, "0ms"),
+        (KEY_SNAPSHOT_TIMEOUT, "+5ms"),
+        (KEY_SNAPSHOT_TIMEOUT, "99999999999999999999ms"),
+        (KEY_SNAPSHOT_RETRY, "-1ms"),
     ] {
         let mut cfg = config();
         cfg.insert(key, value);
@@ -358,7 +382,7 @@ fn plan_md_spreads_more_streams_than_one_connection_carries_over_endpoints() {
 fn feeds_it_does_not_decode_and_unknown_instruments_are_refused_with_nothing_sent() {
     let cfg = config();
     let refused = [
-        Feed::Book(BookId(1)),
+        Feed::Book(BookId(2)),
         Feed::Touch(TouchSourceId(1)),
         Feed::Trades,
         Feed::Mark,

@@ -8,20 +8,24 @@
 //!   Binance's USD-M documentation (decision 0003; the citations are in `caps.rs`).
 //! - [`config_schema`](VenueFactory::config_schema): the WebSocket base URL and the partial-depth
 //!   stream's levels and speed are configuration ([`KEY_WS_BASE_URL`], [`KEY_DEPTH_LEVELS`],
-//!   [`KEY_DEPTH_SPEED`]).
+//!   [`KEY_DEPTH_SPEED`]), and so are the REST base URL and the diff-depth snapshot's limit,
+//!   timeout and retry interval ([`KEY_REST_BASE_URL`], [`KEY_SNAPSHOT_LIMIT`],
+//!   [`KEY_SNAPSHOT_TIMEOUT`], [`KEY_SNAPSHOT_RETRY`]).
 //! - [`plan_md`](VenueFactory::plan_md): subscriptions on the combined-stream endpoint of the
 //!   `/public` route, at most 1024 streams per connection, each instrument spelled as the
 //!   [`SpecTable`](fbc_core::SpecTable) says.
 //! - [`md_codec`](VenueFactory::md_codec): a sans-IO codec that sends live `SUBSCRIBE` and
 //!   `UNSUBSCRIBE` requests with request ids and consumes their replies, decodes `bookTicker`
-//!   into touches and each partial-depth message into a complete snapshot of its book channel.
+//!   into touches and each partial-depth message into a complete snapshot of its book channel,
+//!   and keeps the diff-depth book ([`BOOK_DIFF`]) anchored on a REST snapshot as Binance
+//!   documents, detecting gaps, duplicates and events out of order (`diff.rs`).
 //!
-//! The diff-depth book, anchored on a REST snapshot, is not declared or decoded yet (FBC-tfb).
 //! Trades, funding, mark, index and statistics are not decoded and are declared
 //! [`FeedSource::None`](fbc_core::FeedSource).
 
 mod caps;
 mod config;
+mod diff;
 mod md;
 
 use std::collections::BTreeSet;
@@ -33,7 +37,10 @@ use fbc_core::{
 };
 
 pub use caps::rest_depth_weight;
-pub use config::{KEY_DEPTH_LEVELS, KEY_DEPTH_SPEED, KEY_WS_BASE_URL};
+pub use config::{
+    KEY_DEPTH_LEVELS, KEY_DEPTH_SPEED, KEY_REST_BASE_URL, KEY_SNAPSHOT_LIMIT, KEY_SNAPSHOT_RETRY,
+    KEY_SNAPSHOT_TIMEOUT, KEY_WS_BASE_URL,
+};
 
 use crate::config::Settings;
 use crate::md::{BinanceUsdmMd, stream_name};
@@ -43,6 +50,9 @@ pub const TOUCH_BOOK_TICKER: TouchSourceId = TouchSourceId(0);
 /// The partial-depth channel (`depth<levels>@<speed>`), each message a snapshot of the top
 /// levels: [`MdCaps::books`](fbc_core::MdCaps)`[0]`.
 pub const BOOK_PARTIAL: BookId = BookId(0);
+/// The diff-depth channel (`depth@100ms`), anchored on a `GET /fapi/v1/depth` snapshot:
+/// [`MdCaps::books`](fbc_core::MdCaps)`[1]`.
+pub const BOOK_DIFF: BookId = BookId(1);
 
 /// More subscriptions than `u16::MAX + 1` endpoints of 1024 streams each carry.
 const TOO_MANY_ENDPOINTS: ConfigError = ConfigError::Invalid {

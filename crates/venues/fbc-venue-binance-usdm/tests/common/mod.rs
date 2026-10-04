@@ -11,7 +11,10 @@ use fbc_core::{
     PriceGrid, SizeStep, SpecTable, TradingStatus, UnderlyingId, VenueConfig, VenueFactory,
     VenueId, VenueMeta, WallNs, dispatch_market_data,
 };
-use fbc_venue_binance_usdm::{BinanceUsdm, KEY_DEPTH_LEVELS, KEY_DEPTH_SPEED, KEY_WS_BASE_URL};
+use fbc_venue_binance_usdm::{
+    BinanceUsdm, KEY_DEPTH_LEVELS, KEY_DEPTH_SPEED, KEY_REST_BASE_URL, KEY_SNAPSHOT_LIMIT,
+    KEY_SNAPSHOT_RETRY, KEY_SNAPSHOT_TIMEOUT, KEY_WS_BASE_URL,
+};
 use rust_decimal::Decimal;
 
 pub const BTC: InstrumentId = InstrumentId::new(1);
@@ -19,12 +22,25 @@ pub const ETH: InstrumentId = InstrumentId::new(2);
 /// In no spec table the tests build.
 pub const SOL: InstrumentId = InstrumentId::new(3);
 
-/// The configuration the tests run under: five levels every 100 ms.
+/// Every key the configuration takes, with the values the tests run under: five levels every
+/// 100 ms on the partial-depth stream; diff-depth anchored on 1000-level snapshots, each
+/// request timing out after 5 s and retried 2 s after a failure.
+pub const CONFIG: [(&str, &str); 7] = [
+    (KEY_WS_BASE_URL, "wss://fstream.binance.com"),
+    (KEY_DEPTH_LEVELS, "5"),
+    (KEY_DEPTH_SPEED, "100ms"),
+    (KEY_REST_BASE_URL, "https://fapi.binance.com"),
+    (KEY_SNAPSHOT_LIMIT, "1000"),
+    (KEY_SNAPSHOT_TIMEOUT, "5000ms"),
+    (KEY_SNAPSHOT_RETRY, "2000ms"),
+];
+
+/// The configuration the tests run under ([`CONFIG`]).
 pub fn config() -> VenueConfig {
     let mut cfg = VenueConfig::new();
-    cfg.insert(KEY_WS_BASE_URL, "wss://fstream.binance.com");
-    cfg.insert(KEY_DEPTH_LEVELS, "5");
-    cfg.insert(KEY_DEPTH_SPEED, "100ms");
+    for (key, value) in CONFIG {
+        cfg.insert(key, value);
+    }
     cfg
 }
 
@@ -77,12 +93,22 @@ impl MdSink for Sink {
     }
 }
 
+fn read(dir: &str, name: &str) -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../fixtures/binance-usdm")
+        .join(dir)
+        .join(name);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"))
+}
+
+/// The REST response body of fixture `name`.
+pub fn rest_fixture(name: &str) -> String {
+    read("rest", name).trim_end().to_owned()
+}
+
 /// The frames of fixture `name`, one per line.
 pub fn fixture(name: &str) -> Vec<String> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../fixtures/binance-usdm/md")
-        .join(name);
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+    let text = read("md", name);
     text.lines()
         .filter(|l| !l.trim().is_empty())
         .map(str::to_owned)

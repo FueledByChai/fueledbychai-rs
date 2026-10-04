@@ -170,8 +170,10 @@ rather than guess.
   - `crates/venues/fbc-venues` (the registry, the only crate that sees concrete venues),
     `crates/venues/fbc-venue-binance-usdm` (market data only:
     `exec: None` caps citing Binance's USD-M pages, `plan_md` on the `/public` combined-stream
-    endpoint, live SUBSCRIBE/UNSUBSCRIBE, `bookTicker` touches and partial-depth snapshots;
-    the diff-depth book and its REST anchor are FBC-tfb's), `crates/venues/fbc-venue-paradex`
+    endpoint, live SUBSCRIBE/UNSUBSCRIBE, `bookTicker` touches, partial-depth snapshots, and
+    the diff-depth book in `src/diff.rs`, anchored on a `GET /fapi/v1/depth` snapshot with
+    `pu` continuity, duplicates ignored, a gap resynced from a new snapshot and a failed
+    snapshot retried on a configured timer), `crates/venues/fbc-venue-paradex`
     (so far its signer: the SNIP-12 revision 0 hash and Stark-curve signature, tested against
     `fixtures/paradex/signing/paradex-vectors.tsv`; and market data: an SBE reader gated on each
     frame's block lengths, bbo and trades decoded into touches and trades, the order book
@@ -190,8 +192,8 @@ rather than guess.
   the signing benchmark and the Java hash oracle the Paradex signer is checked against;
   recorded Paradex frames go elsewhere under `fixtures/paradex/`; `fixtures/paradex/md/` holds
   SBE frames hand-built from Paradex's published schema, and one captured public book frame
-  whose provenance its README gives. `fixtures/binance-usdm/` holds hand-written frames in
-  Binance's documented shapes, its README citing the pages.
+  whose provenance its README gives. `fixtures/binance-usdm/` holds hand-written frames (`md/`) and REST
+  responses (`rest/`) in Binance's documented shapes, its README citing the pages.
   `fixtures/licence-gate/` is a standalone two-crate workspace the licence gate's self-test
   runs against (0017).
 - Docs: `docs/decisions/` (records, index in its `README.md`; cite by number, never restate one
