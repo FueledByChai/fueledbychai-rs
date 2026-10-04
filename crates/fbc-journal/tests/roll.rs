@@ -342,11 +342,15 @@ fn a_roll_that_cannot_compress_fails_the_append_and_keeps_the_closed_segment_rea
         Err(JournalError::Io(_))
     ));
     assert_eq!(names(&day), ["1-000000.fbcj", "1-000000.fbcj.zst"]);
+    // Codex r4177658809: the directory at the compressed name is not a segment, so the
+    // uncompressed one is read.
+    assert_eq!(read_ok(&root, 1), [timer(1)]);
 }
 
 #[test]
 fn a_segment_that_cannot_be_read_is_an_io_error_and_reading_goes_on() {
-    // A directory named like an uncompressed segment opens but cannot be read.
+    // A link named like an uncompressed segment, to a directory: it opens but cannot be read.
+    // (A directory itself is not a segment and is passed over.)
     let root = fresh_dir("unreadable");
     let mut w = JournalWriter::create(&root, 1, key()).unwrap();
     w.append(at(1, 0), &timer(1)).unwrap();
@@ -356,7 +360,9 @@ fn a_segment_that_cannot_be_read_is_an_io_error_and_reading_goes_on() {
     // and the directory takes sequence 2, between them.
     let day = root.join("20261003");
     fs::rename(day.join("1-000001.fbcj"), day.join("1-000003.fbcj")).unwrap();
-    fs::create_dir(day.join("1-000002.fbcj")).unwrap();
+    fs::create_dir(day.join("a-directory")).unwrap();
+    std::os::unix::fs::symlink(day.join("a-directory"), day.join("1-000002.fbcj")).unwrap();
+    fs::create_dir(day.join("1-000004.fbcj")).unwrap();
     let read = read_all(&root, 1);
     assert_eq!(read.len(), 3, "{read:?}");
     assert_eq!(*read[0].as_ref().unwrap(), timer(1));
@@ -366,4 +372,44 @@ fn a_segment_that_cannot_be_read_is_an_io_error_and_reading_goes_on() {
         read[1]
     );
     assert_eq!(*read[2].as_ref().unwrap(), timer(3));
+}
+
+#[test]
+fn a_segment_compressed_after_the_reader_listed_it_is_read_compressed() {
+    // Codex r4177658812: the reader lists the open segment uncompressed, then the writer
+    // rolls, compressing it and removing the name the reader listed.
+    let root = fresh_dir("rolled_under_reader");
+    let mut w = JournalWriter::create(&root, 1, key()).unwrap();
+    w.append(at(1, 0), &timer(1)).unwrap();
+    w.append(at(1, 5), &timer(2)).unwrap();
+    w.flush().unwrap();
+    let reader = JournalReader::open(&root, 1).unwrap();
+    w.append(at(2, 0), &timer(3)).unwrap();
+    assert_eq!(
+        names(&root.join("20261003")),
+        ["1-000000.fbcj.zst", "1-000001.fbcj"]
+    );
+    let read: Vec<Record> = reader.map(Result::unwrap).collect();
+    // The segments listed are read; the one started after the listing is not.
+    assert_eq!(read, [timer(1), timer(2)]);
+    drop(w);
+
+    // A listed segment gone in both forms is still an i/o error, and reading goes on.
+    let root = fresh_dir("gone_under_reader");
+    let mut w = JournalWriter::create(&root, 1, key()).unwrap();
+    w.append(at(1, 0), &timer(1)).unwrap();
+    w.append(at(2, 0), &timer(2)).unwrap();
+    drop(w);
+    let reader = JournalReader::open(&root, 1).unwrap();
+    fs::remove_file(root.join("20261003/1-000000.fbcj.zst")).unwrap();
+    let read: Vec<_> = reader.collect();
+    assert!(matches!(&read[0], Err(JournalError::Io(_))), "{read:?}");
+    assert_eq!(*read[1].as_ref().unwrap(), timer(2));
+    let reader = JournalReader::open(&root, 1).unwrap();
+    fs::remove_file(root.join("20261003/1-000001.fbcj")).unwrap();
+    let read: Vec<_> = reader.collect();
+    assert!(
+        matches!(&read[..], [Err(JournalError::Io(e))] if e.kind() == std::io::ErrorKind::NotFound),
+        "{read:?}"
+    );
 }

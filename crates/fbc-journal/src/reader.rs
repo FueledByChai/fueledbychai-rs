@@ -10,12 +10,14 @@ use crate::JournalError;
 use crate::format::{self, MAGIC, VERSION};
 use crate::record::Record;
 use crate::redact::SpanDigest;
-use crate::writer::{Listed, list_segments};
+use crate::writer::{COMPRESSED_EXT, Listed, list_segments, with_ext};
 
 /// Reads one shard's records in the order they were written: the day directories in date
 /// order, each day's segments in sequence order, each segment from its start. Directories
 /// and files that are not this shard's segments are passed over. A closed segment is read
 /// through zstd (`.fbcj.zst`), the open one, or one a stopped writer left open, as written.
+/// The segments are listed when the reader opens; one listed uncompressed that the writer
+/// compresses before the reader reaches it is read in its compressed form.
 ///
 /// An error in a segment (a bad header, a record cut short, a record that cannot be read,
 /// compressed data that cannot be decompressed or fails its checksum) is returned once, and
@@ -80,12 +82,25 @@ impl JournalReader {
             Some(open) => open,
             None => {
                 let Listed {
-                    path, compressed, ..
+                    mut path,
+                    mut compressed,
+                    ..
                 } = self
                     .segments
                     .pop_front()
                     .expect("next checks for a segment");
-                let file = BufReader::new(File::open(&path)?);
+                let file = match File::open(&path) {
+                    // The writer rolled the segment since it was listed: it is now under
+                    // its compressed name, whole (the compressed form takes its name before
+                    // the uncompressed one is removed).
+                    Err(e) if e.kind() == io::ErrorKind::NotFound && !compressed => {
+                        path = with_ext(&path, COMPRESSED_EXT);
+                        compressed = true;
+                        File::open(&path)?
+                    }
+                    file => file?,
+                };
+                let file = BufReader::new(file);
                 let file: Box<dyn Read + Send> = if compressed {
                     Box::new(zstd::stream::read::Decoder::with_buffer(file)?)
                 } else {
