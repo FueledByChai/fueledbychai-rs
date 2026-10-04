@@ -136,6 +136,27 @@ async fn reading_from_or_pushing_to_a_closed_connection_fails_the_script() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn closing_a_connection_the_client_already_closed_fails_the_script() {
+    // Steps name their connections, so a script can act on an older one while a newer is open.
+    let server = stub(vec![
+        Step::Accept,
+        Step::Accept,
+        Step::Read { conn: 1 },
+        Step::Close { conn: 0 },
+    ])
+    .await;
+    let first = connector().websocket(&server.ws_url("/md")).await.unwrap();
+    let mut second = connector().websocket(&server.ws_url("/md")).await.unwrap();
+    drop(first);
+    settle().await;
+    second.send(Message::text("go")).await.unwrap();
+    // The client closed first: the stub did not force this close (Codex r4177464414).
+    let err = server.finished().await.unwrap_err();
+    assert_eq!(err, ScriptError::Closed { step: 3, conn: 0 });
+    assert_eq!(server.live(), 1);
+}
+
+#[tokio::test(start_paused = true)]
 async fn the_http_endpoint_answers_fixed_responses_by_path_and_refuses_what_it_cannot_read() {
     let routes = HttpRoutes::from([(
         "/markets".to_owned(),
@@ -163,12 +184,16 @@ async fn the_http_endpoint_answers_fixed_responses_by_path_and_refuses_what_it_c
     assert!(missing.body().is_empty());
     let posted = call(Method::POST, "/markets", b"{\"a\":1}").await;
     assert_eq!(posted.status(), StatusCode::OK);
-    // A body that arrives after its head is read to its stated length before the answer.
+    // A body that arrives after its head is read to its stated length before the answer, and
+    // its request keeps its place in arrival order though a later one finished first (Codex
+    // r4177464418).
     let addr = server.http_url("").trim_start_matches("http://").to_owned();
     let mut raw = TcpStream::connect(&addr).await.unwrap();
     let head = b"PUT /markets HTTP/1.1\r\nContent-Length: 3\r\n\r\n";
     raw.write_all(head).await.unwrap();
     settle().await;
+    let later = call(Method::GET, "/later", b"").await;
+    assert_eq!(later.status(), StatusCode::NOT_FOUND);
     raw.write_all(b"abc").await.unwrap();
     let mut answer = String::new();
     raw.read_to_string(&mut answer).await.unwrap();
@@ -179,19 +204,23 @@ async fn the_http_endpoint_answers_fixed_responses_by_path_and_refuses_what_it_c
             "GET /markets?x=1",
             "GET /nope",
             "POST /markets",
-            "PUT /markets"
+            "PUT /markets",
+            "GET /later"
         ]
     );
 
     // A request line without a target, a bad length, a head that never ends within the limit,
-    // and a body longer than the limit are each answered 400 and not recorded.
+    // a head that ends just past it (Codex r4177464412), and a body longer than the limit are
+    // each answered 400 and not recorded.
     let too_long = format!("POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n", 1 << 20);
     let endless = "x".repeat(70 * 1024);
+    let big_head = format!("GET / HTTP/1.1\r\nX: {}\r\n\r\n", "y".repeat(65_600));
     for request in [
         "JUNK\r\n\r\n",
         "GET / HTTP/1.1\r\nContent-Length: many\r\n\r\n",
         too_long.as_str(),
         endless.as_str(),
+        big_head.as_str(),
     ] {
         let mut raw = TcpStream::connect(&addr).await.unwrap();
         raw.write_all(request.as_bytes()).await.unwrap();
@@ -199,5 +228,5 @@ async fn the_http_endpoint_answers_fixed_responses_by_path_and_refuses_what_it_c
         raw.read_to_string(&mut answer).await.unwrap();
         assert!(answer.starts_with("HTTP/1.1 400 "), "{answer}");
     }
-    assert_eq!(server.http_requests().len(), 4);
+    assert_eq!(server.http_requests().len(), 5);
 }
