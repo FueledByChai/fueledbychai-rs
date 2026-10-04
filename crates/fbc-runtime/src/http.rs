@@ -1,6 +1,6 @@
 //! The HTTP/1.1 call (`http://`), on the one connector.
 
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::client::conn::http1;
 use hyper::header::{HOST, HeaderValue};
 use hyper_util::rt::TokioIo;
@@ -14,10 +14,15 @@ use crate::target;
 
 impl Connector {
     /// Sends `request`, whose URI is an absolute `http://` URL, on a new connection through
-    /// this connector, and reads the whole response. The request goes in origin form (path and
-    /// query) with a Host header from the URL unless the caller set one; user information in
-    /// the URL is never sent.
-    pub async fn http(&self, request: Request<Bytes>) -> Result<Response<Bytes>, NetError> {
+    /// this connector, and reads the whole response, failing once its body passes `max_body`
+    /// bytes (the caller's limit, so a large or unending body cannot exhaust memory). The
+    /// request goes in origin form (path and query) with a Host header from the URL unless the
+    /// caller set one; user information in the URL is never sent.
+    pub async fn http(
+        &self,
+        request: Request<Bytes>,
+        max_body: usize,
+    ) -> Result<Response<Bytes>, NetError> {
         let (mut parts, body) = request.into_parts();
         let to = target::target(&parts.uri, "http")?;
         if !parts.headers.contains_key(HOST) {
@@ -34,7 +39,8 @@ impl Connector {
         let exchange = async move {
             let response = sender.send_request(request).await.map_err(http_error)?;
             let (parts, body) = response.into_parts();
-            let body = body.collect().await.map_err(http_error)?.to_bytes();
+            let body = Limited::new(body, max_body);
+            let body = body.collect().await.map_err(body_error)?.to_bytes();
             Ok(Response::from_parts(parts, body))
         };
         // The connection runs beside the exchange and ends once the exchange drops its sender.
@@ -54,6 +60,17 @@ fn host_header(uri: &Uri) -> Result<HeaderValue, NetError> {
     };
     HeaderValue::try_from(value).map_err(|_| NetError::protocol(Step::Url, BAD_HOST))
 }
+
+/// A body read failure: over the caller's limit, or hyper's own error.
+fn body_error(e: Box<dyn std::error::Error + Send + Sync>) -> NetError {
+    if e.is::<LengthLimitError>() {
+        NetError::protocol(Step::Http, OVER_LIMIT)
+    } else {
+        NetError::new(Step::Http, Cause::Detail(e.to_string()))
+    }
+}
+
+const OVER_LIMIT: &str = "the response body is over the caller's limit";
 
 fn http_error(e: hyper::Error) -> NetError {
     NetError::new(Step::Http, Cause::Detail(e.to_string()))

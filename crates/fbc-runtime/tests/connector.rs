@@ -14,6 +14,8 @@ use futures_util::{SinkExt, StreamExt};
 
 const LOCAL: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const DOMAINNAME: u8 = 3;
+/// The response-body limit the tests pass; far above any body the local servers send.
+const LIMIT: usize = 1 << 16;
 
 fn through(stub: &Socks5Stub) -> Connector {
     Connector::new(ProxyConfig::Socks5 {
@@ -72,7 +74,7 @@ async fn socks5_carries_an_http_request_with_the_target_named_as_a_hostname() {
     let port = server.addr.port();
     let url = format!("http://api.venue.test:{port}/v1/markets?market=X");
 
-    let response = through(&stub).http(get(&url)).await.unwrap();
+    let response = through(&stub).http(get(&url), LIMIT).await.unwrap();
 
     assert_eq!(response.status(), 200);
     assert_eq!(response.body().as_ref(), b"GET /v1/markets?market=X");
@@ -98,7 +100,7 @@ async fn direct_reaches_both_servers_and_the_stub_sees_no_connection() {
 
     echo_once(&direct, &format!("ws://{}/stream", ws.addr)).await;
     let url = format!("http://{}/v1/time", http.addr);
-    let response = direct.http(get(&url)).await.unwrap();
+    let response = direct.http(get(&url), LIMIT).await.unwrap();
 
     assert_eq!(response.body().as_ref(), b"GET /v1/time");
     assert_eq!((ws.connections(), http.connections()), (1, 1));
@@ -123,7 +125,9 @@ async fn a_refused_connect_names_the_proxy_step_and_the_reply_code() {
     let connector = through(&stub);
 
     let ws = connector.websocket("ws://ws.venue.test:9/stream").await;
-    let http = connector.http(get("http://api.venue.test:9/v1/time")).await;
+    let http = connector
+        .http(get("http://api.venue.test:9/v1/time"), LIMIT)
+        .await;
 
     assert_refused(&ws.unwrap_err(), 5, "connection refused");
     assert_refused(&http.unwrap_err(), 5, "connection refused");
@@ -146,7 +150,7 @@ async fn an_ip_literal_goes_to_the_proxy_as_an_ipv4_address() {
     let stub = venue_stub(Answer::Relay).await;
 
     let url = format!("http://{}/v1/time", server.addr);
-    through(&stub).http(get(&url)).await.unwrap();
+    through(&stub).http(get(&url), LIMIT).await.unwrap();
 
     let targets = stub.targets();
     assert_eq!(
@@ -180,7 +184,7 @@ async fn a_proxy_that_wants_authentication_fails_at_the_greeting() {
         port: proxy.port(),
     });
     let err = connector
-        .http(get("http://api.venue.test/"))
+        .http(get("http://api.venue.test/"), LIMIT)
         .await
         .unwrap_err();
     assert_eq!(err.step(), Step::ProxyGreeting);
@@ -196,7 +200,7 @@ async fn a_closed_target_fails_at_the_target_tcp_step_without_quoting_the_url() 
     let direct = Connector::new(ProxyConfig::Direct);
     let url = format!("http://user:hunter2@127.0.0.1:{port}/v1/orders?token=sesame");
 
-    let http = direct.http(get(&url)).await.unwrap_err();
+    let http = direct.http(get(&url), LIMIT).await.unwrap_err();
     let ws = direct
         .websocket(&url.replacen("http", "ws", 1))
         .await
@@ -229,7 +233,7 @@ async fn tls_and_foreign_schemes_fail_at_the_url_step_before_any_connection() {
         "ws://api.venue.test/",
         "/relative",
     ] {
-        let err = connector.http(get(url)).await.unwrap_err();
+        let err = connector.http(get(url), LIMIT).await.unwrap_err();
         assert_eq!(err.step(), Step::Url);
     }
     assert_eq!(stub.connections(), 0);
@@ -253,7 +257,9 @@ async fn a_server_that_hangs_up_fails_at_the_websocket_or_http_step() {
     let direct = Connector::new(ProxyConfig::Direct);
 
     let ws = direct.websocket(&format!("ws://{}/", server.addr)).await;
-    let http = direct.http(get(&format!("http://{}/", server.addr))).await;
+    let http = direct
+        .http(get(&format!("http://{}/", server.addr)), LIMIT)
+        .await;
 
     assert_eq!(ws.unwrap_err().step(), Step::WebSocketUpgrade);
     let err = http.unwrap_err();
@@ -275,7 +281,7 @@ async fn a_request_body_and_a_caller_host_header_reach_the_server() {
         .unwrap();
 
     let response = Connector::new(ProxyConfig::Direct)
-        .http(request)
+        .http(request, LIMIT)
         .await
         .unwrap();
 
@@ -283,4 +289,33 @@ async fn a_request_body_and_a_caller_host_header_reach_the_server() {
     let seen = server.requests();
     assert_eq!(seen[0].host, "api.venue.test");
     assert_eq!(seen[0].body, b"{\"x\":1}");
+}
+
+#[tokio::test]
+async fn a_response_body_over_the_callers_limit_fails_at_the_http_step() {
+    let server = HttpServer::start().await;
+    let direct = Connector::new(ProxyConfig::Direct);
+    let url = format!("http://{}/v1/time", server.addr);
+    let body = b"GET /v1/time".len();
+
+    let fits = direct.http(get(&url), body).await.unwrap();
+    let over = direct.http(get(&url), body - 1).await.unwrap_err();
+
+    assert_eq!(fits.body().len(), body);
+    assert_eq!(over.step(), Step::Http);
+    assert_eq!(
+        over.cause(),
+        &Cause::Protocol("the response body is over the caller's limit")
+    );
+}
+
+#[tokio::test]
+async fn a_body_cut_short_fails_at_the_http_step() {
+    let server = scripted(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort").await;
+    let err = Connector::new(ProxyConfig::Direct)
+        .http(get(&format!("http://{server}/")), LIMIT)
+        .await
+        .unwrap_err();
+    assert_eq!(err.step(), Step::Http);
+    assert!(matches!(err.cause(), Cause::Detail(_)), "{err:?}");
 }
