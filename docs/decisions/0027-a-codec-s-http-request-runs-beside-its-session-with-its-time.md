@@ -37,9 +37,10 @@ passes before anything was written, and how a changed plan reaches running conne
   have been written and acted on. A request's URL is absolute; one that is not is `NotSent`.
 - **Poll endpoints** have one epoch, begun when the session runs: `on_open` is called as soon
   as the codec is built, `subscribe` takes the reconciler's difference as for a socket, and an
-  `Effect::Send` or `Effect::Reconnect` naming the endpoint is refused and counted. A session
-  whose control has already dropped builds no codec, so it asks for nothing (Codex
-  r4177698436).
+  `Effect::Send` or `Effect::Reconnect` naming the endpoint is refused and counted.
+- **A dropped control comes first.** A session whose control has already dropped builds no
+  codec, poll or socket, so nothing is sent or asked for after the drop, and a drop wins over
+  a handshake that completes at the same time (Codex r4177698436, r4177790164).
 - **Plans.** `MdVenueControl::set_desired` calls `plan_md` with the spec table at once and
   returns a refusal (`UnknownInstrument`, `UnsupportedFeed`, configuration), a stream named
   twice, or a socket URL no attempt could open as a `PlanError`; nothing opens or closes for a
