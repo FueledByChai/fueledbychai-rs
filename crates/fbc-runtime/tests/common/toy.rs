@@ -1,7 +1,8 @@
 //! A toy market-data venue for the runtime's session tests (FBC-ku8): `exec: None`, trades only,
 //! a text protocol of one `kind|key=value|...` record per frame. It describes no real venue.
 //!
-//! Out: `hello|codec=<n>` on open (`n` counts the codecs its factory built), and
+//! Out: `hello|codec=<n>|plan=<ids>` on open (`n` counts the codecs its factory built, `ids`
+//! are the instruments of the plan it was built for), and
 //! `sub|add=A,B|remove=C` per subscribe call (empty parts left out).
 //! In: `trade|sym=A|px=<ticks>|qty=<lots>|seq=<n>` is a trade; `arm|sym=A|ms=<n>` sets a timer
 //! whose firing reports the instrument's trades stale; `bye` asks for a reconnect; `odd` asks for
@@ -153,9 +154,11 @@ impl VenueFactory for ToyVenue {
         Ok(Vec::new())
     }
 
-    fn md_codec(&self, _: &VenueConfig, _: &EndpointPlan) -> Box<dyn MdCodec> {
+    fn md_codec(&self, _: &VenueConfig, ep: &EndpointPlan) -> Box<dyn MdCodec> {
         let n = self.codecs.fetch_add(1, Ordering::SeqCst);
-        Box::new(ToyMd { n })
+        let plan = ep.subs.iter().map(|s| s.inst.get().to_string());
+        let plan = plan.collect::<Vec<_>>().join(",");
+        Box::new(ToyMd { n, plan })
     }
 
     fn plan_exec(&self, _: &VenueConfig) -> Result<Vec<ExecEndpoint>, VenueError> {
@@ -167,9 +170,10 @@ impl VenueFactory for ToyVenue {
     }
 }
 
-/// One epoch's codec, numbered in the order the factory built it.
+/// One epoch's codec, numbered in the order the factory built it, and its plan's instruments.
 struct ToyMd {
     n: u32,
+    plan: String,
 }
 
 const CONTROL: RateCharge = RateCharge::one(OpKind::Control, None);
@@ -197,7 +201,8 @@ fn num(fields: &[(&str, &str)], key: &'static str) -> Result<i64, DecodeError> {
 
 impl MdCodec for ToyMd {
     fn on_open(&mut self, fx: &mut Effects) {
-        fx.push(send(STREAM, format!("hello|codec={}", self.n)));
+        let hello = format!("hello|codec={}|plan={}", self.n, self.plan);
+        fx.push(send(STREAM, hello));
     }
 
     fn subscribe(

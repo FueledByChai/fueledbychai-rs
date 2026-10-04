@@ -2,11 +2,13 @@
 //! so an endpoint that keeps dropping cannot hammer the egress IP the deployment shares.
 //!
 //! Every number comes from the consumer's [`ReconnectPacing`]; there is no default in code
-//! (0009). The first attempt goes at once. After a connection that opened drops, the next
+//! (0009). An attempt that has not opened by its deadline is abandoned and counts as failed.
+//! The first attempt goes at once. After a connection that opened drops, the next
 //! attempt waits the floor; each attempt that fails to open doubles the wait, up to the
 //! ceiling. Independently, at most `budget` attempts start in any `window` (half-open, so two
 //! attempts exactly `window` apart fall in different windows); an attempt the budget holds back
-//! waits until the oldest of the last `budget` attempts leaves the window.
+//! waits until the oldest of the last `budget` attempts leaves the window. A wait that would
+//! pass the end of the clock never ends: the session waits for its control instead of panicking.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -15,14 +17,15 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-/// The consumer's reconnect pacing: exponential backoff between `floor` and `ceiling`, and at
-/// most `budget` connection attempts per `window`.
+/// The consumer's reconnect pacing: exponential backoff between `floor` and `ceiling`, at most
+/// `budget` connection attempts per `window`, and a `deadline` for each attempt to open.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct ReconnectPacing {
     floor: Duration,
     ceiling: Duration,
     budget: NonZeroU32,
     window: Duration,
+    deadline: Duration,
 }
 
 /// Why a [`ReconnectPacing`] was refused.
@@ -36,6 +39,8 @@ pub enum PacingError {
     ZeroBudget,
     /// A zero window bounds nothing.
     ZeroWindow,
+    /// A zero deadline would abandon every attempt.
+    ZeroDeadline,
 }
 
 impl fmt::Display for PacingError {
@@ -45,6 +50,7 @@ impl fmt::Display for PacingError {
             PacingError::CeilingBelowFloor => "the reconnect ceiling is below the floor",
             PacingError::ZeroBudget => "the connection attempt budget is zero",
             PacingError::ZeroWindow => "the attempt budget's window is zero",
+            PacingError::ZeroDeadline => "the connection attempt deadline is zero",
         })
     }
 }
@@ -52,12 +58,14 @@ impl fmt::Display for PacingError {
 impl std::error::Error for PacingError {}
 
 impl ReconnectPacing {
-    /// Backoff from `floor` doubling to `ceiling`, and at most `budget` attempts per `window`.
+    /// Backoff from `floor` doubling to `ceiling`, at most `budget` attempts per `window`, and
+    /// each attempt abandoned if it has not opened within `deadline`.
     pub fn new(
         floor: Duration,
         ceiling: Duration,
         budget: u32,
         window: Duration,
+        deadline: Duration,
     ) -> Result<ReconnectPacing, PacingError> {
         if floor.is_zero() {
             return Err(PacingError::ZeroFloor);
@@ -69,11 +77,15 @@ impl ReconnectPacing {
         if window.is_zero() {
             return Err(PacingError::ZeroWindow);
         }
+        if deadline.is_zero() {
+            return Err(PacingError::ZeroDeadline);
+        }
         Ok(ReconnectPacing {
             floor,
             ceiling,
             budget,
             window,
+            deadline,
         })
     }
 
@@ -93,11 +105,22 @@ impl ReconnectPacing {
         self.window
     }
 
+    pub fn deadline(&self) -> Duration {
+        self.deadline
+    }
+
     /// The wait after `failures` consecutive attempts that did not open: the floor after a drop
     /// (no failure) or a first failure, doubling with each further one, capped at the ceiling.
     fn backoff(&self, failures: u32) -> Duration {
-        let doublings = failures.saturating_sub(1).min(31);
-        self.floor.saturating_mul(1 << doublings).min(self.ceiling)
+        let mut wait = self.floor;
+        // Saturating, so the wait reaches any ceiling within about a hundred doublings.
+        for _ in 1..failures {
+            if wait >= self.ceiling {
+                break;
+            }
+            wait = wait.saturating_mul(2);
+        }
+        wait.min(self.ceiling)
     }
 }
 
@@ -121,18 +144,24 @@ impl Pacer {
     }
 
     /// When the next attempt may start: never before `now`, the backoff after the last attempt
-    /// or connection ended, or the moment the budget frees a slot.
-    pub(crate) fn next_attempt(&self, now: Instant) -> Instant {
+    /// or connection ended, or the moment the budget frees a slot; `None` when that is past the
+    /// end of the clock.
+    pub(crate) fn next_attempt(&self, now: Instant) -> Option<Instant> {
         let mut at = now;
         if let Some(ended) = self.ended {
-            at = at.max(ended + self.pacing.backoff(self.failures));
+            at = at.max(ended.checked_add(self.pacing.backoff(self.failures))?);
         }
         if self.attempts.len() >= self.pacing.budget() as usize
             && let Some(oldest) = self.attempts.front()
         {
-            at = at.max(*oldest + self.pacing.window);
+            at = at.max(oldest.checked_add(self.pacing.window)?);
         }
-        at
+        Some(at)
+    }
+
+    /// How long an attempt may take to open.
+    pub(crate) fn deadline(&self) -> Duration {
+        self.pacing.deadline
     }
 
     /// An attempt started at `at`.
@@ -169,18 +198,18 @@ mod tests {
     }
 
     fn pacing(floor: u64, ceiling: u64, budget: u32, window: u64) -> ReconnectPacing {
-        ReconnectPacing::new(ms(floor), ms(ceiling), budget, ms(window)).unwrap()
+        ReconnectPacing::new(ms(floor), ms(ceiling), budget, ms(window), ms(1)).unwrap()
     }
 
     #[test]
     fn every_number_is_the_consumers_and_a_useless_one_is_refused() {
         let p = pacing(100, 800, 3, 1_000);
         assert_eq!(
-            (p.floor(), p.ceiling(), p.budget(), p.window()),
-            (ms(100), ms(800), 3, ms(1_000))
+            (p.floor(), p.ceiling(), p.budget(), p.window(), p.deadline()),
+            (ms(100), ms(800), 3, ms(1_000), ms(1))
         );
         let refused = |floor, ceiling, budget, window| {
-            let err = ReconnectPacing::new(ms(floor), ms(ceiling), budget, ms(window));
+            let err = ReconnectPacing::new(ms(floor), ms(ceiling), budget, ms(window), ms(1));
             (err.unwrap_err(), err.unwrap_err().to_string())
         };
         assert_eq!(
@@ -208,6 +237,9 @@ mod tests {
                 "the attempt budget's window is zero".into()
             )
         );
+        let err = ReconnectPacing::new(ms(1), ms(1), 1, ms(1), ms(0)).unwrap_err();
+        assert_eq!(err, PacingError::ZeroDeadline);
+        assert_eq!(err.to_string(), "the connection attempt deadline is zero");
     }
 
     #[test]
@@ -216,25 +248,44 @@ mod tests {
         let waits: Vec<_> = (0..6).map(|n| p.backoff(n)).collect();
         assert_eq!(waits, [100, 100, 200, 400, 800, 800].map(ms));
         assert_eq!(p.backoff(u32::MAX), ms(800));
-        let wide = ReconnectPacing::new(ms(1), Duration::MAX, 1, ms(1)).unwrap();
-        assert_eq!(wide.backoff(u32::MAX), ms(1 << 31));
+        // Past 2^31 floors the doubling goes on to the ceiling (Codex r4177068883).
+        let ceiling = ms(1 << 40);
+        let wide = ReconnectPacing::new(ms(1), ceiling, 1, ms(1), ms(1)).unwrap();
+        assert_eq!(wide.backoff(33), ms(1 << 32));
+        assert_eq!(wide.backoff(u32::MAX), ceiling);
+        let unbounded = ReconnectPacing::new(ms(1), Duration::MAX, 1, ms(1), ms(1)).unwrap();
+        assert_eq!(unbounded.backoff(u32::MAX), Duration::MAX);
+    }
+
+    #[test]
+    fn a_wait_past_the_end_of_the_clock_never_ends_instead_of_panicking() {
+        let t0 = Instant::now();
+        let huge = Duration::MAX;
+        let mut by_floor = Pacer::new(ReconnectPacing::new(huge, huge, 9, ms(1), ms(1)).unwrap());
+        by_floor.attempted(t0);
+        by_floor.opened();
+        by_floor.dropped(t0);
+        assert_eq!(by_floor.next_attempt(t0), None);
+        let mut by_window = Pacer::new(ReconnectPacing::new(ms(1), ms(1), 1, huge, ms(1)).unwrap());
+        by_window.attempted(t0);
+        assert_eq!(by_window.next_attempt(t0), None);
     }
 
     #[test]
     fn the_first_attempt_goes_at_once_and_a_drop_waits_the_floor() {
         let t0 = Instant::now();
         let mut pacer = Pacer::new(pacing(100, 800, 10, 1_000));
-        assert_eq!(pacer.next_attempt(t0), t0);
+        assert_eq!(pacer.next_attempt(t0), Some(t0));
         pacer.attempted(t0);
         pacer.failed(t0);
         pacer.attempted(t0 + ms(100));
         pacer.failed(t0 + ms(100));
-        assert_eq!(pacer.next_attempt(t0 + ms(100)), t0 + ms(300));
+        assert_eq!(pacer.next_attempt(t0 + ms(100)), Some(t0 + ms(300)));
         pacer.attempted(t0 + ms(300));
         pacer.opened();
         pacer.dropped(t0 + ms(5_000));
-        assert_eq!(pacer.next_attempt(t0 + ms(5_000)), t0 + ms(5_100));
-        assert_eq!(pacer.next_attempt(t0 + ms(9_000)), t0 + ms(9_000));
+        assert_eq!(pacer.next_attempt(t0 + ms(5_000)), Some(t0 + ms(5_100)));
+        assert_eq!(pacer.next_attempt(t0 + ms(9_000)), Some(t0 + ms(9_000)));
     }
 
     #[test]
@@ -245,9 +296,9 @@ mod tests {
             pacer.attempted(t0 + ms(at));
             pacer.failed(t0 + ms(at));
         }
-        assert_eq!(pacer.next_attempt(t0 + ms(10)), t0 + ms(1_000));
+        assert_eq!(pacer.next_attempt(t0 + ms(10)), Some(t0 + ms(1_000)));
         pacer.attempted(t0 + ms(1_000));
         pacer.failed(t0 + ms(1_000));
-        assert_eq!(pacer.next_attempt(t0 + ms(1_000)), t0 + ms(1_010));
+        assert_eq!(pacer.next_attempt(t0 + ms(1_000)), Some(t0 + ms(1_010)));
     }
 }

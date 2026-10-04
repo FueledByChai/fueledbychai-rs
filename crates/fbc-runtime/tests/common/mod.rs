@@ -447,15 +447,15 @@ impl Peer {
 }
 
 /// A server on a 127.0.0.1 ephemeral port that accepts connections and never answers on them,
-/// reporting each accept.
-pub async fn hanging() -> (SocketAddr, mpsc::UnboundedReceiver<()>) {
+/// reporting the (tokio) instant of each accept.
+pub async fn hanging() -> (SocketAddr, mpsc::UnboundedReceiver<Instant>) {
     let (listener, addr) = listen().await;
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         let mut held = Vec::new();
         loop {
             held.push(listener.accept().await.unwrap().0);
-            let _ = tx.send(());
+            let _ = tx.send(Instant::now());
         }
     });
     (addr, rx)

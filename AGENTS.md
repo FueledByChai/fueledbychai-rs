@@ -146,7 +146,7 @@ rather than guess.
     keeping a refused or waiting subscription pending. Both are logic only, with no socket.
     `MdSession` drives one market-data socket endpoint over them (0023): a fresh codec per
     epoch, events stamped (an `IngestClock` shared per shard) and handed to the consumer's
-    `MdHandler` inline, the codec's effects executed, reconnects paced by `ReconnectPacing`;
+    `MdHandler` inline, the codec's effects executed, reconnects paced by `ReconnectPacing` (backoff, attempt budget, attempt deadline);
     `tests/common/toy.rs` is the toy market-data venue later runtime tests reuse.
   - `crates/fbc-book` (it depends on `fbc-core` only: one tick-indexed L2 book per
     instrument and `BookId`, built from book events the same live and in replay, with
