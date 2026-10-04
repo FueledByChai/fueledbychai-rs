@@ -164,8 +164,8 @@ rather than guess.
     consumer's `RedactionKey` (`src/redact.rs`, 0024; signatures kept verbatim), and a
     `JournalSink` that never blocks: a hand-written queue of atomic words (0021) with a consumer-configured byte budget, a soft
     limit for Normal records and a Safety reserve, drops counted by class, a `Degraded` marker
-    once space returns, and a writer thread draining it; still planned: the nonce,
-    encode-context and cycle records), `crates/fbc-sim` (simulated venue and queue-position
+    once space returns, and a writer thread draining it; the nonce, encode-context and cycle
+    records arrived in format version 3, whose reader still reads version 2 journals), `crates/fbc-sim` (simulated venue and queue-position
     fill-model code, never calibrations), `crates/fbc-conformance` (the adapter conformance kit,
     0025; it depends on `fbc-runtime`, and on `fbc-core` in its tests, never on a venue crate: so
     far a public stub venue server on 127.0.0.1 ephemeral ports, a WebSocket endpoint that plays
@@ -205,7 +205,9 @@ rather than guess.
   in Paradex's documented shape. `fixtures/binance-usdm/` holds hand-written frames (`md/`) and REST
   responses (`rest/`) in Binance's documented shapes, its README citing the pages.
   `fixtures/licence-gate/` is a standalone two-crate workspace the licence gate's self-test
-  runs against (0017).
+  runs against (0017). `fixtures/journal/` holds journals `fbc-journal` wrote in an older
+  format version, from synthetic records, which later readers must still read; its README says
+  how each was written.
 - Docs: `docs/decisions/` (records, index in its `README.md`; cite by number, never restate one
   in a doc or a ticket), `docs/PRODUCT_BACKLOG.md` (stories), and the Beads queue in `.beads`
   (prefix `FBC`).

@@ -10,8 +10,9 @@ use core::fmt;
 use core::ops::Range;
 
 use fbc_core::{
-    ConnKey, Header, HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag, MonoNs,
-    NotSentReason, RawFrame, RpcId, Stamp, Subscription, TimerTag, WireSlice, WireUrl,
+    ConnKey, EncodeCtx, Header, HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag,
+    InstrumentId, MonoNs, NotSentReason, RawFrame, RpcId, Stamp, Subscription, TimerTag, WireSlice,
+    WireUrl,
 };
 
 /// The byte a redaction span reads back as. A span's bytes are never written (its keyed hash
@@ -89,6 +90,12 @@ pub enum Marker {
     /// Records are no longer being dropped.
     Recovered,
 }
+
+/// A nonce source as the runtime numbers it: one per scope the venue's
+/// [`NonceScope`](fbc_core::NonceScope) names (an account, a signing key). Which number names
+/// which source is the runtime's choice.
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+pub struct NonceSourceId(pub u32);
 
 /// One HTTP header as journaled. `redact` says its value is a credential: the codec marked it,
 /// or its name is one of [`SECRET_HEADERS`]. A read-back header with `redact` has its value
@@ -273,6 +280,22 @@ pub enum Record {
     Control { at: MonoNs, ev: ControlEvent },
     /// A marker.
     Marker(Marker),
+    /// A nonce `source` reserved: one record per value, in the order reserved, so replay and a
+    /// restarted source carry on from exactly where the live one stood (0006).
+    Nonce { source: NonceSourceId, value: u64 },
+    /// The context one call was given (0014 item 1): its wall and monotonic time and the
+    /// nonces reserved for it, which replay hands the same call. `rpc` names the request of an
+    /// `encode`; it is `None` for the other calls that take a context (`on_open`, `on_timer`,
+    /// `resync`), which replay matches by their place in the journal.
+    EncodeCtx { rpc: Option<RpcId>, ctx: EncodeCtx },
+    /// A decide cycle began (design §4.8): every input up to ingest sequence
+    /// `last_ingest_seq` had been drained, and the shard ran its strategy and planner for
+    /// `instruments`, in that order. Written for every pass, a pass that decides nothing
+    /// included, so replay decides exactly where the live shard did.
+    Cycle {
+        last_ingest_seq: u64,
+        instruments: Vec<InstrumentId>,
+    },
 }
 
 impl Record {

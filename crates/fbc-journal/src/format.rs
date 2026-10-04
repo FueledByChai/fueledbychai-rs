@@ -13,26 +13,35 @@
 //! the record ([`Record::digests`] gives their order). A record redacts at most
 //! [`MAX_REDACTED`] bytes, so a damaged length cannot make the reader allocate more than that
 //! for blanks.
+//!
+//! Version 3 (FBC-ec9) adds three kinds and changes none: `Nonce`, `EncodeCtx` and `Cycle`.
+//! The reader reads versions 2 and 3, so a journal written before these kinds existed reads
+//! back unchanged; a version 2 segment holding one of them is malformed. A reader of version 2
+//! refuses a version 3 segment at its header, rather than part way through.
 
 use core::ops::Range;
 
 use fbc_core::{
-    BookId, ConnKey, Feed, HttpFailure, HttpMethod, HttpTag, InstrumentId, KernelRxNs, MonoNs,
-    NotSentReason, RpcId, Stamp, Subscription, TimerTag, TouchSourceId, WallNs, WireSlice, WireUrl,
+    BookId, ConnKey, EncodeCtx, Feed, HttpFailure, HttpMethod, HttpTag, InstrumentId, KernelRxNs,
+    MonoNs, NonceBlock, NotSentReason, RpcId, Stamp, Subscription, TimerTag, TouchSourceId, WallNs,
+    WireSlice, WireUrl,
 };
 
 use crate::JournalError;
 use crate::record::{
-    BLANK, ControlEvent, HeaderRec, HttpRequestRec, HttpResponseRec, Marker, Opaque, Opcode,
-    Record, WriteRes,
+    BLANK, ControlEvent, HeaderRec, HttpRequestRec, HttpResponseRec, Marker, NonceSourceId, Opaque,
+    Opcode, Record, WriteRes,
 };
 use crate::redact::{DIGEST_LEN, RedactionKey, SpanDigest};
 
 /// The first bytes of every segment.
 pub const MAGIC: [u8; 4] = *b"FBCJ";
-/// The format version this crate writes and reads. Version 1 (FBC-aen) wrote no hash for a
-/// span; version 2 writes each span's keyed hash (FBC-apz).
-pub const VERSION: u16 = 2;
+/// The format version this crate writes. Version 1 (FBC-aen) wrote no hash for a span;
+/// version 2 writes each span's keyed hash (FBC-apz); version 3 adds the `Nonce`, `EncodeCtx`
+/// and `Cycle` kinds (FBC-ec9).
+pub const VERSION: u16 = 3;
+/// The oldest format version this crate reads: version 1 is refused (0024).
+pub const OLDEST_READABLE: u16 = 2;
 /// The most bytes one record may redact, its spans and secret header values together.
 /// Credentials are short; the bound keeps a damaged length from making the reader allocate
 /// gigabytes of blanks. The writer refuses a record over it ([`JournalError::TooLarge`]).
@@ -46,6 +55,10 @@ const HTTP_RESULT: u8 = 5;
 const TIMER: u8 = 6;
 const CONTROL: u8 = 7;
 const MARKER: u8 = 8;
+// Version 3.
+const NONCE: u8 = 9;
+const ENCODE_CTX: u8 = 10;
+const CYCLE: u8 = 11;
 
 // Field-less enums are a byte: the value's place in its table. Encoding matches exhaustively,
 // so a new variant fails to compile until it has a byte; decoding indexes the table.
@@ -277,6 +290,35 @@ fn encode_body(
                 Marker::Recovered => e.u8(2),
             }
         }
+        Record::Nonce { source, value } => {
+            e.u8(NONCE);
+            e.u32(source.0);
+            e.u64(*value);
+        }
+        Record::EncodeCtx { rpc, ctx } => {
+            e.u8(ENCODE_CTX);
+            e.rpc(*rpc);
+            e.i64(ctx.wall.0);
+            e.u64(ctx.mono.0);
+            let nonces = ctx.nonces.as_slice();
+            e.u32(len32(nonces.len())?);
+            for n in nonces {
+                e.u64(*n);
+                e.within()?;
+            }
+        }
+        Record::Cycle {
+            last_ingest_seq,
+            instruments,
+        } => {
+            e.u8(CYCLE);
+            e.u64(*last_ingest_seq);
+            e.u32(len32(instruments.len())?);
+            for inst in instruments {
+                e.u32(inst.get());
+                e.within()?;
+            }
+        }
     }
     if e.over {
         return Err(JournalError::TooLarge);
@@ -472,16 +514,28 @@ impl Enc<'_> {
 /// What in a record body could not be read; the reader names the segment.
 pub(crate) type Bad = &'static str;
 
-/// Reads one record body, which must be consumed exactly: the record with its spans blanked,
-/// and the keyed hashes written in their place, in the order [`Record::digests`] gives.
+/// Reads one record body of the current [`VERSION`]: [`decode_version`].
+#[cfg(test)]
 pub(crate) fn decode(body: &[u8]) -> Result<(Record, Vec<SpanDigest>), Bad> {
+    decode_version(body, VERSION)
+}
+
+/// Reads one record body of a segment in format `version` (one this crate reads), which must
+/// be consumed exactly: the record with its spans blanked, and the keyed hashes written in
+/// their place, in the order [`Record::digests`] gives. A kind newer than `version` is
+/// malformed.
+pub(crate) fn decode_version(body: &[u8], version: u16) -> Result<(Record, Vec<SpanDigest>), Bad> {
     let mut d = Dec {
         buf: body,
         at: 0,
         blanked: 0,
         digests: Vec::new(),
     };
-    let record = match d.u8()? {
+    let kind = d.u8()?;
+    if kind >= NONCE && version < 3 {
+        return Err("record kind");
+    }
+    let record = match kind {
         INBOUND => {
             let stamp = d.stamp()?;
             let opcode = d.pick(&OPCODES, "opcode")?;
@@ -574,6 +628,22 @@ pub(crate) fn decode(body: &[u8]) -> Result<(Record, Vec<SpanDigest>), Bad> {
             2 => Marker::Recovered,
             _ => return Err("marker"),
         }),
+        NONCE => Record::Nonce {
+            source: NonceSourceId(d.u32()?),
+            value: d.u64()?,
+        },
+        ENCODE_CTX => Record::EncodeCtx {
+            rpc: d.rpc()?,
+            ctx: EncodeCtx {
+                wall: WallNs(d.i64()?),
+                mono: MonoNs(d.u64()?),
+                nonces: NonceBlock::new(d.nonces()?),
+            },
+        },
+        CYCLE => Record::Cycle {
+            last_ingest_seq: d.u64()?,
+            instruments: d.instruments()?,
+        },
         _ => return Err("record kind"),
     };
     if d.at != body.len() {
@@ -734,6 +804,24 @@ impl<'a> Dec<'a> {
             });
         }
         Ok(headers)
+    }
+
+    fn nonces(&mut self) -> Result<Vec<u64>, Bad> {
+        let count = self.u32()?;
+        let mut nonces = Vec::new();
+        for _ in 0..count {
+            nonces.push(self.u64()?);
+        }
+        Ok(nonces)
+    }
+
+    fn instruments(&mut self) -> Result<Vec<InstrumentId>, Bad> {
+        let count = self.u32()?;
+        let mut instruments = Vec::new();
+        for _ in 0..count {
+            instruments.push(InstrumentId::new(self.u32()?));
+        }
+        Ok(instruments)
     }
 
     fn subs(&mut self) -> Result<Vec<Subscription>, Bad> {
@@ -1083,6 +1171,81 @@ mod tests {
             encode(&result(headers), &key(), &mut body),
             Err(JournalError::TooLarge)
         ));
+    }
+
+    fn encode_ctx(nonces: Vec<u64>) -> Record {
+        Record::EncodeCtx {
+            rpc: Some(RpcId(3)),
+            ctx: EncodeCtx {
+                wall: WallNs(-5),
+                mono: MonoNs(6),
+                nonces: NonceBlock::new(nonces),
+            },
+        }
+    }
+
+    fn cycle(n: u32) -> Record {
+        Record::Cycle {
+            last_ingest_seq: 9,
+            instruments: (0..n).map(InstrumentId::new).collect(),
+        }
+    }
+
+    #[test]
+    fn the_version_3_kinds_round_trip_and_are_refused_in_a_version_2_body() {
+        let nonce = Record::Nonce {
+            source: NonceSourceId(2),
+            value: 7,
+        };
+        for record in [nonce, encode_ctx(vec![1, 2]), cycle(3)] {
+            assert_eq!(round_trip(&record), record);
+            let mut body = Vec::new();
+            encode(&record, &key(), &mut body).unwrap();
+            assert_eq!(decode_version(&body, 3).unwrap().0, record);
+            assert_eq!(decode_version(&body, 2), Err("record kind"));
+        }
+        // The version 2 kinds read the same in either version.
+        let body = good_outbound();
+        assert_eq!(decode_version(&body, 2), decode_version(&body, 3));
+    }
+
+    #[test]
+    fn a_damaged_version_3_body_is_refused_with_what_was_wrong() {
+        let mut ctx = Vec::new();
+        encode(&encode_ctx(vec![1, 2]), &key(), &mut ctx).unwrap();
+        let mut cyc = Vec::new();
+        encode(&cycle(2), &key(), &mut cyc).unwrap();
+        let cases: Vec<(Vec<u8>, Bad)> = vec![
+            ([NONCE, 0, 0, 0, 0].to_vec(), "record ends early"),
+            // An rpc flag that is neither 0 nor 1.
+            ([&[ENCODE_CTX][..], &[2]].concat(), "rpc"),
+            // A nonce or an instrument cut short, and a count past the body.
+            (ctx[..ctx.len() - 1].to_vec(), "record ends early"),
+            (cyc[..cyc.len() - 1].to_vec(), "record ends early"),
+            (
+                [&[CYCLE][..], &[0; 8], &words(&[u32::MAX]), &[0; 4]].concat(),
+                "record ends early",
+            ),
+            ([ctx.clone(), vec![0]].concat(), "bytes after the record"),
+        ];
+        for (body, want) in cases {
+            assert_eq!(decode(&body), Err(want), "{body:?}");
+        }
+    }
+
+    #[test]
+    fn a_long_nonce_or_instrument_list_stops_at_the_limit() {
+        for record in [encode_ctx((0..4_096).collect()), cycle(4_096)] {
+            let mut body = Vec::new();
+            assert!(matches!(
+                encode_within(&record, &key(), &mut body, 64),
+                Err(JournalError::TooLarge)
+            ));
+            assert!(body.is_empty());
+            let mut unlimited = Vec::new();
+            encode(&record, &key(), &mut unlimited).unwrap();
+            assert_eq!(decode(&unlimited).unwrap().0, record);
+        }
     }
 
     #[test]
