@@ -62,6 +62,35 @@ async fn until(done: impl Fn() -> bool) {
     }
 }
 
+/// Holds tokio's paused clock still until dropped. A paused clock otherwise jumps to its next
+/// timer whenever the runtime waits on socket I/O; while a blocking task runs it does not
+/// (tokio's test-util), so time moves only by `tokio::time::advance`, and neither machine load
+/// nor the CPU a 64 MiB frame takes to build can use up a deadline (FBC-3dj).
+fn freeze() -> std::sync::mpsc::Sender<()> {
+    let (thaw, frozen) = std::sync::mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || frozen.recv());
+    thaw
+}
+
+/// Lets the session run, without moving the clock, until `done`; what it waits for needs no
+/// socket I/O, so it comes within a few turns of the runtime or not at all.
+async fn settle(done: impl Fn() -> bool) {
+    for _ in 0..10_000 {
+        if done() {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("not settled");
+}
+
+/// Lets the session run a while without moving the clock.
+async fn churn() {
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+}
+
 fn key(epoch: u32) -> ConnKey {
     ConnKey { conn: CONN, epoch }
 }
@@ -152,8 +181,9 @@ async fn an_unanswered_request_times_out_and_a_refused_or_lost_one_says_so() {
     assert_eq!(log, want);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_request_goes_out_and_times_out_while_a_write_waits_on_a_stalled_peer() {
+    let frozen = freeze();
     let (mut ws, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
     let venue = ToyVenue::leak();
     let (mut session, control) = MdSession::new(session(venue, socket(ws.url())), |_| {}).unwrap();
@@ -161,26 +191,37 @@ async fn a_request_goes_out_and_times_out_while_a_write_waits_on_a_stalled_peer(
         let mut peer = ws.accept().await;
         assert_eq!(peer.recv().await, "hello|codec=0|plan=1");
         assert_eq!(peer.recv().await, "sub|add=A");
-        // A GET with a 150 ms timeout, then a 64 MiB frame the stalled peer holds back for
-        // 600 ms (Codex r4177481297).
+        // A GET with a 150 ms timeout, then a 64 MiB frame the peer holds back until the test
+        // lets it go (Codex r4177481297), so the write cannot end before then; the clock moves
+        // only when the test moves it (FBC-3dj).
         let url = http.url("/during");
         let start = Instant::now();
         peer.send(&format!("get|tag=9|ms=150|kb=65536|url={url}"));
-        peer.stall_for(ms(600));
-        let during = tokio::time::timeout(ms(450), http.request()).await;
-        let held = during.expect("the request goes out while the write waits");
-        until(|| venue.http_log().len() == 1).await;
-        // Its deadline ran from when it was asked for, not from when the write ended.
-        assert!(start.elapsed() < ms(600 + 150), "{:?}", start.elapsed());
+        let release = peer.hold();
+        // The request goes out while the write waits.
+        let held = http.request().await;
+        // It times out by its own deadline, 150 ms after it was asked for, while the write
+        // still waits: not a moment before, and not from when the write ends.
+        tokio::time::advance(ms(149)).await;
+        churn().await;
+        assert!(venue.http_log().is_empty(), "{:?}", venue.http_log());
+        tokio::time::advance(ms(1)).await;
+        settle(|| venue.http_log().len() == 1).await;
+        assert_eq!(start.elapsed(), ms(150));
+        // The write was waiting all along: its frame arrives once the peer reads again.
+        release.send(()).unwrap();
+        assert_eq!(peer.recv().await.len(), 65536 * 1024);
         drop((held, control));
     };
     let (run, ()) = tokio::join!(session.run(), script);
     run.unwrap();
+    drop(frozen);
     assert_eq!(venue.http_log(), ["0/9:TimedOut"]);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_request_asked_for_by_a_result_that_comes_back_during_a_write_starts_at_once() {
+    let frozen = freeze();
     let (mut ws, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
     let venue = ToyVenue::leak();
     let (mut session, control) = MdSession::new(session(venue, socket(ws.url())), |_| {}).unwrap();
@@ -188,29 +229,36 @@ async fn a_request_asked_for_by_a_result_that_comes_back_during_a_write_starts_a
         let mut peer = ws.accept().await;
         assert_eq!(peer.recv().await, "hello|codec=0|plan=1");
         assert_eq!(peer.recv().await, "sub|add=A");
-        // A GET, then a 64 MiB frame the stalled peer holds back for 1000 ms. The GET's answer
-        // asks for a second GET with a 150 ms timeout that is never answered (Codex
-        // r4177887264).
+        // A GET, then a 64 MiB frame the peer holds back until the test lets it go. The GET's
+        // answer asks for a second GET with a 150 ms timeout that is never answered (Codex
+        // r4177887264). The clock moves only when the test moves it (FBC-3dj).
         peer.send(&format!(
             "get|tag=9|ms=5000|kb=65536|url={}",
             http.url("/during")
         ));
-        peer.stall_for(ms(1000));
+        let release = peer.hold();
         let start = Instant::now();
         let nested = format!("get|tag=5|ms=150|url={}", http.url("/nested"));
         http.request()
             .await
             .answer("HTTP/1.1 200 OK", &nested)
             .await;
-        let held = tokio::time::timeout(ms(500), http.request()).await;
-        let held = held.expect("the second request goes out while the write waits");
-        until(|| venue.http_log().len() == 2).await;
-        // Its deadline ran from when the codec asked for it, not from when the write ended.
-        assert!(start.elapsed() < ms(1000), "{:?}", start.elapsed());
+        // The second request goes out while the write waits.
+        let held = http.request().await;
+        // It times out 150 ms after the codec asked for it, while the write still waits.
+        tokio::time::advance(ms(149)).await;
+        churn().await;
+        assert_eq!(venue.http_log(), ["0/9:200:-"]);
+        tokio::time::advance(ms(1)).await;
+        settle(|| venue.http_log().len() == 2).await;
+        assert_eq!(start.elapsed(), ms(150));
+        release.send(()).unwrap();
+        assert_eq!(peer.recv().await.len(), 65536 * 1024);
         drop((held, control));
     };
     let (run, ()) = tokio::join!(session.run(), script);
     run.unwrap();
+    drop(frozen);
     assert_eq!(venue.http_log(), ["0/9:200:-", "0/5:TimedOut"]);
 }
 
