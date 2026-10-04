@@ -10,9 +10,9 @@
 //! In: `trade|sym=A|px=<ticks>|qty=<lots>|seq=<n>` is a trade; `arm|sym=A|ms=<n>` sets a timer
 //! whose firing reports the instrument's trades stale; `big|kb=<n>` asks for an `n` KiB frame;
 //! `bye` asks for a reconnect; `say` asks to send `said`; `get|tag=<n>|ms=<t>|url=<u>` asks for
-//! a GET of `u` with a `t` ms timeout (and, with `|kb=<k>`, then a `k` KiB frame); `get` with
-//! `ms=max` asks for a timeout past the end of the clock; `odd` asks for a frame and a reconnect on another stream,
-//! which a session refuses. Anything else, and every binary frame, is malformed.
+//! a GET of `u` with a `t` ms timeout (and, with `|kb=<k>`, then a `k` KiB frame, and with
+//! `|bye=1`, then a reconnect); `get` with `ms=max` asks for a timeout past the end of the clock;
+//! `odd` asks for a frame and a reconnect on another stream, which a session refuses. Anything else, and every binary frame, is malformed.
 //!
 //! Every `on_http` is logged as `<codec>/<tag>:<status>:<x-toy header>` or
 //! `<codec>/<tag>:<failure>`, and a response body's lines are read as frames. On a poll
@@ -473,6 +473,12 @@ impl ToyMd {
                 fx.push(get(tag as u64, url, timeout));
                 if let Ok(kb) = num(&fields, "kb") {
                     fx.push(send(self.stream, "x".repeat(kb as usize * 1024)));
+                }
+                if field(&fields, "bye").is_ok() {
+                    fx.push(Effect::Reconnect {
+                        stream: self.stream,
+                        reason: "bye",
+                    });
                 }
             }
             "odd" => {
