@@ -7,7 +7,7 @@ use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use crate::JournalError;
-use crate::format::{self, MAGIC, VERSION};
+use crate::format::{self, MAGIC, OLDEST_READABLE, VERSION};
 use crate::record::Record;
 use crate::redact::SpanDigest;
 use crate::writer::{COMPRESSED_EXT, Listed, list_segments, with_ext};
@@ -25,6 +25,10 @@ use crate::writer::{COMPRESSED_EXT, Listed, list_segments, with_ext};
 /// segment can be found again. A compressed segment's checksum covers the whole segment and
 /// is checked at its end, so a mismatch is reported after the segment's records.
 ///
+/// It reads segments of every format version from [`OLDEST_READABLE`] to [`VERSION`]: a
+/// version 2 segment, written before the `Nonce`, `EncodeCtx` and `Cycle` kinds existed,
+/// reads back as it was written.
+///
 /// As an iterator it returns records with their redaction spans blanked
 /// ([`Record::blanked`]); [`entries`](JournalReader::entries) returns each with the keyed
 /// hashes written in place of its spans.
@@ -38,6 +42,8 @@ struct Open {
     path: PathBuf,
     compressed: bool,
     file: Box<dyn Read + Send>,
+    /// The segment's format version, once its header is read.
+    version: u16,
 }
 
 impl Open {
@@ -110,6 +116,7 @@ impl JournalReader {
                     path,
                     compressed,
                     file,
+                    version: 0,
                 });
                 let mut head = [0u8; 6];
                 if open.read_full(&mut head)? < head.len() {
@@ -123,12 +130,13 @@ impl JournalReader {
                     });
                 }
                 let version = u16::from_le_bytes([head[4], head[5]]);
-                if version != VERSION {
+                if !(OLDEST_READABLE..=VERSION).contains(&version) {
                     return Err(JournalError::UnsupportedVersion {
                         segment: open.path.clone(),
                         version,
                     });
                 }
+                open.version = version;
                 open
             }
         };
@@ -153,7 +161,7 @@ impl JournalReader {
                 segment: open.path.clone(),
             });
         }
-        format::decode(&body)
+        format::decode_version(&body, open.version)
             .map(|(record, digests)| Some(Entry { record, digests }))
             .map_err(|what| JournalError::Malformed {
                 segment: open.path.clone(),

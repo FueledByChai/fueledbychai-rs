@@ -7,8 +7,9 @@
 //! - [`Record`], the records the runtime writes: inbound frames with their stamps, outbound
 //!   frames with their redaction spans and write results, HTTP requests and results with
 //!   headers, timer firings, control records (connections opened and closed, subscription
-//!   calls) and markers (a session's start with the consumer's header, `Degraded`,
-//!   `Recovered`).
+//!   calls), markers (a session's start with the consumer's header, `Degraded`,
+//!   `Recovered`), the nonces each source reserved, the context (wall and monotonic time,
+//!   nonces) each encode was given, and decide-cycle boundaries.
 //! - [`JournalWriter`], which writes one shard's records into a directory the consumer
 //!   supplies, one subdirectory per UTC day (`YYYYMMDD`), segments named
 //!   `<shard>-<seq>.fbcj`, rolled at every UTC hour; each segment it closes is compressed with
@@ -53,8 +54,8 @@ mod writer;
 pub use error::JournalError;
 pub use reader::{Entries, Entry, JournalReader};
 pub use record::{
-    BLANK, ControlEvent, HeaderRec, HttpRequestRec, HttpResponseRec, Marker, Opaque, Opcode,
-    Record, SECRET_HEADERS, WriteRes, is_secret_header,
+    BLANK, ControlEvent, HeaderRec, HttpRequestRec, HttpResponseRec, Marker, NonceSourceId, Opaque,
+    Opcode, Record, SECRET_HEADERS, WriteRes, is_secret_header,
 };
 pub use redact::{RedactionKey, SpanDigest};
 pub use sink::{
