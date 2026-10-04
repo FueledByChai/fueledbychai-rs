@@ -93,11 +93,11 @@ fn plan_md_negotiates_sbe_and_the_codec_subscribes_once_per_channel() {
 #[test]
 fn nothing_is_planned_or_sent_for_a_feed_or_instrument_it_cannot_spell() {
     let specs = specs();
-    let mark = sub(BTC, Feed::Mark);
+    let index = sub(BTC, Feed::Index);
     let unknown = sub(fbc_core::InstrumentId::new(9), Feed::Trades);
     let other_touch = sub(BTC, Feed::Touch(fbc_core::TouchSourceId(1)));
     for (bad, err) in [
-        (mark, VenueError::UnsupportedFeed(mark)),
+        (index, VenueError::UnsupportedFeed(index)),
         (other_touch, VenueError::UnsupportedFeed(other_touch)),
         (unknown, VenueError::UnknownInstrument(unknown.inst)),
     ] {

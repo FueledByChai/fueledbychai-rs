@@ -1,0 +1,33 @@
+# MarketSummaryEvent (template 4), schema 1:0, block 216
+# Hand-built from paradex_1_0.xml at tradeparadex/paradex-py b8248fb747e278d2167ac2f056b339a287d5ef30.
+# Little-endian; '#' starts a comment. Same values as markets-summary-v1.sbe.txt.
+d8 00 04 00 01 00 00 00                           # header: blockLength=216 templateId=4 (MarketSummaryEvent) schemaId=1 version=0
+40 85 7e 84 41 40 06 00                           # @0 ts int64 = 1759500000200000 (us, feed publish)
+ed 03 00 00 00 00 00 00                           # @8 seq int64 = 1005
+4e 91 88 8d a3 05 00 00                           # @16 markPrice Price8 = 6200012345678 (62000.12345678)
+80 bb f9 71 a3 05 00 00                           # @24 indexPrice Price8 = 6199550000000 (61995.5, not decoded)
+80 20 c7 8f a3 05 00 00                           # @32 lastPrice Price8 = 6200050000000 (62000.5, not decoded)
+80 65 53 60 54 dc 2b 00                           # @40 volumeUsd24h Value8 = 12345678950000000 (123456789.5, not decoded)
+60 be 97 be 1c 00 00 00                           # @48 openInterest Qty8 = 123456700000 (1234.567, not decoded)
+d2 04 00 00 00 00 00 00                           # @56 fundingRate Rate8 = 1234 (0.00001234: fundingRatePrecise cut to 8dp)
+00 30 cc 8c a3 05 00 00                           # @64 bid Price8NULL = 6200000000000 (62000.0, not decoded)
+80 20 c7 8f a3 05 00 00                           # @72 ask Price8NULL = 6200050000000 (62000.5, not decoded)
+00 aa 15 44 5f da b4 0d                           # @80 totalVolume Value8 = 987654321000000000 (9876543210.0, not decoded)
+d0 12 13 00 00 00 00 00                           # @88 priceChangeRate24h Rate8 = 1250000 (0.0125, not decoded)
+00 00 00 00 00 00 00 80                           # @96 markIv Rate8NULL = null (options only: null for a perpetual)
+00 00 00 00 00 00 00 80                           # @104 bidIv Rate8NULL = null (options only: null for a perpetual)
+00 00 00 00 00 00 00 80                           # @112 askIv Rate8NULL = null (options only: null for a perpetual)
+00 00 00 00 00 00 00 80                           # @120 lastIv Rate8NULL = null (options only: null for a perpetual)
+00 00 00 00 00 00 00 80                           # @128 delta Rate8NULL = null (options only: null for a perpetual)
+00 00 00 00 00 00 00 80                           # @136 gamma Rate8NULL = null (options only: null for a perpetual)
+00 00 00 00 00 00 00 80                           # @144 vega Rate8NULL = null (options only: null for a perpetual)
+00 00 00 00 00 00 00 80                           # @152 theta Rate8NULL = null (options only: null for a perpetual)
+00 00 00 00 00 00 00 80                           # @160 rho Rate8NULL = null (options only: null for a perpetual)
+00 00 00 00 00 00 00 80                           # @168 volga Rate8NULL = null (options only: null for a perpetual)
+00 00 00 00 00 00 00 80                           # @176 vanna Rate8NULL = null (options only: null for a perpetual)
+00 00 00 00 00 00 00 80                           # @184 futureFundingRate Rate8NULL = null (options only: null for a perpetual)
+00 00 00 00 00 00 00 80                           # @192 externalFairPrice Price8NULL = null (not decoded)
+40 78 7d 01 00 00 00 00                           # @200 bidSize Qty8NULL = 25000000 (0.25, not decoded)
+80 d1 f0 08 00 00 00 00                           # @208 askSize Qty8NULL = 150000000 (1.5, not decoded)
+0c                                                # market varString8 length = 12
+42 54 43 2d 55 53 44 2d 50 45 52 50               # market = "BTC-USD-PERP"

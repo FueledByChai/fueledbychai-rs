@@ -210,14 +210,20 @@ pub fn caps() -> VenueCaps {
                 // bits of the 28-digit trade id; the full id (tradeIdStr) is 1:2's.
                 trade_id: false,
             },
-            // markets_summary and funding_data are not decoded yet (FBC-9a4).
+            // The markets_summary.{market} channel, MarketSummaryEvent (template 4): its
+            // fundingRate (fundingRatePrecise from schema version 1). It states neither the
+            // funding interval nor the next funding time. funding_data (FundingDataEvent, the
+            // per-period settlement record) is not decoded.
             funding: FundingCaps {
-                source: FeedSource::None,
+                source: FeedSource::Stream,
                 interval_reported: false,
                 next_time_reported: false,
             },
+            // MarketSummaryEvent carries volume and open interest, and the index price, but this
+            // adapter does not decode them yet.
             stats: FeedSource::None,
-            mark: FeedSource::None,
+            // The markets_summary.{market} channel, MarketSummaryEvent.markPrice.
+            mark: FeedSource::Stream,
             index: FeedSource::None,
             // The schema: "Timestamps: all int64, microseconds since Unix epoch (UTC)".
             ts_precision: Duration::from_micros(1),

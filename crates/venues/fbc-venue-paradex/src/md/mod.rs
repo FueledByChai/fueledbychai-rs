@@ -5,7 +5,9 @@
 //! [`ParadexMd`] subscribes with one JSON-RPC `subscribe` text frame per channel
 //! (`bbo.{market}`, `trades.{market}`, `order_book.{market}.{feed_type}@15@50ms`), and decodes
 //! `BboEvent` (template 2) into [`MdEvent::Touch`], `TradeEvent` (template 1) into
-//! [`MdEvent::Trade`] and `BookEvent` (template 3) into book events ([`book`]). Heartbeats
+//! [`MdEvent::Trade`], `BookEvent` (template 3) into book events ([`book`]) and
+//! `MarketSummaryEvent` (template 4, `markets_summary.{market}`) into [`MdEvent::Mark`] and
+//! [`MdEvent::Funding`] ([`summary`]), each pushed while its feed is subscribed. Heartbeats
 //! (template 40) and templates it does not decode are skipped. A subscribe acknowledgement is
 //! consumed; a subscribe error is returned as the frame's error and never retried.
 //!
@@ -14,6 +16,7 @@
 pub mod book;
 pub mod rest;
 pub mod sbe;
+pub mod summary;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -30,6 +33,7 @@ use serde_json::{Value, json};
 
 use book::{BookFeed, decode_book};
 use sbe::{Block, Message, NULL_I64};
+use summary::{TEMPLATE_SUMMARY, decode_summary};
 
 pub use book::{DELTAS, INTERACTIVE_DELTAS};
 
@@ -51,22 +55,21 @@ const EXP: i8 = -8;
 /// The channel a subscription is to, as Paradex names it; refused for a feed this adapter does
 /// not decode, or an instrument missing from `specs`.
 pub fn channel(sub: Subscription, specs: &SpecTable) -> Result<String, VenueError> {
-    let unsupported = VenueError::UnsupportedFeed(sub);
-    let prefix = match sub.feed {
-        Feed::Touch(BBO) => Some("bbo"),
-        Feed::Trades => Some("trades"),
-        Feed::Book(book) if book::book_channel(book, "").is_some() => None,
-        _ => return Err(unsupported),
+    let spell = |symbol: &str| match sub.feed {
+        Feed::Touch(BBO) => Some(format!("bbo.{symbol}")),
+        Feed::Trades => Some(format!("trades.{symbol}")),
+        // One channel carries both: MarketSummaryEvent has the mark price and the funding rate.
+        Feed::Mark | Feed::Funding => Some(format!("markets_summary.{symbol}")),
+        Feed::Book(book) => book::book_channel(book, symbol),
+        _ => None,
     };
+    let unsupported = VenueError::UnsupportedFeed(sub);
+    // A feed this adapter does not decode is refused before the instrument is looked up.
+    spell("").ok_or(unsupported)?;
     let spec = specs
         .get(sub.inst)
         .ok_or(VenueError::UnknownInstrument(sub.inst))?;
-    let symbol = spec.venue_symbol.as_wire();
-    match (prefix, sub.feed) {
-        (Some(prefix), _) => Ok(format!("{prefix}.{symbol}")),
-        (None, Feed::Book(book)) => book::book_channel(book, symbol).ok_or(unsupported),
-        (None, _) => Err(unsupported),
-    }
+    spell(spec.venue_symbol.as_wire()).ok_or(unsupported)
 }
 
 /// What a JSON-RPC request this codec sent asked for.
@@ -89,6 +92,9 @@ pub struct ParadexMd {
     channel_of: BTreeMap<InstrumentId, BookId>,
     /// The books subscribed now, and their sequences.
     books: BTreeMap<InstrumentId, BookFeed>,
+    /// The mark and funding feeds subscribed now: a market's `markets_summary` channel is
+    /// subscribed while it has either.
+    summary: BTreeSet<Subscription>,
 }
 
 impl ParadexMd {
@@ -100,6 +106,7 @@ impl ParadexMd {
             pending: BTreeMap::new(),
             channel_of: BTreeMap::new(),
             books: BTreeMap::new(),
+            summary: BTreeSet::new(),
         }
     }
 
@@ -170,12 +177,18 @@ impl MdCodec for ParadexMd {
         // Every channel is spelled, and the books checked, before the first push, so a refusal
         // pushes nothing and changes nothing.
         let mut frames = Vec::new();
+        let mut summary = self.summary.clone();
         for (request, subs) in [(Request::Subscribe, add), (Request::Unsubscribe, remove)] {
             for sub in subs {
-                frames.push((request, channel(*sub, specs)?, sub.inst));
+                let channel = channel(*sub, specs)?;
+                if summary_feed(sub.feed) && !summary_changes(&mut summary, request, *sub) {
+                    continue;
+                }
+                frames.push((request, channel, sub.inst));
             }
         }
         let (channel_of, active) = self.books_after(add, remove)?;
+        self.summary = summary;
         self.books.retain(|inst, _| active.contains(inst));
         for inst in active {
             let book = channel_of[&inst];
@@ -221,6 +234,28 @@ impl MdCodec for ParadexMd {
         let (meta, event) = match msg.header().template_id {
             TEMPLATE_BBO => decode_bbo(&msg, specs)?,
             TEMPLATE_TRADE => decode_trade(&msg, specs)?,
+            TEMPLATE_SUMMARY => {
+                let s = decode_summary(&msg, specs)?;
+                let wanted = |feed| self.summary.contains(&Subscription { inst: s.inst, feed });
+                if wanted(Feed::Mark) {
+                    let mark = MdEvent::Mark {
+                        inst: s.inst,
+                        px: s.mark,
+                    };
+                    sink.push(s.meta, mark);
+                }
+                if wanted(Feed::Funding) {
+                    let funding = MdEvent::Funding {
+                        inst: s.inst,
+                        rate_e12: s.rate_e12,
+                        // MarketSummaryEvent states neither.
+                        interval: None,
+                        next: None,
+                    };
+                    sink.push(s.meta, funding);
+                }
+                return Ok(());
+            }
             TEMPLATE_BOOK => {
                 let frame = decode_book(&msg, specs)?;
                 // A market with no book on this connection (unsubscribed, the frame in flight)
@@ -266,6 +301,37 @@ impl MdCodec for ParadexMd {
     /// (docs.paradex.trade, WebSocket "Introduction", ping/pong).
     fn keepalive(&self) -> Option<Keepalive> {
         None
+    }
+}
+
+/// A feed carried by the `markets_summary` channel.
+fn summary_feed(feed: Feed) -> bool {
+    matches!(feed, Feed::Mark | Feed::Funding)
+}
+
+/// Takes `request` for summary feed `sub` into `summary`; true when the market's
+/// `markets_summary` channel needs the request sent: the first of its feeds subscribed, or the
+/// last subscribed one removed.
+fn summary_changes(
+    summary: &mut BTreeSet<Subscription>,
+    request: Request,
+    sub: Subscription,
+) -> bool {
+    let any = |summary: &BTreeSet<Subscription>| {
+        [Feed::Mark, Feed::Funding].into_iter().any(|feed| {
+            summary.contains(&Subscription {
+                inst: sub.inst,
+                feed,
+            })
+        })
+    };
+    match request {
+        Request::Subscribe => {
+            let had = any(summary);
+            summary.insert(sub);
+            !had
+        }
+        Request::Unsubscribe => summary.remove(&sub) && !any(summary),
     }
 }
 
