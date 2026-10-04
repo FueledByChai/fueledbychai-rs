@@ -494,6 +494,7 @@ dependencies = [
 name = "fbc-venue-paradex"
 version = "0.0.1"
 dependencies = [
+ "fbc-book",
  "fbc-core",
  "rust_decimal",
  "serde_json",

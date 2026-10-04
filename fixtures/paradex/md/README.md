@@ -26,9 +26,15 @@ that file describes for versions below 2.
 | `book-longer-entries.sbe.txt` | A DELTA at seq 1003 whose group entries are 24 bytes, 8 past the known price and size (skipped) |
 | `book-delta-1004.sbe.txt` | A DELTA at seq 1004: after 1002, seq 1003 is skipped |
 | `btc-book-delta-2026-09-23.sbe` | Captured, raw bytes: see below |
+| `book15-snapshot-2000.sbe.txt` | A SNAPSHOT at seq 2000: 15 bids (62000.0 down by 0.5) and 15 asks (62000.5 up by 0.5) |
+| `book15-delta-2001.sbe.txt` | A DELTA at seq 2001: one bid changed, one ask removed, one ask added below the 15th |
+| `book15-delta-2002.sbe.txt` | A DELTA at seq 2002: a new best bid, the worst bid removed |
 
 The snapshot and the deltas at 1001, 1002 and 1003 are a continuous sequence; 1004 after 1002
 is a skipped seq_no, and 1001 or 1002 after 1002 a backwards one (`tests/md_book.rs`).
+
+The `book15-` frames are a continuous depth-15 sequence whose book at seq 2002 is the REST
+snapshot `../rest/orderbook-btc-2002.json` (`tests/md_oracles.rs`).
 
 ## The captured frame
 

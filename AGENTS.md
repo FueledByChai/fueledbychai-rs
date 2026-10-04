@@ -185,7 +185,9 @@ rather than guess.
     `fixtures/paradex/signing/paradex-vectors.tsv`; and market data: an SBE reader gated on each
     frame's block lengths, bbo and trades decoded into touches and trades, the order book
     deltas into book events with seq_no continuity (0022), held to the hand-built frames and one
-    captured public frame in `fixtures/paradex/md/`), later `crates/venues/fbc-venue-hibachi`
+    captured public frame in `fixtures/paradex/md/`; the REST `/orderbook` snapshot at depth 15
+    (`src/md/rest.rs`); and, in `tests/oracle/` with `fbc-book` as a dev-dependency only, the
+    BT-401 book and bbo-touch agreement checks), later `crates/venues/fbc-venue-hibachi`
     (0016).
   - Dependency direction (design §3): `fbc-core`, `fbc-book`, `fbc-oms`, `fbc-journal` and
     `fbc-sim` never depend on a venue crate; a venue crate depends on `fbc-core` and protocol
@@ -199,7 +201,8 @@ rather than guess.
   the signing benchmark and the Java hash oracle the Paradex signer is checked against;
   recorded Paradex frames go elsewhere under `fixtures/paradex/`; `fixtures/paradex/md/` holds
   SBE frames hand-built from Paradex's published schema, and one captured public book frame
-  whose provenance its README gives. `fixtures/binance-usdm/` holds hand-written frames (`md/`) and REST
+  whose provenance its README gives; `fixtures/paradex/rest/` a hand-built `/orderbook` response
+  in Paradex's documented shape. `fixtures/binance-usdm/` holds hand-written frames (`md/`) and REST
   responses (`rest/`) in Binance's documented shapes, its README citing the pages.
   `fixtures/licence-gate/` is a standalone two-crate workspace the licence gate's self-test
   runs against (0017).
