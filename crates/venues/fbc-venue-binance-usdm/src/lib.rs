@@ -16,9 +16,9 @@
 //!   `UNSUBSCRIBE` requests with request ids and consumes their replies, decodes `bookTicker`
 //!   into touches and each partial-depth message into a complete snapshot of its book channel.
 //!
-//! The diff-depth channel is declared (its book is FBC-tfb's, anchored on a REST snapshot) but
-//! not yet subscribed: asking for it is refused as an unsupported feed. Trades, funding, mark,
-//! index and statistics are not decoded and are declared [`FeedSource::None`](fbc_core::FeedSource).
+//! The diff-depth book, anchored on a REST snapshot, is not declared or decoded yet (FBC-tfb).
+//! Trades, funding, mark, index and statistics are not decoded and are declared
+//! [`FeedSource::None`](fbc_core::FeedSource).
 
 mod caps;
 mod config;
@@ -43,9 +43,6 @@ pub const TOUCH_BOOK_TICKER: TouchSourceId = TouchSourceId(0);
 /// The partial-depth channel (`depth<levels>@<speed>`), each message a snapshot of the top
 /// levels: [`MdCaps::books`](fbc_core::MdCaps)`[0]`.
 pub const BOOK_PARTIAL: BookId = BookId(0);
-/// The diff-depth channel (`depth@100ms`), anchored on a REST snapshot:
-/// [`MdCaps::books`](fbc_core::MdCaps)`[1]`. Declared, not yet decoded (FBC-tfb).
-pub const BOOK_DIFF: BookId = BookId(1);
 
 /// More subscriptions than `u16::MAX + 1` endpoints of 1024 streams each carry.
 const TOO_MANY_ENDPOINTS: ConfigError = ConfigError::Invalid {

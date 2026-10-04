@@ -17,7 +17,7 @@ use fbc_core::{
     TrafficClass, VenueConfig, VenueError, VenueFactory,
 };
 use fbc_venue_binance_usdm::{
-    BOOK_DIFF, BOOK_PARTIAL, BinanceUsdm, KEY_DEPTH_LEVELS, KEY_DEPTH_SPEED, KEY_WS_BASE_URL,
+    BOOK_PARTIAL, BinanceUsdm, KEY_DEPTH_LEVELS, KEY_DEPTH_SPEED, KEY_WS_BASE_URL,
     TOUCH_BOOK_TICKER, rest_depth_weight,
 };
 use serde_json::Value;
@@ -94,7 +94,7 @@ fn the_factory_declares_its_market_data_with_each_feed_it_does_not_decode_none()
     assert_eq!(touch.seq_domain, SeqDomain::SharedWithBook);
     assert_eq!(touch.ts_kind, ExchTsKind::MatchingEngine);
 
-    assert_eq!((BOOK_PARTIAL, BOOK_DIFF), (BookId(0), BookId(1)));
+    assert_eq!(BOOK_PARTIAL, BookId(0));
     let partial = md.books[usize::from(BOOK_PARTIAL.0)];
     assert_eq!(partial.channel, "depth5@100ms");
     assert_eq!(partial.max_depth, 5);
@@ -102,11 +102,9 @@ fn the_factory_declares_its_market_data_with_each_feed_it_does_not_decode_none()
     assert_eq!(partial.continuity, Continuity::Windowed);
     assert!(partial.windowed && !partial.rest_anchor);
     assert_eq!(partial.queue_model, QueueModelQuality::BracketOnly);
-    let diff = md.books[usize::from(BOOK_DIFF.0)];
-    assert_eq!(diff.channel, "depth@100ms");
-    assert_eq!(diff.continuity, Continuity::PrevId);
-    assert!(diff.rest_anchor && !diff.windowed);
-    assert_eq!(md.books.len(), 2);
+    // Only the channel the codec decodes is declared (Codex r4176771984): the diff-depth book
+    // and its REST anchor are declared with their codec (FBC-tfb).
+    assert_eq!(md.books.len(), 1);
 
     assert_eq!(md.trades.source, FeedSource::None);
     assert_eq!(md.funding.source, FeedSource::None);
@@ -202,6 +200,9 @@ fn a_missing_or_invalid_key_is_refused_by_caps_and_plan_md() {
         (KEY_WS_BASE_URL, "ws://[]:80"),
         (KEY_WS_BASE_URL, "ws://[::1]x"),
         (KEY_WS_BASE_URL, "ws://[g::1]:80"),
+        // Codex r4176771986: bracket contents parse as an IPv6 address.
+        (KEY_WS_BASE_URL, "ws://[:::]"),
+        (KEY_WS_BASE_URL, "ws://[1:2:3:4:5:6:7:8:9]:80"),
         (KEY_DEPTH_LEVELS, "50"),
         (KEY_DEPTH_SPEED, "1s"),
     ] {
@@ -357,8 +358,7 @@ fn plan_md_spreads_more_streams_than_one_connection_carries_over_endpoints() {
 fn feeds_it_does_not_decode_and_unknown_instruments_are_refused_with_nothing_sent() {
     let cfg = config();
     let refused = [
-        Feed::Book(BOOK_DIFF),
-        Feed::Book(BookId(2)),
+        Feed::Book(BookId(1)),
         Feed::Touch(TouchSourceId(1)),
         Feed::Trades,
         Feed::Mark,

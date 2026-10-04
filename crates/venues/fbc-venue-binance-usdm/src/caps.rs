@@ -13,8 +13,10 @@
 //!   real time; `u` is the order book update id, `E` the event time, `T` the transaction time.
 //! - [PARTIAL] `websocket-market-streams/Partial-Book-Depth-Streams`: `<symbol>@depth<levels>`,
 //!   `@depth<levels>@500ms`, `@depth<levels>@100ms`; levels 5, 10 or 20; 250, 500 or 100 ms.
-//! - [DIFF] `websocket-market-streams/Diff-Book-Depth-Streams`: `<symbol>@depth@100ms`; `pu` is
-//!   the final update id of the previous message, and a local book starts from a REST snapshot.
+//!
+//! Only the book channel the codec decodes is declared: the diff-depth channel (`depth@100ms`)
+//! and its REST anchor come with their codec (FBC-tfb).
+//!
 //! - [DEPTH] `market-data/rest-api/Order-Book`: `GET /fapi/v1/depth`, weight 2 for limits 5, 10,
 //!   20 and 50, 5 for 100, 10 for 500, 20 for 1000.
 //! - [INFO] `market-data/rest-api/Exchange-Information`: `rateLimits` holds `REQUEST_WEIGHT`,
@@ -80,34 +82,19 @@ pub(crate) fn caps(settings: &Settings) -> VenueCaps {
                 // The public book; no retail-price-improvement stream is decoded here.
                 includes_channels: TagSet::of(&[Channel::Public]),
             }],
-            books: vec![
-                BookCaps {
-                    channel: depth.name,
-                    max_depth: depth.levels,
-                    // Published every 100, 250 or 500 ms [PARTIAL].
-                    cadence: Cadence::Pulsed(depth.speed),
-                    // Each message is the top `levels` per side: nothing to chain.
-                    continuity: Continuity::Windowed,
-                    windowed: true,
-                    rest_anchor: false,
-                    includes_channels: TagSet::of(&[Channel::Public]),
-                    // Aggregated top-of-book snapshots: brackets only.
-                    queue_model: QueueModelQuality::BracketOnly,
-                },
-                BookCaps {
-                    channel: "depth@100ms",
-                    // As deep as the deepest REST snapshot it is anchored on [DEPTH].
-                    max_depth: 1000,
-                    cadence: Cadence::Pulsed(Duration::from_millis(100)),
-                    // `pu` names the previous message's `u` [DIFF].
-                    continuity: Continuity::PrevId,
-                    windowed: false,
-                    rest_anchor: true,
-                    includes_channels: TagSet::of(&[Channel::Public]),
-                    // 100 ms aggregated diffs: brackets only.
-                    queue_model: QueueModelQuality::BracketOnly,
-                },
-            ],
+            books: vec![BookCaps {
+                channel: depth.name,
+                max_depth: depth.levels,
+                // Published every 100, 250 or 500 ms [PARTIAL].
+                cadence: Cadence::Pulsed(depth.speed),
+                // Each message is the top `levels` per side: nothing to chain.
+                continuity: Continuity::Windowed,
+                windowed: true,
+                rest_anchor: false,
+                includes_channels: TagSet::of(&[Channel::Public]),
+                // Aggregated top-of-book snapshots: brackets only.
+                queue_model: QueueModelQuality::BracketOnly,
+            }],
             // Published by Binance but not decoded by this adapter.
             trades: TradeCaps {
                 source: FeedSource::None,
