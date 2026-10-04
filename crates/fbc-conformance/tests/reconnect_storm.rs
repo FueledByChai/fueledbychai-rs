@@ -16,12 +16,23 @@ use fbc_core::{EndpointPlan, Envelope, MdEvent, MdTransport, VenueConfig, WireUr
 use fbc_runtime::{
     Connector, IngestClock, Input, MdSession, MdSessionConfig, ProxyConfig, ReconnectPacing,
 };
+use tokio::sync::oneshot;
 use toy::ToyVenue;
 
 const CONN: u16 = 3;
 
 fn secs(n: u64) -> Duration {
     Duration::from_secs(n)
+}
+
+/// Resolves once `limit` of wall-clock time has passed.
+fn watchdog(limit: Duration) -> oneshot::Receiver<()> {
+    let (tx, rx) = oneshot::channel();
+    std::thread::spawn(move || {
+        std::thread::sleep(limit);
+        let _ = tx.send(());
+    });
+    rx
 }
 
 #[tokio::test(start_paused = true)]
@@ -67,7 +78,16 @@ async fn a_session_rides_out_the_340_reconnect_storm_subscribed_once_per_epoch_a
         drop(control);
         live
     };
-    let (run, live) = tokio::join!(session.run(), storm);
+    // A regression that loses an event or a reconnect fails here instead of hanging (Codex
+    // r4177514254). The bound is wall-clock, from another thread: a tokio timer would let the
+    // paused clock jump ahead during socket I/O.
+    let bounded = async {
+        tokio::select! {
+            live = storm => live,
+            _ = watchdog(Duration::from_secs(60)) => panic!("the storm did not end within 60 s"),
+        }
+    };
+    let (run, live) = tokio::join!(session.run(), bounded);
     run.unwrap();
     assert_eq!(live, 1);
 
