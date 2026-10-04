@@ -19,6 +19,11 @@ use fbc_journal::{
     Marker, Opaque, Opcode, Record, WriteRes,
 };
 
+/// The key the journal hashes redaction spans under in these tests.
+fn key() -> std::sync::Arc<fbc_journal::RedactionKey> {
+    std::sync::Arc::new(fbc_journal::RedactionKey::new(&[9; 32]).unwrap())
+}
+
 const SEC: i64 = 1_000_000_000;
 /// 2026-10-03T23:59:59Z and 2026-10-04T00:00:01Z.
 const BEFORE_MIDNIGHT: WallNs = WallNs(1_791_071_999 * SEC);
@@ -354,7 +359,7 @@ fn every_kind_round_trips_across_two_days_in_order_with_no_secret_written() {
     let root = fresh_dir("round_trip");
     let s = session();
 
-    let mut writer = JournalWriter::create(&root, 2).unwrap();
+    let mut writer = JournalWriter::create(&root, 2, key()).unwrap();
     for (now, record) in &s.records {
         writer.append(*now, record).unwrap();
     }

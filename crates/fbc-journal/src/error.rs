@@ -15,7 +15,8 @@ pub enum JournalError {
     /// A record the format cannot hold as it is (`what` says why), such as a text frame that
     /// is not UTF-8.
     Unencodable(&'static str),
-    /// A [`SinkConfig`](crate::SinkConfig) the journal queue cannot use (`what` says why).
+    /// A [`SinkConfig`](crate::SinkConfig) the journal queue cannot use, or a
+    /// [`RedactionKey`](crate::RedactionKey) too short to hash under (`what` says why).
     Config(&'static str),
     /// A segment does not start with the journal's magic bytes.
     BadMagic { segment: PathBuf },
@@ -45,7 +46,7 @@ impl fmt::Display for JournalError {
                 write!(f, "a journal record cannot be written: {what}")
             }
             JournalError::Config(what) => {
-                write!(f, "a journal sink cannot use its configuration: {what}")
+                write!(f, "the journal cannot use its configuration: {what}")
             }
             JournalError::BadMagic { segment } => {
                 write!(f, "{} is not a journal segment", segment.display())

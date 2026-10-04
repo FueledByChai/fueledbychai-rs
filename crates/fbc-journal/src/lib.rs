@@ -23,12 +23,15 @@
 //! hand-written little-endian encoding ([`format`]). There is no serialization dependency:
 //! adding one would need a decision record and the licence gate (FBC-cu0).
 //!
-//! **Redaction (0006, 0009).** No byte of a redaction span is written: the spans of a
+//! **Redaction (0006, 0009, 0024).** No byte of a redaction span is written: the spans of a
 //! [`WireSlice`](fbc_core::WireSlice) or [`WireUrl`](fbc_core::WireUrl), header values a codec
 //! marked redacted, and the values of the [`SECRET_HEADERS`] by name, in requests and results
-//! alike. The record keeps each span's place and length, and the reader returns [`BLANK`]
-//! bytes there ([`Record::blanked`] gives what the reader will return). Keyed hashes in their
-//! place are FBC-apz's, under `src/redact*`. Order signatures are not redacted.
+//! alike. Each is written as its HMAC-SHA-256 under the consumer's [`RedactionKey`], so equal
+//! secrets hash equally and replay compares bytes modulo spans ([`redact`]). The record keeps
+//! each span's place and length, and the reader returns [`BLANK`] bytes there
+//! ([`Record::blanked`] gives what the reader will return) with the hashes beside it
+//! ([`JournalReader::entries`], [`Record::digests`]). Order signatures are not redacted: bytes
+//! outside spans are written verbatim.
 //!
 //! **What is still written verbatim.** Inbound frames, HTTP response bodies, and response
 //! header names and values other than the [`SECRET_HEADERS`] carry no redaction metadata in
@@ -42,15 +45,17 @@ mod error;
 pub mod format;
 mod reader;
 mod record;
+pub mod redact;
 mod sink;
 mod writer;
 
 pub use error::JournalError;
-pub use reader::JournalReader;
+pub use reader::{Entries, Entry, JournalReader};
 pub use record::{
     BLANK, ControlEvent, HeaderRec, HttpRequestRec, HttpResponseRec, Marker, Opaque, Opcode,
     Record, SECRET_HEADERS, WriteRes, is_secret_header,
 };
+pub use redact::{RedactionKey, SpanDigest};
 pub use sink::{
     JournalDrain, JournalSink, QueueSink, Recorded, SinkConfig, WriterThread, journal_queue,
 };

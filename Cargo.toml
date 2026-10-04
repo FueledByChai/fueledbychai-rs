@@ -46,6 +46,11 @@ rustls = { version = "=0.23.43", default-features = false, features = ["ring", "
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = { version = "=1.0.9", default-features = false }
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring"] }
+# The journal's keyed hashes (FBC-apz, decision 0024): HMAC-SHA-256, pinned exactly so a
+# silent change cannot change what a recorded span hashes to. Both are already in the lockfile
+# through the Paradex signer's tree.
+hmac = { version = "=0.12.1", default-features = false }
+sha2 = { version = "=0.10.9", default-features = false }
 
 # Stark-curve arithmetic is unusably slow unoptimized; the signer's tests sign thousands of
 # vectors. Optimizing these dependencies in test builds changes no result, only the time.

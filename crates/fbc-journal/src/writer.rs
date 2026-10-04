@@ -4,12 +4,14 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use fbc_core::WallNs;
 
 use crate::JournalError;
 use crate::format::{self, MAGIC, VERSION};
 use crate::record::Record;
+use crate::redact::RedactionKey;
 
 /// The extension of a segment file.
 pub const SEGMENT_EXT: &str = "fbcj";
@@ -113,6 +115,8 @@ struct Segment {
 pub struct JournalWriter {
     root: PathBuf,
     shard: u16,
+    /// The key redaction spans are hashed under.
+    key: Arc<RedactionKey>,
     open: Option<Segment>,
     /// The latest day this shard has written to; no record is filed under an earlier one.
     latest: Option<i64>,
@@ -120,15 +124,20 @@ pub struct JournalWriter {
 }
 
 impl JournalWriter {
-    /// A writer for `shard` under `root`, which it creates if missing. No segment is opened
-    /// until the first record.
-    pub fn create(root: impl AsRef<Path>, shard: u16) -> Result<JournalWriter, JournalError> {
+    /// A writer for `shard` under `root`, which it creates if missing, hashing redaction spans
+    /// under `key`. No segment is opened until the first record.
+    pub fn create(
+        root: impl AsRef<Path>,
+        shard: u16,
+        key: Arc<RedactionKey>,
+    ) -> Result<JournalWriter, JournalError> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
         let latest = list_segments(&root, shard)?.pop().map(|(day, ..)| day);
         Ok(JournalWriter {
             root,
             shard,
+            key,
             open: None,
             latest,
             body: Vec::new(),
@@ -136,11 +145,13 @@ impl JournalWriter {
     }
 
     /// Writes `record`, filed under the UTC day of `now`. No byte of a redaction span and no
-    /// secret header value is written (see [`Record::blanked`]).
+    /// secret header value is written: each is written as its keyed hash
+    /// ([`Record::digests`]) and reads back blanked ([`Record::blanked`]).
     pub fn append(&mut self, now: WallNs, record: &Record) -> Result<(), JournalError> {
         let mut body = std::mem::take(&mut self.body);
         body.clear();
-        let written = format::encode(record, &mut body).and_then(|()| self.append_body(now, &body));
+        let written = format::encode(record, &self.key, &mut body)
+            .and_then(|()| self.append_body(now, &body));
         self.body = body;
         written
     }

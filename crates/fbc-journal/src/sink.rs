@@ -6,8 +6,8 @@
 //! Its producer end is a [`QueueSink`]; its consumer end, a [`JournalDrain`], is
 //! [spawned](JournalDrain::spawn) onto a thread of its own as a [`WriterThread`].
 //!
-//! **Admission.** A record is encoded on the caller's thread (so no redacted byte enters the
-//! queue) and admitted by its class: a Normal record while the queue stays at or under the
+//! **Admission.** A record is encoded on the caller's thread, its redaction spans hashed under
+//! the [`RedactionKey`] (so no redacted byte enters the queue), and admitted by its class: a Normal record while the queue stays at or under the
 //! soft limit, a Safety record (cancels, reducing orders, acks, fills) while it stays within
 //! the whole budget, the part above the soft limit being the Safety reserve. A record that
 //! does not fit is dropped and counted by class, and [`record`](JournalSink::record) says so:
@@ -38,6 +38,7 @@ use std::thread::{self, JoinHandle, Thread};
 use fbc_core::{TrafficClass, WallNs};
 
 use crate::record::{Marker, Record};
+use crate::redact::RedactionKey;
 use crate::{JournalError, JournalWriter, format};
 
 /// The queue's unit: one `AtomicU64`.
@@ -77,16 +78,22 @@ pub trait JournalSink {
     fn record(&mut self, class: TrafficClass, now: WallNs, record: &Record) -> Recorded;
 }
 
-/// Makes the journal queue: the sink the shard records into and the drain a writer thread
-/// empties it with.
-pub fn journal_queue(config: SinkConfig) -> Result<(QueueSink, JournalDrain), JournalError> {
+/// Makes the journal queue: the sink the shard records into, which hashes redaction spans
+/// under `key`, and the drain a writer thread empties it with.
+pub fn journal_queue(
+    config: SinkConfig,
+    key: Arc<RedactionKey>,
+) -> Result<(QueueSink, JournalDrain), JournalError> {
     let cap = config.budget_bytes / WORD;
     let soft = (cap as u128 * u128::from(config.soft_limit_pct) / 100) as usize;
-    let marker = entry_words_of(&Record::Marker(Marker::Degraded {
-        from_seq: 0,
-        dropped: 0,
-    }));
-    let smallest = entry_words_of(&Record::Marker(Marker::Recovered));
+    let marker = entry_words_of(
+        &Record::Marker(Marker::Degraded {
+            from_seq: 0,
+            dropped: 0,
+        }),
+        &key,
+    );
+    let smallest = entry_words_of(&Record::Marker(Marker::Recovered), &key);
     // A gap closes only when a marker and a record fit under the soft limit together.
     if soft < marker + smallest {
         return Err(JournalError::Config(
@@ -115,6 +122,7 @@ pub fn journal_queue(config: SinkConfig) -> Result<(QueueSink, JournalDrain), Jo
     });
     let sink = QueueSink {
         ring: Arc::clone(&ring),
+        key,
         soft,
         next_seq: 0,
         dropped: [0; 2],
@@ -158,9 +166,9 @@ fn entry_words(len: usize) -> usize {
 }
 
 /// The words a small fixed record's entry takes.
-fn entry_words_of(record: &Record) -> usize {
+fn entry_words_of(record: &Record, key: &RedactionKey) -> usize {
     let mut body = Vec::new();
-    format::encode(record, &mut body).expect("a marker always encodes");
+    format::encode(record, key, &mut body).expect("a marker always encodes");
     entry_words(body.len())
 }
 
@@ -239,6 +247,8 @@ const NO_GAP: u64 = u64::MAX;
 /// Dropping it lets the writer finish what is queued and stop.
 pub struct QueueSink {
     ring: Arc<Ring>,
+    /// The key redaction spans are hashed under.
+    key: Arc<RedactionKey>,
     /// The soft limit, in words.
     soft: usize,
     next_seq: u64,
@@ -316,7 +326,8 @@ impl QueueSink {
                 from_seq: gap.from_seq,
                 dropped: gap.dropped,
             });
-            format::encode(&degraded, &mut self.marker).expect("a marker always encodes");
+            format::encode(&degraded, &self.key, &mut self.marker)
+                .expect("a marker always encodes");
             entry_words(self.marker.len())
         });
         let used = self.ring.used();
@@ -329,7 +340,7 @@ impl QueueSink {
         }
         .saturating_sub(used);
         let limit = room.saturating_sub(HEADER_WORDS) * WORD;
-        let need = format::encode_within(record, &mut self.body, limit)
+        let need = format::encode_within(record, &self.key, &mut self.body, limit)
             .map_or(usize::MAX, |()| entry_words(self.body.len()));
         if fits(used, marker.saturating_add(need), self.soft) {
             if self.gap.take().is_some() {
@@ -437,13 +448,20 @@ mod tests {
     use crate::{Opaque, Opcode};
     use fbc_core::{ConnKey, MonoNs, Stamp};
 
+    fn key() -> Arc<RedactionKey> {
+        Arc::new(RedactionKey::new(&[5; 32]).unwrap())
+    }
+
     #[test]
     fn a_record_too_large_for_the_room_left_is_not_copied() {
         // Codex r4176799800: dropping a large frame must not copy it on the shard thread.
-        let (mut sink, _drain) = journal_queue(SinkConfig {
-            budget_bytes: 256,
-            soft_limit_pct: 50,
-        })
+        let (mut sink, _drain) = journal_queue(
+            SinkConfig {
+                budget_bytes: 256,
+                soft_limit_pct: 50,
+            },
+            key(),
+        )
         .unwrap();
         let inbound = |len: usize| Record::Inbound {
             stamp: Stamp {
@@ -469,7 +487,7 @@ mod tests {
         // fits alone but not after the 5-word marker, and is dropped without being copied.
         let mid = inbound(59);
         let mut body = Vec::new();
-        format::encode(&mid, &mut body).unwrap();
+        format::encode(&mid, &key(), &mut body).unwrap();
         assert_eq!(entry_words(body.len()), 14);
         assert_eq!(
             sink.record(TrafficClass::Normal, WallNs(0), &mid),
@@ -487,17 +505,20 @@ mod tests {
         // Unit tests get no CARGO_TARGET_TMPDIR: a directory of this process's own.
         let root =
             std::env::temp_dir().join(format!("fbc-journal-sink-in-flight-{}", std::process::id()));
-        let (sink, drain) = journal_queue(SinkConfig {
-            budget_bytes: 256,
-            soft_limit_pct: 50,
-        })
+        let (sink, drain) = journal_queue(
+            SinkConfig {
+                budget_bytes: 256,
+                soft_limit_pct: 50,
+            },
+            key(),
+        )
         .unwrap();
         let ring = Arc::clone(&sink.ring);
         // The sink is mid-push as the writer sees it close.
         ring.busy.store(true, SeqCst);
         ring.closed.store(true, SeqCst);
         let writer = drain
-            .spawn(JournalWriter::create(&root, 1).unwrap())
+            .spawn(JournalWriter::create(&root, 1, key()).unwrap())
             .unwrap();
         while ring.writer.get().is_none() {
             thread::yield_now();
@@ -507,7 +528,7 @@ mod tests {
         }
         // The push lands, then the sink is done; the writer writes it and stops.
         let mut body = Vec::new();
-        format::encode(&Record::Marker(Marker::Recovered), &mut body).unwrap();
+        format::encode(&Record::Marker(Marker::Recovered), &key(), &mut body).unwrap();
         ring.push(WallNs(0), &body);
         ring.busy.store(false, SeqCst);
         writer.close().unwrap();

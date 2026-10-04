@@ -1,6 +1,6 @@
 [package]
 name = "fbc-journal"
-description = "The journal of everything that crosses the shard boundary: its record format, a day-grouped segment writer, an in-order reader and a sink that never blocks."
+description = "The journal of everything that crosses the shard boundary: its record format, a day-grouped segment writer, an in-order reader, a sink that never blocks, and keyed hashes in place of redacted spans."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,3 +10,5 @@ publish = false
 
 [dependencies]
 fbc-core = { path = "../fbc-core" }
+hmac = { workspace = true }
+sha2 = { workspace = true }

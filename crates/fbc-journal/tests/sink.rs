@@ -17,6 +17,11 @@ use fbc_journal::{
     Record, Recorded, SinkConfig, journal_queue,
 };
 
+/// The key the journal hashes redaction spans under in these tests.
+fn key() -> std::sync::Arc<fbc_journal::RedactionKey> {
+    std::sync::Arc::new(fbc_journal::RedactionKey::new(&[9; 32]).unwrap())
+}
+
 const SEC: i64 = 1_000_000_000;
 /// 2026-10-03T12:00:00Z.
 const NOW: WallNs = WallNs(1_791_028_800 * SEC);
@@ -71,7 +76,7 @@ fn a_stalled_writer_drops_normal_then_safety_records_counted_and_marks_the_gap()
         budget_bytes: 4096,
         soft_limit_pct: 75,
     };
-    let (mut sink, drain) = journal_queue(config).unwrap();
+    let (mut sink, drain) = journal_queue(config, key()).unwrap();
 
     // The writer is stalled: nothing drains the queue. The sink runs on its own thread so that
     // a `record` that blocked fails the test (no report within PATIENCE) instead of hanging it.
@@ -141,7 +146,7 @@ fn a_stalled_writer_drops_normal_then_safety_records_counted_and_marks_the_gap()
 
     // The writer resumes and drains; the next record finds space under the soft limit.
     let writer = drain
-        .spawn(JournalWriter::create(&root, 1).unwrap())
+        .spawn(JournalWriter::create(&root, 1, key()).unwrap())
         .unwrap();
     until_drained(&sink);
     assert_eq!(
@@ -166,13 +171,16 @@ fn a_stalled_writer_drops_normal_then_safety_records_counted_and_marks_the_gap()
 #[test]
 fn a_running_writer_keeps_up_and_wakes_for_each_record() {
     let root = fresh_dir("sink_running");
-    let (mut sink, drain) = journal_queue(SinkConfig {
-        budget_bytes: 512,
-        soft_limit_pct: 85,
-    })
+    let (mut sink, drain) = journal_queue(
+        SinkConfig {
+            budget_bytes: 512,
+            soft_limit_pct: 85,
+        },
+        key(),
+    )
     .unwrap();
     let writer = drain
-        .spawn(JournalWriter::create(&root, 2).unwrap())
+        .spawn(JournalWriter::create(&root, 2, key()).unwrap())
         .unwrap();
     // Many times the queue's size, one record at a time, the writer idle in between: the ring
     // wraps over and over and the writer is woken each time.
@@ -202,13 +210,16 @@ fn a_writer_draining_while_the_sink_floods_loses_nothing_it_admitted() {
     // The two ends run at once and the ring wraps thousands of times: every admitted record is
     // read back once and in order, and the markers account for every drop.
     let root = fresh_dir("sink_flood");
-    let (mut sink, drain) = journal_queue(SinkConfig {
-        budget_bytes: 1024,
-        soft_limit_pct: 85,
-    })
+    let (mut sink, drain) = journal_queue(
+        SinkConfig {
+            budget_bytes: 1024,
+            soft_limit_pct: 85,
+        },
+        key(),
+    )
     .unwrap();
     let writer = drain
-        .spawn(JournalWriter::create(&root, 3).unwrap())
+        .spawn(JournalWriter::create(&root, 3, key()).unwrap())
         .unwrap();
     let mut admitted = Vec::new();
     let mut dropped = Vec::new();
@@ -264,13 +275,16 @@ fn close_ends_with_a_busy_sink_and_refuses_what_comes_after() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     let root = fresh_dir("sink_close_busy");
-    let (mut sink, drain) = journal_queue(SinkConfig {
-        budget_bytes: 1024,
-        soft_limit_pct: 85,
-    })
+    let (mut sink, drain) = journal_queue(
+        SinkConfig {
+            budget_bytes: 1024,
+            soft_limit_pct: 85,
+        },
+        key(),
+    )
     .unwrap();
     let writer = drain
-        .spawn(JournalWriter::create(&root, 4).unwrap())
+        .spawn(JournalWriter::create(&root, 4, key()).unwrap())
         .unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let accepted = Arc::new(AtomicU64::new(0));
@@ -327,10 +341,13 @@ fn a_gap_still_open_at_shutdown_is_marked_last() {
     // journal must still say so. Once by closing the writer, once by dropping the sink.
     for (name, by_close) in [("sink_gap_close", true), ("sink_gap_drop", false)] {
         let root = fresh_dir(name);
-        let (mut sink, drain) = journal_queue(SinkConfig {
-            budget_bytes: 512,
-            soft_limit_pct: 50,
-        })
+        let (mut sink, drain) = journal_queue(
+            SinkConfig {
+                budget_bytes: 512,
+                soft_limit_pct: 50,
+            },
+            key(),
+        )
         .unwrap();
         let mut kept = Vec::new();
         let mut seq = 0;
@@ -346,7 +363,7 @@ fn a_gap_still_open_at_shutdown_is_marked_last() {
             Recorded::DroppedCounted
         );
         let writer = drain
-            .spawn(JournalWriter::create(&root, 1).unwrap())
+            .spawn(JournalWriter::create(&root, 1, key()).unwrap())
             .unwrap();
         if by_close {
             writer.close().unwrap();
@@ -371,10 +388,13 @@ fn a_gap_still_open_at_shutdown_is_marked_last() {
 #[test]
 fn a_record_the_queue_or_the_format_cannot_hold_is_dropped_and_counted() {
     let root = fresh_dir("sink_unholdable");
-    let (mut sink, drain) = journal_queue(SinkConfig {
-        budget_bytes: 256,
-        soft_limit_pct: 50,
-    })
+    let (mut sink, drain) = journal_queue(
+        SinkConfig {
+            budget_bytes: 256,
+            soft_limit_pct: 50,
+        },
+        key(),
+    )
     .unwrap();
     let big = Record::Inbound {
         stamp: match timer(0) {
@@ -408,7 +428,7 @@ fn a_record_the_queue_or_the_format_cannot_hold_is_dropped_and_counted() {
         Recorded::Ok
     );
     let writer = drain
-        .spawn(JournalWriter::create(&root, 1).unwrap())
+        .spawn(JournalWriter::create(&root, 1, key()).unwrap())
         .unwrap();
     writer.close().unwrap();
     assert_eq!(
@@ -429,13 +449,16 @@ fn a_writer_that_cannot_write_reports_it_and_the_sink_keeps_counting() {
     fs::create_dir_all(&root).unwrap();
     // A file where the day's directory should be.
     fs::write(root.join("20261003"), b"x").unwrap();
-    let (mut sink, drain) = journal_queue(SinkConfig {
-        budget_bytes: 256,
-        soft_limit_pct: 50,
-    })
+    let (mut sink, drain) = journal_queue(
+        SinkConfig {
+            budget_bytes: 256,
+            soft_limit_pct: 50,
+        },
+        key(),
+    )
     .unwrap();
     let writer = drain
-        .spawn(JournalWriter::create(&root, 1).unwrap())
+        .spawn(JournalWriter::create(&root, 1, key()).unwrap())
         .unwrap();
     assert_eq!(
         sink.record(TrafficClass::Normal, NOW, &timer(0)),
@@ -467,10 +490,13 @@ fn a_configuration_the_queue_cannot_use_is_refused() {
         // A reserve of one word holds no record.
         (800, 99, RESERVE),
     ] {
-        let err = journal_queue(SinkConfig {
-            budget_bytes,
-            soft_limit_pct,
-        })
+        let err = journal_queue(
+            SinkConfig {
+                budget_bytes,
+                soft_limit_pct,
+            },
+            key(),
+        )
         .err()
         .unwrap();
         assert!(
@@ -479,7 +505,7 @@ fn a_configuration_the_queue_cannot_use_is_refused() {
         );
         assert_eq!(
             err.to_string(),
-            format!("a journal sink cannot use its configuration: {why}")
+            format!("the journal cannot use its configuration: {why}")
         );
         assert!(err.source().is_none());
     }
@@ -489,10 +515,13 @@ fn a_configuration_the_queue_cannot_use_is_refused() {
 fn the_smallest_configuration_accepted_can_close_a_gap() {
     // Eight words of soft limit: a Degraded marker (five) and the smallest record (three).
     let root = fresh_dir("sink_smallest");
-    let (mut sink, drain) = journal_queue(SinkConfig {
-        budget_bytes: 88,
-        soft_limit_pct: 73,
-    })
+    let (mut sink, drain) = journal_queue(
+        SinkConfig {
+            budget_bytes: 88,
+            soft_limit_pct: 73,
+        },
+        key(),
+    )
     .unwrap();
     let stamp = match timer(0) {
         Record::Timer { stamp, .. } => stamp,
@@ -510,7 +539,7 @@ fn the_smallest_configuration_accepted_can_close_a_gap() {
     let small = Record::Marker(Marker::Recovered);
     assert_eq!(sink.record(TrafficClass::Normal, NOW, &small), Recorded::Ok);
     let writer = drain
-        .spawn(JournalWriter::create(&root, 1).unwrap())
+        .spawn(JournalWriter::create(&root, 1, key()).unwrap())
         .unwrap();
     writer.close().unwrap();
     assert_eq!(
