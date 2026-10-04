@@ -17,7 +17,8 @@ use common::toy::{self, ToyVenue};
 use common::{ScriptedHttp, ScriptedWs};
 use fbc_core::{
     BookId, ConnKey, EndpointPlan, Envelope, FeedHealth, HttpFailure, HttpTag, MdEvent,
-    MdTransport, MonoNs, Stamp, Subscription, TimerTag, VenueConfig, WallNs, WireSlice, WireUrl,
+    MdTransport, MonoNs, Stamp, Subscription, TimerTag, TrafficClass, VenueConfig, WallNs,
+    WireSlice, WireUrl,
 };
 use fbc_journal::{
     ControlEvent, HeaderRec, HttpResponseRec, JournalError, JournalReader, JournalWriter, Marker,
@@ -493,4 +494,83 @@ fn a_replay_refuses_a_configuration_the_venue_refuses() {
     assert!(matches!(err, ReplayError::Config(_)));
     assert!(err.to_string().starts_with("venue configuration refused: "));
     assert!(std::error::Error::source(&err).is_some());
+}
+
+/// A sink that keeps every record it is offered, in memory.
+#[derive(Default)]
+struct Kept(Vec<Record>);
+
+impl fbc_journal::JournalSink for Kept {
+    fn record(&mut self, _: TrafficClass, _: WallNs, record: &Record) -> fbc_journal::Recorded {
+        self.0.push(record.clone());
+        fbc_journal::Recorded::Ok
+    }
+    fn omit(&mut self, _: TrafficClass, _: WallNs) -> fbc_journal::Recorded {
+        fbc_journal::Recorded::DroppedCounted
+    }
+}
+
+/// Codex r4179805832: an HTTP result, a frame or a timer the session takes as its control
+/// drops is journaled but reaches no codec, so replay must not feed it either: it is journaled
+/// after the epoch's close. The session's select takes any ready branch at random, so the race
+/// is run many times; in every run the replay equals the live session, and some runs take an
+/// input with the drop.
+#[tokio::test]
+async fn an_input_taken_as_the_control_drops_is_replayed_into_no_codec() {
+    const RUNS: usize = 48;
+    let (mut ws, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
+    let mut raced = 0;
+    for _ in 0..RUNS {
+        let (venue, seen) = (ToyVenue::leak(), Seen::default());
+        let (mut session, control) =
+            MdSession::new(session(venue, &ws.url()), keep(&seen)).unwrap();
+        let kept = Rc::new(RefCell::new(Kept::default()));
+        session.set_journal(Journal::new(kept.clone()));
+        let mut run = Box::pin(session.run());
+        let watch = seen.clone();
+        let script = async {
+            let mut peer = ws.accept().await;
+            assert_eq!(peer.recv().await, "hello|codec=0|plan=1");
+            assert_eq!(peer.recv().await, "sub|add=A");
+            peer.send("trade|sym=A|px=1|qty=1|seq=1");
+            until(|| watch.borrow().len() == 1).await;
+            peer.send("arm|sym=A|ms=10");
+            peer.send(&format!("get|tag=4|ms=5000|url={}", http.url("/ready")));
+            (peer, http.request().await)
+        };
+        let (peer, exchange) = tokio::select! {
+            _ = &mut run => panic!("the session stopped"),
+            got = script => got,
+        };
+        // The answer, a frame and the timer are all in before the session runs again, and the
+        // control drops with them.
+        tokio::spawn(exchange.answer("HTTP/1.1 200 OK", "trade|sym=A|px=2|qty=1|seq=2"));
+        peer.send("trade|sym=A|px=3|qty=1|seq=3");
+        tokio::time::sleep(ms(30)).await;
+        drop(control);
+        run.await.unwrap();
+        drop(peer);
+        let live = seen.take();
+        let records = kept.borrow().0.clone();
+        // What was taken with the drop is journaled after the epoch's close.
+        let close = records.iter().position(|r| {
+            matches!(
+                r,
+                Record::Control {
+                    ev: ControlEvent::Closed(_),
+                    ..
+                }
+            )
+        });
+        let after = records[close.unwrap() + 1..].iter().any(|r| {
+            matches!(
+                r,
+                Record::Inbound { .. } | Record::Timer { .. } | Record::HttpResult { .. }
+            )
+        });
+        raced += usize::from(after);
+        let (replayed, _, _) = replay_records(records);
+        assert_eq!(replayed, live);
+    }
+    assert!(raced > 0, "no run took an input as the control dropped");
 }

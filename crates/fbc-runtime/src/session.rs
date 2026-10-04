@@ -45,7 +45,9 @@
 //! waits on the journal: a record the sink has no room for is dropped and counted there, and
 //! the frame is written all the same. A write that failed, or that the control's drop
 //! interrupted, has no write result: whether any of it reached the venue is unknown, and the
-//! connection's `Closed` follows. Pings, pongs and close frames carry no data and are not
+//! connection's `Closed` follows. A frame, timer firing or HTTP result the session takes as the
+//! control drops reaches no codec, and is journaled after the epoch's `Closed`, so a replay
+//! ([`crate::MdReplay`]) feeds it to none either. Pings, pongs and close frames carry no data and are not
 //! journaled. Until FBC-7lm, nothing a codec receives carries redaction spans, so inbound
 //! frames and responses would be journaled verbatim: a session that carries a credential (its
 //! endpoint URL has a redaction span, or it has sent a frame or HTTP request with one, or with a
@@ -310,6 +312,9 @@ struct Answered {
 /// How a connected epoch ended.
 enum End {
     Stop,
+    /// The session stopped and the epoch's `Closed` is already journaled, ahead of the inputs
+    /// taken with the stop.
+    StopClosed,
     Dropped,
 }
 
@@ -326,7 +331,7 @@ enum Idle {
 enum Wake {
     Frame(Option<Result<Message, tokio_tungstenite::tungstenite::Error>>),
     Timer,
-    Http((Stamp, Answered)),
+    Http(Answered),
     Desired(bool),
 }
 
@@ -561,6 +566,9 @@ impl<H: MdHandler> MdSession<H> {
         } else {
             self.epoch(ws, key).await
         };
+        if let Ok(End::StopClosed) = end {
+            return Ok(End::Stop);
+        }
         self.control(|| ControlEvent::Closed(key));
         end
     }
@@ -592,26 +600,33 @@ impl<H: MdHandler> MdSession<H> {
                 _ = sleep_or_never(self.next_deadline()) => Wake::Timer,
                 // A subscribe call waiting for the buckets tries again as if the set changed.
                 _ = sleep_or_never(self.rate_retry) => Wake::Desired(true),
-                Some(done) = self.http.next() => Wake::Http(self.stamp_http(done)),
+                Some(done) = self.http.next() => Wake::Http(done),
                 r = self.desired.changed() => Wake::Desired(r.is_ok()),
             };
             // The control first: what woke with its drop reaches no codec (Codex r4177887269).
-            // A frame read or a timer taken with it is still stamped and journaled (Codex
-            // r4178646794, r4179379935).
-            let wake = if self.stop.has_changed().is_err() {
-                match &wake {
+            // The epoch is journaled closed first, and a frame read, a timer taken or an HTTP
+            // result that came back with the drop is then stamped and journaled after it (Codex
+            // r4178646794, r4179379935), so replay, which feeds a closed epoch nothing, feeds
+            // it to no codec either (Codex r4179805832).
+            if self.stop.has_changed().is_err() || matches!(wake, Wake::Desired(false)) {
+                self.control(|| ControlEvent::Closed(key));
+                match wake {
                     Wake::Frame(Some(Ok(message))) => {
-                        self.take_in(key, message);
+                        self.take_in(key, &message);
                     }
                     Wake::Timer => {
                         let _ = self.take_timer()?;
                     }
+                    Wake::Http(done) => {
+                        self.stamp_http(done);
+                    }
                     _ => {}
                 }
-                Wake::Desired(false)
-            } else {
-                wake
-            };
+                if let Some(ws) = ws.as_mut() {
+                    close(ws, &self.rates, key);
+                }
+                return Ok(End::StopClosed);
+            }
             open = match wake {
                 Wake::Frame(Some(Ok(message))) => {
                     let mut fx = Effects::new();
@@ -620,7 +635,7 @@ impl<H: MdHandler> MdSession<H> {
                 }
                 Wake::Frame(_) => false,
                 Wake::Timer => self.fire(&mut ws, codec.as_mut()).await?,
-                Wake::Http(done) => match self.admit_http(done)? {
+                Wake::Http(done) => match self.admit_http(self.stamp_http(done))? {
                     Some((stamp, done)) => {
                         let mut fx = Effects::new();
                         self.answer(codec.as_mut(), stamp, done, &mut fx);
@@ -628,16 +643,11 @@ impl<H: MdHandler> MdSession<H> {
                     }
                     None => true,
                 },
-                Wake::Desired(true) => {
+                // A dropped control stopped the epoch above.
+                Wake::Desired(_) => {
                     let subs = self.desired.borrow_and_update().clone();
                     let call = self.rec.set_desired(subs);
                     self.subscribe(&mut ws, codec.as_mut(), call).await?
-                }
-                Wake::Desired(false) => {
-                    if let Some(ws) = ws.as_mut() {
-                        close(ws, &self.rates, key);
-                    }
-                    return Ok(End::Stop);
                 }
             };
         }
