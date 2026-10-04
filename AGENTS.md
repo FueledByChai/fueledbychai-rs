@@ -152,6 +152,9 @@ rather than guess.
     `MdHandler` inline, the codec's effects executed, reconnects paced by `ReconnectPacing` (backoff, attempt budget, attempt deadline);
     a codec's HTTP requests run with their timeouts and answer only the epoch that asked, and a
     poll endpoint opens no connection (0027); `MdVenue` applies `plan_md`'s endpoints by stream;
+    `MdBooks` (fed by the `BookKeeper` handler) keeps one `fbc-book` book per (instrument,
+    `BookId`), routing each book event by its channel, and exposes each instrument's trading
+    book as the consumer's `TradingBooks` configures it (FBC-nij);
     `tests/common/toy.rs` is the toy market-data venue later runtime tests reuse.
   - `crates/fbc-book` (it depends on `fbc-core` only: one tick-indexed L2 book per
     instrument and `BookId`, built from book events the same live and in replay, with

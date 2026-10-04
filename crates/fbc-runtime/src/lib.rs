@@ -42,10 +42,16 @@
 //! [`VenueFactory::plan_md`](fbc_core::VenueFactory::plan_md) spreads the desired subscriptions
 //! over them, opening, keeping and closing endpoints as the plan changes.
 //!
+//! [`MdBooks`] keeps one book per (instrument, book channel) from the events a session hands on,
+//! routing each book event by its `BookId`, and exposes each instrument's configured trading
+//! book ([`TradingBooks`]); [`BookKeeper`] is the [`MdHandler`] that feeds it and then the
+//! consumer's [`BookHandler`] (FBC-nij).
+//!
 //! Not here yet: order-entry sessions, keepalives, client certificates and certificate pinning.
 //! Apart from a codec's HTTP request, no call here has a deadline of its own; the caller bounds
 //! one with its own timer.
 
+mod books;
 mod connector;
 mod epoch;
 mod error;
@@ -60,6 +66,7 @@ mod tls;
 mod transport;
 pub mod ws;
 
+pub use books::{BookHandler, BookKeeper, MdBooks, TradingBookConflict, TradingBooks};
 pub use connector::{Connector, ProxyConfig};
 pub use epoch::{Admit, EpochError, Epochs, Input};
 pub use error::{Cause, NetError, Step};
