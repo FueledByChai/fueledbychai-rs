@@ -388,16 +388,17 @@ impl<H: MdHandler> MdSession<H> {
     }
 
     /// Offers the record `make` builds, if the session has a journal, under `class`, telling
-    /// the sink first that it holds `payload` bytes, so a sink with no room refuses it unbuilt.
+    /// the sink first that it holds `payload()` bytes, so a sink with no room refuses it
+    /// unbuilt. With no journal, neither is worked out (Codex r4178802725).
     fn journal_with(
         &self,
         class: TrafficClass,
         now: WallNs,
-        payload: usize,
+        payload: impl FnOnce() -> usize,
         make: impl FnOnce() -> Record,
     ) {
         if let Some(journal) = &self.journal {
-            journal.record_with(class, now, payload, make);
+            journal.record_with(class, now, payload(), make);
         }
     }
 
@@ -409,7 +410,7 @@ impl<H: MdHandler> MdSession<H> {
         &self,
         class: TrafficClass,
         now: WallNs,
-        payload: usize,
+        payload: impl FnOnce() -> usize,
         make: impl FnOnce() -> Record,
     ) {
         let Some(journal) = &self.journal else {
@@ -419,7 +420,8 @@ impl<H: MdHandler> MdSession<H> {
             self.withheld.set(self.withheld.get() + 1);
             journal.omit(class, now);
         } else {
-            journal.record_with(class, now, payload, make);
+            // Sized only when it may be recorded (Codex r4178802725).
+            journal.record_with(class, now, payload(), make);
         }
     }
 
@@ -625,7 +627,7 @@ impl<H: MdHandler> MdSession<H> {
             Message::Binary(bytes) => RawFrame::Binary(bytes.as_ref()),
             _ => return None,
         };
-        let payload = raw.bytes().len();
+        let payload = || raw.bytes().len();
         self.journal_input(TrafficClass::Normal, stamp.recv_wall, payload, || {
             Record::inbound(stamp, raw)
         });
@@ -729,7 +731,7 @@ impl<H: MdHandler> MdSession<H> {
             // Offered with the least its subscriptions encode to, so a full journal refuses it
             // before the sets are copied (Codex r4178567381).
             let (at, now) = self.clock.now();
-            let payload = SUB_BYTES * (this.add().len() + this.remove().len());
+            let payload = || SUB_BYTES * (this.add().len() + this.remove().len());
             let make = || subscribe_rec(at, self.current(), &this);
             self.journal_with(TrafficClass::Normal, now, payload, make);
             let mut fx = Effects::new();
@@ -895,13 +897,18 @@ impl<H: MdHandler> MdSession<H> {
         // it before it is cloned (Codex r4178287660, r4178427394). Redacted spans and secret
         // header values are journaled as fixed-size digests, so they do not count (Codex
         // r4178567377).
-        self.journal_with(class, now, request_bytes(&req), || Record::HttpRequest {
-            at,
-            conn,
-            tag,
-            rpc,
-            req: HttpRequestRec::from(&req),
-        });
+        self.journal_with(
+            class,
+            now,
+            || request_bytes(&req),
+            || Record::HttpRequest {
+                at,
+                conn,
+                tag,
+                rpc,
+                req: HttpRequestRec::from(&req),
+            },
+        );
         let (connector, max_body) = (self.connector.clone(), self.http_max_body);
         self.http.push(Box::pin(async move {
             let result = connector.http_by(&req, deadline, max_body).await;
@@ -924,7 +931,7 @@ impl<H: MdHandler> MdSession<H> {
         let stamp = self.clock.stamp(key);
         // Its body and headers, so a full journal refuses it before it is copied (Codex
         // r4178427394).
-        let payload = done.result.as_ref().map_or(0, response_bytes);
+        let payload = || done.result.as_ref().map_or(0, response_bytes);
         self.journal_input(done.class, stamp.recv_wall, payload, || {
             Record::HttpResult {
                 stamp,
@@ -1006,17 +1013,29 @@ fn subscribe_rec(at: MonoNs, conn: ConnKey, call: &SubscribeCall) -> Record {
 }
 
 /// The bytes of a request the journal keeps verbatim: its URL and body outside their redacted
-/// spans, and its header names and the values of headers that are not secret.
+/// spans, and its header names and the values of headers that are not secret. `usize::MAX`
+/// when it redacts more than the format takes, which refuses it whatever the room (Codex
+/// r4178802722).
 fn request_bytes(req: &HttpRequest) -> usize {
     let secret = |h: &fbc_core::Header| h.redact || is_secret_header(h.name);
-    let headers: usize = req
-        .headers
-        .iter()
-        .map(|h| h.name.len() + if secret(h) { 0 } else { h.value.len() })
-        .sum();
-    verbatim(req.url.as_str().len(), req.url.redactions())
-        + verbatim(req.body.bytes().len(), req.body.redactions())
-        + headers
+    let (mut kept, mut hidden) = (0, 0);
+    for h in &req.headers {
+        kept += h.name.len();
+        *if secret(h) { &mut hidden } else { &mut kept } += h.value.len();
+    }
+    for (len, spans) in [
+        (req.url.as_str().len(), req.url.redactions()),
+        (req.body.bytes().len(), req.body.redactions()),
+    ] {
+        let spanned = redacted(spans);
+        kept += len - spanned;
+        hidden += spanned;
+    }
+    if hidden as u64 > fbc_journal::format::MAX_REDACTED {
+        usize::MAX
+    } else {
+        kept
+    }
 }
 
 /// The bytes of a response the journal keeps verbatim: its body, its header names and the
@@ -1046,11 +1065,9 @@ fn lossy_len(bytes: &[u8]) -> usize {
         .sum()
 }
 
-/// The bytes of content `len` long that the journal keeps verbatim: all but its redacted spans,
-/// each of which it writes as a fixed-size digest.
-fn verbatim(len: usize, spans: &[std::ops::Range<u32>]) -> usize {
-    let redacted: usize = spans.iter().map(|s| (s.end - s.start) as usize).sum();
-    len - redacted
+/// The bytes `spans` redact, each of which the journal writes as a fixed-size digest.
+fn redacted(spans: &[std::ops::Range<u32>]) -> usize {
+    spans.iter().map(|s| (s.end - s.start) as usize).sum()
 }
 
 /// Whether `effect` asks a socket endpoint of stream `own` to reconnect, which ends its epoch.
@@ -1117,8 +1134,8 @@ mod tests {
     /// credential does not count towards the bytes a request is offered to the journal with.
     #[test]
     fn only_bytes_outside_redacted_spans_count_as_kept_verbatim() {
-        assert_eq!(verbatim(10, &[]), 10);
-        assert_eq!(verbatim(4096, &[4..4000, 4010..4090]), 4 + 10 + 6);
+        assert_eq!(redacted(&[]), 0);
+        assert_eq!(4096 - redacted(&[4..4000, 4010..4090]), 4 + 10 + 6);
     }
 
     /// Codex r4178725031: a header value that is not UTF-8 is kept lossily, each bad sequence
@@ -1141,6 +1158,33 @@ mod tests {
             .sum();
         assert_eq!(kept, "x-raw".len() + 8 + "x-ok".len() + "fine".len());
         assert_eq!(response_bytes(&response), kept + rec.body.0.len());
+    }
+
+    /// Codex r4178802722: a request redacting more than the journal format takes is refused by
+    /// the format whatever the room, so it is offered as one no sink can fit and is never
+    /// cloned.
+    #[test]
+    fn a_request_redacting_more_than_the_format_takes_is_offered_as_unfittable() {
+        let request = |redacted: usize| {
+            let span = 1..redacted as u32 + 1;
+            HttpRequest {
+                method: fbc_core::HttpMethod::Post,
+                url: fbc_core::WireUrl::redacted("https://toy/x".into(), Vec::new()).unwrap(),
+                headers: vec![fbc_core::Header {
+                    name: "x-sig",
+                    value: "abcd".into(),
+                    redact: true,
+                }],
+                body: fbc_core::WireSlice::redacted(vec![b'k'; redacted + 2], vec![span]).unwrap(),
+            }
+        };
+        let limit = fbc_journal::format::MAX_REDACTED as usize;
+        let at_limit = request(limit - 4);
+        assert_eq!(
+            request_bytes(&at_limit),
+            "https://toy/x".len() + "x-sig".len() + 2
+        );
+        assert_eq!(request_bytes(&request(limit - 3)), usize::MAX);
     }
 
     #[test]
