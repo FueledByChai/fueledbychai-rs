@@ -283,6 +283,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fbc-journal"
+version = "0.0.1"
+dependencies = [
+ "fbc-core",
+]
+
+[[package]]
 name = "fbc-venue-paradex"
 version = "0.0.1"
 dependencies = [
