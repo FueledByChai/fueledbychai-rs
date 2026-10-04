@@ -113,7 +113,7 @@ rather than guess.
   price grids, exact prices, sealed ids, the client-id codec, `NamespaceLease`, `CidMint`,
   `Fee`/`FeeBook`, `DecodeScope`, `InstrumentSpec` (maker-safe `quantize`), `VenueCaps`,
   the market-data and execution events, venue commands, and the codec, signer, nonce and
-  factory traits with `Effects` and `EncodeCtx`, `crates/fbc-journal` with its record
+  factory traits with `Effects` and `EncodeCtx`, `crates/fbc-book` with its L2 book, `crates/fbc-journal` with its record
   format, day-grouped segment writer and in-order reader, `crates/fbc-runtime` with its first
   slice (the connector, SOCKS5 CONNECT, `ws://` and HTTP/1.1; 0019), and
   `crates/venues/fbc-venue-paradex` with only its signer (`src/sign`); the rest are planned. Members are the `crates/fbc-*` and
@@ -135,7 +135,11 @@ rather than guess.
     and an `http://` HTTP/1.1 call over it, and `NetError` naming the failed step; its network
     dependencies are pinned exactly (0019). `tests/common/` holds the SOCKS5 stub, WebSocket
     server and HTTP server on 127.0.0.1 ephemeral ports that later runtime tests reuse.
-  - `crates/fbc-book` (tick-indexed order book), `crates/fbc-oms` (order lattice, permits,
+  - `crates/fbc-book` (it depends on `fbc-core` only: one tick-indexed L2 book per
+    instrument and `BookId`, built from book events the same live and in replay, with
+    snapshots, deltas, windows and gap invalidation, touch, top-n, an exact top-n comparison
+    and canonical bytes; still planned: the ex-own projection, touch arbitration and
+    continuity policies), `crates/fbc-oms` (order lattice, permits,
     pre-trade caps, `ExecutionPlanner`; 0005, 0013), `crates/fbc-journal` (0006; it depends on
     `fbc-core` only: the records the runtime writes, length-prefixed in a hand-written
     little-endian format with a version, a writer of one subdirectory per UTC day with segments
