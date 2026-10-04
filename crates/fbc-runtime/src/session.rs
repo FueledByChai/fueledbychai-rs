@@ -308,16 +308,20 @@ impl<H: MdHandler> MdSession<H> {
             }
             self.pacer.attempted(Instant::now());
             self.counters.attempts += 1;
-            // A connect fails at its deadline, is stopped by the control's drop, and keeps the
-            // desired set current.
+            // A connect fails at its deadline, is stopped by the control's drop, keeps the
+            // desired set current and fires an ended epoch's timers as they fall due.
             let deadline = Instant::now().checked_add(self.pacer.deadline());
             let opened = {
-                let connect = self.connector.websocket(&self.url);
+                let (connector, url) = (self.connector.clone(), self.url.clone());
+                let connect = connector.websocket(&url);
                 tokio::pin!(connect);
                 loop {
                     tokio::select! {
                         opened = &mut connect => break opened.ok(),
                         _ = sleep_or_never(deadline) => break None,
+                        _ = sleep_or_never(self.next_deadline()) => {
+                            let _ = self.take_timer()?;
+                        }
                         r = self.desired.changed() => match r {
                             Ok(()) => {
                                 let subs = self.desired.borrow_and_update().clone();
@@ -387,10 +391,15 @@ impl<H: MdHandler> MdSession<H> {
                 }
             };
         }
+        // A write the control's drop interrupted ends the session, not just the epoch.
+        if self.stop.has_changed().is_err() {
+            return Ok(End::Stop);
+        }
         Ok(End::Dropped)
     }
 
-    /// Decodes one message of epoch `key`; pings, pongs and close frames carry no data.
+    /// Stamps one message of epoch `key` and decodes it; pings, pongs and close frames take
+    /// their place in ingest order but carry no data.
     fn decode(
         &mut self,
         codec: &mut dyn MdCodec,
@@ -398,12 +407,12 @@ impl<H: MdHandler> MdSession<H> {
         message: &Message,
         fx: &mut Effects,
     ) {
+        let stamp = self.clock.stamp(key);
         let raw = match message {
             Message::Text(text) => RawFrame::Text(text.as_str()),
             Message::Binary(bytes) => RawFrame::Binary(bytes.as_ref()),
             _ => return,
         };
-        let stamp = self.clock.stamp(key);
         let mut sink = Sink {
             handler: &mut self.handler,
             epochs: &mut self.epochs,

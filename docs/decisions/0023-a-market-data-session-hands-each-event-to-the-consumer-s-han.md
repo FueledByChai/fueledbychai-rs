@@ -32,15 +32,16 @@ that never answers would otherwise hold the session in one attempt indefinitely.
   in ingest order and a slow handler slows the reads rather than growing a backlog. The
   consumer's engine adapts `on_md` to its own `on_input`.
 - **Stamps.** The runtime stamps each input (a frame, a timer firing) once, before decode, and
-  every event that input yields carries that stamp; a timer firing of an ended epoch is stamped
-  too, so it keeps its place in ingest order though it is dropped: `ingest_seq` from an `IngestClock` that the
+  every event that input yields carries that stamp; a ping, pong or close frame is stamped too,
+  and so is a timer firing of an ended epoch, even while a connection attempt is pending, so
+  each keeps its place in ingest order though it yields nothing: `ingest_seq` from an `IngestClock` that the
   sessions of one shard share (cloning shares it), `recv_mono` from that clock's origin,
   `recv_wall` from the system clock, `conn` the session's connection number and current epoch,
   `kernel_rx` `None` until FBC-2y3.
 - **Control.** `MdControl::set_desired` replaces the desired set through a watch channel that
   holds only the latest set, so nothing queues; the reconciler sends only the difference.
   Dropping the control stops the session, even while a write waits on a peer that stopped
-  reading; a close frame is sent only if the socket takes it at once, and a stopping or
+  reading (a stop, which opens no new epoch); a close frame is sent only if the socket takes it at once, and a stopping or
   reconnecting session never waits on one.
 - **Effects.** `Send` and `Reconnect` for the session's own stream are executed in order (a
   frame whose bytes are UTF-8 goes as a text frame, any other as binary); `Timer` fires into the

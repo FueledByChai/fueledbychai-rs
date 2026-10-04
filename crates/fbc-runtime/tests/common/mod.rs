@@ -442,6 +442,13 @@ impl Peer {
             .send(Out::Send(Message::binary(bytes.to_vec())));
     }
 
+    /// Sends a ping, which carries no data.
+    pub fn ping(&self) {
+        let _ = self
+            .to_client
+            .send(Out::Send(Message::Ping(Vec::new().into())));
+    }
+
     /// Stops reading from the client, holding the connection open.
     pub fn stall(&self) {
         let _ = self.to_client.send(Out::Stall);
@@ -459,6 +466,32 @@ pub async fn hanging() -> (SocketAddr, mpsc::UnboundedReceiver<Instant>) {
     let (listener, addr) = listen().await;
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            held.push(listener.accept().await.unwrap().0);
+            let _ = tx.send(Instant::now());
+        }
+    });
+    (addr, rx)
+}
+
+/// A server on a 127.0.0.1 ephemeral port whose first connection is a WebSocket that is sent
+/// `texts` and then held open, and whose later connections are accepted and never answered;
+/// reports the (tokio) instant of each later accept.
+pub async fn once_then_hanging(
+    texts: &'static [&'static str],
+) -> (SocketAddr, mpsc::UnboundedReceiver<Instant>) {
+    let (listener, addr) = listen().await;
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        tokio::spawn(async move {
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for text in texts {
+                ws.send(Message::text(*text)).await.unwrap();
+            }
+            while let Some(Ok(_)) = ws.next().await {}
+        });
         let mut held = Vec::new();
         loop {
             held.push(listener.accept().await.unwrap().0);

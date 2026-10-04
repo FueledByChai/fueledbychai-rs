@@ -11,7 +11,7 @@ use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use common::toy::{self, REFUSE, ToyVenue};
-use common::{ScriptedWs, hanging, refusing};
+use common::{ScriptedWs, hanging, once_then_hanging, refusing};
 use fbc_core::{ConnKey, Envelope, Feed, FeedHealth, InstrumentId, MdEvent, MdTransport, WireUrl};
 use fbc_core::{EndpointPlan, VenueConfig};
 use fbc_runtime::{
@@ -114,9 +114,10 @@ async fn events_arrive_stamped_in_ingest_order_and_a_drop_opens_a_fresh_epoch_su
     assert_eq!(conns, [key(0), key(0), key(1), key(1)]);
     let ingest: Vec<_> = envs.iter().map(|e| e.stamp.ingest_seq).collect();
     assert!(ingest.windows(2).all(|w| w[0] < w[1]));
-    // Every input took a place in ingest order: four frames, then (in either order) two frames
-    // and the old timer's dropped firing, then the current timer's firing (Codex r4177068885).
-    assert_eq!((ingest[0], ingest[1], ingest[3]), (0, 3, 7));
+    // Every input took a place in ingest order: four frames and the close frame, then (in either
+    // order) two frames and the old timer's dropped firing, then the current timer's firing
+    // (Codex r4177068885, r4177205689).
+    assert_eq!((ingest[0], ingest[1], ingest[3]), (0, 3, 8));
     assert!(
         envs.windows(2)
             .all(|w| w[0].stamp.recv_mono <= w[1].stamp.recv_mono)
@@ -240,6 +241,55 @@ async fn dropping_the_control_stops_a_session_whose_write_waits_on_a_peer_that_s
     };
     let (run, ()) = tokio::join!(session.run(), script);
     run.unwrap();
+    // A stop, not a drop: no new epoch was opened for it (Codex r4177205693).
+    assert_eq!(session.current(), key(0));
+}
+
+#[tokio::test]
+async fn control_frames_take_their_place_in_ingest_order() {
+    let mut server = ScriptedWs::start().await;
+    let seen = Seen::default();
+    let config = session(ToyVenue::leak(), server.url(), &[1], quick());
+    let (mut session, control) = MdSession::new(config, keep(&seen)).unwrap();
+    let watch = seen.clone();
+    let script = async move {
+        let mut peer = server.accept().await;
+        assert_eq!(peer.recv().await, "hello|codec=0|plan=1");
+        assert_eq!(peer.recv().await, "sub|add=A");
+        peer.send("trade|sym=A|px=100|qty=1|seq=1");
+        peer.ping();
+        peer.send("trade|sym=A|px=101|qty=1|seq=2");
+        until(|| watch.borrow().len() == 2).await;
+        drop(control);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    // The ping consumed an ingest number though it carried no event (Codex r4177205689).
+    let ingest: Vec<_> = seen
+        .borrow()
+        .iter()
+        .map(|(_, e)| e.stamp.ingest_seq)
+        .collect();
+    assert_eq!(ingest, [0, 2]);
+}
+
+#[tokio::test]
+async fn an_ended_epochs_timer_fires_into_nothing_while_an_attempt_hangs() {
+    let (addr, mut accepts) = once_then_hanging(&["arm|sym=A|ms=200", "bye"]).await;
+    let config = session(ToyVenue::leak(), format!("ws://{addr}/md"), &[1], quick());
+    let (mut session, control) = MdSession::new(config, |_| {}).unwrap();
+    let script = async move {
+        // The second attempt hangs until its 5 s deadline; the timer falls due 200 ms after the
+        // first connection asked for it.
+        accepts.recv().await.unwrap();
+        tokio::time::sleep(ms(600)).await;
+        drop(control);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    // It fired, stamped and counted, during the attempt (Codex r4177205690).
+    assert_eq!(session.stale(Input::Timer), 1);
+    assert_eq!(session.counters().attempts, 2);
 }
 
 #[tokio::test(start_paused = true)]
