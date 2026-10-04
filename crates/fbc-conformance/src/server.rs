@@ -86,7 +86,8 @@ pub struct StubServer {
     ws: SocketAddr,
     http: SocketAddr,
     conns: Shared<Vec<ConnRecord>>,
-    requests: Shared<Vec<String>>,
+    /// One slot per HTTP connection in accept order, filled once its request is read.
+    requests: Shared<Vec<Option<String>>>,
     result: watch::Receiver<Option<Result<(), ScriptError>>>,
     _stop: watch::Sender<()>,
 }
@@ -163,16 +164,17 @@ impl StubServer {
         conns.iter().filter(|c| c.upgraded && c.open).count()
     }
 
-    /// Every HTTP request's method and target, e.g. `GET /markets?x=1`, in arrival order.
+    /// Every HTTP request's method and target, e.g. `GET /markets?x=1`, in the order their
+    /// connections arrived (one request per connection), however long each took to read.
     pub fn http_requests(&self) -> Vec<String> {
-        lock(&self.requests).clone()
+        lock(&self.requests).iter().flatten().cloned().collect()
     }
 }
 
 /// What the player asks a connection's task to do.
 enum Cmd {
     Push(Frame, oneshot::Sender<bool>),
-    Close,
+    Close(oneshot::Sender<bool>),
     Silent,
 }
 
@@ -263,8 +265,8 @@ async fn serve_ws(
                     };
                     let _ = sent.send(ws.send(message).await.is_ok());
                 }
-                Some(Cmd::Close) => {
-                    let _ = ws.close(None).await;
+                Some(Cmd::Close(sent)) => {
+                    let _ = sent.send(ws.close(None).await.is_ok());
                 }
                 Some(Cmd::Silent) => {
                     let _ = stop.changed().await;
@@ -298,15 +300,16 @@ async fn play(
             }
             Step::Push { conn, frame } => {
                 let (handle, closed) = handle(&mut conns, step, conn)?;
-                let (sent, ok) = oneshot::channel();
-                let asked = handle.cmds.send(Cmd::Push(frame, sent)).is_ok();
-                if !(asked && ok.await.unwrap_or(false)) {
+                if !done(handle, |sent| Cmd::Push(frame, sent)).await {
                     return Err(closed);
                 }
             }
+            // A close the socket did not take was not forced by the stub (Codex r4177464414).
             Step::Close { conn } => {
                 let (handle, closed) = handle(&mut conns, step, conn)?;
-                handle.cmds.send(Cmd::Close).map_err(|_| closed)?;
+                if !done(handle, Cmd::Close).await {
+                    return Err(closed);
+                }
             }
             Step::Silent { conn } => {
                 let (handle, closed) = handle(&mut conns, step, conn)?;
@@ -315,6 +318,13 @@ async fn play(
         }
     }
     Ok(())
+}
+
+/// Asks the connection's task for `cmd` and waits for its outcome: false when the write failed
+/// or the connection had already ended.
+async fn done(handle: &Conn, cmd: impl FnOnce(oneshot::Sender<bool>) -> Cmd) -> bool {
+    let (sent, ok) = oneshot::channel();
+    handle.cmds.send(cmd(sent)).is_ok() && ok.await.unwrap_or(false)
 }
 
 /// The next accepted connection once upgraded; `None` when its upgrade failed or the listener
@@ -337,7 +347,7 @@ fn handle(
 async fn accept_http(
     listener: TcpListener,
     routes: Arc<HttpRoutes>,
-    requests: Shared<Vec<String>>,
+    requests: Shared<Vec<Option<String>>>,
     mut stop: watch::Receiver<()>,
 ) {
     loop {
@@ -346,10 +356,17 @@ async fn accept_http(
             _ = stop.changed() => return,
         };
         let Ok((stream, _)) = stream else { return };
+        // The connection's slot is taken now, so a slow request keeps its place (Codex
+        // r4177464418).
+        let slot = {
+            let mut requests = lock(&requests);
+            requests.push(None);
+            requests.len() - 1
+        };
         let (routes, requests, mut stop) = (routes.clone(), requests.clone(), stop.clone());
         tokio::spawn(async move {
             tokio::select! {
-                _ = serve_http(stream, &routes, &requests) => {}
+                _ = serve_http(stream, &routes, &requests, slot) => {}
                 _ = stop.changed() => {}
             }
         });
@@ -357,7 +374,12 @@ async fn accept_http(
 }
 
 /// Answers one request on `stream`, then closes it.
-async fn serve_http(mut stream: TcpStream, routes: &HttpRoutes, requests: &Mutex<Vec<String>>) {
+async fn serve_http(
+    mut stream: TcpStream,
+    routes: &HttpRoutes,
+    requests: &Mutex<Vec<Option<String>>>,
+    slot: usize,
+) {
     let reply = match read_request(&mut stream).await {
         Some(line) => {
             let path = line.split(' ').nth(1).unwrap_or_default();
@@ -366,7 +388,7 @@ async fn serve_http(mut stream: TcpStream, routes: &HttpRoutes, requests: &Mutex
                 status: 404,
                 body: Vec::new(),
             });
-            lock(requests).push(line);
+            lock(requests)[slot] = Some(line);
             reply
         }
         None => HttpReply {
@@ -402,6 +424,10 @@ async fn read_request(stream: &mut TcpStream) -> Option<String> {
         let n = stream.read(&mut chunk).await.ok().filter(|n| *n > 0)?;
         seen.extend_from_slice(&chunk[..n]);
     };
+    // The delimiter can arrive in the read that passes the limit (Codex r4177464412).
+    if head_end > MAX_REQUEST {
+        return None;
+    }
     let head = std::str::from_utf8(&seen[..head_end]).ok()?;
     let mut lines = head.split("\r\n");
     let (method, rest) = lines.next()?.split_once(' ')?;
