@@ -11,10 +11,11 @@
 //! whose firing reports the instrument's trades stale; `big|kb=<n>` asks for an `n` KiB frame;
 //! `bye` asks for a reconnect; `say` asks to send `said`; `get|tag=<n>|ms=<t>|url=<u>` asks for
 //! a GET of `u` with a `t` ms timeout (and, with `|kb=<k>`, then a `k` KiB frame, and with
-//! `|bye=1`, then a reconnect); `get` with `ms=max` asks for a timeout past the end of the clock;
+//! `|bye=1`, then a reconnect; with `|auth=1`, it carries an `Authorization` header); `get` with `ms=max` asks for a timeout past the end of the clock;
 //! `odd` asks for a frame and a reconnect on another stream, which a session refuses;
 //! `cancel|id=<n>` asks to send the cancel-shaped frame `cancel|id=<n>` as Safety traffic (FBC-f3w:
-//! the runtime treats a write by its class, not its content).
+//! the runtime treats a write by its class, not its content); `auth` asks to send
+//! `auth|key=toy-secret` with the key marked as a redaction span, as a codec sends a credential.
 //! Book channel `b` of instrument `A`: `begin|sym=A|book=<b>|epoch=<e>|seq=<n>` begins a
 //! snapshot and anchors the channel's sequence; `lvl|sym=A|book=<b>|side=bid|px=<ticks>|qty=<lots>|seq=<n>`
 //! sets a level (in the snapshot or as a delta) and `end|sym=A|book=<b>|seq=<n>` ends the
@@ -37,7 +38,7 @@ use fbc_core::{
     Aggressor, AssetSym, BookCaps, BookId, BookSide, Cadence, Channel, ConfigError, ConnTopology,
     Continuity, DecodeError, DecodeScope, Effect, Effects, Encoding, EndpointPlan, ExchTsKind,
     ExecCodec, ExecEndpoint, Feed, FeedHealth, FeedSource, FieldSpec, FundingCaps, FundingSpec,
-    HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag, Inbound, InboundSpans,
+    Header, HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag, Inbound, InboundSpans,
     InstrumentId, InstrumentKind, InstrumentSpec, Keepalive, Lots, MatchingCaps, MdCaps, MdCodec,
     MdEvent, MdSink, MdTransport, MonoNs, OpKind, PriceGrid, QueueModelQuality, RateCharge,
     RawFrame, Readiness, SizeStep, SpecTable, StpScope, StreamId, Subscription, TagSet, Ticks,
@@ -506,6 +507,19 @@ impl ToyMd {
                 reason: "bye",
             }),
             "say" => fx.push(send(self.stream, "said".into())),
+            "auth" => {
+                let text = "auth|key=toy-secret";
+                let span = "auth|key=".len() as u32..text.len() as u32;
+                let frame = WireSlice::redacted(text.as_bytes().to_vec(), vec![span])
+                    .expect("the span lies inside the frame");
+                fx.push(Effect::Send {
+                    stream: self.stream,
+                    frame,
+                    rpc: None,
+                    class: TrafficClass::Normal,
+                    charge: CONTROL,
+                });
+            }
             "cancel" => {
                 let id = num(&fields, "id")?;
                 let text = format!("cancel|id={id}");
@@ -518,7 +532,15 @@ impl ToyMd {
                     _ => Duration::from_millis(num(&fields, "ms")? as u64),
                 };
                 let url = field(&fields, "url")?.to_owned();
-                fx.push(get(tag as u64, url, timeout));
+                let mut get = get(tag as u64, url, timeout);
+                if let (Ok(_), Effect::Http { req, .. }) = (field(&fields, "auth"), &mut get) {
+                    req.headers.push(Header {
+                        name: "Authorization",
+                        value: "toy-token".into(),
+                        redact: false,
+                    });
+                }
+                fx.push(get);
                 if let Ok(kb) = num(&fields, "kb") {
                     fx.push(send(self.stream, "x".repeat(kb as usize * 1024)));
                 }

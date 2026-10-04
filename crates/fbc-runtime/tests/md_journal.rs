@@ -438,3 +438,211 @@ async fn every_endpoint_a_venue_opens_records_into_its_one_journal() {
         }
     }
 }
+
+/// Codex r4178197275: until a codec can mark the credential spans of what comes back (FBC-7lm),
+/// a session that has sent a credential journals none of what it receives verbatim.
+#[tokio::test]
+async fn a_session_that_sent_a_credential_journals_nothing_it_receives_verbatim() {
+    let (mut ws, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
+    let seen = Seen::default();
+    let venue = ToyVenue::leak();
+    let (mut session, control) = MdSession::new(session(venue, ws.url()), keep(&seen)).unwrap();
+    let kept = Rc::new(RefCell::new(Kept::default()));
+    session.set_journal(Journal::new(kept.clone()));
+    let snap = http.url("/snap");
+    let watch = seen.clone();
+    let script = async move {
+        let mut peer = ws.accept().await;
+        assert_eq!(peer.recv().await, "hello|codec=0|plan=1");
+        assert_eq!(peer.recv().await, "sub|add=A");
+        peer.send("trade|sym=A|px=1|qty=1|seq=1");
+        until(|| watch.borrow().len() == 1).await;
+        peer.send("auth");
+        assert_eq!(peer.recv().await, "auth|key=toy-secret");
+        // The venue echoes the key, in a frame and in a response.
+        peer.send("trade|sym=A|px=2|qty=1|seq=2|echo=toy-secret");
+        until(|| watch.borrow().len() == 2).await;
+        peer.send(&format!("get|tag=1|ms=5000|url={snap}"));
+        let head = "HTTP/1.1 200 OK\r\nX-Echo: toy-secret";
+        http.request().await.answer(head, "say").await;
+        assert_eq!(peer.recv().await, "said");
+        drop(control);
+        assert_eq!(peer.next().await, None);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    let kept = kept.borrow();
+    let lines: Vec<String> = kept.0.iter().map(line).collect();
+    assert!(lines.contains(&"in 0 trade|sym=A|px=1|qty=1|seq=1".to_owned()));
+    // The credential frame is journaled with its span; nothing received after it is.
+    assert!(lines.contains(&"out 0 auth|key=toy-secret".to_owned()));
+    assert!(lines.contains(&"request 0 1 Get /snap".to_owned()));
+    assert!(lines.contains(&"out 0 said".to_owned()));
+    let inbound = lines.iter().filter(|l| l.starts_with("in ")).count();
+    let results = lines.iter().filter(|l| l.starts_with("result ")).count();
+    assert_eq!((inbound, results), (2, 0), "{lines:#?}");
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("in ") && l.contains("toy-secret"))
+    );
+    assert_eq!(session.counters().journal_withheld, 3);
+}
+
+/// A session whose endpoint URL carries a credential journals nothing it receives verbatim from
+/// its first frame on.
+#[tokio::test]
+async fn a_session_whose_url_carries_a_credential_journals_nothing_it_receives_verbatim() {
+    let mut ws = ScriptedWs::start().await;
+    let seen = Seen::default();
+    let mut config = session(ToyVenue::leak(), ws.url());
+    let url = ws.url();
+    let span = (url.len() - "md".len()) as u32..url.len() as u32;
+    config.plan.transport = MdTransport::Socket {
+        url: WireUrl::redacted(url, vec![span]).unwrap(),
+    };
+    let (mut session, control) = MdSession::new(config, keep(&seen)).unwrap();
+    let kept = Rc::new(RefCell::new(Kept::default()));
+    session.set_journal(Journal::new(kept.clone()));
+    let watch = seen.clone();
+    let script = async move {
+        let mut peer = ws.accept().await;
+        assert_eq!(peer.recv().await, "hello|codec=0|plan=1");
+        assert_eq!(peer.recv().await, "sub|add=A");
+        peer.send("trade|sym=A|px=1|qty=1|seq=1");
+        until(|| watch.borrow().len() == 1).await;
+        drop(control);
+        assert_eq!(peer.next().await, None);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    let lines: Vec<String> = kept.borrow().0.iter().map(line).collect();
+    assert!(!lines.iter().any(|l| l.starts_with("in ")), "{lines:#?}");
+    assert!(lines.contains(&"out 0 sub|add=A".to_owned()));
+    assert_eq!(session.counters().journal_withheld, 1);
+}
+
+/// A sink that takes `pause` to record an HTTP request, as a slow encode would.
+struct SlowRequests {
+    pause: Duration,
+}
+
+impl JournalSink for SlowRequests {
+    fn record(&mut self, _: TrafficClass, _: WallNs, record: &Record) -> Recorded {
+        if let Record::HttpRequest { .. } = record {
+            std::thread::sleep(self.pause);
+        }
+        Recorded::Ok
+    }
+}
+
+/// Codex r4178197281: a request's timeout runs from when the codec asked, so time spent
+/// journaling it counts against it.
+#[tokio::test]
+async fn journaling_a_request_counts_against_its_timeout() {
+    let (mut ws, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
+    let venue = ToyVenue::leak();
+    let (mut session, control) = MdSession::new(session(venue, ws.url()), |_| {}).unwrap();
+    let slow = SlowRequests { pause: ms(400) };
+    session.set_journal(Journal::new(Rc::new(RefCell::new(slow))));
+    let slow_url = http.url("/slow");
+    let script = async move {
+        let mut peer = ws.accept().await;
+        assert_eq!(peer.recv().await, "hello|codec=0|plan=1");
+        assert_eq!(peer.recv().await, "sub|add=A");
+        let start = std::time::Instant::now();
+        peer.send(&format!("get|tag=2|ms=500|url={slow_url}"));
+        let _held = http.request().await;
+        until(|| venue.http_log().len() == 1).await;
+        let took = start.elapsed();
+        drop(control);
+        took
+    };
+    let (run, took) = tokio::join!(session.run(), script);
+    run.unwrap();
+    assert_eq!(venue.http_log(), ["0/2:TimedOut"]);
+    // 500 ms from the ask, not 400 ms of journaling and then 500 more.
+    assert!(took >= ms(500) && took < ms(800), "{took:?}");
+}
+
+/// A request carrying a secret header makes the session credentialed: its response is withheld.
+#[tokio::test]
+async fn a_request_with_a_secret_header_withholds_its_response_from_the_journal() {
+    let (mut ws, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
+    let venue = ToyVenue::leak();
+    let (mut session, control) = MdSession::new(session(venue, ws.url()), |_| {}).unwrap();
+    let kept = Rc::new(RefCell::new(Kept::default()));
+    session.set_journal(Journal::new(kept.clone()));
+    let snap = http.url("/snap");
+    let script = async move {
+        let mut peer = ws.accept().await;
+        assert_eq!(peer.recv().await, "hello|codec=0|plan=1");
+        assert_eq!(peer.recv().await, "sub|add=A");
+        peer.send(&format!("get|tag=4|ms=5000|url={snap}|auth=1"));
+        let head = "HTTP/1.1 200 OK\r\nX-Echo: toy-token";
+        http.request().await.answer(head, "").await;
+        until(|| venue.http_log().len() == 1).await;
+        drop(control);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    let lines: Vec<String> = kept.borrow().0.iter().map(line).collect();
+    assert!(lines.contains(&"request 0 4 Get /snap".to_owned()));
+    assert!(
+        !lines.iter().any(|l| l.starts_with("result ")),
+        "{lines:#?}"
+    );
+    // The request's own frame was journaled before it made the session credentialed.
+    assert_eq!(session.counters().journal_withheld, 1);
+}
+
+/// A sink that keeps each record's kind only, for frames too large to keep.
+#[derive(Default)]
+struct Kinds(Vec<String>);
+
+impl JournalSink for Kinds {
+    fn record(&mut self, _: TrafficClass, _: WallNs, record: &Record) -> Recorded {
+        let kind = match record {
+            Record::Outbound { frame, .. } => format!("out {}", frame.bytes().len()),
+            Record::WriteResult { .. } => "write".into(),
+            Record::Control {
+                ev: ControlEvent::Closed(_),
+                ..
+            } => "close".into(),
+            _ => "other".into(),
+        };
+        self.0.push(kind);
+        Recorded::Ok
+    }
+}
+
+/// A write the control's drop interrupts has no write result: whether it reached the venue is
+/// unknown, and the connection's close follows its frame.
+#[tokio::test]
+async fn an_interrupted_write_is_journaled_without_a_write_result() {
+    let mut ws = ScriptedWs::start().await;
+    let (mut session, control) =
+        MdSession::new(session(ToyVenue::leak(), ws.url()), |_| {}).unwrap();
+    let kinds = Rc::new(RefCell::new(Kinds::default()));
+    session.set_journal(Journal::new(kinds.clone()));
+    let big = 64 * 1024 * 1024;
+    let watch = kinds.clone();
+    let script = async move {
+        let mut peer = ws.accept().await;
+        assert_eq!(peer.recv().await, "hello|codec=0|plan=1");
+        assert_eq!(peer.recv().await, "sub|add=A");
+        // 64 MiB is far more than the loopback socket buffers hold.
+        peer.send("big|kb=65536");
+        peer.stall();
+        until(|| watch.borrow().0.contains(&format!("out {big}"))).await;
+        tokio::time::sleep(ms(50)).await;
+        drop(control);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    let kinds = kinds.borrow();
+    assert_eq!(
+        kinds.0[kinds.0.len() - 2..],
+        [format!("out {big}"), "close".into()]
+    );
+}
