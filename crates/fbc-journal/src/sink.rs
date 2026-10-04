@@ -14,10 +14,11 @@
 //! the caller proceeds either way. A record the format cannot hold, or one larger than the
 //! room its class has left, is dropped and counted the same way, and its payload is not
 //! copied: encoding stops where the room ends. A caller whose record would copy a large payload
-//! to be built offers it with [`record_with`](JournalSink::record_with) and its size: one whose
-//! payload alone exceeds that room is dropped and counted without being built. A record the
-//! caller may not journal at all is [omitted](JournalSink::omit): dropped and counted the same
-//! way, so the gap it leaves is marked.
+//! to be built offers it [borrowed](JournalSink::record_ref) instead: it is encoded from what
+//! it borrows, so one with no room is refused before its payload is copied, at the exact
+//! length it encodes to (FBC-f3w). A record the caller may not journal at all is
+//! [omitted](JournalSink::omit): dropped and counted the same way, so the gap it leaves is
+//! marked.
 //!
 //! **The gap.** The sink numbers the records offered to it from 0. The first drop opens a gap;
 //! it closes once space returns, that is when a record arrives and the `Degraded` marker and
@@ -41,7 +42,7 @@ use std::thread::{self, JoinHandle, Thread};
 
 use fbc_core::{TrafficClass, WallNs};
 
-use crate::record::{Marker, Record};
+use crate::record::{Marker, Record, RecordRef};
 use crate::redact::RedactionKey;
 use crate::{JournalError, JournalWriter, format};
 
@@ -81,20 +82,15 @@ pub trait JournalSink {
     /// no room left. Never blocks and never fails the caller.
     fn record(&mut self, class: TrafficClass, now: WallNs, record: &Record) -> Recorded;
 
-    /// Journals the record `make` builds, as [`record`](JournalSink::record) does, when the
-    /// record's encoding holds at least `payload` bytes (a frame's or a body's): a sink that can
-    /// tell such a record has no room drops and counts it without calling `make`, so a large
-    /// payload is not copied only to be refused (FBC-f3w); `usize::MAX` stands for a record the
-    /// format refuses whatever the room. By default it builds and records it.
-    fn record_with(
-        &mut self,
-        class: TrafficClass,
-        now: WallNs,
-        payload: usize,
-        make: &mut dyn FnMut() -> Record,
-    ) -> Recorded {
-        let _ = payload;
-        self.record(class, now, &make())
+    /// Journals `record`, whose large contents it borrows, as [`record`](JournalSink::record)
+    /// journals the owned record it stands for ([`RecordRef::to_record`]). A sink that encodes
+    /// it from what it borrows refuses one with no room before its payload is copied (FBC-f3w).
+    /// By default it builds the owned record and records that.
+    fn record_ref(&mut self, class: TrafficClass, now: WallNs, record: RecordRef<'_>) -> Recorded {
+        match record {
+            RecordRef::Owned(record) => self.record(class, now, record),
+            borrowed => self.record(class, now, &borrowed.to_record()),
+        }
     }
 
     /// Counts a record of `class` that the caller withholds, its content being one the journal
@@ -184,16 +180,6 @@ struct Ring {
     gap_wall: AtomicU64,
     /// The writer thread, set by the thread itself before it can park.
     writer: OnceLock<Thread>,
-}
-
-/// Ends the sink's busy span when dropped: armed only while a record builder runs, so one that
-/// panics cannot leave the writer waiting on a push that will never come.
-struct BusyGuard<'a>(&'a AtomicBool);
-
-impl Drop for BusyGuard<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, SeqCst);
-    }
 }
 
 /// The words an entry with a body of `len` bytes takes.
@@ -321,40 +307,11 @@ impl QueueSink {
 
 impl JournalSink for QueueSink {
     fn record(&mut self, class: TrafficClass, now: WallNs, record: &Record) -> Recorded {
-        self.offer(class, now, Some(record))
+        self.offer(class, now, Some(record.into()))
     }
 
-    fn record_with(
-        &mut self,
-        class: TrafficClass,
-        now: WallNs,
-        payload: usize,
-        make: &mut dyn FnMut() -> Record,
-    ) -> Recorded {
-        // An entry holding `payload` bytes needs at least this many words; one that exceeds the
-        // room its class has even before an open gap's marker is refused unbuilt, and so is any
-        // record once the writer is closed (Codex r4178427389). Otherwise the record is built
-        // and admitted exactly.
-        // A Normal record must also fit after an open gap's marker (Codex r4178646788).
-        let (need, limit) = match class {
-            TrafficClass::Normal => (self.marker_words() + entry_words(payload), self.soft),
-            TrafficClass::Safety => (entry_words(payload), self.ring.words.len()),
-        };
-        // Busy from the look at `closed` through the build and the push, so a writer closing
-        // meanwhile waits for the record instead of it being built only to be dropped (Codex
-        // r4178725028).
-        self.ring.busy.store(true, SeqCst);
-        let open = !self.ring.closed.load(SeqCst);
-        let recorded = if open && fits(self.ring.used(), need, limit) {
-            // A builder that panics ends the busy span as it unwinds (Codex r4178802729).
-            let unwinding = BusyGuard(&self.ring.busy);
-            let record = make();
-            std::mem::forget(unwinding);
-            self.settle(class, now, Some(&record), open)
-        } else {
-            self.settle(class, now, None, open)
-        };
-        self.end_busy(recorded)
+    fn record_ref(&mut self, class: TrafficClass, now: WallNs, record: RecordRef<'_>) -> Recorded {
+        self.offer(class, now, Some(record))
     }
 
     fn omit(&mut self, class: TrafficClass, now: WallNs) -> Recorded {
@@ -363,26 +320,18 @@ impl JournalSink for QueueSink {
 }
 
 impl QueueSink {
-    /// Offers `record`, numbering it; `None` stands for a record already known not to fit,
-    /// which is dropped and counted like any other.
-    fn offer(&mut self, class: TrafficClass, now: WallNs, record: Option<&Record>) -> Recorded {
-        self.ring.busy.store(true, SeqCst);
-        let open = !self.ring.closed.load(SeqCst);
-        let recorded = self.settle(class, now, record, open);
-        self.end_busy(recorded)
-    }
-
-    /// Numbers `record` and admits it, or drops and counts it, with the sink already busy and
-    /// `open` what it saw of `closed` once busy.
-    fn settle(
+    /// Offers `record`, numbering it; `None` stands for a record the caller withholds, which is
+    /// dropped and counted like any other.
+    fn offer(
         &mut self,
         class: TrafficClass,
         now: WallNs,
-        record: Option<&Record>,
-        open: bool,
+        record: Option<RecordRef<'_>>,
     ) -> Recorded {
         let seq = self.next_seq;
         self.next_seq += 1;
+        self.ring.busy.store(true, SeqCst);
+        let open = !self.ring.closed.load(SeqCst);
         let recorded = match record {
             Some(record) if open => self.admit(class, now, record),
             _ => Recorded::DroppedCounted,
@@ -401,24 +350,17 @@ impl QueueSink {
                 self.ring.gap_wall.store(gap.wall.0 as u64, Relaxed);
             }
         }
-        recorded
-    }
-
-    /// Ends the sink's busy span, waking the writer for a record pushed in it.
-    fn end_busy(&self, recorded: Recorded) -> Recorded {
         self.ring.busy.store(false, SeqCst);
         if recorded == Recorded::Ok {
             self.ring.wake();
         }
         recorded
     }
-}
 
-impl QueueSink {
-    /// Encodes an open gap's marker into `self.marker` and gives the words its entry takes; 0
-    /// when no gap is open.
-    fn marker_words(&mut self) -> usize {
-        self.gap.as_ref().map_or(0, |gap| {
+    /// Pushes `record` (after an open gap's marker) if its class has room for it.
+    fn admit(&mut self, class: TrafficClass, now: WallNs, record: RecordRef<'_>) -> Recorded {
+        self.body.clear();
+        let marker = self.gap.as_ref().map_or(0, |gap| {
             self.marker.clear();
             let degraded = Record::Marker(Marker::Degraded {
                 from_seq: gap.from_seq,
@@ -427,13 +369,7 @@ impl QueueSink {
             format::encode(&degraded, &self.key, &mut self.marker)
                 .expect("a marker always encodes");
             entry_words(self.marker.len())
-        })
-    }
-
-    /// Pushes `record` (after an open gap's marker) if its class has room for it.
-    fn admit(&mut self, class: TrafficClass, now: WallNs, record: &Record) -> Recorded {
-        self.body.clear();
-        let marker = self.marker_words();
+        });
         let used = self.ring.used();
         // A body too long for the room its class has left is refused before it is copied: a
         // Normal record has the soft limit less an open gap's marker, a Safety record the
@@ -603,99 +539,6 @@ mod tests {
             "{}",
             sink.body.capacity()
         );
-    }
-
-    #[test]
-    fn a_record_offered_lazily_leaves_room_for_an_open_gaps_marker_before_it_is_built() {
-        // Codex r4178646788: with a gap open, a Normal record offered lazily must fit after the
-        // marker that goes ahead of it, or it is refused unbuilt. The soft limit is 16 words; a
-        // 96-byte payload needs a 14-word entry, which fits alone but not after the 5-word
-        // marker.
-        let (mut sink, _drain) = journal_queue(
-            SinkConfig {
-                budget_bytes: 256,
-                soft_limit_pct: 50,
-            },
-            key(),
-        )
-        .unwrap();
-        assert_eq!(
-            sink.omit(TrafficClass::Normal, WallNs(0)),
-            Recorded::DroppedCounted
-        );
-        assert_eq!(entry_words(96), 14);
-        let refused = sink.record_with(TrafficClass::Normal, WallNs(0), 96, &mut || {
-            panic!("built though it cannot fit after the marker")
-        });
-        assert_eq!(refused, Recorded::DroppedCounted);
-        assert_eq!(sink.dropped(TrafficClass::Normal), 2);
-    }
-
-    #[test]
-    fn a_record_built_lazily_is_kept_though_the_sink_closes_while_it_is_built() {
-        // Codex r4178725028: the sink is busy from its look at `closed` until its push ends,
-        // so a writer closing while the record is built waits for it rather than leaving a
-        // record built only to be dropped.
-        let (mut sink, _drain) = journal_queue(
-            SinkConfig {
-                budget_bytes: 256,
-                soft_limit_pct: 50,
-            },
-            key(),
-        )
-        .unwrap();
-        let ring = Arc::clone(&sink.ring);
-        let kept = sink.record_with(TrafficClass::Normal, WallNs(0), 0, &mut || {
-            assert!(ring.busy.load(SeqCst), "built outside the sink's busy span");
-            ring.closed.store(true, SeqCst);
-            Record::Marker(Marker::Recovered)
-        });
-        assert_eq!(kept, Recorded::Ok);
-        assert!(!ring.busy.load(SeqCst));
-        assert_ne!(ring.used(), 0);
-        assert_eq!(sink.dropped(TrafficClass::Normal), 0);
-    }
-
-    #[test]
-    fn a_record_builder_that_panics_leaves_the_sink_usable_and_the_writer_free_to_close() {
-        // Codex r4178802729: a caller that catches the builder's panic keeps the sink, so the
-        // busy span must end as the builder unwinds, not when the sink is dropped.
-        let root =
-            std::env::temp_dir().join(format!("fbc-journal-sink-unwind-{}", std::process::id()));
-        let (mut sink, drain) = journal_queue(
-            SinkConfig {
-                budget_bytes: 256,
-                soft_limit_pct: 50,
-            },
-            key(),
-        )
-        .unwrap();
-        let writer = drain
-            .spawn(JournalWriter::create(&root, 1, key()).unwrap())
-            .unwrap();
-        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            sink.record_with(TrafficClass::Normal, WallNs(0), 0, &mut || {
-                panic!("builder")
-            })
-        }));
-        assert!(unwound.is_err());
-        assert!(
-            !sink.ring.busy.load(SeqCst),
-            "busy left set by an unwinding builder"
-        );
-        let recovered = Record::Marker(Marker::Recovered);
-        assert_eq!(
-            sink.record(TrafficClass::Normal, WallNs(0), &recovered),
-            Recorded::Ok
-        );
-        writer.close().unwrap();
-        let read: Vec<Record> = crate::JournalReader::open(&root, 1)
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
-        assert_eq!(read, [recovered]);
-        drop(sink);
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

@@ -441,6 +441,139 @@ impl Record {
     }
 }
 
+/// A record offered to a sink with its large contents borrowed from where they lie (FBC-f3w):
+/// a frame, a request, a response or a subscribe call's sets. A sink with no room for one
+/// refuses it before a byte of its payload is copied, and one it admits is encoded straight
+/// from what it borrows, so no size is worked out apart from the encoding itself. Each encodes
+/// exactly as the owned [`Record`] [`to_record`](RecordRef::to_record) gives, which is what the
+/// reader returns. Every other kind is offered [`Owned`](RecordRef::Owned).
+///
+/// Its `Debug` is the owned record's, which shows no credential.
+#[derive(Copy, Clone)]
+pub enum RecordRef<'a> {
+    /// Any record, owned.
+    Owned(&'a Record),
+    /// A [`Record::Inbound`]: the frame as it came off a stream.
+    Inbound { stamp: Stamp, frame: RawFrame<'a> },
+    /// A [`Record::HttpRequest`]: the request a codec asked for.
+    HttpRequest {
+        at: MonoNs,
+        conn: ConnKey,
+        tag: HttpTag,
+        rpc: Option<RpcId>,
+        req: &'a HttpRequest,
+    },
+    /// A [`Record::HttpResult`]: the response as the transport handed it, or why none came.
+    HttpResult {
+        stamp: Stamp,
+        tag: HttpTag,
+        result: Result<ResponseRef<'a>, HttpFailure>,
+    },
+    /// A [`Record::Control`] of a [`ControlEvent::Subscribe`].
+    Subscribe {
+        at: MonoNs,
+        conn: ConnKey,
+        add: &'a [Subscription],
+        remove: &'a [Subscription],
+    },
+}
+
+/// An HTTP response as the transport handed it, borrowed: its status, its headers in order
+/// with their values as raw bytes, and its body. The journal reads each header value lossily as
+/// UTF-8 (each invalid sequence as U+FFFD), as a codec is handed it, and only once the record
+/// is admitted. `Debug` shows the status, the number of headers and the body's length only.
+#[derive(Copy, Clone)]
+pub struct ResponseRef<'a> {
+    pub status: u16,
+    pub headers: &'a [(&'a str, &'a [u8])],
+    pub body: &'a [u8],
+}
+
+impl fmt::Debug for ResponseRef<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResponseRef")
+            .field("status", &self.status)
+            .field("headers", &self.headers.len())
+            .field("body_len", &self.body.len())
+            .finish()
+    }
+}
+
+impl From<&ResponseRef<'_>> for HttpResponseRec {
+    fn from(resp: &ResponseRef<'_>) -> HttpResponseRec {
+        HttpResponseRec {
+            status: resp.status,
+            headers: resp
+                .headers
+                .iter()
+                .map(|(name, value)| HeaderRec {
+                    name: (*name).to_owned(),
+                    value: String::from_utf8_lossy(value).into_owned(),
+                    redact: false,
+                    redact_name: false,
+                })
+                .collect(),
+            body: Opaque(resp.body.to_vec()),
+            body_redact: Vec::new(),
+        }
+    }
+}
+
+impl fmt::Debug for RecordRef<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The owned record's `Debug` is the one reviewed for credentials (0009); this is for
+        // diagnostics, not a hot path, so building it is fine.
+        f.debug_tuple("RecordRef").field(&self.to_record()).finish()
+    }
+}
+
+impl<'a> From<&'a Record> for RecordRef<'a> {
+    fn from(record: &'a Record) -> RecordRef<'a> {
+        RecordRef::Owned(record)
+    }
+}
+
+impl RecordRef<'_> {
+    /// The record this stands for, owned: what it encodes as.
+    pub fn to_record(&self) -> Record {
+        match *self {
+            RecordRef::Owned(record) => record.clone(),
+            RecordRef::Inbound { stamp, frame } => Record::inbound(stamp, frame),
+            RecordRef::HttpRequest {
+                at,
+                conn,
+                tag,
+                rpc,
+                req,
+            } => Record::HttpRequest {
+                at,
+                conn,
+                tag,
+                rpc,
+                req: HttpRequestRec::from(req),
+            },
+            RecordRef::HttpResult { stamp, tag, result } => Record::HttpResult {
+                stamp,
+                tag,
+                result: result.as_ref().map(HttpResponseRec::from).map_err(|e| *e),
+            },
+            RecordRef::Subscribe {
+                at,
+                conn,
+                add,
+                remove,
+            } => Record::Control {
+                at,
+                ev: ControlEvent::Subscribe {
+                    conn,
+                    add: add.to_vec(),
+                    remove: remove.to_vec(),
+                },
+            },
+        }
+    }
+}
+
 /// `len` blank characters.
 fn blank_text(len: usize) -> String {
     String::from_utf8(vec![BLANK; len]).expect("BLANK is ASCII")
@@ -469,4 +602,66 @@ fn blank_url(url: &WireUrl) -> WireUrl {
     let text = String::from_utf8(blank_spans(url.as_str().as_bytes(), url.redactions()))
         .expect("spans cover whole characters");
     WireUrl::redacted(text, url.redactions().to_vec()).expect("spans already checked")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Codex r4179379939: a borrowed record shows no credential, a header secret by name
+    /// included, as the owned record it stands for does not.
+    #[test]
+    fn a_borrowed_record_shows_no_credential() {
+        let req = HttpRequest {
+            method: HttpMethod::Get,
+            url: WireUrl::plain("https://toy/x"),
+            headers: vec![Header {
+                name: "Authorization",
+                value: "live-secret-token".into(),
+                redact: false,
+            }],
+            body: WireSlice::plain(Vec::new()),
+        };
+        let stamp = Stamp {
+            ingest_seq: 1,
+            kernel_rx: None,
+            recv_mono: MonoNs(1),
+            recv_wall: fbc_core::WallNs(1),
+            conn: ConnKey { conn: 1, epoch: 1 },
+        };
+        let request = RecordRef::HttpRequest {
+            at: MonoNs(1),
+            conn: stamp.conn,
+            tag: HttpTag(1),
+            rpc: None,
+            req: &req,
+        };
+        let headers = [("set-cookie", &b"sid=live-cookie"[..])];
+        let result = RecordRef::HttpResult {
+            stamp,
+            tag: HttpTag(1),
+            result: Ok(ResponseRef {
+                status: 200,
+                headers: &headers,
+                body: b"live-body",
+            }),
+        };
+        let response = ResponseRef {
+            status: 200,
+            headers: &headers,
+            body: b"live-body",
+        };
+        let shown = [
+            format!("{request:?}"),
+            format!("{result:?}"),
+            format!("{response:?}"),
+        ];
+        for shown in &shown {
+            assert!(!shown.contains("live-"), "{shown}");
+        }
+        assert_eq!(
+            shown[2],
+            "ResponseRef { status: 200, headers: 1, body_len: 9 }"
+        );
+    }
 }
