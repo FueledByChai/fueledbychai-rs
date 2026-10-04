@@ -490,8 +490,39 @@ fn a_snapshot_deeper_than_the_configured_limit_is_refused_and_retried() {
     );
 }
 
+/// The one retry timer in `fx`, its interval the configured one.
+fn retry_timer(fx: &Effects) -> TimerTag {
+    let [Effect::Timer { tag, after }] = fx.as_slice() else {
+        panic!("one retry timer: {fx:?}")
+    };
+    assert_eq!(*after, Duration::from_secs(2));
+    *tag
+}
+
+/// Fires `timer` and returns the snapshot request it asks for.
+fn fire(codec: &mut dyn MdCodec, timer: TimerTag) -> HttpTag {
+    let (mut sink, mut fx) = (Sink::default(), Effects::new());
+    codec.on_timer(timer, MonoNs(1), WallNs(1), &mut sink, &mut fx);
+    assert!(sink.0.is_empty());
+    snapshot_request(&fx)
+}
+
+/// e3 alone after a snapshot at 1027045, which it straddles: the snapshot under `epoch`, then
+/// e3's delta.
+fn bridged_by_e3(epoch: u32) -> Vec<(VenueMeta, MdEvent)> {
+    let snap = meta(1_027_045, 1_589_436_922_959);
+    let mut want: Vec<_> = first_snapshot(epoch)[..6]
+        .iter()
+        .map(|&(_, ev)| (snap, ev))
+        .collect();
+    want.extend(e3());
+    want
+}
+
 #[test]
-fn a_snapshot_older_than_every_buffered_event_is_a_gap_and_asks_again() {
+fn a_snapshot_the_buffered_events_do_not_bridge_is_never_published_and_is_retried() {
+    // Codex r4177522988: a snapshot older than the first event after it is never published,
+    // so no consumer sees it valid.
     let mut codec = subscribed();
     let frames = fixture("diff_depth.jsonl");
     let (_, _, fx) = frame(codec.as_mut(), &frames[0]);
@@ -502,38 +533,51 @@ fn a_snapshot_older_than_every_buffered_event_is_a_gap_and_asks_again() {
     let body = rest_fixture("depth_snapshot.json");
     let (result, sink, fx) = http(codec.as_mut(), tag, ok(&body));
     assert_eq!(result, Ok(()));
-    let snap = meta(1_027_024, 1_589_436_922_959);
-    let e2_meta = meta(1_027_040, 1_589_436_923_060);
-    let mut want = first_snapshot(1);
-    want.truncate(6);
-    want.push((e2_meta, GAP));
-    assert_eq!(sink.0, want);
-    assert_eq!(sink.0[0], (snap, begin(1)));
-    let tag = snapshot_request(&fx);
-    // The new anchor straddles e2, which was kept for it.
-    let body = body.replace(r#""lastUpdateId":1027024"#, r#""lastUpdateId":1027035"#);
-    let (result, sink, _) = http(codec.as_mut(), tag, ok(&body));
+    assert!(sink.0.is_empty(), "{:?}", sink.0);
+    let tag = fire(codec.as_mut(), retry_timer(&fx));
+    // The retry's snapshot is bridged by e3, buffered meanwhile: the first epoch published.
+    let (events, effects) = run(codec.as_mut(), &frames[3..4]);
+    assert!(events.is_empty() && effects.is_empty());
+    let body = body.replace(r#""lastUpdateId":1027024"#, r#""lastUpdateId":1027045"#);
+    let (result, sink, fx) = http(codec.as_mut(), tag, ok(&body));
     assert_eq!(result, Ok(()));
-    assert_eq!(sink.0[0].1, begin(2));
-    assert_eq!(sink.0[6..], e2());
+    assert!(fx.is_empty());
+    assert_eq!(sink.0, bridged_by_e3(1));
 }
 
 #[test]
-fn after_a_snapshot_with_nothing_buffered_the_first_event_must_straddle_it() {
+fn a_snapshot_with_nothing_buffered_to_bridge_it_is_held_until_an_event_does() {
     let mut codec = subscribed();
     let frames = fixture("diff_depth.jsonl");
     let (_, _, fx) = frame(codec.as_mut(), &frames[0]);
     let tag = snapshot_request(&fx);
     let body = rest_fixture("depth_snapshot.json");
-    // e0 alone is buffered, and dropped: it ends before the snapshot.
+    // e0 alone is buffered, and dropped: it ends before the snapshot, which is held.
     let (result, sink, fx) = http(codec.as_mut(), tag, ok(&body));
     assert_eq!(result, Ok(()));
-    assert!(fx.is_empty());
-    assert_eq!(sink.0, first_snapshot(1)[..6]);
-    // e0 again is dropped too; e1 straddles and applies; e2 follows.
+    assert!(sink.0.is_empty() && fx.is_empty());
+    // e0 again is dropped too; e1 straddles: the snapshot, then its delta; e2 follows.
     let (events, effects) = run(codec.as_mut(), &frames[..3]);
     assert!(effects.is_empty());
-    assert_eq!(events, [first_snapshot(1)[6..].to_vec(), e2()].concat());
+    assert_eq!(events, [first_snapshot(1), e2()].concat());
+
+    // A held snapshot the next event does not bridge is never published, and is retried.
+    let mut codec = subscribed();
+    let (_, _, fx) = frame(codec.as_mut(), &frames[0]);
+    let tag = snapshot_request(&fx);
+    let (result, sink, _) = http(codec.as_mut(), tag, ok(&body));
+    assert_eq!(result, Ok(()));
+    assert!(sink.0.is_empty());
+    let (result, sink, fx) = frame(codec.as_mut(), &frames[2]);
+    assert_eq!(result, Ok(()));
+    assert!(sink.0.is_empty(), "{:?}", sink.0);
+    let tag = fire(codec.as_mut(), retry_timer(&fx));
+    let (events, effects) = run(codec.as_mut(), &frames[3..4]);
+    assert!(events.is_empty() && effects.is_empty());
+    let body = body.replace(r#""lastUpdateId":1027024"#, r#""lastUpdateId":1027045"#);
+    let (result, sink, _) = http(codec.as_mut(), tag, ok(&body));
+    assert_eq!(result, Ok(()));
+    assert_eq!(sink.0, bridged_by_e3(1));
 }
 
 #[test]
