@@ -11,7 +11,8 @@
 //!   DOMAINNAME), so the proxy resolves it, as `socks5h` does, and the process never resolves a
 //!   venue host itself; an IP literal goes as an IP address.
 //! - A WebSocket client for `ws://` URLs ([`Connector::websocket`], [`ws`]) and an HTTP/1.1
-//!   call for `http://` URLs ([`Connector::http`], [`http`]), both over that connector.
+//!   call for `http://` URLs ([`Connector::http`], [`http`]), both over that connector; an
+//!   HTTP call reads at most the response-body bytes its caller allows.
 //!
 //! Every failure is a [`NetError`] that names the [`Step`] that failed and never quotes a
 //! URL, so a URL's user information or query cannot reach a log through it (0014 item 8).

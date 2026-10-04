@@ -39,6 +39,12 @@ no username or password, and accepted the stack below as the default (FBC-2ds no
   SOCKS5 greeting, SOCKS5 CONNECT with the reply code and its RFC name, WebSocket upgrade,
   HTTP) and holds no URL, so neither `Display` nor `Debug` can show a URL's user information or
   query (0014 item 8). An I/O error keeps its kind only.
+- **Bounded bodies.** `Connector::http` takes the caller's response-body limit and fails at
+  the HTTP step once a body passes it (`http_body_util::Limited`), so a large or unending body
+  cannot exhaust memory; the number comes from the consumer, not from code here.
+- **Known gap.** tungstenite 0.30 accepts an upgrade response only when its `Connection` header
+  is exactly `Upgrade` (case aside), not a token list such as `keep-alive, Upgrade` that RFC 6455
+  allows; FBC-17h tracks a token-aware upgrade.
 - **Not yet.** TLS (`wss://`, `https://`; FBC-27a), epochs, sessions and reconnects (FBC-5pt,
   FBC-ku8). No call has a deadline of its own; the caller bounds one.
 
