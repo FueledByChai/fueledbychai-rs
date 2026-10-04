@@ -374,8 +374,13 @@ impl Enc<'_> {
     fn spanned(&mut self, bytes: &[u8], spans: &[Range<u32>]) -> Result<(), JournalError> {
         self.u32(len32(bytes.len())?);
         self.u32(len32(spans.len())?);
-        // Counted first, stopping at the first span past MAX_REDACTED, so a record that
+        // Descriptors that cannot fit stop the record before the spans are walked. Then the
+        // spans are counted, stopping at the first one past MAX_REDACTED, so a record that
         // redacts too much writes no descriptor.
+        if spans.len().saturating_mul(8) > self.room() {
+            self.over = true;
+            return Err(JournalError::TooLarge);
+        }
         for span in spans {
             self.redact(u64::from(span.end - span.start))?;
         }
@@ -1113,9 +1118,8 @@ mod tests {
             e.spanned(&[b'a'; 128], &spans),
             Err(JournalError::TooLarge)
         ));
-        // The spans are counted against MAX_REDACTED first (no copy); their descriptors stop
-        // at the limit.
-        assert_eq!(e.redacted, 64);
+        // Descriptors that cannot fit stop it before the spans are counted.
+        assert_eq!(e.redacted, 0);
         assert!(e.out.len() <= 16);
 
         let mut out = Vec::new();
@@ -1186,5 +1190,24 @@ mod tests {
         ));
         // Only the two lengths: no span descriptor.
         assert_eq!(e.out.len(), 8);
+    }
+
+    #[test]
+    fn span_descriptors_that_cannot_fit_are_refused_before_the_spans_are_walked() {
+        // Codex r4176986652: with no room for the descriptors, the spans are not counted.
+        let mut out = Vec::new();
+        let mut e = Enc {
+            out: &mut out,
+            redacted: 0,
+            end: 64,
+            over: false,
+        };
+        let spans: Vec<Range<u32>> = (0..64).map(|i| i * 2..i * 2 + 1).collect();
+        assert!(matches!(
+            e.spanned(&[b'a'; 128], &spans),
+            Err(JournalError::TooLarge)
+        ));
+        assert_eq!(e.redacted, 0);
+        assert!(e.out.len() <= 64);
     }
 }
