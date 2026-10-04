@@ -28,7 +28,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use fbc_core::Subscription;
+use fbc_core::{ConnKey, Subscription};
 
 /// The next reconciler's origin: every reconciler in the process has its own, so a call made
 /// by one is never taken for another's.
@@ -76,6 +76,9 @@ pub enum ReconcileError {
     NotCurrent { current: u32, given: u32 },
     /// A call made by another reconciler.
     ForeignCall,
+    /// [`Reconciler::begin_epoch`] or [`Reconciler::opened`] named another connection than
+    /// the reconciler's: it was routed to the wrong stream.
+    OtherConnection { stream: u16, given: u16 },
 }
 
 impl fmt::Display for ReconcileError {
@@ -95,6 +98,10 @@ impl fmt::Display for ReconcileError {
                     "epoch {given} opened, but the current epoch is {current}"
                 )
             }
+            ReconcileError::OtherConnection { stream, given } => write!(
+                f,
+                "an epoch of connection {given} reached the reconciler of connection {stream}"
+            ),
             ReconcileError::ForeignCall => {
                 f.write_str("a subscribe call made by another reconciler was settled here")
             }
@@ -109,6 +116,7 @@ impl std::error::Error for ReconcileError {}
 #[derive(Debug)]
 pub struct Reconciler {
     origin: u64,
+    conn: u16,
     epoch: u32,
     open: bool,
     desired: BTreeSet<Subscription>,
@@ -122,11 +130,14 @@ pub struct Reconciler {
 }
 
 impl Reconciler {
-    /// A stream at `epoch`, not yet open, wanting nothing. Its calls settle only on it.
-    pub fn new(epoch: u32) -> Reconciler {
+    /// The stream of connection `key.conn`, at epoch `key.epoch`, not yet open, wanting
+    /// nothing. Its epochs begin and open only by that connection's key, and its calls settle
+    /// only on it.
+    pub fn new(key: ConnKey) -> Reconciler {
         Reconciler {
             origin: NEXT_ORIGIN.fetch_add(1, Ordering::Relaxed),
-            epoch,
+            conn: key.conn,
+            epoch: key.epoch,
             open: false,
             desired: BTreeSet::new(),
             active: BTreeSet::new(),
@@ -179,9 +190,11 @@ impl Reconciler {
         self.next_call()
     }
 
-    /// The connection closed or reconnects as `epoch`: nothing is subscribed on it yet, the
-    /// epoch is not open, and an outstanding call of the old epoch no longer counts.
-    pub fn begin_epoch(&mut self, epoch: u32) -> Result<(), ReconcileError> {
+    /// The connection closed or reconnects under `key` (this stream's connection, a later
+    /// epoch): nothing is subscribed on it yet, the epoch is not open, and an outstanding call
+    /// of the old epoch no longer counts.
+    pub fn begin_epoch(&mut self, key: ConnKey) -> Result<(), ReconcileError> {
+        let epoch = self.own_epoch(key)?;
         if epoch <= self.epoch {
             return Err(ReconcileError::NotNewer {
                 current: self.epoch,
@@ -197,8 +210,10 @@ impl Reconciler {
         Ok(())
     }
 
-    /// The current epoch's connection is open: yields the desired set, once.
-    pub fn opened(&mut self, epoch: u32) -> Result<Option<SubscribeCall>, ReconcileError> {
+    /// The connection opened under `key`, which must be this stream's current epoch: yields the
+    /// desired set, once.
+    pub fn opened(&mut self, key: ConnKey) -> Result<Option<SubscribeCall>, ReconcileError> {
+        let epoch = self.own_epoch(key)?;
         if epoch != self.epoch {
             return Err(ReconcileError::NotCurrent {
                 current: self.epoch,
@@ -231,6 +246,17 @@ impl Reconciler {
         let changed = self.settle(&call)?;
         self.held = !changed;
         Ok(self.next_call())
+    }
+
+    /// The epoch `key` names, if it is of this reconciler's connection.
+    fn own_epoch(&self, key: ConnKey) -> Result<u32, ReconcileError> {
+        if key.conn != self.conn {
+            return Err(ReconcileError::OtherConnection {
+                stream: self.conn,
+                given: key.conn,
+            });
+        }
+        Ok(key.epoch)
     }
 
     /// End the outstanding call, if `call` is it, and say whether the desired set changed
@@ -276,7 +302,7 @@ impl Reconciler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fbc_core::{BookId, Feed, InstrumentId};
+    use fbc_core::{BookId, ConnKey, Feed, InstrumentId};
 
     fn sub(inst: u32) -> Subscription {
         Subscription {
@@ -295,8 +321,13 @@ mod tests {
         (call.epoch(), insts(call.add()), insts(call.remove()))
     }
 
+    /// Epoch `epoch` of connection 0, the one these tests' reconcilers stand for.
+    fn k(epoch: u32) -> ConnKey {
+        ConnKey { conn: 0, epoch }
+    }
+
     fn at(epoch: u32) -> Reconciler {
-        Reconciler::new(epoch)
+        Reconciler::new(k(epoch))
     }
 
     /// Everything a reconciler holds, to show that a refused settlement changed none of it.
@@ -306,7 +337,7 @@ mod tests {
 
     fn open_at(epoch: u32) -> Reconciler {
         let mut rec = at(epoch);
-        assert_eq!(rec.opened(epoch), Ok(None));
+        assert_eq!(rec.opened(k(epoch)), Ok(None));
         rec
     }
 
@@ -335,7 +366,7 @@ mod tests {
         assert_eq!(rec.set_desired(set(&[2, 1])), None);
         assert_eq!(rec.set_desired(set(&[1, 1, 2])), None);
         assert_eq!(rec.retry(), None);
-        assert_eq!(rec.opened(0), Ok(None));
+        assert_eq!(rec.opened(k(0)), Ok(None));
         // Removed and then re-added: each change is a difference once.
         send(&mut rec, &[2], &[], &[1]);
         assert_eq!(rec.set_desired(set(&[2])), None);
@@ -348,14 +379,14 @@ mod tests {
         let mut rec = open_at(0);
         send(&mut rec, &[1, 2], &[1, 2], &[]);
         for epoch in 1..=3 {
-            assert_eq!(rec.begin_epoch(epoch), Ok(()));
+            assert_eq!(rec.begin_epoch(k(epoch)), Ok(()));
             assert_eq!(rec.epoch(), epoch);
             assert!(rec.active().is_empty());
             assert_eq!(rec.pending(), set(&[1, 2]));
-            let call = rec.opened(epoch).unwrap().expect("the desired set");
+            let call = rec.opened(k(epoch)).unwrap().expect("the desired set");
             assert_eq!(shape(&call), (epoch, vec![1, 2], vec![]));
             assert_eq!(rec.sent(call), Ok(None));
-            assert_eq!(rec.opened(epoch), Ok(None));
+            assert_eq!(rec.opened(k(epoch)), Ok(None));
             assert_eq!(rec.set_desired(set(&[1, 2])), None);
             assert_eq!(rec.retry(), None);
         }
@@ -365,10 +396,10 @@ mod tests {
     fn a_new_epoch_sends_the_desired_set_with_no_removals_of_the_old_one() {
         let mut rec = open_at(0);
         send(&mut rec, &[1, 2], &[1, 2], &[]);
-        rec.begin_epoch(1).unwrap();
+        rec.begin_epoch(k(1)).unwrap();
         // Changed while the new epoch waits to open: only the set desired now goes.
         assert_eq!(rec.set_desired(set(&[2, 3])), None);
-        let call = rec.opened(1).unwrap().expect("the desired set");
+        let call = rec.opened(k(1)).unwrap().expect("the desired set");
         assert_eq!(shape(&call), (1, vec![2, 3], vec![]));
         assert_eq!(rec.sent(call), Ok(None));
     }
@@ -380,7 +411,7 @@ mod tests {
         assert_eq!(rec.retry(), None);
         assert_eq!(rec.pending(), set(&[7, 8]));
         assert_eq!(rec.desired(), &set(&[7, 8]).into_iter().collect());
-        let call = rec.opened(5).unwrap().expect("the waiting set");
+        let call = rec.opened(k(5)).unwrap().expect("the waiting set");
         assert_eq!(shape(&call), (5, vec![7, 8], vec![]));
         assert_eq!(rec.pending(), set(&[7, 8]), "in flight is still pending");
         assert_eq!(rec.sent(call), Ok(None));
@@ -395,7 +426,7 @@ mod tests {
         assert!(rec.active().is_empty());
         assert_eq!(rec.pending(), set(&[1, 2]));
         assert_eq!(
-            rec.opened(0),
+            rec.opened(k(0)),
             Ok(None),
             "a refusal is not retried by itself"
         );
@@ -411,8 +442,8 @@ mod tests {
         assert_eq!(rec.refused(call), Ok(None));
 
         // And so does the next epoch once it opens.
-        rec.begin_epoch(1).unwrap();
-        let call = rec.opened(1).unwrap().expect("the refused set");
+        rec.begin_epoch(k(1)).unwrap();
+        let call = rec.opened(k(1)).unwrap().expect("the refused set");
         assert_eq!(shape(&call), (1, vec![1, 2, 3], vec![]));
         assert_eq!(rec.sent(call), Ok(None));
         assert!(rec.pending().is_empty());
@@ -439,7 +470,7 @@ mod tests {
         let first = rec.set_desired(set(&[1])).unwrap();
         assert_eq!(rec.set_desired(set(&[1, 2])), None);
         assert_eq!(rec.retry(), None);
-        assert_eq!(rec.opened(0), Ok(None));
+        assert_eq!(rec.opened(k(0)), Ok(None));
         let next = rec.sent(first).unwrap().expect("the change");
         assert_eq!(shape(&next), (0, vec![2], vec![]));
         assert_eq!(rec.sent(next), Ok(None));
@@ -449,7 +480,7 @@ mod tests {
     fn a_call_of_an_older_epoch_is_dropped_and_changes_nothing() {
         let mut rec = open_at(0);
         let old = rec.set_desired(set(&[1])).unwrap();
-        rec.begin_epoch(1).unwrap();
+        rec.begin_epoch(k(1)).unwrap();
         let before = state(&rec);
         assert_eq!(
             rec.sent(old),
@@ -459,14 +490,14 @@ mod tests {
             })
         );
         assert_eq!(state(&rec), before);
-        let call = rec.opened(1).unwrap().expect("the desired set");
+        let call = rec.opened(k(1)).unwrap().expect("the desired set");
         assert_eq!(shape(&call), (1, vec![1], vec![]));
 
         // A refusal from the old epoch is dropped too, even while a new call is outstanding.
         let mut other = open_at(0);
         let old = other.set_desired(set(&[2])).unwrap();
-        other.begin_epoch(1).unwrap();
-        let current = other.opened(1).unwrap().unwrap();
+        other.begin_epoch(k(1)).unwrap();
+        let current = other.opened(k(1)).unwrap().unwrap();
         let err = other.refused(old).unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -479,7 +510,7 @@ mod tests {
     #[test]
     fn epochs_only_rise_and_only_the_current_one_opens() {
         let mut rec = at(2);
-        let err = rec.begin_epoch(2).unwrap_err();
+        let err = rec.begin_epoch(k(2)).unwrap_err();
         assert_eq!(
             err,
             ReconcileError::NotNewer {
@@ -492,7 +523,7 @@ mod tests {
             "epoch 2 cannot begin after epoch 2; epochs only rise"
         );
         assert_eq!(
-            rec.begin_epoch(1),
+            rec.begin_epoch(k(1)),
             Err(ReconcileError::NotNewer {
                 current: 2,
                 given: 1
@@ -500,7 +531,7 @@ mod tests {
         );
         assert_eq!(rec.set_desired(set(&[1])), None, "not open");
         for given in [1, 3] {
-            let err = rec.opened(given).unwrap_err();
+            let err = rec.opened(k(given)).unwrap_err();
             assert_eq!(err, ReconcileError::NotCurrent { current: 2, given });
         }
         assert_eq!(
@@ -512,7 +543,7 @@ mod tests {
             "epoch 3 opened, but the current epoch is 2"
         );
         assert_eq!(rec.pending(), set(&[1]), "a refused open leaves it waiting");
-        assert!(rec.opened(2).unwrap().is_some());
+        assert!(rec.opened(k(2)).unwrap().is_some());
     }
 
     #[test]
@@ -527,7 +558,7 @@ mod tests {
         assert_eq!(shape(&next), (0, vec![1, 2], vec![]));
         // Refused again with no change meanwhile: held until a retry, a change or an epoch.
         assert_eq!(rec.refused(next), Ok(None));
-        assert_eq!(rec.opened(0), Ok(None));
+        assert_eq!(rec.opened(k(0)), Ok(None));
         let again = rec.retry().expect("the refused set");
         assert_eq!(shape(&again), (0, vec![1, 2], vec![]));
         assert_eq!(rec.sent(again), Ok(None));
@@ -555,5 +586,36 @@ mod tests {
         let from_b = b.set_desired(set(&[])).unwrap();
         assert_eq!(a.refused(from_b), Err(ReconcileError::ForeignCall));
         assert_eq!(state(&a), a_before);
+    }
+
+    #[test]
+    fn an_epoch_of_another_connection_neither_begins_nor_opens() {
+        let mut rec = Reconciler::new(ConnKey { conn: 1, epoch: 0 });
+        assert_eq!(rec.set_desired(set(&[1])), None);
+        let before = state(&rec);
+        let other = ConnKey { conn: 2, epoch: 0 };
+        let err = rec.opened(other).unwrap_err();
+        assert_eq!(
+            err,
+            ReconcileError::OtherConnection {
+                stream: 1,
+                given: 2
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "an epoch of connection 2 reached the reconciler of connection 1"
+        );
+        assert_eq!(
+            rec.begin_epoch(ConnKey { conn: 2, epoch: 5 }),
+            Err(ReconcileError::OtherConnection {
+                stream: 1,
+                given: 2
+            })
+        );
+        assert_eq!(state(&rec), before, "nothing yielded, the epoch unchanged");
+        assert_eq!(rec.epoch(), 0);
+        let call = rec.opened(ConnKey { conn: 1, epoch: 0 }).unwrap().unwrap();
+        assert_eq!(shape(&call), (0, vec![1], vec![]));
     }
 }
