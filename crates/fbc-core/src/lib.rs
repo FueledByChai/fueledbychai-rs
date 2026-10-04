@@ -33,9 +33,9 @@ pub use caps::{
     AckModel, AmendAck, AmendCaps, AmendQty, Batch, BookCaps, Cadence, CancelOnDisconnect, CapTag,
     ConnTopology, Continuity, Encoding, ExecCaps, Feature, FeedSource, FillCaps, FillSource,
     FundingCaps, LimitScope, MatchingCaps, MdCaps, NonceScope, OpKind, OrderCaps, OrderKindTag,
-    OrderingKey, QueueModelQuality, RateLimit, Readiness, RefKind, SeqDomain, SnapshotSource,
-    SpeedBump, SpeedBumpScope, StpScope, Support, TagSet, TifTag, TouchSourceCaps, TradeCaps,
-    VenueCaps,
+    OrderingKey, QueueModelQuality, RateCharge, RateLimit, Readiness, RefKind, SeqDomain,
+    SnapshotSource, SpeedBump, SpeedBumpScope, StpScope, Support, TagSet, TifTag, TouchSourceCaps,
+    TradeCaps, VenueCaps,
 };
 
 pub use cid::{Charset, ClientIdFormat, MAX_WIRE_LEN, WireCid, decode_cid, encode_cid};

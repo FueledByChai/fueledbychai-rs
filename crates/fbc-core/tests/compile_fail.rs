@@ -55,7 +55,8 @@ fn caps_and_specs_declare_every_field() {
 /// `VenueOrderState::Rejected` takes a `TerminalReject`, which refuses `RejectKind::NotFound`
 /// and cannot be built as a literal: not knowing an order is never terminal (decision 0005).
 /// An RPC frame and an HTTP request cannot be asked for without a timeout, so every
-/// order-entry request reaches Unknown when unanswered.
+/// order-entry request reaches Unknown when unanswered, nor without its rate charge (decision
+/// 0018).
 #[test]
 fn a_not_found_rejection_is_not_a_terminal_state() {
     let cases = trybuild::TestCases::new();

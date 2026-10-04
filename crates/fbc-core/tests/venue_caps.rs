@@ -14,8 +14,9 @@ use std::path::Path;
 
 use common::{market_data_only_caps, synthetic_caps};
 use fbc_core::{
-    AssetSym, Batch, Channel, Feature, FeedSource, Money, Namespace, NonceScope, OrderKindTag,
-    Readiness, RefKind, SpeedBumpScope, Support, TifTag, dispatch,
+    AssetSym, Batch, Channel, Feature, FeedSource, InstrumentId, LimitScope, Money, Namespace,
+    NonceScope, OpKind, OrderKindTag, RateCharge, Readiness, RefKind, SpeedBumpScope, Support,
+    TifTag, dispatch,
 };
 
 #[test]
@@ -57,6 +58,26 @@ fn the_synthetic_venue_declares_every_capability() {
     assert!(caps.md.books[1].includes_channels.contains(Channel::Rpi));
     assert!(!caps.md.books[0].includes_channels.contains(Channel::Rpi));
     assert_eq!(caps.limits[0].ops.iter().count(), 3);
+    // Decision 0018: limits per instrument, per connection, and on opening connections, each
+    // counting the charges for its operations (a per-pair one only when they name the pair).
+    let scopes = caps.limits.iter().map(|l| l.scope).collect::<Vec<_>>();
+    assert_eq!(
+        scopes,
+        [
+            LimitScope::Account,
+            LimitScope::Ip,
+            LimitScope::Pair,
+            LimitScope::Connection,
+            LimitScope::Ip,
+        ]
+    );
+    let (pair, conn, connect) = (&caps.limits[2], &caps.limits[3], &caps.limits[4]);
+    let inst = Some(InstrumentId::new(1));
+    assert!(pair.counts(&RateCharge::one(OpKind::Amend, inst)));
+    assert!(!pair.counts(&RateCharge::one(OpKind::Amend, None)));
+    assert!(conn.counts(&RateCharge::one(OpKind::Control, None)));
+    assert!(connect.counts(&RateCharge::one(OpKind::Connect, None)));
+    assert!(!connect.counts(&RateCharge::one(OpKind::Rest, None)));
     assert_eq!(caps.readiness_ceiling, Readiness::Paper);
     // Capabilities are plain data: a clone is equal, and a debug print names the values.
     assert_eq!(caps.clone(), caps);

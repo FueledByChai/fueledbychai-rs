@@ -1,0 +1,11 @@
+error[E0063]: missing field `charge` in initializer of `Effect`
+ --> tests/ui_states/request_without_charge.rs:9:17
+  |
+9 |     let _send = Effect::Send {
+  |                 ^^^^^^^^^^^^ missing `charge`
+
+error[E0063]: missing field `charge` in initializer of `Effect`
+  --> tests/ui_states/request_without_charge.rs:15:17
+   |
+15 |     let _http = Effect::Http {
+   |                 ^^^^^^^^^^^^ missing `charge`

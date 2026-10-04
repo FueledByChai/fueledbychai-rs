@@ -20,3 +20,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0015](0015-order-and-fill-capabilities-fold-into-one-optional-exec-bloc.md) Order and fill capabilities fold into one optional exec block, so a venue cannot claim fills without orders or orders without fills — accepted
 - [0016](0016-venue-order-paradex-first-its-signer-offline-before-market-d.md) Venue order: Paradex first, its signer offline before market data, then order entry; then Hibachi; Binance USD-M as reference — accepted, supersedes 0007
 - [0017](0017-a-licence-gate-cargo-deny-pinned-at-0-20-2-checks-every-depe.md) A licence gate: cargo-deny pinned at 0.20.2 checks every dependency against a permissive allowlist on every machine that runs the check — accepted
+- [0018](0018-every-frame-and-http-request-carries-its-rate-charge-and-lim.md) Every frame and HTTP request carries its rate charge, and limits gain a per-connection scope and a connect operation — accepted

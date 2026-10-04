@@ -146,6 +146,24 @@ pub fn synthetic_caps() -> VenueCaps {
                 per: Duration::from_secs(60),
                 units: 1_200,
             },
+            RateLimit {
+                scope: LimitScope::Pair,
+                ops: TagSet::of(&[OpKind::Place, OpKind::Amend]),
+                per: Duration::from_secs(10),
+                units: 100,
+            },
+            RateLimit {
+                scope: LimitScope::Connection,
+                ops: TagSet::of(&[OpKind::Subscribe, OpKind::Control]),
+                per: Duration::from_secs(1),
+                units: 10,
+            },
+            RateLimit {
+                scope: LimitScope::Ip,
+                ops: TagSet::of(&[OpKind::Connect]),
+                per: Duration::from_secs(300),
+                units: 300,
+            },
         ],
         readiness_ceiling: Readiness::Paper,
     }

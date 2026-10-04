@@ -22,10 +22,12 @@
 
 use core::fmt;
 use core::marker::PhantomData;
+use core::num::NonZeroU32;
 use core::time::Duration;
 
 use crate::cid::ClientIdFormat;
 use crate::fee::VenueFeeSign;
+use crate::ids::InstrumentId;
 use crate::time::ExchTsKind;
 use crate::units::Channel;
 
@@ -407,7 +409,8 @@ pub enum ConnTopology {
 }
 
 /// One rate limit: at most `units` of the operations in `ops` per `per`, counted across
-/// `scope`.
+/// `scope`. Each request counts its [`RateCharge::weight`] in units: one for a venue that
+/// counts requests, the request's weight for one that budgets weight (decision 0018).
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct RateLimit {
     /// What the limit is counted across.
@@ -416,7 +419,7 @@ pub struct RateLimit {
     pub ops: TagSet<OpKind>,
     /// The window.
     pub per: Duration,
-    /// The units allowed per window.
+    /// The units allowed per window: requests, or weight where requests are weighted.
     pub units: u32,
 }
 
@@ -434,6 +437,60 @@ pub enum LimitScope {
         /// Traded volume, in USDC, that earns one request.
         usdc_per_req: u32,
     },
+    /// One connection, while it stays open: a cap on the frames written to it (a venue's limit
+    /// on incoming messages per connection). It counts frames and keepalives on that
+    /// connection, never an HTTP request (decision 0018).
+    Connection,
+}
+
+impl RateLimit {
+    /// Whether this limit counts `charge`: it lists the charge's operation and, when it is
+    /// counted per pair, the charge names the instrument (decision 0018). Which bucket the
+    /// charge falls in (the account, the IP, the instrument, the connection) is the runtime's
+    /// to pick from [`scope`](RateLimit::scope).
+    pub fn counts(&self, charge: &RateCharge) -> bool {
+        let keyed = match self.scope {
+            LimitScope::Pair => charge.inst.is_some(),
+            LimitScope::Account
+            | LimitScope::Ip
+            | LimitScope::AddressVolume { .. }
+            | LimitScope::Connection => true,
+        };
+        keyed && self.ops.contains(charge.op)
+    }
+}
+
+/// What one request costs against a venue's rate limits (decision 0018): the operation it is,
+/// the instrument it is counted against where a limit is per pair, and its weight in the units
+/// of the limits that count it. Every frame and HTTP request a codec asks for
+/// ([`Effect::Send`](crate::Effect::Send), [`Effect::Http`](crate::Effect::Http)) and every
+/// [`Keepalive`](crate::Keepalive) carries one, so the runtime charges the right bucket for
+/// what a codec sends on its own (a resync, a token refresh, a resubscribe, a pong) as well as
+/// for orders. The runtime charges [`OpKind::Connect`] itself for each connection it opens.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct RateCharge {
+    /// The operation, matched against each limit's [`ops`](RateLimit::ops).
+    pub op: OpKind,
+    /// The scope key: the instrument a per-pair limit ([`LimitScope::Pair`]) counts the request
+    /// against, `None` for a request that names no single instrument (authentication, a
+    /// resync, an account-wide cancel-all). A per-pair limit counts only charges that name one,
+    /// so a codec names the instrument on every request its venue counts per pair.
+    pub inst: Option<InstrumentId>,
+    /// The cost in the units of every limit that counts the request: one for a venue that
+    /// counts requests, more for a weighted request (a deeper book snapshot against a weight
+    /// budget). Never zero, so no request rides free.
+    pub weight: NonZeroU32,
+}
+
+impl RateCharge {
+    /// A request of `op` that costs one unit, counted against `inst` where a limit is per pair.
+    pub const fn one(op: OpKind, inst: Option<InstrumentId>) -> RateCharge {
+        RateCharge {
+            op,
+            inst,
+            weight: NonZeroU32::MIN,
+        }
+    }
 }
 
 /// How far an adapter may be promoted, in order: [`Record`](Readiness::Record) <
@@ -637,6 +694,12 @@ pub enum OpKind {
     Subscribe,
     /// Any other REST request.
     Rest,
+    /// Opening a connection (a venue's limit on new connections): the runtime charges one for
+    /// each connection it opens, planned or reconnected.
+    Connect,
+    /// Any other frame written on a connection: authentication, a keepalive ping or pong, a
+    /// session message.
+    Control,
 }
 
 cap_tags!(OrderKindTag: OrderKindTag::Limit, OrderKindTag::Market);
@@ -651,6 +714,8 @@ cap_tags!(
     OpKind::Query,
     OpKind::Subscribe,
     OpKind::Rest,
+    OpKind::Connect,
+    OpKind::Control,
 );
 
 #[cfg(test)]
@@ -670,7 +735,50 @@ mod tests {
         declared_in_order::<Channel>();
         declared_in_order::<RefKind>();
         declared_in_order::<OpKind>();
-        assert_eq!(OpKind::ALL.len(), 7);
+        assert_eq!(OpKind::ALL.len(), 9);
+    }
+
+    #[test]
+    fn a_limit_counts_the_charges_for_its_operations_keyed_as_its_scope_needs() {
+        // Decision 0018: a limit counts a charge whose operation it lists; a per-pair limit only
+        // one that names the instrument, every other scope whatever the charge names.
+        let inst = Some(InstrumentId::new(3));
+        let limit = |scope| RateLimit {
+            scope,
+            ops: TagSet::of(&[OpKind::Place, OpKind::Control]),
+            per: Duration::from_secs(1),
+            units: 10,
+        };
+        let scopes = [
+            LimitScope::Account,
+            LimitScope::Ip,
+            LimitScope::Pair,
+            LimitScope::AddressVolume { usdc_per_req: 1 },
+            LimitScope::Connection,
+        ];
+        for scope in scopes {
+            let limit = limit(scope);
+            assert!(
+                limit.counts(&RateCharge::one(OpKind::Place, inst)),
+                "{scope:?}"
+            );
+            assert!(
+                !limit.counts(&RateCharge::one(OpKind::Cancel, inst)),
+                "{scope:?}"
+            );
+            let unkeyed = limit.counts(&RateCharge::one(OpKind::Control, None));
+            assert_eq!(unkeyed, scope != LimitScope::Pair, "{scope:?}");
+        }
+        // A charge costs one unit unless it says more; its weight is never zero.
+        assert_eq!(RateCharge::one(OpKind::Connect, None).weight.get(), 1);
+        let deep = RateCharge {
+            weight: NonZeroU32::new(20).unwrap(),
+            ..RateCharge::one(OpKind::Rest, None)
+        };
+        assert!(limit(LimitScope::Ip).counts(&RateCharge {
+            op: OpKind::Place,
+            ..deep
+        }));
     }
 
     #[test]
