@@ -36,9 +36,11 @@ This record augments 0014; where they differ, this one wins.
    requests and more for a weighted request, never zero so no request rides free.
    `RateCharge::one(op, inst)` is the common case. A codec charges what it sends from every
    callback, not only from `encode`.
-2. **A limit counts a charge by operation, keyed by its scope.** `RateLimit::counts(charge)`
-   holds when the limit lists `charge.op` and, for a `Pair` limit, the charge names an
-   instrument. The runtime charges `weight` to every limit that counts the request, in the
+2. **A limit counts a charge by operation, keyed by its scope.** `RateLimit::counts(charge,
+   via)` holds when the limit lists `charge.op`; for a `Pair` limit, the charge names an
+   instrument; and for a `Connection` limit, `via` is `Via::Frame`. `Effect::charge()` gives a
+   request's charge with its `Via` (`Frame` for `Send`, `Http` for `Http`; a keepalive is a
+   frame), so the runtime has one matching rule for every request. The runtime charges `weight` to every limit that counts the request, in the
    bucket its scope picks: the account, the source IP, the named instrument, the connection, or
    the address's volume allowance. A per-pair limit counts only charges that name an
    instrument, so a codec names the instrument on every request its venue counts per pair; each
@@ -47,7 +49,9 @@ This record augments 0014; where they differ, this one wins.
    limit costs at worst a venue-side rate-limit reject; it never blocks a cancel (0012).
 3. **`LimitScope::Connection`** counts per connection, while it stays open: the frames written
    on it (`Effect::Send` to its stream) and its keepalives. It never counts an HTTP request,
-   which goes on no connection a codec names.
+   which goes on no connection a codec names, even of an operation it lists for frames: a venue
+   that places orders over both a socket and REST has its socket's message cap count only the
+   socket's (Codex r4176401174).
 4. **`OpKind::Connect`** is opening a connection. The runtime charges
    `RateCharge::one(OpKind::Connect, None)` for each connection it opens, planned or after an
    `Effect::Reconnect`, against the limits that list it; no codec charges it.

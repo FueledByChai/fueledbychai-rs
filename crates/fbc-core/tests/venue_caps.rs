@@ -16,7 +16,7 @@ use common::{market_data_only_caps, synthetic_caps};
 use fbc_core::{
     AssetSym, Batch, Channel, Feature, FeedSource, InstrumentId, LimitScope, Money, Namespace,
     NonceScope, OpKind, OrderKindTag, RateCharge, Readiness, RefKind, SpeedBumpScope, Support,
-    TifTag, dispatch,
+    TifTag, Via, dispatch,
 };
 
 #[test]
@@ -73,11 +73,13 @@ fn the_synthetic_venue_declares_every_capability() {
     );
     let (pair, conn, connect) = (&caps.limits[2], &caps.limits[3], &caps.limits[4]);
     let inst = Some(InstrumentId::new(1));
-    assert!(pair.counts(&RateCharge::one(OpKind::Amend, inst)));
-    assert!(!pair.counts(&RateCharge::one(OpKind::Amend, None)));
-    assert!(conn.counts(&RateCharge::one(OpKind::Control, None)));
-    assert!(connect.counts(&RateCharge::one(OpKind::Connect, None)));
-    assert!(!connect.counts(&RateCharge::one(OpKind::Rest, None)));
+    let (frame, http) = (Via::Frame, Via::Http);
+    assert!(pair.counts(&RateCharge::one(OpKind::Amend, inst), http));
+    assert!(!pair.counts(&RateCharge::one(OpKind::Amend, None), http));
+    let control = RateCharge::one(OpKind::Control, None);
+    assert!(conn.counts(&control, frame) && !conn.counts(&control, http));
+    assert!(connect.counts(&RateCharge::one(OpKind::Connect, None), frame));
+    assert!(!connect.counts(&RateCharge::one(OpKind::Rest, None), http));
     assert_eq!(caps.readiness_ceiling, Readiness::Paper);
     // Capabilities are plain data: a clone is equal, and a debug print names the values.
     assert_eq!(caps.clone(), caps);
