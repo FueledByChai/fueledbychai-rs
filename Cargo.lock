@@ -465,6 +465,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fbc-venue-binance-usdm"
+version = "0.0.1"
+dependencies = [
+ "fbc-core",
+ "rust_decimal",
+ "serde_json",
+]
+
+[[package]]
 name = "fbc-venue-paradex"
 version = "0.0.1"
 dependencies = [
