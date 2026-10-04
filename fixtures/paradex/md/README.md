@@ -1,8 +1,8 @@
 # Paradex SBE market-data frames
 
-Hand-built, except one captured frame: each `.sbe.txt` file is one binary frame written as
-whitespace-separated hex bytes, one field per line, `#` to the end of a line a comment, and the
-one `.sbe` file is a frame's raw bytes. No account, order or fill frame and no account value is
+Hand-built, except two captured frames: each `.sbe.txt` file is one binary frame written as
+whitespace-separated hex bytes, one field per line, `#` to the end of a line a comment, and each
+`.sbe` file is a frame's raw bytes. No account, order or fill frame and no account value is
 here (0009).
 
 Layouts follow Paradex's published schema, `paradex_1_0.xml` in
@@ -30,6 +30,9 @@ that file describes for versions below 2.
 | `book15-delta-2001.sbe.txt` | A DELTA at seq 2001: one bid changed, one ask removed, one ask added below the 15th |
 | `book15-delta-2002.sbe.txt` | A DELTA at seq 2002: a new best bid, the worst bid removed |
 | `book15-delta-2003-empty.sbe.txt` | A DELTA at seq 2003 with no levels: the book unchanged, the sequence advanced |
+| `markets-summary-v0.sbe.txt` | `MarketSummaryEvent` (template 4) at schema version 0: a 216-byte root block, fundingRate only at 8 decimals |
+| `markets-summary-v1.sbe.txt` | The same values at schema version 1: a 240-byte root block, with `forwardRate`, `riskFreeRate` and `fundingRatePrecise` appended |
+| `eth-markets-summary-2026-09-23.sbe` | Captured, raw bytes, version 1: see below |
 
 The snapshot and the deltas at 1001, 1002 and 1003 are a continuous sequence; 1004 after 1002
 is a skipped seq_no, and 1001 or 1002 after 1002 a backwards one (`tests/md_book.rs`).
@@ -37,7 +40,14 @@ is a skipped seq_no, and 1001 or 1002 after 1002 a backwards one (`tests/md_book
 The `book15-` frames are a continuous depth-15 sequence whose book at seq 2002 is the REST
 snapshot `../rest/orderbook-btc-2002.json` (`tests/md_oracles.rs`).
 
-## The captured frame
+The two `markets-summary-` frames carry the same values, field for field, each in the layout
+its version describes (the schema's `sinceVersion="1"` fields are the three appended); the
+`fundingRate` both carry, 0.00001234, is `fundingRatePrecise`, 0.000012345678, cut to 8
+decimals. docs.paradex.trade ("Binary Encoding (SBE)", Schema versioning) names the two block
+lengths: "Version 1 of `MarketSummaryEvent` has a 240-byte root block; version 0 has 216"
+(`tests/md_summary.rs`).
+
+## The captured frames
 
 `btc-book-delta-2026-09-23.sbe` is one `BookEvent` DELTA for BTC-USD-PERP (seq_no 7678386728,
 ts 1790187959762000 us, one ask level at 84209.4 removed), received from Paradex's public
@@ -46,3 +56,10 @@ production WebSocket (`wss://ws.api.prod.paradex.trade/v1?sbeSchemaId=1&sbeSchem
 `ParadexSbeTranscoderTest` (branch `paradex-sbe`, `commons/paradex-common-api`). It is public
 market data: an order book level of a public channel, with no account, order or fill in it. The
 bytes here are that constant, unchanged.
+
+`eth-markets-summary-2026-09-23.sbe` is one `MarketSummaryEvent` for ETH-USD-PERP at schema
+version 1 (240-byte root block; mark 2662.8925496, fundingRatePrecise 0.000443605046, seq 0),
+received from the same WebSocket and URL on 2026-09-23 and kept as the
+`LIVE_MARKET_SUMMARY_ETH` hex constant of the same Java test. It is public market data, a
+market's ticker, with no account, order or fill in it. The bytes here are that constant,
+unchanged.
