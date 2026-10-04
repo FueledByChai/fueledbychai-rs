@@ -656,6 +656,9 @@ async fn an_interrupted_write_is_journaled_without_a_write_result() {
     );
 }
 
+/// The least a subscribe call for one subscription encodes to: its instrument id and feed tag.
+const SUB_ONE: usize = 5;
+
 /// A sink that refuses every record offered lazily without building it, keeping the payload
 /// size it was told, and keeps the kind of every record offered built.
 #[derive(Default)]
@@ -711,14 +714,14 @@ async fn inbound_frames_and_responses_are_offered_lazily_with_their_size() {
     let sink = sink.borrow();
     // The frame, the request it asked for (its URL; the toy's body and headers are empty) and
     // the response: its body and every header name and value (Codex r4178427394).
+    // The subscribe call comes first, offered with the bytes its one subscription encodes to
+    // (Codex r4178567381).
     let headers = "content-length".len() + "3".len() + "connection".len() + "close".len();
-    assert_eq!(sink.lazy, [get.len(), snap.len(), "say".len() + headers]);
-    assert!(
-        !sink
-            .built
-            .iter()
-            .any(|l| l.starts_with("in ") || l.starts_with("result "))
-    );
+    let lazy = [SUB_ONE, get.len(), snap.len(), "say".len() + headers];
+    assert_eq!(sink.lazy, lazy);
+    assert!(!sink.built.iter().any(|l| {
+        l.starts_with("in ") || l.starts_with("result ") || l.starts_with("subscribe ")
+    }));
 }
 
 /// Codex r4178287664: an input a credentialed session withholds leaves a gap the journal marks,
@@ -832,8 +835,10 @@ async fn http_requests_are_offered_lazily_with_their_size() {
     };
     let (run, ()) = tokio::join!(session.run(), script);
     run.unwrap();
-    // The inbound frame and the request: its URL and its one header (the toy's body is empty).
-    // The result is withheld unoffered, as the request carried a credential.
-    let header = "Authorization".len() + "toy-token".len();
-    assert_eq!(sizes.borrow().0, [get_len, url.len() + header]);
+    // The subscribe call, the inbound frame and the request: its URL and its one header's name
+    // (the toy's body is empty). The Authorization value is journaled as a fixed-size digest,
+    // so it does not count (Codex r4178567377). The result is withheld unoffered, as the
+    // request carried a credential.
+    let header = "Authorization".len();
+    assert_eq!(sizes.borrow().0, [SUB_ONE, get_len, url.len() + header]);
 }
