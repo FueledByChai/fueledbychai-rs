@@ -22,6 +22,8 @@ pub enum JournalError {
     BadMagic { segment: PathBuf },
     /// A segment is in a format version this reader does not know.
     UnsupportedVersion { segment: PathBuf, version: u16 },
+    /// A compressed segment's data cannot be decompressed (damaged, cut short, or not zstd).
+    Compressed { segment: PathBuf, error: io::Error },
     /// A segment ends inside its header or a record (a write cut short).
     Truncated { segment: PathBuf },
     /// A record's body cannot be read: `what` names the field.
@@ -56,6 +58,9 @@ impl fmt::Display for JournalError {
                 "{} is in journal format version {version}, which this reader does not know",
                 segment.display()
             ),
+            JournalError::Compressed { segment, error } => {
+                write!(f, "{} cannot be decompressed: {error}", segment.display())
+            }
             JournalError::Truncated { segment } => {
                 write!(f, "{} ends inside a record", segment.display())
             }
@@ -69,7 +74,7 @@ impl fmt::Display for JournalError {
 impl std::error::Error for JournalError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            JournalError::Io(e) => Some(e),
+            JournalError::Io(e) | JournalError::Compressed { error: e, .. } => Some(e),
             _ => None,
         }
     }

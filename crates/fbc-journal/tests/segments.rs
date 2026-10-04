@@ -83,7 +83,8 @@ fn a_clock_stepping_back_across_midnight_stays_in_the_later_day() {
     drop(w);
 
     assert_eq!(names(&root), ["20261003", "20261004"]);
-    assert_eq!(names(&root.join("20261003")), ["1-000000.fbcj"]);
+    // The first day's segment closed at midnight and was compressed (FBC-g67).
+    assert_eq!(names(&root.join("20261003")), ["1-000000.fbcj.zst"]);
     assert_eq!(names(&root.join("20261004")), ["1-000000.fbcj"]);
     let read: Vec<Record> = read_all(&root, 1).into_iter().map(Result::unwrap).collect();
     assert_eq!(read, [timer(1), timer(2), timer(3), timer(4)]);
@@ -109,9 +110,11 @@ fn a_writer_restarted_on_a_clock_behind_the_journal_stays_in_the_latest_day() {
     drop(second);
 
     assert_eq!(names(&root), ["20261004", "20261005"]);
+    // The restarted writer filed timer(2) under the first hour of the latest day; timer(3),
+    // at noon of that day, rolled that segment, which was compressed (FBC-g67).
     assert_eq!(
         names(&root.join("20261004")),
-        ["1-000000.fbcj", "1-000001.fbcj"]
+        ["1-000000.fbcj", "1-000001.fbcj.zst", "1-000002.fbcj"]
     );
     let read: Vec<Record> = read_all(&root, 1).into_iter().map(Result::unwrap).collect();
     assert_eq!(read, [timer(1), timer(2), timer(3)]);

@@ -1,5 +1,5 @@
 //! The segment writer: one subdirectory per UTC day under the consumer's directory, segments
-//! named `<shard>-<seq>`.
+//! named `<shard>-<seq>`, rolled at every UTC hour, each closed segment compressed with zstd.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
@@ -16,7 +16,21 @@ use crate::redact::RedactionKey;
 /// The extension of a segment file.
 pub const SEGMENT_EXT: &str = "fbcj";
 
+/// The extension a closed segment takes when it is compressed: `<shard>-<seq>.fbcj.zst`, one
+/// zstd frame, with a content checksum, holding the segment's bytes as they were written.
+pub const COMPRESSED_EXT: &str = "zst";
+
+/// The zstd level closed segments are compressed at: zstd's own default.
+const LEVEL: i32 = 3;
+
 const NANOS_PER_DAY: i64 = 86_400 * 1_000_000_000;
+const NANOS_PER_HOUR: i64 = 3_600 * 1_000_000_000;
+const HOURS_PER_DAY: i64 = 24;
+
+/// The UTC hour of `wall`, as hours since 1970-01-01T00:00Z.
+fn hour_of(wall: WallNs) -> i64 {
+    wall.0.div_euclid(NANOS_PER_HOUR)
+}
 
 /// The UTC day of `wall`, as days since 1970-01-01.
 pub(crate) fn day_of(wall: WallNs) -> i64 {
@@ -62,20 +76,37 @@ pub(crate) fn parse_day(name: &str) -> Option<i64> {
     (possible.contains(&day) && day_dir(day) == name).then_some(day)
 }
 
-/// The sequence number of `name` if it is a segment of `shard`.
-pub(crate) fn segment_seq(name: &str, shard: u16) -> Option<u32> {
+/// The sequence number of `name` if it is a segment of `shard`, and whether it is the
+/// compressed form (`.fbcj.zst`).
+pub(crate) fn segment_seq(name: &str, shard: u16) -> Option<(u32, bool)> {
+    let (name, compressed) = match name
+        .strip_suffix(COMPRESSED_EXT)
+        .and_then(|n| n.strip_suffix('.'))
+    {
+        Some(plain) => (plain, true),
+        None => (name, false),
+    };
     let stem = name.strip_suffix(SEGMENT_EXT)?.strip_suffix('.')?;
     let (owner, seq) = stem.split_once('-')?;
     if owner.parse::<u16>().ok()? != shard {
         return None;
     }
-    seq.parse().ok()
+    Some((seq.parse().ok()?, compressed))
 }
 
-/// One shard's segments under `root` in write order, with their days: the day directories
-/// (`YYYYMMDD`, [`parse_day`]) in date order, each day's segments in sequence order. Anything
-/// else is passed over.
-pub(crate) fn list_segments(root: &Path, shard: u16) -> io::Result<Vec<(i64, u32, PathBuf)>> {
+/// A segment found on disk.
+pub(crate) struct Listed {
+    pub(crate) day: i64,
+    pub(crate) compressed: bool,
+    pub(crate) path: PathBuf,
+}
+
+/// One shard's segments under `root` in write order: the day directories (`YYYYMMDD`,
+/// [`parse_day`]) in date order, each day's segments in sequence order. Anything else is
+/// passed over. A segment found both compressed and not (a writer stopped between writing the
+/// compressed form and removing the other) is listed once, compressed: the compressed form is
+/// complete before it takes its name.
+pub(crate) fn list_segments(root: &Path, shard: u16) -> io::Result<Vec<Listed>> {
     let mut found = Vec::new();
     for entry in fs::read_dir(root)? {
         let entry = entry?;
@@ -85,40 +116,89 @@ pub(crate) fn list_segments(root: &Path, shard: u16) -> io::Result<Vec<(i64, u32
         };
         for file in fs::read_dir(entry.path())? {
             let file = file?;
-            if let Some(seq) = file
+            if let Some((seq, compressed)) = file
                 .file_name()
                 .to_str()
                 .and_then(|n| segment_seq(n, shard))
             {
-                found.push((day, seq, file.path()));
+                found.push((day, seq, !compressed, file.path()));
             }
         }
     }
+    // The compressed form of a sequence number sorts first and is the one kept.
     found.sort();
-    Ok(found)
+    found.dedup_by(|later, kept| (later.0, later.1) == (kept.0, kept.1));
+    Ok(found
+        .into_iter()
+        .map(|(day, _, plain, path)| Listed {
+            day,
+            compressed: !plain,
+            path,
+        })
+        .collect())
+}
+
+/// Compresses the closed segment at `plain` into `<plain>.zst` and removes `plain`. The
+/// compressed form is written under a temporary name, synced, and renamed into place, so a
+/// segment named `.zst` is always whole; until the rename, `plain` is the segment.
+fn compress(plain: &Path) -> io::Result<()> {
+    let done = with_ext(plain, COMPRESSED_EXT);
+    let tmp = with_ext(&done, "tmp");
+    let written = File::create(&tmp).and_then(|out| {
+        let mut zst = zstd::stream::write::Encoder::new(out, LEVEL)?;
+        // The frame carries a checksum of its content, so a damaged segment fails to
+        // decompress rather than reading back as other records.
+        zst.include_checksum(true)?;
+        io::copy(&mut File::open(plain)?, &mut zst)?;
+        zst.finish()?.sync_all()?;
+        fs::rename(&tmp, &done)
+    });
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written?;
+    fs::remove_file(plain)
+}
+
+/// `path` with `.ext` appended to its name.
+fn with_ext(path: &Path, ext: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".");
+    name.push(ext);
+    PathBuf::from(name)
 }
 
 struct Segment {
-    day: i64,
+    /// The UTC hour the segment holds records of.
+    hour: i64,
+    path: PathBuf,
     file: BufWriter<File>,
 }
 
 /// Writes one shard's records into segments under a directory the consumer supplies.
 ///
 /// Time comes from the caller: [`append`](JournalWriter::append) takes the wall time it
-/// files the record under. A record whose UTC day is later than the open segment's starts a
-/// segment in that day's directory; one whose day is earlier (the wall clock stepped back
-/// across midnight) stays in the latest day written, so reading the days in order is reading
-/// in write order. That holds across restarts: a new writer starts from the latest day that
-/// holds one of the shard's segments, and a new segment takes the next sequence number after
-/// the shard's existing segments in its day, so a restarted writer never overwrites one.
+/// files the record under. A segment holds one UTC hour: a record whose hour is later than
+/// the open segment's closes it and starts a segment in that hour's day directory, so the
+/// segment rolls every hour and at every UTC day boundary (an hour with no record has no
+/// segment). A record whose hour is earlier (the wall clock stepped back) stays in the latest
+/// hour written, so reading the days in order is reading in write order. That holds across
+/// restarts: a new writer starts from the latest day that holds one of the shard's segments,
+/// and a new segment takes the next sequence number after the shard's existing segments in
+/// its day, so a restarted writer never overwrites one.
+///
+/// Each segment the writer closes is compressed with zstd into `<shard>-<seq>.fbcj.zst`
+/// ([`COMPRESSED_EXT`]) and the uncompressed file removed, on the thread that appends (the
+/// [`WriterThread`](crate::WriterThread), never the shard's). The open segment stays
+/// uncompressed, and so does the one a stopped writer left open. The reader reads both forms.
 pub struct JournalWriter {
     root: PathBuf,
     shard: u16,
     /// The key redaction spans are hashed under.
     key: Arc<RedactionKey>,
     open: Option<Segment>,
-    /// The latest day this shard has written to; no record is filed under an earlier one.
+    /// The latest UTC hour this shard has written to; no record is filed under an earlier
+    /// one. A restarted writer starts from the first hour of the latest day on disk.
     latest: Option<i64>,
     body: Vec<u8>,
 }
@@ -133,7 +213,9 @@ impl JournalWriter {
     ) -> Result<JournalWriter, JournalError> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
-        let latest = list_segments(&root, shard)?.pop().map(|(day, ..)| day);
+        let latest = list_segments(&root, shard)?
+            .pop()
+            .map(|s| s.day * HOURS_PER_DAY);
         Ok(JournalWriter {
             root,
             shard,
@@ -156,18 +238,21 @@ impl JournalWriter {
         written
     }
 
-    /// Writes a record body [`format::encode`] made, filed under the UTC day of `now`.
+    /// Writes a record body [`format::encode`] made, filed under the UTC hour of `now`. A
+    /// record of a later hour first closes and compresses the open segment; if that fails,
+    /// the record is not written, the closed segment stays as it is (uncompressed, and read
+    /// as such), and the next record starts a new segment.
     pub(crate) fn append_body(&mut self, now: WallNs, body: &[u8]) -> Result<(), JournalError> {
         let len = u32::try_from(body.len()).map_err(|_| JournalError::TooLarge)?;
-        let day = day_of(now).max(self.latest.unwrap_or(i64::MIN));
-        self.latest = Some(day);
+        let hour = hour_of(now).max(self.latest.unwrap_or(i64::MIN));
+        self.latest = Some(hour);
         let segment = match self.open.take() {
-            Some(open) if open.day == day => open,
+            Some(open) if open.hour == hour => open,
             open => {
-                if let Some(mut done) = open {
-                    done.file.flush()?;
+                if let Some(done) = open {
+                    close(done)?;
                 }
-                self.start(day)?
+                self.start(hour)?
             }
         };
         let file = &mut self.open.insert(segment).file;
@@ -188,27 +273,34 @@ impl JournalWriter {
         Ok(())
     }
 
-    /// Opens the next segment of this shard in `day`'s directory.
-    fn start(&self, day: i64) -> Result<Segment, JournalError> {
-        let dir = self.root.join(day_dir(day));
+    /// Opens the next segment of this shard, for `hour`, in its day's directory.
+    fn start(&self, hour: i64) -> Result<Segment, JournalError> {
+        let dir = self.root.join(day_dir(hour.div_euclid(HOURS_PER_DAY)));
         fs::create_dir_all(&dir)?;
         let mut next = 0;
         for entry in fs::read_dir(&dir)? {
             let name = entry?.file_name();
-            if let Some(seq) = name.to_str().and_then(|n| segment_seq(n, self.shard)) {
+            if let Some((seq, _)) = name.to_str().and_then(|n| segment_seq(n, self.shard)) {
                 next = next.max(seq.saturating_add(1));
             }
         }
-        let name = format!("{}-{next:06}.{SEGMENT_EXT}", self.shard);
+        let path = dir.join(format!("{}-{next:06}.{SEGMENT_EXT}", self.shard));
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(dir.join(name))?;
+            .open(&path)?;
         let mut file = BufWriter::new(file);
         file.write_all(&MAGIC)?;
         file.write_all(&VERSION.to_le_bytes())?;
-        Ok(Segment { day, file })
+        Ok(Segment { hour, path, file })
     }
+}
+
+/// Closes a segment: everything written to it reaches the file, which is then compressed.
+fn close(segment: Segment) -> Result<(), JournalError> {
+    let Segment { path, file, .. } = segment;
+    drop(file.into_inner().map_err(io::IntoInnerError::into_error)?);
+    Ok(compress(&path)?)
 }
 
 #[cfg(test)]
@@ -263,10 +355,15 @@ mod tests {
 
     #[test]
     fn only_this_shard_s_segments_are_counted() {
-        assert_eq!(segment_seq("2-000004.fbcj", 2), Some(4));
-        assert_eq!(segment_seq("2-4.fbcj", 2), Some(4));
+        assert_eq!(segment_seq("2-000004.fbcj", 2), Some((4, false)));
+        assert_eq!(segment_seq("2-4.fbcj", 2), Some((4, false)));
+        assert_eq!(segment_seq("2-000004.fbcj.zst", 2), Some((4, true)));
         assert_eq!(segment_seq("3-000004.fbcj", 2), None);
+        assert_eq!(segment_seq("3-000004.fbcj.zst", 2), None);
         assert_eq!(segment_seq("2-000004.zst", 2), None);
+        assert_eq!(segment_seq("2-000004.fbcjzst", 2), None);
+        assert_eq!(segment_seq("2-000004.fbcj.zst.tmp", 2), None);
+        assert_eq!(segment_seq("2-000004.fbcj.zst.zst", 2), None);
         assert_eq!(segment_seq("2-000004fbcj", 2), None);
         assert_eq!(segment_seq("2_000004.fbcj", 2), None);
         assert_eq!(segment_seq("x-000004.fbcj", 2), None);

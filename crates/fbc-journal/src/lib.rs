@@ -11,9 +11,10 @@
 //!   `Recovered`).
 //! - [`JournalWriter`], which writes one shard's records into a directory the consumer
 //!   supplies, one subdirectory per UTC day (`YYYYMMDD`), segments named
-//!   `<shard>-<seq>.fbcj`. Time comes from the caller.
+//!   `<shard>-<seq>.fbcj`, rolled at every UTC hour; each segment it closes is compressed with
+//!   zstd into `<shard>-<seq>.fbcj.zst` (decision 0025). Time comes from the caller.
 //! - [`JournalReader`], which returns one shard's records in write order across segments
-//!   and days.
+//!   and days, the closed compressed segments and the open uncompressed one alike.
 //! - [`JournalSink`], what the shard journals through, which never blocks (0006): a
 //!   [`QueueSink`] feeds a bounded queue with a soft limit for Normal records and a Safety
 //!   reserve, counts what it drops by class and marks the gap with `Degraded` once space
@@ -59,4 +60,4 @@ pub use redact::{RedactionKey, SpanDigest};
 pub use sink::{
     JournalDrain, JournalSink, QueueSink, Recorded, SinkConfig, WriterThread, journal_queue,
 };
-pub use writer::{JournalWriter, SEGMENT_EXT};
+pub use writer::{COMPRESSED_EXT, JournalWriter, SEGMENT_EXT};

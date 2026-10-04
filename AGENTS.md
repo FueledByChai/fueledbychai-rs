@@ -114,7 +114,7 @@ rather than guess.
   `Fee`/`FeeBook`, `DecodeScope`, `InstrumentSpec` (maker-safe `quantize`), `VenueCaps`,
   the market-data and execution events, venue commands, and the codec, signer, nonce and
   factory traits with `Effects` and `EncodeCtx`, `crates/fbc-book` with its L2 book, `crates/fbc-journal` with its record
-  format, day-grouped segment writer, in-order reader and never-blocking sink, `crates/fbc-runtime` with its first
+  format, day-grouped segment writer rolled hourly with zstd-compressed closed segments, in-order reader and never-blocking sink, `crates/fbc-runtime` with its first
   slices (the connector, SOCKS5 CONNECT, WebSocket and HTTP/1.1, plain or TLS, 0019 and 0020;
   connection epochs and the subscription reconciler; the market-data session, 0023), `crates/fbc-conformance` with its stub venue server (0025),
   `crates/venues/fbc-venue-paradex` with its signer (`src/sign`), SBE market data (`src/md`: bbo,
@@ -156,15 +156,16 @@ rather than guess.
     and canonical bytes; still planned: the ex-own projection, touch arbitration and
     continuity policies), `crates/fbc-oms` (order lattice, permits,
     pre-trade caps, `ExecutionPlanner`; 0005, 0013), `crates/fbc-journal` (0006; it depends on
-    `fbc-core`, and `hmac` and `sha2` for its keyed hashes, only: the records the runtime writes, length-prefixed in a hand-written
+    `fbc-core`, and `hmac` and `sha2` for its keyed hashes and `zstd` for its closed segments, only: the records the runtime writes, length-prefixed in a hand-written
     little-endian format with a version, a writer of one subdirectory per UTC day with segments
-    named `<shard>-<seq>.fbcj` and time from the caller, a reader in write order, and no byte of
+    named `<shard>-<seq>.fbcj` and time from the caller, rolled at every UTC hour, each closed
+    segment compressed into `<shard>-<seq>.fbcj.zst` (0025), a reader in write order of both forms, and no byte of
     a redaction span or secret header written but each as its HMAC-SHA-256 under the
     consumer's `RedactionKey` (`src/redact.rs`, 0024; signatures kept verbatim), and a
     `JournalSink` that never blocks: a hand-written queue of atomic words (0021) with a consumer-configured byte budget, a soft
     limit for Normal records and a Safety reserve, drops counted by class, a `Degraded` marker
     once space returns, and a writer thread draining it; still planned: the nonce,
-    encode-context and cycle records, and compression and the hourly roll), `crates/fbc-sim` (simulated venue and queue-position
+    encode-context and cycle records), `crates/fbc-sim` (simulated venue and queue-position
     fill-model code, never calibrations), `crates/fbc-conformance` (the adapter conformance kit,
     0025; it depends on `fbc-runtime`, and on `fbc-core` in its tests, never on a venue crate: so
     far a public stub venue server on 127.0.0.1 ephemeral ports, a WebSocket endpoint that plays

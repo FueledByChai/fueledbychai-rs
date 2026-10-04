@@ -1,4 +1,5 @@
-//! The reader: one shard's records in write order, across its segments and days.
+//! The reader: one shard's records in write order, across its segments and days, compressed
+//! and not.
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -9,31 +10,58 @@ use crate::JournalError;
 use crate::format::{self, MAGIC, VERSION};
 use crate::record::Record;
 use crate::redact::SpanDigest;
-use crate::writer::list_segments;
+use crate::writer::{Listed, list_segments};
 
 /// Reads one shard's records in the order they were written: the day directories in date
 /// order, each day's segments in sequence order, each segment from its start. Directories
-/// and files that are not this shard's segments are passed over.
+/// and files that are not this shard's segments are passed over. A closed segment is read
+/// through zstd (`.fbcj.zst`), the open one, or one a stopped writer left open, as written.
 ///
-/// An error in a segment (a bad header, a record cut short, a record that cannot be read)
-/// is returned once, and reading goes on with the next segment, since nothing after a
-/// damaged record in the same segment can be found again.
+/// An error in a segment (a bad header, a record cut short, a record that cannot be read,
+/// compressed data that cannot be decompressed or fails its checksum) is returned once, and
+/// reading goes on with the next segment, since nothing after a damaged record in the same
+/// segment can be found again. A compressed segment's checksum covers the whole segment and
+/// is checked at its end, so a mismatch is reported after the segment's records.
 ///
 /// As an iterator it returns records with their redaction spans blanked
 /// ([`Record::blanked`]); [`entries`](JournalReader::entries) returns each with the keyed
 /// hashes written in place of its spans.
 pub struct JournalReader {
-    segments: VecDeque<PathBuf>,
-    open: Option<(PathBuf, BufReader<File>)>,
+    segments: VecDeque<Listed>,
+    open: Option<Open>,
+}
+
+/// The segment being read.
+struct Open {
+    path: PathBuf,
+    compressed: bool,
+    file: Box<dyn Read + Send>,
+}
+
+impl Open {
+    /// Reads until `buf` is full or the segment ends; how many bytes were read.
+    fn read_full(&mut self, buf: &mut [u8]) -> Result<usize, JournalError> {
+        read_full(&mut self.file, buf).map_err(|e| self.failed(e))
+    }
+
+    /// The error a failed read of this segment is: one of a compressed segment is its
+    /// decompression failing, which names the segment.
+    fn failed(&self, error: io::Error) -> JournalError {
+        if self.compressed {
+            JournalError::Compressed {
+                segment: self.path.clone(),
+                error,
+            }
+        } else {
+            JournalError::Io(error)
+        }
+    }
 }
 
 impl JournalReader {
     /// A reader of `shard`'s segments under `root`, listed now.
     pub fn open(root: impl AsRef<Path>, shard: u16) -> Result<JournalReader, JournalError> {
-        let segments = list_segments(root.as_ref(), shard)?
-            .into_iter()
-            .map(|(.., path)| path)
-            .collect();
+        let segments = list_segments(root.as_ref(), shard)?.into_iter().collect();
         Ok(JournalReader {
             segments,
             open: None,
@@ -48,53 +76,72 @@ impl JournalReader {
     /// The next entry of the open segment, opening the next segment when there is none.
     /// `Ok(None)` when the open segment ended cleanly.
     fn next_in_segment(&mut self) -> Result<Option<Entry>, JournalError> {
-        let (path, file) = match &mut self.open {
+        let open = match &mut self.open {
             Some(open) => open,
             None => {
-                let path = self
+                let Listed {
+                    path, compressed, ..
+                } = self
                     .segments
                     .pop_front()
                     .expect("next checks for a segment");
-                let mut file = BufReader::new(File::open(&path)?);
+                let file = BufReader::new(File::open(&path)?);
+                let file: Box<dyn Read + Send> = if compressed {
+                    Box::new(zstd::stream::read::Decoder::with_buffer(file)?)
+                } else {
+                    Box::new(file)
+                };
+                let open = self.open.insert(Open {
+                    path,
+                    compressed,
+                    file,
+                });
                 let mut head = [0u8; 6];
-                if read_full(&mut file, &mut head)? < head.len() {
-                    return Err(JournalError::Truncated { segment: path });
+                if open.read_full(&mut head)? < head.len() {
+                    return Err(JournalError::Truncated {
+                        segment: open.path.clone(),
+                    });
                 }
                 if head[..4] != MAGIC {
-                    return Err(JournalError::BadMagic { segment: path });
+                    return Err(JournalError::BadMagic {
+                        segment: open.path.clone(),
+                    });
                 }
                 let version = u16::from_le_bytes([head[4], head[5]]);
                 if version != VERSION {
                     return Err(JournalError::UnsupportedVersion {
-                        segment: path,
+                        segment: open.path.clone(),
                         version,
                     });
                 }
-                self.open.insert((path, file))
+                open
             }
         };
         let mut len = [0u8; 4];
-        match read_full(file, &mut len)? {
+        match open.read_full(&mut len)? {
             0 => return Ok(None),
             4 => {}
             _ => {
                 return Err(JournalError::Truncated {
-                    segment: path.clone(),
+                    segment: open.path.clone(),
                 });
             }
         }
         let len = u32::from_le_bytes(len);
         let mut body = Vec::new();
-        file.take(u64::from(len)).read_to_end(&mut body)?;
+        (&mut open.file)
+            .take(u64::from(len))
+            .read_to_end(&mut body)
+            .map_err(|e| open.failed(e))?;
         if body.len() < len as usize {
             return Err(JournalError::Truncated {
-                segment: path.clone(),
+                segment: open.path.clone(),
             });
         }
         format::decode(&body)
             .map(|(record, digests)| Some(Entry { record, digests }))
             .map_err(|what| JournalError::Malformed {
-                segment: path.clone(),
+                segment: open.path.clone(),
                 what,
             })
     }
