@@ -19,16 +19,17 @@ The writer files each record under the UTC hour of the caller's time, clamped so
 goes back: a record of a later hour closes the open segment and starts the next one in that
 hour's day directory, so segments roll every hour and at every UTC day boundary, and an hour
 with no record has no segment. Each segment the writer closes is compressed, whole, into one
-zstd frame with a content checksum (so damage fails decompression rather than reading back as
-other records), named `<shard>-<seq>.fbcj.zst`: written under a temporary name, synced, renamed
-into place, then the uncompressed file removed, so a `.zst` segment is always complete and a
-segment found in both forms is read once, compressed. The open segment, and one a stopped
-writer left open, stay uncompressed; the reader reads both forms in order. A roll that
-cannot compress fails that append without writing the record, and leaves the closed segment
-uncompressed and readable. The crate is `zstd` `=0.13.3` (MIT), with zstd-safe 7.3.0 and
-zstd-sys 2.1.0+zstd.1.5.7 in the lockfile (both BSD-3-Clause; zstd-sys builds the bundled
-libzstd, BSD-3-Clause, through `cc`, adding jobserver and pkg-config, MIT OR Apache-2.0),
-default features off, pinned exactly in the workspace manifest, at zstd's
+zstd frame with a content checksum (so damage fails decompression rather than reading back
+as other records), named `<shard>-<seq>.fbcj.zst`: written under a temporary name, synced,
+renamed into place, the directory synced so the rename is durable, then the uncompressed
+file removed, so a `.zst` segment is always complete and a segment found in both forms is
+read once, compressed. The open segment, and one a stopped writer left open, stay
+uncompressed; the reader reads both forms in order. A roll that cannot compress fails that
+append without writing the record, and leaves the closed segment uncompressed and readable,
+and the writer stays in that segment's hour. The crate is `zstd` `=0.13.3` (MIT), with
+zstd-safe 7.3.0 and zstd-sys 2.1.0+zstd.1.5.7 in the lockfile (both BSD-3-Clause; zstd-sys
+builds the bundled libzstd, BSD-3-Clause, through `cc`, adding jobserver and pkg-config, MIT
+OR Apache-2.0), default features off, pinned exactly in the workspace manifest, at zstd's
 default level 3.
 
 ## Alternatives
