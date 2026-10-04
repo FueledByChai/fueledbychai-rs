@@ -31,15 +31,15 @@ use fbc_core::{
     DecodeScope, Effect, Effects, EncodeCtx, EncodeReceipt, Encoding, EndpointPlan, Envelope,
     ExchNs, ExchTsKind, ExecCaps, ExecCodec, ExecEndpoint, ExecEvent, ExecSink, Feed, FeedSource,
     FieldSpec, FillCaps, FillEvent, FillIdent, FillSource, FundingCaps, FundingSpec, HttpFailure,
-    HttpResponse, HttpTag, InstrumentId, InstrumentKind, InstrumentSpec, ItemRef, Keepalive,
-    KeepaliveKind, LimitScope, Liquidity3, Lots, Lvl, MatchingCaps, MdCaps, MdCodec, MdEvent,
-    MdSink, MdTransport, Money, MonoNs, Namespace, NamespaceLease, NewOrder, NonceBlock,
-    NonceScope, NotSentReason, OpKind, OrderCaps, OrderKind, OrderKindTag, OrderingKey, PriceGrid,
-    PxExact, RateCharge, RateLimit, RawFrame, Readiness, RpcCall, RpcId, SeqDomain, Side,
-    SignedLots, SizeStep, SnapshotSource, SpecTable, Stamp, StpScope, StreamId, SubmitOutcome,
-    Subscription, Support, TagSet, Ticks, TifTag, TimerTag, TouchSourceCaps, TouchSourceId,
-    TradeCaps, TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueCommand, VenueConfig,
-    VenueError, VenueFactory, VenueFeeSign, VenueId, VenueMeta, VenueOrderSnapshot,
+    HttpResponse, HttpTag, Inbound, InboundSpans, InstrumentId, InstrumentKind, InstrumentSpec,
+    ItemRef, Keepalive, KeepaliveKind, LimitScope, Liquidity3, Lots, Lvl, MatchingCaps, MdCaps,
+    MdCodec, MdEvent, MdSink, MdTransport, Money, MonoNs, Namespace, NamespaceLease, NewOrder,
+    NonceBlock, NonceScope, NotSentReason, OpKind, OrderCaps, OrderKind, OrderKindTag, OrderingKey,
+    PriceGrid, PxExact, RateCharge, RateLimit, RawFrame, Readiness, RpcCall, RpcId, SeqDomain,
+    Side, SignedLots, SizeStep, SnapshotSource, SpecTable, Stamp, StpScope, StreamId,
+    SubmitOutcome, Subscription, Support, TagSet, Ticks, TifTag, TimerTag, TouchSourceCaps,
+    TouchSourceId, TradeCaps, TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueCommand,
+    VenueConfig, VenueError, VenueFactory, VenueFeeSign, VenueId, VenueMeta, VenueOrderSnapshot,
     VenueOrderState, Via, WallNs, WireSlice, WireUrl, decode_cid, dispatch, encode_cid,
 };
 use rust_decimal::Decimal;
@@ -299,6 +299,10 @@ impl MdCodec for ToyMd {
             kind: KeepaliveKind::Frame(WireSlice::plain(b"ping".to_vec())),
             charge: CONTROL,
         })
+    }
+    /// Public market data: nothing to redact.
+    fn redact_inbound(&self, _input: Inbound<'_>) -> InboundSpans {
+        InboundSpans::NONE
     }
 }
 
@@ -561,6 +565,10 @@ impl ExecCodec for ToyExec {
             self.resync_at = Some(ctx.wall);
             ToyExec::ask_resync(ctx.wall, fx);
         }
+    }
+    /// The toy authenticates with no credential, so its frames carry none.
+    fn redact_inbound(&self, _input: Inbound<'_>) -> InboundSpans {
+        InboundSpans::NONE
     }
 }
 

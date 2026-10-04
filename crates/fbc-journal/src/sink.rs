@@ -473,6 +473,7 @@ mod tests {
             },
             opcode: Opcode::Binary,
             bytes: Opaque(vec![7; len]),
+            redact: Vec::new(),
         };
         let big = inbound(1 << 20);
         for class in [TrafficClass::Normal, TrafficClass::Safety] {
@@ -485,7 +486,7 @@ mod tests {
         // Codex r4176841165: with a gap open, a Normal record must leave room for the marker.
         // The queue is empty and the soft limit is 16 words; this record's entry is 14, so it
         // fits alone but not after the 5-word marker, and is dropped without being copied.
-        let mid = inbound(59);
+        let mid = inbound(55);
         let mut body = Vec::new();
         format::encode(&mid, &key(), &mut body).unwrap();
         assert_eq!(entry_words(body.len()), 14);

@@ -1,6 +1,8 @@
 //! FBC-ec9's done line: Nonce, EncodeCtx and Cycle records, written interleaved with the other
 //! kinds, read back equal and in write order; and a journal written before these kinds existed
 //! (format version 2, `fixtures/journal/v2`) still reads back unchanged (0006, 0014 item 1).
+//! So does a journal written in format version 3 (`fixtures/journal/v3`), before inbound
+//! redaction spans (FBC-7lm, decision 0028).
 //!
 //! Every secret here is synthetic, and each is assembled at run time so no credential-shaped
 //! literal sits in the source.
@@ -214,8 +216,23 @@ fn v2_records() -> Vec<(WallNs, Record)> {
     ]
 }
 
-fn fixture_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/journal/v2")
+/// What `fixtures/journal/v3` holds: the version 2 records with one decide cycle's records
+/// (its boundary, the nonces reserved, the encode's context and frame) after the second
+/// inbound frame, all written by the version 3 writer (its README says how).
+fn v3_records() -> Vec<(WallNs, Record)> {
+    let mut out = v2_records();
+    let at = out
+        .iter()
+        .position(|(_, r)| matches!(r, Record::Outbound { .. }))
+        .unwrap();
+    out.splice(at..at, cycle(1, &[500, 501]).into_iter().map(|r| (NOON, r)));
+    out
+}
+
+fn fixture_root(version: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/journal")
+        .join(version)
 }
 
 /// The format version in a segment's header.
@@ -226,22 +243,30 @@ fn version_of(segment: &[u8]) -> u16 {
 
 #[test]
 fn a_journal_written_before_these_kinds_existed_reads_back_unchanged() {
-    let root = fixture_root();
+    reads_back_unchanged("v2", 2, v2_records());
+}
+
+#[test]
+fn a_journal_written_before_inbound_redaction_spans_reads_back_unchanged() {
+    reads_back_unchanged("v3", 3, v3_records());
+}
+
+/// The fixture in `fixtures/journal/<dir>`, which the format `version` writer left (a closed,
+/// compressed segment and the open one), reads back as `written`, hashes included.
+fn reads_back_unchanged(dir: &str, version: u16, written: Vec<(WallNs, Record)>) {
+    let root = fixture_root(dir);
     let day = root.join("20261003");
-    // The fixture is what the version 2 writer left: a closed, compressed segment and the open
-    // one, both in version 2.
     let closed = zstd::decode_all(&fs::read(day.join("1-000000.fbcj.zst")).unwrap()[..]).unwrap();
     let open = fs::read(day.join("1-000001.fbcj")).unwrap();
-    assert_eq!(version_of(&closed), 2);
-    assert_eq!(version_of(&open), 2);
-    const { assert!(VERSION > 2) };
+    assert_eq!(version_of(&closed), version);
+    assert_eq!(version_of(&open), version);
+    assert!(VERSION > version);
 
     let entries: Vec<Entry> = JournalReader::open(&root, 1)
         .unwrap()
         .entries()
         .collect::<Result<_, _>>()
         .unwrap();
-    let written = v2_records();
     assert_eq!(entries.len(), written.len());
     let key = key();
     for (entry, (_, record)) in entries.iter().zip(&written) {

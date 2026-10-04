@@ -10,9 +10,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use fbc_core::{
     BookSide, ConfigError, DecodeError, DecodeScope, Effect, Effects, ExchNs, ExchTsKind, Feed,
-    HttpFailure, HttpResponse, HttpTag, InstrumentId, InstrumentSpec, Keepalive, Lots, Lvl,
-    MdCodec, MdEvent, MdSink, MonoNs, OpKind, PxExact, RateCharge, RawFrame, SpecTable, StreamId,
-    Subscription, Ticks, TimerTag, TrafficClass, VenueError, VenueMeta, WallNs, WireSlice,
+    HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans, InstrumentId, InstrumentSpec,
+    Keepalive, Lots, Lvl, MdCodec, MdEvent, MdSink, MonoNs, OpKind, PxExact, RateCharge, RawFrame,
+    SpecTable, StreamId, Subscription, Ticks, TimerTag, TrafficClass, VenueError, VenueMeta,
+    WallNs, WireSlice,
 };
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
@@ -438,5 +439,10 @@ impl MdCodec for BinanceUsdmMd {
     /// a pong; the codec sends nothing of its own.
     fn keepalive(&self) -> Option<Keepalive> {
         None
+    }
+
+    /// None: public market data, from public streams and the unauthenticated depth snapshot.
+    fn redact_inbound(&self, _input: Inbound<'_>) -> InboundSpans {
+        InboundSpans::NONE
     }
 }

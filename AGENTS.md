@@ -128,6 +128,8 @@ rather than guess.
     commands, the codec and factory traits, `DecodeScope` and `EncodeCtx` (0003, 0004).
     `VenueCaps` keeps order and fill capabilities together in `exec: Option<ExecCaps>`,
     `None` for a market-data-only venue, which declares no fill source or fee sign (0015).
+    Every codec names the credentials in what it receives (`redact_inbound`, `InboundSpans`;
+    0028) so the journal keeps them only as keyed hashes.
     `Lots` is built only through `Lots::new`, which refuses a negative count, and `Ticks`,
     `Lots` and `SignedLots` have checked arithmetic only (`checked_*` and `abs_lots` return
     `None` rather than wrap; no `+`, `-` or unary `-`), so overflow behaves the same in every
@@ -171,7 +173,9 @@ rather than guess.
     `JournalSink` that never blocks: a hand-written queue of atomic words (0021) with a consumer-configured byte budget, a soft
     limit for Normal records and a Safety reserve, drops counted by class, a `Degraded` marker
     once space returns, and a writer thread draining it; the nonce, encode-context and cycle
-    records arrived in format version 3, whose reader still reads version 2 journals), `crates/fbc-sim` (simulated venue and queue-position
+    records arrived in format version 3, and the keyed hashes of the credential spans a codec
+    names in inbound frames and responses (`redact_inbound`, 0028) in version 4, whose reader
+    still reads version 2 and 3 journals), `crates/fbc-sim` (simulated venue and queue-position
     fill-model code, never calibrations), `crates/fbc-conformance` (the adapter conformance kit,
     0025; it depends on `fbc-runtime`, and on `fbc-core` in its tests, never on a venue crate: so
     far a public stub venue server on 127.0.0.1 ephemeral ports, a WebSocket endpoint that plays

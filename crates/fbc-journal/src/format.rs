@@ -15,16 +15,23 @@
 //! for blanks.
 //!
 //! Version 3 (FBC-ec9) adds three kinds and changes none: `Nonce`, `EncodeCtx` and `Cycle`.
-//! The reader reads versions 2 and 3, so a journal written before these kinds existed reads
-//! back unchanged; a version 2 segment holding one of them is malformed. A reader of version 2
-//! refuses a version 3 segment at its header, rather than part way through.
+//! A version 2 segment holding one of them is malformed. A reader of version 2 refuses a
+//! version 3 segment at its header, rather than part way through.
+//!
+//! Version 4 (FBC-7lm, decision 0028) writes the credentials a codec named in inbound bytes as
+//! keyed hashes: an inbound frame's bytes and a response's body are written as a [`WireSlice`]
+//! is (their spans hashed, the rest verbatim), and a header is a flag byte (0 plain, 1 its
+//! value secret, 2 its name and value secret) then its name and its value, each secret one as
+//! its length and its hash. Versions 2 and 3 wrote a header's name before its flag, and an
+//! inbound frame's bytes and a response's body whole. The reader reads versions 2, 3 and 4, so
+//! a journal written before reads back unchanged.
 
 use core::ops::Range;
 
 use fbc_core::{
     BookId, ConnKey, EncodeCtx, Feed, HttpFailure, HttpMethod, HttpTag, InstrumentId, KernelRxNs,
     MonoNs, NonceBlock, NotSentReason, RpcId, Stamp, Subscription, TimerTag, TouchSourceId, WallNs,
-    WireSlice, WireUrl,
+    WireSlice, WireUrl, check_redactions,
 };
 
 use crate::JournalError;
@@ -38,8 +45,9 @@ use crate::redact::{DIGEST_LEN, RedactionKey, SpanDigest};
 pub const MAGIC: [u8; 4] = *b"FBCJ";
 /// The format version this crate writes. Version 1 (FBC-aen) wrote no hash for a span;
 /// version 2 writes each span's keyed hash (FBC-apz); version 3 adds the `Nonce`, `EncodeCtx`
-/// and `Cycle` kinds (FBC-ec9).
-pub const VERSION: u16 = 3;
+/// and `Cycle` kinds (FBC-ec9); version 4 hashes the spans a codec names in inbound frames,
+/// response bodies and response header names (FBC-7lm).
+pub const VERSION: u16 = 4;
 /// The oldest format version this crate reads: version 1 is refused (0024).
 pub const OLDEST_READABLE: u16 = 2;
 /// The most bytes one record may redact, its spans and secret header values together.
@@ -170,11 +178,11 @@ fn encode_body(
             stamp,
             opcode,
             bytes,
+            redact,
         } => {
             e.u8(INBOUND);
             e.stamp(stamp);
             e.u8(opcode_byte(*opcode));
-            e.u32(len32(bytes.0.len())?);
             // Checked before the payload is copied, and only for a payload that fits after
             // the fields before it: one that cannot is refused for its size, unscanned.
             if *opcode == Opcode::Text
@@ -183,8 +191,7 @@ fn encode_body(
             {
                 return Err(JournalError::Unencodable("a text frame that is not UTF-8"));
             }
-            e.put(&bytes.0);
-            e.within()?;
+            e.inbound_spanned(&bytes.0, redact)?;
         }
         Record::Outbound {
             at,
@@ -242,7 +249,7 @@ fn encode_body(
                     e.u8(0);
                     e.u16(resp.status);
                     e.headers(&resp.headers)?;
-                    e.bytes(&resp.body.0)?;
+                    e.inbound_spanned(&resp.body.0, &resp.body_redact)?;
                 }
                 Err(failure) => {
                     e.u8(1);
@@ -466,21 +473,53 @@ impl Enc<'_> {
         self.within()
     }
 
-    /// Headers: a secret one's value is written as its length and its keyed hash.
+    /// Inbound bytes with the spans a codec named in them, written as [`Enc::spanned`] writes
+    /// a [`WireSlice`]. The spans are checked first ([`check_redactions`]), since a record
+    /// built field by field may hold any; spans on bytes that cannot fit are refused for
+    /// their size, unscanned.
+    fn inbound_spanned(&mut self, bytes: &[u8], spans: &[Range<u32>]) -> Result<(), JournalError> {
+        if !spans.is_empty() {
+            if bytes.len() > self.room() {
+                self.over = true;
+                return Err(JournalError::TooLarge);
+            }
+            if check_redactions(bytes, spans).is_err() {
+                return Err(JournalError::Unencodable("inbound redaction spans"));
+            }
+        }
+        self.spanned(bytes, spans)
+    }
+
+    /// A secret header's name or value: its length and its keyed hash.
+    fn hashed(&mut self, v: &str) -> Result<(), JournalError> {
+        self.redact(v.len() as u64)?;
+        self.u32(len32(v.len())?);
+        let digest = self.key.digest(v.as_bytes());
+        self.put(&digest.0);
+        self.within()
+    }
+
+    /// Headers: each a flag byte (0 plain, 1 its value secret, 2 its name and value secret),
+    /// its name and its value, a secret one written as its length and its keyed hash.
     fn headers(&mut self, headers: &[HeaderRec]) -> Result<(), JournalError> {
         self.u32(len32(headers.len())?);
         for h in headers {
-            self.bytes(h.name.as_bytes())?;
-            if h.secret() {
-                self.redact(h.value.len() as u64)?;
-                self.u8(1);
-                self.u32(len32(h.value.len())?);
-                let digest = self.key.digest(h.value.as_bytes());
-                self.put(&digest.0);
-                self.within()?;
-            } else {
-                self.u8(0);
-                self.bytes(h.value.as_bytes())?;
+            match (h.redact_name, h.secret()) {
+                (true, _) => {
+                    self.u8(2);
+                    self.hashed(&h.name)?;
+                    self.hashed(&h.value)?;
+                }
+                (false, true) => {
+                    self.u8(1);
+                    self.bytes(h.name.as_bytes())?;
+                    self.hashed(&h.value)?;
+                }
+                (false, false) => {
+                    self.u8(0);
+                    self.bytes(h.name.as_bytes())?;
+                    self.bytes(h.value.as_bytes())?;
+                }
             }
         }
         Ok(())
@@ -530,6 +569,7 @@ pub(crate) fn decode_version(body: &[u8], version: u16) -> Result<(Record, Vec<S
         at: 0,
         blanked: 0,
         digests: Vec::new(),
+        version,
     };
     let kind = d.u8()?;
     if kind >= NONCE && version < 3 {
@@ -539,14 +579,16 @@ pub(crate) fn decode_version(body: &[u8], version: u16) -> Result<(Record, Vec<S
         INBOUND => {
             let stamp = d.stamp()?;
             let opcode = d.pick(&OPCODES, "opcode")?;
-            let bytes = d.bytes()?;
-            if opcode == Opcode::Text && core::str::from_utf8(bytes).is_err() {
+            let (bytes, redact) = d.inbound()?;
+            // Spans on character boundaries keep a blanked text frame UTF-8.
+            if opcode == Opcode::Text && core::str::from_utf8(&bytes).is_err() {
                 return Err("text frame");
             }
             Record::Inbound {
                 stamp,
                 opcode,
-                bytes: Opaque(bytes.to_vec()),
+                bytes: Opaque(bytes),
+                redact,
             }
         }
         OUTBOUND => Record::Outbound {
@@ -591,11 +633,16 @@ pub(crate) fn decode_version(body: &[u8], version: u16) -> Result<(Record, Vec<S
             stamp: d.stamp()?,
             tag: HttpTag(d.u64()?),
             result: match d.u8()? {
-                0 => Ok(HttpResponseRec {
-                    status: d.u16()?,
-                    headers: d.headers()?,
-                    body: Opaque(d.bytes()?.to_vec()),
-                }),
+                0 => {
+                    let (status, headers) = (d.u16()?, d.headers()?);
+                    let (body, body_redact) = d.inbound()?;
+                    Ok(HttpResponseRec {
+                        status,
+                        headers,
+                        body: Opaque(body),
+                        body_redact,
+                    })
+                }
                 1 => Err(d.pick(&FAILURES, "http failure")?),
                 _ => return Err("http result"),
             },
@@ -659,6 +706,8 @@ struct Dec<'a> {
     blanked: u64,
     /// The keyed hashes read so far, in record order.
     digests: Vec<SpanDigest>,
+    /// The segment's format version.
+    version: u16,
 }
 
 impl<'a> Dec<'a> {
@@ -783,24 +832,49 @@ impl<'a> Dec<'a> {
         Ok((out, spans))
     }
 
+    /// Inbound bytes: in version 4 written with their spans ([`Dec::spanned`]), before it
+    /// whole, with none.
+    fn inbound(&mut self) -> Result<(Vec<u8>, Vec<Range<u32>>), Bad> {
+        if self.version >= 4 {
+            self.spanned()
+        } else {
+            Ok((self.bytes()?.to_vec(), Vec::new()))
+        }
+    }
+
+    /// A secret header's name or value, written with [`Enc::hashed`]: blanks at its length.
+    fn hashed(&mut self) -> Result<String, Bad> {
+        let len = self.u32()?;
+        self.blank(u64::from(len))?;
+        self.digest()?;
+        Ok(String::from_utf8(vec![BLANK; len as usize]).expect("BLANK is ASCII"))
+    }
+
     fn headers(&mut self) -> Result<Vec<HeaderRec>, Bad> {
         let count = self.u32()?;
         let mut headers = Vec::new();
         for _ in 0..count {
-            let name = self.text()?;
-            let redact = self.flag("header flag")?;
-            let value = if redact {
-                let len = self.u32()?;
-                self.blank(u64::from(len))?;
-                self.digest()?;
-                String::from_utf8(vec![BLANK; len as usize]).expect("BLANK is ASCII")
+            // Version 4 puts the flag first and may hash the name; before it, the name came
+            // first and only a value was secret.
+            let (flag, name) = if self.version >= 4 {
+                match self.pick(&[0u8, 1, 2], "header flag")? {
+                    2 => (2, self.hashed()?),
+                    flag => (flag, self.text()?),
+                }
+            } else {
+                let name = self.text()?;
+                (u8::from(self.flag("header flag")?), name)
+            };
+            let value = if flag > 0 {
+                self.hashed()?
             } else {
                 self.text()?
             };
             headers.push(HeaderRec {
                 name,
                 value,
-                redact,
+                redact: flag > 0,
+                redact_name: flag == 2,
             });
         }
         Ok(headers)
@@ -882,6 +956,7 @@ mod tests {
                 stamp: stamp(),
                 opcode: Opcode::Text,
                 bytes: Opaque(big.clone()),
+                redact: Vec::new(),
             },
             Record::Outbound {
                 at: MonoNs(1),
@@ -896,6 +971,7 @@ mod tests {
                     status: 200,
                     headers: Vec::new(),
                     body: Opaque(big.clone()),
+                    body_redact: Vec::new(),
                 }),
             },
         ];
@@ -920,6 +996,7 @@ mod tests {
             stamp: stamp(),
             opcode: Opcode::Text,
             bytes: Opaque(vec![0xff; 1 << 20]),
+            redact: Vec::new(),
         };
         assert!(matches!(
             encode(&not_utf8, &key(), &mut body),
@@ -931,6 +1008,7 @@ mod tests {
             stamp: stamp(),
             opcode: Opcode::Text,
             bytes: Opaque(vec![0xff; 1 << 20]),
+            redact: Vec::new(),
         };
         assert!(matches!(
             encode_within(&not_utf8, &key(), &mut Vec::new(), 256),
@@ -944,6 +1022,7 @@ mod tests {
             stamp: stamp(),
             opcode: Opcode::Text,
             bytes: Opaque(bytes.to_vec()),
+            redact: Vec::new(),
         };
         assert_eq!(round_trip(&frame(b"ok")), frame(b"ok"));
         let mut body = Vec::new();
@@ -960,8 +1039,49 @@ mod tests {
             stamp: stamp(),
             opcode: Opcode::Binary,
             bytes: Opaque(vec![0xff]),
+            redact: Vec::new(),
         };
         assert_eq!(round_trip(&binary), binary);
+    }
+
+    #[test]
+    fn inbound_spans_are_hashed_and_bytes_that_cannot_fit_are_refused_unscanned() {
+        let frame = |opcode, bytes: &[u8], redact| Record::Inbound {
+            stamp: stamp(),
+            opcode,
+            bytes: Opaque(bytes.to_vec()),
+            redact,
+        };
+        // A text frame's span on whole characters reads back blanked and still UTF-8.
+        let text = frame(Opcode::Text, "kéy=é|".as_bytes(), vec![1..3, 5..7]);
+        let mut body = Vec::new();
+        encode(&text, &key(), &mut body).unwrap();
+        let (back, digests) = decode(&body).unwrap();
+        assert_eq!(back, text.blanked());
+        assert_eq!(digests, text.digests(&key()));
+        assert_eq!(digests, [key().digest("é".as_bytes()); 2]);
+        // A frame with spans that cannot fit is refused for its size before its spans are
+        // checked (these would be refused as damaged), and leaves the body as it was.
+        let big = frame(
+            Opcode::Binary,
+            &[1; 512],
+            std::iter::once(600..700).collect(),
+        );
+        let mut body = vec![9];
+        let refused = encode_within(&big, &key(), &mut body, 256);
+        assert!(matches!(refused, Err(JournalError::TooLarge)));
+        assert_eq!(body, [9]);
+        // A text frame whose blanked bytes are not UTF-8 is refused by the reader.
+        let mut body = Vec::new();
+        encode(
+            &frame(Opcode::Text, b"ab", std::iter::once(0..1).collect()),
+            &key(),
+            &mut body,
+        )
+        .unwrap();
+        let at = body.len() - 1;
+        body[at] = 0xff;
+        assert_eq!(decode(&body), Err("text frame"));
     }
 
     #[test]
@@ -1148,6 +1268,7 @@ mod tests {
             name: "Cookie".into(),
             value: "c".repeat(MAX_REDACTED as usize),
             redact: false,
+            redact_name: false,
         }];
         let result = |headers: Vec<HeaderRec>| Record::HttpResult {
             stamp: stamp(),
@@ -1156,6 +1277,7 @@ mod tests {
                 status: 200,
                 headers,
                 body: Opaque(Vec::new()),
+                body_redact: Vec::new(),
             }),
         };
         assert_eq!(
@@ -1166,6 +1288,7 @@ mod tests {
             name: "X-Key".into(),
             value: "k".into(),
             redact: true,
+            redact_name: false,
         });
         assert!(matches!(
             encode(&result(headers), &key(), &mut body),
@@ -1253,19 +1376,22 @@ mod tests {
         // A span over the whole of a u32::MAX-byte frame, in a record of a few bytes.
         let huge = outbound_with(&words(&[u32::MAX, 1, 0, u32::MAX]));
         assert_eq!(decode(&huge), Err("redacted length"));
-        // A secret response header claiming a u32::MAX-byte value.
-        let header = [
-            &[HTTP_RESULT][..],
-            &[0; 31], // a stamp with no kernel time
-            &[0; 8],
-            &[0, 200, 0],
-            &words(&[1, 1]),
-            b"a",
-            &[1],
-            &words(&[u32::MAX]),
-        ]
-        .concat();
-        assert_eq!(decode(&header), Err("redacted length"));
+        // A secret response header claiming a u32::MAX-byte value: in version 4 its flag
+        // comes first, and a secret name may claim it too; before, the name came first.
+        let head = [&[HTTP_RESULT][..], &[0; 31], &[0; 8], &[0, 200, 0]].concat();
+        let result_with = |tail: &[u8]| [&head[..], &words(&[1]), tail].concat();
+        let value = result_with(&[&[1][..], &words(&[1]), b"a", &words(&[u32::MAX])].concat());
+        assert_eq!(decode(&value), Err("redacted length"));
+        let name = result_with(&[&[2][..], &words(&[u32::MAX])].concat());
+        assert_eq!(decode(&name), Err("redacted length"));
+        let old = result_with(&[&words(&[1]), &b"a"[..], &[1], &words(&[u32::MAX])].concat());
+        assert_eq!(decode_version(&old, 3), Err("redacted length"));
+        // A version 4 inbound frame or response body is spanned: a span over u32::MAX bytes.
+        let span = words(&[u32::MAX, 1, 0, u32::MAX]);
+        let frame = [&[INBOUND][..], &[0; 31], &[0], &span].concat();
+        assert_eq!(decode(&frame), Err("redacted length"));
+        let body = [&head[..], &words(&[0]), &span].concat();
+        assert_eq!(decode(&body), Err("redacted length"));
     }
 
     /// An HTTP request body from its method on.
@@ -1282,12 +1408,20 @@ mod tests {
         assert_eq!(decode(&request_with(&split)), Err("url text"));
         // An unknown method.
         assert_eq!(decode(&request_with(&[9])), Err("method"));
-        // A header name that is not UTF-8, and a header flag that is neither 0 nor 1.
+        // A header name that is not UTF-8, and a header flag that is not 0, 1 or 2 (version
+        // 4, flag first) or not 0 or 1 (before, after the name).
         let url = [&[0][..], &words(&[0, 0])].concat();
-        let bad_name = [&url[..], &words(&[1, 1]), &[0xff]].concat();
+        let bad_name = [&url[..], &words(&[1]), &[0], &words(&[1]), &[0xff]].concat();
         assert_eq!(decode(&request_with(&bad_name)), Err("text"));
-        let bad_flag = [&url[..], &words(&[1, 1]), b"a", &[2]].concat();
+        let bad_flag = [&url[..], &words(&[1]), &[3]].concat();
         assert_eq!(decode(&request_with(&bad_flag)), Err("header flag"));
+        let old_name = [&url[..], &words(&[1, 1]), &[0xff]].concat();
+        assert_eq!(decode_version(&request_with(&old_name), 3), Err("text"));
+        let old_flag = [&url[..], &words(&[1, 1]), b"a", &[2]].concat();
+        assert_eq!(
+            decode_version(&request_with(&old_flag), 3),
+            Err("header flag")
+        );
     }
 
     #[test]
@@ -1308,11 +1442,13 @@ mod tests {
                 name: "x-long".into(),
                 value: "v".repeat(64),
                 redact: false,
+                redact_name: false,
             },
             HeaderRec {
                 name: "x-secret".into(),
                 value: "s".repeat(10),
                 redact: true,
+                redact_name: false,
             },
         ];
         assert!(matches!(e.headers(&headers), Err(JournalError::TooLarge)));
@@ -1365,6 +1501,7 @@ mod tests {
             stamp: stamp(),
             opcode: Opcode::Text,
             bytes: Opaque(payload),
+            redact: Vec::new(),
         };
         assert!(matches!(
             encode_within(&record, &key(), &mut Vec::new(), 64),

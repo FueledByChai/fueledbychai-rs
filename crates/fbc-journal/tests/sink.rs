@@ -403,6 +403,7 @@ fn a_record_the_queue_or_the_format_cannot_hold_is_dropped_and_counted() {
         },
         opcode: Opcode::Binary,
         bytes: Opaque(vec![7; 300]),
+        redact: Vec::new(),
     };
     let not_utf8 = Record::Inbound {
         stamp: match timer(1) {
@@ -411,6 +412,7 @@ fn a_record_the_queue_or_the_format_cannot_hold_is_dropped_and_counted() {
         },
         opcode: Opcode::Text,
         bytes: Opaque(vec![0xff]),
+        redact: Vec::new(),
     };
     assert_eq!(
         sink.record(TrafficClass::Safety, NOW, &big),
@@ -531,6 +533,7 @@ fn the_smallest_configuration_accepted_can_close_a_gap() {
         stamp,
         opcode: Opcode::Binary,
         bytes: Opaque(vec![1; 100]),
+        redact: Vec::new(),
     };
     assert_eq!(
         sink.record(TrafficClass::Normal, NOW, &too_big),

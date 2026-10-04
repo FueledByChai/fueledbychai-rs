@@ -13,9 +13,9 @@ use std::time::Duration;
 use common::{BTC, CONFIG, ETH, SOL, config, specs};
 use fbc_core::{
     BookId, Cadence, ConfigError, ConfigScope, ConnTopology, Continuity, Effect, Effects, Encoding,
-    ExchTsKind, Feed, FeedSource, FieldUnit, LimitScope, MdTransport, OpKind, QueueModelQuality,
-    RateLimit, Readiness, SeqDomain, StpScope, StreamId, Subscription, TagSet, TouchSourceId,
-    TrafficClass, VenueConfig, VenueError, VenueFactory,
+    ExchTsKind, Feed, FeedSource, FieldUnit, Inbound, InboundSpans, LimitScope, MdTransport,
+    OpKind, QueueModelQuality, RateLimit, RawFrame, Readiness, SeqDomain, StpScope, StreamId,
+    Subscription, TagSet, TouchSourceId, TrafficClass, VenueConfig, VenueError, VenueFactory,
 };
 use fbc_venue_binance_usdm::{
     BOOK_DIFF, BOOK_PARTIAL, BinanceUsdm, KEY_DEPTH_LEVELS, KEY_DEPTH_SPEED, KEY_REST_BASE_URL,
@@ -333,6 +333,9 @@ fn plan_md_puts_two_instruments_touch_and_depth_on_one_endpoint_subscribed_in_on
     );
     assert!(frame.redactions().is_empty());
     assert_eq!(codec.keepalive(), None);
+    // Public market data: nothing inbound to redact.
+    let frame = Inbound::Frame(RawFrame::Text("{}"));
+    assert_eq!(codec.redact_inbound(frame), InboundSpans::NONE);
 
     // An unsubscribe is its own frame under the next request id; nothing to send sends nothing.
     codec

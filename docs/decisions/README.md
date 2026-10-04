@@ -30,3 +30,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0025](0025-conformance-fault-scripts-are-typed-rust-values-played-by-a-.md) Conformance fault scripts are typed Rust values played by a public stub server; a text script format is deferred — accepted
 - [0026](0026-journal-segments-roll-every-utc-hour-and-each-closed-segment.md) Journal segments roll every UTC hour and each closed segment is compressed with zstd 0.13.3 pinned, the bundled libzstd at level 3 — accepted
 - [0027](0027-a-codec-s-http-request-runs-beside-its-session-with-its-time.md) A codec's HTTP request runs beside its session with its timeout and comes back only to the epoch that asked; a venue's plan is applied by stream — accepted
+- [0028](0028-codecs-name-the-credentials-in-inbound-frames-and-http-respo.md) Codecs name the credentials in inbound frames and HTTP responses, and the journal hashes them in format version 4, augmenting 0014 — accepted

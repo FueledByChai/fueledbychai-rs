@@ -22,10 +22,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use fbc_core::{
     Aggressor, BookId, DecodeError, DecodeScope, Effect, Effects, ExchNs, ExchTsKind, Feed,
-    HttpFailure, HttpResponse, HttpTag, InstrumentId, InstrumentSpec, Keepalive, Lots, Lvl,
-    MdCodec, MdEvent, MdSink, MonoNs, OpKind, PxExact, RateCharge, RawFrame, SpecTable, StreamId,
-    Subscription, Ticks, TimerTag, TouchSourceId, TrafficClass, VenueError, VenueMeta, WallNs,
-    WireSlice,
+    HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans, InstrumentId, InstrumentSpec,
+    Keepalive, Lots, Lvl, MdCodec, MdEvent, MdSink, MonoNs, OpKind, PxExact, RateCharge, RawFrame,
+    SpecTable, StreamId, Subscription, Ticks, TimerTag, TouchSourceId, TrafficClass, VenueError,
+    VenueMeta, WallNs, WireSlice,
 };
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
@@ -301,6 +301,11 @@ impl MdCodec for ParadexMd {
     /// (docs.paradex.trade, WebSocket "Introduction", ping/pong).
     fn keepalive(&self) -> Option<Keepalive> {
         None
+    }
+
+    /// None: public market data, from public channels and the unauthenticated `/orderbook`.
+    fn redact_inbound(&self, _input: Inbound<'_>) -> InboundSpans {
+        InboundSpans::NONE
     }
 }
 

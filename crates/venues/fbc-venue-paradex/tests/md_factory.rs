@@ -8,8 +8,9 @@ use std::time::Duration;
 
 use fbc_core::{
     ConfigError, ConnTopology, Effect, Effects, Encoding, Feed, FeedSource, HttpFailure, HttpTag,
-    LimitScope, MdCodec, MdTransport, MonoNs, OpKind, RateCharge, StreamId, Subscription, TagSet,
-    TimerTag, TrafficClass, VenueConfig, VenueError, VenueFactory, WallNs, dispatch_market_data,
+    Inbound, InboundSpans, LimitScope, MdCodec, MdTransport, MonoNs, OpKind, RateCharge, RawFrame,
+    StreamId, Subscription, TagSet, TimerTag, TrafficClass, VenueConfig, VenueError, VenueFactory,
+    WallNs, dispatch_market_data,
 };
 use fbc_venue_paradex::ParadexFactory;
 use fbc_venue_paradex::factory::{MD_STREAM, MD_URL, caps};
@@ -189,6 +190,9 @@ fn the_codec_needs_no_keepalive_timer_or_http() {
         codec.keepalive().is_none(),
         "the server pings; pongs are the socket's"
     );
+    // Public market data: nothing inbound to redact.
+    let frame = Inbound::Frame(RawFrame::Binary(&[1, 2]));
+    assert_eq!(codec.redact_inbound(frame), InboundSpans::NONE);
     let (mut sink, mut fx) = (Collect::default(), Effects::new());
     codec.on_timer(TimerTag(1), MonoNs(0), WallNs(0), &mut sink, &mut fx);
     let specs = specs();
