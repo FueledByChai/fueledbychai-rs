@@ -12,7 +12,8 @@
 //! the whole budget, the part above the soft limit being the Safety reserve. A record that
 //! does not fit is dropped and counted by class, and [`record`](JournalSink::record) says so:
 //! the caller proceeds either way. A record the format cannot hold, or one larger than the
-//! budget, is dropped and counted the same way.
+//! room its class has left, is dropped and counted the same way, and its payload is not
+//! copied: encoding stops where the room ends.
 //!
 //! **The gap.** The sink numbers the records offered to it from 0. The first drop opens a gap;
 //! it closes once space returns, that is when a record arrives and the `Degraded` marker and
@@ -50,7 +51,9 @@ pub struct SinkConfig {
     /// counted with their 16-byte header and their body rounded up to whole words.
     pub budget_bytes: usize,
     /// The share of the budget, in percent, Normal records may fill. The rest is the Safety
-    /// reserve.
+    /// reserve. [`journal_queue`] refuses a soft limit that cannot hold a `Degraded` marker and
+    /// the smallest record together (a gap could never close) and a reserve that cannot hold
+    /// the smallest record.
     pub soft_limit_pct: u8,
 }
 
@@ -76,13 +79,26 @@ pub trait JournalSink {
 /// empties it with.
 pub fn journal_queue(config: SinkConfig) -> Result<(QueueSink, JournalDrain), JournalError> {
     let cap = config.budget_bytes / WORD;
-    if cap == 0 {
-        return Err(JournalError::Config("a journal queue budget under 8 bytes"));
-    }
-    if config.soft_limit_pct > 100 {
-        return Err(JournalError::Config("a soft limit over 100% of the budget"));
-    }
     let soft = (cap as u128 * u128::from(config.soft_limit_pct) / 100) as usize;
+    let marker = entry_words_of(&Record::Marker(Marker::Degraded {
+        from_seq: 0,
+        dropped: 0,
+    }));
+    let smallest = entry_words_of(&Record::Marker(Marker::Recovered));
+    // A gap closes only when a marker and a record fit under the soft limit together.
+    if soft < marker + smallest {
+        return Err(JournalError::Config(
+            "a soft limit too small to hold a Degraded marker and a record",
+        ));
+    }
+    if cap
+        .checked_sub(soft)
+        .is_none_or(|reserve| reserve < smallest)
+    {
+        return Err(JournalError::Config(
+            "a Safety reserve too small to hold a record",
+        ));
+    }
     let ring = Arc::new(Ring {
         words: (0..cap).map(|_| AtomicU64::new(0)).collect(),
         head: AtomicU64::new(0),
@@ -121,6 +137,13 @@ struct Ring {
 /// The words an entry with a body of `len` bytes takes.
 fn entry_words(len: usize) -> usize {
     HEADER_WORDS + len.div_ceil(WORD)
+}
+
+/// The words a small fixed record's entry takes.
+fn entry_words_of(record: &Record) -> usize {
+    let mut body = Vec::new();
+    format::encode(record, &mut body).expect("a marker always encodes");
+    entry_words(body.len())
 }
 
 impl Ring {
@@ -231,8 +254,16 @@ impl JournalSink for QueueSink {
         let seq = self.next_seq;
         self.next_seq += 1;
         self.body.clear();
-        // A record the format refuses needs more room than any queue has.
-        let need = format::encode(record, &mut self.body)
+        let used = self.ring.used();
+        // A body too long for the room its class has left is refused before it is copied; a
+        // record refused, for that or by the format, needs more room than any queue has.
+        let room = match class {
+            TrafficClass::Normal => self.soft,
+            TrafficClass::Safety => self.ring.words.len(),
+        }
+        .saturating_sub(used);
+        let limit = room.saturating_sub(HEADER_WORDS) * WORD;
+        let need = format::encode_within(record, &mut self.body, limit)
             .map_or(usize::MAX, |()| entry_words(self.body.len()));
         let marker = self.gap.as_ref().map_or(0, |gap| {
             self.marker.clear();
@@ -243,7 +274,6 @@ impl JournalSink for QueueSink {
             format::encode(&degraded, &mut self.marker).expect("a marker always encodes");
             entry_words(self.marker.len())
         });
-        let used = self.ring.used();
         if fits(used, marker.saturating_add(need), self.soft) {
             if self.gap.take().is_some() {
                 self.ring.push(now, &self.marker);
@@ -336,5 +366,40 @@ impl WriterThread {
         self.handle
             .join()
             .expect("the journal writer thread panicked")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Opaque, Opcode};
+    use fbc_core::{ConnKey, MonoNs, Stamp};
+
+    #[test]
+    fn a_record_too_large_for_the_room_left_is_not_copied() {
+        // Codex r4176799800: dropping a large frame must not copy it on the shard thread.
+        let (mut sink, _drain) = journal_queue(SinkConfig {
+            budget_bytes: 256,
+            soft_limit_pct: 50,
+        })
+        .unwrap();
+        let big = Record::Inbound {
+            stamp: Stamp {
+                ingest_seq: 0,
+                kernel_rx: None,
+                recv_mono: MonoNs(0),
+                recv_wall: WallNs(0),
+                conn: ConnKey { conn: 1, epoch: 1 },
+            },
+            opcode: Opcode::Binary,
+            bytes: Opaque(vec![7; 1 << 20]),
+        };
+        for class in [TrafficClass::Normal, TrafficClass::Safety] {
+            assert_eq!(
+                sink.record(class, WallNs(0), &big),
+                Recorded::DroppedCounted
+            );
+            assert!(sink.body.capacity() <= 512, "{}", sink.body.capacity());
+        }
     }
 }

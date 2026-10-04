@@ -342,9 +342,19 @@ fn a_writer_that_cannot_write_reports_it_and_the_sink_keeps_counting() {
 
 #[test]
 fn a_configuration_the_queue_cannot_use_is_refused() {
+    const SOFT: &str = "a soft limit too small to hold a Degraded marker and a record";
+    const RESERVE: &str = "a Safety reserve too small to hold a record";
     for (budget_bytes, soft_limit_pct, why) in [
-        (7, 85, "a journal queue budget under 8 bytes"),
-        (4096, 101, "a soft limit over 100% of the budget"),
+        (7, 85, SOFT),
+        (4096, 0, SOFT),
+        // Codex r4176799797: six words of soft limit, and a marker and the smallest record
+        // need eight, so a gap could never close.
+        (64, 85, SOFT),
+        // Codex r4176799793: no reserve at all.
+        (4096, 100, RESERVE),
+        (4096, 101, RESERVE),
+        // A reserve of one word holds no record.
+        (800, 99, RESERVE),
     ] {
         let err = journal_queue(SinkConfig {
             budget_bytes,
@@ -362,4 +372,44 @@ fn a_configuration_the_queue_cannot_use_is_refused() {
         );
         assert!(err.source().is_none());
     }
+}
+
+#[test]
+fn the_smallest_configuration_accepted_can_close_a_gap() {
+    // Eight words of soft limit: a Degraded marker (five) and the smallest record (three).
+    let root = fresh_dir("sink_smallest");
+    let (mut sink, drain) = journal_queue(SinkConfig {
+        budget_bytes: 88,
+        soft_limit_pct: 73,
+    })
+    .unwrap();
+    let stamp = match timer(0) {
+        Record::Timer { stamp, .. } => stamp,
+        _ => unreachable!(),
+    };
+    let too_big = Record::Inbound {
+        stamp,
+        opcode: Opcode::Binary,
+        bytes: Opaque(vec![1; 100]),
+    };
+    assert_eq!(
+        sink.record(TrafficClass::Normal, NOW, &too_big),
+        Recorded::DroppedCounted
+    );
+    let small = Record::Marker(Marker::Recovered);
+    assert_eq!(sink.record(TrafficClass::Normal, NOW, &small), Recorded::Ok);
+    let writer = drain
+        .spawn(JournalWriter::create(&root, 1).unwrap())
+        .unwrap();
+    writer.close().unwrap();
+    assert_eq!(
+        read_all(&root, 1),
+        [
+            Record::Marker(Marker::Degraded {
+                from_seq: 0,
+                dropped: 1
+            }),
+            small
+        ]
+    );
 }
