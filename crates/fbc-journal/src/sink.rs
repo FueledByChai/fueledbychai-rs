@@ -254,17 +254,6 @@ impl JournalSink for QueueSink {
         let seq = self.next_seq;
         self.next_seq += 1;
         self.body.clear();
-        let used = self.ring.used();
-        // A body too long for the room its class has left is refused before it is copied; a
-        // record refused, for that or by the format, needs more room than any queue has.
-        let room = match class {
-            TrafficClass::Normal => self.soft,
-            TrafficClass::Safety => self.ring.words.len(),
-        }
-        .saturating_sub(used);
-        let limit = room.saturating_sub(HEADER_WORDS) * WORD;
-        let need = format::encode_within(record, &mut self.body, limit)
-            .map_or(usize::MAX, |()| entry_words(self.body.len()));
         let marker = self.gap.as_ref().map_or(0, |gap| {
             self.marker.clear();
             let degraded = Record::Marker(Marker::Degraded {
@@ -274,6 +263,18 @@ impl JournalSink for QueueSink {
             format::encode(&degraded, &mut self.marker).expect("a marker always encodes");
             entry_words(self.marker.len())
         });
+        let used = self.ring.used();
+        // A body too long for the room its class has left is refused before it is copied: a
+        // Normal record has the soft limit less an open gap's marker, a Safety record the
+        // whole budget. A record refused, for that or by the format, fits nowhere.
+        let room = match class {
+            TrafficClass::Normal => self.soft.saturating_sub(marker),
+            TrafficClass::Safety => self.ring.words.len(),
+        }
+        .saturating_sub(used);
+        let limit = room.saturating_sub(HEADER_WORDS) * WORD;
+        let need = format::encode_within(record, &mut self.body, limit)
+            .map_or(usize::MAX, |()| entry_words(self.body.len()));
         if fits(used, marker.saturating_add(need), self.soft) {
             if self.gap.take().is_some() {
                 self.ring.push(now, &self.marker);
@@ -383,7 +384,7 @@ mod tests {
             soft_limit_pct: 50,
         })
         .unwrap();
-        let big = Record::Inbound {
+        let inbound = |len: usize| Record::Inbound {
             stamp: Stamp {
                 ingest_seq: 0,
                 kernel_rx: None,
@@ -392,8 +393,9 @@ mod tests {
                 conn: ConnKey { conn: 1, epoch: 1 },
             },
             opcode: Opcode::Binary,
-            bytes: Opaque(vec![7; 1 << 20]),
+            bytes: Opaque(vec![7; len]),
         };
+        let big = inbound(1 << 20);
         for class in [TrafficClass::Normal, TrafficClass::Safety] {
             assert_eq!(
                 sink.record(class, WallNs(0), &big),
@@ -401,5 +403,21 @@ mod tests {
             );
             assert!(sink.body.capacity() <= 512, "{}", sink.body.capacity());
         }
+        // Codex r4176841165: with a gap open, a Normal record must leave room for the marker.
+        // The queue is empty and the soft limit is 16 words; this record's entry is 14, so it
+        // fits alone but not after the 5-word marker, and is dropped without being copied.
+        let mid = inbound(59);
+        let mut body = Vec::new();
+        format::encode(&mid, &mut body).unwrap();
+        assert_eq!(entry_words(body.len()), 14);
+        assert_eq!(
+            sink.record(TrafficClass::Normal, WallNs(0), &mid),
+            Recorded::DroppedCounted
+        );
+        assert!(
+            sink.body.capacity() < body.len(),
+            "{}",
+            sink.body.capacity()
+        );
     }
 }
