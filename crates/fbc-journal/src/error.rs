@@ -12,6 +12,9 @@ pub enum JournalError {
     /// A record or one of its fields is longer than the format's `u32` length, or a record
     /// redacts more than [`MAX_REDACTED`](crate::format::MAX_REDACTED) bytes.
     TooLarge,
+    /// A record the format cannot hold as it is (`what` says why), such as a text frame that
+    /// is not UTF-8.
+    Unencodable(&'static str),
     /// A segment does not start with the journal's magic bytes.
     BadMagic { segment: PathBuf },
     /// A segment is in a format version this reader does not know.
@@ -36,6 +39,9 @@ impl fmt::Display for JournalError {
         match self {
             JournalError::Io(e) => write!(f, "journal i/o: {e}"),
             JournalError::TooLarge => f.write_str("a journal record is too large for its format"),
+            JournalError::Unencodable(what) => {
+                write!(f, "a journal record cannot be written: {what}")
+            }
             JournalError::BadMagic { segment } => {
                 write!(f, "{} is not a journal segment", segment.display())
             }

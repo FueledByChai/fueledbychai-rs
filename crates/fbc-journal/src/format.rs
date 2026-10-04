@@ -116,6 +116,9 @@ pub(crate) fn encode(record: &Record, out: &mut Vec<u8>) -> Result<(), JournalEr
             opcode,
             bytes,
         } => {
+            if *opcode == Opcode::Text && core::str::from_utf8(&bytes.0).is_err() {
+                return Err(JournalError::Unencodable("a text frame that is not UTF-8"));
+            }
             e.u8(INBOUND);
             e.stamp(stamp);
             e.u8(opcode_byte(*opcode));
@@ -168,15 +171,9 @@ pub(crate) fn encode(record: &Record, out: &mut Vec<u8>) -> Result<(), JournalEr
             e.headers(&req.headers)?;
             e.spanned(req.body.bytes(), req.body.redactions())?;
         }
-        Record::HttpResult {
-            at,
-            conn,
-            tag,
-            result,
-        } => {
+        Record::HttpResult { stamp, tag, result } => {
             e.u8(HTTP_RESULT);
-            e.u64(at.0);
-            e.conn(*conn);
+            e.stamp(stamp);
             e.u64(tag.0);
             match result {
                 Ok(resp) => {
@@ -191,10 +188,9 @@ pub(crate) fn encode(record: &Record, out: &mut Vec<u8>) -> Result<(), JournalEr
                 }
             }
         }
-        Record::Timer { fired, conn, tag } => {
+        Record::Timer { stamp, tag } => {
             e.u8(TIMER);
-            e.u64(fired.0);
-            e.conn(*conn);
+            e.stamp(stamp);
             e.u64(tag.0);
         }
         Record::Control { at, ev } => {
@@ -374,11 +370,19 @@ pub(crate) fn decode(body: &[u8]) -> Result<Record, Bad> {
         blanked: 0,
     };
     let record = match d.u8()? {
-        INBOUND => Record::Inbound {
-            stamp: d.stamp()?,
-            opcode: d.pick(&OPCODES, "opcode")?,
-            bytes: Opaque(d.bytes()?.to_vec()),
-        },
+        INBOUND => {
+            let stamp = d.stamp()?;
+            let opcode = d.pick(&OPCODES, "opcode")?;
+            let bytes = d.bytes()?;
+            if opcode == Opcode::Text && core::str::from_utf8(bytes).is_err() {
+                return Err("text frame");
+            }
+            Record::Inbound {
+                stamp,
+                opcode,
+                bytes: Opaque(bytes.to_vec()),
+            }
+        }
         OUTBOUND => Record::Outbound {
             at: MonoNs(d.u64()?),
             conn: d.conn()?,
@@ -418,8 +422,7 @@ pub(crate) fn decode(body: &[u8]) -> Result<Record, Bad> {
             },
         },
         HTTP_RESULT => Record::HttpResult {
-            at: MonoNs(d.u64()?),
-            conn: d.conn()?,
+            stamp: d.stamp()?,
             tag: HttpTag(d.u64()?),
             result: match d.u8()? {
                 0 => Ok(HttpResponseRec {
@@ -432,8 +435,7 @@ pub(crate) fn decode(body: &[u8]) -> Result<Record, Bad> {
             },
         },
         TIMER => Record::Timer {
-            fired: MonoNs(d.u64()?),
-            conn: d.conn()?,
+            stamp: d.stamp()?,
             tag: TimerTag(d.u64()?),
         },
         CONTROL => Record::Control {
@@ -644,6 +646,42 @@ mod tests {
         ConnKey { conn: 1, epoch: 2 }
     }
 
+    fn stamp() -> Stamp {
+        Stamp {
+            ingest_seq: 5,
+            kernel_rx: None,
+            recv_mono: MonoNs(6),
+            recv_wall: WallNs(7),
+            conn: conn(),
+        }
+    }
+
+    #[test]
+    fn a_text_frame_must_be_utf8() {
+        let frame = |bytes: &[u8]| Record::Inbound {
+            stamp: stamp(),
+            opcode: Opcode::Text,
+            bytes: Opaque(bytes.to_vec()),
+        };
+        assert_eq!(round_trip(&frame(b"ok")), frame(b"ok"));
+        let mut body = Vec::new();
+        assert!(matches!(
+            encode(&frame(&[0xff]), &mut body),
+            Err(JournalError::Unencodable("a text frame that is not UTF-8"))
+        ));
+        // A damaged segment that labels other bytes as text.
+        encode(&frame(b"x"), &mut body).unwrap();
+        *body.last_mut().unwrap() = 0xff;
+        assert_eq!(decode(&body), Err("text frame"));
+        // Binary frames are any bytes.
+        let binary = Record::Inbound {
+            stamp: stamp(),
+            opcode: Opcode::Binary,
+            bytes: Opaque(vec![0xff]),
+        };
+        assert_eq!(round_trip(&binary), binary);
+    }
+
     #[test]
     fn every_table_value_has_its_own_byte_and_round_trips() {
         for (i, v) in OPCODES.iter().enumerate() {
@@ -655,8 +693,7 @@ mod tests {
         for (i, v) in FAILURES.iter().enumerate() {
             assert_eq!(usize::from(failure_byte(*v)), i);
             let r = Record::HttpResult {
-                at: MonoNs(1),
-                conn: conn(),
+                stamp: stamp(),
                 tag: HttpTag(1),
                 result: Err(*v),
             };
@@ -766,11 +803,11 @@ mod tests {
                 "write result",
             ),
             (
-                [&[HTTP_RESULT][..], &[0; 8], &[0; 6], &[0; 8], &[2]].concat(),
+                [&[HTTP_RESULT][..], &[0; 31], &[0; 8], &[2]].concat(),
                 "http result",
             ),
             (
-                [&[HTTP_RESULT][..], &[0; 8], &[0; 6], &[0; 8], &[1, 3]].concat(),
+                [&[HTTP_RESULT][..], &[0; 31], &[0; 8], &[1, 3]].concat(),
                 "http failure",
             ),
             ([&[CONTROL][..], &[0; 8], &[3]].concat(), "control event"),
@@ -831,8 +868,7 @@ mod tests {
             redact: false,
         }];
         let result = |headers: Vec<HeaderRec>| Record::HttpResult {
-            at: MonoNs(1),
-            conn: conn(),
+            stamp: stamp(),
             tag: HttpTag(1),
             result: Ok(HttpResponseRec {
                 status: 200,
@@ -863,8 +899,7 @@ mod tests {
         // A secret response header claiming a u32::MAX-byte value.
         let header = [
             &[HTTP_RESULT][..],
-            &[0; 8],
-            &[0; 6],
+            &[0; 31], // a stamp with no kernel time
             &[0; 8],
             &[0, 200, 0],
             &words(&[1, 1]),

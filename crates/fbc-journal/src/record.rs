@@ -257,19 +257,18 @@ pub enum Record {
         rpc: Option<RpcId>,
         req: HttpRequestRec,
     },
-    /// An HTTP request's response with its headers, or why none came.
+    /// An HTTP request's response with its headers, or why none came. `stamp` is the one the
+    /// runtime gave the events the codec pushed for it: its ingest sequence, when the result
+    /// came (both clocks), and the connection epoch whose codec asked.
     HttpResult {
-        at: MonoNs,
-        conn: ConnKey,
+        stamp: Stamp,
         tag: HttpTag,
         result: Result<HttpResponseRec, HttpFailure>,
     },
-    /// A codec's timer fired.
-    Timer {
-        fired: MonoNs,
-        conn: ConnKey,
-        tag: TimerTag,
-    },
+    /// A codec's timer fired. `stamp` is the one the runtime gave the events the codec pushed
+    /// for it: its ingest sequence, the `now` and `wall` the codec's `on_timer` was called
+    /// with, and the connection epoch whose codec set the timer.
+    Timer { stamp: Stamp, tag: TimerTag },
     /// A connection change or a subscription call.
     Control { at: MonoNs, ev: ControlEvent },
     /// A marker.
@@ -319,14 +318,8 @@ impl Record {
                 rpc: *rpc,
                 req: req.blanked(),
             },
-            Record::HttpResult {
-                at,
-                conn,
-                tag,
-                result,
-            } => Record::HttpResult {
-                at: *at,
-                conn: *conn,
+            Record::HttpResult { stamp, tag, result } => Record::HttpResult {
+                stamp: *stamp,
                 tag: *tag,
                 result: result
                     .as_ref()
