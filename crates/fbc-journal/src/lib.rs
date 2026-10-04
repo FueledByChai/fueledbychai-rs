@@ -12,7 +12,7 @@
 //! - [`JournalWriter`], which writes one shard's records into a directory the consumer
 //!   supplies, one subdirectory per UTC day (`YYYYMMDD`), segments named
 //!   `<shard>-<seq>.fbcj`, rolled at every UTC hour; each segment it closes is compressed with
-//!   zstd into `<shard>-<seq>.fbcj.zst` (decision 0025). Time comes from the caller.
+//!   zstd into `<shard>-<seq>.fbcj.zst` (decision 0026). Time comes from the caller.
 //! - [`JournalReader`], which returns one shard's records in write order across segments
 //!   and days, the closed compressed segments and the open uncompressed one alike.
 //! - [`JournalSink`], what the shard journals through, which never blocks (0006): a

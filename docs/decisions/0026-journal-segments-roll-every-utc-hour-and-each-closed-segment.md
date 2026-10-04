@@ -1,4 +1,4 @@
-# 0025 — Journal segments roll every UTC hour and each closed segment is compressed with zstd 0.13.3 pinned, the bundled libzstd at level 3
+# 0026 — Journal segments roll every UTC hour and each closed segment is compressed with zstd 0.13.3 pinned, the bundled libzstd at level 3
 
 Status: accepted
 Date: 2026-10-04
