@@ -16,7 +16,7 @@
 //!
 //! One call is outstanding at a time; a change made meanwhile goes in the call that follows it,
 //! whether the outstanding call was sent or refused. A call settles only on the reconciler that
-//! made it, and only while it is the outstanding one.
+//! made it, and only in the epoch it was made for.
 //! A new epoch ([`Reconciler::begin_epoch`]) starts with nothing subscribed, and once it opens
 //! ([`Reconciler::opened`]) it subscribes the desired set exactly once. Until then every
 //! desired subscription waits, pending. Every call yielded must be settled: an unsettled call
@@ -26,8 +26,13 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use fbc_core::{ConnKey, Subscription};
+use fbc_core::Subscription;
+
+/// The next reconciler's origin: every reconciler in the process has its own, so a call made
+/// by one is never taken for another's.
+static NEXT_ORIGIN: AtomicU64 = AtomicU64::new(0);
 
 /// The subscriptions to add and to remove on the current epoch's connection: the difference
 /// between the desired set and the active one. Settle it with [`Reconciler::sent`] or
@@ -35,10 +40,9 @@ use fbc_core::{ConnKey, Subscription};
 #[derive(Eq, PartialEq, Debug)]
 #[must_use = "a subscribe call holds back its epoch until it is settled"]
 pub struct SubscribeCall {
-    conn: u16,
+    /// The reconciler that made it.
+    origin: u64,
     epoch: u32,
-    /// Which of its reconciler's calls this is, so only the outstanding one settles.
-    seq: u64,
     add: Vec<Subscription>,
     remove: Vec<Subscription>,
 }
@@ -70,10 +74,8 @@ pub enum ReconcileError {
     NotNewer { current: u32, given: u32 },
     /// [`Reconciler::opened`] named an epoch other than the current one.
     NotCurrent { current: u32, given: u32 },
-    /// A call made by another stream's reconciler.
-    OtherStream { stream: u16, call: u16 },
-    /// A call that is not this reconciler's outstanding one.
-    NotOutstanding,
+    /// A call made by another reconciler.
+    ForeignCall,
 }
 
 impl fmt::Display for ReconcileError {
@@ -93,12 +95,8 @@ impl fmt::Display for ReconcileError {
                     "epoch {given} opened, but the current epoch is {current}"
                 )
             }
-            ReconcileError::OtherStream { stream, call } => write!(
-                f,
-                "a subscribe call of connection {call} was settled on connection {stream}"
-            ),
-            ReconcileError::NotOutstanding => {
-                f.write_str("a subscribe call that is not outstanding was settled")
+            ReconcileError::ForeignCall => {
+                f.write_str("a subscribe call made by another reconciler was settled here")
             }
         }
     }
@@ -107,18 +105,16 @@ impl fmt::Display for ReconcileError {
 impl std::error::Error for ReconcileError {}
 
 /// The subscription state of one stream: what the consumer wants, and what the current epoch
-/// has subscribed.
-#[derive(Clone, Eq, PartialEq, Debug)]
+/// has subscribed. It is not `Clone`: a copy would share its origin, and so its calls.
+#[derive(Debug)]
 pub struct Reconciler {
-    conn: u16,
+    origin: u64,
     epoch: u32,
     open: bool,
     desired: BTreeSet<Subscription>,
     active: BTreeSet<Subscription>,
-    /// The outstanding call's `seq`.
-    in_flight: Option<u64>,
-    /// The `seq` the next call takes.
-    next_seq: u64,
+    /// A call of the current epoch is outstanding.
+    in_flight: bool,
     /// The desired set changed while the outstanding call was out.
     changed: bool,
     /// A refused call waits for a retry, a change or an epoch.
@@ -126,17 +122,15 @@ pub struct Reconciler {
 }
 
 impl Reconciler {
-    /// The stream of connection `key.conn`, at epoch `key.epoch`, not yet open, wanting
-    /// nothing. Its calls settle only on it.
-    pub fn new(key: ConnKey) -> Reconciler {
+    /// A stream at `epoch`, not yet open, wanting nothing. Its calls settle only on it.
+    pub fn new(epoch: u32) -> Reconciler {
         Reconciler {
-            conn: key.conn,
-            epoch: key.epoch,
+            origin: NEXT_ORIGIN.fetch_add(1, Ordering::Relaxed),
+            epoch,
             open: false,
             desired: BTreeSet::new(),
             active: BTreeSet::new(),
-            in_flight: None,
-            next_seq: 0,
+            in_flight: false,
             changed: false,
             held: false,
         }
@@ -171,7 +165,7 @@ impl Reconciler {
         subs: impl IntoIterator<Item = Subscription>,
     ) -> Option<SubscribeCall> {
         let desired: BTreeSet<_> = subs.into_iter().collect();
-        if self.in_flight.is_some() && desired != self.desired {
+        if self.in_flight && desired != self.desired {
             self.changed = true;
         }
         self.desired = desired;
@@ -197,7 +191,7 @@ impl Reconciler {
         self.epoch = epoch;
         self.open = false;
         self.active.clear();
-        self.in_flight = None;
+        self.in_flight = false;
         self.changed = false;
         self.held = false;
         Ok(())
@@ -240,24 +234,20 @@ impl Reconciler {
     }
 
     /// End the outstanding call, if `call` is it, and say whether the desired set changed
-    /// while it was out.
+    /// while it was out. A call of this reconciler and of the current epoch is the outstanding
+    /// one: an epoch has one call out at a time, a call cannot be copied, and settling it
+    /// consumes it.
     fn settle(&mut self, call: &SubscribeCall) -> Result<bool, ReconcileError> {
-        if call.conn != self.conn {
-            return Err(ReconcileError::OtherStream {
-                stream: self.conn,
-                call: call.conn,
-            });
+        if call.origin != self.origin {
+            return Err(ReconcileError::ForeignCall);
         }
-        if call.epoch < self.epoch {
+        if call.epoch != self.epoch {
             return Err(ReconcileError::StaleCall {
                 call: call.epoch,
                 current: self.epoch,
             });
         }
-        if call.epoch != self.epoch || self.in_flight != Some(call.seq) {
-            return Err(ReconcileError::NotOutstanding);
-        }
-        self.in_flight = None;
+        self.in_flight = false;
         Ok(std::mem::take(&mut self.changed))
     }
 
@@ -265,7 +255,7 @@ impl Reconciler {
     /// the epoch is open, no call is outstanding, no refusal waits for a retry, and there is
     /// one.
     fn next_call(&mut self) -> Option<SubscribeCall> {
-        if !self.open || self.in_flight.is_some() || self.held {
+        if !self.open || self.in_flight || self.held {
             return None;
         }
         let add: Vec<_> = self.desired.difference(&self.active).copied().collect();
@@ -273,13 +263,10 @@ impl Reconciler {
         if add.is_empty() && remove.is_empty() {
             return None;
         }
-        let seq = self.next_seq;
-        self.next_seq = seq.wrapping_add(1);
-        self.in_flight = Some(seq);
+        self.in_flight = true;
         Some(SubscribeCall {
-            conn: self.conn,
+            origin: self.origin,
             epoch: self.epoch,
-            seq,
             add,
             remove,
         })
@@ -289,7 +276,7 @@ impl Reconciler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fbc_core::{BookId, ConnKey, Feed, InstrumentId};
+    use fbc_core::{BookId, Feed, InstrumentId};
 
     fn sub(inst: u32) -> Subscription {
         Subscription {
@@ -308,9 +295,13 @@ mod tests {
         (call.epoch(), insts(call.add()), insts(call.remove()))
     }
 
-    /// The reconciler of connection 0, at `epoch`.
     fn at(epoch: u32) -> Reconciler {
-        Reconciler::new(ConnKey { conn: 0, epoch })
+        Reconciler::new(epoch)
+    }
+
+    /// Everything a reconciler holds, to show that a refused settlement changed none of it.
+    fn state(rec: &Reconciler) -> String {
+        format!("{rec:?}")
     }
 
     fn open_at(epoch: u32) -> Reconciler {
@@ -459,7 +450,7 @@ mod tests {
         let mut rec = open_at(0);
         let old = rec.set_desired(set(&[1])).unwrap();
         rec.begin_epoch(1).unwrap();
-        let before = rec.clone();
+        let before = state(&rec);
         assert_eq!(
             rec.sent(old),
             Err(ReconcileError::StaleCall {
@@ -467,7 +458,7 @@ mod tests {
                 current: 1
             })
         );
-        assert_eq!(rec, before);
+        assert_eq!(state(&rec), before);
         let call = rec.opened(1).unwrap().expect("the desired set");
         assert_eq!(shape(&call), (1, vec![1], vec![]));
 
@@ -543,48 +534,26 @@ mod tests {
     }
 
     #[test]
-    fn a_call_settles_only_on_the_stream_that_made_it() {
-        let mut a = Reconciler::new(ConnKey { conn: 1, epoch: 0 });
-        let mut b = Reconciler::new(ConnKey { conn: 2, epoch: 0 });
-        a.opened(0).unwrap();
-        b.opened(0).unwrap();
-        let from_a = a.set_desired(set(&[1])).unwrap();
-        let from_b = b.set_desired(set(&[2])).unwrap();
-        let (a_before, b_before) = (a.clone(), b.clone());
-        assert_eq!(
-            b.sent(from_a),
-            Err(ReconcileError::OtherStream { stream: 2, call: 1 })
-        );
-        assert_eq!(b, b_before);
-        let err = a.refused(from_b).unwrap_err();
-        assert_eq!(err, ReconcileError::OtherStream { stream: 1, call: 2 });
-        assert_eq!(
-            err.to_string(),
-            "a subscribe call of connection 2 was settled on connection 1"
-        );
-        assert_eq!(a, a_before);
-    }
-
-    #[test]
-    fn a_call_that_is_not_outstanding_is_refused_and_changes_nothing() {
-        // Two reconcilers misconfigured onto one connection: neither settles the other's call.
+    fn a_call_settles_only_on_the_reconciler_that_made_it() {
+        // Two reconcilers at the same epoch, each with its first call out: the calls agree on
+        // everything but the reconciler that made them.
         let mut a = open_at(0);
         let mut b = open_at(0);
         let from_a = a.set_desired(set(&[1])).unwrap();
-        let b_idle = b.clone();
-        assert_eq!(b.sent(from_a), Err(ReconcileError::NotOutstanding));
-        assert_eq!(b, b_idle, "b had no call outstanding");
-
-        let first_b = b.set_desired(set(&[2])).unwrap();
-        assert_eq!(b.sent(first_b), Ok(None));
-        let second_b = b.set_desired(set(&[])).unwrap();
-        let a_waiting = a.clone();
-        let err = a.refused(second_b).unwrap_err();
-        assert_eq!(err, ReconcileError::NotOutstanding);
+        let from_b = b.set_desired(set(&[2])).unwrap();
+        let (a_before, b_before) = (state(&a), state(&b));
+        let err = b.sent(from_a).unwrap_err();
+        assert_eq!(err, ReconcileError::ForeignCall);
         assert_eq!(
             err.to_string(),
-            "a subscribe call that is not outstanding was settled"
+            "a subscribe call made by another reconciler was settled here"
         );
-        assert_eq!(a, a_waiting, "a's own call is still the outstanding one");
+        assert_eq!(state(&b), b_before);
+        // b still settles its own call, and its refusal is refused on a.
+        assert_eq!(b.sent(from_b), Ok(None));
+        assert_eq!(b.active(), &set(&[2]).into_iter().collect());
+        let from_b = b.set_desired(set(&[])).unwrap();
+        assert_eq!(a.refused(from_b), Err(ReconcileError::ForeignCall));
+        assert_eq!(state(&a), a_before);
     }
 }
