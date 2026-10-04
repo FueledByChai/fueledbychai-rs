@@ -116,9 +116,11 @@ rather than guess.
   factory traits with `Effects` and `EncodeCtx`, `crates/fbc-book` with its L2 book, `crates/fbc-journal` with its record
   format, day-grouped segment writer, in-order reader and never-blocking sink, `crates/fbc-runtime` with its first
   slices (the connector, SOCKS5 CONNECT, WebSocket and HTTP/1.1, plain or TLS, 0019 and 0020;
-  connection epochs and the subscription reconciler; the market-data session, 0023), and
+  connection epochs and the subscription reconciler; the market-data session, 0023),
   `crates/venues/fbc-venue-paradex` with its signer (`src/sign`), SBE market data (`src/md`: bbo,
-  trades and the order book) and its factory (`src/factory.rs`, market data only); the rest are planned. Members are the `crates/fbc-*` and
+  trades and the order book) and its factory (`src/factory.rs`, market data only),
+  and `crates/venues/fbc-venue-binance-usdm` with its market-data-only factory and codec; the
+  rest are planned. Members are the `crates/fbc-*` and
   `crates/venues/fbc-*` globs, and `fixtures/` is excluded from the workspace:
   - `crates/fbc-core`: the contract. Time, units, price grids and exact prices, sealed ids and
     the canonical client-id codec, `Fee`/`FeeBook`, `InstrumentSpec`, `VenueCaps`, events,
@@ -166,7 +168,10 @@ rather than guess.
     fill-model code, never calibrations), `crates/fbc-conformance` (adapter conformance kit and
     stub venue server).
   - `crates/venues/fbc-venues` (the registry, the only crate that sees concrete venues),
-    `crates/venues/fbc-venue-binance-usdm` (market data only), `crates/venues/fbc-venue-paradex`
+    `crates/venues/fbc-venue-binance-usdm` (market data only:
+    `exec: None` caps citing Binance's USD-M pages, `plan_md` on the `/public` combined-stream
+    endpoint, live SUBSCRIBE/UNSUBSCRIBE, `bookTicker` touches and partial-depth snapshots;
+    the diff-depth book is FBC-tfb's), `crates/venues/fbc-venue-paradex`
     (so far its signer: the SNIP-12 revision 0 hash and Stark-curve signature, tested against
     `fixtures/paradex/signing/paradex-vectors.tsv`; and market data: an SBE reader gated on each
     frame's block lengths, bbo and trades decoded into touches and trades, the order book
@@ -185,7 +190,8 @@ rather than guess.
   the signing benchmark and the Java hash oracle the Paradex signer is checked against;
   recorded Paradex frames go elsewhere under `fixtures/paradex/`; `fixtures/paradex/md/` holds
   SBE frames hand-built from Paradex's published schema, and one captured public book frame
-  whose provenance its README gives.
+  whose provenance its README gives. `fixtures/binance-usdm/` holds hand-written frames in
+  Binance's documented shapes, its README citing the pages.
   `fixtures/licence-gate/` is a standalone two-crate workspace the licence gate's self-test
   runs against (0017).
 - Docs: `docs/decisions/` (records, index in its `README.md`; cite by number, never restate one
