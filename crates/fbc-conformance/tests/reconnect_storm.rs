@@ -62,6 +62,8 @@ async fn a_session_rides_out_the_340_reconnect_storm_subscribed_once_per_epoch_a
         connector: Connector::new(ProxyConfig::Direct),
         pacing,
         clock: IngestClock::new(),
+        // The toy asks for no HTTP here; any bound would do.
+        http_max_body: 64 * 1024,
         conn: CONN,
     };
     let (mut session, control) =
