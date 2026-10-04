@@ -35,7 +35,7 @@ pub use caps::{
     FundingCaps, LimitScope, MatchingCaps, MdCaps, NonceScope, OpKind, OrderCaps, OrderKindTag,
     OrderingKey, QueueModelQuality, RateCharge, RateLimit, Readiness, RefKind, SeqDomain,
     SnapshotSource, SpeedBump, SpeedBumpScope, StpScope, Support, TagSet, TifTag, TouchSourceCaps,
-    TradeCaps, VenueCaps,
+    TradeCaps, VenueCaps, Via,
 };
 
 pub use cid::{Charset, ClientIdFormat, MAX_WIRE_LEN, WireCid, decode_cid, encode_cid};

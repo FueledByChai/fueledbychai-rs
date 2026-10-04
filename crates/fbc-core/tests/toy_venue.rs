@@ -40,7 +40,7 @@ use fbc_core::{
     Subscription, Support, TagSet, Ticks, TifTag, TimerTag, TouchSourceCaps, TouchSourceId,
     TradeCaps, TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueCommand, VenueConfig,
     VenueError, VenueFactory, VenueFeeSign, VenueId, VenueMeta, VenueOrderSnapshot,
-    VenueOrderState, WallNs, WireSlice, WireUrl, decode_cid, dispatch, encode_cid,
+    VenueOrderState, Via, WallNs, WireSlice, WireUrl, decode_cid, dispatch, encode_cid,
 };
 use rust_decimal::Decimal;
 
@@ -1066,15 +1066,12 @@ fn the_toy_charges_its_encode_resync_keepalive_and_subscribe_traffic() {
     exec.on_open(EXEC_STREAM, &ctx(1_000, &[]), &mut fx);
     exec.resync(&ctx(2_000, &[]), &mut fx);
     exec.on_timer(RESYNC_TAG, &ctx(9_000, &[]), &mut fx);
-    let mut charges: Vec<RateCharge> = fx
-        .as_slice()
-        .iter()
-        .filter_map(|effect| match effect {
-            Effect::Send { charge, .. } | Effect::Http { charge, .. } => Some(*charge),
-            Effect::Timer { .. } | Effect::Reconnect { .. } => None,
-        })
-        .collect();
-    charges.push(ToyMd.keepalive().unwrap().charge);
+    // Every request is a frame (the toy asks for no HTTP), and so is the ping.
+    let mut sent: Vec<(RateCharge, Via)> =
+        fx.as_slice().iter().filter_map(Effect::charge).collect();
+    sent.push((ToyMd.keepalive().unwrap().charge, Via::Frame));
+    assert!(sent.iter().all(|(_, via)| *via == Via::Frame));
+    let charges: Vec<RateCharge> = sent.iter().map(|(charge, _)| *charge).collect();
 
     // The order names its instrument, the resync costs its weight, and the subscriptions, hello
     // and ping are counted on their connection.
@@ -1096,16 +1093,25 @@ fn the_toy_charges_its_encode_resync_keepalive_and_subscribe_traffic() {
     // the toy's traffic, so the declaration is no wider than what the codecs send.
     let limits = toy_caps().limits;
     for charge in &charges {
-        assert!(limits.iter().any(|l| l.counts(charge)), "{charge:?}");
+        assert!(
+            limits.iter().any(|l| l.counts(charge, Via::Frame)),
+            "{charge:?}"
+        );
         for limit in limits.iter().filter(|l| l.ops.contains(charge.op)) {
-            assert!(limit.counts(charge), "{limit:?} misses {charge:?}");
+            assert!(
+                limit.counts(charge, Via::Frame),
+                "{limit:?} misses {charge:?}"
+            );
         }
     }
     for limit in &limits {
-        assert!(charges.iter().any(|c| limit.counts(c)), "{limit:?}");
+        assert!(
+            charges.iter().any(|c| limit.counts(c, Via::Frame)),
+            "{limit:?}"
+        );
     }
     let unkeyed = RateCharge::one(OpKind::Place, None);
-    assert!(!limits[0].counts(&unkeyed));
+    assert!(!limits[0].counts(&unkeyed, Via::Frame));
 }
 
 // ---------------------------------------------------------------------------------------------

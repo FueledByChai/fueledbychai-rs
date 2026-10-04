@@ -444,20 +444,28 @@ pub enum LimitScope {
 }
 
 impl RateLimit {
-    /// Whether this limit counts `charge`: it lists the charge's operation and, when it is
-    /// counted per pair, the charge names the instrument (decision 0018). Which bucket the
-    /// charge falls in (the account, the IP, the instrument, the connection) is the runtime's
-    /// to pick from [`scope`](RateLimit::scope).
-    pub fn counts(&self, charge: &RateCharge) -> bool {
+    /// Whether this limit counts `charge`, sent `via` a frame or an HTTP request: it lists the
+    /// charge's operation; when it is counted per pair, the charge names the instrument; and
+    /// when it is counted per connection, the request is a frame on one (decision 0018). Which
+    /// bucket the charge falls in (the account, the IP, the instrument, the connection) is the
+    /// runtime's to pick from [`scope`](RateLimit::scope).
+    pub fn counts(&self, charge: &RateCharge, via: Via) -> bool {
         let keyed = match self.scope {
             LimitScope::Pair => charge.inst.is_some(),
-            LimitScope::Account
-            | LimitScope::Ip
-            | LimitScope::AddressVolume { .. }
-            | LimitScope::Connection => true,
+            LimitScope::Connection => via == Via::Frame,
+            LimitScope::Account | LimitScope::Ip | LimitScope::AddressVolume { .. } => true,
         };
         keyed && self.ops.contains(charge.op)
     }
+}
+
+/// How a charged request goes out: as a frame on a connection (an
+/// [`Effect::Send`](crate::Effect::Send) or a keepalive), or as an HTTP request
+/// ([`Effect::Http`](crate::Effect::Http)), which no per-connection limit counts.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum Via {
+    Frame,
+    Http,
 }
 
 /// What one request costs against a venue's rate limits (decision 0018): the operation it is,
@@ -758,16 +766,16 @@ mod tests {
         ];
         for scope in scopes {
             let limit = limit(scope);
-            assert!(
-                limit.counts(&RateCharge::one(OpKind::Place, inst)),
-                "{scope:?}"
-            );
-            assert!(
-                !limit.counts(&RateCharge::one(OpKind::Cancel, inst)),
-                "{scope:?}"
-            );
-            let unkeyed = limit.counts(&RateCharge::one(OpKind::Control, None));
+            let place = RateCharge::one(OpKind::Place, inst);
+            assert!(limit.counts(&place, Via::Frame), "{scope:?}");
+            let cancel = RateCharge::one(OpKind::Cancel, inst);
+            assert!(!limit.counts(&cancel, Via::Frame), "{scope:?}");
+            let unkeyed = limit.counts(&RateCharge::one(OpKind::Control, None), Via::Frame);
             assert_eq!(unkeyed, scope != LimitScope::Pair, "{scope:?}");
+            // Codex r4176401174: a per-connection limit never counts an HTTP request, even of
+            // an operation it lists for frames; every other scope counts both.
+            let http = limit.counts(&place, Via::Http);
+            assert_eq!(http, scope != LimitScope::Connection, "{scope:?}");
         }
         // A charge costs one unit unless it says more; its weight is never zero.
         assert_eq!(RateCharge::one(OpKind::Connect, None).weight.get(), 1);
@@ -775,10 +783,11 @@ mod tests {
             weight: NonZeroU32::new(20).unwrap(),
             ..RateCharge::one(OpKind::Rest, None)
         };
-        assert!(limit(LimitScope::Ip).counts(&RateCharge {
+        let deep_place = RateCharge {
             op: OpKind::Place,
             ..deep
-        }));
+        };
+        assert!(limit(LimitScope::Ip).counts(&deep_place, Via::Http));
     }
 
     #[test]

@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use arrayvec::ArrayVec;
 use compact_str::CompactString;
 
-use crate::caps::RateCharge;
+use crate::caps::{RateCharge, Via};
 use crate::command::{NotSentReason, OrderKind, Tif, VenueCommand};
 use crate::event::{BookId, ExecEvent, MdEvent, RpcId, StreamId, TouchSourceId, VenueMeta};
 use crate::fee::FeeError;
@@ -459,6 +459,19 @@ pub enum Effect {
         stream: StreamId,
         reason: &'static str,
     },
+}
+
+impl Effect {
+    /// The rate charge of a frame or HTTP request, and how it goes out, which decides whether
+    /// a per-connection limit counts it (decision 0018); `None` for a timer or a reconnect,
+    /// which write nothing to the venue.
+    pub fn charge(&self) -> Option<(RateCharge, Via)> {
+        match self {
+            Effect::Send { charge, .. } => Some((*charge, Via::Frame)),
+            Effect::Http { charge, .. } => Some((*charge, Via::Http)),
+            Effect::Timer { .. } | Effect::Reconnect { .. } => None,
+        }
+    }
 }
 
 /// The effects one codec call asked for, in order.
@@ -1294,7 +1307,7 @@ mod tests {
         assert!(!carries(vec![http(None)]));
         assert!(!carries(vec![frame(Some(rpc)), frame(Some(other))]));
         assert!(!carries(vec![frame(Some(rpc)), frame(None)]));
-        assert!(!carries(vec![timer]));
+        assert!(!carries(vec![timer.clone()]));
         assert!(!carries(vec![]));
         // Codex r4173103646: every request effect is labelled with the command's own class
         // (VenueCommand::traffic_class), so a cancel is never rate-limited as normal traffic
@@ -1302,6 +1315,14 @@ mod tests {
         let mut fx = Effects::new();
         fx.push(frame(Some(rpc)));
         assert!(!fx.carry_request(rpc, TrafficClass::Normal));
+
+        // Each request states its charge and how it goes out, so a per-connection limit counts
+        // the frame and never the HTTP request (decision 0018, Codex r4176401174); a timer
+        // writes nothing to the venue and carries none.
+        let cancel = RateCharge::one(OpKind::Cancel, None);
+        assert_eq!(frame(Some(rpc)).charge(), Some((cancel, Via::Frame)));
+        assert_eq!(http(Some(rpc)).charge(), Some((cancel, Via::Http)));
+        assert_eq!(timer.charge(), None);
     }
 
     #[test]
