@@ -159,7 +159,7 @@ fn the_factory_declares_market_data_only_with_its_cited_limits() {
     );
     assert_eq!(
         md.topology,
-        ConnTopology::Shared {
+        ConnTopology::SharedOneBookPerInstrument {
             max_subscriptions: None
         }
     );

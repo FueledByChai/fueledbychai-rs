@@ -339,20 +339,28 @@ fn the_codec_refuses_a_second_book_channel_of_one_market_and_sends_nothing() {
     let refused = fresh.subscribe(&both, &[], &specs(), &mut fx);
     assert_eq!(refused, Err(VenueError::UnsupportedFeed(second)));
     assert!(fx.is_empty(), "a refusal sends nothing");
-    // The refusal changed nothing: BTC's deltas book still decodes, and the interactive one
-    // is taken once the deltas one is removed in the same call.
+    // The refusal changed nothing: BTC's deltas book still decodes.
     pushed(
         &feed(&mut codec, &frame("book-snapshot.sbe.txt")),
         &snapshot_events(DELTAS, 1),
     );
     let deltas = [sub(BTC, Feed::Book(DELTAS))];
-    codec
-        .subscribe(&[second], &deltas, &specs(), &mut fx)
-        .unwrap();
-    assert_eq!(fx.len(), 2);
+    // Swapping BTC's book channel on this connection is refused too, in one call or after the
+    // old one is removed (Codex r4176866128): frames do not name their channel, so the old
+    // channel's frames still in flight would be taken for the new one's.
+    let swap = codec.subscribe(&[second], &deltas, &specs(), &mut fx);
+    assert_eq!(swap, Err(VenueError::UnsupportedFeed(second)));
+    assert!(fx.is_empty(), "a refusal sends nothing");
+    codec.subscribe(&[], &deltas, &specs(), &mut fx).unwrap();
+    let later = codec.subscribe(&[second], &[], &specs(), &mut fx);
+    assert_eq!(later, Err(VenueError::UnsupportedFeed(second)));
+    assert_eq!(fx.len(), 1, "only the unsubscribe was sent");
+    // The channel it had can come back, awaiting a fresh snapshot.
+    codec.subscribe(&deltas, &[], &specs(), &mut fx).unwrap();
+    pushed(&feed(&mut codec, &frame("book-delta-1001.sbe.txt")), &[]);
     pushed(
         &feed(&mut codec, &frame("book-snapshot.sbe.txt")),
-        &snapshot_events(INTERACTIVE_DELTAS, 1),
+        &snapshot_events(DELTAS, 1),
     );
     // A book channel this adapter does not declare is refused.
     let undeclared = sub(BTC, Feed::Book(BookId(2)));
@@ -443,4 +451,11 @@ fn the_factory_declares_both_book_channels_with_their_continuity() {
         TagSet::of(&[Channel::Public, Channel::Rpi])
     );
     assert_eq!(md.touch_sources[0].seq_domain, SeqDomain::SharedWithBook);
+    // The caps state what plan_md keeps (Codex r4176866133).
+    assert_eq!(
+        md.topology,
+        fbc_core::ConnTopology::SharedOneBookPerInstrument {
+            max_subscriptions: None
+        }
+    );
 }

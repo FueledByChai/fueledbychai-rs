@@ -224,10 +224,11 @@ pub fn caps() -> VenueCaps {
             // A frame names its message by template id and its instrument by `market`, but a
             // BookEvent does not say which order-book channel (snapshot, deltas, interactive)
             // it belongs to ("Binary Encoding (SBE)": "Frames do not explicitly identify their
-            // channel"). bbo and trades share a connection; at most one book channel per market
-            // and connection, which plan_md keeps and the codec's subscribe enforces.
-            // docs.paradex.trade states no cap on subscriptions per connection.
-            topology: ConnTopology::Shared {
+            // channel"). bbo, trades and one book channel per market share a connection; a
+            // market's second book channel goes on another (decision 0022), as plan_md plans
+            // and the codec's subscribe enforces. docs.paradex.trade states no cap on
+            // subscriptions per connection.
+            topology: ConnTopology::SharedOneBookPerInstrument {
                 max_subscriptions: None,
             },
             // The introduction states none: the server's 55-second ping keeps it open.
