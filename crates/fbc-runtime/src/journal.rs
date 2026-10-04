@@ -38,6 +38,12 @@ impl Journal {
         let _ = self.sink.borrow_mut().record(class, now, record);
     }
 
+    /// Has the sink count a record of `class` the session withholds, so the journal marks the
+    /// gap ([`JournalSink::omit`]).
+    pub(crate) fn omit(&self, class: TrafficClass, now: WallNs) {
+        let _ = self.sink.borrow_mut().omit(class, now);
+    }
+
     /// Offers the record `make` builds, telling the sink first that it holds `payload` bytes,
     /// so a sink with no room for them refuses it unbuilt ([`JournalSink::record_with`]).
     pub(crate) fn record_with(
@@ -73,6 +79,11 @@ mod tests {
                 TrafficClass::Safety => Recorded::Ok,
             }
         }
+
+        fn omit(&mut self, class: TrafficClass, _: WallNs) -> Recorded {
+            self.0.push((class, Record::Marker(Marker::Recovered)));
+            Recorded::DroppedCounted
+        }
     }
 
     #[test]
@@ -83,8 +94,16 @@ mod tests {
         let marker = Record::Marker(Marker::Recovered);
         journal.record(TrafficClass::Normal, WallNs(1), &marker);
         shared.record(TrafficClass::Safety, WallNs(2), &marker);
+        journal.omit(TrafficClass::Normal, WallNs(3));
         let classes: Vec<_> = sink.borrow().0.iter().map(|(c, _)| *c).collect();
-        assert_eq!(classes, [TrafficClass::Normal, TrafficClass::Safety]);
+        assert_eq!(
+            classes,
+            [
+                TrafficClass::Normal,
+                TrafficClass::Safety,
+                TrafficClass::Normal
+            ]
+        );
         assert_eq!(format!("{journal:?}"), "Journal");
     }
 }

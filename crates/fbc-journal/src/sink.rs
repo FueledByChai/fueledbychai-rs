@@ -15,7 +15,9 @@
 //! room its class has left, is dropped and counted the same way, and its payload is not
 //! copied: encoding stops where the room ends. A caller whose record would copy a large payload
 //! to be built offers it with [`record_with`](JournalSink::record_with) and its size: one whose
-//! payload alone exceeds that room is dropped and counted without being built.
+//! payload alone exceeds that room is dropped and counted without being built. A record the
+//! caller may not journal at all is [omitted](JournalSink::omit): dropped and counted the same
+//! way, so the gap it leaves is marked.
 //!
 //! **The gap.** The sink numbers the records offered to it from 0. The first drop opens a gap;
 //! it closes once space returns, that is when a record arrives and the `Degraded` marker and
@@ -93,6 +95,12 @@ pub trait JournalSink {
         let _ = payload;
         self.record(class, now, &make())
     }
+
+    /// Counts a record of `class` that the caller withholds, its content being one the journal
+    /// may not keep, as dropped: numbered into a gap like any other drop, so the journal marks
+    /// the omission (a `Degraded` marker before the next record written) rather than reading as
+    /// complete. Never blocks.
+    fn omit(&mut self, class: TrafficClass, now: WallNs) -> Recorded;
 }
 
 /// Makes the journal queue: the sink the shard records into, which hashes redaction spans
@@ -324,6 +332,10 @@ impl JournalSink for QueueSink {
         } else {
             self.offer(class, now, None)
         }
+    }
+
+    fn omit(&mut self, class: TrafficClass, now: WallNs) -> Recorded {
+        self.offer(class, now, None)
     }
 }
 
