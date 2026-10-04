@@ -109,20 +109,37 @@ fn len32(n: usize) -> Result<u32, JournalError> {
 
 /// Appends a record's body (kind and fields) to `out`.
 pub(crate) fn encode(record: &Record, out: &mut Vec<u8>) -> Result<(), JournalError> {
-    let mut e = Enc(out, 0);
+    encode_within(record, out, usize::MAX)
+}
+
+/// [`encode`], refusing a body longer than `limit` bytes with [`JournalError::TooLarge`]
+/// before copying the bytes that would pass it, so a record too large for the room left
+/// costs no copy of its payload.
+pub(crate) fn encode_within(
+    record: &Record,
+    out: &mut Vec<u8>,
+    limit: usize,
+) -> Result<(), JournalError> {
+    let start = out.len();
+    let mut e = Enc {
+        out,
+        redacted: 0,
+        end: start.saturating_add(limit),
+        over: false,
+    };
     match record {
         Record::Inbound {
             stamp,
             opcode,
             bytes,
         } => {
-            if *opcode == Opcode::Text && core::str::from_utf8(&bytes.0).is_err() {
-                return Err(JournalError::Unencodable("a text frame that is not UTF-8"));
-            }
             e.u8(INBOUND);
             e.stamp(stamp);
             e.u8(opcode_byte(*opcode));
             e.bytes(&bytes.0)?;
+            if *opcode == Opcode::Text && !e.over && core::str::from_utf8(&bytes.0).is_err() {
+                return Err(JournalError::Unencodable("a text frame that is not UTF-8"));
+            }
         }
         Record::Outbound {
             at,
@@ -229,43 +246,60 @@ pub(crate) fn encode(record: &Record, out: &mut Vec<u8>) -> Result<(), JournalEr
             }
         }
     }
+    if e.over {
+        return Err(JournalError::TooLarge);
+    }
     Ok(())
 }
 
-/// The output, and the bytes redacted so far.
-struct Enc<'a>(&'a mut Vec<u8>, u64);
+/// The output, the bytes redacted so far, where the body must end by, and whether it has
+/// passed that end, after which nothing more is copied.
+struct Enc<'a> {
+    out: &'a mut Vec<u8>,
+    redacted: u64,
+    end: usize,
+    over: bool,
+}
 
 impl Enc<'_> {
+    /// Every byte the encoder writes goes through here.
+    fn put(&mut self, v: &[u8]) {
+        self.over = self.over || self.out.len().saturating_add(v.len()) > self.end;
+        if !self.over {
+            self.out.extend_from_slice(v);
+        }
+    }
+
     fn u8(&mut self, v: u8) {
-        self.0.push(v);
+        self.put(&[v]);
     }
 
     fn u16(&mut self, v: u16) {
-        self.0.extend_from_slice(&v.to_le_bytes());
+        self.put(&v.to_le_bytes());
     }
 
     fn u32(&mut self, v: u32) {
-        self.0.extend_from_slice(&v.to_le_bytes());
+        self.put(&v.to_le_bytes());
     }
 
     fn u64(&mut self, v: u64) {
-        self.0.extend_from_slice(&v.to_le_bytes());
+        self.put(&v.to_le_bytes());
     }
 
     fn i64(&mut self, v: i64) {
-        self.0.extend_from_slice(&v.to_le_bytes());
+        self.put(&v.to_le_bytes());
     }
 
     fn bytes(&mut self, v: &[u8]) -> Result<(), JournalError> {
         self.u32(len32(v.len())?);
-        self.0.extend_from_slice(v);
+        self.put(v);
         Ok(())
     }
 
     /// Counts `n` more redacted bytes against [`MAX_REDACTED`].
     fn redact(&mut self, n: u64) -> Result<(), JournalError> {
-        self.1 += n;
-        if self.1 > MAX_REDACTED {
+        self.redacted += n;
+        if self.redacted > MAX_REDACTED {
             return Err(JournalError::TooLarge);
         }
         Ok(())
@@ -311,10 +345,10 @@ impl Enc<'_> {
         self.redact(spans.iter().map(|s| u64::from(s.end - s.start)).sum())?;
         let mut at = 0;
         for span in spans {
-            self.0.extend_from_slice(&bytes[at..span.start as usize]);
+            self.put(&bytes[at..span.start as usize]);
             at = span.end as usize;
         }
-        self.0.extend_from_slice(&bytes[at..]);
+        self.put(&bytes[at..]);
         Ok(())
     }
 
@@ -654,6 +688,58 @@ mod tests {
             recv_wall: WallNs(7),
             conn: conn(),
         }
+    }
+
+    #[test]
+    fn a_record_over_the_limit_is_refused_before_its_payload_is_copied() {
+        // Codex r4176799800: the sink must not copy a payload it is about to drop.
+        let big = vec![b'a'; 1 << 20];
+        let records = [
+            Record::Inbound {
+                stamp: stamp(),
+                opcode: Opcode::Text,
+                bytes: Opaque(big.clone()),
+            },
+            Record::Outbound {
+                at: MonoNs(1),
+                conn: conn(),
+                rpc: None,
+                frame: WireSlice::redacted(big.clone(), vec![0..1, 2..3]).unwrap(),
+            },
+            Record::HttpResult {
+                stamp: stamp(),
+                tag: HttpTag(1),
+                result: Ok(HttpResponseRec {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: Opaque(big.clone()),
+                }),
+            },
+        ];
+        for record in &records {
+            let mut body = Vec::new();
+            assert!(matches!(
+                encode_within(record, &mut body, 256),
+                Err(JournalError::TooLarge)
+            ));
+            assert!(body.capacity() <= 512, "{}", body.capacity());
+            // Within a limit it fits, it encodes as without one.
+            let mut unlimited = Vec::new();
+            encode(record, &mut unlimited).unwrap();
+            let mut limited = Vec::new();
+            encode_within(record, &mut limited, unlimited.len()).unwrap();
+            assert_eq!(limited, unlimited);
+        }
+        // A text frame too large to copy is refused for its size, before its UTF-8 is checked.
+        let not_utf8 = Record::Inbound {
+            stamp: stamp(),
+            opcode: Opcode::Text,
+            bytes: Opaque(vec![0xff; 1 << 20]),
+        };
+        assert!(matches!(
+            encode_within(&not_utf8, &mut Vec::new(), 256),
+            Err(JournalError::TooLarge)
+        ));
     }
 
     #[test]
