@@ -114,7 +114,8 @@ rather than guess.
   `Fee`/`FeeBook`, `DecodeScope`, `InstrumentSpec` (maker-safe `quantize`), `VenueCaps`,
   the market-data and execution events, venue commands, and the codec, signer, nonce and
   factory traits with `Effects` and `EncodeCtx`, `crates/fbc-journal` with its record
-  format, day-grouped segment writer and in-order reader, and
+  format, day-grouped segment writer and in-order reader, `crates/fbc-runtime` with its first
+  slice (the connector, SOCKS5 CONNECT, `ws://` and HTTP/1.1; 0019), and
   `crates/venues/fbc-venue-paradex` with only its signer (`src/sign`); the rest are planned. Members are the `crates/fbc-*` and
   `crates/venues/fbc-*` globs, and `fixtures/` is excluded from the workspace:
   - `crates/fbc-core`: the contract. Time, units, price grids and exact prices, sealed ids and
@@ -128,7 +129,12 @@ rather than guess.
     build profile (the `units` module documents the policy).
   - `crates/fbc-runtime`: the one generic runtime: WebSocket, TLS and HTTP through SOCKS5,
     reconnects and connection epochs, subscription reconciliation, rate limits with a safety
-    floor, kernel receive timestamps, the shard host (0002).
+    floor, kernel receive timestamps, the shard host (0002). So far `ProxyConfig` (`Direct` or
+    `Socks5 { host, port }`, no credentials), `Connector` (every TCP connection, directly or
+    through a hand-written SOCKS5 CONNECT that sends the target's host name), a `ws://` client
+    and an `http://` HTTP/1.1 call over it, and `NetError` naming the failed step; its network
+    dependencies are pinned exactly (0019). `tests/common/` holds the SOCKS5 stub, WebSocket
+    server and HTTP server on 127.0.0.1 ephemeral ports that later runtime tests reuse.
   - `crates/fbc-book` (tick-indexed order book), `crates/fbc-oms` (order lattice, permits,
     pre-trade caps, `ExecutionPlanner`; 0005, 0013), `crates/fbc-journal` (0006; it depends on
     `fbc-core` only: the records the runtime writes, length-prefixed in a hand-written

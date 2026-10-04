@@ -28,6 +28,17 @@ starknet-crypto = { version = "=0.8.1", default-features = false, features = ["s
 starknet-core = "=0.16.0"
 sha3 = { version = "=0.10.8", default-features = false }
 serde_json = "1"
+# The runtime's network stack (FBC-2ds, decision 0019): exact pins, so a dependency moves only
+# by a ticket that says why. tokio runs current_thread (design §5.1); tokio-tungstenite and
+# hyper speak WebSocket and HTTP/1.1 over the one connector in fbc-runtime, which does the
+# SOCKS5 CONNECT itself. Default features are off; each crate turns on what it uses.
+tokio = { version = "=1.53.2", default-features = false }
+tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
+hyper = { version = "=1.11.1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "=0.1.21", default-features = false, features = ["tokio"] }
+http-body-util = { version = "=0.1.5", default-features = false }
+# Test-only: the Stream and Sink traits a test drives a WebSocket with.
+futures-util = { version = "=0.3.34", default-features = false }
 
 # Stark-curve arithmetic is unusably slow unoptimized; the signer's tests sign thousands of
 # vectors. Optimizing these dependencies in test builds changes no result, only the time.
