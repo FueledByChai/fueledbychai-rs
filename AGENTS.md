@@ -117,7 +117,7 @@ rather than guess.
   format, day-grouped segment writer rolled hourly with zstd-compressed closed segments, in-order reader and never-blocking sink, `crates/fbc-runtime` with its first
   slices (the connector, SOCKS5 CONNECT, WebSocket and HTTP/1.1, plain or TLS, 0019 and 0020, the WebSocket handshake its own, 0029;
   connection epochs and the subscription reconciler; the market-data session, 0023; HTTP
-  effects, poll endpoints and plans, 0027; journaling, 0006; rate-limit buckets with a safety reserve, 0030), `crates/fbc-conformance` with its stub venue server (0025),
+  effects, poll endpoints and plans, 0027; journaling and decoder replay, 0006; rate-limit buckets with a safety reserve, 0030), `crates/fbc-conformance` with its stub venue server (0025),
   `crates/venues/fbc-venue-paradex` with its signer (`src/sign`), SBE market data (`src/md`: bbo,
   trades and the order book) and its factory (`src/factory.rs`, market data only),
   and `crates/venues/fbc-venue-binance-usdm` with its market-data-only factory and codec; the
@@ -162,6 +162,9 @@ rather than guess.
     `RateLimiter` keeps a sliding-window bucket per declared limit and scope key, charged by
     each frame's, request's and connection attempt's rate charge, normal traffic stopping at
     the consumer's `SafetyReserve`, refusals and 429/418 counted by scope (0030);
+    `MdReplay` feeds one session's journal back to the venue's decoders through the same calls,
+    with the recorded stamps, effects not executed (decoder replay; the caller supplies the
+    `VenueConfig` and `SpecTable`);
     `tests/common/toy.rs` is the toy market-data venue later runtime tests reuse.
   - `crates/fbc-book` (it depends on `fbc-core` only: one tick-indexed L2 book per
     instrument and `BookId`, built from book events the same live and in replay, with

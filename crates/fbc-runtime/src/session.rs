@@ -68,10 +68,10 @@ use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fbc_core::{
-    ConfigError, ConnKey, Effect, Effects, EndpointPlan, Envelope, HttpFailure, HttpResponse,
-    HttpTag, MdCodec, MdEvent, MdSink, MdTransport, MonoNs, OpKind, RateCharge, RawFrame,
-    SpecTable, Stamp, StreamId, Subscription, TimerTag, TrafficClass, VenueCaps, VenueConfig,
-    VenueFactory, VenueMeta, Via, WallNs, dispatch_market_data,
+    ConfigError, ConnKey, DecodeError, Effect, Effects, EndpointPlan, Envelope, HttpFailure,
+    HttpResponse, HttpTag, MdCodec, MdEvent, MdSink, MdTransport, MonoNs, OpKind, RateCharge,
+    RawFrame, SpecTable, Stamp, StreamId, Subscription, TimerTag, TrafficClass, VenueCaps,
+    VenueConfig, VenueFactory, VenueMeta, Via, WallNs, dispatch_market_data,
 };
 use fbc_journal::{ControlEvent, Record, RecordRef, ResponseRef, WriteRes, is_secret_header};
 use futures_util::stream::FuturesUnordered;
@@ -689,11 +689,7 @@ impl<H: MdHandler> MdSession<H> {
             epochs: &mut self.epochs,
             stamp,
         };
-        let specs = &self.specs;
-        let decoded = dispatch_market_data(&self.caps, |scope| {
-            codec.on_frame(raw, scope, specs, &mut sink, fx)
-        });
-        if decoded.is_err() {
+        if feed_frame(codec, &self.caps, &self.specs, raw, &mut sink, fx).is_err() {
             self.counters.decode_errors += 1;
         }
     }
@@ -707,9 +703,7 @@ impl<H: MdHandler> MdSession<H> {
         };
         let (specs, caps) = (&self.specs, &self.caps);
         let decoded = with_response(&done.result, |resp| {
-            dispatch_market_data(caps, |scope| {
-                codec.on_http(done.tag, resp, scope, specs, &mut sink, fx)
-            })
+            feed_http(codec, caps, specs, done.tag, resp, &mut sink, fx)
         });
         if decoded.is_err() {
             self.counters.decode_errors += 1;
@@ -731,7 +725,7 @@ impl<H: MdHandler> MdSession<H> {
                 stamp,
             };
             let mut fx = Effects::new();
-            codec.on_timer(tag, stamp.recv_mono, stamp.recv_wall, &mut sink, &mut fx);
+            feed_timer(codec, stamp, tag, &mut sink, &mut fx);
             open = self.execute(ws, codec, fx, false).await?;
         }
         Ok(open)
@@ -1072,6 +1066,47 @@ impl<H: MdHandler> MdSession<H> {
     fn next_deadline(&self) -> Option<Instant> {
         self.timers.peek().map(|Reverse((at, ..))| *at)
     }
+}
+
+/// Hands a data frame to `codec` inside the venue's decode scope: the one call a live session
+/// and a replay ([`crate::MdReplay`]) make for it (design §10.1).
+pub(crate) fn feed_frame(
+    codec: &mut dyn MdCodec,
+    caps: &VenueCaps,
+    specs: &SpecTable,
+    raw: RawFrame<'_>,
+    sink: &mut dyn MdSink,
+    fx: &mut Effects,
+) -> Result<(), DecodeError> {
+    dispatch_market_data(caps, |scope| codec.on_frame(raw, scope, specs, sink, fx))
+}
+
+/// Hands an HTTP result to the codec that asked for it, inside the venue's decode scope: the
+/// one call a live session and a replay make for it.
+pub(crate) fn feed_http(
+    codec: &mut dyn MdCodec,
+    caps: &VenueCaps,
+    specs: &SpecTable,
+    tag: HttpTag,
+    resp: Result<HttpResponse<'_>, HttpFailure>,
+    sink: &mut dyn MdSink,
+    fx: &mut Effects,
+) -> Result<(), DecodeError> {
+    dispatch_market_data(caps, |scope| {
+        codec.on_http(tag, resp, scope, specs, sink, fx)
+    })
+}
+
+/// Fires a codec's timer at the instant `stamp` gives it: the one call a live session and a
+/// replay make for it.
+pub(crate) fn feed_timer(
+    codec: &mut dyn MdCodec,
+    stamp: Stamp,
+    tag: TimerTag,
+    sink: &mut dyn MdSink,
+    fx: &mut Effects,
+) {
+    codec.on_timer(tag, stamp.recv_mono, stamp.recv_wall, sink, fx);
 }
 
 /// Calls `f` with `result` as a codec is handed it: the response's status, its headers in

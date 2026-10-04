@@ -68,10 +68,12 @@ pub const ONE_STREAM: &str = "toy.one_stream";
 /// The toy's instruments, by id: 1 is `A`, 2 is `B`, 3 is `C`.
 const SYMBOLS: [&str; 3] = ["A", "B", "C"];
 
-/// The toy venue; it counts the codecs it builds and logs their `on_http` calls.
+/// The toy venue; it counts the codecs it builds, keeps the instruments of the plan each was
+/// built for, and logs their `on_http` calls.
 #[derive(Default)]
 pub struct ToyVenue {
     codecs: AtomicU32,
+    plans: Mutex<Vec<Vec<u32>>>,
     http: Arc<Mutex<Vec<String>>>,
     subscribes: Arc<AtomicU32>,
     limits: Vec<RateLimit>,
@@ -105,6 +107,11 @@ impl ToyVenue {
     /// How many subscribe calls its codecs had.
     pub fn subscribe_calls(&self) -> u32 {
         self.subscribes.load(Ordering::SeqCst)
+    }
+
+    /// The instruments of the plan each codec was built for, in the order it built them.
+    pub fn plans(&self) -> Vec<Vec<u32>> {
+        self.plans.lock().unwrap().clone()
     }
 
     /// Every `on_http` call its codecs had, in order.
@@ -277,6 +284,8 @@ impl VenueFactory for ToyVenue {
 
     fn md_codec(&self, cfg: &VenueConfig, ep: &EndpointPlan) -> Box<dyn MdCodec> {
         let n = self.codecs.fetch_add(1, Ordering::SeqCst);
+        let ids = ep.subs.iter().map(|s| s.inst.get()).collect();
+        self.plans.lock().unwrap().push(ids);
         let plan = ep.subs.iter().map(|s| s.inst.get().to_string());
         let plan = plan.collect::<Vec<_>>().join(",");
         let poll = match &ep.transport {
