@@ -1,6 +1,7 @@
 //! The configuration Binance USD-M reads: where to connect, and which partial-depth stream.
 
 use core::time::Duration;
+use std::net::Ipv6Addr;
 
 use fbc_core::{ConfigError, ConfigScope, FieldSpec, FieldUnit, VenueConfig};
 
@@ -56,7 +57,7 @@ pub(crate) struct Settings {
 }
 
 /// Whether `authority` is `host[:port]` and nothing more: a host name or IPv4 address of
-/// letters, digits, dots and hyphens, or a bracketed IPv6 address, and a port from 1 to 65535.
+/// letters, digits, dots and hyphens, or a bracketed address that parses as IPv6, and a port from 1 to 65535.
 /// No user information, path, query or fragment: the endpoint path is appended to it.
 fn is_host_port(authority: &str) -> bool {
     let (host_ok, port) = match authority.strip_prefix('[') {
@@ -64,7 +65,6 @@ fn is_host_port(authority: &str) -> bool {
             let Some((host, after)) = rest.split_once(']') else {
                 return false;
             };
-            let ipv6 = |c: char| c.is_ascii_hexdigit() || c == ':' || c == '.';
             let port = match after {
                 "" => None,
                 _ => match after.strip_prefix(':') {
@@ -72,7 +72,7 @@ fn is_host_port(authority: &str) -> bool {
                     None => return false,
                 },
             };
-            (!host.is_empty() && host.chars().all(ipv6), port)
+            (host.parse::<Ipv6Addr>().is_ok(), port)
         }
         None => {
             let (host, port) = match authority.split_once(':') {

@@ -171,7 +171,7 @@ rather than guess.
     `crates/venues/fbc-venue-binance-usdm` (market data only:
     `exec: None` caps citing Binance's USD-M pages, `plan_md` on the `/public` combined-stream
     endpoint, live SUBSCRIBE/UNSUBSCRIBE, `bookTicker` touches and partial-depth snapshots;
-    the diff-depth book is FBC-tfb's), `crates/venues/fbc-venue-paradex`
+    the diff-depth book and its REST anchor are FBC-tfb's), `crates/venues/fbc-venue-paradex`
     (so far its signer: the SNIP-12 revision 0 hash and Stark-curve signature, tested against
     `fixtures/paradex/signing/paradex-vectors.tsv`; and market data: an SBE reader gated on each
     frame's block lengths, bbo and trades decoded into touches and trades, the order book
