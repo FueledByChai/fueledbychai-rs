@@ -365,6 +365,7 @@ enum Out {
     Send(Message),
     Drop,
     Stall(Option<std::time::Duration>),
+    Hold(oneshot::Receiver<()>),
 }
 
 /// One accepted connection: the text frames the client sent, in order, and a way to answer.
@@ -407,6 +408,9 @@ impl ScriptedWs {
                                 Some(Out::Send(message)) => ws.send(message).await.unwrap(),
                                 Some(Out::Stall(None)) => std::future::pending().await,
                                 Some(Out::Stall(Some(pause))) => tokio::time::sleep(pause).await,
+                                Some(Out::Hold(release)) => {
+                                    let _ = release.await;
+                                }
                                 _ => {
                                     let _ = ws.close(None).await;
                                     break;
@@ -466,6 +470,14 @@ impl Peer {
     /// Stops reading from the client for `pause`, then reads again.
     pub fn stall_for(&self, pause: std::time::Duration) {
         let _ = self.to_client.send(Out::Stall(Some(pause)));
+    }
+
+    /// Stops reading from the client until the returned sender fires or drops, then reads
+    /// again: the test, not a clock, ends the stall.
+    pub fn hold(&self) -> oneshot::Sender<()> {
+        let (release, held) = oneshot::channel();
+        let _ = self.to_client.send(Out::Hold(held));
+        release
     }
 
     /// Closes the connection.
