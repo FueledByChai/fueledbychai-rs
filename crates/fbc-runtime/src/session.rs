@@ -36,8 +36,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fbc_core::{
     ConfigError, ConnKey, Effect, Effects, EndpointPlan, Envelope, HttpFailure, HttpRequest,
     HttpResponse, HttpTag, MdCodec, MdEvent, MdSink, MdTransport, MonoNs, RawFrame, SpecTable,
-    Stamp, Subscription, TimerTag, VenueCaps, VenueConfig, VenueFactory, VenueMeta, WallNs,
-    dispatch_market_data,
+    Stamp, StreamId, Subscription, TimerTag, VenueCaps, VenueConfig, VenueFactory, VenueMeta,
+    WallNs, dispatch_market_data,
 };
 use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt, SinkExt, StreamExt};
@@ -623,7 +623,10 @@ impl<H: MdHandler> MdSession<H> {
                     // back meanwhile reaches the codec at once, so the handler gets its events
                     // in the shard's ingest order (Codex r4177698441). A request the codec asks
                     // for then starts at once, its timeout running from now (Codex
-                    // r4177887264); its other effects wait for the rest of this batch.
+                    // r4177887264); its other effects wait for the rest of this batch. A request
+                    // behind a reconnect of this stream, still queued in this batch or asked for
+                    // first, waits too: that reconnect ends the epoch before its turn, so it is
+                    // never sent (Codex r4177934308).
                     let send = ws.send(message);
                     tokio::pin!(send);
                     open = loop {
@@ -637,11 +640,13 @@ impl<H: MdHandler> MdSession<H> {
                         if let Some((stamp, done)) = self.admit_http(done)? {
                             let mut more = Effects::new();
                             self.answer(codec, stamp, done, &mut more);
+                            let mut ends = effects.iter().any(|e| ends_epoch(e, own));
                             for effect in more.take() {
+                                ends |= ends_epoch(&effect, own);
                                 match effect {
                                     Effect::Http {
                                         tag, req, timeout, ..
-                                    } => self.ask(epoch, tag, req, timeout),
+                                    } if !ends => self.ask(epoch, tag, req, timeout),
                                     other => effects.push_back(other),
                                 }
                             }
@@ -726,6 +731,11 @@ impl<H: MdHandler> MdSession<H> {
     fn next_deadline(&self) -> Option<Instant> {
         self.timers.peek().map(|Reverse((at, ..))| *at)
     }
+}
+
+/// Whether `effect` asks a socket endpoint of stream `own` to reconnect, which ends its epoch.
+fn ends_epoch(effect: &Effect, own: StreamId) -> bool {
+    matches!(effect, Effect::Reconnect { stream, .. } if *stream == own)
 }
 
 /// Sends a close frame if the socket takes it now, without waiting on a peer that stopped

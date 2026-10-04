@@ -214,6 +214,52 @@ async fn a_request_asked_for_by_a_result_that_comes_back_during_a_write_starts_a
     assert_eq!(venue.http_log(), ["0/9:200:-", "0/5:TimedOut"]);
 }
 
+/// A GET, then a 64 MiB frame the stalled peer holds back for 600 ms, and with `bye`, then a
+/// reconnect. The GET's answer is `body`, which asks for a second GET at `/nested`.
+async fn a_request_behind_a_reconnect_during_a_write(bye: bool, body: impl Fn(&str) -> String) {
+    let (mut ws, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
+    let venue = ToyVenue::leak();
+    let (mut session, control) = MdSession::new(session(venue, socket(ws.url())), |_| {}).unwrap();
+    let script = async move {
+        let mut first = ws.accept().await;
+        assert_eq!(first.recv().await, "hello|codec=0|plan=1");
+        assert_eq!(first.recv().await, "sub|add=A");
+        let bye = if bye { "|bye=1" } else { "" };
+        let url = http.url("/during");
+        first.send(&format!("get|tag=9|ms=5000|kb=65536{bye}|url={url}"));
+        first.stall_for(ms(600));
+        let nested = body(&http.url("/nested"));
+        http.request()
+            .await
+            .answer("HTTP/1.1 200 OK", &nested)
+            .await;
+        let mut second = ws.accept().await;
+        assert_eq!(second.recv().await, "hello|codec=1|plan=1");
+        tokio::time::sleep(ms(50)).await;
+        // The reconnect ended the epoch before the second GET's turn, so it never went out.
+        assert_eq!(http.connections(), 1);
+        assert!(http.try_request().is_none());
+        drop((first, second, control));
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    assert_eq!(venue.http_log(), ["0/9:200:-"]);
+}
+
+#[tokio::test]
+async fn a_request_asked_for_during_a_write_after_its_own_reconnect_is_not_sent() {
+    // The answer asks for a reconnect, then a GET (Codex r4177934308).
+    let body = |url: &str| format!("bye\nget|tag=5|ms=5000|url={url}");
+    a_request_behind_a_reconnect_during_a_write(false, body).await;
+}
+
+#[tokio::test]
+async fn a_request_asked_for_during_a_write_with_a_reconnect_still_queued_is_not_sent() {
+    // The write's own batch has a reconnect waiting behind it; the answer asks for a GET.
+    let body = |url: &str| format!("get|tag=5|ms=5000|url={url}");
+    a_request_behind_a_reconnect_during_a_write(true, body).await;
+}
+
 #[tokio::test]
 async fn a_result_that_is_ready_as_the_control_drops_reaches_no_codec() {
     let (mut ws, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
