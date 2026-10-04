@@ -303,6 +303,15 @@ impl Enc<'_> {
     fn bytes(&mut self, v: &[u8]) -> Result<(), JournalError> {
         self.u32(len32(v.len())?);
         self.put(v);
+        self.within()
+    }
+
+    /// Fails once the body has passed its limit, so a loop over a record's elements stops
+    /// there rather than walking the rest.
+    fn within(&self) -> Result<(), JournalError> {
+        if self.over {
+            return Err(JournalError::TooLarge);
+        }
         Ok(())
     }
 
@@ -351,15 +360,17 @@ impl Enc<'_> {
         for span in spans {
             self.u32(span.start);
             self.u32(span.end);
+            self.within()?;
         }
         self.redact(spans.iter().map(|s| u64::from(s.end - s.start)).sum())?;
         let mut at = 0;
         for span in spans {
             self.put(&bytes[at..span.start as usize]);
+            self.within()?;
             at = span.end as usize;
         }
         self.put(&bytes[at..]);
-        Ok(())
+        self.within()
     }
 
     /// Headers: a secret one's value is written as its length alone.
@@ -398,6 +409,7 @@ impl Enc<'_> {
                 Feed::Funding => self.u8(5),
                 Feed::Stats => self.u8(6),
             }
+            self.within()?;
         }
         Ok(())
     }
@@ -1040,5 +1052,62 @@ mod tests {
         assert_eq!(decode(&request_with(&bad_name)), Err("text"));
         let bad_flag = [&url[..], &words(&[1, 1]), b"a", &[2]].concat();
         assert_eq!(decode(&request_with(&bad_flag)), Err("header flag"));
+    }
+
+    #[test]
+    fn encoding_stops_at_the_limit_instead_of_walking_the_rest() {
+        // Codex r4176902248: past the limit, no later element is visited. A secret header or
+        // a span list after the limit would count redacted bytes if it were.
+        let mut out = Vec::new();
+        let mut e = Enc {
+            out: &mut out,
+            redacted: 0,
+            end: 16,
+            over: false,
+        };
+        let headers = [
+            HeaderRec {
+                name: "x-long".into(),
+                value: "v".repeat(64),
+                redact: false,
+            },
+            HeaderRec {
+                name: "x-secret".into(),
+                value: "s".repeat(10),
+                redact: true,
+            },
+        ];
+        assert!(matches!(e.headers(&headers), Err(JournalError::TooLarge)));
+        assert_eq!(e.redacted, 0);
+
+        let mut out = Vec::new();
+        let mut e = Enc {
+            out: &mut out,
+            redacted: 0,
+            end: 16,
+            over: false,
+        };
+        let spans: Vec<Range<u32>> = (0..64).map(|i| i * 2..i * 2 + 1).collect();
+        assert!(matches!(
+            e.spanned(&[b'a'; 128], &spans),
+            Err(JournalError::TooLarge)
+        ));
+        assert_eq!(e.redacted, 0);
+
+        let mut out = Vec::new();
+        let mut e = Enc {
+            out: &mut out,
+            redacted: 0,
+            end: 16,
+            over: false,
+        };
+        let subs: Vec<Subscription> = (1..=64)
+            .map(|i| Subscription {
+                inst: InstrumentId::new(i),
+                feed: Feed::Trades,
+            })
+            .collect();
+        assert!(matches!(e.subs(&subs), Err(JournalError::TooLarge)));
+        assert!(e.out.len() <= 16);
     }
 }
