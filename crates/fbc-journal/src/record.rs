@@ -14,13 +14,13 @@ use fbc_core::{
     NotSentReason, RawFrame, RpcId, Stamp, Subscription, TimerTag, WireSlice, WireUrl,
 };
 
-/// The byte a redaction span reads back as. A span's bytes are never written (FBC-apz will
-/// store a keyed hash in their place); the record keeps the span's place and length, and the
-/// reader fills it with this byte. It is ASCII, so a blanked URL or header value stays text.
+/// The byte a redaction span reads back as. A span's bytes are never written (its keyed hash
+/// is, [`Record::digests`]); the record keeps the span's place and length, and the reader
+/// fills it with this byte. It is ASCII, so a blanked URL or header value stays text.
 pub const BLANK: u8 = 0;
 
 /// The headers whose values are credentials whatever the codec marked: their values are
-/// written blanked in requests and results alike (design §9; a venue behind a CDN sets
+/// written as keyed hashes and read back blanked, in requests and results alike (design §9; a venue behind a CDN sets
 /// cookies on responses). Matched without regard to case, as HTTP names are.
 pub const SECRET_HEADERS: [&str; 4] = [
     "Authorization",

@@ -9,6 +9,11 @@ use fbc_core::{ConnKey, MonoNs, Stamp, TimerTag, WallNs};
 use fbc_journal::format::{MAGIC, VERSION};
 use fbc_journal::{JournalError, JournalReader, JournalWriter, Marker, Record};
 
+/// The key the journal hashes redaction spans under in these tests.
+fn key() -> std::sync::Arc<fbc_journal::RedactionKey> {
+    std::sync::Arc::new(fbc_journal::RedactionKey::new(&[9; 32]).unwrap())
+}
+
 const SEC: i64 = 1_000_000_000;
 /// 2026-10-03T12:00:00Z and the next day at the same time.
 const DAY1: WallNs = WallNs(1_791_028_800 * SEC);
@@ -49,11 +54,11 @@ fn names(dir: &Path) -> Vec<String> {
 #[test]
 fn a_restarted_writer_starts_the_next_segment_and_never_overwrites() {
     let root = fresh_dir("restart");
-    let mut first = JournalWriter::create(&root, 1).unwrap();
+    let mut first = JournalWriter::create(&root, 1, key()).unwrap();
     first.append(DAY1, &timer(1)).unwrap();
     first.append(DAY1, &timer(2)).unwrap();
     drop(first);
-    let mut second = JournalWriter::create(&root, 1).unwrap();
+    let mut second = JournalWriter::create(&root, 1, key()).unwrap();
     second.flush().unwrap(); // nothing open yet
     second.append(DAY1, &timer(3)).unwrap();
     second.flush().unwrap();
@@ -70,7 +75,7 @@ fn a_restarted_writer_starts_the_next_segment_and_never_overwrites() {
 #[test]
 fn a_clock_stepping_back_across_midnight_stays_in_the_later_day() {
     let root = fresh_dir("clock_back");
-    let mut w = JournalWriter::create(&root, 1).unwrap();
+    let mut w = JournalWriter::create(&root, 1, key()).unwrap();
     w.append(DAY1, &timer(1)).unwrap();
     w.append(DAY2, &timer(2)).unwrap();
     w.append(DAY1, &timer(3)).unwrap();
@@ -89,16 +94,16 @@ fn a_writer_restarted_on_a_clock_behind_the_journal_stays_in_the_latest_day() {
     // Codex r4176373442: the shard already has a segment under the later day, and the process
     // restarts with the wall clock back in the earlier one.
     let root = fresh_dir("restart_clock_back");
-    let mut first = JournalWriter::create(&root, 1).unwrap();
+    let mut first = JournalWriter::create(&root, 1, key()).unwrap();
     first.append(DAY2, &timer(1)).unwrap();
     drop(first);
     // Another shard's later day does not hold this shard back.
-    let mut other = JournalWriter::create(&root, 2).unwrap();
+    let mut other = JournalWriter::create(&root, 2, key()).unwrap();
     other
         .append(WallNs(DAY2.0 + 86_400 * SEC), &timer(9))
         .unwrap();
     drop(other);
-    let mut second = JournalWriter::create(&root, 1).unwrap();
+    let mut second = JournalWriter::create(&root, 1, key()).unwrap();
     second.append(DAY1, &timer(2)).unwrap();
     second.append(DAY2, &timer(3)).unwrap();
     drop(second);
@@ -115,8 +120,8 @@ fn a_writer_restarted_on_a_clock_behind_the_journal_stays_in_the_latest_day() {
 #[test]
 fn the_reader_passes_over_other_shards_and_files_that_are_not_segments() {
     let root = fresh_dir("strays");
-    let mut one = JournalWriter::create(&root, 1).unwrap();
-    let mut two = JournalWriter::create(&root, 2).unwrap();
+    let mut one = JournalWriter::create(&root, 1, key()).unwrap();
+    let mut two = JournalWriter::create(&root, 2, key()).unwrap();
     one.append(DAY1, &timer(1)).unwrap();
     two.append(DAY1, &timer(20)).unwrap();
     one.append(DAY2, &timer(2)).unwrap();
@@ -148,7 +153,7 @@ fn a_directory_named_like_no_real_date_is_not_a_day() {
         )
         .unwrap();
     }
-    let mut w = JournalWriter::create(&root, 1).unwrap();
+    let mut w = JournalWriter::create(&root, 1, key()).unwrap();
     w.append(DAY1, &timer(1)).unwrap();
     drop(w);
     assert_eq!(names(&root.join("20261003")), ["1-000000.fbcj"]);
@@ -163,13 +168,13 @@ fn a_directory_that_cannot_be_made_is_an_io_error() {
     let file = root.join("a-file");
     fs::write(&file, b"x").unwrap();
     assert!(matches!(
-        JournalWriter::create(&file, 1),
+        JournalWriter::create(&file, 1, key()),
         Err(JournalError::Io(_))
     ));
 
     // A file where the day's directory should be.
     fs::write(root.join("20261003"), b"x").unwrap();
-    let mut w = JournalWriter::create(&root, 1).unwrap();
+    let mut w = JournalWriter::create(&root, 1, key()).unwrap();
     let err = w.append(DAY1, &timer(1)).unwrap_err();
     assert!(matches!(err, JournalError::Io(_)), "{err:?}");
     assert!(err.to_string().starts_with("journal i/o: "));
@@ -200,7 +205,7 @@ fn segment_bytes(records: &[Record]) -> Vec<u8> {
         "scratch-segment-{}",
         CALLS.fetch_add(1, Ordering::Relaxed)
     ));
-    let mut w = JournalWriter::create(&root, 1).unwrap();
+    let mut w = JournalWriter::create(&root, 1, key()).unwrap();
     for r in records {
         w.append(DAY1, r).unwrap();
     }

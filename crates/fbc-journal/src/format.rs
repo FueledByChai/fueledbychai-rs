@@ -5,11 +5,14 @@
 //! little-endian; an `Option` is a byte (0 none, 1 some) and the value; a byte string or text
 //! is its length (`u32`) and its bytes; an enum is a tag byte and its fields.
 //!
-//! Redacted content is never written. A [`WireSlice`] or [`WireUrl`] is its total length, its
-//! span count, each span's start and end (`u32`), and then only the bytes outside the spans;
-//! a secret header is its name, a flag byte, and its value's length alone. The reader puts
-//! [`BLANK`] where the spans were. A record redacts at most [`MAX_REDACTED`] bytes, so a
-//! damaged length cannot make the reader allocate more than that for blanks.
+//! Redacted content is never written (FBC-apz, decision 0024). A [`WireSlice`] or [`WireUrl`] is
+//! its total length, its span count, each span's start and end (`u32`) and the span's
+//! HMAC-SHA-256 under the [`RedactionKey`] (32 bytes), and then only the bytes outside the
+//! spans; a secret header is its name, a flag byte, its value's length and the value's
+//! HMAC-SHA-256. The reader puts [`BLANK`] where the spans were and returns the hashes beside
+//! the record ([`Record::digests`] gives their order). A record redacts at most
+//! [`MAX_REDACTED`] bytes, so a damaged length cannot make the reader allocate more than that
+//! for blanks.
 
 use core::ops::Range;
 
@@ -23,11 +26,13 @@ use crate::record::{
     BLANK, ControlEvent, HeaderRec, HttpRequestRec, HttpResponseRec, Marker, Opaque, Opcode,
     Record, WriteRes,
 };
+use crate::redact::{DIGEST_LEN, RedactionKey, SpanDigest};
 
 /// The first bytes of every segment.
 pub const MAGIC: [u8; 4] = *b"FBCJ";
-/// The format version this crate writes and reads.
-pub const VERSION: u16 = 1;
+/// The format version this crate writes and reads. Version 1 (FBC-aen) wrote no hash for a
+/// span; version 2 writes each span's keyed hash (FBC-apz).
+pub const VERSION: u16 = 2;
 /// The most bytes one record may redact, its spans and secret header values together.
 /// Credentials are short; the bound keeps a damaged length from making the reader allocate
 /// gigabytes of blanks. The writer refuses a record over it ([`JournalError::TooLarge`]).
@@ -107,9 +112,13 @@ fn len32(n: usize) -> Result<u32, JournalError> {
     u32::try_from(n).map_err(|_| JournalError::TooLarge)
 }
 
-/// Appends a record's body (kind and fields) to `out`.
-pub(crate) fn encode(record: &Record, out: &mut Vec<u8>) -> Result<(), JournalError> {
-    encode_within(record, out, usize::MAX)
+/// Appends a record's body (kind and fields) to `out`, each redacted span hashed under `key`.
+pub(crate) fn encode(
+    record: &Record,
+    key: &RedactionKey,
+    out: &mut Vec<u8>,
+) -> Result<(), JournalError> {
+    encode_within(record, key, out, usize::MAX)
 }
 
 /// [`encode`], refusing a body longer than `limit` bytes with [`JournalError::TooLarge`]
@@ -117,11 +126,12 @@ pub(crate) fn encode(record: &Record, out: &mut Vec<u8>) -> Result<(), JournalEr
 /// costs no copy of its payload. A refused record leaves `out` as it was.
 pub(crate) fn encode_within(
     record: &Record,
+    key: &RedactionKey,
     out: &mut Vec<u8>,
     limit: usize,
 ) -> Result<(), JournalError> {
     let start = out.len();
-    let encoded = encode_body(record, out, limit);
+    let encoded = encode_body(record, key, out, limit);
     // A refused record leaves `out` as it found it.
     if encoded.is_err() {
         out.truncate(start);
@@ -129,10 +139,16 @@ pub(crate) fn encode_within(
     encoded
 }
 
-fn encode_body(record: &Record, out: &mut Vec<u8>, limit: usize) -> Result<(), JournalError> {
+fn encode_body(
+    record: &Record,
+    key: &RedactionKey,
+    out: &mut Vec<u8>,
+    limit: usize,
+) -> Result<(), JournalError> {
     let mut e = Enc {
         end: body_end(out.len(), limit),
         out,
+        key,
         redacted: 0,
         over: false,
     };
@@ -268,16 +284,20 @@ fn encode_body(record: &Record, out: &mut Vec<u8>, limit: usize) -> Result<(), J
     Ok(())
 }
 
+/// A span's descriptor: its start and end (`u32`) and its keyed hash.
+const SPAN_DESCRIPTOR: usize = 8 + DIGEST_LEN;
+
 /// Where a body that starts at `start` in its buffer must end: within `limit` bytes, and never
 /// past the format's `u32` body length.
 fn body_end(start: usize, limit: usize) -> usize {
     start.saturating_add(limit.min(u32::MAX as usize))
 }
 
-/// The output, the bytes redacted so far, where the body must end by, and whether it has
-/// passed that end, after which nothing more is copied.
+/// The output, the key spans are hashed under, the bytes redacted so far, where the body must
+/// end by, and whether it has passed that end, after which nothing more is copied.
 struct Enc<'a> {
     out: &'a mut Vec<u8>,
+    key: &'a RedactionKey,
     redacted: u64,
     end: usize,
     over: bool,
@@ -370,14 +390,15 @@ impl Enc<'_> {
         self.conn(s.conn);
     }
 
-    /// Content with redaction spans: lengths and spans, then only the bytes outside them.
+    /// Content with redaction spans: lengths, each span with its keyed hash, then only the
+    /// bytes outside the spans.
     fn spanned(&mut self, bytes: &[u8], spans: &[Range<u32>]) -> Result<(), JournalError> {
         self.u32(len32(bytes.len())?);
         self.u32(len32(spans.len())?);
         // Descriptors that cannot fit stop the record before the spans are walked. Then the
         // spans are counted, stopping at the first one past MAX_REDACTED, so a record that
-        // redacts too much writes no descriptor.
-        if spans.len().saturating_mul(8) > self.room() {
+        // redacts too much writes no descriptor and hashes no span.
+        if spans.len().saturating_mul(SPAN_DESCRIPTOR) > self.room() {
             self.over = true;
             return Err(JournalError::TooLarge);
         }
@@ -387,6 +408,10 @@ impl Enc<'_> {
         for span in spans {
             self.u32(span.start);
             self.u32(span.end);
+            let digest = self
+                .key
+                .digest(&bytes[span.start as usize..span.end as usize]);
+            self.put(&digest.0);
             self.within()?;
         }
         let mut at = 0;
@@ -399,7 +424,7 @@ impl Enc<'_> {
         self.within()
     }
 
-    /// Headers: a secret one's value is written as its length alone.
+    /// Headers: a secret one's value is written as its length and its keyed hash.
     fn headers(&mut self, headers: &[HeaderRec]) -> Result<(), JournalError> {
         self.u32(len32(headers.len())?);
         for h in headers {
@@ -408,6 +433,9 @@ impl Enc<'_> {
                 self.redact(h.value.len() as u64)?;
                 self.u8(1);
                 self.u32(len32(h.value.len())?);
+                let digest = self.key.digest(h.value.as_bytes());
+                self.put(&digest.0);
+                self.within()?;
             } else {
                 self.u8(0);
                 self.bytes(h.value.as_bytes())?;
@@ -444,12 +472,14 @@ impl Enc<'_> {
 /// What in a record body could not be read; the reader names the segment.
 pub(crate) type Bad = &'static str;
 
-/// Reads one record body, which must be consumed exactly.
-pub(crate) fn decode(body: &[u8]) -> Result<Record, Bad> {
+/// Reads one record body, which must be consumed exactly: the record with its spans blanked,
+/// and the keyed hashes written in their place, in the order [`Record::digests`] gives.
+pub(crate) fn decode(body: &[u8]) -> Result<(Record, Vec<SpanDigest>), Bad> {
     let mut d = Dec {
         buf: body,
         at: 0,
         blanked: 0,
+        digests: Vec::new(),
     };
     let record = match d.u8()? {
         INBOUND => {
@@ -549,7 +579,7 @@ pub(crate) fn decode(body: &[u8]) -> Result<Record, Bad> {
     if d.at != body.len() {
         return Err("bytes after the record");
     }
-    Ok(record)
+    Ok((record, d.digests))
 }
 
 struct Dec<'a> {
@@ -557,6 +587,8 @@ struct Dec<'a> {
     at: usize,
     /// Blank bytes put in so far.
     blanked: u64,
+    /// The keyed hashes read so far, in record order.
+    digests: Vec<SpanDigest>,
 }
 
 impl<'a> Dec<'a> {
@@ -645,7 +677,15 @@ impl<'a> Dec<'a> {
         })
     }
 
-    /// Content written with [`Enc::spanned`], each span filled with [`BLANK`].
+    /// A span's keyed hash.
+    fn digest(&mut self) -> Result<(), Bad> {
+        let digest = SpanDigest(self.array()?);
+        self.digests.push(digest);
+        Ok(())
+    }
+
+    /// Content written with [`Enc::spanned`], each span filled with [`BLANK`] and its hash
+    /// kept.
     fn spanned(&mut self) -> Result<(Vec<u8>, Vec<Range<u32>>), Bad> {
         let len = self.u32()?;
         let count = self.u32()?;
@@ -657,13 +697,15 @@ impl<'a> Dec<'a> {
             if span.start < at || span.start >= span.end || span.end > len {
                 return Err("redaction spans");
             }
+            // Counted before any blank is allocated.
+            self.blank(u64::from(span.end - span.start))?;
+            self.digest()?;
             spans.push(span.clone());
             at = span.end;
         }
         let mut at = 0;
         for span in &spans {
             out.extend_from_slice(self.take((span.start - at) as usize)?);
-            self.blank(u64::from(span.end - span.start))?;
             out.resize(span.end as usize, BLANK);
             at = span.end;
         }
@@ -680,6 +722,7 @@ impl<'a> Dec<'a> {
             let value = if redact {
                 let len = self.u32()?;
                 self.blank(u64::from(len))?;
+                self.digest()?;
                 String::from_utf8(vec![BLANK; len as usize]).expect("BLANK is ASCII")
             } else {
                 self.text()?
@@ -720,8 +763,12 @@ mod tests {
 
     fn round_trip(record: &Record) -> Record {
         let mut body = Vec::new();
-        encode(record, &mut body).unwrap();
-        decode(&body).unwrap()
+        encode(record, &key(), &mut body).unwrap();
+        decode(&body).unwrap().0
+    }
+
+    fn key() -> RedactionKey {
+        RedactionKey::new(&[3; 32]).unwrap()
     }
 
     fn conn() -> ConnKey {
@@ -767,15 +814,15 @@ mod tests {
         for record in &records {
             let mut body = Vec::new();
             assert!(matches!(
-                encode_within(record, &mut body, 256),
+                encode_within(record, &key(), &mut body, 256),
                 Err(JournalError::TooLarge)
             ));
             assert!(body.capacity() <= 512, "{}", body.capacity());
             // Within a limit it fits, it encodes as without one.
             let mut unlimited = Vec::new();
-            encode(record, &mut unlimited).unwrap();
+            encode(record, &key(), &mut unlimited).unwrap();
             let mut limited = Vec::new();
-            encode_within(record, &mut limited, unlimited.len()).unwrap();
+            encode_within(record, &key(), &mut limited, unlimited.len()).unwrap();
             assert_eq!(limited, unlimited);
         }
         // Codex r4176868162: a text frame that fits but is not UTF-8 is refused before its
@@ -787,7 +834,7 @@ mod tests {
             bytes: Opaque(vec![0xff; 1 << 20]),
         };
         assert!(matches!(
-            encode(&not_utf8, &mut body),
+            encode(&not_utf8, &key(), &mut body),
             Err(JournalError::Unencodable(_))
         ));
         assert!(body.capacity() < 1 << 10, "{}", body.capacity());
@@ -798,7 +845,7 @@ mod tests {
             bytes: Opaque(vec![0xff; 1 << 20]),
         };
         assert!(matches!(
-            encode_within(&not_utf8, &mut Vec::new(), 256),
+            encode_within(&not_utf8, &key(), &mut Vec::new(), 256),
             Err(JournalError::TooLarge)
         ));
     }
@@ -813,11 +860,11 @@ mod tests {
         assert_eq!(round_trip(&frame(b"ok")), frame(b"ok"));
         let mut body = Vec::new();
         assert!(matches!(
-            encode(&frame(&[0xff]), &mut body),
+            encode(&frame(&[0xff]), &key(), &mut body),
             Err(JournalError::Unencodable("a text frame that is not UTF-8"))
         ));
         // A damaged segment that labels other bytes as text.
-        encode(&frame(b"x"), &mut body).unwrap();
+        encode(&frame(b"x"), &key(), &mut body).unwrap();
         *body.last_mut().unwrap() = 0xff;
         assert_eq!(decode(&body), Err("text frame"));
         // Binary frames are any bytes.
@@ -896,7 +943,7 @@ mod tests {
             rpc: Some(RpcId(4)),
             frame,
         };
-        encode(&r, &mut body).unwrap();
+        encode(&r, &key(), &mut body).unwrap();
         body
     }
 
@@ -937,7 +984,7 @@ mod tests {
             (outbound_with(&words(&[6, 1, 2, 2])), "redaction spans"),
             (outbound_with(&words(&[6, 1, 5, 7])), "redaction spans"),
             (
-                outbound_with(&words(&[6, 2, 3, 4, 1, 2])),
+                outbound_with(&[&words(&[6, 2, 3, 4])[..], &[0; 32], &words(&[1, 2])].concat()),
                 "redaction spans",
             ),
             // A write result, an HTTP result, a control event and a marker of no known tag.
@@ -1005,7 +1052,7 @@ mod tests {
         assert_eq!(round_trip(&at_limit), at_limit.blanked());
         let mut body = Vec::new();
         assert!(matches!(
-            encode(&outbound(MAX_REDACTED + 1), &mut body),
+            encode(&outbound(MAX_REDACTED + 1), &key(), &mut body),
             Err(JournalError::TooLarge)
         ));
         // Spans and secret header values count together.
@@ -1033,7 +1080,7 @@ mod tests {
             redact: true,
         });
         assert!(matches!(
-            encode(&result(headers), &mut body),
+            encode(&result(headers), &key(), &mut body),
             Err(JournalError::TooLarge)
         ));
     }
@@ -1068,7 +1115,7 @@ mod tests {
         // A URL that is not UTF-8, then a span that splits a character of it.
         let not_utf8 = [&[0][..], &words(&[1, 0]), &[0xff]].concat();
         assert_eq!(decode(&request_with(&not_utf8)), Err("url text"));
-        let split = [&[0][..], &words(&[2, 1, 1, 2]), &[0xc3]].concat();
+        let split = [&[0][..], &words(&[2, 1, 1, 2]), &[0; 32], &[0xc3]].concat();
         assert_eq!(decode(&request_with(&split)), Err("url text"));
         // An unknown method.
         assert_eq!(decode(&request_with(&[9])), Err("method"));
@@ -1085,8 +1132,10 @@ mod tests {
         // Codex r4176902248: past the limit, no later element is written. A secret header
         // after the limit would count redacted bytes if it were visited.
         let mut out = Vec::new();
+        let k = key();
         let mut e = Enc {
             out: &mut out,
+            key: &k,
             redacted: 0,
             end: 16,
             over: false,
@@ -1107,8 +1156,10 @@ mod tests {
         assert_eq!(e.redacted, 0);
 
         let mut out = Vec::new();
+        let k = key();
         let mut e = Enc {
             out: &mut out,
+            key: &k,
             redacted: 0,
             end: 16,
             over: false,
@@ -1123,8 +1174,10 @@ mod tests {
         assert!(e.out.len() <= 16);
 
         let mut out = Vec::new();
+        let k = key();
         let mut e = Enc {
             out: &mut out,
+            key: &k,
             redacted: 0,
             end: 16,
             over: false,
@@ -1151,12 +1204,12 @@ mod tests {
             bytes: Opaque(payload),
         };
         assert!(matches!(
-            encode_within(&record, &mut Vec::new(), 64),
+            encode_within(&record, &key(), &mut Vec::new(), 64),
             Err(JournalError::TooLarge)
         ));
         let mut unlimited = Vec::new();
         assert!(matches!(
-            encode(&record, &mut unlimited),
+            encode(&record, &key(), &mut unlimited),
             Err(JournalError::Unencodable(_))
         ));
     }
@@ -1175,8 +1228,10 @@ mod tests {
         // Codex r4176960480: spans redacting more than MAX_REDACTED in all are refused before
         // their descriptors are written, however much room the limit leaves.
         let mut out = Vec::new();
+        let k = key();
         let mut e = Enc {
             out: &mut out,
+            key: &k,
             redacted: 0,
             end: usize::MAX,
             over: false,
@@ -1196,8 +1251,10 @@ mod tests {
     fn span_descriptors_that_cannot_fit_are_refused_before_the_spans_are_walked() {
         // Codex r4176986652: with no room for the descriptors, the spans are not counted.
         let mut out = Vec::new();
+        let k = key();
         let mut e = Enc {
             out: &mut out,
+            key: &k,
             redacted: 0,
             end: 64,
             over: false,

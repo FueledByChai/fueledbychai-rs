@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::JournalError;
 use crate::format::{self, MAGIC, VERSION};
 use crate::record::Record;
+use crate::redact::SpanDigest;
 use crate::writer::list_segments;
 
 /// Reads one shard's records in the order they were written: the day directories in date
@@ -17,6 +18,10 @@ use crate::writer::list_segments;
 /// An error in a segment (a bad header, a record cut short, a record that cannot be read)
 /// is returned once, and reading goes on with the next segment, since nothing after a
 /// damaged record in the same segment can be found again.
+///
+/// As an iterator it returns records with their redaction spans blanked
+/// ([`Record::blanked`]); [`entries`](JournalReader::entries) returns each with the keyed
+/// hashes written in place of its spans.
 pub struct JournalReader {
     segments: VecDeque<PathBuf>,
     open: Option<(PathBuf, BufReader<File>)>,
@@ -35,9 +40,14 @@ impl JournalReader {
         })
     }
 
-    /// The next record of the open segment, opening the next segment when there is none.
+    /// The records with the keyed hashes of their spans, in the same order.
+    pub fn entries(self) -> Entries {
+        Entries { reader: self }
+    }
+
+    /// The next entry of the open segment, opening the next segment when there is none.
     /// `Ok(None)` when the open segment ended cleanly.
-    fn next_in_segment(&mut self) -> Result<Option<Record>, JournalError> {
+    fn next_in_segment(&mut self) -> Result<Option<Entry>, JournalError> {
         let (path, file) = match &mut self.open {
             Some(open) => open,
             None => {
@@ -82,21 +92,18 @@ impl JournalReader {
             });
         }
         format::decode(&body)
-            .map(Some)
+            .map(|(record, digests)| Some(Entry { record, digests }))
             .map_err(|what| JournalError::Malformed {
                 segment: path.clone(),
                 what,
             })
     }
-}
 
-impl Iterator for JournalReader {
-    type Item = Result<Record, JournalError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+    /// The next entry in write order, across segments and days.
+    fn next_entry(&mut self) -> Option<Result<Entry, JournalError>> {
         while self.open.is_some() || !self.segments.is_empty() {
             match self.next_in_segment() {
-                Ok(Some(record)) => return Some(Ok(record)),
+                Ok(Some(entry)) => return Some(Ok(entry)),
                 Ok(None) => self.open = None,
                 Err(e) => {
                     self.open = None;
@@ -105,6 +112,39 @@ impl Iterator for JournalReader {
             }
         }
         None
+    }
+}
+
+impl Iterator for JournalReader {
+    type Item = Result<Record, JournalError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_entry().map(|e| e.map(|entry| entry.record))
+    }
+}
+
+/// A record as read back, with the keyed hash of each of its redaction spans in the order
+/// [`Record::digests`] gives (decision 0024). A live record matches one read back when its
+/// [`blanked`](Record::blanked) form equals `record` and its [`digests`](Record::digests)
+/// under the same key equal `digests`: bytes compared outside the spans, hashes inside.
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+pub struct Entry {
+    /// The record, its spans blanked ([`Record::blanked`]).
+    pub record: Record,
+    /// The keyed hash of each span, in record order.
+    pub digests: Vec<SpanDigest>,
+}
+
+/// A [`JournalReader`]'s entries ([`JournalReader::entries`]).
+pub struct Entries {
+    reader: JournalReader,
+}
+
+impl Iterator for Entries {
+    type Item = Result<Entry, JournalError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.reader.next_entry()
     }
 }
 

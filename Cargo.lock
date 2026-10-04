@@ -444,6 +444,8 @@ name = "fbc-journal"
 version = "0.0.1"
 dependencies = [
  "fbc-core",
+ "hmac",
+ "sha2",
 ]
 
 [[package]]
