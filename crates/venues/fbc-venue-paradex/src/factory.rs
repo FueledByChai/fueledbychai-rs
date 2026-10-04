@@ -7,16 +7,17 @@
 //! commit `b8248fb747e278d2167ac2f056b339a287d5ef30` ("the schema" below).
 
 use core::time::Duration;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use fbc_core::{
-    Cadence, Channel, ConfigError, ConfigScope, ConnTopology, Encoding, EndpointPlan, ExchTsKind,
-    ExecCodec, ExecEndpoint, FeedSource, FieldSpec, FieldUnit, FundingCaps, LimitScope,
-    MatchingCaps, MdCaps, MdCodec, MdTransport, OpKind, RateLimit, Readiness, SeqDomain, SpecTable,
-    StpScope, StreamId, Subscription, TagSet, TouchSourceCaps, TradeCaps, VenueCaps, VenueConfig,
-    VenueError, VenueFactory, WireUrl,
+    BookCaps, Cadence, Channel, ConfigError, ConfigScope, ConnTopology, Continuity, Encoding,
+    EndpointPlan, ExchTsKind, ExecCodec, ExecEndpoint, Feed, FeedSource, FieldSpec, FieldUnit,
+    FundingCaps, LimitScope, MatchingCaps, MdCaps, MdCodec, MdTransport, OpKind, QueueModelQuality,
+    RateLimit, Readiness, SeqDomain, SpecTable, StpScope, StreamId, Subscription, TagSet,
+    TouchSourceCaps, TradeCaps, VenueCaps, VenueConfig, VenueError, VenueFactory, WireUrl,
 };
 
+use crate::md::book::BOOK_CHANNELS;
 use crate::md::{self, ParadexMd, sbe};
 
 /// The configuration key of the public WebSocket URL, without the SBE negotiation
@@ -25,7 +26,8 @@ use crate::md::{self, ParadexMd, sbe};
 /// "Introduction").
 pub const MD_URL: &str = "paradex.md.url";
 
-/// The stream the one market-data connection is planned on.
+/// The stream of the first market-data connection; a market's second book channel goes on
+/// `StreamId(1)`, and so on.
 pub const MD_STREAM: StreamId = StreamId(0);
 
 const SCHEMA: &[FieldSpec] = &[FieldSpec {
@@ -77,9 +79,12 @@ impl VenueFactory for ParadexFactory {
         Ok(caps())
     }
 
-    /// Every subscription on one connection: a binary frame names its channel by its template
-    /// id and its `market` field, so bbo and trades frames need no connection of their own
-    /// (see [`caps`], `topology`).
+    /// As few connections as can carry `subs` with at most one book channel per market on
+    /// each: a binary frame names its message by template id and its market by `market`, but
+    /// not which book channel it is on (see [`caps`], `topology`). The first connection
+    /// ([`MD_STREAM`]) carries every bbo and trades subscription and each market's first book
+    /// channel; connection `k` carries each market's book channel number `k`, in `BookId`
+    /// order.
     fn plan_md(
         &self,
         cfg: &VenueConfig,
@@ -87,17 +92,33 @@ impl VenueFactory for ParadexFactory {
         subs: &BTreeSet<Subscription>,
     ) -> Result<Vec<EndpointPlan>, VenueError> {
         let url = ParadexFactory::md_url(cfg)?;
+        let mut conns: Vec<Vec<Subscription>> = Vec::new();
+        let mut books_of: BTreeMap<_, usize> = BTreeMap::new();
         for sub in subs {
             md::channel(*sub, specs)?;
+            let conn = match sub.feed {
+                Feed::Book(_) => {
+                    let books = books_of.entry(sub.inst).or_insert(0);
+                    *books += 1;
+                    *books - 1
+                }
+                _ => 0,
+            };
+            if conns.len() <= conn {
+                conns.resize_with(conn + 1, Vec::new);
+            }
+            conns[conn].push(*sub);
         }
-        if subs.is_empty() {
-            return Ok(Vec::new());
-        }
-        Ok(vec![EndpointPlan {
-            stream: MD_STREAM,
-            transport: MdTransport::Socket { url },
-            subs: subs.iter().copied().collect(),
-        }])
+        // At most as many connections as declared book channels, so the index fits a u16.
+        let plans = conns
+            .into_iter()
+            .zip(0u16..)
+            .map(|(subs, stream)| EndpointPlan {
+                stream: StreamId(stream),
+                transport: MdTransport::Socket { url: url.clone() },
+                subs,
+            });
+        Ok(plans.collect())
     }
 
     fn md_codec(&self, _cfg: &VenueConfig, ep: &EndpointPlan) -> Box<dyn MdCodec> {
@@ -112,6 +133,27 @@ impl VenueFactory for ParadexFactory {
     /// None: market data only until order entry lands (BT-402).
     fn exec_codec(&self, _cfg: &VenueConfig) -> Option<Result<Box<dyn ExecCodec>, VenueError>> {
         None
+    }
+}
+
+/// One `order_book` channel at depth 15 and the 50ms refresh rate (decision 0022).
+fn book(channel: &'static str, includes: &[Channel]) -> BookCaps {
+    BookCaps {
+        channel,
+        // The channel's "@15".
+        max_depth: 15,
+        // The channel's refresh rate: changes published at most every 50ms.
+        cadence: Cadence::Capped(Duration::from_millis(50)),
+        // Decision 0022: the schema's BookEvent.seq ("DELTA must be applied in order") advances
+        // by one per frame, as FueledByChaiTrading's recorder (BookEpochSequencer) holds it.
+        continuity: Continuity::PlusOne,
+        // The venue keeps the top 15 itself with deltas; it sends no window bounds.
+        windowed: false,
+        // The channel starts with a snapshot (update type "s"); no REST anchor.
+        rest_anchor: false,
+        includes_channels: TagSet::of(includes),
+        // Aggregated levels at a 50ms cadence: queue position only brackets.
+        queue_model: QueueModelQuality::BracketOnly,
     }
 }
 
@@ -141,7 +183,7 @@ pub fn caps() -> VenueCaps {
                 cadence: Cadence::Realtime,
                 // The schema's TradeEvent.seq is "the same counter BboEvent.seq reports", the
                 // orderbook sequence number (the bbo channel's seq_no, "Sequence number of the
-                // orderbook").
+                // orderbook"); decision 0022 takes BookEvent.seq to be that counter too.
                 seq_domain: SeqDomain::SharedWithBook,
                 // BboEvent has one timestamp, `ts`; the schema's TradeEvent calls the same
                 // field the "Feed publish timestamp".
@@ -150,8 +192,15 @@ pub fn caps() -> VenueCaps {
                 // (BookEvent.bestBidPrice); bbo is the public book's.
                 includes_channels: TagSet::of(&[Channel::Public]),
             }],
-            // The order_book channel is decoded by FBC-70f; none is offered until then.
-            books: Vec::new(),
+            // docs.paradex.trade, "order_book.{market_symbol}.{feed_type}@15@{refresh_rate}":
+            // feed types `deltas` and `interactive_deltas` at the 50ms refresh rate, both
+            // carried as the schema's BookEvent (template 3).
+            // The schema's BookEvent: the interactive feed's best prices are "including RPI",
+            // so its levels show RPI liquidity too.
+            books: vec![
+                book(BOOK_CHANNELS[0], &[Channel::Public]),
+                book(BOOK_CHANNELS[1], &[Channel::Public, Channel::Rpi]),
+            ],
             trades: TradeCaps {
                 // The trades.{market} channel, TradeEvent (template 1).
                 source: FeedSource::Stream,
@@ -176,8 +225,8 @@ pub fn caps() -> VenueCaps {
             // BookEvent does not say which order-book channel (snapshot, deltas, interactive)
             // it belongs to ("Binary Encoding (SBE)": "Frames do not explicitly identify their
             // channel"). bbo and trades share a connection; at most one book channel per market
-            // and connection, enforced with the book in FBC-70f. docs.paradex.trade states no
-            // cap on subscriptions per connection.
+            // and connection, which plan_md keeps and the codec's subscribe enforces.
+            // docs.paradex.trade states no cap on subscriptions per connection.
             topology: ConnTopology::Shared {
                 max_subscriptions: None,
             },

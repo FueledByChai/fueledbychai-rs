@@ -1,0 +1,28 @@
+# BookEvent (template 3), schema 1:1, block 89: a SNAPSHOT at seq 1000
+# Hand-built from paradex_1_0.xml at tradeparadex/paradex-py b8248fb747e278d2167ac2f056b339a287d5ef30.
+# Little-endian; '#' starts a comment.
+59 00 03 00 01 00 01 00                           # header: blockLength=89 templateId=3 (BookEvent) schemaId=1 version=1
+40 5a 7d 84 41 40 06 00                           # @0 ts int64 = 1759500000123456 us
+e8 03 00 00 00 00 00 00                           # @8 seq int64 = 1000
+00                                                # @16 pkgType uint8 = 0 (SNAPSHOT)
+00 00 00 00 00 00 00 80                           # @17 bestBidPrice int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @25 bestBidSize int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @33 bestAskPrice int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @41 bestAskSize int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @49 relativeSpread int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @57 bestBidApiPrice int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @65 bestBidApiSize int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @73 bestAskApiPrice int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @81 bestAskApiSize int64 = null (INT64_MIN)
+10 00 02 00                                       # bids group: blockLength=16 numInGroup=2
+80 20 c7 8f a3 05 00 00                           #   price = 6200050000000 (62000.5)
+40 78 7d 01 00 00 00 00                           #   size = 25000000 (0.25)
+00 8a 2e 8f a3 05 00 00                           #   price = 6200040000000 (62000.4)
+00 e1 f5 05 00 00 00 00                           #   size = 100000000 (1)
+10 00 02 00                                       # asks group: blockLength=16 numInGroup=2
+00 11 c2 92 a3 05 00 00                           #   price = 6200100000000 (62001)
+80 d1 f0 08 00 00 00 00                           #   size = 150000000 (1.5)
+80 01 bd 95 a3 05 00 00                           #   price = 6200150000000 (62001.5)
+00 c2 eb 0b 00 00 00 00                           #   size = 200000000 (2)
+0c                                                # market varString8 length = 12
+42 54 43 2d 55 53 44 2d 50 45 52 50               # market = "BTC-USD-PERP"

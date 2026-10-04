@@ -152,7 +152,11 @@ fn the_factory_declares_market_data_only_with_its_cited_limits() {
     assert_eq!(md.touch_sources.len(), 1);
     assert_eq!(md.touch_sources[0].channel, "bbo");
     assert_eq!(md.trades.source, FeedSource::Stream);
-    assert!(md.books.is_empty(), "the order book is FBC-70f's");
+    assert_eq!(
+        md.books.len(),
+        2,
+        "deltas and interactive_deltas (md_book.rs)"
+    );
     assert_eq!(
         md.topology,
         ConnTopology::Shared {
