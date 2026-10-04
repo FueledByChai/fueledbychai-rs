@@ -21,13 +21,27 @@
 //! Every failure is a [`NetError`] that names the [`Step`] that failed and never quotes a
 //! URL, so a URL's user information or query cannot reach a log through it (0014 item 8).
 //!
-//! Not here yet: connection epochs, sessions and reconnects, client certificates and
-//! certificate pinning. No call here has a deadline of its own; the caller bounds one with its
-//! own timer.
+//! The logic of reconnects (FBC-5pt) has no socket, so every case of it is a
+//! unit test:
+//!
+//! - [`Epochs`] numbers the lives of one stream's connection (a close or a reconnect opens
+//!   the next epoch) and drops, counting per [`Input`], a frame, timer firing, HTTP result or
+//!   event of an older epoch, so a dead connection's late arrivals never reach the current
+//!   codec.
+//! - [`Reconciler`] yields, for one stream, only the difference between the subscriptions
+//!   wanted and those the current epoch has sent ([`SubscribeCall`]): an active subscription
+//!   is never sent twice, a new epoch subscribes the desired set once, and one that could not
+//!   be sent stays pending until it is.
+//!
+//! Not here yet: the sessions that drive codecs, effects and reconnects over these, client
+//! certificates and certificate pinning. No call here has a deadline of its own; the caller
+//! bounds one with its own timer.
 
 mod connector;
+mod epoch;
 mod error;
 pub mod http;
+mod reconcile;
 mod socks5;
 mod target;
 mod tls;
@@ -35,5 +49,7 @@ mod transport;
 pub mod ws;
 
 pub use connector::{Connector, ProxyConfig};
+pub use epoch::{Admit, EpochError, Epochs, Input};
 pub use error::{Cause, NetError, Step};
+pub use reconcile::{ReconcileError, Reconciler, SubscribeCall};
 pub use transport::Transport;

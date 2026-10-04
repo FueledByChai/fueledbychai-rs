@@ -450,6 +450,7 @@ dependencies = [
 name = "fbc-runtime"
 version = "0.0.1"
 dependencies = [
+ "fbc-core",
  "futures-util",
  "http-body-util",
  "hyper",
