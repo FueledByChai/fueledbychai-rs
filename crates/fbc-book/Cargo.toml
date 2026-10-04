@@ -1,0 +1,12 @@
+[package]
+name = "fbc-book"
+description = "A tick-indexed L2 order book built from normalized book events, the same live and in replay: touch, top-n, exact comparison and canonical bytes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+fbc-core = { path = "../fbc-core" }
