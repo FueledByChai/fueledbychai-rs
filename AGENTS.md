@@ -149,6 +149,8 @@ rather than guess.
   privacy scan, so recorded frames never go in it. `fixtures/paradex/signing/` already holds
   the signing benchmark and the Java hash oracle the Paradex signer is checked against;
   recorded Paradex frames go elsewhere under `fixtures/paradex/`.
+  `fixtures/licence-gate/` is a standalone two-crate workspace the licence gate's self-test
+  runs against (0017).
 - Docs: `docs/decisions/` (records, index in its `README.md`; cite by number, never restate one
   in a doc or a ticket), `docs/PRODUCT_BACKLOG.md` (stories), and the Beads queue in `.beads`
   (prefix `FBC`).
@@ -183,16 +185,22 @@ key- and address-shaped hex, PEM headers and master-key bytes; 0009), then, once
 exists, `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
 `cargo test --workspace`, `cargo build --workspace --release` and the credential placement
 check (a venue crate's source outside `src/sign*` and `src/auth*` that names a JWT, bearer
-token, API key, authorization header or private key fails; 0009), then the coverage
+token, API key, authorization header or private key fails; 0009), then the licence gate
+(`scripts/licence-check.sh --self-test`, which proves the gate refuses the GPL-3.0-only path
+crate in `fixtures/licence-gate` and names it, then `cargo deny check licenses` on the workspace
+against `deny.toml`'s permissive allowlist; 0017), then the coverage
 ratchet (`scripts/coverage.sh`, workspace line coverage from cargo-llvm-cov, against
 `coverage-floor.txt` with 0.2 points of slack; the workspace ticket records the first floor
 with `scripts/coverage-ratchet.sh --set`). `scripts/check.sh --fast` skips the ratchet. On the
 empty repository it takes about four minutes, almost all of it the loop's
 self-tests. cargo-llvm-cov 0.9.1 is installed once by hand (`rustup component add
 llvm-tools-preview`, `cargo install cargo-llvm-cov --version 0.9.1 --locked`); CI installs the
-same version itself, and moving it is a ticket, like the toolchain. Planned
-steps still marked TODO in the script: the dependency-direction check (with the first venue
-crate), the licence gate, and the golden-refresh flag (with `fbc-journal`).
+same version itself, and moving it is a ticket, like the toolchain. cargo-deny is required the
+same way on every machine that runs the check, fast or full (0017): install it once by hand
+with `cargo install cargo-deny --version 0.20.2 --locked`; CI installs the same version, the
+licence step fails naming the install command when it is missing or another version, and
+moving it is a ticket. Planned steps still marked TODO in the script: the dependency-direction
+check (with the first venue crate) and the golden-refresh flag (with `fbc-journal`).
 
 ### Rules
 

@@ -1,0 +1,15 @@
+# A standalone workspace of its own (fixtures/ is excluded from the main one): the licence
+# gate's self-test fixture (README.md beside this file).
+[package]
+name = "licence-gate-app"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+gpl-dep = { path = "gpl-dep" }
+
+[workspace]
+resolver = "3"
+members = ["gpl-dep"]

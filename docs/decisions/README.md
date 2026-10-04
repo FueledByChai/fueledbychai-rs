@@ -19,3 +19,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0014](0014-the-venue-boundary-as-built-refines-design-4-6-to-4-8-where-.md) The venue boundary as built refines design 4.6 to 4.8 where a sans-IO codec needs more than the design text gives it — accepted
 - [0015](0015-order-and-fill-capabilities-fold-into-one-optional-exec-bloc.md) Order and fill capabilities fold into one optional exec block, so a venue cannot claim fills without orders or orders without fills — accepted
 - [0016](0016-venue-order-paradex-first-its-signer-offline-before-market-d.md) Venue order: Paradex first, its signer offline before market data, then order entry; then Hibachi; Binance USD-M as reference — accepted, supersedes 0007
+- [0017](0017-a-licence-gate-cargo-deny-pinned-at-0-20-2-checks-every-depe.md) A licence gate: cargo-deny pinned at 0.20.2 checks every dependency against a permissive allowlist on every machine that runs the check — accepted

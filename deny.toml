@@ -1,0 +1,31 @@
+# The licence gate (decision 0017, design §3): every crate in the workspace's dependency graph,
+# dev-dependencies and every platform included, carries a licence from this permissive list,
+# and nothing of the GPL or AGPL family. scripts/licence-check.sh runs
+# `cargo deny check licenses` against this file in scripts/check.sh, with cargo-deny pinned at
+# the version that script names. Only the licences section is configured: advisories and bans
+# are not checked yet (they are a ticket of their own).
+
+[graph]
+# Optional dependencies count too: a feature switched on later must not bring in a licence
+# the gate never saw.
+all-features = true
+
+[licenses]
+# The allowlist is policy, not an inventory of today's tree: a licence listed here may not be
+# in use yet (ISC, Zlib and CDLA-Permissive-2.0 arrive with the network stack), so an unused
+# entry is not reported.
+unused-allowed-license = "allow"
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "ISC",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "Zlib",
+  "Unicode-3.0",
+  "CDLA-Permissive-2.0",
+]
+# No per-crate exceptions and no clarifications. A crate that needs one is a ticket that says
+# why, and the exception goes here with that ticket's id beside it.
+exceptions = []
