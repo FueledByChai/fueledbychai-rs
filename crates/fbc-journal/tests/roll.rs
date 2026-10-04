@@ -320,14 +320,21 @@ fn a_roll_that_cannot_compress_fails_the_append_and_keeps_the_closed_segment_rea
     assert!(matches!(err, JournalError::Io(_)), "{err:?}");
     // The record that failed was not written; the closed segment stays as it was.
     assert_eq!(read_ok(&root, 1), [timer(1)]);
-    // The writer goes on in a new segment.
+    // The writer goes on in a new segment, still in 06:00 (Codex r4177713018: the rejected
+    // roll did not move it to 07:00), so a 06:00 record goes there and 07:00 rolls again.
+    w.append(at(6, 30), &timer(5)).unwrap();
     w.append(at(7, 1), &timer(3)).unwrap();
     drop(w);
     assert_eq!(
         names(&day),
-        ["1-000000.fbcj", "1-000000.fbcj.zst.tmp", "1-000001.fbcj"]
+        [
+            "1-000000.fbcj",
+            "1-000000.fbcj.zst.tmp",
+            "1-000001.fbcj.zst",
+            "1-000002.fbcj"
+        ]
     );
-    assert_eq!(read_ok(&root, 1), [timer(1), timer(3)]);
+    assert_eq!(read_ok(&root, 1), [timer(1), timer(5), timer(3)]);
 
     // A directory where the compressed segment itself goes: the rename fails, and the
     // temporary file is removed.
@@ -347,6 +354,7 @@ fn a_roll_that_cannot_compress_fails_the_append_and_keeps_the_closed_segment_rea
     assert_eq!(read_ok(&root, 1), [timer(1)]);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_segment_that_cannot_be_read_is_an_io_error_and_reading_goes_on() {
     // A link named like an uncompressed segment, to a directory: it opens but cannot be read.

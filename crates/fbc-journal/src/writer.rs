@@ -103,28 +103,32 @@ pub(crate) struct Listed {
 
 /// One shard's segments under `root` in write order: the day directories (`YYYYMMDD`,
 /// [`parse_day`]) in date order, each day's segments in sequence order. Anything else is
-/// passed over, and so is a directory, whatever its name. A segment found both compressed and not (a writer stopped between writing the
-/// compressed form and removing the other) is listed once, compressed: the compressed form is
-/// complete before it takes its name.
+/// passed over, and so is a directory, whatever its name; an entry whose type cannot be read
+/// is an error, not passed over. A segment found both compressed and not (a writer stopped
+/// between writing the compressed form and removing the other) is listed once, compressed:
+/// the compressed form is complete before it takes its name.
 pub(crate) fn list_segments(root: &Path, shard: u16) -> io::Result<Vec<Listed>> {
     let mut found = Vec::new();
     for entry in fs::read_dir(root)? {
         let entry = entry?;
-        let day = parse_day(&entry.file_name().to_string_lossy());
-        let Some(day) = day.filter(|_| entry.file_type().is_ok_and(|t| t.is_dir())) else {
+        let Some(day) = parse_day(&entry.file_name().to_string_lossy()) else {
             continue;
         };
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
         for file in fs::read_dir(entry.path())? {
             let file = file?;
             // A directory is never a segment, whatever its name (one at a compressed
             // segment's name must not hide the uncompressed segment).
-            let named = file.file_type().is_ok_and(|t| !t.is_dir());
-            if let Some((seq, compressed)) = named
-                .then(|| file.file_name())
-                .as_ref()
-                .and_then(|n| n.to_str())
+            let Some((seq, compressed)) = file
+                .file_name()
+                .to_str()
                 .and_then(|n| segment_seq(n, shard))
-            {
+            else {
+                continue;
+            };
+            if !file.file_type()?.is_dir() {
                 found.push((day, seq, !compressed, file.path()));
             }
         }
@@ -143,9 +147,13 @@ pub(crate) fn list_segments(root: &Path, shard: u16) -> io::Result<Vec<Listed>> 
 }
 
 /// Compresses the closed segment at `plain` into `<plain>.zst` and removes `plain`. The
-/// compressed form is written under a temporary name, synced, and renamed into place, so a
-/// segment named `.zst` is always whole; until the rename, `plain` is the segment.
+/// compressed form is written under a temporary name, synced, and renamed into place, and the
+/// rename made durable before `plain` is removed, so a segment named `.zst` is always whole
+/// and a power loss leaves at least one form; until the rename, `plain` is the segment.
 fn compress(plain: &Path) -> io::Result<()> {
+    let dir = plain
+        .parent()
+        .expect("a segment lives in its day's directory");
     let done = with_ext(plain, COMPRESSED_EXT);
     let tmp = with_ext(&done, "tmp");
     let written = File::create(&tmp).and_then(|out| {
@@ -161,7 +169,18 @@ fn compress(plain: &Path) -> io::Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     written?;
-    fs::remove_file(plain)
+    sync_dir(dir)?;
+    fs::remove_file(plain)?;
+    sync_dir(dir)
+}
+
+/// Makes the entries of `dir` (a rename, a removal) durable, where the platform can.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 /// `path` with `.ext` appended to its name.
@@ -245,11 +264,11 @@ impl JournalWriter {
     /// Writes a record body [`format::encode`] made, filed under the UTC hour of `now`. A
     /// record of a later hour first closes and compresses the open segment; if that fails,
     /// the record is not written, the closed segment stays as it is (uncompressed, and read
-    /// as such), and the next record starts a new segment.
+    /// as such), the writer stays in the closed segment's hour, and the next record starts a
+    /// new segment.
     pub(crate) fn append_body(&mut self, now: WallNs, body: &[u8]) -> Result<(), JournalError> {
         let len = u32::try_from(body.len()).map_err(|_| JournalError::TooLarge)?;
         let hour = hour_of(now).max(self.latest.unwrap_or(i64::MIN));
-        self.latest = Some(hour);
         let segment = match self.open.take() {
             Some(open) if open.hour == hour => open,
             open => {
@@ -259,6 +278,8 @@ impl JournalWriter {
                 self.start(hour)?
             }
         };
+        // Only now, with the segment of `hour` open: a rejected roll leaves the hour as it was.
+        self.latest = Some(hour);
         let file = &mut self.open.insert(segment).file;
         let written = file
             .write_all(&len.to_le_bytes())
