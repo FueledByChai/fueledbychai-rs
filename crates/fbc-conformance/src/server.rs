@@ -175,7 +175,7 @@ impl StubServer {
 enum Cmd {
     Push(Frame, oneshot::Sender<bool>),
     Close(oneshot::Sender<bool>),
-    Silent,
+    Silent(oneshot::Sender<bool>),
 }
 
 /// The player's handle on an upgraded connection.
@@ -268,7 +268,8 @@ async fn serve_ws(
                 Some(Cmd::Close(sent)) => {
                     let _ = sent.send(ws.close(None).await.is_ok());
                 }
-                Some(Cmd::Silent) => {
+                Some(Cmd::Silent(sent)) => {
+                    let _ = sent.send(true);
                     let _ = stop.changed().await;
                     break;
                 }
@@ -311,9 +312,12 @@ async fn play(
                     return Err(closed);
                 }
             }
+            // The step ends once the connection has stopped reading (Codex r4177514250).
             Step::Silent { conn } => {
                 let (handle, closed) = handle(&mut conns, step, conn)?;
-                handle.cmds.send(Cmd::Silent).map_err(|_| closed)?;
+                if !done(handle, Cmd::Silent).await {
+                    return Err(closed);
+                }
             }
         }
     }

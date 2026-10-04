@@ -78,8 +78,8 @@ async fn a_silent_connection_stays_open_reading_nothing_until_the_stub_is_droppe
     .await;
     let mut ws = connector().websocket(&server.ws_url("/md")).await.unwrap();
     ws.send(Message::text("one")).await.unwrap();
+    // Once the script has finished, the connection has gone silent (Codex r4177514250).
     server.finished().await.unwrap();
-    settle().await;
     ws.send(Message::text("two")).await.unwrap();
     settle().await;
     assert_eq!(server.connections()[0].received, [Frame::text("one")]);
