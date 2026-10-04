@@ -55,6 +55,12 @@ jobs:
             rustup component add llvm-tools-preview
             cargo install cargo-llvm-cov --version 0.9.1 --locked
           fi
+      # The licence gate (0017): the same pinned cargo-deny scripts/licence-check.sh requires.
+      - name: Install cargo-deny
+        run: |
+          if [ -f Cargo.toml ]; then
+            cargo install cargo-deny --version 0.20.2 --locked
+          fi
       # The queue checks read the commits, and a shallow clone leaves git log origin/main with
       # only the tip, so --reconcile cannot see the commits a closed ticket names (LK-48).
       - name: Fetch the queue's history

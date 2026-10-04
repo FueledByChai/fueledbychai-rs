@@ -43,11 +43,15 @@ if [ -f Cargo.toml ]; then
   else
     echo "skipped: no venue crate yet"
   fi
+  # Licence gate (0017, design §3): every dependency carries a licence on deny.toml's
+  # permissive allowlist. Needs the pinned cargo-deny on every machine, as coverage needs
+  # cargo-llvm-cov; the self-test proves the gate refuses a GPL-3.0-only crate and names it.
+  step "licence gate"
+  scripts/licence-check.sh --self-test
+  scripts/licence-check.sh
   # TODO: dependency rules (design §3): fbc-core, fbc-book, fbc-oms, fbc-journal and fbc-sim
   # never depend on a venue crate; only crates/venues/fbc-venues sees concrete venues. Waits on:
   # the first venue crate (scripts/check-deps.sh reading `cargo metadata` lands with it).
-  # TODO: licence gate (`cargo deny check licenses`, design §3, §16). Waits on: whether
-  # cargo-deny is installed on every machine that runs the check, or only in CI.
   # TODO: exact-replay and signing goldens run as cargo tests; a refresh flag is needed only if
   # a golden must be regenerated. Waits on: where the golden journals live and who approves a
   # refresh (decide when fbc-journal lands, 0006).
