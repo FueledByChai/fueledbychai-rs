@@ -362,6 +362,7 @@ pub struct ScriptedWs {
 enum Out {
     Send(Message),
     Drop,
+    Stall,
 }
 
 /// One accepted connection: the text frames the client sent, in order, and a way to answer.
@@ -396,6 +397,7 @@ impl ScriptedWs {
                             },
                             cmd = out.recv() => match cmd {
                                 Some(Out::Send(message)) => ws.send(message).await.unwrap(),
+                                Some(Out::Stall) => std::future::pending().await,
                                 _ => {
                                     let _ = ws.close(None).await;
                                     break;
@@ -438,6 +440,11 @@ impl Peer {
         let _ = self
             .to_client
             .send(Out::Send(Message::binary(bytes.to_vec())));
+    }
+
+    /// Stops reading from the client, holding the connection open.
+    pub fn stall(&self) {
+        let _ = self.to_client.send(Out::Stall);
     }
 
     /// Closes the connection.

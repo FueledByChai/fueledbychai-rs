@@ -223,6 +223,25 @@ async fn an_attempt_that_does_not_open_by_its_deadline_fails_and_the_control_sto
     assert_eq!(session.counters().failed_attempts, 2);
 }
 
+#[tokio::test]
+async fn dropping_the_control_stops_a_session_whose_write_waits_on_a_peer_that_stopped_reading() {
+    let mut server = ScriptedWs::start().await;
+    let config = session(ToyVenue::leak(), server.url(), &[1], quick());
+    let (mut session, control) = MdSession::new(config, |_| {}).unwrap();
+    let script = async move {
+        let mut peer = server.accept().await;
+        assert_eq!(peer.recv().await, "hello|codec=0|plan=1");
+        assert_eq!(peer.recv().await, "sub|add=A");
+        // 64 MiB is far more than the loopback socket buffers hold (Codex r4177113779).
+        peer.send("big|kb=65536");
+        peer.stall();
+        tokio::time::sleep(ms(200)).await;
+        drop(control);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_refusing_server_sees_attempts_spaced_by_the_backoff_and_within_the_budget() {
     let (addr, mut accepts) = refusing().await;

@@ -5,7 +5,8 @@
 //! are the instruments of the plan it was built for), and
 //! `sub|add=A,B|remove=C` per subscribe call (empty parts left out).
 //! In: `trade|sym=A|px=<ticks>|qty=<lots>|seq=<n>` is a trade; `arm|sym=A|ms=<n>` sets a timer
-//! whose firing reports the instrument's trades stale; `bye` asks for a reconnect; `odd` asks for
+//! whose firing reports the instrument's trades stale; `big|kb=<n>` asks for an `n` KiB frame;
+//! `bye` asks for a reconnect; `odd` asks for
 //! a frame and a reconnect on another stream and an HTTP request, which a session refuses.
 //! Anything else, and every binary frame, is malformed.
 
@@ -272,6 +273,10 @@ impl MdCodec for ToyMd {
                 tag: TimerTag(u64::from(inst()?.get())),
                 after: Duration::from_millis(num(&fields, "ms")? as u64),
             }),
+            "big" => {
+                let kb = num(&fields, "kb")? as usize;
+                fx.push(send(STREAM, "x".repeat(kb * 1024)));
+            }
             "bye" => fx.push(Effect::Reconnect {
                 stream: STREAM,
                 reason: "bye",

@@ -39,7 +39,9 @@ that never answers would otherwise hold the session in one attempt indefinitely.
   `kernel_rx` `None` until FBC-2y3.
 - **Control.** `MdControl::set_desired` replaces the desired set through a watch channel that
   holds only the latest set, so nothing queues; the reconciler sends only the difference.
-  Dropping the control stops the session.
+  Dropping the control stops the session, even while a write waits on a peer that stopped
+  reading; a close frame is sent only if the socket takes it at once, and a stopping or
+  reconnecting session never waits on one.
 - **Effects.** `Send` and `Reconnect` for the session's own stream are executed in order (a
   frame whose bytes are UTF-8 goes as a text frame, any other as binary); `Timer` fires into the
   epoch that set it, and into nothing once that epoch has ended (counted as stale). A frame or
