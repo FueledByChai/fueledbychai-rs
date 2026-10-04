@@ -1,17 +1,26 @@
-//! A toy market-data venue for the runtime's session tests (FBC-ku8): `exec: None`, trades only,
-//! a text protocol of one `kind|key=value|...` record per frame. It describes no real venue.
+//! A toy market-data venue for the runtime's session tests (FBC-ku8, FBC-klr): `exec: None`,
+//! trades only, a text protocol of one `kind|key=value|...` record per frame. It describes no
+//! real venue.
 //!
+//! Plan: trades only, at most two subscriptions per socket endpoint in instrument order; the
+//! `n`th endpoint is `StreamId(n)` at the configuration's `toy.url.<n>`.
 //! Out: `hello|codec=<n>|plan=<ids>` on open (`n` counts the codecs its factory built, `ids`
 //! are the instruments of the plan it was built for), and
 //! `sub|add=A,B|remove=C` per subscribe call (empty parts left out).
 //! In: `trade|sym=A|px=<ticks>|qty=<lots>|seq=<n>` is a trade; `arm|sym=A|ms=<n>` sets a timer
 //! whose firing reports the instrument's trades stale; `big|kb=<n>` asks for an `n` KiB frame;
-//! `bye` asks for a reconnect; `odd` asks for
-//! a frame and a reconnect on another stream and an HTTP request, which a session refuses.
-//! Anything else, and every binary frame, is malformed.
+//! `bye` asks for a reconnect; `say` asks to send `said`; `get|tag=<n>|ms=<t>|url=<u>` asks for
+//! a GET of `u` with a `t` ms timeout; `odd` asks for a frame and a reconnect on another stream,
+//! which a session refuses. Anything else, and every binary frame, is malformed.
+//!
+//! Every `on_http` is logged as `<codec>/<tag>:<status>:<x-toy header>` or
+//! `<codec>/<tag>:<failure>`, and a response body's lines are read as frames. On a poll
+//! endpoint the codec sends nothing: `on_open` sets a 10 ms timer whose firing asks for
+//! `<base_url>/poll?syms=<subscribed>`, and each answer sets it again.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fbc_core::{
@@ -19,10 +28,10 @@ use fbc_core::{
     Encoding, EndpointPlan, ExchTsKind, ExecCodec, ExecEndpoint, Feed, FeedHealth, FeedSource,
     FieldSpec, FundingCaps, FundingSpec, HttpFailure, HttpMethod, HttpRequest, HttpResponse,
     HttpTag, InstrumentId, InstrumentKind, InstrumentSpec, Keepalive, Lots, MatchingCaps, MdCaps,
-    MdCodec, MdEvent, MdSink, MonoNs, OpKind, PriceGrid, RateCharge, RawFrame, Readiness, SizeStep,
-    SpecTable, StpScope, StreamId, Subscription, Ticks, TimerTag, TradeCaps, TradingStatus,
-    TrafficClass, UnderlyingId, VenueCaps, VenueConfig, VenueError, VenueFactory, VenueId,
-    VenueMeta, WallNs, WireSlice, WireUrl, dispatch_market_data,
+    MdCodec, MdEvent, MdSink, MdTransport, MonoNs, OpKind, PriceGrid, RateCharge, RawFrame,
+    Readiness, SizeStep, SpecTable, StpScope, StreamId, Subscription, Ticks, TimerTag, TradeCaps,
+    TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueConfig, VenueError, VenueFactory,
+    VenueId, VenueMeta, WallNs, WireSlice, WireUrl, dispatch_market_data,
 };
 use rust_decimal::Decimal;
 
@@ -30,13 +39,16 @@ use rust_decimal::Decimal;
 pub const STREAM: StreamId = StreamId(0);
 /// The configuration key that makes the toy refuse its configuration.
 pub const REFUSE: &str = "toy.refuse";
+/// The configuration key that makes the toy name every endpoint of a plan stream 0.
+pub const ONE_STREAM: &str = "toy.one_stream";
 /// The toy's instruments, by id: 1 is `A`, 2 is `B`, 3 is `C`.
 const SYMBOLS: [&str; 3] = ["A", "B", "C"];
 
-/// The toy venue; it counts the codecs it builds.
+/// The toy venue; it counts the codecs it builds and logs their `on_http` calls.
 #[derive(Default)]
 pub struct ToyVenue {
     codecs: AtomicU32,
+    http: Arc<Mutex<Vec<String>>>,
 }
 
 impl ToyVenue {
@@ -44,7 +56,17 @@ impl ToyVenue {
     pub fn leak() -> &'static ToyVenue {
         Box::leak(Box::default())
     }
+
+    /// Every `on_http` call its codecs had, in order.
+    pub fn http_log(&self) -> Vec<String> {
+        self.http.lock().unwrap().clone()
+    }
 }
+
+/// Subscriptions per socket endpoint in the toy's plan.
+const PER_SOCKET: usize = 2;
+/// The poll codec's timer.
+const POLL: TimerTag = TimerTag(0);
 
 /// Trades on instrument `inst`.
 pub fn sub(inst: u32) -> Subscription {
@@ -145,21 +167,54 @@ impl VenueFactory for ToyVenue {
         }
     }
 
-    /// Planning is FBC-klr's; the tests hand the session its plan.
     fn plan_md(
         &self,
-        _: &VenueConfig,
-        _: &SpecTable,
-        _: &BTreeSet<Subscription>,
+        cfg: &VenueConfig,
+        specs: &SpecTable,
+        subs: &BTreeSet<Subscription>,
     ) -> Result<Vec<EndpointPlan>, VenueError> {
-        Ok(Vec::new())
+        let mut plans: Vec<EndpointPlan> = Vec::new();
+        for (i, sub) in subs.iter().enumerate() {
+            if sub.feed != Feed::Trades {
+                return Err(VenueError::UnsupportedFeed(*sub));
+            }
+            specs
+                .get(sub.inst)
+                .ok_or(VenueError::UnknownInstrument(sub.inst))?;
+            let n = i / PER_SOCKET;
+            if plans.len() == n {
+                let url = cfg.get(&format!("toy.url.{n}"));
+                let url = url.ok_or(ConfigError::Missing("toy.url.<n>"))?;
+                let one = cfg.get(ONE_STREAM).is_some();
+                plans.push(EndpointPlan {
+                    stream: StreamId(if one { 0 } else { n as u16 }),
+                    transport: MdTransport::Socket {
+                        url: WireUrl::plain(url),
+                    },
+                    subs: Vec::new(),
+                });
+            }
+            plans[n].subs.push(*sub);
+        }
+        Ok(plans)
     }
 
     fn md_codec(&self, _: &VenueConfig, ep: &EndpointPlan) -> Box<dyn MdCodec> {
         let n = self.codecs.fetch_add(1, Ordering::SeqCst);
         let plan = ep.subs.iter().map(|s| s.inst.get().to_string());
         let plan = plan.collect::<Vec<_>>().join(",");
-        Box::new(ToyMd { n, plan })
+        let poll = match &ep.transport {
+            MdTransport::Poll { base_url } => Some(base_url.as_str().to_owned()),
+            MdTransport::Socket { .. } => None,
+        };
+        Box::new(ToyMd {
+            n,
+            plan,
+            stream: ep.stream,
+            poll,
+            syms: Vec::new(),
+            log: self.http.clone(),
+        })
     }
 
     fn plan_exec(&self, _: &VenueConfig) -> Result<Vec<ExecEndpoint>, VenueError> {
@@ -171,10 +226,15 @@ impl VenueFactory for ToyVenue {
     }
 }
 
-/// One epoch's codec, numbered in the order the factory built it, and its plan's instruments.
+/// One epoch's codec, numbered in the order the factory built it, and its plan's instruments;
+/// on a poll endpoint, its base URL and the symbols it polls.
 struct ToyMd {
     n: u32,
     plan: String,
+    stream: StreamId,
+    poll: Option<String>,
+    syms: Vec<String>,
+    log: Arc<Mutex<Vec<String>>>,
 }
 
 const CONTROL: RateCharge = RateCharge::one(OpKind::Control, None);
@@ -200,10 +260,33 @@ fn num(fields: &[(&str, &str)], key: &'static str) -> Result<i64, DecodeError> {
         .map_err(|_| DecodeError::Malformed(key))
 }
 
+fn get(tag: u64, url: String, timeout: Duration) -> Effect {
+    Effect::Http {
+        tag: HttpTag(tag),
+        req: HttpRequest {
+            method: HttpMethod::Get,
+            url: WireUrl::plain(url),
+            headers: Vec::new(),
+            body: WireSlice::plain(Vec::new()),
+        },
+        rpc: None,
+        timeout,
+        class: TrafficClass::Normal,
+        charge: CONTROL,
+    }
+}
+
 impl MdCodec for ToyMd {
     fn on_open(&mut self, fx: &mut Effects) {
+        if self.poll.is_some() {
+            fx.push(Effect::Timer {
+                tag: POLL,
+                after: Duration::from_millis(10),
+            });
+            return;
+        }
         let hello = format!("hello|codec={}|plan={}", self.n, self.plan);
-        fx.push(send(STREAM, hello));
+        fx.push(send(self.stream, hello));
     }
 
     fn subscribe(
@@ -224,13 +307,18 @@ impl MdCodec for ToyMd {
                 .collect()
         };
         let (add, remove) = (spell(add)?, spell(remove)?);
+        if self.poll.is_some() {
+            self.syms.retain(|s| !remove.contains(&s.as_str()));
+            self.syms.extend(add.iter().map(|s| s.to_string()));
+            return Ok(());
+        }
         let mut text = String::from("sub");
         for (part, syms) in [("add", add), ("remove", remove)] {
             if !syms.is_empty() {
                 text += &format!("|{part}={}", syms.join(","));
             }
         }
-        fx.push(send(STREAM, text));
+        fx.push(send(self.stream, text));
         Ok(())
     }
 
@@ -245,6 +333,85 @@ impl MdCodec for ToyMd {
         let RawFrame::Text(line) = f else {
             return Err(DecodeError::Malformed("binary frame"));
         };
+        self.line(line, specs, sink, fx)
+    }
+
+    fn on_http(
+        &mut self,
+        tag: HttpTag,
+        resp: Result<HttpResponse<'_>, HttpFailure>,
+        _: &DecodeScope<'_>,
+        specs: &SpecTable,
+        sink: &mut dyn MdSink,
+        fx: &mut Effects,
+    ) -> Result<(), DecodeError> {
+        let entry = match resp {
+            Ok(r) => {
+                let toy = r
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("x-toy"));
+                format!("{}:{}", r.status, toy.map_or("-", |(_, v)| *v))
+            }
+            Err(failure) => format!("{failure:?}"),
+        };
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("{}/{}:{entry}", self.n, tag.0));
+        if self.poll.is_some() {
+            fx.push(Effect::Timer {
+                tag: POLL,
+                after: Duration::from_millis(10),
+            });
+        }
+        let body = resp.map_or(&b""[..], |r| r.body);
+        let body = std::str::from_utf8(body).map_err(|_| DecodeError::Malformed("body"))?;
+        for line in body.lines() {
+            self.line(line, specs, sink, fx)?;
+        }
+        Ok(())
+    }
+
+    fn on_timer(
+        &mut self,
+        tag: TimerTag,
+        _: MonoNs,
+        _: WallNs,
+        sink: &mut dyn MdSink,
+        fx: &mut Effects,
+    ) {
+        if let (POLL, Some(base)) = (tag, &self.poll) {
+            let url = format!("{base}/poll?syms={}", self.syms.join(","));
+            fx.push(get(0, url, Duration::from_secs(1)));
+            return;
+        }
+        let inst = InstrumentId::new(tag.0 as u32);
+        let h = FeedHealth::Stale;
+        sink.push(
+            VenueMeta::NONE,
+            MdEvent::Health {
+                inst,
+                feed: Feed::Trades,
+                h,
+            },
+        );
+    }
+
+    fn keepalive(&self) -> Option<Keepalive> {
+        None
+    }
+}
+
+impl ToyMd {
+    /// One record of the toy's protocol, from a frame or a response body.
+    fn line(
+        &mut self,
+        line: &str,
+        specs: &SpecTable,
+        sink: &mut dyn MdSink,
+        fx: &mut Effects,
+    ) -> Result<(), DecodeError> {
         let mut parts = line.split('|');
         let kind = parts.next().unwrap_or_default();
         let fields: Vec<_> = parts.filter_map(|p| p.split_once('=')).collect();
@@ -275,12 +442,18 @@ impl MdCodec for ToyMd {
             }),
             "big" => {
                 let kb = num(&fields, "kb")? as usize;
-                fx.push(send(STREAM, "x".repeat(kb * 1024)));
+                fx.push(send(self.stream, "x".repeat(kb * 1024)));
             }
             "bye" => fx.push(Effect::Reconnect {
-                stream: STREAM,
+                stream: self.stream,
                 reason: "bye",
             }),
+            "say" => fx.push(send(self.stream, "said".into())),
+            "get" => {
+                let (tag, ms) = (num(&fields, "tag")?, num(&fields, "ms")?);
+                let url = field(&fields, "url")?.to_owned();
+                fx.push(get(tag as u64, url, Duration::from_millis(ms as u64)));
+            }
             "odd" => {
                 let other = StreamId(9);
                 fx.push(send(other, "stray".into()));
@@ -288,59 +461,9 @@ impl MdCodec for ToyMd {
                     stream: other,
                     reason: "stray",
                 });
-                fx.push(Effect::Http {
-                    tag: HttpTag(1),
-                    req: HttpRequest {
-                        method: HttpMethod::Get,
-                        url: WireUrl::plain("http://toy.invalid/"),
-                        headers: Vec::new(),
-                        body: WireSlice::plain(Vec::new()),
-                    },
-                    rpc: None,
-                    timeout: Duration::from_secs(1),
-                    class: TrafficClass::Normal,
-                    charge: CONTROL,
-                });
             }
             _ => return Err(DecodeError::Malformed("kind")),
         }
         Ok(())
-    }
-
-    /// The toy asks for no HTTP a session would answer.
-    fn on_http(
-        &mut self,
-        _: HttpTag,
-        _: Result<HttpResponse<'_>, HttpFailure>,
-        _: &DecodeScope<'_>,
-        _: &SpecTable,
-        _: &mut dyn MdSink,
-        _: &mut Effects,
-    ) -> Result<(), DecodeError> {
-        Ok(())
-    }
-
-    fn on_timer(
-        &mut self,
-        tag: TimerTag,
-        _: MonoNs,
-        _: WallNs,
-        sink: &mut dyn MdSink,
-        _: &mut Effects,
-    ) {
-        let inst = InstrumentId::new(tag.0 as u32);
-        let h = FeedHealth::Stale;
-        sink.push(
-            VenueMeta::NONE,
-            MdEvent::Health {
-                inst,
-                feed: Feed::Trades,
-                h,
-            },
-        );
-    }
-
-    fn keepalive(&self) -> Option<Keepalive> {
-        None
     }
 }

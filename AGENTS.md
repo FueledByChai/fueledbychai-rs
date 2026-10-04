@@ -116,7 +116,8 @@ rather than guess.
   factory traits with `Effects` and `EncodeCtx`, `crates/fbc-book` with its L2 book, `crates/fbc-journal` with its record
   format, day-grouped segment writer rolled hourly with zstd-compressed closed segments, in-order reader and never-blocking sink, `crates/fbc-runtime` with its first
   slices (the connector, SOCKS5 CONNECT, WebSocket and HTTP/1.1, plain or TLS, 0019 and 0020;
-  connection epochs and the subscription reconciler; the market-data session, 0023), `crates/fbc-conformance` with its stub venue server (0025),
+  connection epochs and the subscription reconciler; the market-data session, 0023; HTTP
+  effects, poll endpoints and plans, 0027), `crates/fbc-conformance` with its stub venue server (0025),
   `crates/venues/fbc-venue-paradex` with its signer (`src/sign`), SBE market data (`src/md`: bbo,
   trades and the order book) and its factory (`src/factory.rs`, market data only),
   and `crates/venues/fbc-venue-binance-usdm` with its market-data-only factory and codec; the
@@ -146,9 +147,11 @@ rather than guess.
     timer, HTTP result or event of an older epoch; `Reconciler` yields a stream's subscribe
     calls as the difference between the desired and the active set, once per new epoch,
     keeping a refused or waiting subscription pending. Both are logic only, with no socket.
-    `MdSession` drives one market-data socket endpoint over them (0023): a fresh codec per
+    `MdSession` drives one market-data endpoint over them (0023): a fresh codec per
     epoch, events stamped (an `IngestClock` shared per shard) and handed to the consumer's
     `MdHandler` inline, the codec's effects executed, reconnects paced by `ReconnectPacing` (backoff, attempt budget, attempt deadline);
+    a codec's HTTP requests run with their timeouts and answer only the epoch that asked, and a
+    poll endpoint opens no connection (0027); `MdVenue` applies `plan_md`'s endpoints by stream;
     `tests/common/toy.rs` is the toy market-data venue later runtime tests reuse.
   - `crates/fbc-book` (it depends on `fbc-core` only: one tick-indexed L2 book per
     instrument and `BookId`, built from book events the same live and in replay, with
