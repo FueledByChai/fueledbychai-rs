@@ -227,6 +227,62 @@ fn credential_spans_are_journaled_only_as_keyed_hashes_and_replay_decodes_the_sa
 }
 
 #[test]
+fn a_redacted_json_body_still_parses_when_read_back() {
+    // Codex r4179231677: a credential inside a JSON string, or standing as a JSON number, is
+    // blanked with bytes JSON accepts there, so a codec that parses the live body with
+    // serde_json parses the replayed one too, to the same document outside the spans.
+    let token = secret("token");
+    let id = "4071";
+    let body = format!("{{\"jwt_token\":\"{token}\",\"key_id\":{id},\"ttl\":300}}");
+    let span = |needle: &str| {
+        let at = body.find(needle).unwrap() as u32;
+        at..at + needle.len() as u32
+    };
+    let headers = [("Set-Cookie", "sid=abc; Path=/")];
+    let resp = HttpResponse {
+        status: 200,
+        headers: &headers,
+        body: body.as_bytes(),
+    };
+    let spans = InboundSpans::response(vec![(0, HeaderMark::Value)], vec![span(&token), span(id)]);
+    let record = Record::HttpResult {
+        stamp: stamp(1),
+        tag: AUTH_TAG,
+        result: Ok(HttpResponseRec::redacted(&resp, &spans).unwrap()),
+    };
+    let root = fresh_dir("inbound_redaction_json");
+    let mut writer = JournalWriter::create(&root, 1, key()).unwrap();
+    writer.append(NOW, &record).unwrap();
+    writer.flush().unwrap();
+    drop(writer);
+    let back: Vec<Record> = JournalReader::open(&root, 1)
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let [
+        Record::HttpResult {
+            result: Ok(back), ..
+        },
+    ] = &back[..]
+    else {
+        panic!("{back:?}")
+    };
+    let live: serde_json::Value = serde_json::from_slice(body.as_bytes()).unwrap();
+    let replayed: serde_json::Value = serde_json::from_slice(&back.body.0).unwrap();
+    assert_eq!(replayed["ttl"], live["ttl"]);
+    assert_eq!(replayed["jwt_token"].as_str().unwrap().len(), token.len());
+    assert_ne!(replayed["jwt_token"], live["jwt_token"]);
+    assert!(replayed["key_id"].is_u64());
+    // The blanked cookie is still a header value a parser takes: printable, no separator.
+    let cookie = &back.headers[0].value;
+    assert!(
+        cookie
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && b != b';' && b != b',')
+    );
+}
+
+#[test]
 fn spans_that_do_not_fit_their_input_are_refused() {
     let resp = HttpResponse {
         status: 200,

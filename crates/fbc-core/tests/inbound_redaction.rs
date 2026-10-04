@@ -22,17 +22,20 @@ fn secret(what: &str) -> String {
     format!("SYNTH{}{}SECRET", what.to_uppercase(), "-i7b")
 }
 
-/// `bytes` with every span filled with the journal's blank byte (0).
+/// The byte fbc-journal reads a redaction span back as (its `BLANK`).
+const BLANK: u8 = b'2';
+
+/// `bytes` with every span filled with the journal's blank byte.
 fn blanked(bytes: &[u8], spans: &[Range<u32>]) -> Vec<u8> {
     let mut out = bytes.to_vec();
     for s in spans {
-        out[s.start as usize..s.end as usize].fill(0);
+        out[s.start as usize..s.end as usize].fill(BLANK);
     }
     out
 }
 
 fn blank_text(len: usize) -> String {
-    "\0".repeat(len)
+    char::from(BLANK).to_string().repeat(len)
 }
 
 #[test]
