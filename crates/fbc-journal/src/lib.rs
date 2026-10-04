@@ -24,8 +24,15 @@
 //! marked redacted, and the values of the [`SECRET_HEADERS`] by name, in requests and results
 //! alike. The record keeps each span's place and length, and the reader returns [`BLANK`]
 //! bytes there ([`Record::blanked`] gives what the reader will return). Keyed hashes in their
-//! place are FBC-apz's, under `src/redact*`; spans a codec marks in inbound frames and
-//! response bodies are FBC-7lm's. Order signatures are not redacted.
+//! place are FBC-apz's, under `src/redact*`. Order signatures are not redacted.
+//!
+//! **What is still written verbatim.** Inbound frames, HTTP response bodies, and response
+//! header names and values other than the [`SECRET_HEADERS`] carry no redaction metadata in
+//! `fbc-core` yet (a [`RawFrame`](fbc_core::RawFrame) or an
+//! [`HttpResponse`](fbc_core::HttpResponse) marks nothing), so they are written as they came:
+//! decoder replay needs their bytes. A codec marking credential spans there, and the journal
+//! blanking them, is FBC-7lm. Until it lands, journal no traffic whose inbound side carries a
+//! credential (an auth response holding a JWT, a frame echoing a key).
 
 mod error;
 pub mod format;

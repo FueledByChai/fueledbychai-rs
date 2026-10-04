@@ -2,7 +2,7 @@
 //! named `<shard>-<seq>`.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use fbc_core::WallNs;
@@ -22,7 +22,7 @@ pub(crate) fn day_of(wall: WallNs) -> i64 {
 }
 
 /// The directory name of a UTC day: `YYYYMMDD`. Every `WallNs` falls in years 1677 to 2262,
-/// so the year always has four digits.
+/// so the year always has four digits and the names sort in date order.
 pub(crate) fn day_dir(day: i64) -> String {
     // Howard Hinnant's civil_from_days.
     let z = day + 719_468;
@@ -47,8 +47,34 @@ pub(crate) fn segment_seq(name: &str, shard: u16) -> Option<u32> {
     seq.parse().ok()
 }
 
+/// One shard's segments under `root` in write order: the day directories (`YYYYMMDD`) in date
+/// order, each day's segments in sequence order. Anything else is passed over.
+pub(crate) fn list_segments(root: &Path, shard: u16) -> io::Result<Vec<(String, u32, PathBuf)>> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let day = entry.file_name().to_string_lossy().into_owned();
+        let digits = day.len() == 8 && day.bytes().all(|b| b.is_ascii_digit());
+        if !digits || !entry.file_type()?.is_dir() {
+            continue;
+        }
+        for file in fs::read_dir(entry.path())? {
+            let file = file?;
+            if let Some(seq) = file
+                .file_name()
+                .to_str()
+                .and_then(|n| segment_seq(n, shard))
+            {
+                found.push((day.clone(), seq, file.path()));
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
 struct Segment {
-    day: i64,
+    day: String,
     file: BufWriter<File>,
 }
 
@@ -57,13 +83,16 @@ struct Segment {
 /// Time comes from the caller: [`append`](JournalWriter::append) takes the wall time it
 /// files the record under. A record whose UTC day is later than the open segment's starts a
 /// segment in that day's directory; one whose day is earlier (the wall clock stepped back
-/// across midnight) stays in the open segment, so reading the days in order is reading in
-/// write order. A new segment takes the next sequence number after the shard's existing
-/// segments in its day, so a restarted writer never overwrites one.
+/// across midnight) stays in the latest day written, so reading the days in order is reading
+/// in write order. That holds across restarts: a new writer starts from the latest day that
+/// holds one of the shard's segments, and a new segment takes the next sequence number after
+/// the shard's existing segments in its day, so a restarted writer never overwrites one.
 pub struct JournalWriter {
     root: PathBuf,
     shard: u16,
     open: Option<Segment>,
+    /// The latest day this shard has written to; no record is filed under an earlier one.
+    latest: Option<String>,
     body: Vec<u8>,
 }
 
@@ -73,10 +102,12 @@ impl JournalWriter {
     pub fn create(root: impl AsRef<Path>, shard: u16) -> Result<JournalWriter, JournalError> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
+        let latest = list_segments(&root, shard)?.pop().map(|(day, ..)| day);
         Ok(JournalWriter {
             root,
             shard,
             open: None,
+            latest,
             body: Vec::new(),
         })
     }
@@ -87,9 +118,10 @@ impl JournalWriter {
         self.body.clear();
         format::encode(record, &mut self.body)?;
         let len = u32::try_from(self.body.len()).map_err(|_| JournalError::TooLarge)?;
-        let day = day_of(now);
+        let day = day_dir(day_of(now)).max(self.latest.take().unwrap_or_default());
+        self.latest = Some(day.clone());
         let segment = match self.open.take() {
-            Some(open) if day <= open.day => open,
+            Some(open) if open.day == day => open,
             open => {
                 if let Some(mut done) = open {
                     done.file.flush()?;
@@ -116,8 +148,8 @@ impl JournalWriter {
     }
 
     /// Opens the next segment of this shard in `day`'s directory.
-    fn start(&self, day: i64) -> Result<Segment, JournalError> {
-        let dir = self.root.join(day_dir(day));
+    fn start(&self, day: String) -> Result<Segment, JournalError> {
+        let dir = self.root.join(&day);
         fs::create_dir_all(&dir)?;
         let mut next = 0;
         for entry in fs::read_dir(&dir)? {

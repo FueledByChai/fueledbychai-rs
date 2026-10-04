@@ -228,7 +228,8 @@ impl fmt::Debug for HttpResponseRec {
 /// One journal record.
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub enum Record {
-    /// A frame as it came off a stream, with its stamp, before decoding.
+    /// A frame as it came off a stream, with its stamp, before decoding. Its bytes are
+    /// written verbatim: a codec marks no span in an inbound frame until FBC-7lm.
     Inbound {
         stamp: Stamp,
         opcode: Opcode,

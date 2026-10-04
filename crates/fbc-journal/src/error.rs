@@ -9,7 +9,8 @@ use std::path::PathBuf;
 pub enum JournalError {
     /// The file system refused.
     Io(io::Error),
-    /// A record or one of its fields is longer than the format's `u32` length.
+    /// A record or one of its fields is longer than the format's `u32` length, or a record
+    /// redacts more than [`MAX_REDACTED`](crate::format::MAX_REDACTED) bytes.
     TooLarge,
     /// A segment does not start with the journal's magic bytes.
     BadMagic { segment: PathBuf },
