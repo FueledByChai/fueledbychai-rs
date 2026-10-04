@@ -1,0 +1,29 @@
+# BookEvent (template 3) whose group entries are 24 bytes, 8 past the known price and size; for the SBE reader's group test only
+# Hand-built from paradex_1_0.xml at tradeparadex/paradex-py b8248fb747e278d2167ac2f056b339a287d5ef30.
+# Little-endian; '#' starts a comment.
+59 00 03 00 01 00 01 00                           # header: blockLength=89 templateId=3 (BookEvent) schemaId=1 version=1
+40 5a 7d 84 41 40 06 00                           # @0 ts int64 = 1759500000123456 us
+eb 03 00 00 00 00 00 00                           # @8 seq int64 = 1003
+01                                                # @16 pkgType uint8 = 1 (DELTA)
+00 00 00 00 00 00 00 80                           # @17 bestBidPrice int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @25 bestBidSize int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @33 bestAskPrice int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @41 bestAskSize int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @49 relativeSpread int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @57 bestBidApiPrice int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @65 bestBidApiSize int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @73 bestAskApiPrice int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @81 bestAskApiSize int64 = null (INT64_MIN)
+18 00 02 00                                       # bids group: blockLength=24 (16 known + 8 appended) numInGroup=2
+80 20 c7 8f a3 05 00 00                           #   price = 6200050000000
+40 78 7d 01 00 00 00 00                           #   size = 25000000
+ee ee ee ee ee ee ee ee                           #   8 appended bytes, skipped
+00 8a 2e 8f a3 05 00 00                           #   price = 6200040000000
+00 00 00 00 00 00 00 00                           #   size = 0
+ee ee ee ee ee ee ee ee                           #   8 appended bytes, skipped
+18 00 01 00                                       # asks group: blockLength=24 numInGroup=1
+00 11 c2 92 a3 05 00 00                           #   price = 6200100000000
+80 d1 f0 08 00 00 00 00                           #   size = 150000000
+ee ee ee ee ee ee ee ee                           #   8 appended bytes, skipped
+0c                                                # market varString8 length = 12
+42 54 43 2d 55 53 44 2d 50 45 52 50               # market = "BTC-USD-PERP"

@@ -1,0 +1,6 @@
+# HeartbeatEvent (template 40), schema 1:1
+# Hand-built from paradex_1_0.xml at tradeparadex/paradex-py b8248fb747e278d2167ac2f056b339a287d5ef30.
+# Little-endian; '#' starts a comment.
+10 00 28 00 01 00 01 00                           # header: blockLength=16 templateId=40 (HeartbeatEvent) schemaId=1 version=1
+40 5a 7d 84 41 40 06 00                           # @0 ts int64 = 1759500000123456 us
+00 00 00 00 00 00 00 00                           # @8 seq int64 = 0

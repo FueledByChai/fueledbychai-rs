@@ -116,7 +116,8 @@ rather than guess.
   factory traits with `Effects` and `EncodeCtx`, `crates/fbc-book` with its L2 book, `crates/fbc-journal` with its record
   format, day-grouped segment writer and in-order reader, `crates/fbc-runtime` with its first
   slice (the connector, SOCKS5 CONNECT, WebSocket and HTTP/1.1, plain or TLS; 0019, 0020), and
-  `crates/venues/fbc-venue-paradex` with only its signer (`src/sign`); the rest are planned. Members are the `crates/fbc-*` and
+  `crates/venues/fbc-venue-paradex` with its signer (`src/sign`), SBE market data (`src/md`: bbo
+  and trades) and its factory (`src/factory.rs`, market data only); the rest are planned. Members are the `crates/fbc-*` and
   `crates/venues/fbc-*` globs, and `fixtures/` is excluded from the workspace:
   - `crates/fbc-core`: the contract. Time, units, price grids and exact prices, sealed ids and
     the canonical client-id codec, `Fee`/`FeeBook`, `InstrumentSpec`, `VenueCaps`, events,
@@ -156,7 +157,9 @@ rather than guess.
   - `crates/venues/fbc-venues` (the registry, the only crate that sees concrete venues),
     `crates/venues/fbc-venue-binance-usdm` (market data only), `crates/venues/fbc-venue-paradex`
     (so far its signer: the SNIP-12 revision 0 hash and Stark-curve signature, tested against
-    `fixtures/paradex/signing/paradex-vectors.tsv`), later `crates/venues/fbc-venue-hibachi`
+    `fixtures/paradex/signing/paradex-vectors.tsv`; and market data: an SBE reader gated on each
+    frame's block lengths, bbo and trades decoded into touches and trades, held to the
+    hand-built frames in `fixtures/paradex/md/`), later `crates/venues/fbc-venue-hibachi`
     (0016).
   - Dependency direction (design §3): `fbc-core`, `fbc-book`, `fbc-oms`, `fbc-journal` and
     `fbc-sim` never depend on a venue crate; a venue crate depends on `fbc-core` and protocol
@@ -168,7 +171,8 @@ rather than guess.
   that says where they come from (0009); that marker exempts only its own directory from the
   privacy scan, so recorded frames never go in it. `fixtures/paradex/signing/` already holds
   the signing benchmark and the Java hash oracle the Paradex signer is checked against;
-  recorded Paradex frames go elsewhere under `fixtures/paradex/`.
+  recorded Paradex frames go elsewhere under `fixtures/paradex/`; `fixtures/paradex/md/` holds
+  SBE frames hand-built from Paradex's published schema.
   `fixtures/licence-gate/` is a standalone two-crate workspace the licence gate's self-test
   runs against (0017).
 - Docs: `docs/decisions/` (records, index in its `README.md`; cite by number, never restate one
