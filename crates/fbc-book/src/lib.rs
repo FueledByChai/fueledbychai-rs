@@ -13,7 +13,8 @@
 //! state so two books compare byte for byte.
 //!
 //! Not here yet: the ex-own projection, touch arbitration and continuity policies (the rest of
-//! design §3's book), and keeping books per stream in the runtime (FBC-nij).
+//! design §3's book). `fbc-runtime`'s `MdBooks` keeps these books for a venue's sessions and
+//! exposes each instrument's configured trading book (FBC-nij).
 
 mod book;
 mod books;

@@ -1,8 +1,8 @@
-//! A toy market-data venue for the runtime's session tests (FBC-ku8, FBC-klr): `exec: None`,
-//! trades only, a text protocol of one `kind|key=value|...` record per frame. It describes no
-//! real venue.
+//! A toy market-data venue for the runtime's session tests (FBC-ku8, FBC-klr, FBC-nij):
+//! `exec: None`, trades and two book channels, a text protocol of one `kind|key=value|...`
+//! record per frame. It describes no real venue.
 //!
-//! Plan: trades only, at most two subscriptions per socket endpoint in instrument order; the
+//! Plan: trades only (a session test names its book subscriptions in its own plan), at most two subscriptions per socket endpoint in instrument order; the
 //! `n`th endpoint is `StreamId(n)` at the configuration's `toy.url.<n>`.
 //! Out: `hello|codec=<n>|plan=<ids>` on open (`n` counts the codecs its factory built, `ids`
 //! are the instruments of the plan it was built for), and
@@ -12,7 +12,13 @@
 //! `bye` asks for a reconnect; `say` asks to send `said`; `get|tag=<n>|ms=<t>|url=<u>` asks for
 //! a GET of `u` with a `t` ms timeout (and, with `|kb=<k>`, then a `k` KiB frame, and with
 //! `|bye=1`, then a reconnect); `get` with `ms=max` asks for a timeout past the end of the clock;
-//! `odd` asks for a frame and a reconnect on another stream, which a session refuses. Anything else, and every binary frame, is malformed.
+//! `odd` asks for a frame and a reconnect on another stream, which a session refuses.
+//! Book channel `b` of instrument `A`: `begin|sym=A|book=<b>|epoch=<e>|seq=<n>` begins a
+//! snapshot and anchors the channel's sequence; `lvl|sym=A|book=<b>|side=bid|px=<ticks>|qty=<lots>|seq=<n>`
+//! sets a level (in the snapshot or as a delta) and `end|sym=A|book=<b>|seq=<n>` ends the
+//! snapshot, each only when its seq is the channel's last plus one: any other seq reports a gap
+//! on that channel, and until its next `begin` the channel's records are dropped.
+//! Anything else, and every binary frame, is malformed.
 //!
 //! Every `on_http` is logged as `<codec>/<tag>:<status>:<x-toy header>` or
 //! `<codec>/<tag>:<failure>`, and a response body's lines are read as frames. On a poll
@@ -20,20 +26,21 @@
 //! `<base_url>/poll?syms=<subscribed>` at once, and each answer sets a 10 ms timer whose
 //! firing asks again.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fbc_core::{
-    Aggressor, AssetSym, ConfigError, ConnTopology, DecodeError, DecodeScope, Effect, Effects,
-    Encoding, EndpointPlan, ExchTsKind, ExecCodec, ExecEndpoint, Feed, FeedHealth, FeedSource,
-    FieldSpec, FundingCaps, FundingSpec, HttpFailure, HttpMethod, HttpRequest, HttpResponse,
-    HttpTag, InstrumentId, InstrumentKind, InstrumentSpec, Keepalive, Lots, MatchingCaps, MdCaps,
-    MdCodec, MdEvent, MdSink, MdTransport, MonoNs, OpKind, PriceGrid, RateCharge, RawFrame,
-    Readiness, SizeStep, SpecTable, StpScope, StreamId, Subscription, Ticks, TimerTag, TradeCaps,
-    TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueConfig, VenueError, VenueFactory,
-    VenueId, VenueMeta, WallNs, WireSlice, WireUrl, dispatch_market_data,
+    Aggressor, AssetSym, BookCaps, BookId, BookSide, Cadence, Channel, ConfigError, ConnTopology,
+    Continuity, DecodeError, DecodeScope, Effect, Effects, Encoding, EndpointPlan, ExchTsKind,
+    ExecCodec, ExecEndpoint, Feed, FeedHealth, FeedSource, FieldSpec, FundingCaps, FundingSpec,
+    HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag, InstrumentId, InstrumentKind,
+    InstrumentSpec, Keepalive, Lots, MatchingCaps, MdCaps, MdCodec, MdEvent, MdSink, MdTransport,
+    MonoNs, OpKind, PriceGrid, QueueModelQuality, RateCharge, RawFrame, Readiness, SizeStep,
+    SpecTable, StpScope, StreamId, Subscription, TagSet, Ticks, TimerTag, TradeCaps, TradingStatus,
+    TrafficClass, UnderlyingId, VenueCaps, VenueConfig, VenueError, VenueFactory, VenueId,
+    VenueMeta, WallNs, WireSlice, WireUrl, dispatch_market_data,
 };
 use rust_decimal::Decimal;
 
@@ -80,6 +87,29 @@ pub fn sub(inst: u32) -> Subscription {
     Subscription {
         inst: InstrumentId::new(inst),
         feed: Feed::Trades,
+    }
+}
+
+/// Book channel `book` of instrument `inst`.
+pub fn book(inst: u32, book: BookId) -> Subscription {
+    Subscription {
+        inst: InstrumentId::new(inst),
+        feed: Feed::Book(book),
+    }
+}
+
+/// One of the toy's two book channels: sequenced plus one, no window, no REST anchor.
+fn book_caps(channel: &'static str) -> BookCaps {
+    BookCaps {
+        channel,
+        // The toy's records carry any number of levels.
+        max_depth: u16::MAX,
+        cadence: Cadence::Realtime,
+        continuity: Continuity::PlusOne,
+        windowed: false,
+        rest_anchor: false,
+        includes_channels: TagSet::of(&[Channel::Public]),
+        queue_model: QueueModelQuality::BracketOnly,
     }
 }
 
@@ -130,7 +160,7 @@ pub fn caps() -> VenueCaps {
         md: MdCaps {
             encoding: Encoding::Json,
             touch_sources: Vec::new(),
-            books: Vec::new(),
+            books: vec![book_caps("book0"), book_caps("book1")],
             trades: TradeCaps {
                 source: FeedSource::Stream,
                 aggressor: false,
@@ -222,6 +252,7 @@ impl VenueFactory for ToyVenue {
             syms: Vec::new(),
             polling: false,
             log: self.http.clone(),
+            books: BTreeMap::new(),
         })
     }
 
@@ -244,6 +275,8 @@ struct ToyMd {
     syms: Vec<String>,
     polling: bool,
     log: Arc<Mutex<Vec<String>>>,
+    /// Each anchored book channel's last seq; a channel absent waits for its next `begin`.
+    books: BTreeMap<(InstrumentId, BookId), i64>,
 }
 
 const CONTROL: RateCharge = RateCharge::one(OpKind::Control, None);
@@ -480,6 +513,46 @@ impl ToyMd {
                         reason: "bye",
                     });
                 }
+            }
+            "begin" | "lvl" | "end" => {
+                let (inst, seq) = (inst()?, num(&fields, "seq")?);
+                let book = BookId(num(&fields, "book")? as u8);
+                let ev = match kind {
+                    "begin" => {
+                        let epoch = num(&fields, "epoch")? as u32;
+                        MdEvent::BookSnapshotBegin { inst, book, epoch }
+                    }
+                    "end" => MdEvent::BookSnapshotEnd { inst, book },
+                    _ => MdEvent::Level {
+                        inst,
+                        book,
+                        side: match field(&fields, "side")? {
+                            "bid" => BookSide::Bid,
+                            "ask" => BookSide::Ask,
+                            _ => return Err(DecodeError::Malformed("side")),
+                        },
+                        px: Ticks(num(&fields, "px")?),
+                        qty: Lots::new(num(&fields, "qty")?)
+                            .ok_or(DecodeError::Malformed("qty"))?,
+                    },
+                };
+                let meta = VenueMeta {
+                    exch_ts: None,
+                    exch_ts_kind: ExchTsKind::Unknown,
+                    venue_seq: Some(seq as u64),
+                };
+                let last = self.books.get(&(inst, book)).copied();
+                if kind != "begin" && last.and_then(|l| l.checked_add(1)) != Some(seq) {
+                    if last.is_some() {
+                        self.books.remove(&(inst, book));
+                        let h = FeedHealth::Gap;
+                        let feed = Feed::Book(book);
+                        sink.push(meta, MdEvent::Health { inst, feed, h });
+                    }
+                    return Ok(());
+                }
+                self.books.insert((inst, book), seq);
+                sink.push(meta, ev);
             }
             "odd" => {
                 let other = StreamId(9);
