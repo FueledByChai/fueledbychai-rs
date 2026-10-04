@@ -130,15 +130,52 @@ async fn an_unanswered_request_times_out_and_a_refused_or_lost_one_says_so() {
         peer.send(&format!("get|tag=5|ms=5000|url={}", http.url("/lost")));
         drop(http.request().await);
         until(|| venue.http_log().len() == 4).await;
+        // A timeout past the end of the clock bounds nothing: refused at once, never sent
+        // (Codex r4177481307).
+        peer.send(&format!("get|tag=6|ms=max|url={}", http.url("/forever")));
+        tokio::time::sleep(ms(300)).await;
+        assert_eq!(venue.http_log().len(), 5, "{:?}", venue.http_log());
+        assert!(http.try_request().is_none());
         drop(control);
     };
     let (run, ()) = tokio::join!(session.run(), script);
     run.unwrap();
     let log = venue.http_log();
-    assert_eq!(
-        log,
-        ["0/2:TimedOut", "0/3:NotSent", "0/4:NotSent", "0/5:Lost"]
-    );
+    let want = [
+        "0/2:TimedOut",
+        "0/3:NotSent",
+        "0/4:NotSent",
+        "0/5:Lost",
+        "0/6:NotSent",
+    ];
+    assert_eq!(log, want);
+}
+
+#[tokio::test]
+async fn a_request_goes_out_and_times_out_while_a_write_waits_on_a_stalled_peer() {
+    let (mut ws, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
+    let venue = ToyVenue::leak();
+    let (mut session, control) = MdSession::new(session(venue, socket(ws.url())), |_| {}).unwrap();
+    let script = async move {
+        let mut peer = ws.accept().await;
+        assert_eq!(peer.recv().await, "hello|codec=0|plan=1");
+        assert_eq!(peer.recv().await, "sub|add=A");
+        // A GET with a 150 ms timeout, then a 64 MiB frame the stalled peer holds back for
+        // 600 ms (Codex r4177481297).
+        let url = http.url("/during");
+        let start = Instant::now();
+        peer.send(&format!("get|tag=9|ms=150|kb=65536|url={url}"));
+        peer.stall_for(ms(600));
+        let during = tokio::time::timeout(ms(450), http.request()).await;
+        let held = during.expect("the request goes out while the write waits");
+        until(|| venue.http_log().len() == 1).await;
+        // Its deadline ran from when it was asked for, not from when the write ended.
+        assert!(start.elapsed() < ms(600 + 150), "{:?}", start.elapsed());
+        drop((held, control));
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    assert_eq!(venue.http_log(), ["0/9:TimedOut"]);
 }
 
 #[tokio::test]

@@ -10,7 +10,8 @@
 //! In: `trade|sym=A|px=<ticks>|qty=<lots>|seq=<n>` is a trade; `arm|sym=A|ms=<n>` sets a timer
 //! whose firing reports the instrument's trades stale; `big|kb=<n>` asks for an `n` KiB frame;
 //! `bye` asks for a reconnect; `say` asks to send `said`; `get|tag=<n>|ms=<t>|url=<u>` asks for
-//! a GET of `u` with a `t` ms timeout; `odd` asks for a frame and a reconnect on another stream,
+//! a GET of `u` with a `t` ms timeout (and, with `|kb=<k>`, then a `k` KiB frame); `get` with
+//! `ms=max` asks for a timeout past the end of the clock; `odd` asks for a frame and a reconnect on another stream,
 //! which a session refuses. Anything else, and every binary frame, is malformed.
 //!
 //! Every `on_http` is logged as `<codec>/<tag>:<status>:<x-toy header>` or
@@ -450,9 +451,16 @@ impl ToyMd {
             }),
             "say" => fx.push(send(self.stream, "said".into())),
             "get" => {
-                let (tag, ms) = (num(&fields, "tag")?, num(&fields, "ms")?);
+                let tag = num(&fields, "tag")?;
+                let timeout = match field(&fields, "ms")? {
+                    "max" => Duration::MAX,
+                    _ => Duration::from_millis(num(&fields, "ms")? as u64),
+                };
                 let url = field(&fields, "url")?.to_owned();
-                fx.push(get(tag as u64, url, Duration::from_millis(ms as u64)));
+                fx.push(get(tag as u64, url, timeout));
+                if let Ok(kb) = num(&fields, "kb") {
+                    fx.push(send(self.stream, "x".repeat(kb as usize * 1024)));
+                }
             }
             "odd" => {
                 let other = StreamId(9);

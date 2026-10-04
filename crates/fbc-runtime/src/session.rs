@@ -26,7 +26,7 @@
 
 use std::cell::Cell;
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap};
+use std::collections::{BTreeSet, BinaryHeap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -218,6 +218,8 @@ pub struct MdSession<H> {
     timer_seq: u64,
     /// HTTP requests in flight, each with the epoch that asked.
     http: FuturesUnordered<Pending>,
+    /// HTTP results that came back while a write waited, in order, for the codec after it.
+    answered: VecDeque<Answered>,
     http_max_body: usize,
     counters: MdCounters,
     handler: H,
@@ -296,6 +298,7 @@ impl<H: MdHandler> MdSession<H> {
             timers: BinaryHeap::new(),
             timer_seq: 0,
             http: FuturesUnordered::new(),
+            answered: VecDeque::new(),
             http_max_body: config.http_max_body,
             counters: MdCounters::default(),
             handler,
@@ -330,6 +333,7 @@ impl<H: MdHandler> MdSession<H> {
             MdTransport::Poll { .. } => self.connected(None).await.map(|_| ()),
         };
         self.http.clear();
+        self.answered.clear();
         ran
     }
 
@@ -402,6 +406,10 @@ impl<H: MdHandler> MdSession<H> {
             }
             let key = self.epochs.advance()?;
             self.rec.begin_epoch(key)?;
+            // Results that came back during the ended epoch's last write come back into nothing.
+            while let Some(done) = self.answered.pop_front() {
+                let _ = self.take_http(done)?;
+            }
         }
     }
 
@@ -424,11 +432,14 @@ impl<H: MdHandler> MdSession<H> {
         let mut open = self.execute(&mut ws, fx).await
             && self.subscribe(&mut ws, codec.as_mut(), call).await?;
         while open {
-            let wake = tokio::select! {
-                frame = next_frame(&mut ws) => Wake::Frame(frame),
-                _ = sleep_or_never(self.next_deadline()) => Wake::Timer,
-                Some(done) = self.http.next() => Wake::Http(done),
-                r = self.desired.changed() => Wake::Desired(r.is_ok()),
+            let wake = match self.answered.pop_front() {
+                Some(done) => Wake::Http(done),
+                None => tokio::select! {
+                    frame = next_frame(&mut ws) => Wake::Frame(frame),
+                    _ = sleep_or_never(self.next_deadline()) => Wake::Timer,
+                    Some(done) = self.http.next() => Wake::Http(done),
+                    r = self.desired.changed() => Wake::Desired(r.is_ok()),
+                },
             };
             open = match wake {
                 Wake::Frame(Some(Ok(message))) => {
@@ -592,10 +603,17 @@ impl<H: MdHandler> MdSession<H> {
                     let bytes = frame.bytes();
                     let text = std::str::from_utf8(bytes).map(Message::text);
                     let message = text.unwrap_or_else(|_| Message::binary(bytes.to_vec()));
-                    open = tokio::select! {
-                        biased;
-                        sent = ws.send(message) => sent.is_ok(),
-                        _ = self.stop.changed() => false,
+                    // Requests in flight keep going while the write waits; their results wait
+                    // for the codec until it is done.
+                    let send = ws.send(message);
+                    tokio::pin!(send);
+                    open = loop {
+                        tokio::select! {
+                            biased;
+                            sent = &mut send => break sent.is_ok(),
+                            _ = self.stop.changed() => break false,
+                            Some(done) = self.http.next() => self.answered.push_back(done),
+                        }
                     };
                 }
                 (Effect::Timer { tag, after }, _) => {
@@ -624,11 +642,13 @@ impl<H: MdHandler> MdSession<H> {
     }
 
     /// Starts `req` for the codec of `epoch`; it runs beside the session until it is answered,
-    /// fails or times out.
+    /// fails or times out. Its timeout runs from now, when the codec asked; one past the end
+    /// of the clock bounds nothing, so the request is not sent.
     fn ask(&mut self, epoch: u32, tag: HttpTag, req: HttpRequest, timeout: Duration) {
         let (connector, max_body) = (self.connector.clone(), self.http_max_body);
+        let deadline = Instant::now().checked_add(timeout);
         self.http.push(Box::pin(async move {
-            let result = connector.http_within(&req, timeout, max_body).await;
+            let result = connector.http_by(&req, deadline, max_body).await;
             Answered { epoch, tag, result }
         }));
     }

@@ -24,6 +24,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use tls::TlsServer;
 
@@ -363,7 +364,7 @@ pub struct ScriptedWs {
 enum Out {
     Send(Message),
     Drop,
-    Stall,
+    Stall(Option<std::time::Duration>),
 }
 
 /// One accepted connection: the text frames the client sent, in order, and a way to answer.
@@ -386,7 +387,13 @@ impl ScriptedWs {
                     to_client,
                 });
                 tokio::spawn(async move {
-                    let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    // No size limit: a test may stall the reads under a frame larger than the
+                    // socket buffers hold, then resume them.
+                    let config = WebSocketConfig::default()
+                        .max_message_size(None)
+                        .max_frame_size(None);
+                    let ws = tokio_tungstenite::accept_async_with_config(stream, Some(config));
+                    let mut ws = ws.await.unwrap();
                     loop {
                         tokio::select! {
                             msg = ws.next() => match msg {
@@ -398,7 +405,8 @@ impl ScriptedWs {
                             },
                             cmd = out.recv() => match cmd {
                                 Some(Out::Send(message)) => ws.send(message).await.unwrap(),
-                                Some(Out::Stall) => std::future::pending().await,
+                                Some(Out::Stall(None)) => std::future::pending().await,
+                                Some(Out::Stall(Some(pause))) => tokio::time::sleep(pause).await,
                                 _ => {
                                     let _ = ws.close(None).await;
                                     break;
@@ -452,7 +460,12 @@ impl Peer {
 
     /// Stops reading from the client, holding the connection open.
     pub fn stall(&self) {
-        let _ = self.to_client.send(Out::Stall);
+        let _ = self.to_client.send(Out::Stall(None));
+    }
+
+    /// Stops reading from the client for `pause`, then reads again.
+    pub fn stall_for(&self, pause: std::time::Duration) {
+        let _ = self.to_client.send(Out::Stall(Some(pause)));
     }
 
     /// Closes the connection.
