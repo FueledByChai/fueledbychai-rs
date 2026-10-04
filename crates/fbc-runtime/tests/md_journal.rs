@@ -842,3 +842,54 @@ async fn http_requests_are_offered_lazily_with_their_size() {
     let header = "Authorization".len();
     assert_eq!(sizes.borrow().0, [SUB_ONE, get_len, url.len() + header]);
 }
+
+/// Codex r4178646794: a data frame read in the same poll as the control's drop reaches no codec,
+/// but the journal still records it, so a recording never silently misses an input the session
+/// read. The session's select takes either ready branch at random, so the race is run many
+/// times: some runs read the frame first, and each of those must journal it.
+#[tokio::test]
+async fn a_frame_read_as_the_control_drops_is_journaled_but_reaches_no_codec() {
+    const RUNS: usize = 96;
+    // The peers run on a runtime of their own, so the session's thread can be blocked while a
+    // peer writes.
+    let (peers, ready) = std::sync::mpsc::channel();
+    let (done, finish) = tokio::sync::oneshot::channel::<()>();
+    let server = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            for _ in 0..RUNS {
+                peers.send(ScriptedWs::start().await).unwrap();
+            }
+            let _ = finish.await;
+        });
+    });
+    let mut journaled = 0;
+    for _ in 0..RUNS {
+        let mut ws = ready.recv().unwrap();
+        let seen = Seen::default();
+        let (mut session, control) =
+            MdSession::new(session(ToyVenue::leak(), ws.url()), keep(&seen)).unwrap();
+        let kept = Rc::new(RefCell::new(Kept::default()));
+        session.set_journal(Journal::new(kept.clone()));
+        let script = async move {
+            let mut peer = ws.accept().await;
+            assert_eq!(peer.recv().await, "hello|codec=0|plan=1");
+            assert_eq!(peer.recv().await, "sub|add=A");
+            peer.send("trade|sym=A|px=1|qty=1|seq=1");
+            // Blocks the session's thread, so the frame lands unread before the drop.
+            std::thread::sleep(ms(25));
+            drop(control);
+        };
+        let (run, ()) = tokio::join!(session.run(), script);
+        run.unwrap();
+        assert!(seen.borrow().is_empty());
+        let kept = kept.borrow();
+        journaled += kept.0.iter().filter(|r| line(r).starts_with("in ")).count();
+    }
+    done.send(()).unwrap();
+    server.join().unwrap();
+    assert!(journaled > 0, "no run journaled the frame it read");
+}

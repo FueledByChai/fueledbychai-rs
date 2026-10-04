@@ -570,7 +570,11 @@ impl<H: MdHandler> MdSession<H> {
                 r = self.desired.changed() => Wake::Desired(r.is_ok()),
             };
             // The control first: what woke with its drop reaches no codec (Codex r4177887269).
+            // A frame read with it is still stamped and journaled (Codex r4178646794).
             let wake = if self.stop.has_changed().is_err() {
+                if let Wake::Frame(Some(Ok(message))) = &wake {
+                    self.take_in(key, message);
+                }
                 Wake::Desired(false)
             } else {
                 wake
@@ -611,8 +615,24 @@ impl<H: MdHandler> MdSession<H> {
         Ok(End::Dropped)
     }
 
-    /// Stamps one message of epoch `key` and decodes it; pings, pongs and close frames take
-    /// their place in ingest order but carry no data.
+    /// Stamps one message of epoch `key` and journals it; its stamp and data frame, when it
+    /// carries data. Pings, pongs and close frames take their place in ingest order but carry
+    /// no data.
+    fn take_in<'m>(&mut self, key: ConnKey, message: &'m Message) -> Option<(Stamp, RawFrame<'m>)> {
+        let stamp = self.clock.stamp(key);
+        let raw = match message {
+            Message::Text(text) => RawFrame::Text(text.as_str()),
+            Message::Binary(bytes) => RawFrame::Binary(bytes.as_ref()),
+            _ => return None,
+        };
+        let payload = raw.bytes().len();
+        self.journal_input(TrafficClass::Normal, stamp.recv_wall, payload, || {
+            Record::inbound(stamp, raw)
+        });
+        Some((stamp, raw))
+    }
+
+    /// Stamps and journals one message of epoch `key` and decodes it ([`Self::take_in`]).
     fn decode(
         &mut self,
         codec: &mut dyn MdCodec,
@@ -620,16 +640,9 @@ impl<H: MdHandler> MdSession<H> {
         message: &Message,
         fx: &mut Effects,
     ) {
-        let stamp = self.clock.stamp(key);
-        let raw = match message {
-            Message::Text(text) => RawFrame::Text(text.as_str()),
-            Message::Binary(bytes) => RawFrame::Binary(bytes.as_ref()),
-            _ => return,
+        let Some((stamp, raw)) = self.take_in(key, message) else {
+            return;
         };
-        let payload = raw.bytes().len();
-        self.journal_input(TrafficClass::Normal, stamp.recv_wall, payload, || {
-            Record::inbound(stamp, raw)
-        });
         let mut sink = Sink {
             handler: &mut self.handler,
             epochs: &mut self.epochs,

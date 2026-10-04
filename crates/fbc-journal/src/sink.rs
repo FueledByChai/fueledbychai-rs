@@ -324,12 +324,13 @@ impl JournalSink for QueueSink {
         // room its class has even before an open gap's marker is refused unbuilt, and so is any
         // record once the writer is closed (Codex r4178427389). Otherwise the record is built
         // and admitted exactly.
-        let limit = match class {
-            TrafficClass::Normal => self.soft,
-            TrafficClass::Safety => self.ring.words.len(),
+        // A Normal record must also fit after an open gap's marker (Codex r4178646788).
+        let (need, limit) = match class {
+            TrafficClass::Normal => (self.marker_words() + entry_words(payload), self.soft),
+            TrafficClass::Safety => (entry_words(payload), self.ring.words.len()),
         };
         let open = !self.ring.closed.load(SeqCst);
-        if open && fits(self.ring.used(), entry_words(payload), limit) {
+        if open && fits(self.ring.used(), need, limit) {
             self.offer(class, now, Some(&make()))
         } else {
             self.offer(class, now, None)
@@ -376,10 +377,10 @@ impl QueueSink {
 }
 
 impl QueueSink {
-    /// Pushes `record` (after an open gap's marker) if its class has room for it.
-    fn admit(&mut self, class: TrafficClass, now: WallNs, record: &Record) -> Recorded {
-        self.body.clear();
-        let marker = self.gap.as_ref().map_or(0, |gap| {
+    /// Encodes an open gap's marker into `self.marker` and gives the words its entry takes; 0
+    /// when no gap is open.
+    fn marker_words(&mut self) -> usize {
+        self.gap.as_ref().map_or(0, |gap| {
             self.marker.clear();
             let degraded = Record::Marker(Marker::Degraded {
                 from_seq: gap.from_seq,
@@ -388,7 +389,13 @@ impl QueueSink {
             format::encode(&degraded, &self.key, &mut self.marker)
                 .expect("a marker always encodes");
             entry_words(self.marker.len())
-        });
+        })
+    }
+
+    /// Pushes `record` (after an open gap's marker) if its class has room for it.
+    fn admit(&mut self, class: TrafficClass, now: WallNs, record: &Record) -> Recorded {
+        self.body.clear();
+        let marker = self.marker_words();
         let used = self.ring.used();
         // A body too long for the room its class has left is refused before it is copied: a
         // Normal record has the soft limit less an open gap's marker, a Safety record the
@@ -558,6 +565,32 @@ mod tests {
             "{}",
             sink.body.capacity()
         );
+    }
+
+    #[test]
+    fn a_record_offered_lazily_leaves_room_for_an_open_gaps_marker_before_it_is_built() {
+        // Codex r4178646788: with a gap open, a Normal record offered lazily must fit after the
+        // marker that goes ahead of it, or it is refused unbuilt. The soft limit is 16 words; a
+        // 96-byte payload needs a 14-word entry, which fits alone but not after the 5-word
+        // marker.
+        let (mut sink, _drain) = journal_queue(
+            SinkConfig {
+                budget_bytes: 256,
+                soft_limit_pct: 50,
+            },
+            key(),
+        )
+        .unwrap();
+        assert_eq!(
+            sink.omit(TrafficClass::Normal, WallNs(0)),
+            Recorded::DroppedCounted
+        );
+        assert_eq!(entry_words(96), 14);
+        let refused = sink.record_with(TrafficClass::Normal, WallNs(0), 96, &mut || {
+            panic!("built though it cannot fit after the marker")
+        });
+        assert_eq!(refused, Recorded::DroppedCounted);
+        assert_eq!(sink.dropped(TrafficClass::Normal), 2);
     }
 
     #[test]
