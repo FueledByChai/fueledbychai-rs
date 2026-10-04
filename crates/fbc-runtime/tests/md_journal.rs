@@ -646,3 +646,61 @@ async fn an_interrupted_write_is_journaled_without_a_write_result() {
         [format!("out {big}"), "close".into()]
     );
 }
+
+/// A sink that refuses every record offered lazily without building it, keeping the payload
+/// size it was told, and keeps the kind of every record offered built.
+#[derive(Default)]
+struct Unbuilt {
+    lazy: Vec<usize>,
+    built: Vec<String>,
+}
+
+impl JournalSink for Unbuilt {
+    fn record(&mut self, _: TrafficClass, _: WallNs, record: &Record) -> Recorded {
+        self.built.push(line(record));
+        Recorded::Ok
+    }
+
+    fn record_with(
+        &mut self,
+        _: TrafficClass,
+        _: WallNs,
+        payload: usize,
+        _: &mut dyn FnMut() -> Record,
+    ) -> Recorded {
+        self.lazy.push(payload);
+        Recorded::DroppedCounted
+    }
+}
+
+/// Codex r4178252055: inbound frames and response bodies are offered lazily, with their size,
+/// so a sink with no room refuses them before they are copied.
+#[tokio::test]
+async fn inbound_frames_and_responses_are_offered_lazily_with_their_size() {
+    let (mut ws, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
+    let venue = ToyVenue::leak();
+    let (mut session, control) = MdSession::new(session(venue, ws.url()), |_| {}).unwrap();
+    let sink = Rc::new(RefCell::new(Unbuilt::default()));
+    session.set_journal(Journal::new(sink.clone()));
+    let get = format!("get|tag=1|ms=5000|url={}", http.url("/snap"));
+    let frame = get.clone();
+    let script = async move {
+        let mut peer = ws.accept().await;
+        assert_eq!(peer.recv().await, "hello|codec=0|plan=1");
+        assert_eq!(peer.recv().await, "sub|add=A");
+        peer.send(&frame);
+        http.request().await.answer("HTTP/1.1 200 OK", "say").await;
+        assert_eq!(peer.recv().await, "said");
+        drop(control);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    let sink = sink.borrow();
+    assert_eq!(sink.lazy, [get.len(), "say".len()]);
+    assert!(
+        !sink
+            .built
+            .iter()
+            .any(|l| l.starts_with("in ") || l.starts_with("result "))
+    );
+}

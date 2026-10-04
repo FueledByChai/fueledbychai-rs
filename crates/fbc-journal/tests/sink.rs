@@ -556,3 +556,44 @@ fn the_smallest_configuration_accepted_can_close_a_gap() {
         ]
     );
 }
+
+/// Codex r4178252055 (FBC-f3w): a record offered lazily whose payload cannot fit the room its
+/// class has left is dropped and counted without being built, so a large frame is never copied
+/// on the shard thread only to be refused; the gap it opens is marked like any other.
+#[test]
+fn a_record_offered_lazily_is_not_built_when_its_payload_cannot_fit() {
+    let root = fresh_dir("sink_lazy");
+    let config = SinkConfig {
+        budget_bytes: 1024,
+        soft_limit_pct: 50,
+    };
+    let (mut sink, drain) = journal_queue(config, key()).unwrap();
+    let mut built = 0;
+    let mut first = || {
+        built += 1;
+        timer(0)
+    };
+    let fits = sink.record_with(TrafficClass::Normal, NOW, 8, &mut first);
+    assert_eq!((fits, built), (Recorded::Ok, 1));
+    // More than the whole budget: never built, whatever its class.
+    for class in [TrafficClass::Normal, TrafficClass::Safety] {
+        let refused = sink.record_with(class, NOW, 4096, &mut || panic!("built"));
+        assert_eq!(refused, Recorded::DroppedCounted);
+        assert_eq!(sink.dropped(class), 1);
+    }
+    let writer = drain
+        .spawn(JournalWriter::create(&root, 1, key()).unwrap())
+        .unwrap();
+    until_drained(&sink);
+    assert_eq!(
+        sink.record(TrafficClass::Normal, NOW, &timer(3)),
+        Recorded::Ok
+    );
+    writer.close().unwrap();
+    let degraded = Record::Marker(Marker::Degraded {
+        from_seq: 1,
+        dropped: 2,
+    });
+    assert_eq!(read_all(&root, 1), [timer(0), degraded, timer(3)]);
+    fs::remove_dir_all(&root).unwrap();
+}

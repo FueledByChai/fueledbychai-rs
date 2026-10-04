@@ -13,7 +13,9 @@
 //! does not fit is dropped and counted by class, and [`record`](JournalSink::record) says so:
 //! the caller proceeds either way. A record the format cannot hold, or one larger than the
 //! room its class has left, is dropped and counted the same way, and its payload is not
-//! copied: encoding stops where the room ends.
+//! copied: encoding stops where the room ends. A caller whose record would copy a large payload
+//! to be built offers it with [`record_with`](JournalSink::record_with) and its size: one whose
+//! payload alone exceeds that room is dropped and counted without being built.
 //!
 //! **The gap.** The sink numbers the records offered to it from 0. The first drop opens a gap;
 //! it closes once space returns, that is when a record arrives and the `Degraded` marker and
@@ -76,6 +78,21 @@ pub trait JournalSink {
     /// Journals `record` under the UTC day of `now`, or drops and counts it when its class has
     /// no room left. Never blocks and never fails the caller.
     fn record(&mut self, class: TrafficClass, now: WallNs, record: &Record) -> Recorded;
+
+    /// Journals the record `make` builds, as [`record`](JournalSink::record) does, when the
+    /// record's encoding holds at least `payload` bytes (a frame's or a body's): a sink that can
+    /// tell such a record has no room drops and counts it without calling `make`, so a large
+    /// payload is not copied only to be refused (FBC-f3w). By default it builds and records it.
+    fn record_with(
+        &mut self,
+        class: TrafficClass,
+        now: WallNs,
+        payload: usize,
+        make: &mut dyn FnMut() -> Record,
+    ) -> Recorded {
+        let _ = payload;
+        self.record(class, now, &make())
+    }
 }
 
 /// Makes the journal queue: the sink the shard records into, which hashes redaction spans
@@ -285,14 +302,42 @@ impl QueueSink {
 
 impl JournalSink for QueueSink {
     fn record(&mut self, class: TrafficClass, now: WallNs, record: &Record) -> Recorded {
+        self.offer(class, now, Some(record))
+    }
+
+    fn record_with(
+        &mut self,
+        class: TrafficClass,
+        now: WallNs,
+        payload: usize,
+        make: &mut dyn FnMut() -> Record,
+    ) -> Recorded {
+        // An entry holding `payload` bytes needs at least this many words; one that exceeds the
+        // room its class has even before an open gap's marker is refused unbuilt. Otherwise the
+        // record is built and admitted exactly.
+        let limit = match class {
+            TrafficClass::Normal => self.soft,
+            TrafficClass::Safety => self.ring.words.len(),
+        };
+        if fits(self.ring.used(), entry_words(payload), limit) {
+            self.offer(class, now, Some(&make()))
+        } else {
+            self.offer(class, now, None)
+        }
+    }
+}
+
+impl QueueSink {
+    /// Offers `record`, numbering it; `None` stands for a record already known not to fit,
+    /// which is dropped and counted like any other.
+    fn offer(&mut self, class: TrafficClass, now: WallNs, record: Option<&Record>) -> Recorded {
         let seq = self.next_seq;
         self.next_seq += 1;
         self.ring.busy.store(true, SeqCst);
         let open = !self.ring.closed.load(SeqCst);
-        let recorded = if open {
-            self.admit(class, now, record)
-        } else {
-            Recorded::DroppedCounted
+        let recorded = match record {
+            Some(record) if open => self.admit(class, now, record),
+            _ => Recorded::DroppedCounted,
         };
         if recorded == Recorded::DroppedCounted {
             self.dropped[class_index(class)] += 1;

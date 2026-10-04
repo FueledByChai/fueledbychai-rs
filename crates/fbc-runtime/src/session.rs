@@ -384,13 +384,24 @@ impl<H: MdHandler> MdSession<H> {
         }
     }
 
-    /// Offers the record of an input `make` builds, unless the session has carried a
-    /// credential, in which case the input is withheld and counted.
-    fn journal_input(&self, class: TrafficClass, now: WallNs, make: impl FnOnce() -> Record) {
-        if self.journal.is_some() && self.credentialed.get() {
+    /// Offers the record of an input `make` builds, holding `payload` bytes the input carries,
+    /// unless the session has carried a credential, in which case the input is withheld and
+    /// counted. The sink is told the payload's size first, so one with no room for it refuses it
+    /// before it is copied (Codex r4178252055).
+    fn journal_input(
+        &self,
+        class: TrafficClass,
+        now: WallNs,
+        payload: usize,
+        make: impl FnOnce() -> Record,
+    ) {
+        let Some(journal) = &self.journal else {
+            return;
+        };
+        if self.credentialed.get() {
             self.withheld.set(self.withheld.get() + 1);
         } else {
-            self.journal(class, now, make);
+            journal.record_with(class, now, payload, make);
         }
     }
 
@@ -597,7 +608,8 @@ impl<H: MdHandler> MdSession<H> {
             Message::Binary(bytes) => RawFrame::Binary(bytes.as_ref()),
             _ => return,
         };
-        self.journal_input(TrafficClass::Normal, stamp.recv_wall, || {
+        let payload = raw.bytes().len();
+        self.journal_input(TrafficClass::Normal, stamp.recv_wall, payload, || {
             Record::inbound(stamp, raw)
         });
         let mut sink = Sink {
@@ -874,10 +886,13 @@ impl<H: MdHandler> MdSession<H> {
             ..self.current()
         };
         let stamp = self.clock.stamp(key);
-        self.journal_input(done.class, stamp.recv_wall, || Record::HttpResult {
-            stamp,
-            tag: done.tag,
-            result: done.result.as_ref().map(response_rec).map_err(|e| *e),
+        let payload = done.result.as_ref().map_or(0, |r| r.body().len());
+        self.journal_input(done.class, stamp.recv_wall, payload, || {
+            Record::HttpResult {
+                stamp,
+                tag: done.tag,
+                result: done.result.as_ref().map(response_rec).map_err(|e| *e),
+            }
         });
         (stamp, done)
     }
