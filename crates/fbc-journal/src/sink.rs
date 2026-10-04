@@ -105,6 +105,7 @@ pub fn journal_queue(config: SinkConfig) -> Result<(QueueSink, JournalDrain), Jo
         tail: AtomicU64::new(0),
         parked: AtomicBool::new(false),
         closed: AtomicBool::new(false),
+        busy: AtomicBool::new(false),
         writer: OnceLock::new(),
     });
     let sink = QueueSink {
@@ -128,8 +129,13 @@ struct Ring {
     tail: AtomicU64,
     /// The writer is parked, or about to park, and wants waking.
     parked: AtomicBool,
-    /// No more records are coming: the writer stops once the ring is empty.
+    /// Closed: the sink refuses every record from now on, and the writer stops once the ring
+    /// is empty.
     closed: AtomicBool,
+    /// The sink is between its look at `closed` and the end of its push. With both flags
+    /// `SeqCst`, a writer that sees `closed` and then `busy` clear knows no record it has not
+    /// seen will be pushed.
+    busy: AtomicBool,
     /// The writer thread, set by the thread itself before it can park.
     writer: OnceLock<Thread>,
 }
@@ -253,6 +259,31 @@ impl JournalSink for QueueSink {
     fn record(&mut self, class: TrafficClass, now: WallNs, record: &Record) -> Recorded {
         let seq = self.next_seq;
         self.next_seq += 1;
+        self.ring.busy.store(true, SeqCst);
+        let recorded = if self.ring.closed.load(SeqCst) {
+            Recorded::DroppedCounted
+        } else {
+            self.admit(class, now, record)
+        };
+        self.ring.busy.store(false, SeqCst);
+        if recorded == Recorded::DroppedCounted {
+            self.dropped[class_index(class)] += 1;
+            self.gap
+                .get_or_insert(Gap {
+                    from_seq: seq,
+                    dropped: 0,
+                })
+                .dropped += 1;
+        } else {
+            self.ring.wake();
+        }
+        recorded
+    }
+}
+
+impl QueueSink {
+    /// Pushes `record` (after an open gap's marker) if its class has room for it.
+    fn admit(&mut self, class: TrafficClass, now: WallNs, record: &Record) -> Recorded {
         self.body.clear();
         let marker = self.gap.as_ref().map_or(0, |gap| {
             self.marker.clear();
@@ -283,16 +314,8 @@ impl JournalSink for QueueSink {
         } else if class == TrafficClass::Safety && fits(used, need, self.ring.words.len()) {
             self.ring.push(now, &self.body);
         } else {
-            self.dropped[class_index(class)] += 1;
-            self.gap
-                .get_or_insert(Gap {
-                    from_seq: seq,
-                    dropped: 0,
-                })
-                .dropped += 1;
             return Recorded::DroppedCounted;
         }
-        self.ring.wake();
         Recorded::Ok
     }
 }
@@ -333,8 +356,12 @@ fn run(ring: &Ring, mut writer: JournalWriter) -> Result<(), JournalError> {
     let _ = ring.writer.set(thread::current());
     let mut body = Vec::new();
     loop {
-        // Read before looking at the ring: a record queued before the sink closed is seen.
+        // Read before looking at the ring. Once closed, the sink pushes nothing new after its
+        // push in flight, if any, which `busy` waits out: what the ring then holds is the end.
         let closing = ring.closed.load(SeqCst);
+        while closing && ring.busy.load(SeqCst) {
+            thread::yield_now();
+        }
         if let Some(wall) = ring.pop(&mut body) {
             writer.append_body(wall, &body)?;
             continue;
@@ -358,9 +385,9 @@ pub struct WriterThread {
 }
 
 impl WriterThread {
-    /// Writes what is queued, flushes, and stops the thread. Records offered after this stay
-    /// queued until the queue fills, and are then dropped and counted. Returns the write error
-    /// that stopped the thread, if one did.
+    /// Closes the sink, writes what it accepted, flushes, and stops the thread. The sink drops
+    /// and counts every record offered after this. Returns the write error that stopped the
+    /// thread, if one did.
     pub fn close(self) -> Result<(), JournalError> {
         self.ring.closed.store(true, SeqCst);
         self.handle.thread().unpark();
@@ -419,5 +446,43 @@ mod tests {
             "{}",
             sink.body.capacity()
         );
+    }
+
+    #[test]
+    fn a_closing_writer_waits_out_a_push_in_flight() {
+        // Unit tests get no CARGO_TARGET_TMPDIR: a directory of this process's own.
+        let root =
+            std::env::temp_dir().join(format!("fbc-journal-sink-in-flight-{}", std::process::id()));
+        let (sink, drain) = journal_queue(SinkConfig {
+            budget_bytes: 256,
+            soft_limit_pct: 50,
+        })
+        .unwrap();
+        let ring = Arc::clone(&sink.ring);
+        // The sink is mid-push as the writer sees it close.
+        ring.busy.store(true, SeqCst);
+        ring.closed.store(true, SeqCst);
+        let writer = drain
+            .spawn(JournalWriter::create(&root, 1).unwrap())
+            .unwrap();
+        while ring.writer.get().is_none() {
+            thread::yield_now();
+        }
+        for _ in 0..1_000 {
+            thread::yield_now();
+        }
+        // The push lands, then the sink is done; the writer writes it and stops.
+        let mut body = Vec::new();
+        format::encode(&Record::Marker(Marker::Recovered), &mut body).unwrap();
+        ring.push(WallNs(0), &body);
+        ring.busy.store(false, SeqCst);
+        writer.close().unwrap();
+        let read: Vec<Record> = crate::JournalReader::open(&root, 1)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(read, [Record::Marker(Marker::Recovered)]);
+        drop(sink);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

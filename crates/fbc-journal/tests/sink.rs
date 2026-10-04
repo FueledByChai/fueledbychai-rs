@@ -258,6 +258,70 @@ fn a_writer_draining_while_the_sink_floods_loses_nothing_it_admitted() {
 }
 
 #[test]
+fn close_ends_with_a_busy_sink_and_refuses_what_comes_after() {
+    // Codex r4176868171: a sink that keeps the queue full must not hold close() up, and every
+    // record the sink accepted is written.
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    let root = fresh_dir("sink_close_busy");
+    let (mut sink, drain) = journal_queue(SinkConfig {
+        budget_bytes: 1024,
+        soft_limit_pct: 85,
+    })
+    .unwrap();
+    let writer = drain
+        .spawn(JournalWriter::create(&root, 4).unwrap())
+        .unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let accepted = Arc::new(AtomicU64::new(0));
+    let producer = thread::spawn({
+        let (stop, accepted) = (Arc::clone(&stop), Arc::clone(&accepted));
+        move || {
+            let mut kept = Vec::new();
+            let mut seq = 0;
+            while !stop.load(Ordering::SeqCst) {
+                if sink.record(TrafficClass::Normal, NOW, &timer(seq)) == Recorded::Ok {
+                    kept.push(seq);
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                }
+                seq += 1;
+            }
+            (sink, kept, seq)
+        }
+    });
+    let start = std::time::Instant::now();
+    while accepted.load(Ordering::SeqCst) < 1_000 {
+        assert!(start.elapsed() < PATIENCE, "the producer never got going");
+        thread::yield_now();
+    }
+    let (closed, closing) = mpsc::channel();
+    let closer = thread::spawn(move || closed.send(writer.close()).unwrap());
+    let result = closing
+        .recv_timeout(PATIENCE)
+        .expect("close never returned while the sink kept producing");
+    result.unwrap();
+    closer.join().unwrap();
+    stop.store(true, Ordering::SeqCst);
+    let (mut sink, kept, seq) = producer.join().unwrap();
+
+    // After close, the sink refuses and counts.
+    let before = sink.dropped(TrafficClass::Safety);
+    assert_eq!(
+        sink.record(TrafficClass::Safety, NOW, &timer(seq)),
+        Recorded::DroppedCounted
+    );
+    assert_eq!(sink.dropped(TrafficClass::Safety), before + 1);
+    let written: Vec<u64> = read_all(&root, 4)
+        .into_iter()
+        .filter_map(|r| match r {
+            Record::Timer { tag, .. } => Some(tag.0),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(written, kept);
+}
+
+#[test]
 fn a_record_the_queue_or_the_format_cannot_hold_is_dropped_and_counted() {
     let root = fresh_dir("sink_unholdable");
     let (mut sink, drain) = journal_queue(SinkConfig {

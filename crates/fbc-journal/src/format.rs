@@ -133,13 +133,18 @@ pub(crate) fn encode_within(
             opcode,
             bytes,
         } => {
+            // Checked before any copy, and only for a frame within the limit: one past it is
+            // refused for its size without being scanned.
+            if *opcode == Opcode::Text
+                && bytes.0.len() <= e.room()
+                && core::str::from_utf8(&bytes.0).is_err()
+            {
+                return Err(JournalError::Unencodable("a text frame that is not UTF-8"));
+            }
             e.u8(INBOUND);
             e.stamp(stamp);
             e.u8(opcode_byte(*opcode));
             e.bytes(&bytes.0)?;
-            if *opcode == Opcode::Text && !e.over && core::str::from_utf8(&bytes.0).is_err() {
-                return Err(JournalError::Unencodable("a text frame that is not UTF-8"));
-            }
         }
         Record::Outbound {
             at,
@@ -262,6 +267,11 @@ struct Enc<'a> {
 }
 
 impl Enc<'_> {
+    /// The bytes left before the limit.
+    fn room(&self) -> usize {
+        self.end.saturating_sub(self.out.len())
+    }
+
     /// Every byte the encoder writes goes through here.
     fn put(&mut self, v: &[u8]) {
         self.over = self.over || self.out.len().saturating_add(v.len()) > self.end;
@@ -730,6 +740,19 @@ mod tests {
             encode_within(record, &mut limited, unlimited.len()).unwrap();
             assert_eq!(limited, unlimited);
         }
+        // Codex r4176868162: a text frame that fits but is not UTF-8 is refused before its
+        // payload is copied.
+        let mut body = Vec::new();
+        let not_utf8 = Record::Inbound {
+            stamp: stamp(),
+            opcode: Opcode::Text,
+            bytes: Opaque(vec![0xff; 1 << 20]),
+        };
+        assert!(matches!(
+            encode(&not_utf8, &mut body),
+            Err(JournalError::Unencodable(_))
+        ));
+        assert!(body.capacity() < 1 << 10, "{}", body.capacity());
         // A text frame too large to copy is refused for its size, before its UTF-8 is checked.
         let not_utf8 = Record::Inbound {
             stamp: stamp(),
