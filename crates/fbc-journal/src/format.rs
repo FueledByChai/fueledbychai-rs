@@ -29,15 +29,15 @@
 use core::ops::Range;
 
 use fbc_core::{
-    BookId, ConnKey, EncodeCtx, Feed, HttpFailure, HttpMethod, HttpTag, InstrumentId, KernelRxNs,
-    MonoNs, NonceBlock, NotSentReason, RpcId, Stamp, Subscription, TimerTag, TouchSourceId, WallNs,
-    WireSlice, WireUrl, check_redactions,
+    BookId, ConnKey, EncodeCtx, Feed, Header, HttpFailure, HttpMethod, HttpTag, InstrumentId,
+    KernelRxNs, MonoNs, NonceBlock, NotSentReason, RawFrame, RpcId, Stamp, Subscription, TimerTag,
+    TouchSourceId, WallNs, WireSlice, WireUrl, check_redactions,
 };
 
 use crate::JournalError;
 use crate::record::{
     BLANK, ControlEvent, HeaderRec, HttpRequestRec, HttpResponseRec, Marker, NonceSourceId, Opaque,
-    Opcode, Record, WriteRes,
+    Opcode, Record, RecordRef, WriteRes, is_secret_header,
 };
 use crate::redact::{DIGEST_LEN, RedactionKey, SpanDigest};
 
@@ -144,15 +144,22 @@ pub(crate) fn encode(
 
 /// [`encode`], refusing a body longer than `limit` bytes with [`JournalError::TooLarge`]
 /// before copying the bytes that would pass it, so a record too large for the room left
-/// costs no copy of its payload. A refused record leaves `out` as it was.
-pub(crate) fn encode_within(
-    record: &Record,
+/// costs no copy of its payload. A refused record leaves `out` as it was. A borrowed record
+/// ([`RecordRef`]) is encoded from what it borrows, by the same code as the owned record it
+/// stands for, so the room it is admitted to is checked at its exact encoded length.
+pub(crate) fn encode_within<'r>(
+    record: impl Into<RecordRef<'r>>,
     key: &RedactionKey,
     out: &mut Vec<u8>,
     limit: usize,
 ) -> Result<(), JournalError> {
+    let record = record.into();
     let start = out.len();
-    let encoded = encode_body(record, key, out, limit);
+    // A first pass measures the body, hashing and copying nothing, so a record that cannot fit
+    // is refused before any of its redactions is hashed (Codex r4179465515); the same code then
+    // writes it.
+    let encoded = encode_body(record, key, out, limit, false)
+        .and_then(|()| encode_body(record, key, out, limit, true));
     // A refused record leaves `out` as it found it.
     if encoded.is_err() {
         out.truncate(start);
@@ -160,18 +167,82 @@ pub(crate) fn encode_within(
     encoded
 }
 
+/// Encodes `record` into `out` within `limit` bytes, or with `write` false only measures it:
+/// nothing is copied or hashed, and only a record too large is refused.
 fn encode_body(
-    record: &Record,
+    record: RecordRef<'_>,
     key: &RedactionKey,
     out: &mut Vec<u8>,
     limit: usize,
+    write: bool,
 ) -> Result<(), JournalError> {
     let mut e = Enc {
         end: body_end(out.len(), limit),
+        at: out.len(),
+        write,
         out,
         key,
         redacted: 0,
         over: false,
+    };
+    // A borrowed record goes through the same field writers as the owned record it stands for.
+    let record = match record {
+        RecordRef::Owned(record) => record,
+        RecordRef::Inbound { stamp, frame } => {
+            let opcode = match frame {
+                RawFrame::Text(_) => Opcode::Text,
+                RawFrame::Binary(_) => Opcode::Binary,
+            };
+            e.inbound(&stamp, opcode, frame.bytes(), &[])?;
+            return e.within();
+        }
+        RecordRef::HttpRequest {
+            at,
+            conn,
+            tag,
+            rpc,
+            req,
+        } => {
+            let hide = |h: &Header| Hide::value_if(h.redact || is_secret_header(h.name));
+            let headers = req
+                .headers
+                .iter()
+                .map(|h| (h.name, Value::Text(&h.value), hide(h)));
+            e.http_request(
+                (at, conn, tag, rpc),
+                req.method,
+                &req.url,
+                headers,
+                &req.body,
+            )?;
+            return e.within();
+        }
+        RecordRef::HttpResult { stamp, tag, result } => {
+            let result = result.map(|r| {
+                let headers = r.headers.iter();
+                let headers = headers.map(|(name, raw)| {
+                    (
+                        *name,
+                        Value::Lossy(raw),
+                        Hide::value_if(is_secret_header(name)),
+                    )
+                });
+                // A borrowed response carries no spans: a codec names them (decision 0028)
+                // only once the session asks it (FBC-s69).
+                (r.status, headers, (r.body, &[][..]))
+            });
+            e.http_result(&stamp, tag, result)?;
+            return e.within();
+        }
+        RecordRef::Subscribe {
+            at,
+            conn,
+            add,
+            remove,
+        } => {
+            e.subscribe(at, conn, add, remove)?;
+            return e.within();
+        }
     };
     match record {
         Record::Inbound {
@@ -179,20 +250,7 @@ fn encode_body(
             opcode,
             bytes,
             redact,
-        } => {
-            e.u8(INBOUND);
-            e.stamp(stamp);
-            e.u8(opcode_byte(*opcode));
-            // Checked before the payload is copied, and only for a payload that fits after
-            // the fields before it: one that cannot is refused for its size, unscanned.
-            if *opcode == Opcode::Text
-                && bytes.0.len() <= e.room()
-                && core::str::from_utf8(&bytes.0).is_err()
-            {
-                return Err(JournalError::Unencodable("a text frame that is not UTF-8"));
-            }
-            e.inbound_spanned(&bytes.0, redact)?;
-        }
+        } => e.inbound(stamp, *opcode, &bytes.0, redact)?,
         Record::Outbound {
             at,
             conn,
@@ -230,32 +288,24 @@ fn encode_body(
             rpc,
             req,
         } => {
-            e.u8(HTTP_REQUEST);
-            e.u64(at.0);
-            e.conn(*conn);
-            e.u64(tag.0);
-            e.rpc(*rpc);
-            e.u8(method_byte(req.method));
-            e.spanned(req.url.as_str().as_bytes(), req.url.redactions())?;
-            e.headers(&req.headers)?;
-            e.spanned(req.body.bytes(), req.body.redactions())?;
+            let headers = rec_headers(&req.headers);
+            e.http_request(
+                (*at, *conn, *tag, *rpc),
+                req.method,
+                &req.url,
+                headers,
+                &req.body,
+            )?;
         }
         Record::HttpResult { stamp, tag, result } => {
-            e.u8(HTTP_RESULT);
-            e.stamp(stamp);
-            e.u64(tag.0);
-            match result {
-                Ok(resp) => {
-                    e.u8(0);
-                    e.u16(resp.status);
-                    e.headers(&resp.headers)?;
-                    e.inbound_spanned(&resp.body.0, &resp.body_redact)?;
-                }
-                Err(failure) => {
-                    e.u8(1);
-                    e.u8(failure_byte(*failure));
-                }
-            }
+            let result = result
+                .as_ref()
+                .map(|r| {
+                    let body = (r.body.0.as_slice(), r.body_redact.as_slice());
+                    (r.status, rec_headers(&r.headers), body)
+                })
+                .map_err(|e| *e);
+            e.http_result(stamp, *tag, result)?;
         }
         Record::Timer { stamp, tag } => {
             e.u8(TIMER);
@@ -275,10 +325,7 @@ fn encode_body(
                     e.conn(*conn);
                 }
                 ControlEvent::Subscribe { conn, add, remove } => {
-                    e.u8(2);
-                    e.conn(*conn);
-                    e.subs(add)?;
-                    e.subs(remove)?;
+                    e.subscription(*conn, add, remove)?;
                 }
             }
         }
@@ -327,10 +374,178 @@ fn encode_body(
             }
         }
     }
-    if e.over {
-        return Err(JournalError::TooLarge);
+    e.within()
+}
+
+impl Enc<'_> {
+    /// An inbound frame: its stamp, its opcode and its bytes with the spans a codec named in
+    /// them.
+    fn inbound(
+        &mut self,
+        stamp: &Stamp,
+        opcode: Opcode,
+        bytes: &[u8],
+        spans: &[Range<u32>],
+    ) -> Result<(), JournalError> {
+        self.u8(INBOUND);
+        self.stamp(stamp);
+        self.u8(opcode_byte(opcode));
+        // Checked before the payload is copied, and only for a payload that fits after the
+        // fields before it: one that cannot is refused for its size, unscanned.
+        if self.write
+            && opcode == Opcode::Text
+            && bytes.len() <= self.room()
+            && core::str::from_utf8(bytes).is_err()
+        {
+            return Err(JournalError::Unencodable("a text frame that is not UTF-8"));
+        }
+        self.inbound_spanned(bytes, spans)
     }
-    Ok(())
+
+    /// An HTTP request: when and by whom it was asked for (`at`, `conn`, `tag`, `rpc`), its
+    /// method, URL, headers (name, value, what of it is secret) and body.
+    fn http_request<'h>(
+        &mut self,
+        (at, conn, tag, rpc): (MonoNs, ConnKey, HttpTag, Option<RpcId>),
+        method: HttpMethod,
+        url: &WireUrl,
+        headers: impl ExactSizeIterator<Item = (&'h str, Value<'h>, Hide)>,
+        body: &WireSlice,
+    ) -> Result<(), JournalError> {
+        self.u8(HTTP_REQUEST);
+        self.u64(at.0);
+        self.conn(conn);
+        self.u64(tag.0);
+        self.rpc(rpc);
+        self.u8(method_byte(method));
+        self.spanned(url.as_str().as_bytes(), url.redactions())?;
+        self.headers(headers)?;
+        self.spanned(body.bytes(), body.redactions())
+    }
+
+    /// An HTTP result: the response's status, headers (name, value, what of it is secret) and
+    /// body with the spans a codec named in it, or why none came.
+    fn http_result<'h>(
+        &mut self,
+        stamp: &Stamp,
+        tag: HttpTag,
+        result: Result<
+            (
+                u16,
+                impl ExactSizeIterator<Item = (&'h str, Value<'h>, Hide)>,
+                Spanned<'_>,
+            ),
+            HttpFailure,
+        >,
+    ) -> Result<(), JournalError> {
+        self.u8(HTTP_RESULT);
+        self.stamp(stamp);
+        self.u64(tag.0);
+        match result {
+            Ok((status, headers, (body, spans))) => {
+                self.u8(0);
+                self.u16(status);
+                self.headers(headers)?;
+                self.inbound_spanned(body, spans)
+            }
+            Err(failure) => {
+                self.u8(1);
+                self.u8(failure_byte(failure));
+                Ok(())
+            }
+        }
+    }
+
+    /// A control record of a subscribe call.
+    fn subscribe(
+        &mut self,
+        at: MonoNs,
+        conn: ConnKey,
+        add: &[Subscription],
+        remove: &[Subscription],
+    ) -> Result<(), JournalError> {
+        self.u8(CONTROL);
+        self.u64(at.0);
+        self.subscription(conn, add, remove)
+    }
+
+    /// A subscribe call's event: its connection and the subscriptions added and removed.
+    fn subscription(
+        &mut self,
+        conn: ConnKey,
+        add: &[Subscription],
+        remove: &[Subscription],
+    ) -> Result<(), JournalError> {
+        self.u8(2);
+        self.conn(conn);
+        self.subs(add)?;
+        self.subs(remove)
+    }
+}
+
+/// Journaled headers as (name, value, what of it is secret).
+fn rec_headers(headers: &[HeaderRec]) -> impl ExactSizeIterator<Item = (&str, Value<'_>, Hide)> {
+    headers.iter().map(|h| {
+        let hide = if h.redact_name {
+            Hide::NameAndValue
+        } else {
+            Hide::value_if(h.secret())
+        };
+        (h.name.as_str(), Value::Text(&h.value), hide)
+    })
+}
+
+/// Bytes with the redaction spans named in them.
+type Spanned<'b> = (&'b [u8], &'b [Range<u32>]);
+
+/// What of a header the journal keeps only as keyed hashes.
+#[derive(Copy, Clone)]
+enum Hide {
+    Nothing,
+    Value,
+    NameAndValue,
+}
+
+impl Hide {
+    /// Its value when `secret`, else nothing.
+    fn value_if(secret: bool) -> Hide {
+        if secret { Hide::Value } else { Hide::Nothing }
+    }
+}
+
+/// The UTF-8 a lossily read value is written as: [`String::from_utf8_lossy`]'s, without
+/// building it.
+const REPLACEMENT: &[u8] = "\u{FFFD}".as_bytes();
+
+/// A header value as journaled: text, or raw bytes read lossily as UTF-8.
+#[derive(Copy, Clone)]
+enum Value<'a> {
+    Text(&'a str),
+    Lossy(&'a [u8]),
+}
+
+impl<'a> Value<'a> {
+    /// The value's UTF-8 in pieces: a lossy one's valid runs, each invalid sequence as U+FFFD.
+    fn chunks(self) -> impl Iterator<Item = &'a [u8]> {
+        let (text, raw): (&[u8], &[u8]) = match self {
+            Value::Text(text) => (text.as_bytes(), &[]),
+            Value::Lossy(raw) => (&[], raw),
+        };
+        let lossy = raw.utf8_chunks().flat_map(|c| {
+            let bad: &[u8] = if c.invalid().is_empty() {
+                &[]
+            } else {
+                REPLACEMENT
+            };
+            [c.valid().as_bytes(), bad]
+        });
+        core::iter::once(text).chain(lossy)
+    }
+
+    /// The length of the value's UTF-8.
+    fn len(self) -> usize {
+        self.chunks().map(<[u8]>::len).sum()
+    }
 }
 
 /// A span's descriptor: its start and end (`u32`) and its keyed hash.
@@ -343,26 +558,44 @@ fn body_end(start: usize, limit: usize) -> usize {
 }
 
 /// The output, the key spans are hashed under, the bytes redacted so far, where the body must
-/// end by, and whether it has passed that end, after which nothing more is copied.
+/// end by, and whether it has passed that end, after which nothing more is copied. `at` is
+/// where the body has reached in `out`; with `write` false the body is only measured, nothing
+/// copied into `out` and nothing hashed.
 struct Enc<'a> {
     out: &'a mut Vec<u8>,
     key: &'a RedactionKey,
     redacted: u64,
     end: usize,
     over: bool,
+    at: usize,
+    write: bool,
 }
 
 impl Enc<'_> {
     /// The bytes left before the limit.
     fn room(&self) -> usize {
-        self.end.saturating_sub(self.out.len())
+        self.end.saturating_sub(self.at)
     }
 
     /// Every byte the encoder writes goes through here.
     fn put(&mut self, v: &[u8]) {
-        self.over = self.over || self.out.len().saturating_add(v.len()) > self.end;
+        self.over = self.over || self.at.saturating_add(v.len()) > self.end;
         if !self.over {
-            self.out.extend_from_slice(v);
+            if self.write {
+                self.out.extend_from_slice(v);
+            }
+            self.at += v.len();
+        }
+    }
+
+    /// The keyed hash of `chunks`, concatenated; a measuring pass hashes nothing and counts
+    /// the hash's length.
+    fn hash<'c>(&mut self, chunks: impl IntoIterator<Item = &'c [u8]>) {
+        if self.write {
+            let digest = self.key.digest_chunks(chunks);
+            self.put(&digest.0);
+        } else {
+            self.put(&[0; DIGEST_LEN]);
         }
     }
 
@@ -457,10 +690,7 @@ impl Enc<'_> {
         for span in spans {
             self.u32(span.start);
             self.u32(span.end);
-            let digest = self
-                .key
-                .digest(&bytes[span.start as usize..span.end as usize]);
-            self.put(&digest.0);
+            self.hash([&bytes[span.start as usize..span.end as usize]]);
             self.within()?;
         }
         let mut at = 0;
@@ -490,35 +720,49 @@ impl Enc<'_> {
         self.spanned(bytes, spans)
     }
 
-    /// A secret header's name or value: its length and its keyed hash.
-    fn hashed(&mut self, v: &str) -> Result<(), JournalError> {
-        self.redact(v.len() as u64)?;
-        self.u32(len32(v.len())?);
-        let digest = self.key.digest(v.as_bytes());
-        self.put(&digest.0);
+    /// A secret header's name or value: its length and its keyed hash. The length and the
+    /// digest must fit before the value is counted or hashed (Codex r4179310271).
+    fn hashed(&mut self, v: Value<'_>) -> Result<(), JournalError> {
+        if 4 + DIGEST_LEN > self.room() {
+            self.over = true;
+            return Err(JournalError::TooLarge);
+        }
+        let len = v.len();
+        self.redact(len as u64)?;
+        self.u32(len32(len)?);
+        self.hash(v.chunks());
         self.within()
     }
 
-    /// Headers: each a flag byte (0 plain, 1 its value secret, 2 its name and value secret),
-    /// its name and its value, a secret one written as its length and its keyed hash.
-    fn headers(&mut self, headers: &[HeaderRec]) -> Result<(), JournalError> {
+    /// Headers as (name, value, what of it is secret): each a flag byte (0 plain, 1 its value
+    /// secret, 2 its name and value secret), its name and its value, a secret one written as
+    /// its length and its keyed hash.
+    fn headers<'h>(
+        &mut self,
+        headers: impl ExactSizeIterator<Item = (&'h str, Value<'h>, Hide)>,
+    ) -> Result<(), JournalError> {
         self.u32(len32(headers.len())?);
-        for h in headers {
-            match (h.redact_name, h.secret()) {
-                (true, _) => {
+        for (name, value, hide) in headers {
+            match hide {
+                Hide::NameAndValue => {
                     self.u8(2);
-                    self.hashed(&h.name)?;
-                    self.hashed(&h.value)?;
+                    self.hashed(Value::Text(name))?;
+                    self.hashed(value)?;
                 }
-                (false, true) => {
+                Hide::Value => {
                     self.u8(1);
-                    self.bytes(h.name.as_bytes())?;
-                    self.hashed(&h.value)?;
+                    self.bytes(name.as_bytes())?;
+                    self.hashed(value)?;
                 }
-                (false, false) => {
+                Hide::Nothing => {
                     self.u8(0);
-                    self.bytes(h.name.as_bytes())?;
-                    self.bytes(h.value.as_bytes())?;
+                    self.bytes(name.as_bytes())?;
+                    let len = value.len();
+                    self.u32(len32(len)?);
+                    for chunk in value.chunks() {
+                        self.put(chunk);
+                    }
+                    self.within()?;
                 }
             }
         }
@@ -922,6 +1166,8 @@ impl<'a> Dec<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::record::ResponseRef;
+    use fbc_core::HttpRequest;
 
     fn round_trip(record: &Record) -> Record {
         let mut body = Vec::new();
@@ -1424,6 +1670,87 @@ mod tests {
         );
     }
 
+    /// Codex r4179465515: a record that cannot fit its limit is refused before any of its
+    /// redactions is hashed, however much of it would fit before the field that does not: a
+    /// request whose redacted URL fits but whose body does not hashes nothing.
+    #[test]
+    fn a_record_that_cannot_fit_is_refused_before_any_redaction_is_hashed() {
+        let url = "k".repeat(4096);
+        let req = HttpRequest {
+            method: HttpMethod::Get,
+            url: WireUrl::redacted(url, vec![0..2048, 2048..4096]).unwrap(),
+            headers: vec![Header {
+                name: "Authorization",
+                value: "token".into(),
+                redact: false,
+            }],
+            body: WireSlice::plain(vec![b'b'; 1 << 16]),
+        };
+        let view = RecordRef::HttpRequest {
+            at: MonoNs(1),
+            conn: conn(),
+            tag: HttpTag(1),
+            rpc: None,
+            req: &req,
+        };
+        let before = crate::redact::digests_taken();
+        let mut out = Vec::new();
+        assert!(matches!(
+            encode_within(view, &key(), &mut out, 1024),
+            Err(JournalError::TooLarge)
+        ));
+        assert_eq!(
+            crate::redact::digests_taken(),
+            before,
+            "hashed a refused record"
+        );
+        assert!(out.is_empty());
+        encode_within(view, &key(), &mut out, usize::MAX).unwrap();
+        assert_eq!(crate::redact::digests_taken(), before + 3);
+    }
+
+    /// Codex r4179310271: a secret header whose length and digest cannot fit after its flag
+    /// and name is refused before its value is counted or hashed, so a record bound to be
+    /// dropped costs no scan of a long credential; a secret name likewise.
+    #[test]
+    fn a_secret_header_with_no_room_for_its_digest_is_refused_unhashed() {
+        let k = key();
+        let value = "s".repeat(4096);
+        // Room for the count, the flag, the name's length and the name, and the value's length
+        // and digest but one byte.
+        let mut out = Vec::new();
+        let mut e = Enc {
+            out: &mut out,
+            key: &k,
+            redacted: 0,
+            end: 4 + 1 + 4 + "cookie".len() + 4 + DIGEST_LEN - 1,
+            over: false,
+            at: 0,
+            write: true,
+        };
+        let headers = [("cookie", Value::Text(&value), Hide::Value)].into_iter();
+        assert!(matches!(e.headers(headers), Err(JournalError::TooLarge)));
+        assert_eq!(e.redacted, 0, "counted before its digest was known to fit");
+        assert_eq!(e.out.len(), 4 + 1 + 4 + "cookie".len());
+
+        // A secret name: room for the count, the flag and the name's length and digest but one
+        // byte.
+        let mut out = Vec::new();
+        let mut e = Enc {
+            out: &mut out,
+            key: &k,
+            redacted: 0,
+            end: 4 + 1 + 4 + DIGEST_LEN - 1,
+            over: false,
+            at: 0,
+            write: true,
+        };
+        let headers = [("x-echo-k", Value::Text(&value), Hide::NameAndValue)].into_iter();
+        assert!(matches!(e.headers(headers), Err(JournalError::TooLarge)));
+        assert_eq!(e.redacted, 0, "counted before its digest was known to fit");
+        assert_eq!(e.out.len(), 4 + 1);
+    }
+
     #[test]
     fn encoding_stops_at_the_limit_instead_of_walking_the_rest() {
         // Codex r4176902248: past the limit, no later element is written. A secret header
@@ -1436,6 +1763,8 @@ mod tests {
             redacted: 0,
             end: 16,
             over: false,
+            at: 0,
+            write: true,
         };
         let headers = [
             HeaderRec {
@@ -1451,7 +1780,10 @@ mod tests {
                 redact_name: false,
             },
         ];
-        assert!(matches!(e.headers(&headers), Err(JournalError::TooLarge)));
+        assert!(matches!(
+            e.headers(rec_headers(&headers)),
+            Err(JournalError::TooLarge)
+        ));
         assert_eq!(e.redacted, 0);
 
         let mut out = Vec::new();
@@ -1462,6 +1794,8 @@ mod tests {
             redacted: 0,
             end: 16,
             over: false,
+            at: 0,
+            write: true,
         };
         let spans: Vec<Range<u32>> = (0..64).map(|i| i * 2..i * 2 + 1).collect();
         assert!(matches!(
@@ -1480,6 +1814,8 @@ mod tests {
             redacted: 0,
             end: 16,
             over: false,
+            at: 0,
+            write: true,
         };
         let subs: Vec<Subscription> = (1..=64)
             .map(|i| Subscription {
@@ -1535,6 +1871,8 @@ mod tests {
             redacted: 0,
             end: usize::MAX,
             over: false,
+            at: 0,
+            write: true,
         };
         let span = MAX_REDACTED as u32 / 4;
         let bytes = vec![b'a'; span as usize * 8];
@@ -1558,6 +1896,8 @@ mod tests {
             redacted: 0,
             end: 64,
             over: false,
+            at: 0,
+            write: true,
         };
         let spans: Vec<Range<u32>> = (0..64).map(|i| i * 2..i * 2 + 1).collect();
         assert!(matches!(
@@ -1566,5 +1906,325 @@ mod tests {
         ));
         assert_eq!(e.redacted, 0);
         assert!(e.out.len() <= 64);
+    }
+
+    /// A small deterministic generator (xorshift64*), so the property test below needs no
+    /// dependency and every run checks the same cases.
+    struct Gen(u64);
+
+    impl Gen {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+
+        fn flip(&mut self) -> bool {
+            self.below(2) == 0
+        }
+
+        /// A length: empty, small, or large (past what a small sink holds).
+        fn len(&mut self) -> usize {
+            match self.below(8) {
+                0 => 0,
+                1 => 70_000 + self.below(4096),
+                _ => self.below(64),
+            }
+        }
+
+        fn bytes(&mut self, n: usize) -> Vec<u8> {
+            (0..n).map(|_| self.next() as u8).collect()
+        }
+
+        fn any_bytes(&mut self) -> Vec<u8> {
+            let n = self.len();
+            self.bytes(n)
+        }
+
+        fn any_text(&mut self) -> String {
+            let n = self.len();
+            self.text(n)
+        }
+
+        fn ascii(&mut self, n: usize) -> String {
+            (0..n)
+                .map(|_| char::from(b'a' + self.below(26) as u8))
+                .collect()
+        }
+
+        /// Random bytes read lossily, as the runtime reads a header value: invalid sequences
+        /// become U+FFFD, valid multi-byte ones stay.
+        fn text(&mut self, n: usize) -> String {
+            String::from_utf8_lossy(&self.bytes(n)).into_owned()
+        }
+
+        /// Ordered, disjoint, non-empty spans within `len` bytes.
+        fn spans(&mut self, len: usize) -> Vec<Range<u32>> {
+            let mut spans = Vec::new();
+            let mut at = 0;
+            while at < len && self.below(3) != 0 {
+                // Below `len`, as `at` is.
+                let start = at + self.below((len - at).min(16));
+                let end = start + 1 + self.below((len - start).min(40));
+                spans.push(start as u32..end as u32);
+                at = end;
+            }
+            spans
+        }
+
+        fn slice(&mut self) -> WireSlice {
+            let bytes = self.any_bytes();
+            let spans = self.spans(bytes.len());
+            WireSlice::redacted(bytes, spans).unwrap()
+        }
+
+        fn stamp(&mut self) -> Stamp {
+            Stamp {
+                ingest_seq: self.next(),
+                kernel_rx: self.flip().then(|| KernelRxNs(self.next() as i64)),
+                recv_mono: MonoNs(self.next()),
+                recv_wall: WallNs(self.next() as i64),
+                conn: conn(),
+            }
+        }
+
+        fn rpc(&mut self) -> Option<RpcId> {
+            self.flip().then(|| RpcId(self.next()))
+        }
+
+        fn subs(&mut self) -> Vec<Subscription> {
+            let feeds = [
+                Feed::Touch(TouchSourceId(3)),
+                Feed::Book(BookId(2)),
+                Feed::Trades,
+                Feed::Mark,
+                Feed::Index,
+                Feed::Funding,
+                Feed::Stats,
+            ];
+            (0..self.below(5))
+                .map(|_| Subscription {
+                    inst: InstrumentId::new(self.next() as u32),
+                    feed: feeds[self.below(feeds.len())],
+                })
+                .collect()
+        }
+
+        fn request(&mut self) -> HttpRequest {
+            const NAMES: [&str; 5] = ["Authorization", "cookie", "x-sig", "accept", "X-Api-Key"];
+            let url = {
+                let n = self.len();
+                self.ascii(n)
+            };
+            let spans = self.spans(url.len());
+            HttpRequest {
+                method: METHODS[self.below(METHODS.len())],
+                url: WireUrl::redacted(url, spans).unwrap(),
+                headers: (0..self.below(4))
+                    .map(|_| Header {
+                        name: NAMES[self.below(NAMES.len())],
+                        value: self.any_text(),
+                        redact: self.flip(),
+                    })
+                    .collect(),
+                body: self.slice(),
+            }
+        }
+
+        /// A response's headers as the transport hands them on, raw (often not UTF-8), secret
+        /// ones by name among them.
+        fn response_headers(&mut self) -> Vec<(&'static str, Vec<u8>)> {
+            const NAMES: [&str; 4] = ["set-cookie", "Cookie", "content-type", "x-raw"];
+            (0..self.below(4))
+                .map(|_| (NAMES[self.below(NAMES.len())], self.any_bytes()))
+                .collect()
+        }
+
+        /// One owned record of a kind no [`RecordRef`] borrows.
+        fn owned(&mut self) -> Record {
+            match self.below(9) {
+                0 => Record::Outbound {
+                    at: MonoNs(self.next()),
+                    conn: conn(),
+                    rpc: self.rpc(),
+                    frame: self.slice(),
+                },
+                1 => Record::WriteResult {
+                    at: MonoNs(self.next()),
+                    conn: conn(),
+                    rpc: self.rpc(),
+                    result: if self.flip() {
+                        WriteRes::Written
+                    } else {
+                        WriteRes::NotSent(NOT_SENT[self.below(NOT_SENT.len())])
+                    },
+                },
+                2 => Record::Timer {
+                    stamp: self.stamp(),
+                    tag: TimerTag(self.next()),
+                },
+                3 => Record::Control {
+                    at: MonoNs(self.next()),
+                    ev: if self.flip() {
+                        ControlEvent::Opened(conn())
+                    } else {
+                        ControlEvent::Closed(conn())
+                    },
+                },
+                4 => Record::Marker(match self.below(3) {
+                    0 => Marker::SessionStart {
+                        header: Opaque(self.any_bytes()),
+                    },
+                    1 => Marker::Degraded {
+                        from_seq: self.next(),
+                        dropped: self.next(),
+                    },
+                    _ => Marker::Recovered,
+                }),
+                5 => Record::Nonce {
+                    source: NonceSourceId(self.next() as u32),
+                    value: self.next(),
+                },
+                6 => encode_ctx((0..self.below(6)).map(|_| self.next()).collect()),
+                7 => cycle(self.below(6) as u32),
+                _ => Record::HttpResult {
+                    stamp: self.stamp(),
+                    tag: HttpTag(self.next()),
+                    result: Err(FAILURES[self.below(FAILURES.len())]),
+                },
+            }
+        }
+    }
+
+    /// Checks the one property every offer relies on for one record: the borrowed record
+    /// encodes byte for byte as the owned record it stands for, reads back as that record
+    /// blanked, and a sink's room for it is checked at exactly that length: it fits a limit of
+    /// its encoded length and is refused, leaving the buffer as it was, one byte short of it.
+    fn check(view: RecordRef<'_>) {
+        let owned = view.to_record();
+        let mut borrowed = Vec::new();
+        encode_within(view, &key(), &mut borrowed, usize::MAX).unwrap();
+        let mut built = Vec::new();
+        encode(&owned, &key(), &mut built).unwrap();
+        assert_eq!(borrowed, built, "{owned:?}");
+        assert_eq!(decode(&borrowed).unwrap().0, owned.blanked());
+        let mut exact = vec![7];
+        encode_within(view, &key(), &mut exact, borrowed.len()).unwrap();
+        assert_eq!(exact[1..], borrowed[..]);
+        let mut short = vec![7];
+        assert!(matches!(
+            encode_within(view, &key(), &mut short, borrowed.len() - 1),
+            Err(JournalError::TooLarge)
+        ));
+        assert_eq!(short, [7]);
+    }
+
+    /// FBC-f3w: the size a record is offered to a sink at is the size it encodes to, for every
+    /// kind, borrowed or owned: with redacted spans, secret and plain headers (secret by name
+    /// or by mark), lossily read header values, binary frames that are not UTF-8, and empty and
+    /// large payloads. A borrowed record has no size of its own to drift from its encoding.
+    #[test]
+    fn every_record_is_offered_at_exactly_the_length_it_encodes_to() {
+        let mut g = Gen(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..400 {
+            let stamp = g.stamp();
+            let (text, binary) = (g.any_text(), g.any_bytes());
+            check(RecordRef::Inbound {
+                stamp,
+                frame: RawFrame::Text(&text),
+            });
+            check(RecordRef::Inbound {
+                stamp,
+                frame: RawFrame::Binary(&binary),
+            });
+            let req = g.request();
+            check(RecordRef::HttpRequest {
+                at: MonoNs(g.next()),
+                conn: conn(),
+                tag: HttpTag(g.next()),
+                rpc: g.rpc(),
+                req: &req,
+            });
+            let headers = g.response_headers();
+            let pairs: Vec<(&str, &[u8])> = headers.iter().map(|(n, v)| (*n, &v[..])).collect();
+            let body = g.any_bytes();
+            let result = if g.below(4) == 0 {
+                Err(FAILURES[g.below(FAILURES.len())])
+            } else {
+                Ok(ResponseRef {
+                    status: g.next() as u16,
+                    headers: &pairs,
+                    body: &body,
+                })
+            };
+            check(RecordRef::HttpResult {
+                stamp,
+                tag: HttpTag(g.next()),
+                result,
+            });
+            let (add, remove) = (g.subs(), g.subs());
+            check(RecordRef::Subscribe {
+                at: MonoNs(g.next()),
+                conn: conn(),
+                add: &add,
+                remove: &remove,
+            });
+            let owned = g.owned();
+            check(RecordRef::from(&owned));
+        }
+    }
+
+    /// FBC-f3w: a borrowed record the format refuses is refused as the owned record it stands
+    /// for is, for the same reason.
+    #[test]
+    fn a_borrowed_record_is_refused_as_its_owned_record_is() {
+        let over = MAX_REDACTED as usize + 1;
+        let req = HttpRequest {
+            method: HttpMethod::Post,
+            url: WireUrl::redacted("https://toy/x".into(), Vec::new()).unwrap(),
+            headers: Vec::new(),
+            body: WireSlice::redacted(
+                vec![b'k'; over + 1],
+                vec![0..over as u32, over as u32..over as u32 + 1],
+            )
+            .unwrap(),
+        };
+        let secret = vec![b's'; over];
+        let pairs = [("Set-Cookie", &secret[..])];
+        let views = [
+            RecordRef::HttpRequest {
+                at: MonoNs(1),
+                conn: conn(),
+                tag: HttpTag(1),
+                rpc: None,
+                req: &req,
+            },
+            RecordRef::HttpResult {
+                stamp: stamp(),
+                tag: HttpTag(1),
+                result: Ok(ResponseRef {
+                    status: 200,
+                    headers: &pairs,
+                    body: b"",
+                }),
+            },
+        ];
+        for view in views {
+            let mut out = Vec::new();
+            assert!(matches!(
+                encode_within(view, &key(), &mut out, usize::MAX),
+                Err(JournalError::TooLarge)
+            ));
+            assert!(out.is_empty());
+            assert!(matches!(
+                encode(&view.to_record(), &key(), &mut out),
+                Err(JournalError::TooLarge)
+            ));
+        }
     }
 }

@@ -557,31 +557,44 @@ fn the_smallest_configuration_accepted_can_close_a_gap() {
     );
 }
 
-/// Codex r4178252055 (FBC-f3w): a record offered lazily whose payload cannot fit the room its
-/// class has left is dropped and counted without being built, so a large frame is never copied
-/// on the shard thread only to be refused; the gap it opens is marked like any other.
+/// A borrowed inbound frame of `bytes`, stamped `seq`.
+fn frame(seq: u64, bytes: &[u8]) -> fbc_journal::RecordRef<'_> {
+    fbc_journal::RecordRef::Inbound {
+        stamp: Stamp {
+            ingest_seq: seq,
+            kernel_rx: None,
+            recv_mono: MonoNs(1),
+            recv_wall: NOW,
+            conn: ConnKey { conn: 1, epoch: 1 },
+        },
+        frame: fbc_core::RawFrame::Binary(bytes),
+    }
+}
+
+/// Codex r4178252055 (FBC-f3w): a record offered borrowed is encoded from what it borrows, so
+/// one whose payload cannot fit the room its class has left is dropped and counted before it
+/// is copied, and one that fits is journaled as the owned record it stands for; the gap a drop
+/// opens is marked like any other, and a record the caller withholds is numbered into it.
 #[test]
-fn a_record_offered_lazily_is_not_built_when_its_payload_cannot_fit() {
-    let root = fresh_dir("sink_lazy");
+fn a_record_offered_borrowed_is_journaled_as_its_owned_record_or_dropped_unbuilt() {
+    let root = fresh_dir("sink_borrowed");
     let config = SinkConfig {
         budget_bytes: 1024,
         soft_limit_pct: 50,
     };
     let (mut sink, drain) = journal_queue(config, key()).unwrap();
-    let mut built = 0;
-    let mut first = || {
-        built += 1;
-        timer(0)
-    };
-    let fits = sink.record_with(TrafficClass::Normal, NOW, 8, &mut first);
-    assert_eq!((fits, built), (Recorded::Ok, 1));
-    // More than the whole budget: never built, whatever its class.
+    let small = frame(0, b"tick");
+    assert_eq!(
+        sink.record_ref(TrafficClass::Normal, NOW, small),
+        Recorded::Ok
+    );
+    // More than the whole budget, whatever its class.
+    let big = vec![7; 4096];
     for class in [TrafficClass::Normal, TrafficClass::Safety] {
-        let refused = sink.record_with(class, NOW, 4096, &mut || panic!("built"));
+        let refused = sink.record_ref(class, NOW, frame(1, &big));
         assert_eq!(refused, Recorded::DroppedCounted);
         assert_eq!(sink.dropped(class), 1);
     }
-    // A record the caller withholds is counted and numbered into the same gap.
     assert_eq!(
         sink.omit(TrafficClass::Normal, NOW),
         Recorded::DroppedCounted
@@ -591,8 +604,9 @@ fn a_record_offered_lazily_is_not_built_when_its_payload_cannot_fit() {
         .spawn(JournalWriter::create(&root, 1, key()).unwrap())
         .unwrap();
     until_drained(&sink);
+    let owned = timer(4);
     assert_eq!(
-        sink.record(TrafficClass::Normal, NOW, &timer(4)),
+        sink.record_ref(TrafficClass::Normal, NOW, (&owned).into()),
         Recorded::Ok
     );
     writer.close().unwrap();
@@ -600,16 +614,15 @@ fn a_record_offered_lazily_is_not_built_when_its_payload_cannot_fit() {
         from_seq: 1,
         dropped: 3,
     });
-    assert_eq!(read_all(&root, 1), [timer(0), degraded, timer(4)]);
+    assert_eq!(read_all(&root, 1), [small.to_record(), degraded, owned]);
     fs::remove_dir_all(&root).unwrap();
 }
 
-/// Codex r4178427389 (FBC-f3w): once the writer is closed, a record offered lazily is refused
-/// and counted without being built, however small, so a sink a live session still holds never
-/// copies a record it is bound to drop.
+/// Codex r4178427389 (FBC-f3w): once the writer is closed, a record offered borrowed is
+/// refused and counted without being encoded, however small.
 #[test]
-fn a_closed_sink_never_builds_a_record_offered_lazily() {
-    let root = fresh_dir("sink_lazy_closed");
+fn a_closed_sink_refuses_a_record_offered_borrowed() {
+    let root = fresh_dir("sink_borrowed_closed");
     let config = SinkConfig {
         budget_bytes: 1024,
         soft_limit_pct: 50,
@@ -620,9 +633,44 @@ fn a_closed_sink_never_builds_a_record_offered_lazily() {
         .unwrap();
     writer.close().unwrap();
     for class in [TrafficClass::Normal, TrafficClass::Safety] {
-        let refused = sink.record_with(class, NOW, 8, &mut || panic!("built after close"));
+        let refused = sink.record_ref(class, NOW, frame(0, b"tick"));
         assert_eq!(refused, Recorded::DroppedCounted);
         assert_eq!(sink.dropped(class), 1);
+        assert_eq!(sink.queued_bytes(), 0);
     }
     fs::remove_dir_all(&root).unwrap();
+}
+
+/// A sink that keeps what it is offered, for the trait's default borrowed offer.
+struct Keeps(Vec<Record>);
+
+impl JournalSink for Keeps {
+    fn record(&mut self, _: TrafficClass, _: WallNs, record: &Record) -> Recorded {
+        self.0.push(record.clone());
+        Recorded::Ok
+    }
+
+    fn omit(&mut self, _: TrafficClass, _: WallNs) -> Recorded {
+        Recorded::DroppedCounted
+    }
+}
+
+/// A sink that does not encode borrowed records itself records the owned record each stands
+/// for.
+#[test]
+fn a_sink_by_default_records_the_owned_record_a_borrowed_one_stands_for() {
+    let mut sink = Keeps(Vec::new());
+    let owned = timer(1);
+    let offers = [frame(0, b"tick"), (&owned).into()];
+    for offer in offers {
+        assert_eq!(
+            sink.record_ref(TrafficClass::Normal, NOW, offer),
+            Recorded::Ok
+        );
+    }
+    assert_eq!(
+        sink.omit(TrafficClass::Normal, NOW),
+        Recorded::DroppedCounted
+    );
+    assert_eq!(sink.0, [offers[0].to_record(), owned]);
 }

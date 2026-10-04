@@ -10,7 +10,7 @@ use std::fmt;
 use std::rc::Rc;
 
 use fbc_core::{TrafficClass, WallNs};
-use fbc_journal::{JournalSink, Record};
+use fbc_journal::{JournalSink, Record, RecordRef};
 
 /// The journal the sessions of one shard thread record into. Cloning it shares the sink.
 #[derive(Clone)]
@@ -44,21 +44,10 @@ impl Journal {
         let _ = self.sink.borrow_mut().omit(class, now);
     }
 
-    /// Offers the record `make` builds, telling the sink first that it holds `payload` bytes,
-    /// so a sink with no room for them refuses it unbuilt ([`JournalSink::record_with`]).
-    pub(crate) fn record_with(
-        &self,
-        class: TrafficClass,
-        now: WallNs,
-        payload: usize,
-        make: impl FnOnce() -> Record,
-    ) {
-        let mut make = Some(make);
-        let mut build = || make.take().expect("a sink builds a record at most once")();
-        let _ = self
-            .sink
-            .borrow_mut()
-            .record_with(class, now, payload, &mut build);
+    /// Offers `record`, whose large contents it borrows, so a sink with no room for it
+    /// refuses it before they are copied ([`JournalSink::record_ref`]).
+    pub(crate) fn record_ref(&self, class: TrafficClass, now: WallNs, record: RecordRef<'_>) {
+        let _ = self.sink.borrow_mut().record_ref(class, now, record);
     }
 }
 

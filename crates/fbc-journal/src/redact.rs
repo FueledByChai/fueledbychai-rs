@@ -65,10 +65,34 @@ impl RedactionKey {
 
     /// HMAC-SHA-256 of `bytes` under this key.
     pub fn digest(&self, bytes: &[u8]) -> SpanDigest {
+        self.digest_chunks([bytes])
+    }
+
+    /// HMAC-SHA-256 of `chunks` in order, as of their concatenation, under this key.
+    pub(crate) fn digest_chunks<'a>(
+        &self,
+        chunks: impl IntoIterator<Item = &'a [u8]>,
+    ) -> SpanDigest {
+        #[cfg(test)]
+        TAKEN.with(|n| n.set(n.get() + 1));
         let mut mac = self.mac.clone();
-        mac.update(bytes);
+        for chunk in chunks {
+            mac.update(chunk);
+        }
         SpanDigest(mac.finalize().into_bytes().into())
     }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// The digests this thread has taken, so a test can tell a record was refused unhashed.
+    static TAKEN: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// The digests this test thread has taken.
+#[cfg(test)]
+pub(crate) fn digests_taken() -> usize {
+    TAKEN.with(core::cell::Cell::get)
 }
 
 impl fmt::Debug for RedactionKey {

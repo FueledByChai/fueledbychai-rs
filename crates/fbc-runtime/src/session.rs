@@ -40,12 +40,14 @@
 //! journaled. Until FBC-7lm, nothing a codec receives carries redaction spans, so inbound
 //! frames and responses would be journaled verbatim: a session that carries a credential (its
 //! endpoint URL has a redaction span, or it has sent a frame or HTTP request with one, or with a
-//! header the codec marked or one of the journal's secret headers) journals none of what it
-//! receives from then on, counting each withheld input instead (Codex r4178197275) and omitting
-//! it at the sink, which counts it as dropped and marks the gap with a `Degraded` marker (Codex
-//! r4178287664). What it sends is still journaled, its spans as keyed hashes. Inbound frames,
-//! HTTP requests and HTTP results are offered with their size, so a sink with no room refuses
-//! them before they are copied.
+//! header the codec marked or one of the journal's secret headers) journals no frame or
+//! response it receives from then on, counting each withheld input instead (Codex r4178197275)
+//! and omitting it at the sink, which counts it as dropped and marks the gap with a `Degraded`
+//! marker (Codex r4178287664). An HTTP failure holds nothing received, so it is still journaled
+//! (Codex r4179310275), and so is what the session sends, its spans as keyed hashes. Inbound
+//! frames, HTTP requests, HTTP results and subscribe calls are offered to the sink borrowed
+//! ([`RecordRef`]), so a sink with no room refuses them before they are copied, at the length
+//! the journal's own encoding of them takes.
 
 use std::cell::Cell;
 use std::cmp::Reverse;
@@ -62,10 +64,7 @@ use fbc_core::{
     SpecTable, Stamp, StreamId, Subscription, TimerTag, TrafficClass, VenueCaps, VenueConfig,
     VenueFactory, VenueMeta, WallNs, dispatch_market_data,
 };
-use fbc_journal::{
-    ControlEvent, HeaderRec, HttpRequestRec, HttpResponseRec, Opaque, Record, WriteRes,
-    is_secret_header,
-};
+use fbc_journal::{ControlEvent, Record, RecordRef, ResponseRef, WriteRes, is_secret_header};
 use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use tokio::sync::watch;
@@ -387,42 +386,17 @@ impl<H: MdHandler> MdSession<H> {
         }
     }
 
-    /// Offers the record `make` builds, if the session has a journal, under `class`, telling
-    /// the sink first that it holds `payload()` bytes, so a sink with no room refuses it
-    /// unbuilt. With no journal, neither is worked out (Codex r4178802725).
-    fn journal_with(
-        &self,
-        class: TrafficClass,
-        now: WallNs,
-        payload: impl FnOnce() -> usize,
-        make: impl FnOnce() -> Record,
-    ) {
-        if let Some(journal) = &self.journal {
-            journal.record_with(class, now, payload(), make);
-        }
-    }
-
-    /// Offers the record of an input `make` builds, holding `payload` bytes the input carries,
-    /// unless the session has carried a credential, in which case the input is withheld,
-    /// counted, and omitted at the sink, which marks the gap (Codex r4178287664). The sink is told the payload's size first, so one with no room for it refuses it
-    /// before it is copied (Codex r4178252055).
-    fn journal_input(
-        &self,
-        class: TrafficClass,
-        now: WallNs,
-        payload: impl FnOnce() -> usize,
-        make: impl FnOnce() -> Record,
-    ) {
-        let Some(journal) = &self.journal else {
-            return;
-        };
+    /// The journal an input of `class` is offered to: none when the session has no journal,
+    /// or when it has carried a credential, in which case the input is withheld, counted, and
+    /// omitted at the sink, which marks the gap (Codex r4178287664).
+    fn input_journal(&self, class: TrafficClass, now: WallNs) -> Option<&Journal> {
+        let journal = self.journal.as_ref()?;
         if self.credentialed.get() {
             self.withheld.set(self.withheld.get() + 1);
             journal.omit(class, now);
-        } else {
-            // Sized only when it may be recorded (Codex r4178802725).
-            journal.record_with(class, now, payload(), make);
+            return None;
         }
+        Some(journal)
     }
 
     /// Records a connection change or a subscribe call.
@@ -532,14 +506,19 @@ impl<H: MdHandler> MdSession<H> {
     /// until it drops or the session stops.
     async fn connected(&mut self, ws: Option<WebSocket>) -> Result<End, SessionError> {
         // A control that has already dropped stops the session before a codec is built, so
-        // nothing is sent or asked for after it; a socket just opened is dropped unused (Codex
-        // r4177698436, r4177790164).
-        if self.stop.has_changed().is_err() {
+        // nothing is sent or asked for after it (Codex r4177698436, r4177790164). A poll
+        // endpoint then opens nothing; a socket just opened is journaled opened and closed, and
+        // dropped unused, however late the drop comes (Codex r4179310270).
+        if ws.is_none() && self.stop.has_changed().is_err() {
             return Ok(End::Stop);
         }
         let key = self.current();
         self.control(|| ControlEvent::Opened(key));
-        let end = self.epoch(ws, key).await;
+        let end = if self.stop.has_changed().is_err() {
+            Ok(End::Stop)
+        } else {
+            self.epoch(ws, key).await
+        };
         self.control(|| ControlEvent::Closed(key));
         end
     }
@@ -572,10 +551,17 @@ impl<H: MdHandler> MdSession<H> {
                 r = self.desired.changed() => Wake::Desired(r.is_ok()),
             };
             // The control first: what woke with its drop reaches no codec (Codex r4177887269).
-            // A frame read with it is still stamped and journaled (Codex r4178646794).
+            // A frame read or a timer taken with it is still stamped and journaled (Codex
+            // r4178646794, r4179379935).
             let wake = if self.stop.has_changed().is_err() {
-                if let Wake::Frame(Some(Ok(message))) = &wake {
-                    self.take_in(key, message);
+                match &wake {
+                    Wake::Frame(Some(Ok(message))) => {
+                        self.take_in(key, message);
+                    }
+                    Wake::Timer => {
+                        let _ = self.take_timer()?;
+                    }
+                    _ => {}
                 }
                 Wake::Desired(false)
             } else {
@@ -627,10 +613,12 @@ impl<H: MdHandler> MdSession<H> {
             Message::Binary(bytes) => RawFrame::Binary(bytes.as_ref()),
             _ => return None,
         };
-        let payload = || raw.bytes().len();
-        self.journal_input(TrafficClass::Normal, stamp.recv_wall, payload, || {
-            Record::inbound(stamp, raw)
-        });
+        // Offered borrowed, so a full journal refuses it before it is copied (Codex
+        // r4178252055).
+        let (class, now) = (TrafficClass::Normal, stamp.recv_wall);
+        if let Some(journal) = self.input_journal(class, now) {
+            journal.record_ref(class, now, RecordRef::Inbound { stamp, frame: raw });
+        }
         Some((stamp, raw))
     }
 
@@ -661,37 +649,16 @@ impl<H: MdHandler> MdSession<H> {
 
     /// Hands a current epoch's HTTP result to the codec that asked for it, under `stamp`.
     fn answer(&mut self, codec: &mut dyn MdCodec, stamp: Stamp, done: Answered, fx: &mut Effects) {
-        let headers: Vec<(String, String)> = match &done.result {
-            Ok(response) => response
-                .headers()
-                .iter()
-                .map(|(name, value)| {
-                    let value = String::from_utf8_lossy(value.as_bytes()).into_owned();
-                    (name.as_str().to_owned(), value)
-                })
-                .collect(),
-            Err(_) => Vec::new(),
-        };
-        let headers: Vec<(&str, &str)> = headers
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str()))
-            .collect();
-        let resp = match &done.result {
-            Ok(response) => Ok(HttpResponse {
-                status: response.status().as_u16(),
-                headers: &headers,
-                body: response.body(),
-            }),
-            Err(failure) => Err(*failure),
-        };
         let mut sink = Sink {
             handler: &mut self.handler,
             epochs: &mut self.epochs,
             stamp,
         };
-        let specs = &self.specs;
-        let decoded = dispatch_market_data(&self.caps, |scope| {
-            codec.on_http(done.tag, resp, scope, specs, &mut sink, fx)
+        let (specs, caps) = (&self.specs, &self.caps);
+        let decoded = with_response(&done.result, |resp| {
+            dispatch_market_data(caps, |scope| {
+                codec.on_http(done.tag, resp, scope, specs, &mut sink, fx)
+            })
         });
         if decoded.is_err() {
             self.counters.decode_errors += 1;
@@ -728,12 +695,19 @@ impl<H: MdHandler> MdSession<H> {
     ) -> Result<bool, SessionError> {
         let mut open = true;
         while open && let Some(this) = call.take() {
-            // Offered with the least its subscriptions encode to, so a full journal refuses it
-            // before the sets are copied (Codex r4178567381).
+            // Offered borrowed, so a full journal refuses it before the sets are copied (Codex
+            // r4178567381).
             let (at, now) = self.clock.now();
-            let payload = || subscriptions_bytes(this.add()) + subscriptions_bytes(this.remove());
-            let make = || subscribe_rec(at, self.current(), &this);
-            self.journal_with(TrafficClass::Normal, now, payload, make);
+            if let Some(journal) = &self.journal {
+                let (conn, add, remove) = (self.current(), this.add(), this.remove());
+                let call = RecordRef::Subscribe {
+                    at,
+                    conn,
+                    add,
+                    remove,
+                };
+                journal.record_ref(TrafficClass::Normal, now, call);
+            }
             let mut fx = Effects::new();
             let asked = codec.subscribe(this.add(), this.remove(), &self.specs, &mut fx);
             open = self.execute(ws, &mut *codec, fx).await?;
@@ -893,22 +867,18 @@ impl<H: MdHandler> MdSession<H> {
             self.credentialed.set(true);
         }
         let (at, now) = self.clock.now();
-        // Offered with the bytes it keeps verbatim, headers included, so a full journal refuses
-        // it before it is cloned (Codex r4178287660, r4178427394). Redacted spans and secret
-        // header values are journaled as fixed-size digests, so they do not count (Codex
-        // r4178567377).
-        self.journal_with(
-            class,
-            now,
-            || request_bytes(&req),
-            || Record::HttpRequest {
+        // Offered borrowed, so a full journal refuses it before it is cloned (Codex
+        // r4178287660).
+        if let Some(journal) = &self.journal {
+            let ask = RecordRef::HttpRequest {
                 at,
                 conn,
                 tag,
                 rpc,
-                req: HttpRequestRec::from(&req),
-            },
-        );
+                req: &req,
+            };
+            journal.record_ref(class, now, ask);
+        }
         let (connector, max_body) = (self.connector.clone(), self.http_max_body);
         self.http.push(Box::pin(async move {
             let result = connector.http_by(&req, deadline, max_body).await;
@@ -929,16 +899,35 @@ impl<H: MdHandler> MdSession<H> {
             ..self.current()
         };
         let stamp = self.clock.stamp(key);
-        // Its body and headers, so a full journal refuses it before it is copied (Codex
-        // r4178427394).
-        let payload = || done.result.as_ref().map_or(0, response_bytes);
-        self.journal_input(done.class, stamp.recv_wall, payload, || {
-            Record::HttpResult {
+        // Offered borrowed, its header values raw, so a full journal refuses it before its body
+        // is copied or a value read (Codex r4178252055, r4179379938); the journal reads them
+        // as the codec is handed them. A failure holds no byte of a response, so it is
+        // journaled even by a credentialed session (Codex r4179310275).
+        let journal = match &done.result {
+            Ok(_) => self.input_journal(done.class, stamp.recv_wall),
+            Err(_) => self.journal.as_ref(),
+        };
+        if let Some(journal) = journal {
+            let headers: Vec<(&str, &[u8])> = match &done.result {
+                Ok(r) => r
+                    .headers()
+                    .iter()
+                    .map(|(n, v)| (n.as_str(), v.as_bytes()))
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            let result = done.result.as_ref().map_err(|e| *e).map(|r| ResponseRef {
+                status: r.status().as_u16(),
+                headers: &headers,
+                body: r.body(),
+            });
+            let answer = RecordRef::HttpResult {
                 stamp,
                 tag: done.tag,
-                result: done.result.as_ref().map(response_rec).map_err(|e| *e),
-            }
-        });
+                result,
+            };
+            journal.record_ref(done.class, stamp.recv_wall, answer);
+        }
         (stamp, done)
     }
 
@@ -979,111 +968,29 @@ impl<H: MdHandler> MdSession<H> {
     }
 }
 
-/// A response as the journal keeps it: its status, its headers in order (a value that is not
-/// UTF-8 read lossily, as the codec gets it) and its body.
-fn response_rec(response: &Response<Bytes>) -> HttpResponseRec {
-    HttpResponseRec {
-        status: response.status().as_u16(),
-        headers: response
-            .headers()
-            .iter()
-            .map(|(name, value)| HeaderRec {
-                name: name.as_str().to_owned(),
-                value: String::from_utf8_lossy(value.as_bytes()).into_owned(),
-                redact: false,
-            })
-            .collect(),
-        body: Opaque(response.body().to_vec()),
-    }
-}
-
-/// The bytes `subs` encode to in the journal: each its 4-byte instrument id and its feed's tag,
-/// with a touch source's or book's id after it (Codex r4178860511).
-fn subscriptions_bytes(subs: &[Subscription]) -> usize {
-    subs.iter()
-        .map(|s| match s.feed {
-            fbc_core::Feed::Touch(_) | fbc_core::Feed::Book(_) => 6,
-            _ => 5,
-        })
-        .sum()
-}
-
-/// The record of a subscribe call made on `conn`.
-fn subscribe_rec(at: MonoNs, conn: ConnKey, call: &SubscribeCall) -> Record {
-    Record::Control {
-        at,
-        ev: ControlEvent::Subscribe {
-            conn,
-            add: call.add().to_vec(),
-            remove: call.remove().to_vec(),
-        },
-    }
-}
-
-/// The bytes a request is journaled in, at least: its URL and body outside their redacted
-/// spans, its header names and the values of headers that are not secret, and the digest each
-/// secret value and each span (with its 8-byte range) is journaled as (Codex r4178860509).
-/// `usize::MAX` when it redacts more than the format takes, which refuses it whatever the room
-/// (Codex r4178802722).
-fn request_bytes(req: &HttpRequest) -> usize {
-    use fbc_journal::redact::DIGEST_LEN;
-    let secret = |h: &fbc_core::Header| h.redact || is_secret_header(h.name);
-    let (mut kept, mut hidden) = (0, 0);
-    for h in &req.headers {
-        kept += h.name.len();
-        if secret(h) {
-            kept += DIGEST_LEN;
-            hidden += h.value.len();
-        } else {
-            kept += h.value.len();
+/// Calls `f` with `result` as a codec is handed it: the response's status, its headers in
+/// order (a value that is not UTF-8 read lossily, as the journal reads it) and its body, or why
+/// none came.
+fn with_response<R>(
+    result: &Result<Response<Bytes>, HttpFailure>,
+    f: impl FnOnce(Result<HttpResponse<'_>, HttpFailure>) -> R,
+) -> R {
+    match result {
+        Ok(response) => {
+            let values: Vec<_> = response
+                .headers()
+                .iter()
+                .map(|(name, value)| (name.as_str(), String::from_utf8_lossy(value.as_bytes())))
+                .collect();
+            let headers: Vec<(&str, &str)> = values.iter().map(|(n, v)| (*n, v.as_ref())).collect();
+            f(Ok(HttpResponse {
+                status: response.status().as_u16(),
+                headers: &headers,
+                body: response.body(),
+            }))
         }
+        Err(failure) => f(Err(*failure)),
     }
-    for (len, spans) in [
-        (req.url.as_str().len(), req.url.redactions()),
-        (req.body.bytes().len(), req.body.redactions()),
-    ] {
-        let spanned = redacted(spans);
-        kept += len - spanned + spans.len() * (8 + DIGEST_LEN);
-        hidden += spanned;
-    }
-    if hidden as u64 > fbc_journal::format::MAX_REDACTED {
-        usize::MAX
-    } else {
-        kept
-    }
-}
-
-/// The bytes of a response the journal keeps: its body, its header names, the values of
-/// headers that are not secret, each at the length it is kept read lossily, and the digest
-/// each secret value is journaled as (Codex r4178988952).
-fn response_bytes(r: &Response<Bytes>) -> usize {
-    let headers: usize = r
-        .headers()
-        .iter()
-        .map(|(n, v)| {
-            n.as_str().len()
-                + if is_secret_header(n.as_str()) {
-                    fbc_journal::redact::DIGEST_LEN
-                } else {
-                    lossy_len(v.as_bytes())
-                }
-        })
-        .sum();
-    r.body().len() + headers
-}
-
-/// The length of `bytes` read lossily as UTF-8, without building it: each invalid sequence
-/// becomes one U+FFFD, 3 bytes (Codex r4178725031).
-fn lossy_len(bytes: &[u8]) -> usize {
-    bytes
-        .utf8_chunks()
-        .map(|c| c.valid().len() + if c.invalid().is_empty() { 0 } else { 3 })
-        .sum()
-}
-
-/// The bytes `spans` redact, each of which the journal writes as a fixed-size digest.
-fn redacted(spans: &[std::ops::Range<u32>]) -> usize {
-    spans.iter().map(|s| (s.end - s.start) as usize).sum()
 }
 
 /// Whether `effect` asks a socket endpoint of stream `own` to reconnect, which ends its epoch.
@@ -1146,110 +1053,43 @@ mod tests {
         assert!(seqs[0].recv_mono <= seqs[2].recv_mono);
     }
 
-    /// Codex r4178567377: a redacted span is journaled as a fixed-size digest, so a long
-    /// credential does not count towards the bytes a request is offered to the journal with.
+    /// Codex r4178725031, r4178988952: a response is offered to the journal as the codec is
+    /// handed it, each header value that is not UTF-8 read lossily and a secret one as it came
+    /// (the journal writes its digest), so what is journaled is what the codec saw and its size
+    /// is the journal's own encoding of it.
     #[test]
-    fn only_bytes_outside_redacted_spans_count_as_kept_verbatim() {
-        assert_eq!(redacted(&[]), 0);
-        assert_eq!(4096 - redacted(&[4..4000, 4010..4090]), 4 + 10 + 6);
-    }
-
-    /// Codex r4178725031: a header value that is not UTF-8 is kept lossily, each bad sequence
-    /// as a 3-byte U+FFFD, so it counts at the length the journal keeps.
-    #[test]
-    fn a_response_counts_at_the_size_its_record_keeps() {
+    fn a_response_is_offered_as_the_codec_is_handed_it() {
         let response = Response::builder()
+            .status(201)
             .header(
                 "x-raw",
                 hyper::header::HeaderValue::from_bytes(&[b'a', 0xFF, 0xFE, b'b']).unwrap(),
             )
-            .header("x-ok", "fine")
             .header("set-cookie", "sid=a-long-session-credential")
             .body(Bytes::from_static(b"body"))
             .unwrap();
-        let rec = response_rec(&response);
-        let kept: usize = rec
-            .headers
-            .iter()
-            .filter(|h| !h.secret())
-            .map(|h| h.name.len() + h.value.len())
-            .sum();
-        assert_eq!(kept, "x-raw".len() + 8 + "x-ok".len() + "fine".len());
-        // Codex r4178988952: a secret header's value is journaled as its digest.
-        let secret = "set-cookie".len() + fbc_journal::redact::DIGEST_LEN;
-        assert_eq!(response_bytes(&response), kept + secret + rec.body.0.len());
-    }
-
-    /// Codex r4178802722: a request redacting more than the journal format takes is refused by
-    /// the format whatever the room, so it is offered as one no sink can fit and is never
-    /// cloned.
-    #[test]
-    fn a_request_redacting_more_than_the_format_takes_is_offered_as_unfittable() {
-        let request = |redacted: usize| {
-            let span = 1..redacted as u32 + 1;
-            HttpRequest {
-                method: fbc_core::HttpMethod::Post,
-                url: fbc_core::WireUrl::redacted("https://toy/x".into(), Vec::new()).unwrap(),
-                headers: vec![fbc_core::Header {
-                    name: "x-sig",
-                    value: "abcd".into(),
-                    redact: true,
-                }],
-                body: fbc_core::WireSlice::redacted(vec![b'k'; redacted + 2], vec![span]).unwrap(),
-            }
-        };
-        let limit = fbc_journal::format::MAX_REDACTED as usize;
-        let at_limit = request(limit - 4);
+        let handed = with_response(&Ok(response), |r| {
+            let r = r.unwrap();
+            let headers: Vec<(String, String)> = r
+                .headers
+                .iter()
+                .map(|(n, v)| ((*n).to_owned(), (*v).to_owned()))
+                .collect();
+            (r.status, headers, r.body.to_vec())
+        });
         assert_eq!(
-            request_bytes(&at_limit),
-            // The header's and the span's digests, the span's range, and the 2 kept bytes.
-            "https://toy/x".len() + "x-sig".len() + 2 * fbc_journal::redact::DIGEST_LEN + 8 + 2
+            handed,
+            (
+                201,
+                vec![
+                    ("x-raw".into(), "a\u{FFFD}\u{FFFD}b".into()),
+                    ("set-cookie".into(), "sid=a-long-session-credential".into()),
+                ],
+                b"body".to_vec()
+            )
         );
-        assert_eq!(request_bytes(&request(limit - 3)), usize::MAX);
-    }
-
-    /// Codex r4178860509: each redacted span is journaled as an 8-byte range and a digest, and
-    /// a secret header's value as a digest, so a request of many small spans counts them.
-    #[test]
-    fn a_request_counts_the_digest_each_redaction_is_journaled_as() {
-        let digest = fbc_journal::redact::DIGEST_LEN;
-        let request = HttpRequest {
-            method: fbc_core::HttpMethod::Post,
-            url: fbc_core::WireUrl::redacted("https://toy/x".into(), Vec::new()).unwrap(),
-            headers: vec![
-                fbc_core::Header {
-                    name: "x-sig",
-                    value: "abcd".into(),
-                    redact: true,
-                },
-                fbc_core::Header {
-                    name: "accept",
-                    value: "json".into(),
-                    redact: false,
-                },
-            ],
-            body: fbc_core::WireSlice::redacted(vec![b'k'; 10], vec![0..1, 4..5, 8..9]).unwrap(),
-        };
-        let header = "x-sig".len() + digest + "accept".len() + "json".len();
-        let body = (10 - 3) + 3 * (8 + digest);
-        assert_eq!(
-            request_bytes(&request),
-            "https://toy/x".len() + header + body
-        );
-    }
-
-    /// Codex r4178860511: a touch or book subscription encodes its feed in two bytes, the other
-    /// feeds in one, each after a 4-byte instrument id.
-    #[test]
-    fn a_subscription_counts_the_bytes_its_feed_encodes_to() {
-        let inst = fbc_core::InstrumentId::new(1);
-        let sub = |feed| Subscription { inst, feed };
-        let subs = [
-            sub(fbc_core::Feed::Touch(fbc_core::TouchSourceId(0))),
-            sub(fbc_core::Feed::Book(fbc_core::BookId(0))),
-            sub(fbc_core::Feed::Trades),
-        ];
-        assert_eq!(subscriptions_bytes(&subs), 6 + 6 + 5);
+        let failed = with_response(&Err(HttpFailure::TimedOut), |r| r.map(|_| ()));
+        assert_eq!(failed, Err(HttpFailure::TimedOut));
     }
 
     #[test]

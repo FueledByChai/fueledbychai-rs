@@ -22,7 +22,7 @@ use fbc_core::{
 };
 use fbc_journal::{
     BLANK, ControlEvent, HeaderRec, JournalReader, JournalSink, JournalWriter, Marker, QueueSink,
-    Record, Recorded, RedactionKey, SinkConfig, journal_queue,
+    Record, RecordRef, Recorded, RedactionKey, SinkConfig, journal_queue,
 };
 use fbc_runtime::{
     Connector, IngestClock, Input, Journal, MdSession, MdSessionConfig, MdVenue, MdVenueConfig,
@@ -271,6 +271,7 @@ async fn a_journaled_session_reads_back_every_input_output_and_connection_change
         name: "x-toy".into(),
         value: "yes".into(),
         redact: false,
+        redact_name: false,
     };
     assert_eq!(header("x-toy"), Some(toy));
     let cookie = header("set-cookie").unwrap();
@@ -656,16 +657,14 @@ async fn an_interrupted_write_is_journaled_without_a_write_result() {
     );
 }
 
-/// What a subscribe call for the toy's one trades subscription encodes to: its instrument id
-/// and feed tag.
-const SUB_ONE: usize = 5;
-
-/// A sink that refuses every record offered lazily without building it, keeping the payload
-/// size it was told, and keeps the kind of every record offered built.
+/// A sink that refuses every record offered borrowed, keeping what it stands for, and keeps the
+/// kind of every record offered built.
 #[derive(Default)]
 struct Unbuilt {
-    lazy: Vec<usize>,
+    borrowed: Vec<String>,
     built: Vec<String>,
+    /// Each response's headers as offered: name and raw value.
+    raw: Vec<(String, Vec<u8>)>,
 }
 
 impl JournalSink for Unbuilt {
@@ -674,25 +673,29 @@ impl JournalSink for Unbuilt {
         Recorded::Ok
     }
 
-    fn record_with(
-        &mut self,
-        _: TrafficClass,
-        _: WallNs,
-        payload: usize,
-        _: &mut dyn FnMut() -> Record,
-    ) -> Recorded {
-        self.lazy.push(payload);
+    fn record_ref(&mut self, _: TrafficClass, _: WallNs, record: RecordRef<'_>) -> Recorded {
+        if let RecordRef::HttpResult { result: Ok(r), .. } = record {
+            let raw = r.headers.iter().map(|(n, v)| ((*n).to_owned(), v.to_vec()));
+            self.raw.extend(raw);
+        }
+        match record {
+            RecordRef::Owned(record) => self.built.push(line(record)),
+            borrowed => self.borrowed.push(line(&borrowed.to_record())),
+        }
         Recorded::DroppedCounted
     }
+
     fn omit(&mut self, _: TrafficClass, _: WallNs) -> Recorded {
         Recorded::DroppedCounted
     }
 }
 
-/// Codex r4178252055: inbound frames and response bodies are offered lazily, with their size,
-/// so a sink with no room refuses them before they are copied.
+/// Codex r4178252055, r4178287660, r4178567381: subscribe calls, inbound frames, HTTP requests
+/// and their results are offered borrowed, so a sink with no room refuses them before they are
+/// copied, at the length the journal's own encoding of them takes (FBC-f3w: no size is worked
+/// out apart from the encoding).
 #[tokio::test]
-async fn inbound_frames_and_responses_are_offered_lazily_with_their_size() {
+async fn subscribes_frames_requests_and_results_are_offered_borrowed() {
     let (mut ws, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
     let venue = ToyVenue::leak();
     let (mut session, control) = MdSession::new(session(venue, ws.url()), |_| {}).unwrap();
@@ -713,15 +716,25 @@ async fn inbound_frames_and_responses_are_offered_lazily_with_their_size() {
     let (run, ()) = tokio::join!(session.run(), script);
     run.unwrap();
     let sink = sink.borrow();
-    // The frame, the request it asked for (its URL; the toy's body and headers are empty) and
-    // the response: its body and every header name and value (Codex r4178427394).
-    // The subscribe call comes first, offered with the bytes its one subscription encodes to
-    // (Codex r4178567381).
-    let headers = "content-length".len() + "3".len() + "connection".len() + "close".len();
-    let lazy = [SUB_ONE, get.len(), snap.len(), "say".len() + headers];
-    assert_eq!(sink.lazy, lazy);
+    let borrowed = [
+        r#"subscribe 0 +["1"] -[]"#.to_owned(),
+        format!("in 0 {get}"),
+        "request 0 1 Get /snap".into(),
+        "result 0 1 200".into(),
+    ];
+    assert_eq!(sink.borrowed, borrowed);
+    // The response's header values are offered raw, read only once admitted (Codex
+    // r4179379938).
+    let raw = [
+        ("content-length".to_owned(), b"3".to_vec()),
+        ("connection".to_owned(), b"close".to_vec()),
+    ];
+    assert_eq!(sink.raw, raw);
     assert!(!sink.built.iter().any(|l| {
-        l.starts_with("in ") || l.starts_with("result ") || l.starts_with("subscribe ")
+        l.starts_with("in ")
+            || l.starts_with("request ")
+            || l.starts_with("result ")
+            || l.starts_with("subscribe ")
     }));
 }
 
@@ -787,61 +800,37 @@ async fn withheld_inputs_leave_a_gap_the_journal_marks() {
     fs::remove_dir_all(&root).unwrap();
 }
 
-/// A sink that keeps the size each request was offered with, refusing it unbuilt.
-#[derive(Default)]
-struct RequestSizes(Vec<usize>);
-
-impl JournalSink for RequestSizes {
-    fn record(&mut self, _: TrafficClass, _: WallNs, _: &Record) -> Recorded {
-        Recorded::Ok
-    }
-
-    fn record_with(
-        &mut self,
-        _: TrafficClass,
-        _: WallNs,
-        payload: usize,
-        _: &mut dyn FnMut() -> Record,
-    ) -> Recorded {
-        self.0.push(payload);
-        Recorded::DroppedCounted
-    }
-
-    fn omit(&mut self, _: TrafficClass, _: WallNs) -> Recorded {
-        Recorded::DroppedCounted
-    }
-}
-
-/// Codex r4178287660: an HTTP request is offered lazily too, with its URL and body size, so a
-/// full journal refuses it before it is cloned; its header names and values count too (Codex
-/// r4178427394).
+/// Codex r4178287660: a credentialed HTTP request is offered borrowed too, so a full journal
+/// refuses it before it is cloned; the journal hashes its Authorization value as it encodes it
+/// (Codex r4178567377, r4178860509). Its result is withheld unoffered.
 #[tokio::test]
-async fn http_requests_are_offered_lazily_with_their_size() {
+async fn a_credentialed_request_is_offered_borrowed_and_its_result_withheld() {
     let (mut ws, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
     let venue = ToyVenue::leak();
     let (mut session, control) = MdSession::new(session(venue, ws.url()), |_| {}).unwrap();
-    let sizes = Rc::new(RefCell::new(RequestSizes::default()));
-    session.set_journal(Journal::new(sizes.clone()));
+    let sink = Rc::new(RefCell::new(Unbuilt::default()));
+    session.set_journal(Journal::new(sink.clone()));
     let url = http.url("/snap");
     let get = format!("get|tag=1|ms=5000|auth=1|url={url}");
-    let get_len = get.len();
+    let frame = get.clone();
     let script = async move {
         let mut peer = ws.accept().await;
         assert_eq!(peer.recv().await, "hello|codec=0|plan=1");
         assert_eq!(peer.recv().await, "sub|add=A");
-        peer.send(&get);
+        peer.send(&frame);
         http.request().await.answer("HTTP/1.1 200 OK", "").await;
         until(|| venue.http_log().len() == 1).await;
         drop(control);
     };
     let (run, ()) = tokio::join!(session.run(), script);
     run.unwrap();
-    // The subscribe call, the inbound frame and the request: its URL and its one header's name
-    // (the toy's body is empty). The Authorization value is journaled as a fixed-size digest,
-    // so it counts as that digest, whatever its length (Codex r4178567377, r4178860509). The
-    // result is withheld unoffered, as the request carried a credential.
-    let header = "Authorization".len() + fbc_journal::redact::DIGEST_LEN;
-    assert_eq!(sizes.borrow().0, [SUB_ONE, get_len, url.len() + header]);
+    let borrowed = [
+        r#"subscribe 0 +["1"] -[]"#.to_owned(),
+        format!("in 0 {get}"),
+        "request 0 1 Get /snap".into(),
+    ];
+    assert_eq!(sink.borrow().borrowed, borrowed);
+    assert_eq!(session.counters().journal_withheld, 1);
 }
 
 /// Codex r4178646794: a data frame read in the same poll as the control's drop reaches no codec,
@@ -893,4 +882,139 @@ async fn a_frame_read_as_the_control_drops_is_journaled_but_reaches_no_codec() {
     done.send(()).unwrap();
     server.join().unwrap();
     assert!(journaled > 0, "no run journaled the frame it read");
+}
+
+/// Codex r4179310275: a credentialed request's failure holds no byte of the response, so it is
+/// journaled like any other, and replay can make the `on_http` call the live codec got; only a
+/// response is withheld.
+#[tokio::test]
+async fn a_credentialed_requests_failure_is_journaled() {
+    let mut ws = ScriptedWs::start().await;
+    let venue = ToyVenue::leak();
+    let (mut session, control) = MdSession::new(session(venue, ws.url()), |_| {}).unwrap();
+    let sink = Rc::new(RefCell::new(Unbuilt::default()));
+    session.set_journal(Journal::new(sink.clone()));
+    let url = format!("http://127.0.0.1:{}/snap", common::closed_port().await);
+    let get = format!("get|tag=1|ms=5000|auth=1|url={url}");
+    let frame = get.clone();
+    let script = async move {
+        let mut peer = ws.accept().await;
+        assert_eq!(peer.recv().await, "hello|codec=0|plan=1");
+        assert_eq!(peer.recv().await, "sub|add=A");
+        peer.send(&frame);
+        until(|| venue.http_log().len() == 1).await;
+        drop(control);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    let borrowed = sink.borrow().borrowed.clone();
+    assert_eq!(borrowed.len(), 4, "{borrowed:?}");
+    assert_eq!(borrowed[2], "request 0 1 Get /snap");
+    assert!(
+        borrowed[3].starts_with("result 0 1 ") && !borrowed[3].ends_with(" 200"),
+        "{borrowed:?}"
+    );
+    assert_eq!(session.counters().journal_withheld, 0);
+}
+
+/// A sink that keeps each record's line and drops the session's control as the first
+/// connection's opening is journaled.
+struct DropsOnOpen {
+    control: Option<fbc_runtime::MdControl>,
+    lines: Vec<String>,
+}
+
+impl JournalSink for DropsOnOpen {
+    fn record(&mut self, _: TrafficClass, _: WallNs, record: &Record) -> Recorded {
+        if let Record::Control {
+            ev: ControlEvent::Opened(_),
+            ..
+        } = record
+        {
+            self.control = None;
+        }
+        self.lines.push(line(record));
+        Recorded::Ok
+    }
+
+    fn omit(&mut self, _: TrafficClass, _: WallNs) -> Recorded {
+        Recorded::DroppedCounted
+    }
+}
+
+/// Codex r4179310270: a socket the session holds is journaled opened and closed even when the
+/// control drops as it opens; the session then builds no codec and sends nothing on it. (The
+/// control can be dropped from another thread at any instant; dropping it from inside the
+/// journal, as the opening is recorded, puts that instant exactly here.)
+#[tokio::test]
+async fn a_socket_opened_as_the_control_drops_is_journaled_opened_and_closed() {
+    let mut ws = ScriptedWs::start().await;
+    let venue = ToyVenue::leak();
+    let (mut session, control) = MdSession::new(session(venue, ws.url()), |_| {}).unwrap();
+    let sink = Rc::new(RefCell::new(DropsOnOpen {
+        control: Some(control),
+        lines: Vec::new(),
+    }));
+    session.set_journal(Journal::new(sink.clone()));
+    let script = async move {
+        let mut peer = ws.accept().await;
+        assert_eq!(peer.next().await, None);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    assert_eq!(sink.borrow().lines, ["open 0", "close 0"]);
+    assert_eq!(venue.codecs(), 0);
+}
+
+/// Codex r4179379935: a timer that wins the session's select as the control drops reaches no
+/// codec, but the journal still records it, so a recording never silently misses an input the
+/// session took. The select takes either ready branch at random, so the race is run many
+/// times: some runs take the timer, and each of those must journal it.
+#[tokio::test]
+async fn a_timer_that_fires_as_the_control_drops_is_journaled_but_reaches_no_codec() {
+    const RUNS: usize = 64;
+    let mut raced = 0;
+    for _ in 0..RUNS {
+        let mut ws = ScriptedWs::start().await;
+        let seen = Seen::default();
+        let (mut session, control) =
+            MdSession::new(session(ToyVenue::leak(), ws.url()), keep(&seen)).unwrap();
+        let kept = Rc::new(RefCell::new(Kept::default()));
+        session.set_journal(Journal::new(kept.clone()));
+        let watch = kept.clone();
+        let script = async move {
+            let mut peer = ws.accept().await;
+            assert_eq!(peer.recv().await, "hello|codec=0|plan=1");
+            assert_eq!(peer.recv().await, "sub|add=A");
+            peer.send("arm|sym=A|ms=20");
+            // Journaled before it is decoded; decoding arms the timer in the same turn.
+            while !watch.borrow().0.iter().any(|r| line(r).starts_with("in ")) {
+                tokio::task::yield_now().await;
+            }
+            // Blocks the session's thread past the timer's due time, so the timer and the
+            // drop are both ready when the session next runs.
+            std::thread::sleep(ms(60));
+            drop(control);
+        };
+        let (run, ()) = tokio::join!(session.run(), script);
+        run.unwrap();
+        let kept = kept.borrow();
+        let timers = kept
+            .0
+            .iter()
+            .filter(|r| line(r).starts_with("timer "))
+            .count();
+        let delivered = !seen.borrow().is_empty();
+        assert!(
+            timers == 1 || !delivered,
+            "a timer reached the codec unjournaled"
+        );
+        if timers == 1 && !delivered {
+            raced += 1;
+        }
+    }
+    assert!(
+        raced > 0,
+        "no run journaled a timer that fired as the control dropped"
+    );
 }
