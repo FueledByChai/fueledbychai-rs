@@ -115,7 +115,8 @@ rather than guess.
   the market-data and execution events, venue commands, and the codec, signer, nonce and
   factory traits with `Effects` and `EncodeCtx`, `crates/fbc-book` with its L2 book, `crates/fbc-journal` with its record
   format, day-grouped segment writer and in-order reader, `crates/fbc-runtime` with its first
-  slice (the connector, SOCKS5 CONNECT, WebSocket and HTTP/1.1, plain or TLS; 0019, 0020), and
+  slices (the connector, SOCKS5 CONNECT, WebSocket and HTTP/1.1, plain or TLS, 0019 and 0020;
+  connection epochs and the subscription reconciler), and
   `crates/venues/fbc-venue-paradex` with its signer (`src/sign`), SBE market data (`src/md`: bbo,
   trades and the order book) and its factory (`src/factory.rs`, market data only); the rest are planned. Members are the `crates/fbc-*` and
   `crates/venues/fbc-*` globs, and `fixtures/` is excluded from the workspace:
@@ -139,7 +140,10 @@ rather than guess.
     dependencies are pinned exactly (0019, 0020). `tests/common/` holds the SOCKS5 stub,
     WebSocket server and HTTP server on 127.0.0.1 ephemeral ports, each server plain or behind
     TLS with a certificate from a CA the test generates in memory, that later runtime tests
-    reuse.
+    reuse. `Epochs` numbers a stream's connection lives and drops, counting per kind, a frame,
+    timer, HTTP result or event of an older epoch; `Reconciler` yields a stream's subscribe
+    calls as the difference between the desired and the active set, once per new epoch,
+    keeping a refused or waiting subscription pending. Both are logic only, with no socket.
   - `crates/fbc-book` (it depends on `fbc-core` only: one tick-indexed L2 book per
     instrument and `BookId`, built from book events the same live and in replay, with
     snapshots, deltas, windows and gap invalidation, touch, top-n, an exact top-n comparison
