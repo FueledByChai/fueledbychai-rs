@@ -16,6 +16,10 @@ pub enum Step {
     ProxyGreeting,
     /// The SOCKS5 CONNECT request and its reply (RFC 1928 §4, §6).
     ProxyConnect,
+    /// Adding a consumer's TLS trust anchor: the bytes are not a usable certificate.
+    TlsTrust,
+    /// The TLS handshake with the target: its certificate, its name, or the TLS exchange.
+    TlsHandshake,
     /// The WebSocket opening handshake.
     WebSocketUpgrade,
     /// The HTTP/1.1 exchange: sending the request or reading the response.
@@ -30,6 +34,8 @@ impl fmt::Display for Step {
             Step::TargetTcp => "TCP connection to the target",
             Step::ProxyGreeting => "SOCKS5 greeting",
             Step::ProxyConnect => "SOCKS5 CONNECT",
+            Step::TlsTrust => "TLS trust anchor",
+            Step::TlsHandshake => "TLS handshake",
             Step::WebSocketUpgrade => "WebSocket upgrade",
             Step::Http => "HTTP/1.1 request",
         })
@@ -138,6 +144,14 @@ mod tests {
         assert_eq!(
             shown(Step::TargetTcp, Cause::Io(io::ErrorKind::TimedOut)),
             "TCP connection to the target failed: timed out"
+        );
+        assert_eq!(
+            shown(Step::TlsTrust, Cause::Detail("bad DER".into())),
+            "TLS trust anchor failed: bad DER"
+        );
+        assert_eq!(
+            shown(Step::TlsHandshake, Cause::Io(io::ErrorKind::UnexpectedEof)),
+            "TLS handshake failed: unexpected end of file"
         );
         assert_eq!(
             shown(Step::WebSocketUpgrade, Cause::Status(404)),

@@ -1,6 +1,6 @@
 [package]
 name = "fbc-runtime"
-description = "The one generic runtime: so far a connector that opens TCP directly or through a SOCKS5 proxy, with ws:// and HTTP/1.1 over it."
+description = "The one generic runtime: so far a connector that opens TCP directly or through a SOCKS5 proxy, with WebSocket and HTTP/1.1 over it, plain or TLS."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,8 +14,12 @@ tokio-tungstenite.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+webpki-roots.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "net", "io-util", "macros"] }
 tokio-tungstenite.workspace = true
 futures-util = { workspace = true, features = ["sink", "std"] }
+rcgen.workspace = true

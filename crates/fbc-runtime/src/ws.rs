@@ -1,6 +1,5 @@
-//! The WebSocket client (`ws://`), on the one connector.
+//! The WebSocket client (`ws://`, and `wss://` over TLS), on the one connector.
 
-use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite;
 
 pub use tungstenite::Message;
@@ -8,16 +7,18 @@ pub use tungstenite::Message;
 use crate::connector::Connector;
 use crate::error::{Cause, NetError, Step};
 use crate::target;
+use crate::transport::Transport;
 
 /// An open WebSocket: a `Stream` of incoming [`Message`]s and a `Sink` for outgoing ones.
-pub type WebSocket = tokio_tungstenite::WebSocketStream<TcpStream>;
+pub type WebSocket = tokio_tungstenite::WebSocketStream<Transport>;
 
 impl Connector {
-    /// Opens `url` (`ws://` only) through this connector and completes the WebSocket upgrade.
+    /// Opens `url` (`ws://`, or `wss://` with TLS) through this connector and completes the
+    /// WebSocket upgrade.
     pub async fn websocket(&self, url: &str) -> Result<WebSocket, NetError> {
         let uri = target::parse(url)?;
-        let to = target::target(&uri, "ws")?;
-        let stream = self.connect(&to.host, to.port).await?;
+        let to = target::target(&uri, "ws", "wss")?;
+        let stream = self.open(&to).await?;
         let (socket, _response) = tokio_tungstenite::client_async(uri, stream)
             .await
             .map_err(upgrade_error)?;

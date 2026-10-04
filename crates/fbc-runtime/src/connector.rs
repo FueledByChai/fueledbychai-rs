@@ -1,10 +1,15 @@
-//! The one connector: every connection the runtime opens, WebSocket or HTTP, goes through
-//! [`Connector::connect`], so the proxy applies to all of them (0002).
+//! The one connector: every connection the runtime opens, WebSocket or HTTP, plain or TLS,
+//! goes through [`Connector::connect`], so the proxy applies to all of them (0002).
+
+use std::fmt;
 
 use tokio::net::TcpStream;
 
 use crate::error::{NetError, Step, io};
 use crate::socks5;
+use crate::target::Target;
+use crate::tls::{self, Trust};
+use crate::transport::Transport;
 
 /// How the runtime reaches the network, chosen by the consumer per process. There is no
 /// default: the deployment box connects directly and the owner's laptop through a SOCKS5 host
@@ -18,20 +23,45 @@ pub enum ProxyConfig {
     Socks5 { host: String, port: u16 },
 }
 
-/// Opens TCP connections under one [`ProxyConfig`], and the WebSocket and HTTP/1.1 exchanges
-/// on them ([`Connector::websocket`], [`Connector::http`]).
-#[derive(Debug, Clone)]
+/// Opens TCP connections under one [`ProxyConfig`], TLS over them for `wss://` and
+/// `https://`, and the WebSocket and HTTP/1.1 exchanges on them ([`Connector::websocket`],
+/// [`Connector::http`]).
+#[derive(Clone)]
 pub struct Connector {
     proxy: ProxyConfig,
+    trust: Trust,
 }
 
 impl Connector {
+    /// A connector under `proxy` that trusts the webpki-roots anchors (Mozilla's roots) for TLS.
     pub fn new(proxy: ProxyConfig) -> Self {
-        Connector { proxy }
+        Connector {
+            proxy,
+            trust: Trust::webpki(),
+        }
     }
 
     pub fn proxy(&self) -> &ProxyConfig {
         &self.proxy
+    }
+
+    /// Adds a DER-encoded certificate as a TLS trust anchor, beside webpki-roots, for every
+    /// later `wss://` and `https://` connection; a certificate that cannot be one fails at
+    /// [`Step::TlsTrust`]. Hostname verification stays on whatever the anchors are.
+    pub fn add_trust_anchor(&mut self, der: &[u8]) -> Result<(), NetError> {
+        self.trust.add(der)
+    }
+
+    /// Opens `to` through [`Connector::connect`], with the TLS handshake on top when `to` asks
+    /// for TLS. The server name is checked before any connection opens.
+    pub(crate) async fn open(&self, to: &Target) -> Result<Transport, NetError> {
+        if !to.tls {
+            return Ok(Transport::Plain(self.connect(&to.host, to.port).await?));
+        }
+        let name = tls::server_name(&to.host)?;
+        let stream = self.connect(&to.host, to.port).await?;
+        let stream = self.trust.handshake(name, stream).await?;
+        Ok(Transport::Tls(Box::new(stream)))
     }
 
     /// A TCP stream to `host:port`, directly or through the proxy, with Nagle's algorithm off.
@@ -49,6 +79,16 @@ impl Connector {
                 Ok(stream)
             }
         }
+    }
+}
+
+/// The proxy and how many trust anchors the consumer added; never the anchors themselves.
+impl fmt::Debug for Connector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Connector")
+            .field("proxy", &self.proxy)
+            .field("added_trust_anchors", &self.trust.added())
+            .finish()
     }
 }
 
@@ -73,6 +113,14 @@ mod tests {
         assert_eq!(
             Connector::new(ProxyConfig::Direct).proxy(),
             &ProxyConfig::Direct
+        );
+    }
+
+    #[test]
+    fn debug_shows_the_proxy_and_the_count_of_added_anchors() {
+        assert_eq!(
+            format!("{:?}", Connector::new(ProxyConfig::Direct)),
+            "Connector { proxy: Direct, added_trust_anchors: 0 }"
         );
     }
 }

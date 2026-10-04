@@ -216,23 +216,19 @@ async fn a_closed_target_fails_at_the_target_tcp_step_without_quoting_the_url() 
 }
 
 #[tokio::test]
-async fn tls_and_foreign_schemes_fail_at_the_url_step_before_any_connection() {
+async fn foreign_schemes_fail_at_the_url_step_before_any_connection() {
     let stub = venue_stub(Answer::Relay).await;
     let connector = through(&stub);
 
     let cases = [
-        connector.websocket("wss://ws.venue.test/").await,
+        connector.websocket("https://ws.venue.test/").await,
         connector.websocket("http://ws.venue.test/").await,
         connector.websocket("not a url").await,
     ];
     for result in cases {
         assert_eq!(result.unwrap_err().step(), Step::Url);
     }
-    for url in [
-        "https://api.venue.test/",
-        "ws://api.venue.test/",
-        "/relative",
-    ] {
+    for url in ["wss://api.venue.test/", "ws://api.venue.test/", "/relative"] {
         let err = connector.http(get(url), LIMIT).await.unwrap_err();
         assert_eq!(err.step(), Step::Url);
     }
