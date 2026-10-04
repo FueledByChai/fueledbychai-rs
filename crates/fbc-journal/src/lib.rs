@@ -1,0 +1,42 @@
+//! The journal: everything that crosses the shard boundary, recorded so a recorded day
+//! replays through the same code that ran live (decision 0006, design §4.8 as 0014 refines it).
+//!
+//! The library writes and reads the journal; where its files live and how long they are kept
+//! is the consumer's choice. It has:
+//!
+//! - [`Record`], the records the runtime writes: inbound frames with their stamps, outbound
+//!   frames with their redaction spans and write results, HTTP requests and results with
+//!   headers, timer firings, control records (connections opened and closed, subscription
+//!   calls) and markers (a session's start with the consumer's header, `Degraded`,
+//!   `Recovered`).
+//! - [`JournalWriter`], which writes one shard's records into a directory the consumer
+//!   supplies, one subdirectory per UTC day (`YYYYMMDD`), segments named
+//!   `<shard>-<seq>.fbcj`. Time comes from the caller.
+//! - [`JournalReader`], which returns one shard's records in write order across segments
+//!   and days.
+//!
+//! **Format.** Length-prefixed records after a header holding the format version, in a
+//! hand-written little-endian encoding ([`format`]). There is no serialization dependency:
+//! adding one would need a decision record and the licence gate (FBC-cu0).
+//!
+//! **Redaction (0006, 0009).** No byte of a redaction span is written: the spans of a
+//! [`WireSlice`](fbc_core::WireSlice) or [`WireUrl`](fbc_core::WireUrl), header values a codec
+//! marked redacted, and the values of the [`SECRET_HEADERS`] by name, in requests and results
+//! alike. The record keeps each span's place and length, and the reader returns [`BLANK`]
+//! bytes there ([`Record::blanked`] gives what the reader will return). Keyed hashes in their
+//! place are FBC-apz's, under `src/redact*`; spans a codec marks in inbound frames and
+//! response bodies are FBC-7lm's. Order signatures are not redacted.
+
+mod error;
+pub mod format;
+mod reader;
+mod record;
+mod writer;
+
+pub use error::JournalError;
+pub use reader::JournalReader;
+pub use record::{
+    BLANK, ControlEvent, HeaderRec, HttpRequestRec, HttpResponseRec, Marker, Opaque, Opcode,
+    Record, SECRET_HEADERS, WriteRes, is_secret_header,
+};
+pub use writer::{JournalWriter, SEGMENT_EXT};

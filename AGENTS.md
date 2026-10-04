@@ -113,8 +113,9 @@ rather than guess.
   price grids, exact prices, sealed ids, the client-id codec, `NamespaceLease`, `CidMint`,
   `Fee`/`FeeBook`, `DecodeScope`, `InstrumentSpec` (maker-safe `quantize`), `VenueCaps`,
   the market-data and execution events, venue commands, and the codec, signer, nonce and
-  factory traits with `Effects` and `EncodeCtx`, and `crates/venues/fbc-venue-paradex` with
-  only its signer (`src/sign`); the rest are planned. Members are the `crates/fbc-*` and
+  factory traits with `Effects` and `EncodeCtx`, `crates/fbc-journal` with its record
+  format, day-grouped segment writer and in-order reader, and
+  `crates/venues/fbc-venue-paradex` with only its signer (`src/sign`); the rest are planned. Members are the `crates/fbc-*` and
   `crates/venues/fbc-*` globs, and `fixtures/` is excluded from the workspace:
   - `crates/fbc-core`: the contract. Time, units, price grids and exact prices, sealed ids and
     the canonical client-id codec, `Fee`/`FeeBook`, `InstrumentSpec`, `VenueCaps`, events,
@@ -129,8 +130,13 @@ rather than guess.
     reconnects and connection epochs, subscription reconciliation, rate limits with a safety
     floor, kernel receive timestamps, the shard host (0002).
   - `crates/fbc-book` (tick-indexed order book), `crates/fbc-oms` (order lattice, permits,
-    pre-trade caps, `ExecutionPlanner`; 0005, 0013), `crates/fbc-journal` (format, writer with
-    safety reserve, reader; 0006), `crates/fbc-sim` (simulated venue and queue-position
+    pre-trade caps, `ExecutionPlanner`; 0005, 0013), `crates/fbc-journal` (0006; it depends on
+    `fbc-core` only: the records the runtime writes, length-prefixed in a hand-written
+    little-endian format with a version, a writer of one subdirectory per UTC day with segments
+    named `<shard>-<seq>.fbcj` and time from the caller, a reader in write order, and no byte of
+    a redaction span or secret header written; still planned: keyed hashes in `src/redact*`,
+    the nonce, encode-context and cycle records, compression and the hourly roll, and the
+    never-blocking sink with its safety reserve), `crates/fbc-sim` (simulated venue and queue-position
     fill-model code, never calibrations), `crates/fbc-conformance` (adapter conformance kit and
     stub venue server).
   - `crates/venues/fbc-venues` (the registry, the only crate that sees concrete venues),
@@ -201,7 +207,9 @@ same way on every machine that runs the check, fast or full (0017): install it o
 with `cargo install cargo-deny --version 0.20.2 --locked`; CI installs the same version, the
 licence step fails naming the install command when it is missing or another version, and
 moving it is a ticket. Planned steps still marked TODO in the script: the dependency-direction
-check (with the first venue crate) and the golden-refresh flag (with `fbc-journal`).
+check (with the first venue crate) and the golden-refresh flag. The golden-refresh TODO stays
+open now that `fbc-journal` exists: exact-replay goldens compare outbound bytes, which need the
+exec path (BT-402).
 
 ### Rules
 

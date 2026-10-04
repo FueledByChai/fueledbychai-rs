@@ -53,8 +53,8 @@ if [ -f Cargo.toml ]; then
   # never depend on a venue crate; only crates/venues/fbc-venues sees concrete venues. Waits on:
   # the first venue crate (scripts/check-deps.sh reading `cargo metadata` lands with it).
   # TODO: exact-replay and signing goldens run as cargo tests; a refresh flag is needed only if
-  # a golden must be regenerated. Waits on: where the golden journals live and who approves a
-  # refresh (decide when fbc-journal lands, 0006).
+  # a golden must be regenerated. Waits on: the exec path (BT-402), since exact-replay goldens
+  # compare outbound bytes; fbc-journal exists (0006), but nothing yet replays exec traffic.
 else
   step "stack"; echo "skipped: no Cargo.toml yet"
 fi
