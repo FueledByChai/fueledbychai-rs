@@ -417,8 +417,11 @@ async fn every_endpoint_a_venue_opens_records_into_its_one_journal() {
     control.set_desired([1, 2, 3].map(toy::sub)).unwrap();
     let script = async move {
         let (mut a, mut b) = (s0.accept().await, s1.accept().await);
-        assert_eq!(a.recv().await, "hello|codec=0|plan=1,2");
-        assert_eq!(b.recv().await, "hello|codec=1|plan=3");
+        // Which endpoint's codec is built first depends on which connects first: only the
+        // plans are fixed.
+        let plan = |hello: String| hello.split_once("|plan=").map(|(_, p)| p.to_owned());
+        assert_eq!(plan(a.recv().await).as_deref(), Some("1,2"));
+        assert_eq!(plan(b.recv().await).as_deref(), Some("3"));
         assert_eq!(a.recv().await, "sub|add=A,B");
         assert_eq!(b.recv().await, "sub|add=C");
         drop(control);
