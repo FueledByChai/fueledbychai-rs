@@ -138,9 +138,16 @@ impl JournalWriter {
     /// Writes `record`, filed under the UTC day of `now`. No byte of a redaction span and no
     /// secret header value is written (see [`Record::blanked`]).
     pub fn append(&mut self, now: WallNs, record: &Record) -> Result<(), JournalError> {
-        self.body.clear();
-        format::encode(record, &mut self.body)?;
-        let len = u32::try_from(self.body.len()).map_err(|_| JournalError::TooLarge)?;
+        let mut body = std::mem::take(&mut self.body);
+        body.clear();
+        let written = format::encode(record, &mut body).and_then(|()| self.append_body(now, &body));
+        self.body = body;
+        written
+    }
+
+    /// Writes a record body [`format::encode`] made, filed under the UTC day of `now`.
+    pub(crate) fn append_body(&mut self, now: WallNs, body: &[u8]) -> Result<(), JournalError> {
+        let len = u32::try_from(body.len()).map_err(|_| JournalError::TooLarge)?;
         let day = day_of(now).max(self.latest.unwrap_or(i64::MIN));
         self.latest = Some(day);
         let segment = match self.open.take() {
@@ -155,7 +162,7 @@ impl JournalWriter {
         let file = &mut self.open.insert(segment).file;
         let written = file
             .write_all(&len.to_le_bytes())
-            .and_then(|()| file.write_all(&self.body));
+            .and_then(|()| file.write_all(body));
         // After a failed write the segment may end inside a record: drop it, so the next
         // record starts a new segment and the reader reports this one's end as truncated.
         self.open = self.open.take().filter(|_| written.is_ok());
