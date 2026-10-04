@@ -114,17 +114,26 @@ pub(crate) fn encode(record: &Record, out: &mut Vec<u8>) -> Result<(), JournalEr
 
 /// [`encode`], refusing a body longer than `limit` bytes with [`JournalError::TooLarge`]
 /// before copying the bytes that would pass it, so a record too large for the room left
-/// costs no copy of its payload.
+/// costs no copy of its payload. A refused record leaves `out` as it was.
 pub(crate) fn encode_within(
     record: &Record,
     out: &mut Vec<u8>,
     limit: usize,
 ) -> Result<(), JournalError> {
     let start = out.len();
+    let encoded = encode_body(record, out, limit);
+    // A refused record leaves `out` as it found it.
+    if encoded.is_err() {
+        out.truncate(start);
+    }
+    encoded
+}
+
+fn encode_body(record: &Record, out: &mut Vec<u8>, limit: usize) -> Result<(), JournalError> {
     let mut e = Enc {
+        end: body_end(out.len(), limit),
         out,
         redacted: 0,
-        end: start.saturating_add(limit),
         over: false,
     };
     match record {
@@ -133,18 +142,20 @@ pub(crate) fn encode_within(
             opcode,
             bytes,
         } => {
-            // Checked before any copy, and only for a frame within the limit: one past it is
-            // refused for its size without being scanned.
+            e.u8(INBOUND);
+            e.stamp(stamp);
+            e.u8(opcode_byte(*opcode));
+            e.u32(len32(bytes.0.len())?);
+            // Checked before the payload is copied, and only for a payload that fits after
+            // the fields before it: one that cannot is refused for its size, unscanned.
             if *opcode == Opcode::Text
                 && bytes.0.len() <= e.room()
                 && core::str::from_utf8(&bytes.0).is_err()
             {
                 return Err(JournalError::Unencodable("a text frame that is not UTF-8"));
             }
-            e.u8(INBOUND);
-            e.stamp(stamp);
-            e.u8(opcode_byte(*opcode));
-            e.bytes(&bytes.0)?;
+            e.put(&bytes.0);
+            e.within()?;
         }
         Record::Outbound {
             at,
@@ -255,6 +266,12 @@ pub(crate) fn encode_within(
         return Err(JournalError::TooLarge);
     }
     Ok(())
+}
+
+/// Where a body that starts at `start` in its buffer must end: within `limit` bytes, and never
+/// past the format's `u32` body length.
+fn body_end(start: usize, limit: usize) -> usize {
+    start.saturating_add(limit.min(u32::MAX as usize))
 }
 
 /// The output, the bytes redacted so far, where the body must end by, and whether it has
@@ -1109,5 +1126,36 @@ mod tests {
             .collect();
         assert!(matches!(e.subs(&subs), Err(JournalError::TooLarge)));
         assert!(e.out.len() <= 16);
+    }
+
+    #[test]
+    fn a_text_frame_that_cannot_fit_with_its_fields_is_not_scanned() {
+        // Codex r4176932550: the payload alone fits the limit, the record with its fixed
+        // fields does not; it is refused for its size, not after a UTF-8 scan.
+        let mut payload = vec![b'a'; 63];
+        payload.push(0xff);
+        let record = Record::Inbound {
+            stamp: stamp(),
+            opcode: Opcode::Text,
+            bytes: Opaque(payload),
+        };
+        assert!(matches!(
+            encode_within(&record, &mut Vec::new(), 64),
+            Err(JournalError::TooLarge)
+        ));
+        let mut unlimited = Vec::new();
+        assert!(matches!(
+            encode(&record, &mut unlimited),
+            Err(JournalError::Unencodable(_))
+        ));
+    }
+
+    #[test]
+    fn no_limit_lets_a_body_past_the_format_s_u32_length() {
+        // Codex r4176932553: a queue with more than 4 GiB of room must still refuse at
+        // encoding a body the format cannot frame.
+        assert_eq!(body_end(0, usize::MAX), u32::MAX as usize);
+        assert_eq!(body_end(10, usize::MAX), 10 + u32::MAX as usize);
+        assert_eq!(body_end(10, 64), 74);
     }
 }
