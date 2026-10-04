@@ -1,0 +1,26 @@
+# BookEvent (template 3), schema 1:1, block 89: a DELTA at seq 2001, after book15-snapshot-2000: one bid changed, one ask removed, one ask added
+# Hand-built from paradex_1_0.xml at tradeparadex/paradex-py b8248fb747e278d2167ac2f056b339a287d5ef30.
+# Little-endian; '#' starts a comment.
+59 00 03 00 01 00 01 00                           # header: blockLength=89 templateId=3 (BookEvent) schemaId=1 version=1
+40 5a 7d 84 41 40 06 00                           # @0 ts int64 = 1759500000123456 us
+d1 07 00 00 00 00 00 00                           # @8 seq int64 = 2001
+01                                                # @16 pkgType uint8 = 1 (DELTA)
+00 00 00 00 00 00 00 80                           # @17 bestBidPrice int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @25 bestBidSize int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @33 bestAskPrice int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @41 bestAskSize int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @49 relativeSpread int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @57 bestBidApiPrice int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @65 bestBidApiSize int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @73 bestAskApiPrice int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @81 bestAskApiSize int64 = null (INT64_MIN)
+10 00 01 00                                       # bids group: blockLength=16 numInGroup=1
+80 3f d1 89 a3 05 00 00                           #   price = 6199950000000 (61999.5)
+c0 68 78 04 00 00 00 00                           #   size = 75000000 (0.75)
+10 00 02 00                                       # asks group: blockLength=16 numInGroup=2
+00 11 c2 92 a3 05 00 00                           #   price = 6200100000000 (62001)
+00 00 00 00 00 00 00 00                           #   size = 0 (0) : removes the level
+00 38 7b bc a3 05 00 00                           #   price = 6200800000000 (62008)
+00 68 89 09 00 00 00 00                           #   size = 160000000 (1.6)
+0c                                                # market varString8 length = 12
+42 54 43 2d 55 53 44 2d 50 45 52 50               # market = "BTC-USD-PERP"

@@ -8,8 +8,11 @@
 //! [`MdEvent::Trade`] and `BookEvent` (template 3) into book events ([`book`]). Heartbeats
 //! (template 40) and templates it does not decode are skipped. A subscribe acknowledgement is
 //! consumed; a subscribe error is returned as the frame's error and never retried.
+//!
+//! [`rest`] decodes the REST order book snapshot (`/v1/orderbook/{market}` at depth 15).
 
 pub mod book;
+pub mod rest;
 pub mod sbe;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -379,8 +382,12 @@ fn price(spec: &InstrumentSpec, mantissa: i64) -> Result<Ticks, DecodeError> {
 /// A `Qty8` mantissa as lots of the instrument's size step; refused off the step, negative or
 /// null.
 fn lots(spec: &InstrumentSpec, mantissa: i64) -> Result<Lots, DecodeError> {
+    lots_of(spec, Decimal::new(mantissa, EXP.unsigned_abs().into()))
+}
+
+/// A size as lots of the instrument's size step; refused off the step or negative.
+fn lots_of(spec: &InstrumentSpec, value: Decimal) -> Result<Lots, DecodeError> {
     let off = DecodeError::Malformed("size off the instrument's size step");
-    let value = Decimal::new(mantissa, EXP.unsigned_abs().into());
     let step = spec.size_step.get();
     let count = value.checked_div(step).ok_or(off)?;
     if !count.fract().is_zero() || count.checked_mul(step) != Some(value) {
