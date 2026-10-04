@@ -2,17 +2,21 @@
 //! shapes design §4.8 gives them as 0014 refines it.
 //!
 //! A record is owned, so the reader can hand one back. Its `Debug` shows no credential (0009):
-//! inbound bytes and response bodies by length only (a venue can echo a key), a redaction span
-//! or a redacted header value by length, and a response's headers by count, as `fbc-core`'s
-//! own types do.
+//! inbound bytes and response bodies by length only (a venue can echo a key a codec did not
+//! mark), a redaction span or a redacted header name or value by length, and a response's
+//! headers by count, as `fbc-core`'s own types do.
+//!
+//! Inbound bytes carry the spans the codec named in them ([`InboundSpans`], decision 0028):
+//! [`Record::inbound_redacted`] and [`HttpResponseRec::redacted`] build an inbound frame's or a
+//! response's record with them, and the journal blanks them as it does an outbound frame's.
 
 use core::fmt;
 use core::ops::Range;
 
 use fbc_core::{
-    ConnKey, EncodeCtx, Header, HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag,
-    InstrumentId, MonoNs, NotSentReason, RawFrame, RpcId, Stamp, Subscription, TimerTag, WireSlice,
-    WireUrl,
+    ConnKey, EncodeCtx, Header, HeaderMark, HttpFailure, HttpMethod, HttpRequest, HttpResponse,
+    HttpTag, Inbound, InboundSpans, InstrumentId, MonoNs, NotSentReason, RawFrame, RedactError,
+    RpcId, Stamp, Subscription, TimerTag, WireSlice, WireUrl,
 };
 
 /// The byte a redaction span reads back as. A span's bytes are never written (its keyed hash
@@ -98,27 +102,35 @@ pub enum Marker {
 pub struct NonceSourceId(pub u32);
 
 /// One HTTP header as journaled. `redact` says its value is a credential: the codec marked it,
-/// or its name is one of [`SECRET_HEADERS`]. A read-back header with `redact` has its value
-/// blanked, at its length. `Debug` shows a redacted value by length only.
+/// or its name is one of [`SECRET_HEADERS`]; `redact_name` says its name is one too (a key a
+/// proxy echoes in a header name, [`HeaderMark::NameAndValue`]), and its value with it. A
+/// read-back header has what was secret blanked, at its length, and `redact` set. `Debug`
+/// shows a redacted name or value by length only.
 #[derive(Clone, Eq, PartialEq, Hash)]
 pub struct HeaderRec {
     pub name: String,
     pub value: String,
     pub redact: bool,
+    pub redact_name: bool,
 }
 
 impl HeaderRec {
     /// Whether the journal blanks this header's value.
     pub fn secret(&self) -> bool {
-        self.redact || is_secret_header(&self.name)
+        self.redact || self.redact_name || is_secret_header(&self.name)
     }
 
     fn blanked(&self) -> HeaderRec {
         if self.secret() {
             HeaderRec {
-                name: self.name.clone(),
+                name: if self.redact_name {
+                    blank_text(self.name.len())
+                } else {
+                    self.name.clone()
+                },
                 value: blank_text(self.value.len()),
                 redact: true,
+                redact_name: self.redact_name,
             }
         } else {
             self.clone()
@@ -132,6 +144,7 @@ impl From<&Header> for HeaderRec {
             name: h.name.to_owned(),
             value: h.value.clone(),
             redact: h.redact,
+            redact_name: false,
         }
     }
 }
@@ -139,7 +152,14 @@ impl From<&Header> for HeaderRec {
 impl fmt::Debug for HeaderRec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut d = f.debug_struct("HeaderRec");
-        d.field("name", &self.name);
+        if self.redact_name {
+            d.field(
+                "name",
+                &format_args!("<redacted {} bytes>", self.name.len()),
+            );
+        } else {
+            d.field("name", &self.name);
+        }
         if self.secret() {
             d.field(
                 "value",
@@ -148,7 +168,9 @@ impl fmt::Debug for HeaderRec {
         } else {
             d.field("value", &self.value);
         }
-        d.field("redact", &self.redact).finish()
+        d.field("redact", &self.redact)
+            .field("redact_name", &self.redact_name)
+            .finish()
     }
 }
 
@@ -183,28 +205,53 @@ impl From<&HttpRequest> for HttpRequestRec {
     }
 }
 
-/// An HTTP response as journaled, with its headers. Response headers carry no codec mark
-/// (FBC-7lm adds one), so only [`SECRET_HEADERS`] are blanked; the body is kept verbatim.
-/// `Debug` shows the status, the number of headers and the body's length only, as
-/// [`HttpResponse`]'s does.
+/// An HTTP response as journaled, with its headers and the spans of its body that hold
+/// credentials. The headers the codec marked ([`HttpResponseRec::redacted`]) and the
+/// [`SECRET_HEADERS`] are blanked, and so are `body_redact`'s spans; the rest of the body is
+/// kept verbatim. `Debug` shows the status, the number of headers and the body's length only,
+/// as [`HttpResponse`]'s does.
 #[derive(Clone, Eq, PartialEq, Hash)]
 pub struct HttpResponseRec {
     pub status: u16,
     pub headers: Vec<HeaderRec>,
     pub body: Opaque,
+    /// The body's credential spans: non-empty, inside it, in ascending order.
+    pub body_redact: Vec<Range<u32>>,
 }
 
 impl HttpResponseRec {
+    /// `resp` as journaled with the credentials its codec named in it
+    /// ([`ExecCodec::redact_inbound`](fbc_core::ExecCodec::redact_inbound)): the marked
+    /// headers and body spans are blanked. `Err` when `spans` do not fit `resp`
+    /// ([`InboundSpans::check`]).
+    pub fn redacted(
+        resp: &HttpResponse<'_>,
+        spans: &InboundSpans,
+    ) -> Result<HttpResponseRec, RedactError> {
+        spans.check(Inbound::Http(HttpTag(0), *resp))?;
+        let mut rec = HttpResponseRec::from(resp);
+        for &(at, mark) in spans.headers() {
+            // Checked: every mark names a header.
+            let h = &mut rec.headers[at as usize];
+            h.redact = true;
+            h.redact_name = mark == HeaderMark::NameAndValue;
+        }
+        rec.body_redact = spans.body().to_vec();
+        Ok(rec)
+    }
+
     fn blanked(&self) -> HttpResponseRec {
         HttpResponseRec {
             status: self.status,
             headers: self.headers.iter().map(HeaderRec::blanked).collect(),
-            body: self.body.clone(),
+            body: Opaque(blank_spans(&self.body.0, &self.body_redact)),
+            body_redact: self.body_redact.clone(),
         }
     }
 }
 
 impl From<&HttpResponse<'_>> for HttpResponseRec {
+    /// `resp` with nothing marked: only the [`SECRET_HEADERS`] are blanked.
     fn from(resp: &HttpResponse<'_>) -> HttpResponseRec {
         HttpResponseRec {
             status: resp.status,
@@ -215,9 +262,11 @@ impl From<&HttpResponse<'_>> for HttpResponseRec {
                     name: (*name).to_owned(),
                     value: (*value).to_owned(),
                     redact: false,
+                    redact_name: false,
                 })
                 .collect(),
             body: Opaque(resp.body.to_vec()),
+            body_redact: Vec::new(),
         }
     }
 }
@@ -235,12 +284,15 @@ impl fmt::Debug for HttpResponseRec {
 /// One journal record.
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub enum Record {
-    /// A frame as it came off a stream, with its stamp, before decoding. Its bytes are
-    /// written verbatim: a codec marks no span in an inbound frame until FBC-7lm.
+    /// A frame as it came off a stream, with its stamp, before decoding, and the spans of its
+    /// bytes its codec named as credentials ([`Record::inbound_redacted`]): non-empty, inside
+    /// the bytes, in ascending order, and on character boundaries in a text frame. The spans
+    /// are blanked; the rest is written verbatim.
     Inbound {
         stamp: Stamp,
         opcode: Opcode,
         bytes: Opaque,
+        redact: Vec<Range<u32>>,
     },
     /// A frame written to a connection, with its redaction spans.
     Outbound {
@@ -299,8 +351,13 @@ pub enum Record {
 }
 
 impl Record {
-    /// An inbound frame as it came off a stream.
+    /// An inbound frame as it came off a stream, with nothing marked: for a codec whose
+    /// frames hold no credential ([`InboundSpans::NONE`]).
     pub fn inbound(stamp: Stamp, frame: RawFrame<'_>) -> Record {
+        Record::inbound_with(stamp, frame, Vec::new())
+    }
+
+    fn inbound_with(stamp: Stamp, frame: RawFrame<'_>, redact: Vec<Range<u32>>) -> Record {
         let opcode = match frame {
             RawFrame::Text(_) => Opcode::Text,
             RawFrame::Binary(_) => Opcode::Binary,
@@ -309,7 +366,21 @@ impl Record {
             stamp,
             opcode,
             bytes: Opaque(frame.bytes().to_vec()),
+            redact,
         }
+    }
+
+    /// An inbound frame with the credentials its codec named in it
+    /// ([`MdCodec::redact_inbound`](fbc_core::MdCodec::redact_inbound),
+    /// [`ExecCodec::redact_inbound`](fbc_core::ExecCodec::redact_inbound)), which the journal
+    /// blanks. `Err` when `spans` do not fit `frame` ([`InboundSpans::check`]).
+    pub fn inbound_redacted(
+        stamp: Stamp,
+        frame: RawFrame<'_>,
+        spans: &InboundSpans,
+    ) -> Result<Record, RedactError> {
+        spans.check(Inbound::Frame(frame))?;
+        Ok(Record::inbound_with(stamp, frame, spans.body().to_vec()))
     }
 
     /// The record as the reader returns it: every redaction span's bytes and every secret
@@ -317,6 +388,17 @@ impl Record {
     /// marked `redact`. A record with nothing to redact is returned as it is.
     pub fn blanked(&self) -> Record {
         match self {
+            Record::Inbound {
+                stamp,
+                opcode,
+                bytes,
+                redact,
+            } => Record::Inbound {
+                stamp: *stamp,
+                opcode: *opcode,
+                bytes: Opaque(blank_spans(&bytes.0, redact)),
+                redact: redact.clone(),
+            },
             Record::Outbound {
                 at,
                 conn,
@@ -359,11 +441,15 @@ fn blank_text(len: usize) -> String {
     String::from_utf8(vec![BLANK; len]).expect("BLANK is ASCII")
 }
 
-/// `bytes` with every span's bytes blanked.
+/// `bytes` with every span's bytes blanked. A span reaching past the end (in a record built
+/// field by field, which the writer refuses) is blanked as far as the bytes go.
 fn blank_spans(bytes: &[u8], spans: &[Range<u32>]) -> Vec<u8> {
     let mut out = bytes.to_vec();
     for span in spans {
-        out[span.start as usize..span.end as usize].fill(BLANK);
+        let end = (span.end as usize).min(out.len());
+        if let Some(part) = out.get_mut(span.start as usize..end) {
+            part.fill(BLANK);
+        }
     }
     out
 }

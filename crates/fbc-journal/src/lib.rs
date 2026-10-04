@@ -25,23 +25,23 @@
 //! hand-written little-endian encoding ([`format`]). There is no serialization dependency:
 //! adding one would need a decision record and the licence gate (FBC-cu0).
 //!
-//! **Redaction (0006, 0009, 0024).** No byte of a redaction span is written: the spans of a
-//! [`WireSlice`](fbc_core::WireSlice) or [`WireUrl`](fbc_core::WireUrl), header values a codec
-//! marked redacted, and the values of the [`SECRET_HEADERS`] by name, in requests and results
-//! alike. Each is written as its HMAC-SHA-256 under the consumer's [`RedactionKey`], so equal
-//! secrets hash equally and replay compares bytes modulo spans ([`redact`]). The record keeps
-//! each span's place and length, and the reader returns [`BLANK`] bytes there
-//! ([`Record::blanked`] gives what the reader will return) with the hashes beside it
-//! ([`JournalReader::entries`], [`Record::digests`]). Order signatures are not redacted: bytes
-//! outside spans are written verbatim.
+//! **Redaction (0006, 0009, 0024, 0028).** No byte of a redaction span is written: the spans
+//! of a [`WireSlice`](fbc_core::WireSlice) or [`WireUrl`](fbc_core::WireUrl), header values
+//! (and, in a response, names) a codec marked redacted, the values of the [`SECRET_HEADERS`] by
+//! name, in requests and results alike, and the spans a codec named in an inbound frame or a
+//! response body ([`InboundSpans`](fbc_core::InboundSpans), through
+//! [`Record::inbound_redacted`] and [`HttpResponseRec::redacted`]). Each is written as its
+//! HMAC-SHA-256 under the consumer's [`RedactionKey`], so equal secrets hash equally and replay
+//! compares bytes modulo spans ([`redact`]). The record keeps each span's place and length, and
+//! the reader returns [`BLANK`] bytes there ([`Record::blanked`] gives what the reader will
+//! return) with the hashes beside it ([`JournalReader::entries`], [`Record::digests`]); replay
+//! hands a codec the blanked input. Order signatures are not redacted: bytes outside spans are
+//! written verbatim.
 //!
-//! **What is still written verbatim.** Inbound frames, HTTP response bodies, and response
-//! header names and values other than the [`SECRET_HEADERS`] carry no redaction metadata in
-//! `fbc-core` yet (a [`RawFrame`](fbc_core::RawFrame) or an
-//! [`HttpResponse`](fbc_core::HttpResponse) marks nothing), so they are written as they came:
-//! decoder replay needs their bytes. A codec marking credential spans there, and the journal
-//! blanking them, is FBC-7lm. Until it lands, journal no traffic whose inbound side carries a
-//! credential (an auth response holding a JWT, a frame echoing a key).
+//! **What is still written verbatim.** Whatever in inbound bytes the codec did not mark: a
+//! record built with [`Record::inbound`] or [`HttpResponseRec::from`] marks nothing, for a codec
+//! whose input holds no credential. The runtime journaling a session through its codec's
+//! `redact_inbound` is FBC-s69.
 
 mod error;
 pub mod format;

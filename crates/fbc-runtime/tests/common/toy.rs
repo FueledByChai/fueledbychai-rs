@@ -35,12 +35,12 @@ use fbc_core::{
     Aggressor, AssetSym, BookCaps, BookId, BookSide, Cadence, Channel, ConfigError, ConnTopology,
     Continuity, DecodeError, DecodeScope, Effect, Effects, Encoding, EndpointPlan, ExchTsKind,
     ExecCodec, ExecEndpoint, Feed, FeedHealth, FeedSource, FieldSpec, FundingCaps, FundingSpec,
-    HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag, InstrumentId, InstrumentKind,
-    InstrumentSpec, Keepalive, Lots, MatchingCaps, MdCaps, MdCodec, MdEvent, MdSink, MdTransport,
-    MonoNs, OpKind, PriceGrid, QueueModelQuality, RateCharge, RawFrame, Readiness, SizeStep,
-    SpecTable, StpScope, StreamId, Subscription, TagSet, Ticks, TimerTag, TradeCaps, TradingStatus,
-    TrafficClass, UnderlyingId, VenueCaps, VenueConfig, VenueError, VenueFactory, VenueId,
-    VenueMeta, WallNs, WireSlice, WireUrl, dispatch_market_data,
+    HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag, Inbound, InboundSpans,
+    InstrumentId, InstrumentKind, InstrumentSpec, Keepalive, Lots, MatchingCaps, MdCaps, MdCodec,
+    MdEvent, MdSink, MdTransport, MonoNs, OpKind, PriceGrid, QueueModelQuality, RateCharge,
+    RawFrame, Readiness, SizeStep, SpecTable, StpScope, StreamId, Subscription, TagSet, Ticks,
+    TimerTag, TradeCaps, TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueConfig,
+    VenueError, VenueFactory, VenueId, VenueMeta, WallNs, WireSlice, WireUrl, dispatch_market_data,
 };
 use rust_decimal::Decimal;
 
@@ -441,6 +441,10 @@ impl MdCodec for ToyMd {
 
     fn keepalive(&self) -> Option<Keepalive> {
         None
+    }
+
+    fn redact_inbound(&self, _input: Inbound<'_>) -> InboundSpans {
+        InboundSpans::NONE
     }
 }
 

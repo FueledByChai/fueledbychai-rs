@@ -14,7 +14,10 @@
 //! - [`OrderSigner`] signs the normalized wire view of an order ([`PlaceWire`], [`AmendWire`],
 //!   [`CancelWire`]); a venue's signer lives in its `src/sign` (decision 0009).
 //! - Frames carry redaction spans ([`WireSlice`]) and HTTP headers a redaction flag, so the
-//!   journal can keep credentials only as keyed hashes (decision 0006).
+//!   journal can keep credentials only as keyed hashes (decision 0006). Inbound bytes carry
+//!   none, so each codec names the credentials in what it receives
+//!   ([`MdCodec::redact_inbound`], [`ExecCodec::redact_inbound`], [`InboundSpans`]) before the
+//!   journal writes it (decision 0028).
 
 use core::fmt;
 use core::ops::Range;
@@ -111,6 +114,17 @@ fn check_spans(
     Ok(())
 }
 
+/// Checks redaction spans against `bytes`: each non-empty, inside, after the one before it,
+/// and, where `bytes` are UTF-8, on character boundaries, so blanking whole spans with an
+/// ASCII byte keeps them UTF-8. The rule [`InboundSpans::check`] holds a codec's spans to,
+/// and the journal holds a record's inbound spans to before it writes them.
+pub fn check_redactions(bytes: &[u8], redact: &[Range<u32>]) -> Result<(), RedactError> {
+    match core::str::from_utf8(bytes) {
+        Ok(text) => check_spans(bytes.len(), redact, |at| text.is_char_boundary(at)),
+        Err(_) => check_spans(bytes.len(), redact, |_| true),
+    }
+}
+
 /// A URL for the wire, with the spans that hold credentials (a key or token in the path,
 /// query or user information), so the journal stores those spans only as keyed hashes and
 /// replay compares URLs modulo them, as it does frames ([`WireSlice`]) and headers.
@@ -182,6 +196,9 @@ pub enum RedactError {
     OutOfBounds,
     /// Two spans overlap, or the spans are not in ascending order.
     Unordered,
+    /// A header mark names no header of the response (a frame has none), or the marks are not
+    /// in strictly ascending order of header.
+    NoSuchHeader,
 }
 
 impl fmt::Display for RedactError {
@@ -189,6 +206,7 @@ impl fmt::Display for RedactError {
         f.write_str(match self {
             RedactError::OutOfBounds => "a redaction span lies outside the frame",
             RedactError::Unordered => "redaction spans overlap or are out of order",
+            RedactError::NoSuchHeader => "a header mark names no header, or marks are out of order",
         })
     }
 }
@@ -401,6 +419,92 @@ pub enum HttpFailure {
     TimedOut,
     /// The connection failed after the request was written: the venue may have acted on it.
     Lost,
+}
+
+/// Bytes that came in from a venue, for a codec to name the credentials in before the journal
+/// writes them ([`MdCodec::redact_inbound`], [`ExecCodec::redact_inbound`]).
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum Inbound<'a> {
+    /// A frame off one of the codec's streams.
+    Frame(RawFrame<'a>),
+    /// The response to the HTTP request the codec tagged `tag`.
+    Http(HttpTag, HttpResponse<'a>),
+}
+
+/// What of an HTTP response header holds a credential.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum HeaderMark {
+    /// Its value (a cookie, a token).
+    Value,
+    /// Its name and its value (a key a proxy echoes in a header name).
+    NameAndValue,
+}
+
+/// The credentials a codec names in one inbound frame or HTTP response: spans of the frame's
+/// bytes or the response's body, and the response's headers by index with what of each holds
+/// one. The journal writes each only as a keyed hash and reads it back blanked, so replay
+/// decodes the record modulo these spans (decision 0028). Headers the journal blanks by name
+/// (`Set-Cookie` and the rest) are blanked whether marked or not.
+#[derive(Clone, Eq, PartialEq, Hash, Debug, Default)]
+pub struct InboundSpans {
+    body: Vec<Range<u32>>,
+    headers: Vec<(u32, HeaderMark)>,
+}
+
+impl InboundSpans {
+    /// Nothing holds a credential.
+    pub const NONE: InboundSpans = InboundSpans {
+        body: Vec::new(),
+        headers: Vec::new(),
+    };
+
+    /// The credential spans of a frame's bytes.
+    pub fn frame(body: Vec<Range<u32>>) -> InboundSpans {
+        InboundSpans {
+            body,
+            headers: Vec::new(),
+        }
+    }
+
+    /// The credentials of an HTTP response: `headers` by index into the response's headers,
+    /// ascending, and `body` spans of its body.
+    pub fn response(headers: Vec<(u32, HeaderMark)>, body: Vec<Range<u32>>) -> InboundSpans {
+        InboundSpans { body, headers }
+    }
+
+    /// The spans of the frame's bytes or the response's body.
+    pub fn body(&self) -> &[Range<u32>] {
+        &self.body
+    }
+
+    /// The marked headers, by index into the response's headers.
+    pub fn headers(&self) -> &[(u32, HeaderMark)] {
+        &self.headers
+    }
+
+    /// Whether nothing is marked.
+    pub fn is_empty(&self) -> bool {
+        self.body.is_empty() && self.headers.is_empty()
+    }
+
+    /// Checks these spans against what they were named in: body spans as
+    /// [`check_redactions`] says, and header marks each naming a header of the response, in
+    /// strictly ascending order; a frame has no headers to mark.
+    pub fn check(&self, input: Inbound<'_>) -> Result<(), RedactError> {
+        let (bytes, headers) = match input {
+            Inbound::Frame(f) => (f.bytes(), 0),
+            Inbound::Http(_, resp) => (resp.body, resp.headers.len()),
+        };
+        let mut next = 0;
+        for &(at, _) in &self.headers {
+            let at = usize::try_from(at).unwrap_or(usize::MAX);
+            if at < next || at >= headers {
+                return Err(RedactError::NoSuchHeader);
+            }
+            next = at + 1;
+        }
+        check_redactions(bytes, &self.body)
+    }
 }
 
 /// Which traffic a frame is: safety traffic (cancels, reducing orders, keepalives,
@@ -857,6 +961,12 @@ pub trait MdCodec: Send {
     );
     /// How the stream is kept alive, or `None` where the venue needs nothing.
     fn keepalive(&self) -> Option<Keepalive>;
+    /// The credentials in `input`, a frame or a response this codec is about to be handed,
+    /// which the journal keeps only as keyed hashes ([`InboundSpans`]). Pure: it depends on
+    /// `input` and the codec's state alone and changes nothing. Replay hands the codec the
+    /// journaled input with these spans blanked, so decoding must not depend on their bytes.
+    /// Public market data holds none: [`InboundSpans::NONE`].
+    fn redact_inbound(&self, input: Inbound<'_>) -> InboundSpans;
 }
 
 /// An [`ExecCodec`] callback other than `encode` that takes an [`EncodeCtx`].
@@ -932,6 +1042,13 @@ pub trait ExecCodec: Send {
     /// Read the venue's open orders and positions (reads only), reported as the `Resync*`
     /// events.
     fn resync(&mut self, ctx: &EncodeCtx, fx: &mut Effects);
+    /// The credentials in `input`, a frame or a response this codec is about to be handed (an
+    /// authentication response's token, a cookie, a frame echoing a key), which the journal
+    /// keeps only as keyed hashes ([`InboundSpans`]). Pure: it depends on `input` and the
+    /// codec's state alone and changes nothing. Replay hands the codec the journaled input
+    /// with these spans blanked, so what it decodes must not depend on their bytes beyond
+    /// holding them (a token kept for later requests is kept blanked).
+    fn redact_inbound(&self, input: Inbound<'_>) -> InboundSpans;
 }
 
 /// The most bytes a [`Sig`] holds: room for the longest wire form a planned venue sends,
@@ -1147,6 +1264,59 @@ mod tests {
         assert!(WireSlice::plain(b"x".to_vec()).redactions().is_empty());
         assert!(RedactError::OutOfBounds.to_string().contains("outside"));
         assert!(RedactError::Unordered.to_string().contains("order"));
+    }
+
+    #[test]
+    fn inbound_spans_must_name_what_the_input_holds() {
+        let one = |span: Range<u32>| vec![span];
+        let frame = Inbound::Frame(RawFrame::Text("hello|key=é|x"));
+        assert_eq!(InboundSpans::NONE.check(frame), Ok(()));
+        assert!(InboundSpans::NONE.is_empty());
+        let spans = InboundSpans::frame(one(10..12));
+        assert_eq!(spans.check(frame), Ok(()));
+        assert!(!spans.is_empty());
+        // Inside a UTF-8 character, past the end, out of order: refused.
+        let check = |body: Vec<Range<u32>>| InboundSpans::frame(body).check(frame);
+        assert_eq!(check(one(10..11)), Err(RedactError::OutOfBounds));
+        assert_eq!(check(one(10..20)), Err(RedactError::OutOfBounds));
+        assert_eq!(check(vec![5..7, 1..2]), Err(RedactError::Unordered));
+        // Bytes that are not UTF-8 take spans anywhere inside them.
+        let binary = Inbound::Frame(RawFrame::Binary(&[0xff, 0xc3, 0xa9]));
+        assert_eq!(InboundSpans::frame(one(1..2)).check(binary), Ok(()));
+        assert_eq!(check_redactions(b"ab", &[0..1, 1..2]), Ok(()));
+        // A frame has no header to mark.
+        let header = InboundSpans::response(vec![(0, HeaderMark::Value)], Vec::new());
+        assert_eq!(header.check(frame), Err(RedactError::NoSuchHeader));
+
+        let headers = [("Set-Cookie", "a"), ("X-Echo-k", "b")];
+        let resp = HttpResponse {
+            status: 200,
+            headers: &headers,
+            body: b"auth|token=t",
+        };
+        let http = Inbound::Http(HttpTag(1), resp);
+        let marks = vec![(0, HeaderMark::Value), (1, HeaderMark::NameAndValue)];
+        let spans = InboundSpans::response(marks.clone(), one(11..12));
+        assert_eq!(spans.check(http), Ok(()));
+        assert_eq!(spans.headers(), marks.as_slice());
+        assert_eq!(spans.body(), one(11..12));
+        let refused =
+            |marks: Vec<(u32, HeaderMark)>| InboundSpans::response(marks, Vec::new()).check(http);
+        assert_eq!(
+            refused(vec![(2, HeaderMark::Value)]),
+            Err(RedactError::NoSuchHeader)
+        );
+        assert_eq!(
+            refused(vec![(u32::MAX, HeaderMark::Value)]),
+            Err(RedactError::NoSuchHeader)
+        );
+        let twice = vec![(1, HeaderMark::Value), (1, HeaderMark::NameAndValue)];
+        assert_eq!(refused(twice), Err(RedactError::NoSuchHeader));
+        let backwards = vec![(1, HeaderMark::Value), (0, HeaderMark::Value)];
+        assert_eq!(refused(backwards), Err(RedactError::NoSuchHeader));
+        let body = InboundSpans::response(Vec::new(), one(11..13));
+        assert_eq!(body.check(http), Err(RedactError::OutOfBounds));
+        assert!(RedactError::NoSuchHeader.to_string().contains("header"));
     }
 
     #[test]

@@ -63,6 +63,7 @@ fn frame(n: u64, len: usize) -> Record {
         stamp: stamp(n, WallNs(n as i64)),
         opcode: Opcode::Text,
         bytes: Opaque(text.bytes().cycle().take(len).collect()),
+        redact: Vec::new(),
     }
 }
 

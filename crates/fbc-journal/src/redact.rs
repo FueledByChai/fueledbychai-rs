@@ -3,20 +3,26 @@
 //! The journal never writes a redaction span's bytes (0006, 0009). In their place it writes
 //! the span's HMAC-SHA-256 under a [`RedactionKey`] the consumer supplies: the same secret
 //! under the same key hashes the same way every time, so replay compares outbound bytes modulo
-//! spans and still sees whether a credential changed. The spans are the ones the journal has
-//! always blanked: the spans of a [`WireSlice`](fbc_core::WireSlice) or
-//! [`WireUrl`](fbc_core::WireUrl), header values a codec marked redacted, and the values of the
-//! [`SECRET_HEADERS`](crate::SECRET_HEADERS) by name, in requests and results alike. Bytes
-//! outside spans, order signatures included, are written verbatim.
+//! spans and still sees whether a credential changed. The spans are the ones the journal
+//! blanks: the spans of a [`WireSlice`](fbc_core::WireSlice) or
+//! [`WireUrl`](fbc_core::WireUrl), header names and values a codec marked redacted, the values
+//! of the [`SECRET_HEADERS`](crate::SECRET_HEADERS) by name, in requests and results alike,
+//! and the spans a codec named in an inbound frame or a response body
+//! ([`InboundSpans`](fbc_core::InboundSpans), FBC-7lm, decision 0028). Bytes outside spans,
+//! order signatures included, are written verbatim.
 //!
 //! [`Record::digests`] gives a record's hashes in the order the format writes them, which is
 //! the order [`Entry::digests`](crate::Entry) reads them back in:
 //!
-//! - an outbound frame: its spans in order;
+//! - an inbound or outbound frame: its spans in order;
 //! - an HTTP request: its URL's spans, then its secret headers in header order, then its body's
 //!   spans;
-//! - an HTTP result with a response: its secret headers in header order;
+//! - an HTTP result with a response: its secret headers in header order, then its body's
+//!   spans;
 //! - every other record: none.
+//!
+//! A secret header gives its name's hash and then its value's when its name is redacted
+//! (`HeaderRec::redact_name`), and its value's alone otherwise.
 
 use core::fmt;
 
@@ -100,17 +106,22 @@ impl Record {
         let spans = |bytes: &[u8], spans: &[core::ops::Range<u32>]| {
             spans
                 .iter()
-                .map(|s| key.digest(&bytes[s.start as usize..s.end as usize]))
+                // A span past the end (a record the writer refuses) hashes what the bytes hold.
+                .map(|s| key.digest(bytes.get(s.start as usize..s.end as usize).unwrap_or(&[])))
                 .collect::<Vec<_>>()
         };
         let headers = |headers: &[HeaderRec]| {
-            headers
-                .iter()
-                .filter(|h| h.secret())
-                .map(|h| key.digest(h.value.as_bytes()))
-                .collect::<Vec<_>>()
+            let mut out = Vec::new();
+            for h in headers.iter().filter(|h| h.secret()) {
+                if h.redact_name {
+                    out.push(key.digest(h.name.as_bytes()));
+                }
+                out.push(key.digest(h.value.as_bytes()));
+            }
+            out
         };
         match self {
+            Record::Inbound { bytes, redact, .. } => spans(&bytes.0, redact),
             Record::Outbound { frame, .. } => spans(frame.bytes(), frame.redactions()),
             Record::HttpRequest { req, .. } => {
                 let mut out = spans(req.url.as_str().as_bytes(), req.url.redactions());
@@ -120,7 +131,11 @@ impl Record {
             }
             Record::HttpResult {
                 result: Ok(resp), ..
-            } => headers(&resp.headers),
+            } => {
+                let mut out = headers(&resp.headers);
+                out.extend(spans(&resp.body.0, &resp.body_redact));
+                out
+            }
             _ => Vec::new(),
         }
     }
