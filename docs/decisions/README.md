@@ -28,3 +28,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0023](0023-a-market-data-session-hands-each-event-to-the-consumer-s-han.md) A market-data session hands each event to the consumer's handler inline and paces reconnects by consumer-configured backoff and attempt budget — accepted
 - [0024](0024-the-journal-hashes-each-redacted-span-with-hmac-sha-256-unde.md) The journal hashes each redacted span with HMAC-SHA-256 under a consumer key, using hmac 0.12.1 and sha2 0.10.9 pinned — accepted
 - [0025](0025-conformance-fault-scripts-are-typed-rust-values-played-by-a-.md) Conformance fault scripts are typed Rust values played by a public stub server; a text script format is deferred — accepted
+- [0025](0025-journal-segments-roll-every-utc-hour-and-each-closed-segment.md) Journal segments roll every UTC hour and each closed segment is compressed with zstd 0.13.3 pinned, the bundled libzstd at level 3 — accepted
