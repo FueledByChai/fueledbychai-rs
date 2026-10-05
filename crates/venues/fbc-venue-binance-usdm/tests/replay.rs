@@ -230,13 +230,13 @@ async fn decoder_replay_of_the_journal_rebuilds_the_binance_books_byte_identical
         }
         drop(control);
     };
-    // A regression that loses a frame fails here instead of hanging.
-    let bounded = async {
-        tokio::time::timeout(Duration::from_secs(60), script)
-            .await
-            .expect("the session did not apply the fixtures within 60 s");
-    };
-    let (run, ()) = tokio::join!(session.run(), bounded);
+    // A regression that loses a frame, or one that keeps the session running once its control
+    // drops, fails here instead of hanging: the bound covers the session and the script together
+    // (Codex r4180053526).
+    let both = async { tokio::join!(session.run(), script) };
+    let (run, ()) = tokio::time::timeout(Duration::from_secs(60), both)
+        .await
+        .expect("the session did not apply the fixtures and stop within 60 s");
     run.unwrap();
     writer.close().unwrap();
     let counters = session.counters();
