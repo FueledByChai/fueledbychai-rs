@@ -448,19 +448,25 @@ impl OrderRecord {
         self.cum_fills.checked_add(qty)
     }
 
-    /// Counts a fill the ledger accepted, naming the venue id `vid`, the order's fill sum then
-    /// being `cum_fills` (checked by [`Self::cum_fills_with`]).
+    /// Counts a fill the ledger accepted, naming the venue id `vid` and reporting the order's
+    /// cumulative quantity `cum_after`, the order's fill sum then being `cum_fills` (checked by
+    /// [`Self::cum_fills_with`]).
     ///
-    /// The fill counts whatever the order's state. A terminal order does not move. Otherwise
+    /// The fill counts whatever the order's state, and `cum_after`, when reported, raises
+    /// `cum_venue`. A terminal order does not move. Otherwise
     /// the record learns the fill's venue id when it has none; a PendingNew or Unknown order is
     /// promoted; and the order is Filled only when the fills alone cover its total and no amend
     /// to a larger total is in flight, never on the venue's cumulative count alone.
     pub(crate) fn apply_fill(
         &mut self,
         vid: Option<&VenueOrderId>,
+        cum_after: Option<Lots>,
         cum_fills: Lots,
     ) -> FillApplied {
         self.cum_fills = cum_fills;
+        if let Some(cum) = cum_after {
+            self.cum_venue = self.cum_venue.max(cum);
+        }
         if self.state.is_terminal() {
             return FillApplied::AfterEnd;
         }
@@ -613,11 +619,11 @@ mod tests {
     fn an_amend_to_a_larger_total_in_flight_keeps_a_covered_order_resting() {
         let mut rec = order(4);
         assert!(rec.amend_sent(Ticks(101), lots(8), RpcId(3), MonoNs(2)));
-        assert_eq!(rec.apply_fill(None, lots(4)), FillApplied::Live);
+        assert_eq!(rec.apply_fill(None, None, lots(4)), FillApplied::Live);
         assert_eq!(rec.state(), OrdState::PartiallyFilled);
         assert_eq!(rec.resting(), Lots::ZERO);
         // Once the fills cover the amended total too, the order is filled.
-        assert_eq!(rec.apply_fill(None, lots(8)), FillApplied::Completed);
+        assert_eq!(rec.apply_fill(None, None, lots(8)), FillApplied::Completed);
         assert_eq!(rec.state(), OrdState::Terminal(TerminalKind::Filled));
     }
 
@@ -635,7 +641,7 @@ mod tests {
         for outcome in fails {
             let mut rec = order(5);
             assert!(rec.amend_sent(Ticks(101), lots(8), RpcId(3), MonoNs(2)));
-            assert_eq!(rec.apply_fill(None, lots(5)), FillApplied::Live);
+            assert_eq!(rec.apply_fill(None, None, lots(5)), FillApplied::Live);
             rec.on_outcome(OrderOp::Amend, None, &outcome, MonoNs(3));
             assert_eq!(rec.state(), OrdState::Terminal(TerminalKind::Filled));
             assert_eq!(rec.resting(), Lots::ZERO);
@@ -646,7 +652,7 @@ mod tests {
     fn a_covered_order_is_filled_once_an_update_resolves_the_amend_at_or_below_its_fills() {
         let mut rec = order(5);
         assert!(rec.amend_sent(Ticks(101), lots(8), RpcId(3), MonoNs(2)));
-        assert_eq!(rec.apply_fill(None, lots(5)), FillApplied::Live);
+        assert_eq!(rec.apply_fill(None, None, lots(5)), FillApplied::Live);
         // The venue amended it to eight: still resting three.
         let mut amended = update(VenueOrderState::Amended { new_vid: None }, 5);
         amended.qty = Some(lots(8));
@@ -664,7 +670,7 @@ mod tests {
     fn an_amend_confirmed_without_its_total_takes_the_total_that_was_sent() {
         let mut rec = order(5);
         assert!(rec.amend_sent(Ticks(101), lots(8), RpcId(3), MonoNs(2)));
-        assert_eq!(rec.apply_fill(None, lots(5)), FillApplied::Live);
+        assert_eq!(rec.apply_fill(None, None, lots(5)), FillApplied::Live);
         // The venue confirms the amend but echoes neither price nor total.
         let amended = update(VenueOrderState::Amended { new_vid: None }, 5);
         assert_eq!(rec.apply_update(&amended, key(1)), Applied::Amended);
@@ -678,7 +684,7 @@ mod tests {
     fn an_amend_to_a_smaller_total_in_flight_does_not_hold_a_covered_order_open() {
         let mut rec = order(6);
         assert!(rec.amend_sent(Ticks(101), lots(3), RpcId(3), MonoNs(2)));
-        assert_eq!(rec.apply_fill(None, lots(6)), FillApplied::Completed);
+        assert_eq!(rec.apply_fill(None, None, lots(6)), FillApplied::Completed);
         assert_eq!(rec.intent(), Intent::None);
     }
 }

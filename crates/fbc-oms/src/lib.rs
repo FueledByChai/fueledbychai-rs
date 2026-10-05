@@ -25,8 +25,11 @@
 //! forgotten and replayed after a long reconnect cannot be applied twice; a refused replay is
 //! counted ([`ReplayCounts`]). The ledger hands an accepted fill back as an [`AcceptedFill`],
 //! which [`Registry::apply_fill`] consumes: the only path that moves an order's `cum_fills`
-//! and the inventory. The ledger records a fill only once the registry applies it; it cannot
-//! be cloned, and a registry takes fills from one ledger only. An order's filled quantity is
+//! and the inventory. The ledger records a fill only once the registry counts it; it cannot
+//! be cloned, and a registry takes fills from one ledger only. A fill under another
+//! namespace's or a non-canonical client id, or naming neither our client id nor a venue id
+//! the registry knows, is flagged and not counted (decision 0005, I4); a fill's reported
+//! cumulative quantity raises the order's `cum_venue`. An order's filled quantity is
 //! the larger of the venue's cumulative count (`cum_venue`) and `cum_fills`, never their sum;
 //! a fill promotes a PendingNew or Unknown order, and the order is Filled only when its fills
 //! alone cover its total with no amend to a larger total in flight, which is checked again

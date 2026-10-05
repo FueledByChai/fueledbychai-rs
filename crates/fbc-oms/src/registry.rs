@@ -32,9 +32,13 @@ pub enum FillRouted {
     Foreign(Namespace),
     /// Flagged, not counted: its client id is not canonical (another system's order).
     NotCanonical,
-    /// To no order the registry holds, though it names no other namespace: a fill on the
-    /// account, so the inventory moved.
-    Untracked,
+    /// To no order the registry holds, under our namespace's client id `cid` (an order of an
+    /// earlier run, say): the inventory moved.
+    OursUntracked(ClientOrderId),
+    /// Flagged, not counted: it names no client id and no venue id of an order the registry
+    /// holds, so nothing shows it is ours (another namespace's order on a venue that echoes no
+    /// client id looks the same; decision 0005, I4).
+    Unattributed,
 }
 
 /// Where [`Registry::apply_update`] sent an update.
@@ -165,12 +169,15 @@ impl Registry {
     /// sum move (decision 0005, I3).
     ///
     /// Routed as [`Registry::apply_update`] routes an order update. A fill of our order counts
-    /// on it ([`FillApplied`]) and moves the inventory; one naming no order the registry holds
-    /// moves the inventory only; another namespace's or a non-canonical one moves nothing and
-    /// is flagged. The ledger records the fill only once it is applied (flagged included).
-    /// Refused, counting nothing and leaving the ledger as it was, when the order's fill sum or
-    /// the inventory would overflow, or when the fill comes from another ledger than the first
-    /// one the registry took a fill from.
+    /// on it ([`FillApplied`]) and moves the inventory; one under our namespace's client id
+    /// for no order the registry holds moves the inventory only; another namespace's, a
+    /// non-canonical or an unattributed one moves nothing and is flagged. The ledger records
+    /// only a fill that counted, once it is applied: a flagged fill is not kept, so it never
+    /// moves the retention horizon, and delivered again it is routed again (an unattributed
+    /// fill reaches its order once the registry knows the order's venue id). Refused, counting
+    /// nothing and leaving the ledger as it was, when the order's fill sum or the inventory
+    /// would overflow, or when the fill comes from another ledger than the first one the
+    /// registry took a fill from.
     pub fn apply_fill(&mut self, accepted: AcceptedFill<'_, '_>) -> Result<FillRouted, OmsError> {
         let ledger = accepted.ledger_id();
         if self.ledger.is_some_and(|ours| ours != ledger) {
@@ -178,17 +185,16 @@ impl Registry {
         }
         self.ledger = Some(ledger);
         let fill = accepted.fill();
-        let cid = match fill.cid {
-            Some(CidMatch::Foreign(ns)) => {
-                accepted.commit();
-                return Ok(FillRouted::Foreign(ns));
-            }
-            Some(CidMatch::Unparseable) => {
-                accepted.commit();
-                return Ok(FillRouted::NotCanonical);
-            }
-            Some(CidMatch::Ours(cid)) if self.orders.contains_key(&cid) => Some(cid),
-            Some(CidMatch::Ours(_)) | None => fill.vid().and_then(|v| self.cid_of(v)),
+        let by_vid = fill.vid().and_then(|v| self.cid_of(v));
+        let (cid, ours) = match fill.cid {
+            Some(CidMatch::Foreign(ns)) => return Ok(FillRouted::Foreign(ns)),
+            Some(CidMatch::Unparseable) => return Ok(FillRouted::NotCanonical),
+            Some(CidMatch::Ours(cid)) if self.orders.contains_key(&cid) => (Some(cid), cid),
+            Some(CidMatch::Ours(cid)) => (by_vid, by_vid.unwrap_or(cid)),
+            None => match by_vid {
+                Some(cid) => (Some(cid), cid),
+                None => return Ok(FillRouted::Unattributed),
+            },
         };
         let overflow = OmsError::FillOverflow(fill.inst);
         let inventory = self
@@ -203,10 +209,11 @@ impl Registry {
         self.inventory.insert(fill.inst, inventory);
         Ok(match (cid, cum) {
             (Some(cid), Some(cum)) => {
-                let applied = self.with_record(cid, |rec| rec.apply_fill(fill.vid(), cum));
+                let applied =
+                    self.with_record(cid, |rec| rec.apply_fill(fill.vid(), fill.cum_after(), cum));
                 FillRouted::Ours(cid, applied)
             }
-            _ => FillRouted::Untracked,
+            _ => FillRouted::OursUntracked(ours),
         })
     }
 
