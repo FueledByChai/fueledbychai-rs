@@ -22,7 +22,10 @@ notes), a separate write-stall window from the consumer's configuration over reu
   (`MdCounters::write_stalls`); the epoch ends as a drop, so the session reconnects through the
   pacing, waiting the floor within the budget. The abandoned write has no write result in the
   journal, as a failed one has none; the connection's `Closed` follows. The socket is dropped,
-  not sent a close frame its peer would not read.
+  not sent a close frame its peer would not read. A write the session finds completed when it
+  next runs counts as completed, even if that is after the window (a starved or suspended
+  task): its peer took the frame, and dropping a connection that just did would reconnect a
+  healthy stream for the session's own latency.
 - **Timers.** While a write waits, the session's timers fire as they fall due: each is stamped
   then, so it takes its place in ingest order, an ended epoch's into nothing, a current epoch's
   into its codec. The effects the codec asks for join the rest of the batch, as an HTTP result's
@@ -38,6 +41,9 @@ notes), a separate write-stall window from the consumer's configuration over reu
   alarm counts a frame waiting behind a write as heard (0033).
 - Fire timers only after the write ends, bounded tightly enough: their stamps would still lag
   their deadlines by up to the window.
+- Hold a write the session finds completed only after the window to the window and end the
+  epoch (Codex r4180686922): the window would then also bound the session's own scheduling,
+  and a suspended process would drop every healthy connection it resumes on.
 
 ## Consequences
 

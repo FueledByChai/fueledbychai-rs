@@ -39,7 +39,10 @@
 //! epoch's into nothing), each stamped then, so it takes its place in ingest order, and the
 //! effects a current epoch's codec asks for join the rest of the batch, as an HTTP result's
 //! do. A timer due no later than the window fires first, even when the session runs again only
-//! after both are past; one due after it does not fire into the codec.
+//! after both are past; one due after it does not fire into the codec. A write the session finds
+//! completed when it runs again counts as completed, even past the window (a starved or
+//! suspended task): the peer took the frame, and the window bounds the wait on the peer, not the
+//! session's own scheduling.
 //!
 //! **Liveness (0033).** On a socket endpoint, each epoch sends its codec's [`Keepalive`] every
 //! interval the codec declares (a WebSocket ping, or the codec's own frame as Safety traffic),
