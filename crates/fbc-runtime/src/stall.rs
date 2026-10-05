@@ -1,4 +1,4 @@
-//! The bound on a socket write that a peer stopped reading (FBC-ha3, decision 0035).
+//! The bound on a socket write that a peer stopped reading (FBC-ha3, decision 0036).
 //!
 //! A session's write that has not completed within the consumer's [`WriteStall`] window is
 //! abandoned: the epoch ends as a drop and the session reconnects through its

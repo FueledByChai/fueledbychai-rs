@@ -59,7 +59,7 @@ pub struct MdVenueConfig {
     pub limiter: RateLimiter,
     /// Each socket endpoint's silence window and rotation margin (0033).
     pub liveness: Liveness,
-    /// Each socket endpoint's bound on a write its peer stopped reading (0035).
+    /// Each socket endpoint's bound on a write its peer stopped reading (0036).
     pub write_stall: WriteStall,
 }
 

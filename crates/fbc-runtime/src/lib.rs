@@ -71,7 +71,7 @@
 //!
 //! A session's socket write waits on a peer that stopped reading for at most the consumer's
 //! [`WriteStall`] window, then ends the epoch as a drop and reconnects through the pacing; the
-//! session's timers fire meanwhile (FBC-ha3, decision 0035).
+//! session's timers fire meanwhile (FBC-ha3, decision 0036).
 //!
 //! Not here yet: order-entry sessions, client certificates and certificate pinning.
 //! Apart from a codec's HTTP request (its own timeout) and a session's connection attempts and
