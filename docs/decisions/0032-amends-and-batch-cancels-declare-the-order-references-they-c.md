@@ -1,4 +1,4 @@
-# 0031 — Amends and batch cancels declare the order references they can name, and a codec refuses a request with none of them
+# 0032 — Amends and batch cancels declare the order references they can name, and a codec refuses a request with none of them
 
 Status: accepted
 Date: 2026-10-04

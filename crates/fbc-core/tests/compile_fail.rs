@@ -43,7 +43,7 @@ fn fee_seal_does_not_compile() {
 }
 
 /// A `VenueCaps` (or `FillCaps`) literal missing one field does not compile, nor an `AmendCaps`
-/// or `CancelBatch` that does not say which references it can name (0031), `VenueCaps` and
+/// or `CancelBatch` that does not say which references it can name (0032), `VenueCaps` and
 /// `InstrumentSpec` have no `default()`, and a `VenueSymbol` cannot be built outside `fbc-core`
 /// (decision 0003, design §4.4, §4.5). Order capabilities without fill capabilities, and fill
 /// capabilities without an exec block, cannot be written (decision 0015).
