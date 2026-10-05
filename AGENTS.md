@@ -122,9 +122,9 @@ rather than guess.
   slices (the connector, SOCKS5 CONNECT, WebSocket and HTTP/1.1, plain or TLS, 0019 and 0020, the WebSocket handshake its own, 0029;
   connection epochs and the subscription reconciler; the market-data session, 0023; HTTP
   effects, poll endpoints and plans, 0027; journaling and decoder replay, 0006; rate-limit buckets with a safety reserve, 0030), `crates/fbc-conformance` with its stub venue server (0025),
-  `crates/fbc-oms` with its first slice (the order lattice, item outcomes and the registry by
-  client id; 0005, property-tested with proptest, 0037; the gateway traits and the
-  authorization order entry needs, 0045),
+  `crates/fbc-oms` with its first slices (the order lattice, item outcomes and the registry by
+  client id; the fill ledger, the two fill counters and the inventory; 0005, property-tested
+  with proptest, 0037; the gateway traits and the authorization order entry needs, 0045),
   `crates/venues/fbc-venue-paradex` with its signer (`src/sign`), SBE market data (`src/md`: bbo,
   trades and the order book) and its factory (`src/factory.rs`, market data only),
   and `crates/venues/fbc-venue-binance-usdm` with its market-data-only factory and codec; the
@@ -197,14 +197,19 @@ rather than guess.
     `apply_update` under an `OrderKey` (the venue's ordering key, ingest tiebreak), amends that
     issue new venue ids and the superseded ids they leave, `on_outcome` per command item, and
     the `Registry` by client id that routes each update by client id or any venue id the order
-    had; I1 for order updates and I2 property-tested in `tests/lattice.rs`; the gateway traits
+    had; the `FillLedger` keyed by `FillEvent::key()` and bounded by an age and a count from
+    the consumer's configuration, whose replayed fills apply only when absent, newer than the
+    session-start watermark and newer than its retention horizon, and the `AcceptedFill` it
+    hands `Registry::apply_fill`, the one path that moves an order's `cum_fills` and the
+    inventory (filled is `max(cum_venue, cum_fills)`, never their sum); I1 for order updates
+    and I2 property-tested in `tests/lattice.rs`, I1 with fills and I3 in `tests/fills.rs`;
+    the gateway traits
     `OrderGateway` and `ManagedGateway`, moved here from `fbc-core`, whose `submit` takes an
     `Authorization` only `fbc-oms` issues, for one order-affecting command on one market with
     that market's `StateGeneration`, not `Clone` and consumed on submit, and whose
     `submit_control` takes a `ControlCommand` that carries no order-affecting command (0045,
-    compile-fail cases in `tests/ui_authorization/`); still planned: the
-    `FillLedger` and second fill counter, permits, pre-trade caps and `ExecutionPlanner`; 0005,
-    0013), `crates/fbc-journal` (0006; it depends on
+    compile-fail cases in `tests/ui_authorization/`); still planned: permits, pre-trade caps
+    and `ExecutionPlanner`; 0005, 0013), `crates/fbc-journal` (0006; it depends on
     `fbc-core`, and `hmac` and `sha2` for its keyed hashes and `zstd` for its closed segments, only: the records the runtime writes, length-prefixed in a hand-written
     little-endian format with a version, a writer of one subdirectory per UTC day with segments
     named `<shard>-<seq>.fbcj` and time from the caller, rolled at every UTC hour, each closed
