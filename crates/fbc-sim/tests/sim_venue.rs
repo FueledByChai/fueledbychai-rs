@@ -1970,3 +1970,25 @@ fn a_cancel_names_a_venue_id_by_its_exact_spelling() {
     assert_eq!(rejected(&got[1].1), Some(RejectKind::NotFound), "{got:?}");
     assert_eq!(outcome_of(&got[2].1), Some((4, ACCEPTED)), "{got:?}");
 }
+
+#[test]
+fn a_placement_whose_level_would_overflow_its_lots_is_refused() {
+    // Codex r4183438501: the size at a price, the public size, every simulated order resting
+    // there and the new order together, must fit in an i64 of lots; an order that would push
+    // it past is refused rather than leave the venue's own size truncated.
+    let mut v = Venue::new(Bracket::Middle);
+    v.snapshot(T0, &[(199, 6)], &[(201, 5)]);
+    v.send(limit(cid(), Side::Buy, 199, i64::MAX - 10), 1, T0);
+    v.tick(T0 + 5 * MS);
+    let got = v.answers();
+    assert_eq!(outcome_of(&got[0].1), Some((1, ACCEPTED)), "{got:?}");
+    v.send(limit(cid(), Side::Buy, 199, 5), 2, T0 + 6 * MS);
+    v.tick(T0 + 11 * MS);
+    let got = v.answers();
+    assert_eq!(rejected(&got[0].1), Some(RejectKind::InvalidQty), "{got:?}");
+    // Four more fit exactly.
+    v.send(limit(cid(), Side::Buy, 199, 4), 3, T0 + 12 * MS);
+    v.tick(T0 + 17 * MS);
+    let got = v.answers();
+    assert_eq!(outcome_of(&got[0].1), Some((3, ACCEPTED)), "{got:?}");
+}

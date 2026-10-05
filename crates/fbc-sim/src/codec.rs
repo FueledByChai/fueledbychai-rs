@@ -249,7 +249,8 @@ impl ExecCodec for SimCodec {
             }),
             Reply::Fill(fill) => ExecEvent::Fill(FillEvent {
                 // Only what the stood-in venue reports (Codex r4182448147): without fill ids
-                // a fill is keyed by its order and cumulative quantity.
+                // a fill is keyed by its order and cumulative quantity. With them it names both,
+                // which `FillCaps` cannot yet say a venue's fills omit (FBC-2g7).
                 ident: if self.fills.fill_id {
                     FillIdent::Venue {
                         fill: scope.fill_id(&fill.fid)?,
