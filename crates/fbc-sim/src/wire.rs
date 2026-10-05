@@ -18,10 +18,10 @@ use fbc_core::{
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub(crate) struct WireError(pub &'static str);
 
-/// One record: its kind and its fields, in order.
+/// One record: its kind and its fields, in order, each value unescaped.
 struct Record<'a> {
     kind: &'a str,
-    fields: Vec<(&'a str, &'a str)>,
+    fields: Vec<(&'a str, String)>,
 }
 
 impl<'a> Record<'a> {
@@ -29,17 +29,20 @@ impl<'a> Record<'a> {
         let text = core::str::from_utf8(bytes).map_err(|_| WireError("utf-8"))?;
         let mut parts = text.split('|');
         let kind = parts.next().unwrap_or_default();
-        let fields = parts.map(|part| part.split_once('='));
-        let fields = fields.collect::<Option<Vec<_>>>();
-        let fields = fields.ok_or(WireError("field"))?;
+        let mut fields = Vec::new();
+        for part in parts {
+            let (key, value) = part.split_once('=').ok_or(WireError("field"))?;
+            fields.push((key, unescape(value)?));
+        }
         Ok(Record { kind, fields })
     }
 
-    fn opt(&self, key: &str) -> Option<&'a str> {
-        self.fields.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
+    fn opt(&self, key: &str) -> Option<&str> {
+        let found = self.fields.iter().find(|(k, _)| *k == key);
+        found.map(|(_, v)| v.as_str())
     }
 
-    fn str(&self, key: &'static str) -> Result<&'a str, WireError> {
+    fn str(&self, key: &'static str) -> Result<&str, WireError> {
         self.opt(key).ok_or(WireError(key))
     }
 
@@ -83,6 +86,24 @@ impl<'a> Record<'a> {
     }
 }
 
+/// A value as [`Writer::field`] escaped it, read back; refused for an escape it never writes.
+fn unescape(value: &str) -> Result<String, WireError> {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(at) = rest.find('%') {
+        out.push_str(&rest[..at]);
+        out.push(match rest.get(at + 1..at + 3) {
+            Some("25") => '%',
+            Some("7C") => '|',
+            Some("3D") => '=',
+            _ => return Err(WireError("escape")),
+        });
+        rest = &rest[at + 3..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
 /// Builds one record.
 struct Writer(String);
 
@@ -91,9 +112,16 @@ impl Writer {
         Writer(kind.to_owned())
     }
 
+    /// Adds `key=value`, the value escaped (Codex r4182154750): `%`, `|` and `=` are written
+    /// `%25`, `%7C` and `%3D`, so no value can split a record or a field.
     fn field(mut self, key: &str, value: impl Display) -> Writer {
+        let value = value.to_string();
+        let escaped = value
+            .replace('%', "%25")
+            .replace('|', "%7C")
+            .replace('=', "%3D");
         // Writing to a String cannot fail.
-        let _ = write!(self.0, "|{key}={value}");
+        let _ = write!(self.0, "|{key}={escaped}");
         self
     }
 

@@ -24,7 +24,9 @@ SimVenue is two halves joined by a simulated order-entry stream:
   `EncodeCtx` wall and monotonic time; `on_frame` decodes each answer frame into an `Outcome`,
   `OrderUpdate` or `FillEvent` through `DecodeScope` only, so venue ids, fill ids and fees are
   built as a real codec builds them (0004). It refuses what the stood-in venue's `OrderCaps`
-  do not offer.
+  do not offer, and an order combining features they declare in `flag_conflicts`
+  (`NotSent(FlagConflict)`). The frames are text records whose values are escaped, so no
+  value (an asset symbol, a venue id) can split a record.
 - **`SimEngine` is a pure state machine.** It is fed the shard's market-data envelopes in
   ingest order and the codec's frames, holds its own `fbc-book` books built from those
   envelopes (it never reads the runtime's `MdBooks`), one queue model per instrument, and its
@@ -40,13 +42,17 @@ SimVenue is two halves joined by a simulated order-entry stream:
   shows them; immediate-or-cancel, fill-or-kill and market remainders are cancelled unfilled.
   A trade fills resting orders through the queue model as the maker; one without an aggressor
   is classified against the touch and ignored inside the spread. A level that shrinks by more
-  than the trades printed at its price since it last changed is a level cancel.
+  than the trades printed at its price since it last changed is a level cancel, whether a
+  delta or a replacement snapshot shrinks it; each change of the level ends what those trades
+  explain, so none carries to a later change.
 - **Fees.** A fill's fee is the consumer's `FeeBook` rate for the simulated account,
   instrument, public channel and liquidity at the fill's wall time, times its notional
   (`InstrumentSpec::notional`), rounded to the nano, written in the stood-in venue's fee sign
-  so `DecodeScope::fee` reads it back as a cost. A placement that would take a fill without a
-  current rate is refused; a resting order that a trade would fill without one is cancelled
-  by the venue, never filled with an invented fee.
+  so `DecodeScope::fee` reads it back as a cost. A fee that is not a finite number of nanos
+  fitting an `i128` (a NaN or infinite rate, an overflowing product) is no fee. A placement
+  that would take a fill without a fee is refused (a fill-or-kill order that cannot fill whole
+  takes nothing and needs none); a resting order that a trade would fill without one is
+  cancelled by the venue, never filled with an invented fee.
 - **Configuration.** `SimConfig` carries the stood-in venue's `ExecCaps`, the latency, the RPC
   timeout, the stream, the bracket, the account, the fee book, the spec table and each
   instrument's trading book. None of them has a default and no number lives in `fbc-sim`

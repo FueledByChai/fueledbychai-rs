@@ -13,8 +13,8 @@ use fbc_core::{
     AccountKey, AckLevel, AckModel, Aggressor, AmendOrder, AssetSym, BookId, BookSide, Bps,
     CancelOnDisconnect, CancelOrder, CancelReason, Channel, CidMatch, CidMint, ClientIdFormat,
     ClientOrderId, ConnKey, ConnTopology, CtxCall, DecodeError, Effect, Effects, EncodeCtx,
-    Encoding, Envelope, ExecCaps, ExecCodec, ExecEvent, ExecSink, FeeBook, FeeEntry, FeeKey,
-    FeeRate, FeeSource, Feed, FeedHealth, FeedSource, FillCaps, FillSource, FundingCaps,
+    Encoding, Envelope, ExecCaps, ExecCodec, ExecEvent, ExecSink, Feature, FeeBook, FeeEntry,
+    FeeKey, FeeRate, FeeSource, Feed, FeedHealth, FeedSource, FillCaps, FillSource, FundingCaps,
     FundingSpec, HttpFailure, HttpTag, Inbound, InboundSpans, InstrumentId, InstrumentKind,
     InstrumentSpec, ItemRef, Liquidity, Liquidity3, Lots, MatchingCaps, MdCaps, MdEvent, MonoNs,
     Namespace, NamespaceLease, NewOrder, NonceBlock, NonceScope, NotSentReason, OpKind, OrderCaps,
@@ -1437,4 +1437,226 @@ fn the_codec_refuses_answers_it_cannot_read_and_does_nothing_else() {
         outcome: SubmitOutcome::Unknown,
     };
     assert_eq!(sink.0, [(VenueMeta::NONE, unknown)]);
+}
+
+#[test]
+fn the_codec_refuses_an_order_combining_features_the_venue_refuses_together() {
+    // Codex r4182154713: a declared flag conflict is refused before anything is sent.
+    let mut conflicted = config(Bracket::Middle, VenueFeeSign::PositiveIsCost, fees());
+    conflicted.exec.order.flag_conflicts = vec![
+        (Feature::PostOnly, Feature::ReduceOnly),
+        (Feature::Ioc, Feature::ReduceOnly),
+        (Feature::Fok, Feature::PostOnly),
+        (Feature::Rpi, Feature::PostOnly),
+    ];
+    let mut v = Venue::with(conflicted);
+    let with = |tif, post_only, reduce_only| {
+        let mut cmd = place(
+            cid(),
+            Side::Buy,
+            OrderKind::Limit { px: Ticks(1) },
+            1,
+            tif,
+            post_only,
+        );
+        if let VenueCommand::Place(o) = &mut cmd {
+            o.reduce_only = reduce_only;
+        }
+        cmd
+    };
+    for cmd in [
+        with(TifTag::Gtc, true, true),
+        with(TifTag::Ioc, false, true),
+        with(TifTag::Fok, true, false),
+    ] {
+        assert_eq!(
+            v.encode(&cmd, 1, T0).unwrap_err(),
+            NotSentReason::FlagConflict,
+            "{cmd:?}"
+        );
+    }
+    // Each feature alone, or a pair the venue does not refuse, is sent.
+    for cmd in [
+        with(TifTag::Gtc, true, false),
+        with(TifTag::Gtc, false, true),
+        with(TifTag::Fok, false, true),
+    ] {
+        assert!(v.encode(&cmd, 1, T0).is_ok(), "{cmd:?}");
+    }
+}
+
+#[test]
+fn a_snapshot_that_replaces_the_book_advances_queues_by_its_shrinks() {
+    // Codex r4182154723: a level that a replacement snapshot shows smaller, with no trade at
+    // it, is a level cancel, as a delta's shrink is.
+    let mut filled = Vec::new();
+    for bracket in [Bracket::Pessimistic, Bracket::Optimistic] {
+        let mut v = Venue::new(bracket);
+        v.snapshot(T0, &[(199, 6)], &[(201, 5)]);
+        v.send(limit(cid(), Side::Buy, 199, 2), 1, T0);
+        // An offer whose level the snapshot leaves as it was.
+        v.send(limit(cid(), Side::Sell, 201, 1), 2, T0);
+        v.tick(T0 + 5 * MS);
+        assert_eq!(v.answers().len(), 4);
+        // A print inside the spread, which no resting order meets; the snapshot ends what it
+        // explains.
+        v.trade(T0 + 5 * MS, Aggressor::Buyer, 200, 1);
+        v.md(
+            T0 + 6 * MS,
+            MdEvent::BookSnapshotBegin {
+                inst: INST,
+                book: BOOK,
+                epoch: 2,
+            },
+        )
+        .unwrap();
+        v.level(T0 + 6 * MS, BookSide::Bid, 199, 3);
+        v.level(T0 + 6 * MS, BookSide::Ask, 201, 5);
+        v.md(
+            T0 + 6 * MS,
+            MdEvent::BookSnapshotEnd {
+                inst: INST,
+                book: BOOK,
+            },
+        )
+        .unwrap();
+        v.trade(T0 + 7 * MS, Aggressor::Seller, 199, 4);
+        filled.push(
+            v.answers()
+                .iter()
+                .filter_map(|(_, ev)| fill_of(ev))
+                .map(|f| f.1)
+                .sum::<i64>(),
+        );
+    }
+    assert_eq!(filled, [0, 1]);
+}
+
+#[test]
+fn trades_explain_only_the_next_change_of_their_level() {
+    // Codex r4182154731: a trade larger than the shrink that follows it explains that shrink
+    // only; a later shrink is a cancel.
+    let mut v = Venue::new(Bracket::Optimistic);
+    v.snapshot(T0, &[(199, 6)], &[(201, 5)]);
+    v.send(limit(cid(), Side::Buy, 199, 2), 1, T0);
+    v.tick(T0 + 5 * MS);
+    assert_eq!(v.answers().len(), 2);
+    // Five traded, consuming five of the six ahead; the level's next change shows two of them
+    // gone, and the other three traded lots explain nothing after it.
+    v.trade(T0 + 6 * MS, Aggressor::Seller, 199, 5);
+    v.level(T0 + 7 * MS, BookSide::Bid, 199, 4);
+    // Then the last lot ahead is cancelled: the order is at the front.
+    v.level(T0 + 8 * MS, BookSide::Bid, 199, 1);
+    v.trade(T0 + 9 * MS, Aggressor::Seller, 199, 1);
+    let got = v.answers();
+    assert_eq!(
+        got.iter()
+            .filter_map(|(_, ev)| fill_of(ev))
+            .map(|f| f.1)
+            .sum::<i64>(),
+        1
+    );
+}
+
+#[test]
+fn a_fill_or_kill_that_cannot_fill_needs_no_fee() {
+    // Codex r4182154743: an underfilled fill-or-kill order takes nothing, so a missing taker
+    // rate does not refuse it.
+    let mut makers_only = FeeBook::new();
+    let (key, entry) = rate(INST, Liquidity::Maker, MAKER_BPS, FeeSource::ConfigOverride);
+    makers_only.insert(key, entry);
+    let mut v = Venue::with(config(
+        Bracket::Optimistic,
+        VenueFeeSign::PositiveIsCost,
+        makers_only,
+    ));
+    v.snapshot(T0, &[(199, 1)], &[(201, 2)]);
+    v.send(
+        place(
+            cid(),
+            Side::Buy,
+            OrderKind::Limit { px: Ticks(201) },
+            5,
+            TifTag::Fok,
+            false,
+        ),
+        1,
+        T0,
+    );
+    v.tick(T0 + 5 * MS);
+    let got = v.answers();
+    assert_eq!(outcome_of(&got[0].1), Some((1, ACCEPTED)));
+    assert_eq!(
+        state_of(&got[1].1),
+        Some((VenueOrderState::Canceled(CancelReason::Unfilled), 0))
+    );
+}
+
+#[test]
+fn a_fee_that_is_not_a_finite_number_of_nanos_is_never_invented() {
+    // Codex r4182154747: a rate whose fee is not finite, or does not fit an i128, refuses the
+    // fill rather than saturate or read NaN as zero.
+    for bps in [f64::NAN, f64::INFINITY, 1e40] {
+        let mut book = FeeBook::new();
+        for liquidity in [Liquidity::Maker, Liquidity::Taker] {
+            let (key, entry) = rate(INST, liquidity, bps, FeeSource::ConfigOverride);
+            book.insert(key, entry);
+        }
+        let mut v = Venue::with(config(
+            Bracket::Optimistic,
+            VenueFeeSign::PositiveIsCost,
+            book,
+        ));
+        v.snapshot(T0, &[(198, 1)], &[(201, 2)]);
+        v.send(
+            place(cid(), Side::Buy, OrderKind::Market, 1, TifTag::Ioc, false),
+            1,
+            T0,
+        );
+        v.send(limit(cid(), Side::Buy, 199, 1), 2, T0);
+        v.tick(T0 + 5 * MS);
+        let got = v.answers();
+        assert_eq!(rejected(&got[0].1), Some(RejectKind::Other), "{bps}");
+        v.trade(T0 + 6 * MS, Aggressor::Seller, 199, 1);
+        let got = v.answers();
+        assert_eq!(
+            state_of(&got[0].1),
+            Some((VenueOrderState::Canceled(CancelReason::Venue), 0)),
+            "{bps}"
+        );
+    }
+}
+
+#[test]
+fn an_asset_symbol_with_the_frames_delimiters_survives_the_wire() {
+    // Codex r4182154750: field values are escaped, so a symbol holding `|`, `=` or `%` reads
+    // back whole.
+    let odd = AssetSym::new("U|S=D%").unwrap();
+    let mut cfg = config(Bracket::Optimistic, VenueFeeSign::PositiveIsCost, fees());
+    let mut table = SpecTable::new();
+    table.insert(InstrumentSpec {
+        quote_ccy: odd,
+        settle_ccy: odd,
+        ..spec(INST, "SIM-PERP")
+    });
+    cfg.specs = table;
+    let mut v = Venue::with(cfg);
+    v.snapshot(T0, &[(198, 1)], &[(201, 2)]);
+    v.send(
+        place(cid(), Side::Buy, OrderKind::Market, 1, TifTag::Ioc, false),
+        1,
+        T0,
+    );
+    v.tick(T0 + 5 * MS);
+    let got = v.answers();
+    let ExecEvent::Fill(f) = &got[1].1 else {
+        panic!("{got:?}")
+    };
+    assert_eq!(f.fee.cost().asset, odd);
+    // A broken escape is malformed.
+    let bad = "fill|seq=1|fid=F1|cid=c|vid=S1|inst=1|side=S|px=1|qty=1|cum=1|liq=M|fee=0|asset=U%7";
+    assert_eq!(
+        v.decode(bad.as_bytes()),
+        Err(DecodeError::Malformed("escape"))
+    );
 }

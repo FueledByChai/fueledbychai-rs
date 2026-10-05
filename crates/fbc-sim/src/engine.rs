@@ -4,7 +4,7 @@
 
 use core::fmt;
 use core::time::Duration;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use fbc_book::{BookError, Books, L2Book};
 use fbc_core::{
@@ -89,11 +89,13 @@ struct At {
 ///   maker. A trade the venue gives no aggressor for is classified against the touch (at or
 ///   above the offer a buy, at or below the bid a sell), and ignored inside the spread.
 /// - A trading book's level that shrinks by more than the trades at its price since it last
-///   changed is a level cancel for the queue model.
+///   changed is a level cancel for the queue model, whether a delta or a replacement snapshot
+///   shrinks it; each change ends what those trades explain.
 /// - Every fill's fee is the fee book's rate for the account, instrument, public channel and
 ///   liquidity at the fill's wall time, times its notional, rounded to the nano, written in the
 ///   stood-in venue's fee sign so the codec's [`DecodeScope`](fbc_core::DecodeScope) reads it
-///   back as a cost (0004). A place that would take a fill without a rate is refused
+///   back as a cost (0004); a fee that is not a finite number of nanos fitting an `i128` is no
+///   fee. A place that would take a fill without one is refused
 ///   (`no_fee`); a resting order a trade would fill without a rate is cancelled by the venue
 ///   instead.
 #[derive(Clone, Debug)]
@@ -188,6 +190,9 @@ impl SimEngine {
             } if self.trading.get(&inst) == Some(&book) => {
                 self.level(&env.body, inst, side, px, qty)
             }
+            MdEvent::BookSnapshotEnd { inst, book } if self.trading.get(&inst) == Some(&book) => {
+                self.snapshot_end(&env.body, inst)
+            }
             ref body => self.books.apply(body).map(drop).map_err(SimError::Book),
         }
     }
@@ -244,7 +249,11 @@ impl SimEngine {
         let rate = self.fees.rate(&key, wall)?.0.0;
         let notional = self.specs.get(inst)?.notional(px, qty)?;
         // A model's f64 (0004): the rate is in basis points of the notional.
-        let cost = (notional.nanos as f64 * rate / 10_000.0).round() as i128;
+        let cost = (notional.nanos as f64 * rate / 10_000.0).round();
+        // Never a saturated or NaN-as-zero fee (Codex r4182154747): it must be a finite number
+        // of nanos that fits an i128 (2^127 is the first value past it).
+        let fits = cost.is_finite() && cost >= i128::MIN as f64 && cost < i128::MAX as f64;
+        let cost = fits.then_some(cost as i128)?;
         let raw = match self.fee_sign {
             VenueFeeSign::PositiveIsCost => Some(cost),
             VenueFeeSign::PositiveIsRebate => cost.checked_neg(),
@@ -297,7 +306,7 @@ impl SimEngine {
         if p.post_only && opposite.first().is_some_and(|l| within(&l)) {
             return Err(Refusal::PostOnlyWouldCross);
         }
-        let mut takes = Vec::new();
+        let mut crossed = Vec::new();
         let mut left = p.qty;
         for lvl in opposite.iter().filter(within) {
             let qty = lvl.qty.min(left);
@@ -305,12 +314,18 @@ impl SimEngine {
                 break;
             }
             left = left.checked_sub(qty).unwrap_or(Lots::ZERO);
-            let fee = self.fee(p.inst, Liquidity::Taker, lvl.px, qty, at.wall);
-            takes.push((lvl.px, qty, fee.ok_or(Refusal::NoFee)?));
+            crossed.push((lvl.px, qty));
         }
+        // A fill-or-kill order that cannot fill whole takes nothing, so it needs no fee
+        // (Codex r4182154743): fees are looked up only for the fills that will happen.
         if p.tif == TifTag::Fok && left > Lots::ZERO {
-            takes.clear();
+            crossed.clear();
             left = p.qty;
+        }
+        let mut takes = Vec::new();
+        for (px, qty) in crossed {
+            let fee = self.fee(p.inst, Liquidity::Taker, px, qty, at.wall);
+            takes.push((px, qty, fee.ok_or(Refusal::NoFee)?));
         }
         let rests = match p.px {
             Some(px) if p.tif == TifTag::Gtc && left > Lots::ZERO => {
@@ -484,21 +499,57 @@ impl SimEngine {
             .filter(|b| b.snapshot_in_progress().is_none())
             .and_then(|b| b.level(side, px).ok().flatten());
         self.books.apply(ev).map_err(SimError::Book)?;
-        let Some(before) = before else {
-            return Ok(());
-        };
-        let key = (inst, side == BookSide::Bid, px);
-        let Some(shrunk) = before.checked_sub(qty) else {
-            // The level grew: trades at it no longer explain a later shrink.
-            self.traded.remove(&key);
-            return Ok(());
-        };
-        let traded = self.traded.remove(&key).unwrap_or(Lots::ZERO);
-        let explained = traded.min(shrunk);
-        if let Some(rest) = traded.checked_sub(explained).filter(|r| *r > Lots::ZERO) {
-            self.traded.insert(key, rest);
+        match before {
+            Some(before) => self.level_changed(inst, side, px, before, qty),
+            None => Ok(()),
         }
-        let cancelled = shrunk.checked_sub(explained).unwrap_or(Lots::ZERO);
+    }
+
+    /// A replacement snapshot of `inst`'s trading book completed: each level a resting order
+    /// sits at changed from its size in the book replaced to its size in the snapshot, as a
+    /// delta would have changed it (Codex r4182154723), and the trades printed before it
+    /// explain no later change.
+    fn snapshot_end(&mut self, ev: &MdEvent, inst: InstrumentId) -> Result<(), SimError> {
+        let held: BTreeSet<(bool, Ticks)> = self
+            .live
+            .values()
+            .filter(|o| o.inst == inst)
+            .map(|o| (o.side == Side::Buy, o.px))
+            .collect();
+        let side = |bid| if bid { BookSide::Bid } else { BookSide::Ask };
+        let size = |engine: &SimEngine, bid, px| {
+            let book = engine.trading_book(inst);
+            book.and_then(|b| b.level(side(bid), px).ok().flatten())
+        };
+        let before: Vec<_> = held.iter().map(|&(bid, px)| size(self, bid, px)).collect();
+        self.books.apply(ev).map_err(SimError::Book)?;
+        let mut changed = Ok(());
+        for (&(bid, px), before) in held.iter().zip(before) {
+            if let (Some(before), Some(after)) = (before, size(self, bid, px)) {
+                changed = changed.and(self.level_changed(inst, side(bid), px, before, after));
+            }
+        }
+        self.traded.retain(|key, _| key.0 != inst);
+        changed
+    }
+
+    /// The trading book's level at `side` and `px` changed from `before` to `after`. The
+    /// trades printed at it since its last change explain a shrink up to their size, and the
+    /// rest of the shrink is a level cancel; the change ends what those trades explain, so
+    /// none is carried to a later change (Codex r4182154731).
+    fn level_changed(
+        &mut self,
+        inst: InstrumentId,
+        side: BookSide,
+        px: Ticks,
+        before: Lots,
+        after: Lots,
+    ) -> Result<(), SimError> {
+        let traded = self.traded.remove(&(inst, side == BookSide::Bid, px));
+        let shrunk = before.checked_sub(after).unwrap_or(Lots::ZERO);
+        let cancelled = shrunk
+            .checked_sub(traded.unwrap_or(Lots::ZERO))
+            .unwrap_or(Lots::ZERO);
         let level_before = before
             .checked_add(self.own(inst, side, px))
             .unwrap_or(before);
