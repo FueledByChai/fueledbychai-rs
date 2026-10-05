@@ -1,0 +1,5 @@
+error[E0616]: field `cmd` of struct `Authorization` is private
+ --> tests/ui_authorization/batch_item_replaced.rs:6:10
+  |
+6 |     auth.cmd = VenueCommand::PlaceBatch(vec![extra]);
+  |          ^^^ private field

@@ -1,5 +1,6 @@
 //! Order truth (decision 0005): the monotone order lattice every later part of the OMS builds
-//! on, each command item's outcome, and the registry of orders by client id.
+//! on, each command item's outcome, the registry of orders by client id, and the one way order
+//! entry reaches a gateway.
 //!
 //! An [`OrderRecord`] holds one of our orders. Its [`OrdState`]s are ranked: PendingNew and
 //! Unknown (0), Open (1), PartiallyFilled (2), Terminal (3), and a terminal state is absorbing.
@@ -18,12 +19,31 @@
 //! Decision 0005's I1 (for order updates) and I2 are property-tested in `tests/lattice.rs`
 //! (decision 0037).
 //!
+//! Order entry reaches a venue only through this crate (0013 rule 2, decision 0045): the
+//! gateway traits, [`OrderGateway`] and [`ManagedGateway`], live here, and
+//! [`OrderGateway::submit`] takes an [`Authorization`], which only this crate issues, for one
+//! order-affecting command (a place, an amend, a batch, a cancel, a cancel-many or an
+//! instrument cancel-all) on one market, carrying that market's [`StateGeneration`]. It cannot
+//! be cloned or edited, and submitting consumes it (`tests/compile_fail.rs`). A command that
+//! affects no order goes through [`OrderGateway::submit_control`] as a [`ControlCommand`].
+//!
 //! Not here yet: fills, the `FillLedger` and the second fill counter (FBC-sq9), permits
-//! (FBC-lrc), the pre-trade caps (FBC-2e4) and the Unknown ladder.
+//! (FBC-lrc), the pre-trade caps (FBC-2e4), the market states (FBC-c4v), issuing an
+//! authorization after them and its check at submit (FBC-afd), and the Unknown ladder.
 
+mod authorize;
+mod gateway;
 mod record;
 mod registry;
 
+/// The helpers the integration tests share, once for the unit tests too: one namespace lease
+/// per test binary.
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod common;
+
+pub use authorize::{Authorization, StateGeneration};
+pub use gateway::{ControlCommand, ManagedGateway, OrderGateway};
 pub use record::{
     Applied, Intent, OrdState, OrderKey, OrderOp, OrderRecord, OutcomeApplied, TerminalKind,
 };

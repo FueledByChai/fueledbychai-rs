@@ -1,0 +1,11 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+ --> tests/ui_authorization/generation_forged.rs:6:5
+  |
+6 |     StateGeneration(u64::MAX)
+  |     ^^^^^^^^^^^^^^^
+  |
+note: constructor is not visible here due to private fields
+ --> src/authorize.rs
+  |
+  | pub struct StateGeneration(u64);
+  |                            ^^^ private field

@@ -1,0 +1,7 @@
+error[E0277]: the trait bound `Authorization: From<VenueCommand>` is not satisfied
+ --> tests/ui_authorization/cancel_from_command.rs:6:34
+  |
+6 |     VenueCommand::Cancel(cancel).into()
+  |                                  ^^^^ the trait `From<VenueCommand>` is not implemented for `Authorization`
+  |
+  = note: required for `VenueCommand` to implement `Into<Authorization>`

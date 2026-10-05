@@ -13,10 +13,9 @@
 //! them, and [`VenueFactory::test_connection`] proves them with an [`HttpPlan`] whose result is
 //! an [`AccountSummary`] (decision 0043).
 //!
-//! [`OrderGateway`] is what submits commands: the live gateway (runtime, exec codec and
-//! signer), the simulated venue, and a [`ManagedGateway`] for a venue reachable only through a
-//! vendor SDK that owns its own socket (journaled at the event level; using one needs a
-//! decision record first, 0002).
+//! What submits commands, the gateway traits, lives in `fbc-oms` (decision 0045): an
+//! order-affecting command reaches a gateway only with an authorization `fbc-oms` issues, and
+//! this crate cannot name that type. [`SubmitHandle`], what a submit gives back, stays here.
 
 use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};
@@ -24,15 +23,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::auth::Secrets;
 use crate::caps::VenueCaps;
 use crate::codec::{
-    DecodeError, Effect, Effects, EncodeCtx, EncodeReceipt, ExecCodec, HttpFailure, HttpResponse,
-    HttpTag, MdCodec, SpecTable, Subscription, WireUrl,
+    DecodeError, Effect, Effects, EncodeReceipt, ExecCodec, HttpFailure, HttpResponse, HttpTag,
+    MdCodec, SpecTable, Subscription, WireUrl,
 };
-use crate::command::{NotSentReason, VenueCommand};
+use crate::command::NotSentReason;
 use crate::event::{RpcId, StreamId};
-use crate::ids::{AccountKey, IdError, InstrumentId};
+use crate::ids::{IdError, InstrumentId};
 use crate::resolve::{AssetKey, InstrumentSpecDraft, SymbolError};
 use crate::scope::DecodeScope;
-use crate::stamps::PathStamps;
 use crate::units::Money;
 
 /// Where a configuration key lives.
@@ -471,32 +469,6 @@ pub struct SubmitHandle {
     pub rpc: RpcId,
     pub receipt: Result<EncodeReceipt, NotSentReason>,
 }
-
-/// Submits commands for accounts: the live gateway, the simulated venue, a managed gateway.
-///
-/// Every order command reaches a gateway only through `fbc-oms`, after its caps and the kill
-/// switch (0013 rule 2, 0012). Nothing implements this trait yet; FBC-ob2 makes that path the
-/// only one (an OMS-issued authorization, or a gateway built only inside `fbc-oms`) before a
-/// live gateway exists.
-///
-/// `t` carries the command's path marks (0034): a live gateway marks
-/// [`PathStage::Encode`](crate::PathStage::Encode) around its call to [`ExecCodec::encode`],
-/// which it hands `t` to mark its signer calls, and its runtime marks
-/// [`PathStage::Write`](crate::PathStage::Write) around the socket write.
-pub trait OrderGateway {
-    fn submit(
-        &mut self,
-        acct: AccountKey,
-        cmd: VenueCommand,
-        ctx: &EncodeCtx,
-        t: &mut PathStamps<'_>,
-    ) -> SubmitHandle;
-}
-
-/// A gateway for a venue reachable only through a vendor SDK that owns its own socket. It emits
-/// the same execution events and is journaled at the event level, so its replay is event-level,
-/// not frame-level. Using one needs its own decision record first (0002).
-pub trait ManagedGateway: OrderGateway + Send {}
 
 #[cfg(test)]
 mod tests {

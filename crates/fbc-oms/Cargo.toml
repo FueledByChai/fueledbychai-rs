@@ -1,6 +1,6 @@
 [package]
 name = "fbc-oms"
-description = "Order truth: the monotone order lattice, each command item's outcome, and the registry of orders by client id."
+description = "Order truth: the monotone order lattice, each command item's outcome, the registry of orders by client id, and the gateway traits order entry reaches a venue through, with the authorization only fbc-oms issues."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,3 +13,4 @@ fbc-core = { path = "../fbc-core" }
 
 [dev-dependencies]
 proptest.workspace = true
+trybuild.workspace = true
