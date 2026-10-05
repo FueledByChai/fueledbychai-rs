@@ -34,9 +34,10 @@ keepalives (FBC-bnl) and journaling (FBC-2pr) come later and are not decided her
   `NonceSource` (calling it not at all for none), and calls `on_open` with an `EncodeCtx`
   holding them and the shard clock's wall and monotonic time (0014 item 1). A source that
   reserves another count ends the session with `ExecSessionError::Nonces`: a nonce the codec
-  did not ask for would sign nothing it can account for. A session that ends in an error
-  retires the epoch it was in, so running it again stamps the next connection under the next
-  epoch.
+  did not ask for would sign nothing it can account for. A run that ends in an error, or
+  whose future is dropped while connected, leaves the session able to run again: the epoch it
+  was in is retired (the handler told it ended, the next connection stamped under the next
+  epoch) and the next attempt waits the pacing's floor, as after a drop.
 - **A stop ends the epoch at once.** Dropping the `ExecControl` stops the session, and the
   epoch ends there, even inside the handler: every event the codec pushes after it (the rest of
   a resync pushed whole, say) is of an ended epoch, dropped and counted
@@ -53,7 +54,8 @@ keepalives (FBC-bnl) and journaling (FBC-2pr) come later and are not decided her
   written: buckets that refuse it for now end the epoch as a drop, so `on_open` (which may have
   changed the codec's state, as an authentication asked for) runs again on the next epoch
   rather than the codec believe it sent what it never did; frames that can never fit together
-  end the session (`ExecSessionError::OpenNeverFits`). A frame or
+  end the session (`ExecSessionError::OpenNeverFits`). Nothing behind a reconnect of the
+  session's stream is charged, since it is never reached. A frame or
   reconnect for another stream is a codec defect, refused and counted, and so, until FBC-bnl,
   is every `Timer` and `Http` effect: none reaches the core.
 - **One connection.** A session drives exactly one planned order-entry connection. A plan of
@@ -79,6 +81,10 @@ keepalives (FBC-bnl) and journaling (FBC-2pr) come later and are not decided her
   namespace and a limiter shared with whatever counts against the same limits.
 - An event pushed after the consumer's stop is lost to it; whatever it said is read again by
   the next session's resync (0013).
+- The session does not call the codec's `resync`: running it once per epoch after
+  authentication, before any place or amend, is FBC-w19's.
+- A stop is checked before each effect; one that arrives from another thread while a write is
+  already under way cannot unsend what the socket took, and is seen before the next effect.
 - Until FBC-bnl, a codec that needs a timer or an HTTP request (a token refresh, a dead-man
   refresh) cannot run on this session; until FBC-0ga, nothing is submitted.
 
