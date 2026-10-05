@@ -6,13 +6,14 @@
 //! of [`ClientOrderId`]s, and it takes the lease by value, so minting without a held lease
 //! does not compile and the lease stays held for as long as the mint lives. The lease prevents
 //! client-id collisions between processes; it does not by itself stop two quoters on one
-//! market (that is the market lease, decision 0010).
+//! market (that is the [`MarketLease`](crate::MarketLease), decision 0013).
 
 use core::fmt;
-use std::fs::{File, TryLockError};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use crate::ids::{AccountKey, ClientOrderId, IdError, Namespace};
+use crate::lease::try_lock;
 use crate::time::WallNs;
 
 /// An exclusive lock on one (account, namespace) pair, held until it is dropped.
@@ -41,18 +42,7 @@ impl NamespaceLease {
         ns: Namespace,
     ) -> Result<NamespaceLease, LeaseError> {
         let path = dir.join(format!("account-{}-ns-{}.lock", account.get(), ns.get()));
-        let locked = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .and_then(|file| match file.try_lock() {
-                Ok(()) => Ok(Some(file)),
-                Err(TryLockError::WouldBlock) => Ok(None),
-                Err(TryLockError::Error(source)) => Err(source),
-            });
-        match locked {
+        match try_lock(&path) {
             Ok(Some(file)) => Ok(NamespaceLease {
                 account,
                 ns,
