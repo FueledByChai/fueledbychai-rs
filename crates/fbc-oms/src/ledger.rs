@@ -12,8 +12,9 @@
 //!
 //! A fill applies only through the [`AcceptedFill`] the ledger hands back, which
 //! [`Registry::apply_fill`](crate::Registry::apply_fill) consumes: no other path moves an
-//! order's fill count or the inventory. The ledger records the fill only when the registry
-//! applies it, so a fill the registry refuses is tried again when it is delivered again. The
+//! order's fill count or the inventory. The ledger records a fill only when the registry
+//! counts it, so a fill the registry refuses or only flags is routed again when it is
+//! delivered again, and never moves the retention horizon. The
 //! accepted fill borrows the ledger until it is applied or dropped, the ledger cannot be
 //! cloned, and a registry takes fills from one ledger only, so no fill is accepted twice.
 

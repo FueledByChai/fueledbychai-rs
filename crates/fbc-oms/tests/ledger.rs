@@ -4,12 +4,13 @@
 
 mod common;
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use common::{cid, fill, ident, lots, placement, update};
 use fbc_core::{
-    AckLevel, CidMatch, ExchNs, ExchTsKind, FillEvent, FillIdent, InstrumentId, ItemRef, Lots,
-    MonoNs, Namespace, Side, SignedLots, SubmitOutcome, VenueOrderState, WallNs,
+    AckLevel, CidMatch, ClientOrderId, ExchNs, ExchTsKind, FillEvent, FillIdent, InstrumentId,
+    ItemRef, Lots, MonoNs, Namespace, Side, SignedLots, SubmitOutcome, VenueOrderState, WallNs,
 };
 use fbc_oms::{
     AcceptedFill, Admission, FillApplied, FillLedger, FillRouted, FillTime, Horizon, LedgerConfig,
@@ -43,9 +44,16 @@ fn timed(exch: i64, kind: ExchTsKind) -> Option<FillTime> {
     })
 }
 
-/// A live (`replay` false) or replayed buy of `qty` named by fill id `fid`, with no client id.
+/// A client id of our namespace under which no test registers an order.
+fn stray() -> ClientOrderId {
+    static STRAY: OnceLock<ClientOrderId> = OnceLock::new();
+    *STRAY.get_or_init(cid)
+}
+
+/// A live (`replay` false) or replayed buy of `qty` named by fill id `fid`, for our namespace's
+/// client id of an order the registry does not hold: counted in the inventory only.
 fn untracked(fid: &str, qty: i64, replay: bool) -> FillEvent {
-    fill(None, ident(fid), Side::Buy, qty, replay)
+    fill(Some(stray()), ident(fid), Side::Buy, qty, replay)
 }
 
 fn accepted<'l, 'f>(admission: Admission<'l, 'f>) -> AcceptedFill<'l, 'f> {
@@ -104,7 +112,7 @@ fn a_fill_delivered_twice_moves_inventory_once() {
     let a = accepted(l.admit(&f, engine(1_100), MonoNs(0)));
     assert_eq!(a.fill(), &f);
     assert!(format!("{a:?}").contains("AcceptedFill"));
-    assert_eq!(reg.apply_fill(a), Ok(FillRouted::Untracked));
+    assert_eq!(reg.apply_fill(a), Ok(FillRouted::OursUntracked(stray())));
     assert!(l.contains(&f.key()));
     assert_eq!(l.len(), 1);
     assert!(matches!(
@@ -130,7 +138,7 @@ fn a_fill_without_a_fill_id_is_keyed_by_its_order_and_cumulative_quantity() {
             vid: common::vid("v9"),
             cum_after: lots(cum),
         };
-        fill(None, id, Side::Sell, qty, false)
+        fill(Some(stray()), id, Side::Sell, qty, false)
     };
     reg.apply_fill(accepted(l.admit(&derived(2, 2), None, MonoNs(0))))
         .unwrap();
@@ -502,7 +510,7 @@ fn a_fill_naming_only_the_venue_id_reaches_its_order_and_teaches_the_id() {
 }
 
 #[test]
-fn foreign_and_non_canonical_fills_are_flagged_and_not_counted() {
+fn foreign_non_canonical_and_unattributed_fills_are_flagged_not_counted_and_not_kept() {
     let (mut l, mut reg) = session();
     let mut foreign = untracked("f1", 5, false);
     foreign.cid = Some(CidMatch::Foreign(Namespace::new(9)));
@@ -516,15 +524,119 @@ fn foreign_and_non_canonical_fills_are_flagged_and_not_counted() {
         reg.apply_fill(accepted(l.admit(&other, None, MonoNs(0)))),
         Ok(FillRouted::NotCanonical)
     );
+    // No client id, and a venue id that names no order the registry holds: another
+    // namespace's order on a venue that echoes no client id would look the same.
+    let anonymous = FillIdent::Venue {
+        fill: common::fill_id("f3"),
+        vid: Some(common::vid("v-unknown")),
+        cum_after: None,
+    };
+    let unattributed = fill(None, anonymous, Side::Buy, 5, false);
+    assert_eq!(
+        reg.apply_fill(accepted(l.admit(&unattributed, None, MonoNs(0)))),
+        Ok(FillRouted::Unattributed)
+    );
     assert_eq!(reg.inventory(INST), SignedLots(0));
-    // Ours, but for an order the registry does not hold: the account's position moved.
-    let mut orphan = untracked("f3", 2, false);
-    orphan.cid = Some(CidMatch::Ours(cid()));
+    // None of them is kept: delivered again, each is flagged again.
+    assert!(l.is_empty());
+    assert!(matches!(
+        l.admit(&unattributed, None, MonoNs(1)),
+        Admission::Apply(_)
+    ));
+    // Ours, but for an order the registry does not hold: our namespace's position moved.
+    let orphan = untracked("f4", 2, false);
     assert_eq!(
         reg.apply_fill(accepted(l.admit(&orphan, None, MonoNs(0)))),
-        Ok(FillRouted::Untracked)
+        Ok(FillRouted::OursUntracked(stray()))
     );
     assert_eq!(reg.inventory(INST), SignedLots(2));
+}
+
+#[test]
+fn an_unattributed_fill_counts_once_its_order_is_known() {
+    let (mut l, mut reg) = session();
+    let c = cid();
+    reg.insert(placement(c, 100, 10)).unwrap();
+    let anonymous = FillIdent::Venue {
+        fill: common::fill_id("f1"),
+        vid: Some(common::vid("v5")),
+        cum_after: None,
+    };
+    let early = fill(None, anonymous, Side::Buy, 3, false);
+    assert_eq!(
+        reg.apply_fill(accepted(l.admit(&early, None, MonoNs(0)))),
+        Ok(FillRouted::Unattributed)
+    );
+    let item = ItemRef {
+        idx: 0,
+        cid: Some(c),
+        vid: Some(common::vid("v5")),
+    };
+    let ack = SubmitOutcome::Accepted {
+        ack: AckLevel::Final,
+    };
+    reg.on_outcome(c, OrderOp::Place, &item, &ack, MonoNs(1))
+        .unwrap();
+    // Delivered again (a replay after a reconnect, say), it now reaches its order.
+    let mut again = early.clone();
+    again.replay = true;
+    assert_eq!(
+        reg.apply_fill(accepted(l.admit(&again, engine(1_100), MonoNs(2)))),
+        Ok(FillRouted::Ours(c, FillApplied::Live))
+    );
+    assert_eq!(reg.get(c).unwrap().cum_fills(), lots(3));
+    assert_eq!(reg.inventory(INST), SignedLots(3));
+}
+
+#[test]
+fn flagged_fills_never_move_the_horizon() {
+    let mut l = ledger(1, 1_000);
+    let mut reg = Registry::new();
+    // A foreign fill with no usable time, then one of ours: nothing ours was forgotten.
+    let mut foreign = untracked("f1", 5, false);
+    foreign.cid = Some(CidMatch::Foreign(Namespace::new(9)));
+    reg.apply_fill(accepted(l.admit(&foreign, None, MonoNs(0))))
+        .unwrap();
+    reg.apply_fill(accepted(l.admit(
+        &untracked("f2", 1, false),
+        engine(1_100),
+        MonoNs(1),
+    )))
+    .unwrap();
+    assert_eq!(l.horizon(), Horizon::Full);
+    // An absent replay of ours newer than the watermark still applies.
+    assert_eq!(
+        reg.apply_fill(accepted(l.admit(
+            &untracked("f3", 2, true),
+            engine(1_050),
+            MonoNs(2)
+        ),)),
+        Ok(FillRouted::OursUntracked(stray()))
+    );
+    assert_eq!(reg.inventory(INST), SignedLots(3));
+}
+
+#[test]
+fn a_fills_cumulative_quantity_raises_the_venues_count() {
+    let (mut l, mut reg) = session();
+    let c = cid();
+    reg.insert(placement(c, 100, 12)).unwrap();
+    reg.apply_update(&update(Some(c), VenueOrderState::Open, 6), key(1));
+    let named = FillIdent::Venue {
+        fill: common::fill_id("f1"),
+        vid: None,
+        cum_after: Some(lots(10)),
+    };
+    let f = fill(Some(c), named, Side::Buy, 4, false);
+    reg.apply_fill(accepted(l.admit(&f, None, MonoNs(0))))
+        .unwrap();
+    let rec = reg.get(c).unwrap();
+    assert_eq!(rec.cum_venue(), lots(10));
+    assert_eq!(rec.cum_fills(), lots(4));
+    assert_eq!(rec.filled(), lots(10));
+    assert_eq!(rec.resting(), lots(2));
+    // The inventory moves by the fill's own quantity only.
+    assert_eq!(reg.inventory(INST), SignedLots(4));
 }
 
 #[test]
@@ -556,12 +668,12 @@ fn a_fill_that_would_overflow_counts_nothing() {
     );
     assert_eq!(reg.inventory(INST), SignedLots(i64::MAX));
     // Once a sell makes room, the redelivered fill applies, once.
-    let sell = fill(None, ident("u2"), Side::Sell, 5, false);
+    let sell = fill(Some(stray()), ident("u2"), Side::Sell, 5, false);
     reg.apply_fill(accepted(l.admit(&sell, None, MonoNs(0))))
         .unwrap();
     assert_eq!(
         reg.apply_fill(accepted(l.admit(&one, None, MonoNs(0)))),
-        Ok(FillRouted::Untracked)
+        Ok(FillRouted::OursUntracked(stray()))
     );
     assert!(matches!(
         l.admit(&one, None, MonoNs(0)),
