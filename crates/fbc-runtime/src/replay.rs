@@ -6,7 +6,10 @@
 //! with no socket and no clock:
 //!
 //! - each `Opened` control record begins an epoch with a fresh codec from
-//!   [`VenueFactory::md_codec`], whose `on_open` is called; `Closed` ends it;
+//!   [`VenueFactory::md_codec`], whose `on_open` is called; `Closed` ends it, and the handler
+//!   is told the epoch ended ([`MdHandler::on_epoch_end`]) as live, so the books built from a
+//!   replay are invalidated where the live ones were (decision 0039); an `Opened` with an epoch
+//!   still open (its `Closed` was dropped) ends that one first;
 //! - each `Subscribe` control record calls the codec's `subscribe` with its differences;
 //! - each inbound frame, HTTP result and timer firing of the open epoch goes to the codec with
 //!   its recorded [`Stamp`] (its ingest sequence, both clocks and its connection epoch), inside
@@ -251,17 +254,18 @@ impl<H: MdHandler> MdReplay<H> {
         match ev {
             ControlEvent::Opened(key) if self.owns(*key) => {
                 // An opening with no close before it (the close was dropped) ends the open epoch.
-                self.finish();
+                if let Some(open) = self.open.as_ref().map(|e| e.key) {
+                    self.end(open);
+                }
                 self.open = Some(Epoch {
                     key: *key,
                     codec: None,
                     held: Vec::new(),
                 });
             }
-            ControlEvent::Closed(key) if self.open.as_ref().is_some_and(|e| e.key == *key) => {
-                self.finish();
-                self.open = None;
-            }
+            // A close of an epoch that is not open (its opening was dropped) fed nothing, but
+            // ended all the same, as live.
+            ControlEvent::Closed(key) if self.owns(*key) => self.end(*key),
             ControlEvent::Subscribe { conn, add, remove } if self.owns(*conn) => {
                 if self.open.as_ref().is_some_and(|e| e.key == *conn) {
                     self.build(add.clone());
@@ -275,6 +279,16 @@ impl<H: MdHandler> MdReplay<H> {
             }
             _ => {}
         }
+    }
+
+    /// Ends epoch `key`: the open one, if it is, answers what it held first; then the handler is
+    /// told, as live ([`MdHandler::on_epoch_end`], decision 0039).
+    fn end(&mut self, key: ConnKey) {
+        if self.open.as_ref().is_some_and(|e| e.key == key) {
+            self.finish();
+            self.open = None;
+        }
+        self.handler.on_epoch_end(key);
     }
 
     /// Builds the open epoch's codec for `subs`, if it has none yet, calls its `on_open` and

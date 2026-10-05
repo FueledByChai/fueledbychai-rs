@@ -167,7 +167,9 @@ rather than guess.
     poll endpoint opens no connection (0027); `MdVenue` applies `plan_md`'s endpoints by stream;
     `MdBooks` (fed by the `BookKeeper` handler) keeps one `fbc-book` book per (instrument,
     `BookId`), routing each book event by its channel, and exposes each instrument's trading
-    book as the consumer's `TradingBooks` configures it (FBC-nij);
+    book as the consumer's `TradingBooks` configures it (FBC-nij); a session tells its handler
+    each connection epoch's end (`MdHandler::on_epoch_end`, live and in replay), and every book
+    that epoch fed is then gapped until its next snapshot (0039);
     a `Journal` (the consumer's `fbc-journal` sink) set on a session or venue records every input,
     output and connection change under its traffic class and is never waited on (0006);
     `RateLimiter` keeps a sliding-window bucket per declared limit and scope key, charged by

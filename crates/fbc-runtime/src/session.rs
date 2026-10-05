@@ -146,6 +146,15 @@ pub trait MdHandler {
     fn on_tick_to_wire(&mut self, sample: TickToWire) {
         let _ = sample;
     }
+
+    /// Connection epoch `key` ended (a drop, a reconnect the codec asked for, a rotation, a
+    /// silence, a stalled write, an error or a stop): called once per epoch, as its `Closed` is
+    /// journaled, after every event of it the handler is given and before any of the next
+    /// (decision 0039). What the epoch built (a book) may no longer match the venue. Nothing by
+    /// default.
+    fn on_epoch_end(&mut self, key: ConnKey) {
+        let _ = key;
+    }
 }
 
 /// The writes a handler issues while it handles an event ([`MdHandler::on_md_with`]): each goes
@@ -747,8 +756,15 @@ impl<H: MdHandler> MdSession<H> {
         if let Ok(End::StopClosed) = end {
             return Ok(End::Stop);
         }
-        self.control(|| ControlEvent::Closed(key));
+        self.closed(key);
         end
+    }
+
+    /// Journals epoch `key` closed and tells the handler it ended, after the last event of it
+    /// the handler is given (decision 0039).
+    fn closed(&mut self, key: ConnKey) {
+        self.control(|| ControlEvent::Closed(key));
+        self.handler.on_epoch_end(key);
     }
 
     /// The epoch `key`, opened on `ws`, until it drops or the session stops.
@@ -820,7 +836,7 @@ impl<H: MdHandler> MdSession<H> {
             // r4178646794, r4179379935), so replay, which feeds a closed epoch nothing, feeds
             // it to no codec either (Codex r4179805832).
             if self.stop.has_changed().is_err() || matches!(wake, Wake::Desired(false)) {
-                self.control(|| ControlEvent::Closed(key));
+                self.closed(key);
                 match wake {
                     Wake::Frame(Some(Ok(message))) => {
                         self.take_in(key, rx, &message);

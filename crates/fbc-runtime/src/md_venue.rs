@@ -21,8 +21,8 @@ use std::pin::Pin;
 use std::rc::Rc;
 
 use fbc_core::{
-    EndpointPlan, Envelope, MdEvent, MdTransport, SpecTable, StreamId, Subscription, VenueConfig,
-    VenueError, VenueFactory,
+    ConnKey, EndpointPlan, Envelope, MdEvent, MdTransport, SpecTable, StreamId, Subscription,
+    VenueConfig, VenueError, VenueFactory,
 };
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
@@ -141,6 +141,10 @@ impl<H: MdHandler> MdHandler for Shared<H> {
 
     fn on_tick_to_wire(&mut self, sample: TickToWire) {
         self.0.borrow_mut().on_tick_to_wire(sample);
+    }
+
+    fn on_epoch_end(&mut self, key: ConnKey) {
+        self.0.borrow_mut().on_epoch_end(key);
     }
 }
 
@@ -292,6 +296,7 @@ mod tests {
     struct Recording {
         events: usize,
         ticks: Vec<i64>,
+        ended: Vec<ConnKey>,
     }
 
     impl MdHandler for Recording {
@@ -312,10 +317,14 @@ mod tests {
         fn on_tick_to_wire(&mut self, sample: TickToWire) {
             self.ticks.push(sample.nanos);
         }
+
+        fn on_epoch_end(&mut self, key: ConnKey) {
+            self.ended.push(key);
+        }
     }
 
     #[test]
-    fn the_shared_handler_forwards_events_writes_and_tick_to_wire() {
+    fn the_shared_handler_forwards_events_writes_tick_to_wire_and_epoch_ends() {
         let inner = Rc::new(RefCell::new(Recording::default()));
         let mut shared = Shared(inner.clone());
         let stamp = Stamp {
@@ -350,7 +359,9 @@ mod tests {
         let mut fx = fbc_core::Effects::new();
         out.drain_into(&mut fx);
         assert_eq!(fx.len(), 1);
+        shared.on_epoch_end(stamp.conn);
         let inner = inner.borrow();
         assert_eq!((inner.events, inner.ticks.as_slice()), (2, &[7][..]));
+        assert_eq!(inner.ended, [stamp.conn]);
     }
 }
