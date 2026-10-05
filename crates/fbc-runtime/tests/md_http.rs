@@ -13,7 +13,8 @@ use common::toy::{self, ToyVenue};
 use common::{ScriptedHttp, ScriptedWs, closed_port, hanging, once_then_hanging};
 use fbc_core::{ConnKey, EndpointPlan, Envelope, MdEvent, MdTransport, VenueConfig, WireUrl};
 use fbc_runtime::{
-    Connector, IngestClock, Input, MdSession, MdSessionConfig, ProxyConfig, ReconnectPacing,
+    Connector, IngestClock, Input, Liveness, MdSession, MdSessionConfig, ProxyConfig,
+    ReconnectPacing,
 };
 use tokio::sync::oneshot;
 use tokio::time::Instant;
@@ -48,6 +49,7 @@ fn session(venue: &'static ToyVenue, transport: MdTransport) -> MdSessionConfig 
         http_max_body: 64 * 1024,
         conn: CONN,
         limiter: venue.limiter(0),
+        liveness: Liveness::new(Duration::from_secs(3_600), Duration::from_millis(1)).unwrap(),
     }
 }
 

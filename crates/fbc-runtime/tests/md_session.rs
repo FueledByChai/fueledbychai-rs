@@ -15,7 +15,7 @@ use common::{ScriptedWs, hanging, once_then_hanging, refusing};
 use fbc_core::{ConnKey, Envelope, Feed, FeedHealth, InstrumentId, MdEvent, MdTransport, WireUrl};
 use fbc_core::{EndpointPlan, VenueConfig};
 use fbc_runtime::{
-    Connector, IngestClock, Input, MdCounters, MdSession, MdSessionConfig, ProxyConfig,
+    Connector, IngestClock, Input, Liveness, MdCounters, MdSession, MdSessionConfig, ProxyConfig,
     ReconnectPacing, SessionError, Step,
 };
 
@@ -54,6 +54,7 @@ fn session(
         http_max_body: 1024,
         conn: CONN,
         limiter: venue.limiter(0),
+        liveness: Liveness::new(Duration::from_secs(3_600), Duration::from_millis(1)).unwrap(),
     }
 }
 

@@ -25,8 +25,8 @@ use fbc_journal::{
     Opaque, Opcode, Record, RedactionKey, SinkConfig, WriteRes, journal_queue,
 };
 use fbc_runtime::{
-    Connector, IngestClock, Journal, MdReplay, MdReplayConfig, MdReplayCounters, MdSession,
-    MdSessionConfig, ProxyConfig, ReconnectPacing, ReplayError,
+    Connector, IngestClock, Journal, Liveness, MdReplay, MdReplayConfig, MdReplayCounters,
+    MdSession, MdSessionConfig, ProxyConfig, ReconnectPacing, ReplayError,
 };
 
 type Seen = Rc<RefCell<Vec<Envelope<MdEvent>>>>;
@@ -76,6 +76,7 @@ fn session(venue: &'static ToyVenue, url: &str) -> MdSessionConfig {
         http_max_body: 64 * 1024,
         conn: CONN,
         limiter: venue.limiter(0),
+        liveness: Liveness::new(Duration::from_secs(3_600), ms(1)).unwrap(),
     }
 }
 

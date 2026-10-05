@@ -369,9 +369,15 @@ enum Out {
     Hold(oneshot::Receiver<()>),
 }
 
-/// One accepted connection: the text frames the client sent, in order, and a way to answer.
+/// What a [`Peer`] hears when the client sends a WebSocket ping.
+pub const PING: &str = "<ping>";
+/// What a [`Peer`] hears when the client answers its ping.
+pub const PONG: &str = "<pong>";
+
+/// One accepted connection: the text frames (and pings) the client sent, in order, each with
+/// the (tokio) instant the server read it, and a way to answer.
 pub struct Peer {
-    from_client: mpsc::UnboundedReceiver<String>,
+    from_client: mpsc::UnboundedReceiver<(Instant, String)>,
     to_client: mpsc::UnboundedSender<Out>,
 }
 
@@ -427,13 +433,18 @@ impl ScriptedWs {
     pub async fn accept(&mut self) -> Peer {
         self.peers.recv().await.unwrap()
     }
+
+    /// A connection the server has already accepted, if any.
+    pub fn try_accept(&mut self) -> Option<Peer> {
+        self.peers.try_recv().ok()
+    }
 }
 
 /// Plays one scripted connection: reports each text frame the client sends on `heard` and does
 /// what the test asks on `out`.
 async fn script_ws<S: AsyncRead + AsyncWrite + Unpin>(
     stream: S,
-    heard: mpsc::UnboundedSender<String>,
+    heard: mpsc::UnboundedSender<(Instant, String)>,
     mut out: mpsc::UnboundedReceiver<Out>,
 ) {
     // No size limit: a test may stall the reads under a frame larger than the socket buffers
@@ -447,7 +458,14 @@ async fn script_ws<S: AsyncRead + AsyncWrite + Unpin>(
         tokio::select! {
             msg = ws.next() => match msg {
                 Some(Ok(Message::Text(text))) => {
-                    let _ = heard.send(text.as_str().to_owned());
+                    let _ = heard.send((Instant::now(), text.as_str().to_owned()));
+                }
+                // FBC-djl: a WebSocket ping is heard as `<ping>`, a pong as `<pong>`.
+                Some(Ok(Message::Ping(_))) => {
+                    let _ = heard.send((Instant::now(), PING.to_owned()));
+                }
+                Some(Ok(Message::Pong(_))) => {
+                    let _ = heard.send((Instant::now(), PONG.to_owned()));
                 }
                 Some(Ok(_)) => {}
                 _ => break,
@@ -471,7 +489,21 @@ async fn script_ws<S: AsyncRead + AsyncWrite + Unpin>(
 impl Peer {
     /// The next text frame from the client, or `None` once the connection closed.
     pub async fn next(&mut self) -> Option<String> {
+        self.next_at().await.map(|(_, text)| text)
+    }
+
+    /// The next text frame from the client and the instant the server read it, or `None` once
+    /// the connection closed.
+    pub async fn next_at(&mut self) -> Option<(Instant, String)> {
         self.from_client.recv().await
+    }
+
+    /// Whether the client has sent nothing more yet and the connection is still open.
+    pub fn quiet(&mut self) -> bool {
+        matches!(
+            self.from_client.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        )
     }
 
     /// The next text frame from the client, which must come.

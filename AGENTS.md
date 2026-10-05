@@ -152,6 +152,8 @@ rather than guess.
     `MdSession` drives one market-data endpoint over them (0023): a fresh codec per
     epoch, events stamped (an `IngestClock` shared per shard) and handed to the consumer's
     `MdHandler` inline, the codec's effects executed, reconnects paced by `ReconnectPacing` (backoff, attempt budget, attempt deadline);
+    a socket endpoint's keepalive, rotation before the venue's `max_conn_lifetime` and silence
+    alarm, from the consumer's `Liveness` (0033);
     a codec's HTTP requests run with their timeouts and answer only the epoch that asked, and a
     poll endpoint opens no connection (0027); `MdVenue` applies `plan_md`'s endpoints by stream;
     `MdBooks` (fed by the `BookKeeper` handler) keeps one `fbc-book` book per (instrument,

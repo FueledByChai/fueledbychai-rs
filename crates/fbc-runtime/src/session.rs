@@ -30,7 +30,22 @@
 //!
 //! One thread drives a session (design §5.1): [`MdSession::run`] spawns no task, so the read,
 //! the decode and the handler's call run in one call stack on the caller's current-thread
-//! runtime. Not here yet: keepalive, rotation and silence (FBC-djl).
+//! runtime. Not here yet: a bound on a stalled write (FBC-ha3).
+//!
+//! **Liveness (0033).** On a socket endpoint, each epoch sends its codec's [`Keepalive`] every
+//! interval the codec declares (a WebSocket ping, or the codec's own frame as Safety traffic),
+//! charged the keepalive's own rate charge; one the buckets refuse is not sent, as any other
+//! frame they refuse. A keepalive with a zero interval is a codec defect, refused and counted,
+//! and the epoch runs without one. Where the venue declares a `max_conn_lifetime`, the
+//! connection is rotated the consumer's [`Liveness`] margin before it ends: the epoch closes
+//! and the next opens at once, within the attempt budget but without the floor a drop waits,
+//! and subscribes the desired set once. A stream that receives no frame, pings and pongs
+//! included, within the consumer's silence window is reported stale (one [`MdEvent::Health`]
+//! with [`FeedHealth::Stale`] per desired subscription, all under one stamp of the silent
+//! epoch; a write the handler issues as it is told is not sent) and closed, and reconnects as
+//! any drop does, through the pacing. A frame that was
+//! waiting to be read when the window ran out (a write held the session) counts as heard, not
+//! silence. A poll endpoint has none of these.
 //!
 //! **Kernel receive times and tick-to-wire (FBC-2y3, decision 0031).** On Linux each frame's
 //! stamp carries the kernel receive time of the last packet read beneath TLS and WebSocket when
@@ -74,13 +89,14 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fbc_core::{
-    ConfigError, ConnKey, DecodeError, Effect, Effects, EndpointPlan, Envelope, HttpFailure,
-    HttpResponse, HttpTag, KernelRxNs, MdCodec, MdEvent, MdSink, MdTransport, MonoNs, OpKind,
-    RateCharge, RawFrame, SpecTable, Stamp, StreamId, Subscription, TimerTag, TrafficClass,
-    VenueCaps, VenueConfig, VenueFactory, VenueMeta, Via, WallNs, WireSlice, dispatch_market_data,
+    ConfigError, ConnKey, DecodeError, Effect, Effects, EndpointPlan, Envelope, FeedHealth,
+    HttpFailure, HttpResponse, HttpTag, Keepalive, KeepaliveKind, KernelRxNs, MdCodec, MdEvent,
+    MdSink, MdTransport, MonoNs, OpKind, RateCharge, RawFrame, SpecTable, Stamp, StreamId,
+    Subscription, TimerTag, TrafficClass, VenueCaps, VenueConfig, VenueFactory, VenueMeta, Via,
+    WallNs, WireSlice, dispatch_market_data,
 };
 use fbc_journal::{ControlEvent, Record, RecordRef, ResponseRef, WriteRes, is_secret_header};
 use futures_util::stream::FuturesUnordered;
@@ -93,6 +109,7 @@ use crate::epoch::{Admit, EpochError, Epochs, Input};
 use crate::error::NetError;
 use crate::http::{self, Bytes, Response, StatusCode};
 use crate::journal::Journal;
+use crate::liveness::{Alive, Liveness, LivenessError};
 use crate::pacing::{Pacer, ReconnectPacing};
 use crate::ratelimit::{RateError, RateLimiter, Refused, Request};
 use crate::reconcile::{ReconcileError, Reconciler, SubscribeCall};
@@ -152,6 +169,13 @@ impl Outbox {
     /// Moves the writes issued into `fx`, after what is there.
     pub(crate) fn drain_into(&mut self, fx: &mut Effects) {
         self.sends.drain(..).for_each(|e| fx.push(e));
+    }
+
+    /// Drops the writes issued, unsent; how many there were.
+    pub(crate) fn discard(&mut self) -> u64 {
+        let issued = self.sends.len() as u64;
+        self.sends.clear();
+        issued
     }
 }
 
@@ -262,6 +286,8 @@ pub struct MdSessionConfig {
     /// The buckets of the venue's declared limits, shared with every session that counts
     /// against the same ones; built for exactly the venue's limits.
     pub limiter: RateLimiter,
+    /// The silence window and the rotation margin (0033).
+    pub liveness: Liveness,
 }
 
 /// Why a session could not start, or stopped.
@@ -279,6 +305,8 @@ pub enum SessionError {
     Reconcile(ReconcileError),
     /// The venue's rate limits cannot be counted, or the limiter is not theirs.
     Rates(RateError),
+    /// The consumer's liveness settings do not fit the venue.
+    Liveness(LivenessError),
 }
 
 impl fmt::Display for SessionError {
@@ -292,6 +320,7 @@ impl fmt::Display for SessionError {
             SessionError::Epoch(e) => write!(f, "{e}"),
             SessionError::Reconcile(e) => write!(f, "{e}"),
             SessionError::Rates(e) => write!(f, "{e}"),
+            SessionError::Liveness(e) => write!(f, "{e}"),
         }
     }
 }
@@ -307,6 +336,12 @@ impl From<EpochError> for SessionError {
 impl From<RateError> for SessionError {
     fn from(e: RateError) -> Self {
         SessionError::Rates(e)
+    }
+}
+
+impl From<LivenessError> for SessionError {
+    fn from(e: LivenessError) -> Self {
+        SessionError::Liveness(e)
     }
 }
 
@@ -345,8 +380,15 @@ pub struct MdCounters {
     /// Subscribe calls the codec refused; their subscriptions stay pending.
     pub refused_subscribes: u64,
     /// Effects refused as codec defects: a frame or reconnect for another stream, or for a
-    /// poll endpoint's own.
+    /// poll endpoint's own, and a keepalive with a zero interval; and a write a handler issued
+    /// as it was told its stream fell silent.
     pub refused_effects: u64,
+    /// Keepalives due; one the buckets refused was not sent.
+    pub keepalives: u64,
+    /// Epochs ended because their stream fell silent.
+    pub silences: u64,
+    /// Epochs ended to rotate the connection before the venue's lifetime.
+    pub rotations: u64,
     /// Inbound frames and HTTP responses not journaled because the session carries a
     /// credential (until FBC-7lm).
     pub journal_withheld: u64,
@@ -363,6 +405,10 @@ pub struct MdSession<H> {
     connector: Connector,
     clock: IngestClock,
     pacer: Pacer,
+    /// The consumer's silence window.
+    silence: Duration,
+    /// How long after it opens a connection is rotated; `None` where the venue sets no limit.
+    rotate_after: Option<Duration>,
     epochs: Epochs,
     rec: Reconciler,
     desired: watch::Receiver<BTreeSet<Subscription>>,
@@ -409,6 +455,8 @@ enum End {
     /// taken with the stop.
     StopClosed,
     Dropped,
+    /// Closed to rotate before the venue's lifetime.
+    Rotated,
 }
 
 /// What woke a disconnected session: the pacer, a timer, an ended epoch's HTTP result (already
@@ -426,6 +474,9 @@ enum Wake {
     Timer,
     Http(Answered),
     Desired(bool),
+    Keepalive,
+    Silent,
+    Rotate,
 }
 
 impl<H: MdHandler> MdSession<H> {
@@ -446,6 +497,7 @@ impl<H: MdHandler> MdSession<H> {
             .caps(&config.cfg)
             .map_err(SessionError::Config)?;
         config.limiter.check(&caps.limits)?;
+        let rotate_after = config.liveness.rotate_after(caps.md.max_conn_lifetime)?;
         let epochs = Epochs::new(config.conn);
         let mut rec = Reconciler::new(epochs.current());
         let first: BTreeSet<_> = config.plan.subs.iter().copied().collect();
@@ -463,6 +515,8 @@ impl<H: MdHandler> MdSession<H> {
             connector: config.connector,
             clock: config.clock,
             pacer: Pacer::new(config.pacing),
+            silence: config.liveness.silence(),
+            rotate_after,
             epochs,
             rec,
             desired,
@@ -634,10 +688,13 @@ impl<H: MdHandler> MdSession<H> {
             // error (Codex r4179720972).
             let end = self.connected(Some(ws)).await;
             self.rates.closed(self.current());
-            let end = end?;
-            self.pacer.dropped(Instant::now());
-            if let End::Stop = end {
-                return Ok(());
+            match end? {
+                End::Stop | End::StopClosed => return Ok(()),
+                End::Dropped => self.pacer.dropped(Instant::now()),
+                // A planned close, not a drop: the next epoch opens at once, within the
+                // budget, since the floor after the last drop or failure passed before this
+                // connection opened.
+                End::Rotated => {}
             }
             let key = self.epochs.advance()?;
             self.rec.begin_epoch(key)?;
@@ -683,6 +740,13 @@ impl<H: MdHandler> MdSession<H> {
             ..self.plan.clone()
         };
         let mut codec = self.venue.md_codec(&self.cfg, &plan);
+        // Liveness runs on a socket only (0033): the keepalive, the silence window from the
+        // last frame heard and the rotation from the open.
+        let (silence, rotate_after) = (self.silence, self.rotate_after);
+        let (mut alive, refused) =
+            Alive::open(ws.is_some(), codec.keepalive(), silence, rotate_after);
+        self.counters.refused_effects += u64::from(refused);
+        let mut rotated = false;
         let mut fx = Effects::new();
         codec.on_open(&mut fx);
         let call = self.rec.opened(key)?;
@@ -699,7 +763,22 @@ impl<H: MdHandler> MdSession<H> {
                 _ = sleep_or_never(self.rate_retry) => Wake::Desired(true),
                 Some(done) = self.http.next() => Wake::Http(done),
                 r = self.desired.changed() => Wake::Desired(r.is_ok()),
+                _ = sleep_or_never(alive.keepalive_at) => Wake::Keepalive,
+                _ = sleep_or_never(alive.silent_at) => Wake::Silent,
+                _ = sleep_or_never(alive.rotate_at) => Wake::Rotate,
             };
+            // A frame already waiting when the window ran out, because a write held the
+            // session, was heard: it is read, not reported silent.
+            let wake = match wake {
+                Wake::Silent => match next_frame(&mut ws).now_or_never() {
+                    Some(frame) => Wake::Frame(frame),
+                    None => Wake::Silent,
+                },
+                other => other,
+            };
+            if let Wake::Frame(Some(Ok(_))) = wake {
+                alive.heard();
+            }
             // The kernel receive time of the last packet read beneath the frame, if any.
             let rx = ws.as_ref().and_then(|ws| ws.get_ref().kernel_rx());
             // The control first: what woke with its drop reaches no codec (Codex r4177887269).
@@ -750,13 +829,97 @@ impl<H: MdHandler> MdSession<H> {
                     let call = self.rec.set_desired(subs);
                     self.subscribe(&mut ws, codec.as_mut(), call).await?
                 }
+                Wake::Keepalive => {
+                    alive.beat();
+                    let mut open = true;
+                    if let Some(k) = &alive.keepalive {
+                        open = self.keep_alive(&mut ws, codec.as_mut(), k).await?;
+                    }
+                    open
+                }
+                Wake::Silent => {
+                    self.counters.silences += 1;
+                    self.report_silent(key);
+                    if let Some(ws) = ws.as_mut() {
+                        close(ws, &self.rates, key);
+                    }
+                    false
+                }
+                Wake::Rotate => {
+                    self.counters.rotations += 1;
+                    rotated = true;
+                    if let Some(ws) = ws.as_mut() {
+                        close(ws, &self.rates, key);
+                    }
+                    false
+                }
             };
         }
         // A write the control's drop interrupted ends the session, not just the epoch.
         if self.stop.has_changed().is_err() {
             return Ok(End::Stop);
         }
-        Ok(End::Dropped)
+        Ok(if rotated { End::Rotated } else { End::Dropped })
+    }
+
+    /// Sends `keepalive` on the epoch's socket, charged its own rate charge as Safety traffic
+    /// and attributed to no input; false when the epoch ended.
+    async fn keep_alive(
+        &mut self,
+        ws: &mut Option<WebSocket>,
+        codec: &mut dyn MdCodec,
+        keepalive: &Keepalive,
+    ) -> Result<bool, SessionError> {
+        self.counters.keepalives += 1;
+        match &keepalive.kind {
+            KeepaliveKind::Frame(frame) => {
+                let mut fx = Effects::new();
+                fx.push(Effect::Send {
+                    stream: self.plan.stream,
+                    frame: frame.clone(),
+                    rpc: None,
+                    class: TrafficClass::Safety,
+                    charge: keepalive.charge,
+                });
+                self.execute(ws, codec, fx, false, None).await
+            }
+            KeepaliveKind::WsPing => {
+                // Only a socket has a keepalive; the effects of a result answered while the
+                // ping is written follow it.
+                let ping = Request {
+                    charge: keepalive.charge,
+                    via: Via::Frame,
+                    class: TrafficClass::Safety,
+                };
+                let key = self.current();
+                let (mut open, mut effects) = (true, VecDeque::new());
+                if let Some(socket) = ws.as_mut()
+                    && self.rates.charge(Instant::now(), key, &[ping]).is_ok()
+                {
+                    let ping = Message::Ping(Default::default());
+                    open = self.write(socket, codec, ping, &mut effects).await?;
+                }
+                Ok(open && self.run_effects(ws, codec, effects).await?)
+            }
+        }
+    }
+
+    /// Reports every desired subscription of the silent epoch `key` stale, under one stamp. A
+    /// write the handler issues meanwhile is not sent, on the closing connection or the next:
+    /// it is counted with the refused effects.
+    fn report_silent(&mut self, key: ConnKey) {
+        let stamp = self.clock.stamp(key, None);
+        let mut sink = Sink {
+            handler: &mut self.handler,
+            epochs: &mut self.epochs,
+            out: &mut self.outbox,
+            stamp,
+        };
+        for sub in self.rec.desired() {
+            let (inst, feed, h) = (sub.inst, sub.feed, FeedHealth::Stale);
+            sink.push(VenueMeta::NONE, MdEvent::Health { inst, feed, h });
+        }
+        self.counters.refused_effects += self.outbox.discard();
     }
 
     /// Stamps one message of epoch `key`, whose last packet the kernel received at `rx` when it
@@ -976,14 +1139,22 @@ impl<H: MdHandler> MdSession<H> {
         charged: bool,
         origin: Option<Stamp>,
     ) -> Result<bool, SessionError> {
+        let effects = fx.take().into_iter();
+        let effects = effects.map(|e| (e, charged, origin)).collect();
+        self.run_effects(ws, codec, effects).await
+    }
+
+    /// Executes `effects` in order, each with whether it was charged already and the input it
+    /// is attributed to ([`Self::execute`]).
+    async fn run_effects(
+        &mut self,
+        ws: &mut Option<WebSocket>,
+        codec: &mut dyn MdCodec,
+        mut effects: VecDeque<(Effect, bool, Option<Stamp>)>,
+    ) -> Result<bool, SessionError> {
         let key = self.current();
         let epoch = key.epoch;
         let own = self.plan.stream;
-        let mut effects: VecDeque<(Effect, bool, Option<Stamp>)> = fx
-            .take()
-            .into_iter()
-            .map(|e| (e, charged, origin))
-            .collect();
         let mut open = true;
         while open
             && let Some((effect, origin)) =
@@ -1014,37 +1185,7 @@ impl<H: MdHandler> MdSession<H> {
                         rpc,
                         frame,
                     });
-                    // Requests in flight keep going while the write waits. A result that comes
-                    // back meanwhile reaches the codec at once, so the handler gets its events
-                    // in the shard's ingest order (Codex r4177698441). A request the codec asks
-                    // for then starts at once, its timeout running from now (Codex
-                    // r4177887264); its other effects wait for the rest of this batch. A request
-                    // behind a reconnect of this stream, still queued in this batch or asked for
-                    // first, waits too: that reconnect ends the epoch before its turn, so it is
-                    // never sent (Codex r4177934308).
-                    let send = ws.send(message);
-                    tokio::pin!(send);
-                    open = loop {
-                        let done = tokio::select! {
-                            biased;
-                            sent = &mut send => break sent.is_ok(),
-                            _ = self.stop.changed() => break false,
-                            Some(done) = self.http.next() => done,
-                        };
-                        let done = self.stamp_http(done);
-                        if let Some((stamp, done)) = self.admit_http(done)? {
-                            let mut more = Effects::new();
-                            self.answer(codec, stamp, done, &mut more);
-                            let mut ends = effects.iter().any(|(e, ..)| ends_epoch(e, own));
-                            for effect in more.take() {
-                                ends |= ends_epoch(&effect, own);
-                                match effect {
-                                    ask @ Effect::Http { .. } if !ends => self.ask(epoch, ask),
-                                    other => effects.push_back((other, false, Some(stamp))),
-                                }
-                            }
-                        }
-                    };
+                    open = self.write(ws, codec, message, &mut effects).await?;
                     if open {
                         let (at, now) = self.clock.now();
                         self.journal(class, now, || Record::WriteResult {
@@ -1076,6 +1217,47 @@ impl<H: MdHandler> MdSession<H> {
             }
         }
         Ok(open)
+    }
+
+    /// Writes `message` on `ws`; false when the write failed or the control's drop interrupted
+    /// it. Requests in flight keep going while the write waits. A result that comes back
+    /// meanwhile reaches the codec at once, so the handler gets its events in the shard's
+    /// ingest order (Codex r4177698441). A request the codec asks for then starts at once, its
+    /// timeout running from now (Codex r4177887264); its other effects join `effects`, behind
+    /// the rest of the batch, uncharged and attributed to the result. A request behind a
+    /// reconnect of this stream, still queued in `effects` or asked for first, waits too: that
+    /// reconnect ends the epoch before its turn, so it is never sent (Codex r4177934308).
+    async fn write(
+        &mut self,
+        ws: &mut WebSocket,
+        codec: &mut dyn MdCodec,
+        message: Message,
+        effects: &mut VecDeque<(Effect, bool, Option<Stamp>)>,
+    ) -> Result<bool, SessionError> {
+        let (epoch, own) = (self.current().epoch, self.plan.stream);
+        let send = ws.send(message);
+        tokio::pin!(send);
+        loop {
+            let done = tokio::select! {
+                biased;
+                sent = &mut send => return Ok(sent.is_ok()),
+                _ = self.stop.changed() => return Ok(false),
+                Some(done) = self.http.next() => done,
+            };
+            let done = self.stamp_http(done);
+            if let Some((stamp, done)) = self.admit_http(done)? {
+                let mut more = Effects::new();
+                self.answer(codec, stamp, done, &mut more);
+                let mut ends = effects.iter().any(|(e, ..)| ends_epoch(e, own));
+                for effect in more.take() {
+                    ends |= ends_epoch(&effect, own);
+                    match effect {
+                        ask @ Effect::Http { .. } if !ends => self.ask(epoch, ask),
+                        other => effects.push_back((other, false, Some(stamp))),
+                    }
+                }
+            }
+        }
     }
 
     /// Starts the HTTP request `ask` for the codec of `epoch` ([`start_http`]), journaled as it
