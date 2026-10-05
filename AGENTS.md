@@ -165,6 +165,10 @@ rather than guess.
     `MdReplay` feeds one session's journal back to the venue's decoders through the same calls,
     with the recorded stamps, effects not executed (decoder replay; the caller supplies the
     `VenueConfig` and `SpecTable`);
+    every connection reads through `Tcp`, which on Linux keeps the `SO_TIMESTAMPNS` kernel
+    receive time beneath TLS and WebSocket (nix, Linux only), so a frame's stamp carries
+    `kernel_rx`, and a session reports each Safety write attributed to such a frame, the
+    codec's or one the handler issues through its `Outbox`, as a `TickToWire` (0031);
     `tests/common/toy.rs` is the toy market-data venue later runtime tests reuse.
   - `crates/fbc-book` (it depends on `fbc-core` only: one tick-indexed L2 book per
     instrument and `BookId`, built from book events the same live and in replay, with

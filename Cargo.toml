@@ -55,6 +55,10 @@ sha2 = { version = "=0.10.9", default-features = false }
 # default features off (no legacy formats, no dictionary builder). zstd-safe and zstd-sys are
 # BSD-3-Clause; zstd-sys builds the bundled C libzstd (BSD-3-Clause).
 zstd = { version = "=0.13.3", default-features = false }
+# Kernel receive timestamps on Linux (FBC-2y3, decision 0031): SO_TIMESTAMPNS and recvmsg with
+# its control message through nix's safe wrappers, so fbc-runtime holds no unsafe code. Pinned
+# exactly; only the socket and uio modules. A Linux-only dependency of fbc-runtime.
+nix = { version = "=0.31.3", default-features = false, features = ["socket", "uio"] }
 
 # Stark-curve arithmetic is unusably slow unoptimized; the signer's tests sign thousands of
 # vectors. Optimizing these dependencies in test builds changes no result, only the time.

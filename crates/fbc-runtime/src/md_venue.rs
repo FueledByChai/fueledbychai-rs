@@ -33,7 +33,9 @@ use crate::error::NetError;
 use crate::journal::Journal;
 use crate::pacing::ReconnectPacing;
 use crate::ratelimit::RateLimiter;
-use crate::session::{IngestClock, MdControl, MdHandler, MdSession, MdSessionConfig, SessionError};
+use crate::session::{
+    IngestClock, MdControl, MdHandler, MdSession, MdSessionConfig, Outbox, SessionError, TickToWire,
+};
 use crate::ws;
 
 /// What a venue's market data needs, all from the consumer.
@@ -125,6 +127,14 @@ struct Shared<H>(Rc<RefCell<H>>);
 impl<H: MdHandler> MdHandler for Shared<H> {
     fn on_md(&mut self, env: Envelope<MdEvent>) {
         self.0.borrow_mut().on_md(env);
+    }
+
+    fn on_md_with(&mut self, env: Envelope<MdEvent>, out: &mut Outbox) {
+        self.0.borrow_mut().on_md_with(env, out);
+    }
+
+    fn on_tick_to_wire(&mut self, sample: TickToWire) {
+        self.0.borrow_mut().on_tick_to_wire(sample);
     }
 }
 
@@ -257,5 +267,81 @@ impl<H: MdHandler + 'static> MdVenue<H> {
             .push(Box::pin(async move { session.run().await }));
         self.open.insert(stream, (transport, control));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fbc_core::{
+        ConnKey, ExchTsKind, Feed, FeedHealth, InstrumentId, KernelRxNs, MonoNs, OpKind,
+        RateCharge, Stamp, StreamId, TrafficClass, VenueMeta, WallNs, WireSlice,
+    };
+
+    /// Records what reaches it, and writes once per event it is handed with an outbox.
+    #[derive(Default)]
+    struct Recording {
+        events: usize,
+        ticks: Vec<i64>,
+    }
+
+    impl MdHandler for Recording {
+        fn on_md(&mut self, _: Envelope<MdEvent>) {
+            self.events += 1;
+        }
+
+        fn on_md_with(&mut self, env: Envelope<MdEvent>, out: &mut Outbox) {
+            let charge = RateCharge::one(OpKind::Cancel, None);
+            out.send(
+                WireSlice::plain(b"pull".to_vec()),
+                TrafficClass::Safety,
+                charge,
+            );
+            self.on_md(env);
+        }
+
+        fn on_tick_to_wire(&mut self, sample: TickToWire) {
+            self.ticks.push(sample.nanos);
+        }
+    }
+
+    #[test]
+    fn the_shared_handler_forwards_events_writes_and_tick_to_wire() {
+        let inner = Rc::new(RefCell::new(Recording::default()));
+        let mut shared = Shared(inner.clone());
+        let stamp = Stamp {
+            ingest_seq: 0,
+            kernel_rx: Some(KernelRxNs(1)),
+            recv_mono: MonoNs(2),
+            recv_wall: WallNs(3),
+            conn: ConnKey { conn: 1, epoch: 0 },
+        };
+        let env = || {
+            let meta = VenueMeta {
+                exch_ts: None,
+                exch_ts_kind: ExchTsKind::Unknown,
+                venue_seq: None,
+            };
+            let ev = MdEvent::Health {
+                inst: InstrumentId::new(1),
+                feed: Feed::Trades,
+                h: FeedHealth::Stale,
+            };
+            Envelope::new(stamp, meta, ev)
+        };
+        let mut out = Outbox::new(StreamId(0));
+        shared.on_md(env());
+        shared.on_md_with(env(), &mut out);
+        let stream = StreamId(0);
+        shared.on_tick_to_wire(TickToWire {
+            stream,
+            frame: stamp,
+            nanos: 7,
+        });
+        let mut fx = fbc_core::Effects::new();
+        out.drain_into(&mut fx);
+        assert_eq!(fx.len(), 1);
+        let inner = inner.borrow();
+        assert_eq!((inner.events, inner.ticks.as_slice()), (2, &[7][..]));
     }
 }

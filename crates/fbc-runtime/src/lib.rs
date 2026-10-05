@@ -58,6 +58,12 @@
 //! normal traffic stops at, and counts refusals and a venue's 429 and 418 by scope (FBC-bel,
 //! decision 0030); every session charges it before it writes, asks or connects.
 //!
+//! Every connection reads through a [`Tcp`] stream that, on Linux, turns on `SO_TIMESTAMPNS` and
+//! keeps the kernel receive time of what it reads, beneath TLS and WebSocket, so each frame's
+//! stamp carries its `kernel_rx`; a session reports each Safety-class write attributed to a
+//! frame with one as a [`TickToWire`], to its handler (FBC-2y3, decision 0031). Elsewhere
+//! `kernel_rx` is `None` and nothing is reported.
+//!
 //! Not here yet: order-entry sessions, keepalives, client certificates and certificate pinning.
 //! Apart from a codec's HTTP request, no call here has a deadline of its own; the caller bounds
 //! one with its own timer.
@@ -76,6 +82,7 @@ mod replay;
 mod session;
 mod socks5;
 mod target;
+mod tcp;
 mod tls;
 mod transport;
 pub mod ws;
@@ -94,6 +101,8 @@ pub use ratelimit::{
 pub use reconcile::{ReconcileError, Reconciler, SubscribeCall};
 pub use replay::{MdReplay, MdReplayConfig, MdReplayCounters, ReplayError};
 pub use session::{
-    IngestClock, MdControl, MdCounters, MdHandler, MdSession, MdSessionConfig, SessionError,
+    IngestClock, MdControl, MdCounters, MdHandler, MdSession, MdSessionConfig, Outbox,
+    SessionError, TickToWire,
 };
+pub use tcp::Tcp;
 pub use transport::Transport;

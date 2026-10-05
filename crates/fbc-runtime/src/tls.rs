@@ -11,11 +11,11 @@ use std::sync::Arc;
 
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
-use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
 use crate::error::{Cause, NetError, Step};
+use crate::tcp::Tcp;
 
 /// The anchors a server's certificate must chain to, and the client configuration built from
 /// them; rebuilt whenever the consumer adds an anchor, never per connection.
@@ -59,8 +59,8 @@ impl Trust {
     pub(crate) async fn handshake(
         &self,
         name: ServerName<'static>,
-        stream: TcpStream,
-    ) -> Result<TlsStream<TcpStream>, NetError> {
+        stream: Tcp,
+    ) -> Result<TlsStream<Tcp>, NetError> {
         TlsConnector::from(self.config.clone())
             .connect(name, stream)
             .await
