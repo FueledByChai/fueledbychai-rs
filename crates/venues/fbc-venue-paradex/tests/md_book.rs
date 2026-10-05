@@ -128,6 +128,26 @@ fn a_refusal_answering_an_older_subscribe_keeps_the_book_a_later_one_is_still_as
 }
 
 #[test]
+fn a_refusal_of_the_latest_subscribe_drops_the_book_though_an_older_one_is_unanswered() {
+    // Request 1 subscribes, 2 unsubscribes and 3 subscribes the same channel again; the venue
+    // answers out of order, refusing request 3 first (Codex r4182919464).
+    let mut codec = codec(DELTAS);
+    let mut fx = fbc_core::Effects::new();
+    let book = [sub(BTC, Feed::Book(DELTAS))];
+    codec.subscribe(&[], &book, &specs(), &mut fx).unwrap();
+    codec.subscribe(&book, &[], &specs(), &mut fx).unwrap();
+    let out = decode_with(&mut codec, RawFrame::Text(&rpc_error(3)));
+    pushed(&out, &[refused_sub(BTC, Feed::Book(DELTAS))]);
+    // The older requests' acknowledgements change nothing: the book stays dropped.
+    for id in [1, 2] {
+        let ack = format!(r#"{{"jsonrpc":"2.0","result":{{}},"id":{id}}}"#);
+        pushed(&decode_with(&mut codec, RawFrame::Text(&ack)), &[]);
+    }
+    let out = feed(&mut codec, &frame("book-snapshot.sbe.txt"));
+    pushed(&out, &[]);
+}
+
+#[test]
 fn a_snapshot_decodes_into_begin_its_levels_and_end_on_the_subscribed_book() {
     for book in [DELTAS, INTERACTIVE_DELTAS] {
         let mut codec = codec(book);
