@@ -42,7 +42,10 @@ This augments 0035 and 0043 (it supersedes nothing there):
      Stark key (`paradex.private.key`, the Java library's names) out of `Secrets` into a
      `ParadexSigner`, and reads the chain id (`paradex.chain.id`: hex, decimal or the chain's
      name), the REST base (`paradex.rest.url`, a host and the path `/v1` alone, since the
-     login is signed as `/v1/auth`, Codex r4186295475), the signature lifetime (`paradex.auth.signature.lifetime`, whole seconds, at
+     login is signed as `/v1/auth`, Codex r4186295475; its host parsed when configured as a
+     DNS name, an IPv4 address or a bracketed IPv6 address with an optional port 1 to 65535,
+     Codex r4186547040; `https://`, or `http://` only to a loopback host, `127.0.0.0/8`,
+     `::1` or `localhost`, for a test stub, the owner's review), the signature lifetime (`paradex.auth.signature.lifetime`, whole seconds, at
      most the one week Paradex takes, Codex r4184897007),
      the refresh interval (`paradex.jwt.refresh`) and the request timeout
      (`paradex.rest.timeout`), all Account scope and all required: no number is defaulted in

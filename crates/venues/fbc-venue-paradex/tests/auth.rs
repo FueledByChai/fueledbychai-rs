@@ -515,13 +515,12 @@ fn the_configuration_is_read_and_refused_by_key_never_by_value() {
         invalid(REST_URL, value);
     }
     // The login is signed as /v1/auth, so the base is a host and exactly /v1 (Codex
-    // r4186295475): no empty authority, no path before or after /v1.
+    // r4186295475): no path before or after /v1.
     for value in [
-        "https:///v1",
         "https://proxy.example/prefix/v1",
         "https://api.prod.paradex.trade//v1",
         "https://api.prod.paradex.trade/v1/v1",
-        "http:///v1/",
+        "https://api.prod.paradex.trade",
     ] {
         assert_eq!(
             invalid(REST_URL, value),
@@ -611,6 +610,140 @@ fn the_configuration_is_read_and_refused_by_key_never_by_value() {
             reason: "not a Stark key in range"
         }))
     );
+}
+
+/// The reason `Login::new` gives for refusing `value` as the REST base, checking it names the
+/// key and never shows the value.
+fn refused_rest(value: &str) -> &'static str {
+    let mut cfg = cfg();
+    cfg.insert(REST_URL, value);
+    let err = Login::new(&cfg, creds()).expect_err(value);
+    let VenueError::Config(ConfigError::Invalid { key, reason }) = err else {
+        panic!("{value}: {err:?}")
+    };
+    assert_eq!(key, REST_URL, "{value}");
+    let host = value.split("//").nth(1).unwrap_or(value);
+    let host = host.split('/').next().unwrap_or(host);
+    if !host.is_empty() {
+        assert_hidden(&format!("{err} {err:?}"), &[host]);
+    }
+    reason
+}
+
+/// The login URL `Login::new` builds from `base`.
+fn login_url(base: &str) -> String {
+    let mut cfg = cfg();
+    cfg.insert(REST_URL, base);
+    let login = Login::new(&cfg, creds()).unwrap_or_else(|err| panic!("{base}: {err:?}"));
+    let Effect::Http { req, .. } = login.request(&ctx_at(1_759_400_000), LOGIN).unwrap() else {
+        unreachable!()
+    };
+    req.url.as_str().to_owned()
+}
+
+#[test]
+fn the_rest_host_is_parsed_at_config_time_and_refused_by_key_never_by_value() {
+    // Codex r4186547040: an authority the runtime cannot open (no host, an unclosed IPv6
+    // literal, a port out of range or not a number) is refused when the login is configured,
+    // not found later as a request the runtime never sends.
+    const HOST: &str = "the REST base's host is not a DNS name, an IPv4 address or a bracketed IPv6 \
+                        address, with an optional port from 1 to 65535";
+    for value in [
+        "https:///v1",
+        "https://:443/v1",
+        "https://[::1/v1",
+        "https://[::1]x/v1",
+        "https://[SYNTHETIC]/v1",
+        "https://[::1]:/v1",
+        "https://api.prod.paradex.trade:/v1",
+        "https://api.prod.paradex.trade:0/v1",
+        "https://api.prod.paradex.trade:65536/v1",
+        "https://api.prod.paradex.trade:123456/v1",
+        "https://api.prod.paradex.trade:4a3/v1",
+        "https://api.prod.paradex.trade:443:443/v1",
+        "https://api prod.paradex.trade/v1",
+        "https://api_prod.paradex.trade/v1",
+        "https://-api.prod.paradex.trade/v1",
+        "https://api-.prod.paradex.trade/v1",
+        "https://api..paradex.trade/v1",
+        "https://.paradex.trade/v1",
+        "https://api.prod.paradex.trade./v1",
+        "https://300.1.1.1/v1",
+        "https://127.0.0.01/v1",
+        "https://1.2.3/v1",
+        &format!("https://{}.trade/v1", "a".repeat(64)),
+        &format!("https://{}trade/v1", "abcdefghi.".repeat(25)),
+        "http:///v1/",
+    ] {
+        assert_eq!(refused_rest(value), HOST, "{value}");
+    }
+    // A DNS name, an IPv4 address or a bracketed IPv6 address, with or without a port.
+    for (base, url) in [
+        (
+            "https://api.prod.paradex.trade:443/v1",
+            "https://api.prod.paradex.trade:443/v1/auth",
+        ),
+        (
+            "https://API.Testnet.Paradex.Trade/v1",
+            "https://API.Testnet.Paradex.Trade/v1/auth",
+        ),
+        (
+            "https://10.0.0.1:65535/v1",
+            "https://10.0.0.1:65535/v1/auth",
+        ),
+        (
+            "https://[2001:db8::1]:1/v1",
+            "https://[2001:db8::1]:1/v1/auth",
+        ),
+        ("https://[2001:db8::1]/v1/", "https://[2001:db8::1]/v1/auth"),
+        ("https://a-1.b2/v1", "https://a-1.b2/v1/auth"),
+        (
+            &format!("https://{}.trade/v1", "a".repeat(63)),
+            &format!("https://{}.trade/v1/auth", "a".repeat(63)),
+        ),
+    ] {
+        assert_eq!(login_url(base), url, "{base}");
+    }
+}
+
+#[test]
+fn the_rest_base_is_https_or_plain_http_to_a_loopback_test_stub_only() {
+    // The owner's review: the login sends a signature that mints tokens and the account read a
+    // token, so the base is https://, and http:// only to a loopback host (127.0.0.0/8, ::1,
+    // localhost), for a test stub; anything else is refused when it is configured.
+    const PLAIN: &str = "http:// is for a loopback test stub only (127.0.0.0/8, ::1 or \
+                         localhost): give an https:// base";
+    for value in [
+        "http://api.prod.paradex.trade/v1",
+        "http://10.0.0.1/v1",
+        "http://128.0.0.1/v1",
+        "http://[::2]/v1",
+        "http://[::ffff:127.0.0.1]/v1",
+        "http://localhost.example/v1",
+        "http://my-localhost/v1",
+    ] {
+        assert_eq!(refused_rest(value), PLAIN, "{value}");
+    }
+    for value in [
+        "wss://api.prod.paradex.trade/v1",
+        "ftp://127.0.0.1/v1",
+        "127.0.0.1/v1",
+    ] {
+        assert_eq!(
+            refused_rest(value),
+            "not an https:// URL, or an http:// one to a loopback host",
+            "{value}"
+        );
+    }
+    for (base, url) in [
+        ("http://127.0.0.1:8080/v1", "http://127.0.0.1:8080/v1/auth"),
+        ("http://127.255.0.9/v1", "http://127.255.0.9/v1/auth"),
+        ("http://[::1]:9/v1", "http://[::1]:9/v1/auth"),
+        ("http://localhost:1/v1", "http://localhost:1/v1/auth"),
+        ("http://LocalHost/v1/", "http://LocalHost/v1/auth"),
+    ] {
+        assert_eq!(login_url(base), url, "{base}");
+    }
 }
 
 #[test]

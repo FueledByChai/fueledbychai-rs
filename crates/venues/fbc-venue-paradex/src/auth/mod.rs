@@ -57,7 +57,8 @@ pub const ACCOUNT_ADDRESS: &str = "paradex.account.address";
 pub const SIGNING_KEY: &str = "paradex.private.key";
 /// The configuration key of the REST API base, a host and the path `/v1` alone:
 /// `https://api.prod.paradex.trade/v1` on mainnet, `https://api.testnet.paradex.trade/v1` on
-/// testnet. The login is `POST /auth` under it, signed as `/v1/auth`.
+/// testnet. The login is `POST /auth` under it, signed as `/v1/auth`. It is `https://`, or
+/// `http://` to a loopback host (`127.0.0.0/8`, `::1`, `localhost`) for a test stub.
 pub const REST_URL: &str = "paradex.rest.url";
 /// The configuration key of the Starknet chain id the login is signed for: `0x` and hex
 /// digits, decimal digits, or the chain's name (`PRIVATE_SN_PARACLEAR_MAINNET`).
@@ -76,8 +77,9 @@ pub const REST_URL_FIELD: FieldSpec = FieldSpec {
     key: REST_URL,
     scope: ConfigScope::Account,
     unit: FieldUnit::Dimensionless,
-    doc: "REST API base (http:// or https://): a host and the path /v1 alone, without query or user, e.g. \
-          https://api.prod.paradex.trade/v1; the login is POST /auth under it",
+    doc: "REST API base: https://, or http:// to a loopback host (127.0.0.0/8, ::1, localhost) \
+          for a test stub; a host, an optional port and the path /v1 alone, without query or \
+          user, e.g. https://api.prod.paradex.trade/v1; the login is POST /auth under it",
 };
 /// The chain id's schema entry.
 pub const CHAIN_ID_FIELD: FieldSpec = FieldSpec {
@@ -208,10 +210,14 @@ fn duration(text: &str) -> Option<Duration> {
 /// The REST base from `text`, without a trailing slash.
 fn rest_base(text: &str) -> Result<String, ConfigError> {
     let base = text.trim_end_matches('/');
-    let after = base
-        .strip_prefix("https://")
-        .or_else(|| base.strip_prefix("http://"))
-        .ok_or(invalid(REST_URL, "not an http:// or https:// URL"))?;
+    let (after, plain) = match (base.strip_prefix("https://"), base.strip_prefix("http://")) {
+        (Some(after), _) => (after, false),
+        (None, Some(after)) => (after, true),
+        (None, None) => {
+            let reason = "not an https:// URL, or an http:// one to a loopback host";
+            return Err(invalid(REST_URL, reason));
+        }
+    };
     if after.contains(['?', '#', '@']) {
         return Err(invalid(
             REST_URL,
@@ -221,13 +227,91 @@ fn rest_base(text: &str) -> Result<String, ConfigError> {
     // The login is signed as /v1/auth (sign_auth_request), so the base must be a host and
     // the path /v1 alone: a prefix before it would send a path the signature does not name.
     let (authority, path) = after.split_at(after.find('/').unwrap_or(after.len()));
-    if authority.is_empty() || path != SIGNED_PREFIX {
+    if path != SIGNED_PREFIX {
         return Err(invalid(
             REST_URL,
             "the login is signed as /v1/auth: give a host and the path /v1 alone",
         ));
     }
+    // Parsed here, so a base the runtime could not open is refused when it is configured,
+    // not found at the first login as a request never sent (Codex r4186547040).
+    let host = host(authority).ok_or(invalid(
+        REST_URL,
+        "the REST base's host is not a DNS name, an IPv4 address or a bracketed IPv6 address, \
+         with an optional port from 1 to 65535",
+    ))?;
+    // The login carries a signature that mints tokens and the account read a token: plain
+    // HTTP only to this machine, for a test stub (the owner's review).
+    if plain && !host.is_loopback() {
+        return Err(invalid(
+            REST_URL,
+            "http:// is for a loopback test stub only (127.0.0.0/8, ::1 or localhost): give an \
+             https:// base",
+        ));
+    }
     Ok(base.to_owned())
+}
+
+/// The host an authority names, when it is a DNS name, an IPv4 address or a bracketed IPv6
+/// address, then optionally `:` and a port from 1 to 65535: a stricter reading than the
+/// runtime's, so whatever passes it the runtime opens.
+fn host(authority: &str) -> Option<Host<'_>> {
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(literal) => {
+            let (address, port) = literal.split_once(']')?;
+            (Host::V6(address.parse().ok()?), port)
+        }
+        None => {
+            let (name, port) = authority.split_at(authority.find(':').unwrap_or(authority.len()));
+            let host = match name.parse() {
+                Ok(address) => Host::V4(address),
+                Err(_) => Host::Name(dns_name(name)?),
+            };
+            (host, port)
+        }
+    };
+    if let Some(digits) = port.strip_prefix(':') {
+        let numeric = (1..=5).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit());
+        let port: u16 = numeric.then(|| digits.parse().ok()).flatten()?;
+        (port != 0).then_some(())?;
+    } else if !port.is_empty() {
+        return None;
+    }
+    Some(host)
+}
+
+/// A host an authority names.
+enum Host<'a> {
+    Name(&'a str),
+    V4(core::net::Ipv4Addr),
+    V6(core::net::Ipv6Addr),
+}
+
+impl Host<'_> {
+    /// Whether the host is this machine: `127.0.0.0/8`, `::1` or `localhost`.
+    fn is_loopback(&self) -> bool {
+        match self {
+            Host::Name(name) => name.eq_ignore_ascii_case("localhost"),
+            Host::V4(address) => address.is_loopback(),
+            Host::V6(address) => address.is_loopback(),
+        }
+    }
+}
+
+/// `name` when it is a DNS name: at most 253 bytes of dot-separated labels, each 1 to 63
+/// letters, digits and inner hyphens, the last not all digits (so it is no IPv4 address
+/// written another way).
+fn dns_name(name: &str) -> Option<&str> {
+    let label = |label: &str| {
+        let inner = |b: u8| b.is_ascii_alphanumeric() || b == b'-';
+        (1..=63).contains(&label.len())
+            && label.bytes().all(inner)
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    };
+    let last = name.rsplit('.').next().unwrap_or(name);
+    let numeric = last.bytes().all(|b| b.is_ascii_digit());
+    (name.len() <= 253 && name.split('.').all(label) && !numeric).then_some(name)
 }
 
 impl Login {
