@@ -69,9 +69,14 @@
 //! [`Liveness`] margin before the venue's `max_conn_lifetime`, and a stream that hears nothing
 //! within the consumer's silence window is reported stale and reconnected under a new epoch.
 //!
+//! A session's socket write waits on a peer that stopped reading for at most the consumer's
+//! [`WriteStall`] window, then ends the epoch as a drop and reconnects through the pacing; the
+//! session's timers fire meanwhile (FBC-ha3, decision 0035).
+//!
 //! Not here yet: order-entry sessions, client certificates and certificate pinning.
-//! Apart from a codec's HTTP request, no call here has a deadline of its own; the caller bounds
-//! one with its own timer.
+//! Apart from a codec's HTTP request (its own timeout) and a session's connection attempts and
+//! socket writes (the consumer's attempt deadline and write-stall window), no call here has a
+//! deadline of its own; the caller bounds one with its own timer.
 
 mod books;
 mod connector;
