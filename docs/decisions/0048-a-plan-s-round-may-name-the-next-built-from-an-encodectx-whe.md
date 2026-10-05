@@ -46,7 +46,11 @@ This augments 0035 and 0043 (it supersedes nothing there):
      most the one week Paradex takes, Codex r4184897007),
      the refresh interval (`paradex.jwt.refresh`) and the request timeout
      (`paradex.rest.timeout`), all Account scope and all required: no number is defaulted in
-     code. A missing or invalid key is refused by its name, never its value.
+     code. A missing or invalid key is refused by its name, never its value. The key is the
+     account's own Stark key: a registered trading subkey logs in through
+     `/auth/{public_key}`, whose signed path Paradex does not document and the Java library
+     never used, and a subkey cannot be told from the main key by its bytes, so the field says
+     so and subkey login is FBC-2vhg (Codex r4185155410).
    - `Login::request(ctx, tag)` is the login as an `Effect::Http`: `POST /auth` with the four
      documented headers in that order, timestamp `ctx.wall` in whole seconds, expiry that plus
      the lifetime, an empty body, safety traffic. The signature header is redacted (anyone
