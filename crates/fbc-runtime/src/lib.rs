@@ -75,7 +75,7 @@
 //!
 //! [`ExecSession`] drives one account's order-entry connection as
 //! [`VenueFactory::plan_exec`](fbc_core::VenueFactory::plan_exec) plans it (FBC-oaz, decision
-//! 0050): one [`ExecCodec`](fbc_core::ExecCodec) for the session's life, its `on_open` called on
+//! 0052): one [`ExecCodec`](fbc_core::ExecCodec) for the session's life, its `on_open` called on
 //! each new epoch with exactly the nonces it asks for, frames decoded inside the venue's decode
 //! scope, every event stamped and handed to the consumer's [`ExecHandler`] inline, and reconnects
 //! paced by the consumer's [`ReconnectPacing`]. Command submission, its HTTP requests, timers and

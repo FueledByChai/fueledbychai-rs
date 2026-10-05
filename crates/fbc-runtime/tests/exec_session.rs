@@ -2,7 +2,7 @@
 //! against a local WebSocket server; its `on_open` is called once per epoch with exactly the
 //! nonces it asked for, its events are stamped in the shard's ingest order and handed to the
 //! handler inline, an event of an ended epoch is dropped and counted, and a dropped connection
-//! is reconnected through the consumer's pacing (decision 0050).
+//! is reconnected through the consumer's pacing (decision 0052).
 
 mod common;
 #[path = "../../fbc-conformance/src/toy/mod.rs"]
