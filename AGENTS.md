@@ -116,7 +116,8 @@ rather than guess.
   `VenueCaps`, the market-data and execution events, venue commands, and the codec, signer,
   nonce and factory traits with `Effects` and `EncodeCtx` (the factory's discovery an
   `HttpPlan`), and the write-only `PathStamps` a codec marks
-  its latency stages through (0034), `crates/fbc-book` with its L2 book, `crates/fbc-journal` with its record
+  its latency stages through (0034), `crates/fbc-book` with its L2 book, `crates/fbc-sim` with its
+  queue-position fill model (0038), `crates/fbc-journal` with its record
   format, day-grouped segment writer rolled hourly with zstd-compressed closed segments, in-order reader and never-blocking sink, `crates/fbc-runtime` with its first
   slices (the connector, SOCKS5 CONNECT, WebSocket and HTTP/1.1, plain or TLS, 0019 and 0020, the WebSocket handshake its own, 0029;
   connection epochs and the subscription reconciler; the market-data session, 0023; HTTP
@@ -182,8 +183,8 @@ rather than guess.
     `tests/common/toy.rs` is the toy market-data venue later runtime tests reuse.
   - `crates/fbc-book` (it depends on `fbc-core` only: one tick-indexed L2 book per
     instrument and `BookId`, built from book events the same live and in replay, with
-    snapshots, deltas, windows and gap invalidation, touch, top-n, an exact top-n comparison
-    and canonical bytes; still planned: the ex-own projection, touch arbitration and
+    snapshots, deltas, windows and gap invalidation, touch, top-n, one level's size, an exact
+    top-n comparison and canonical bytes; still planned: the ex-own projection, touch arbitration and
     continuity policies), `crates/fbc-oms` (it depends on `fbc-core` only, `proptest` as a
     dev-dependency, 0037: so far `OrderRecord`, whose ranked states, PendingNew and Unknown 0,
     Open 1, PartiallyFilled 2, Terminal 3, only move forward with a terminal state absorbing,
@@ -205,7 +206,12 @@ rather than guess.
     records arrived in format version 3, and the keyed hashes of the credential spans a codec
     names in inbound frames and responses (`redact_inbound`, 0028) in version 4, whose reader
     still reads version 2 and 3 journals), `crates/fbc-sim` (simulated venue and queue-position
-    fill-model code, never calibrations), `crates/fbc-conformance` (the adapter conformance kit,
+    fill-model code, never calibrations; it depends on `fbc-core` and `fbc-book` only: so far
+    `QueueModel`, each modelled order's place in its level's queue under a `Bracket`
+    (Pessimistic, Middle, Optimistic) from a `QueueConfig` with no `Default`, queued on arrival
+    behind its level less every modelled own order, advanced by level cancels per bracket and
+    filled by trades at or through its price, 0038; still planned: the simulated venue,
+    FBC-uoo), `crates/fbc-conformance` (the adapter conformance kit,
     0025; it depends on `fbc-runtime`, and on `fbc-core` in its tests, never on a venue crate: so
     far a public stub venue server on 127.0.0.1 ephemeral ports, a WebSocket endpoint that plays
     a fault script of typed steps and records every connection and data frame, and an HTTP/1.1

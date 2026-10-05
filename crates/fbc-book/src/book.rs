@@ -329,6 +329,22 @@ impl L2Book {
         })
     }
 
+    /// The size at `px` on `side`: `Some(Lots::ZERO)` when the book has no level there, and
+    /// `None` when `px` is outside the window, where the size is unknown.
+    pub fn level(&self, side: BookSide, px: Ticks) -> Result<Option<Lots>, BookError> {
+        if !matches!(self.state, BookState::Valid { .. }) {
+            return Err(BookError::NotValid(self.state));
+        }
+        if self.window.is_some_and(|w| !w.contains(px)) {
+            return Ok(None);
+        }
+        let levels = match side {
+            BookSide::Bid => &self.levels.bids,
+            BookSide::Ask => &self.levels.asks,
+        };
+        Ok(Some(levels.get(&px).copied().unwrap_or(Lots::ZERO)))
+    }
+
     /// The best `n` levels of each side inside the window.
     pub fn top(&self, n: usize) -> Result<Top, BookError> {
         if !matches!(self.state, BookState::Valid { .. }) {

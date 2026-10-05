@@ -40,3 +40,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0035](0035-instruments-are-discovered-as-one-round-of-http-requests-par.md) Instruments are discovered as one round of HTTP requests parsed in a decode scope, and resolved through a fixed alias table — accepted
 - [0036](0036-a-socket-write-waits-on-its-peer-at-most-the-consumer-s-writ.md) A socket write waits on its peer at most the consumer's write-stall window, and timers due meanwhile fire — accepted
 - [0037](0037-property-tests-use-proptest-1-11-0-pinned-exactly-dev-only-d.md) Property tests use proptest 1.11.0, pinned exactly, dev-only, default features off, with a fixed seed per property — accepted
+- [0038](0038-a-trade-through-a-simulated-order-s-price-empties-the-queue-.md) A trade through a simulated order's price empties the queue ahead and fills it from the trade's size; a trade's size is spent once in match order — accepted

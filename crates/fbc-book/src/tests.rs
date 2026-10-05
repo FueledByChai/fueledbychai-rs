@@ -381,6 +381,34 @@ fn a_windowed_book_reports_no_level_outside_its_window() {
     );
 }
 
+/// FBC-30g: one level's size, which the queue model in `fbc-sim` reads when an order arrives.
+#[test]
+fn one_level_reads_its_size_zero_when_empty_and_unknown_outside_the_window() {
+    let mut fresh = L2Book::new();
+    assert_eq!(
+        fresh.level(BookSide::Bid, Ticks(100)),
+        Err(BookError::NotValid(BookState::AwaitingSnapshot))
+    );
+    fresh.begin_snapshot(1);
+    fresh.set_level(BookSide::Bid, Ticks(100), lots(3));
+    fresh.set_level(BookSide::Ask, Ticks(101), lots(4));
+    fresh.end_snapshot().unwrap();
+    assert_eq!(fresh.level(BookSide::Bid, Ticks(100)), Ok(Some(lots(3))));
+    assert_eq!(fresh.level(BookSide::Ask, Ticks(101)), Ok(Some(lots(4))));
+    // The other side at the same price, and a price with no level, are empty.
+    assert_eq!(fresh.level(BookSide::Ask, Ticks(100)), Ok(Some(Lots::ZERO)));
+    assert_eq!(fresh.level(BookSide::Bid, Ticks(99)), Ok(Some(Lots::ZERO)));
+    // Outside a window a level is unknown, not empty.
+    fresh.set_window(Ticks(100), Ticks(100)).unwrap();
+    assert_eq!(fresh.level(BookSide::Bid, Ticks(100)), Ok(Some(lots(3))));
+    assert_eq!(fresh.level(BookSide::Ask, Ticks(101)), Ok(None));
+    fresh.gap();
+    assert_eq!(
+        fresh.level(BookSide::Bid, Ticks(100)),
+        Err(BookError::NotValid(BookState::Gapped))
+    );
+}
+
 #[test]
 fn a_window_applies_to_a_snapshot_in_progress() {
     let mut books = Books::new();

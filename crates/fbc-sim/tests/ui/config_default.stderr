@@ -1,0 +1,5 @@
+error[E0277]: the trait bound `QueueConfig: Default` is not satisfied
+ --> tests/ui/config_default.rs:3:41
+  |
+3 |     let _config: fbc_sim::QueueConfig = Default::default();
+  |                                         ^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `QueueConfig`
