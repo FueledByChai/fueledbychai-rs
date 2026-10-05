@@ -112,19 +112,26 @@ fn a_refused_book_subscribe_is_reported_and_its_frames_are_not_applied_until_ask
 }
 
 #[test]
-fn a_refusal_answering_an_older_subscribe_keeps_the_book_a_later_one_is_still_asking_for() {
-    // Request 1 subscribes, 2 unsubscribes and 3 subscribes the same channel again.
-    let mut codec = codec(DELTAS);
-    let mut fx = fbc_core::Effects::new();
-    let book = [sub(BTC, Feed::Book(DELTAS))];
-    codec.subscribe(&[], &book, &specs(), &mut fx).unwrap();
-    codec.subscribe(&book, &[], &specs(), &mut fx).unwrap();
-    assert_eq!(fx.len(), 2);
-    // The refusal of request 1 is reported, but request 3 still stands: its book is kept.
-    let out = decode_with(&mut codec, RawFrame::Text(&rpc_error(1)));
-    pushed(&out, &[refused_sub(BTC, Feed::Book(DELTAS))]);
-    let out = feed(&mut codec, &frame("book-snapshot.sbe.txt"));
-    pushed(&out, &snapshot_events(DELTAS, 1));
+fn a_refusal_answering_an_older_subscribe_keeps_the_book_a_later_one_asked_for() {
+    // Request 1 subscribes, 2 unsubscribes and 3 subscribes the same channel again; request 3
+    // is still unanswered, or already acknowledged (Codex r4183051811), when 1 is refused.
+    for ack_first in [false, true] {
+        let mut codec = codec(DELTAS);
+        let mut fx = fbc_core::Effects::new();
+        let book = [sub(BTC, Feed::Book(DELTAS))];
+        codec.subscribe(&[], &book, &specs(), &mut fx).unwrap();
+        codec.subscribe(&book, &[], &specs(), &mut fx).unwrap();
+        assert_eq!(fx.len(), 2);
+        if ack_first {
+            let ack = r#"{"jsonrpc":"2.0","result":{},"id":3}"#;
+            pushed(&decode_with(&mut codec, RawFrame::Text(ack)), &[]);
+        }
+        // The refusal of request 1 is reported, but request 3 stands: its book is kept.
+        let out = decode_with(&mut codec, RawFrame::Text(&rpc_error(1)));
+        pushed(&out, &[refused_sub(BTC, Feed::Book(DELTAS))]);
+        let out = feed(&mut codec, &frame("book-snapshot.sbe.txt"));
+        pushed(&out, &snapshot_events(DELTAS, 1));
+    }
 }
 
 #[test]

@@ -254,8 +254,18 @@ fn a_subscribe_acknowledgement_is_consumed_and_a_refused_subscribe_is_reported_b
         assert_eq!(out.result, Err(DecodeError::Malformed(what)));
         assert!(out.events.is_empty() && out.fx.is_empty());
     }
-    // Subscribed again (the consumer's call), its trades are pushed again.
+    // Subscribed again (the consumer's call, request 4), its trades are pushed again.
     codec.subscribe(&subs[1..], &[], &specs(), &mut fx).unwrap();
+    let out = decode_with(&mut codec, RawFrame::Binary(&trade));
+    assert_eq!(out.events.len(), 1);
+    // Unsubscribed (5) and subscribed again (6); once 6 is acknowledged, a late refusal of 4
+    // names its subscription but leaves the trades flowing (Codex r4183051811).
+    codec.subscribe(&[], &subs[1..], &specs(), &mut fx).unwrap();
+    codec.subscribe(&subs[1..], &[], &specs(), &mut fx).unwrap();
+    let ack6 = r#"{"jsonrpc":"2.0","result":{},"id":6}"#;
+    assert_eq!(decode_with(&mut codec, RawFrame::Text(ack6)).result, Ok(()));
+    let out = decode_with(&mut codec, RawFrame::Text(&rpc_error(4)));
+    assert_eq!(out.events, [refused_sub(BTC, subs[1].feed)]);
     let out = decode_with(&mut codec, RawFrame::Binary(&trade));
     assert_eq!(out.events.len(), 1);
     for (text, what) in [
