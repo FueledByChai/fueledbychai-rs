@@ -198,8 +198,10 @@ impl Item {
 ///   declare `keeps_priority: Some(true)` and its price is unchanged; otherwise (design §4.5:
 ///   `None` is not measured yet, and the simulator resets) it is matched again as a new order
 ///   at its price and queues behind the level's size there, crossing the book as a placement
-///   would. Where the caps say a rejected amend does not keep the original, the venue cancels
-///   the order it refused to amend.
+///   would. An accepted amend is answered with the amended order's event (`Amended`, under
+///   its venue id), then any fills it takes and the state they leave it in. Where the caps say
+///   a rejected amend does not keep the original, the venue cancels the order it refused to
+///   amend.
 /// - A cancel ends a resting order; one the venue has ended is refused `AlreadyTerminal`, one
 ///   it never had `NotFound`. A batch of cancels is each cancelled in turn and answered with
 ///   one outcome per item in one frame. A cancel-all of an instrument ends every resting order
@@ -799,7 +801,18 @@ impl SimEngine {
         };
         match self.match_amend(n, &order, &a, at) {
             Ok((amended, taken)) => {
-                let events = self.commit(n, amended, Some(a.px), taken);
+                // The amended order's event first (Codex r4186905749), as the venue reports
+                // it or a codec turns its reply into it, then what it takes.
+                let vid = vid(n);
+                let state = SimState::Amended;
+                let event = Reply::Order(order_event(&amended, &vid, state, Some(a.px)));
+                let quiet = taken.takes.is_empty();
+                let mut events = self.commit(n, amended, Some(a.px), taken);
+                // An amended order that takes nothing rests as the amended event says.
+                if quiet {
+                    events.clear();
+                }
+                events.insert(0, event);
                 Item::accepted(order.cid, n, events)
             }
             // A venue whose refused amend does not keep the original cancels it.

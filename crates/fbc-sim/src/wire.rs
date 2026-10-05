@@ -177,6 +177,7 @@ const LIQUIDITY: &[(&str, Liquidity)] = &[("M", Liquidity::Maker), ("T", Liquidi
 
 const STATES: &[(&str, SimState)] = &[
     ("open", SimState::Open),
+    ("amended", SimState::Amended),
     ("filled", SimState::Filled),
     ("canceled", SimState::Canceled(CancelReason::Requested)),
     ("unfilled", SimState::Canceled(CancelReason::Unfilled)),
@@ -516,6 +517,8 @@ impl Command {
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub(crate) enum SimState {
     Open,
+    /// Amended, keeping its venue id; it rests at the event's price and total.
+    Amended,
     Filled,
     Canceled(CancelReason),
 }

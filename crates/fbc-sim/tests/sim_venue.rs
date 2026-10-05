@@ -2522,11 +2522,12 @@ fn an_amend_resets_the_orders_queue_position_unless_its_caps_say_amends_keep_pri
         };
         assert_eq!((*rpc, outcome), (RpcId(3), &ACCEPTED));
         assert_eq!((item.cid, item.vid.as_ref()), (Some(first), Some(&a)));
+        // Codex r4186905749: the amended order's event, under the same venue id.
         let o = order_of(&got[1].1);
         assert_eq!(
             (o.state.clone(), o.qty, o.px, o.vid.as_ref()),
             (
-                VenueOrderState::Open,
+                VenueOrderState::Amended { new_vid: None },
                 Some(lots(3)),
                 Some(Ticks(199)),
                 Some(&a)
@@ -2566,7 +2567,10 @@ fn an_amend_to_another_price_is_a_new_order_there_and_crosses_as_one() {
     v.tick(T0 + 15 * MS);
     let got = v.events();
     assert_eq!(outcome_of(&got[0].1), Some((2, ACCEPTED)));
-    assert_eq!(order_of(&got[1].1).px, Some(Ticks(198)));
+    let o = order_of(&got[1].1);
+    let amended = VenueOrderState::Amended { new_vid: None };
+    assert_eq!((o.state.clone(), o.px), (amended.clone(), Some(Ticks(198))));
+    assert_eq!(got.len(), 2, "{got:?}");
     assert_eq!(v.ahead(&a), 4);
 
     // Post-only across the offer: refused, and the order keeps its place and price.
@@ -2583,9 +2587,12 @@ fn an_amend_to_another_price_is_a_new_order_there_and_crosses_as_one() {
     v.tick(T0 + 35 * MS);
     let got = v.events();
     assert_eq!(outcome_of(&got[0].1), Some((4, ACCEPTED)));
+    // Amended first, then what it takes and the state it is left in.
+    let o = order_of(&got[1].1);
+    assert_eq!((o.state.clone(), o.cum_filled), (amended, lots(0)));
     let taker = expected_fee(201, 2, TAKER_BPS);
-    assert_eq!(fill_of(&got[1].1), Some((201, 2, Liquidity3::Taker, taker)));
-    let o = order_of(&got[2].1);
+    assert_eq!(fill_of(&got[2].1), Some((201, 2, Liquidity3::Taker, taker)));
+    let o = order_of(&got[3].1);
     assert_eq!(
         (o.state.clone(), o.cum_filled, o.post_only),
         (VenueOrderState::Filled, lots(2), Some(false))
