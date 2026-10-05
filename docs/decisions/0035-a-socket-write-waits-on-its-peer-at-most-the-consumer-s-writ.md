@@ -26,8 +26,9 @@ notes), a separate write-stall window from the consumer's configuration over reu
 - **Timers.** While a write waits, the session's timers fire as they fall due: each is stamped
   then, so it takes its place in ingest order, an ended epoch's into nothing, a current epoch's
   into its codec. The effects the codec asks for join the rest of the batch, as an HTTP result's
-  that comes back during a write do (0027). A timer due at the same instant as the window fires
-  first. Keepalives, rotation and the silence alarm (0033) still wait for the write.
+  that comes back during a write do (0027). A timer due no later than the window fires first,
+  even when the session runs again only after both are past; one due after the window does not
+  fire into the codec (the epoch ends at the window, and it fires into nothing). Keepalives, rotation and the silence alarm (0033) still wait for the write.
 
 ## Alternatives
 

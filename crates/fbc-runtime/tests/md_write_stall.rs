@@ -172,6 +172,42 @@ async fn a_write_the_peer_stops_reading_ends_its_epoch_at_the_window_and_a_timer
     assert_eq!(session.current(), key(1));
 }
 
+/// Codex r4180583622: a session that first runs again after both a timer and the window are
+/// past (a paused clock's jump, a starved executor) honours whichever came first. A timer due
+/// after the window does not reach the codec: the epoch ended at the window, and the timer
+/// fires into nothing.
+#[tokio::test(start_paused = true)]
+async fn a_timer_due_after_the_window_does_not_fire_into_the_codec_when_both_are_past() {
+    let frozen = freeze();
+    let mut server = ScriptedWs::start().await;
+    let seen = Seen::default();
+    let config = toy_session(server.url(), ms(3_000));
+    let (mut session, control) = MdSession::new(config, keep(&seen)).unwrap();
+    let script = async move {
+        let mut peer = server.accept().await;
+        assert_eq!(peer.recv().await, "hello|codec=0|plan=1,2");
+        assert_eq!(peer.recv().await, "sub|add=A,B");
+        peer.send("arm|sym=A|ms=4000");
+        peer.send("big|kb=65536");
+        let release = peer.hold();
+        churn().await;
+        // One step past both the window (3 s) and the timer (4 s).
+        advance(ms(5_000)).await;
+        churn().await;
+        advance(ms(1_000)).await;
+        let mut next = server.accept().await;
+        assert_eq!(next.recv().await, "hello|codec=1|plan=1,2");
+        drop((release, control));
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    drop(frozen);
+    assert!(seen.borrow().is_empty());
+    assert_eq!(session.counters().write_stalls, 1);
+    assert_eq!(session.stale(Input::Timer), 1);
+    assert_eq!(session.current(), key(1));
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_write_that_completes_within_the_window_keeps_its_epoch() {
     let frozen = freeze();
