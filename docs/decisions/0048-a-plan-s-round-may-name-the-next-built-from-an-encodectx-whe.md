@@ -74,7 +74,10 @@ This augments 0035 and 0043 (it supersedes nothing there):
      token another way.
    - `LoginCycle` makes logins as effects for an order-entry codec: one on `start`, one on
      each firing of its refresh timer, which `on_answer` sets for the configured interval
-     after every login answer, failed ones included, whatever the answer holds. It keeps the
+     after every login answer, failed ones included, whatever the answer holds. A login that
+     cannot be signed (`start` or `on_timer` returning a `SignError`) sets the same timer and
+     reports the error, so a signing failure never stops the refresh (the owner's review);
+     the codec reports it (FBC-xzp). It keeps the
      last token a login gave until another replaces it.
    - `test_connection` is `HttpPlan::later(0, ..)`: round one the login, built from the
      context it is sent under; round two, named once the login's answer gave a token,
@@ -114,7 +117,9 @@ This augments 0035 and 0043 (it supersedes nothing there):
   (FBC-f65). Nothing journals plan answers today.
 - The Paradex order-entry codec (FBC-xzp) holds a `LoginCycle`, routes the login's answer and
   the refresh timer to it, answers `redact_inbound` for the login with `token_spans`, and
-  sends `ws_frame` or `header()` with the current token. Its config schema already lists the
+  sends `ws_frame` or `header()` with the current token. It reports the `SignError` that
+  `start` or `on_timer` returns (the cycle has already set its timer again) as it reports a
+  failed login. Its config schema already lists the
   auth keys.
 - Discovery's parsers return `PlanStep` through `HttpPlan::new` unchanged; a test reads a
   one-round result with `PlanStep::done`.
