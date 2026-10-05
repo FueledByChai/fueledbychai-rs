@@ -401,25 +401,35 @@ impl<H: ExecHandler> ExecSession<H> {
     }
 
     /// Executes `fx` in order ([`Core::execute`]), attributed to the input stamped `origin`;
-    /// timers and HTTP requests are refused and counted until FBC-bnl. False when the epoch
-    /// ended.
+    /// each timer and HTTP request is refused and counted as its turn comes, until FBC-bnl, so
+    /// one behind a reconnect or a failed write, which ends the epoch first, is never reached
+    /// (Codex r4188639448). False when the epoch ended.
     async fn execute(
         &mut self,
         ws: &mut Option<WebSocket>,
         mut fx: Effects,
         origin: Option<Stamp>,
     ) -> Result<bool, ExecSessionError> {
-        let mut kept = Effects::new();
+        let mut before = Effects::new();
         for effect in fx.take() {
-            match effect {
-                Effect::Timer { .. } | Effect::Http { .. } => {
-                    self.core.counters.refused_effects += 1;
-                }
-                other => kept.push(other),
+            if !matches!(effect, Effect::Timer { .. } | Effect::Http { .. }) {
+                before.push(effect);
+                continue;
             }
+            let before = std::mem::take(&mut before);
+            if !self
+                .core
+                .execute(ws, &mut NoInputs, before, false, origin)
+                .await?
+            {
+                return Ok(false);
+            }
+            self.core.counters.refused_effects += 1;
         }
-        let inputs = &mut NoInputs;
-        Ok(self.core.execute(ws, inputs, kept, false, origin).await?)
+        Ok(self
+            .core
+            .execute(ws, &mut NoInputs, before, false, origin)
+            .await?)
     }
 }
 

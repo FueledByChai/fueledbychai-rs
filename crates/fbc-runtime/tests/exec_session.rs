@@ -157,7 +157,8 @@ impl VenueFactory for ExecToy {
 /// authentication. Its `on_open` asks for two nonces on the first epoch, three on the second,
 /// and so on, so each epoch's reservation differs. Three frames of the test's own: `stray`
 /// asks for a timer, an HTTP request, and a frame and a reconnect on another stream, then
-/// sends `said`; `bye` asks to reconnect its stream.
+/// sends `said`; `bye` asks to reconnect its stream, then for a timer and an HTTP request,
+/// which the reconnect leaves unreached.
 struct Recording {
     inner: ToyExec,
     opens: Opens,
@@ -206,25 +207,29 @@ impl ExecCodec for Recording {
             class: TrafficClass::Normal,
             charge: RateCharge::one(OpKind::Control, None),
         };
+        // A timer and an HTTP request, which the session refuses.
+        let unsupported = |fx: &mut Effects| {
+            fx.push(Effect::Timer {
+                tag: TimerTag(1),
+                after: Duration::ZERO,
+            });
+            fx.push(Effect::Http {
+                tag: HttpTag(1),
+                req: HttpRequest {
+                    method: HttpMethod::Get,
+                    url: WireUrl::plain("http://127.0.0.1:1/"),
+                    headers: Vec::new(),
+                    body: WireSlice::plain(Vec::new()),
+                },
+                rpc: None,
+                timeout: Duration::from_secs(1),
+                class: TrafficClass::Normal,
+                charge: RateCharge::one(OpKind::Query, None),
+            });
+        };
         match f {
             RawFrame::Text("stray") => {
-                fx.push(Effect::Timer {
-                    tag: TimerTag(1),
-                    after: Duration::ZERO,
-                });
-                fx.push(Effect::Http {
-                    tag: HttpTag(1),
-                    req: HttpRequest {
-                        method: HttpMethod::Get,
-                        url: WireUrl::plain("http://127.0.0.1:1/"),
-                        headers: Vec::new(),
-                        body: WireSlice::plain(Vec::new()),
-                    },
-                    rpc: None,
-                    timeout: Duration::from_secs(1),
-                    class: TrafficClass::Normal,
-                    charge: RateCharge::one(OpKind::Query, None),
-                });
+                unsupported(fx);
                 fx.push(send(other));
                 let reason = "stray";
                 fx.push(Effect::Reconnect {
@@ -237,6 +242,7 @@ impl ExecCodec for Recording {
             RawFrame::Text("bye") => {
                 let reason = "bye";
                 fx.push(Effect::Reconnect { stream, reason });
+                unsupported(fx);
                 Ok(())
             }
             _ => self.inner.on_frame(stream, f, scope, specs, sink, fx),
@@ -647,7 +653,9 @@ async fn stray_effects_are_refused_and_a_reconnect_the_codec_asks_for_opens_the_
     };
     let (run, ()) = tokio::join!(session.run(), script);
     run.unwrap();
-    // A timer, an HTTP request, and a frame and a reconnect for another stream.
+    // A timer, an HTTP request, and a frame and a reconnect for another stream; not the timer
+    // and request behind the reconnect, which ended the epoch before their turn (Codex
+    // r4188639448).
     assert_eq!(session.counters().refused_effects, 4);
     assert_eq!(session.current(), key(1));
     let ends: Vec<_> = log
