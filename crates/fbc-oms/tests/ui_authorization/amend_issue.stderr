@@ -4,7 +4,7 @@ error[E0624]: associated function `issue` is private
 7 |       Authorization::issue(acct, VenueCommand::Amend(amend), &Default::default()).unwrap()
   |                      ^^^^^ private associated function
   |
- ::: src/authorize.rs
+ ::: src/grant.rs
   |
   | /     pub(crate) fn issue(
   | |         acct: AccountKey,
