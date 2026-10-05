@@ -224,8 +224,12 @@ pub struct OrderRecord {
     absent: u8,
     /// When the ladder last built a tombstone cancel for the order.
     tombstone_at: Option<MonoNs>,
-    /// The request the latest tombstone cancel was sent under.
-    tombstone: Option<RpcId>,
+    /// The requests of the tombstone cancels sent while the order is on the ladder: any of
+    /// them may answer.
+    tombstones: Vec<RpcId>,
+    /// When the ladder built the order's query: an acknowledged query clears its request's
+    /// deadline, so the ladder keeps its own.
+    queried_at: Option<MonoNs>,
 }
 
 impl OrderRecord {
@@ -258,7 +262,8 @@ impl OrderRecord {
             ladder: LadderStep::Query,
             absent: 0,
             tombstone_at: None,
-            tombstone: None,
+            tombstones: Vec::new(),
+            queried_at: None,
         }
     }
 
@@ -612,7 +617,7 @@ impl OrderRecord {
             return OutcomeApplied::Unchanged;
         }
         if let OrderOp::Cancel(rpc) = op
-            && self.tombstone == Some(rpc)
+            && self.tombstones.contains(&rpc)
         {
             let ended = match outcome {
                 SubmitOutcome::Accepted {
@@ -671,6 +676,10 @@ impl OrderRecord {
                     return OutcomeApplied::Unchanged;
                 }
                 self.intent = Intent::None;
+                // A refused tombstone settles nothing the ladder asked: the next one follows.
+                if !matches!(op, OrderOp::Cancel(rpc) if self.tombstones.contains(&rpc)) {
+                    self.intent_settled();
+                }
                 self.complete_if_covered();
                 OutcomeApplied::IntentCleared
             }
@@ -739,6 +748,16 @@ impl OrderRecord {
         {
             self.intent = Intent::None;
             self.settle();
+            self.intent_settled();
+        }
+    }
+
+    /// The command in flight was settled (confirmed or refused): a resting order is off the
+    /// Unknown ladder, nothing about it unknown any more. An Unknown or PendingNew one stays:
+    /// its placement is still the ladder's.
+    fn intent_settled(&mut self) {
+        if self.state.rank() > 0 && !self.state.is_terminal() {
+            self.leave_ladder();
         }
     }
 
@@ -794,11 +813,21 @@ impl OrderRecord {
         self.ladder = LadderStep::Query;
         self.absent = 0;
         self.tombstone_at = None;
-        self.tombstone = None;
+        self.tombstones.clear();
+        self.queried_at = None;
     }
 
     pub(crate) fn set_ladder_step(&mut self, step: LadderStep) {
         self.ladder = step;
+    }
+
+    /// When the ladder built the order's query.
+    pub(crate) fn queried_at(&self) -> Option<MonoNs> {
+        self.queried_at
+    }
+
+    pub(crate) fn set_queried_at(&mut self, now: MonoNs) {
+        self.queried_at = Some(now);
     }
 
     pub(crate) fn set_sent(&mut self, at: MonoNs, wall: WallNs) {
@@ -841,7 +870,7 @@ impl OrderRecord {
     pub(crate) fn tombstone_sent(&mut self, rpc: RpcId, now: MonoNs) -> bool {
         let sent = self.cancel_sent(rpc, now);
         if sent {
-            self.tombstone = Some(rpc);
+            self.tombstones.push(rpc);
         }
         sent
     }

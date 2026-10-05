@@ -12,7 +12,8 @@
 //! again ([`Registry::insert`]).
 //!
 //! On the ladder:
-//! 1. It is queried once, by the reference the venue's `query_refs` declare
+//! 1. It is queried once, by the reference the venue's `query_refs` declare, and the answer
+//!    is awaited for the intent timeout at most
 //!    ([`QueryOrder::reference`]); a client id always exists. An answer showing the order
 //!    resting with nothing in flight, or ended, resolves it ([`LadderResolution::Resolved`]),
 //!    an open order still counting against the caps; one naming another order than the one
@@ -233,7 +234,10 @@ impl Registry {
                 }
                 plan.escalated.push(cid);
             }
-            step(rec, caps, &mut plan);
+            if step(rec, cfg, caps, now, &mut plan) {
+                // No longer awaited: a late result is ignored, resyncs decide.
+                self.queries.retain(|_, queried| *queried != cid);
+            }
             let since = rec
                 .tombstone_at()
                 .or(rec.unknown_since())
@@ -433,9 +437,18 @@ fn escalate(rec: &mut OrderRecord, cfg: &LadderConfig, now: MonoNs) -> bool {
     true
 }
 
-/// The step an order on the ladder takes in a pass: its query when one is due (or straight to
-/// resyncs when the venue's queries name no reference it has), a resync while they decide.
-fn step(rec: &mut OrderRecord, caps: &OrderCaps, plan: &mut LadderPlan) {
+/// The step an order on the ladder takes in a pass at `now`: its query when one is due (or
+/// straight to resyncs when the venue's queries name no reference it has), a resync while
+/// they decide. A query built the intent timeout ago and still unanswered (an acknowledgement
+/// clears its request's deadline, and the result may never come) is given up for resyncs:
+/// whether it was.
+fn step(
+    rec: &mut OrderRecord,
+    cfg: &LadderConfig,
+    caps: &OrderCaps,
+    now: MonoNs,
+    plan: &mut LadderPlan,
+) -> bool {
     match rec.ladder_step() {
         Some(LadderStep::Query) => {
             let query = QueryOrder {
@@ -445,14 +458,28 @@ fn step(rec: &mut OrderRecord, caps: &OrderCaps, plan: &mut LadderPlan) {
             };
             if query.reference(caps.query_refs).is_some() {
                 rec.set_ladder_step(LadderStep::Querying);
+                rec.set_queried_at(now);
                 plan.queries.push((rec.cid(), ControlCommand::Query(query)));
             } else {
                 rec.set_ladder_step(LadderStep::Resync);
                 plan.resync = true;
             }
+            false
         }
-        Some(LadderStep::Resync) => plan.resync = true,
-        Some(LadderStep::Querying) | None => {}
+        Some(LadderStep::Querying)
+            if rec
+                .queried_at()
+                .is_some_and(|built| now >= built + cfg.intent_timeout) =>
+        {
+            rec.set_ladder_step(LadderStep::Resync);
+            plan.resync = true;
+            true
+        }
+        Some(LadderStep::Resync) => {
+            plan.resync = true;
+            false
+        }
+        Some(LadderStep::Querying) | None => false,
     }
 }
 
