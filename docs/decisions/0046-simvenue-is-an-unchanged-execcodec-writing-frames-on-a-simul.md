@@ -1,4 +1,4 @@
-# 0045 — SimVenue is an unchanged ExecCodec writing frames on a simulated order stream to a pure engine fed the shard's envelopes
+# 0046 — SimVenue is an unchanged ExecCodec writing frames on a simulated order stream to a pure engine fed the shard's envelopes
 
 Status: accepted
 Date: 2026-10-05

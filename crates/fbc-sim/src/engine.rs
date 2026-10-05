@@ -1,6 +1,6 @@
 //! SimVenue's matching engine: a pure state machine over the shard's market-data envelopes and
 //! the frames its codec writes, answering with frames after the configured latency (decision
-//! 0045).
+//! 0046).
 
 use core::fmt;
 use core::time::Duration;
@@ -207,7 +207,7 @@ impl SimEngine {
         }
     }
 
-    /// Acts on every command that arrived by `now`, a stamp the host read (decision 0045).
+    /// Acts on every command that arrived by `now`, a stamp the host read (decision 0046).
     pub fn advance(&mut self, now: MonoNs) {
         while let Some(entry) = self.in_flight.first_entry() {
             let (mono, _) = *entry.key();

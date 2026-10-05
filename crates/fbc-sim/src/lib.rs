@@ -18,7 +18,7 @@
 //!   trade's size (0038). An order is never filled past what remains, and each fill is
 //!   reported once.
 //!
-//! SimVenue, the simulated venue (BT-501; decision 0045), in two halves joined by a simulated
+//! SimVenue, the simulated venue (BT-501; decision 0046), in two halves joined by a simulated
 //! order-entry stream:
 //!
 //! - [`SimCodec`] is an [`ExecCodec`](fbc_core::ExecCodec), the boundary every venue's codec
