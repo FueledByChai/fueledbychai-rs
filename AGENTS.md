@@ -227,7 +227,9 @@ rather than guess.
     scripts; venue crates take it as a dev-dependency instead of writing their own servers;
     and `src/toy/`, the conformance toy venue BT-502 means (0044), public and includable by path
     from another crate's tests, so far its order entry: every command kind encoded through
-    `ExecCodec`, each declared order capability checked before signing; still planned: the named
+    `ExecCodec`, each declared order capability checked before signing; and its order updates,
+    fills (keyed by fill id, or `FillKey::Derived` when declared without one), request rejects
+    through its code table and venue modes, decoded through `DecodeScope`; still planned: the named
     suite and its macro, and the rest of the conformance toy).
   - `crates/venues/fbc-venues` (the registry, the only crate that sees concrete venues),
     `crates/venues/fbc-venue-binance-usdm` (market data only:

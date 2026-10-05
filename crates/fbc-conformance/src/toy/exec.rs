@@ -16,20 +16,22 @@
 use fbc_core::{
     AmendOrder, AmendRef, AmendWire, CancelOrder, CancelRef, CancelScope, CancelWire, Channel,
     ChosenRef, ClientOrderId, CtxCall, DecodeError, DecodeScope, Effect, Effects, EncodeCtx,
-    EncodeReceipt, ExecCodec, ExecEvent, ExecSink, HttpFailure, HttpResponse, HttpTag, Inbound,
-    InboundSpans, InstrumentId, NewOrder, NotSentReason, OpKind, OrderCaps, OrderKindTag,
+    EncodeReceipt, ExecCodec, ExecEvent, ExecSink, FillCaps, HttpFailure, HttpResponse, HttpTag,
+    Inbound, InboundSpans, InstrumentId, NewOrder, NotSentReason, OpKind, OrderCaps, OrderKindTag,
     OrderSigner, PathStage, PathStamps, PlaceWire, RateCharge, RawFrame, RefKind, RpcCall, RpcId,
     Side, SpecTable, StreamId, SubmitOutcome, TagSet, Tif, TimerTag, VenueCommand, VenueMeta,
     VenueOrderId, WireCid, WireSlice, encode_cid,
 };
 
-use super::{DEAD_MAN_TTL, EXEC_STREAM, RPC_TIMEOUT, caps, weight};
+use super::{DEAD_MAN_TTL, EXEC_STREAM, FillIds, RPC_TIMEOUT, caps_for, decode, weight};
 
 use NotSentReason::{SignFailed, Unencodable, Unsupported};
 
-/// The toy's order-entry codec, signing through the [`OrderSigner`] it is given.
+/// The toy's order-entry codec, signing through the [`OrderSigner`] it is given and decoding
+/// what the venue sends as the caps it was built with declare.
 pub struct ToyExec {
     order: OrderCaps,
+    fills: FillCaps,
     signer: Box<dyn OrderSigner>,
 }
 
@@ -39,8 +41,18 @@ type Request = (String, RateCharge);
 impl ToyExec {
     /// A codec for the toy's declared [`caps`], signing with `signer`.
     pub fn new(signer: Box<dyn OrderSigner>) -> ToyExec {
-        let order = caps().exec.expect("the toy takes orders").order;
-        ToyExec { order, signer }
+        ToyExec::with_fill_ids(signer, FillIds::Venue)
+    }
+
+    /// A codec for the toy declared with `fill_ids` ([`caps_for`]), signing with `signer`.
+    pub fn with_fill_ids(signer: Box<dyn OrderSigner>, fill_ids: FillIds) -> ToyExec {
+        let exec = caps_for(fill_ids).exec.expect("the toy takes orders");
+        let (order, fills) = (exec.order, exec.fills);
+        ToyExec {
+            order,
+            fills,
+            signer,
+        }
     }
 
     /// Refuses an order of a kind, time in force, channel or flag the caps do not declare.
@@ -393,17 +405,20 @@ impl ExecCodec for ToyExec {
         Ok(receipt)
     }
 
-    /// Order updates and fills are decoded with FBC-7ce.
+    /// One record per frame, read whole before it is pushed ([`decode`]); nothing it receives
+    /// asks for an effect.
     fn on_frame(
         &mut self,
         _stream: StreamId,
-        _f: RawFrame<'_>,
-        _scope: &DecodeScope<'_>,
-        _specs: &SpecTable,
-        _sink: &mut dyn ExecSink,
+        f: RawFrame<'_>,
+        scope: &DecodeScope<'_>,
+        specs: &SpecTable,
+        sink: &mut dyn ExecSink,
         _fx: &mut Effects,
     ) -> Result<(), DecodeError> {
-        Err(DecodeError::Malformed("the toy decodes no frame yet"))
+        let (meta, event) = decode::event(f, &self.fills, scope, specs)?;
+        sink.push(meta, event);
+        Ok(())
     }
 
     fn on_http(

@@ -15,7 +15,8 @@
 //!   and [`silence_after_ack`], a connection that goes silent once its subscriptions are
 //!   acknowledged, followed by the reconnect (FBC-53c).
 //! - [`toy`], the conformance toy venue (decision 0044): so far its order entry, every
-//!   declared order capability exercised through `ExecCodec` (FBC-7lx).
+//!   declared order capability exercised through `ExecCodec` (FBC-7lx), and its order updates,
+//!   fills, request rejects and venue modes decoded through `DecodeScope` (FBC-7ce).
 //!
 //! Not here yet: the named conformance suite and its macro, and the rest of the conformance toy
 //! venue.
