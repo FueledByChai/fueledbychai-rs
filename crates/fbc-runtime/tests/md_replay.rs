@@ -428,6 +428,65 @@ fn an_ended_epochs_inputs_and_other_connections_records_reach_no_codec() {
     );
 }
 
+/// What a replay hands its handler, in order: each event's venue sequence, or an epoch's end.
+type Told = Rc<RefCell<Vec<Result<ConnKey, Option<u64>>>>>;
+
+struct Ends(Told);
+
+impl fbc_runtime::MdHandler for Ends {
+    fn on_md(&mut self, env: Envelope<MdEvent>) {
+        self.0.borrow_mut().push(Err(env.venue_seq));
+    }
+
+    fn on_epoch_end(&mut self, key: ConnKey) {
+        self.0.borrow_mut().push(Ok(key));
+    }
+}
+
+#[test]
+fn a_replay_tells_the_handler_each_epoch_end_where_the_live_session_did() {
+    let records = vec![
+        opened(0),
+        subscribe(0, &[1], &[]),
+        frame(1, 0, &trade(1)),
+        closed(0),
+        opened(1),
+        // A result held for the opening call is answered before the epoch ends.
+        result(2, 1, 1, &trade(2)),
+        // An opening with no close before it ends the open epoch.
+        opened(2),
+        frame(3, 2, &trade(3)),
+        // A close of an epoch whose opening was dropped ends it too; another connection's close
+        // is another session's.
+        closed(5),
+        Record::Control {
+            at: MonoNs(0),
+            ev: ControlEvent::Closed(ConnKey {
+                conn: CONN + 1,
+                epoch: 0,
+            }),
+        },
+        closed(2),
+        frame(4, 2, &trade(4)),
+    ];
+    let told = Told::default();
+    let mut replay = MdReplay::new(replay_config(ToyVenue::leak()), Ends(told.clone())).unwrap();
+    replay.run(records.into_iter().map(Ok)).unwrap();
+    assert_eq!(
+        *told.borrow(),
+        [
+            Err(Some(1)),
+            Ok(conn(0)),
+            Err(Some(2)),
+            Ok(conn(1)),
+            Err(Some(3)),
+            Ok(conn(5)),
+            Ok(conn(2)),
+        ]
+    );
+    assert_eq!(replay.counters().stale, 1);
+}
+
 #[test]
 fn what_the_codec_refuses_is_counted_as_it_was_live() {
     let (seen, counters, _) = replay_records(vec![

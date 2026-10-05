@@ -16,17 +16,21 @@
 //! the consumer's [`BookHandler`] with the books as they now are, in the same call stack
 //! (decision 0023).
 //!
-//! Not here yet (FBC-crh): a connection's end does not invalidate the books it fed. The handler
-//! sees only events (decision 0023), and a session opens its next epoch without one, so a book
-//! stays [`Valid`](fbc_book::BookState::Valid), with its last levels, from a drop until the new
-//! epoch's snapshot ends, unless its codec reports a gap. Until FBC-crh lands, a book's validity
-//! says only that no gap was reported, not that its connection is still up.
+//! **A connection's end (FBC-crh, decision 0039).** Each book remembers the connection epoch
+//! ([`ConnKey`]) of the last event about it. When a session's epoch ends (a drop, a reconnect
+//! its codec asks for, a rotation, a silence, a stalled write or a stop), the session tells its
+//! handler ([`MdHandler::on_epoch_end`]) after the last event of that epoch, and every book
+//! last fed by that epoch, or by an earlier one of the same connection, is invalidated as a gap
+//! ([`MdBooks::end_epoch`]): its levels and any snapshot in progress are gone, and it reads as
+//! [`Gapped`](fbc_book::BookState::Gapped) until its next complete snapshot. A book another
+//! connection feeds is untouched. The consumer's [`BookHandler::on_epoch_end`] is then told,
+//! with the books as the end left them.
 
 use std::collections::BTreeMap;
 use std::fmt;
 
 use fbc_book::{Applied, BookError, Books, L2Book};
-use fbc_core::{BookId, Envelope, InstrumentId, MdEvent};
+use fbc_core::{BookId, ConnKey, Envelope, Feed, FeedHealth, InstrumentId, MdEvent};
 
 use crate::session::MdHandler;
 
@@ -92,6 +96,8 @@ impl TradingBooks {
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub struct MdBooks {
     books: Books,
+    /// The connection epoch of the last event about each book.
+    fed: BTreeMap<(InstrumentId, BookId), ConnKey>,
     trading: TradingBooks,
     refused: u64,
 }
@@ -101,20 +107,45 @@ impl MdBooks {
     pub fn new(trading: TradingBooks) -> MdBooks {
         MdBooks {
             books: Books::new(),
+            fed: BTreeMap::new(),
             trading,
             refused: 0,
         }
     }
 
-    /// Applies one event to the book of its instrument and channel; an event about no book
-    /// changes nothing. A refused event (a snapshot end with no snapshot begun, an inverted
-    /// window) is counted.
-    pub fn apply(&mut self, ev: &MdEvent) -> Result<Applied, BookError> {
+    /// Applies one event, which came from connection epoch `from`, to the book of its
+    /// instrument and channel, and remembers `from` as the epoch that last fed that book; an
+    /// event about no book changes nothing. A refused event (a snapshot end with no snapshot
+    /// begun, an inverted window) is counted.
+    pub fn apply(&mut self, from: ConnKey, ev: &MdEvent) -> Result<Applied, BookError> {
+        if let Some(book) = book_of(ev) {
+            self.fed.insert(book, from);
+        }
         let applied = self.books.apply(ev);
         if applied.is_err() {
             self.refused += 1;
         }
         applied
+    }
+
+    /// Connection epoch `ended` has ended: every book last fed by it, or by an earlier epoch of
+    /// its connection, is invalidated as a gap until its next complete snapshot. A book whose
+    /// last event came from another connection, or from a later epoch, is untouched. Returns
+    /// how many books it invalidated.
+    pub fn end_epoch(&mut self, ended: ConnKey) -> usize {
+        let mut invalidated = 0;
+        for (&(inst, book), &from) in &self.fed {
+            // A `Live` or `Stale` report made no book.
+            let exists = self.books.get(inst, book).is_some();
+            if exists && from.conn == ended.conn && from.epoch <= ended.epoch {
+                let h = FeedHealth::Gap;
+                let feed = Feed::Book(book);
+                // A gap on a book that exists is never refused.
+                let _ = self.books.apply(&MdEvent::Health { inst, feed, h });
+                invalidated += 1;
+            }
+        }
+        invalidated
     }
 
     /// The book of `inst` on channel `book`, once an event about it has arrived.
@@ -128,8 +159,8 @@ impl MdBooks {
     }
 
     /// The book of `inst`'s configured trading channel, once an event about it has arrived:
-    /// never another channel's book, whatever state either is in.
-    /// Its state does not yet reflect a dropped connection (FBC-crh; see the module docs).
+    /// never another channel's book, whatever state either is in. It reads invalid from the end
+    /// of the connection epoch that last fed it until its next complete snapshot.
     pub fn trading_book(&self, inst: InstrumentId) -> Option<&L2Book> {
         self.book(inst, self.trading.get(inst)?)
     }
@@ -144,6 +175,12 @@ impl MdBooks {
 /// per event, in ingest order, with the books as that event left them.
 pub trait BookHandler {
     fn on_md(&mut self, env: Envelope<MdEvent>, books: &MdBooks);
+
+    /// Connection epoch `key` ended and the books it fed are invalid ([`MdBooks::end_epoch`]):
+    /// called with the books as that left them. Nothing by default.
+    fn on_epoch_end(&mut self, key: ConnKey, books: &MdBooks) {
+        let _ = (key, books);
+    }
 }
 
 impl<F: FnMut(Envelope<MdEvent>, &MdBooks)> BookHandler for F {
@@ -174,7 +211,28 @@ impl<H: BookHandler> BookKeeper<H> {
 impl<H: BookHandler> MdHandler for BookKeeper<H> {
     fn on_md(&mut self, env: Envelope<MdEvent>) {
         // A refusal is counted in the books; the consumer still sees the event.
-        let _ = self.books.apply(&env.body);
+        let _ = self.books.apply(env.stamp.conn, &env.body);
         self.handler.on_md(env, &self.books);
+    }
+
+    fn on_epoch_end(&mut self, key: ConnKey) {
+        self.books.end_epoch(key);
+        self.handler.on_epoch_end(key, &self.books);
+    }
+}
+
+/// The book an event is about, if it is about one.
+fn book_of(ev: &MdEvent) -> Option<(InstrumentId, BookId)> {
+    match *ev {
+        MdEvent::BookSnapshotBegin { inst, book, .. }
+        | MdEvent::BookSnapshotEnd { inst, book }
+        | MdEvent::Level { inst, book, .. }
+        | MdEvent::Window { inst, book, .. }
+        | MdEvent::Health {
+            inst,
+            feed: Feed::Book(book),
+            ..
+        } => Some((inst, book)),
+        _ => None,
     }
 }
