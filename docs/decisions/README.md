@@ -33,4 +33,5 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0028](0028-codecs-name-the-credentials-in-inbound-frames-and-http-respo.md) Codecs name the credentials in inbound frames and HTTP responses, and the journal hashes them in format version 4, augmenting 0014 — accepted
 - [0029](0029-the-websocket-opening-handshake-is-the-runtime-s-own-over-hy.md) The WebSocket opening handshake is the runtime's own over hyper, with a token-aware Connection check — accepted
 - [0030](0030-rate-buckets-are-sliding-windows-per-declared-limit-and-scop.md) Rate buckets are sliding windows per declared limit and scope key, with a consumer-configured safety reserve; what each refusal does — accepted
+- [0031](0031-amends-and-batch-cancels-declare-the-order-references-they-c.md) Amends and batch cancels declare the order references they can name, and a codec refuses a request with none of them — accepted
 - [0031](0031-kernel-receive-timestamps-come-from-so-timestampns-through-n.md) Kernel receive timestamps come from SO_TIMESTAMPNS through nix 0.31.3 on Linux, and a session reports each Safety write's tick-to-wire to its handler — accepted

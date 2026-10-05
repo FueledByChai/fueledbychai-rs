@@ -7,12 +7,13 @@
 use std::time::Duration;
 
 use fbc_core::{
-    AckModel, AmendAck, AmendCaps, AmendQty, Batch, BookCaps, Cadence, CancelOnDisconnect, Channel,
-    Charset, ClientIdFormat, ConnTopology, Continuity, Encoding, ExchTsKind, ExecCaps, Feature,
-    FeedSource, FillCaps, FillSource, FundingCaps, LimitScope, MatchingCaps, MdCaps, NonceScope,
-    OpKind, OrderCaps, OrderKindTag, OrderingKey, QueueModelQuality, RateLimit, Readiness, RefKind,
-    SeqDomain, SnapshotSource, SpeedBump, SpeedBumpScope, StpScope, Support, TagSet, TifTag,
-    TouchSourceCaps, TradeCaps, VenueCaps, VenueFeeSign,
+    AckModel, AmendAck, AmendCaps, AmendQty, Batch, BookCaps, Cadence, CancelBatch,
+    CancelOnDisconnect, Channel, Charset, ClientIdFormat, ConnTopology, Continuity, Encoding,
+    ExchTsKind, ExecCaps, Feature, FeedSource, FillCaps, FillSource, FundingCaps, LimitScope,
+    MatchingCaps, MdCaps, NonceScope, OpKind, OrderCaps, OrderKindTag, OrderingKey,
+    QueueModelQuality, RateLimit, Readiness, RefKind, SeqDomain, SnapshotSource, SpeedBump,
+    SpeedBumpScope, StpScope, Support, TagSet, TifTag, TouchSourceCaps, TradeCaps, VenueCaps,
+    VenueFeeSign,
 };
 
 /// A synthetic venue that declares every capability field.
@@ -30,6 +31,8 @@ pub fn synthetic_caps() -> VenueCaps {
                     (Feature::Rpi, Feature::ReduceOnly),
                 ],
                 amend: Some(AmendCaps {
+                    // Amends name the order by the venue's id only.
+                    refs: TagSet::of(&[RefKind::Venue]),
                     price: true,
                     qty: true,
                     flags: false,
@@ -45,7 +48,12 @@ pub fn synthetic_caps() -> VenueCaps {
                 cancel_before_ack: false,
                 cancel_is_signed: false,
                 batch_place: Some(Batch { max_items: 10 }),
-                batch_cancel: None,
+                // A batch cancel names its items by the venue's id only, though a single
+                // cancel also takes our client id.
+                batch_cancel: Some(CancelBatch {
+                    max_items: 20,
+                    refs: TagSet::of(&[RefKind::Venue]),
+                }),
                 cancel_all_account: Support::Native,
                 cancel_all_instrument: Support::Unsupported,
                 cancel_on_disconnect: CancelOnDisconnect::PerConnection {

@@ -30,12 +30,12 @@ pub mod units;
 pub mod venue;
 
 pub use caps::{
-    AckModel, AmendAck, AmendCaps, AmendQty, Batch, BookCaps, Cadence, CancelOnDisconnect, CapTag,
-    ConnTopology, Continuity, Encoding, ExecCaps, Feature, FeedSource, FillCaps, FillSource,
-    FundingCaps, LimitScope, MatchingCaps, MdCaps, NonceScope, OpKind, OrderCaps, OrderKindTag,
-    OrderingKey, QueueModelQuality, RateCharge, RateLimit, Readiness, RefKind, SeqDomain,
-    SnapshotSource, SpeedBump, SpeedBumpScope, StpScope, Support, TagSet, TifTag, TouchSourceCaps,
-    TradeCaps, VenueCaps, Via,
+    AckModel, AmendAck, AmendCaps, AmendQty, Batch, BookCaps, Cadence, CancelBatch,
+    CancelOnDisconnect, CapTag, ConnTopology, Continuity, Encoding, ExecCaps, Feature, FeedSource,
+    FillCaps, FillSource, FundingCaps, LimitScope, MatchingCaps, MdCaps, NonceScope, OpKind,
+    OrderCaps, OrderKindTag, OrderingKey, QueueModelQuality, RateCharge, RateLimit, Readiness,
+    RefKind, SeqDomain, SnapshotSource, SpeedBump, SpeedBumpScope, StpScope, Support, TagSet,
+    TifTag, TouchSourceCaps, TradeCaps, VenueCaps, Via,
 };
 
 pub use cid::{Charset, ClientIdFormat, MAX_WIRE_LEN, WireCid, decode_cid, encode_cid};
@@ -48,9 +48,9 @@ pub use codec::{
     WireSlice, WireUrl, check_redactions,
 };
 pub use command::{
-    AckLevel, AmendOrder, CancelOrder, CancelScope, NewOrder, NotAmendable, NotSentReason,
-    OrderKind, QueryOrder, Reject, RejectKind, SubmitOutcome, TerminalHint, TerminalReject, Tif,
-    VenueCommand,
+    AckLevel, AmendOrder, CancelOrder, CancelScope, ChosenRef, NewOrder, NotAmendable,
+    NotSentReason, OrderKind, QueryOrder, Reject, RejectKind, SubmitOutcome, TerminalHint,
+    TerminalReject, Tif, VenueCommand,
 };
 pub use event::{
     BookId, CancelReason, ConnState, Envelope, ExecEvent, FeedHealth, FillEvent, FillIdent,

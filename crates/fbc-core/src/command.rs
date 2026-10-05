@@ -16,10 +16,10 @@ use std::sync::Arc;
 
 use compact_str::CompactString;
 
-use crate::caps::{AmendQty, Feature, OrderKindTag, TifTag};
+use crate::caps::{AmendCaps, AmendQty, Feature, OrderKindTag, RefKind, TagSet, TifTag};
 use crate::codec::TrafficClass;
 use crate::event::VenueMode;
-use crate::ids::{ClientOrderId, InstrumentId, OrderRef};
+use crate::ids::{ClientOrderId, InstrumentId, OrderRef, VenueOrderId};
 use crate::units::{Channel, Lots, Side, Ticks};
 
 /// A time in force.
@@ -125,6 +125,45 @@ impl AmendOrder {
     }
 }
 
+impl AmendOrder {
+    /// The reference the amend names its order by: the first of the kinds the venue declares
+    /// for amends ([`AmendCaps::refs`]) that the command carries, or `None` when it carries
+    /// none of them. A codec refuses that amend (`NotSent(Unsupported)`), and a planner reads
+    /// the same answer from the caps before it builds one.
+    pub fn reference(&self, caps: &AmendCaps) -> Option<ChosenRef<'_>> {
+        ChosenRef::choose(caps.refs, &self.target, None)
+    }
+}
+
+/// The one reference a request names its order by, chosen from what the command carries and the
+/// venue declares for the operation. Kinds are tried in [`RefKind`]'s declaration order: the
+/// venue's id first, which names the order the venue holds, then our client id, then the
+/// placement nonce. A codec turns it into its wire reference
+/// ([`AmendRef`](crate::AmendRef), [`CancelRef`](crate::CancelRef)).
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum ChosenRef<'a> {
+    /// The venue's order id.
+    Venue(&'a VenueOrderId),
+    /// Our client id, still to be written in the venue's wire format.
+    Client(ClientOrderId),
+    /// The nonce the order was placed with.
+    PlacementNonce(u64),
+}
+
+impl<'a> ChosenRef<'a> {
+    fn choose(
+        declared: TagSet<RefKind>,
+        target: &'a OrderRef,
+        placement_nonce: Option<u64>,
+    ) -> Option<ChosenRef<'a>> {
+        declared.iter().find_map(|kind| match kind {
+            RefKind::Venue => target.venue().map(ChosenRef::Venue),
+            RefKind::Client => target.client().map(ChosenRef::Client),
+            RefKind::PlacementNonce => placement_nonce.map(ChosenRef::PlacementNonce),
+        })
+    }
+}
+
 /// A cancel of one order.
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub struct CancelOrder {
@@ -133,6 +172,17 @@ pub struct CancelOrder {
     pub side: Side,
     /// The nonce the order was placed with, for venues that cancel by it.
     pub placement_nonce: Option<u64>,
+}
+
+impl CancelOrder {
+    /// The reference the cancel names its order by: the first of `declared` the command carries,
+    /// or `None` when it carries none of them. `declared` is the venue's
+    /// [`OrderCaps::cancel_refs`](crate::OrderCaps::cancel_refs) for a single cancel and its
+    /// [`CancelBatch::refs`](crate::CancelBatch::refs) for an item of a batch cancel, which
+    /// can be narrower; a codec refuses a cancel, or a whole batch, with an item that has none.
+    pub fn reference(&self, declared: TagSet<RefKind>) -> Option<ChosenRef<'_>> {
+        ChosenRef::choose(declared, &self.target, self.placement_nonce)
+    }
 }
 
 /// A query for one order.
@@ -490,6 +540,78 @@ mod tests {
             TerminalReject::new(limited).is_some(),
             "a placement refused never rested"
         );
+    }
+
+    #[test]
+    fn a_request_names_its_order_by_the_first_declared_reference_it_carries() {
+        let vid = dispatch(&caps(), Namespace::new(1), |scope| {
+            scope.venue_order_id("V-9")
+        })
+        .unwrap();
+        let cid = ClientOrderId::new(Namespace::new(1), 9);
+        let cancel = |target, placement_nonce| CancelOrder {
+            target,
+            inst: InstrumentId::new(1),
+            side: Side::Buy,
+            placement_nonce,
+        };
+        let refs = |kinds: &[RefKind]| TagSet::of(kinds);
+        let all = refs(&[RefKind::Venue, RefKind::Client, RefKind::PlacementNonce]);
+        // The venue's id first, then ours, then the placement nonce: what the command carries.
+        let both = cancel(OrderRef::Both(cid, vid.clone()), Some(3));
+        assert_eq!(both.reference(all), Some(ChosenRef::Venue(&vid)));
+        assert_eq!(
+            both.reference(refs(&[RefKind::Client, RefKind::PlacementNonce])),
+            Some(ChosenRef::Client(cid))
+        );
+        assert_eq!(
+            both.reference(refs(&[RefKind::PlacementNonce])),
+            Some(ChosenRef::PlacementNonce(3))
+        );
+        // A reference the command lacks is skipped; one the venue does not declare is never used.
+        let unacked = cancel(OrderRef::Client(cid), None);
+        assert_eq!(unacked.reference(all), Some(ChosenRef::Client(cid)));
+        assert_eq!(unacked.reference(refs(&[RefKind::Venue])), None);
+        assert_eq!(unacked.reference(TagSet::none()), None);
+        let by_nonce = cancel(OrderRef::Client(cid), Some(4));
+        assert_eq!(
+            by_nonce.reference(refs(&[RefKind::Venue, RefKind::PlacementNonce])),
+            Some(ChosenRef::PlacementNonce(4))
+        );
+        // An amend carries no placement nonce, so declaring one names nothing it can send.
+        let amend = |target| AmendOrder {
+            target,
+            inst: InstrumentId::new(1),
+            side: Side::Buy,
+            tif: TifTag::Gtc,
+            channel: Channel::Public,
+            post_only: true,
+            reduce_only: false,
+            reducing: false,
+            px: Ticks(100),
+            qty: Lots::new(2).unwrap(),
+            cum_filled: Lots::new(0).unwrap(),
+        };
+        let amend_caps = |kinds: &[RefKind]| AmendCaps {
+            refs: TagSet::of(kinds),
+            price: true,
+            qty: true,
+            flags: false,
+            when_partially_filled: true,
+            reject_keeps_original: true,
+            keeps_venue_id: true,
+            ack: crate::caps::AmendAck::ReplacedEvent,
+            qty_semantics: AmendQty::TotalIncludingFilled,
+            keeps_priority: None,
+        };
+        let by_venue = amend_caps(&[RefKind::Venue, RefKind::PlacementNonce]);
+        let acked = amend(OrderRef::Venue(vid.clone()));
+        assert_eq!(acked.reference(&by_venue), Some(ChosenRef::Venue(&vid)));
+        assert_eq!(amend(OrderRef::Client(cid)).reference(&by_venue), None);
+        let by_client = amend_caps(&[RefKind::Client]);
+        assert_eq!(acked.reference(&by_client), None);
+        let both = amend(OrderRef::Both(cid, vid.clone()));
+        assert_eq!(both.reference(&by_client), Some(ChosenRef::Client(cid)));
     }
 
     #[test]
