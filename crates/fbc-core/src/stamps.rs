@@ -52,7 +52,9 @@ pub trait PathRecorder {
 }
 
 /// The handle a gateway and a codec mark an order's stages through: it passes each mark to the
-/// runtime's [`PathRecorder`], or drops it when off. It holds no time and gives none back.
+/// runtime's [`PathRecorder`], or drops it when off. It holds no time and gives none back, and
+/// shows no sign of whether it is on, so a codec cannot encode differently when replay hands it
+/// stamps that are off.
 pub struct PathStamps<'a> {
     recorder: Option<&'a mut dyn PathRecorder>,
 }
@@ -68,11 +70,6 @@ impl<'a> PathStamps<'a> {
     /// Marks go nowhere: for a caller that times nothing.
     pub fn off() -> PathStamps<'static> {
         PathStamps { recorder: None }
-    }
-
-    /// Whether marks go to a recorder.
-    pub fn is_on(&self) -> bool {
-        self.recorder.is_some()
     }
 
     /// Marks the start of `stage`.
@@ -107,11 +104,10 @@ impl<'a> PathStamps<'a> {
     }
 }
 
+/// Shows no state: whether marks are recorded is hidden from whoever holds the stamps.
 impl fmt::Debug for PathStamps<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PathStamps")
-            .field("on", &self.is_on())
-            .finish()
+        f.write_str("PathStamps")
     }
 }
 
@@ -137,14 +133,13 @@ mod tests {
     fn marks_reach_the_recorder_in_the_order_they_are_made() {
         let mut marks = Marks::default();
         let mut t = PathStamps::new(&mut marks);
-        assert!(t.is_on());
         t.start(PathStage::Encode);
         let signed = t.span(PathStage::Sign, || 42);
         let failed: Result<u8, &str> = t.span(PathStage::Sign, || Err("refused"));
         t.end(PathStage::Encode);
         t.span(PathStage::Write, || ());
         assert_eq!((signed, failed), (42, Err("refused")));
-        assert_eq!(format!("{t:?}"), "PathStamps { on: true }");
+        assert_eq!(format!("{t:?}"), format!("{:?}", PathStamps::off()));
         use {PathEdge::*, PathStage::*};
         assert_eq!(
             marks.0,
@@ -164,10 +159,9 @@ mod tests {
     #[test]
     fn marks_made_while_off_go_nowhere() {
         let mut t = PathStamps::off();
-        assert!(!t.is_on());
         t.start(PathStage::Encode);
         assert_eq!(t.span(PathStage::Sign, || 7), 7);
         t.end(PathStage::Encode);
-        assert_eq!(format!("{t:?}"), "PathStamps { on: false }");
+        assert_eq!(format!("{t:?}"), "PathStamps");
     }
 }

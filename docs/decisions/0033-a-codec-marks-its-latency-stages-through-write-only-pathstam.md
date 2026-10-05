@@ -24,7 +24,8 @@ A codec marks a stage boundary; it never learns when that was.
 - `PathStamps<'a>` is a write-only handle on a `&mut dyn PathRecorder`, or off
   (`PathStamps::off()`, for a caller that times nothing). It has `start`, `end` and `span`
   (marks the start, runs a closure, marks the end whatever the closure returned) and no
-  accessor: its recorder field is private, it holds no time and returns none.
+  accessor: its recorder field is private, it holds no time and returns none, and nothing about
+  it, its `Debug` included, shows whether it is on, so a codec cannot tell live from replay.
 - `ExecCodec::encode` takes `t: &mut PathStamps<'_>` after its `EncodeCtx`, and
   `OrderGateway::submit` takes one last, as the design has them. Who marks what: the gateway
   marks `Encode` around its call to `encode`, the codec marks `Sign` around each signer call (a
