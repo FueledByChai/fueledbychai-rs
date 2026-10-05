@@ -18,6 +18,7 @@ use fbc_runtime::{
     Connector, IngestClock, Input, Liveness, MdCounters, MdSession, MdSessionConfig, ProxyConfig,
     ReconnectPacing, SessionError, Step, WriteStall,
 };
+use tokio::time::{Instant, advance};
 
 type Seen = Rc<RefCell<Vec<(ThreadId, Envelope<MdEvent>)>>>;
 
@@ -72,6 +73,23 @@ fn quick() -> ReconnectPacing {
 async fn until(done: impl Fn() -> bool) {
     while !done() {
         tokio::time::sleep(ms(2)).await;
+    }
+}
+
+/// Holds tokio's paused clock still until dropped. A paused clock otherwise jumps to its next
+/// timer whenever the runtime waits on socket I/O; while a blocking task runs it does not
+/// (tokio's test-util), so time moves only by `advance` and machine load cannot use up a
+/// deadline (FBC-3dj, FBC-3ti).
+fn freeze() -> std::sync::mpsc::Sender<()> {
+    let (thaw, frozen) = std::sync::mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || frozen.recv());
+    thaw
+}
+
+/// Lets every task run a while without moving the clock.
+async fn churn() {
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
     }
 }
 
@@ -209,27 +227,40 @@ async fn a_refused_subscribe_stays_pending_stray_effects_are_refused_and_bye_rec
     assert_eq!(session.current(), key(1));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_attempt_that_does_not_open_by_its_deadline_fails_and_the_control_stops_a_hung_one() {
+    let frozen = freeze();
     let (addr, mut accepts) = hanging().await;
     let pacing = ReconnectPacing::new(ms(50), ms(50), 100, ms(60_000), ms(100)).unwrap();
     let config = session(ToyVenue::leak(), format!("ws://{addr}/md"), &[1], pacing);
     let (mut session, control) = MdSession::new(config, |_| {}).unwrap();
     let script = async move {
-        let mut at = Vec::new();
+        let start = Instant::now();
+        let mut at = vec![accepts.recv().await.unwrap()];
         while at.len() < 3 {
+            // Each attempt hangs until its 100 ms deadline, then waits the 50 ms floor (Codex
+            // r4177068887): no attempt a moment before both have passed. The clock moves only
+            // when the test moves it, a step at a time so the failure is seen at its deadline,
+            // and load cannot shift an attempt (FBC-3ti).
+            advance(ms(100)).await;
+            churn().await;
+            advance(ms(49)).await;
+            churn().await;
+            assert!(accepts.try_recv().is_err(), "an attempt before 150 ms");
+            advance(ms(1)).await;
             at.push(accepts.recv().await.unwrap());
         }
         control.set_desired([1, 2].map(toy::sub));
         tokio::task::yield_now().await;
         drop(control);
-        at
+        at.into_iter()
+            .map(|t| t.duration_since(start))
+            .collect::<Vec<_>>()
     };
     let (run, at) = tokio::join!(session.run(), script);
     run.unwrap();
-    // Each attempt hangs until its 100 ms deadline, then waits the 50 ms floor (Codex
-    // r4177068887); real time, so only the lower bound is exact.
-    assert!(at.windows(2).all(|w| w[1].duration_since(w[0]) >= ms(150)));
+    drop(frozen);
+    assert_eq!(at, [0, 150, 300].map(ms));
     assert_eq!(session.counters().attempts, 3);
     assert_eq!(session.counters().failed_attempts, 2);
 }
