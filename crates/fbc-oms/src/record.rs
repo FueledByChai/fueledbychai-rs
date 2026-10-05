@@ -189,6 +189,10 @@ pub struct OrderRecord {
     placement_nonce: Option<u64>,
     /// A cancel was asked for and waits for the order's acknowledgement (design §4.9).
     cancel_awaits_ack: bool,
+    /// An amended update named no new venue id: on a venue whose amend gives a new id, the
+    /// current id may be retired, and the record does not know the new one. Kept until the
+    /// order ends: a later replacement may arrive out of order.
+    vid_retired: bool,
 }
 
 impl OrderRecord {
@@ -216,6 +220,7 @@ impl OrderRecord {
             unknown_since: None,
             placement_nonce: None,
             cancel_awaits_ack: false,
+            vid_retired: false,
         }
     }
 
@@ -346,6 +351,13 @@ impl OrderRecord {
         matches!(self.intent, Intent::PendingAmend { .. }) || self.unsettled.is_some()
     }
 
+    /// Whether an amended update named no new venue id ([`VenueOrderState::Amended`] with
+    /// `new_vid: None`): on a venue whose amend gives the order a new id, the record's id may
+    /// be retired, so commands leave it out.
+    pub fn vid_retired(&self) -> bool {
+        self.vid_retired
+    }
+
     /// Whether a cancel was asked for and waits for the order's acknowledgement, since no
     /// reference its venue's cancel can name was usable ([`crate::CancelChoice::AwaitAck`]).
     pub fn cancel_awaits_ack(&self) -> bool {
@@ -436,9 +448,13 @@ impl OrderRecord {
             self.last_key
                 .is_none_or(|last| last.venue.is_some_and(|l| k > l))
         });
-        if let VenueOrderState::Amended { new_vid: Some(nv) } = &u.state {
-            let taught = u.vid.as_ref().is_some_and(|v| self.taught.contains(v));
-            self.replace(u.vid.as_ref(), nv, later || taught);
+        match &u.state {
+            VenueOrderState::Amended { new_vid: Some(nv) } => {
+                let taught = u.vid.as_ref().is_some_and(|v| self.taught.contains(v));
+                self.replace(u.vid.as_ref(), nv, later || taught);
+            }
+            VenueOrderState::Amended { new_vid: None } => self.vid_retired = true,
+            _ => {}
         }
         let ends = terminal_kind(&u.state);
         if ends.is_none() && self.last_key.is_some_and(|last| key.is_older_than(last)) {
