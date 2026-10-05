@@ -1151,3 +1151,148 @@ fn an_order_shown_resting_with_its_cancel_still_unresolved_stays_on_the_ladder()
     assert!(plan.queries.is_empty(), "not queried again");
     assert!(plan.resync);
 }
+
+// ---- review round 3: what put the order on the ladder, and the queries awaited ----
+
+#[test]
+fn a_placement_shown_resting_takes_a_pending_new_order_with_nothing_in_flight_off_the_ladder() {
+    let mut reg = Registry::new();
+    let c = reg.insert(placement(cid(), 100, 10)).unwrap().cid();
+    reg.cancel_sent(c, RpcId(2), at(1)).unwrap();
+    reg.on_outcome(
+        c,
+        OrderOp::Cancel(RpcId(2)),
+        &item(None, None),
+        &SubmitOutcome::Unknown,
+        at(2),
+    )
+    .unwrap();
+    assert_eq!(reg.get(c).unwrap().state(), OrdState::PendingNew);
+    // The cancel's late refusal settles it, but the placement is still unknown.
+    reg.on_outcome(
+        c,
+        OrderOp::Cancel(RpcId(2)),
+        &item(None, None),
+        &refused(RejectKind::Other),
+        at(3),
+    )
+    .unwrap();
+    assert!(reg.get(c).unwrap().ladder_step().is_some());
+    // The acknowledgement shows it resting with nothing in flight: off the ladder.
+    reg.on_outcome(
+        c,
+        OrderOp::Place,
+        &item(None, Some(vid("p1"))),
+        &accepted(),
+        at(4),
+    )
+    .unwrap();
+    let rec = reg.get(c).unwrap();
+    assert_eq!(rec.state(), OrdState::Open);
+    assert_eq!(rec.ladder_step(), None);
+    assert!(reg.live(c).is_ok());
+}
+
+#[test]
+fn a_later_command_settled_leaves_the_order_on_the_ladder_while_the_one_that_put_it_there_is_not() {
+    // What names the command whose fate puts an order on the ladder.
+    assert_eq!(OrderOp::Place.rpc(), None);
+    assert_eq!(OrderOp::Cancel(RpcId(3)).rpc(), Some(RpcId(3)));
+    for first_amend in [true, false] {
+        let amendable = OrderCaps {
+            amend: Some(amend_caps(false)),
+            ..caps()
+        };
+        let mut reg = Registry::new();
+        let c = open(&mut reg, "b1");
+        // A goes unanswered: the ladder takes the order.
+        let a = OrderOp::Amend(RpcId(3));
+        if first_amend {
+            reg.amend_sent(c, Ticks(101), lots(12), RpcId(3), at(10))
+                .unwrap();
+        } else {
+            reg.cancel_sent(c, RpcId(3), at(10)).unwrap();
+        }
+        let a = if first_amend {
+            a
+        } else {
+            OrderOp::Cancel(RpcId(3))
+        };
+        reg.on_outcome(c, a, &item(None, None), &SubmitOutcome::Unknown, at(15))
+            .unwrap();
+        // A safety cancel B fails: A's fate is still unknown.
+        for b in [
+            refused(RejectKind::Other),
+            SubmitOutcome::NotSent(fbc_core::NotSentReason::Disconnected),
+        ] {
+            reg.cancel_sent(c, RpcId(4), at(20)).unwrap();
+            assert_eq!(
+                reg.on_outcome(c, OrderOp::Cancel(RpcId(4)), &item(None, None), &b, at(21)),
+                Ok(OutcomeApplied::IntentCleared)
+            );
+            let rec = reg.get(c).unwrap();
+            assert_eq!(rec.unknown_since(), Some(at(15)));
+            assert_eq!(reg.live(c).unwrap_err(), PermitRefusal::OnLadder(c));
+        }
+        // Still counted at the largest total A may have left resting.
+        let resting = if first_amend { lots(12) } else { lots(10) };
+        assert_eq!(reg.get(c).unwrap().resting(), resting);
+        places_or_amends_nothing(&reg.ladder(&cfg(), &amendable, at(30)));
+    }
+}
+
+#[test]
+fn a_query_awaited_for_an_order_that_left_the_ladder_is_forgotten_on_the_next_pass() {
+    let mut reg = Registry::new();
+    let cids: Vec<ClientOrderId> = (0..3).map(|_| unknown(&mut reg)).collect();
+    assert_eq!(reg.ladder(&cfg(), &caps(), at(6)).queries.len(), 3);
+    for (n, &c) in cids.iter().enumerate() {
+        let n = n as u64;
+        reg.query_sent(c, RpcId(n)).unwrap();
+        reg.on_query_outcome(RpcId(n), &accepted());
+        // An event resolves it before the result, which never comes.
+        reg.apply_update(&update(Some(c), VenueOrderState::Open, 0), key(n));
+        assert_eq!(reg.get(c).unwrap().ladder_step(), None);
+    }
+    assert_eq!(reg.queries_awaited(), 3);
+    reg.ladder(&cfg(), &caps(), at(7));
+    assert_eq!(reg.queries_awaited(), 0);
+
+    // An order back on the ladder never takes its earlier query's late result.
+    let c = cancel_unanswered(&mut reg, "z1");
+    reg.ladder(&cfg(), &caps(), at(16));
+    reg.query_sent(c, RpcId(20)).unwrap();
+    reg.on_query_outcome(RpcId(20), &accepted());
+    let shown = [snap(Some(c), "z1", VenueOrderState::Open, 0)];
+    reg.on_resync(&cfg(), &caps(), wall(2_000), &shown, key(10));
+    // Its cancel is settled (refused): off the ladder, then a new cancel goes unanswered.
+    reg.on_outcome(
+        c,
+        OrderOp::Cancel(RpcId(50)),
+        &item(None, None),
+        &refused(RejectKind::Other),
+        at(17),
+    )
+    .unwrap();
+    assert_eq!(reg.get(c).unwrap().ladder_step(), None);
+    reg.cancel_sent(c, RpcId(51), at(18)).unwrap();
+    reg.on_outcome(
+        c,
+        OrderOp::Cancel(RpcId(51)),
+        &item(None, None),
+        &SubmitOutcome::Unknown,
+        at(19),
+    )
+    .unwrap();
+    let late = QueryAnswer::new(
+        RpcId(20),
+        OrderRef::Both(c, vid("z1")),
+        Some(snap(Some(c), "z1", canceled(), 0)),
+    )
+    .unwrap();
+    assert_eq!(
+        reg.on_query_answer(&late, key(11)),
+        LadderResolution::Ignored
+    );
+    assert_eq!(reg.get(c).unwrap().state(), OrdState::Open);
+}
