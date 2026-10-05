@@ -27,12 +27,14 @@ const INST: InstrumentId = InstrumentId::new(1);
 /// A registry whose inventory cap (0005's I6) is far above any order here: the permits are
 /// what these tests judge; the caps are `tests/caps.rs`'s.
 fn registry() -> Registry {
-    Registry::with_caps(PreTradeCaps::new().with_market(
+    let mut reg = Registry::with_caps(PreTradeCaps::new().with_market(
         INST,
         MarketCaps {
             inventory: lots(1_000_000),
         },
-    ))
+    ));
+    reg.seed_position(INST, SignedLots(0)).unwrap();
+    reg
 }
 
 fn accepted() -> SubmitOutcome {

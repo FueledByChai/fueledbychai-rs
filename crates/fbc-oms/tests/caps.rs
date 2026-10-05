@@ -43,8 +43,11 @@ fn caps(cap: i64) -> PreTradeCaps {
     )
 }
 
+/// A registry under the inventory cap `cap`, flat: its position seeded from the venue as 0.
 fn registry(cap: i64) -> Registry {
-    Registry::with_caps(caps(cap))
+    let mut reg = Registry::with_caps(caps(cap));
+    reg.seed_position(INST, SignedLots(0)).unwrap();
+    reg
 }
 
 fn buy(qty: i64) -> NewOrder {
@@ -478,6 +481,9 @@ fn a_batch_over_several_markets_or_repeating_a_client_id_is_refused_as_built() {
             inventory: lots(CAP),
         },
     ));
+    for market in [INST, OTHER] {
+        reg.seed_position(market, SignedLots(0)).unwrap();
+    }
     let mut eth = buy(1);
     eth.inst = OTHER;
     let btc = buy(1);
@@ -609,6 +615,45 @@ fn a_market_without_a_configured_cap_admits_nothing() {
 }
 
 #[test]
+fn a_market_admits_nothing_until_its_position_is_seeded_from_the_venue() {
+    // After a restart the account may already hold a position: until the venue's is seeded,
+    // the worst case is unknown and nothing is built.
+    let mut reg = Registry::with_caps(caps(CAP));
+    assert!(!reg.position_known(INST));
+    let unknown = OmsError::Capped(CapRefusal::PositionUnknown(INST));
+    assert_eq!(reg.place(buy(1)), Err(unknown.clone()));
+    assert_eq!(reg.place_batch(vec![buy(1)]).unwrap().refused[0].1, unknown);
+    let a = reg.insert(buy(1)).unwrap().cid();
+    outcome(&mut reg, a, OrderOp::Place, accepted(), Some("a"));
+    assert_eq!(
+        amend(&mut reg, &amending(true), a, 2, false),
+        Err(AmendRefusal::Capped(CapRefusal::PositionUnknown(INST)))
+    );
+    // Seeded long 50 under a cap of 50: no more bids, though offers reduce it.
+    reg.seed_position(INST, SignedLots(50)).unwrap();
+    assert!(reg.position_known(INST));
+    assert_eq!(reg.inventory(INST), SignedLots(50));
+    assert_eq!(reg.place(buy(1)), Err(capped(Side::Buy, 52)));
+    reg.place(sell(L0)).unwrap();
+    // Seeded once only.
+    assert_eq!(
+        reg.seed_position(INST, SignedLots(0)),
+        Err(OmsError::PositionSeeded(INST))
+    );
+    // A fill before the seed: how it counts against the snapshot is the resync's (FBC-38r),
+    // so the seed is refused and the market stays unknown.
+    let mut reg = Registry::with_caps(caps(CAP));
+    let mut l = ledger();
+    position(&mut reg, &mut l, Side::Buy, 5, "early");
+    assert_eq!(
+        reg.seed_position(INST, SignedLots(5)),
+        Err(OmsError::PositionMoved(INST))
+    );
+    assert!(!reg.position_known(INST));
+    assert_eq!(reg.place(sell(1)), Err(unknown));
+}
+
+#[test]
 fn a_worst_case_that_does_not_fit_is_refused() {
     let max = i64::MAX;
     // Resting that would overflow.
@@ -659,6 +704,21 @@ fn the_refusals_say_what_was_refused() {
     let overflow = breach(Side::Sell, None, CAP).to_string();
     assert!(overflow.contains("does not fit"), "{overflow}");
     assert!(OmsError::MixedMarkets.to_string().contains("market"));
+    let unknown = OmsError::Capped(CapRefusal::PositionUnknown(INST)).to_string();
+    assert!(
+        unknown.contains("not seeded") && unknown.contains(&inst),
+        "{unknown}"
+    );
+    assert!(
+        OmsError::PositionSeeded(INST)
+            .to_string()
+            .contains("already seeded")
+    );
+    assert!(
+        OmsError::PositionMoved(INST)
+            .to_string()
+            .contains("before its position was seeded")
+    );
     let err: &dyn std::error::Error = &breach(Side::Buy, Some(51), CAP);
     assert!(err.source().is_none());
 }
