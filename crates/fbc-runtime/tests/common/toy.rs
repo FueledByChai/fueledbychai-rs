@@ -43,7 +43,8 @@
 //! FBC-53c: `ack|sym=A` acknowledges instrument `A`'s subscription, as a venue does. The first
 //! acknowledgement a codec reads marks `A` live and, when the configuration's `toy.snapshot`
 //! names a base URL, asks for a GET of `<base>/A` (tag: the instrument's id, timeout 1 s), whose
-//! body is read like any response; a repeated acknowledgement asks for nothing.
+//! body is read like any response; a repeated acknowledgement asks for nothing, until a
+//! subscribe call removes `A`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
@@ -503,6 +504,11 @@ impl MdCodec for ToyMd {
         fx: &mut Effects,
     ) -> Result<(), VenueError> {
         self.subscribes.fetch_add(1, Ordering::SeqCst);
+        // A removed subscription's acknowledgement is forgotten: one added again is
+        // acknowledged afresh (Codex r4181466463).
+        for sub in remove {
+            self.live.remove(&sub.inst);
+        }
         let (add_subs, remove_subs) = (add, remove);
         let spell = |subs: &[Subscription]| -> Result<Vec<&str>, VenueError> {
             let spec = |s: &Subscription| {
