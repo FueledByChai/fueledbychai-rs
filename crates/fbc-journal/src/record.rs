@@ -313,9 +313,9 @@ pub enum Record {
         redact: Vec<Range<u32>>,
     },
     /// A frame written to a connection, with the kind it was sent as and its redaction spans.
-    /// A text frame's bytes are UTF-8 with its spans on character boundaries, so it stays UTF-8
-    /// blanked. The kind is kept rather than read off the bytes (FBC-q7b): a binary frame whose
-    /// only bytes that are not UTF-8 lie in its spans is UTF-8 once blanked.
+    /// A text frame's bytes are UTF-8 as sent; a span may split a character, so blanked they
+    /// need not be. The kind is kept rather than read off the bytes (FBC-q7b): a binary frame
+    /// whose only bytes that are not UTF-8 lie in its spans is UTF-8 once blanked.
     Outbound {
         at: MonoNs,
         conn: ConnKey,

@@ -42,3 +42,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0037](0037-property-tests-use-proptest-1-11-0-pinned-exactly-dev-only-d.md) Property tests use proptest 1.11.0, pinned exactly, dev-only, default features off, with a fixed seed per property — accepted
 - [0038](0038-a-trade-through-a-simulated-order-s-price-empties-the-queue-.md) A trade through a simulated order's price empties the queue ahead and fills it from the trade's size; a trade's size is spent once in match order — accepted
 - [0039](0039-a-session-tells-its-handler-each-connection-epoch-s-end-and-.md) A session tells its handler each connection epoch's end, and the runtime's books invalidate every book that epoch fed until its next snapshot, augmenting 0023 — accepted
+- [0040](0040-the-journal-keeps-the-kind-each-outbound-frame-was-sent-as-i.md) The journal keeps the kind each outbound frame was sent as in format version 5, augmenting 0028 — accepted
