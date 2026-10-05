@@ -24,6 +24,7 @@
 
 mod decode;
 mod exec;
+mod factory;
 mod session;
 mod signer;
 
@@ -32,17 +33,18 @@ use core::time::Duration;
 
 use fbc_core::{
     AckModel, AmendAck, AmendCaps, AmendQty, AssetSym, Batch, CancelBatch, CancelOnDisconnect,
-    Channel, Charset, ClientIdFormat, ConnTopology, DecodeScope, Encoding, ExecCaps, FeedSource,
-    FillCaps, FillSource, FundingCaps, FundingSpec, InstrumentId, InstrumentKind, InstrumentSpec,
-    LimitScope, Lots, MatchingCaps, MdCaps, Namespace, NonceScope, OpKind, OrderCaps, OrderKindTag,
-    OrderingKey, PriceGrid, RateLimit, Readiness, RefKind, SizeStep, SnapshotSource, SpecTable,
-    StpScope, StreamId, Support, TagSet, TifTag, TradeCaps, TradingStatus, UnderlyingId, VenueCaps,
-    VenueFeeSign, VenueId, WallNs, dispatch,
+    Channel, Charset, ClientIdFormat, ConnTopology, DecodeScope, Encoding, ExecCaps, Feature,
+    FeedSource, FillCaps, FillSource, FundingCaps, FundingSpec, InstrumentId, InstrumentKind,
+    InstrumentSpec, LimitScope, Lots, MatchingCaps, MdCaps, Namespace, NonceScope, OpKind,
+    OrderCaps, OrderKindTag, OrderingKey, PriceGrid, RateLimit, Readiness, RefKind, SizeStep,
+    SnapshotSource, SpecTable, StpScope, StreamId, Support, TagSet, TifTag, TradeCaps,
+    TradingStatus, UnderlyingId, VenueCaps, VenueFeeSign, VenueId, WallNs, dispatch,
 };
 use rust_decimal::Decimal;
 
 pub use decode::{REJECT_CODES, reject_kind};
 pub use exec::ToyExec;
+pub use factory::{EXEC_URL_KEY, NoMd, ToyFactory};
 pub use signer::ToySigner;
 
 /// The order-entry stream every request is written to.
@@ -94,7 +96,9 @@ pub fn caps_for(fill_ids: FillIds) -> VenueCaps {
                 channels: TagSet::of(&[Channel::Public]),
                 post_only: true,
                 reduce_only: true,
-                flag_conflicts: Vec::new(),
+                // A post-only order that is also immediate-or-cancel is refused: it could
+                // neither rest nor take.
+                flag_conflicts: vec![(Feature::PostOnly, Feature::Ioc)],
                 // An amend names its order by the venue's id only, and its quantity is what is
                 // left to fill.
                 amend: Some(AmendCaps {

@@ -6,7 +6,8 @@
 //! signer call is marked as the sign stage through [`PathStamps`] (0034).
 //!
 //! Before it signs anything it refuses, as `NotSent(Unsupported)`, an order (a placement, a
-//! batch item or an amend) of a kind, time in force, channel or flag its caps do not declare,
+//! batch item or an amend) of a kind, time in force, channel or flag its caps do not declare
+//! (and as `NotSent(FlagConflict)` one combining a pair its caps declare in conflict),
 //! an amend or cancel whose only references are undeclared for it (a batch cancel's
 //! references are narrower than a single cancel's), a batch longer than its `max_items`, and an
 //! account-wide cancel-all. What cannot be written is `Unencodable`: an instrument missing from
@@ -16,17 +17,17 @@
 use fbc_core::{
     AmendOrder, AmendRef, AmendWire, CancelOrder, CancelRef, CancelScope, CancelWire, Channel,
     ChosenRef, ClientOrderId, CtxCall, DecodeError, DecodeScope, Effect, Effects, EncodeCtx,
-    EncodeReceipt, ExecCodec, ExecEvent, ExecSink, FillCaps, HttpFailure, HttpResponse, HttpTag,
-    Inbound, InboundSpans, InstrumentId, NewOrder, NotSentReason, OpKind, OrderCaps, OrderKindTag,
-    OrderSigner, PathStage, PathStamps, PlaceWire, RateCharge, RawFrame, RefKind, RpcCall, RpcId,
-    Side, SpecTable, StreamId, TagSet, Tif, TimerTag, VenueCommand, VenueOrderId, WireCid,
-    WireSlice, encode_cid,
+    EncodeReceipt, ExecCodec, ExecEvent, ExecSink, Feature, FillCaps, HttpFailure, HttpResponse,
+    HttpTag, Inbound, InboundSpans, InstrumentId, NewOrder, NotSentReason, OpKind, OrderCaps,
+    OrderKindTag, OrderSigner, PathStage, PathStamps, PlaceWire, RateCharge, RawFrame, RefKind,
+    RpcCall, RpcId, Side, SpecTable, StreamId, TagSet, Tif, TimerTag, VenueCommand, VenueOrderId,
+    WireCid, WireSlice, encode_cid,
 };
 
 use super::session::{self, Answers};
 use super::{DEAD_MAN_TTL, EXEC_STREAM, FillIds, RPC_TIMEOUT, caps_for, decode, weight};
 
-use NotSentReason::{SignFailed, Unencodable, Unsupported};
+use NotSentReason::{FlagConflict, SignFailed, Unencodable, Unsupported};
 
 /// The toy's order-entry codec, signing through the [`OrderSigner`] it is given and decoding
 /// what the venue sends as the caps it was built with declare.
@@ -58,7 +59,9 @@ impl ToyExec {
         }
     }
 
-    /// Refuses an order of a kind, time in force, channel or flag the caps do not declare.
+    /// Refuses an order of a kind, time in force, channel or flag the caps do not declare
+    /// (`Unsupported`), then one combining a pair of features the caps declare in conflict
+    /// (`FlagConflict`).
     fn declared(
         &self,
         kind: OrderKindTag,
@@ -68,9 +71,19 @@ impl ToyExec {
     ) -> Result<(), NotSentReason> {
         let c = &self.order;
         let (post_only, reduce_only) = flags;
-        let flags = (!post_only || c.post_only) && (!reduce_only || c.reduce_only);
+        let offered = (!post_only || c.post_only) && (!reduce_only || c.reduce_only);
         let shape = c.kinds.contains(kind) && c.tifs.contains(tif) && c.channels.contains(channel);
-        (shape && flags).then_some(()).ok_or(Unsupported)
+        (shape && offered).then_some(()).ok_or(Unsupported)?;
+        let features = [
+            (Feature::PostOnly, post_only),
+            (Feature::ReduceOnly, reduce_only),
+            (Feature::Ioc, tif == Tif::Ioc),
+            (Feature::Fok, tif == Tif::Fok),
+            (Feature::Rpi, channel == Channel::Rpi),
+        ];
+        let has = |feature| features.contains(&(feature, true));
+        let conflict = c.flag_conflicts.iter().any(|&(a, b)| has(a) && has(b));
+        (!conflict).then_some(()).ok_or(FlagConflict)
     }
 
     fn check_place(&self, o: &NewOrder) -> Result<(), NotSentReason> {

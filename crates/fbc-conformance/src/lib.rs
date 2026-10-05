@@ -20,16 +20,24 @@
 //!   and [`silence_after_ack`], a connection that goes silent once its subscriptions are
 //!   acknowledged, followed by the reconnect (FBC-53c).
 //! - [`toy`], the conformance toy venue (decision 0044): so far its order entry, every
-//!   declared order capability exercised through `ExecCodec` (FBC-7lx), and its order updates,
-//!   fills, request rejects and venue modes decoded through `DecodeScope` (FBC-7ce).
+//!   declared order capability exercised through `ExecCodec` (FBC-7lx), its order updates,
+//!   fills, request rejects and venue modes decoded through `DecodeScope` (FBC-7ce), its answers
+//!   to queries, batches, resyncs and authentication (FBC-sal), and [`toy::ToyFactory`], the
+//!   factory the named suite builds it from (FBC-8ew).
+//! - [`suite`], the named conformance suite (design §6, FBC-8ew): [`suite!`], which an adapter
+//!   crate's `tests/conformance.rs` invokes with its factory, its fixture directory (whose
+//!   layout [`suite`] documents) and the setup its fixtures assume, each named check becoming a
+//!   test; and each check as a public function. So far `caps_truthful` and
+//!   `commands_selfcontained`; the conformance toy passes both, and a deliberately broken toy
+//!   fails `caps_truthful` (`tests/suite_broken.rs`).
 //!
-//! Not here yet: the named conformance suite and its macro, and the rest of the conformance toy
-//! venue.
+//! Not here yet: the suite's other checks, and the rest of the conformance toy venue.
 
 mod pacing;
 mod routes;
 mod script;
 mod server;
+pub mod suite;
 pub mod toy;
 
 pub use pacing::{PacingBreach, check_pacing};
