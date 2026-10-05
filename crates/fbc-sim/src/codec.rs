@@ -6,11 +6,11 @@ use std::sync::Arc;
 
 use fbc_core::{
     AckLevel, Channel, ChosenRef, CidMatch, CtxCall, DecodeError, DecodeScope, Effect, Effects,
-    EncodeCtx, EncodeReceipt, ExchTsKind, ExecCodec, ExecEvent, ExecSink, FillEvent, FillIdent,
-    HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans, ItemRef, Liquidity, Liquidity3,
-    NotSentReason, OpKind, OrderCaps, OrderKind, OrderUpdate, PathStamps, RateCharge, RawFrame,
-    Reject, RpcCall, RpcId, SpecTable, StreamId, SubmitOutcome, TimerTag, VenueCommand, VenueMeta,
-    VenueOrderState, WireSlice, encode_cid,
+    EncodeCtx, EncodeReceipt, ExchTsKind, ExecCodec, ExecEvent, ExecSink, Feature, FillEvent,
+    FillIdent, HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans, ItemRef, Liquidity,
+    Liquidity3, NotSentReason, OpKind, OrderCaps, OrderKind, OrderUpdate, PathStamps, RateCharge,
+    RawFrame, Reject, RpcCall, RpcId, SpecTable, StreamId, SubmitOutcome, TifTag, TimerTag,
+    VenueCommand, VenueMeta, VenueOrderState, WireSlice, encode_cid,
 };
 
 use crate::config::SimConfig;
@@ -54,6 +54,22 @@ impl SimCodec {
             && (self.caps.reduce_only || !o.reduce_only);
         if !offered {
             return Err(NotSentReason::Unsupported);
+        }
+        // Codex r4182154713: a pair the stood-in venue refuses together is refused here too.
+        let has = |feature| match feature {
+            Feature::PostOnly => o.post_only,
+            Feature::ReduceOnly => o.reduce_only,
+            Feature::Ioc => o.tif == TifTag::Ioc,
+            Feature::Fok => o.tif == TifTag::Fok,
+            Feature::Rpi => o.channel == Channel::Rpi,
+        };
+        if self
+            .caps
+            .flag_conflicts
+            .iter()
+            .any(|&(a, b)| has(a) && has(b))
+        {
+            return Err(NotSentReason::FlagConflict);
         }
         let cid =
             encode_cid(&self.caps.client_id, o.cid).map_err(|_| NotSentReason::Unencodable)?;
