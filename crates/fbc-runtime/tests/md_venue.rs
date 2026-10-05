@@ -16,7 +16,7 @@ use fbc_core::{
 };
 use fbc_runtime::{
     Connector, IngestClock, Liveness, MdVenue, MdVenueConfig, PlanError, ProxyConfig,
-    ReconnectPacing, SessionError, Step,
+    ReconnectPacing, SessionError, Step, WriteStall,
 };
 
 type Seen = Rc<RefCell<Vec<Envelope<MdEvent>>>>;
@@ -42,6 +42,7 @@ fn config(urls: &[String], conns: Range<u16>) -> MdVenueConfig {
         conns,
         limiter: venue.limiter(0),
         liveness: Liveness::new(Duration::from_secs(3_600), Duration::from_millis(1)).unwrap(),
+        write_stall: WriteStall::new(Duration::from_secs(3_600)).unwrap(),
     }
 }
 

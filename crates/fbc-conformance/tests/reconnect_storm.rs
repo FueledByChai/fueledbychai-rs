@@ -15,7 +15,7 @@ use fbc_conformance::{
 use fbc_core::{EndpointPlan, Envelope, MdEvent, MdTransport, VenueConfig, WireUrl};
 use fbc_runtime::{
     Connector, IngestClock, Input, Liveness, MdSession, MdSessionConfig, ProxyConfig,
-    ReconnectPacing,
+    ReconnectPacing, WriteStall,
 };
 use tokio::sync::oneshot;
 use toy::ToyVenue;
@@ -70,6 +70,7 @@ async fn a_session_rides_out_the_340_reconnect_storm_subscribed_once_per_epoch_a
         limiter: venue.limiter(0),
         // No silence window, for the same reason as no attempt deadline.
         liveness: Liveness::new(Duration::MAX, Duration::from_millis(1)).unwrap(),
+        write_stall: WriteStall::new(Duration::MAX).unwrap(),
     };
     let (mut session, control) =
         MdSession::new(config, move |env| keep.borrow_mut().push(env)).unwrap();

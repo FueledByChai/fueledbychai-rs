@@ -21,7 +21,7 @@ use fbc_core::{
 use fbc_runtime::{
     BucketKey, Connector, IngestClock, Liveness, MdSession, MdSessionConfig, MdVenue,
     MdVenueConfig, ProxyConfig, RateCounts, RateError, RateLimiter, ReconnectPacing, SafetyReserve,
-    ScopeCounts, SessionError,
+    ScopeCounts, SessionError, WriteStall,
 };
 use tokio::time::Instant;
 
@@ -97,6 +97,7 @@ fn session(venue: &'static ToyVenue, url: String, limiter: RateLimiter) -> MdSes
         conn: CONN,
         limiter,
         liveness: no_alarm(),
+        write_stall: WriteStall::new(Duration::from_secs(3_600)).unwrap(),
     }
 }
 
@@ -636,6 +637,7 @@ fn a_venue_declaring_an_address_volume_limit_is_refused_at_start() {
         conns: Range { start: 0, end: 4 },
         limiter: other,
         liveness: no_alarm(),
+        write_stall: WriteStall::new(Duration::from_secs(3_600)).unwrap(),
     };
     let err = MdVenue::new(config, |_| {}).err().unwrap();
     assert_eq!(err, SessionError::from(RateError::OtherLimits));

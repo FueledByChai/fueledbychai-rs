@@ -30,7 +30,15 @@
 //!
 //! One thread drives a session (design §5.1): [`MdSession::run`] spawns no task, so the read,
 //! the decode and the handler's call run in one call stack on the caller's current-thread
-//! runtime. Not here yet: a bound on a stalled write (FBC-ha3).
+//! runtime.
+//!
+//! **A stalled write (FBC-ha3, decision 0035).** A write waits on its peer for at most the
+//! consumer's [`WriteStall`] window from when it began: one not completed by then is abandoned,
+//! counted ([`MdCounters::write_stalls`]), and the epoch ends as a drop, reconnecting through
+//! the pacing. While it waits, the session's timers that fall due fire as they do (an ended
+//! epoch's into nothing), each stamped then, so it takes its place in ingest order, and the
+//! effects a current epoch's codec asks for join the rest of the batch, as an HTTP result's
+//! do. A timer due at the same instant as the window fires first.
 //!
 //! **Liveness (0033).** On a socket endpoint, each epoch sends its codec's [`Keepalive`] every
 //! interval the codec declares (a WebSocket ping, or the codec's own frame as Safety traffic),
@@ -65,11 +73,11 @@
 //! closing by [`ConnKey`] and each `subscribe` call. A record goes under the traffic class of
 //! what it records (a frame or request under its effect's, everything else Normal), and nothing
 //! waits on the journal: a record the sink has no room for is dropped and counted there, and
-//! the frame is written all the same. A write that failed, or that the control's drop
-//! interrupted, has no write result: whether any of it reached the venue is unknown, and the
-//! connection's `Closed` follows. A frame, timer firing or HTTP result the session takes as the
-//! control drops reaches no codec, and is journaled after the epoch's `Closed`, so a replay
-//! ([`crate::MdReplay`]) feeds it to none either. Pings, pongs and close frames carry no data and are not
+//! the frame is written all the same. A write that failed, that outlasted the write-stall
+//! window, or that the control's drop interrupted, has no write result: whether any of it
+//! reached the venue is unknown, and the connection's `Closed` follows. A frame, timer firing
+//! or HTTP result the session takes as the control drops reaches no codec, and is journaled
+//! after the epoch's `Closed`, so a replay ([`crate::MdReplay`]) feeds it to none either. Pings, pongs and close frames carry no data and are not
 //! journaled. Until FBC-7lm, nothing a codec receives carries redaction spans, so inbound
 //! frames and responses would be journaled verbatim: a session that carries a credential (its
 //! endpoint URL has a redaction span, or it has sent a frame or HTTP request with one, or with a
@@ -113,6 +121,7 @@ use crate::liveness::{Alive, Liveness, LivenessError};
 use crate::pacing::{Pacer, ReconnectPacing};
 use crate::ratelimit::{RateError, RateLimiter, Refused, Request};
 use crate::reconcile::{ReconcileError, Reconciler, SubscribeCall};
+use crate::stall::WriteStall;
 use crate::ws::{self, Message, WebSocket};
 
 /// Where the consumer receives a session's events: called once per event, in ingest order, on
@@ -288,6 +297,8 @@ pub struct MdSessionConfig {
     pub limiter: RateLimiter,
     /// The silence window and the rotation margin (0033).
     pub liveness: Liveness,
+    /// The longest one write may wait on a peer that stopped reading (0035).
+    pub write_stall: WriteStall,
 }
 
 /// Why a session could not start, or stopped.
@@ -389,6 +400,8 @@ pub struct MdCounters {
     pub silences: u64,
     /// Epochs ended to rotate the connection before the venue's lifetime.
     pub rotations: u64,
+    /// Epochs ended because a write did not complete within the write-stall window.
+    pub write_stalls: u64,
     /// Inbound frames and HTTP responses not journaled because the session carries a
     /// credential (until FBC-7lm).
     pub journal_withheld: u64,
@@ -409,6 +422,8 @@ pub struct MdSession<H> {
     silence: Duration,
     /// How long after it opens a connection is rotated; `None` where the venue sets no limit.
     rotate_after: Option<Duration>,
+    /// The consumer's write-stall window.
+    write_stall: Duration,
     epochs: Epochs,
     rec: Reconciler,
     desired: watch::Receiver<BTreeSet<Subscription>>,
@@ -523,6 +538,7 @@ impl<H: MdHandler> MdSession<H> {
             pacer: Pacer::new(config.pacing),
             silence: config.liveness.silence(),
             rotate_after,
+            write_stall: config.write_stall.window(),
             epochs,
             rec,
             desired,
@@ -1023,18 +1039,24 @@ impl<H: MdHandler> MdSession<H> {
     ) -> Result<bool, SessionError> {
         let mut open = true;
         if let Some((stamp, tag)) = self.take_timer()? {
-            let mut sink = Sink {
-                handler: &mut self.handler,
-                epochs: &mut self.epochs,
-                out: &mut self.outbox,
-                stamp,
-            };
             let mut fx = Effects::new();
-            feed_timer(codec, stamp, tag, &mut sink, &mut fx);
-            self.outbox.drain_into(&mut fx);
+            self.ring(codec, stamp, tag, &mut fx);
             open = self.execute(ws, codec, fx, false, Some(stamp)).await?;
         }
         Ok(open)
+    }
+
+    /// Hands a current epoch's timer firing to its codec, under `stamp`; the handler's writes
+    /// follow the codec's effects in `fx`.
+    fn ring(&mut self, codec: &mut dyn MdCodec, stamp: Stamp, tag: TimerTag, fx: &mut Effects) {
+        let mut sink = Sink {
+            handler: &mut self.handler,
+            epochs: &mut self.epochs,
+            out: &mut self.outbox,
+            stamp,
+        };
+        feed_timer(codec, stamp, tag, &mut sink, fx);
+        self.outbox.drain_into(fx);
     }
 
     /// Sends `call` and every call the reconciler yields after it, after the call waiting for
@@ -1236,14 +1258,17 @@ impl<H: MdHandler> MdSession<H> {
         Ok(open)
     }
 
-    /// Writes `message` on `ws`; false when the write failed or the control's drop interrupted
-    /// it. Requests in flight keep going while the write waits. A result that comes back
-    /// meanwhile reaches the codec at once, so the handler gets its events in the shard's
+    /// Writes `message` on `ws`; false when the write failed, did not complete within the
+    /// write-stall window (counted), or the control's drop interrupted it. Requests in flight
+    /// keep going while the write waits, and timers fire as they fall due (FBC-ha3), a timer
+    /// due with the window first. A result that comes back, or a current epoch's timer that
+    /// fires, meanwhile reaches the codec at once, so the handler gets its events in the shard's
     /// ingest order (Codex r4177698441). A request the codec asks for then starts at once, its
     /// timeout running from now (Codex r4177887264); its other effects join `effects`, behind
-    /// the rest of the batch, uncharged and attributed to the result. A request behind a
-    /// reconnect of this stream, still queued in `effects` or asked for first, waits too: that
-    /// reconnect ends the epoch before its turn, so it is never sent (Codex r4177934308).
+    /// the rest of the batch, uncharged and attributed to the result or firing. A request
+    /// behind a reconnect of this stream, still queued in `effects` or asked for first, waits
+    /// too: that reconnect ends the epoch before its turn, so it is never sent (Codex
+    /// r4177934308).
     async fn write(
         &mut self,
         ws: &mut WebSocket,
@@ -1252,19 +1277,38 @@ impl<H: MdHandler> MdSession<H> {
         effects: &mut VecDeque<(Effect, bool, Option<Stamp>)>,
     ) -> Result<bool, SessionError> {
         let (epoch, own) = (self.current().epoch, self.plan.stream);
+        // A window past the end of the clock never runs out.
+        let stalled = Instant::now().checked_add(self.write_stall);
         let send = ws.send(message);
         tokio::pin!(send);
         loop {
-            let done = tokio::select! {
+            let timer = self.next_deadline();
+            let woke = tokio::select! {
                 biased;
                 sent = &mut send => return Ok(sent.is_ok()),
                 _ = self.stop.changed() => return Ok(false),
-                Some(done) = self.http.next() => done,
+                _ = sleep_or_never(timer) => None,
+                _ = sleep_or_never(stalled) => {
+                    self.counters.write_stalls += 1;
+                    return Ok(false);
+                }
+                Some(done) = self.http.next() => Some(done),
             };
-            let done = self.stamp_http(done);
-            if let Some((stamp, done)) = self.admit_http(done)? {
-                let mut more = Effects::new();
-                self.answer(codec, stamp, done, &mut more);
+            let mut more = Effects::new();
+            let stamp = match woke {
+                None => self.take_timer()?.map(|(stamp, tag)| {
+                    self.ring(codec, stamp, tag, &mut more);
+                    stamp
+                }),
+                Some(done) => {
+                    let done = self.stamp_http(done);
+                    self.admit_http(done)?.map(|(stamp, done)| {
+                        self.answer(codec, stamp, done, &mut more);
+                        stamp
+                    })
+                }
+            };
+            if let Some(stamp) = stamp {
                 let mut ends = effects.iter().any(|(e, ..)| ends_epoch(e, own));
                 for effect in more.take() {
                     ends |= ends_epoch(&effect, own);

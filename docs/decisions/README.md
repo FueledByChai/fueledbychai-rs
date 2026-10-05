@@ -37,4 +37,5 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0032](0032-amends-and-batch-cancels-declare-the-order-references-they-c.md) Amends and batch cancels declare the order references they can name, and a codec refuses a request with none of them — accepted
 - [0033](0033-a-socket-endpoint-sends-its-codec-s-keepalive-rotates-before.md) A socket endpoint sends its codec's keepalive, rotates before the venue's connection lifetime and reports a silent stream stale before reconnecting — accepted
 - [0034](0034-a-codec-marks-its-latency-stages-through-write-only-pathstam.md) A codec marks its latency stages through write-only PathStamps and the runtime reads the clock — accepted
+- [0035](0035-a-socket-write-waits-on-its-peer-at-most-the-consumer-s-writ.md) A socket write waits on its peer at most the consumer's write-stall window, and timers due meanwhile fire — accepted
 - [0035](0035-instruments-are-discovered-as-one-round-of-http-requests-par.md) Instruments are discovered as one round of HTTP requests parsed in a decode scope, and resolved through a fixed alias table — accepted

@@ -87,6 +87,7 @@ mod reconcile;
 mod replay;
 mod session;
 mod socks5;
+mod stall;
 mod target;
 mod tcp;
 mod tls;
@@ -111,5 +112,6 @@ pub use session::{
     IngestClock, MdControl, MdCounters, MdHandler, MdSession, MdSessionConfig, Outbox,
     SessionError, TickToWire,
 };
+pub use stall::{WriteStall, WriteStallError};
 pub use tcp::Tcp;
 pub use transport::Transport;

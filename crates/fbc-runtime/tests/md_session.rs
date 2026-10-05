@@ -16,7 +16,7 @@ use fbc_core::{ConnKey, Envelope, Feed, FeedHealth, InstrumentId, MdEvent, MdTra
 use fbc_core::{EndpointPlan, VenueConfig};
 use fbc_runtime::{
     Connector, IngestClock, Input, Liveness, MdCounters, MdSession, MdSessionConfig, ProxyConfig,
-    ReconnectPacing, SessionError, Step,
+    ReconnectPacing, SessionError, Step, WriteStall,
 };
 
 type Seen = Rc<RefCell<Vec<(ThreadId, Envelope<MdEvent>)>>>;
@@ -55,6 +55,7 @@ fn session(
         conn: CONN,
         limiter: venue.limiter(0),
         liveness: Liveness::new(Duration::from_secs(3_600), Duration::from_millis(1)).unwrap(),
+        write_stall: WriteStall::new(Duration::from_secs(3_600)).unwrap(),
     }
 }
 
