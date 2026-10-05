@@ -25,6 +25,7 @@ pub mod fee;
 pub mod grid;
 pub mod ids;
 pub mod instrument;
+pub mod lease;
 pub mod mint;
 pub mod resolve;
 pub mod scope;
@@ -74,6 +75,7 @@ pub use instrument::{
     FundingSpec, InstrumentKind, InstrumentSpec, QtyError, QuantizeError, SizeStep, TradingStatus,
     VenueNativeId,
 };
+pub use lease::{AccountLease, LeaseName, MAX_LOCK_FILE_NAME_LEN, MarketLease, NamedLeaseError};
 pub use mint::{CidMint, LeaseError, LeaseIo, NamespaceLease};
 pub use resolve::{
     AliasError, AliasTable, AssetKey, InstrumentResolver, InstrumentSpecDraft, Listing,
