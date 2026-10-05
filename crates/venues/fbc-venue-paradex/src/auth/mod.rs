@@ -462,8 +462,8 @@ impl fmt::Display for LoginError {
 impl std::error::Error for LoginError {}
 
 /// Logins as effects, for an order-entry codec: one when started, then one each time the
-/// refresh timer fires, which is set after every login answer, a failed one included, for the
-/// configured refresh interval. The token is kept until a later login gives another, so a
+/// refresh timer fires, which is set after every login answer, a failed one included, and
+/// after every login that could not be signed, for the configured refresh interval. The token is kept until a later login gives another, so a
 /// failed login leaves the last one in place. The codec routes the answer to
 /// [`login_tag`](LoginCycle::login_tag) and the firing of
 /// [`refresh_tag`](LoginCycle::refresh_tag) here.
@@ -500,16 +500,36 @@ impl LoginCycle {
         self.token.as_ref()
     }
 
-    /// Asks for the first login, signed at `ctx`'s time. `Err` pushes nothing.
+    /// Asks for the first login, signed at `ctx`'s time. `Err` says why it could not be
+    /// signed; the refresh timer is set instead, for the configured interval, so its firing
+    /// tries again and the cycle never stops refreshing by itself. The codec reports the
+    /// error (FBC-xzp).
     pub fn start(&mut self, ctx: &EncodeCtx, fx: &mut Effects) -> Result<(), SignError> {
-        fx.push(self.login.request(ctx, self.login_tag)?);
-        Ok(())
+        match self.login.request(ctx, self.login_tag) {
+            Ok(login) => {
+                fx.push(login);
+                Ok(())
+            }
+            Err(err) => {
+                fx.push(self.refresh_timer());
+                Err(err)
+            }
+        }
     }
 
-    /// The refresh timer fired: asks for the next login, signed at `ctx`'s time. `Err` pushes
-    /// nothing.
+    /// The refresh timer fired: asks for the next login, signed at `ctx`'s time. `Err` says
+    /// why it could not be signed, and sets the timer again, as [`start`](LoginCycle::start)
+    /// does.
     pub fn on_timer(&mut self, ctx: &EncodeCtx, fx: &mut Effects) -> Result<(), SignError> {
         self.start(ctx, fx)
+    }
+
+    /// The refresh timer, for the configured interval.
+    fn refresh_timer(&self) -> Effect {
+        Effect::Timer {
+            tag: self.refresh_tag,
+            after: self.login.refresh,
+        }
     }
 
     /// The login's answer, or why none came: keeps the token it gives, and sets the refresh
@@ -520,10 +540,7 @@ impl LoginCycle {
         answer: Result<HttpResponse<'_>, HttpFailure>,
         fx: &mut Effects,
     ) -> Result<(), LoginError> {
-        fx.push(Effect::Timer {
-            tag: self.refresh_tag,
-            after: self.login.refresh,
-        });
+        fx.push(self.refresh_timer());
         let resp = answer.map_err(LoginError::Failed)?;
         if !(200..300).contains(&resp.status) {
             return Err(LoginError::Status(resp.status));

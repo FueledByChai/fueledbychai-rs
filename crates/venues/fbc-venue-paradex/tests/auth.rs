@@ -444,7 +444,9 @@ fn login_errors_say_what_failed_and_never_what_the_venue_sent() {
     for (err, text) in cases {
         assert_eq!(err.to_string(), text);
     }
-    // A login signed before 1970 is not signed.
+    // A login signed before 1970 is not signed. The owner's review: the cycle does not stop
+    // refreshing when signing fails; it reports the failure and sets the refresh timer for
+    // the configured interval instead, so the next firing tries again.
     let mut fx = Effects::new();
     let mut cycle = LoginCycle::new(login(), LOGIN, REFRESH_TIMER);
     let before = EncodeCtx {
@@ -452,9 +454,19 @@ fn login_errors_say_what_failed_and_never_what_the_venue_sent() {
         ..ctx_at(0)
     };
     let refused = Err(SignError::Unsignable("timestamp before 1970"));
+    let retry = Effect::Timer {
+        tag: REFRESH_TIMER,
+        after: Duration::from_secs(60),
+    };
     assert_eq!(cycle.start(&before, &mut fx), refused);
+    assert_eq!(fx.take(), std::slice::from_ref(&retry));
     assert_eq!(cycle.on_timer(&before, &mut fx), refused);
-    assert!(fx.is_empty());
+    assert_eq!(fx.take(), std::slice::from_ref(&retry));
+    assert!(cycle.token().is_none());
+    // The timer's next firing, at a time that signs, logs in.
+    let at = ctx_at(1_759_400_120);
+    cycle.on_timer(&at, &mut fx).unwrap();
+    assert_eq!(fx.take(), [login().request(&at, LOGIN).unwrap()]);
     // The latest wall time there is still signs: a lifetime of at most a week cannot carry
     // the expiry past u64 seconds.
     let last = EncodeCtx {
