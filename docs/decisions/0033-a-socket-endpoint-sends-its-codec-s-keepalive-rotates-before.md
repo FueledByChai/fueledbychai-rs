@@ -36,7 +36,9 @@ FBC-ha3), not by the silence window.
   included) within the silence window, counted from the epoch's open and from each frame
   read, is reported stale: one `MdEvent::Health { h: Stale }` per subscription wanted when
   the window runs out (the control's latest set, even one the session has not applied yet),
-  all under one stamp of the silent epoch, handed to the consumer's handler. Then the connection is
+  all under one stamp of the silent epoch, handed to the consumer's handler. A write the
+  handler issues through its `Outbox` as it is told is not sent, on the closing connection
+  or the next, and is counted with the refused effects. Then the connection is
   closed and the session reconnects as after any drop, waiting the floor within the budget. A
   frame that was already waiting when the window ran out (a write held the session) counts as
   heard. A poll endpoint has no keepalive, rotation or silence window.
