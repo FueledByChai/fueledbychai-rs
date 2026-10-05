@@ -1,0 +1,26 @@
+# BookEvent (template 3), schema 1:1, block 89: an ETH-USD-PERP DELTA at seq 503, after the snapshot at 502
+# Hand-built from paradex_1_0.xml at tradeparadex/paradex-py b8248fb747e278d2167ac2f056b339a287d5ef30.
+# Little-endian; '#' starts a comment.
+59 00 03 00 01 00 01 00                           # header: blockLength=89 templateId=3 (BookEvent) schemaId=1 version=1
+d0 2a 81 84 41 40 06 00                           # @0 ts int64 = 1759500000373456 us
+f7 01 00 00 00 00 00 00                           # @8 seq int64 = 503
+01                                                # @16 pkgType uint8 = 1 (DELTA)
+00 00 00 00 00 00 00 80                           # @17 bestBidPrice int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @25 bestBidSize int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @33 bestAskPrice int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @41 bestAskSize int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @49 relativeSpread int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @57 bestBidApiPrice int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @65 bestBidApiSize int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @73 bestAskApiPrice int64 = null (INT64_MIN)
+00 00 00 00 00 00 00 80                           # @81 bestAskApiSize int64 = null (INT64_MIN)
+10 00 01 00                                       # bids group: blockLength=16 numInGroup=1
+00 ba 7f e3 37 00 00 00                           #   price = 240040000000 (2400.4)
+00 65 cd 1d 00 00 00 00                           #   size = 500000000 (5)
+10 00 02 00                                       # asks group: blockLength=16 numInGroup=2
+00 6e 44 e8 37 00 00 00                           #   price = 240120000000 (2401.2)
+00 00 00 00 00 00 00 00                           #   size = 0 (0) : removes the level
+80 04 dd e8 37 00 00 00                           #   price = 240130000000 (2401.3)
+80 f0 fa 02 00 00 00 00                           #   size = 50000000 (0.5)
+0c                                                # market varString8 length = 12
+45 54 48 2d 55 53 44 2d 50 45 52 50               # market = "ETH-USD-PERP"
