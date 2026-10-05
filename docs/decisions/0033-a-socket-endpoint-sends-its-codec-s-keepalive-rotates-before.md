@@ -19,8 +19,10 @@ FBC-ha3), not by the silence window.
 
 - **Configuration.** `Liveness::new(silence, rotation_margin)`, carried by `MdSessionConfig`
   and `MdVenueConfig`, with no default in code (0009) and zeros refused. A margin not below
-  the venue's declared lifetime is refused when the session or venue is built
-  (`SessionError::Liveness`).
+  the venue's declared lifetime is refused when a socket endpoint's session or the venue is
+  built (`SessionError::Liveness`); a poll endpoint's session opens no connection to rotate and
+  is not checked. The venue checks eagerly because it may plan a socket endpoint at any time,
+  and a refusal then would end its run.
 - **Keepalive.** Each epoch of a socket endpoint sends its codec's keepalive every declared
   interval from the epoch's open: a WebSocket ping (not journaled, like every control frame),
   or the codec's frame as an `Effect::Send` of Safety traffic, journaled as any frame is. Either

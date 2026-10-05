@@ -497,7 +497,13 @@ impl<H: MdHandler> MdSession<H> {
             .caps(&config.cfg)
             .map_err(SessionError::Config)?;
         config.limiter.check(&caps.limits)?;
-        let rotate_after = config.liveness.rotate_after(caps.md.max_conn_lifetime)?;
+        // Only a socket endpoint opens a connection to rotate (Codex r4180333662).
+        let rotate_after = match config.plan.transport {
+            MdTransport::Socket { .. } => {
+                config.liveness.rotate_after(caps.md.max_conn_lifetime)?
+            }
+            MdTransport::Poll { .. } => None,
+        };
         let epochs = Epochs::new(config.conn);
         let mut rec = Reconciler::new(epochs.current());
         let first: BTreeSet<_> = config.plan.subs.iter().copied().collect();
