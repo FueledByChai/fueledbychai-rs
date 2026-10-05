@@ -825,7 +825,7 @@ impl ExecSink for Collect {
 }
 
 #[test]
-fn outside_encode_the_toy_signs_nothing_decodes_nothing_yet_and_times_a_request_out_as_unknown() {
+fn outside_encode_the_toy_signs_nothing_decodes_no_ack_yet_and_times_a_request_out_as_unknown() {
     let mut codec = ToyExec::new(Box::new(ToySigner));
     for call in [
         CtxCall::Open(EXEC_STREAM),
@@ -839,6 +839,8 @@ fn outside_encode_the_toy_signs_nothing_decodes_nothing_yet_and_times_a_request_
     codec.on_timer(TimerTag(1), &ctx(), &mut fx);
     codec.resync(&ctx(), &mut fx);
     assert!(fx.is_empty());
+    // Acknowledgements are decoded with FBC-sal; the toy's order and fill events are
+    // toy_events.rs's.
     let frame = RawFrame::Text("ack|rpc=11");
     let specs = toy::specs();
     toy::with_scope(|scope| {

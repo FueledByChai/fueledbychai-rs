@@ -6,17 +6,21 @@
 //! files), so another crate's tests can include it with
 //! `#[path = "../../fbc-conformance/src/toy/mod.rs"] mod toy;`.
 //!
-//! So far (FBC-7lx) it is order entry: [`ToyExec`] encodes every [`VenueCommand`] kind, checking
+//! So far it is order entry (FBC-7lx): [`ToyExec`] encodes every [`VenueCommand`] kind, checking
 //! the kind, time in force, channel and flags of every order against [`caps`] before it signs
 //! anything, and [`ToySigner`] signs places, amends and cancels seeing only the reference the
-//! request carries. It decodes nothing yet: order updates and fills arrive with FBC-7ce, queries
-//! answered, resync and authentication with FBC-sal, market data with FBC-u1d and FBC-z2s.
+//! request carries; and the order and fill events (FBC-7ce): [`ToyExec`] decodes order updates,
+//! fills, request rejects (through [`REJECT_CODES`]) and venue modes through the
+//! [`DecodeScope`] it is lent. Queries answered, acknowledgements, resync and authentication
+//! arrive with FBC-sal, market data with FBC-u1d and FBC-z2s.
 //!
 //! Protocol: its own, describing no real venue, as `fbc-core`'s toy: one record per line,
 //! `kind|key=value|...`. A request's first record names its `rpc`; a batch's first record
 //! counts its items (`n`), one record per item following, each numbered (`i`). Prices are
-//! ticks, sizes lots, `ts` the signature time in nanoseconds from the encode context.
+//! ticks, sizes lots, `ts` the signature time in nanoseconds from the encode context. What the
+//! venue sends is one record per frame; its fields are listed where it is decoded.
 
+mod decode;
 mod exec;
 mod signer;
 
@@ -34,6 +38,7 @@ use fbc_core::{
 };
 use rust_decimal::Decimal;
 
+pub use decode::{REJECT_CODES, reject_kind};
 pub use exec::ToyExec;
 pub use signer::ToySigner;
 
@@ -54,9 +59,25 @@ pub const MAX_BATCH: u16 = 4;
 /// The dead-man timer cancel-on-disconnect arms and each refresh restarts.
 pub const DEAD_MAN_TTL: Duration = Duration::from_secs(10);
 
-/// What the toy declares. Order entry is what its codec exercises so far; the fill fields are
-/// what FBC-7ce decodes, and it declares no market data yet.
+/// Whether the toy's fills carry a venue fill id ([`FillCaps::fill_id`]). Venues differ here,
+/// and the flag is one per venue, so the toy is declared either way and its frames keep to the
+/// declaration it was built with (Codex r4172835753).
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum FillIds {
+    /// Every fill names its venue fill id; [`caps`] declares this.
+    Venue,
+    /// No fill names one: fills are keyed by order and cumulative quantity.
+    Derived,
+}
+
+/// What the toy declares, its fills carrying venue fill ids. Order entry and order and fill
+/// events are what its codec exercises so far; it declares no market data yet.
 pub fn caps() -> VenueCaps {
+    caps_for(FillIds::Venue)
+}
+
+/// What the toy declares with fill ids as `fill_ids` says; nothing else differs.
+pub fn caps_for(fill_ids: FillIds) -> VenueCaps {
     let by_venue_or_nonce = TagSet::of(&[RefKind::Venue, RefKind::PlacementNonce]);
     VenueCaps {
         exec: Some(ExecCaps {
@@ -76,8 +97,10 @@ pub fn caps() -> VenueCaps {
                     flags: true,
                     when_partially_filled: true,
                     reject_keeps_original: true,
-                    keeps_venue_id: true,
-                    ack: AmendAck::RpcReplyOnly,
+                    // An amended order gets a new venue id, which the order event reporting
+                    // the replaced order names.
+                    keeps_venue_id: false,
+                    ack: AmendAck::ReplacedEvent,
                     qty_semantics: AmendQty::Remaining,
                     keeps_priority: None,
                 }),
@@ -120,12 +143,12 @@ pub fn caps() -> VenueCaps {
             fills: FillCaps {
                 source: FillSource::Native,
                 liquidity_flag: true,
-                realized_pnl: false,
-                realized_funding: false,
+                realized_pnl: true,
+                realized_funding: true,
                 fee_sign: VenueFeeSign::PositiveIsCost,
                 fee_asset_reported: true,
-                fill_id: true,
-                replays_fills_on_reconnect: false,
+                fill_id: fill_ids == FillIds::Venue,
+                replays_fills_on_reconnect: true,
             },
         }),
         matching: MatchingCaps {
@@ -175,7 +198,12 @@ pub fn caps() -> VenueCaps {
 
 /// Runs `f` in the decode scope the core lends for the toy's caps and namespace.
 pub fn with_scope<R>(f: impl for<'s> FnOnce(&'s DecodeScope<'s>) -> R) -> R {
-    dispatch(&caps(), OWN_NS, f)
+    with_scope_for(FillIds::Venue, f)
+}
+
+/// Runs `f` in the decode scope the core lends for the toy declared with `fill_ids`.
+pub fn with_scope_for<R>(fill_ids: FillIds, f: impl for<'s> FnOnce(&'s DecodeScope<'s>) -> R) -> R {
+    dispatch(&caps_for(fill_ids), OWN_NS, f)
 }
 
 /// The toy's instrument specs.
