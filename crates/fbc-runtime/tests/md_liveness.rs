@@ -576,6 +576,44 @@ async fn a_window_that_runs_out_as_the_connection_rotates_is_silence() {
     );
 }
 
+/// Codex r4180372215: a keepalive due once the window has run out is not sent on the silent
+/// stream; the stream is reported stale and closed first. Which of two deadlines due at once
+/// the session sees first is chance, so it is tried on many epochs.
+#[tokio::test(start_paused = true)]
+async fn a_keepalive_due_as_the_window_runs_out_is_not_sent_on_the_silent_stream() {
+    const EPOCHS: u32 = 16;
+    let frozen = freeze();
+    let mut server = ScriptedWs::start().await;
+    let seen = Seen::default();
+    let liveness = Liveness::new(ms(5_000), ms(1)).unwrap();
+    let config = toy_session(server.url(), &[(KEEPALIVE, "frame:5000")], liveness);
+    let (mut session, control) = MdSession::new(config, keep(&seen)).unwrap();
+    let watch = seen.clone();
+    let script = async move {
+        let mut peer = server.accept().await;
+        for epoch in 0..EPOCHS {
+            assert_eq!(peer.recv().await, format!("hello|codec={epoch}|plan=1,2"));
+            assert_eq!(peer.recv().await, "sub|add=A,B");
+            advance(ms(5_000)).await;
+            let reports = 2 * (epoch as usize + 1);
+            settle(|| watch.borrow().len() == reports).await;
+            // Closed with no keepalive written first.
+            assert_eq!(peer.next().await, None);
+            advance(ms(1_000)).await;
+            peer = server.accept().await;
+        }
+        drop(control);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    drop(frozen);
+    let counters = session.counters();
+    assert_eq!(
+        (counters.silences, counters.keepalives),
+        (u64::from(EPOCHS), 0)
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_frame_that_waited_behind_a_held_write_is_heard_not_silence() {
     let frozen = freeze();

@@ -773,12 +773,13 @@ impl<H: MdHandler> MdSession<H> {
                 _ = sleep_or_never(alive.silent_at) => Wake::Silent,
                 _ = sleep_or_never(alive.rotate_at) => Wake::Rotate,
             };
-            // A rotation due once the window has run out too is a silence, whichever deadline
-            // the select saw first (Codex r4180246768). A frame already waiting when the window
-            // ran out, because a write held the session, was heard: it is read, not reported
-            // silent.
+            // A rotation or a keepalive due once the window has run out too is a silence,
+            // whichever deadline the select saw first: nothing is written on a silent stream
+            // before it is reported (Codex r4180246768, r4180372215). A frame already waiting
+            // when the window ran out, because a write held the session, was heard: it is read,
+            // not reported silent.
             let wake = match wake {
-                Wake::Rotate if alive.silent_by(Instant::now()) => Wake::Silent,
+                Wake::Rotate | Wake::Keepalive if alive.silent_by(Instant::now()) => Wake::Silent,
                 other => other,
             };
             let wake = match wake {
