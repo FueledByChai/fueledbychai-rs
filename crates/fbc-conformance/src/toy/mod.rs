@@ -11,8 +11,10 @@
 //! anything, and [`ToySigner`] signs places, amends and cancels seeing only the reference the
 //! request carries; and the order and fill events (FBC-7ce): [`ToyExec`] decodes order updates,
 //! fills, request rejects (through [`REJECT_CODES`]) and venue modes through the
-//! [`DecodeScope`] it is lent. Queries answered, acknowledgements, resync and authentication
-//! arrive with FBC-sal, market data with FBC-u1d and FBC-z2s.
+//! [`DecodeScope`] it is lent; and the answers (FBC-sal): order queries by venue id or placement
+//! nonce answered with the query's rpc, a request's items answered in separate frames held and
+//! pushed in one call, a resync answered in frames and pushed whole at its end, and an
+//! authentication with [`TOY_TOKEN`] acknowledged. Market data arrives with FBC-u1d and FBC-z2s.
 //!
 //! Protocol: its own, describing no real venue, as `fbc-core`'s toy: one record per line,
 //! `kind|key=value|...`. A request's first record names its `rpc`; a batch's first record
@@ -22,6 +24,7 @@
 
 mod decode;
 mod exec;
+mod session;
 mod signer;
 
 use core::num::NonZeroU32;
@@ -58,6 +61,10 @@ pub const SYMBOL_B: &str = "TOYB-PERP";
 pub const MAX_BATCH: u16 = 4;
 /// The dead-man timer cancel-on-disconnect arms and each refresh restarts.
 pub const DEAD_MAN_TTL: Duration = Duration::from_secs(10);
+/// The token the toy authenticates with: synthetic, of no account and no venue. It stands for
+/// a session credential, so it goes out in a redaction span and `redact_inbound` names it in
+/// the acknowledgement that echoes it (decision 0028).
+pub const TOY_TOKEN: &str = "toy-session-token";
 
 /// Whether the toy's fills carry a venue fill id ([`FillCaps::fill_id`]). Venues differ here,
 /// and the flag is one per venue, so the toy is declared either way and its frames keep to the

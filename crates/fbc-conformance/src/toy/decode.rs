@@ -12,6 +12,9 @@
 //! - `reject|rpc|code|msg?`: the venue refused request `rpc` as a whole.
 //! - `mode|m|sym?|ts?|seq?`: a venue mode, for market `sym` or, without one, the account.
 //!
+//! The answers to requests, resyncs and authentication are read here too ([`snapshot`],
+//! [`position`], [`refusal`]) but held by the session ([`super::session`]).
+//!
 //! Every field the caps promise is required (client ids and flags echoed, liquidity, the fee's
 //! asset, realized P&L and funding, a sequence on order and fill events), an optional quantity
 //! that is present must be a count (Codex r4172917318: negative is malformed, never absent), and
@@ -23,8 +26,9 @@ use core::str::FromStr;
 use fbc_core::{
     AssetSym, CancelReason, DecodeError, DecodeScope, ExchNs, ExchTsKind, ExecEvent, FillCaps,
     FillEvent, FillIdent, InstrumentSpec, Liquidity3, Lots, ModeScope, Money, NotAmendable,
-    OrderUpdate, RawFrame, Reject, RejectKind, RpcId, Side, SpecTable, SubmitOutcome, TerminalHint,
-    TerminalReject, Ticks, VenueMeta, VenueMode, VenueOrderState,
+    OrderUpdate, PxExact, RawFrame, Reject, RejectKind, RpcId, Side, SignedLots, SpecTable,
+    SubmitOutcome, TerminalHint, TerminalReject, Ticks, VenueMeta, VenueMode, VenueOrderSnapshot,
+    VenueOrderState,
 };
 
 use DecodeError::Malformed;
@@ -60,28 +64,32 @@ pub fn reject_kind(code: &str) -> RejectKind {
     found.map_or(RejectKind::Other, |(_, kind)| *kind)
 }
 
-/// The one event `frame` carries, with what the venue said about its time and order.
-pub(super) fn event(
-    frame: RawFrame<'_>,
-    fills: &FillCaps,
-    scope: &DecodeScope<'_>,
-    specs: &SpecTable,
-) -> Result<(VenueMeta, ExecEvent), DecodeError> {
+/// The one record `frame` carries.
+pub(super) fn record(frame: RawFrame<'_>) -> Result<Record<'_>, DecodeError> {
     let RawFrame::Text(text) = frame else {
         return Err(Malformed("binary frame"));
     };
     if text.lines().count() > 1 {
         return Err(Malformed("one record per frame"));
     }
-    let r = Record::parse(text)?;
+    Record::parse(text)
+}
+
+/// The one event record `r` carries, with what the venue said about its time and order.
+pub(super) fn event(
+    r: &Record<'_>,
+    fills: &FillCaps,
+    scope: &DecodeScope<'_>,
+    specs: &SpecTable,
+) -> Result<(VenueMeta, ExecEvent), DecodeError> {
     Ok(match r.kind {
-        "order" => (r.meta(true)?, ExecEvent::Order(order(&r, scope, specs)?)),
+        "order" => (r.meta(true)?, ExecEvent::Order(order(r, scope, specs)?)),
         "fill" | "refill" => (
             r.meta(true)?,
-            ExecEvent::Fill(fill(&r, fills, scope, specs)?),
+            ExecEvent::Fill(fill(r, fills, scope, specs)?),
         ),
-        "reject" => (r.meta(false)?, reject(&r)?),
-        "mode" => (r.meta(false)?, mode(&r, specs)?),
+        "reject" => (r.meta(false)?, reject(r)?),
+        "mode" => (r.meta(false)?, mode(r, specs)?),
         _ => return Err(Malformed("kind")),
     })
 }
@@ -190,16 +198,56 @@ fn fill(
 
 /// A refusal of the whole request: its outcome for every item, which answers it.
 fn reject(r: &Record<'_>) -> Result<ExecEvent, DecodeError> {
-    let code = r.get("code")?;
-    let reject = Reject {
-        kind: reject_kind(code),
-        venue_code: Some(code.into()),
-        raw: r.opt("msg").unwrap_or("").into(),
-    };
     Ok(ExecEvent::Outcome {
         rpc: RpcId(r.num("rpc")?),
         item: None,
-        outcome: SubmitOutcome::Rejected(reject),
+        outcome: SubmitOutcome::Rejected(refusal(r)?),
+    })
+}
+
+/// The venue's refusal a record states: its `code`, read through [`REJECT_CODES`], and its
+/// message `msg` when it sends one.
+pub(super) fn refusal(r: &Record<'_>) -> Result<Reject, DecodeError> {
+    let code = r.get("code")?;
+    Ok(Reject {
+        kind: reject_kind(code),
+        venue_code: Some(code.into()),
+        raw: r.opt("msg").unwrap_or("").into(),
+    })
+}
+
+/// One order as a query answer or a resync reports it: every field the caps promise is
+/// required, and its total quantity covers its filled part; `px` is absent for an order
+/// without a price.
+pub(super) fn snapshot(
+    r: &Record<'_>,
+    scope: &DecodeScope<'_>,
+    specs: &SpecTable,
+) -> Result<VenueOrderSnapshot, DecodeError> {
+    let (qty, cum_filled) = (r.lots("qty")?, r.lots("cum")?);
+    if cum_filled > qty {
+        return Err(Malformed("cum"));
+    }
+    Ok(VenueOrderSnapshot {
+        cid: Some(scope.client_order_id(r.get("cid")?)),
+        vid: scope.venue_order_id(r.get("vid")?)?,
+        inst: r.spec(specs)?.id,
+        side: r.side()?,
+        state: state(r, scope)?,
+        px: r.opt_num("px")?.map(Ticks),
+        qty,
+        cum_filled,
+        post_only: Some(r.flag("po")?),
+        reduce_only: Some(r.flag("ro")?),
+    })
+}
+
+/// A position: its market `sym`, signed quantity `qty` and, when sent, average entry `avg`.
+pub(super) fn position(r: &Record<'_>, specs: &SpecTable) -> Result<ExecEvent, DecodeError> {
+    Ok(ExecEvent::ResyncPosition {
+        inst: r.spec(specs)?.id,
+        qty: SignedLots(r.num("qty")?),
+        avg_entry: r.opt_num::<PxExact>("avg")?,
     })
 }
 
@@ -220,8 +268,8 @@ fn mode(r: &Record<'_>, specs: &SpecTable) -> Result<ExecEvent, DecodeError> {
 }
 
 /// One record: its kind and its fields in order.
-struct Record<'a> {
-    kind: &'a str,
+pub(super) struct Record<'a> {
+    pub(super) kind: &'a str,
     fields: Vec<(&'a str, &'a str)>,
 }
 
@@ -235,24 +283,24 @@ impl<'a> Record<'a> {
         Ok(Record { kind, fields })
     }
 
-    fn opt(&self, key: &str) -> Option<&'a str> {
+    pub(super) fn opt(&self, key: &str) -> Option<&'a str> {
         self.fields.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
     }
 
-    fn get(&self, key: &'static str) -> Result<&'a str, DecodeError> {
+    pub(super) fn get(&self, key: &'static str) -> Result<&'a str, DecodeError> {
         self.opt(key).ok_or(Malformed(key))
     }
 
-    fn num<T: FromStr>(&self, key: &'static str) -> Result<T, DecodeError> {
+    pub(super) fn num<T: FromStr>(&self, key: &'static str) -> Result<T, DecodeError> {
         self.get(key)?.parse().map_err(|_| Malformed(key))
     }
 
-    fn opt_num<T: FromStr>(&self, key: &'static str) -> Result<Option<T>, DecodeError> {
+    pub(super) fn opt_num<T: FromStr>(&self, key: &'static str) -> Result<Option<T>, DecodeError> {
         self.opt(key).map(|_| self.num(key)).transpose()
     }
 
     /// A required count; a negative one is malformed.
-    fn lots(&self, key: &'static str) -> Result<Lots, DecodeError> {
+    pub(super) fn lots(&self, key: &'static str) -> Result<Lots, DecodeError> {
         Lots::new(self.num(key)?).ok_or(Malformed(key))
     }
 
@@ -262,7 +310,7 @@ impl<'a> Record<'a> {
     }
 
     /// `0` or `1`.
-    fn flag(&self, key: &'static str) -> Result<bool, DecodeError> {
+    pub(super) fn flag(&self, key: &'static str) -> Result<bool, DecodeError> {
         match self.get(key)? {
             "0" => Ok(false),
             "1" => Ok(true),
@@ -290,7 +338,7 @@ impl<'a> Record<'a> {
 
     /// The venue's time when it sends one, and its sequence, required on order and fill events
     /// (the toy's ordering key is its sequence).
-    fn meta(&self, sequenced: bool) -> Result<VenueMeta, DecodeError> {
+    pub(super) fn meta(&self, sequenced: bool) -> Result<VenueMeta, DecodeError> {
         let exch_ts = self.opt_num("ts")?.map(ExchNs);
         let exch_ts_kind = match exch_ts {
             Some(_) => ExchTsKind::MatchingEngine,
