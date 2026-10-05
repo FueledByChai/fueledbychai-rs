@@ -117,7 +117,7 @@ rather than guess.
   nonce and factory traits with `Effects` and `EncodeCtx` (the factory's discovery and
   `test_connection` each an `HttpPlan`), credentials as `Secrets` in `src/auth.rs` (0043), and the write-only `PathStamps` a codec marks
   its latency stages through (0034), `crates/fbc-book` with its L2 book, `crates/fbc-sim` with its
-  queue-position fill model (0038), `crates/fbc-journal` with its record
+  queue-position fill model (0038) and SimVenue (0043), `crates/fbc-journal` with its record
   format, day-grouped segment writer rolled hourly with zstd-compressed closed segments, in-order reader and never-blocking sink, `crates/fbc-runtime` with its first
   slices (the connector, SOCKS5 CONNECT, WebSocket and HTTP/1.1, plain or TLS, 0019 and 0020, the WebSocket handshake its own, 0029;
   connection epochs and the subscription reconciler; the market-data session, 0023; HTTP
@@ -223,8 +223,13 @@ rather than guess.
     (Pessimistic, Middle, Optimistic) from a `QueueConfig` with no `Default`, queued on arrival
     behind its level on the public book less every modelled public order, an RPI order also
     behind public size that joins later, advanced by level cancels per bracket and filled by
-    trades at or through its price, 0038; still planned: the simulated venue,
-    FBC-uoo), `crates/fbc-conformance` (the adapter conformance kit,
+    trades at or through its price, 0038; and SimVenue (0043): `SimCodec`, an unchanged
+    `ExecCodec` that writes places and cancels as frames on a simulated order-entry stream and
+    decodes the answers through `DecodeScope`, and `SimEngine`, a pure state machine fed the
+    shard's envelopes (its own books) and those frames, crossing, queueing and filling orders
+    and answering after the consumer's `SimLatency`, fees from the consumer's `FeeBook`, all from
+    a `SimConfig` with no `Default`; still planned: amends, batches, queries and injected orders,
+    FBC-nv2, and resync, FBC-bq3), `crates/fbc-conformance` (the adapter conformance kit,
     0025; it depends on `fbc-runtime` and `fbc-core`, never on a venue crate: so
     far a public stub venue server on 127.0.0.1 ephemeral ports, a WebSocket endpoint that plays
     a fault script of typed steps and records every connection and data frame, and an HTTP/1.1
