@@ -141,6 +141,14 @@ impl Epochs {
         Ok(Admit::Stale)
     }
 
+    /// Drops and counts an input of kind `input` that arrived after the current epoch ended
+    /// but before the next opened: an event an order-entry codec pushes once its session
+    /// stopped (decision 0050).
+    pub(crate) fn drop_ended(&mut self, input: Input) {
+        let count = &mut self.stale[input.index()];
+        *count = count.saturating_add(1);
+    }
+
     /// How many inputs of kind `input` were dropped as stale.
     pub fn stale(&self, input: Input) -> u64 {
         self.stale[input.index()]
