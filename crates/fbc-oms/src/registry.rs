@@ -338,8 +338,9 @@ impl Registry {
     /// by the client id the venue echoed (`None` when it echoes none) and its venue id. Another
     /// namespace's or a non-canonical client id gets none (decision 0005, I4); nor does an
     /// order the registry does not hold (an orphan, which only I7's resync cancels), nor one
-    /// whose client id and venue id name different orders of ours. Our registered client id,
-    /// or with none echoed a venue id our order had, names the order.
+    /// whose client id and venue id name different orders of ours, nor one shown under a venue
+    /// id its record has not learnt (the event showing it is applied first). Our registered
+    /// client id, or with none echoed a venue id our order had, names the order.
     pub fn cancellable_seen(
         &mut self,
         cid: Option<CidMatch>,
@@ -353,6 +354,7 @@ impl Registry {
                     Some(by_vid) if by_vid != cid => {
                         return Err(PermitRefusal::Conflicting { cid, by_vid });
                     }
+                    None if vid.is_some() => return Err(PermitRefusal::Unlearned(cid)),
                     _ => cid,
                 }
             }

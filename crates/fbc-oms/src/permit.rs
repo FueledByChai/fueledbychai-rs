@@ -61,6 +61,10 @@ pub enum PermitRefusal {
         cid: ClientOrderId,
         by_vid: ClientOrderId,
     },
+    /// The venue shows our order `cid` under a venue id its record has not learnt: the record
+    /// would name it by another id, or wait for one. The event showing it is applied first
+    /// ([`Registry::apply_update`](crate::Registry::apply_update)), and the record learns it.
+    Unlearned(ClientOrderId),
 }
 
 /// Why a [`Live`] permit builds no amend.
@@ -161,7 +165,8 @@ impl<'r> Live<'r> {
     /// every other field from its record: refused where the venue's caps cannot amend it
     /// (no amend at all, a market order, a partly filled order where the venue cannot amend
     /// one, a price or total the venue cannot change, nothing left to rest, or no reference
-    /// the amend can name). The amend carries the order's filled quantity
+    /// the amend can name). It names the order without a venue id an earlier amend, not yet
+    /// confirmed, may have replaced (on a venue whose amend gives a new id). The amend carries the order's filled quantity
     /// ([`OrderRecord::filled`]) as `cum_filled` (0014 item 5), the venue's reduce-only flag
     /// of the placement, and `reducing`, the caller's classification of the amended order as
     /// one that can only reduce the position, as on [`NewOrder::reducing`](fbc_core::NewOrder):
@@ -193,7 +198,7 @@ impl<'r> Live<'r> {
         }
         let placed = rec.placed();
         let amend = AmendOrder {
-            target: rec.order_ref(),
+            target: rec.order_ref(caps),
             inst: placed.inst,
             side: placed.side,
             tif: placed.tif,
@@ -279,16 +284,8 @@ pub(crate) fn cancel_of(
     declared: TagSet<fbc_core::RefKind>,
 ) -> Option<CancelOrder> {
     let placed = rec.placed();
-    // On a venue whose amend gives the order a new id, an amend not yet confirmed may have
-    // retired the id the record holds: the cancel names the order without it.
-    let retiring = caps.amend.is_some_and(|a| !a.keeps_venue_id) && rec.amend_unconfirmed();
-    let target = if retiring {
-        OrderRef::Client(rec.cid())
-    } else {
-        rec.order_ref()
-    };
     let cancel = CancelOrder {
-        target,
+        target: rec.order_ref(caps),
         inst: placed.inst,
         side: placed.side,
         placement_nonce: rec.placement_nonce(),
@@ -322,11 +319,14 @@ pub(crate) fn batches(items: Vec<CancelOrder>, max_items: u16) -> Vec<PermittedC
 }
 
 impl OrderRecord {
-    /// The reference that names the order: our client id, with the venue's id once known.
-    pub(crate) fn order_ref(&self) -> OrderRef {
+    /// The reference that names the order in a command: our client id, with the venue's id
+    /// once known, unless an amend not yet confirmed may have replaced it on a venue whose
+    /// amend gives the order a new id ([`OrderRecord::amend_unconfirmed`]).
+    pub(crate) fn order_ref(&self, caps: &OrderCaps) -> OrderRef {
+        let retiring = caps.amend.is_some_and(|a| !a.keeps_venue_id) && self.amend_unconfirmed();
         match self.vid() {
-            Some(vid) => OrderRef::Both(self.cid(), vid.clone()),
-            None => OrderRef::Client(self.cid()),
+            Some(vid) if !retiring => OrderRef::Both(self.cid(), vid.clone()),
+            _ => OrderRef::Client(self.cid()),
         }
     }
 }
