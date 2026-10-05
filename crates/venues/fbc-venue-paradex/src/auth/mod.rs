@@ -50,8 +50,10 @@ pub use token::{SessionToken, token_spans};
 /// The credential key of the Starknet account address (`0x` and hex digits), as the Java
 /// library names it.
 pub const ACCOUNT_ADDRESS: &str = "paradex.account.address";
-/// The credential key of the account's Stark private key (`0x` and hex digits), as the Java
-/// library names it.
+/// The credential key of the account's own Stark private key (`0x` and hex digits), as the
+/// Java library names it. A registered trading subkey logs in through `/auth/{public_key}`,
+/// which this login does not make yet (FBC-2vhg), and a subkey cannot be told from the main
+/// key by its bytes: give the main key.
 pub const SIGNING_KEY: &str = "paradex.private.key";
 /// The configuration key of the REST API base, ending in `/v1`:
 /// `https://api.prod.paradex.trade/v1` on mainnet, `https://api.testnet.paradex.trade/v1` on
@@ -120,8 +122,8 @@ pub const SIGNING_KEY_FIELD: FieldSpec = FieldSpec {
     key: SIGNING_KEY,
     scope: ConfigScope::Account,
     unit: FieldUnit::Dimensionless,
-    doc: "credential: the account's Stark private key (0x and hex digits), handed over in \
-          Secrets",
+    doc: "credential: the account's own Stark private key (0x and hex digits), handed over in \
+          Secrets; not a trading subkey, whose login (/auth/{public_key}) is not built yet",
 };
 
 /// The tag of the login request in [`connection_plan`].
