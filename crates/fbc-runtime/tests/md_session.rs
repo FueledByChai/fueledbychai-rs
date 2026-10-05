@@ -124,7 +124,13 @@ async fn events_arrive_stamped_in_ingest_order_and_a_drop_opens_a_fresh_epoch_su
         envs.windows(2)
             .all(|w| w[0].stamp.recv_mono <= w[1].stamp.recv_mono)
     );
-    assert!(envs.iter().all(|e| e.stamp.kernel_rx.is_none()));
+    // Frames carry a kernel receive time on Linux only (FBC-2y3); timer firings never do.
+    assert!(
+        envs[..3]
+            .iter()
+            .all(|e| e.stamp.kernel_rx.is_some() == cfg!(target_os = "linux"))
+    );
+    assert_eq!(envs[3].stamp.kernel_rx, None);
     let seqs: Vec<_> = envs.iter().map(|e| e.venue_seq).collect();
     assert_eq!(seqs, [Some(1), Some(2), Some(3), None]);
     // The old epoch's timer (instrument A) fired into nothing; only the current one's reported.

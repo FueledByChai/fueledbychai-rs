@@ -30,8 +30,15 @@
 //!
 //! One thread drives a session (design §5.1): [`MdSession::run`] spawns no task, so the read,
 //! the decode and the handler's call run in one call stack on the caller's current-thread
-//! runtime. Not here yet: keepalive, rotation and silence (FBC-djl), kernel timestamps
-//! (FBC-2y3).
+//! runtime. Not here yet: keepalive, rotation and silence (FBC-djl).
+//!
+//! **Kernel receive times and tick-to-wire (FBC-2y3, decision 0031).** On Linux each frame's
+//! stamp carries the kernel receive time of the last packet read beneath TLS and WebSocket when
+//! it completed ([`crate::Tcp`]); elsewhere, and for timer firings and HTTP results, it is
+//! `None`. A write issued while an input is handled, by the codec's effects or through the
+//! [`Outbox`] the handler is given, is attributed to that input; when it is Safety traffic and
+//! the input's stamp has a kernel receive time, its completion is reported to the handler as a
+//! [`TickToWire`]: write done minus that time, for the session's stream.
 //!
 //! **The journal (0006).** With a [`Journal`] set ([`MdSession::set_journal`]), the session
 //! records everything that crosses the shard boundary as it happens, so replay can call each
@@ -71,9 +78,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use fbc_core::{
     ConfigError, ConnKey, DecodeError, Effect, Effects, EndpointPlan, Envelope, HttpFailure,
-    HttpResponse, HttpTag, MdCodec, MdEvent, MdSink, MdTransport, MonoNs, OpKind, RateCharge,
-    RawFrame, SpecTable, Stamp, StreamId, Subscription, TimerTag, TrafficClass, VenueCaps,
-    VenueConfig, VenueFactory, VenueMeta, Via, WallNs, dispatch_market_data,
+    HttpResponse, HttpTag, KernelRxNs, MdCodec, MdEvent, MdSink, MdTransport, MonoNs, OpKind,
+    RateCharge, RawFrame, SpecTable, Stamp, StreamId, Subscription, TimerTag, TrafficClass,
+    VenueCaps, VenueConfig, VenueFactory, VenueMeta, Via, WallNs, WireSlice, dispatch_market_data,
 };
 use fbc_journal::{ControlEvent, Record, RecordRef, ResponseRef, WriteRes, is_secret_header};
 use futures_util::stream::FuturesUnordered;
@@ -95,6 +102,89 @@ use crate::ws::{self, Message, WebSocket};
 /// the thread that drives the session, before the next frame is read (decision 0023).
 pub trait MdHandler {
     fn on_md(&mut self, env: Envelope<MdEvent>);
+
+    /// What the session calls for each event: [`MdHandler::on_md`] by default. A handler that
+    /// writes while it handles an event implements this and issues its writes through `out`
+    /// (decision 0031).
+    fn on_md_with(&mut self, env: Envelope<MdEvent>, out: &mut Outbox) {
+        let _ = out;
+        self.on_md(env);
+    }
+
+    /// A Safety-class write attributed to a frame with a kernel receive time completed: its
+    /// tick-to-wire (decision 0031). Nothing by default.
+    fn on_tick_to_wire(&mut self, sample: TickToWire) {
+        let _ = sample;
+    }
+}
+
+/// The writes a handler issues while it handles an event ([`MdHandler::on_md_with`]): each goes
+/// on the session's own stream once the codec's effects for the same input have, in the order
+/// issued, charged to the buckets and journaled as a codec's frames are, and attributed to the
+/// input being handled (decision 0031). A poll endpoint has no stream to write on: it refuses
+/// and counts them, as it does a codec's frames.
+#[derive(Debug)]
+pub struct Outbox {
+    stream: StreamId,
+    sends: Vec<Effect>,
+}
+
+impl Outbox {
+    /// An empty outbox for writes on `stream`.
+    pub(crate) fn new(stream: StreamId) -> Outbox {
+        Outbox {
+            stream,
+            sends: Vec::new(),
+        }
+    }
+
+    /// Issues a write of `frame` as `class` traffic, charged `charge`.
+    pub fn send(&mut self, frame: WireSlice, class: TrafficClass, charge: RateCharge) {
+        self.sends.push(Effect::Send {
+            stream: self.stream,
+            frame,
+            rpc: None,
+            class,
+            charge,
+        });
+    }
+
+    /// Moves the writes issued into `fx`, after what is there.
+    pub(crate) fn drain_into(&mut self, fx: &mut Effects) {
+        self.sends.drain(..).for_each(|e| fx.push(e));
+    }
+}
+
+/// The tick-to-wire of one Safety-class write (design §5.3, decision 0031): from the kernel
+/// receive time of the frame it is attributed to until the write completed, both on the
+/// realtime clock.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct TickToWire {
+    /// The stream written to.
+    pub stream: StreamId,
+    /// The stamp of the frame being handled when the write was issued; its `kernel_rx` is set.
+    pub frame: Stamp,
+    /// Write done minus the frame's kernel receive time, in nanoseconds; negative only if the
+    /// wall clock stepped back between them.
+    pub nanos: i64,
+}
+
+/// The tick-to-wire of a write of `class` on `stream` that completed at `written`, attributed
+/// to the input stamped `origin`: only Safety traffic attributed to a frame with a kernel
+/// receive time has one.
+fn tick_to_wire(
+    stream: StreamId,
+    class: TrafficClass,
+    origin: Option<Stamp>,
+    written: WallNs,
+) -> Option<TickToWire> {
+    let frame = origin.filter(|_| class == TrafficClass::Safety)?;
+    let KernelRxNs(rx) = frame.kernel_rx?;
+    Some(TickToWire {
+        stream,
+        frame,
+        nanos: written.0.saturating_sub(rx),
+    })
 }
 
 impl<F: FnMut(Envelope<MdEvent>)> MdHandler for F {
@@ -126,14 +216,15 @@ impl IngestClock {
         }
     }
 
-    /// Stamps an input of `conn` arriving now; `kernel_rx` waits for FBC-2y3.
-    fn stamp(&self, conn: ConnKey) -> Stamp {
+    /// Stamps an input of `conn` arriving now, whose last packet the kernel received at
+    /// `kernel_rx` when it knows.
+    fn stamp(&self, conn: ConnKey, kernel_rx: Option<KernelRxNs>) -> Stamp {
         let ingest_seq = self.next.get();
         self.next.set(ingest_seq.wrapping_add(1));
         let (recv_mono, recv_wall) = self.now();
         Stamp {
             ingest_seq,
-            kernel_rx: None,
+            kernel_rx,
             recv_mono,
             recv_wall,
             conn,
@@ -294,6 +385,8 @@ pub struct MdSession<H> {
     credentialed: Cell<bool>,
     /// Inputs withheld from the journal since ([`MdCounters::journal_withheld`]).
     withheld: Cell<u64>,
+    /// The writes the handler issues while it handles an input.
+    outbox: Outbox,
     handler: H,
 }
 
@@ -359,6 +452,7 @@ impl<H: MdHandler> MdSession<H> {
         let _ = rec.set_desired(first.iter().copied());
         let (tx, desired) = watch::channel(first);
         let (stop_tx, stop) = watch::channel(());
+        let outbox = Outbox::new(config.plan.stream);
         let session = MdSession {
             venue: config.venue,
             cfg: config.cfg,
@@ -384,6 +478,7 @@ impl<H: MdHandler> MdSession<H> {
             journal: None,
             credentialed: Cell::new(credentialed),
             withheld: Cell::new(0),
+            outbox,
             handler,
         };
         let control = MdControl {
@@ -592,7 +687,9 @@ impl<H: MdHandler> MdSession<H> {
         codec.on_open(&mut fx);
         let call = self.rec.opened(key)?;
         (self.waiting, self.rate_retry) = (None, None);
-        let mut open = self.execute(&mut ws, codec.as_mut(), fx, false).await?
+        let mut open = self
+            .execute(&mut ws, codec.as_mut(), fx, false, None)
+            .await?
             && self.subscribe(&mut ws, codec.as_mut(), call).await?;
         while open {
             let wake = tokio::select! {
@@ -603,6 +700,8 @@ impl<H: MdHandler> MdSession<H> {
                 Some(done) = self.http.next() => Wake::Http(done),
                 r = self.desired.changed() => Wake::Desired(r.is_ok()),
             };
+            // The kernel receive time of the last packet read beneath the frame, if any.
+            let rx = ws.as_ref().and_then(|ws| ws.get_ref().kernel_rx());
             // The control first: what woke with its drop reaches no codec (Codex r4177887269).
             // The epoch is journaled closed first, and a frame read, a timer taken or an HTTP
             // result that came back with the drop is then stamped and journaled after it (Codex
@@ -612,7 +711,7 @@ impl<H: MdHandler> MdSession<H> {
                 self.control(|| ControlEvent::Closed(key));
                 match wake {
                     Wake::Frame(Some(Ok(message))) => {
-                        self.take_in(key, &message);
+                        self.take_in(key, rx, &message);
                     }
                     Wake::Timer => {
                         let _ = self.take_timer()?;
@@ -630,8 +729,9 @@ impl<H: MdHandler> MdSession<H> {
             open = match wake {
                 Wake::Frame(Some(Ok(message))) => {
                     let mut fx = Effects::new();
-                    self.decode(codec.as_mut(), key, &message, &mut fx);
-                    self.execute(&mut ws, codec.as_mut(), fx, false).await?
+                    let origin = self.decode(codec.as_mut(), key, rx, &message, &mut fx);
+                    self.execute(&mut ws, codec.as_mut(), fx, false, origin)
+                        .await?
                 }
                 Wake::Frame(_) => false,
                 Wake::Timer => self.fire(&mut ws, codec.as_mut()).await?,
@@ -639,7 +739,8 @@ impl<H: MdHandler> MdSession<H> {
                     Some((stamp, done)) => {
                         let mut fx = Effects::new();
                         self.answer(codec.as_mut(), stamp, done, &mut fx);
-                        self.execute(&mut ws, codec.as_mut(), fx, false).await?
+                        self.execute(&mut ws, codec.as_mut(), fx, false, Some(stamp))
+                            .await?
                     }
                     None => true,
                 },
@@ -658,11 +759,17 @@ impl<H: MdHandler> MdSession<H> {
         Ok(End::Dropped)
     }
 
-    /// Stamps one message of epoch `key` and journals it; its stamp and data frame, when it
-    /// carries data. Pings, pongs and close frames take their place in ingest order but carry
-    /// no data; a ping or a close is charged for the answer the WebSocket layer sends to it.
-    fn take_in<'m>(&mut self, key: ConnKey, message: &'m Message) -> Option<(Stamp, RawFrame<'m>)> {
-        let stamp = self.clock.stamp(key);
+    /// Stamps one message of epoch `key`, whose last packet the kernel received at `rx` when it
+    /// knows, and journals it; its stamp and data frame, when it carries data. Pings, pongs and
+    /// close frames take their place in ingest order but carry no data; a ping or a close is
+    /// charged for the answer the WebSocket layer sends to it.
+    fn take_in<'m>(
+        &mut self,
+        key: ConnKey,
+        rx: Option<KernelRxNs>,
+        message: &'m Message,
+    ) -> Option<(Stamp, RawFrame<'m>)> {
+        let stamp = self.clock.stamp(key, rx);
         let raw = match message {
             Message::Text(text) => RawFrame::Text(text.as_str()),
             Message::Binary(bytes) => RawFrame::Binary(bytes.as_ref()),
@@ -683,32 +790,38 @@ impl<H: MdHandler> MdSession<H> {
         Some((stamp, raw))
     }
 
-    /// Stamps and journals one message of epoch `key` and decodes it ([`Self::take_in`]).
+    /// Stamps and journals one message of epoch `key` and decodes it ([`Self::take_in`]); the
+    /// handler's writes follow the codec's effects in `fx`. The stamp of a data frame, which
+    /// the effects are attributed to.
     fn decode(
         &mut self,
         codec: &mut dyn MdCodec,
         key: ConnKey,
+        rx: Option<KernelRxNs>,
         message: &Message,
         fx: &mut Effects,
-    ) {
-        let Some((stamp, raw)) = self.take_in(key, message) else {
-            return;
-        };
+    ) -> Option<Stamp> {
+        let (stamp, raw) = self.take_in(key, rx, message)?;
         let mut sink = Sink {
             handler: &mut self.handler,
             epochs: &mut self.epochs,
+            out: &mut self.outbox,
             stamp,
         };
         if feed_frame(codec, &self.caps, &self.specs, raw, &mut sink, fx).is_err() {
             self.counters.decode_errors += 1;
         }
+        self.outbox.drain_into(fx);
+        Some(stamp)
     }
 
-    /// Hands a current epoch's HTTP result to the codec that asked for it, under `stamp`.
+    /// Hands a current epoch's HTTP result to the codec that asked for it, under `stamp`; the
+    /// handler's writes follow the codec's effects in `fx`.
     fn answer(&mut self, codec: &mut dyn MdCodec, stamp: Stamp, done: Answered, fx: &mut Effects) {
         let mut sink = Sink {
             handler: &mut self.handler,
             epochs: &mut self.epochs,
+            out: &mut self.outbox,
             stamp,
         };
         let (specs, caps) = (&self.specs, &self.caps);
@@ -718,6 +831,7 @@ impl<H: MdHandler> MdSession<H> {
         if decoded.is_err() {
             self.counters.decode_errors += 1;
         }
+        self.outbox.drain_into(fx);
     }
 
     /// Fires the earliest timer, which is due: an ended epoch's into nothing, the current
@@ -732,11 +846,13 @@ impl<H: MdHandler> MdSession<H> {
             let mut sink = Sink {
                 handler: &mut self.handler,
                 epochs: &mut self.epochs,
+                out: &mut self.outbox,
                 stamp,
             };
             let mut fx = Effects::new();
             feed_timer(codec, stamp, tag, &mut sink, &mut fx);
-            open = self.execute(ws, codec, fx, false).await?;
+            self.outbox.drain_into(&mut fx);
+            open = self.execute(ws, codec, fx, false, Some(stamp)).await?;
         }
         Ok(open)
     }
@@ -815,7 +931,7 @@ impl<H: MdHandler> MdSession<H> {
             Ok(_) => {
                 let mut all = Effects::new();
                 effects.into_iter().for_each(|e| all.push(e));
-                return match self.execute(ws, codec, all, true).await? {
+                return match self.execute(ws, codec, all, true, None).await? {
                     true => Ok((true, self.rec.sent(call)?)),
                     false => Ok((false, None)),
                 };
@@ -838,7 +954,7 @@ impl<H: MdHandler> MdSession<H> {
             };
             let mut one = Effects::new();
             one.push(effect);
-            if !self.execute(ws, codec, one, true).await? {
+            if !self.execute(ws, codec, one, true, None).await? {
                 return Ok((false, None));
             }
         }
@@ -848,22 +964,30 @@ impl<H: MdHandler> MdSession<H> {
     /// for, which ends the epoch and leaves the rest unexecuted. A poll endpoint (`ws` is
     /// `None`) refuses every frame and reconnect. Each frame is charged as its turn comes,
     /// unless `charged` says `fx`'s were already, and one the buckets refuse is not written;
-    /// effects asked for meanwhile are charged as theirs come.
+    /// effects asked for meanwhile are charged as theirs come. `fx` is attributed to the input
+    /// stamped `origin`, and effects asked for meanwhile to the input that asked: a Safety
+    /// frame's completion is reported as its tick-to-wire when that input has a kernel receive
+    /// time.
     async fn execute(
         &mut self,
         ws: &mut Option<WebSocket>,
         codec: &mut dyn MdCodec,
         mut fx: Effects,
         charged: bool,
+        origin: Option<Stamp>,
     ) -> Result<bool, SessionError> {
         let key = self.current();
         let epoch = key.epoch;
         let own = self.plan.stream;
-        let mut effects: VecDeque<(Effect, bool)> =
-            fx.take().into_iter().map(|e| (e, charged)).collect();
+        let mut effects: VecDeque<(Effect, bool, Option<Stamp>)> = fx
+            .take()
+            .into_iter()
+            .map(|e| (e, charged, origin))
+            .collect();
         let mut open = true;
         while open
-            && let Some(effect) = next_admitted(&mut effects, &self.rates, key, own, ws.is_some())
+            && let Some((effect, origin)) =
+                next_admitted(&mut effects, &self.rates, key, own, ws.is_some())
         {
             match (effect, ws.as_mut()) {
                 (
@@ -911,12 +1035,12 @@ impl<H: MdHandler> MdSession<H> {
                         if let Some((stamp, done)) = self.admit_http(done)? {
                             let mut more = Effects::new();
                             self.answer(codec, stamp, done, &mut more);
-                            let mut ends = effects.iter().any(|(e, _)| ends_epoch(e, own));
+                            let mut ends = effects.iter().any(|(e, ..)| ends_epoch(e, own));
                             for effect in more.take() {
                                 ends |= ends_epoch(&effect, own);
                                 match effect {
                                     ask @ Effect::Http { .. } if !ends => self.ask(epoch, ask),
-                                    other => effects.push_back((other, false)),
+                                    other => effects.push_back((other, false, Some(stamp))),
                                 }
                             }
                         }
@@ -929,6 +1053,9 @@ impl<H: MdHandler> MdSession<H> {
                             rpc,
                             result: WriteRes::Written,
                         });
+                        let tick = tick_to_wire(own, class, origin, now);
+                        tick.into_iter()
+                            .for_each(|t| self.handler.on_tick_to_wire(t));
                     }
                 }
                 (Effect::Timer { tag, after }, _) => {
@@ -1008,7 +1135,7 @@ impl<H: MdHandler> MdSession<H> {
             epoch: done.epoch,
             ..self.current()
         };
-        let stamp = self.clock.stamp(key);
+        let stamp = self.clock.stamp(key, None);
         // Offered borrowed, its header values raw, so a full journal refuses it before its body
         // is copied or a value read (Codex r4178252055, r4179379938); the journal reads them
         // as the codec is handed them. A failure holds no byte of a response, so it is
@@ -1061,7 +1188,7 @@ impl<H: MdHandler> MdSession<H> {
                 epoch,
                 ..self.current()
             };
-            let stamp = self.clock.stamp(key);
+            let stamp = self.clock.stamp(key, None);
             self.journal(TrafficClass::Normal, stamp.recv_wall, || Record::Timer {
                 stamp,
                 tag,
@@ -1202,20 +1329,20 @@ fn next_of_call(
     }
 }
 
-/// The next of `effects` to execute: a frame on stream `own` of a socket endpoint is charged
-/// on connection `key` as its turn comes, unless it was already, and one the buckets refuse
-/// is dropped unwritten (decision 0030).
+/// The next of `effects` to execute, with the input it is attributed to: a frame on stream
+/// `own` of a socket endpoint is charged on connection `key` as its turn comes, unless it was
+/// already, and one the buckets refuse is dropped unwritten (decision 0030).
 fn next_admitted(
-    effects: &mut VecDeque<(Effect, bool)>,
+    effects: &mut VecDeque<(Effect, bool, Option<Stamp>)>,
     rates: &RateLimiter,
     key: ConnKey,
     own: StreamId,
     socket: bool,
-) -> Option<Effect> {
-    std::iter::from_fn(|| effects.pop_front()).find_map(|(effect, charged)| {
+) -> Option<(Effect, Option<Stamp>)> {
+    std::iter::from_fn(|| effects.pop_front()).find_map(|(effect, charged, origin)| {
         let request = frame_of(&effect, own, socket).filter(|_| !charged);
         let admitted = request.is_none_or(|r| rates.charge(Instant::now(), key, &[r]).is_ok());
-        admitted.then_some(effect)
+        admitted.then_some((effect, origin))
     })
 }
 
@@ -1311,17 +1438,19 @@ async fn sleep_or_never(at: Option<Instant>) {
 }
 
 /// Stamps each pushed event with its input's stamp and hands it to the handler at once (0014
-/// item 2); an event of an older epoch is dropped and counted.
+/// item 2), with the outbox its writes go in; an event of an older epoch is dropped and counted.
 struct Sink<'a, H> {
     handler: &'a mut H,
     epochs: &'a mut Epochs,
+    out: &'a mut Outbox,
     stamp: Stamp,
 }
 
 impl<H: MdHandler> MdSink for Sink<'_, H> {
     fn push(&mut self, meta: VenueMeta, ev: MdEvent) {
         if let Ok(Admit::Current) = self.epochs.admit(Input::Event, self.stamp.conn) {
-            self.handler.on_md(Envelope::new(self.stamp, meta, ev));
+            let env = Envelope::new(self.stamp, meta, ev);
+            self.handler.on_md_with(env, self.out);
         }
     }
 }
@@ -1391,11 +1520,69 @@ mod tests {
     }
 
     #[test]
+    fn only_a_safety_write_attributed_to_a_frame_with_a_kernel_receive_time_has_a_tick_to_wire() {
+        let conn = ConnKey { conn: 1, epoch: 0 };
+        let clock = IngestClock::new();
+        let frame = clock.stamp(conn, Some(KernelRxNs(1_000)));
+        let (own, safety) = (StreamId(4), TrafficClass::Safety);
+        let tick = tick_to_wire(own, safety, Some(frame), WallNs(1_250));
+        assert_eq!(
+            tick,
+            Some(TickToWire {
+                stream: own,
+                frame,
+                nanos: 250
+            })
+        );
+        // A wall clock stepped back between the two reads as negative.
+        let back = tick_to_wire(own, safety, Some(frame), WallNs(900));
+        assert_eq!(back.map(|t| t.nanos), Some(-100));
+        let normal = tick_to_wire(own, TrafficClass::Normal, Some(frame), WallNs(1_250));
+        let timer = tick_to_wire(own, safety, Some(clock.stamp(conn, None)), WallNs(1_250));
+        let unattributed = tick_to_wire(own, safety, None, WallNs(1_250));
+        assert_eq!((normal, timer, unattributed), (None, None, None));
+    }
+
+    #[test]
+    fn a_handler_by_default_hands_each_event_to_on_md_and_ignores_tick_to_wire() {
+        let mut seen = Vec::new();
+        let mut handler = |env: Envelope<MdEvent>| seen.push(env.stamp.ingest_seq);
+        let stamp = IngestClock::new().stamp(ConnKey { conn: 1, epoch: 0 }, None);
+        let meta = VenueMeta {
+            exch_ts: None,
+            exch_ts_kind: fbc_core::ExchTsKind::Unknown,
+            venue_seq: None,
+        };
+        let ev = MdEvent::Health {
+            inst: fbc_core::InstrumentId::new(1),
+            feed: fbc_core::Feed::Trades,
+            h: fbc_core::FeedHealth::Stale,
+        };
+        let mut out = Outbox::new(StreamId(0));
+        handler.on_md_with(Envelope::new(stamp, meta, ev), &mut out);
+        let nanos = 5;
+        let stream = StreamId(0);
+        handler.on_tick_to_wire(TickToWire {
+            stream,
+            frame: stamp,
+            nanos,
+        });
+        let mut fx = Effects::new();
+        out.drain_into(&mut fx);
+        assert!(fx.is_empty());
+        assert_eq!(seen, [0]);
+    }
+
+    #[test]
     fn clones_of_a_clock_share_one_ingest_sequence() {
         let clock = IngestClock::default();
         let other = clock.clone();
         let conn = ConnKey { conn: 1, epoch: 2 };
-        let seqs = [clock.stamp(conn), other.stamp(conn), clock.stamp(conn)];
+        let seqs = [
+            clock.stamp(conn, None),
+            other.stamp(conn, None),
+            clock.stamp(conn, None),
+        ];
         assert_eq!(seqs.map(|s| s.ingest_seq), [0, 1, 2]);
         assert!(seqs.iter().all(|s| s.conn == conn && s.kernel_rx.is_none()));
         assert!(seqs[0].recv_mono <= seqs[2].recv_mono);

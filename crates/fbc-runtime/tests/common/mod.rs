@@ -3,7 +3,7 @@
 //! table, a WebSocket echo server, and an HTTP/1.1 server that answers with the request line it
 //! saw, each of the two servers plain or behind TLS with a certificate from a CA the test
 //! generates ([`tls`]); a WebSocket server each test scripts connection by connection
-//! ([`ScriptedWs`]), one that refuses every connection and reports when ([`refusing`]), an HTTP
+//! ([`ScriptedWs`], plain or behind TLS), one that refuses every connection and reports when ([`refusing`]), an HTTP
 //! server whose answers the test scripts request by request ([`ScriptedHttp`]), and a toy
 //! market-data venue ([`toy`]), and a WebSocket server whose upgrade response the test writes
 //! ([`upgrading`]). Nothing here reaches the internet. Later runtime tickets reuse and extend
@@ -377,52 +377,46 @@ pub struct Peer {
 
 impl ScriptedWs {
     pub async fn start() -> Self {
+        Self::run(None).await
+    }
+
+    /// The same server behind TLS (`wss://`, [`ScriptedWs::wss_url`]).
+    pub async fn start_tls(tls: TlsServer) -> Self {
+        Self::run(Some(tls)).await
+    }
+
+    async fn run(tls: Option<TlsServer>) -> Self {
         let (listener, addr) = listen().await;
         let (tx, peers) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
                 let (heard, from_client) = mpsc::unbounded_channel();
-                let (to_client, mut out) = mpsc::unbounded_channel();
+                let (to_client, out) = mpsc::unbounded_channel();
                 let _ = tx.send(Peer {
                     from_client,
                     to_client,
                 });
+                let tls = tls.clone();
                 tokio::spawn(async move {
-                    // No size limit: a test may stall the reads under a frame larger than the
-                    // socket buffers hold, then resume them.
-                    let config = WebSocketConfig::default()
-                        .max_message_size(None)
-                        .max_frame_size(None);
-                    let ws = tokio_tungstenite::accept_async_with_config(stream, Some(config));
-                    let mut ws = ws.await.unwrap();
-                    loop {
-                        tokio::select! {
-                            msg = ws.next() => match msg {
-                                Some(Ok(Message::Text(text))) => {
-                                    let _ = heard.send(text.as_str().to_owned());
-                                }
-                                Some(Ok(_)) => {}
-                                _ => break,
-                            },
-                            cmd = out.recv() => match cmd {
-                                Some(Out::Send(message)) => ws.send(message).await.unwrap(),
-                                Some(Out::Stall(None)) => std::future::pending().await,
-                                Some(Out::Stall(Some(pause))) => tokio::time::sleep(pause).await,
-                                Some(Out::Hold(release)) => {
-                                    let _ = release.await;
-                                }
-                                _ => {
-                                    let _ = ws.close(None).await;
-                                    break;
-                                }
-                            },
+                    match tls {
+                        None => script_ws(stream, heard, out).await,
+                        Some(tls) => {
+                            if let Some(stream) = tls.accept(stream).await {
+                                script_ws(stream, heard, out).await;
+                            }
                         }
                     }
                 });
             }
         });
         ScriptedWs { addr, peers }
+    }
+
+    /// The `wss://` URL of a server started with [`ScriptedWs::start_tls`], by the name its
+    /// certificate gives 127.0.0.1.
+    pub fn wss_url(&self, host: &str) -> String {
+        format!("wss://{host}:{}/md", self.addr.port())
     }
 
     pub fn url(&self) -> String {
@@ -432,6 +426,45 @@ impl ScriptedWs {
     /// The next connection the server accepted.
     pub async fn accept(&mut self) -> Peer {
         self.peers.recv().await.unwrap()
+    }
+}
+
+/// Plays one scripted connection: reports each text frame the client sends on `heard` and does
+/// what the test asks on `out`.
+async fn script_ws<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: S,
+    heard: mpsc::UnboundedSender<String>,
+    mut out: mpsc::UnboundedReceiver<Out>,
+) {
+    // No size limit: a test may stall the reads under a frame larger than the socket buffers
+    // hold, then resume them.
+    let config = WebSocketConfig::default()
+        .max_message_size(None)
+        .max_frame_size(None);
+    let ws = tokio_tungstenite::accept_async_with_config(stream, Some(config));
+    let mut ws = ws.await.unwrap();
+    loop {
+        tokio::select! {
+            msg = ws.next() => match msg {
+                Some(Ok(Message::Text(text))) => {
+                    let _ = heard.send(text.as_str().to_owned());
+                }
+                Some(Ok(_)) => {}
+                _ => break,
+            },
+            cmd = out.recv() => match cmd {
+                Some(Out::Send(message)) => ws.send(message).await.unwrap(),
+                Some(Out::Stall(None)) => std::future::pending().await,
+                Some(Out::Stall(Some(pause))) => tokio::time::sleep(pause).await,
+                Some(Out::Hold(release)) => {
+                    let _ = release.await;
+                }
+                _ => {
+                    let _ = ws.close(None).await;
+                    break;
+                }
+            },
+        }
     }
 }
 

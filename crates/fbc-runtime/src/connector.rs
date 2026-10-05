@@ -8,6 +8,7 @@ use tokio::net::TcpStream;
 use crate::error::{NetError, Step, io};
 use crate::socks5;
 use crate::target::Target;
+use crate::tcp::Tcp;
 use crate::tls::{self, Trust};
 use crate::transport::Transport;
 
@@ -53,13 +54,15 @@ impl Connector {
     }
 
     /// Opens `to` through [`Connector::connect`], with the TLS handshake on top when `to` asks
-    /// for TLS. The server name is checked before any connection opens.
+    /// for TLS. The server name is checked before any connection opens. The stream keeps the
+    /// kernel receive time of what it reads, on Linux ([`Tcp`]).
     pub(crate) async fn open(&self, to: &Target) -> Result<Transport, NetError> {
         if !to.tls {
-            return Ok(Transport::Plain(self.connect(&to.host, to.port).await?));
+            let stream = self.connect(&to.host, to.port).await?;
+            return Ok(Transport::Plain(Tcp::new(stream)));
         }
         let name = tls::server_name(&to.host)?;
-        let stream = self.connect(&to.host, to.port).await?;
+        let stream = Tcp::new(self.connect(&to.host, to.port).await?);
         let stream = self.trust.handshake(name, stream).await?;
         Ok(Transport::Tls(Box::new(stream)))
     }

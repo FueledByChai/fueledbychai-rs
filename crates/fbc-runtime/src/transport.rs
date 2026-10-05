@@ -5,16 +5,29 @@ use std::io::{self, IoSlice};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use fbc_core::KernelRxNs;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
+
+use crate::tcp::Tcp;
 
 /// A connection the [`crate::Connector`] opened: plain (`ws://`, `http://`) or TLS (`wss://`,
 /// `https://`), directly or through the proxy either way.
 #[derive(Debug)]
 pub enum Transport {
-    Plain(TcpStream),
-    Tls(Box<TlsStream<TcpStream>>),
+    Plain(Tcp),
+    Tls(Box<TlsStream<Tcp>>),
+}
+
+impl Transport {
+    /// The kernel receive time of the last packet read beneath any TLS ([`Tcp::kernel_rx`]):
+    /// `None` off Linux.
+    pub fn kernel_rx(&self) -> Option<KernelRxNs> {
+        match self {
+            Transport::Plain(s) => s.kernel_rx(),
+            Transport::Tls(s) => s.get_ref().0.kernel_rx(),
+        }
+    }
 }
 
 impl AsyncRead for Transport {
