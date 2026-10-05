@@ -5,7 +5,8 @@
 //! restart-safe minting under a namespace lease ([`mint`]), fees with one sign convention and
 //! per-account fee rates ([`fee`]), the decode scope that alone builds venue ids, venue
 //! symbols and fees ([`scope`]), instrument specs with maker-safe quantization
-//! ([`instrument`]) and venue capabilities with every field mandatory ([`caps`]); decisions
+//! ([`instrument`]), instrument resolution through an alias table ([`resolve`]) and venue
+//! capabilities with every field mandatory ([`caps`]); decisions
 //! 0003, 0004 and 0008 fix their shape.
 //!
 //! It also fixes the boundary every venue adapter implements (decision 0002): normalized
@@ -25,6 +26,7 @@ pub mod grid;
 pub mod ids;
 pub mod instrument;
 pub mod mint;
+pub mod resolve;
 pub mod scope;
 pub mod stamps;
 pub mod time;
@@ -73,6 +75,10 @@ pub use instrument::{
     VenueNativeId,
 };
 pub use mint::{CidMint, LeaseError, LeaseIo, NamespaceLease};
+pub use resolve::{
+    AliasError, AliasTable, AssetKey, InstrumentResolver, InstrumentSpecDraft, Listing,
+    ResolveError, SymbolError, common_symbol_parts,
+};
 pub use scope::{DecodeScope, dispatch, dispatch_market_data};
 pub use stamps::{PathEdge, PathMark, PathRecorder, PathStage, PathStamps};
 pub use time::{ConnKey, ExchNs, ExchTsKind, KernelRxNs, MonoNs, Stamp, WallNs};
@@ -81,6 +87,7 @@ pub use units::{
     Ticks,
 };
 pub use venue::{
-    ConfigError, ConfigScope, EndpointPlan, ExecEndpoint, FieldSpec, FieldUnit, ManagedGateway,
-    MdTransport, OrderGateway, SubmitHandle, VenueConfig, VenueError, VenueFactory,
+    ConfigError, ConfigScope, EndpointPlan, ExecEndpoint, FieldSpec, FieldUnit, HttpAnswer,
+    HttpPlan, ManagedGateway, MdTransport, OrderGateway, PlanError, SubmitHandle, VenueConfig,
+    VenueError, VenueFactory,
 };

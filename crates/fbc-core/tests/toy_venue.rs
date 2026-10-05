@@ -5,20 +5,26 @@
 //! a `VenueCommand` taking time and nonces only from `EncodeCtx`, and does no IO: everything it
 //! wants done comes back as `Effects`. Its protocol, symbols and values describe no real venue.
 //!
-//! The toy proves FBC-5's and FBC-ji6's done lines; it is not a conformance suite, and its `VenueCaps` declare
-//! only what its codecs do. One socket carries the touch; one carries order entry (limit orders
-//! out, each signed with a toy hash, its signer call marked as the sign stage through
-//! `PathStamps`; acks, account events, fills and a resync answered in one frame in). It has
-//! no book, trades or other feed, cancels, amends and queries nothing, reads no configuration,
-//! and asks for no HTTP; it keeps one resync in flight, and its one timer asks for that resync
-//! again while it is unanswered. Its market-data socket is kept alive with a ping frame.
+//! The toy proves FBC-5's, FBC-ji6's and FBC-ahf's done lines; it is not a conformance suite,
+//! and its `VenueCaps` declare only what its codecs do. One socket carries the touch; one
+//! carries order entry (limit orders out, each signed with a toy hash, its signer call marked
+//! as the sign stage through `PathStamps`; acks, account events, fills and a resync answered in
+//! one frame in). It has no book, trades or other feed, cancels, amends and queries nothing,
+//! reads no configuration, and its codecs ask for no HTTP; it keeps one resync in flight, and
+//! its one timer asks for that resync again while it is unanswered. Its market-data socket is
+//! kept alive with a ping frame.
+//!
+//! Its factory discovers its instruments with one `GET` of its market list, a plan of effects
+//! whose parser builds one `InstrumentSpecDraft` per `market` record inside the decode scope,
+//! and reads Java-era tickers by its own FBC rule: `X/USDT` is `X-PERP`, listed in USDC.
 //!
 //! Every frame it asks for, and its ping, carries the rate charge its declared limits count
 //! (decision 0018): orders per instrument, a resync as a weighted query against the account,
 //! and subscriptions, its hello and its pings against the connection they are written on.
 //!
 //! Protocol: one record per line, `kind|key=value|...`; `ts` is the venue's matching-engine time
-//! in nanoseconds and `seq` its sequence. Prices are ticks, sizes lots, money nanos of USDC.
+//! in nanoseconds and `seq` its sequence. Prices are ticks, sizes lots, money nanos of USDC. A
+//! market record states its tick and size step as decimals and its minimum size in lots.
 
 use std::collections::BTreeSet;
 use std::num::NonZeroU32;
@@ -27,23 +33,25 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use fbc_core::{
-    AccountKey, AckLevel, AckModel, AssetSym, Cadence, CancelOnDisconnect, Channel, Charset,
-    CidMatch, CidMint, ClientIdFormat, ClientOrderId, ConfigError, ConnKey, ConnTopology, CtxCall,
-    DecodeError, DecodeScope, Effect, Effects, EncodeCtx, EncodeReceipt, Encoding, EndpointPlan,
-    Envelope, ExchNs, ExchTsKind, ExecCaps, ExecCodec, ExecEndpoint, ExecEvent, ExecSink, Feed,
-    FeedSource, FieldSpec, FillCaps, FillEvent, FillIdent, FillSource, FundingCaps, FundingSpec,
-    HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans, InstrumentId, InstrumentKind,
-    InstrumentSpec, ItemRef, Keepalive, KeepaliveKind, LimitScope, Liquidity3, Lots, Lvl,
-    MatchingCaps, MdCaps, MdCodec, MdEvent, MdSink, MdTransport, Money, MonoNs, Namespace,
-    NamespaceLease, NewOrder, NonceBlock, NonceScope, NotSentReason, OpKind, OrderCaps,
+    AccountKey, AckLevel, AckModel, AliasTable, AssetKey, AssetSym, Cadence, CancelOnDisconnect,
+    Channel, Charset, CidMatch, CidMint, ClientIdFormat, ClientOrderId, ConfigError, ConnKey,
+    ConnTopology, CtxCall, DecodeError, DecodeScope, Effect, Effects, EncodeCtx, EncodeReceipt,
+    Encoding, EndpointPlan, Envelope, ExchNs, ExchTsKind, ExecCaps, ExecCodec, ExecEndpoint,
+    ExecEvent, ExecSink, Feed, FeedSource, FieldSpec, FillCaps, FillEvent, FillIdent, FillSource,
+    FundingCaps, FundingSpec, HttpFailure, HttpMethod, HttpPlan, HttpRequest, HttpResponse,
+    HttpTag, Inbound, InboundSpans, InstrumentId, InstrumentKind, InstrumentResolver,
+    InstrumentSpec, InstrumentSpecDraft, ItemRef, Keepalive, KeepaliveKind, LimitScope, Liquidity3,
+    Listing, Lots, Lvl, MatchingCaps, MdCaps, MdCodec, MdEvent, MdSink, MdTransport, Money, MonoNs,
+    Namespace, NamespaceLease, NewOrder, NonceBlock, NonceScope, NotSentReason, OpKind, OrderCaps,
     OrderGateway, OrderKind, OrderKindTag, OrderingKey, PathEdge, PathMark, PathRecorder,
-    PathStage, PathStamps, PlaceWire, PriceGrid, PxExact, RateCharge, RateLimit, RawFrame,
-    Readiness, RpcCall, RpcId, SeqDomain, Side, Sig, SignedLots, SizeStep, SnapshotSource,
-    SpecTable, Stamp, StpScope, StreamId, SubmitHandle, SubmitOutcome, Subscription, Support,
-    TagSet, Ticks, TifTag, TimerTag, TouchSourceCaps, TouchSourceId, TradeCaps, TradingStatus,
-    TrafficClass, UnderlyingId, VenueCaps, VenueCommand, VenueConfig, VenueError, VenueFactory,
-    VenueFeeSign, VenueId, VenueMeta, VenueOrderSnapshot, VenueOrderState, Via, WallNs, WireSlice,
-    WireUrl, decode_cid, dispatch, encode_cid,
+    PathStage, PathStamps, PlaceWire, PlanError, PriceGrid, PxExact, RateCharge, RateLimit,
+    RawFrame, Readiness, ResolveError, RpcCall, RpcId, SeqDomain, Side, Sig, SignedLots, SizeStep,
+    SnapshotSource, SpecTable, Stamp, StpScope, StreamId, SubmitHandle, SubmitOutcome,
+    Subscription, Support, SymbolError, TagSet, Ticks, TifTag, TimerTag, TouchSourceCaps,
+    TouchSourceId, TradeCaps, TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueCommand,
+    VenueConfig, VenueError, VenueFactory, VenueFeeSign, VenueId, VenueMeta, VenueOrderSnapshot,
+    VenueOrderState, Via, WallNs, WireSlice, WireUrl, common_symbol_parts, decode_cid, dispatch,
+    dispatch_market_data, encode_cid,
 };
 use rust_decimal::Decimal;
 
@@ -78,6 +86,9 @@ const RESYNC_CHARGE: RateCharge = RateCharge {
 };
 /// How often the market-data socket is pinged.
 const PING_EVERY: Duration = Duration::from_secs(30);
+/// Where the toy lists its markets, and the tag of the one request discovery makes there.
+const MARKETS_URL: &str = "https://toy.invalid/markets";
+const MARKETS_TAG: HttpTag = HttpTag(1);
 
 fn usdc() -> AssetSym {
     AssetSym::new("USDC").unwrap()
@@ -618,6 +629,86 @@ impl ExecCodec for ToyExec {
     }
 }
 
+/// The one request discovery makes: its market list, a REST request no limit of the toy's
+/// counts.
+fn markets_request() -> Effect {
+    Effect::Http {
+        tag: MARKETS_TAG,
+        req: HttpRequest {
+            method: HttpMethod::Get,
+            url: WireUrl::plain(MARKETS_URL),
+            headers: vec![],
+            body: WireSlice::plain(vec![]),
+        },
+        rpc: None,
+        timeout: RPC_TIMEOUT,
+        class: TrafficClass::Normal,
+        charge: RateCharge::one(OpKind::Rest, None),
+    }
+}
+
+/// A field the market record must state: refused by name when it does not.
+fn required<'a>(frame: &Frame<'a>, key: &'static str) -> Result<&'a str, PlanError> {
+    frame.opt(key).ok_or(PlanError::Missing(key))
+}
+
+/// A field that must parse as a `T`; a value that does not is malformed.
+fn read<T: FromStr>(frame: &Frame<'_>, key: &'static str) -> Result<T, PlanError> {
+    let bad = DecodeError::Malformed(key);
+    required(frame, key)?.parse().map_err(|_| bad.into())
+}
+
+fn asset_sym(frame: &Frame<'_>, key: &'static str) -> Result<AssetSym, PlanError> {
+    let bad = DecodeError::Malformed(key);
+    AssetSym::new(required(frame, key)?).ok_or(bad.into())
+}
+
+/// One market record as a draft, its symbol built by the decode scope. Every field the toy's
+/// protocol carries is required; what it never states (funding, fees, limits) is said
+/// explicitly. A missing field refuses the record by name.
+fn draft(line: &str, scope: &DecodeScope<'_>) -> Result<InstrumentSpecDraft, PlanError> {
+    let frame = Frame::parse(line)?;
+    if frame.kind != "market" {
+        return Err(DecodeError::Malformed("kind").into());
+    }
+    let venue_symbol = scope.venue_symbol(required(&frame, "sym")?)?;
+    let asset = AssetKey {
+        base: asset_sym(&frame, "base")?,
+        quote: asset_sym(&frame, "quote")?,
+        kind: InstrumentKind::Perpetual,
+    };
+    let settle_ccy = asset_sym(&frame, "settle")?;
+    let price_grid = PriceGrid::fixed(read(&frame, "tick")?);
+    let price_grid = price_grid.map_err(|_| DecodeError::Malformed("tick"))?;
+    let size_step = SizeStep::new(read(&frame, "step")?);
+    let size_step = size_step.ok_or(DecodeError::Malformed("step"))?;
+    let min_size = Lots::new(read(&frame, "min")?).ok_or(DecodeError::Malformed("min"))?;
+    let status = match required(&frame, "status")? {
+        "trading" => TradingStatus::Trading,
+        "halted" => TradingStatus::Halted,
+        _ => return Err(DecodeError::Malformed("status").into()),
+    };
+    Ok(InstrumentSpecDraft {
+        asset,
+        venue_symbol,
+        native_id: None,
+        price_grid,
+        quote_grid: None,
+        size_step,
+        min_size,
+        min_notional: None,
+        max_order_size: None,
+        position_limit: None,
+        price_band: None,
+        max_open_orders: None,
+        multiplier: Decimal::ONE,
+        settle_ccy,
+        funding: FundingSpec::Unknown,
+        public_fees: None,
+        status,
+    })
+}
+
 /// The toy venue's factory. The toy reads no configuration.
 struct ToyFactory;
 
@@ -632,6 +723,34 @@ impl VenueFactory for ToyFactory {
 
     fn caps(&self, _cfg: &VenueConfig) -> Result<VenueCaps, ConfigError> {
         Ok(toy_caps())
+    }
+
+    /// The toy's FBC rule: `X/USDT` is `X-PERP`, which the toy lists in USDC; the ticker's
+    /// quote is kept as written, and the alias table reads both as USD.
+    fn parse_fbc_common_symbol(&self, s: &str) -> Result<AssetKey, SymbolError> {
+        let (base, quote) = common_symbol_parts(s)?;
+        if quote.as_str() != "USDT" {
+            return Err(SymbolError::Unmapped);
+        }
+        let kind = InstrumentKind::Perpetual;
+        Ok(AssetKey { base, quote, kind })
+    }
+
+    /// One `GET` of the market list; each line of the answer is one market.
+    fn discover(
+        &self,
+        _cfg: &VenueConfig,
+    ) -> Result<HttpPlan<Vec<InstrumentSpecDraft>>, VenueError> {
+        let mut fx = Effects::new();
+        fx.push(markets_request());
+        let plan = HttpPlan::new(fx, |responses, scope| {
+            // The plan holds one request, so its parser is handed one response.
+            let list = responses.first().ok_or(PlanError::Answers)?;
+            let text = core::str::from_utf8(list.body);
+            let text = text.map_err(|_| DecodeError::Malformed("utf-8"))?;
+            text.lines().map(|line| draft(line, scope)).collect()
+        });
+        Ok(plan.expect("one HTTP request makes a valid plan"))
     }
 
     fn plan_md(
@@ -1546,4 +1665,176 @@ fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
         decode_cid(&format, OWN_NS, wire.unwrap()),
         CidMatch::Ours(cid)
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Discovery and resolution (FBC-ahf).
+// ---------------------------------------------------------------------------------------------
+
+/// The venue the consumer numbers the toy as, as in `specs()`.
+const TOY_VENUE: VenueId = VenueId::new(9);
+
+/// The toy's market list: the market the other tests trade, and a halted one nobody lists.
+const MARKETS: &str =
+    "market|sym=TOY-PERP|base=TOY|quote=USDC|settle=USDC|tick=0.5|step=0.001|min=1|status=trading
+market|sym=TOYB-PERP|base=TOYB|quote=USDC|settle=USDC|tick=0.01|step=0.1|min=10|status=halted";
+
+/// Discovery's plan answered with `answer`, parsed in the decode scope market data is
+/// dispatched with (discovery holds no engine namespace).
+fn discover_with(
+    answer: Result<HttpResponse<'_>, HttpFailure>,
+) -> Result<Vec<InstrumentSpecDraft>, PlanError> {
+    let plan = ToyFactory.discover(&VenueConfig::new()).unwrap();
+    dispatch_market_data(&toy_caps(), |scope| {
+        plan.parse(&[(MARKETS_TAG, answer)], scope)
+    })
+}
+
+fn discover(body: &str) -> Result<Vec<InstrumentSpecDraft>, PlanError> {
+    let (status, headers) = (200, &[][..]);
+    discover_with(Ok(HttpResponse {
+        status,
+        headers,
+        body: body.as_bytes(),
+    }))
+}
+
+fn perp(base: &str, quote: &str) -> AssetKey {
+    AssetKey {
+        base: AssetSym::new(base).unwrap(),
+        quote: AssetSym::new(quote).unwrap(),
+        kind: InstrumentKind::Perpetual,
+    }
+}
+
+#[test]
+fn discovery_is_a_plan_of_http_effects_whose_parser_builds_drafts_in_the_decode_scope() {
+    let plan = ToyFactory.discover(&VenueConfig::new()).unwrap();
+    // Only effects: one GET of the market list, no frame, timer or reconnect, and no IO.
+    assert_eq!(plan.requests(), [markets_request()]);
+    assert!(
+        plan.requests()
+            .iter()
+            .all(|fx| matches!(fx, Effect::Http { rpc: None, .. }))
+    );
+
+    let drafts = discover(MARKETS).unwrap();
+    let symbols = drafts.iter().map(|d| d.venue_symbol.as_wire());
+    assert_eq!(Vec::from_iter(symbols), ["TOY-PERP", "TOYB-PERP"]);
+    let expected = InstrumentSpecDraft {
+        asset: perp("TOY", "USDC"),
+        venue_symbol: with_scope(|scope| scope.venue_symbol(SYMBOL)).unwrap(),
+        native_id: None,
+        price_grid: PriceGrid::fixed(Decimal::new(5, 1)).unwrap(),
+        quote_grid: None,
+        size_step: SizeStep::new(Decimal::new(1, 3)).unwrap(),
+        min_size: Lots::new(1).unwrap(),
+        min_notional: None,
+        max_order_size: None,
+        position_limit: None,
+        price_band: None,
+        max_open_orders: None,
+        multiplier: Decimal::ONE,
+        settle_ccy: usdc(),
+        funding: FundingSpec::Unknown,
+        public_fees: None,
+        status: TradingStatus::Trading,
+    };
+    assert_eq!(drafts[0], expected);
+    assert_eq!(drafts[1].status, TradingStatus::Halted);
+}
+
+#[test]
+fn a_draft_and_a_java_era_ticker_resolve_to_one_instrument_through_the_alias_table() {
+    let drafts = discover(MARKETS).unwrap();
+    let legacy = ToyFactory.parse_fbc_common_symbol("TOY/USDT").unwrap();
+    // The venue states USDC and the Java-era ticker USDT; the consumer lists the instrument
+    // once, as TOY/USD.
+    assert_eq!(drafts[0].asset, perp("TOY", "USDC"));
+    assert_eq!(legacy, perp("TOY", "USDT"));
+    let mut resolver = InstrumentResolver::new(AliasTable::seeded());
+    let listing = Listing {
+        id: INST,
+        underlying: UnderlyingId::new(1),
+    };
+    resolver
+        .list(TOY_VENUE, perp("TOY", "USD"), listing)
+        .unwrap();
+    for key in [drafts[0].asset, legacy] {
+        assert_eq!(resolver.resolve(TOY_VENUE, key), Ok(INST));
+    }
+    // The resolved draft is the spec the other tests trade against.
+    let spec = resolver.spec(TOY_VENUE, drafts[0].clone(), 1, WallNs(0));
+    assert_eq!(spec.as_ref(), Ok(specs().get(INST).unwrap()));
+
+    // Nothing is guessed: a market the consumer did not list, or the same keys read without
+    // the aliases, resolve to nothing.
+    let unlisted = resolver.spec(TOY_VENUE, drafts[1].clone(), 1, WallNs(0));
+    let key = perp("TOYB", "USD");
+    let venue = TOY_VENUE;
+    assert_eq!(unlisted, Err(ResolveError::NotListed { venue, key }));
+    let mut bare = InstrumentResolver::new(AliasTable::empty());
+    bare.list(TOY_VENUE, perp("TOY", "USD"), listing).unwrap();
+    for key in [drafts[0].asset, legacy] {
+        let refused = Err(ResolveError::NotListed { venue, key });
+        assert_eq!(bare.resolve(TOY_VENUE, key), refused);
+    }
+
+    // The toy's FBC rule reads only X/USDT, and only in the common form.
+    let rule = |s| ToyFactory.parse_fbc_common_symbol(s);
+    assert_eq!(rule("TOY/BTC"), Err(SymbolError::Unmapped));
+    assert_eq!(rule("TOYUSDT"), Err(SymbolError::NotCommonForm));
+    assert_eq!(rule("TOY-PERP"), Err(SymbolError::NotCommonForm));
+}
+
+#[test]
+fn a_market_missing_a_required_field_is_refused_by_name() {
+    let first = MARKETS.lines().next().unwrap();
+    for field in [
+        "sym", "base", "quote", "settle", "tick", "step", "min", "status",
+    ] {
+        let kept = first
+            .split('|')
+            .filter(|part| !part.starts_with(&format!("{field}=")));
+        let line = Vec::from_iter(kept).join("|");
+        // The whole answer is refused, the complete second market with it.
+        let answer = format!("{line}\n{}", MARKETS.lines().nth(1).unwrap());
+        assert_eq!(discover(&answer), Err(PlanError::Missing(field)), "{field}");
+    }
+    // A value the venue states but that is no valid value is malformed, not missing.
+    for (from, to, part) in [
+        ("tick=0.5", "tick=0", "tick"),
+        ("tick=0.5", "tick=x", "tick"),
+        ("step=0.001", "step=0", "step"),
+        ("min=1", "min=-1", "min"),
+        ("base=TOY", "base=TOOLONGBASE", "base"),
+        ("status=trading", "status=open", "status"),
+        ("market|", "other|", "kind"),
+    ] {
+        let line = first.replace(from, to);
+        let malformed = Err(PlanError::Decode(DecodeError::Malformed(part)));
+        assert_eq!(discover(&line), malformed, "{to}");
+    }
+    let symbol = Err(PlanError::Decode(DecodeError::IdRefused(
+        fbc_core::IdError::Empty,
+    )));
+    assert_eq!(discover(&first.replace("TOY-PERP", "")), symbol);
+    let not_text = discover_with(Ok(HttpResponse {
+        status: 200,
+        headers: &[],
+        body: &[0xff],
+    }));
+    let utf8 = Err(PlanError::Decode(DecodeError::Malformed("utf-8")));
+    assert_eq!(not_text, utf8);
+    // An answer that is not a 2xx response never reaches the parser.
+    let failed = discover_with(Err(HttpFailure::TimedOut));
+    let (tag, failure) = (MARKETS_TAG, HttpFailure::TimedOut);
+    assert_eq!(failed, Err(PlanError::Http { tag, failure }));
+    let body = MARKETS.as_bytes();
+    let unavailable = discover_with(Ok(HttpResponse {
+        status: 503,
+        headers: &[],
+        body,
+    }));
+    assert_eq!(unavailable, Err(PlanError::Status { tag, status: 503 }));
 }

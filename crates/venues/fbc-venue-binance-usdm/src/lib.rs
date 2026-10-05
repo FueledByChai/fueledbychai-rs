@@ -31,9 +31,9 @@ mod md;
 use std::collections::BTreeSet;
 
 use fbc_core::{
-    BookId, ConfigError, EndpointPlan, ExecCodec, ExecEndpoint, FieldSpec, MdCodec, MdTransport,
-    SpecTable, StreamId, Subscription, TouchSourceId, VenueCaps, VenueConfig, VenueError,
-    VenueFactory, WireUrl,
+    AssetKey, BookId, ConfigError, EndpointPlan, ExecCodec, ExecEndpoint, FieldSpec, HttpPlan,
+    InstrumentSpecDraft, MdCodec, MdTransport, SpecTable, StreamId, Subscription, SymbolError,
+    TouchSourceId, VenueCaps, VenueConfig, VenueError, VenueFactory, WireUrl,
 };
 
 pub use caps::rest_depth_weight;
@@ -76,6 +76,19 @@ impl VenueFactory for BinanceUsdm {
 
     fn caps(&self, cfg: &VenueConfig) -> Result<VenueCaps, ConfigError> {
         Settings::read(cfg).map(|settings| caps::caps(&settings))
+    }
+
+    /// None yet: Binance's FBC rule (`X/USDT` is `XUSDT`) is FBC-fwf.
+    fn parse_fbc_common_symbol(&self, _s: &str) -> Result<AssetKey, SymbolError> {
+        Err(SymbolError::NoRule)
+    }
+
+    /// None yet: discovery from `GET /fapi/v1/exchangeInfo` is FBC-fwf.
+    fn discover(
+        &self,
+        _cfg: &VenueConfig,
+    ) -> Result<HttpPlan<Vec<InstrumentSpecDraft>>, VenueError> {
+        Err(VenueError::NoDiscovery)
     }
 
     /// One endpoint per [`caps::MAX_STREAMS`] subscriptions, in the order of `subs`, every one

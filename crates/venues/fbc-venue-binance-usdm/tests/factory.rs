@@ -15,7 +15,8 @@ use fbc_core::{
     BookId, Cadence, ConfigError, ConfigScope, ConnTopology, Continuity, Effect, Effects, Encoding,
     ExchTsKind, Feed, FeedSource, FieldUnit, Inbound, InboundSpans, LimitScope, MdTransport,
     OpKind, QueueModelQuality, RateLimit, RawFrame, Readiness, SeqDomain, StpScope, StreamId,
-    Subscription, TagSet, TouchSourceId, TrafficClass, VenueConfig, VenueError, VenueFactory,
+    Subscription, SymbolError, TagSet, TouchSourceId, TrafficClass, VenueConfig, VenueError,
+    VenueFactory,
 };
 use fbc_venue_binance_usdm::{
     BOOK_DIFF, BOOK_PARTIAL, BinanceUsdm, KEY_DEPTH_LEVELS, KEY_DEPTH_SPEED, KEY_REST_BASE_URL,
@@ -35,6 +36,11 @@ fn the_factory_declares_market_data_only_with_no_exec_codec_or_endpoint() {
     assert_eq!(caps.exec, None);
     assert!(BinanceUsdm.exec_codec(&cfg).is_none());
     assert_eq!(BinanceUsdm.plan_exec(&cfg), Ok(Vec::new()));
+    // Discovery and the Java-era ticker rule are not built yet (FBC-fwf): both say so.
+    let ticker = BinanceUsdm.parse_fbc_common_symbol("BTC/USDT");
+    assert_eq!(ticker, Err(SymbolError::NoRule));
+    let discovered = BinanceUsdm.discover(&cfg).err();
+    assert_eq!(discovered, Some(VenueError::NoDiscovery));
     assert_eq!(BinanceUsdm.id(), "BINANCE_FUTURES");
     // Never promoted past recording: it is the reference feed, not a traded venue.
     assert_eq!(caps.readiness_ceiling, Readiness::Record);

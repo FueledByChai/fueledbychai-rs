@@ -47,16 +47,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fbc_core::{
-    Aggressor, AssetSym, BookCaps, BookId, BookSide, Cadence, Channel, ConfigError, ConnTopology,
-    Continuity, DecodeError, DecodeScope, Effect, Effects, Encoding, EndpointPlan, ExchTsKind,
-    ExecCodec, ExecEndpoint, Feed, FeedHealth, FeedSource, FieldSpec, FundingCaps, FundingSpec,
-    Header, HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag, Inbound, InboundSpans,
-    InstrumentId, InstrumentKind, InstrumentSpec, Keepalive, KeepaliveKind, Lots, MatchingCaps,
-    MdCaps, MdCodec, MdEvent, MdSink, MdTransport, MonoNs, OpKind, PriceGrid, QueueModelQuality,
-    RateCharge, RateLimit, RawFrame, Readiness, SizeStep, SpecTable, StpScope, StreamId,
-    Subscription, TagSet, Ticks, TimerTag, TradeCaps, TradingStatus, TrafficClass, UnderlyingId,
-    VenueCaps, VenueConfig, VenueError, VenueFactory, VenueId, VenueMeta, WallNs, WireSlice,
-    WireUrl, dispatch_market_data,
+    Aggressor, AssetKey, AssetSym, BookCaps, BookId, BookSide, Cadence, Channel, ConfigError,
+    ConnTopology, Continuity, DecodeError, DecodeScope, Effect, Effects, Encoding, EndpointPlan,
+    ExchTsKind, ExecCodec, ExecEndpoint, Feed, FeedHealth, FeedSource, FieldSpec, FundingCaps,
+    FundingSpec, Header, HttpFailure, HttpMethod, HttpPlan, HttpRequest, HttpResponse, HttpTag,
+    Inbound, InboundSpans, InstrumentId, InstrumentKind, InstrumentSpec, InstrumentSpecDraft,
+    Keepalive, KeepaliveKind, Lots, MatchingCaps, MdCaps, MdCodec, MdEvent, MdSink, MdTransport,
+    MonoNs, OpKind, PriceGrid, QueueModelQuality, RateCharge, RateLimit, RawFrame, Readiness,
+    SizeStep, SpecTable, StpScope, StreamId, Subscription, SymbolError, TagSet, Ticks, TimerTag,
+    TradeCaps, TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueConfig, VenueError,
+    VenueFactory, VenueId, VenueMeta, WallNs, WireSlice, WireUrl, dispatch_market_data,
 };
 use fbc_runtime::{RateLimiter, SafetyReserve};
 use rust_decimal::Decimal;
@@ -262,6 +262,19 @@ impl VenueFactory for ToyVenue {
                 Ok(caps)
             }
         }
+    }
+
+    /// The toy has no Java-era tickers.
+    fn parse_fbc_common_symbol(&self, _s: &str) -> Result<AssetKey, SymbolError> {
+        Err(SymbolError::NoRule)
+    }
+
+    /// The tests state the toy's instruments.
+    fn discover(
+        &self,
+        _cfg: &VenueConfig,
+    ) -> Result<HttpPlan<Vec<InstrumentSpecDraft>>, VenueError> {
+        Err(VenueError::NoDiscovery)
     }
 
     fn plan_md(
