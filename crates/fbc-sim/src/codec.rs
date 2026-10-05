@@ -305,6 +305,7 @@ impl SimCodec {
             side: o.side,
             state: match o.state {
                 SimState::Open => VenueOrderState::Open,
+                SimState::Amended => VenueOrderState::Amended { new_vid: None },
                 SimState::Filled => VenueOrderState::Filled,
                 SimState::Canceled(reason) => VenueOrderState::Canceled(reason),
             },
