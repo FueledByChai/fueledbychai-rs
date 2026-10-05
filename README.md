@@ -20,4 +20,5 @@ Status: scaffolding. The Cargo workspace exists with seven crates:
 
 No venue is supported yet: Paradex has its signer and its bbo, trades and order book market data, not yet order entry; Binance USD-M
 decodes its touch, partial depth and diff-depth book; `MdSession` makes the diff-depth book's REST snapshot request (the
-codec's `Effect::Http`, decision 0027), though no test yet runs that codec through a session.
+codec's `Effect::Http`, decision 0027), and `tests/replay.rs` runs that codec through a session against the
+conformance stub and rebuilds its books byte-identically by decoder replay of the session's journal (0006).
