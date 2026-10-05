@@ -34,8 +34,8 @@ use fbc_journal::{
     RedactionKey, SinkConfig, journal_queue,
 };
 use fbc_runtime::{
-    Connector, IngestClock, Journal, MdReplay, MdReplayConfig, MdReplayCounters, MdSession,
-    MdSessionConfig, ProxyConfig, RateLimiter, ReconnectPacing, SafetyReserve,
+    Connector, IngestClock, Journal, Liveness, MdReplay, MdReplayConfig, MdReplayCounters,
+    MdSession, MdSessionConfig, ProxyConfig, RateLimiter, ReconnectPacing, SafetyReserve,
 };
 use fbc_venue_binance_usdm::{
     BOOK_DIFF, BOOK_PARTIAL, BinanceUsdm, KEY_REST_BASE_URL, KEY_SNAPSHOT_TIMEOUT, KEY_WS_BASE_URL,
@@ -197,6 +197,7 @@ async fn decoder_replay_of_the_journal_rebuilds_the_binance_books_byte_identical
         http_max_body: 64 * 1024,
         conn: CONN,
         limiter: RateLimiter::new(&caps.limits, SafetyReserve::percent(0).unwrap()).unwrap(),
+        liveness: Liveness::new(Duration::from_secs(3_600), ms(1)).unwrap(),
     };
 
     // Live: the session journals everything it takes in, and the handler keeps every event.
