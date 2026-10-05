@@ -1,4 +1,4 @@
-//! An order-entry session (FBC-oaz, decision 0050): drives one account's order-entry
+//! An order-entry session (FBC-oaz, decision 0052): drives one account's order-entry
 //! connection, as [`VenueFactory::plan_exec`] plans it, through connection epochs on the shared
 //! session core (FBC-e73), with one [`ExecCodec`] for the session's life (decisions 0002, 0014,
 //! 0015, 0019, 0023).
@@ -59,7 +59,7 @@ use crate::ws::{self, Message, WebSocket};
 
 /// Where the consumer receives an order-entry session's events: called once per event, in
 /// ingest order, on the thread that drives the session, before the next frame is read
-/// (decision 0050, as 0023 for market data).
+/// (decision 0052, as 0023 for market data).
 pub trait ExecHandler {
     fn on_exec(&mut self, env: Envelope<ExecEvent>);
 
@@ -112,7 +112,7 @@ pub enum ExecSessionError {
     /// The venue takes no orders: it declares no `exec` block, or builds no order-entry codec.
     NoOrderEntry,
     /// The venue planned this many order-entry connections; a session drives exactly one
-    /// (decision 0050).
+    /// (decision 0052).
     Endpoints(usize),
     /// The consumer's nonce source reserved another number of nonces than were asked for.
     Nonces { asked: u16, reserved: usize },
@@ -302,7 +302,7 @@ impl<H: ExecHandler> ExecSession<H> {
     /// Connects, reconnects as paced, and delivers events until the [`ExecControl`] is
     /// dropped.
     ///
-    /// A session runs once (decision 0050): a run that ended, in an error or not, or whose
+    /// A session runs once (decision 0052): a run that ended, in an error or not, or whose
     /// future was dropped, leaves nothing to run again, and a later call returns
     /// [`ExecSessionError::Ended`] without connecting (Codex r4189174493, r4189174502). A run
     /// dropped while connected leaves its epoch to be ended there or when the session drops:
