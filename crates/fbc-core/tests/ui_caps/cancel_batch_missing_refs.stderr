@@ -1,0 +1,5 @@
+error[E0063]: missing field `refs` in initializer of `CancelBatch`
+ --> tests/ui_caps/cancel_batch_missing_refs.rs:6:13
+  |
+6 |     let _ = CancelBatch { max_items: 20 };
+  |             ^^^^^^^^^^^ missing `refs`

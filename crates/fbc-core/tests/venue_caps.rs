@@ -16,7 +16,7 @@ use common::{market_data_only_caps, synthetic_caps};
 use fbc_core::{
     AssetSym, Batch, Channel, Feature, FeedSource, InstrumentId, LimitScope, Money, Namespace,
     NonceScope, OpKind, OrderKindTag, RateCharge, Readiness, RefKind, SpeedBumpScope, Support,
-    TifTag, Via, dispatch,
+    TagSet, TifTag, Via, dispatch,
 };
 
 #[test]
@@ -40,6 +40,14 @@ fn the_synthetic_venue_declares_every_capability() {
         (amend.when_partially_filled, amend.keeps_priority),
         (false, None)
     );
+    // Amends and batch cancels say which references they can name: here the venue's id only,
+    // narrower than a single cancel's.
+    assert_eq!(amend.refs, TagSet::of(&[RefKind::Venue]));
+    let batch_cancel = order
+        .batch_cancel
+        .expect("the synthetic venue cancels in batches");
+    assert_eq!(batch_cancel.refs, TagSet::of(&[RefKind::Venue]));
+    assert!(order.cancel_refs.contains(RefKind::Client) && batch_cancel.max_items == 20);
     assert!(order.query_refs.contains(RefKind::Client));
     assert!(!order.query_refs.contains(RefKind::Venue));
     assert_eq!(order.batch_place, Some(Batch { max_items: 10 }));

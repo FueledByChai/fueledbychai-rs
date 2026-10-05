@@ -1,0 +1,5 @@
+error[E0063]: missing field `refs` in initializer of `AmendCaps`
+ --> tests/ui_caps/amend_caps_missing_refs.rs:6:13
+  |
+6 |     let _ = AmendCaps {
+  |             ^^^^^^^^^ missing `refs`

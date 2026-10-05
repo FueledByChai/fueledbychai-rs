@@ -84,8 +84,9 @@ pub struct OrderCaps {
     pub cancel_is_signed: bool,
     /// Batched placement, or `None` where orders go one at a time.
     pub batch_place: Option<Batch>,
-    /// Batched cancels, or `None` where cancels go one at a time.
-    pub batch_cancel: Option<Batch>,
+    /// Batched cancels and the references their items can name, or `None` where cancels go one
+    /// at a time.
+    pub batch_cancel: Option<CancelBatch>,
     /// Cancelling every order on the account in one request.
     pub cancel_all_account: Support,
     /// Cancelling every order on one instrument in one request; never widened to the account.
@@ -131,6 +132,13 @@ pub enum CancelOnDisconnect {
 /// How a venue amends an order.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct AmendCaps {
+    /// The references an amend can name its order by natively: [`RefKind::Venue`],
+    /// [`RefKind::Client`], or both. An amend carries no placement nonce, so
+    /// [`RefKind::PlacementNonce`] here matches no amend; [`AmendOrder::reference`] picks from
+    /// this set, and a codec refuses an amend it finds no declared reference for (0031).
+    ///
+    /// [`AmendOrder::reference`]: crate::AmendOrder::reference
+    pub refs: TagSet<RefKind>,
     /// The price can be amended.
     pub price: bool,
     /// The quantity can be amended.
@@ -537,6 +545,20 @@ pub enum Support {
 pub struct Batch {
     /// The most items in one request.
     pub max_items: u16,
+}
+
+/// A batch cancel's limits and the references its items can name. A venue's batch cancel can
+/// take fewer kinds than its single cancel ([`OrderCaps::cancel_refs`]): one that names orders
+/// by venue id only cannot cancel an order not yet acknowledged.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct CancelBatch {
+    /// The most cancels in one request.
+    pub max_items: u16,
+    /// The references each item can name natively; [`CancelOrder::reference`] picks from this
+    /// set, and a codec refuses a batch with an item it finds no declared reference for (0031).
+    ///
+    /// [`CancelOrder::reference`]: crate::CancelOrder::reference
+    pub refs: TagSet<RefKind>,
 }
 
 /// How a venue acknowledges an order.
