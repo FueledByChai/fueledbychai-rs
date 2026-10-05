@@ -656,7 +656,14 @@ fn a_liveness_needs_a_window_and_a_margin_and_the_margin_must_fit_the_venues_lif
     let config = toy_session(url.clone(), &[(LIFETIME_MS, "10001")], tight);
     assert!(MdSession::new(config, keep(&Seen::default())).is_ok());
     // A venue with no lifetime takes any margin.
-    assert!(MdSession::new(toy_session(url, &[], tight), keep(&Seen::default())).is_ok());
+    assert!(MdSession::new(toy_session(url.clone(), &[], tight), keep(&Seen::default())).is_ok());
+    // A poll endpoint opens no connection to rotate, so the margin is not checked against the
+    // lifetime (Codex r4180333662).
+    let mut poll = toy_session(url, &[(LIFETIME_MS, "10000")], tight);
+    poll.plan.transport = MdTransport::Poll {
+        base_url: WireUrl::plain("http://127.0.0.1:1".to_owned()),
+    };
+    assert!(MdSession::new(poll, keep(&Seen::default())).is_ok());
 
     let venue = |lifetime: &str| {
         let mut cfg = VenueConfig::new();
