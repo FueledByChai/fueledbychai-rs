@@ -933,9 +933,100 @@ fn a_seen_order_whose_client_id_and_venue_id_name_different_orders_gets_no_permi
             .unwrap_err(),
         PermitRefusal::Conflicting { cid: a, by_vid: b }
     );
-    // Both naming the same order, or a venue id no order had: a permit for it.
-    for seen in [Some(&a_vid), Some(&vid("unseen")), None] {
+    // Both naming the same order, or no venue id: a permit for it.
+    for seen in [Some(&a_vid), None] {
         let permit = reg.cancellable_seen(Some(CidMatch::Ours(a)), seen).unwrap();
         assert_eq!(permit.order().cid(), a);
     }
+}
+
+#[test]
+fn a_seen_order_naming_a_venue_id_its_record_has_not_learnt_gets_no_permit_until_it_has() {
+    // Codex r4186908002: the record would cancel by an id it holds, or wait for one, while the
+    // venue shows another. The event showing it is applied first, and the record learns it.
+    let caps = caps_with(&[RefKind::Venue], false);
+    let mut reg = Registry::new();
+    let a = order_at(&mut reg, Ack::Pending, false);
+    let seen = vid("seen-a");
+    assert_eq!(
+        reg.cancellable_seen(Some(CidMatch::Ours(a)), Some(&seen))
+            .unwrap_err(),
+        PermitRefusal::Unlearned(a)
+    );
+    let mut open = update(Some(a), VenueOrderState::Open, 0);
+    open.vid = Some(seen.clone());
+    reg.apply_update(
+        &open,
+        OrderKey {
+            venue: None,
+            ingest: 1,
+        },
+    );
+    let CancelChoice::Send(cmd) = reg
+        .cancellable_seen(Some(CidMatch::Ours(a)), Some(&seen))
+        .unwrap()
+        .cancel(&caps)
+    else {
+        panic!("the venue id is learnt")
+    };
+    assert_eq!(single(&cmd).target, OrderRef::Both(a, seen));
+}
+
+#[test]
+fn an_amend_while_an_earlier_one_that_replaces_the_venue_id_is_unconfirmed_does_not_name_the_old_id()
+ {
+    // Codex r4186908014: an amend replaced in flight by a cancel the venue refused may still
+    // have given the order a new id; the next amend names it by client id, or is refused.
+    let caps = |refs: &[RefKind]| {
+        with_amend(AmendCaps {
+            keeps_venue_id: false,
+            ..amend_caps(refs, true)
+        })
+    };
+    let mut reg = Registry::new();
+    let c = order_at(&mut reg, Ack::AckedVid, false);
+    reg.amend_sent(c, Ticks(101), lots(10), RpcId(1), MonoNs(1))
+        .unwrap();
+    reg.cancel_sent(c, RpcId(2), MonoNs(2)).unwrap();
+    let refused = SubmitOutcome::Rejected(fbc_core::Reject {
+        kind: fbc_core::RejectKind::Margin,
+        venue_code: None,
+        raw: "refused".into(),
+    });
+    let item = ItemRef {
+        idx: 0,
+        cid: None,
+        vid: None,
+    };
+    reg.on_outcome(c, OrderOp::Cancel(RpcId(2)), &item, &refused, MonoNs(3))
+        .unwrap();
+    assert!(reg.get(c).unwrap().amend_unconfirmed());
+    assert_eq!(
+        reg.live(c)
+            .unwrap()
+            .amend(&caps(&[RefKind::Venue]), Ticks(102), lots(10), false),
+        Err(AmendRefusal::NoDeclaredReference)
+    );
+    let cmd = reg
+        .live(c)
+        .unwrap()
+        .amend(
+            &caps(&[RefKind::Venue, RefKind::Client]),
+            Ticks(102),
+            lots(10),
+            false,
+        )
+        .unwrap();
+    let VenueCommand::Amend(amend) = cmd.command() else {
+        panic!("an amend")
+    };
+    assert_eq!(amend.target, OrderRef::Client(c));
+    // A venue that keeps the id names it.
+    let keeping = with_amend(amend_caps(&[RefKind::Venue], true));
+    assert!(
+        reg.live(c)
+            .unwrap()
+            .amend(&keeping, Ticks(102), lots(10), false)
+            .is_ok()
+    );
 }
