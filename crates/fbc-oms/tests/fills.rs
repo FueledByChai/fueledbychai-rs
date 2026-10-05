@@ -497,32 +497,44 @@ proptest! {
             let time = time_of(spec, skew);
             let key = f.key();
             let before = applied.get(&key).copied().unwrap_or(0);
-            let horizon = ledger.horizon();
-            let admission = ledger.admit(&f, time, MonoNs(now));
-
             let engine_time = time.filter(|t| t.kind == ExchTsKind::MatchingEngine);
             let newer = engine_time.is_some_and(|t| t.aligned > WallNs(WATERMARK));
-            let vouched = match horizon {
+            let vouched_by = |horizon: Horizon| match horizon {
                 Horizon::Full => true,
                 Horizon::At(h) => engine_time.is_some_and(|t| t.exch > h),
                 Horizon::Lost => false,
             };
-            if !replay {
-                // A fill's first, live arrival: never seen, so always applied.
-                prop_assert!(matches!(admission, Admission::Apply(_)), "{:?}", admission);
-            } else if before == 0 && newer && vouched {
-                prop_assert!(matches!(admission, Admission::Apply(_)), "{:?}", admission);
-            }
-            if let Admission::Apply(accepted) = admission {
-                prop_assert_eq!(before, 0, "a fill moved inventory twice");
-                if replay {
-                    prop_assert!(newer, "a replay at or before the watermark was applied");
-                    prop_assert!(vouched, "a replay the ledger could not vouch for was applied");
+            // The horizon only moves forward; admitting may move it (what aged out is forgotten
+            // first), so an applied replay was vouched for by the horizon before it too.
+            let vouched_before = vouched_by(ledger.horizon());
+            let refused = match ledger.admit(&f, time, MonoNs(now)) {
+                Admission::Apply(accepted) => {
+                    prop_assert_eq!(before, 0, "a fill moved inventory twice");
+                    if replay {
+                        prop_assert!(newer, "a replay at or before the watermark was applied");
+                        prop_assert!(
+                            vouched_before,
+                            "a replay the ledger could not vouch for was applied"
+                        );
+                    }
+                    let routed = reg.apply_fill(accepted).unwrap();
+                    prop_assert!(matches!(routed, FillRouted::Ours(c, _) if c == cid));
+                    applied.insert(key, before + 1);
+                    expected = expected.checked_add(signed(spec.side, lots(spec.qty))).unwrap();
+                    None
                 }
-                let routed = reg.apply_fill(accepted).unwrap();
-                prop_assert!(matches!(routed, FillRouted::Ours(c, _) if c == cid));
-                applied.insert(key, before + 1);
-                expected = expected.checked_add(signed(spec.side, lots(spec.qty))).unwrap();
+                other => Some(format!("{other:?}")),
+            };
+            if let Some(refused) = refused {
+                // A fill's first, live arrival: never seen, so always applied.
+                prop_assert!(replay, "a live fill was refused: {}", refused);
+                // A replay absent, newer than the watermark and vouched for by the horizon it
+                // was judged under (the one after admitting) is applied.
+                prop_assert!(
+                    !(before == 0 && newer && vouched_by(ledger.horizon())),
+                    "a replay the ledger should apply was refused: {}",
+                    refused
+                );
             }
             prop_assert_eq!(reg.inventory(INST), expected);
             prop_assert!(ledger.len() <= s.max_entries);

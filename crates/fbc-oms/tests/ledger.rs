@@ -332,6 +332,31 @@ fn a_fill_forgotten_by_age_and_then_replayed_never_moves_inventory_again() {
 }
 
 #[test]
+fn a_fill_past_its_age_is_forgotten_before_the_next_fill_is_checked_against_it() {
+    // Codex r4185485780: the first fill after the age ran out reuses the key of the fill that
+    // aged out; the ledger forgets the old one first, whatever comes next.
+    let mut l = ledger(100, 50);
+    let mut reg = Registry::new();
+    let a = untracked("a", 3, false);
+    reg.apply_fill(accepted(l.admit(&a, engine(1_200), MonoNs(0))))
+        .unwrap();
+    // A replay under its key, past the age: refused by the horizon the forgetting set, not
+    // held as a duplicate, and the inventory does not move.
+    let replayed = untracked("a", 3, true);
+    assert!(matches!(
+        l.admit(&replayed, engine(1_190), MonoNs(50)),
+        Admission::BeyondHorizon
+    ));
+    assert!(!l.contains(&a.key()));
+    assert_eq!(l.horizon(), Horizon::At(ExchNs(1_200)));
+    // A live fill reusing the key past the age is a new fill: it is counted.
+    let reused = untracked("a", 2, false);
+    reg.apply_fill(accepted(l.admit(&reused, engine(1_300), MonoNs(51))))
+        .unwrap();
+    assert_eq!(reg.inventory(INST), SignedLots(5));
+}
+
+#[test]
 fn forgetting_a_fill_with_no_usable_time_loses_the_horizon_for_good() {
     let mut l = ledger(1, 1_000);
     let mut reg = Registry::new();
