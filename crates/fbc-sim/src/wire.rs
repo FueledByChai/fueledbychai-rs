@@ -1,4 +1,4 @@
-//! The frames on SimVenue's simulated order-entry stream (decision 0045): what [`SimCodec`]
+//! The frames on SimVenue's simulated order-entry stream (decision 0046): what [`SimCodec`]
 //! writes for each command and what [`SimEngine`] answers, one record per frame,
 //! `kind|key=value|...`, in text. Both ends build and read them here, so the format has one
 //! source.

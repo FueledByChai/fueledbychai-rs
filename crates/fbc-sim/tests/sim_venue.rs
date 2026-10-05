@@ -1,5 +1,5 @@
 //! FBC-uoo's done line: SimVenue driven through its codec and engine only, with no runtime and
-//! no socket (decision 0045). A placed order is answered Accepted after the configured latency
+//! no socket (decision 0046). A placed order is answered Accepted after the configured latency
 //! and filled through the queue model by later trades; a post-only order that would cross is
 //! rejected; a cancel ends the order; every fill carries a fee from the fee book, read back
 //! through the decode scope; and two runs over the same envelopes and frames give identical
