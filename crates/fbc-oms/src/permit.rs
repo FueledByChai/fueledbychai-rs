@@ -32,7 +32,7 @@ use fbc_core::{
     OrderCaps, OrderKind, OrderRef, TagSet, Ticks, VenueCommand,
 };
 
-use crate::caps::{CapRefusal, Exposure};
+use crate::caps::{Adds, CapRefusal, Exposure};
 use crate::record::{Intent, OrdState, OrderRecord};
 
 /// Why the registry gives no permit for an order.
@@ -95,7 +95,8 @@ pub enum AmendRefusal {
     /// inventory cap, so no amend is built (FBC-b0z9).
     RemainingQty,
     /// A pre-trade cap refused it (0013 rule 2): the amend would take the worst case on the
-    /// order's side past the inventory cap, or its market has no cap configured.
+    /// order's side past the inventory cap, or what the side has resting past the resting
+    /// cap, or its market has no caps configured.
     Capped(CapRefusal),
 }
 
@@ -217,10 +218,11 @@ impl<'r> Live<'r> {
     /// it chooses the traffic class only and exempts the amend from no check (0013 rule 2).
     ///
     /// Refused, never built, when the amend would take the worst case on the order's side past
-    /// its market's inventory cap (0005's I6), the order counted at the larger of its resting
-    /// quantity now and the amend's, as it is while the amend is in flight, or when its market
-    /// has no cap configured ([`AmendRefusal::Capped`]). A replace (an amend on a venue whose
-    /// amend gives the order a new id) is checked the same way. An amend built counts at once
+    /// its market's inventory cap (0005's I6), or what the side has resting past its resting
+    /// cap (0052), the order counted at the larger of its resting quantity now and the
+    /// amend's, as it is while the amend is in flight, or when its market has no caps
+    /// configured ([`AmendRefusal::Capped`]). A replace (an amend on a venue whose amend gives
+    /// the order a new id) is checked the same way. An amend built counts at once
     /// ([`OrderRecord::amend_built`]), so a check after it, of this order or another, sees
     /// it; it becomes the amend in flight when it is reported sent
     /// ([`Registry::amend_sent`](crate::Registry::amend_sent)), and an order whose amend was
@@ -271,7 +273,10 @@ impl<'r> Live<'r> {
             return Err(AmendRefusal::NoDeclaredReference);
         }
         self.exposure
-            .admit(rec.exposure_if_amended(qty))
+            .admit(Adds {
+                exposure: rec.exposure_if_amended(qty),
+                resting: rec.resting_if_amended(qty),
+            })
             .map_err(AmendRefusal::Capped)?;
         let cid = rec.cid();
         let build = self.rec.set_amend_built(qty);
