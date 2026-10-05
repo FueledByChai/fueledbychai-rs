@@ -3,8 +3,11 @@
 //!
 //! A [`VenueFactory`] is the one value a venue crate exports. From the consumer's
 //! configuration it states the venue's capabilities, plans market-data connections, and builds
-//! the codecs the runtime drives. Nothing outside the venue crates and the registry names a
-//! venue; everything else reads [`VenueCaps`].
+//! the codecs the runtime drives. It also discovers the venue's instruments, as an [`HttpPlan`]
+//! (REST requests as effects, and a parser that reads their answers inside a
+//! [`DecodeScope`]), and reads the Java-era tickers through its FBC common-symbol rule (design
+//! §4.4; the resolution itself is [`resolve`](crate::resolve)). Nothing outside the venue crates
+//! and the registry names a venue; everything else reads [`VenueCaps`].
 //!
 //! [`OrderGateway`] is what submits commands: the live gateway (runtime, exec codec and
 //! signer), the simulated venue, and a [`ManagedGateway`] for a venue reachable only through a
@@ -16,11 +19,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::caps::VenueCaps;
 use crate::codec::{
-    EncodeCtx, EncodeReceipt, ExecCodec, MdCodec, SpecTable, Subscription, WireUrl,
+    DecodeError, Effect, Effects, EncodeCtx, EncodeReceipt, ExecCodec, HttpFailure, HttpResponse,
+    HttpTag, MdCodec, SpecTable, Subscription, WireUrl,
 };
 use crate::command::{NotSentReason, VenueCommand};
 use crate::event::{RpcId, StreamId};
-use crate::ids::{AccountKey, InstrumentId};
+use crate::ids::{AccountKey, IdError, InstrumentId};
+use crate::resolve::{AssetKey, InstrumentSpecDraft, SymbolError};
+use crate::scope::DecodeScope;
 use crate::stamps::PathStamps;
 
 /// Where a configuration key lives.
@@ -171,6 +177,8 @@ pub enum VenueError {
     /// The venue does not offer this feed ([`MdCaps`](crate::MdCaps) says so): nothing is
     /// planned or sent for it.
     UnsupportedFeed(Subscription),
+    /// The adapter discovers no instruments: the consumer states them.
+    NoDiscovery,
 }
 
 impl fmt::Display for VenueError {
@@ -186,6 +194,7 @@ impl fmt::Display for VenueError {
                 sub.inst.get(),
                 sub.feed
             ),
+            VenueError::NoDiscovery => f.write_str("the venue adapter discovers no instruments"),
         }
     }
 }
@@ -232,11 +241,146 @@ pub struct ExecEndpoint {
     pub url: WireUrl,
 }
 
+/// Why an [`HttpPlan`] was refused, or its answers could not be read.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum PlanError {
+    /// A plan's effect is not an HTTP request: a plan asks for requests and nothing else.
+    NotHttp,
+    /// Two of a plan's requests carry this tag, so their answers could not be told apart.
+    DuplicateTag(HttpTag),
+    /// The answers are not one per request, in the plan's order, under the requests' tags.
+    Answers,
+    /// The request tagged `tag` got no response.
+    Http { tag: HttpTag, failure: HttpFailure },
+    /// The request tagged `tag` was answered with a status other than 2xx.
+    Status { tag: HttpTag, status: u16 },
+    /// An answer is not what the venue documents; names the part.
+    Decode(DecodeError),
+    /// An answer leaves out a field the result requires, named here: the whole answer is
+    /// refused, and nothing is guessed in its place.
+    Missing(&'static str),
+}
+
+impl fmt::Display for PlanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PlanError::NotHttp => f.write_str("a plan's effect is not an HTTP request"),
+            PlanError::DuplicateTag(tag) => write!(f, "two requests carry tag {}", tag.0),
+            PlanError::Answers => f.write_str("the answers do not match the plan's requests"),
+            PlanError::Http { tag, failure } => {
+                write!(f, "request {} got no response: {failure:?}", tag.0)
+            }
+            PlanError::Status { tag, status } => {
+                write!(f, "request {} was answered with status {status}", tag.0)
+            }
+            PlanError::Decode(err) => write!(f, "answer refused: {err}"),
+            PlanError::Missing(field) => {
+                write!(f, "answer refused: required field {field} is missing")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PlanError {}
+
+impl From<DecodeError> for PlanError {
+    fn from(err: DecodeError) -> PlanError {
+        PlanError::Decode(err)
+    }
+}
+
+impl From<IdError> for PlanError {
+    fn from(err: IdError) -> PlanError {
+        PlanError::Decode(err.into())
+    }
+}
+
+/// The answer the runtime got for one request of an [`HttpPlan`]: the response, or why none
+/// came.
+pub type HttpAnswer<'a> = (HttpTag, Result<HttpResponse<'a>, HttpFailure>);
+
+/// Reads the 2xx responses to a plan's requests, in the plan's order, inside a decode scope.
+type Parser<T> =
+    Box<dyn FnOnce(&[HttpResponse<'_>], &DecodeScope<'_>) -> Result<T, PlanError> + Send>;
+
+/// A factory call that needs REST answers, as data (decision 0002): the requests, as
+/// [`Effect::Http`]s the runtime makes through the consumer's proxy, and the parser that reads
+/// their answers. The parser runs inside a [`DecodeScope`], the only builder of a
+/// [`VenueSymbol`](crate::VenueSymbol), and does no IO and reads no clock.
+pub struct HttpPlan<T> {
+    requests: Vec<Effect>,
+    parser: Parser<T>,
+}
+
+impl<T> fmt::Debug for HttpPlan<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HttpPlan")
+            .field("requests", &self.requests)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> HttpPlan<T> {
+    /// A plan of `requests` read by `parser`. Refused when an effect is not an
+    /// [`Effect::Http`] ([`PlanError::NotHttp`]) or two share a tag.
+    pub fn new(
+        mut requests: Effects,
+        parser: impl FnOnce(&[HttpResponse<'_>], &DecodeScope<'_>) -> Result<T, PlanError>
+        + Send
+        + 'static,
+    ) -> Result<HttpPlan<T>, PlanError> {
+        let requests = requests.take();
+        let mut tags = BTreeSet::new();
+        for effect in &requests {
+            let Effect::Http { tag, .. } = effect else {
+                return Err(PlanError::NotHttp);
+            };
+            if !tags.insert(tag.0) {
+                return Err(PlanError::DuplicateTag(*tag));
+            }
+        }
+        Ok(HttpPlan {
+            requests,
+            parser: Box::new(parser),
+        })
+    }
+
+    /// The requests to make, every one an [`Effect::Http`].
+    pub fn requests(&self) -> &[Effect] {
+        &self.requests
+    }
+
+    /// Reads `answers`, one per request in the plan's order, inside `scope`. Refused before the
+    /// parser runs when the answers do not match the requests, a request got no response, or a
+    /// response's status is not 2xx; otherwise the parser's result.
+    pub fn parse(
+        self,
+        answers: &[HttpAnswer<'_>],
+        scope: &DecodeScope<'_>,
+    ) -> Result<T, PlanError> {
+        if answers.len() != self.requests.len() {
+            return Err(PlanError::Answers);
+        }
+        let mut responses = Vec::with_capacity(answers.len());
+        for (effect, (tag, answer)) in self.requests.iter().zip(answers) {
+            if !matches!(effect, Effect::Http { tag: asked, .. } if asked == tag) {
+                return Err(PlanError::Answers);
+            }
+            let resp = answer.map_err(|failure| PlanError::Http { tag: *tag, failure })?;
+            if !(200..300).contains(&resp.status) {
+                let status = resp.status;
+                return Err(PlanError::Status { tag: *tag, status });
+            }
+            responses.push(resp);
+        }
+        (self.parser)(&responses, scope)
+    }
+}
+
 /// The one value a venue crate exports.
 ///
-/// Instrument discovery and the legacy-symbol hook (FBC-ahf), and the credential-bearing calls
-/// (`exec_codec`'s credentials and `test_connection`, under `src/auth`; FBC-b3b) are not
-/// declared yet.
+/// The credential-bearing calls (`exec_codec`'s credentials and `test_connection`, under
+/// `src/auth`; FBC-b3b) are not declared yet.
 pub trait VenueFactory: Sync + 'static {
     /// The venue's name as FBC spells it ("PARADEX").
     fn id(&self) -> &'static str;
@@ -244,6 +388,19 @@ pub trait VenueFactory: Sync + 'static {
     fn config_schema(&self) -> &'static [FieldSpec];
     /// What the venue can do under `cfg`.
     fn caps(&self, cfg: &VenueConfig) -> Result<VenueCaps, ConfigError>;
+    /// The asset key of the instrument a Java-era ticker names on this venue, by FBC's rule for
+    /// it (Paradex `X/USDT` is `X-USD-PERP`, Hibachi `X/USDT` is `X/USDT-P`, Binance `X/USDT` is
+    /// `XUSDT`): the key the venue's discovery states for that instrument, which the consumer's
+    /// legacy reader then resolves (design §4.4). [`SymbolError::NoRule`] for a venue the Java
+    /// library never traded.
+    fn parse_fbc_common_symbol(&self, s: &str) -> Result<AssetKey, SymbolError>;
+    /// The venue's instruments: REST requests as effects, and a parser that reads their answers
+    /// into one [`InstrumentSpecDraft`] per instrument inside a [`DecodeScope`], refusing an
+    /// answer that leaves out a required field ([`PlanError::Missing`]). `Err` when the
+    /// configuration is refused, or [`VenueError::NoDiscovery`] for an adapter that discovers
+    /// nothing.
+    fn discover(&self, cfg: &VenueConfig)
+    -> Result<HttpPlan<Vec<InstrumentSpecDraft>>, VenueError>;
     /// How `subs` spread over endpoints: connections, and for feeds the venue offers only over
     /// REST, connectionless poll endpoints ([`MdTransport`]). Each instrument is spelled as
     /// `specs` says (a venue may put its symbols in the URL). `Err` names an instrument missing
@@ -407,5 +564,124 @@ mod tests {
         };
         let shown = VenueError::UnsupportedFeed(sub).to_string();
         assert_eq!(shown, "instrument 7 has no Index feed on this venue");
+    }
+
+    fn get(tag: u64) -> Effect {
+        Effect::Http {
+            tag: HttpTag(tag),
+            req: crate::codec::HttpRequest {
+                method: crate::codec::HttpMethod::Get,
+                url: WireUrl::plain("https://venue.invalid/list?key=SYNTHETIC-PLAN-KEY"),
+                headers: vec![],
+                body: crate::codec::WireSlice::plain(vec![]),
+            },
+            rpc: None,
+            timeout: core::time::Duration::from_secs(1),
+            class: crate::codec::TrafficClass::Normal,
+            charge: crate::caps::RateCharge::one(crate::caps::OpKind::Rest, None),
+        }
+    }
+
+    /// A plan of `tags` whose parser gives the bodies it was handed, in order.
+    fn plan(tags: &[u64]) -> Result<HttpPlan<Vec<Vec<u8>>>, PlanError> {
+        let mut fx = Effects::new();
+        tags.iter().for_each(|tag| fx.push(get(*tag)));
+        HttpPlan::new(fx, |responses, _scope| {
+            Ok(responses.iter().map(|r| r.body.to_vec()).collect())
+        })
+    }
+
+    fn ok(body: &[u8]) -> Result<HttpResponse<'_>, HttpFailure> {
+        Ok(HttpResponse {
+            status: 200,
+            headers: &[],
+            body,
+        })
+    }
+
+    fn parse(
+        plan: HttpPlan<Vec<Vec<u8>>>,
+        answers: &[HttpAnswer<'_>],
+    ) -> Result<Vec<Vec<u8>>, PlanError> {
+        crate::scope::dispatch_market_data(&crate::caps::testing::caps(), |scope| {
+            plan.parse(answers, scope)
+        })
+    }
+
+    #[test]
+    fn a_plan_holds_only_http_requests_each_under_its_own_tag() {
+        let timer = Effect::Timer {
+            tag: crate::codec::TimerTag(1),
+            after: core::time::Duration::from_secs(1),
+        };
+        let mut fx = Effects::new();
+        fx.push(get(1));
+        fx.push(timer);
+        let refused = HttpPlan::<()>::new(fx, |_, _| Ok(()));
+        assert_eq!(refused.err(), Some(PlanError::NotHttp));
+        let duplicate = plan(&[1, 2, 1]).err();
+        assert_eq!(duplicate, Some(PlanError::DuplicateTag(HttpTag(1))));
+        assert_eq!(plan(&[]).unwrap().requests(), []);
+        assert_eq!(plan(&[1, 2]).unwrap().requests(), [get(1), get(2)]);
+    }
+
+    #[test]
+    fn a_plan_parses_only_one_2xx_answer_per_request_in_its_order() {
+        let both = [(HttpTag(1), ok(b"a")), (HttpTag(2), ok(b"b"))];
+        let parsed = parse(plan(&[1, 2]).unwrap(), &both);
+        assert_eq!(parsed, Ok(vec![b"a".to_vec(), b"b".to_vec()]));
+        let swapped = [both[1], both[0]];
+        for answers in [&both[..1], &swapped[..], &[both[0], both[1], both[1]][..]] {
+            let refused = parse(plan(&[1, 2]).unwrap(), answers);
+            assert_eq!(refused, Err(PlanError::Answers));
+        }
+        let lost = [(HttpTag(1), ok(b"a")), (HttpTag(2), Err(HttpFailure::Lost))];
+        let (tag, failure) = (HttpTag(2), HttpFailure::Lost);
+        assert_eq!(
+            parse(plan(&[1, 2]).unwrap(), &lost),
+            Err(PlanError::Http { tag, failure })
+        );
+        for status in [199, 301, 404] {
+            let resp = Ok(HttpResponse {
+                status,
+                headers: &[],
+                body: b"",
+            });
+            let refused = parse(plan(&[1]).unwrap(), &[(HttpTag(1), resp)]);
+            let tag = HttpTag(1);
+            assert_eq!(refused, Err(PlanError::Status { tag, status }), "{status}");
+        }
+    }
+
+    #[test]
+    fn plan_errors_say_what_was_refused_and_a_plan_shows_no_credential() {
+        let id: PlanError = IdError::Empty.into();
+        assert_eq!(
+            id,
+            PlanError::Decode(DecodeError::IdRefused(IdError::Empty))
+        );
+        let (tag, failure) = (HttpTag(4), HttpFailure::TimedOut);
+        let cases = [
+            (PlanError::NotHttp, "not an HTTP request"),
+            (PlanError::DuplicateTag(tag), "two requests carry tag 4"),
+            (PlanError::Answers, "do not match"),
+            (
+                PlanError::Http { tag, failure },
+                "request 4 got no response: TimedOut",
+            ),
+            (PlanError::Status { tag, status: 503 }, "with status 503"),
+            (id, "answer refused: venue id refused"),
+            (PlanError::Missing("tick"), "required field tick is missing"),
+        ];
+        for (err, text) in cases {
+            assert!(err.to_string().contains(text), "{err}");
+        }
+        assert_eq!(
+            VenueError::NoDiscovery.to_string(),
+            "the venue adapter discovers no instruments"
+        );
+        let shown = format!("{:?}", plan(&[1]).unwrap());
+        assert!(shown.starts_with("HttpPlan { requests: ["), "{shown}");
+        assert!(!shown.contains("SYNTHETIC-PLAN-KEY"), "{shown}");
     }
 }

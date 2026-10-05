@@ -9,8 +9,8 @@ use std::time::Duration;
 use fbc_core::{
     ConfigError, ConnTopology, Effect, Effects, Encoding, Feed, FeedSource, HttpFailure, HttpTag,
     Inbound, InboundSpans, LimitScope, MdCodec, MdTransport, MonoNs, OpKind, RateCharge, RawFrame,
-    StreamId, Subscription, TagSet, TimerTag, TrafficClass, VenueConfig, VenueError, VenueFactory,
-    WallNs, dispatch_market_data,
+    StreamId, Subscription, SymbolError, TagSet, TimerTag, TrafficClass, VenueConfig, VenueError,
+    VenueFactory, WallNs, dispatch_market_data,
 };
 use fbc_venue_paradex::ParadexFactory;
 use fbc_venue_paradex::factory::{MD_STREAM, MD_URL, caps};
@@ -148,6 +148,11 @@ fn the_factory_declares_market_data_only_with_its_cited_limits() {
     assert!(declared.exec.is_none());
     assert!(ParadexFactory.exec_codec(&cfg()).is_none());
     assert_eq!(ParadexFactory.plan_exec(&cfg()), Ok(Vec::new()));
+    // Discovery and the Java-era ticker rule are not built yet (FBC-l5o): both say so.
+    let ticker = ParadexFactory.parse_fbc_common_symbol("BTC/USDT");
+    assert_eq!(ticker, Err(SymbolError::NoRule));
+    let discovered = ParadexFactory.discover(&cfg()).err();
+    assert_eq!(discovered, Some(VenueError::NoDiscovery));
     let md = &declared.md;
     assert_eq!(md.encoding, Encoding::Sbe);
     assert_eq!(md.touch_sources.len(), 1);

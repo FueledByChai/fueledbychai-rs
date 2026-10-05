@@ -111,9 +111,11 @@ rather than guess.
 
 - A Cargo workspace (0001, 0008). `crates/fbc-core` exists, with time, units,
   price grids, exact prices, sealed ids, the client-id codec, `NamespaceLease`, `CidMint`,
-  `Fee`/`FeeBook`, `DecodeScope`, `InstrumentSpec` (maker-safe `quantize`), `VenueCaps`,
-  the market-data and execution events, venue commands, and the codec, signer, nonce and
-  factory traits with `Effects` and `EncodeCtx`, and the write-only `PathStamps` a codec marks
+  `Fee`/`FeeBook`, `DecodeScope`, `InstrumentSpec` (maker-safe `quantize`), instrument
+  resolution (`AssetKey`, `AliasTable`, `InstrumentResolver`, `InstrumentSpecDraft`; 0035),
+  `VenueCaps`, the market-data and execution events, venue commands, and the codec, signer,
+  nonce and factory traits with `Effects` and `EncodeCtx` (the factory's discovery an
+  `HttpPlan`), and the write-only `PathStamps` a codec marks
   its latency stages through (0034), `crates/fbc-book` with its L2 book, `crates/fbc-journal` with its record
   format, day-grouped segment writer rolled hourly with zstd-compressed closed segments, in-order reader and never-blocking sink, `crates/fbc-runtime` with its first
   slices (the connector, SOCKS5 CONNECT, WebSocket and HTTP/1.1, plain or TLS, 0019 and 0020, the WebSocket handshake its own, 0029;

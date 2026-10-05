@@ -10,11 +10,12 @@ use core::time::Duration;
 use std::collections::{BTreeMap, BTreeSet};
 
 use fbc_core::{
-    BookCaps, Cadence, Channel, ConfigError, ConfigScope, ConnTopology, Continuity, Encoding,
-    EndpointPlan, ExchTsKind, ExecCodec, ExecEndpoint, Feed, FeedSource, FieldSpec, FieldUnit,
-    FundingCaps, LimitScope, MatchingCaps, MdCaps, MdCodec, MdTransport, OpKind, QueueModelQuality,
-    RateLimit, Readiness, SeqDomain, SpecTable, StpScope, StreamId, Subscription, TagSet,
-    TouchSourceCaps, TradeCaps, VenueCaps, VenueConfig, VenueError, VenueFactory, WireUrl,
+    AssetKey, BookCaps, Cadence, Channel, ConfigError, ConfigScope, ConnTopology, Continuity,
+    Encoding, EndpointPlan, ExchTsKind, ExecCodec, ExecEndpoint, Feed, FeedSource, FieldSpec,
+    FieldUnit, FundingCaps, HttpPlan, InstrumentSpecDraft, LimitScope, MatchingCaps, MdCaps,
+    MdCodec, MdTransport, OpKind, QueueModelQuality, RateLimit, Readiness, SeqDomain, SpecTable,
+    StpScope, StreamId, Subscription, SymbolError, TagSet, TouchSourceCaps, TradeCaps, VenueCaps,
+    VenueConfig, VenueError, VenueFactory, WireUrl,
 };
 
 use crate::md::book::BOOK_CHANNELS;
@@ -77,6 +78,19 @@ impl VenueFactory for ParadexFactory {
 
     fn caps(&self, _cfg: &VenueConfig) -> Result<VenueCaps, ConfigError> {
         Ok(caps())
+    }
+
+    /// None yet: Paradex's FBC rule (`X/USDT` is `X-USD-PERP`) is FBC-l5o.
+    fn parse_fbc_common_symbol(&self, _s: &str) -> Result<AssetKey, SymbolError> {
+        Err(SymbolError::NoRule)
+    }
+
+    /// None yet: discovery from `GET /markets` is FBC-l5o.
+    fn discover(
+        &self,
+        _cfg: &VenueConfig,
+    ) -> Result<HttpPlan<Vec<InstrumentSpecDraft>>, VenueError> {
+        Err(VenueError::NoDiscovery)
     }
 
     /// As few connections as can carry `subs` with at most one book channel per market on
