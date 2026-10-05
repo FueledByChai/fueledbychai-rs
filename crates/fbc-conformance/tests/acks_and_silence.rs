@@ -5,7 +5,7 @@
 //! subscription live and asks the stub's REST path for a snapshot. The runtime never parses an
 //! acknowledgement, so the duplicate-ack test proves the codec-plus-runtime path.
 //!
-//! Both tests run on a paused clock that moves only when the test moves it: a blocking task that
+//! Every test runs on a paused clock that moves only when the test moves it: a blocking task that
 //! never ends keeps tokio from jumping the clock while socket I/O is under way. Every wait is for
 //! something the test can observe, bounded by wall-clock time from another thread so that a
 //! regression fails instead of hanging; no assertion depends on how long a wait took.
@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use fbc_conformance::{
-    Frame, HttpReply, HttpRoutes, StubServer, duplicate_acks, silence_after_ack,
+    Frame, HttpReply, HttpRoutes, Step, StubServer, WsScript, duplicate_acks, silence_after_ack,
 };
 use fbc_core::{
     ConnKey, EndpointPlan, Envelope, Feed, FeedHealth, InstrumentId, MdEvent, MdTransport,
@@ -170,7 +170,12 @@ async fn under_duplicate_acks_the_codec_asks_one_snapshot_each_and_nothing_is_se
         // connection's frames in order, so once both have reached the handler every
         // acknowledgement has been read and every snapshot it caused asked for; then each
         // snapshot asked for is let land.
-        until(|| trade_seqs(&watch.borrow()).ends_with(&[3, 4])).await;
+        // A snapshot may land before, between or after the trades (Codex r4181466459).
+        until(|| {
+            let seqs = trade_seqs(&watch.borrow());
+            seqs.contains(&3) && seqs.contains(&4)
+        })
+        .await;
         until(|| venue.http_log().len() == venue.snapshots() as usize).await;
         drop(control);
     };
@@ -206,6 +211,64 @@ async fn under_duplicate_acks_the_codec_asks_one_snapshot_each_and_nothing_is_se
     let counters = session.counters();
     assert_eq!((counters.attempts, counters.decode_errors), (1, 0));
     assert_eq!((counters.silences, counters.refused_effects), (0, 0));
+}
+
+/// Codex r4181466463: the toy forgets an acknowledgement when its subscription is removed, so a
+/// subscription removed and added again on the same connection is snapshotted again on its new
+/// acknowledgement, while a repeated one still asks for nothing.
+#[tokio::test(start_paused = true)]
+async fn a_subscription_removed_and_added_again_is_snapshotted_again_on_its_new_ack() {
+    let frozen = freeze();
+    let push = |frame: Frame| Step::Push { conn: 0, frame };
+    let read = Step::Read { conn: 0 };
+    let script = WsScript::new(vec![
+        Step::Accept,
+        read.clone(),
+        read.clone(),
+        push(ack("A")),
+        push(ack("B")),
+        read.clone(),
+        read,
+        push(ack("A")),
+        push(ack("A")),
+        push(Frame::text(trade("A", 101, 5))),
+    ]);
+    let server = StubServer::start(script, snapshots()).await.unwrap();
+    let venue = ToyVenue::leak();
+    let lax = Liveness::new(Duration::from_secs(3_600), ms(1)).unwrap();
+    let seen = Seen::default();
+    let (mut session, control) = MdSession::new(session(venue, &server, lax), keep(&seen)).unwrap();
+
+    let watch = seen.clone();
+    let drive = async {
+        until(|| watch.borrow().len() == 2).await;
+        control.set_desired([toy::sub(2)]);
+        until(|| server.connections()[0].received.len() == 3).await;
+        control.set_desired([toy::sub(1), toy::sub(2)]);
+        server.finished().await.unwrap();
+        // The trade was pushed after the acknowledgements, so once it has reached the handler
+        // each has been read; then each snapshot asked for is let land.
+        until(|| trade_seqs(&watch.borrow()).contains(&5)).await;
+        until(|| venue.http_log().len() == venue.snapshots() as usize).await;
+        drop(control);
+    };
+    let (run, ()) = tokio::join!(session.run(), drive);
+    run.unwrap();
+    drop(frozen);
+
+    let sent = [
+        "hello|codec=0|plan=1,2",
+        "sub|add=A,B",
+        "sub|remove=A",
+        "sub|add=A",
+    ];
+    assert_eq!(server.connections()[0].received, sent.map(Frame::text));
+    assert_eq!(venue.snapshots(), 3);
+    assert_eq!(
+        sorted(server.http_requests()),
+        ["GET /snapshot/A", "GET /snapshot/A", "GET /snapshot/B"]
+    );
+    assert_eq!(sorted(trade_seqs(&seen.borrow())), [1, 1, 2, 5]);
 }
 
 #[tokio::test(start_paused = true)]
