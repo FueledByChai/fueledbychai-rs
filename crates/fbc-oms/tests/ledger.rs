@@ -13,8 +13,9 @@ use fbc_core::{
     ItemRef, Lots, MonoNs, Namespace, Side, SignedLots, SubmitOutcome, VenueOrderState, WallNs,
 };
 use fbc_oms::{
-    AcceptedFill, Admission, FillApplied, FillLedger, FillRouted, FillTime, Horizon, LedgerConfig,
-    LedgerConfigError, OmsError, OrdState, OrderKey, OrderOp, Registry, ReplayCounts, TerminalKind,
+    AcceptedFill, Admission, Applied, FillApplied, FillLedger, FillRouted, FillTime, Horizon,
+    LedgerConfig, LedgerConfigError, OmsError, OrdState, OrderKey, OrderOp, Registry, ReplayCounts,
+    Routed, TerminalKind,
 };
 
 const INST: InstrumentId = InstrumentId::new(1);
@@ -507,6 +508,37 @@ fn a_fill_naming_only_the_venue_id_reaches_its_order_and_teaches_the_id() {
     );
     assert_eq!(reg.get(c).unwrap().cum_fills(), lots(5));
     assert_eq!(reg.inventory(INST), SignedLots(-5));
+}
+
+#[test]
+fn a_fill_naming_an_amends_new_venue_id_lets_an_update_on_that_id_reach_its_order() {
+    // Codex r4182353421: the fill under our client id names the amend's new venue id before
+    // the Amended update does.
+    let (mut l, mut reg) = session();
+    let c = cid();
+    reg.insert(placement(c, 100, 10)).unwrap();
+    let mut open = update(Some(c), VenueOrderState::Open, 0);
+    open.vid = Some(common::vid("v1"));
+    reg.apply_update(&open, key(1));
+    let named = FillIdent::Venue {
+        fill: common::fill_id("f1"),
+        vid: Some(common::vid("v2")),
+        cum_after: None,
+    };
+    let f = fill(Some(c), named, Side::Buy, 3, false);
+    assert_eq!(
+        reg.apply_fill(accepted(l.admit(&f, None, MonoNs(0)))),
+        Ok(FillRouted::Ours(c, FillApplied::Live))
+    );
+    assert_eq!(reg.cid_of(&common::vid("v2")), Some(c));
+    // A cancel naming only the new id ends the order.
+    let mut cancel = update(None, common::canceled(), 3);
+    cancel.vid = Some(common::vid("v2"));
+    assert_eq!(
+        reg.apply_update(&cancel, key(2)),
+        Routed::Ours(c, Applied::Advanced)
+    );
+    assert!(reg.get(c).unwrap().state().is_terminal());
 }
 
 #[test]

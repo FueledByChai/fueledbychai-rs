@@ -169,7 +169,7 @@ impl Registry {
     /// sum move (decision 0005, I3).
     ///
     /// Routed as [`Registry::apply_update`] routes an order update. A fill of our order counts
-    /// on it ([`FillApplied`]) and moves the inventory; one under our namespace's client id
+    /// on it ([`FillApplied`]), moves the inventory and indexes the venue id it names; one under our namespace's client id
     /// for no order the registry holds moves the inventory only; another namespace's, a
     /// non-canonical or an unattributed one moves nothing and is flagged. The ledger records
     /// only a fill that counted, once it is applied: a flagged fill is not kept, so it never
@@ -211,6 +211,12 @@ impl Registry {
             (Some(cid), Some(cum)) => {
                 let applied =
                     self.with_record(cid, |rec| rec.apply_fill(fill.vid(), fill.cum_after(), cum));
+                // The fill's venue id names this order even when the record knows it by
+                // another (an amend's new id, before the Amended update), so a later update
+                // naming only that id still reaches it.
+                if let Some(v) = fill.vid() {
+                    self.by_vid.entry(v.clone()).or_insert(cid);
+                }
                 FillRouted::Ours(cid, applied)
             }
             _ => FillRouted::OursUntracked(ours),

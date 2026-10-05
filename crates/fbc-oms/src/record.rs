@@ -138,7 +138,7 @@ pub enum OutcomeApplied {
     /// left to the Unknown ladder ([`OrderRecord::unknown_since`]).
     AwaitingLadder,
     /// The amend or cancel was not sent or was refused: the order is as it was, nothing in
-    /// flight; Filled if its fills cover its total once no larger amend is in flight.
+    /// flight; Filled if its fills then cover every total the venue may hold.
     IntentCleared,
     /// Nothing changed: the order is terminal, or the outcome waits for an order event.
     Unchanged,
@@ -171,6 +171,9 @@ pub struct OrderRecord {
     qty: Lots,
     cum_venue: Lots,
     cum_fills: Lots,
+    /// The largest total of the amends a later command replaced in flight, before anything
+    /// tied a confirmation to them: any of them may rest at the venue.
+    unsettled: Option<Lots>,
     state: OrdState,
     intent: Intent,
     last_key: Option<OrderKey>,
@@ -193,6 +196,7 @@ impl OrderRecord {
             px,
             cum_venue: Lots::ZERO,
             cum_fills: Lots::ZERO,
+            unsettled: None,
             state: OrdState::PendingNew,
             intent: Intent::None,
             last_key: None,
@@ -251,14 +255,31 @@ impl OrderRecord {
         self.cum_venue.max(self.cum_fills)
     }
 
-    /// The quantity still resting: nothing once terminal; otherwise the total less the filled
-    /// part, so a PendingNew or Unknown order counts as fully resting.
+    /// The quantity still resting: nothing once terminal; otherwise the largest total the
+    /// venue may hold less the filled part, so a PendingNew or Unknown order counts as fully
+    /// resting, and an amend to a larger total counts from when it is sent until the venue
+    /// confirms an amend sent at or after it, or the amend is refused while it is the only
+    /// one unconfirmed (I6).
     pub fn resting(&self) -> Lots {
         if self.state.is_terminal() {
             Lots::ZERO
         } else {
-            self.qty.checked_sub(self.filled()).unwrap_or(Lots::ZERO)
+            self.ceiling()
+                .checked_sub(self.filled())
+                .unwrap_or(Lots::ZERO)
         }
+    }
+
+    /// The largest total the venue may hold: the order's total, the amend in flight's and
+    /// those of the amends replaced in flight before they were confirmed.
+    fn ceiling(&self) -> Lots {
+        let pending = match self.intent {
+            Intent::PendingAmend { qty, .. } => qty,
+            _ => Lots::ZERO,
+        };
+        self.qty
+            .max(pending)
+            .max(self.unsettled.unwrap_or(Lots::ZERO))
     }
 
     /// Where the order stands.
@@ -302,6 +323,10 @@ impl OrderRecord {
         if self.state.is_terminal() {
             return false;
         }
+        if let Intent::PendingAmend { qty, .. } = self.intent {
+            // Replaced before anything confirmed it: the amend may still reach the venue.
+            self.unsettled = Some(self.unsettled.map_or(qty, |u| u.max(qty)));
+        }
         self.intent = intent;
         true
     }
@@ -314,10 +339,15 @@ impl OrderRecord {
     /// is ignored, though an amend's replacement of one venue id by another, a fact whenever
     /// it arrives, is still recorded. The venue's price and total apply when the update states
     /// them; `cum_venue` keeps the largest cumulative fill. An Open update moves the order to
-    /// Open, or PartiallyFilled once something is filled; an amended update moves no state,
-    /// and resolves an amend in flight, whose price and total stand where the update does not
-    /// state them. Either ends the order Filled when its fills alone then cover its total with no amend to
-    /// a larger total in flight.
+    /// Open, or PartiallyFilled once something is filled; an amended update moves no state.
+    /// An update leaving the order at the price and total of the amend in flight confirms it.
+    /// An amended update stating neither also confirms it, the amend's price and total then
+    /// standing, when it is tied to that amend: no earlier amend was replaced in flight
+    /// unconfirmed, and it names a new venue id the record did not know, or carries a venue
+    /// ordering key later than the last update's. Otherwise it may be a duplicate of an older
+    /// confirmation, and the amend stays in flight, counted ([`Self::resting`]). Either kind
+    /// of update ends the order Filled when its fills alone then cover every total the venue
+    /// may hold.
     pub fn apply_update(&mut self, u: &OrderUpdate, key: OrderKey) -> Applied {
         if self.state.is_terminal() {
             return Applied::IgnoredLate;
@@ -328,6 +358,12 @@ impl OrderRecord {
         if let (None, Some(v)) = (&self.vid, &u.vid) {
             self.vid = Some(self.follow(v));
         }
+        let issued = matches!(&u.state, VenueOrderState::Amended { new_vid: Some(nv) }
+            if self.vid.as_ref() != Some(nv) && !self.is_superseded(nv));
+        let later = key.venue.is_some_and(|k| {
+            self.last_key
+                .is_none_or(|last| last.venue.is_some_and(|l| k > l))
+        });
         if let VenueOrderState::Amended { new_vid: Some(nv) } = &u.state {
             self.replace(u.vid.as_ref(), nv);
         }
@@ -351,13 +387,15 @@ impl OrderRecord {
             return Applied::Advanced;
         }
         if let VenueOrderState::Amended { .. } = u.state {
-            if let Intent::PendingAmend { px, qty, .. } = self.intent {
-                // The venue confirmed the amend in flight: what it does not echo is what was
-                // sent.
+            if let Intent::PendingAmend { px, qty, .. } = self.intent
+                && self.unsettled.is_none()
+                && (issued || later)
+            {
+                // Tied to the amend in flight: what the venue does not echo is what was sent.
                 self.px = Some(u.px.unwrap_or(px));
                 self.qty = u.qty.unwrap_or(qty);
-                self.intent = Intent::None;
             }
+            self.confirm_if_stated();
             self.complete_if_covered();
             return Applied::Amended;
         }
@@ -365,12 +403,7 @@ impl OrderRecord {
             self.unknown_since = None;
         }
         self.state = self.live_state();
-        if let Intent::PendingAmend { px, qty, .. } = self.intent
-            && self.px == Some(px)
-            && self.qty == qty
-        {
-            self.intent = Intent::None;
-        }
+        self.confirm_if_stated();
         self.complete_if_covered();
         Applied::Advanced
     }
@@ -455,8 +488,8 @@ impl OrderRecord {
     /// The fill counts whatever the order's state, and `cum_after`, when reported, raises
     /// `cum_venue`. A terminal order does not move. Otherwise
     /// the record learns the fill's venue id when it has none; a PendingNew or Unknown order is
-    /// promoted; and the order is Filled only when the fills alone cover its total and no amend
-    /// to a larger total is in flight, never on the venue's cumulative count alone.
+    /// promoted; and the order is Filled only when the fills alone cover every total the venue
+    /// may hold (an amend's in flight included), never on the venue's cumulative count alone.
     pub(crate) fn apply_fill(
         &mut self,
         vid: Option<&VenueOrderId>,
@@ -483,13 +516,23 @@ impl OrderRecord {
         FillApplied::Live
     }
 
-    /// Ends a live order Filled when its fills alone cover its total and no amend to a larger
-    /// total is in flight; whether it did. Checked whenever the fills, the total or the amend
-    /// in flight change.
+    /// Resolves the amend in flight once the order stands at its price and total: the venue
+    /// applied it, and with it every amend sent before it.
+    fn confirm_if_stated(&mut self) {
+        if let Intent::PendingAmend { px, qty, .. } = self.intent
+            && self.px == Some(px)
+            && self.qty == qty
+        {
+            self.intent = Intent::None;
+            self.unsettled = None;
+        }
+    }
+
+    /// Ends a live order Filled when its fills alone cover every total the venue may hold
+    /// (its own, the amend in flight's and any unconfirmed earlier amend's); whether it did.
+    /// Checked whenever the fills, the total or the amends in flight change.
     fn complete_if_covered(&mut self) -> bool {
-        let growing =
-            matches!(self.intent, Intent::PendingAmend { qty, .. } if qty > self.cum_fills);
-        let covered = !self.state.is_terminal() && self.cum_fills >= self.qty && !growing;
+        let covered = !self.state.is_terminal() && self.cum_fills >= self.ceiling();
         if covered {
             self.end(TerminalKind::Filled);
         }
@@ -514,6 +557,7 @@ impl OrderRecord {
     fn end(&mut self, kind: TerminalKind) {
         self.state = OrdState::Terminal(kind);
         self.intent = Intent::None;
+        self.unsettled = None;
         self.unknown_since = None;
     }
 
@@ -621,7 +665,8 @@ mod tests {
         assert!(rec.amend_sent(Ticks(101), lots(8), RpcId(3), MonoNs(2)));
         assert_eq!(rec.apply_fill(None, None, lots(4)), FillApplied::Live);
         assert_eq!(rec.state(), OrdState::PartiallyFilled);
-        assert_eq!(rec.resting(), Lots::ZERO);
+        // The amend may already rest at the venue: its four more lots count as resting.
+        assert_eq!(rec.resting(), lots(4));
         // Once the fills cover the amended total too, the order is filled.
         assert_eq!(rec.apply_fill(None, None, lots(8)), FillApplied::Completed);
         assert_eq!(rec.state(), OrdState::Terminal(TerminalKind::Filled));
@@ -655,7 +700,7 @@ mod tests {
         assert_eq!(rec.apply_fill(None, None, lots(5)), FillApplied::Live);
         // The venue amended it to eight: still resting three.
         let mut amended = update(VenueOrderState::Amended { new_vid: None }, 5);
-        amended.qty = Some(lots(8));
+        (amended.px, amended.qty) = (Some(Ticks(101)), Some(lots(8)));
         rec.apply_update(&amended, key(1));
         assert_eq!(rec.state(), OrdState::PartiallyFilled);
         assert_eq!(rec.resting(), lots(3));
@@ -666,18 +711,118 @@ mod tests {
         assert_eq!(rec.state(), OrdState::Terminal(TerminalKind::Filled));
     }
 
+    fn keyed(venue: u64, ingest: u64) -> OrderKey {
+        OrderKey {
+            venue: Some(venue),
+            ingest,
+        }
+    }
+
+    fn refused() -> SubmitOutcome {
+        SubmitOutcome::Rejected(Reject {
+            kind: RejectKind::NotAmendable(NotAmendable::Other),
+            venue_code: None,
+            raw: "refused".into(),
+        })
+    }
+
     #[test]
-    fn an_amend_confirmed_without_its_total_takes_the_total_that_was_sent() {
+    fn an_amend_confirmed_later_than_anything_applied_takes_the_values_that_were_sent() {
         let mut rec = order(5);
+        rec.apply_update(&update(VenueOrderState::Open, 0), keyed(1, 1));
         assert!(rec.amend_sent(Ticks(101), lots(8), RpcId(3), MonoNs(2)));
         assert_eq!(rec.apply_fill(None, None, lots(5)), FillApplied::Live);
-        // The venue confirms the amend but echoes neither price nor total.
+        // The venue confirms the amend under a newer ordering key, echoing neither price nor
+        // total.
         let amended = update(VenueOrderState::Amended { new_vid: None }, 5);
-        assert_eq!(rec.apply_update(&amended, key(1)), Applied::Amended);
+        assert_eq!(rec.apply_update(&amended, keyed(2, 2)), Applied::Amended);
         assert_eq!(rec.state(), OrdState::PartiallyFilled);
         assert_eq!((rec.px(), rec.qty()), (Some(Ticks(101)), lots(8)));
         assert_eq!(rec.resting(), lots(3));
         assert_eq!(rec.intent(), Intent::None);
+    }
+
+    #[test]
+    fn an_amend_confirmed_with_nothing_to_tie_it_to_the_amend_in_flight_counts_the_larger_total() {
+        let mut rec = order(5);
+        assert!(rec.amend_sent(Ticks(101), lots(8), RpcId(3), MonoNs(2)));
+        assert_eq!(rec.apply_fill(None, None, lots(5)), FillApplied::Live);
+        // No venue ordering key, no new venue id, no price or total: this may be a duplicate
+        // of an older confirmation, so the amend stays in flight and its total counts.
+        let amended = update(VenueOrderState::Amended { new_vid: None }, 5);
+        assert_eq!(rec.apply_update(&amended, key(1)), Applied::Amended);
+        assert_eq!(rec.state(), OrdState::PartiallyFilled);
+        assert_eq!((rec.px(), rec.qty()), (Some(Ticks(100)), lots(5)));
+        assert!(matches!(rec.intent(), Intent::PendingAmend { .. }));
+        assert_eq!(rec.resting(), lots(3));
+        // An update stating the amend's price and total resolves it.
+        let mut stated = update(VenueOrderState::Amended { new_vid: None }, 5);
+        (stated.px, stated.qty) = (Some(Ticks(101)), Some(lots(8)));
+        assert_eq!(rec.apply_update(&stated, key(2)), Applied::Amended);
+        assert_eq!(rec.intent(), Intent::None);
+        assert_eq!(rec.resting(), lots(3));
+    }
+
+    #[test]
+    fn a_duplicate_of_an_older_amend_confirmation_does_not_resolve_a_newer_amend() {
+        // Codex r4182353444: the venue keeps its order id.
+        let mut rec = order(5);
+        rec.apply_update(&update(VenueOrderState::Open, 0), keyed(1, 1));
+        assert!(rec.amend_sent(Ticks(101), lots(6), RpcId(3), MonoNs(2)));
+        let a1 = update(VenueOrderState::Amended { new_vid: None }, 0);
+        assert_eq!(rec.apply_update(&a1, keyed(2, 2)), Applied::Amended);
+        assert_eq!((rec.px(), rec.qty()), (Some(Ticks(101)), lots(6)));
+        assert!(rec.amend_sent(Ticks(102), lots(9), RpcId(4), MonoNs(3)));
+        // A1's confirmation again: same venue key, later ingest.
+        assert_eq!(rec.apply_update(&a1, keyed(2, 3)), Applied::Amended);
+        assert!(matches!(
+            rec.intent(),
+            Intent::PendingAmend { qty, .. } if qty == lots(9)
+        ));
+        assert_eq!((rec.px(), rec.qty()), (Some(Ticks(101)), lots(6)));
+        assert_eq!(rec.resting(), lots(9), "A2 may rest");
+        // A2 is refused: the order is A1's.
+        rec.on_outcome(OrderOp::Amend, None, &refused(), MonoNs(4));
+        assert_eq!(rec.intent(), Intent::None);
+        assert_eq!((rec.px(), rec.qty()), (Some(Ticks(101)), lots(6)));
+        assert_eq!(rec.resting(), lots(6));
+    }
+
+    #[test]
+    fn an_amend_replaced_in_flight_counts_until_a_later_amend_is_confirmed() {
+        let mut rec = order(5);
+        rec.apply_update(&update(VenueOrderState::Open, 0), keyed(1, 1));
+        // A1 to nine, then A2 to seven before anything answers A1.
+        assert!(rec.amend_sent(Ticks(101), lots(9), RpcId(3), MonoNs(2)));
+        assert!(rec.amend_sent(Ticks(102), lots(7), RpcId(4), MonoNs(3)));
+        assert_eq!(rec.resting(), lots(9), "A1 may rest");
+        // A newer bare confirmation could be A1's: it resolves neither.
+        let bare = update(VenueOrderState::Amended { new_vid: None }, 0);
+        assert_eq!(rec.apply_update(&bare, keyed(2, 2)), Applied::Amended);
+        assert_eq!((rec.px(), rec.qty()), (Some(Ticks(100)), lots(5)));
+        assert_eq!(rec.resting(), lots(9));
+        // A2 is refused: A1 may still rest, so its total still counts, and fills short of
+        // it do not complete the order.
+        rec.on_outcome(OrderOp::Amend, None, &refused(), MonoNs(4));
+        assert_eq!(rec.intent(), Intent::None);
+        assert_eq!(rec.resting(), lots(9));
+        assert_eq!(rec.apply_fill(None, None, lots(5)), FillApplied::Live);
+        assert_eq!(rec.resting(), lots(4));
+        // A3 to six, confirmed with its values: the venue applied it after A1.
+        assert!(rec.amend_sent(Ticks(103), lots(6), RpcId(5), MonoNs(5)));
+        let mut a3 = update(VenueOrderState::Amended { new_vid: None }, 5);
+        (a3.px, a3.qty) = (Some(Ticks(103)), Some(lots(6)));
+        assert_eq!(rec.apply_update(&a3, keyed(3, 3)), Applied::Amended);
+        assert_eq!(rec.intent(), Intent::None);
+        assert_eq!(rec.resting(), lots(1));
+    }
+
+    #[test]
+    fn a_cancel_sent_over_an_amend_in_flight_keeps_the_amends_total_counted() {
+        let mut rec = order(5);
+        assert!(rec.amend_sent(Ticks(101), lots(8), RpcId(3), MonoNs(2)));
+        assert!(rec.cancel_sent(RpcId(4), MonoNs(3)));
+        assert_eq!(rec.resting(), lots(8));
     }
 
     #[test]
