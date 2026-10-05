@@ -5,7 +5,7 @@
 //! hold the line; these tests read the crate's sources and fail if anything but `scope.rs`
 //! calls them, or if anything builds the tuple structs other than those constructors' bodies.
 //!
-//! Decisions 0002 and 0033: a codec gets time only from `EncodeCtx` or callback arguments, and
+//! Decisions 0002 and 0034: a codec gets time only from `EncodeCtx` or callback arguments, and
 //! marks its latency stages through `PathStamps`, which gives back none. Nothing in `fbc-core`
 //! reads a clock, so nothing in it can hand a codec a time the runtime did not journal.
 
@@ -145,7 +145,7 @@ fn nothing_in_the_core_reads_a_clock() {
     }
     assert!(
         reads.is_empty(),
-        "fbc-core reads a clock (0002, 0033):\n{}",
+        "fbc-core reads a clock (0002, 0034):\n{}",
         reads.join("\n")
     );
 }

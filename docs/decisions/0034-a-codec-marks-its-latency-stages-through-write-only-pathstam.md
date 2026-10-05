@@ -1,4 +1,4 @@
-# 0033 — A codec marks its latency stages through write-only PathStamps and the runtime reads the clock
+# 0034 — A codec marks its latency stages through write-only PathStamps and the runtime reads the clock
 
 Status: accepted
 Date: 2026-10-04

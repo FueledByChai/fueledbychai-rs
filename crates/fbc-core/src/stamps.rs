@@ -1,4 +1,4 @@
-//! Per-stage latency stamps on an order's way out, with no clock in the codec (decision 0033,
+//! Per-stage latency stamps on an order's way out, with no clock in the codec (decision 0034,
 //! design §4.7, §5.3, §11).
 //!
 //! The latency budget splits an order's path into stages: the encode, each signer call inside

@@ -3,7 +3,7 @@
 //! seals), `tests/ui_ids/` (the id seals), `tests/ui_fee/` (the fee seal), `tests/ui_caps/`
 //! (decision 0003: capabilities and specs with every field mandatory) and `tests/ui_states/`
 //! (decision 0005: no terminal state for an unknown order, no request without a deadline),
-//! `tests/ui_stamps/` (decision 0033: path stamps give a codec no time) and their expected
+//! `tests/ui_stamps/` (decision 0034: path stamps give a codec no time) and their expected
 //! `.stderr`. Regenerate the expected output with
 //! `TRYBUILD=overwrite cargo test -p fbc-core --test compile_fail` only when the pinned
 //! toolchain moves (0008).
@@ -67,7 +67,7 @@ fn a_not_found_rejection_is_not_a_terminal_state() {
 /// A codec marks its stages through `PathStamps` and learns no time from it: it cannot reach the
 /// runtime's recorder through the handle, cannot ask it whether it records (so it cannot tell
 /// live from replay), and neither `PathStamps` nor `PathRecorder::mark` returns the instant a
-/// mark was recorded at (decision 0033).
+/// mark was recorded at (decision 0034).
 #[test]
 fn path_stamps_give_a_codec_no_time() {
     let cases = trybuild::TestCases::new();
