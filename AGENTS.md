@@ -265,8 +265,16 @@ rather than guess.
     queries answered with the query's rpc, a request's items answered in separate frames held
     and pushed in one call (`on_rpc_timeout` pushing `Unknown` only for the unanswered ones), a
     resync answered in frames and pushed whole at its end, and an authentication whose token
-    `redact_inbound` names; still planned: the named suite and its macro, and the rest of the
-    conformance toy).
+    `redact_inbound` names; and its factory, `ToyFactory`; and `src/suite/`, the named suite:
+    `suite!`, invoked from an adapter's `tests/conformance.rs` with its factory, its fixture
+    directory (one subdirectory per check that reads recorded data) and the setup its fixtures
+    assume, one test per check, each check also a public function returning what it probed or
+    every breach by capability; so far `caps_truthful` (every absence the caps declare refused
+    `NotSent(Unsupported)` with no effect, every flag conflict `NotSent(FlagConflict)`, an
+    instrument cancel-all never widened, a control per operation sent) and
+    `commands_selfcontained` (every amend, cancel and query by each declared reference encoded
+    by a fresh codec, alike after it saw the placement); still planned: the suite's other checks
+    and the rest of the conformance toy).
   - `crates/venues/fbc-venues` (the registry, the only crate that sees concrete venues),
     `crates/venues/fbc-venue-binance-usdm` (market data only:
     `exec: None` caps citing Binance's USD-M pages, `plan_md` on the `/public` combined-stream
