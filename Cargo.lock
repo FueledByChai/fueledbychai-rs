@@ -520,6 +520,7 @@ dependencies = [
  "starknet-core",
  "starknet-crypto",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

@@ -13,6 +13,7 @@ fbc-core = { path = "../../fbc-core" }
 rust_decimal.workspace = true
 starknet-crypto.workspace = true
 sha3.workspace = true
+zeroize.workspace = true
 serde_json.workspace = true
 
 # fbc-conformance, fbc-journal, fbc-runtime and tokio are test-only: the decoder-replay test

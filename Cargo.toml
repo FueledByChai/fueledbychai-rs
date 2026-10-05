@@ -27,6 +27,9 @@ trybuild = "1"
 starknet-crypto = { version = "=0.8.1", default-features = false, features = ["std"] }
 starknet-core = "=0.16.0"
 sha3 = { version = "=0.10.8", default-features = false }
+# The Paradex signing key is overwritten when dropped (FBC-dm9): zeroize's volatile writes, the
+# same version starknet-crypto already uses for its RFC 6979 nonce, so the lockfile gains no crate.
+zeroize = { version = "=1.9.0", default-features = false }
 serde_json = "1"
 # The runtime's network stack (FBC-2ds, decision 0019): exact pins, so a dependency moves only
 # by a ticket that says why. tokio runs current_thread (design §5.1); tokio-tungstenite and
