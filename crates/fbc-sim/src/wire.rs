@@ -1,7 +1,8 @@
 //! The frames on SimVenue's simulated order-entry stream (decision 0046): what [`SimCodec`]
-//! writes for each command and what [`SimEngine`] answers, one record per frame,
-//! `kind|key=value|...`, in text. Both ends build and read them here, so the format has one
-//! source.
+//! writes for each command and what [`SimEngine`] answers, in text: one record per line,
+//! `kind|key=value|...`, and one line per frame except for a batch, whose items follow its
+//! header line, and a query's answer, whose order follows it. Both ends build and read them
+//! here, so the format has one source.
 //!
 //! [`SimCodec`]: crate::SimCodec
 //! [`SimEngine`]: crate::SimEngine
@@ -10,8 +11,8 @@ use core::fmt::{Display, Write as _};
 use core::str::FromStr;
 
 use fbc_core::{
-    AssetSym, CancelReason, InstrumentId, Liquidity, Lots, MonoNs, RejectKind, Side, TerminalHint,
-    Ticks, TifTag, WallNs,
+    AssetSym, CancelReason, InstrumentId, Liquidity, Lots, MonoNs, NotAmendable, RejectKind, Side,
+    TerminalHint, Ticks, TifTag, WallNs,
 };
 
 /// A field a frame lacks or cannot be read as.
@@ -24,9 +25,22 @@ struct Record<'a> {
     fields: Vec<(&'a str, String)>,
 }
 
+/// A frame's records, one per line.
+fn records(bytes: &[u8]) -> Result<Vec<Record<'_>>, WireError> {
+    let text = core::str::from_utf8(bytes).map_err(|_| WireError("utf-8"))?;
+    text.split('\n').map(Record::parse).collect()
+}
+
+/// A frame's one record: refused when it has more.
+fn record(bytes: &[u8]) -> Result<(Record<'_>, Vec<Record<'_>>), WireError> {
+    let mut lines = records(bytes)?.into_iter();
+    // `split` gives at least one line.
+    let head = lines.next().ok_or(WireError("kind"))?;
+    Ok((head, lines.collect()))
+}
+
 impl<'a> Record<'a> {
-    fn parse(bytes: &'a [u8]) -> Result<Record<'a>, WireError> {
-        let text = core::str::from_utf8(bytes).map_err(|_| WireError("utf-8"))?;
+    fn parse(text: &'a str) -> Result<Record<'a>, WireError> {
         let mut parts = text.split('|');
         let kind = parts.next().unwrap_or_default();
         let mut fields = Vec::new();
@@ -96,6 +110,7 @@ fn unescape(value: &str) -> Result<String, WireError> {
             Some("25") => '%',
             Some("7C") => '|',
             Some("3D") => '=',
+            Some("0A") => '\n',
             _ => return Err(WireError("escape")),
         });
         rest = &rest[at + 3..];
@@ -112,14 +127,16 @@ impl Writer {
         Writer(kind.to_owned())
     }
 
-    /// Adds `key=value`, the value escaped (Codex r4182154750): `%`, `|` and `=` are written
-    /// `%25`, `%7C` and `%3D`, so no value can split a record or a field.
+    /// Adds `key=value`, the value escaped (Codex r4182154750): `%`, `|`, `=` and a newline
+    /// are written `%25`, `%7C`, `%3D` and `%0A`, so no value can split a line, a record or a
+    /// field.
     fn field(mut self, key: &str, value: impl Display) -> Writer {
         let value = value.to_string();
         let escaped = value
             .replace('%', "%25")
             .replace('|', "%7C")
-            .replace('=', "%3D");
+            .replace('=', "%3D")
+            .replace('\n', "%0A");
         // Writing to a String cannot fail.
         let _ = write!(self.0, "|{key}={escaped}");
         self
@@ -136,6 +153,13 @@ impl Writer {
     fn name<T: Copy + PartialEq>(self, key: &str, table: &[(&str, T)], value: T) -> Writer {
         let found = table.iter().find(|(_, v)| *v == value);
         self.field(key, found.map_or("", |(name, _)| *name))
+    }
+
+    /// Starts the next record of the frame, on its own line.
+    fn line(mut self, kind: &str) -> Writer {
+        self.0.push('\n');
+        self.0.push_str(kind);
+        self
     }
 
     fn finish(self) -> Vec<u8> {
@@ -169,6 +193,14 @@ const REFUSALS: &[(&str, Refusal)] = &[
     ("no_fee", Refusal::NoFee),
     ("invalid_qty", Refusal::InvalidQty),
     ("invalid_px", Refusal::InvalidPrice),
+    (
+        "not_amendable",
+        Refusal::NotAmendable(NotAmendable::Unsupported),
+    ),
+    (
+        "partially_filled",
+        Refusal::NotAmendable(NotAmendable::PartiallyFilled),
+    ),
 ];
 
 /// When a command left the client: its encode's wall and monotonic time.
@@ -182,7 +214,22 @@ pub(crate) struct Sent {
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub(crate) enum Command {
     Place(Place),
+    /// A batch of placements, each item carrying the batch's rpc and send time.
+    Batch(Head, Vec<Place>),
+    Amend(Amend),
     Cancel(Cancel),
+    /// A batch of cancels.
+    Cancels(Head, Vec<Target>),
+    /// Every order on one instrument.
+    CancelAll(Head, InstrumentId),
+    Query(Query),
+}
+
+/// What every command frame starts with: its request and when it left the client.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub(crate) struct Head {
+    pub rpc: u64,
+    pub sent: Sent,
 }
 
 /// A new order. `px` is `None` for a market order.
@@ -194,6 +241,21 @@ pub(crate) struct Place {
     pub inst: InstrumentId,
     pub side: Side,
     pub px: Option<Ticks>,
+    pub qty: Lots,
+    pub tif: TifTag,
+    pub post_only: bool,
+    pub reduce_only: bool,
+}
+
+/// An amend naming its order, with the order's full values after it. `qty` is the venue's
+/// wire quantity, read under the stood-in venue's `AmendQty`.
+#[derive(Clone, Eq, PartialEq, Debug)]
+pub(crate) struct Amend {
+    pub head: Head,
+    pub target: Target,
+    pub inst: InstrumentId,
+    pub side: Side,
+    pub px: Ticks,
     pub qty: Lots,
     pub tif: TifTag,
     pub post_only: bool,
@@ -214,77 +276,237 @@ pub(crate) enum Target {
     Client(String),
 }
 
+/// A query naming its order by `target`, and every identifier the query's own reference
+/// carries (`vid`, and our wire client id `cid`), which its answer echoes so the codec can name
+/// the order the query asked about.
+#[derive(Clone, Eq, PartialEq, Debug)]
+pub(crate) struct Query {
+    pub head: Head,
+    pub target: Target,
+    pub vid: Option<String>,
+    pub cid: Option<String>,
+}
+
+impl Writer {
+    fn head(kind: &str, head: Head) -> Writer {
+        Writer::new(kind)
+            .field("rpc", head.rpc)
+            .field("mono", head.sent.mono.0)
+            .field("wall", head.sent.wall.0)
+    }
+
+    fn target(self, target: &Target) -> Writer {
+        match target {
+            Target::Venue(vid) => self.field("vid", vid),
+            Target::Client(cid) => self.field("cid", cid),
+        }
+    }
+
+    fn opt(self, key: &str, value: Option<impl Display>) -> Writer {
+        match value {
+            Some(value) => self.field(key, value),
+            None => self,
+        }
+    }
+
+    /// A placement's order fields.
+    fn order(self, p: &Place) -> Writer {
+        self.field("cid", &p.cid)
+            .field("inst", p.inst.get())
+            .side(p.side)
+            .opt("px", p.px.map(|px| px.0))
+            .field("qty", p.qty.get())
+            .name("tif", TIFS, p.tif)
+            .flag("po", p.post_only)
+            .flag("ro", p.reduce_only)
+    }
+
+    /// An order event's fields.
+    fn event(self, o: &OrderEvent) -> Writer {
+        self.field("cid", &o.cid)
+            .field("vid", &o.vid)
+            .field("inst", o.inst.get())
+            .side(o.side)
+            .name("state", STATES, o.state)
+            .field("cum", o.cum.get())
+            .opt("px", o.px.map(|px| px.0))
+            .field("qty", o.qty.get())
+            .flag("po", o.post_only)
+            .flag("ro", o.reduce_only)
+    }
+}
+
+impl Record<'_> {
+    fn head(&self) -> Result<Head, WireError> {
+        Ok(Head {
+            rpc: self.num("rpc")?,
+            sent: Sent {
+                mono: MonoNs(self.num("mono")?),
+                wall: WallNs(self.num("wall")?),
+            },
+        })
+    }
+
+    fn target(&self) -> Result<Target, WireError> {
+        match (self.opt("vid"), self.opt("cid")) {
+            (Some(vid), _) => Ok(Target::Venue(vid.to_owned())),
+            (None, Some(cid)) => Ok(Target::Client(cid.to_owned())),
+            (None, None) => Err(WireError("target")),
+        }
+    }
+
+    fn px(&self) -> Result<Option<Ticks>, WireError> {
+        self.opt("px").map(|_| self.ticks("px")).transpose()
+    }
+
+    /// A placement under `head`.
+    fn place(&self, head: Head) -> Result<Place, WireError> {
+        Ok(Place {
+            rpc: head.rpc,
+            sent: head.sent,
+            cid: self.str("cid")?.to_owned(),
+            inst: self.inst()?,
+            side: self.side()?,
+            px: self.px()?,
+            qty: self.lots("qty")?,
+            tif: self.named("tif", TIFS)?,
+            post_only: self.flag("po")?,
+            reduce_only: self.flag("ro")?,
+        })
+    }
+
+    fn event(&self) -> Result<OrderEvent, WireError> {
+        Ok(OrderEvent {
+            cid: self.str("cid")?.to_owned(),
+            vid: self.str("vid")?.to_owned(),
+            inst: self.inst()?,
+            side: self.side()?,
+            state: self.named("state", STATES)?,
+            cum: self.lots("cum")?,
+            px: self.px()?,
+            qty: self.lots("qty")?,
+            post_only: self.flag("po")?,
+            reduce_only: self.flag("ro")?,
+        })
+    }
+}
+
+/// Each of `lines` read as an item of kind `item`.
+fn items<'a, T>(
+    lines: Vec<Record<'a>>,
+    item: &str,
+    read: impl Fn(&Record<'a>) -> Result<T, WireError>,
+) -> Result<Vec<T>, WireError> {
+    let read = |r: &Record<'a>| {
+        if r.kind == item {
+            read(r)
+        } else {
+            Err(WireError("item"))
+        }
+    };
+    lines.iter().map(read).collect()
+}
+
 impl Command {
     pub(crate) fn sent(&self) -> Sent {
         match self {
             Command::Place(p) => p.sent,
             Command::Cancel(c) => c.sent,
+            Command::Amend(Amend { head, .. })
+            | Command::Query(Query { head, .. })
+            | Command::Batch(head, _)
+            | Command::Cancels(head, _)
+            | Command::CancelAll(head, _) => head.sent,
         }
     }
 
     pub(crate) fn encode(&self) -> Vec<u8> {
         match self {
             Command::Place(p) => {
-                let w = Writer::new("place")
-                    .field("rpc", p.rpc)
-                    .field("mono", p.sent.mono.0)
-                    .field("wall", p.sent.wall.0)
-                    .field("cid", &p.cid)
-                    .field("inst", p.inst.get())
-                    .side(p.side);
-                let w = match p.px {
-                    Some(px) => w.field("px", px.0),
-                    None => w,
+                let head = Head {
+                    rpc: p.rpc,
+                    sent: p.sent,
                 };
-                w.field("qty", p.qty.get())
-                    .name("tif", TIFS, p.tif)
-                    .flag("po", p.post_only)
-                    .flag("ro", p.reduce_only)
-                    .finish()
+                Writer::head("place", head).order(p)
             }
+            Command::Batch(head, places) => places
+                .iter()
+                .fold(Writer::head("batch", *head), |w, p| w.line("item").order(p)),
+            Command::Amend(a) => Writer::head("amend", a.head)
+                .target(&a.target)
+                .field("inst", a.inst.get())
+                .side(a.side)
+                .field("px", a.px.0)
+                .field("qty", a.qty.get())
+                .name("tif", TIFS, a.tif)
+                .flag("po", a.post_only)
+                .flag("ro", a.reduce_only),
             Command::Cancel(c) => {
-                let (key, id) = match &c.target {
-                    Target::Venue(vid) => ("vid", vid),
-                    Target::Client(cid) => ("cid", cid),
+                let head = Head {
+                    rpc: c.rpc,
+                    sent: c.sent,
                 };
-                Writer::new("cancel")
-                    .field("rpc", c.rpc)
-                    .field("mono", c.sent.mono.0)
-                    .field("wall", c.sent.wall.0)
-                    .field(key, id)
-                    .finish()
+                Writer::head("cancel", head).target(&c.target)
             }
+            Command::Cancels(head, targets) => {
+                targets.iter().fold(Writer::head("cancels", *head), |w, t| {
+                    w.line("item").target(t)
+                })
+            }
+            Command::CancelAll(head, inst) => {
+                Writer::head("cancelall", *head).field("inst", inst.get())
+            }
+            Command::Query(q) => Writer::head("query", q.head)
+                .target(&q.target)
+                .opt("qvid", q.vid.as_ref())
+                .opt("qcid", q.cid.as_ref()),
         }
+        .finish()
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Command, WireError> {
-        let r = Record::parse(bytes)?;
-        let rpc = r.num("rpc")?;
-        let sent = Sent {
-            mono: MonoNs(r.num("mono")?),
-            wall: WallNs(r.num("wall")?),
+        let (r, lines) = record(bytes)?;
+        let head = r.head()?;
+        let single = |command: Command| {
+            if lines.is_empty() {
+                Ok(command)
+            } else {
+                Err(WireError("item"))
+            }
         };
         match r.kind {
-            "place" => Ok(Command::Place(Place {
-                rpc,
-                sent,
-                cid: r.str("cid")?.to_owned(),
+            "place" => single(Command::Place(r.place(head)?)),
+            "batch" => Ok(Command::Batch(
+                head,
+                items(lines, "item", |i| i.place(head))?,
+            )),
+            "amend" => single(Command::Amend(Amend {
+                head,
+                target: r.target()?,
                 inst: r.inst()?,
                 side: r.side()?,
-                px: r.opt("px").map(|_| r.ticks("px")).transpose()?,
+                px: r.ticks("px")?,
                 qty: r.lots("qty")?,
                 tif: r.named("tif", TIFS)?,
                 post_only: r.flag("po")?,
                 reduce_only: r.flag("ro")?,
             })),
-            "cancel" => {
-                let target = match (r.opt("vid"), r.opt("cid")) {
-                    (Some(vid), _) => Target::Venue(vid.to_owned()),
-                    (None, Some(cid)) => Target::Client(cid.to_owned()),
-                    (None, None) => return Err(WireError("target")),
-                };
-                Ok(Command::Cancel(Cancel { rpc, sent, target }))
-            }
+            "cancel" => single(Command::Cancel(Cancel {
+                rpc: head.rpc,
+                sent: head.sent,
+                target: r.target()?,
+            })),
+            "cancels" => Ok(Command::Cancels(
+                head,
+                items(lines, "item", Record::target)?,
+            )),
+            "cancelall" => single(Command::CancelAll(head, r.inst()?)),
+            "query" => single(Command::Query(Query {
+                head,
+                target: r.target()?,
+                vid: r.opt("qvid").map(str::to_owned),
+                cid: r.opt("qcid").map(str::to_owned),
+            })),
             _ => Err(WireError("kind")),
         }
     }
@@ -315,6 +537,8 @@ pub(crate) enum Refusal {
     InvalidQty,
     /// A limit price the instrument's price grid does not accept.
     InvalidPrice,
+    /// An amend the stood-in venue's amend capabilities do not allow.
+    NotAmendable(NotAmendable),
 }
 
 impl Refusal {
@@ -326,6 +550,7 @@ impl Refusal {
             Refusal::Terminal(hint) => RejectKind::AlreadyTerminal(hint),
             Refusal::InvalidQty => RejectKind::InvalidQty,
             Refusal::InvalidPrice => RejectKind::InvalidPrice,
+            Refusal::NotAmendable(why) => RejectKind::NotAmendable(why),
             Refusal::DuplicateClientId | Refusal::NoBook | Refusal::NoFee => RejectKind::Other,
         }
     }
@@ -335,6 +560,14 @@ impl Refusal {
         let found = REFUSALS.iter().find(|(_, r)| *r == self);
         found.map_or("", |(name, _)| *name)
     }
+}
+
+/// What became of one item of a request: accepted, naming the order it placed, amended or
+/// cancelled, or refused.
+#[derive(Clone, Eq, PartialEq, Debug)]
+pub(crate) enum ItemResult {
+    Accepted { cid: String, vid: String },
+    Rejected(Refusal),
 }
 
 /// An answer frame, engine to codec. Every one carries the engine's sequence number.
@@ -349,6 +582,23 @@ pub(crate) enum Reply {
     Rejected {
         rpc: u64,
         refusal: Refusal,
+    },
+    /// Each item of a batch, in the batch's order, in one frame.
+    Items {
+        rpc: u64,
+        items: Vec<ItemResult>,
+    },
+    /// A request of no items accepted whole: a cancel-all.
+    Done {
+        rpc: u64,
+    },
+    /// A query's answer, echoing the identifiers it named its order by, with the order when the
+    /// venue knows it.
+    Query {
+        rpc: u64,
+        vid: Option<String>,
+        cid: Option<String>,
+        found: Option<OrderEvent>,
     },
     Order(OrderEvent),
     Fill(FillRecord),
@@ -396,23 +646,35 @@ impl Reply {
                 .field("seq", seq)
                 .field("rpc", rpc)
                 .name("code", REFUSALS, *refusal),
-            Reply::Order(o) => {
-                let w = Writer::new("order")
-                    .field("seq", seq)
-                    .field("cid", &o.cid)
-                    .field("vid", &o.vid)
-                    .field("inst", o.inst.get())
-                    .side(o.side)
-                    .name("state", STATES, o.state)
-                    .field("cum", o.cum.get());
-                let w = match o.px {
-                    Some(px) => w.field("px", px.0),
-                    None => w,
-                };
-                w.field("qty", o.qty.get())
-                    .flag("po", o.post_only)
-                    .flag("ro", o.reduce_only)
+            Reply::Items { rpc, items } => {
+                let w = Writer::new("items").field("seq", seq).field("rpc", rpc);
+                items.iter().fold(w, |w, item| match item {
+                    ItemResult::Accepted { cid, vid } => {
+                        w.line("ack").field("cid", cid).field("vid", vid)
+                    }
+                    ItemResult::Rejected(refusal) => {
+                        w.line("reject").name("code", REFUSALS, *refusal)
+                    }
+                })
             }
+            Reply::Done { rpc } => Writer::new("done").field("seq", seq).field("rpc", rpc),
+            Reply::Query {
+                rpc,
+                vid,
+                cid,
+                found,
+            } => {
+                let w = Writer::new("query")
+                    .field("seq", seq)
+                    .field("rpc", rpc)
+                    .opt("qvid", vid.as_ref())
+                    .opt("qcid", cid.as_ref());
+                match found {
+                    Some(o) => w.line("order").event(o),
+                    None => w,
+                }
+            }
+            Reply::Order(o) => Writer::new("order").field("seq", seq).event(o),
             Reply::Fill(f) => Writer::new("fill")
                 .field("seq", seq)
                 .field("fid", &f.fid)
@@ -432,31 +694,55 @@ impl Reply {
 
     /// The reply and its sequence number.
     pub(crate) fn decode(bytes: &[u8]) -> Result<(u64, Reply), WireError> {
-        let r = Record::parse(bytes)?;
+        let (r, lines) = record(bytes)?;
         let seq = r.num("seq")?;
+        let single = |reply: Reply| {
+            if lines.is_empty() {
+                Ok(reply)
+            } else {
+                Err(WireError("item"))
+            }
+        };
         let reply = match r.kind {
-            "ack" => Reply::Accepted {
+            "ack" => single(Reply::Accepted {
                 rpc: r.num("rpc")?,
                 cid: r.str("cid")?.to_owned(),
                 vid: r.str("vid")?.to_owned(),
-            },
-            "reject" => Reply::Rejected {
+            }),
+            "reject" => single(Reply::Rejected {
                 rpc: r.num("rpc")?,
                 refusal: r.named("code", REFUSALS)?,
-            },
-            "order" => Reply::Order(OrderEvent {
-                cid: r.str("cid")?.to_owned(),
-                vid: r.str("vid")?.to_owned(),
-                inst: r.inst()?,
-                side: r.side()?,
-                state: r.named("state", STATES)?,
-                cum: r.lots("cum")?,
-                px: r.opt("px").map(|_| r.ticks("px")).transpose()?,
-                qty: r.lots("qty")?,
-                post_only: r.flag("po")?,
-                reduce_only: r.flag("ro")?,
             }),
-            "fill" => Reply::Fill(FillRecord {
+            "items" => {
+                let item = |i: &Record<'_>| match i.kind {
+                    "ack" => Ok(ItemResult::Accepted {
+                        cid: i.str("cid")?.to_owned(),
+                        vid: i.str("vid")?.to_owned(),
+                    }),
+                    "reject" => Ok(ItemResult::Rejected(i.named("code", REFUSALS)?)),
+                    _ => Err(WireError("item")),
+                };
+                let items = lines.iter().map(item).collect::<Result<_, _>>()?;
+                Ok(Reply::Items {
+                    rpc: r.num("rpc")?,
+                    items,
+                })
+            }
+            "done" => single(Reply::Done { rpc: r.num("rpc")? }),
+            "query" => {
+                let mut found = items(lines, "order", Record::event)?;
+                if found.len() > 1 {
+                    return Err(WireError("item"));
+                }
+                Ok(Reply::Query {
+                    rpc: r.num("rpc")?,
+                    vid: r.opt("qvid").map(str::to_owned),
+                    cid: r.opt("qcid").map(str::to_owned),
+                    found: found.pop(),
+                })
+            }
+            "order" => single(Reply::Order(r.event()?)),
+            "fill" => single(Reply::Fill(FillRecord {
                 fid: r.str("fid")?.to_owned(),
                 cid: r.str("cid")?.to_owned(),
                 vid: r.str("vid")?.to_owned(),
@@ -468,9 +754,9 @@ impl Reply {
                 liquidity: r.named("liq", LIQUIDITY)?,
                 fee: r.num("fee")?,
                 asset: AssetSym::new(r.str("asset")?).ok_or(WireError("asset"))?,
-            }),
-            _ => return Err(WireError("kind")),
-        };
+            })),
+            _ => Err(WireError("kind")),
+        }?;
         Ok((seq, reply))
     }
 }

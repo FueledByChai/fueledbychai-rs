@@ -22,17 +22,22 @@
 //! order-entry stream:
 //!
 //! - [`SimCodec`] is an [`ExecCodec`](fbc_core::ExecCodec), the boundary every venue's codec
-//!   implements (0014, unchanged): it writes each place and cancel as a frame on the simulated
-//!   stream and decodes the answers into outcomes, order updates and fills through the
-//!   [`DecodeScope`](fbc_core::DecodeScope) only.
+//!   implements (0014, unchanged): it writes each command the stood-in venue takes (place,
+//!   amend, cancel, their batches, an instrument cancel-all, a query) as a frame on the
+//!   simulated stream and decodes the answers into outcomes, order updates, fills and query
+//!   results through the [`DecodeScope`](fbc_core::DecodeScope) only.
 //! - [`SimEngine`] is a pure state machine: fed the shard's market-data envelopes (it holds its
 //!   own `fbc-book` books) and the codec's frames, it matches orders against the book and
 //!   through the queue model and answers with frames ([`Answer`]) due after the configured
-//!   [`SimLatency`]. It reads no clock.
+//!   [`SimLatency`]. It reads no clock. An amend resets the order's queue position unless the
+//!   stood-in venue's caps declare `keeps_priority: Some(true)` (design §4.5). Orders the
+//!   consumer injects ([`SimEngine::inject`]: another process's, design §10.2 step 2) queue and
+//!   fill as modelled orders, so they are never size ahead of a later order, and are never
+//!   answered as the consumer's own.
 //!
 //! Every number SimVenue uses, its capabilities, latency, bracket and fee rates included, is in
-//! the consumer's [`SimConfig`]. Not here yet: amends, batches, queries and injected orders
-//! (FBC-nv2), hosting in the runtime (FBC-6mf) and replay (FBC-w9g).
+//! the consumer's [`SimConfig`]. Not here yet: hosting in the runtime (FBC-6mf) and replay
+//! (FBC-w9g).
 
 mod codec;
 mod config;
@@ -42,7 +47,7 @@ mod wire;
 
 pub use codec::SimCodec;
 pub use config::{SimConfig, SimLatency};
-pub use engine::{Answer, SimEngine, SimError};
+pub use engine::{Answer, InjectedOrder, SimEngine, SimError};
 pub use queue::{
     Bracket, NewOrder, OrderKey, QueueConfig, QueueError, QueueModel, QueuePos, SimFill, TradeView,
 };
