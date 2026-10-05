@@ -465,7 +465,8 @@ proptest! {
     fn i3_a_replayed_fill_moves_inventory_only_when_absent_newer_and_vouched_for(
         s in session()
     ) {
-        let cid = cid();
+        // An order per side, each fill on the one of its side.
+        let (buy, sell) = (cid(), cid());
         let mut ledger = FillLedger::new(
             LedgerConfig {
                 max_age: Duration::from_nanos(s.max_age),
@@ -475,7 +476,10 @@ proptest! {
         )
         .unwrap();
         let mut reg = Registry::new();
-        reg.insert(placement(cid, 100, 1_000_000)).unwrap();
+        reg.insert(placement(buy, 100, 1_000_000)).unwrap();
+        let mut selling = placement(sell, 100, 1_000_000);
+        selling.side = Side::Sell;
+        reg.insert(selling).unwrap();
 
         let mut applied: HashMap<FillKey, u32> = HashMap::new();
         let mut expected = SignedLots(0);
@@ -488,6 +492,7 @@ proptest! {
             let replay = seen[i] || !spec.live;
             seen[i] = true;
             replayed += u64::from(replay);
+            let cid = if spec.side == Side::Buy { buy } else { sell };
             let f = fill(Some(cid), common::ident(&format!("f{i}")), spec.side, spec.qty, replay);
             let time = time_of(spec, skew);
             let key = f.key();
