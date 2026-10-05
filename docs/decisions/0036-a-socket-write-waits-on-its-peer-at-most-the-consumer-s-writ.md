@@ -1,4 +1,4 @@
-# 0035 — A socket write waits on its peer at most the consumer's write-stall window, and timers due meanwhile fire
+# 0036 — A socket write waits on its peer at most the consumer's write-stall window, and timers due meanwhile fire
 
 Status: accepted
 Date: 2026-10-04

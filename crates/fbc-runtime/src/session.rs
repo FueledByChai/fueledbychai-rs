@@ -32,7 +32,7 @@
 //! the decode and the handler's call run in one call stack on the caller's current-thread
 //! runtime.
 //!
-//! **A stalled write (FBC-ha3, decision 0035).** A write waits on its peer for at most the
+//! **A stalled write (FBC-ha3, decision 0036).** A write waits on its peer for at most the
 //! consumer's [`WriteStall`] window from when it began: one not completed by then is abandoned,
 //! counted ([`MdCounters::write_stalls`]), and the epoch ends as a drop, reconnecting through
 //! the pacing. While it waits, the session's timers that fall due fire as they do (an ended
@@ -301,7 +301,7 @@ pub struct MdSessionConfig {
     pub limiter: RateLimiter,
     /// The silence window and the rotation margin (0033).
     pub liveness: Liveness,
-    /// The longest one write may wait on a peer that stopped reading (0035).
+    /// The longest one write may wait on a peer that stopped reading (0036).
     pub write_stall: WriteStall,
 }
 
