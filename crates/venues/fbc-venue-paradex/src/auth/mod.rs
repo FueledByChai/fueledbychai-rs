@@ -60,7 +60,8 @@ pub const REST_URL: &str = "paradex.rest.url";
 /// The configuration key of the Starknet chain id the login is signed for: `0x` and hex
 /// digits, decimal digits, or the chain's name (`PRIVATE_SN_PARACLEAR_MAINNET`).
 pub const CHAIN_ID: &str = "paradex.chain.id";
-/// The configuration key of the login signature's lifetime, in whole seconds (`3600s`).
+/// The configuration key of the login signature's lifetime, in whole seconds (`3600s`), at
+/// most Paradex's one week (`604800s`).
 pub const SIGNATURE_LIFETIME: &str = "paradex.auth.signature.lifetime";
 /// The configuration key of the interval between logins (`60s`), the token's refresh.
 pub const REFRESH: &str = "paradex.jwt.refresh";
@@ -127,6 +128,10 @@ pub const SIGNING_KEY_FIELD: FieldSpec = FieldSpec {
 pub const LOGIN_TAG: HttpTag = HttpTag(1);
 /// The tag of the account read in [`connection_plan`].
 pub const ACCOUNT_TAG: HttpTag = HttpTag(2);
+
+/// The longest signature lifetime Paradex takes: "Max 1 week" (docs.paradex.trade "Get JWT",
+/// `PARADEX-SIGNATURE-EXPIRATION`).
+const MAX_SIGNATURE_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// The path a login is signed under; the REST base must end in its `/v1`.
 const SIGNED_PREFIX: &str = "/v1";
@@ -237,6 +242,10 @@ impl Login {
         if lifetime.subsec_nanos() != 0 {
             return Err(invalid(SIGNATURE_LIFETIME, "not whole seconds").into());
         }
+        if lifetime > MAX_SIGNATURE_LIFETIME {
+            let reason = "longer than Paradex's one-week maximum (604800s)";
+            return Err(invalid(SIGNATURE_LIFETIME, reason).into());
+        }
         let (refresh, timeout) = (interval(REFRESH)?, interval(TIMEOUT)?);
 
         let mut take = |key| creds.take(key).ok_or(ConfigError::Missing(key));
@@ -270,8 +279,7 @@ impl Login {
     }
 
     /// The login as request `tag`: `POST /auth` signed at `ctx.wall` in whole seconds, its
-    /// signature expiring the configured lifetime later. Refused for a time before 1970 or an
-    /// expiry past `u64` seconds.
+    /// signature expiring the configured lifetime later. Refused for a time before 1970.
     pub fn request(&self, ctx: &EncodeCtx, tag: HttpTag) -> Result<Effect, SignError> {
         let timestamp = seconds(ctx.wall)?;
         let expiration = timestamp

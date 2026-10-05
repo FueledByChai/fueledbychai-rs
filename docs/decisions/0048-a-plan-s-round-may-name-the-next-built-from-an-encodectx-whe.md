@@ -42,7 +42,8 @@ This augments 0035 and 0043 (it supersedes nothing there):
      Stark key (`paradex.private.key`, the Java library's names) out of `Secrets` into a
      `ParadexSigner`, and reads the chain id (`paradex.chain.id`: hex, decimal or the chain's
      name), the REST base (`paradex.rest.url`, ending in `/v1`, since the login is signed as
-     `/v1/auth`), the signature lifetime (`paradex.auth.signature.lifetime`, whole seconds),
+     `/v1/auth`), the signature lifetime (`paradex.auth.signature.lifetime`, whole seconds, at
+     most the one week Paradex takes, Codex r4184897007),
      the refresh interval (`paradex.jwt.refresh`) and the request timeout
      (`paradex.rest.timeout`), all Account scope and all required: no number is defaulted in
      code. A missing or invalid key is refused by its name, never its value.
@@ -58,9 +59,12 @@ This augments 0035 and 0043 (it supersedes nothing there):
      frame with `params.bearer` inside its one redaction span, and `header()`, the
      `Authorization: Bearer` header marked redacted.
    - `token_spans(resp)` names the token for `redact_inbound`: every copy of the `jwt_token`
-     string in the body, overlapping copies as one span; nothing for a body that is empty or
-     JSON without `jwt_token` (a refusal); the whole body when it is not JSON or its token's
-     bytes cannot be found as written (not a string, or escaped).
+     string in the body, overlapping copies as one span, when the body mentions `jwt_token`
+     once and holds no escape; nothing for a body that is empty, or JSON that neither mentions
+     `jwt_token` nor escapes anything (a refusal); otherwise the whole body: not JSON, a token
+     that is not a non-empty string, a repeated or nested key (a parsed object keeps only the
+     last of repeated keys, Codex r4184896990), or an escape that could spell the key or
+     token another way.
    - `LoginCycle` makes logins as effects for an order-entry codec: one on `start`, one on
      each firing of its refresh timer, which `on_answer` sets for the configured interval
      after every login answer, failed ones included, whatever the answer holds. It keeps the

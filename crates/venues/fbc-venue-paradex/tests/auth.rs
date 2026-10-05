@@ -265,6 +265,30 @@ fn an_answer_whose_token_cannot_be_located_is_redacted_whole_and_one_without_a_t
     // Bytes that are not JSON, a token that is not a string, and a token written with
     // escapes (so its bytes are not the token's) are redacted whole, since where a token
     // stands in them cannot be told.
+    // Codex r4184896990: a parsed answer keeps only the last of repeated keys, so an answer
+    // that names jwt_token more than once (repeated, nested, or in a value), or holds any
+    // escape that could spell the key another way, is redacted whole: an earlier token is not
+    // left verbatim. A refusal that mentions no token and escapes nothing is left as it is.
+    let repeated = br#"{"jwt_token":"SYNTHETIC-A","jwt_token":"SYNTHETIC-B"}"#;
+    let nested = br#"{"data":{"jwt_token":"SYNTHETIC-A"},"jwt_token":"SYNTHETIC-B"}"#;
+    let nested_only = br#"{"data":{"jwt_token":"SYNTHETIC-A"}}"#;
+    let mentioned = br#"{"error":"no jwt_token"}"#;
+    let escaped_refusal = br#"{"error":"a "quoted" reason"}"#;
+    for body in [
+        &repeated[..],
+        nested,
+        nested_only,
+        mentioned,
+        escaped_refusal,
+    ] {
+        let whole = 0..u32::try_from(body.len()).unwrap();
+        let spans = spans_of(200, body);
+        assert_eq!(
+            spans,
+            InboundSpans::response(vec![], vec![whole]),
+            "{body:?}"
+        );
+    }
     let escaped = br#"{"jwt_token":"\u0053YNTHETIC"}"#;
     for body in [
         &b"not json"[..],
@@ -420,7 +444,7 @@ fn login_errors_say_what_failed_and_never_what_the_venue_sent() {
     for (err, text) in cases {
         assert_eq!(err.to_string(), text);
     }
-    // A login signed before 1970, or whose expiry would pass u64, is not signed.
+    // A login signed before 1970 is not signed.
     let mut fx = Effects::new();
     let mut cycle = LoginCycle::new(login(), LOGIN, REFRESH_TIMER);
     let before = EncodeCtx {
@@ -431,12 +455,13 @@ fn login_errors_say_what_failed_and_never_what_the_venue_sent() {
     assert_eq!(cycle.start(&before, &mut fx), refused);
     assert_eq!(cycle.on_timer(&before, &mut fx), refused);
     assert!(fx.is_empty());
-    let mut forever = cfg();
-    forever.insert(SIGNATURE_LIFETIME, &format!("{}s", u64::MAX));
-    let late = Login::new(&forever, creds())
-        .unwrap()
-        .request(&ctx_at(1), LOGIN);
-    assert_eq!(late, Err(SignError::Unsignable("signature expiration")));
+    // The latest wall time there is still signs: a lifetime of at most a week cannot carry
+    // the expiry past u64 seconds.
+    let last = EncodeCtx {
+        wall: WallNs(i64::MAX),
+        ..ctx_at(0)
+    };
+    assert!(login().request(&last, LOGIN).is_ok());
 }
 
 #[test]
@@ -519,6 +544,14 @@ fn the_configuration_is_read_and_refused_by_key_never_by_value() {
         }
     }
     assert_eq!(invalid(SIGNATURE_LIFETIME, "1500ms"), "not whole seconds");
+    // Codex r4184897007: Paradex takes a signature valid for at most one week ("Get JWT").
+    assert_eq!(
+        invalid(SIGNATURE_LIFETIME, "604801s"),
+        "longer than Paradex's one-week maximum (604800s)"
+    );
+    let mut week = cfg();
+    week.insert(SIGNATURE_LIFETIME, "604800s");
+    assert!(Login::new(&week, creds()).is_ok());
     // A missing setting is refused by its key.
     for key in [REST_URL, CHAIN_ID, SIGNATURE_LIFETIME, REFRESH, TIMEOUT] {
         let mut cfg = VenueConfig::new();
