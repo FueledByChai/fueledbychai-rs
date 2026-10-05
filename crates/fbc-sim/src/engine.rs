@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use fbc_book::{BookError, Books, L2Book};
 use fbc_core::{
     AccountKey, Aggressor, AmendCaps, AmendQty, AssetSym, BookId, BookSide, CancelReason, Channel,
-    Envelope, FeeBook, FeeKey, InstrumentId, Liquidity, Lots, MdEvent, MonoNs, NotAmendable, Side,
-    SpecTable, TerminalHint, Ticks, TifTag, VenueFeeSign, VenueOrderId, WallNs,
+    Envelope, FeeBook, FeeKey, FillSource, InstrumentId, Liquidity, Lots, MdEvent, MonoNs,
+    NotAmendable, Side, SpecTable, TerminalHint, Ticks, TifTag, VenueFeeSign, VenueOrderId, WallNs,
 };
 
 use crate::config::{SimConfig, SimLatency};
@@ -19,7 +19,7 @@ use crate::queue::{
 };
 use crate::wire::{
     Amend, Command, FillRecord, ItemResult, OrderEvent, Place, Query, Refusal, Reply, SimState,
-    Target, WireError,
+    Stamp, Target, WireError,
 };
 
 /// One frame the engine answers with, due at the codec at `at`: the instant the venue acted
@@ -212,6 +212,12 @@ impl Item {
 ///   the request's wall time, every order SimVenue placed that rests (injected ones are another
 ///   process's) with its cumulative fill, and one position per instrument SimVenue has a fill
 ///   in, the signed sum of those fills.
+/// - Every answer carries the engine's sequence number and the wall time of the instant the
+///   venue acted, which the codec reports as the stood-in venue orders its events (decision
+///   0050). A fill carries the price P&L it realized on SimVenue's position in its instrument,
+///   kept as the signed lots and the notional they were opened at, and zero funding, since the
+///   engine accrues none. A venue whose fills are derived from order status is sent no fill:
+///   its order updates carry each fill's cumulative quantity.
 /// - A public trade on a trading book fills resting orders, SimVenue's own and injected ones,
 ///   through the queue model, as the maker. A trade the venue gives no aggressor for is
 ///   classified against the touch (at or above the offer a buy, at or below the bid a sell),
@@ -255,9 +261,12 @@ pub struct SimEngine {
     /// Public size a level lost to trades printed at it, and to injected orders withdrawn from
     /// it, since it last changed, by (instrument, bid side, price).
     traded: BTreeMap<(InstrumentId, bool, Ticks), Lots>,
-    /// The signed sum of SimVenue's own fills in each instrument it has a fill in, in lots: an
-    /// `i128`, which no sum of `i64` fills reaches the end of.
-    positions: BTreeMap<InstrumentId, i128>,
+    /// SimVenue's position in each instrument it has a fill in, from its own fills: its lots
+    /// an `i128`, which no sum of `i64` fills reaches the end of, and its cost.
+    positions: BTreeMap<InstrumentId, Position>,
+    /// Whether the stood-in venue sends fills of their own; otherwise its order updates carry
+    /// them (decision 0050).
+    native_fills: bool,
     out: Vec<Answer>,
     frames: u64,
     orders: u64,
@@ -287,6 +296,7 @@ impl SimEngine {
             in_flight: BTreeMap::new(),
             traded: BTreeMap::new(),
             positions: BTreeMap::new(),
+            native_fills: config.exec.fills.source == FillSource::Native,
             out: Vec::new(),
             frames: 0,
             orders: 0,
@@ -474,7 +484,11 @@ impl SimEngine {
     }
 
     fn answer(&mut self, at: At, reply: Reply) {
-        let frame = reply.encode(self.seq);
+        let stamp = Stamp {
+            seq: self.seq,
+            ts: Some(at.wall),
+        };
+        let frame = reply.encode(stamp);
         self.seq += 1;
         let at = at.mono + self.latency.to_client;
         self.out.push(Answer { at, frame });
@@ -528,8 +542,8 @@ impl SimEngine {
         shown.checked_sub(credit).unwrap_or(Lots::ZERO)
     }
 
-    /// The fee of a fill in the venue's fee sign, and its asset; `None` without a current
-    /// rate, or when the notional or fee does not fit.
+    /// The fee of a fill in the venue's fee sign, its asset and the fill's notional; `None`
+    /// without a current rate, or when the notional or fee does not fit.
     fn fee(
         &self,
         inst: InstrumentId,
@@ -537,7 +551,7 @@ impl SimEngine {
         px: Ticks,
         qty: Lots,
         wall: WallNs,
-    ) -> Option<(i128, AssetSym)> {
+    ) -> Option<Charge> {
         let key = FeeKey {
             account: self.account,
             instrument: inst,
@@ -559,7 +573,11 @@ impl SimEngine {
             VenueFeeSign::PositiveIsCost => Some(cost),
             VenueFeeSign::PositiveIsRebate => cost.checked_neg(),
         };
-        Some((raw?, notional.asset))
+        Some(Charge {
+            fee: raw?,
+            asset: notional.asset,
+            notional: notional.nanos,
+        })
     }
 
     /// The modelled size at `side` and `px` of `inst` that the real book does not show:
@@ -755,10 +773,17 @@ impl SimEngine {
     ) -> Vec<Reply> {
         let vid = vid(n);
         let mut events = Vec::new();
-        for (fill_px, qty, fee) in taken.takes {
+        let last = taken.takes.len();
+        for (i, (fill_px, qty, charge)) in taken.takes.into_iter().enumerate() {
             order.cum = order.cum.checked_add(qty).unwrap_or(order.cum);
-            let fill = self.fill_record(&order, &vid, fill_px, qty, Liquidity::Taker, fee);
-            events.push(Reply::Fill(fill));
+            let fill = self.fill_record(&order, &vid, fill_px, qty, Liquidity::Taker, charge);
+            if self.native_fills {
+                events.push(Reply::Fill(fill));
+            } else if i + 1 < last {
+                // A derived-fills venue's update carries each fill but the last, which the
+                // order's closing event below carries.
+                events.push(Reply::Order(order_event(&order, &vid, SimState::Open, px)));
+            }
         }
         let state = if taken.rests {
             SimState::Open
@@ -783,7 +808,7 @@ impl SimEngine {
         px: Ticks,
         qty: Lots,
         liquidity: Liquidity,
-        fee: (i128, AssetSym),
+        charge: Charge,
     ) -> FillRecord {
         let fid = format!("F{}", self.fills);
         self.fills += 1;
@@ -791,9 +816,9 @@ impl SimEngine {
             Side::Buy => i128::from(qty.get()),
             Side::Sell => -i128::from(qty.get()),
         };
-        // Saturating only past 2^63 fills of an i64 of lots each, which never happens.
-        let position = self.positions.entry(order.inst).or_insert(0);
-        *position = position.saturating_add(signed);
+        // Its lots saturate only past 2^63 fills of an i64 of lots each, which never happens.
+        let position = self.positions.entry(order.inst).or_insert(Position::FLAT);
+        let pnl = position.fill(signed, charge.notional);
         FillRecord {
             fid,
             cid: order.cid.clone(),
@@ -804,8 +829,12 @@ impl SimEngine {
             qty,
             cum: order.cum,
             liquidity,
-            fee: fee.0,
-            asset: fee.1,
+            fee: charge.fee,
+            pnl,
+            // The engine accrues no funding on a position, so a fill realizes none (decision
+            // 0050; FBC-uki4).
+            funding: Some(0),
+            asset: charge.asset,
         }
     }
 
@@ -989,7 +1018,7 @@ impl SimEngine {
         let reply = Reply::Resync {
             wm: asked,
             orders: orders.collect(),
-            positions: self.positions.iter().map(|(&i, &q)| (i, q)).collect(),
+            positions: self.positions.iter().map(|(&i, p)| (i, p.lots)).collect(),
         };
         self.answer(at, reply);
     }
@@ -1230,12 +1259,15 @@ impl SimEngine {
         self.injected_fills.push(fill);
     }
 
-    fn maker_fill(&mut self, fill: SimFill, mut order: Resting, fee: (i128, AssetSym), at: At) {
+    fn maker_fill(&mut self, fill: SimFill, mut order: Resting, charge: Charge, at: At) {
         let n = fill.key.0;
         let vid = vid(n);
         order.cum = order.cum.checked_add(fill.qty).unwrap_or(order.cum);
-        let record = self.fill_record(&order, &vid, fill.px, fill.qty, Liquidity::Maker, fee);
-        self.answer(at, Reply::Fill(record));
+        let record = self.fill_record(&order, &vid, fill.px, fill.qty, Liquidity::Maker, charge);
+        // A derived-fills venue's order update below carries the fill.
+        if self.native_fills {
+            self.answer(at, Reply::Fill(record));
+        }
         let px = Some(order.px);
         let state = if fill.remaining == Lots::ZERO {
             SimState::Filled
@@ -1251,11 +1283,77 @@ impl SimEngine {
     }
 }
 
-/// What an order takes before it changes anything: its fills, `(px, qty, (fee, asset))`, and
+/// What an order takes before it changes anything: its fills, `(px, qty, charge)`, and
 /// whether its rest was queued.
 struct Taken {
-    takes: Vec<(Ticks, Lots, (i128, AssetSym))>,
+    takes: Vec<(Ticks, Lots, Charge)>,
     rests: bool,
+}
+
+/// What a fill costs: its fee in the venue's fee sign, the asset of that fee, and the fill's
+/// notional in nanos of that asset.
+#[derive(Copy, Clone, Debug)]
+struct Charge {
+    fee: i128,
+    asset: AssetSym,
+    notional: i128,
+}
+
+/// The account's position in one instrument, from SimVenue's own fills (decisions 0049,
+/// 0050): its signed lots, buys positive, and the notional its open lots were opened at, in
+/// nanos of the quote asset; `None` once that sum stops fitting an `i128`, until the position
+/// is flat or flips.
+#[derive(Copy, Clone, Debug)]
+struct Position {
+    lots: i128,
+    cost: Option<i128>,
+}
+
+impl Position {
+    const FLAT: Position = Position {
+        lots: 0,
+        cost: Some(0),
+    };
+
+    /// Books a fill of `signed` lots (buys positive) whose notional is `notional`: the price
+    /// P&L it realized, positive for a gain. A fill that adds to the position, or opens one,
+    /// realizes nothing. One that reduces it realizes, on the lots it closes, their share of
+    /// the fill's notional against their share of the position's cost, each share truncated
+    /// and taken off what it was taken from, so a position closed whole leaves no cost behind;
+    /// the lots past the position's open a new one at their share of the fill. `None` when the
+    /// position's cost cannot be counted.
+    fn fill(&mut self, signed: i128, notional: i128) -> Option<i128> {
+        let before = self.lots;
+        self.lots = before.saturating_add(signed);
+        // A fill of no lots, which the engine never books, would only add nothing.
+        if before == 0 || signed == 0 || (before > 0) == (signed > 0) {
+            self.cost = self.cost.and_then(|cost| cost.checked_add(notional));
+            return Some(0);
+        }
+        let (held, qty) = (before.saturating_abs(), signed.saturating_abs());
+        let closed = held.min(qty);
+        let closing = share(notional, closed, qty);
+        let basis = self.cost.and_then(|cost| share(cost, closed, held));
+        self.cost = self.cost.zip(basis).map(|(cost, basis)| cost - basis);
+        if closed == held {
+            // Flat, or flipped: what is open was opened by this fill alone.
+            self.cost = closing.map(|closing| notional - closing);
+        }
+        let (closing, basis) = (closing?, basis?);
+        if before > 0 {
+            closing.checked_sub(basis)
+        } else {
+            basis.checked_sub(closing)
+        }
+    }
+}
+
+/// `x`'s share `part` of `whole` (`0 < part <= whole`), truncated toward zero, without forming
+/// `x * part`; `None` only when `whole` passes 2^63, where its remainder times `part` may not
+/// fit.
+fn share(x: i128, part: i128, whole: i128) -> Option<i128> {
+    let (each, rest) = (x / whole, x % whole);
+    Some(each * part + rest.checked_mul(part)? / whole)
 }
 
 /// The most lots a `Lots` holds.

@@ -6,11 +6,11 @@ use core::time::Duration;
 use std::sync::Arc;
 
 use fbc_core::{
-    AckLevel, AckModel, AmendOrder, CancelOnDisconnect, CancelOrder, CancelScope, Channel,
-    ChosenRef, CidMatch, CtxCall, DecodeError, DecodeScope, Effect, Effects, EncodeCtx,
-    EncodeReceipt, ExchTsKind, ExecCaps, ExecCodec, ExecEvent, ExecSink, Feature, FillCaps,
-    FillEvent, FillIdent, FillSource, HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans,
-    InstrumentId, ItemRef, Liquidity, Liquidity3, MatchingCaps, NotSentReason, OpKind, OrderCaps,
+    AckLevel, AckModel, AmendOrder, AssetSym, CancelOnDisconnect, CancelOrder, CancelScope,
+    Channel, ChosenRef, CidMatch, CtxCall, DecodeError, DecodeScope, Effect, Effects, EncodeCtx,
+    EncodeReceipt, ExchNs, ExchTsKind, ExecCaps, ExecCodec, ExecEvent, ExecSink, Feature, FillCaps,
+    FillEvent, FillIdent, HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans, InstrumentId,
+    ItemRef, Liquidity, Liquidity3, MatchingCaps, Money, NotSentReason, OpKind, OrderCaps,
     OrderKindTag, OrderRef, OrderUpdate, OrderingKey, PathStamps, QueryAnswer, RateCharge,
     RawFrame, Reject, RpcCall, RpcId, SignedLots, SpecTable, StreamId, SubmitOutcome, Support,
     TifTag, TimerTag, TrafficClass, VenueCommand, VenueMeta, VenueOrderSnapshot, VenueOrderState,
@@ -20,7 +20,7 @@ use fbc_core::{
 use crate::config::SimConfig;
 use crate::wire::{
     Amend, Cancel, Command, Head, ItemResult, OrderEvent, Place, Query, Refusal, Reply, Sent,
-    SimState, Target, WireError,
+    SimState, Stamp, Target, WireError,
 };
 
 /// The codec half of SimVenue. It writes each placement, batch of placements, amend, cancel,
@@ -39,10 +39,15 @@ use crate::wire::{
 /// (owner decision A). It refuses RPI orders, which the engine cannot fill yet (FBC-njk,
 /// decision 0046), amends for a venue that gives the amended order a new venue id (FBC-kodq),
 /// and placements and amends for a venue whose events the engine cannot say yet: two-phase
-/// acknowledgement (FBC-zr1), an ordering key other than a venue sequence, realized values on
-/// fills, or fills derived from order status (FBC-938), a venue with a speed bump (FBC-7y8),
-/// one whose fills replay on reconnect (FBC-3q6), or one that cancels orders on a disconnect,
-/// which the simulated stream never has (FBC-fji). Cancels and queries still go.
+/// acknowledgement (FBC-zr1), a venue with a speed bump (FBC-7y8), one whose fills replay on
+/// reconnect (FBC-3q6), or one that cancels orders on a disconnect, which the simulated stream
+/// never has (FBC-fji). Cancels and queries still go.
+///
+/// Each event is ordered as the stood-in venue's [`OrderingKey`] says (decision 0050): by the
+/// engine's sequence number, by the instant the venue acted as its timestamp or block time, or
+/// by nothing. A fill carries the realized P&L and funding the engine reports only where the
+/// venue's [`FillCaps`] say its fills do; a venue whose fills are derived from order status
+/// gets none from the engine, only order updates carrying them.
 ///
 /// A resync (decision 0049) is one frame asking the engine for its resting orders and
 /// positions, one at a time, whose one-frame answer it decodes into the `Resync*` events.
@@ -52,6 +57,7 @@ pub struct SimCodec {
     modelled: bool,
     caps: OrderCaps,
     fills: FillCaps,
+    ordering: OrderingKey,
     stream: StreamId,
     rpc_timeout: Duration,
     /// The wall time of the resync asked for and not answered yet.
@@ -65,6 +71,7 @@ impl SimCodec {
             modelled: modelled(&config.exec, &config.matching),
             caps: config.exec.order.clone(),
             fills: config.exec.fills,
+            ordering: config.exec.order.ordering_key,
             stream: config.stream,
             rpc_timeout: config.rpc_timeout,
             resync_at: None,
@@ -324,6 +331,29 @@ impl SimCodec {
         })
     }
 
+    /// What an answer says of its order, as the stood-in venue orders its events (decision
+    /// 0050): the engine's sequence number for a sequenced venue; the instant the venue acted,
+    /// as the matching engine's timestamp, for one ordered by a venue timestamp or a block time,
+    /// which a frame must then carry; nothing for one ordered by nothing.
+    fn meta(&self, stamp: Stamp) -> Result<VenueMeta, DecodeError> {
+        Ok(match self.ordering {
+            OrderingKey::VenueSeq => VenueMeta {
+                exch_ts: None,
+                exch_ts_kind: ExchTsKind::Unknown,
+                venue_seq: Some(stamp.seq),
+            },
+            OrderingKey::VenueTs | OrderingKey::BlockTime => {
+                let ts = stamp.ts.ok_or(DecodeError::Malformed("ts"))?;
+                VenueMeta {
+                    exch_ts: Some(ExchNs(ts.0)),
+                    exch_ts_kind: ExchTsKind::MatchingEngine,
+                    venue_seq: None,
+                }
+            }
+            OrderingKey::None => VenueMeta::NONE,
+        })
+    }
+
     /// A resync's answer, decoded whole: only the one asked for, named by its watermark, the
     /// request's wall time; a position past an `i64` of lots is refused, never wrapped.
     fn resync_answer(
@@ -349,7 +379,7 @@ impl SimCodec {
             events.push(ExecEvent::ResyncPosition {
                 inst,
                 qty: SignedLots(qty),
-                // The engine keeps no entry price.
+                // The engine reports no entry price.
                 avg_entry: None,
             });
         }
@@ -406,21 +436,22 @@ fn shared(mut insts: impl Iterator<Item = InstrumentId>) -> Option<InstrumentId>
 
 /// Whether the engine answers as the venue `exec` and `matching` describe: it delays no
 /// command past its latency (Codex r4184245574; FBC-7y8), it acknowledges in one phase
-/// (Codex r4182678509; FBC-zr1), orders its answers by a venue sequence, keeps no position to
-/// report realized P&L or funding from, and sends fills of their own (Codex r4182991971,
-/// r4182991978; FBC-938), never replays a fill on reconnect (Codex r4184546713; FBC-3q6), and
-/// leaves orders resting across a disconnect, which the simulated stream has no notion of
-/// (Codex r4184778435; FBC-fji).
+/// (Codex r4182678509; FBC-zr1), never replays a fill on reconnect (Codex r4184546713;
+/// FBC-3q6), and leaves orders resting across a disconnect, which the simulated stream has no
+/// notion of (Codex r4184778435; FBC-fji). Every ordering key, realized values on fills and
+/// fills derived from order status it answers as the venue would (FBC-938, decision 0050).
 /// Placements for any other venue are refused rather than answered with events unlike its own.
 fn modelled(exec: &ExecCaps, matching: &MatchingCaps) -> bool {
     matching.speed_bump.is_none()
         && exec.order.ack == AckModel::SinglePhase
-        && exec.order.ordering_key == OrderingKey::VenueSeq
-        && !exec.fills.realized_pnl
-        && !exec.fills.realized_funding
-        && exec.fills.source == FillSource::Native
         && !exec.fills.replays_fills_on_reconnect
         && exec.order.cancel_on_disconnect == CancelOnDisconnect::None
+}
+
+/// An amount of `asset` a fill carries, where the stood-in venue's fills `report` it.
+fn money(report: bool, nanos: Option<i128>, asset: AssetSym) -> Option<Money> {
+    let nanos = nanos.filter(|_| report)?;
+    Some(Money::new(nanos, asset))
 }
 
 fn malformed(err: WireError) -> DecodeError {
@@ -487,7 +518,8 @@ impl ExecCodec for SimCodec {
         sink: &mut dyn ExecSink,
         _fx: &mut Effects,
     ) -> Result<(), DecodeError> {
-        let (seq, reply) = Reply::decode(f.bytes()).map_err(malformed)?;
+        let (stamp, reply) = Reply::decode(f.bytes()).map_err(malformed)?;
+        let meta = self.meta(stamp)?;
         let events = match reply {
             Reply::Accepted { rpc, cid, vid } => {
                 let result = ItemResult::Accepted { cid, vid };
@@ -562,8 +594,9 @@ impl ExecCodec for SimCodec {
                     (true, Liquidity::Taker) => Liquidity3::Taker,
                 },
                 fee: scope.fee(fill.fee, fill.asset)?,
-                realized_pnl: None,
-                realized_funding: None,
+                // Only where the stood-in venue's fills carry them (decision 0050).
+                realized_pnl: money(self.fills.realized_pnl, fill.pnl, fill.asset),
+                realized_funding: money(self.fills.realized_funding, fill.funding, fill.asset),
                 replay: false,
             })],
             Reply::Resync {
@@ -571,11 +604,6 @@ impl ExecCodec for SimCodec {
                 orders,
                 positions,
             } => self.resync_answer(wm, orders, positions, scope)?,
-        };
-        let meta = VenueMeta {
-            exch_ts: None,
-            exch_ts_kind: ExchTsKind::Unknown,
-            venue_seq: Some(seq),
         };
         for event in events {
             sink.push(meta, event);

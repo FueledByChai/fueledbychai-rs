@@ -64,6 +64,11 @@ impl<'a> Record<'a> {
         self.str(key)?.parse().map_err(|_| WireError(key))
     }
 
+    /// A number the record may leave out.
+    fn maybe<T: FromStr>(&self, key: &'static str) -> Result<Option<T>, WireError> {
+        self.opt(key).map(|_| self.num(key)).transpose()
+    }
+
     fn lots(&self, key: &'static str) -> Result<Lots, WireError> {
         Lots::new(self.num(key)?).ok_or(WireError(key))
     }
@@ -364,7 +369,7 @@ impl Record<'_> {
     }
 
     fn px(&self) -> Result<Option<Ticks>, WireError> {
-        self.opt("px").map(|_| self.ticks("px")).transpose()
+        Ok(self.maybe("px")?.map(Ticks))
     }
 
     /// A placement under `head`.
@@ -587,7 +592,17 @@ pub(crate) enum ItemResult {
     Rejected(Refusal),
 }
 
-/// An answer frame, engine to codec. Every one carries the engine's sequence number.
+/// What every answer frame says of its order (decision 0050): the engine's sequence number,
+/// and the wall time of the instant the venue acted, which the codec reports as the venue's
+/// timestamp or block time where the stood-in venue orders its events by one. `ts` is `None`
+/// only in a frame the engine did not write.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub(crate) struct Stamp {
+    pub seq: u64,
+    pub ts: Option<WallNs>,
+}
+
+/// An answer frame, engine to codec. Every one carries the engine's [`Stamp`].
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub(crate) enum Reply {
     /// A command accepted, naming the order it placed or cancelled.
@@ -644,7 +659,10 @@ pub(crate) struct OrderEvent {
     pub reduce_only: bool,
 }
 
-/// A fill; `fee` is the raw amount in the simulated venue's declared fee sign.
+/// A fill; `fee` is the raw amount in the simulated venue's declared fee sign. `pnl` is the
+/// price P&L the fill realized on the account's position, positive for a gain, and `None` when
+/// the engine cannot count it; `funding` the funding it realized, positive when received
+/// (decision 0050). All three are in nanos of `asset`.
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub(crate) struct FillRecord {
     pub fid: String,
@@ -657,23 +675,32 @@ pub(crate) struct FillRecord {
     pub cum: Lots,
     pub liquidity: Liquidity,
     pub fee: i128,
+    pub pnl: Option<i128>,
+    pub funding: Option<i128>,
     pub asset: AssetSym,
 }
 
+impl Writer {
+    /// An answer's first record, of kind `kind`, under `stamp`.
+    fn stamped(kind: &str, stamp: Stamp) -> Writer {
+        let w = Writer::new(kind).field("seq", stamp.seq);
+        w.opt("ts", stamp.ts.map(|ts| ts.0))
+    }
+}
+
 impl Reply {
-    pub(crate) fn encode(&self, seq: u64) -> Vec<u8> {
+    pub(crate) fn encode(&self, stamp: Stamp) -> Vec<u8> {
+        let head = |kind| Writer::stamped(kind, stamp);
         match self {
-            Reply::Accepted { rpc, cid, vid } => Writer::new("ack")
-                .field("seq", seq)
+            Reply::Accepted { rpc, cid, vid } => head("ack")
                 .field("rpc", rpc)
                 .field("cid", cid)
                 .field("vid", vid),
-            Reply::Rejected { rpc, refusal } => Writer::new("reject")
-                .field("seq", seq)
+            Reply::Rejected { rpc, refusal } => head("reject")
                 .field("rpc", rpc)
                 .name("code", REFUSALS, *refusal),
             Reply::Items { rpc, items } => {
-                let w = Writer::new("items").field("seq", seq).field("rpc", rpc);
+                let w = head("items").field("rpc", rpc);
                 items.iter().fold(w, |w, item| match item {
                     ItemResult::Accepted { cid, vid } => {
                         w.line("ack").field("cid", cid).field("vid", vid)
@@ -683,15 +710,14 @@ impl Reply {
                     }
                 })
             }
-            Reply::Done { rpc } => Writer::new("done").field("seq", seq).field("rpc", rpc),
+            Reply::Done { rpc } => head("done").field("rpc", rpc),
             Reply::Query {
                 rpc,
                 vid,
                 cid,
                 found,
             } => {
-                let w = Writer::new("query")
-                    .field("seq", seq)
+                let w = head("query")
                     .field("rpc", rpc)
                     .opt("qvid", vid.as_ref())
                     .opt("qcid", cid.as_ref());
@@ -700,9 +726,8 @@ impl Reply {
                     None => w,
                 }
             }
-            Reply::Order(o) => Writer::new("order").field("seq", seq).event(o),
-            Reply::Fill(f) => Writer::new("fill")
-                .field("seq", seq)
+            Reply::Order(o) => head("order").event(o),
+            Reply::Fill(f) => head("fill")
                 .field("fid", &f.fid)
                 .field("cid", &f.cid)
                 .field("vid", &f.vid)
@@ -713,13 +738,15 @@ impl Reply {
                 .field("cum", f.cum.get())
                 .name("liq", LIQUIDITY, f.liquidity)
                 .field("fee", f.fee)
+                .opt("pnl", f.pnl)
+                .opt("fund", f.funding)
                 .field("asset", f.asset.as_str()),
             Reply::Resync {
                 wm,
                 orders,
                 positions,
             } => {
-                let w = Writer::new("resync").field("seq", seq).field("wm", wm.0);
+                let w = head("resync").field("wm", wm.0);
                 let w = orders.iter().fold(w, |w, o| w.line("order").event(o));
                 positions.iter().fold(w, |w, (inst, qty)| {
                     w.line("pos").field("inst", inst.get()).field("qty", qty)
@@ -729,10 +756,13 @@ impl Reply {
         .finish()
     }
 
-    /// The reply and its sequence number.
-    pub(crate) fn decode(bytes: &[u8]) -> Result<(u64, Reply), WireError> {
+    /// The reply and its stamp.
+    pub(crate) fn decode(bytes: &[u8]) -> Result<(Stamp, Reply), WireError> {
         let (r, lines) = record(bytes)?;
-        let seq = r.num("seq")?;
+        let stamp = Stamp {
+            seq: r.num("seq")?,
+            ts: r.maybe("ts")?.map(WallNs),
+        };
         let single = |reply: Reply| {
             if lines.is_empty() {
                 Ok(reply)
@@ -790,6 +820,8 @@ impl Reply {
                 cum: r.lots("cum")?,
                 liquidity: r.named("liq", LIQUIDITY)?,
                 fee: r.num("fee")?,
+                pnl: r.maybe("pnl")?,
+                funding: r.maybe("fund")?,
                 asset: AssetSym::new(r.str("asset")?).ok_or(WireError("asset"))?,
             })),
             "resync" => {
@@ -809,6 +841,6 @@ impl Reply {
             }
             _ => Err(WireError("kind")),
         }?;
-        Ok((seq, reply))
+        Ok((stamp, reply))
     }
 }
