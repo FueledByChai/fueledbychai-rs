@@ -94,8 +94,8 @@ struct At {
 /// - Every fill's fee is the fee book's rate for the account, instrument, public channel and
 ///   liquidity at the fill's wall time, times its notional, rounded to the nano, written in the
 ///   stood-in venue's fee sign so the codec's [`DecodeScope`](fbc_core::DecodeScope) reads it
-///   back as a cost (0004); a fee that is not a finite number of nanos fitting an `i128` is no
-///   fee. A place that would take a fill without one is refused
+///   back as a cost (0004); a fee that is not a finite number of nanos strictly inside `i128`'s
+///   range is no fee. A place that would take a fill without one is refused
 ///   (`no_fee`); a resting order a trade would fill without a rate is cancelled by the venue
 ///   instead.
 #[derive(Clone, Debug)]
@@ -251,8 +251,9 @@ impl SimEngine {
         // A model's f64 (0004): the rate is in basis points of the notional.
         let cost = (notional.nanos as f64 * rate / 10_000.0).round();
         // Never a saturated or NaN-as-zero fee (Codex r4182154747): it must be a finite number
-        // of nanos that fits an i128 (2^127 is the first value past it).
-        let fits = cost.is_finite() && cost >= i128::MIN as f64 && cost < i128::MAX as f64;
+        // of nanos strictly inside i128's range, since the decode scope refuses i128::MIN
+        // (Codex r4182342652) and 2^127 is the first value past i128::MAX.
+        let fits = cost.is_finite() && cost > i128::MIN as f64 && cost < i128::MAX as f64;
         let cost = fits.then_some(cost as i128)?;
         let raw = match self.fee_sign {
             VenueFeeSign::PositiveIsCost => Some(cost),

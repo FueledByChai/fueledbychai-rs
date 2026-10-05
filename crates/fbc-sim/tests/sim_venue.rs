@@ -1660,3 +1660,30 @@ fn an_asset_symbol_with_the_frames_delimiters_survives_the_wire() {
         Err(DecodeError::Malformed("escape"))
     );
 }
+
+#[test]
+fn a_fee_of_exactly_i128_min_nanos_is_no_fee() {
+    // Codex r4182342652: the decode scope refuses i128::MIN nanos, so the engine must not
+    // write it. A fill of one lot at 4 ticks is 1 USDC (1e9 nanos) on this spec; this rate
+    // rounds its fee to exactly -2^127 nanos.
+    let rate_bps = -(2f64.powi(127)) / 1e5;
+    assert_eq!((1e9 * rate_bps / 10_000.0).round(), i128::MIN as f64);
+    let mut book = FeeBook::new();
+    let (key, entry) = rate(INST, Liquidity::Taker, rate_bps, FeeSource::ConfigOverride);
+    book.insert(key, entry);
+    let mut v = Venue::with(config(
+        Bracket::Optimistic,
+        VenueFeeSign::PositiveIsCost,
+        book,
+    ));
+    v.snapshot(T0, &[(3, 1)], &[(4, 1)]);
+    v.send(
+        place(cid(), Side::Buy, OrderKind::Market, 1, TifTag::Ioc, false),
+        1,
+        T0,
+    );
+    v.tick(T0 + 5 * MS);
+    let got = v.answers();
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(rejected(&got[0].1), Some(RejectKind::Other));
+}
