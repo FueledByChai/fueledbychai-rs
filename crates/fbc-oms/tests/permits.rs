@@ -636,7 +636,7 @@ fn an_amend_is_built_from_the_record_and_carries_the_filled_quantity() {
     fill_of(&mut reg, &mut ledger, c, "a", 3);
     let live = reg.live(c).unwrap();
     assert_eq!(live.order().state(), OrdState::PartiallyFilled);
-    let cmd = live.amend(&caps, Ticks(101), lots(12)).unwrap();
+    let cmd = live.amend(&caps, Ticks(101), lots(12), false).unwrap();
     let placed = placement(c, 100, 10);
     assert_eq!(
         cmd.command(),
@@ -666,12 +666,14 @@ fn an_amend_is_refused_for_a_partly_filled_order_where_the_caps_forbid_it() {
     assert!(
         reg.live(c)
             .unwrap()
-            .amend(&caps, Ticks(101), lots(10))
+            .amend(&caps, Ticks(101), lots(10), false)
             .is_ok()
     );
     fill_of(&mut reg, &mut ledger, c, "p", 1);
     assert_eq!(
-        reg.live(c).unwrap().amend(&caps, Ticks(101), lots(10)),
+        reg.live(c)
+            .unwrap()
+            .amend(&caps, Ticks(101), lots(10), false),
         Err(AmendRefusal::PartiallyFilled)
     );
 }
@@ -683,14 +685,18 @@ fn an_amend_is_refused_for_a_reference_amend_caps_do_not_declare() {
     let c = order_at(&mut reg, Ack::AckedNoVid, false);
     let by_venue = with_amend(amend_caps(&[RefKind::Venue], true));
     assert_eq!(
-        reg.live(c).unwrap().amend(&by_venue, Ticks(101), lots(10)),
+        reg.live(c)
+            .unwrap()
+            .amend(&by_venue, Ticks(101), lots(10), false),
         Err(AmendRefusal::NoDeclaredReference)
     );
     // An amend carries no placement nonce, so declaring nonces does not help.
     let by_nonce = with_amend(amend_caps(&[RefKind::PlacementNonce], true));
     reg.placement_nonce_used(c, 3).unwrap();
     assert_eq!(
-        reg.live(c).unwrap().amend(&by_nonce, Ticks(101), lots(10)),
+        reg.live(c)
+            .unwrap()
+            .amend(&by_nonce, Ticks(101), lots(10), false),
         Err(AmendRefusal::NoDeclaredReference)
     );
     // Declared by client id, it amends by client id.
@@ -698,7 +704,7 @@ fn an_amend_is_refused_for_a_reference_amend_caps_do_not_declare() {
     let cmd = reg
         .live(c)
         .unwrap()
-        .amend(&by_client, Ticks(101), lots(10))
+        .amend(&by_client, Ticks(101), lots(10), false)
         .unwrap();
     let VenueCommand::Amend(amend) = cmd.command() else {
         panic!("an amend")
@@ -715,7 +721,9 @@ fn an_amend_is_refused_where_the_venue_cannot_make_it() {
     let mut ledger = ledger();
     let c = order_at(&mut reg, Ack::AckedVid, false);
     let amend = |reg: &Registry, caps: &OrderCaps, px: i64, qty: i64| {
-        reg.live(c).unwrap().amend(caps, Ticks(px), lots(qty))
+        reg.live(c)
+            .unwrap()
+            .amend(caps, Ticks(px), lots(qty), false)
     };
     assert_eq!(
         amend(&reg, &order_caps(), 101, 10),
@@ -751,7 +759,9 @@ fn an_amend_is_refused_where_the_venue_cannot_make_it() {
     let m = reg.insert(market).unwrap().cid();
     ack(&mut reg, m, Some(vid("m1")));
     assert_eq!(
-        reg.live(m).unwrap().amend(&caps, Ticks(100), lots(10)),
+        reg.live(m)
+            .unwrap()
+            .amend(&caps, Ticks(100), lots(10), false),
         Err(AmendRefusal::NotLimit)
     );
 }
@@ -798,4 +808,134 @@ fn only_a_resting_order_with_nothing_in_flight_is_live() {
     );
     let open = order_at(&mut reg, Ack::AckedNoVid, false);
     assert_eq!(reg.live(open).unwrap().order().state(), OrdState::Open);
+}
+
+// ---- review fixes ----
+
+#[test]
+fn a_cancel_while_an_amend_that_replaces_the_venue_id_is_in_flight_does_not_name_the_old_id() {
+    // Codex r4186718675: the venue gives the amended order a new id, and the amend is on its
+    // way, so the record's venue id may already be retired.
+    let replacing = |refs: &[RefKind]| OrderCaps {
+        amend: Some(AmendCaps {
+            keeps_venue_id: false,
+            ..amend_caps(&[RefKind::Venue], true)
+        }),
+        batch_cancel: Some(CancelBatch {
+            max_items: 4,
+            refs: TagSet::of(&[RefKind::Venue]),
+        }),
+        ..caps_with(refs, false)
+    };
+    let mut reg = Registry::new();
+    let c = order_at(&mut reg, Ack::AckedVid, false);
+    let old = reg.get(c).unwrap().vid().cloned().unwrap();
+    reg.amend_sent(c, Ticks(101), lots(10), RpcId(1), MonoNs(1))
+        .unwrap();
+
+    // By venue id only: the cancel waits, single or in a batch.
+    let caps = replacing(&[RefKind::Venue]);
+    assert_eq!(
+        reg.cancellable(c).unwrap().cancel(&caps),
+        CancelChoice::AwaitAck
+    );
+    let plan = reg.cancel_many(&[c], &caps);
+    assert!(plan.commands.is_empty(), "{plan:?}");
+    assert_eq!(plan.awaiting_ack, vec![c]);
+    // By client id too: the client id names it, not the old venue id.
+    let both = replacing(&[RefKind::Venue, RefKind::Client]);
+    let CancelChoice::Send(cmd) = reg.cancellable(c).unwrap().cancel(&both) else {
+        panic!("the client id names the order")
+    };
+    assert_eq!(single(&cmd).target, OrderRef::Client(c));
+    let plan = reg.cancel_many(&[c], &both);
+    assert_eq!(single(&plan.commands[0]).target, OrderRef::Client(c));
+
+    // The amend confirmed under its new id: the cancel by venue id is due, naming the new id.
+    assert_eq!(
+        reg.cancellable(c).unwrap().cancel(&caps),
+        CancelChoice::AwaitAck
+    );
+    let mut amended = update(
+        Some(c),
+        VenueOrderState::Amended {
+            new_vid: Some(vid("new")),
+        },
+        0,
+    );
+    amended.vid = Some(old);
+    amended.px = Some(Ticks(101));
+    amended.qty = Some(lots(10));
+    reg.apply_update(
+        &amended,
+        OrderKey {
+            venue: Some(5),
+            ingest: 2,
+        },
+    );
+    assert_eq!(reg.cancels_due(&caps), vec![c]);
+    let CancelChoice::Send(cmd) = reg.cancellable(c).unwrap().cancel(&caps) else {
+        panic!("due")
+    };
+    assert_eq!(single(&cmd).target, OrderRef::Both(c, vid("new")));
+
+    // A venue that keeps the id across an amend names it while the amend is in flight.
+    let d = order_at(&mut reg, Ack::AckedVid, false);
+    reg.amend_sent(d, Ticks(101), lots(10), RpcId(3), MonoNs(1))
+        .unwrap();
+    let keeping = OrderCaps {
+        amend: Some(amend_caps(&[RefKind::Venue], true)),
+        ..caps_with(&[RefKind::Venue], false)
+    };
+    assert!(matches!(
+        reg.cancellable(d).unwrap().cancel(&keeping),
+        CancelChoice::Send(_)
+    ));
+}
+
+#[test]
+fn an_amend_the_planner_classifies_as_reducing_stays_safety_traffic() {
+    // Codex r4186718683: the classification is the caller's, as on a placement.
+    let caps = with_amend(amend_caps(&[RefKind::Venue], true));
+    let mut reg = Registry::new();
+    let c = order_at(&mut reg, Ack::AckedVid, false);
+    for reducing in [false, true] {
+        let cmd = reg
+            .live(c)
+            .unwrap()
+            .amend(&caps, Ticks(100), lots(8), reducing)
+            .unwrap();
+        let VenueCommand::Amend(amend) = cmd.command() else {
+            panic!("an amend")
+        };
+        assert_eq!(amend.reducing, reducing);
+        assert_eq!(
+            cmd.command().traffic_class(),
+            if reducing {
+                fbc_core::TrafficClass::Safety
+            } else {
+                fbc_core::TrafficClass::Normal
+            }
+        );
+    }
+}
+
+#[test]
+fn a_seen_order_whose_client_id_and_venue_id_name_different_orders_gets_no_permit() {
+    // Codex r4186718692, as Registry::apply_fill flags such a fill.
+    let mut reg = Registry::new();
+    let a = order_at(&mut reg, Ack::AckedVid, false);
+    let b = order_at(&mut reg, Ack::AckedVid, false);
+    let b_vid = reg.get(b).unwrap().vid().cloned().unwrap();
+    let a_vid = reg.get(a).unwrap().vid().cloned().unwrap();
+    assert_eq!(
+        reg.cancellable_seen(Some(CidMatch::Ours(a)), Some(&b_vid))
+            .unwrap_err(),
+        PermitRefusal::Conflicting { cid: a, by_vid: b }
+    );
+    // Both naming the same order, or a venue id no order had: a permit for it.
+    for seen in [Some(&a_vid), Some(&vid("unseen")), None] {
+        let permit = reg.cancellable_seen(Some(CidMatch::Ours(a)), seen).unwrap();
+        assert_eq!(permit.order().cid(), a);
+    }
 }

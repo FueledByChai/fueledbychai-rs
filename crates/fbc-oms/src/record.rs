@@ -339,6 +339,13 @@ impl OrderRecord {
         self.state.rank() > 0 || self.vid.is_some()
     }
 
+    /// Whether an amend is in flight, or one replaced in flight is not yet confirmed: on a venue
+    /// whose amend gives the order a new id, the venue may already know it by an id the record
+    /// has not learnt.
+    pub fn amend_unconfirmed(&self) -> bool {
+        matches!(self.intent, Intent::PendingAmend { .. }) || self.unsettled.is_some()
+    }
+
     /// Whether a cancel was asked for and waits for the order's acknowledgement, since no
     /// reference its venue's cancel can name was usable ([`crate::CancelChoice::AwaitAck`]).
     pub fn cancel_awaits_ack(&self) -> bool {

@@ -337,8 +337,9 @@ impl Registry {
     /// The permit to cancel an order the venue shows (an update, a fill or a snapshot), named
     /// by the client id the venue echoed (`None` when it echoes none) and its venue id. Another
     /// namespace's or a non-canonical client id gets none (decision 0005, I4); nor does an
-    /// order the registry does not hold (an orphan, which only I7's resync cancels). Our
-    /// registered client id, or with none echoed a venue id our order had, names the order.
+    /// order the registry does not hold (an orphan, which only I7's resync cancels), nor one
+    /// whose client id and venue id name different orders of ours. Our registered client id,
+    /// or with none echoed a venue id our order had, names the order.
     pub fn cancellable_seen(
         &mut self,
         cid: Option<CidMatch>,
@@ -347,7 +348,14 @@ impl Registry {
         let cid = match cid {
             Some(CidMatch::Foreign(ns)) => return Err(PermitRefusal::Foreign(ns)),
             Some(CidMatch::Unparseable) => return Err(PermitRefusal::NotCanonical),
-            Some(CidMatch::Ours(cid)) if self.orders.contains_key(&cid) => cid,
+            Some(CidMatch::Ours(cid)) if self.orders.contains_key(&cid) => {
+                match vid.and_then(|v| self.cid_of(v)) {
+                    Some(by_vid) if by_vid != cid => {
+                        return Err(PermitRefusal::Conflicting { cid, by_vid });
+                    }
+                    _ => cid,
+                }
+            }
             Some(CidMatch::Ours(_)) => return Err(PermitRefusal::Untracked),
             None => vid
                 .and_then(|v| self.cid_of(v))
