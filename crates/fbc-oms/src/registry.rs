@@ -18,6 +18,7 @@ use crate::permit::{
     self, CancelChoice, CancelPlan, Cancellable, Live, PermitRefusal, PermittedCommand, PlacePlan,
 };
 use crate::record::{Applied, FillApplied, OrderKey, OrderOp, OrderRecord, OutcomeApplied};
+use crate::resync::{MarketState, Placed, Placement, Seed};
 
 /// Our orders, by client id, with an index of every venue id they were known by, the
 /// inventory per instrument that the fills the ledger accepted moved, and the Unknown ladder's
@@ -27,10 +28,11 @@ pub struct Registry {
     pub(crate) orders: HashMap<ClientOrderId, OrderRecord>,
     caps: PreTradeCaps,
     by_vid: HashMap<VenueOrderId, ClientOrderId>,
-    inventory: HashMap<InstrumentId, SignedLots>,
-    /// The markets whose starting position the consumer gave from the venue
-    /// ([`Registry::seed_position`]): only on them is the inventory the position.
-    seeded: HashSet<InstrumentId>,
+    pub(crate) inventory: HashMap<InstrumentId, SignedLots>,
+    /// Each market's position as the registry knows it: not seeded (with the fills accepted
+    /// so far), seeded by a resync or by hand, or unsettled; only on a seeded market is the
+    /// inventory the position.
+    pub(crate) markets: HashMap<InstrumentId, MarketState>,
     /// The ledger whose fills the registry applies: the first one it was given.
     ledger: Option<u64>,
     /// The ladder's queries out, by request.
@@ -51,6 +53,14 @@ pub enum FillRouted {
     /// To no order the registry holds, under our namespace's client id `cid` (an order of an
     /// earlier run, say): the inventory moved.
     OursUntracked(ClientOrderId),
+    /// Kept by the ledger and, when the registry holds its order `cid`, counted on it, but not
+    /// on the inventory: the position the market's resync seeded already holds it (decision
+    /// 0052).
+    InSnapshot(ClientOrderId),
+    /// Counted, but it falls between the request and the answer of the resync that seeded its
+    /// market and nothing shows on which side: the market's position is unknown from now on
+    /// ([`Registry::position`]; decision 0052).
+    Unsettled(ClientOrderId),
     /// Flagged, not counted: it routes to our order `cid` but names another instrument or the
     /// other side than the order's placement (a misdecoded or misrouted fill).
     Disagrees(ClientOrderId),
@@ -213,7 +223,7 @@ impl Registry {
             inst,
             side,
             cap: self.caps.market(inst),
-            pos: self.seeded.contains(&inst).then(|| self.inventory(inst)),
+            pos: self.position(inst),
             others: self.sum_on(inst, side, except, OrderRecord::exposure),
             others_resting: self.sum_on(inst, side, except, OrderRecord::resting),
         }
@@ -325,31 +335,34 @@ impl Registry {
         Routed::Ours(cid, applied)
     }
 
-    /// Seeds the position on `inst` from the venue (its snapshot at session start), from which
-    /// the fills the ledger accepts then move it. Until a market is seeded its position is
-    /// unknown and the pre-trade caps admit no place or amend on it
-    /// ([`CapRefusal::PositionUnknown`]). Refused once the market is seeded, and once a fill
-    /// moved its inventory before it was seeded: how such a fill is counted against the
-    /// snapshot is the resync's (FBC-38r), so the market stays unknown and admits nothing.
+    /// Seeds the position on `inst` by hand, from which the fills the ledger accepts then all
+    /// move it: a resync seeds a market from its snapshot instead ([`Registry::resync`]), and
+    /// places the fills that straddle it. Until a market is seeded its position is unknown and
+    /// the pre-trade caps admit no place or amend on it ([`CapRefusal::PositionUnknown`]).
+    /// Refused once the market is seeded, and once a fill moved its inventory before it was
+    /// seeded: only a resync's snapshot can place such a fill, so the market stays unknown.
     pub fn seed_position(&mut self, inst: InstrumentId, pos: SignedLots) -> Result<(), OmsError> {
-        if self.seeded.contains(&inst) {
-            return Err(OmsError::PositionSeeded(inst));
-        }
-        if self.inventory.contains_key(&inst) {
-            return Err(OmsError::PositionMoved(inst));
+        match self.markets.get(&inst) {
+            Some(MarketState::Seeded(_) | MarketState::Unsettled) => {
+                return Err(OmsError::PositionSeeded(inst));
+            }
+            Some(MarketState::Unseeded(_)) => return Err(OmsError::PositionMoved(inst)),
+            None => {}
         }
         self.inventory.insert(inst, pos);
-        self.seeded.insert(inst);
+        self.markets
+            .insert(inst, MarketState::Seeded(Seed::by_hand(pos)));
         Ok(())
     }
 
-    /// Whether the position on `inst` was seeded from the venue ([`Registry::seed_position`]).
+    /// Whether the position on `inst` is known ([`Registry::position`]).
     pub fn position_known(&self, inst: InstrumentId) -> bool {
-        self.seeded.contains(&inst)
+        self.position(inst).is_some()
     }
 
-    /// The inventory on `inst`: the position seeded from the venue, if any, moved by the
-    /// accepted fills; positive is long.
+    /// The inventory on `inst`: the position seeded from the venue, moved by the accepted
+    /// fills the seed does not hold; positive is long. Before the market is seeded, the sum of
+    /// the fills accepted so far, which is not the position ([`Registry::position`]).
     pub fn inventory(&self, inst: InstrumentId) -> SignedLots {
         self.inventory.get(&inst).copied().unwrap_or(SignedLots(0))
     }
@@ -399,18 +412,35 @@ impl Registry {
                 return Ok(FillRouted::Disagrees(cid));
             }
         }
+        let placed = Placed::of(
+            ours,
+            fill.vid().cloned(),
+            fill.qty,
+            fill.cum_after(),
+            accepted.time(),
+            accepted.arrived(),
+        );
+        let placement = self.placement(fill.inst, cid.is_some(), &placed);
         let overflow = OmsError::FillOverflow(fill.inst);
-        let inventory = self
-            .inventory(fill.inst)
-            .checked_add(SignedLots::of(fill.side, fill.qty))
-            .ok_or(overflow.clone())?;
+        let signed = SignedLots::of(fill.side, fill.qty);
+        let inventory = match placement {
+            Placement::InSnapshot { .. } => self.inventory(fill.inst),
+            Placement::After | Placement::Unsettled => self
+                .inventory(fill.inst)
+                .checked_add(signed)
+                .ok_or(overflow.clone())?,
+        };
         let cum = match cid {
+            Some(cid) if placement == (Placement::InSnapshot { shown: true }) => {
+                Some(self.orders[&cid].cum_fills())
+            }
             Some(cid) => Some(self.orders[&cid].cum_fills_with(fill.qty).ok_or(overflow)?),
             None => None,
         };
         accepted.commit();
         self.inventory.insert(fill.inst, inventory);
-        Ok(match (cid, cum) {
+        self.fill_counted(fill.inst, fill.key(), placed, signed, placement);
+        let routed = match (cid, cum) {
             (Some(cid), Some(cum)) => {
                 let applied =
                     self.with_record(cid, |rec| rec.apply_fill(fill.vid(), fill.cum_after(), cum));
@@ -423,6 +453,11 @@ impl Registry {
                 FillRouted::Ours(cid, applied)
             }
             _ => FillRouted::OursUntracked(ours),
+        };
+        Ok(match placement {
+            Placement::After => routed,
+            Placement::InSnapshot { .. } => FillRouted::InSnapshot(ours),
+            Placement::Unsettled => FillRouted::Unsettled(ours),
         })
     }
 

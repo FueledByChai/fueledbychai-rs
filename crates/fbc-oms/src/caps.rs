@@ -125,6 +125,11 @@ impl PreTradeCaps {
         Ok(self)
     }
 
+    /// The markets these caps configure.
+    pub(crate) fn markets(&self) -> impl Iterator<Item = InstrumentId> + '_ {
+        self.markets.keys().copied()
+    }
+
     /// The caps configured for `market`, if any.
     pub fn market(&self, market: InstrumentId) -> Option<MarketCaps> {
         self.markets.get(&market).copied()
@@ -136,9 +141,10 @@ impl PreTradeCaps {
 pub enum CapRefusal {
     /// The consumer configured no caps for the market: it admits nothing.
     NoCap(InstrumentId),
-    /// The market's position was not seeded from the venue
-    /// ([`Registry::seed_position`](crate::Registry::seed_position)): the worst case is not
-    /// known, so it admits nothing.
+    /// The market's position is not known: no resync seeded it from the venue
+    /// ([`Registry::resync`](crate::Registry::resync)), or a fill since could not be placed
+    /// against the seed ([`Registry::position`](crate::Registry::position)): the worst case is
+    /// not known, so it admits nothing.
     PositionUnknown(InstrumentId),
     /// The worst-case position on `side` with the order admitted, `worst`, would exceed the
     /// inventory cap `cap` (0005's I6); `worst` is `None` when it does not fit a lot count.
@@ -165,7 +171,10 @@ impl fmt::Display for CapRefusal {
                 write!(f, "no pre-trade caps are configured for {inst:?}")
             }
             CapRefusal::PositionUnknown(inst) => {
-                write!(f, "the position on {inst:?} was not seeded from the venue")
+                write!(
+                    f,
+                    "the position on {inst:?} was not seeded from the venue, or is no longer known"
+                )
             }
             CapRefusal::InventoryCap {
                 inst,

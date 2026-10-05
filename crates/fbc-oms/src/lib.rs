@@ -79,9 +79,10 @@
 //! [`CapsConfigError`]); decision 0052 names them: the inventory cap is 0005's I6, the
 //! worst-case position `|pos + Σ resting same side + new| ≤ cap`, and the resting cap a gross
 //! bound per side, `Σ resting same side + new ≤ cap`, which also bounds the side that reduces
-//! the position, where I6 admits up to twice the inventory cap. The position is the one seeded
-//! from the venue ([`Registry::seed_position`]), moved by the fills the ledger accepted; a
-//! market not seeded admits nothing. Each order counts what may rest as
+//! the position, where I6 admits up to twice the inventory cap. The position is the one a
+//! resync seeded from the venue ([`Registry::resync`], [`Registry::position`]), moved by the
+//! fills the ledger accepted; a market not seeded, or whose position a fill made unknown since,
+//! admits nothing. Each order counts what may rest as
 //! [`Registry::resting_on`] counts it (PendingNew and Unknown orders in full, a partly filled
 //! order's remainder until it is terminal, an amend at the larger of its old and new quantity
 //! from when it is built), and against the inventory cap its [`OrderRecord::exposure`]: that,
@@ -92,6 +93,17 @@
 //! has none, reducing and reduce-only ones included: I6 admits an order that genuinely
 //! reduces the position by its formula; the resting cap bounds it like any other. Cancels are
 //! never capped (`tests/caps.rs`).
+//!
+//! Resyncs (decision 0052, `tests/resync.rs`): the consumer hands each resync's answer to
+//! [`Registry::resync`] as a [`ResyncSnapshot`]. The first one seeds each market's position,
+//! once per process, and registers our open orders it shows that the registry does not hold
+//! (an earlier run's, never amended); until then the market's position is unknown
+//! ([`Registry::position`]) and nothing is built on it. A fill executed between the request and
+//! the answer counts exactly once, wherever it arrives: the snapshot holds it when it arrived
+//! before the request, its order shows the cumulative fill it brought, or (its order not shown)
+//! it executed by the watermark or the venue's snapshot source is trustworthy; a fill nothing
+//! places leaves the market unknown. Later resyncs compare each position with the inventory as
+//! of the watermark and report a desync, never overwriting it ([`PositionCheck`]).
 //!
 //! Not here yet: the market states (FBC-c4v), and issuing an authorization after them and its
 //! check at submit (FBC-afd).
@@ -104,6 +116,7 @@ mod ledger;
 mod permit;
 mod record;
 mod registry;
+mod resync;
 
 /// The helpers the integration tests share, once for the unit tests too: one namespace lease
 /// per test binary.
@@ -128,3 +141,4 @@ pub use record::{
     OutcomeApplied, TerminalKind,
 };
 pub use registry::{FillRouted, OmsError, Registry, Routed};
+pub use resync::{PositionCheck, ResyncError, ResyncReport, ResyncSnapshot};
