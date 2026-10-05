@@ -30,6 +30,7 @@ mod md;
 
 use std::collections::BTreeSet;
 
+use fbc_core::{AccountSummary, Secrets};
 use fbc_core::{
     AssetKey, BookId, ConfigError, EndpointPlan, ExecCodec, ExecEndpoint, FieldSpec, HttpPlan,
     InstrumentSpecDraft, MdCodec, MdTransport, SpecTable, StreamId, Subscription, SymbolError,
@@ -132,8 +133,22 @@ impl VenueFactory for BinanceUsdm {
         Ok(Vec::new())
     }
 
-    /// None: market data only (decision 0015).
-    fn exec_codec(&self, _cfg: &VenueConfig) -> Option<Result<Box<dyn ExecCodec>, VenueError>> {
+    /// None: market data only (decision 0015); the credentials are dropped, and so zeroed,
+    /// unread.
+    fn exec_codec(
+        &self,
+        _cfg: &VenueConfig,
+        _creds: Secrets,
+    ) -> Option<Result<Box<dyn ExecCodec>, VenueError>> {
+        None
+    }
+
+    /// None: market data only, it takes no credentials.
+    fn test_connection(
+        &self,
+        _cfg: &VenueConfig,
+        _creds: Secrets,
+    ) -> Option<Result<HttpPlan<AccountSummary>, VenueError>> {
         None
     }
 }

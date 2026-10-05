@@ -9,6 +9,10 @@
 //! §4.4; the resolution itself is [`resolve`](crate::resolve)). Nothing outside the venue crates
 //! and the registry names a venue; everything else reads [`VenueCaps`].
 //!
+//! Credentials reach a venue only as [`Secrets`] (`src/auth`, 0009): an order-entry codec takes
+//! them, and [`VenueFactory::test_connection`] proves them with an [`HttpPlan`] whose result is
+//! an [`AccountSummary`] (decision 0043).
+//!
 //! [`OrderGateway`] is what submits commands: the live gateway (runtime, exec codec and
 //! signer), the simulated venue, and a [`ManagedGateway`] for a venue reachable only through a
 //! vendor SDK that owns its own socket (journaled at the event level; using one needs a
@@ -17,6 +21,7 @@
 use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::auth::Secrets;
 use crate::caps::VenueCaps;
 use crate::codec::{
     DecodeError, Effect, Effects, EncodeCtx, EncodeReceipt, ExecCodec, HttpFailure, HttpResponse,
@@ -28,6 +33,7 @@ use crate::ids::{AccountKey, IdError, InstrumentId};
 use crate::resolve::{AssetKey, InstrumentSpecDraft, SymbolError};
 use crate::scope::DecodeScope;
 use crate::stamps::PathStamps;
+use crate::units::Money;
 
 /// Where a configuration key lives.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
@@ -241,6 +247,28 @@ pub struct ExecEndpoint {
     pub url: WireUrl,
 }
 
+/// What a venue says about the account a set of credentials reaches, for the consumer's Test
+/// Connection. Both fields are private account data (0009): its `Debug` shows the account by
+/// length and the equity only by whether the venue reported one, so a log of it shows that the
+/// credentials work and nothing of whose they are or what the account holds.
+#[derive(Clone, Eq, PartialEq, Hash)]
+pub struct AccountSummary {
+    /// The account as the venue names it (an address, an account id).
+    pub account: String,
+    /// The account's equity, where the venue reports one.
+    pub equity: Option<Money>,
+}
+
+impl fmt::Debug for AccountSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let equity = self.equity.as_ref().map(|_| format_args!("<redacted>"));
+        f.debug_struct("AccountSummary")
+            .field("account", &Len(self.account.len()))
+            .field("equity", &equity)
+            .finish()
+    }
+}
+
 /// Why an [`HttpPlan`] was refused, or its answers could not be read.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum PlanError {
@@ -378,9 +406,6 @@ impl<T> HttpPlan<T> {
 }
 
 /// The one value a venue crate exports.
-///
-/// The credential-bearing calls (`exec_codec`'s credentials and `test_connection`, under
-/// `src/auth`; FBC-b3b) are not declared yet.
 pub trait VenueFactory: Sync + 'static {
     /// The venue's name as FBC spells it ("PARADEX").
     fn id(&self) -> &'static str;
@@ -416,10 +441,27 @@ pub trait VenueFactory: Sync + 'static {
     /// The order-entry connections to open under `cfg`; empty for a venue whose order entry is
     /// HTTP only, or that has none.
     fn plan_exec(&self, cfg: &VenueConfig) -> Result<Vec<ExecEndpoint>, VenueError>;
-    /// An order-entry codec, or `None` for a market-data-only venue. It writes client ids in
-    /// the format its capabilities declare ([`OrderCaps::client_id`](crate::OrderCaps)), the one
-    /// source the runtime also decodes with.
-    fn exec_codec(&self, cfg: &VenueConfig) -> Option<Result<Box<dyn ExecCodec>, VenueError>>;
+    /// An order-entry codec for the account `creds` reach, or `None` for a market-data-only
+    /// venue, which drops them unread. It writes client ids in the format its capabilities
+    /// declare ([`OrderCaps::client_id`](crate::OrderCaps)), the one source the runtime also
+    /// decodes with. `Err` names a credential key missing from `creds`, or the configuration
+    /// refused ([`ConfigError`]); it never carries a credential's value.
+    fn exec_codec(
+        &self,
+        cfg: &VenueConfig,
+        creds: Secrets,
+    ) -> Option<Result<Box<dyn ExecCodec>, VenueError>>;
+    /// A plan that proves `creds` against the venue and ends in an [`AccountSummary`], for the
+    /// consumer's Test Connection: one round of requests, built here and carrying the
+    /// credentials they need, and a parser that reads the account from their 2xx answers inside
+    /// a [`DecodeScope`]. A refused request ends it with [`PlanError::Status`] before the parser
+    /// runs. `None` for a venue that takes no credentials, which drops them unread. `Err` as
+    /// for [`exec_codec`](VenueFactory::exec_codec).
+    fn test_connection(
+        &self,
+        cfg: &VenueConfig,
+        creds: Secrets,
+    ) -> Option<Result<HttpPlan<AccountSummary>, VenueError>>;
 }
 
 /// What submitting a command gave: its request id, and the nonces it used or why it was not

@@ -457,6 +457,7 @@ dependencies = [
  "compact_str",
  "rust_decimal",
  "trybuild",
+ "zeroize",
 ]
 
 [[package]]

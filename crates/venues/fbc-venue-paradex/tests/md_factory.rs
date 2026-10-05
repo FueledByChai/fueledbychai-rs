@@ -6,6 +6,7 @@ mod md;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use fbc_core::Secrets;
 use fbc_core::{
     ConfigError, ConnTopology, Effect, Effects, Encoding, Feed, FeedSource, HttpFailure, HttpTag,
     Inbound, InboundSpans, LimitScope, MdCodec, MdTransport, MonoNs, OpKind, RateCharge, RawFrame,
@@ -146,7 +147,12 @@ fn the_factory_declares_market_data_only_with_its_cited_limits() {
     assert_eq!(declared, caps());
     assert_eq!(ParadexFactory.id(), "PARADEX");
     assert!(declared.exec.is_none());
-    assert!(ParadexFactory.exec_codec(&cfg()).is_none());
+    assert!(ParadexFactory.exec_codec(&cfg(), Secrets::new()).is_none());
+    assert!(
+        ParadexFactory
+            .test_connection(&cfg(), Secrets::new())
+            .is_none()
+    );
     assert_eq!(ParadexFactory.plan_exec(&cfg()), Ok(Vec::new()));
     // Discovery and the Java-era ticker rule are not built yet (FBC-l5o): both say so.
     let ticker = ParadexFactory.parse_fbc_common_symbol("BTC/USDT");

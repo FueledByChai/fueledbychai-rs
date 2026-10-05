@@ -11,6 +11,7 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use common::{BTC, CONFIG, ETH, SOL, config, specs};
+use fbc_core::Secrets;
 use fbc_core::{
     BookId, Cadence, ConfigError, ConfigScope, ConnTopology, Continuity, Effect, Effects, Encoding,
     ExchTsKind, Feed, FeedSource, FieldUnit, Inbound, InboundSpans, LimitScope, MdTransport,
@@ -34,7 +35,8 @@ fn the_factory_declares_market_data_only_with_no_exec_codec_or_endpoint() {
     let cfg = config();
     let caps = BinanceUsdm.caps(&cfg).unwrap();
     assert_eq!(caps.exec, None);
-    assert!(BinanceUsdm.exec_codec(&cfg).is_none());
+    assert!(BinanceUsdm.exec_codec(&cfg, Secrets::new()).is_none());
+    assert!(BinanceUsdm.test_connection(&cfg, Secrets::new()).is_none());
     assert_eq!(BinanceUsdm.plan_exec(&cfg), Ok(Vec::new()));
     // Discovery and the Java-era ticker rule are not built yet (FBC-fwf): both say so.
     let ticker = BinanceUsdm.parse_fbc_common_symbol("BTC/USDT");

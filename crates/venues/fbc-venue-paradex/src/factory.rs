@@ -9,6 +9,7 @@
 use core::time::Duration;
 use std::collections::{BTreeMap, BTreeSet};
 
+use fbc_core::{AccountSummary, Secrets};
 use fbc_core::{
     AssetKey, BookCaps, Cadence, Channel, ConfigError, ConfigScope, ConnTopology, Continuity,
     Encoding, EndpointPlan, ExchTsKind, ExecCodec, ExecEndpoint, Feed, FeedSource, FieldSpec,
@@ -144,8 +145,22 @@ impl VenueFactory for ParadexFactory {
         Ok(Vec::new())
     }
 
-    /// None: market data only until order entry lands (BT-402).
-    fn exec_codec(&self, _cfg: &VenueConfig) -> Option<Result<Box<dyn ExecCodec>, VenueError>> {
+    /// None: market data only until order entry lands (BT-402); the credentials are dropped,
+    /// and so zeroed, unread.
+    fn exec_codec(
+        &self,
+        _cfg: &VenueConfig,
+        _creds: Secrets,
+    ) -> Option<Result<Box<dyn ExecCodec>, VenueError>> {
+        None
+    }
+
+    /// None until Paradex authentication lands (FBC-mz1).
+    fn test_connection(
+        &self,
+        _cfg: &VenueConfig,
+        _creds: Secrets,
+    ) -> Option<Result<HttpPlan<AccountSummary>, VenueError>> {
         None
     }
 }
