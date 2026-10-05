@@ -4,6 +4,10 @@
 //! from anywhere inside `fbc-core`, including its unit tests, so the compiler alone cannot
 //! hold the line; these tests read the crate's sources and fail if anything but `scope.rs`
 //! calls them, or if anything builds the tuple structs other than those constructors' bodies.
+//!
+//! Decisions 0002 and 0033: a codec gets time only from `EncodeCtx` or callback arguments, and
+//! marks its latency stages through `PathStamps`, which gives back none. Nothing in `fbc-core`
+//! reads a clock, so nothing in it can hand a codec a time the runtime did not journal.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -114,5 +118,34 @@ fn only_from_declared_builds_the_fee_struct() {
         builds,
         ["fee.rs"],
         "a Fee is built somewhere other than Fee::from_declared (0004)"
+    );
+}
+
+#[test]
+fn nothing_in_the_core_reads_a_clock() {
+    let mut reads = Vec::new();
+    for (name, text) in crate_sources() {
+        for (n, line) in text.lines().enumerate() {
+            let is_read = [
+                "Instant::now",
+                ".elapsed()",
+                "SystemTime",
+                "UNIX_EPOCH",
+                "quanta",
+                "clock_gettime",
+                "Utc::now",
+                "Local::now",
+            ]
+            .iter()
+            .any(|pat| line.contains(pat));
+            if is_read {
+                reads.push(format!("{name}:{}: {}", n + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        reads.is_empty(),
+        "fbc-core reads a clock (0002, 0033):\n{}",
+        reads.join("\n")
     );
 }

@@ -18,9 +18,9 @@ use fbc_core::{
     AmendOrder, CancelOrder, Channel, ChosenRef, CidMint, ClientOrderId, CtxCall, DecodeError,
     DecodeScope, Effect, Effects, EncodeCtx, EncodeReceipt, ExecCodec, ExecEvent, ExecSink,
     HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans, InstrumentId, Lots, MonoNs,
-    Namespace, NamespaceLease, NonceBlock, NotSentReason, OpKind, OrderCaps, OrderRef, RateCharge,
-    RawFrame, RpcCall, RpcId, Side, SpecTable, StreamId, SubmitOutcome, Ticks, TifTag, TimerTag,
-    VenueCommand, VenueMeta, VenueOrderId, WallNs, WireSlice, dispatch, encode_cid,
+    Namespace, NamespaceLease, NonceBlock, NotSentReason, OpKind, OrderCaps, OrderRef, PathStamps,
+    RateCharge, RawFrame, RpcCall, RpcId, Side, SpecTable, StreamId, SubmitOutcome, Ticks, TifTag,
+    TimerTag, VenueCommand, VenueMeta, VenueOrderId, WallNs, WireSlice, dispatch, encode_cid,
 };
 
 const STREAM: StreamId = StreamId(0);
@@ -103,6 +103,7 @@ impl ExecCodec for RefCodec {
         rpc: RpcId,
         _specs: &SpecTable,
         _ctx: &EncodeCtx,
+        _t: &mut PathStamps<'_>,
         fx: &mut Effects,
     ) -> Result<EncodeReceipt, NotSentReason> {
         let (line, charge) = self.frame(cmd)?;
@@ -178,7 +179,8 @@ fn ctx() -> EncodeCtx {
 /// nothing was asked for).
 fn encode(cmd: &VenueCommand) -> Result<String, NotSentReason> {
     let mut fx = Effects::new();
-    let result = RefCodec::new().encode(cmd, RPC, &SpecTable::new(), &ctx(), &mut fx);
+    let (specs, off) = (SpecTable::new(), &mut PathStamps::off());
+    let result = RefCodec::new().encode(cmd, RPC, &specs, &ctx(), off, &mut fx);
     if let Err(reason) = result {
         assert!(fx.is_empty(), "a refused command asked for {fx:?}");
         return Err(reason);

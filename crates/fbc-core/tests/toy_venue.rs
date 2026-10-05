@@ -5,9 +5,10 @@
 //! a `VenueCommand` taking time and nonces only from `EncodeCtx`, and does no IO: everything it
 //! wants done comes back as `Effects`. Its protocol, symbols and values describe no real venue.
 //!
-//! The toy proves FBC-5's done line; it is not a conformance suite, and its `VenueCaps` declare
-//! only what its codecs do. One socket carries the touch; one carries order entry (unsigned
-//! limit orders out; acks, account events, fills and a resync answered in one frame in). It has
+//! The toy proves FBC-5's and FBC-ji6's done lines; it is not a conformance suite, and its `VenueCaps` declare
+//! only what its codecs do. One socket carries the touch; one carries order entry (limit orders
+//! out, each signed with a toy hash, its signer call marked as the sign stage through
+//! `PathStamps`; acks, account events, fills and a resync answered in one frame in). It has
 //! no book, trades or other feed, cancels, amends and queries nothing, reads no configuration,
 //! and asks for no HTTP; it keeps one resync in flight, and its one timer asks for that resync
 //! again while it is unanswered. Its market-data socket is kept alive with a ping frame.
@@ -26,21 +27,23 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use fbc_core::{
-    AckLevel, AckModel, AssetSym, Cadence, CancelOnDisconnect, Channel, Charset, CidMatch, CidMint,
-    ClientIdFormat, ClientOrderId, ConfigError, ConnKey, ConnTopology, CtxCall, DecodeError,
-    DecodeScope, Effect, Effects, EncodeCtx, EncodeReceipt, Encoding, EndpointPlan, Envelope,
-    ExchNs, ExchTsKind, ExecCaps, ExecCodec, ExecEndpoint, ExecEvent, ExecSink, Feed, FeedSource,
-    FieldSpec, FillCaps, FillEvent, FillIdent, FillSource, FundingCaps, FundingSpec, HttpFailure,
-    HttpResponse, HttpTag, Inbound, InboundSpans, InstrumentId, InstrumentKind, InstrumentSpec,
-    ItemRef, Keepalive, KeepaliveKind, LimitScope, Liquidity3, Lots, Lvl, MatchingCaps, MdCaps,
-    MdCodec, MdEvent, MdSink, MdTransport, Money, MonoNs, Namespace, NamespaceLease, NewOrder,
-    NonceBlock, NonceScope, NotSentReason, OpKind, OrderCaps, OrderKind, OrderKindTag, OrderingKey,
-    PriceGrid, PxExact, RateCharge, RateLimit, RawFrame, Readiness, RpcCall, RpcId, SeqDomain,
-    Side, SignedLots, SizeStep, SnapshotSource, SpecTable, Stamp, StpScope, StreamId,
-    SubmitOutcome, Subscription, Support, TagSet, Ticks, TifTag, TimerTag, TouchSourceCaps,
-    TouchSourceId, TradeCaps, TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueCommand,
-    VenueConfig, VenueError, VenueFactory, VenueFeeSign, VenueId, VenueMeta, VenueOrderSnapshot,
-    VenueOrderState, Via, WallNs, WireSlice, WireUrl, decode_cid, dispatch, encode_cid,
+    AccountKey, AckLevel, AckModel, AssetSym, Cadence, CancelOnDisconnect, Channel, Charset,
+    CidMatch, CidMint, ClientIdFormat, ClientOrderId, ConfigError, ConnKey, ConnTopology, CtxCall,
+    DecodeError, DecodeScope, Effect, Effects, EncodeCtx, EncodeReceipt, Encoding, EndpointPlan,
+    Envelope, ExchNs, ExchTsKind, ExecCaps, ExecCodec, ExecEndpoint, ExecEvent, ExecSink, Feed,
+    FeedSource, FieldSpec, FillCaps, FillEvent, FillIdent, FillSource, FundingCaps, FundingSpec,
+    HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans, InstrumentId, InstrumentKind,
+    InstrumentSpec, ItemRef, Keepalive, KeepaliveKind, LimitScope, Liquidity3, Lots, Lvl,
+    MatchingCaps, MdCaps, MdCodec, MdEvent, MdSink, MdTransport, Money, MonoNs, Namespace,
+    NamespaceLease, NewOrder, NonceBlock, NonceScope, NotSentReason, OpKind, OrderCaps,
+    OrderGateway, OrderKind, OrderKindTag, OrderingKey, PathEdge, PathMark, PathRecorder,
+    PathStage, PathStamps, PlaceWire, PriceGrid, PxExact, RateCharge, RateLimit, RawFrame,
+    Readiness, RpcCall, RpcId, SeqDomain, Side, Sig, SignedLots, SizeStep, SnapshotSource,
+    SpecTable, Stamp, StpScope, StreamId, SubmitHandle, SubmitOutcome, Subscription, Support,
+    TagSet, Ticks, TifTag, TimerTag, TouchSourceCaps, TouchSourceId, TradeCaps, TradingStatus,
+    TrafficClass, UnderlyingId, VenueCaps, VenueCommand, VenueConfig, VenueError, VenueFactory,
+    VenueFeeSign, VenueId, VenueMeta, VenueOrderSnapshot, VenueOrderState, Via, WallNs, WireSlice,
+    WireUrl, decode_cid, dispatch, encode_cid,
 };
 use rust_decimal::Decimal;
 
@@ -201,6 +204,30 @@ fn send(
         class,
         charge,
     }
+}
+
+/// The toy's signature over an order as it goes on the wire: an FNV-1a hash of its fields in
+/// hexadecimal. It reads only the wire view, which takes its time and nonce from the encode
+/// context.
+fn toy_sign(w: &PlaceWire<'_>) -> Sig {
+    let signed = format!(
+        "{}|{}|{:?}|{:?}|{}|{:?}|{:?}|{}|{}|{}|{:?}",
+        w.spec.venue_symbol.as_wire(),
+        w.cid,
+        w.side,
+        w.kind,
+        w.qty.get(),
+        w.tif,
+        w.channel,
+        w.post_only,
+        w.reduce_only,
+        w.wall.0,
+        w.nonce,
+    );
+    let hash = signed.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    Sig::new(format!("{hash:016x}").as_bytes()).expect("16 bytes fit a signature")
 }
 
 /// Refuses a subscription to a feed the toy's caps do not offer, or an instrument missing from
@@ -471,13 +498,15 @@ impl ExecCodec for ToyExec {
         fx.push(send(stream, &hello, None, TrafficClass::Safety, CONTROL));
     }
 
-    /// Encodes a limit order, its time and nonce from `ctx` alone; the toy offers nothing else.
+    /// Encodes and signs a limit order, its time and nonce from `ctx` alone, marking the signer
+    /// call through `t`; the toy offers nothing else.
     fn encode(
         &mut self,
         cmd: &VenueCommand,
         rpc: RpcId,
         specs: &SpecTable,
         ctx: &EncodeCtx,
+        t: &mut PathStamps<'_>,
         fx: &mut Effects,
     ) -> Result<EncodeReceipt, NotSentReason> {
         let VenueCommand::Place(o) = cmd else {
@@ -493,8 +522,24 @@ impl ExecCodec for ToyExec {
         let mut receipt = EncodeReceipt::new();
         let nonce = receipt.use_nonce(ctx, 0);
         let nonce = nonce.ok_or(NotSentReason::Unencodable)?;
+        let wire = PlaceWire {
+            spec,
+            cid: cid.as_str(),
+            side: o.side,
+            kind: o.kind,
+            qty: o.qty,
+            tif: o.tif,
+            channel: o.channel,
+            post_only: o.post_only,
+            reduce_only: o.reduce_only,
+            wall: ctx.wall,
+            nonce: Some(nonce),
+        };
+        // The signer call is the sign stage; the marks give back no time (0033).
+        let sig = t.span(PathStage::Sign, || toy_sign(&wire));
         let frame = format!(
-            "rpc={}\nplace|cid={cid}|sym={}|side={}|px={}|qty={}|po={}|ro={}|ts={}|nonce={nonce}",
+            "rpc={}\nplace|cid={cid}|sym={}|side={}|px={}|qty={}|po={}|ro={}|ts={}|nonce={nonce}\
+             |sig={}",
             rpc.0,
             spec.venue_symbol.as_wire(),
             if o.side == Side::Buy { "B" } else { "S" },
@@ -503,6 +548,7 @@ impl ExecCodec for ToyExec {
             u8::from(o.post_only),
             u8::from(o.reduce_only),
             ctx.wall.0,
+            String::from_utf8_lossy(sig.as_bytes()),
         );
         // An order counts against its instrument's limit.
         let charge = RateCharge::one(OpKind::Place, Some(o.inst));
@@ -862,7 +908,8 @@ fn encode(
     ctx: &EncodeCtx,
 ) -> Result<(EncodeReceipt, Vec<Effect>), NotSentReason> {
     let mut fx = Effects::new();
-    let receipt = exec_codec().encode(cmd, RpcId(11), &specs(), ctx, &mut fx);
+    let off = &mut PathStamps::off();
+    let receipt = exec_codec().encode(cmd, RpcId(11), &specs(), ctx, off, &mut fx);
     assert!(
         receipt.is_ok() || fx.is_empty(),
         "a command not sent pushed {fx:?}"
@@ -996,14 +1043,155 @@ fn encoding_the_same_command_with_the_same_encode_ctx_twice_gives_identical_byte
     let mut codec = exec_codec();
     let twice = [0, 1].map(|_| {
         let mut fx = Effects::new();
+        let off = &mut PathStamps::off();
         codec
-            .encode(&cmd, RpcId(11), &specs(), &at, &mut fx)
+            .encode(&cmd, RpcId(11), &specs(), &at, off, &mut fx)
             .unwrap();
         fx.take()
     });
     // The same codec twice, and a fresh one: codec state does not leak into the bytes.
     assert_eq!(twice[0], twice[1]);
     assert_eq!(twice[0], encode(&cmd, &at).unwrap().1);
+}
+
+/// A path recorder with a clock of its own, as the runtime's reads its: each mark is kept at the
+/// next tick, `step` nanoseconds after the one before, from `from`.
+struct Tape {
+    at: u64,
+    step: u64,
+    marks: Vec<(PathMark, MonoNs)>,
+}
+
+impl Tape {
+    fn new(from: u64, step: u64) -> Tape {
+        let marks = Vec::new();
+        Tape {
+            at: from,
+            step,
+            marks,
+        }
+    }
+
+    /// The marks without their times.
+    fn stages(&self) -> Vec<PathMark> {
+        self.marks.iter().map(|(mark, _)| *mark).collect()
+    }
+}
+
+impl PathRecorder for Tape {
+    fn mark(&mut self, mark: PathMark) {
+        self.marks.push((mark, MonoNs(self.at)));
+        self.at += self.step;
+    }
+}
+
+const fn mark(stage: PathStage, edge: PathEdge) -> PathMark {
+    PathMark { stage, edge }
+}
+
+const SIGN_START: PathMark = mark(PathStage::Sign, PathEdge::Start);
+const SIGN_END: PathMark = mark(PathStage::Sign, PathEdge::End);
+
+#[test]
+fn encode_marks_its_signer_call_and_its_bytes_are_the_same_whatever_the_stamps_recorded() {
+    // FBC-ji6, decision 0033: the codec marks the start and end of its signer call through
+    // PathStamps, and learns no time from it, so the same command under the same context encodes
+    // to the same bytes whether the marks are recorded at one time, another, or not at all.
+    let cmd = VenueCommand::Place(order(mint()));
+    let at = ctx(1_759_363_200_300_000_000, &[9_000]);
+    let run = |t: &mut PathStamps<'_>| {
+        let mut fx = Effects::new();
+        let receipt = exec_codec().encode(&cmd, RpcId(11), &specs(), &at, t, &mut fx);
+        (receipt.unwrap(), fx.take())
+    };
+    let (mut early, mut late) = (Tape::new(0, 1), Tape::new(1 << 62, 450_000));
+    let off = run(&mut PathStamps::off());
+    assert_eq!(run(&mut PathStamps::new(&mut early)), off);
+    assert_eq!(run(&mut PathStamps::new(&mut late)), off);
+    assert_eq!(off, encode(&cmd, &at).unwrap());
+
+    // Each recorder kept the sign stage at its own times.
+    assert_eq!(
+        early.marks,
+        [(SIGN_START, MonoNs(0)), (SIGN_END, MonoNs(1))]
+    );
+    assert_eq!(late.stages(), [SIGN_START, SIGN_END]);
+    assert_eq!(
+        late.marks[1].1 - late.marks[0].1,
+        Duration::from_nanos(450_000)
+    );
+
+    // A command refused before it is signed marks nothing.
+    let ioc = VenueCommand::Place(NewOrder {
+        tif: TifTag::Ioc,
+        ..order(mint())
+    });
+    let mut refused = Tape::new(0, 1);
+    let mut fx = Effects::new();
+    let t = &mut PathStamps::new(&mut refused);
+    let result = exec_codec().encode(&ioc, RpcId(12), &specs(), &at, t, &mut fx);
+    assert_eq!(result.err(), Some(NotSentReason::Unsupported));
+    assert!(refused.marks.is_empty() && fx.is_empty());
+}
+
+/// A gateway over the toy's codec, as a live one is without its sockets: it marks the encode
+/// stage around the codec's call, hands the codec the same stamps to mark its signer call, and
+/// keeps what the codec asked to send.
+struct ToyGateway {
+    codec: Box<dyn ExecCodec>,
+    next_rpc: u64,
+    sent: Vec<Effect>,
+}
+
+impl OrderGateway for ToyGateway {
+    fn submit(
+        &mut self,
+        _acct: AccountKey,
+        cmd: VenueCommand,
+        ctx: &EncodeCtx,
+        t: &mut PathStamps<'_>,
+    ) -> SubmitHandle {
+        let rpc = RpcId(self.next_rpc);
+        self.next_rpc += 1;
+        let mut fx = Effects::new();
+        t.start(PathStage::Encode);
+        let receipt = self.codec.encode(&cmd, rpc, &specs(), ctx, t, &mut fx);
+        t.end(PathStage::Encode);
+        self.sent.extend(fx.take());
+        SubmitHandle { rpc, receipt }
+    }
+}
+
+#[test]
+fn submit_threads_path_stamps_through_encode_to_the_signer_call() {
+    let mut gateway = ToyGateway {
+        codec: exec_codec(),
+        next_rpc: 11,
+        sent: Vec::new(),
+    };
+    let cmd = VenueCommand::Place(order(mint()));
+    let at = ctx(1_759_363_200_300_000_000, &[9_000]);
+    let mut tape = Tape::new(1_000, 10);
+    let handle = gateway.submit(
+        AccountKey::new(1),
+        cmd.clone(),
+        &at,
+        &mut PathStamps::new(&mut tape),
+    );
+
+    // The sign stage nests inside the encode stage, every mark at the recorder's own time.
+    let (encode_start, encode_end) = (
+        mark(PathStage::Encode, PathEdge::Start),
+        mark(PathStage::Encode, PathEdge::End),
+    );
+    let times = [1_000, 1_010, 1_020, 1_030].map(MonoNs);
+    let marks = [encode_start, SIGN_START, SIGN_END, encode_end];
+    assert_eq!(tape.marks, marks.into_iter().zip(times).collect::<Vec<_>>());
+
+    // The request went out as the codec encodes it without stamps.
+    assert_eq!(handle.rpc, RpcId(11));
+    assert_eq!(handle.receipt.unwrap().nonces(), [(0, 9_000)]);
+    assert_eq!(gateway.sent, encode(&cmd, &at).unwrap().1);
 }
 
 #[test]
@@ -1015,7 +1203,7 @@ fn encode_takes_time_and_nonces_only_from_the_encode_ctx() {
     let wire_cid = encode_cid(&CID_FORMAT, cid).unwrap();
     let frame = format!(
         "rpc=11\nplace|cid={wire_cid}|sym=TOY-PERP|side=B|px=130865|qty=25|po=1|ro=0\
-         |ts=1759363200300000000|nonce=9000"
+         |ts=1759363200300000000|nonce=9000|sig=ed3eb2c5eed9bf85"
     );
     // One frame with its deadline and its command's traffic class; the receipt names the
     // nonce the context reserved, for the OMS to keep.
@@ -1060,8 +1248,9 @@ fn the_toy_charges_its_encode_resync_keepalive_and_subscribe_traffic() {
     // retry), so the runtime can charge each to the right bucket.
     let mut fx = Effects::new();
     let place = VenueCommand::Place(order(mint()));
+    let off = &mut PathStamps::off();
     exec_codec()
-        .encode(&place, RpcId(11), &specs(), &ctx(1, &[1]), &mut fx)
+        .encode(&place, RpcId(11), &specs(), &ctx(1, &[1]), off, &mut fx)
         .unwrap();
     let touch = Subscription {
         inst: INST,

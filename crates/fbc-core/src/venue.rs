@@ -21,6 +21,7 @@ use crate::codec::{
 use crate::command::{NotSentReason, VenueCommand};
 use crate::event::{RpcId, StreamId};
 use crate::ids::{AccountKey, InstrumentId};
+use crate::stamps::PathStamps;
 
 /// Where a configuration key lives.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
@@ -278,8 +279,19 @@ pub struct SubmitHandle {
 /// switch (0013 rule 2, 0012). Nothing implements this trait yet; FBC-ob2 makes that path the
 /// only one (an OMS-issued authorization, or a gateway built only inside `fbc-oms`) before a
 /// live gateway exists.
+///
+/// `t` carries the command's path marks (0033): a live gateway marks
+/// [`PathStage::Encode`](crate::PathStage::Encode) around its call to [`ExecCodec::encode`],
+/// which it hands `t` to mark its signer calls, and its runtime marks
+/// [`PathStage::Write`](crate::PathStage::Write) around the socket write.
 pub trait OrderGateway {
-    fn submit(&mut self, acct: AccountKey, cmd: VenueCommand, ctx: &EncodeCtx) -> SubmitHandle;
+    fn submit(
+        &mut self,
+        acct: AccountKey,
+        cmd: VenueCommand,
+        ctx: &EncodeCtx,
+        t: &mut PathStamps<'_>,
+    ) -> SubmitHandle;
 }
 
 /// A gateway for a venue reachable only through a vendor SDK that owns its own socket. It emits

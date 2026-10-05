@@ -1,0 +1,5 @@
+error[E0616]: field `recorder` of struct `PathStamps` is private
+ --> tests/ui_stamps/recorder_behind_stamps.rs:6:28
+  |
+6 |     let _recorder = &mut t.recorder;
+  |                            ^^^^^^^^ private field
