@@ -49,7 +49,8 @@ SimVenue is two halves joined by a simulated order-entry stream:
   instrument, public channel and liquidity at the fill's wall time, times its notional
   (`InstrumentSpec::notional`), rounded to the nano, written in the stood-in venue's fee sign
   so `DecodeScope::fee` reads it back as a cost. A fee that is not a finite number of nanos
-  fitting an `i128` (a NaN or infinite rate, an overflowing product) is no fee. A placement
+  strictly inside `i128`'s range (a NaN or infinite rate, an overflowing product, or
+  `i128::MIN`, which `DecodeScope::fee` refuses) is no fee. A placement
   that would take a fill without a fee is refused (a fill-or-kill order that cannot fill whole
   takes nothing and needs none); a resting order that a trade would fill without one is
   cancelled by the venue, never filled with an invented fee.
