@@ -53,6 +53,8 @@ enum Twist {
     Mislabelled,
     /// Every command is refused `Unsupported`.
     RefusesAll,
+    /// Every placement is refused `Unsupported`.
+    RefusesPlacements,
     /// A sent request's frames name no rpc.
     Unlabelled,
     /// Every charge names no instrument.
@@ -228,6 +230,10 @@ impl ExecCodec for Twisted {
             }
             (Twist::Mislabelled, Err(NotSentReason::Unsupported)) => {
                 Err(NotSentReason::Unencodable)
+            }
+            (Twist::RefusesPlacements, _) if matches!(cmd, VenueCommand::Place(_)) => {
+                fx.take();
+                Err(NotSentReason::Unsupported)
             }
             (Twist::RefusesAll, _) => {
                 fx.take();
@@ -504,10 +510,7 @@ fn caps_truthful_probes_a_declaration_that_takes_no_order_or_reference_at_all() 
     // Nothing an order can be: the plainest placement is refused, so nothing is varied.
     let no_kinds = Broken::declaring(|caps| order(caps).kinds = TagSet::none());
     let failure = failed(no_kinds.caps_truthful());
-    let what = said(
-        &failure,
-        "OrderCaps declares no order: the plainest placement",
-    );
+    let what = said(&failure, "OrderCaps allows no order: the first it names");
     assert!(what.starts_with("sent"), "{failure}");
     assert!(
         !failure
@@ -523,7 +526,7 @@ fn caps_truthful_probes_a_declaration_that_takes_no_order_or_reference_at_all() 
     });
     let failure = failed(market_only.caps_truthful());
     assert!(said(&failure, "control: a placement").starts_with("refused as NotSent(Unsupported)"));
-    let amend = said(&failure, "OrderCaps declares no limit order to amend");
+    let amend = said(&failure, "OrderCaps allows no limit order to amend");
     assert!(amend.starts_with("sent"), "{failure}");
     assert!(!failure.names("control: an amend"), "{failure}");
 
@@ -547,12 +550,13 @@ fn caps_truthful_probes_a_declaration_that_takes_no_order_or_reference_at_all() 
         assert!(said(&failure, capability).starts_with("sent"), "{failure}");
     }
     assert!(!failure.names("control: an amend"), "{failure}");
+    // A batch of no item: one item is past its limit, and nothing else is probed in it.
     assert!(
-        !failure
-            .breaches
-            .iter()
-            .any(|b| b.capability.starts_with("Batch."))
+        said(&failure, "Batch.max_items is 0").starts_with("sent"),
+        "{failure}"
     );
+    let in_batch = |b: &suite::Breach| b.capability.contains("(a batch item)");
+    assert!(!failure.breaches.iter().any(in_batch), "{failure}");
 
     let no_batch_items = Broken::declaring(|caps| {
         let o = order(caps);
@@ -563,16 +567,10 @@ fn caps_truthful_probes_a_declaration_that_takes_no_order_or_reference_at_all() 
         });
     });
     let failure = failed(no_batch_items.caps_truthful());
-    assert!(
-        said(&failure, "Batch.max_items is 1").starts_with("sent"),
-        "{failure}"
-    );
-    assert!(
-        !failure
-            .breaches
-            .iter()
-            .any(|b| b.capability.starts_with("CancelBatch"))
-    );
+    for capability in ["Batch.max_items is 1", "CancelBatch.max_items is 0"] {
+        assert!(said(&failure, capability).starts_with("sent"), "{failure}");
+    }
+    assert_eq!(failure.breaches.len(), 2, "{failure}");
     // A batch cancel of no item names no reference to encode.
     let probed = match no_batch_items.commands_selfcontained() {
         Ok(Verdict::Passed { probed, .. }) => probed,
@@ -620,6 +618,9 @@ fn a_codec_that_refuses_everything_fails_every_control() {
         "control: a cancel",
         "control: a batch cancel",
         "control: a query",
+        "control: protection (arm)",
+        "control: protection (disarm)",
+        "control: dead-man timer (refresh)",
         "OrderCaps.cancel_all_instrument is Native: never widened",
     ] {
         assert!(
@@ -636,7 +637,9 @@ fn a_codec_that_refuses_everything_fails_every_control() {
         what,
         "refused as NotSent(Unsupported) by a freshly built codec"
     );
-    assert_eq!(failure.breaches.len(), 7, "{failure}");
+    assert_eq!(failure.breaches.len(), 8, "{failure}");
+    let warm = said(&failure, "control: the placement a warm codec sees first");
+    assert!(warm.starts_with("refused as NotSent(Unsupported) though the caps allow it"));
 }
 
 #[test]
@@ -683,6 +686,68 @@ fn a_codec_that_encodes_differently_once_it_saw_the_placement_is_not_self_contai
         Broken::twisted(Twist::Stateful).caps_truthful(),
         Ok(Verdict::Passed { .. })
     ));
+}
+
+#[test]
+fn operations_the_caps_declare_are_controls_the_codec_must_send() {
+    // An account cancel-all and cancel-on-disconnect protection declared, which the toy does
+    // not send: an account cancel-all, and protection without a dead-man timer.
+    let declared = Broken::declaring(|caps| {
+        let o = order(caps);
+        o.cancel_all_account = Support::Native;
+        o.cancel_on_disconnect = CancelOnDisconnect::PerConnection {
+            rearm_on_reconnect: false,
+        };
+    });
+    let failure = failed(declared.caps_truthful());
+    let account = said(&failure, "control: an account cancel-all");
+    assert!(account.starts_with("refused as NotSent(Unsupported) though the caps declare it"));
+    // The toy arms and disarms its protection, and refuses nothing else declared.
+    assert_eq!(failure.breaches.len(), 2, "{failure}");
+    let refresh = "OrderCaps.cancel_on_disconnect has no dead-man timer (refresh)";
+    assert!(said(&failure, refresh).starts_with("sent"), "{failure}");
+}
+
+#[test]
+fn the_control_order_is_the_first_the_caps_allow_not_the_first_they_name() {
+    // An IOC order conflicts with itself here, so the plainest allowed order is FOK, which
+    // the toy does not take: its control fails, rather than the caps reading as allowing none.
+    let ioc_refused = Broken::declaring(|caps| {
+        let o = order(caps);
+        o.tifs = TagSet::of(&[TifTag::Ioc, TifTag::Fok]);
+        o.flag_conflicts = vec![(Feature::Ioc, Feature::Ioc)];
+    });
+    let failure = failed(ioc_refused.caps_truthful());
+    let control = said(&failure, "control: a placement");
+    assert!(control.starts_with("refused as NotSent(Unsupported) though the caps declare it"));
+    assert!(!failure.names("OrderCaps allows no order: the first it names"));
+    // The IOC order is probed as the conflict it is, and the toy sends it.
+    let ioc = said(&failure, "OrderCaps.flag_conflicts has (Ioc, Ioc)");
+    assert_eq!(
+        ioc,
+        "sent (1 effect(s)) where the caps make it NotSent(FlagConflict)"
+    );
+}
+
+#[test]
+fn commands_selfcontained_needs_its_warm_placement_sent_and_skips_amends_of_no_limit_order() {
+    let failure = failed(Broken::twisted(Twist::RefusesPlacements).commands_selfcontained());
+    let warm = said(&failure, "control: the placement a warm codec sees first");
+    assert!(warm.starts_with("refused as NotSent(Unsupported) though the caps allow it"));
+    assert_eq!(failure.breaches.len(), 1, "{failure}");
+
+    // No order allowed: no warm codec and no amend, and the cancels and queries still encode.
+    let no_orders = Broken::declaring(|caps| order(caps).kinds = TagSet::none());
+    let Ok(Verdict::Passed { probed, .. }) = no_orders.commands_selfcontained() else {
+        panic!("cancels and queries are self-contained");
+    };
+    assert!(
+        !probed
+            .iter()
+            .any(|p| p.contains("amend") || p.contains("warm")),
+        "{probed:?}"
+    );
+    assert_eq!(probed.len(), 6, "{probed:?}");
 }
 
 // ---------------------------------------------------------------------------------------------
