@@ -55,9 +55,10 @@ SimVenue is two halves joined by a simulated order-entry stream:
   spread. A level that shrinks by more than the trades printed at its price since it last
   changed is a level cancel, whether a delta or a replacement snapshot shrinks it; each change
   of the level ends what those trades explain, so none carries to a later change, while an
-  update repeating its size is no change; a replacement snapshot also ends what was traded at a
-  level the old or the new book does not reach, whose sizes it cannot compare, and a delta that
-  first shows a level the book did not reach ends what was traded there. The trades at a
+  update repeating its size is no change; a replacement snapshot restates every level, so it
+  ends what was traded at each, even where it repeats a level's size or cannot compare sizes (a
+  level the old or the new book does not reach), and a delta that first shows a level the book
+  did not reach ends what was traded there. The trades at a
   level saturate at an `i64` of lots rather than drop a print.
 - **Fees.** A fill's fee is the consumer's `FeeBook` rate for the simulated account, instrument,
   public channel and liquidity at the fill's wall time, times its notional

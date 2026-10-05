@@ -98,9 +98,9 @@ struct At {
 ///   above the offer a buy, at or below the bid a sell), and ignored inside the spread.
 /// - A trading book's level that shrinks by more than the trades at its price since it last
 ///   changed is a level cancel for the queue model, whether a delta or a replacement snapshot
-///   shrinks it; each change ends what those trades explain, and so does a snapshot at a
-///   level the old or the new book does not reach, whose sizes cannot be compared, and a
-///   delta that first shows a level the book did not reach.
+///   shrinks it; each change ends what those trades explain, and so does every replacement
+///   snapshot, which restates the level even where it repeats its size or cannot compare
+///   sizes, and a delta that first shows a level the book did not reach.
 /// - Every fill's fee is the fee book's rate for the account, instrument, public channel and
 ///   liquidity at the fill's wall time, times its notional, rounded to the nano, written in the
 ///   stood-in venue's fee sign so the codec's [`DecodeScope`](fbc_core::DecodeScope) reads it
@@ -544,7 +544,8 @@ impl SimEngine {
 
     /// A replacement snapshot of `inst`'s trading book completed: each level a resting order
     /// sits at, or trades printed at, changed from its size in the book replaced to its size in
-    /// the snapshot, as a delta would have changed it (Codex r4182154723).
+    /// the snapshot, as a delta would have changed it (Codex r4182154723), and no trade before
+    /// the snapshot explains a later change.
     fn snapshot_end(&mut self, ev: &MdEvent, inst: InstrumentId) -> Result<(), SimError> {
         // The levels a resting order sits at, and those trades printed at since they changed.
         let orders = self.live.values().filter(|o| o.inst == inst);
@@ -561,17 +562,14 @@ impl SimEngine {
         self.books.apply(ev).map_err(SimError::Book)?;
         let mut changed = Ok(());
         for (&(bid, px), before) in held.iter().zip(before) {
-            match (before, size(self, bid, px)) {
-                (Some(before), Some(after)) => {
-                    changed = changed.and(self.level_changed(inst, side(bid), px, before, after));
-                }
-                // Sizes that cannot be compared (a level the old or the new book does not
-                // reach) are still a change at the snapshot (Codex r4182678488): it ends what
-                // the trades printed there explain.
-                _ => {
-                    self.traded.remove(&(inst, bid, px));
-                }
+            if let (Some(before), Some(after)) = (before, size(self, bid, px)) {
+                changed = changed.and(self.level_changed(inst, side(bid), px, before, after));
             }
+            // The snapshot restates every level, so it ends what the trades printed there
+            // explain whatever it shows: a size equal to the one it replaced (Codex
+            // r4184026666), or sizes that cannot be compared, at a level the old or the new
+            // book does not reach (Codex r4182678488).
+            self.traded.remove(&(inst, bid, px));
         }
         changed
     }

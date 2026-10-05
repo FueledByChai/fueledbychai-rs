@@ -2105,3 +2105,30 @@ fn a_trade_the_venue_cannot_charge_spends_nothing_on_the_order_it_cancels() {
     );
     assert_eq!(got.len(), 2, "{got:?}");
 }
+
+#[test]
+fn a_snapshot_repeating_a_levels_size_ends_what_earlier_trades_explain() {
+    // Codex r4184026666: a replacement snapshot restates the level, so its size already
+    // reflects the trades printed before it even when it equals the size it replaced (public
+    // size joined as much as traded); a later shrink with no trade is a level cancel.
+    let mut v = Venue::new(Bracket::Optimistic);
+    v.snapshot(T0, &[(199, 6)], &[(201, 5)]);
+    v.send(limit(cid(), Side::Buy, 199, 2), 1, T0);
+    v.tick(T0 + 5 * MS);
+    assert_eq!(v.answers().len(), 2);
+    // Three of the six ahead trade; the snapshot shows the level at six again.
+    v.trade(T0 + 6 * MS, Aggressor::Seller, 199, 3);
+    v.snapshot(T0 + 7 * MS, &[(199, 6)], &[(201, 5)]);
+    // Three cancelled: the three left ahead go, so a trade of two fills both lots.
+    v.level(T0 + 8 * MS, BookSide::Bid, 199, 3);
+    v.trade(T0 + 9 * MS, Aggressor::Seller, 199, 2);
+    let got = v.answers();
+    assert_eq!(
+        got.iter()
+            .filter_map(|(_, ev)| fill_of(ev))
+            .map(|f| f.1)
+            .sum::<i64>(),
+        2,
+        "{got:?}"
+    );
+}
