@@ -740,10 +740,9 @@ async fn the_endpoint_opens_through_the_consumers_socks5_proxy_by_name() {
 }
 
 #[tokio::test]
-async fn a_nonce_source_that_reserves_another_count_ends_the_session_and_retires_its_epoch() {
+async fn a_nonce_source_that_reserves_another_count_ends_the_session_which_runs_once() {
     let mut server = ScriptedWs::start().await;
-    let floor = ReconnectPacing::new(ms(200), ms(200), 100, Duration::from_secs(60), ms(5_000));
-    let (mut config, _) = setup(ExecToy::leak(), &server.url(), floor.unwrap());
+    let (mut config, _) = setup(ExecToy::leak(), &server.url(), quick());
     let log = Arc::default();
     config.nonces = Box::new(Counting {
         next: 0,
@@ -751,41 +750,25 @@ async fn a_nonce_source_that_reserves_another_count_ends_the_session_and_retires
         log,
     });
     let heard = Log::default();
-    let (mut session, control) = ExecSession::new(config, Keep::new(&heard)).unwrap();
+    let (mut session, _control) = ExecSession::new(config, Keep::new(&heard)).unwrap();
+    let script = async {
+        let mut peer = server.accept().await;
+        // Nothing was sent on the connection.
+        assert_eq!(peer.next().await, None);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
     let short = ExecSessionError::Nonces {
         asked: 2,
         reserved: 1,
     };
-    let mut ended = None;
-    for epoch in 0..2 {
-        let script = async {
-            let mut peer = server.accept().await;
-            let accepted = Instant::now();
-            // Nothing was sent on the connection.
-            assert_eq!(peer.next().await, None);
-            accepted
-        };
-        let (run, accepted) = tokio::join!(session.run(), script);
-        assert_eq!(run.err(), Some(short.clone()));
-        // The connection's epoch is retired, so running again stamps the next connection
-        // under the next epoch (Codex r4188802893), and waits the pacing's floor as after a
-        // drop (Codex r4188995364).
-        assert_eq!(session.current(), key(epoch + 1));
-        if let Some(ended) = ended {
-            assert!(accepted.duration_since(ended) >= ms(200));
-        }
-        ended = Some(Instant::now());
-    }
-    drop(control);
-    let ends: Vec<_> = heard
-        .borrow()
-        .iter()
-        .map(|h| match h {
-            Heard::End(k) => *k,
-            Heard::Event(..) => panic!("{h:?}"),
-        })
-        .collect();
-    assert_eq!(ends, [key(0), key(1)]);
+    assert_eq!(run.err(), Some(short));
+    // Its epoch was retired (Codex r4188802893), and the session runs once: a second call
+    // connects nothing (Codex r4189174493, r4189174502).
+    assert_eq!(session.current(), key(1));
+    assert_eq!(session.run().await.err(), Some(ExecSessionError::Ended));
+    assert!(server.try_accept().is_none());
+    assert_eq!(session.counters().attempts, 1);
+    assert!(matches!(heard.borrow()[..], [Heard::End(k)] if k == key(0)));
 }
 
 #[tokio::test]
@@ -876,43 +859,33 @@ async fn nothing_behind_a_reconnect_on_open_asks_for_is_charged() {
 }
 
 #[tokio::test]
-async fn a_run_dropped_mid_epoch_has_that_epoch_ended_and_retired_by_the_next_run() {
+async fn a_run_dropped_mid_epoch_has_its_epoch_ended_by_the_next_call_or_the_sessions_drop() {
     let mut server = ScriptedWs::start().await;
-    let (config, _) = setup(ExecToy::leak(), &server.url(), quick());
-    let log = Log::default();
-    let (mut session, control) = ExecSession::new(config, Keep::new(&log)).unwrap();
-    let mut first = tokio::select! {
-        _ = session.run() => panic!("the run ended"),
-        peer = async {
-            let mut peer = server.accept().await;
-            let _ = (peer.recv().await, peer.recv().await);
-            peer
-        } => peer,
-    };
-    // The cancelled run left its epoch open: the handler has not been told it ended.
-    assert!(log.borrow().is_empty());
-    assert_eq!(first.next().await, None);
-    let script = async move {
-        let mut second = server.accept().await;
-        let opened = second.recv().await;
-        drop(control);
-        opened
-    };
-    let (run, opened) = tokio::join!(session.run(), script);
-    run.unwrap();
-    assert!(opened.starts_with("auth|ts="));
-    // The next run ended it first and opened the next connection under the next epoch
-    // (Codex r4188995359).
-    let ends: Vec<_> = log
-        .borrow()
-        .iter()
-        .filter_map(|h| match h {
-            Heard::End(k) => Some(*k),
-            Heard::Event(..) => None,
-        })
-        .collect();
-    assert_eq!(ends, [key(0), key(1)]);
-    assert_eq!(session.current(), key(1));
+    for rerun in [true, false] {
+        let (config, _) = setup(ExecToy::leak(), &server.url(), quick());
+        let log = Log::default();
+        let (mut session, _control) = ExecSession::new(config, Keep::new(&log)).unwrap();
+        let mut peer = tokio::select! {
+            _ = session.run() => panic!("the run ended"),
+            peer = async {
+                let mut peer = server.accept().await;
+                let _ = (peer.recv().await, peer.recv().await);
+                peer
+            } => peer,
+        };
+        // The dropped run's socket closed, but its epoch is not yet told ended.
+        assert_eq!(peer.next().await, None);
+        assert!(log.borrow().is_empty());
+        if rerun {
+            // A session runs once: the next call ends the left epoch and connects nothing
+            // (Codex r4188995359).
+            assert_eq!(session.run().await.err(), Some(ExecSessionError::Ended));
+            assert!(server.try_accept().is_none());
+        }
+        // Dropping the session ends it otherwise (Codex r4189174470); never twice.
+        drop(session);
+        assert!(matches!(log.borrow()[..], [Heard::End(k)] if k == key(0)));
+    }
 }
 
 #[tokio::test]
