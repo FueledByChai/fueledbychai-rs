@@ -38,7 +38,8 @@
 //! the pacing. While it waits, the session's timers that fall due fire as they do (an ended
 //! epoch's into nothing), each stamped then, so it takes its place in ingest order, and the
 //! effects a current epoch's codec asks for join the rest of the batch, as an HTTP result's
-//! do. A timer due at the same instant as the window fires first.
+//! do. A timer due no later than the window fires first, even when the session runs again only
+//! after both are past; one due after it does not fire into the codec.
 //!
 //! **Liveness (0033).** On a socket endpoint, each epoch sends its codec's [`Keepalive`] every
 //! interval the codec declares (a WebSocket ping, or the codec's own frame as Safety traffic),
@@ -1260,8 +1261,8 @@ impl<H: MdHandler> MdSession<H> {
 
     /// Writes `message` on `ws`; false when the write failed, did not complete within the
     /// write-stall window (counted), or the control's drop interrupted it. Requests in flight
-    /// keep going while the write waits, and timers fire as they fall due (FBC-ha3), a timer
-    /// due with the window first. A result that comes back, or a current epoch's timer that
+    /// keep going while the write waits, and timers due no later than the window fire as they
+    /// fall due (FBC-ha3), before the window ends it. A result that comes back, or a current epoch's timer that
     /// fires, meanwhile reaches the codec at once, so the handler gets its events in the shard's
     /// ingest order (Codex r4177698441). A request the codec asks for then starts at once, its
     /// timeout running from now (Codex r4177887264); its other effects join `effects`, behind
@@ -1282,7 +1283,10 @@ impl<H: MdHandler> MdSession<H> {
         let send = ws.send(message);
         tokio::pin!(send);
         loop {
+            // Only a timer due no later than the window: one due after it waits for the epoch's
+            // end, even when the session first runs again past both (Codex r4180583622).
             let timer = self.next_deadline();
+            let timer = timer.filter(|at| stalled.is_none_or(|stalled| *at <= stalled));
             let woke = tokio::select! {
                 biased;
                 sent = &mut send => return Ok(sent.is_ok()),
