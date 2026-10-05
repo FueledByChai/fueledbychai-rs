@@ -92,7 +92,8 @@ struct At {
 ///   good-till-cancelled order that would rest where the book does not know the size (past
 ///   its depth or window) is refused whole (`no_book`), the part that would cross included,
 ///   since its queue position cannot be set. A resting order queues behind the level's size
-///   less the trades printed at its price whose shrink the level has not shown yet.
+///   less the trades printed at its price whose shrink the level has not shown yet; a trade
+///   printed through a level counts as taking all of it.
 /// - A cancel ends a resting order; one the venue has ended is refused `AlreadyTerminal`, one
 ///   it never had `NotFound`.
 /// - A public trade on a trading book fills resting orders through the queue model, as the
@@ -640,7 +641,28 @@ impl SimEngine {
                 }
             }
         };
-        let key = (inst, taker == Side::Sell, px);
+        // A print through a level emptied it first (Codex r4184546701): each known level the
+        // taker's side shows at a better price than the print's is credited with its whole
+        // size, so its removal is explained and an order arriving there queues behind none of
+        // it.
+        let top = book.top(usize::MAX).map(|top| match taker {
+            Side::Buy => top.asks,
+            Side::Sell => top.bids,
+        });
+        let through = top
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|lvl| match taker {
+                Side::Buy => lvl.px < px,
+                Side::Sell => lvl.px > px,
+            });
+        let bid = taker == Side::Sell;
+        let emptied: Vec<_> = through.map(|lvl| ((inst, bid, lvl.px), lvl.qty)).collect();
+        for (key, size) in emptied {
+            let traded = self.traded.entry(key).or_insert(Lots::ZERO);
+            *traded = (*traded).max(size);
+        }
+        let key = (inst, bid, px);
         let traded = self.traded.get(&key).copied().unwrap_or(Lots::ZERO);
         // Saturated, never dropped (Codex r4182448176): past an i64 of lots the trades
         // explain any shrink a level can show.
