@@ -36,6 +36,9 @@
 //!   answered as the consumer's own. A resync (0049) is answered in one frame: the resting
 //!   orders, the position the fills imply in each instrument, and the request's wall time as
 //!   the watermark.
+//!   Answers are ordered by the stood-in venue's ordering key, fills carry the realized P&L
+//!   and funding its fills declare, and a venue whose fills are derived from order status gets
+//!   order updates in their place (0050).
 //!
 //! Every number SimVenue uses, its capabilities, latency, bracket and fee rates included, is in
 //! the consumer's [`SimConfig`]. Not here yet: hosting in the runtime (FBC-6mf) and replay

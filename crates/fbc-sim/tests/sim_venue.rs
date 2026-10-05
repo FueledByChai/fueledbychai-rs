@@ -15,6 +15,11 @@
 //! configured latency with its begin carrying the request's wall time, one order per resting
 //! order with its cumulative fill, one position per instrument equal to the signed sum of its
 //! fills, and its end (decision 0049).
+//!
+//! FBC-938's done line: answers carry a venue timestamp, a block time or no ordering key as
+//! the stood-in venue declares; fills carry realized P&L and realized funding where it declares
+//! them and `None` where not; a derived-fills venue's fills arrive only as order updates; and
+//! each of those venues is placed through the codec rather than refused (decision 0050).
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
@@ -24,18 +29,18 @@ use fbc_core::{
     AccountKey, AckLevel, AckModel, Aggressor, AmendAck, AmendCaps, AmendOrder, AmendQty, AssetSym,
     Batch, BookId, BookSide, Bps, CancelBatch, CancelOnDisconnect, CancelOrder, CancelReason,
     CancelScope, Channel, CidMatch, CidMint, ClientIdFormat, ClientOrderId, ConnKey, ConnTopology,
-    CtxCall, DecodeError, Effect, Effects, EncodeCtx, Encoding, Envelope, ExecCaps, ExecCodec,
-    ExecEvent, ExecSink, Feature, FeeBook, FeeEntry, FeeKey, FeeRate, FeeSource, Feed, FeedHealth,
-    FeedSource, FillCaps, FillIdent, FillSource, FundingCaps, FundingSpec, HttpFailure, HttpTag,
-    Inbound, InboundSpans, InstrumentId, InstrumentKind, InstrumentSpec, ItemRef, Liquidity,
-    Liquidity3, Lots, MatchingCaps, MdCaps, MdEvent, MonoNs, Namespace, NamespaceLease, NewOrder,
-    NonceBlock, NonceScope, NotAmendable, NotSentReason, OpKind, OrderCaps, OrderKind,
-    OrderKindTag, OrderRef, OrderUpdate, OrderingKey, PathStamps, PriceGrid, QueryOrder,
-    RateCharge, RawFrame, Readiness, RefKind, RejectKind, RpcCall, RpcId, Side, SignedLots,
-    SizeStep, SnapshotSource, SpecTable, SpeedBump, SpeedBumpScope, Stamp, StpScope, StreamId,
-    SubmitOutcome, Support, TagSet, TerminalHint, Ticks, Tif, TifTag, TimerTag, TradeCaps,
-    TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueCommand, VenueFeeSign, VenueId,
-    VenueMeta, VenueOrderId, VenueOrderState, WallNs, dispatch,
+    CtxCall, DecodeError, Effect, Effects, EncodeCtx, Encoding, Envelope, ExchNs, ExchTsKind,
+    ExecCaps, ExecCodec, ExecEvent, ExecSink, Feature, FeeBook, FeeEntry, FeeKey, FeeRate,
+    FeeSource, Feed, FeedHealth, FeedSource, FillCaps, FillIdent, FillSource, FundingCaps,
+    FundingSpec, HttpFailure, HttpTag, Inbound, InboundSpans, InstrumentId, InstrumentKind,
+    InstrumentSpec, ItemRef, Liquidity, Liquidity3, Lots, MatchingCaps, MdCaps, MdEvent, MonoNs,
+    Namespace, NamespaceLease, NewOrder, NonceBlock, NonceScope, NotAmendable, NotSentReason,
+    OpKind, OrderCaps, OrderKind, OrderKindTag, OrderRef, OrderUpdate, OrderingKey, PathStamps,
+    PriceGrid, QueryOrder, RateCharge, RawFrame, Readiness, RefKind, RejectKind, RpcCall, RpcId,
+    Side, SignedLots, SizeStep, SnapshotSource, SpecTable, SpeedBump, SpeedBumpScope, Stamp,
+    StpScope, StreamId, SubmitOutcome, Support, TagSet, TerminalHint, Ticks, Tif, TifTag, TimerTag,
+    TradeCaps, TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueCommand, VenueFeeSign,
+    VenueId, VenueMeta, VenueOrderId, VenueOrderState, WallNs, dispatch,
 };
 use fbc_sim::{
     Answer, Bracket, InjectedOrder, OrderKey, QueueConfig, QueueError, SimCodec, SimConfig,
@@ -1942,11 +1947,10 @@ fn a_two_phase_venue_is_not_stood_in_for_yet() {
 }
 
 #[test]
-fn a_venue_whose_events_the_engine_cannot_say_yet_is_not_stood_in_for() {
-    // Codex r4182991971, r4182991978: the engine orders its answers by a venue sequence and
-    // keeps no position, and sends fills of their own; a venue ordered otherwise, whose fills
-    // carry realized P&L or funding, or whose fills are derived from order status, gets no
-    // placement rather than events unlike its own (FBC-938). Cancels still go.
+fn a_venue_ordered_otherwise_with_realized_values_or_derived_fills_is_stood_in_for() {
+    // FBC-938 (Codex r4182991971, r4182991978): the engine orders its answers by the key the
+    // stood-in venue declares, reports the realized values its fills carry, and sends a
+    // derived-fills venue's fills as order updates, so the codec places for each of them.
     let changes: [&dyn Fn(&mut SimConfig); 6] = [
         &|c| c.exec.order.ordering_key = OrderingKey::VenueTs,
         &|c| c.exec.order.ordering_key = OrderingKey::BlockTime,
@@ -1959,9 +1963,7 @@ fn a_venue_whose_events_the_engine_cannot_say_yet_is_not_stood_in_for() {
         let mut config = config(Bracket::Optimistic, VenueFeeSign::PositiveIsCost, fees());
         change(&mut config);
         let mut v = Venue::with(config);
-        let refused = v.encode(&limit(cid(), Side::Buy, 199, 1), 1, T0);
-        assert_eq!(refused.err(), Some(NotSentReason::Unsupported));
-        assert!(v.encode(&cancel(OrderRef::Client(cid())), 2, T0).is_ok());
+        assert!(v.encode(&limit(cid(), Side::Buy, 199, 1), 1, T0).is_ok());
     }
 }
 
@@ -3902,4 +3904,286 @@ fn the_engine_refuses_a_resync_frame_it_cannot_read() {
     }
     v.tick(T0);
     assert!(v.frames().is_empty());
+}
+
+impl Venue {
+    /// The engine's answers since the last call, each decoded with the venue meta the codec
+    /// gives it and its due time.
+    fn metas(&mut self) -> Vec<(MonoNs, VenueMeta, ExecEvent)> {
+        let mut out = Vec::new();
+        for answer in self.engine.take_answers() {
+            for (meta, ev) in self.decode(&answer.frame).unwrap() {
+                out.push((answer.at, meta, ev));
+            }
+        }
+        out
+    }
+}
+
+/// A venue whose events are ordered by `key`.
+fn keyed(key: OrderingKey) -> Venue {
+    let mut keyed = config(Bracket::Pessimistic, VenueFeeSign::PositiveIsCost, fees());
+    keyed.exec.order.ordering_key = key;
+    Venue::with(keyed)
+}
+
+#[test]
+fn answers_carry_the_ordering_key_the_stood_in_venue_declares() {
+    let sent = T0 + MS;
+    let acted = sent + 5 * MS;
+    let traded = T0 + 20 * MS;
+    let at = |mono: u64| VenueMeta {
+        exch_ts: Some(ExchNs(WALL0 + mono as i64)),
+        exch_ts_kind: ExchTsKind::MatchingEngine,
+        venue_seq: None,
+    };
+    let seq = |n: u64| VenueMeta {
+        exch_ts: None,
+        exch_ts_kind: ExchTsKind::Unknown,
+        venue_seq: Some(n),
+    };
+    for key in [
+        OrderingKey::VenueSeq,
+        OrderingKey::VenueTs,
+        OrderingKey::BlockTime,
+        OrderingKey::None,
+    ] {
+        let mut v = keyed(key);
+        v.snapshot(T0, &[(199, 1)], &[(201, 5)]);
+        // Placed through the codec, never refused, and answered when the venue acts.
+        v.send(limit(cid(), Side::Buy, 199, 2), 1, sent);
+        v.tick(acted);
+        // One lot ahead, then a trade of two fills one of ours as the maker.
+        v.trade(traded, Aggressor::Seller, 199, 2);
+        let got = v.metas();
+        let kinds: Vec<_> = got
+            .iter()
+            .map(|(_, _, ev)| match ev {
+                ExecEvent::Outcome { .. } => "outcome",
+                ExecEvent::Order(_) => "order",
+                ExecEvent::Fill(_) => "fill",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["outcome", "order", "fill", "order"], "{key:?}");
+        let metas: Vec<_> = got.iter().map(|(_, meta, _)| *meta).collect();
+        // A venue sequence for a sequenced venue; the instant the venue acted, on the
+        // command's answers and on the trade's, as its timestamp or its block time; and
+        // nothing for a venue that orders its events by nothing.
+        let expected = match key {
+            OrderingKey::VenueSeq => [seq(0), seq(1), seq(2), seq(3)],
+            OrderingKey::VenueTs | OrderingKey::BlockTime => {
+                [at(acted), at(acted), at(traded), at(traded)]
+            }
+            OrderingKey::None => [VenueMeta::NONE; 4],
+        };
+        assert_eq!(metas, expected, "{key:?}");
+    }
+}
+
+#[test]
+fn the_codec_refuses_an_answer_without_the_time_its_venue_orders_by() {
+    for key in [OrderingKey::VenueTs, OrderingKey::BlockTime] {
+        let mut v = keyed(key);
+        for frame in ["done|seq=1|rpc=1", "done|seq=1|ts=x|rpc=1"] {
+            assert_eq!(
+                v.decode(frame.as_bytes()),
+                Err(DecodeError::Malformed("ts")),
+                "{key:?} {frame}"
+            );
+        }
+        let got = v.decode(b"done|seq=1|ts=7|rpc=1").unwrap();
+        assert_eq!(got[0].0.exch_ts, Some(ExchNs(7)));
+    }
+    // A venue ordered by sequence, or by nothing, needs no time.
+    for key in [OrderingKey::VenueSeq, OrderingKey::None] {
+        assert!(keyed(key).decode(b"done|seq=1|rpc=1").is_ok());
+    }
+    // Realized values that cannot be read are refused, whatever the venue declares.
+    let mut v = keyed(OrderingKey::VenueSeq);
+    let fill = "fill|seq=1|fid=F1|cid=c|vid=S1|inst=1|side=S|px=1|qty=1|cum=1|liq=M|fee=0";
+    for (extra, what) in [("pnl=x", "pnl"), ("fund=x", "fund")] {
+        let frame = format!("{fill}|{extra}|asset=USDC");
+        assert_eq!(
+            v.decode(frame.as_bytes()),
+            Err(DecodeError::Malformed(what)),
+            "{frame}"
+        );
+    }
+}
+
+/// The notional of `qty` lots at `px` on the trading instrument, in nanos of USDC.
+fn notional(px: i64, qty: i64) -> i128 {
+    let spec = spec(INST, "SIM-PERP");
+    spec.notional(Ticks(px), lots(qty)).unwrap().nanos
+}
+
+/// A venue whose fills carry realized P&L where `pnl` and realized funding where `funding`.
+fn realizing(pnl: bool, funding: bool) -> Venue {
+    let mut realizing = config(Bracket::Pessimistic, VenueFeeSign::PositiveIsCost, fees());
+    realizing.exec.fills.realized_pnl = pnl;
+    realizing.exec.fills.realized_funding = funding;
+    Venue::with(realizing)
+}
+
+fn ioc(side: Side, px: i64, qty: i64) -> VenueCommand {
+    let kind = OrderKind::Limit { px: Ticks(px) };
+    place(cid(), side, kind, qty, TifTag::Ioc, false)
+}
+
+/// Each fill since the last call.
+fn fills(v: &mut Venue) -> Vec<fbc_core::FillEvent> {
+    let got = v.answers().into_iter().map(|(_, ev)| ev);
+    let fill = |ev| match ev {
+        ExecEvent::Fill(f) => Some(f),
+        _ => None,
+    };
+    got.filter_map(fill).collect()
+}
+
+#[test]
+fn fills_carry_realized_pnl_and_funding_where_the_stood_in_venue_declares_them() {
+    let usd = |nanos| Some(fbc_core::Money::new(nanos, usdc()));
+    for (pnl, funding) in [(true, true), (true, false), (false, true), (false, false)] {
+        let mut v = realizing(pnl, funding);
+        v.snapshot(T0, &[(199, 5), (198, 5)], &[(201, 3), (202, 5)]);
+        // Two lots bought at 201: an opening fill realizes nothing.
+        v.send(ioc(Side::Buy, 201, 2), 1, T0);
+        v.tick(T0 + 5 * MS);
+        let opened = fills(&mut v);
+        // Three sold at 199: two close the long at a loss of 2 ticks a lot, and one opens a
+        // short, at 199.
+        v.send(ioc(Side::Sell, 199, 3), 2, T0 + 10 * MS);
+        v.tick(T0 + 15 * MS);
+        let flipped = fills(&mut v);
+        // A bid resting at 198 behind five lots, filled for one as the maker by a trade of
+        // six, closes the short a tick lower: a gain.
+        v.send(limit(cid(), Side::Buy, 198, 1), 3, T0 + 20 * MS);
+        v.tick(T0 + 25 * MS);
+        v.answers();
+        v.trade(T0 + 30 * MS, Aggressor::Seller, 198, 6);
+        let closed = fills(&mut v);
+        let got: Vec<_> = [opened, flipped, closed]
+            .concat()
+            .into_iter()
+            .map(|f| (f.liquidity, f.realized_pnl, f.realized_funding))
+            .collect();
+        let say = |gain: i128| pnl.then(|| usd(gain)).flatten();
+        // The engine accrues no funding, so a fill realizes none: zero where declared.
+        let paid = funding.then(|| usd(0)).flatten();
+        assert_eq!(
+            got,
+            [
+                (Liquidity3::Taker, say(0), paid),
+                (
+                    Liquidity3::Taker,
+                    say(notional(199, 2) - notional(201, 2)),
+                    paid
+                ),
+                (
+                    Liquidity3::Maker,
+                    say(notional(199, 1) - notional(198, 1)),
+                    paid
+                ),
+            ],
+            "pnl {pnl}, funding {funding}"
+        );
+        if pnl {
+            assert_eq!(got[1].1, usd(-1_000_000_000), "a loss of 1 USDC");
+            assert_eq!(got[2].1, usd(250_000_000), "a gain of 0.25 USDC");
+        }
+    }
+}
+
+#[test]
+fn a_position_whose_cost_overflows_reports_no_realized_pnl_until_it_is_flat() {
+    // A lot so large that two fills of two lots' notional pass an i128 of nanos together.
+    let mut huge = config(Bracket::Pessimistic, VenueFeeSign::PositiveIsCost, fees());
+    huge.exec.fills.realized_pnl = true;
+    let mut table = SpecTable::new();
+    let mut big = spec(INST, "SIM-PERP");
+    big.multiplier = Decimal::from_i128_with_scale(10_i128.pow(27), 0);
+    let size = |px| big.notional(Ticks(px), lots(2)).unwrap().nanos;
+    let (bought, sold) = (size(201), size(199));
+    assert!(bought.checked_add(bought).is_none());
+    table.insert(big.clone());
+    huge.specs = table;
+    let mut v = Venue::with(huge);
+    v.snapshot(T0, &[(199, 50)], &[(201, 50)]);
+    let mut realized = Vec::new();
+    for (n, (side, px)) in [
+        (Side::Buy, 201),
+        (Side::Buy, 201),
+        (Side::Sell, 199),
+        (Side::Sell, 199),
+        (Side::Buy, 201),
+        (Side::Sell, 199),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let at = T0 + 10 * MS * n as u64;
+        v.send(ioc(side, px, 2), n as u64, at);
+        v.tick(at + 5 * MS);
+        let got = fills(&mut v);
+        assert_eq!(got.len(), 1, "fill {n}");
+        realized.push(got[0].realized_pnl.as_ref().map(|m| m.nanos));
+    }
+    // The first opens; the second opens too, but the position's cost no longer fits, so the
+    // two closing fills cannot say what they realized. Flat again, the next round trip can.
+    assert_eq!(
+        realized,
+        [Some(0), Some(0), None, None, Some(0), Some(sold - bought)]
+    );
+}
+
+#[test]
+fn a_derived_fills_venue_reports_its_fills_only_as_order_updates() {
+    let mut derived = config(Bracket::Middle, VenueFeeSign::PositiveIsCost, fees());
+    derived.exec.fills.source = FillSource::DerivedFromOrderStatus;
+    let mut v = Venue::with(derived);
+    v.snapshot(T0, &[(199, 5)], &[(201, 3), (202, 2), (203, 5)]);
+    // Seven bought up to 202: three at 201 and two at 202 as the taker, two rest at 202.
+    let buy = place(
+        cid(),
+        Side::Buy,
+        OrderKind::Limit { px: Ticks(202) },
+        7,
+        TifTag::Gtc,
+        false,
+    );
+    v.send(buy, 1, T0);
+    v.tick(T0 + 5 * MS);
+    let got = v.answers();
+    assert_eq!(outcome_of(&got[0].1), Some((1, ACCEPTED)));
+    let states: Vec<_> = got[1..].iter().map(|(_, ev)| state_of(ev)).collect();
+    assert_eq!(
+        states,
+        [
+            Some((VenueOrderState::Open, 3)),
+            Some((VenueOrderState::Open, 5))
+        ]
+    );
+    // A trade fills one of the resting two as the maker: its order update carries it.
+    v.trade(T0 + 6 * MS, Aggressor::Seller, 202, 1);
+    let got = v.answers();
+    let states: Vec<_> = got.iter().map(|(_, ev)| state_of(ev)).collect();
+    assert_eq!(states, [Some((VenueOrderState::Open, 6))]);
+    // A market order filled whole at one level: one update, its last.
+    let market = place(cid(), Side::Buy, OrderKind::Market, 1, TifTag::Ioc, false);
+    v.send(market, 2, T0 + 10 * MS);
+    v.tick(T0 + 15 * MS);
+    let got = v.answers();
+    let states: Vec<_> = got[1..].iter().map(|(_, ev)| state_of(ev)).collect();
+    assert_eq!(states, [Some((VenueOrderState::Filled, 1))]);
+    // No fill event was ever sent, yet the fills still make the position.
+    assert!(v.frames.iter().all(|a| !a.frame.starts_with(b"fill")));
+    v.resync(T0 + 20 * MS);
+    v.tick(T0 + 30 * MS);
+    let got = v.frames();
+    assert!(got[0].1.contains(&ExecEvent::ResyncPosition {
+        inst: INST,
+        qty: SignedLots(7),
+        avg_entry: None,
+    }));
 }

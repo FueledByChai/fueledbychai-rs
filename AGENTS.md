@@ -244,7 +244,9 @@ rather than guess.
     shard's envelopes (its own books) and those frames, crossing, queueing and filling orders
     and answering after the consumer's `SimLatency`, fees from the consumer's `FeeBook`, all from
     a `SimConfig` with no `Default`, and a resync answered with the resting orders and the
-    positions the fills imply, 0049; still planned: amends, batches, queries and injected
+    positions the fills imply, 0049, answers ordered by the stood-in venue's key with realized
+    P&L and funding on fills where it declares them and derived fills as order updates, 0050;
+    still planned: amends, batches, queries and injected
     orders, FBC-nv2), `crates/fbc-conformance` (the adapter conformance kit,
     0025; it depends on `fbc-runtime` and `fbc-core`, never on a venue crate: so
     far a public stub venue server on 127.0.0.1 ephemeral ports, a WebSocket endpoint that plays
