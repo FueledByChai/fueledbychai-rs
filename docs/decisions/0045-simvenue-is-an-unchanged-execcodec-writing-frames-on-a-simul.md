@@ -23,7 +23,9 @@ SimVenue is two halves joined by a simulated order-entry stream:
   timeout, traffic class and rate charge, like any venue), stamped with the encode's
   `EncodeCtx` wall and monotonic time; `on_frame` decodes each answer frame into an `Outcome`,
   `OrderUpdate` or `FillEvent` through `DecodeScope` only, so venue ids, fill ids and fees are
-  built as a real codec builds them (0004). It refuses what the stood-in venue's `OrderCaps`
+  built as a real codec builds them (0004), and says only what the stood-in venue's
+  `FillCaps` report: without fill ids a fill is `FillIdent::Derived`, and without a liquidity
+  flag its liquidity is `Unknown`. It refuses what the stood-in venue's `OrderCaps`
   do not offer, and an order combining features they declare in `flag_conflicts`
   (`NotSent(FlagConflict)`). The frames are text records whose values are escaped, so no
   value (an asset symbol, a venue id) can split a record.
@@ -44,7 +46,8 @@ SimVenue is two halves joined by a simulated order-entry stream:
   is classified against the touch and ignored inside the spread. A level that shrinks by more
   than the trades printed at its price since it last changed is a level cancel, whether a
   delta or a replacement snapshot shrinks it; each change of the level ends what those trades
-  explain, so none carries to a later change.
+  explain, so none carries to a later change, while an update repeating its size is no change.
+  The trades at a level saturate at an `i64` of lots rather than drop a print.
 - **Fees.** A fill's fee is the consumer's `FeeBook` rate for the simulated account,
   instrument, public channel and liquidity at the fill's wall time, times its notional
   (`InstrumentSpec::notional`), rounded to the nano, written in the stood-in venue's fee sign

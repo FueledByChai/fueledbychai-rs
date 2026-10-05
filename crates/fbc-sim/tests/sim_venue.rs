@@ -14,15 +14,16 @@ use fbc_core::{
     CancelOnDisconnect, CancelOrder, CancelReason, Channel, CidMatch, CidMint, ClientIdFormat,
     ClientOrderId, ConnKey, ConnTopology, CtxCall, DecodeError, Effect, Effects, EncodeCtx,
     Encoding, Envelope, ExecCaps, ExecCodec, ExecEvent, ExecSink, Feature, FeeBook, FeeEntry,
-    FeeKey, FeeRate, FeeSource, Feed, FeedHealth, FeedSource, FillCaps, FillSource, FundingCaps,
-    FundingSpec, HttpFailure, HttpTag, Inbound, InboundSpans, InstrumentId, InstrumentKind,
-    InstrumentSpec, ItemRef, Liquidity, Liquidity3, Lots, MatchingCaps, MdCaps, MdEvent, MonoNs,
-    Namespace, NamespaceLease, NewOrder, NonceBlock, NonceScope, NotSentReason, OpKind, OrderCaps,
-    OrderKind, OrderKindTag, OrderRef, OrderingKey, PathStamps, PriceGrid, RateCharge, RawFrame,
-    Readiness, RefKind, RejectKind, RpcCall, RpcId, Side, SizeStep, SnapshotSource, SpecTable,
-    Stamp, StpScope, StreamId, SubmitOutcome, Support, TagSet, TerminalHint, Ticks, Tif, TifTag,
-    TimerTag, TradeCaps, TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueCommand,
-    VenueFeeSign, VenueId, VenueMeta, VenueOrderState, WallNs, dispatch,
+    FeeKey, FeeRate, FeeSource, Feed, FeedHealth, FeedSource, FillCaps, FillIdent, FillSource,
+    FundingCaps, FundingSpec, HttpFailure, HttpTag, Inbound, InboundSpans, InstrumentId,
+    InstrumentKind, InstrumentSpec, ItemRef, Liquidity, Liquidity3, Lots, MatchingCaps, MdCaps,
+    MdEvent, MonoNs, Namespace, NamespaceLease, NewOrder, NonceBlock, NonceScope, NotSentReason,
+    OpKind, OrderCaps, OrderKind, OrderKindTag, OrderRef, OrderingKey, PathStamps, PriceGrid,
+    RateCharge, RawFrame, Readiness, RefKind, RejectKind, RpcCall, RpcId, Side, SizeStep,
+    SnapshotSource, SpecTable, Stamp, StpScope, StreamId, SubmitOutcome, Support, TagSet,
+    TerminalHint, Ticks, Tif, TifTag, TimerTag, TradeCaps, TradingStatus, TrafficClass,
+    UnderlyingId, VenueCaps, VenueCommand, VenueFeeSign, VenueId, VenueMeta, VenueOrderState,
+    WallNs, dispatch,
 };
 use fbc_sim::{
     Answer, Bracket, OrderKey, QueueConfig, QueueError, SimCodec, SimConfig, SimEngine, SimError,
@@ -1686,4 +1687,81 @@ fn a_fee_of_exactly_i128_min_nanos_is_no_fee() {
     let got = v.answers();
     assert_eq!(got.len(), 1, "{got:?}");
     assert_eq!(rejected(&got[0].1), Some(RejectKind::Other));
+}
+
+#[test]
+fn fills_say_only_what_the_stood_in_venue_reports() {
+    // Codex r4182448147, r4182448157: a venue without fill ids keys its fills by order and
+    // cumulative quantity, and one without a liquidity flag does not say maker or taker.
+    let mut bare = config(Bracket::Optimistic, VenueFeeSign::PositiveIsCost, fees());
+    bare.exec.fills.fill_id = false;
+    bare.exec.fills.liquidity_flag = false;
+    let mut v = Venue::with(bare);
+    v.snapshot(T0, &[(198, 1)], &[(201, 2)]);
+    v.send(
+        place(cid(), Side::Buy, OrderKind::Market, 1, TifTag::Ioc, false),
+        1,
+        T0,
+    );
+    v.tick(T0 + 5 * MS);
+    let got = v.answers();
+    let ExecEvent::Outcome {
+        item: Some(ItemRef { vid: Some(vid), .. }),
+        ..
+    } = &got[0].1
+    else {
+        panic!("{got:?}")
+    };
+    let ExecEvent::Fill(f) = &got[1].1 else {
+        panic!("{got:?}")
+    };
+    let derived = FillIdent::Derived {
+        vid: vid.clone(),
+        cum_after: lots(1),
+    };
+    assert_eq!((&f.ident, f.liquidity), (&derived, Liquidity3::Unknown));
+}
+
+#[test]
+fn a_repeated_level_keeps_what_the_trades_explain() {
+    // Codex r4182448165: a level update that repeats the level's size changes nothing, so the
+    // trades printed at it still explain its next shrink.
+    let mut v = Venue::new(Bracket::Optimistic);
+    v.snapshot(T0, &[(199, 6)], &[(201, 5)]);
+    v.send(limit(cid(), Side::Buy, 199, 2), 1, T0);
+    v.tick(T0 + 5 * MS);
+    assert_eq!(v.answers().len(), 2);
+    v.trade(T0 + 6 * MS, Aggressor::Seller, 199, 3);
+    v.level(T0 + 7 * MS, BookSide::Bid, 199, 6);
+    v.level(T0 + 8 * MS, BookSide::Bid, 199, 3);
+    // Three traded of the six ahead: three remain, so a trade of three fills nothing.
+    v.trade(T0 + 9 * MS, Aggressor::Seller, 199, 3);
+    let got = v.answers();
+    assert_eq!(
+        got.iter().filter_map(|(_, ev)| fill_of(ev)).count(),
+        0,
+        "{got:?}"
+    );
+}
+
+#[test]
+fn trades_past_an_i64_of_lots_still_explain_a_shrink() {
+    // Codex r4182448176: the trades at a level saturate rather than drop a print, so a later
+    // shrink they explain is no cancel.
+    let mut v = Venue::new(Bracket::Optimistic);
+    v.snapshot(T0, &[(199, 10)], &[(201, 5)]);
+    v.trade(T0 + MS, Aggressor::Seller, 199, 1);
+    v.trade(T0 + MS, Aggressor::Seller, 199, i64::MAX);
+    v.send(limit(cid(), Side::Buy, 199, 2), 1, T0 + 2 * MS);
+    v.tick(T0 + 7 * MS);
+    assert_eq!(v.answers().len(), 2);
+    v.level(T0 + 8 * MS, BookSide::Bid, 199, 5);
+    // Ten ahead and none of it cancelled: a trade of seven fills nothing.
+    v.trade(T0 + 9 * MS, Aggressor::Seller, 199, 7);
+    let got = v.answers();
+    assert_eq!(
+        got.iter().filter_map(|(_, ev)| fill_of(ev)).count(),
+        0,
+        "{got:?}"
+    );
 }

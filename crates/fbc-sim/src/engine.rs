@@ -507,16 +507,15 @@ impl SimEngine {
     }
 
     /// A replacement snapshot of `inst`'s trading book completed: each level a resting order
-    /// sits at changed from its size in the book replaced to its size in the snapshot, as a
-    /// delta would have changed it (Codex r4182154723), and the trades printed before it
-    /// explain no later change.
+    /// sits at, or trades printed at, changed from its size in the book replaced to its size in
+    /// the snapshot, as a delta would have changed it (Codex r4182154723).
     fn snapshot_end(&mut self, ev: &MdEvent, inst: InstrumentId) -> Result<(), SimError> {
-        let held: BTreeSet<(bool, Ticks)> = self
-            .live
-            .values()
-            .filter(|o| o.inst == inst)
-            .map(|o| (o.side == Side::Buy, o.px))
-            .collect();
+        // The levels a resting order sits at, and those trades printed at since they changed.
+        let orders = self.live.values().filter(|o| o.inst == inst);
+        let mut held: BTreeSet<(bool, Ticks)> =
+            orders.map(|o| (o.side == Side::Buy, o.px)).collect();
+        let traded = self.traded.keys().filter(|key| key.0 == inst);
+        held.extend(traded.map(|&(_, bid, px)| (bid, px)));
         let side = |bid| if bid { BookSide::Bid } else { BookSide::Ask };
         let size = |engine: &SimEngine, bid, px| {
             let book = engine.trading_book(inst);
@@ -530,7 +529,6 @@ impl SimEngine {
                 changed = changed.and(self.level_changed(inst, side(bid), px, before, after));
             }
         }
-        self.traded.retain(|key, _| key.0 != inst);
         changed
     }
 
@@ -546,6 +544,11 @@ impl SimEngine {
         before: Lots,
         after: Lots,
     ) -> Result<(), SimError> {
+        // A repeat of the level's size is no change (Codex r4182448165): the trades still
+        // explain its next one.
+        if before == after {
+            return Ok(());
+        }
         let traded = self.traded.remove(&(inst, side == BookSide::Bid, px));
         let shrunk = before.checked_sub(after).unwrap_or(Lots::ZERO);
         let cancelled = shrunk
@@ -584,8 +587,10 @@ impl SimEngine {
         };
         let key = (inst, taker == Side::Sell, px);
         let traded = self.traded.get(&key).copied().unwrap_or(Lots::ZERO);
+        // Saturated, never dropped (Codex r4182448176): past an i64 of lots the trades
+        // explain any shrink a level can show.
         self.traded
-            .insert(key, traded.checked_add(qty).unwrap_or(traded));
+            .insert(key, traded.checked_add(qty).unwrap_or(MAX_LOTS));
         let Some(queue) = self.queues.get_mut(&inst) else {
             return;
         };
@@ -648,6 +653,12 @@ struct Taken {
     takes: Vec<(Ticks, Lots, (i128, AssetSym))>,
     rests: bool,
 }
+
+/// The most lots a `Lots` holds.
+const MAX_LOTS: Lots = match Lots::new(i64::MAX) {
+    Some(lots) => lots,
+    None => Lots::ZERO,
+};
 
 /// The venue's id for its `n`th order.
 fn vid(n: u64) -> String {
