@@ -1,0 +1,15 @@
+[package]
+name = "fbc-oms"
+description = "Order truth: the monotone order lattice, each command item's outcome, and the registry of orders by client id."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+fbc-core = { path = "../fbc-core" }
+
+[dev-dependencies]
+proptest.workspace = true

@@ -62,6 +62,9 @@ zstd = { version = "=0.13.3", default-features = false }
 # its control message through nix's safe wrappers, so fbc-runtime holds no unsafe code. Pinned
 # exactly; only the socket and uio modules. A Linux-only dependency of fbc-runtime.
 nix = { version = "=0.31.3", default-features = false, features = ["socket", "uio"] }
+# Property tests (FBC-iv2, decision 0037): dev-only, pinned exactly, default features off (no
+# fork, timeout or tempfile); `std` brings rand, regex-syntax and num-traits, all MIT or Apache-2.0.
+proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
 
 # Stark-curve arithmetic is unusably slow unoptimized; the signer's tests sign thousands of
 # vectors. Optimizing these dependencies in test builds changes no result, only the time.

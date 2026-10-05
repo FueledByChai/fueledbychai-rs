@@ -121,6 +121,8 @@ rather than guess.
   slices (the connector, SOCKS5 CONNECT, WebSocket and HTTP/1.1, plain or TLS, 0019 and 0020, the WebSocket handshake its own, 0029;
   connection epochs and the subscription reconciler; the market-data session, 0023; HTTP
   effects, poll endpoints and plans, 0027; journaling and decoder replay, 0006; rate-limit buckets with a safety reserve, 0030), `crates/fbc-conformance` with its stub venue server (0025),
+  `crates/fbc-oms` with its first slice (the order lattice, item outcomes and the registry by
+  client id; 0005, property-tested with proptest, 0037),
   `crates/venues/fbc-venue-paradex` with its signer (`src/sign`), SBE market data (`src/md`: bbo,
   trades and the order book) and its factory (`src/factory.rs`, market data only),
   and `crates/venues/fbc-venue-binance-usdm` with its market-data-only factory and codec; the
@@ -182,8 +184,15 @@ rather than guess.
     instrument and `BookId`, built from book events the same live and in replay, with
     snapshots, deltas, windows and gap invalidation, touch, top-n, an exact top-n comparison
     and canonical bytes; still planned: the ex-own projection, touch arbitration and
-    continuity policies), `crates/fbc-oms` (order lattice, permits,
-    pre-trade caps, `ExecutionPlanner`; 0005, 0013), `crates/fbc-journal` (0006; it depends on
+    continuity policies), `crates/fbc-oms` (it depends on `fbc-core` only, `proptest` as a
+    dev-dependency, 0037: so far `OrderRecord`, whose ranked states, PendingNew and Unknown 0,
+    Open 1, PartiallyFilled 2, Terminal 3, only move forward with a terminal state absorbing,
+    `apply_update` under an `OrderKey` (the venue's ordering key, ingest tiebreak), amends that
+    issue new venue ids and the superseded ids they leave, `on_outcome` per command item, and
+    the `Registry` by client id that routes each update by client id or any venue id the order
+    had; I1 for order updates and I2 property-tested in `tests/lattice.rs`; still planned: the
+    `FillLedger` and second fill counter, permits, pre-trade caps and `ExecutionPlanner`; 0005,
+    0013), `crates/fbc-journal` (0006; it depends on
     `fbc-core`, and `hmac` and `sha2` for its keyed hashes and `zstd` for its closed segments, only: the records the runtime writes, length-prefixed in a hand-written
     little-endian format with a version, a writer of one subdirectory per UTC day with segments
     named `<shard>-<seq>.fbcj` and time from the caller, rolled at every UTC hour, each closed
