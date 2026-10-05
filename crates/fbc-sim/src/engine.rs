@@ -82,7 +82,8 @@ struct At {
 ///   size cannot be judged. A place of zero lots is refused (`InvalidQty`), since zero lots is
 ///   never an order, and so is one below the spec's minimum size or above its largest order,
 ///   and one that would rest where the level's size with the simulated orders there and its
-///   own would not fit in lots.
+///   own would not fit in lots. A limit price the spec's grid does not accept is refused
+///   (`InvalidPrice`).
 /// - A place crosses the trading book's displayed levels, each fill at a level's price up to
 ///   its size, as the taker; a post-only order that would cross is refused
 ///   (`PostOnlyWouldCross`). The rest of a good-till-cancelled limit order rests and queues
@@ -90,7 +91,8 @@ struct At {
 ///   cancelled unfilled, and a fill-or-kill order that cannot fill whole fills nothing. A
 ///   good-till-cancelled order that would rest where the book does not know the size (past
 ///   its depth or window) is refused whole (`no_book`), the part that would cross included,
-///   since its queue position cannot be set.
+///   since its queue position cannot be set. A resting order queues behind the level's size
+///   less the trades printed at its price whose shrink the level has not shown yet.
 /// - A cancel ends a resting order; one the venue has ended is refused `AlreadyTerminal`, one
 ///   it never had `NotFound`.
 /// - A public trade on a trading book fills resting orders through the queue model, as the
@@ -313,6 +315,10 @@ impl SimEngine {
         if p.qty == Lots::ZERO || p.qty < spec.min_size || too_big {
             return Err(Refusal::InvalidQty);
         }
+        // A limit price must be one the grid accepts (Codex r4184245564).
+        if p.px.is_some_and(|px| !spec.price_grid.valid_at(px)) {
+            return Err(Refusal::InvalidPrice);
+        }
         let book = self.trading_book(p.inst).ok_or(Refusal::NoBook)?;
         let top = book.top(usize::MAX).map_err(|_| Refusal::NoBook)?;
         let opposite = match p.side {
@@ -353,6 +359,13 @@ impl SimEngine {
                 let side = p.side.book_side();
                 let book = self.trading_book(p.inst).ok_or(Refusal::NoBook)?;
                 let shown = book.level(side, px).ok().flatten().ok_or(Refusal::NoBook)?;
+                // Trades printed at the price whose shrink the level has not shown yet took
+                // their size before the order arrived (Codex r4184245578): it queues behind
+                // what they left, and that shrink, which they explain, moves nothing.
+                let credit = self.traded.get(&(p.inst, side == BookSide::Bid, px));
+                let shown = shown
+                    .checked_sub(credit.copied().unwrap_or(Lots::ZERO))
+                    .unwrap_or(Lots::ZERO);
                 // Codex r4183438501: the size at the price, the public size, every simulated
                 // order resting there and this one together, must fit in lots, so the venue's
                 // own size there is never truncated.

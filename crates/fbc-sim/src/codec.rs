@@ -8,10 +8,10 @@ use fbc_core::{
     AckLevel, AckModel, Channel, ChosenRef, CidMatch, CtxCall, DecodeError, DecodeScope, Effect,
     Effects, EncodeCtx, EncodeReceipt, ExchTsKind, ExecCaps, ExecCodec, ExecEvent, ExecSink,
     Feature, FillCaps, FillEvent, FillIdent, FillSource, HttpFailure, HttpResponse, HttpTag,
-    Inbound, InboundSpans, ItemRef, Liquidity, Liquidity3, NotSentReason, OpKind, OrderCaps,
-    OrderKind, OrderUpdate, OrderingKey, PathStamps, RateCharge, RawFrame, Reject, RpcCall, RpcId,
-    SpecTable, StreamId, SubmitOutcome, TifTag, TimerTag, VenueCommand, VenueMeta, VenueOrderState,
-    WireSlice, encode_cid,
+    Inbound, InboundSpans, ItemRef, Liquidity, Liquidity3, MatchingCaps, NotSentReason, OpKind,
+    OrderCaps, OrderKind, OrderUpdate, OrderingKey, PathStamps, RateCharge, RawFrame, Reject,
+    RpcCall, RpcId, SpecTable, StreamId, SubmitOutcome, TifTag, TimerTag, VenueCommand, VenueMeta,
+    VenueOrderState, WireSlice, encode_cid,
 };
 
 use crate::config::SimConfig;
@@ -25,8 +25,8 @@ use crate::wire::{Cancel, Command, Place, Refusal, Reply, Sent, SimState, Target
 /// what the stood-in venue's [`OrderCaps`] do not offer, RPI orders, which the engine cannot
 /// fill yet (FBC-njk, decision 0043), and placements for a venue whose events the engine
 /// cannot say yet: two-phase acknowledgement (FBC-zr1), an ordering key other than a venue
-/// sequence, realized values on fills, or fills derived from order status (FBC-938); amends,
-/// batches and queries are FBC-nv2's.
+/// sequence, realized values on fills, or fills derived from order status (FBC-938), or a
+/// venue with a speed bump (FBC-7y8); amends, batches and queries are FBC-nv2's.
 #[derive(Clone, Debug)]
 pub struct SimCodec {
     /// Whether the engine can say what the stood-in venue's events say ([`modelled`]).
@@ -41,7 +41,7 @@ impl SimCodec {
     /// A codec for the venue `config` stands in for.
     pub fn new(config: &SimConfig) -> SimCodec {
         SimCodec {
-            modelled: modelled(&config.exec),
+            modelled: modelled(&config.exec, &config.matching),
             caps: config.exec.order.clone(),
             fills: config.exec.fills,
             stream: config.stream,
@@ -127,13 +127,15 @@ impl SimCodec {
     }
 }
 
-/// Whether the engine answers as the venue `exec` describes: it acknowledges in one phase
+/// Whether the engine answers as the venue `exec` and `matching` describe: it delays no
+/// command past its latency (Codex r4184245574; FBC-7y8), it acknowledges in one phase
 /// (Codex r4182678509; FBC-zr1), orders its answers by a venue sequence, keeps no position to
 /// report realized P&L or funding from, and sends fills of their own (Codex r4182991971,
 /// r4182991978; FBC-938). Placements for any other venue are refused rather than answered with
 /// events unlike its own.
-fn modelled(exec: &ExecCaps) -> bool {
-    exec.order.ack == AckModel::SinglePhase
+fn modelled(exec: &ExecCaps, matching: &MatchingCaps) -> bool {
+    matching.speed_bump.is_none()
+        && exec.order.ack == AckModel::SinglePhase
         && exec.order.ordering_key == OrderingKey::VenueSeq
         && !exec.fills.realized_pnl
         && !exec.fills.realized_funding

@@ -168,6 +168,7 @@ const REFUSALS: &[(&str, Refusal)] = &[
     ("no_book", Refusal::NoBook),
     ("no_fee", Refusal::NoFee),
     ("invalid_qty", Refusal::InvalidQty),
+    ("invalid_px", Refusal::InvalidPrice),
 ];
 
 /// When a command left the client: its encode's wall and monotonic time.
@@ -312,6 +313,8 @@ pub(crate) enum Refusal {
     NoFee,
     /// A placement of zero lots, which is never an order, or outside the spec's size limits.
     InvalidQty,
+    /// A limit price the instrument's price grid does not accept.
+    InvalidPrice,
 }
 
 impl Refusal {
@@ -322,6 +325,7 @@ impl Refusal {
             Refusal::NotFound => RejectKind::NotFound,
             Refusal::Terminal(hint) => RejectKind::AlreadyTerminal(hint),
             Refusal::InvalidQty => RejectKind::InvalidQty,
+            Refusal::InvalidPrice => RejectKind::InvalidPrice,
             Refusal::DuplicateClientId | Refusal::NoBook | Refusal::NoFee => RejectKind::Other,
         }
     }

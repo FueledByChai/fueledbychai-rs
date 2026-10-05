@@ -3,7 +3,9 @@
 use core::time::Duration;
 use std::collections::BTreeMap;
 
-use fbc_core::{AccountKey, BookId, ExecCaps, FeeBook, InstrumentId, SpecTable, StreamId};
+use fbc_core::{
+    AccountKey, BookId, ExecCaps, FeeBook, InstrumentId, MatchingCaps, SpecTable, StreamId,
+};
 
 use crate::queue::QueueConfig;
 
@@ -26,6 +28,9 @@ pub struct SimConfig {
     /// they do not offer, spells client ids in their format, and the engine reports fees in
     /// their fee sign.
     pub exec: ExecCaps,
+    /// How the venue it stands in for matches: the codec places nothing for a venue with a
+    /// speed bump, which the engine does not model yet (FBC-7y8).
+    pub matching: MatchingCaps,
     pub latency: SimLatency,
     /// How long the runtime waits for an answer to each command before it is Unknown.
     pub rpc_timeout: Duration,
