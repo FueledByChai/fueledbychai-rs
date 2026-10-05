@@ -135,7 +135,7 @@ pub struct AmendCaps {
     /// The references an amend can name its order by natively: [`RefKind::Venue`],
     /// [`RefKind::Client`], or both. An amend carries no placement nonce, so
     /// [`RefKind::PlacementNonce`] here matches no amend; [`AmendOrder::reference`] picks from
-    /// this set, and a codec refuses an amend it finds no declared reference for (0031).
+    /// this set, and a codec refuses an amend it finds no declared reference for (0032).
     ///
     /// [`AmendOrder::reference`]: crate::AmendOrder::reference
     pub refs: TagSet<RefKind>,
@@ -555,7 +555,7 @@ pub struct CancelBatch {
     /// The most cancels in one request.
     pub max_items: u16,
     /// The references each item can name natively; [`CancelOrder::reference`] picks from this
-    /// set, and a codec refuses a batch with an item it finds no declared reference for (0031).
+    /// set, and a codec refuses a batch with an item it finds no declared reference for (0032).
     ///
     /// [`CancelOrder::reference`]: crate::CancelOrder::reference
     pub refs: TagSet<RefKind>,
