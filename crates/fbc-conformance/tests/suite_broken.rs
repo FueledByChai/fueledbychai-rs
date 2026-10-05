@@ -11,13 +11,13 @@ use std::collections::BTreeSet;
 use fbc_conformance::suite::{self, Failure, Setup, Subject, Verdict};
 use fbc_conformance::toy::{self, ToyExec, ToyFactory, ToySigner};
 use fbc_core::{
-    AccountSummary, AssetKey, Batch, CancelBatch, CancelOnDisconnect, ConfigError, CtxCall,
-    DecodeError, Effect, Effects, EncodeCtx, EncodeReceipt, EndpointPlan, ExecCodec, ExecEndpoint,
-    ExecEvent, ExecSink, Feature, FieldSpec, HttpFailure, HttpPlan, HttpTag, Inbound, InboundSpans,
-    InstrumentSpecDraft, MdCodec, MonoNs, NonceBlock, NotSentReason, OrderCaps, OrderKindTag,
-    PathStamps, RawFrame, RefKind, RpcId, Secrets, SpecTable, StreamId, Subscription, Support,
-    SymbolError, TagSet, TifTag, TimerTag, VenueCaps, VenueCommand, VenueConfig, VenueError,
-    VenueFactory, VenueMeta, WallNs,
+    AccountSummary, AssetKey, Batch, CancelBatch, CancelOnDisconnect, CancelScope, ConfigError,
+    CtxCall, DecodeError, Effect, Effects, EncodeCtx, EncodeReceipt, EndpointPlan, ExecCodec,
+    ExecEndpoint, ExecEvent, ExecSink, Feature, FieldSpec, HttpFailure, HttpPlan, HttpTag, Inbound,
+    InboundSpans, InstrumentSpecDraft, MdCodec, MonoNs, NonceBlock, NotSentReason, OrderCaps,
+    OrderKindTag, PathStamps, RawFrame, RefKind, RpcId, Secrets, SpecTable, StreamId, Subscription,
+    Support, SymbolError, TagSet, TifTag, TimerTag, VenueCaps, VenueCommand, VenueConfig,
+    VenueError, VenueFactory, VenueMeta, WallNs,
 };
 
 const FIXTURES: &str = concat!(
@@ -38,6 +38,26 @@ fn assumed() -> Setup {
 fn one_instrument() -> Setup {
     let mut specs = SpecTable::new();
     specs.insert(toy::specs().get(toy::INST_A).unwrap().clone());
+    Setup { specs, ..assumed() }
+}
+
+/// The toy's setup with its first instrument on a banded grid that starts at 100.0 in steps
+/// of 0.5 (tick 200 of the finest 0.5), so tick 100 is off the grid.
+fn banded() -> Setup {
+    let mut specs = toy::specs();
+    let mut a = specs.get(toy::INST_A).unwrap().clone();
+    let bands = [
+        (
+            rust_decimal::Decimal::new(1000, 1),
+            rust_decimal::Decimal::new(5, 1),
+        ),
+        (
+            rust_decimal::Decimal::new(2000, 1),
+            rust_decimal::Decimal::new(15, 1),
+        ),
+    ];
+    a.price_grid = fbc_core::PriceGrid::banded(&bands).unwrap();
+    specs.insert(a);
     Setup { specs, ..assumed() }
 }
 
@@ -69,6 +89,11 @@ enum Twist {
     AccountWide,
     /// A cancel-all goes as an HTTP request whose body is the frame it would have been.
     OverHttp,
+    /// The first instrument's cancel-all is written as an account-wide one; the second's is
+    /// refused.
+    AccountWideRefusingOther,
+    /// An order or amend priced off its instrument's grid is refused `Unencodable`.
+    ChecksGrid,
     /// A sent request's frames name no rpc.
     Unlabelled,
     /// Every charge names no instrument.
@@ -274,7 +299,33 @@ impl ExecCodec for Twisted {
                 }
                 Ok(receipt)
             }
-            (Twist::AccountWide, Ok(receipt)) if matches!(cmd, VenueCommand::CancelAll(_)) => {
+            (Twist::AccountWideRefusingOther, Ok(_))
+                if *cmd == VenueCommand::CancelAll(CancelScope::Instrument(toy::INST_B)) =>
+            {
+                fx.take();
+                Err(NotSentReason::Unsupported)
+            }
+            (Twist::ChecksGrid, result) => {
+                let priced = match cmd {
+                    VenueCommand::Place(o) => vec![(o.inst, o.kind.limit_px())],
+                    VenueCommand::PlaceBatch(os) => {
+                        os.iter().map(|o| (o.inst, o.kind.limit_px())).collect()
+                    }
+                    VenueCommand::Amend(a) => vec![(a.inst, Some(a.px))],
+                    _ => Vec::new(),
+                };
+                let off = |(inst, px): &(fbc_core::InstrumentId, Option<fbc_core::Ticks>)| {
+                    px.is_some_and(|px| !specs.get(*inst).unwrap().price_grid.valid_at(px))
+                };
+                if priced.iter().any(off) {
+                    fx.take();
+                    return Err(NotSentReason::Unencodable);
+                }
+                result
+            }
+            (Twist::AccountWide | Twist::AccountWideRefusingOther, Ok(receipt))
+                if matches!(cmd, VenueCommand::CancelAll(_)) =>
+            {
                 for effect in fx.take() {
                     fx.push(match effect {
                         Effect::Send {
@@ -832,6 +883,37 @@ fn every_reference_declared_and_the_longest_batches_leave_nothing_to_probe_past(
     };
     let past = |p: &&String| p.contains("lacks [") || p.contains("max_items");
     assert!(!probed.iter().any(|p| past(&p)), "{probed:?}");
+}
+
+#[test]
+fn a_cancel_all_compared_with_one_never_sent_proves_nothing() {
+    // Codex r4189256916: the second instrument's cancel-all refused, the first's account-wide.
+    let failure = failed(Broken::twisted(Twist::AccountWideRefusingOther).caps_truthful());
+    let what = said(
+        &failure,
+        "OrderCaps.cancel_all_instrument is Native: never widened",
+    );
+    assert_eq!(
+        what,
+        "the cancel-all of instrument 8 was not sent as one, so nothing shows this one names \
+         instrument 7"
+    );
+}
+
+#[test]
+fn orders_are_priced_on_the_instruments_grid() {
+    // Codex r4189256906: a codec that refuses an off-grid price still passes both checks on a
+    // banded grid where tick 100 is below the first band.
+    let grid_checked = Broken::twisted(Twist::ChecksGrid);
+    for check in [suite::caps_truthful, suite::commands_selfcontained] {
+        let subject = Subject::new(&grid_checked, FIXTURES, banded).unwrap();
+        assert!(matches!(check(&subject), Ok(Verdict::Passed { .. })));
+    }
+    // And on the toy's own grid, where every tick is valid.
+    assert!(matches!(
+        grid_checked.caps_truthful(),
+        Ok(Verdict::Passed { .. })
+    ));
 }
 
 #[test]

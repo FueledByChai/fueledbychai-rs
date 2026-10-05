@@ -175,12 +175,26 @@ fn widened(h: &Harness<'_>, e: &Encoded, other: Option<&Encoded>) -> Option<Stri
             c.op
         ));
     }
-    let Some(other) = other else {
+    let (Some(other), Some(other_inst)) = (other, h.other_inst) else {
         return Some(format!(
             "the setup lists only instrument {inst}, so no cancel-all of a second can show this \
              one names its own: list two"
         ));
     };
+    // The comparison means something only if the other cancel-all is sent too, as itself
+    // (Codex r4189256916).
+    let class = VenueCommand::CancelAll(CancelScope::Instrument(other_inst)).traffic_class();
+    let charged = other.fx.as_slice().iter().filter_map(Effect::charge);
+    let charged = charged
+        .into_iter()
+        .all(|(c, _)| c.op == OpKind::CancelAll && c.inst == Some(other_inst));
+    if other.result.is_err() || !other.fx.carry_request(RPC, class) || !charged {
+        return Some(format!(
+            "the cancel-all of instrument {} was not sent as one, so nothing shows this one \
+             names instrument {inst}",
+            other_inst.get()
+        ));
+    }
     (requests(&other.fx) == requests(&e.fx)).then(|| {
         format!(
             "written exactly as the cancel-all of another instrument: it does not name \
