@@ -41,8 +41,8 @@ This augments 0035 and 0043 (it supersedes nothing there):
    - `Login::new(cfg, creds)` moves the account address (`paradex.account.address`) and the
      Stark key (`paradex.private.key`, the Java library's names) out of `Secrets` into a
      `ParadexSigner`, and reads the chain id (`paradex.chain.id`: hex, decimal or the chain's
-     name), the REST base (`paradex.rest.url`, ending in `/v1`, since the login is signed as
-     `/v1/auth`), the signature lifetime (`paradex.auth.signature.lifetime`, whole seconds, at
+     name), the REST base (`paradex.rest.url`, a host and the path `/v1` alone, since the
+     login is signed as `/v1/auth`, Codex r4186295475), the signature lifetime (`paradex.auth.signature.lifetime`, whole seconds, at
      most the one week Paradex takes, Codex r4184897007),
      the refresh interval (`paradex.jwt.refresh`) and the request timeout
      (`paradex.rest.timeout`), all Account scope and all required: no number is defaulted in

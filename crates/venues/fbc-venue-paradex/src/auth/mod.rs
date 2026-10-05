@@ -55,7 +55,7 @@ pub const ACCOUNT_ADDRESS: &str = "paradex.account.address";
 /// which this login does not make yet (FBC-2vhg), and a subkey cannot be told from the main
 /// key by its bytes: give the main key.
 pub const SIGNING_KEY: &str = "paradex.private.key";
-/// The configuration key of the REST API base, ending in `/v1`:
+/// The configuration key of the REST API base, a host and the path `/v1` alone:
 /// `https://api.prod.paradex.trade/v1` on mainnet, `https://api.testnet.paradex.trade/v1` on
 /// testnet. The login is `POST /auth` under it, signed as `/v1/auth`.
 pub const REST_URL: &str = "paradex.rest.url";
@@ -76,7 +76,7 @@ pub const REST_URL_FIELD: FieldSpec = FieldSpec {
     key: REST_URL,
     scope: ConfigScope::Account,
     unit: FieldUnit::Dimensionless,
-    doc: "REST API base (http:// or https://) ending in /v1, without query or user, e.g. \
+    doc: "REST API base (http:// or https://): a host and the path /v1 alone, without query or user, e.g. \
           https://api.prod.paradex.trade/v1; the login is POST /auth under it",
 };
 /// The chain id's schema entry.
@@ -218,10 +218,13 @@ fn rest_base(text: &str) -> Result<String, ConfigError> {
             "the adapter writes the path; give the API base with no query, fragment or user",
         ));
     }
-    if !base.ends_with(SIGNED_PREFIX) || !after.contains('/') {
+    // The login is signed as /v1/auth (sign_auth_request), so the base must be a host and
+    // the path /v1 alone: a prefix before it would send a path the signature does not name.
+    let (authority, path) = after.split_at(after.find('/').unwrap_or(after.len()));
+    if authority.is_empty() || path != SIGNED_PREFIX {
         return Err(invalid(
             REST_URL,
-            "the login is signed as /v1/auth: give the API base ending in /v1",
+            "the login is signed as /v1/auth: give a host and the path /v1 alone",
         ));
     }
     Ok(base.to_owned())

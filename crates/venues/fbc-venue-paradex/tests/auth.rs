@@ -514,6 +514,21 @@ fn the_configuration_is_read_and_refused_by_key_never_by_value() {
     ] {
         invalid(REST_URL, value);
     }
+    // The login is signed as /v1/auth, so the base is a host and exactly /v1 (Codex
+    // r4186295475): no empty authority, no path before or after /v1.
+    for value in [
+        "https:///v1",
+        "https://proxy.example/prefix/v1",
+        "https://api.prod.paradex.trade//v1",
+        "https://api.prod.paradex.trade/v1/v1",
+        "http:///v1/",
+    ] {
+        assert_eq!(
+            invalid(REST_URL, value),
+            "the login is signed as /v1/auth: give a host and the path /v1 alone",
+            "{value}"
+        );
+    }
     assert_eq!(
         invalid(REST_URL, "http://127.0.0.1:1/v1#a"),
         "the adapter writes the path; give the API base with no query, fragment or user"
