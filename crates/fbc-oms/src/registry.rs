@@ -1,15 +1,16 @@
 //! The registry of our orders by client id, the routing of venue events and accepted fills to
 //! them, and the inventory those fills moved.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use fbc_core::{
-    CidMatch, ClientOrderId, InstrumentId, ItemRef, MonoNs, Namespace, NewOrder, OrderUpdate,
-    SignedLots, SubmitOutcome, VenueOrderId,
+    CidMatch, ClientOrderId, InstrumentId, ItemRef, Lots, MonoNs, Namespace, NewOrder, OrderCaps,
+    OrderUpdate, RpcId, SignedLots, SubmitOutcome, Ticks, VenueOrderId,
 };
 
 use crate::ledger::AcceptedFill;
+use crate::permit::{self, CancelChoice, CancelPlan, Cancellable, Live, PermitRefusal};
 use crate::record::{Applied, FillApplied, OrderKey, OrderOp, OrderRecord, OutcomeApplied};
 
 /// Our orders, by client id, with an index of every venue id they were known by, and the
@@ -82,6 +83,8 @@ pub enum OmsError {
     /// The fill was accepted by another ledger than the one whose fills the registry applies,
     /// which cannot vouch that the registry never counted it.
     OtherLedger,
+    /// The order's placement nonce was already recorded as another value.
+    NonceRecorded(ClientOrderId),
 }
 
 impl fmt::Display for OmsError {
@@ -105,6 +108,9 @@ impl fmt::Display for OmsError {
                     f,
                     "the fill was accepted by another fill ledger than this registry's"
                 )
+            }
+            OmsError::NonceRecorded(cid) => {
+                write!(f, "{cid:?} already has another placement nonce recorded")
             }
         }
     }
@@ -267,6 +273,145 @@ impl Registry {
         Ok(self.with_record(cid, |rec| {
             rec.on_outcome(op, item.vid.as_ref(), outcome, now)
         }))
+    }
+
+    /// Records the nonce the placement of `cid` was sent with (from its encode receipt), for
+    /// venues that cancel by it. The same nonce again changes nothing; another is refused.
+    pub fn placement_nonce_used(&mut self, cid: ClientOrderId, nonce: u64) -> Result<(), OmsError> {
+        let rec = self.orders.get_mut(&cid).ok_or(OmsError::UnknownCid(cid))?;
+        match rec.placement_nonce() {
+            Some(known) if known != nonce => Err(OmsError::NonceRecorded(cid)),
+            _ => {
+                rec.set_placement_nonce(nonce);
+                Ok(())
+            }
+        }
+    }
+
+    /// Records the amend of `cid` to `px` and `qty` sent at `now` under `rpc`
+    /// ([`OrderRecord::amend_sent`]): false once the order is terminal.
+    pub fn amend_sent(
+        &mut self,
+        cid: ClientOrderId,
+        px: Ticks,
+        qty: Lots,
+        rpc: RpcId,
+        now: MonoNs,
+    ) -> Result<bool, OmsError> {
+        let rec = self.orders.get_mut(&cid).ok_or(OmsError::UnknownCid(cid))?;
+        Ok(rec.amend_sent(px, qty, rpc, now))
+    }
+
+    /// Records the cancel of `cid` sent at `now` under `rpc` ([`OrderRecord::cancel_sent`]):
+    /// false once the order is terminal.
+    pub fn cancel_sent(
+        &mut self,
+        cid: ClientOrderId,
+        rpc: RpcId,
+        now: MonoNs,
+    ) -> Result<bool, OmsError> {
+        let rec = self.orders.get_mut(&cid).ok_or(OmsError::UnknownCid(cid))?;
+        Ok(rec.cancel_sent(rpc, now))
+    }
+
+    /// The permit to amend our order `cid`: it rests (Open or PartiallyFilled) with no command
+    /// in flight and no cancel waiting for its acknowledgement.
+    pub fn live(&self, cid: ClientOrderId) -> Result<Live<'_>, PermitRefusal> {
+        let rec = self
+            .orders
+            .get(&cid)
+            .ok_or(PermitRefusal::UnknownCid(cid))?;
+        Live::check(rec)
+    }
+
+    /// The permit to cancel our order `cid`: it is not terminal (PendingNew, Unknown and an
+    /// order with a command in flight included).
+    pub fn cancellable(&mut self, cid: ClientOrderId) -> Result<Cancellable<'_>, PermitRefusal> {
+        let rec = self
+            .orders
+            .get_mut(&cid)
+            .ok_or(PermitRefusal::UnknownCid(cid))?;
+        Cancellable::check(rec)
+    }
+
+    /// The permit to cancel an order the venue shows (an update, a fill or a snapshot), named
+    /// by the client id the venue echoed (`None` when it echoes none) and its venue id. Another
+    /// namespace's or a non-canonical client id gets none (decision 0005, I4); nor does an
+    /// order the registry does not hold (an orphan, which only I7's resync cancels). Our
+    /// registered client id, or with none echoed a venue id our order had, names the order.
+    pub fn cancellable_seen(
+        &mut self,
+        cid: Option<CidMatch>,
+        vid: Option<&VenueOrderId>,
+    ) -> Result<Cancellable<'_>, PermitRefusal> {
+        let cid = match cid {
+            Some(CidMatch::Foreign(ns)) => return Err(PermitRefusal::Foreign(ns)),
+            Some(CidMatch::Unparseable) => return Err(PermitRefusal::NotCanonical),
+            Some(CidMatch::Ours(cid)) if self.orders.contains_key(&cid) => cid,
+            Some(CidMatch::Ours(_)) => return Err(PermitRefusal::Untracked),
+            None => vid
+                .and_then(|v| self.cid_of(v))
+                .ok_or(PermitRefusal::Untracked)?,
+        };
+        self.cancellable(cid)
+    }
+
+    /// Builds the cancels of our orders `cids` (each once, in the order given), each through
+    /// its [`Cancellable`] permit: an item whose reference the venue's batch cancel declares
+    /// (`OrderCaps::batch_cancel`) goes in a cancel-many of its market, at most `max_items`
+    /// apiece; an item with only a reference the batch does not declare goes as a single
+    /// cancel (on a venue whose batch cancel takes venue ids only, a client-id cancel carrying
+    /// its market); one with no usable reference yet waits for its acknowledgement
+    /// ([`CancelChoice::AwaitAck`]); one with no permit is refused.
+    pub fn cancel_many(&mut self, cids: &[ClientOrderId], caps: &OrderCaps) -> CancelPlan {
+        let batch = caps.batch_cancel.filter(|b| b.max_items > 0);
+        let mut plan = CancelPlan::default();
+        let mut items = Vec::new();
+        let mut singles = Vec::new();
+        let mut seen = HashSet::new();
+        for &cid in cids {
+            if !seen.insert(cid) {
+                continue;
+            }
+            let mut permit = match self.cancellable(cid) {
+                Ok(permit) => permit,
+                Err(refusal) => {
+                    plan.refused.push((cid, refusal));
+                    continue;
+                }
+            };
+            if let Some(b) = batch
+                && let Some(item) = permit.batch_item(caps, b.refs)
+            {
+                items.push(item);
+                continue;
+            }
+            match permit.cancel(caps) {
+                CancelChoice::Send(cmd) => singles.push(cmd),
+                CancelChoice::AwaitAck => plan.awaiting_ack.push(cid),
+            }
+        }
+        if let Some(b) = batch {
+            plan.commands = permit::batches(items, b.max_items);
+        }
+        plan.commands.extend(singles);
+        plan
+    }
+
+    /// Our orders whose cancel waited for their acknowledgement and can now be built: a
+    /// reference the venue's single cancel names is usable. Asked after every event, a
+    /// deferred cancel is due the moment the acknowledgement lands; in client id order.
+    pub fn cancels_due(&self, caps: &OrderCaps) -> Vec<ClientOrderId> {
+        let mut due: Vec<ClientOrderId> = self
+            .orders
+            .values()
+            .filter(|rec| {
+                rec.cancel_awaits_ack() && permit::cancel_of(rec, caps, caps.cancel_refs).is_some()
+            })
+            .map(OrderRecord::cid)
+            .collect();
+        due.sort();
+        due
     }
 
     /// Runs `change` on the registered order `cid`, then indexes every venue id it has.

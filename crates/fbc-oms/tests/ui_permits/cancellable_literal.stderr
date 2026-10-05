@@ -1,0 +1,5 @@
+error[E0451]: field `rec` of struct `Cancellable` is private
+ --> tests/ui_permits/cancellable_literal.rs:6:19
+  |
+6 |     Cancellable { rec }
+  |                   ^^^ private field

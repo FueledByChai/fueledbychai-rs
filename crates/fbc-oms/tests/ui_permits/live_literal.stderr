@@ -1,0 +1,5 @@
+error[E0451]: field `rec` of struct `fbc_oms::Live` is private
+ --> tests/ui_permits/live_literal.rs:6:12
+  |
+6 |     Live { rec }
+  |            ^^^ private field

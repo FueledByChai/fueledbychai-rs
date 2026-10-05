@@ -51,13 +51,24 @@
 //! be cloned or edited, and submitting consumes it (`tests/compile_fail.rs`). A command that
 //! affects no order goes through [`OrderGateway::submit_control`] as a [`ControlCommand`].
 //!
-//! Not here yet: permits (FBC-lrc), the pre-trade caps (FBC-2e4), the market states
-//! (FBC-c4v), issuing an authorization after them and its check at submit (FBC-afd), and the
-//! Unknown ladder.
+//! Amends and cancels are built through permits (decision 0005): the [`Registry`] gives a
+//! [`Live`] permit for a resting order with nothing in flight, the only way to build an amend,
+//! and a [`Cancellable`] one for any order that is not terminal, the only way to build a
+//! cancel; never one for another namespace's or a non-canonical order (I4). A cancel names its
+//! order by the reference design §4.9 orders from the venue's [`OrderCaps`](fbc_core::OrderCaps),
+//! or waits for the acknowledgement and is due the moment it lands
+//! ([`Registry::cancels_due`]); a cancel-many batches only the items whose reference its batch
+//! declares and sends the others alone ([`Registry::cancel_many`]). What a permit builds is a
+//! [`PermittedCommand`], from which alone an amend or a cancel is authorized (`tests/permits.rs`,
+//! and `tests/ui_permits/` for the compile-fail half).
+//!
+//! Not here yet: the pre-trade caps (FBC-2e4), the market states (FBC-c4v), issuing an
+//! authorization after them and its check at submit (FBC-afd), and the Unknown ladder.
 
 mod gateway;
 mod grant;
 mod ledger;
+mod permit;
 mod record;
 mod registry;
 
@@ -72,6 +83,9 @@ pub use grant::{Authorization, StateGeneration};
 pub use ledger::{
     AcceptedFill, Admission, FillLedger, FillTime, Horizon, LedgerConfig, LedgerConfigError,
     ReplayCounts,
+};
+pub use permit::{
+    AmendRefusal, CancelChoice, CancelPlan, Cancellable, Live, PermitRefusal, PermittedCommand,
 };
 pub use record::{
     Applied, FillApplied, Intent, OrdState, OrderKey, OrderOp, OrderRecord, OutcomeApplied,

@@ -94,34 +94,7 @@ pub fn ident(fid: &str) -> FillIdent {
 fn decode_caps() -> VenueCaps {
     VenueCaps {
         exec: Some(ExecCaps {
-            order: OrderCaps {
-                kinds: TagSet::of(&[OrderKindTag::Limit]),
-                tifs: TagSet::of(&[TifTag::Gtc]),
-                channels: TagSet::of(&[Channel::Public]),
-                post_only: true,
-                reduce_only: true,
-                flag_conflicts: vec![],
-                amend: None,
-                cancel_refs: TagSet::of(&[RefKind::Venue]),
-                query_refs: TagSet::of(&[RefKind::Venue]),
-                cancel_before_ack: false,
-                cancel_is_signed: false,
-                batch_place: None,
-                batch_cancel: None,
-                cancel_all_account: Support::Unsupported,
-                cancel_all_instrument: Support::Unsupported,
-                cancel_on_disconnect: CancelOnDisconnect::PerConnection {
-                    rearm_on_reconnect: true,
-                },
-                ack: AckModel::SinglePhase,
-                client_id: ClientIdFormat::Uuid,
-                cid_echoed_on_events: true,
-                nonce_scope: NonceScope::PerAccountMonotonic,
-                ordering_key: OrderingKey::VenueSeq,
-                snapshot_source: SnapshotSource::Trustworthy,
-                events_echo_flags: false,
-                sign_cost_hint_us: 0,
-            },
+            order: order_caps(),
             fills: FillCaps {
                 source: FillSource::Native,
                 liquidity_flag: true,
@@ -160,6 +133,39 @@ fn decode_caps() -> VenueCaps {
         },
         limits: vec![],
         readiness_ceiling: Readiness::Record,
+    }
+}
+
+/// The synthetic venue's order capabilities: limit GTC orders on the public book, no amend,
+/// single cancels by venue id only and no batch cancel; tests change the fields they need.
+pub fn order_caps() -> OrderCaps {
+    OrderCaps {
+        kinds: TagSet::of(&[OrderKindTag::Limit]),
+        tifs: TagSet::of(&[TifTag::Gtc]),
+        channels: TagSet::of(&[Channel::Public]),
+        post_only: true,
+        reduce_only: true,
+        flag_conflicts: vec![],
+        amend: None,
+        cancel_refs: TagSet::of(&[RefKind::Venue]),
+        query_refs: TagSet::of(&[RefKind::Venue]),
+        cancel_before_ack: false,
+        cancel_is_signed: false,
+        batch_place: None,
+        batch_cancel: None,
+        cancel_all_account: Support::Unsupported,
+        cancel_all_instrument: Support::Unsupported,
+        cancel_on_disconnect: CancelOnDisconnect::PerConnection {
+            rearm_on_reconnect: true,
+        },
+        ack: AckModel::SinglePhase,
+        client_id: ClientIdFormat::Uuid,
+        cid_echoed_on_events: true,
+        nonce_scope: NonceScope::PerAccountMonotonic,
+        ordering_key: OrderingKey::VenueSeq,
+        snapshot_source: SnapshotSource::Trustworthy,
+        events_echo_flags: false,
+        sign_cost_hint_us: 0,
     }
 }
 

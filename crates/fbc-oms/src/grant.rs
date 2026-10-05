@@ -18,6 +18,8 @@ use std::collections::BTreeMap;
 
 use fbc_core::{AccountKey, CancelScope, InstrumentId, VenueCommand};
 
+use crate::PermittedCommand;
+
 /// How many times a market's state has changed: the kill switch, an arming call, a disarm or
 /// any other move of its order-entry state (0012). An [`Authorization`] carries the value its
 /// market had when it was issued.
@@ -79,6 +81,9 @@ pub(crate) enum IssueRefusal {
     /// A batch whose items name more than one market: an authorization carries one market's
     /// generation.
     MixedMarkets,
+    /// An amend, a cancel or a cancel-many not built through a permit: it is authorized only
+    /// as the [`PermittedCommand`] its permit built (decision 0005, FBC-lrc).
+    NeedsPermit,
 }
 
 /// An order-affecting command `fbc-oms` admitted, for one account and one market, with that
@@ -96,10 +101,37 @@ pub struct Authorization {
 impl Authorization {
     /// Issues an authorization for `cmd` on `acct`, carrying the generation `generations` holds
     /// for the command's market. Refused for a command that affects no order, an account
-    /// cancel-all, an empty batch and a batch over several markets. The caps and the kill
-    /// switch are checked before this is called (FBC-2e4, FBC-c4v, FBC-afd).
+    /// cancel-all, an empty batch, a batch over several markets, and an amend, a cancel or a
+    /// cancel-many, which are issued only from their permit ([`Authorization::issue_permitted`]).
+    /// The caps and the kill switch are checked before this is called (FBC-2e4, FBC-c4v,
+    /// FBC-afd).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn issue(
+        acct: AccountKey,
+        cmd: VenueCommand,
+        generations: &Generations,
+    ) -> Result<Authorization, IssueRefusal> {
+        if matches!(
+            cmd,
+            VenueCommand::Amend(_) | VenueCommand::Cancel(_) | VenueCommand::CancelMany(_)
+        ) {
+            return Err(IssueRefusal::NeedsPermit);
+        }
+        Authorization::issue_any(acct, cmd, generations)
+    }
+
+    /// Issues an authorization for the amend, cancel or cancel-many a permit built, as
+    /// [`Authorization::issue`] does for any other command.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn issue_permitted(
+        acct: AccountKey,
+        cmd: PermittedCommand,
+        generations: &Generations,
+    ) -> Result<Authorization, IssueRefusal> {
+        Authorization::issue_any(acct, cmd.into_command(), generations)
+    }
+
+    fn issue_any(
         acct: AccountKey,
         cmd: VenueCommand,
         generations: &Generations,
@@ -215,6 +247,43 @@ mod tests {
         ]
     }
 
+    /// Whether `cmd` is authorized only from a permit: an amend, a cancel or a cancel-many.
+    fn permitted_kind(cmd: &VenueCommand) -> bool {
+        matches!(
+            cmd,
+            VenueCommand::Amend(_) | VenueCommand::Cancel(_) | VenueCommand::CancelMany(_)
+        )
+    }
+
+    /// Issues `cmd` the way its kind is issued: from a permit's command, or directly.
+    fn issue(cmd: VenueCommand, generations: &Generations) -> Result<Authorization, IssueRefusal> {
+        if permitted_kind(&cmd) {
+            Authorization::issue_permitted(ACCT, PermittedCommand::for_test(cmd), generations)
+        } else {
+            Authorization::issue(ACCT, cmd, generations)
+        }
+    }
+
+    #[test]
+    fn an_amend_or_a_cancel_is_authorized_only_as_its_permit_built_it() {
+        let generations = Generations::default();
+        let btc = InstrumentId::new(1);
+        for cmd in order_commands(btc).into_iter().filter(permitted_kind) {
+            assert_eq!(
+                Authorization::issue(ACCT, cmd.clone(), &generations).unwrap_err(),
+                IssueRefusal::NeedsPermit,
+                "{cmd:?}"
+            );
+            let auth = Authorization::issue_permitted(
+                ACCT,
+                PermittedCommand::for_test(cmd.clone()),
+                &generations,
+            )
+            .unwrap();
+            assert_eq!(auth.command(), &cmd);
+        }
+    }
+
     #[test]
     fn an_authorization_carries_the_state_generation_of_the_market_it_was_issued_for() {
         let (btc, eth) = (InstrumentId::new(1), InstrumentId::new(2));
@@ -227,7 +296,7 @@ mod tests {
 
         for (market, generation) in [(btc, 2), (eth, 1)] {
             for cmd in order_commands(market) {
-                let auth = Authorization::issue(ACCT, cmd.clone(), &generations).unwrap();
+                let auth = issue(cmd.clone(), &generations).unwrap();
                 assert_eq!(auth.market(), market, "{cmd:?}");
                 assert_eq!(auth.generation().get(), generation, "{cmd:?}");
                 assert_eq!(auth.account(), ACCT);
@@ -261,7 +330,7 @@ mod tests {
     fn no_authorization_for_a_command_that_names_no_single_market_or_affects_no_order() {
         let generations = Generations::default();
         let (btc, eth) = (InstrumentId::new(1), InstrumentId::new(2));
-        let refused = |cmd| Authorization::issue(ACCT, cmd, &generations).unwrap_err();
+        let refused = |cmd| issue(cmd, &generations).unwrap_err();
         // No record admits an account cancel-all (0005's I7 admits only the instrument one).
         assert_eq!(
             refused(VenueCommand::CancelAll(CancelScope::Account)),

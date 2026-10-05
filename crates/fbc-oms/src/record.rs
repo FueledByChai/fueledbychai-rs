@@ -185,6 +185,10 @@ pub struct OrderRecord {
     intent: Intent,
     last_key: Option<OrderKey>,
     unknown_since: Option<MonoNs>,
+    /// The nonce the placement was sent with, for venues that cancel by it.
+    placement_nonce: Option<u64>,
+    /// A cancel was asked for and waits for the order's acknowledgement (design §4.9).
+    cancel_awaits_ack: bool,
 }
 
 impl OrderRecord {
@@ -210,6 +214,8 @@ impl OrderRecord {
             intent: Intent::None,
             last_key: None,
             unknown_since: None,
+            placement_nonce: None,
+            cancel_awaits_ack: false,
         }
     }
 
@@ -321,6 +327,32 @@ impl OrderRecord {
         self.unknown_since
     }
 
+    /// The nonce the placement was sent with, once recorded
+    /// ([`Registry::placement_nonce_used`](crate::Registry::placement_nonce_used)).
+    pub fn placement_nonce(&self) -> Option<u64> {
+        self.placement_nonce
+    }
+
+    /// Whether the venue acknowledged the order: it rests, or ended, or the venue named it by
+    /// its own id. A PendingNew or Unknown order without a venue id is not acknowledged.
+    pub fn acknowledged(&self) -> bool {
+        self.state.rank() > 0 || self.vid.is_some()
+    }
+
+    /// Whether a cancel was asked for and waits for the order's acknowledgement, since no
+    /// reference its venue's cancel can name was usable ([`crate::CancelChoice::AwaitAck`]).
+    pub fn cancel_awaits_ack(&self) -> bool {
+        self.cancel_awaits_ack
+    }
+
+    pub(crate) fn set_cancel_awaits_ack(&mut self, awaits: bool) {
+        self.cancel_awaits_ack = awaits;
+    }
+
+    pub(crate) fn set_placement_nonce(&mut self, nonce: u64) {
+        self.placement_nonce = Some(nonce);
+    }
+
     /// Records an amend to `px` and `qty` sent at `now` under `rpc`. Refused (false) once the
     /// order is terminal.
     pub fn amend_sent(&mut self, px: Ticks, qty: Lots, rpc: RpcId, now: MonoNs) -> bool {
@@ -332,9 +364,14 @@ impl OrderRecord {
         })
     }
 
-    /// Records a cancel sent at `now` under `rpc`. Refused (false) once the order is terminal.
+    /// Records a cancel sent at `now` under `rpc`, which no longer waits for the order's
+    /// acknowledgement. Refused (false) once the order is terminal.
     pub fn cancel_sent(&mut self, rpc: RpcId, now: MonoNs) -> bool {
-        self.set_intent(Intent::PendingCancel { rpc, since: now })
+        let sent = self.set_intent(Intent::PendingCancel { rpc, since: now });
+        if sent {
+            self.cancel_awaits_ack = false;
+        }
+        sent
     }
 
     fn set_intent(&mut self, intent: Intent) -> bool {
@@ -646,6 +683,7 @@ impl OrderRecord {
     fn end(&mut self, kind: TerminalKind) {
         self.state = OrdState::Terminal(kind);
         self.intent = Intent::None;
+        self.cancel_awaits_ack = false;
         self.settle();
         self.unknown_since = None;
     }

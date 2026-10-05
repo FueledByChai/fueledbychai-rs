@@ -208,8 +208,13 @@ rather than guess.
     `Authorization` only `fbc-oms` issues, for one order-affecting command on one market with
     that market's `StateGeneration`, not `Clone` and consumed on submit, and whose
     `submit_control` takes a `ControlCommand` that carries no order-affecting command (0045,
-    compile-fail cases in `tests/ui_authorization/`); still planned: permits, pre-trade caps
-    and `ExecutionPlanner`; 0005, 0013), `crates/fbc-journal` (0006; it depends on
+    compile-fail cases in `tests/ui_authorization/`); the `Live` and `Cancellable` permits
+    the registry gives, through which alone an amend or a cancel is built, each cancel naming
+    its order by design §4.9's reference from the venue's caps or waiting for the
+    acknowledgement, a cancel-many batching only the items its batch declares a reference for,
+    and no permit for a foreign-namespace or non-canonical order (I4; `tests/permits.rs`,
+    compile-fail cases in `tests/ui_permits/`); still planned: pre-trade caps and
+    `ExecutionPlanner`; 0005, 0013), `crates/fbc-journal` (0006; it depends on
     `fbc-core`, and `hmac` and `sha2` for its keyed hashes and `zstd` for its closed segments, only: the records the runtime writes, length-prefixed in a hand-written
     little-endian format with a version, a writer of one subdirectory per UTC day with segments
     named `<shard>-<seq>.fbcj` and time from the caller, rolled at every UTC hour, each closed

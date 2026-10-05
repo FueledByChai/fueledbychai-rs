@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/ui_permits/amend_without_live.rs:6:25
+  |
+6 |     let _ = Live::amend(reg.get(cid).unwrap(), caps, Ticks(1), qty);
+  |             ----------- ^^^^^^^^^^^^^^^^^^^^^ expected `Live<'_>`, found `&OrderRecord`
+  |             |
+  |             arguments to this function are incorrect
+  |
+note: method defined here
+ --> src/permit.rs
+  |
+  |     pub fn amend(
+  |            ^^^^^

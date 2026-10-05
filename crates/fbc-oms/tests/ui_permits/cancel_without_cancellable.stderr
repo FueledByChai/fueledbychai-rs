@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/ui_permits/cancel_without_cancellable.rs:6:33
+  |
+6 |     let _ = Cancellable::cancel(reg.get(cid).unwrap(), caps);
+  |             ------------------- ^^^^^^^^^^^^^^^^^^^^^ expected `Cancellable<'_>`, found `&OrderRecord`
+  |             |
+  |             arguments to this function are incorrect
+  |
+note: method defined here
+ --> src/permit.rs
+  |
+  |     pub fn cancel(self, caps: &OrderCaps) -> CancelChoice {
+  |            ^^^^^^
