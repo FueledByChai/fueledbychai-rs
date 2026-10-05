@@ -20,6 +20,11 @@
 //! the stood-in venue declares; fills carry realized P&L and realized funding where it declares
 //! them and `None` where not; a derived-fills venue's fills arrive only as order updates; and
 //! each of those venues is placed through the codec rather than refused (decision 0050).
+//!
+//! FBC-4qr's done line: a crossing order is prevented from trading with our own resting order
+//! as the stood-in venue's STP scope says, and a second crossing order before the next book
+//! update (or a later item of one batch) finds only what the first left at each displayed
+//! level (decision 0051).
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
@@ -735,6 +740,16 @@ fn a_crossing_order_fills_against_the_displayed_levels_as_the_taker() {
         fill_of(&got[0].1),
         Some((202, 1, Liquidity3::Maker, expected_fee(202, 1, MAKER_BPS)))
     );
+    // Its last lot is cancelled, so no later sell meets it (decision 0051), and the book
+    // restates the levels it took, which it had taken until then.
+    v.send(
+        cancel(OrderRef::Venue(order_of(&got[1].1).vid.clone().unwrap())),
+        9,
+        T0 + 7 * MS,
+    );
+    v.snapshot(T0 + 8 * MS, &[(199, 5), (198, 5)], &asks);
+    v.tick(T0 + 12 * MS);
+    assert_eq!(v.answers().len(), 2);
 
     // Immediate or cancel: the rest is cancelled unfilled.
     v.send(buy(TifTag::Ioc), 2, T0 + 10 * MS);
@@ -754,7 +769,8 @@ fn a_crossing_order_fills_against_the_displayed_levels_as_the_taker() {
         state_of(&got[1].1),
         Some((VenueOrderState::Canceled(CancelReason::Unfilled), 0))
     );
-    // A market order sweeps every displayed level and fills whole.
+    // A market order sweeps every displayed level, restated, and fills whole.
+    v.snapshot(T0 + 26 * MS, &[(199, 5), (198, 5)], &asks);
     let market = place(cid(), Side::Buy, OrderKind::Market, 10, TifTag::Ioc, false);
     v.send(market, 4, T0 + 30 * MS);
     v.tick(T0 + 35 * MS);
@@ -3711,9 +3727,10 @@ fn a_resync_is_answered_after_the_latency_with_the_resting_orders_and_the_positi
         qty: lots(3),
     };
     v.engine.inject(MonoNs(T0 + 11 * MS), injected).unwrap();
-    // Five lots ahead of the bid, then one fills it in part (+1); seven lots bought at 201
-    // consume the five ahead of the offer and fill two of its three (-2).
-    v.trade(T0 + 20 * MS, Aggressor::Seller, 199, 6);
+    // Four lots ahead of the bid, since the taker took the first of the five (decision
+    // 0051), then one fills it in part (+1); seven lots bought at 201 consume the five ahead of
+    // the offer and fill two of its three (-2).
+    v.trade(T0 + 20 * MS, Aggressor::Seller, 199, 5);
     v.trade(T0 + 21 * MS, Aggressor::Buyer, 201, 7);
     let fills: Vec<_> = v.answers().iter().filter_map(|(_, e)| fill_of(e)).collect();
     assert_eq!(fills.len(), 2);
@@ -4186,4 +4203,321 @@ fn a_derived_fills_venue_reports_its_fills_only_as_order_updates() {
         qty: SignedLots(7),
         avg_entry: None,
     }));
+}
+
+/// A venue whose self-trade prevention covers `scope`, otherwise the default one.
+fn stp(bracket: Bracket, scope: StpScope) -> Venue {
+    let mut c = rich_config(bracket);
+    c.matching.stp_scope = scope;
+    Venue::with(c)
+}
+
+/// A crossing order of `qty` lots on `side` up to `px`, good till cancelled or as `tif` says.
+fn crossing(side: Side, px: i64, qty: i64, tif: TifTag) -> VenueCommand {
+    place(
+        cid(),
+        side,
+        OrderKind::Limit { px: Ticks(px) },
+        qty,
+        tif,
+        false,
+    )
+}
+
+/// The (price, quantity, liquidity) of each fill among `got`, in order.
+fn takes(got: &[(MonoNs, ExecEvent)]) -> Vec<(i64, i64, Liquidity3)> {
+    let fills = got.iter().filter_map(|(_, ev)| fill_of(ev));
+    fills.map(|(px, qty, liq, _)| (px, qty, liq)).collect()
+}
+
+/// The (state, cumulative fill) of each order event among `got`, in order.
+fn states(got: &[(MonoNs, ExecEvent)]) -> Vec<(VenueOrderState, i64)> {
+    got.iter().filter_map(|(_, ev)| state_of(ev)).collect()
+}
+
+const SELF_TRADE: VenueOrderState = VenueOrderState::Canceled(CancelReason::SelfTrade);
+
+#[test]
+fn a_crossing_order_is_prevented_from_trading_with_our_own_resting_order_as_the_stp_scope_says() {
+    // FBC-4qr's done line, first half. One account's orders never meet under an `Account` or
+    // `Owner` scope: the venue expires the taker where it would meet our own resting order
+    // (Paradex's default, `EXPIRE_TAKER`), after the public size ahead of that order.
+    for scope in [StpScope::Account, StpScope::Owner] {
+        let mut v = stp(Bracket::Pessimistic, scope);
+        v.snapshot(T0, &[(199, 5)], &[(202, 5), (203, 5)]);
+        // Our own offer inside the spread, at 201, which the real book never shows.
+        let ours = v.rest(limit(cid(), Side::Sell, 201, 2), 1, T0);
+        // A buy up to 203 meets it before any public offer: it trades nothing and ends.
+        v.send(crossing(Side::Buy, 203, 4, TifTag::Gtc), 2, T0 + 10 * MS);
+        v.tick(T0 + 15 * MS);
+        let got = v.events();
+        assert_eq!(outcome_of(&got[0].1), Some((2, ACCEPTED)), "{got:?}");
+        assert_eq!(takes(&got), [], "{scope:?}: {got:?}");
+        assert_eq!(states(&got), [(SELF_TRADE, 0)], "{scope:?}");
+        // Ours is untouched: still resting, first in its queue, and a trade fills it.
+        assert_eq!(v.ahead(&ours), 0);
+        v.trade(T0 + 20 * MS, Aggressor::Buyer, 201, 2);
+        let got = v.events();
+        assert_eq!(takes(&got), [(201, 2, Liquidity3::Maker)]);
+
+        // Our offer behind five public lots at 202: a buy of seven takes those five first, as
+        // the venue matches in time priority, then is expired where it would meet ours.
+        let ours = v.rest(limit(cid(), Side::Sell, 202, 1), 3, T0 + 30 * MS);
+        assert_eq!(v.ahead(&ours), 5);
+        v.send(crossing(Side::Buy, 203, 7, TifTag::Gtc), 4, T0 + 40 * MS);
+        v.tick(T0 + 45 * MS);
+        let got = v.events();
+        assert_eq!(takes(&got), [(202, 5, Liquidity3::Taker)], "{got:?}");
+        assert_eq!(states(&got), [(SELF_TRADE, 5)]);
+        // The five it took were ahead of ours, so ours is first now: a buy of one fills it.
+        assert_eq!(v.ahead(&ours), 0);
+        v.trade(T0 + 50 * MS, Aggressor::Buyer, 202, 1);
+        assert_eq!(takes(&v.events()), [(202, 1, Liquidity3::Maker)]);
+
+        // A post-only bid at our own offer's price would cross it: refused, as the venue does.
+        let ours = v.rest(limit(cid(), Side::Sell, 201, 1), 5, T0 + 60 * MS);
+        v.send(limit(cid(), Side::Buy, 201, 1), 6, T0 + 70 * MS);
+        v.tick(T0 + 75 * MS);
+        assert_eq!(
+            rejected(&v.events()[0].1),
+            Some(RejectKind::PostOnlyWouldCross)
+        );
+        assert_eq!(v.ahead(&ours), 0);
+    }
+}
+
+#[test]
+fn a_venue_that_prevents_no_self_trade_fills_both_of_our_orders() {
+    // With no scope, the crossing order trades with ours: a taker fill for it and a maker fill
+    // for ours at our price, each charged, then the public size behind and beyond.
+    let mut v = stp(Bracket::Pessimistic, StpScope::None);
+    v.snapshot(T0, &[(199, 5)], &[(202, 5), (203, 5)]);
+    let ours = v.rest(limit(cid(), Side::Sell, 201, 2), 1, T0);
+    v.send(crossing(Side::Buy, 202, 4, TifTag::Ioc), 2, T0 + 10 * MS);
+    v.tick(T0 + 15 * MS);
+    let got = v.events();
+    assert_eq!(
+        takes(&got),
+        [
+            (201, 2, Liquidity3::Taker),
+            (202, 2, Liquidity3::Taker),
+            (201, 2, Liquidity3::Maker)
+        ],
+        "{got:?}"
+    );
+    let maker = got.iter().filter_map(|(_, ev)| match ev {
+        ExecEvent::Fill(f) if f.liquidity == Liquidity3::Maker => Some(f.vid().cloned()),
+        _ => None,
+    });
+    assert_eq!(maker.collect::<Vec<_>>(), [Some(ours.clone())]);
+    assert_eq!(
+        states(&got),
+        [(VenueOrderState::Filled, 4), (VenueOrderState::Filled, 2)]
+    );
+    assert_eq!(v.engine.queue_position(&ours), None);
+    // The two fills of ours net out in the position a resync reports.
+    v.resync(T0 + 20 * MS);
+    v.tick(T0 + 30 * MS);
+    let got = v.frames();
+    assert!(got[0].1.contains(&ExecEvent::ResyncPosition {
+        inst: INST,
+        qty: SignedLots(2),
+        avg_entry: None,
+    }));
+}
+
+#[test]
+fn a_self_trade_the_fee_book_cannot_charge_is_refused() {
+    // The maker side of a self-trade needs a maker rate like any fill: without one the
+    // placement is refused and nothing changes.
+    let mut book = FeeBook::new();
+    let (key, entry) = rate(INST, Liquidity::Taker, TAKER_BPS, FeeSource::ConfigOverride);
+    book.insert(key, entry);
+    let mut c = config(Bracket::Pessimistic, VenueFeeSign::PositiveIsRebate, book);
+    c.matching.stp_scope = StpScope::None;
+    let mut v = Venue::with(c);
+    v.snapshot(T0, &[(199, 5)], &[(202, 5)]);
+    let ours = v.rest(limit(cid(), Side::Sell, 201, 2), 1, T0);
+    v.send(crossing(Side::Buy, 202, 1, TifTag::Ioc), 2, T0 + 10 * MS);
+    v.tick(T0 + 15 * MS);
+    let got = v.events();
+    assert_eq!(refusal(&got[0].1), (RejectKind::Other, "no_fee".to_owned()));
+    assert_eq!(got.len(), 1);
+    assert_eq!(v.ahead(&ours), 0);
+    assert_eq!(v.engine.queue_position(&ours).unwrap().remaining, lots(2));
+}
+
+#[test]
+fn a_fill_or_kill_order_our_own_order_stops_takes_nothing() {
+    // Expired at our own order before it could fill whole, it fills nothing.
+    let mut v = stp(Bracket::Pessimistic, StpScope::Account);
+    v.snapshot(T0, &[(199, 5)], &[(201, 5), (203, 5)]);
+    let ours = v.rest(limit(cid(), Side::Sell, 202, 2), 1, T0);
+    v.send(crossing(Side::Buy, 203, 8, TifTag::Fok), 2, T0 + 10 * MS);
+    v.tick(T0 + 15 * MS);
+    let got = v.events();
+    assert_eq!(takes(&got), []);
+    assert_eq!(states(&got), [(SELF_TRADE, 0)]);
+    // Nothing was taken: the next buy still finds all five at 201.
+    v.send(crossing(Side::Buy, 201, 5, TifTag::Ioc), 3, T0 + 20 * MS);
+    v.tick(T0 + 25 * MS);
+    assert_eq!(takes(&v.events()), [(201, 5, Liquidity3::Taker)]);
+    assert_eq!(v.ahead(&ours), 0);
+}
+
+#[test]
+fn a_second_crossing_order_before_the_next_book_update_finds_only_what_the_first_left() {
+    // FBC-4qr's done line, second half: what a crossing order takes stays taken from each
+    // displayed level until the next book event at that level replaces it.
+    let mut v = stp(Bracket::Pessimistic, StpScope::Account);
+    v.snapshot(T0, &[(199, 5)], &[(201, 3), (202, 2), (203, 5)]);
+    v.send(crossing(Side::Buy, 202, 4, TifTag::Ioc), 1, T0);
+    v.tick(T0 + 5 * MS);
+    let got = v.events();
+    let taken = [(201, 3, Liquidity3::Taker), (202, 1, Liquidity3::Taker)];
+    assert_eq!(takes(&got), taken);
+    // The second finds 201 empty and one lot at 202, then goes on to 203.
+    v.send(crossing(Side::Buy, 203, 4, TifTag::Ioc), 2, T0 + 10 * MS);
+    v.tick(T0 + 15 * MS);
+    let got = v.events();
+    let taken = [(202, 1, Liquidity3::Taker), (203, 3, Liquidity3::Taker)];
+    assert_eq!(takes(&got), taken, "{got:?}");
+    // A post-only bid at 201 no longer crosses: the level is empty until the book says so.
+    let bid = v.rest(limit(cid(), Side::Buy, 201, 1), 3, T0 + 20 * MS);
+    v.send(cancel(OrderRef::Venue(bid)), 4, T0 + 30 * MS);
+    v.tick(T0 + 35 * MS);
+    v.events();
+    // An offer resting at 203 queues behind the two lots left there, not the five shown.
+    let offer = v.rest(limit(cid(), Side::Sell, 203, 1), 5, T0 + 40 * MS);
+    assert_eq!(v.ahead(&offer), 2);
+    // The book's next event at 201, though it repeats the size, replaces what was taken: a
+    // buy finds the three lots again. 202 is still empty, 203 still has two before ours.
+    v.level(T0 + 50 * MS, BookSide::Ask, 201, 3);
+    v.send(crossing(Side::Buy, 203, 6, TifTag::Ioc), 6, T0 + 60 * MS);
+    v.tick(T0 + 65 * MS);
+    let got = v.events();
+    let taken = [(201, 3, Liquidity3::Taker), (203, 2, Liquidity3::Taker)];
+    assert_eq!(takes(&got), taken, "{got:?}");
+    assert_eq!(states(&got), [(SELF_TRADE, 5)]);
+    // A replacement snapshot restates every level, so nothing taken survives it, even at a
+    // level it leaves out that a later delta shows again.
+    v.snapshot(T0 + 70 * MS, &[(199, 5)], &[(201, 3), (203, 5)]);
+    v.level(T0 + 71 * MS, BookSide::Ask, 202, 2);
+    v.send(crossing(Side::Buy, 202, 5, TifTag::Ioc), 7, T0 + 80 * MS);
+    v.tick(T0 + 85 * MS);
+    let taken = [(201, 3, Liquidity3::Taker), (202, 2, Liquidity3::Taker)];
+    assert_eq!(takes(&v.events()), taken);
+}
+
+#[test]
+fn two_marketable_items_of_one_batch_never_take_the_same_lots() {
+    // FBC-nv2's batch (Codex r4186693194): the items are placed in turn, so the second finds
+    // only what the first left, and meets a resting item of the same batch as our own order.
+    let mut v = stp(Bracket::Pessimistic, StpScope::Account);
+    v.snapshot(T0, &[(199, 5)], &[(201, 3), (202, 5)]);
+    let items = vec![
+        new_order(crossing(Side::Buy, 201, 2, TifTag::Ioc)),
+        new_order(crossing(Side::Buy, 201, 2, TifTag::Ioc)),
+        new_order(limit(cid(), Side::Buy, 200, 1)),
+        new_order(crossing(Side::Sell, 199, 3, TifTag::Ioc)),
+    ];
+    v.send(VenueCommand::PlaceBatch(items), 1, T0);
+    v.tick(T0 + 5 * MS);
+    let got = v.events();
+    assert_eq!(
+        takes(&got),
+        [(201, 2, Liquidity3::Taker), (201, 1, Liquidity3::Taker)],
+        "{got:?}"
+    );
+    assert_eq!(
+        states(&got),
+        [
+            (VenueOrderState::Filled, 2),
+            (VenueOrderState::Canceled(CancelReason::Unfilled), 1),
+            (VenueOrderState::Open, 0),
+            (SELF_TRADE, 0)
+        ]
+    );
+}
+
+#[test]
+fn an_amend_that_would_meet_our_own_order_is_expired_after_its_amended_event() {
+    // An amend matched again as a new order (decision 0046) meets our own orders as a
+    // placement does: amended, then expired where it would trade with ours.
+    let mut c = rich_config(Bracket::Pessimistic);
+    c.matching.stp_scope = StpScope::Account;
+    let mut v = Venue::with(c);
+    v.snapshot(T0, &[(199, 5)], &[(203, 5)]);
+    let ours = v.rest(limit(cid(), Side::Sell, 201, 1), 1, T0);
+    let bid = cid();
+    let resting = v.rest(limit(bid, Side::Buy, 199, 2), 2, T0 + 10 * MS);
+    let mut to = amend(OrderRef::Venue(resting), Side::Buy, 202, 2, 0);
+    to.post_only = false;
+    v.send(VenueCommand::Amend(to), 3, T0 + 20 * MS);
+    v.tick(T0 + 25 * MS);
+    let got = v.events();
+    assert_eq!(outcome_of(&got[0].1), Some((3, ACCEPTED)), "{got:?}");
+    assert_eq!(
+        states(&got),
+        [
+            (VenueOrderState::Amended { new_vid: None }, 0),
+            (SELF_TRADE, 0)
+        ],
+        "{got:?}"
+    );
+    assert_eq!(v.ahead(&ours), 0);
+}
+
+#[test]
+fn our_order_a_self_trade_fills_in_part_rests_with_the_rest() {
+    // With no scope, a crossing order smaller than ours fills it in part; the rest keeps its
+    // place, first in its queue, and the next trade at its price fills it.
+    let mut v = stp(Bracket::Pessimistic, StpScope::None);
+    v.snapshot(T0, &[(199, 5)], &[(202, 5)]);
+    let ours = v.rest(limit(cid(), Side::Sell, 201, 3), 1, T0);
+    v.send(crossing(Side::Buy, 201, 2, TifTag::Ioc), 2, T0 + 10 * MS);
+    v.tick(T0 + 15 * MS);
+    let got = v.events();
+    assert_eq!(
+        takes(&got),
+        [(201, 2, Liquidity3::Taker), (201, 2, Liquidity3::Maker)]
+    );
+    assert_eq!(
+        states(&got),
+        [(VenueOrderState::Filled, 2), (VenueOrderState::Open, 2)]
+    );
+    let pos = v.engine.queue_position(&ours).unwrap();
+    assert_eq!((pos.remaining, pos.ahead), (lots(1), lots(0)));
+    v.trade(T0 + 20 * MS, Aggressor::Buyer, 201, 1);
+    let got = v.events();
+    assert_eq!(takes(&got), [(201, 1, Liquidity3::Maker)]);
+    assert_eq!(states(&got), [(VenueOrderState::Filled, 3)]);
+}
+
+#[test]
+fn a_crossing_order_meets_our_orders_at_one_price_in_their_arrival_order() {
+    // Two of ours at 201, both behind its one public lot. The venue matches in time priority:
+    // a buy of three takes that lot, then trades with the earlier of ours, then the later.
+    let mut v = stp(Bracket::Pessimistic, StpScope::None);
+    v.snapshot(T0, &[(199, 5)], &[(201, 1), (202, 5)]);
+    let first = v.rest(limit(cid(), Side::Sell, 201, 1), 1, T0);
+    let second = v.rest(limit(cid(), Side::Sell, 201, 2), 2, T0 + 10 * MS);
+    assert_eq!((v.ahead(&first), v.ahead(&second)), (1, 1));
+    v.send(crossing(Side::Buy, 201, 3, TifTag::Ioc), 3, T0 + 20 * MS);
+    v.tick(T0 + 25 * MS);
+    let got = v.events();
+    assert_eq!(
+        takes(&got),
+        [
+            (201, 3, Liquidity3::Taker),
+            (201, 1, Liquidity3::Maker),
+            (201, 1, Liquidity3::Maker)
+        ],
+        "{got:?}"
+    );
+    assert_eq!(filled(&got)[1..], [first.clone(), second.clone()]);
+    // The second rests with one lot, nothing ahead of it.
+    let pos = v.engine.queue_position(&second).unwrap();
+    assert_eq!((pos.remaining, pos.ahead), (lots(1), lots(0)));
+    assert_eq!(v.engine.queue_position(&first), None);
 }

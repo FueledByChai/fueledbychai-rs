@@ -39,6 +39,9 @@
 //!   Answers are ordered by the stood-in venue's ordering key, fills carry the realized P&L
 //!   and funding its fills declare, and a venue whose fills are derived from order status gets
 //!   order updates in their place (0050).
+//!   A crossing order meets SimVenue's own resting orders as the stood-in venue's self-trade
+//!   prevention says, and what it takes from a displayed level stays taken until the book's
+//!   next event there (0051).
 //!
 //! Every number SimVenue uses, its capabilities, latency, bracket and fee rates included, is in
 //! the consumer's [`SimConfig`]. Not here yet: hosting in the runtime (FBC-6mf) and replay

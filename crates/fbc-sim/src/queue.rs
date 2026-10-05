@@ -186,6 +186,26 @@ impl QueueModel {
         }
     }
 
+    /// The modelled orders resting at `side` and `px`, in the order the venue matches them:
+    /// every public order before any RPI order, each channel in arrival order (0038).
+    pub(crate) fn at_level(&self, side: Side, px: Ticks) -> Vec<(OrderKey, QueuePos)> {
+        let mut at: Vec<_> = self
+            .orders
+            .iter()
+            .filter(|(_, held)| held.pos.side == side && held.pos.px == px)
+            .collect();
+        at.sort_by(|(_, a), (_, b)| a.pos.channel.cmp(&b.pos.channel).then(a.seq.cmp(&b.seq)));
+        at.into_iter().map(|(key, held)| (*key, held.pos)).collect()
+    }
+
+    /// Sets the public size ahead of the order under `key`, keeping its place among the
+    /// modelled orders: a crossing order took size ahead of it (decision 0051).
+    pub(crate) fn set_ahead(&mut self, key: OrderKey, ahead: Lots) {
+        if let Some(held) = self.orders.get_mut(&key) {
+            held.pos.ahead = ahead;
+        }
+    }
+
     /// Queues a new order behind its level's size on the public `book`, less every modelled
     /// public order the model already holds at its side and price (they are queued themselves,
     /// so they never count as size ahead). `book` is the level as the simulated venue shows it
