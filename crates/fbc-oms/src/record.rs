@@ -209,8 +209,11 @@ pub struct OrderRecord {
     /// tied a confirmation to them: any of them may rest at the venue.
     unsettled: Option<Lots>,
     /// The total of an amend built ([`Live::amend`](crate::Live::amend)) and not yet reported
-    /// sent: counted as resting from when it is built, so a later check sees it.
-    built: Option<Lots>,
+    /// sent, with the build's number: counted as resting from when it is built, so a later
+    /// check sees it.
+    built: Option<(Lots, u64)>,
+    /// How many amends were built for the order: the next build's number.
+    builds: u64,
     /// The latest venue ordering key applied when an amend was replaced in flight, or since
     /// while a command was in flight: only a total stated under a later key, with no command
     /// in flight, settles `unsettled`.
@@ -269,6 +272,7 @@ impl OrderRecord {
             cum_fills: Lots::ZERO,
             unsettled: None,
             built: None,
+            builds: 0,
             unsettled_bar: None,
             state: OrdState::PendingNew,
             intent: Intent::None,
@@ -364,27 +368,52 @@ impl OrderRecord {
         }
     }
 
-    /// What [`Self::resting`] would be once an amend to the total `qty` is sent: the larger
-    /// of the order's resting quantity now and that of the amend, until it is acknowledged.
-    pub(crate) fn resting_if_amended(&self, qty: Lots) -> Lots {
+    /// What the order may still add to the position beyond what the inventory counts, for the
+    /// inventory cap (0005's I6): its [`Self::resting`] quantity, plus the fills the venue
+    /// reported on its order updates (`cum_venue`) that the ledger has not counted yet, which
+    /// the inventory does not hold until their fill events arrive; a terminal order keeps
+    /// those until then. That is the largest total the venue may hold, or the venue's
+    /// cumulative fill when larger, less the fills counted (`cum_fills`).
+    pub fn exposure(&self) -> Lots {
+        let held = if self.state.is_terminal() {
+            self.cum_venue
+        } else {
+            self.ceiling().max(self.cum_venue)
+        };
+        held.checked_sub(self.cum_fills).unwrap_or(Lots::ZERO)
+    }
+
+    /// What [`Self::exposure`] would be once an amend to the total `qty` is built: the larger
+    /// of the order's total now and the amend's, until it is acknowledged.
+    pub(crate) fn exposure_if_amended(&self, qty: Lots) -> Lots {
         self.ceiling()
             .max(qty)
-            .checked_sub(self.filled())
+            .max(self.cum_venue)
+            .checked_sub(self.cum_fills)
             .unwrap_or(Lots::ZERO)
     }
 
     /// The total of the amend built and not yet reported sent ([`Self::amend_sent`]), if any.
     pub fn amend_built(&self) -> Option<Lots> {
-        self.built
+        self.built.map(|(qty, _)| qty)
     }
 
-    pub(crate) fn set_amend_built(&mut self, qty: Lots) {
-        self.built = Some(qty);
+    /// Records an amend to the total `qty` built, and returns the build's number.
+    pub(crate) fn set_amend_built(&mut self, qty: Lots) -> u64 {
+        let build = self.builds;
+        self.builds += 1;
+        self.built = Some((qty, build));
+        build
     }
 
-    /// Releases the amend built and never handed to a gateway; whether there was one.
-    pub(crate) fn withdraw_built(&mut self) -> bool {
-        self.built.take().is_some()
+    /// Releases the amend built as number `build` and never handed to a gateway; whether it
+    /// was the one built and not yet reported sent.
+    pub(crate) fn withdraw_built(&mut self, build: u64) -> bool {
+        let ours = self.built.is_some_and(|(_, b)| b == build);
+        if ours {
+            self.built = None;
+        }
+        ours
     }
 
     /// The largest total the venue may hold: the order's total, the amend in flight's, an
@@ -397,7 +426,7 @@ impl OrderRecord {
         };
         self.qty
             .max(pending)
-            .max(self.built.unwrap_or(Lots::ZERO))
+            .max(self.amend_built().unwrap_or(Lots::ZERO))
             .max(self.unsettled.unwrap_or(Lots::ZERO))
     }
 
@@ -513,6 +542,7 @@ impl OrderRecord {
         let built = self
             .built
             .take()
+            .map(|(qty, _)| qty)
             .filter(|b| !matches!(intent, Intent::PendingAmend { qty, .. } if qty == *b));
         let replaced = match self.intent {
             Intent::PendingAmend { qty, .. } => Some(qty),

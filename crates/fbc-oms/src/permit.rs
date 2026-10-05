@@ -28,8 +28,8 @@
 use std::collections::BTreeMap;
 
 use fbc_core::{
-    AmendOrder, CancelOrder, ChosenRef, ClientOrderId, InstrumentId, Lots, Namespace, OrderCaps,
-    OrderKind, OrderRef, TagSet, Ticks, VenueCommand,
+    AmendOrder, AmendQty, CancelOrder, ChosenRef, ClientOrderId, InstrumentId, Lots, Namespace,
+    OrderCaps, OrderKind, OrderRef, TagSet, Ticks, VenueCommand,
 };
 
 use crate::caps::{CapRefusal, Exposure};
@@ -90,6 +90,10 @@ pub enum AmendRefusal {
     /// The order carries no reference the venue's amend can name
     /// ([`AmendCaps::refs`](fbc_core::AmendCaps::refs)).
     NoDeclaredReference,
+    /// The venue's amend states the quantity still to fill ([`AmendQty::Remaining`]): what it
+    /// may rest once fills arrive while the amend is on its way is not modelled against the
+    /// inventory cap, so no amend is built (FBC-b0z9).
+    RemainingQty,
     /// A pre-trade cap refused it (0013 rule 2): the amend would take the worst case on the
     /// order's side past the inventory cap, or its market has no cap configured.
     Capped(CapRefusal),
@@ -104,6 +108,9 @@ pub enum AmendRefusal {
 #[derive(Eq, PartialEq, Debug)]
 pub struct PermittedCommand {
     cmd: VenueCommand,
+    /// For an amend, its order and the build's number, by which alone its reservation is
+    /// released ([`Registry::amend_not_submitted`]).
+    built: Option<(ClientOrderId, u64)>,
 }
 
 impl PermittedCommand {
@@ -119,7 +126,12 @@ impl PermittedCommand {
 
     /// A place or a batch of places the pre-trade caps admitted.
     pub(crate) fn admitted(cmd: VenueCommand) -> PermittedCommand {
-        PermittedCommand { cmd }
+        PermittedCommand { cmd, built: None }
+    }
+
+    /// For an amend, its order and the build's number.
+    pub(crate) fn built(&self) -> Option<(ClientOrderId, u64)> {
+        self.built
     }
 }
 
@@ -222,6 +234,9 @@ impl<'r> Live<'r> {
     ) -> Result<PermittedCommand, AmendRefusal> {
         let rec = &*self.rec;
         let amend_caps = caps.amend.as_ref().ok_or(AmendRefusal::NotAmendable)?;
+        if amend_caps.qty_semantics == AmendQty::Remaining {
+            return Err(AmendRefusal::RemainingQty);
+        }
         if rec.placed().kind == OrderKind::Market {
             return Err(AmendRefusal::NotLimit);
         }
@@ -256,11 +271,13 @@ impl<'r> Live<'r> {
             return Err(AmendRefusal::NoDeclaredReference);
         }
         self.exposure
-            .admit(rec.resting_if_amended(qty))
+            .admit(rec.exposure_if_amended(qty))
             .map_err(AmendRefusal::Capped)?;
-        self.rec.set_amend_built(qty);
+        let cid = rec.cid();
+        let build = self.rec.set_amend_built(qty);
         Ok(PermittedCommand {
             cmd: VenueCommand::Amend(amend),
+            built: Some((cid, build)),
         })
     }
 }
@@ -294,9 +311,7 @@ impl<'r> Cancellable<'r> {
         match cancel_of(self.rec, caps, caps.cancel_refs) {
             Some(cancel) => {
                 self.rec.set_cancel_awaits_ack(false);
-                CancelChoice::Send(PermittedCommand {
-                    cmd: VenueCommand::Cancel(cancel),
-                })
+                CancelChoice::Send(PermittedCommand::admitted(VenueCommand::Cancel(cancel)))
             }
             None => {
                 self.rec.set_cancel_awaits_ack(true);
@@ -358,6 +373,7 @@ pub(crate) fn tombstone_of(rec: &OrderRecord, caps: &OrderCaps) -> Option<Permit
             side: placed.side,
             placement_nonce: None,
         }),
+        built: None,
     })
 }
 
@@ -374,9 +390,7 @@ pub(crate) fn batches(items: Vec<CancelOrder>, max_items: u16) -> Vec<PermittedC
         .flat_map(|items| {
             items
                 .chunks(size)
-                .map(|chunk| PermittedCommand {
-                    cmd: VenueCommand::CancelMany(chunk.to_vec()),
-                })
+                .map(|chunk| PermittedCommand::admitted(VenueCommand::CancelMany(chunk.to_vec())))
                 .collect::<Vec<_>>()
         })
         .collect()
@@ -399,6 +413,6 @@ impl OrderRecord {
 impl PermittedCommand {
     /// A permitted command from any command, for the authorization's own tests.
     pub(crate) fn for_test(cmd: VenueCommand) -> PermittedCommand {
-        PermittedCommand { cmd }
+        PermittedCommand::admitted(cmd)
     }
 }
