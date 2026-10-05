@@ -207,7 +207,7 @@ impl QueueModel {
     /// [`accept`](QueueModel::accept) with the level's size given rather than read from a
     /// book: `shown` is the size at the order's side and price as the simulated venue shows it,
     /// with the modelled public orders it holds there. SimVenue gives it when its book, the
-    /// real venue's, does not show its own simulated orders (decision 0044).
+    /// real venue's, does not show its own simulated orders (decision 0045).
     pub fn accept_shown(
         &mut self,
         key: OrderKey,
