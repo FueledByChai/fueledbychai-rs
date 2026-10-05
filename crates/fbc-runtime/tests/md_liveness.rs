@@ -18,11 +18,11 @@ use common::toy::{self, KEEPALIVE, LIFETIME_MS, ToyVenue};
 use common::{PING, PONG, ScriptedHttp, ScriptedWs};
 use fbc_core::{
     ConnKey, EndpointPlan, Envelope, FeedHealth, LimitScope, MdEvent, MdTransport, OpKind,
-    RateLimit, TagSet, VenueConfig, WireUrl,
+    RateCharge, RateLimit, TagSet, TrafficClass, VenueConfig, WireSlice, WireUrl,
 };
 use fbc_runtime::{
-    Connector, IngestClock, Liveness, LivenessError, MdControl, MdSession, MdSessionConfig,
-    MdVenue, MdVenueConfig, ProxyConfig, ReconnectPacing, SessionError,
+    Connector, IngestClock, Liveness, LivenessError, MdControl, MdHandler, MdSession,
+    MdSessionConfig, MdVenue, MdVenueConfig, Outbox, ProxyConfig, ReconnectPacing, SessionError,
 };
 use tokio::time::{Instant, advance};
 
@@ -462,6 +462,31 @@ fn a_handler_may_change_the_desired_set_from_a_stale_report() {
         .expect("the session finished");
 }
 
+/// A consumer's handler that answers each stale report by wanting C instead, and by issuing a
+/// write, which the session must send on neither the closing connection nor the next.
+struct Resubscribe {
+    control: Rc<RefCell<Option<MdControl>>>,
+    reports: Rc<RefCell<u32>>,
+}
+
+impl MdHandler for Resubscribe {
+    fn on_md(&mut self, _: Envelope<MdEvent>) {}
+
+    fn on_md_with(&mut self, env: Envelope<MdEvent>, out: &mut Outbox) {
+        if let (MdEvent::Health { .. }, Some(control)) = (env.body, self.control.borrow().as_ref())
+        {
+            *self.reports.borrow_mut() += 1;
+            control.set_desired([toy::sub(3)]);
+            let charge = RateCharge::one(OpKind::Control, None);
+            out.send(
+                WireSlice::plain(b"resub".to_vec()),
+                TrafficClass::Normal,
+                charge,
+            );
+        }
+    }
+}
+
 async fn resubscribe_on_stale() {
     let frozen = freeze();
     let mut server = ScriptedWs::start().await;
@@ -469,12 +494,9 @@ async fn resubscribe_on_stale() {
     let config = toy_session(server.url(), &[], liveness);
     let slot: Rc<RefCell<Option<MdControl>>> = Rc::default();
     let reports = Rc::new(RefCell::new(0));
-    let (to, counted) = (slot.clone(), reports.clone());
-    let handler = move |env: Envelope<MdEvent>| {
-        if let (MdEvent::Health { .. }, Some(control)) = (env.body, to.borrow().as_ref()) {
-            *counted.borrow_mut() += 1;
-            control.set_desired([toy::sub(3)]);
-        }
+    let handler = Resubscribe {
+        control: slot.clone(),
+        reports: reports.clone(),
     };
     let (mut session, control) = MdSession::new(config, handler).unwrap();
     *slot.borrow_mut() = Some(control);
@@ -484,20 +506,25 @@ async fn resubscribe_on_stale() {
         assert_eq!(first.recv().await, "sub|add=A,B");
         churn().await;
         advance(ms(5_000)).await;
+        // Nothing more on the silent connection.
         assert_eq!(first.next().await, None);
         churn().await;
         advance(ms(1_000)).await;
         let mut second = server.accept().await;
         assert_eq!(second.recv().await, "hello|codec=1|plan=3");
         assert_eq!(second.recv().await, "sub|add=C");
+        // Nor on the next, when the session next writes for an input.
+        second.send("say|id=1");
+        assert_eq!(second.recv().await, "said|id=1");
         slot.borrow_mut().take();
         assert_eq!(second.next().await, None);
     };
     let (run, ()) = tokio::join!(session.run(), script);
     run.unwrap();
     drop(frozen);
-    // Both of the silent epoch's subscriptions were reported.
+    // Both of the silent epoch's subscriptions were reported, and each write refused.
     assert_eq!(*reports.borrow(), 2);
+    assert_eq!(session.counters().refused_effects, 2);
 }
 
 #[tokio::test(start_paused = true)]
