@@ -3,8 +3,8 @@
 //!
 //! 1. From its subscription, a book buffers its events. The first event asks for the snapshot,
 //!    `GET /fapi/v1/depth?symbol=<SYMBOL>&limit=<limit>`, as an [`Effect::Http`] with the
-//!    configured timeout and the limit's documented weight against the REST budget. (The
-//!    runtime's `MdSession` does not make HTTP requests yet: FBC-moe.)
+//!    configured timeout and the limit's documented weight against the REST budget; the
+//!    runtime's `MdSession` makes it and hands the result to `on_http` (FBC-klr, FBC-moe).
 //! 2. The response is held until an event bridges it: an event whose `u` is below the
 //!    snapshot's `lastUpdateId` is dropped; the first one after must straddle it
 //!    (`U <= lastUpdateId <= u`). That event publishes `BookSnapshotBegin` under the book's next
