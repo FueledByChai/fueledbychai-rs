@@ -25,9 +25,9 @@
 //! frame for the session's own stream is charged to the buckets and written, a reconnect of it
 //! ends the epoch and opens the next through the consumer's [`ReconnectPacing`]. What `on_open`
 //! asks for is charged together first: buckets that refuse it for now end the epoch as a drop,
-//! so `on_open` runs again on the next, and frames that never fit together end the session. An
-//! error ends the session with its epoch retired, so a later run stamps the next connection
-//! under the next epoch. A frame or reconnect for another stream is a codec defect,
+//! so `on_open` runs again on the next, and frames that never fit together end the session. A
+//! session runs once ([`ExecSession::run`]): after an error, or once stopped, the consumer
+//! builds a new one to connect again. A frame or reconnect for another stream is a codec defect,
 //! refused and counted, and so, for now, are timers and HTTP requests, which FBC-bnl brings.
 //! A write waits on its peer at most the consumer's [`WriteStall`] window (0036). Submitting
 //! commands is FBC-0ga's, and journaling FBC-2pr's.
@@ -321,7 +321,6 @@ impl<H: ExecHandler> ExecSession<H> {
             let key = self.current();
             self.in_epoch = Some(key);
             let end = self.connected(ws).await;
-            self.in_epoch = None;
             match end {
                 Ok(End::Stop) => {
                     self.core.rates.closed(key);
@@ -364,6 +363,10 @@ impl<H: ExecHandler> ExecSession<H> {
     async fn connected(&mut self, ws: WebSocket) -> Result<End, ExecSessionError> {
         let key = self.current();
         let end = self.epoch(ws, key).await;
+        // Cleared before the handler is called, so a handler that panics is never told twice
+        // (Codex r4189618551).
+        self.in_epoch = None;
+        self.core.rates.closed(key);
         self.handler.on_epoch_end(key);
         end
     }

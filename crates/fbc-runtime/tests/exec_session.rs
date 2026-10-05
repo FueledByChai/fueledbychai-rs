@@ -36,7 +36,7 @@ use fbc_runtime::{
     ExecSessionError, IngestClock, Input, ProxyConfig, RateError, RateLimiter, ReconnectPacing,
     Request, SafetyReserve, SessionError, Step, WriteStall,
 };
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::time::Instant;
@@ -910,6 +910,36 @@ async fn a_run_dropped_mid_epoch_has_its_epoch_ended_by_the_next_call_or_the_ses
         // Its bucket is forgotten with it (Codex r4189428438).
         assert_eq!(charged(), 0);
     }
+}
+
+/// A handler whose `on_epoch_end` panics, counting its calls.
+struct Panicking(Rc<std::cell::Cell<u32>>);
+
+impl ExecHandler for Panicking {
+    fn on_exec(&mut self, _: Envelope<ExecEvent>) {}
+
+    fn on_epoch_end(&mut self, _: ConnKey) {
+        self.0.set(self.0.get() + 1);
+        panic!("the handler failed");
+    }
+}
+
+#[tokio::test]
+async fn a_handler_that_panics_as_it_is_told_an_epoch_ended_is_never_told_twice() {
+    let mut server = ScriptedWs::start().await;
+    let (config, _) = setup(ExecToy::leak(), &server.url(), quick());
+    let ends = Rc::default();
+    let (mut session, _control) = ExecSession::new(config, Panicking(Rc::clone(&ends))).unwrap();
+    let script = async move {
+        let peer = server.accept().await;
+        peer.drop_conn();
+    };
+    let run = std::panic::AssertUnwindSafe(session.run()).catch_unwind();
+    let (run, ()) = tokio::join!(run, script);
+    assert!(run.is_err());
+    // Dropping the session after the panic tells it nothing again (Codex r4189618551).
+    drop(session);
+    assert_eq!(ends.get(), 1);
 }
 
 #[tokio::test]
