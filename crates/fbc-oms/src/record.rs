@@ -580,9 +580,7 @@ impl OrderRecord {
             self.complete_if_covered();
             return Applied::Amended;
         }
-        if self.state == OrdState::Unknown {
-            self.leave_ladder();
-        }
+        self.placement_settled();
         self.state = self.live_state();
         self.confirm_if_stated(stated);
         self.complete_if_covered();
@@ -642,8 +640,8 @@ impl OrderRecord {
                 if self.state.rank() > 0 {
                     return OutcomeApplied::Unchanged;
                 }
+                self.placement_settled();
                 self.state = self.live_state();
-                self.leave_ladder();
                 OutcomeApplied::Opened
             }
             (OrderOp::Place, SubmitOutcome::Rejected(r)) if r.kind != RejectKind::NotFound => {
@@ -726,9 +724,7 @@ impl OrderRecord {
         if self.complete_if_covered() {
             return FillApplied::Completed;
         }
-        if self.state == OrdState::Unknown {
-            self.leave_ladder();
-        }
+        self.placement_settled();
         self.state = self.live_state();
         FillApplied::Live
     }
@@ -776,6 +772,15 @@ impl OrderRecord {
     fn await_ladder(&mut self, now: MonoNs) -> OutcomeApplied {
         self.enter_ladder(now);
         OutcomeApplied::AwaitingLadder
+    }
+
+    /// Called as the venue shows a PendingNew or Unknown order resting: an Unknown order leaves
+    /// the Unknown ladder, unless a cancel is in flight on it, whose fate is still the ladder's
+    /// to settle (its tombstone clock running on).
+    fn placement_settled(&mut self) {
+        if self.state == OrdState::Unknown && self.intent == Intent::None {
+            self.leave_ladder();
+        }
     }
 
     /// Puts the order on the Unknown ladder at `now`, unless it is on it already.
