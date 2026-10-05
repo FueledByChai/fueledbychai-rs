@@ -167,6 +167,7 @@ const REFUSALS: &[(&str, Refusal)] = &[
     ("duplicate", Refusal::DuplicateClientId),
     ("no_book", Refusal::NoBook),
     ("no_fee", Refusal::NoFee),
+    ("invalid_qty", Refusal::InvalidQty),
 ];
 
 /// When a command left the client: its encode's wall and monotonic time.
@@ -309,6 +310,8 @@ pub(crate) enum Refusal {
     NoBook,
     /// The consumer's fee book has no current rate for a fill the order would take.
     NoFee,
+    /// A placement of zero lots, which is never an order.
+    InvalidQty,
 }
 
 impl Refusal {
@@ -318,6 +321,7 @@ impl Refusal {
             Refusal::PostOnlyWouldCross => RejectKind::PostOnlyWouldCross,
             Refusal::NotFound => RejectKind::NotFound,
             Refusal::Terminal(hint) => RejectKind::AlreadyTerminal(hint),
+            Refusal::InvalidQty => RejectKind::InvalidQty,
             Refusal::DuplicateClientId | Refusal::NoBook | Refusal::NoFee => RejectKind::Other,
         }
     }

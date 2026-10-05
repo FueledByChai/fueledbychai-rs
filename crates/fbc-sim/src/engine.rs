@@ -78,11 +78,15 @@ struct At {
 /// any envelope stamped at or after its arrival, and are held until such an envelope (or
 /// [`advance`](SimEngine::advance)) passes them.
 ///
+/// - A place of zero lots is refused (`InvalidQty`), since zero lots is never an order.
 /// - A place crosses the trading book's displayed levels, each fill at a level's price up to
 ///   its size, as the taker; a post-only order that would cross is refused
 ///   (`PostOnlyWouldCross`). The rest of a good-till-cancelled limit order rests and queues
 ///   (decision 0038); the rest of an immediate-or-cancel, fill-or-kill or market order is
-///   cancelled unfilled, and a fill-or-kill order that cannot fill whole fills nothing.
+///   cancelled unfilled, and a fill-or-kill order that cannot fill whole fills nothing. A
+///   good-till-cancelled order that would rest where the book does not know the size (past
+///   its depth or window) is refused whole (`no_book`), the part that would cross included,
+///   since its queue position cannot be set.
 /// - A cancel ends a resting order; one the venue has ended is refused `AlreadyTerminal`, one
 ///   it never had `NotFound`.
 /// - A public trade on a trading book fills resting orders through the queue model, as the
@@ -90,7 +94,8 @@ struct At {
 ///   above the offer a buy, at or below the bid a sell), and ignored inside the spread.
 /// - A trading book's level that shrinks by more than the trades at its price since it last
 ///   changed is a level cancel for the queue model, whether a delta or a replacement snapshot
-///   shrinks it; each change ends what those trades explain.
+///   shrinks it; each change ends what those trades explain, and so does a snapshot at a
+///   level the old or the new book does not reach, whose sizes cannot be compared.
 /// - Every fill's fee is the fee book's rate for the account, instrument, public channel and
 ///   liquidity at the fill's wall time, times its notional, rounded to the nano, written in the
 ///   stood-in venue's fee sign so the codec's [`DecodeScope`](fbc_core::DecodeScope) reads it
@@ -292,6 +297,10 @@ impl SimEngine {
     fn match_place(&mut self, p: &Place, at: At) -> Result<Taken, Refusal> {
         if self.by_cid.contains_key(&p.cid) {
             return Err(Refusal::DuplicateClientId);
+        }
+        // Zero lots is never an order (Codex r4182678519; `InstrumentSpec::floor_qty`).
+        if p.qty == Lots::ZERO {
+            return Err(Refusal::InvalidQty);
         }
         let book = self.trading_book(p.inst).ok_or(Refusal::NoBook)?;
         let top = book.top(usize::MAX).map_err(|_| Refusal::NoBook)?;
@@ -525,8 +534,16 @@ impl SimEngine {
         self.books.apply(ev).map_err(SimError::Book)?;
         let mut changed = Ok(());
         for (&(bid, px), before) in held.iter().zip(before) {
-            if let (Some(before), Some(after)) = (before, size(self, bid, px)) {
-                changed = changed.and(self.level_changed(inst, side(bid), px, before, after));
+            match (before, size(self, bid, px)) {
+                (Some(before), Some(after)) => {
+                    changed = changed.and(self.level_changed(inst, side(bid), px, before, after));
+                }
+                // Sizes that cannot be compared (a level the old or the new book does not
+                // reach) are still a change at the snapshot (Codex r4182678488): it ends what
+                // the trades printed there explain.
+                _ => {
+                    self.traded.remove(&(inst, bid, px));
+                }
             }
         }
         changed

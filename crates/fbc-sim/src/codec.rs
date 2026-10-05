@@ -5,12 +5,12 @@ use core::time::Duration;
 use std::sync::Arc;
 
 use fbc_core::{
-    AckLevel, Channel, ChosenRef, CidMatch, CtxCall, DecodeError, DecodeScope, Effect, Effects,
-    EncodeCtx, EncodeReceipt, ExchTsKind, ExecCodec, ExecEvent, ExecSink, Feature, FillCaps,
-    FillEvent, FillIdent, HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans, ItemRef,
-    Liquidity, Liquidity3, NotSentReason, OpKind, OrderCaps, OrderKind, OrderUpdate, PathStamps,
-    RateCharge, RawFrame, Reject, RpcCall, RpcId, SpecTable, StreamId, SubmitOutcome, TifTag,
-    TimerTag, VenueCommand, VenueMeta, VenueOrderState, WireSlice, encode_cid,
+    AckLevel, AckModel, Channel, ChosenRef, CidMatch, CtxCall, DecodeError, DecodeScope, Effect,
+    Effects, EncodeCtx, EncodeReceipt, ExchTsKind, ExecCodec, ExecEvent, ExecSink, Feature,
+    FillCaps, FillEvent, FillIdent, HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans,
+    ItemRef, Liquidity, Liquidity3, NotSentReason, OpKind, OrderCaps, OrderKind, OrderUpdate,
+    PathStamps, RateCharge, RawFrame, Reject, RpcCall, RpcId, SpecTable, StreamId, SubmitOutcome,
+    TifTag, TimerTag, VenueCommand, VenueMeta, VenueOrderState, WireSlice, encode_cid,
 };
 
 use crate::config::SimConfig;
@@ -20,9 +20,11 @@ use crate::wire::{Cancel, Command, Place, Refusal, Reply, Sent, SimState, Target
 /// [`VenueCommand::Cancel`] as a frame on the simulated stream, stamped with its encode's time
 /// from [`EncodeCtx`], and decodes the engine's answers into outcomes, order updates and fills
 /// through [`DecodeScope`] only, so venue ids, fill ids and fees are built as a real codec
-/// builds them (0004). It refuses what the stood-in venue's [`OrderCaps`] do not offer, and
-/// RPI orders, which the engine cannot fill yet (FBC-njk, decision 0043); amends, batches and
-/// queries are FBC-nv2's.
+/// builds them (0004), saying on its events only what the stood-in venue echoes. It refuses
+/// what the stood-in venue's [`OrderCaps`] do not offer, RPI orders, which the engine cannot
+/// fill yet (FBC-njk, decision 0043), and placements for a venue that acknowledges in two
+/// phases, which the engine does not model yet (FBC-zr1); amends, batches and queries are
+/// FBC-nv2's.
 #[derive(Clone, Debug)]
 pub struct SimCodec {
     caps: OrderCaps,
@@ -54,7 +56,11 @@ impl SimCodec {
             && o.channel == Channel::Public
             && (self.caps.post_only || !o.post_only)
             && (self.caps.reduce_only || !o.reduce_only);
-        if !offered {
+        // Codex r4182678509: the engine accepts in one phase, so a venue that acknowledges in
+        // two is not stood in for yet (FBC-zr1) rather than its provisional acceptance be
+        // reported final.
+        let single_phase = self.caps.ack == AckModel::SinglePhase;
+        if !offered || !single_phase {
             return Err(NotSentReason::Unsupported);
         }
         // Codex r4182154713: a pair the stood-in venue refuses together is refused here too.
@@ -90,6 +96,12 @@ impl SimCodec {
             post_only: o.post_only,
             reduce_only: o.reduce_only,
         }))
+    }
+
+    /// An event's client id, read only where the stood-in venue echoes it on events.
+    fn echoed_cid(&self, scope: &DecodeScope<'_>, wire: &str) -> Option<CidMatch> {
+        let echoed = self.caps.cid_echoed_on_events;
+        echoed.then(|| scope.client_order_id(wire))
     }
 
     fn cancel(
@@ -201,8 +213,10 @@ impl ExecCodec for SimCodec {
                 }),
                 outcome: SubmitOutcome::Rejected(reject(refusal)),
             },
+            // Only what the stood-in venue echoes on its events (Codex r4182678498,
+            // r4182678504): its client ids and the order's flags.
             Reply::Order(o) => ExecEvent::Order(OrderUpdate {
-                cid: Some(scope.client_order_id(&o.cid)),
+                cid: self.echoed_cid(scope, &o.cid),
                 vid: Some(scope.venue_order_id(&o.vid)?),
                 inst: o.inst,
                 side: o.side,
@@ -214,8 +228,8 @@ impl ExecCodec for SimCodec {
                 cum_filled: o.cum,
                 px: o.px,
                 qty: Some(o.qty),
-                post_only: Some(o.post_only),
-                reduce_only: Some(o.reduce_only),
+                post_only: self.caps.events_echo_flags.then_some(o.post_only),
+                reduce_only: self.caps.events_echo_flags.then_some(o.reduce_only),
             }),
             Reply::Fill(fill) => ExecEvent::Fill(FillEvent {
                 // Only what the stood-in venue reports (Codex r4182448147): without fill ids
@@ -232,7 +246,7 @@ impl ExecCodec for SimCodec {
                         cum_after: fill.cum,
                     }
                 },
-                cid: Some(scope.client_order_id(&fill.cid)),
+                cid: self.echoed_cid(scope, &fill.cid),
                 inst: fill.inst,
                 side: fill.side,
                 px: fill.px,
