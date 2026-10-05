@@ -268,6 +268,8 @@ impl SimEngine {
         // (Codex r4182342652) and 2^127 is the first value past i128::MAX.
         let fits = cost.is_finite() && cost > i128::MIN as f64 && cost < i128::MAX as f64;
         let cost = fits.then_some(cost as i128)?;
+        // `raw` is the venue's wire number in the venue's own sign, not a `Fee`: the codec
+        // turns it into one through `DecodeScope::fee`, the only place a fee's sign is set.
         let raw = match self.fee_sign {
             VenueFeeSign::PositiveIsCost => Some(cost),
             VenueFeeSign::PositiveIsRebate => cost.checked_neg(),
@@ -622,6 +624,11 @@ impl SimEngine {
     }
 
     fn trade(&mut self, inst: InstrumentId, aggressor: Aggressor, px: Ticks, qty: Lots, at: At) {
+        // A trade of no size says nothing of any level, the ones it printed through included
+        // (Codex r4184778419), as the queue model holds for its own levels.
+        if qty == Lots::ZERO {
+            return;
+        }
         let Some(book) = self.trading_book(inst) else {
             return;
         };

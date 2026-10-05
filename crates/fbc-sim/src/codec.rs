@@ -5,13 +5,13 @@ use core::time::Duration;
 use std::sync::Arc;
 
 use fbc_core::{
-    AckLevel, AckModel, Channel, ChosenRef, CidMatch, CtxCall, DecodeError, DecodeScope, Effect,
-    Effects, EncodeCtx, EncodeReceipt, ExchTsKind, ExecCaps, ExecCodec, ExecEvent, ExecSink,
-    Feature, FillCaps, FillEvent, FillIdent, FillSource, HttpFailure, HttpResponse, HttpTag,
-    Inbound, InboundSpans, ItemRef, Liquidity, Liquidity3, MatchingCaps, NotSentReason, OpKind,
-    OrderCaps, OrderKind, OrderUpdate, OrderingKey, PathStamps, RateCharge, RawFrame, Reject,
-    RpcCall, RpcId, SpecTable, StreamId, SubmitOutcome, TifTag, TimerTag, VenueCommand, VenueMeta,
-    VenueOrderState, WireSlice, encode_cid,
+    AckLevel, AckModel, CancelOnDisconnect, Channel, ChosenRef, CidMatch, CtxCall, DecodeError,
+    DecodeScope, Effect, Effects, EncodeCtx, EncodeReceipt, ExchTsKind, ExecCaps, ExecCodec,
+    ExecEvent, ExecSink, Feature, FillCaps, FillEvent, FillIdent, FillSource, HttpFailure,
+    HttpResponse, HttpTag, Inbound, InboundSpans, ItemRef, Liquidity, Liquidity3, MatchingCaps,
+    NotSentReason, OpKind, OrderCaps, OrderKind, OrderUpdate, OrderingKey, PathStamps, RateCharge,
+    RawFrame, Reject, RpcCall, RpcId, SpecTable, StreamId, SubmitOutcome, TifTag, TimerTag,
+    VenueCommand, VenueMeta, VenueOrderState, WireSlice, encode_cid,
 };
 
 use crate::config::SimConfig;
@@ -26,7 +26,8 @@ use crate::wire::{Cancel, Command, Place, Refusal, Reply, Sent, SimState, Target
 /// fill yet (FBC-njk, decision 0044), and placements for a venue whose events the engine
 /// cannot say yet: two-phase acknowledgement (FBC-zr1), an ordering key other than a venue
 /// sequence, realized values on fills, or fills derived from order status (FBC-938), a venue
-/// with a speed bump (FBC-7y8), or one whose fills replay on reconnect (FBC-3q6); amends,
+/// with a speed bump (FBC-7y8), one whose fills replay on reconnect (FBC-3q6), or one that
+/// cancels orders on a disconnect, which the simulated stream never has (FBC-fji); amends,
 /// batches and queries are FBC-nv2's.
 #[derive(Clone, Debug)]
 pub struct SimCodec {
@@ -132,7 +133,9 @@ impl SimCodec {
 /// command past its latency (Codex r4184245574; FBC-7y8), it acknowledges in one phase
 /// (Codex r4182678509; FBC-zr1), orders its answers by a venue sequence, keeps no position to
 /// report realized P&L or funding from, and sends fills of their own (Codex r4182991971,
-/// r4182991978; FBC-938), and never replays a fill on reconnect (Codex r4184546713; FBC-3q6).
+/// r4182991978; FBC-938), never replays a fill on reconnect (Codex r4184546713; FBC-3q6), and
+/// leaves orders resting across a disconnect, which the simulated stream has no notion of
+/// (Codex r4184778435; FBC-fji).
 /// Placements for any other venue are refused rather than answered with events unlike its own.
 fn modelled(exec: &ExecCaps, matching: &MatchingCaps) -> bool {
     matching.speed_bump.is_none()
@@ -142,6 +145,7 @@ fn modelled(exec: &ExecCaps, matching: &MatchingCaps) -> bool {
         && !exec.fills.realized_funding
         && exec.fills.source == FillSource::Native
         && !exec.fills.replays_fills_on_reconnect
+        && exec.order.cancel_on_disconnect == CancelOnDisconnect::None
 }
 
 fn malformed(err: WireError) -> DecodeError {
