@@ -83,8 +83,10 @@ SimVenue is two halves joined by a simulated order-entry stream:
   accepts in one phase and would report a provisional acceptance as final (FBC-zr1), and one
   whose `ordering_key` is not `VenueSeq`, whose fills carry realized P&L or funding, or whose
   fills are derived from order status (FBC-938), one whose fills replay on reconnect (FBC-3q6),
-  and one with a `MatchingCaps::speed_bump`, since a command acts `to_venue` after it was sent
-  and no later (FBC-7y8); cancels still go. A fill with a venue fill id always names its order's
+  one with a `MatchingCaps::speed_bump`, since a command acts `to_venue` after it was sent
+  and no later (FBC-7y8), and one whose `cancel_on_disconnect` is not `None`, since the
+  simulated stream never disconnects and nothing would cancel what the venue cancels when it
+  does (FBC-fji); cancels still go. A fill with a venue fill id always names its order's
   venue id and cumulative quantity, which `FillCaps` cannot yet say a venue's fills omit
   (FBC-2g7). `resync` answers nothing (FBC-bq3). A crossing order meets only the displayed book:
   not the venue's own resting orders, and two crossing orders between book updates can take the

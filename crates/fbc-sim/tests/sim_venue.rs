@@ -2254,3 +2254,56 @@ fn a_venue_that_replays_fills_on_reconnect_is_not_stood_in_for_yet() {
     assert_eq!(refused.err(), Some(NotSentReason::Unsupported));
     assert!(v.encode(&cancel(OrderRef::Client(cid())), 2, T0).is_ok());
 }
+
+#[test]
+fn a_zero_size_trade_through_a_level_explains_nothing_there() {
+    // Codex r4184778419: a trade of no size says nothing of the levels it printed through, so
+    // the offer at 200 keeps all three lots: an order arriving there queues behind them, and a
+    // trade of two at 200 fills none of it.
+    let mut v = Venue::new(Bracket::Pessimistic);
+    v.snapshot(T0, &[(198, 5)], &[(200, 3), (201, 4)]);
+    v.trade(T0 + MS, Aggressor::Buyer, 201, 0);
+    v.send(limit(cid(), Side::Sell, 200, 2), 1, T0);
+    v.tick(T0 + 5 * MS);
+    assert_eq!(v.answers().len(), 2);
+    v.trade(T0 + 7 * MS, Aggressor::Buyer, 200, 2);
+    let got = v.answers();
+    assert!(got.iter().all(|(_, ev)| fill_of(ev).is_none()), "{got:?}");
+    // One lot still ahead: a trade of three fills both of the order's.
+    v.trade(T0 + 8 * MS, Aggressor::Buyer, 200, 3);
+    let got = v.answers();
+    assert_eq!(
+        got.iter()
+            .filter_map(|(_, ev)| fill_of(ev))
+            .map(|f| f.1)
+            .sum::<i64>(),
+        2,
+        "{got:?}"
+    );
+}
+
+#[test]
+fn a_venue_that_cancels_on_disconnect_is_not_stood_in_for_yet() {
+    // Codex r4184778435: the simulated stream has no disconnect, so nothing would cancel what
+    // a venue cancels when its connection drops or its dead-man timer lapses; such a venue
+    // gets no placement rather than orders that outlive a disconnect it would end them on
+    // (FBC-fji models the lifecycle). Cancels still go.
+    for on_disconnect in [
+        CancelOnDisconnect::PerConnection {
+            rearm_on_reconnect: false,
+        },
+        CancelOnDisconnect::PerConnection {
+            rearm_on_reconnect: true,
+        },
+        CancelOnDisconnect::DeadMan {
+            max_ttl: Duration::from_secs(5),
+        },
+    ] {
+        let mut config = config(Bracket::Optimistic, VenueFeeSign::PositiveIsCost, fees());
+        config.exec.order.cancel_on_disconnect = on_disconnect;
+        let mut v = Venue::with(config);
+        let refused = v.encode(&limit(cid(), Side::Buy, 199, 1), 1, T0);
+        assert_eq!(refused.err(), Some(NotSentReason::Unsupported));
+        assert!(v.encode(&cancel(OrderRef::Client(cid())), 2, T0).is_ok());
+    }
+}
