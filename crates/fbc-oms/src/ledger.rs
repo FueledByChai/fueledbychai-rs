@@ -189,7 +189,8 @@ impl FillLedger {
     /// Decides whether `fill`, which the venue timed `time` (`None` when it sent no
     /// timestamp), is applied, at `now` on the shard's monotonic clock.
     ///
-    /// A fill whose key the ledger holds is a duplicate. Otherwise a live fill is accepted. A
+    /// The fills older than the configured age at `now` are forgotten first, each moving the
+    /// horizon. A fill whose key the ledger then holds is a duplicate. Otherwise a live fill is accepted. A
     /// replayed fill is accepted only when it has a matching-engine time later than the
     /// session-start watermark (aligned) and than the retention horizon (on the venue's
     /// clock); otherwise it is refused and counted, and the ledger keeps nothing of it. An
@@ -202,6 +203,8 @@ impl FillLedger {
         time: Option<FillTime>,
         now: MonoNs,
     ) -> Admission<'l, 'f> {
+        // What has aged out is forgotten first, so it never stands as a duplicate.
+        self.forget_older_than(now);
         let key = fill.key();
         if self.keys.contains(&key) {
             if fill.replay {
