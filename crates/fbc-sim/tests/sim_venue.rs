@@ -3522,3 +3522,80 @@ fn the_codec_refuses_request_answers_it_cannot_read() {
     let got = v.decode(same.as_bytes()).unwrap();
     assert!(matches!(&got[0].1, ExecEvent::QueryResult(a) if a.found().is_some()));
 }
+
+#[test]
+fn an_injected_order_the_book_does_not_show_yet_is_not_counted_in_its_level() {
+    // Codex r4186502479: two orders injected before the book shows either: the second queues
+    // behind the ten public lots, not behind ten less the first.
+    let mut v = Venue::new(Bracket::Optimistic);
+    v.snapshot(T0, &[(199, 10)], &[(201, 5)]);
+    let first = v.engine.inject(MonoNs(T0 + MS), injected(199, 4)).unwrap();
+    let second = v.engine.inject(MonoNs(T0 + MS), injected(199, 3)).unwrap();
+    assert_eq!(v.engine.injected(second).unwrap().ahead, lots(10));
+    // The book shows the first (ten to fourteen); an order of ours then queues behind the ten
+    // public lots: the first is shown and modelled, the second modelled and not shown yet.
+    v.level(T0 + 2 * MS, BookSide::Bid, 199, 14);
+    let ours = v.rest(limit(cid(), Side::Buy, 199, 2), 1, T0 + 10 * MS);
+    assert_eq!(v.ahead(&ours), 10);
+    // The second is withdrawn before the book showed it: nothing of it will leave the book, so
+    // a real shrink of two public lots that follows advances ours (optimistic: all of it).
+    v.engine.withdraw(MonoNs(T0 + 20 * MS), second).unwrap();
+    v.level(T0 + 21 * MS, BookSide::Bid, 199, 12);
+    assert_eq!(v.ahead(&ours), 8);
+    // The first, shown, withdrawn: the book's shrink of its four moves ours no further.
+    v.engine.withdraw(MonoNs(T0 + 30 * MS), first).unwrap();
+    v.level(T0 + 31 * MS, BookSide::Bid, 199, 8);
+    assert_eq!(v.ahead(&ours), 8);
+}
+
+#[test]
+fn an_injected_order_filled_before_the_book_shows_it_is_shown_net_of_its_fill() {
+    let mut v = Venue::new(Bracket::Pessimistic);
+    v.snapshot(T0, &[(199, 2), (198, 5)], &[(201, 5)]);
+    let key = v.engine.inject(MonoNs(T0 + MS), injected(199, 4)).unwrap();
+    // Three sold: the two public lots, then one of the injected order, not shown yet.
+    v.trade(T0 + 2 * MS, Aggressor::Seller, 199, 3);
+    assert_eq!(v.engine.take_injected_fills().len(), 1);
+    // The book then shows the public lots gone and the injected order's three left; an order
+    // of ours queues behind none of it: the three are modelled.
+    v.level(T0 + 3 * MS, BookSide::Bid, 199, 0);
+    v.level(T0 + 4 * MS, BookSide::Bid, 199, 3);
+    let ours = v.rest(limit(cid(), Side::Buy, 199, 1), 1, T0 + 10 * MS);
+    assert_eq!(v.ahead(&ours), 0);
+    assert_eq!(v.engine.injected(key).unwrap().remaining, lots(3));
+}
+
+#[test]
+fn an_injected_order_its_level_could_not_hold_is_refused() {
+    // Codex r4186502501: the level's size, the simulated orders there and the injected order
+    // must fit in lots together.
+    let mut v = Venue::new(Bracket::Middle);
+    v.snapshot(T0, &[(199, i64::MAX)], &[(201, 5)]);
+    let over = v.engine.inject(MonoNs(T0), injected(199, 1));
+    let overflow = QueueError::Overflow {
+        side: BookSide::Bid,
+        px: Ticks(199),
+    };
+    assert_eq!(over, Err(SimError::Queue(overflow)));
+}
+
+#[test]
+fn a_priority_keeping_amend_that_grows_where_its_level_is_unknown_is_refused() {
+    // Codex r4186502494: a book that shows no bid knows no bid level's size, so a larger
+    // order cannot be shown to fit: refused, and the order keeps its size. A smaller one needs
+    // no check.
+    let mut v = rich(Bracket::Middle, |o| o.amend = Some(amend_caps(Some(true))));
+    v.snapshot(T0, &[(199, 4)], &[(201, 5)]);
+    let a = v.rest(limit(cid(), Side::Buy, 199, 2), 1, T0);
+    v.level(T0 + 10 * MS, BookSide::Bid, 199, 0);
+    for (rpc, qty) in [(2, 3), (3, 1)] {
+        let cmd = amend(OrderRef::Venue(a.clone()), Side::Buy, 199, qty, 0);
+        v.send(VenueCommand::Amend(cmd), rpc, T0 + 10 * MS);
+    }
+    v.engine.advance(MonoNs(T0 + 15 * MS));
+    let got = v.events();
+    let refused = (RejectKind::Other, "no_book".to_owned());
+    assert_eq!(refusal(&got[0].1), refused);
+    assert_eq!(outcome_of(&got[1].1), Some((3, ACCEPTED)));
+    assert_eq!(v.engine.queue_position(&a).unwrap().remaining, lots(1));
+}

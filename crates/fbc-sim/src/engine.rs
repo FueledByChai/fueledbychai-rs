@@ -75,6 +75,23 @@ pub struct InjectedOrder {
     pub qty: Lots,
 }
 
+/// An injected order the engine holds, and how much of it the engine's book has not shown yet
+/// (Codex r4186502479): all of it when injected, as it arrives at the venue; the level's
+/// growths show it, in injection order, and its fills come out of what is not shown first,
+/// since the book shows an order net of its fills.
+#[derive(Copy, Clone, Debug)]
+struct Injected {
+    order: InjectedOrder,
+    unshown: Lots,
+}
+
+impl Injected {
+    fn at(&self, inst: InstrumentId, side: BookSide, px: Ticks) -> bool {
+        let o = &self.order;
+        o.inst == inst && o.side.book_side() == side && o.px == px
+    }
+}
+
 /// A resting order the venue holds.
 #[derive(Clone, Debug)]
 struct Resting {
@@ -193,7 +210,10 @@ impl Item {
 ///   through the queue model, as the maker. A trade the venue gives no aggressor for is
 ///   classified against the touch (at or above the offer a buy, at or below the bid a sell),
 ///   and ignored inside the spread. An injected order's fills are never answered on the
-///   order-entry stream ([`take_injected_fills`](SimEngine::take_injected_fills)).
+///   order-entry stream ([`take_injected_fills`](SimEngine::take_injected_fills)). An
+///   injected order is in the real book, but the engine's book shows it only from the growth
+///   of its level that follows its injection (in injection order, net of its fills); until
+///   then its size is added to the level, as SimVenue's own orders' always is.
 /// - A trading book's level that shrinks by more than the trades at its price since it last
 ///   changed (and the injected orders withdrawn from it) is a level cancel for the queue
 ///   model, whether a delta or a replacement snapshot shrinks it; each change ends what those
@@ -223,7 +243,7 @@ pub struct SimEngine {
     live: BTreeMap<u64, Resting>,
     ended: BTreeMap<u64, Ended>,
     by_cid: BTreeMap<String, u64>,
-    injected: BTreeMap<u64, InjectedOrder>,
+    injected: BTreeMap<u64, Injected>,
     injected_fills: Vec<SimFill>,
     in_flight: BTreeMap<(MonoNs, u64), (WallNs, Command)>,
     /// Public size a level lost to trades printed at it, and to injected orders withdrawn from
@@ -376,11 +396,13 @@ impl SimEngine {
             .level(side, px)
             .map_err(|e| SimError::Queue(QueueError::Book(e)))?
             .ok_or(SimError::Queue(QueueError::UnknownLevel { side, px }))?;
-        // SimVenue's own orders are not in the real book, so they are added; the injected
-        // ones are, once it shows them, and the queue model takes every modelled order out.
+        // SimVenue's own orders are not in the real book, so they are added, and so are the
+        // injected ones it does not show yet; the queue model takes every modelled order out.
+        // The level, they and this order must fit in lots together (Codex r4186502501).
         let shown = self
             .unshown(order.inst, side, px, shown)
             .checked_add(self.own(order.inst, side, px))
+            .filter(|shown| shown.checked_add(order.qty).is_some())
             .ok_or(SimError::Queue(QueueError::Overflow { side, px }))?;
         let key = OrderKey(self.orders);
         let modelled = NewOrder {
@@ -394,23 +416,27 @@ impl SimEngine {
             .accept_shown(key, modelled, shown)
             .map_err(SimError::Queue)?;
         self.orders += 1;
-        self.injected.insert(key.0, order);
+        let unshown = order.qty;
+        self.injected.insert(key.0, Injected { order, unshown });
         Ok(key)
     }
 
     /// The process that placed injected order `key` cancelled it at `now`: the commands that
-    /// arrived by then act first, and the order leaves its queue. The size it had left is
-    /// taken from its level as a trade's is, so the book's shrink when it shows the
-    /// cancellation moves no other order, which never had that size ahead of it. Refused for a
-    /// key the engine does not hold as injected (one never injected, or since filled whole).
+    /// arrived by then act first, and the order leaves its queue. The size it had left that
+    /// the book shows is taken from its level as a trade's is, so the book's shrink when it
+    /// shows the cancellation moves no other order, which never had that size ahead of it;
+    /// what the book never showed never leaves it. Refused for a key the engine does not hold
+    /// as injected (one never injected, or since filled whole).
     pub fn withdraw(&mut self, now: MonoNs, key: OrderKey) -> Result<(), SimError> {
         self.advance(now);
-        let order = self
+        let held = self
             .injected
             .remove(&key.0)
             .ok_or(SimError::NotInjected(key))?;
+        let order = held.order;
         let pos = self.queue_of(order.inst).remove(key);
         let left = pos.map_or(Lots::ZERO, |pos| pos.remaining);
+        let left = left.checked_sub(held.unshown).unwrap_or(Lots::ZERO);
         let level = (order.inst, order.side == Side::Buy, order.px);
         let taken = self.traded.entry(level).or_insert(Lots::ZERO);
         *taken = taken.checked_add(left).unwrap_or(MAX_LOTS);
@@ -419,8 +445,8 @@ impl SimEngine {
 
     /// Where injected order `key` sits, while the engine holds it.
     pub fn injected(&self, key: OrderKey) -> Option<QueuePos> {
-        let order = self.injected.get(&key.0)?;
-        self.queues.get(&order.inst)?.position(key)
+        let held = self.injected.get(&key.0)?;
+        self.queues.get(&held.order.inst)?.position(key)
     }
 
     /// The injected orders' fills since the last call, in the order trades gave them.
@@ -525,16 +551,19 @@ impl SimEngine {
         Some((raw?, notional.asset))
     }
 
-    /// The size of SimVenue's own orders resting at `side` and `px` of `inst`, which the real
-    /// book never shows. It fits in lots, since a placement that would push its level past
-    /// them is refused; it would saturate.
+    /// The modelled size at `side` and `px` of `inst` that the real book does not show:
+    /// SimVenue's own resting orders, which it never shows, and the injected orders' size it
+    /// has not shown yet. It fits in lots, since a placement or injection that would push its
+    /// level past them is refused; it would saturate.
     fn own(&self, inst: InstrumentId, side: BookSide, px: Ticks) -> Lots {
         let at = self
             .live
             .values()
-            .filter(|o| o.inst == inst && o.side.book_side() == side && o.px == px);
-        at.fold(Lots::ZERO, |sum, o| {
-            let left = o.qty.checked_sub(o.cum).unwrap_or(Lots::ZERO);
+            .filter(|o| o.inst == inst && o.side.book_side() == side && o.px == px)
+            .map(|o| o.qty.checked_sub(o.cum).unwrap_or(Lots::ZERO));
+        let unshown = self.injected.values().filter(|i| i.at(inst, side, px));
+        let at = at.chain(unshown.map(|i| i.unshown));
+        at.fold(Lots::ZERO, |sum, left| {
             sum.checked_add(left).unwrap_or(MAX_LOTS)
         })
     }
@@ -836,15 +865,19 @@ impl SimEngine {
         // only at its price; a place at another price is no place to keep.
         if caps.keeps_priority == Some(true) && !priced {
             let left = order.qty.checked_sub(order.cum).unwrap_or(Lots::ZERO);
-            let others = self.own(a.inst, side, a.px).checked_sub(left);
-            let book = self.trading_book(a.inst);
-            let shown = book.and_then(|b| b.level(side, a.px).ok().flatten());
-            // As a placement (Codex r4183438501): the level's size, the other simulated orders
-            // there and this one's rest must fit in lots.
-            let fits = others
-                .and_then(|o| o.checked_add(shown.unwrap_or(Lots::ZERO)))
-                .and_then(|o| o.checked_add(rest));
-            fits.ok_or(Refusal::InvalidQty)?;
+            // As a placement (Codex r4183438501): a larger rest must fit in lots with the
+            // level's size and the other modelled orders there, so the level must be known
+            // (Codex r4186502494); a smaller one fits where the order did.
+            if rest > left {
+                let book = self.trading_book(a.inst);
+                let shown = book.and_then(|b| b.level(side, a.px).ok().flatten());
+                let shown = shown.ok_or(Refusal::NoBook)?;
+                let others = self.own(a.inst, side, a.px).checked_sub(left);
+                let fits = others
+                    .and_then(|o| o.checked_add(shown))
+                    .and_then(|o| o.checked_add(rest));
+                fits.ok_or(Refusal::InvalidQty)?;
+            }
             self.queue_of(a.inst).set_remaining(key, rest);
             let taken = Taken {
                 takes: Vec::new(),
@@ -968,8 +1001,8 @@ impl SimEngine {
         let orders = self.live.values().filter(|o| o.inst == inst);
         let mut held: BTreeSet<(bool, Ticks)> =
             orders.map(|o| (o.side == Side::Buy, o.px)).collect();
-        let injected = self.injected.values().filter(|o| o.inst == inst);
-        held.extend(injected.map(|o| (o.side == Side::Buy, o.px)));
+        let injected = self.injected.values().filter(|i| i.order.inst == inst);
+        held.extend(injected.map(|i| (i.order.side == Side::Buy, i.order.px)));
         let traded = self.traded.keys().filter(|key| key.0 == inst);
         held.extend(traded.map(|&(_, bid, px)| (bid, px)));
         let side = |bid| if bid { BookSide::Bid } else { BookSide::Ask };
@@ -1008,6 +1041,13 @@ impl SimEngine {
         // explain its next one.
         if before == after {
             return;
+        }
+        // A growth shows the injected orders there it has not shown yet, in injection order.
+        let mut grown = after.checked_sub(before).unwrap_or(Lots::ZERO);
+        for held in self.injected.values_mut().filter(|i| i.at(inst, side, px)) {
+            let shown = held.unshown.min(grown);
+            held.unshown = held.unshown.checked_sub(shown).unwrap_or(Lots::ZERO);
+            grown = grown.checked_sub(shown).unwrap_or(Lots::ZERO);
         }
         let traded = self.traded.remove(&(inst, side == BookSide::Bid, px));
         let shrunk = before.checked_sub(after).unwrap_or(Lots::ZERO);
@@ -1137,6 +1177,9 @@ impl SimEngine {
     }
 
     fn injected_fill(&mut self, fill: SimFill) {
+        if let Some(held) = self.injected.get_mut(&fill.key.0) {
+            held.unshown = held.unshown.checked_sub(fill.qty).unwrap_or(Lots::ZERO);
+        }
         if fill.remaining == Lots::ZERO {
             self.injected.remove(&fill.key.0);
         }
