@@ -48,7 +48,7 @@ fn untracked(fid: &str, qty: i64, replay: bool) -> FillEvent {
     fill(None, ident(fid), Side::Buy, qty, replay)
 }
 
-fn accepted(admission: Admission<'_>) -> AcceptedFill<'_> {
+fn accepted<'l, 'f>(admission: Admission<'l, 'f>) -> AcceptedFill<'l, 'f> {
     match admission {
         Admission::Apply(a) => a,
         other => panic!("expected the fill accepted, got {other:?}"),
@@ -124,6 +124,7 @@ fn a_fill_delivered_twice_moves_inventory_once() {
 #[test]
 fn a_fill_without_a_fill_id_is_keyed_by_its_order_and_cumulative_quantity() {
     let mut l = ledger(4, 100);
+    let mut reg = Registry::new();
     let derived = |cum: i64, qty: i64| {
         let id = FillIdent::Derived {
             vid: common::vid("v9"),
@@ -131,18 +132,50 @@ fn a_fill_without_a_fill_id_is_keyed_by_its_order_and_cumulative_quantity() {
         };
         fill(None, id, Side::Sell, qty, false)
     };
-    assert!(matches!(
-        l.admit(&derived(2, 2), None, MonoNs(0)),
-        Admission::Apply(_)
-    ));
+    reg.apply_fill(accepted(l.admit(&derived(2, 2), None, MonoNs(0))))
+        .unwrap();
     assert!(matches!(
         l.admit(&derived(2, 2), None, MonoNs(0)),
         Admission::Duplicate
     ));
-    assert!(matches!(
-        l.admit(&derived(5, 3), None, MonoNs(0)),
-        Admission::Apply(_)
-    ));
+    reg.apply_fill(accepted(l.admit(&derived(5, 3), None, MonoNs(0))))
+        .unwrap();
+    assert_eq!(reg.inventory(INST), SignedLots(-5));
+}
+
+#[test]
+fn an_accepted_fill_not_applied_leaves_nothing_in_the_ledger() {
+    let mut l = ledger(4, 100);
+    let f = untracked("f1", 1, true);
+    {
+        let unapplied = accepted(l.admit(&f, engine(1_100), MonoNs(0)));
+        assert_eq!(unapplied.fill(), &f);
+    }
+    assert!(l.is_empty());
+    assert_eq!(l.replays(), ReplayCounts::default());
+    // So it is accepted again, and counts once it is applied.
+    let mut reg = Registry::new();
+    reg.apply_fill(accepted(l.admit(&f, engine(1_100), MonoNs(1))))
+        .unwrap();
+    assert!(l.contains(&f.key()));
+    assert_eq!(l.replays().applied, 1);
+}
+
+#[test]
+fn a_registry_takes_fills_from_one_ledger_only() {
+    let (mut first, mut second) = (ledger(4, 100), ledger(4, 100));
+    let mut reg = Registry::new();
+    let f = untracked("f1", 2, false);
+    reg.apply_fill(accepted(first.admit(&f, None, MonoNs(0))))
+        .unwrap();
+    // Another ledger has never seen the fill and would accept it again.
+    let e = reg
+        .apply_fill(accepted(second.admit(&f, None, MonoNs(0))))
+        .unwrap_err();
+    assert_eq!(e, OmsError::OtherLedger);
+    assert!(e.to_string().contains("another fill ledger"));
+    assert!(second.is_empty());
+    assert_eq!(reg.inventory(INST), SignedLots(2));
 }
 
 // ---- replays: the watermark ----
@@ -292,12 +325,18 @@ fn a_fill_forgotten_by_age_and_then_replayed_never_moves_inventory_again() {
 #[test]
 fn forgetting_a_fill_with_no_usable_time_loses_the_horizon_for_good() {
     let mut l = ledger(1, 1_000);
+    let mut reg = Registry::new();
     for (fid, time) in [
         ("a", timed(1_100, ExchTsKind::Unknown)),
         ("b", engine(1_200)),
         ("c", engine(1_300)),
     ] {
-        accepted(l.admit(&untracked(fid, 1, false), time, MonoNs(0)));
+        reg.apply_fill(accepted(l.admit(
+            &untracked(fid, 1, false),
+            time,
+            MonoNs(0),
+        )))
+        .unwrap();
     }
     assert_eq!(l.horizon(), Horizon::Lost);
     assert!(matches!(
@@ -501,18 +540,34 @@ fn a_fill_that_would_overflow_counts_nothing() {
     assert_eq!(reg.get(c).unwrap().cum_fills(), lots(i64::MAX));
     assert_eq!(reg.inventory(INST), SignedLots(i64::MAX));
 
+    // The refused fill is not in the ledger, so a redelivery is tried again.
+    let refused = fill(Some(c), ident("f2"), Side::Buy, 1, false);
+    assert!(!l.contains(&refused.key()));
+
     // Fills of no order the registry holds overflow only the inventory.
     let (mut l, mut reg) = session();
-    for (n, qty) in [i64::MAX, 1].into_iter().enumerate() {
-        let f = untracked(&format!("u{n}"), qty, false);
-        let routed = reg.apply_fill(accepted(l.admit(&f, None, MonoNs(0))));
-        if n == 0 {
-            assert_eq!(routed, Ok(FillRouted::Untracked));
-        } else {
-            assert_eq!(routed, Err(OmsError::FillOverflow(INST)));
-        }
-    }
+    let big = untracked("u0", i64::MAX, false);
+    reg.apply_fill(accepted(l.admit(&big, None, MonoNs(0))))
+        .unwrap();
+    let one = untracked("u1", 1, false);
+    assert_eq!(
+        reg.apply_fill(accepted(l.admit(&one, None, MonoNs(0)))),
+        Err(OmsError::FillOverflow(INST))
+    );
     assert_eq!(reg.inventory(INST), SignedLots(i64::MAX));
+    // Once a sell makes room, the redelivered fill applies, once.
+    let sell = fill(None, ident("u2"), Side::Sell, 5, false);
+    reg.apply_fill(accepted(l.admit(&sell, None, MonoNs(0))))
+        .unwrap();
+    assert_eq!(
+        reg.apply_fill(accepted(l.admit(&one, None, MonoNs(0)))),
+        Ok(FillRouted::Untracked)
+    );
+    assert!(matches!(
+        l.admit(&one, None, MonoNs(0)),
+        Admission::Duplicate
+    ));
+    assert_eq!(reg.inventory(INST), SignedLots(i64::MAX - 4));
 }
 
 #[test]

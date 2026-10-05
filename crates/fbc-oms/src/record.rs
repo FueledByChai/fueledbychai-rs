@@ -138,7 +138,7 @@ pub enum OutcomeApplied {
     /// left to the Unknown ladder ([`OrderRecord::unknown_since`]).
     AwaitingLadder,
     /// The amend or cancel was not sent or was refused: the order is as it was, nothing in
-    /// flight.
+    /// flight; Filled if its fills cover its total once no larger amend is in flight.
     IntentCleared,
     /// Nothing changed: the order is terminal, or the outcome waits for an order event.
     Unchanged,
@@ -315,6 +315,8 @@ impl OrderRecord {
     /// it arrives, is still recorded. The venue's price and total apply when the update states
     /// them; `cum_venue` keeps the largest cumulative fill. An Open update moves the order to
     /// Open, or PartiallyFilled once something is filled; an amended update moves no state.
+    /// Either ends the order Filled when its fills alone then cover its total with no amend to
+    /// a larger total in flight.
     pub fn apply_update(&mut self, u: &OrderUpdate, key: OrderKey) -> Applied {
         if self.state.is_terminal() {
             return Applied::IgnoredLate;
@@ -351,6 +353,7 @@ impl OrderRecord {
             if let Intent::PendingAmend { .. } = self.intent {
                 self.intent = Intent::None;
             }
+            self.complete_if_covered();
             return Applied::Amended;
         }
         if self.state == OrdState::Unknown {
@@ -363,6 +366,7 @@ impl OrderRecord {
         {
             self.intent = Intent::None;
         }
+        self.complete_if_covered();
         Applied::Advanced
     }
 
@@ -427,6 +431,7 @@ impl OrderRecord {
             }
             (_, SubmitOutcome::NotSent(_) | SubmitOutcome::Rejected(_)) => {
                 self.intent = Intent::None;
+                self.complete_if_covered();
                 OutcomeApplied::IntentCleared
             }
             (_, SubmitOutcome::Unknown) => self.await_ladder(now),
@@ -457,9 +462,7 @@ impl OrderRecord {
         if let (None, Some(v)) = (&self.vid, vid) {
             self.vid = Some(self.follow(v));
         }
-        let growing = matches!(self.intent, Intent::PendingAmend { qty, .. } if qty > cum_fills);
-        if cum_fills >= self.qty && !growing {
-            self.end(TerminalKind::Filled);
+        if self.complete_if_covered() {
             return FillApplied::Completed;
         }
         if self.state == OrdState::Unknown {
@@ -467,6 +470,19 @@ impl OrderRecord {
         }
         self.state = self.live_state();
         FillApplied::Live
+    }
+
+    /// Ends a live order Filled when its fills alone cover its total and no amend to a larger
+    /// total is in flight; whether it did. Checked whenever the fills, the total or the amend
+    /// in flight change.
+    fn complete_if_covered(&mut self) -> bool {
+        let growing =
+            matches!(self.intent, Intent::PendingAmend { qty, .. } if qty > self.cum_fills);
+        let covered = !self.state.is_terminal() && self.cum_fills >= self.qty && !growing;
+        if covered {
+            self.end(TerminalKind::Filled);
+        }
+        covered
     }
 
     /// The state of an order the venue shows resting: PartiallyFilled once something is
@@ -529,9 +545,11 @@ fn terminal_kind(state: &VenueOrderState) -> Option<TerminalKind> {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use fbc_core::{
-        AccountKey, Channel, CidMint, InstrumentId, Namespace, NamespaceLease, Side, Tif, WallNs,
+        AccountKey, Channel, CidMint, InstrumentId, Namespace, NamespaceLease, NotAmendable,
+        Reject, Side, Tif, WallNs,
     };
 
     use super::*;
@@ -540,10 +558,35 @@ mod tests {
         Lots::new(n).unwrap()
     }
 
+    fn key(ingest: u64) -> OrderKey {
+        OrderKey {
+            venue: None,
+            ingest,
+        }
+    }
+
+    /// A venue update in `state` with cumulative fill `cum`, naming no ids.
+    fn update(state: VenueOrderState, cum: i64) -> OrderUpdate {
+        OrderUpdate {
+            cid: None,
+            vid: None,
+            inst: InstrumentId::new(1),
+            side: Side::Buy,
+            state,
+            cum_filled: lots(cum),
+            px: None,
+            qty: None,
+            post_only: None,
+            reduce_only: None,
+        }
+    }
+
     /// A pending limit buy of `qty`, under a client id minted in a lease of its own.
     fn order(qty: i64) -> OrderRecord {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let dir: PathBuf =
-            std::env::temp_dir().join(format!("fbc-oms-record-{}-{qty}", std::process::id()));
+            std::env::temp_dir().join(format!("fbc-oms-record-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let lease = NamespaceLease::acquire(&dir, AccountKey::new(1), Namespace::new(3)).unwrap();
         let cid = CidMint::new(lease, 0, 0, WallNs(0)).mint().unwrap();
@@ -570,6 +613,45 @@ mod tests {
         assert_eq!(rec.resting(), Lots::ZERO);
         // Once the fills cover the amended total too, the order is filled.
         assert_eq!(rec.apply_fill(None, lots(8)), FillApplied::Completed);
+        assert_eq!(rec.state(), OrdState::Terminal(TerminalKind::Filled));
+    }
+
+    #[test]
+    fn a_covered_order_is_filled_once_the_larger_amend_fails() {
+        let refusal = Reject {
+            kind: RejectKind::NotAmendable(NotAmendable::Other),
+            venue_code: None,
+            raw: "refused".into(),
+        };
+        let fails = [
+            SubmitOutcome::NotSent(NotSentReason::Unencodable),
+            SubmitOutcome::Rejected(refusal),
+        ];
+        for outcome in fails {
+            let mut rec = order(5);
+            assert!(rec.amend_sent(Ticks(101), lots(8), RpcId(3), MonoNs(2)));
+            assert_eq!(rec.apply_fill(None, lots(5)), FillApplied::Live);
+            rec.on_outcome(OrderOp::Amend, None, &outcome, MonoNs(3));
+            assert_eq!(rec.state(), OrdState::Terminal(TerminalKind::Filled));
+            assert_eq!(rec.resting(), Lots::ZERO);
+        }
+    }
+
+    #[test]
+    fn a_covered_order_is_filled_once_an_update_resolves_the_amend_at_or_below_its_fills() {
+        let mut rec = order(5);
+        assert!(rec.amend_sent(Ticks(101), lots(8), RpcId(3), MonoNs(2)));
+        assert_eq!(rec.apply_fill(None, lots(5)), FillApplied::Live);
+        // The venue amended it to eight: still resting three.
+        let mut amended = update(VenueOrderState::Amended { new_vid: None }, 5);
+        amended.qty = Some(lots(8));
+        rec.apply_update(&amended, key(1));
+        assert_eq!(rec.state(), OrdState::PartiallyFilled);
+        assert_eq!(rec.resting(), lots(3));
+        // A later update reports a total the fills already cover.
+        let mut open = update(VenueOrderState::Open, 5);
+        open.qty = Some(lots(5));
+        rec.apply_update(&open, key(2));
         assert_eq!(rec.state(), OrdState::Terminal(TerminalKind::Filled));
     }
 
