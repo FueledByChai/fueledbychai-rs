@@ -527,6 +527,55 @@ async fn resubscribe_on_stale() {
     assert_eq!(session.counters().refused_effects, 2);
 }
 
+/// Codex r4180246768: a window that runs out as the connection is due to rotate is a silence,
+/// reported stale and reconnected as paced, never a planned rotation. Which of two deadlines due
+/// at once the session sees first is chance, so it is tried on many epochs.
+#[tokio::test(start_paused = true)]
+async fn a_window_that_runs_out_as_the_connection_rotates_is_silence() {
+    const EPOCHS: u32 = 24;
+    let frozen = freeze();
+    let mut server = ScriptedWs::start().await;
+    let seen = Seen::default();
+    // The venue closes a connection 10 s after it opens and the margin is 2 s: rotation is due
+    // 8 s after the open, as the 8 s window runs out.
+    let liveness = Liveness::new(ms(8_000), ms(2_000)).unwrap();
+    let config = toy_session(server.url(), &[(LIFETIME_MS, "10000")], liveness);
+    let (mut session, control) = MdSession::new(config, keep(&seen)).unwrap();
+    let watch = seen.clone();
+    let script = async move {
+        let mut peer = server.accept().await;
+        for epoch in 0..EPOCHS {
+            assert_eq!(peer.recv().await, format!("hello|codec={epoch}|plan=1,2"));
+            assert_eq!(peer.recv().await, "sub|add=A,B");
+            advance(ms(8_000)).await;
+            let reports = 2 * (epoch as usize + 1);
+            settle(|| watch.borrow().len() == reports).await;
+            assert_eq!(peer.next().await, None);
+            // A drop waits the pacing's floor; a rotation would have reconnected at once.
+            churn().await;
+            assert!(server.try_accept().is_none());
+            advance(ms(1_000)).await;
+            peer = server.accept().await;
+        }
+        drop(control);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    drop(frozen);
+    assert!(seen.borrow().iter().all(|e| matches!(
+        e.body,
+        MdEvent::Health {
+            h: FeedHealth::Stale,
+            ..
+        }
+    )));
+    let counters = session.counters();
+    assert_eq!(
+        (counters.silences, counters.rotations),
+        (u64::from(EPOCHS), 0)
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_frame_that_waited_behind_a_held_write_is_heard_not_silence() {
     let frozen = freeze();
