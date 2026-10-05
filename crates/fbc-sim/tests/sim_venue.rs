@@ -2217,3 +2217,40 @@ fn an_order_arriving_after_a_trade_its_level_has_not_shown_is_not_behind_that_tr
         "{got:?}"
     );
 }
+
+#[test]
+fn an_order_arriving_after_a_trade_through_its_level_is_not_behind_that_level() {
+    // Codex r4184546701: a buy printed at 201 emptied the offer at 200 before it, though the
+    // level shows that only later; an order arriving at 200 in between queues behind none of
+    // it, and the level's removal moves nothing.
+    let mut v = Venue::new(Bracket::Pessimistic);
+    v.snapshot(T0, &[(198, 5)], &[(200, 3), (201, 4)]);
+    v.send(limit(cid(), Side::Sell, 200, 2), 1, T0);
+    v.trade(T0 + 4 * MS, Aggressor::Buyer, 201, 5);
+    v.tick(T0 + 5 * MS);
+    assert_eq!(v.answers().len(), 2);
+    v.level(T0 + 6 * MS, BookSide::Ask, 200, 0);
+    v.trade(T0 + 7 * MS, Aggressor::Buyer, 200, 2);
+    let got = v.answers();
+    assert_eq!(
+        got.iter()
+            .filter_map(|(_, ev)| fill_of(ev))
+            .map(|f| f.1)
+            .sum::<i64>(),
+        2,
+        "{got:?}"
+    );
+}
+
+#[test]
+fn a_venue_that_replays_fills_on_reconnect_is_not_stood_in_for_yet() {
+    // Codex r4184546713: the engine never replays a fill, so a venue whose fills replay on
+    // reconnect gets no placement rather than a session that never shows a replay (FBC-3q6).
+    // Cancels still go.
+    let mut config = config(Bracket::Optimistic, VenueFeeSign::PositiveIsCost, fees());
+    config.exec.fills.replays_fills_on_reconnect = true;
+    let mut v = Venue::with(config);
+    let refused = v.encode(&limit(cid(), Side::Buy, 199, 1), 1, T0);
+    assert_eq!(refused.err(), Some(NotSentReason::Unsupported));
+    assert!(v.encode(&cancel(OrderRef::Client(cid())), 2, T0).is_ok());
+}

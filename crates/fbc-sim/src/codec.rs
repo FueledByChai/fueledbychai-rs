@@ -25,8 +25,9 @@ use crate::wire::{Cancel, Command, Place, Refusal, Reply, Sent, SimState, Target
 /// what the stood-in venue's [`OrderCaps`] do not offer, RPI orders, which the engine cannot
 /// fill yet (FBC-njk, decision 0043), and placements for a venue whose events the engine
 /// cannot say yet: two-phase acknowledgement (FBC-zr1), an ordering key other than a venue
-/// sequence, realized values on fills, or fills derived from order status (FBC-938), or a
-/// venue with a speed bump (FBC-7y8); amends, batches and queries are FBC-nv2's.
+/// sequence, realized values on fills, or fills derived from order status (FBC-938), a venue
+/// with a speed bump (FBC-7y8), or one whose fills replay on reconnect (FBC-3q6); amends,
+/// batches and queries are FBC-nv2's.
 #[derive(Clone, Debug)]
 pub struct SimCodec {
     /// Whether the engine can say what the stood-in venue's events say ([`modelled`]).
@@ -131,8 +132,8 @@ impl SimCodec {
 /// command past its latency (Codex r4184245574; FBC-7y8), it acknowledges in one phase
 /// (Codex r4182678509; FBC-zr1), orders its answers by a venue sequence, keeps no position to
 /// report realized P&L or funding from, and sends fills of their own (Codex r4182991971,
-/// r4182991978; FBC-938). Placements for any other venue are refused rather than answered with
-/// events unlike its own.
+/// r4182991978; FBC-938), and never replays a fill on reconnect (Codex r4184546713; FBC-3q6).
+/// Placements for any other venue are refused rather than answered with events unlike its own.
 fn modelled(exec: &ExecCaps, matching: &MatchingCaps) -> bool {
     matching.speed_bump.is_none()
         && exec.order.ack == AckModel::SinglePhase
@@ -140,6 +141,7 @@ fn modelled(exec: &ExecCaps, matching: &MatchingCaps) -> bool {
         && !exec.fills.realized_pnl
         && !exec.fills.realized_funding
         && exec.fills.source == FillSource::Native
+        && !exec.fills.replays_fills_on_reconnect
 }
 
 fn malformed(err: WireError) -> DecodeError {
