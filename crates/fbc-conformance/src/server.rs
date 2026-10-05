@@ -1,11 +1,12 @@
 //! The stub venue server: a WebSocket endpoint that plays a [`WsScript`] and an HTTP/1.1
-//! endpoint that answers fixed responses by path, each on its own 127.0.0.1 ephemeral port.
+//! endpoint that answers by an [`HttpRouter`]'s rules, each on its own 127.0.0.1 ephemeral port.
 //! Nothing here reaches beyond the loopback interface.
 
-use std::collections::BTreeMap;
+use std::any::Any;
 use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use futures_util::{SinkExt, StreamExt};
@@ -15,18 +16,10 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::script::{Frame, Step, WsScript};
+use fbc_runtime::http::Method;
 
-/// A fixed HTTP response.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HttpReply {
-    pub status: u16,
-    pub body: Vec<u8>,
-}
-
-/// Fixed responses by request path (the target without its query); any other path is answered
-/// 404 with an empty body, and a request the stub cannot read 400.
-pub type HttpRoutes = BTreeMap<String, HttpReply>;
+use crate::routes::{HttpReply, HttpRequest, HttpRouter};
+use crate::script::{Frame, Responder, Step, WsScript};
 
 /// The most bytes the stub reads of one request's head, and of its body.
 const MAX_REQUEST: usize = 64 * 1024;
@@ -54,6 +47,12 @@ pub enum ScriptError {
     Accept { step: usize, conn: usize },
     /// The connection closed before the step could read from or write to it.
     Closed { step: usize, conn: usize },
+    /// The step's responder refused the frame it read, or panicked; `reason` says which.
+    Respond {
+        step: usize,
+        conn: usize,
+        reason: String,
+    },
 }
 
 impl fmt::Display for ScriptError {
@@ -67,6 +66,12 @@ impl fmt::Display for ScriptError {
             }
             ScriptError::Closed { step, conn } => {
                 write!(f, "step {step}: connection {conn} is closed")
+            }
+            ScriptError::Respond { step, conn, reason } => {
+                write!(
+                    f,
+                    "step {step}: the responder on connection {conn} failed: {reason}"
+                )
             }
         }
     }
@@ -93,8 +98,9 @@ pub struct StubServer {
 }
 
 impl StubServer {
-    /// Binds both endpoints and starts playing `script`.
-    pub async fn start(script: WsScript, routes: HttpRoutes) -> io::Result<StubServer> {
+    /// Binds both endpoints and starts playing `script`; HTTP requests are answered by `router`,
+    /// an [`HttpRouter`] or 0025's fixed [`HttpRoutes`](crate::HttpRoutes).
+    pub async fn start(script: WsScript, router: impl Into<HttpRouter>) -> io::Result<StubServer> {
         let ws_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let http_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let (ws, http) = (ws_listener.local_addr()?, http_listener.local_addr()?);
@@ -111,7 +117,7 @@ impl StubServer {
         ));
         tokio::spawn(accept_http(
             http_listener,
-            Arc::new(routes),
+            Arc::new(router.into()),
             requests.clone(),
             stop.clone(),
         ));
@@ -309,6 +315,16 @@ async fn play(
                 let (handle, closed) = handle(&mut conns, step, conn)?;
                 handle.frames.recv().await.ok_or(closed)?;
             }
+            Step::Respond { conn, with } => {
+                let (handle, closed) = handle(&mut conns, step, conn)?;
+                let frame = handle.frames.recv().await.ok_or(closed.clone())?;
+                let refused = |reason| ScriptError::Respond { step, conn, reason };
+                for frame in respond(&with, &frame).map_err(refused)? {
+                    if !done(handle, |sent| Cmd::Push(frame, sent)).await {
+                        return Err(closed);
+                    }
+                }
+            }
             Step::Push { conn, frame } => {
                 let (handle, closed) = handle(&mut conns, step, conn)?;
                 if !done(handle, |sent| Cmd::Push(frame, sent)).await {
@@ -332,6 +348,20 @@ async fn play(
         }
     }
     Ok(())
+}
+
+/// What `with` computes from `frame`; a panic in it is a refusal, so a script whose responder
+/// panicked never reads as finished.
+fn respond(with: &Responder, frame: &Frame) -> Result<Vec<Frame>, String> {
+    let caught = catch_unwind(AssertUnwindSafe(|| with.respond(frame)));
+    caught.unwrap_or_else(|panic| Err(format!("panicked: {}", panic_text(&*panic))))
+}
+
+/// A panic's message, when it is a string.
+fn panic_text(panic: &(dyn Any + Send)) -> &str {
+    let text = panic.downcast_ref::<&str>().copied();
+    let text = text.or_else(|| panic.downcast_ref::<String>().map(String::as_str));
+    text.unwrap_or("a panic")
 }
 
 /// Asks the connection's task for `cmd` and waits for its outcome: false when the write failed
@@ -360,7 +390,7 @@ fn handle(
 
 async fn accept_http(
     listener: TcpListener,
-    routes: Arc<HttpRoutes>,
+    routes: Arc<HttpRouter>,
     requests: Shared<Vec<Option<String>>>,
     mut stop: watch::Receiver<()>,
 ) {
@@ -390,20 +420,14 @@ async fn accept_http(
 /// Answers one request on `stream`, then closes it.
 async fn serve_http(
     mut stream: TcpStream,
-    routes: &HttpRoutes,
+    routes: &HttpRouter,
     requests: &Mutex<Vec<Option<String>>>,
     slot: usize,
 ) {
     let reply = match read_request(&mut stream).await {
-        Some(line) => {
-            let path = line.split(' ').nth(1).unwrap_or_default();
-            let path = path.split('?').next().unwrap_or_default();
-            let reply = routes.get(path).cloned().unwrap_or(HttpReply {
-                status: 404,
-                body: Vec::new(),
-            });
+        Some((line, request)) => {
             lock(requests)[slot] = Some(line);
-            reply
+            routes.answer(request)
         }
         None => HttpReply {
             status: 400,
@@ -423,9 +447,11 @@ async fn serve_http(
     let _ = tokio::io::copy(&mut stream, &mut tokio::io::sink()).await;
 }
 
-/// Reads a request's head and body; its method and target, or `None` when it is not a request
-/// the stub can read within [`MAX_REQUEST`].
-async fn read_request(stream: &mut TcpStream) -> Option<String> {
+/// Reads a request's head and body: its method and target as recorded, and the request, or
+/// `None` when it is not a request the stub can read within [`MAX_REQUEST`]. A body is read by
+/// its Content-Length only; a request that names a transfer coding is refused, never handed on
+/// with its body missing.
+async fn read_request(stream: &mut TcpStream) -> Option<(String, HttpRequest)> {
     let mut seen = Vec::new();
     let head_end = loop {
         if let Some(i) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -442,21 +468,44 @@ async fn read_request(stream: &mut TcpStream) -> Option<String> {
     if head_end > MAX_REQUEST {
         return None;
     }
-    let head = std::str::from_utf8(&seen[..head_end]).ok()?;
+    let head = std::str::from_utf8(&seen[..head_end - 4]).ok()?;
     let mut lines = head.split("\r\n");
     let (method, rest) = lines.next()?.split_once(' ')?;
     let (target, _version) = rest.rsplit_once(' ')?;
-    let length = lines
-        .filter_map(|l| l.split_once(':'))
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-        .map_or(Some(0), |(_, v)| v.trim().parse::<usize>().ok())?;
+    let line = format!("{method} {target}");
+    let method = Method::from_bytes(method.as_bytes()).ok()?;
+    let headers: Vec<(String, String)> = lines
+        .map(|l| {
+            l.split_once(':')
+                .map(|(k, v)| (k.to_owned(), v.trim().to_owned()))
+        })
+        .collect::<Option<_>>()?;
+    let named = |name: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name));
+    if named("transfer-encoding").is_some() {
+        return None;
+    }
+    let length = named("content-length").map_or(Some(0), |(_, v)| v.parse::<usize>().ok())?;
     if length > MAX_REQUEST {
         return None;
     }
-    let mut body = seen.len() - head_end;
-    while body < length {
+    let mut body = seen[head_end..].to_vec();
+    while body.len() < length {
         let mut chunk = [0u8; 1024];
-        body += stream.read(&mut chunk).await.ok().filter(|n| *n > 0)?;
+        let n = stream.read(&mut chunk).await.ok().filter(|n| *n > 0)?;
+        body.extend_from_slice(&chunk[..n]);
     }
-    Some(format!("{method} {target}"))
+    body.truncate(length);
+    let (path, query) = match target.split_once('?') {
+        Some((path, query)) => (path, Some(query.to_owned())),
+        None => (target, None),
+    };
+    let request = HttpRequest {
+        method,
+        path: path.to_owned(),
+        query,
+        headers,
+        body,
+        params: Vec::new(),
+    };
+    Some((line, request))
 }

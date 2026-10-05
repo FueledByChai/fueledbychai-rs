@@ -1,6 +1,10 @@
 //! Fault scripts as typed Rust values (decision 0025): a [`WsScript`] is one timeline of
 //! [`Step`]s, each naming the connection it acts on by its accept order, so a script can drive
-//! several connections and interleave them.
+//! several connections and interleave them. A [`Step::Respond`] answers the frame it reads with
+//! frames a [`Responder`] computes from it (decision 0047).
+
+use std::fmt;
+use std::sync::Arc;
 
 /// A WebSocket data frame, as the stub sends or received it. Pings, pongs and close frames are
 /// protocol, not data, and are never recorded.
@@ -26,12 +30,54 @@ pub enum Step {
     /// Wait for the next data frame from `conn` (every frame is recorded as it arrives, read or
     /// not). Reading a subscribe and then pushing a reply is how a script acknowledges it.
     Read { conn: usize },
+    /// Wait for the next data frame from `conn`, as [`Step::Read`] does, and send `conn`, in
+    /// order, the frames `with` computes from it (none is allowed): a reply echoing the
+    /// request's id, a batch's outcome per item. A responder that refuses the frame, or panics,
+    /// fails the script.
+    Respond { conn: usize, with: Responder },
     /// Send `frame` to `conn`.
     Push { conn: usize, frame: Frame },
     /// Send `conn` a close frame; the stub keeps recording until the client's close reply.
     Close { conn: usize },
     /// Stop reading from and writing to `conn`, holding it open until the stub is dropped.
     Silent { conn: usize },
+}
+
+/// What a responder computes from the frame it was handed: the frames to send, or why it
+/// refuses that frame.
+pub type Responded = Result<Vec<Frame>, String>;
+
+type RespondFn = dyn Fn(&Frame) -> Responded + Send + Sync;
+
+/// A typed Rust function from the frame a [`Step::Respond`] read to the frames it sends back.
+/// Clones share the function; two responders are equal only when they share it, so a script
+/// compares as it always did.
+#[derive(Clone)]
+pub struct Responder(Arc<RespondFn>);
+
+impl Responder {
+    pub fn new(respond: impl Fn(&Frame) -> Responded + Send + Sync + 'static) -> Responder {
+        Responder(Arc::new(respond))
+    }
+
+    /// The frames to send for `frame`, or why it was refused.
+    pub(crate) fn respond(&self, frame: &Frame) -> Responded {
+        (self.0)(frame)
+    }
+}
+
+impl PartialEq for Responder {
+    fn eq(&self, other: &Responder) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for Responder {}
+
+impl fmt::Debug for Responder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Responder(..)")
+    }
 }
 
 /// A script the stub plays from its start, step by step.

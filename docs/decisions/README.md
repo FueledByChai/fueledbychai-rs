@@ -49,3 +49,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0044](0044-the-conformance-toy-venue-in-fbc-conformance-stands-in-for-b.md) The conformance toy venue in fbc-conformance stands in for BT-502's toy venue from BT-102 — accepted
 - [0045](0045-order-entry-reaches-a-gateway-only-with-an-authorization-fbc.md) Order entry reaches a gateway only with an authorization fbc-oms issues, and the gateway traits live in fbc-oms, refining design 4.8 — accepted
 - [0046](0046-simvenue-is-an-unchanged-execcodec-writing-frames-on-a-simul.md) SimVenue is an unchanged ExecCodec writing frames on a simulated order stream to a pure engine fed the shard's envelopes — accepted
+- [0047](0047-the-stub-answers-what-it-reads-a-script-step-pushes-frames-a.md) The stub answers what it reads: a script step pushes frames a function computes from the frame read, and HTTP rules match method and path pattern, augmenting 0025 — accepted
