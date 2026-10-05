@@ -7,7 +7,8 @@
 //! it), `BookSnapshotEnd` makes the replacement the book, `Window` bounds a windowed book, and
 //! `Health` with a gap on the book's feed invalidates it until the next complete snapshot.
 //!
-//! A valid book gives its [`touch`](L2Book::touch) and [`top`](L2Book::top) levels per side,
+//! A valid book gives its [`touch`](L2Book::touch), its [`top`](L2Book::top) levels per side and
+//! one [`level`](L2Book::level)'s size,
 //! never a level outside its window; two tops compare exactly, naming the first level that
 //! differs ([`Top::first_difference`]); and [`L2Book::canonical_bytes`] serializes the whole
 //! state so two books compare byte for byte.
