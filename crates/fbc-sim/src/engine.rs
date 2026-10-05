@@ -872,6 +872,8 @@ impl SimEngine {
                 let book = self.trading_book(a.inst);
                 let shown = book.and_then(|b| b.level(side, a.px).ok().flatten());
                 let shown = shown.ok_or(Refusal::NoBook)?;
+                // Less what trades took that the book has not shown (Codex r4186693205).
+                let shown = self.unshown(a.inst, side, a.px, shown);
                 let others = self.own(a.inst, side, a.px).checked_sub(left);
                 let fits = others
                     .and_then(|o| o.checked_add(shown))
