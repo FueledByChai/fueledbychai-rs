@@ -1,6 +1,7 @@
 //! Order truth (decision 0005): the monotone order lattice every later part of the OMS builds
-//! on, each command item's outcome, the registry of orders by client id, and the one way order
-//! entry reaches a gateway.
+//! on, each command item's outcome, the registry of orders by client id, the fill ledger
+//! through which alone fills move an order's fill count and the inventory, and the one way
+//! order entry reaches a gateway.
 //!
 //! An [`OrderRecord`] holds one of our orders. Its [`OrdState`]s are ranked: PendingNew and
 //! Unknown (0), Open (1), PartiallyFilled (2), Terminal (3), and a terminal state is absorbing.
@@ -16,8 +17,20 @@
 //! leaves the order as it was. [`Registry`] keeps the records by client id and routes each
 //! update to its order.
 //!
-//! Decision 0005's I1 (for order updates) and I2 are property-tested in `tests/lattice.rs`
-//! (decision 0037).
+//! Fills (decision 0005, I3) pass the [`FillLedger`] first, which deduplicates them by
+//! [`FillEvent::key`](fbc_core::FillEvent::key) and holds them for an age and a count the
+//! consumer configures. A live fill is accepted when absent; a replayed or snapshot fill only
+//! reconciles, accepted only when absent and executed after both the session-start watermark
+//! and the ledger's retention horizon, the venue time of the latest fill it forgot, so a fill
+//! forgotten and replayed after a long reconnect cannot be applied twice; a refused replay is
+//! counted ([`ReplayCounts`]). The ledger hands an accepted fill back as an [`AcceptedFill`],
+//! which [`Registry::apply_fill`] consumes: the only path that moves an order's `cum_fills`
+//! and the inventory. An order's filled quantity is the larger of the venue's cumulative count
+//! (`cum_venue`) and `cum_fills`, never their sum; a fill promotes a PendingNew or Unknown
+//! order, and the order is Filled only when its fills alone cover it.
+//!
+//! Decision 0005's I1 (for order updates) and I2 are property-tested in `tests/lattice.rs`,
+//! I1 with fills and I3 in `tests/fills.rs` (decision 0037).
 //!
 //! Order entry reaches a venue only through this crate (0013 rule 2, decision 0045): the
 //! gateway traits, [`OrderGateway`] and [`ManagedGateway`], live here, and
@@ -27,12 +40,13 @@
 //! be cloned or edited, and submitting consumes it (`tests/compile_fail.rs`). A command that
 //! affects no order goes through [`OrderGateway::submit_control`] as a [`ControlCommand`].
 //!
-//! Not here yet: fills, the `FillLedger` and the second fill counter (FBC-sq9), permits
-//! (FBC-lrc), the pre-trade caps (FBC-2e4), the market states (FBC-c4v), issuing an
-//! authorization after them and its check at submit (FBC-afd), and the Unknown ladder.
+//! Not here yet: permits (FBC-lrc), the pre-trade caps (FBC-2e4), the market states
+//! (FBC-c4v), issuing an authorization after them and its check at submit (FBC-afd), and the
+//! Unknown ladder.
 
 mod gateway;
 mod grant;
+mod ledger;
 mod record;
 mod registry;
 
@@ -44,7 +58,12 @@ mod common;
 
 pub use gateway::{ControlCommand, ManagedGateway, OrderGateway};
 pub use grant::{Authorization, StateGeneration};
-pub use record::{
-    Applied, Intent, OrdState, OrderKey, OrderOp, OrderRecord, OutcomeApplied, TerminalKind,
+pub use ledger::{
+    AcceptedFill, Admission, FillLedger, FillTime, Horizon, LedgerConfig, LedgerConfigError,
+    ReplayCounts,
 };
-pub use registry::{OmsError, Registry, Routed};
+pub use record::{
+    Applied, FillApplied, Intent, OrdState, OrderKey, OrderOp, OrderRecord, OutcomeApplied,
+    TerminalKind,
+};
+pub use registry::{FillRouted, OmsError, Registry, Routed};

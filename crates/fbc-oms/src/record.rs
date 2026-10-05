@@ -144,11 +144,23 @@ pub enum OutcomeApplied {
     Unchanged,
 }
 
+/// What a fill the ledger accepted did to its order
+/// ([`Registry::apply_fill`](crate::Registry::apply_fill)).
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum FillApplied {
+    /// Counted; the order rests, PartiallyFilled (a PendingNew or Unknown order is promoted).
+    Live,
+    /// Counted, and the fills alone now cover the order's total: it is Filled.
+    Completed,
+    /// Counted on an order already terminal, whose state does not move.
+    AfterEnd,
+}
+
 /// One of our orders, as the OMS knows it.
 ///
 /// The fields are private and change only through [`apply_update`](OrderRecord::apply_update),
-/// [`on_outcome`](OrderRecord::on_outcome) and the sent intents, so the lattice only moves
-/// forward.
+/// [`on_outcome`](OrderRecord::on_outcome), the sent intents and the fills the ledger accepted
+/// ([`Registry::apply_fill`](crate::Registry::apply_fill)), so the lattice only moves forward.
 #[derive(Clone, Debug)]
 pub struct OrderRecord {
     placed: NewOrder,
@@ -158,6 +170,7 @@ pub struct OrderRecord {
     px: Option<Ticks>,
     qty: Lots,
     cum_venue: Lots,
+    cum_fills: Lots,
     state: OrdState,
     intent: Intent,
     last_key: Option<OrderKey>,
@@ -179,6 +192,7 @@ impl OrderRecord {
             replaced: Vec::new(),
             px,
             cum_venue: Lots::ZERO,
+            cum_fills: Lots::ZERO,
             state: OrdState::PendingNew,
             intent: Intent::None,
             last_key: None,
@@ -226,10 +240,15 @@ impl OrderRecord {
         self.cum_venue
     }
 
-    /// The filled quantity. Until the fill ledger lands (FBC-sq9) it is the venue's cumulative
-    /// count; then it is the larger of that and the deduplicated fill sum, never their sum.
+    /// The sum of the order's fills the ledger accepted: each fill counted once.
+    pub fn cum_fills(&self) -> Lots {
+        self.cum_fills
+    }
+
+    /// The filled quantity: the larger of the venue's cumulative count and the deduplicated
+    /// fill sum, never their sum, since both count the same executions (decision 0005, I3).
     pub fn filled(&self) -> Lots {
-        self.cum_venue
+        self.cum_venue.max(self.cum_fills)
     }
 
     /// The quantity still resting: nothing once terminal; otherwise the total less the filled
@@ -414,6 +433,42 @@ impl OrderRecord {
         }
     }
 
+    /// The order's fill sum once a fill of `qty` is counted; `None` when that overflows.
+    pub(crate) fn cum_fills_with(&self, qty: Lots) -> Option<Lots> {
+        self.cum_fills.checked_add(qty)
+    }
+
+    /// Counts a fill the ledger accepted, naming the venue id `vid`, the order's fill sum then
+    /// being `cum_fills` (checked by [`Self::cum_fills_with`]).
+    ///
+    /// The fill counts whatever the order's state. A terminal order does not move. Otherwise
+    /// the record learns the fill's venue id when it has none; a PendingNew or Unknown order is
+    /// promoted; and the order is Filled only when the fills alone cover its total and no amend
+    /// to a larger total is in flight, never on the venue's cumulative count alone.
+    pub(crate) fn apply_fill(
+        &mut self,
+        vid: Option<&VenueOrderId>,
+        cum_fills: Lots,
+    ) -> FillApplied {
+        self.cum_fills = cum_fills;
+        if self.state.is_terminal() {
+            return FillApplied::AfterEnd;
+        }
+        if let (None, Some(v)) = (&self.vid, vid) {
+            self.vid = Some(self.follow(v));
+        }
+        let growing = matches!(self.intent, Intent::PendingAmend { qty, .. } if qty > cum_fills);
+        if cum_fills >= self.qty && !growing {
+            self.end(TerminalKind::Filled);
+            return FillApplied::Completed;
+        }
+        if self.state == OrdState::Unknown {
+            self.unknown_since = None;
+        }
+        self.state = self.live_state();
+        FillApplied::Live
+    }
+
     /// The state of an order the venue shows resting: PartiallyFilled once something is
     /// filled, Open before.
     fn live_state(&self) -> OrdState {
@@ -468,5 +523,61 @@ fn terminal_kind(state: &VenueOrderState) -> Option<TerminalKind> {
         VenueOrderState::Canceled(reason) => Some(TerminalKind::Canceled(*reason)),
         VenueOrderState::Rejected(reject) => Some(TerminalKind::Rejected(reject.kind())),
         VenueOrderState::Expired => Some(TerminalKind::Expired),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use fbc_core::{
+        AccountKey, Channel, CidMint, InstrumentId, Namespace, NamespaceLease, Side, Tif, WallNs,
+    };
+
+    use super::*;
+
+    fn lots(n: i64) -> Lots {
+        Lots::new(n).unwrap()
+    }
+
+    /// A pending limit buy of `qty`, under a client id minted in a lease of its own.
+    fn order(qty: i64) -> OrderRecord {
+        let dir: PathBuf =
+            std::env::temp_dir().join(format!("fbc-oms-record-{}-{qty}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lease = NamespaceLease::acquire(&dir, AccountKey::new(1), Namespace::new(3)).unwrap();
+        let cid = CidMint::new(lease, 0, 0, WallNs(0)).mint().unwrap();
+        OrderRecord::new(NewOrder {
+            cid,
+            inst: InstrumentId::new(1),
+            side: Side::Buy,
+            qty: lots(qty),
+            kind: OrderKind::Limit { px: Ticks(100) },
+            tif: Tif::Gtc,
+            channel: Channel::Public,
+            post_only: true,
+            reduce_only: false,
+            reducing: false,
+        })
+    }
+
+    #[test]
+    fn an_amend_to_a_larger_total_in_flight_keeps_a_covered_order_resting() {
+        let mut rec = order(4);
+        assert!(rec.amend_sent(Ticks(101), lots(8), RpcId(3), MonoNs(2)));
+        assert_eq!(rec.apply_fill(None, lots(4)), FillApplied::Live);
+        assert_eq!(rec.state(), OrdState::PartiallyFilled);
+        assert_eq!(rec.resting(), Lots::ZERO);
+        // Once the fills cover the amended total too, the order is filled.
+        assert_eq!(rec.apply_fill(None, lots(8)), FillApplied::Completed);
+        assert_eq!(rec.state(), OrdState::Terminal(TerminalKind::Filled));
+    }
+
+    #[test]
+    fn an_amend_to_a_smaller_total_in_flight_does_not_hold_a_covered_order_open() {
+        let mut rec = order(6);
+        assert!(rec.amend_sent(Ticks(101), lots(3), RpcId(3), MonoNs(2)));
+        assert_eq!(rec.apply_fill(None, lots(6)), FillApplied::Completed);
+        assert_eq!(rec.intent(), Intent::None);
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "fbc-oms"
-description = "Order truth: the monotone order lattice, each command item's outcome, the registry of orders by client id, and the gateway traits order entry reaches a venue through, with the authorization only fbc-oms issues."
+description = "Order truth: the monotone order lattice, each command item's outcome, the registry of orders by client id, the fill ledger with the inventory its fills move, and the gateway traits order entry reaches a venue through, with the authorization only fbc-oms issues."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
