@@ -137,9 +137,13 @@ fn a_new_order_queues_behind_its_level_less_every_modelled_own_order() {
             .accept(OrderKey(5), sell(101, 1), &book(&[(100, 18)], &[(101, 4)]))
             .unwrap();
         assert_eq!(offer.ahead, lots(4), "{bracket:?}");
-        // An empty level: nothing ahead.
+        // An empty price the book knows (between its asks): nothing ahead.
         let alone = m
-            .accept(OrderKey(6), sell(105, 1), &book(&[(100, 18)], &[(101, 5)]))
+            .accept(
+                OrderKey(6),
+                sell(105, 1),
+                &book(&[(100, 18)], &[(101, 5), (107, 1)]),
+            )
             .unwrap();
         assert_eq!(alone.ahead, Lots::ZERO, "{bracket:?}");
     }
@@ -169,21 +173,79 @@ fn an_rpi_order_queues_behind_every_public_order_at_its_price() {
         )
         .unwrap();
     assert_eq!((rpi.channel, rpi.ahead), (Channel::Rpi, lots(6)));
-    // A public bid arriving later at 100, with 3 of the public size gone (6 + 2 shown, now
-    // 3 + 2), is matched before the earlier RPI bid.
-    m.accept(OrderKey(2), buy(100, 4), &book(&[(100, 5)], &[]))
+    // A public bid arriving later at 100, once 3 of the public size went (the public book
+    // never shows the RPI bid, so nothing is subtracted for it), is matched before it.
+    m.accept(OrderKey(2), buy(100, 4), &book(&[(100, 3)], &[]))
         .unwrap();
     assert_eq!(ahead(&m, 2), 3);
-    // Retail flow of 8 at 100: the 3 public lots ahead, the public bid's 4, then 1 more lot
-    // of the public size ahead of the RPI bid, which keeps 2 ahead.
-    let fills = m.trade(trade(Side::Sell, 100, 8, Channel::Rpi));
-    assert_eq!(fills, vec![fill(2, Side::Buy, 100, 4, 0)]);
-    assert_eq!(ahead(&m, 1), 2);
-    // Retail flow of 3: the last 2 ahead, then 1 fills it.
+    m.level_cancel(BookSide::Bid, Ticks(100), lots(3), lots(6))
+        .unwrap();
+    // 5 public lots join behind the public bid (3 + 4 + 5 = 12 shown): ahead of the RPI bid.
+    m.public_join(BookSide::Bid, Ticks(100), lots(5)).unwrap();
+    assert_eq!((ahead(&m, 1), ahead(&m, 2)), (11, 3));
+    // A second RPI bid queues behind the modelled public bid and every other public lot.
+    let second = m
+        .accept(
+            OrderKey(3),
+            order(Side::Buy, 100, Channel::Rpi, 1),
+            &book(&[(100, 12)], &[]),
+        )
+        .unwrap();
+    assert_eq!(second.ahead, lots(8));
+    // Retail flow of 16 at 100: the 3 public lots ahead of the public bid, its 4, then the 8
+    // more of the first RPI bid's 11 ahead (Pessimistic still counts the 3 cancelled lots),
+    // and 1 of the first RPI bid's 2. The second RPI bid, behind it, gets none.
+    let fills = m.trade(trade(Side::Sell, 100, 16, Channel::Rpi));
+    assert_eq!(
+        fills,
+        vec![fill(2, Side::Buy, 100, 4, 0), fill(1, Side::Buy, 100, 1, 1)]
+    );
+    assert_eq!((ahead(&m, 1), ahead(&m, 3)), (0, 0));
     assert_eq!(
         m.trade(trade(Side::Sell, 100, 3, Channel::Rpi)),
-        vec![fill(1, Side::Buy, 100, 1, 1)]
+        vec![fill(1, Side::Buy, 100, 1, 0), fill(3, Side::Buy, 100, 1, 0)]
     );
+}
+
+#[test]
+fn public_size_joining_a_level_moves_no_public_order_and_no_other_level() {
+    let mut m = queued(Bracket::Middle, 5, 1);
+    m.accept(
+        OrderKey(2),
+        order(Side::Buy, 99, Channel::Rpi, 1),
+        &book(&[(100, 5), (99, 2)], &[]),
+    )
+    .unwrap();
+    m.accept(
+        OrderKey(3),
+        order(Side::Sell, 100, Channel::Rpi, 1),
+        &book(&[(99, 2)], &[(100, 4)]),
+    )
+    .unwrap();
+    m.public_join(BookSide::Bid, Ticks(100), lots(7)).unwrap();
+    assert_eq!((ahead(&m, 1), ahead(&m, 2), ahead(&m, 3)), (5, 2, 4));
+}
+
+#[test]
+fn an_rpi_order_ahead_past_an_i64_is_refused() {
+    let mut m = model(Bracket::Optimistic);
+    let b = book(&[(100, i64::MAX)], &[]);
+    let rpi = order(Side::Buy, 100, Channel::Rpi, 1);
+    m.accept(OrderKey(1), rpi, &b).unwrap();
+    m.accept(OrderKey(2), rpi, &book(&[(100, 1)], &[])).unwrap();
+    let err = m
+        .public_join(BookSide::Bid, Ticks(100), lots(1))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        QueueError::Overflow {
+            side: BookSide::Bid,
+            px: Ticks(100),
+        }
+    );
+    assert_eq!(err.to_string(), "lots at Bid level 100 overflow");
+    // Neither order moved.
+    assert_eq!((ahead(&m, 1), ahead(&m, 2)), (i64::MAX, 1));
 }
 
 #[test]
@@ -309,6 +371,16 @@ fn a_trade_fills_an_order_only_once_the_queue_ahead_is_consumed() {
 }
 
 #[test]
+fn a_trade_of_no_size_changes_nothing() {
+    for bracket in BRACKETS {
+        let mut m = queued(bracket, 5, 3);
+        assert!(m.trade(sold(99, 0)).is_empty());
+        assert!(m.trade(sold(100, 0)).is_empty());
+        assert_eq!(ahead(&m, 1), 5, "{bracket:?}");
+    }
+}
+
+#[test]
 fn a_trade_the_order_cannot_meet_changes_nothing() {
     for bracket in BRACKETS {
         let mut m = queued(bracket, 5, 3);
@@ -429,17 +501,27 @@ fn accept_refuses_and_changes_nothing() {
     let outside = m.accept(OrderKey(4), sell(110, 1), &windowed).unwrap_err();
     assert_eq!(
         outside,
-        QueueError::OutsideWindow {
+        QueueError::UnknownLevel {
             side: BookSide::Ask,
             px: Ticks(110),
         }
     );
     assert_eq!(
         outside.to_string(),
-        "Ask level 110 is outside the book's window"
+        "the book does not know the size at Ask level 110"
+    );
+    // Past the deepest level a capped book shows: unknown, not empty, so refused.
+    let capped = book(&[(100, 8), (98, 2)], &[(101, 3)]);
+    let deep = m.accept(OrderKey(5), buy(97, 1), &capped).unwrap_err();
+    assert_eq!(
+        deep,
+        QueueError::UnknownLevel {
+            side: BookSide::Bid,
+            px: Ticks(97),
+        }
     );
 
-    for key in 2..=4 {
+    for key in 2..=5 {
         assert_eq!(m.position(OrderKey(key)), None);
     }
 }
@@ -453,12 +535,11 @@ fn modelled_size_past_an_i64_is_refused() {
     let err = m.accept(OrderKey(3), buy(100, 1), &b).unwrap_err();
     assert_eq!(
         err,
-        QueueError::OwnSizeOverflow {
+        QueueError::Overflow {
             side: BookSide::Bid,
             px: Ticks(100),
         }
     );
-    assert_eq!(err.to_string(), "modelled orders at Bid level 100 overflow");
     assert_eq!(m.position(OrderKey(3)), None);
     // The error is a std error.
     let _: &dyn std::error::Error = &err;

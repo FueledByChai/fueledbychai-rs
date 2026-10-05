@@ -383,28 +383,56 @@ fn a_windowed_book_reports_no_level_outside_its_window() {
 
 /// FBC-30g: one level's size, which the queue model in `fbc-sim` reads when an order arrives.
 #[test]
-fn one_level_reads_its_size_zero_when_empty_and_unknown_outside_the_window() {
-    let mut fresh = L2Book::new();
+fn one_level_reads_its_size_zero_when_empty_and_unknown_past_what_the_book_shows() {
+    let mut b = L2Book::new();
     assert_eq!(
-        fresh.level(BookSide::Bid, Ticks(100)),
+        b.level(BookSide::Bid, Ticks(100)),
         Err(BookError::NotValid(BookState::AwaitingSnapshot))
     );
-    fresh.begin_snapshot(1);
-    fresh.set_level(BookSide::Bid, Ticks(100), lots(3));
-    fresh.set_level(BookSide::Ask, Ticks(101), lots(4));
-    fresh.end_snapshot().unwrap();
-    assert_eq!(fresh.level(BookSide::Bid, Ticks(100)), Ok(Some(lots(3))));
-    assert_eq!(fresh.level(BookSide::Ask, Ticks(101)), Ok(Some(lots(4))));
-    // The other side at the same price, and a price with no level, are empty.
-    assert_eq!(fresh.level(BookSide::Ask, Ticks(100)), Ok(Some(Lots::ZERO)));
-    assert_eq!(fresh.level(BookSide::Bid, Ticks(99)), Ok(Some(Lots::ZERO)));
-    // Outside a window a level is unknown, not empty.
-    fresh.set_window(Ticks(100), Ticks(100)).unwrap();
-    assert_eq!(fresh.level(BookSide::Bid, Ticks(100)), Ok(Some(lots(3))));
-    assert_eq!(fresh.level(BookSide::Ask, Ticks(101)), Ok(None));
-    fresh.gap();
+    b.begin_snapshot(1);
+    b.set_level(BookSide::Bid, Ticks(100), lots(3));
+    b.set_level(BookSide::Bid, Ticks(97), lots(2));
+    b.set_level(BookSide::Ask, Ticks(101), lots(4));
+    b.set_level(BookSide::Ask, Ticks(104), lots(1));
+    b.end_snapshot().unwrap();
+    assert_eq!(b.level(BookSide::Bid, Ticks(100)), Ok(Some(lots(3))));
+    assert_eq!(b.level(BookSide::Bid, Ticks(97)), Ok(Some(lots(2))));
+    assert_eq!(b.level(BookSide::Ask, Ticks(101)), Ok(Some(lots(4))));
+    assert_eq!(b.level(BookSide::Ask, Ticks(104)), Ok(Some(lots(1))));
+    // Between shown levels, and better than the touch, a price is empty.
+    assert_eq!(b.level(BookSide::Bid, Ticks(98)), Ok(Some(Lots::ZERO)));
+    assert_eq!(b.level(BookSide::Bid, Ticks(102)), Ok(Some(Lots::ZERO)));
+    assert_eq!(b.level(BookSide::Ask, Ticks(103)), Ok(Some(Lots::ZERO)));
+    assert_eq!(b.level(BookSide::Ask, Ticks(99)), Ok(Some(Lots::ZERO)));
+    // Past the deepest level a capped book shows, the size is unknown, not empty.
+    assert_eq!(b.level(BookSide::Bid, Ticks(96)), Ok(None));
+    assert_eq!(b.level(BookSide::Ask, Ticks(105)), Ok(None));
+    // A side with no level shows nothing known.
+    let mut one_sided = b.clone();
+    one_sided.set_level(BookSide::Ask, Ticks(101), Lots::ZERO);
+    one_sided.set_level(BookSide::Ask, Ticks(104), Lots::ZERO);
+    assert_eq!(one_sided.level(BookSide::Ask, Ticks(101)), Ok(None));
     assert_eq!(
-        fresh.level(BookSide::Bid, Ticks(100)),
+        one_sided.level(BookSide::Bid, Ticks(100)),
+        Ok(Some(lots(3)))
+    );
+    // A windowed book knows every price inside its window, past its deepest level too, and
+    // none outside it.
+    b.set_window(Ticks(98), Ticks(102)).unwrap();
+    assert_eq!(b.level(BookSide::Bid, Ticks(100)), Ok(Some(lots(3))));
+    assert_eq!(b.level(BookSide::Bid, Ticks(98)), Ok(Some(Lots::ZERO)));
+    assert_eq!(b.level(BookSide::Ask, Ticks(102)), Ok(Some(Lots::ZERO)));
+    assert_eq!(b.level(BookSide::Bid, Ticks(97)), Ok(None));
+    assert_eq!(b.level(BookSide::Ask, Ticks(104)), Ok(None));
+    // A level set outside the window is not known either.
+    b.set_level(BookSide::Bid, Ticks(90), lots(5));
+    assert_eq!(b.level(BookSide::Bid, Ticks(90)), Ok(None));
+    // A windowed side with no level is known empty inside the window.
+    b.set_level(BookSide::Bid, Ticks(100), Lots::ZERO);
+    assert_eq!(b.level(BookSide::Bid, Ticks(100)), Ok(Some(Lots::ZERO)));
+    b.gap();
+    assert_eq!(
+        b.level(BookSide::Bid, Ticks(100)),
         Err(BookError::NotValid(BookState::Gapped))
     );
 }
