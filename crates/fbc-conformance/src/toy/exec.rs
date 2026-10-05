@@ -19,10 +19,11 @@ use fbc_core::{
     EncodeReceipt, ExecCodec, ExecEvent, ExecSink, FillCaps, HttpFailure, HttpResponse, HttpTag,
     Inbound, InboundSpans, InstrumentId, NewOrder, NotSentReason, OpKind, OrderCaps, OrderKindTag,
     OrderSigner, PathStage, PathStamps, PlaceWire, RateCharge, RawFrame, RefKind, RpcCall, RpcId,
-    Side, SpecTable, StreamId, SubmitOutcome, TagSet, Tif, TimerTag, VenueCommand, VenueMeta,
-    VenueOrderId, WireCid, WireSlice, encode_cid,
+    Side, SpecTable, StreamId, TagSet, Tif, TimerTag, VenueCommand, VenueOrderId, WireCid,
+    WireSlice, encode_cid,
 };
 
+use super::session::{self, Answers};
 use super::{DEAD_MAN_TTL, EXEC_STREAM, FillIds, RPC_TIMEOUT, caps_for, decode, weight};
 
 use NotSentReason::{SignFailed, Unencodable, Unsupported};
@@ -33,6 +34,7 @@ pub struct ToyExec {
     order: OrderCaps,
     fills: FillCaps,
     signer: Box<dyn OrderSigner>,
+    answers: Answers,
 }
 
 /// A request's frame and the charge it carries.
@@ -52,6 +54,7 @@ impl ToyExec {
             order,
             fills,
             signer,
+            answers: Answers::default(),
         }
     }
 
@@ -378,8 +381,11 @@ impl ExecCodec for ToyExec {
         0
     }
 
-    /// The toy authenticates with nothing yet (FBC-sal).
-    fn on_open(&mut self, _stream: StreamId, _ctx: &EncodeCtx, _fx: &mut Effects) {}
+    /// Authenticates with the toy's token in a redaction span; Authenticated waits for the
+    /// venue's acknowledgement. A resync still being read was cut short by the reconnect.
+    fn on_open(&mut self, stream: StreamId, ctx: &EncodeCtx, fx: &mut Effects) {
+        self.answers.ask_auth(stream, ctx, fx);
+    }
 
     fn encode(
         &mut self,
@@ -402,23 +408,41 @@ impl ExecCodec for ToyExec {
             class: cmd.traffic_class(),
             charge,
         });
+        self.answers.sent(rpc, cmd);
         Ok(receipt)
     }
 
-    /// One record per frame, read whole before it is pushed ([`decode`]); nothing it receives
-    /// asks for an effect.
+    /// One record per frame, read whole before anything is pushed: the answers to requests,
+    /// resyncs and authentication through the session it holds (`session.rs`), the rest as
+    /// events (`decode.rs`). Nothing it receives asks for an effect.
     fn on_frame(
         &mut self,
-        _stream: StreamId,
+        stream: StreamId,
         f: RawFrame<'_>,
         scope: &DecodeScope<'_>,
         specs: &SpecTable,
         sink: &mut dyn ExecSink,
         _fx: &mut Effects,
     ) -> Result<(), DecodeError> {
-        let (meta, event) = decode::event(f, &self.fills, scope, specs)?;
-        sink.push(meta, event);
-        Ok(())
+        let r = decode::record(f)?;
+        let answers = &mut self.answers;
+        match r.kind {
+            "item" => answers.item(&r, scope, sink),
+            "qres" => answers.query(&r, scope, specs, sink),
+            "rsbegin" | "rsorder" | "rspos" | "rsend" => {
+                answers.resync_frame(&r, scope, specs, sink)
+            }
+            "auth" => answers.auth(stream, &r, sink),
+            _ => {
+                let (meta, event) = decode::event(&r, &self.fills, scope, specs)?;
+                // A refusal of the whole request answers every item.
+                if let ExecEvent::Outcome { rpc, .. } = event {
+                    answers.answered(rpc);
+                }
+                sink.push(meta, event);
+                Ok(())
+            }
+        }
     }
 
     fn on_http(
@@ -436,17 +460,20 @@ impl ExecCodec for ToyExec {
     /// The toy sets no timer.
     fn on_timer(&mut self, _tag: TimerTag, _ctx: &EncodeCtx, _fx: &mut Effects) {}
 
-    /// The toy holds no item outcome, so a request timed out is `Unknown` as a whole.
+    /// The outcomes held for `rpc`'s answered items, then `Unknown` for every item still
+    /// unanswered; `Unknown` for the whole request when none was answered (0014 item 3).
     fn on_rpc_timeout(&mut self, rpc: RpcId, sink: &mut dyn ExecSink) {
-        let (item, outcome) = (None, SubmitOutcome::Unknown);
-        sink.push(VenueMeta::NONE, ExecEvent::Outcome { rpc, item, outcome });
+        self.answers.timed_out(rpc, sink);
     }
 
-    /// The toy resyncs nothing yet (FBC-sal).
-    fn resync(&mut self, _ctx: &EncodeCtx, _fx: &mut Effects) {}
+    /// Asks for the open orders and positions as of `ctx.wall`, the resync's watermark.
+    fn resync(&mut self, ctx: &EncodeCtx, fx: &mut Effects) {
+        self.answers.ask_resync(EXEC_STREAM, ctx, fx);
+    }
 
-    /// The toy authenticates with no credential, so nothing it receives carries one.
-    fn redact_inbound(&self, _input: Inbound<'_>) -> InboundSpans {
-        InboundSpans::NONE
+    /// The toy's token wherever a text frame carries one (the authentication acknowledgement
+    /// echoes it).
+    fn redact_inbound(&self, input: Inbound<'_>) -> InboundSpans {
+        session::token_spans(input)
     }
 }

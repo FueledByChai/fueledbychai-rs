@@ -245,8 +245,12 @@ rather than guess.
     from another crate's tests, so far its order entry: every command kind encoded through
     `ExecCodec`, each declared order capability checked before signing; and its order updates,
     fills (keyed by fill id, or `FillKey::Derived` when declared without one), request rejects
-    through its code table and venue modes, decoded through `DecodeScope`; still planned: the named
-    suite and its macro, and the rest of the conformance toy).
+    through its code table and venue modes, decoded through `DecodeScope`; and its answers: order
+    queries answered with the query's rpc, a request's items answered in separate frames held
+    and pushed in one call (`on_rpc_timeout` pushing `Unknown` only for the unanswered ones), a
+    resync answered in frames and pushed whole at its end, and an authentication whose token
+    `redact_inbound` names; still planned: the named suite and its macro, and the rest of the
+    conformance toy).
   - `crates/venues/fbc-venues` (the registry, the only crate that sees concrete venues),
     `crates/venues/fbc-venue-binance-usdm` (market data only:
     `exec: None` caps citing Binance's USD-M pages, `plan_md` on the `/public` combined-stream
