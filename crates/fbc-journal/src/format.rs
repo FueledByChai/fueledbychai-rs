@@ -29,8 +29,9 @@
 //! `Outbound` record has an opcode byte after its `rpc`. Versions 2 to 4 kept no kind, and
 //! their outbound frames read back with the kind their blanked bytes imply ([`Opcode::of`]),
 //! which is binary when a byte that is not UTF-8 lies outside the spans or a span splits a
-//! character. The reader reads versions 2 to 5, so a journal written before reads back
-//! unchanged.
+//! character. Version 5 also adds the `InboundControl` kind (FBC-drf, decision 0041): a ping,
+//! pong or close frame a session received, at its stamp, its payload or close reason written as
+//! a [`WireSlice`] whose one span covers it all; a version 2 to 4 segment cannot hold one. The reader reads versions 2 to 5, so a journal written before reads back unchanged.
 
 use core::ops::Range;
 
@@ -42,8 +43,8 @@ use fbc_core::{
 
 use crate::JournalError;
 use crate::record::{
-    BLANK, ControlEvent, HeaderRec, HttpRequestRec, HttpResponseRec, Marker, NonceSourceId, Opaque,
-    Opcode, Record, RecordRef, WriteRes, is_secret_header,
+    BLANK, CloseRec, ControlEvent, HeaderRec, HttpRequestRec, HttpResponseRec, Marker,
+    NonceSourceId, Opaque, Opcode, Record, RecordRef, WriteRes, WsControl, is_secret_header,
 };
 use crate::redact::{DIGEST_LEN, RedactionKey, SpanDigest};
 
@@ -53,7 +54,7 @@ pub const MAGIC: [u8; 4] = *b"FBCJ";
 /// version 2 writes each span's keyed hash (FBC-apz); version 3 adds the `Nonce`, `EncodeCtx`
 /// and `Cycle` kinds (FBC-ec9); version 4 hashes the spans a codec names in inbound frames,
 /// response bodies and response header names (FBC-7lm); version 5 keeps the kind an outbound
-/// frame was sent as (FBC-q7b).
+/// frame was sent as (FBC-q7b) and adds the `InboundControl` kind (FBC-drf).
 pub const VERSION: u16 = 5;
 /// The oldest format version this crate reads: version 1 is refused (0024).
 pub const OLDEST_READABLE: u16 = 2;
@@ -74,6 +75,8 @@ const MARKER: u8 = 8;
 const NONCE: u8 = 9;
 const ENCODE_CTX: u8 = 10;
 const CYCLE: u8 = 11;
+// Version 5.
+const INBOUND_CONTROL: u8 = 12;
 
 // Field-less enums are a byte: the value's place in its table. Encoding matches exhaustively,
 // so a new variant fails to compile until it has a byte; decoding indexes the table.
@@ -401,6 +404,26 @@ fn encode_body(
             for inst in instruments {
                 e.u32(inst.get());
                 e.within()?;
+            }
+        }
+        Record::InboundControl { stamp, frame } => {
+            e.u8(INBOUND_CONTROL);
+            e.stamp(stamp);
+            match frame {
+                WsControl::Ping(payload) => {
+                    e.u8(0);
+                    e.whole(&payload.0)?;
+                }
+                WsControl::Pong(payload) => {
+                    e.u8(1);
+                    e.whole(&payload.0)?;
+                }
+                WsControl::Close(None) => e.u8(2),
+                WsControl::Close(Some(close)) => {
+                    e.u8(3);
+                    e.u16(close.code);
+                    e.whole(close.reason.as_bytes())?;
+                }
             }
         }
     }
@@ -780,6 +803,13 @@ impl Enc<'_> {
         self.within()
     }
 
+    /// Bytes no codec names spans in, written as [`Enc::spanned`] writes a [`WireSlice`] whose
+    /// one span covers them all: only their length and keyed hash (decision 0041).
+    fn whole(&mut self, bytes: &[u8]) -> Result<(), JournalError> {
+        let span = whole_span(len32(bytes.len())?);
+        self.spanned(bytes, span.as_slice())
+    }
+
     /// Inbound bytes with the spans a codec named in them, written as [`Enc::spanned`] writes
     /// a [`WireSlice`]. The spans are checked first ([`check_redactions`]), since a record
     /// built field by field may hold any; spans on bytes that cannot fit are refused for
@@ -876,6 +906,12 @@ impl Enc<'_> {
     }
 }
 
+/// The span of `len` bytes written whole ([`Enc::whole`]): the one covering them all, or none
+/// when there are none.
+fn whole_span(len: u32) -> Option<Range<u32>> {
+    (len > 0).then_some(0..len)
+}
+
 /// What in a record body could not be read; the reader names the segment.
 pub(crate) type Bad = &'static str;
 
@@ -898,7 +934,7 @@ pub(crate) fn decode_version(body: &[u8], version: u16) -> Result<(Record, Vec<S
         version,
     };
     let kind = d.u8()?;
-    if kind >= NONCE && version < 3 {
+    if (kind >= NONCE && version < 3) || (kind >= INBOUND_CONTROL && version < 5) {
         return Err("record kind");
     }
     let record = match kind {
@@ -1026,6 +1062,19 @@ pub(crate) fn decode_version(body: &[u8], version: u16) -> Result<(Record, Vec<S
         CYCLE => Record::Cycle {
             last_ingest_seq: d.u64()?,
             instruments: d.instruments()?,
+        },
+        INBOUND_CONTROL => Record::InboundControl {
+            stamp: d.stamp()?,
+            frame: match d.u8()? {
+                0 => WsControl::Ping(Opaque(d.whole()?)),
+                1 => WsControl::Pong(Opaque(d.whole()?)),
+                2 => WsControl::Close(None),
+                3 => WsControl::Close(Some(CloseRec {
+                    code: d.u16()?,
+                    reason: String::from_utf8(d.whole()?).expect("BLANK is ASCII"),
+                })),
+                _ => return Err("control frame"),
+            },
         },
         _ => return Err("record kind"),
     };
@@ -1166,6 +1215,16 @@ impl<'a> Dec<'a> {
         }
         out.extend_from_slice(self.take((len - at) as usize)?);
         Ok((out, spans))
+    }
+
+    /// Content written with [`Enc::whole`]: blanks at its length, its one hash kept. Any other
+    /// spans are malformed.
+    fn whole(&mut self) -> Result<Vec<u8>, Bad> {
+        let (bytes, spans) = self.spanned()?;
+        if spans.as_slice() != whole_span(bytes.len() as u32).as_slice() {
+            return Err("control payload");
+        }
+        Ok(bytes)
     }
 
     /// Inbound bytes: in version 4 written with their spans ([`Dec::spanned`]), before it
@@ -1766,6 +1825,114 @@ mod tests {
         assert_eq!(decode_version(&body, 2), decode(&good_outbound()));
     }
 
+    fn controls() -> [Record; 4] {
+        let control = |frame| Record::InboundControl {
+            stamp: stamp(),
+            frame,
+        };
+        [
+            control(WsControl::Ping(Opaque(b"hb".to_vec()))),
+            control(WsControl::Pong(Opaque(vec![0xff, 0]))),
+            control(WsControl::Close(None)),
+            control(WsControl::Close(Some(CloseRec {
+                code: 1001,
+                reason: "going away \u{e9}".into(),
+            }))),
+        ]
+    }
+
+    /// FBC-drf: a ping, pong or close frame a session received round-trips at its stamp, with
+    /// its close code, and its payload or reason as the keyed hash of the whole, read back
+    /// blanked at its length; a segment of version 4 or earlier, which cannot hold one, refuses
+    /// it as a kind it does not have.
+    #[test]
+    fn a_received_control_frame_round_trips_and_is_refused_before_version_5() {
+        let blanked = |frame| Record::InboundControl {
+            stamp: stamp(),
+            frame,
+        };
+        let want = [
+            blanked(WsControl::Ping(Opaque(b"22".to_vec()))),
+            blanked(WsControl::Pong(Opaque(b"22".to_vec()))),
+            blanked(WsControl::Close(None)),
+            blanked(WsControl::Close(Some(CloseRec {
+                code: 1001,
+                reason: "2222222222222".into(),
+            }))),
+        ];
+        let secrets: [&[u8]; 4] = [b"hb", &[0xff, 0], b"", "going away \u{e9}".as_bytes()];
+        for ((record, want), secret) in controls().into_iter().zip(want).zip(secrets) {
+            assert_eq!(record.blanked(), want);
+            let mut body = Vec::new();
+            encode(&record, &key(), &mut body).unwrap();
+            let (read, digests) = decode(&body).unwrap();
+            assert_eq!(read, want);
+            let hashed: Vec<_> = (!secret.is_empty())
+                .then(|| key().digest(secret))
+                .into_iter()
+                .collect();
+            assert_eq!(digests, hashed);
+            assert_eq!(record.digests(&key()), hashed);
+            assert!(!secret.is_empty() || body.len() == 1 + 8 + 1 + 8 + 8 + 6 + 1);
+            for version in OLDEST_READABLE..VERSION {
+                assert_eq!(decode_version(&body, version), Err("record kind"));
+            }
+        }
+    }
+
+    /// FBC-drf: a control frame's payload is too large for the room left like any record's,
+    /// and its `Debug` shows no payload or reason, only their lengths.
+    #[test]
+    fn a_control_frame_is_sized_by_its_payload_and_shows_it_by_length() {
+        let [ping, _, _, close] = controls();
+        for record in [&ping, &close] {
+            let mut body = Vec::new();
+            encode(record, &key(), &mut body).unwrap();
+            let mut short = Vec::new();
+            assert!(matches!(
+                encode_within(record, &key(), &mut short, body.len() - 1),
+                Err(JournalError::TooLarge)
+            ));
+            assert!(short.is_empty());
+        }
+        let shown = format!("{ping:?} {close:?}");
+        assert!(!shown.contains("hb") && !shown.contains("going"), "{shown}");
+        assert!(shown.contains("reason_len: 13"), "{shown}");
+    }
+
+    #[test]
+    fn a_damaged_control_frame_is_refused_with_what_was_wrong() {
+        let head = |kind: u8| {
+            let mut body = Vec::new();
+            encode(&controls()[2], &key(), &mut body).unwrap();
+            body.pop();
+            body.push(kind);
+            body
+        };
+        let cases: Vec<(Vec<u8>, Bad)> = vec![
+            (head(4), "control frame"),
+            // A ping's payload or a close's code or reason cut short.
+            (
+                [&head(0)[..], &words(&[9, 1])].concat(),
+                "record ends early",
+            ),
+            ([head(3), vec![0xe9]].concat(), "record ends early"),
+            // A payload some of which is written verbatim: a span short of its end, or none.
+            (
+                [&head(1)[..], &words(&[2, 1, 0, 1]), &[0; DIGEST_LEN], b"x"].concat(),
+                "control payload",
+            ),
+            (
+                [&head(0)[..], &words(&[1, 0]), b"x"].concat(),
+                "control payload",
+            ),
+            ([head(2), vec![0]].concat(), "bytes after the record"),
+        ];
+        for (body, want) in cases {
+            assert_eq!(decode(&body), Err(want), "{body:?}");
+        }
+    }
+
     #[test]
     fn a_damaged_version_3_body_is_refused_with_what_was_wrong() {
         let mut ctx = Vec::new();
@@ -2320,7 +2487,7 @@ mod tests {
 
         /// One owned record of a kind no [`RecordRef`] borrows.
         fn owned(&mut self) -> Record {
-            match self.below(9) {
+            match self.below(10) {
                 0 => Record::Outbound {
                     at: MonoNs(self.next()),
                     conn: conn(),
@@ -2366,6 +2533,18 @@ mod tests {
                 },
                 6 => encode_ctx((0..self.below(6)).map(|_| self.next()).collect()),
                 7 => cycle(self.below(6) as u32),
+                8 => Record::InboundControl {
+                    stamp: self.stamp(),
+                    frame: match self.below(4) {
+                        0 => WsControl::Ping(Opaque(self.any_bytes())),
+                        1 => WsControl::Pong(Opaque(self.any_bytes())),
+                        2 => WsControl::Close(None),
+                        _ => WsControl::Close(Some(CloseRec {
+                            code: self.next() as u16,
+                            reason: self.any_text(),
+                        })),
+                    },
+                },
                 _ => Record::HttpResult {
                     stamp: self.stamp(),
                     tag: HttpTag(self.next()),

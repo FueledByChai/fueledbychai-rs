@@ -20,7 +20,8 @@
 //!
 //! Effects a codec asks for are not executed, and the outbound frames, write results and HTTP
 //! requests the journal holds are outputs, not fed to anything: exact replay of outbound bytes
-//! is BT-402's. The caller supplies what the session ran with: the [`VenueConfig`], the
+//! is BT-402's. A ping, pong or close frame the session received reached no codec live, so its
+//! record (FBC-drf, decision 0041) is fed to none either. The caller supplies what the session ran with: the [`VenueConfig`], the
 //! [`SpecTable`] and the endpoint's plan. Whether the journal's `SessionStart` header carries
 //! them is the consumer's choice (design §9).
 //!

@@ -76,6 +76,59 @@ impl Opcode {
     }
 }
 
+/// A WebSocket control message a session received (FBC-drf): it carries no data for a codec,
+/// but the session stamps it and it keeps its place in ingest order (decision 0023), so its
+/// record keeps that place. No codec names the credentials in a ping's or pong's payload or a
+/// close frame's reason, so the journal writes each only as the keyed hash of the whole, and
+/// the reader returns it as [`BLANK`] at its length (decision 0041). `Debug` shows them by
+/// length only.
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+pub enum WsControl {
+    Ping(Opaque),
+    Pong(Opaque),
+    /// A close frame: its status code and reason, or `None` for one with no body.
+    Close(Option<CloseRec>),
+}
+
+/// A received close frame's status code and reason. `Debug` shows the reason by length only.
+#[derive(Clone, Eq, PartialEq, Hash)]
+pub struct CloseRec {
+    pub code: u16,
+    pub reason: String,
+}
+
+impl WsControl {
+    /// What the journal writes only as its keyed hash: the payload, or the close reason.
+    pub fn content(&self) -> &[u8] {
+        match self {
+            WsControl::Ping(payload) | WsControl::Pong(payload) => &payload.0,
+            WsControl::Close(Some(close)) => close.reason.as_bytes(),
+            WsControl::Close(None) => &[],
+        }
+    }
+
+    fn blanked(&self) -> WsControl {
+        let blank = |p: &Opaque| Opaque(vec![BLANK; p.0.len()]);
+        match self {
+            WsControl::Ping(payload) => WsControl::Ping(blank(payload)),
+            WsControl::Pong(payload) => WsControl::Pong(blank(payload)),
+            WsControl::Close(close) => WsControl::Close(close.as_ref().map(|c| CloseRec {
+                code: c.code,
+                reason: blank_text(c.reason.len()),
+            })),
+        }
+    }
+}
+
+impl fmt::Debug for CloseRec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CloseRec")
+            .field("code", &self.code)
+            .field("reason_len", &self.reason.len())
+            .finish()
+    }
+}
+
 /// What became of writing an outbound frame.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum WriteRes {
@@ -312,6 +365,11 @@ pub enum Record {
         bytes: Opaque,
         redact: Vec<Range<u32>>,
     },
+    /// A ping, pong or close frame as it came off a stream, with the stamp it took its place in
+    /// ingest order with (FBC-drf): no stamped input leaves a gap in the journal's ingest
+    /// sequences that a `Degraded` marker does not explain. Its payload or reason is written
+    /// only as a keyed hash ([`WsControl`]).
+    InboundControl { stamp: Stamp, frame: WsControl },
     /// A frame written to a connection, with the kind it was sent as and its redaction spans.
     /// A text frame's bytes are UTF-8 as sent; a span may split a character, so blanked they
     /// need not be. The kind is kept rather than read off the bytes (FBC-q7b): a binary frame
@@ -454,6 +512,10 @@ impl Record {
                     .as_ref()
                     .map(HttpResponseRec::blanked)
                     .map_err(|e| *e),
+            },
+            Record::InboundControl { stamp, frame } => Record::InboundControl {
+                stamp: *stamp,
+                frame: frame.blanked(),
             },
             other => other.clone(),
         }
