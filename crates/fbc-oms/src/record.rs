@@ -168,6 +168,8 @@ pub struct OrderRecord {
     vid: Option<VenueOrderId>,
     /// Which venue id an amend replaced with which: every source is superseded.
     replaced: Vec<(VenueOrderId, VenueOrderId)>,
+    /// The venue ids fills named other than the current one: the order's too.
+    taught: Vec<VenueOrderId>,
     px: Option<Ticks>,
     qty: Lots,
     cum_venue: Lots,
@@ -198,6 +200,7 @@ impl OrderRecord {
             placed,
             vid: None,
             replaced: Vec::new(),
+            taught: Vec::new(),
             px,
             cum_venue: Lots::ZERO,
             cum_fills: Lots::ZERO,
@@ -353,8 +356,9 @@ impl OrderRecord {
     /// terminal update applies whatever its key, and names the order's last venue id. A
     /// non-terminal update strictly older than the last applied ([`OrderKey::is_older_than`])
     /// is ignored, though an amend's replacement of one venue id by another, a fact whenever
-    /// it arrives, is still recorded. The venue's price and total apply when the update states
-    /// them, except a total below any the venue may hold ([`Self::resting`]) while a command
+    /// it arrives, is still recorded; it supersedes the current id too when it replaces one a
+    /// fill named, or arrives under a later venue ordering key. The venue's price and total
+    /// apply when the update states them, except a total below any the venue may hold ([`Self::resting`]) while a command
     /// is in flight, from an update without a venue
     /// ordering key later than the last applied's: it may be a delayed or duplicate one from
     /// before an amend that raised the total, so neither applies, and an amend in flight to
@@ -388,7 +392,8 @@ impl OrderRecord {
                 .is_none_or(|last| last.venue.is_some_and(|l| k > l))
         });
         if let VenueOrderState::Amended { new_vid: Some(nv) } = &u.state {
-            self.replace(u.vid.as_ref(), nv);
+            let taught = u.vid.as_ref().is_some_and(|v| self.taught.contains(v));
+            self.replace(u.vid.as_ref(), nv, later || taught);
         }
         let ends = terminal_kind(&u.state);
         if ends.is_none() && self.last_key.is_some_and(|last| key.is_older_than(last)) {
@@ -571,8 +576,12 @@ impl OrderRecord {
         if self.state.is_terminal() {
             return FillApplied::AfterEnd;
         }
-        if let (None, Some(v)) = (&self.vid, vid) {
-            self.vid = Some(self.follow(v));
+        match (&self.vid, vid) {
+            (None, Some(v)) => self.vid = Some(self.follow(v)),
+            (Some(current), Some(v)) if v != current && !self.taught.contains(v) => {
+                self.taught.push(v.clone());
+            }
+            _ => {}
         }
         if self.complete_if_covered() {
             return FillApplied::Completed;
@@ -638,14 +647,25 @@ impl OrderRecord {
 
     /// Records that an amend replaced `old` (the record's current id when the update names
     /// none) by `new`, unless that would make the replacements circular, and moves the
-    /// current id to the end of its chain of replacements.
-    fn replace(&mut self, old: Option<&VenueOrderId>, new: &VenueOrderId) {
-        if let Some(from) = old.or(self.vid.as_ref()).cloned()
-            && self.follow(new) != from
+    /// current id to the end of its chain of replacements. When `old` is another id than the
+    /// current one and `advance` holds (a fill named `old`, or the update carries a venue
+    /// ordering key later than the last applied's, so the current id is no newer than `old`),
+    /// the current id is replaced by `new` too, unless that would be circular: the order rests
+    /// as `new`, so a delayed update naming the old current id is ignored rather than ending
+    /// the order while `new` may rest. Without either, a delayed amend of an id older than the
+    /// current one looks the same, so the current id stays.
+    fn replace(&mut self, old: Option<&VenueOrderId>, new: &VenueOrderId, advance: bool) {
+        let current = self.vid.clone();
+        let also = if advance { current.clone() } else { None };
+        for from in [old.cloned().or(current.clone()), also]
+            .into_iter()
+            .flatten()
         {
-            self.replaced.push((from, new.clone()));
+            if !self.is_superseded(&from) && self.follow(new) != from {
+                self.replaced.push((from, new.clone()));
+            }
         }
-        let current = self.vid.as_ref().unwrap_or(new);
+        let current = current.as_ref().unwrap_or(new);
         self.vid = Some(self.follow(current));
     }
 
