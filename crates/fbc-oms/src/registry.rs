@@ -35,6 +35,9 @@ pub enum FillRouted {
     /// To no order the registry holds, under our namespace's client id `cid` (an order of an
     /// earlier run, say): the inventory moved.
     OursUntracked(ClientOrderId),
+    /// Flagged, not counted: it routes to our order `cid` but names another instrument or the
+    /// other side than the order's placement (a misdecoded or misrouted fill).
+    Disagrees(ClientOrderId),
     /// Flagged, not counted: it names no client id and no venue id of an order the registry
     /// holds, so nothing shows it is ours (another namespace's order on a venue that echoes no
     /// client id looks the same; decision 0005, I4).
@@ -171,7 +174,8 @@ impl Registry {
     /// Routed as [`Registry::apply_update`] routes an order update. A fill of our order counts
     /// on it ([`FillApplied`]), moves the inventory and indexes the venue id it names; one under our namespace's client id
     /// for no order the registry holds moves the inventory only; another namespace's, a
-    /// non-canonical or an unattributed one moves nothing and is flagged. The ledger records
+    /// non-canonical or an unattributed one, or one whose instrument or side is not its
+    /// order's, moves nothing and is flagged. The ledger records
     /// only a fill that counted, once it is applied: a flagged fill is not kept, so it never
     /// moves the retention horizon, and delivered again it is routed again (an unattributed
     /// fill reaches its order once the registry knows the order's venue id). Refused, counting
@@ -196,6 +200,12 @@ impl Registry {
                 None => return Ok(FillRouted::Unattributed),
             },
         };
+        if let Some(cid) = cid {
+            let placed = self.orders[&cid].placed();
+            if placed.inst != fill.inst || placed.side != fill.side {
+                return Ok(FillRouted::Disagrees(cid));
+            }
+        }
         let overflow = OmsError::FillOverflow(fill.inst);
         let inventory = self
             .inventory(fill.inst)

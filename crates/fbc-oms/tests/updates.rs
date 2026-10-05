@@ -125,13 +125,15 @@ fn a_stale_update_is_ignored_and_a_terminal_one_applies_whatever_its_key() {
 
 #[test]
 fn the_venue_states_price_and_total_and_an_open_update_matching_an_amend_clears_it() {
+    // Under venue ordering keys: an update lowering the total while an amend is in flight
+    // applies only under a key later than the last applied.
     let mut rec = OrderRecord::new(placement(cid(), 100, 10));
-    rec.apply_update(&update(None, VenueOrderState::Open, 0), at(None, 0));
+    rec.apply_update(&update(None, VenueOrderState::Open, 0), at(Some(1), 0));
     rec.amend_sent(Ticks(102), lots(8), RpcId(1), MonoNs(1));
 
     let mut other = update(None, VenueOrderState::Open, 0);
     other.px = Some(Ticks(101));
-    rec.apply_update(&other, at(None, 1));
+    rec.apply_update(&other, at(Some(2), 1));
     assert_eq!((rec.px(), rec.qty()), (Some(Ticks(101)), lots(10)));
     assert!(
         matches!(rec.intent(), Intent::PendingAmend { .. }),
@@ -140,7 +142,7 @@ fn the_venue_states_price_and_total_and_an_open_update_matching_an_amend_clears_
 
     let mut px_only = update(None, VenueOrderState::Open, 0);
     px_only.px = Some(Ticks(102));
-    rec.apply_update(&px_only, at(None, 2));
+    rec.apply_update(&px_only, at(Some(3), 2));
     assert!(
         matches!(rec.intent(), Intent::PendingAmend { .. }),
         "the total still differs"
@@ -148,14 +150,14 @@ fn the_venue_states_price_and_total_and_an_open_update_matching_an_amend_clears_
 
     let mut matching = update(None, VenueOrderState::Open, 0);
     (matching.px, matching.qty) = (Some(Ticks(102)), Some(lots(8)));
-    rec.apply_update(&matching, at(None, 3));
+    rec.apply_update(&matching, at(Some(4), 3));
     assert_eq!((rec.px(), rec.qty()), (Some(Ticks(102)), lots(8)));
     assert_eq!(rec.intent(), Intent::None);
 
     // An amended update with nothing pending leaves the intent alone.
     rec.cancel_sent(RpcId(2), MonoNs(2));
     let amended = update(None, VenueOrderState::Amended { new_vid: None }, 0);
-    assert_eq!(rec.apply_update(&amended, at(None, 4)), Applied::Amended);
+    assert_eq!(rec.apply_update(&amended, at(Some(5), 4)), Applied::Amended);
     assert!(matches!(rec.intent(), Intent::PendingCancel { .. }));
 }
 
@@ -238,7 +240,7 @@ fn a_new_venue_id_alone_does_not_tie_a_confirmation_to_the_amend_in_flight() {
     assert_eq!((rec.px(), rec.qty()), (Some(Ticks(101)), lots(6)));
     assert_eq!(rec.resting(), lots(9));
     let refusal = fbc_core::SubmitOutcome::NotSent(fbc_core::NotSentReason::Backpressure);
-    rec.on_outcome(fbc_oms::OrderOp::Amend, None, &refusal, MonoNs(3));
+    rec.on_outcome(fbc_oms::OrderOp::Amend(RpcId(2)), None, &refusal, MonoNs(3));
     assert_eq!((rec.px(), rec.qty()), (Some(Ticks(101)), lots(6)));
     assert_eq!(rec.resting(), lots(6));
 }

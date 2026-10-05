@@ -115,12 +115,12 @@ pub enum Applied {
     IgnoredSupersededVid,
 }
 
-/// The kind of command an outcome answers.
+/// The kind of command an outcome answers, with the request an amend or cancel was sent under.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum OrderOp {
     Place,
-    Amend,
-    Cancel,
+    Amend(RpcId),
+    Cancel(RpcId),
 }
 
 /// What [`OrderRecord::on_outcome`] did with an item's outcome. None of these is a command:
@@ -140,7 +140,8 @@ pub enum OutcomeApplied {
     /// The amend or cancel was not sent or was refused: the order is as it was, nothing in
     /// flight; Filled if its fills then cover every total the venue may hold.
     IntentCleared,
-    /// Nothing changed: the order is terminal, or the outcome waits for an order event.
+    /// Nothing changed: the order is terminal, the outcome waits for an order event, or it
+    /// refuses an amend or cancel that is not the command in flight (an earlier one's, late).
     Unchanged,
 }
 
@@ -345,7 +346,10 @@ impl OrderRecord {
     /// non-terminal update strictly older than the last applied ([`OrderKey::is_older_than`])
     /// is ignored, though an amend's replacement of one venue id by another, a fact whenever
     /// it arrives, is still recorded. The venue's price and total apply when the update states
-    /// them; `cum_venue` keeps the largest cumulative fill. An Open update moves the order to
+    /// them, except a lower total while a command is in flight from an update without a venue
+    /// ordering key later than the last applied's: it may be a delayed or duplicate one from
+    /// before an amend that raised the total, so neither applies, and an amend in flight to
+    /// that lower total stays in flight, counted. `cum_venue` keeps the largest cumulative fill. An Open update moves the order to
     /// Open, or PartiallyFilled once something is filled; an amended update moves no state.
     /// An update leaving the order at the price and total of the amend in flight confirms it.
     /// An amended update stating neither also confirms it, the amend's price and total then
@@ -380,21 +384,32 @@ impl OrderRecord {
             return Applied::IgnoredStale;
         }
         self.cum_venue = self.cum_venue.max(u.cum_filled);
-        if let Some(px) = u.px {
-            self.px = Some(px);
-        }
-        if let Some(qty) = u.qty {
-            self.qty = qty;
-            if self.intent == Intent::None
-                && key
-                    .venue
-                    .is_some_and(|k| self.unsettled_bar.is_some_and(|bar| k > bar))
-            {
-                // The venue states the total with no command in flight, under a key later than
-                // any applied while the amends replaced in flight could still be on their way:
-                // they are behind this total. An update under an earlier key, or none, may
-                // predate them (a delayed or duplicate one), and settles nothing.
-                self.settle();
+        // A lower total, with a command in flight, from an update nothing shows is later than
+        // the last applied, may be a delayed or duplicate one from before an amend that raised
+        // the total: neither its price nor its total applies (a terminal update ends the order
+        // whatever it states).
+        let stale_lower = u.qty.is_some_and(|q| q < self.qty)
+            && self.intent != Intent::None
+            && !later
+            && ends.is_none();
+        if !stale_lower {
+            if let Some(px) = u.px {
+                self.px = Some(px);
+            }
+            if let Some(qty) = u.qty {
+                self.qty = qty;
+                if self.intent == Intent::None
+                    && key
+                        .venue
+                        .is_some_and(|k| self.unsettled_bar.is_some_and(|bar| k > bar))
+                {
+                    // The venue states the total with no command in flight, under a key later
+                    // than any applied while the amends replaced in flight could still be on
+                    // their way: they are behind this total. An update under an earlier key,
+                    // or none, may predate them (a delayed or duplicate one), and settles
+                    // nothing.
+                    self.settle();
+                }
             }
         }
         if self.unsettled.is_some() && self.intent != Intent::None {
@@ -440,7 +455,8 @@ impl OrderRecord {
     /// says it does not know the order (`NotFound`), which, like no answer, moves a PendingNew
     /// order to Unknown. An amend or cancel not sent or refused leaves the order as it was
     /// with nothing in flight, except a cancel refused because the order already ended, which
-    /// waits for the order's terminal event; unanswered or not known to the venue, it is left
+    /// waits for the order's terminal event, and an outcome naming another request than the
+    /// command in flight's, which leaves that command in flight; unanswered or not known to the venue, it is left
     /// to the Unknown ladder.
     pub fn on_outcome(
         &mut self,
@@ -481,7 +497,7 @@ impl OrderRecord {
                 OutcomeApplied::MovedToUnknown
             }
             (_, SubmitOutcome::Accepted { .. }) => OutcomeApplied::Unchanged,
-            (OrderOp::Cancel, SubmitOutcome::Rejected(r))
+            (OrderOp::Cancel(_), SubmitOutcome::Rejected(r))
                 if matches!(r.kind, RejectKind::AlreadyTerminal(_)) =>
             {
                 OutcomeApplied::Unchanged
@@ -490,11 +506,24 @@ impl OrderRecord {
                 self.await_ladder(now)
             }
             (_, SubmitOutcome::NotSent(_) | SubmitOutcome::Rejected(_)) => {
+                if !self.answers_intent(op) {
+                    // An earlier command's: the command in flight is still unanswered.
+                    return OutcomeApplied::Unchanged;
+                }
                 self.intent = Intent::None;
                 self.complete_if_covered();
                 OutcomeApplied::IntentCleared
             }
             (_, SubmitOutcome::Unknown) => self.await_ladder(now),
+        }
+    }
+
+    /// Whether `op` is the command in flight: an amend or cancel under the intent's request.
+    fn answers_intent(&self, op: OrderOp) -> bool {
+        match (op, self.intent) {
+            (OrderOp::Amend(r), Intent::PendingAmend { rpc, .. })
+            | (OrderOp::Cancel(r), Intent::PendingCancel { rpc, .. }) => r == rpc,
+            _ => false,
         }
     }
 
@@ -715,7 +744,7 @@ mod tests {
             let mut rec = order(5);
             assert!(rec.amend_sent(Ticks(101), lots(8), RpcId(3), MonoNs(2)));
             assert_eq!(rec.apply_fill(None, None, lots(5)), FillApplied::Live);
-            rec.on_outcome(OrderOp::Amend, None, &outcome, MonoNs(3));
+            rec.on_outcome(OrderOp::Amend(RpcId(3)), None, &outcome, MonoNs(3));
             assert_eq!(rec.state(), OrdState::Terminal(TerminalKind::Filled));
             assert_eq!(rec.resting(), Lots::ZERO);
         }
@@ -810,7 +839,7 @@ mod tests {
         assert_eq!((rec.px(), rec.qty()), (Some(Ticks(101)), lots(6)));
         assert_eq!(rec.resting(), lots(9), "A2 may rest");
         // A2 is refused: the order is A1's.
-        rec.on_outcome(OrderOp::Amend, None, &refused(), MonoNs(4));
+        rec.on_outcome(OrderOp::Amend(RpcId(4)), None, &refused(), MonoNs(4));
         assert_eq!(rec.intent(), Intent::None);
         assert_eq!((rec.px(), rec.qty()), (Some(Ticks(101)), lots(6)));
         assert_eq!(rec.resting(), lots(6));
@@ -831,7 +860,7 @@ mod tests {
         assert_eq!(rec.resting(), lots(9));
         // A2 is refused: A1 may still rest, so its total still counts, and fills short of
         // it do not complete the order.
-        rec.on_outcome(OrderOp::Amend, None, &refused(), MonoNs(4));
+        rec.on_outcome(OrderOp::Amend(RpcId(4)), None, &refused(), MonoNs(4));
         assert_eq!(rec.intent(), Intent::None);
         assert_eq!(rec.resting(), lots(9));
         assert_eq!(rec.apply_fill(None, None, lots(5)), FillApplied::Live);
@@ -854,7 +883,7 @@ mod tests {
         assert!(rec.amend_sent(Ticks(102), lots(7), RpcId(4), MonoNs(3)));
         // An update applied while A2 is in flight raises the bar to its key.
         rec.apply_update(&update(VenueOrderState::Open, 0), keyed(2, 2));
-        rec.on_outcome(OrderOp::Amend, None, &refused(), MonoNs(4));
+        rec.on_outcome(OrderOp::Amend(RpcId(4)), None, &refused(), MonoNs(4));
         assert_eq!(rec.resting(), lots(9), "A1 may rest");
         // A total stated under the bar's key may predate A1: it settles nothing.
         let mut open = update(VenueOrderState::Open, 0);
@@ -879,7 +908,7 @@ mod tests {
         let mut rec = order(5);
         assert!(rec.amend_sent(Ticks(101), lots(9), RpcId(3), MonoNs(2)));
         assert!(rec.amend_sent(Ticks(102), lots(7), RpcId(4), MonoNs(3)));
-        rec.on_outcome(OrderOp::Amend, None, &refused(), MonoNs(4));
+        rec.on_outcome(OrderOp::Amend(RpcId(4)), None, &refused(), MonoNs(4));
         let mut open = update(VenueOrderState::Open, 0);
         open.qty = Some(lots(5));
         rec.apply_update(&open, keyed(1, 1));
@@ -898,7 +927,7 @@ mod tests {
         let mut open = update(VenueOrderState::Open, 0);
         open.qty = Some(lots(5));
         rec.apply_update(&open, key(1));
-        rec.on_outcome(OrderOp::Amend, None, &refused(), MonoNs(4));
+        rec.on_outcome(OrderOp::Amend(RpcId(4)), None, &refused(), MonoNs(4));
         assert_eq!(rec.resting(), lots(9));
     }
 
@@ -919,7 +948,7 @@ mod tests {
         assert_eq!(rec.resting(), lots(4));
         // The cancel is refused; then the venue states the total under a later key than any
         // applied while the cancel was in flight: the amend is behind it.
-        rec.on_outcome(OrderOp::Cancel, None, &refused(), MonoNs(4));
+        rec.on_outcome(OrderOp::Cancel(RpcId(4)), None, &refused(), MonoNs(4));
         rec.apply_update(&open, keyed(3, 3));
         assert_eq!(rec.state(), OrdState::Terminal(TerminalKind::Filled));
     }
@@ -934,7 +963,7 @@ mod tests {
         rec.apply_update(&open, keyed(1, 1));
         assert!(rec.amend_sent(Ticks(101), lots(9), RpcId(3), MonoNs(2)));
         assert!(rec.cancel_sent(RpcId(4), MonoNs(3)));
-        rec.on_outcome(OrderOp::Cancel, None, &refused(), MonoNs(4));
+        rec.on_outcome(OrderOp::Cancel(RpcId(4)), None, &refused(), MonoNs(4));
         assert_eq!(rec.apply_update(&open, keyed(1, 2)), Applied::Advanced);
         assert_eq!(rec.resting(), lots(9), "the amend may rest");
         assert_eq!(rec.apply_fill(None, None, lots(5)), FillApplied::Live);
@@ -943,9 +972,84 @@ mod tests {
         let mut rec = order(5);
         assert!(rec.amend_sent(Ticks(101), lots(9), RpcId(3), MonoNs(2)));
         assert!(rec.cancel_sent(RpcId(4), MonoNs(3)));
-        rec.on_outcome(OrderOp::Cancel, None, &refused(), MonoNs(4));
+        rec.on_outcome(OrderOp::Cancel(RpcId(4)), None, &refused(), MonoNs(4));
         rec.apply_update(&open, key(1));
         assert_eq!(rec.resting(), lots(9));
+    }
+
+    #[test]
+    fn a_stale_update_echoing_a_smaller_amend_in_flight_does_not_confirm_it() {
+        // Codex r4183252333: 5@100 amended to 9@101, then an amend back to 5@100 is in flight
+        // and a duplicate of the original Open, stating 5@100, arrives.
+        let mut rec = order(5);
+        let mut open = update(VenueOrderState::Open, 0);
+        (open.px, open.qty) = (Some(Ticks(100)), Some(lots(5)));
+        rec.apply_update(&open, key(1));
+        assert!(rec.amend_sent(Ticks(101), lots(9), RpcId(3), MonoNs(2)));
+        let mut a1 = update(VenueOrderState::Amended { new_vid: None }, 0);
+        (a1.px, a1.qty) = (Some(Ticks(101)), Some(lots(9)));
+        rec.apply_update(&a1, key(2));
+        // Confirming a larger total lowers nothing, so it needs no ordering key.
+        assert_eq!(rec.intent(), Intent::None);
+        assert_eq!(rec.qty(), lots(9));
+        assert!(rec.amend_sent(Ticks(100), lots(5), RpcId(4), MonoNs(3)));
+        rec.apply_update(&open, key(3));
+        assert!(matches!(rec.intent(), Intent::PendingAmend { qty, .. } if qty == lots(5)));
+        assert_eq!(rec.resting(), lots(9), "nine may still rest");
+        // The amend is refused: the order is nine, and five fills do not complete it.
+        rec.on_outcome(OrderOp::Amend(RpcId(4)), None, &refused(), MonoNs(4));
+        assert_eq!(rec.qty(), lots(9));
+        assert_eq!(rec.apply_fill(None, None, lots(5)), FillApplied::Live);
+        assert_eq!(rec.resting(), lots(4));
+        // Under a venue ordering key later than any applied, the echo confirms the smaller
+        // amend.
+        let mut rec = order(5);
+        rec.apply_update(&open, keyed(1, 1));
+        assert!(rec.amend_sent(Ticks(101), lots(9), RpcId(3), MonoNs(2)));
+        rec.apply_update(&a1, keyed(2, 2));
+        assert!(rec.amend_sent(Ticks(100), lots(5), RpcId(4), MonoNs(3)));
+        rec.apply_update(&open, keyed(2, 3));
+        assert!(matches!(rec.intent(), Intent::PendingAmend { .. }));
+        rec.apply_update(&open, keyed(3, 4));
+        assert_eq!(rec.intent(), Intent::None);
+        assert_eq!(rec.resting(), lots(5));
+    }
+
+    #[test]
+    fn an_outcome_for_a_command_no_longer_in_flight_leaves_the_intent() {
+        // Codex r4183252345: A1 to eight confirmed, A2 to ten in flight, fills reach eight,
+        // then a delayed refusal of A1 arrives.
+        let mut rec = order(5);
+        assert!(rec.amend_sent(Ticks(101), lots(8), RpcId(3), MonoNs(2)));
+        let mut a1 = update(VenueOrderState::Amended { new_vid: None }, 0);
+        (a1.px, a1.qty) = (Some(Ticks(101)), Some(lots(8)));
+        rec.apply_update(&a1, key(1));
+        assert!(rec.amend_sent(Ticks(102), lots(10), RpcId(4), MonoNs(3)));
+        assert_eq!(rec.apply_fill(None, None, lots(8)), FillApplied::Live);
+        for op in [OrderOp::Amend(RpcId(3)), OrderOp::Cancel(RpcId(3))] {
+            assert_eq!(
+                rec.on_outcome(op, None, &refused(), MonoNs(4)),
+                OutcomeApplied::Unchanged
+            );
+            assert_eq!(
+                rec.on_outcome(
+                    op,
+                    None,
+                    &SubmitOutcome::NotSent(NotSentReason::Unencodable),
+                    MonoNs(4)
+                ),
+                OutcomeApplied::Unchanged
+            );
+        }
+        assert!(matches!(rec.intent(), Intent::PendingAmend { qty, .. } if qty == lots(10)));
+        assert_eq!(rec.state(), OrdState::PartiallyFilled);
+        assert_eq!(rec.resting(), lots(2));
+        // A2's own refusal clears it, and the fills cover the order.
+        assert_eq!(
+            rec.on_outcome(OrderOp::Amend(RpcId(4)), None, &refused(), MonoNs(5)),
+            OutcomeApplied::IntentCleared
+        );
+        assert_eq!(rec.state(), OrdState::Terminal(TerminalKind::Filled));
     }
 
     #[test]

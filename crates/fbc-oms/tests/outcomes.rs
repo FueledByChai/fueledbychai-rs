@@ -217,7 +217,12 @@ fn a_refused_or_unsent_amend_leaves_the_original_alive() {
         assert!(rec.amend_sent(Ticks(101), lots(12), RpcId(2), MonoNs(2)));
         assert!(matches!(rec.intent(), Intent::PendingAmend { .. }));
         assert_eq!(
-            rec.on_outcome(OrderOp::Amend, Some(&vid("v1")), &outcome, MonoNs(3)),
+            rec.on_outcome(
+                OrderOp::Amend(RpcId(2)),
+                Some(&vid("v1")),
+                &outcome,
+                MonoNs(3)
+            ),
             OutcomeApplied::IntentCleared
         );
         assert_eq!(rec.state(), OrdState::Open);
@@ -232,7 +237,7 @@ fn an_accepted_amend_waits_for_the_amended_event() {
     let mut rec = open_record();
     rec.amend_sent(Ticks(101), lots(12), RpcId(2), MonoNs(2));
     assert_eq!(
-        rec.on_outcome(OrderOp::Amend, None, &accepted(), MonoNs(3)),
+        rec.on_outcome(OrderOp::Amend(RpcId(2)), None, &accepted(), MonoNs(3)),
         OutcomeApplied::Unchanged
     );
     assert!(matches!(rec.intent(), Intent::PendingAmend { .. }));
@@ -248,10 +253,10 @@ fn an_accepted_amend_waits_for_the_amended_event() {
 #[test]
 fn an_unanswered_amend_or_cancel_is_left_to_the_unknown_ladder() {
     for (op, outcome) in [
-        (OrderOp::Amend, SubmitOutcome::Unknown),
-        (OrderOp::Cancel, SubmitOutcome::Unknown),
-        (OrderOp::Amend, refused(RejectKind::NotFound)),
-        (OrderOp::Cancel, refused(RejectKind::NotFound)),
+        (OrderOp::Amend(RpcId(2)), SubmitOutcome::Unknown),
+        (OrderOp::Cancel(RpcId(2)), SubmitOutcome::Unknown),
+        (OrderOp::Amend(RpcId(2)), refused(RejectKind::NotFound)),
+        (OrderOp::Cancel(RpcId(2)), refused(RejectKind::NotFound)),
     ] {
         let mut rec = open_record();
         rec.cancel_sent(RpcId(2), MonoNs(2));
@@ -279,7 +284,7 @@ fn a_cancel_refused_as_already_terminal_waits_for_the_terminal_event() {
     rec.cancel_sent(RpcId(2), MonoNs(2));
     let outcome = refused(RejectKind::AlreadyTerminal(TerminalHint::Unspecified));
     assert_eq!(
-        rec.on_outcome(OrderOp::Cancel, None, &outcome, MonoNs(3)),
+        rec.on_outcome(OrderOp::Cancel(RpcId(2)), None, &outcome, MonoNs(3)),
         OutcomeApplied::Unchanged
     );
     assert_eq!(
@@ -307,7 +312,7 @@ fn a_cancel_refused_otherwise_or_unsent_leaves_the_order_resting() {
         let mut rec = open_record();
         rec.cancel_sent(RpcId(2), MonoNs(2));
         assert_eq!(
-            rec.on_outcome(OrderOp::Cancel, None, &outcome, MonoNs(3)),
+            rec.on_outcome(OrderOp::Cancel(RpcId(2)), None, &outcome, MonoNs(3)),
             OutcomeApplied::IntentCleared
         );
         assert_eq!(rec.intent(), Intent::None);
@@ -316,7 +321,7 @@ fn a_cancel_refused_otherwise_or_unsent_leaves_the_order_resting() {
     let mut rec = open_record();
     rec.cancel_sent(RpcId(2), MonoNs(2));
     assert_eq!(
-        rec.on_outcome(OrderOp::Cancel, None, &accepted(), MonoNs(3)),
+        rec.on_outcome(OrderOp::Cancel(RpcId(2)), None, &accepted(), MonoNs(3)),
         OutcomeApplied::Unchanged,
         "an accepted cancel waits for the order's terminal event"
     );
@@ -335,7 +340,7 @@ fn a_terminal_order_takes_no_outcome_and_no_intent() {
             OrderOp::Place,
             SubmitOutcome::NotSent(NotSentReason::Disconnected),
         ),
-        (OrderOp::Cancel, refused(RejectKind::NotFound)),
+        (OrderOp::Cancel(RpcId(2)), refused(RejectKind::NotFound)),
     ] {
         assert_eq!(
             rec.on_outcome(op, None, &outcome, MonoNs(9)),

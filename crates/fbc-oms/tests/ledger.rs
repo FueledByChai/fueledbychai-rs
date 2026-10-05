@@ -424,7 +424,7 @@ fn an_unanswered_cancel_stays_on_the_ladder_through_a_fill() {
         .unwrap();
     reg.on_outcome(
         c,
-        OrderOp::Cancel,
+        OrderOp::Cancel(fbc_core::RpcId(1)),
         &item,
         &SubmitOutcome::Unknown,
         MonoNs(7),
@@ -484,7 +484,9 @@ fn a_fill_after_the_order_ended_is_counted_without_moving_its_state() {
 fn a_fill_naming_only_the_venue_id_reaches_its_order_and_teaches_the_id() {
     let (mut l, mut reg) = session();
     let c = cid();
-    reg.insert(placement(c, 100, 10)).unwrap();
+    let mut selling = placement(c, 100, 10);
+    selling.side = Side::Sell;
+    reg.insert(selling).unwrap();
     // The first fill names our client id and the venue id: the record learns the id.
     let first = FillIdent::Venue {
         fill: common::fill_id("f1"),
@@ -539,6 +541,44 @@ fn a_fill_naming_an_amends_new_venue_id_lets_an_update_on_that_id_reach_its_orde
         Routed::Ours(c, Applied::Advanced)
     );
     assert!(reg.get(c).unwrap().state().is_terminal());
+}
+
+#[test]
+fn a_fill_whose_instrument_or_side_disagrees_with_its_order_is_flagged_not_counted_and_not_kept() {
+    // Codex r4183252360: the fill names a held order's client id but another instrument, or
+    // the other side.
+    let (mut l, mut reg) = session();
+    let c = cid();
+    reg.insert(placement(c, 100, 10)).unwrap();
+    let mut other_inst = fill(Some(c), ident("f1"), Side::Buy, 4, false);
+    other_inst.inst = InstrumentId::new(2);
+    let other_side = fill(Some(c), ident("f2"), Side::Sell, 4, false);
+    for f in [&other_inst, &other_side] {
+        assert_eq!(
+            reg.apply_fill(accepted(l.admit(f, None, MonoNs(0)))),
+            Ok(FillRouted::Disagrees(c))
+        );
+        assert!(!l.contains(&f.key()));
+    }
+    assert_eq!(reg.inventory(INST), SignedLots(0));
+    assert_eq!(reg.inventory(InstrumentId::new(2)), SignedLots(0));
+    assert_eq!(reg.get(c).unwrap().cum_fills(), Lots::ZERO);
+    assert_eq!(reg.get(c).unwrap().state(), OrdState::PendingNew);
+    // Routed by venue id, too.
+    let mut open = update(Some(c), VenueOrderState::Open, 0);
+    open.vid = Some(common::vid("v1"));
+    reg.apply_update(&open, key(1));
+    let by_vid = FillIdent::Venue {
+        fill: common::fill_id("f3"),
+        vid: Some(common::vid("v1")),
+        cum_after: None,
+    };
+    let f = fill(None, by_vid, Side::Sell, 4, false);
+    assert_eq!(
+        reg.apply_fill(accepted(l.admit(&f, None, MonoNs(0)))),
+        Ok(FillRouted::Disagrees(c))
+    );
+    assert_eq!(reg.inventory(INST), SignedLots(0));
 }
 
 #[test]

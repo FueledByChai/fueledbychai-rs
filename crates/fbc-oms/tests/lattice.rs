@@ -343,8 +343,8 @@ fn op() -> impl Strategy<Value = Op> {
     ];
     let order_op = prop_oneof![
         Just(OrderOp::Place),
-        Just(OrderOp::Amend),
-        Just(OrderOp::Cancel)
+        (0u64..8).prop_map(|r| OrderOp::Amend(RpcId(r))),
+        (0u64..8).prop_map(|r| OrderOp::Cancel(RpcId(r)))
     ];
     let out = prop_oneof![
         Just(Out::NotSent),
