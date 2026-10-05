@@ -1,7 +1,9 @@
 //! FBC-klr's done line, for one endpoint: a codec's HTTP request comes back to its `on_http` as
 //! a response with its status and headers, or as `TimedOut`, `NotSent` or `Lost`; a response
-//! that arrives after its stream reconnected reaches no codec and is counted; and a poll
-//! endpoint opens no socket, delivers what it polls and refuses a frame or a reconnect.
+//! that arrives after its stream reconnected reaches no codec and is counted, while the new
+//! epoch's own request reaches its codec with its events stamped under that epoch (FBC-moe's
+//! done line too); and a poll endpoint opens no socket, delivers what it polls and refuses a
+//! frame or a reconnect.
 
 mod common;
 
@@ -369,14 +371,23 @@ async fn a_response_that_arrives_after_its_stream_reconnected_is_dropped_and_cou
         tokio::time::sleep(ms(50)).await;
         second.send("trade|sym=A|px=2|qty=1|seq=2");
         until(|| watch.borrow().len() == 1).await;
+        // The new epoch's own request reaches its codec, and what on_http pushes is stamped
+        // under that epoch (FBC-moe).
+        second.send(&format!("get|tag=7|ms=5000|url={}", http.url("/fresh")));
+        let fresh = http.request().await;
+        assert_eq!(fresh.line, "GET /fresh");
+        fresh.answer(head, "trade|sym=A|px=3|qty=1|seq=3").await;
+        until(|| watch.borrow().len() == 2).await;
         drop(control);
     };
     let (run, ()) = tokio::join!(session.run(), script);
     run.unwrap();
-    assert!(venue.http_log().is_empty(), "{:?}", venue.http_log());
+    // Only the new epoch's codec (1) saw an HTTP result, and only its own: the old epoch's
+    // snapshot (tag 6) reached no codec.
+    assert_eq!(venue.http_log(), ["1/7:200:-"]);
     let seen = seen.borrow();
-    assert_eq!(seen.len(), 1);
-    assert_eq!((seen[0].stamp.conn, seen[0].venue_seq), (key(1), Some(2)));
+    let seqs: Vec<_> = seen.iter().map(|e| (e.stamp.conn, e.venue_seq)).collect();
+    assert_eq!(seqs, [(key(1), Some(2)), (key(1), Some(3))]);
     assert_eq!(session.stale(Input::Http), 1);
 }
 
