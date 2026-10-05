@@ -105,6 +105,9 @@ pub struct ParadexMd {
     /// The mark and funding feeds subscribed now: a market's `markets_summary` channel is
     /// subscribed while it has either.
     summary: BTreeSet<Subscription>,
+    /// Touch and trade feeds the venue refused and nothing has subscribed since: their frames
+    /// still in flight are not pushed.
+    refused: BTreeSet<Subscription>,
 }
 
 impl ParadexMd {
@@ -117,6 +120,7 @@ impl ParadexMd {
             channel_of: BTreeMap::new(),
             books: BTreeMap::new(),
             summary: BTreeSet::new(),
+            refused: BTreeSet::new(),
         }
     }
 
@@ -155,10 +159,8 @@ impl ParadexMd {
     fn on_text(&mut self, text: &str, sink: &mut dyn MdSink) -> Result<(), DecodeError> {
         let reply: Value = serde_json::from_str(text)
             .map_err(|_| DecodeError::Malformed("text frame is not JSON"))?;
-        let sent = reply
-            .get("id")
-            .and_then(Value::as_u64)
-            .and_then(|id| self.pending.remove(&id));
+        let id = reply.get("id").and_then(Value::as_u64);
+        let sent = id.and_then(|id| Some((id, self.pending.remove(&id)?)));
         if reply.get("result").is_some() {
             return Ok(());
         }
@@ -167,29 +169,28 @@ impl ParadexMd {
                 "text frame is neither a reply nor an error",
             ));
         }
-        match sent.map(|sent| (sent.request, sent)) {
-            Some((Request::Subscribe, sent)) => {
-                self.refuse(sent, sink);
+        match sent {
+            Some((id, sent)) if sent.request == Request::Subscribe => {
+                self.refuse(id, sent, sink);
                 Ok(())
             }
-            Some((Request::Unsubscribe, _)) => {
-                Err(DecodeError::Malformed("the venue refused an unsubscribe"))
-            }
+            Some(_) => Err(DecodeError::Malformed("the venue refused an unsubscribe")),
             None => Err(DecodeError::Malformed("the venue reported an error")),
         }
     }
 
-    /// The venue refused subscribe request `sent`: pushes [`FeedHealth::Refused`] for each
-    /// subscription its channel was to carry (a market's `markets_summary` channel carries its
-    /// mark and its funding), which the codec then holds no longer, so their frames are not
+    /// The venue refused subscribe request `id`, `sent`: pushes [`FeedHealth::Refused`] for
+    /// each subscription its channel was to carry (a market's `markets_summary` channel carries
+    /// its mark and its funding), which the codec then holds no longer, so their frames are not
     /// pushed or applied and only a new subscription sends the channel again. When a later
-    /// subscribe to the same channel is still unanswered, this refusal answers the older
-    /// request only: it names the subscription it was sent for and keeps the codec's state.
-    fn refuse(&mut self, sent: Sent, sink: &mut dyn MdSink) {
+    /// subscribe to the same channel (a higher id) is still unanswered, this refusal answers
+    /// the older request only: it names the subscription it was sent for and keeps the codec's
+    /// state (Codex r4182919464: an older request still unanswered does not).
+    fn refuse(&mut self, id: u64, sent: Sent, sink: &mut dyn MdSink) {
         let again = self
             .pending
-            .values()
-            .any(|p| p.request == Request::Subscribe && p.channel == sent.channel);
+            .range(id + 1..)
+            .any(|(_, p)| p.request == Request::Subscribe && p.channel == sent.channel);
         let mut refused = BTreeSet::from([sent.sub]);
         if !again {
             let inst = sent.sub.inst;
@@ -202,7 +203,10 @@ impl ParadexMd {
                 Feed::Book(_) => {
                     self.books.remove(&inst);
                 }
-                _ => {}
+                // Touch and trades (Codex r4182919469).
+                _ => {
+                    self.refused.insert(sent.sub);
+                }
             }
         }
         for Subscription { inst, feed } in refused {
@@ -245,6 +249,9 @@ impl MdCodec for ParadexMd {
                 .or_insert_with(|| BookFeed::new(book));
         }
         self.channel_of = channel_of;
+        for sub in add {
+            self.refused.remove(sub);
+        }
         for (request, channel, sub) in frames {
             let (id, method) = (self.next_id, request_method(request));
             self.next_id += 1;
@@ -286,7 +293,7 @@ impl MdCodec for ParadexMd {
             RawFrame::Binary(frame) => frame,
         };
         let msg = Message::parse(frame)?;
-        let (meta, event) = match msg.header().template_id {
+        let (meta, event, sub) = match msg.header().template_id {
             TEMPLATE_BBO => decode_bbo(&msg, specs)?,
             TEMPLATE_TRADE => decode_trade(&msg, specs)?,
             TEMPLATE_SUMMARY => {
@@ -324,7 +331,9 @@ impl MdCodec for ParadexMd {
             // schema's versioning policy says unknown template ids must be.
             _ => return Ok(()),
         };
-        sink.push(meta, event);
+        if !self.refused.contains(&sub) {
+            sink.push(meta, event);
+        }
         Ok(())
     }
 
@@ -402,8 +411,12 @@ fn request_method(request: Request) -> &'static str {
     }
 }
 
+/// A decoded bbo or trade frame: what the venue said, the event, and the subscription it is
+/// data of.
+type Decoded = (VenueMeta, MdEvent, Subscription);
+
 /// `BboEvent`: ts@0, seq@8, bidPrice@16, bidSize@24, askPrice@32, askSize@40, then `market`.
-fn decode_bbo(msg: &Message<'_>, specs: &SpecTable) -> Result<(VenueMeta, MdEvent), DecodeError> {
+fn decode_bbo(msg: &Message<'_>, specs: &SpecTable) -> Result<Decoded, DecodeError> {
     let block = msg.block();
     let spec = frame_market(msg, specs)?;
     let bid = level(spec, &block, 16, "bbo bid")?;
@@ -419,13 +432,21 @@ fn decode_bbo(msg: &Message<'_>, specs: &SpecTable) -> Result<(VenueMeta, MdEven
         ask,
         source: BBO,
     };
-    Ok((meta, event))
+    let feed = Feed::Touch(BBO);
+    Ok((
+        meta,
+        event,
+        Subscription {
+            inst: spec.id,
+            feed,
+        },
+    ))
 }
 
 /// `TradeEvent`: seq@8, side@24, price@25, size@33, createdAt@41, then `market`. The int64
 /// `tradeId`@16 is not read: the schema deprecates it as the truncated low 64 bits of
 /// Paradex's 28-digit trade id.
-fn decode_trade(msg: &Message<'_>, specs: &SpecTable) -> Result<(VenueMeta, MdEvent), DecodeError> {
+fn decode_trade(msg: &Message<'_>, specs: &SpecTable) -> Result<Decoded, DecodeError> {
     let block = msg.block();
     let spec = frame_market(msg, specs)?;
     let aggressor = match block.u8_at(24) {
@@ -450,7 +471,15 @@ fn decode_trade(msg: &Message<'_>, specs: &SpecTable) -> Result<(VenueMeta, MdEv
         px,
         qty,
     };
-    Ok((meta, event))
+    let feed = Feed::Trades;
+    Ok((
+        meta,
+        event,
+        Subscription {
+            inst: spec.id,
+            feed,
+        },
+    ))
 }
 
 /// The spec of a bbo or trade frame's `market`, the first variable-length field of both.

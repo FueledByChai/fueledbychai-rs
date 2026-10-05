@@ -237,6 +237,13 @@ fn a_subscribe_acknowledgement_is_consumed_and_a_refused_subscribe_is_reported_b
     assert_eq!(out.result, Ok(()));
     assert_eq!(out.events, [refused_sub(BTC, subs[1].feed)]);
     assert!(out.fx.is_empty(), "{:?}", out.fx);
+    // A trade still in flight is not pushed once its feed is refused (Codex r4182919469); the
+    // touch, whose subscribe was acknowledged, still is.
+    let trade = frame("trade.sbe.txt");
+    let out = decode_with(&mut codec, RawFrame::Binary(&trade));
+    assert_eq!((out.result, out.events.len()), (Ok(()), 0));
+    let out = decode_with(&mut codec, RawFrame::Binary(&frame("bbo.sbe.txt")));
+    assert_eq!(out.events.len(), 1);
     let cases = [
         (3, "the venue refused an unsubscribe"),
         // An answered request is not answered twice; an unknown id is still an error.
@@ -247,6 +254,10 @@ fn a_subscribe_acknowledgement_is_consumed_and_a_refused_subscribe_is_reported_b
         assert_eq!(out.result, Err(DecodeError::Malformed(what)));
         assert!(out.events.is_empty() && out.fx.is_empty());
     }
+    // Subscribed again (the consumer's call), its trades are pushed again.
+    codec.subscribe(&subs[1..], &[], &specs(), &mut fx).unwrap();
+    let out = decode_with(&mut codec, RawFrame::Binary(&trade));
+    assert_eq!(out.events.len(), 1);
     for (text, what) in [
         ("not json", "text frame is not JSON"),
         (
