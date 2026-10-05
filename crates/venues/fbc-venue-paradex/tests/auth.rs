@@ -903,7 +903,7 @@ fn test_connection_ends_at_a_refused_login_and_reads_no_account() {
 }
 
 #[test]
-fn test_connection_refuses_an_account_answer_missing_a_field_and_shows_no_account() {
+fn test_connection_refuses_an_account_answer_without_its_account_or_with_a_malformed_field() {
     let secs = 1_759_400_000;
     let body = login_body(TOKEN);
     let read = |answer: &[u8]| {
@@ -920,15 +920,33 @@ fn test_connection_refuses_an_account_answer_missing_a_field_and_shows_no_accoun
         read(br#"{"account_value":"1","settlement_asset":"USDC"}"#),
         missing("account")
     );
-    assert_eq!(
-        read(br#"{"account":"0x1","settlement_asset":"USDC"}"#),
-        missing("account_value")
-    );
-    assert_eq!(
-        read(br#"{"account":"0x1","account_value":"1"}"#),
-        missing("settlement_asset")
-    );
+    assert_eq!(read(br#"{"account":7}"#), missing("account"));
+    // Codex r4186547050: Paradex documents account_value and settlement_asset as optional. A
+    // valid account whose answer lacks either, or gives it as null, passes with no equity.
+    let no_equity = |answer: &[u8]| {
+        let summary = read(answer).unwrap();
+        assert_eq!(summary.account, "0xSYNTHETICACCOUNT");
+        assert_eq!(summary.equity, None);
+        assert_hidden(&format!("{summary:?}"), &["0xSYNTHETICACCOUNT"]);
+    };
+    no_equity(br#"{"account":"0xSYNTHETICACCOUNT"}"#);
+    no_equity(br#"{"account":"0xSYNTHETICACCOUNT","settlement_asset":"USDC"}"#);
+    no_equity(br#"{"account":"0xSYNTHETICACCOUNT","account_value":"1234.5"}"#);
+    no_equity(br#"{"account":"0xSYNTHETICACCOUNT","account_value":null,"settlement_asset":null}"#);
     let malformed = |part| Err(PlanError::Decode(DecodeError::Malformed(part)));
+    // A field given but unreadable is still refused, alone or beside its pair.
+    assert_eq!(
+        read(br#"{"account":"0x1","account_value":1234}"#),
+        malformed("account_value")
+    );
+    assert_eq!(
+        read(br#"{"account":"0x1","settlement_asset":["USDC"]}"#),
+        malformed("settlement_asset")
+    );
+    assert_eq!(
+        read(br#"{"account":"0x1","account_value":"x"}"#),
+        malformed("account_value")
+    );
     assert_eq!(
         read(b"[]"),
         malformed("account answer is not a JSON object")

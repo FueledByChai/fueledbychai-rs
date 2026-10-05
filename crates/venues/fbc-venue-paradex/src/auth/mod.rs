@@ -538,7 +538,8 @@ impl LoginCycle {
 /// context the runtime sends it under, is the login ([`LOGIN_TAG`]); the second, built once the
 /// login's answer gave a token, reads the account (`GET /account`, [`ACCOUNT_TAG`]) with it.
 /// The account read answers the summary: `account`, and `account_value` in `settlement_asset`
-/// as the equity, truncated toward zero at a nanounit. A refused login ends the plan before
+/// as the equity, truncated toward zero at a nanounit, or no equity when the answer lacks
+/// either (Paradex documents both as optional). A refused login ends the plan before
 /// the read is built. The credentials are moved into the plan and dropped, and so zeroed, once
 /// the login is built; the token once the read is (its bytes in the read's redacted header are
 /// the request's, as 0043 says of every request).
@@ -567,29 +568,41 @@ pub fn connection_plan(
     }))
 }
 
-/// The summary in an account answer (docs.paradex.trade "Get account information").
+/// The summary in an account answer (docs.paradex.trade "Get account information"): the
+/// `account` it requires, and the equity when it gives both `account_value` and
+/// `settlement_asset`, which Paradex documents as optional (Codex r4186547050). A field that is
+/// absent or null gives no equity; one given but unreadable is refused.
 fn account_summary(body: &[u8]) -> Result<AccountSummary, PlanError> {
     const NOT_OBJECT: DecodeError = DecodeError::Malformed("account answer is not a JSON object");
     let doc: Value = serde_json::from_slice(body).map_err(|_| NOT_OBJECT)?;
     let doc = doc.as_object().ok_or(NOT_OBJECT)?;
-    let text = |field| {
-        doc.get(field)
-            .and_then(Value::as_str)
-            .ok_or(PlanError::Missing(field))
-    };
-    let account = text("account")?.to_owned();
-    let value = text("account_value")?;
-    let asset = text("settlement_asset")?;
+    let account = doc
+        .get("account")
+        .and_then(Value::as_str)
+        .ok_or(PlanError::Missing("account"))?
+        .to_owned();
     let malformed = |part| PlanError::Decode(DecodeError::Malformed(part));
-    let nanos = value
-        .parse::<Decimal>()
-        .ok()
-        .and_then(|d| d.checked_mul(Decimal::from(1_000_000_000)))
-        .and_then(|d| i128::try_from(d.trunc()).ok())
-        .ok_or(malformed("account_value"))?;
-    let asset = AssetSym::new(asset).ok_or(malformed("settlement_asset"))?;
+    let optional = |field| match doc.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.as_str())),
+        Some(_) => Err(malformed(field)),
+    };
+    let nanos = |value: &str| {
+        value
+            .parse::<Decimal>()
+            .ok()
+            .and_then(|d| d.checked_mul(Decimal::from(1_000_000_000)))
+            .and_then(|d| i128::try_from(d.trunc()).ok())
+            .ok_or(malformed("account_value"))
+    };
+    let value = optional("account_value")?.map(nanos).transpose()?;
+    let asset = optional("settlement_asset")?
+        .map(|asset| AssetSym::new(asset).ok_or(malformed("settlement_asset")))
+        .transpose()?;
     Ok(AccountSummary {
         account,
-        equity: Some(Money::new(nanos, asset)),
+        equity: value
+            .zip(asset)
+            .map(|(nanos, asset)| Money::new(nanos, asset)),
     })
 }

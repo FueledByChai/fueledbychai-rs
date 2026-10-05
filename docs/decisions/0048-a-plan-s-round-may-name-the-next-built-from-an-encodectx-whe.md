@@ -79,7 +79,8 @@ This augments 0035 and 0043 (it supersedes nothing there):
    - `test_connection` is `HttpPlan::later(0, ..)`: round one the login, built from the
      context it is sent under; round two, named once the login's answer gave a token,
      `GET /account` with the token's header. The summary is `account`, and `account_value`
-     in `settlement_asset` truncated toward zero at a nanounit. The signer is dropped, and its
+     in `settlement_asset` truncated toward zero at a nanounit, or no equity when the answer
+     lacks either, both optional in Paradex's documentation (Codex r4186547050). The signer is dropped, and its
      key zeroed, once the login is built.
    - The factory declares the REST limits these requests are charged against (Codex
      r4185685704), from Paradex's "API Rate Limits" table: the login (`Rest`) 600 per minute
