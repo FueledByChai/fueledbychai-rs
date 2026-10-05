@@ -34,10 +34,13 @@ keepalives (FBC-bnl) and journaling (FBC-2pr) come later and are not decided her
   `NonceSource` (calling it not at all for none), and calls `on_open` with an `EncodeCtx`
   holding them and the shard clock's wall and monotonic time (0014 item 1). A source that
   reserves another count ends the session with `ExecSessionError::Nonces`: a nonce the codec
-  did not ask for would sign nothing it can account for. A run that ends in an error, or
-  whose future is dropped while connected, leaves the session able to run again: the epoch it
-  was in is retired (the handler told it ended, the next connection stamped under the next
-  epoch) and the next attempt waits the pacing's floor, as after a drop.
+  did not ask for would sign nothing it can account for.
+- **A session runs once.** `ExecSession::run` is called once; a later call returns
+  `ExecSessionError::Ended` and connects nothing, so no rerun can bypass the pacing or stamp
+  another connection's life with an epoch already used. A run that ends in an error retires
+  its epoch; a run whose future is dropped while connected leaves its epoch to be ended by
+  the next call or by the session's drop, and the handler is told it ended either way. A
+  consumer that wants order entry again after an error builds a new session.
 - **A stop ends the epoch at once.** Dropping the `ExecControl` stops the session, and the
   epoch ends there, even inside the handler: every event the codec pushes after it (the rest of
   a resync pushed whole, say) is of an ended epoch, dropped and counted
@@ -54,7 +57,8 @@ keepalives (FBC-bnl) and journaling (FBC-2pr) come later and are not decided her
   written: buckets that refuse it for now end the epoch as a drop, so `on_open` (which may have
   changed the codec's state, as an authentication asked for) runs again on the next epoch
   rather than the codec believe it sent what it never did; frames that can never fit together
-  end the session (`ExecSessionError::OpenNeverFits`). Nothing behind a reconnect of the
+  end the session (`ExecSessionError::OpenNeverFits`). A stop that came while `on_open` ran
+  charges nothing. Nothing behind a reconnect of the
   session's stream is charged, since it is never reached. A frame or
   reconnect for another stream is a codec defect, refused and counted, and so, until FBC-bnl,
   is every `Timer` and `Http` effect: none reaches the core.

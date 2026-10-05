@@ -119,6 +119,8 @@ pub enum ExecSessionError {
     /// The frames the codec's `on_open` asks for weigh more together than the venue's buckets
     /// ever admit, so no epoch could open.
     OpenNeverFits,
+    /// The session has run: it runs once, and a new one is built to run again.
+    Ended,
 }
 
 impl fmt::Display for ExecSessionError {
@@ -135,6 +137,7 @@ impl fmt::Display for ExecSessionError {
                 f,
                 "the nonce source reserved {reserved} nonces when {asked} were asked for"
             ),
+            ExecSessionError::Ended => f.write_str("the session has run; it runs once"),
             ExecSessionError::OpenNeverFits => f.write_str(
                 "the frames on_open asks for weigh more together than the buckets ever admit",
             ),
@@ -188,7 +191,7 @@ pub struct ExecCounters {
 }
 
 /// One account's order-entry connection, driven by [`ExecSession::run`].
-pub struct ExecSession<H> {
+pub struct ExecSession<H: ExecHandler> {
     /// The epochs, effects, writes and pacing (FBC-e73).
     core: Core,
     /// The one codec of the session's life.
@@ -203,7 +206,17 @@ pub struct ExecSession<H> {
     /// The epoch a run is connected in, until it ends: still set when a run starts, it was
     /// left by a run cancelled mid-epoch.
     in_epoch: Option<ConnKey>,
+    /// Whether [`ExecSession::run`] was called.
+    ran: bool,
     handler: H,
+}
+
+/// A session dropped while a dropped run left its epoch connected tells the handler it ended
+/// (Codex r4189174470).
+impl<H: ExecHandler> Drop for ExecSession<H> {
+    fn drop(&mut self) {
+        self.end_left_epoch();
+    }
 }
 
 /// How a connected epoch ended.
@@ -259,6 +272,7 @@ impl<H: ExecHandler> ExecSession<H> {
             nonces: config.nonces,
             decode_errors: 0,
             in_epoch: None,
+            ran: false,
             handler,
         };
         Ok((session, ExecControl { _stop: stop_tx }))
@@ -288,14 +302,16 @@ impl<H: ExecHandler> ExecSession<H> {
     /// Connects, reconnects as paced, and delivers events until the [`ExecControl`] is
     /// dropped.
     ///
-    /// A run that ends in an error, or whose future is dropped while connected, leaves the
-    /// session able to run again: the epoch it was in is retired (the handler told it ended,
-    /// the next connection stamped under the next epoch) and the next attempt waits the
-    /// pacing's floor, as after a drop (Codex r4188802893, r4188995359, r4188995364).
+    /// A session runs once (decision 0050): a run that ended, in an error or not, or whose
+    /// future was dropped, leaves nothing to run again, and a later call returns
+    /// [`ExecSessionError::Ended`] without connecting (Codex r4189174493, r4189174502). A run
+    /// dropped while connected leaves its epoch to be ended there or when the session drops:
+    /// the handler is told it ended either way (Codex r4188995359, r4189174470). A run that
+    /// ends in an error retires its epoch as a drop (Codex r4188802893).
     pub async fn run(&mut self) -> Result<(), ExecSessionError> {
-        if let Some(key) = self.in_epoch.take() {
-            self.handler.on_epoch_end(key);
-            self.retire(key)?;
+        self.end_left_epoch();
+        if std::mem::replace(&mut self.ran, true) {
+            return Err(ExecSessionError::Ended);
         }
         loop {
             let mut ctl = Stop(self.core.stop.clone());
@@ -317,6 +333,13 @@ impl<H: ExecHandler> ExecSession<H> {
                     return Err(e);
                 }
             }
+        }
+    }
+
+    /// Tells the handler the epoch a dropped run left connected ended, if one did.
+    fn end_left_epoch(&mut self) {
+        if let Some(key) = self.in_epoch.take() {
+            self.handler.on_epoch_end(key);
         }
     }
 
@@ -460,10 +483,13 @@ impl<H: ExecHandler> ExecSession<H> {
         }
         let own = |e: &Effect| frame_of(e, stream, true);
         let frames: Vec<Request> = effects.iter().filter_map(own).collect();
-        match self.core.rates.charge(Instant::now(), key, &frames) {
-            Ok(_) => {}
-            Err(Refused { ready_at: Some(_) }) => return Ok(false),
-            Err(Refused { ready_at: None }) => return Err(ExecSessionError::OpenNeverFits),
+        // A stop that came while `on_open` ran charges nothing (Codex r4189174483).
+        let now = Instant::now();
+        let charged = (!self.stopped()).then(|| self.core.rates.charge(now, key, &frames));
+        match charged {
+            Some(Ok(_)) => {}
+            None | Some(Err(Refused { ready_at: Some(_) })) => return Ok(false),
+            Some(Err(Refused { ready_at: None })) => return Err(ExecSessionError::OpenNeverFits),
         }
         effects.into_iter().for_each(|e| fx.push(e));
         self.execute(ws, fx, true, None).await
@@ -567,6 +593,7 @@ mod tests {
                 "the venue adapter discovers no instruments",
             ),
             (ExecSessionError::NoOrderEntry, "the venue takes no orders"),
+            (ExecSessionError::Ended, "the session has run; it runs once"),
             (
                 ExecSessionError::OpenNeverFits,
                 "the frames on_open asks for weigh more together than the buckets ever admit",
