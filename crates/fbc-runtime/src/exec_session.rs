@@ -336,9 +336,11 @@ impl<H: ExecHandler> ExecSession<H> {
         }
     }
 
-    /// Tells the handler the epoch a dropped run left connected ended, if one did.
+    /// Ends the epoch a dropped run left connected, if one did: its per-connection buckets
+    /// forgotten (Codex r4189428438) and the handler told.
     fn end_left_epoch(&mut self) {
         if let Some(key) = self.in_epoch.take() {
+            self.core.rates.closed(key);
             self.handler.on_epoch_end(key);
         }
     }

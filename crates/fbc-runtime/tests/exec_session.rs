@@ -25,14 +25,14 @@ use fbc_core::{
     AccountSummary, AssetKey, ConfigError, ConnKey, ConnState, CtxCall, DecodeError, DecodeScope,
     Effect, Effects, EncodeCtx, EncodeReceipt, EndpointPlan, Envelope, ExecCodec, ExecEndpoint,
     ExecEvent, ExecSink, FieldSpec, HttpFailure, HttpMethod, HttpPlan, HttpRequest, HttpResponse,
-    HttpTag, Inbound, InboundSpans, InstrumentSpecDraft, MdCodec, MdTransport, ModeScope, MonoNs,
-    NonceBlock, NonceSource, NotSentReason, OpKind, PathStamps, RateCharge, RawFrame, RpcId,
-    Secrets, SpecTable, StreamId, Subscription, SymbolError, TimerTag, TrafficClass, VenueCaps,
-    VenueCommand, VenueConfig, VenueError, VenueFactory, VenueMode, Via, WallNs, WireSlice,
-    WireUrl,
+    HttpTag, Inbound, InboundSpans, InstrumentSpecDraft, LimitScope, MdCodec, MdTransport,
+    ModeScope, MonoNs, NonceBlock, NonceSource, NotSentReason, OpKind, PathStamps, RateCharge,
+    RateLimit, RawFrame, RpcId, Secrets, SpecTable, StreamId, Subscription, SymbolError, TagSet,
+    TimerTag, TrafficClass, VenueCaps, VenueCommand, VenueConfig, VenueError, VenueFactory,
+    VenueMode, Via, WallNs, WireSlice, WireUrl,
 };
 use fbc_runtime::{
-    Connector, ExecControl, ExecCounters, ExecHandler, ExecSession, ExecSessionConfig,
+    BucketKey, Connector, ExecControl, ExecCounters, ExecHandler, ExecSession, ExecSessionConfig,
     ExecSessionError, IngestClock, Input, ProxyConfig, RateError, RateLimiter, ReconnectPacing,
     Request, SafetyReserve, SessionError, Step, WriteStall,
 };
@@ -59,6 +59,8 @@ const HEAVY: &str = "exec.heavy";
 /// Any value: the recorded codec's `on_open` asks to reconnect after its frames, then for a
 /// frame heavier than the toy's limit, which the reconnect leaves unreached.
 const OPEN_BYE: &str = "exec.open_bye";
+/// Any value: the venue also declares a per-connection limit, of `Control` and `Query`.
+const CONN_LIMIT: &str = "exec.conn_limit";
 
 /// Every `on_open` call the recorded codec saw: its stream and context.
 type Opens = Arc<Mutex<Vec<(StreamId, EncodeCtx)>>>;
@@ -97,7 +99,18 @@ impl VenueFactory for ExecToy {
                 exec: None,
                 ..exec_toy::caps()
             }),
-            None => Ok(exec_toy::caps()),
+            None => {
+                let mut caps = exec_toy::caps();
+                if cfg.get(CONN_LIMIT).is_some() {
+                    caps.limits.push(RateLimit {
+                        scope: LimitScope::Connection,
+                        ops: TagSet::of(&[OpKind::Control, OpKind::Query]),
+                        per: Duration::from_secs(60),
+                        units: 10,
+                    });
+                }
+                Ok(caps)
+            }
         }
     }
 
@@ -862,7 +875,14 @@ async fn nothing_behind_a_reconnect_on_open_asks_for_is_charged() {
 async fn a_run_dropped_mid_epoch_has_its_epoch_ended_by_the_next_call_or_the_sessions_drop() {
     let mut server = ScriptedWs::start().await;
     for rerun in [true, false] {
-        let (config, _) = setup(ExecToy::leak(), &server.url(), quick());
+        let venue = ExecToy::leak();
+        let (mut config, _) = setup(venue, &server.url(), quick());
+        // A per-connection limit, so the dropped run's epoch has buckets to forget.
+        config.cfg.insert(CONN_LIMIT, "yes");
+        let limits = venue.caps(&config.cfg).unwrap().limits;
+        config.limiter = RateLimiter::new(&limits, SafetyReserve::percent(0).unwrap()).unwrap();
+        let shared = config.limiter.clone();
+        let charged = move || shared.used(Instant::now(), 1, BucketKey::Connection(key(0)));
         let log = Log::default();
         let (mut session, _control) = ExecSession::new(config, Keep::new(&log)).unwrap();
         let mut peer = tokio::select! {
@@ -873,9 +893,11 @@ async fn a_run_dropped_mid_epoch_has_its_epoch_ended_by_the_next_call_or_the_ses
                 peer
             } => peer,
         };
-        // The dropped run's socket closed, but its epoch is not yet told ended.
+        // The dropped run's socket closed, but its epoch is not yet told ended, and its
+        // authentication and resync still count in its bucket.
         assert_eq!(peer.next().await, None);
         assert!(log.borrow().is_empty());
+        assert_eq!(charged(), 2);
         if rerun {
             // A session runs once: the next call ends the left epoch and connects nothing
             // (Codex r4188995359).
@@ -885,6 +907,8 @@ async fn a_run_dropped_mid_epoch_has_its_epoch_ended_by_the_next_call_or_the_ses
         // Dropping the session ends it otherwise (Codex r4189174470); never twice.
         drop(session);
         assert!(matches!(log.borrow()[..], [Heard::End(k)] if k == key(0)));
+        // Its bucket is forgotten with it (Codex r4189428438).
+        assert_eq!(charged(), 0);
     }
 }
 
