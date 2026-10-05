@@ -78,9 +78,11 @@ struct At {
 /// any envelope stamped at or after its arrival, and are held until such an envelope (or
 /// [`advance`](SimEngine::advance)) passes them.
 ///
-/// - A place of zero lots is refused (`InvalidQty`), since zero lots is never an order, and so
-///   is one that would rest where the level's size with the simulated orders there and its own
-///   would not fit in lots.
+/// - A place for an instrument the spec table does not list is refused (`no_book`), since its
+///   size cannot be judged. A place of zero lots is refused (`InvalidQty`), since zero lots is
+///   never an order, and so is one below the spec's minimum size or above its largest order,
+///   and one that would rest where the level's size with the simulated orders there and its
+///   own would not fit in lots.
 /// - A place crosses the trading book's displayed levels, each fill at a level's price up to
 ///   its size, as the taker; a post-only order that would cross is refused
 ///   (`PostOnlyWouldCross`). The rest of a good-till-cancelled limit order rests and queues
@@ -97,14 +99,15 @@ struct At {
 /// - A trading book's level that shrinks by more than the trades at its price since it last
 ///   changed is a level cancel for the queue model, whether a delta or a replacement snapshot
 ///   shrinks it; each change ends what those trades explain, and so does a snapshot at a
-///   level the old or the new book does not reach, whose sizes cannot be compared.
+///   level the old or the new book does not reach, whose sizes cannot be compared, and a
+///   delta that first shows a level the book did not reach.
 /// - Every fill's fee is the fee book's rate for the account, instrument, public channel and
 ///   liquidity at the fill's wall time, times its notional, rounded to the nano, written in the
 ///   stood-in venue's fee sign so the codec's [`DecodeScope`](fbc_core::DecodeScope) reads it
 ///   back as a cost (0004); a fee that is not a finite number of nanos strictly inside `i128`'s
 ///   range is no fee. A place that would take a fill without one is refused
 ///   (`no_fee`); a resting order a trade would fill without a rate is cancelled by the venue
-///   instead.
+///   instead, and the trade's size it would have taken goes to the orders behind it.
 #[derive(Clone, Debug)]
 pub struct SimEngine {
     fee_sign: VenueFeeSign,
@@ -301,8 +304,13 @@ impl SimEngine {
         if self.by_cid.contains_key(&p.cid) {
             return Err(Refusal::DuplicateClientId);
         }
-        // Zero lots is never an order (Codex r4182678519; `InstrumentSpec::floor_qty`).
-        if p.qty == Lots::ZERO {
+        // The venue judges an order's size by its spec, so with none it places nothing
+        // (Codex r4183669448).
+        let spec = self.specs.get(p.inst).ok_or(Refusal::NoBook)?;
+        // Zero lots is never an order (Codex r4182678519; `InstrumentSpec::floor_qty`), nor is
+        // one below the spec's minimum or above its largest order (Codex r4183669448).
+        let too_big = spec.max_order_size.is_some_and(|max| p.qty > max);
+        if p.qty == Lots::ZERO || p.qty < spec.min_size || too_big {
             return Err(Refusal::InvalidQty);
         }
         let book = self.trading_book(p.inst).ok_or(Refusal::NoBook)?;
@@ -515,13 +523,21 @@ impl SimEngine {
         px: Ticks,
         qty: Lots,
     ) -> Result<(), SimError> {
-        let before = self
-            .trading_book(inst)
-            .filter(|b| b.snapshot_in_progress().is_none())
+        let book = self.trading_book(inst);
+        let in_snapshot = book.is_some_and(|b| b.snapshot_in_progress().is_some());
+        let before = book
+            .filter(|_| !in_snapshot)
             .and_then(|b| b.level(side, px).ok().flatten());
         self.books.apply(ev).map_err(SimError::Book)?;
         match before {
             Some(before) => self.level_changed(inst, side, px, before, qty),
+            // A snapshot's levels are compared at its end. Outside one, a level the book did
+            // not know is a change too (Codex r4183669454): its size already reflects the
+            // trades printed there, so they explain none of its next shrink.
+            None if !in_snapshot => {
+                self.traded.remove(&(inst, side == BookSide::Bid, px));
+                Ok(())
+            }
             None => Ok(()),
         }
     }
@@ -619,34 +635,56 @@ impl SimEngine {
         // explain any shrink a level can show.
         self.traded
             .insert(key, traded.checked_add(qty).unwrap_or(MAX_LOTS));
-        let Some(queue) = self.queues.get_mut(&inst) else {
-            return;
-        };
         let view = TradeView {
             taker,
             px,
             qty,
             channel: Channel::Public,
         };
-        // The queue model holds only resting orders, so each fill names one.
-        for fill in queue.trade(view) {
-            if let Some(order) = self.live.remove(&fill.key.0) {
-                self.maker_fill(fill, order, at);
+        // The trade is matched on a copy of the queues first (Codex r4183669469): an order it
+        // would fill with no rate to charge is cancelled by the venue and leaves the queue, and
+        // the trade is matched again, so the size it would have taken reaches the orders
+        // behind it. Each round takes at least one order out of the queue, so this ends.
+        loop {
+            let Some(mut queue) = self.queues.get(&inst).cloned() else {
+                return;
+            };
+            let fills = queue.trade(view);
+            let priced: Vec<_> = fills
+                .iter()
+                .map(|f| self.fee(inst, Liquidity::Maker, f.px, f.qty, at.wall))
+                .collect();
+            if priced.iter().all(Option::is_some) {
+                self.queues.insert(inst, queue);
+                // The queue model holds only resting orders, so each fill names one.
+                for (fill, fee) in fills.into_iter().zip(priced.into_iter().flatten()) {
+                    if let Some(order) = self.live.remove(&fill.key.0) {
+                        self.maker_fill(fill, order, fee, at);
+                    }
+                }
+                return;
+            }
+            for (fill, _) in fills.iter().zip(&priced).filter(|(_, fee)| fee.is_none()) {
+                let n = fill.key.0;
+                // Out of the queue whatever the venue holds, so the next round cannot meet it.
+                if let Some(queue) = self.queues.get_mut(&inst) {
+                    queue.remove(fill.key);
+                }
+                if let Some(order) = self.live.remove(&n) {
+                    // No rate to charge it at: the venue cancels the order rather than fill it.
+                    self.end(n, &order, TerminalHint::Canceled);
+                    let state = SimState::Canceled(CancelReason::Venue);
+                    let event = order_event(&order, &vid(n), state, Some(order.px));
+                    self.answer(at, Reply::Order(event));
+                }
             }
         }
     }
 
-    fn maker_fill(&mut self, fill: SimFill, mut order: Resting, at: At) {
+    fn maker_fill(&mut self, fill: SimFill, mut order: Resting, fee: (i128, AssetSym), at: At) {
+        let (fee, asset) = fee;
         let n = fill.key.0;
         let vid = vid(n);
-        let Some((fee, asset)) = self.fee(order.inst, Liquidity::Maker, fill.px, fill.qty, at.wall)
-        else {
-            // No rate to charge it at: the venue cancels the order rather than fill it.
-            self.end(n, &order, TerminalHint::Canceled);
-            let state = SimState::Canceled(CancelReason::Venue);
-            let event = order_event(&order, &vid, state, Some(order.px));
-            return self.answer(at, Reply::Order(event));
-        };
         order.cum = order.cum.checked_add(fill.qty).unwrap_or(order.cum);
         let record = self.fill_record(
             &order.cid,

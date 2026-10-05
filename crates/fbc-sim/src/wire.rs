@@ -305,12 +305,12 @@ pub(crate) enum Refusal {
     Terminal(TerminalHint),
     /// A placement reusing a client id the venue already knows.
     DuplicateClientId,
-    /// The venue's book cannot place the order: no trading book for the instrument, the book is
-    /// not valid, or it does not know the size at the order's price (decision 0038).
+    /// The venue's book cannot place the order: no spec or no trading book for the instrument,
+    /// the book is not valid, or it does not know the size at the order's price (decision 0038).
     NoBook,
     /// The consumer's fee book has no current rate for a fill the order would take.
     NoFee,
-    /// A placement of zero lots, which is never an order.
+    /// A placement of zero lots, which is never an order, or outside the spec's size limits.
     InvalidQty,
 }
 
