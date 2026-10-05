@@ -92,6 +92,6 @@ pub use units::{
 };
 pub use venue::{
     AccountSummary, ConfigError, ConfigScope, EndpointPlan, ExecEndpoint, FieldSpec, FieldUnit,
-    HttpAnswer, HttpPlan, MdTransport, PlanError, SubmitHandle, VenueConfig, VenueError,
-    VenueFactory,
+    HttpAnswer, HttpPlan, MdTransport, NextRound, PlanError, PlanStep, SubmitHandle, VenueConfig,
+    VenueError, VenueFactory,
 };

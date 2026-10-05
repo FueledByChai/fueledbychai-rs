@@ -115,7 +115,7 @@ rather than guess.
   resolution (`AssetKey`, `AliasTable`, `InstrumentResolver`, `InstrumentSpecDraft`; 0035),
   `VenueCaps`, the market-data and execution events, venue commands, and the codec, signer,
   nonce and factory traits with `Effects` and `EncodeCtx` (the factory's discovery and
-  `test_connection` each an `HttpPlan`), credentials as `Secrets` in `src/auth.rs` (0043), and the write-only `PathStamps` a codec marks
+  `test_connection` each an `HttpPlan`, whose rounds may name the next, built from an `EncodeCtx` when sent, 0048), credentials as `Secrets` in `src/auth.rs` (0043), and the write-only `PathStamps` a codec marks
   its latency stages through (0034), `crates/fbc-book` with its L2 book, `crates/fbc-sim` with its
   queue-position fill model (0038) and SimVenue (0046), `crates/fbc-journal` with its record
   format, day-grouped segment writer rolled hourly with zstd-compressed closed segments, in-order reader and never-blocking sink, `crates/fbc-runtime` with its first
@@ -259,7 +259,10 @@ rather than guess.
     `pu` continuity, duplicates ignored, a gap resynced from a new snapshot and a failed
     snapshot retried on a configured timer), `crates/venues/fbc-venue-paradex`
     (so far its signer: the SNIP-12 revision 0 hash and Stark-curve signature, tested against
-    `fixtures/paradex/signing/paradex-vectors.tsv`; and market data: an SBE reader gated on each
+    `fixtures/paradex/signing/paradex-vectors.tsv`; its authentication in `src/auth/`: the
+    `/auth` login signed from `Secrets`, the session token read, named for the journal and sent
+    only redacted, the refresh timer apart from the signature's expiry, and Test Connection as a
+    two-round plan, 0048; and market data: an SBE reader gated on each
     frame's block lengths, bbo and trades decoded into touches and trades, the order book
     deltas into book events with seq_no continuity (0022), held to the hand-built frames and one
     captured public frame in `fixtures/paradex/md/`; the REST `/orderbook` snapshot at depth 15

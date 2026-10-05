@@ -1855,6 +1855,7 @@ fn discover_with(
     dispatch_market_data(&toy_caps(), |scope| {
         plan.parse(&[(MARKETS_TAG, answer)], scope)
     })
+    .map(|step| step.done().expect("a one-round plan ends in its result"))
 }
 
 fn discover(body: &str) -> Result<Vec<InstrumentSpecDraft>, PlanError> {
@@ -2066,6 +2067,7 @@ fn connect_with(
     dispatch_market_data(&toy_caps(), |scope| {
         plan.parse(&[(ACCOUNT_TAG, answer)], scope)
     })
+    .map(|step| step.done().expect("a one-round plan ends in its result"))
 }
 
 /// The toy's test_connection answered `status` with `body`.
