@@ -19,6 +19,8 @@ pub struct Registry {
     orders: HashMap<ClientOrderId, OrderRecord>,
     by_vid: HashMap<VenueOrderId, ClientOrderId>,
     inventory: HashMap<InstrumentId, SignedLots>,
+    /// The ledger whose fills the registry applies: the first one it was given.
+    ledger: Option<u64>,
 }
 
 /// Where [`Registry::apply_fill`] sent a fill the ledger accepted.
@@ -62,8 +64,11 @@ pub enum OmsError {
         item: ClientOrderId,
     },
     /// Counting the fill would overflow its order's fill sum or the instrument's inventory:
-    /// nothing was counted.
+    /// nothing was counted, and the ledger did not record it.
     FillOverflow(InstrumentId),
+    /// The fill was accepted by another ledger than the one whose fills the registry applies,
+    /// which cannot vouch that the registry never counted it.
+    OtherLedger,
 }
 
 impl fmt::Display for OmsError {
@@ -80,6 +85,12 @@ impl fmt::Display for OmsError {
                 write!(
                     f,
                     "a fill on {inst:?} overflows its order's fill sum or the inventory"
+                )
+            }
+            OmsError::OtherLedger => {
+                write!(
+                    f,
+                    "the fill was accepted by another fill ledger than this registry's"
                 )
             }
         }
@@ -156,13 +167,26 @@ impl Registry {
     /// Routed as [`Registry::apply_update`] routes an order update. A fill of our order counts
     /// on it ([`FillApplied`]) and moves the inventory; one naming no order the registry holds
     /// moves the inventory only; another namespace's or a non-canonical one moves nothing and
-    /// is flagged. Refused, counting nothing, when the order's fill sum or the inventory would
-    /// overflow.
-    pub fn apply_fill(&mut self, accepted: AcceptedFill<'_>) -> Result<FillRouted, OmsError> {
+    /// is flagged. The ledger records the fill only once it is applied (flagged included).
+    /// Refused, counting nothing and leaving the ledger as it was, when the order's fill sum or
+    /// the inventory would overflow, or when the fill comes from another ledger than the first
+    /// one the registry took a fill from.
+    pub fn apply_fill(&mut self, accepted: AcceptedFill<'_, '_>) -> Result<FillRouted, OmsError> {
+        let ledger = accepted.ledger_id();
+        if self.ledger.is_some_and(|ours| ours != ledger) {
+            return Err(OmsError::OtherLedger);
+        }
+        self.ledger = Some(ledger);
         let fill = accepted.fill();
         let cid = match fill.cid {
-            Some(CidMatch::Foreign(ns)) => return Ok(FillRouted::Foreign(ns)),
-            Some(CidMatch::Unparseable) => return Ok(FillRouted::NotCanonical),
+            Some(CidMatch::Foreign(ns)) => {
+                accepted.commit();
+                return Ok(FillRouted::Foreign(ns));
+            }
+            Some(CidMatch::Unparseable) => {
+                accepted.commit();
+                return Ok(FillRouted::NotCanonical);
+            }
             Some(CidMatch::Ours(cid)) if self.orders.contains_key(&cid) => Some(cid),
             Some(CidMatch::Ours(_)) | None => fill.vid().and_then(|v| self.cid_of(v)),
         };
@@ -171,16 +195,19 @@ impl Registry {
             .inventory(fill.inst)
             .checked_add(SignedLots::of(fill.side, fill.qty))
             .ok_or(overflow.clone())?;
-        let routed = match cid {
-            Some(cid) => {
-                let cum = self.orders[&cid].cum_fills_with(fill.qty).ok_or(overflow)?;
+        let cum = match cid {
+            Some(cid) => Some(self.orders[&cid].cum_fills_with(fill.qty).ok_or(overflow)?),
+            None => None,
+        };
+        accepted.commit();
+        self.inventory.insert(fill.inst, inventory);
+        Ok(match (cid, cum) {
+            (Some(cid), Some(cum)) => {
                 let applied = self.with_record(cid, |rec| rec.apply_fill(fill.vid(), cum));
                 FillRouted::Ours(cid, applied)
             }
-            None => FillRouted::Untracked,
-        };
-        self.inventory.insert(fill.inst, inventory);
-        Ok(routed)
+            _ => FillRouted::Untracked,
+        })
     }
 
     /// Applies the outcome of one command item to the order `cid` it was sent for

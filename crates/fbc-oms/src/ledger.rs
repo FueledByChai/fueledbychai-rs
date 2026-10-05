@@ -12,10 +12,14 @@
 //!
 //! A fill applies only through the [`AcceptedFill`] the ledger hands back, which
 //! [`Registry::apply_fill`](crate::Registry::apply_fill) consumes: no other path moves an
-//! order's fill count or the inventory.
+//! order's fill count or the inventory. The ledger records the fill only when the registry
+//! applies it, so a fill the registry refuses is tried again when it is delivered again. The
+//! accepted fill borrows the ledger until it is applied or dropped, the ledger cannot be
+//! cloned, and a registry takes fills from one ledger only, so no fill is accepted twice.
 
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fbc_core::{ExchNs, ExchTsKind, FillEvent, FillKey, MonoNs, WallNs};
@@ -77,9 +81,9 @@ pub enum Horizon {
 
 /// What [`FillLedger::admit`] decided about the fill it was given.
 #[derive(Debug)]
-pub enum Admission<'f> {
+pub enum Admission<'l, 'f> {
     /// Apply it: hand it to [`Registry::apply_fill`](crate::Registry::apply_fill).
-    Apply(AcceptedFill<'f>),
+    Apply(AcceptedFill<'l, 'f>),
     /// The ledger holds a fill under its key.
     Duplicate,
     /// A replayed fill executed at or before the session-start watermark: the session's
@@ -94,16 +98,30 @@ pub enum Admission<'f> {
 }
 
 /// A fill the ledger accepted, to be applied once. It cannot be cloned or built outside the
-/// ledger, and [`Registry::apply_fill`](crate::Registry::apply_fill) consumes it.
+/// ledger, holds the ledger until [`Registry::apply_fill`](crate::Registry::apply_fill)
+/// consumes it, and is recorded in the ledger only then; dropped, it leaves nothing there.
 #[derive(Debug)]
-pub struct AcceptedFill<'f> {
+pub struct AcceptedFill<'l, 'f> {
+    ledger: &'l mut FillLedger,
     fill: &'f FillEvent,
+    time: Option<FillTime>,
+    now: MonoNs,
 }
 
-impl<'f> AcceptedFill<'f> {
+impl<'f> AcceptedFill<'_, 'f> {
     /// The fill.
     pub fn fill(&self) -> &'f FillEvent {
         self.fill
+    }
+
+    /// Which ledger accepted it.
+    pub(crate) fn ledger_id(&self) -> u64 {
+        self.ledger.id
+    }
+
+    /// Records the fill in the ledger that accepted it: called once it is applied.
+    pub(crate) fn commit(self) {
+        self.ledger.record(self.fill, self.time, self.now);
     }
 }
 
@@ -122,7 +140,7 @@ pub struct ReplayCounts {
     pub untimed: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Entry {
     key: FillKey,
     applied_at: MonoNs,
@@ -132,8 +150,11 @@ struct Entry {
 }
 
 /// The fills the OMS applied, deduplicated by [`FillEvent::key`] and bounded by age and count.
-#[derive(Clone, Debug)]
+/// Not `Clone`: two copies could each accept the same fill once.
+#[derive(Debug)]
 pub struct FillLedger {
+    /// This ledger, among every ledger the process made.
+    id: u64,
     config: LedgerConfig,
     watermark: WallNs,
     keys: HashSet<FillKey>,
@@ -152,7 +173,9 @@ impl FillLedger {
         if config.max_entries == 0 {
             return Err(LedgerConfigError::ZeroEntries);
         }
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         Ok(FillLedger {
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
             config,
             watermark,
             keys: HashSet::new(),
@@ -169,14 +192,15 @@ impl FillLedger {
     /// replayed fill is accepted only when it has a matching-engine time later than the
     /// session-start watermark (aligned) and than the retention horizon (on the venue's
     /// clock); otherwise it is refused and counted, and the ledger keeps nothing of it. An
-    /// accepted fill is recorded under its key; then the fills older than the configured age,
-    /// and the oldest beyond the configured count, are forgotten, each moving the horizon.
-    pub fn admit<'f>(
-        &mut self,
+    /// accepted fill is recorded under its key when the registry applies it; then the fills
+    /// older than the configured age, and the oldest beyond the configured count, are
+    /// forgotten, each moving the horizon.
+    pub fn admit<'l, 'f>(
+        &'l mut self,
         fill: &'f FillEvent,
         time: Option<FillTime>,
         now: MonoNs,
-    ) -> Admission<'f> {
+    ) -> Admission<'l, 'f> {
         let key = fill.key();
         if self.keys.contains(&key) {
             if fill.replay {
@@ -184,12 +208,26 @@ impl FillLedger {
             }
             return Admission::Duplicate;
         }
+        if fill.replay
+            && let Some(refused) = self.refuse_replay(time)
+        {
+            return refused;
+        }
+        Admission::Apply(AcceptedFill {
+            ledger: self,
+            fill,
+            time,
+            now,
+        })
+    }
+
+    /// Records an accepted fill once it is applied, forgetting what the age and count
+    /// configured no longer keep.
+    fn record(&mut self, fill: &FillEvent, time: Option<FillTime>, now: MonoNs) {
         if fill.replay {
-            if let Some(refused) = self.refuse_replay(time) {
-                return refused;
-            }
             self.replays.applied += 1;
         }
+        let key = fill.key();
         self.forget_older_than(now);
         self.keys.insert(key.clone());
         self.entries.push_back(Entry {
@@ -204,12 +242,11 @@ impl FillLedger {
             excess -= 1;
             self.forget(gone);
         }
-        Admission::Apply(AcceptedFill { fill })
     }
 
     /// Why a replayed fill timed `time`, absent from the ledger, is not applied; `None` when it
     /// is. Counts the refusal.
-    fn refuse_replay(&mut self, time: Option<FillTime>) -> Option<Admission<'static>> {
+    fn refuse_replay(&mut self, time: Option<FillTime>) -> Option<Admission<'static, 'static>> {
         let Some(t) = time.filter(|t| t.kind == ExchTsKind::MatchingEngine) else {
             self.replays.untimed += 1;
             return Some(Admission::Untimed);
