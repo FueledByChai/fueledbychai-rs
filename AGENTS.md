@@ -218,9 +218,9 @@ rather than guess.
     far a public stub venue server on 127.0.0.1 ephemeral ports, a WebSocket endpoint that plays
     a fault script of typed steps and records every connection and data frame, and an HTTP/1.1
     endpoint with fixed responses by path; the reconnect-storm script and a check of connection
-    attempts against `ReconnectPacing`; venue crates take it as a dev-dependency instead of
-    writing their own servers; still planned: the duplicate-ack and silence scripts, the named
-    suite and its macro, and the full conformance venue).
+    attempts against `ReconnectPacing`; the duplicate-ack and silence-after-subscription
+    scripts; venue crates take it as a dev-dependency instead of writing their own servers;
+    still planned: the named suite and its macro, and the full conformance venue).
   - `crates/venues/fbc-venues` (the registry, the only crate that sees concrete venues),
     `crates/venues/fbc-venue-binance-usdm` (market data only:
     `exec: None` caps citing Binance's USD-M pages, `plan_md` on the `/public` combined-stream
