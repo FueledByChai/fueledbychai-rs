@@ -74,22 +74,26 @@
 //! ladder it counts as fully resting and gets no [`Live`] permit; nothing places or amends it
 //! again (`tests/ladder.rs`).
 //!
-//! The pre-trade caps (0013 rule 2) are the consumer's [`PreTradeCaps`], per market, with no
-//! default: the inventory cap is 0005's I6 (the owner's decision A names it so), the worst-case
-//! position `|pos + Σ resting same side + new| ≤ cap`. The position is the one seeded from the
-//! venue ([`Registry::seed_position`]), moved by the fills the ledger accepted; a market not
-//! seeded admits nothing. Each order counts its [`OrderRecord::exposure`]: what may rest as
+//! The pre-trade caps (0013 rule 2) are the consumer's [`PreTradeCaps`], per market, both
+//! required with no default (a [`MarketCapsConfig`] missing either is refused,
+//! [`CapsConfigError`]); decision 0052 names them: the inventory cap is 0005's I6, the
+//! worst-case position `|pos + Σ resting same side + new| ≤ cap`, and the resting cap a gross
+//! bound per side, `Σ resting same side + new ≤ cap`, which also bounds the side that reduces
+//! the position, where I6 admits up to twice the inventory cap. The position is the one seeded
+//! from the venue ([`Registry::seed_position`]), moved by the fills the ledger accepted; a
+//! market not seeded admits nothing. Each order counts what may rest as
 //! [`Registry::resting_on`] counts it (PendingNew and Unknown orders in full, a partly filled
 //! order's remainder until it is terminal, an amend at the larger of its old and new quantity
-//! from when it is built), plus the fills the venue reported that the inventory does not hold
-//! yet. A place is built only by [`Registry::place`], a batch only by [`Registry::place_batch`]
-//! (each item judged with the earlier ones admitted counted PendingNew) and an amend or replace
-//! only by [`Live::amend`], each refused, never built, when it would breach the cap or its
-//! market has none, reducing and reduce-only ones included: the formula admits an order that
-//! genuinely reduces the position by itself. Cancels are never capped (`tests/caps.rs`).
+//! from when it is built), and against the inventory cap its [`OrderRecord::exposure`]: that,
+//! plus the fills the venue reported that the inventory does not hold yet. A place is built
+//! only by [`Registry::place`], a batch only by [`Registry::place_batch`] (each item judged
+//! with the earlier ones admitted counted PendingNew) and an amend or replace only by
+//! [`Live::amend`], each refused, never built, when it would breach either cap or its market
+//! has none, reducing and reduce-only ones included: the formulas admit an order that
+//! genuinely reduces the position by themselves. Cancels are never capped (`tests/caps.rs`).
 //!
-//! Not here yet: the gross per-side resting cap (FBC-zf7), the market states (FBC-c4v), and
-//! issuing an authorization after them and its check at submit (FBC-afd).
+//! Not here yet: the market states (FBC-c4v), and issuing an authorization after them and its
+//! check at submit (FBC-afd).
 
 mod caps;
 mod gateway;
@@ -106,7 +110,7 @@ mod registry;
 #[path = "../tests/common/mod.rs"]
 mod common;
 
-pub use caps::{CapRefusal, MarketCaps, PreTradeCaps};
+pub use caps::{CapRefusal, CapsConfigError, MarketCaps, MarketCapsConfig, PreTradeCaps};
 pub use gateway::{ControlCommand, ManagedGateway, OrderGateway};
 pub use grant::{Authorization, StateGeneration};
 pub use ladder::{LadderConfig, LadderConfigError, LadderPlan, LadderResolution, ResyncApplied};

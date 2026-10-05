@@ -1,6 +1,7 @@
 //! The registry of our orders by client id, the routing of venue events and accepted fills to
 //! them, the inventory those fills moved, and the pre-trade caps every place, amend and batch
-//! item is built under (0013 rule 2, 0005's I6).
+//! item is built under (0013 rule 2: the inventory cap, 0005's I6, and the resting cap,
+//! decision 0052).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -10,7 +11,7 @@ use fbc_core::{
     OrderUpdate, RpcId, Side, SignedLots, SubmitOutcome, Ticks, VenueCommand, VenueOrderId,
 };
 
-use crate::caps::{CapRefusal, Exposure, PreTradeCaps};
+use crate::caps::{Adds, CapRefusal, Exposure, PreTradeCaps};
 use crate::ladder;
 use crate::ledger::AcceptedFill;
 use crate::permit::{
@@ -179,9 +180,9 @@ impl Registry {
     /// [`OrderRecord::resting`], so PendingNew and Unknown orders count in full, a partly
     /// filled order its remainder until it is terminal, and an amend at the larger of its old
     /// and new quantity from when it is built until it is acknowledged. `None` when the sum
-    /// does not fit a lot count. The inventory cap counts each order's
-    /// [`OrderRecord::exposure`]: this, plus the fills the venue reported that the inventory
-    /// does not hold yet.
+    /// does not fit a lot count. The resting cap bounds this, with the order judged, per side;
+    /// the inventory cap counts each order's [`OrderRecord::exposure`]: this, plus the fills
+    /// the venue reported that the inventory does not hold yet.
     pub fn resting_on(&self, inst: InstrumentId, side: Side) -> Option<Lots> {
         self.sum_on(inst, side, None, OrderRecord::resting)
     }
@@ -204,9 +205,9 @@ impl Registry {
             .try_fold(Lots::ZERO, |sum, rec| sum.checked_add(each(rec)))
     }
 
-    /// What `inst` and `side` hold before an order is judged against the inventory cap: the
-    /// market's caps, the position, and the resting quantity of our orders on the side but
-    /// `except` (the order an amend changes).
+    /// What `inst` and `side` hold before an order is judged against the pre-trade caps: the
+    /// market's caps, the position, and what our orders on the side but `except` (the order
+    /// an amend changes) may add to the position and have resting.
     fn exposure(&self, inst: InstrumentId, side: Side, except: Option<ClientOrderId>) -> Exposure {
         Exposure {
             inst,
@@ -214,13 +215,15 @@ impl Registry {
             cap: self.caps.market(inst),
             pos: self.seeded.contains(&inst).then(|| self.inventory(inst)),
             others: self.sum_on(inst, side, except, OrderRecord::exposure),
+            others_resting: self.sum_on(inst, side, except, OrderRecord::resting),
         }
     }
 
     /// Builds the place of `order` when its market's pre-trade caps admit it, and registers
     /// it PendingNew, so every later check counts it in full. Refused, never built and never
-    /// registered, when it would take the worst case on its side past the inventory cap or
-    /// its market has no cap ([`OmsError::Capped`]), reducing and reduce-only orders included,
+    /// registered, when it would take the worst case on its side past the inventory cap, or
+    /// what its side has resting past the resting cap, or its market has no caps
+    /// ([`OmsError::Capped`]), reducing and reduce-only orders included,
     /// or when an order is already registered under its client id. A place built and then not
     /// sent is reported as such ([`Registry::on_outcome`]), which ends the order.
     pub fn place(&mut self, order: NewOrder) -> Result<PermittedCommand, OmsError> {
@@ -266,7 +269,7 @@ impl Registry {
             return Err(OmsError::DuplicateCid(order.cid));
         }
         self.exposure(order.inst, order.side, None)
-            .admit(order.qty)
+            .admit(Adds::placing(order.qty))
             .map_err(OmsError::Capped)
     }
 

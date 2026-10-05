@@ -393,6 +393,16 @@ impl OrderRecord {
             .unwrap_or(Lots::ZERO)
     }
 
+    /// What [`Self::resting`] would be once an amend to the total `qty` is built, for an order
+    /// that is not terminal: the larger of the order's total now and the amend's, less the
+    /// filled part, until it is acknowledged.
+    pub(crate) fn resting_if_amended(&self, qty: Lots) -> Lots {
+        self.ceiling()
+            .max(qty)
+            .checked_sub(self.filled())
+            .unwrap_or(Lots::ZERO)
+    }
+
     /// The total of the amend built and not yet reported sent ([`Self::amend_sent`]), if any.
     pub fn amend_built(&self) -> Option<Lots> {
         self.built.map(|(qty, _)| qty)

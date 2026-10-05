@@ -1,31 +1,96 @@
 //! The pre-trade caps (0013 rule 2), as the consumer configures them (0009), and why one
 //! refused an order command.
 //!
-//! The inventory cap is decision 0005's I6, which 0005 calls the pre-trade resting cap: the
-//! owner's decision A (2026-10-04) names it the inventory cap, the worst-case position if every
-//! resting order on the command's side filled, `|pos + Σ resting same side + new| ≤ cap`, and
-//! keeps the name "resting cap" for a gross bound per side (FBC-zf7). The registry checks it
-//! in the one path every place, amend, replace and batch item is built through
-//! ([`Registry::place`](crate::Registry::place), [`Registry::place_batch`](crate::Registry::place_batch)
-//! and [`Live::amend`](crate::Live::amend)), reducing and reduce-only ones included: the formula
-//! admits an order that genuinely reduces the position by itself. Cancels are never capped.
+//! Two caps per market, both enforced (decision 0052, the owner's decision A of 2026-10-04):
+//!
+//! - the **inventory cap** is decision 0005's I6, which 0005 calls the pre-trade resting cap:
+//!   the worst-case position if every resting order on the command's side filled,
+//!   `|pos + Σ resting same side + new| ≤ inventory cap`;
+//! - the **resting cap** is a gross bound per side on the order stack, whatever the position:
+//!   `Σ resting same side + new ≤ resting cap`. I6 lets the side that reduces the position rest
+//!   up to twice the inventory cap; the resting cap bounds it too.
+//!
+//! Resting counts the same for both ([`OrderRecord::resting`](crate::OrderRecord::resting)):
+//! PendingNew and Unknown orders in full, a partly filled order's remainder until it is
+//! terminal, an amend at the larger of its old and new quantity from when it is built until it
+//! is acknowledged, and the earlier items of the same batch as PendingNew. The inventory cap
+//! also counts the fills the venue reported that the inventory does not hold yet
+//! ([`OrderRecord::exposure`](crate::OrderRecord::exposure)); those no longer rest, so the
+//! resting cap does not. The registry checks both in the one path every place, amend, replace
+//! and batch item is built through ([`Registry::place`](crate::Registry::place),
+//! [`Registry::place_batch`](crate::Registry::place_batch) and
+//! [`Live::amend`](crate::Live::amend)), reducing and reduce-only ones included. Cancels are
+//! never capped.
 //!
 //! Quantities are in the market's lots: the consumer converts a notional cap at the price it
-//! chooses. A market the configuration does not name admits no order: there is no default.
-//! Nor does a market whose position was not seeded from the venue: the worst case starts from
-//! the position, which is unknown until then.
+//! chooses. Both caps are required configuration with no default in code: a market's
+//! configuration missing either is refused ([`CapsConfigError`]), and a market the
+//! configuration does not name admits no order. Nor does a market whose position was not
+//! seeded from the venue: the worst case starts from the position, which is unknown until
+//! then.
 
 use std::collections::BTreeMap;
 use std::fmt;
 
 use fbc_core::{InstrumentId, Lots, Side, SignedLots};
 
-/// One market's caps. Every field is required: the configuration has no default value.
+/// One market's caps as the consumer's configuration states them (0009), each one possibly
+/// absent. Both are required: [`PreTradeCaps::with_market`] refuses a market missing either,
+/// and nothing in code supplies a default.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct MarketCapsConfig {
+    /// The inventory cap (0005's I6): the largest worst-case position, in lots, either way.
+    pub inventory: Option<Lots>,
+    /// The resting cap: the most our orders on one side may have resting, in lots.
+    pub resting: Option<Lots>,
+}
+
+/// One market's caps, both present: built only from a [`MarketCapsConfig`] that states both
+/// ([`PreTradeCaps::with_market`]).
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct MarketCaps {
-    /// The inventory cap (0005's I6): the largest worst-case position, in lots, either way.
-    pub inventory: Lots,
+    inventory: Lots,
+    resting: Lots,
 }
+
+impl MarketCaps {
+    /// The inventory cap (0005's I6): the largest worst-case position, in lots, either way.
+    pub fn inventory(&self) -> Lots {
+        self.inventory
+    }
+
+    /// The resting cap: the most our orders on one side may have resting, in lots.
+    pub fn resting(&self) -> Lots {
+        self.resting
+    }
+}
+
+/// Why a configuration of the pre-trade caps was refused: a cap it must state is missing, and
+/// no default stands in for it.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum CapsConfigError {
+    /// The market's configuration states no inventory cap.
+    MissingInventoryCap(InstrumentId),
+    /// The market's configuration states no resting cap.
+    MissingRestingCap(InstrumentId),
+}
+
+impl fmt::Display for CapsConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CapsConfigError::MissingInventoryCap(inst) => write!(
+                f,
+                "the configuration states no inventory cap for {inst:?}, and there is no default"
+            ),
+            CapsConfigError::MissingRestingCap(inst) => write!(
+                f,
+                "the configuration states no resting cap for {inst:?}, and there is no default"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CapsConfigError {}
 
 /// The consumer's pre-trade caps, per market. A market it does not name admits no place or
 /// amend ([`CapRefusal::NoCap`]).
@@ -40,10 +105,24 @@ impl PreTradeCaps {
         PreTradeCaps::default()
     }
 
-    /// These caps with `caps` for `market`, replacing any it had.
-    pub fn with_market(mut self, market: InstrumentId, caps: MarketCaps) -> PreTradeCaps {
+    /// These caps with `config`'s for `market`, replacing any it had. Refused, the whole
+    /// configuration with it, when `config` is missing the inventory cap or the resting cap:
+    /// neither has a default.
+    pub fn with_market(
+        mut self,
+        market: InstrumentId,
+        config: MarketCapsConfig,
+    ) -> Result<PreTradeCaps, CapsConfigError> {
+        let caps = MarketCaps {
+            inventory: config
+                .inventory
+                .ok_or(CapsConfigError::MissingInventoryCap(market))?,
+            resting: config
+                .resting
+                .ok_or(CapsConfigError::MissingRestingCap(market))?,
+        };
         self.markets.insert(market, caps);
-        self
+        Ok(self)
     }
 
     /// The caps configured for `market`, if any.
@@ -55,7 +134,7 @@ impl PreTradeCaps {
 /// Why a pre-trade cap refused a place, an amend or a batch item: it was never built.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum CapRefusal {
-    /// The consumer configured no cap for the market: it admits nothing.
+    /// The consumer configured no caps for the market: it admits nothing.
     NoCap(InstrumentId),
     /// The market's position was not seeded from the venue
     /// ([`Registry::seed_position`](crate::Registry::seed_position)): the worst case is not
@@ -69,13 +148,21 @@ pub enum CapRefusal {
         worst: Option<Lots>,
         cap: Lots,
     },
+    /// What our orders on `side` would have resting with the order admitted, `resting`, would
+    /// exceed the resting cap `cap`; `resting` is `None` when it does not fit a lot count.
+    RestingCap {
+        inst: InstrumentId,
+        side: Side,
+        resting: Option<Lots>,
+        cap: Lots,
+    },
 }
 
 impl fmt::Display for CapRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CapRefusal::NoCap(inst) => {
-                write!(f, "no inventory cap is configured for {inst:?}")
+                write!(f, "no pre-trade caps are configured for {inst:?}")
             }
             CapRefusal::PositionUnknown(inst) => {
                 write!(f, "the position on {inst:?} was not seeded from the venue")
@@ -103,15 +190,40 @@ impl fmt::Display for CapRefusal {
                  count, so it cannot be held under the inventory cap of {} lots",
                 cap.get()
             ),
+            CapRefusal::RestingCap {
+                inst,
+                side,
+                resting: Some(resting),
+                cap,
+            } => write!(
+                f,
+                "our {side:?} orders on {inst:?} would have {} lots resting with the order, \
+                 over the resting cap of {} lots",
+                resting.get(),
+                cap.get()
+            ),
+            CapRefusal::RestingCap {
+                inst,
+                side,
+                resting: None,
+                cap,
+            } => write!(
+                f,
+                "what our {side:?} orders on {inst:?} would have resting with the order does \
+                 not fit a lot count, so it cannot be held under the resting cap of {} lots",
+                cap.get()
+            ),
         }
     }
 }
 
 impl std::error::Error for CapRefusal {}
 
-/// What one side of a market holds before an order is judged: its cap, the position (`None`
-/// until it is seeded from the venue) and the quantity our other orders on that side may have
-/// resting (`None` when the sum does not fit).
+/// What one side of a market holds before an order is judged: its caps, the position (`None`
+/// until it is seeded from the venue), what our other orders on that side may still add to
+/// the position ([`OrderRecord::exposure`](crate::OrderRecord::exposure)) and what they have
+/// resting ([`OrderRecord::resting`](crate::OrderRecord::resting)), each `None` when the sum
+/// does not fit.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct Exposure {
     pub(crate) inst: InstrumentId,
@@ -119,28 +231,62 @@ pub(crate) struct Exposure {
     pub(crate) cap: Option<MarketCaps>,
     pub(crate) pos: Option<SignedLots>,
     pub(crate) others: Option<Lots>,
+    pub(crate) others_resting: Option<Lots>,
+}
+
+/// What an order brings to its side once admitted: what it may add to the position, for the
+/// inventory cap, and what it has resting, for the resting cap.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct Adds {
+    pub(crate) exposure: Lots,
+    pub(crate) resting: Lots,
+}
+
+impl Adds {
+    /// A new order: all of it may rest and fill.
+    pub(crate) fn placing(qty: Lots) -> Adds {
+        Adds {
+            exposure: qty,
+            resting: qty,
+        }
+    }
 }
 
 impl Exposure {
-    /// Whether `new` lots more resting on the side keep the worst case within the market's
-    /// inventory cap (0005's I6): `|pos + Σ resting same side + new| ≤ cap`. Nothing is
-    /// exempt: a reducing order passes only by what the formula gives it.
-    pub(crate) fn admit(&self, new: Lots) -> Result<(), CapRefusal> {
+    /// Whether the order `new` brings keeps the side within both of the market's caps: the
+    /// inventory cap (0005's I6), `|pos + Σ resting same side + new| ≤ cap`, then the resting
+    /// cap, `Σ resting same side + new ≤ cap`. Nothing is exempt: a reducing order passes only
+    /// by what the formulas give it.
+    pub(crate) fn admit(&self, new: Adds) -> Result<(), CapRefusal> {
         let (inst, side) = (self.inst, self.side);
-        let cap = self.cap.ok_or(CapRefusal::NoCap(inst))?.inventory;
+        let caps = self.cap.ok_or(CapRefusal::NoCap(inst))?;
         let pos = self.pos.ok_or(CapRefusal::PositionUnknown(inst))?;
         let worst = self
             .others
-            .and_then(|resting| resting.checked_add(new))
+            .and_then(|others| others.checked_add(new.exposure))
             .and_then(|total| pos.checked_add(SignedLots::of(side, total)))
             .and_then(SignedLots::abs_lots);
         match worst {
-            Some(worst) if worst <= cap => Ok(()),
-            worst => Err(CapRefusal::InventoryCap {
+            Some(worst) if worst <= caps.inventory => {}
+            worst => {
+                return Err(CapRefusal::InventoryCap {
+                    inst,
+                    side,
+                    worst,
+                    cap: caps.inventory,
+                });
+            }
+        }
+        let resting = self
+            .others_resting
+            .and_then(|others| others.checked_add(new.resting));
+        match resting {
+            Some(resting) if resting <= caps.resting => Ok(()),
+            resting => Err(CapRefusal::RestingCap {
                 inst,
                 side,
-                worst,
-                cap,
+                resting,
+                cap: caps.resting,
             }),
         }
     }

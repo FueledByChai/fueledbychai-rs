@@ -18,21 +18,26 @@ use fbc_core::{
     VenueOrderState, WallNs,
 };
 use fbc_oms::{
-    Admission, AmendRefusal, CancelChoice, FillLedger, FillRouted, LedgerConfig, MarketCaps,
+    Admission, AmendRefusal, CancelChoice, FillLedger, FillRouted, LedgerConfig, MarketCapsConfig,
     OmsError, OrdState, OrderKey, OrderOp, PermitRefusal, PermittedCommand, PreTradeCaps, Registry,
 };
 
 const INST: InstrumentId = InstrumentId::new(1);
 
-/// A registry whose inventory cap (0005's I6) is far above any order here: the permits are
+/// A registry whose inventory cap (0005's I6) and resting cap are far above any order here: the permits are
 /// what these tests judge; the caps are `tests/caps.rs`'s.
 fn registry() -> Registry {
-    let mut reg = Registry::with_caps(PreTradeCaps::new().with_market(
-        INST,
-        MarketCaps {
-            inventory: lots(1_000_000),
-        },
-    ));
+    let mut reg = Registry::with_caps(
+        PreTradeCaps::new()
+            .with_market(
+                INST,
+                MarketCapsConfig {
+                    inventory: Some(lots(1_000_000)),
+                    resting: Some(lots(1_000_000)),
+                },
+            )
+            .unwrap(),
+    );
     reg.seed_position(INST, SignedLots(0)).unwrap();
     reg
 }
