@@ -7,11 +7,11 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fbc_core::{
-    AccountKey, AmendOrder, CancelOrder, Channel, CidMint, ClientOrderId, Effects, EncodeCtx,
-    EncodeReceipt, ExecCodec, Feature, InstrumentId, Lots, MonoNs, Namespace, NamespaceLease,
-    NewOrder, NonceBlock, NotSentReason, OrderCaps, OrderKind, OrderKindTag, OrderRef, PathStamps,
-    QueryOrder, RefKind, RpcId, Side, SpecTable, TagSet, Ticks, TifTag, VenueCaps, VenueCommand,
-    VenueOrderId, WallNs, dispatch,
+    AccountKey, AmendOrder, CancelOrder, CapTag, Channel, CidMint, ClientOrderId, Effects,
+    EncodeCtx, EncodeReceipt, ExecCodec, Feature, InstrumentId, Lots, MonoNs, Namespace,
+    NamespaceLease, NewOrder, NonceBlock, NotSentReason, OrderCaps, OrderKind, OrderKindTag,
+    OrderRef, PathStamps, QueryOrder, RefKind, RpcId, Side, SpecTable, TagSet, Ticks, TifTag,
+    VenueCaps, VenueCommand, VenueOrderId, WallNs, dispatch,
 };
 
 use super::{Failure, Subject};
@@ -148,16 +148,34 @@ pub(crate) struct Shape {
 }
 
 impl Shape {
-    /// The plainest order the caps declare: a limit order where they offer one, their first
-    /// time in force and channel, no flag.
-    pub fn plain(o: &OrderCaps) -> Shape {
-        let kind = if o.kinds.contains(OrderKindTag::Limit) {
-            OrderKindTag::Limit
-        } else {
-            o.kinds.iter().next().unwrap_or(OrderKindTag::Limit)
-        };
+    /// The plainest order the caps allow: the first of their kinds (a limit order first),
+    /// times in force and channels, tried in declaration order, that no declared flag conflict
+    /// refuses, with no flag; `None` when they allow none.
+    pub fn plain(o: &OrderCaps) -> Option<Shape> {
+        Shape::sendable(o, OrderKindTag::ALL)
+    }
+
+    /// The plainest order of a kind in `kinds` the caps allow, as [`Shape::plain`].
+    pub fn sendable(o: &OrderCaps, kinds: &[OrderKindTag]) -> Option<Shape> {
+        let kinds = kinds.iter().copied().filter(|&k| o.kinds.contains(k));
+        kinds
+            .flat_map(|kind| o.tifs.iter().map(move |tif| (kind, tif)))
+            .flat_map(|(kind, tif)| o.channels.iter().map(move |channel| (kind, tif, channel)))
+            .map(|(kind, tif, channel)| Shape {
+                kind,
+                tif,
+                channel,
+                post_only: false,
+                reduce_only: false,
+            })
+            .find(|shape| shape.refusal(o).is_none())
+    }
+
+    /// The first order the caps name, allowed or not (a limit order, good till cancelled, on
+    /// the public book where they name none): what a probe sends when they allow no order.
+    pub fn first(o: &OrderCaps) -> Shape {
         Shape {
-            kind,
+            kind: o.kinds.iter().next().unwrap_or(OrderKindTag::Limit),
             tif: o.tifs.iter().next().unwrap_or(TifTag::Gtc),
             channel: o.channels.iter().next().unwrap_or(Channel::Public),
             post_only: false,
@@ -358,6 +376,23 @@ fn mint_in(dir: &Path, n: usize) -> Result<Vec<ClientOrderId>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_plainest_order_skips_a_combination_a_declared_conflict_refuses() {
+        // Codex r4188835160: IOC first, RPI only, and IOC with RPI in conflict.
+        let mut o = crate::toy::caps().exec.unwrap().order;
+        o.tifs = TagSet::of(&[TifTag::Ioc, TifTag::Fok]);
+        o.channels = TagSet::of(&[Channel::Rpi]);
+        o.flag_conflicts = vec![(Feature::Ioc, Feature::Rpi)];
+        let plain = Shape::plain(&o).unwrap();
+        assert_eq!((plain.tif, plain.channel), (TifTag::Fok, Channel::Rpi));
+        assert_eq!(
+            Shape::first(&o).refusal(&o),
+            Some(NotSentReason::FlagConflict)
+        );
+        o.tifs = TagSet::of(&[TifTag::Ioc]);
+        assert_eq!(Shape::plain(&o), None);
+    }
 
     #[test]
     fn minting_reports_a_directory_it_cannot_create() {

@@ -1,8 +1,9 @@
 //! `caps_truthful` (decision 0003): a venue does only what its caps declare.
 //!
 //! Each probe is one command, encoded by a codec built fresh from the factory, that the caps
-//! either refuse or declare; it changes one thing from the plainest order the caps declare
-//! ([`Shape::plain`]), so the refusal it should meet is unambiguous:
+//! either refuse or declare; it changes one thing from the plainest order the caps allow
+//! ([`Shape::plain`]: the first combination of their kinds, times in force and channels that
+//! no declared conflict refuses), so the refusal it should meet is unambiguous:
 //!
 //! - every order kind, time in force, channel and flag the caps leave out, on a placement, on
 //!   an item of a batch placement and on an amend, is refused `NotSent(Unsupported)`;
@@ -11,16 +12,17 @@
 //!   probed);
 //! - an absent operation (amend, batch placement, batch cancel, an account or instrument
 //!   cancel-all, cancel-on-disconnect, or a dead-man refresh without a dead-man timer), a
-//!   batch longer than its `max_items`, and an amend, cancel, batch-cancel item or query
+//!   batch longer than its `max_items` (one item, for a `max_items` of zero), and an amend, cancel, batch-cancel item or query
 //!   naming only references the caps leave out for it are refused `NotSent(Unsupported)`;
 //! - a refusal asks for no effect: no frame, no HTTP request, no timer;
 //! - an instrument cancel-all the caps declare is sent charged as a cancel-all of that
 //!   instrument and nothing wider (an account-wide request's charge names no instrument), and
 //!   one they leave out is refused rather than widened to the account.
 //!
-//! Beside the probes, one control per operation (the plainest declared placement, batch,
-//! amend, cancel, batch cancel and query) must be sent, carrying its request: a codec that
-//! refuses everything would otherwise pass. Which amend fields may change (`AmendCaps`'s
+//! Beside the probes, one control per operation the caps declare (the plainest allowed
+//! placement, batch, amend, cancel, batch cancel and query, an account cancel-all, arming and
+//! disarming cancel-on-disconnect, a dead-man refresh) must be sent, carrying its request: a
+//! codec that refuses everything would otherwise pass (Codex r4188835150). Which amend fields may change (`AmendCaps`'s
 //! `price`, `qty` and `flags`) is not probed: an amend carries the whole amended order and no
 //! codec holds the original to compare it with, so those are the OMS's permits to hold.
 //!
@@ -28,8 +30,8 @@
 //! codec, and fails when it builds one.
 
 use fbc_core::{
-    CancelOnDisconnect, CancelScope, CapTag, Channel, Effect, Feature, NotSentReason, OpKind,
-    OrderCaps, OrderKindTag, RefKind, Support, TifTag, VenueCommand,
+    CancelBatch, CancelOnDisconnect, CancelScope, CapTag, Channel, Effect, Feature, NotSentReason,
+    OpKind, OrderCaps, OrderKindTag, RefKind, Support, TifTag, VenueCommand,
 };
 
 use super::harness::{Encoded, Harness, Ids, RPC, Shape, undeclared};
@@ -186,7 +188,15 @@ type Push<'a> = &'a mut dyn FnMut(String, VenueCommand, Expect);
 /// The order shapes: kinds, times in force, channels, flags and flag conflicts, each on a
 /// placement, a batch item and an amend, beside a control of each.
 fn shapes(h: &Harness<'_>, o: &OrderCaps, ids: &Ids, push: Push<'_>) {
-    let plain = Shape::plain(o);
+    let place = |shape| VenueCommand::Place(ids.order(h, 0, shape));
+    let Some(plain) = Shape::plain(o) else {
+        // The caps allow no order: the first they name is refused, and every variant of it
+        // would be refused for more than the one thing it changes.
+        let first = Shape::first(o);
+        let why = first.refusal(o).unwrap_or(Unsupported);
+        let label = "OrderCaps allows no order: the first it names".to_owned();
+        return push(label, place(first), Expect::Refused(why));
+    };
     let mut variants: Vec<(String, Shape)> = Vec::new();
     for &kind in OrderKindTag::ALL.iter().filter(|&&k| !o.kinds.contains(k)) {
         let label = format!("OrderCaps.kinds lacks {kind:?}");
@@ -223,13 +233,6 @@ fn shapes(h: &Harness<'_>, o: &OrderCaps, ids: &Ids, push: Push<'_>) {
         .into_iter()
         .filter_map(|(label, shape)| shape.refusal(o).map(|why| (label, shape, why)))
         .collect();
-    let place = |shape| VenueCommand::Place(ids.order(h, 0, shape));
-    if let Some(why) = plain.refusal(o) {
-        // Nothing the caps declare is an order: the plainest is refused, and every variant of
-        // it would be refused for more than the one thing it changes.
-        let label = "OrderCaps declares no order: the plainest placement".to_owned();
-        return push(label, place(plain), Expect::Refused(why));
-    }
     push(
         "control: a placement".to_owned(),
         place(plain),
@@ -257,22 +260,19 @@ fn batch_shapes(
         return push(label, cmd, Expect::Refused(Unsupported));
     };
     let max = usize::from(batch.max_items);
-    if max == 0 {
-        return;
-    }
     let batch_of = |last: Shape| {
         let lead = (max >= 2).then(|| ids.order(h, 0, plain));
         let items = lead.into_iter().chain([ids.order(h, 1, last)]).collect();
         VenueCommand::PlaceBatch(items)
     };
-    push(
-        "control: a batch placement".to_owned(),
-        batch_of(plain),
-        Expect::Sent,
-    );
-    for (label, shape, why) in variants {
-        let label = format!("{label} (a batch item)");
-        push(label, batch_of(*shape), Expect::Refused(*why));
+    // A batch of no item has room for nothing but the one-item probe past its limit.
+    if max > 0 {
+        let control = "control: a batch placement".to_owned();
+        push(control, batch_of(plain), Expect::Sent);
+        for (label, shape, why) in variants {
+            let label = format!("{label} (a batch item)");
+            push(label, batch_of(*shape), Expect::Refused(*why));
+        }
     }
     if batch.max_items < u16::MAX {
         let items = (0..=max).map(|i| ids.order(h, i, plain)).collect();
@@ -301,14 +301,15 @@ fn amend_shapes(
         let label = "OrderCaps.amend is None".to_owned();
         return push(label, amend(plain, both), Expect::Refused(Unsupported));
     };
-    let limit = Shape {
-        kind: OrderKindTag::Limit,
-        ..plain
+    let Some(limit) = Shape::sendable(o, &[OrderKindTag::Limit]) else {
+        let first = Shape {
+            kind: OrderKindTag::Limit,
+            ..Shape::first(o)
+        };
+        let why = first.refusal(o).unwrap_or(Unsupported);
+        let label = "OrderCaps allows no limit order to amend".to_owned();
+        return push(label, amend(first, both), Expect::Refused(why));
     };
-    if let Some(why) = limit.refusal(o) {
-        let label = "OrderCaps declares no limit order to amend".to_owned();
-        return push(label, amend(limit, both), Expect::Refused(why));
-    }
     let named = AMEND_REFS.iter().any(|&k| caps.refs.contains(k));
     if named {
         push(
@@ -365,41 +366,7 @@ fn references(h: &Harness<'_>, o: &OrderCaps, ids: &Ids, push: Push<'_>) {
                 Expect::Refused(Unsupported),
             );
         }
-        Some(batch) if batch.max_items > 0 => {
-            let max = usize::from(batch.max_items);
-            let batch_of = |last| {
-                let lead = (max >= 2).then(|| cancel(0));
-                VenueCommand::CancelMany(lead.into_iter().chain([last]).collect())
-            };
-            if batch.refs.is_empty() {
-                let label = "CancelBatch.refs is empty".to_owned();
-                push(label, batch_of(cancel(1)), Expect::Refused(Unsupported));
-            } else {
-                push(
-                    "control: a batch cancel".to_owned(),
-                    batch_of(cancel(1)),
-                    Expect::Sent,
-                );
-            }
-            let left_out = undeclared(batch.refs, RefKind::ALL);
-            if let Some(refs) = ids
-                .carrying(1, &left_out)
-                .filter(|_| !batch.refs.is_empty())
-            {
-                let label = format!("CancelBatch.refs lacks {left_out:?}");
-                push(
-                    label,
-                    batch_of(ids.cancel(h, refs)),
-                    Expect::Refused(Unsupported),
-                );
-            }
-            if batch.max_items < u16::MAX {
-                let cmd = VenueCommand::CancelMany((0..=max).map(cancel).collect());
-                let label = format!("CancelBatch.max_items is {max}");
-                push(label, cmd, Expect::Refused(Unsupported));
-            }
-        }
-        Some(_) => {}
+        Some(batch) => batch_cancels(h, ids, batch, push),
     }
 
     let query = VenueCommand::Query(ids.query(h, full(0)));
@@ -420,48 +387,92 @@ fn references(h: &Harness<'_>, o: &OrderCaps, ids: &Ids, push: Push<'_>) {
     }
 }
 
+/// Batch cancels the caps declare: where the batch has room, a control naming every reference
+/// and an item naming only references the caps leave out for batch items; and one item past
+/// its limit, so a batch of no item is probed too.
+fn batch_cancels(h: &Harness<'_>, ids: &Ids, batch: CancelBatch, push: Push<'_>) {
+    let cancel = |i| ids.cancel(h, ids.carrying(i, RefKind::ALL).expect("every reference"));
+    let max = usize::from(batch.max_items);
+    if max > 0 {
+        let batch_of = |last| {
+            let lead = (max >= 2).then(|| cancel(0));
+            VenueCommand::CancelMany(lead.into_iter().chain([last]).collect())
+        };
+        if batch.refs.is_empty() {
+            let label = "CancelBatch.refs is empty".to_owned();
+            push(label, batch_of(cancel(1)), Expect::Refused(Unsupported));
+        } else {
+            let control = "control: a batch cancel".to_owned();
+            push(control, batch_of(cancel(1)), Expect::Sent);
+            let left_out = undeclared(batch.refs, RefKind::ALL);
+            if let Some(refs) = ids.carrying(1, &left_out) {
+                let label = format!("CancelBatch.refs lacks {left_out:?}");
+                let cmd = batch_of(ids.cancel(h, refs));
+                push(label, cmd, Expect::Refused(Unsupported));
+            }
+        }
+    }
+    if batch.max_items < u16::MAX {
+        let cmd = VenueCommand::CancelMany((0..=max).map(cancel).collect());
+        let label = format!("CancelBatch.max_items is {max}");
+        push(label, cmd, Expect::Refused(Unsupported));
+    }
+}
+
 /// Cancel-alls and cancel-on-disconnect.
 fn operations(h: &Harness<'_>, o: &OrderCaps, push: Push<'_>) {
     let refused = Expect::Refused(Unsupported);
-    if o.cancel_all_account == Support::Unsupported {
-        let cmd = VenueCommand::CancelAll(CancelScope::Account);
-        push(
-            "OrderCaps.cancel_all_account is Unsupported".to_owned(),
-            cmd,
-            refused,
-        );
+    let account = VenueCommand::CancelAll(CancelScope::Account);
+    match o.cancel_all_account {
+        Support::Unsupported => {
+            let label = "OrderCaps.cancel_all_account is Unsupported".to_owned();
+            push(label, account, refused);
+        }
+        Support::Native => push(
+            "control: an account cancel-all".to_owned(),
+            account,
+            Expect::Sent,
+        ),
     }
     let cmd = VenueCommand::CancelAll(CancelScope::Instrument(h.inst));
     match o.cancel_all_instrument {
         Support::Unsupported => {
-            push(
-                "OrderCaps.cancel_all_instrument is Unsupported".to_owned(),
-                cmd,
-                refused,
-            );
+            let label = "OrderCaps.cancel_all_instrument is Unsupported".to_owned();
+            push(label, cmd, refused);
         }
         Support::Native => {
             let label = "OrderCaps.cancel_all_instrument is Native: never widened".to_owned();
             push(label, cmd, Expect::SentOnInstrument);
         }
     }
-    let label = |what| format!("OrderCaps.cancel_on_disconnect has no {what}");
-    let (arm, refresh) = match o.cancel_on_disconnect {
-        CancelOnDisconnect::None => (true, true),
-        CancelOnDisconnect::PerConnection { .. } => (false, true),
-        CancelOnDisconnect::DeadMan { .. } => (false, false),
+    // Arming and disarming cancel-on-disconnect, and refreshing a dead-man timer: sent where
+    // the caps declare them, refused where they do not.
+    let (protection, dead_man) = match o.cancel_on_disconnect {
+        CancelOnDisconnect::None => (false, false),
+        CancelOnDisconnect::PerConnection { .. } => (true, false),
+        CancelOnDisconnect::DeadMan { .. } => (true, true),
     };
-    if arm {
-        let on = VenueCommand::ArmCancelOnDisconnect(true);
-        push(label("protection (arm)"), on, refused);
-        let off = VenueCommand::ArmCancelOnDisconnect(false);
-        push(label("protection (disarm)"), off, refused);
-    }
-    if refresh {
-        push(
-            label("dead-man timer (refresh)"),
-            VenueCommand::RefreshDeadMan,
-            refused,
-        );
-    }
+    let expect = |declared| if declared { Expect::Sent } else { refused };
+    let label = |declared, what| match declared {
+        true => format!("control: {what}"),
+        false => format!("OrderCaps.cancel_on_disconnect has no {what}"),
+    };
+    let arm = VenueCommand::ArmCancelOnDisconnect(true);
+    push(
+        label(protection, "protection (arm)"),
+        arm,
+        expect(protection),
+    );
+    let disarm = VenueCommand::ArmCancelOnDisconnect(false);
+    push(
+        label(protection, "protection (disarm)"),
+        disarm,
+        expect(protection),
+    );
+    let refresh = VenueCommand::RefreshDeadMan;
+    push(
+        label(dead_man, "dead-man timer (refresh)"),
+        refresh,
+        expect(dead_man),
+    );
 }

@@ -46,6 +46,9 @@ fn caps_truthful_probes_every_absence_and_the_declared_flag_conflict_on_the_toy(
         "control: a cancel",
         "control: a batch cancel",
         "control: a query",
+        "control: protection (arm)",
+        "control: protection (disarm)",
+        "control: dead-man timer (refresh)",
         "OrderCaps.kinds lacks Market",
         "OrderCaps.tifs lacks Fok",
         "OrderCaps.tifs lacks Fok (a batch item)",
@@ -72,7 +75,7 @@ fn caps_truthful_probes_every_absence_and_the_declared_flag_conflict_on_the_toy(
     let absent = [
         "post_only is false",
         "reduce_only is false",
-        "cancel_on_disconnect",
+        "cancel_on_disconnect has no",
         "cancel_refs lacks",
     ];
     for name in absent {
@@ -89,6 +92,7 @@ fn commands_selfcontained_encodes_every_declared_reference_on_the_toy() {
     assert_eq!(
         probed,
         [
+            "control: the placement a warm codec sees first",
             "AmendCaps.refs has Venue: an amend",
             "OrderCaps.cancel_refs has Venue: a cancel",
             "OrderCaps.cancel_refs has Client: a cancel",
