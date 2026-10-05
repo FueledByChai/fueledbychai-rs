@@ -34,6 +34,7 @@ use crate::fee::FeeError;
 use crate::ids::{IdError, InstrumentId, VenueOrderId};
 use crate::instrument::InstrumentSpec;
 use crate::scope::DecodeScope;
+use crate::stamps::PathStamps;
 use crate::time::{MonoNs, WallNs};
 use crate::units::{Channel, Lots, Side, Ticks};
 use crate::venue::VenueError;
@@ -995,12 +996,17 @@ pub trait ExecCodec: Send {
     /// ([`Effects::carry_request`]): every frame or HTTP request names `rpc`, so it has a
     /// deadline, and is labelled with `cmd`'s traffic class; each carries the [`RateCharge`]
     /// the venue counts it as. Never retries.
+    ///
+    /// Each signer call is marked as a [`PathStage::Sign`](crate::PathStage::Sign) through `t`
+    /// ([`PathStamps::span`]); the marks give back no time, so the bytes are the same whatever
+    /// they recorded (0033).
     fn encode(
         &mut self,
         cmd: &VenueCommand,
         rpc: RpcId,
         specs: &SpecTable,
         ctx: &EncodeCtx,
+        t: &mut PathStamps<'_>,
         fx: &mut Effects,
     ) -> Result<EncodeReceipt, NotSentReason>;
     /// Decode one frame from `stream`. `Err` means nothing was pushed ([`ExecSink`]).

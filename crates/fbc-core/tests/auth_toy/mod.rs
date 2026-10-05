@@ -21,9 +21,9 @@ use std::time::Duration;
 use fbc_core::{
     ConnState, CtxCall, DecodeError, DecodeScope, Effect, Effects, EncodeCtx, EncodeReceipt,
     ExecCodec, ExecEvent, ExecSink, HeaderMark, HttpFailure, HttpMethod, HttpRequest, HttpResponse,
-    HttpTag, Inbound, InboundSpans, Namespace, NotSentReason, OpKind, RateCharge, RawFrame, RpcId,
-    SpecTable, StreamId, SubmitOutcome, TimerTag, TrafficClass, VenueCommand, VenueMeta, WireSlice,
-    WireUrl, dispatch,
+    HttpTag, Inbound, InboundSpans, Namespace, NotSentReason, OpKind, PathStamps, RateCharge,
+    RawFrame, RpcId, SpecTable, StreamId, SubmitOutcome, TimerTag, TrafficClass, VenueCommand,
+    VenueMeta, WireSlice, WireUrl, dispatch,
 };
 
 /// The order-entry stream.
@@ -102,6 +102,7 @@ impl ExecCodec for AuthToy {
         _rpc: RpcId,
         _specs: &SpecTable,
         _ctx: &EncodeCtx,
+        _t: &mut PathStamps<'_>,
         _fx: &mut Effects,
     ) -> Result<EncodeReceipt, NotSentReason> {
         Err(NotSentReason::Unsupported)

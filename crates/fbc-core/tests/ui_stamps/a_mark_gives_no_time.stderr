@@ -1,0 +1,28 @@
+error[E0308]: mismatched types
+ --> tests/ui_stamps/a_mark_gives_no_time.rs:6:5
+  |
+5 | fn through_stamps(t: &mut PathStamps<'_>) -> MonoNs {
+  |                                              ------ expected `MonoNs` because of return type
+6 |     t.start(PathStage::Sign)
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^ expected `MonoNs`, found `()`
+  |
+note: method `start` modifies its receiver in-place
+ --> tests/ui_stamps/a_mark_gives_no_time.rs:6:7
+  |
+6 |     t.start(PathStage::Sign)
+  |       ^^^^^ this call modifies `t` in-place
+
+error[E0308]: mismatched types
+  --> tests/ui_stamps/a_mark_gives_no_time.rs:14:5
+   |
+ 9 | fn through_recorder(r: &mut dyn PathRecorder) -> MonoNs {
+   |                                                  ------ expected `MonoNs` because of return type
+...
+14 |     r.mark(mark)
+   |     ^^^^^^^^^^^^ expected `MonoNs`, found `()`
+   |
+note: method `mark` modifies its receiver in-place
+  --> tests/ui_stamps/a_mark_gives_no_time.rs:14:7
+   |
+14 |     r.mark(mark)
+   |       ^^^^ this call modifies `r` in-place

@@ -11,8 +11,9 @@
 //! It also fixes the boundary every venue adapter implements (decision 0002): normalized
 //! market-data and execution events ([`event`]), venue commands and their outcomes
 //! ([`command`]), the sans-IO codec traits with their effects and the encode context that is a
-//! codec's only source of time and nonces ([`codec`]), and the venue factory and gateway
-//! traits ([`venue`]).
+//! codec's only source of time and nonces ([`codec`]), the write-only stamps a codec marks its
+//! stages through without reading a clock ([`stamps`]), and the venue factory and gateway traits
+//! ([`venue`]).
 
 pub mod caps;
 pub mod cid;
@@ -25,6 +26,7 @@ pub mod ids;
 pub mod instrument;
 pub mod mint;
 pub mod scope;
+pub mod stamps;
 pub mod time;
 pub mod units;
 pub mod venue;
@@ -72,6 +74,7 @@ pub use instrument::{
 };
 pub use mint::{CidMint, LeaseError, LeaseIo, NamespaceLease};
 pub use scope::{DecodeScope, dispatch, dispatch_market_data};
+pub use stamps::{PathEdge, PathMark, PathRecorder, PathStage, PathStamps};
 pub use time::{ConnKey, ExchNs, ExchTsKind, KernelRxNs, MonoNs, Stamp, WallNs};
 pub use units::{
     Aggressor, AssetSym, BookSide, Bps, Channel, Liquidity, Lots, Money, PxExact, Side, SignedLots,
