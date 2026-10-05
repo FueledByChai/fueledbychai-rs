@@ -23,6 +23,7 @@ use fbc_core::{
 use fbc_runtime::{
     Connector, IngestClock, Liveness, LivenessError, MdControl, MdHandler, MdSession,
     MdSessionConfig, MdVenue, MdVenueConfig, Outbox, ProxyConfig, ReconnectPacing, SessionError,
+    WriteStall,
 };
 use tokio::time::{Instant, advance};
 
@@ -76,6 +77,7 @@ fn toy_session(url: String, cfg: &[(&'static str, &str)], liveness: Liveness) ->
         conn: CONN,
         limiter: venue.limiter(0),
         liveness,
+        write_stall: WriteStall::new(Duration::from_secs(3_600)).unwrap(),
     }
 }
 
@@ -718,6 +720,7 @@ fn a_liveness_needs_a_window_and_a_margin_and_the_margin_must_fit_the_venues_lif
             conns: 0..4,
             limiter: venue.limiter(0),
             liveness: tight,
+            write_stall: WriteStall::new(Duration::from_secs(3_600)).unwrap(),
         }
     };
     let err = MdVenue::new(venue("10000"), keep(&Seen::default()))

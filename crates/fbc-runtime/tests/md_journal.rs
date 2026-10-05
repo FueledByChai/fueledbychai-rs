@@ -26,7 +26,7 @@ use fbc_journal::{
 };
 use fbc_runtime::{
     Connector, IngestClock, Input, Journal, Liveness, MdSession, MdSessionConfig, MdVenue,
-    MdVenueConfig, ProxyConfig, ReconnectPacing,
+    MdVenueConfig, ProxyConfig, ReconnectPacing, WriteStall,
 };
 
 type Seen = Rc<RefCell<Vec<Envelope<MdEvent>>>>;
@@ -80,6 +80,7 @@ fn session(venue: &'static ToyVenue, url: String) -> MdSessionConfig {
         conn: CONN,
         limiter: venue.limiter(0),
         liveness: Liveness::new(Duration::from_secs(3_600), Duration::from_millis(1)).unwrap(),
+        write_stall: WriteStall::new(Duration::from_secs(3_600)).unwrap(),
     }
 }
 
@@ -414,6 +415,7 @@ async fn every_endpoint_a_venue_opens_records_into_its_one_journal() {
         conns: 10..20,
         limiter: toy_venue.limiter(0),
         liveness: Liveness::new(Duration::from_secs(3_600), Duration::from_millis(1)).unwrap(),
+        write_stall: WriteStall::new(Duration::from_secs(3_600)).unwrap(),
     };
     let (mut venue, control) = MdVenue::new(config, |_| {}).unwrap();
     let kept = Rc::new(RefCell::new(Kept::default()));

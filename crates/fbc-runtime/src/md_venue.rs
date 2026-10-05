@@ -37,6 +37,7 @@ use crate::ratelimit::RateLimiter;
 use crate::session::{
     IngestClock, MdControl, MdHandler, MdSession, MdSessionConfig, Outbox, SessionError, TickToWire,
 };
+use crate::stall::WriteStall;
 use crate::ws;
 
 /// What a venue's market data needs, all from the consumer.
@@ -58,6 +59,8 @@ pub struct MdVenueConfig {
     pub limiter: RateLimiter,
     /// Each socket endpoint's silence window and rotation margin (0033).
     pub liveness: Liveness,
+    /// Each socket endpoint's bound on a write its peer stopped reading (0035).
+    pub write_stall: WriteStall,
 }
 
 /// Why a desired set was not planned; nothing was opened or closed for it.
@@ -263,6 +266,7 @@ impl<H: MdHandler + 'static> MdVenue<H> {
             conn,
             limiter: c.limiter.clone(),
             liveness: c.liveness,
+            write_stall: c.write_stall,
         };
         let (mut session, control) = MdSession::new(config, Shared(self.handler.clone()))?;
         if let Some(journal) = &self.journal {

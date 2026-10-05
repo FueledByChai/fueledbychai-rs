@@ -20,7 +20,7 @@ use fbc_core::{
 };
 use fbc_runtime::{
     Connector, IngestClock, Liveness, MdHandler, MdSession, MdSessionConfig, Outbox, ProxyConfig,
-    ReconnectPacing, TickToWire,
+    ReconnectPacing, TickToWire, WriteStall,
 };
 
 /// What the handler saw: every envelope, and every tick-to-wire reported.
@@ -99,6 +99,7 @@ async fn run(tls: bool) -> (Seen, WallNs) {
         conn: 3,
         limiter: venue.limiter(0),
         liveness: Liveness::new(Duration::from_secs(3_600), Duration::from_millis(1)).unwrap(),
+        write_stall: WriteStall::new(Duration::from_secs(3_600)).unwrap(),
     };
     let seen = Seen::default();
     let start = now();
