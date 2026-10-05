@@ -200,6 +200,9 @@ pub struct ExecSession<H> {
     specs: SpecTable,
     nonces: Box<dyn NonceSource>,
     decode_errors: u64,
+    /// The epoch a run is connected in, until it ends: still set when a run starts, it was
+    /// left by a run cancelled mid-epoch.
+    in_epoch: Option<ConnKey>,
     handler: H,
 }
 
@@ -255,6 +258,7 @@ impl<H: ExecHandler> ExecSession<H> {
             specs: config.specs,
             nonces: config.nonces,
             decode_errors: 0,
+            in_epoch: None,
             handler,
         };
         Ok((session, ExecControl { _stop: stop_tx }))
@@ -283,26 +287,46 @@ impl<H: ExecHandler> ExecSession<H> {
 
     /// Connects, reconnects as paced, and delivers events until the [`ExecControl`] is
     /// dropped.
+    ///
+    /// A run that ends in an error, or whose future is dropped while connected, leaves the
+    /// session able to run again: the epoch it was in is retired (the handler told it ended,
+    /// the next connection stamped under the next epoch) and the next attempt waits the
+    /// pacing's floor, as after a drop (Codex r4188802893, r4188995359, r4188995364).
     pub async fn run(&mut self) -> Result<(), ExecSessionError> {
+        if let Some(key) = self.in_epoch.take() {
+            self.handler.on_epoch_end(key);
+            self.retire(key)?;
+        }
         loop {
             let mut ctl = Stop(self.core.stop.clone());
             let Some(ws) = self.core.connect(&self.url, &mut ctl).await? else {
                 return Ok(());
             };
+            let key = self.current();
+            self.in_epoch = Some(key);
             let end = self.connected(ws).await;
-            self.core.rates.closed(self.current());
+            self.in_epoch = None;
             match end {
-                Ok(End::Stop) => return Ok(()),
-                Ok(End::Dropped) => self.core.pacer.dropped(Instant::now()),
-                // The ended connection's epoch is retired all the same, so a later run never
-                // stamps another connection's life with it (Codex r4188802893).
+                Ok(End::Stop) => {
+                    self.core.rates.closed(key);
+                    return Ok(());
+                }
+                Ok(End::Dropped) => self.retire(key)?,
                 Err(e) => {
-                    self.core.epochs.advance()?;
+                    self.retire(key)?;
                     return Err(e);
                 }
             }
-            self.core.epochs.advance()?;
         }
+    }
+
+    /// Ends connected epoch `key` as a drop: its buckets forgotten, the pacing told, the next
+    /// epoch opened.
+    fn retire(&mut self, key: ConnKey) -> Result<(), ExecSessionError> {
+        self.core.rates.closed(key);
+        self.core.pacer.dropped(Instant::now());
+        self.core.epochs.advance()?;
+        Ok(())
     }
 
     /// Whether the control has dropped.
@@ -426,8 +450,15 @@ impl<H: ExecHandler> ExecSession<H> {
         key: ConnKey,
         mut fx: Effects,
     ) -> Result<bool, ExecSessionError> {
-        let effects = fx.take();
-        let own = |e: &Effect| frame_of(e, self.stream, true);
+        let mut effects = fx.take();
+        // Nothing behind a reconnect of the session's stream is ever reached, so nothing
+        // behind it is charged (Codex r4188995331).
+        let stream = self.stream;
+        let ends = |e: &Effect| matches!(e, Effect::Reconnect { stream: s, .. } if *s == stream);
+        if let Some(at) = effects.iter().position(ends) {
+            effects.truncate(at + 1);
+        }
+        let own = |e: &Effect| frame_of(e, stream, true);
         let frames: Vec<Request> = effects.iter().filter_map(own).collect();
         match self.core.rates.charge(Instant::now(), key, &frames) {
             Ok(_) => {}

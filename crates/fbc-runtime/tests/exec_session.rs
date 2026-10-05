@@ -56,6 +56,9 @@ const CAPS: &str = "exec.caps";
 const CODEC: &str = "exec.codec";
 /// Any value: the recorded codec's `on_open` also sends a frame heavier than the toy's limit.
 const HEAVY: &str = "exec.heavy";
+/// Any value: the recorded codec's `on_open` asks to reconnect after its frames, then for a
+/// frame heavier than the toy's limit, which the reconnect leaves unreached.
+const OPEN_BYE: &str = "exec.open_bye";
 
 /// Every `on_open` call the recorded codec saw: its stream and context.
 type Opens = Arc<Mutex<Vec<(StreamId, EncodeCtx)>>>;
@@ -145,6 +148,7 @@ impl VenueFactory for ExecToy {
                 inner: toy,
                 opens: self.opens.clone(),
                 heavy: cfg.get(HEAVY).is_some(),
+                bye: cfg.get(OPEN_BYE).is_some(),
             }),
         }))
     }
@@ -169,6 +173,7 @@ struct Recording {
     inner: ToyExec,
     opens: Opens,
     heavy: bool,
+    bye: bool,
 }
 
 impl ExecCodec for Recording {
@@ -183,7 +188,11 @@ impl ExecCodec for Recording {
         self.opens.lock().unwrap().push((stream, ctx.clone()));
         self.inner.on_open(stream, ctx, fx);
         self.inner.resync(ctx, fx);
-        if self.heavy {
+        if self.bye {
+            let reason = "bye";
+            fx.push(Effect::Reconnect { stream, reason });
+        }
+        if self.heavy || self.bye {
             fx.push(Effect::Send {
                 stream,
                 frame: WireSlice::plain(b"heavy".to_vec()),
@@ -733,7 +742,8 @@ async fn the_endpoint_opens_through_the_consumers_socks5_proxy_by_name() {
 #[tokio::test]
 async fn a_nonce_source_that_reserves_another_count_ends_the_session_and_retires_its_epoch() {
     let mut server = ScriptedWs::start().await;
-    let (mut config, _) = setup(ExecToy::leak(), &server.url(), quick());
+    let floor = ReconnectPacing::new(ms(200), ms(200), 100, Duration::from_secs(60), ms(5_000));
+    let (mut config, _) = setup(ExecToy::leak(), &server.url(), floor.unwrap());
     let log = Arc::default();
     config.nonces = Box::new(Counting {
         next: 0,
@@ -746,17 +756,25 @@ async fn a_nonce_source_that_reserves_another_count_ends_the_session_and_retires
         asked: 2,
         reserved: 1,
     };
+    let mut ended = None;
     for epoch in 0..2 {
         let script = async {
             let mut peer = server.accept().await;
+            let accepted = Instant::now();
             // Nothing was sent on the connection.
             assert_eq!(peer.next().await, None);
+            accepted
         };
-        let (run, ()) = tokio::join!(session.run(), script);
+        let (run, accepted) = tokio::join!(session.run(), script);
         assert_eq!(run.err(), Some(short.clone()));
         // The connection's epoch is retired, so running again stamps the next connection
-        // under the next epoch (Codex r4188802893).
+        // under the next epoch (Codex r4188802893), and waits the pacing's floor as after a
+        // drop (Codex r4188995364).
         assert_eq!(session.current(), key(epoch + 1));
+        if let Some(ended) = ended {
+            assert!(accepted.duration_since(ended) >= ms(200));
+        }
+        ended = Some(Instant::now());
     }
     drop(control);
     let ends: Vec<_> = heard
@@ -833,6 +851,68 @@ async fn on_open_frames_the_buckets_refuse_for_now_end_the_epoch_and_go_once_the
     run.unwrap();
     assert!(empty >= 1);
     assert!(shared.counts().refused.account >= 1);
+}
+
+#[tokio::test]
+async fn nothing_behind_a_reconnect_on_open_asks_for_is_charged() {
+    let mut server = ScriptedWs::start().await;
+    let (mut config, _) = setup(ExecToy::leak(), &server.url(), quick());
+    // The heavy frame behind the reconnect would never fit; it is never reached, so it is not
+    // charged and every epoch opens (Codex r4188995331).
+    config.cfg.insert(OPEN_BYE, "yes");
+    let (mut session, control) = ExecSession::new(config, |_| {}).unwrap();
+    let script = async move {
+        for _ in 0..2 {
+            let mut peer = server.accept().await;
+            assert!(peer.recv().await.starts_with("auth|ts="));
+            assert!(peer.recv().await.starts_with("resync|ts="));
+            assert_eq!(peer.next().await, None);
+        }
+        drop(control);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    assert!(session.current().epoch >= 2);
+}
+
+#[tokio::test]
+async fn a_run_dropped_mid_epoch_has_that_epoch_ended_and_retired_by_the_next_run() {
+    let mut server = ScriptedWs::start().await;
+    let (config, _) = setup(ExecToy::leak(), &server.url(), quick());
+    let log = Log::default();
+    let (mut session, control) = ExecSession::new(config, Keep::new(&log)).unwrap();
+    let mut first = tokio::select! {
+        _ = session.run() => panic!("the run ended"),
+        peer = async {
+            let mut peer = server.accept().await;
+            let _ = (peer.recv().await, peer.recv().await);
+            peer
+        } => peer,
+    };
+    // The cancelled run left its epoch open: the handler has not been told it ended.
+    assert!(log.borrow().is_empty());
+    assert_eq!(first.next().await, None);
+    let script = async move {
+        let mut second = server.accept().await;
+        let opened = second.recv().await;
+        drop(control);
+        opened
+    };
+    let (run, opened) = tokio::join!(session.run(), script);
+    run.unwrap();
+    assert!(opened.starts_with("auth|ts="));
+    // The next run ended it first and opened the next connection under the next epoch
+    // (Codex r4188995359).
+    let ends: Vec<_> = log
+        .borrow()
+        .iter()
+        .filter_map(|h| match h {
+            Heard::End(k) => Some(*k),
+            Heard::Event(..) => None,
+        })
+        .collect();
+    assert_eq!(ends, [key(0), key(1)]);
+    assert_eq!(session.current(), key(1));
 }
 
 #[tokio::test]
