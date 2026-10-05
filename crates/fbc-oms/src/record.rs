@@ -258,8 +258,8 @@ impl OrderRecord {
     /// The quantity still resting: nothing once terminal; otherwise the largest total the
     /// venue may hold less the filled part, so a PendingNew or Unknown order counts as fully
     /// resting, and an amend to a larger total counts from when it is sent until the venue
-    /// confirms an amend sent at or after it, or the amend is refused while it is the only
-    /// one unconfirmed (I6).
+    /// confirms an amend sent at or after it, or states the total once no amend is in flight,
+    /// or the amend is refused while it is the only one unconfirmed (I6).
     pub fn resting(&self) -> Lots {
         if self.state.is_terminal() {
             Lots::ZERO
@@ -345,7 +345,8 @@ impl OrderRecord {
     /// standing, when it is tied to that amend: no earlier amend was replaced in flight
     /// unconfirmed, and it names a new venue id the record did not know, or carries a venue
     /// ordering key later than the last update's. Otherwise it may be a duplicate of an older
-    /// confirmation, and the amend stays in flight, counted ([`Self::resting`]). Either kind
+    /// confirmation, and the amend stays in flight, counted ([`Self::resting`]). A total
+    /// stated while no amend is in flight settles the amends replaced in flight before it. Either kind
     /// of update ends the order Filled when its fills alone then cover every total the venue
     /// may hold.
     pub fn apply_update(&mut self, u: &OrderUpdate, key: OrderKey) -> Applied {
@@ -377,6 +378,12 @@ impl OrderRecord {
         }
         if let Some(qty) = u.qty {
             self.qty = qty;
+            if !matches!(self.intent, Intent::PendingAmend { .. }) {
+                // The venue states the total with no amend in flight: the later amend that
+                // replaced them has been answered, so the amends replaced in flight, sent
+                // before it, are behind this total.
+                self.unsettled = None;
+            }
         }
         self.last_key = Some(key);
         if let Some(kind) = ends {
@@ -815,6 +822,41 @@ mod tests {
         assert_eq!(rec.apply_update(&a3, keyed(3, 3)), Applied::Amended);
         assert_eq!(rec.intent(), Intent::None);
         assert_eq!(rec.resting(), lots(1));
+    }
+
+    #[test]
+    fn a_total_stated_once_no_amend_is_in_flight_settles_the_amends_replaced_in_flight() {
+        // Codex r4182657487.
+        let mut rec = order(5);
+        assert!(rec.amend_sent(Ticks(101), lots(9), RpcId(3), MonoNs(2)));
+        assert!(rec.amend_sent(Ticks(102), lots(7), RpcId(4), MonoNs(3)));
+        rec.on_outcome(OrderOp::Amend, None, &refused(), MonoNs(4));
+        assert_eq!(rec.resting(), lots(9), "A1 may rest");
+        // An update stating no total settles nothing.
+        assert_eq!(
+            rec.apply_update(&update(VenueOrderState::Open, 0), key(1)),
+            Applied::Advanced
+        );
+        assert_eq!(rec.resting(), lots(9));
+        // The venue states the order's total: A1 did not take.
+        let mut open = update(VenueOrderState::Open, 0);
+        (open.px, open.qty) = (Some(Ticks(100)), Some(lots(5)));
+        assert_eq!(rec.apply_update(&open, key(2)), Applied::Advanced);
+        assert_eq!(rec.resting(), lots(5));
+        assert_eq!(rec.apply_fill(None, None, lots(5)), FillApplied::Completed);
+    }
+
+    #[test]
+    fn a_total_stated_while_an_amend_is_in_flight_settles_nothing_replaced_before_it() {
+        let mut rec = order(5);
+        assert!(rec.amend_sent(Ticks(101), lots(9), RpcId(3), MonoNs(2)));
+        assert!(rec.amend_sent(Ticks(102), lots(7), RpcId(4), MonoNs(3)));
+        // Stating the original total while A2 is in flight: A1 may yet reach the venue.
+        let mut open = update(VenueOrderState::Open, 0);
+        open.qty = Some(lots(5));
+        rec.apply_update(&open, key(1));
+        rec.on_outcome(OrderOp::Amend, None, &refused(), MonoNs(4));
+        assert_eq!(rec.resting(), lots(9));
     }
 
     #[test]
