@@ -81,8 +81,9 @@ pub(crate) enum IssueRefusal {
     /// A batch whose items name more than one market: an authorization carries one market's
     /// generation.
     MixedMarkets,
-    /// An amend, a cancel or a cancel-many not built through a permit: it is authorized only
-    /// as the [`PermittedCommand`] its permit built (decision 0005, FBC-lrc).
+    /// A place, a batch of places, an amend, a cancel or a cancel-many this crate did not
+    /// build: it is authorized only as the [`PermittedCommand`] its permit or the pre-trade
+    /// caps built (decision 0005, FBC-lrc, 0013 rule 2).
     NeedsPermit,
 }
 
@@ -100,28 +101,27 @@ pub struct Authorization {
 
 impl Authorization {
     /// Issues an authorization for `cmd` on `acct`, carrying the generation `generations` holds
-    /// for the command's market. Refused for a command that affects no order, an account
-    /// cancel-all, an empty batch, a batch over several markets, and an amend, a cancel or a
-    /// cancel-many, which are issued only from their permit ([`Authorization::issue_permitted`]).
-    /// The caps and the kill switch are checked before this is called (FBC-2e4, FBC-c4v,
-    /// FBC-afd).
+    /// for the command's market: only an instrument cancel-all is issued from a plain command.
+    /// Refused for a command that affects no order and an account cancel-all, and for a place,
+    /// a batch of places, an amend, a cancel and a cancel-many, which are issued only from the
+    /// [`PermittedCommand`] built under the pre-trade caps or a permit
+    /// ([`Authorization::issue_permitted`]). The kill switch is checked before this is called
+    /// (FBC-c4v, FBC-afd).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn issue(
         acct: AccountKey,
         cmd: VenueCommand,
         generations: &Generations,
     ) -> Result<Authorization, IssueRefusal> {
-        if matches!(
-            cmd,
-            VenueCommand::Amend(_) | VenueCommand::Cancel(_) | VenueCommand::CancelMany(_)
-        ) {
+        if permitted_kind(&cmd) {
             return Err(IssueRefusal::NeedsPermit);
         }
         Authorization::issue_any(acct, cmd, generations)
     }
 
-    /// Issues an authorization for the amend, cancel or cancel-many a permit built, as
-    /// [`Authorization::issue`] does for any other command.
+    /// Issues an authorization for the place or batch the pre-trade caps admitted, or the
+    /// amend, cancel or cancel-many a permit built, as [`Authorization::issue`] does for an
+    /// instrument cancel-all.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn issue_permitted(
         acct: AccountKey,
@@ -164,6 +164,19 @@ impl Authorization {
     pub fn command(&self) -> &VenueCommand {
         &self.cmd
     }
+}
+
+/// Whether `cmd` is authorized only as a [`PermittedCommand`]: a place, a batch of places, an
+/// amend, a cancel or a cancel-many.
+fn permitted_kind(cmd: &VenueCommand) -> bool {
+    matches!(
+        cmd,
+        VenueCommand::Place(_)
+            | VenueCommand::PlaceBatch(_)
+            | VenueCommand::Amend(_)
+            | VenueCommand::Cancel(_)
+            | VenueCommand::CancelMany(_)
+    )
 }
 
 /// The one market every item of an order-affecting command names.
@@ -247,17 +260,9 @@ mod tests {
         ]
     }
 
-    /// Whether `cmd` is authorized only from a permit: an amend, a cancel or a cancel-many.
-    fn permitted_kind(cmd: &VenueCommand) -> bool {
-        matches!(
-            cmd,
-            VenueCommand::Amend(_) | VenueCommand::Cancel(_) | VenueCommand::CancelMany(_)
-        )
-    }
-
     /// Issues `cmd` the way its kind is issued: from a permit's command, or directly.
     fn issue(cmd: VenueCommand, generations: &Generations) -> Result<Authorization, IssueRefusal> {
-        if permitted_kind(&cmd) {
+        if super::permitted_kind(&cmd) {
             Authorization::issue_permitted(ACCT, PermittedCommand::for_test(cmd), generations)
         } else {
             Authorization::issue(ACCT, cmd, generations)
@@ -265,7 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn an_amend_or_a_cancel_is_authorized_only_as_its_permit_built_it() {
+    fn a_place_an_amend_or_a_cancel_is_authorized_only_as_this_crate_built_it() {
         let generations = Generations::default();
         let btc = InstrumentId::new(1);
         for cmd in order_commands(btc).into_iter().filter(permitted_kind) {
@@ -306,15 +311,13 @@ mod tests {
 
         // One issued before a state change keeps the generation it was issued under, so the
         // check at submit (FBC-afd) can tell it is stale; one issued after carries the new one.
-        let before = Authorization::issue(
-            ACCT,
+        let before = issue(
             VenueCommand::Place(on(btc, placement(cid(), 100, 1))),
             &generations,
         )
         .unwrap();
         let killed = generations.advance(btc);
-        let after = Authorization::issue(
-            ACCT,
+        let after = issue(
             VenueCommand::Place(on(btc, placement(cid(), 100, 1))),
             &generations,
         )

@@ -1,26 +1,30 @@
 //! The registry of our orders by client id, the routing of venue events and accepted fills to
-//! them, and the inventory those fills moved.
+//! them, the inventory those fills moved, and the pre-trade caps every place, amend and batch
+//! item is built under (0013 rule 2, 0005's I6).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use fbc_core::{
     CidMatch, ClientOrderId, InstrumentId, ItemRef, Lots, MonoNs, Namespace, NewOrder, OrderCaps,
-    OrderUpdate, RpcId, SignedLots, SubmitOutcome, Ticks, VenueOrderId,
+    OrderUpdate, RpcId, Side, SignedLots, SubmitOutcome, Ticks, VenueCommand, VenueOrderId,
 };
 
+use crate::caps::{CapRefusal, Exposure, PreTradeCaps};
 use crate::ladder;
-
 use crate::ledger::AcceptedFill;
-use crate::permit::{self, CancelChoice, CancelPlan, Cancellable, Live, PermitRefusal};
+use crate::permit::{
+    self, CancelChoice, CancelPlan, Cancellable, Live, PermitRefusal, PermittedCommand, PlacePlan,
+};
 use crate::record::{Applied, FillApplied, OrderKey, OrderOp, OrderRecord, OutcomeApplied};
 
 /// Our orders, by client id, with an index of every venue id they were known by, the
 /// inventory per instrument that the fills the ledger accepted moved, and the Unknown ladder's
-/// queries out and orders lost ([`Registry::ladder`]).
+/// queries out and orders lost ([`Registry::ladder`]), and the consumer's pre-trade caps.
 #[derive(Debug, Default)]
 pub struct Registry {
     pub(crate) orders: HashMap<ClientOrderId, OrderRecord>,
+    caps: PreTradeCaps,
     by_vid: HashMap<VenueOrderId, ClientOrderId>,
     inventory: HashMap<InstrumentId, SignedLots>,
     /// The ledger whose fills the registry applies: the first one it was given.
@@ -94,6 +98,11 @@ pub enum OmsError {
     NonceRecorded(ClientOrderId),
     /// The order's placement was already recorded as sent at other instants.
     SentRecorded(ClientOrderId),
+    /// A pre-trade cap refused the place or batch item (0013 rule 2): it was never built.
+    Capped(CapRefusal),
+    /// The batch names more than one market: a batch is one market's command, so none of it
+    /// was built.
+    MixedMarkets,
 }
 
 impl fmt::Display for OmsError {
@@ -124,6 +133,8 @@ impl fmt::Display for OmsError {
             OmsError::SentRecorded(cid) => {
                 write!(f, "{cid:?} was already recorded as sent at other instants")
             }
+            OmsError::Capped(refusal) => write!(f, "refused by a pre-trade cap: {refusal}"),
+            OmsError::MixedMarkets => write!(f, "a batch of places names more than one market"),
         }
     }
 }
@@ -131,13 +142,118 @@ impl fmt::Display for OmsError {
 impl std::error::Error for OmsError {}
 
 impl Registry {
-    /// An empty registry.
+    /// An empty registry with no pre-trade cap configured: it builds no place or amend until
+    /// it is given caps ([`Registry::with_caps`]); cancels need none.
     pub fn new() -> Registry {
         Registry::default()
     }
 
-    /// Registers a placement about to be sent, PendingNew. Refused when an order is already
-    /// registered under its client id.
+    /// An empty registry under the consumer's pre-trade caps (0009, 0013 rule 2).
+    pub fn with_caps(caps: PreTradeCaps) -> Registry {
+        Registry {
+            caps,
+            ..Registry::default()
+        }
+    }
+
+    /// The pre-trade caps every place, amend and batch item is checked against.
+    pub fn caps(&self) -> &PreTradeCaps {
+        &self.caps
+    }
+
+    /// The quantity our orders on `inst` and `side` may have resting (0005's I6): each order's
+    /// [`OrderRecord::resting`], so PendingNew and Unknown orders count in full, a partly
+    /// filled order its remainder until it is terminal, and an amend in flight at the larger
+    /// of its old and new quantity. `None` when the sum does not fit a lot count.
+    pub fn resting_on(&self, inst: InstrumentId, side: Side) -> Option<Lots> {
+        self.resting_except(inst, side, None)
+    }
+
+    fn resting_except(
+        &self,
+        inst: InstrumentId,
+        side: Side,
+        except: Option<ClientOrderId>,
+    ) -> Option<Lots> {
+        self.orders
+            .values()
+            .filter(|rec| {
+                let placed = rec.placed();
+                placed.inst == inst && placed.side == side && Some(placed.cid) != except
+            })
+            .try_fold(Lots::ZERO, |sum, rec| sum.checked_add(rec.resting()))
+    }
+
+    /// What `inst` and `side` hold before an order is judged against the inventory cap: the
+    /// market's caps, the position, and the resting quantity of our orders on the side but
+    /// `except` (the order an amend changes).
+    fn exposure(&self, inst: InstrumentId, side: Side, except: Option<ClientOrderId>) -> Exposure {
+        Exposure {
+            inst,
+            side,
+            cap: self.caps.market(inst),
+            pos: self.inventory(inst),
+            others: self.resting_except(inst, side, except),
+        }
+    }
+
+    /// Builds the place of `order` when its market's pre-trade caps admit it, and registers
+    /// it PendingNew, so every later check counts it in full. Refused, never built and never
+    /// registered, when it would take the worst case on its side past the inventory cap or
+    /// its market has no cap ([`OmsError::Capped`]), reducing and reduce-only orders included,
+    /// or when an order is already registered under its client id. A place built and then not
+    /// sent is reported as such ([`Registry::on_outcome`]), which ends the order.
+    pub fn place(&mut self, order: NewOrder) -> Result<PermittedCommand, OmsError> {
+        self.admit_placement(&order)?;
+        self.insert(order.clone())?;
+        Ok(PermittedCommand::admitted(VenueCommand::Place(order)))
+    }
+
+    /// Builds a batch of places of one market from the items the pre-trade caps admit, in the
+    /// order given, each judged with the earlier items admitted counted as PendingNew; the
+    /// items admitted are registered PendingNew, and each item refused, by a cap or for a
+    /// client id already registered (an earlier item's included), is never built and listed
+    /// in [`PlacePlan::refused`]. Refused whole, nothing registered, when the items name more
+    /// than one market. An empty batch, or one whose every item is refused, builds nothing.
+    pub fn place_batch(&mut self, orders: Vec<NewOrder>) -> Result<PlacePlan, OmsError> {
+        if let Some(first) = orders.first()
+            && orders.iter().any(|o| o.inst != first.inst)
+        {
+            return Err(OmsError::MixedMarkets);
+        }
+        let mut plan = PlacePlan::default();
+        let mut admitted = Vec::new();
+        for order in orders {
+            let cid = order.cid;
+            match self
+                .admit_placement(&order)
+                .and_then(|()| self.insert(order.clone()).map(|_| ()))
+            {
+                Ok(()) => admitted.push(order),
+                Err(refusal) => plan.refused.push((cid, refusal)),
+            }
+        }
+        if !admitted.is_empty() {
+            plan.command = Some(PermittedCommand::admitted(VenueCommand::PlaceBatch(
+                admitted,
+            )));
+        }
+        Ok(plan)
+    }
+
+    fn admit_placement(&self, order: &NewOrder) -> Result<(), OmsError> {
+        if self.orders.contains_key(&order.cid) {
+            return Err(OmsError::DuplicateCid(order.cid));
+        }
+        self.exposure(order.inst, order.side, None)
+            .admit(order.qty)
+            .map_err(OmsError::Capped)
+    }
+
+    /// Registers a placement about to be sent, PendingNew, without building its command (an
+    /// order learnt otherwise, say). Refused when an order is already registered under its
+    /// client id. A place is built only through [`Registry::place`] or
+    /// [`Registry::place_batch`], under the pre-trade caps.
     pub fn insert(&mut self, placed: NewOrder) -> Result<&OrderRecord, OmsError> {
         let cid = placed.cid;
         match self.orders.entry(cid) {
@@ -320,6 +436,16 @@ impl Registry {
         Ok(rec.amend_sent(px, qty, rpc, now))
     }
 
+    /// Releases the amend of `cid` built ([`Live::amend`]) and never handed to a gateway (its
+    /// authorization refused, or the command dropped): it no longer counts as resting, and
+    /// the order may be amended again. False when no amend was built and not reported sent. An
+    /// amend a gateway took is reported with [`Registry::amend_sent`] instead, under the
+    /// request the gateway gave it, and its outcome resolves it, a not-sent one included.
+    pub fn amend_not_submitted(&mut self, cid: ClientOrderId) -> Result<bool, OmsError> {
+        let rec = self.orders.get_mut(&cid).ok_or(OmsError::UnknownCid(cid))?;
+        Ok(rec.withdraw_built())
+    }
+
     /// Records the cancel of `cid` sent at `now` under `rpc` ([`OrderRecord::cancel_sent`]):
     /// false once the order is terminal.
     pub fn cancel_sent(
@@ -333,13 +459,21 @@ impl Registry {
     }
 
     /// The permit to amend our order `cid`: it rests (Open or PartiallyFilled) with no command
-    /// in flight and no cancel waiting for its acknowledgement.
-    pub fn live(&self, cid: ClientOrderId) -> Result<Live<'_>, PermitRefusal> {
-        let rec = self
+    /// in flight, no amend built and not yet reported sent, and no cancel waiting for its
+    /// acknowledgement. It holds the registry mutably, so nothing changes the orders the
+    /// amend is judged against until it is built.
+    pub fn live(&mut self, cid: ClientOrderId) -> Result<Live<'_>, PermitRefusal> {
+        let placed = self
             .orders
             .get(&cid)
-            .ok_or(PermitRefusal::UnknownCid(cid))?;
-        Live::check(rec)
+            .ok_or(PermitRefusal::UnknownCid(cid))?
+            .placed();
+        let exposure = self.exposure(placed.inst, placed.side, Some(cid));
+        let rec = self
+            .orders
+            .get_mut(&cid)
+            .expect("the order was found above");
+        Live::check(rec, exposure)
     }
 
     /// The permit to cancel our order `cid`: it is not terminal (PendingNew, Unknown and an
