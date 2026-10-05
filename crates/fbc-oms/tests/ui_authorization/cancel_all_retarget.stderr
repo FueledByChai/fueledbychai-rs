@@ -1,0 +1,11 @@
+error[E0616]: field `cmd` of struct `Authorization` is private
+ --> tests/ui_authorization/cancel_all_retarget.rs:7:10
+  |
+7 |     auth.cmd = VenueCommand::CancelAll(CancelScope::Instrument(inst));
+  |          ^^^ private field
+
+error[E0616]: field `generation` of struct `Authorization` is private
+ --> tests/ui_authorization/cancel_all_retarget.rs:8:10
+  |
+8 |     auth.generation = other.generation();
+  |          ^^^^^^^^^^ private field

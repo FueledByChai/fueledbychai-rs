@@ -477,6 +477,7 @@ version = "0.0.1"
 dependencies = [
  "fbc-core",
  "proptest",
+ "trybuild",
 ]
 
 [[package]]

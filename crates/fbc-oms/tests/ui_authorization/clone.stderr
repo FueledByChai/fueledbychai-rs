@@ -1,0 +1,19 @@
+error[E0308]: mismatched types
+ --> tests/ui_authorization/clone.rs:5:6
+  |
+5 |     (auth.clone(), Clone::clone(auth))
+  |      ^^^^^^^^^^^^ expected `Authorization`, found `&Authorization`
+  |
+note: `Authorization` does not implement `Clone`, so `&Authorization` was cloned instead
+ --> tests/ui_authorization/clone.rs:5:6
+  |
+5 |     (auth.clone(), Clone::clone(auth))
+  |      ^^^^
+
+error[E0277]: the trait bound `Authorization: Clone` is not satisfied
+ --> tests/ui_authorization/clone.rs:5:33
+  |
+5 |     (auth.clone(), Clone::clone(auth))
+  |                    ------------ ^^^^ the trait `Clone` is not implemented for `Authorization`
+  |                    |
+  |                    required by a bound introduced by this call

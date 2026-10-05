@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use fbc_core::{
-    AccountKey, AccountSummary, AckLevel, AckModel, AliasTable, AssetKey, AssetSym, Cadence,
+    AccountSummary, AckLevel, AckModel, AliasTable, AssetKey, AssetSym, Cadence,
     CancelOnDisconnect, Channel, Charset, CidMatch, CidMint, ClientIdFormat, ClientOrderId,
     ConfigError, ConnKey, ConnTopology, CtxCall, DecodeError, DecodeScope, Effect, Effects,
     EncodeCtx, EncodeReceipt, Encoding, EndpointPlan, Envelope, ExchNs, ExchTsKind, ExecCaps,
@@ -48,14 +48,14 @@ use fbc_core::{
     InstrumentKind, InstrumentResolver, InstrumentSpec, InstrumentSpecDraft, ItemRef, Keepalive,
     KeepaliveKind, LimitScope, Liquidity3, Listing, Lots, Lvl, MatchingCaps, MdCaps, MdCodec,
     MdEvent, MdSink, MdTransport, Money, MonoNs, Namespace, NamespaceLease, NewOrder, NonceBlock,
-    NonceScope, NotSentReason, OpKind, OrderCaps, OrderGateway, OrderKind, OrderKindTag,
-    OrderingKey, PathEdge, PathMark, PathRecorder, PathStage, PathStamps, PlaceWire, PlanError,
-    PriceGrid, PxExact, RateCharge, RateLimit, RawFrame, Readiness, ResolveError, RpcCall, RpcId,
-    SeqDomain, Side, Sig, SignedLots, SizeStep, SnapshotSource, SpecTable, Stamp, StpScope,
-    StreamId, SubmitHandle, SubmitOutcome, Subscription, Support, SymbolError, TagSet, Ticks,
-    TifTag, TimerTag, TouchSourceCaps, TouchSourceId, TradeCaps, TradingStatus, TrafficClass,
-    UnderlyingId, VenueCaps, VenueCommand, VenueConfig, VenueError, VenueFactory, VenueFeeSign,
-    VenueId, VenueMeta, VenueOrderSnapshot, VenueOrderState, Via, WallNs, WireSlice, WireUrl,
+    NonceScope, NotSentReason, OpKind, OrderCaps, OrderKind, OrderKindTag, OrderingKey, PathEdge,
+    PathMark, PathRecorder, PathStage, PathStamps, PlaceWire, PlanError, PriceGrid, PxExact,
+    RateCharge, RateLimit, RawFrame, Readiness, ResolveError, RpcCall, RpcId, SeqDomain, Side, Sig,
+    SignedLots, SizeStep, SnapshotSource, SpecTable, Stamp, StpScope, StreamId, SubmitHandle,
+    SubmitOutcome, Subscription, Support, SymbolError, TagSet, Ticks, TifTag, TimerTag,
+    TouchSourceCaps, TouchSourceId, TradeCaps, TradingStatus, TrafficClass, UnderlyingId,
+    VenueCaps, VenueCommand, VenueConfig, VenueError, VenueFactory, VenueFeeSign, VenueId,
+    VenueMeta, VenueOrderSnapshot, VenueOrderState, Via, WallNs, WireSlice, WireUrl,
     common_symbol_parts, decode_cid, dispatch, dispatch_market_data, encode_cid,
 };
 use fbc_core::{ConfigScope, FieldUnit, Header, Secret, Secrets};
@@ -1395,17 +1395,18 @@ fn encode_marks_its_signer_call_and_its_bytes_are_the_same_whatever_the_stamps_r
 
 /// A gateway over the toy's codec, as a live one is without its sockets: it marks the encode
 /// stage around the codec's call, hands the codec the same stamps to mark its signer call, and
-/// keeps what the codec asked to send.
+/// keeps what the codec asked to send. A real gateway implements `fbc-oms`'s `OrderGateway`,
+/// whose submit takes the command inside an authorization only `fbc-oms` issues (decision
+/// 0045); this crate cannot name that type, so the toy takes the command it would hold.
 struct ToyGateway {
     codec: Box<dyn ExecCodec>,
     next_rpc: u64,
     sent: Vec<Effect>,
 }
 
-impl OrderGateway for ToyGateway {
+impl ToyGateway {
     fn submit(
         &mut self,
-        _acct: AccountKey,
         cmd: VenueCommand,
         ctx: &EncodeCtx,
         t: &mut PathStamps<'_>,
@@ -1431,12 +1432,7 @@ fn submit_threads_path_stamps_through_encode_to_the_signer_call() {
     let cmd = VenueCommand::Place(order(mint()));
     let at = ctx(1_759_363_200_300_000_000, &[9_000]);
     let mut tape = Tape::new(1_000, 10);
-    let handle = gateway.submit(
-        AccountKey::new(1),
-        cmd.clone(),
-        &at,
-        &mut PathStamps::new(&mut tape),
-    );
+    let handle = gateway.submit(cmd.clone(), &at, &mut PathStamps::new(&mut tape));
 
     // The sign stage nests inside the encode stage, every mark at the recorder's own time.
     let (encode_start, encode_end) = (

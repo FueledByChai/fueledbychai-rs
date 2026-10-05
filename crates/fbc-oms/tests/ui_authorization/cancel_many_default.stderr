@@ -1,0 +1,5 @@
+error[E0599]: no associated function or constant named `default` found for struct `Authorization` in the current scope
+ --> tests/ui_authorization/cancel_many_default.rs:5:20
+  |
+5 |     Authorization::default()
+  |                    ^^^^^^^ associated function or constant not found in `Authorization`

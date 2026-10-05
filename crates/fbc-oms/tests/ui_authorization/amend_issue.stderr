@@ -1,0 +1,14 @@
+error[E0624]: associated function `issue` is private
+ --> tests/ui_authorization/amend_issue.rs:7:20
+  |
+7 |       Authorization::issue(acct, VenueCommand::Amend(amend), &Default::default()).unwrap()
+  |                      ^^^^^ private associated function
+  |
+ ::: src/authorize.rs
+  |
+  | /     pub(crate) fn issue(
+  | |         acct: AccountKey,
+  | |         cmd: VenueCommand,
+  | |         generations: &Generations,
+  | |     ) -> Result<Authorization, IssueRefusal> {
+  | |____________________________________________- private associated function defined here

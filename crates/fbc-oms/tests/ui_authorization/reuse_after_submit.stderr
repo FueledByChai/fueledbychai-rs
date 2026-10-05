@@ -1,0 +1,10 @@
+error[E0382]: use of moved value: `auth`
+  --> tests/ui_authorization/reuse_after_submit.rs:12:20
+   |
+ 7 |     auth: Authorization,
+   |     ---- move occurs because `auth` has type `Authorization`, which does not implement the `Copy` trait
+...
+11 |     gateway.submit(auth, ctx, t);
+   |                    ---- value moved here
+12 |     gateway.submit(auth, ctx, t);
+   |                    ^^^^ value used here after move

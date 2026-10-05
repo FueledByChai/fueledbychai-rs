@@ -4,15 +4,14 @@
 //! The latency budget splits an order's path into stages: the encode, each signer call inside
 //! it, and the socket write. The runtime times them, but a codec may read no clock (0002), so a
 //! codec marks a stage boundary without learning when it was: [`ExecCodec::encode`] and
-//! [`OrderGateway::submit`] take a [`PathStamps`], a write-only handle on a [`PathRecorder`] the
-//! runtime implements. At each [`mark`](PathRecorder::mark) the runtime reads its own clock and
+//! `fbc-oms`'s `OrderGateway::submit` (0045) take a [`PathStamps`], a write-only handle on a
+//! [`PathRecorder`] the runtime implements. At each [`mark`](PathRecorder::mark) the runtime reads its own clock and
 //! keeps the instant with the command's record; the call returns nothing, and nothing in this
 //! crate reads a clock, so the codec never sees a value and its bytes cannot depend on one.
 //! Replay hands the same codec a recorder of its own, or [`PathStamps::off`], and gets the same
 //! bytes whatever was recorded.
 //!
 //! [`ExecCodec::encode`]: crate::ExecCodec::encode
-//! [`OrderGateway::submit`]: crate::OrderGateway::submit
 
 use core::fmt;
 

@@ -47,3 +47,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0042](0042-a-codec-reports-a-subscription-the-venue-refused-as-the-feed.md) A codec reports a subscription the venue refused as the feed's health Refused, naming its instrument and feed, and asks for nothing to retry it — accepted
 - [0043](0043-credentials-reach-a-codec-as-secrets-zeroed-on-drop-with-zer.md) Credentials reach a codec as Secrets, zeroed on drop with zeroize 1.9.0 pinned, and test_connection is an HTTP plan, augmenting 0014 — accepted
 - [0044](0044-the-conformance-toy-venue-in-fbc-conformance-stands-in-for-b.md) The conformance toy venue in fbc-conformance stands in for BT-502's toy venue from BT-102 — accepted
+- [0045](0045-order-entry-reaches-a-gateway-only-with-an-authorization-fbc.md) Order entry reaches a gateway only with an authorization fbc-oms issues, and the gateway traits live in fbc-oms, refining design 4.8 — accepted

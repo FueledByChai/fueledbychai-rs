@@ -1,0 +1,19 @@
+error[E0599]: no variant, associated function, or constant named `Place` found for enum `ControlCommand` in the current scope
+  --> tests/ui_authorization/control_carries_no_order.rs:14:50
+   |
+14 |     gateway.submit_control(acct, ControlCommand::Place(order), ctx, t);
+   |                                                  ^^^^^ variant, associated function, or constant not found in `ControlCommand`
+
+error[E0599]: no variant, associated function, or constant named `Cancel` found for enum `ControlCommand` in the current scope
+  --> tests/ui_authorization/control_carries_no_order.rs:15:50
+   |
+15 |     gateway.submit_control(acct, ControlCommand::Cancel(cancel), ctx, t);
+   |                                                  ^^^^^^ variant, associated function, or constant not found in `ControlCommand`
+
+error[E0277]: the trait bound `ControlCommand: From<VenueCommand>` is not satisfied
+  --> tests/ui_authorization/control_carries_no_order.rs:16:57
+   |
+16 |     gateway.submit_control(acct, VenueCommand::FeeQuery.into(), ctx, t);
+   |                                                         ^^^^ the trait `From<VenueCommand>` is not implemented for `ControlCommand`
+   |
+   = note: required for `VenueCommand` to implement `Into<ControlCommand>`

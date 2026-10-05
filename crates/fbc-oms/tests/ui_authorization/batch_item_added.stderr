@@ -1,0 +1,5 @@
+error[E0596]: cannot borrow `*items` as mutable, as it is behind a `&` reference
+ --> tests/ui_authorization/batch_item_added.rs:8:9
+  |
+8 |         items.push(extra);
+  |         ^^^^^ `items` is a `&` reference, so it cannot be borrowed as mutable
