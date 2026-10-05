@@ -62,11 +62,24 @@
 //! [`PermittedCommand`], from which alone an amend or a cancel is authorized (`tests/permits.rs`,
 //! and `tests/ui_permits/` for the compile-fail half).
 //!
-//! Not here yet: the pre-trade caps (FBC-2e4), the market states (FBC-c4v), issuing an
-//! authorization after them and its check at submit (FBC-afd), and the Unknown ladder.
+//! The Unknown ladder (decision 0005's I5 and I9) resolves an order whose fate the OMS does not
+//! know: an Unknown order, an amend or cancel unanswered or not known to the venue, or a
+//! command in flight past the consumer's intent timeout ([`LadderConfig`]). On the consumer's
+//! journaled timer, [`Registry::ladder`] queries it once by a reference the venue's queries
+//! declare, asks for resyncs while the query is inconclusive, and tombstone-cancels it by
+//! client id after the configured maximum; [`Registry::on_query_answer`] and
+//! [`Registry::on_resync`] resolve it from what the venue shows, and a trustworthy snapshot
+//! source that misses it the configured number of times in a row, past its sent time and the
+//! settle time, ends it [`TerminalKind::Lost`], counted ([`Registry::lost`]). While on the
+//! ladder it counts as fully resting and gets no [`Live`] permit; nothing places or amends it
+//! again (`tests/ladder.rs`).
+//!
+//! Not here yet: the pre-trade caps (FBC-2e4), the market states (FBC-c4v), and issuing an
+//! authorization after them and its check at submit (FBC-afd).
 
 mod gateway;
 mod grant;
+mod ladder;
 mod ledger;
 mod permit;
 mod record;
@@ -80,6 +93,7 @@ mod common;
 
 pub use gateway::{ControlCommand, ManagedGateway, OrderGateway};
 pub use grant::{Authorization, StateGeneration};
+pub use ladder::{LadderConfig, LadderConfigError, LadderPlan, LadderResolution, ResyncApplied};
 pub use ledger::{
     AcceptedFill, Admission, FillLedger, FillTime, Horizon, LedgerConfig, LedgerConfigError,
     ReplayCounts,
@@ -88,7 +102,7 @@ pub use permit::{
     AmendRefusal, CancelChoice, CancelPlan, Cancellable, Live, PermitRefusal, PermittedCommand,
 };
 pub use record::{
-    Applied, FillApplied, Intent, OrdState, OrderKey, OrderOp, OrderRecord, OutcomeApplied,
-    TerminalKind,
+    Applied, FillApplied, Intent, LadderStep, OrdState, OrderKey, OrderOp, OrderRecord,
+    OutcomeApplied, TerminalKind,
 };
 pub use registry::{FillRouted, OmsError, Registry, Routed};

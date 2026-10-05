@@ -213,7 +213,12 @@ rather than guess.
     its order by design §4.9's reference from the venue's caps or waiting for the
     acknowledgement, a cancel-many batching only the items its batch declares a reference for,
     and no permit for a foreign-namespace or non-canonical order (I4; `tests/permits.rs`,
-    compile-fail cases in `tests/ui_permits/`); still planned: pre-trade caps and
+    compile-fail cases in `tests/ui_permits/`); the Unknown ladder (I5, I9; `src/ladder.rs`,
+    `tests/ladder.rs`), run on the consumer's timer with its `LadderConfig`: a command past the
+    intent timeout escalates, an order on the ladder is queried once by a declared reference,
+    resolved by the answer or a resync, Lost after the configured trustworthy snapshots past its
+    sent time plus the settle time, tombstone-cancelled by client id after the maximum, and
+    never placed or amended again; still planned: pre-trade caps and
     `ExecutionPlanner`; 0005, 0013), `crates/fbc-journal` (0006; it depends on
     `fbc-core`, and `hmac` and `sha2` for its keyed hashes and `zstd` for its closed segments, only: the records the runtime writes, length-prefixed in a hand-written
     little-endian format with a version, a writer of one subdirectory per UTC day with segments
