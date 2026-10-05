@@ -1765,3 +1765,140 @@ fn trades_past_an_i64_of_lots_still_explain_a_shrink() {
         "{got:?}"
     );
 }
+
+#[test]
+fn a_snapshot_that_hides_a_level_ends_what_its_trades_explain() {
+    // Codex r4182678488: a replacement snapshot whose depth no longer reaches a level cannot
+    // compare its sizes, but it still ends what the trades printed there explain, so a later
+    // shrink of that level is a cancel.
+    let mut v = Venue::new(Bracket::Optimistic);
+    v.snapshot(T0, &[(199, 6), (198, 4)], &[(201, 5)]);
+    v.send(limit(cid(), Side::Buy, 198, 2), 1, T0);
+    // Three printed at 198 before the order arrives: no queue meets them.
+    v.trade(T0 + MS, Aggressor::Seller, 198, 3);
+    v.tick(T0 + 5 * MS);
+    assert_eq!(v.answers().len(), 2);
+    // A snapshot down to 199 only: 198 is past its depth.
+    v.snapshot(T0 + 6 * MS, &[(199, 6)], &[(201, 5)]);
+    // 198 shown again at four, then three of them cancelled: one left ahead.
+    v.level(T0 + 7 * MS, BookSide::Bid, 198, 4);
+    v.level(T0 + 8 * MS, BookSide::Bid, 198, 1);
+    v.trade(T0 + 9 * MS, Aggressor::Seller, 198, 3);
+    let got = v.answers();
+    assert_eq!(
+        got.iter()
+            .filter_map(|(_, ev)| fill_of(ev))
+            .map(|f| f.1)
+            .sum::<i64>(),
+        2,
+        "{got:?}"
+    );
+}
+
+#[test]
+fn a_zero_size_placement_is_refused_and_nothing_is_placed() {
+    // Codex r4182678519: zero lots is never an order (InstrumentSpec::floor_qty), so the venue
+    // refuses it as an invalid quantity rather than report it Filled.
+    let mut v = Venue::new(Bracket::Optimistic);
+    v.snapshot(T0, &[(199, 6)], &[(201, 5)]);
+    let zero = |cid| {
+        VenueCommand::Place(NewOrder {
+            cid,
+            inst: INST,
+            side: Side::Buy,
+            qty: Lots::ZERO,
+            kind: OrderKind::Limit { px: Ticks(199) },
+            tif: TifTag::Gtc,
+            channel: Channel::Public,
+            post_only: false,
+            reduce_only: false,
+            reducing: false,
+        })
+    };
+    let order = cid();
+    v.send(zero(order), 1, T0);
+    v.tick(T0 + 5 * MS);
+    let got = v.answers();
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(rejected(&got[0].1), Some(RejectKind::InvalidQty));
+    // Nothing was placed: a cancel of it is not found.
+    v.send(cancel(OrderRef::Client(order)), 2, T0 + 6 * MS);
+    v.tick(T0 + 11 * MS);
+    let got = v.answers();
+    assert_eq!(rejected(&got[0].1), Some(RejectKind::NotFound));
+}
+
+#[test]
+fn order_events_say_only_what_the_stood_in_venue_echoes() {
+    // Codex r4182678498, r4182678504: a venue that does not echo client ids on its events, or
+    // the order's flags, says neither; the outcome of our own command still names its order.
+    let mut bare = config(Bracket::Optimistic, VenueFeeSign::PositiveIsCost, fees());
+    bare.exec.order.cid_echoed_on_events = false;
+    bare.exec.order.events_echo_flags = false;
+    let mut v = Venue::with(bare);
+    v.snapshot(T0, &[(198, 1)], &[(201, 2)]);
+    let order = cid();
+    v.send(
+        place(order, Side::Buy, OrderKind::Market, 1, TifTag::Ioc, false),
+        1,
+        T0,
+    );
+    v.tick(T0 + 5 * MS);
+    let got = v.answers();
+    assert_eq!(got.len(), 3, "{got:?}");
+    let ExecEvent::Outcome {
+        item: Some(ItemRef {
+            cid: Some(echo), ..
+        }),
+        ..
+    } = &got[0].1
+    else {
+        panic!("{got:?}")
+    };
+    assert_eq!(*echo, order);
+    let ExecEvent::Fill(f) = &got[1].1 else {
+        panic!("{got:?}")
+    };
+    assert_eq!(f.cid, None);
+    let ExecEvent::Order(o) = &got[2].1 else {
+        panic!("{got:?}")
+    };
+    assert_eq!((&o.cid, o.post_only, o.reduce_only), (&None, None, None));
+
+    // And a venue that echoes them says them.
+    let mut v = Venue::new(Bracket::Optimistic);
+    v.snapshot(T0, &[(198, 1)], &[(201, 2)]);
+    v.send(
+        place(order, Side::Buy, OrderKind::Market, 1, TifTag::Ioc, false),
+        1,
+        T0,
+    );
+    v.tick(T0 + 5 * MS);
+    let got = v.answers();
+    let ExecEvent::Fill(f) = &got[1].1 else {
+        panic!("{got:?}")
+    };
+    assert_eq!(f.cid, Some(CidMatch::Ours(order)));
+    let ExecEvent::Order(o) = &got[2].1 else {
+        panic!("{got:?}")
+    };
+    assert_eq!(
+        (&o.cid, o.post_only, o.reduce_only),
+        (&Some(CidMatch::Ours(order)), Some(false), Some(false))
+    );
+}
+
+#[test]
+fn a_two_phase_venue_is_not_stood_in_for_yet() {
+    // Codex r4182678509: the engine accepts in one phase, so for a venue that acknowledges in
+    // two the codec sends no placement rather than report a provisional acceptance as final
+    // (FBC-zr1 models both phases). A cancel, which the ack model does not govern, still goes.
+    let mut two = config(Bracket::Optimistic, VenueFeeSign::PositiveIsCost, fees());
+    two.exec.order.ack = AckModel::TwoPhase {
+        risk_reject_window: Duration::from_millis(50),
+    };
+    let mut v = Venue::with(two);
+    let refused = v.encode(&limit(cid(), Side::Buy, 199, 1), 1, T0);
+    assert_eq!(refused.err(), Some(NotSentReason::Unsupported));
+    assert!(v.encode(&cancel(OrderRef::Client(cid())), 2, T0).is_ok());
+}
