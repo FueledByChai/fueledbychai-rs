@@ -1,5 +1,5 @@
 //! SimVenue's codec: an [`ExecCodec`] like any venue's (decision 0014, unchanged), whose
-//! stream is the simulated one its [`SimEngine`](crate::SimEngine) reads (decision 0043).
+//! stream is the simulated one its [`SimEngine`](crate::SimEngine) reads (decision 0044).
 
 use core::time::Duration;
 use std::sync::Arc;
@@ -23,7 +23,7 @@ use crate::wire::{Cancel, Command, Place, Refusal, Reply, Sent, SimState, Target
 /// through [`DecodeScope`] only, so venue ids, fill ids and fees are built as a real codec
 /// builds them (0004), saying on its events only what the stood-in venue echoes. It refuses
 /// what the stood-in venue's [`OrderCaps`] do not offer, RPI orders, which the engine cannot
-/// fill yet (FBC-njk, decision 0043), and placements for a venue whose events the engine
+/// fill yet (FBC-njk, decision 0044), and placements for a venue whose events the engine
 /// cannot say yet: two-phase acknowledgement (FBC-zr1), an ordering key other than a venue
 /// sequence, realized values on fills, or fills derived from order status (FBC-938), a venue
 /// with a speed bump (FBC-7y8), or one whose fills replay on reconnect (FBC-3q6); amends,
