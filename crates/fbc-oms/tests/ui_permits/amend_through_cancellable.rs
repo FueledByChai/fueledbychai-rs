@@ -4,7 +4,7 @@ use fbc_core::{Lots, OrderCaps, Ticks};
 use fbc_oms::Registry;
 
 fn amend(reg: &mut Registry, cid: fbc_core::ClientOrderId, caps: &OrderCaps, qty: Lots) {
-    let _ = reg.cancellable(cid).unwrap().amend(caps, Ticks(1), qty);
+    let _ = reg.cancellable(cid).unwrap().amend(caps, Ticks(1), qty, false);
 }
 
 fn main() {}

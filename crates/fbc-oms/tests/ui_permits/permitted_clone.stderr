@@ -1,0 +1,5 @@
+error[E0599]: no method named `clone` found for struct `PermittedCommand` in the current scope
+ --> tests/ui_permits/permitted_clone.rs:6:10
+  |
+6 |     (cmd.clone(), cmd)
+  |          ^^^^^ method not found in `PermittedCommand`

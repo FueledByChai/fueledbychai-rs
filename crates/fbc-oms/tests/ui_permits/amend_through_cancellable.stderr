@@ -1,5 +1,5 @@
 error[E0599]: no method named `amend` found for struct `Cancellable<'r>` in the current scope
  --> tests/ui_permits/amend_through_cancellable.rs:7:43
   |
-7 |     let _ = reg.cancellable(cid).unwrap().amend(caps, Ticks(1), qty);
+7 |     let _ = reg.cancellable(cid).unwrap().amend(caps, Ticks(1), qty, false);
   |                                           ^^^^^ method not found in `Cancellable<'_>`

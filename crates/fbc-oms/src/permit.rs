@@ -55,6 +55,12 @@ pub enum PermitRefusal {
     /// An order the venue shows that the registry does not hold, under our namespace's client
     /// id or none: an orphan, which only 0005's I7 cancels, by resync (not modelled here).
     Untracked,
+    /// The venue shows our client id `cid` with a venue id our order `by_vid` had: they name
+    /// different orders, so neither is cancelled on its word.
+    Conflicting {
+        cid: ClientOrderId,
+        by_vid: ClientOrderId,
+    },
 }
 
 /// Why a [`Live`] permit builds no amend.
@@ -80,8 +86,9 @@ pub enum AmendRefusal {
 
 /// A venue command built from a permit, every field from the order's record: an amend, a
 /// cancel or a cancel-many of one market. Only this crate builds one; it can be read, not
-/// edited, and an authorization for an amend or a cancel is issued only from one (0045).
-#[derive(Clone, Eq, PartialEq, Debug)]
+/// edited, and an authorization for an amend or a cancel is issued only from one (0045). It
+/// has no `Clone`: each permit's command is authorized once.
+#[derive(Eq, PartialEq, Debug)]
 pub struct PermittedCommand {
     cmd: VenueCommand,
 }
@@ -99,7 +106,7 @@ impl PermittedCommand {
 }
 
 /// What a [`Cancellable`] permit built.
-#[derive(Clone, Eq, PartialEq, Debug)]
+#[derive(Eq, PartialEq, Debug)]
 pub enum CancelChoice {
     /// A cancel naming the order by the reference chosen.
     Send(PermittedCommand),
@@ -110,7 +117,7 @@ pub enum CancelChoice {
 }
 
 /// What [`Registry::cancel_many`](crate::Registry::cancel_many) built.
-#[derive(Clone, Eq, PartialEq, Debug, Default)]
+#[derive(Eq, PartialEq, Debug, Default)]
 pub struct CancelPlan {
     /// The commands, in order: a cancel-many per market and per `max_items` of the items
     /// whose reference the venue's batch cancel declares, then a single cancel for each item
@@ -155,13 +162,16 @@ impl<'r> Live<'r> {
     /// (no amend at all, a market order, a partly filled order where the venue cannot amend
     /// one, a price or total the venue cannot change, nothing left to rest, or no reference
     /// the amend can name). The amend carries the order's filled quantity
-    /// ([`OrderRecord::filled`]) as `cum_filled` (0014 item 5), and is never classified as
-    /// reducing here: the venue's reduce-only flag is the placement's.
+    /// ([`OrderRecord::filled`]) as `cum_filled` (0014 item 5), the venue's reduce-only flag
+    /// of the placement, and `reducing`, the caller's classification of the amended order as
+    /// one that can only reduce the position, as on [`NewOrder::reducing`](fbc_core::NewOrder):
+    /// it chooses the traffic class only and exempts the amend from no check (0013 rule 2).
     pub fn amend(
         self,
         caps: &OrderCaps,
         px: Ticks,
         qty: Lots,
+        reducing: bool,
     ) -> Result<PermittedCommand, AmendRefusal> {
         let rec = self.rec;
         let amend_caps = caps.amend.as_ref().ok_or(AmendRefusal::NotAmendable)?;
@@ -190,7 +200,7 @@ impl<'r> Live<'r> {
             channel: placed.channel,
             post_only: placed.post_only,
             reduce_only: placed.reduce_only,
-            reducing: false,
+            reducing,
             px,
             qty,
             cum_filled: filled,
@@ -261,15 +271,24 @@ impl<'r> Cancellable<'r> {
 /// The cancel of `rec`, naming it by the first of `declared` the command carries, as a codec
 /// chooses it ([`CancelOrder::reference`]); `None` when it carries none of them, or only the
 /// client id while the order is not acknowledged and the venue takes no cancel before the
-/// acknowledgement.
+/// acknowledgement. The command carries the record's venue id unless an amend not yet
+/// confirmed may have replaced it, on a venue whose amend does not keep the id.
 pub(crate) fn cancel_of(
     rec: &OrderRecord,
     caps: &OrderCaps,
     declared: TagSet<fbc_core::RefKind>,
 ) -> Option<CancelOrder> {
     let placed = rec.placed();
+    // On a venue whose amend gives the order a new id, an amend not yet confirmed may have
+    // retired the id the record holds: the cancel names the order without it.
+    let retiring = caps.amend.is_some_and(|a| !a.keeps_venue_id) && rec.amend_unconfirmed();
+    let target = if retiring {
+        OrderRef::Client(rec.cid())
+    } else {
+        rec.order_ref()
+    };
     let cancel = CancelOrder {
-        target: rec.order_ref(),
+        target,
         inst: placed.inst,
         side: placed.side,
         placement_nonce: rec.placement_nonce(),
