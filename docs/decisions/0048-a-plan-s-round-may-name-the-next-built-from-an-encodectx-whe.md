@@ -78,6 +78,10 @@ This augments 0035 and 0043 (it supersedes nothing there):
      `GET /account` with the token's header. The summary is `account`, and `account_value`
      in `settlement_asset` truncated toward zero at a nanounit. The signer is dropped, and its
      key zeroed, once the login is built.
+   - The factory declares the REST limits these requests are charged against (Codex
+     r4185685704), from Paradex's "API Rate Limits" table: the login (`Rest`) 600 per minute
+     per IP; private GETs (`Query`) 120 per second and 600 per minute per account; and 1500
+     per minute per IP across both.
 
 ## Alternatives
 

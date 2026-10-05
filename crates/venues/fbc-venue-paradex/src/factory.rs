@@ -205,6 +205,12 @@ pub fn caps() -> VenueCaps {
         per: Duration::from_secs(secs),
         units,
     };
+    let limit = |scope, ops: &[OpKind], secs, units| RateLimit {
+        scope,
+        ops: TagSet::of(ops),
+        per: Duration::from_secs(secs),
+        units,
+    };
     VenueCaps {
         // Order entry is BT-402's (decision 0015: no order or fill claims until then).
         exec: None,
@@ -282,7 +288,21 @@ pub fn caps() -> VenueCaps {
         },
         // "Websocket Rate Limits": "a maximum of 20 connections per second or 600 connections
         // per minute per IP address". No limit on subscribe frames is documented.
-        limits: vec![per(1, 20), per(60, 600)],
+        limits: vec![
+            per(1, 20),
+            per(60, 600),
+            // "API Rate Limits": "POST /auth | 600 req/m | IP address". The login (auth.rs)
+            // is this adapter's only `Rest` request.
+            limit(LimitScope::Ip, &[OpKind::Rest], 60, 600),
+            // "GET /* | 120 req/s OR 600 req/m | Account": the account read (auth.rs) and
+            // every later private GET charge `Query`. Both windows are declared.
+            limit(LimitScope::Account, &[OpKind::Query], 1, 120),
+            limit(LimitScope::Account, &[OpKind::Query], 60, 600),
+            // Public requests default to 1500 req/m per IP, and private ones are "also
+            // subject to an additional IP-based rate limit of 1500 req/m across all accounts
+            // from the same IP address".
+            limit(LimitScope::Ip, &[OpKind::Rest, OpKind::Query], 60, 1500),
+        ],
         readiness_ceiling: Readiness::Record,
     }
 }

@@ -178,18 +178,27 @@ fn the_factory_declares_market_data_only_with_its_cited_limits() {
             max_subscriptions: None
         }
     );
-    // "20 connections per second or 600 connections per minute per IP address".
-    let connects: Vec<_> = declared
+    // "20 connections per second or 600 connections per minute per IP address"; the REST
+    // table (Codex r4185685704): POST /auth 600 req/m per IP, private GET /* 120 req/s or
+    // 600 req/m per account, and 1500 req/m per IP across public and private requests.
+    let limits: Vec<_> = declared
         .limits
         .iter()
         .map(|l| (l.scope, l.ops, l.per, l.units))
         .collect();
     let connect = TagSet::of(&[OpKind::Connect]);
+    let login = TagSet::of(&[OpKind::Rest]);
+    let query = TagSet::of(&[OpKind::Query]);
+    let rest = TagSet::of(&[OpKind::Rest, OpKind::Query]);
     assert_eq!(
-        connects,
+        limits,
         [
             (LimitScope::Ip, connect, Duration::from_secs(1), 20),
             (LimitScope::Ip, connect, Duration::from_secs(60), 600),
+            (LimitScope::Ip, login, Duration::from_secs(60), 600),
+            (LimitScope::Account, query, Duration::from_secs(1), 120),
+            (LimitScope::Account, query, Duration::from_secs(60), 600),
+            (LimitScope::Ip, rest, Duration::from_secs(60), 1500),
         ]
     );
 }
