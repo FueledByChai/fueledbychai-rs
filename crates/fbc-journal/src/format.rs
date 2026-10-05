@@ -35,9 +35,9 @@
 use core::ops::Range;
 
 use fbc_core::{
-    BookId, ConnKey, EncodeCtx, Feed, Header, HttpFailure, HttpMethod, HttpTag, InstrumentId,
-    KernelRxNs, MonoNs, NonceBlock, NotSentReason, RawFrame, RpcId, Stamp, Subscription, TimerTag,
-    TouchSourceId, WallNs, WireSlice, WireUrl, check_redactions,
+    BookId, ConnKey, EncodeCtx, Feed, Header, HeaderMark, HttpFailure, HttpMethod, HttpTag,
+    InstrumentId, KernelRxNs, MonoNs, NonceBlock, NotSentReason, RawFrame, RpcId, Stamp,
+    Subscription, TimerTag, TouchSourceId, WallNs, WireSlice, WireUrl, check_redactions,
 };
 
 use crate::JournalError;
@@ -195,12 +195,16 @@ fn encode_body(
     // A borrowed record goes through the same field writers as the owned record it stands for.
     let record = match record {
         RecordRef::Owned(record) => record,
-        RecordRef::Inbound { stamp, frame } => {
+        RecordRef::Inbound {
+            stamp,
+            frame,
+            redact,
+        } => {
             let opcode = match frame {
                 RawFrame::Text(_) => Opcode::Text,
                 RawFrame::Binary(_) => Opcode::Binary,
             };
-            e.inbound(&stamp, opcode, frame.bytes(), &[])?;
+            e.inbound(&stamp, opcode, frame.bytes(), redact)?;
             return e.within();
         }
         RecordRef::HttpRequest {
@@ -225,18 +229,26 @@ fn encode_body(
             return e.within();
         }
         RecordRef::HttpResult { stamp, tag, result } => {
+            // Marks that do not name the headers in ascending order cannot be the codec's
+            // checked spans (`InboundSpans::check`): refused, as spans that do not fit are.
+            if let Ok(r) = &result
+                && !marks_fit(r.marks, r.headers.len())
+            {
+                return Err(JournalError::Unencodable("inbound header marks"));
+            }
             let result = result.map(|r| {
-                let headers = r.headers.iter();
-                let headers = headers.map(|(name, raw)| {
-                    (
-                        *name,
-                        Value::Lossy(raw),
-                        Hide::value_if(is_secret_header(name)),
-                    )
+                // Ascending, as just checked: each header takes the next mark if it names it.
+                let mut marks = r.marks.iter().peekable();
+                let headers = r.headers.iter().enumerate().map(move |(at, (name, raw))| {
+                    let mark = marks.next_if(|(m, _)| *m as usize == at);
+                    let hide = match mark {
+                        Some((_, HeaderMark::NameAndValue)) => Hide::NameAndValue,
+                        Some((_, HeaderMark::Value)) => Hide::Value,
+                        None => Hide::value_if(is_secret_header(name)),
+                    };
+                    (*name, Value::Lossy(raw), hide)
                 });
-                // A borrowed response carries no spans: a codec names them (decision 0028)
-                // only once the session asks it (FBC-s69).
-                (r.status, headers, (r.body, &[][..]))
+                (r.status, headers, (r.body, r.body_redact))
             });
             e.http_result(&stamp, tag, result)?;
             return e.within();
@@ -499,6 +511,18 @@ impl Enc<'_> {
         self.subs(add)?;
         self.subs(remove)
     }
+}
+
+/// Whether `marks` name headers of a response with `headers` of them, in strictly ascending
+/// order, as [`InboundSpans::check`](fbc_core::InboundSpans::check) holds a codec's to.
+fn marks_fit(marks: &[(u32, HeaderMark)], headers: usize) -> bool {
+    let mut next = 0;
+    marks.iter().all(|&(at, _)| {
+        let at = at as usize;
+        let fits = at >= next && at < headers;
+        next = at + 1;
+        fits
+    })
 }
 
 /// Journaled headers as (name, value, what of it is secret).
@@ -2204,6 +2228,28 @@ mod tests {
             spans
         }
 
+        /// Spans a codec could name in inbound `bytes`: [`Gen::spans`] less any that would
+        /// split a character where the bytes are UTF-8 ([`check_redactions`]).
+        fn inbound_spans(&mut self, bytes: &[u8]) -> Vec<Range<u32>> {
+            let spans = self.spans(bytes.len()).into_iter();
+            spans
+                .filter(|s| check_redactions(bytes, core::slice::from_ref(s)).is_ok())
+                .collect()
+        }
+
+        /// Marks on some of `n` response headers, in ascending order, of either kind.
+        fn marks(&mut self, n: usize) -> Vec<(u32, HeaderMark)> {
+            let mut marks = Vec::new();
+            for at in 0..n as u32 {
+                match self.below(3) {
+                    0 => marks.push((at, HeaderMark::Value)),
+                    1 => marks.push((at, HeaderMark::NameAndValue)),
+                    _ => {}
+                }
+            }
+            marks
+        }
+
         fn slice(&mut self) -> WireSlice {
             let bytes = self.any_bytes();
             let spans = self.spans(bytes.len());
@@ -2356,19 +2402,25 @@ mod tests {
     /// kind, borrowed or owned: with redacted spans, secret and plain headers (secret by name
     /// or by mark), lossily read header values, binary frames that are not UTF-8, and empty and
     /// large payloads. A borrowed record has no size of its own to drift from its encoding.
+    /// FBC-s69: so is a borrowed inbound frame or response carrying the spans its codec named
+    /// (body spans, headers marked by value or by name and value), as the session offers them.
     #[test]
     fn every_record_is_offered_at_exactly_the_length_it_encodes_to() {
         let mut g = Gen(0x9e37_79b9_7f4a_7c15);
         for _ in 0..400 {
             let stamp = g.stamp();
             let (text, binary) = (g.any_text(), g.any_bytes());
+            let (text_spans, binary_spans) =
+                (g.inbound_spans(text.as_bytes()), g.inbound_spans(&binary));
             check(RecordRef::Inbound {
                 stamp,
                 frame: RawFrame::Text(&text),
+                redact: &text_spans,
             });
             check(RecordRef::Inbound {
                 stamp,
                 frame: RawFrame::Binary(&binary),
+                redact: &binary_spans,
             });
             let req = g.request();
             check(RecordRef::HttpRequest {
@@ -2381,6 +2433,7 @@ mod tests {
             let headers = g.response_headers();
             let pairs: Vec<(&str, &[u8])> = headers.iter().map(|(n, v)| (*n, &v[..])).collect();
             let body = g.any_bytes();
+            let (marks, body_redact) = (g.marks(pairs.len()), g.inbound_spans(&body));
             let result = if g.below(4) == 0 {
                 Err(FAILURES[g.below(FAILURES.len())])
             } else {
@@ -2388,6 +2441,8 @@ mod tests {
                     status: g.next() as u16,
                     headers: &pairs,
                     body: &body,
+                    marks: &marks,
+                    body_redact: &body_redact,
                 })
             };
             check(RecordRef::HttpResult {
@@ -2439,6 +2494,8 @@ mod tests {
                     status: 200,
                     headers: &pairs,
                     body: b"",
+                    marks: &[],
+                    body_redact: &[],
                 }),
             },
         ];
@@ -2454,5 +2511,58 @@ mod tests {
                 Err(JournalError::TooLarge)
             ));
         }
+    }
+
+    /// FBC-s69: a borrowed response whose header marks do not name its headers in ascending
+    /// order, or a borrowed frame or body whose spans do not fit it, is refused unwritten, as
+    /// [`InboundSpans::check`](fbc_core::InboundSpans::check) refuses such spans; the session
+    /// checks a codec's spans before it offers them, so only a defect of its own reaches this.
+    #[test]
+    fn a_borrowed_input_whose_spans_do_not_fit_it_is_refused() {
+        let pairs = [("x-a", &b"1"[..]), ("x-b", &b"2"[..])];
+        let result = |marks| RecordRef::HttpResult {
+            stamp: stamp(),
+            tag: HttpTag(1),
+            result: Ok(ResponseRef {
+                status: 200,
+                headers: &pairs,
+                body: b"ok",
+                marks,
+                body_redact: &[],
+            }),
+        };
+        let past = [(2, HeaderMark::Value)];
+        let unordered = [(1, HeaderMark::Value), (0, HeaderMark::Value)];
+        let twice = [(1, HeaderMark::Value), (1, HeaderMark::NameAndValue)];
+        let spans: Vec<_> = std::iter::once(0..9).collect();
+        let views = [
+            result(&past),
+            result(&unordered),
+            result(&twice),
+            RecordRef::Inbound {
+                stamp: stamp(),
+                frame: RawFrame::Text("short"),
+                redact: &spans,
+            },
+        ];
+        for view in views {
+            let mut out = vec![7];
+            assert!(matches!(
+                encode_within(view, &key(), &mut out, usize::MAX),
+                Err(JournalError::Unencodable(_))
+            ));
+            assert_eq!(out, [7]);
+        }
+        let mut out = Vec::new();
+        let fits = [(0, HeaderMark::NameAndValue), (1, HeaderMark::Value)];
+        encode_within(result(&fits), &key(), &mut out, usize::MAX).unwrap();
+        let Record::HttpResult { result: Ok(r), .. } = decode(&out).unwrap().0 else {
+            panic!("not a result");
+        };
+        assert!(r.headers.iter().all(|h| h.redact));
+        assert_eq!(
+            r.headers.iter().map(|h| h.redact_name).collect::<Vec<_>>(),
+            [true, false]
+        );
     }
 }

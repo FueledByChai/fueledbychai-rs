@@ -472,8 +472,14 @@ impl Record {
 pub enum RecordRef<'a> {
     /// Any record, owned.
     Owned(&'a Record),
-    /// A [`Record::Inbound`]: the frame as it came off a stream.
-    Inbound { stamp: Stamp, frame: RawFrame<'a> },
+    /// A [`Record::Inbound`]: the frame as it came off a stream, with the credential spans its
+    /// codec named in it (checked as [`InboundSpans::check`] checks them, or the record is
+    /// refused as unencodable).
+    Inbound {
+        stamp: Stamp,
+        frame: RawFrame<'a>,
+        redact: &'a [Range<u32>],
+    },
     /// A [`Record::HttpRequest`]: the request a codec asked for.
     HttpRequest {
         at: MonoNs,
@@ -498,7 +504,10 @@ pub enum RecordRef<'a> {
 }
 
 /// An HTTP response as the transport handed it, borrowed: its status, its headers in order
-/// with their values as raw bytes, and its body. The journal reads each header value lossily as
+/// with their values as raw bytes, and its body, with the credentials its codec named in it
+/// ([`InboundSpans`]): `marks`, headers by index in strictly ascending order, and `body_redact`,
+/// spans of the body (the record is refused as unencodable when either does not fit, as
+/// [`InboundSpans::check`] refuses them). The journal reads each header value lossily as
 /// UTF-8 (each invalid sequence as U+FFFD), as a codec is handed it, and only once the record
 /// is admitted. `Debug` shows the status, the number of headers and the body's length only.
 #[derive(Copy, Clone)]
@@ -506,6 +515,8 @@ pub struct ResponseRef<'a> {
     pub status: u16,
     pub headers: &'a [(&'a str, &'a [u8])],
     pub body: &'a [u8],
+    pub marks: &'a [(u32, HeaderMark)],
+    pub body_redact: &'a [Range<u32>],
 }
 
 impl fmt::Debug for ResponseRef<'_> {
@@ -519,21 +530,30 @@ impl fmt::Debug for ResponseRef<'_> {
 }
 
 impl From<&ResponseRef<'_>> for HttpResponseRec {
+    /// `resp` as journaled, its marked headers and body spans blanked. A mark that names no
+    /// header marks nothing here; the journal refuses such a borrowed record unwritten.
     fn from(resp: &ResponseRef<'_>) -> HttpResponseRec {
+        let mut headers: Vec<HeaderRec> = resp
+            .headers
+            .iter()
+            .map(|(name, value)| HeaderRec {
+                name: (*name).to_owned(),
+                value: String::from_utf8_lossy(value).into_owned(),
+                redact: false,
+                redact_name: false,
+            })
+            .collect();
+        for &(at, mark) in resp.marks {
+            if let Some(h) = headers.get_mut(at as usize) {
+                h.redact = true;
+                h.redact_name = mark == HeaderMark::NameAndValue;
+            }
+        }
         HttpResponseRec {
             status: resp.status,
-            headers: resp
-                .headers
-                .iter()
-                .map(|(name, value)| HeaderRec {
-                    name: (*name).to_owned(),
-                    value: String::from_utf8_lossy(value).into_owned(),
-                    redact: false,
-                    redact_name: false,
-                })
-                .collect(),
+            headers,
             body: Opaque(resp.body.to_vec()),
-            body_redact: Vec::new(),
+            body_redact: resp.body_redact.to_vec(),
         }
     }
 }
@@ -557,7 +577,11 @@ impl RecordRef<'_> {
     pub fn to_record(&self) -> Record {
         match *self {
             RecordRef::Owned(record) => record.clone(),
-            RecordRef::Inbound { stamp, frame } => Record::inbound(stamp, frame),
+            RecordRef::Inbound {
+                stamp,
+                frame,
+                redact,
+            } => Record::inbound_with(stamp, frame, redact.to_vec()),
             RecordRef::HttpRequest {
                 at,
                 conn,
@@ -663,12 +687,16 @@ mod tests {
                 status: 200,
                 headers: &headers,
                 body: b"live-body",
+                marks: &[],
+                body_redact: &[],
             }),
         };
         let response = ResponseRef {
             status: 200,
             headers: &headers,
             body: b"live-body",
+            marks: &[(0, HeaderMark::NameAndValue)],
+            body_redact: &[],
         };
         let shown = [
             format!("{request:?}"),

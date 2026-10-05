@@ -42,6 +42,12 @@
 //! venue's `max_conn_lifetime`, and `toy.keepalive` (`ping:<ms>` or `frame:<ms>`) gives its codec
 //! a WebSocket ping, or the frame `ka`, every `<ms>` milliseconds.
 //!
+//! FBC-s69: the codec names credentials in what it receives (`redact_inbound`): the value of
+//! every `echo=<v>` field (up to the next `|` or line end) in a frame or a response body, the
+//! value of a response's `x-echo` header, and the name and value of a response header named
+//! `x-key-<k>`. Two inputs make it a defective codec on purpose: a frame ending `|oops=1` gets a
+//! span past its end, and a response with an `x-oops` header a mark past its last header.
+//!
 //! FBC-53c: `ack|sym=A` acknowledges instrument `A`'s subscription, as a venue does. The first
 //! acknowledgement a codec reads marks `A` live and, when the configuration's `toy.snapshot`
 //! names a base URL, asks for a GET of `<base>/A` (tag: the instrument's id, timeout 1 s), whose
@@ -58,13 +64,14 @@ use fbc_core::{
     Aggressor, AssetKey, AssetSym, BookCaps, BookId, BookSide, Cadence, Channel, ConfigError,
     ConnTopology, Continuity, DecodeError, DecodeScope, Effect, Effects, Encoding, EndpointPlan,
     ExchTsKind, ExecCodec, ExecEndpoint, Feed, FeedHealth, FeedSource, FieldSpec, FundingCaps,
-    FundingSpec, Header, HttpFailure, HttpMethod, HttpPlan, HttpRequest, HttpResponse, HttpTag,
-    Inbound, InboundSpans, InstrumentId, InstrumentKind, InstrumentSpec, InstrumentSpecDraft,
-    Keepalive, KeepaliveKind, Lots, MatchingCaps, MdCaps, MdCodec, MdEvent, MdSink, MdTransport,
-    MonoNs, OpKind, PriceGrid, QueueModelQuality, RateCharge, RateLimit, RawFrame, Readiness,
-    SizeStep, SpecTable, StpScope, StreamId, Subscription, SymbolError, TagSet, Ticks, TimerTag,
-    TradeCaps, TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueConfig, VenueError,
-    VenueFactory, VenueId, VenueMeta, WallNs, WireSlice, WireUrl, dispatch_market_data,
+    FundingSpec, Header, HeaderMark, HttpFailure, HttpMethod, HttpPlan, HttpRequest, HttpResponse,
+    HttpTag, Inbound, InboundSpans, InstrumentId, InstrumentKind, InstrumentSpec,
+    InstrumentSpecDraft, Keepalive, KeepaliveKind, Lots, MatchingCaps, MdCaps, MdCodec, MdEvent,
+    MdSink, MdTransport, MonoNs, OpKind, PriceGrid, QueueModelQuality, RateCharge, RateLimit,
+    RawFrame, Readiness, SizeStep, SpecTable, StpScope, StreamId, Subscription, SymbolError,
+    TagSet, Ticks, TimerTag, TradeCaps, TradingStatus, TrafficClass, UnderlyingId, VenueCaps,
+    VenueConfig, VenueError, VenueFactory, VenueId, VenueMeta, WallNs, WireSlice, WireUrl,
+    dispatch_market_data,
 };
 use fbc_runtime::{RateLimiter, SafetyReserve};
 use rust_decimal::Decimal;
@@ -641,9 +648,51 @@ impl MdCodec for ToyMd {
         self.keepalive.clone()
     }
 
-    fn redact_inbound(&self, _input: Inbound<'_>) -> InboundSpans {
-        InboundSpans::NONE
+    fn redact_inbound(&self, input: Inbound<'_>) -> InboundSpans {
+        match input {
+            // A defect on purpose: a span past the frame's end.
+            Inbound::Frame(f) if f.bytes().ends_with(b"|oops=1") => {
+                InboundSpans::frame(std::iter::once(0..f.bytes().len() as u32 + 1).collect())
+            }
+            Inbound::Frame(f) => InboundSpans::frame(echo_spans(f.bytes())),
+            Inbound::Http(_, r) => {
+                // A defect on purpose: a mark past the last header.
+                let oops = r.headers.iter().any(|(n, _)| *n == "x-oops");
+                let marks = r.headers.iter().enumerate().filter_map(|(at, (name, _))| {
+                    let mark = match *name {
+                        "x-echo" => HeaderMark::Value,
+                        n if n.starts_with("x-key-") => HeaderMark::NameAndValue,
+                        _ => return None,
+                    };
+                    Some((at as u32, mark))
+                });
+                let mut marks: Vec<_> = marks.collect();
+                if oops {
+                    marks.push((r.headers.len() as u32, HeaderMark::Value));
+                }
+                InboundSpans::response(marks, echo_spans(r.body))
+            }
+        }
     }
+}
+
+/// The spans of every `echo=` field's value in `bytes`: up to the next `|` or line end.
+fn echo_spans(bytes: &[u8]) -> Vec<std::ops::Range<u32>> {
+    const ECHO: &[u8] = b"echo=";
+    let mut spans = Vec::new();
+    let mut at = 0;
+    while let Some(found) = bytes[at..].windows(ECHO.len()).position(|w| w == ECHO) {
+        let start = at + found + ECHO.len();
+        let len = bytes[start..]
+            .iter()
+            .position(|b| matches!(b, b'|' | b'\n'));
+        let end = start + len.unwrap_or(bytes.len() - start);
+        if end > start {
+            spans.push(start as u32..end as u32);
+        }
+        at = end;
+    }
+    spans
 }
 
 impl ToyMd {

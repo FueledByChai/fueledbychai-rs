@@ -568,6 +568,7 @@ fn frame(seq: u64, bytes: &[u8]) -> fbc_journal::RecordRef<'_> {
             conn: ConnKey { conn: 1, epoch: 1 },
         },
         frame: fbc_core::RawFrame::Binary(bytes),
+        redact: &[],
     }
 }
 

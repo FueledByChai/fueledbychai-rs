@@ -32,3 +32,6 @@ tokio = { workspace = true, features = ["rt", "net", "io-util", "macros", "sync"
 tokio-tungstenite.workspace = true
 rust_decimal.workspace = true
 rcgen.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+zstd.workspace = true
