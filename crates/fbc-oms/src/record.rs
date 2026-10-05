@@ -230,6 +230,14 @@ impl OrderRecord {
         self.replaced.iter().map(|(old, _)| old)
     }
 
+    /// Every venue id the order is or was known by: its current one and both ends of every
+    /// replacement (an id a fill taught the registry included, once an amend replaced it).
+    pub fn known_vids(&self) -> impl Iterator<Item = &VenueOrderId> {
+        self.vid
+            .iter()
+            .chain(self.replaced.iter().flat_map(|(old, new)| [old, new]))
+    }
+
     /// Whether an amend replaced `vid`.
     pub fn is_superseded(&self, vid: &VenueOrderId) -> bool {
         self.replaced.iter().any(|(old, _)| old == vid)
@@ -346,12 +354,15 @@ impl OrderRecord {
     /// non-terminal update strictly older than the last applied ([`OrderKey::is_older_than`])
     /// is ignored, though an amend's replacement of one venue id by another, a fact whenever
     /// it arrives, is still recorded. The venue's price and total apply when the update states
-    /// them, except a lower total while a command is in flight from an update without a venue
+    /// them, except a total below any the venue may hold ([`Self::resting`]) while a command
+    /// is in flight, from an update without a venue
     /// ordering key later than the last applied's: it may be a delayed or duplicate one from
     /// before an amend that raised the total, so neither applies, and an amend in flight to
     /// that lower total stays in flight, counted. `cum_venue` keeps the largest cumulative fill. An Open update moves the order to
     /// Open, or PartiallyFilled once something is filled; an amended update moves no state.
-    /// An update leaving the order at the price and total of the amend in flight confirms it.
+    /// An update stating a price or total that applies, and leaving the order at the price and
+    /// total of the amend in flight, confirms it; the record already at those values confirms
+    /// nothing.
     /// An amended update stating neither also confirms it, the amend's price and total then
     /// standing, when it is tied to that amend: no earlier amend was replaced in flight
     /// unconfirmed, and it carries a venue ordering key later than the last update's. Without
@@ -384,14 +395,19 @@ impl OrderRecord {
             return Applied::IgnoredStale;
         }
         self.cum_venue = self.cum_venue.max(u.cum_filled);
-        // A lower total, with a command in flight, from an update nothing shows is later than
-        // the last applied, may be a delayed or duplicate one from before an amend that raised
-        // the total: neither its price nor its total applies (a terminal update ends the order
-        // whatever it states).
-        let stale_lower = u.qty.is_some_and(|q| q < self.qty)
+        // A total below any the venue may hold (the order's, the amend in flight's or an
+        // unsettled one's), with a command in flight, from an update nothing shows is later
+        // than the last applied, may be a delayed or duplicate one from before an amend that
+        // raised the total: neither its price nor its total applies (a terminal update ends
+        // the order whatever it states).
+        let stale_lower = u.qty.is_some_and(|q| q < self.ceiling())
             && self.intent != Intent::None
             && !later
             && ends.is_none();
+        // Whether the update stated a price or total that applied: only such an update, or an
+        // amended one tied to the amend in flight, can show the order at the amend's values;
+        // the record matching them already shows nothing new.
+        let mut stated = !stale_lower && (u.px.is_some() || u.qty.is_some());
         if !stale_lower {
             if let Some(px) = u.px {
                 self.px = Some(px);
@@ -431,8 +447,9 @@ impl OrderRecord {
                 // Tied to the amend in flight: what the venue does not echo is what was sent.
                 self.px = Some(u.px.unwrap_or(px));
                 self.qty = u.qty.unwrap_or(qty);
+                stated = true;
             }
-            self.confirm_if_stated();
+            self.confirm_if_stated(stated);
             self.complete_if_covered();
             return Applied::Amended;
         }
@@ -440,7 +457,7 @@ impl OrderRecord {
             self.unknown_since = None;
         }
         self.state = self.live_state();
-        self.confirm_if_stated();
+        self.confirm_if_stated(stated);
         self.complete_if_covered();
         Applied::Advanced
     }
@@ -567,10 +584,11 @@ impl OrderRecord {
         FillApplied::Live
     }
 
-    /// Resolves the amend in flight once the order stands at its price and total: the venue
-    /// applied it, and with it every amend sent before it.
-    fn confirm_if_stated(&mut self) {
+    /// Resolves the amend in flight once an update that `stated` values leaves the order at its
+    /// price and total: the venue applied it, and with it every amend sent before it.
+    fn confirm_if_stated(&mut self, stated: bool) {
         if let Intent::PendingAmend { px, qty, .. } = self.intent
+            && stated
             && self.px == Some(px)
             && self.qty == qty
         {
@@ -1013,6 +1031,28 @@ mod tests {
         rec.apply_update(&open, keyed(3, 4));
         assert_eq!(rec.intent(), Intent::None);
         assert_eq!(rec.resting(), lots(5));
+    }
+
+    #[test]
+    fn a_stale_update_echoing_an_amend_that_replaced_a_larger_one_does_not_confirm_it() {
+        // Codex r4183571332: A raises 5@100 to 9@101 and is replaced in flight by B back to
+        // 5@100; a duplicate of the original Open states 5@100.
+        let mut rec = order(5);
+        let mut open = update(VenueOrderState::Open, 0);
+        (open.px, open.qty) = (Some(Ticks(100)), Some(lots(5)));
+        rec.apply_update(&open, key(1));
+        assert!(rec.amend_sent(Ticks(101), lots(9), RpcId(3), MonoNs(2)));
+        assert!(rec.amend_sent(Ticks(100), lots(5), RpcId(4), MonoNs(3)));
+        rec.apply_update(&open, key(2));
+        assert!(matches!(rec.intent(), Intent::PendingAmend { qty, .. } if qty == lots(5)));
+        assert_eq!(rec.resting(), lots(9), "A may rest");
+        // Nor does an update stating neither price nor total, though the record is at B's.
+        rec.apply_update(&update(VenueOrderState::Open, 0), key(3));
+        assert!(matches!(rec.intent(), Intent::PendingAmend { .. }));
+        rec.on_outcome(OrderOp::Amend(RpcId(4)), None, &refused(), MonoNs(4));
+        assert_eq!(rec.resting(), lots(9));
+        assert_eq!(rec.apply_fill(None, None, lots(5)), FillApplied::Live);
+        assert_eq!(rec.resting(), lots(4));
     }
 
     #[test]
