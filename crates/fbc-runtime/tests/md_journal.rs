@@ -15,14 +15,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::toy::{self, ToyVenue};
-use common::{ScriptedHttp, ScriptedWs, heard_binary};
+use common::{PONG, ScriptedHttp, ScriptedWs, heard_binary};
 use fbc_core::{
     ConnKey, EndpointPlan, Envelope, MdEvent, MdTransport, Stamp, TrafficClass, VenueConfig,
     WallNs, WireUrl,
 };
 use fbc_journal::{
     BLANK, ControlEvent, HeaderRec, JournalReader, JournalSink, JournalWriter, Marker, Opcode,
-    QueueSink, Record, RecordRef, Recorded, RedactionKey, SinkConfig, journal_queue,
+    QueueSink, Record, RecordRef, Recorded, RedactionKey, SinkConfig, WsControl, journal_queue,
 };
 use fbc_runtime::{
     Connector, IngestClock, Input, Journal, Liveness, MdSession, MdSessionConfig, MdVenue,
@@ -130,6 +130,14 @@ fn line(record: &Record) -> String {
             Err(failure) => format!("result {} {} {failure:?}", stamp.conn.epoch, tag.0),
         },
         Record::Timer { stamp, tag } => format!("timer {} {}", stamp.conn.epoch, tag.0),
+        Record::InboundControl { stamp, frame } => match frame {
+            WsControl::Ping(p) => format!("ping {} {}", stamp.conn.epoch, text(&p.0)),
+            WsControl::Pong(p) => format!("pong {} {}", stamp.conn.epoch, text(&p.0)),
+            WsControl::Close(None) => format!("close frame {}", stamp.conn.epoch),
+            WsControl::Close(Some(c)) => {
+                format!("close frame {} {} {}", stamp.conn.epoch, c.code, c.reason)
+            }
+        },
         Record::Marker(Marker::Degraded { .. }) => "degraded".into(),
         other => format!("{other:?}"),
     }
@@ -139,10 +147,38 @@ fn line(record: &Record) -> String {
 fn stamp_of(record: &Record) -> Option<Stamp> {
     match record {
         Record::Inbound { stamp, .. }
+        | Record::InboundControl { stamp, .. }
         | Record::HttpResult { stamp, .. }
         | Record::Timer { stamp, .. } => Some(*stamp),
         _ => None,
     }
+}
+
+/// FBC-drf: the stamped inputs of a journal of one session (its ingest clock its own) take
+/// ingest sequences one after another, and every sequence none of them carries lies in a gap a
+/// `Degraded` marker before the next stamped record counts. The number of sequences such
+/// markers account for.
+fn ingest_gaps_marked(records: &[Record]) -> u64 {
+    let (mut last, mut marked, mut explained) = (None::<u64>, 0, 0);
+    for record in records {
+        if let Record::Marker(Marker::Degraded { dropped, .. }) = record {
+            marked += dropped;
+        }
+        let Some(stamp) = stamp_of(record) else {
+            continue;
+        };
+        let missing = match last {
+            Some(last) => stamp.ingest_seq - last - 1,
+            None => stamp.ingest_seq,
+        };
+        assert!(
+            missing <= marked,
+            "ingest sequences before {} are missing unmarked",
+            stamp.ingest_seq
+        );
+        (last, marked, explained) = (Some(stamp.ingest_seq), 0, explained + missing);
+    }
+    explained
 }
 
 #[tokio::test]
@@ -250,6 +286,7 @@ async fn a_journaled_session_reads_back_every_input_output_and_connection_change
     // the stamps of the inputs journaled for them.
     let stamps: Vec<Stamp> = records.iter().filter_map(stamp_of).collect();
     assert!(stamps.windows(2).all(|w| w[0].ingest_seq < w[1].ingest_seq));
+    assert_eq!(ingest_gaps_marked(&records), 0);
     let seen = seen.borrow();
     for env in seen.iter() {
         assert!(stamps.contains(&env.stamp), "{:?}", env.stamp);
@@ -337,6 +374,11 @@ async fn a_full_journal_never_holds_back_a_safety_frame_and_marks_the_gap_once_s
         peer.send("cancel|id=999");
         assert_eq!(peer.recv().await, "cancel|id=999");
         assert_eq!(dropped(&queue, TrafficClass::Safety), before + 2);
+        // A ping finds no room either (FBC-drf): its ingest sequence lies in the marked gap.
+        let normal = dropped(&queue, TrafficClass::Normal);
+        peer.ping_with(b"full");
+        assert_eq!(peer.recv().await, PONG);
+        assert_eq!(dropped(&queue, TrafficClass::Normal), normal + 1);
         // The writer resumes and drains the queue; the next record is preceded by the marker.
         let writer = drain
             .spawn(JournalWriter::create(&root, SHARD, key()).unwrap())
@@ -380,6 +422,10 @@ async fn a_full_journal_never_holds_back_a_safety_frame_and_marks_the_gap_once_s
     });
     assert!(kept_from_reserve, "{lines:#?}");
     assert!(!lines.iter().any(|l| l.ends_with("cancel|id=999")));
+    // Every ingest sequence no record carries (the dropped cancels' and the ping's) lies in the
+    // gap the marker counts.
+    assert!(!lines.iter().any(|l| l.starts_with("ping ")), "{lines:#?}");
+    assert!(ingest_gaps_marked(&records) >= 2);
     fs::remove_dir_all(&root).unwrap();
 }
 
@@ -758,6 +804,97 @@ async fn subscribes_frames_requests_and_results_are_offered_borrowed() {
             || l.starts_with("result ")
             || l.starts_with("subscribe ")
     }));
+}
+
+/// FBC-drf's done line: a session journals every ping, pong and close frame it receives at the
+/// ingest sequence it stamped it with, with its close code, and its payload or reason as a
+/// keyed hash read back blanked (decision 0041), so the journal's stamped inputs leave no gap
+/// in ingest order that no marker explains.
+#[tokio::test]
+async fn a_session_journals_every_control_frame_it_receives_in_its_ingest_place() {
+    let root = fresh_dir("md_journal_control_frames");
+    let config = SinkConfig {
+        budget_bytes: 1 << 20,
+        soft_limit_pct: 85,
+    };
+    let (sink, drain) = journal_queue(config, key()).unwrap();
+    let writer = drain
+        .spawn(JournalWriter::create(&root, SHARD, key()).unwrap())
+        .unwrap();
+    let sink = Rc::new(RefCell::new(sink));
+    let mut ws = ScriptedWs::start().await;
+    let seen = Seen::default();
+    let (mut session, control) =
+        MdSession::new(session(ToyVenue::leak(), ws.url()), keep(&seen)).unwrap();
+    session.set_journal(Journal::new(sink.clone()));
+    let watch = seen.clone();
+    let script = async move {
+        let mut first = ws.accept().await;
+        assert_eq!(first.recv().await, "hello|codec=0|plan=1");
+        assert_eq!(first.recv().await, "sub|add=A");
+        first.send("trade|sym=A|px=100|qty=1|seq=1");
+        until(|| watch.borrow().len() == 1).await;
+        first.ping_with(b"hb");
+        assert_eq!(first.recv().await, PONG);
+        first.pong(b"unasked");
+        first.send("trade|sym=A|px=101|qty=1|seq=2");
+        until(|| watch.borrow().len() == 2).await;
+        first.close_with(1001, "going away");
+        assert_eq!(first.next().await, None);
+        let mut second = ws.accept().await;
+        assert_eq!(second.recv().await, "hello|codec=1|plan=1");
+        assert_eq!(second.recv().await, "sub|add=A");
+        second.ping();
+        assert_eq!(second.recv().await, PONG);
+        second.send("trade|sym=A|px=102|qty=1|seq=3");
+        until(|| watch.borrow().len() == 3).await;
+        drop(control);
+        assert_eq!(second.next().await, None);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    writer.close().unwrap();
+    assert_eq!(sink.borrow().dropped(TrafficClass::Normal), 0);
+    let records = read_all(&root);
+    let lines: Vec<String> = records.iter().map(line).collect();
+    let expected = [
+        "open 0",
+        "out 0 hello|codec=0|plan=1",
+        "write 0 Written",
+        "subscribe 0 +[\"1\"] -[]",
+        "out 0 sub|add=A",
+        "write 0 Written",
+        "in 0 trade|sym=A|px=100|qty=1|seq=1",
+        "ping 0 22",
+        "pong 0 2222222",
+        "in 0 trade|sym=A|px=101|qty=1|seq=2",
+        "close frame 0 1001 2222222222",
+        "close 0",
+        "open 1",
+        "out 1 hello|codec=1|plan=1",
+        "write 1 Written",
+        "subscribe 1 +[\"1\"] -[]",
+        "out 1 sub|add=A",
+        "write 1 Written",
+        "ping 1 ",
+        "in 1 trade|sym=A|px=102|qty=1|seq=3",
+        "close 1",
+    ];
+    assert_eq!(lines, expected);
+    // Every input the session stamped is journaled at its stamp: the sequences run on with
+    // no gap, and the events the codec pushed carry the stamps of the frames around them.
+    assert_eq!(ingest_gaps_marked(&records), 0);
+    let seqs: Vec<u64> = records
+        .iter()
+        .filter_map(stamp_of)
+        .map(|s| s.ingest_seq)
+        .collect();
+    assert_eq!(seqs, (seqs[0]..seqs[0] + 7).collect::<Vec<_>>());
+    let stamps: Vec<Stamp> = records.iter().filter_map(stamp_of).collect();
+    for env in seen.borrow().iter() {
+        assert!(stamps.contains(&env.stamp), "{:?}", env.stamp);
+    }
+    fs::remove_dir_all(&root).unwrap();
 }
 
 /// FBC-q7b's done line: a session journals the kind it sent each frame as. A binary frame

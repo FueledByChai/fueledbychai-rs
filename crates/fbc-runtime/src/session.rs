@@ -81,9 +81,12 @@
 //! window, or that the control's drop interrupted, has no write result: whether any of it
 //! reached the venue is unknown, and the connection's `Closed` follows. A frame, timer firing
 //! or HTTP result the session takes as the control drops reaches no codec, and is journaled
-//! after the epoch's `Closed`, so a replay ([`crate::MdReplay`]) feeds it to none either. Pings, pongs and close frames carry no data and are not
-//! journaled. What the session sends is journaled with its redaction spans as keyed hashes.
-//! What it receives is journaled with the credentials the epoch's codec names in it
+//! after the epoch's `Closed`, so a replay ([`crate::MdReplay`]) feeds it to none either. Pings,
+//! pongs and close frames carry no data, but each is stamped and journaled at its stamp, its
+//! payload or close reason only as its keyed hash, since no codec names what is in them
+//! (FBC-drf, decision 0041), so the journal's ingest sequences have no gap a `Degraded` marker
+//! does not explain. What the session sends is journaled with its redaction spans as keyed
+//! hashes. What it receives is journaled with the credentials the epoch's codec names in it
 //! ([`MdCodec::redact_inbound`], decision 0028), asked before the input is journaled: a frame's
 //! spans, and a response's body spans and the headers it marks, each written as its keyed hash
 //! and the rest verbatim, so nothing received is withheld. Spans that do not fit what they
@@ -111,7 +114,9 @@ use fbc_core::{
     RawFrame, SpecTable, Stamp, StreamId, Subscription, TimerTag, TrafficClass, VenueCaps,
     VenueConfig, VenueFactory, VenueMeta, Via, WallNs, WireSlice, dispatch_market_data,
 };
-use fbc_journal::{ControlEvent, Opcode, Record, RecordRef, ResponseRef, WriteRes};
+use fbc_journal::{
+    CloseRec, ControlEvent, Opaque, Opcode, Record, RecordRef, ResponseRef, WriteRes, WsControl,
+};
 use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use tokio::sync::watch;
@@ -972,8 +977,7 @@ impl<H: MdHandler> MdSession<H> {
     /// Stamps one message of epoch `key`, whose last packet the kernel received at `rx` when it
     /// knows, and journals it with the credentials `codec`, the epoch's, names in it; its stamp
     /// and data frame, when it carries data. Pings, pongs and close frames take their place in
-    /// ingest order but carry no data; a ping or a close is charged for the answer the
-    /// WebSocket layer sends to it.
+    /// ingest order and are journaled there, but carry no data ([`Self::take_control`]).
     fn take_in<'m>(
         &mut self,
         codec: &dyn MdCodec,
@@ -981,18 +985,17 @@ impl<H: MdHandler> MdSession<H> {
         rx: Option<KernelRxNs>,
         message: &'m Message,
     ) -> Option<(Stamp, RawFrame<'m>)> {
-        let stamp = self.clock.stamp(key, rx);
         let raw = match message {
             Message::Text(text) => RawFrame::Text(text.as_str()),
             Message::Binary(bytes) => RawFrame::Binary(bytes.as_ref()),
-            // The WebSocket layer answers a ping with a pong of its own, and a close with a
-            // close (decision 0030, Codex r4179720976).
-            Message::Ping(_) | Message::Close(_) => {
-                self.rates.record(Instant::now(), key, CONTROL);
+            control => {
+                if let Some(frame) = ws_control(control) {
+                    self.take_control(key, rx, frame);
+                }
                 return None;
             }
-            _ => return None,
         };
+        let stamp = self.clock.stamp(key, rx);
         // Offered borrowed, so a full journal refuses it before it is copied (Codex
         // r4178252055).
         if let Some(journal) = &self.journal {
@@ -1005,6 +1008,21 @@ impl<H: MdHandler> MdSession<H> {
             journal.record_ref(TrafficClass::Normal, stamp.recv_wall, frame);
         }
         Some((stamp, raw))
+    }
+
+    /// Stamps a ping, pong or close frame of epoch `key` and journals it at that stamp, under
+    /// Normal (FBC-drf): every ingest sequence the session takes is journaled, or lies in a gap
+    /// the journal marks. The journal writes its payload or reason only as a keyed hash
+    /// (decision 0041). A ping or a close is charged for the answer the WebSocket layer sends
+    /// to it: a pong of its own, and a close (decision 0030, Codex r4179720976).
+    fn take_control(&mut self, key: ConnKey, rx: Option<KernelRxNs>, frame: WsControl) {
+        let stamp = self.clock.stamp(key, rx);
+        if !matches!(frame, WsControl::Pong(_)) {
+            self.rates.record(Instant::now(), key, CONTROL);
+        }
+        self.journal(TrafficClass::Normal, stamp.recv_wall, || {
+            Record::InboundControl { stamp, frame }
+        });
     }
 
     /// Stamps and journals one message of epoch `key` and decodes it ([`Self::take_in`]); the
@@ -1713,6 +1731,21 @@ fn close(ws: &mut WebSocket, rates: &RateLimiter, key: ConnKey) {
     }
 }
 
+/// The record of a WebSocket control message a session received: a ping's or pong's payload,
+/// or a close frame's code and reason. `None` for a data frame, and for a raw frame, which
+/// only a sender builds: the WebSocket layer reads none, so it takes no place in ingest order.
+fn ws_control(message: &Message) -> Option<WsControl> {
+    Some(match message {
+        Message::Ping(payload) => WsControl::Ping(Opaque(payload.to_vec())),
+        Message::Pong(payload) => WsControl::Pong(Opaque(payload.to_vec())),
+        Message::Close(close) => WsControl::Close(close.as_ref().map(|c| CloseRec {
+            code: c.code.into(),
+            reason: c.reason.as_str().to_owned(),
+        })),
+        Message::Text(_) | Message::Binary(_) | Message::Frame(_) => return None,
+    })
+}
+
 /// The next message on the socket; a poll endpoint has none, ever.
 async fn next_frame(
     ws: &mut Option<WebSocket>,
@@ -1919,6 +1952,42 @@ mod tests {
         );
         let failed = with_response(&Err(HttpFailure::TimedOut), |r| r.map(|_| ()));
         assert_eq!(failed, Err(HttpFailure::TimedOut));
+    }
+
+    /// FBC-drf: a control message is journaled with its payload, or its close code and reason;
+    /// a data frame is none, nor is a raw frame, which the WebSocket layer never reads.
+    #[test]
+    fn a_control_message_is_recorded_with_what_it_carries() {
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+        use tokio_tungstenite::tungstenite::protocol::frame::Frame;
+        let close = CloseFrame {
+            code: 4000.into(),
+            reason: "bye".into(),
+        };
+        let cases = [
+            (
+                Message::Ping(b"p".to_vec().into()),
+                Some(WsControl::Ping(Opaque(b"p".to_vec()))),
+            ),
+            (
+                Message::Pong(Vec::new().into()),
+                Some(WsControl::Pong(Opaque(Vec::new()))),
+            ),
+            (Message::Close(None), Some(WsControl::Close(None))),
+            (
+                Message::Close(Some(close)),
+                Some(WsControl::Close(Some(CloseRec {
+                    code: 4000,
+                    reason: "bye".into(),
+                }))),
+            ),
+            (Message::text("t"), None),
+            (Message::binary(vec![1]), None),
+            (Message::Frame(Frame::ping(vec![2])), None),
+        ];
+        for (message, want) in cases {
+            assert_eq!(ws_control(&message), want, "{message:?}");
+        }
     }
 
     #[test]

@@ -160,6 +160,14 @@ impl Record {
                 out.extend(spans(&resp.body.0, &resp.body_redact));
                 out
             }
+            // Written whole as one hash, when there is anything to write (decision 0041).
+            Record::InboundControl { frame, .. } => {
+                let whole = frame.content();
+                (!whole.is_empty())
+                    .then(|| key.digest(whole))
+                    .into_iter()
+                    .collect()
+            }
             _ => Vec::new(),
         }
     }

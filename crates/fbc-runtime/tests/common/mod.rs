@@ -25,7 +25,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 
 use tls::TlsServer;
 
@@ -540,6 +540,28 @@ impl Peer {
         let _ = self
             .to_client
             .send(Out::Send(Message::Ping(Vec::new().into())));
+    }
+
+    /// Sends a ping carrying `payload`.
+    pub fn ping_with(&self, payload: &[u8]) {
+        let ping = Message::Ping(payload.to_vec().into());
+        let _ = self.to_client.send(Out::Send(ping));
+    }
+
+    /// Sends a pong carrying `payload`, which answers no ping.
+    pub fn pong(&self, payload: &[u8]) {
+        let pong = Message::Pong(payload.to_vec().into());
+        let _ = self.to_client.send(Out::Send(pong));
+    }
+
+    /// Sends a close frame with status `code` and `reason`; the connection closes once the
+    /// client answers it.
+    pub fn close_with(&self, code: u16, reason: &str) {
+        let frame = CloseFrame {
+            code: code.into(),
+            reason: reason.into(),
+        };
+        let _ = self.to_client.send(Out::Send(Message::Close(Some(frame))));
     }
 
     /// Stops reading from the client, holding the connection open.

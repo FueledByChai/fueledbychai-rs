@@ -390,6 +390,15 @@ fn an_ended_epochs_inputs_and_other_connections_records_reach_no_codec() {
         // A close of an epoch that is not the open one changes nothing.
         closed(7),
         frame(4, 0, &trade(4)),
+        // A control frame the session received reached no codec live, nor does it here
+        // (FBC-drf).
+        Record::InboundControl {
+            stamp: stamp(5, 0),
+            frame: fbc_journal::WsControl::Close(Some(fbc_journal::CloseRec {
+                code: 1001,
+                reason: "bye".into(),
+            })),
+        },
         // An opening with no close before it ends the open epoch.
         opened(1),
         result(5, 0, 1, &trade(5)),

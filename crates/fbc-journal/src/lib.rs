@@ -55,8 +55,9 @@ mod writer;
 pub use error::JournalError;
 pub use reader::{Entries, Entry, JournalReader};
 pub use record::{
-    BLANK, ControlEvent, HeaderRec, HttpRequestRec, HttpResponseRec, Marker, NonceSourceId, Opaque,
-    Opcode, Record, RecordRef, ResponseRef, SECRET_HEADERS, WriteRes, is_secret_header,
+    BLANK, CloseRec, ControlEvent, HeaderRec, HttpRequestRec, HttpResponseRec, Marker,
+    NonceSourceId, Opaque, Opcode, Record, RecordRef, ResponseRef, SECRET_HEADERS, WriteRes,
+    WsControl, is_secret_header,
 };
 pub use redact::{RedactionKey, SpanDigest};
 pub use sink::{
