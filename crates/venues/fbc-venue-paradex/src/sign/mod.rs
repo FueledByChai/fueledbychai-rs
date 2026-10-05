@@ -10,6 +10,35 @@
 //! size and price scaled x1e8 and truncated ([`scale_e8`]), strings by Java's TypedData rule
 //! ([`message_felt`]). `fixtures/paradex/signing/paradex-vectors.tsv`, written by
 //! `ParadexHashOracle.java` from the Java signer, is the golden file the tests hold this to.
+//!
+//! # Key copies
+//!
+//! What is wiped: [`StarkKey`] owns the key as 32 bytes in one heap buffer, read there straight
+//! from the hex digits, and its `Drop` overwrites them with zeros (`zeroize`, volatile writes),
+//! a refused key's included. Each public-key or signature call converts the bytes to a `Felt`
+//! for the call only, and that `Felt` and the signature's RFC 6979 nonce `k` (which recovers
+//! the key from a signature) are held in `Zeroizing` and overwritten when the call returns.
+//!
+//! What is not, and why: the wipe stops at this module's own values. starknet-crypto 0.8.1
+//! (pinned exactly) and the crates under it take the key and nonce by reference and make
+//! copies we cannot reach:
+//!
+//! - `get_public_key` passes the key `Felt` by value to the scalar multiplication
+//!   (starknet-types-core 0.2.4, `&ProjectivePoint * Felt`), which takes its integer
+//!   representative and walks its bits; `sign` does the same with `k` for `r`.
+//! - `rfc6979_generate_k` copies the key into a 32-byte array and a crypto-bigint `U256` that it
+//!   does not wipe (it wipes only the byte copy it seeds HMAC-DRBG with); the HMAC-DRBG state
+//!   (rfc6979 0.4.0), derived from the key, is dropped unwiped; and the nonce, which it keeps in
+//!   `Zeroizing` while drawing it, leaves as a byte array and a `Felt` that it does not wipe.
+//! - `sign` turns the key, `k` and the products `r·key` and `h + r·key` into num-bigint
+//!   `BigInt`s (`mul_mod_floor`, `add_unbounded`, `mod_inverse`, `bigint_mul_mod_floor`), heap
+//!   allocations freed without wiping.
+//!
+//! Beyond those, a moved value (the `Felt` handed to `Zeroizing`, the nonce returned by value)
+//! can leave a copy in a stack slot or register that no code can name. The `text` given to
+//! [`StarkKey::from_hex`] is the caller's to wipe. Reaching starknet-crypto's copies would mean
+//! patching or replacing its signing path, whose signatures the Java vectors pin; this module
+//! does not.
 
 mod felt;
 mod typed;
@@ -23,17 +52,29 @@ use fbc_core::{
 use rust_decimal::Decimal;
 pub use starknet_crypto::Felt;
 use starknet_crypto::{get_public_key, rfc6979_generate_k};
+use zeroize::{Zeroize, Zeroizing};
 
 pub use felt::{FeltError, ScaleError, message_felt, scale_e8, short_string};
 pub use typed::{HashError, OrderMessage, ParadexHasher, ParadexOrderType, RequestMessage};
 
-/// The order of the Stark curve's generator: a signing key lies in `[1, EC_ORDER)`.
-const EC_ORDER: &str =
-    "3618502788666131213697322783095070105526743751716087489154079457884512865583";
+/// The order of the Stark curve's generator, as 32 big-endian bytes (in decimal
+/// 3618502788666131213697322783095070105526743751716087489154079457884512865583): a signing key
+/// lies in `[1, EC_ORDER)`.
+const EC_ORDER_BE: [u8; 32] = [
+    0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xb7, 0x81, 0x12, 0x6d, 0xca, 0xe7, 0xb2, 0x32, 0x1e, 0x66, 0xa2, 0x41, 0xad, 0xc6, 0x4d, 0x2f,
+];
 
 /// A Stark-curve signing key. It is never printed: `Debug` shows only that a key is there, and
 /// no error carries any part of it. It is not `Clone`, so it lives where it was built.
-pub struct StarkKey(Felt);
+///
+/// The key's 32 big-endian bytes sit in one heap buffer for the key's whole life (moving the
+/// key, into a [`ParadexSigner`] say, moves only the pointer), and dropping the key overwrites
+/// that buffer with zeros through `zeroize`'s volatile writes before it is freed. What the
+/// wipe does not reach is listed in the module's [key copies](self#key-copies).
+pub struct StarkKey {
+    bytes: Box<[u8; 32]>,
+}
 
 /// Why text is not a signing key; never carries the text.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
@@ -44,23 +85,79 @@ pub enum KeyError {
     OutOfRange,
 }
 
+/// A `Felt` copy of the key, or of a signature's nonce, which recovers the key as well: held
+/// only inside `Zeroizing`, so it is overwritten with zero when the signature is done.
+#[derive(Copy, Clone, Default)]
+struct Scalar(Felt);
+
+impl zeroize::DefaultIsZeroes for Scalar {}
+
 impl StarkKey {
-    /// The key written as `0x` and hex digits, as Paradex and the Java signer take it.
+    /// The key written as `0x` and hex digits (either case, leading zeros allowed), as Paradex
+    /// and the Java signer take it. The digits are read straight into the key's own buffer, so
+    /// a refused key's digits are wiped too; `text` itself is the caller's to wipe.
     pub fn from_hex(text: &str) -> Result<StarkKey, KeyError> {
         let digits = text.strip_prefix("0x").ok_or(KeyError::NotHex)?;
         if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(KeyError::NotHex);
         }
-        let order = Felt::from_dec_str(EC_ORDER).expect("the curve order is a felt");
-        match felt::parse_radix(digits, 16) {
-            Some(k) if k != Felt::ZERO && k < order => Ok(StarkKey(k)),
-            _ => Err(KeyError::OutOfRange),
+        let digits = digits.trim_start_matches('0').as_bytes();
+        if digits.len() > 64 {
+            return Err(KeyError::OutOfRange);
         }
+        // Built first, so its Drop wipes the buffer on every path out of here.
+        let mut key = StarkKey {
+            bytes: Box::new([0u8; 32]),
+        };
+        for (i, &digit) in digits.iter().rev().enumerate() {
+            let nibble = match digit {
+                b'0'..=b'9' => digit - b'0',
+                _ => (digit | 0x20) - b'a' + 10,
+            };
+            key.bytes[31 - i / 2] |= nibble << (4 * (i % 2));
+        }
+        // Big-endian bytes order as the integers they hold.
+        if *key.bytes == [0u8; 32] || *key.bytes >= EC_ORDER_BE {
+            return Err(KeyError::OutOfRange);
+        }
+        Ok(key)
     }
 
     /// The public key: the x coordinate of key x G.
     pub fn public_key(&self) -> Felt {
-        get_public_key(&self.0)
+        get_public_key(&self.scalar().0)
+    }
+
+    /// The key as a `Felt`, for one call into starknet-crypto, wiped when it drops.
+    fn scalar(&self) -> Zeroizing<Scalar> {
+        Zeroizing::new(Scalar(Felt::from_bytes_be(&self.bytes)))
+    }
+}
+
+impl Drop for StarkKey {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+        #[cfg(test)]
+        wipe_probe::record(&self.bytes);
+    }
+}
+
+/// The test-only hook: what a dropped key's buffer held once its `Drop` had run, per thread.
+#[cfg(test)]
+mod wipe_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static WIPED: Cell<Option<[u8; 32]>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn record(bytes: &[u8; 32]) {
+        WIPED.with(|w| w.set(Some(*bytes)));
+    }
+
+    /// The last dropped key's buffer on this thread, if a key dropped since the last take.
+    pub(super) fn take() -> Option<[u8; 32]> {
+        WIPED.with(Cell::take)
     }
 }
 
@@ -167,8 +264,9 @@ impl ParadexSigner {
     /// Stark-curve ECDSA over `hash` with the RFC 6979 nonce. Refused only for a hash at or
     /// past 2^251, which a Pedersen hash reaches with probability about 2^-59.
     fn sign_hash(&self, hash: &Felt) -> Result<StarkSig, SignError> {
-        let k = rfc6979_generate_k(hash, &self.key.0, None);
-        let sig = starknet_crypto::sign(&self.key.0, hash, &k)
+        let key = self.key.scalar();
+        let k = Zeroizing::new(Scalar(rfc6979_generate_k(hash, &key.0, None)));
+        let sig = starknet_crypto::sign(&key.0, hash, &k.0)
             .map_err(|_| SignError::Backend("stark-curve signature"))?;
         Ok(StarkSig { r: sig.r, s: sig.s })
     }
@@ -246,6 +344,17 @@ impl OrderSigner for ParadexSigner {
 mod tests {
     use super::*;
 
+    const EC_ORDER: &str =
+        "3618502788666131213697322783095070105526743751716087489154079457884512865583";
+
+    #[test]
+    fn the_curve_order_bytes_are_the_curve_order() {
+        assert_eq!(
+            Felt::from_bytes_be(&EC_ORDER_BE),
+            Felt::from_dec_str(EC_ORDER).unwrap()
+        );
+    }
+
     #[test]
     fn a_key_is_hex_in_range_and_never_printed() {
         assert_eq!(StarkKey::from_hex("12").map(|_| ()), Err(KeyError::NotHex));
@@ -293,6 +402,63 @@ mod tests {
             longest.as_bytes(),
             format!(r#"["{EC_ORDER_MINUS_ONE}","{EC_ORDER_MINUS_ONE}"]"#).as_bytes()
         );
+    }
+
+    #[test]
+    fn dropping_a_key_overwrites_the_bytes_it_owns() {
+        let _ = wipe_probe::take();
+        let key = StarkKey::from_hex("0x2a").unwrap();
+        let mut held = [0u8; 32];
+        held[31] = 0x2a;
+        assert_eq!(*key.bytes, held, "the key is held big-endian");
+        assert_eq!(wipe_probe::take(), None, "nothing is wiped before the drop");
+        drop(key);
+        assert_eq!(wipe_probe::take(), Some([0u8; 32]));
+        // Held by a signer, the key is wiped when the signer drops.
+        let signer = ParadexSigner::new(Felt::ONE, Felt::ONE, StarkKey::from_hex("0x2a").unwrap());
+        drop(signer);
+        assert_eq!(wipe_probe::take(), Some([0u8; 32]));
+    }
+
+    #[test]
+    fn a_refused_key_wipes_the_digits_it_read() {
+        let _ = wipe_probe::take();
+        let order = Felt::from_dec_str(EC_ORDER).unwrap();
+        let at_order = format!("{order:#x}");
+        assert_eq!(
+            StarkKey::from_hex(&at_order).map(|_| ()),
+            Err(KeyError::OutOfRange)
+        );
+        assert_eq!(wipe_probe::take(), Some([0u8; 32]));
+        assert_eq!(
+            StarkKey::from_hex("0x0").map(|_| ()),
+            Err(KeyError::OutOfRange)
+        );
+        assert_eq!(wipe_probe::take(), Some([0u8; 32]));
+        // Refused before a buffer exists: nothing to wipe.
+        assert_eq!(StarkKey::from_hex("12").map(|_| ()), Err(KeyError::NotHex));
+        assert_eq!(wipe_probe::take(), None);
+    }
+
+    #[test]
+    fn a_key_reads_hex_of_any_case_and_leading_zeros() {
+        let mixed = StarkKey::from_hex("0x00AbC").unwrap();
+        assert_eq!(mixed.public_key(), get_public_key(&Felt::from(0xabcu16)));
+        let padded = format!("0x{}2a", "0".repeat(80));
+        let key = StarkKey::from_hex(&padded).unwrap();
+        assert_eq!(key.public_key(), get_public_key(&Felt::from(42u8)));
+        // 64 hex digits, the most a 256-bit buffer holds: in range below the curve order.
+        let full = format!("0x0{}", "7".repeat(63));
+        assert!(StarkKey::from_hex(&full).is_ok());
+    }
+
+    #[test]
+    fn a_scalar_copy_is_overwritten_with_zero() {
+        let mut copy = Scalar(Felt::from(42u8));
+        copy.zeroize();
+        assert_eq!(copy.0, Felt::ZERO);
+        let key = StarkKey::from_hex("0x2a").unwrap();
+        assert_eq!(key.scalar().0, Felt::from(42u8));
     }
 
     const EC_ORDER_MINUS_ONE: &str =
