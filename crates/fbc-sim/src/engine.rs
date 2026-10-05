@@ -78,7 +78,9 @@ struct At {
 /// any envelope stamped at or after its arrival, and are held until such an envelope (or
 /// [`advance`](SimEngine::advance)) passes them.
 ///
-/// - A place of zero lots is refused (`InvalidQty`), since zero lots is never an order.
+/// - A place of zero lots is refused (`InvalidQty`), since zero lots is never an order, and so
+///   is one that would rest where the level's size with the simulated orders there and its own
+///   would not fit in lots.
 /// - A place crosses the trading book's displayed levels, each fill at a level's price up to
 ///   its size, as the taker; a post-only order that would cross is refused
 ///   (`PostOnlyWouldCross`). The rest of a good-till-cancelled limit order rests and queues
@@ -267,7 +269,8 @@ impl SimEngine {
         Some((raw?, notional.asset))
     }
 
-    /// The size of the modelled orders resting at `side` and `px` of `inst`.
+    /// The size of the modelled orders resting at `side` and `px` of `inst`. It fits in lots,
+    /// since a placement that would push its level past them is refused; it would saturate.
     fn own(&self, inst: InstrumentId, side: BookSide, px: Ticks) -> Lots {
         let at = self
             .live
@@ -275,7 +278,7 @@ impl SimEngine {
             .filter(|o| o.inst == inst && o.side.book_side() == side && o.px == px);
         at.fold(Lots::ZERO, |sum, o| {
             let left = o.qty.checked_sub(o.cum).unwrap_or(Lots::ZERO);
-            sum.checked_add(left).unwrap_or(sum)
+            sum.checked_add(left).unwrap_or(MAX_LOTS)
         })
     }
 
@@ -342,9 +345,13 @@ impl SimEngine {
                 let side = p.side.book_side();
                 let book = self.trading_book(p.inst).ok_or(Refusal::NoBook)?;
                 let shown = book.level(side, px).ok().flatten().ok_or(Refusal::NoBook)?;
+                // Codex r4183438501: the size at the price, the public size, every simulated
+                // order resting there and this one together, must fit in lots, so the venue's
+                // own size there is never truncated.
                 let shown = shown
                     .checked_add(self.own(p.inst, side, px))
-                    .ok_or(Refusal::NoBook)?;
+                    .filter(|shown| shown.checked_add(left).is_some())
+                    .ok_or(Refusal::InvalidQty)?;
                 let order = NewOrder {
                     side: p.side,
                     px,
@@ -577,7 +584,7 @@ impl SimEngine {
             .unwrap_or(Lots::ZERO);
         let level_before = before
             .checked_add(self.own(inst, side, px))
-            .unwrap_or(before);
+            .unwrap_or(MAX_LOTS);
         match self.queues.get_mut(&inst) {
             Some(queue) if cancelled > Lots::ZERO => queue
                 .level_cancel(side, px, cancelled, level_before)
