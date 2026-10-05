@@ -183,7 +183,8 @@ rather than guess.
     `tests/common/toy.rs` is the toy market-data venue later runtime tests reuse.
   - `crates/fbc-book` (it depends on `fbc-core` only: one tick-indexed L2 book per
     instrument and `BookId`, built from book events the same live and in replay, with
-    snapshots, deltas, windows and gap invalidation, touch, top-n, one level's size, an exact
+    snapshots, deltas, windows and gap invalidation, touch, top-n, one level's size where it is
+    known (inside the window, or no deeper than a capped book shows), an exact
     top-n comparison and canonical bytes; still planned: the ex-own projection, touch arbitration and
     continuity policies), `crates/fbc-oms` (it depends on `fbc-core` only, `proptest` as a
     dev-dependency, 0037: so far `OrderRecord`, whose ranked states, PendingNew and Unknown 0,
@@ -209,8 +210,9 @@ rather than guess.
     fill-model code, never calibrations; it depends on `fbc-core` and `fbc-book` only: so far
     `QueueModel`, each modelled order's place in its level's queue under a `Bracket`
     (Pessimistic, Middle, Optimistic) from a `QueueConfig` with no `Default`, queued on arrival
-    behind its level less every modelled own order, advanced by level cancels per bracket and
-    filled by trades at or through its price, 0038; still planned: the simulated venue,
+    behind its level on the public book less every modelled public order, an RPI order also
+    behind public size that joins later, advanced by level cancels per bracket and filled by
+    trades at or through its price, 0038; still planned: the simulated venue,
     FBC-uoo), `crates/fbc-conformance` (the adapter conformance kit,
     0025; it depends on `fbc-runtime`, and on `fbc-core` in its tests, never on a venue crate: so
     far a public stub venue server on 127.0.0.1 ephemeral ports, a WebSocket endpoint that plays

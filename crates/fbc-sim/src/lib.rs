@@ -8,9 +8,11 @@
 //! none of the cancelled size ([`Bracket::Pessimistic`]), by its proportional share
 //! ([`Bracket::Middle`]) or by all of it up to the size ahead ([`Bracket::Optimistic`]).
 //!
-//! - [`QueueModel::accept`] queues a new order behind its level's size on an `fbc-book` book,
-//!   less every modelled own order the model holds at that side and price (the simulation's
-//!   own and injected ones alike); an RPI order queues behind every public order at its price.
+//! - [`QueueModel::accept`] queues a new order behind its level's size on the public
+//!   `fbc-book` book, less every modelled public order the model holds at that side and price
+//!   (the simulation's own and injected ones alike), and only where the book knows that size;
+//!   an RPI order queues behind every public order at its price, those that join later
+//!   ([`QueueModel::public_join`]) included.
 //! - [`QueueModel::trade`] lets a trade at an order's price consume the size ahead of it first
 //!   and then fill it; a trade through its price empties the queue ahead and fills it from the
 //!   trade's size (0038). An order is never filled past what remains, and each fill is

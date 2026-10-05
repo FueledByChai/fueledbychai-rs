@@ -82,10 +82,11 @@ pub enum QueueError {
     ZeroQuantity(OrderKey),
     /// The book cannot be read.
     Book(BookError),
-    /// The order's price is outside the book's window, where the level's size is unknown.
-    OutsideWindow { side: BookSide, px: Ticks },
-    /// The modelled orders at the order's side and price sum past an `i64` of lots.
-    OwnSizeOverflow { side: BookSide, px: Ticks },
+    /// The book does not know the level's size at the order's price: outside its window, or
+    /// past the deepest level a capped book shows ([`L2Book::level`]).
+    UnknownLevel { side: BookSide, px: Ticks },
+    /// Lots at a level (the modelled orders there, or the size ahead of one) past an `i64`.
+    Overflow { side: BookSide, px: Ticks },
     /// A level said to shrink by more than its size before.
     CancelExceedsLevel { cancelled: Lots, level_before: Lots },
 }
@@ -96,11 +97,15 @@ impl fmt::Display for QueueError {
             QueueError::DuplicateOrder(key) => write!(f, "order {} is already queued", key.0),
             QueueError::ZeroQuantity(key) => write!(f, "order {} has no size", key.0),
             QueueError::Book(e) => write!(f, "queue model cannot read the book: {e}"),
-            QueueError::OutsideWindow { side, px } => {
-                write!(f, "{side:?} level {} is outside the book's window", px.0)
+            QueueError::UnknownLevel { side, px } => {
+                write!(
+                    f,
+                    "the book does not know the size at {side:?} level {}",
+                    px.0
+                )
             }
-            QueueError::OwnSizeOverflow { side, px } => {
-                write!(f, "modelled orders at {side:?} level {} overflow", px.0)
+            QueueError::Overflow { side, px } => {
+                write!(f, "lots at {side:?} level {} overflow", px.0)
             }
             QueueError::CancelExceedsLevel {
                 cancelled,
@@ -128,12 +133,17 @@ struct Held {
 /// under one [`Bracket`].
 ///
 /// The caller drives it: it queues each order as the order arrives ([`accept`]), reports each
-/// level that shrank with no trade at its price ([`level_cancel`]) and each public trade
-/// ([`trade`]), and removes an order it cancels ([`remove`]). An order the model fills
-/// completely leaves it.
+/// level that shrank with no trade at its price ([`level_cancel`]), the public size that joins
+/// a level ([`public_join`]) and each public trade ([`trade`]), and removes an order it
+/// cancels ([`remove`]). An order the model fills completely leaves it.
+///
+/// The book it reads is the public book: the public channel's levels, every modelled public
+/// order included once it shows. A modelled RPI order is not in it, and its size ahead is the
+/// public size at its price only (0038).
 ///
 /// [`accept`]: QueueModel::accept
 /// [`level_cancel`]: QueueModel::level_cancel
+/// [`public_join`]: QueueModel::public_join
 /// [`trade`]: QueueModel::trade
 /// [`remove`]: QueueModel::remove
 #[derive(Clone, Debug)]
@@ -168,15 +178,18 @@ impl QueueModel {
         self.orders.remove(&key).map(|held| held.pos)
     }
 
-    /// Queues a new order behind its level's size on `book`, less every modelled order the
-    /// model already holds at its side and price, whatever their channel (they are queued
-    /// themselves, so they never count as size ahead). `book` is the level as the simulated
-    /// venue shows it when the order arrives: with the modelled orders it holds, and before
-    /// any update that shows the new order itself. A level smaller than the modelled orders at
-    /// it (they show late) leaves nothing ahead.
+    /// Queues a new order behind its level's size on the public `book`, less every modelled
+    /// public order the model already holds at its side and price (they are queued themselves,
+    /// so they never count as size ahead). `book` is the level as the simulated venue shows it
+    /// when the order arrives: with the modelled public orders it holds, and before any update
+    /// that shows the new order itself. A level smaller than the modelled orders at it (they
+    /// show late) leaves nothing ahead. Refused where the book does not know the level's size.
     ///
-    /// An RPI order counts the same size ahead, and every public order at its price, modelled
-    /// ones included, goes before it when a trade fills them ([`trade`](QueueModel::trade)).
+    /// The rule is the same for an RPI order, so it queues behind every public order at its
+    /// price: the public size, which grows as public orders join
+    /// ([`public_join`](QueueModel::public_join)), and the modelled public orders, which go
+    /// before it when a trade fills them ([`trade`](QueueModel::trade)). Other participants'
+    /// RPI orders are not in the public book and are not counted ahead of it (0038).
     pub fn accept(
         &mut self,
         key: OrderKey,
@@ -193,13 +206,16 @@ impl QueueModel {
         let shown = book
             .level(side, order.px)
             .map_err(QueueError::Book)?
-            .ok_or(QueueError::OutsideWindow { side, px: order.px })?;
+            .ok_or(QueueError::UnknownLevel { side, px: order.px })?;
         let own = self
             .orders
             .values()
-            .filter(|held| held.pos.side == order.side && held.pos.px == order.px)
-            .try_fold(Lots::ZERO, |sum, held| sum.checked_add(held.pos.remaining))
-            .ok_or(QueueError::OwnSizeOverflow { side, px: order.px })?;
+            .map(|held| held.pos)
+            .filter(|pos| {
+                pos.side == order.side && pos.px == order.px && pos.channel == Channel::Public
+            })
+            .try_fold(Lots::ZERO, |sum, pos| sum.checked_add(pos.remaining))
+            .ok_or(QueueError::Overflow { side, px: order.px })?;
         let pos = QueuePos {
             side: order.side,
             px: order.px,
@@ -256,6 +272,33 @@ impl QueueModel {
         Ok(())
     }
 
+    /// `added` lots of public size, not a modelled order, joined the level at `side` and
+    /// `px`. It queues behind every public order there and before every RPI order, so each
+    /// modelled RPI order there has that much more ahead of it; a public order is unmoved.
+    /// Refused, changing nothing, when an RPI order's size ahead would pass an `i64`.
+    pub fn public_join(
+        &mut self,
+        side: BookSide,
+        px: Ticks,
+        added: Lots,
+    ) -> Result<(), QueueError> {
+        let behind = |pos: &QueuePos| {
+            pos.side.book_side() == side && pos.px == px && pos.channel == Channel::Rpi
+        };
+        let fits = self
+            .orders
+            .values()
+            .filter(|held| behind(&held.pos))
+            .all(|held| held.pos.ahead.checked_add(added).is_some());
+        if !fits {
+            return Err(QueueError::Overflow { side, px });
+        }
+        for held in self.orders.values_mut().filter(|held| behind(&held.pos)) {
+            held.pos.ahead = lots(held.pos.ahead.get() + added.get());
+        }
+        Ok(())
+    }
+
     /// A public trade (0038). It reaches the modelled orders on the side its taker hit, at its
     /// price or through it (a better price for the taker's counterparty), in the order the
     /// venue matches them: the best price first, and at a price every public order before any
@@ -270,8 +313,12 @@ impl QueueModel {
     ///
     /// A trade's size is spent once across the orders it reaches; an order is never filled
     /// past what remains, and an order of a channel the trade's flow cannot fill (an RPI order
-    /// under public flow) only loses the size ahead of it. Gives one fill per order filled.
+    /// under public flow) only loses the size ahead of it. Gives one fill per order filled. A
+    /// trade of no size changes nothing: it says nothing of the levels it printed through.
     pub fn trade(&mut self, t: TradeView) -> Vec<SimFill> {
+        if t.qty == Lots::ZERO {
+            return Vec::new();
+        }
         let maker = t.taker.opposite();
         let reached = |pos: &QueuePos| {
             pos.side == maker
