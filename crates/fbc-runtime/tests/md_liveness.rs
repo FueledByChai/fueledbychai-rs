@@ -21,8 +21,8 @@ use fbc_core::{
     RateLimit, TagSet, VenueConfig, WireUrl,
 };
 use fbc_runtime::{
-    Connector, IngestClock, Liveness, LivenessError, MdSession, MdSessionConfig, MdVenue,
-    MdVenueConfig, ProxyConfig, ReconnectPacing, SessionError,
+    Connector, IngestClock, Liveness, LivenessError, MdControl, MdSession, MdSessionConfig,
+    MdVenue, MdVenueConfig, ProxyConfig, ReconnectPacing, SessionError,
 };
 use tokio::time::{Instant, advance};
 
@@ -439,6 +439,65 @@ async fn the_alarm_reports_the_set_wanted_when_it_rings() {
         .collect();
     assert_eq!(insts, [2, 3]);
     assert_eq!(session.counters().silences, 1);
+}
+
+/// Codex r4180000633: a handler that answers a stale report by changing the desired set, as a
+/// consumer that resubscribes elsewhere would, does so while the alarm is still reporting. A
+/// session that held the set's lock meanwhile would deadlock: the test runs it on a thread of
+/// its own and fails, rather than hangs, if it does not finish.
+#[test]
+fn a_handler_may_change_the_desired_set_from_a_stale_report() {
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        rt.block_on(resubscribe_on_stale());
+        let _ = done.send(());
+    });
+    finished
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the session finished");
+}
+
+async fn resubscribe_on_stale() {
+    let frozen = freeze();
+    let mut server = ScriptedWs::start().await;
+    let liveness = Liveness::new(ms(5_000), ms(1)).unwrap();
+    let config = toy_session(server.url(), &[], liveness);
+    let slot: Rc<RefCell<Option<MdControl>>> = Rc::default();
+    let reports = Rc::new(RefCell::new(0));
+    let (to, counted) = (slot.clone(), reports.clone());
+    let handler = move |env: Envelope<MdEvent>| {
+        if let (MdEvent::Health { .. }, Some(control)) = (env.body, to.borrow().as_ref()) {
+            *counted.borrow_mut() += 1;
+            control.set_desired([toy::sub(3)]);
+        }
+    };
+    let (mut session, control) = MdSession::new(config, handler).unwrap();
+    *slot.borrow_mut() = Some(control);
+    let script = async {
+        let mut first = server.accept().await;
+        assert_eq!(first.recv().await, "hello|codec=0|plan=1,2");
+        assert_eq!(first.recv().await, "sub|add=A,B");
+        churn().await;
+        advance(ms(5_000)).await;
+        assert_eq!(first.next().await, None);
+        churn().await;
+        advance(ms(1_000)).await;
+        let mut second = server.accept().await;
+        assert_eq!(second.recv().await, "hello|codec=1|plan=3");
+        assert_eq!(second.recv().await, "sub|add=C");
+        slot.borrow_mut().take();
+        assert_eq!(second.next().await, None);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    drop(frozen);
+    // Both of the silent epoch's subscriptions were reported.
+    assert_eq!(*reports.borrow(), 2);
 }
 
 #[tokio::test(start_paused = true)]

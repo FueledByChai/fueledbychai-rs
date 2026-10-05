@@ -906,9 +906,12 @@ impl<H: MdHandler> MdSession<H> {
 
     /// Reports every subscription wanted now stale, under one stamp of the silent epoch `key`:
     /// the control's latest set, even one the session has not applied yet (Codex
-    /// r4179959341); the next epoch applies it. A write the handler issues meanwhile is not
-    /// sent, on the closing connection or the next: it is counted with the refused effects.
+    /// r4179959341); the next epoch applies it. The set is copied first, so a handler that
+    /// changes it as it is told finds it unlocked (Codex r4180000633). A write the handler
+    /// issues meanwhile is not sent, on the closing connection or the next: it is counted with
+    /// the refused effects.
     fn report_silent(&mut self, key: ConnKey) {
+        let wanted = self.desired.borrow().clone();
         let stamp = self.clock.stamp(key, None);
         let mut sink = Sink {
             handler: &mut self.handler,
@@ -916,7 +919,7 @@ impl<H: MdHandler> MdSession<H> {
             out: &mut self.outbox,
             stamp,
         };
-        for sub in self.desired.borrow().iter() {
+        for sub in wanted {
             let (inst, feed, h) = (sub.inst, sub.feed, FeedHealth::Stale);
             sink.push(VenueMeta::NONE, MdEvent::Health { inst, feed, h });
         }
