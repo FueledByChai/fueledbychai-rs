@@ -1,5 +1,5 @@
 // Marking a stage gives nothing back: neither through PathStamps nor through the recorder trait
-// does a mark return the instant it was recorded at (decision 0033).
+// does a mark return the instant it was recorded at (decision 0034).
 use fbc_core::{MonoNs, PathEdge, PathMark, PathRecorder, PathStage, PathStamps};
 
 fn through_stamps(t: &mut PathStamps<'_>) -> MonoNs {

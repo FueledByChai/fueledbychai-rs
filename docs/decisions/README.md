@@ -36,4 +36,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0031](0031-kernel-receive-timestamps-come-from-so-timestampns-through-n.md) Kernel receive timestamps come from SO_TIMESTAMPNS through nix 0.31.3 on Linux, and a session reports each Safety write's tick-to-wire to its handler — accepted
 - [0032](0032-amends-and-batch-cancels-declare-the-order-references-they-c.md) Amends and batch cancels declare the order references they can name, and a codec refuses a request with none of them — accepted
 - [0033](0033-a-socket-endpoint-sends-its-codec-s-keepalive-rotates-before.md) A socket endpoint sends its codec's keepalive, rotates before the venue's connection lifetime and reports a silent stream stale before reconnecting — accepted
-- [0033](0033-a-codec-marks-its-latency-stages-through-write-only-pathstam.md) A codec marks its latency stages through write-only PathStamps and the runtime reads the clock — accepted
+- [0034](0034-a-codec-marks-its-latency-stages-through-write-only-pathstam.md) A codec marks its latency stages through write-only PathStamps and the runtime reads the clock — accepted

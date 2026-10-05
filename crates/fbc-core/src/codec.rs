@@ -999,7 +999,7 @@ pub trait ExecCodec: Send {
     ///
     /// Each signer call is marked as a [`PathStage::Sign`](crate::PathStage::Sign) through `t`
     /// ([`PathStamps::span`]); the marks give back no time, so the bytes are the same whatever
-    /// they recorded (0033).
+    /// they recorded (0034).
     fn encode(
         &mut self,
         cmd: &VenueCommand,

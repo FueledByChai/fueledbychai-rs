@@ -114,7 +114,7 @@ rather than guess.
   `Fee`/`FeeBook`, `DecodeScope`, `InstrumentSpec` (maker-safe `quantize`), `VenueCaps`,
   the market-data and execution events, venue commands, and the codec, signer, nonce and
   factory traits with `Effects` and `EncodeCtx`, and the write-only `PathStamps` a codec marks
-  its latency stages through (0033), `crates/fbc-book` with its L2 book, `crates/fbc-journal` with its record
+  its latency stages through (0034), `crates/fbc-book` with its L2 book, `crates/fbc-journal` with its record
   format, day-grouped segment writer rolled hourly with zstd-compressed closed segments, in-order reader and never-blocking sink, `crates/fbc-runtime` with its first
   slices (the connector, SOCKS5 CONNECT, WebSocket and HTTP/1.1, plain or TLS, 0019 and 0020, the WebSocket handshake its own, 0029;
   connection epochs and the subscription reconciler; the market-data session, 0023; HTTP
@@ -127,7 +127,7 @@ rather than guess.
   - `crates/fbc-core`: the contract. Time, units, price grids and exact prices, sealed ids and
     the canonical client-id codec, `Fee`/`FeeBook`, `InstrumentSpec`, `VenueCaps`, events,
     commands, the codec and factory traits, `DecodeScope` and `EncodeCtx` (0003, 0004), and
-    `PathStamps`, whose marks reach the runtime's `PathRecorder` and give back no time (0033).
+    `PathStamps`, whose marks reach the runtime's `PathRecorder` and give back no time (0034).
     `VenueCaps` keeps order and fill capabilities together in `exec: Option<ExecCaps>`,
     `None` for a market-data-only venue, which declares no fill source or fee sign (0015).
     Every codec names the credentials in what it receives (`redact_inbound`, `InboundSpans`;

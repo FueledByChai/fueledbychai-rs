@@ -535,7 +535,7 @@ impl ExecCodec for ToyExec {
             wall: ctx.wall,
             nonce: Some(nonce),
         };
-        // The signer call is the sign stage; the marks give back no time (0033).
+        // The signer call is the sign stage; the marks give back no time (0034).
         let sig = t.span(PathStage::Sign, || toy_sign(&wire));
         let frame = format!(
             "rpc={}\nplace|cid={cid}|sym={}|side={}|px={}|qty={}|po={}|ro={}|ts={}|nonce={nonce}\
@@ -1094,7 +1094,7 @@ const SIGN_END: PathMark = mark(PathStage::Sign, PathEdge::End);
 
 #[test]
 fn encode_marks_its_signer_call_and_its_bytes_are_the_same_whatever_the_stamps_recorded() {
-    // FBC-ji6, decision 0033: the codec marks the start and end of its signer call through
+    // FBC-ji6, decision 0034: the codec marks the start and end of its signer call through
     // PathStamps, and learns no time from it, so the same command under the same context encodes
     // to the same bytes whether the marks are recorded at one time, another, or not at all.
     let cmd = VenueCommand::Place(order(mint()));

@@ -280,7 +280,7 @@ pub struct SubmitHandle {
 /// only one (an OMS-issued authorization, or a gateway built only inside `fbc-oms`) before a
 /// live gateway exists.
 ///
-/// `t` carries the command's path marks (0033): a live gateway marks
+/// `t` carries the command's path marks (0034): a live gateway marks
 /// [`PathStage::Encode`](crate::PathStage::Encode) around its call to [`ExecCodec::encode`],
 /// which it hands `t` to mark its signer calls, and its runtime marks
 /// [`PathStage::Write`](crate::PathStage::Write) around the socket write.
