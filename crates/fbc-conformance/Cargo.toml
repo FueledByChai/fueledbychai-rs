@@ -1,6 +1,6 @@
 [package]
 name = "fbc-conformance"
-description = "The adapter conformance kit: so far a stub venue server on 127.0.0.1 that plays WebSocket fault scripts and fixed HTTP responses, the reconnect-storm script, and a check of connection attempts against reconnect pacing."
+description = "The adapter conformance kit: so far a stub venue server on 127.0.0.1 that plays WebSocket fault scripts and fixed HTTP responses, the reconnect-storm, duplicate-ack and silence-after-subscription scripts, and a check of connection attempts against reconnect pacing."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

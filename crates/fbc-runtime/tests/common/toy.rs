@@ -39,6 +39,11 @@
 //! FBC-djl: the configuration's `toy.lifetime_ms` declares that many milliseconds as the
 //! venue's `max_conn_lifetime`, and `toy.keepalive` (`ping:<ms>` or `frame:<ms>`) gives its codec
 //! a WebSocket ping, or the frame `ka`, every `<ms>` milliseconds.
+//!
+//! FBC-53c: `ack|sym=A` acknowledges instrument `A`'s subscription, as a venue does. The first
+//! acknowledgement a codec reads marks `A` live and, when the configuration's `toy.snapshot`
+//! names a base URL, asks for a GET of `<base>/A` (tag: the instrument's id, timeout 1 s), whose
+//! body is read like any response; a repeated acknowledgement asks for nothing.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
@@ -74,6 +79,9 @@ pub const ONE_STREAM: &str = "toy.one_stream";
 pub const LIFETIME_MS: &str = "toy.lifetime_ms";
 /// The configuration key that gives the codec a keepalive: `ping:<ms>` or `frame:<ms>`.
 pub const KEEPALIVE: &str = "toy.keepalive";
+/// The configuration key that names the base URL an acknowledged subscription's snapshot is
+/// asked for under.
+pub const SNAPSHOT: &str = "toy.snapshot";
 /// The toy's instruments, by id: 1 is `A`, 2 is `B`, 3 is `C`.
 const SYMBOLS: [&str; 3] = ["A", "B", "C"];
 
@@ -85,6 +93,7 @@ pub struct ToyVenue {
     plans: Mutex<Vec<Vec<u32>>>,
     http: Arc<Mutex<Vec<String>>>,
     subscribes: Arc<AtomicU32>,
+    snapshots: Arc<AtomicU32>,
     limits: Vec<RateLimit>,
 }
 
@@ -116,6 +125,11 @@ impl ToyVenue {
     /// How many subscribe calls its codecs had.
     pub fn subscribe_calls(&self) -> u32 {
         self.subscribes.load(Ordering::SeqCst)
+    }
+
+    /// How many snapshots its codecs asked for on an acknowledgement.
+    pub fn snapshots(&self) -> u32 {
+        self.snapshots.load(Ordering::SeqCst)
     }
 
     /// The instruments of the plan each codec was built for, in the order it built them.
@@ -331,6 +345,9 @@ impl VenueFactory for ToyVenue {
             subscribes: self.subscribes.clone(),
             split: cfg.get(SPLIT).map(|w| w.parse().unwrap_or(1)),
             keepalive: cfg.get(KEEPALIVE).map(keepalive),
+            snapshot: cfg.get(SNAPSHOT).map(str::to_owned),
+            live: BTreeSet::new(),
+            snapshots: self.snapshots.clone(),
         })
     }
 
@@ -360,6 +377,11 @@ struct ToyMd {
     /// instrument.
     split: Option<u32>,
     keepalive: Option<Keepalive>,
+    /// The base URL of the snapshots acknowledgements ask for.
+    snapshot: Option<String>,
+    /// The instruments whose subscription an acknowledgement marked live.
+    live: BTreeSet<InstrumentId>,
+    snapshots: Arc<AtomicU32>,
 }
 
 /// The keepalive `ping:<ms>` or `frame:<ms>` names.
@@ -650,6 +672,14 @@ impl ToyMd {
                     qty,
                 };
                 sink.push(meta, ev);
+            }
+            "ack" => {
+                let inst = inst()?;
+                if let (true, Some(base)) = (self.live.insert(inst), &self.snapshot) {
+                    self.snapshots.fetch_add(1, Ordering::SeqCst);
+                    let url = format!("{base}/{}", field(&fields, "sym")?);
+                    fx.push(get(u64::from(inst.get()), url, Duration::from_secs(1)));
+                }
             }
             "arm" => fx.push(Effect::Timer {
                 tag: TimerTag(u64::from(inst()?.get())),

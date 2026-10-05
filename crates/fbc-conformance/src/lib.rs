@@ -11,14 +11,18 @@
 //! - Scripts are typed Rust values; a text format is deferred (decision 0025).
 //! - [`reconnect_storm`], the storm of [`STORM_RECONNECTS`] forced reconnects, and
 //!   [`check_pacing`], which holds the attempts a stub saw to the client's reconnect pacing.
+//! - [`duplicate_acks`], every subscription acknowledged twice and each data frame pushed once,
+//!   and [`silence_after_ack`], a connection that goes silent once its subscriptions are
+//!   acknowledged, followed by the reconnect (FBC-53c).
 //!
-//! Not here yet: the duplicate-ack and silence scripts (FBC-53c), the named conformance suite
-//! and its macro, and the full conformance venue.
+//! Not here yet: the named conformance suite and its macro, and the full conformance venue.
 
 mod pacing;
 mod script;
 mod server;
 
 pub use pacing::{PacingBreach, check_pacing};
-pub use script::{Frame, STORM_RECONNECTS, Step, WsScript, reconnect_storm};
+pub use script::{
+    Frame, STORM_RECONNECTS, Step, WsScript, duplicate_acks, reconnect_storm, silence_after_ack,
+};
 pub use server::{ConnRecord, HttpReply, HttpRoutes, ScriptError, StubServer};

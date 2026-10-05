@@ -74,6 +74,42 @@ pub fn reconnect_storm(
     WsScript::new(steps)
 }
 
+/// Duplicate subscription acknowledgements, behind the Java stack's duplicate subscriptions
+/// after reconnects: one connection is accepted, `reads` frames are read from it (a client's
+/// open and subscribe frames), every frame of `acks` is pushed twice, and each frame of `data`
+/// once. The connection stays open.
+pub fn duplicate_acks(reads: usize, acks: &[Frame], data: &[Frame]) -> WsScript {
+    let push = |frame: &Frame| Step::Push {
+        conn: 0,
+        frame: frame.clone(),
+    };
+    let mut steps = vec![Step::Accept];
+    steps.extend((0..reads).map(|_| Step::Read { conn: 0 }));
+    steps.extend(acks.iter().flat_map(|ack| [push(ack), push(ack)]));
+    steps.extend(data.iter().map(push));
+    WsScript::new(steps)
+}
+
+/// Silence after subscription: connection 0 is accepted, `reads` frames are read from it, every
+/// frame of `acks` is pushed once, and then nothing arrives on it, though it stays open. The
+/// client should give up on it and reconnect: connection 1 is accepted, read and acknowledged
+/// the same way, and stays open.
+pub fn silence_after_ack(reads: usize, acks: &[Frame]) -> WsScript {
+    let mut steps = Vec::new();
+    for conn in 0..2 {
+        steps.push(Step::Accept);
+        steps.extend((0..reads).map(|_| Step::Read { conn }));
+        steps.extend(acks.iter().map(|ack| Step::Push {
+            conn,
+            frame: ack.clone(),
+        }));
+        if conn == 0 {
+            steps.push(Step::Silent { conn });
+        }
+    }
+    WsScript::new(steps)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +140,52 @@ mod tests {
         let accepts = full.steps.iter().filter(|s| **s == Step::Accept).count();
         assert_eq!(accepts, STORM_RECONNECTS + 1);
         assert_eq!(WsScript::default(), WsScript::new(Vec::new()));
+    }
+
+    #[test]
+    fn duplicate_acks_pushes_each_ack_twice_and_each_data_frame_once() {
+        let (a, b, d) = (Frame::text("a"), Frame::text("b"), Frame::text("d"));
+        let push = |frame: &Frame| Step::Push {
+            conn: 0,
+            frame: frame.clone(),
+        };
+        let script = duplicate_acks(1, &[a.clone(), b.clone()], std::slice::from_ref(&d));
+        assert_eq!(
+            script.steps,
+            [
+                Step::Accept,
+                Step::Read { conn: 0 },
+                push(&a),
+                push(&a),
+                push(&b),
+                push(&b),
+                push(&d),
+            ]
+        );
+    }
+
+    #[test]
+    fn silence_after_ack_acknowledges_then_goes_silent_and_takes_the_reconnect() {
+        let ack = Frame::text("ack");
+        let push = |conn| Step::Push {
+            conn,
+            frame: ack.clone(),
+        };
+        let script = silence_after_ack(2, std::slice::from_ref(&ack));
+        let read = |conn| Step::Read { conn };
+        assert_eq!(
+            script.steps,
+            [
+                Step::Accept,
+                read(0),
+                read(0),
+                push(0),
+                Step::Silent { conn: 0 },
+                Step::Accept,
+                read(1),
+                read(1),
+                push(1),
+            ]
+        );
     }
 }
