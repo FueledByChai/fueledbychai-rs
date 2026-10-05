@@ -178,6 +178,14 @@ impl QueueModel {
         self.orders.remove(&key).map(|held| held.pos)
     }
 
+    /// Sets what the order under `key` has left, keeping its place in its queue: an amend the
+    /// stood-in venue declares keeps priority (`AmendCaps::keeps_priority`, design §4.5).
+    pub(crate) fn set_remaining(&mut self, key: OrderKey, remaining: Lots) {
+        if let Some(held) = self.orders.get_mut(&key) {
+            held.pos.remaining = remaining;
+        }
+    }
+
     /// Queues a new order behind its level's size on the public `book`, less every modelled
     /// public order the model already holds at its side and price (they are queued themselves,
     /// so they never count as size ahead). `book` is the level as the simulated venue shows it

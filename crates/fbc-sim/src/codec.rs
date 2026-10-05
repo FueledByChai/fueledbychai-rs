@@ -1,34 +1,47 @@
 //! SimVenue's codec: an [`ExecCodec`] like any venue's (decision 0014, unchanged), whose
 //! stream is the simulated one its [`SimEngine`](crate::SimEngine) reads (decision 0046).
 
+use core::num::NonZeroU32;
 use core::time::Duration;
 use std::sync::Arc;
 
 use fbc_core::{
-    AckLevel, AckModel, CancelOnDisconnect, Channel, ChosenRef, CidMatch, CtxCall, DecodeError,
-    DecodeScope, Effect, Effects, EncodeCtx, EncodeReceipt, ExchTsKind, ExecCaps, ExecCodec,
-    ExecEvent, ExecSink, Feature, FillCaps, FillEvent, FillIdent, FillSource, HttpFailure,
-    HttpResponse, HttpTag, Inbound, InboundSpans, ItemRef, Liquidity, Liquidity3, MatchingCaps,
-    NotSentReason, OpKind, OrderCaps, OrderKind, OrderUpdate, OrderingKey, PathStamps, RateCharge,
-    RawFrame, Reject, RpcCall, RpcId, SpecTable, StreamId, SubmitOutcome, TifTag, TimerTag,
-    VenueCommand, VenueMeta, VenueOrderState, WireSlice, encode_cid,
+    AckLevel, AckModel, AmendOrder, CancelOnDisconnect, CancelOrder, CancelScope, Channel,
+    ChosenRef, CidMatch, CtxCall, DecodeError, DecodeScope, Effect, Effects, EncodeCtx,
+    EncodeReceipt, ExchTsKind, ExecCaps, ExecCodec, ExecEvent, ExecSink, Feature, FillCaps,
+    FillEvent, FillIdent, FillSource, HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans,
+    InstrumentId, ItemRef, Liquidity, Liquidity3, MatchingCaps, NotSentReason, OpKind, OrderCaps,
+    OrderKindTag, OrderRef, OrderUpdate, OrderingKey, PathStamps, QueryAnswer, RateCharge,
+    RawFrame, Reject, RpcCall, RpcId, SpecTable, StreamId, SubmitOutcome, Support, TifTag,
+    TimerTag, VenueCommand, VenueMeta, VenueOrderSnapshot, VenueOrderState, WireSlice, encode_cid,
 };
 
 use crate::config::SimConfig;
-use crate::wire::{Cancel, Command, Place, Refusal, Reply, Sent, SimState, Target, WireError};
+use crate::wire::{
+    Amend, Cancel, Command, Head, ItemResult, OrderEvent, Place, Query, Refusal, Reply, Sent,
+    SimState, Target, WireError,
+};
 
-/// The codec half of SimVenue. It writes each [`VenueCommand::Place`] and
-/// [`VenueCommand::Cancel`] as a frame on the simulated stream, stamped with its encode's time
-/// from [`EncodeCtx`], and decodes the engine's answers into outcomes, order updates and fills
-/// through [`DecodeScope`] only, so venue ids, fill ids and fees are built as a real codec
-/// builds them (0004), saying on its events only what the stood-in venue echoes. It refuses
-/// what the stood-in venue's [`OrderCaps`] do not offer, RPI orders, which the engine cannot
-/// fill yet (FBC-njk, decision 0046), and placements for a venue whose events the engine
-/// cannot say yet: two-phase acknowledgement (FBC-zr1), an ordering key other than a venue
-/// sequence, realized values on fills, or fills derived from order status (FBC-938), a venue
-/// with a speed bump (FBC-7y8), one whose fills replay on reconnect (FBC-3q6), or one that
-/// cancels orders on a disconnect, which the simulated stream never has (FBC-fji); amends,
-/// batches and queries are FBC-nv2's.
+/// The codec half of SimVenue. It writes each placement, batch of placements, amend, cancel,
+/// batch of cancels, instrument cancel-all and order query as a frame on the simulated stream,
+/// stamped with its encode's time from [`EncodeCtx`] and charged one per item, and decodes the
+/// engine's answers into outcomes (a batch's every item in the one call that decodes its
+/// frame, record 0014), order updates, fills and query results through [`DecodeScope`] only,
+/// so venue ids, fill ids and fees are built as a real codec builds them (0004), saying on its
+/// events only what the stood-in venue echoes. An amend is answered as an outcome then the
+/// amended order's event, whether the venue reports it with an event or only in its reply
+/// ([`AmendAck`](fbc_core::AmendAck)), which a real codec turns into the same event.
+///
+/// It refuses what the stood-in venue's [`OrderCaps`] do not offer: a kind, time in force,
+/// flag or reference, amends, batches (or one longer than their `max_items`; an empty one is
+/// unencodable), an instrument cancel-all, queries; and never sends an account-wide cancel-all
+/// (owner decision A). It refuses RPI orders, which the engine cannot fill yet (FBC-njk,
+/// decision 0046), amends for a venue that gives the amended order a new venue id (FBC-kodq),
+/// and placements and amends for a venue whose events the engine cannot say yet: two-phase
+/// acknowledgement (FBC-zr1), an ordering key other than a venue sequence, realized values on
+/// fills, or fills derived from order status (FBC-938), a venue with a speed bump (FBC-7y8),
+/// one whose fills replay on reconnect (FBC-3q6), or one that cancels orders on a disconnect,
+/// which the simulated stream never has (FBC-fji). Cancels and queries still go.
 #[derive(Clone, Debug)]
 pub struct SimCodec {
     /// Whether the engine can say what the stood-in venue's events say ([`modelled`]).
@@ -51,28 +64,32 @@ impl SimCodec {
         }
     }
 
-    fn place(
+    /// Whether the stood-in venue takes an order of this kind, time in force, channel and
+    /// flags, which the engine can answer as it would.
+    fn offered(
         &self,
-        o: &fbc_core::NewOrder,
-        rpc: RpcId,
-        sent: Sent,
-    ) -> Result<Command, NotSentReason> {
-        let offered = self.caps.kinds.contains(o.kind.tag())
-            && self.caps.tifs.contains(o.tif)
-            && self.caps.channels.contains(o.channel)
-            && o.channel == Channel::Public
-            && (self.caps.post_only || !o.post_only)
-            && (self.caps.reduce_only || !o.reduce_only);
+        kind: OrderKindTag,
+        tif: TifTag,
+        channel: Channel,
+        post_only: bool,
+        reduce_only: bool,
+    ) -> Result<(), NotSentReason> {
+        let offered = self.caps.kinds.contains(kind)
+            && self.caps.tifs.contains(tif)
+            && self.caps.channels.contains(channel)
+            && channel == Channel::Public
+            && (self.caps.post_only || !post_only)
+            && (self.caps.reduce_only || !reduce_only);
         if !offered || !self.modelled {
             return Err(NotSentReason::Unsupported);
         }
         // Codex r4182154713: a pair the stood-in venue refuses together is refused here too.
         let has = |feature| match feature {
-            Feature::PostOnly => o.post_only,
-            Feature::ReduceOnly => o.reduce_only,
-            Feature::Ioc => o.tif == TifTag::Ioc,
-            Feature::Fok => o.tif == TifTag::Fok,
-            Feature::Rpi => o.channel == Channel::Rpi,
+            Feature::PostOnly => post_only,
+            Feature::ReduceOnly => reduce_only,
+            Feature::Ioc => tif == TifTag::Ioc,
+            Feature::Fok => tif == TifTag::Fok,
+            Feature::Rpi => channel == Channel::Rpi,
         };
         if self
             .caps
@@ -82,23 +99,157 @@ impl SimCodec {
         {
             return Err(NotSentReason::FlagConflict);
         }
-        let cid =
-            encode_cid(&self.caps.client_id, o.cid).map_err(|_| NotSentReason::Unencodable)?;
-        Ok(Command::Place(Place {
-            rpc: rpc.0,
-            sent,
-            cid: cid.to_string(),
+        Ok(())
+    }
+
+    /// A placement, refused as unencodable for an instrument the spec table does not list.
+    fn place(
+        &self,
+        o: &fbc_core::NewOrder,
+        head: Head,
+        specs: &SpecTable,
+    ) -> Result<Place, NotSentReason> {
+        if specs.get(o.inst).is_none() {
+            return Err(NotSentReason::Unencodable);
+        }
+        self.offered(o.kind.tag(), o.tif, o.channel, o.post_only, o.reduce_only)?;
+        Ok(Place {
+            rpc: head.rpc,
+            sent: head.sent,
+            cid: self.wire_cid(o.cid)?,
             inst: o.inst,
             side: o.side,
-            px: match o.kind {
-                OrderKind::Limit { px } => Some(px),
-                OrderKind::Market => None,
-            },
+            px: o.kind.limit_px(),
             qty: o.qty,
             tif: o.tif,
             post_only: o.post_only,
             reduce_only: o.reduce_only,
-        }))
+        })
+    }
+
+    /// Our client id in the stood-in venue's wire format.
+    fn wire_cid(&self, cid: fbc_core::ClientOrderId) -> Result<String, NotSentReason> {
+        let wire = encode_cid(&self.caps.client_id, cid);
+        Ok(wire.map_err(|_| NotSentReason::Unencodable)?.to_string())
+    }
+
+    /// The order a request names, by the reference chosen for it; the simulated venue tracks
+    /// no placement nonces.
+    fn target(&self, chosen: Option<ChosenRef<'_>>) -> Result<Target, NotSentReason> {
+        match chosen {
+            Some(ChosenRef::Venue(vid)) => Ok(Target::Venue(vid.as_str().to_owned())),
+            Some(ChosenRef::Client(cid)) => Ok(Target::Client(self.wire_cid(cid)?)),
+            Some(ChosenRef::PlacementNonce(_)) | None => Err(NotSentReason::Unsupported),
+        }
+    }
+
+    /// An amend, for a venue whose amends the engine answers as it would: one that keeps the
+    /// order's venue id (FBC-kodq), with the order's full values after it and the quantity the
+    /// venue's wire carries.
+    fn amend(&self, a: &AmendOrder, head: Head, specs: &SpecTable) -> Result<Amend, NotSentReason> {
+        let caps = self.caps.amend.filter(|caps| caps.keeps_venue_id);
+        let caps = caps.ok_or(NotSentReason::Unsupported)?;
+        let kind = OrderKindTag::Limit;
+        self.offered(kind, a.tif, a.channel, a.post_only, a.reduce_only)?;
+        let target = self.target(a.reference(&caps))?;
+        // A total at or below the filled quantity leaves nothing to rest: a cancel, not an
+        // amend (`AmendOrder::wire_qty`).
+        let qty = a.wire_qty(caps.qty_semantics);
+        let qty = qty.ok_or(NotSentReason::Unencodable)?;
+        specs.get(a.inst).ok_or(NotSentReason::Unencodable)?;
+        Ok(Amend {
+            head,
+            target,
+            inst: a.inst,
+            side: a.side,
+            px: a.px,
+            qty,
+            tif: a.tif,
+            post_only: a.post_only,
+            reduce_only: a.reduce_only,
+        })
+    }
+
+    /// The frame `cmd` is written as, with its operation, the instrument its charge names and
+    /// its weight: one per item of a batch.
+    fn command(
+        &self,
+        cmd: &VenueCommand,
+        head: Head,
+        specs: &SpecTable,
+    ) -> Result<(Command, OpKind, Option<InstrumentId>, usize), NotSentReason> {
+        use NotSentReason::Unsupported;
+        Ok(match cmd {
+            VenueCommand::Place(o) => {
+                let place = self.place(o, head, specs)?;
+                (Command::Place(place), OpKind::Place, Some(o.inst), 1)
+            }
+            VenueCommand::PlaceBatch(orders) => {
+                let max = self.caps.batch_place.map(|batch| batch.max_items);
+                batch_len(orders.len(), max)?;
+                let place = |o| self.place(o, head, specs);
+                let places = orders.iter().map(place).collect::<Result<_, _>>()?;
+                let inst = shared(orders.iter().map(|o| o.inst));
+                (
+                    Command::Batch(head, places),
+                    OpKind::Place,
+                    inst,
+                    orders.len(),
+                )
+            }
+            VenueCommand::Amend(a) => {
+                let amend = self.amend(a, head, specs)?;
+                (Command::Amend(amend), OpKind::Amend, Some(a.inst), 1)
+            }
+            // A cancel names only the order, so an instrument the table no longer lists does
+            // not stop it (Codex r4182991965).
+            VenueCommand::Cancel(c) => {
+                let target = self.target(c.reference(self.caps.cancel_refs))?;
+                let cancel = Cancel {
+                    rpc: head.rpc,
+                    sent: head.sent,
+                    target,
+                };
+                (Command::Cancel(cancel), OpKind::Cancel, Some(c.inst), 1)
+            }
+            VenueCommand::CancelMany(cancels) => {
+                let batch = self.caps.batch_cancel.ok_or(Unsupported)?;
+                batch_len(cancels.len(), Some(batch.max_items))?;
+                let target = |c: &CancelOrder| self.target(c.reference(batch.refs));
+                let targets = cancels.iter().map(target).collect::<Result<_, _>>()?;
+                let inst = shared(cancels.iter().map(|c| c.inst));
+                let command = Command::Cancels(head, targets);
+                (command, OpKind::Cancel, inst, cancels.len())
+            }
+            // Never widened to the account, and never account-wide (owner decision A).
+            VenueCommand::CancelAll(CancelScope::Instrument(inst))
+                if self.caps.cancel_all_instrument == Support::Native =>
+            {
+                (
+                    Command::CancelAll(head, *inst),
+                    OpKind::CancelAll,
+                    Some(*inst),
+                    1,
+                )
+            }
+            VenueCommand::Query(q) => {
+                let target = self.target(q.reference(self.caps.query_refs))?;
+                let vid = q.target.venue().map(|vid| vid.as_str().to_owned());
+                let cid = q
+                    .target
+                    .client()
+                    .map(|cid| self.wire_cid(cid))
+                    .transpose()?;
+                let query = Query {
+                    head,
+                    target,
+                    vid,
+                    cid,
+                };
+                (Command::Query(query), OpKind::Query, Some(q.inst), 1)
+            }
+            _ => return Err(Unsupported),
+        })
     }
 
     /// An event's client id, read only where the stood-in venue echoes it on events.
@@ -107,26 +258,108 @@ impl SimCodec {
         echoed.then(|| scope.client_order_id(wire))
     }
 
-    fn cancel(
-        &self,
-        c: &fbc_core::CancelOrder,
-        rpc: RpcId,
-        sent: Sent,
-    ) -> Result<Command, NotSentReason> {
-        let target = match c.reference(self.caps.cancel_refs) {
-            Some(ChosenRef::Venue(vid)) => Target::Venue(vid.as_str().to_owned()),
-            Some(ChosenRef::Client(cid)) => {
-                let wire = encode_cid(&self.caps.client_id, cid);
-                Target::Client(wire.map_err(|_| NotSentReason::Unencodable)?.to_string())
+    /// The outcome of item `idx` of request `rpc`.
+    fn outcome(
+        rpc: u64,
+        idx: u16,
+        result: ItemResult,
+        scope: &DecodeScope<'_>,
+    ) -> Result<ExecEvent, DecodeError> {
+        let (item, outcome) = match result {
+            ItemResult::Accepted { cid, vid } => {
+                let item = ItemRef {
+                    idx,
+                    cid: ours(scope, &cid),
+                    vid: Some(scope.venue_order_id(&vid)?),
+                };
+                let ack = AckLevel::Final;
+                (item, SubmitOutcome::Accepted { ack })
             }
-            Some(ChosenRef::PlacementNonce(_)) | None => return Err(NotSentReason::Unsupported),
+            ItemResult::Rejected(refusal) => {
+                let (cid, vid) = (None, None);
+                (
+                    ItemRef { idx, cid, vid },
+                    SubmitOutcome::Rejected(reject(refusal)),
+                )
+            }
         };
-        Ok(Command::Cancel(Cancel {
-            rpc: rpc.0,
-            sent,
-            target,
-        }))
+        Ok(ExecEvent::Outcome {
+            rpc: RpcId(rpc),
+            item: Some(item),
+            outcome,
+        })
     }
+
+    /// An order as the venue reports it, saying only what the stood-in venue echoes (Codex
+    /// r4182678498, r4182678504): its client ids and the order's flags.
+    fn snapshot(
+        &self,
+        o: OrderEvent,
+        scope: &DecodeScope<'_>,
+    ) -> Result<VenueOrderSnapshot, DecodeError> {
+        let flags = self.caps.events_echo_flags;
+        Ok(VenueOrderSnapshot {
+            cid: self.echoed_cid(scope, &o.cid),
+            vid: scope.venue_order_id(&o.vid)?,
+            inst: o.inst,
+            side: o.side,
+            state: match o.state {
+                SimState::Open => VenueOrderState::Open,
+                SimState::Filled => VenueOrderState::Filled,
+                SimState::Canceled(reason) => VenueOrderState::Canceled(reason),
+            },
+            px: o.px,
+            qty: o.qty,
+            cum_filled: o.cum,
+            post_only: flags.then_some(o.post_only),
+            reduce_only: flags.then_some(o.reduce_only),
+        })
+    }
+
+    /// A query's answer: the order it asked about, named by the identifiers it echoes, and
+    /// the order the venue reports, which must be that order ([`QueryAnswer::new`]).
+    fn query_answer(
+        &self,
+        rpc: u64,
+        ids: (Option<String>, Option<String>),
+        found: Option<OrderEvent>,
+        scope: &DecodeScope<'_>,
+    ) -> Result<ExecEvent, DecodeError> {
+        let vid = ids.0.map(|vid| scope.venue_order_id(&vid)).transpose()?;
+        let cid = match ids.1 {
+            Some(cid) => Some(ours(scope, &cid).ok_or(DecodeError::Malformed("query cid"))?),
+            None => None,
+        };
+        let target = match (cid, vid) {
+            (Some(cid), Some(vid)) => OrderRef::Both(cid, vid),
+            (Some(cid), None) => OrderRef::Client(cid),
+            (None, Some(vid)) => OrderRef::Venue(vid),
+            (None, None) => return Err(DecodeError::Malformed("query target")),
+        };
+        let found = found.map(|o| self.snapshot(o, scope)).transpose()?;
+        let answer = QueryAnswer::new(RpcId(rpc), target, found);
+        let answer = answer.ok_or(DecodeError::Malformed("query answer names another order"))?;
+        Ok(ExecEvent::QueryResult(answer))
+    }
+}
+
+/// A batch's length checked against the venue's: refused when it takes no batch or the batch
+/// is longer than it takes, and unencodable when empty.
+fn batch_len(len: usize, max_items: Option<u16>) -> Result<(), NotSentReason> {
+    let max = max_items.ok_or(NotSentReason::Unsupported)?;
+    if len > usize::from(max) {
+        return Err(NotSentReason::Unsupported);
+    }
+    if len == 0 {
+        return Err(NotSentReason::Unencodable);
+    }
+    Ok(())
+}
+
+/// The instrument every item names, or `None` for a batch that spans several.
+fn shared(mut insts: impl Iterator<Item = InstrumentId>) -> Option<InstrumentId> {
+    let first = insts.next()?;
+    insts.all(|inst| inst == first).then_some(first)
 }
 
 /// Whether the engine answers as the venue `exec` and `matching` describe: it delays no
@@ -178,20 +411,17 @@ impl ExecCodec for SimCodec {
         _t: &mut PathStamps<'_>,
         fx: &mut Effects,
     ) -> Result<EncodeReceipt, NotSentReason> {
-        let sent = Sent {
-            mono: ctx.mono,
-            wall: ctx.wall,
+        let head = Head {
+            rpc: rpc.0,
+            sent: Sent {
+                mono: ctx.mono,
+                wall: ctx.wall,
+            },
         };
-        let (command, op, inst) = match cmd {
-            // A placement needs its instrument's spec; a cancel names only the order, so an
-            // instrument the table no longer lists does not stop it (Codex r4182991965).
-            VenueCommand::Place(o) if specs.get(o.inst).is_none() => {
-                return Err(NotSentReason::Unencodable);
-            }
-            VenueCommand::Place(o) => (self.place(o, rpc, sent)?, OpKind::Place, o.inst),
-            VenueCommand::Cancel(c) => (self.cancel(c, rpc, sent)?, OpKind::Cancel, c.inst),
-            _ => return Err(NotSentReason::Unsupported),
-        };
+        let (command, op, inst, items) = self.command(cmd, head, specs)?;
+        // At most a batch's `max_items`, a u16, so never zero and always a u32.
+        let weight = u32::try_from(items).ok().and_then(NonZeroU32::new);
+        let weight = weight.unwrap_or(NonZeroU32::MIN);
         fx.push(Effect::Send {
             stream: self.stream,
             frame: WireSlice::plain(command.encode()),
@@ -200,7 +430,7 @@ impl ExecCodec for SimCodec {
                 timeout: self.rpc_timeout,
             }),
             class: cmd.traffic_class(),
-            charge: RateCharge::one(op, Some(inst)),
+            charge: RateCharge { op, inst, weight },
         });
         Ok(EncodeReceipt::new())
     }
@@ -216,46 +446,53 @@ impl ExecCodec for SimCodec {
         _fx: &mut Effects,
     ) -> Result<(), DecodeError> {
         let (seq, reply) = Reply::decode(f.bytes()).map_err(malformed)?;
-        let event = match reply {
-            Reply::Accepted { rpc, cid, vid } => ExecEvent::Outcome {
+        let events = match reply {
+            Reply::Accepted { rpc, cid, vid } => {
+                let result = ItemResult::Accepted { cid, vid };
+                vec![SimCodec::outcome(rpc, 0, result, scope)?]
+            }
+            Reply::Rejected { rpc, refusal } => {
+                let result = ItemResult::Rejected(refusal);
+                vec![SimCodec::outcome(rpc, 0, result, scope)?]
+            }
+            // Every item's outcome is pushed in this one call (the one-call contract, 0014).
+            Reply::Items { rpc, items } => {
+                let outcome = |(idx, result): (usize, ItemResult)| {
+                    let idx = u16::try_from(idx).map_err(|_| DecodeError::Malformed("items"))?;
+                    SimCodec::outcome(rpc, idx, result, scope)
+                };
+                let items = items.into_iter().enumerate().map(outcome);
+                items.collect::<Result<_, _>>()?
+            }
+            Reply::Done { rpc } => vec![ExecEvent::Outcome {
                 rpc: RpcId(rpc),
-                item: Some(ItemRef {
-                    idx: 0,
-                    cid: ours(scope, &cid),
-                    vid: Some(scope.venue_order_id(&vid)?),
-                }),
+                item: None,
                 outcome: SubmitOutcome::Accepted {
                     ack: AckLevel::Final,
                 },
-            },
-            Reply::Rejected { rpc, refusal } => ExecEvent::Outcome {
-                rpc: RpcId(rpc),
-                item: Some(ItemRef {
-                    idx: 0,
-                    cid: None,
-                    vid: None,
-                }),
-                outcome: SubmitOutcome::Rejected(reject(refusal)),
-            },
-            // Only what the stood-in venue echoes on its events (Codex r4182678498,
-            // r4182678504): its client ids and the order's flags.
-            Reply::Order(o) => ExecEvent::Order(OrderUpdate {
-                cid: self.echoed_cid(scope, &o.cid),
-                vid: Some(scope.venue_order_id(&o.vid)?),
-                inst: o.inst,
-                side: o.side,
-                state: match o.state {
-                    SimState::Open => VenueOrderState::Open,
-                    SimState::Filled => VenueOrderState::Filled,
-                    SimState::Canceled(reason) => VenueOrderState::Canceled(reason),
-                },
-                cum_filled: o.cum,
-                px: o.px,
-                qty: Some(o.qty),
-                post_only: self.caps.events_echo_flags.then_some(o.post_only),
-                reduce_only: self.caps.events_echo_flags.then_some(o.reduce_only),
-            }),
-            Reply::Fill(fill) => ExecEvent::Fill(FillEvent {
+            }],
+            Reply::Query {
+                rpc,
+                vid,
+                cid,
+                found,
+            } => vec![self.query_answer(rpc, (vid, cid), found, scope)?],
+            Reply::Order(o) => {
+                let o = self.snapshot(o, scope)?;
+                vec![ExecEvent::Order(OrderUpdate {
+                    cid: o.cid,
+                    vid: Some(o.vid),
+                    inst: o.inst,
+                    side: o.side,
+                    state: o.state,
+                    cum_filled: o.cum_filled,
+                    px: o.px,
+                    qty: Some(o.qty),
+                    post_only: o.post_only,
+                    reduce_only: o.reduce_only,
+                })]
+            }
+            Reply::Fill(fill) => vec![ExecEvent::Fill(FillEvent {
                 // Only what the stood-in venue reports (Codex r4182448147): without fill ids
                 // a fill is keyed by its order and cumulative quantity. With them it names both,
                 // which `FillCaps` cannot yet say a venue's fills omit (FBC-2g7).
@@ -286,14 +523,16 @@ impl ExecCodec for SimCodec {
                 realized_pnl: None,
                 realized_funding: None,
                 replay: false,
-            }),
+            })],
         };
         let meta = VenueMeta {
             exch_ts: None,
             exch_ts_kind: ExchTsKind::Unknown,
             venue_seq: Some(seq),
         };
-        sink.push(meta, event);
+        for event in events {
+            sink.push(meta, event);
+        }
         Ok(())
     }
 
