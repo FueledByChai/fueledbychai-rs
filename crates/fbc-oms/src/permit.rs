@@ -32,6 +32,7 @@ use fbc_core::{
     OrderKind, OrderRef, TagSet, Ticks, VenueCommand,
 };
 
+use crate::caps::{CapRefusal, Exposure};
 use crate::record::{Intent, OrdState, OrderRecord};
 
 /// Why the registry gives no permit for an order.
@@ -89,12 +90,17 @@ pub enum AmendRefusal {
     /// The order carries no reference the venue's amend can name
     /// ([`AmendCaps::refs`](fbc_core::AmendCaps::refs)).
     NoDeclaredReference,
+    /// A pre-trade cap refused it (0013 rule 2): the amend would take the worst case on the
+    /// order's side past the inventory cap, or its market has no cap configured.
+    Capped(CapRefusal),
 }
 
-/// A venue command built from a permit, every field from the order's record: an amend, a
-/// cancel or a cancel-many of one market. Only this crate builds one; it can be read, not
-/// edited, and an authorization for an amend or a cancel is issued only from one (0045). It
-/// has no `Clone`: each permit's command is authorized once.
+/// A venue command this crate built: an amend, a cancel or a cancel-many of one market from a
+/// permit, every field from the order's record, or a place or a batch of places the
+/// pre-trade caps admitted ([`Registry::place`], [`Registry::place_batch`]). Only this crate
+/// builds one; it can be read, not edited, and an authorization for an order-affecting
+/// command other than an instrument cancel-all is issued only from one (0045). It has no
+/// `Clone`: each one is authorized once.
 #[derive(Eq, PartialEq, Debug)]
 pub struct PermittedCommand {
     cmd: VenueCommand,
@@ -109,6 +115,11 @@ impl PermittedCommand {
     /// The command, for the authorization issued from it.
     pub(crate) fn into_command(self) -> VenueCommand {
         self.cmd
+    }
+
+    /// A place or a batch of places the pre-trade caps admitted.
+    pub(crate) fn admitted(cmd: VenueCommand) -> PermittedCommand {
+        PermittedCommand { cmd }
     }
 }
 
@@ -136,15 +147,30 @@ pub struct CancelPlan {
     pub refused: Vec<(ClientOrderId, PermitRefusal)>,
 }
 
+/// What [`Registry::place_batch`] built.
+#[derive(Eq, PartialEq, Debug, Default)]
+pub struct PlacePlan {
+    /// The batch of the items admitted, in the order given; `None` when none was.
+    pub command: Option<PermittedCommand>,
+    /// The items refused, never built, and why.
+    pub refused: Vec<(ClientOrderId, crate::OmsError)>,
+}
+
 /// The permit to amend an order: it rests (Open or PartiallyFilled) with nothing in flight.
-/// Only the [`Registry`](crate::Registry) gives one ([`Registry::live`](crate::Registry::live)).
+/// Only the [`Registry`](crate::Registry) gives one ([`Registry::live`](crate::Registry::live)),
+/// holding it mutably, with what the order's side holds besides the order, so the amend is
+/// judged against the pre-trade caps with every other order as the registry has it.
 #[derive(Debug)]
 pub struct Live<'r> {
-    rec: &'r OrderRecord,
+    rec: &'r mut OrderRecord,
+    exposure: Exposure,
 }
 
 impl<'r> Live<'r> {
-    pub(crate) fn check(rec: &'r OrderRecord) -> Result<Live<'r>, PermitRefusal> {
+    pub(crate) fn check(
+        rec: &'r mut OrderRecord,
+        exposure: Exposure,
+    ) -> Result<Live<'r>, PermitRefusal> {
         let cid = rec.cid();
         match rec.state() {
             OrdState::Terminal(_) => return Err(PermitRefusal::Terminal(cid)),
@@ -153,13 +179,13 @@ impl<'r> Live<'r> {
             }
             OrdState::Open | OrdState::PartiallyFilled => {}
         }
-        if rec.intent() != Intent::None || rec.cancel_awaits_ack() {
+        if rec.intent() != Intent::None || rec.cancel_awaits_ack() || rec.amend_built().is_some() {
             return Err(PermitRefusal::IntentPending(cid));
         }
         if rec.unknown_since().is_some() {
             return Err(PermitRefusal::OnLadder(cid));
         }
-        Ok(Live { rec })
+        Ok(Live { rec, exposure })
     }
 
     /// The order the permit is for.
@@ -177,6 +203,16 @@ impl<'r> Live<'r> {
     /// of the placement, and `reducing`, the caller's classification of the amended order as
     /// one that can only reduce the position, as on [`NewOrder::reducing`](fbc_core::NewOrder):
     /// it chooses the traffic class only and exempts the amend from no check (0013 rule 2).
+    ///
+    /// Refused, never built, when the amend would take the worst case on the order's side past
+    /// its market's inventory cap (0005's I6), the order counted at the larger of its resting
+    /// quantity now and the amend's, as it is while the amend is in flight, or when its market
+    /// has no cap configured ([`AmendRefusal::Capped`]). A replace (an amend on a venue whose
+    /// amend gives the order a new id) is checked the same way. An amend built counts at once
+    /// ([`OrderRecord::amend_built`]), so a check after it, of this order or another, sees
+    /// it; it becomes the amend in flight when it is reported sent
+    /// ([`Registry::amend_sent`](crate::Registry::amend_sent)), and an order whose amend was
+    /// built and never sent gets no further Live permit: it can still be cancelled.
     pub fn amend(
         self,
         caps: &OrderCaps,
@@ -184,7 +220,7 @@ impl<'r> Live<'r> {
         qty: Lots,
         reducing: bool,
     ) -> Result<PermittedCommand, AmendRefusal> {
-        let rec = self.rec;
+        let rec = &*self.rec;
         let amend_caps = caps.amend.as_ref().ok_or(AmendRefusal::NotAmendable)?;
         if rec.placed().kind == OrderKind::Market {
             return Err(AmendRefusal::NotLimit);
@@ -219,6 +255,10 @@ impl<'r> Live<'r> {
         if amend.reference(amend_caps).is_none() {
             return Err(AmendRefusal::NoDeclaredReference);
         }
+        self.exposure
+            .admit(rec.resting_if_amended(qty))
+            .map_err(AmendRefusal::Capped)?;
+        self.rec.set_amend_built(qty);
         Ok(PermittedCommand {
             cmd: VenueCommand::Amend(amend),
         })

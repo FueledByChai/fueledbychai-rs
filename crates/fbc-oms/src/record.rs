@@ -208,6 +208,9 @@ pub struct OrderRecord {
     /// The largest total of the amends a later command replaced in flight, before anything
     /// tied a confirmation to them: any of them may rest at the venue.
     unsettled: Option<Lots>,
+    /// The total of an amend built ([`Live::amend`](crate::Live::amend)) and not yet reported
+    /// sent: counted as resting from when it is built, so a later check sees it.
+    built: Option<Lots>,
     /// The latest venue ordering key applied when an amend was replaced in flight, or since
     /// while a command was in flight: only a total stated under a later key, with no command
     /// in flight, settles `unsettled`.
@@ -265,6 +268,7 @@ impl OrderRecord {
             cum_venue: Lots::ZERO,
             cum_fills: Lots::ZERO,
             unsettled: None,
+            built: None,
             unsettled_bar: None,
             state: OrdState::PendingNew,
             intent: Intent::None,
@@ -345,7 +349,8 @@ impl OrderRecord {
 
     /// The quantity still resting: nothing once terminal; otherwise the largest total the
     /// venue may hold less the filled part, so a PendingNew or Unknown order counts as fully
-    /// resting, and an amend to a larger total counts from when it is sent until the venue
+    /// resting, and an amend to a larger total counts from when it is built
+    /// ([`Live::amend`](crate::Live::amend)), then sent, until the venue
     /// confirms an amend sent at or after it, or states the total once no command is in flight
     /// under a venue ordering key later than any applied while the amend was on its way, or the
     /// amend is refused while it is the only one unconfirmed, or the order ends (I6).
@@ -359,8 +364,32 @@ impl OrderRecord {
         }
     }
 
-    /// The largest total the venue may hold: the order's total, the amend in flight's and
-    /// those of the amends replaced in flight before they were confirmed.
+    /// What [`Self::resting`] would be once an amend to the total `qty` is sent: the larger
+    /// of the order's resting quantity now and that of the amend, until it is acknowledged.
+    pub(crate) fn resting_if_amended(&self, qty: Lots) -> Lots {
+        self.ceiling()
+            .max(qty)
+            .checked_sub(self.filled())
+            .unwrap_or(Lots::ZERO)
+    }
+
+    /// The total of the amend built and not yet reported sent ([`Self::amend_sent`]), if any.
+    pub fn amend_built(&self) -> Option<Lots> {
+        self.built
+    }
+
+    pub(crate) fn set_amend_built(&mut self, qty: Lots) {
+        self.built = Some(qty);
+    }
+
+    /// Releases the amend built and never handed to a gateway; whether there was one.
+    pub(crate) fn withdraw_built(&mut self) -> bool {
+        self.built.take().is_some()
+    }
+
+    /// The largest total the venue may hold: the order's total, the amend in flight's, an
+    /// amend built and not yet reported sent, and those of the amends replaced in flight
+    /// before they were confirmed.
     fn ceiling(&self) -> Lots {
         let pending = match self.intent {
             Intent::PendingAmend { qty, .. } => qty,
@@ -368,6 +397,7 @@ impl OrderRecord {
         };
         self.qty
             .max(pending)
+            .max(self.built.unwrap_or(Lots::ZERO))
             .max(self.unsettled.unwrap_or(Lots::ZERO))
     }
 
@@ -427,7 +457,9 @@ impl OrderRecord {
     /// whose amend gives the order a new id, the venue may already know it by an id the record
     /// has not learnt.
     pub fn amend_unconfirmed(&self) -> bool {
-        matches!(self.intent, Intent::PendingAmend { .. }) || self.unsettled.is_some()
+        matches!(self.intent, Intent::PendingAmend { .. })
+            || self.unsettled.is_some()
+            || self.built.is_some()
     }
 
     /// Whether an amended update named no new venue id ([`VenueOrderState::Amended`] with
@@ -476,7 +508,17 @@ impl OrderRecord {
         if self.state.is_terminal() {
             return false;
         }
-        if let Intent::PendingAmend { qty, .. } = self.intent {
+        // An amend built and not reported sent becomes the amend in flight when this is it;
+        // otherwise, like an amend replaced in flight, it may still reach the venue.
+        let built = self
+            .built
+            .take()
+            .filter(|b| !matches!(intent, Intent::PendingAmend { qty, .. } if qty == *b));
+        let replaced = match self.intent {
+            Intent::PendingAmend { qty, .. } => Some(qty),
+            _ => None,
+        };
+        if let Some(qty) = replaced.max(built) {
             // Replaced before anything confirmed it: the amend may still reach the venue.
             self.unsettled = Some(self.unsettled.map_or(qty, |u| u.max(qty)));
             self.unsettled_bar = self.unsettled_bar.max(self.last_key.and_then(|k| k.venue));
@@ -913,6 +955,7 @@ impl OrderRecord {
     fn end(&mut self, kind: TerminalKind) {
         self.state = OrdState::Terminal(kind);
         self.intent = Intent::None;
+        self.built = None;
         self.cancel_awaits_ack = false;
         self.settle();
         self.leave_ladder();

@@ -74,9 +74,21 @@
 //! ladder it counts as fully resting and gets no [`Live`] permit; nothing places or amends it
 //! again (`tests/ladder.rs`).
 //!
-//! Not here yet: the pre-trade caps (FBC-2e4), the market states (FBC-c4v), and issuing an
-//! authorization after them and its check at submit (FBC-afd).
+//! The pre-trade caps (0013 rule 2) are the consumer's [`PreTradeCaps`], per market, with no
+//! default: the inventory cap is 0005's I6 (the owner's decision A names it so), the worst-case
+//! position `|pos + Σ resting same side + new| ≤ cap`, resting as [`Registry::resting_on`]
+//! counts it (PendingNew and Unknown orders in full, a partly filled order's remainder until it
+//! is terminal, an amend in flight at the larger of its old and new quantity). A place is built
+//! only by [`Registry::place`], a batch only by [`Registry::place_batch`] (each item judged
+//! with the earlier ones admitted counted PendingNew) and an amend or replace only by
+//! [`Live::amend`], each refused, never built, when it would breach the cap or its market has
+//! none, reducing and reduce-only ones included: the formula admits an order that genuinely
+//! reduces the position by itself. Cancels are never capped (`tests/caps.rs`).
+//!
+//! Not here yet: the gross per-side resting cap (FBC-zf7), the market states (FBC-c4v), and
+//! issuing an authorization after them and its check at submit (FBC-afd).
 
+mod caps;
 mod gateway;
 mod grant;
 mod ladder;
@@ -91,6 +103,7 @@ mod registry;
 #[path = "../tests/common/mod.rs"]
 mod common;
 
+pub use caps::{CapRefusal, MarketCaps, PreTradeCaps};
 pub use gateway::{ControlCommand, ManagedGateway, OrderGateway};
 pub use grant::{Authorization, StateGeneration};
 pub use ladder::{LadderConfig, LadderConfigError, LadderPlan, LadderResolution, ResyncApplied};
@@ -100,6 +113,7 @@ pub use ledger::{
 };
 pub use permit::{
     AmendRefusal, CancelChoice, CancelPlan, Cancellable, Live, PermitRefusal, PermittedCommand,
+    PlacePlan,
 };
 pub use record::{
     Applied, FillApplied, Intent, LadderStep, OrdState, OrderKey, OrderOp, OrderRecord,

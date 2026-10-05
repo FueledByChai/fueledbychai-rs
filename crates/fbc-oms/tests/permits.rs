@@ -18,11 +18,22 @@ use fbc_core::{
     VenueOrderState, WallNs,
 };
 use fbc_oms::{
-    Admission, AmendRefusal, CancelChoice, FillLedger, FillRouted, LedgerConfig, OmsError,
-    OrdState, OrderKey, OrderOp, PermitRefusal, PermittedCommand, Registry,
+    Admission, AmendRefusal, CancelChoice, FillLedger, FillRouted, LedgerConfig, MarketCaps,
+    OmsError, OrdState, OrderKey, OrderOp, PermitRefusal, PermittedCommand, PreTradeCaps, Registry,
 };
 
 const INST: InstrumentId = InstrumentId::new(1);
+
+/// A registry whose inventory cap (0005's I6) is far above any order here: the permits are
+/// what these tests judge; the caps are `tests/caps.rs`'s.
+fn registry() -> Registry {
+    Registry::with_caps(PreTradeCaps::new().with_market(
+        INST,
+        MarketCaps {
+            inventory: lots(1_000_000),
+        },
+    ))
+}
 
 fn accepted() -> SubmitOutcome {
     SubmitOutcome::Accepted {
@@ -126,7 +137,7 @@ fn a_cancel_names_its_order_by_the_reference_design_4_9_orders_for_every_combina
                     cases += 1;
                     let caps = caps_with(&refs, before_ack);
                     let has = |k| refs.contains(&k);
-                    let mut reg = Registry::new();
+                    let mut reg = registry();
                     let c = order_at(&mut reg, stage, nonce);
                     let acked = matches!(stage, Ack::AckedNoVid | Ack::AckedVid);
                     let known_vid = reg.get(c).unwrap().vid().cloned();
@@ -199,7 +210,7 @@ fn a_cancel_names_its_order_by_the_reference_design_4_9_orders_for_every_combina
 fn a_cancel_waiting_for_the_acknowledgement_is_due_the_moment_it_lands() {
     // Cancels by venue id only: an order the venue has not named waits.
     let caps = caps_with(&[RefKind::Venue], false);
-    let mut reg = Registry::new();
+    let mut reg = registry();
     let c = order_at(&mut reg, Ack::Pending, false);
     let quiet = order_at(&mut reg, Ack::Pending, false);
     assert_eq!(
@@ -260,7 +271,7 @@ fn a_cancel_waiting_for_the_acknowledgement_is_due_the_moment_it_lands() {
 fn an_acknowledgement_that_names_no_usable_reference_leaves_the_cancel_waiting() {
     // Cancels by venue id only, and the acknowledgement carries no venue id.
     let caps = caps_with(&[RefKind::Venue], false);
-    let mut reg = Registry::new();
+    let mut reg = registry();
     let c = order_at(&mut reg, Ack::Pending, false);
     assert_eq!(
         reg.cancellable(c).unwrap().cancel(&caps),
@@ -288,7 +299,7 @@ fn a_venue_declaring_client_and_nonce_cancels_waits_for_the_acknowledgement_rath
     // refuses a client-id cancel before the acknowledgement: sending would be refused, so the
     // OMS waits (FBC-03fi would let the command carry the nonce alone).
     let caps = caps_with(&[RefKind::Client, RefKind::PlacementNonce], false);
-    let mut reg = Registry::new();
+    let mut reg = registry();
     let c = order_at(&mut reg, Ack::Pending, true);
     assert_eq!(
         reg.cancellable(c).unwrap().cancel(&caps),
@@ -307,7 +318,7 @@ fn a_venue_declaring_client_and_nonce_cancels_waits_for_the_acknowledgement_rath
 
 #[test]
 fn a_placement_nonce_is_recorded_once() {
-    let mut reg = Registry::new();
+    let mut reg = registry();
     let c = reg.insert(placement(cid(), 100, 1)).unwrap().cid();
     assert_eq!(reg.get(c).unwrap().placement_nonce(), None);
     assert_eq!(reg.placement_nonce_used(c, 5), Ok(()));
@@ -343,7 +354,7 @@ fn a_placement_nonce_is_recorded_once() {
 #[test]
 fn every_order_that_is_not_terminal_is_cancellable_and_no_other() {
     let caps = caps_with(&[RefKind::Venue, RefKind::Client], true);
-    let mut reg = Registry::new();
+    let mut reg = registry();
     let pending = order_at(&mut reg, Ack::Pending, false);
     let unknown = order_at(&mut reg, Ack::Unknown, false);
     let amending = order_at(&mut reg, Ack::AckedVid, false);
@@ -385,7 +396,7 @@ fn every_order_that_is_not_terminal_is_cancellable_and_no_other() {
 #[test]
 fn a_foreign_namespace_order_is_never_cancelled_individually_and_its_fill_moves_nothing() {
     let caps = caps_with(&[RefKind::Venue, RefKind::Client], true);
-    let mut reg = Registry::new();
+    let mut reg = registry();
     let ours = order_at(&mut reg, Ack::AckedVid, false);
     let our_vid = reg.get(ours).unwrap().vid().cloned().unwrap();
 
@@ -476,7 +487,7 @@ fn many(cmd: &PermittedCommand) -> &[CancelOrder] {
 #[test]
 fn a_cancel_many_item_without_a_batch_declared_reference_goes_as_a_single_cancel() {
     let caps = batch_caps(2);
-    let mut reg = Registry::new();
+    let mut reg = registry();
     let a = order_at(&mut reg, Ack::AckedVid, false);
     let b = order_at(&mut reg, Ack::AckedVid, false);
     let c = order_at(&mut reg, Ack::AckedVid, false);
@@ -553,7 +564,7 @@ fn a_cancel_many_item_without_a_batch_declared_reference_goes_as_a_single_cancel
 
 #[test]
 fn without_a_batch_cancel_every_item_goes_as_a_single_cancel() {
-    let mut reg = Registry::new();
+    let mut reg = registry();
     let a = order_at(&mut reg, Ack::AckedVid, false);
     let b = order_at(&mut reg, Ack::AckedVid, false);
     for caps in [
@@ -630,7 +641,7 @@ fn ledger() -> FillLedger {
 #[test]
 fn an_amend_is_built_from_the_record_and_carries_the_filled_quantity() {
     let caps = with_amend(amend_caps(&[RefKind::Venue], true));
-    let mut reg = Registry::new();
+    let mut reg = registry();
     let mut ledger = ledger();
     let c = order_at(&mut reg, Ack::AckedVid, false);
     fill_of(&mut reg, &mut ledger, c, "a", 3);
@@ -659,7 +670,7 @@ fn an_amend_is_built_from_the_record_and_carries_the_filled_quantity() {
 #[test]
 fn an_amend_is_refused_for_a_partly_filled_order_where_the_caps_forbid_it() {
     let caps = with_amend(amend_caps(&[RefKind::Venue], false));
-    let mut reg = Registry::new();
+    let mut reg = registry();
     let mut ledger = ledger();
     let c = order_at(&mut reg, Ack::AckedVid, false);
     // Unfilled, it amends.
@@ -669,6 +680,8 @@ fn an_amend_is_refused_for_a_partly_filled_order_where_the_caps_forbid_it() {
             .amend(&caps, Ticks(101), lots(10), false)
             .is_ok()
     );
+    // Never submitted: withdrawn, so the order can be amended again.
+    assert_eq!(reg.amend_not_submitted(c), Ok(true));
     fill_of(&mut reg, &mut ledger, c, "p", 1);
     assert_eq!(
         reg.live(c)
@@ -680,7 +693,7 @@ fn an_amend_is_refused_for_a_partly_filled_order_where_the_caps_forbid_it() {
 
 #[test]
 fn an_amend_is_refused_for_a_reference_amend_caps_do_not_declare() {
-    let mut reg = Registry::new();
+    let mut reg = registry();
     // Acknowledged without the venue's id: only the client id names it.
     let c = order_at(&mut reg, Ack::AckedNoVid, false);
     let by_venue = with_amend(amend_caps(&[RefKind::Venue], true));
@@ -717,16 +730,22 @@ fn an_amend_is_refused_for_a_reference_amend_caps_do_not_declare() {
 
 #[test]
 fn an_amend_is_refused_where_the_venue_cannot_make_it() {
-    let mut reg = Registry::new();
+    let mut reg = registry();
     let mut ledger = ledger();
     let c = order_at(&mut reg, Ack::AckedVid, false);
-    let amend = |reg: &Registry, caps: &OrderCaps, px: i64, qty: i64| {
-        reg.live(c)
+    // Each amend built is withdrawn, never submitted, so the next can be built.
+    let amend = |reg: &mut Registry, caps: &OrderCaps, px: i64, qty: i64| {
+        let built = reg
+            .live(c)
             .unwrap()
-            .amend(caps, Ticks(px), lots(qty), false)
+            .amend(caps, Ticks(px), lots(qty), false);
+        if built.is_ok() {
+            assert_eq!(reg.amend_not_submitted(c), Ok(true));
+        }
+        built
     };
     assert_eq!(
-        amend(&reg, &order_caps(), 101, 10),
+        amend(&mut reg, &order_caps(), 101, 10),
         Err(AmendRefusal::NotAmendable)
     );
     let fixed_px = with_amend(AmendCaps {
@@ -734,24 +753,27 @@ fn an_amend_is_refused_where_the_venue_cannot_make_it() {
         ..amend_caps(&[RefKind::Venue], true)
     });
     assert_eq!(
-        amend(&reg, &fixed_px, 101, 10),
+        amend(&mut reg, &fixed_px, 101, 10),
         Err(AmendRefusal::PriceNotAmendable)
     );
-    assert!(amend(&reg, &fixed_px, 100, 12).is_ok());
+    assert!(amend(&mut reg, &fixed_px, 100, 12).is_ok());
     let fixed_qty = with_amend(AmendCaps {
         qty: false,
         ..amend_caps(&[RefKind::Venue], true)
     });
     assert_eq!(
-        amend(&reg, &fixed_qty, 100, 12),
+        amend(&mut reg, &fixed_qty, 100, 12),
         Err(AmendRefusal::QtyNotAmendable)
     );
-    assert!(amend(&reg, &fixed_qty, 101, 10).is_ok());
+    assert!(amend(&mut reg, &fixed_qty, 101, 10).is_ok());
     // A total at or below the filled quantity leaves nothing to rest: a cancel, not an amend.
     let caps = with_amend(amend_caps(&[RefKind::Venue], true));
     fill_of(&mut reg, &mut ledger, c, "n", 4);
-    assert_eq!(amend(&reg, &caps, 100, 4), Err(AmendRefusal::NothingToRest));
-    assert!(amend(&reg, &caps, 100, 5).is_ok());
+    assert_eq!(
+        amend(&mut reg, &caps, 100, 4),
+        Err(AmendRefusal::NothingToRest)
+    );
+    assert!(amend(&mut reg, &caps, 100, 5).is_ok());
 
     // A resting market order is not amended.
     let mut market = placement(cid(), 100, 10);
@@ -768,7 +790,7 @@ fn an_amend_is_refused_where_the_venue_cannot_make_it() {
 
 #[test]
 fn only_a_resting_order_with_nothing_in_flight_is_live() {
-    let mut reg = Registry::new();
+    let mut reg = registry();
     let pending = order_at(&mut reg, Ack::Pending, false);
     let unknown = order_at(&mut reg, Ack::Unknown, false);
     assert_eq!(
@@ -827,7 +849,7 @@ fn a_cancel_while_an_amend_that_replaces_the_venue_id_is_in_flight_does_not_name
         }),
         ..caps_with(refs, false)
     };
-    let mut reg = Registry::new();
+    let mut reg = registry();
     let c = order_at(&mut reg, Ack::AckedVid, false);
     let old = reg.get(c).unwrap().vid().cloned().unwrap();
     reg.amend_sent(c, Ticks(101), lots(10), RpcId(1), MonoNs(1))
@@ -897,7 +919,7 @@ fn a_cancel_while_an_amend_that_replaces_the_venue_id_is_in_flight_does_not_name
 fn an_amend_the_planner_classifies_as_reducing_stays_safety_traffic() {
     // Codex r4186718683: the classification is the caller's, as on a placement.
     let caps = with_amend(amend_caps(&[RefKind::Venue], true));
-    let mut reg = Registry::new();
+    let mut reg = registry();
     let c = order_at(&mut reg, Ack::AckedVid, false);
     for reducing in [false, true] {
         let cmd = reg
@@ -905,6 +927,7 @@ fn an_amend_the_planner_classifies_as_reducing_stays_safety_traffic() {
             .unwrap()
             .amend(&caps, Ticks(100), lots(8), reducing)
             .unwrap();
+        assert_eq!(reg.amend_not_submitted(c), Ok(true));
         let VenueCommand::Amend(amend) = cmd.command() else {
             panic!("an amend")
         };
@@ -923,7 +946,7 @@ fn an_amend_the_planner_classifies_as_reducing_stays_safety_traffic() {
 #[test]
 fn a_seen_order_whose_client_id_and_venue_id_name_different_orders_gets_no_permit() {
     // Codex r4186718692, as Registry::apply_fill flags such a fill.
-    let mut reg = Registry::new();
+    let mut reg = registry();
     let a = order_at(&mut reg, Ack::AckedVid, false);
     let b = order_at(&mut reg, Ack::AckedVid, false);
     let b_vid = reg.get(b).unwrap().vid().cloned().unwrap();
@@ -945,7 +968,7 @@ fn a_seen_order_naming_a_venue_id_its_record_has_not_learnt_gets_no_permit_until
     // Codex r4186908002: the record would cancel by an id it holds, or wait for one, while the
     // venue shows another. The event showing it is applied first, and the record learns it.
     let caps = caps_with(&[RefKind::Venue], false);
-    let mut reg = Registry::new();
+    let mut reg = registry();
     let a = order_at(&mut reg, Ack::Pending, false);
     let seen = vid("seen-a");
     assert_eq!(
@@ -983,7 +1006,7 @@ fn an_amend_while_an_earlier_one_that_replaces_the_venue_id_is_unconfirmed_does_
             ..amend_caps(refs, true)
         })
     };
-    let mut reg = Registry::new();
+    let mut reg = registry();
     let c = order_at(&mut reg, Ack::AckedVid, false);
     reg.amend_sent(c, Ticks(101), lots(10), RpcId(1), MonoNs(1))
         .unwrap();
@@ -1021,6 +1044,7 @@ fn an_amend_while_an_earlier_one_that_replaces_the_venue_id_is_unconfirmed_does_
         panic!("an amend")
     };
     assert_eq!(amend.target, OrderRef::Client(c));
+    assert_eq!(reg.amend_not_submitted(c), Ok(true));
     // A venue that keeps the id names it.
     let keeping = with_amend(amend_caps(&[RefKind::Venue], true));
     assert!(
@@ -1042,7 +1066,7 @@ fn an_amend_confirmed_without_its_new_venue_id_leaves_the_old_id_out_of_every_la
         }),
         ..caps_with(refs, false)
     };
-    let mut reg = Registry::new();
+    let mut reg = registry();
     let c = order_at(&mut reg, Ack::AckedVid, false);
     let old = reg.get(c).unwrap().vid().cloned().unwrap();
     reg.amend_sent(c, Ticks(101), lots(10), RpcId(1), MonoNs(1))

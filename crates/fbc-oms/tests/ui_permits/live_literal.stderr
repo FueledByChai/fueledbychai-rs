@@ -1,5 +1,7 @@
-error[E0451]: field `rec` of struct `fbc_oms::Live` is private
- --> tests/ui_permits/live_literal.rs:6:12
+error: cannot construct `fbc_oms::Live<'_>` with struct literal syntax due to private fields
+ --> tests/ui_permits/live_literal.rs:6:5
   |
 6 |     Live { rec }
-  |            ^^^ private field
+  |     ^^^^   --- private field
+  |
+  = note: ...and other private field `exposure` that was not provided
