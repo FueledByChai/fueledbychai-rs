@@ -90,10 +90,13 @@ fn span(start: usize, len: usize) -> Range<u32> {
 
 /// The credentials in a login answer, for the codec's `redact_inbound` (0028): every copy of
 /// the token its `jwt_token` field holds, wherever in the body it stands (overlapping copies
-/// as one span). Nothing for an answer that is JSON without a `jwt_token` (a refusal) or has
-/// no body. The whole body when the answer is not JSON, or holds a `jwt_token` whose bytes
-/// cannot be found as written (not a string, or written with escapes), since where a token
-/// stands in it cannot then be told.
+/// as one span), when that is the body's one mention of `jwt_token` and the body holds no
+/// escape. Nothing for a body that is empty, or JSON that neither mentions `jwt_token` nor
+/// escapes anything (a refusal). Otherwise the whole body: where a token stands cannot be
+/// told in an answer that is not JSON, holds a `jwt_token` that is not a non-empty string,
+/// names it more than once (a parsed object keeps only the last of repeated keys, Codex
+/// r4184896990), nests it, or holds an escape that could spell the key or the token another
+/// way.
 pub fn token_spans(resp: &HttpResponse<'_>) -> InboundSpans {
     let body = resp.body;
     let whole = || InboundSpans::response(vec![], vec![span(0, body.len())]);
@@ -103,10 +106,17 @@ pub fn token_spans(resp: &HttpResponse<'_>) -> InboundSpans {
     let Ok(doc) = serde_json::from_slice::<Value>(body) else {
         return whole();
     };
+    let mentions = body
+        .windows(FIELD.len())
+        .filter(|window| *window == FIELD.as_bytes())
+        .count();
+    let plain = !body.contains(&b'\\');
     let token = match doc.get(FIELD) {
-        None => return InboundSpans::NONE,
-        Some(Value::String(token)) if !token.is_empty() => token.as_bytes(),
-        Some(_) => return whole(),
+        None if mentions == 0 && plain => return InboundSpans::NONE,
+        Some(Value::String(token)) if !token.is_empty() && mentions == 1 && plain => {
+            token.as_bytes()
+        }
+        _ => return whole(),
     };
     let mut spans: Vec<Range<u32>> = Vec::new();
     let starts = body.windows(token.len()).enumerate();
@@ -117,8 +127,6 @@ pub fn token_spans(resp: &HttpResponse<'_>) -> InboundSpans {
             _ => spans.push(copy),
         }
     }
-    if spans.is_empty() {
-        return whole();
-    }
+    // The token's bytes are in the body: no escape, so the string stands as written.
     InboundSpans::response(vec![], spans)
 }
