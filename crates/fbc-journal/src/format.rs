@@ -25,11 +25,12 @@
 //! its length and its hash. Versions 2 and 3 wrote a header's name before its flag, and an
 //! inbound frame's bytes and a response's body whole.
 //!
-//! Version 5 (FBC-q7b) writes the kind an outbound frame was sent as: an `Outbound` record has
-//! an opcode byte after its `rpc`. Versions 2 to 4 kept no kind, and their outbound frames read
-//! back with the kind their blanked bytes imply ([`Opcode::of`]), which is binary only when a
-//! byte that is not UTF-8 lies outside the spans. The reader reads versions 2 to 5, so a
-//! journal written before reads back unchanged.
+//! Version 5 (FBC-q7b, decision 0040) writes the kind an outbound frame was sent as: an
+//! `Outbound` record has an opcode byte after its `rpc`. Versions 2 to 4 kept no kind, and
+//! their outbound frames read back with the kind their blanked bytes imply ([`Opcode::of`]),
+//! which is binary when a byte that is not UTF-8 lies outside the spans or a span splits a
+//! character. The reader reads versions 2 to 5, so a journal written before reads back
+//! unchanged.
 
 use core::ops::Range;
 
@@ -270,18 +271,13 @@ fn encode_body(
             e.rpc(*rpc);
             e.u8(opcode_byte(*opcode));
             let (bytes, spans) = (frame.bytes(), frame.redactions());
-            // A text frame must stay UTF-8 blanked: its bytes UTF-8 and its spans on character
-            // boundaries. Checked before the payload is copied, in the writing pass only, so
-            // only once the measuring pass found the record fits; a span may make it fit in
-            // less room than its bytes take, so the check does not wait on their length
-            // (Codex r4182133314).
-            if e.write
-                && *opcode == Opcode::Text
-                && (core::str::from_utf8(bytes).is_err() || check_redactions(bytes, spans).is_err())
-            {
-                return Err(JournalError::Unencodable(
-                    "a text frame that is not UTF-8 once blanked",
-                ));
+            // A text frame was sent as UTF-8; a span may split one of its characters, since a
+            // `WireSlice`'s spans are any bytes (Codex r4182256932). Checked before the payload
+            // is copied, in the writing pass only, so only once the measuring pass found the
+            // record fits; a span may make it fit in less room than its bytes take, so the
+            // check does not wait on their length (Codex r4182133314).
+            if e.write && *opcode == Opcode::Text && core::str::from_utf8(bytes).is_err() {
+                return Err(JournalError::Unencodable("a text frame that is not UTF-8"));
             }
             e.spanned(bytes, spans)?;
         }
@@ -905,11 +901,9 @@ pub(crate) fn decode_version(body: &[u8], version: u16) -> Result<(Record, Vec<S
                 None
             };
             let (bytes, spans) = d.spanned()?;
-            // Before version 5, the kind the blanked bytes imply.
+            // Before version 5, the kind the blanked bytes imply. A text frame's blanked bytes
+            // need not be UTF-8: a span may split a character.
             let opcode = kept.unwrap_or_else(|| Opcode::of(&bytes));
-            if opcode == Opcode::Text && core::str::from_utf8(&bytes).is_err() {
-                return Err("text frame");
-            }
             Record::Outbound {
                 at,
                 conn,
@@ -1528,42 +1522,44 @@ mod tests {
         assert_eq!(Opcode::of(b"\xff"), Opcode::Binary);
     }
 
-    /// FBC-q7b: a text frame stays UTF-8 once blanked, so one that is not UTF-8, or whose span
-    /// splits a character, is refused, and a damaged segment's text frame that is not UTF-8 or
-    /// opcode of no known kind is malformed.
+    /// FBC-q7b: a text frame was sent as UTF-8, so one that is not is refused; a span may
+    /// split one of its characters (a [`WireSlice`]'s spans are any bytes, Codex r4182256932),
+    /// and it is kept as text though it is not UTF-8 once blanked. A damaged segment's opcode
+    /// of no known kind is malformed.
     #[test]
-    fn an_outbound_text_frame_must_be_utf8_once_blanked() {
+    fn an_outbound_text_frame_must_be_utf8_as_sent() {
         let not_utf8 = outbound(Opcode::Text, b"a\xff", None);
-        let split = outbound(Opcode::Text, "\u{e9}t\u{e9}".as_bytes(), Some(1..3));
-        for record in [&not_utf8, &split] {
-            let mut body = Vec::new();
-            assert!(matches!(
-                encode(record, &key(), &mut body),
-                Err(JournalError::Unencodable(
-                    "a text frame that is not UTF-8 once blanked"
-                ))
-            ));
-            assert!(body.is_empty());
-            // One too large for the room left is refused for its size, unscanned.
-            assert!(matches!(
-                encode_within(record, &key(), &mut body, OUTBOUND_HEAD + 1),
-                Err(JournalError::TooLarge)
-            ));
-        }
+        let mut body = Vec::new();
+        assert!(matches!(
+            encode(&not_utf8, &key(), &mut body),
+            Err(JournalError::Unencodable("a text frame that is not UTF-8"))
+        ));
+        assert!(body.is_empty());
+        // One too large for the room left is refused for its size, unscanned.
+        assert!(matches!(
+            encode_within(&not_utf8, &key(), &mut body, OUTBOUND_HEAD + 1),
+            Err(JournalError::TooLarge)
+        ));
         // Codex r4182133314: one whose span makes it fit in less room than its bytes take is
         // checked all the same.
         let mut bytes = b"a\xff".to_vec();
         bytes.resize(202, b'x');
         let spanned = outbound(Opcode::Text, &bytes, Some(2..202));
-        let mut body = Vec::new();
         assert!(matches!(
             encode_within(&spanned, &key(), &mut body, OUTBOUND_HEAD + 60),
             Err(JournalError::Unencodable(_))
         ));
         assert!(body.is_empty());
+        // A span splitting a character of a text frame.
+        let split = outbound(Opcode::Text, "\u{e9}t\u{e9}".as_bytes(), Some(1..3));
+        let back = round_trip(&split);
+        assert_eq!(back, split.blanked());
+        let Record::Outbound { opcode, frame, .. } = back else {
+            unreachable!()
+        };
+        assert_eq!(opcode, Opcode::Text);
+        assert!(core::str::from_utf8(frame.bytes()).is_err());
         encode(&outbound(Opcode::Binary, b"a\xff", None), &key(), &mut body).unwrap();
-        body[OUTBOUND_HEAD - 1] = opcode_byte(Opcode::Text);
-        assert_eq!(decode(&body), Err("text frame"));
         body[OUTBOUND_HEAD - 1] = 2;
         assert_eq!(decode(&body), Err("opcode"));
     }
