@@ -343,9 +343,10 @@ impl OrderRecord {
     /// An update leaving the order at the price and total of the amend in flight confirms it.
     /// An amended update stating neither also confirms it, the amend's price and total then
     /// standing, when it is tied to that amend: no earlier amend was replaced in flight
-    /// unconfirmed, and it names a new venue id the record did not know, or carries a venue
-    /// ordering key later than the last update's. Otherwise it may be a duplicate of an older
-    /// confirmation, and the amend stays in flight, counted ([`Self::resting`]). A total
+    /// unconfirmed, and it carries a venue ordering key later than the last update's. Without
+    /// that it may be a duplicate, or a late notice, of an older amend's confirmation (a new
+    /// venue id first seen here included), and the amend stays in flight, counted
+    /// ([`Self::resting`]). A total
     /// stated while no amend is in flight settles the amends replaced in flight before it. Either kind
     /// of update ends the order Filled when its fills alone then cover every total the venue
     /// may hold.
@@ -359,8 +360,6 @@ impl OrderRecord {
         if let (None, Some(v)) = (&self.vid, &u.vid) {
             self.vid = Some(self.follow(v));
         }
-        let issued = matches!(&u.state, VenueOrderState::Amended { new_vid: Some(nv) }
-            if self.vid.as_ref() != Some(nv) && !self.is_superseded(nv));
         let later = key.venue.is_some_and(|k| {
             self.last_key
                 .is_none_or(|last| last.venue.is_some_and(|l| k > l))
@@ -396,7 +395,7 @@ impl OrderRecord {
         if let VenueOrderState::Amended { .. } = u.state {
             if let Intent::PendingAmend { px, qty, .. } = self.intent
                 && self.unsettled.is_none()
-                && (issued || later)
+                && later
             {
                 // Tied to the amend in flight: what the venue does not echo is what was sent.
                 self.px = Some(u.px.unwrap_or(px));

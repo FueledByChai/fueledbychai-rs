@@ -209,50 +209,38 @@ fn an_amend_with_a_new_venue_id_supersedes_the_old_one() {
 }
 
 #[test]
-fn an_amend_confirmed_under_the_new_venue_id_it_issued_takes_the_values_that_were_sent() {
+fn a_new_venue_id_alone_does_not_tie_a_confirmation_to_the_amend_in_flight() {
+    // Codex r4182826886: A1's replacement notice arrives late, after an update stated A1's
+    // values and A2 was sent.
     let mut rec = OrderRecord::new(placement(cid(), 100, 5));
     let mut open = update(None, VenueOrderState::Open, 0);
     open.vid = Some(vid("v1"));
     rec.apply_update(&open, at(None, 0));
-    rec.amend_sent(Ticks(101), lots(8), RpcId(1), MonoNs(1));
-    let issued = |old: &str, new: &str| {
-        let mut u = update(
-            None,
-            VenueOrderState::Amended {
-                new_vid: Some(vid(new)),
-            },
-            0,
-        );
-        u.vid = Some(vid(old));
-        u
-    };
-    // Neither price nor total echoed: the new id ties the confirmation to the amend.
-    assert_eq!(
-        rec.apply_update(&issued("v1", "v2"), at(None, 1)),
-        Applied::Amended
-    );
-    assert_eq!((rec.px(), rec.qty()), (Some(Ticks(101)), lots(8)));
+    rec.amend_sent(Ticks(101), lots(6), RpcId(1), MonoNs(1));
+    let mut a1 = update(None, VenueOrderState::Open, 0);
+    (a1.px, a1.qty) = (Some(Ticks(101)), Some(lots(6)));
+    rec.apply_update(&a1, at(None, 1));
     assert_eq!(rec.intent(), Intent::None);
-
-    // A2 to nine; a duplicate naming no old id names v2, already current: it resolves nothing.
     rec.amend_sent(Ticks(102), lots(9), RpcId(2), MonoNs(2));
-    let mut unnamed = issued("v1", "v2");
-    unnamed.vid = None;
-    assert_eq!(rec.apply_update(&unnamed, at(None, 2)), Applied::Amended);
-    assert!(matches!(rec.intent(), Intent::PendingAmend { .. }));
-    assert_eq!(rec.qty(), lots(8));
-    assert_eq!(rec.resting(), lots(9));
-
-    // A3 to seven before A2 is answered: a new id now cannot say which amend it confirms.
-    rec.amend_sent(Ticks(103), lots(7), RpcId(3), MonoNs(3));
-    assert_eq!(
-        rec.apply_update(&issued("v2", "v3"), at(None, 3)),
-        Applied::Amended
+    let mut late = update(
+        None,
+        VenueOrderState::Amended {
+            new_vid: Some(vid("v2")),
+        },
+        0,
     );
-    assert_eq!(rec.vid(), Some(&vid("v3")));
+    late.vid = Some(vid("v1"));
+    assert_eq!(rec.apply_update(&late, at(None, 2)), Applied::Amended);
+    // The replacement is recorded; A2 stays in flight, counted, and its refusal leaves A1's.
+    assert_eq!(rec.vid(), Some(&vid("v2")));
+    assert!(rec.is_superseded(&vid("v1")));
     assert!(matches!(rec.intent(), Intent::PendingAmend { .. }));
-    assert_eq!((rec.px(), rec.qty()), (Some(Ticks(101)), lots(8)));
-    assert_eq!(rec.resting(), lots(9), "A2 may rest");
+    assert_eq!((rec.px(), rec.qty()), (Some(Ticks(101)), lots(6)));
+    assert_eq!(rec.resting(), lots(9));
+    let refusal = fbc_core::SubmitOutcome::NotSent(fbc_core::NotSentReason::Backpressure);
+    rec.on_outcome(fbc_oms::OrderOp::Amend, None, &refusal, MonoNs(3));
+    assert_eq!((rec.px(), rec.qty()), (Some(Ticks(101)), lots(6)));
+    assert_eq!(rec.resting(), lots(6));
 }
 
 #[test]

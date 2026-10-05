@@ -37,8 +37,8 @@
 //! sent until a confirmation tied to it, or to a later amend, arrives, until the venue states
 //! the total with no amend in flight, or until it is refused while no earlier amend is
 //! unconfirmed: an amended update stating no price or total is tied
-//! to the amend in flight only by a new venue id or a later venue ordering key, never by
-//! arriving later alone, since it may duplicate an older confirmation.
+//! to the amend in flight only by a later venue ordering key, never by arriving later or by a
+//! new venue id alone, since it may duplicate, or be a late notice of, an older confirmation.
 //!
 //! Decision 0005's I1 (for order updates) and I2 are property-tested in `tests/lattice.rs`,
 //! I1 with fills and I3 in `tests/fills.rs` (decision 0037).
