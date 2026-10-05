@@ -73,7 +73,15 @@
 //! [`WriteStall`] window, then ends the epoch as a drop and reconnects through the pacing; the
 //! session's timers fire meanwhile (FBC-ha3, decision 0036).
 //!
-//! Not here yet: order-entry sessions, client certificates and certificate pinning.
+//! [`ExecSession`] drives one account's order-entry connection as
+//! [`VenueFactory::plan_exec`](fbc_core::VenueFactory::plan_exec) plans it (FBC-oaz, decision
+//! 0050): one [`ExecCodec`](fbc_core::ExecCodec) for the session's life, its `on_open` called on
+//! each new epoch with exactly the nonces it asks for, frames decoded inside the venue's decode
+//! scope, every event stamped and handed to the consumer's [`ExecHandler`] inline, and reconnects
+//! paced by the consumer's [`ReconnectPacing`]. Command submission, its HTTP requests, timers and
+//! keepalives, and its journal come with later tickets.
+//!
+//! Not here yet: client certificates and certificate pinning.
 //! Apart from a codec's HTTP request (its own timeout) and a session's connection attempts and
 //! socket writes (the consumer's attempt deadline and write-stall window), no call here has a
 //! deadline of its own; the caller bounds one with its own timer.
@@ -82,6 +90,7 @@ mod books;
 mod connector;
 mod epoch;
 mod error;
+mod exec_session;
 pub mod http;
 mod journal;
 mod liveness;
@@ -104,6 +113,9 @@ pub use books::{BookHandler, BookKeeper, MdBooks, TradingBookConflict, TradingBo
 pub use connector::{Connector, ProxyConfig};
 pub use epoch::{Admit, EpochError, Epochs, Input};
 pub use error::{Cause, NetError, Step};
+pub use exec_session::{
+    ExecControl, ExecCounters, ExecHandler, ExecSession, ExecSessionConfig, ExecSessionError,
+};
 pub use journal::Journal;
 pub use liveness::{Liveness, LivenessError};
 pub use md_venue::{MdVenue, MdVenueConfig, MdVenueControl, PlanError};
