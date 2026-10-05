@@ -1,0 +1,5 @@
+error[E0599]: no method named `cancel` found for struct `fbc_oms::Live<'r>` in the current scope
+ --> tests/ui_permits/cancel_through_live.rs:6:36
+  |
+6 |     let _ = reg.live(cid).unwrap().cancel(caps);
+  |                                    ^^^^^^ method not found in `fbc_oms::Live<'_>`
