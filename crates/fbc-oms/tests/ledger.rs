@@ -658,6 +658,173 @@ fn an_amend_replacing_a_venue_id_a_fill_taught_is_followed_to_its_new_id() {
     assert!(reg.get(c).unwrap().state().is_terminal());
 }
 
+/// Places 10 lots under a fresh client id, opens it as `v1`, and books fills of 2 and 1 that
+/// both name `v2`, an id only the fills taught.
+fn opened_as_v1_with_a_fill_naming_v2(l: &mut FillLedger, reg: &mut Registry) -> ClientOrderId {
+    let c = cid();
+    reg.insert(placement(c, 100, 10)).unwrap();
+    let mut open = update(Some(c), VenueOrderState::Open, 0);
+    open.vid = Some(common::vid("v1"));
+    reg.apply_update(&open, key(1));
+    for (n, (id, qty)) in [("f1", 2), ("f2", 1)].into_iter().enumerate() {
+        let named = FillIdent::Venue {
+            fill: common::fill_id(id),
+            vid: Some(common::vid("v2")),
+            cum_after: None,
+        };
+        let f = fill(Some(c), named, Side::Buy, qty, false);
+        reg.apply_fill(accepted(l.admit(&f, None, MonoNs(n as u64))))
+            .unwrap();
+    }
+    c
+}
+
+#[test]
+fn an_amend_replacing_a_fill_taught_venue_id_supersedes_the_current_one() {
+    // Codex review 5414313854: the record holds v1, a fill teaches v2, and an Amended update
+    // naming v2 replaces it by v3. v1 must be superseded too, or a delayed Canceled naming v1
+    // would end the order while v3 may rest, and the caps would see no exposure.
+    let (mut l, mut reg) = session();
+    let c = opened_as_v1_with_a_fill_naming_v2(&mut l, &mut reg);
+    let mut amended = update(
+        None,
+        VenueOrderState::Amended {
+            new_vid: Some(common::vid("v3")),
+        },
+        3,
+    );
+    amended.vid = Some(common::vid("v2"));
+    assert_eq!(
+        reg.apply_update(&amended, key(2)),
+        Routed::Ours(c, Applied::Amended)
+    );
+    let rec = reg.get(c).unwrap();
+    assert_eq!(rec.vid(), Some(&common::vid("v3")));
+    assert!(rec.is_superseded(&common::vid("v1")));
+    assert_eq!(rec.resting(), lots(7));
+    // The delayed cancel of v1 is ignored: the order still counts its seven lots resting.
+    let mut late = update(None, common::canceled(), 3);
+    late.vid = Some(common::vid("v1"));
+    assert_eq!(
+        reg.apply_update(&late, key(3)),
+        Routed::Ours(c, Applied::IgnoredSupersededVid)
+    );
+    let rec = reg.get(c).unwrap();
+    assert!(!rec.state().is_terminal());
+    assert_eq!(rec.resting(), lots(7));
+    // A cancel naming v3, the id that rests, ends it.
+    let mut cancel = update(None, common::canceled(), 3);
+    cancel.vid = Some(common::vid("v3"));
+    assert_eq!(
+        reg.apply_update(&cancel, key(4)),
+        Routed::Ours(c, Applied::Advanced)
+    );
+    assert_eq!(reg.get(c).unwrap().resting(), Lots::ZERO);
+}
+
+#[test]
+fn an_amend_replacing_a_fill_taught_venue_id_by_the_current_one_keeps_it_current() {
+    // v2 -> v1 while v1 is current: recording v1 -> v1 would be circular, so v1 stays current
+    // and live, and only v2 is superseded.
+    let (mut l, mut reg) = session();
+    let c = opened_as_v1_with_a_fill_naming_v2(&mut l, &mut reg);
+    let mut amended = update(
+        None,
+        VenueOrderState::Amended {
+            new_vid: Some(common::vid("v1")),
+        },
+        3,
+    );
+    amended.vid = Some(common::vid("v2"));
+    assert_eq!(
+        reg.apply_update(&amended, key(2)),
+        Routed::Ours(c, Applied::Amended)
+    );
+    let rec = reg.get(c).unwrap();
+    assert_eq!(rec.vid(), Some(&common::vid("v1")));
+    assert!(rec.is_superseded(&common::vid("v2")));
+    assert!(!rec.is_superseded(&common::vid("v1")));
+    assert_eq!(rec.resting(), lots(7));
+}
+
+#[test]
+fn a_later_keyed_amend_of_an_unseen_venue_id_supersedes_the_current_one() {
+    // No fill taught v2 (the v1 -> v2 notice was missed), but the amend of v2 carries a venue
+    // key later than v1's: v1 is no newer than v2, so it is superseded by v3 as well.
+    let (_, mut reg) = session();
+    let c = cid();
+    reg.insert(placement(c, 100, 10)).unwrap();
+    let keyed = |venue, ingest| OrderKey {
+        venue: Some(venue),
+        ingest,
+    };
+    let mut open = update(Some(c), VenueOrderState::Open, 0);
+    open.vid = Some(common::vid("v1"));
+    reg.apply_update(&open, keyed(1, 1));
+    let mut amended = update(
+        Some(c),
+        VenueOrderState::Amended {
+            new_vid: Some(common::vid("v3")),
+        },
+        0,
+    );
+    amended.vid = Some(common::vid("v2"));
+    reg.apply_update(&amended, keyed(2, 2));
+    let rec = reg.get(c).unwrap();
+    assert_eq!(rec.vid(), Some(&common::vid("v3")));
+    let mut late = update(None, common::canceled(), 0);
+    late.vid = Some(common::vid("v1"));
+    assert_eq!(
+        reg.apply_update(&late, keyed(1, 3)),
+        Routed::Ours(c, Applied::IgnoredSupersededVid)
+    );
+    assert_eq!(reg.get(c).unwrap().resting(), lots(10));
+}
+
+#[test]
+fn a_delayed_amend_of_an_unseen_older_venue_id_leaves_the_current_one() {
+    // The order rests as v2 (v0 -> v1 -> v2); the v0 -> v1 notice arrives last, keyless and
+    // naming an id no fill taught: it may be older than v2, so v2 stays current and its
+    // terminal update still ends the order.
+    let (mut l, mut reg) = session();
+    let c = cid();
+    reg.insert(placement(c, 100, 10)).unwrap();
+    let mut open = update(Some(c), VenueOrderState::Open, 0);
+    open.vid = Some(common::vid("v2"));
+    reg.apply_update(&open, key(1));
+    // A fill naming the current id, twice, teaches nothing new.
+    for (n, f) in ["f1", "f2"].into_iter().enumerate() {
+        let named = FillIdent::Venue {
+            fill: common::fill_id(f),
+            vid: Some(common::vid("v2")),
+            cum_after: None,
+        };
+        let f = fill(Some(c), named, Side::Buy, 1, false);
+        reg.apply_fill(accepted(l.admit(&f, None, MonoNs(n as u64))))
+            .unwrap();
+    }
+    let mut amended = update(
+        Some(c),
+        VenueOrderState::Amended {
+            new_vid: Some(common::vid("v1")),
+        },
+        0,
+    );
+    amended.vid = Some(common::vid("v0"));
+    reg.apply_update(&amended, key(2));
+    let rec = reg.get(c).unwrap();
+    assert_eq!(rec.vid(), Some(&common::vid("v2")));
+    assert!(rec.is_superseded(&common::vid("v0")));
+    assert!(!rec.is_superseded(&common::vid("v2")));
+    let mut end = update(None, common::canceled(), 2);
+    end.vid = Some(common::vid("v2"));
+    assert_eq!(
+        reg.apply_update(&end, key(3)),
+        Routed::Ours(c, Applied::Advanced)
+    );
+    assert_eq!(reg.get(c).unwrap().resting(), Lots::ZERO);
+}
+
 #[test]
 fn foreign_non_canonical_and_unattributed_fills_are_flagged_not_counted_and_not_kept() {
     let (mut l, mut reg) = session();
