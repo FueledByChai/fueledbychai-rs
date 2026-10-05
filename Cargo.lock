@@ -510,12 +510,16 @@ name = "fbc-venue-paradex"
 version = "0.0.1"
 dependencies = [
  "fbc-book",
+ "fbc-conformance",
  "fbc-core",
+ "fbc-journal",
+ "fbc-runtime",
  "rust_decimal",
  "serde_json",
  "sha3",
  "starknet-core",
  "starknet-crypto",
+ "tokio",
 ]
 
 [[package]]

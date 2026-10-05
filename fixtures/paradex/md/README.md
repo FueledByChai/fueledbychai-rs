@@ -30,12 +30,21 @@ that file describes for versions below 2.
 | `book15-delta-2001.sbe.txt` | A DELTA at seq 2001: one bid changed, one ask removed, one ask added below the 15th |
 | `book15-delta-2002.sbe.txt` | A DELTA at seq 2002: a new best bid, the worst bid removed |
 | `book15-delta-2003-empty.sbe.txt` | A DELTA at seq 2003 with no levels: the book unchanged, the sequence advanced |
+| `eth-book-snapshot-500.sbe.txt` | An ETH-USD-PERP SNAPSHOT at seq 500: two bids, two asks |
+| `eth-book-delta-501.sbe.txt` | An ETH-USD-PERP DELTA at seq 501: one bid changed, one ask added |
+| `eth-book-snapshot-502.sbe.txt` | An ETH-USD-PERP SNAPSHOT at seq 502, as a new subscription receives it: two bids, one ask |
+| `eth-book-delta-503.sbe.txt` | An ETH-USD-PERP DELTA at seq 503: one bid added, one ask removed, one ask added |
 | `markets-summary-v0.sbe.txt` | `MarketSummaryEvent` (template 4) at schema version 0: a 216-byte root block, fundingRate only at 8 decimals |
 | `markets-summary-v1.sbe.txt` | The same values at schema version 1: a 240-byte root block, with `forwardRate`, `riskFreeRate` and `fundingRatePrecise` appended |
 | `eth-markets-summary-2026-09-23.sbe` | Captured, raw bytes, version 1: see below |
 
 The snapshot and the deltas at 1001, 1002 and 1003 are a continuous sequence; 1004 after 1002
 is a skipped seq_no, and 1001 or 1002 after 1002 a backwards one (`tests/md_book.rs`).
+
+The `eth-book-` frames are ETH-USD-PERP's: 500 and 501 a continuous sequence, and 502 and 503
+another, from the fresh snapshot a new subscription receives. With the BTC frames they give the
+decoder-replay test (`tests/replay.rs`) books of two markets on one connection, through BTC's
+gap and the reconnect that resyncs both.
 
 The `book15-` frames are a continuous depth-15 sequence whose book at seq 2002 is the REST
 snapshot `../rest/orderbook-btc-2002.json` (`tests/md_oracles.rs`).
