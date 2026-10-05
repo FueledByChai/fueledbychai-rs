@@ -2175,3 +2175,44 @@ fn test_connection_proves_the_key_and_logs_no_account_or_balance() {
     };
     assert_eq!(err, VenueError::Config(ConfigError::Missing(KEY)));
 }
+
+#[test]
+fn a_refused_test_connection_draws_no_nonce_and_never_reaches_its_parser() {
+    // Codex r4180237818: a plan that reserved nonces for a follow-up before it saw the answer
+    // would reserve them on a 401 too. An HttpPlan has no follow-up to reserve for. Its requests
+    // are the whole round, built (and signed, for a venue that signs) when the factory makes the
+    // plan, before any answer; its parser is handed only the 2xx answers and the decode scope,
+    // no EncodeCtx and no Effects, so it can neither sign nor ask for more; and `parse`
+    // consumes the plan. Every request is fixed before the first answer, so a refused answer
+    // changes nothing it asked for.
+    let plan = connection_plan();
+    let before = plan.requests().to_vec();
+    assert_eq!(before, [asked_for_account()]);
+    let refused = connect_with(
+        plan,
+        Ok(HttpResponse {
+            status: 401,
+            headers: &[],
+            body: b"",
+        }),
+    );
+    let tag = ACCOUNT_TAG;
+    assert_eq!(refused, Err(PlanError::Status { tag, status: 401 }));
+
+    // The refusal is decided before the parser runs: a plan of the same request whose parser
+    // panics if called ends the same way.
+    let mut fx = Effects::new();
+    fx.push(asked_for_account());
+    let unreachable = HttpPlan::new(fx, |_, _| -> Result<AccountSummary, PlanError> {
+        panic!("a refused answer reached the parser")
+    });
+    let refused = connect_with(
+        unreachable.unwrap(),
+        Ok(HttpResponse {
+            status: 401,
+            headers: &[],
+            body: b"",
+        }),
+    );
+    assert_eq!(refused, Err(PlanError::Status { tag, status: 401 }));
+}
