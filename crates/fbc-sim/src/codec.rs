@@ -6,11 +6,11 @@ use std::sync::Arc;
 
 use fbc_core::{
     AckLevel, Channel, ChosenRef, CidMatch, CtxCall, DecodeError, DecodeScope, Effect, Effects,
-    EncodeCtx, EncodeReceipt, ExchTsKind, ExecCodec, ExecEvent, ExecSink, Feature, FillEvent,
-    FillIdent, HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans, ItemRef, Liquidity,
-    Liquidity3, NotSentReason, OpKind, OrderCaps, OrderKind, OrderUpdate, PathStamps, RateCharge,
-    RawFrame, Reject, RpcCall, RpcId, SpecTable, StreamId, SubmitOutcome, TifTag, TimerTag,
-    VenueCommand, VenueMeta, VenueOrderState, WireSlice, encode_cid,
+    EncodeCtx, EncodeReceipt, ExchTsKind, ExecCodec, ExecEvent, ExecSink, Feature, FillCaps,
+    FillEvent, FillIdent, HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans, ItemRef,
+    Liquidity, Liquidity3, NotSentReason, OpKind, OrderCaps, OrderKind, OrderUpdate, PathStamps,
+    RateCharge, RawFrame, Reject, RpcCall, RpcId, SpecTable, StreamId, SubmitOutcome, TifTag,
+    TimerTag, VenueCommand, VenueMeta, VenueOrderState, WireSlice, encode_cid,
 };
 
 use crate::config::SimConfig;
@@ -26,6 +26,7 @@ use crate::wire::{Cancel, Command, Place, Refusal, Reply, Sent, SimState, Target
 #[derive(Clone, Debug)]
 pub struct SimCodec {
     caps: OrderCaps,
+    fills: FillCaps,
     stream: StreamId,
     rpc_timeout: Duration,
 }
@@ -35,6 +36,7 @@ impl SimCodec {
     pub fn new(config: &SimConfig) -> SimCodec {
         SimCodec {
             caps: config.exec.order.clone(),
+            fills: config.exec.fills,
             stream: config.stream,
             rpc_timeout: config.rpc_timeout,
         }
@@ -216,19 +218,30 @@ impl ExecCodec for SimCodec {
                 reduce_only: Some(o.reduce_only),
             }),
             Reply::Fill(fill) => ExecEvent::Fill(FillEvent {
-                ident: FillIdent::Venue {
-                    fill: scope.fill_id(&fill.fid)?,
-                    vid: Some(scope.venue_order_id(&fill.vid)?),
-                    cum_after: Some(fill.cum),
+                // Only what the stood-in venue reports (Codex r4182448147): without fill ids
+                // a fill is keyed by its order and cumulative quantity.
+                ident: if self.fills.fill_id {
+                    FillIdent::Venue {
+                        fill: scope.fill_id(&fill.fid)?,
+                        vid: Some(scope.venue_order_id(&fill.vid)?),
+                        cum_after: Some(fill.cum),
+                    }
+                } else {
+                    FillIdent::Derived {
+                        vid: scope.venue_order_id(&fill.vid)?,
+                        cum_after: fill.cum,
+                    }
                 },
                 cid: Some(scope.client_order_id(&fill.cid)),
                 inst: fill.inst,
                 side: fill.side,
                 px: fill.px,
                 qty: fill.qty,
-                liquidity: match fill.liquidity {
-                    Liquidity::Maker => Liquidity3::Maker,
-                    Liquidity::Taker => Liquidity3::Taker,
+                // Codex r4182448157: a venue without the flag does not say.
+                liquidity: match (self.fills.liquidity_flag, fill.liquidity) {
+                    (false, _) => Liquidity3::Unknown,
+                    (true, Liquidity::Maker) => Liquidity3::Maker,
+                    (true, Liquidity::Taker) => Liquidity3::Taker,
                 },
                 fee: scope.fee(fill.fee, fill.asset)?,
                 realized_pnl: None,
