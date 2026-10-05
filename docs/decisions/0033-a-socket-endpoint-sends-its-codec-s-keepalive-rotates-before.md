@@ -41,7 +41,8 @@ FBC-ha3), not by the silence window.
   or the next, and is counted with the refused effects. Then the connection is
   closed and the session reconnects as after any drop, waiting the floor within the budget. A
   frame that was already waiting when the window ran out (a write held the session) counts as
-  heard. A poll endpoint has no keepalive, rotation or silence window.
+  heard. A rotation due once the window has run out as well is a silence, not a rotation. A
+  poll endpoint has no keepalive, rotation or silence window.
 - The alarm and the rotation are not journaled as inputs of their own yet; the journal shows
   the connection's `Closed` and the next `Opened`.
 

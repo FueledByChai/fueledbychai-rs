@@ -129,6 +129,11 @@ impl Alive {
         self.silent_at = Instant::now().checked_add(self.silence);
     }
 
+    /// True when the silence window has run out by `now`; never on a poll endpoint.
+    pub(crate) fn silent_by(&self, now: Instant) -> bool {
+        self.silent_at.is_some_and(|at| at <= now)
+    }
+
     /// A keepalive goes now: the next falls due an interval later.
     pub(crate) fn beat(&mut self) {
         let next = |k: &Keepalive| Instant::now().checked_add(k.interval);
@@ -139,6 +144,18 @@ impl Alive {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_window_has_run_out_from_its_deadline_on_and_never_on_a_poll_endpoint() {
+        let s = Duration::from_secs;
+        let (socket, _) = Alive::open(true, None, s(5), Some(s(5)));
+        let at = socket.silent_at.unwrap();
+        assert!(!socket.silent_by(at - Duration::from_nanos(1)));
+        assert!(socket.silent_by(at));
+        assert!(socket.silent_by(at + s(1)));
+        let (poll, _) = Alive::open(false, None, s(5), Some(s(5)));
+        assert!(!poll.silent_by(at + s(3_600)));
+    }
 
     #[test]
     fn a_connection_rotates_its_margin_before_the_venues_lifetime() {
