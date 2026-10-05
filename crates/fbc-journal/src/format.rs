@@ -271,11 +271,12 @@ fn encode_body(
             e.u8(opcode_byte(*opcode));
             let (bytes, spans) = (frame.bytes(), frame.redactions());
             // A text frame must stay UTF-8 blanked: its bytes UTF-8 and its spans on character
-            // boundaries. Checked before the payload is copied, and only for a payload that
-            // fits after the fields before it, as an inbound frame's is.
+            // boundaries. Checked before the payload is copied, in the writing pass only, so
+            // only once the measuring pass found the record fits; a span may make it fit in
+            // less room than its bytes take, so the check does not wait on their length
+            // (Codex r4182133314).
             if e.write
                 && *opcode == Opcode::Text
-                && bytes.len() <= e.room()
                 && (core::str::from_utf8(bytes).is_err() || check_redactions(bytes, spans).is_err())
             {
                 return Err(JournalError::Unencodable(
@@ -1549,7 +1550,17 @@ mod tests {
                 Err(JournalError::TooLarge)
             ));
         }
+        // Codex r4182133314: one whose span makes it fit in less room than its bytes take is
+        // checked all the same.
+        let mut bytes = b"a\xff".to_vec();
+        bytes.resize(202, b'x');
+        let spanned = outbound(Opcode::Text, &bytes, Some(2..202));
         let mut body = Vec::new();
+        assert!(matches!(
+            encode_within(&spanned, &key(), &mut body, OUTBOUND_HEAD + 60),
+            Err(JournalError::Unencodable(_))
+        ));
+        assert!(body.is_empty());
         encode(&outbound(Opcode::Binary, b"a\xff", None), &key(), &mut body).unwrap();
         body[OUTBOUND_HEAD - 1] = opcode_byte(Opcode::Text);
         assert_eq!(decode(&body), Err("text frame"));
