@@ -2,8 +2,8 @@
 //! refinements).
 
 use fbc_core::{
-    CancelReason, ClientOrderId, Lots, MonoNs, NewOrder, NotSentReason, OrderKind, OrderUpdate,
-    RejectKind, RpcId, SubmitOutcome, Ticks, VenueOrderId, VenueOrderState,
+    AckLevel, CancelReason, ClientOrderId, Lots, MonoNs, NewOrder, NotSentReason, OrderKind,
+    OrderUpdate, RejectKind, RpcId, SubmitOutcome, Ticks, VenueOrderId, VenueOrderState, WallNs,
 };
 
 /// Where an order stands. The states are ranked ([`OrdState::rank`]) and a record's rank never
@@ -53,6 +53,11 @@ pub enum TerminalKind {
     Expired,
     /// Never sent: no byte of the placement reached a socket buffer.
     NotSent(NotSentReason),
+    /// Ended without our seeing how: the Unknown ladder found it absent from the configured
+    /// number of trustworthy snapshots taken after it was sent and settled, or its tombstone
+    /// cancel was refused because it had already ended (design §4.9). Counted
+    /// ([`Registry::lost`](crate::Registry::lost)); a late fill still counts.
+    Lost,
 }
 
 /// The order an update arrived in: the venue's ordering key when the venue gives one
@@ -143,6 +148,22 @@ pub enum OutcomeApplied {
     /// Nothing changed: the order is terminal, the outcome waits for an order event, or it
     /// refuses an amend or cancel that is not the command in flight (an earlier one's, late).
     Unchanged,
+    /// The Unknown ladder's tombstone cancel was answered: accepted for good, the order ended
+    /// Canceled; refused because the order had already ended, it ended Lost.
+    TombstoneResolved,
+}
+
+/// Where an order on the Unknown ladder stands (design §4.9): entered, it is queried; a query
+/// that cannot be built, is not answered or finds nothing conclusive leaves it to resyncs.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum LadderStep {
+    /// A query is due at the ladder's next pass.
+    Query,
+    /// Its query was built and is out.
+    Querying,
+    /// The query was inconclusive, or the venue's queries name no reference the order has:
+    /// resyncs decide, a resync is asked for on every pass.
+    Resync,
 }
 
 /// What a fill the ledger accepted did to its order
@@ -193,6 +214,18 @@ pub struct OrderRecord {
     /// current id may be retired, and the record does not know the new one. Kept until the
     /// order ends: a later replacement may arrive out of order.
     vid_retired: bool,
+    /// When the placement was sent, on the shard's monotonic clock and on the wall clock a
+    /// snapshot's watermark is aligned to.
+    sent: Option<(MonoNs, WallNs)>,
+    /// The ladder step, while [`Self::unknown_since`] is set.
+    ladder: LadderStep,
+    /// How many trustworthy snapshots in a row, past its sent time and the settle time, did not
+    /// show the order while it was on the ladder.
+    absent: u8,
+    /// When the ladder last built a tombstone cancel for the order.
+    tombstone_at: Option<MonoNs>,
+    /// The request the latest tombstone cancel was sent under.
+    tombstone: Option<RpcId>,
 }
 
 impl OrderRecord {
@@ -221,6 +254,11 @@ impl OrderRecord {
             placement_nonce: None,
             cancel_awaits_ack: false,
             vid_retired: false,
+            sent: None,
+            ladder: LadderStep::Query,
+            absent: 0,
+            tombstone_at: None,
+            tombstone: None,
         }
     }
 
@@ -326,10 +364,29 @@ impl OrderRecord {
         self.last_key
     }
 
-    /// When the order, or the command in flight on it, became unknown: the Unknown ladder's
-    /// starting point. Cleared when the order leaves Unknown or ends.
+    /// When the order, or the command in flight on it, became unknown, or the command in
+    /// flight outlived the intent timeout: the Unknown ladder's starting point, and the order
+    /// is on the ladder while it is set. Cleared when the order leaves Unknown, when the ladder
+    /// resolves it, or when it ends.
     pub fn unknown_since(&self) -> Option<MonoNs> {
         self.unknown_since
+    }
+
+    /// Where the order stands on the Unknown ladder; `None` when it is not on it.
+    pub fn ladder_step(&self) -> Option<LadderStep> {
+        self.unknown_since.map(|_| self.ladder)
+    }
+
+    /// How many trustworthy snapshots in a row, each taken at least the settle time after the
+    /// order was sent, did not show it while it was on the ladder.
+    pub fn absent_snapshots(&self) -> u8 {
+        self.absent
+    }
+
+    /// When the placement was sent, on the monotonic and the wall clock, once recorded
+    /// ([`Registry::placement_sent`](crate::Registry::placement_sent)).
+    pub fn sent_at(&self) -> Option<(MonoNs, WallNs)> {
+        self.sent
     }
 
     /// The nonce the placement was sent with, once recorded
@@ -524,7 +581,7 @@ impl OrderRecord {
             return Applied::Amended;
         }
         if self.state == OrdState::Unknown {
-            self.unknown_since = None;
+            self.leave_ladder();
         }
         self.state = self.live_state();
         self.confirm_if_stated(stated);
@@ -544,7 +601,8 @@ impl OrderRecord {
     /// with nothing in flight, except a cancel refused because the order already ended, which
     /// waits for the order's terminal event, and an outcome naming another request than the
     /// command in flight's, which leaves that command in flight; unanswered or not known to the venue, it is left
-    /// to the Unknown ladder.
+    /// to the Unknown ladder. The ladder's tombstone cancel, accepted for good, ends the order
+    /// Canceled, and refused because the order already ended, ends it Lost.
     pub fn on_outcome(
         &mut self,
         op: OrderOp,
@@ -554,6 +612,23 @@ impl OrderRecord {
     ) -> OutcomeApplied {
         if self.state.is_terminal() {
             return OutcomeApplied::Unchanged;
+        }
+        if let OrderOp::Cancel(rpc) = op
+            && self.tombstone == Some(rpc)
+        {
+            let ended = match outcome {
+                SubmitOutcome::Accepted {
+                    ack: AckLevel::Final,
+                } => Some(TerminalKind::Canceled(CancelReason::Requested)),
+                SubmitOutcome::Rejected(r) if matches!(r.kind, RejectKind::AlreadyTerminal(_)) => {
+                    Some(TerminalKind::Lost)
+                }
+                _ => None,
+            };
+            if let Some(kind) = ended {
+                self.end(kind);
+                return OutcomeApplied::TombstoneResolved;
+            }
         }
         match (op, outcome) {
             (OrderOp::Place, SubmitOutcome::NotSent(reason)) => {
@@ -568,7 +643,7 @@ impl OrderRecord {
                     return OutcomeApplied::Unchanged;
                 }
                 self.state = self.live_state();
-                self.unknown_since = None;
+                self.leave_ladder();
                 OutcomeApplied::Opened
             }
             (OrderOp::Place, SubmitOutcome::Rejected(r)) if r.kind != RejectKind::NotFound => {
@@ -580,7 +655,7 @@ impl OrderRecord {
                     return OutcomeApplied::Unchanged;
                 }
                 self.state = OrdState::Unknown;
-                self.unknown_since = Some(now);
+                self.enter_ladder(now);
                 OutcomeApplied::MovedToUnknown
             }
             (_, SubmitOutcome::Accepted { .. }) => OutcomeApplied::Unchanged,
@@ -652,7 +727,7 @@ impl OrderRecord {
             return FillApplied::Completed;
         }
         if self.state == OrdState::Unknown {
-            self.unknown_since = None;
+            self.leave_ladder();
         }
         self.state = self.live_state();
         FillApplied::Live
@@ -699,8 +774,71 @@ impl OrderRecord {
     }
 
     fn await_ladder(&mut self, now: MonoNs) -> OutcomeApplied {
-        self.unknown_since.get_or_insert(now);
+        self.enter_ladder(now);
         OutcomeApplied::AwaitingLadder
+    }
+
+    /// Puts the order on the Unknown ladder at `now`, unless it is on it already.
+    pub(crate) fn enter_ladder(&mut self, now: MonoNs) {
+        self.unknown_since.get_or_insert(now);
+    }
+
+    /// Takes the order off the Unknown ladder: a later entry starts afresh.
+    pub(crate) fn leave_ladder(&mut self) {
+        self.unknown_since = None;
+        self.ladder = LadderStep::Query;
+        self.absent = 0;
+        self.tombstone_at = None;
+        self.tombstone = None;
+    }
+
+    pub(crate) fn set_ladder_step(&mut self, step: LadderStep) {
+        self.ladder = step;
+    }
+
+    pub(crate) fn set_sent(&mut self, at: MonoNs, wall: WallNs) {
+        self.sent = Some((at, wall));
+    }
+
+    /// Moves a PendingNew order, sent and unanswered past its deadline, to Unknown at `now`.
+    pub(crate) fn time_out_placement(&mut self, now: MonoNs) {
+        self.state = OrdState::Unknown;
+        self.enter_ladder(now);
+    }
+
+    /// Counts one more trustworthy snapshot that did not show the order; whether that makes
+    /// `needed` in a row, which ends it Lost.
+    pub(crate) fn absent_from_snapshot(&mut self, needed: u8) -> bool {
+        self.absent = self.absent.saturating_add(1);
+        let lost = self.absent >= needed;
+        if lost {
+            self.end(TerminalKind::Lost);
+        }
+        lost
+    }
+
+    /// A snapshot showed the order: the absences in a row start again.
+    pub(crate) fn shown_in_snapshot(&mut self) {
+        self.absent = 0;
+    }
+
+    /// When the ladder last built a tombstone cancel for the order.
+    pub(crate) fn tombstone_at(&self) -> Option<MonoNs> {
+        self.tombstone_at
+    }
+
+    pub(crate) fn set_tombstone_at(&mut self, now: MonoNs) {
+        self.tombstone_at = Some(now);
+    }
+
+    /// Records the tombstone cancel sent at `now` under `rpc`, as any cancel
+    /// ([`Self::cancel_sent`]); false once the order is terminal.
+    pub(crate) fn tombstone_sent(&mut self, rpc: RpcId, now: MonoNs) -> bool {
+        let sent = self.cancel_sent(rpc, now);
+        if sent {
+            self.tombstone = Some(rpc);
+        }
+        sent
     }
 
     fn end(&mut self, kind: TerminalKind) {
@@ -708,7 +846,7 @@ impl OrderRecord {
         self.intent = Intent::None;
         self.cancel_awaits_ack = false;
         self.settle();
-        self.unknown_since = None;
+        self.leave_ladder();
     }
 
     /// Records that an amend replaced `old` (the record's current id when the update names

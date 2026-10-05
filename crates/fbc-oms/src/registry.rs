@@ -9,19 +9,26 @@ use fbc_core::{
     OrderUpdate, RpcId, SignedLots, SubmitOutcome, Ticks, VenueOrderId,
 };
 
+use crate::ladder;
+
 use crate::ledger::AcceptedFill;
 use crate::permit::{self, CancelChoice, CancelPlan, Cancellable, Live, PermitRefusal};
 use crate::record::{Applied, FillApplied, OrderKey, OrderOp, OrderRecord, OutcomeApplied};
 
-/// Our orders, by client id, with an index of every venue id they were known by, and the
-/// inventory per instrument that the fills the ledger accepted moved.
+/// Our orders, by client id, with an index of every venue id they were known by, the
+/// inventory per instrument that the fills the ledger accepted moved, and the Unknown ladder's
+/// queries out and orders lost ([`Registry::ladder`]).
 #[derive(Debug, Default)]
 pub struct Registry {
-    orders: HashMap<ClientOrderId, OrderRecord>,
+    pub(crate) orders: HashMap<ClientOrderId, OrderRecord>,
     by_vid: HashMap<VenueOrderId, ClientOrderId>,
     inventory: HashMap<InstrumentId, SignedLots>,
     /// The ledger whose fills the registry applies: the first one it was given.
     ledger: Option<u64>,
+    /// The ladder's queries out, by request.
+    pub(crate) queries: HashMap<RpcId, ClientOrderId>,
+    /// How many orders ended Lost.
+    pub(crate) lost: u64,
 }
 
 /// Where [`Registry::apply_fill`] sent a fill the ledger accepted.
@@ -85,6 +92,8 @@ pub enum OmsError {
     OtherLedger,
     /// The order's placement nonce was already recorded as another value.
     NonceRecorded(ClientOrderId),
+    /// The order's placement was already recorded as sent at other instants.
+    SentRecorded(ClientOrderId),
 }
 
 impl fmt::Display for OmsError {
@@ -111,6 +120,9 @@ impl fmt::Display for OmsError {
             }
             OmsError::NonceRecorded(cid) => {
                 write!(f, "{cid:?} already has another placement nonce recorded")
+            }
+            OmsError::SentRecorded(cid) => {
+                write!(f, "{cid:?} was already recorded as sent at other instants")
             }
         }
     }
@@ -270,9 +282,15 @@ impl Registry {
         if !self.orders.contains_key(&cid) {
             return Err(OmsError::UnknownCid(cid));
         }
-        Ok(self.with_record(cid, |rec| {
+        let applied = self.with_record(cid, |rec| {
             rec.on_outcome(op, item.vid.as_ref(), outcome, now)
-        }))
+        });
+        if ladder::is_lost(self.orders[&cid].state())
+            && applied == OutcomeApplied::TombstoneResolved
+        {
+            self.lost += 1;
+        }
+        Ok(applied)
     }
 
     /// Records the nonce the placement of `cid` was sent with (from its encode receipt), for
@@ -425,7 +443,7 @@ impl Registry {
     }
 
     /// Runs `change` on the registered order `cid`, then indexes every venue id it has.
-    fn with_record<R>(
+    pub(crate) fn with_record<R>(
         &mut self,
         cid: ClientOrderId,
         change: impl FnOnce(&mut OrderRecord) -> R,

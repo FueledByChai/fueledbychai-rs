@@ -65,6 +65,9 @@ pub enum PermitRefusal {
     /// would name it by another id, or wait for one. The event showing it is applied first
     /// ([`Registry::apply_update`](crate::Registry::apply_update)), and the record learns it.
     Unlearned(ClientOrderId),
+    /// The order is on the Unknown ladder: what the venue holds of it is not known, so it is
+    /// never amended until the ladder resolves it (decision 0005, I5; [`Registry::ladder`](crate::Registry::ladder)).
+    OnLadder(ClientOrderId),
 }
 
 /// Why a [`Live`] permit builds no amend.
@@ -152,6 +155,9 @@ impl<'r> Live<'r> {
         }
         if rec.intent() != Intent::None || rec.cancel_awaits_ack() {
             return Err(PermitRefusal::IntentPending(cid));
+        }
+        if rec.unknown_since().is_some() {
+            return Err(PermitRefusal::OnLadder(cid));
         }
         Ok(Live { rec })
     }
@@ -297,6 +303,24 @@ pub(crate) fn cancel_of(
     usable.then_some(cancel)
 }
 
+/// The Unknown ladder's tombstone cancel of `rec`, naming it by client id alone, whether or
+/// not the venue acknowledged it (design §4.9); `None` when the venue's single cancel cannot
+/// name a client id.
+pub(crate) fn tombstone_of(rec: &OrderRecord, caps: &OrderCaps) -> Option<PermittedCommand> {
+    if !crate::ladder::cancels_by_client(caps) {
+        return None;
+    }
+    let placed = rec.placed();
+    Some(PermittedCommand {
+        cmd: VenueCommand::Cancel(CancelOrder {
+            target: OrderRef::Client(rec.cid()),
+            inst: placed.inst,
+            side: placed.side,
+            placement_nonce: None,
+        }),
+    })
+}
+
 /// Splits `items` into cancel-many commands of one market each, at most `max_items` (above 0)
 /// items apiece, markets in id order and items in the order given.
 pub(crate) fn batches(items: Vec<CancelOrder>, max_items: u16) -> Vec<PermittedCommand> {
@@ -324,10 +348,8 @@ impl OrderRecord {
     /// confirmed may have replaced it ([`OrderRecord::amend_unconfirmed`]) or one confirmed
     /// without naming the new id did ([`OrderRecord::vid_retired`]).
     pub(crate) fn order_ref(&self, caps: &OrderCaps) -> OrderRef {
-        let retiring = caps.amend.is_some_and(|a| !a.keeps_venue_id)
-            && (self.amend_unconfirmed() || self.vid_retired());
         match self.vid() {
-            Some(vid) if !retiring => OrderRef::Both(self.cid(), vid.clone()),
+            Some(vid) if !self.id_may_have_moved(caps) => OrderRef::Both(self.cid(), vid.clone()),
             _ => OrderRef::Client(self.cid()),
         }
     }
