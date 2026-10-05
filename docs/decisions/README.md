@@ -51,3 +51,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0046](0046-simvenue-is-an-unchanged-execcodec-writing-frames-on-a-simul.md) SimVenue is an unchanged ExecCodec writing frames on a simulated order stream to a pure engine fed the shard's envelopes — accepted
 - [0047](0047-the-stub-answers-what-it-reads-a-script-step-pushes-frames-a.md) The stub answers what it reads: a script step pushes frames a function computes from the frame read, and HTTP rules match method and path pattern, augmenting 0025 — accepted
 - [0048](0048-a-plan-s-round-may-name-the-next-built-from-an-encodectx-whe.md) A plan's round may name the next, built from an EncodeCtx when it is sent, and Paradex logs in that way, augmenting 0035 and 0043 — accepted
+- [0049](0049-simvenue-answers-a-resync-with-its-resting-orders-and-the-po.md) SimVenue answers a resync with its resting orders and the positions its fills imply, augmenting 0046 — accepted

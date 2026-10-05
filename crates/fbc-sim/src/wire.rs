@@ -224,6 +224,9 @@ pub(crate) enum Command {
     /// Every order on one instrument.
     CancelAll(Head, InstrumentId),
     Query(Query),
+    /// A resync (decision 0049): a read of the resting orders and positions, which names no
+    /// request id since it awaits no RPC deadline.
+    Resync(Sent),
 }
 
 /// What every command frame starts with: its request and when it left the client.
@@ -341,10 +344,14 @@ impl Record<'_> {
     fn head(&self) -> Result<Head, WireError> {
         Ok(Head {
             rpc: self.num("rpc")?,
-            sent: Sent {
-                mono: MonoNs(self.num("mono")?),
-                wall: WallNs(self.num("wall")?),
-            },
+            sent: self.sent()?,
+        })
+    }
+
+    fn sent(&self) -> Result<Sent, WireError> {
+        Ok(Sent {
+            mono: MonoNs(self.num("mono")?),
+            wall: WallNs(self.num("wall")?),
         })
     }
 
@@ -418,6 +425,7 @@ impl Command {
             | Command::Batch(head, _)
             | Command::Cancels(head, _)
             | Command::CancelAll(head, _) => head.sent,
+            Command::Resync(sent) => *sent,
         }
     }
 
@@ -461,13 +469,15 @@ impl Command {
                 .target(&q.target)
                 .opt("qvid", q.vid.as_ref())
                 .opt("qcid", q.cid.as_ref()),
+            Command::Resync(sent) => Writer::new("resync")
+                .field("mono", sent.mono.0)
+                .field("wall", sent.wall.0),
         }
         .finish()
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Command, WireError> {
         let (r, lines) = record(bytes)?;
-        let head = r.head()?;
         let single = |command: Command| {
             if lines.is_empty() {
                 Ok(command)
@@ -475,6 +485,10 @@ impl Command {
                 Err(WireError("item"))
             }
         };
+        if r.kind == "resync" {
+            return single(Command::Resync(r.sent()?));
+        }
+        let head = r.head()?;
         match r.kind {
             "place" => single(Command::Place(r.place(head)?)),
             "batch" => Ok(Command::Batch(
@@ -605,6 +619,15 @@ pub(crate) enum Reply {
     },
     Order(OrderEvent),
     Fill(FillRecord),
+    /// A resync's whole answer, in one frame (decision 0049): `wm` is the wall time of the
+    /// request it answers, `orders` the resting orders, and `positions` the signed sum of the
+    /// account's fills in each instrument it has a fill in, in lots, as an `i128` so a sum past
+    /// an `i64` of lots is written as it is and the codec refuses it rather than wrap.
+    Resync {
+        wm: WallNs,
+        orders: Vec<OrderEvent>,
+        positions: Vec<(InstrumentId, i128)>,
+    },
 }
 
 #[derive(Clone, Eq, PartialEq, Debug)]
@@ -691,6 +714,17 @@ impl Reply {
                 .name("liq", LIQUIDITY, f.liquidity)
                 .field("fee", f.fee)
                 .field("asset", f.asset.as_str()),
+            Reply::Resync {
+                wm,
+                orders,
+                positions,
+            } => {
+                let w = Writer::new("resync").field("seq", seq).field("wm", wm.0);
+                let w = orders.iter().fold(w, |w, o| w.line("order").event(o));
+                positions.iter().fold(w, |w, (inst, qty)| {
+                    w.line("pos").field("inst", inst.get()).field("qty", qty)
+                })
+            }
         }
         .finish()
     }
@@ -758,6 +792,21 @@ impl Reply {
                 fee: r.num("fee")?,
                 asset: AssetSym::new(r.str("asset")?).ok_or(WireError("asset"))?,
             })),
+            "resync" => {
+                let (mut orders, mut positions) = (Vec::new(), Vec::new());
+                for line in &lines {
+                    match line.kind {
+                        "order" => orders.push(line.event()?),
+                        "pos" => positions.push((line.inst()?, line.num("qty")?)),
+                        _ => return Err(WireError("item")),
+                    }
+                }
+                Ok(Reply::Resync {
+                    wm: WallNs(r.num("wm")?),
+                    orders,
+                    positions,
+                })
+            }
             _ => Err(WireError("kind")),
         }?;
         Ok((seq, reply))
