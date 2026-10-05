@@ -2,8 +2,12 @@
 //! typed-data hash of the messages Paradex signs and their Stark-curve signature behind
 //! fbc-core's `OrderSigner`; and its public market data ([`md`]): SBE frames decoded by their
 //! stated block lengths into touches, trades and order book events with seq_no continuity
-//! (decision 0022), behind the [`ParadexFactory`] with market-data capabilities only. Order entry comes in a later ticket (BT-402).
+//! (decision 0022), behind the [`ParadexFactory`] with market-data capabilities only; and its
+//! authentication ([`auth`], a review path, 0009): the login signed from the consumer's
+//! credentials, the session token it gives, its refresh, and Test Connection (decision 0048).
+//! Order entry comes in a later ticket (BT-402).
 
+pub mod auth;
 pub mod factory;
 pub mod md;
 pub mod sign;

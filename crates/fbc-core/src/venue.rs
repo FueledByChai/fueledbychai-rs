@@ -23,8 +23,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::auth::Secrets;
 use crate::caps::VenueCaps;
 use crate::codec::{
-    DecodeError, Effect, Effects, EncodeReceipt, ExecCodec, HttpFailure, HttpResponse, HttpTag,
-    MdCodec, SpecTable, Subscription, WireUrl,
+    DecodeError, Effect, Effects, EncodeCtx, EncodeReceipt, ExecCodec, HttpFailure, HttpResponse,
+    HttpTag, MdCodec, SignError, SpecTable, Subscription, WireUrl,
 };
 use crate::command::NotSentReason;
 use crate::event::{RpcId, StreamId};
@@ -285,6 +285,9 @@ pub enum PlanError {
     /// An answer leaves out a field the result requires, named here: the whole answer is
     /// refused, and nothing is guessed in its place.
     Missing(&'static str),
+    /// A later round's request could not be signed (decision 0048); it carries no key
+    /// material, as no [`SignError`] does.
+    Sign(SignError),
 }
 
 impl fmt::Display for PlanError {
@@ -303,6 +306,7 @@ impl fmt::Display for PlanError {
             PlanError::Missing(field) => {
                 write!(f, "answer refused: required field {field} is missing")
             }
+            PlanError::Sign(err) => write!(f, "a request could not be signed: {err}"),
         }
     }
 }
@@ -312,6 +316,12 @@ impl std::error::Error for PlanError {}
 impl From<DecodeError> for PlanError {
     fn from(err: DecodeError) -> PlanError {
         PlanError::Decode(err)
+    }
+}
+
+impl From<SignError> for PlanError {
+    fn from(err: SignError) -> PlanError {
+        PlanError::Sign(err)
     }
 }
 
@@ -325,14 +335,25 @@ impl From<IdError> for PlanError {
 /// came.
 pub type HttpAnswer<'a> = (HttpTag, Result<HttpResponse<'a>, HttpFailure>);
 
-/// Reads the 2xx responses to a plan's requests, in the plan's order, inside a decode scope.
+/// Reads the 2xx responses to a plan's requests, in the plan's order, inside a decode scope,
+/// into the plan's result or the round that follows.
 type Parser<T> =
-    Box<dyn FnOnce(&[HttpResponse<'_>], &DecodeScope<'_>) -> Result<T, PlanError> + Send>;
+    Box<dyn FnOnce(&[HttpResponse<'_>], &DecodeScope<'_>) -> Result<PlanStep<T>, PlanError> + Send>;
+
+/// Builds a round of a plan from the [`EncodeCtx`] the runtime fills when it is about to send
+/// it.
+type Build<T> = Box<dyn FnOnce(&EncodeCtx) -> Result<HttpPlan<T>, PlanError> + Send>;
 
 /// A factory call that needs REST answers, as data (decision 0002): the requests, as
 /// [`Effect::Http`]s the runtime makes through the consumer's proxy, and the parser that reads
 /// their answers. The parser runs inside a [`DecodeScope`], the only builder of a
 /// [`VenueSymbol`](crate::VenueSymbol), and does no IO and reads no clock.
+///
+/// A plan is a round of requests (decision 0035). Its parser ends it with the result, or with
+/// a [`NextRound`] that builds the next round from an [`EncodeCtx`] (decision 0048): a request
+/// that signs a timestamp, or one that carries what an earlier answer gave (a login's token),
+/// is built only when the runtime is about to send it, from the time and nonces it reserves
+/// then, never before the answer that decides whether it is sent.
 pub struct HttpPlan<T> {
     requests: Vec<Effect>,
     parser: Parser<T>,
@@ -346,12 +367,100 @@ impl<T> fmt::Debug for HttpPlan<T> {
     }
 }
 
-impl<T> HttpPlan<T> {
-    /// A plan of `requests` read by `parser`. Refused when an effect is not an
-    /// [`Effect::Http`] ([`PlanError::NotHttp`]) or two share a tag.
+/// What a round of a plan ended in: the result, or the round that follows.
+pub enum PlanStep<T> {
+    /// The plan's result.
+    Done(T),
+    /// Another round, to build from an [`EncodeCtx`] and send.
+    Next(NextRound<T>),
+}
+
+impl<T> PlanStep<T> {
+    /// The result, or `None` when another round follows.
+    pub fn done(self) -> Option<T> {
+        match self {
+            PlanStep::Done(result) => Some(result),
+            PlanStep::Next(_) => None,
+        }
+    }
+
+    /// The next round, or `None` when this is the result.
+    pub fn next(self) -> Option<NextRound<T>> {
+        match self {
+            PlanStep::Done(_) => None,
+            PlanStep::Next(next) => Some(next),
+        }
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for PlanStep<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PlanStep::Done(result) => f.debug_tuple("Done").field(result).finish(),
+            PlanStep::Next(next) => f.debug_tuple("Next").field(next).finish(),
+        }
+    }
+}
+
+/// A plan's next round, not yet built: it states how many nonces its requests sign with, and
+/// the runtime reserves exactly that many into the [`EncodeCtx`] it builds the round from, when
+/// it is about to send it (decision 0048). Its `Debug` shows that count only: what it was built
+/// from (a token an earlier answer gave) stays inside.
+pub struct NextRound<T> {
+    nonces: u16,
+    build: Build<T>,
+}
+
+impl<T> fmt::Debug for NextRound<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NextRound")
+            .field("nonces", &self.nonces)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> NextRound<T> {
+    /// A round built by `build` from a context holding `nonces` nonces.
     pub fn new(
-        mut requests: Effects,
+        nonces: u16,
+        build: impl FnOnce(&EncodeCtx) -> Result<HttpPlan<T>, PlanError> + Send + 'static,
+    ) -> NextRound<T> {
+        NextRound {
+            nonces,
+            build: Box::new(build),
+        }
+    }
+
+    /// How many nonces the context it is built from must hold.
+    pub fn nonces(&self) -> u16 {
+        self.nonces
+    }
+
+    /// The round, built from `ctx`: its wall time, and the nonces reserved for it.
+    pub fn build(self, ctx: &EncodeCtx) -> Result<HttpPlan<T>, PlanError> {
+        (self.build)(ctx)
+    }
+}
+
+impl<T> HttpPlan<T> {
+    /// A plan of one round, `requests` read by `parser` into the result. Refused when an
+    /// effect is not an [`Effect::Http`] ([`PlanError::NotHttp`]) or two share a tag.
+    pub fn new(
+        requests: Effects,
         parser: impl FnOnce(&[HttpResponse<'_>], &DecodeScope<'_>) -> Result<T, PlanError>
+        + Send
+        + 'static,
+    ) -> Result<HttpPlan<T>, PlanError> {
+        HttpPlan::then(requests, move |responses, scope| {
+            parser(responses, scope).map(PlanStep::Done)
+        })
+    }
+
+    /// A round of `requests` whose `parser` ends the plan or names the next round
+    /// ([`PlanStep`]). Refused as [`new`](HttpPlan::new) is.
+    pub fn then(
+        mut requests: Effects,
+        parser: impl FnOnce(&[HttpResponse<'_>], &DecodeScope<'_>) -> Result<PlanStep<T>, PlanError>
         + Send
         + 'static,
     ) -> Result<HttpPlan<T>, PlanError> {
@@ -371,6 +480,23 @@ impl<T> HttpPlan<T> {
         })
     }
 
+    /// A plan whose first round needs an [`EncodeCtx`] (a signed timestamp): it asks for no
+    /// request, and its [`parse`](HttpPlan::parse) of no answers gives that round as a
+    /// [`NextRound`] of `nonces` nonces built by `build`.
+    pub fn later(
+        nonces: u16,
+        build: impl FnOnce(&EncodeCtx) -> Result<HttpPlan<T>, PlanError> + Send + 'static,
+    ) -> HttpPlan<T>
+    where
+        T: 'static,
+    {
+        let next = NextRound::new(nonces, build);
+        HttpPlan {
+            requests: Vec::new(),
+            parser: Box::new(move |_, _| Ok(PlanStep::Next(next))),
+        }
+    }
+
     /// The requests to make, every one an [`Effect::Http`].
     pub fn requests(&self) -> &[Effect] {
         &self.requests
@@ -378,12 +504,12 @@ impl<T> HttpPlan<T> {
 
     /// Reads `answers`, one per request in the plan's order, inside `scope`. Refused before the
     /// parser runs when the answers do not match the requests, a request got no response, or a
-    /// response's status is not 2xx; otherwise the parser's result.
+    /// response's status is not 2xx; otherwise the parser's result, or the next round.
     pub fn parse(
         self,
         answers: &[HttpAnswer<'_>],
         scope: &DecodeScope<'_>,
-    ) -> Result<T, PlanError> {
+    ) -> Result<PlanStep<T>, PlanError> {
         if answers.len() != self.requests.len() {
             return Err(PlanError::Answers);
         }
@@ -620,6 +746,7 @@ mod tests {
         crate::scope::dispatch_market_data(&crate::caps::testing::caps(), |scope| {
             plan.parse(answers, scope)
         })
+        .map(|step| step.done().expect("a one-round plan ends in its result"))
     }
 
     #[test]
@@ -667,6 +794,121 @@ mod tests {
         }
     }
 
+    fn ctx(wall: i64, nonces: Vec<u64>) -> EncodeCtx {
+        EncodeCtx {
+            wall: crate::time::WallNs(wall),
+            mono: crate::time::MonoNs(0),
+            nonces: crate::codec::NonceBlock::new(nonces),
+        }
+    }
+
+    /// Runs one round of `plan` with `answers`.
+    fn step<T>(plan: HttpPlan<T>, answers: &[HttpAnswer<'_>]) -> Result<PlanStep<T>, PlanError> {
+        crate::scope::dispatch_market_data(&crate::caps::testing::caps(), |scope| {
+            plan.parse(answers, scope)
+        })
+    }
+
+    /// A request tagged `tag` whose URL ends in `path`.
+    fn get_at(tag: u64, path: &str) -> Effect {
+        let mut effect = get(tag);
+        if let Effect::Http { req, .. } = &mut effect {
+            req.url = WireUrl::plain(format!("https://venue.invalid/{path}"));
+        }
+        effect
+    }
+
+    #[test]
+    fn a_later_plan_builds_its_first_round_from_the_context_it_is_sent_under() {
+        // Decision 0048: a round that signs a timestamp is built from the EncodeCtx the runtime
+        // fills when it sends it. A later plan asks for nothing; its parse of no answers names
+        // that round, which states its nonces and is built only from the context it is given.
+        let plan = HttpPlan::later(2, |ctx: &EncodeCtx| {
+            let mut fx = Effects::new();
+            let path = format!("t={}&n={:?}", ctx.wall.0, ctx.nonces.as_slice());
+            fx.push(get_at(1, &path));
+            HttpPlan::new(fx, |responses, _| Ok(responses[0].body.to_vec()))
+        });
+        assert_eq!(plan.requests(), []);
+        let next = step(plan, &[]).ok().and_then(PlanStep::next);
+        let next = next.expect("a later plan's first step is its round");
+        assert_eq!(next.nonces(), 2);
+        assert_eq!(format!("{next:?}"), "NextRound { nonces: 2, .. }");
+        let round = next.build(&ctx(7, vec![10, 11])).unwrap();
+        assert_eq!(round.requests(), [get_at(1, "t=7&n=[10, 11]")]);
+        let done = step(round, &[(HttpTag(1), ok(b"x"))]).unwrap();
+        assert_eq!(format!("{done:?}"), "Done([120])");
+        assert_eq!(done.done(), Some(b"x".to_vec()));
+        // A later plan's step, like any, is refused when answers come for requests it never
+        // asked for.
+        let plan = HttpPlan::<()>::later(0, |_| unreachable!("never built"));
+        assert_eq!(
+            step(plan, &[(HttpTag(1), ok(b""))]).err(),
+            Some(PlanError::Answers)
+        );
+    }
+
+    #[test]
+    fn a_round_names_the_next_only_after_its_answers_and_a_refusal_builds_nothing() {
+        // Codex r4180237818 on FBC-b3b: nothing of a follow-up, nonces included, exists before
+        // the answer that decides it. The follow-up is the parser's to name, so a refused or
+        // missing answer ends the plan before any later round is built or reserved for.
+        let first = || {
+            let mut fx = Effects::new();
+            fx.push(get(1));
+            HttpPlan::then(fx, |responses, _| {
+                let carried = responses[0].body.to_vec();
+                Ok(PlanStep::Next(NextRound::new(1, move |ctx: &EncodeCtx| {
+                    let mut fx = Effects::new();
+                    let nonce = ctx.nonce(0).ok_or(PlanError::Missing("nonce"))?;
+                    let path = format!("{}-{nonce}", String::from_utf8_lossy(&carried));
+                    fx.push(get_at(2, &path));
+                    HttpPlan::new(fx, |responses, _| Ok(responses[0].status))
+                })))
+            })
+            .unwrap()
+        };
+        let named = || step(first(), &[(HttpTag(1), ok(b"tok"))]).unwrap();
+        let next = named().next().expect("the first round names the second");
+        assert_eq!(next.nonces(), 1);
+        assert!(named().done().is_none());
+        // Its Debug shows the count, not what the round carries from the answer.
+        assert_eq!(
+            format!("{:?}", named()),
+            "Next(NextRound { nonces: 1, .. })"
+        );
+        let second = next.build(&ctx(0, vec![99])).unwrap();
+        assert_eq!(second.requests(), [get_at(2, "tok-99")]);
+        let done = step(second, &[(HttpTag(2), ok(b""))]).unwrap();
+        assert_eq!(format!("{done:?}"), "Done(200)");
+        assert!(done.next().is_none());
+        // A round built from a context without the nonces it asked for is the builder's to
+        // refuse.
+        let next = named().next().expect("the first round names the second");
+        assert_eq!(
+            next.build(&ctx(0, vec![])).err(),
+            Some(PlanError::Missing("nonce"))
+        );
+        // A refusal is decided before the parser runs, so no next round exists to build.
+        let refused = Ok(HttpResponse {
+            status: 401,
+            headers: &[],
+            body: b"",
+        });
+        let tag = HttpTag(1);
+        let ended = step(first(), &[(tag, refused)]).err();
+        assert_eq!(ended, Some(PlanError::Status { tag, status: 401 }));
+        let failure = HttpFailure::Lost;
+        let ended = step(first(), &[(tag, Err(failure))]).err();
+        assert_eq!(ended, Some(PlanError::Http { tag, failure }));
+        // `then` refuses what `new` refuses.
+        let mut fx = Effects::new();
+        fx.push(get(1));
+        fx.push(get(1));
+        let duplicate = HttpPlan::<()>::then(fx, |_, _| unreachable!()).err();
+        assert_eq!(duplicate, Some(PlanError::DuplicateTag(HttpTag(1))));
+    }
+
     #[test]
     fn plan_errors_say_what_was_refused_and_a_plan_shows_no_credential() {
         let id: PlanError = IdError::Empty.into();
@@ -686,6 +928,10 @@ mod tests {
             (PlanError::Status { tag, status: 503 }, "with status 503"),
             (id, "answer refused: venue id refused"),
             (PlanError::Missing("tick"), "required field tick is missing"),
+            (
+                SignError::Unsignable("timestamp").into(),
+                "a request could not be signed: cannot sign: timestamp",
+            ),
         ];
         for (err, text) in cases {
             assert!(err.to_string().contains(text), "{err}");

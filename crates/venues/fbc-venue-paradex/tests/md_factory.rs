@@ -137,8 +137,9 @@ fn the_url_is_configuration_and_the_adapter_writes_its_query() {
             "{url}: {refused:?}"
         );
     }
+    // The market-data URL is the schema's first key; the rest are authentication's (auth.rs).
     let schema = ParadexFactory.config_schema();
-    assert_eq!(schema.iter().map(|f| f.key).collect::<Vec<_>>(), [MD_URL]);
+    assert_eq!(schema[0].key, MD_URL);
 }
 
 #[test]
@@ -148,11 +149,13 @@ fn the_factory_declares_market_data_only_with_its_cited_limits() {
     assert_eq!(ParadexFactory.id(), "PARADEX");
     assert!(declared.exec.is_none());
     assert!(ParadexFactory.exec_codec(&cfg(), Secrets::new()).is_none());
-    assert!(
-        ParadexFactory
-            .test_connection(&cfg(), Secrets::new())
-            .is_none()
-    );
+    // Test Connection logs in (FBC-mz1, auth.rs); without its settings it says which is
+    // missing.
+    let tested = ParadexFactory.test_connection(&cfg(), Secrets::new());
+    let Some(Err(VenueError::Config(ConfigError::Missing(key)))) = tested else {
+        panic!("Paradex proves credentials, once configured")
+    };
+    assert_eq!(key, fbc_venue_paradex::auth::REST_URL);
     assert_eq!(ParadexFactory.plan_exec(&cfg()), Ok(Vec::new()));
     // Discovery and the Java-era ticker rule are not built yet (FBC-l5o): both say so.
     let ticker = ParadexFactory.parse_fbc_common_symbol("BTC/USDT");

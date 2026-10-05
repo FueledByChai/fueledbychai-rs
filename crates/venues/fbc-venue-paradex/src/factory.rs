@@ -19,6 +19,7 @@ use fbc_core::{
     VenueConfig, VenueError, VenueFactory, WireUrl,
 };
 
+use crate::auth;
 use crate::md::book::BOOK_CHANNELS;
 use crate::md::{self, ParadexMd, sbe};
 
@@ -32,13 +33,22 @@ pub const MD_URL: &str = "paradex.md.url";
 /// `StreamId(1)`, and so on.
 pub const MD_STREAM: StreamId = StreamId(0);
 
-const SCHEMA: &[FieldSpec] = &[FieldSpec {
-    key: MD_URL,
-    scope: ConfigScope::Account,
-    unit: FieldUnit::Dimensionless,
-    doc: "Public WebSocket URL (wss://), without query parameters; the adapter appends the SBE \
-          negotiation (sbeSchemaId=1&sbeSchemaVersion=1).",
-}];
+const SCHEMA: &[FieldSpec] = &[
+    FieldSpec {
+        key: MD_URL,
+        scope: ConfigScope::Account,
+        unit: FieldUnit::Dimensionless,
+        doc: "Public WebSocket URL (wss://), without query parameters; the adapter appends the \
+              SBE negotiation (sbeSchemaId=1&sbeSchemaVersion=1).",
+    },
+    auth::REST_URL_FIELD,
+    auth::CHAIN_ID_FIELD,
+    auth::SIGNATURE_LIFETIME_FIELD,
+    auth::REFRESH_FIELD,
+    auth::TIMEOUT_FIELD,
+    auth::ACCOUNT_ADDRESS_FIELD,
+    auth::SIGNING_KEY_FIELD,
+];
 
 /// The Paradex venue.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
@@ -155,13 +165,14 @@ impl VenueFactory for ParadexFactory {
         None
     }
 
-    /// None until Paradex authentication lands (FBC-mz1).
+    /// The login, then the account read with the token it gave ([`auth::connection_plan`],
+    /// decision 0048).
     fn test_connection(
         &self,
-        _cfg: &VenueConfig,
-        _creds: Secrets,
+        cfg: &VenueConfig,
+        creds: Secrets,
     ) -> Option<Result<HttpPlan<AccountSummary>, VenueError>> {
-        None
+        Some(auth::connection_plan(cfg, creds))
     }
 }
 
