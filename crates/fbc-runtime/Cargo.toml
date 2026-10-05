@@ -1,6 +1,6 @@
 [package]
 name = "fbc-runtime"
-description = "The one generic runtime: so far a connector that opens TCP directly or through a SOCKS5 proxy, with WebSocket and HTTP/1.1 over it, plain or TLS, connection epochs with a subscription reconciler, and market-data sessions that drive a venue's planned endpoints with paced reconnects, HTTP effects, poll endpoints and rate-limit buckets with a safety reserve, kernel receive timestamps and tick-to-wire on Linux, and one book per instrument and book channel with each instrument's configured trading book, journaling everything that crosses the shard boundary, and decoder replay of a journaled session."
+description = "The one generic runtime: so far a connector that opens TCP directly or through a SOCKS5 proxy, with WebSocket and HTTP/1.1 over it, plain or TLS, connection epochs with a subscription reconciler, and market-data sessions that drive a venue's planned endpoints with paced reconnects, keepalives, rotation before a venue's connection lifetime, a silence alarm, HTTP effects, poll endpoints and rate-limit buckets with a safety reserve, kernel receive timestamps and tick-to-wire on Linux, and one book per instrument and book channel with each instrument's configured trading book, journaling everything that crosses the shard boundary, and decoder replay of a journaled session."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

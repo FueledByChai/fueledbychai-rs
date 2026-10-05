@@ -35,6 +35,10 @@
 //! endpoint the codec sends nothing: its first subscribe asks for
 //! `<base_url>/poll?syms=<subscribed>` at once, and each answer sets a 10 ms timer whose
 //! firing asks again.
+//!
+//! FBC-djl: the configuration's `toy.lifetime_ms` declares that many milliseconds as the
+//! venue's `max_conn_lifetime`, and `toy.keepalive` (`ping:<ms>` or `frame:<ms>`) gives its codec
+//! a WebSocket ping, or the frame `ka`, every `<ms>` milliseconds.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
@@ -47,11 +51,12 @@ use fbc_core::{
     Continuity, DecodeError, DecodeScope, Effect, Effects, Encoding, EndpointPlan, ExchTsKind,
     ExecCodec, ExecEndpoint, Feed, FeedHealth, FeedSource, FieldSpec, FundingCaps, FundingSpec,
     Header, HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag, Inbound, InboundSpans,
-    InstrumentId, InstrumentKind, InstrumentSpec, Keepalive, Lots, MatchingCaps, MdCaps, MdCodec,
-    MdEvent, MdSink, MdTransport, MonoNs, OpKind, PriceGrid, QueueModelQuality, RateCharge,
-    RateLimit, RawFrame, Readiness, SizeStep, SpecTable, StpScope, StreamId, Subscription, TagSet,
-    Ticks, TimerTag, TradeCaps, TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueConfig,
-    VenueError, VenueFactory, VenueId, VenueMeta, WallNs, WireSlice, WireUrl, dispatch_market_data,
+    InstrumentId, InstrumentKind, InstrumentSpec, Keepalive, KeepaliveKind, Lots, MatchingCaps,
+    MdCaps, MdCodec, MdEvent, MdSink, MdTransport, MonoNs, OpKind, PriceGrid, QueueModelQuality,
+    RateCharge, RateLimit, RawFrame, Readiness, SizeStep, SpecTable, StpScope, StreamId,
+    Subscription, TagSet, Ticks, TimerTag, TradeCaps, TradingStatus, TrafficClass, UnderlyingId,
+    VenueCaps, VenueConfig, VenueError, VenueFactory, VenueId, VenueMeta, WallNs, WireSlice,
+    WireUrl, dispatch_market_data,
 };
 use fbc_runtime::{RateLimiter, SafetyReserve};
 use rust_decimal::Decimal;
@@ -65,6 +70,10 @@ pub const REFUSE: &str = "toy.refuse";
 pub const SPLIT: &str = "toy.split";
 /// The configuration key that makes the toy name every endpoint of a plan stream 0.
 pub const ONE_STREAM: &str = "toy.one_stream";
+/// The configuration key that declares the venue's connection lifetime, in milliseconds.
+pub const LIFETIME_MS: &str = "toy.lifetime_ms";
+/// The configuration key that gives the codec a keepalive: `ping:<ms>` or `frame:<ms>`.
+pub const KEEPALIVE: &str = "toy.keepalive";
 /// The toy's instruments, by id: 1 is `A`, 2 is `B`, 3 is `C`.
 const SYMBOLS: [&str; 3] = ["A", "B", "C"];
 
@@ -243,10 +252,15 @@ impl VenueFactory for ToyVenue {
                 key: REFUSE,
                 reason: "refused",
             }),
-            None => Ok(VenueCaps {
-                limits: self.limits.clone(),
-                ..caps()
-            }),
+            None => {
+                let mut caps = VenueCaps {
+                    limits: self.limits.clone(),
+                    ..caps()
+                };
+                let lifetime = cfg.get(LIFETIME_MS).and_then(|ms| ms.parse().ok());
+                caps.md.max_conn_lifetime = lifetime.map(Duration::from_millis);
+                Ok(caps)
+            }
         }
     }
 
@@ -303,6 +317,7 @@ impl VenueFactory for ToyVenue {
             books: BTreeMap::new(),
             subscribes: self.subscribes.clone(),
             split: cfg.get(SPLIT).map(|w| w.parse().unwrap_or(1)),
+            keepalive: cfg.get(KEEPALIVE).map(keepalive),
         })
     }
 
@@ -331,6 +346,21 @@ struct ToyMd {
     /// One frame per instrument of a subscribe call, each charged this weight to its
     /// instrument.
     split: Option<u32>,
+    keepalive: Option<Keepalive>,
+}
+
+/// The keepalive `ping:<ms>` or `frame:<ms>` names.
+fn keepalive(spec: &str) -> Keepalive {
+    let (kind, ms) = spec.split_once(':').expect("kind:ms");
+    let kind = match kind {
+        "ping" => KeepaliveKind::WsPing,
+        _ => KeepaliveKind::Frame(WireSlice::plain(b"ka".to_vec())),
+    };
+    Keepalive {
+        interval: Duration::from_millis(ms.parse().expect("milliseconds")),
+        kind,
+        charge: CONTROL,
+    }
 }
 
 const CONTROL: RateCharge = RateCharge::one(OpKind::Control, None);
@@ -561,7 +591,7 @@ impl MdCodec for ToyMd {
     }
 
     fn keepalive(&self) -> Option<Keepalive> {
-        None
+        self.keepalive.clone()
     }
 
     fn redact_inbound(&self, _input: Inbound<'_>) -> InboundSpans {

@@ -15,8 +15,8 @@ use fbc_core::{
     ConnKey, Envelope, Feed, InstrumentId, MdEvent, StreamId, Subscription, VenueConfig, VenueError,
 };
 use fbc_runtime::{
-    Connector, IngestClock, MdVenue, MdVenueConfig, PlanError, ProxyConfig, ReconnectPacing,
-    SessionError, Step,
+    Connector, IngestClock, Liveness, MdVenue, MdVenueConfig, PlanError, ProxyConfig,
+    ReconnectPacing, SessionError, Step,
 };
 
 type Seen = Rc<RefCell<Vec<Envelope<MdEvent>>>>;
@@ -41,6 +41,7 @@ fn config(urls: &[String], conns: Range<u16>) -> MdVenueConfig {
         http_max_body: 64 * 1024,
         conns,
         limiter: venue.limiter(0),
+        liveness: Liveness::new(Duration::from_secs(3_600), Duration::from_millis(1)).unwrap(),
     }
 }
 

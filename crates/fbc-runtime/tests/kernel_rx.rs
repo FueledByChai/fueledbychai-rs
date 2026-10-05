@@ -19,7 +19,7 @@ use fbc_core::{
     WallNs, WireSlice, WireUrl,
 };
 use fbc_runtime::{
-    Connector, IngestClock, MdHandler, MdSession, MdSessionConfig, Outbox, ProxyConfig,
+    Connector, IngestClock, Liveness, MdHandler, MdSession, MdSessionConfig, Outbox, ProxyConfig,
     ReconnectPacing, TickToWire,
 };
 
@@ -98,6 +98,7 @@ async fn run(tls: bool) -> (Seen, WallNs) {
         http_max_body: 1024,
         conn: 3,
         limiter: venue.limiter(0),
+        liveness: Liveness::new(Duration::from_secs(3_600), Duration::from_millis(1)).unwrap(),
     };
     let seen = Seen::default();
     let start = now();

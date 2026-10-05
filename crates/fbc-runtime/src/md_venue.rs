@@ -31,6 +31,7 @@ use tokio::sync::watch;
 use crate::connector::Connector;
 use crate::error::NetError;
 use crate::journal::Journal;
+use crate::liveness::Liveness;
 use crate::pacing::ReconnectPacing;
 use crate::ratelimit::RateLimiter;
 use crate::session::{
@@ -55,6 +56,8 @@ pub struct MdVenueConfig {
     /// The buckets of the venue's declared limits, which every endpoint charges (decision
     /// 0030); built for exactly the venue's limits.
     pub limiter: RateLimiter,
+    /// Each socket endpoint's silence window and rotation margin (0033).
+    pub liveness: Liveness,
 }
 
 /// Why a desired set was not planned; nothing was opened or closed for it.
@@ -164,6 +167,7 @@ impl<H: MdHandler + 'static> MdVenue<H> {
             .caps(&config.cfg)
             .map_err(SessionError::Config)?;
         config.limiter.check(&caps.limits)?;
+        config.liveness.rotate_after(caps.md.max_conn_lifetime)?;
         let (tx, plan) = watch::channel(Vec::new());
         let control = MdVenueControl {
             venue: config.venue,
@@ -258,6 +262,7 @@ impl<H: MdHandler + 'static> MdVenue<H> {
             http_max_body: c.http_max_body,
             conn,
             limiter: c.limiter.clone(),
+            liveness: c.liveness,
         };
         let (mut session, control) = MdSession::new(config, Shared(self.handler.clone()))?;
         if let Some(journal) = &self.journal {

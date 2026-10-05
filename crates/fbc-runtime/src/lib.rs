@@ -64,7 +64,12 @@
 //! frame with one as a [`TickToWire`], to its handler (FBC-2y3, decision 0031). Elsewhere
 //! `kernel_rx` is `None` and nothing is reported.
 //!
-//! Not here yet: order-entry sessions, keepalives, client certificates and certificate pinning.
+//! A socket endpoint stays alive by itself (FBC-djl, decision 0033): its codec's keepalive goes
+//! out at the declared interval, its connection rotates to the next epoch the consumer's
+//! [`Liveness`] margin before the venue's `max_conn_lifetime`, and a stream that hears nothing
+//! within the consumer's silence window is reported stale and reconnected under a new epoch.
+//!
+//! Not here yet: order-entry sessions, client certificates and certificate pinning.
 //! Apart from a codec's HTTP request, no call here has a deadline of its own; the caller bounds
 //! one with its own timer.
 
@@ -74,6 +79,7 @@ mod epoch;
 mod error;
 pub mod http;
 mod journal;
+mod liveness;
 mod md_venue;
 mod pacing;
 mod ratelimit;
@@ -92,6 +98,7 @@ pub use connector::{Connector, ProxyConfig};
 pub use epoch::{Admit, EpochError, Epochs, Input};
 pub use error::{Cause, NetError, Step};
 pub use journal::Journal;
+pub use liveness::{Liveness, LivenessError};
 pub use md_venue::{MdVenue, MdVenueConfig, MdVenueControl, PlanError};
 pub use pacing::{PacingError, ReconnectPacing};
 pub use ratelimit::{

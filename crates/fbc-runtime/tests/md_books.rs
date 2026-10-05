@@ -18,7 +18,7 @@ use fbc_core::{
     MdTransport, Ticks, VenueConfig, WireUrl,
 };
 use fbc_runtime::{
-    BookKeeper, Connector, IngestClock, MdBooks, MdHandler, MdSession, MdSessionConfig,
+    BookKeeper, Connector, IngestClock, Liveness, MdBooks, MdHandler, MdSession, MdSessionConfig,
     ProxyConfig, ReconnectPacing, TradingBookConflict, TradingBooks,
 };
 
@@ -95,6 +95,7 @@ async fn two_book_channels_of_one_instrument_on_one_connection_stay_separate_and
         http_max_body: 1024,
         conn: 3,
         limiter: venue.limiter(0),
+        liveness: Liveness::new(Duration::from_secs(3_600), Duration::from_millis(1)).unwrap(),
     };
     // The interactive channel is the configured trading book of instrument A.
     let trading = TradingBooks::new([(inst(A), INTERACTIVE)]).unwrap();

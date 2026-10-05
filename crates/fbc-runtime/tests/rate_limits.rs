@@ -13,15 +13,15 @@ use std::ops::Range;
 use std::time::Duration;
 
 use common::toy::{self, ToyVenue};
-use common::{ScriptedHttp, ScriptedWs, refusing};
+use common::{PONG, ScriptedHttp, ScriptedWs, refusing};
 use fbc_core::{
     ConnKey, EndpointPlan, InstrumentId, LimitScope, MdTransport, OpKind, RateCharge, RateLimit,
     TagSet, VenueConfig, WireUrl,
 };
 use fbc_runtime::{
-    BucketKey, Connector, IngestClock, MdSession, MdSessionConfig, MdVenue, MdVenueConfig,
-    ProxyConfig, RateCounts, RateError, RateLimiter, ReconnectPacing, SafetyReserve, ScopeCounts,
-    SessionError,
+    BucketKey, Connector, IngestClock, Liveness, MdSession, MdSessionConfig, MdVenue,
+    MdVenueConfig, ProxyConfig, RateCounts, RateError, RateLimiter, ReconnectPacing, SafetyReserve,
+    ScopeCounts, SessionError,
 };
 use tokio::time::Instant;
 
@@ -96,7 +96,14 @@ fn session(venue: &'static ToyVenue, url: String, limiter: RateLimiter) -> MdSes
         http_max_body: 1024,
         conn: CONN,
         limiter,
+        liveness: no_alarm(),
     }
+}
+
+/// No silence window: on paused time a pending window would let the clock jump ahead during
+/// socket I/O (FBC-djl).
+fn no_alarm() -> Liveness {
+    Liveness::new(Duration::MAX, ms(1)).unwrap()
 }
 
 async fn until(done: impl Fn() -> bool) {
@@ -556,6 +563,8 @@ async fn a_pong_the_websocket_layer_sends_on_its_own_is_charged_to_its_connectio
         // The hello and the ping's pong (Codex r4179266588) leave room for one more frame.
         peer.ping();
         peer.send("say|id=1");
+        // The scripted server hears the pong first (FBC-djl).
+        assert_eq!(peer.recv().await, PONG);
         assert_eq!(peer.recv().await, "said|id=1");
         peer.send("say|id=2");
         until(|| rates.counts().refused.connection == 1).await;
@@ -626,6 +635,7 @@ fn a_venue_declaring_an_address_volume_limit_is_refused_at_start() {
         http_max_body: 1024,
         conns: Range { start: 0, end: 4 },
         limiter: other,
+        liveness: no_alarm(),
     };
     let err = MdVenue::new(config, |_| {}).err().unwrap();
     assert_eq!(err, SessionError::from(RateError::OtherLimits));
