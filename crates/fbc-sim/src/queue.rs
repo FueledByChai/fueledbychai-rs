@@ -196,6 +196,24 @@ impl QueueModel {
         order: NewOrder,
         book: &L2Book,
     ) -> Result<QueuePos, QueueError> {
+        let side = order.side.book_side();
+        let shown = book
+            .level(side, order.px)
+            .map_err(QueueError::Book)?
+            .ok_or(QueueError::UnknownLevel { side, px: order.px })?;
+        self.accept_shown(key, order, shown)
+    }
+
+    /// [`accept`](QueueModel::accept) with the level's size given rather than read from a
+    /// book: `shown` is the size at the order's side and price as the simulated venue shows it,
+    /// with the modelled public orders it holds there. SimVenue gives it when its book, the
+    /// real venue's, does not show its own simulated orders (decision 0043).
+    pub fn accept_shown(
+        &mut self,
+        key: OrderKey,
+        order: NewOrder,
+        shown: Lots,
+    ) -> Result<QueuePos, QueueError> {
         if self.orders.contains_key(&key) {
             return Err(QueueError::DuplicateOrder(key));
         }
@@ -203,10 +221,6 @@ impl QueueModel {
             return Err(QueueError::ZeroQuantity(key));
         }
         let side = order.side.book_side();
-        let shown = book
-            .level(side, order.px)
-            .map_err(QueueError::Book)?
-            .ok_or(QueueError::UnknownLevel { side, px: order.px })?;
         let own = self
             .orders
             .values()

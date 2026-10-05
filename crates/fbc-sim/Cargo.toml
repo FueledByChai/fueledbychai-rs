@@ -1,6 +1,6 @@
 [package]
 name = "fbc-sim"
-description = "Simulation mechanisms with no calibration in them: the queue-position fill model, bracketed Pessimistic, Middle and Optimistic."
+description = "Simulation mechanisms with no calibration in them: the queue-position fill model, bracketed Pessimistic, Middle and Optimistic, and SimVenue, a simulated venue behind an ExecCodec."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,4 +13,5 @@ fbc-core = { path = "../fbc-core" }
 fbc-book = { path = "../fbc-book" }
 
 [dev-dependencies]
+rust_decimal.workspace = true
 trybuild.workspace = true
