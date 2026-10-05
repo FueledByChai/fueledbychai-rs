@@ -374,6 +374,13 @@ pub const PING: &str = "<ping>";
 /// What a [`Peer`] hears when the client answers its ping.
 pub const PONG: &str = "<pong>";
 
+/// What a [`Peer`] hears when the client sends a binary frame of `bytes`: `<binary HEX>`, the
+/// bytes in lower-case hex.
+pub fn heard_binary(bytes: &[u8]) -> String {
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!("<binary {hex}>")
+}
+
 /// One accepted connection: the text frames (and pings) the client sent, in order, each with
 /// the (tokio) instant the server read it, and a way to answer.
 pub struct Peer {
@@ -444,8 +451,8 @@ impl ScriptedWs {
     }
 }
 
-/// Plays one scripted connection: reports each text frame the client sends on `heard` and does
-/// what the test asks on `out`.
+/// Plays one scripted connection: reports each text or binary frame the client sends on `heard`
+/// and does what the test asks on `out`.
 async fn script_ws<S: AsyncRead + AsyncWrite + Unpin>(
     stream: S,
     heard: mpsc::UnboundedSender<(Instant, String)>,
@@ -470,6 +477,9 @@ async fn script_ws<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 Some(Ok(Message::Pong(_))) => {
                     let _ = heard.send((Instant::now(), PONG.to_owned()));
+                }
+                Some(Ok(Message::Binary(bytes))) => {
+                    let _ = heard.send((Instant::now(), heard_binary(&bytes)));
                 }
                 Some(Ok(_)) => {}
                 _ => break,

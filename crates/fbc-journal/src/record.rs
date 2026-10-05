@@ -63,6 +63,19 @@ pub enum Opcode {
     Binary,
 }
 
+impl Opcode {
+    /// The kind a frame of these bytes is sent as: text when they are UTF-8, binary otherwise.
+    /// A session chooses an outbound frame's kind this way; a journal of format version 4 or
+    /// earlier, which did not keep it, reads an outbound frame back with the kind its blanked
+    /// bytes imply.
+    pub fn of(bytes: &[u8]) -> Opcode {
+        match core::str::from_utf8(bytes) {
+            Ok(_) => Opcode::Text,
+            Err(_) => Opcode::Binary,
+        }
+    }
+}
+
 /// What became of writing an outbound frame.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum WriteRes {
@@ -299,11 +312,15 @@ pub enum Record {
         bytes: Opaque,
         redact: Vec<Range<u32>>,
     },
-    /// A frame written to a connection, with its redaction spans.
+    /// A frame written to a connection, with the kind it was sent as and its redaction spans.
+    /// A text frame's bytes are UTF-8 with its spans on character boundaries, so it stays UTF-8
+    /// blanked. The kind is kept rather than read off the bytes (FBC-q7b): a binary frame whose
+    /// only bytes that are not UTF-8 lie in its spans is UTF-8 once blanked.
     Outbound {
         at: MonoNs,
         conn: ConnKey,
         rpc: Option<RpcId>,
+        opcode: Opcode,
         frame: WireSlice,
     },
     /// What became of writing the outbound frame before it on `conn`.
@@ -408,11 +425,13 @@ impl Record {
                 at,
                 conn,
                 rpc,
+                opcode,
                 frame,
             } => Record::Outbound {
                 at: *at,
                 conn: *conn,
                 rpc: *rpc,
+                opcode: *opcode,
                 frame: blank_slice(frame),
             },
             Record::HttpRequest {

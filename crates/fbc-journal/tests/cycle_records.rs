@@ -2,7 +2,8 @@
 //! kinds, read back equal and in write order; and a journal written before these kinds existed
 //! (format version 2, `fixtures/journal/v2`) still reads back unchanged (0006, 0014 item 1).
 //! So does a journal written in format version 3 (`fixtures/journal/v3`), before inbound
-//! redaction spans (FBC-7lm, decision 0028).
+//! redaction spans (FBC-7lm, decision 0028), and one in format version 4
+//! (`fixtures/journal/v4`), before outbound frames kept the kind they were sent as (FBC-q7b).
 //!
 //! Every secret here is synthetic, and each is assembled at run time so no credential-shaped
 //! literal sits in the source.
@@ -13,13 +14,13 @@ use std::sync::Arc;
 
 use fbc_core::{
     ConnKey, EncodeCtx, Feed, Header, HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag,
-    InstrumentId, KernelRxNs, MonoNs, NonceBlock, NotSentReason, RawFrame, RpcId, Stamp,
-    Subscription, TimerTag, WallNs, WireSlice, WireUrl,
+    InboundSpans, InstrumentId, KernelRxNs, MonoNs, NonceBlock, NotSentReason, RawFrame, RpcId,
+    Stamp, Subscription, TimerTag, WallNs, WireSlice, WireUrl,
 };
 use fbc_journal::format::{MAGIC, VERSION};
 use fbc_journal::{
     ControlEvent, Entry, HttpRequestRec, HttpResponseRec, JournalError, JournalReader,
-    JournalWriter, Marker, NonceSourceId, Opaque, Record, RedactionKey, WriteRes,
+    JournalWriter, Marker, NonceSourceId, Opaque, Opcode, Record, RedactionKey, WriteRes,
 };
 
 const SEC: i64 = 1_000_000_000;
@@ -143,6 +144,7 @@ fn v2_records() -> Vec<(WallNs, Record)> {
                 at: MonoNs(30),
                 conn: conn(),
                 rpc: Some(RpcId(5)),
+                opcode: Opcode::Text,
                 frame: WireSlice::redacted(frame.into_bytes(), vec![frame_span]).unwrap(),
             },
         ),
@@ -229,6 +231,50 @@ fn v3_records() -> Vec<(WallNs, Record)> {
     out
 }
 
+/// What `fixtures/journal/v4` holds: the version 3 records with, after the decide cycle's
+/// frame, an inbound frame with a credential its codec named, a binary outbound frame whose
+/// bytes outside its redaction span are not UTF-8, and one whose only bytes that are not UTF-8
+/// lie inside its span, all written by the version 4 writer (its README says how). Version 4
+/// kept no outbound frame's kind, so each reads back with the kind its blanked bytes imply
+/// (FBC-q7b): the first binary, the second text, with `inside` its kind.
+fn v4_records(inside_kind: Opcode) -> Vec<(WallNs, Record)> {
+    let mut out = v3_records();
+    let at = out
+        .iter()
+        .position(|(_, r)| matches!(r, Record::WriteResult { .. }))
+        .unwrap();
+    let echo = secret("echo");
+    let text = format!("{{\"channel\":\"fills\",\"echo\":\"{echo}\"}}");
+    let spans = InboundSpans::frame(vec![span_of(text.as_bytes(), &echo)]);
+    let inbound = Record::inbound_redacted(stamp(3, NOON), RawFrame::Text(&text), &spans).unwrap();
+    let mut outside = b"bin|".to_vec();
+    outside.extend_from_slice(&[0xc3, 0x28]);
+    outside.extend_from_slice(secret("bin-outside").as_bytes());
+    let outside_span = (outside.len() - secret("bin-outside").len()) as u32..outside.len() as u32;
+    let mut inside = b"bin|".to_vec();
+    inside.extend_from_slice(&[0xff, 0xfe]);
+    inside.extend_from_slice(secret("bin-inside").as_bytes());
+    let inside_span = 4..inside.len() as u32;
+    let new = [
+        inbound,
+        binary_outbound(80, outside, outside_span, Opcode::Binary),
+        binary_outbound(81, inside, inside_span, inside_kind),
+    ];
+    out.splice(at..at, new.into_iter().map(|r| (NOON, r)));
+    out
+}
+
+/// A frame written at `at` as `opcode`, with its credential span.
+fn binary_outbound(at: u64, bytes: Vec<u8>, span: std::ops::Range<u32>, opcode: Opcode) -> Record {
+    Record::Outbound {
+        at: MonoNs(at),
+        conn: conn(),
+        rpc: None,
+        opcode,
+        frame: WireSlice::redacted(bytes, vec![span]).unwrap(),
+    }
+}
+
 fn fixture_root(version: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/journal")
@@ -249,6 +295,47 @@ fn a_journal_written_before_these_kinds_existed_reads_back_unchanged() {
 #[test]
 fn a_journal_written_before_inbound_redaction_spans_reads_back_unchanged() {
     reads_back_unchanged("v3", 3, v3_records());
+}
+
+/// FBC-q7b: a journal written before outbound frames kept their kind reads back, each such
+/// frame with the kind its blanked bytes imply.
+#[test]
+fn a_journal_written_before_outbound_opcodes_reads_back_with_the_kind_its_bytes_imply() {
+    reads_back_unchanged("v4", 4, v4_records(Opcode::Text));
+}
+
+/// FBC-q7b's done line: a binary frame whose only bytes that are not UTF-8 lie inside its
+/// redaction span, which is UTF-8 once blanked, reads back as the binary frame it was sent as.
+#[test]
+fn a_binary_frame_utf8_once_blanked_reads_back_binary() {
+    let root = fresh_dir("outbound_opcode");
+    let written = v4_records(Opcode::Binary);
+    let mut writer = JournalWriter::create(&root, 1, key()).unwrap();
+    for (now, record) in &written {
+        writer.append(*now, record).unwrap();
+    }
+    writer.flush().unwrap();
+    drop(writer);
+    let open = fs::read(root.join("20261003/1-000001.fbcj")).unwrap();
+    assert_eq!(version_of(&open), VERSION);
+    let read: Vec<Record> = JournalReader::open(&root, 1)
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let expected: Vec<Record> = written.iter().map(|(_, r)| r.blanked()).collect();
+    assert_eq!(read, expected);
+    let at_81 = |r: &&Record| matches!(r, Record::Outbound { at: MonoNs(81), .. });
+    let Some(Record::Outbound { opcode, frame, .. }) = read.iter().find(at_81) else {
+        panic!("{read:?}");
+    };
+    let sent = written.iter().map(|(_, r)| r).find(at_81);
+    let Some(Record::Outbound { frame: sent, .. }) = sent else {
+        panic!("{written:?}");
+    };
+    assert_eq!(*opcode, Opcode::Binary);
+    // What was sent was not UTF-8; what reads back is, so only the kept kind says binary.
+    assert!(std::str::from_utf8(sent.bytes()).is_err());
+    assert!(std::str::from_utf8(frame.bytes()).is_ok());
 }
 
 /// The fixture in `fixtures/journal/<dir>`, which the format `version` writer left (a closed,
@@ -310,6 +397,7 @@ fn cycle(n: u64, nonces: &[u64]) -> Vec<Record> {
         at: MonoNs(n * 1_000 + 1),
         conn: conn(),
         rpc: Some(RpcId(n)),
+        opcode: Opcode::Text,
         frame: WireSlice::plain(format!("{{\"order\":{n}}}").into_bytes()),
     });
     out

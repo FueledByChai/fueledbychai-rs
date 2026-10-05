@@ -19,7 +19,7 @@ use fbc_core::{
 };
 use fbc_journal::{
     BLANK, Entry, HttpRequestRec, HttpResponseRec, JournalReader, JournalSink, JournalWriter,
-    Record, RedactionKey, SinkConfig, SpanDigest, journal_queue,
+    Opcode, Record, RedactionKey, SinkConfig, SpanDigest, journal_queue,
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -195,6 +195,7 @@ fn session() -> Session {
         at: MonoNs(4),
         conn: CONN,
         rpc: Some(RpcId(9)),
+        opcode: Opcode::Text,
         frame,
     });
     span_values.push(vec![jwt.clone()]);
