@@ -15,7 +15,9 @@
 //! 1. It is queried once, by the reference the venue's `query_refs` declare
 //!    ([`QueryOrder::reference`]); a client id always exists. An answer showing the order
 //!    resting with nothing in flight, or ended, resolves it ([`LadderResolution::Resolved`]),
-//!    an open order still counting against the caps.
+//!    an open order still counting against the caps; one naming another order than the one
+//!    queried applies nothing ([`LadderResolution::TargetMismatch`]). An Unknown order shown
+//!    resting with a cancel still in flight stays on the ladder.
 //! 2. A query that cannot be built, goes unanswered or is inconclusive (the venue does not
 //!    find the order, or shows it with a command still in flight) leaves it to resyncs, and the
 //!    ladder asks for one on every pass ([`LadderPlan::resync`]). A resync showing the order
@@ -168,6 +170,10 @@ pub enum LadderResolution {
     Resolved(OrdState),
     /// The venue did not settle it: resyncs decide ([`LadderPlan::resync`]).
     Inconclusive,
+    /// The answer carries the query's request but names another order than the one queried
+    /// (another client id, or a venue id another order of ours holds): nothing of it applies,
+    /// the query is spent and resyncs decide.
+    TargetMismatch,
     /// Not the answer to a ladder query the registry holds, or its order is no longer on the
     /// ladder: nothing changed.
     Ignored,
@@ -262,6 +268,16 @@ impl Registry {
         let Some(cid) = self.ladder_query(answer.rpc()) else {
             return LadderResolution::Ignored;
         };
+        // Our queries always name the order by our client id, with a venue id it has.
+        let target = answer.target();
+        let names_it = target.client() == Some(cid)
+            && target
+                .venue()
+                .is_none_or(|v| self.cid_of(v).is_none_or(|by_vid| by_vid == cid));
+        if !names_it {
+            self.with_record(cid, |rec| rec.set_ladder_step(LadderStep::Resync));
+            return LadderResolution::TargetMismatch;
+        }
         match answer.found() {
             Some(snap) => {
                 let u = update_of(snap);
@@ -312,11 +328,18 @@ impl Registry {
         let mut applied = ResyncApplied::default();
         let mut shown = std::collections::HashSet::new();
         for snap in orders {
-            let by_cid = match snap.cid {
-                Some(CidMatch::Ours(cid)) if self.orders.contains_key(&cid) => Some(cid),
-                _ => None,
-            };
             let by_vid = self.cid_of(&snap.vid);
+            let by_cid = match snap.cid {
+                // Another namespace's or a non-canonical client id names no order of ours, as
+                // for an order update: nothing of it applies by its venue id, though an order
+                // of ours holding that id is not counted absent.
+                Some(CidMatch::Foreign(_) | CidMatch::Unparseable) => {
+                    shown.extend(by_vid);
+                    continue;
+                }
+                Some(CidMatch::Ours(cid)) if self.orders.contains_key(&cid) => Some(cid),
+                Some(CidMatch::Ours(_)) | None => None,
+            };
             shown.extend(by_cid);
             shown.extend(by_vid);
             let cid = match (by_cid, by_vid) {

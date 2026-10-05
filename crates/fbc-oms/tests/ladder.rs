@@ -917,3 +917,122 @@ fn the_ladders_records_are_refused_for_an_order_the_registry_does_not_hold_or_a_
     assert!(refusal.to_string().contains("already recorded as sent"));
     assert_eq!(reg.get(c).unwrap().sent_at(), Some((at(1), wall(2))));
 }
+
+// ---- review: answers and snapshots that name another order, ladder kept while unsettled ----
+
+#[test]
+fn a_query_answer_naming_another_order_than_the_one_queried_is_never_applied() {
+    let mut reg = Registry::new();
+    let c = unknown(&mut reg);
+    let other = open(&mut reg, "g9");
+    reg.ladder(&cfg(), &caps(), at(6));
+    reg.query_sent(c, RpcId(1)).unwrap();
+    // The reply carries our query's request but names another of our orders: its snapshot
+    // agrees with what it names, not with what we asked.
+    let answer = QueryAnswer::new(
+        RpcId(1),
+        OrderRef::Client(other),
+        Some(snap(Some(other), "g9", VenueOrderState::Open, 4)),
+    )
+    .unwrap();
+    assert_eq!(
+        reg.on_query_answer(&answer, key(1)),
+        LadderResolution::TargetMismatch
+    );
+    let rec = reg.get(c).unwrap();
+    assert_eq!(rec.state(), OrdState::Unknown);
+    assert_eq!(rec.vid(), None);
+    assert_eq!(rec.ladder_step(), Some(LadderStep::Resync));
+    assert_eq!(reg.get(other).unwrap().filled(), lots(0));
+
+    // Our client id with a venue id another order of ours holds: not applied either.
+    let c = unknown(&mut reg);
+    reg.ladder(&cfg(), &caps(), at(6));
+    reg.query_sent(c, RpcId(2)).unwrap();
+    let answer = QueryAnswer::new(
+        RpcId(2),
+        OrderRef::Both(c, vid("g9")),
+        Some(snap(Some(c), "g9", canceled(), 0)),
+    )
+    .unwrap();
+    assert_eq!(
+        reg.on_query_answer(&answer, key(2)),
+        LadderResolution::TargetMismatch
+    );
+    assert_eq!(reg.get(c).unwrap().state(), OrdState::Unknown);
+    assert_eq!(reg.get(other).unwrap().state(), OrdState::Open);
+}
+
+#[test]
+fn a_snapshot_entry_under_another_namespaces_or_a_non_canonical_client_id_is_never_routed_by_venue_id()
+ {
+    for seen in [CidMatch::Foreign(Namespace::new(9)), CidMatch::Unparseable] {
+        let mut reg = Registry::new();
+        let c = cancel_unanswered(&mut reg, "h1");
+        let mut entry = snap(None, "h1", canceled(), 0);
+        entry.cid = Some(seen);
+        let none: &[VenueOrderSnapshot] = &[];
+        reg.on_resync(&cfg(), &caps(), wall(2_000), none, key(1));
+        assert_eq!(reg.get(c).unwrap().absent_snapshots(), 1);
+        let applied = reg.on_resync(&cfg(), &caps(), wall(2_010), &[entry], key(2));
+        assert_eq!(applied, ResyncApplied::default());
+        let rec = reg.get(c).unwrap();
+        assert_eq!(
+            rec.state(),
+            OrdState::Open,
+            "{seen:?} moves nothing of ours"
+        );
+        // Its venue id is ours: it is not counted absent either.
+        assert_eq!(rec.absent_snapshots(), 0);
+    }
+}
+
+#[test]
+fn an_order_shown_resting_with_its_cancel_still_unresolved_stays_on_the_ladder() {
+    // An Unknown order with a tombstone out: the venue shows it Open. Its placement is
+    // settled, its cancel is not: it stays on the ladder, the tombstone clock running on.
+    let mut reg = Registry::new();
+    let c = unknown(&mut reg);
+    reg.ladder(&cfg(), &caps(), at(6));
+    reg.query_sent(c, RpcId(1)).unwrap();
+    reg.on_query_outcome(RpcId(1), &SubmitOutcome::Unknown);
+    reg.ladder(&cfg(), &caps(), at(1_005));
+    reg.tombstone_sent(c, RpcId(9), at(1_005)).unwrap();
+    let shown = [snap(Some(c), "k1", VenueOrderState::Open, 0)];
+    let applied = reg.on_resync(&cfg(), &caps(), wall(2_000), &shown, key(1));
+    assert!(applied.resolved.is_empty());
+    let rec = reg.get(c).unwrap();
+    assert_eq!(rec.state(), OrdState::Open);
+    assert_eq!(rec.unknown_since(), Some(at(5)));
+    assert_eq!(rec.ladder_step(), Some(LadderStep::Resync));
+    let plan = reg.ladder(&cfg(), &caps(), at(2_004));
+    assert!(plan.escalated.is_empty() && plan.queries.is_empty());
+    assert!(plan.tombstones.is_empty());
+    assert_eq!(reg.ladder(&cfg(), &caps(), at(2_005)).tombstones.len(), 1);
+
+    // A placement cancelled before its acknowledgement, both past the intent timeout: the
+    // query shows it Open, its cancel still in flight.
+    let mut reg = Registry::new();
+    let c = reg.insert(placement(cid(), 100, 10)).unwrap().cid();
+    reg.placement_sent(c, at(0), wall(1_000)).unwrap();
+    reg.cancel_sent(c, RpcId(2), at(1)).unwrap();
+    let plan = reg.ladder(&cfg(), &caps(), at(101));
+    assert_eq!(plan.escalated, vec![c]);
+    reg.query_sent(c, RpcId(3)).unwrap();
+    let answer = QueryAnswer::new(
+        RpcId(3),
+        OrderRef::Client(c),
+        Some(snap(Some(c), "k2", VenueOrderState::Open, 0)),
+    )
+    .unwrap();
+    assert_eq!(
+        reg.on_query_answer(&answer, key(1)),
+        LadderResolution::Inconclusive
+    );
+    let rec = reg.get(c).unwrap();
+    assert_eq!(rec.unknown_since(), Some(at(101)));
+    let plan = reg.ladder(&cfg(), &caps(), at(102));
+    assert!(plan.escalated.is_empty(), "not escalated again");
+    assert!(plan.queries.is_empty(), "not queried again");
+    assert!(plan.resync);
+}
