@@ -41,7 +41,7 @@
 //! and the next opens at once, within the attempt budget but without the floor a drop waits,
 //! and subscribes the desired set once. A stream that receives no frame, pings and pongs
 //! included, within the consumer's silence window is reported stale (one [`MdEvent::Health`]
-//! with [`FeedHealth::Stale`] per desired subscription, all under one stamp of the silent
+//! with [`FeedHealth::Stale`] per subscription wanted then, all under one stamp of the silent
 //! epoch; a write the handler issues as it is told is not sent) and closed, and reconnects as
 //! any drop does, through the pacing. A frame that was
 //! waiting to be read when the window ran out (a write held the session) counts as heard, not
@@ -904,9 +904,10 @@ impl<H: MdHandler> MdSession<H> {
         }
     }
 
-    /// Reports every desired subscription of the silent epoch `key` stale, under one stamp. A
-    /// write the handler issues meanwhile is not sent, on the closing connection or the next:
-    /// it is counted with the refused effects.
+    /// Reports every subscription wanted now stale, under one stamp of the silent epoch `key`:
+    /// the control's latest set, even one the session has not applied yet (Codex
+    /// r4179959341); the next epoch applies it. A write the handler issues meanwhile is not
+    /// sent, on the closing connection or the next: it is counted with the refused effects.
     fn report_silent(&mut self, key: ConnKey) {
         let stamp = self.clock.stamp(key, None);
         let mut sink = Sink {
@@ -915,7 +916,7 @@ impl<H: MdHandler> MdSession<H> {
             out: &mut self.outbox,
             stamp,
         };
-        for sub in self.rec.desired() {
+        for sub in self.desired.borrow().iter() {
             let (inst, feed, h) = (sub.inst, sub.feed, FeedHealth::Stale);
             sink.push(VenueMeta::NONE, MdEvent::Health { inst, feed, h });
         }

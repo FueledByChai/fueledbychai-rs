@@ -398,6 +398,49 @@ async fn only_a_frame_heard_restarts_the_window_and_each_epoch_starts_its_own() 
     assert_eq!(session.counters().silences, 2);
 }
 
+/// Codex r4179959341: a change of the desired set that arrives as the window runs out is what
+/// the alarm reports, whichever the session sees first.
+#[tokio::test(start_paused = true)]
+async fn the_alarm_reports_the_set_wanted_when_it_rings() {
+    let frozen = freeze();
+    let mut server = ScriptedWs::start().await;
+    let seen = Seen::default();
+    let liveness = Liveness::new(ms(5_000), ms(1)).unwrap();
+    let config = toy_session(server.url(), &[], liveness);
+    let (mut session, control) = MdSession::new(config, keep(&seen)).unwrap();
+    let watch = seen.clone();
+    let script = async move {
+        let mut peer = server.accept().await;
+        assert_eq!(peer.recv().await, "hello|codec=0|plan=1,2");
+        assert_eq!(peer.recv().await, "sub|add=A,B");
+        // A write the peer holds back keeps the session busy while A is dropped and C added,
+        // and the window runs out: both are due when the write ends.
+        peer.send("big|kb=65536");
+        let release = peer.hold();
+        churn().await;
+        control.set_desired([2, 3].map(toy::sub));
+        advance(ms(6_000)).await;
+        churn().await;
+        release.send(()).unwrap();
+        assert_eq!(peer.recv().await.len(), 65536 * 1024);
+        settle(|| watch.borrow().len() == 2).await;
+        drop(control);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    drop(frozen);
+    let insts: Vec<_> = seen
+        .borrow()
+        .iter()
+        .map(|e| match e.body {
+            MdEvent::Health { inst, .. } => inst.get(),
+            _ => 0,
+        })
+        .collect();
+    assert_eq!(insts, [2, 3]);
+    assert_eq!(session.counters().silences, 1);
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_frame_that_waited_behind_a_held_write_is_heard_not_silence() {
     let frozen = freeze();

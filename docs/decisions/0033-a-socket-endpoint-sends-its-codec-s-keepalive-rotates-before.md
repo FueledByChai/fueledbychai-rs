@@ -34,8 +34,9 @@ FBC-ha3), not by the silence window.
   closed before the new one opens (break before make).
 - **Silence.** A socket stream that receives no frame (pings, pongs and close frames
   included) within the silence window, counted from the epoch's open and from each frame
-  read, is reported stale: one `MdEvent::Health { h: Stale }` per desired subscription, all
-  under one stamp of the silent epoch, handed to the consumer's handler. Then the connection is
+  read, is reported stale: one `MdEvent::Health { h: Stale }` per subscription wanted when
+  the window runs out (the control's latest set, even one the session has not applied yet),
+  all under one stamp of the silent epoch, handed to the consumer's handler. Then the connection is
   closed and the session reconnects as after any drop, waiting the floor within the budget. A
   frame that was already waiting when the window ran out (a write held the session) counts as
   heard. A poll endpoint has no keepalive, rotation or silence window.
