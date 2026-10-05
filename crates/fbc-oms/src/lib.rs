@@ -31,8 +31,8 @@
 //! (FBC-lrc), the pre-trade caps (FBC-2e4), the market states (FBC-c4v), issuing an
 //! authorization after them and its check at submit (FBC-afd), and the Unknown ladder.
 
-mod authorize;
 mod gateway;
+mod grant;
 mod record;
 mod registry;
 
@@ -42,8 +42,8 @@ mod registry;
 #[path = "../tests/common/mod.rs"]
 mod common;
 
-pub use authorize::{Authorization, StateGeneration};
 pub use gateway::{ControlCommand, ManagedGateway, OrderGateway};
+pub use grant::{Authorization, StateGeneration};
 pub use record::{
     Applied, Intent, OrdState, OrderKey, OrderOp, OrderRecord, OutcomeApplied, TerminalKind,
 };

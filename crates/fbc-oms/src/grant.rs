@@ -10,6 +10,9 @@
 //! the check at submit can refuse it once the market's state has moved on (FBC-afd). It has
 //! no `Clone`, no public constructor and no way to edit its command, and submitting consumes
 //! it, so each one is spent once (the compile-fail cases in `tests/ui_authorization/`).
+//!
+//! The module is `grant`, not `auth`: `src/auth*` is 0009's review path for credential code,
+//! and this holds none.
 
 use std::collections::BTreeMap;
 

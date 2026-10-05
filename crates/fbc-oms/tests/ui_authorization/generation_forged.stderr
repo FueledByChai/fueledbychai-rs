@@ -5,7 +5,7 @@ error[E0423]: cannot initialize a tuple struct which contains private fields
   |     ^^^^^^^^^^^^^^^
   |
 note: constructor is not visible here due to private fields
- --> src/authorize.rs
+ --> src/grant.rs
   |
   | pub struct StateGeneration(u64);
   |                            ^^^ private field
