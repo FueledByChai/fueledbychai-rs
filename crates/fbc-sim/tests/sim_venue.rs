@@ -1992,3 +1992,116 @@ fn a_placement_whose_level_would_overflow_its_lots_is_refused() {
     let got = v.answers();
     assert_eq!(outcome_of(&got[0].1), Some((3, ACCEPTED)), "{got:?}");
 }
+
+#[test]
+fn a_placement_outside_the_specs_size_limits_is_refused() {
+    // Codex r4183669448: the venue refuses an order below the spec's minimum size or above its
+    // largest order, as InvalidQty; the sizes at the limits are orders.
+    let mut config = config(Bracket::Optimistic, VenueFeeSign::PositiveIsRebate, fees());
+    let mut limited = spec(INST, "SIM-PERP");
+    limited.min_size = lots(2);
+    limited.max_order_size = Some(lots(4));
+    config.specs.insert(limited);
+    let mut v = Venue::with(config);
+    v.snapshot(T0, &[(199, 6)], &[(201, 5)]);
+    for (rpc, qty) in [(1, 1), (2, 5), (3, 2), (4, 4)] {
+        v.send(limit(cid(), Side::Buy, 199, qty), rpc, T0);
+    }
+    v.tick(T0 + 5 * MS);
+    let got = v.answers();
+    let outcomes: Vec<_> = got.iter().filter_map(|(_, ev)| outcome_of(ev)).collect();
+    assert_eq!(outcomes.len(), 4, "{got:?}");
+    assert_eq!(rejected(&got[0].1), Some(RejectKind::InvalidQty), "{got:?}");
+    assert_eq!(rejected(&got[1].1), Some(RejectKind::InvalidQty), "{got:?}");
+    assert_eq!(outcomes[2], (3, ACCEPTED));
+    assert_eq!(outcomes[3], (4, ACCEPTED));
+    // A trade of everything ahead and more fills only the two orders that rested.
+    v.trade(T0 + 6 * MS, Aggressor::Seller, 199, 20);
+    let got = v.answers();
+    let filled: Vec<_> = got
+        .iter()
+        .filter_map(|(_, ev)| fill_of(ev))
+        .map(|f| f.1)
+        .collect();
+    assert_eq!(filled, [2, 4], "{got:?}");
+}
+
+#[test]
+fn an_engine_without_the_instruments_spec_places_nothing() {
+    // Codex r4183669448: with no spec the venue cannot check an order's size, so it refuses
+    // the placement (`no_book`) rather than accept a size it cannot judge.
+    let mut v = Venue::new(Bracket::Optimistic);
+    let mut bare = config(Bracket::Optimistic, VenueFeeSign::PositiveIsRebate, fees());
+    bare.specs = SpecTable::new();
+    v.engine = SimEngine::new(&bare);
+    v.snapshot(T0, &[(199, 6)], &[(201, 5)]);
+    v.send(limit(cid(), Side::Buy, 199, 2), 1, T0);
+    v.tick(T0 + 5 * MS);
+    let got = v.answers();
+    assert_eq!(got.len(), 1, "{got:?}");
+    let ExecEvent::Outcome {
+        outcome: SubmitOutcome::Rejected(r),
+        ..
+    } = &got[0].1
+    else {
+        panic!("{got:?}")
+    };
+    assert_eq!(
+        (r.kind, r.venue_code.as_deref()),
+        (RejectKind::Other, Some("no_book"))
+    );
+}
+
+#[test]
+fn a_level_a_delta_first_shows_ends_what_earlier_trades_explain() {
+    // Codex r4183669454: trades printed at a price the capped book did not reach explain
+    // nothing once a delta first shows that level, since its size already reflects them; a
+    // later shrink with no trade is a level cancel.
+    let mut v = Venue::new(Bracket::Optimistic);
+    v.snapshot(T0, &[(199, 6)], &[(201, 5)]);
+    // 198 is past the book's depth: the print there meets no known level.
+    v.trade(T0 + MS, Aggressor::Seller, 198, 3);
+    v.level(T0 + 2 * MS, BookSide::Bid, 198, 4);
+    v.send(limit(cid(), Side::Buy, 198, 2), 1, T0 + 2 * MS);
+    v.tick(T0 + 7 * MS);
+    assert_eq!(v.answers().len(), 2);
+    // Three of the four ahead cancelled: one left ahead, so a trade of three fills both lots.
+    v.level(T0 + 8 * MS, BookSide::Bid, 198, 1);
+    v.trade(T0 + 9 * MS, Aggressor::Seller, 198, 3);
+    let got = v.answers();
+    assert_eq!(
+        got.iter()
+            .filter_map(|(_, ev)| fill_of(ev))
+            .map(|f| f.1)
+            .sum::<i64>(),
+        2,
+        "{got:?}"
+    );
+}
+
+#[test]
+fn a_trade_the_venue_cannot_charge_spends_nothing_on_the_order_it_cancels() {
+    // Codex r4183669469: an order a trade would fill with no maker rate is cancelled, and the
+    // print's size it would have taken reaches the next order at the level instead.
+    let mut v = Venue::with(config(
+        Bracket::Optimistic,
+        VenueFeeSign::PositiveIsRebate,
+        FeeBook::new(),
+    ));
+    v.snapshot(T0, &[(199, 1)], &[(201, 5)]);
+    v.send(limit(cid(), Side::Buy, 199, 1), 1, T0);
+    v.send(limit(cid(), Side::Buy, 199, 1), 2, T0);
+    v.tick(T0 + 5 * MS);
+    assert_eq!(v.answers().len(), 4);
+    // One lot ahead of both and one more: the first order cannot be charged, so the venue
+    // cancels it and the lot reaches the second, which it cancels too, filling neither.
+    v.trade(T0 + 6 * MS, Aggressor::Seller, 199, 2);
+    let got = v.answers();
+    let states: Vec<_> = got.iter().filter_map(|(_, ev)| state_of(ev)).collect();
+    assert_eq!(
+        states,
+        vec![(VenueOrderState::Canceled(CancelReason::Venue), 0); 2],
+        "{got:?}"
+    );
+    assert_eq!(got.len(), 2, "{got:?}");
+}
