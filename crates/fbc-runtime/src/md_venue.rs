@@ -34,9 +34,8 @@ use crate::journal::Journal;
 use crate::liveness::Liveness;
 use crate::pacing::ReconnectPacing;
 use crate::ratelimit::RateLimiter;
-use crate::session::{
-    IngestClock, MdControl, MdHandler, MdSession, MdSessionConfig, Outbox, SessionError, TickToWire,
-};
+use crate::session::{MdControl, MdHandler, MdSession, MdSessionConfig, Outbox, SessionError};
+use crate::session_core::{IngestClock, TickToWire};
 use crate::stall::WriteStall;
 use crate::ws;
 

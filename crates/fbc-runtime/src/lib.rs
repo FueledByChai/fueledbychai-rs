@@ -91,6 +91,7 @@ mod ratelimit;
 mod reconcile;
 mod replay;
 mod session;
+mod session_core;
 mod socks5;
 mod stall;
 mod target;
@@ -114,9 +115,9 @@ pub use ratelimit::{
 pub use reconcile::{ReconcileError, Reconciler, SubscribeCall};
 pub use replay::{MdReplay, MdReplayConfig, MdReplayCounters, ReplayError};
 pub use session::{
-    IngestClock, MdControl, MdCounters, MdHandler, MdSession, MdSessionConfig, Outbox,
-    SessionError, TickToWire,
+    MdControl, MdCounters, MdHandler, MdSession, MdSessionConfig, Outbox, SessionError,
 };
+pub use session_core::{IngestClock, TickToWire};
 pub use stall::{WriteStall, WriteStallError};
 pub use tcp::Tcp;
 pub use transport::Transport;
