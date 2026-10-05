@@ -397,6 +397,10 @@ impl ScriptedWs {
         tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
+                // Each frame the script sends leaves at once: under Nagle, Linux holds a small
+                // frame behind the previous one's ACK for wall time, so the session reads it
+                // only after the test has moved the paused clock.
+                stream.set_nodelay(true).unwrap();
                 let (heard, from_client) = mpsc::unbounded_channel();
                 let (to_client, out) = mpsc::unbounded_channel();
                 let _ = tx.send(Peer {
