@@ -219,6 +219,11 @@ impl Registry {
     /// maximum time, and again each maximum after. Orders in client id order.
     pub fn ladder(&mut self, cfg: &LadderConfig, caps: &OrderCaps, now: MonoNs) -> LadderPlan {
         let mut plan = LadderPlan::default();
+        // Forget the queries no order awaits any more: it left the ladder (an event resolved
+        // it, or it ended) or gave its query up, and the result may never come.
+        let orders = &self.orders;
+        self.queries
+            .retain(|rpc, cid| orders[cid].query_rpc() == Some(*rpc));
         let mut cids: Vec<ClientOrderId> = self
             .orders
             .iter()
@@ -234,10 +239,7 @@ impl Registry {
                 }
                 plan.escalated.push(cid);
             }
-            if step(rec, cfg, caps, now, &mut plan) {
-                // No longer awaited: a late result is ignored, resyncs decide.
-                self.queries.retain(|_, queried| *queried != cid);
-            }
+            step(rec, cfg, caps, now, &mut plan);
             let since = rec
                 .tombstone_at()
                 .or(rec.unknown_since())
@@ -256,9 +258,8 @@ impl Registry {
     /// Records the request the ladder's query for `cid` was sent under, which its answer or
     /// outcome names.
     pub fn query_sent(&mut self, cid: ClientOrderId, rpc: RpcId) -> Result<(), OmsError> {
-        if !self.orders.contains_key(&cid) {
-            return Err(OmsError::UnknownCid(cid));
-        }
+        let rec = self.orders.get_mut(&cid).ok_or(OmsError::UnknownCid(cid))?;
+        rec.set_query_rpc(Some(rpc));
         self.queries.insert(rpc, cid);
         Ok(())
     }
@@ -413,7 +414,22 @@ impl Registry {
     /// ladder query of ours or the order is no longer on the ladder.
     fn ladder_query(&mut self, rpc: RpcId) -> Option<ClientOrderId> {
         let cid = self.queries.remove(&rpc)?;
-        self.orders[&cid].unknown_since().map(|_| cid)
+        let rec = self
+            .orders
+            .get_mut(&cid)
+            .expect("a query is recorded for a held order");
+        if rec.unknown_since().is_none() || rec.query_rpc() != Some(rpc) {
+            return None;
+        }
+        rec.set_query_rpc(None);
+        Some(cid)
+    }
+
+    /// How many ladder queries are awaited: sent, and their order still on the ladder waiting
+    /// for them. A query whose order left the ladder, or was given up, is forgotten at the
+    /// ladder's next pass.
+    pub fn queries_awaited(&self) -> usize {
+        self.queries.len()
     }
 }
 
@@ -421,9 +437,13 @@ impl Registry {
 /// cancel in flight, is at least the intent timeout old: a placement moves it to Unknown.
 /// Whether it did.
 fn escalate(rec: &mut OrderRecord, cfg: &LadderConfig, now: MonoNs) -> bool {
-    let since = match (rec.state(), rec.intent(), rec.sent_at()) {
-        (_, Intent::PendingAmend { since, .. } | Intent::PendingCancel { since, .. }, _) => since,
-        (OrdState::PendingNew, Intent::None, Some((at, _))) => at,
+    let (since, cause) = match (rec.state(), rec.intent(), rec.sent_at()) {
+        (
+            _,
+            Intent::PendingAmend { since, rpc, .. } | Intent::PendingCancel { since, rpc, .. },
+            _,
+        ) => (since, Some(rpc)),
+        (OrdState::PendingNew, Intent::None, Some((at, _))) => (at, None),
         _ => return false,
     };
     if now < since + cfg.intent_timeout {
@@ -432,7 +452,7 @@ fn escalate(rec: &mut OrderRecord, cfg: &LadderConfig, now: MonoNs) -> bool {
     if rec.state() == OrdState::PendingNew {
         rec.time_out_placement(now);
     } else {
-        rec.enter_ladder(now);
+        rec.enter_ladder(now, cause);
     }
     true
 }
@@ -440,15 +460,14 @@ fn escalate(rec: &mut OrderRecord, cfg: &LadderConfig, now: MonoNs) -> bool {
 /// The step an order on the ladder takes in a pass at `now`: its query when one is due (or
 /// straight to resyncs when the venue's queries name no reference it has), a resync while
 /// they decide. A query built the intent timeout ago and still unanswered (an acknowledgement
-/// clears its request's deadline, and the result may never come) is given up for resyncs:
-/// whether it was.
+/// clears its request's deadline, and the result may never come) is given up for resyncs.
 fn step(
     rec: &mut OrderRecord,
     cfg: &LadderConfig,
     caps: &OrderCaps,
     now: MonoNs,
     plan: &mut LadderPlan,
-) -> bool {
+) {
     match rec.ladder_step() {
         Some(LadderStep::Query) => {
             let query = QueryOrder {
@@ -464,22 +483,19 @@ fn step(
                 rec.set_ladder_step(LadderStep::Resync);
                 plan.resync = true;
             }
-            false
         }
         Some(LadderStep::Querying)
             if rec
                 .queried_at()
                 .is_some_and(|built| now >= built + cfg.intent_timeout) =>
         {
+            // No longer awaited: a late result is ignored, resyncs decide.
             rec.set_ladder_step(LadderStep::Resync);
+            rec.set_query_rpc(None);
             plan.resync = true;
-            true
         }
-        Some(LadderStep::Resync) => {
-            plan.resync = true;
-            false
-        }
-        Some(LadderStep::Querying) | None => false,
+        Some(LadderStep::Resync) => plan.resync = true,
+        Some(LadderStep::Querying) | None => {}
     }
 }
 
