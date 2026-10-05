@@ -117,7 +117,7 @@ rather than guess.
   nonce and factory traits with `Effects` and `EncodeCtx` (the factory's discovery and
   `test_connection` each an `HttpPlan`), credentials as `Secrets` in `src/auth.rs` (0043), and the write-only `PathStamps` a codec marks
   its latency stages through (0034), `crates/fbc-book` with its L2 book, `crates/fbc-sim` with its
-  queue-position fill model (0038) and SimVenue (0043), `crates/fbc-journal` with its record
+  queue-position fill model (0038) and SimVenue (0044), `crates/fbc-journal` with its record
   format, day-grouped segment writer rolled hourly with zstd-compressed closed segments, in-order reader and never-blocking sink, `crates/fbc-runtime` with its first
   slices (the connector, SOCKS5 CONNECT, WebSocket and HTTP/1.1, plain or TLS, 0019 and 0020, the WebSocket handshake its own, 0029;
   connection epochs and the subscription reconciler; the market-data session, 0023; HTTP
@@ -223,7 +223,7 @@ rather than guess.
     (Pessimistic, Middle, Optimistic) from a `QueueConfig` with no `Default`, queued on arrival
     behind its level on the public book less every modelled public order, an RPI order also
     behind public size that joins later, advanced by level cancels per bracket and filled by
-    trades at or through its price, 0038; and SimVenue (0043): `SimCodec`, an unchanged
+    trades at or through its price, 0038; and SimVenue (0044): `SimCodec`, an unchanged
     `ExecCodec` that writes places and cancels as frames on a simulated order-entry stream and
     decodes the answers through `DecodeScope`, and `SimEngine`, a pure state machine fed the
     shard's envelopes (its own books) and those frames, crossing, queueing and filling orders
