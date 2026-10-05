@@ -14,7 +14,7 @@ use fbc_core::{
 use fbc_venue_paradex::ParadexFactory;
 use fbc_venue_paradex::factory::{MD_STREAM, MD_URL, caps};
 use fbc_venue_paradex::md::ParadexMd;
-use md::{BTC, Decoded, ETH, decode_with, frame, raw, specs};
+use md::{BTC, Decoded, ETH, decode_with, frame, raw, refused_sub, rpc_error, specs};
 
 const V0: &str = "markets-summary-v0.sbe.txt";
 const V1: &str = "markets-summary-v1.sbe.txt";
@@ -271,6 +271,42 @@ fn one_markets_summary_channel_carries_mark_and_funding_and_each_is_pushed_only_
     assert_eq!(requests(&fx), [("unsubscribe".to_owned(), channel)]);
     let out = decode_with(&mut codec, RawFrame::Binary(&v1));
     assert_eq!((out.result, out.events), (Ok(()), vec![]));
+}
+
+#[test]
+fn a_refused_markets_summary_subscribe_reports_every_feed_the_channel_carried_and_forgets_them() {
+    let (specs, channel) = (specs(), "markets_summary.BTC-USD-PERP".to_owned());
+    let (mark, funding) = (sub(BTC, Feed::Mark), sub(BTC, Feed::Funding));
+    let mut codec = ParadexMd::new(StreamId(0));
+    // Mark goes out as request 1; funding then rides the same channel, with no frame of its own.
+    let mut fx = Effects::new();
+    codec.subscribe(&[mark], &[], &specs, &mut fx).unwrap();
+    codec.subscribe(&[funding], &[], &specs, &mut fx).unwrap();
+    assert_eq!(fx.len(), 1);
+    // The refusal names both feeds the channel was to carry, and asks for nothing (FBC-50m).
+    let out = decode_with(&mut codec, RawFrame::Text(&rpc_error(1)));
+    assert_eq!(out.result, Ok(()));
+    let both = vec![
+        refused_sub(BTC, Feed::Mark),
+        refused_sub(BTC, Feed::Funding),
+    ];
+    assert_eq!(out.events, both);
+    assert!(out.fx.is_empty(), "{:?}", out.fx);
+    // Neither feed is subscribed now: a summary frame pushes nothing, removing them sends no
+    // unsubscribe, and only a new subscription the consumer asks for goes out again.
+    let v1 = frame(V1);
+    let out = decode_with(&mut codec, RawFrame::Binary(&v1));
+    assert_eq!((out.result, out.events), (Ok(()), vec![]));
+    let mut fx = Effects::new();
+    codec.subscribe(&[], &[funding], &specs, &mut fx).unwrap();
+    assert!(fx.is_empty(), "{fx:?}");
+    codec.subscribe(&[mark], &[], &specs, &mut fx).unwrap();
+    assert_eq!(requests(&fx), [("subscribe".to_owned(), channel)]);
+    // A subscribe refused after its feeds were removed still names the feed it was sent for.
+    let mut fx = Effects::new();
+    codec.subscribe(&[], &[mark], &specs, &mut fx).unwrap();
+    let out = decode_with(&mut codec, RawFrame::Text(&rpc_error(2)));
+    assert_eq!(out.events, [refused_sub(BTC, Feed::Mark)]);
 }
 
 #[test]

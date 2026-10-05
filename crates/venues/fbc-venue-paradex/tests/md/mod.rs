@@ -120,3 +120,17 @@ pub fn refused(bytes: &[u8], err: DecodeError) {
     assert_eq!(out.result, Err(err));
     assert!(out.events.is_empty() && out.fx.is_empty());
 }
+
+/// A JSON-RPC error answering request `id`, in the shape docs.paradex.trade shows for the
+/// WebSocket API ("Invalid parameters").
+pub fn rpc_error(id: u64) -> String {
+    format!(
+        r#"{{"jsonrpc":"2.0","error":{{"code":-32602,"message":"Invalid parameters"}},"usIn":1,"usOut":2,"usDiff":1,"id":{id}}}"#
+    )
+}
+
+/// The health event reporting that the venue refused `feed` of `inst`.
+pub fn refused_sub(inst: InstrumentId, feed: fbc_core::Feed) -> (VenueMeta, MdEvent) {
+    let h = fbc_core::FeedHealth::Refused;
+    (VenueMeta::NONE, MdEvent::Health { inst, feed, h })
+}

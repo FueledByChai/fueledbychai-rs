@@ -9,7 +9,7 @@ use fbc_core::{
     VenueMeta,
 };
 use fbc_venue_paradex::md::{BBO, ParadexMd};
-use md::{BTC, decode, decode_with, frame, refused, specs};
+use md::{BTC, decode, decode_with, frame, refused, refused_sub, rpc_error, specs};
 
 /// BboEvent.ts in the fixtures, in microseconds.
 const TS_US: i64 = 1_759_500_000_123_456;
@@ -209,7 +209,8 @@ fn a_frame_for_an_unknown_market_or_without_one_is_refused() {
 }
 
 #[test]
-fn a_subscribe_acknowledgement_is_consumed_and_a_subscribe_error_is_reported() {
+fn a_subscribe_acknowledgement_is_consumed_and_a_refused_subscribe_is_reported_by_instrument_and_feed()
+ {
     let mut codec = ParadexMd::new(fbc_core::StreamId(0));
     let mut fx = fbc_core::Effects::new();
     let subs = [
@@ -227,23 +228,22 @@ fn a_subscribe_acknowledgement_is_consumed_and_a_subscribe_error_is_reported() {
     assert_eq!(fx.len(), 3);
     // Requests 1 and 2 subscribed, 3 unsubscribed.
     let ack = r#"{"jsonrpc":"2.0","result":{"channel":"bbo.BTC-USD-PERP"},"usIn":1,"usOut":2,"usDiff":1,"id":1}"#;
-    let error = |id: u32| {
-        format!(
-            r#"{{"jsonrpc":"2.0","error":{{"code":-32602,"message":"Invalid parameters"}},"usIn":1,"usOut":2,"usDiff":1,"id":{id}}}"#
-        )
-    };
     let out = decode_with(&mut codec, RawFrame::Text(ack));
     assert_eq!(out.result, Ok(()));
     assert!(out.events.is_empty() && out.fx.is_empty());
-    // A refused subscribe is reported as the frame's error, and nothing is asked for: no retry.
+    // A refused subscribe is reported as the subscription it refused (FBC-50m), and nothing is
+    // asked for: no subscribe resent, no reconnect.
+    let out = decode_with(&mut codec, RawFrame::Text(&rpc_error(2)));
+    assert_eq!(out.result, Ok(()));
+    assert_eq!(out.events, [refused_sub(BTC, subs[1].feed)]);
+    assert!(out.fx.is_empty(), "{:?}", out.fx);
     let cases = [
-        (2, "the venue refused a subscribe"),
         (3, "the venue refused an unsubscribe"),
         // An answered request is not answered twice; an unknown id is still an error.
         (2, "the venue reported an error"),
     ];
     for (id, what) in cases {
-        let out = decode_with(&mut codec, RawFrame::Text(&error(id)));
+        let out = decode_with(&mut codec, RawFrame::Text(&rpc_error(id)));
         assert_eq!(out.result, Err(DecodeError::Malformed(what)));
         assert!(out.events.is_empty() && out.fx.is_empty());
     }
