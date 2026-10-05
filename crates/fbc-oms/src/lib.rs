@@ -34,8 +34,9 @@
 //! a fill promotes a PendingNew or Unknown order, and the order is Filled only when its fills
 //! alone cover every total the venue may hold, which is checked again whenever the total or
 //! the amends in flight change. An amend to a larger total counts as resting from when it is
-//! sent until a confirmation tied to it, or to a later amend, arrives, or until it is refused
-//! while no earlier amend is unconfirmed: an amended update stating no price or total is tied
+//! sent until a confirmation tied to it, or to a later amend, arrives, until the venue states
+//! the total with no amend in flight, or until it is refused while no earlier amend is
+//! unconfirmed: an amended update stating no price or total is tied
 //! to the amend in flight only by a new venue id or a later venue ordering key, never by
 //! arriving later alone, since it may duplicate an older confirmation.
 //!
