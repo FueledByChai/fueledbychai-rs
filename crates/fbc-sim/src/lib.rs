@@ -33,7 +33,9 @@
 //!   stood-in venue's caps declare `keeps_priority: Some(true)` (design §4.5). Orders the
 //!   consumer injects ([`SimEngine::inject`]: another process's, design §10.2 step 2) queue and
 //!   fill as modelled orders, so they are never size ahead of a later order, and are never
-//!   answered as the consumer's own.
+//!   answered as the consumer's own. A resync (0049) is answered in one frame: the resting
+//!   orders, the position the fills imply in each instrument, and the request's wall time as
+//!   the watermark.
 //!
 //! Every number SimVenue uses, its capabilities, latency, bracket and fee rates included, is in
 //! the consumer's [`SimConfig`]. Not here yet: hosting in the runtime (FBC-6mf) and replay

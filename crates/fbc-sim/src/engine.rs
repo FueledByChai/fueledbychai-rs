@@ -208,6 +208,10 @@ impl Item {
 ///   SimVenue placed on that instrument and no other; injected orders are another process's
 ///   and never end.
 /// - A query answers with the order as the venue holds it, or as it ended, or with none.
+/// - A resync (decision 0049) acts like any command and is answered in one frame: its watermark
+///   the request's wall time, every order SimVenue placed that rests (injected ones are another
+///   process's) with its cumulative fill, and one position per instrument SimVenue has a fill
+///   in, the signed sum of those fills.
 /// - A public trade on a trading book fills resting orders, SimVenue's own and injected ones,
 ///   through the queue model, as the maker. A trade the venue gives no aggressor for is
 ///   classified against the touch (at or above the offer a buy, at or below the bid a sell),
@@ -251,6 +255,9 @@ pub struct SimEngine {
     /// Public size a level lost to trades printed at it, and to injected orders withdrawn from
     /// it, since it last changed, by (instrument, bid side, price).
     traded: BTreeMap<(InstrumentId, bool, Ticks), Lots>,
+    /// The signed sum of SimVenue's own fills in each instrument it has a fill in, in lots: an
+    /// `i128`, which no sum of `i64` fills reaches the end of.
+    positions: BTreeMap<InstrumentId, i128>,
     out: Vec<Answer>,
     frames: u64,
     orders: u64,
@@ -279,6 +286,7 @@ impl SimEngine {
             injected_fills: Vec::new(),
             in_flight: BTreeMap::new(),
             traded: BTreeMap::new(),
+            positions: BTreeMap::new(),
             out: Vec::new(),
             frames: 0,
             orders: 0,
@@ -370,6 +378,7 @@ impl SimEngine {
                 }
                 Command::CancelAll(head, inst) => self.cancel_all(head.rpc, inst, at),
                 Command::Query(q) => self.query(q, at),
+                Command::Resync(sent) => self.resync(sent.wall, at),
             }
         }
     }
@@ -778,6 +787,13 @@ impl SimEngine {
     ) -> FillRecord {
         let fid = format!("F{}", self.fills);
         self.fills += 1;
+        let signed = match order.side {
+            Side::Buy => i128::from(qty.get()),
+            Side::Sell => -i128::from(qty.get()),
+        };
+        // Saturating only past 2^63 fills of an i64 of lots each, which never happens.
+        let position = self.positions.entry(order.inst).or_insert(0);
+        *position = position.saturating_add(signed);
         FillRecord {
             fid,
             cid: order.cid.clone(),
@@ -961,6 +977,19 @@ impl SimEngine {
             vid: q.vid,
             cid: q.cid,
             found: live.or(ended),
+        };
+        self.answer(at, reply);
+    }
+
+    /// Answers a resync asked at `asked` (decision 0049), in one frame: the orders resting and
+    /// the positions the fills imply when the venue acts, its watermark the request's wall time.
+    fn resync(&mut self, asked: WallNs, at: At) {
+        let orders = self.live.iter();
+        let orders = orders.map(|(&n, o)| order_event(o, &vid(n), SimState::Open, Some(o.px)));
+        let reply = Reply::Resync {
+            wm: asked,
+            orders: orders.collect(),
+            positions: self.positions.iter().map(|(&i, &q)| (i, q)).collect(),
         };
         self.answer(at, reply);
     }

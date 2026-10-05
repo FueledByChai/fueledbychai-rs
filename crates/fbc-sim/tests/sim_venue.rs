@@ -10,6 +10,11 @@
 //! cancel-many and an instrument cancel-all end exactly the orders they name or cover; a query
 //! is answered with its rpc; and an injected order is excluded from a later order's queue ahead
 //! and never reported as the consumer's own order.
+//!
+//! FBC-bq3's done line: a resync after two placements and partial fills is answered after the
+//! configured latency with its begin carrying the request's wall time, one order per resting
+//! order with its cumulative fill, one position per instrument equal to the signed sum of its
+//! fills, and its end (decision 0049).
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
@@ -26,11 +31,11 @@ use fbc_core::{
     Liquidity3, Lots, MatchingCaps, MdCaps, MdEvent, MonoNs, Namespace, NamespaceLease, NewOrder,
     NonceBlock, NonceScope, NotAmendable, NotSentReason, OpKind, OrderCaps, OrderKind,
     OrderKindTag, OrderRef, OrderUpdate, OrderingKey, PathStamps, PriceGrid, QueryOrder,
-    RateCharge, RawFrame, Readiness, RefKind, RejectKind, RpcCall, RpcId, Side, SizeStep,
-    SnapshotSource, SpecTable, SpeedBump, SpeedBumpScope, Stamp, StpScope, StreamId, SubmitOutcome,
-    Support, TagSet, TerminalHint, Ticks, Tif, TifTag, TimerTag, TradeCaps, TradingStatus,
-    TrafficClass, UnderlyingId, VenueCaps, VenueCommand, VenueFeeSign, VenueId, VenueMeta,
-    VenueOrderId, VenueOrderState, WallNs, dispatch,
+    RateCharge, RawFrame, Readiness, RefKind, RejectKind, RpcCall, RpcId, Side, SignedLots,
+    SizeStep, SnapshotSource, SpecTable, SpeedBump, SpeedBumpScope, Stamp, StpScope, StreamId,
+    SubmitOutcome, Support, TagSet, TerminalHint, Ticks, Tif, TifTag, TimerTag, TradeCaps,
+    TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueCommand, VenueFeeSign, VenueId,
+    VenueMeta, VenueOrderId, VenueOrderState, WallNs, dispatch,
 };
 use fbc_sim::{
     Answer, Bracket, InjectedOrder, OrderKey, QueueConfig, QueueError, SimCodec, SimConfig,
@@ -406,6 +411,33 @@ impl Venue {
         })?;
         assert!(fx.is_empty());
         Ok(sink.0)
+    }
+
+    /// Asks the codec for a resync at `mono` and hands what it writes to the engine.
+    fn resync(&mut self, mono: u64) -> Effects {
+        let mut fx = Effects::new();
+        assert_eq!(self.codec.nonces_for(CtxCall::Resync), 0);
+        self.codec.resync(&Venue::ctx(mono), &mut fx);
+        for effect in fx.as_slice() {
+            let Effect::Send { stream, frame, .. } = effect else {
+                panic!("the codec only writes frames: {effect:?}");
+            };
+            assert_eq!(*stream, STREAM);
+            self.engine.on_order_frame(frame.bytes()).unwrap();
+        }
+        fx
+    }
+
+    /// The engine's answer frames since the last call, each decoded whole, with its due time.
+    fn frames(&mut self) -> Vec<(MonoNs, Vec<ExecEvent>)> {
+        let mut out = Vec::new();
+        for answer in self.engine.take_answers() {
+            let events = self.decode(&answer.frame).unwrap();
+            assert!(events.iter().all(|(meta, _)| meta.venue_seq.is_some()));
+            out.push((answer.at, events.into_iter().map(|(_, ev)| ev).collect()));
+            self.frames.push(answer);
+        }
+        out
     }
 
     /// The engine's answers since the last call, each decoded, with its due time.
@@ -1427,7 +1459,6 @@ fn the_codec_refuses_answers_it_cannot_read_and_does_nothing_else() {
     assert_eq!(v.codec.nonces_for(CtxCall::Open(STREAM)), 0);
     v.codec.on_open(STREAM, &ctx, &mut fx);
     v.codec.on_timer(TimerTag(1), &ctx, &mut fx);
-    v.codec.resync(&ctx, &mut fx);
     assert!(fx.is_empty() && sink.0.is_empty());
     assert_eq!(
         v.codec
@@ -3621,4 +3652,254 @@ fn a_priority_keeping_amend_grows_into_what_trades_took_from_its_level() {
     v.tick(T0 + 25 * MS);
     assert_eq!(outcome_of(&v.events()[0].1), Some((2, ACCEPTED)));
     assert_eq!(v.engine.queue_position(&a).unwrap().remaining, lots(3));
+}
+
+/// A resting order as a resync reports it: `(vid, side, px, qty, cum)`.
+fn resync_order_of(ev: &ExecEvent) -> Option<(VenueOrderId, Side, i64, i64, i64)> {
+    match ev {
+        ExecEvent::ResyncOrder(o) => Some((
+            o.vid.clone(),
+            o.side,
+            o.px?.0,
+            o.qty.get(),
+            o.cum_filled.get(),
+        )),
+        _ => None,
+    }
+}
+
+/// The venue id each placement's outcome names, in answer order.
+fn placed_vids(got: &[(MonoNs, ExecEvent)]) -> Vec<VenueOrderId> {
+    let vid = |(_, ev): &(MonoNs, ExecEvent)| match ev {
+        ExecEvent::Outcome {
+            item: Some(item), ..
+        } => item.vid.clone(),
+        _ => None,
+    };
+    got.iter().filter_map(vid).collect()
+}
+
+#[test]
+fn a_resync_is_answered_after_the_latency_with_the_resting_orders_and_the_position_the_fills_imply()
+{
+    let mut v = Venue::new(Bracket::Pessimistic);
+    v.snapshot(T0, &[(199, 5), (198, 10)], &[(201, 5), (202, 5)]);
+    // Two placements that rest, each behind five lots.
+    let (bid, offer) = (cid(), cid());
+    v.send(limit(bid, Side::Buy, 199, 2), 1, T0 + MS);
+    v.send(limit(offer, Side::Sell, 201, 3), 2, T0 + 2 * MS);
+    // A third crosses as the taker, selling one lot at 199, and ends filled.
+    let taker = place(
+        cid(),
+        Side::Sell,
+        OrderKind::Limit { px: Ticks(199) },
+        1,
+        TifTag::Ioc,
+        false,
+    );
+    v.send(taker, 3, T0 + 3 * MS);
+    v.tick(T0 + 10 * MS);
+    let vids = placed_vids(&v.answers());
+    assert_eq!(vids.len(), 3);
+    // Another process's order rests too; it is never reported as ours.
+    let injected = InjectedOrder {
+        inst: INST,
+        side: Side::Buy,
+        px: Ticks(198),
+        qty: lots(3),
+    };
+    v.engine.inject(MonoNs(T0 + 11 * MS), injected).unwrap();
+    // Five lots ahead of the bid, then one fills it in part (+1); seven lots bought at 201
+    // consume the five ahead of the offer and fill two of its three (-2).
+    v.trade(T0 + 20 * MS, Aggressor::Seller, 199, 6);
+    v.trade(T0 + 21 * MS, Aggressor::Buyer, 201, 7);
+    let fills: Vec<_> = v.answers().iter().filter_map(|(_, e)| fill_of(e)).collect();
+    assert_eq!(fills.len(), 2);
+
+    // The resync is asked at `asked`: one frame on the simulated stream, a read that waits for
+    // no RPC deadline.
+    let asked = T0 + 30 * MS;
+    let fx = v.resync(asked);
+    let [
+        Effect::Send {
+            rpc: None,
+            class: TrafficClass::Safety,
+            charge,
+            ..
+        },
+    ] = fx.as_slice()
+    else {
+        panic!("{fx:?}");
+    };
+    assert_eq!(*charge, RateCharge::one(OpKind::Query, None));
+    // It acts at its encode time plus the latency to the venue, and not before.
+    v.tick(asked + 4 * MS);
+    assert!(v.frames().is_empty());
+    v.tick(asked + 5 * MS);
+    let got = v.frames();
+    let [(at, events)] = got.as_slice() else {
+        panic!("one frame: {got:?}");
+    };
+    assert_eq!(*at, MonoNs(asked) + TO_VENUE + TO_CLIENT);
+    let [
+        ExecEvent::ResyncBegin { watermark },
+        ExecEvent::ResyncOrder(first),
+        ExecEvent::ResyncOrder(second),
+        ExecEvent::ResyncPosition {
+            inst,
+            qty,
+            avg_entry: None,
+        },
+        ExecEvent::ResyncEnd,
+    ] = events.as_slice()
+    else {
+        panic!("{events:?}");
+    };
+    // The watermark is the request's wall time.
+    assert_eq!(*watermark, WallNs(WALL0 + asked as i64));
+    // One per resting order, with its cumulative fill; the filled taker is not resting.
+    assert_eq!(
+        [&events[1], &events[2]].map(resync_order_of),
+        [
+            Some((vids[0].clone(), Side::Buy, 199, 2, 1)),
+            Some((vids[1].clone(), Side::Sell, 201, 3, 2)),
+        ]
+    );
+    assert_eq!(
+        (first.cid, first.state.clone(), first.post_only),
+        (Some(CidMatch::Ours(bid)), VenueOrderState::Open, Some(true))
+    );
+    assert_eq!(
+        (second.cid, second.reduce_only),
+        (Some(CidMatch::Ours(offer)), Some(false))
+    );
+    // One position for the instrument: the signed sum of its fills, +1 - 1 - 2.
+    assert_eq!((*inst, *qty), (INST, SignedLots(-2)));
+}
+
+#[test]
+fn a_resync_with_nothing_resting_or_filled_is_its_begin_and_end_and_one_at_a_time() {
+    let mut v = Venue::new(Bracket::Middle);
+    let asked = T0;
+    assert_eq!(v.resync(asked).as_slice().len(), 1);
+    // A second asked before the first is answered writes nothing: one resync at a time.
+    assert!(v.resync(asked + MS).is_empty());
+    v.tick(asked + 10 * MS);
+    let begin = |at: u64| ExecEvent::ResyncBegin {
+        watermark: WallNs(WALL0 + at as i64),
+    };
+    let got = v.frames();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].1, [begin(asked), ExecEvent::ResyncEnd]);
+    // Once it is answered the next is asked, its watermark its own.
+    let again = T0 + 20 * MS;
+    assert_eq!(v.resync(again).as_slice().len(), 1);
+    v.tick(again + 10 * MS);
+    assert_eq!(v.frames()[0].1, [begin(again), ExecEvent::ResyncEnd]);
+}
+
+#[test]
+fn a_resync_says_only_what_the_stood_in_venue_echoes() {
+    let mut quiet = config(Bracket::Middle, VenueFeeSign::PositiveIsCost, fees());
+    quiet.exec.order.cid_echoed_on_events = false;
+    quiet.exec.order.events_echo_flags = false;
+    let mut v = Venue::with(quiet);
+    v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+    v.send(limit(cid(), Side::Buy, 199, 2), 1, T0 + MS);
+    v.tick(T0 + 10 * MS);
+    v.answers();
+    v.resync(T0 + 20 * MS);
+    v.tick(T0 + 30 * MS);
+    let got = v.frames();
+    let events = &got[0].1;
+    let ExecEvent::ResyncOrder(o) = &events[1] else {
+        panic!("{events:?}")
+    };
+    assert_eq!((o.cid, o.post_only, o.reduce_only), (None, None, None));
+    // Nothing filled, so no position is reported.
+    assert_eq!(events.len(), 3);
+}
+
+#[test]
+fn the_codec_refuses_a_resync_answer_it_did_not_ask_for_or_cannot_read() {
+    let mut v = Venue::new(Bracket::Middle);
+    let wm = WALL0 + T0 as i64;
+    let begin = format!("resync|seq=1|wm={wm}");
+    assert_eq!(
+        v.decode(begin.as_bytes()),
+        Err(DecodeError::Malformed("no resync asked for"))
+    );
+    v.resync(T0);
+    let other = format!("resync|seq=1|wm={}", wm + 1);
+    let wide = format!("{begin}\npos|inst=1|qty={}", i128::from(i64::MAX) + 1);
+    let order = "order|cid=c|vid=S1|inst=1|side=B|state=open|cum=0|px=1|qty=1|po=0|ro=0";
+    let empty_vid = format!("{begin}\n{}", order.replace("vid=S1", "vid="));
+    for (frame, what) in [
+        (other.as_str(), "resync for another request"),
+        (wide.as_str(), "qty"),
+        ("resync|seq=1", "wm"),
+        (&format!("{begin}\npos|inst=1|qty=x"), "qty"),
+        (&format!("{begin}\nfill|inst=1"), "item"),
+        (
+            &format!("{begin}\n{}", order.replace("qty=1", "qty=-1")),
+            "qty",
+        ),
+    ] {
+        assert_eq!(
+            v.decode(frame.as_bytes()),
+            Err(DecodeError::Malformed(what)),
+            "{frame}"
+        );
+    }
+    assert!(matches!(
+        v.decode(empty_vid.as_bytes()),
+        Err(DecodeError::IdRefused(_))
+    ));
+    // Nothing refused ended the resync: the answer asked for still reads, a negative position
+    // and a foreign client id as they are.
+    let got = v
+        .decode(
+            format!(
+                "{begin}\n{}\npos|inst=1|qty=-4",
+                order.replace("side=B", "side=S")
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let events: Vec<_> = got.into_iter().map(|(_, ev)| ev).collect();
+    let ExecEvent::ResyncOrder(o) = &events[1] else {
+        panic!("{events:?}")
+    };
+    assert_eq!((o.cid, o.side), (Some(CidMatch::Unparseable), Side::Sell));
+    assert_eq!(
+        events[2],
+        ExecEvent::ResyncPosition {
+            inst: INST,
+            qty: SignedLots(-4),
+            avg_entry: None
+        }
+    );
+    // It ended that resync: the same answer again is one nobody asked for.
+    assert_eq!(
+        v.decode(begin.as_bytes()),
+        Err(DecodeError::Malformed("no resync asked for"))
+    );
+}
+
+#[test]
+fn the_engine_refuses_a_resync_frame_it_cannot_read() {
+    let mut v = Venue::new(Bracket::Middle);
+    for (frame, what) in [
+        ("resync|mono=1", "wall"),
+        ("resync|wall=1", "mono"),
+        ("resync|mono=1|wall=1\nitem", "item"),
+    ] {
+        assert_eq!(
+            v.engine.on_order_frame(frame.as_bytes()),
+            Err(SimError::Malformed(what)),
+            "{frame}"
+        );
+    }
+    v.tick(T0);
+    assert!(v.frames().is_empty());
 }

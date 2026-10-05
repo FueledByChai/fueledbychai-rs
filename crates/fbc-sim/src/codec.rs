@@ -12,8 +12,9 @@ use fbc_core::{
     FillEvent, FillIdent, FillSource, HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans,
     InstrumentId, ItemRef, Liquidity, Liquidity3, MatchingCaps, NotSentReason, OpKind, OrderCaps,
     OrderKindTag, OrderRef, OrderUpdate, OrderingKey, PathStamps, QueryAnswer, RateCharge,
-    RawFrame, Reject, RpcCall, RpcId, SpecTable, StreamId, SubmitOutcome, Support, TifTag,
-    TimerTag, VenueCommand, VenueMeta, VenueOrderSnapshot, VenueOrderState, WireSlice, encode_cid,
+    RawFrame, Reject, RpcCall, RpcId, SignedLots, SpecTable, StreamId, SubmitOutcome, Support,
+    TifTag, TimerTag, TrafficClass, VenueCommand, VenueMeta, VenueOrderSnapshot, VenueOrderState,
+    WallNs, WireSlice, encode_cid,
 };
 
 use crate::config::SimConfig;
@@ -42,6 +43,9 @@ use crate::wire::{
 /// fills, or fills derived from order status (FBC-938), a venue with a speed bump (FBC-7y8),
 /// one whose fills replay on reconnect (FBC-3q6), or one that cancels orders on a disconnect,
 /// which the simulated stream never has (FBC-fji). Cancels and queries still go.
+///
+/// A resync (decision 0049) is one frame asking the engine for its resting orders and
+/// positions, one at a time, whose one-frame answer it decodes into the `Resync*` events.
 #[derive(Clone, Debug)]
 pub struct SimCodec {
     /// Whether the engine can say what the stood-in venue's events say ([`modelled`]).
@@ -50,6 +54,8 @@ pub struct SimCodec {
     fills: FillCaps,
     stream: StreamId,
     rpc_timeout: Duration,
+    /// The wall time of the resync asked for and not answered yet.
+    resync_at: Option<WallNs>,
 }
 
 impl SimCodec {
@@ -61,6 +67,7 @@ impl SimCodec {
             fills: config.exec.fills,
             stream: config.stream,
             rpc_timeout: config.rpc_timeout,
+            resync_at: None,
         }
     }
 
@@ -317,6 +324,40 @@ impl SimCodec {
         })
     }
 
+    /// A resync's answer, decoded whole: only the one asked for, named by its watermark, the
+    /// request's wall time; a position past an `i64` of lots is refused, never wrapped.
+    fn resync_answer(
+        &mut self,
+        wm: WallNs,
+        orders: Vec<OrderEvent>,
+        positions: Vec<(InstrumentId, i128)>,
+        scope: &DecodeScope<'_>,
+    ) -> Result<Vec<ExecEvent>, DecodeError> {
+        match self.resync_at {
+            None => return Err(DecodeError::Malformed("no resync asked for")),
+            Some(asked) if asked != wm => {
+                return Err(DecodeError::Malformed("resync for another request"));
+            }
+            Some(_) => {}
+        }
+        let mut events = vec![ExecEvent::ResyncBegin { watermark: wm }];
+        for o in orders {
+            events.push(ExecEvent::ResyncOrder(self.snapshot(o, scope)?));
+        }
+        for (inst, qty) in positions {
+            let qty = i64::try_from(qty).map_err(|_| DecodeError::Malformed("qty"))?;
+            events.push(ExecEvent::ResyncPosition {
+                inst,
+                qty: SignedLots(qty),
+                // The engine keeps no entry price.
+                avg_entry: None,
+            });
+        }
+        events.push(ExecEvent::ResyncEnd);
+        self.resync_at = None;
+        Ok(events)
+    }
+
     /// A query's answer: the order it asked about, named by the identifiers it echoes, and
     /// the order the venue reports, which must be that order ([`QueryAnswer::new`]).
     fn query_answer(
@@ -525,6 +566,11 @@ impl ExecCodec for SimCodec {
                 realized_funding: None,
                 replay: false,
             })],
+            Reply::Resync {
+                wm,
+                orders,
+                positions,
+            } => self.resync_answer(wm, orders, positions, scope)?,
         };
         let meta = VenueMeta {
             exch_ts: None,
@@ -560,8 +606,27 @@ impl ExecCodec for SimCodec {
         sink.push(VenueMeta::NONE, ExecEvent::Outcome { rpc, item, outcome });
     }
 
-    /// Not yet: the simulated venue answers no resync (FBC-bq3).
-    fn resync(&mut self, _ctx: &EncodeCtx, _fx: &mut Effects) {}
+    /// Asks the engine for its resting orders and positions (decision 0049): one frame,
+    /// stamped with the call's time, whose wall time is the answer's watermark. A read, so it
+    /// awaits no RPC deadline; the simulated stream never loses a frame, so the answer always
+    /// comes, and while one is unanswered another call asks nothing.
+    fn resync(&mut self, ctx: &EncodeCtx, fx: &mut Effects) {
+        if self.resync_at.is_some() {
+            return;
+        }
+        self.resync_at = Some(ctx.wall);
+        let sent = Sent {
+            mono: ctx.mono,
+            wall: ctx.wall,
+        };
+        fx.push(Effect::Send {
+            stream: self.stream,
+            frame: WireSlice::plain(Command::Resync(sent).encode()),
+            rpc: None,
+            class: TrafficClass::Safety,
+            charge: RateCharge::one(OpKind::Query, None),
+        });
+    }
 
     /// The simulated stream carries no credential.
     fn redact_inbound(&self, _input: Inbound<'_>) -> InboundSpans {

@@ -238,8 +238,9 @@ rather than guess.
     decodes the answers through `DecodeScope`, and `SimEngine`, a pure state machine fed the
     shard's envelopes (its own books) and those frames, crossing, queueing and filling orders
     and answering after the consumer's `SimLatency`, fees from the consumer's `FeeBook`, all from
-    a `SimConfig` with no `Default`; still planned: amends, batches, queries and injected orders,
-    FBC-nv2, and resync, FBC-bq3), `crates/fbc-conformance` (the adapter conformance kit,
+    a `SimConfig` with no `Default`, and a resync answered with the resting orders and the
+    positions the fills imply, 0049; still planned: amends, batches, queries and injected
+    orders, FBC-nv2), `crates/fbc-conformance` (the adapter conformance kit,
     0025; it depends on `fbc-runtime` and `fbc-core`, never on a venue crate: so
     far a public stub venue server on 127.0.0.1 ephemeral ports, a WebSocket endpoint that plays
     a fault script of typed steps and records every connection and data frame, and an HTTP/1.1
