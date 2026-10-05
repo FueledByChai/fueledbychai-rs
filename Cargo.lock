@@ -495,9 +495,14 @@ dependencies = [
 name = "fbc-venue-binance-usdm"
 version = "0.0.1"
 dependencies = [
+ "fbc-book",
+ "fbc-conformance",
  "fbc-core",
+ "fbc-journal",
+ "fbc-runtime",
  "rust_decimal",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

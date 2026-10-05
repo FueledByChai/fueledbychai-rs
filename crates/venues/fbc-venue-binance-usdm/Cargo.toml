@@ -12,3 +12,13 @@ publish = false
 fbc-core = { path = "../../fbc-core" }
 rust_decimal.workspace = true
 serde_json.workspace = true
+
+# Test-only: the decoder-replay test (tests/replay.rs) runs the codec in fbc-runtime against the
+# conformance kit's stub server, journals the session, and rebuilds fbc-book's books from the
+# journal (design §6 step 12). scripts/check-deps.sh does not count dev-dependencies.
+[dev-dependencies]
+fbc-book = { path = "../../fbc-book" }
+fbc-conformance = { path = "../../fbc-conformance" }
+fbc-journal = { path = "../../fbc-journal" }
+fbc-runtime = { path = "../../fbc-runtime" }
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
