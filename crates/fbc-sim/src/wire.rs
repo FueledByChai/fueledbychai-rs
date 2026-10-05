@@ -187,6 +187,7 @@ const STATES: &[(&str, SimState)] = &[
     ("canceled", SimState::Canceled(CancelReason::Requested)),
     ("unfilled", SimState::Canceled(CancelReason::Unfilled)),
     ("venue", SimState::Canceled(CancelReason::Venue)),
+    ("self_trade", SimState::Canceled(CancelReason::SelfTrade)),
 ];
 
 const REFUSALS: &[(&str, Refusal)] = &[

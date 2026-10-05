@@ -10,7 +10,8 @@ use fbc_book::{BookError, Books, L2Book};
 use fbc_core::{
     AccountKey, Aggressor, AmendCaps, AmendQty, AssetSym, BookId, BookSide, CancelReason, Channel,
     Envelope, FeeBook, FeeKey, FillSource, InstrumentId, Liquidity, Lots, MdEvent, MonoNs,
-    NotAmendable, Side, SpecTable, TerminalHint, Ticks, TifTag, VenueFeeSign, VenueOrderId, WallNs,
+    NotAmendable, Side, SpecTable, StpScope, TerminalHint, Ticks, TifTag, VenueFeeSign,
+    VenueOrderId, WallNs,
 };
 
 use crate::config::{SimConfig, SimLatency};
@@ -187,6 +188,12 @@ impl Item {
 ///   since its queue position cannot be set. A resting order queues behind the level's size
 ///   less the trades printed at its price whose shrink the level has not shown yet; a trade
 ///   printed through a level counts as taking all of it.
+/// - A crossing order also meets SimVenue's own resting orders on the other side (decision
+///   0051), each behind the public size ahead of it: where the stood-in venue's
+///   `stp_scope` is not `None` the venue expires the crossing order there (`SelfTrade`), and
+///   otherwise the two trade, our resting order filled as the maker. The public size it takes
+///   from a displayed level stays taken, for later orders, until the book's next event at that
+///   level; injected orders are met only as the size the book shows of them.
 /// - A batch of places is each item placed in turn, at the same instant, and answered with
 ///   one outcome per item in one frame, before the items' fills and order events.
 /// - An amend changes a resting order's price, size and flags as the stood-in venue's
@@ -261,6 +268,14 @@ pub struct SimEngine {
     /// Public size a level lost to trades printed at it, and to injected orders withdrawn from
     /// it, since it last changed, by (instrument, bid side, price).
     traded: BTreeMap<(InstrumentId, bool, Ticks), Lots>,
+    /// Public size SimVenue's crossing orders took from a displayed level, which the real book
+    /// never shows taken, until the next book event at that level replaces it (decision 0051),
+    /// by (instrument, bid side, price).
+    depleted: BTreeMap<(InstrumentId, bool, Ticks), Lots>,
+    /// Whether the stood-in venue prevents one account's orders trading with each other: every
+    /// order SimVenue places is one account's, so any scope but `None` covers them (decision
+    /// 0051).
+    prevents_self_trade: bool,
     /// SimVenue's position in each instrument it has a fill in, from its own fills: its lots
     /// an `i128`, which no sum of `i64` fills reaches the end of, and its cost.
     positions: BTreeMap<InstrumentId, Position>,
@@ -295,6 +310,8 @@ impl SimEngine {
             injected_fills: Vec::new(),
             in_flight: BTreeMap::new(),
             traded: BTreeMap::new(),
+            depleted: BTreeMap::new(),
+            prevents_self_trade: config.matching.stp_scope != StpScope::None,
             positions: BTreeMap::new(),
             native_fills: config.exec.fills.source == FillSource::Native,
             out: Vec::new(),
@@ -535,11 +552,16 @@ impl SimEngine {
     }
 
     /// `shown`, the size the book shows at a level, less what trades printed there (or
-    /// injected orders withdrawn from it) took before the book showed it.
+    /// injected orders withdrawn from it) took before the book showed it, and less what
+    /// SimVenue's crossing orders took there since the book's last event at it (decision 0051).
     fn unshown(&self, inst: InstrumentId, side: BookSide, px: Ticks, shown: Lots) -> Lots {
-        let credit = self.traded.get(&(inst, side == BookSide::Bid, px));
-        let credit = credit.copied().unwrap_or(Lots::ZERO);
-        shown.checked_sub(credit).unwrap_or(Lots::ZERO)
+        let key = (inst, side == BookSide::Bid, px);
+        [self.traded.get(&key), self.depleted.get(&key)]
+            .into_iter()
+            .flatten()
+            .fold(shown, |left, taken| {
+                left.checked_sub(*taken).unwrap_or(Lots::ZERO)
+            })
     }
 
     /// The fee of a fill in the venue's fee sign, its asset and the fill's notional; `None`
@@ -663,57 +685,90 @@ impl SimEngine {
     }
 
     /// What an order does, decided before anything but its queue changes: the fills it takes,
-    /// each with its fee, and whether its rest was queued under `key`.
+    /// each with its fee, the resting orders of ours it trades with, and whether its rest was
+    /// queued under `key`.
+    ///
+    /// It meets the opposite side as the venue would (decision 0051): each price best first,
+    /// within its limit, where the displayed level has public size left or an order of ours
+    /// rests. At a price it takes the public size ahead of each of our orders there, in their
+    /// match order, then meets that order: a venue that prevents self-trades expires the
+    /// crossing order there (`EXPIRE_TAKER`), one that does not fills both. What is left of the
+    /// public size behind them is taken last.
     fn match_order(&mut self, p: &Match, key: OrderKey, at: At) -> Result<Taken, Refusal> {
         let book = self.trading_book(p.inst).ok_or(Refusal::NoBook)?;
         let top = book.top(usize::MAX).map_err(|_| Refusal::NoBook)?;
-        let (opposite, maker_bid) = match p.side {
-            Side::Buy => (top.asks, false),
-            Side::Sell => (top.bids, true),
+        let maker = p.side.opposite();
+        let maker_bid = maker == Side::Buy;
+        let shown = match p.side {
+            Side::Buy => top.asks,
+            Side::Sell => top.bids,
         };
         // What each opposite level still holds: trades printed there, or through it, whose
-        // shrink the book has not shown yet took their size first (Codex r4185186386), so a
-        // level they emptied is neither crossed nor taken from.
-        let opposite: Vec<(Ticks, Lots)> = opposite
+        // shrink the book has not shown yet took their size first (Codex r4185186386), and so
+        // did our earlier crossing orders since the book's last event there (decision 0051).
+        let mut prices: BTreeMap<Ticks, Lots> = shown
             .iter()
             .map(|lvl| {
-                let credit = self.traded.get(&(p.inst, maker_bid, lvl.px)).copied();
-                let left = lvl.qty.checked_sub(credit.unwrap_or(Lots::ZERO));
-                (lvl.px, left.unwrap_or(Lots::ZERO))
+                (
+                    lvl.px,
+                    self.unshown(p.inst, maker.book_side(), lvl.px, lvl.qty),
+                )
             })
             .filter(|&(_, qty)| qty > Lots::ZERO)
             .collect();
-        let within = |&&(lvl_px, _): &&(Ticks, Lots)| match (p.px, p.side) {
+        // Our own resting orders on that side are in the real book, though its feed never
+        // shows them.
+        let ours = self
+            .live
+            .values()
+            .filter(|o| o.inst == p.inst && o.side == maker);
+        for o in ours {
+            prices.entry(o.px).or_insert(Lots::ZERO);
+        }
+        let within = |lvl_px: Ticks| match (p.px, p.side) {
             (None, _) => true,
             (Some(px), Side::Buy) => lvl_px <= px,
             (Some(px), Side::Sell) => lvl_px >= px,
         };
-        if p.post_only && opposite.first().is_some_and(|l| within(&l)) {
+        let mut prices: Vec<(Ticks, Lots)> = prices.into_iter().collect();
+        if p.side == Side::Sell {
+            prices.reverse();
+        }
+        prices.retain(|&(px, _)| within(px));
+        if p.post_only && !prices.is_empty() {
             return Err(Refusal::PostOnlyWouldCross);
         }
-        let mut crossed = Vec::new();
+        let mut walk = Walk::default();
         let mut left = p.qty;
-        for &(px, size) in opposite.iter().filter(within) {
-            let qty = size.min(left);
-            if qty == Lots::ZERO {
+        for (px, public) in prices {
+            if left == Lots::ZERO || walk.expired {
                 break;
             }
-            left = left.checked_sub(qty).unwrap_or(Lots::ZERO);
-            crossed.push((px, qty));
+            left = self.meet_level(p.inst, maker, px, public, left, &mut walk);
         }
         // A fill-or-kill order that cannot fill whole takes nothing, so it needs no fee
         // (Codex r4182154743): fees are looked up only for the fills that will happen.
         if p.tif == TifTag::Fok && left > Lots::ZERO {
-            crossed.clear();
+            walk = Walk {
+                expired: walk.expired,
+                ..Walk::default()
+            };
             left = p.qty;
         }
         let mut takes = Vec::new();
-        for (px, qty) in crossed {
+        for &(px, qty) in &walk.takes {
             let fee = self.fee(p.inst, Liquidity::Taker, px, qty, at.wall);
             takes.push((px, qty, fee.ok_or(Refusal::NoFee)?));
         }
+        let mut makers = Vec::new();
+        for &(n, px, qty) in &walk.makers {
+            let fee = self.fee(p.inst, Liquidity::Maker, px, qty, at.wall);
+            makers.push((n, qty, fee.ok_or(Refusal::NoFee)?));
+        }
+        let level = |(px, qty)| ((p.inst, maker_bid, px), qty);
+        let depleted = walk.depleted.into_iter().map(level).collect();
         let rests = match p.px {
-            Some(px) if p.tif == TifTag::Gtc && left > Lots::ZERO => {
+            Some(px) if p.tif == TifTag::Gtc && left > Lots::ZERO && !walk.expired => {
                 let side = p.side.book_side();
                 let book = self.trading_book(p.inst).ok_or(Refusal::NoBook)?;
                 let shown = book.level(side, px).ok().flatten().ok_or(Refusal::NoBook)?;
@@ -741,7 +796,91 @@ impl SimEngine {
             }
             _ => false,
         };
-        Ok(Taken { takes, rests })
+        Ok(Taken {
+            takes,
+            rests,
+            expired: walk.expired,
+            makers,
+            depleted,
+            ahead: walk.ahead,
+        })
+    }
+
+    /// The crossing order, `left` lots still to fill, meets the opposite level at `px` on
+    /// `maker`'s side, where `public` lots of public size are left: it takes the public size
+    /// ahead of each order of ours there, then meets that order, and takes the public size
+    /// behind them last. Records what it did in `walk`; gives what it has left.
+    fn meet_level(
+        &self,
+        inst: InstrumentId,
+        maker: Side,
+        px: Ticks,
+        public: Lots,
+        mut left: Lots,
+        walk: &mut Walk,
+    ) -> Lots {
+        let queued = self.queues.get(&inst).map(|q| q.at_level(maker, px));
+        // Only our own orders: an injected one is another process's, met only as the public
+        // size the book shows of it (decision 0051).
+        let ours: Vec<_> = queued
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(key, _)| self.live.contains_key(&key.0))
+            .collect();
+        let (mut public_taken, mut traded) = (Lots::ZERO, Lots::ZERO);
+        let mut reached = BTreeSet::new();
+        for &(key, pos) in &ours {
+            // The public size ahead of it, as far as the level still has any.
+            let ahead = pos.ahead.checked_sub(public_taken).unwrap_or(Lots::ZERO);
+            let rest = public.checked_sub(public_taken).unwrap_or(Lots::ZERO);
+            let take = ahead.min(rest).min(left);
+            public_taken = sum(public_taken, take);
+            left = left.checked_sub(take).unwrap_or(Lots::ZERO);
+            if left == Lots::ZERO {
+                break;
+            }
+            // It meets ours: nothing is ahead of ours any more.
+            reached.insert(key);
+            if self.prevents_self_trade {
+                walk.expired = true;
+                break;
+            }
+            let qty = pos.remaining.min(left);
+            left = left.checked_sub(qty).unwrap_or(Lots::ZERO);
+            traded = sum(traded, qty);
+            walk.makers.push((key.0, px, qty));
+            if left == Lots::ZERO {
+                break;
+            }
+        }
+        if !walk.expired {
+            let rest = public.checked_sub(public_taken).unwrap_or(Lots::ZERO);
+            let take = rest.min(left);
+            public_taken = sum(public_taken, take);
+            left = left.checked_sub(take).unwrap_or(Lots::ZERO);
+        }
+        // The public size it took was at the front of the level, so it was ahead of every
+        // order of ours there it did not reach.
+        let ahead = ours.iter().map(|&(key, pos)| {
+            let ahead = pos.ahead.checked_sub(public_taken).unwrap_or(Lots::ZERO);
+            (
+                key,
+                if reached.contains(&key) {
+                    Lots::ZERO
+                } else {
+                    ahead
+                },
+            )
+        });
+        walk.ahead.extend(ahead);
+        let at_px = sum(public_taken, traded);
+        if at_px > Lots::ZERO {
+            walk.takes.push((px, at_px));
+        }
+        if public_taken > Lots::ZERO {
+            walk.depleted.push((px, public_taken));
+        }
+        left
     }
 
     fn commit_place(&mut self, p: Place, taken: Taken) -> Item {
@@ -773,6 +912,17 @@ impl SimEngine {
     ) -> Vec<Reply> {
         let vid = vid(n);
         let mut events = Vec::new();
+        // What it took from the displayed levels stays taken until the book's next event
+        // there, and the orders of ours there moved up by what it took ahead of them.
+        for (level, qty) in taken.depleted {
+            let depleted = self.depleted.entry(level).or_insert(Lots::ZERO);
+            *depleted = sum(*depleted, qty);
+        }
+        if let Some(queue) = self.queues.get_mut(&order.inst) {
+            for (key, ahead) in taken.ahead {
+                queue.set_ahead(key, ahead);
+            }
+        }
         let last = taken.takes.len();
         for (i, (fill_px, qty, charge)) in taken.takes.into_iter().enumerate() {
             order.cum = order.cum.checked_add(qty).unwrap_or(order.cum);
@@ -789,6 +939,8 @@ impl SimEngine {
             SimState::Open
         } else if order.cum == order.qty {
             SimState::Filled
+        } else if taken.expired {
+            SimState::Canceled(CancelReason::SelfTrade)
         } else {
             SimState::Canceled(CancelReason::Unfilled)
         };
@@ -797,6 +949,23 @@ impl SimEngine {
             self.live.insert(n, order);
         } else {
             self.ended.insert(n, Ended { order, px, state });
+        }
+        // The orders of ours it traded with, where the venue lets one account trade with
+        // itself: each one's maker fill, after the crossing order's own events.
+        // Each is one the walk found resting, and no other order has moved it since.
+        let makers = taken.makers.into_iter();
+        let makers =
+            makers.filter_map(|(m, qty, charge)| Some((m, self.live.remove(&m)?, qty, charge)));
+        for (m, resting, qty, charge) in makers.collect::<Vec<_>>() {
+            let left = resting.qty.checked_sub(resting.cum);
+            let remaining = left.and_then(|l| l.checked_sub(qty)).unwrap_or(Lots::ZERO);
+            let queue = self.queue_of(resting.inst);
+            if remaining == Lots::ZERO {
+                queue.remove(OrderKey(m));
+            } else {
+                queue.set_remaining(OrderKey(m), remaining);
+            }
+            events.extend(self.maker_events(m, resting, qty, remaining, charge));
         }
         events
     }
@@ -851,7 +1020,7 @@ impl SimEngine {
                 let vid = vid(n);
                 let state = SimState::Amended;
                 let event = Reply::Order(order_event(&amended, &vid, state, Some(a.px)));
-                let quiet = taken.takes.is_empty();
+                let quiet = taken.takes.is_empty() && taken.rests;
                 let mut events = self.commit(n, amended, Some(a.px), taken);
                 // An amended order that takes nothing rests as the amended event says.
                 if quiet {
@@ -939,11 +1108,7 @@ impl SimEngine {
                 fits.ok_or(Refusal::InvalidQty)?;
             }
             self.queue_of(a.inst).set_remaining(key, rest);
-            let taken = Taken {
-                takes: Vec::new(),
-                rests: true,
-            };
-            return Ok((amended, taken));
+            return Ok((amended, Taken::resting()));
         }
         // Otherwise it is matched as a new order at its price, without its old place or its
         // old size at the venue, both put back if the venue refuses it.
@@ -1049,6 +1214,9 @@ impl SimEngine {
             .filter(|_| !in_snapshot)
             .and_then(|b| b.level(side, px).ok().flatten());
         self.books.apply(ev).map_err(SimError::Book)?;
+        // The book's event at the level replaces what our crossing orders took there
+        // (decision 0051), whatever it shows.
+        self.depleted.remove(&(inst, side == BookSide::Bid, px));
         match before {
             Some(before) => {
                 self.level_changed(inst, side, px, before, qty);
@@ -1085,6 +1253,8 @@ impl SimEngine {
         };
         let before: Vec<_> = held.iter().map(|&(bid, px)| size(self, bid, px)).collect();
         self.books.apply(ev).map_err(SimError::Book)?;
+        // It restates every level, so nothing our crossing orders took survives it.
+        self.depleted.retain(|key, _| key.0 != inst);
         for (&(bid, px), before) in held.iter().zip(before) {
             if let (Some(before), Some(after)) = (before, size(self, bid, px)) {
                 self.level_changed(inst, side(bid), px, before, after);
@@ -1259,35 +1429,91 @@ impl SimEngine {
         self.injected_fills.push(fill);
     }
 
-    fn maker_fill(&mut self, fill: SimFill, mut order: Resting, charge: Charge, at: At) {
-        let n = fill.key.0;
+    fn maker_fill(&mut self, fill: SimFill, order: Resting, charge: Charge, at: At) {
+        let events = self.maker_events(fill.key.0, order, fill.qty, fill.remaining, charge);
+        for event in events {
+            self.answer(at, event);
+        }
+    }
+
+    /// Resting order `n` (`order`, out of `live`) filled `qty` lots at its price as the maker,
+    /// `remaining` left: its fill and order events. It rests again unless filled whole.
+    fn maker_events(
+        &mut self,
+        n: u64,
+        mut order: Resting,
+        qty: Lots,
+        remaining: Lots,
+        charge: Charge,
+    ) -> Vec<Reply> {
         let vid = vid(n);
-        order.cum = order.cum.checked_add(fill.qty).unwrap_or(order.cum);
-        let record = self.fill_record(&order, &vid, fill.px, fill.qty, Liquidity::Maker, charge);
+        let mut events = Vec::new();
+        order.cum = order.cum.checked_add(qty).unwrap_or(order.cum);
+        let record = self.fill_record(&order, &vid, order.px, qty, Liquidity::Maker, charge);
         // A derived-fills venue's order update below carries the fill.
         if self.native_fills {
-            self.answer(at, Reply::Fill(record));
+            events.push(Reply::Fill(record));
         }
         let px = Some(order.px);
-        let state = if fill.remaining == Lots::ZERO {
+        let state = if remaining == Lots::ZERO {
             SimState::Filled
         } else {
             SimState::Open
         };
-        self.answer(at, Reply::Order(order_event(&order, &vid, state, px)));
+        events.push(Reply::Order(order_event(&order, &vid, state, px)));
         if state == SimState::Open {
             self.live.insert(n, order);
         } else {
             self.ended.insert(n, Ended { order, px, state });
         }
+        events
     }
 }
 
-/// What an order takes before it changes anything: its fills, `(px, qty, charge)`, and
-/// whether its rest was queued.
+/// What an order takes before it changes anything: its fills, `(px, qty, charge)`, whether
+/// its rest was queued, whether the venue expired it where it would have traded with an order
+/// of ours, the orders of ours it trades with instead (`(n, qty, charge)`, their maker fills),
+/// the public size it takes from each displayed level, and the size then ahead of each order
+/// of ours at those levels (decision 0051).
 struct Taken {
     takes: Vec<(Ticks, Lots, Charge)>,
     rests: bool,
+    expired: bool,
+    makers: Vec<(u64, Lots, Charge)>,
+    depleted: Vec<((InstrumentId, bool, Ticks), Lots)>,
+    ahead: Vec<(OrderKey, Lots)>,
+}
+
+impl Taken {
+    /// An order that takes nothing and rests where it is.
+    fn resting() -> Taken {
+        Taken {
+            takes: Vec::new(),
+            rests: true,
+            expired: false,
+            makers: Vec::new(),
+            depleted: Vec::new(),
+            ahead: Vec::new(),
+        }
+    }
+}
+
+/// What a crossing order meets on its way through the opposite side, before its fees: the
+/// size it takes at each price, `(n, px, qty)` for each order of ours it trades with, the
+/// public size it takes at each price, the size then ahead of each order of ours it passes or
+/// meets, and whether the venue expired it at one of ours.
+#[derive(Default)]
+struct Walk {
+    takes: Vec<(Ticks, Lots)>,
+    makers: Vec<(u64, Ticks, Lots)>,
+    depleted: Vec<(Ticks, Lots)>,
+    ahead: Vec<(OrderKey, Lots)>,
+    expired: bool,
+}
+
+/// `a` plus `b`, saturating at the most lots a `Lots` holds.
+fn sum(a: Lots, b: Lots) -> Lots {
+    a.checked_add(b).unwrap_or(MAX_LOTS)
 }
 
 /// What a fill costs: its fee in the venue's fee sign, the asset of that fee, and the fill's

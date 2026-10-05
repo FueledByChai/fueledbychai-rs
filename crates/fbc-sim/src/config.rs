@@ -29,7 +29,9 @@ pub struct SimConfig {
     /// their fee sign.
     pub exec: ExecCaps,
     /// How the venue it stands in for matches: the codec places nothing for a venue with a
-    /// speed bump, which the engine does not model yet (FBC-7y8).
+    /// speed bump, which the engine does not model yet (FBC-7y8), and the engine expires a
+    /// crossing order that would trade with one of SimVenue's own resting orders unless its
+    /// `stp_scope` is `None` (decision 0051).
     pub matching: MatchingCaps,
     pub latency: SimLatency,
     /// How long the runtime waits for an answer to each command before it is Unknown.

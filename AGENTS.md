@@ -246,6 +246,9 @@ rather than guess.
     a `SimConfig` with no `Default`, and a resync answered with the resting orders and the
     positions the fills imply, 0049, answers ordered by the stood-in venue's key with realized
     P&L and funding on fills where it declares them and derived fills as order updates, 0050;
+    crossing orders meeting SimVenue's own resting orders under the stood-in venue's
+    `stp_scope` and depleting the displayed levels they take until the book's next event
+    there, 0051;
     still planned: amends, batches, queries and injected
     orders, FBC-nv2), `crates/fbc-conformance` (the adapter conformance kit,
     0025; it depends on `fbc-runtime` and `fbc-core`, never on a venue crate: so
