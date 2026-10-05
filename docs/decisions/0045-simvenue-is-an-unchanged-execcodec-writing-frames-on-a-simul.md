@@ -40,26 +40,27 @@ SimVenue is two halves joined by a simulated order-entry stream:
   `on_frame` then. `advance(now)` lets a host move time with a stamp it read when no envelope
   comes.
 - **Matching.** A placement for an instrument the spec table does not list is refused
-  (`no_book`), since its size cannot be judged. A placement of zero lots is refused
-  `InvalidQty`, since zero lots is never an order (`InstrumentSpec::floor_qty`), and so is one
-  below the spec's `min_size` or above its `max_order_size`, and one that would rest where the
-  level's size, the simulated orders there and its own would not fit in lots. A placement crosses the trading
-  book's displayed levels as the taker; a post-only order that would cross is refused
-  `PostOnlyWouldCross`; a good-till-cancelled limit order's rest queues (0038), on the level's
-  size as the venue would show it with the simulated orders it holds there
-  (`QueueModel::accept_shown`), since the real book never shows them; immediate-or-cancel,
-  fill-or-kill and market remainders are cancelled unfilled. A good-till-cancelled order that
-  would rest where the book does not know the size (past its depth or window) is refused whole
-  (`no_book`), crossing part included. A trade fills resting orders through the queue model as
-  the maker; one without an aggressor is classified against the touch and ignored inside the
-  spread. A level that shrinks by more than the trades printed at its price since it last
-  changed is a level cancel, whether a delta or a replacement snapshot shrinks it; each change
-  of the level ends what those trades explain, so none carries to a later change, while an
-  update repeating its size is no change; a replacement snapshot restates every level, so it
-  ends what was traded at each, even where it repeats a level's size or cannot compare sizes (a
-  level the old or the new book does not reach), and a delta that first shows a level the book
-  did not reach ends what was traded there. The trades at a
-  level saturate at an `i64` of lots rather than drop a print.
+  (`no_book`), since its size cannot be judged. A placement of zero lots is refused `InvalidQty`,
+  since zero lots is never an order (`InstrumentSpec::floor_qty`), and so is one below the spec's
+  `min_size` or above its `max_order_size`, and one that would rest where the level's size, the
+  simulated orders there and its own would not fit in lots; a limit price the spec's `price_grid`
+  does not accept is refused `InvalidPrice`. A placement crosses the trading book's displayed
+  levels as the taker; a post-only order that would cross is refused `PostOnlyWouldCross`; a
+  good-till-cancelled limit order's rest queues (0038), on the level's size as the venue would
+  show it with the simulated orders it holds there (`QueueModel::accept_shown`), since the real
+  book never shows them, less the trades printed at its price whose shrink the level has not
+  shown yet, which took their size before the order arrived; immediate-or-cancel, fill-or-kill
+  and market remainders are cancelled unfilled. A good-till-cancelled order that would rest where
+  the book does not know the size (past its depth or window) is refused whole (`no_book`),
+  crossing part included. A trade fills resting orders through the queue model as the maker; one
+  without an aggressor is classified against the touch and ignored inside the spread. A level
+  that shrinks by more than the trades printed at its price since it last changed is a level
+  cancel, whether a delta or a replacement snapshot shrinks it; each change of the level ends
+  what those trades explain, so none carries to a later change, while an update repeating its
+  size is no change; a replacement snapshot restates every level, so it ends what was traded at
+  each, even where it repeats a level's size or cannot compare sizes (a level the old or the new
+  book does not reach), and a delta that first shows a level the book did not reach ends what was
+  traded there. The trades at a level saturate at an `i64` of lots rather than drop a print.
 - **Fees.** A fill's fee is the consumer's `FeeBook` rate for the simulated account, instrument,
   public channel and liquidity at the fill's wall time, times its notional
   (`InstrumentSpec::notional`), rounded to the nano, written in the stood-in venue's fee sign so
@@ -70,23 +71,25 @@ SimVenue is two halves joined by a simulated order-entry stream:
   none); a resting order that a trade would fill without one is cancelled by the venue, never
   filled with an invented fee, and the trade's size it would have taken goes to the orders
   behind it.
-- **Configuration.** `SimConfig` carries the stood-in venue's `ExecCaps`, the latency, the RPC
-  timeout, the stream, the bracket, the account, the fee book, the spec table and each
-  instrument's trading book. None of them has a default and no number lives in `fbc-sim` (0001,
-  0009).
+- **Configuration.** `SimConfig` carries the stood-in venue's `ExecCaps` and `MatchingCaps`, the
+  latency, the RPC timeout, the stream, the bracket, the account, the fee book, the spec table
+  and each instrument's trading book. None of them has a default and no number lives in `fbc-sim`
+  (0001, 0009).
 - **Not yet.** RPI orders are refused, since a public trade feed does not say which flow was
   retail and the queue model fills RPI orders from retail flow only (FBC-njk). Placements for a
   venue whose events the engine cannot say yet are refused (`NotSent(Unsupported)`) rather than
   answered with events unlike its own: one whose `ack` is `AckModel::TwoPhase`, since the engine
   accepts in one phase and would report a provisional acceptance as final (FBC-zr1), and one
   whose `ordering_key` is not `VenueSeq`, whose fills carry realized P&L or funding, or whose
-  fills are derived from order status (FBC-938); cancels still go. A fill with a venue fill id
-  always names its order's venue id and cumulative quantity, which `FillCaps` cannot yet say a
-  venue's fills omit (FBC-2g7). `resync` answers nothing (FBC-bq3). A crossing order meets only
-  the displayed book: not the venue's own resting orders, and two crossing orders between book
-  updates can take the same lots (FBC-4qr). Reduce-only is echoed, not enforced, since the
-  engine keeps no position. Of the spec's limits only the order size is judged; minimum
-  notional, price band, trading status, position limit and open-order cap are FBC-205's.
+  fills are derived from order status (FBC-938), and one with a `MatchingCaps::speed_bump`, since
+  a command acts `to_venue` after it was sent and no later (FBC-7y8); cancels still go. A fill
+  with a venue fill id always names its order's venue id and cumulative quantity, which
+  `FillCaps` cannot yet say a venue's fills omit (FBC-2g7). `resync` answers nothing (FBC-bq3). A
+  crossing order meets only the displayed book: not the venue's own resting orders, and two
+  crossing orders between book updates can take the same lots (FBC-4qr). Reduce-only is echoed,
+  not enforced, since the engine keeps no position. Of the spec's limits only the order size is
+  judged; minimum notional, price band, trading status, position limit and open-order cap are
+  FBC-205's.
 
 ## Alternatives
 

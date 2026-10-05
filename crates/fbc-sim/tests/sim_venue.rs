@@ -20,10 +20,10 @@ use fbc_core::{
     MdEvent, MonoNs, Namespace, NamespaceLease, NewOrder, NonceBlock, NonceScope, NotSentReason,
     OpKind, OrderCaps, OrderKind, OrderKindTag, OrderRef, OrderingKey, PathStamps, PriceGrid,
     RateCharge, RawFrame, Readiness, RefKind, RejectKind, RpcCall, RpcId, Side, SizeStep,
-    SnapshotSource, SpecTable, Stamp, StpScope, StreamId, SubmitOutcome, Support, TagSet,
-    TerminalHint, Ticks, Tif, TifTag, TimerTag, TradeCaps, TradingStatus, TrafficClass,
-    UnderlyingId, VenueCaps, VenueCommand, VenueFeeSign, VenueId, VenueMeta, VenueOrderState,
-    WallNs, dispatch,
+    SnapshotSource, SpecTable, SpeedBump, SpeedBumpScope, Stamp, StpScope, StreamId, SubmitOutcome,
+    Support, TagSet, TerminalHint, Ticks, Tif, TifTag, TimerTag, TradeCaps, TradingStatus,
+    TrafficClass, UnderlyingId, VenueCaps, VenueCommand, VenueFeeSign, VenueId, VenueMeta,
+    VenueOrderState, WallNs, dispatch,
 };
 use fbc_sim::{
     Answer, Bracket, OrderKey, QueueConfig, QueueError, SimCodec, SimConfig, SimEngine, SimError,
@@ -220,6 +220,7 @@ fn fees() -> FeeBook {
 fn config(bracket: Bracket, fee_sign: VenueFeeSign, fees: FeeBook) -> SimConfig {
     SimConfig {
         exec: caps(fee_sign).exec.unwrap(),
+        matching: caps(fee_sign).matching,
         latency: SimLatency {
             to_venue: TO_VENUE,
             to_client: TO_CLIENT,
@@ -1746,8 +1747,9 @@ fn a_repeated_level_keeps_what_the_trades_explain() {
 
 #[test]
 fn trades_past_an_i64_of_lots_still_explain_a_shrink() {
-    // Codex r4182448176: the trades at a level saturate rather than drop a print, so a later
-    // shrink they explain is no cancel.
+    // Codex r4182448176: the trades at a level saturate rather than drop a print. Printed
+    // before the order arrived and not yet shown by the level, they took everything ahead of it
+    // (Codex r4184245578), so a trade of two fills it; a dropped print would leave nine ahead.
     let mut v = Venue::new(Bracket::Optimistic);
     v.snapshot(T0, &[(199, 10)], &[(201, 5)]);
     v.trade(T0 + MS, Aggressor::Seller, 199, 1);
@@ -1755,13 +1757,16 @@ fn trades_past_an_i64_of_lots_still_explain_a_shrink() {
     v.send(limit(cid(), Side::Buy, 199, 2), 1, T0 + 2 * MS);
     v.tick(T0 + 7 * MS);
     assert_eq!(v.answers().len(), 2);
+    // The level's shrink the trades explain moves nothing.
     v.level(T0 + 8 * MS, BookSide::Bid, 199, 5);
-    // Ten ahead and none of it cancelled: a trade of seven fills nothing.
-    v.trade(T0 + 9 * MS, Aggressor::Seller, 199, 7);
+    v.trade(T0 + 9 * MS, Aggressor::Seller, 199, 2);
     let got = v.answers();
     assert_eq!(
-        got.iter().filter_map(|(_, ev)| fill_of(ev)).count(),
-        0,
+        got.iter()
+            .filter_map(|(_, ev)| fill_of(ev))
+            .map(|f| f.1)
+            .sum::<i64>(),
+        2,
         "{got:?}"
     );
 }
@@ -2122,6 +2127,86 @@ fn a_snapshot_repeating_a_levels_size_ends_what_earlier_trades_explain() {
     // Three cancelled: the three left ahead go, so a trade of two fills both lots.
     v.level(T0 + 8 * MS, BookSide::Bid, 199, 3);
     v.trade(T0 + 9 * MS, Aggressor::Seller, 199, 2);
+    let got = v.answers();
+    assert_eq!(
+        got.iter()
+            .filter_map(|(_, ev)| fill_of(ev))
+            .map(|f| f.1)
+            .sum::<i64>(),
+        2,
+        "{got:?}"
+    );
+}
+
+#[test]
+fn a_limit_price_off_the_specs_grid_is_refused() {
+    // Codex r4184245564: a limit price the instrument's grid does not accept (two significant
+    // figures here: 19.9 is not one, 19 is) is refused as an invalid price, and nothing rests.
+    let mut config = config(Bracket::Optimistic, VenueFeeSign::PositiveIsRebate, fees());
+    let mut sig = spec(INST, "SIM-PERP");
+    sig.price_grid = PriceGrid::sig_figs(2, 1, false).unwrap();
+    config.specs.insert(sig);
+    let mut v = Venue::with(config);
+    v.snapshot(T0, &[(190, 6), (199, 1)], &[(201, 5)]);
+    let off = cid();
+    v.send(limit(off, Side::Buy, 199, 1), 1, T0);
+    v.send(limit(cid(), Side::Buy, 190, 1), 2, T0);
+    v.tick(T0 + 5 * MS);
+    let got = v.answers();
+    let ExecEvent::Outcome {
+        outcome: SubmitOutcome::Rejected(r),
+        ..
+    } = &got[0].1
+    else {
+        panic!("{got:?}")
+    };
+    assert_eq!(
+        (r.kind, r.venue_code.as_deref()),
+        (RejectKind::InvalidPrice, Some("invalid_px"))
+    );
+    assert_eq!(outcome_of(&got[1].1), Some((2, ACCEPTED)), "{got:?}");
+    v.send(cancel(OrderRef::Client(off)), 3, T0 + 6 * MS);
+    v.tick(T0 + 11 * MS);
+    let got = v.answers();
+    assert_eq!(rejected(&got[0].1), Some(RejectKind::NotFound), "{got:?}");
+}
+
+#[test]
+fn a_venue_with_a_speed_bump_is_not_stood_in_for_yet() {
+    // Codex r4184245574: the engine acts on a command `to_venue` after it was sent, with no
+    // speed bump; a venue that delays orders gets no placement rather than fills it would not
+    // give (FBC-7y8). Cancels still go.
+    for applies_to in [
+        SpeedBumpScope::TakersOnly,
+        SpeedBumpScope::AllButCancels,
+        SpeedBumpScope::Everything,
+    ] {
+        let mut config = config(Bracket::Optimistic, VenueFeeSign::PositiveIsCost, fees());
+        config.matching.speed_bump = Some(SpeedBump {
+            delay: Duration::from_millis(25),
+            applies_to,
+        });
+        let mut v = Venue::with(config);
+        let refused = v.encode(&limit(cid(), Side::Buy, 199, 1), 1, T0);
+        assert_eq!(refused.err(), Some(NotSentReason::Unsupported));
+        assert!(v.encode(&cancel(OrderRef::Client(cid())), 2, T0).is_ok());
+    }
+}
+
+#[test]
+fn an_order_arriving_after_a_trade_its_level_has_not_shown_is_not_behind_that_trade() {
+    // Codex r4184245578: a trade printed before the order arrived, whose shrink the level
+    // shows only after, had already taken its size: the order queues behind what is left, and
+    // the shrink, which that trade explains, moves nothing.
+    let mut v = Venue::new(Bracket::Pessimistic);
+    v.snapshot(T0, &[(199, 6)], &[(201, 5)]);
+    v.send(limit(cid(), Side::Buy, 199, 2), 1, T0);
+    v.trade(T0 + 4 * MS, Aggressor::Seller, 199, 4);
+    v.tick(T0 + 5 * MS);
+    assert_eq!(v.answers().len(), 2);
+    v.level(T0 + 6 * MS, BookSide::Bid, 199, 2);
+    // Two left ahead: a trade of four fills both lots.
+    v.trade(T0 + 7 * MS, Aggressor::Seller, 199, 4);
     let got = v.answers();
     assert_eq!(
         got.iter()
