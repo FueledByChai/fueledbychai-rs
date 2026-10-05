@@ -314,8 +314,9 @@ impl OrderRecord {
     /// is ignored, though an amend's replacement of one venue id by another, a fact whenever
     /// it arrives, is still recorded. The venue's price and total apply when the update states
     /// them; `cum_venue` keeps the largest cumulative fill. An Open update moves the order to
-    /// Open, or PartiallyFilled once something is filled; an amended update moves no state.
-    /// Either ends the order Filled when its fills alone then cover its total with no amend to
+    /// Open, or PartiallyFilled once something is filled; an amended update moves no state,
+    /// and resolves an amend in flight, whose price and total stand where the update does not
+    /// state them. Either ends the order Filled when its fills alone then cover its total with no amend to
     /// a larger total in flight.
     pub fn apply_update(&mut self, u: &OrderUpdate, key: OrderKey) -> Applied {
         if self.state.is_terminal() {
@@ -350,7 +351,11 @@ impl OrderRecord {
             return Applied::Advanced;
         }
         if let VenueOrderState::Amended { .. } = u.state {
-            if let Intent::PendingAmend { .. } = self.intent {
+            if let Intent::PendingAmend { px, qty, .. } = self.intent {
+                // The venue confirmed the amend in flight: what it does not echo is what was
+                // sent.
+                self.px = Some(u.px.unwrap_or(px));
+                self.qty = u.qty.unwrap_or(qty);
                 self.intent = Intent::None;
             }
             self.complete_if_covered();
@@ -653,6 +658,20 @@ mod tests {
         open.qty = Some(lots(5));
         rec.apply_update(&open, key(2));
         assert_eq!(rec.state(), OrdState::Terminal(TerminalKind::Filled));
+    }
+
+    #[test]
+    fn an_amend_confirmed_without_its_total_takes_the_total_that_was_sent() {
+        let mut rec = order(5);
+        assert!(rec.amend_sent(Ticks(101), lots(8), RpcId(3), MonoNs(2)));
+        assert_eq!(rec.apply_fill(None, lots(5)), FillApplied::Live);
+        // The venue confirms the amend but echoes neither price nor total.
+        let amended = update(VenueOrderState::Amended { new_vid: None }, 5);
+        assert_eq!(rec.apply_update(&amended, key(1)), Applied::Amended);
+        assert_eq!(rec.state(), OrdState::PartiallyFilled);
+        assert_eq!((rec.px(), rec.qty()), (Some(Ticks(101)), lots(8)));
+        assert_eq!(rec.resting(), lots(3));
+        assert_eq!(rec.intent(), Intent::None);
     }
 
     #[test]
