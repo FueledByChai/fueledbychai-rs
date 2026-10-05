@@ -82,17 +82,18 @@
 //! reached the venue is unknown, and the connection's `Closed` follows. A frame, timer firing
 //! or HTTP result the session takes as the control drops reaches no codec, and is journaled
 //! after the epoch's `Closed`, so a replay ([`crate::MdReplay`]) feeds it to none either. Pings, pongs and close frames carry no data and are not
-//! journaled. Until FBC-7lm, nothing a codec receives carries redaction spans, so inbound
-//! frames and responses would be journaled verbatim: a session that carries a credential (its
-//! endpoint URL has a redaction span, or it has sent a frame or HTTP request with one, or with a
-//! header the codec marked or one of the journal's secret headers) journals no frame or
-//! response it receives from then on, counting each withheld input instead (Codex r4178197275)
-//! and omitting it at the sink, which counts it as dropped and marks the gap with a `Degraded`
-//! marker (Codex r4178287664). An HTTP failure holds nothing received, so it is still journaled
-//! (Codex r4179310275), and so is what the session sends, its spans as keyed hashes. Inbound
-//! frames, HTTP requests, HTTP results and subscribe calls are offered to the sink borrowed
-//! ([`RecordRef`]), so a sink with no room refuses them before they are copied, at the length
-//! the journal's own encoding of them takes.
+//! journaled. What the session sends is journaled with its redaction spans as keyed hashes.
+//! What it receives is journaled with the credentials the epoch's codec names in it
+//! ([`MdCodec::redact_inbound`], decision 0028), asked before the input is journaled: a frame's
+//! spans, and a response's body spans and the headers it marks, each written as its keyed hash
+//! and the rest verbatim, so nothing received is withheld. Spans that do not fit what they
+//! were named in ([`InboundSpans::check`]) are a codec defect, counted
+//! ([`MdCounters::refused_redactions`]): that input is journaled with its whole body and every
+//! header, name and value, hashed, never verbatim. So is a response that comes back to an epoch
+//! that has ended, which no codec is left to ask, and which reaches none, live or in replay.
+//! Inbound frames, HTTP requests, HTTP results and subscribe calls are offered to the sink
+//! borrowed ([`RecordRef`]), so a sink with no room refuses them before they are copied, at the
+//! length the journal's own encoding of them takes.
 
 use std::cell::Cell;
 use std::cmp::Reverse;
@@ -105,14 +106,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fbc_core::{
     ConfigError, ConnKey, DecodeError, Effect, Effects, EndpointPlan, Envelope, FeedHealth,
-    HttpFailure, HttpResponse, HttpTag, Keepalive, KeepaliveKind, KernelRxNs, MdCodec, MdEvent,
-    MdSink, MdTransport, MonoNs, OpKind, RateCharge, RawFrame, SpecTable, Stamp, StreamId,
-    Subscription, TimerTag, TrafficClass, VenueCaps, VenueConfig, VenueFactory, VenueMeta, Via,
-    WallNs, WireSlice, dispatch_market_data,
+    HeaderMark, HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans, Keepalive,
+    KeepaliveKind, KernelRxNs, MdCodec, MdEvent, MdSink, MdTransport, MonoNs, OpKind, RateCharge,
+    RawFrame, SpecTable, Stamp, StreamId, Subscription, TimerTag, TrafficClass, VenueCaps,
+    VenueConfig, VenueFactory, VenueMeta, Via, WallNs, WireSlice, dispatch_market_data,
 };
-use fbc_journal::{
-    ControlEvent, Opcode, Record, RecordRef, ResponseRef, WriteRes, is_secret_header,
-};
+use fbc_journal::{ControlEvent, Opcode, Record, RecordRef, ResponseRef, WriteRes};
 use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use tokio::sync::watch;
@@ -417,9 +416,9 @@ pub struct MdCounters {
     pub rotations: u64,
     /// Epochs ended because a write did not complete within the write-stall window.
     pub write_stalls: u64,
-    /// Inbound frames and HTTP responses not journaled because the session carries a
-    /// credential (until FBC-7lm).
-    pub journal_withheld: u64,
+    /// Inbound frames and HTTP responses whose codec named credential spans that do not fit
+    /// them (a codec defect): journaled with the whole body and every header hashed.
+    pub refused_redactions: u64,
 }
 
 /// One market-data endpoint, driven by [`MdSession::run`].
@@ -457,10 +456,8 @@ pub struct MdSession<H> {
     waiting: Option<(SubscribeCall, VecDeque<Effect>)>,
     rate_retry: Option<Instant>,
     journal: Option<Journal>,
-    /// The session has carried a credential: nothing it receives is journaled (until FBC-7lm).
-    credentialed: Cell<bool>,
-    /// Inputs withheld from the journal since ([`MdCounters::journal_withheld`]).
-    withheld: Cell<u64>,
+    /// Inputs whose codec's spans did not fit them ([`MdCounters::refused_redactions`]).
+    refused_redactions: Cell<u64>,
     /// The writes the handler issues while it handles an input.
     outbox: Outbox,
     handler: H,
@@ -515,12 +512,12 @@ impl<H: MdHandler> MdSession<H> {
         config: MdSessionConfig,
         handler: H,
     ) -> Result<(MdSession<H>, MdControl), SessionError> {
-        let (url, credentialed) = match &config.plan.transport {
+        let url = match &config.plan.transport {
             MdTransport::Socket { url } => {
                 ws::check_url(url.as_str()).map_err(SessionError::Url)?;
-                (url.as_str().to_owned(), !url.redactions().is_empty())
+                url.as_str().to_owned()
             }
-            MdTransport::Poll { base_url } => (String::new(), !base_url.redactions().is_empty()),
+            MdTransport::Poll { .. } => String::new(),
         };
         let caps = config
             .venue
@@ -567,8 +564,7 @@ impl<H: MdHandler> MdSession<H> {
             waiting: None,
             rate_retry: None,
             journal: None,
-            credentialed: Cell::new(credentialed),
-            withheld: Cell::new(0),
+            refused_redactions: Cell::new(0),
             outbox,
             handler,
         };
@@ -591,7 +587,7 @@ impl<H: MdHandler> MdSession<H> {
 
     pub fn counters(&self) -> MdCounters {
         MdCounters {
-            journal_withheld: self.withheld.get(),
+            refused_redactions: self.refused_redactions.get(),
             ..self.counters
         }
     }
@@ -609,17 +605,13 @@ impl<H: MdHandler> MdSession<H> {
         }
     }
 
-    /// The journal an input of `class` is offered to: none when the session has no journal,
-    /// or when it has carried a credential, in which case the input is withheld, counted, and
-    /// omitted at the sink, which marks the gap (Codex r4178287664).
-    fn input_journal(&self, class: TrafficClass, now: WallNs) -> Option<&Journal> {
-        let journal = self.journal.as_ref()?;
-        if self.credentialed.get() {
-            self.withheld.set(self.withheld.get() + 1);
-            journal.omit(class, now);
-            return None;
-        }
-        Some(journal)
+    /// The credentials `codec` names in `input`, checked: [`inbound_spans`], counting a
+    /// defect.
+    fn spans(&self, codec: Option<&dyn MdCodec>, input: Inbound<'_>) -> InboundSpans {
+        let (spans, refused) = inbound_spans(codec, input);
+        let n = self.refused_redactions.get();
+        self.refused_redactions.set(n + u64::from(refused));
+        spans
     }
 
     /// Records a connection change or a subscribe call.
@@ -657,7 +649,7 @@ impl<H: MdHandler> MdSession<H> {
                     _ = sleep_or_never(at) => Idle::Attempt,
                     _ = sleep_or_never(timer) => Idle::Timer,
                     Some(done) = self.http.next() => {
-                        let done = self.stamp_http(done);
+                        let done = self.stamp_http(None, done);
                         let _ = self.admit_http(done)?;
                         Idle::Http
                     }
@@ -709,7 +701,7 @@ impl<H: MdHandler> MdSession<H> {
                             let _ = self.take_timer()?;
                         }
                         Some(done) = self.http.next() => {
-                            let done = self.stamp_http(done);
+                            let done = self.stamp_http(None, done);
                             let _ = self.admit_http(done)?;
                         }
                     }
@@ -841,13 +833,13 @@ impl<H: MdHandler> MdSession<H> {
                 self.closed(key);
                 match wake {
                     Wake::Frame(Some(Ok(message))) => {
-                        self.take_in(key, rx, &message);
+                        self.take_in(&*codec, key, rx, &message);
                     }
                     Wake::Timer => {
                         let _ = self.take_timer()?;
                     }
                     Wake::Http(done) => {
-                        self.stamp_http(done);
+                        self.stamp_http(Some(&*codec), done);
                     }
                     _ => {}
                 }
@@ -865,7 +857,7 @@ impl<H: MdHandler> MdSession<H> {
                 }
                 Wake::Frame(_) => false,
                 Wake::Timer => self.fire(&mut ws, codec.as_mut()).await?,
-                Wake::Http(done) => match self.admit_http(self.stamp_http(done))? {
+                Wake::Http(done) => match self.admit_http(self.stamp_http(Some(&*codec), done))? {
                     Some((stamp, done)) => {
                         let mut fx = Effects::new();
                         self.answer(codec.as_mut(), stamp, done, &mut fx);
@@ -978,11 +970,13 @@ impl<H: MdHandler> MdSession<H> {
     }
 
     /// Stamps one message of epoch `key`, whose last packet the kernel received at `rx` when it
-    /// knows, and journals it; its stamp and data frame, when it carries data. Pings, pongs and
-    /// close frames take their place in ingest order but carry no data; a ping or a close is
-    /// charged for the answer the WebSocket layer sends to it.
+    /// knows, and journals it with the credentials `codec`, the epoch's, names in it; its stamp
+    /// and data frame, when it carries data. Pings, pongs and close frames take their place in
+    /// ingest order but carry no data; a ping or a close is charged for the answer the
+    /// WebSocket layer sends to it.
     fn take_in<'m>(
         &mut self,
+        codec: &dyn MdCodec,
         key: ConnKey,
         rx: Option<KernelRxNs>,
         message: &'m Message,
@@ -1001,9 +995,14 @@ impl<H: MdHandler> MdSession<H> {
         };
         // Offered borrowed, so a full journal refuses it before it is copied (Codex
         // r4178252055).
-        let (class, now) = (TrafficClass::Normal, stamp.recv_wall);
-        if let Some(journal) = self.input_journal(class, now) {
-            journal.record_ref(class, now, RecordRef::Inbound { stamp, frame: raw });
+        if let Some(journal) = &self.journal {
+            let spans = self.spans(Some(codec), Inbound::Frame(raw));
+            let frame = RecordRef::Inbound {
+                stamp,
+                frame: raw,
+                redact: spans.body(),
+            };
+            journal.record_ref(TrafficClass::Normal, stamp.recv_wall, frame);
         }
         Some((stamp, raw))
     }
@@ -1019,7 +1018,7 @@ impl<H: MdHandler> MdSession<H> {
         message: &Message,
         fx: &mut Effects,
     ) -> Option<Stamp> {
-        let (stamp, raw) = self.take_in(key, rx, message)?;
+        let (stamp, raw) = self.take_in(&*codec, key, rx, message)?;
         let mut sink = Sink {
             handler: &mut self.handler,
             epochs: &mut self.epochs,
@@ -1242,9 +1241,6 @@ impl<H: MdHandler> MdSession<H> {
                     };
                     let message = text.unwrap_or_else(|_| Message::binary(bytes.to_vec()));
                     let (conn, rpc) = (self.current(), rpc.map(|call| call.id));
-                    if !frame.redactions().is_empty() {
-                        self.credentialed.set(true);
-                    }
                     let (at, now) = self.clock.now();
                     self.journal(class, now, || Record::Outbound {
                         at,
@@ -1333,7 +1329,7 @@ impl<H: MdHandler> MdSession<H> {
                     stamp
                 }),
                 Some(done) => {
-                    let done = self.stamp_http(done);
+                    let done = self.stamp_http(Some(&*codec), done);
                     self.admit_http(done)?.map(|(stamp, done)| {
                         self.answer(codec, stamp, done, &mut more);
                         stamp
@@ -1371,13 +1367,6 @@ impl<H: MdHandler> MdSession<H> {
             ..
         } = &ask
         {
-            let secret = |h: &fbc_core::Header| h.redact || is_secret_header(h.name);
-            if !req.url.redactions().is_empty()
-                || !req.body.redactions().is_empty()
-                || req.headers.iter().any(secret)
-            {
-                self.credentialed.set(true);
-            }
             let (at, wall) = self.clock.now();
             // Offered borrowed, so a full journal refuses it before it is cloned (Codex
             // r4178287660).
@@ -1404,22 +1393,26 @@ impl<H: MdHandler> MdSession<H> {
     }
 
     /// Stamps an HTTP result as it comes back, under the epoch that asked for it, so it takes
-    /// its place in the shard's ingest order even when it is dropped, and journals it there.
-    fn stamp_http(&self, done: Answered) -> (Stamp, Answered) {
+    /// its place in the shard's ingest order even when it is dropped, and journals it there
+    /// with the credentials the codec of that epoch names in it: `codec`, the current epoch's
+    /// when one is running. A result of an ended epoch has no codec left to ask: all of it is
+    /// hashed ([`inbound_spans`]).
+    fn stamp_http(&self, codec: Option<&dyn MdCodec>, done: Answered) -> (Stamp, Answered) {
         let key = ConnKey {
             epoch: done.epoch,
             ..self.current()
         };
         let stamp = self.clock.stamp(key, None);
         // Offered borrowed, its header values raw, so a full journal refuses it before its body
-        // is copied or a value read (Codex r4178252055, r4179379938); the journal reads them
-        // as the codec is handed them. A failure holds no byte of a response, so it is
-        // journaled even by a credentialed session (Codex r4179310275).
-        let journal = match &done.result {
-            Ok(_) => self.input_journal(done.class, stamp.recv_wall),
-            Err(_) => self.journal.as_ref(),
-        };
-        if let Some(journal) = journal {
+        // is copied (Codex r4178252055, r4179379938); the journal reads them as the codec is
+        // handed them, and so does the codec, asked for its spans first. A failure holds no byte
+        // of a response and has nothing to name.
+        if let Some(journal) = &self.journal {
+            let codec = codec.filter(|_| done.epoch == self.current().epoch);
+            let spans = with_response(&done.result, |resp| {
+                resp.map(|r| self.spans(codec, Inbound::Http(done.tag, r)))
+            })
+            .unwrap_or_default();
             let headers: Vec<(&str, &[u8])> = match &done.result {
                 Ok(r) => r
                     .headers()
@@ -1432,6 +1425,8 @@ impl<H: MdHandler> MdSession<H> {
                 status: r.status().as_u16(),
                 headers: &headers,
                 body: r.body(),
+                marks: spans.headers(),
+                body_redact: spans.body(),
             });
             let answer = RecordRef::HttpResult {
                 stamp,
@@ -1544,6 +1539,30 @@ fn with_response<R>(
         }
         Err(failure) => f(Err(*failure)),
     }
+}
+
+/// The credentials `codec` names in `input` ([`MdCodec::redact_inbound`]), and whether they
+/// were refused. Spans that do not fit `input` ([`InboundSpans::check`]) are a codec defect and
+/// are refused; then, as when there is no codec to ask, all of `input` is marked: the whole
+/// body and every header by name and value, so nothing no codec vouched for is journaled
+/// verbatim.
+fn inbound_spans(codec: Option<&dyn MdCodec>, input: Inbound<'_>) -> (InboundSpans, bool) {
+    let named = codec.map(|codec| codec.redact_inbound(input));
+    if let Some(spans) = named.as_ref().filter(|s| s.check(input).is_ok()) {
+        return (spans.clone(), false);
+    }
+    let (bytes, headers) = match input {
+        Inbound::Frame(frame) => (frame.bytes(), 0),
+        Inbound::Http(_, resp) => (resp.body, resp.headers.len()),
+    };
+    // A body past u32 cannot be journaled at all: the journal refuses it for its size.
+    let end = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+    let body = (end > 0).then_some(0..end).into_iter().collect();
+    let marks = (0..headers as u32).map(|at| (at, HeaderMark::NameAndValue));
+    (
+        InboundSpans::response(marks.collect(), body),
+        named.is_some(),
+    )
 }
 
 /// Whether `effect` asks a socket endpoint of stream `own` to reconnect, which ends its epoch.

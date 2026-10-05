@@ -453,10 +453,11 @@ async fn every_endpoint_a_venue_opens_records_into_its_one_journal() {
     }
 }
 
-/// Codex r4178197275: until a codec can mark the credential spans of what comes back (FBC-7lm),
-/// a session that has sent a credential journals none of what it receives verbatim.
+/// Codex r4178197275, FBC-s69: a session that has sent a credential journals what it receives
+/// with the credentials its codec names in it hashed (the key the venue echoes in a frame and a
+/// response header), withholding nothing.
 #[tokio::test]
-async fn a_session_that_sent_a_credential_journals_nothing_it_receives_verbatim() {
+async fn a_session_that_sent_a_credential_journals_what_it_receives_with_its_codecs_spans() {
     let (mut ws, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
     let seen = Seen::default();
     let venue = ToyVenue::leak();
@@ -486,27 +487,29 @@ async fn a_session_that_sent_a_credential_journals_nothing_it_receives_verbatim(
     let (run, ()) = tokio::join!(session.run(), script);
     run.unwrap();
     let kept = kept.borrow();
-    let lines: Vec<String> = kept.0.iter().map(line).collect();
+    // As the journal reads them back: every span blanked.
+    let lines: Vec<String> = kept.0.iter().map(|r| line(&r.blanked())).collect();
     assert!(lines.contains(&"in 0 trade|sym=A|px=1|qty=1|seq=1".to_owned()));
-    // The credential frame is journaled with its span; nothing received after it is.
-    assert!(lines.contains(&"out 0 auth|key=toy-secret".to_owned()));
+    assert!(lines.contains(&"out 0 auth|key=2222222222".to_owned()));
+    assert!(lines.contains(&"in 0 trade|sym=A|px=2|qty=1|seq=2|echo=2222222222".to_owned()));
     assert!(lines.contains(&"request 0 1 Get /snap".to_owned()));
     assert!(lines.contains(&"out 0 said".to_owned()));
     let inbound = lines.iter().filter(|l| l.starts_with("in ")).count();
     let results = lines.iter().filter(|l| l.starts_with("result ")).count();
-    assert_eq!((inbound, results), (2, 0), "{lines:#?}");
-    assert!(
-        !lines
-            .iter()
-            .any(|l| l.starts_with("in ") && l.contains("toy-secret"))
-    );
-    assert_eq!(session.counters().journal_withheld, 3);
+    assert_eq!((inbound, results), (4, 1), "{lines:#?}");
+    assert!(!lines.iter().any(|l| l.contains("toy-secret")));
+    let echo = kept.0.iter().find_map(|r| match r {
+        Record::HttpResult { result: Ok(r), .. } => r.headers.iter().find(|h| h.name == "x-echo"),
+        _ => None,
+    });
+    assert!(echo.unwrap().secret());
+    assert_eq!(session.counters().refused_redactions, 0);
 }
 
-/// A session whose endpoint URL carries a credential journals nothing it receives verbatim from
-/// its first frame on.
+/// A session whose endpoint URL carries a credential journals what it receives (FBC-s69), with
+/// the spans its codec names, from its first frame on.
 #[tokio::test]
-async fn a_session_whose_url_carries_a_credential_journals_nothing_it_receives_verbatim() {
+async fn a_session_whose_url_carries_a_credential_journals_what_it_receives() {
     let mut ws = ScriptedWs::start().await;
     let seen = Seen::default();
     let mut config = session(ToyVenue::leak(), ws.url());
@@ -531,9 +534,11 @@ async fn a_session_whose_url_carries_a_credential_journals_nothing_it_receives_v
     let (run, ()) = tokio::join!(session.run(), script);
     run.unwrap();
     let lines: Vec<String> = kept.borrow().0.iter().map(line).collect();
-    assert!(!lines.iter().any(|l| l.starts_with("in ")), "{lines:#?}");
+    assert!(
+        lines.contains(&"in 0 trade|sym=A|px=1|qty=1|seq=1".to_owned()),
+        "{lines:#?}"
+    );
     assert!(lines.contains(&"out 0 sub|add=A".to_owned()));
-    assert_eq!(session.counters().journal_withheld, 1);
 }
 
 /// A sink that takes `pause` to record an HTTP request, as a slow encode would.
@@ -582,9 +587,10 @@ async fn journaling_a_request_counts_against_its_timeout() {
     assert!(took >= ms(1_500) && took < ms(2_200), "{took:?}");
 }
 
-/// A request carrying a secret header makes the session credentialed: its response is withheld.
+/// A request carrying a secret header has its response journaled (FBC-s69), the header the codec
+/// marks in it hashed.
 #[tokio::test]
-async fn a_request_with_a_secret_header_withholds_its_response_from_the_journal() {
+async fn a_request_with_a_secret_header_has_its_response_journaled_with_its_codecs_marks() {
     let (mut ws, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
     let venue = ToyVenue::leak();
     let (mut session, control) = MdSession::new(session(venue, ws.url()), |_| {}).unwrap();
@@ -603,14 +609,20 @@ async fn a_request_with_a_secret_header_withholds_its_response_from_the_journal(
     };
     let (run, ()) = tokio::join!(session.run(), script);
     run.unwrap();
-    let lines: Vec<String> = kept.borrow().0.iter().map(line).collect();
+    let kept = kept.borrow();
+    let lines: Vec<String> = kept.0.iter().map(line).collect();
     assert!(lines.contains(&"request 0 4 Get /snap".to_owned()));
-    assert!(
-        !lines.iter().any(|l| l.starts_with("result ")),
-        "{lines:#?}"
-    );
-    // The request's own frame was journaled before it made the session credentialed.
-    assert_eq!(session.counters().journal_withheld, 1);
+    assert!(lines.contains(&"result 0 4 200".to_owned()), "{lines:#?}");
+    let result = kept
+        .0
+        .iter()
+        .find(|r| matches!(r, Record::HttpResult { .. }));
+    let Some(Record::HttpResult { result: Ok(r), .. }) = result else {
+        panic!("{lines:#?}")
+    };
+    let echo = r.headers.iter().find(|h| h.name == "x-echo").unwrap();
+    assert!(echo.redact && !echo.redact_name);
+    assert_eq!(session.counters().refused_redactions, 0);
 }
 
 /// A sink that keeps each record's kind only, for frames too large to keep.
@@ -748,68 +760,6 @@ async fn subscribes_frames_requests_and_results_are_offered_borrowed() {
     }));
 }
 
-/// Codex r4178287664: an input a credentialed session withholds leaves a gap the journal marks,
-/// so a recording of it never reads as complete.
-#[tokio::test]
-async fn withheld_inputs_leave_a_gap_the_journal_marks() {
-    let root = fresh_dir("md_journal_withheld");
-    let config = SinkConfig {
-        budget_bytes: 1 << 20,
-        soft_limit_pct: 85,
-    };
-    let (sink, drain) = journal_queue(config, key()).unwrap();
-    let writer = drain
-        .spawn(JournalWriter::create(&root, SHARD, key()).unwrap())
-        .unwrap();
-    let sink = Rc::new(RefCell::new(sink));
-    let mut ws = ScriptedWs::start().await;
-    let seen = Seen::default();
-    let (mut session, control) =
-        MdSession::new(session(ToyVenue::leak(), ws.url()), keep(&seen)).unwrap();
-    session.set_journal(Journal::new(sink.clone()));
-    let watch = seen.clone();
-    let script = async move {
-        let mut peer = ws.accept().await;
-        assert_eq!(peer.recv().await, "hello|codec=0|plan=1");
-        assert_eq!(peer.recv().await, "sub|add=A");
-        peer.send("auth");
-        assert_eq!(peer.recv().await, "auth|key=toy-secret");
-        peer.send("trade|sym=A|px=2|qty=1|seq=2|echo=toy-secret");
-        until(|| watch.borrow().len() == 1).await;
-        peer.send("say");
-        assert_eq!(peer.recv().await, "said");
-        drop(control);
-        assert_eq!(peer.next().await, None);
-    };
-    let (run, ()) = tokio::join!(session.run(), script);
-    run.unwrap();
-    writer.close().unwrap();
-    assert_eq!(session.counters().journal_withheld, 2);
-    let records = read_all(&root);
-    let lines: Vec<String> = records.iter().map(line).collect();
-    let tail: Vec<&str> = lines[lines.len() - 5..]
-        .iter()
-        .map(String::as_str)
-        .collect();
-    assert_eq!(
-        tail,
-        [
-            "write 0 Written",
-            "degraded",
-            "out 0 said",
-            "write 0 Written",
-            "close 0"
-        ],
-        "{lines:#?}"
-    );
-    let marker = &records[records.len() - 4];
-    assert!(matches!(
-        marker,
-        Record::Marker(Marker::Degraded { dropped: 2, .. })
-    ));
-    fs::remove_dir_all(&root).unwrap();
-}
-
 /// FBC-q7b's done line: a session journals the kind it sent each frame as. A binary frame
 /// whose only bytes that are not UTF-8 lie inside its redaction span is UTF-8 once blanked,
 /// and still reads back binary; the text frames read back text.
@@ -865,9 +815,9 @@ async fn a_session_journals_the_kind_it_sent_each_frame_as() {
 
 /// Codex r4178287660: a credentialed HTTP request is offered borrowed too, so a full journal
 /// refuses it before it is cloned; the journal hashes its Authorization value as it encodes it
-/// (Codex r4178567377, r4178860509). Its result is withheld unoffered.
+/// (Codex r4178567377, r4178860509). So is its result, with its codec's spans (FBC-s69).
 #[tokio::test]
-async fn a_credentialed_request_is_offered_borrowed_and_its_result_withheld() {
+async fn a_credentialed_request_and_its_result_are_offered_borrowed() {
     let (mut ws, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
     let venue = ToyVenue::leak();
     let (mut session, control) = MdSession::new(session(venue, ws.url()), |_| {}).unwrap();
@@ -891,9 +841,9 @@ async fn a_credentialed_request_is_offered_borrowed_and_its_result_withheld() {
         r#"subscribe 0 +["1"] -[]"#.to_owned(),
         format!("in 0 {get}"),
         "request 0 1 Get /snap".into(),
+        "result 0 1 200".into(),
     ];
     assert_eq!(sink.borrow().borrowed, borrowed);
-    assert_eq!(session.counters().journal_withheld, 1);
 }
 
 /// Codex r4178646794: a data frame read in the same poll as the control's drop reaches no codec,
@@ -948,8 +898,7 @@ async fn a_frame_read_as_the_control_drops_is_journaled_but_reaches_no_codec() {
 }
 
 /// Codex r4179310275: a credentialed request's failure holds no byte of the response, so it is
-/// journaled like any other, and replay can make the `on_http` call the live codec got; only a
-/// response is withheld.
+/// journaled like any other, and replay can make the `on_http` call the live codec got.
 #[tokio::test]
 async fn a_credentialed_requests_failure_is_journaled() {
     let mut ws = ScriptedWs::start().await;
@@ -977,7 +926,6 @@ async fn a_credentialed_requests_failure_is_journaled() {
         borrowed[3].starts_with("result 0 1 ") && !borrowed[3].ends_with(" 200"),
         "{borrowed:?}"
     );
-    assert_eq!(session.counters().journal_withheld, 0);
 }
 
 /// A sink that keeps each record's line and drops the session's control as the first

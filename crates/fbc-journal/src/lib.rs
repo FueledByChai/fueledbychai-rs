@@ -40,8 +40,9 @@
 //!
 //! **What is still written verbatim.** Whatever in inbound bytes the codec did not mark: a
 //! record built with [`Record::inbound`] or [`HttpResponseRec::from`] marks nothing, for a codec
-//! whose input holds no credential. The runtime journaling a session through its codec's
-//! `redact_inbound` is FBC-s69.
+//! whose input holds no credential. The runtime offers each inbound frame and response borrowed
+//! ([`RecordRef::Inbound`], [`ResponseRef`]) with the spans its codec's `redact_inbound` named
+//! (FBC-s69), and the journal refuses borrowed spans or header marks that do not fit them.
 
 mod error;
 pub mod format;

@@ -486,6 +486,7 @@ dependencies = [
  "fbc-core",
  "fbc-journal",
  "futures-util",
+ "hmac",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -493,10 +494,12 @@ dependencies = [
  "rcgen",
  "rust_decimal",
  "rustls",
+ "sha2",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
  "webpki-roots",
+ "zstd",
 ]
 
 [[package]]
