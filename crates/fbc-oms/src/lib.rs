@@ -32,8 +32,12 @@
 //! cumulative quantity raises the order's `cum_venue`. An order's filled quantity is
 //! the larger of the venue's cumulative count (`cum_venue`) and `cum_fills`, never their sum;
 //! a fill promotes a PendingNew or Unknown order, and the order is Filled only when its fills
-//! alone cover its total with no amend to a larger total in flight, which is checked again
-//! whenever the total or the amend in flight changes.
+//! alone cover every total the venue may hold, which is checked again whenever the total or
+//! the amends in flight change. An amend to a larger total counts as resting from when it is
+//! sent until a confirmation tied to it, or to a later amend, arrives, or until it is refused
+//! while no earlier amend is unconfirmed: an amended update stating no price or total is tied
+//! to the amend in flight only by a new venue id or a later venue ordering key, never by
+//! arriving later alone, since it may duplicate an older confirmation.
 //!
 //! Decision 0005's I1 (for order updates) and I2 are property-tested in `tests/lattice.rs`,
 //! I1 with fills and I3 in `tests/fills.rs` (decision 0037).
