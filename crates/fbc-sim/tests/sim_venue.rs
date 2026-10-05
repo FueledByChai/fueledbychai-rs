@@ -3599,3 +3599,19 @@ fn a_priority_keeping_amend_that_grows_where_its_level_is_unknown_is_refused() {
     assert_eq!(outcome_of(&got[1].1), Some((3, ACCEPTED)));
     assert_eq!(v.engine.queue_position(&a).unwrap().remaining, lots(1));
 }
+
+#[test]
+fn a_priority_keeping_amend_grows_into_what_trades_took_from_its_level() {
+    // Codex r4186693205: the level's size less what trades took that the book has not shown
+    // yet, as a placement judges it: one lot traded from a level of i64::MAX - 2 lots leaves
+    // room for the two-lot order there to grow to three.
+    let mut v = rich(Bracket::Middle, |o| o.amend = Some(amend_caps(Some(true))));
+    v.snapshot(T0, &[(199, i64::MAX - 2)], &[(201, 5)]);
+    let a = v.rest(limit(cid(), Side::Buy, 199, 2), 1, T0);
+    v.trade(T0 + 10 * MS, Aggressor::Seller, 199, 1);
+    let cmd = amend(OrderRef::Venue(a.clone()), Side::Buy, 199, 3, 0);
+    v.send(VenueCommand::Amend(cmd), 2, T0 + 20 * MS);
+    v.tick(T0 + 25 * MS);
+    assert_eq!(outcome_of(&v.events()[0].1), Some((2, ACCEPTED)));
+    assert_eq!(v.engine.queue_position(&a).unwrap().remaining, lots(3));
+}
