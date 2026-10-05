@@ -14,7 +14,7 @@ use fbc_core::{
 };
 
 use crate::config::{SimConfig, SimLatency};
-use crate::queue::{NewOrder, OrderKey, QueueConfig, QueueError, QueueModel, SimFill, TradeView};
+use crate::queue::{NewOrder, OrderKey, QueueConfig, QueueModel, SimFill, TradeView};
 use crate::wire::{
     Cancel, Command, FillRecord, OrderEvent, Place, Refusal, Reply, SimState, Target, WireError,
 };
@@ -34,8 +34,6 @@ pub enum SimError {
     Malformed(&'static str),
     /// A market-data event the book refused; the book is as `fbc-book` leaves it.
     Book(BookError),
-    /// The queue model refused a level cancel.
-    Queue(QueueError),
 }
 
 impl fmt::Display for SimError {
@@ -43,7 +41,6 @@ impl fmt::Display for SimError {
         match self {
             SimError::Malformed(what) => write!(f, "simulated order-entry frame: bad {what}"),
             SimError::Book(e) => write!(f, "simulated venue's book: {e}"),
-            SimError::Queue(e) => write!(f, "simulated venue's queue model: {e}"),
         }
     }
 }
@@ -324,27 +321,39 @@ impl SimEngine {
         }
         let book = self.trading_book(p.inst).ok_or(Refusal::NoBook)?;
         let top = book.top(usize::MAX).map_err(|_| Refusal::NoBook)?;
-        let opposite = match p.side {
-            Side::Buy => top.asks,
-            Side::Sell => top.bids,
+        let (opposite, maker_bid) = match p.side {
+            Side::Buy => (top.asks, false),
+            Side::Sell => (top.bids, true),
         };
-        let within = |lvl: &&fbc_core::Lvl| match (p.px, p.side) {
+        // What each opposite level still holds: trades printed there, or through it, whose
+        // shrink the book has not shown yet took their size first (Codex r4185186386), so a
+        // level they emptied is neither crossed nor taken from.
+        let opposite: Vec<(Ticks, Lots)> = opposite
+            .iter()
+            .map(|lvl| {
+                let credit = self.traded.get(&(p.inst, maker_bid, lvl.px)).copied();
+                let left = lvl.qty.checked_sub(credit.unwrap_or(Lots::ZERO));
+                (lvl.px, left.unwrap_or(Lots::ZERO))
+            })
+            .filter(|&(_, qty)| qty > Lots::ZERO)
+            .collect();
+        let within = |&&(lvl_px, _): &&(Ticks, Lots)| match (p.px, p.side) {
             (None, _) => true,
-            (Some(px), Side::Buy) => lvl.px <= px,
-            (Some(px), Side::Sell) => lvl.px >= px,
+            (Some(px), Side::Buy) => lvl_px <= px,
+            (Some(px), Side::Sell) => lvl_px >= px,
         };
         if p.post_only && opposite.first().is_some_and(|l| within(&l)) {
             return Err(Refusal::PostOnlyWouldCross);
         }
         let mut crossed = Vec::new();
         let mut left = p.qty;
-        for lvl in opposite.iter().filter(within) {
-            let qty = lvl.qty.min(left);
+        for &(px, size) in opposite.iter().filter(within) {
+            let qty = size.min(left);
             if qty == Lots::ZERO {
                 break;
             }
             left = left.checked_sub(qty).unwrap_or(Lots::ZERO);
-            crossed.push((lvl.px, qty));
+            crossed.push((px, qty));
         }
         // A fill-or-kill order that cannot fill whole takes nothing, so it needs no fee
         // (Codex r4182154743): fees are looked up only for the fills that will happen.
@@ -546,7 +555,10 @@ impl SimEngine {
             .and_then(|b| b.level(side, px).ok().flatten());
         self.books.apply(ev).map_err(SimError::Book)?;
         match before {
-            Some(before) => self.level_changed(inst, side, px, before, qty),
+            Some(before) => {
+                self.level_changed(inst, side, px, before, qty);
+                Ok(())
+            }
             // A snapshot's levels are compared at its end. Outside one, a level the book did
             // not know is a change too (Codex r4183669454): its size already reflects the
             // trades printed there, so they explain none of its next shrink.
@@ -576,10 +588,9 @@ impl SimEngine {
         };
         let before: Vec<_> = held.iter().map(|&(bid, px)| size(self, bid, px)).collect();
         self.books.apply(ev).map_err(SimError::Book)?;
-        let mut changed = Ok(());
         for (&(bid, px), before) in held.iter().zip(before) {
             if let (Some(before), Some(after)) = (before, size(self, bid, px)) {
-                changed = changed.and(self.level_changed(inst, side(bid), px, before, after));
+                self.level_changed(inst, side(bid), px, before, after);
             }
             // The snapshot restates every level, so it ends what the trades printed there
             // explain whatever it shows: a size equal to the one it replaced (Codex
@@ -587,7 +598,7 @@ impl SimEngine {
             // book does not reach (Codex r4182678488).
             self.traded.remove(&(inst, bid, px));
         }
-        changed
+        Ok(())
     }
 
     /// The trading book's level at `side` and `px` changed from `before` to `after`. The
@@ -601,25 +612,25 @@ impl SimEngine {
         px: Ticks,
         before: Lots,
         after: Lots,
-    ) -> Result<(), SimError> {
+    ) {
         // A repeat of the level's size is no change (Codex r4182448165): the trades still
         // explain its next one.
         if before == after {
-            return Ok(());
+            return;
         }
         let traded = self.traded.remove(&(inst, side == BookSide::Bid, px));
         let shrunk = before.checked_sub(after).unwrap_or(Lots::ZERO);
         let cancelled = shrunk
             .checked_sub(traded.unwrap_or(Lots::ZERO))
             .unwrap_or(Lots::ZERO);
-        let level_before = before
-            .checked_add(self.own(inst, side, px))
-            .unwrap_or(MAX_LOTS);
-        match self.queues.get_mut(&inst) {
-            Some(queue) if cancelled > Lots::ZERO => queue
-                .level_cancel(side, px, cancelled, level_before)
-                .map_err(SimError::Queue),
-            _ => Ok(()),
+        // The public size and the simulated orders there each fit in lots, but together may
+        // not (Codex r4185186401): the level's size before is counted in an i128, so the
+        // Middle bracket's share is never taken of a truncated level.
+        let own = self.own(inst, side, px);
+        let level_before = i128::from(before.get()) + i128::from(own.get());
+        if let Some(queue) = self.queues.get_mut(&inst) {
+            // `cancelled` is at most the public shrink, so at most `level_before`.
+            queue.level_cancel_wide(side, px, cancelled, level_before);
         }
     }
 

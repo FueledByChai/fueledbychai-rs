@@ -88,9 +88,10 @@ SimVenue is two halves joined by a simulated order-entry stream:
   simulated stream never disconnects and nothing would cancel what the venue cancels when it
   does (FBC-fji); cancels still go. A fill with a venue fill id always names its order's
   venue id and cumulative quantity, which `FillCaps` cannot yet say a venue's fills omit
-  (FBC-2g7). `resync` answers nothing (FBC-bq3). A crossing order meets only the displayed book:
-  not the venue's own resting orders, and two crossing orders between book updates can take the
-  same lots (FBC-4qr). Reduce-only is echoed, not enforced, since the engine keeps no position.
+  (FBC-2g7). `resync` answers nothing (FBC-bq3). A crossing order meets only the displayed book,
+  less what trades printed at or through a level have taken before the book shows it: not the
+  venue's own resting orders, and two crossing orders between book updates can take the same
+  lots (FBC-4qr). Reduce-only is echoed, not enforced, since the engine keeps no position.
   Of the spec's limits only the order size is judged; minimum notional, price band, trading
   status, position limit and open-order cap are FBC-205's.
 

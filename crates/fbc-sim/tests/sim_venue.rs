@@ -25,10 +25,7 @@ use fbc_core::{
     TrafficClass, UnderlyingId, VenueCaps, VenueCommand, VenueFeeSign, VenueId, VenueMeta,
     VenueOrderState, WallNs, dispatch,
 };
-use fbc_sim::{
-    Answer, Bracket, OrderKey, QueueConfig, QueueError, SimCodec, SimConfig, SimEngine, SimError,
-    SimLatency,
-};
+use fbc_sim::{Answer, Bracket, QueueConfig, SimCodec, SimConfig, SimEngine, SimError, SimLatency};
 use rust_decimal::Decimal;
 
 const NS: Namespace = Namespace::new(9);
@@ -1203,12 +1200,7 @@ fn the_engine_refuses_frames_and_events_it_cannot_read() {
         "simulated order-entry frame: bad rpc"
     );
     assert!(err.to_string().starts_with("simulated venue's book: "));
-    let queue = SimError::Queue(QueueError::ZeroQuantity(OrderKey(1)));
-    assert_eq!(
-        queue.to_string(),
-        "simulated venue's queue model: order 1 has no size"
-    );
-    let _: &dyn std::error::Error = &queue;
+    let _: &dyn std::error::Error = &err;
 }
 
 #[test]
@@ -2306,4 +2298,66 @@ fn a_venue_that_cancels_on_disconnect_is_not_stood_in_for_yet() {
         assert_eq!(refused.err(), Some(NotSentReason::Unsupported));
         assert!(v.encode(&cancel(OrderRef::Client(cid())), 2, T0).is_ok());
     }
+}
+
+#[test]
+fn a_crossing_order_takes_nothing_an_earlier_trade_already_took() {
+    // Codex r4185186386: a buy of five printed at 200 took the whole offer there before the
+    // book shows it gone. A crossing buy arriving in between takes its four lots at 201, and
+    // a post-only buy at 200 crosses nothing and rests.
+    let mut v = Venue::new(Bracket::Optimistic);
+    v.snapshot(T0, &[(198, 5)], &[(200, 5), (201, 4)]);
+    v.trade(T0 + MS, Aggressor::Buyer, 200, 5);
+    let taker = place(
+        cid(),
+        Side::Buy,
+        OrderKind::Limit { px: Ticks(201) },
+        4,
+        TifTag::Gtc,
+        false,
+    );
+    v.send(taker, 1, T0);
+    v.tick(T0 + 5 * MS);
+    let got = v.answers();
+    let fills: Vec<_> = got.iter().filter_map(|(_, ev)| fill_of(ev)).collect();
+    assert_eq!(
+        fills.iter().map(|f| (f.0, f.1)).collect::<Vec<_>>(),
+        [(201, 4)],
+        "{got:?}"
+    );
+    v.send(limit(cid(), Side::Buy, 200, 1), 2, T0 + 6 * MS);
+    v.tick(T0 + 11 * MS);
+    let got = v.answers();
+    assert_eq!(outcome_of(&got[0].1), Some((2, ACCEPTED)), "{got:?}");
+}
+
+#[test]
+fn a_level_whose_public_size_and_own_orders_pass_an_i64_still_advances_by_its_share() {
+    // Codex r4185186401: the order rests behind 2^61 public lots with 2^62 of its own. The
+    // public size grows to 2^62 + 2^61, so the level holds 2^63 + 2^61 lots in all, then
+    // shrinks back by 2^62 with no trade: the Middle bracket advances the order by
+    // floor(2^62 × 2^61 / (2^63 + 2^61)) = floor(2^62 / 5), not by a share of a level
+    // truncated to an i64, so a trade a little smaller than what is left ahead fills nothing.
+    let p = 1_i64 << 61;
+    let mut v = Venue::new(Bracket::Middle);
+    v.snapshot(T0, &[(199, p)], &[(201, 5)]);
+    v.send(limit(cid(), Side::Buy, 199, 1 << 62), 1, T0);
+    v.tick(T0 + 5 * MS);
+    assert_eq!(v.answers().len(), 2);
+    v.level(T0 + 6 * MS, BookSide::Bid, 199, (1 << 62) + p);
+    v.level(T0 + 7 * MS, BookSide::Bid, 199, p);
+    let ahead = p - (1 << 62) / 5;
+    v.trade(T0 + 8 * MS, Aggressor::Seller, 199, ahead);
+    let got = v.answers();
+    assert!(got.is_empty(), "{got:?}");
+    v.trade(T0 + 9 * MS, Aggressor::Seller, 199, 1);
+    let got = v.answers();
+    assert_eq!(
+        got.iter()
+            .filter_map(|(_, ev)| fill_of(ev))
+            .map(|f| f.1)
+            .sum::<i64>(),
+        1,
+        "{got:?}"
+    );
 }

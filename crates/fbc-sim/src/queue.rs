@@ -265,10 +265,24 @@ impl QueueModel {
                 level_before,
             });
         }
+        self.level_cancel_wide(side, px, cancelled, i128::from(level_before.get()));
+        Ok(())
+    }
+
+    /// [`QueueModel::level_cancel`] for a level whose size before, its public size and its
+    /// modelled orders together, may pass an `i64` of lots (Codex r4185186401). The caller
+    /// keeps `cancelled` at most `level_before`.
+    pub(crate) fn level_cancel_wide(
+        &mut self,
+        side: BookSide,
+        px: Ticks,
+        cancelled: Lots,
+        level_before: i128,
+    ) {
         if cancelled == Lots::ZERO {
-            return Ok(());
+            return;
         }
-        let (d, before) = (i128::from(cancelled.get()), i128::from(level_before.get()));
+        let (d, before) = (i128::from(cancelled.get()), level_before);
         for held in self.orders.values_mut() {
             let pos = &mut held.pos;
             if pos.side.book_side() != side || pos.px != px {
@@ -283,7 +297,6 @@ impl QueueModel {
             };
             pos.ahead = lots(ahead - advance);
         }
-        Ok(())
     }
 
     /// `added` lots of public size, not a modelled order, joined the level at `side` and
