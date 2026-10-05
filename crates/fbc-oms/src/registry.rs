@@ -27,6 +27,9 @@ pub struct Registry {
     caps: PreTradeCaps,
     by_vid: HashMap<VenueOrderId, ClientOrderId>,
     inventory: HashMap<InstrumentId, SignedLots>,
+    /// The markets whose starting position the consumer gave from the venue
+    /// ([`Registry::seed_position`]): only on them is the inventory the position.
+    seeded: HashSet<InstrumentId>,
     /// The ledger whose fills the registry applies: the first one it was given.
     ledger: Option<u64>,
     /// The ladder's queries out, by request.
@@ -103,6 +106,10 @@ pub enum OmsError {
     /// The batch names more than one market: a batch is one market's command, so none of it
     /// was built.
     MixedMarkets,
+    /// The market's position was already seeded.
+    PositionSeeded(InstrumentId),
+    /// A fill moved the market's inventory before its position was seeded.
+    PositionMoved(InstrumentId),
 }
 
 impl fmt::Display for OmsError {
@@ -135,6 +142,13 @@ impl fmt::Display for OmsError {
             }
             OmsError::Capped(refusal) => write!(f, "refused by a pre-trade cap: {refusal}"),
             OmsError::MixedMarkets => write!(f, "a batch of places names more than one market"),
+            OmsError::PositionSeeded(inst) => {
+                write!(f, "the position on {inst:?} was already seeded")
+            }
+            OmsError::PositionMoved(inst) => write!(
+                f,
+                "a fill moved the inventory on {inst:?} before its position was seeded"
+            ),
         }
     }
 }
@@ -192,7 +206,7 @@ impl Registry {
             inst,
             side,
             cap: self.caps.market(inst),
-            pos: self.inventory(inst),
+            pos: self.seeded.contains(&inst).then(|| self.inventory(inst)),
             others: self.resting_except(inst, side, except),
         }
     }
@@ -302,7 +316,31 @@ impl Registry {
         Routed::Ours(cid, applied)
     }
 
-    /// The inventory on `inst` the accepted fills moved: positive is long.
+    /// Seeds the position on `inst` from the venue (its snapshot at session start), from which
+    /// the fills the ledger accepts then move it. Until a market is seeded its position is
+    /// unknown and the pre-trade caps admit no place or amend on it
+    /// ([`CapRefusal::PositionUnknown`]). Refused once the market is seeded, and once a fill
+    /// moved its inventory before it was seeded: how such a fill is counted against the
+    /// snapshot is the resync's (FBC-38r), so the market stays unknown and admits nothing.
+    pub fn seed_position(&mut self, inst: InstrumentId, pos: SignedLots) -> Result<(), OmsError> {
+        if self.seeded.contains(&inst) {
+            return Err(OmsError::PositionSeeded(inst));
+        }
+        if self.inventory.contains_key(&inst) {
+            return Err(OmsError::PositionMoved(inst));
+        }
+        self.inventory.insert(inst, pos);
+        self.seeded.insert(inst);
+        Ok(())
+    }
+
+    /// Whether the position on `inst` was seeded from the venue ([`Registry::seed_position`]).
+    pub fn position_known(&self, inst: InstrumentId) -> bool {
+        self.seeded.contains(&inst)
+    }
+
+    /// The inventory on `inst`: the position seeded from the venue, if any, moved by the
+    /// accepted fills; positive is long.
     pub fn inventory(&self, inst: InstrumentId) -> SignedLots {
         self.inventory.get(&inst).copied().unwrap_or(SignedLots(0))
     }

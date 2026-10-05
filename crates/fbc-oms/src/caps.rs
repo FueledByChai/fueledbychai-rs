@@ -12,6 +12,8 @@
 //!
 //! Quantities are in the market's lots: the consumer converts a notional cap at the price it
 //! chooses. A market the configuration does not name admits no order: there is no default.
+//! Nor does a market whose position was not seeded from the venue: the worst case starts from
+//! the position, which is unknown until then.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -55,6 +57,10 @@ impl PreTradeCaps {
 pub enum CapRefusal {
     /// The consumer configured no cap for the market: it admits nothing.
     NoCap(InstrumentId),
+    /// The market's position was not seeded from the venue
+    /// ([`Registry::seed_position`](crate::Registry::seed_position)): the worst case is not
+    /// known, so it admits nothing.
+    PositionUnknown(InstrumentId),
     /// The worst-case position on `side` with the order admitted, `worst`, would exceed the
     /// inventory cap `cap` (0005's I6); `worst` is `None` when it does not fit a lot count.
     InventoryCap {
@@ -70,6 +76,9 @@ impl fmt::Display for CapRefusal {
         match self {
             CapRefusal::NoCap(inst) => {
                 write!(f, "no inventory cap is configured for {inst:?}")
+            }
+            CapRefusal::PositionUnknown(inst) => {
+                write!(f, "the position on {inst:?} was not seeded from the venue")
             }
             CapRefusal::InventoryCap {
                 inst,
@@ -100,14 +109,15 @@ impl fmt::Display for CapRefusal {
 
 impl std::error::Error for CapRefusal {}
 
-/// What one side of a market holds before an order is judged: its cap, the position and the
-/// quantity our other orders on that side may have resting (`None` when the sum does not fit).
+/// What one side of a market holds before an order is judged: its cap, the position (`None`
+/// until it is seeded from the venue) and the quantity our other orders on that side may have
+/// resting (`None` when the sum does not fit).
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct Exposure {
     pub(crate) inst: InstrumentId,
     pub(crate) side: Side,
     pub(crate) cap: Option<MarketCaps>,
-    pub(crate) pos: SignedLots,
+    pub(crate) pos: Option<SignedLots>,
     pub(crate) others: Option<Lots>,
 }
 
@@ -118,10 +128,11 @@ impl Exposure {
     pub(crate) fn admit(&self, new: Lots) -> Result<(), CapRefusal> {
         let (inst, side) = (self.inst, self.side);
         let cap = self.cap.ok_or(CapRefusal::NoCap(inst))?.inventory;
+        let pos = self.pos.ok_or(CapRefusal::PositionUnknown(inst))?;
         let worst = self
             .others
             .and_then(|resting| resting.checked_add(new))
-            .and_then(|total| self.pos.checked_add(SignedLots::of(side, total)))
+            .and_then(|total| pos.checked_add(SignedLots::of(side, total)))
             .and_then(SignedLots::abs_lots);
         match worst {
             Some(worst) if worst <= cap => Ok(()),
