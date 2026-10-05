@@ -15,14 +15,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::toy::{self, ToyVenue};
-use common::{ScriptedHttp, ScriptedWs};
+use common::{ScriptedHttp, ScriptedWs, heard_binary};
 use fbc_core::{
     ConnKey, EndpointPlan, Envelope, MdEvent, MdTransport, Stamp, TrafficClass, VenueConfig,
     WallNs, WireUrl,
 };
 use fbc_journal::{
-    BLANK, ControlEvent, HeaderRec, JournalReader, JournalSink, JournalWriter, Marker, QueueSink,
-    Record, RecordRef, Recorded, RedactionKey, SinkConfig, journal_queue,
+    BLANK, ControlEvent, HeaderRec, JournalReader, JournalSink, JournalWriter, Marker, Opcode,
+    QueueSink, Record, RecordRef, Recorded, RedactionKey, SinkConfig, journal_queue,
 };
 use fbc_runtime::{
     Connector, IngestClock, Input, Journal, Liveness, MdSession, MdSessionConfig, MdVenue,
@@ -807,6 +807,59 @@ async fn withheld_inputs_leave_a_gap_the_journal_marks() {
         marker,
         Record::Marker(Marker::Degraded { dropped: 2, .. })
     ));
+    fs::remove_dir_all(&root).unwrap();
+}
+
+/// FBC-q7b's done line: a session journals the kind it sent each frame as. A binary frame
+/// whose only bytes that are not UTF-8 lie inside its redaction span is UTF-8 once blanked,
+/// and still reads back binary; the text frames read back text.
+#[tokio::test]
+async fn a_session_journals_the_kind_it_sent_each_frame_as() {
+    let root = fresh_dir("md_journal_opcode");
+    let config = SinkConfig {
+        budget_bytes: 1 << 20,
+        soft_limit_pct: 85,
+    };
+    let (sink, drain) = journal_queue(config, key()).unwrap();
+    let writer = drain
+        .spawn(JournalWriter::create(&root, SHARD, key()).unwrap())
+        .unwrap();
+    let mut ws = ScriptedWs::start().await;
+    let (mut session, control) =
+        MdSession::new(session(ToyVenue::leak(), ws.url()), |_| {}).unwrap();
+    session.set_journal(Journal::new(Rc::new(RefCell::new(sink))));
+    let script = async move {
+        let mut peer = ws.accept().await;
+        assert_eq!(peer.recv().await, "hello|codec=0|plan=1");
+        assert_eq!(peer.recv().await, "sub|add=A");
+        peer.send("bauth");
+        assert_eq!(peer.recv().await, heard_binary(toy::BINARY_AUTH));
+        peer.send("say");
+        assert_eq!(peer.recv().await, "said");
+        drop(control);
+        assert_eq!(peer.next().await, None);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    writer.close().unwrap();
+    let sent: Vec<(Opcode, Vec<u8>)> = read_all(&root)
+        .into_iter()
+        .filter_map(|r| match r {
+            Record::Outbound { opcode, frame, .. } => Some((opcode, frame.bytes().to_vec())),
+            _ => None,
+        })
+        .collect();
+    let key_at = b"bauth|key=".len();
+    let mut blanked = toy::BINARY_AUTH[..key_at].to_vec();
+    blanked.resize(toy::BINARY_AUTH.len(), BLANK);
+    assert!(std::str::from_utf8(&blanked).is_ok());
+    let want = [
+        (Opcode::Text, b"hello|codec=0|plan=1".to_vec()),
+        (Opcode::Text, b"sub|add=A".to_vec()),
+        (Opcode::Binary, blanked),
+        (Opcode::Text, b"said".to_vec()),
+    ];
+    assert_eq!(sent, want);
     fs::remove_dir_all(&root).unwrap();
 }
 

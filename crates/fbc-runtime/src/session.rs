@@ -110,7 +110,9 @@ use fbc_core::{
     Subscription, TimerTag, TrafficClass, VenueCaps, VenueConfig, VenueFactory, VenueMeta, Via,
     WallNs, WireSlice, dispatch_market_data,
 };
-use fbc_journal::{ControlEvent, Record, RecordRef, ResponseRef, WriteRes, is_secret_header};
+use fbc_journal::{
+    ControlEvent, Opcode, Record, RecordRef, ResponseRef, WriteRes, is_secret_header,
+};
 use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use tokio::sync::watch;
@@ -1232,6 +1234,12 @@ impl<H: MdHandler> MdSession<H> {
                 ) if stream == own => {
                     let bytes = frame.bytes();
                     let text = std::str::from_utf8(bytes).map(Message::text);
+                    // The kind it is sent as is journaled with it (FBC-q7b): its bytes once
+                    // blanked may not say.
+                    let opcode = match text {
+                        Ok(_) => Opcode::Text,
+                        Err(_) => Opcode::Binary,
+                    };
                     let message = text.unwrap_or_else(|_| Message::binary(bytes.to_vec()));
                     let (conn, rpc) = (self.current(), rpc.map(|call| call.id));
                     if !frame.redactions().is_empty() {
@@ -1242,6 +1250,7 @@ impl<H: MdHandler> MdSession<H> {
                         at,
                         conn,
                         rpc,
+                        opcode,
                         frame,
                     });
                     open = self.write(ws, codec, message, &mut effects).await?;

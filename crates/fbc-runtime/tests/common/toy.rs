@@ -15,7 +15,9 @@
 //! `odd` asks for a frame and a reconnect on another stream, which a session refuses;
 //! `cancel|id=<n>` asks to send the cancel-shaped frame `cancel|id=<n>` as Safety traffic (FBC-f3w:
 //! the runtime treats a write by its class, not its content); `auth` asks to send
-//! `auth|key=toy-secret` with the key marked as a redaction span, as a codec sends a credential.
+//! `auth|key=toy-secret` with the key marked as a redaction span, as a codec sends a credential;
+//! `bauth` asks to send [`BINARY_AUTH`] as a binary frame, its key (the only bytes that are not
+//! UTF-8) marked as a redaction span (FBC-q7b).
 //! Book channel `b` of instrument `A`: `begin|sym=A|book=<b>|epoch=<e>|seq=<n>` begins a
 //! snapshot and anchors the channel's sequence; `lvl|sym=A|book=<b>|side=bid|px=<ticks>|qty=<lots>|seq=<n>`
 //! sets a level (in the snapshot or as a delta) and `end|sym=A|book=<b>|seq=<n>` ends the
@@ -401,6 +403,10 @@ fn keepalive(spec: &str) -> Keepalive {
 
 const CONTROL: RateCharge = RateCharge::one(OpKind::Control, None);
 
+/// The binary frame `bauth` asks to send: its key, the bytes after `bauth|key=`, is the only
+/// part that is not UTF-8.
+pub const BINARY_AUTH: &[u8] = b"bauth|key=\xff\xfe\x80";
+
 fn send(stream: StreamId, text: String) -> Effect {
     send_as(TrafficClass::Normal, stream, text)
 }
@@ -710,6 +716,18 @@ impl ToyMd {
                 let text = "auth|key=toy-secret";
                 let span = "auth|key=".len() as u32..text.len() as u32;
                 let frame = WireSlice::redacted(text.as_bytes().to_vec(), vec![span])
+                    .expect("the span lies inside the frame");
+                fx.push(Effect::Send {
+                    stream: self.stream,
+                    frame,
+                    rpc: None,
+                    class: TrafficClass::Normal,
+                    charge: CONTROL,
+                });
+            }
+            "bauth" => {
+                let span = "bauth|key=".len() as u32..BINARY_AUTH.len() as u32;
+                let frame = WireSlice::redacted(BINARY_AUTH.to_vec(), vec![span])
                     .expect("the span lies inside the frame");
                 fx.push(Effect::Send {
                     stream: self.stream,

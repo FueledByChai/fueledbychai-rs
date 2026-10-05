@@ -303,6 +303,7 @@ fn an_epochs_codec_is_built_for_its_opening_subscription_and_answers_what_came_b
             at: MonoNs(1),
             conn: conn(0),
             rpc: None,
+            opcode: Opcode::Text,
             frame: WireSlice::plain(b"hello".to_vec()),
         },
         result(1, 0, 7, &trade(1)),

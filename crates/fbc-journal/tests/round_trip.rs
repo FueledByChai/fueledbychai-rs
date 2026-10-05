@@ -155,6 +155,7 @@ fn session() -> Session {
             at: MonoNs(11),
             conn: conn(1),
             rpc: Some(RpcId(40)),
+            opcode: Opcode::Text,
             frame,
         },
     ));
@@ -304,6 +305,7 @@ fn session() -> Session {
             at: MonoNs(31),
             conn: conn(1),
             rpc: None,
+            opcode: Opcode::Text,
             frame: WireSlice::plain(b"{\"op\":\"ping\"}".to_vec()),
         },
     ));

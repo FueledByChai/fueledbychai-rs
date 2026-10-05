@@ -23,8 +23,13 @@
 //! is (their spans hashed, the rest verbatim), and a header is a flag byte (0 plain, 1 its
 //! value secret, 2 its name and value secret) then its name and its value, each secret one as
 //! its length and its hash. Versions 2 and 3 wrote a header's name before its flag, and an
-//! inbound frame's bytes and a response's body whole. The reader reads versions 2, 3 and 4, so
-//! a journal written before reads back unchanged.
+//! inbound frame's bytes and a response's body whole.
+//!
+//! Version 5 (FBC-q7b) writes the kind an outbound frame was sent as: an `Outbound` record has
+//! an opcode byte after its `rpc`. Versions 2 to 4 kept no kind, and their outbound frames read
+//! back with the kind their blanked bytes imply ([`Opcode::of`]), which is binary only when a
+//! byte that is not UTF-8 lies outside the spans. The reader reads versions 2 to 5, so a
+//! journal written before reads back unchanged.
 
 use core::ops::Range;
 
@@ -46,8 +51,9 @@ pub const MAGIC: [u8; 4] = *b"FBCJ";
 /// The format version this crate writes. Version 1 (FBC-aen) wrote no hash for a span;
 /// version 2 writes each span's keyed hash (FBC-apz); version 3 adds the `Nonce`, `EncodeCtx`
 /// and `Cycle` kinds (FBC-ec9); version 4 hashes the spans a codec names in inbound frames,
-/// response bodies and response header names (FBC-7lm).
-pub const VERSION: u16 = 4;
+/// response bodies and response header names (FBC-7lm); version 5 keeps the kind an outbound
+/// frame was sent as (FBC-q7b).
+pub const VERSION: u16 = 5;
 /// The oldest format version this crate reads: version 1 is refused (0024).
 pub const OLDEST_READABLE: u16 = 2;
 /// The most bytes one record may redact, its spans and secret header values together.
@@ -255,13 +261,28 @@ fn encode_body(
             at,
             conn,
             rpc,
+            opcode,
             frame,
         } => {
             e.u8(OUTBOUND);
             e.u64(at.0);
             e.conn(*conn);
             e.rpc(*rpc);
-            e.spanned(frame.bytes(), frame.redactions())?;
+            e.u8(opcode_byte(*opcode));
+            let (bytes, spans) = (frame.bytes(), frame.redactions());
+            // A text frame must stay UTF-8 blanked: its bytes UTF-8 and its spans on character
+            // boundaries. Checked before the payload is copied, and only for a payload that
+            // fits after the fields before it, as an inbound frame's is.
+            if e.write
+                && *opcode == Opcode::Text
+                && bytes.len() <= e.room()
+                && (core::str::from_utf8(bytes).is_err() || check_redactions(bytes, spans).is_err())
+            {
+                return Err(JournalError::Unencodable(
+                    "a text frame that is not UTF-8 once blanked",
+                ));
+            }
+            e.spanned(bytes, spans)?;
         }
         Record::WriteResult {
             at,
@@ -875,15 +896,27 @@ pub(crate) fn decode_version(body: &[u8], version: u16) -> Result<(Record, Vec<S
                 redact,
             }
         }
-        OUTBOUND => Record::Outbound {
-            at: MonoNs(d.u64()?),
-            conn: d.conn()?,
-            rpc: d.rpc()?,
-            frame: {
-                let (bytes, spans) = d.spanned()?;
-                WireSlice::redacted(bytes, spans).map_err(|_| "redaction spans")?
-            },
-        },
+        OUTBOUND => {
+            let (at, conn, rpc) = (MonoNs(d.u64()?), d.conn()?, d.rpc()?);
+            let kept = if version >= 5 {
+                Some(d.pick(&OPCODES, "opcode")?)
+            } else {
+                None
+            };
+            let (bytes, spans) = d.spanned()?;
+            // Before version 5, the kind the blanked bytes imply.
+            let opcode = kept.unwrap_or_else(|| Opcode::of(&bytes));
+            if opcode == Opcode::Text && core::str::from_utf8(&bytes).is_err() {
+                return Err("text frame");
+            }
+            Record::Outbound {
+                at,
+                conn,
+                rpc,
+                opcode,
+                frame: WireSlice::redacted(bytes, spans).map_err(|_| "redaction spans")?,
+            }
+        }
         WRITE_RESULT => Record::WriteResult {
             at: MonoNs(d.u64()?),
             conn: d.conn()?,
@@ -1248,6 +1281,7 @@ mod tests {
                 at: MonoNs(1),
                 conn: conn(),
                 rpc: None,
+                opcode: Opcode::Binary,
                 frame: WireSlice::redacted(big.clone(), vec![0..1, 2..3]).unwrap(),
             },
             Record::HttpResult {
@@ -1435,14 +1469,93 @@ mod tests {
             at: MonoNs(1),
             conn: conn(),
             rpc: Some(RpcId(4)),
+            opcode: Opcode::Text,
             frame,
         };
         encode(&r, &key(), &mut body).unwrap();
         body
     }
 
-    /// Bytes of an Outbound record up to its span list: kind, at, conn, rpc.
-    const OUTBOUND_HEAD: usize = 1 + 8 + 6 + 1 + 8;
+    /// Bytes of an Outbound record up to its span list: kind, at, conn, rpc, opcode.
+    const OUTBOUND_HEAD: usize = 1 + 8 + 6 + 1 + 8 + 1;
+
+    /// `good_outbound` as a version 4 writer wrote it: with no opcode byte.
+    fn v4_outbound(body: &[u8]) -> Vec<u8> {
+        [&body[..OUTBOUND_HEAD - 1], &body[OUTBOUND_HEAD..]].concat()
+    }
+
+    /// An outbound frame with `good_outbound`'s head.
+    fn outbound(opcode: Opcode, bytes: &[u8], span: Option<Range<u32>>) -> Record {
+        Record::Outbound {
+            at: MonoNs(1),
+            conn: conn(),
+            rpc: Some(RpcId(4)),
+            opcode,
+            frame: WireSlice::redacted(bytes.to_vec(), span.into_iter().collect()).unwrap(),
+        }
+    }
+
+    /// FBC-q7b: an outbound frame keeps the kind it was sent as, a binary one that is UTF-8
+    /// once blanked included; a version 4 body, which kept none, reads back with the kind its
+    /// blanked bytes imply.
+    #[test]
+    fn an_outbound_frame_keeps_its_kind_and_an_older_one_reads_with_the_kind_its_bytes_imply() {
+        let inside = outbound(Opcode::Binary, b"k=\xff\xfe;", Some(2..4));
+        let outside = outbound(Opcode::Binary, b"\xc3(k=ab", Some(4..6));
+        let text = outbound(Opcode::Text, "k=\u{e9}t\u{e9};".as_bytes(), Some(2..4));
+        for record in [&inside, &outside, &text] {
+            let back = round_trip(record);
+            assert_eq!(back, record.blanked());
+            let mut body = Vec::new();
+            encode(record, &key(), &mut body).unwrap();
+            let Record::Outbound { opcode, frame, .. } =
+                decode_version(&v4_outbound(&body), 4).unwrap().0
+            else {
+                unreachable!()
+            };
+            assert_eq!(opcode, Opcode::of(frame.bytes()));
+        }
+        let kind = |r: &Record| match r {
+            Record::Outbound { opcode, .. } => *opcode,
+            _ => unreachable!(),
+        };
+        assert_eq!(kind(&round_trip(&inside)), Opcode::Binary);
+        let mut body = Vec::new();
+        encode(&inside, &key(), &mut body).unwrap();
+        let old = decode_version(&v4_outbound(&body), 4).unwrap().0;
+        assert_eq!(kind(&old), Opcode::Text);
+        assert_eq!(Opcode::of(b"\xff"), Opcode::Binary);
+    }
+
+    /// FBC-q7b: a text frame stays UTF-8 once blanked, so one that is not UTF-8, or whose span
+    /// splits a character, is refused, and a damaged segment's text frame that is not UTF-8 or
+    /// opcode of no known kind is malformed.
+    #[test]
+    fn an_outbound_text_frame_must_be_utf8_once_blanked() {
+        let not_utf8 = outbound(Opcode::Text, b"a\xff", None);
+        let split = outbound(Opcode::Text, "\u{e9}t\u{e9}".as_bytes(), Some(1..3));
+        for record in [&not_utf8, &split] {
+            let mut body = Vec::new();
+            assert!(matches!(
+                encode(record, &key(), &mut body),
+                Err(JournalError::Unencodable(
+                    "a text frame that is not UTF-8 once blanked"
+                ))
+            ));
+            assert!(body.is_empty());
+            // One too large for the room left is refused for its size, unscanned.
+            assert!(matches!(
+                encode_within(record, &key(), &mut body, OUTBOUND_HEAD + 1),
+                Err(JournalError::TooLarge)
+            ));
+        }
+        let mut body = Vec::new();
+        encode(&outbound(Opcode::Binary, b"a\xff", None), &key(), &mut body).unwrap();
+        body[OUTBOUND_HEAD - 1] = opcode_byte(Opcode::Text);
+        assert_eq!(decode(&body), Err("text frame"));
+        body[OUTBOUND_HEAD - 1] = 2;
+        assert_eq!(decode(&body), Err("opcode"));
+    }
 
     /// An Outbound body with these content fields after its head.
     fn outbound_with(tail: &[u8]) -> Vec<u8> {
@@ -1539,6 +1652,7 @@ mod tests {
             at: MonoNs(1),
             conn: conn(),
             rpc: None,
+            opcode: Opcode::Binary,
             frame: WireSlice::redacted(vec![7; len as usize + 2], vec![0..1, 2..len as u32 + 1])
                 .unwrap(),
         };
@@ -1613,9 +1727,12 @@ mod tests {
             assert_eq!(decode_version(&body, 3).unwrap().0, record);
             assert_eq!(decode_version(&body, 2), Err("record kind"));
         }
-        // The version 2 kinds read the same in either version.
-        let body = good_outbound();
+        // The version 2 kinds read the same in versions 2 to 4, and as version 5 reads them
+        // with the opcode they were sent with.
+        let body = v4_outbound(&good_outbound());
         assert_eq!(decode_version(&body, 2), decode_version(&body, 3));
+        assert_eq!(decode_version(&body, 2), decode_version(&body, 4));
+        assert_eq!(decode_version(&body, 2), decode(&good_outbound()));
     }
 
     #[test]
@@ -2155,6 +2272,7 @@ mod tests {
                     at: MonoNs(self.next()),
                     conn: conn(),
                     rpc: self.rpc(),
+                    opcode: Opcode::Binary,
                     frame: self.slice(),
                 },
                 1 => Record::WriteResult {

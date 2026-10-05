@@ -207,8 +207,9 @@ rather than guess.
     limit for Normal records and a Safety reserve, drops counted by class, a `Degraded` marker
     once space returns, and a writer thread draining it; the nonce, encode-context and cycle
     records arrived in format version 3, and the keyed hashes of the credential spans a codec
-    names in inbound frames and responses (`redact_inbound`, 0028) in version 4, whose reader
-    still reads version 2 and 3 journals), `crates/fbc-sim` (simulated venue and queue-position
+    names in inbound frames and responses (`redact_inbound`, 0028) in version 4, and the kind
+    each outbound frame was sent as in version 5, whose reader still reads version 2 to 4
+    journals), `crates/fbc-sim` (simulated venue and queue-position
     fill-model code, never calibrations; it depends on `fbc-core` and `fbc-book` only: so far
     `QueueModel`, each modelled order's place in its level's queue under a `Bracket`
     (Pessimistic, Middle, Optimistic) from a `QueueConfig` with no `Default`, queued on arrival
