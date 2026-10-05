@@ -12,6 +12,7 @@ mod exec_toy;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
+use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, ThreadId};
@@ -27,12 +28,13 @@ use fbc_core::{
     HttpTag, Inbound, InboundSpans, InstrumentSpecDraft, MdCodec, MdTransport, ModeScope, MonoNs,
     NonceBlock, NonceSource, NotSentReason, OpKind, PathStamps, RateCharge, RawFrame, RpcId,
     Secrets, SpecTable, StreamId, Subscription, SymbolError, TimerTag, TrafficClass, VenueCaps,
-    VenueCommand, VenueConfig, VenueError, VenueFactory, VenueMode, WallNs, WireSlice, WireUrl,
+    VenueCommand, VenueConfig, VenueError, VenueFactory, VenueMode, Via, WallNs, WireSlice,
+    WireUrl,
 };
 use fbc_runtime::{
     Connector, ExecControl, ExecCounters, ExecHandler, ExecSession, ExecSessionConfig,
     ExecSessionError, IngestClock, Input, ProxyConfig, RateError, RateLimiter, ReconnectPacing,
-    SafetyReserve, SessionError, Step, WriteStall,
+    Request, SafetyReserve, SessionError, Step, WriteStall,
 };
 use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
@@ -52,6 +54,8 @@ const CAPS: &str = "exec.caps";
 /// `none`: no codec; `refuse`: the codec is refused; `plain`: the toy's codec as it is, asking
 /// for no nonce. By default the toy's codec, recorded.
 const CODEC: &str = "exec.codec";
+/// Any value: the recorded codec's `on_open` also sends a frame heavier than the toy's limit.
+const HEAVY: &str = "exec.heavy";
 
 /// Every `on_open` call the recorded codec saw: its stream and context.
 type Opens = Arc<Mutex<Vec<(StreamId, EncodeCtx)>>>;
@@ -140,6 +144,7 @@ impl VenueFactory for ExecToy {
             None => Box::new(Recording {
                 inner: toy,
                 opens: self.opens.clone(),
+                heavy: cfg.get(HEAVY).is_some(),
             }),
         }))
     }
@@ -155,13 +160,15 @@ impl VenueFactory for ExecToy {
 
 /// The conformance toy's codec, recording each `on_open` and asking a resync after the
 /// authentication. Its `on_open` asks for two nonces on the first epoch, three on the second,
-/// and so on, so each epoch's reservation differs. Three frames of the test's own: `stray`
+/// and so on, so each epoch's reservation differs. Frames of the test's own: `stray`
 /// asks for a timer, an HTTP request, and a frame and a reconnect on another stream, then
 /// sends `said`; `bye` asks to reconnect its stream, then for a timer and an HTTP request,
-/// which the reconnect leaves unreached.
+/// which the reconnect leaves unreached; `halt` pushes a `ResyncBegin` and asks to send
+/// `said`.
 struct Recording {
     inner: ToyExec,
     opens: Opens,
+    heavy: bool,
 }
 
 impl ExecCodec for Recording {
@@ -176,6 +183,18 @@ impl ExecCodec for Recording {
         self.opens.lock().unwrap().push((stream, ctx.clone()));
         self.inner.on_open(stream, ctx, fx);
         self.inner.resync(ctx, fx);
+        if self.heavy {
+            fx.push(Effect::Send {
+                stream,
+                frame: WireSlice::plain(b"heavy".to_vec()),
+                rpc: None,
+                class: TrafficClass::Safety,
+                charge: RateCharge {
+                    weight: NonZeroU32::new(51).unwrap(),
+                    ..RateCharge::one(OpKind::Control, None)
+                },
+            });
+        }
     }
 
     fn encode(
@@ -236,6 +255,14 @@ impl ExecCodec for Recording {
                     stream: other,
                     reason,
                 });
+                fx.push(send(stream));
+                Ok(())
+            }
+            RawFrame::Text("halt") => {
+                let begin = ExecEvent::ResyncBegin {
+                    watermark: WallNs(0),
+                };
+                sink.push(fbc_core::VenueMeta::NONE, begin);
                 fx.push(send(stream));
                 Ok(())
             }
@@ -704,7 +731,7 @@ async fn the_endpoint_opens_through_the_consumers_socks5_proxy_by_name() {
 }
 
 #[tokio::test]
-async fn a_nonce_source_that_reserves_another_count_ends_the_session() {
+async fn a_nonce_source_that_reserves_another_count_ends_the_session_and_retires_its_epoch() {
     let mut server = ScriptedWs::start().await;
     let (mut config, _) = setup(ExecToy::leak(), &server.url(), quick());
     let log = Arc::default();
@@ -714,22 +741,112 @@ async fn a_nonce_source_that_reserves_another_count_ends_the_session() {
         log,
     });
     let heard = Log::default();
-    let (mut session, _control) = ExecSession::new(config, Keep::new(&heard)).unwrap();
+    let (mut session, control) = ExecSession::new(config, Keep::new(&heard)).unwrap();
+    let short = ExecSessionError::Nonces {
+        asked: 2,
+        reserved: 1,
+    };
+    for epoch in 0..2 {
+        let script = async {
+            let mut peer = server.accept().await;
+            // Nothing was sent on the connection.
+            assert_eq!(peer.next().await, None);
+        };
+        let (run, ()) = tokio::join!(session.run(), script);
+        assert_eq!(run.err(), Some(short.clone()));
+        // The connection's epoch is retired, so running again stamps the next connection
+        // under the next epoch (Codex r4188802893).
+        assert_eq!(session.current(), key(epoch + 1));
+    }
+    drop(control);
+    let ends: Vec<_> = heard
+        .borrow()
+        .iter()
+        .map(|h| match h {
+            Heard::End(k) => *k,
+            Heard::Event(..) => panic!("{h:?}"),
+        })
+        .collect();
+    assert_eq!(ends, [key(0), key(1)]);
+}
+
+#[tokio::test]
+async fn a_write_the_codec_asks_for_with_the_event_that_stopped_the_session_is_not_sent() {
+    let mut server = ScriptedWs::start().await;
+    let (config, _) = setup(ExecToy::leak(), &server.url(), quick());
+    let log = Log::default();
+    let handler = Keep::new(&log);
+    let slot = Rc::clone(&handler.control);
+    let (mut session, control) = ExecSession::new(config, handler).unwrap();
+    *slot.borrow_mut() = Some(control);
     let script = async move {
         let mut peer = server.accept().await;
-        // Nothing was sent on the connection.
+        let _ = (peer.recv().await, peer.recv().await);
+        peer.send("halt");
+        // The handler stopped the session on the frame's event: its `said` never went out
+        // (Codex r4188802881).
         assert_eq!(peer.next().await, None);
     };
     let (run, ()) = tokio::join!(session.run(), script);
-    let err = run.err().unwrap();
-    assert_eq!(
-        err,
-        ExecSessionError::Nonces {
-            asked: 2,
-            reserved: 1
+    run.unwrap();
+    assert_eq!(log.borrow().len(), 2);
+    assert_eq!(session.current(), key(0));
+}
+
+#[tokio::test]
+async fn on_open_frames_the_buckets_refuse_for_now_end_the_epoch_and_go_once_there_is_room() {
+    let mut server = ScriptedWs::start().await;
+    let pacing = ReconnectPacing::new(ms(300), ms(300), 100, Duration::from_secs(60), ms(5_000));
+    let (config, _) = setup(ExecToy::leak(), &server.url(), pacing.unwrap());
+    // The account's whole budget of 50 a second, taken by another session sharing the limiter.
+    let shared = config.limiter.clone();
+    let taken = Request {
+        charge: RateCharge {
+            weight: NonZeroU32::new(50).unwrap(),
+            ..RateCharge::one(OpKind::Control, None)
+        },
+        via: Via::Frame,
+        class: TrafficClass::Safety,
+    };
+    let other = ConnKey { conn: 99, epoch: 0 };
+    shared.charge(Instant::now(), other, &[taken]).unwrap();
+    let (mut session, control) = ExecSession::new(config, |_| {}).unwrap();
+    let script = async move {
+        // Each epoch opened while the budget is spent sends nothing and is dropped, to try
+        // again after the floor (Codex r4188802873); once the second is out, one goes.
+        let mut empty = 0;
+        loop {
+            let mut peer = server.accept().await;
+            match peer.next().await {
+                None => empty += 1,
+                Some(opened) => {
+                    assert!(opened.starts_with("auth|ts="), "{opened}");
+                    assert!(peer.recv().await.starts_with("resync|ts="));
+                    break;
+                }
+            }
         }
-    );
-    assert!(matches!(heard.borrow()[..], [Heard::End(k)] if k == key(0)));
+        drop(control);
+        empty
+    };
+    let (run, empty) = tokio::join!(session.run(), script);
+    run.unwrap();
+    assert!(empty >= 1);
+    assert!(shared.counts().refused.account >= 1);
+}
+
+#[tokio::test]
+async fn on_open_frames_that_can_never_fit_together_end_the_session() {
+    let mut server = ScriptedWs::start().await;
+    let (mut config, _) = setup(ExecToy::leak(), &server.url(), quick());
+    config.cfg.insert(HEAVY, "yes");
+    let (mut session, _control) = ExecSession::new(config, |_| {}).unwrap();
+    let script = async move {
+        let mut peer = server.accept().await;
+        assert_eq!(peer.next().await, None);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    assert_eq!(run.err(), Some(ExecSessionError::OpenNeverFits));
 }
 
 #[test]

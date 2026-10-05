@@ -21,9 +21,13 @@
 //! ends at once when the consumer stops the session, even inside its handler, so the rest of
 //! the frame being handled reaches it no more.
 //!
-//! The codec's effects are executed in order: a frame for the session's own stream is charged
-//! to the buckets and written, a reconnect of it ends the epoch and opens the next through the
-//! consumer's [`ReconnectPacing`]. A frame or reconnect for another stream is a codec defect,
+//! The codec's effects are executed in order, each only while the session has not stopped: a
+//! frame for the session's own stream is charged to the buckets and written, a reconnect of it
+//! ends the epoch and opens the next through the consumer's [`ReconnectPacing`]. What `on_open`
+//! asks for is charged together first: buckets that refuse it for now end the epoch as a drop,
+//! so `on_open` runs again on the next, and frames that never fit together end the session. An
+//! error ends the session with its epoch retired, so a later run stamps the next connection
+//! under the next epoch. A frame or reconnect for another stream is a codec defect,
 //! refused and counted, and so, for now, are timers and HTTP requests, which FBC-bnl brings.
 //! A write waits on its peer at most the consumer's [`WriteStall`] window (0036). Submitting
 //! commands is FBC-0ga's, and journaling FBC-2pr's.
@@ -44,10 +48,11 @@ use tokio::time::Instant;
 use crate::connector::Connector;
 use crate::epoch::{Admit, EpochError, Epochs, Input};
 use crate::pacing::ReconnectPacing;
-use crate::ratelimit::{RateError, RateLimiter};
+use crate::ratelimit::{RateError, RateLimiter, Refused, Request};
 use crate::session::SessionError;
 use crate::session_core::{
-    Answered, Control, Core, CoreConfig, EpochInputs, IngestClock, TickToWire, close, next_frame,
+    Answered, Control, Core, CoreConfig, EpochInputs, IngestClock, TickToWire, close, frame_of,
+    next_frame,
 };
 use crate::stall::WriteStall;
 use crate::ws::{self, Message, WebSocket};
@@ -111,6 +116,9 @@ pub enum ExecSessionError {
     Endpoints(usize),
     /// The consumer's nonce source reserved another number of nonces than were asked for.
     Nonces { asked: u16, reserved: usize },
+    /// The frames the codec's `on_open` asks for weigh more together than the venue's buckets
+    /// ever admit, so no epoch could open.
+    OpenNeverFits,
 }
 
 impl fmt::Display for ExecSessionError {
@@ -126,6 +134,9 @@ impl fmt::Display for ExecSessionError {
             ExecSessionError::Nonces { asked, reserved } => write!(
                 f,
                 "the nonce source reserved {reserved} nonces when {asked} were asked for"
+            ),
+            ExecSessionError::OpenNeverFits => f.write_str(
+                "the frames on_open asks for weigh more together than the buckets ever admit",
             ),
         }
     }
@@ -280,9 +291,15 @@ impl<H: ExecHandler> ExecSession<H> {
             };
             let end = self.connected(ws).await;
             self.core.rates.closed(self.current());
-            match end? {
-                End::Stop => return Ok(()),
-                End::Dropped => self.core.pacer.dropped(Instant::now()),
+            match end {
+                Ok(End::Stop) => return Ok(()),
+                Ok(End::Dropped) => self.core.pacer.dropped(Instant::now()),
+                // The ended connection's epoch is retired all the same, so a later run never
+                // stamps another connection's life with it (Codex r4188802893).
+                Err(e) => {
+                    self.core.epochs.advance()?;
+                    return Err(e);
+                }
             }
             self.core.epochs.advance()?;
         }
@@ -309,7 +326,7 @@ impl<H: ExecHandler> ExecSession<H> {
         // is told of it, so nothing is reserved or sent.
         let mut open = !self.stopped() && {
             let fx = self.open()?;
-            self.execute(&mut ws, fx, None).await?
+            self.open_effects(&mut ws, key, fx).await?
         };
         while open {
             // A frame first: one waiting as the control drops is taken, and stamped below.
@@ -334,9 +351,7 @@ impl<H: ExecHandler> ExecSession<H> {
                 Some(Some(Ok(message))) => {
                     let mut fx = Effects::new();
                     let origin = self.decode(key, rx, &message, &mut fx);
-                    // A handler that stopped the session has nothing more sent for it; the
-                    // next wake ends the epoch.
-                    self.stopped() || self.execute(&mut ws, fx, origin).await?
+                    self.execute(&mut ws, fx, false, origin).await?
                 }
                 _ => false,
             };
@@ -400,36 +415,58 @@ impl<H: ExecHandler> ExecSession<H> {
         Some(stamp)
     }
 
-    /// Executes `fx` in order ([`Core::execute`]), attributed to the input stamped `origin`;
-    /// each timer and HTTP request is refused and counted as its turn comes, until FBC-bnl, so
-    /// one behind a reconnect or a failed write, which ends the epoch first, is never reached
-    /// (Codex r4188639448). False when the epoch ended.
+    /// Executes what `on_open` asked for on epoch `key`. Its frames are charged together
+    /// first, so all of them go or none does (Codex r4188802873): buckets that refuse them for
+    /// now end the epoch as a drop, which reconnects through the pacing and calls `on_open`
+    /// again, rather than leave the codec believing it sent what it never did; frames that can
+    /// never fit together end the session. False when the epoch ended.
+    async fn open_effects(
+        &mut self,
+        ws: &mut Option<WebSocket>,
+        key: ConnKey,
+        mut fx: Effects,
+    ) -> Result<bool, ExecSessionError> {
+        let effects = fx.take();
+        let own = |e: &Effect| frame_of(e, self.stream, true);
+        let frames: Vec<Request> = effects.iter().filter_map(own).collect();
+        match self.core.rates.charge(Instant::now(), key, &frames) {
+            Ok(_) => {}
+            Err(Refused { ready_at: Some(_) }) => return Ok(false),
+            Err(Refused { ready_at: None }) => return Err(ExecSessionError::OpenNeverFits),
+        }
+        effects.into_iter().for_each(|e| fx.push(e));
+        self.execute(ws, fx, true, None).await
+    }
+
+    /// Executes `fx` in order ([`Core::execute`]), each effect as its turn comes, attributed to
+    /// the input stamped `origin`, its frames already charged when `charged` says so. A stop,
+    /// from the handler or from another thread, ends the epoch before the next effect (Codex
+    /// r4188802881). Each timer and HTTP request is refused and counted as its turn comes,
+    /// until FBC-bnl, so one behind a reconnect or a failed write, which ends the epoch first,
+    /// is never reached (Codex r4188639448). False when the epoch ended.
     async fn execute(
         &mut self,
         ws: &mut Option<WebSocket>,
         mut fx: Effects,
+        charged: bool,
         origin: Option<Stamp>,
     ) -> Result<bool, ExecSessionError> {
-        let mut before = Effects::new();
         for effect in fx.take() {
-            if !matches!(effect, Effect::Timer { .. } | Effect::Http { .. }) {
-                before.push(effect);
-                continue;
-            }
-            let before = std::mem::take(&mut before);
-            if !self
-                .core
-                .execute(ws, &mut NoInputs, before, false, origin)
-                .await?
-            {
+            if self.stopped() {
                 return Ok(false);
             }
-            self.core.counters.refused_effects += 1;
+            if matches!(effect, Effect::Timer { .. } | Effect::Http { .. }) {
+                self.core.counters.refused_effects += 1;
+                continue;
+            }
+            let mut one = Effects::new();
+            one.push(effect);
+            let inputs = &mut NoInputs;
+            if !self.core.execute(ws, inputs, one, charged, origin).await? {
+                return Ok(false);
+            }
         }
-        Ok(self
-            .core
-            .execute(ws, &mut NoInputs, before, false, origin)
-            .await?)
+        Ok(true)
     }
 }
 
@@ -499,6 +536,10 @@ mod tests {
                 "the venue adapter discovers no instruments",
             ),
             (ExecSessionError::NoOrderEntry, "the venue takes no orders"),
+            (
+                ExecSessionError::OpenNeverFits,
+                "the frames on_open asks for weigh more together than the buckets ever admit",
+            ),
             (
                 ExecSessionError::Endpoints(2),
                 "the venue planned 2 order-entry connections; a session drives exactly one",
