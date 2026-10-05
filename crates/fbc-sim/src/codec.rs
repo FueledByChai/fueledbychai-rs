@@ -6,11 +6,12 @@ use std::sync::Arc;
 
 use fbc_core::{
     AckLevel, AckModel, Channel, ChosenRef, CidMatch, CtxCall, DecodeError, DecodeScope, Effect,
-    Effects, EncodeCtx, EncodeReceipt, ExchTsKind, ExecCodec, ExecEvent, ExecSink, Feature,
-    FillCaps, FillEvent, FillIdent, HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans,
-    ItemRef, Liquidity, Liquidity3, NotSentReason, OpKind, OrderCaps, OrderKind, OrderUpdate,
-    PathStamps, RateCharge, RawFrame, Reject, RpcCall, RpcId, SpecTable, StreamId, SubmitOutcome,
-    TifTag, TimerTag, VenueCommand, VenueMeta, VenueOrderState, WireSlice, encode_cid,
+    Effects, EncodeCtx, EncodeReceipt, ExchTsKind, ExecCaps, ExecCodec, ExecEvent, ExecSink,
+    Feature, FillCaps, FillEvent, FillIdent, FillSource, HttpFailure, HttpResponse, HttpTag,
+    Inbound, InboundSpans, ItemRef, Liquidity, Liquidity3, NotSentReason, OpKind, OrderCaps,
+    OrderKind, OrderUpdate, OrderingKey, PathStamps, RateCharge, RawFrame, Reject, RpcCall, RpcId,
+    SpecTable, StreamId, SubmitOutcome, TifTag, TimerTag, VenueCommand, VenueMeta, VenueOrderState,
+    WireSlice, encode_cid,
 };
 
 use crate::config::SimConfig;
@@ -22,11 +23,14 @@ use crate::wire::{Cancel, Command, Place, Refusal, Reply, Sent, SimState, Target
 /// through [`DecodeScope`] only, so venue ids, fill ids and fees are built as a real codec
 /// builds them (0004), saying on its events only what the stood-in venue echoes. It refuses
 /// what the stood-in venue's [`OrderCaps`] do not offer, RPI orders, which the engine cannot
-/// fill yet (FBC-njk, decision 0043), and placements for a venue that acknowledges in two
-/// phases, which the engine does not model yet (FBC-zr1); amends, batches and queries are
-/// FBC-nv2's.
+/// fill yet (FBC-njk, decision 0043), and placements for a venue whose events the engine
+/// cannot say yet: two-phase acknowledgement (FBC-zr1), an ordering key other than a venue
+/// sequence, realized values on fills, or fills derived from order status (FBC-938); amends,
+/// batches and queries are FBC-nv2's.
 #[derive(Clone, Debug)]
 pub struct SimCodec {
+    /// Whether the engine can say what the stood-in venue's events say ([`modelled`]).
+    modelled: bool,
     caps: OrderCaps,
     fills: FillCaps,
     stream: StreamId,
@@ -37,6 +41,7 @@ impl SimCodec {
     /// A codec for the venue `config` stands in for.
     pub fn new(config: &SimConfig) -> SimCodec {
         SimCodec {
+            modelled: modelled(&config.exec),
             caps: config.exec.order.clone(),
             fills: config.exec.fills,
             stream: config.stream,
@@ -56,11 +61,7 @@ impl SimCodec {
             && o.channel == Channel::Public
             && (self.caps.post_only || !o.post_only)
             && (self.caps.reduce_only || !o.reduce_only);
-        // Codex r4182678509: the engine accepts in one phase, so a venue that acknowledges in
-        // two is not stood in for yet (FBC-zr1) rather than its provisional acceptance be
-        // reported final.
-        let single_phase = self.caps.ack == AckModel::SinglePhase;
-        if !offered || !single_phase {
+        if !offered || !self.modelled {
             return Err(NotSentReason::Unsupported);
         }
         // Codex r4182154713: a pair the stood-in venue refuses together is refused here too.
@@ -126,6 +127,19 @@ impl SimCodec {
     }
 }
 
+/// Whether the engine answers as the venue `exec` describes: it acknowledges in one phase
+/// (Codex r4182678509; FBC-zr1), orders its answers by a venue sequence, keeps no position to
+/// report realized P&L or funding from, and sends fills of their own (Codex r4182991971,
+/// r4182991978; FBC-938). Placements for any other venue are refused rather than answered with
+/// events unlike its own.
+fn modelled(exec: &ExecCaps) -> bool {
+    exec.order.ack == AckModel::SinglePhase
+        && exec.order.ordering_key == OrderingKey::VenueSeq
+        && !exec.fills.realized_pnl
+        && !exec.fills.realized_funding
+        && exec.fills.source == FillSource::Native
+}
+
 fn malformed(err: WireError) -> DecodeError {
     DecodeError::Malformed(err.0)
 }
@@ -161,13 +175,15 @@ impl ExecCodec for SimCodec {
             wall: ctx.wall,
         };
         let (command, op, inst) = match cmd {
+            // A placement needs its instrument's spec; a cancel names only the order, so an
+            // instrument the table no longer lists does not stop it (Codex r4182991965).
+            VenueCommand::Place(o) if specs.get(o.inst).is_none() => {
+                return Err(NotSentReason::Unencodable);
+            }
             VenueCommand::Place(o) => (self.place(o, rpc, sent)?, OpKind::Place, o.inst),
             VenueCommand::Cancel(c) => (self.cancel(c, rpc, sent)?, OpKind::Cancel, c.inst),
             _ => return Err(NotSentReason::Unsupported),
         };
-        if specs.get(inst).is_none() {
-            return Err(NotSentReason::Unencodable);
-        }
         fx.push(Effect::Send {
             stream: self.stream,
             frame: WireSlice::plain(command.encode()),
