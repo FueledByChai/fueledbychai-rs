@@ -3,7 +3,8 @@
 //! seals), `tests/ui_ids/` (the id seals), `tests/ui_fee/` (the fee seal), `tests/ui_caps/`
 //! (decision 0003: capabilities and specs with every field mandatory) and `tests/ui_states/`
 //! (decision 0005: no terminal state for an unknown order, no request without a deadline),
-//! `tests/ui_stamps/` (decision 0034: path stamps give a codec no time) and their expected
+//! `tests/ui_stamps/` (decision 0034: path stamps give a codec no time), `tests/ui_auth/`
+//! (decision 0043: credentials cannot be cloned) and their expected
 //! `.stderr`. Regenerate the expected output with
 //! `TRYBUILD=overwrite cargo test -p fbc-core --test compile_fail` only when the pinned
 //! toolchain moves (0008).
@@ -73,4 +74,12 @@ fn a_not_found_rejection_is_not_a_terminal_state() {
 fn path_stamps_give_a_codec_no_time() {
     let cases = trybuild::TestCases::new();
     cases.compile_fail("tests/ui_stamps/*.rs");
+}
+
+/// A `Secret` and a `Secrets` cannot be cloned: each credential exists once, where the consumer
+/// built it or where a codec moved it to, and is zeroed when dropped (decisions 0009, 0043).
+#[test]
+fn credentials_cannot_be_cloned() {
+    let cases = trybuild::TestCases::new();
+    cases.compile_fail("tests/ui_auth/*.rs");
 }

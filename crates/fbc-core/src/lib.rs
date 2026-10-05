@@ -14,8 +14,9 @@
 //! ([`command`]), the sans-IO codec traits with their effects and the encode context that is a
 //! codec's only source of time and nonces ([`codec`]), the write-only stamps a codec marks its
 //! stages through without reading a clock ([`stamps`]), and the venue factory and gateway traits
-//! ([`venue`]).
+//! ([`venue`]). Credentials reach a codec only as [`auth::Secrets`] (decision 0009).
 
+pub mod auth;
 pub mod caps;
 pub mod cid;
 pub mod codec;
@@ -34,6 +35,7 @@ pub mod time;
 pub mod units;
 pub mod venue;
 
+pub use auth::{Secret, Secrets};
 pub use caps::{
     AckModel, AmendAck, AmendCaps, AmendQty, Batch, BookCaps, Cadence, CancelBatch,
     CancelOnDisconnect, CapTag, ConnTopology, Continuity, Encoding, ExecCaps, Feature, FeedSource,
@@ -89,7 +91,7 @@ pub use units::{
     Ticks,
 };
 pub use venue::{
-    ConfigError, ConfigScope, EndpointPlan, ExecEndpoint, FieldSpec, FieldUnit, HttpAnswer,
-    HttpPlan, ManagedGateway, MdTransport, OrderGateway, PlanError, SubmitHandle, VenueConfig,
-    VenueError, VenueFactory,
+    AccountSummary, ConfigError, ConfigScope, EndpointPlan, ExecEndpoint, FieldSpec, FieldUnit,
+    HttpAnswer, HttpPlan, ManagedGateway, MdTransport, OrderGateway, PlanError, SubmitHandle,
+    VenueConfig, VenueError, VenueFactory,
 };

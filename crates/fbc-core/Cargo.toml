@@ -12,6 +12,9 @@ publish = false
 arrayvec.workspace = true
 compact_str.workspace = true
 rust_decimal.workspace = true
+# A `Secret` holds its value in `Zeroizing<String>` (FBC-b3b, decision 0043), which needs
+# zeroize's `alloc` feature; the workspace pins the version (FBC-dm9).
+zeroize = { workspace = true, features = ["alloc"] }
 
 [dev-dependencies]
 trybuild.workspace = true

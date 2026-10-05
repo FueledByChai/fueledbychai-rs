@@ -60,6 +60,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use fbc_core::{AccountSummary, Secrets};
 use fbc_core::{
     Aggressor, AssetKey, AssetSym, BookCaps, BookId, BookSide, Cadence, Channel, ConfigError,
     ConnTopology, Continuity, DecodeError, DecodeScope, Effect, Effects, Encoding, EndpointPlan,
@@ -365,7 +366,19 @@ impl VenueFactory for ToyVenue {
         Ok(Vec::new())
     }
 
-    fn exec_codec(&self, _: &VenueConfig) -> Option<Result<Box<dyn ExecCodec>, VenueError>> {
+    fn exec_codec(
+        &self,
+        _: &VenueConfig,
+        _: Secrets,
+    ) -> Option<Result<Box<dyn ExecCodec>, VenueError>> {
+        None
+    }
+
+    fn test_connection(
+        &self,
+        _: &VenueConfig,
+        _: Secrets,
+    ) -> Option<Result<HttpPlan<AccountSummary>, VenueError>> {
         None
     }
 }

@@ -45,3 +45,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0040](0040-the-journal-keeps-the-kind-each-outbound-frame-was-sent-as-i.md) The journal keeps the kind each outbound frame was sent as in format version 5, augmenting 0028 — accepted
 - [0041](0041-a-session-journals-each-ping-pong-and-close-frame-it-receive.md) A session journals each ping, pong and close frame it receives at its ingest place, in format version 5 — accepted
 - [0042](0042-a-codec-reports-a-subscription-the-venue-refused-as-the-feed.md) A codec reports a subscription the venue refused as the feed's health Refused, naming its instrument and feed, and asks for nothing to retry it — accepted
+- [0043](0043-credentials-reach-a-codec-as-secrets-zeroed-on-drop-with-zer.md) Credentials reach a codec as Secrets, zeroed on drop with zeroize 1.9.0 pinned, and test_connection is an HTTP plan, augmenting 0014 — accepted

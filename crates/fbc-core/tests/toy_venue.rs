@@ -5,18 +5,23 @@
 //! a `VenueCommand` taking time and nonces only from `EncodeCtx`, and does no IO: everything it
 //! wants done comes back as `Effects`. Its protocol, symbols and values describe no real venue.
 //!
-//! The toy proves FBC-5's, FBC-ji6's and FBC-ahf's done lines; it is not a conformance suite,
-//! and its `VenueCaps` declare only what its codecs do. One socket carries the touch; one
-//! carries order entry (limit orders out, each signed with a toy hash, its signer call marked
-//! as the sign stage through `PathStamps`; acks, account events, fills and a resync answered in
-//! one frame in). It has no book, trades or other feed, cancels, amends and queries nothing,
-//! reads no configuration, and its codecs ask for no HTTP; it keeps one resync in flight, and
-//! its one timer asks for that resync again while it is unanswered. Its market-data socket is
-//! kept alive with a ping frame.
+//! The toy proves FBC-5's, FBC-ji6's, FBC-ahf's and FBC-b3b's done lines; it is not a
+//! conformance suite, and its `VenueCaps` declare only what its codecs do. One socket carries
+//! the touch; one carries order entry (limit orders out, each signed with a toy hash, its signer
+//! call marked as the sign stage through `PathStamps`; acks, account events, fills and a resync
+//! answered in one frame in). It has no book, trades or other feed, cancels, amends and queries
+//! nothing, and its codecs ask for no HTTP; it keeps one resync in flight, and its one timer
+//! asks for that resync again while it is unanswered. Its market-data socket is kept alive with
+//! a ping frame.
 //!
 //! Its factory discovers its instruments with one `GET` of its market list, a plan of effects
 //! whose parser builds one `InstrumentSpecDraft` per `market` record inside the decode scope,
 //! and reads Java-era tickers by its own FBC rule: `X/USDT` is `X-PERP`, listed in USDC.
+//!
+//! Its one configuration key is its credential (FBC-b3b, decision 0043): the exec codec takes
+//! it from the `Secrets` the factory is handed and sends it in its hello as a redaction span,
+//! and `test_connection` proves it with a plan of one `GET` of the account whose header carries
+//! it redacted.
 //!
 //! Every frame it asks for, and its ping, carries the rate charge its declared limits count
 //! (decision 0018): orders per instrument, a resync as a weighted query against the account,
@@ -33,26 +38,27 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use fbc_core::{
-    AccountKey, AckLevel, AckModel, AliasTable, AssetKey, AssetSym, Cadence, CancelOnDisconnect,
-    Channel, Charset, CidMatch, CidMint, ClientIdFormat, ClientOrderId, ConfigError, ConnKey,
-    ConnTopology, CtxCall, DecodeError, DecodeScope, Effect, Effects, EncodeCtx, EncodeReceipt,
-    Encoding, EndpointPlan, Envelope, ExchNs, ExchTsKind, ExecCaps, ExecCodec, ExecEndpoint,
-    ExecEvent, ExecSink, Feed, FeedHealth, FeedSource, FieldSpec, FillCaps, FillEvent, FillIdent,
-    FillSource, FundingCaps, FundingSpec, HttpFailure, HttpMethod, HttpPlan, HttpRequest,
-    HttpResponse, HttpTag, Inbound, InboundSpans, InstrumentId, InstrumentKind, InstrumentResolver,
-    InstrumentSpec, InstrumentSpecDraft, ItemRef, Keepalive, KeepaliveKind, LimitScope, Liquidity3,
-    Listing, Lots, Lvl, MatchingCaps, MdCaps, MdCodec, MdEvent, MdSink, MdTransport, Money, MonoNs,
-    Namespace, NamespaceLease, NewOrder, NonceBlock, NonceScope, NotSentReason, OpKind, OrderCaps,
-    OrderGateway, OrderKind, OrderKindTag, OrderingKey, PathEdge, PathMark, PathRecorder,
-    PathStage, PathStamps, PlaceWire, PlanError, PriceGrid, PxExact, RateCharge, RateLimit,
-    RawFrame, Readiness, ResolveError, RpcCall, RpcId, SeqDomain, Side, Sig, SignedLots, SizeStep,
-    SnapshotSource, SpecTable, Stamp, StpScope, StreamId, SubmitHandle, SubmitOutcome,
-    Subscription, Support, SymbolError, TagSet, Ticks, TifTag, TimerTag, TouchSourceCaps,
-    TouchSourceId, TradeCaps, TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueCommand,
-    VenueConfig, VenueError, VenueFactory, VenueFeeSign, VenueId, VenueMeta, VenueOrderSnapshot,
-    VenueOrderState, Via, WallNs, WireSlice, WireUrl, common_symbol_parts, decode_cid, dispatch,
-    dispatch_market_data, encode_cid,
+    AccountKey, AccountSummary, AckLevel, AckModel, AliasTable, AssetKey, AssetSym, Cadence,
+    CancelOnDisconnect, Channel, Charset, CidMatch, CidMint, ClientIdFormat, ClientOrderId,
+    ConfigError, ConnKey, ConnTopology, CtxCall, DecodeError, DecodeScope, Effect, Effects,
+    EncodeCtx, EncodeReceipt, Encoding, EndpointPlan, Envelope, ExchNs, ExchTsKind, ExecCaps,
+    ExecCodec, ExecEndpoint, ExecEvent, ExecSink, Feed, FeedHealth, FeedSource, FieldSpec,
+    FillCaps, FillEvent, FillIdent, FillSource, FundingCaps, FundingSpec, HttpFailure, HttpMethod,
+    HttpPlan, HttpRequest, HttpResponse, HttpTag, Inbound, InboundSpans, InstrumentId,
+    InstrumentKind, InstrumentResolver, InstrumentSpec, InstrumentSpecDraft, ItemRef, Keepalive,
+    KeepaliveKind, LimitScope, Liquidity3, Listing, Lots, Lvl, MatchingCaps, MdCaps, MdCodec,
+    MdEvent, MdSink, MdTransport, Money, MonoNs, Namespace, NamespaceLease, NewOrder, NonceBlock,
+    NonceScope, NotSentReason, OpKind, OrderCaps, OrderGateway, OrderKind, OrderKindTag,
+    OrderingKey, PathEdge, PathMark, PathRecorder, PathStage, PathStamps, PlaceWire, PlanError,
+    PriceGrid, PxExact, RateCharge, RateLimit, RawFrame, Readiness, ResolveError, RpcCall, RpcId,
+    SeqDomain, Side, Sig, SignedLots, SizeStep, SnapshotSource, SpecTable, Stamp, StpScope,
+    StreamId, SubmitHandle, SubmitOutcome, Subscription, Support, SymbolError, TagSet, Ticks,
+    TifTag, TimerTag, TouchSourceCaps, TouchSourceId, TradeCaps, TradingStatus, TrafficClass,
+    UnderlyingId, VenueCaps, VenueCommand, VenueConfig, VenueError, VenueFactory, VenueFeeSign,
+    VenueId, VenueMeta, VenueOrderSnapshot, VenueOrderState, Via, WallNs, WireSlice, WireUrl,
+    common_symbol_parts, decode_cid, dispatch, dispatch_market_data, encode_cid,
 };
+use fbc_core::{ConfigScope, FieldUnit, Header, Secret, Secrets};
 use rust_decimal::Decimal;
 
 // ---------------------------------------------------------------------------------------------
@@ -89,6 +95,18 @@ const PING_EVERY: Duration = Duration::from_secs(30);
 /// Where the toy lists its markets, and the tag of the one request discovery makes there.
 const MARKETS_URL: &str = "https://toy.invalid/markets";
 const MARKETS_TAG: HttpTag = HttpTag(1);
+/// The toy's credential, by its configuration key: an account-scoped secret.
+const KEY: &str = "toy.key";
+const SCHEMA: &[FieldSpec] = &[FieldSpec {
+    key: KEY,
+    scope: ConfigScope::Account,
+    unit: FieldUnit::Dimensionless,
+    doc: "the account's key, sent in the hello and in the account request",
+}];
+/// The account request `test_connection` makes, its tag and header.
+const ACCOUNT_URL: &str = "https://toy.invalid/account";
+const ACCOUNT_TAG: HttpTag = HttpTag(1);
+const KEY_HEADER: &str = "X-Toy-Key";
 
 fn usdc() -> AssetSym {
     AssetSym::new("USDC").unwrap()
@@ -357,6 +375,7 @@ impl MdCodec for ToyMd {
 /// resync's watermark (record 0014), since the venue's echo of it cannot be trusted alone.
 struct ToyExec {
     resync_at: Option<WallNs>,
+    key: Secret,
 }
 
 impl ToyExec {
@@ -512,9 +531,20 @@ impl ExecCodec for ToyExec {
         0
     }
 
+    /// Says hello with the key, which the frame marks as a credential span.
     fn on_open(&mut self, stream: StreamId, ctx: &EncodeCtx, fx: &mut Effects) {
-        let hello = format!("hello|ts={}", ctx.wall.0);
-        fx.push(send(stream, &hello, None, TrafficClass::Safety, CONTROL));
+        let head = format!("hello|ts={}|key=", ctx.wall.0);
+        let mut bytes = head.clone().into_bytes();
+        bytes.extend_from_slice(self.key.expose().as_bytes());
+        let span = head.len() as u32..bytes.len() as u32;
+        let frame = WireSlice::redacted(bytes, vec![span]).unwrap();
+        fx.push(Effect::Send {
+            stream,
+            frame,
+            rpc: None,
+            class: TrafficClass::Safety,
+            charge: CONTROL,
+        });
     }
 
     /// Encodes and signs a limit order, its time and nonce from `ctx` alone, marking the signer
@@ -717,7 +747,52 @@ fn draft(line: &str, scope: &DecodeScope<'_>) -> Result<InstrumentSpecDraft, Pla
     })
 }
 
-/// The toy venue's factory. The toy reads no configuration.
+/// The one request the toy's `test_connection` makes: a `GET` of the account with the key in a
+/// redacted header, which the plan's `Debug` and the journal never show.
+fn account_request(key: &Secret) -> Effect {
+    let key = Header {
+        name: KEY_HEADER,
+        value: key.expose().to_owned(),
+        redact: true,
+    };
+    Effect::Http {
+        tag: ACCOUNT_TAG,
+        req: HttpRequest {
+            method: HttpMethod::Get,
+            url: WireUrl::plain(ACCOUNT_URL),
+            headers: vec![key],
+            body: WireSlice::plain(Vec::new()),
+        },
+        rpc: None,
+        timeout: RPC_TIMEOUT,
+        class: TrafficClass::Normal,
+        charge: RateCharge::one(OpKind::Query, None),
+    }
+}
+
+/// The account answer, `account|id=...|equity=...` with equity in nanos of USDC, as the summary
+/// test_connection ends in. A field it leaves out refuses it by name.
+fn account(text: &str) -> Result<AccountSummary, PlanError> {
+    let frame = Frame::parse(text)?;
+    if frame.kind != "account" {
+        return Err(DecodeError::Malformed("kind").into());
+    }
+    let account = required(&frame, "id")?.to_owned();
+    let equity = Money::new(read(&frame, "equity")?, usdc());
+    Ok(AccountSummary {
+        account,
+        equity: Some(equity),
+    })
+}
+
+/// The toy's key, moved out of `creds`, or the configuration refusal that names it missing.
+fn take_key(mut creds: Secrets) -> Result<Secret, VenueError> {
+    creds
+        .take(KEY)
+        .ok_or(VenueError::Config(ConfigError::Missing(KEY)))
+}
+
+/// The toy venue's factory. The toy reads one key, its credential.
 struct ToyFactory;
 
 impl VenueFactory for ToyFactory {
@@ -726,7 +801,7 @@ impl VenueFactory for ToyFactory {
     }
 
     fn config_schema(&self) -> &'static [FieldSpec] {
-        &[]
+        SCHEMA
     }
 
     fn caps(&self, _cfg: &VenueConfig) -> Result<VenueCaps, ConfigError> {
@@ -792,8 +867,38 @@ impl VenueFactory for ToyFactory {
         }])
     }
 
-    fn exec_codec(&self, _cfg: &VenueConfig) -> Option<Result<Box<dyn ExecCodec>, VenueError>> {
-        Some(Ok(Box::new(ToyExec { resync_at: None })))
+    fn exec_codec(
+        &self,
+        _cfg: &VenueConfig,
+        creds: Secrets,
+    ) -> Option<Result<Box<dyn ExecCodec>, VenueError>> {
+        Some(take_key(creds).map(|key| {
+            let codec: Box<dyn ExecCodec> = Box::new(ToyExec {
+                resync_at: None,
+                key,
+            });
+            codec
+        }))
+    }
+
+    fn test_connection(
+        &self,
+        _cfg: &VenueConfig,
+        creds: Secrets,
+    ) -> Option<Result<HttpPlan<AccountSummary>, VenueError>> {
+        Some(take_key(creds).map(|key| {
+            let mut fx = Effects::new();
+            fx.push(account_request(&key));
+            // The key is in the request; the parser needs none of it, and the `Secret` that
+            // held it is zeroed when it drops here.
+            let plan = HttpPlan::new(fx, |responses, _scope| {
+                // The plan holds one request, so its parser is handed one response.
+                let answer = responses.first().ok_or(PlanError::Answers)?;
+                let text = core::str::from_utf8(answer.body);
+                account(text.map_err(|_| DecodeError::Malformed("utf-8"))?)
+            });
+            plan.expect("one HTTP request makes a valid plan")
+        }))
     }
 }
 
@@ -966,8 +1071,35 @@ fn specs() -> SpecTable {
     table
 }
 
+/// A synthetic key: no venue or account uses it (0009).
+const SYNTHETIC_KEY: &str = "SYNTHETIC-toy-key-7f3a";
+
+/// The toy's credentials, holding the synthetic key.
+fn creds() -> Secrets {
+    let mut creds = Secrets::new();
+    creds.insert(KEY, Secret::new(SYNTHETIC_KEY.to_owned()));
+    creds
+}
+
+/// The hello the toy's exec codec says on open at `wall`: the synthetic key in a redaction span.
+fn hello(wall: i64) -> Effect {
+    let head = format!("hello|ts={wall}|key=");
+    let text = format!("{head}{SYNTHETIC_KEY}");
+    let span = head.len() as u32..text.len() as u32;
+    Effect::Send {
+        stream: EXEC_STREAM,
+        frame: WireSlice::redacted(text.into_bytes(), vec![span]).unwrap(),
+        rpc: None,
+        class: TrafficClass::Safety,
+        charge: CONTROL,
+    }
+}
+
 fn exec_codec() -> Box<dyn ExecCodec> {
-    ToyFactory.exec_codec(&VenueConfig::new()).unwrap().unwrap()
+    ToyFactory
+        .exec_codec(&VenueConfig::new(), creds())
+        .unwrap()
+        .unwrap()
 }
 
 /// Decodes `frames` through `codec` inside the decode scope: each result and what was pushed.
@@ -1566,7 +1698,10 @@ fn a_frame_that_fails_to_decode_pushes_nothing() {
 fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
     let (factory, cfg): (&dyn VenueFactory, _) = (&ToyFactory, VenueConfig::new());
     assert_eq!(factory.id(), "TOY");
-    assert!(factory.config_schema().is_empty());
+    assert_eq!(
+        Vec::from_iter(factory.config_schema().iter().map(|f| f.key)),
+        [KEY]
+    );
     assert_eq!(factory.caps(&cfg), Ok(toy_caps()));
 
     // Planning and subscribing see the spec table, so the venue's own symbol goes on the wire.
@@ -1654,9 +1789,9 @@ fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
         tag: RESYNC_TAG,
         after: RPC_TIMEOUT,
     };
-    let (hello, asked) = ("hello|ts=1000", "snapshot|ts=2000");
+    let asked = "snapshot|ts=2000";
     let expected = [
-        safety(hello, CONTROL),
+        hello(1_000),
         safety(asked, RESYNC_CHARGE),
         retry.clone(),
         safety(asked, RESYNC_CHARGE),
@@ -1873,4 +2008,170 @@ fn a_market_missing_a_required_field_is_refused_by_name() {
         body,
     }));
     assert_eq!(unavailable, Err(PlanError::Status { tag, status: 503 }));
+}
+
+#[test]
+fn the_exec_codec_takes_its_key_from_secrets_and_no_debug_shows_it() {
+    // FBC-b3b, decision 0043: credentials reach the codec only as `Secrets`, built here from a
+    // synthetic key. Formatting them, or anything the codec asks for with the key in it, shows
+    // none of it.
+    let secrets = creds();
+    for shown in [
+        format!("{secrets:?}"),
+        format!("{secrets:#?}"),
+        secrets.to_string(),
+    ] {
+        assert!(!shown.contains(SYNTHETIC_KEY), "{shown}");
+    }
+    assert!(format!("{secrets:?}").contains(KEY));
+
+    // The codec sends the key in its hello, marked as the frame's one credential span, so the
+    // journal keeps it as a keyed hash; the effect's Debug shows the span by length only.
+    let mut exec = exec_codec();
+    let mut fx = Effects::new();
+    exec.on_open(EXEC_STREAM, &ctx(1_000, &[]), &mut fx);
+    assert_eq!(fx.as_slice(), [hello(1_000)]);
+    let Effect::Send { frame, .. } = &fx.as_slice()[0] else {
+        unreachable!()
+    };
+    let [span] = frame.redactions() else {
+        panic!("one span")
+    };
+    let span = span.start as usize..span.end as usize;
+    assert_eq!(&frame.bytes()[span], SYNTHETIC_KEY.as_bytes());
+    let shown = format!("{fx:?}");
+    assert!(!shown.contains(SYNTHETIC_KEY), "{shown}");
+
+    // Without its key the factory builds no codec, and its refusal names the key, not a value.
+    let refused = ToyFactory.exec_codec(&VenueConfig::new(), Secrets::new());
+    let Some(Err(err)) = refused else {
+        panic!("a codec without its key")
+    };
+    assert_eq!(err, VenueError::Config(ConfigError::Missing(KEY)));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Credentials and test_connection (FBC-b3b).
+// ---------------------------------------------------------------------------------------------
+
+/// The toy's test_connection plan for the synthetic key.
+fn connection_plan() -> HttpPlan<AccountSummary> {
+    ToyFactory
+        .test_connection(&VenueConfig::new(), creds())
+        .unwrap()
+        .unwrap()
+}
+
+/// `plan` answered with `answer` for its account request, parsed in the decode scope.
+fn connect_with(
+    plan: HttpPlan<AccountSummary>,
+    answer: Result<HttpResponse<'_>, HttpFailure>,
+) -> Result<AccountSummary, PlanError> {
+    dispatch_market_data(&toy_caps(), |scope| {
+        plan.parse(&[(ACCOUNT_TAG, answer)], scope)
+    })
+}
+
+/// The toy's test_connection answered `status` with `body`.
+fn connect(status: u16, body: &[u8]) -> Result<AccountSummary, PlanError> {
+    let headers = &[];
+    connect_with(
+        connection_plan(),
+        Ok(HttpResponse {
+            status,
+            headers,
+            body,
+        }),
+    )
+}
+
+/// The account request the toy asks for with the synthetic key.
+fn asked_for_account() -> Effect {
+    let key = Header {
+        name: KEY_HEADER,
+        value: SYNTHETIC_KEY.to_owned(),
+        redact: true,
+    };
+    Effect::Http {
+        tag: ACCOUNT_TAG,
+        req: HttpRequest {
+            method: HttpMethod::Get,
+            url: WireUrl::plain(ACCOUNT_URL),
+            headers: vec![key],
+            body: WireSlice::plain(Vec::new()),
+        },
+        rpc: None,
+        timeout: RPC_TIMEOUT,
+        class: TrafficClass::Normal,
+        charge: RateCharge::one(OpKind::Query, None),
+    }
+}
+
+#[test]
+fn test_connection_proves_the_key_and_logs_no_account_or_balance() {
+    // FBC-b3b, design §4.7: test_connection is an HttpPlan (0035, 0043), its request built from
+    // the key and its parser reading the AccountSummary inside the decode scope. The plan's
+    // Debug shows the request but not the key its redacted header carries.
+    let plan = connection_plan();
+    assert_eq!(plan.requests(), [asked_for_account()]);
+    let shown = format!("{plan:?}");
+    assert!(shown.contains(ACCOUNT_URL), "{shown}");
+    assert!(!shown.contains(SYNTHETIC_KEY), "{shown}");
+
+    let (account, equity) = ("SYNTHETIC-ACCT-42", 1_234_500_000_000_i128);
+    let body = format!("account|id={account}|equity={equity}");
+    let summary = connect(200, body.as_bytes()).unwrap();
+    let expected = AccountSummary {
+        account: account.to_owned(),
+        equity: Some(Money::new(equity, usdc())),
+    };
+    assert_eq!(summary, expected);
+    // Its Debug shows neither the account nor the balance (0009).
+    let shown = format!("{summary:?}");
+    assert!(!shown.contains(account), "{shown}");
+    assert!(!shown.contains(&equity.to_string()), "{shown}");
+    assert_eq!(
+        shown,
+        format!(
+            "AccountSummary {{ account: <{} bytes>, equity: Some(<redacted>) }}",
+            account.len()
+        )
+    );
+    let none = AccountSummary {
+        equity: None,
+        ..summary
+    };
+    assert!(format!("{none:?}").ends_with("equity: None }"));
+
+    // A refusal, a missing response and an answer it cannot read each end the plan with why,
+    // and none of them carries what the venue sent.
+    let tag = ACCOUNT_TAG;
+    let lost = connect_with(connection_plan(), Err(HttpFailure::TimedOut));
+    let failure = HttpFailure::TimedOut;
+    assert_eq!(lost, Err(PlanError::Http { tag, failure }));
+    let malformed = |part| PlanError::Decode(DecodeError::Malformed(part));
+    let cases: [(u16, &[u8], PlanError); 7] = [
+        (
+            401,
+            SYNTHETIC_KEY.as_bytes(),
+            PlanError::Status { tag, status: 401 },
+        ),
+        (200, b"\xff", malformed("utf-8")),
+        (200, b"account|x", malformed("field")),
+        (200, b"fill|id=a", malformed("kind")),
+        (200, b"account|equity=1", PlanError::Missing("id")),
+        (200, b"account|id=a", PlanError::Missing("equity")),
+        (200, b"account|id=a|equity=x", malformed("equity")),
+    ];
+    for (status, body, err) in cases {
+        assert_eq!(connect(status, body), Err(err), "{err}");
+        assert!(!err.to_string().contains(SYNTHETIC_KEY), "{err}");
+    }
+
+    // Without its key there is no plan, and the refusal names the key.
+    let refused = ToyFactory.test_connection(&VenueConfig::new(), Secrets::new());
+    let Some(Err(err)) = refused else {
+        panic!("a plan without its key")
+    };
+    assert_eq!(err, VenueError::Config(ConfigError::Missing(KEY)));
 }

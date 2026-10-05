@@ -114,8 +114,8 @@ rather than guess.
   `Fee`/`FeeBook`, `DecodeScope`, `InstrumentSpec` (maker-safe `quantize`), instrument
   resolution (`AssetKey`, `AliasTable`, `InstrumentResolver`, `InstrumentSpecDraft`; 0035),
   `VenueCaps`, the market-data and execution events, venue commands, and the codec, signer,
-  nonce and factory traits with `Effects` and `EncodeCtx` (the factory's discovery an
-  `HttpPlan`), and the write-only `PathStamps` a codec marks
+  nonce and factory traits with `Effects` and `EncodeCtx` (the factory's discovery and
+  `test_connection` each an `HttpPlan`), credentials as `Secrets` in `src/auth.rs` (0043), and the write-only `PathStamps` a codec marks
   its latency stages through (0034), `crates/fbc-book` with its L2 book, `crates/fbc-sim` with its
   queue-position fill model (0038), `crates/fbc-journal` with its record
   format, day-grouped segment writer rolled hourly with zstd-compressed closed segments, in-order reader and never-blocking sink, `crates/fbc-runtime` with its first
@@ -136,7 +136,9 @@ rather than guess.
     `VenueCaps` keeps order and fill capabilities together in `exec: Option<ExecCaps>`,
     `None` for a market-data-only venue, which declares no fill source or fee sign (0015).
     Every codec names the credentials in what it receives (`redact_inbound`, `InboundSpans`;
-    0028) so the journal keeps them only as keyed hashes.
+    0028) so the journal keeps them only as keyed hashes. Credentials reach `exec_codec` and
+    `test_connection` only as `Secrets` (`src/auth.rs`, a review path): no `Clone`, a `Debug`
+    and `Display` that show no value, zeroed on drop with `zeroize` pinned (0043).
     `Lots` is built only through `Lots::new`, which refuses a negative count, and `Ticks`,
     `Lots` and `SignedLots` have checked arithmetic only (`checked_*` and `abs_lots` return
     `None` rather than wrap; no `+`, `-` or unary `-`), so overflow behaves the same in every
