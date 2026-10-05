@@ -44,3 +44,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0039](0039-a-session-tells-its-handler-each-connection-epoch-s-end-and-.md) A session tells its handler each connection epoch's end, and the runtime's books invalidate every book that epoch fed until its next snapshot, augmenting 0023 — accepted
 - [0040](0040-the-journal-keeps-the-kind-each-outbound-frame-was-sent-as-i.md) The journal keeps the kind each outbound frame was sent as in format version 5, augmenting 0028 — accepted
 - [0041](0041-a-session-journals-each-ping-pong-and-close-frame-it-receive.md) A session journals each ping, pong and close frame it receives at its ingest place, in format version 5 — accepted
+- [0042](0042-a-codec-reports-a-subscription-the-venue-refused-as-the-feed.md) A codec reports a subscription the venue refused as the feed's health Refused, naming its instrument and feed, and asks for nothing to retry it — accepted

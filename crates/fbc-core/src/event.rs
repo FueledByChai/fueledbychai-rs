@@ -122,6 +122,11 @@ pub enum FeedHealth {
     Gap,
     /// Nothing arrived within the feed's expected cadence.
     Stale,
+    /// The venue refused the subscription to this feed: nothing of it arrives on the
+    /// connection. Neither a snapshot nor a reconnect heals it, so the codec that reports it
+    /// asks for nothing to retry it: no subscribe is resent and no reconnect asked for
+    /// (decision 0042). Whether to ask again is the consumer's call.
+    Refused,
 }
 
 /// A market-data event. Prices on the book are [`Ticks`] on the instrument's finest grid;

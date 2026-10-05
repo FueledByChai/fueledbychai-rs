@@ -37,9 +37,9 @@ use fbc_core::{
     Channel, Charset, CidMatch, CidMint, ClientIdFormat, ClientOrderId, ConfigError, ConnKey,
     ConnTopology, CtxCall, DecodeError, DecodeScope, Effect, Effects, EncodeCtx, EncodeReceipt,
     Encoding, EndpointPlan, Envelope, ExchNs, ExchTsKind, ExecCaps, ExecCodec, ExecEndpoint,
-    ExecEvent, ExecSink, Feed, FeedSource, FieldSpec, FillCaps, FillEvent, FillIdent, FillSource,
-    FundingCaps, FundingSpec, HttpFailure, HttpMethod, HttpPlan, HttpRequest, HttpResponse,
-    HttpTag, Inbound, InboundSpans, InstrumentId, InstrumentKind, InstrumentResolver,
+    ExecEvent, ExecSink, Feed, FeedHealth, FeedSource, FieldSpec, FillCaps, FillEvent, FillIdent,
+    FillSource, FundingCaps, FundingSpec, HttpFailure, HttpMethod, HttpPlan, HttpRequest,
+    HttpResponse, HttpTag, Inbound, InboundSpans, InstrumentId, InstrumentKind, InstrumentResolver,
     InstrumentSpec, InstrumentSpecDraft, ItemRef, Keepalive, KeepaliveKind, LimitScope, Liquidity3,
     Listing, Lots, Lvl, MatchingCaps, MdCaps, MdCodec, MdEvent, MdSink, MdTransport, Money, MonoNs,
     Namespace, NamespaceLease, NewOrder, NonceBlock, NonceScope, NotSentReason, OpKind, OrderCaps,
@@ -290,6 +290,14 @@ impl MdCodec for ToyMd {
         _fx: &mut Effects,
     ) -> Result<(), DecodeError> {
         let f = Frame::parse(text(f)?)?;
+        if f.kind == "refused" {
+            // The venue refused the subscription to the toy's one feed: reported by instrument
+            // and feed, and nothing asked for, so nothing is retried.
+            let (inst, feed) = (f.inst(specs)?, Feed::Touch(TouchSourceId(0)));
+            let h = FeedHealth::Refused;
+            sink.push(VenueMeta::NONE, MdEvent::Health { inst, feed, h });
+            return Ok(());
+        }
         if f.kind != "touch" {
             return Err(DecodeError::Malformed("kind"));
         }
@@ -1433,6 +1441,34 @@ fn the_toy_charges_its_encode_resync_keepalive_and_subscribe_traffic() {
 // ---------------------------------------------------------------------------------------------
 // The rest of the boundary the toy uses.
 // ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a_subscription_the_venue_refused_is_reported_by_instrument_and_feed_and_nothing_is_retried() {
+    // The subscription goes out as one frame.
+    let (specs, mut fx) = (specs(), Effects::new());
+    let touch = Subscription {
+        inst: INST,
+        feed: Feed::Touch(TouchSourceId(0)),
+    };
+    ToyMd.subscribe(&[touch], &[], &specs, &mut fx).unwrap();
+    assert_eq!(fx.len(), 1);
+    // The venue's refusal is an event naming the instrument and the feed, not a decode error
+    // the runtime would only count; decoding it asks for no effect (decode_md checks), so no
+    // subscribe is resent and no reconnect is asked for. A refusal naming an instrument the
+    // spec table lacks is refused itself, pushing nothing.
+    let (results, sink) = decode_md(&[
+        RawFrame::Text("refused|sym=TOY-PERP"),
+        RawFrame::Text("refused|sym=NOPE-PERP"),
+    ]);
+    assert_eq!(results, [Ok(()), Err(DecodeError::UnknownInstrument)]);
+    let refused = MdEvent::Health {
+        inst: touch.inst,
+        feed: touch.feed,
+        h: FeedHealth::Refused,
+    };
+    assert_eq!(sink.bodies(), [&refused]);
+    assert_eq!(sink.0[0].venue_seq, None);
+}
 
 #[test]
 fn the_toy_decodes_market_data_frames_into_md_events() {

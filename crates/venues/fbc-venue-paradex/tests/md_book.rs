@@ -16,7 +16,7 @@ use fbc_core::{
 use fbc_venue_paradex::ParadexFactory;
 use fbc_venue_paradex::factory::{MD_URL, caps};
 use fbc_venue_paradex::md::{BBO, DELTAS, INTERACTIVE_DELTAS, ParadexMd};
-use md::{BTC, Decoded, ETH, decode_with, frame, raw, specs};
+use md::{BTC, Decoded, ETH, decode_with, frame, raw, refused_sub, rpc_error, specs};
 
 /// BookEvent.ts in the hand-built fixtures, in microseconds.
 const TS_US: i64 = 1_759_500_000_123_456;
@@ -91,6 +91,40 @@ fn pushed(out: &Decoded, events: &[(VenueMeta, MdEvent)]) {
     assert_eq!(out.result, Ok(()));
     assert_eq!(out.events, events);
     assert!(out.fx.is_empty(), "{:?}", out.fx);
+}
+
+#[test]
+fn a_refused_book_subscribe_is_reported_and_its_frames_are_not_applied_until_asked_again() {
+    // Request 1 subscribed BTC's deltas book; the venue refuses it (FBC-50m).
+    let mut codec = codec(DELTAS);
+    let out = decode_with(&mut codec, RawFrame::Text(&rpc_error(1)));
+    pushed(&out, &[refused_sub(BTC, Feed::Book(DELTAS))]);
+    // Nothing of that book is applied: a snapshot still in flight pushes nothing.
+    let out = feed(&mut codec, &frame("book-snapshot.sbe.txt"));
+    pushed(&out, &[]);
+    // Subscribed again (the consumer's call), its next snapshot starts the book.
+    let mut fx = fbc_core::Effects::new();
+    let again = [sub(BTC, Feed::Book(DELTAS))];
+    codec.subscribe(&again, &[], &specs(), &mut fx).unwrap();
+    assert_eq!(fx.len(), 1);
+    let out = feed(&mut codec, &frame("book-snapshot.sbe.txt"));
+    pushed(&out, &snapshot_events(DELTAS, 1));
+}
+
+#[test]
+fn a_refusal_answering_an_older_subscribe_keeps_the_book_a_later_one_is_still_asking_for() {
+    // Request 1 subscribes, 2 unsubscribes and 3 subscribes the same channel again.
+    let mut codec = codec(DELTAS);
+    let mut fx = fbc_core::Effects::new();
+    let book = [sub(BTC, Feed::Book(DELTAS))];
+    codec.subscribe(&[], &book, &specs(), &mut fx).unwrap();
+    codec.subscribe(&book, &[], &specs(), &mut fx).unwrap();
+    assert_eq!(fx.len(), 2);
+    // The refusal of request 1 is reported, but request 3 still stands: its book is kept.
+    let out = decode_with(&mut codec, RawFrame::Text(&rpc_error(1)));
+    pushed(&out, &[refused_sub(BTC, Feed::Book(DELTAS))]);
+    let out = feed(&mut codec, &frame("book-snapshot.sbe.txt"));
+    pushed(&out, &snapshot_events(DELTAS, 1));
 }
 
 #[test]

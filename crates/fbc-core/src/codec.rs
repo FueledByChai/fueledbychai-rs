@@ -928,7 +928,10 @@ pub trait MdCodec: Send {
         specs: &SpecTable,
         fx: &mut Effects,
     ) -> Result<(), VenueError>;
-    /// Decode one frame. `Err` means nothing was pushed ([`MdSink`]).
+    /// Decode one frame. `Err` means nothing was pushed ([`MdSink`]). A frame in which the
+    /// venue refuses a subscription is reported, not failed: one
+    /// `MdEvent::Health { h: Refused, .. }` per subscription it refuses, naming the
+    /// instrument and feed, and no effect asked for to retry it (decision 0042).
     fn on_frame(
         &mut self,
         f: RawFrame<'_>,

@@ -9,7 +9,8 @@
 //! `MarketSummaryEvent` (template 4, `markets_summary.{market}`) into [`MdEvent::Mark`] and
 //! [`MdEvent::Funding`] ([`summary`]), each pushed while its feed is subscribed. Heartbeats
 //! (template 40) and templates it does not decode are skipped. A subscribe acknowledgement is
-//! consumed; a subscribe error is returned as the frame's error and never retried.
+//! consumed; a subscribe error is reported as [`FeedHealth::Refused`] for each subscription the
+//! channel was to carry, and never retried (decision 0042).
 //!
 //! [`rest`] decodes the REST order book snapshot (`/v1/orderbook/{market}` at depth 15).
 
@@ -22,10 +23,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use fbc_core::{
     Aggressor, BookId, DecodeError, DecodeScope, Effect, Effects, ExchNs, ExchTsKind, Feed,
-    HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans, InstrumentId, InstrumentSpec,
-    Keepalive, Lots, Lvl, MdCodec, MdEvent, MdSink, MonoNs, OpKind, PxExact, RateCharge, RawFrame,
-    SpecTable, StreamId, Subscription, Ticks, TimerTag, TouchSourceId, TrafficClass, VenueError,
-    VenueMeta, WallNs, WireSlice,
+    FeedHealth, HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans, InstrumentId,
+    InstrumentSpec, Keepalive, Lots, Lvl, MdCodec, MdEvent, MdSink, MonoNs, OpKind, PxExact,
+    RateCharge, RawFrame, SpecTable, StreamId, Subscription, Ticks, TimerTag, TouchSourceId,
+    TrafficClass, VenueError, VenueMeta, WallNs, WireSlice,
 };
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
@@ -79,13 +80,22 @@ enum Request {
     Unsubscribe,
 }
 
+/// A JSON-RPC request this codec sent and the venue has not answered yet.
+#[derive(Clone, Eq, PartialEq, Debug)]
+struct Sent {
+    request: Request,
+    /// The subscription the request was sent for.
+    sub: Subscription,
+    channel: String,
+}
+
 /// The market-data codec for one connection epoch of one Paradex WebSocket.
 #[derive(Debug)]
 pub struct ParadexMd {
     stream: StreamId,
     next_id: u64,
     /// Requests sent and not yet answered, by JSON-RPC id.
-    pending: BTreeMap<u64, Request>,
+    pending: BTreeMap<u64, Sent>,
     /// The one book channel each market may have on this connection: its first book
     /// subscription here fixes it, and an unsubscribe keeps it, since frames of the old channel
     /// can still arrive and name only their market.
@@ -139,12 +149,13 @@ impl ParadexMd {
         Ok((channel_of, active))
     }
 
-    /// Consumes a JSON-RPC text frame: an acknowledgement is consumed; an error is returned,
-    /// naming the request it answers, and asks for nothing, so nothing is retried.
-    fn on_text(&mut self, text: &str) -> Result<(), DecodeError> {
+    /// Consumes a JSON-RPC text frame: an acknowledgement is consumed; a refused subscribe is
+    /// reported ([`Self::refuse`]); any other error is returned, naming the request it
+    /// answers. None asks for anything, so nothing is retried.
+    fn on_text(&mut self, text: &str, sink: &mut dyn MdSink) -> Result<(), DecodeError> {
         let reply: Value = serde_json::from_str(text)
             .map_err(|_| DecodeError::Malformed("text frame is not JSON"))?;
-        let request = reply
+        let sent = reply
             .get("id")
             .and_then(Value::as_u64)
             .and_then(|id| self.pending.remove(&id));
@@ -156,11 +167,48 @@ impl ParadexMd {
                 "text frame is neither a reply nor an error",
             ));
         }
-        Err(DecodeError::Malformed(match request {
-            Some(Request::Subscribe) => "the venue refused a subscribe",
-            Some(Request::Unsubscribe) => "the venue refused an unsubscribe",
-            None => "the venue reported an error",
-        }))
+        match sent.map(|sent| (sent.request, sent)) {
+            Some((Request::Subscribe, sent)) => {
+                self.refuse(sent, sink);
+                Ok(())
+            }
+            Some((Request::Unsubscribe, _)) => {
+                Err(DecodeError::Malformed("the venue refused an unsubscribe"))
+            }
+            None => Err(DecodeError::Malformed("the venue reported an error")),
+        }
+    }
+
+    /// The venue refused subscribe request `sent`: pushes [`FeedHealth::Refused`] for each
+    /// subscription its channel was to carry (a market's `markets_summary` channel carries its
+    /// mark and its funding), which the codec then holds no longer, so their frames are not
+    /// pushed or applied and only a new subscription sends the channel again. When a later
+    /// subscribe to the same channel is still unanswered, this refusal answers the older
+    /// request only: it names the subscription it was sent for and keeps the codec's state.
+    fn refuse(&mut self, sent: Sent, sink: &mut dyn MdSink) {
+        let again = self
+            .pending
+            .values()
+            .any(|p| p.request == Request::Subscribe && p.channel == sent.channel);
+        let mut refused = BTreeSet::from([sent.sub]);
+        if !again {
+            let inst = sent.sub.inst;
+            match sent.sub.feed {
+                Feed::Mark | Feed::Funding => {
+                    let carried = |s: &Subscription| s.inst == inst;
+                    refused.extend(self.summary.iter().copied().filter(carried));
+                    self.summary.retain(|s| !carried(s));
+                }
+                Feed::Book(_) => {
+                    self.books.remove(&inst);
+                }
+                _ => {}
+            }
+        }
+        for Subscription { inst, feed } in refused {
+            let h = FeedHealth::Refused;
+            sink.push(VenueMeta::NONE, MdEvent::Health { inst, feed, h });
+        }
     }
 }
 
@@ -184,7 +232,7 @@ impl MdCodec for ParadexMd {
                 if summary_feed(sub.feed) && !summary_changes(&mut summary, request, *sub) {
                     continue;
                 }
-                frames.push((request, channel, sub.inst));
+                frames.push((request, channel, *sub));
             }
         }
         let (channel_of, active) = self.books_after(add, remove)?;
@@ -197,10 +245,9 @@ impl MdCodec for ParadexMd {
                 .or_insert_with(|| BookFeed::new(book));
         }
         self.channel_of = channel_of;
-        for (request, channel, inst) in frames {
+        for (request, channel, sub) in frames {
             let (id, method) = (self.next_id, request_method(request));
             self.next_id += 1;
-            self.pending.insert(id, request);
             let text = json!({
                 "jsonrpc": "2.0",
                 "method": method,
@@ -212,8 +259,16 @@ impl MdCodec for ParadexMd {
                 frame: WireSlice::plain(text.to_string().into_bytes()),
                 rpc: None,
                 class: TrafficClass::Normal,
-                charge: RateCharge::one(OpKind::Subscribe, Some(inst)),
+                charge: RateCharge::one(OpKind::Subscribe, Some(sub.inst)),
             });
+            self.pending.insert(
+                id,
+                Sent {
+                    request,
+                    sub,
+                    channel,
+                },
+            );
         }
         Ok(())
     }
@@ -227,7 +282,7 @@ impl MdCodec for ParadexMd {
         fx: &mut Effects,
     ) -> Result<(), DecodeError> {
         let frame = match f {
-            RawFrame::Text(text) => return self.on_text(text),
+            RawFrame::Text(text) => return self.on_text(text, sink),
             RawFrame::Binary(frame) => frame,
         };
         let msg = Message::parse(frame)?;
