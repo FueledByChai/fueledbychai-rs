@@ -1,0 +1,5 @@
+error[E0599]: no method named `is_on` found for mutable reference `&mut PathStamps<'_>` in the current scope
+ --> tests/ui_stamps/recording_state_hidden.rs:6:7
+  |
+6 |     t.is_on()
+  |       ^^^^^ method not found in `&mut PathStamps<'_>`

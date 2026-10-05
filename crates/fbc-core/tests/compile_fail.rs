@@ -65,8 +65,9 @@ fn a_not_found_rejection_is_not_a_terminal_state() {
 }
 
 /// A codec marks its stages through `PathStamps` and learns no time from it: it cannot reach the
-/// runtime's recorder through the handle, and neither `PathStamps` nor `PathRecorder::mark`
-/// returns the instant a mark was recorded at (decision 0033).
+/// runtime's recorder through the handle, cannot ask it whether it records (so it cannot tell
+/// live from replay), and neither `PathStamps` nor `PathRecorder::mark` returns the instant a
+/// mark was recorded at (decision 0033).
 #[test]
 fn path_stamps_give_a_codec_no_time() {
     let cases = trybuild::TestCases::new();
