@@ -42,6 +42,8 @@ pub(crate) struct Harness<'s> {
     pub caps: VenueCaps,
     specs: SpecTable,
     pub inst: InstrumentId,
+    /// The second instrument by id, where the setup lists one.
+    pub other_inst: Option<InstrumentId>,
     qty: Lots,
 }
 
@@ -66,12 +68,14 @@ impl<'s> Harness<'s> {
         // At least one lot, so an amend always leaves something to rest.
         let qty = Lots::new(spec.min_size.get().max(1)).expect("a positive count");
         let inst = spec.id;
+        let other_inst = setup.specs.iter().nth(1).map(|spec| spec.id);
         Ok(Harness {
             check,
             subject,
             caps,
             specs: setup.specs,
             inst,
+            other_inst,
             qty,
         })
     }
@@ -221,6 +225,13 @@ impl Shape {
         }
     }
 
+    /// Whether the caps declare a pair of this shape's features in conflict.
+    pub fn conflicts(self, o: &OrderCaps) -> bool {
+        o.flag_conflicts
+            .iter()
+            .any(|&(a, b)| self.has(a) && self.has(b))
+    }
+
     /// Why the caps refuse an order of this shape: `Unsupported` for a kind, time in force,
     /// channel or flag they do not declare, then `FlagConflict` for a pair of features they
     /// declare in conflict; `None` when they allow it.
@@ -233,11 +244,7 @@ impl Shape {
         if !offered {
             return Some(NotSentReason::Unsupported);
         }
-        let conflict = o
-            .flag_conflicts
-            .iter()
-            .any(|&(a, b)| self.has(a) && self.has(b));
-        conflict.then_some(NotSentReason::FlagConflict)
+        self.conflicts(o).then_some(NotSentReason::FlagConflict)
     }
 }
 

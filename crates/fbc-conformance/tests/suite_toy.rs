@@ -92,7 +92,6 @@ fn commands_selfcontained_encodes_every_declared_reference_on_the_toy() {
     assert_eq!(
         probed,
         [
-            "control: the placement a warm codec sees first",
             "AmendCaps.refs has Venue: an amend",
             "OrderCaps.cancel_refs has Venue: a cancel",
             "OrderCaps.cancel_refs has Client: a cancel",

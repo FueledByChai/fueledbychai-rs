@@ -11,7 +11,8 @@
 //! differently once it has seen the placement depends on state the command does not carry.
 //! A placement nonce is probed only where some command can name its order by it, behind a
 //! target the operation does not take. The placement the warm codec sees is the plainest order
-//! the caps allow, and must itself be sent (a control); where they allow no order there is no
+//! the caps allow, and must itself be sent, carrying its request, on each warm codec, or the
+//! command is a breach left uncompared; where they allow no order there is no
 //! warm codec, and amends, which target a resting limit order, are probed only where the caps
 //! allow a limit order.
 //!
@@ -48,34 +49,22 @@ pub fn commands_selfcontained(subject: &Subject<'_>) -> Result<Verdict, Failure>
     }
     let mut breaches = Vec::new();
     let mut probed = Vec::new();
-    // The placement a warm codec sees first, which must be sent for the comparison to mean
-    // anything; none where the caps allow no order.
+    // The placement a warm codec sees first; none where the caps allow no order.
     let place = Shape::plain(&exec.order).map(|shape| VenueCommand::Place(ids.order(&h, 0, shape)));
-    if let Some(place) = &place {
-        let label = "control: the placement a warm codec sees first".to_owned();
-        if let Err(why) = h.encode(h.exec_codec()?.as_mut(), place, PLACE_RPC).result {
-            let what = format!(
-                "refused as NotSent({why:?}) though the caps allow it, so no codec here has seen \
-                 the order placed"
-            );
-            breaches.push(Breach {
-                capability: label.clone(),
-                what,
-            });
-        }
-        probed.push(label);
-    }
     for (label, cmd) in commands {
         let fresh = h.encode(h.exec_codec()?.as_mut(), &cmd, RPC);
-        let after_place = match &place {
+        // Each warm codec's placement must itself be sent, carrying its request, or the codec
+        // has seen nothing and the comparison proves nothing (Codex r4188991867).
+        let warm = match &place {
             Some(place) => {
                 let mut warm = h.exec_codec()?;
-                let _placed = h.encode(warm.as_mut(), place, PLACE_RPC);
-                Some(h.encode(warm.as_mut(), &cmd, RPC))
+                let placed = h.encode(warm.as_mut(), place, PLACE_RPC);
+                let sent = placed.result.is_ok()
+                    && placed.fx.carry_request(PLACE_RPC, place.traffic_class());
+                Some(sent.then(|| h.encode(warm.as_mut(), &cmd, RPC)))
             }
             None => None,
         };
-        let differs = after_place.is_some_and(|a| a.result != fresh.result || a.fx != fresh.fx);
         let class = cmd.traffic_class();
         let what = match &fresh.result {
             Err(why) => Some(format!(
@@ -86,12 +75,19 @@ pub fn commands_selfcontained(subject: &Subject<'_>) -> Result<Verdict, Failure>
                  {class:?} traffic",
                 RPC.0
             )),
-            Ok(_) if differs => Some(
-                "encoded differently by a codec that first saw the order placed: it \
-                      depends on state the command does not carry"
-                    .to_owned(),
-            ),
-            Ok(_) => None,
+            Ok(_) => match warm {
+                Some(None) => Some(
+                    "not compared: the placement a codec was to see first was refused or sent \
+                     without its request, though the caps allow it"
+                        .to_owned(),
+                ),
+                Some(Some(after)) if after.result != fresh.result || after.fx != fresh.fx => Some(
+                    "encoded differently by a codec that first saw the order placed: it \
+                     depends on state the command does not carry"
+                        .to_owned(),
+                ),
+                _ => None,
+            },
         };
         if let Some(what) = what {
             breaches.push(Breach {

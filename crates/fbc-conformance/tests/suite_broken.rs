@@ -34,6 +34,13 @@ fn assumed() -> Setup {
     }
 }
 
+/// A setup with the toy's first instrument only.
+fn one_instrument() -> Setup {
+    let mut specs = SpecTable::new();
+    specs.insert(toy::specs().get(toy::INST_A).unwrap().clone());
+    Setup { specs, ..assumed() }
+}
+
 /// A setup with no instrument.
 fn no_instruments() -> Setup {
     Setup {
@@ -55,6 +62,13 @@ enum Twist {
     RefusesAll,
     /// Every placement is refused `Unsupported`.
     RefusesPlacements,
+    /// A placement's frames name no rpc.
+    UnlabelledPlacements,
+    /// An instrument cancel-all is written as an account-wide one, still charged to its
+    /// instrument.
+    AccountWide,
+    /// A cancel-all goes as an HTTP request whose body is the frame it would have been.
+    OverHttp,
     /// A sent request's frames name no rpc.
     Unlabelled,
     /// Every charge names no instrument.
@@ -238,6 +252,78 @@ impl ExecCodec for Twisted {
             (Twist::RefusesAll, _) => {
                 fx.take();
                 Err(NotSentReason::Unsupported)
+            }
+            (Twist::UnlabelledPlacements, Ok(receipt)) if matches!(cmd, VenueCommand::Place(_)) => {
+                for effect in fx.take() {
+                    fx.push(match effect {
+                        Effect::Send {
+                            stream,
+                            frame,
+                            class,
+                            charge,
+                            ..
+                        } => Effect::Send {
+                            stream,
+                            frame,
+                            rpc: None,
+                            class,
+                            charge,
+                        },
+                        other => other,
+                    });
+                }
+                Ok(receipt)
+            }
+            (Twist::AccountWide, Ok(receipt)) if matches!(cmd, VenueCommand::CancelAll(_)) => {
+                for effect in fx.take() {
+                    fx.push(match effect {
+                        Effect::Send {
+                            stream,
+                            rpc,
+                            class,
+                            charge,
+                            ..
+                        } => Effect::Send {
+                            stream,
+                            frame: fbc_core::WireSlice::plain(
+                                format!("cancelall|rpc={}", rpc.unwrap().id.0).into_bytes(),
+                            ),
+                            rpc,
+                            class,
+                            charge,
+                        },
+                        other => other,
+                    });
+                }
+                Ok(receipt)
+            }
+            (Twist::OverHttp, Ok(receipt)) if matches!(cmd, VenueCommand::CancelAll(_)) => {
+                for effect in fx.take() {
+                    let Effect::Send {
+                        frame,
+                        rpc,
+                        class,
+                        charge,
+                        ..
+                    } = effect
+                    else {
+                        unreachable!("the toy's cancel-all is one frame");
+                    };
+                    fx.push(Effect::Http {
+                        tag: HttpTag(1),
+                        req: fbc_core::HttpRequest {
+                            method: fbc_core::HttpMethod::Delete,
+                            url: fbc_core::WireUrl::plain("https://toy.invalid/orders"),
+                            headers: Vec::new(),
+                            body: frame,
+                        },
+                        rpc: rpc.map(|call| call.id),
+                        timeout: core::time::Duration::from_secs(5),
+                        class,
+                        charge,
+                    });
+                }
+                Ok(receipt)
             }
             (Twist::Unlabelled | Twist::Widened, Ok(receipt)) => {
                 for effect in fx.take() {
@@ -507,16 +593,33 @@ fn commands_selfcontained_names_a_reference_the_toy_declares_but_does_not_take()
 
 #[test]
 fn caps_truthful_probes_a_declaration_that_takes_no_order_or_reference_at_all() {
-    // Nothing an order can be: the plainest placement is refused, so nothing is varied.
-    let no_kinds = Broken::declaring(|caps| order(caps).kinds = TagSet::none());
+    // Nothing an order can be: the first order named is refused, and every absence is still
+    // probed on it, in a placement, a batch and an amend (Codex r4188991858); no control is.
+    let no_kinds = Broken::declaring(|caps| {
+        order(caps).kinds = TagSet::none();
+        order(caps).post_only = false;
+    });
     let failure = failed(no_kinds.caps_truthful());
-    let what = said(&failure, "OrderCaps allows no order: the first it names");
-    assert!(what.starts_with("sent"), "{failure}");
+    for capability in [
+        "OrderCaps allows no order: the first it names",
+        "OrderCaps.post_only is false (a batch item)",
+        "OrderCaps allows no limit order to amend",
+        "OrderCaps.post_only is false (an amend)",
+    ] {
+        assert!(said(&failure, capability).starts_with("sent"), "{failure}");
+    }
+    let controls = [
+        "control: a placement",
+        "control: a batch placement",
+        "control: an amend",
+    ];
+    assert!(!controls.iter().any(|c| failure.names(c)), "{failure}");
+    // Where the toy refuses, for the probe's reason or another that applies, there is no
+    // breach: a post-only IOC order of no declared kind may be refused as either.
+    assert!(!failure.names("OrderCaps.tifs lacks Fok"), "{failure}");
     assert!(
-        !failure
-            .breaches
-            .iter()
-            .any(|b| b.capability.contains("(a batch item)"))
+        !failure.names("OrderCaps.flag_conflicts has (PostOnly, Ioc)"),
+        "{failure}"
     );
 
     // Market orders only: nothing to amend, and the toy refuses the market control.
@@ -637,9 +740,7 @@ fn a_codec_that_refuses_everything_fails_every_control() {
         what,
         "refused as NotSent(Unsupported) by a freshly built codec"
     );
-    assert_eq!(failure.breaches.len(), 8, "{failure}");
-    let warm = said(&failure, "control: the placement a warm codec sees first");
-    assert!(warm.starts_with("refused as NotSent(Unsupported) though the caps allow it"));
+    assert_eq!(failure.breaches.len(), 7, "{failure}");
 }
 
 #[test]
@@ -673,6 +774,64 @@ fn an_instrument_cancel_all_charged_to_no_instrument_is_widened() {
     );
     // Only the cancel-all is held to its instrument.
     assert_eq!(failure.breaches.len(), 1, "{failure}");
+}
+
+#[test]
+fn an_instrument_cancel_all_written_as_the_accounts_is_widened_whatever_its_charge() {
+    // Codex r4188991848: charged to its instrument, but the request names none.
+    let failure = failed(Broken::twisted(Twist::AccountWide).caps_truthful());
+    let what = said(
+        &failure,
+        "OrderCaps.cancel_all_instrument is Native: never widened",
+    );
+    assert_eq!(
+        what,
+        "written exactly as the cancel-all of another instrument: it does not name instrument \
+         7, so it cancels beyond it"
+    );
+    assert_eq!(failure.breaches.len(), 1, "{failure}");
+
+    // With one instrument there is no second to compare it with: the setup must list two.
+    let subject = Subject::new(&ToyFactory, FIXTURES, one_instrument).unwrap();
+    let failure = failed(suite::caps_truthful(&subject));
+    let what = said(
+        &failure,
+        "OrderCaps.cancel_all_instrument is Native: never widened",
+    );
+    assert!(what.ends_with("names its own: list two"), "{what}");
+}
+
+#[test]
+fn an_instrument_cancel_all_over_http_is_compared_by_its_request() {
+    // Each request names its instrument in its body, so neither is widened.
+    assert!(matches!(
+        Broken::twisted(Twist::OverHttp).caps_truthful(),
+        Ok(Verdict::Passed { .. })
+    ));
+}
+
+#[test]
+fn every_reference_declared_and_the_longest_batches_leave_nothing_to_probe_past() {
+    // Every reference an operation can take is declared, and no batch can be longer than its
+    // limit: none of those absences is probed, and the toy's controls still pass.
+    let broken = Broken::declaring(|caps| {
+        let o = order(caps);
+        let all = TagSet::of(&[RefKind::Venue, RefKind::Client, RefKind::PlacementNonce]);
+        o.amend.as_mut().unwrap().refs = TagSet::of(&[RefKind::Venue, RefKind::Client]);
+        o.query_refs = all;
+        o.batch_cancel = Some(CancelBatch {
+            max_items: u16::MAX,
+            refs: all,
+        });
+        o.batch_place = Some(Batch {
+            max_items: u16::MAX,
+        });
+    });
+    let Ok(Verdict::Passed { probed, .. }) = broken.caps_truthful() else {
+        panic!("the toy keeps every control");
+    };
+    let past = |p: &&String| p.contains("lacks [") || p.contains("max_items");
+    assert!(!probed.iter().any(|p| past(&p)), "{probed:?}");
 }
 
 #[test]
@@ -731,10 +890,19 @@ fn the_control_order_is_the_first_the_caps_allow_not_the_first_they_name() {
 
 #[test]
 fn commands_selfcontained_needs_its_warm_placement_sent_and_skips_amends_of_no_limit_order() {
+    // A codec whose placements are refused never sees one, so nothing it encodes after is
+    // compared, and each command says so (Codex r4188991867).
     let failure = failed(Broken::twisted(Twist::RefusesPlacements).commands_selfcontained());
-    let warm = said(&failure, "control: the placement a warm codec sees first");
-    assert!(warm.starts_with("refused as NotSent(Unsupported) though the caps allow it"));
-    assert_eq!(failure.breaches.len(), 1, "{failure}");
+    let what = said(&failure, "OrderCaps.cancel_refs has Client: a cancel");
+    assert!(what.starts_with("not compared: the placement a codec was to see first was refused"));
+    assert_eq!(failure.breaches.len(), 7, "{failure}");
+    // So does one whose placements carry no request.
+    let failure = failed(Broken::twisted(Twist::UnlabelledPlacements).commands_selfcontained());
+    let what = said(&failure, "OrderCaps.query_refs has Venue: a query");
+    assert!(
+        what.ends_with("sent without its request, though the caps allow it"),
+        "{what}"
+    );
 
     // No order allowed: no warm codec and no amend, and the cancels and queries still encode.
     let no_orders = Broken::declaring(|caps| order(caps).kinds = TagSet::none());
