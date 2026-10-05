@@ -358,11 +358,12 @@ impl OrderRecord {
     /// is ignored, though an amend's replacement of one venue id by another, a fact whenever
     /// it arrives, is still recorded; it supersedes the current id too when it replaces one a
     /// fill named, or arrives under a later venue ordering key. The venue's price and total
-    /// apply when the update states them, except a total below any the venue may hold ([`Self::resting`]) while a command
-    /// is in flight, from an update without a venue
-    /// ordering key later than the last applied's: it may be a delayed or duplicate one from
-    /// before an amend that raised the total, so neither applies, and an amend in flight to
-    /// that lower total stays in flight, counted. `cum_venue` keeps the largest cumulative fill. An Open update moves the order to
+    /// apply when the update states them, except a total below any the venue may hold
+    /// ([`Self::resting`]) while a command is in flight, or a price other than the order's
+    /// while an amend is in flight from an update that is not an amended one, either from an
+    /// update without a venue ordering key later than the last applied's: it may be a delayed
+    /// or duplicate one from before an earlier amend, so neither applies, and the amend in
+    /// flight stays in flight, counted. `cum_venue` keeps the largest cumulative fill. An Open update moves the order to
     /// Open, or PartiallyFilled once something is filled; an amended update moves no state.
     /// An update stating a price or total that applies, and leaving the order at the price and
     /// total of the amend in flight, confirms it; the record already at those values confirms
@@ -404,11 +405,15 @@ impl OrderRecord {
         // unsettled one's), with a command in flight, from an update nothing shows is later
         // than the last applied, may be a delayed or duplicate one from before an amend that
         // raised the total: neither its price nor its total applies (a terminal update ends
-        // the order whatever it states).
-        let stale_lower = u.qty.is_some_and(|q| q < self.ceiling())
-            && self.intent != Intent::None
-            && !later
-            && ends.is_none();
+        // the order whatever it states). Nor do they from such an update moving the price
+        // while an amend is in flight, unless it is an amended one: an Open or other update
+        // may be a delayed or duplicate one from before an earlier amend, and would confirm a
+        // price-only amend the venue may yet refuse.
+        let unordered = self.intent != Intent::None && !later && ends.is_none();
+        let stale_px = matches!(self.intent, Intent::PendingAmend { .. })
+            && !matches!(u.state, VenueOrderState::Amended { .. })
+            && u.px.is_some_and(|p| Some(p) != self.px);
+        let stale_lower = unordered && (u.qty.is_some_and(|q| q < self.ceiling()) || stale_px);
         // Whether the update stated a price or total that applied: only such an update, or an
         // amended one tied to the amend in flight, can show the order at the amend's values;
         // the record matching them already shows nothing new.
@@ -1013,6 +1018,41 @@ mod tests {
         rec.on_outcome(OrderOp::Cancel(RpcId(4)), None, &refused(), MonoNs(4));
         rec.apply_update(&open, key(1));
         assert_eq!(rec.resting(), lots(9));
+    }
+
+    #[test]
+    fn a_stale_update_echoing_a_price_only_amend_in_flight_does_not_confirm_it() {
+        // Codex r4185208110: 5@100 amended to 5@101, then an amend back to 5@100 is in flight
+        // and a duplicate of the original Open, stating 5@100, arrives without a venue key.
+        let mut rec = order(5);
+        let mut open = update(VenueOrderState::Open, 0);
+        (open.px, open.qty) = (Some(Ticks(100)), Some(lots(5)));
+        rec.apply_update(&open, key(1));
+        assert!(rec.amend_sent(Ticks(101), lots(5), RpcId(3), MonoNs(2)));
+        let mut a1 = update(VenueOrderState::Amended { new_vid: None }, 0);
+        (a1.px, a1.qty) = (Some(Ticks(101)), Some(lots(5)));
+        rec.apply_update(&a1, key(2));
+        assert_eq!(rec.intent(), Intent::None);
+        assert!(rec.amend_sent(Ticks(100), lots(5), RpcId(4), MonoNs(3)));
+        assert_eq!(rec.apply_update(&open, key(3)), Applied::Advanced);
+        assert_eq!(
+            rec.px(),
+            Some(Ticks(101)),
+            "the echo's price does not apply"
+        );
+        assert!(matches!(rec.intent(), Intent::PendingAmend { px, .. } if px == Ticks(100)));
+        // The amend is refused: the order still rests at 101.
+        rec.on_outcome(OrderOp::Amend(RpcId(4)), None, &refused(), MonoNs(4));
+        assert_eq!(rec.px(), Some(Ticks(101)));
+        // The same update under a venue key later than any applied is no echo: it confirms.
+        let mut rec = order(5);
+        rec.apply_update(&open, keyed(1, 1));
+        assert!(rec.amend_sent(Ticks(101), lots(5), RpcId(3), MonoNs(2)));
+        let mut moved = open.clone();
+        moved.px = Some(Ticks(101));
+        rec.apply_update(&moved, keyed(2, 2));
+        assert_eq!(rec.intent(), Intent::None);
+        assert_eq!(rec.px(), Some(Ticks(101)));
     }
 
     #[test]

@@ -219,7 +219,9 @@ fn a_new_venue_id_alone_does_not_tie_a_confirmation_to_the_amend_in_flight() {
     open.vid = Some(vid("v1"));
     rec.apply_update(&open, at(None, 0));
     rec.amend_sent(Ticks(101), lots(6), RpcId(1), MonoNs(1));
-    let mut a1 = update(None, VenueOrderState::Open, 0);
+    // An amended update confirms A1 (on a feed without venue keys, an Open moving the price
+    // may be an echo from before an earlier amend, and confirms nothing).
+    let mut a1 = update(None, VenueOrderState::Amended { new_vid: None }, 0);
     (a1.px, a1.qty) = (Some(Ticks(101)), Some(lots(6)));
     rec.apply_update(&a1, at(None, 1));
     assert_eq!(rec.intent(), Intent::None);
