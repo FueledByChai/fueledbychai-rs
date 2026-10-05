@@ -1,6 +1,6 @@
 [package]
 name = "fbc-conformance"
-description = "The adapter conformance kit: so far a stub venue server on 127.0.0.1 that plays WebSocket fault scripts and fixed HTTP responses, the reconnect-storm, duplicate-ack and silence-after-subscription scripts, and a check of connection attempts against reconnect pacing."
+description = "The adapter conformance kit: so far a stub venue server on 127.0.0.1 that plays WebSocket fault scripts and fixed HTTP responses, the reconnect-storm, duplicate-ack and silence-after-subscription scripts, a check of connection attempts against reconnect pacing, and the conformance toy venue's order entry."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,16 +8,16 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
-# It depends on fbc-runtime (and, in its tests, fbc-core), never on a venue crate: venue crates
-# take it as a dev-dependency (design §6 step 12).
+# It depends on fbc-runtime and fbc-core (the conformance toy venue, src/toy/), never on a venue
+# crate: venue crates take it as a dev-dependency (design §6 step 12).
 [dependencies]
+fbc-core = { path = "../fbc-core" }
 fbc-runtime = { path = "../fbc-runtime" }
+# The conformance toy's instrument specs (price grids and size steps are decimals).
+rust_decimal.workspace = true
 tokio = { workspace = true, features = ["rt", "net", "io-util", "macros", "sync", "time"] }
 tokio-tungstenite.workspace = true
 futures-util = { workspace = true, features = ["sink", "std"] }
 
 [dev-dependencies]
-fbc-core = { path = "../fbc-core" }
 tokio = { workspace = true, features = ["rt", "net", "io-util", "macros", "sync", "time", "test-util"] }
-# The runtime's toy market-data venue (crates/fbc-runtime/tests/common/toy.rs) needs it.
-rust_decimal.workspace = true

@@ -219,13 +219,16 @@ rather than guess.
     behind public size that joins later, advanced by level cancels per bracket and filled by
     trades at or through its price, 0038; still planned: the simulated venue,
     FBC-uoo), `crates/fbc-conformance` (the adapter conformance kit,
-    0025; it depends on `fbc-runtime`, and on `fbc-core` in its tests, never on a venue crate: so
+    0025; it depends on `fbc-runtime` and `fbc-core`, never on a venue crate: so
     far a public stub venue server on 127.0.0.1 ephemeral ports, a WebSocket endpoint that plays
     a fault script of typed steps and records every connection and data frame, and an HTTP/1.1
     endpoint with fixed responses by path; the reconnect-storm script and a check of connection
     attempts against `ReconnectPacing`; the duplicate-ack and silence-after-subscription
     scripts; venue crates take it as a dev-dependency instead of writing their own servers;
-    still planned: the named suite and its macro, and the full conformance venue).
+    and `src/toy/`, the conformance toy venue BT-502 means (0044), public and includable by path
+    from another crate's tests, so far its order entry: every command kind encoded through
+    `ExecCodec`, each declared order capability checked before signing; still planned: the named
+    suite and its macro, and the rest of the conformance toy).
   - `crates/venues/fbc-venues` (the registry, the only crate that sees concrete venues),
     `crates/venues/fbc-venue-binance-usdm` (market data only:
     `exec: None` caps citing Binance's USD-M pages, `plan_md` on the `/public` combined-stream
