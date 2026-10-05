@@ -1030,3 +1030,63 @@ fn an_amend_while_an_earlier_one_that_replaces_the_venue_id_is_unconfirmed_does_
             .is_ok()
     );
 }
+
+#[test]
+fn an_amend_confirmed_without_its_new_venue_id_leaves_the_old_id_out_of_every_later_command() {
+    // Codex r4187102109: on a venue whose amend gives a new id, a confirmation that does not
+    // echo it retires the old id without teaching the new one.
+    let replacing = |refs: &[RefKind]| OrderCaps {
+        amend: Some(AmendCaps {
+            keeps_venue_id: false,
+            ..amend_caps(refs, true)
+        }),
+        ..caps_with(refs, false)
+    };
+    let mut reg = Registry::new();
+    let c = order_at(&mut reg, Ack::AckedVid, false);
+    let old = reg.get(c).unwrap().vid().cloned().unwrap();
+    reg.amend_sent(c, Ticks(101), lots(10), RpcId(1), MonoNs(1))
+        .unwrap();
+    let mut amended = update(Some(c), VenueOrderState::Amended { new_vid: None }, 0);
+    amended.vid = Some(old.clone());
+    amended.px = Some(Ticks(101));
+    amended.qty = Some(lots(10));
+    reg.apply_update(
+        &amended,
+        OrderKey {
+            venue: Some(5),
+            ingest: 2,
+        },
+    );
+    let rec = reg.get(c).unwrap();
+    assert!(!rec.amend_unconfirmed());
+    assert!(rec.vid_retired());
+
+    // By venue id only: the cancel waits and the amend is refused, rather than name `old`.
+    let by_venue = replacing(&[RefKind::Venue]);
+    assert_eq!(
+        reg.live(c)
+            .unwrap()
+            .amend(&by_venue, Ticks(102), lots(10), false),
+        Err(AmendRefusal::NoDeclaredReference)
+    );
+    assert_eq!(
+        reg.cancellable(c).unwrap().cancel(&by_venue),
+        CancelChoice::AwaitAck
+    );
+    // By client id too: the client id names it.
+    let both = replacing(&[RefKind::Venue, RefKind::Client]);
+    let CancelChoice::Send(cmd) = reg.cancellable(c).unwrap().cancel(&both) else {
+        panic!("the client id names the order")
+    };
+    assert_eq!(single(&cmd).target, OrderRef::Client(c));
+    // A venue that keeps the id across amends still names it.
+    let keeping = OrderCaps {
+        amend: Some(amend_caps(&[RefKind::Venue], true)),
+        ..caps_with(&[RefKind::Venue], false)
+    };
+    let CancelChoice::Send(cmd) = reg.cancellable(c).unwrap().cancel(&keeping) else {
+        panic!("the kept id names the order")
+    };
+    assert_eq!(single(&cmd).target, OrderRef::Both(c, old));
+}

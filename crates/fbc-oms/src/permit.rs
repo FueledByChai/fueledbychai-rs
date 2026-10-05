@@ -320,10 +320,12 @@ pub(crate) fn batches(items: Vec<CancelOrder>, max_items: u16) -> Vec<PermittedC
 
 impl OrderRecord {
     /// The reference that names the order in a command: our client id, with the venue's id
-    /// once known, unless an amend not yet confirmed may have replaced it on a venue whose
-    /// amend gives the order a new id ([`OrderRecord::amend_unconfirmed`]).
+    /// once known, unless, on a venue whose amend gives the order a new id, an amend not yet
+    /// confirmed may have replaced it ([`OrderRecord::amend_unconfirmed`]) or one confirmed
+    /// without naming the new id did ([`OrderRecord::vid_retired`]).
     pub(crate) fn order_ref(&self, caps: &OrderCaps) -> OrderRef {
-        let retiring = caps.amend.is_some_and(|a| !a.keeps_venue_id) && self.amend_unconfirmed();
+        let retiring = caps.amend.is_some_and(|a| !a.keeps_venue_id)
+            && (self.amend_unconfirmed() || self.vid_retired());
         match self.vid() {
             Some(vid) if !retiring => OrderRef::Both(self.cid(), vid.clone()),
             _ => OrderRef::Client(self.cid()),
