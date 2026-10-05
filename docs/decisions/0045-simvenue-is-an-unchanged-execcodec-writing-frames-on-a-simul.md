@@ -69,11 +69,14 @@ SimVenue is two halves joined by a simulated order-entry stream:
   0009).
 - **Not yet.** RPI orders are refused, since a public trade feed does not say which flow was
   retail and the queue model fills RPI orders from retail flow only (FBC-njk). Placements for a
-  venue whose `ack` is `AckModel::TwoPhase` are refused (`NotSent(Unsupported)`), since the
-  engine accepts in one phase and would report a provisional acceptance as final (FBC-zr1).
-  `resync` answers nothing (FBC-bq3). A crossing order meets only the displayed book: not the
-  venue's own resting orders, and two crossing orders between book updates can take the same
-  lots (FBC-4qr). Reduce-only is echoed, not enforced, since the engine keeps no position.
+  venue whose events the engine cannot say yet are refused (`NotSent(Unsupported)`) rather than
+  answered with events unlike its own: one whose `ack` is `AckModel::TwoPhase`, since the engine
+  accepts in one phase and would report a provisional acceptance as final (FBC-zr1), and one
+  whose `ordering_key` is not `VenueSeq`, whose fills carry realized P&L or funding, or whose
+  fills are derived from order status (FBC-938); cancels still go. `resync` answers nothing
+  (FBC-bq3). A crossing order meets only the displayed book: not the venue's own resting orders,
+  and two crossing orders between book updates can take the same lots (FBC-4qr). Reduce-only is
+  echoed, not enforced, since the engine keeps no position.
 
 ## Alternatives
 

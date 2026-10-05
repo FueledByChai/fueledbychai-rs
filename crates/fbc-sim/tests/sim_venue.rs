@@ -1902,3 +1902,71 @@ fn a_two_phase_venue_is_not_stood_in_for_yet() {
     assert_eq!(refused.err(), Some(NotSentReason::Unsupported));
     assert!(v.encode(&cancel(OrderRef::Client(cid())), 2, T0).is_ok());
 }
+
+#[test]
+fn a_venue_whose_events_the_engine_cannot_say_yet_is_not_stood_in_for() {
+    // Codex r4182991971, r4182991978: the engine orders its answers by a venue sequence and
+    // keeps no position, and sends fills of their own; a venue ordered otherwise, whose fills
+    // carry realized P&L or funding, or whose fills are derived from order status, gets no
+    // placement rather than events unlike its own (FBC-938). Cancels still go.
+    let changes: [&dyn Fn(&mut SimConfig); 6] = [
+        &|c| c.exec.order.ordering_key = OrderingKey::VenueTs,
+        &|c| c.exec.order.ordering_key = OrderingKey::BlockTime,
+        &|c| c.exec.order.ordering_key = OrderingKey::None,
+        &|c| c.exec.fills.realized_pnl = true,
+        &|c| c.exec.fills.realized_funding = true,
+        &|c| c.exec.fills.source = FillSource::DerivedFromOrderStatus,
+    ];
+    for change in changes {
+        let mut config = config(Bracket::Optimistic, VenueFeeSign::PositiveIsCost, fees());
+        change(&mut config);
+        let mut v = Venue::with(config);
+        let refused = v.encode(&limit(cid(), Side::Buy, 199, 1), 1, T0);
+        assert_eq!(refused.err(), Some(NotSentReason::Unsupported));
+        assert!(v.encode(&cancel(OrderRef::Client(cid())), 2, T0).is_ok());
+    }
+}
+
+#[test]
+fn a_cancel_needs_no_spec_for_its_instrument() {
+    // Codex r4182991965: a cancel names only the order, so an instrument the spec table no
+    // longer lists does not stop it; a placement still needs the spec.
+    let mut v = Venue::new(Bracket::Optimistic);
+    v.snapshot(T0, &[(199, 6)], &[(201, 5)]);
+    let order = cid();
+    v.send(limit(order, Side::Buy, 199, 1), 1, T0);
+    v.tick(T0 + 5 * MS);
+    assert_eq!(v.answers().len(), 2);
+    v.specs = SpecTable::new();
+    assert_eq!(
+        v.encode(&limit(cid(), Side::Buy, 199, 1), 2, T0 + 6 * MS)
+            .err(),
+        Some(NotSentReason::Unencodable)
+    );
+    v.send(cancel(OrderRef::Client(order)), 3, T0 + 6 * MS);
+    v.tick(T0 + 11 * MS);
+    let got = v.answers();
+    assert_eq!(outcome_of(&got[0].1), Some((3, ACCEPTED)), "{got:?}");
+}
+
+#[test]
+fn a_cancel_names_a_venue_id_by_its_exact_spelling() {
+    // Codex r4182991987: "S00" and "S+0" are not "S0"; a cancel naming them finds nothing and
+    // the order rests on.
+    let mut v = Venue::new(Bracket::Optimistic);
+    v.snapshot(T0, &[(199, 6)], &[(201, 5)]);
+    v.send(limit(cid(), Side::Buy, 199, 1), 1, T0);
+    v.tick(T0 + 5 * MS);
+    assert_eq!(v.answers().len(), 2);
+    for (rpc, spelling) in [(2, "S00"), (3, "S+0")] {
+        let vid = dispatch(&v.caps, NS, |scope| scope.venue_order_id(spelling)).unwrap();
+        v.send(cancel(OrderRef::Venue(vid)), rpc, T0 + 6 * MS);
+    }
+    let real = dispatch(&v.caps, NS, |scope| scope.venue_order_id("S0")).unwrap();
+    v.send(cancel(OrderRef::Venue(real)), 4, T0 + 6 * MS);
+    v.tick(T0 + 11 * MS);
+    let got = v.answers();
+    assert_eq!(rejected(&got[0].1), Some(RejectKind::NotFound), "{got:?}");
+    assert_eq!(rejected(&got[1].1), Some(RejectKind::NotFound), "{got:?}");
+    assert_eq!(outcome_of(&got[2].1), Some((4, ACCEPTED)), "{got:?}");
+}

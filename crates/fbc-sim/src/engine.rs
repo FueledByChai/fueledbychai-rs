@@ -458,7 +458,11 @@ impl SimEngine {
 
     fn cancel(&mut self, c: Cancel, at: At) {
         let n = match &c.target {
-            Target::Venue(vid) => vid.strip_prefix('S').and_then(|n| n.parse().ok()),
+            // Only the exact spelling the venue gave (Codex r4182991987): "S00" is not "S0".
+            Target::Venue(v) => {
+                let n = v.strip_prefix('S').and_then(|n| n.parse().ok());
+                n.filter(|&n| vid(n) == *v)
+            }
             Target::Client(cid) => self.by_cid.get(cid).copied(),
         };
         let Some(order) = n.and_then(|n| self.live.remove(&n).map(|o| (n, o))) else {
