@@ -196,6 +196,15 @@ pub struct QueryOrder {
     pub placement_nonce: Option<u64>,
 }
 
+impl QueryOrder {
+    /// The reference the query names its order by: the first of `declared` (the venue's
+    /// [`OrderCaps::query_refs`](crate::OrderCaps::query_refs)) the command carries, chosen as
+    /// a cancel's is, or `None` when it carries none of them; a codec refuses that query.
+    pub fn reference(&self, declared: TagSet<RefKind>) -> Option<ChosenRef<'_>> {
+        ChosenRef::choose(declared, &self.target, self.placement_nonce)
+    }
+}
+
 /// What a cancel-all covers. An instrument cancel-all is never widened to the account.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum CancelScope {
@@ -612,6 +621,37 @@ mod tests {
         assert_eq!(acked.reference(&by_client), None);
         let both = amend(OrderRef::Both(cid, vid.clone()));
         assert_eq!(both.reference(&by_client), Some(ChosenRef::Client(cid)));
+    }
+
+    #[test]
+    fn a_query_names_its_order_as_a_cancel_does() {
+        let vid = dispatch(&caps(), Namespace::new(1), |scope| {
+            scope.venue_order_id("V-3")
+        })
+        .unwrap();
+        let cid = ClientOrderId::new(Namespace::new(1), 3);
+        let query = |target, placement_nonce| QueryOrder {
+            target,
+            inst: InstrumentId::new(1),
+            placement_nonce,
+        };
+        let by = |kinds: &[RefKind]| TagSet::of(kinds);
+        let acked = query(OrderRef::Both(cid, vid.clone()), Some(8));
+        let venue_or_nonce = by(&[RefKind::Venue, RefKind::PlacementNonce]);
+        assert_eq!(
+            acked.reference(venue_or_nonce),
+            Some(ChosenRef::Venue(&vid))
+        );
+        // An order in Unknown with no venue id yet is queried by the nonce it was placed with.
+        let unacked = query(OrderRef::Client(cid), Some(8));
+        assert_eq!(
+            unacked.reference(venue_or_nonce),
+            Some(ChosenRef::PlacementNonce(8))
+        );
+        assert_eq!(
+            query(OrderRef::Client(cid), None).reference(venue_or_nonce),
+            None
+        );
     }
 
     #[test]
