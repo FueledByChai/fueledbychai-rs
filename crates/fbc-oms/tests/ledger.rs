@@ -582,6 +582,83 @@ fn a_fill_whose_instrument_or_side_disagrees_with_its_order_is_flagged_not_count
 }
 
 #[test]
+fn a_fill_whose_client_id_and_venue_id_name_different_orders_is_flagged_not_counted_and_not_kept() {
+    // Codex r4183571339: the client id names order A, the venue id order B, both on the
+    // same instrument and side.
+    let (mut l, mut reg) = session();
+    let (a, b) = (cid(), cid());
+    reg.insert(placement(a, 100, 10)).unwrap();
+    reg.insert(placement(b, 100, 10)).unwrap();
+    let mut open = update(Some(b), VenueOrderState::Open, 0);
+    open.vid = Some(common::vid("vb"));
+    reg.apply_update(&open, key(1));
+    let naming_b = |fid: &str| FillIdent::Venue {
+        fill: common::fill_id(fid),
+        vid: Some(common::vid("vb")),
+        cum_after: None,
+    };
+    let f = fill(Some(a), naming_b("f1"), Side::Buy, 4, false);
+    assert_eq!(
+        reg.apply_fill(accepted(l.admit(&f, None, MonoNs(0)))),
+        Ok(FillRouted::Conflicting { cid: a, by_vid: b })
+    );
+    assert!(!l.contains(&f.key()));
+    // Our namespace's client id of no order held, with B's venue id: conflicting too.
+    let f = fill(Some(stray()), naming_b("f2"), Side::Buy, 4, false);
+    assert_eq!(
+        reg.apply_fill(accepted(l.admit(&f, None, MonoNs(0)))),
+        Ok(FillRouted::Conflicting {
+            cid: stray(),
+            by_vid: b
+        })
+    );
+    assert!(!l.contains(&f.key()));
+    assert_eq!(reg.inventory(INST), SignedLots(0));
+    assert_eq!(reg.get(a).unwrap().cum_fills(), Lots::ZERO);
+    assert_eq!(reg.get(b).unwrap().cum_fills(), Lots::ZERO);
+}
+
+#[test]
+fn an_amend_replacing_a_venue_id_a_fill_taught_is_followed_to_its_new_id() {
+    // Codex r4183571346: the record holds v1, a fill teaches v2, then an Amended update
+    // replaces v2 by v3 before the v1 -> v2 notice, and a cancel names only v3.
+    let (mut l, mut reg) = session();
+    let c = cid();
+    reg.insert(placement(c, 100, 10)).unwrap();
+    let mut open = update(Some(c), VenueOrderState::Open, 0);
+    open.vid = Some(common::vid("v1"));
+    reg.apply_update(&open, key(1));
+    let named = FillIdent::Venue {
+        fill: common::fill_id("f1"),
+        vid: Some(common::vid("v2")),
+        cum_after: None,
+    };
+    let f = fill(Some(c), named, Side::Buy, 3, false);
+    reg.apply_fill(accepted(l.admit(&f, None, MonoNs(0))))
+        .unwrap();
+    let mut amended = update(
+        None,
+        VenueOrderState::Amended {
+            new_vid: Some(common::vid("v3")),
+        },
+        3,
+    );
+    amended.vid = Some(common::vid("v2"));
+    assert_eq!(
+        reg.apply_update(&amended, key(2)),
+        Routed::Ours(c, Applied::Amended)
+    );
+    assert_eq!(reg.cid_of(&common::vid("v3")), Some(c));
+    let mut cancel = update(None, common::canceled(), 3);
+    cancel.vid = Some(common::vid("v3"));
+    assert_eq!(
+        reg.apply_update(&cancel, key(3)),
+        Routed::Ours(c, Applied::Advanced)
+    );
+    assert!(reg.get(c).unwrap().state().is_terminal());
+}
+
+#[test]
 fn foreign_non_canonical_and_unattributed_fills_are_flagged_not_counted_and_not_kept() {
     let (mut l, mut reg) = session();
     let mut foreign = untracked("f1", 5, false);

@@ -38,6 +38,12 @@ pub enum FillRouted {
     /// Flagged, not counted: it routes to our order `cid` but names another instrument or the
     /// other side than the order's placement (a misdecoded or misrouted fill).
     Disagrees(ClientOrderId),
+    /// Flagged, not counted: its client id `cid` (ours) and its venue id, held by our order
+    /// `by_vid`, name different orders.
+    Conflicting {
+        cid: ClientOrderId,
+        by_vid: ClientOrderId,
+    },
     /// Flagged, not counted: it names no client id and no venue id of an order the registry
     /// holds, so nothing shows it is ours (another namespace's order on a venue that echoes no
     /// client id looks the same; decision 0005, I4).
@@ -174,8 +180,9 @@ impl Registry {
     /// Routed as [`Registry::apply_update`] routes an order update. A fill of our order counts
     /// on it ([`FillApplied`]), moves the inventory and indexes the venue id it names; one under our namespace's client id
     /// for no order the registry holds moves the inventory only; another namespace's, a
-    /// non-canonical or an unattributed one, or one whose instrument or side is not its
-    /// order's, moves nothing and is flagged. The ledger records
+    /// non-canonical or an unattributed one, one whose client id and venue id name different
+    /// orders, or one whose instrument or side is not its order's, moves nothing and is
+    /// flagged. The ledger records
     /// only a fill that counted, once it is applied: a flagged fill is not kept, so it never
     /// moves the retention horizon, and delivered again it is routed again (an unattributed
     /// fill reaches its order once the registry knows the order's venue id). Refused, counting
@@ -193,8 +200,13 @@ impl Registry {
         let (cid, ours) = match fill.cid {
             Some(CidMatch::Foreign(ns)) => return Ok(FillRouted::Foreign(ns)),
             Some(CidMatch::Unparseable) => return Ok(FillRouted::NotCanonical),
-            Some(CidMatch::Ours(cid)) if self.orders.contains_key(&cid) => (Some(cid), cid),
-            Some(CidMatch::Ours(cid)) => (by_vid, by_vid.unwrap_or(cid)),
+            Some(CidMatch::Ours(cid)) => match by_vid {
+                Some(other) if other != cid => {
+                    return Ok(FillRouted::Conflicting { cid, by_vid: other });
+                }
+                _ if self.orders.contains_key(&cid) => (Some(cid), cid),
+                _ => (None, cid),
+            },
             None => match by_vid {
                 Some(cid) => (Some(cid), cid),
                 None => return Ok(FillRouted::Unattributed),
@@ -268,7 +280,7 @@ impl Registry {
             .get_mut(&cid)
             .expect("the caller checked the order is registered");
         let out = change(rec);
-        for vid in rec.vid().into_iter().chain(rec.superseded_vids()) {
+        for vid in rec.known_vids() {
             self.by_vid.entry(vid.clone()).or_insert(cid);
         }
         out
