@@ -108,6 +108,9 @@ pub struct ParadexMd {
     /// Touch and trade feeds the venue refused and nothing has subscribed since: their frames
     /// still in flight are not pushed.
     refused: BTreeSet<Subscription>,
+    /// The id of the latest subscribe sent for each channel, answered or not: a refusal of an
+    /// older one leaves the state a newer one set up.
+    latest: BTreeMap<String, u64>,
 }
 
 impl ParadexMd {
@@ -121,6 +124,7 @@ impl ParadexMd {
             books: BTreeMap::new(),
             summary: BTreeSet::new(),
             refused: BTreeSet::new(),
+            latest: BTreeMap::new(),
         }
     }
 
@@ -183,14 +187,14 @@ impl ParadexMd {
     /// each subscription its channel was to carry (a market's `markets_summary` channel carries
     /// its mark and its funding), which the codec then holds no longer, so their frames are not
     /// pushed or applied and only a new subscription sends the channel again. When a later
-    /// subscribe to the same channel (a higher id) is still unanswered, this refusal answers
-    /// the older request only: it names the subscription it was sent for and keeps the codec's
-    /// state (Codex r4182919464: an older request still unanswered does not).
+    /// subscribe to the same channel (a higher id) was sent, answered or not, this refusal
+    /// answers the older request only: it names the subscription it was sent for and keeps the
+    /// state the later one set up (Codex r4182919464, r4183051811).
     fn refuse(&mut self, id: u64, sent: Sent, sink: &mut dyn MdSink) {
         let again = self
-            .pending
-            .range(id + 1..)
-            .any(|(_, p)| p.request == Request::Subscribe && p.channel == sent.channel);
+            .latest
+            .get(&sent.channel)
+            .is_some_and(|&last| last > id);
         let mut refused = BTreeSet::from([sent.sub]);
         if !again {
             let inst = sent.sub.inst;
@@ -255,6 +259,9 @@ impl MdCodec for ParadexMd {
         for (request, channel, sub) in frames {
             let (id, method) = (self.next_id, request_method(request));
             self.next_id += 1;
+            if request == Request::Subscribe {
+                self.latest.insert(channel.clone(), id);
+            }
             let text = json!({
                 "jsonrpc": "2.0",
                 "method": method,
