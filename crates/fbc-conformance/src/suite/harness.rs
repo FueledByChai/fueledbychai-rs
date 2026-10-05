@@ -25,7 +25,7 @@ const NAMESPACE: Namespace = Namespace::new(1);
 const WALL: WallNs = WallNs(1_759_363_200_000_000_000);
 /// The first placement nonce an order carries; item `i`'s is this plus `i`.
 const PLACEMENT_NONCE: u64 = 1_000;
-/// A limit price; codecs encode it without judging it.
+/// The limit price aimed at: the valid price at or above it on the instrument's grid is used.
 const PX: Ticks = Ticks(100);
 
 /// What an encode gave.
@@ -45,6 +45,8 @@ pub(crate) struct Harness<'s> {
     /// The second instrument by id, where the setup lists one.
     pub other_inst: Option<InstrumentId>,
     qty: Lots,
+    /// A valid limit price on the instrument's grid (Codex r4189256906).
+    px: Ticks,
 }
 
 impl<'s> Harness<'s> {
@@ -68,6 +70,11 @@ impl<'s> Harness<'s> {
         // At least one lot, so an amend always leaves something to rest.
         let qty = Lots::new(spec.min_size.get().max(1)).expect("a positive count");
         let inst = spec.id;
+        let grid = &spec.price_grid;
+        let px = grid
+            .ceil_valid(PX)
+            .or_else(|| grid.lowest_valid())
+            .unwrap_or(PX);
         let other_inst = setup.specs.iter().nth(1).map(|spec| spec.id);
         Ok(Harness {
             check,
@@ -77,6 +84,7 @@ impl<'s> Harness<'s> {
             inst,
             other_inst,
             qty,
+            px,
         })
     }
 
@@ -266,7 +274,7 @@ impl Ids {
     /// Order `i` placed with `shape` on the harness's instrument.
     pub fn order(&self, h: &Harness<'_>, i: usize, shape: Shape) -> NewOrder {
         let kind = match shape.kind {
-            OrderKindTag::Limit => OrderKind::Limit { px: PX },
+            OrderKindTag::Limit => OrderKind::Limit { px: h.px },
             OrderKindTag::Market => OrderKind::Market,
         };
         NewOrder {
@@ -297,7 +305,7 @@ impl Ids {
             post_only: order.post_only,
             reduce_only: order.reduce_only,
             reducing: false,
-            px: PX,
+            px: h.px,
             qty: order.qty,
             cum_filled: Lots::new(0).expect("zero is a count"),
         }
