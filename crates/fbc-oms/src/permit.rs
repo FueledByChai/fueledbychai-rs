@@ -69,6 +69,10 @@ pub enum PermitRefusal {
     /// The order is on the Unknown ladder: what the venue holds of it is not known, so it is
     /// never amended until the ladder resolves it (decision 0005, I5; [`Registry::ladder`](crate::Registry::ladder)).
     OnLadder(ClientOrderId),
+    /// The order was registered from a resync's snapshot (an earlier run's): its placement's
+    /// time in force and channel are not known, so it is never amended, only cancelled
+    /// (decision 0052).
+    FromSnapshot(ClientOrderId),
 }
 
 /// Why a [`Live`] permit builds no amend.
@@ -197,6 +201,9 @@ impl<'r> Live<'r> {
         }
         if rec.unknown_since().is_some() {
             return Err(PermitRefusal::OnLadder(cid));
+        }
+        if rec.from_snapshot() {
+            return Err(PermitRefusal::FromSnapshot(cid));
         }
         Ok(Live { rec, exposure })
     }

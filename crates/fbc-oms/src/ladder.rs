@@ -516,7 +516,7 @@ fn resolve(rec: &mut OrderRecord) -> Option<OrdState> {
 }
 
 /// The order update a snapshot of an order states.
-fn update_of(snap: &VenueOrderSnapshot) -> OrderUpdate {
+pub(crate) fn update_of(snap: &VenueOrderSnapshot) -> OrderUpdate {
     OrderUpdate {
         cid: snap.cid,
         vid: Some(snap.vid.clone()),

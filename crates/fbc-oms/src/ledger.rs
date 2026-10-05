@@ -115,6 +115,16 @@ impl<'f> AcceptedFill<'_, 'f> {
         self.fill
     }
 
+    /// When the venue timed it, if it did.
+    pub(crate) fn time(&self) -> Option<FillTime> {
+        self.time
+    }
+
+    /// When it was given to the ledger, on the shard's monotonic clock.
+    pub(crate) fn arrived(&self) -> MonoNs {
+        self.now
+    }
+
     /// Which ledger accepted it.
     pub(crate) fn ledger_id(&self) -> u64 {
         self.ledger.id

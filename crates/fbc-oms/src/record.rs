@@ -2,8 +2,9 @@
 //! refinements).
 
 use fbc_core::{
-    AckLevel, CancelReason, ClientOrderId, Lots, MonoNs, NewOrder, NotSentReason, OrderKind,
-    OrderUpdate, RejectKind, RpcId, SubmitOutcome, Ticks, VenueOrderId, VenueOrderState, WallNs,
+    AckLevel, CancelReason, Channel, ClientOrderId, Lots, MonoNs, NewOrder, NotSentReason,
+    OrderKind, OrderUpdate, RejectKind, RpcId, SubmitOutcome, Ticks, Tif, VenueOrderId,
+    VenueOrderSnapshot, VenueOrderState, WallNs,
 };
 
 /// Where an order stands. The states are ranked ([`OrdState::rank`]) and a record's rank never
@@ -251,6 +252,9 @@ pub struct OrderRecord {
     /// The amend or cancel whose fate put the resting order on the ladder: only its settling
     /// takes the order off. `None` when the placement's fate did.
     ladder_cause: Option<RpcId>,
+    /// Registered from a resync's snapshot (an earlier run's order): its placement's time in
+    /// force and channel are not known, so it is never amended.
+    from_snapshot: bool,
 }
 
 impl OrderRecord {
@@ -289,7 +293,43 @@ impl OrderRecord {
             queried_at: None,
             query_rpc: None,
             ladder_cause: None,
+            from_snapshot: false,
         }
+    }
+
+    /// The record of our order `cid` an earlier run placed, as a resync's snapshot shows it:
+    /// PendingNew until the snapshot applies as its update. Its placement is the snapshot's
+    /// side, total, price and the flags it echoes (false when it does not); its time in force
+    /// and channel are not known, so the order is never amended
+    /// ([`PermitRefusal::FromSnapshot`](crate::PermitRefusal::FromSnapshot)).
+    pub(crate) fn seeded_from(cid: ClientOrderId, o: &VenueOrderSnapshot) -> OrderRecord {
+        let mut rec = OrderRecord::new(NewOrder {
+            cid,
+            inst: o.inst,
+            side: o.side,
+            qty: o.qty,
+            kind: o.px.map_or(OrderKind::Market, |px| OrderKind::Limit { px }),
+            tif: Tif::Gtc,
+            channel: Channel::Public,
+            post_only: o.post_only.unwrap_or(false),
+            reduce_only: o.reduce_only.unwrap_or(false),
+            reducing: false,
+        });
+        rec.from_snapshot = true;
+        rec
+    }
+
+    /// Whether the order was registered from a resync's snapshot, not placed by this process.
+    pub fn from_snapshot(&self) -> bool {
+        self.from_snapshot
+    }
+
+    /// Sets the fills counted on the order to `cum` as a resync seeds its market: the
+    /// cumulative fill the snapshot showed, which the seeded position holds, plus the fills
+    /// after it. Ends a live order Filled when they cover it.
+    pub(crate) fn set_cum_fills(&mut self, cum: Lots) {
+        self.cum_fills = cum;
+        self.complete_if_covered();
     }
 
     /// Our id for the order.

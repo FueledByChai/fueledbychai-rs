@@ -224,7 +224,10 @@ rather than guess.
     intent timeout escalates, an order on the ladder is queried once by a declared reference,
     resolved by the answer or a resync, Lost after the configured trustworthy snapshots past its
     sent time plus the settle time, tombstone-cancelled by client id after the maximum, and
-    never placed or amended again; still planned: pre-trade caps and
+    never placed or amended again; resyncs (0052; `src/resync.rs`, `tests/resync.rs`): the
+    first seeds each market's position once and registers our open orders it shows, the
+    position unknown until then, a fill straddling the snapshot counted once, later ones
+    compared and reported, never overwriting the inventory; still planned: pre-trade caps and
     `ExecutionPlanner`; 0005, 0013), `crates/fbc-journal` (0006; it depends on
     `fbc-core`, and `hmac` and `sha2` for its keyed hashes and `zstd` for its closed segments, only: the records the runtime writes, length-prefixed in a hand-written
     little-endian format with a version, a writer of one subdirectory per UTC day with segments
