@@ -175,19 +175,25 @@ impl Registry {
         &self.caps
     }
 
-    /// The quantity our orders on `inst` and `side` may have resting (0005's I6): each order's
+    /// The quantity our orders on `inst` and `side` may have resting: each order's
     /// [`OrderRecord::resting`], so PendingNew and Unknown orders count in full, a partly
-    /// filled order its remainder until it is terminal, and an amend in flight at the larger
-    /// of its old and new quantity. `None` when the sum does not fit a lot count.
+    /// filled order its remainder until it is terminal, and an amend at the larger of its old
+    /// and new quantity from when it is built until it is acknowledged. `None` when the sum
+    /// does not fit a lot count. The inventory cap counts each order's
+    /// [`OrderRecord::exposure`]: this, plus the fills the venue reported that the inventory
+    /// does not hold yet.
     pub fn resting_on(&self, inst: InstrumentId, side: Side) -> Option<Lots> {
-        self.resting_except(inst, side, None)
+        self.sum_on(inst, side, None, OrderRecord::resting)
     }
 
-    fn resting_except(
+    /// The sum of `each` over our orders on `inst` and `side` but `except`; `None` when it
+    /// does not fit a lot count.
+    fn sum_on(
         &self,
         inst: InstrumentId,
         side: Side,
         except: Option<ClientOrderId>,
+        each: fn(&OrderRecord) -> Lots,
     ) -> Option<Lots> {
         self.orders
             .values()
@@ -195,7 +201,7 @@ impl Registry {
                 let placed = rec.placed();
                 placed.inst == inst && placed.side == side && Some(placed.cid) != except
             })
-            .try_fold(Lots::ZERO, |sum, rec| sum.checked_add(rec.resting()))
+            .try_fold(Lots::ZERO, |sum, rec| sum.checked_add(each(rec)))
     }
 
     /// What `inst` and `side` hold before an order is judged against the inventory cap: the
@@ -207,7 +213,7 @@ impl Registry {
             side,
             cap: self.caps.market(inst),
             pos: self.seeded.contains(&inst).then(|| self.inventory(inst)),
-            others: self.resting_except(inst, side, except),
+            others: self.sum_on(inst, side, except, OrderRecord::exposure),
         }
     }
 
@@ -474,14 +480,18 @@ impl Registry {
         Ok(rec.amend_sent(px, qty, rpc, now))
     }
 
-    /// Releases the amend of `cid` built ([`Live::amend`]) and never handed to a gateway (its
-    /// authorization refused, or the command dropped): it no longer counts as resting, and
-    /// the order may be amended again. False when no amend was built and not reported sent. An
-    /// amend a gateway took is reported with [`Registry::amend_sent`] instead, under the
+    /// Releases the reservation of an amend [`Live::amend`] built and never handed to a
+    /// gateway, consuming its command, so it can no longer be submitted: it no longer counts
+    /// as resting, and the order may be amended again. False, the command dropped all the same,
+    /// when it is not an amend, or not the one its order has built and not yet reported sent.
+    /// An amend a gateway took is reported with [`Registry::amend_sent`] instead, under the
     /// request the gateway gave it, and its outcome resolves it, a not-sent one included.
-    pub fn amend_not_submitted(&mut self, cid: ClientOrderId) -> Result<bool, OmsError> {
-        let rec = self.orders.get_mut(&cid).ok_or(OmsError::UnknownCid(cid))?;
-        Ok(rec.withdraw_built())
+    pub fn amend_not_submitted(&mut self, cmd: PermittedCommand) -> bool {
+        cmd.built().is_some_and(|(cid, build)| {
+            self.orders
+                .get_mut(&cid)
+                .is_some_and(|rec| rec.withdraw_built(build))
+        })
     }
 
     /// Records the cancel of `cid` sent at `now` under `rpc` ([`OrderRecord::cancel_sent`]):

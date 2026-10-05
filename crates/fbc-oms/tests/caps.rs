@@ -262,6 +262,66 @@ fn a_partly_filled_orders_remainder_counts_until_it_is_terminal() {
     reg.place(buy(40)).unwrap();
 }
 
+#[test]
+fn a_fill_the_venue_reported_counts_until_its_fill_event_moves_the_inventory() {
+    let mut reg = registry(CAP);
+    let mut l = ledger();
+    let a = open(&mut reg, buy(50), "a");
+    // The order update reports all 50 filled before the fill event arrives: nothing rests,
+    // but the inventory does not hold the 50 yet, so they still count.
+    let mut filled = update(Some(a), VenueOrderState::Filled, 50);
+    filled.vid = Some(vid("a"));
+    reg.apply_update(
+        &filled,
+        OrderKey {
+            venue: None,
+            ingest: 1,
+        },
+    );
+    assert!(reg.get(a).unwrap().state().is_terminal());
+    assert_eq!(reg.resting_on(INST, Side::Buy), Some(Lots::ZERO));
+    assert_eq!(reg.get(a).unwrap().exposure(), lots(50));
+    assert_eq!(reg.place(buy(1)), Err(capped(Side::Buy, 51)));
+    // Part reported on a live order counts the same way.
+    let mut reg2 = registry(CAP);
+    let b = open(&mut reg2, buy(30), "b");
+    let mut part = update(Some(b), VenueOrderState::Open, 20);
+    part.vid = Some(vid("b"));
+    reg2.apply_update(
+        &part,
+        OrderKey {
+            venue: None,
+            ingest: 1,
+        },
+    );
+    assert_eq!(reg2.resting_on(INST, Side::Buy), Some(lots(10)));
+    assert_eq!(reg2.place(buy(21)), Err(capped(Side::Buy, 51)));
+    // The fill event arrives: the inventory holds the 50, and the order no longer adds them.
+    fill_of(&mut reg, &mut l, a, Side::Buy, 50, "fa");
+    assert_eq!(reg.inventory(INST), SignedLots(50));
+    assert_eq!(reg.get(a).unwrap().exposure(), Lots::ZERO);
+    assert_eq!(reg.place(buy(1)), Err(capped(Side::Buy, 51)));
+    reg.place(sell(L0)).unwrap();
+}
+
+#[test]
+fn no_amend_is_built_on_a_venue_whose_amend_states_the_remaining_quantity() {
+    let mut reg = registry(CAP);
+    let a = open(&mut reg, buy(20), "a");
+    let mut remaining = amending(true);
+    if let Some(caps) = remaining.amend.as_mut() {
+        caps.qty_semantics = AmendQty::Remaining;
+    }
+    // What it may rest once fills arrive while it is on its way is not modelled (FBC-b0z9).
+    for qty in [20, 30, 10] {
+        assert_eq!(
+            amend(&mut reg, &remaining, a, qty, false),
+            Err(AmendRefusal::RemainingQty)
+        );
+    }
+    assert_eq!(reg.get(a).unwrap().amend_built(), None);
+}
+
 // ---- amends and replaces ----
 
 #[test]
@@ -365,7 +425,7 @@ fn an_amend_counts_from_when_it_is_built_so_two_built_before_either_is_sent_cann
     let a = open(&mut reg, buy(20), "a");
     let b = open(&mut reg, buy(20), "b");
     // Built, not yet reported sent: its 30 count at once.
-    amend(&mut reg, &venue, a, 30, false).unwrap();
+    let built_a = amend(&mut reg, &venue, a, 30, false).unwrap();
     assert_eq!(reg.get(a).unwrap().amend_built(), Some(lots(30)));
     assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(50)));
     assert_eq!(
@@ -378,11 +438,10 @@ fn an_amend_counts_from_when_it_is_built_so_two_built_before_either_is_sent_cann
         reg.live(a).unwrap_err(),
         fbc_oms::PermitRefusal::IntentPending(a)
     );
-    // Never handed to a gateway: withdrawn, it no longer counts.
-    assert_eq!(reg.amend_not_submitted(a), Ok(true));
-    assert_eq!(reg.amend_not_submitted(a), Ok(false));
+    // Never handed to a gateway: its command, withdrawn, is spent and no longer counts.
+    assert!(reg.amend_not_submitted(built_a));
     assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(40)));
-    amend(&mut reg, &venue, b, 30, false).unwrap();
+    let first_b = amend(&mut reg, &venue, b, 30, false).unwrap();
     // Reported sent, the amend built is the one in flight.
     reg.amend_sent(b, Ticks(100), lots(30), RpcId(1), MonoNs(2))
         .unwrap();
@@ -390,11 +449,28 @@ fn an_amend_counts_from_when_it_is_built_so_two_built_before_either_is_sent_cann
     assert_eq!(rec.amend_built(), None);
     assert!(matches!(rec.intent(), fbc_oms::Intent::PendingAmend { qty, .. } if qty == lots(30)));
     assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(50)));
-    let stranger = cid();
-    assert_eq!(
-        reg.amend_not_submitted(stranger),
-        Err(OmsError::UnknownCid(stranger))
-    );
+    // Refused by the venue, it is resolved; a second amend is built.
+    let refused = SubmitOutcome::Rejected(fbc_core::Reject {
+        kind: fbc_core::RejectKind::InvalidQty,
+        venue_code: None,
+        raw: "refused".into(),
+    });
+    outcome(&mut reg, b, OrderOp::Amend(RpcId(1)), refused, None);
+    let second_b = amend(&mut reg, &venue, b, 25, false).unwrap();
+    // Only the command of the build not yet reported releases it: not the first, already
+    // sent, nor a cancel, nor another registry's amend.
+    assert!(!reg.amend_not_submitted(first_b));
+    let CancelChoice::Send(cancel) = reg.cancellable(a).unwrap().cancel(&venue) else {
+        panic!("a cancel")
+    };
+    assert!(!reg.amend_not_submitted(cancel));
+    let mut other = registry(CAP);
+    let o = open(&mut other, buy(1), "o");
+    let foreign = amend(&mut other, &venue, o, 2, false).unwrap();
+    assert!(!reg.amend_not_submitted(foreign));
+    assert_eq!(reg.get(b).unwrap().amend_built(), Some(lots(25)));
+    assert!(reg.amend_not_submitted(second_b));
+    assert_eq!(reg.get(b).unwrap().amend_built(), None);
 }
 
 #[test]

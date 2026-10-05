@@ -676,14 +676,13 @@ fn an_amend_is_refused_for_a_partly_filled_order_where_the_caps_forbid_it() {
     let mut ledger = ledger();
     let c = order_at(&mut reg, Ack::AckedVid, false);
     // Unfilled, it amends.
-    assert!(
-        reg.live(c)
-            .unwrap()
-            .amend(&caps, Ticks(101), lots(10), false)
-            .is_ok()
-    );
+    let cmd = reg
+        .live(c)
+        .unwrap()
+        .amend(&caps, Ticks(101), lots(10), false)
+        .unwrap();
     // Never submitted: withdrawn, so the order can be amended again.
-    assert_eq!(reg.amend_not_submitted(c), Ok(true));
+    assert!(reg.amend_not_submitted(cmd));
     fill_of(&mut reg, &mut ledger, c, "p", 1);
     assert_eq!(
         reg.live(c)
@@ -737,14 +736,10 @@ fn an_amend_is_refused_where_the_venue_cannot_make_it() {
     let c = order_at(&mut reg, Ack::AckedVid, false);
     // Each amend built is withdrawn, never submitted, so the next can be built.
     let amend = |reg: &mut Registry, caps: &OrderCaps, px: i64, qty: i64| {
-        let built = reg
-            .live(c)
+        reg.live(c)
             .unwrap()
-            .amend(caps, Ticks(px), lots(qty), false);
-        if built.is_ok() {
-            assert_eq!(reg.amend_not_submitted(c), Ok(true));
-        }
-        built
+            .amend(caps, Ticks(px), lots(qty), false)
+            .map(|cmd| assert!(reg.amend_not_submitted(cmd)))
     };
     assert_eq!(
         amend(&mut reg, &order_caps(), 101, 10),
@@ -929,7 +924,6 @@ fn an_amend_the_planner_classifies_as_reducing_stays_safety_traffic() {
             .unwrap()
             .amend(&caps, Ticks(100), lots(8), reducing)
             .unwrap();
-        assert_eq!(reg.amend_not_submitted(c), Ok(true));
         let VenueCommand::Amend(amend) = cmd.command() else {
             panic!("an amend")
         };
@@ -942,6 +936,7 @@ fn an_amend_the_planner_classifies_as_reducing_stays_safety_traffic() {
                 fbc_core::TrafficClass::Normal
             }
         );
+        assert!(reg.amend_not_submitted(cmd));
     }
 }
 
@@ -1046,7 +1041,7 @@ fn an_amend_while_an_earlier_one_that_replaces_the_venue_id_is_unconfirmed_does_
         panic!("an amend")
     };
     assert_eq!(amend.target, OrderRef::Client(c));
-    assert_eq!(reg.amend_not_submitted(c), Ok(true));
+    assert!(reg.amend_not_submitted(cmd));
     // A venue that keeps the id names it.
     let keeping = with_amend(amend_caps(&[RefKind::Venue], true));
     assert!(
