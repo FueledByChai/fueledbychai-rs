@@ -415,8 +415,8 @@ posts one comment headed `DeepSeek review` that names the reviewed head SHA and 
 none. Files that did not fit are named under **Not reviewed** (or **Reviewed from the diff
 only**); a complete comment covers the rest of the change, and the independent reviewers, who
 read the whole diff, cover those files as they cover every file. An answer cut off at the
-output allowance (`finish_reason` `length`; deepseek-v4-pro thinks by default and its
-`max_tokens` counts the reasoning) is not final: that part is reviewed again as two halves of
+output allowance (`finish_reason` `length`; a thinking model's `max_tokens` counts the
+reasoning) is not final: that part is reviewed again as two halves of
 its files, or a single file from its diff only, up to `DEEPSEEK_SPLIT_DEPTH` (default 2) times,
 and the comment names the parts so split (FBC-yf0j). An answer that is not the asked JSON
 although it was not cut off (`finish_reason` `stop`) is asked for once more, with the same
@@ -451,10 +451,12 @@ imports, and pins every action to a full commit SHA. The job is not a required s
   script runs from the pull request's head, so the trust boundary is push access to this
   repository; the owner chose to keep it there with a CI-only DeepSeek key used for nothing
   else (owner decision 2026-10-05, FBC-omhd).
-- Repository variable `DEEPSEEK_MODEL`, default `deepseek-v4-pro`: DeepSeek's most capable
-  model on its OpenAI-compatible API, with JSON output and thinking on by default (the API's
-  change log of 2026-09-10 retired `deepseek-chat` and `deepseek-reasoner`; `deepseek-flash` is
-  the cheaper alternative). Set it with `gh variable set DEEPSEEK_MODEL --body <model>`; an
+- Repository variable `DEEPSEEK_MODEL`, default `deepseek-flash` (DeepSeek-V4.1-Flash, the
+  owner's choice of 2026-10-06, FBC-qo3h): DeepSeek's cheaper model on its OpenAI-compatible
+  API, with JSON output, the same 1M context and 384K maximum output as `deepseek-v4-pro`, and
+  about 4.4x cheaper (the API's change log of 2026-09-10 retired `deepseek-chat` and
+  `deepseek-reasoner`; `deepseek-v4-pro`, the most capable model, stays selectable through this
+  variable). Set it with `gh variable set DEEPSEEK_MODEL --body <model>`; an
   unset variable takes the default. Optional variables, each unset at the script's default:
   `DEEPSEEK_API_BASE` (default `https://api.deepseek.com`), `DEEPSEEK_TOKEN_BUDGET` (estimated
   prompt tokens per request, characters / 3, default 120000), `DEEPSEEK_MAX_CHUNKS` (parts per
