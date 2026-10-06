@@ -197,9 +197,9 @@ rather than guess.
     reported at most once to `ExecHandler::on_submitted` (sent, or `NotSent` with nothing
     written: no authenticated epoch, the codec's refusal, effects that do not carry the request,
     make an HTTP request or give it a deadline past the end of the clock, the buckets), an
-    authorization kept until its command is encoded, request ids from the account's `RpcIds` shared by its sessions,
-    and each unanswered request handed to `on_rpc_timeout` once at its deadline,
-    across a reconnect too, never written again (0057; compile-fail cases in
+    authorization kept until its command is encoded, request ids from the account's `RpcIds`
+    shared by its sessions, and each unanswered request handed to `on_rpc_timeout` once at its
+    deadline, across a reconnect too, never written again (0057; compile-fail cases in
     `tests/ui_submit/`) (its tests include the conformance toy by path);
     `tests/common/toy.rs` is the toy market-data venue later runtime tests reuse.
   - `crates/fbc-book` (it depends on `fbc-core` only: one tick-indexed L2 book per

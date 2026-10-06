@@ -112,15 +112,22 @@ frame unwritten while the codec believed it sent (FBC-m2xw).
   immediately before the encode and before any nonce is reserved, not in `ExecOrders::submit`,
   which only queues: between the two, the rest of the input being handled and earlier queued
   writes may trip the kill switch or move the market's generation. A stale authorization is
-  then `NotSent` with a reason, nothing written. Until FBC-afd defines the check, an
-  authorization is checked when it is issued only (and for its account at `submit`). Nothing outside fbc-oms's own tests issues one yet, so no order-affecting command
-  can reach a session today; control commands can.
+  then `NotSent` with a reason, nothing written. FBC-j5bw makes that call once FBC-afd defines
+  the check, with an authorized place and batch through the session (the owner's answer (B) to
+  RB-0ga-1 narrowed FBC-0ga to control commands, which take the same path). Until then an
+  authorization is checked when it is issued only (and for its account at `submit`). Nothing
+  outside fbc-oms's own tests issues one yet, so no order-affecting command can reach a session
+  today; control commands can.
 - The rate-limit refusal of a submitted command's frames is reported, not dropped; FBC-m2xw
   still decides it for the frames a codec asks for from `on_frame`.
 - FBC-2pr journals the nonce blocks, encode contexts and deadline firings this record adds, so
   replay can take them where the live session did, and resumes an account's `RpcIds` after the
   last id journaled.
 - A consumer builds one `RpcIds` per account and passes it in every `ExecSessionConfig` for it.
+- Only the session gives request ids. The RPC table registers every `Send` that carries an
+  `RpcCall`, including frames a codec asks for from `on_open`, `on_timer` or `on_frame`, so a
+  codec that minted its own ids would share the namespace with `RpcIds`, and an answer to one
+  could clear the other's deadline. No codec mints ids.
 
 ## What would show this was wrong
 
