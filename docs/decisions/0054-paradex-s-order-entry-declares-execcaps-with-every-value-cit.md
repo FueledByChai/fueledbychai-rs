@@ -86,12 +86,21 @@ Each is declared at the value under which the OMS and the planner do less, and i
 confirmed or corrected on the owner's testnet run (FBC-8xr); a correction is a new record.
 
 - `when_partially_filled`: whether `order.modify` accepts a partly filled order. Declared
-  `false`: a partly filled order is cancelled and replaced, never amended. It also makes the
-  next item moot for every amend sent.
+  `false`: an order the OMS knows to be partly filled is cancelled and replaced, never amended.
+  An amend is still sent on an order with nothing filled as far as the OMS knows, and a fill
+  in flight can reach it first, so the next item is narrowed, not made moot.
 - `qty_semantics`: `order.modify`'s size is the "New (or unchanged) size", and `OrderEvent`'s
   `size` is the order's size beside `sizeOpen`, the remaining part; no page says whether the
   size of a partly filled order's modify includes the filled part. Declared
-  `AmendQty::TotalIncludingFilled`; with `when_partially_filled: false`, no amend depends on it.
+  `AmendQty::TotalIncludingFilled`, which those two fields support; it decides an amend's size
+  only when a fill in flight reaches the order before the amend does. This is the one value in
+  this list that is not the one under which the OMS does less: that would be
+  `AmendQty::Remaining`, under which the OMS refuses every amend. FBC-olg's done line pins the
+  total. If Paradex in fact reads the size as the remaining part, an amend to Q that meets a
+  fill f in flight leaves Q resting while the OMS counts Q - f, so resting exposure on that side
+  is undercounted, and the worst-case inventory can pass the cap by at most one in-flight fill
+  per amended order. FBC-8xr's check that a modify's size is the total must pass before any
+  live Paradex amend.
 - `reject_keeps_original`: that a REJECTED modify leaves the order resting. Declared `true`,
   read from the event's own status, since the event that reports the rejection is an update of
   the order itself; the codec reports the order's state as that event gives it.
@@ -114,7 +123,17 @@ confirmed or corrected on the owner's testnet run (FBC-8xr); a correction is a n
   provisional (`AckModel::TwoPhase`), but the time the risk check takes is not stated. Declared
   five seconds.
 - `snapshot_source`: whether the open-orders snapshot is consistent with the order stream.
-  Declared `SnapshotSource::Untrustworthy`: an order's absence from it never ends the order.
+  Declared `SnapshotSource::Untrustworthy`. This one field governs two things: an order's
+  absence from the snapshot never ends the order (it is never Lost on that absence), and,
+  under the seed rule FBC-38r proposes, a resync from it never seeds a market's position. With
+  the owner's rule that nothing is sent after a restart before the first trustworthy resync,
+  Paradex is then never seeded by a resync, and once FBC-xzp wires these caps every place and
+  amend on it is refused unless the consumer seeds by hand. The owner decided this value on
+  2026-10-06 (option C of question RB-olg-3, recorded in FBC-olg's notes): it stays
+  `Untrustworthy` here; FBC-8xr's owner-assisted testnet run, seeded by hand on testnet only,
+  compares `GET /orders` and `GET /positions` with the order and fill streams; and a new record
+  flips it to `Trustworthy`, on that evidence, before any live Paradex session. Hand-seeding is
+  never a live path, so FBC-xzp's live use waits on that record.
 - `keeps_priority`: whether a modify keeps queue priority. `None`, as design §4.5 has it, until
   calibration measures it.
 - `LimitScope::Ip`: whether the 1500 req/m per-IP limit on private requests counts the
@@ -162,6 +181,14 @@ margin accounts.
 - A SimVenue standing in for Paradex (FBC-2zxk) refuses placements until it models a two-phase
   acknowledgement (FBC-zr1) and cancel-on-disconnect (FBC-fji), which these values trip.
 - The conformance suite's `caps_truthful` holds the codec to these values once it exists.
+- While `snapshot_source` is `Untrustworthy`, no resync seeds a Paradex market under the seed
+  rule FBC-38r proposes, so with these caps wired (FBC-xzp) Paradex places and amends nothing
+  unless seeded by hand, which only FBC-8xr's testnet run does; and 0005's I7 acts on Paradex
+  only on orphans two sources confirm. No live Paradex session runs until a new record, on
+  FBC-8xr's comparison of `GET /orders` and `GET /positions` with the streams, declares the
+  snapshot `Trustworthy` (the owner's choice C, 2026-10-06).
+- Paradex amends live only once FBC-8xr has shown that `order.modify`'s size is the total;
+  until then the in-flight-fill undercount named under `qty_semantics` above is not ruled out.
 - Each value in the list above is a question for FBC-8xr's run, and the capability values it
   contradicts are corrected by a new record.
 
@@ -170,7 +197,9 @@ margin accounts.
 - The testnet run (FBC-8xr) amending a partly filled order, cancelling by client id before the
   acknowledgement, replaying fills after a reconnect, accepting batches of more than ten,
   leaving orders resting after an unexpected disconnect, not counting WebSocket order
-  methods per IP, or counting a batch once per IP: each corrects its value by a new record.
+  methods per IP, counting a batch once per IP, `GET /orders` and `GET /positions` snapshots
+  that match the order and fill streams (or ones that lag them), or a modify whose size is read
+  as the remaining part: each corrects or confirms its value by a new record.
 - An `order.modify` reply that later contradicts its order event, which would make the reply
   the confirmation (`AmendAck::RpcReplyOnly`), or a REJECTED modify that ends the order.
 - Private channel payloads arriving as JSON on a 1:2 socket, or a 1:2 negotiation refused with
