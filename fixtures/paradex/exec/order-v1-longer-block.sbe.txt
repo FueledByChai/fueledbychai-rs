@@ -1,4 +1,4 @@
-# OrderEvent (template 20): OPEN at version 1 with a 128-byte block: two bytes past the version-1 fields, never read as request_info
+# OrderEvent (template 20): OPEN at version 1 with a 128-byte block: two bytes past the version-1 fields, a modify SUCCESS where version 2 puts request_info, never read as request_info
 # Hand-built from paradex_1_0.xml at tradeparadex/paradex-py b8248fb747e278d2167ac2f056b339a287d5ef30.
 # SYNTHETIC: the account is 32 made-up bytes (a0..bf), no Paradex account. Little-endian; '#' starts a comment.
 80 00 14 00 01 00 01 00                           # header: blockLength=128 templateId=20 (OrderEvent) schemaId=1 version=1
@@ -21,7 +21,7 @@ b8 fa 7c 84 41 40 06 00                           # @108 receivedAt int64 = 1759
 c5 98 7e 84 41 40 06 00                           # @116 publishedAt int64 = 1759500000204997 us (not read)
 00                                                # @124 stp uint8 = 0 (NONE, not read)
 00                                                # @125 flags uint8 = 0x00
-ee ee                                             # @126 2 bytes past the known fields, skipped
+04 01                                             # @126 2 bytes past the known fields, where version 2 puts requestStatus = 4 (SUCCESS) and requestType = 1 (MODIFY_ORDER): skipped
 13                                                # orderId varString8 length = 19
 31 37 35 39 35 30 30 30 30 30 30 30 30 30 30 30 30 30 31 # orderId = "1759500000000000001"
 24                                                # clientOrderId varString8 length = 36
