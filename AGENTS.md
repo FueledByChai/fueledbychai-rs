@@ -191,8 +191,14 @@ rather than guess.
     consumer's `NonceSource`, frames decoded inside `dispatch`, events stamped and handed to the
     consumer's `ExecHandler` inline, a stop ending the epoch at once, reconnects paced; the
     codec's HTTP requests and timers answered only to the epoch that asked, `on_timer` given
-    exactly the nonces it asks for, and its keepalive its own timer (0056) (its tests include
-    the conformance toy by path);
+    exactly the nonces it asks for, and its keepalive its own timer (0056); commands reach its
+    codec only through its `ExecOrders`, as an fbc-oms `Authorization` for its account or a
+    `ControlCommand`, each encoded on its next turn with one reserved nonce per item and
+    reported once to `ExecHandler::on_submitted` (sent, or `NotSent` with nothing written: no
+    authenticated epoch, the codec's refusal, effects that do not carry the request, the
+    buckets), and each unanswered request handed to `on_rpc_timeout` once at its deadline,
+    across a reconnect too, never written again (0057; compile-fail cases in
+    `tests/ui_submit/`) (its tests include the conformance toy by path);
     `tests/common/toy.rs` is the toy market-data venue later runtime tests reuse.
   - `crates/fbc-book` (it depends on `fbc-core` only: one tick-indexed L2 book per
     instrument and `BookId`, built from book events the same live and in replay, with

@@ -27,7 +27,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fbc_core::{
     ConnKey, Effect, Effects, HeaderMark, HttpFailure, HttpResponse, HttpTag, Inbound,
     InboundSpans, Keepalive, KeepaliveKind, KernelRxNs, MonoNs, OpKind, RateCharge, RawFrame,
-    Stamp, StreamId, TimerTag, TrafficClass, Via, WallNs,
+    RpcCall, Stamp, StreamId, TimerTag, TrafficClass, Via, WallNs,
 };
 use fbc_journal::{CloseRec, ControlEvent, Opaque, Opcode, Record, RecordRef, ResponseRef};
 use fbc_journal::{WriteRes, WsControl};
@@ -145,6 +145,11 @@ pub(crate) trait EpochInputs {
     fn answer(&mut self, epochs: &mut Epochs, stamp: Stamp, done: Answered, fx: &mut Effects);
     /// A Safety-class write attributed to a frame with a kernel receive time completed.
     fn on_tick_to_wire(&mut self, sample: TickToWire);
+    /// A frame of request `call` is about to be written, so the request's deadline runs from
+    /// now (FBC-0ga). Nothing, by default: no market-data request awaits an answer.
+    fn sent_rpc(&mut self, call: RpcCall) {
+        let _ = call;
+    }
     /// Whether an input handed on while a write waited ended the session, so the core executes
     /// none of the rest of the batch. Never, by default.
     fn halted(&self) -> bool {
@@ -572,6 +577,9 @@ impl Core {
                         Err(_) => Opcode::Binary,
                     };
                     let message = text.unwrap_or_else(|_| Message::binary(bytes.to_vec()));
+                    // Its deadline runs from before the write, so a write that fails after bytes
+                    // may have left still reaches it (FBC-0ga).
+                    rpc.into_iter().for_each(|call| inputs.sent_rpc(call));
                     let (conn, rpc) = (self.current(), rpc.map(|call| call.id));
                     let (at, now) = self.clock.now();
                     self.journal(class, now, || Record::Outbound {
@@ -1173,6 +1181,11 @@ mod tests {
             .execute(&mut None, &mut Nothing(false), fx, false, None)
             .await;
         assert_eq!((open, core.next_deadline().is_some()), (Ok(true), true));
+        // No market-data request awaits an answer: a frame of one is nothing to the inputs.
+        Nothing(false).sent_rpc(fbc_core::RpcCall {
+            id: fbc_core::RpcId(1),
+            timeout: Duration::ZERO,
+        });
         let fired = core.fire(&mut None, &mut Nothing(false)).await;
         assert_eq!((fired, core.next_deadline()), (Ok(true), None));
         let mut fx = Effects::new();

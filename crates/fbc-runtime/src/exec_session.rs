@@ -30,7 +30,7 @@
 //! session runs once ([`ExecSession::run`]): after an error, or once stopped, the consumer
 //! builds a new one to connect again. A frame or reconnect for another stream is a codec defect,
 //! refused and counted. A write waits on its peer at most the consumer's [`WriteStall`] window
-//! (0036). Submitting commands is FBC-0ga's, and journaling FBC-2pr's.
+//! (0036). Journaling is FBC-2pr's.
 //!
 //! **HTTP requests, timers and keepalives (FBC-bnl, decision 0056).** A request the codec asks
 //! for runs beside the session's reads with its own timeout, charged to the buckets, and its
@@ -50,15 +50,43 @@
 //! for joins the rest of the write's batch. Once the session stops, no timer firing or result
 //! reaches the codec, no effect is executed, and requests still in flight are dropped.
 //!
+//! **Submitting commands (FBC-0ga, decision 0057).** Commands reach the codec only through the
+//! session's [`ExecOrders`] ([`ExecSession::orders`]): an order-affecting one only as the
+//! fbc-oms [`Authorization`](fbc_oms::Authorization) issued for it, for the session's account
+//! (0013 rule 2, 0045), and one that affects no order as a
+//! [`ControlCommand`](fbc_oms::ControlCommand). Each is given its [`RpcId`] at once and is
+//! taken on the session's next turn, after the input being handled: one submitted while the
+//! stream had no epoch the codec reported authenticated
+//! ([`ConnState::Authenticated`](fbc_core::ConnState::Authenticated)), or on an epoch that has
+//! since ended, is `NotSent(Disconnected)`; otherwise it is encoded with an [`EncodeCtx`]
+//! holding exactly [`VenueCommand::items`](fbc_core::VenueCommand::items) nonces reserved from
+//! the consumer's [`NonceSource`] and the shard clock's time. What the codec refuses is
+//! `NotSent` for its reason; effects that do not carry the request
+//! ([`Effects::carry_request`]), or that name another stream or a reconnect, are
+//! `NotSent(Unencodable)`, and frames the buckets do not admit together `NotSent(RateBudget)`,
+//! each with nothing written. Otherwise the handler is told it was sent, with the nonces it
+//! used ([`ExecHandler::on_submitted`]), and its effects are executed. A request's deadline runs
+//! from just before its frame is written; the first event that answers it
+//! ([`ExecEvent::answers`]) clears it, and one still unanswered then is handed to the codec's
+//! `on_rpc_timeout` once, which reports it `Unknown`: whether the connection is the one it was
+//! written on, a later one, or none while the session waits to reconnect (stamped under the
+//! session's current epoch, which is the one it waits to open). A write that fails or stalls
+//! after bytes may have left thus reports `Unknown` too. The session never encodes or writes a
+//! command twice, and a reconnect never re-sends one (0005, 0013 rule 1). A deadline that falls
+//! due while a write waits on a stalled peer is handled once the write ends, within the
+//! write-stall window. Once the session has stopped, nothing more is reported.
+//!
 //! One thread drives a session (design §5.1): [`ExecSession::run`] spawns no task.
 
 use std::fmt;
+use std::rc::Rc;
 
 use fbc_core::{
-    ConnKey, CtxCall, Effect, Effects, EncodeCtx, Envelope, ExecCodec, ExecEvent, ExecSink,
-    Inbound, InboundSpans, KernelRxNs, MonoNs, Namespace, NonceBlock, NonceSource, Secrets,
-    SpecTable, Stamp, StreamId, TimerTag, VenueCaps, VenueConfig, VenueError, VenueFactory,
-    VenueMeta, WallNs, dispatch,
+    AccountKey, ConnKey, ConnState, CtxCall, Effect, Effects, EncodeCtx, Envelope, ExecCodec,
+    ExecEvent, ExecSink, Inbound, InboundSpans, KernelRxNs, MonoNs, Namespace, NonceBlock,
+    NonceSource, NotSentReason, PathStamps, RpcCall, RpcId, Secrets, SpecTable, Stamp, StreamId,
+    SubmitHandle, TimerTag, VenueCaps, VenueConfig, VenueError, VenueFactory, VenueMeta, WallNs,
+    dispatch,
 };
 use futures_util::{FutureExt, StreamExt};
 use tokio::sync::watch;
@@ -66,6 +94,7 @@ use tokio::time::Instant;
 
 use crate::connector::Connector;
 use crate::epoch::{Admit, EpochError, Epochs, Input};
+use crate::exec_orders::{ExecOrders, Queued, Rpcs, Shared};
 use crate::pacing::ReconnectPacing;
 use crate::ratelimit::{RateError, RateLimiter, Refused, Request};
 use crate::session::SessionError;
@@ -88,6 +117,15 @@ pub trait ExecHandler {
     fn on_epoch_end(&mut self, key: ConnKey) {
         let _ = key;
     }
+
+    /// What became of a command submitted through the session's [`ExecOrders`]: called once
+    /// per submission, in submission order, before any event answering its request (decision
+    /// 0057). `handle.receipt` holds the nonces the encode used when it was sent, or why it was
+    /// not. A consumer whose OMS awaits a command's outcome implements it: a command not sent is
+    /// reported here only. Nothing by default.
+    fn on_submitted(&mut self, handle: SubmitHandle) {
+        let _ = handle;
+    }
 }
 
 impl<F: FnMut(Envelope<ExecEvent>)> ExecHandler for F {
@@ -102,6 +140,8 @@ pub struct ExecSessionConfig {
     pub cfg: VenueConfig,
     /// The account's credentials, handed to the venue's `exec_codec` once.
     pub creds: Secrets,
+    /// The account they reach: [`ExecOrders::submit`] takes only its authorizations.
+    pub acct: AccountKey,
     /// The engine namespace the account's client ids are minted under, which the decode scope
     /// reads ours by.
     pub ns: Namespace,
@@ -137,7 +177,7 @@ pub enum ExecSessionError {
     /// (decision 0053).
     Endpoints(usize),
     /// The consumer's nonce source reserved another number of nonces than were asked for, for
-    /// `on_open` or `on_timer`.
+    /// `on_open`, `on_timer` or an encode.
     Nonces { asked: u16, reserved: usize },
     /// The frames the codec's `on_open` asks for weigh more together than the venue's buckets
     /// ever admit, so no epoch could open.
@@ -225,6 +265,13 @@ pub struct ExecSession<H: ExecHandler> {
     specs: SpecTable,
     nonces: Box<dyn NonceSource>,
     decode_errors: u64,
+    /// What [`ExecOrders`] and the session share: the commands waiting, the authenticated
+    /// epoch.
+    orders: Rc<Shared>,
+    /// The deadlines of the requests written (FBC-0ga).
+    rpcs: Rpcs,
+    /// The shard clock, for what is stamped while the core waits to connect.
+    clock: IngestClock,
     /// The control's drop, as the codec's inputs see it while the core runs.
     stop: watch::Receiver<()>,
     /// Why a timer firing the core took during a write ended the session: its nonce
@@ -244,6 +291,7 @@ pub struct ExecSession<H: ExecHandler> {
 /// abort the process (Reviewer B, B2).
 impl<H: ExecHandler> Drop for ExecSession<H> {
     fn drop(&mut self) {
+        self.orders.end();
         if std::thread::panicking() {
             if let Some(key) = self.in_epoch.take() {
                 self.core.rates.closed(key);
@@ -265,6 +313,10 @@ enum Wake {
     Frame(Option<Result<Message, tokio_tungstenite::tungstenite::Error>>),
     Timer,
     Http(Answered),
+    /// A command was submitted.
+    Orders,
+    /// A request's deadline fell due.
+    Rpc,
     Stop,
 }
 
@@ -282,6 +334,9 @@ macro_rules! feed {
             stop: &$s.stop,
             decode_errors: &mut $s.decode_errors,
             fault: &mut $s.fault,
+            rpcs: &mut $s.rpcs,
+            orders: &$s.orders,
+            own: $s.stream,
         }
     };
 }
@@ -310,6 +365,7 @@ impl<H: ExecHandler> ExecSession<H> {
         let codec = codec.ok_or(ExecSessionError::NoOrderEntry)?;
         let codec = codec.map_err(ExecSessionError::Venue)?;
         let (stop_tx, stop) = watch::channel(());
+        let clock = config.clock.clone();
         let core = Core::new(CoreConfig {
             own: endpoint.stream,
             connector: config.connector,
@@ -331,6 +387,9 @@ impl<H: ExecHandler> ExecSession<H> {
             specs: config.specs,
             nonces: config.nonces,
             decode_errors: 0,
+            orders: Shared::new(config.acct),
+            rpcs: Rpcs::default(),
+            clock,
             stop,
             fault: None,
             in_epoch: None,
@@ -343,6 +402,14 @@ impl<H: ExecHandler> ExecSession<H> {
     /// The current connection epoch.
     pub fn current(&self) -> ConnKey {
         self.core.current()
+    }
+
+    /// What commands reach the session through: authorizations for its account, and control
+    /// commands (decision 0057). It takes none once the session has run or dropped.
+    pub fn orders(&self) -> ExecOrders {
+        ExecOrders {
+            shared: Rc::clone(&self.orders),
+        }
     }
 
     /// Inputs of an ended epoch dropped, by kind.
@@ -379,13 +446,24 @@ impl<H: ExecHandler> ExecSession<H> {
         }
         let ran = self.run_epochs().await;
         self.core.http.clear();
+        self.orders.end();
         ran
     }
 
     /// Opens epoch after epoch, as paced, until the session stops or fails.
     async fn run_epochs(&mut self) -> Result<(), ExecSessionError> {
         loop {
-            let mut ctl = Stop(self.core.stop.clone());
+            // While it waits to connect, the session still reports each deadline that falls
+            // due, and each command submitted, under the epoch it waits to open.
+            let mut ctl = Between {
+                stop: self.core.stop.clone(),
+                orders: &self.orders,
+                rpcs: &mut self.rpcs,
+                codec: &mut *self.codec,
+                handler: &mut self.handler,
+                clock: &self.clock,
+                key: self.core.current(),
+            };
             let Some(ws) = self.core.connect(&self.url, &mut ctl).await? else {
                 return Ok(());
             };
@@ -433,6 +511,7 @@ impl<H: ExecHandler> ExecSession<H> {
     async fn connected(&mut self, ws: WebSocket) -> Result<End, ExecSessionError> {
         let key = self.current();
         let end = self.epoch(ws, key).await;
+        self.orders.set_ready(None);
         // Cleared before the handler is called, so a handler that panics is never told twice
         // (Codex r4189618551).
         self.in_epoch = None;
@@ -454,10 +533,13 @@ impl<H: ExecHandler> ExecSession<H> {
             // Unbiased: each turn polls the branches from a random one, so frames that keep
             // arriving starve no timer, result or stop, and the stop is checked after every wake
             // below whichever branch won (DeepSeek DS-1).
+            let rpc_due = self.rpcs.next_deadline();
             let wake = tokio::select! {
                 frame = next_frame(&mut ws) => Wake::Frame(frame),
                 _ = sleep_or_never(self.core.next_deadline()) => Wake::Timer,
                 Some(done) = self.core.http.next() => Wake::Http(done),
+                _ = self.orders.wake.notified() => Wake::Orders,
+                _ = sleep_or_never(rpc_due) => Wake::Rpc,
                 _ = self.core.stop.changed() => Wake::Stop,
             };
             // The kernel receive time of the last packet read beneath the frame, if any.
@@ -477,7 +559,17 @@ impl<H: ExecHandler> ExecSession<H> {
                 Wake::Frame(_) | Wake::Stop => false,
                 Wake::Timer => self.fire(&mut ws).await?,
                 Wake::Http(done) => self.answer(&mut ws, done).await?,
+                Wake::Orders => true,
+                Wake::Rpc => {
+                    self.time_out(key);
+                    true
+                }
             };
+            // What was submitted, by the handler as it took the input or meanwhile, goes out
+            // before the next input.
+            if open {
+                open = self.send_queued(&mut ws, key).await?;
+            }
         }
         // A stop closes the connection; a drop, a reconnect the codec asked for (which the
         // core closed) or a failed write leaves it to be dropped.
@@ -519,6 +611,9 @@ impl<H: ExecHandler> ExecSession<H> {
             epochs: &mut self.core.epochs,
             stop: &self.core.stop,
             stamp,
+            rpcs: &mut self.rpcs,
+            orders: &self.orders,
+            own: self.stream,
         };
         let (codec, stream, specs) = (&mut self.codec, self.stream, &self.specs);
         let decoded = dispatch(&self.caps, self.ns, |scope| {
@@ -648,7 +743,7 @@ impl<H: ExecHandler> ExecSession<H> {
                 let _ = self.core.stamp_http(Some(&redact), done);
                 next_frame(ws).now_or_never()
             }
-            Wake::Stop => next_frame(ws).now_or_never(),
+            Wake::Orders | Wake::Rpc | Wake::Stop => next_frame(ws).now_or_never(),
         };
         if let Some(Some(Ok(message))) = waiting {
             let _ = self.core.take_in(&redact, key, rx, &message);
@@ -659,6 +754,105 @@ impl<H: ExecHandler> ExecSession<H> {
     /// The session's error when a timer firing the core took ended it.
     fn faulted(&mut self) -> Result<(), ExecSessionError> {
         self.fault.take().map_or(Ok(()), Err)
+    }
+
+    /// Takes every command waiting, in submission order, on epoch `key` ([`Self::send`]), until
+    /// the epoch ends or the session stops; what still waits then is the next turn's. False when
+    /// the epoch ended.
+    async fn send_queued(
+        &mut self,
+        ws: &mut Option<WebSocket>,
+        key: ConnKey,
+    ) -> Result<bool, ExecSessionError> {
+        let mut open = true;
+        while open
+            && !self.stopped()
+            && let Some(queued) = self.orders.pop()
+        {
+            open = self.send(ws, key, queued).await?;
+        }
+        Ok(open)
+    }
+
+    /// Encodes and writes one submitted command on epoch `key`, telling the handler what became
+    /// of it (the module docs say how). False when the epoch ended.
+    async fn send(
+        &mut self,
+        ws: &mut Option<WebSocket>,
+        key: ConnKey,
+        queued: Queued,
+    ) -> Result<bool, ExecSessionError> {
+        let Queued { rpc, cmd, epoch } = queued;
+        let ready = self.orders.ready().is_some_and(|ready| ready == key.epoch);
+        let not_sent = |reason| SubmitHandle {
+            rpc,
+            receipt: Err(reason),
+        };
+        if !ready || epoch != Some(key.epoch) {
+            self.handler
+                .on_submitted(not_sent(NotSentReason::Disconnected));
+            return Ok(true);
+        }
+        // A batch longer than u16::MAX items, which no venue takes, has no nonce block.
+        let items = cmd.items().map(|n| reserve(&mut *self.nonces, n));
+        let mut fx = Effects::new();
+        let encoded = items
+            .transpose()?
+            .ok_or(NotSentReason::Unencodable)
+            .and_then(|nonces| {
+                let (mono, wall) = self.core.clock.now();
+                let ctx = EncodeCtx { wall, mono, nonces };
+                let mut t = PathStamps::off();
+                self.codec
+                    .encode(&cmd, rpc, &self.specs, &ctx, &mut t, &mut fx)
+            });
+        let receipt = match encoded {
+            Ok(receipt) if carries(&fx, rpc, cmd.traffic_class(), self.stream) => receipt,
+            Ok(_) => {
+                self.handler
+                    .on_submitted(not_sent(NotSentReason::Unencodable));
+                return Ok(true);
+            }
+            Err(reason) => {
+                self.handler.on_submitted(not_sent(reason));
+                return Ok(true);
+            }
+        };
+        // Its frames go together or not at all, so the codec's request is either written whole
+        // or reported not sent.
+        let own = |e: &Effect| frame_of(e, self.stream, true);
+        let frames: Vec<_> = fx.as_slice().iter().filter_map(own).collect();
+        if self
+            .core
+            .rates
+            .charge(Instant::now(), key, &frames)
+            .is_err()
+        {
+            self.handler
+                .on_submitted(not_sent(NotSentReason::RateBudget));
+            return Ok(true);
+        }
+        let receipt = Ok(receipt);
+        self.handler.on_submitted(SubmitHandle { rpc, receipt });
+        self.execute(ws, fx, true, None).await
+    }
+
+    /// Hands each request whose deadline fell due unanswered to the codec's `on_rpc_timeout`,
+    /// its events stamped under epoch `key`; once the session has stopped, the sink drops them.
+    fn time_out(&mut self, key: ConnKey) {
+        for rpc in self.rpcs.take_due(Instant::now()) {
+            let stamp = self.core.clock.stamp(key, None);
+            let mut sink = Sink {
+                handler: &mut self.handler,
+                epochs: &mut self.core.epochs,
+                stop: &self.core.stop,
+                stamp,
+                rpcs: &mut self.rpcs,
+                orders: &self.orders,
+                own: self.stream,
+            };
+            self.codec.on_rpc_timeout(rpc, &mut sink);
+        }
     }
 }
 
@@ -671,27 +865,105 @@ fn context(
     mono: MonoNs,
     wall: WallNs,
 ) -> Result<EncodeCtx, ExecSessionError> {
-    let asked = codec.nonces_for(call);
-    let nonces = match asked {
-        0 => NonceBlock::EMPTY,
-        n => nonces.reserve(n),
-    };
-    if nonces.len() != usize::from(asked) {
-        let reserved = nonces.len();
-        return Err(ExecSessionError::Nonces { asked, reserved });
-    }
+    let nonces = reserve(nonces, codec.nonces_for(call))?;
     Ok(EncodeCtx { wall, mono, nonces })
 }
 
-/// The order-entry session's control as the core waits on it between epochs: only its drop.
-struct Stop(watch::Receiver<()>);
+/// Exactly `asked` nonces from `nonces` (none reserved when `asked` is 0), or why not.
+fn reserve(nonces: &mut dyn NonceSource, asked: u16) -> Result<NonceBlock, ExecSessionError> {
+    let block = match asked {
+        0 => NonceBlock::EMPTY,
+        n => nonces.reserve(n),
+    };
+    if block.len() != usize::from(asked) {
+        let reserved = block.len();
+        return Err(ExecSessionError::Nonces { asked, reserved });
+    }
+    Ok(block)
+}
 
-impl Control for Stop {
+/// Whether `fx`, an encode's effects for request `rpc` of traffic class `class`, may be executed:
+/// they carry the request ([`Effects::carry_request`]), every frame goes to the session's own
+/// stream `own`, and none asks to reconnect, which would leave a frame of the request unwritten
+/// with its outcome unreported (0014 item 3).
+fn carries(fx: &Effects, rpc: RpcId, class: fbc_core::TrafficClass, own: StreamId) -> bool {
+    let elsewhere = |effect: &Effect| match effect {
+        Effect::Send { stream, .. } => *stream != own,
+        other => matches!(other, Effect::Reconnect { .. }),
+    };
+    !fx.as_slice().iter().any(elsewhere) && fx.carry_request(rpc, class)
+}
+
+/// The order-entry session as the core waits to connect: the control's drop, and what still
+/// reaches the handler meanwhile (FBC-0ga). A command submitted is `NotSent(Disconnected)`, and
+/// a request whose deadline falls due is handed to the codec's `on_rpc_timeout`, its events
+/// stamped under `key`, the epoch the session waits to open; once the control has dropped,
+/// neither.
+struct Between<'a, H> {
+    stop: watch::Receiver<()>,
+    orders: &'a Shared,
+    rpcs: &'a mut Rpcs,
+    codec: &'a mut dyn ExecCodec,
+    handler: &'a mut H,
+    clock: &'a IngestClock,
+    key: ConnKey,
+}
+
+impl<H> Between<'_, H> {
+    fn stopped(&self) -> bool {
+        self.stop.has_changed().is_err()
+    }
+}
+
+impl<H: ExecHandler> Control for Between<'_, H> {
+    /// True when there is something to report (at once when it already waits), false once the
+    /// control dropped.
     async fn changed(&mut self) -> bool {
-        self.0.changed().await.is_ok()
+        let (due, waiting) = (self.rpcs.next_deadline(), self.orders.waiting());
+        tokio::select! {
+            biased;
+            r = self.stop.changed() => r.is_ok(),
+            () = std::future::ready(()), if waiting => true,
+            _ = self.orders.wake.notified() => true,
+            _ = sleep_or_never(due) => true,
+        }
     }
 
-    fn apply(&mut self) {}
+    fn apply(&mut self) {
+        while !self.stopped()
+            && let Some(queued) = self.orders.pop()
+        {
+            let receipt = Err(NotSentReason::Disconnected);
+            let rpc = queued.rpc;
+            self.handler.on_submitted(SubmitHandle { rpc, receipt });
+        }
+        // Once the control has dropped, the sink hands the handler nothing.
+        for rpc in self.rpcs.take_due(Instant::now()) {
+            let stamp = self.clock.stamp(self.key, None);
+            let mut sink = Late {
+                handler: &mut *self.handler,
+                stop: &self.stop,
+                stamp,
+            };
+            self.codec.on_rpc_timeout(rpc, &mut sink);
+        }
+    }
+}
+
+/// Hands the events of a deadline that fell due while the session waits to connect to the
+/// handler, stamped `stamp`, until the control drops.
+struct Late<'a, H> {
+    handler: &'a mut H,
+    stop: &'a watch::Receiver<()>,
+    stamp: Stamp,
+}
+
+impl<H: ExecHandler> ExecSink for Late<'_, H> {
+    fn push(&mut self, meta: VenueMeta, ev: ExecEvent) {
+        if self.stop.has_changed().is_ok() {
+            self.handler.on_exec(Envelope::new(self.stamp, meta, ev));
+        }
+    }
 }
 
 /// What the core hands a current epoch's timer firings and HTTP results to: the session's one
@@ -708,6 +980,9 @@ struct Feed<'a, H> {
     stop: &'a watch::Receiver<()>,
     decode_errors: &'a mut u64,
     fault: &'a mut Option<ExecSessionError>,
+    rpcs: &'a mut Rpcs,
+    orders: &'a Shared,
+    own: StreamId,
 }
 
 impl<H> Feed<'_, H> {
@@ -745,6 +1020,9 @@ impl<H: ExecHandler> EpochInputs for Feed<'_, H> {
             epochs,
             stop: self.stop,
             stamp,
+            rpcs: &mut *self.rpcs,
+            orders: self.orders,
+            own: self.own,
         };
         let (codec, specs) = (&mut *self.codec, self.specs);
         let decoded = dispatch(self.caps, self.ns, |scope| {
@@ -759,6 +1037,10 @@ impl<H: ExecHandler> EpochInputs for Feed<'_, H> {
 
     fn on_tick_to_wire(&mut self, _: TickToWire) {}
 
+    fn sent_rpc(&mut self, call: RpcCall) {
+        self.rpcs.sent(call, Instant::now());
+    }
+
     /// A timer's mis-reserved nonces end the session before another effect is executed.
     fn halted(&self) -> bool {
         self.fault.is_some()
@@ -767,19 +1049,33 @@ impl<H: ExecHandler> EpochInputs for Feed<'_, H> {
 
 /// Stamps each pushed event with its input's stamp and hands it to the handler at once (0014
 /// item 2); an event of an ended epoch, one pushed after the control dropped included, is
-/// dropped and counted.
+/// dropped and counted. An event that answers a request clears its deadline (FBC-0ga), and the
+/// codec's report of the session's own stream says whether its epoch is authenticated.
 struct Sink<'a, H> {
     handler: &'a mut H,
     epochs: &'a mut Epochs,
     stop: &'a watch::Receiver<()>,
     stamp: Stamp,
+    rpcs: &'a mut Rpcs,
+    orders: &'a Shared,
+    own: StreamId,
 }
 
 impl<H: ExecHandler> ExecSink for Sink<'_, H> {
     fn push(&mut self, meta: VenueMeta, ev: ExecEvent) {
+        if let Some(rpc) = ev.answers() {
+            self.rpcs.answered(rpc);
+        }
         if self.stop.has_changed().is_err() {
             self.epochs.drop_ended(Input::Event);
         } else if let Ok(Admit::Current) = self.epochs.admit(Input::Event, self.stamp.conn) {
+            if let ExecEvent::Conn { stream, state } = &ev
+                && *stream == self.own
+            {
+                let authenticated = *state == ConnState::Authenticated;
+                let epoch = authenticated.then_some(self.stamp.conn.epoch);
+                self.orders.set_ready(epoch);
+            }
             self.handler.on_exec(Envelope::new(self.stamp, meta, ev));
         }
     }
@@ -825,15 +1121,5 @@ mod tests {
         }
         let epoch = ExecSessionError::from(EpochError::Exhausted { conn: 3 });
         assert_eq!(epoch.to_string(), "connection 3 has no epoch left to open");
-    }
-
-    /// Between epochs the core waits on the control's drop alone: it has no state to apply.
-    #[tokio::test]
-    async fn the_control_changes_only_by_its_drop() {
-        let (tx, rx) = watch::channel(());
-        let mut stop = Stop(rx);
-        stop.apply();
-        drop(tx);
-        assert!(!stop.changed().await);
     }
 }

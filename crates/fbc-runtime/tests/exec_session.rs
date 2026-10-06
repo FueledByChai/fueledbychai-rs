@@ -579,6 +579,7 @@ fn setup(
         venue,
         cfg,
         creds: Secrets::new(),
+        acct: fbc_core::AccountKey::new(1),
         ns: OWN_NS,
         specs: exec_toy::specs(),
         connector: Connector::new(ProxyConfig::Direct),
