@@ -4,10 +4,13 @@
 //!
 //! **The seed.** A market's position is unknown until a resync seeds it, once per process
 //! ([`Registry::resync`]): until then [`Registry::position`] is `None` and the pre-trade caps
-//! admit no place or amend on it. The seed registers our namespace's open orders the snapshot
-//! shows that the registry does not hold (an earlier run's; never amended, only cancelled:
-//! their placement is not known), and sets the position to the snapshot's, plus the fills
-//! accepted before the seed that the snapshot does not hold.
+//! admit no place or amend on it. Only a resync from a trustworthy snapshot source seeds; one
+//! that can be stale or incomplete, or none, seeds nothing ([`ResyncReport::untrustworthy`]).
+//! Every resync registers our namespace's open orders the snapshot shows on a market not
+//! seeded yet that the registry does not hold (an earlier run's; never amended, only
+//! cancelled: their placement is not known), whether or not it seeds the market, so a cancel
+//! of every order the registry holds reaches them. The seed sets the position to the
+//! snapshot's, plus the fills accepted before the seed that the snapshot does not hold.
 //!
 //! **A fill straddling the snapshot** (executed after the request, reported before or after the
 //! answer) is counted exactly once. The snapshot holds a fill when:
@@ -16,8 +19,12 @@
 //!    `cum_after` (when the fill reports none: its matching-engine time is at or before the
 //!    watermark);
 //! 3. the snapshot does not show the fill's order, and its matching-engine time is at or before
-//!    the watermark or the venue's snapshot source is trustworthy: the order was not open when
-//!    the venue read the account, so every fill of it came before.
+//!    the watermark, or the order was at the venue before the request: it was not open when
+//!    the venue read the account, so every fill of it came before. An order the registry held
+//!    before the seed that no snapshot showed it may have reached the venue after the read, so
+//!    only its time places it; an earlier run's order the registry does not hold, or one a
+//!    snapshot showed, was there (0013's cancel-on-disconnect ends an earlier run's orders in
+//!    flight).
 //!
 //! It does not hold a fill of an order it shows with a cumulative fill below the fill's
 //! `cum_after`, nor any fill of an order placed after the seed. A fill none of these rules
@@ -121,7 +128,8 @@ pub struct ResyncReport {
     pub ladder: ResyncApplied,
     /// The markets it seeded, with their position.
     pub seeded: Vec<(InstrumentId, SignedLots)>,
-    /// Our orders it registered from the snapshot as it seeded their market.
+    /// Our open orders it registered from the snapshot, on markets not seeded before it,
+    /// whether it seeded them or not.
     pub registered: Vec<ClientOrderId>,
     /// The markets it could not seed, each with a fill accepted before the seed that the
     /// snapshot neither holds nor shows to be after it: they stay unknown.
@@ -131,6 +139,10 @@ pub struct ResyncReport {
     /// Open orders under our namespace on a market seeded before it that the registry does not
     /// hold (0005's I7 orphans).
     pub untracked: Vec<(ClientOrderId, VenueOrderId)>,
+    /// The venue's snapshot source is not trustworthy (it can be stale or incomplete, or the
+    /// venue offers none): the resync seeded no market, so their positions stay unknown and
+    /// nothing is built on them (decision 0052).
+    pub untrustworthy: bool,
 }
 
 /// A market's position, as the registry knows it.
@@ -191,7 +203,7 @@ impl Placed {
 pub(crate) struct Seed {
     /// The snapshot that seeded it; `None` when the consumer seeded it by hand
     /// ([`Registry::seed_position`]), so every later fill counts.
-    reference: Option<SeedRef>,
+    reference: Option<Box<SeedRef>>,
     /// The inventory as of `folded_to`.
     base: i128,
     /// Every fill counted on the inventory since then arrived after it.
@@ -217,7 +229,10 @@ impl Seed {
 struct SeedRef {
     watermark: WallNs,
     requested_at: MonoNs,
-    trustworthy: bool,
+    /// The orders the registry held on the market before the seed that no snapshot showed it:
+    /// one may have reached the venue after it read the account, so the snapshot not showing
+    /// it does not place its fills (Reviewer B's P1 on PR #80).
+    unsure: HashSet<ClientOrderId>,
     /// Our orders it showed, with their cumulative fill.
     shown: HashMap<ClientOrderId, Lots>,
     /// Every order it showed, by venue id, with its cumulative fill: an order shown without
@@ -256,7 +271,7 @@ impl SeedRef {
                     true
                 }
                 (Some(_), None) => before_watermark,
-                (None, _) => before_watermark || self.trustworthy,
+                (None, _) => before_watermark || !self.unsure.contains(&f.cid),
             };
         if held {
             Placement::InSnapshot {
@@ -322,9 +337,11 @@ impl Registry {
     ///
     /// The Unknown ladder's orders apply first ([`Registry::on_resync`], with `cfg` and
     /// `caps`; call this instead of it, not beside it), then every other order of ours the
-    /// snapshot shows as its order update would. Each market not yet seeded that the caps
-    /// configure, the snapshot names or a fill moved is then seeded, unless a fill it holds is
-    /// unsettled, registering our open orders it shows; each market seeded before is compared.
+    /// snapshot shows as its order update would. Our open orders it shows on a market not yet
+    /// seeded that the registry does not hold are registered. From a trustworthy snapshot
+    /// source, each market not yet seeded that the caps configure, the snapshot names or a fill
+    /// moved is then seeded, unless a fill it holds is unsettled; from any other, none is
+    /// ([`ResyncReport::untrustworthy`]). Each market seeded before is compared.
     /// Refused whole, nothing applied, when the snapshot lists a position or one of our orders
     /// twice, or a seed overflows.
     pub fn resync(
@@ -348,8 +365,15 @@ impl Registry {
                 return Err(ResyncError::DuplicateOrder(cid));
             }
         }
-        let mut report = ResyncReport::default();
-        let seeds = self.plan_seeds(caps, snap, &positions, &ours, &mut report)?;
+        let mut report = ResyncReport {
+            untrustworthy: caps.snapshot_source != SnapshotSource::Trustworthy,
+            ..ResyncReport::default()
+        };
+        let seeds = if report.untrustworthy {
+            Vec::new()
+        } else {
+            self.plan_seeds(snap, &positions, &ours, &mut report)?
+        };
 
         let ladder: HashSet<ClientOrderId> = self
             .orders
@@ -380,15 +404,19 @@ impl Registry {
         }
         for (&cid, o) in &ours {
             if self.held_order(o).is_none()
-                && matches!(self.markets.get(&o.inst), Some(MarketState::Seeded(_)))
+                && matches!(
+                    self.markets.get(&o.inst),
+                    Some(MarketState::Seeded(_) | MarketState::Unsettled)
+                )
             {
                 report.untracked.push((cid, o.vid.clone()));
             }
         }
         report.untracked.sort_by_key(|(cid, _)| *cid);
 
+        self.register_shown(snap, key, &mut report);
         for plan in seeds {
-            self.seed(plan, key, &mut report);
+            self.seed(plan, &mut report);
         }
         report.registered.sort();
         Ok(report)
@@ -408,12 +436,34 @@ impl Registry {
         }
     }
 
-    /// The seeds this resync makes, decided before anything applies: each market not yet
-    /// seeded that the caps configure, the snapshot names or a fill moved, whose held fills
-    /// the snapshot places.
+    /// Registers our open orders the snapshot shows on a market not seeded yet that the
+    /// registry does not hold (an earlier run's), whether this resync seeds the market or not,
+    /// so a cancel of every order the registry holds reaches them (Reviewer B's P2 on PR #80).
+    /// One whose venue id names another order of ours is not registered.
+    fn register_shown(&mut self, snap: &ResyncSnapshot, key: OrderKey, report: &mut ResyncReport) {
+        for o in &snap.orders {
+            if let Some(CidMatch::Ours(cid)) = o.cid
+                && o.state == VenueOrderState::Open
+                && !self.orders.contains_key(&cid)
+                && self.cid_of(&o.vid).is_none()
+                && matches!(
+                    self.markets.get(&o.inst),
+                    None | Some(MarketState::Unseeded(_))
+                )
+            {
+                self.orders.insert(cid, OrderRecord::seeded_from(cid, o));
+                let u = update_of(o);
+                self.with_record(cid, |rec| rec.apply_update(&u, key));
+                report.registered.push(cid);
+            }
+        }
+    }
+
+    /// The seeds this resync makes from a trustworthy snapshot, decided before anything
+    /// applies: each market not yet seeded that the caps configure, the snapshot names or a
+    /// fill moved, whose held fills the snapshot places.
     fn plan_seeds(
         &self,
-        caps: &OrderCaps,
         snap: &ResyncSnapshot,
         positions: &HashMap<InstrumentId, SignedLots>,
         ours: &HashMap<ClientOrderId, &VenueOrderSnapshot>,
@@ -439,14 +489,18 @@ impl Registry {
             let mut reference = SeedRef {
                 watermark: snap.watermark,
                 requested_at: snap.requested_at,
-                trustworthy: caps.snapshot_source == SnapshotSource::Trustworthy,
+                unsure: self
+                    .orders
+                    .values()
+                    .filter(|rec| rec.placed().inst == inst && !rec.from_snapshot())
+                    .map(OrderRecord::cid)
+                    .collect(),
                 shown: HashMap::new(),
                 shown_vids: HashMap::new(),
                 known: HashSet::new(),
             };
             // Our orders it shows: one the registry holds by its id (an order shown under our
             // client id and another order's venue id by neither), or one to register.
-            let mut register = HashMap::new();
             for o in snap.orders.iter().filter(|o| o.inst == inst) {
                 reference.shown_vids.insert(o.vid.clone(), o.cum_filled);
                 if let Some(cid) = self.held_order(o) {
@@ -455,7 +509,6 @@ impl Registry {
                     && !self.orders.contains_key(&cid)
                 {
                     reference.shown.insert(cid, o.cum_filled);
-                    register.insert(cid, o.clone());
                 }
             }
             let overflow = ResyncError::Overflow(inst);
@@ -496,39 +549,26 @@ impl Registry {
                 pos: SignedLots(pos),
                 folded_to,
                 baselines,
-                register,
                 reference,
             });
         }
         Ok(plans)
     }
 
-    /// Applies one planned seed: registers our open orders the snapshot shows that the
-    /// registry does not hold, sets the fill count of each order it shows to the cumulative
-    /// fill it showed plus the fills after it, and the position.
-    fn seed(&mut self, plan: SeedPlan, key: OrderKey, report: &mut ResyncReport) {
+    /// Applies one planned seed: sets the fill count of each order it shows that the registry
+    /// holds (those [`Registry::register_shown`] registered included) to the cumulative fill it
+    /// showed plus the fills after it, and the position.
+    fn seed(&mut self, plan: SeedPlan, report: &mut ResyncReport) {
         let SeedPlan {
             inst,
             pos,
             folded_to,
             baselines,
-            register,
             mut reference,
         } = plan;
         for (cid, cum) in baselines {
             if self.orders.contains_key(&cid) {
                 self.with_record(cid, |rec| rec.set_cum_fills(cum));
-            } else if let Some(o) = register.get(&cid)
-                && o.state == VenueOrderState::Open
-                && self.cid_of(&o.vid).is_none()
-            {
-                self.orders.insert(cid, OrderRecord::seeded_from(cid, o));
-                let u = update_of(o);
-                self.with_record(cid, |rec| {
-                    rec.apply_update(&u, key);
-                    rec.set_cum_fills(cum);
-                });
-                report.registered.push(cid);
             }
         }
         reference.known = self
@@ -541,7 +581,7 @@ impl Registry {
         self.markets.insert(
             inst,
             MarketState::Seeded(Seed {
-                reference: Some(reference),
+                reference: Some(Box::new(reference)),
                 base: i128::from(pos.0),
                 folded_to,
                 log: Vec::new(),
@@ -601,7 +641,5 @@ struct SeedPlan {
     pos: SignedLots,
     folded_to: MonoNs,
     baselines: Vec<(ClientOrderId, Lots)>,
-    /// Our orders it shows that the registry does not hold: registered when open.
-    register: HashMap<ClientOrderId, VenueOrderSnapshot>,
     reference: SeedRef,
 }

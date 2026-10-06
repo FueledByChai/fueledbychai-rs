@@ -445,41 +445,41 @@ fn a_fill_of_an_order_the_snapshot_does_not_show_is_in_it_from_a_trustworthy_sou
 
 #[test]
 fn a_fill_nothing_places_leaves_the_market_unknown() {
-    // From an untrustworthy source, a fill of an order the snapshot does not show, executed
-    // after the request, may or may not be in it.
+    // A fill of an order the registry held before the seed and the snapshot does not show,
+    // executed after the request, may or may not be in it: the order may have reached the
+    // venue after its read.
     let mut reg = registry();
     let mut l = ledger();
-    let gone = cid();
-    let f = order_fill(gone, "g", "x", 5, Some(5));
+    let early = cid();
+    reg.insert(placement(early, 100, 5)).unwrap();
+    let f = order_fill(early, "g", "x", 5, Some(5));
     apply(&mut reg, &mut l, &f, exec(1_500), 1_100);
     let snap = snapshot(vec![], &[(INST, 5)]);
-    let report = resync_with(&mut reg, SnapshotSource::Untrustworthy, &snap);
+    let report = resync(&mut reg, &snap);
     assert!(report.seeded.is_empty());
     assert_eq!(report.unsettled, vec![(INST, f.key())]);
     assert_eq!(reg.position(INST), None);
     // A resync requested after it arrived places it: the snapshot holds it.
     let later = snapshot_at(2_000, 2_000, vec![], &[(INST, 5)]);
-    let report = resync_with(&mut reg, SnapshotSource::Untrustworthy, &later);
+    let report = resync(&mut reg, &later);
     assert_eq!(report.seeded, vec![(INST, SignedLots(5))]);
     assert_eq!(reg.position(INST), Some(SignedLots(5)));
-    // Executed at or before the watermark, it is in the snapshot whatever the source.
+    // Executed at or before the watermark, it is in the snapshot.
     let mut reg = registry();
     let mut l = ledger();
+    reg.insert(placement(early, 100, 5)).unwrap();
     apply(&mut reg, &mut l, &f, exec(1_000), 1_100);
-    resync_with(&mut reg, SnapshotSource::None, &snap);
+    resync(&mut reg, &snap);
     assert_eq!(reg.position(INST), Some(SignedLots(5)));
 
     // After the seed, such a fill makes the position unknown for the rest of the process.
     let mut reg = registry();
     let mut l = ledger();
-    resync_with(
-        &mut reg,
-        SnapshotSource::Untrustworthy,
-        &snapshot(vec![], &[]),
-    );
+    reg.insert(placement(early, 100, 5)).unwrap();
+    resync(&mut reg, &snapshot(vec![], &[]));
     assert_eq!(
         apply(&mut reg, &mut l, &f, exec(1_500), 1_100),
-        FillRouted::Unsettled(gone)
+        FillRouted::Unsettled(early)
     );
     assert_eq!(reg.position(INST), None);
     assert_eq!(
@@ -532,8 +532,10 @@ fn a_fill_without_a_cumulative_fill_is_placed_by_its_time() {
     apply(&mut reg, &mut l, &f, None, 1_100);
     let report = resync(&mut reg, &snap);
     assert_eq!(report.unsettled, vec![(INST, f.key())]);
-    assert!(report.registered.is_empty());
-    assert!(reg.get(a).is_none());
+    assert_eq!(reg.position(INST), None);
+    // The order is registered all the same, so a cancel reaches it.
+    assert_eq!(report.registered, vec![a]);
+    assert!(reg.get(a).unwrap().from_snapshot());
 }
 
 #[test]
@@ -588,7 +590,8 @@ fn an_order_registered_before_the_seed_counts_the_fill_the_snapshot_shows() {
         reg.get(a).unwrap().state(),
         OrdState::Terminal(fbc_oms::TerminalKind::Filled)
     );
-    // A fill of an order not shown, after the seed, counts on its order but not the position.
+    // A fill of an order not shown, executed after the watermark and arriving after the seed:
+    // the order may have reached the venue after its read, so nothing places the fill.
     let b = cid();
     let mut reg2 = registry();
     let mut l2 = ledger();
@@ -602,9 +605,9 @@ fn an_order_registered_before_the_seed_counts_the_fill_the_snapshot_shows() {
             exec(1_500),
             1_100
         ),
-        FillRouted::InSnapshot(b)
+        FillRouted::Unsettled(b)
     );
-    assert_eq!(reg2.position(INST), Some(SignedLots(5)));
+    assert_eq!(reg2.position(INST), None);
     assert_eq!(reg2.get(b).unwrap().cum_fills(), lots(5));
     // Its seeded fill count covering the order ends it.
     let mut reg3 = registry();
@@ -806,4 +809,130 @@ fn an_order_shown_without_our_client_id_is_still_shown() {
         }
         assert_eq!(reg.position(INST), Some(SignedLots(10)), "before: {before}");
     }
+}
+
+/// Reviewer B's P1 on PR #80: an order the registry held before the first resync may reach the
+/// venue after it read the account, so the snapshot not showing it says nothing of its fills
+/// executed after the watermark. Counted as in the snapshot, a 50-lot fill would vanish and
+/// the $50 inventory cap admit 50 lots more.
+#[test]
+fn a_fill_of_an_order_registered_before_the_seed_and_not_shown_is_never_assumed_in_it() {
+    // Its fill arrives after the answer: the position becomes unknown, nothing is built.
+    let mut reg = registry();
+    let mut l = ledger();
+    let b = cid();
+    reg.insert(placement(b, 100, CAP)).unwrap();
+    resync(&mut reg, &snapshot(vec![], &[(INST, 0)]));
+    let f = order_fill(b, "b", "x", CAP, Some(CAP));
+    assert_eq!(
+        apply(&mut reg, &mut l, &f, exec(1_500), 1_100),
+        FillRouted::Unsettled(b)
+    );
+    assert_eq!(reg.position(INST), None);
+    assert_eq!(
+        reg.place(placement(cid(), 100, CAP)),
+        Err(OmsError::Capped(CapRefusal::PositionUnknown(INST)))
+    );
+    // Its fill arrives before the answer: the market is not seeded.
+    let mut reg = registry();
+    let mut l = ledger();
+    reg.insert(placement(b, 100, CAP)).unwrap();
+    apply(&mut reg, &mut l, &f, exec(1_500), 1_100);
+    let report = resync(&mut reg, &snapshot(vec![], &[(INST, 0)]));
+    assert!(report.seeded.is_empty());
+    assert_eq!(report.unsettled, vec![(INST, f.key())]);
+    assert_eq!(reg.position(INST), None);
+    // Executed by the watermark, the snapshot holds it all the same.
+    let mut reg = registry();
+    let mut l = ledger();
+    reg.insert(placement(b, 100, CAP)).unwrap();
+    resync(&mut reg, &snapshot(vec![], &[(INST, CAP)]));
+    assert_eq!(
+        apply(&mut reg, &mut l, &f, exec(W), 1_100),
+        FillRouted::InSnapshot(b)
+    );
+    assert_eq!(reg.position(INST), Some(SignedLots(CAP)));
+}
+
+/// Reviewer A's finding on PR #80: a snapshot source that can be stale or incomplete, or none,
+/// seeds no market, so order entry stays held until a trustworthy resync.
+#[test]
+fn a_resync_seeds_nothing_unless_the_snapshot_source_is_trustworthy() {
+    for source in [SnapshotSource::Untrustworthy, SnapshotSource::None] {
+        let mut reg = registry();
+        let report = resync_with(&mut reg, source, &snapshot(vec![], &[(INST, 0)]));
+        assert!(report.untrustworthy, "{source:?}");
+        assert!(report.seeded.is_empty() && report.unsettled.is_empty());
+        assert_eq!(reg.position(INST), None);
+        assert_eq!(
+            reg.place(placement(cid(), 100, 1)),
+            Err(OmsError::Capped(CapRefusal::PositionUnknown(INST)))
+        );
+        // A trustworthy one then seeds it.
+        let report = resync(&mut reg, &snapshot_at(2_000, 2_000, vec![], &[(INST, 0)]));
+        assert!(!report.untrustworthy);
+        assert_eq!(report.seeded, vec![(INST, SignedLots(0))]);
+        reg.place(placement(cid(), 100, 1)).unwrap();
+    }
+}
+
+/// Reviewer B's P2 on PR #80: our open orders on a market the resync does not seed must still
+/// be registered, or a Stop's cancel of every order the registry holds cannot reach them.
+#[test]
+fn our_open_orders_on_a_market_left_unseeded_are_registered_and_cancellable() {
+    // Left unseeded by a fill nothing places (shown, no cumulative fill, untimed).
+    let mut reg = registry();
+    let mut l = ledger();
+    let a = cid();
+    let f = order_fill(a, "a", "x", 4, None);
+    apply(&mut reg, &mut l, &f, None, 1_100);
+    let report = resync(
+        &mut reg,
+        &snapshot(vec![shown(a, "a", 20, 10)], &[(INST, 10)]),
+    );
+    assert_eq!(report.unsettled, vec![(INST, f.key())]);
+    assert_eq!(report.registered, vec![a]);
+    assert_eq!(reg.position(INST), None);
+    assert_eq!(reg.cid_of(&vid("a")), Some(a));
+    assert_eq!(reg.cancel_many(&[a], &order_caps()).commands.len(), 1);
+    // A later resync seeds the market, counting the order's shown fill and the one after.
+    let report = resync(
+        &mut reg,
+        &snapshot_at(2_000, 2_000, vec![shown(a, "a", 20, 14)], &[(INST, 14)]),
+    );
+    assert_eq!(report.seeded, vec![(INST, SignedLots(14))]);
+    assert_eq!(reg.get(a).unwrap().cum_fills(), lots(14));
+
+    // Left unseeded by an untrustworthy source.
+    let mut reg = registry();
+    let b = cid();
+    let report = resync_with(
+        &mut reg,
+        SnapshotSource::Untrustworthy,
+        &snapshot(vec![shown(b, "b", 5, 0)], &[]),
+    );
+    assert_eq!(report.registered, vec![b]);
+    assert_eq!(reg.cancel_many(&[b], &order_caps()).commands.len(), 1);
+
+    // On a market whose position a fill made unknown after the seed, an open order of ours
+    // the registry does not hold is reported (0005's I7), as on a seeded one.
+    let mut reg = registry();
+    let mut l = ledger();
+    let early = cid();
+    reg.insert(placement(early, 100, 5)).unwrap();
+    resync(&mut reg, &snapshot(vec![], &[]));
+    apply(
+        &mut reg,
+        &mut l,
+        &order_fill(early, "e", "y", 5, Some(5)),
+        exec(1_500),
+        1_100,
+    );
+    assert_eq!(reg.position(INST), None);
+    let orphan = cid();
+    let report = resync(
+        &mut reg,
+        &snapshot_at(3_000, 3_000, vec![shown(orphan, "o", 5, 0)], &[]),
+    );
+    assert_eq!(report.untracked, vec![(orphan, vid("o"))]);
 }

@@ -95,15 +95,16 @@
 //! never capped (`tests/caps.rs`).
 //!
 //! Resyncs (decision 0052, `tests/resync.rs`): the consumer hands each resync's answer to
-//! [`Registry::resync`] as a [`ResyncSnapshot`]. The first one seeds each market's position,
-//! once per process, and registers our open orders it shows that the registry does not hold
-//! (an earlier run's, never amended); until then the market's position is unknown
+//! [`Registry::resync`] as a [`ResyncSnapshot`]. The first one from a trustworthy snapshot
+//! source seeds each market's position, once per process; every one registers our open orders
+//! it shows on a market not yet seeded that the registry does not hold (an earlier run's, never
+//! amended), so a cancel reaches them. Until its seed a market's position is unknown
 //! ([`Registry::position`]) and nothing is built on it. A fill executed between the request and
 //! the answer counts exactly once, wherever it arrives: the snapshot holds it when it arrived
 //! before the request, its order shows the cumulative fill it brought, or (its order not shown)
-//! it executed by the watermark or the venue's snapshot source is trustworthy; a fill nothing
-//! places leaves the market unknown. Later resyncs compare each position with the inventory as
-//! of the watermark and report a desync, never overwriting it ([`PositionCheck`]).
+//! it executed by the watermark or its order was at the venue before the request; a fill
+//! nothing places leaves the market unknown. Later resyncs compare each position with the
+//! inventory as of the watermark and report a desync, never overwriting it ([`PositionCheck`]).
 //!
 //! Not here yet: the market states (FBC-c4v), and issuing an authorization after them and its
 //! check at submit (FBC-afd).
