@@ -16,7 +16,7 @@ use fbc_core::{
     SnapshotSource, SubmitOutcome, Ticks, VenueOrderSnapshot, VenueOrderState, WallNs,
 };
 use fbc_oms::{
-    Admission, ArmRefusal, CapRefusal, FillLedger, FillRouted, FillTime, LadderConfig,
+    Admission, ArmRefusal, CapRefusal, EntryState, FillLedger, FillRouted, FillTime, LadderConfig,
     LedgerConfig, MarketCapsConfig, OmsError, OrdState, OrderKey, OrderOp, PermitRefusal,
     PermittedCommand, PositionCheck, PreTradeCaps, Registry, ResyncError, ResyncReport,
     ResyncSnapshot, StateRefusal, TerminalKind,
@@ -56,15 +56,41 @@ fn registry_resting(resting: i64) -> Registry {
 }
 
 /// The owner's Start on `INST` (decision 0012), with its leases: its position must be known.
+/// Only this call arms a market in this file, once, so no resync, fill or ladder tick before
+/// it may have armed or moved the market.
 fn arm(reg: &mut Registry) {
+    untouched(reg);
     arm::start(reg, INST);
 }
 
+/// `INST` is as a fresh registry has it, disarmed in Cancel-only at generation 0: nothing but
+/// the owner's Start (`arm`) changes it.
+fn untouched(reg: &Registry) {
+    let e = reg.entry(INST);
+    assert_eq!(
+        (e.armed(), e.state(), e.generation().get()),
+        (false, EntryState::CancelOnly, 0),
+        "a resync, fill or ladder tick moved the market"
+    );
+}
+
 /// Builds the place of `order`, the owner's Start pressed first once `INST`'s position is known
-/// (decision 0012): until then nothing is armed, and the market's state refuses it.
+/// (decision 0012): until then nothing is armed, and the market's state refuses it. An armed
+/// market must be exactly as `arm` left it, so a resync, fill or ladder tick that armed it, or
+/// moved its state, fails here rather than being hidden by the arming.
 fn place(reg: &mut Registry, order: NewOrder) -> Result<PermittedCommand, OmsError> {
-    if !reg.entry(INST).armed() && reg.position_known(INST) {
-        arm(reg);
+    let e = reg.entry(INST);
+    if e.armed() {
+        assert_eq!(
+            (e.state(), e.generation().get()),
+            (EntryState::Quoting, 1),
+            "a resync, fill or ladder tick moved the armed market"
+        );
+    } else {
+        untouched(reg);
+        if reg.position_known(INST) {
+            arm(reg);
+        }
     }
     reg.place(order)
 }
