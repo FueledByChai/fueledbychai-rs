@@ -568,36 +568,28 @@ impl<H: ExecHandler> ExecSession<H> {
         self.execute(ws, fx, true, None).await
     }
 
-    /// Executes `fx` in order ([`Core::execute`]), each effect as its turn comes, attributed to
-    /// the input stamped `origin`, its frames already charged when `charged` says so. A stop,
-    /// from the handler or from another thread, ends the epoch before the next effect (Codex
+    /// Executes `fx` in order ([`Core::execute`]), as one batch, attributed to the input
+    /// stamped `origin`, its frames already charged when `charged` says so. A stop, from the
+    /// handler or from another thread, ends the epoch before the next effect (Codex
     /// r4188802881), so a timer or request behind a reconnect or a failed write, which ends the
     /// epoch first, is never reached (Codex r4188639448). A timer firing or an HTTP result the
-    /// core takes while a write waits reaches the codec through [`Feed`]; one whose nonces the
-    /// source mis-reserved ends the session. False when the epoch ended.
+    /// core takes while a write waits reaches the codec through [`Feed`], and what it asks for
+    /// goes behind the rest of `fx`, so a reconnect still in `fx` ends the epoch before it is
+    /// reached (Reviewer B, B1); one whose nonces the source mis-reserved halts the batch and
+    /// ends the session. False when the epoch ended.
     async fn execute(
         &mut self,
         ws: &mut Option<WebSocket>,
-        mut fx: Effects,
+        fx: Effects,
         charged: bool,
         origin: Option<Stamp>,
     ) -> Result<bool, ExecSessionError> {
-        for effect in fx.take() {
-            if self.stopped() {
-                return Ok(false);
-            }
-            let mut one = Effects::new();
-            one.push(effect);
-            let open = self
-                .core
-                .execute(ws, &mut feed!(self), one, charged, origin)
-                .await?;
-            self.faulted()?;
-            if !open {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        let open = self
+            .core
+            .execute(ws, &mut feed!(self), fx, charged, origin)
+            .await?;
+        self.faulted()?;
+        Ok(open)
     }
 
     /// Fires the earliest timer, which is due: an ended epoch's into nothing (dropped and
@@ -763,6 +755,11 @@ impl<H: ExecHandler> EpochInputs for Feed<'_, H> {
     }
 
     fn on_tick_to_wire(&mut self, _: TickToWire) {}
+
+    /// A timer's mis-reserved nonces end the session before another effect is executed.
+    fn halted(&self) -> bool {
+        self.fault.is_some()
+    }
 }
 
 /// Stamps each pushed event with its input's stamp and hands it to the handler at once (0014

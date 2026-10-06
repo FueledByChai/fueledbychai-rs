@@ -220,7 +220,8 @@ impl VenueFactory for ExecToy {
 /// `ResyncBegin` and asks to send `said`; `arm|tag=<n>|ms=<t>` sets timer `n` to fire in `t`
 /// ms; `ask|tag=<n>|path=<p>` asks for a GET of `p` under the configured base URL, whose result
 /// it records, pushes as an account `Halted` mode and acknowledges with `got|tag=<n>`;
-/// `big|kb=<n>` asks to send an `n` KiB frame.
+/// `big|kb=<n>` asks to send an `n` KiB frame, then, with `|then=said`, to send `said`, or with
+/// `|then=bye`, to reconnect its stream.
 struct Recording {
     inner: ToyExec,
     opens: Opens,
@@ -390,6 +391,15 @@ impl ExecCodec for Recording {
                     class: TrafficClass::Normal,
                     charge: RateCharge::one(OpKind::Control, None),
                 });
+                let then = text.split('|').find_map(|part| part.strip_prefix("then="));
+                match then {
+                    Some("said") => fx.push(send(stream)),
+                    Some("bye") => fx.push(Effect::Reconnect {
+                        stream,
+                        reason: "bye",
+                    }),
+                    _ => {}
+                }
                 Ok(())
             }
             _ => self.inner.on_frame(stream, f, scope, specs, sink, fx),
@@ -1112,6 +1122,106 @@ async fn a_timers_nonces_mis_reserved_while_a_write_waits_end_the_session_as_the
     assert_eq!(run.err(), Some(short));
     assert!(venue.timers().is_empty());
     assert_eq!(session.counters().write_stalls, 1);
+}
+
+/// What woke the session while a write waited.
+#[derive(Copy, Clone)]
+enum During {
+    /// Timer 5, due 500 ms into the write; its `on_timer` asks to send `rang|tag=5`.
+    Timer,
+    /// The result of request 7, asked for just before; its `on_http` pushes an event and asks
+    /// to send `got|tag=7`.
+    Http,
+}
+
+/// A frame decoding to a 64 MiB frame and then `then`, with `during` taken while the peer does
+/// not read the 64 MiB one: what the peer hears on that connection once it reads again, each
+/// frame by its length, until it closes (`None`) or the test has heard `frames`; and the events
+/// the handler, a closure, was handed.
+async fn heard_behind_a_stalled_write(
+    during: During,
+    then: &str,
+    frames: usize,
+) -> (Vec<Option<usize>>, usize) {
+    let frozen = freeze();
+    let (mut server, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
+    let venue = ExecToy::leak();
+    let pacing = ReconnectPacing::new(ms(1_000), ms(8_000), 100, ms(60_000), Duration::MAX);
+    let (mut config, _) = setup(venue, &server.url(), pacing.unwrap());
+    config.cfg.insert(HTTP, &http.url(""));
+    config.write_stall = WriteStall::new(ms(3_000)).unwrap();
+    let events = Rc::new(RefCell::new(0));
+    let counted = events.clone();
+    let handler = move |_| *counted.borrow_mut() += 1;
+    let (mut session, control) = ExecSession::new(config, handler).unwrap();
+    let script = async move {
+        let mut peer = server.accept().await;
+        let _ = (peer.recv().await, peer.recv().await);
+        match during {
+            During::Timer => peer.send("arm|tag=5|ms=500"),
+            During::Http => peer.send("ask|tag=7|path=/x"),
+        }
+        peer.send(&format!("big|kb=65536|then={then}"));
+        let release = peer.hold();
+        churn().await;
+        match during {
+            During::Timer => {
+                advance(ms(500)).await;
+                settle(|| venue.timers().len() == 1).await;
+            }
+            During::Http => {
+                let asked = http.request().await;
+                asked.answer("HTTP/1.1 200 OK", "x").await;
+                settle(|| venue.answers().len() == 1).await;
+            }
+        }
+        drop(release);
+        let mut heard = Vec::new();
+        while heard.len() < frames {
+            let next = peer.next().await;
+            let end = next.is_none();
+            heard.push(next.map(|text| text.len()));
+            if end {
+                break;
+            }
+        }
+        drop(control);
+        heard
+    };
+    let (run, heard) = tokio::join!(session.run(), script);
+    run.unwrap();
+    drop(frozen);
+    let events = *events.borrow();
+    (heard, events)
+}
+
+const BIG: usize = 65_536 * 1024;
+
+/// What a timer firing asks for while a write waits goes behind the rest of that write's batch
+/// (decision 0054), not ahead of it (Reviewer B, B1).
+#[tokio::test(start_paused = true)]
+async fn a_frame_a_timer_asks_for_while_a_write_waits_goes_behind_the_rest_of_the_batch() {
+    let (said, rang) = ("said".len(), "rang|tag=5".len());
+    let (heard, _) = heard_behind_a_stalled_write(During::Timer, "said", 3).await;
+    assert_eq!(heard, [Some(BIG), Some(said), Some(rang)]);
+}
+
+/// So does what an HTTP result coming back while a write waits asks for; the event it pushes
+/// reaches the handler at once (Reviewer B, B1).
+#[tokio::test(start_paused = true)]
+async fn a_frame_an_http_result_asks_for_while_a_write_waits_goes_behind_the_rest_of_the_batch() {
+    let (said, got) = ("said".len(), "got|tag=7".len());
+    let (heard, events) = heard_behind_a_stalled_write(During::Http, "said", 3).await;
+    assert_eq!(heard, [Some(BIG), Some(said), Some(got)]);
+    assert_eq!(events, 1);
+}
+
+/// A reconnect left in the batch of a waiting write ends the epoch before what a timer firing
+/// asked for meanwhile is reached, so it is never sent (Reviewer B, B1).
+#[tokio::test(start_paused = true)]
+async fn a_reconnect_behind_a_waiting_write_ends_the_epoch_before_a_timers_frame() {
+    let (heard, _) = heard_behind_a_stalled_write(During::Timer, "bye", 3).await;
+    assert_eq!(heard, [Some(BIG), None]);
 }
 
 // ---------------------------------------------------------------------------------------------

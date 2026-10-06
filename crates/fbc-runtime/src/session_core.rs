@@ -145,6 +145,11 @@ pub(crate) trait EpochInputs {
     fn answer(&mut self, epochs: &mut Epochs, stamp: Stamp, done: Answered, fx: &mut Effects);
     /// A Safety-class write attributed to a frame with a kernel receive time completed.
     fn on_tick_to_wire(&mut self, sample: TickToWire);
+    /// Whether an input handed on while a write waited ended the session, so the core executes
+    /// none of the rest of the batch. Never, by default.
+    fn halted(&self) -> bool {
+        false
+    }
 }
 
 /// The consumer's control of a session, as the core waits on it between epochs.
@@ -529,9 +534,10 @@ impl Core {
     }
 
     /// Executes `effects` in order, each with whether it was charged already and the input it
-    /// is attributed to ([`Self::execute`]). Once the control has dropped none is executed and
-    /// the epoch has ended, so what a timer firing or an HTTP result asked for while a write
-    /// waited is not executed after a stop that came as the write completed (FBC-bnl).
+    /// is attributed to ([`Self::execute`]). Once the control has dropped, or `inputs` halted,
+    /// none is executed and the epoch has ended, so what a timer firing or an HTTP result asked
+    /// for while a write waited is not executed after a stop that came as the write completed
+    /// (FBC-bnl).
     async fn run_effects(
         &mut self,
         ws: &mut Option<WebSocket>,
@@ -541,7 +547,7 @@ impl Core {
         let key = self.current();
         let epoch = key.epoch;
         let own = self.own;
-        let mut open = self.stop.has_changed().is_ok();
+        let mut open = self.stop.has_changed().is_ok() && !inputs.halted();
         while open
             && let Some((effect, origin)) =
                 next_admitted(&mut effects, &self.rates, key, own, ws.is_some())
@@ -604,7 +610,7 @@ impl Core {
                     self.counters.refused_effects += 1;
                 }
             }
-            open &= self.stop.has_changed().is_ok();
+            open &= self.stop.has_changed().is_ok() && !inputs.halted();
         }
         Ok(open)
     }
@@ -1117,8 +1123,8 @@ mod tests {
         }
     }
 
-    /// Inputs no test here hands anything.
-    struct Nothing;
+    /// Inputs that take what they are handed and ask for nothing; halted when `.0` says so.
+    struct Nothing(bool);
 
     impl EpochInputs for Nothing {
         fn redact_inbound(&self, _: Inbound<'_>) -> InboundSpans {
@@ -1127,12 +1133,16 @@ mod tests {
         fn ring(&mut self, _: &mut Epochs, _: Stamp, _: TimerTag, _: &mut Effects) {}
         fn answer(&mut self, _: &mut Epochs, _: Stamp, _: Answered, _: &mut Effects) {}
         fn on_tick_to_wire(&mut self, _: TickToWire) {}
+        fn halted(&self) -> bool {
+            self.0
+        }
     }
 
-    /// FBC-bnl: once the control has dropped, the core executes no effect, so what was asked
-    /// for while a write waited is not executed after a stop that came as it completed.
+    /// FBC-bnl: once the control has dropped, or the inputs halted, the core executes no
+    /// effect, so what was asked for while a write waited is not executed after a stop that
+    /// came as it completed, nor after a timer firing that ended the session (Reviewer B, B1).
     #[tokio::test]
-    async fn once_the_control_dropped_no_effect_is_executed() {
+    async fn once_the_control_dropped_or_the_inputs_halted_no_effect_is_executed() {
         let reserve = crate::ratelimit::SafetyReserve::percent(0).unwrap();
         let (tx, stop) = watch::channel(());
         let ms = Duration::from_millis;
@@ -1154,13 +1164,24 @@ mod tests {
         };
         let mut fx = Effects::new();
         fx.push(timer());
-        let open = core.execute(&mut None, &mut Nothing, fx, false, None).await;
+        let open = core
+            .execute(&mut None, &mut Nothing(false), fx, false, None)
+            .await;
         assert_eq!((open, core.next_deadline().is_some()), (Ok(true), true));
-        let _ = core.take_timer();
+        let fired = core.fire(&mut None, &mut Nothing(false)).await;
+        assert_eq!((fired, core.next_deadline()), (Ok(true), None));
+        let mut fx = Effects::new();
+        fx.push(timer());
+        let open = core
+            .execute(&mut None, &mut Nothing(true), fx, false, None)
+            .await;
+        assert_eq!((open, core.next_deadline()), (Ok(false), None));
         drop(tx);
         let mut fx = Effects::new();
         fx.push(timer());
-        let open = core.execute(&mut None, &mut Nothing, fx, false, None).await;
+        let open = core
+            .execute(&mut None, &mut Nothing(false), fx, false, None)
+            .await;
         assert_eq!((open, core.next_deadline()), (Ok(false), None));
     }
 }
