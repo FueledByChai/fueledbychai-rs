@@ -1248,7 +1248,7 @@ async fn heard_behind_a_stalled_write(
 const BIG: usize = 65_536 * 1024;
 
 /// What a timer firing asks for while a write waits goes behind the rest of that write's batch
-/// (decision 0054), not ahead of it (Reviewer B, B1).
+/// (decision 0056), not ahead of it (Reviewer B, B1).
 #[tokio::test(start_paused = true)]
 async fn a_frame_a_timer_asks_for_while_a_write_waits_goes_behind_the_rest_of_the_batch() {
     let (said, rang) = ("said".len(), "rang|tag=5".len());
