@@ -425,6 +425,56 @@ fn exit_refuses_an_amend_until_its_admission_is_built() {
 }
 
 #[test]
+fn exit_builds_no_place_or_batch_item_of_any_kind_but_builds_cancels() {
+    // Flatten and Wind-down, each from Quoting with the control's resting orders and position.
+    // Every shape 0012 names, the reducing exits included, is refused until FBC-7gl builds
+    // Exit's own admission; single cancels and cancel-many are built all the same.
+    type Call = fn(&mut Registry, InstrumentId, Leases) -> Result<MarketEntry, ArmRefusal>;
+    let calls: [(&str, Call); 2] = [
+        ("flatten", Registry::flatten),
+        ("wind-down", Registry::wind_down),
+    ];
+    for (case, call) in calls {
+        let (mut reg, bid, ask) = quoting();
+        call(&mut reg, INST, Leases::none()).unwrap();
+        let before = reg.len();
+        for (name, order) in places() {
+            assert_eq!(
+                reg.place(order),
+                Err(OmsError::State(StateRefusal::Exit(INST))),
+                "{case}: {name}"
+            );
+        }
+        let plan = reg
+            .place_batch(places().into_iter().map(|(_, o)| o).collect())
+            .unwrap();
+        assert_eq!(plan.command, None, "{case}");
+        assert_eq!(plan.refused.len(), places().len(), "{case}");
+        for (c, why) in &plan.refused {
+            assert_eq!(
+                why,
+                &OmsError::State(StateRefusal::Exit(INST)),
+                "{case}: {c:?}"
+            );
+        }
+        assert_eq!(reg.len(), before, "{case}");
+
+        let caps = venue(false);
+        let plan = reg.cancel_many(&[bid, ask], &caps);
+        assert_eq!(plan.commands.len(), 1, "{case}");
+        match plan.commands[0].command() {
+            VenueCommand::CancelMany(items) => assert_eq!(items.len(), 2, "{case}"),
+            other => panic!("{case}: expected a cancel-many, got {other:?}"),
+        }
+        let single = reg.cancellable(ask).unwrap().cancel(&caps);
+        assert!(
+            matches!(&single, CancelChoice::Send(cmd) if matches!(cmd.command(), VenueCommand::Cancel(_))),
+            "{case}: {single:?}"
+        );
+    }
+}
+
+#[test]
 fn a_disarm_leaves_the_market_cancel_only_and_releases_its_leases() {
     // From Quoting and from Exit.
     for exit in [false, true] {
