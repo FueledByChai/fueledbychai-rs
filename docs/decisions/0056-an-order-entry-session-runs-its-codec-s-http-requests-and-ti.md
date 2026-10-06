@@ -44,8 +44,13 @@ asked"; `on_timer` takes an `EncodeCtx`, so its nonces must be reserved (0014 it
   no effect is executed. The session core now stops executing a batch's effects once the
   control has dropped and reports the epoch ended, for market data as for order entry, so an
   effect a timer or a result asked for while a write waited is not executed after a stop that
-  came as the write completed. What woke the session as the control dropped, and a frame
+  came as the write completed, and a request one asks for after the stop is not started, so it
+  is never charged or journaled. What woke the session as the control dropped, and a frame
   waiting then, is stamped, so it keeps its place in ingest order, and reaches no codec.
+- **No input starves another.** Between writes the session waits on its frames, its timers,
+  its results and the stop in one unbiased `select!`, which polls them from a random one each
+  time, and checks the stop after every wake, so a peer that keeps sending frames holds back
+  neither a due timer, nor a result, nor the stop.
 
 ## Alternatives
 

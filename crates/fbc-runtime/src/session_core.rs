@@ -625,7 +625,8 @@ impl Core {
     /// `effects`, behind the rest of the batch, uncharged and attributed to the result or
     /// firing. A request behind a reconnect of this stream, still queued in `effects` or asked
     /// for first, waits too: that reconnect ends the epoch before its turn, so it is never sent
-    /// (Codex r4177934308).
+    /// (Codex r4177934308); so does one asked for once the control has dropped or the inputs
+    /// halted, which no effect follows (Reviewer B, B6).
     async fn write(
         &mut self,
         ws: &mut WebSocket,
@@ -670,7 +671,11 @@ impl Core {
                 }
             };
             if let Some(stamp) = stamp {
-                let mut ends = effects.iter().any(|(e, ..)| ends_epoch(e, own));
+                // A stop the input brought, its handler dropping the control or the inputs
+                // halting, starts no request either: it would be charged and journaled after
+                // the stop, never sent (Reviewer B, B6).
+                let stopped = self.stop.has_changed().is_err() || inputs.halted();
+                let mut ends = stopped || effects.iter().any(|(e, ..)| ends_epoch(e, own));
                 for effect in more.take() {
                     ends |= ends_epoch(&effect, own);
                     match effect {

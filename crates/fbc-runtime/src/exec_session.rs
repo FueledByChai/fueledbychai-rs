@@ -451,6 +451,9 @@ impl<H: ExecHandler> ExecSession<H> {
             self.open_effects(&mut ws, key, fx).await?
         };
         while open {
+            // Unbiased: each turn polls the branches from a random one, so frames that keep
+            // arriving starve no timer, result or stop, and the stop is checked after every wake
+            // below whichever branch won (DeepSeek DS-1).
             let wake = tokio::select! {
                 frame = next_frame(&mut ws) => Wake::Frame(frame),
                 _ = sleep_or_never(self.core.next_deadline()) => Wake::Timer,

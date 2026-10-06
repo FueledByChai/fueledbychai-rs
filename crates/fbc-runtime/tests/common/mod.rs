@@ -364,6 +364,7 @@ pub struct ScriptedWs {
 /// What a [`Peer`] asks its connection to do.
 enum Out {
     Send(Message),
+    SendAll(Vec<Message>),
     Drop,
     Stall(Option<std::time::Duration>),
     Hold(oneshot::Receiver<()>),
@@ -486,6 +487,17 @@ async fn script_ws<S: AsyncRead + AsyncWrite + Unpin>(
             },
             cmd = out.recv() => match cmd {
                 Some(Out::Send(message)) => ws.send(message).await.unwrap(),
+                // A client that closes mid-flood ends the connection, as a drop does.
+                Some(Out::SendAll(messages)) => {
+                    for message in messages {
+                        if ws.feed(message).await.is_err() {
+                            break;
+                        }
+                    }
+                    if ws.flush().await.is_err() {
+                        break;
+                    }
+                }
                 Some(Out::Stall(None)) => std::future::pending().await,
                 Some(Out::Stall(Some(pause))) => tokio::time::sleep(pause).await,
                 Some(Out::Hold(release)) => {
@@ -527,6 +539,13 @@ impl Peer {
 
     pub fn send(&self, text: &str) {
         let _ = self.to_client.send(Out::Send(Message::text(text)));
+    }
+
+    /// Sends every text of `texts`, buffered and flushed together, so the client finds them
+    /// waiting at once rather than one by one.
+    pub fn send_all(&self, texts: impl IntoIterator<Item = String>) {
+        let messages = texts.into_iter().map(Message::text).collect();
+        let _ = self.to_client.send(Out::SendAll(messages));
     }
 
     pub fn send_binary(&self, bytes: &[u8]) {
