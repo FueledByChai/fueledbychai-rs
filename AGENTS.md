@@ -194,9 +194,10 @@ rather than guess.
     exactly the nonces it asks for, and its keepalive its own timer (0056); commands reach its
     codec only through its `ExecOrders`, as an fbc-oms `Authorization` for its account or a
     `ControlCommand`, each encoded on its next turn with one reserved nonce per item and
-    reported once to `ExecHandler::on_submitted` (sent, or `NotSent` with nothing written: no
-    authenticated epoch, the codec's refusal, effects that do not carry the request or make an
-    HTTP request, the buckets), request ids from the account's `RpcIds` shared by its sessions,
+    reported at most once to `ExecHandler::on_submitted` (sent, or `NotSent` with nothing
+    written: no authenticated epoch, the codec's refusal, effects that do not carry the request,
+    make an HTTP request or give it a deadline past the end of the clock, the buckets), an
+    authorization kept until its command is encoded, request ids from the account's `RpcIds` shared by its sessions,
     and each unanswered request handed to `on_rpc_timeout` once at its deadline,
     across a reconnect too, never written again (0057; compile-fail cases in
     `tests/ui_submit/`) (its tests include the conformance toy by path);

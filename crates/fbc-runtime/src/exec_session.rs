@@ -53,7 +53,8 @@
 //! **Submitting commands (FBC-0ga, decision 0057).** Commands reach the codec only through the
 //! session's [`ExecOrders`] ([`ExecSession::orders`]): an order-affecting one only as the
 //! fbc-oms [`Authorization`](fbc_oms::Authorization) issued for it, for the session's account
-//! (0013 rule 2, 0045), and one that affects no order as a
+//! (0013 rule 2, 0045), kept until its command is encoded, where fbc-oms's submit-time
+//! re-check belongs (FBC-afd), and one that affects no order as a
 //! [`ControlCommand`](fbc_oms::ControlCommand). Each is given its [`RpcId`] at once and is
 //! taken on the session's next turn, after the input being handled: one submitted while the
 //! stream had no epoch the codec reported authenticated
@@ -62,8 +63,8 @@
 //! holding exactly [`VenueCommand::items`](fbc_core::VenueCommand::items) nonces reserved from
 //! the consumer's [`NonceSource`] and the shard clock's time. What the codec refuses is
 //! `NotSent` for its reason; effects that do not carry the request
-//! ([`Effects::carry_request`]), or that name another stream or a reconnect, are
-//! `NotSent(Unencodable)`, and frames the buckets do not admit together `NotSent(RateBudget)`,
+//! ([`Effects::carry_request`]), or that name another stream, a reconnect, an HTTP request or
+//! a request whose deadline is past the end of the clock, are `NotSent(Unencodable)`, and frames the buckets do not admit together `NotSent(RateBudget)`,
 //! each with nothing written. Otherwise the handler is told it was sent, with the nonces it
 //! used ([`ExecHandler::on_submitted`]), and its effects are executed. A request's deadline runs
 //! from just before its frame is written; the first event that answers it
@@ -799,7 +800,7 @@ impl<H: ExecHandler> ExecSession<H> {
         key: ConnKey,
         queued: Queued,
     ) -> Result<bool, ExecSessionError> {
-        let Queued { rpc, cmd, epoch } = queued;
+        let Queued { rpc, item, epoch } = queued;
         let ready = self.orders.ready().is_some_and(|ready| ready == key.epoch);
         let not_sent = |reason| SubmitHandle {
             rpc,
@@ -810,6 +811,11 @@ impl<H: ExecHandler> ExecSession<H> {
                 .on_submitted(not_sent(NotSentReason::Disconnected));
             return Ok(true);
         }
+        // fbc-oms's submit-time re-check of an authorization (FBC-afd) belongs here, at encode
+        // and before any nonce is reserved, not where `ExecOrders::submit` queued it: the kill
+        // switch or the market's StateGeneration may have moved since (decision 0057; PR #87
+        // Reviewer B B7). The authorization is spent when this returns.
+        let cmd = item.command();
         // A batch longer than u16::MAX items, which no venue takes, has no nonce block.
         let items = cmd.items().map(|n| reserve(&mut *self.nonces, n));
         let mut fx = Effects::new();
@@ -821,10 +827,12 @@ impl<H: ExecHandler> ExecSession<H> {
                 let ctx = EncodeCtx { wall, mono, nonces };
                 let mut t = PathStamps::off();
                 self.codec
-                    .encode(&cmd, rpc, &self.specs, &ctx, &mut t, &mut fx)
+                    .encode(cmd, rpc, &self.specs, &ctx, &mut t, &mut fx)
             });
         let receipt = match encoded {
-            Ok(receipt) if carries(&fx, rpc, cmd.traffic_class(), self.stream) => receipt,
+            Ok(receipt) if carries(&fx, rpc, cmd.traffic_class(), self.stream, Instant::now()) => {
+                receipt
+            }
             Ok(_) => {
                 self.handler
                     .on_submitted(not_sent(NotSentReason::Unencodable));
@@ -904,10 +912,20 @@ fn reserve(nonces: &mut dyn NonceSource, asked: u16) -> Result<NonceBlock, ExecS
 /// stream `own`, and none asks to reconnect, which would leave a frame of the request unwritten
 /// with its outcome unreported (0014 item 3), or is an HTTP request: order entry is
 /// WebSocket-only (0057), since an HTTP request gets no deadline here and its result is dropped
-/// once its epoch ends, so it could never come back `Unknown`.
-fn carries(fx: &Effects, rpc: RpcId, class: fbc_core::TrafficClass, own: StreamId) -> bool {
+/// once its epoch ends, so it could never come back `Unknown`. Nor does a frame name a request
+/// whose deadline, its timeout from `now`, is past the end of the clock: that request would
+/// never come back `Unknown` either (PR #87 Reviewer B B9).
+fn carries(
+    fx: &Effects,
+    rpc: RpcId,
+    class: fbc_core::TrafficClass,
+    own: StreamId,
+    now: Instant,
+) -> bool {
     let elsewhere = |effect: &Effect| match effect {
-        Effect::Send { stream, .. } => *stream != own,
+        Effect::Send { stream, rpc, .. } => {
+            *stream != own || rpc.is_some_and(|call| now.checked_add(call.timeout).is_none())
+        }
         other => matches!(other, Effect::Reconnect { .. } | Effect::Http { .. }),
     };
     !fx.as_slice().iter().any(elsewhere) && fx.carry_request(rpc, class)

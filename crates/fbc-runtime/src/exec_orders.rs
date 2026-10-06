@@ -48,10 +48,29 @@ impl fmt::Display for SubmitRefusal {
 
 impl std::error::Error for SubmitRefusal {}
 
+/// What was submitted: the authorization fbc-oms issued for an order-affecting command, kept
+/// until the command is encoded so fbc-oms's submit-time re-check (FBC-afd) can run then, in
+/// `ExecSession::send` just before the encode, not at queue time (decision 0057; PR #87
+/// Reviewer B B7), or a command that affects no order.
+pub(crate) enum Submitted {
+    Authorized(Authorization),
+    Control(VenueCommand),
+}
+
+impl Submitted {
+    /// The command to encode.
+    pub(crate) fn command(&self) -> &VenueCommand {
+        match self {
+            Submitted::Authorized(auth) => auth.command(),
+            Submitted::Control(cmd) => cmd,
+        }
+    }
+}
+
 /// A command waiting for the session's next turn.
 pub(crate) struct Queued {
     pub(crate) rpc: RpcId,
-    pub(crate) cmd: VenueCommand,
+    pub(crate) item: Submitted,
     /// The epoch whose stream was authenticated when it was submitted, if one was: it is sent
     /// only on that epoch.
     pub(crate) epoch: Option<u32>,
@@ -112,8 +131,8 @@ impl Shared {
         })
     }
 
-    /// Gives `cmd` the next request id and queues it for the session's next turn.
-    fn push(&self, cmd: VenueCommand) -> Result<RpcId, SubmitRefusal> {
+    /// Gives `item` the next request id and queues it for the session's next turn.
+    fn push(&self, item: Submitted) -> Result<RpcId, SubmitRefusal> {
         if self.ended.get() {
             return Err(SubmitRefusal::Ended);
         }
@@ -121,7 +140,7 @@ impl Shared {
         let epoch = self.ready.get();
         self.queue
             .borrow_mut()
-            .push_back(Queued { rpc, cmd, epoch });
+            .push_back(Queued { rpc, item, epoch });
         self.wake.notify_one();
         Ok(rpc)
     }
@@ -188,17 +207,18 @@ impl ExecOrders {
 
     /// Submits the order-affecting command fbc-oms authorized, spending the authorization: its
     /// request id, or why nothing was submitted (an authorization for another account, or a
-    /// session that has ended).
+    /// session that has ended). The session keeps the authorization until it encodes the
+    /// command, where fbc-oms's submit-time re-check runs (FBC-afd, decision 0057).
     pub fn submit(&self, auth: Authorization) -> Result<RpcId, SubmitRefusal> {
         if auth.account() != self.shared.acct {
             return Err(SubmitRefusal::OtherAccount);
         }
-        self.shared.push(auth.command().clone())
+        self.shared.push(Submitted::Authorized(auth))
     }
 
     /// Submits a command that affects no order: its request id, or [`SubmitRefusal::Ended`].
     pub fn submit_control(&self, cmd: ControlCommand) -> Result<RpcId, SubmitRefusal> {
-        self.shared.push(cmd.into_command())
+        self.shared.push(Submitted::Control(cmd.into_command()))
     }
 }
 
@@ -213,7 +233,8 @@ pub(crate) struct Rpcs {
 impl Rpcs {
     /// Request `call` is written at `now`: its deadline is `call.timeout` from then. A request
     /// already waiting keeps the deadline of its first frame; one whose deadline is past the end
-    /// of the clock never falls due.
+    /// of the clock never falls due, which is why the session refuses to send one (PR #87
+    /// Reviewer B B9).
     pub(crate) fn sent(&mut self, call: RpcCall, now: Instant) {
         if self.live.insert(call.id)
             && let Some(at) = now.checked_add(call.timeout)
@@ -310,8 +331,9 @@ mod tests {
             Shared::new(AccountKey::new(2), ids.clone()),
             Shared::new(AccountKey::new(2), ids),
         );
-        assert_eq!(first.push(VenueCommand::FeeQuery), Ok(RpcId(1)));
-        assert_eq!(second.push(VenueCommand::FeeQuery), Ok(RpcId(2)));
+        let fee = || Submitted::Control(VenueCommand::FeeQuery);
+        assert_eq!(first.push(fee()), Ok(RpcId(1)));
+        assert_eq!(second.push(fee()), Ok(RpcId(2)));
         assert_eq!(RpcIds::after(RpcId(41)).next(), RpcId(42));
         assert!(format!("{:?}", RpcIds::default()).starts_with("RpcIds"));
     }
@@ -337,7 +359,7 @@ mod tests {
         assert!(shared.waiting());
         let queued = shared.pop().unwrap();
         assert_eq!((queued.rpc, queued.epoch), (RpcId(1), Some(3)));
-        assert_eq!(queued.cmd, VenueCommand::FeeQuery);
+        assert_eq!(queued.item.command(), &VenueCommand::FeeQuery);
         shared.end();
         assert!(!shared.waiting());
         assert_eq!(shared.ready(), None);

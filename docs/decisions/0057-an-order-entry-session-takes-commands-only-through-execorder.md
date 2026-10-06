@@ -38,16 +38,18 @@ frame unwritten while the codec believed it sent (FBC-m2xw).
   implement `OrderGateway`: its `ctx` argument would let a caller choose nonces the session's
   source never reserved. The trait stays for gateways that take their context from outside
   (SimVenue, a managed gateway).
-- **What became of it, once, to the handler.** `ExecHandler::on_submitted(SubmitHandle)` is
-  called once per submission while the session lasts, in submission order, before any event
+- **What became of it, at most once, to the handler.** `ExecHandler::on_submitted(SubmitHandle)`
+  is called at most once per submission while the session lasts (the cases the session's end
+  leaves unreported are listed below), in submission order, before any event
   answering its request: the
   receipt with the nonces the encode used, or `NotSent` and why. A command is
   `NotSent(Disconnected)` when it was submitted while the stream had no epoch the codec
   reported `Authenticated`, or is taken on another epoch than that one, including while the
   session waits to reconnect; `NotSent` for the codec's reason when `encode` refuses it;
   `NotSent(Unencodable)` when its effects do not carry its request (`Effects::carry_request`),
-  name another stream, ask to reconnect or make an HTTP request, or a batch is longer than
-  `u16::MAX` items; and
+  name another stream, ask to reconnect or make an HTTP request, name a request whose deadline
+  (its `RpcCall::timeout` from the encode) is past the end of the clock, so it could never
+  come back `Unknown`, or a batch is longer than `u16::MAX` items; and
   `NotSent(RateBudget)` when the buckets do not admit its frames together. In each of those
   cases nothing is written and no deadline is set. Otherwise it is encoded with an `EncodeCtx`
   holding exactly `VenueCommand::items()` nonces from the session's source and the shard
@@ -64,7 +66,10 @@ frame unwritten while the codec believed it sent (FBC-m2xw).
   `NotSent(Unencodable)`, nothing requested. An HTTP request gets no deadline in the RPC table,
   its result is dropped once its epoch ends (0027) and the rate pre-charge covers frames only,
   so it could leave a command reported sent that never reaches `Unknown`. Paradex's order entry
-  is WebSocket-only (owner); HTTP order entry is FBC-4nfb's.
+  is WebSocket-only (owner); HTTP order entry is FBC-4nfb's. The rule covers every command the
+  session encodes, control commands too: Paradex's order query is REST (`GET
+  /orders/by_client_id/{client_id}`), so 0005's Unknown-ladder query, and a fee query over
+  REST, is `NotSent(Unencodable)` on Paradex until FBC-m8vm carries HTTP control commands.
 - **Authenticated is the codec's word.** The session's own stream's epoch is authenticated from
   the `Conn { Authenticated }` event the codec pushes for it until another `Conn` state for it
   or the epoch's end.
@@ -102,9 +107,13 @@ frame unwritten while the codec believed it sent (FBC-m2xw).
   `ExecHandler::on_submitted` wherever its OMS waits for a command's outcome: a command not sent
   is reported there only. `ExecSessionConfig` names the account (`acct`).
 - fbc-runtime depends on fbc-oms (0045); fbc-oms never depends on fbc-runtime.
-- fbc-oms's check at submit (FBC-afd) is called where `ExecOrders::submit` takes the
-  authorization, once FBC-afd defines it; until then an authorization is checked when it is
-  issued only. Nothing outside fbc-oms's own tests issues one yet, so no order-affecting command
+- The session keeps a submitted `Authorization` (account, market, `StateGeneration`) until it
+  encodes the command, and fbc-oms's check at submit (FBC-afd) runs there, in `ExecSession::send`
+  immediately before the encode and before any nonce is reserved, not in `ExecOrders::submit`,
+  which only queues: between the two, the rest of the input being handled and earlier queued
+  writes may trip the kill switch or move the market's generation. A stale authorization is
+  then `NotSent` with a reason, nothing written. Until FBC-afd defines the check, an
+  authorization is checked when it is issued only (and for its account at `submit`). Nothing outside fbc-oms's own tests issues one yet, so no order-affecting command
   can reach a session today; control commands can.
 - The rate-limit refusal of a submitted command's frames is reported, not dropped; FBC-m2xw
   still decides it for the frames a codec asks for from `on_frame`.
@@ -119,6 +128,6 @@ frame unwritten while the codec believed it sent (FBC-m2xw).
 - A consumer that needs a command's receipt in the same call that submitted it (the shard host's
   decide pass), which would bring the synchronous `OrderGateway` shape back to the runtime.
 - A request id given twice for one account, or a venue whose order entry needs HTTP before
-  FBC-4nfb.
+  FBC-4nfb, or whose control commands need HTTP before FBC-m8vm.
 - A venue whose request outlives its connection (answered on the next one), for which a
   `NotSent(Disconnected)` on a later epoch would refuse what it could still take.
