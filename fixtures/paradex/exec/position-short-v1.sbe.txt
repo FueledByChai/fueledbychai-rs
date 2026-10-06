@@ -1,0 +1,27 @@
+# PositionEvent (template 22): a short of 0.05 at an average entry of 62000.05, at version 1
+# Hand-built from paradex_1_0.xml at tradeparadex/paradex-py b8248fb747e278d2167ac2f056b339a287d5ef30.
+# SYNTHETIC: the account is 32 made-up bytes (a0..bf), no Paradex account. Little-endian; '#' starts a comment.
+9a 00 16 00 01 00 01 00                           # header: blockLength=154 templateId=22 (PositionEvent) schemaId=1 version=1
+da ad 81 84 41 40 06 00                           # @0 ts int64 = 1759500000407002 us
+5a 1b 00 00 00 00 00 00                           # @8 seq int64 = 7002
+02                                                # @16 side uint8 = 2 (SELL, short)
+40 4b 4c 00 00 00 00 00                           # @17 size Qty8 = 5000000 (0.05, absolute)
+40 7b 18 8d a3 05 00 00                           # @25 avgEntryPrice Price8 = 6200005000000 (62000.05)
+80 83 7e b5 ff ff ff ff                           # @33 unrealizedPnl Value8 = -1250000000 (-12.5, not read)
+80 93 dc 14 00 00 00 00                           # @41 realizedPnl Value8 = 350000000 (3.5, not read)
+00 fa 66 c8 a3 05 00 00                           # @49 markPrice Price8NULL = 6201000000000 (62010, not read)
+00 00 00 00 00 00 00 80                           # @57 liquidationPrice Price8NULL = null (not at risk, not read)
+80 b2 e6 0e 00 00 00 00                           # @65 leverage Rate8 = 250000000 (2.5, not read)
+b2 ad 81 84 41 40 06 00                           # @73 updatedAt int64 = 1759500000406962 us (not read)
+a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 aa ab ac ad ae af   # @81 account [32] bytes 0-15 (SYNTHETIC, not read)
+b0 b1 b2 b3 b4 b5 b6 b7 b8 b9 ba bb bc bd be bf   # @97 account [32] bytes 16-31 (SYNTHETIC, not read)
+40 7b 18 8d a3 05 00 00                           # @113 avgEntryPriceUsd Price8 = 6200005000000 (62000.05, not read)
+70 93 8b d2 b7 ff ff ff                           # @121 cost Value8 = -310000250000 (-3100.0025, signed, not read)
+70 93 8b d2 b7 ff ff ff                           # @129 costUsd Value8 = -310000250000 (-3100.0025, signed, not read)
+d2 02 96 49 00 00 00 00                           # @137 cachedFundingIndex Price8 = 1234567890 (12.3456789, not read)
+00 e5 48 ff ff ff ff ff                           # @145 unrealizedFundingPnl Value8 = -12000000 (-0.12, not read)
+01                                                # @153 status uint8 = 1 (OPEN)
+0c                                                # market varString8 length = 12
+42 54 43 2d 55 53 44 2d 50 45 52 50               # market = "BTC-USD-PERP"
+13                                                # lastFillId varString8 length = 19
+38 36 31 35 32 36 32 31 34 38 30 30 37 37 31 38 30 30 31 # lastFillId = "8615262148007718001"

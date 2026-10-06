@@ -1,12 +1,14 @@
-Synthetic order-event and fill-event fixtures (decision 0009). Nothing in this directory was
-received from Paradex or belongs to an account.
+Synthetic order, fill, position and account event fixtures (decision 0009). Nothing in this
+directory was received from Paradex or belongs to an account.
 
 - Every frame here is hand-built from Paradex's published SBE schema (see README.md). Each
-  OrderEvent and FillEvent carries a 32-byte `account` field; in every frame it is the made-up
-  bytes a0, a1, ... bf, which are not a Starknet account address of the owner or of anyone else.
+  OrderEvent, FillEvent, PositionEvent and AccountEvent carries a 32-byte `account` field; in
+  every frame it is the made-up bytes a0, a1, ... bf, which are not a Starknet account address
+  of the owner or of anyone else.
 - The client ids are either ids this library mints in the tests' namespace (computed from the
   test's namespace, account key and start time, see the test) or a random version 4 UUID; the
   order ids, fill and trade ids, request ids, sequences, timestamps, prices, sizes, fees and
-  realized amounts are made-up inputs.
+  realized amounts, positions, average entries, collateral and account values are made-up
+  inputs.
 
 This marker covers fixtures/paradex/exec/ only. Recorded Paradex frames never go here.
