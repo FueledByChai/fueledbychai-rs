@@ -406,7 +406,16 @@ posts one comment headed `DeepSeek review` that names the reviewed head SHA and 
 `DS-1`, `DS-2`, ... with severity P1, P2 or P3, file, line, problem and fix, or says there are
 none. Files that did not fit are named under **Not reviewed** (or **Reviewed from the diff
 only**); a complete comment covers the rest of the change, and the independent reviewers, who
-read the whole diff, cover those files as they cover every file. A missing key, an API error, an
+read the whole diff, cover those files as they cover every file. An answer cut off at the
+output allowance (`finish_reason` `length`; deepseek-v4-pro thinks by default and its
+`max_tokens` counts the reasoning) is not final: that part is reviewed again as two halves of
+its files, or a single file from its diff only, up to `DEEPSEEK_SPLIT_DEPTH` (default 2) times,
+and the comment names the parts so split (FBC-yf0j). The workflow passes `DEEPSEEK_MODEL`,
+`DEEPSEEK_API_BASE`, `DEEPSEEK_TOKEN_BUDGET`, `DEEPSEEK_MAX_OUTPUT_TOKENS` (default 65536;
+DeepSeek documents a 384K maximum), `DEEPSEEK_SPLIT_DEPTH`, `DEEPSEEK_MAX_CHUNKS`,
+`DEEPSEEK_TIMEOUT`, `DEEPSEEK_RETRIES` and `DEEPSEEK_RETRY_DELAY` from repository variables of
+the same name (unset: the script's default); the wall-clock bounds below are not variables.
+A missing key, an API error, an
 answer that is not the asked JSON, git work before the first request still running after 5
 minutes, or requests still unanswered 45 minutes after the first one (these bounds leave room
 inside the job's 60-minute limit to post) posts a comment saying the
