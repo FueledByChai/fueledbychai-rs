@@ -9,9 +9,11 @@ token budget into chunks and merges their findings; asks DeepSeek's OpenAI-compa
 completions endpoint for findings as JSON and validates them; and posts ONE pull request comment
 headed "DeepSeek review" that names the reviewed head SHA. A missing key, an API error or an
 answer that is not valid findings JSON posts a comment saying the review did not complete for
-that SHA (never a silent pass) and exits non-zero. Every finding, whole and redacted, is also
-printed to the job log as one JSON line; when the comment has no room for all of them its marker
-says status=truncated, which is not a complete review, and the run exits non-zero.
+that SHA (never a silent pass) and exits non-zero; an API error is reported by its status and
+the error's type and code only, never its body. Every finding, whole and redacted, and the full
+report of what was not reviewed are also printed to the job log as JSON lines; when the comment
+has no room for all of it, its marker says status=truncated, which is not a complete review, and
+the run exits non-zero.
 
 Standard library only. The API key is read only from DEEPSEEK_API_KEY, sent only in the
 Authorization header, and removed from every message this script prints or posts (0009).
@@ -307,11 +309,10 @@ def http_json(url, payload, headers, timeout):
         return e.code, e.read()
 
 
-def auth_error_detail(body):
-    """The error's type and code from an authentication failure, never its text: a 401 or 403
-    body can echo a fragment of the key ("Your api key: ****abcd"), which the redactor, removing
-    only the whole key, would let through. A type or code that is not a plain identifier is
-    dropped."""
+def api_error_detail(body):
+    """The error's type and code from a failed API call, never its text: an error body can echo
+    a fragment of the key ("Your api key: ****abcd"), which the redactor, removing only the whole
+    key, would let through. A type or code that is not a plain identifier is dropped."""
     try:
         error = json.loads(body.decode("utf-8")).get("error")
     except (ValueError, AttributeError, UnicodeDecodeError):
@@ -364,11 +365,7 @@ def call_model(cfg, messages, redact):
         else:
             if status == 200:
                 return body
-            if status in (401, 403):
-                raise Incomplete(redact("the DeepSeek API answered HTTP %d%s" % (
-                    status, auth_error_detail(body))))
-            snippet = body.decode("utf-8", "replace").strip().replace("\n", " ")[:300]
-            failure = "HTTP %d: %s" % (status, snippet)
+            failure = "HTTP %d%s" % (status, api_error_detail(body))
             if last or not (status == 429 or status >= 500):
                 raise Incomplete(redact("the DeepSeek API answered " + failure))
         if time.monotonic() + delay >= cfg["deadline_at"]:
@@ -502,18 +499,19 @@ def lines_size(lines):
 
 
 def complete_comment(cfg, findings, report):
-    """(body, shown): the comment and how many findings it shows whole. Findings it has no room
-    for make it status=truncated, not a complete review; the job log holds every finding."""
+    """(body, shown, truncated): the comment, how many findings it shows whole, and whether
+    anything (a finding or a line of the report) had no room. A truncated comment says
+    status=truncated, not a complete review; the job log holds every finding and the report."""
     head = cfg["head"]
 
-    def marker(shown):
-        if shown == len(findings):
+    def marker(shown, truncated):
+        if not truncated:
             return "<!-- deepseek-review head=%s status=complete findings=%d -->" % (
                 head, len(findings))
         return "<!-- deepseek-review head=%s status=truncated findings=%d shown=%d -->" % (
             head, len(findings), shown)
-    # The longest marker holds its place until it is known whether every finding fits.
-    lines = [HEADING, "", marker(-1),
+    # The longest marker holds its place until it is known whether everything fits.
+    lines = [HEADING, "", marker(len(findings), True),
              "Reviewed head `%s` against base `%s` with model `%s` (%d request%s, %d file%s)." % (
                  head, cfg["base"], safe(cfg["model"], 100), report["chunks"],
                  "" if report["chunks"] == 1 else "s", report["files"],
@@ -544,28 +542,33 @@ def complete_comment(cfg, findings, report):
                   "complete review: every finding is in this run's job log as one JSON line "
                   "(`deepseek-review: findings for head ...`)." % (
                       omitted, "" if omitted == 1 else "s")]
-    lines[2] = marker(shown)
     if report["diff_only"]:
         lines += ["", "Reviewed from the diff only (full text over the token budget): " +
                   ", ".join(code(p) for p in report["diff_only"])]
     if report["not_reviewed"]:
         lines += ["", "**Not reviewed:**"]
         lines += ["- %s: %s" % (code(p), r) for p, r in sorted(report["not_reviewed"].items())]
-    return cap_body(lines), shown
+    _, dropped = cap_body(lines)
+    truncated = shown < len(findings) or dropped > 0
+    lines[2] = marker(shown, truncated)  # no longer than the placeholder: drops no more lines
+    body, _ = cap_body(lines)
+    return body, shown, truncated
 
 
 def cap_body(lines):
-    """The comment within GitHub's size limit: lines past BODY_CAP are dropped, and a last line
-    says how many, so nothing is cut silently."""
+    """(body, dropped): the comment within GitHub's size limit. Lines past BODY_CAP are dropped
+    and a last line says how many, so nothing is cut silently; the caller marks such a comment
+    truncated."""
     out, size = [], 0
     for n, line in enumerate(lines):
         if size + len(line) + 1 > BODY_CAP:
-            out.append("... %d further line%s omitted: the comment size limit." % (
-                len(lines) - n, "" if len(lines) - n == 1 else "s"))
-            break
+            out.append("... %d further line%s omitted: the comment size limit. This is not a "
+                       "complete review: the job log holds the full report." % (
+                           len(lines) - n, "" if len(lines) - n == 1 else "s"))
+            return "\n".join(out) + "\n", len(lines) - n
         out.append(line)
         size += len(line) + 1
-    return "\n".join(out) + "\n"
+    return "\n".join(out) + "\n", 0
 
 
 def incomplete_comment(head, reason):
@@ -604,6 +607,13 @@ def findings_log_line(head, findings, redact):
     return redact("deepseek-review: findings for head %s: %s" % (head, json.dumps(
         [{k: f[k] for k in ("id", "severity", "file", "line", "problem", "fix")}
          for f in findings])))
+
+
+def report_log_line(head, report, redact):
+    """What was reviewed and what was not, whole, as one ASCII JSON line for the job log."""
+    return redact("deepseek-review: report for head %s: %s" % (head, json.dumps(
+        {k: report[k] for k in ("files", "chunks", "diff_only", "not_reviewed")},
+        sort_keys=True)))
 
 
 def main():
@@ -648,8 +658,9 @@ def main():
                        retry_delay=env_float("DEEPSEEK_RETRY_DELAY", 10.0))
             findings, report = review(cfg)
             print(findings_log_line(cfg["head"], findings, redact))
-            body, shown = complete_comment(cfg, findings, report)
-            status = 0 if shown == len(findings) else 1
+            print(report_log_line(cfg["head"], report, redact))
+            body, shown, truncated = complete_comment(cfg, findings, report)
+            status = 1 if truncated else 0
             summary = "%s, %d finding%s%s" % (
                 "complete" if status == 0 else "truncated", len(findings),
                 "" if len(findings) == 1 else "s", "" if status == 0 else " (%d shown)" % shown)

@@ -397,11 +397,13 @@ posts one comment headed `DeepSeek review` that names the reviewed head SHA and 
 none. Files that did not fit are named under **Not reviewed**. A missing key, an API error, an
 answer that is not the asked JSON, or requests still unanswered 45 minutes after the first one
 (the deadline leaves room inside the job's 60-minute limit to post) posts a comment saying the
-review did not complete for that SHA, never a pass, and fails only that job. For a 401 or 403
-the comment carries only the status and the error's type and code, never the body, which can
-echo part of the key. Every finding, whole and redacted, is also printed to the job log as one
-JSON line (`deepseek-review: findings for head <SHA>: [...]`); when the comment has no room for
-all of them, its marker says `status=truncated findings=N shown=M` and the job fails. Model text
+review did not complete for that SHA, never a pass, and fails only that job. An API error is
+reported by its status and the error's type and code only, never its body, which can echo part
+of the key. Every finding, whole and redacted, and the full report of files reviewed from the
+diff only or not reviewed are also printed to the job log as JSON lines (`deepseek-review:
+findings for head <SHA>: [...]` and `deepseek-review: report for head <SHA>: {...}`); when the
+comment has no room for all of it, its marker says `status=truncated findings=N shown=M` and the
+job fails. Model text
 in the comment cannot @-mention anyone (a zero-width space follows each `@`). The workflow runs
 the script with `python3 -I`, so no file beside it can stand in for a standard-library module it
 imports, and pins every action to a full commit SHA. The job is not a required status check.
@@ -435,8 +437,8 @@ imports, and pins every action to a full commit SHA. The job is not a required s
 
   A comment counts only when it names the PR's current head SHA and is complete (the marker line
   under the heading says `status=complete`). A `status=truncated` comment is not a complete
-  review: read every finding from that run's job log line, fix or answer the P1s and P2s, and
-  push; the next head's review counts. Every P1 and P2 finding is fixed, with a test, or
+  review: read every finding and the report from that run's job log lines, fix or answer the P1s
+  and P2s, and push; the next head's review counts. Every P1 and P2 finding is fixed, with a test, or
   answered with evidence in a reply naming its id before merge; P3s are fixed or answered. A
   comment saying the review did not complete is not a review: re-run the workflow for that head
   or report the cause. The comment is advisory input from a model reading untrusted pull
