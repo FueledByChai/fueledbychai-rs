@@ -39,8 +39,10 @@ keepalives (FBC-bnl) and journaling (FBC-2pr) come later and are not decided her
   `ExecSessionError::Ended` and connects nothing, so no rerun can bypass the pacing or stamp
   another connection's life with an epoch already used. A run that ends in an error retires
   its epoch; a run whose future is dropped while connected leaves its epoch to be ended by
-  the next call or by the session's drop, and the handler is told it ended either way. A
-  consumer that wants order entry again after an error builds a new session.
+  the next call or by the session's drop, and the handler is told it ended either way, except
+  when the session is dropped as a panic unwinds: then its buckets are forgotten but the
+  handler is not called, since a second panic would abort the process. A consumer that wants
+  order entry again after an error builds a new session.
 - **A stop ends the epoch at once.** Dropping the `ExecControl` stops the session, and the
   epoch ends there, even inside the handler: every event the codec pushes after it (the rest of
   a resync pushed whole, say) is of an ended epoch, dropped and counted
@@ -56,7 +58,9 @@ keepalives (FBC-bnl) and journaling (FBC-2pr) come later and are not decided her
   `ReconnectPacing` (0023). What `on_open` asks for is charged together before any of it is
   written: buckets that refuse it for now end the epoch as a drop, so `on_open` (which may have
   changed the codec's state, as an authentication asked for) runs again on the next epoch
-  rather than the codec believe it sent what it never did; frames that can never fit together
+  rather than the codec believe it sent what it never did, and the next attempt starts no
+  sooner than the moment the buckets would admit it as well as the pacing allows, so a refused
+  open does not reconnect at every floor sending nothing; frames that can never fit together
   end the session (`ExecSessionError::OpenNeverFits`). A stop that came while `on_open` ran
   charges nothing. Nothing behind a reconnect of the
   session's stream is charged, since it is never reached. A frame or
@@ -91,6 +95,11 @@ keepalives (FBC-bnl) and journaling (FBC-2pr) come later and are not decided her
   already under way cannot unsend what the socket took, and is seen before the next effect.
 - Until FBC-bnl, a codec that needs a timer or an HTTP request (a token refresh, a dead-man
   refresh) cannot run on this session; until FBC-0ga, nothing is submitted.
+- Only `on_open`'s frames are charged together. A frame the codec asks for later (from
+  `on_frame`, as a challenge's signed reply) is charged alone, as 0030 has it for market data,
+  and one the buckets refuse is dropped unwritten and counted by the limiter while the codec is
+  not told: the session could stay connected but never authenticated. FBC-m2xw decides whether
+  such a refusal ends the epoch or reaches the codec, before FBC-0ga submits commands.
 
 ## What would show this was wrong
 

@@ -25,7 +25,8 @@
 //! frame for the session's own stream is charged to the buckets and written, a reconnect of it
 //! ends the epoch and opens the next through the consumer's [`ReconnectPacing`]. What `on_open`
 //! asks for is charged together first: buckets that refuse it for now end the epoch as a drop,
-//! so `on_open` runs again on the next, and frames that never fit together end the session. A
+//! so `on_open` runs again on the next, opened no sooner than they would admit it, and frames
+//! that never fit together end the session. A
 //! session runs once ([`ExecSession::run`]): after an error, or once stopped, the consumer
 //! builds a new one to connect again. A frame or reconnect for another stream is a codec defect,
 //! refused and counted, and so, for now, are timers and HTTP requests, which FBC-bnl brings.
@@ -212,10 +213,18 @@ pub struct ExecSession<H: ExecHandler> {
 }
 
 /// A session dropped while a dropped run left its epoch connected tells the handler it ended
-/// (Codex r4189174470).
+/// (Codex r4189174470), unless it is dropped as a panic unwinds: its buckets are forgotten,
+/// but the handler, which may have panicked itself, is not called, since a second panic would
+/// abort the process (Reviewer B, B2).
 impl<H: ExecHandler> Drop for ExecSession<H> {
     fn drop(&mut self) {
-        self.end_left_epoch();
+        if std::thread::panicking() {
+            if let Some(key) = self.in_epoch.take() {
+                self.core.rates.closed(key);
+            }
+        } else {
+            self.end_left_epoch();
+        }
     }
 }
 
@@ -322,13 +331,12 @@ impl<H: ExecHandler> ExecSession<H> {
             self.in_epoch = Some(key);
             let end = self.connected(ws).await;
             match end {
-                Ok(End::Stop) => {
-                    self.core.rates.closed(key);
-                    return Ok(());
-                }
+                // `connected` forgot the epoch's buckets.
+                Ok(End::Stop) => return Ok(()),
                 Ok(End::Dropped) => self.retire(key)?,
+                // The run's own error, not one retiring the epoch might add.
                 Err(e) => {
-                    self.retire(key)?;
+                    let _ = self.retire(key);
                     return Err(e);
                 }
             }
@@ -469,9 +477,10 @@ impl<H: ExecHandler> ExecSession<H> {
 
     /// Executes what `on_open` asked for on epoch `key`. Its frames are charged together
     /// first, so all of them go or none does (Codex r4188802873): buckets that refuse them for
-    /// now end the epoch as a drop, which reconnects through the pacing and calls `on_open`
-    /// again, rather than leave the codec believing it sent what it never did; frames that can
-    /// never fit together end the session. False when the epoch ended.
+    /// now end the epoch as a drop, which reconnects through the pacing, no sooner than the
+    /// buckets would admit them, and calls `on_open` again, rather than leave the codec
+    /// believing it sent what it never did; frames that can never fit together end the
+    /// session. False when the epoch ended.
     async fn open_effects(
         &mut self,
         ws: &mut Option<WebSocket>,
@@ -493,7 +502,14 @@ impl<H: ExecHandler> ExecSession<H> {
         let charged = (!self.stopped()).then(|| self.core.rates.charge(now, key, &frames));
         match charged {
             Some(Ok(_)) => {}
-            None | Some(Err(Refused { ready_at: Some(_) })) => return Ok(false),
+            None => return Ok(false),
+            // The next attempt waits for the buckets as well as the pacing, so a refused open
+            // does not reconnect at every floor, sending nothing, until they have room
+            // (Reviewer B, B1).
+            Some(Err(Refused { ready_at: Some(at) })) => {
+                self.core.pacer.hold_until(at);
+                return Ok(false);
+            }
             Some(Err(Refused { ready_at: None })) => return Err(ExecSessionError::OpenNeverFits),
         }
         effects.into_iter().for_each(|e| fx.push(e));

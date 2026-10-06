@@ -131,6 +131,8 @@ pub(crate) struct Pacer {
     attempts: VecDeque<Instant>,
     failures: u32,
     ended: Option<Instant>,
+    /// No attempt starts before this, until the next one does.
+    held: Option<Instant>,
 }
 
 impl Pacer {
@@ -140,14 +142,15 @@ impl Pacer {
             attempts: VecDeque::new(),
             failures: 0,
             ended: None,
+            held: None,
         }
     }
 
     /// When the next attempt may start: never before `now`, the backoff after the last attempt
-    /// or connection ended, or the moment the budget frees a slot; `None` when that is past the
-    /// end of the clock.
+    /// or connection ended, the moment the budget frees a slot, or the hold; `None` when that
+    /// is past the end of the clock.
     pub(crate) fn next_attempt(&self, now: Instant) -> Option<Instant> {
-        let mut at = now;
+        let mut at = self.held.map_or(now, |held| now.max(held));
         if let Some(ended) = self.ended {
             at = at.max(ended.checked_add(self.pacing.backoff(self.failures))?);
         }
@@ -164,8 +167,16 @@ impl Pacer {
         self.pacing.deadline
     }
 
+    /// The next attempt starts no sooner than `at`, as well as everything else that paces it:
+    /// the moment the venue's buckets admit what an order-entry epoch opens with (decision
+    /// 0052). The latest hold wins; the next attempt to start releases it.
+    pub(crate) fn hold_until(&mut self, at: Instant) {
+        self.held = Some(self.held.map_or(at, |held| held.max(at)));
+    }
+
     /// An attempt started at `at`.
     pub(crate) fn attempted(&mut self, at: Instant) {
+        self.held = None;
         self.attempts.push_back(at);
         while self.attempts.len() > self.pacing.budget() as usize {
             self.attempts.pop_front();
@@ -300,5 +311,24 @@ mod tests {
         pacer.attempted(t0 + ms(1_000));
         pacer.failed(t0 + ms(1_000));
         assert_eq!(pacer.next_attempt(t0 + ms(1_000)), Some(t0 + ms(1_010)));
+    }
+
+    #[test]
+    fn a_hold_delays_the_next_attempt_past_the_floor_until_one_starts() {
+        let t0 = Instant::now();
+        let mut pacer = Pacer::new(pacing(10, 10, 100, 1_000));
+        pacer.attempted(t0);
+        pacer.opened();
+        pacer.hold_until(t0 + ms(900));
+        pacer.hold_until(t0 + ms(500));
+        pacer.dropped(t0 + ms(5));
+        // The latest hold, not the floor after the drop.
+        assert_eq!(pacer.next_attempt(t0 + ms(5)), Some(t0 + ms(900)));
+        assert_eq!(pacer.next_attempt(t0 + ms(950)), Some(t0 + ms(950)));
+        // The attempt that starts releases it: the next drop waits the floor alone.
+        pacer.attempted(t0 + ms(900));
+        pacer.opened();
+        pacer.dropped(t0 + ms(905));
+        assert_eq!(pacer.next_attempt(t0 + ms(905)), Some(t0 + ms(915)));
     }
 }
