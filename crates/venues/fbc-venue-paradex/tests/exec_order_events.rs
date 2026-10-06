@@ -260,6 +260,13 @@ fn a_market_order_has_no_price_and_closes_filled() {
     // none either.
     let zero = with_i64(frame("order-market-ioc-v1.sbe.txt"), 20, 0);
     assert_eq!(one_update(&zero).1.px, None);
+    // A market order stating any other price contradicts that rule: refused, not passed on as
+    // an order update a limit order's would look the same as (DeepSeek DS-1 on PR #85).
+    let priced = with_i64(frame("order-market-ioc-v1.sbe.txt"), 20, 6_200_000_000_000);
+    assert_eq!(
+        refused(&priced),
+        DecodeError::Malformed("market order with a price")
+    );
 }
 
 #[test]
