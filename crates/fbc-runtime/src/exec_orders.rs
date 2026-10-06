@@ -28,6 +28,8 @@ use fbc_oms::{Authorization, ControlCommand};
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
+use crate::exec_gate::Gate;
+
 /// Why [`ExecOrders`] took no command. Nothing of it reached the session.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum SubmitRefusal {
@@ -116,19 +118,30 @@ pub(crate) struct Shared {
     pub(crate) wake: Notify,
     /// The epoch whose stream the codec reported authenticated, while it lasts.
     ready: Cell<Option<u32>>,
+    /// Whether that epoch takes places and amends yet: its cancel-on-disconnect arm and its
+    /// resync (FBC-w19, decision 0058).
+    pub(crate) gate: RefCell<Gate>,
     ended: Cell<bool>,
 }
 
 impl Shared {
-    pub(crate) fn new(acct: AccountKey, ids: RpcIds) -> Rc<Shared> {
+    /// What the session for `acct` shares with its orders, its request ids from `ids`, its
+    /// venue's protection per connection and re-armed on each when `rearm`.
+    pub(crate) fn new(acct: AccountKey, ids: RpcIds, rearm: bool) -> Rc<Shared> {
         Rc::new(Shared {
             acct,
             ids,
             queue: RefCell::default(),
             wake: Notify::new(),
             ready: Cell::new(None),
+            gate: RefCell::new(Gate::new(rearm)),
             ended: Cell::new(false),
         })
+    }
+
+    /// The next request id, for a request the session sends of its own (its arm).
+    pub(crate) fn next_rpc(&self) -> RpcId {
+        self.ids.next()
     }
 
     /// Gives `item` the next request id and queues it for the session's next turn.
@@ -220,6 +233,18 @@ impl ExecOrders {
     /// Submits a command that affects no order: its request id, or [`SubmitRefusal::Ended`].
     pub fn submit_control(&self, cmd: ControlCommand) -> Result<RpcId, SubmitRefusal> {
         self.shared.push(Submitted::Control(cmd.into_command()))
+    }
+
+    /// Whether the session's current epoch takes places and amends (FBC-w19, decision 0058):
+    /// the codec reported its stream authenticated, the venue accepted the cancel-on-disconnect
+    /// arm the session sent then (or, where the protection outlives a connection, one on an
+    /// earlier epoch), and the resync the session asked for then has pushed its `ResyncEnd` to
+    /// the handler. Until then a place, a batch of places or an amend is
+    /// `NotSent(Disconnected)`, with no nonce reserved and nothing written; a cancel, a
+    /// cancel-many, an instrument cancel-all and a control command are not held.
+    pub fn may_place(&self) -> bool {
+        let gate = self.shared.gate.borrow();
+        self.shared.ready().is_some_and(|epoch| gate.placing(epoch))
     }
 }
 
@@ -329,8 +354,8 @@ mod tests {
     fn request_ids_count_up_across_the_sessions_sharing_them_from_where_they_start() {
         let ids = RpcIds::default();
         let (first, second) = (
-            Shared::new(AccountKey::new(2), ids.clone()),
-            Shared::new(AccountKey::new(2), ids),
+            Shared::new(AccountKey::new(2), ids.clone(), true),
+            Shared::new(AccountKey::new(2), ids, true),
         );
         let fee = || Submitted::Control(VenueCommand::FeeQuery);
         assert_eq!(first.push(fee()), Ok(RpcId(1)));
@@ -347,7 +372,7 @@ mod tests {
 
     #[test]
     fn orders_give_increasing_request_ids_and_none_once_ended() {
-        let shared = Shared::new(AccountKey::new(2), RpcIds::default());
+        let shared = Shared::new(AccountKey::new(2), RpcIds::default(), true);
         let orders = ExecOrders {
             shared: Rc::clone(&shared),
         };

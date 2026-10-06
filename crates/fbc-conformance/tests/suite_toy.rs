@@ -48,7 +48,7 @@ fn caps_truthful_probes_every_absence_and_the_declared_flag_conflict_on_the_toy(
         "control: a query",
         "control: protection (arm)",
         "control: protection (disarm)",
-        "control: dead-man timer (refresh)",
+        "OrderCaps.cancel_on_disconnect has no dead-man timer (refresh)",
         "OrderCaps.kinds lacks Market",
         "OrderCaps.tifs lacks Fok",
         "OrderCaps.tifs lacks Fok (a batch item)",
@@ -70,12 +70,12 @@ fn caps_truthful_probes_every_absence_and_the_declared_flag_conflict_on_the_toy(
             "{name} not probed: {probed:#?}"
         );
     }
-    // The toy offers post-only, reduce-only, a dead-man timer and every cancel reference: none
-    // of those is probed as absent.
+    // The toy offers post-only, reduce-only, per-connection protection and every cancel
+    // reference: none of those is probed as absent.
     let absent = [
         "post_only is false",
         "reduce_only is false",
-        "cancel_on_disconnect has no",
+        "cancel_on_disconnect has no protection",
         "cancel_refs lacks",
     ];
     for name in absent {

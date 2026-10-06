@@ -695,11 +695,15 @@ async fn on_open_gets_exactly_its_nonces_each_epoch_and_events_arrive_stamped_in
     run.unwrap();
 
     // One `on_open` per epoch, each with exactly the nonces it asked for (two, then three),
-    // reserved from the consumer's source and nothing else, and the clock's time.
+    // reserved from the consumer's source, and the clock's time; between them, the one nonce of
+    // the first epoch's cancel-on-disconnect arm, sent once it authenticated (FBC-w19).
     let opens = venue.opens();
     let blocks: Vec<_> = opens.iter().map(|(_, ctx)| ctx.nonces.as_slice()).collect();
-    assert_eq!(blocks, [&[0, 1][..], &[2, 3, 4][..]]);
-    assert_eq!(*reserved.lock().unwrap(), [vec![0, 1], vec![2, 3, 4]]);
+    assert_eq!(blocks, [&[0, 1][..], &[3, 4, 5][..]]);
+    assert_eq!(
+        *reserved.lock().unwrap(),
+        [vec![0, 1], vec![2], vec![3, 4, 5]]
+    );
     assert!(opens.iter().all(|(stream, _)| *stream == EXEC_STREAM));
     assert!(opens[0].1.mono <= opens[1].1.mono);
     // What on_open sent carries its context's time: the authentication and the resync.

@@ -439,7 +439,7 @@ fn a_single_request_is_answered_by_its_one_item_at_once() {
             accepted(),
         ))],
     );
-    s.send(VenueCommand::RefreshDeadMan, 42);
+    s.send(VenueCommand::ArmCancelOnDisconnect(true), 42);
     s.pushes(
         "item|rpc=42|i=0|res=ok",
         vec![none(outcome(42, item(0, None, None), accepted()))],

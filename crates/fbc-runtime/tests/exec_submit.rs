@@ -8,8 +8,11 @@
 //! submitted while its stream has no authenticated epoch `NotSent(Disconnected)` and one whose
 //! effects do not carry its request `NotSent(Unencodable)`, each with no byte written.
 //!
-//! The requests here are control commands (a dead-man refresh: one item, one nonce, answered
-//! by an `item` record), which reach the same path as an authorized place.
+//! The requests here are control commands (an order query: one item, one nonce, answered by a
+//! `qres` record), which reach the same path as an authorized place. Once the toy acknowledges
+//! the authentication, the session arms its cancel-on-disconnect and resyncs (FBC-w19): the
+//! tests have the venue accept the arm and answer the resync first ([`ready`]), and leave the
+//! session's own arm out of what they log.
 
 mod common;
 #[path = "../../fbc-conformance/src/toy/mod.rs"]
@@ -22,17 +25,17 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::ScriptedWs;
 use common::toy::ToyVenue;
+use common::{Peer, ScriptedWs};
 use exec_toy::{OWN_NS, RPC_TIMEOUT, TOY_TOKEN, ToyExec, ToySigner};
 use fbc_core::{
-    AccountKey, AccountSummary, AckLevel, AssetKey, ConfigError, ConnKey, ConnState, CtxCall,
-    DecodeError, DecodeScope, Effect, Effects, EncodeCtx, EncodeReceipt, EndpointPlan, Envelope,
-    ExecCodec, ExecEndpoint, ExecEvent, ExecSink, FieldSpec, HttpFailure, HttpMethod, HttpPlan,
-    HttpRequest, HttpResponse, HttpTag, Inbound, InboundSpans, InstrumentSpecDraft, MdCodec,
-    NonceBlock, NonceSource, NotSentReason, PathStamps, RawFrame, RpcCall, RpcId, Secrets,
-    SpecTable, StreamId, SubmitHandle, SubmitOutcome, Subscription, SymbolError, TimerTag,
-    VenueCaps, VenueCommand, VenueConfig, VenueError, VenueFactory, WireUrl,
+    AccountKey, AccountSummary, AssetKey, ConfigError, ConnKey, ConnState, CtxCall, DecodeError,
+    DecodeScope, Effect, Effects, EncodeCtx, EncodeReceipt, EndpointPlan, Envelope, ExecCodec,
+    ExecEndpoint, ExecEvent, ExecSink, FieldSpec, HttpFailure, HttpMethod, HttpPlan, HttpRequest,
+    HttpResponse, HttpTag, Inbound, InboundSpans, InstrumentSpecDraft, MdCodec, NonceBlock,
+    NonceSource, NotSentReason, PathStamps, RawFrame, RpcCall, RpcId, Secrets, SpecTable, StreamId,
+    SubmitHandle, SubmitOutcome, Subscription, SymbolError, TimerTag, VenueCaps, VenueCommand,
+    VenueConfig, VenueError, VenueFactory, WireUrl,
 };
 use fbc_oms::ControlCommand;
 use fbc_runtime::{
@@ -167,7 +170,8 @@ impl VenueFactory for SubmitToy {
     }
 }
 
-/// The toy's codec, logging each encode and timeout; with `strip`, an encode's frames name no
+/// The toy's codec, logging each encode and timeout but the session's own arm, which it encodes
+/// as the toy does; with `strip`, an encode's frames name no
 /// request, with `timer`, an encode also sets a timer, with `http`, an encode's frames go as
 /// HTTP requests naming the request instead, and with `never`, an encode's frames give the
 /// request a timeout past the end of the clock.
@@ -198,6 +202,10 @@ impl ExecCodec for Logged {
         t: &mut PathStamps<'_>,
         fx: &mut Effects,
     ) -> Result<EncodeReceipt, NotSentReason> {
+        // The session's own arm (FBC-w19, exec_ready.rs) is encoded as the toy does, unlogged.
+        if *cmd == VenueCommand::ArmCancelOnDisconnect(true) {
+            return self.inner.encode(cmd, rpc, specs, ctx, t, fx);
+        }
         let encode = Call::Encode {
             rpc,
             ctx: ctx.clone(),
@@ -457,18 +465,6 @@ impl ExecHandler for Keep {
     }
 }
 
-/// How many times the handler heard the stream authenticated.
-fn authentications(log: &Log) -> usize {
-    let log = log.borrow();
-    let authenticated = |heard: &&Heard| {
-        matches!(heard, Heard::Event(env) if matches!(env.body, ExecEvent::Conn {
-            state: ConnState::Authenticated,
-            ..
-        }))
-    };
-    log.iter().filter(authenticated).count()
-}
-
 /// How many epochs the handler was told ended.
 fn ends(log: &Log) -> usize {
     let log = log.borrow();
@@ -485,11 +481,17 @@ fn handles(log: &Log) -> Vec<SubmitHandle> {
     log.iter().filter_map(handle).collect()
 }
 
-/// The outcomes the handler heard: request, item index, outcome and epoch.
+/// The outcomes the handler heard: request, item index, outcome and epoch. The venue's
+/// acceptances of the session's own arms, which [`ready`] asks for, are left out: no request
+/// of the tests' is ever accepted, only answered as a query or timed out.
 fn outcomes(log: &Log) -> Vec<(RpcId, Option<u16>, SubmitOutcome, ConnKey)> {
     let log = log.borrow();
     let outcome = |heard: &Heard| match heard {
         Heard::Event(env) => match &env.body {
+            ExecEvent::Outcome {
+                outcome: SubmitOutcome::Accepted { .. },
+                ..
+            } => None,
             ExecEvent::Outcome { rpc, item, outcome } => Some((
                 *rpc,
                 item.as_ref().map(|i| i.idx),
@@ -501,6 +503,13 @@ fn outcomes(log: &Log) -> Vec<(RpcId, Option<u16>, SubmitOutcome, ConnKey)> {
         _ => None,
     };
     log.iter().filter_map(outcome).collect()
+}
+
+/// How many query answers the handler heard.
+fn answers(log: &Log) -> usize {
+    let log = log.borrow();
+    let answer = |h: &&Heard| matches!(h, Heard::Event(env) if matches!(env.body, ExecEvent::QueryResult(_)));
+    log.iter().filter(answer).count()
 }
 
 /// Stops tokio's paused clock from jumping while socket I/O is under way: it moves only by
@@ -531,17 +540,51 @@ async fn settle(done: impl Fn() -> bool) {
 
 const AUTH_ACK: &str = "auth|ok=1|token=toy-session-token";
 
-/// What the toy writes for a dead-man refresh, request `rpc`.
-fn heartbeat(rpc: RpcId) -> String {
-    format!("heartbeat|rpc={}|ttl_ms=10000", rpc.0)
+/// An order query for venue order `V-1`: one item, as a cancel or a place.
+fn query() -> ControlCommand {
+    let vid = exec_toy::with_scope(|scope| scope.venue_order_id("V-1")).unwrap();
+    ControlCommand::Query(fbc_core::QueryOrder {
+        target: fbc_core::OrderRef::Venue(vid),
+        inst: exec_toy::INST_A,
+        placement_nonce: None,
+    })
 }
 
-/// The venue's acceptance of request `rpc`'s one item.
-fn accepted(rpc: RpcId) -> String {
-    format!("item|rpc={}|i=0|res=ok", rpc.0)
+/// What the toy writes for [`query`], request `rpc`.
+fn queried(rpc: RpcId) -> String {
+    format!("query|rpc={}|vid=V-1|sym=TOYA-PERP", rpc.0)
 }
 
-const REFRESH: ControlCommand = ControlCommand::RefreshDeadMan;
+/// The venue's answer to query `rpc`: no such order.
+fn not_found(rpc: RpcId) -> String {
+    format!("qres|rpc={}|found=0", rpc.0)
+}
+
+/// Acknowledges the authentication `peer` was sent, reads the arm and the resync the session
+/// then sends (FBC-w19), has the venue accept the arm and answer the resync with nothing open,
+/// and waits until the handler heard the resync end: the epoch takes places. The arm's request.
+async fn ready(peer: &mut Peer, watch: &Log) -> RpcId {
+    let resynced = resync_ends(watch);
+    peer.send(AUTH_ACK);
+    let arm = peer.recv().await;
+    let rpc = arm
+        .strip_prefix("cod|rpc=")
+        .and_then(|a| a.strip_suffix("|on=1"));
+    let rpc = RpcId(rpc.expect(&arm).parse().unwrap());
+    let resync = peer.recv().await;
+    let wm = resync.strip_prefix("resync|ts=").expect(&resync);
+    peer.send(&format!("item|rpc={}|i=0|res=ok", rpc.0));
+    peer.send_all([format!("rsbegin|wm={wm}"), "rsend".to_owned()]);
+    settle(|| resync_ends(watch) == resynced + 1).await;
+    rpc
+}
+
+/// How many times the handler heard a resync end.
+fn resync_ends(log: &Log) -> usize {
+    let log = log.borrow();
+    let end = |h: &&Heard| matches!(h, Heard::Event(env) if env.body == ExecEvent::ResyncEnd);
+    log.iter().filter(end).count()
+}
 
 // ---------------------------------------------------------------------------------------------
 // The done line.
@@ -567,12 +610,11 @@ async fn a_request_is_encoded_with_one_reserved_nonce_per_item_and_its_answer_cl
         let auth = peer.recv().await;
         assert!(auth.starts_with("auth|ts="), "{auth}");
         assert!(auth.ends_with(TOY_TOKEN));
-        peer.send(AUTH_ACK);
-        settle(|| authentications(&watch) == 1).await;
-        let rpc = orders.submit_control(REFRESH).unwrap();
-        assert_eq!(peer.recv().await, heartbeat(rpc));
-        peer.send(&accepted(rpc));
-        settle(|| outcomes(&watch).len() == 1).await;
+        ready(&mut peer, &watch).await;
+        let rpc = orders.submit_control(query()).unwrap();
+        assert_eq!(peer.recv().await, queried(rpc));
+        peer.send(&not_found(rpc));
+        settle(|| answers(&watch) == 1).await;
         // Its deadline, and twice it, pass: the answer cleared it.
         advance(RPC_TIMEOUT * 2).await;
         churn().await;
@@ -585,23 +627,21 @@ async fn a_request_is_encoded_with_one_reserved_nonce_per_item_and_its_answer_cl
     drop(frozen);
 
     // One encode, with exactly one nonce (the request's one item), the source's only
-    // reservation; the toy's on_open asks for none.
+    // reservation after the session's arm's; the toy's on_open and resync ask for none.
     let calls = venue.calls();
     let [Call::Encode { rpc: encoded, ctx }] = &calls[..] else {
         panic!("{calls:?}");
     };
-    assert_eq!((*encoded, ctx.nonces.as_slice()), (rpc, &[0][..]));
-    assert_eq!(*reserved.lock().unwrap(), [vec![0]]);
-    // Its handle reached the handler: sent, using no nonce of its own (a refresh keeps none).
+    assert_eq!((*encoded, ctx.nonces.as_slice()), (rpc, &[1][..]));
+    assert_eq!(*reserved.lock().unwrap(), [vec![0], vec![1]]);
+    // Its handle reached the handler: sent, using no nonce of its own (a query keeps none).
     let sent = SubmitHandle {
         rpc,
         receipt: Ok(EncodeReceipt::new()),
     };
     assert_eq!(handles(&log), [sent]);
-    let accepted = SubmitOutcome::Accepted {
-        ack: AckLevel::Final,
-    };
-    assert_eq!(outcomes(&log), [(rpc, Some(0), accepted, key(0))]);
+    assert_eq!(answers(&log), 1);
+    assert!(outcomes(&log).is_empty());
     assert!(venue.timeouts().is_empty());
 }
 
@@ -620,11 +660,10 @@ async fn an_unanswered_request_is_reported_unknown_once_at_its_deadline_and_neve
     let script = async move {
         let mut peer = server.accept().await;
         peer.recv().await;
-        peer.send(AUTH_ACK);
-        settle(|| authentications(&watch) == 1).await;
-        let rpc = orders.submit_control(REFRESH).unwrap();
+        ready(&mut peer, &watch).await;
+        let rpc = orders.submit_control(query()).unwrap();
         let (sent_at, sent) = peer.next_at().await.unwrap();
-        assert_eq!(sent, heartbeat(rpc));
+        assert_eq!(sent, queried(rpc));
         // Not a moment before its deadline.
         advance(RPC_TIMEOUT - ms(1)).await;
         churn().await;
@@ -641,8 +680,7 @@ async fn an_unanswered_request_is_reported_unknown_once_at_its_deadline_and_neve
         advance(ms(10)).await;
         let mut next = server.accept().await;
         assert!(next.recv().await.starts_with("auth|ts="));
-        next.send(AUTH_ACK);
-        settle(|| authentications(&watch) == 2).await;
+        ready(&mut next, &watch).await;
         advance(RPC_TIMEOUT * 2).await;
         churn().await;
         assert!(next.quiet());
@@ -665,7 +703,7 @@ async fn an_unanswered_request_is_reported_unknown_once_at_its_deadline_and_neve
 }
 
 /// A request the handler submits while handling the first epoch's `Authenticated` event goes
-/// out at once; the connection drops before it is answered, and it is reported `Unknown` at its
+/// out at once, behind the session's arm and resync; the connection drops before it is answered, and it is reported `Unknown` at its
 /// deadline on the next epoch, which never writes it again.
 #[tokio::test(start_paused = true)]
 async fn a_request_in_flight_across_a_reconnect_is_reported_unknown_at_its_deadline_on_the_next_epoch()
@@ -678,21 +716,20 @@ async fn a_request_in_flight_across_a_reconnect_is_reported_unknown_at_its_deadl
     let keep = Keep::new(&log);
     let on_auth = Rc::clone(&keep.on_auth);
     let (mut session, control) = ExecSession::new(config, keep).unwrap();
-    *on_auth.borrow_mut() = Some((session.orders(), REFRESH));
+    *on_auth.borrow_mut() = Some((session.orders(), query()));
     let watch = Rc::clone(&log);
     let script = async move {
         let mut peer = server.accept().await;
         peer.recv().await;
-        peer.send(AUTH_ACK);
+        ready(&mut peer, &watch).await;
         let (sent_at, sent) = peer.next_at().await.unwrap();
-        assert!(sent.starts_with("heartbeat|rpc="), "{sent}");
+        assert!(sent.starts_with("query|rpc="), "{sent}");
         peer.drop_conn();
         settle(|| ends(&watch) == 1).await;
         advance(ms(10)).await;
         let mut next = server.accept().await;
         assert!(next.recv().await.starts_with("auth|ts="));
-        next.send(AUTH_ACK);
-        settle(|| authentications(&watch) == 2).await;
+        ready(&mut next, &watch).await;
         advance(RPC_TIMEOUT - ms(10) - ms(1)).await;
         churn().await;
         assert!(venue.timeouts().is_empty());
@@ -743,13 +780,12 @@ async fn while_disconnected_a_deadline_still_reports_unknown_and_a_new_command_i
     let script = async move {
         let mut peer = server.accept().await;
         peer.recv().await;
-        peer.send(AUTH_ACK);
-        settle(|| authentications(&watch) == 1).await;
-        let first = orders.submit_control(REFRESH).unwrap();
-        assert_eq!(peer.recv().await, heartbeat(first));
+        ready(&mut peer, &watch).await;
+        let first = orders.submit_control(query()).unwrap();
+        assert_eq!(peer.recv().await, queried(first));
         peer.drop_conn();
         settle(|| ends(&watch) == 1).await;
-        let second = orders.submit_control(REFRESH).unwrap();
+        let second = orders.submit_control(query()).unwrap();
         settle(|| handles(&watch).len() == 2).await;
         advance(RPC_TIMEOUT).await;
         settle(|| !outcomes(&watch).is_empty()).await;
@@ -757,8 +793,7 @@ async fn while_disconnected_a_deadline_still_reports_unknown_and_a_new_command_i
         advance(Duration::from_secs(60)).await;
         let mut next = server.accept().await;
         assert!(next.recv().await.starts_with("auth|ts="));
-        next.send(AUTH_ACK);
-        settle(|| authentications(&watch) == 2).await;
+        ready(&mut next, &watch).await;
         churn().await;
         assert!(next.quiet());
         drop(control);
@@ -782,9 +817,10 @@ async fn while_disconnected_a_deadline_still_reports_unknown_and_a_new_command_i
         outcomes(&log),
         [(first, None, SubmitOutcome::Unknown, key(1))]
     );
-    // The second was never encoded and no nonce was reserved for it.
+    // The second was never encoded and no nonce was reserved for it: the first epoch's arm,
+    // the first request and the next epoch's arm took one each.
     assert_eq!(venue.timeouts().len(), 1);
-    assert_eq!(*reserved.lock().unwrap(), [vec![0]]);
+    assert_eq!(*reserved.lock().unwrap(), [vec![0], vec![1], vec![2]]);
 }
 
 /// A command submitted before the venue acknowledged the authentication is
@@ -802,7 +838,7 @@ async fn a_command_submitted_while_no_epoch_is_authenticated_is_not_sent_with_no
     let script = async move {
         let mut peer = server.accept().await;
         assert!(peer.recv().await.starts_with("auth|ts="));
-        let rpc = orders.submit_control(REFRESH).unwrap();
+        let rpc = orders.submit_control(query()).unwrap();
         settle(|| handles(&watch).len() == 1).await;
         advance(RPC_TIMEOUT * 2).await;
         churn().await;
@@ -840,9 +876,8 @@ async fn a_command_whose_effects_do_not_carry_its_request_is_not_sent_with_no_by
     let script = async move {
         let mut peer = server.accept().await;
         peer.recv().await;
-        peer.send(AUTH_ACK);
-        settle(|| authentications(&watch) == 1).await;
-        let rpc = orders.submit_control(REFRESH).unwrap();
+        ready(&mut peer, &watch).await;
+        let rpc = orders.submit_control(query()).unwrap();
         settle(|| handles(&watch).len() == 1).await;
         advance(RPC_TIMEOUT * 2).await;
         churn().await;
@@ -881,9 +916,8 @@ async fn a_command_whose_encode_carries_its_request_over_http_is_not_sent_with_n
     let script = async move {
         let mut peer = server.accept().await;
         peer.recv().await;
-        peer.send(AUTH_ACK);
-        settle(|| authentications(&watch) == 1).await;
-        let rpc = orders.submit_control(REFRESH).unwrap();
+        ready(&mut peer, &watch).await;
+        let rpc = orders.submit_control(query()).unwrap();
         settle(|| handles(&watch).len() == 1).await;
         advance(RPC_TIMEOUT * 2).await;
         churn().await;
@@ -922,9 +956,8 @@ async fn a_command_whose_request_has_no_representable_deadline_is_not_sent_with_
     let script = async move {
         let mut peer = server.accept().await;
         peer.recv().await;
-        peer.send(AUTH_ACK);
-        settle(|| authentications(&watch) == 1).await;
-        let rpc = orders.submit_control(REFRESH).unwrap();
+        ready(&mut peer, &watch).await;
+        let rpc = orders.submit_control(query()).unwrap();
         settle(|| handles(&watch).len() == 1).await;
         advance(RPC_TIMEOUT * 2).await;
         churn().await;
@@ -958,10 +991,10 @@ async fn request_ids_are_unique_for_the_account_across_its_sessions() {
     // The account's one counter, handed to each session built for it.
     second.rpc_ids = first.rpc_ids.clone();
     let (session, _control) = ExecSession::new(first, |_: Envelope<ExecEvent>| {}).unwrap();
-    let earlier = session.orders().submit_control(REFRESH).unwrap();
+    let earlier = session.orders().submit_control(query()).unwrap();
     drop(session);
     let (session, _control) = ExecSession::new(second, |_: Envelope<ExecEvent>| {}).unwrap();
-    let later = session.orders().submit_control(REFRESH).unwrap();
+    let later = session.orders().submit_control(query()).unwrap();
     assert_ne!(earlier, later);
 }
 
@@ -976,8 +1009,8 @@ async fn a_request_the_buckets_refuse_is_not_sent_rate_budget_with_no_byte_writt
     let frozen = freeze();
     let mut server = ScriptedWs::start().await;
     let venue = SubmitToy::leak();
-    // One unit a second: the authentication takes it.
-    let (config, _) = setup(venue, &server.url(), quick(), &[(UNITS, "1")]);
+    // Three units a second: the authentication, the arm and the resync take them.
+    let (config, _) = setup(venue, &server.url(), quick(), &[(UNITS, "3")]);
     let log = Log::default();
     let (mut session, control) = ExecSession::new(config, Keep::new(&log)).unwrap();
     let orders = session.orders();
@@ -985,9 +1018,8 @@ async fn a_request_the_buckets_refuse_is_not_sent_rate_budget_with_no_byte_writt
     let script = async move {
         let mut peer = server.accept().await;
         peer.recv().await;
-        peer.send(AUTH_ACK);
-        settle(|| authentications(&watch) == 1).await;
-        let rpc = orders.submit_control(REFRESH).unwrap();
+        ready(&mut peer, &watch).await;
+        let rpc = orders.submit_control(query()).unwrap();
         settle(|| handles(&watch).len() == 1).await;
         advance(RPC_TIMEOUT * 2).await;
         churn().await;
@@ -1022,8 +1054,7 @@ async fn a_request_the_codec_refuses_is_reported_with_its_reason_and_nothing_wri
     let script = async move {
         let mut peer = server.accept().await;
         peer.recv().await;
-        peer.send(AUTH_ACK);
-        settle(|| authentications(&watch) == 1).await;
+        ready(&mut peer, &watch).await;
         // The toy queries by venue id or placement nonce, never by client id alone.
         let query = fbc_core::QueryOrder {
             target: fbc_core::OrderRef::Client(common_cid()),
@@ -1070,9 +1101,10 @@ async fn a_nonce_source_that_reserves_another_count_for_an_encode_ends_the_sessi
     let venue = SubmitToy::leak();
     let (mut config, _) = setup(venue, &server.url(), quick(), &[]);
     let short = Arc::default();
+    // The session's arm takes the first reservation, whole.
     config.nonces = Box::new(Counting {
         next: 0,
-        short_from: 0,
+        short_from: 1,
         log: Arc::clone(&short),
     });
     let log = Log::default();
@@ -1082,9 +1114,8 @@ async fn a_nonce_source_that_reserves_another_count_for_an_encode_ends_the_sessi
     let script = async move {
         let mut peer = server.accept().await;
         peer.recv().await;
-        peer.send(AUTH_ACK);
-        settle(|| authentications(&watch) == 1).await;
-        orders.submit_control(REFRESH).unwrap();
+        ready(&mut peer, &watch).await;
+        orders.submit_control(query()).unwrap();
         // The session ends, closing the connection having written nothing more.
         assert_eq!(peer.next().await, None);
         orders
@@ -1101,7 +1132,7 @@ async fn a_nonce_source_that_reserves_another_count_for_an_encode_ends_the_sessi
     assert!(venue.calls().is_empty());
     assert!(handles(&log).is_empty());
     // A session that has run takes no more submissions.
-    assert_eq!(orders.submit_control(REFRESH), Err(SubmitRefusal::Ended));
+    assert_eq!(orders.submit_control(query()), Err(SubmitRefusal::Ended));
 }
 
 /// Once the session has stopped, or been dropped, `ExecOrders` refuses every submission.
@@ -1114,13 +1145,13 @@ async fn orders_refuse_submissions_once_the_session_has_stopped_or_dropped() {
     let orders = session.orders();
     drop(control);
     session.run().await.unwrap();
-    assert_eq!(orders.submit_control(REFRESH), Err(SubmitRefusal::Ended));
+    assert_eq!(orders.submit_control(query()), Err(SubmitRefusal::Ended));
 
     let (config, _) = setup(venue, &server.url(), quick(), &[]);
     let (session, _control) = ExecSession::new(config, |_: Envelope<ExecEvent>| {}).unwrap();
     let orders = session.orders();
     drop(session);
-    assert_eq!(orders.submit_control(REFRESH), Err(SubmitRefusal::Ended));
+    assert_eq!(orders.submit_control(query()), Err(SubmitRefusal::Ended));
 }
 
 /// A command submitted while the session waits to reconnect, in the same turn as the control
@@ -1139,7 +1170,7 @@ async fn a_command_waiting_as_the_control_drops_between_epochs_is_never_reported
         let peer = server.accept().await;
         peer.drop_conn();
         settle(|| ends(&watch) == 1).await;
-        orders.submit_control(REFRESH).unwrap();
+        orders.submit_control(query()).unwrap();
         drop(control);
     };
     let (run, ()) = tokio::join!(session.run(), script);
@@ -1162,7 +1193,7 @@ async fn a_handler_that_takes_no_handles_still_gets_nothing_written_unauthentica
     let script = async move {
         let mut peer = server.accept().await;
         assert!(peer.recv().await.starts_with("auth|ts="));
-        orders.submit_control(REFRESH).unwrap();
+        orders.submit_control(query()).unwrap();
         churn().await;
         assert!(peer.quiet());
         drop(control);
@@ -1193,7 +1224,7 @@ impl ExecHandler for Resubmit {
         let again = handle.receipt.is_err() && handles(&self.log).len() < AGAIN;
         self.log.borrow_mut().push(Heard::Submitted(handle));
         if let Some(orders) = self.orders.borrow().as_ref().filter(|_| again) {
-            let _ = orders.submit_control(REFRESH);
+            let _ = orders.submit_control(query());
         }
     }
 
@@ -1211,8 +1242,8 @@ async fn a_handler_resubmitting_what_was_not_sent_cannot_hold_an_epoch_in_one_tu
     let frozen = freeze();
     let mut server = ScriptedWs::start().await;
     let venue = SubmitToy::leak();
-    // One unit a second: the authentication takes it.
-    let (config, _) = setup(venue, &server.url(), quick(), &[(UNITS, "1")]);
+    // Three units a second: the authentication, the arm and the resync take them.
+    let (config, _) = setup(venue, &server.url(), quick(), &[(UNITS, "3")]);
     let log = Log::default();
     let shared = Rc::default();
     let handler = Resubmit {
@@ -1226,9 +1257,8 @@ async fn a_handler_resubmitting_what_was_not_sent_cannot_hold_an_epoch_in_one_tu
     let script = async move {
         let mut peer = server.accept().await;
         peer.recv().await;
-        peer.send(AUTH_ACK);
-        settle(|| watch.borrow().len() == 1).await;
-        orders.submit_control(REFRESH).unwrap();
+        ready(&mut peer, &watch).await;
+        orders.submit_control(query()).unwrap();
         settle(|| !handles(&watch).is_empty()).await;
         drop(control);
     };
@@ -1263,7 +1293,7 @@ async fn a_handler_resubmitting_what_was_not_sent_cannot_hold_the_wait_to_reconn
         let peer = server.accept().await;
         peer.drop_conn();
         settle(|| ends(&watch) == 1).await;
-        orders.submit_control(REFRESH).unwrap();
+        orders.submit_control(query()).unwrap();
         settle(|| !handles(&watch).is_empty()).await;
         drop(control);
     };

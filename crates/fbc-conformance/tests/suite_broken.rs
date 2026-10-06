@@ -552,11 +552,13 @@ fn caps_truthful_names_every_absent_capability_the_toy_still_sends() {
         "OrderCaps.cancel_all_instrument is Unsupported",
         "OrderCaps.cancel_on_disconnect has no protection (arm)",
         "OrderCaps.cancel_on_disconnect has no protection (disarm)",
-        "OrderCaps.cancel_on_disconnect has no dead-man timer (refresh)",
     ] {
         assert!(said(&failure, capability).starts_with("sent"), "{failure}");
     }
-    // What the toy really leaves out is still refused, and its controls are still sent.
+    // What the toy really leaves out is still refused, and its controls are still sent: it has
+    // no dead-man timer either (its protection is per connection).
+    let refresh = "OrderCaps.cancel_on_disconnect has no dead-man timer (refresh)";
+    assert!(!failure.names(refresh), "{failure}");
     for kept in [
         "OrderCaps.kinds lacks Market",
         "OrderCaps.channels lacks Rpi",
@@ -595,11 +597,11 @@ fn caps_truthful_names_limits_and_references_narrower_than_the_toy_takes() {
         "CancelBatch.refs lacks [Client, PlacementNonce]",
         "AmendCaps.refs lacks [Venue]",
         "OrderCaps.query_refs lacks [Client, PlacementNonce]",
-        "OrderCaps.cancel_on_disconnect has no dead-man timer (refresh)",
     ] {
         assert!(said(&failure, capability).starts_with("sent"), "{failure}");
     }
     assert!(!failure.names("OrderCaps.cancel_on_disconnect has no protection (arm)"));
+    assert!(!failure.names("OrderCaps.cancel_on_disconnect has no dead-man timer (refresh)"));
     assert!(
         !failure
             .breaches
@@ -774,7 +776,6 @@ fn a_codec_that_refuses_everything_fails_every_control() {
         "control: a query",
         "control: protection (arm)",
         "control: protection (disarm)",
-        "control: dead-man timer (refresh)",
         "OrderCaps.cancel_all_instrument is Native: never widened",
     ] {
         assert!(
@@ -931,22 +932,23 @@ fn a_codec_that_encodes_differently_once_it_saw_the_placement_is_not_self_contai
 
 #[test]
 fn operations_the_caps_declare_are_controls_the_codec_must_send() {
-    // An account cancel-all and cancel-on-disconnect protection declared, which the toy does
-    // not send: an account cancel-all, and protection without a dead-man timer.
+    // An account cancel-all and a dead-man timer declared, which the toy does not send: its
+    // protection is per connection, with no timer to refresh.
     let declared = Broken::declaring(|caps| {
         let o = order(caps);
         o.cancel_all_account = Support::Native;
-        o.cancel_on_disconnect = CancelOnDisconnect::PerConnection {
-            rearm_on_reconnect: false,
+        o.cancel_on_disconnect = CancelOnDisconnect::DeadMan {
+            max_ttl: std::time::Duration::from_secs(10),
         };
     });
     let failure = failed(declared.caps_truthful());
+    let refused = "refused as NotSent(Unsupported) though the caps declare it";
     let account = said(&failure, "control: an account cancel-all");
-    assert!(account.starts_with("refused as NotSent(Unsupported) though the caps declare it"));
+    assert!(account.starts_with(refused), "{failure}");
+    let refresh = said(&failure, "control: dead-man timer (refresh)");
+    assert!(refresh.starts_with(refused), "{failure}");
     // The toy arms and disarms its protection, and refuses nothing else declared.
     assert_eq!(failure.breaches.len(), 2, "{failure}");
-    let refresh = "OrderCaps.cancel_on_disconnect has no dead-man timer (refresh)";
-    assert!(said(&failure, refresh).starts_with("sent"), "{failure}");
 }
 
 #[test]

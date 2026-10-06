@@ -78,17 +78,37 @@
 //! due while a write waits on a stalled peer is handled once the write ends, within the
 //! write-stall window. Once the session has stopped, nothing more is reported.
 //!
+//! **Cancel-on-disconnect and the resync, every epoch (FBC-w19, decision 0058).** A session
+//! takes only a venue whose cancel-on-disconnect is per connection: one declaring `None` or
+//! `DeadMan` is refused when it is built ([`ExecSessionError::CancelOnDisconnect`]). Once the
+//! codec reports an epoch's stream authenticated, the session sends `ArmCancelOnDisconnect(true)`
+//! as a request of its own (its id from the account's [`RpcIds`], one nonce reserved, its frames
+//! charged together), on every epoch where the protection lapses with the connection and
+//! otherwise until an arm is accepted, then calls the codec's `resync` with exactly the nonces
+//! [`ExecCodec::nonces_for`] asks for with [`CtxCall::Resync`], its frames charged together as
+//! `on_open`'s are (buckets that refuse them for now end the epoch as a drop, opened again no
+//! sooner than they would admit them; frames that never fit end the session,
+//! [`ExecSessionError::ResyncNeverFits`]). The arm's and the resync's events reach the handler
+//! as any other. Until the venue has accepted the arm and the resync's `ResyncEnd` has reached
+//! the handler, the epoch takes no place, batch of places or amend: each is
+//! `NotSent(Disconnected)`, counted ([`ExecCounters::unready_refusals`]), with no nonce reserved
+//! and nothing written, while cancels and control commands go out
+//! ([`ExecOrders::may_place`]). An arm the codec refuses, the buckets do not admit, the venue
+//! rejects, or that is unanswered at its deadline fails the epoch: once the input being handled
+//! and the commands waiting are taken (a cancel among them goes out), the epoch ends as a drop,
+//! counted ([`ExecCounters::arm_failures`]), and the next opens through the pacing.
+//!
 //! One thread drives a session (design §5.1): [`ExecSession::run`] spawns no task.
 
 use std::fmt;
 use std::rc::Rc;
 
 use fbc_core::{
-    AccountKey, ConnKey, ConnState, CtxCall, Effect, Effects, EncodeCtx, Envelope, ExecCodec,
-    ExecEvent, ExecSink, Inbound, InboundSpans, KernelRxNs, MonoNs, Namespace, NonceBlock,
-    NonceSource, NotSentReason, PathStamps, RpcCall, RpcId, Secrets, SpecTable, Stamp, StreamId,
-    SubmitHandle, TimerTag, VenueCaps, VenueConfig, VenueError, VenueFactory, VenueMeta, WallNs,
-    dispatch,
+    AccountKey, CancelOnDisconnect, ConnKey, ConnState, CtxCall, Effect, Effects, EncodeCtx,
+    EncodeReceipt, Envelope, ExecCodec, ExecEvent, ExecSink, Inbound, InboundSpans, KernelRxNs,
+    MonoNs, Namespace, NonceBlock, NonceSource, NotSentReason, PathStamps, RpcCall, RpcId, Secrets,
+    SpecTable, Stamp, StreamId, SubmitHandle, TimerTag, VenueCaps, VenueCommand, VenueConfig,
+    VenueError, VenueFactory, VenueMeta, WallNs, dispatch,
 };
 use futures_util::{FutureExt, StreamExt};
 use tokio::sync::watch;
@@ -195,6 +215,13 @@ pub enum ExecSessionError {
     /// The frames the codec's `on_open` asks for weigh more together than the venue's buckets
     /// ever admit, so no epoch could open.
     OpenNeverFits,
+    /// The venue's cancel-on-disconnect is not per connection: it declares none (`None`), or a
+    /// dead-man timer (`DeadMan`), which no planned venue needs. A session places orders only
+    /// behind per-connection protection (decision 0058).
+    CancelOnDisconnect(CancelOnDisconnect),
+    /// The frames the codec's resync asks for weigh more together than the venue's buckets ever
+    /// admit, so no epoch could take places.
+    ResyncNeverFits,
     /// The session has run: it runs once, and a new one is built to run again.
     Ended,
 }
@@ -216,6 +243,21 @@ impl fmt::Display for ExecSessionError {
             ExecSessionError::Ended => f.write_str("the session has run; it runs once"),
             ExecSessionError::OpenNeverFits => f.write_str(
                 "the frames on_open asks for weigh more together than the buckets ever admit",
+            ),
+            ExecSessionError::CancelOnDisconnect(cod) => {
+                let declared = match cod {
+                    CancelOnDisconnect::None => "None",
+                    CancelOnDisconnect::PerConnection { .. } => "PerConnection",
+                    CancelOnDisconnect::DeadMan { .. } => "DeadMan",
+                };
+                write!(
+                    f,
+                    "the venue declares cancel-on-disconnect {declared}; a session places orders \
+                     only behind per-connection protection"
+                )
+            }
+            ExecSessionError::ResyncNeverFits => f.write_str(
+                "the frames the resync asks for weigh more together than the buckets ever admit",
             ),
         }
     }
@@ -263,6 +305,12 @@ pub struct ExecCounters {
     pub refused_effects: u64,
     /// Epochs ended because a write did not complete within the write-stall window.
     pub write_stalls: u64,
+    /// Epochs ended because their cancel-on-disconnect arm failed: the codec refused it, the
+    /// buckets did not admit it, the venue rejected it, or it was unanswered at its deadline.
+    pub arm_failures: u64,
+    /// Places, batches of places and amends refused because their epoch was not yet armed and
+    /// resynced.
+    pub unready_refusals: u64,
 }
 
 /// One account's order-entry connection, driven by [`ExecSession::run`].
@@ -278,6 +326,10 @@ pub struct ExecSession<H: ExecHandler> {
     specs: SpecTable,
     nonces: Box<dyn NonceSource>,
     decode_errors: u64,
+    /// Epochs ended by a failed arm.
+    arm_failures: u64,
+    /// Places and amends refused on an epoch not yet armed and resynced.
+    unready_refusals: u64,
     /// What [`ExecOrders`] and the session share: the commands waiting, the authenticated
     /// epoch.
     orders: Rc<Shared>,
@@ -364,9 +416,13 @@ impl<H: ExecHandler> ExecSession<H> {
     ) -> Result<(ExecSession<H>, ExecControl), ExecSessionError> {
         let (venue, cfg) = (config.venue, &config.cfg);
         let caps = venue.caps(cfg).map_err(SessionError::Config)?;
-        if caps.exec.is_none() {
+        let Some(exec) = &caps.exec else {
             return Err(ExecSessionError::NoOrderEntry);
-        }
+        };
+        let rearm = match exec.order.cancel_on_disconnect {
+            CancelOnDisconnect::PerConnection { rearm_on_reconnect } => rearm_on_reconnect,
+            other => return Err(ExecSessionError::CancelOnDisconnect(other)),
+        };
         config.limiter.check(&caps.limits)?;
         let mut plan = venue.plan_exec(cfg).map_err(ExecSessionError::Venue)?;
         let endpoint = match (plan.pop(), plan.len()) {
@@ -400,7 +456,9 @@ impl<H: ExecHandler> ExecSession<H> {
             specs: config.specs,
             nonces: config.nonces,
             decode_errors: 0,
-            orders: Shared::new(config.acct, config.rpc_ids),
+            arm_failures: 0,
+            unready_refusals: 0,
+            orders: Shared::new(config.acct, config.rpc_ids, rearm),
             rpcs: Rpcs::default(),
             clock,
             stop,
@@ -438,6 +496,8 @@ impl<H: ExecHandler> ExecSession<H> {
             decode_errors: self.decode_errors,
             refused_effects: core.refused_effects,
             write_stalls: core.write_stalls,
+            arm_failures: self.arm_failures,
+            unready_refusals: self.unready_refusals,
         }
     }
 
@@ -540,7 +600,8 @@ impl<H: ExecHandler> ExecSession<H> {
         // is told of it, so nothing is reserved or sent.
         let mut open = !self.stopped() && {
             let fx = self.open()?;
-            self.open_effects(&mut ws, key, fx).await?
+            let never = ExecSessionError::OpenNeverFits;
+            self.execute_together(&mut ws, key, fx, never).await?
         };
         while open {
             // Unbiased: each turn polls the branches from a random one, so frames that keep
@@ -578,10 +639,19 @@ impl<H: ExecHandler> ExecSession<H> {
                     true
                 }
             };
+            // An epoch just authenticated arms its protection and resyncs, before what waits.
+            if open {
+                open = self.prepare(&mut ws, key).await?;
+            }
             // What was submitted, by the handler as it took the input or meanwhile, goes out
             // before the next input.
             if open {
                 open = self.send_queued(&mut ws, key).await?;
+            }
+            // An epoch whose arm failed ends as a drop, once what waited has gone out.
+            if open && self.orders.gate.borrow().failed(key.epoch) {
+                self.arm_failures += 1;
+                open = false;
             }
         }
         // A stop closes the connection; a drop, a reconnect the codec asked for (which the
@@ -638,17 +708,18 @@ impl<H: ExecHandler> ExecSession<H> {
         Some(stamp)
     }
 
-    /// Executes what `on_open` asked for on epoch `key`. Its frames are charged together
-    /// first, so all of them go or none does (Codex r4188802873): buckets that refuse them for
-    /// now end the epoch as a drop, which reconnects through the pacing, no sooner than the
-    /// buckets would admit them, and calls `on_open` again, rather than leave the codec
-    /// believing it sent what it never did; frames that can never fit together end the
-    /// session. False when the epoch ended.
-    async fn open_effects(
+    /// Executes what `on_open` or the codec's resync asked for on epoch `key`. Its frames are
+    /// charged together first, so all of them go or none does (Codex r4188802873): buckets that
+    /// refuse them for now end the epoch as a drop, which reconnects through the pacing, no
+    /// sooner than the buckets would admit them, and calls `on_open` (and the resync) again,
+    /// rather than leave the codec believing it sent what it never did; frames that can never
+    /// fit together end the session with `never`. False when the epoch ended.
+    async fn execute_together(
         &mut self,
         ws: &mut Option<WebSocket>,
         key: ConnKey,
         mut fx: Effects,
+        never: ExecSessionError,
     ) -> Result<bool, ExecSessionError> {
         let mut effects = fx.take();
         // Nothing behind a reconnect of the session's stream is ever reached, so nothing
@@ -673,7 +744,7 @@ impl<H: ExecHandler> ExecSession<H> {
                 self.core.pacer.hold_until(at);
                 return Ok(false);
             }
-            Some(Err(Refused { ready_at: None })) => return Err(ExecSessionError::OpenNeverFits),
+            Some(Err(Refused { ready_at: None })) => return Err(never),
         }
         effects.into_iter().for_each(|e| fx.push(e));
         self.execute(ws, fx, true, None).await
@@ -802,16 +873,10 @@ impl<H: ExecHandler> ExecSession<H> {
         queued: Queued,
     ) -> Result<bool, ExecSessionError> {
         let Queued { rpc, item, epoch } = queued;
-        let ready = self.orders.ready().is_some_and(|ready| ready == key.epoch);
         let not_sent = |reason| SubmitHandle {
             rpc,
             receipt: Err(reason),
         };
-        if !ready || epoch != Some(key.epoch) {
-            self.handler
-                .on_submitted(not_sent(NotSentReason::Disconnected));
-            return Ok(true);
-        }
         // fbc-oms's submit-time re-check of an authorization,
         // `Authorization::check_at_submit` (FBC-afd, decision 0060; FBC-j5bw calls it), belongs
         // here, at encode and before any nonce is reserved, not where
@@ -819,6 +884,39 @@ impl<H: ExecHandler> ExecSession<H> {
         // have moved since (decision 0057; PR #87 Reviewer B B7). The authorization is spent
         // when this returns.
         let cmd = item.command();
+        let current = self.orders.ready() == Some(key.epoch) && epoch == Some(key.epoch);
+        // No place or amend before the epoch's arm is accepted and its resync has ended
+        // (decision 0058): counted, no nonce reserved, nothing written.
+        let held = current && !self.orders.gate.borrow().admits(cmd, key.epoch);
+        self.unready_refusals += u64::from(held);
+        if !current || held {
+            self.handler
+                .on_submitted(not_sent(NotSentReason::Disconnected));
+            return Ok(true);
+        }
+        match self.encode(cmd, rpc, key)? {
+            Ok((receipt, fx)) => {
+                let receipt = Ok(receipt);
+                self.handler.on_submitted(SubmitHandle { rpc, receipt });
+                self.execute(ws, fx, true, None).await
+            }
+            Err(reason) => {
+                self.handler.on_submitted(not_sent(reason));
+                Ok(true)
+            }
+        }
+    }
+
+    /// Encodes `cmd` as request `rpc` for epoch `key`, with an [`EncodeCtx`] holding exactly
+    /// its items' nonces, and charges its frames together: its receipt and effects, ready to
+    /// execute, or why it is not sent, nothing written (the module docs say which). The
+    /// session's error when the nonce source reserved another count.
+    fn encode(
+        &mut self,
+        cmd: &VenueCommand,
+        rpc: RpcId,
+        key: ConnKey,
+    ) -> Result<Result<(EncodeReceipt, Effects), NotSentReason>, ExecSessionError> {
         // A batch longer than u16::MAX items, which no venue takes, has no nonce block.
         let items = cmd.items().map(|n| reserve(&mut *self.nonces, n));
         let mut fx = Effects::new();
@@ -836,15 +934,8 @@ impl<H: ExecHandler> ExecSession<H> {
             Ok(receipt) if carries(&fx, rpc, cmd.traffic_class(), self.stream, Instant::now()) => {
                 receipt
             }
-            Ok(_) => {
-                self.handler
-                    .on_submitted(not_sent(NotSentReason::Unencodable));
-                return Ok(true);
-            }
-            Err(reason) => {
-                self.handler.on_submitted(not_sent(reason));
-                return Ok(true);
-            }
+            Ok(_) => return Ok(Err(NotSentReason::Unencodable)),
+            Err(reason) => return Ok(Err(reason)),
         };
         // Its frames go together or not at all, so the codec's request is either written whole
         // or reported not sent.
@@ -856,19 +947,79 @@ impl<H: ExecHandler> ExecSession<H> {
             .charge(Instant::now(), key, &frames)
             .is_err()
         {
-            self.handler
-                .on_submitted(not_sent(NotSentReason::RateBudget));
+            return Ok(Err(NotSentReason::RateBudget));
+        }
+        Ok(Ok((receipt, fx)))
+    }
+
+    /// Arms the venue's cancel-on-disconnect on just authenticated epoch `key`, then asks the
+    /// codec's resync, as each is due (decision 0058). False when the epoch ended.
+    async fn prepare(
+        &mut self,
+        ws: &mut Option<WebSocket>,
+        key: ConnKey,
+    ) -> Result<bool, ExecSessionError> {
+        let epoch = key.epoch;
+        if self.stopped() || self.orders.ready() != Some(epoch) {
             return Ok(true);
         }
-        let receipt = Ok(receipt);
-        self.handler.on_submitted(SubmitHandle { rpc, receipt });
-        self.execute(ws, fx, true, None).await
+        let mut open = true;
+        if self.orders.gate.borrow().arm_due(epoch) {
+            open = self.arm(ws, key).await?;
+        }
+        let resync = {
+            let gate = self.orders.gate.borrow();
+            gate.resync_due(epoch) && !gate.failed(epoch)
+        };
+        if open && resync {
+            open = self.resync(ws, key).await?;
+        }
+        Ok(open)
+    }
+
+    /// Sends `ArmCancelOnDisconnect(true)` on epoch `key` as a request of the session's own; one
+    /// not sent fails the epoch. False when the epoch ended.
+    async fn arm(
+        &mut self,
+        ws: &mut Option<WebSocket>,
+        key: ConnKey,
+    ) -> Result<bool, ExecSessionError> {
+        let rpc = self.orders.next_rpc();
+        let cmd = VenueCommand::ArmCancelOnDisconnect(true);
+        match self.encode(&cmd, rpc, key)? {
+            Ok((_, fx)) => {
+                self.orders.gate.borrow_mut().arm_sent(key.epoch, rpc);
+                self.execute(ws, fx, true, None).await
+            }
+            Err(_) => {
+                self.orders.gate.borrow_mut().arm_not_sent(key.epoch);
+                Ok(true)
+            }
+        }
+    }
+
+    /// Asks the codec's resync on epoch `key`, with exactly the nonces it asks for, its frames
+    /// charged together. False when the epoch ended.
+    async fn resync(
+        &mut self,
+        ws: &mut Option<WebSocket>,
+        key: ConnKey,
+    ) -> Result<bool, ExecSessionError> {
+        let (mono, wall) = self.core.clock.now();
+        let ctx = context(&*self.codec, &mut *self.nonces, CtxCall::Resync, mono, wall)?;
+        let mut fx = Effects::new();
+        self.codec.resync(&ctx, &mut fx);
+        self.orders.gate.borrow_mut().resync_asked(key.epoch);
+        let never = ExecSessionError::ResyncNeverFits;
+        self.execute_together(ws, key, fx, never).await
     }
 
     /// Hands each request whose deadline fell due unanswered to the codec's `on_rpc_timeout`,
     /// its events stamped under epoch `key`; once the session has stopped, the sink drops them.
     fn time_out(&mut self, key: ConnKey) {
         for rpc in self.rpcs.take_due(Instant::now()) {
+            // An arm unanswered at its deadline fails its epoch, whatever the codec reports.
+            self.orders.gate.borrow_mut().timed_out(rpc);
             let stamp = self.core.clock.stamp(key, None);
             let mut sink = Sink {
                 handler: &mut self.handler,
@@ -1114,14 +1265,22 @@ impl<H: ExecHandler> ExecSink for Sink<'_, H> {
         if self.stop.has_changed().is_err() {
             self.epochs.drop_ended(Input::Event);
         } else if let Ok(Admit::Current) = self.epochs.admit(Input::Event, self.stamp.conn) {
+            let epoch = self.stamp.conn.epoch;
             if let ExecEvent::Conn { stream, state } = &ev
                 && *stream == self.own
             {
                 let authenticated = *state == ConnState::Authenticated;
-                let epoch = authenticated.then_some(self.stamp.conn.epoch);
-                self.orders.set_ready(epoch);
+                self.orders.set_ready(authenticated.then_some(epoch));
+                if authenticated {
+                    self.orders.gate.borrow_mut().authenticated(epoch);
+                }
             }
+            // The arm's answer and the resync's end count once the handler has the event.
+            let settled = self.orders.gate.borrow().settles(epoch, &ev);
             self.handler.on_exec(Envelope::new(self.stamp, meta, ev));
+            if let Some(settled) = settled {
+                self.orders.gate.borrow_mut().settle(epoch, settled);
+            }
         }
     }
 }
@@ -1144,6 +1303,29 @@ mod tests {
                 "the venue adapter discovers no instruments",
             ),
             (ExecSessionError::NoOrderEntry, "the venue takes no orders"),
+            (
+                ExecSessionError::CancelOnDisconnect(CancelOnDisconnect::None),
+                "the venue declares cancel-on-disconnect None; a session places orders only \
+                 behind per-connection protection",
+            ),
+            (
+                ExecSessionError::CancelOnDisconnect(CancelOnDisconnect::PerConnection {
+                    rearm_on_reconnect: false,
+                }),
+                "the venue declares cancel-on-disconnect PerConnection; a session places orders \
+                 only behind per-connection protection",
+            ),
+            (
+                ExecSessionError::CancelOnDisconnect(CancelOnDisconnect::DeadMan {
+                    max_ttl: std::time::Duration::from_secs(1),
+                }),
+                "the venue declares cancel-on-disconnect DeadMan; a session places orders only \
+                 behind per-connection protection",
+            ),
+            (
+                ExecSessionError::ResyncNeverFits,
+                "the frames the resync asks for weigh more together than the buckets ever admit",
+            ),
             (ExecSessionError::Ended, "the session has run; it runs once"),
             (
                 ExecSessionError::OpenNeverFits,
