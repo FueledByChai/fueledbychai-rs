@@ -3,6 +3,11 @@
 //! nonces it asked for, its events are stamped in the shard's ingest order and handed to the
 //! handler inline, an event of an ended epoch is dropped and counted, and a dropped connection
 //! is reconnected through the consumer's pacing (decision 0053).
+//!
+//! FBC-bnl's done line, against local WebSocket and HTTP servers: the codec's HTTP result is
+//! answered only to the epoch that asked, a timer of an ended epoch is dropped and counted,
+//! `on_timer` is called with exactly the nonces it asked for, and its keepalive (a timer it
+//! arms on open and again on each firing) is sent at its declared interval (decision 0056).
 
 mod common;
 #[path = "../../fbc-conformance/src/toy/mod.rs"]
@@ -20,7 +25,7 @@ use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use common::toy::ToyVenue;
-use common::{Answer, ScriptedWs, Socks5Stub, refusing};
+use common::{Answer, ScriptedHttp, ScriptedWs, Socks5Stub, refusing};
 use exec_toy::{EXEC_STREAM, OWN_NS, TOY_TOKEN, ToyExec, ToySigner};
 use fbc_core::{
     AccountSummary, AssetKey, ConfigError, ConnKey, ConnState, CtxCall, DecodeError, DecodeScope,
@@ -40,7 +45,7 @@ use fbc_runtime::{
 use futures_util::{FutureExt, StreamExt};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
-use tokio::time::Instant;
+use tokio::time::{Instant, advance};
 
 // ---------------------------------------------------------------------------------------------
 // The venue: the conformance toy's order entry, planned on one endpoint.
@@ -62,13 +67,28 @@ const HEAVY: &str = "exec.heavy";
 const OPEN_BYE: &str = "exec.open_bye";
 /// Any value: the venue also declares a per-connection limit, of `Control` and `Query`.
 const CONN_LIMIT: &str = "exec.conn_limit";
+/// The base URL the recorded codec's HTTP requests go to.
+const HTTP: &str = "exec.http";
+/// Milliseconds: the recorded codec keeps its stream alive with a `ping` frame this often, a
+/// timer it arms on open and again on each firing.
+const KEEPALIVE: &str = "exec.keepalive";
+
+/// The tag of the recorded codec's keepalive timer.
+const PING: TimerTag = TimerTag(99);
 
 /// Every `on_open` call the recorded codec saw: its stream and context.
 type Opens = Arc<Mutex<Vec<(StreamId, EncodeCtx)>>>;
+/// Every `on_timer` call the recorded codec saw: its tag and context.
+type Timers = Arc<Mutex<Vec<(TimerTag, EncodeCtx)>>>;
+/// Every HTTP result the recorded codec was handed for a request it asked for:
+/// `<tag>:<status>:<body>`, or `<tag>:<failure>`.
+type Answers = Arc<Mutex<Vec<String>>>;
 
 #[derive(Default)]
 struct ExecToy {
     opens: Opens,
+    timers: Timers,
+    answers: Answers,
 }
 
 impl ExecToy {
@@ -78,6 +98,14 @@ impl ExecToy {
 
     fn opens(&self) -> Vec<(StreamId, EncodeCtx)> {
         self.opens.lock().unwrap().clone()
+    }
+
+    fn timers(&self) -> Vec<(TimerTag, EncodeCtx)> {
+        self.timers.lock().unwrap().clone()
+    }
+
+    fn answers(&self) -> Vec<String> {
+        self.answers.lock().unwrap().clone()
     }
 }
 
@@ -161,6 +189,11 @@ impl VenueFactory for ExecToy {
             None => Box::new(Recording {
                 inner: toy,
                 opens: self.opens.clone(),
+                timers: self.timers.clone(),
+                answers: self.answers.clone(),
+                asked: BTreeSet::new(),
+                http: cfg.get(HTTP).map(str::to_owned),
+                keepalive: cfg.get(KEEPALIVE).map(|n| ms(n.parse().unwrap())),
                 heavy: cfg.get(HEAVY).is_some(),
                 bye: cfg.get(OPEN_BYE).is_some(),
             }),
@@ -176,24 +209,49 @@ impl VenueFactory for ExecToy {
     }
 }
 
-/// The conformance toy's codec, recording each `on_open` and asking a resync after the
-/// authentication. Its `on_open` asks for two nonces on the first epoch, three on the second,
-/// and so on, so each epoch's reservation differs. Frames of the test's own: `stray`
-/// asks for a timer, an HTTP request, and a frame and a reconnect on another stream, then
-/// sends `said`; `bye` asks to reconnect its stream, then for a timer and an HTTP request,
-/// which the reconnect leaves unreached; `halt` pushes a `ResyncBegin` and asks to send
-/// `said`.
+/// The conformance toy's codec, recording each `on_open`, `on_timer` and HTTP result, and asking
+/// a resync after the authentication. Its `on_open` asks for two nonces on the first epoch,
+/// three on the second, and so on, and its `on_timer` for one on its first call, two on its
+/// second, and so on, so each reservation differs. With a keepalive it arms [`PING`] on open,
+/// and sends `ping` and arms it again on each firing; any other timer sends `rang|tag=<n>`.
+/// Frames of the test's own: `stray` asks for a timer, an HTTP request, and a frame and a
+/// reconnect on another stream, then sends `said`; `bye` asks to reconnect its stream, then for
+/// a timer and an HTTP request, which the reconnect leaves unreached; `halt` pushes a
+/// `ResyncBegin` and asks to send `said`; `arm|tag=<n>|ms=<t>` sets timer `n` to fire in `t`
+/// ms; `ask|tag=<n>|path=<p>` asks for a GET of `p` under the configured base URL, whose result
+/// it records, pushes as an account `Halted` mode and acknowledges with `got|tag=<n>`;
+/// `big|kb=<n>` asks to send an `n` KiB frame.
 struct Recording {
     inner: ToyExec,
     opens: Opens,
+    timers: Timers,
+    answers: Answers,
+    /// The tags of the requests `ask` asked for; any other result goes to the toy's codec.
+    asked: BTreeSet<HttpTag>,
+    http: Option<String>,
+    keepalive: Option<Duration>,
     heavy: bool,
     bye: bool,
+}
+
+/// The value of `name` in a test frame `kind|name=value|...`.
+fn field<'a>(text: &'a str, name: &str) -> &'a str {
+    let found = text.split('|').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        (key == name).then_some(value)
+    });
+    found.unwrap_or_else(|| panic!("{name} in {text}"))
+}
+
+fn tag_of(text: &str) -> u64 {
+    field(text, "tag").parse().unwrap()
 }
 
 impl ExecCodec for Recording {
     fn nonces_for(&self, call: CtxCall) -> u16 {
         match call {
             CtxCall::Open(_) => 2 + self.opens.lock().unwrap().len() as u16,
+            CtxCall::Timer(_) => 1 + self.timers.lock().unwrap().len() as u16,
             other => self.inner.nonces_for(other),
         }
     }
@@ -202,6 +260,9 @@ impl ExecCodec for Recording {
         self.opens.lock().unwrap().push((stream, ctx.clone()));
         self.inner.on_open(stream, ctx, fx);
         self.inner.resync(ctx, fx);
+        if let Some(after) = self.keepalive {
+            fx.push(Effect::Timer { tag: PING, after });
+        }
         if self.bye {
             let reason = "bye";
             fx.push(Effect::Reconnect { stream, reason });
@@ -295,6 +356,42 @@ impl ExecCodec for Recording {
                 unsupported(fx);
                 Ok(())
             }
+            RawFrame::Text(text) if text.starts_with("arm|") => {
+                let tag = TimerTag(tag_of(text));
+                let after = ms(field(text, "ms").parse().unwrap());
+                fx.push(Effect::Timer { tag, after });
+                Ok(())
+            }
+            RawFrame::Text(text) if text.starts_with("ask|") => {
+                let tag = HttpTag(tag_of(text));
+                let base = self.http.as_deref().unwrap();
+                self.asked.insert(tag);
+                fx.push(Effect::Http {
+                    tag,
+                    req: HttpRequest {
+                        method: HttpMethod::Get,
+                        url: WireUrl::plain(format!("{base}{}", field(text, "path"))),
+                        headers: Vec::new(),
+                        body: WireSlice::plain(Vec::new()),
+                    },
+                    rpc: None,
+                    timeout: Duration::from_secs(5),
+                    class: TrafficClass::Normal,
+                    charge: RateCharge::one(OpKind::Query, None),
+                });
+                Ok(())
+            }
+            RawFrame::Text(text) if text.starts_with("big|") => {
+                let kb: usize = field(text, "kb").parse().unwrap();
+                fx.push(Effect::Send {
+                    stream,
+                    frame: WireSlice::plain(vec![b'x'; kb * 1024]),
+                    rpc: None,
+                    class: TrafficClass::Normal,
+                    charge: RateCharge::one(OpKind::Control, None),
+                });
+                Ok(())
+            }
             _ => self.inner.on_frame(stream, f, scope, specs, sink, fx),
         }
     }
@@ -308,11 +405,43 @@ impl ExecCodec for Recording {
         sink: &mut dyn ExecSink,
         fx: &mut Effects,
     ) -> Result<(), DecodeError> {
-        self.inner.on_http(tag, resp, scope, specs, sink, fx)
+        if !self.asked.remove(&tag) {
+            return self.inner.on_http(tag, resp, scope, specs, sink, fx);
+        }
+        let answer = match resp {
+            Ok(r) => format!("{}:{}:{}", tag.0, r.status, String::from_utf8_lossy(r.body)),
+            Err(failure) => format!("{}:{failure:?}", tag.0),
+        };
+        self.answers.lock().unwrap().push(answer);
+        let halted = mode(ModeScope::Account, VenueMode::Halted);
+        sink.push(fbc_core::VenueMeta::NONE, halted);
+        fx.push(Effect::Send {
+            stream: EXEC_STREAM,
+            frame: WireSlice::plain(format!("got|tag={}", tag.0).into_bytes()),
+            rpc: None,
+            class: TrafficClass::Normal,
+            charge: RateCharge::one(OpKind::Control, None),
+        });
+        Ok(())
     }
 
     fn on_timer(&mut self, tag: TimerTag, ctx: &EncodeCtx, fx: &mut Effects) {
+        self.timers.lock().unwrap().push((tag, ctx.clone()));
         self.inner.on_timer(tag, ctx, fx);
+        let (text, class) = match tag {
+            PING => ("ping".to_owned(), TrafficClass::Safety),
+            TimerTag(n) => (format!("rang|tag={n}"), TrafficClass::Normal),
+        };
+        fx.push(Effect::Send {
+            stream: EXEC_STREAM,
+            frame: WireSlice::plain(text.into_bytes()),
+            rpc: None,
+            class,
+            charge: RateCharge::one(OpKind::Control, None),
+        });
+        if let (PING, Some(after)) = (tag, self.keepalive) {
+            fx.push(Effect::Timer { tag: PING, after });
+        }
     }
 
     fn on_rpc_timeout(&mut self, rpc: RpcId, sink: &mut dyn ExecSink) {
@@ -328,17 +457,18 @@ impl ExecCodec for Recording {
     }
 }
 
-/// Nonces counted up from 0, each reservation logged; a short source reserves one fewer than
-/// asked.
+/// Nonces counted up from 0, each reservation logged; from its `short_from`th reservation on
+/// (0 for every one), the source reserves one fewer than asked.
 struct Counting {
     next: u64,
-    short: bool,
+    short_from: usize,
     log: Arc<Mutex<Vec<Vec<u64>>>>,
 }
 
 impl NonceSource for Counting {
     fn reserve(&mut self, len: u16) -> NonceBlock {
-        let len = len - u16::from(self.short);
+        let short = self.log.lock().unwrap().len() >= self.short_from;
+        let len = len - u16::from(short);
         let block = NonceBlock::consecutive(self.next, len).unwrap();
         self.next += u64::from(len);
         self.log.lock().unwrap().push(block.as_slice().to_vec());
@@ -382,7 +512,7 @@ fn setup(
     cfg.insert(URL, url);
     let nonces = Counting {
         next: 0,
-        short: false,
+        short_from: usize::MAX,
         log: Arc::clone(&log),
     };
     let config = ExecSessionConfig {
@@ -398,6 +528,7 @@ fn setup(
         conn: CONN,
         limiter: limiter(),
         write_stall: WriteStall::new(Duration::from_secs(3_600)).unwrap(),
+        http_max_body: 4096,
     };
     (config, log)
 }
@@ -680,21 +811,328 @@ async fn a_refusing_server_sees_attempts_spaced_by_the_backoff_and_within_the_bu
 }
 
 // ---------------------------------------------------------------------------------------------
+// FBC-bnl's done line: HTTP requests, timers and the keepalive, each only to the epoch that
+// asked (decision 0056).
+// ---------------------------------------------------------------------------------------------
+
+/// Stops tokio's paused clock from jumping while socket I/O is under way: it moves only by
+/// `advance`, until the returned sender drops.
+fn freeze() -> std::sync::mpsc::Sender<()> {
+    let (thaw, frozen) = std::sync::mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || frozen.recv());
+    thaw
+}
+
+/// Lets every task run a while without moving the clock.
+async fn churn() {
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Lets the session run, without moving the clock, until `done`.
+async fn settle(done: impl Fn() -> bool) {
+    for _ in 0..100_000 {
+        if done() {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("not settled");
+}
+
+/// The epochs the handler heard events of, and its ends, in order.
+fn heard_conns(log: &Log) -> Vec<(bool, ConnKey)> {
+    let log = log.borrow();
+    let conn = |heard: &Heard| match heard {
+        Heard::Event(_, env) => (true, env.stamp.conn),
+        Heard::End(key) => (false, *key),
+    };
+    log.iter().map(conn).collect()
+}
+
+#[tokio::test]
+async fn an_http_result_is_answered_only_to_the_epoch_that_asked() {
+    let (mut server, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
+    let venue = ExecToy::leak();
+    let (mut config, _) = setup(venue, &server.url(), quick());
+    config.cfg.insert(HTTP, &http.url(""));
+    let log = Log::default();
+    let (mut session, control) = ExecSession::new(config, Keep::new(&log)).unwrap();
+    let script = async move {
+        let mut first = server.accept().await;
+        let _ = (first.recv().await, first.recv().await);
+        first.send("ask|tag=1|path=/now");
+        let now = http.request().await;
+        assert_eq!(now.line, "GET /now");
+        now.answer("HTTP/1.1 200 OK", "first").await;
+        // What on_http asks for is executed on the socket.
+        assert_eq!(first.recv().await, "got|tag=1");
+        // A request whose epoch ends before its answer comes back.
+        first.send("ask|tag=2|path=/late");
+        let late = http.request().await;
+        first.drop_conn();
+        let mut second = server.accept().await;
+        let _ = (second.recv().await, second.recv().await);
+        // Answered once the session has read it whole, into the new epoch.
+        late.answer("HTTP/1.1 200 OK", "late").await;
+        // The new epoch's own request reaches the codec, and what it pushes is stamped under
+        // that epoch.
+        second.send("ask|tag=3|path=/fresh");
+        let fresh = http.request().await;
+        assert_eq!(fresh.line, "GET /fresh");
+        fresh.answer("HTTP/1.1 201 Created", "fresh").await;
+        assert_eq!(second.recv().await, "got|tag=3");
+        drop(control);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    // The old epoch's result (tag 2) reached no codec, though the codec lives across epochs.
+    assert_eq!(venue.answers(), ["1:200:first", "3:201:fresh"]);
+    assert_eq!(session.stale(Input::Http), 1);
+    assert_eq!(
+        heard_conns(&log),
+        [
+            (true, key(0)),
+            (false, key(0)),
+            (true, key(1)),
+            (false, key(1))
+        ]
+    );
+    assert_eq!(session.counters().decode_errors, 0);
+}
+
+#[tokio::test]
+async fn a_timer_of_an_ended_epoch_is_dropped_and_counted_and_on_timer_gets_exactly_its_nonces() {
+    let mut server = ScriptedWs::start().await;
+    let venue = ExecToy::leak();
+    let (config, reserved) = setup(venue, &server.url(), quick());
+    let (mut session, control) = ExecSession::new(config, |_| {}).unwrap();
+    let script = async move {
+        let mut first = server.accept().await;
+        let _ = (first.recv().await, first.recv().await);
+        // Due in 300 ms, but its epoch ends first.
+        first.send("arm|tag=5|ms=300");
+        first.send("bye");
+        assert_eq!(first.next().await, None);
+        let mut second = server.accept().await;
+        let _ = (second.recv().await, second.recv().await);
+        // Past the old timer's time: it was armed before this epoch opened. The heap fires it
+        // before any timer armed from now on, so it has come back into nothing once the next
+        // one rings.
+        tokio::time::sleep(ms(400)).await;
+        second.send("arm|tag=7|ms=0");
+        assert_eq!(second.recv().await, "rang|tag=7");
+        second.send("arm|tag=8|ms=0");
+        assert_eq!(second.recv().await, "rang|tag=8");
+        drop(control);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    assert_eq!(session.stale(Input::Timer), 1);
+    let timers = venue.timers();
+    let tags: Vec<_> = timers.iter().map(|(tag, _)| *tag).collect();
+    assert_eq!(tags, [TimerTag(7), TimerTag(8)]);
+    // on_timer asked for one nonce, then two: each call got exactly those, reserved from the
+    // consumer's source after the two epochs' on_open reservations, and nothing else.
+    let blocks: Vec<_> = timers.iter().map(|(_, c)| c.nonces.as_slice()).collect();
+    assert_eq!(blocks, [&[5][..], &[6, 7][..]]);
+    let all = [vec![0, 1], vec![2, 3, 4], vec![5], vec![6, 7]];
+    assert_eq!(*reserved.lock().unwrap(), all);
+    // Each context carries the shard clock's time of its firing, after its epoch opened.
+    let opened = venue.opens()[1].1.mono;
+    assert!(opened <= timers[0].1.mono && timers[0].1.mono <= timers[1].1.mono);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_codecs_keepalive_goes_out_at_its_declared_interval_with_the_nonces_it_asks_for() {
+    let frozen = freeze();
+    let mut server = ScriptedWs::start().await;
+    let venue = ExecToy::leak();
+    let (mut config, reserved) = setup(venue, &server.url(), quick());
+    config.cfg.insert(KEEPALIVE, "1000");
+    let (mut session, control) = ExecSession::new(config, |_| {}).unwrap();
+    let script = async move {
+        let mut peer = server.accept().await;
+        assert!(peer.recv().await.starts_with("auth|ts="));
+        let (opened, resync) = peer.next_at().await.unwrap();
+        assert!(resync.starts_with("resync|ts="), "{resync}");
+        let mut at = Vec::new();
+        for _ in 0..3 {
+            // Not a moment before the interval.
+            advance(ms(999)).await;
+            churn().await;
+            assert!(peer.quiet());
+            advance(ms(1)).await;
+            let (when, what) = peer.next_at().await.unwrap();
+            assert_eq!(what, "ping");
+            at.push(when.duration_since(opened));
+        }
+        drop(control);
+        at
+    };
+    let (run, at) = tokio::join!(session.run(), script);
+    run.unwrap();
+    drop(frozen);
+    assert_eq!(at, [1_000, 2_000, 3_000].map(ms));
+    let timers = venue.timers();
+    assert!(timers.iter().all(|(tag, _)| *tag == PING));
+    let blocks: Vec<_> = timers
+        .iter()
+        .map(|(_, c)| c.nonces.as_slice().to_vec())
+        .collect();
+    assert_eq!(blocks, [vec![2], vec![3, 4], vec![5, 6, 7]]);
+    let all = [vec![0, 1], vec![2], vec![3, 4], vec![5, 6, 7]];
+    assert_eq!(*reserved.lock().unwrap(), all);
+    // Each firing's context carries the time it was due at, on the shard clock.
+    let opened = venue.opens()[0].1.mono.0;
+    let due: Vec<_> = timers.iter().map(|(_, c)| c.mono.0 - opened).collect();
+    assert_eq!(due, [1_000_000_000, 2_000_000_000, 3_000_000_000]);
+}
+
+#[tokio::test]
+async fn a_nonce_source_that_reserves_another_count_for_a_timer_ends_the_session_before_on_timer() {
+    let mut server = ScriptedWs::start().await;
+    let venue = ExecToy::leak();
+    let (mut config, _) = setup(venue, &server.url(), quick());
+    config.nonces = Box::new(Counting {
+        next: 0,
+        short_from: 1,
+        log: Arc::default(),
+    });
+    let log = Log::default();
+    let (mut session, _control) = ExecSession::new(config, Keep::new(&log)).unwrap();
+    let script = async move {
+        let mut peer = server.accept().await;
+        let _ = (peer.recv().await, peer.recv().await);
+        peer.send("arm|tag=5|ms=0");
+        // The timer reached no codec, so it sent nothing, and the connection closed.
+        assert_eq!(peer.next().await, None);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    let short = ExecSessionError::Nonces {
+        asked: 1,
+        reserved: 0,
+    };
+    assert_eq!(run.err(), Some(short));
+    assert!(venue.timers().is_empty());
+    assert_eq!(heard_conns(&log), [(false, key(0))]);
+    assert_eq!(session.current(), key(1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_timer_due_during_a_stalled_write_fires_into_on_timer_and_the_window_ends_the_epoch() {
+    let frozen = freeze();
+    let mut server = ScriptedWs::start().await;
+    let venue = ExecToy::leak();
+    // A 1 s floor and no attempt deadline: neither is the bound under test.
+    let pacing = ReconnectPacing::new(ms(1_000), ms(8_000), 100, ms(60_000), Duration::MAX);
+    let (mut config, _) = setup(venue, &server.url(), pacing.unwrap());
+    config.write_stall = WriteStall::new(ms(3_000)).unwrap();
+    let (mut session, control) = ExecSession::new(config, |_| {}).unwrap();
+    let script = async move {
+        let mut peer = server.accept().await;
+        let _ = (peer.recv().await, peer.recv().await);
+        // A timer due in 500 ms, then a 64 MiB frame the peer never reads: far more than the
+        // loopback socket buffers hold, so the write waits on the peer.
+        peer.send("arm|tag=5|ms=500");
+        peer.send("big|kb=65536");
+        let release = peer.hold();
+        churn().await;
+        // The timer fires into the codec while the write still waits, at its own time.
+        advance(ms(499)).await;
+        churn().await;
+        assert!(venue.timers().is_empty());
+        advance(ms(1)).await;
+        settle(|| venue.timers().len() == 1).await;
+        // The write is abandoned at the window, 3 s after it began, and the epoch ends as a
+        // drop: the next attempt waits the pacing's 1 s floor, so it starts 4 s in.
+        for step in [2_499, 1, 999] {
+            advance(ms(step)).await;
+            churn().await;
+            assert!(server.try_accept().is_none());
+        }
+        advance(ms(1)).await;
+        let mut next = None;
+        for _ in 0..100_000 {
+            next = server.try_accept();
+            if next.is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(next.is_some());
+        drop((control, release));
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    drop(frozen);
+    assert_eq!(session.counters().write_stalls, 1);
+    assert_eq!(venue.timers()[0].0, TimerTag(5));
+    assert_eq!(session.current(), key(1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_timers_nonces_mis_reserved_while_a_write_waits_end_the_session_as_the_write_ends() {
+    let frozen = freeze();
+    let mut server = ScriptedWs::start().await;
+    let venue = ExecToy::leak();
+    let pacing = ReconnectPacing::new(ms(1_000), ms(8_000), 100, ms(60_000), Duration::MAX);
+    let (mut config, _) = setup(venue, &server.url(), pacing.unwrap());
+    config.write_stall = WriteStall::new(ms(3_000)).unwrap();
+    config.nonces = Box::new(Counting {
+        next: 0,
+        short_from: 1,
+        log: Arc::default(),
+    });
+    let (mut session, _control) = ExecSession::new(config, |_| {}).unwrap();
+    let script = async move {
+        let mut peer = server.accept().await;
+        let _ = (peer.recv().await, peer.recv().await);
+        // Two timers due while a 64 MiB frame the peer never reads waits to be written.
+        peer.send("arm|tag=5|ms=500");
+        peer.send("arm|tag=6|ms=600");
+        peer.send("big|kb=65536");
+        let release = peer.hold();
+        churn().await;
+        // The first firing's nonces are mis-reserved, so neither reaches the codec; the session
+        // ends once the write it waits on is abandoned at the window.
+        for step in [500, 100, 2_400] {
+            advance(ms(step)).await;
+            churn().await;
+        }
+        release
+    };
+    let (run, release) = tokio::join!(session.run(), script);
+    drop((frozen, release));
+    let short = ExecSessionError::Nonces {
+        asked: 1,
+        reserved: 0,
+    };
+    assert_eq!(run.err(), Some(short));
+    assert!(venue.timers().is_empty());
+    assert_eq!(session.counters().write_stalls, 1);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Effects, the proxy, and what a session refuses.
 // ---------------------------------------------------------------------------------------------
 
 #[tokio::test]
 async fn stray_effects_are_refused_and_a_reconnect_the_codec_asks_for_opens_the_next_epoch() {
     let mut server = ScriptedWs::start().await;
-    let (config, _) = setup(ExecToy::leak(), &server.url(), quick());
+    let venue = ExecToy::leak();
+    let (config, _) = setup(venue, &server.url(), quick());
     let log = Log::default();
     let (mut session, control) = ExecSession::new(config, Keep::new(&log)).unwrap();
     let script = async move {
         let mut first = server.accept().await;
         let _ = (first.recv().await, first.recv().await);
         first.send("stray");
-        // Only the frame for the session's own stream went out.
+        // Of the frames, only the one for the session's own stream went out; then the timer
+        // fired (FBC-bnl).
         assert_eq!(first.recv().await, "said");
+        assert_eq!(first.recv().await, "rang|tag=1");
         first.send("bye");
         assert_eq!(first.next().await, None);
         let mut second = server.accept().await;
@@ -703,10 +1141,15 @@ async fn stray_effects_are_refused_and_a_reconnect_the_codec_asks_for_opens_the_
     };
     let (run, ()) = tokio::join!(session.run(), script);
     run.unwrap();
-    // A timer, an HTTP request, and a frame and a reconnect for another stream; not the timer
-    // and request behind the reconnect, which ended the epoch before their turn (Codex
-    // r4188639448).
-    assert_eq!(session.counters().refused_effects, 4);
+    // A frame and a reconnect for another stream. The timer fired into the codec and the
+    // request's failure reached it, which the toy cannot decode (FBC-bnl); the timer and the
+    // request behind the reconnect were never reached, since it ended the epoch before their
+    // turn (Codex r4188639448).
+    let counters = session.counters();
+    assert_eq!((counters.refused_effects, counters.decode_errors), (2, 1));
+    let rang: Vec<_> = venue.timers().iter().map(|(tag, _)| *tag).collect();
+    assert_eq!(rang, [TimerTag(1)]);
+    assert_eq!(session.stale(Input::Timer) + session.stale(Input::Http), 0);
     assert_eq!(session.current(), key(1));
     let ends: Vec<_> = log
         .borrow()
@@ -760,7 +1203,7 @@ async fn a_nonce_source_that_reserves_another_count_ends_the_session_which_runs_
     let log = Arc::default();
     config.nonces = Box::new(Counting {
         next: 0,
-        short: true,
+        short_from: 0,
         log,
     });
     let heard = Log::default();
@@ -1131,8 +1574,8 @@ fn the_exec_toy_is_the_conformance_toys_order_entry_and_nothing_else() {
     codec.resync(&ctx, &mut fx);
     let frame = Inbound::Frame(RawFrame::Text("x"));
     assert_eq!(codec.redact_inbound(frame), InboundSpans::NONE);
-    // The fee query, then the resync.
-    assert_eq!(fx.take().len(), 2);
+    // The fee query, the timer's frame, then the resync.
+    assert_eq!(fx.take().len(), 3);
     assert_eq!(pushed.len(), 1);
 }
 
