@@ -89,8 +89,9 @@
 //! only by [`Registry::place`], a batch only by [`Registry::place_batch`] (each item judged
 //! with the earlier ones admitted counted PendingNew) and an amend or replace only by
 //! [`Live::amend`], each refused, never built, when it would breach either cap or its market
-//! has none, reducing and reduce-only ones included: the formulas admit an order that
-//! genuinely reduces the position by themselves. Cancels are never capped (`tests/caps.rs`).
+//! has none, reducing and reduce-only ones included: I6 admits an order that genuinely
+//! reduces the position by its formula; the resting cap bounds it like any other. Cancels are
+//! never capped (`tests/caps.rs`).
 //!
 //! Not here yet: the market states (FBC-c4v), and issuing an authorization after them and its
 //! check at submit (FBC-afd).
