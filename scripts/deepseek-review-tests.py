@@ -221,20 +221,21 @@ class ReviewTest(unittest.TestCase):
         self.assertEqual(self.rc, 0, self.out + self.err)
         body = self.one_comment()
         self.assertIn("head=%s status=complete findings=2" % head, body)
-        self.assertIn("Reviewed head `%s` against base `%s` with model `deepseek-v4-pro`" %
+        self.assertIn("Reviewed head `%s` against base `%s` with model `deepseek-flash`" %
                       (head, self.base), body)
         self.assertIn("- **DS-1** P1 `crates/a/src/lib.rs:2`: returns 2, cap breached\n"
                       "  - Fix: return 1", body)
         self.assertIn("- **DS-2** P3 `crates/b/src/lib.rs:1`: minor thing", body)
         self.assertIn("(P1: 1, P2: 0, P3: 1)", body)
         self.assertIn("complete, 2 findings", self.out)
-        # The request: one call, the key only in the header, JSON mode, the default model.
+        # The request: one call, the key only in the header, JSON mode, the default model
+        # (DEEPSEEK_MODEL is not set here).
         self.assertEqual(len(self.chat.requests), 1)
         request = self.chat.requests[0]
         self.assertEqual(request["path"], "/chat/completions")
         self.assertEqual(request["headers"]["Authorization"], "Bearer " + KEY)
         self.assertNotIn(KEY, json.dumps(request["body"]))
-        self.assertEqual(request["body"]["model"], "deepseek-v4-pro")
+        self.assertEqual(request["body"]["model"], "deepseek-flash")
         self.assertEqual(request["body"]["response_format"], {"type": "json_object"})
         self.assertEqual(request["body"]["max_tokens"], 65536)
         system, user = [m["content"] for m in request["body"]["messages"]]
@@ -297,12 +298,21 @@ class ReviewTest(unittest.TestCase):
 
     def test_model_variable_and_empty_variable(self):
         head = self.change()
-        self.run_review(head, DEEPSEEK_MODEL="deepseek-flash")
-        self.assertEqual(self.chat.requests[-1]["body"]["model"], "deepseek-flash")
-        self.assertIn("with model `deepseek-flash`", self.one_comment())
+        self.run_review(head, DEEPSEEK_MODEL="deepseek-v4-pro")
+        self.assertEqual(self.chat.requests[-1]["body"]["model"], "deepseek-v4-pro")
+        self.assertIn("with model `deepseek-v4-pro`", self.one_comment())
         self.github.requests.clear()
         self.run_review(head, DEEPSEEK_MODEL="")  # an unset repository variable expands to ""
-        self.assertEqual(self.chat.requests[-1]["body"]["model"], "deepseek-v4-pro")
+        self.assertEqual(self.chat.requests[-1]["body"]["model"], "deepseek-flash")
+        self.assertIn("with model `deepseek-flash`", self.one_comment())
+
+    def test_default_model_is_deepseek_flash_when_the_variable_is_unset(self):
+        # The owner's choice of 2026-10-06 (FBC-qo3h): DeepSeek-V4.1-Flash is the default.
+        head = self.change()
+        self.run_review(head)  # DEEPSEEK_MODEL absent from the environment altogether
+        self.assertEqual(self.rc, 0, self.out + self.err)
+        self.assertEqual(self.chat.requests[-1]["body"]["model"], "deepseek-flash")
+        self.assertIn("with model `deepseek-flash`", self.one_comment())
 
     def test_a_fenced_answer_is_accepted(self):
         head = self.change()

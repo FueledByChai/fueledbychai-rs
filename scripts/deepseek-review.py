@@ -34,11 +34,13 @@ the same name (unset: the default here); the wall-clock bounds stay at their def
 test holds inside the job's timeout-minutes (Reviewer B, B11 on PR #82).
   DEEPSEEK_API_KEY       the key (repository secret); missing or empty -> incomplete review
   DEEPSEEK_API_BASE      endpoint base URL, default https://api.deepseek.com
-  DEEPSEEK_MODEL         model name (repository variable), default deepseek-v4-pro
+  DEEPSEEK_MODEL         model name (repository variable), default deepseek-flash
+                         (DeepSeek-V4.1-Flash); deepseek-v4-pro is the other served model
   DEEPSEEK_TOKEN_BUDGET  estimated prompt tokens per request (chars / 3), default 120000
   DEEPSEEK_MAX_CHUNKS    requests per review at most, default 4; files beyond are not reviewed
   DEEPSEEK_MAX_OUTPUT_TOKENS  max_tokens of each answer, reasoning included, default 65536
-                         (DeepSeek documents a maximum output of 384K for deepseek-v4-pro)
+                         (DeepSeek documents a maximum output of 384K for deepseek-flash
+                         and deepseek-v4-pro)
   DEEPSEEK_SPLIT_DEPTH   times a cut-off answer's part may be split again, 0 to 4, default 2;
                          split pieces do not count against DEEPSEEK_MAX_CHUNKS; a review sends
                          at most DEEPSEEK_MAX_CHUNKS x (2^(depth + 1) - 1) requests (28 at the
@@ -74,11 +76,14 @@ import urllib.error
 import urllib.request
 
 DEFAULT_API_BASE = "https://api.deepseek.com"
-# DeepSeek's most capable model on its OpenAI-compatible API (api-docs.deepseek.com, change log
-# 2026-09-10: deepseek-chat and deepseek-reasoner are retired; deepseek-v4-pro and deepseek-flash
-# are served). It thinks by default; its max_tokens counts the reasoning, so the default output
-# allowance below matches the API's own thinking-mode default rather than the 8K non-thinking one.
-DEFAULT_MODEL = "deepseek-v4-pro"
+# DeepSeek-V4.1-Flash, the owner's choice of default (2026-10-06, FBC-qo3h): DeepSeek's cheaper
+# model on its OpenAI-compatible API, about 4.4x cheaper than deepseek-v4-pro with the same 1M
+# context and 384K maximum output (api-docs.deepseek.com; change log 2026-09-10: deepseek-chat
+# and deepseek-reasoner are retired, deepseek-flash and deepseek-v4-pro are served).
+# deepseek-v4-pro stays selectable through DEEPSEEK_MODEL. A thinking model's max_tokens counts
+# the reasoning, so the default output allowance below matches the API's own thinking-mode
+# default rather than the 8K non-thinking one; it is well inside either model's 384K maximum.
+DEFAULT_MODEL = "deepseek-flash"
 DEFAULT_GITHUB_API = "https://api.github.com"
 CHARS_PER_TOKEN = 3  # conservative for code: overestimating tokens keeps a request in context
 HEADING = "## DeepSeek review"
