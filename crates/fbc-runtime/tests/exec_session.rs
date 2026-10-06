@@ -83,12 +83,17 @@ type Timers = Arc<Mutex<Vec<(TimerTag, EncodeCtx)>>>;
 /// Every HTTP result the recorded codec was handed for a request it asked for:
 /// `<tag>:<status>:<body>`, or `<tag>:<failure>`.
 type Answers = Arc<Mutex<Vec<String>>>;
+/// The recorded codec's inputs of the test's own, in the order it took them: `noise` for each
+/// `noise` frame, `timer <n>` for each firing of timer `n` and `http <n>` for the result of
+/// each request `n` it asked for.
+type Inputs = Arc<Mutex<Vec<String>>>;
 
 #[derive(Default)]
 struct ExecToy {
     opens: Opens,
     timers: Timers,
     answers: Answers,
+    inputs: Inputs,
 }
 
 impl ExecToy {
@@ -106,6 +111,16 @@ impl ExecToy {
 
     fn answers(&self) -> Vec<String> {
         self.answers.lock().unwrap().clone()
+    }
+
+    fn inputs(&self) -> Vec<String> {
+        self.inputs.lock().unwrap().clone()
+    }
+
+    /// How many `noise` frames the codec has decoded.
+    fn noise(&self) -> usize {
+        let inputs = self.inputs.lock().unwrap();
+        inputs.iter().filter(|input| *input == "noise").count()
     }
 }
 
@@ -191,6 +206,7 @@ impl VenueFactory for ExecToy {
                 opens: self.opens.clone(),
                 timers: self.timers.clone(),
                 answers: self.answers.clone(),
+                inputs: self.inputs.clone(),
                 asked: BTreeSet::new(),
                 http: cfg.get(HTTP).map(str::to_owned),
                 keepalive: cfg.get(KEEPALIVE).map(|n| ms(n.parse().unwrap())),
@@ -219,14 +235,17 @@ impl VenueFactory for ExecToy {
 /// a timer and an HTTP request, which the reconnect leaves unreached; `halt` pushes a
 /// `ResyncBegin` and asks to send `said`; `arm|tag=<n>|ms=<t>` sets timer `n` to fire in `t`
 /// ms; `ask|tag=<n>|path=<p>` asks for a GET of `p` under the configured base URL, whose result
-/// it records, pushes as an account `Halted` mode and acknowledges with `got|tag=<n>`;
-/// `big|kb=<n>` asks to send an `n` KiB frame, then, with `|then=said`, to send `said`, or with
-/// `|then=bye`, to reconnect its stream.
+/// it records, pushes as an account `Halted` mode and acknowledges with `got|tag=<n>`, unless
+/// its body is `stop|ask|tag=<m>|path=<q>`: then it pushes a `ResyncBegin` instead and asks for
+/// request `m` too; `big|kb=<n>` asks to send an `n` KiB frame, then, with `|then=said`, to
+/// send `said`, or with `|then=bye`, to reconnect its stream; `noise...` asks for nothing.
+/// `stray`'s request goes to the configured base URL when there is one.
 struct Recording {
     inner: ToyExec,
     opens: Opens,
     timers: Timers,
     answers: Answers,
+    inputs: Inputs,
     /// The tags of the requests `ask` asked for; any other result goes to the toy's codec.
     asked: BTreeSet<HttpTag>,
     http: Option<String>,
@@ -246,6 +265,28 @@ fn field<'a>(text: &'a str, name: &str) -> &'a str {
 
 fn tag_of(text: &str) -> u64 {
     field(text, "tag").parse().unwrap()
+}
+
+impl Recording {
+    /// A GET of `path` under the configured base URL, tagged `tag`, whose result is recorded.
+    fn get(&mut self, tag: HttpTag, path: &str) -> Effect {
+        let base = self.http.as_deref().unwrap();
+        let url = WireUrl::plain(format!("{base}{path}"));
+        self.asked.insert(tag);
+        Effect::Http {
+            tag,
+            req: HttpRequest {
+                method: HttpMethod::Get,
+                url,
+                headers: Vec::new(),
+                body: WireSlice::plain(Vec::new()),
+            },
+            rpc: None,
+            timeout: Duration::from_secs(5),
+            class: TrafficClass::Normal,
+            charge: RateCharge::one(OpKind::Query, None),
+        }
+    }
 }
 
 impl ExecCodec for Recording {
@@ -311,7 +352,11 @@ impl ExecCodec for Recording {
             class: TrafficClass::Normal,
             charge: RateCharge::one(OpKind::Control, None),
         };
-        // A timer and an HTTP request, which the session refuses.
+        // A timer and an HTTP request, which the session executes (FBC-bnl). The request goes
+        // to the configured base URL when there is one, so its result is the test's own
+        // (Reviewer B, B7); `bye`'s is never reached.
+        let base = self.http.as_deref().unwrap_or("http://127.0.0.1:1");
+        let stray_url = format!("{base}/stray");
         let unsupported = |fx: &mut Effects| {
             fx.push(Effect::Timer {
                 tag: TimerTag(1),
@@ -321,7 +366,7 @@ impl ExecCodec for Recording {
                 tag: HttpTag(1),
                 req: HttpRequest {
                     method: HttpMethod::Get,
-                    url: WireUrl::plain("http://127.0.0.1:1/"),
+                    url: WireUrl::plain(stray_url.clone()),
                     headers: Vec::new(),
                     body: WireSlice::plain(Vec::new()),
                 },
@@ -364,22 +409,12 @@ impl ExecCodec for Recording {
                 Ok(())
             }
             RawFrame::Text(text) if text.starts_with("ask|") => {
-                let tag = HttpTag(tag_of(text));
-                let base = self.http.as_deref().unwrap();
-                self.asked.insert(tag);
-                fx.push(Effect::Http {
-                    tag,
-                    req: HttpRequest {
-                        method: HttpMethod::Get,
-                        url: WireUrl::plain(format!("{base}{}", field(text, "path"))),
-                        headers: Vec::new(),
-                        body: WireSlice::plain(Vec::new()),
-                    },
-                    rpc: None,
-                    timeout: Duration::from_secs(5),
-                    class: TrafficClass::Normal,
-                    charge: RateCharge::one(OpKind::Query, None),
-                });
+                let ask = self.get(HttpTag(tag_of(text)), field(text, "path"));
+                fx.push(ask);
+                Ok(())
+            }
+            RawFrame::Text(text) if text.starts_with("noise") => {
+                self.inputs.lock().unwrap().push("noise".to_owned());
                 Ok(())
             }
             RawFrame::Text(text) if text.starts_with("big|") => {
@@ -418,13 +453,27 @@ impl ExecCodec for Recording {
         if !self.asked.remove(&tag) {
             return self.inner.on_http(tag, resp, scope, specs, sink, fx);
         }
+        self.inputs.lock().unwrap().push(format!("http {}", tag.0));
+        let body = resp
+            .as_ref()
+            .ok()
+            .map(|r| String::from_utf8_lossy(r.body).into_owned());
         let answer = match resp {
             Ok(r) => format!("{}:{}:{}", tag.0, r.status, String::from_utf8_lossy(r.body)),
             Err(failure) => format!("{}:{failure:?}", tag.0),
         };
         self.answers.lock().unwrap().push(answer);
-        let halted = mode(ModeScope::Account, VenueMode::Halted);
-        sink.push(fbc_core::VenueMeta::NONE, halted);
+        if let Some(then) = body.as_deref().and_then(|b| b.strip_prefix("stop|")) {
+            let begin = ExecEvent::ResyncBegin {
+                watermark: WallNs(0),
+            };
+            sink.push(fbc_core::VenueMeta::NONE, begin);
+            let ask = self.get(HttpTag(tag_of(then)), field(then, "path"));
+            fx.push(ask);
+        } else {
+            let halted = mode(ModeScope::Account, VenueMode::Halted);
+            sink.push(fbc_core::VenueMeta::NONE, halted);
+        }
         fx.push(Effect::Send {
             stream: EXEC_STREAM,
             frame: WireSlice::plain(format!("got|tag={}", tag.0).into_bytes()),
@@ -437,6 +486,7 @@ impl ExecCodec for Recording {
 
     fn on_timer(&mut self, tag: TimerTag, ctx: &EncodeCtx, fx: &mut Effects) {
         self.timers.lock().unwrap().push((tag, ctx.clone()));
+        self.inputs.lock().unwrap().push(format!("timer {}", tag.0));
         self.inner.on_timer(tag, ctx, fx);
         let (text, class) = match tag {
             PING => ("ping".to_owned(), TrafficClass::Safety),
@@ -1224,15 +1274,169 @@ async fn a_reconnect_behind_a_waiting_write_ends_the_epoch_before_a_timers_frame
     assert_eq!(heard, [Some(BIG), None]);
 }
 
+/// A request an HTTP result asks for while a write waits, after the handler stopped the session
+/// on that result's event, is never started, so it is neither charged nor journaled after the
+/// stop (Reviewer B, B6).
+#[tokio::test(start_paused = true)]
+async fn a_request_asked_for_while_a_write_waits_after_the_stop_is_never_started_or_charged() {
+    let frozen = freeze();
+    let (mut server, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
+    let venue = ExecToy::leak();
+    let pacing = ReconnectPacing::new(ms(1_000), ms(8_000), 100, ms(60_000), Duration::MAX);
+    let (mut config, _) = setup(venue, &server.url(), pacing.unwrap());
+    config.cfg.insert(HTTP, &http.url(""));
+    config.write_stall = WriteStall::new(ms(3_000)).unwrap();
+    let limiter = config.limiter.clone();
+    // The units charged to the toy's one limit, the account's; the clock never moves.
+    let account = || limiter.used(Instant::now(), 0, BucketKey::Shared);
+    let log = Log::default();
+    let handler = Keep::new(&log);
+    let slot = Rc::clone(&handler.control);
+    let (mut session, control) = ExecSession::new(config, handler).unwrap();
+    *slot.borrow_mut() = Some(control);
+    let script = async move {
+        let mut peer = server.accept().await;
+        let _ = (peer.recv().await, peer.recv().await);
+        peer.send("ask|tag=7|path=/x");
+        peer.send("big|kb=65536|then=said");
+        let release = peer.hold();
+        churn().await;
+        let asked = http.request().await;
+        let before = account();
+        // Its event stops the session; then the codec asks for request 8.
+        asked
+            .answer("HTTP/1.1 200 OK", "stop|ask|tag=8|path=/y")
+            .await;
+        settle(|| venue.answers().len() == 1).await;
+        drop(release);
+        before
+    };
+    let (run, before) = tokio::join!(session.run(), script);
+    run.unwrap();
+    drop(frozen);
+    assert_eq!(venue.answers(), ["7:200:stop|ask|tag=8|path=/y"]);
+    // Since the result came back, only the stop's close frame was charged: not request 8.
+    assert_eq!(account(), before + 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Frames that keep arriving starve nothing (DeepSeek DS-1): the wake `select!` is unbiased, so
+// each turn it polls its branches from a random one, and the control's drop is checked after
+// every wake, whichever branch woke it.
+// ---------------------------------------------------------------------------------------------
+
+/// How many frames a flood holds.
+const FLOOD: usize = 2_000;
+
+/// `FLOOD` frames of noise, each `pad` bytes long past its `noise` prefix.
+fn flood(pad: usize) -> impl Iterator<Item = String> {
+    let frame = format!("noise{}", "x".repeat(pad));
+    std::iter::repeat_n(frame, FLOOD)
+}
+
+/// How many `noise` frames the codec decoded before and after it took `what`, which it must
+/// have taken.
+fn noise_around(inputs: &[String], what: &str) -> (usize, usize) {
+    let at = inputs.iter().position(|input| input == what);
+    let at = at.unwrap_or_else(|| panic!("the codec never took {what}"));
+    let noise = |part: &[String]| part.iter().filter(|input| *input == "noise").count();
+    (noise(&inputs[..at]), noise(&inputs[at + 1..]))
+}
+
+/// A timer that falls due as a flood of frames lands is fired while frames are still waiting:
+/// the session does not decode the whole flood first.
+#[tokio::test(start_paused = true)]
+async fn a_timer_due_as_frames_keep_arriving_fires_before_they_are_all_decoded() {
+    let frozen = freeze();
+    let mut server = ScriptedWs::start().await;
+    let venue = ExecToy::leak();
+    let (config, _) = setup(venue, &server.url(), quick());
+    let (mut session, control) = ExecSession::new(config, |_| {}).unwrap();
+    let script = async move {
+        let mut peer = server.accept().await;
+        let _ = (peer.recv().await, peer.recv().await);
+        peer.send("arm|tag=5|ms=100");
+        churn().await;
+        // The flood is written in one go before the clock moves, so when the session next
+        // runs, the timer has fired and every frame is waiting.
+        peer.send_all(flood(0));
+        advance(ms(100)).await;
+        assert_eq!(peer.recv().await, "rang|tag=5");
+        settle(|| venue.noise() == FLOOD).await;
+        drop(control);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    drop(frozen);
+    let (_, after) = noise_around(&venue.inputs(), "timer 5");
+    assert!(after > 0, "the timer waited for the whole flood");
+    assert_eq!(venue.noise(), FLOOD);
+}
+
+/// An HTTP result that comes back as a flood of frames lands is handed to the codec before the
+/// flood, written whole before the answer, is all decoded.
+#[tokio::test]
+async fn an_http_result_back_as_frames_keep_arriving_is_taken_before_they_are_all_decoded() {
+    let (mut server, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
+    let venue = ExecToy::leak();
+    let (mut config, _) = setup(venue, &server.url(), quick());
+    config.cfg.insert(HTTP, &http.url(""));
+    let (mut session, control) = ExecSession::new(config, |_| {}).unwrap();
+    let script = async move {
+        let mut peer = server.accept().await;
+        let _ = (peer.recv().await, peer.recv().await);
+        peer.send("ask|tag=1|path=/x");
+        let asked = http.request().await;
+        // 16 MiB, more than the socket buffers hold: frames are still arriving once the
+        // session has seen the answer come back.
+        peer.send_all(flood(8 * 1024));
+        asked.answer("HTTP/1.1 200 OK", "x").await;
+        assert_eq!(peer.recv().await, "got|tag=1");
+        drop(control);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    let (before, _) = noise_around(&venue.inputs(), "http 1");
+    assert!(before < FLOOD, "the result waited for the whole flood");
+}
+
+/// The control dropped while a flood of frames is still arriving ends the session at its next
+/// wake: no frame is decoded after the drop.
+#[tokio::test]
+async fn a_stop_as_frames_keep_arriving_ends_the_session_before_another_is_decoded() {
+    let mut server = ScriptedWs::start().await;
+    let venue = ExecToy::leak();
+    let (config, _) = setup(venue, &server.url(), quick());
+    let (mut session, control) = ExecSession::new(config, |_| {}).unwrap();
+    let script = async move {
+        let mut peer = server.accept().await;
+        let _ = (peer.recv().await, peer.recv().await);
+        // 16 MiB: more than the socket buffers hold, so frames are still arriving at the drop.
+        peer.send_all(flood(8 * 1024));
+        settle(|| venue.noise() > 0).await;
+        let at = venue.noise();
+        drop(control);
+        at
+    };
+    let (run, at) = tokio::join!(session.run(), script);
+    run.unwrap();
+    assert!(at < FLOOD, "the whole flood was decoded before the drop");
+    assert_eq!(venue.noise(), at);
+    // A stop, not a drop: no epoch opened after it.
+    assert_eq!(session.current(), key(0));
+    assert_eq!(session.counters().attempts, 1);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Effects, the proxy, and what a session refuses.
 // ---------------------------------------------------------------------------------------------
 
 #[tokio::test]
 async fn stray_effects_are_refused_and_a_reconnect_the_codec_asks_for_opens_the_next_epoch() {
-    let mut server = ScriptedWs::start().await;
+    let (mut server, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
     let venue = ExecToy::leak();
-    let (config, _) = setup(venue, &server.url(), quick());
+    let (mut config, _) = setup(venue, &server.url(), quick());
+    config.cfg.insert(HTTP, &http.url(""));
     let log = Log::default();
     let (mut session, control) = ExecSession::new(config, Keep::new(&log)).unwrap();
     let script = async move {
@@ -1243,6 +1447,12 @@ async fn stray_effects_are_refused_and_a_reconnect_the_codec_asks_for_opens_the_
         // fired (FBC-bnl).
         assert_eq!(first.recv().await, "said");
         assert_eq!(first.recv().await, "rang|tag=1");
+        // The request is answered by the script, not by whatever the host has on a port
+        // (Reviewer B, B7). The client closes the connection only as its result is taken, so
+        // the codec has it before `bye` is sent.
+        let stray = http.request().await;
+        assert_eq!(stray.line, "GET /stray");
+        stray.answer("HTTP/1.1 200 OK", "stray").await;
         first.send("bye");
         assert_eq!(first.next().await, None);
         let mut second = server.accept().await;
@@ -1252,7 +1462,7 @@ async fn stray_effects_are_refused_and_a_reconnect_the_codec_asks_for_opens_the_
     let (run, ()) = tokio::join!(session.run(), script);
     run.unwrap();
     // A frame and a reconnect for another stream. The timer fired into the codec and the
-    // request's failure reached it, which the toy cannot decode (FBC-bnl); the timer and the
+    // request's result reached it, which the toy cannot decode (FBC-bnl); the timer and the
     // request behind the reconnect were never reached, since it ended the epoch before their
     // turn (Codex r4188639448).
     let counters = session.counters();
