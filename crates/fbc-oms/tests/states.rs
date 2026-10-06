@@ -10,7 +10,8 @@
 //! lease, without the account lease where the nonce scope is per account, and before the
 //! first trustworthy resync. An armed market whose lease names are given again, for another
 //! account, without it, or with per-account nonces it holds no account lease for, builds
-//! nothing until it is disarmed and armed again under them. No resync or ladder timer moves a
+//! nothing until it is disarmed and armed again under them, as does one whose names now need
+//! an account lease the registry holds for another account. No resync or ladder timer moves a
 //! market, and every change advances its state generation once.
 //!
 //! The values are the owner's first test values: a $50 inventory cap on a synthetic market
@@ -606,6 +607,49 @@ fn a_nonce_scope_given_again_as_per_account_stops_a_market_armed_without_the_acc
     reg.disarm(INST);
     let both = leases(&reg, INST);
     reg.start(INST, both).unwrap();
+    assert!(reg.place(placement(cid(), 100, 1)).is_ok());
+}
+
+/// Reviewer B's RB86-5 on PR #86 (Reviewer A's RA86-1): the account lease the registry holds
+/// stands in for an armed market only while it is the current names' account. INST is armed
+/// under account A with Random nonces (its market lease alone); names for account B arm OTHER
+/// with B's account lease; A's names given back with per-account nonces leave A's account
+/// lease free for a second holder, so INST builds nothing until it is armed again under it.
+#[test]
+fn an_account_lease_held_for_another_account_never_covers_an_armed_market() {
+    let a = lease_keys(NonceScope::Random);
+    let mut reg = Registry::with_caps(caps()).with_lease_keys(a.clone());
+    reg.seed_position(INST, SignedLots(LONG)).unwrap();
+    reg.seed_position(OTHER, SignedLots(0)).unwrap();
+    let lease = Leases::market(market_lease(&reg, INST));
+    reg.start(INST, lease).unwrap();
+    let bid = open(&mut reg, placement(cid(), 100, 5), "v-bid");
+    let ask = open(&mut reg, sell(5, 101), "v-ask");
+    let mut reg = reg.with_lease_keys(lease_keys(NonceScope::Random));
+    let b = leases(&reg, OTHER);
+    assert!(reg.start(OTHER, b).unwrap().armed());
+    assert!(
+        account_lease(&reg).is_none(),
+        "the registry holds B's account lease"
+    );
+    let mut reg = reg.with_lease_keys(rescoped(&a, NonceScope::PerAccountMonotonic));
+    // A second holder can take account A's lease: the registry does not hold it.
+    let second = account_lease(&reg).expect("account A's lease is free");
+    builds_nothing(&mut reg, (bid, ask), StateRefusal::Unleased(INST));
+    let before = seen(reg.entry(INST));
+    assert_eq!(
+        reg.start(INST, Leases::none()),
+        Err(ArmRefusal::WrongAccountLease(INST))
+    );
+    assert_eq!(seen(reg.entry(INST)), before);
+    // Cancels are still built.
+    let cancel = reg.cancellable(bid).unwrap().cancel(&venue(false));
+    assert!(matches!(cancel, CancelChoice::Send(_)), "{cancel:?}");
+    // With both markets disarmed, B's account lease is released and INST arms under A's.
+    reg.disarm(INST);
+    reg.disarm(OTHER);
+    let both = Leases::market(market_lease(&reg, INST)).with_account(second);
+    assert_eq!(seen(reg.start(INST, both).unwrap()).1, EntryState::Quoting);
     assert!(reg.place(placement(cid(), 100, 1)).is_ok());
 }
 
