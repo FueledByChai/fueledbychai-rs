@@ -329,9 +329,9 @@ class ReviewTest(unittest.TestCase):
         self.assertIsNone(re.search(r"@[A-Za-z0-9]", body), body)
         self.assertIn("ping @\u200boctocat and @\u200borg/team", body)
         self.github.requests.clear()
-        self.chat.answer = lambda path, body: (500, b"cc @octocat")
-        self.run_review(head, DEEPSEEK_RETRIES="0")
-        body = self.assert_incomplete(head, "cc @\u200boctocat")
+        self.run_review(head, DEEPSEEK_MODEL="@octocat")
+        body = self.one_comment()
+        self.assertIn("with model `@\u200boctocat`", body)
         self.assertIsNone(re.search(r"@[A-Za-z0-9]", body), body)
 
     def findings_log(self, head):
@@ -453,6 +453,16 @@ class ReviewTest(unittest.TestCase):
         self.assertIn("problem in p", body)
         self.assertIn("- `crates/q/src/lib.rs`: past the limit of 1 requests per review", body)
         self.assertIn("- `crates/r/src/lib.rs`: past the limit of 1 requests per review", body)
+        # The full report is in the job log too (DeepSeek DS-3 on 1eac9ee).
+        prefix = "deepseek-review: report for head %s: " % head
+        lines = [l for l in self.out.splitlines() if l.startswith(prefix)]
+        self.assertEqual(len(lines), 1, self.out)
+        report = json.loads(lines[0][len(prefix):])
+        self.assertEqual(report["not_reviewed"], {
+            "crates/huge/src/lib.rs": "its diff alone is over the token budget",
+            "crates/q/src/lib.rs": "past the limit of 1 requests per review",
+            "crates/r/src/lib.rs": "past the limit of 1 requests per review"})
+        self.assertEqual(report["diff_only"], [])
 
     def test_one_invalid_part_makes_the_whole_review_incomplete(self):
         head = self.big_change()
@@ -486,23 +496,22 @@ class ReviewTest(unittest.TestCase):
         # A hostile or buggy endpoint echoing the key back must not leak it into the comment.
         self.chat.answer = lambda path, body: (500, ("upstream failed for key %s" % KEY).encode())
         self.run_review(head, DEEPSEEK_RETRIES="2")
-        body = self.assert_incomplete(head, "the DeepSeek API answered HTTP 500",
-                                      "upstream failed for key ***")
+        body = self.assert_incomplete(head, "the DeepSeek API answered HTTP 500.")
         self.assertEqual(len(self.chat.requests), 3)
         self.assertIn("did not complete", self.out)
-        self.assertNotIn(KEY, body)
+        self.assertNotIn("upstream failed", body + self.out + self.err)
 
     def test_a_client_error_is_not_retried(self):
         head = self.change()
-        self.chat.answer = lambda path, body: (400, b'{"error": "bad request"}')
+        self.chat.answer = lambda path, body: (400, b'{"error": {"type": "invalid_request_error"}}')
         self.run_review(head, DEEPSEEK_RETRIES="2")
-        self.assert_incomplete(head, "HTTP 400", "bad request")
+        self.assert_incomplete(head, "HTTP 400 (type invalid_request_error)")
         self.assertEqual(len(self.chat.requests), 1)
 
-    def test_an_auth_failure_posts_only_its_status_and_error_type_and_code(self):
-        """Reviewer B, B4: a 401 or 403 body can echo a fragment of the key, which the redactor
-        (exact key only) would not catch; only the status and the error's type and code are
-        posted or printed, never its text."""
+    def test_an_api_error_posts_only_its_status_and_error_type_and_code(self):
+        """Reviewer B, B4 (401, 403) and DeepSeek DS-2 on 1eac9ee (every status): an error body
+        can echo a fragment of the key, which the redactor (exact key only) would not catch;
+        only the status and the error's type and code are posted or printed, never its text."""
         head = self.change()
         fragment = "****" + KEY[-4:]
         cases = [
@@ -514,12 +523,12 @@ class ReviewTest(unittest.TestCase):
              "(code 1234)"),
             ("Your api key %s is invalid" % fragment, None),
         ]
-        for status in (401, 403):
+        for status in (400, 401, 403, 429, 500, 503):
             for answer, detail in cases:
                 self.github.requests.clear()
                 raw = (json.dumps(answer) if isinstance(answer, dict) else answer).encode()
                 self.chat.answer = lambda path, body, s=status, r=raw: (s, r)
-                self.run_review(head, DEEPSEEK_RETRIES="2")
+                self.run_review(head, DEEPSEEK_RETRIES="0")
                 expected = "the DeepSeek API answered HTTP %d" % status
                 body = self.assert_incomplete(head, expected + (" " + detail if detail else "."))
                 for text in (body, self.out, self.err):
@@ -768,10 +777,13 @@ class CommentSizeTest(unittest.TestCase):
                      "problem": "p" * 3000, "fix": "x" * 3000} for n in range(1, 40)]
         report = {"chunks": 4, "files": 3000, "diff_only": ["d%04d.rs" % n for n in range(1000)],
                   "not_reviewed": {"n%04d.rs" % n: "past the limit" for n in range(3000)}}
-        body, shown = module.complete_comment(cfg, findings, report)
+        body, shown, truncated = module.complete_comment(cfg, findings, report)
+        self.assertTrue(truncated)
         self.assertLessEqual(len(body), 65536)
         self.assertIn("further findings omitted: the comment size limit", body)
-        self.assertRegex(body, r"\.\.\. \d+ further lines omitted: the comment size limit\.\n$")
+        self.assertRegex(body, r"\.\.\. \d+ further lines omitted: the comment size limit\. "
+                               r"This is not a complete review: the job log holds the full "
+                               r"report\.\n$")
         self.assertTrue(0 < shown < len(findings), shown)
         self.assertIn("status=truncated findings=39 shown=%d" % shown, body)
         # Every finding counted as shown is in the comment whole, never cut by the size cap.
@@ -791,11 +803,38 @@ class CommentSizeTest(unittest.TestCase):
         for size in range(1, 400, 7):
             findings = [{"id": "DS-%d" % n, "severity": "P3", "file": "f.rs", "line": None,
                          "problem": "q" * size, "fix": ""} for n in range(1, 3000)]
-            body, shown = module.complete_comment(cfg, findings, report)
+            body, shown, truncated = module.complete_comment(cfg, findings, report)
+            self.assertTrue(truncated)
             self.assertLessEqual(len(body), module.BODY_CAP + 1)
             self.assertEqual(len(re.findall(r"^- \*\*DS-\d+\*\* P3 ", body, re.M)), shown, size)
             self.assertIn("shown=%d -->" % shown, body)
             self.assertNotIn("further lines omitted", body)
+
+
+    def test_a_report_cut_by_the_size_limit_is_truncated_not_complete(self):
+        """DeepSeek DS-3 on 1eac9ee: every finding fits but the Not reviewed list does not; the
+        comment must not say status=complete while it hides which files were not reviewed."""
+        spec = importlib.util.spec_from_file_location("deepseek_review", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        cfg = {"head": "a" * 40, "base": "b" * 40, "model": "m"}
+        findings = [{"id": "DS-1", "severity": "P2", "file": "f.rs", "line": 1, "problem": "p",
+                     "fix": "x"}]
+        report = {"chunks": 4, "files": 3001, "diff_only": [],
+                  "not_reviewed": {"n%04d.rs" % n: "past the limit" for n in range(3000)}}
+        body, shown, truncated = module.complete_comment(cfg, findings, report)
+        self.assertEqual((shown, truncated), (1, True))
+        self.assertLessEqual(len(body), 65536)
+        self.assertIn("<!-- deepseek-review head=%s status=truncated findings=1 shown=1 -->"
+                      % ("a" * 40), body)
+        self.assertNotIn("status=complete", body)
+        self.assertRegex(body, r"further lines omitted: the comment size limit\. This is not a "
+                               r"complete review: the job log holds the full report\.\n$")
+        # When everything fits, the comment is complete.
+        report["not_reviewed"] = {"n0001.rs": "past the limit"}
+        body, shown, truncated = module.complete_comment(cfg, findings, report)
+        self.assertEqual((shown, truncated), (1, False))
+        self.assertIn("status=complete findings=1 -->", body)
 
 
 class WorkflowTest(unittest.TestCase):
