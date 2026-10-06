@@ -603,8 +603,10 @@ class ReviewTest(unittest.TestCase):
         head = self.change()
         # Partial JSON, no content, an empty answer, and (DeepSeek DS-1 on 284f437) JSON
         # that parses but is not the asked shape: each cut off at max_tokens.
+        # Round 2, DS-1 on 634ef32: even JSON of the asked shape is not final when the answer
+        # stopped at max_tokens.
         for first in ('{"findings": [{"id": "F1", "sev', None, "", '{"issues": []}',
-                      '{"findings": [{"id": "F1"}]}'):
+                      '{"findings": [{"id": "F1"}]}', findings_json()):
             self.github.requests.clear()
             self.chat.requests.clear()
             calls = []
@@ -629,8 +631,12 @@ class ReviewTest(unittest.TestCase):
             # sent exactly once more.
             self.assertEqual(len(self.chat.requests), 3)
             whole = self.files_in(self.chat.requests[0])
+            self.assertEqual(whole, ["blob.bin", "crates/a/src/[x].rs", "crates/a/src/lib.rs",
+                                     "crates/b/src/lib.rs", "gone.txt"])
             halves = [self.files_in(r) for r in self.chat.requests[1:]]
             self.assertTrue(all(halves), halves)
+            # DeepSeek DS-3 on 634ef32: disjoint halves, together exactly the part's files.
+            self.assertTrue(set(halves[0]).isdisjoint(halves[1]), halves)
             self.assertEqual(sorted(halves[0] + halves[1]), whole)
             users = [r["body"]["messages"][1]["content"] for r in self.chat.requests]
             self.assertIn("This is part 1 of 1 of the change", users[0])

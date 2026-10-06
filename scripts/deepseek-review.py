@@ -453,14 +453,17 @@ def answer_content(body):
 def parse_findings(content, finish_reason=None):
     """Validated findings from the model's answer; Incomplete when it is not the asked JSON, and
     CutOff when it was also cut off at max_tokens: an answer that stopped at the allowance is
-    not the model's whole answer, whether or not what came back happens to parse (DeepSeek DS-1
-    on 284f437)."""
+    not the model's whole answer, whether or not what came back happens to parse or has the
+    asked shape (DeepSeek DS-1 on 284f437 and on 634ef32)."""
     try:
-        return checked_findings(content)
+        findings = checked_findings(content)
     except Incomplete as e:
         if finish_reason == "length":
             raise CutOff(str(e) + CUT_NOTE)
         raise
+    if finish_reason == "length":
+        raise CutOff("the model's answer stopped at the output allowance" + CUT_NOTE)
+    return findings
 
 
 def checked_findings(content):
