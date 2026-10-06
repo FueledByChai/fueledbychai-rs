@@ -7,8 +7,10 @@ name: DeepSeek review
 #
 # pull_request, never pull_request_target: a fork's PR runs no job here and never sees the
 # secret. The key comes only from the DEEPSEEK_API_KEY secret (0009); GitHub masks it in logs
-# and scripts/deepseek-review.py never prints, writes or posts it. DEEPSEEK_MODEL is a
-# repository variable (default deepseek-v4-pro when unset).
+# and scripts/deepseek-review.py never prints, writes or posts it. DEEPSEEK_MODEL and the
+# request tunables below are repository variables; an unset one takes the script's default
+# (FBC-yf0j: DEEPSEEK_MAX_OUTPUT_TOKENS raises the answer allowance without a code change). The
+# wall-clock bounds are not variables: a test holds their defaults inside timeout-minutes.
 # The script runs from the PR head, so only branches of this repository run it. The trust
 # boundary is push access, and the key is a CI-only DeepSeek key (owner decision 2026-10-05,
 # FBC-omhd). -I (isolated mode) keeps a file merged beside the script, such as
@@ -48,6 +50,12 @@ jobs:
           DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}
           DEEPSEEK_API_BASE: ${{ vars.DEEPSEEK_API_BASE }}
           DEEPSEEK_TOKEN_BUDGET: ${{ vars.DEEPSEEK_TOKEN_BUDGET }}
+          DEEPSEEK_MAX_OUTPUT_TOKENS: ${{ vars.DEEPSEEK_MAX_OUTPUT_TOKENS }}
+          DEEPSEEK_SPLIT_DEPTH: ${{ vars.DEEPSEEK_SPLIT_DEPTH }}
+          DEEPSEEK_MAX_CHUNKS: ${{ vars.DEEPSEEK_MAX_CHUNKS }}
+          DEEPSEEK_TIMEOUT: ${{ vars.DEEPSEEK_TIMEOUT }}
+          DEEPSEEK_RETRIES: ${{ vars.DEEPSEEK_RETRIES }}
+          DEEPSEEK_RETRY_DELAY: ${{ vars.DEEPSEEK_RETRY_DELAY }}
           GITHUB_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}

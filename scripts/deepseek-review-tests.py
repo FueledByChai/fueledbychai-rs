@@ -589,6 +589,133 @@ class ReviewTest(unittest.TestCase):
         self.run_review(head)
         self.assert_incomplete(head, "cut off at max_tokens")
 
+    # --- an answer cut off at max_tokens (FBC-yf0j)
+
+    def cut_off(self, content='{"findings": ['):
+        return completion(content, finish="length")
+
+    def files_in(self, request):
+        user = request["body"]["messages"][1]["content"]
+        return sorted(re.findall(r"^=== FILE (\S+) \(status", user, re.M))
+
+    def test_a_cut_off_answer_is_retried_as_smaller_parts_and_the_review_completes(self):
+        """FBC-yf0j: a cut-off first answer followed by complete ones is a complete review."""
+        head = self.change()
+        for first in ('{"findings": [{"id": "F1", "sev', None, ""):
+            self.github.requests.clear()
+            self.chat.requests.clear()
+            calls = []
+
+            def answer(path, body, first=first):
+                calls.append(1)
+                if len(calls) == 1:
+                    return self.cut_off(first)
+                user = body["messages"][1]["content"]
+                found = [finding("F1", "P2", "crates/a/src/lib.rs", 2, "problem in a")] \
+                    if "=== FILE crates/a/src/lib.rs" in user else []
+                return completion(findings_json(*found))
+            self.chat.answer = answer
+            self.run_review(head)
+            self.assertEqual(self.rc, 0, self.out + self.err)
+            body = self.one_comment()
+            self.assertIn("head=%s status=complete findings=1 -->" % head, body)
+            self.assertIn("- **DS-1** P2 `crates/a/src/lib.rs:2`: problem in a", body)
+            self.assertIn("Cut off at max_tokens and reviewed again in smaller pieces: part 1 of 1",
+                          body)
+            # One cut-off request, then its files split between two smaller ones, each file
+            # sent exactly once more.
+            self.assertEqual(len(self.chat.requests), 3)
+            whole = self.files_in(self.chat.requests[0])
+            halves = [self.files_in(r) for r in self.chat.requests[1:]]
+            self.assertTrue(all(halves), halves)
+            self.assertEqual(sorted(halves[0] + halves[1]), whole)
+            users = [r["body"]["messages"][1]["content"] for r in self.chat.requests]
+            self.assertIn("This is part 1 of 1 of the change", users[0])
+            self.assertIn("This is part 1 of 1 of the change, piece 1 of 2", users[1])
+            self.assertIn("This is part 1 of 1 of the change, piece 2 of 2", users[2])
+            prefix = "deepseek-review: report for head %s: " % head
+            report = json.loads([l for l in self.out.splitlines()
+                                 if l.startswith(prefix)][0][len(prefix):])
+            self.assertEqual(report["cut_off"], ["part 1 of 1"])
+
+    def test_a_cut_off_single_file_is_reviewed_again_from_its_diff(self):
+        self.write("crates/a/src/lib.rs", "pub fn a() -> u32 {\n    2 // ONLY-CHANGE\n}\n")
+        head = self.commit("one file")
+        self.chat.answer = lambda path, body: (
+            self.cut_off() if "FULL TEXT" in body["messages"][1]["content"]
+            else completion(findings_json()))
+        self.run_review(head)
+        self.assertEqual(self.rc, 0, self.out + self.err)
+        self.assertEqual(len(self.chat.requests), 2)
+        retry = self.chat.requests[1]["body"]["messages"][1]["content"]
+        self.assertIn("+    2 // ONLY-CHANGE", retry)
+        self.assertNotIn("FULL TEXT", retry)
+        body = self.one_comment()
+        self.assertIn("status=complete findings=0", body)
+        self.assertIn("Reviewed from the diff only after an answer was cut off at max_tokens: "
+                      "`crates/a/src/lib.rs`", body)
+
+    def test_an_answer_still_cut_off_after_the_split_limit_is_incomplete(self):
+        head = self.change()
+        self.chat.answer = lambda path, body: self.cut_off()
+        self.run_review(head, DEEPSEEK_SPLIT_DEPTH="1")
+        self.assert_incomplete(head, "part 1 of 1, piece ", "cut off at max_tokens",
+                               "DEEPSEEK_SPLIT_DEPTH")
+        # The cut-off part, then its first piece, cut off again: the review stops there.
+        self.assertEqual(len(self.chat.requests), 2)
+        # The default depth, 2: the piece of a piece is named, and nothing past it is sent.
+        self.github.requests.clear()
+        self.chat.requests.clear()
+        self.run_review(head)
+        self.assert_incomplete(head, "part 1 of 1, piece 1.1 of 2: ", "DEEPSEEK_SPLIT_DEPTH is 2")
+        self.assertEqual(len(self.chat.requests), 3)
+        self.assertIn("This is part 1 of 1 of the change, piece 1.1 of 2;",
+                      self.chat.requests[2]["body"]["messages"][1]["content"])
+        self.github.requests.clear()
+        self.chat.requests.clear()
+        self.run_review(head, DEEPSEEK_SPLIT_DEPTH="0")
+        self.assert_incomplete(head, "part 1 of 1: ", "cut off at max_tokens")
+        self.assertEqual(len(self.chat.requests), 1)
+
+    def test_a_cut_off_file_already_reviewed_from_its_diff_is_incomplete(self):
+        self.write("crates/long/src/lib.rs", "".join("// old line %d\n" % i for i in range(1000)))
+        self.base = self.commit("long base")
+        self.write("crates/long/src/lib.rs", "".join(
+            "// %s line %d\n" % ("NEW" if i == 5 else "old", i) for i in range(1000)))
+        head = self.commit("long head")
+        self.chat.answer = lambda path, body: self.cut_off(None)
+        self.run_review(head, DEEPSEEK_TOKEN_BUDGET="5000")
+        self.assert_incomplete(head, "has no text content (the answer was cut off at max_tokens)",
+                               "cannot be split further")
+        self.assertEqual(len(self.chat.requests), 1)
+
+    def test_a_null_answer_cut_off_at_max_tokens_says_so(self):
+        """Reviewer B, B12 on PR #82: a thinking model can spend all of max_tokens reasoning and
+        return content null with finish_reason length."""
+        head = self.change()
+        self.chat.answer = lambda path, body: self.cut_off(None)
+        self.run_review(head, DEEPSEEK_SPLIT_DEPTH="0")
+        self.assert_incomplete(head, "has no text content (the answer was cut off at max_tokens)")
+        self.github.requests.clear()
+        self.chat.answer = lambda path, body: completion(None)
+        self.run_review(head)
+        body = self.assert_incomplete(head, "no text content")
+        self.assertNotIn("cut off", body)
+
+    def test_the_output_allowance_and_split_depth_are_settings(self):
+        head = self.change()
+        self.run_review(head, DEEPSEEK_MAX_OUTPUT_TOKENS="131072")
+        self.assertEqual(self.rc, 0, self.out + self.err)
+        self.assertEqual(self.chat.requests[0]["body"]["max_tokens"], 131072)
+        for value, reason in (("-1", "DEEPSEEK_SPLIT_DEPTH must be at least 0"),
+                              ("5", "DEEPSEEK_SPLIT_DEPTH must be at most 4"),
+                              ("x", "DEEPSEEK_SPLIT_DEPTH is not a whole number")):
+            self.github.requests.clear()
+            self.chat.requests.clear()
+            self.run_review(head, DEEPSEEK_SPLIT_DEPTH=value)
+            self.assert_incomplete(head, reason)
+            self.assertEqual(self.chat.requests, [])
+
     def test_findings_that_break_the_schema_are_an_incomplete_review(self):
         head = self.change()
         cases = [
@@ -985,6 +1112,17 @@ class WorkflowTest(unittest.TestCase):
         # Untrusted PR text reaches the script through the environment, never the run line.
         runs = [l for l in self.lines if l.strip().startswith("run:")]
         self.assertTrue(all("${{" not in l for l in runs), runs)
+
+    def test_the_tunables_come_from_repository_variables(self):
+        """FBC-yf0j: the output allowance (and the other request tunables) can be raised without
+        a code change. The wall-clock bounds stay in the script, where a test holds them inside
+        timeout-minutes."""
+        for name in ("DEEPSEEK_MAX_OUTPUT_TOKENS", "DEEPSEEK_SPLIT_DEPTH", "DEEPSEEK_MAX_CHUNKS",
+                     "DEEPSEEK_TOKEN_BUDGET", "DEEPSEEK_TIMEOUT", "DEEPSEEK_RETRIES",
+                     "DEEPSEEK_RETRY_DELAY"):
+            self.assertIn("%s: ${{ vars.%s }}" % (name, name), self.text)
+        for name in ("DEEPSEEK_DEADLINE", "DEEPSEEK_SETUP_TIMEOUT", "DEEPSEEK_POST_TIMEOUT"):
+            self.assertNotIn("vars.%s" % name, self.text)
 
 
 if __name__ == "__main__":

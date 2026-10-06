@@ -7,7 +7,10 @@ It builds the prompt from the pull request's diff against its base plus the full
 touched file, AGENTS.md's Project rules and the decisions index; splits a change larger than the
 token budget into chunks and merges their findings; asks DeepSeek's OpenAI-compatible chat
 completions endpoint for findings as JSON and validates them; and posts ONE pull request comment
-headed "DeepSeek review" that names the reviewed head SHA. A missing key, an API error or an
+headed "DeepSeek review" that names the reviewed head SHA. An answer cut off at max_tokens
+(finish_reason "length": a thinking model's reasoning counts against max_tokens) is not final:
+the part is reviewed again as two smaller pieces, or a single file from its diff only, up to
+DEEPSEEK_SPLIT_DEPTH times (FBC-yf0j). A missing key, an API error or an
 answer that is not valid findings JSON posts a comment saying the review did not complete for
 that SHA (never a silent pass) and exits non-zero; an API error is reported by its status and
 the error's type and code only, never its body. Every finding, whole and redacted, and the full
@@ -20,13 +23,20 @@ Authorization header to the configured endpoint, and removed from every message 
 prints or posts (0009). No request follows a redirect: urllib's default handler would copy the
 Authorization header to whatever host a 3xx names, so a 3xx is an API error like any other.
 
-Environment (the workflow sets these):
+Environment the script reads. The workflow sets the key, the GitHub and pull request fields,
+and every DEEPSEEK_* setting except the three wall-clock bounds from the repository variable of
+the same name (unset: the default here); the wall-clock bounds stay at their defaults, which a
+test holds inside the job's timeout-minutes (Reviewer B, B11 on PR #82).
   DEEPSEEK_API_KEY       the key (repository secret); missing or empty -> incomplete review
   DEEPSEEK_API_BASE      endpoint base URL, default https://api.deepseek.com
   DEEPSEEK_MODEL         model name (repository variable), default deepseek-v4-pro
   DEEPSEEK_TOKEN_BUDGET  estimated prompt tokens per request (chars / 3), default 120000
   DEEPSEEK_MAX_CHUNKS    requests per review at most, default 4; files beyond are not reviewed
   DEEPSEEK_MAX_OUTPUT_TOKENS  max_tokens of each answer, reasoning included, default 65536
+                         (DeepSeek documents a maximum output of 384K for deepseek-v4-pro)
+  DEEPSEEK_SPLIT_DEPTH   times a cut-off answer's part may be split again, 0 to 4, default 2;
+                         split pieces do not count against DEEPSEEK_MAX_CHUNKS, so a review
+                         sends at most DEEPSEEK_MAX_CHUNKS x 2^depth requests
   DEEPSEEK_TIMEOUT       seconds per HTTP request, default 600
   DEEPSEEK_RETRIES       retries after a timeout, HTTP 429 or 5xx, default 2
   DEEPSEEK_RETRY_DELAY   seconds before the first retry (doubled each time), default 10
@@ -75,6 +85,9 @@ COMMENT_RESERVE = 1000  # room kept after the findings for the omitted-findings 
 IDENT_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 DEFAULT_POST_TIMEOUT = 60.0
 DEFAULT_SETUP_TIMEOUT = 300.0  # the git work before the first request
+DEFAULT_SPLIT_DEPTH = 2
+MAX_SPLIT_DEPTH = 4  # 2^4 pieces per part at most: the deadline, not this, is the real bound
+CUT_NOTE = " (the answer was cut off at max_tokens)"
 
 SYSTEM_INSTRUCTIONS = """You are an adversarial code reviewer for fueledbychai-rs, a public Rust \
 library that connects a trading program to crypto venues (market data, order entry, order truth). \
@@ -102,7 +115,12 @@ class Incomplete(Exception):
     """The review did not complete; the message is the reason posted for the head SHA."""
 
 
-def env_int(name, default, minimum):
+class CutOff(Incomplete):
+    """The answer was cut off at max_tokens (finish_reason "length") before it was the asked
+    JSON: the part is reviewed again in smaller pieces before the review is incomplete."""
+
+
+def env_int(name, default, minimum, maximum=None):
     raw = os.environ.get(name, "").strip()
     if not raw:
         return default
@@ -112,6 +130,8 @@ def env_int(name, default, minimum):
         raise Incomplete("%s is not a whole number" % name)
     if value < minimum:
         raise Incomplete("%s must be at least %d" % (name, minimum))
+    if maximum is not None and value > maximum:
+        raise Incomplete("%s must be at most %d" % (name, maximum))
     return value
 
 
@@ -253,14 +273,14 @@ def system_prompt(repo, until, base):
         SYSTEM_INSTRUCTIONS, project_rules(repo, until, base), decisions_index(repo, until, base))
 
 
-def user_prompt(title, body, part, parts, payload, nonce):
+def user_prompt(title, body, label, payload, nonce):
     """Everything from the pull request sits between markers carrying a per-run nonce, so its
-    text cannot close them early."""
-    return ("This is part %d of %d of the change; the other parts are reviewed separately.\n"
+    text cannot close them early. `label` names the part ("part 2 of 3 of the change", or for a
+    piece of a part whose answer was cut off, "part 1 of 1 of the change, piece 2 of 2")."""
+    return ("This is %s; the other parts are reviewed separately.\n"
             "<<<CHANGE %s BEGIN>>>\nPull request title: %s\nPull request description:\n%s\n\n"
             "%s<<<CHANGE %s END>>>\n"
-            "Answer with the json object only." % (part, parts, nonce, title, body, payload,
-                                                    nonce))
+            "Answer with the json object only." % (label, nonce, title, body, payload, nonce))
 
 
 def plan_chunks(units, available, max_chunks):
@@ -419,9 +439,15 @@ def answer_content(body):
         content = choice["message"]["content"]
     except (ValueError, KeyError, IndexError, TypeError, UnicodeDecodeError):
         raise Incomplete("the DeepSeek API returned a response that is not a chat completion")
+    finish = choice.get("finish_reason") if isinstance(choice, dict) else None
     if not isinstance(content, str):
+        # A thinking model can spend all of max_tokens reasoning and return no content at all
+        # (Reviewer B, B12 on PR #82).
+        if finish == "length":
+            raise CutOff("the DeepSeek API returned a chat completion that has no text content"
+                         + CUT_NOTE)
         raise Incomplete("the DeepSeek API returned a chat completion with no text content")
-    return content, choice.get("finish_reason") if isinstance(choice, dict) else None
+    return content, finish
 
 
 def parse_findings(content, finish_reason=None):
@@ -433,8 +459,9 @@ def parse_findings(content, finish_reason=None):
     try:
         answer = json.loads(text)
     except ValueError:
-        cut = " (the answer was cut off at max_tokens)" if finish_reason == "length" else ""
-        raise Incomplete("the model's answer is not valid JSON%s" % cut)
+        if finish_reason == "length":
+            raise CutOff("the model's answer is not valid JSON" + CUT_NOTE)
+        raise Incomplete("the model's answer is not valid JSON")
     if not isinstance(answer, dict) or not isinstance(answer.get("findings"), list):
         raise Incomplete("the model's answer is not an object with a findings list")
     findings = []
@@ -497,12 +524,15 @@ def review(cfg):
     except SetupTimedOut:
         raise Incomplete("the git work before the first request did not finish within %g s"
                          % cfg["setup_timeout"])
-    report = {"chunks": 0, "diff_only": [], "not_reviewed": {}, "files": len(units)}
+    report = {"chunks": 0, "diff_only": [], "not_reviewed": {}, "files": len(units),
+              "cut_off": [], "diff_only_after_cut": []}
     if not units:
         return [], report
     nonce = secrets.token_hex(8)
+    longest_label = "part 99 of 99 of the change, piece %s of 2" % ".".join(
+        ["2"] * max(cfg["split_depth"], 1))
     overhead = estimate_tokens(system) + estimate_tokens(
-        user_prompt(cfg["title"], cfg["body"], 99, 99, "", nonce))
+        user_prompt(cfg["title"], cfg["body"], longest_label, "", nonce))
     available = cfg["budget"] - overhead
     if available <= 0:
         raise Incomplete("DEEPSEEK_TOKEN_BUDGET (%d) is smaller than the review instructions "
@@ -511,18 +541,69 @@ def review(cfg):
     report.update(chunks=len(chunks), diff_only=diff_only, not_reviewed=not_reviewed)
     if not chunks:
         raise Incomplete("no touched file fits in the token budget of %d" % cfg["budget"])
+    by_path = {unit["path"]: unit for unit in units}
     results = []
     for part, chunk in enumerate(chunks, 1):
-        payload = "".join(item for _, item in chunk)
-        messages = [{"role": "system", "content": system},
-                    {"role": "user", "content": user_prompt(cfg["title"], cfg["body"], part,
-                                                            len(chunks), payload, nonce)}]
-        try:
-            content, finish = answer_content(call_model(cfg, messages, cfg["redact"]))
-            results.append(parse_findings(content, finish))
-        except Incomplete as e:
-            raise Incomplete("part %d of %d: %s" % (part, len(chunks), e))
+        ctx = {"cfg": cfg, "system": system, "nonce": nonce, "units": by_path,
+               "report": report, "part": "part %d of %d" % (part, len(chunks))}
+        review_piece(ctx, chunk, "", 0, results)
     return merge_findings(results), report
+
+
+def split_items(items, units):
+    """A cut-off piece made smaller: its files in two halves of about equal estimated tokens,
+    or a single file from its diff only. ([pieces], path now diff-only or None); no pieces
+    when it is a single file already without its text."""
+    if len(items) >= 2:
+        sizes = [estimate_tokens(item) for _, item in items]
+        total, run, best = sum(sizes), 0, (None, 1)
+        for k in range(1, len(items)):
+            run += sizes[k - 1]
+            gap = abs(2 * run - total)
+            if best[0] is None or gap < best[0]:
+                best = (gap, k)
+        return [items[:best[1]], items[best[1]:]], None
+    path, item = items[0]
+    smaller = render_unit(units[path], False)
+    if smaller == item:
+        return [], None
+    return [[(path, smaller)]], path
+
+
+def review_piece(ctx, items, piece, depth, results):
+    """Review one part or piece, appending its findings to results. An answer cut off at
+    max_tokens is reviewed again as smaller pieces, up to DEEPSEEK_SPLIT_DEPTH levels; any other
+    failure, or a cut-off past the limit, raises Incomplete naming the part and piece."""
+    cfg = ctx["cfg"]
+    of_piece = ", piece %s" % piece if piece else ""
+    label = ctx["part"] + of_piece
+    payload = "".join(item for _, item in items)
+    messages = [{"role": "system", "content": ctx["system"]},
+                {"role": "user", "content": user_prompt(
+                    cfg["title"], cfg["body"], ctx["part"] + " of the change" + of_piece, payload,
+                    ctx["nonce"])}]
+    try:
+        content, finish = answer_content(call_model(cfg, messages, cfg["redact"]))
+        results.append(parse_findings(content, finish))
+        return
+    except CutOff as e:
+        cut = e
+    except Incomplete as e:
+        raise Incomplete("%s: %s" % (label, e))
+    if depth >= cfg["split_depth"]:
+        raise Incomplete("%s: %s; not split further: DEEPSEEK_SPLIT_DEPTH is %d" % (
+            label, cut, cfg["split_depth"]))
+    pieces, diff_only = split_items(items, ctx["units"])
+    if not pieces:
+        raise Incomplete("%s: %s; a single file reviewed from its diff cannot be split further"
+                         % (label, cut))
+    ctx["report"]["cut_off"].append(label)
+    if diff_only is not None and diff_only not in ctx["report"]["diff_only_after_cut"]:
+        ctx["report"]["diff_only_after_cut"].append(diff_only)
+    for n, smaller in enumerate(pieces, 1):
+        name = "%d of %d" % (n, len(pieces))
+        review_piece(ctx, smaller, (piece.rsplit(" of ", 1)[0] + "." if piece else "") + name,
+                     depth + 1, results)
 
 
 def safe(text, cap=FIELD_CAP):
@@ -590,6 +671,12 @@ def complete_comment(cfg, findings, report):
     if report["diff_only"]:
         lines += ["", "Reviewed from the diff only (full text over the token budget): " +
                   ", ".join(code(p) for p in report["diff_only"])]
+    if report.get("cut_off"):
+        lines += ["", "Cut off at max_tokens and reviewed again in smaller pieces: " +
+                  ", ".join(safe(p, 100) for p in report["cut_off"])]
+    if report.get("diff_only_after_cut"):
+        lines += ["", "Reviewed from the diff only after an answer was cut off at max_tokens: " +
+                  ", ".join(code(p) for p in report["diff_only_after_cut"])]
     if report["not_reviewed"]:
         lines += ["", "**Not reviewed:**"]
         lines += ["- %s: %s" % (code(p), r) for p, r in sorted(report["not_reviewed"].items())]
@@ -657,7 +744,8 @@ def findings_log_line(head, findings, redact):
 def report_log_line(head, report, redact):
     """What was reviewed and what was not, whole, as one ASCII JSON line for the job log."""
     return redact("deepseek-review: report for head %s: %s" % (head, json.dumps(
-        {k: report[k] for k in ("files", "chunks", "diff_only", "not_reviewed")},
+        {k: report[k] for k in ("files", "chunks", "diff_only", "not_reviewed", "cut_off",
+                                "diff_only_after_cut")},
         sort_keys=True)))
 
 
@@ -700,6 +788,8 @@ def main():
                        budget=env_int("DEEPSEEK_TOKEN_BUDGET", 120000, 1),
                        max_chunks=env_int("DEEPSEEK_MAX_CHUNKS", 4, 1),
                        max_output=env_int("DEEPSEEK_MAX_OUTPUT_TOKENS", 65536, 1),
+                       split_depth=env_int("DEEPSEEK_SPLIT_DEPTH", DEFAULT_SPLIT_DEPTH, 0,
+                                           MAX_SPLIT_DEPTH),
                        timeout=env_float("DEEPSEEK_TIMEOUT", 600.0) or 600.0,
                        retries=env_int("DEEPSEEK_RETRIES", 2, 0),
                        retry_delay=env_float("DEEPSEEK_RETRY_DELAY", 10.0))
