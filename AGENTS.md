@@ -394,7 +394,9 @@ Project rules and the decisions index to DeepSeek's OpenAI-compatible chat compl
 splitting a change over the token budget into several requests and merging their findings, and
 posts one comment headed `DeepSeek review` that names the reviewed head SHA and lists findings
 `DS-1`, `DS-2`, ... with severity P1, P2 or P3, file, line, problem and fix, or says there are
-none. Files that did not fit are named under **Not reviewed**. A missing key, an API error, an
+none. Files that did not fit are named under **Not reviewed** (or **Reviewed from the diff
+only**); a complete comment covers the rest of the change, and the independent reviewers, who
+read the whole diff, cover those files as they cover every file. A missing key, an API error, an
 answer that is not the asked JSON, or requests still unanswered 45 minutes after the first one
 (the deadline leaves room inside the job's 60-minute limit to post) posts a comment saying the
 review did not complete for that SHA, never a pass, and fails only that job. An API error is
