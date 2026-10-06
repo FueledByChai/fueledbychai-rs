@@ -304,8 +304,16 @@ fn a_version_2_frame_without_request_info_and_a_version_1_longer_block_decode_wi
     assert_eq!(meta_got, meta(5014));
     assert_eq!(update, resting(first, VenueOrderState::Open, PX, 150));
     // A version-1 frame has no request_info, whatever bytes a longer block carries where
-    // version 2 puts it.
-    let (meta_got, update) = one_update(&frame("order-v1-longer-block.sbe.txt"));
+    // version 2 puts it: the fixture's are a modify SUCCESS for MODIFY_ORDER (4, 1), which at
+    // version 2 would be an amend, so only the version gate keeps this an order update.
+    let longer = frame("order-v1-longer-block.sbe.txt");
+    assert_eq!((longer[HEADER + 126], longer[HEADER + 127]), (4, 1));
+    let (meta_got, update) = one_update(&longer);
+    assert_eq!(meta_got, meta(5007));
+    assert_eq!(update, resting(first, VenueOrderState::Open, PX, 150));
+    // Nor is a REJECTED for MODIFY_ORDER (3, 1) there an asynchronous reject.
+    let rejected = with_byte(longer, 126, 3);
+    let (meta_got, update) = one_update(&rejected);
     assert_eq!(meta_got, meta(5007));
     assert_eq!(update, resting(first, VenueOrderState::Open, PX, 150));
 }

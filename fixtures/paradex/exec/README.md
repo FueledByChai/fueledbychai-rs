@@ -26,7 +26,7 @@ Every frame is for BTC-USD-PERP. The client id `01000700-199b-81ab-8200-00054d0a
 | `order-foreign-cid-v1.sbe.txt` | OPEN with a random UUID client id |
 | `order-no-cid-v1.sbe.txt` | OPEN with an empty client id |
 | `order-market-ioc-v1.sbe.txt` | CLOSED and filled: a MARKET IOC order with a null price |
-| `order-v1-longer-block.sbe.txt` | OPEN at version 1 with a 128-byte block, its last two bytes shaped like a modify SUCCESS: a version-1 frame has no request_info, so they are skipped |
+| `order-v1-longer-block.sbe.txt` | OPEN at version 1 with a 128-byte block, its last two bytes a modify SUCCESS for MODIFY_ORDER (`04 01`) where version 2 puts request_info: a version-1 frame has no request_info, so they are skipped |
 | `order-closed-filled-v2.sbe.txt` | CLOSED at version 2, nothing open and no cancel reason: filled |
 | `order-closed-canceled-v2.sbe.txt` | CLOSED by `USER_CANCELED` after 0.05 filled |
 | `order-closed-post-only-v2.sbe.txt` | CLOSED by `POST_ONLY_WOULD_CROSS` |
