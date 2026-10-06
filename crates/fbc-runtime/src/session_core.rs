@@ -529,7 +529,9 @@ impl Core {
     }
 
     /// Executes `effects` in order, each with whether it was charged already and the input it
-    /// is attributed to ([`Self::execute`]).
+    /// is attributed to ([`Self::execute`]). Once the control has dropped none is executed and
+    /// the epoch has ended, so what a timer firing or an HTTP result asked for while a write
+    /// waited is not executed after a stop that came as the write completed (FBC-bnl).
     async fn run_effects(
         &mut self,
         ws: &mut Option<WebSocket>,
@@ -539,7 +541,7 @@ impl Core {
         let key = self.current();
         let epoch = key.epoch;
         let own = self.own;
-        let mut open = true;
+        let mut open = self.stop.has_changed().is_ok();
         while open
             && let Some((effect, origin)) =
                 next_admitted(&mut effects, &self.rates, key, own, ws.is_some())
@@ -602,6 +604,7 @@ impl Core {
                     self.counters.refused_effects += 1;
                 }
             }
+            open &= self.stop.has_changed().is_ok();
         }
         Ok(open)
     }
@@ -768,7 +771,7 @@ impl Core {
 
     /// A stamped HTTP result, when the epoch that asked is current; `None` when it ended
     /// (dropped and counted).
-    fn admit_http(
+    pub(crate) fn admit_http(
         &mut self,
         (stamp, done): (Stamp, Answered),
     ) -> Result<Option<(Stamp, Answered)>, SessionError> {
@@ -1112,5 +1115,52 @@ mod tests {
         for (message, want) in cases {
             assert_eq!(ws_control(&message), want, "{message:?}");
         }
+    }
+
+    /// Inputs no test here hands anything.
+    struct Nothing;
+
+    impl EpochInputs for Nothing {
+        fn redact_inbound(&self, _: Inbound<'_>) -> InboundSpans {
+            InboundSpans::NONE
+        }
+        fn ring(&mut self, _: &mut Epochs, _: Stamp, _: TimerTag, _: &mut Effects) {}
+        fn answer(&mut self, _: &mut Epochs, _: Stamp, _: Answered, _: &mut Effects) {}
+        fn on_tick_to_wire(&mut self, _: TickToWire) {}
+    }
+
+    /// FBC-bnl: once the control has dropped, the core executes no effect, so what was asked
+    /// for while a write waited is not executed after a stop that came as it completed.
+    #[tokio::test]
+    async fn once_the_control_dropped_no_effect_is_executed() {
+        let reserve = crate::ratelimit::SafetyReserve::percent(0).unwrap();
+        let (tx, stop) = watch::channel(());
+        let ms = Duration::from_millis;
+        let pacing = ReconnectPacing::new(ms(10), ms(100), 10, ms(1_000), ms(1_000)).unwrap();
+        let mut core = Core::new(CoreConfig {
+            own: StreamId(1),
+            connector: Connector::new(crate::ProxyConfig::Direct),
+            clock: IngestClock::new(),
+            pacing,
+            write_stall: ms(1_000),
+            conn: 1,
+            stop,
+            http_max_body: 0,
+            rates: RateLimiter::new(&[], reserve).unwrap(),
+        });
+        let timer = || Effect::Timer {
+            tag: TimerTag(1),
+            after: Duration::ZERO,
+        };
+        let mut fx = Effects::new();
+        fx.push(timer());
+        let open = core.execute(&mut None, &mut Nothing, fx, false, None).await;
+        assert_eq!((open, core.next_deadline().is_some()), (Ok(true), true));
+        let _ = core.take_timer();
+        drop(tx);
+        let mut fx = Effects::new();
+        fx.push(timer());
+        let open = core.execute(&mut None, &mut Nothing, fx, false, None).await;
+        assert_eq!((open, core.next_deadline()), (Ok(false), None));
     }
 }

@@ -189,8 +189,10 @@ rather than guess.
     `ExecSession` drives one account's order-entry connection as `plan_exec` plans it (0053):
     one `ExecCodec` across its epochs, `on_open` given exactly the nonces it asks for from the
     consumer's `NonceSource`, frames decoded inside `dispatch`, events stamped and handed to the
-    consumer's `ExecHandler` inline, a stop ending the epoch at once, reconnects paced (its
-    tests include the conformance toy by path);
+    consumer's `ExecHandler` inline, a stop ending the epoch at once, reconnects paced; the
+    codec's HTTP requests and timers answered only to the epoch that asked, `on_timer` given
+    exactly the nonces it asks for, and its keepalive its own timer (0056) (its tests include
+    the conformance toy by path);
     `tests/common/toy.rs` is the toy market-data venue later runtime tests reuse.
   - `crates/fbc-book` (it depends on `fbc-core` only: one tick-indexed L2 book per
     instrument and `BookId`, built from book events the same live and in replay, with
