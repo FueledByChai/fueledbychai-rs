@@ -1,0 +1,30 @@
+# OrderEvent (template 20): CLOSED, filled: a MARKET IOC buy with a null price
+# Hand-built from paradex_1_0.xml at tradeparadex/paradex-py b8248fb747e278d2167ac2f056b339a287d5ef30.
+# SYNTHETIC: the account is 32 made-up bytes (a0..bf), no Paradex account. Little-endian; '#' starts a comment.
+7e 00 14 00 01 00 01 00                           # header: blockLength=126 templateId=20 (OrderEvent) schemaId=1 version=1
+ce 98 7e 84 41 40 06 00                           # @0 ts int64 = 1759500000205006 us
+8e 13 00 00 00 00 00 00                           # @8 seq int64 = 5006
+04                                                # @16 status uint8 = 4 (CLOSED)
+01                                                # @17 side uint8 = 1 (BUY)
+02                                                # @18 orderType uint8 = 2 (MARKET)
+02                                                # @19 timeInForce uint8 = 2 (IOC)
+00 00 00 00 00 00 00 80                           # @20 price Price8NULL = -9223372036854775808 (null)
+00 00 00 00 00 00 00 80                           # @28 triggerPrice Price8NULL = null (not conditional)
+c0 e1 e4 00 00 00 00 00                           # @36 size Qty8 = 15000000 (0.15)
+00 00 00 00 00 00 00 00                           # @44 sizeOpen Qty8 = 0 (0)
+00 00 00 00 00 00 00 80                           # @52 avgFillPrice Price8NULL = null (not read)
+a0 fe 7c 84 41 40 06 00                           # @60 createdAt int64 = 1759500000100000 us (not read)
+9c 98 7e 84 41 40 06 00                           # @68 updatedAt int64 = 1759500000204956 us (not read)
+a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 aa ab ac ad ae af   # @76 account [32] bytes 0-15 (SYNTHETIC, not read)
+b0 b1 b2 b3 b4 b5 b6 b7 b8 b9 ba bb bc bd be bf   # @92 account [32] bytes 16-31 (SYNTHETIC, not read)
+b8 fa 7c 84 41 40 06 00                           # @108 receivedAt int64 = 1759500000099000 us (not read)
+c4 98 7e 84 41 40 06 00                           # @116 publishedAt int64 = 1759500000204996 us (not read)
+00                                                # @124 stp uint8 = 0 (NONE, not read)
+00                                                # @125 flags uint8 = 0x00
+13                                                # orderId varString8 length = 19
+31 37 35 39 35 30 30 30 30 30 30 30 30 30 30 30 30 30 31 # orderId = "1759500000000000001"
+24                                                # clientOrderId varString8 length = 36
+30 31 30 30 30 37 30 30 2d 31 39 39 62 2d 38 31 61 62 2d 38 32 30 30 2d 30 30 30 35 34 64 30 61 61 33 66 35 # clientOrderId = "01000700-199b-81ab-8200-00054d0aa3f5"
+0c                                                # market varString8 length = 12
+42 54 43 2d 55 53 44 2d 50 45 52 50               # market = "BTC-USD-PERP"
+00                                                # cancelReason varString8 length = 0

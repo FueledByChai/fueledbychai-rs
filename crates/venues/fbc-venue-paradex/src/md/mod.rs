@@ -499,14 +499,21 @@ fn frame_market<'s>(
 }
 
 /// The spec of the market spelled `symbol`.
-fn market<'s>(symbol: &str, specs: &'s SpecTable) -> Result<&'s InstrumentSpec, DecodeError> {
+pub(crate) fn market<'s>(
+    symbol: &str,
+    specs: &'s SpecTable,
+) -> Result<&'s InstrumentSpec, DecodeError> {
     specs
         .by_symbol(symbol)
         .ok_or(DecodeError::UnknownInstrument)
 }
 
 /// A root field the decoder needs, refused when the frame's block ends before it.
-fn required(block: &Block<'_>, offset: usize, what: &'static str) -> Result<i64, DecodeError> {
+pub(crate) fn required(
+    block: &Block<'_>,
+    offset: usize,
+    what: &'static str,
+) -> Result<i64, DecodeError> {
     block.i64_at(offset).ok_or(DecodeError::Malformed(what))
 }
 
@@ -531,7 +538,7 @@ fn level(
 }
 
 /// A `Price8` mantissa as ticks on the instrument's grid; refused off the grid or when null.
-fn price(spec: &InstrumentSpec, mantissa: i64) -> Result<Ticks, DecodeError> {
+pub(crate) fn price(spec: &InstrumentSpec, mantissa: i64) -> Result<Ticks, DecodeError> {
     let off = DecodeError::Malformed("price off the instrument's grid");
     if mantissa == NULL_I64 {
         return Err(off);
@@ -543,7 +550,7 @@ fn price(spec: &InstrumentSpec, mantissa: i64) -> Result<Ticks, DecodeError> {
 
 /// A `Qty8` mantissa as lots of the instrument's size step; refused off the step, negative or
 /// null.
-fn lots(spec: &InstrumentSpec, mantissa: i64) -> Result<Lots, DecodeError> {
+pub(crate) fn lots(spec: &InstrumentSpec, mantissa: i64) -> Result<Lots, DecodeError> {
     lots_of(spec, Decimal::new(mantissa, EXP.unsigned_abs().into()))
 }
 
@@ -559,13 +566,13 @@ fn lots_of(spec: &InstrumentSpec, value: Decimal) -> Result<Lots, DecodeError> {
 }
 
 /// A timestamp in microseconds as nanoseconds; refused where it does not fit.
-fn micros(us: i64) -> Result<ExchNs, DecodeError> {
+pub(crate) fn micros(us: i64) -> Result<ExchNs, DecodeError> {
     us.checked_mul(1_000)
         .map(ExchNs)
         .ok_or(DecodeError::Malformed("timestamp out of range"))
 }
 
 /// A sequence number; refused when negative.
-fn seq(seq: i64) -> Result<u64, DecodeError> {
+pub(crate) fn seq(seq: i64) -> Result<u64, DecodeError> {
     u64::try_from(seq).map_err(|_| DecodeError::Malformed("negative seq"))
 }

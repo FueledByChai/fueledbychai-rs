@@ -1,6 +1,7 @@
 //! Paradex order entry (BT-402, decision 0054): what it can do ([`exec_caps`], its rate limits
-//! in [`ORDER_OPS`] and [`order_limits`]) and the SBE schema version its order socket
-//! negotiates ([`ORDER_SBE_SCHEMA_VERSION`]). Order entry is WebSocket-only: every place,
+//! in [`ORDER_OPS`] and [`order_limits`]), the SBE schema version its order socket
+//! negotiates ([`ORDER_SBE_SCHEMA_VERSION`]), and its private `OrderEvent` decoded into order
+//! updates, a modify's request_info included ([`decode_order_event`]). Order entry is WebSocket-only: every place,
 //! amend and cancel is one of the socket's JSON-RPC methods, with no REST fallback.
 //!
 //! The order-entry codec is FBC-xvf's; the factory declares these caps, plans the endpoint and
@@ -9,8 +10,10 @@
 //! what it will declare.
 
 mod caps;
+mod order;
 
 pub use caps::{ORDER_OPS, exec_caps, order_limits};
+pub use order::{TEMPLATE_ORDER, decode_order_event};
 
 /// The SBE schema version the order socket negotiates (`sbeSchemaVersion=2`, schema id
 /// [`sbe::SCHEMA_ID`](crate::md::sbe::SCHEMA_ID)): `OrderEvent`'s request_info
