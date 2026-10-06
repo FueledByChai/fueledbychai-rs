@@ -1,4 +1,4 @@
-# 0052 — An order-entry session drives one connection with one ExecCodec across its epochs, hands each stamped event to the consumer's handler inline, and ends its epoch at once on a stop, augmenting 0023
+# 0053 — An order-entry session drives one connection with one ExecCodec across its epochs, hands each stamped event to the consumer's handler inline, and ends its epoch at once on a stop, augmenting 0023
 
 Status: accepted
 Date: 2026-10-05
