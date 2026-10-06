@@ -31,8 +31,11 @@ position, which its fill count must not count again (FBC-2e4, Codex r4189028838)
   the registry does not hold (an earlier run's), so a cancel of every order the registry holds
   (a Stop) reaches them; the seed then counts the snapshot's cumulative fill as the fills they
   have counted. Such an order is cancelled, never amended, since its time in force and channel
-  are not known. On a market already seeded, such an order is reported as untracked (0005's
-  I7), also when a fill since made its position unknown.
+  are not known. It was at the venue by the resync's request, so it counts as sent then (the
+  request's monotonic instant and watermark): a cancel the venue does not know puts it on the
+  Unknown ladder, whose settle and absence rules can end it Lost (Reviewer B's RB80-9 on
+  PR #80). On a market already seeded, such an order is reported as untracked (0005's I7),
+  also when a fill since made its position unknown.
 - **A fill straddling the snapshot.** Fills accepted before the seed are kept with their
   order, cumulative fill, matching-engine time and arrival (the ledger's monotonic `now`). The
   snapshot holds a fill when: it arrived before the request was sent (its `EncodeCtx.mono`,
@@ -99,8 +102,13 @@ position, which its fill count must not count again (FBC-2e4, Codex r4189028838)
 - A venue whose fills carry neither a cumulative fill nor a matching-engine time, with orders
   of ours resting across a restart (no cancel-on-disconnect), will often leave a market unknown
   after the seed; 0013's cancel-on-disconnect rule makes that rare.
-- A venue without a trustworthy snapshot source never has a market seeded by a resync: its
-  consumer seeds by hand (`Registry::seed_position`) or does not trade there.
+- A venue without a trustworthy snapshot source never has a market seeded by a resync, so it
+  does not trade: the owner's rule is that nothing is sent after a restart until the first
+  trustworthy resync. `Registry::seed_position` is for tests and fixtures, and for an
+  owner-assisted testnet run, never a way around that rule on a live venue. Such a venue
+  trades live only after a new decision record flips its snapshot source to trustworthy on
+  evidence (the owner's answer C to RB-olg-3, for Paradex). Reviewer B's RB80-10 on PR #80;
+  FBC-saw1 enforces it in code.
 - An order the consumer registers before the seed, and the snapshot does not show, leaves its
   market unknown once it fills after the watermark: conservative, and rare while nothing is
   sent before the seed.

@@ -9,14 +9,14 @@ use std::time::Duration;
 
 use common::{cid, fill, fill_id, lots, order_caps, placement, update, vid};
 use fbc_core::{
-    CidMatch, ClientOrderId, ExchNs, ExchTsKind, FillEvent, FillIdent, InstrumentId, MonoNs,
-    Namespace, NewOrder, OrderCaps, Side, SignedLots, SnapshotSource, Ticks, VenueOrderSnapshot,
-    VenueOrderState, WallNs,
+    CidMatch, ClientOrderId, ExchNs, ExchTsKind, FillEvent, FillIdent, InstrumentId, ItemRef,
+    MonoNs, Namespace, NewOrder, OrderCaps, Reject, RejectKind, RpcId, Side, SignedLots,
+    SnapshotSource, SubmitOutcome, Ticks, VenueOrderSnapshot, VenueOrderState, WallNs,
 };
 use fbc_oms::{
     Admission, CapRefusal, FillLedger, FillRouted, FillTime, LadderConfig, LedgerConfig,
-    MarketCapsConfig, OmsError, OrdState, OrderKey, PermitRefusal, PositionCheck, PreTradeCaps,
-    Registry, ResyncError, ResyncReport, ResyncSnapshot,
+    MarketCapsConfig, OmsError, OrdState, OrderKey, OrderOp, PermitRefusal, PositionCheck,
+    PreTradeCaps, Registry, ResyncError, ResyncReport, ResyncSnapshot, TerminalKind,
 };
 
 const INST: InstrumentId = InstrumentId::new(1);
@@ -262,6 +262,81 @@ fn an_order_a_resync_registers_counts_against_the_resting_cap() {
     reg.place(offer).unwrap();
     // Ended, it rests nothing: an L0 bid is admitted.
     reg.apply_update(&update(Some(earlier), common::canceled(), 0), key(2));
+    reg.place(placement(cid(), 100, L0)).unwrap();
+}
+
+#[test]
+fn an_order_a_resync_registers_is_sent_at_its_request_and_leaves_the_ladder_by_absence() {
+    // Settle 500 ns, two absent snapshots: an absence counts once a snapshot's watermark is at
+    // least the registering request's watermark plus the settle time.
+    let ladder = LadderConfig::new(
+        Duration::from_secs(1),
+        Duration::from_nanos(500),
+        Duration::from_secs(10),
+        2,
+    )
+    .unwrap();
+    let trustworthy = caps(SnapshotSource::Trustworthy);
+    let mut reg = registry_resting(L0);
+    let earlier = cid();
+    let report = resync(
+        &mut reg,
+        &snapshot(vec![shown(earlier, "e", L0, 0)], &[(INST, 0)]),
+    );
+    assert_eq!(report.registered, vec![earlier]);
+    // It was at the venue by the request that registered it: sent then (Reviewer B RB80-9).
+    assert_eq!(
+        reg.get(earlier).unwrap().sent_at(),
+        Some((MonoNs(REQ), WallNs(W)))
+    );
+    // Stop cancels it and the venue does not know it: on the Unknown ladder, fully resting.
+    reg.cancel_sent(earlier, RpcId(7), MonoNs(1_100)).unwrap();
+    reg.on_outcome(
+        earlier,
+        OrderOp::Cancel(RpcId(7)),
+        &ItemRef {
+            idx: 0,
+            cid: Some(earlier),
+            vid: None,
+        },
+        &SubmitOutcome::Rejected(Reject {
+            kind: RejectKind::NotFound,
+            venue_code: None,
+            raw: "not found".into(),
+        }),
+        MonoNs(1_200),
+    )
+    .unwrap();
+    assert!(reg.get(earlier).unwrap().unknown_since().is_some());
+    assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(L0)));
+    // Absent before the settle time has passed: not counted.
+    let report = reg
+        .resync(
+            &ladder,
+            &trustworthy,
+            &snapshot_at(W + 400, 1_400, vec![], &[(INST, 0)]),
+            key(2),
+        )
+        .unwrap();
+    assert!(report.ladder.lost.is_empty());
+    assert_eq!(reg.get(earlier).unwrap().absent_snapshots(), 0);
+    // Absent from two trustworthy snapshots past it: Lost, and the side rests nothing.
+    for (n, w) in [(3, W + 500), (4, W + 900)] {
+        let report = reg
+            .resync(
+                &ladder,
+                &trustworthy,
+                &snapshot_at(w, 2_000 + w as u64, vec![], &[(INST, 0)]),
+                key(n),
+            )
+            .unwrap();
+        assert_eq!(report.ladder.lost.is_empty(), n == 3, "resync {n}");
+    }
+    assert_eq!(
+        reg.get(earlier).unwrap().state(),
+        OrdState::Terminal(TerminalKind::Lost)
+    );
+    assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(0)));
     reg.place(placement(cid(), 100, L0)).unwrap();
 }
 

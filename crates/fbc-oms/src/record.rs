@@ -301,8 +301,15 @@ impl OrderRecord {
     /// PendingNew until the snapshot applies as its update. Its placement is the snapshot's
     /// side, total, price and the flags it echoes (false when it does not); its time in force
     /// and channel are not known, so the order is never amended
-    /// ([`PermitRefusal::FromSnapshot`](crate::PermitRefusal::FromSnapshot)).
-    pub(crate) fn seeded_from(cid: ClientOrderId, o: &VenueOrderSnapshot) -> OrderRecord {
+    /// ([`PermitRefusal::FromSnapshot`](crate::PermitRefusal::FromSnapshot)). It was at the
+    /// venue by the resync's request, so it counts as sent then: `at` on the monotonic clock and
+    /// `wall`, the snapshot's watermark, from which the Unknown ladder's settle time runs.
+    pub(crate) fn seeded_from(
+        cid: ClientOrderId,
+        o: &VenueOrderSnapshot,
+        at: MonoNs,
+        wall: WallNs,
+    ) -> OrderRecord {
         let mut rec = OrderRecord::new(NewOrder {
             cid,
             inst: o.inst,
@@ -316,6 +323,7 @@ impl OrderRecord {
             reducing: false,
         });
         rec.from_snapshot = true;
+        rec.sent = Some((at, wall));
         rec
     }
 
@@ -515,7 +523,8 @@ impl OrderRecord {
     }
 
     /// When the placement was sent, on the monotonic and the wall clock, once recorded
-    /// ([`Registry::placement_sent`](crate::Registry::placement_sent)).
+    /// ([`Registry::placement_sent`](crate::Registry::placement_sent)); for an order a resync
+    /// registered from its snapshot, that resync's request and watermark.
     pub fn sent_at(&self) -> Option<(MonoNs, WallNs)> {
         self.sent
     }

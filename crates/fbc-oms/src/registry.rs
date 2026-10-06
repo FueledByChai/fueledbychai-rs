@@ -343,6 +343,10 @@ impl Registry {
     /// the pre-trade caps admit no place or amend on it ([`CapRefusal::PositionUnknown`]).
     /// Refused once the market is seeded, and once a fill moved its inventory before it was
     /// seeded: only a resync's snapshot can place such a fill, so the market stays unknown.
+    ///
+    /// For tests, fixtures and an owner-assisted testnet run only: a hand seed is never a way
+    /// around the rule that nothing is sent after a restart until the first trustworthy resync
+    /// (decision 0055's Consequences, Reviewer B's RB80-10 on PR #80).
     pub fn seed_position(&mut self, inst: InstrumentId, pos: SignedLots) -> Result<(), OmsError> {
         match self.markets.get(&inst) {
             Some(MarketState::Seeded(_) | MarketState::Unsettled) => {
