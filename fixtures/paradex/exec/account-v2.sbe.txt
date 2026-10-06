@@ -1,0 +1,20 @@
+# AccountEvent (template 23): version 2 with lastSeenNotification (121-byte block): account value 598.76543211, free collateral 0
+# Hand-built from paradex_1_0.xml at tradeparadex/paradex-py b8248fb747e278d2167ac2f056b339a287d5ef30.
+# SYNTHETIC: the account is 32 made-up bytes (a0..bf), no Paradex account. Little-endian; '#' starts a comment.
+79 00 17 00 01 00 02 00                           # header: blockLength=121 templateId=23 (AccountEvent) schemaId=1 version=2
+62 38 83 84 41 40 06 00                           # @0 ts int64 = 1759500000508002 us
+42 1f 00 00 00 00 00 00                           # @8 seq int64 = 8002
+00 58 47 f8 0d 00 00 00                           # @16 totalCollateral Value8 = 60000000000 (600, not read)
+00 00 00 00 00 00 00 00                           # @24 freeCollateral Value8 = 0 (0)
+00 94 35 77 00 00 00 00                           # @32 initialMarginReq Value8 = 2000000000 (20, not read)
+80 7c 81 4a 00 00 00 00                           # @40 maintenanceMarginReq Value8 = 1250000000 (12.5, not read)
+eb 8a eb f0 0d 00 00 00                           # @48 accountValue Value8 = 59876543211 (598.76543211)
+00 00 00 00 00 00 00 80                           # @56 unrealizedPnl Value8NULL = null (always null, not read)
+44 38 83 84 41 40 06 00                           # @64 updatedAt int64 = 1759500000507972 us (not read)
+a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 aa ab ac ad ae af   # @72 account [32] bytes 0-15 (SYNTHETIC, not read)
+b0 b1 b2 b3 b4 b5 b6 b7 b8 b9 ba bb bc bd be bf   # @88 account [32] bytes 16-31 (SYNTHETIC, not read)
+6b 0e 6a a6 0d 00 00 00                           # @104 marginCushion Value8 = 58626543211 (586.26543211, not read)
+01                                                # @112 status uint8 = 1 (ACTIVE, not read)
+c0 35 6c 84 41 40 06 00                           # @113 lastSeenNotification int64 = 1759499999000000 us, sinceVersion 2 (not read)
+04                                                # settlementAsset varString8 length = 4
+55 53 44 43                                       # settlementAsset = "USDC"

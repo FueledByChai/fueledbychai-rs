@@ -1,4 +1,4 @@
-# Paradex SBE order-event and fill-event frames
+# Paradex SBE order, fill, position and account frames
 
 Hand-built, every one: each `.sbe.txt` file is one binary frame written as whitespace-separated
 hex bytes, one field per line, `#` to the end of a line a comment. The `account` field of each
@@ -14,8 +14,13 @@ after `cancelReason`. The schema says version 2 describes both layouts, so a dec
 block length from the header and takes absent appended var data as missing. `FillEvent`
 (template 21) has a 107-byte root block up to version 1; at version 2 `flags` and
 `orderbookSeqNo` are appended (a 116-byte block), `seq` is optional (null for position
-transfers), and `feeCurrency` follows `market`. The order socket negotiates 1:2 (0054). The
-offsets match FueledByChaiTrading's `ParadexSbeTranscoder`.
+transfers), and `feeCurrency` follows `market`. `PositionEvent` (template 22) has a 154-byte
+root block at every version, then `market` and `lastFillId`. `AccountEvent` (template 23) has a
+113-byte root block; at version 2 `lastSeenNotification` may be appended in place (a 121-byte
+block), then `settlementAsset`. The order socket negotiates 1:2 (0054). The offsets match
+FueledByChaiTrading's `ParadexSbeTranscoder` (which has no `PositionEvent`) and paradex-py's
+generated decoder at that commit, which reads every position and account frame here as its
+title says.
 
 Every frame is for BTC-USD-PERP. The client id `01000700-199b-81ab-8200-00054d0aa3f5` (and
 `...-00099b9bf518`) is the first (and second) id the tests mint in their namespace;
@@ -47,6 +52,15 @@ Every frame is for BTC-USD-PERP. The client id `01000700-199b-81ab-8200-00054d0a
 | `fill-liquidation-v2.sbe.txt` | LIQUIDATION at version 2: 0.15 sold at 61000.0, realizedPnl -150; it carries one of our client ids, which a venue-initiated fill does not match |
 | `fill-transfer-null-seq-v2.sbe.txt` | UNWIND_TRANSFER at version 2: a null `seq`, no order id or client id, liquidity NON_REPRESENTABLE |
 | `fill-short-block.sbe.txt` | A version-2 header declaring a 116-byte block, the frame ending 43 bytes into it |
+| `position-long-v2.sbe.txt` | PositionEvent at version 2: long (BUY) 0.15 at an average entry of 61234.56789012, off the 0.1 tick |
+| `position-short-v1.sbe.txt` | PositionEvent at version 1: short (SELL) 0.05 at an average entry of 62000.05 |
+| `position-closed-v2.sbe.txt` | PositionEvent CLOSED: size 0, its last average entry 61900.0 still stated |
+| `position-longer-block-v2.sbe.txt` | The long position with a 162-byte block: 8 bytes past `status`, skipped |
+| `position-short-block.sbe.txt` | A version-2 header declaring a 154-byte block, the frame ending 40 bytes into it |
+| `account-v1.sbe.txt` | AccountEvent at version 1 (113-byte block): account value 612.34, free collateral 550.25, settlement asset USDC |
+| `account-v2.sbe.txt` | AccountEvent at version 2 with `lastSeenNotification` (121-byte block): account value 598.76543211, free collateral 0 |
+| `account-longer-block-v2.sbe.txt` | The version-2 account frame with a 129-byte block: 8 bytes past `lastSeenNotification`, skipped |
+| `account-short-block.sbe.txt` | A version-2 header declaring a 121-byte block, the frame ending 30 bytes into it |
 
 The cancel reasons are the ones a source names: `USER_CANCELED` (the example of the
 `orders.{market_symbol}` channel in Paradex's AsyncAPI specification, and the Java library's
@@ -54,6 +68,7 @@ The cancel reasons are the ones a source names: `USER_CANCELED` (the example of 
 production runs) and `NOT_ENOUGH_MARGIN` (the example of `cancel_reason` on the "Get order"
 REST page). No Paradex page lists every cancel reason.
 
-The fill and trade ids are made up. The tests
-(`crates/venues/fbc-venue-paradex/tests/exec_order_events.rs` and `exec_fill_events.rs`) also
-change single bytes of these frames to reach the decoders' refusals.
+The fill and trade ids, and every position and account amount, are made up. The tests
+(`crates/venues/fbc-venue-paradex/tests/exec_order_events.rs`, `exec_fill_events.rs` and
+`exec_position_account_events.rs`) also change single bytes of these frames to reach the
+decoders' refusals.

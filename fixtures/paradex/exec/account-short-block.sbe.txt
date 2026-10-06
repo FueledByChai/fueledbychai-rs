@@ -1,0 +1,8 @@
+# AccountEvent (template 23): a version-2 header declaring a 121-byte block, the frame ending 30 bytes into it
+# Hand-built from paradex_1_0.xml at tradeparadex/paradex-py b8248fb747e278d2167ac2f056b339a287d5ef30.
+# SYNTHETIC: the account is 32 made-up bytes (a0..bf), no Paradex account. Little-endian; '#' starts a comment.
+79 00 17 00 01 00 02 00                           # header: blockLength=121 templateId=23 (AccountEvent) schemaId=1 version=2
+64 38 83 84 41 40 06 00                           # @0 ts int64 = 1759500000508004 us
+44 1f 00 00 00 00 00 00                           # @8 seq int64 = 8004
+00 58 47 f8 0d 00 00 00                           # @16 totalCollateral Value8 = 60000000000 (600, not read)
+00 00 00 00 00 00                                 # the first 6 bytes of: @24 freeCollateral Value8 = 0 (0)

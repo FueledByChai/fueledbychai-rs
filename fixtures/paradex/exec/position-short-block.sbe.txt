@@ -1,0 +1,10 @@
+# PositionEvent (template 22): a version-2 header declaring a 154-byte block, the frame ending 40 bytes into it
+# Hand-built from paradex_1_0.xml at tradeparadex/paradex-py b8248fb747e278d2167ac2f056b339a287d5ef30.
+# SYNTHETIC: the account is 32 made-up bytes (a0..bf), no Paradex account. Little-endian; '#' starts a comment.
+9a 00 16 00 01 00 02 00                           # header: blockLength=154 templateId=22 (PositionEvent) schemaId=1 version=2
+dd ad 81 84 41 40 06 00                           # @0 ts int64 = 1759500000407005 us
+5d 1b 00 00 00 00 00 00                           # @8 seq int64 = 7005
+01                                                # @16 side uint8 = 1 (BUY, long)
+c0 e1 e4 00 00 00 00 00                           # @17 size Qty8 = 15000000 (0.15, absolute)
+14 7a 77 ba 91 05 00 00                           # @25 avgEntryPrice Price8 = 6123456789012 (61234.56789012)
+80 83 7e b5 ff ff ff                              # the first 7 bytes of: @33 unrealizedPnl Value8 = -1250000000 (-12.5, not read)

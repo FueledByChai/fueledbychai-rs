@@ -1,9 +1,11 @@
 //! Paradex order entry (BT-402, decision 0054): what it can do ([`exec_caps`], its rate limits
 //! in [`ORDER_OPS`] and [`order_limits`]), the SBE schema version its order socket
-//! negotiates ([`ORDER_SBE_SCHEMA_VERSION`]), and its private `OrderEvent` decoded into order
-//! updates, a modify's request_info included ([`decode_order_event`]), and its private
-//! `FillEvent` decoded into fills with the venue's realized P&L and funding
-//! ([`decode_fill_event`]). Order entry is WebSocket-only: every place,
+//! negotiates ([`ORDER_SBE_SCHEMA_VERSION`]), and its private events decoded: `OrderEvent`
+//! into order updates, a modify's request_info included ([`decode_order_event`]); `FillEvent`
+//! into fills with the venue's realized P&L and funding ([`decode_fill_event`]);
+//! `PositionEvent` into the account's position in a market ([`decode_position_event`]); and
+//! `AccountEvent` into its balance ([`decode_account_event`]). Funding reaches the account only
+//! as each fill's realized funding (decision 0059). Order entry is WebSocket-only: every place,
 //! amend and cancel is one of the socket's JSON-RPC methods, with no REST fallback.
 //!
 //! The order-entry codec is FBC-xvf's; the factory declares these caps, plans the endpoint and
@@ -11,10 +13,14 @@
 //! market data only and [`caps_with_order_entry`](crate::factory::caps_with_order_entry) is
 //! what it will declare.
 
+mod account;
 mod caps;
 mod fill;
 mod order;
 
+pub use account::{
+    TEMPLATE_ACCOUNT, TEMPLATE_POSITION, decode_account_event, decode_position_event,
+};
 pub use caps::{ORDER_OPS, exec_caps, order_limits};
 pub use fill::{TEMPLATE_FILL, decode_fill_event};
 pub use order::{TEMPLATE_ORDER, decode_order_event};
