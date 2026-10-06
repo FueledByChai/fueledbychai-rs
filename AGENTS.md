@@ -195,8 +195,9 @@ rather than guess.
     codec only through its `ExecOrders`, as an fbc-oms `Authorization` for its account or a
     `ControlCommand`, each encoded on its next turn with one reserved nonce per item and
     reported once to `ExecHandler::on_submitted` (sent, or `NotSent` with nothing written: no
-    authenticated epoch, the codec's refusal, effects that do not carry the request, the
-    buckets), and each unanswered request handed to `on_rpc_timeout` once at its deadline,
+    authenticated epoch, the codec's refusal, effects that do not carry the request or make an
+    HTTP request, the buckets), request ids from the account's `RpcIds` shared by its sessions,
+    and each unanswered request handed to `on_rpc_timeout` once at its deadline,
     across a reconnect too, never written again (0057; compile-fail cases in
     `tests/ui_submit/`) (its tests include the conformance toy by path);
     `tests/common/toy.rs` is the toy market-data venue later runtime tests reuse.

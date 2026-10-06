@@ -580,6 +580,7 @@ fn setup(
         cfg,
         creds: Secrets::new(),
         acct: fbc_core::AccountKey::new(1),
+        rpc_ids: fbc_runtime::RpcIds::default(),
         ns: OWN_NS,
         specs: exec_toy::specs(),
         connector: Connector::new(ProxyConfig::Direct),

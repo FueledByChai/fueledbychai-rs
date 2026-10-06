@@ -114,7 +114,7 @@ pub use books::{BookHandler, BookKeeper, MdBooks, TradingBookConflict, TradingBo
 pub use connector::{Connector, ProxyConfig};
 pub use epoch::{Admit, EpochError, Epochs, Input};
 pub use error::{Cause, NetError, Step};
-pub use exec_orders::{ExecOrders, SubmitRefusal};
+pub use exec_orders::{ExecOrders, RpcIds, SubmitRefusal};
 pub use exec_session::{
     ExecControl, ExecCounters, ExecHandler, ExecSession, ExecSessionConfig, ExecSessionError,
 };

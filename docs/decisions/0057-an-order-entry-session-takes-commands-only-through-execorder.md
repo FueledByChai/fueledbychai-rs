@@ -27,26 +27,44 @@ frame unwritten while the codec believed it sent (FBC-m2xw).
   for another account than the session's (`ExecSessionConfig::acct`) as
   `SubmitRefusal::OtherAccount`; `submit_control(ControlCommand)` takes one that affects no
   order. Neither takes a `VenueCommand`, and the session has no other way to write a command
-  (`tests/submit_compile_fail.rs`). Each submission is given its `RpcId` at once (counted from 1
-  per session) and is taken on the session's next turn, after the input being handled; once the
-  session has run or dropped, both refuse with `SubmitRefusal::Ended`. The runtime does not
+  (`tests/submit_compile_fail.rs`). Each submission is given its `RpcId` at once, from the
+  account's `RpcIds` (`ExecSessionConfig::rpc_ids`): the consumer builds one per account and
+  hands a clone to every session it builds for the account, so ids never repeat for the account
+  across sessions, whose unresolved requests fbc-oms and the journal outlive (`RpcIds::after`
+  resumes them from a journal). It is taken on the session's next turn, after the input being
+  handled; a turn takes only the commands waiting as it began, and the session yields while more
+  wait, so a handler that submits from `on_submitted` cannot hold it. Once the session has run
+  or dropped, both refuse with `SubmitRefusal::Ended`. The runtime does not
   implement `OrderGateway`: its `ctx` argument would let a caller choose nonces the session's
   source never reserved. The trait stays for gateways that take their context from outside
   (SimVenue, a managed gateway).
 - **What became of it, once, to the handler.** `ExecHandler::on_submitted(SubmitHandle)` is
-  called once per submission, in submission order, before any event answering its request: the
+  called once per submission while the session lasts, in submission order, before any event
+  answering its request: the
   receipt with the nonces the encode used, or `NotSent` and why. A command is
   `NotSent(Disconnected)` when it was submitted while the stream had no epoch the codec
   reported `Authenticated`, or is taken on another epoch than that one, including while the
   session waits to reconnect; `NotSent` for the codec's reason when `encode` refuses it;
   `NotSent(Unencodable)` when its effects do not carry its request (`Effects::carry_request`),
-  name another stream or ask to reconnect, or a batch is longer than `u16::MAX` items; and
+  name another stream, ask to reconnect or make an HTTP request, or a batch is longer than
+  `u16::MAX` items; and
   `NotSent(RateBudget)` when the buckets do not admit its frames together. In each of those
   cases nothing is written and no deadline is set. Otherwise it is encoded with an `EncodeCtx`
   holding exactly `VenueCommand::items()` nonces from the session's source and the shard
   clock's time, the handler is told it was sent, and its effects are executed, its frames
   already charged. A source that reserves another count ends the session with
-  `ExecSessionError::Nonces`, before `encode`, as for `on_timer`.
+  `ExecSessionError::Nonces`, before `encode`, as for `on_timer`. The codec is not told of a
+  `NotSent` decided after its `encode` (`Unencodable`, `RateBudget`): it keeps no state per
+  request that only an answer or `on_rpc_timeout` releases until its effects are executed.
+  Once the session ends, nothing more is reported: not the commands still waiting, nor the one
+  whose nonces were mis-reserved, and one reported sent as the control dropped may not have been
+  written; the consumer holds each submission not reported, or reported sent and not answered,
+  unresolved until the venue is read again (0013 rule 1).
+- **Order entry is WebSocket-only.** An encode that makes an HTTP request is
+  `NotSent(Unencodable)`, nothing requested. An HTTP request gets no deadline in the RPC table,
+  its result is dropped once its epoch ends (0027) and the rate pre-charge covers frames only,
+  so it could leave a command reported sent that never reaches `Unknown`. Paradex's order entry
+  is WebSocket-only (owner); HTTP order entry is FBC-4nfb's.
 - **Authenticated is the codec's word.** The session's own stream's epoch is authenticated from
   the `Conn { Authenticated }` event the codec pushes for it until another `Conn` state for it
   or the epoch's end.
@@ -91,12 +109,16 @@ frame unwritten while the codec believed it sent (FBC-m2xw).
 - The rate-limit refusal of a submitted command's frames is reported, not dropped; FBC-m2xw
   still decides it for the frames a codec asks for from `on_frame`.
 - FBC-2pr journals the nonce blocks, encode contexts and deadline firings this record adds, so
-  replay can take them where the live session did.
+  replay can take them where the live session did, and resumes an account's `RpcIds` after the
+  last id journaled.
+- A consumer builds one `RpcIds` per account and passes it in every `ExecSessionConfig` for it.
 
 ## What would show this was wrong
 
 - A request written twice, or a request unanswered at its deadline not reported `Unknown`.
 - A consumer that needs a command's receipt in the same call that submitted it (the shard host's
   decide pass), which would bring the synchronous `OrderGateway` shape back to the runtime.
+- A request id given twice for one account, or a venue whose order entry needs HTTP before
+  FBC-4nfb.
 - A venue whose request outlives its connection (answered on the next one), for which a
   `NotSent(Disconnected)` on a later epoch would refuse what it could still take.

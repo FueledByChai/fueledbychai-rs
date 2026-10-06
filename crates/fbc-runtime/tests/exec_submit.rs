@@ -28,16 +28,16 @@ use exec_toy::{OWN_NS, RPC_TIMEOUT, TOY_TOKEN, ToyExec, ToySigner};
 use fbc_core::{
     AccountKey, AccountSummary, AckLevel, AssetKey, ConfigError, ConnKey, ConnState, CtxCall,
     DecodeError, DecodeScope, Effect, Effects, EncodeCtx, EncodeReceipt, EndpointPlan, Envelope,
-    ExecCodec, ExecEndpoint, ExecEvent, ExecSink, FieldSpec, HttpFailure, HttpPlan, HttpResponse,
-    HttpTag, Inbound, InboundSpans, InstrumentSpecDraft, MdCodec, NonceBlock, NonceSource,
-    NotSentReason, PathStamps, RawFrame, RpcId, Secrets, SpecTable, StreamId, SubmitHandle,
-    SubmitOutcome, Subscription, SymbolError, TimerTag, VenueCaps, VenueCommand, VenueConfig,
-    VenueError, VenueFactory, WireUrl,
+    ExecCodec, ExecEndpoint, ExecEvent, ExecSink, FieldSpec, HttpFailure, HttpMethod, HttpPlan,
+    HttpRequest, HttpResponse, HttpTag, Inbound, InboundSpans, InstrumentSpecDraft, MdCodec,
+    NonceBlock, NonceSource, NotSentReason, PathStamps, RawFrame, RpcId, Secrets, SpecTable,
+    StreamId, SubmitHandle, SubmitOutcome, Subscription, SymbolError, TimerTag, VenueCaps,
+    VenueCommand, VenueConfig, VenueError, VenueFactory, WireUrl,
 };
 use fbc_oms::ControlCommand;
 use fbc_runtime::{
     Connector, ExecHandler, ExecOrders, ExecSession, ExecSessionConfig, ExecSessionError,
-    IngestClock, ProxyConfig, RateLimiter, ReconnectPacing, SafetyReserve, SubmitRefusal,
+    IngestClock, ProxyConfig, RateLimiter, ReconnectPacing, RpcIds, SafetyReserve, SubmitRefusal,
     WriteStall,
 };
 use tokio::time::{Instant, advance};
@@ -54,6 +54,8 @@ const STRIP: &str = "submit.strip";
 const TIMER: &str = "submit.timer";
 /// A number: the toy's account limit admits this many units a second, not 50.
 const UNITS: &str = "submit.units";
+/// Any value: the codec's encodes carry their request as an HTTP request, not a frame.
+const HTTP: &str = "submit.http";
 
 /// The account the tests' sessions trade.
 const ACCT: AccountKey = AccountKey::new(4);
@@ -149,6 +151,7 @@ impl VenueFactory for SubmitToy {
             calls: Arc::clone(&self.calls),
             strip: cfg.get(STRIP).is_some(),
             timer: cfg.get(TIMER).is_some(),
+            http: cfg.get(HTTP).is_some(),
         })))
     }
 
@@ -162,12 +165,14 @@ impl VenueFactory for SubmitToy {
 }
 
 /// The toy's codec, logging each encode and timeout; with `strip`, an encode's frames name no
-/// request, and with `timer`, an encode also sets a timer.
+/// request, with `timer`, an encode also sets a timer, and with `http`, an encode's frames go
+/// as HTTP requests naming the request instead.
 struct Logged {
     inner: ToyExec,
     calls: Calls,
     strip: bool,
     timer: bool,
+    http: bool,
 }
 
 impl ExecCodec for Logged {
@@ -211,6 +216,32 @@ impl ExecCodec for Logged {
                         stream,
                         frame,
                         rpc: None,
+                        class,
+                        charge,
+                    },
+                    other => other,
+                });
+            }
+        }
+        if self.http {
+            for effect in fx.take() {
+                fx.push(match effect {
+                    Effect::Send {
+                        frame,
+                        rpc: Some(call),
+                        class,
+                        charge,
+                        ..
+                    } => Effect::Http {
+                        tag: HttpTag(call.id.0),
+                        req: HttpRequest {
+                            method: HttpMethod::Post,
+                            url: WireUrl::plain("http://127.0.0.1:9/orders"),
+                            headers: Vec::new(),
+                            body: frame,
+                        },
+                        rpc: Some(call.id),
+                        timeout: call.timeout,
                         class,
                         charge,
                     },
@@ -332,6 +363,7 @@ fn setup(
         cfg: venue_cfg,
         creds: Secrets::new(),
         acct: ACCT,
+        rpc_ids: RpcIds::default(),
         ns: OWN_NS,
         specs: exec_toy::specs(),
         connector: Connector::new(ProxyConfig::Direct),
@@ -804,6 +836,66 @@ async fn a_command_whose_effects_do_not_carry_its_request_is_not_sent_with_no_by
     assert!(outcomes(&log).is_empty());
 }
 
+/// A command whose encode carries its request as an HTTP request is `NotSent(Unencodable)`:
+/// order entry is WebSocket-only (decision 0057), since an HTTP request gets no deadline and
+/// its result is dropped once its epoch ends, so it could never come back `Unknown` (PR #87
+/// Reviewer A, Reviewer B B1). Nothing is written or requested, and no `Unknown` follows.
+#[tokio::test(start_paused = true)]
+async fn a_command_whose_encode_carries_its_request_over_http_is_not_sent_with_nothing_requested() {
+    let frozen = freeze();
+    let mut server = ScriptedWs::start().await;
+    let venue = SubmitToy::leak();
+    let (config, _) = setup(venue, &server.url(), quick(), &[(HTTP, "1")]);
+    let log = Log::default();
+    let (mut session, control) = ExecSession::new(config, Keep::new(&log)).unwrap();
+    let orders = session.orders();
+    let watch = Rc::clone(&log);
+    let script = async move {
+        let mut peer = server.accept().await;
+        peer.recv().await;
+        peer.send(AUTH_ACK);
+        settle(|| authentications(&watch) == 1).await;
+        let rpc = orders.submit_control(REFRESH).unwrap();
+        settle(|| handles(&watch).len() == 1).await;
+        advance(RPC_TIMEOUT * 2).await;
+        churn().await;
+        assert!(peer.quiet());
+        drop(control);
+        rpc
+    };
+    let (run, rpc) = tokio::join!(session.run(), script);
+    run.unwrap();
+    drop(frozen);
+
+    let refused = SubmitHandle {
+        rpc,
+        receipt: Err(NotSentReason::Unencodable),
+    };
+    assert_eq!(handles(&log), [refused]);
+    let calls = venue.calls();
+    assert!(matches!(&calls[..], [Call::Encode { .. }]), "{calls:?}");
+    assert!(outcomes(&log).is_empty());
+}
+
+/// Request ids are unique for the account across the sessions built in turn for it, so an
+/// answer, or an `Unknown`, for one session's request can never be matched to an earlier
+/// session's request whose fate fbc-oms still waits on (PR #87 Reviewer B B2).
+#[tokio::test(start_paused = true)]
+async fn request_ids_are_unique_for_the_account_across_its_sessions() {
+    let server = ScriptedWs::start().await;
+    let venue = SubmitToy::leak();
+    let (first, _) = setup(venue, &server.url(), quick(), &[]);
+    let (mut second, _) = setup(venue, &server.url(), quick(), &[]);
+    // The account's one counter, handed to each session built for it.
+    second.rpc_ids = first.rpc_ids.clone();
+    let (session, _control) = ExecSession::new(first, |_: Envelope<ExecEvent>| {}).unwrap();
+    let earlier = session.orders().submit_control(REFRESH).unwrap();
+    drop(session);
+    let (session, _control) = ExecSession::new(second, |_: Envelope<ExecEvent>| {}).unwrap();
+    let later = session.orders().submit_control(REFRESH).unwrap();
+    assert_ne!(earlier, later);
+}
+
 // ---------------------------------------------------------------------------------------------
 // The error paths.
 // ---------------------------------------------------------------------------------------------
@@ -1011,4 +1103,106 @@ async fn a_handler_that_takes_no_handles_still_gets_nothing_written_unauthentica
     drop(frozen);
     assert!(venue.calls().is_empty());
     assert!(reserved.lock().unwrap().is_empty());
+}
+
+/// The most times a [`Resubmit`] submits again.
+const AGAIN: usize = 1_000;
+
+/// A handler that keeps what it hears and, once `orders` is set, submits a refresh again each
+/// time it is told one was not sent, up to [`AGAIN`] times.
+struct Resubmit {
+    log: Log,
+    orders: Rc<RefCell<Option<ExecOrders>>>,
+}
+
+impl ExecHandler for Resubmit {
+    fn on_exec(&mut self, env: Envelope<ExecEvent>) {
+        self.log.borrow_mut().push(Heard::Event(Box::new(env)));
+    }
+
+    fn on_submitted(&mut self, handle: SubmitHandle) {
+        let again = handle.receipt.is_err() && handles(&self.log).len() < AGAIN;
+        self.log.borrow_mut().push(Heard::Submitted(handle));
+        if let Some(orders) = self.orders.borrow().as_ref().filter(|_| again) {
+            let _ = orders.submit_control(REFRESH);
+        }
+    }
+
+    fn on_epoch_end(&mut self, key: ConnKey) {
+        self.log.borrow_mut().push(Heard::End(key));
+    }
+}
+
+/// A handler that submits again from `on_submitted` each time it hears a command was not sent
+/// cannot hold the session in one turn: a turn takes only what waited as it began, and the
+/// session yields while more waits, so a control dropped meanwhile stops it (PR #87 Reviewer B
+/// B5). In an epoch, every refresh is refused by the buckets.
+#[tokio::test(start_paused = true)]
+async fn a_handler_resubmitting_what_was_not_sent_cannot_hold_an_epoch_in_one_turn() {
+    let frozen = freeze();
+    let mut server = ScriptedWs::start().await;
+    let venue = SubmitToy::leak();
+    // One unit a second: the authentication takes it.
+    let (config, _) = setup(venue, &server.url(), quick(), &[(UNITS, "1")]);
+    let log = Log::default();
+    let shared = Rc::default();
+    let handler = Resubmit {
+        log: Rc::clone(&log),
+        orders: Rc::clone(&shared),
+    };
+    let (mut session, control) = ExecSession::new(config, handler).unwrap();
+    let orders = session.orders();
+    *shared.borrow_mut() = Some(orders.clone());
+    let watch = Rc::clone(&log);
+    let script = async move {
+        let mut peer = server.accept().await;
+        peer.recv().await;
+        peer.send(AUTH_ACK);
+        settle(|| watch.borrow().len() == 1).await;
+        orders.submit_control(REFRESH).unwrap();
+        settle(|| !handles(&watch).is_empty()).await;
+        drop(control);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    drop(frozen);
+    let heard = handles(&log);
+    assert!(heard.len() < AGAIN, "{}", heard.len());
+    let rate = |h: &SubmitHandle| h.receipt == Err(NotSentReason::RateBudget);
+    assert!(heard.iter().all(rate));
+}
+
+/// The same while the session waits to reconnect: every command is `NotSent(Disconnected)`,
+/// and a handler submitting again each time still lets the control's drop stop the session.
+#[tokio::test(start_paused = true)]
+async fn a_handler_resubmitting_what_was_not_sent_cannot_hold_the_wait_to_reconnect() {
+    let frozen = freeze();
+    let mut server = ScriptedWs::start().await;
+    let venue = SubmitToy::leak();
+    let (config, _) = setup(venue, &server.url(), slow(), &[]);
+    let log = Log::default();
+    let shared = Rc::default();
+    let handler = Resubmit {
+        log: Rc::clone(&log),
+        orders: Rc::clone(&shared),
+    };
+    let (mut session, control) = ExecSession::new(config, handler).unwrap();
+    let orders = session.orders();
+    *shared.borrow_mut() = Some(orders.clone());
+    let watch = Rc::clone(&log);
+    let script = async move {
+        let peer = server.accept().await;
+        peer.drop_conn();
+        settle(|| ends(&watch) == 1).await;
+        orders.submit_control(REFRESH).unwrap();
+        settle(|| !handles(&watch).is_empty()).await;
+        drop(control);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    drop(frozen);
+    let heard = handles(&log);
+    assert!(heard.len() < AGAIN, "{}", heard.len());
+    let gone = |h: &SubmitHandle| h.receipt == Err(NotSentReason::Disconnected);
+    assert!(heard.iter().all(gone));
 }
