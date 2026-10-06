@@ -33,6 +33,7 @@ use fbc_core::{
 };
 
 use crate::caps::{Adds, CapRefusal, Exposure};
+use crate::entry::StateRefusal;
 use crate::record::{Intent, OrdState, OrderRecord};
 
 /// Why the registry gives no permit for an order.
@@ -98,6 +99,9 @@ pub enum AmendRefusal {
     /// may rest once fills arrive while the amend is on its way is not modelled against the
     /// inventory cap, so no amend is built (FBC-b0z9).
     RemainingQty,
+    /// The market's state refused it before either cap was consulted (decision 0012): Killed,
+    /// Cancel-only, or Exit, whose admission is not built yet.
+    State(StateRefusal),
     /// A pre-trade cap refused it (0013 rule 2): the amend would take the worst case on the
     /// order's side past the inventory cap, or what the side has resting past the resting
     /// cap, or its market has no caps configured.
@@ -180,12 +184,16 @@ pub struct PlacePlan {
 #[derive(Debug)]
 pub struct Live<'r> {
     rec: &'r mut OrderRecord,
+    /// What the market's state admits, read when the permit was given: nothing changes it
+    /// while the permit holds the registry.
+    state: Result<(), StateRefusal>,
     exposure: Exposure,
 }
 
 impl<'r> Live<'r> {
     pub(crate) fn check(
         rec: &'r mut OrderRecord,
+        state: Result<(), StateRefusal>,
         exposure: Exposure,
     ) -> Result<Live<'r>, PermitRefusal> {
         let cid = rec.cid();
@@ -205,7 +213,11 @@ impl<'r> Live<'r> {
         if rec.from_snapshot() {
             return Err(PermitRefusal::FromSnapshot(cid));
         }
-        Ok(Live { rec, exposure })
+        Ok(Live {
+            rec,
+            state,
+            exposure,
+        })
     }
 
     /// The order the permit is for.
@@ -224,6 +236,10 @@ impl<'r> Live<'r> {
     /// one that can only reduce the position, as on [`NewOrder::reducing`](fbc_core::NewOrder):
     /// it chooses the traffic class only and exempts the amend from no check (0013 rule 2).
     ///
+    /// Refused, never built, before anything else is judged, when the market's state builds no
+    /// amend (Killed, Cancel-only, or Exit until its admission is built; decision 0012,
+    /// [`AmendRefusal::State`]), whatever `reducing` says.
+    ///
     /// Refused, never built, when the amend would take the worst case on the order's side past
     /// its market's inventory cap (0005's I6), or what the side has resting past its resting
     /// cap (0052), the order counted at the larger of its resting quantity now and the
@@ -241,6 +257,7 @@ impl<'r> Live<'r> {
         qty: Lots,
         reducing: bool,
     ) -> Result<PermittedCommand, AmendRefusal> {
+        self.state.map_err(AmendRefusal::State)?;
         let rec = &*self.rec;
         let amend_caps = caps.amend.as_ref().ok_or(AmendRefusal::NotAmendable)?;
         if amend_caps.qty_semantics == AmendQty::Remaining {

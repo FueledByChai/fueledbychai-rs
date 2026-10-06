@@ -16,6 +16,8 @@
 //! resting cap past any order (`WIDE`); the resting cap's own tests use the first
 //! configuration whole.
 
+#[path = "common/arm.rs"]
+mod arm;
 mod common;
 
 use std::time::Duration;
@@ -27,9 +29,9 @@ use fbc_core::{
     SubmitOutcome, TagSet, Ticks, VenueCommand, VenueOrderState, WallNs,
 };
 use fbc_oms::{
-    AmendRefusal, CancelChoice, CapRefusal, CapsConfigError, FillLedger, FillRouted, LedgerConfig,
-    MarketCapsConfig, OmsError, OrdState, OrderKey, OrderOp, PermittedCommand, PreTradeCaps,
-    Registry,
+    AmendRefusal, ArmRefusal, CancelChoice, CapRefusal, CapsConfigError, FillLedger, FillRouted,
+    LedgerConfig, MarketCapsConfig, OmsError, OrdState, OrderKey, OrderOp, PermittedCommand,
+    PreTradeCaps, Registry, StateRefusal,
 };
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, RngSeed};
@@ -58,10 +60,19 @@ fn caps(inventory: i64, resting: i64) -> PreTradeCaps {
 }
 
 /// A registry under the inventory cap `inventory` and the resting cap `resting`, flat: its
-/// position seeded from the venue as 0.
+/// position seeded from the venue as 0, and the market armed by the owner's Start (decision
+/// 0012), so only the caps judge what it builds.
 fn registry(inventory: i64, resting: i64) -> Registry {
-    let mut reg = Registry::with_caps(caps(inventory, resting));
-    reg.seed_position(INST, SignedLots(0)).unwrap();
+    armed(Registry::with_caps(caps(inventory, resting)), &[INST])
+}
+
+/// `reg` named for its leases, each of `markets` seeded flat and started.
+fn armed(reg: Registry, markets: &[InstrumentId]) -> Registry {
+    let mut reg = arm::named(reg);
+    for &market in markets {
+        reg.seed_position(market, SignedLots(0)).unwrap();
+        arm::start(&mut reg, market);
+    }
     reg
 }
 
@@ -566,10 +577,10 @@ fn ten_batch_items_each_under_the_cap_are_refused_once_together_they_breach_it()
 
 #[test]
 fn a_batch_over_several_markets_or_repeating_a_client_id_is_refused_as_built() {
-    let mut reg = Registry::with_caps(caps(CAP, WIDE).with_market(OTHER, both(CAP, WIDE)).unwrap());
-    for market in [INST, OTHER] {
-        reg.seed_position(market, SignedLots(0)).unwrap();
-    }
+    let mut reg = armed(
+        Registry::with_caps(caps(CAP, WIDE).with_market(OTHER, both(CAP, WIDE)).unwrap()),
+        &[INST, OTHER],
+    );
     let mut eth = buy(1);
     eth.inst = OTHER;
     let btc = buy(1);
@@ -663,13 +674,17 @@ fn cancels_and_cancel_many_are_built_whatever_the_caps_state() {
 
 #[test]
 fn a_market_without_a_configured_cap_admits_nothing() {
-    // No configuration at all, and a configuration naming another market only.
+    // No configuration at all, and a configuration naming another market only; the market
+    // seeded and armed, so only the caps judge.
     for mut reg in [
-        Registry::new(),
-        Registry::with_caps(
-            PreTradeCaps::new()
-                .with_market(OTHER, both(CAP, L0))
-                .unwrap(),
+        armed(Registry::new(), &[INST]),
+        armed(
+            Registry::with_caps(
+                PreTradeCaps::new()
+                    .with_market(OTHER, both(CAP, L0))
+                    .unwrap(),
+            ),
+            &[INST],
         ),
     ] {
         let order = buy(1);
@@ -701,21 +716,29 @@ fn a_market_without_a_configured_cap_admits_nothing() {
 #[test]
 fn a_market_admits_nothing_until_its_position_is_seeded_from_the_venue() {
     // After a restart the account may already hold a position: until the venue's is seeded,
-    // the worst case is unknown and nothing is built.
-    let mut reg = Registry::with_caps(caps(CAP, WIDE));
+    // the worst case is unknown, the owner's Start is refused (decision 0012) and nothing is
+    // built. (An armed market whose position a fill made unknown since is refused by the cap
+    // itself, CapRefusal::PositionUnknown: tests/resync.rs.)
+    let mut reg = arm::named(Registry::with_caps(caps(CAP, WIDE)));
     assert!(!reg.position_known(INST));
-    let unknown = OmsError::Capped(CapRefusal::PositionUnknown(INST));
+    let leases = arm::leases(&reg, INST);
+    assert_eq!(
+        reg.start(INST, leases),
+        Err(ArmRefusal::PositionUnknown(INST))
+    );
+    let unknown = OmsError::State(StateRefusal::CancelOnly(INST));
     assert_eq!(reg.place(buy(1)), Err(unknown.clone()));
     assert_eq!(reg.place_batch(vec![buy(1)]).unwrap().refused[0].1, unknown);
     let a = reg.insert(buy(1)).unwrap().cid();
     outcome(&mut reg, a, OrderOp::Place, accepted(), Some("a"));
     assert_eq!(
         amend(&mut reg, &amending(true), a, 2, false),
-        Err(AmendRefusal::Capped(CapRefusal::PositionUnknown(INST)))
+        Err(AmendRefusal::State(StateRefusal::CancelOnly(INST)))
     );
-    // Seeded long 50 under a cap of 50: no more bids, though offers reduce it.
+    // Seeded long 50 under a cap of 50, and started: no more bids, though offers reduce it.
     reg.seed_position(INST, SignedLots(50)).unwrap();
     assert!(reg.position_known(INST));
+    arm::start(&mut reg, INST);
     assert_eq!(reg.inventory(INST), SignedLots(50));
     assert_eq!(reg.place(buy(1)), Err(capped(Side::Buy, 52)));
     reg.place(sell(L0)).unwrap();
@@ -726,7 +749,7 @@ fn a_market_admits_nothing_until_its_position_is_seeded_from_the_venue() {
     );
     // A fill before the seed: how it counts against the snapshot is the resync's (FBC-38r),
     // so the seed is refused and the market stays unknown.
-    let mut reg = Registry::with_caps(caps(CAP, WIDE));
+    let mut reg = arm::named(Registry::with_caps(caps(CAP, WIDE)));
     let mut l = ledger();
     position(&mut reg, &mut l, Side::Buy, 5, "early");
     assert_eq!(
@@ -734,6 +757,11 @@ fn a_market_admits_nothing_until_its_position_is_seeded_from_the_venue() {
         Err(OmsError::PositionMoved(INST))
     );
     assert!(!reg.position_known(INST));
+    let leases = arm::leases(&reg, INST);
+    assert_eq!(
+        reg.start(INST, leases),
+        Err(ArmRefusal::PositionUnknown(INST))
+    );
     assert_eq!(reg.place(sell(1)), Err(unknown));
 }
 
@@ -1123,8 +1151,7 @@ fn a_configuration_missing_the_inventory_cap_or_the_resting_cap_is_refused_with_
         Err(CapsConfigError::MissingRestingCap(OTHER))
     );
     // Nothing stands in for a refused configuration: a registry without one admits nothing.
-    let mut reg = Registry::new();
-    reg.seed_position(INST, SignedLots(0)).unwrap();
+    let mut reg = armed(Registry::new(), &[INST]);
     assert_eq!(
         reg.place(buy(1)),
         Err(OmsError::Capped(CapRefusal::NoCap(INST)))

@@ -15,7 +15,7 @@ use fbc_core::{
     MatchingCaps, MdCaps, Namespace, NamespaceLease, NewOrder, NonceScope, OrderCaps, OrderKind,
     OrderKindTag, OrderUpdate, OrderingKey, Readiness, RefKind, RejectKind, Side, SnapshotSource,
     StpScope, Support, TagSet, TerminalReject, Ticks, Tif, TifTag, TradeCaps, VenueCaps,
-    VenueFeeSign, VenueOrderId, VenueOrderState, WallNs, dispatch_market_data,
+    VenueFeeSign, VenueOrderId, VenueOrderState, VenueSymbol, WallNs, dispatch_market_data,
 };
 
 /// The namespace every test client id is minted in.
@@ -32,7 +32,8 @@ pub fn cid() -> ClientOrderId {
     mint.lock().unwrap().mint().unwrap()
 }
 
-fn lease_dir() -> PathBuf {
+/// The directory this test binary's leases are taken in.
+pub fn lease_dir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("fbc-oms-tests-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -41,6 +42,11 @@ fn lease_dir() -> PathBuf {
 /// A venue order id, built as a codec builds one: through the decode scope.
 pub fn vid(text: &str) -> VenueOrderId {
     dispatch_market_data(&decode_caps(), |scope| scope.venue_order_id(text)).unwrap()
+}
+
+/// A venue symbol, built as a codec builds one: through the decode scope.
+pub fn symbol(wire: &str) -> VenueSymbol {
+    dispatch_market_data(&decode_caps(), |scope| scope.venue_symbol(wire)).unwrap()
 }
 
 /// A fill id, built as a codec builds one: through the decode scope.

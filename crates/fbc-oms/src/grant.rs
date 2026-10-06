@@ -33,17 +33,13 @@ impl StateGeneration {
     }
 }
 
-/// Each market's current [`StateGeneration`]. The market states (FBC-c4v) advance a market's
-/// generation on every change of its state; nothing outside this crate can.
-// Issued from only by the authorization's tests until the pre-trade path (FBC-afd) and the
-// market states (FBC-c4v) use it.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Each market's current [`StateGeneration`]. The market states advance a market's generation
+/// on every change of its armed flag or state (`src/entry.rs`); nothing outside this crate can.
 #[derive(Clone, Default, Debug)]
 pub(crate) struct Generations {
     by_market: BTreeMap<InstrumentId, StateGeneration>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Generations {
     /// The market's current generation: 0 until its state first changes.
     pub(crate) fn of(&self, market: InstrumentId) -> StateGeneration {

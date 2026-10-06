@@ -237,7 +237,12 @@ rather than guess.
     never placed or amended again; resyncs (0055; `src/resync.rs`, `tests/resync.rs`): the
     first seeds each market's position once and registers our open orders it shows, the
     position unknown until then, a fill straddling the snapshot counted once, later ones
-    compared and reported, never overwriting the inventory; still planned: pre-trade caps and
+    compared and reported, never overwriting the inventory; market states and arming (0012;
+    `src/entry.rs`, `tests/states.rs`): each market armed or not and Killed, Cancel-only, Exit
+    or Quoting, a fresh registry disarmed and Cancel-only, the state checked before the caps,
+    Start, Flatten and Wind-down arming with the market lease (and the account lease where
+    nonces are per account) and refused while Killed or the position is unknown, every change
+    advancing the market's `StateGeneration`; still planned: Exit's admission (FBC-7gl) and
     `ExecutionPlanner`; 0005, 0013), `crates/fbc-journal` (0006; it depends on
     `fbc-core`, and `hmac` and `sha2` for its keyed hashes and `zstd` for its closed segments, only: the records the runtime writes, length-prefixed in a hand-written
     little-endian format with a version, a writer of one subdirectory per UTC day with segments
