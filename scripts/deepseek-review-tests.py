@@ -496,10 +496,12 @@ class ReviewTest(unittest.TestCase):
 
         def answer(path, body):
             calls.append(1)
-            return completion("nope" if len(calls) == 2 else findings_json())
+            # Part 2 answers with invalid JSON, and again when asked once more (FBC-2alv).
+            user = body["messages"][1]["content"]
+            return completion("nope" if "This is part 2 of" in user else findings_json())
         self.chat.answer = answer
         self.run_review(head, DEEPSEEK_TOKEN_BUDGET="5000")
-        self.assert_incomplete(head, "part 2 of ", "not valid JSON")
+        self.assert_incomplete(head, "part 2 of ", "not valid JSON", "asked again once")
 
     def test_a_budget_smaller_than_the_instructions_is_incomplete(self):
         head = self.change()
@@ -584,10 +586,130 @@ class ReviewTest(unittest.TestCase):
         self.chat.answer = lambda path, body: completion("I found no issues!")
         self.run_review(head)
         self.assert_incomplete(head, "the model's answer is not valid JSON")
+        self.assertEqual(len(self.chat.requests), 2)  # asked again once (FBC-2alv)
         self.github.requests.clear()
         self.chat.answer = lambda path, body: completion('{"findings": [', finish="length")
         self.run_review(head)
         self.assert_incomplete(head, "cut off at max_tokens")
+
+    # --- an invalid answer that was not cut off is asked again once (FBC-2alv)
+
+    def report_of(self, head):
+        prefix = "deepseek-review: report for head %s: " % head
+        lines = [l for l in self.out.splitlines() if l.startswith(prefix)]
+        self.assertEqual(len(lines), 1, self.out)
+        return json.loads(lines[0][len(prefix):])
+
+    def test_an_invalid_answer_not_cut_off_is_asked_again_once_and_its_answer_used(self):
+        """PR #84's own run ended 'piece 2 of 2: the model's answer is not valid JSON' with
+        finish_reason stop: such a piece is asked once more, and a valid second answer is used."""
+        head = self.change()
+        # Not JSON at all, and JSON that fails validation: both asked again.
+        for first in ("I found no issues!", '{"issues": []}'):
+            self.github.requests.clear()
+            self.chat.requests.clear()
+            calls = []
+
+            def answer(path, body, first=first):
+                calls.append(1)
+                if len(calls) == 1:
+                    return completion(first)
+                return completion(findings_json(
+                    finding("F1", "P2", "crates/a/src/lib.rs", 2, "problem in a")))
+            self.chat.answer = answer
+            self.run_review(head)
+            self.assertEqual(self.rc, 0, self.out + self.err)
+            body = self.one_comment()
+            self.assertIn("head=%s status=complete findings=1 -->" % head, body)
+            self.assertIn("- **DS-1** P2 `crates/a/src/lib.rs:2`: problem in a", body)
+            self.assertIn("Answered with something other than the asked JSON and asked again: "
+                          "part 1 of 1", body)
+            self.assertIn("(2 requests, 5 files)", body)
+            # Exactly one more request: the same prompt plus the instruction to answer with the
+            # JSON object only.
+            self.assertEqual(len(self.chat.requests), 2)
+            first_msgs, again_msgs = [r["body"]["messages"] for r in self.chat.requests]
+            self.assertEqual(again_msgs[0], first_msgs[0])
+            self.assertEqual(len(again_msgs), 2)
+            self.assertTrue(again_msgs[1]["content"].startswith(first_msgs[1]["content"]))
+            self.assertIn("Answer with the JSON object only", again_msgs[1]["content"]
+                          [len(first_msgs[1]["content"]):])
+            report = self.report_of(head)
+            self.assertEqual(report["asked_again"], ["part 1 of 1"])
+            self.assertEqual(report["requests"], 2)
+
+    def test_a_second_invalid_answer_ends_the_review_incomplete_naming_the_piece(self):
+        """The case PR #84 hit: a cut-off part, its first piece answered, its second piece
+        answered with invalid JSON twice. The second invalid answer ends the review."""
+        head = self.change()
+        calls = []
+
+        def answer(path, body):
+            calls.append(1)
+            user = body["messages"][1]["content"]
+            if len(calls) == 1:
+                return self.cut_off()
+            if "piece 2 of 2" in user:
+                return completion("Here is my review: no problems.")
+            return completion(findings_json())
+        self.chat.answer = answer
+        self.run_review(head)
+        self.assert_incomplete(head, "part 1 of 1, piece 2 of 2: the model's answer is not "
+                               "valid JSON", "asked again once")
+        # The part, its two pieces, and the second piece asked once more: nothing after it.
+        self.assertEqual(len(self.chat.requests), 4)
+        users = [r["body"]["messages"][1]["content"] for r in self.chat.requests]
+        self.assertIn("piece 2 of 2", users[2])
+        self.assertTrue(users[3].startswith(users[2]))
+
+    def test_an_invalid_answer_with_another_finish_reason_is_not_asked_again(self):
+        head = self.change()
+        for finish in ("content_filter", None):
+            self.github.requests.clear()
+            self.chat.requests.clear()
+            self.chat.answer = lambda path, body, f=finish: completion("not json", finish=f)
+            self.run_review(head)
+            body = self.assert_incomplete(head, "part 1 of 1: the model's answer is not valid JSON")
+            self.assertNotIn("asked again", body)
+            self.assertEqual(len(self.chat.requests), 1)
+
+    def test_an_answer_asked_again_counts_against_the_request_ceiling(self):
+        head = self.change()
+        # One part, no splitting: a ceiling of one request leaves no room to ask again.
+        self.chat.answer = lambda path, body: completion("not json")
+        self.run_review(head, DEEPSEEK_MAX_CHUNKS="1", DEEPSEEK_SPLIT_DEPTH="0")
+        self.assert_incomplete(head, "part 1 of 1: ", "the limit of 1 request per review")
+        self.assertEqual(len(self.chat.requests), 1)
+        # Splitting once allows three requests (the part and its two pieces); asking the first
+        # piece again uses the third, so the second piece is never sent.
+        self.github.requests.clear()
+        self.chat.requests.clear()
+        calls = []
+
+        def answer(path, body):
+            calls.append(1)
+            return {1: self.cut_off(), 2: completion("not json")}.get(
+                len(calls), completion(findings_json()))
+        self.chat.answer = answer
+        self.run_review(head, DEEPSEEK_MAX_CHUNKS="1", DEEPSEEK_SPLIT_DEPTH="1")
+        self.assert_incomplete(head, "part 1 of 1, piece 2 of 2: ",
+                               "the limit of 3 requests per review")
+        self.assertEqual(len(self.chat.requests), 3)
+        self.assertNotIn("piece 2 of 2", "".join(
+            r["body"]["messages"][1]["content"] for r in self.chat.requests))
+
+    def test_an_answer_asked_again_is_bounded_by_the_review_deadline(self):
+        head = self.change()
+        calls = []
+
+        def answer(path, body):
+            calls.append(1)
+            return completion("not json") if len(calls) == 1 else self.stalling(path, body)
+        self.chat.answer = answer
+        self.run_review(head, DEEPSEEK_DEADLINE="2", DEEPSEEK_TIMEOUT="60")
+        self.assert_incomplete(head, "part 1 of 1", "the review deadline of 2 s passed")
+        self.assertEqual(len(self.chat.requests), 2)
+        self.assertLess(self.elapsed, 15)
 
     # --- an answer cut off at max_tokens (FBC-yf0j)
 

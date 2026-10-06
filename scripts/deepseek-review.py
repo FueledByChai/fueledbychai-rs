@@ -10,8 +10,13 @@ completions endpoint for findings as JSON and validates them; and posts ONE pull
 headed "DeepSeek review" that names the reviewed head SHA. An answer cut off at max_tokens
 (finish_reason "length": a thinking model's reasoning counts against max_tokens) is not final:
 the part is reviewed again as two smaller pieces, or a single file from its diff only, up to
-DEEPSEEK_SPLIT_DEPTH times (FBC-yf0j). A missing key, an API error or an
-answer that is not valid findings JSON posts a comment saying the review did not complete for
+DEEPSEEK_SPLIT_DEPTH times (FBC-yf0j). An answer that is not the asked findings JSON although
+it was not cut off (finish_reason "stop") is asked for once more, with the same prompt and an
+instruction to answer with the JSON object only (FBC-2alv). Every request, a piece's and an
+answer asked again alike, counts against one ceiling per review, DEEPSEEK_MAX_CHUNKS x
+(2^(DEEPSEEK_SPLIT_DEPTH + 1) - 1): the most a review that splits every part to the limit sends.
+A missing key, an API error, the ceiling reached, or an answer that is still not valid findings
+JSON when asked again posts a comment saying the review did not complete for
 that SHA (never a silent pass) and exits non-zero; an API error is reported by its status and
 the error's type and code only, never its body. Every finding, whole and redacted, and the full
 report of what was not reviewed are also printed to the job log as JSON lines; when the comment
@@ -35,8 +40,9 @@ test holds inside the job's timeout-minutes (Reviewer B, B11 on PR #82).
   DEEPSEEK_MAX_OUTPUT_TOKENS  max_tokens of each answer, reasoning included, default 65536
                          (DeepSeek documents a maximum output of 384K for deepseek-v4-pro)
   DEEPSEEK_SPLIT_DEPTH   times a cut-off answer's part may be split again, 0 to 4, default 2;
-                         split pieces do not count against DEEPSEEK_MAX_CHUNKS, so a review
-                         sends at most DEEPSEEK_MAX_CHUNKS x 2^depth requests
+                         split pieces do not count against DEEPSEEK_MAX_CHUNKS; a review sends
+                         at most DEEPSEEK_MAX_CHUNKS x (2^(depth + 1) - 1) requests (28 at the
+                         defaults), an answer asked again included
   DEEPSEEK_TIMEOUT       seconds per HTTP request, default 600
   DEEPSEEK_RETRIES       retries after a timeout, HTTP 429 or 5xx, default 2
   DEEPSEEK_RETRY_DELAY   seconds before the first retry (doubled each time), default 10
@@ -88,6 +94,8 @@ DEFAULT_SETUP_TIMEOUT = 300.0  # the git work before the first request
 DEFAULT_SPLIT_DEPTH = 2
 MAX_SPLIT_DEPTH = 4  # 2^4 pieces per part at most: the deadline, not this, is the real bound
 CUT_NOTE = " (the answer was cut off at max_tokens)"
+ASK_AGAIN = ("\nYour previous answer was not the asked JSON object. Answer with the JSON object "
+             "only, in exactly the shape the instructions give, and nothing else.")
 
 SYSTEM_INSTRUCTIONS = """You are an adversarial code reviewer for fueledbychai-rs, a public Rust \
 library that connects a trading program to crypto venues (market data, order entry, order truth). \
@@ -113,6 +121,11 @@ Answer {"findings": []} when you find no defect."""
 
 class Incomplete(Exception):
     """The review did not complete; the message is the reason posted for the head SHA."""
+
+
+class InvalidAnswer(Incomplete):
+    """The model's answer, as text, is not the asked findings JSON: asked for once more when it
+    was not cut off (FBC-2alv)."""
 
 
 class CutOff(Incomplete):
@@ -474,15 +487,15 @@ def checked_findings(content):
     try:
         answer = json.loads(text)
     except ValueError:
-        raise Incomplete("the model's answer is not valid JSON")
+        raise InvalidAnswer("the model's answer is not valid JSON")
     if not isinstance(answer, dict) or not isinstance(answer.get("findings"), list):
-        raise Incomplete("the model's answer is not an object with a findings list")
+        raise InvalidAnswer("the model's answer is not an object with a findings list")
     findings = []
     for n, item in enumerate(answer["findings"], 1):
         def bad(field):
-            return Incomplete("the model's finding %d has an invalid %s" % (n, field))
+            return InvalidAnswer("the model's finding %d has an invalid %s" % (n, field))
         if not isinstance(item, dict):
-            raise Incomplete("the model's finding %d is not an object" % n)
+            raise InvalidAnswer("the model's finding %d is not an object" % n)
         fid = item.get("id")
         if isinstance(fid, bool) or not isinstance(fid, (str, int)) or not str(fid).strip():
             raise bad("id")
@@ -538,7 +551,7 @@ def review(cfg):
         raise Incomplete("the git work before the first request did not finish within %g s"
                          % cfg["setup_timeout"])
     report = {"chunks": 0, "diff_only": [], "not_reviewed": {}, "files": len(units),
-              "cut_off": [], "diff_only_after_cut": [], "requests": 0}
+              "cut_off": [], "diff_only_after_cut": [], "asked_again": [], "requests": 0}
     if not units:
         return [], report
     nonce = secrets.token_hex(8)
@@ -556,11 +569,33 @@ def review(cfg):
         raise Incomplete("no touched file fits in the token budget of %d" % cfg["budget"])
     by_path = {unit["path"]: unit for unit in units}
     results = []
+    ceiling = request_ceiling(cfg)
     for part, chunk in enumerate(chunks, 1):
         ctx = {"cfg": cfg, "system": system, "nonce": nonce, "units": by_path,
-               "report": report, "part": "part %d of %d" % (part, len(chunks))}
+               "report": report, "part": "part %d of %d" % (part, len(chunks)),
+               "ceiling": ceiling}
         review_piece(ctx, chunk, "", 0, results)
     return merge_findings(results), report
+
+
+def request_ceiling(cfg):
+    """Requests per review at most: every part split to DEEPSEEK_SPLIT_DEPTH sends 2^(depth+1)-1
+    (the part, its two pieces, their four, ...). An answer asked again (FBC-2alv) counts against
+    it too, so asking again never raises what one review can send."""
+    return cfg["max_chunks"] * (2 ** (cfg["split_depth"] + 1) - 1)
+
+
+def ask(ctx, messages):
+    """One request and its answer's (content, finish_reason), counted against the ceiling."""
+    report, ceiling = ctx["report"], ctx["ceiling"]
+    if report["requests"] >= ceiling:
+        raise Incomplete("not sent: the limit of %d request%s per review was reached "
+                         "(DEEPSEEK_MAX_CHUNKS x (2^(DEEPSEEK_SPLIT_DEPTH + 1) - 1); a piece and "
+                         "an answer asked again each count)" % (ceiling, "" if ceiling == 1
+                                                                 else "s"))
+    report["requests"] += 1
+    cfg = ctx["cfg"]
+    return answer_content(call_model(cfg, messages, cfg["redact"]))
 
 
 def split_items(items, units):
@@ -585,8 +620,10 @@ def split_items(items, units):
 
 def review_piece(ctx, items, piece, depth, results):
     """Review one part or piece, appending its findings to results. An answer cut off at
-    max_tokens is reviewed again as smaller pieces, up to DEEPSEEK_SPLIT_DEPTH levels; any other
-    failure, or a cut-off past the limit, raises Incomplete naming the part and piece."""
+    max_tokens is reviewed again as smaller pieces, up to DEEPSEEK_SPLIT_DEPTH levels; an answer
+    that is not the asked JSON though not cut off is asked for once more (FBC-2alv); any other
+    failure, a second invalid answer, or a cut-off past the limit, raises Incomplete naming the
+    part and piece."""
     cfg = ctx["cfg"]
     of_piece = ", piece %s" % piece if piece else ""
     label = ctx["part"] + of_piece
@@ -595,10 +632,23 @@ def review_piece(ctx, items, piece, depth, results):
                 {"role": "user", "content": user_prompt(
                     cfg["title"], cfg["body"], ctx["part"] + " of the change" + of_piece, payload,
                     ctx["nonce"])}]
-    ctx["report"]["requests"] += 1
     try:
-        content, finish = answer_content(call_model(cfg, messages, cfg["redact"]))
-        results.append(parse_findings(content, finish))
+        content, finish = ask(ctx, messages)
+        try:
+            results.append(parse_findings(content, finish))
+            return
+        except InvalidAnswer:
+            if finish != "stop":
+                raise
+        # Not cut off, yet not the asked JSON (PR #84's own run): ask once more. A cut-off
+        # second answer is split like any other; a second invalid one ends the review.
+        ctx["report"]["asked_again"].append(label)
+        again = [messages[0], {"role": "user", "content": messages[1]["content"] + ASK_AGAIN}]
+        content, finish = ask(ctx, again)
+        try:
+            results.append(parse_findings(content, finish))
+        except InvalidAnswer as e:
+            raise Incomplete("%s (asked again once)" % e)
         return
     except CutOff as e:
         cut = e
@@ -650,7 +700,8 @@ def complete_comment(cfg, findings, report):
                 head, len(findings))
         return "<!-- deepseek-review head=%s status=truncated findings=%d shown=%d -->" % (
             head, len(findings), shown)
-    # Requests sent: one per part, and one per piece of a part whose answer was cut off.
+    # Requests sent: one per part, one per piece of a part whose answer was cut off, and one per
+    # answer asked again.
     requests = report.get("requests", report["chunks"])
     # The longest marker holds its place until it is known whether everything fits.
     lines = [HEADING, "", marker(len(findings), True),
@@ -690,6 +741,9 @@ def complete_comment(cfg, findings, report):
     if report.get("cut_off"):
         lines += ["", "Cut off at max_tokens and reviewed again in smaller pieces: " +
                   ", ".join(safe(p, 100) for p in report["cut_off"])]
+    if report.get("asked_again"):
+        lines += ["", "Answered with something other than the asked JSON and asked again: " +
+                  ", ".join(safe(p, 100) for p in report["asked_again"])]
     if report.get("diff_only_after_cut"):
         lines += ["", "Reviewed from the diff only after an answer was cut off at max_tokens: " +
                   ", ".join(code(p) for p in report["diff_only_after_cut"])]
@@ -761,7 +815,7 @@ def report_log_line(head, report, redact):
     """What was reviewed and what was not, whole, as one ASCII JSON line for the job log."""
     return redact("deepseek-review: report for head %s: %s" % (head, json.dumps(
         {k: report[k] for k in ("files", "chunks", "requests", "diff_only", "not_reviewed",
-                                "cut_off", "diff_only_after_cut")},
+                                "cut_off", "diff_only_after_cut", "asked_again")},
         sort_keys=True)))
 
 
