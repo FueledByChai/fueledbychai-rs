@@ -418,13 +418,18 @@ read the whole diff, cover those files as they cover every file. An answer cut o
 output allowance (`finish_reason` `length`; deepseek-v4-pro thinks by default and its
 `max_tokens` counts the reasoning) is not final: that part is reviewed again as two halves of
 its files, or a single file from its diff only, up to `DEEPSEEK_SPLIT_DEPTH` (default 2) times,
-and the comment names the parts so split (FBC-yf0j). The workflow passes `DEEPSEEK_MODEL`,
+and the comment names the parts so split (FBC-yf0j). An answer that is not the asked JSON
+although it was not cut off (`finish_reason` `stop`) is asked for once more, with the same
+prompt and an instruction to answer with the JSON object only, and the comment names the parts
+so asked (FBC-2alv). Every request, a piece's and an answer asked again alike, counts against
+one ceiling per review, `DEEPSEEK_MAX_CHUNKS` x (2^(`DEEPSEEK_SPLIT_DEPTH` + 1) - 1) (28 at the
+defaults: every part split to the limit); a review that would pass it is incomplete. The workflow passes `DEEPSEEK_MODEL`,
 `DEEPSEEK_API_BASE`, `DEEPSEEK_TOKEN_BUDGET`, `DEEPSEEK_MAX_OUTPUT_TOKENS` (default 65536;
 DeepSeek documents a 384K maximum), `DEEPSEEK_SPLIT_DEPTH`, `DEEPSEEK_MAX_CHUNKS`,
 `DEEPSEEK_TIMEOUT`, `DEEPSEEK_RETRIES` and `DEEPSEEK_RETRY_DELAY` from repository variables of
 the same name (unset: the script's default); the wall-clock bounds below are not variables.
 A missing key, an API error, an
-answer that is not the asked JSON, git work before the first request still running after 5
+answer that is still not the asked JSON when asked again, the request ceiling, git work before the first request still running after 5
 minutes, or requests still unanswered 45 minutes after the first one (these bounds leave room
 inside the job's 60-minute limit to post) posts a comment saying the
 review did not complete for that SHA, never a pass, and fails only that job. An API error is
