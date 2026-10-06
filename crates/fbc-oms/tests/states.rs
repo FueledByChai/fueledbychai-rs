@@ -8,8 +8,10 @@
 //! disarmed market arms it straight into Exit; a disarm leaves Cancel-only; only Start reaches
 //! Quoting. Start, Flatten and Wind-down are refused, changing nothing, without the market
 //! lease, without the account lease where the nonce scope is per account, and before the
-//! first trustworthy resync. No resync or ladder timer moves a market, and every change
-//! advances its state generation once.
+//! first trustworthy resync. An armed market whose lease names are given again, for another
+//! account, without it, or with per-account nonces it holds no account lease for, builds
+//! nothing until it is disarmed and armed again under them. No resync or ladder timer moves a
+//! market, and every change advances its state generation once.
 //!
 //! The values are the owner's first test values: a $50 inventory cap on a synthetic market
 //! where one lot is worth $1, so 50 lots; the resting cap is set past any order here, since
@@ -517,6 +519,113 @@ fn an_account_lease_held_under_other_names_never_arms_a_market() {
     assert!(reg.start(OTHER, lease).unwrap().armed());
 }
 
+/// `keys`'s venue, account and market names, with the nonce scope `scope`.
+fn rescoped(keys: &LeaseKeys, scope: NonceScope) -> LeaseKeys {
+    (1..=4).map(InstrumentId::new).fold(
+        LeaseKeys::new(keys.venue(), keys.account(), scope),
+        |k, m| k.with_market(m, keys.symbol(m).unwrap().clone()),
+    )
+}
+
+/// Every place, batch and amend of the quoting scenario is refused as `why`.
+fn builds_nothing(
+    reg: &mut Registry,
+    (bid, ask): (ClientOrderId, ClientOrderId),
+    why: StateRefusal,
+) {
+    for (name, order) in places() {
+        assert_eq!(reg.place(order), Err(OmsError::State(why)), "{name}");
+    }
+    let plan = reg
+        .place_batch(places().into_iter().map(|(_, o)| o).collect())
+        .unwrap();
+    assert_eq!(plan.command, None);
+    assert_eq!(plan.refused.len(), places().len());
+    for (c, refused) in &plan.refused {
+        assert_eq!(refused, &OmsError::State(why), "{c:?}");
+    }
+    for amend in amends() {
+        assert_eq!(
+            try_amend(reg, (bid, ask), amend),
+            Err(AmendRefusal::State(why)),
+            "{}",
+            amend.0
+        );
+    }
+}
+
+/// Reviewer B's RB86-1 on PR #86, probe 1: names given again for another account while a
+/// market is armed leave a second holder free to take that market's leases under the new
+/// names, so the armed market builds nothing until it is disarmed and armed again under them.
+#[test]
+fn names_given_again_for_another_account_stop_an_armed_market_building() {
+    let (reg, bid, ask) = quoting();
+    let mut reg = reg.with_lease_keys(lease_keys(NonceScope::PerAccountMonotonic));
+    // A second holder takes INST's market lease and the account lease under the new names.
+    let second = leases(&reg, INST);
+    builds_nothing(&mut reg, (bid, ask), StateRefusal::Unleased(INST));
+    // Start on the armed market does not carry it over, changing nothing.
+    let before = seen(reg.entry(INST));
+    assert_eq!(
+        reg.start(INST, Leases::none()),
+        Err(ArmRefusal::WrongMarketLease(INST))
+    );
+    assert_eq!(seen(reg.entry(INST)), before);
+    // Cancels are still built.
+    let cancel = reg.cancellable(bid).unwrap().cancel(&venue(false));
+    assert!(matches!(cancel, CancelChoice::Send(_)), "{cancel:?}");
+    // Disarmed and armed again under the new names' leases, it builds.
+    reg.disarm(INST);
+    assert_eq!(
+        seen(reg.start(INST, second).unwrap()).1,
+        EntryState::Quoting
+    );
+    assert!(reg.place(placement(cid(), 100, 1)).is_ok());
+}
+
+/// Reviewer B's RB86-1 on PR #86, probe 2: the same account's names given again with
+/// per-account nonces while a market is armed with its market lease alone (the nonce scope
+/// was Random) stop it building until it is armed again with the account lease.
+#[test]
+fn a_nonce_scope_given_again_as_per_account_stops_a_market_armed_without_the_account_lease() {
+    let mut reg = Registry::with_caps(caps()).with_lease_keys(lease_keys(NonceScope::Random));
+    reg.seed_position(INST, SignedLots(LONG)).unwrap();
+    let lease = Leases::market(market_lease(&reg, INST));
+    reg.start(INST, lease).unwrap();
+    let bid = open(&mut reg, placement(cid(), 100, 5), "v-bid");
+    let ask = open(&mut reg, sell(5, 101), "v-ask");
+    let keys = rescoped(reg.lease_keys().unwrap(), NonceScope::PerAccountMonotonic);
+    let mut reg = reg.with_lease_keys(keys);
+    builds_nothing(&mut reg, (bid, ask), StateRefusal::Unleased(INST));
+    let before = seen(reg.entry(INST));
+    assert_eq!(
+        reg.flatten(INST, Leases::none()),
+        Err(ArmRefusal::NoAccountLease(INST))
+    );
+    assert_eq!(seen(reg.entry(INST)), before);
+    reg.disarm(INST);
+    let both = leases(&reg, INST);
+    reg.start(INST, both).unwrap();
+    assert!(reg.place(placement(cid(), 100, 1)).is_ok());
+}
+
+/// Names given again that leave an armed market out stop it building too.
+#[test]
+fn names_given_again_without_an_armed_market_stop_it_building() {
+    let (reg, bid, ask) = quoting();
+    let keys = reg.lease_keys().unwrap().clone();
+    let unnamed = LeaseKeys::new(keys.venue(), keys.account(), keys.nonce_scope());
+    let mut reg = reg.with_lease_keys(unnamed);
+    builds_nothing(&mut reg, (bid, ask), StateRefusal::Unleased(INST));
+    assert_eq!(
+        reg.wind_down(INST, Leases::none()),
+        Err(ArmRefusal::NotNamed(INST))
+    );
+    // The names given back, it builds again.
+    let mut reg = reg.with_lease_keys(keys);
+    assert!(reg.place(placement(cid(), 100, 1)).is_ok());
+}
+
 #[test]
 fn only_start_reaches_quoting() {
     let mut reg = seeded();
@@ -864,6 +973,7 @@ fn every_refusal_says_what_refused_it() {
         Box::new(StateRefusal::Killed(INST)),
         Box::new(StateRefusal::CancelOnly(INST)),
         Box::new(StateRefusal::Exit(INST)),
+        Box::new(StateRefusal::Unleased(INST)),
         Box::new(OmsError::State(StateRefusal::Killed(INST))),
     ];
     let texts: Vec<String> = refusals.iter().map(|r| r.to_string()).collect();

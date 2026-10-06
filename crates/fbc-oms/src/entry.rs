@@ -13,7 +13,8 @@
 //!   FBC-7gl's; until it is built, Exit builds no place or amend ([`StateRefusal::Exit`]).
 //! - **Quoting**: entered only by the owner's Start.
 //!
-//! A place or amend is built only on a market that is armed and in Exit or Quoting; a disarmed
+//! A place or amend is built only on a market that is armed and in Exit or Quoting, under
+//! leases the registry's current names still cover ([`StateRefusal::Unleased`]); a disarmed
 //! market is always Killed or Cancel-only. A fresh registry has every market disarmed and in
 //! Cancel-only. Cancels are built in every state.
 //!
@@ -197,7 +198,8 @@ pub enum ArmRefusal {
     NotNamed(InstrumentId),
     /// The market is disarmed and the call carried no market lease.
     NoMarketLease(InstrumentId),
-    /// The market lease given is for another venue, account or symbol.
+    /// The market lease given, or the one an armed market holds, is for another venue, account
+    /// or symbol than the names the registry has now.
     WrongMarketLease(InstrumentId),
     /// The venue's nonce scope is per account and neither the call nor the registry has the
     /// account lease.
@@ -252,6 +254,12 @@ pub enum StateRefusal {
     CancelOnly(InstrumentId),
     /// The market is in Exit, whose admission (FBC-7gl) is not built yet: nothing is built.
     Exit(InstrumentId),
+    /// The market is armed under leases the registry's lease names no longer cover: names
+    /// given since ([`Registry::with_lease_keys`]) are for another venue or account, leave the
+    /// market out, or make the nonces per account while the registry holds no account lease.
+    /// It is disarmed and armed again under the names it has now (Reviewer B's RB86-1 on
+    /// PR #86).
+    Unleased(InstrumentId),
 }
 
 impl fmt::Display for StateRefusal {
@@ -262,6 +270,10 @@ impl fmt::Display for StateRefusal {
             StateRefusal::Exit(inst) => {
                 write!(f, "{inst:?} is in Exit, which builds no order yet")
             }
+            StateRefusal::Unleased(inst) => write!(
+                f,
+                "{inst:?} is armed under leases its lease names no longer cover: disarm it and arm it again"
+            ),
         }
     }
 }
@@ -313,10 +325,38 @@ impl Entries {
     pub(crate) fn admits(&self, market: InstrumentId) -> Result<(), StateRefusal> {
         match (self.armed(market), self.state(market)) {
             (_, EntryState::Killed) => Err(StateRefusal::Killed(market)),
+            (true, _) if self.held_covered(market).is_err() => Err(StateRefusal::Unleased(market)),
             (true, EntryState::Quoting) => Ok(()),
             (true, EntryState::Exit(_)) => Err(StateRefusal::Exit(market)),
             _ => Err(StateRefusal::CancelOnly(market)),
         }
+    }
+
+    /// The names the registry has for `market`, if it has any.
+    fn named(&self, market: InstrumentId) -> Result<&LeaseKeys, ArmRefusal> {
+        self.keys
+            .as_ref()
+            .filter(|k| k.symbols.contains_key(&market))
+            .ok_or(ArmRefusal::NotNamed(market))
+    }
+
+    /// Whether the leases armed `market` holds are still covered by the names the registry has
+    /// now: its market lease, and the account lease where the nonce scope is per account
+    /// (Reviewer B's RB86-1 on PR #86). An account lease the registry holds is this account's
+    /// whenever a market lease is, since no market arms while it is another's.
+    fn held_covered(&self, market: InstrumentId) -> Result<(), ArmRefusal> {
+        let keys = self.named(market)?;
+        if !self
+            .market_leases
+            .get(&market)
+            .is_some_and(|held| keys.covers_market(market, held))
+        {
+            return Err(ArmRefusal::WrongMarketLease(market));
+        }
+        if keys.needs_account_lease() && self.account_lease.is_none() {
+            return Err(ArmRefusal::NoAccountLease(market));
+        }
+        Ok(())
     }
 
     /// Moves `market` to `state`, armed or not, advancing its generation when either changed.
@@ -344,12 +384,11 @@ impl Entries {
             return Err(ArmRefusal::PositionUnknown(market));
         }
         let was_armed = self.armed(market);
-        if !was_armed {
-            let keys = self
-                .keys
-                .as_ref()
-                .filter(|k| k.symbols.contains_key(&market))
-                .ok_or(ArmRefusal::NotNamed(market))?;
+        if was_armed {
+            // Armed under names given again since, it is disarmed and armed again instead.
+            self.held_covered(market)?;
+        } else {
+            let keys = self.named(market)?;
             let lease = leases.market.ok_or(ArmRefusal::NoMarketLease(market))?;
             if !keys.covers_market(market, &lease) {
                 return Err(ArmRefusal::WrongMarketLease(market));
@@ -398,10 +437,12 @@ impl Entries {
 
 impl Registry {
     /// This registry with the names its arming calls check leases against: without them no
-    /// market is armed ([`ArmRefusal::NotNamed`]). Given once, before any market is armed:
-    /// names given later check only the leases of later arming calls, the leases already held
-    /// stay held, and while an account lease held under other names is held no market is
-    /// armed ([`ArmRefusal::WrongAccountLease`]).
+    /// market is armed ([`ArmRefusal::NotNamed`]). Given once, before any market is armed.
+    /// Names given later leave the leases already held held, but an armed market builds no
+    /// place or amend while its held leases are not covered by them
+    /// ([`StateRefusal::Unleased`]), Start, Flatten and Wind-down on it are refused, and while
+    /// an account lease held under other names is held no market is armed
+    /// ([`ArmRefusal::WrongAccountLease`]): such a market is disarmed and armed again.
     pub fn with_lease_keys(mut self, keys: LeaseKeys) -> Registry {
         self.entries.set_keys(keys);
         self
