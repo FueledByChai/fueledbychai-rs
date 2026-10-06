@@ -14,8 +14,8 @@ name: DeepSeek review
 # FBC-omhd). -I (isolated mode) keeps a file merged beside the script, such as
 # scripts/secrets.py, from shadowing a standard-library module and running with the key. Every
 # action is pinned to a full commit SHA, since it runs right before the step holding the key.
-# The script's own 45-minute deadline, counted from its first request, ends every run in a
-# comment well inside timeout-minutes.
+# The script's own bounds (5 minutes for the git work before its first request, 45 minutes
+# from that request, 1 minute to post) end every run in a comment inside timeout-minutes.
 
 on:
   pull_request:

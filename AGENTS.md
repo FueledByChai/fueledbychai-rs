@@ -385,7 +385,7 @@ outbound bytes, which need the exec path (BT-402).
 ### External model review (DeepSeek)
 
 Codex ran out of credits on 2026-10-05, so a model of another family reviews every pull
-request in its place (owner decision 2026-10-06): `.github/workflows/deepseek-review.yml` runs
+request in its place (owner decision 2026-10-05): `.github/workflows/deepseek-review.yml` runs
 `scripts/deepseek-review.py` on every push to a ready pull request from this repository's own
 branches (`pull_request` opened, ready_for_review, synchronize and reopened; drafts and forks
 run nothing, and there is no `pull_request_target`). A new head cancels the run for the old one.
@@ -397,11 +397,13 @@ posts one comment headed `DeepSeek review` that names the reviewed head SHA and 
 none. Files that did not fit are named under **Not reviewed** (or **Reviewed from the diff
 only**); a complete comment covers the rest of the change, and the independent reviewers, who
 read the whole diff, cover those files as they cover every file. A missing key, an API error, an
-answer that is not the asked JSON, or requests still unanswered 45 minutes after the first one
-(the deadline leaves room inside the job's 60-minute limit to post) posts a comment saying the
+answer that is not the asked JSON, git work before the first request still running after 5
+minutes, or requests still unanswered 45 minutes after the first one (these bounds leave room
+inside the job's 60-minute limit to post) posts a comment saying the
 review did not complete for that SHA, never a pass, and fails only that job. An API error is
 reported by its status and the error's type and code only, never its body, which can echo part
-of the key. Every finding, whole and redacted, and the full report of files reviewed from the
+of the key. No request follows a redirect, which would carry the key or the GitHub token to
+another host; a 3xx is an API error like any other. Every finding, whole and redacted, and the full report of files reviewed from the
 diff only or not reviewed are also printed to the job log as JSON lines (`deepseek-review:
 findings for head <SHA>: [...]` and `deepseek-review: report for head <SHA>: {...}`); when the
 comment has no room for all of it, its marker says `status=truncated findings=N shown=M` and the

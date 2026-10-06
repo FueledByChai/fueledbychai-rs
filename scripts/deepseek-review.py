@@ -16,7 +16,9 @@ has no room for all of it, its marker says status=truncated, which is not a comp
 the run exits non-zero.
 
 Standard library only. The API key is read only from DEEPSEEK_API_KEY, sent only in the
-Authorization header, and removed from every message this script prints or posts (0009).
+Authorization header to the configured endpoint, and removed from every message this script
+prints or posts (0009). No request follows a redirect: urllib's default handler would copy the
+Authorization header to whatever host a 3xx names, so a 3xx is an API error like any other.
 
 Environment (the workflow sets these):
   DEEPSEEK_API_KEY       the key (repository secret); missing or empty -> incomplete review
@@ -28,18 +30,23 @@ Environment (the workflow sets these):
   DEEPSEEK_TIMEOUT       seconds per HTTP request, default 600
   DEEPSEEK_RETRIES       retries after a timeout, HTTP 429 or 5xx, default 2
   DEEPSEEK_RETRY_DELAY   seconds before the first retry (doubled each time), default 10
+  DEEPSEEK_SETUP_TIMEOUT wall-clock seconds for the git work before the first request (the
+                         diff and the text of each touched file), default 300; once it passes,
+                         the review is incomplete
   DEEPSEEK_DEADLINE      wall-clock seconds for all requests and retries, counted from the
                          first request, default 2700; once it passes, no further part or retry
                          starts and the review is incomplete
   DEEPSEEK_POST_TIMEOUT  wall-clock seconds for posting the comment, default 60
-  (The deadline and the post together fit inside the job's timeout-minutes, so a run always
-  ends in a comment rather than being killed by GitHub with none; the tests check it.)
+  (The setup bound, the deadline and the post together fit inside the job's timeout-minutes,
+  so a run always ends in a comment rather than being killed by GitHub with none; the tests
+  check it.) Every number setting must be finite.
   GITHUB_TOKEN, GITHUB_API_URL (default https://api.github.com), GITHUB_REPOSITORY
   PR_NUMBER, PR_HEAD_SHA, PR_BASE_SHA, PR_TITLE, PR_BODY
   REVIEW_REPO_DIR        the checkout holding both SHAs, default the working directory
 """
 import http.client
 import json
+import math
 import os
 import re
 import secrets
@@ -67,6 +74,7 @@ DEFAULT_DEADLINE = 2700.0  # 45 min of the job's 60: the rest is checkout, git w
 COMMENT_RESERVE = 1000  # room kept after the findings for the omitted-findings line and the cap
 IDENT_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 DEFAULT_POST_TIMEOUT = 60.0
+DEFAULT_SETUP_TIMEOUT = 300.0  # the git work before the first request
 
 SYSTEM_INSTRUCTIONS = """You are an adversarial code reviewer for fueledbychai-rs, a public Rust \
 library that connects a trading program to crypto venues (market data, order entry, order truth). \
@@ -115,6 +123,8 @@ def env_float(name, default):
         value = float(raw)
     except ValueError:
         raise Incomplete("%s is not a number" % name)
+    if not math.isfinite(value):
+        raise Incomplete("%s is not a finite number" % name)
     if value < 0:
         raise Incomplete("%s must not be negative" % name)
     return value
@@ -137,19 +147,32 @@ def estimate_tokens(text):
     return (len(text) + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN
 
 
-def git(repo, *args):
+class SetupTimedOut(Exception):
+    """The git work before the first request passed its bound. Not an Incomplete, so no caller
+    that treats a failed git command as "no such file" can swallow it."""
+
+
+def git(repo, until, *args):
+    """git's output; Incomplete when it fails, SetupTimedOut when `until` (a time.monotonic()
+    value) passes first, the git process then being killed."""
+    remaining = until - time.monotonic()
+    if remaining <= 0:
+        raise SetupTimedOut()
     # Literal pathspecs: a touched file named like a glob ("[x].rs") selects only itself.
-    result = subprocess.run(["git", "--literal-pathspecs", "-C", repo] + list(args), stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE)
+    try:
+        result = subprocess.run(["git", "--literal-pathspecs", "-C", repo] + list(args),
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=remaining)
+    except subprocess.TimeoutExpired:
+        raise SetupTimedOut()
     if result.returncode != 0:
         raise Incomplete("git %s failed: %s" % (args[0], result.stderr.decode("utf-8", "replace")
                                                 .strip()[:300]))
     return result.stdout
 
 
-def changed_files(repo, base, head):
+def changed_files(repo, until, base, head):
     """[(status, old_path, new_path)] of the change from the merge base to head, sorted by path."""
-    raw = git(repo, "diff", "--name-status", "-z", "-M", "%s...%s" % (base, head))
+    raw = git(repo, until, "diff", "--name-status", "-z", "-M", "%s...%s" % (base, head))
     parts = raw.decode("utf-8", "surrogateescape").split("\0")
     out, i = [], 0
     while i < len(parts) and parts[i]:
@@ -163,17 +186,17 @@ def changed_files(repo, base, head):
     return sorted(out, key=lambda f: f[2])
 
 
-def file_units(repo, base, head):
+def file_units(repo, until, base, head):
     """One unit per touched file: its path, its diff and, unless deleted or binary, its text."""
     units = []
-    for status, old, new in changed_files(repo, base, head):
+    for status, old, new in changed_files(repo, until, base, head):
         paths = [old, new] if old != new else [new]
-        diff = git(repo, "diff", "--no-color", "--no-ext-diff", "-M", "%s...%s" % (base, head),
+        diff = git(repo, until, "diff", "--no-color", "--no-ext-diff", "-M", "%s...%s" % (base, head),
                    "--", *paths).decode("utf-8", "replace")
         text = None
         if status != "D":
             try:
-                data = git(repo, "show", "%s:%s" % (head, new))
+                data = git(repo, until, "show", "%s:%s" % (head, new))
             except Incomplete:
                 data = None  # a submodule or another object with no blob
             if data is not None and b"\0" not in data:
@@ -196,21 +219,21 @@ def render_unit(unit, with_text):
     return out
 
 
-def base_file(repo, base, path):
+def base_file(repo, until, base, path):
     """A file's text at the base commit, or None. Read from git, never from the head checkout: a
     pull request cannot rewrite the rules it is reviewed against, and a symbolic link in it is
     never followed (git gives a link's target path, not what it points at)."""
     try:
-        if git(repo, "cat-file", "-t", "%s:%s" % (base, path)).strip() != b"blob":
+        if git(repo, until, "cat-file", "-t", "%s:%s" % (base, path)).strip() != b"blob":
             return None
-        return git(repo, "show", "%s:%s" % (base, path)).decode("utf-8", "replace")
+        return git(repo, until, "show", "%s:%s" % (base, path)).decode("utf-8", "replace")
     except Incomplete:
         return None
 
 
-def project_rules(repo, base):
+def project_rules(repo, until, base):
     """AGENTS.md's Project rules section at the base (the whole file if it has no such heading)."""
-    text = base_file(repo, base, "AGENTS.md")
+    text = base_file(repo, until, base, "AGENTS.md")
     if text is None:
         return "(AGENTS.md not found at the base)\n"
     start = text.find("## Project rules")
@@ -220,14 +243,14 @@ def project_rules(repo, base):
     return text[start:end if end >= 0 else len(text)].rstrip() + "\n"
 
 
-def decisions_index(repo, base):
-    text = base_file(repo, base, "docs/decisions/README.md")
+def decisions_index(repo, until, base):
+    text = base_file(repo, until, base, "docs/decisions/README.md")
     return "(decisions index not found at the base)\n" if text is None else text
 
 
-def system_prompt(repo, base):
+def system_prompt(repo, until, base):
     return "%s\n\n# The project rules (AGENTS.md)\n\n%s\n# The decisions index\n\n%s" % (
-        SYSTEM_INSTRUCTIONS, project_rules(repo, base), decisions_index(repo, base))
+        SYSTEM_INSTRUCTIONS, project_rules(repo, until, base), decisions_index(repo, until, base))
 
 
 def user_prompt(title, body, part, parts, payload, nonce):
@@ -298,12 +321,26 @@ def bounded(seconds, fn, *args):
     return result["value"]
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuses every redirect, so the 3xx reaches the caller as an HTTPError. urllib's default
+    handler follows 301, 302, 303 (and 307, 308) and copies the Authorization header to the new
+    host, any scheme included, which would send the key or the GitHub token elsewhere and take
+    that host's answer as the review (Reviewer B, B8)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+OPENER = urllib.request.build_opener(NoRedirect)
+
+
 def http_json(url, payload, headers, timeout):
-    """POST payload as JSON; returns (status, body bytes). Raises URLError/OSError on transport."""
+    """POST payload as JSON, following no redirect; returns (status, body bytes). Raises
+    URLError/OSError on transport."""
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(url, data=data, method="POST", headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with OPENER.open(request, timeout=timeout) as response:
             return response.status, response.read()
     except urllib.error.HTTPError as e:
         return e.code, e.read()
@@ -338,8 +375,8 @@ def call_model(cfg, messages, redact):
                "Authorization": "Bearer " + cfg["key"], "User-Agent": "fueledbychai-rs-review"}
     delay = cfg["retry_delay"]
     if cfg.get("deadline_at") is None:
-        # Counted from the first request: the git work before it is inside the job's slack, and
-        # a slow runner cannot end a review before it has asked anything.
+        # Counted from the first request: the git work before it has its own bound
+        # (DEEPSEEK_SETUP_TIMEOUT), and a slow runner cannot end a review before it has asked.
         cfg["deadline_at"] = time.monotonic() + cfg["deadline"]
 
     def past_deadline(after=None):
@@ -416,7 +453,7 @@ def parse_findings(content, finish_reason=None):
         if not isinstance(path, str) or not path.strip():
             raise bad("file")
         line = item.get("line")
-        if line is not None and (isinstance(line, bool) or not isinstance(line, int) or line < 0):
+        if line is not None and (isinstance(line, bool) or not isinstance(line, int) or line < 1):
             raise bad("line")
         problem = item.get("problem")
         if not isinstance(problem, str) or not problem.strip():
@@ -425,7 +462,7 @@ def parse_findings(content, finish_reason=None):
         if not isinstance(fix, str):
             raise bad("fix")
         findings.append({"severity": severity.strip().upper(), "file": path.strip(),
-                         "line": line or None, "problem": problem.strip(), "fix": fix.strip()})
+                         "line": line, "problem": problem.strip(), "fix": fix.strip()})
     return findings
 
 
@@ -453,11 +490,16 @@ def review(cfg):
         raise Incomplete("the DEEPSEEK_API_KEY secret is not set")
     if not SHA_RE.match(cfg["base"]):
         raise Incomplete("PR_BASE_SHA is not a full commit SHA")
-    units = file_units(cfg["repo"], cfg["base"], cfg["head"])
+    until = time.monotonic() + cfg["setup_timeout"]
+    try:
+        units = file_units(cfg["repo"], until, cfg["base"], cfg["head"])
+        system = system_prompt(cfg["repo"], until, cfg["base"]) if units else ""
+    except SetupTimedOut:
+        raise Incomplete("the git work before the first request did not finish within %g s"
+                         % cfg["setup_timeout"])
     report = {"chunks": 0, "diff_only": [], "not_reviewed": {}, "files": len(units)}
     if not units:
         return [], report
-    system = system_prompt(cfg["repo"], cfg["base"])
     nonce = secrets.token_hex(8)
     overhead = estimate_tokens(system) + estimate_tokens(
         user_prompt(cfg["title"], cfg["body"], 99, 99, "", nonce))
@@ -652,6 +694,8 @@ def main():
         try:
             cfg.update(deadline=env_float("DEEPSEEK_DEADLINE", DEFAULT_DEADLINE) or
                        DEFAULT_DEADLINE)
+            cfg.update(setup_timeout=env_float("DEEPSEEK_SETUP_TIMEOUT", DEFAULT_SETUP_TIMEOUT)
+                       or DEFAULT_SETUP_TIMEOUT)
             cfg.update(deadline_at=None,  # set at the first request
                        budget=env_int("DEEPSEEK_TOKEN_BUDGET", 120000, 1),
                        max_chunks=env_int("DEEPSEEK_MAX_CHUNKS", 4, 1),
