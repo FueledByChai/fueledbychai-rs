@@ -30,9 +30,9 @@ use fbc_core::{
     DecodeError, DecodeScope, Effect, Effects, EncodeCtx, EncodeReceipt, EndpointPlan, Envelope,
     ExecCodec, ExecEndpoint, ExecEvent, ExecSink, FieldSpec, HttpFailure, HttpMethod, HttpPlan,
     HttpRequest, HttpResponse, HttpTag, Inbound, InboundSpans, InstrumentSpecDraft, MdCodec,
-    NonceBlock, NonceSource, NotSentReason, PathStamps, RawFrame, RpcId, Secrets, SpecTable,
-    StreamId, SubmitHandle, SubmitOutcome, Subscription, SymbolError, TimerTag, VenueCaps,
-    VenueCommand, VenueConfig, VenueError, VenueFactory, WireUrl,
+    NonceBlock, NonceSource, NotSentReason, PathStamps, RawFrame, RpcCall, RpcId, Secrets,
+    SpecTable, StreamId, SubmitHandle, SubmitOutcome, Subscription, SymbolError, TimerTag,
+    VenueCaps, VenueCommand, VenueConfig, VenueError, VenueFactory, WireUrl,
 };
 use fbc_oms::ControlCommand;
 use fbc_runtime::{
@@ -56,6 +56,8 @@ const TIMER: &str = "submit.timer";
 const UNITS: &str = "submit.units";
 /// Any value: the codec's encodes carry their request as an HTTP request, not a frame.
 const HTTP: &str = "submit.http";
+/// Any value: the codec's encodes give their request a timeout past the end of the clock.
+const NEVER: &str = "submit.never";
 
 /// The account the tests' sessions trade.
 const ACCT: AccountKey = AccountKey::new(4);
@@ -152,6 +154,7 @@ impl VenueFactory for SubmitToy {
             strip: cfg.get(STRIP).is_some(),
             timer: cfg.get(TIMER).is_some(),
             http: cfg.get(HTTP).is_some(),
+            never: cfg.get(NEVER).is_some(),
         })))
     }
 
@@ -165,14 +168,16 @@ impl VenueFactory for SubmitToy {
 }
 
 /// The toy's codec, logging each encode and timeout; with `strip`, an encode's frames name no
-/// request, with `timer`, an encode also sets a timer, and with `http`, an encode's frames go
-/// as HTTP requests naming the request instead.
+/// request, with `timer`, an encode also sets a timer, with `http`, an encode's frames go as
+/// HTTP requests naming the request instead, and with `never`, an encode's frames give the
+/// request a timeout past the end of the clock.
 struct Logged {
     inner: ToyExec,
     calls: Calls,
     strip: bool,
     timer: bool,
     http: bool,
+    never: bool,
 }
 
 impl ExecCodec for Logged {
@@ -216,6 +221,29 @@ impl ExecCodec for Logged {
                         stream,
                         frame,
                         rpc: None,
+                        class,
+                        charge,
+                    },
+                    other => other,
+                });
+            }
+        }
+        if self.never {
+            for effect in fx.take() {
+                fx.push(match effect {
+                    Effect::Send {
+                        stream,
+                        frame,
+                        rpc: Some(call),
+                        class,
+                        charge,
+                    } => Effect::Send {
+                        stream,
+                        frame,
+                        rpc: Some(RpcCall {
+                            timeout: Duration::MAX,
+                            ..call
+                        }),
                         class,
                         charge,
                     },
@@ -846,6 +874,47 @@ async fn a_command_whose_encode_carries_its_request_over_http_is_not_sent_with_n
     let mut server = ScriptedWs::start().await;
     let venue = SubmitToy::leak();
     let (config, _) = setup(venue, &server.url(), quick(), &[(HTTP, "1")]);
+    let log = Log::default();
+    let (mut session, control) = ExecSession::new(config, Keep::new(&log)).unwrap();
+    let orders = session.orders();
+    let watch = Rc::clone(&log);
+    let script = async move {
+        let mut peer = server.accept().await;
+        peer.recv().await;
+        peer.send(AUTH_ACK);
+        settle(|| authentications(&watch) == 1).await;
+        let rpc = orders.submit_control(REFRESH).unwrap();
+        settle(|| handles(&watch).len() == 1).await;
+        advance(RPC_TIMEOUT * 2).await;
+        churn().await;
+        assert!(peer.quiet());
+        drop(control);
+        rpc
+    };
+    let (run, rpc) = tokio::join!(session.run(), script);
+    run.unwrap();
+    drop(frozen);
+
+    let refused = SubmitHandle {
+        rpc,
+        receipt: Err(NotSentReason::Unencodable),
+    };
+    assert_eq!(handles(&log), [refused]);
+    let calls = venue.calls();
+    assert!(matches!(&calls[..], [Call::Encode { .. }]), "{calls:?}");
+    assert!(outcomes(&log).is_empty());
+}
+
+/// A command whose encode gives its request a timeout past the end of the clock is
+/// `NotSent(Unencodable)`: its deadline cannot be represented, so it would never come back
+/// `Unknown` (0005, `RpcCall`'s own contract; PR #87 Reviewer B B9). Nothing is written, and no
+/// `Unknown` follows.
+#[tokio::test(start_paused = true)]
+async fn a_command_whose_request_has_no_representable_deadline_is_not_sent_with_no_byte_written() {
+    let frozen = freeze();
+    let mut server = ScriptedWs::start().await;
+    let venue = SubmitToy::leak();
+    let (config, _) = setup(venue, &server.url(), quick(), &[(NEVER, "1")]);
     let log = Log::default();
     let (mut session, control) = ExecSession::new(config, Keep::new(&log)).unwrap();
     let orders = session.orders();
