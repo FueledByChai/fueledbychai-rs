@@ -87,6 +87,10 @@
 //! socket writes (the consumer's attempt deadline and write-stall window), no call here has a
 //! deadline of its own; the caller bounds one with its own timer.
 
+// The integration tests' shared servers, which a unit test includes, name this crate.
+#[cfg(test)]
+extern crate self as fbc_runtime;
+
 mod books;
 mod connector;
 mod epoch;

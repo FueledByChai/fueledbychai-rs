@@ -236,10 +236,11 @@ impl ExecOrders {
     }
 
     /// Whether the session's current epoch takes places and amends (FBC-w19, decision 0058):
-    /// the codec reported its stream authenticated, the venue accepted the cancel-on-disconnect
-    /// arm the session sent then (or, where the protection outlives a connection, one on an
-    /// earlier epoch), and the resync the session asked for then has pushed its `ResyncEnd` to
-    /// the handler. Until then a place, a batch of places or an amend is
+    /// the codec reported its stream authenticated, the venue finally accepted the
+    /// cancel-on-disconnect arm the session sent then (or, where the protection outlives a
+    /// connection, one on an earlier epoch), and the resync the session asked for then has
+    /// pushed its `ResyncEnd` to the handler. It is true already while the handler is handed the
+    /// last of those two, and a place submitted then goes out once the handler returns. Until then a place, a batch of places or an amend is
     /// `NotSent(Disconnected)`, with no nonce reserved and nothing written; a cancel, a
     /// cancel-many, an instrument cancel-all and a control command are not held.
     pub fn may_place(&self) -> bool {
@@ -395,3 +396,9 @@ mod tests {
         );
     }
 }
+
+// A held place and amend at the session, queued as `ExecOrders::submit` would queue them
+// (FBC-w19; PR #90 Reviewer B B2).
+#[cfg(test)]
+#[path = "exec_held_tests.rs"]
+mod held_tests;
