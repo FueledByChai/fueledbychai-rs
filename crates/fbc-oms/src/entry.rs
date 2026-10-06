@@ -36,7 +36,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
-use fbc_core::{AccountLease, InstrumentId, MarketLease, NonceScope, VenueSymbol};
+use fbc_core::{AccountLease, InstrumentId, MarketLease, NonceScope, OrderCaps, VenueSymbol};
 
 use crate::grant::{Generations, StateGeneration};
 use crate::registry::Registry;
@@ -92,8 +92,9 @@ impl MarketEntry {
 /// The stable names the consumer's leases are taken under (decision 0013 rule 3, FBC-hwe), for
 /// the registry to check a lease given to an arming call against: the venue
 /// ([`VenueFactory::id`](fbc_core::VenueFactory::id)), the consumer's name for the account,
-/// the venue's nonce scope (`caps.exec.order.nonce_scope`) and each market's
-/// [`VenueSymbol`]. A market it does not name is never armed.
+/// the venue's nonce scope, taken from the venue's own [`OrderCaps`] (`caps.exec.order`, the
+/// caps every cancel, amend and resync is judged against) and never given on its own, and
+/// each market's [`VenueSymbol`]. A market it does not name is never armed.
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub struct LeaseKeys {
     venue: String,
@@ -103,12 +104,13 @@ pub struct LeaseKeys {
 }
 
 impl LeaseKeys {
-    /// The names of `account` on `venue`, whose nonce scope is `nonce_scope`, for no market yet.
-    pub fn new(venue: &str, account: &str, nonce_scope: NonceScope) -> LeaseKeys {
+    /// The names of `account` on `venue`, whose order caps are `order` (the nonce scope is
+    /// theirs: DeepSeek's DS-4 on PR #86), for no market yet.
+    pub fn new(venue: &str, account: &str, order: &OrderCaps) -> LeaseKeys {
         LeaseKeys {
             venue: venue.to_owned(),
             account: account.to_owned(),
-            nonce_scope,
+            nonce_scope: order.nonce_scope,
             symbols: BTreeMap::new(),
         }
     }
@@ -129,7 +131,7 @@ impl LeaseKeys {
         &self.account
     }
 
-    /// The venue's nonce scope.
+    /// The venue's nonce scope, from its order caps.
     pub fn nonce_scope(&self) -> NonceScope {
         self.nonce_scope
     }
