@@ -442,9 +442,14 @@ imports, and pins every action to a full commit SHA. The job is not a required s
   model on its OpenAI-compatible API, with JSON output and thinking on by default (the API's
   change log of 2026-09-10 retired `deepseek-chat` and `deepseek-reasoner`; `deepseek-flash` is
   the cheaper alternative). Set it with `gh variable set DEEPSEEK_MODEL --body <model>`; an
-  unset variable takes the default. Optional variables: `DEEPSEEK_API_BASE` (default
-  `https://api.deepseek.com`) and `DEEPSEEK_TOKEN_BUDGET` (estimated prompt tokens per request,
-  characters / 3, default 120000; at most 4 requests per review).
+  unset variable takes the default. Optional variables, each unset at the script's default:
+  `DEEPSEEK_API_BASE` (default `https://api.deepseek.com`), `DEEPSEEK_TOKEN_BUDGET` (estimated
+  prompt tokens per request, characters / 3, default 120000), `DEEPSEEK_MAX_CHUNKS` (parts per
+  review, default 4), `DEEPSEEK_MAX_OUTPUT_TOKENS` (each answer's allowance, reasoning included,
+  default 65536), `DEEPSEEK_SPLIT_DEPTH` (times a cut-off part is split again, 0 to 4, default
+  2), `DEEPSEEK_TIMEOUT` (seconds per request, default 600), `DEEPSEEK_RETRIES` (default 2) and
+  `DEEPSEEK_RETRY_DELAY` (seconds, default 10). A review that keeps ending cut off at max_tokens
+  is fixed by raising `DEEPSEEK_MAX_OUTPUT_TOKENS` or `DEEPSEEK_SPLIT_DEPTH`.
 - How the loop treats the comment: as it treated Codex's review. Where a loop prompt asks for a
   completed Codex review of the head, read the newest `DeepSeek review` comment instead. Only a
   comment authored by `github-actions[bot]` (the workflow's own token) counts. Anyone can
