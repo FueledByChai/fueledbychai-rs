@@ -12,6 +12,7 @@ use fbc_core::{
 };
 
 use crate::caps::{Adds, CapRefusal, Exposure, PreTradeCaps};
+use crate::entry::{Entries, StateRefusal};
 use crate::ladder;
 use crate::ledger::AcceptedFill;
 use crate::permit::{
@@ -39,6 +40,9 @@ pub struct Registry {
     pub(crate) queries: HashMap<RpcId, ClientOrderId>,
     /// How many orders ended Lost.
     pub(crate) lost: u64,
+    /// Each market's armed flag and order-entry state, and the leases arming took (decision
+    /// 0012).
+    pub(crate) entries: Entries,
 }
 
 /// Where [`Registry::apply_fill`] sent a fill the ledger accepted.
@@ -116,6 +120,9 @@ pub enum OmsError {
     SentRecorded(ClientOrderId),
     /// A pre-trade cap refused the place or batch item (0013 rule 2): it was never built.
     Capped(CapRefusal),
+    /// The market's state refused the place or batch item before either cap was consulted
+    /// (decision 0012): it was never built.
+    State(StateRefusal),
     /// The batch names more than one market: a batch is one market's command, so none of it
     /// was built.
     MixedMarkets,
@@ -154,6 +161,7 @@ impl fmt::Display for OmsError {
                 write!(f, "{cid:?} was already recorded as sent at other instants")
             }
             OmsError::Capped(refusal) => write!(f, "refused by a pre-trade cap: {refusal}"),
+            OmsError::State(refusal) => write!(f, "refused by the market's state: {refusal}"),
             OmsError::MixedMarkets => write!(f, "a batch of places names more than one market"),
             OmsError::PositionSeeded(inst) => {
                 write!(f, "the position on {inst:?} was already seeded")
@@ -277,6 +285,7 @@ impl Registry {
     }
 
     fn admit_placement(&self, order: &NewOrder) -> Result<(), OmsError> {
+        self.entries.admits(order.inst).map_err(OmsError::State)?;
         if self.orders.contains_key(&order.cid) {
             return Err(OmsError::DuplicateCid(order.cid));
         }
@@ -561,11 +570,12 @@ impl Registry {
             .ok_or(PermitRefusal::UnknownCid(cid))?
             .placed();
         let exposure = self.exposure(placed.inst, placed.side, Some(cid));
+        let state = self.entries.admits(placed.inst);
         let rec = self
             .orders
             .get_mut(&cid)
             .expect("the order was found above");
-        Live::check(rec, exposure)
+        Live::check(rec, state, exposure)
     }
 
     /// The permit to cancel our order `cid`: it is not terminal (PendingNew, Unknown and an

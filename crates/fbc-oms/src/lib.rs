@@ -106,10 +106,27 @@
 //! nothing places leaves the market unknown. Later resyncs compare each position with the
 //! inventory as of the watermark and report a desync, never overwriting it ([`PositionCheck`]).
 //!
-//! Not here yet: the market states (FBC-c4v), and issuing an authorization after them and its
-//! check at submit (FBC-afd).
+//! Market states and arming (decision 0012; 0013 rules 1 and 3; `tests/states.rs`): each
+//! market is armed or not and in one of Killed, Cancel-only, Exit or Quoting
+//! ([`EntryState`], [`Registry::entry`]); a fresh registry has every market disarmed and in
+//! Cancel-only. A place, amend, replace or batch item is built only on an armed market in
+//! Quoting, the market's state checked before either cap ([`StateRefusal`]): Killed and
+//! Cancel-only build none, reduce-only and reducing ones included, and Exit none until its
+//! admission is built (FBC-7gl); cancels are built in every state. The consumer's calls on the
+//! owner's action move it: [`Registry::start`] (the only way to Quoting),
+//! [`Registry::flatten`] and [`Registry::wind_down`] (straight into Exit), each arming a
+//! disarmed market with its market lease, and the account lease where the venue's nonces are
+//! per account, checked against the consumer's [`LeaseKeys`], and each refused, changing
+//! nothing, for a Killed market or while the market's position is unknown ([`ArmRefusal`]);
+//! [`Registry::disarm`] (to Cancel-only, the leases dropped), [`Registry::kill`] and
+//! [`Registry::lift_kill`] (to Cancel-only, never further). Every change advances the market's
+//! [`StateGeneration`]; no resync, fill or timer changes a market's state.
+//!
+//! Not here yet: issuing an authorization after the market's state and caps, and its check at
+//! submit (FBC-afd).
 
 mod caps;
+mod entry;
 mod gateway;
 mod grant;
 mod ladder;
@@ -126,6 +143,7 @@ mod resync;
 mod common;
 
 pub use caps::{CapRefusal, CapsConfigError, MarketCaps, MarketCapsConfig, PreTradeCaps};
+pub use entry::{ArmRefusal, EntryState, ExitKind, LeaseKeys, Leases, MarketEntry, StateRefusal};
 pub use gateway::{ControlCommand, ManagedGateway, OrderGateway};
 pub use grant::{Authorization, StateGeneration};
 pub use ladder::{LadderConfig, LadderConfigError, LadderPlan, LadderResolution, ResyncApplied};

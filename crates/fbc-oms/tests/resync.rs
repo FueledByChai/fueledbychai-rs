@@ -3,6 +3,8 @@
 //! compares and never overwrites the inventory, and a fill straddling the snapshot (executed
 //! after the request, reported before or after the answer) is counted exactly once.
 
+#[path = "common/arm.rs"]
+mod arm;
 mod common;
 
 use std::time::Duration;
@@ -14,9 +16,10 @@ use fbc_core::{
     SnapshotSource, SubmitOutcome, Ticks, VenueOrderSnapshot, VenueOrderState, WallNs,
 };
 use fbc_oms::{
-    Admission, CapRefusal, FillLedger, FillRouted, FillTime, LadderConfig, LedgerConfig,
-    MarketCapsConfig, OmsError, OrdState, OrderKey, OrderOp, PermitRefusal, PositionCheck,
-    PreTradeCaps, Registry, ResyncError, ResyncReport, ResyncSnapshot, TerminalKind,
+    Admission, ArmRefusal, CapRefusal, FillLedger, FillRouted, FillTime, LadderConfig,
+    LedgerConfig, MarketCapsConfig, OmsError, OrdState, OrderKey, OrderOp, PermitRefusal,
+    PermittedCommand, PositionCheck, PreTradeCaps, Registry, ResyncError, ResyncReport,
+    ResyncSnapshot, StateRefusal, TerminalKind,
 };
 
 const INST: InstrumentId = InstrumentId::new(1);
@@ -36,9 +39,10 @@ fn registry() -> Registry {
     registry_resting(WIDE)
 }
 
-/// A registry under the inventory cap `CAP` and the resting cap `resting`, not seeded.
+/// A registry under the inventory cap `CAP` and the resting cap `resting`, not seeded, its
+/// markets disarmed and named for their leases.
 fn registry_resting(resting: i64) -> Registry {
-    Registry::with_caps(
+    arm::named(Registry::with_caps(
         PreTradeCaps::new()
             .with_market(
                 INST,
@@ -48,7 +52,27 @@ fn registry_resting(resting: i64) -> Registry {
                 },
             )
             .unwrap(),
-    )
+    ))
+}
+
+/// The owner's Start on `INST` (decision 0012), with its leases: its position must be known.
+fn arm(reg: &mut Registry) {
+    arm::start(reg, INST);
+}
+
+/// Builds the place of `order`, the owner's Start pressed first once `INST`'s position is known
+/// (decision 0012): until then nothing is armed, and the market's state refuses it.
+fn place(reg: &mut Registry, order: NewOrder) -> Result<PermittedCommand, OmsError> {
+    if !reg.entry(INST).armed() && reg.position_known(INST) {
+        arm(reg);
+    }
+    reg.place(order)
+}
+
+/// What refuses a place before the first trustworthy resync: the market cannot be armed
+/// while its position is unknown, so it stays Cancel-only.
+fn held() -> OmsError {
+    OmsError::State(StateRefusal::CancelOnly(INST))
 }
 
 fn ledger() -> FillLedger {
@@ -213,11 +237,11 @@ fn the_first_resync_seeds_the_positions_and_registers_our_open_orders() {
     assert!(reg.cancellable(a).is_ok());
     // The inventory cap counts its 25 unfilled lots once beside the seeded 25 (not its 25
     // filled ones again): a bid of one more lot is refused at 51, not 76.
-    assert_eq!(reg.place(placement(cid(), 100, 1)), Err(capped(51)));
+    assert_eq!(place(&mut reg, placement(cid(), 100, 1)), Err(capped(51)));
     // Ended, it counts nothing more: its filled part is in the seeded position.
     let done = update(Some(a), common::canceled(), 25);
     reg.apply_update(&done, key(2));
-    reg.place(placement(cid(), 100, 25)).unwrap();
+    place(&mut reg, placement(cid(), 100, 25)).unwrap();
     // A market is seeded once: the next resync compares.
     let report = resync(&mut reg, &snapshot(vec![], &[(INST, 25)]));
     assert!(report.seeded.is_empty() && report.registered.is_empty());
@@ -248,7 +272,7 @@ fn an_order_a_resync_registers_counts_against_the_resting_cap() {
     assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(L0)));
     // An earlier run's bid fills the side's one L0 order: one more lot is refused at 12.
     assert_eq!(
-        reg.place(placement(cid(), 100, 1)),
+        place(&mut reg, placement(cid(), 100, 1)),
         Err(OmsError::Capped(CapRefusal::RestingCap {
             inst: INST,
             side: Side::Buy,
@@ -259,10 +283,10 @@ fn an_order_a_resync_registers_counts_against_the_resting_cap() {
     // The other side is its own: an L0 offer is admitted.
     let mut offer = placement(cid(), 101, L0);
     offer.side = Side::Sell;
-    reg.place(offer).unwrap();
+    place(&mut reg, offer).unwrap();
     // Ended, it rests nothing: an L0 bid is admitted.
     reg.apply_update(&update(Some(earlier), common::canceled(), 0), key(2));
-    reg.place(placement(cid(), 100, L0)).unwrap();
+    place(&mut reg, placement(cid(), 100, L0)).unwrap();
 }
 
 #[test]
@@ -337,17 +361,27 @@ fn an_order_a_resync_registers_is_sent_at_its_request_and_leaves_the_ladder_by_a
         OrdState::Terminal(TerminalKind::Lost)
     );
     assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(0)));
-    reg.place(placement(cid(), 100, L0)).unwrap();
+    place(&mut reg, placement(cid(), 100, L0)).unwrap();
 }
 
 #[test]
 fn the_position_is_unknown_and_nothing_is_built_until_the_first_resync_applies() {
     let mut reg = registry();
     let mut l = ledger();
-    let unknown = OmsError::Capped(CapRefusal::PositionUnknown(INST));
+    let unknown = held();
     assert_eq!(reg.position(INST), None);
     assert!(!reg.position_known(INST));
-    assert_eq!(reg.place(placement(cid(), 100, 1)), Err(unknown.clone()));
+    // The owner's Start is refused while the position is unknown (decision 0012), so nothing
+    // is built.
+    let leases = arm::leases(&reg, INST);
+    assert_eq!(
+        reg.start(INST, leases),
+        Err(ArmRefusal::PositionUnknown(INST))
+    );
+    assert_eq!(
+        place(&mut reg, placement(cid(), 100, 1)),
+        Err(unknown.clone())
+    );
     // A fill before the seed moves no position: it stays unknown, and only a resync's
     // snapshot can place the fill, so a seed by hand is refused.
     let stray = cid();
@@ -367,13 +401,13 @@ fn the_position_is_unknown_and_nothing_is_built_until_the_first_resync_applies()
         reg.resync(&cfg(), &caps(SnapshotSource::Trustworthy), &twice, key(1)),
         Err(ResyncError::DuplicatePosition(INST))
     );
-    assert_eq!(reg.place(placement(cid(), 100, 1)), Err(unknown));
+    assert_eq!(place(&mut reg, placement(cid(), 100, 1)), Err(unknown));
     // Applied, the position is the venue's and orders are admitted under it.
     let report = resync(&mut reg, &snapshot(vec![], &[(INST, 4)]));
     assert_eq!(report.seeded, vec![(INST, SignedLots(4))]);
     assert_eq!(reg.position(INST), Some(SignedLots(4)));
     assert!(reg.position_known(INST));
-    reg.place(placement(cid(), 100, 1)).unwrap();
+    place(&mut reg, placement(cid(), 100, 1)).unwrap();
     assert_eq!(
         reg.seed_position(INST, SignedLots(0)),
         Err(OmsError::PositionSeeded(INST))
@@ -386,7 +420,7 @@ fn a_later_resync_reports_a_desync_and_never_changes_the_inventory() {
     let mut l = ledger();
     resync(&mut reg, &snapshot(vec![], &[(INST, 0)]));
     let a = cid();
-    reg.place(placement(a, 100, 20)).unwrap();
+    place(&mut reg, placement(a, 100, 20)).unwrap();
     // Before the next request: 5 lots; after it, 3 executed before its watermark and 2 after.
     apply(
         &mut reg,
@@ -512,7 +546,7 @@ fn a_fill_between_the_request_and_the_snapshot_counts_exactly_once() {
         assert_eq!(reg.position(INST), Some(SignedLots(10)), "before: {before}");
         assert_eq!(reg.get(a).unwrap().cum_fills(), lots(10));
         // The order's 10 filled lots count once against the cap: 10 resting beside 10 held.
-        assert_eq!(reg.place(placement(cid(), 100, 31)), Err(capped(51)));
+        assert_eq!(place(&mut reg, placement(cid(), 100, 31)), Err(capped(51)));
     }
 }
 
@@ -543,7 +577,7 @@ fn a_fill_of_an_order_the_snapshot_does_not_show_is_in_it_from_a_trustworthy_sou
     let mut l = ledger();
     resync(&mut reg, &snapshot(vec![], &[]));
     let a = cid();
-    reg.place(placement(a, 100, 5)).unwrap();
+    place(&mut reg, placement(a, 100, 5)).unwrap();
     apply(
         &mut reg,
         &mut l,
@@ -588,13 +622,14 @@ fn a_fill_nothing_places_leaves_the_market_unknown() {
     let mut l = ledger();
     reg.insert(placement(early, 100, 5)).unwrap();
     resync(&mut reg, &snapshot(vec![], &[]));
+    arm(&mut reg);
     assert_eq!(
         apply(&mut reg, &mut l, &f, exec(1_500), 1_100),
         FillRouted::Unsettled(early)
     );
     assert_eq!(reg.position(INST), None);
     assert_eq!(
-        reg.place(placement(cid(), 100, 1)),
+        place(&mut reg, placement(cid(), 100, 1)),
         Err(OmsError::Capped(CapRefusal::PositionUnknown(INST)))
     );
     let report = resync(&mut reg, &snapshot_at(3_000, 3_000, vec![], &[(INST, 5)]));
@@ -748,7 +783,7 @@ fn every_resync_reconciles_the_orders_the_registry_holds() {
     let mut reg = registry();
     resync(&mut reg, &snapshot(vec![], &[]));
     let a = cid();
-    reg.place(placement(a, 100, 10)).unwrap();
+    place(&mut reg, placement(a, 100, 10)).unwrap();
     // The snapshot shows it resting, filled 3: an order update, which never moves the
     // inventory (decision 0005, I3).
     let report = resync(
@@ -791,7 +826,7 @@ fn a_resync_applies_to_the_unknown_ladder_too() {
     let mut reg = registry();
     resync(&mut reg, &snapshot(vec![], &[]));
     let a = cid();
-    reg.place(placement(a, 100, 5)).unwrap();
+    place(&mut reg, placement(a, 100, 5)).unwrap();
     reg.placement_sent(a, MonoNs(0), WallNs(0)).unwrap();
     // Unanswered past the intent timeout: on the ladder.
     let plan = reg.ladder(&cfg(), &order_caps(), MonoNs(2_000_000_000));
@@ -801,7 +836,7 @@ fn a_resync_applies_to_the_unknown_ladder_too() {
     assert_eq!(report.ladder.lost, vec![a]);
     // Shown, an order on the ladder is resolved there and not applied a second time.
     let b = cid();
-    reg.place(placement(b, 100, 5)).unwrap();
+    place(&mut reg, placement(b, 100, 5)).unwrap();
     reg.placement_sent(b, MonoNs(0), WallNs(0)).unwrap();
     reg.ladder(&cfg(), &order_caps(), MonoNs(2_000_000_000));
     let report = resync(
@@ -934,6 +969,7 @@ fn a_fill_of_an_order_registered_before_the_seed_and_not_shown_is_never_assumed_
     let b = cid();
     reg.insert(placement(b, 100, CAP)).unwrap();
     resync(&mut reg, &snapshot(vec![], &[(INST, 0)]));
+    arm(&mut reg);
     let f = order_fill(b, "b", "x", CAP, Some(CAP));
     assert_eq!(
         apply(&mut reg, &mut l, &f, exec(1_500), 1_100),
@@ -941,7 +977,7 @@ fn a_fill_of_an_order_registered_before_the_seed_and_not_shown_is_never_assumed_
     );
     assert_eq!(reg.position(INST), None);
     assert_eq!(
-        reg.place(placement(cid(), 100, CAP)),
+        place(&mut reg, placement(cid(), 100, CAP)),
         Err(OmsError::Capped(CapRefusal::PositionUnknown(INST)))
     );
     // Its fill arrives before the answer: the market is not seeded.
@@ -975,15 +1011,12 @@ fn a_resync_seeds_nothing_unless_the_snapshot_source_is_trustworthy() {
         assert!(report.untrustworthy, "{source:?}");
         assert!(report.seeded.is_empty() && report.unsettled.is_empty());
         assert_eq!(reg.position(INST), None);
-        assert_eq!(
-            reg.place(placement(cid(), 100, 1)),
-            Err(OmsError::Capped(CapRefusal::PositionUnknown(INST)))
-        );
+        assert_eq!(place(&mut reg, placement(cid(), 100, 1)), Err(held()));
         // A trustworthy one then seeds it.
         let report = resync(&mut reg, &snapshot_at(2_000, 2_000, vec![], &[(INST, 0)]));
         assert!(!report.untrustworthy);
         assert_eq!(report.seeded, vec![(INST, SignedLots(0))]);
-        reg.place(placement(cid(), 100, 1)).unwrap();
+        place(&mut reg, placement(cid(), 100, 1)).unwrap();
     }
 }
 

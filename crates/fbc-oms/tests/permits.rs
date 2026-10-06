@@ -6,6 +6,8 @@
 //! and a foreign-namespace or non-canonical order never cancelled one by one, its fills
 //! flagged and moving nothing (I4). The compile-fail half is `tests/compile_fail.rs`.
 
+#[path = "common/arm.rs"]
+mod arm;
 mod common;
 
 use std::time::Duration;
@@ -39,6 +41,9 @@ fn registry() -> Registry {
             .unwrap(),
     );
     reg.seed_position(INST, SignedLots(0)).unwrap();
+    // The owner's Start (decision 0012): the market's state admits amends.
+    let mut reg = arm::named(reg);
+    arm::start(&mut reg, INST);
     reg
 }
 
