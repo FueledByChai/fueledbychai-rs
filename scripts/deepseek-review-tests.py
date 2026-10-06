@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 sys.dont_write_bytecode = True
@@ -35,6 +36,7 @@ class Stub:
 
     def __init__(self, answer):
         self.answer, self.requests = answer, []
+        self.release = threading.Event()  # set on close: frees any stalled handler
         stub = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -44,6 +46,18 @@ class Stub:
                 stub.requests.append({"path": self.path, "headers": dict(self.headers),
                                       "body": body})
                 status, out = stub.answer(self.path, body)
+                if callable(out):  # a stalling or trickling peer: out() yields the pieces
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", "100000")
+                    self.end_headers()
+                    try:
+                        for piece in out():
+                            self.wfile.write(piece)
+                            self.wfile.flush()
+                    except OSError:
+                        pass  # the client gave up, as it should
+                    return
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(out)))
@@ -60,6 +74,7 @@ class Stub:
         self.thread.start()
 
     def close(self):
+        self.release.set()
         self.server.shutdown()
         self.server.server_close()
 
@@ -77,6 +92,20 @@ def findings_json(*findings):
 def finding(fid, severity, path, line, problem, fix="fix it"):
     return {"id": fid, "severity": severity, "file": path, "line": line, "problem": problem,
             "fix": fix}
+
+
+def workflow_run_line():
+    """The workflow's one run line, which starts the script."""
+    runs = [l.strip() for l in WORKFLOW.read_text().splitlines() if l.strip().startswith("run:")]
+    assert len(runs) == 1, runs
+    return runs[0][len("run:"):].strip()
+
+
+def workflow_command(script):
+    """The workflow's run line as argv, with this Python and the given copy of the script."""
+    argv = workflow_run_line().split()
+    assert argv[0] == "python3" and argv[-1] == "scripts/deepseek-review.py", argv
+    return [sys.executable] + argv[1:-1] + [str(script)]
 
 
 def git(repo, *args):
@@ -141,8 +170,10 @@ class ReviewTest(unittest.TestCase):
                 full.pop(name, None)
             else:
                 full[name] = value
-        result = subprocess.run([sys.executable, str(SCRIPT)], env=full, stdout=subprocess.PIPE,
+        started = time.monotonic()
+        result = subprocess.run(workflow_command(SCRIPT), env=full, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, timeout=120)
+        self.elapsed = time.monotonic() - started
         self.rc, self.out, self.err = result.returncode, result.stdout.decode(), \
             result.stderr.decode()
         for text in [self.out, self.err] + [json.dumps(r["body"]) for r in self.github.requests]:
@@ -486,6 +517,139 @@ class ReviewTest(unittest.TestCase):
             self.assertEqual(self.comments(), [])
             self.assertEqual(self.chat.requests, [])
 
+    # --- the run is bounded in time, so it always ends in a comment (Reviewer B, B1)
+
+    def stalling(self, path, body):
+        """An endpoint that accepts the request and never answers until the test ends."""
+        def pieces():
+            self.chat.release.wait(60)
+            yield b""
+        return 200, pieces
+
+    def trickling(self, path, body):
+        """An endpoint that sends one byte at a time, each well inside the socket timeout."""
+        def pieces():
+            while not self.chat.release.wait(0.2):
+                yield b" "
+        return 200, pieces
+
+    def test_a_stalled_api_ends_at_the_deadline_with_an_incomplete_review(self):
+        head = self.change()
+        self.chat.answer = self.stalling
+        self.run_review(head, DEEPSEEK_DEADLINE="2", DEEPSEEK_TIMEOUT="60")
+        self.assert_incomplete(head, "part 1 of 1", "the review deadline of 2 s passed")
+        self.assertLess(self.elapsed, 15)
+
+    def test_a_trickling_answer_is_cut_at_the_deadline(self):
+        head = self.change()
+        self.chat.answer = self.trickling
+        self.run_review(head, DEEPSEEK_DEADLINE="2", DEEPSEEK_TIMEOUT="60")
+        self.assert_incomplete(head, "the review deadline of 2 s passed")
+        self.assertLess(self.elapsed, 15)
+
+    def test_retries_stop_at_the_deadline_instead_of_sleeping_past_it(self):
+        head = self.change()
+        self.chat.answer = lambda path, body: (503, b"busy")
+        self.run_review(head, DEEPSEEK_DEADLINE="2", DEEPSEEK_RETRIES="2",
+                        DEEPSEEK_RETRY_DELAY="60")
+        self.assert_incomplete(head, "the review deadline of 2 s passed", "HTTP 503")
+        self.assertEqual(len(self.chat.requests), 1)
+        self.assertLess(self.elapsed, 15)
+
+    def test_a_slow_part_ends_the_review_without_sending_the_parts_after_it(self):
+        head = self.big_change()
+
+        def answer(path, body):
+            self.chat.release.wait(5)
+            return completion(findings_json())
+        self.chat.answer = answer
+        self.run_review(head, DEEPSEEK_TOKEN_BUDGET="5000", DEEPSEEK_DEADLINE="2")
+        self.assert_incomplete(head, "the review deadline of 2 s passed")
+        self.assertEqual(len(self.chat.requests), 1)
+
+    def test_a_stalled_comments_api_ends_without_hanging(self):
+        head = self.change()
+        def stalled():
+            self.github.release.wait(60)
+            yield b""
+        self.github.answer = lambda path, body: (201, stalled)
+        self.run_review(head, DEEPSEEK_POST_TIMEOUT="2")
+        self.assertEqual(self.rc, 1)
+        self.assertIn("posting the comment failed: no answer within 2 s", self.err)
+        self.assertLess(self.elapsed, 15)
+
+
+class DeadlineTest(unittest.TestCase):
+    def test_the_default_deadline_and_post_fit_inside_the_job_timeout(self):
+        spec = importlib.util.spec_from_file_location("deepseek_review", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        minutes = re.findall(r"^\s*timeout-minutes:\s*(\d+)\s*$", WORKFLOW.read_text(), re.M)
+        self.assertEqual(len(minutes), 1, minutes)
+        # Ten minutes are left for the runner, the checkout and the git work before the review.
+        self.assertLessEqual(module.DEFAULT_DEADLINE + module.DEFAULT_POST_TIMEOUT,
+                             int(minutes[0]) * 60 - 600)
+
+
+class IsolationTest(unittest.TestCase):
+    """Reviewer A: a module beside the script must not shadow the standard library it imports,
+    or any file merged into scripts/ would run with the key in its environment."""
+
+    def test_the_workflow_runs_the_script_isolated_from_files_beside_it(self):
+        work = Path(tempfile.mkdtemp(prefix="deepseek-review-isolation-"))
+        try:
+            (work / "scripts").mkdir()
+            script = work / "scripts" / "deepseek-review.py"
+            shutil.copy(str(SCRIPT), str(script))
+            for name in ("secrets", "json", "subprocess", "urllib", "http"):
+                (work / "scripts" / (name + ".py")).write_text(
+                    "import os, sys\nsys.stdout.write('HIJACKED ' + "
+                    "os.environ.get('DEEPSEEK_API_KEY', ''))\nsys.stdout.flush()\nos._exit(9)\n")
+            env = {"PATH": os.environ["PATH"], "DEEPSEEK_API_KEY": KEY,
+                   "PYTHONPATH": str(work / "scripts")}
+            result = subprocess.run(workflow_command(script), env=env, cwd=str(work),
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+            out = result.stdout.decode() + result.stderr.decode()
+            self.assertNotIn("HIJACKED", out)
+            self.assertNotIn(KEY, out)
+            self.assertEqual(result.returncode, 2, out)  # no PR context: nothing posted
+        finally:
+            shutil.rmtree(str(work), ignore_errors=True)
+
+
+class CommentAuthorTest(unittest.TestCase):
+    """Reviewer B, B2: the loop counts only the workflow's own comment for the head. Anyone can
+    comment on a public pull request, so a look-alike from anyone else must not count. The
+    command AGENTS.md gives the loop is run here over a page of comments with jq."""
+
+    def command_filter(self):
+        text = (HERE.parent / "AGENTS.md").read_text()
+        found = re.findall(r"^\s*gh api repos/\S+/issues/<PR>/comments --paginate --jq '(.+)'$",
+                           text, re.M)
+        self.assertEqual(len(found), 1, "AGENTS.md gives the loop one comment-reading command")
+        return found[0]
+
+    @unittest.skipUnless(shutil.which("jq"), "jq is not installed")
+    def test_only_the_workflows_comment_for_the_head_counts(self):
+        head, old = "a" * 40, "b" * 40
+
+        def comment(n, login, kind, sha, status):
+            return {"id": n, "html_url": "https://example.invalid/c%d" % n,
+                    "user": {"login": login, "type": kind},
+                    "body": "## DeepSeek review\n\n<!-- deepseek-review head=%s status=%s -->\n"
+                            "text\n" % (sha, status)}
+        page = [comment(1, "github-actions[bot]", "Bot", old, "complete findings=0"),
+                comment(2, "github-actions[bot]", "Bot", head, "complete findings=3"),
+                comment(3, "someone", "User", head, "complete findings=0"),
+                comment(4, "github-actions", "User", head, "complete findings=0"),
+                comment(5, "other-app[bot]", "Bot", head, "complete findings=0")]
+        jq = self.command_filter().replace("<HEAD>", head)
+        result = subprocess.run(["jq", "-r", jq], input=json.dumps(page).encode(),
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        lines = result.stdout.decode().splitlines()
+        self.assertEqual(lines, ["https://example.invalid/c2 <!-- deepseek-review head=%s "
+                                 "status=complete findings=3 -->" % head])
+
 
 class CommentSizeTest(unittest.TestCase):
     def test_a_comment_never_exceeds_the_size_limit_and_says_what_it_dropped(self):
@@ -547,7 +711,7 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(secrets, ["DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}"])
         self.assertIn("DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL }}", self.text)
         self.assertIn("persist-credentials: false", self.text)
-        self.assertIn("run: python3 scripts/deepseek-review.py", self.text)
+        self.assertEqual(workflow_run_line(), "python3 -I scripts/deepseek-review.py")
         # Untrusted PR text reaches the script through the environment, never the run line.
         runs = [l for l in self.lines if l.strip().startswith("run:")]
         self.assertTrue(all("${{" not in l for l in runs), runs)
