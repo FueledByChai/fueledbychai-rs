@@ -202,7 +202,8 @@ pub enum ArmRefusal {
     /// The venue's nonce scope is per account and neither the call nor the registry has the
     /// account lease.
     NoAccountLease(InstrumentId),
-    /// The account lease given is for another venue or account.
+    /// The account lease given, or the one the registry holds for a market armed earlier, is
+    /// for another venue or account than the names the registry has now.
     WrongAccountLease(InstrumentId),
 }
 
@@ -353,6 +354,16 @@ impl Entries {
             if !keys.covers_market(market, &lease) {
                 return Err(ArmRefusal::WrongMarketLease(market));
             }
+            // The account lease held for a market armed earlier counts only while it is this
+            // account's: names given again since cannot let it stand in for another
+            // (DeepSeek's DS-1 on PR #86).
+            if self
+                .account_lease
+                .as_ref()
+                .is_some_and(|held| !keys.covers_account(held))
+            {
+                return Err(ArmRefusal::WrongAccountLease(market));
+            }
             let account = match leases.account {
                 Some(given) if !keys.covers_account(&given) => {
                     return Err(ArmRefusal::WrongAccountLease(market));
@@ -388,8 +399,9 @@ impl Entries {
 impl Registry {
     /// This registry with the names its arming calls check leases against: without them no
     /// market is armed ([`ArmRefusal::NotNamed`]). Given once, before any market is armed:
-    /// names given later check only the leases of later arming calls, and the leases already
-    /// held stay held.
+    /// names given later check only the leases of later arming calls, the leases already held
+    /// stay held, and while an account lease held under other names is held no market is
+    /// armed ([`ArmRefusal::WrongAccountLease`]).
     pub fn with_lease_keys(mut self, keys: LeaseKeys) -> Registry {
         self.entries.set_keys(keys);
         self

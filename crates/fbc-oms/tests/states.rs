@@ -486,6 +486,37 @@ fn the_account_lease_is_held_while_any_market_is_armed() {
     assert!(account_lease(&reg).is_some(), "no market is armed");
 }
 
+/// DeepSeek's DS-1 on PR #86: names given again after a market is armed must not let the
+/// account lease held under the old names stand in for the new account's.
+#[test]
+fn an_account_lease_held_under_other_names_never_arms_a_market() {
+    let mut reg = seeded();
+    start(&mut reg, INST);
+    // The names change to another account (per-account nonces) while INST is armed.
+    let mut reg = reg.with_lease_keys(lease_keys(NonceScope::PerAccountMonotonic));
+    // OTHER's market lease under the new names, and no account lease: the one the registry
+    // holds is the old account's, so it does not count.
+    let lease = Leases::market(market_lease(&reg, OTHER));
+    let before = seen(reg.entry(OTHER));
+    assert_eq!(
+        reg.start(OTHER, lease),
+        Err(ArmRefusal::WrongAccountLease(OTHER))
+    );
+    assert_eq!(seen(reg.entry(OTHER)), before);
+    // Nor does the new account's lease arm it while the old one is held: one account lease
+    // at a time.
+    let lease = leases(&reg, OTHER);
+    assert_eq!(
+        reg.start(OTHER, lease),
+        Err(ArmRefusal::WrongAccountLease(OTHER))
+    );
+    assert_eq!(seen(reg.entry(OTHER)), before);
+    // Once INST is disarmed the old lease is dropped, and OTHER arms under the new names.
+    reg.disarm(INST);
+    let lease = leases(&reg, OTHER);
+    assert!(reg.start(OTHER, lease).unwrap().armed());
+}
+
 #[test]
 fn only_start_reaches_quoting() {
     let mut reg = seeded();
