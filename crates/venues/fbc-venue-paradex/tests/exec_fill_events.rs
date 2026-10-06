@@ -1,7 +1,8 @@
 //! FBC-uiy (decisions 0004, 0009, 0014, 0022): Paradex's private `FillEvent` (SBE template 21)
 //! decoded into fills through the core's `DecodeScope` only, at schema versions 1 and 2 and with
-//! a longer root block. Each fill carries the venue's fill id and order id, its side, price,
-//! size and liquidity, the fee under the declared sign (`PositiveIsCost`) in the asset the frame
+//! a longer root block. Each fill carries the venue's fill id (keyed with its fill type, so
+//! fills of different types sharing an id stay apart) and order id, its side, price, size and
+//! liquidity, the fee under the declared sign (`PositiveIsCost`) in the asset the frame
 //! names, the venue's realized P&L (a null one `None`) and realized funding, and our client id
 //! as the frame states them; a position transfer's null `seq` is no venue sequence; a
 //! venue-initiated fill (LIQUIDATION, UNWIND_TRANSFER, SETTLE_MARKET, BLOCK_TRADE) is pushed
@@ -227,7 +228,7 @@ fn a_version_1_maker_fill_decodes_with_our_client_id_a_rebate_and_no_realized_pn
         fill,
         FillEvent {
             ident: FillIdent::Venue {
-                fill: fid("8615262148007718001"),
+                fill: fid("FILL:8615262148007718001"),
                 vid: Some(vid("1759500000000000001")),
                 // FillEvent states no remaining size, so no cumulative quantity.
                 cum_after: None,
@@ -258,7 +259,7 @@ fn a_version_2_taker_fill_carries_its_fee_in_the_named_asset_realized_pnl_and_fu
     assert_eq!(meta_got, meta(6002));
     let expected = FillEvent {
         ident: FillIdent::Venue {
-            fill: fid("8615262148007718002"),
+            fill: fid("FILL:8615262148007718002"),
             vid: Some(vid("1759500000000000002")),
             cum_after: None,
         },
@@ -292,7 +293,7 @@ fn a_version_2_taker_fill_carries_its_fee_in_the_named_asset_realized_pnl_and_fu
         longer,
         FillEvent {
             ident: FillIdent::Venue {
-                fill: fid("8615262148007718004"),
+                fill: fid("FILL:8615262148007718004"),
                 vid: Some(vid("1759500000000000002")),
                 cum_after: None,
             },
@@ -343,7 +344,7 @@ fn a_liquidation_is_pushed_with_no_client_id_match() {
         fill,
         FillEvent {
             ident: FillIdent::Venue {
-                fill: fid("8615262148007718005"),
+                fill: fid("LIQUIDATION:8615262148007718005"),
                 vid: Some(vid("1759500000000000009")),
                 cum_after: None,
             },
@@ -387,7 +388,7 @@ fn a_position_transfer_with_a_null_seq_decodes_with_no_venue_sequence() {
         FillEvent {
             // No order id: the fill names no order.
             ident: FillIdent::Venue {
-                fill: fid("8615262148007718006"),
+                fill: fid("UNWIND_TRANSFER:8615262148007718006"),
                 vid: None,
                 cum_after: None,
             },
@@ -483,4 +484,72 @@ fn a_frame_the_decoder_cannot_read_whole_is_refused_with_nothing_pushed() {
     bad[last] = 0xff;
     assert!(malformed(bad));
     assert!(malformed(with_vars(&v2, &taker_vars(Some("NOTANASSET")))));
+}
+
+#[test]
+fn fills_of_different_types_sharing_a_fill_id_have_different_keys() {
+    // Paradex: a fill id is "Unique string ID of fill per FillType" (AsyncAPI
+    // ResponsesFillResult.id), so a FILL and a LIQUIDATION may share one. Keyed by the id alone,
+    // the OMS ledger would take the second for a duplicate of the first and drop it.
+    let liquidation = frame("fill-liquidation-v2.sbe.txt");
+    let names = [
+        (1, "FILL"),
+        (2, "LIQUIDATION"),
+        (3, "UNWIND_TRANSFER"),
+        (4, "SETTLE_MARKET"),
+        (5, "RPI"),
+        (6, "BLOCK_TRADE"),
+    ];
+    let mut keys = Vec::new();
+    for (fill_type, name) in names {
+        let (_, fill) = one_fill(&with_byte(liquidation.clone(), 16, fill_type));
+        // The key spells the fill type before the venue's id.
+        assert_eq!(
+            fill.ident,
+            FillIdent::Venue {
+                fill: fid(&format!("{name}:8615262148007718005")),
+                vid: Some(vid("1759500000000000009")),
+                cum_after: None,
+            },
+            "{name}"
+        );
+        keys.push(fill.key());
+    }
+    for (i, a) in keys.iter().enumerate() {
+        for b in &keys[i + 1..] {
+            assert_ne!(a, b);
+        }
+    }
+    // The same frame decoded twice: the same key, so a re-sent fill is still a duplicate.
+    assert_eq!(
+        one_fill(&liquidation).1.key(),
+        one_fill(&liquidation).1.key()
+    );
+    // The longest fill id the core takes, with the longest prefix, still fits; one byte more
+    // is refused rather than cut.
+    let v1 = frame("fill-maker-v1.sbe.txt");
+    let transfer = with_byte(v1, 16, 3);
+    let oid = "1759500000000000001";
+    let room = fbc_core::MAX_VENUE_ID_LEN - "UNWIND_TRANSFER:".len();
+    let longest = "9".repeat(room);
+    let (_, fill) = one_fill(&with_vars(
+        &transfer,
+        &[&longest, oid, "", "t", "BTC-USD-PERP"],
+    ));
+    assert_eq!(
+        fill.ident,
+        FillIdent::Venue {
+            fill: fid(&format!("UNWIND_TRANSFER:{longest}")),
+            vid: Some(vid(oid)),
+            cum_after: None,
+        }
+    );
+    let too_long = "9".repeat(room + 1);
+    assert!(matches!(
+        refused(&with_vars(
+            &transfer,
+            &[&too_long, oid, "", "t", "BTC-USD-PERP"]
+        )),
+        DecodeError::IdRefused(_)
+    ));
 }
