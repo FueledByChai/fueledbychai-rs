@@ -224,7 +224,7 @@ rather than guess.
     intent timeout escalates, an order on the ladder is queried once by a declared reference,
     resolved by the answer or a resync, Lost after the configured trustworthy snapshots past its
     sent time plus the settle time, tombstone-cancelled by client id after the maximum, and
-    never placed or amended again; resyncs (0052; `src/resync.rs`, `tests/resync.rs`): the
+    never placed or amended again; resyncs (0055; `src/resync.rs`, `tests/resync.rs`): the
     first seeds each market's position once and registers our open orders it shows, the
     position unknown until then, a fill straddling the snapshot counted once, later ones
     compared and reported, never overwriting the inventory; still planned: pre-trade caps and

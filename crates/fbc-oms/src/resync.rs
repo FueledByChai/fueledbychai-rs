@@ -1,4 +1,4 @@
-//! Resync snapshots (decision 0013 rule 1, 0005's I3; the rules are decision 0052's): the
+//! Resync snapshots (decision 0013 rule 1, 0005's I3; the rules are decision 0055's): the
 //! venue's open orders and positions, re-read without breaking I3 (inventory changes only
 //! through deduplicated fills).
 //!
@@ -62,7 +62,7 @@ use crate::registry::Registry;
 ///
 /// Its open orders and positions must be one read of the account, at one instant: the seed
 /// compares an order's shown cumulative fill with the position read beside it (rule 2 in the
-/// module documentation; decision 0052). A venue whose resync reads them in two requests can
+/// module documentation; decision 0055). A venue whose resync reads them in two requests can
 /// have a fill land between the reads, shown in the one and not in the other, and the seed then
 /// count it never or twice. Such a venue does not meet this yet; FBC-k7t7 makes it declared.
 #[derive(Clone, Eq, PartialEq, Debug)]
@@ -150,7 +150,7 @@ pub struct ResyncReport {
     pub untracked: Vec<(ClientOrderId, VenueOrderId)>,
     /// The venue's snapshot source is not trustworthy (it can be stale or incomplete, or the
     /// venue offers none): the resync seeded no market, so their positions stay unknown and
-    /// nothing is built on them (decision 0052).
+    /// nothing is built on them (decision 0055).
     pub untrustworthy: bool,
 }
 
@@ -342,7 +342,7 @@ impl Registry {
         }
     }
 
-    /// Applies a resync's snapshot, delivered under `key` (decision 0052; the module
+    /// Applies a resync's snapshot, delivered under `key` (decision 0055; the module
     /// documentation gives the rules).
     ///
     /// The Unknown ladder's orders apply first ([`Registry::on_resync`], with `cfg` and

@@ -71,7 +71,7 @@ pub enum PermitRefusal {
     OnLadder(ClientOrderId),
     /// The order was registered from a resync's snapshot (an earlier run's): its placement's
     /// time in force and channel are not known, so it is never amended, only cancelled
-    /// (decision 0052).
+    /// (decision 0055).
     FromSnapshot(ClientOrderId),
 }
 
