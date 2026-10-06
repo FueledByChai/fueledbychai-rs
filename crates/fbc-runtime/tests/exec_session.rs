@@ -14,6 +14,7 @@ use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
 use std::num::NonZeroU32;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, ThreadId};
 use std::time::Duration;
@@ -812,18 +813,8 @@ async fn on_open_frames_the_buckets_refuse_for_now_end_the_epoch_and_go_once_the
     let mut server = ScriptedWs::start().await;
     let pacing = ReconnectPacing::new(ms(300), ms(300), 100, Duration::from_secs(60), ms(5_000));
     let (config, _) = setup(ExecToy::leak(), &server.url(), pacing.unwrap());
-    // The account's whole budget of 50 a second, taken by another session sharing the limiter.
     let shared = config.limiter.clone();
-    let taken = Request {
-        charge: RateCharge {
-            weight: NonZeroU32::new(50).unwrap(),
-            ..RateCharge::one(OpKind::Control, None)
-        },
-        via: Via::Frame,
-        class: TrafficClass::Safety,
-    };
-    let other = ConnKey { conn: 99, epoch: 0 };
-    shared.charge(Instant::now(), other, &[taken]).unwrap();
+    spend_the_accounts_budget(&shared);
     let (mut session, control) = ExecSession::new(config, |_| {}).unwrap();
     let script = async move {
         // Each epoch opened while the budget is spent sends nothing and is dropped, to try
@@ -847,6 +838,56 @@ async fn on_open_frames_the_buckets_refuse_for_now_end_the_epoch_and_go_once_the
     run.unwrap();
     assert!(empty >= 1);
     assert!(shared.counts().refused.account >= 1);
+}
+
+/// Takes the account's whole budget of 50 a second, as another session sharing `limiter` would;
+/// when it was taken.
+fn spend_the_accounts_budget(limiter: &RateLimiter) -> Instant {
+    let taken = Request {
+        charge: RateCharge {
+            weight: NonZeroU32::new(50).unwrap(),
+            ..RateCharge::one(OpKind::Control, None)
+        },
+        via: Via::Frame,
+        class: TrafficClass::Safety,
+    };
+    let other = ConnKey { conn: 99, epoch: 0 };
+    let at = Instant::now();
+    limiter.charge(at, other, &[taken]).unwrap();
+    at
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_next_attempt_after_on_open_frames_the_buckets_refuse_waits_until_they_fit() {
+    let mut server = ScriptedWs::start().await;
+    // A 10 ms floor, so only the buckets can hold the next attempt back for the second their
+    // budget takes to come back. No attempt deadline: on paused time a pending one would let
+    // the clock jump ahead while an attempt's socket I/O is still under way.
+    let pacing = ReconnectPacing::new(ms(10), ms(100), 100, Duration::from_secs(60), Duration::MAX);
+    let (config, _) = setup(ExecToy::leak(), &server.url(), pacing.unwrap());
+    let shared = config.limiter.clone();
+    let taken_at = spend_the_accounts_budget(&shared);
+    let (mut session, control) = ExecSession::new(config, |_| {}).unwrap();
+    let script = async move {
+        // The first epoch sends nothing and is dropped; the next connects only once the
+        // account's budget has room for what on_open sends (Reviewer B, B1), not every floor.
+        let mut first = server.accept().await;
+        assert_eq!(first.next().await, None);
+        let mut second = server.accept().await;
+        let (at, opened) = second.next_at().await.unwrap();
+        assert!(opened.starts_with("auth|ts="), "{opened}");
+        drop(control);
+        at
+    };
+    let (run, at) = tokio::join!(session.run(), script);
+    run.unwrap();
+    assert!(
+        at >= taken_at + Duration::from_secs(1),
+        "{:?}",
+        at - taken_at
+    );
+    assert_eq!(session.counters().attempts, 2);
+    assert_eq!(shared.counts().refused.account, 1);
 }
 
 #[tokio::test]
@@ -940,6 +981,48 @@ async fn a_handler_that_panics_as_it_is_told_an_epoch_ended_is_never_told_twice(
     // Dropping the session after the panic tells it nothing again (Codex r4189618551).
     drop(session);
     assert_eq!(ends.get(), 1);
+}
+
+/// A handler whose every call panics, counting its calls; one that holds a poisoned lock, say.
+struct AlwaysPanics(Arc<AtomicU32>);
+
+impl ExecHandler for AlwaysPanics {
+    fn on_exec(&mut self, _: Envelope<ExecEvent>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        panic!("the handler failed");
+    }
+
+    fn on_epoch_end(&mut self, _: ConnKey) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        panic!("the handler failed again");
+    }
+}
+
+#[tokio::test]
+async fn a_session_dropped_as_its_handlers_panic_unwinds_calls_the_handler_no_more() {
+    let mut server = ScriptedWs::start().await;
+    let url = server.url();
+    let calls = Arc::new(AtomicU32::new(0));
+    let seen = Arc::clone(&calls);
+    let venue = ExecToy::leak();
+    // The session lives in this thread's frame, so on_exec's panic drops it while unwinding:
+    // telling the handler then would panic again and abort the process (Reviewer B, B2).
+    let driver = thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (config, _) = setup(venue, &url, quick());
+        let (mut session, _control) = ExecSession::new(config, AlwaysPanics(seen)).unwrap();
+        rt.block_on(session.run())
+    });
+    let mut peer = server.accept().await;
+    let _ = (peer.recv().await, peer.recv().await);
+    peer.send(AUTH_ACK);
+    let joined = tokio::task::spawn_blocking(move || driver.join());
+    assert!(joined.await.unwrap().is_err());
+    // on_exec alone: the epoch's end is not told during the unwind.
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
