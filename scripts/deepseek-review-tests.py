@@ -429,6 +429,26 @@ class ReviewTest(unittest.TestCase):
                       "the token budget", body)
         self.assertNotIn("=== FILE crates/huge", "".join(users))
 
+    def test_a_finding_repeated_across_parts_keeps_its_highest_severity(self):
+        """DeepSeek DS-2 on b0de47a: the same finding from two parts with different severities
+        is merged into one at the most severe, whichever part comes first."""
+        head = self.big_change()
+
+        def answer(path, body):
+            user = body["messages"][1]["content"]
+            part = int(re.search(r"This is part (\d+) of", user).group(1))
+            severity = {1: "P3", 2: "P1"}.get(part, "P2")
+            return completion(findings_json(finding("F1", severity, "Cargo.toml", 4,
+                                                    "the same  problem", "fix %d" % part)))
+        self.chat.answer = answer
+        self.run_review(head, DEEPSEEK_TOKEN_BUDGET="5000")
+        self.assertEqual(self.rc, 0, self.out + self.err)
+        self.assertGreaterEqual(len(self.chat.requests), 3)
+        body = self.one_comment()
+        self.assertIn("findings=1 -->", body)
+        self.assertIn("(P1: 1, P2: 0, P3: 0)", body)
+        self.assertIn("- **DS-1** P1 `Cargo.toml:4`: the same problem\n  - Fix: fix 2", body)
+
     def test_a_file_whose_text_does_not_fit_is_reviewed_from_its_diff(self):
         self.write("crates/long/src/lib.rs", "".join("// old line %d\n" % i for i in range(1000)))
         self.base = self.commit("long base")

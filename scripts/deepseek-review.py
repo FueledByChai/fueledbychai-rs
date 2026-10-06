@@ -430,14 +430,17 @@ def parse_findings(content, finish_reason=None):
 
 
 def merge_findings(lists):
-    """One list from every chunk's findings: duplicates dropped, most severe first, ids DS-n."""
-    seen, merged = set(), []
+    """One list from every chunk's findings: duplicates dropped, each kept at the most severe
+    copy any part reported (whichever part came first), most severe first, ids DS-n."""
+    seen, merged = {}, []
     for findings in lists:
         for f in findings:
             key = (f["file"], f["line"], " ".join(f["problem"].split()))
             if key not in seen:
-                seen.add(key)
+                seen[key] = len(merged)
                 merged.append(f)
+            elif SEVERITIES.index(f["severity"]) < SEVERITIES.index(merged[seen[key]]["severity"]):
+                merged[seen[key]] = f
     merged.sort(key=lambda f: (SEVERITIES.index(f["severity"]), f["file"], f["line"] or 0))
     for n, f in enumerate(merged, 1):
         f["id"] = "DS-%d" % n
