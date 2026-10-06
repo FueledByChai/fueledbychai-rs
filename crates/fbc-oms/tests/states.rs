@@ -23,7 +23,7 @@ mod common;
 
 use std::time::Duration;
 
-use arm::{account_lease, lease_keys, leases, market_lease, named, start, wire};
+use arm::{account_lease, lease_keys, leases, market_lease, named, scoped, start, wire};
 use common::{cid, lease_dir, lots, order_caps, placement, symbol, vid};
 use fbc_core::{
     AckLevel, AmendAck, AmendCaps, AmendQty, CancelBatch, ClientOrderId, InstrumentId, ItemRef,
@@ -522,7 +522,7 @@ fn an_account_lease_held_under_other_names_never_arms_a_market() {
 /// `keys`'s venue, account and market names, with the nonce scope `scope`.
 fn rescoped(keys: &LeaseKeys, scope: NonceScope) -> LeaseKeys {
     (1..=4).map(InstrumentId::new).fold(
-        LeaseKeys::new(keys.venue(), keys.account(), scope),
+        LeaseKeys::new(keys.venue(), keys.account(), &scoped(scope)),
         |k, m| k.with_market(m, keys.symbol(m).unwrap().clone()),
     )
 }
@@ -614,7 +614,7 @@ fn a_nonce_scope_given_again_as_per_account_stops_a_market_armed_without_the_acc
 fn names_given_again_without_an_armed_market_stop_it_building() {
     let (reg, bid, ask) = quoting();
     let keys = reg.lease_keys().unwrap().clone();
-    let unnamed = LeaseKeys::new(keys.venue(), keys.account(), keys.nonce_scope());
+    let unnamed = LeaseKeys::new(keys.venue(), keys.account(), &scoped(keys.nonce_scope()));
     let mut reg = reg.with_lease_keys(unnamed);
     builds_nothing(&mut reg, (bid, ask), StateRefusal::Unleased(INST));
     assert_eq!(
@@ -624,6 +624,27 @@ fn names_given_again_without_an_armed_market_stop_it_building() {
     // The names given back, it builds again.
     let mut reg = reg.with_lease_keys(keys);
     assert!(reg.place(placement(cid(), 100, 1)).is_ok());
+}
+
+/// DeepSeek's DS-4 on PR #86: the nonce scope arming checks is the venue's own, taken from the
+/// order caps every cancel, amend and resync is judged against, never a value given on its
+/// own; where those caps say per account, the market lease alone does not arm.
+#[test]
+fn lease_names_take_the_nonce_scope_from_the_venues_order_caps() {
+    let venue = order_caps();
+    assert_eq!(venue.nonce_scope, NonceScope::PerAccountMonotonic);
+    let account = lease_keys(NonceScope::None).account().to_owned();
+    let keys = LeaseKeys::new(arm::VENUE, &account, &venue).with_market(INST, symbol(&wire(INST)));
+    assert_eq!(keys.nonce_scope(), venue.nonce_scope);
+    let mut reg = Registry::with_caps(caps()).with_lease_keys(keys);
+    reg.seed_position(INST, SignedLots(0)).unwrap();
+    let lease = Leases::market(market_lease(&reg, INST));
+    assert_eq!(
+        reg.start(INST, lease),
+        Err(ArmRefusal::NoAccountLease(INST))
+    );
+    let both = leases(&reg, INST);
+    assert!(reg.start(INST, both).unwrap().armed());
 }
 
 #[test]
@@ -816,7 +837,7 @@ fn arming_is_refused_for_a_market_the_lease_names_do_not_cover() {
         );
         assert!(reg.lease_keys().is_none());
         // Names that leave the market out.
-        let keys = LeaseKeys::new("synthetic", "acct-unnamed", NonceScope::PerSigner);
+        let keys = LeaseKeys::new("synthetic", "acct-unnamed", &scoped(NonceScope::PerSigner));
         let mut reg = Registry::with_caps(caps()).with_lease_keys(keys);
         reg.seed_position(INST, SignedLots(0)).unwrap();
         refused(
@@ -982,7 +1003,8 @@ fn every_refusal_says_what_refused_it() {
     }
     let unique: std::collections::HashSet<&String> = texts.iter().collect();
     assert_eq!(unique.len(), texts.len(), "{texts:?}");
-    let keys = LeaseKeys::new("v", "a", NonceScope::PerSigner).with_market(INST, symbol("S"));
+    let keys =
+        LeaseKeys::new("v", "a", &scoped(NonceScope::PerSigner)).with_market(INST, symbol("S"));
     assert_eq!(
         (keys.venue(), keys.account(), keys.nonce_scope()),
         ("v", "a", NonceScope::PerSigner)

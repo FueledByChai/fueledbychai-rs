@@ -6,10 +6,10 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use fbc_core::{AccountLease, InstrumentId, MarketLease, NamedLeaseError, NonceScope};
+use fbc_core::{AccountLease, InstrumentId, MarketLease, NamedLeaseError, NonceScope, OrderCaps};
 use fbc_oms::{LeaseKeys, Leases, MarketEntry, Registry};
 
-use crate::common::{lease_dir, symbol};
+use crate::common::{lease_dir, order_caps, symbol};
 
 /// The synthetic venue's name.
 pub const VENUE: &str = "synthetic";
@@ -19,16 +19,23 @@ pub fn wire(market: InstrumentId) -> String {
     format!("SYN-{}-PERP", market.get())
 }
 
+/// The test venue's order caps with the nonce scope `scope`.
+pub fn scoped(scope: NonceScope) -> OrderCaps {
+    OrderCaps {
+        nonce_scope: scope,
+        ..order_caps()
+    }
+}
+
 /// Lease names for an account no other registry of this test binary uses, whose nonce scope is
 /// `scope`, naming the test markets 1 to 4.
 pub fn lease_keys(scope: NonceScope) -> LeaseKeys {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let account = format!("acct-{}", NEXT.fetch_add(1, Ordering::Relaxed));
-    (1..=4)
-        .map(InstrumentId::new)
-        .fold(LeaseKeys::new(VENUE, &account, scope), |keys, m| {
-            keys.with_market(m, symbol(&wire(m)))
-        })
+    (1..=4).map(InstrumentId::new).fold(
+        LeaseKeys::new(VENUE, &account, &scoped(scope)),
+        |keys, m| keys.with_market(m, symbol(&wire(m))),
+    )
 }
 
 /// `reg` under lease names of its own, with per-account nonces (the strictest case).
