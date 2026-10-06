@@ -449,7 +449,9 @@ impl Registry {
     /// Registers our open orders the snapshot shows on a market not seeded yet that the
     /// registry does not hold (an earlier run's), whether this resync seeds the market or not,
     /// so a cancel of every order the registry holds reaches them (Reviewer B's P2 on PR #80).
-    /// One whose venue id names another order of ours is not registered.
+    /// Each counts as sent at the resync's request, so the Unknown ladder's settle and absence
+    /// rules apply to it (Reviewer B's RB80-9). One whose venue id names another order of ours
+    /// is not registered.
     fn register_shown(&mut self, snap: &ResyncSnapshot, key: OrderKey, report: &mut ResyncReport) {
         for o in &snap.orders {
             if let Some(CidMatch::Ours(cid)) = o.cid
@@ -461,7 +463,10 @@ impl Registry {
                     None | Some(MarketState::Unseeded(_))
                 )
             {
-                self.orders.insert(cid, OrderRecord::seeded_from(cid, o));
+                self.orders.insert(
+                    cid,
+                    OrderRecord::seeded_from(cid, o, snap.requested_at, snap.watermark),
+                );
                 let u = update_of(o);
                 self.with_record(cid, |rec| rec.apply_update(&u, key));
                 report.registered.push(cid);
