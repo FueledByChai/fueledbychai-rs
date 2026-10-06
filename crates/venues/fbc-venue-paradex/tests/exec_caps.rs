@@ -318,3 +318,54 @@ fn the_record_cites_a_paradex_page_for_every_order_method_and_lists_each_undocum
     }
     assert!(undocumented.contains("FBC-8xr"));
 }
+
+/// The section of the undocumented-values list that declares `field`, up to the next item.
+fn undocumented_item<'a>(text: &'a str, field: &str) -> &'a str {
+    let list = text
+        .split("### Values no Paradex document states")
+        .nth(1)
+        .expect("the record lists the undocumented values");
+    let start = list
+        .find(&format!("- `{field}`"))
+        .unwrap_or_else(|| panic!("{field} has no item of its own"));
+    let item = &list[start + 1..];
+    let end = item.find("\n- ").unwrap_or(item.len());
+    &item[..end]
+}
+
+#[test]
+fn the_record_states_the_owners_choice_for_the_snapshot_and_that_it_governs_lost_and_the_seed() {
+    assert_eq!(
+        exec::exec_caps().order.snapshot_source,
+        SnapshotSource::Untrustworthy
+    );
+    let text = record();
+    let item = undocumented_item(&text, "snapshot_source");
+    // One field decides both an order's Lost on absence and a resync's seed.
+    assert!(item.contains("Lost"), "{item}");
+    assert!(item.contains("seeds"), "{item}");
+    // The owner's choice, and the evidence that would flip it before any live session.
+    assert!(item.contains("option C"), "{item}");
+    assert!(item.contains("`GET /orders`"), "{item}");
+    assert!(item.contains("`GET /positions`"), "{item}");
+    assert!(item.contains("before any live Paradex session"), "{item}");
+    assert!(item.contains("FBC-xzp"), "{item}");
+}
+
+#[test]
+fn the_record_does_not_call_the_amend_size_the_do_less_value_and_bounds_its_failure() {
+    assert_eq!(
+        exec::exec_caps().order.amend.map(|a| a.qty_semantics),
+        Some(AmendQty::TotalIncludingFilled)
+    );
+    let text = record();
+    let item = undocumented_item(&text, "qty_semantics");
+    assert!(
+        item.contains("not the one under which the OMS does less"),
+        "{item}"
+    );
+    assert!(item.contains("`AmendQty::Remaining`"), "{item}");
+    assert!(item.contains("one in-flight fill"), "{item}");
+    assert!(item.contains("before any\n  live Paradex amend"), "{item}");
+    assert!(!text.contains("no amend depends on it"));
+}

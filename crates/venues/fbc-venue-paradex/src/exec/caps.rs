@@ -110,7 +110,8 @@ pub fn exec_caps() -> ExecCaps {
                 // method's reply (decision 0054).
                 ack: AmendAck::ReplacedEvent,
                 // `order-modify`: size is the "New (or unchanged) size", the order's size, of
-                // which OrderEvent `sizeOpen` is the remaining part.
+                // which OrderEvent `sizeOpen` is the remaining part. Not the do-less value
+                // (`Remaining` is); decision 0054 bounds the risk and FBC-8xr confirms it.
                 qty_semantics: AmendQty::TotalIncludingFilled,
                 // Measured in calibration, never assumed (design §4.5).
                 keeps_priority: None,
@@ -164,8 +165,10 @@ pub fn exec_caps() -> ExecCaps {
             // (non-sequential) ... changes on every order update").
             ordering_key: OrderingKey::VenueSeq,
             // Undocumented whether the open-orders snapshot is consistent with the order
-            // stream: declared untrustworthy (decision 0054), so an absence from it never
-            // ends an order.
+            // stream: declared untrustworthy (decision 0054, the owner's choice), so an
+            // absence from it never ends an order and a resync from it never seeds a
+            // position. A new record flips it, on FBC-8xr's testnet evidence, before any
+            // live Paradex session.
             snapshot_source: SnapshotSource::Untrustworthy,
             // The schema's OrderEvent carries `timeInForce` (POST_ONLY, RPI) and `flags`
             // (REDUCE_ONLY).
