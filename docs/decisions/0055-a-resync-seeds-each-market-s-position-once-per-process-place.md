@@ -1,4 +1,4 @@
-# 0052 — A resync seeds each market's position once per process, places a fill straddling the snapshot by its arrival, order and time, and later resyncs only compare, augmenting 0005 and 0013
+# 0055 — A resync seeds each market's position once per process, places a fill straddling the snapshot by its arrival, order and time, and later resyncs only compare, augmenting 0005 and 0013
 
 Status: accepted
 Date: 2026-10-05

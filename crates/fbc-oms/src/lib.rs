@@ -94,7 +94,7 @@
 //! reduces the position by its formula; the resting cap bounds it like any other. Cancels are
 //! never capped (`tests/caps.rs`).
 //!
-//! Resyncs (decision 0052, `tests/resync.rs`): the consumer hands each resync's answer to
+//! Resyncs (decision 0055, `tests/resync.rs`): the consumer hands each resync's answer to
 //! [`Registry::resync`] as a [`ResyncSnapshot`]. The first one from a trustworthy snapshot
 //! source seeds each market's position, once per process; every one registers our open orders
 //! it shows on a market not yet seeded that the registry does not hold (an earlier run's, never

@@ -1,4 +1,4 @@
-//! Resync snapshots (decision 0052): the first resync of a process seeds each market's position
+//! Resync snapshots (decision 0055): the first resync of a process seeds each market's position
 //! and registers our open orders it shows, the position is unknown until then, a later resync
 //! compares and never overwrites the inventory, and a fill straddling the snapshot (executed
 //! after the request, reported before or after the answer) is counted exactly once.
@@ -21,8 +21,10 @@ use fbc_oms::{
 
 const INST: InstrumentId = InstrumentId::new(1);
 const OTHER: InstrumentId = InstrumentId::new(2);
-/// The owner's first test values, in lots of $1: a $50 inventory cap.
+/// The owner's first test values, in lots of $1: a $50 inventory cap and one $11 L0 order
+/// resting per side.
 const CAP: i64 = 50;
+const L0: i64 = 11;
 /// A resting cap past any order of the tests that judge the inventory cap alone.
 const WIDE: i64 = 1_000_000;
 /// The resync's request: on the wall clock (its watermark) and the monotonic clock.
@@ -31,13 +33,18 @@ const REQ: u64 = 1_000;
 
 /// A registry under the inventory cap `CAP` and a resting cap no test's orders reach.
 fn registry() -> Registry {
+    registry_resting(WIDE)
+}
+
+/// A registry under the inventory cap `CAP` and the resting cap `resting`, not seeded.
+fn registry_resting(resting: i64) -> Registry {
     Registry::with_caps(
         PreTradeCaps::new()
             .with_market(
                 INST,
                 MarketCapsConfig {
                     inventory: Some(lots(CAP)),
-                    resting: Some(lots(WIDE)),
+                    resting: Some(lots(resting)),
                 },
             )
             .unwrap(),
@@ -227,6 +234,35 @@ fn the_first_resync_seeds_the_positions_and_registers_our_open_orders() {
             },
         ]
     );
+}
+
+#[test]
+fn an_order_a_resync_registers_counts_against_the_resting_cap() {
+    let mut reg = registry_resting(L0);
+    let earlier = cid();
+    let report = resync(
+        &mut reg,
+        &snapshot(vec![shown(earlier, "e", L0, 0)], &[(INST, 0)]),
+    );
+    assert_eq!(report.registered, vec![earlier]);
+    assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(L0)));
+    // An earlier run's bid fills the side's one L0 order: one more lot is refused at 12.
+    assert_eq!(
+        reg.place(placement(cid(), 100, 1)),
+        Err(OmsError::Capped(CapRefusal::RestingCap {
+            inst: INST,
+            side: Side::Buy,
+            resting: Some(lots(L0 + 1)),
+            cap: lots(L0),
+        }))
+    );
+    // The other side is its own: an L0 offer is admitted.
+    let mut offer = placement(cid(), 101, L0);
+    offer.side = Side::Sell;
+    reg.place(offer).unwrap();
+    // Ended, it rests nothing: an L0 bid is admitted.
+    reg.apply_update(&update(Some(earlier), common::canceled(), 0), key(2));
+    reg.place(placement(cid(), 100, L0)).unwrap();
 }
 
 #[test]

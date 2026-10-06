@@ -55,12 +55,12 @@ pub enum FillRouted {
     OursUntracked(ClientOrderId),
     /// Kept by the ledger and, when the registry holds its order `cid`, counted on it, but not
     /// on the inventory: the position the market's resync seeded already holds it (decision
-    /// 0052). The order's record has applied the fill: what it did with it (a completion, say)
+    /// 0055). The order's record has applied the fill: what it did with it (a completion, say)
     /// is read from the record ([`Registry::get`]).
     InSnapshot(ClientOrderId),
     /// Counted, but it falls between the request and the answer of the resync that seeded its
     /// market and nothing shows on which side: the market's position is unknown from now on
-    /// ([`Registry::position`]; decision 0052). As for `InSnapshot`, a held order's record has
+    /// ([`Registry::position`]; decision 0055). As for `InSnapshot`, a held order's record has
     /// applied the fill.
     Unsettled(ClientOrderId),
     /// Flagged, not counted: it routes to our order `cid` but names another instrument or the
