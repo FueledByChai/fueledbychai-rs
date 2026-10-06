@@ -126,7 +126,8 @@ rather than guess.
   client id; the fill ledger, the two fill counters and the inventory; 0005, property-tested
   with proptest, 0037; the gateway traits and the authorization order entry needs, 0045),
   `crates/venues/fbc-venue-paradex` with its signer (`src/sign`), SBE market data (`src/md`: bbo,
-  trades and the order book) and its factory (`src/factory.rs`, market data only),
+  trades and the order book), its order-entry capabilities (`src/exec`, 0054) and its factory
+  (`src/factory.rs`, market data only),
   and `crates/venues/fbc-venue-binance-usdm` with its market-data-only factory and codec; the
   rest are planned. Members are the `crates/fbc-*` and
   `crates/venues/fbc-*` globs, and `fixtures/` is excluded from the workspace:
@@ -295,7 +296,8 @@ rather than guess.
     frame's block lengths, bbo and trades decoded into touches and trades, the order book
     deltas into book events with seq_no continuity (0022), held to the hand-built frames and one
     captured public frame in `fixtures/paradex/md/`; the REST `/orderbook` snapshot at depth 15
-    (`src/md/rest.rs`); and, in `tests/oracle/` with `fbc-book` as a dev-dependency only, the
+    (`src/md/rest.rs`); order entry's `ExecCaps` with each value cited and the undocumented ones
+    declared conservatively (`src/exec/`, 0054); and, in `tests/oracle/` with `fbc-book` as a dev-dependency only, the
     BT-401 book and bbo-touch agreement checks), later `crates/venues/fbc-venue-hibachi`
     (0016).
   - Dependency direction (design §3): `fbc-core`, `fbc-book`, `fbc-oms`, `fbc-journal` and

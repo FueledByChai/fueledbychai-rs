@@ -1,9 +1,11 @@
 //! The Paradex venue factory: capabilities, configuration schema and market-data plan
 //! (decisions 0003, 0015, 0016).
 //!
-//! Paradex is market data only here until order entry lands (BT-402): `exec` is `None`, and
-//! there is no order-entry codec or endpoint. Each capability cites the document it comes
-//! from: docs.paradex.trade, or the SBE schema `paradex_1_0.xml` in tradeparadex/paradex-py at
+//! Paradex is market data only here until order entry lands (BT-402): [`caps`] declares
+//! `exec: None`, and there is no order-entry codec or endpoint. [`caps_with_order_entry`] is
+//! what the factory declares once they exist (FBC-xzp): the same market data with
+//! [`exec::exec_caps`] and the order rate limits (decision 0054). Each capability cites the
+//! document it comes from: docs.paradex.trade, or the SBE schema `paradex_1_0.xml` in tradeparadex/paradex-py at
 //! commit `b8248fb747e278d2167ac2f056b339a287d5ef30` ("the schema" below).
 
 use core::time::Duration;
@@ -12,14 +14,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use fbc_core::{AccountSummary, Secrets};
 use fbc_core::{
     AssetKey, BookCaps, Cadence, Channel, ConfigError, ConfigScope, ConnTopology, Continuity,
-    Encoding, EndpointPlan, ExchTsKind, ExecCodec, ExecEndpoint, Feed, FeedSource, FieldSpec,
-    FieldUnit, FundingCaps, HttpPlan, InstrumentSpecDraft, LimitScope, MatchingCaps, MdCaps,
-    MdCodec, MdTransport, OpKind, QueueModelQuality, RateLimit, Readiness, SeqDomain, SpecTable,
-    StpScope, StreamId, Subscription, SymbolError, TagSet, TouchSourceCaps, TradeCaps, VenueCaps,
-    VenueConfig, VenueError, VenueFactory, WireUrl,
+    Encoding, EndpointPlan, ExchTsKind, ExecCaps, ExecCodec, ExecEndpoint, Feed, FeedSource,
+    FieldSpec, FieldUnit, FundingCaps, HttpPlan, InstrumentSpecDraft, LimitScope, MatchingCaps,
+    MdCaps, MdCodec, MdTransport, OpKind, QueueModelQuality, RateLimit, Readiness, SeqDomain,
+    SpecTable, StpScope, StreamId, Subscription, SymbolError, TagSet, TouchSourceCaps, TradeCaps,
+    VenueCaps, VenueConfig, VenueError, VenueFactory, WireUrl,
 };
 
 use crate::auth;
+use crate::exec;
 use crate::md::book::BOOK_CHANNELS;
 use crate::md::{self, ParadexMd, sbe};
 
@@ -197,8 +200,22 @@ fn book(channel: &'static str, includes: &[Channel]) -> BookCaps {
     }
 }
 
-/// What Paradex market data offers through this adapter, each value cited.
+/// What Paradex market data offers through this adapter, each value cited: what
+/// [`ParadexFactory`] declares until order entry is wired (FBC-xzp).
 pub fn caps() -> VenueCaps {
+    venue_caps(None)
+}
+
+/// What Paradex offers with order entry: [`caps`]'s market data and matching, with
+/// [`exec::exec_caps`], the per-account order limits ([`exec::order_limits`]), and the per-IP
+/// limit counting the order methods too (decision 0054). Not yet what [`ParadexFactory`]
+/// declares: FBC-xzp wires it with the order-entry codec.
+pub fn caps_with_order_entry() -> VenueCaps {
+    venue_caps(Some(exec::exec_caps()))
+}
+
+/// Paradex's caps with `exec` as given; the order limits come with order entry.
+fn venue_caps(exec: Option<ExecCaps>) -> VenueCaps {
     let per = |secs, units| RateLimit {
         scope: LimitScope::Ip,
         ops: TagSet::of(&[OpKind::Connect]),
@@ -211,9 +228,35 @@ pub fn caps() -> VenueCaps {
         per: Duration::from_secs(secs),
         units,
     };
+    // Decision 0054: whether Paradex's per-IP limit counts the WebSocket order methods is
+    // undocumented; with order entry they are counted, in the one bucket REST and queries share.
+    let mut ip_ops = vec![OpKind::Rest, OpKind::Query];
+    let mut order_limits = Vec::new();
+    if exec.is_some() {
+        ip_ops.extend(exec::ORDER_OPS);
+        order_limits.extend(exec::order_limits());
+    }
+    let mut limits = vec![
+        // "Websocket Rate Limits": "a maximum of 20 connections per second or 600 connections
+        // per minute per IP address". No limit on subscribe frames is documented.
+        per(1, 20),
+        per(60, 600),
+        // "API Rate Limits": "POST /auth | 600 req/m | IP address". The login (auth.rs)
+        // is this adapter's only `Rest` request.
+        limit(LimitScope::Ip, &[OpKind::Rest], 60, 600),
+        // "GET /* | 120 req/s OR 600 req/m | Account": the account read (auth.rs) and
+        // every later private GET charge `Query`. Both windows are declared.
+        limit(LimitScope::Account, &[OpKind::Query], 1, 120),
+        limit(LimitScope::Account, &[OpKind::Query], 60, 600),
+        // Public requests default to 1500 req/m per IP, and private ones are "also
+        // subject to an additional IP-based rate limit of 1500 req/m across all accounts
+        // from the same IP address".
+        limit(LimitScope::Ip, &ip_ops, 60, 1500),
+    ];
+    limits.extend(order_limits);
     VenueCaps {
         // Order entry is BT-402's (decision 0015: no order or fill claims until then).
-        exec: None,
+        exec,
         matching: MatchingCaps {
             // docs.paradex.trade describes no speed bump.
             speed_bump: None,
@@ -286,23 +329,7 @@ pub fn caps() -> VenueCaps {
             // The introduction states none: the server's 55-second ping keeps it open.
             max_conn_lifetime: None,
         },
-        // "Websocket Rate Limits": "a maximum of 20 connections per second or 600 connections
-        // per minute per IP address". No limit on subscribe frames is documented.
-        limits: vec![
-            per(1, 20),
-            per(60, 600),
-            // "API Rate Limits": "POST /auth | 600 req/m | IP address". The login (auth.rs)
-            // is this adapter's only `Rest` request.
-            limit(LimitScope::Ip, &[OpKind::Rest], 60, 600),
-            // "GET /* | 120 req/s OR 600 req/m | Account": the account read (auth.rs) and
-            // every later private GET charge `Query`. Both windows are declared.
-            limit(LimitScope::Account, &[OpKind::Query], 1, 120),
-            limit(LimitScope::Account, &[OpKind::Query], 60, 600),
-            // Public requests default to 1500 req/m per IP, and private ones are "also
-            // subject to an additional IP-based rate limit of 1500 req/m across all accounts
-            // from the same IP address".
-            limit(LimitScope::Ip, &[OpKind::Rest, OpKind::Query], 60, 1500),
-        ],
+        limits,
         readiness_ceiling: Readiness::Record,
     }
 }

@@ -5,9 +5,11 @@
 //! (decision 0022), behind the [`ParadexFactory`] with market-data capabilities only; and its
 //! authentication ([`auth`], a review path, 0009): the login signed from the consumer's
 //! credentials, the session token it gives, its refresh, and Test Connection (decision 0048).
-//! Order entry comes in a later ticket (BT-402).
+//! Order entry ([`exec`], BT-402) declares its capabilities and the SBE schema version its
+//! socket negotiates (decision 0054); its codec and the factory's wiring come in later tickets.
 
 pub mod auth;
+pub mod exec;
 pub mod factory;
 pub mod md;
 pub mod sign;
