@@ -451,7 +451,19 @@ def answer_content(body):
 
 
 def parse_findings(content, finish_reason=None):
-    """Validated findings from the model's answer; Incomplete when it is not the asked JSON."""
+    """Validated findings from the model's answer; Incomplete when it is not the asked JSON, and
+    CutOff when it was also cut off at max_tokens: an answer that stopped at the allowance is
+    not the model's whole answer, whether or not what came back happens to parse (DeepSeek DS-1
+    on 284f437)."""
+    try:
+        return checked_findings(content)
+    except Incomplete as e:
+        if finish_reason == "length":
+            raise CutOff(str(e) + CUT_NOTE)
+        raise
+
+
+def checked_findings(content):
     text = content.strip()
     fence = re.match(r"^```(?:json)?\s*\n(.*)\n```$", text, re.S)
     if fence:
@@ -459,8 +471,6 @@ def parse_findings(content, finish_reason=None):
     try:
         answer = json.loads(text)
     except ValueError:
-        if finish_reason == "length":
-            raise CutOff("the model's answer is not valid JSON" + CUT_NOTE)
         raise Incomplete("the model's answer is not valid JSON")
     if not isinstance(answer, dict) or not isinstance(answer.get("findings"), list):
         raise Incomplete("the model's answer is not an object with a findings list")
@@ -525,7 +535,7 @@ def review(cfg):
         raise Incomplete("the git work before the first request did not finish within %g s"
                          % cfg["setup_timeout"])
     report = {"chunks": 0, "diff_only": [], "not_reviewed": {}, "files": len(units),
-              "cut_off": [], "diff_only_after_cut": []}
+              "cut_off": [], "diff_only_after_cut": [], "requests": 0}
     if not units:
         return [], report
     nonce = secrets.token_hex(8)
@@ -582,6 +592,7 @@ def review_piece(ctx, items, piece, depth, results):
                 {"role": "user", "content": user_prompt(
                     cfg["title"], cfg["body"], ctx["part"] + " of the change" + of_piece, payload,
                     ctx["nonce"])}]
+    ctx["report"]["requests"] += 1
     try:
         content, finish = answer_content(call_model(cfg, messages, cfg["redact"]))
         results.append(parse_findings(content, finish))
@@ -636,11 +647,13 @@ def complete_comment(cfg, findings, report):
                 head, len(findings))
         return "<!-- deepseek-review head=%s status=truncated findings=%d shown=%d -->" % (
             head, len(findings), shown)
+    # Requests sent: one per part, and one per piece of a part whose answer was cut off.
+    requests = report.get("requests", report["chunks"])
     # The longest marker holds its place until it is known whether everything fits.
     lines = [HEADING, "", marker(len(findings), True),
              "Reviewed head `%s` against base `%s` with model `%s` (%d request%s, %d file%s)." % (
-                 head, cfg["base"], safe(cfg["model"], 100), report["chunks"],
-                 "" if report["chunks"] == 1 else "s", report["files"],
+                 head, cfg["base"], safe(cfg["model"], 100), requests,
+                 "" if requests == 1 else "s", report["files"],
                  "" if report["files"] == 1 else "s"), ""]
     if not findings:
         lines.append("No findings." if report["files"] else "No findings: the change is empty.")
@@ -744,8 +757,8 @@ def findings_log_line(head, findings, redact):
 def report_log_line(head, report, redact):
     """What was reviewed and what was not, whole, as one ASCII JSON line for the job log."""
     return redact("deepseek-review: report for head %s: %s" % (head, json.dumps(
-        {k: report[k] for k in ("files", "chunks", "diff_only", "not_reviewed", "cut_off",
-                                "diff_only_after_cut")},
+        {k: report[k] for k in ("files", "chunks", "requests", "diff_only", "not_reviewed",
+                                "cut_off", "diff_only_after_cut")},
         sort_keys=True)))
 
 

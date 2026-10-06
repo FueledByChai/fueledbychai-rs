@@ -601,7 +601,10 @@ class ReviewTest(unittest.TestCase):
     def test_a_cut_off_answer_is_retried_as_smaller_parts_and_the_review_completes(self):
         """FBC-yf0j: a cut-off first answer followed by complete ones is a complete review."""
         head = self.change()
-        for first in ('{"findings": [{"id": "F1", "sev', None, ""):
+        # Partial JSON, no content, an empty answer, and (DeepSeek DS-1 on 284f437) JSON
+        # that parses but is not the asked shape: each cut off at max_tokens.
+        for first in ('{"findings": [{"id": "F1", "sev', None, "", '{"issues": []}',
+                      '{"findings": [{"id": "F1"}]}'):
             self.github.requests.clear()
             self.chat.requests.clear()
             calls = []
@@ -637,6 +640,9 @@ class ReviewTest(unittest.TestCase):
             report = json.loads([l for l in self.out.splitlines()
                                  if l.startswith(prefix)][0][len(prefix):])
             self.assertEqual(report["cut_off"], ["part 1 of 1"])
+            # DeepSeek DS-2 on 284f437: the comment counts the requests sent, not the parts.
+            self.assertEqual((report["chunks"], report["requests"]), (1, 3))
+            self.assertIn("(3 requests, 5 files)", body)
 
     def test_a_cut_off_single_file_is_reviewed_again_from_its_diff(self):
         self.write("crates/a/src/lib.rs", "pub fn a() -> u32 {\n    2 // ONLY-CHANGE\n}\n")
