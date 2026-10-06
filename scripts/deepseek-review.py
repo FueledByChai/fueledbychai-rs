@@ -9,7 +9,9 @@ token budget into chunks and merges their findings; asks DeepSeek's OpenAI-compa
 completions endpoint for findings as JSON and validates them; and posts ONE pull request comment
 headed "DeepSeek review" that names the reviewed head SHA. A missing key, an API error or an
 answer that is not valid findings JSON posts a comment saying the review did not complete for
-that SHA (never a silent pass) and exits non-zero.
+that SHA (never a silent pass) and exits non-zero. Every finding, whole and redacted, is also
+printed to the job log as one JSON line; when the comment has no room for all of them its marker
+says status=truncated, which is not a complete review, and the run exits non-zero.
 
 Standard library only. The API key is read only from DEEPSEEK_API_KEY, sent only in the
 Authorization header, and removed from every message this script prints or posts (0009).
@@ -24,8 +26,9 @@ Environment (the workflow sets these):
   DEEPSEEK_TIMEOUT       seconds per HTTP request, default 600
   DEEPSEEK_RETRIES       retries after a timeout, HTTP 429 or 5xx, default 2
   DEEPSEEK_RETRY_DELAY   seconds before the first retry (doubled each time), default 10
-  DEEPSEEK_DEADLINE      wall-clock seconds for all requests and retries, default 2700; once it
-                         passes, no further part or retry starts and the review is incomplete
+  DEEPSEEK_DEADLINE      wall-clock seconds for all requests and retries, counted from the
+                         first request, default 2700; once it passes, no further part or retry
+                         starts and the review is incomplete
   DEEPSEEK_POST_TIMEOUT  wall-clock seconds for posting the comment, default 60
   (The deadline and the post together fit inside the job's timeout-minutes, so a run always
   ends in a comment rather than being killed by GitHub with none; the tests check it.)
@@ -59,6 +62,8 @@ FIELD_CAP = 2000  # characters of one finding's problem or fix shown in the comm
 BODY_CAP = 60000  # GitHub refuses comments over 65536 characters
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 DEFAULT_DEADLINE = 2700.0  # 45 min of the job's 60: the rest is checkout, git work and the post
+COMMENT_RESERVE = 1000  # room kept after the findings for the omitted-findings line and the cap
+IDENT_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 DEFAULT_POST_TIMEOUT = 60.0
 
 SYSTEM_INSTRUCTIONS = """You are an adversarial code reviewer for fueledbychai-rs, a public Rust \
@@ -302,6 +307,27 @@ def http_json(url, payload, headers, timeout):
         return e.code, e.read()
 
 
+def auth_error_detail(body):
+    """The error's type and code from an authentication failure, never its text: a 401 or 403
+    body can echo a fragment of the key ("Your api key: ****abcd"), which the redactor, removing
+    only the whole key, would let through. A type or code that is not a plain identifier is
+    dropped."""
+    try:
+        error = json.loads(body.decode("utf-8")).get("error")
+    except (ValueError, AttributeError, UnicodeDecodeError):
+        return ""
+    if not isinstance(error, dict):
+        return ""
+    parts = []
+    for name in ("type", "code"):
+        value = error.get(name)
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            continue
+        if IDENT_RE.match(str(value)):
+            parts.append("%s %s" % (name, value))
+    return " (%s)" % ", ".join(parts) if parts else ""
+
+
 def call_model(cfg, messages, redact):
     url = cfg["api_base"].rstrip("/") + "/chat/completions"
     payload = {"model": cfg["model"], "messages": messages, "temperature": 0,
@@ -310,6 +336,10 @@ def call_model(cfg, messages, redact):
     headers = {"Content-Type": "application/json", "Accept": "application/json",
                "Authorization": "Bearer " + cfg["key"], "User-Agent": "fueledbychai-rs-review"}
     delay = cfg["retry_delay"]
+    if cfg.get("deadline_at") is None:
+        # Counted from the first request: the git work before it is inside the job's slack, and
+        # a slow runner cannot end a review before it has asked anything.
+        cfg["deadline_at"] = time.monotonic() + cfg["deadline"]
 
     def past_deadline(after=None):
         why = "the review deadline of %g s passed" % cfg["deadline"]
@@ -334,6 +364,9 @@ def call_model(cfg, messages, redact):
         else:
             if status == 200:
                 return body
+            if status in (401, 403):
+                raise Incomplete(redact("the DeepSeek API answered HTTP %d%s" % (
+                    status, auth_error_detail(body))))
             snippet = body.decode("utf-8", "replace").strip().replace("\n", " ")[:300]
             failure = "HTTP %d: %s" % (status, snippet)
             if last or not (status == 429 or status >= 500):
@@ -451,21 +484,36 @@ def review(cfg):
 
 
 def safe(text, cap=FIELD_CAP):
-    """Model text made inert in the comment: one line, capped, no HTML comment or tag."""
+    """Model text made inert in the comment: one line, capped, no HTML comment or tag, and no
+    @-mention (a zero-width space after each "@"), so a diff steering the model cannot make the
+    bot ping a user or team."""
     text = " ".join(str(text).split())
     if len(text) > cap:
         text = text[:cap] + " [...]"
-    return text.replace("<", "&lt;").replace(">", "&gt;")
+    return text.replace("<", "&lt;").replace(">", "&gt;").replace("@", "@\u200b")
 
 
 def code(text):
     return "`%s`" % safe(text, 300).replace("`", "'")
 
 
+def lines_size(lines):
+    return sum(len(line) + 1 for line in lines)
+
+
 def complete_comment(cfg, findings, report):
+    """(body, shown): the comment and how many findings it shows whole. Findings it has no room
+    for make it status=truncated, not a complete review; the job log holds every finding."""
     head = cfg["head"]
-    lines = [HEADING, "",
-             "<!-- deepseek-review head=%s status=complete findings=%d -->" % (head, len(findings)),
+
+    def marker(shown):
+        if shown == len(findings):
+            return "<!-- deepseek-review head=%s status=complete findings=%d -->" % (
+                head, len(findings))
+        return "<!-- deepseek-review head=%s status=truncated findings=%d shown=%d -->" % (
+            head, len(findings), shown)
+    # The longest marker holds its place until it is known whether every finding fits.
+    lines = [HEADING, "", marker(-1),
              "Reviewed head `%s` against base `%s` with model `%s` (%d request%s, %d file%s)." % (
                  head, cfg["base"], safe(cfg["model"], 100), report["chunks"],
                  "" if report["chunks"] == 1 else "s", report["files"],
@@ -478,27 +526,32 @@ def complete_comment(cfg, findings, report):
         lines += ["**%d finding%s** (%s). Every P1 and P2 is fixed (with a test) or answered "
                   "with evidence before merge." % (len(findings), "" if len(findings) == 1
                                                    else "s", counts), ""]
-        shown = 0
-        for f in findings:
-            where = f["file"] + (":%d" % f["line"] if f["line"] else "")
-            entry = "- **%s** %s %s: %s" % (f["id"], f["severity"], code(where), safe(f["problem"]))
-            if f["fix"]:
-                entry += "\n  - Fix: %s" % safe(f["fix"])
-            if len("\n".join(lines)) + len(entry) > BODY_CAP:
-                break
-            lines.append(entry)
-            shown += 1
-        if shown < len(findings):
-            lines += ["", "%d further finding%s omitted: the comment size limit. The job log "
-                      "does not hold them either; re-run with a smaller DEEPSEEK_TOKEN_BUDGET."
-                      % (len(findings) - shown, "" if len(findings) - shown == 1 else "s")]
+    shown = 0
+    for f in findings:
+        where = f["file"] + (":%d" % f["line"] if f["line"] else "")
+        entry = "- **%s** %s %s: %s" % (f["id"], f["severity"], code(where), safe(f["problem"]))
+        if f["fix"]:
+            entry += "\n  - Fix: %s" % safe(f["fix"])
+        # The same measure cap_body uses, with room kept for the lines after the findings, so a
+        # finding counted as shown is never cut from the body.
+        if lines_size(lines) + len(entry) + 1 + COMMENT_RESERVE > BODY_CAP:
+            break
+        lines.append(entry)
+        shown += 1
+    if shown < len(findings):
+        omitted = len(findings) - shown
+        lines += ["", "%d further finding%s omitted: the comment size limit. This is not a "
+                  "complete review: every finding is in this run's job log as one JSON line "
+                  "(`deepseek-review: findings for head ...`)." % (
+                      omitted, "" if omitted == 1 else "s")]
+    lines[2] = marker(shown)
     if report["diff_only"]:
         lines += ["", "Reviewed from the diff only (full text over the token budget): " +
                   ", ".join(code(p) for p in report["diff_only"])]
     if report["not_reviewed"]:
         lines += ["", "**Not reviewed:**"]
         lines += ["- %s: %s" % (code(p), r) for p, r in sorted(report["not_reviewed"].items())]
-    return cap_body(lines)
+    return cap_body(lines), shown
 
 
 def cap_body(lines):
@@ -546,8 +599,14 @@ def post_comment(cfg, body):
             status, response.decode("utf-8", "replace").strip()[:300]))
 
 
+def findings_log_line(head, findings, redact):
+    """Every finding, whole, as one ASCII JSON line for the job log (redacted like the comment)."""
+    return redact("deepseek-review: findings for head %s: %s" % (head, json.dumps(
+        [{k: f[k] for k in ("id", "severity", "file", "line", "problem", "fix")}
+         for f in findings])))
+
+
 def main():
-    started = time.monotonic()
     key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     github_token = os.environ.get("GITHUB_TOKEN", "").strip()
     redact = Redactor(key, github_token)
@@ -580,7 +639,7 @@ def main():
         try:
             cfg.update(deadline=env_float("DEEPSEEK_DEADLINE", DEFAULT_DEADLINE) or
                        DEFAULT_DEADLINE)
-            cfg.update(deadline_at=started + cfg["deadline"],
+            cfg.update(deadline_at=None,  # set at the first request
                        budget=env_int("DEEPSEEK_TOKEN_BUDGET", 120000, 1),
                        max_chunks=env_int("DEEPSEEK_MAX_CHUNKS", 4, 1),
                        max_output=env_int("DEEPSEEK_MAX_OUTPUT_TOKENS", 65536, 1),
@@ -588,8 +647,12 @@ def main():
                        retries=env_int("DEEPSEEK_RETRIES", 2, 0),
                        retry_delay=env_float("DEEPSEEK_RETRY_DELAY", 10.0))
             findings, report = review(cfg)
-            body, status = complete_comment(cfg, findings, report), 0
-            summary = "complete, %d finding%s" % (len(findings), "" if len(findings) == 1 else "s")
+            print(findings_log_line(cfg["head"], findings, redact))
+            body, shown = complete_comment(cfg, findings, report)
+            status = 0 if shown == len(findings) else 1
+            summary = "%s, %d finding%s%s" % (
+                "complete" if status == 0 else "truncated", len(findings),
+                "" if len(findings) == 1 else "s", "" if status == 0 else " (%d shown)" % shown)
         except Incomplete as e:
             body, status = incomplete_comment(cfg["head"], redact(e)), 1
             summary = "did not complete: %s" % redact(e)

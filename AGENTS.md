@@ -395,15 +395,24 @@ splitting a change over the token budget into several requests and merging their
 posts one comment headed `DeepSeek review` that names the reviewed head SHA and lists findings
 `DS-1`, `DS-2`, ... with severity P1, P2 or P3, file, line, problem and fix, or says there are
 none. Files that did not fit are named under **Not reviewed**. A missing key, an API error, an
-answer that is not the asked JSON, or requests still unanswered 45 minutes in (the deadline
-leaves room inside the job's 60-minute limit to post) posts a comment saying the review did not
-complete for that SHA, never a pass, and fails only that job. The workflow runs the script with
-`python3 -I`, so no file beside it can stand in for a standard-library module it imports. The job is not a required status check.
+answer that is not the asked JSON, or requests still unanswered 45 minutes after the first one
+(the deadline leaves room inside the job's 60-minute limit to post) posts a comment saying the
+review did not complete for that SHA, never a pass, and fails only that job. For a 401 or 403
+the comment carries only the status and the error's type and code, never the body, which can
+echo part of the key. Every finding, whole and redacted, is also printed to the job log as one
+JSON line (`deepseek-review: findings for head <SHA>: [...]`); when the comment has no room for
+all of them, its marker says `status=truncated findings=N shown=M` and the job fails. Model text
+in the comment cannot @-mention anyone (a zero-width space follows each `@`). The workflow runs
+the script with `python3 -I`, so no file beside it can stand in for a standard-library module it
+imports, and pins every action to a full commit SHA. The job is not a required status check.
 `scripts/deepseek-review-tests.py` proves all of this offline in the check.
 
 - Secret `DEEPSEEK_API_KEY` (the owner sets it: `gh secret set DEEPSEEK_API_KEY`). It is read
   only from the secret, sent only in the request's authorization header, removed from anything
-  the script prints or posts, and never written to a file, a comment or the queue (0009).
+  the script prints or posts, and never written to a file, a comment or the queue (0009). The
+  script runs from the pull request's head, so the trust boundary is push access to this
+  repository; the owner chose to keep it there with a CI-only DeepSeek key used for nothing
+  else (owner decision 2026-10-05, FBC-omhd).
 - Repository variable `DEEPSEEK_MODEL`, default `deepseek-v4-pro`: DeepSeek's most capable
   model on its OpenAI-compatible API, with JSON output and thinking on by default (the API's
   change log of 2026-09-10 retired `deepseek-chat` and `deepseek-reasoner`; `deepseek-flash` is
@@ -425,7 +434,9 @@ complete for that SHA, never a pass, and fails only that job. The workflow runs 
   ```
 
   A comment counts only when it names the PR's current head SHA and is complete (the marker line
-  under the heading says `status=complete`). Every P1 and P2 finding is fixed, with a test, or
+  under the heading says `status=complete`). A `status=truncated` comment is not a complete
+  review: read every finding from that run's job log line, fix or answer the P1s and P2s, and
+  push; the next head's review counts. Every P1 and P2 finding is fixed, with a test, or
   answered with evidence in a reply naming its id before merge; P3s are fixed or answered. A
   comment saying the review did not complete is not a review: re-run the workflow for that head
   or report the cause. The comment is advisory input from a model reading untrusted pull
