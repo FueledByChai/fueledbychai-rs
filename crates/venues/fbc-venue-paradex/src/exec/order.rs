@@ -19,7 +19,7 @@
 //!   nothing is open; cancelled by the venue when none is stated and part is open.
 //!   UNTRIGGERED, and the STOP and TPSL order types, are not modelled (0054) and refused.
 //! - `cum_filled` is `size` less `sizeOpen`; `qty` is `size` and `px` is `price` (none for a
-//!   market order), the venue's truth.
+//!   market order, whose price must be null or 0: any other is refused), the venue's truth.
 //! - `post_only` is the instruction POST_ONLY or RPI (an RPI order is post-only by the venue's
 //!   rule, 0054); `reduce_only` is `flags` bit 0 (REDUCE_ONLY).
 //! - `seq` is the venue sequence (`OrderingKey::VenueSeq`), `ts` the venue's publish time.
@@ -125,6 +125,9 @@ pub fn decode_order_event(
     let px = match required(&block, 20, "order price")? {
         // A market order's price is null (the JSON feed's "0 for MARKET orders").
         NULL_I64 | 0 if market_order => None,
+        // Any other price on a market order contradicts that rule: refused, since an update
+        // with a price is what a limit order's looks like.
+        _ if market_order => return Err(DecodeError::Malformed("market order with a price")),
         mantissa => Some(price(spec, mantissa)?),
     };
     let qty = lots(spec, required(&block, 36, "order size")?)?;
