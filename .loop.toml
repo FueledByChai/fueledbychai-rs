@@ -16,7 +16,9 @@ check_fast = "scripts/check.sh --fast"
 # handling, planned at crates/venues/<venue>/src/sign* and, in any crate (a venue's exec code
 # or runtime header injection), src/auth* (file or directory). AGENTS.md requires credential
 # code to live there, and scripts/check.sh fails a venue crate that keeps it elsewhere.
-review_paths = ["crates/venues/*/src/sign", "crates/*/src/auth"]
+# The DeepSeek reviewer injects an API key outside a crate, so 0009's "adds its path to
+# review_paths in the same change" puts its script and workflow here (FBC-bk02).
+review_paths = ["crates/venues/*/src/sign", "crates/*/src/auth", "scripts/deepseek-review.py", ".github/workflows/deepseek-review.yml"]
 # Commits must end with a Co-Authored-By trailer naming the agent and model that did the work.
 trailer_required = true
 # The loop kit: a git URL and a tag, or a directory inside this checkout.
