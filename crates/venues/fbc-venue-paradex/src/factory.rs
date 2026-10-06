@@ -5,8 +5,9 @@
 //! `exec: None`, and there is no order-entry codec or endpoint. [`caps_with_order_entry`] is
 //! what the factory declares once they exist (FBC-xzp): the same market data with
 //! [`exec::exec_caps`] and the order rate limits (decision 0054). Each capability cites the
-//! document it comes from: docs.paradex.trade, or the SBE schema `paradex_1_0.xml` in tradeparadex/paradex-py at
-//! commit `b8248fb747e278d2167ac2f056b339a287d5ef30` ("the schema" below).
+//! document it comes from: docs.paradex.trade, or the SBE schema `paradex_1_0.xml` in
+//! tradeparadex/paradex-py at commit `b8248fb747e278d2167ac2f056b339a287d5ef30` ("the
+//! schema" below).
 
 use core::time::Duration;
 use std::collections::{BTreeMap, BTreeSet};
@@ -255,7 +256,8 @@ fn venue_caps(exec: Option<ExecCaps>) -> VenueCaps {
     ];
     limits.extend(order_limits);
     VenueCaps {
-        // Order entry is BT-402's (decision 0015: no order or fill claims until then).
+        // None for market data only (decision 0015: no order or fill claims without order
+        // entry); Paradex's order entry otherwise (decision 0054).
         exec,
         matching: MatchingCaps {
             // docs.paradex.trade describes no speed bump.

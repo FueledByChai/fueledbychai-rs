@@ -59,7 +59,7 @@ one `instruction` field and the "Order Instructions" and "Retail Price Improveme
 rule, so the codec writes RPI whether or not the order also asks for post-only, as the Java
 library does. Queries name the client id ("Get order by client id"). The order rate limits are
 "`POST, DELETE, PUT /orders` | 800 req/s OR 17250 req/m | Account", both windows, counting
-place, amend, cancel and cancel-all; a batch is charged once.
+place, amend, cancel and cancel-all; the account limit charges a batch once.
 
 ### The order socket negotiates SBE schema 1:2
 
@@ -120,6 +120,12 @@ confirmed or corrected on the owner's testnet run (FBC-8xr); a correction is a n
 - `LimitScope::Ip`: whether the 1500 req/m per-IP limit on private requests counts the
   WebSocket order methods (design §13.3's check). Declared counted: one per-IP bucket of
   1500 req/m holds REST, queries and order methods together.
+- `RateCharge::weight` of a batch: "consumed once for the entire batch" is stated for the
+  account limit only, and no page says whether the per-IP limit counts a batch once or per
+  item. A charge has one weight for every limit counting it, so the codec charges a batch its
+  item count: the per-IP bucket, the binding one (1500 req/m against 800 req/s), then never
+  admits more than the venue's budget if Paradex counts each item, at the cost of overcounting
+  the account limit, which ten-item batches cannot approach.
 - The encoding of private channel payloads, on which the "Binary Encoding (SBE)" page and the
   schema disagree. Declared SBE (`OrderEvent`, `FillEvent`), as the schema and the Java library
   have it; a JSON payload on a private channel is not guessed at by the decoder.
@@ -150,7 +156,7 @@ margin accounts.
 - FBC-xzp makes `ParadexFactory::caps` return `caps_with_order_entry()`, and its `plan_exec`
   asks for `sbeSchemaVersion=2` on the order socket; FBC-xvf's codec decodes `OrderEvent` and
   `FillEvent` at 1:2, confirms an amend on the order event that reports SUCCESS for
-  MODIFY_ORDER, writes RPI for an order on the RPI channel, charges a batch one unit, and
+  MODIFY_ORDER, writes RPI for an order on the RPI channel, charges a batch its item count, and
   queries an order by client id through a path that also finds a closed order ("Get order by
   client id" returns only orders in `OPEN` status).
 - A SimVenue standing in for Paradex (FBC-2zxk) refuses placements until it models a two-phase
@@ -163,8 +169,8 @@ margin accounts.
 
 - The testnet run (FBC-8xr) amending a partly filled order, cancelling by client id before the
   acknowledgement, replaying fills after a reconnect, accepting batches of more than ten,
-  leaving orders resting after an unexpected disconnect, or not counting WebSocket order
-  methods per IP: each corrects its value by a new record.
+  leaving orders resting after an unexpected disconnect, not counting WebSocket order
+  methods per IP, or counting a batch once per IP: each corrects its value by a new record.
 - An `order.modify` reply that later contradicts its order event, which would make the reply
   the confirmation (`AmendAck::RpcReplyOnly`), or a REJECTED modify that ends the order.
 - Private channel payloads arriving as JSON on a 1:2 socket, or a 1:2 negotiation refused with
