@@ -10,7 +10,10 @@ name: DeepSeek review
 # and scripts/deepseek-review.py never prints, writes or posts it. DEEPSEEK_MODEL is a
 # repository variable (default deepseek-v4-pro when unset).
 # The script runs from the PR head, so only branches of this repository run it: whoever can push
-# one can already run any workflow with the repository's secrets.
+# one can already run any workflow with the repository's secrets. -I (isolated mode) keeps a
+# file merged beside the script, such as scripts/secrets.py, from shadowing a standard-library
+# module and running with the key. The script's own 45-minute deadline ends every run in a
+# comment well inside timeout-minutes.
 
 on:
   pull_request:
@@ -49,4 +52,4 @@ jobs:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
-        run: python3 scripts/deepseek-review.py
+        run: python3 -I scripts/deepseek-review.py

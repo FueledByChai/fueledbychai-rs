@@ -24,6 +24,11 @@ Environment (the workflow sets these):
   DEEPSEEK_TIMEOUT       seconds per HTTP request, default 600
   DEEPSEEK_RETRIES       retries after a timeout, HTTP 429 or 5xx, default 2
   DEEPSEEK_RETRY_DELAY   seconds before the first retry (doubled each time), default 10
+  DEEPSEEK_DEADLINE      wall-clock seconds for all requests and retries, default 2700; once it
+                         passes, no further part or retry starts and the review is incomplete
+  DEEPSEEK_POST_TIMEOUT  wall-clock seconds for posting the comment, default 60
+  (The deadline and the post together fit inside the job's timeout-minutes, so a run always
+  ends in a comment rather than being killed by GitHub with none; the tests check it.)
   GITHUB_TOKEN, GITHUB_API_URL (default https://api.github.com), GITHUB_REPOSITORY
   PR_NUMBER, PR_HEAD_SHA, PR_BASE_SHA, PR_TITLE, PR_BODY
   REVIEW_REPO_DIR        the checkout holding both SHAs, default the working directory
@@ -35,6 +40,7 @@ import re
 import secrets
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -52,6 +58,8 @@ SEVERITIES = ("P1", "P2", "P3")
 FIELD_CAP = 2000  # characters of one finding's problem or fix shown in the comment
 BODY_CAP = 60000  # GitHub refuses comments over 65536 characters
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+DEFAULT_DEADLINE = 2700.0  # 45 min of the job's 60: the rest is checkout, git work and the post
+DEFAULT_POST_TIMEOUT = 60.0
 
 SYSTEM_INSTRUCTIONS = """You are an adversarial code reviewer for fueledbychai-rs, a public Rust \
 library that connects a trading program to crypto venues (market data, order entry, order truth). \
@@ -258,6 +266,31 @@ def plan_chunks(units, available, max_chunks):
     return chunks[:max_chunks], diff_only, not_reviewed
 
 
+class TimedOut(Exception):
+    """A call did not return within its wall-clock bound."""
+
+
+def bounded(seconds, fn, *args):
+    """fn(*args) within `seconds` of wall-clock time, or TimedOut. A socket timeout bounds each
+    read, not the whole answer, so a peer sending a byte at a time could hold a request for
+    hours; the call runs in a daemon thread that is abandoned at the bound."""
+    result = {}
+
+    def run():
+        try:
+            result["value"] = fn(*args)
+        except BaseException as e:  # noqa: BLE001 - re-raised in the caller's thread
+            result["error"] = e
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(max(seconds, 0))
+    if worker.is_alive():
+        raise TimedOut()
+    if "error" in result:
+        raise result["error"]
+    return result["value"]
+
+
 def http_json(url, payload, headers, timeout):
     """POST payload as JSON; returns (status, body bytes). Raises URLError/OSError on transport."""
     data = json.dumps(payload).encode("utf-8")
@@ -277,20 +310,36 @@ def call_model(cfg, messages, redact):
     headers = {"Content-Type": "application/json", "Accept": "application/json",
                "Authorization": "Bearer " + cfg["key"], "User-Agent": "fueledbychai-rs-review"}
     delay = cfg["retry_delay"]
+
+    def past_deadline(after=None):
+        why = "the review deadline of %g s passed" % cfg["deadline"]
+        return Incomplete(redact(why + (" (the last attempt: %s)" % after if after else "")))
     for attempt in range(cfg["retries"] + 1):
         last = attempt == cfg["retries"]
+        remaining = cfg["deadline_at"] - time.monotonic()
+        if remaining <= 0:
+            raise past_deadline()
         try:
-            status, body = http_json(url, payload, headers, cfg["timeout"])
+            status, body = bounded(remaining, http_json, url, payload, headers,
+                                   min(cfg["timeout"], remaining))
+        except TimedOut:
+            raise past_deadline("no answer")
         except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
+            if time.monotonic() >= cfg["deadline_at"]:
+                raise past_deadline("no answer")  # the socket timeout, cut to the deadline
             reason = getattr(e, "reason", None) or type(e).__name__
             if last:
                 raise Incomplete(redact("the DeepSeek API could not be reached: %s" % reason))
+            failure = "unreachable: %s" % reason
         else:
             if status == 200:
                 return body
             snippet = body.decode("utf-8", "replace").strip().replace("\n", " ")[:300]
+            failure = "HTTP %d: %s" % (status, snippet)
             if last or not (status == 429 or status >= 500):
-                raise Incomplete(redact("the DeepSeek API answered HTTP %d: %s" % (status, snippet)))
+                raise Incomplete(redact("the DeepSeek API answered " + failure))
+        if time.monotonic() + delay >= cfg["deadline_at"]:
+            raise past_deadline(failure)  # no retry would start before the deadline
         time.sleep(delay)
         delay *= 2
     raise Incomplete("the DeepSeek API was not called")  # unreachable: the loop runs at least once
@@ -393,8 +442,8 @@ def review(cfg):
         messages = [{"role": "system", "content": system},
                     {"role": "user", "content": user_prompt(cfg["title"], cfg["body"], part,
                                                             len(chunks), payload, nonce)}]
-        content, finish = answer_content(call_model(cfg, messages, cfg["redact"]))
         try:
+            content, finish = answer_content(call_model(cfg, messages, cfg["redact"]))
             results.append(parse_findings(content, finish))
         except Incomplete as e:
             raise Incomplete("part %d of %d: %s" % (part, len(chunks), e))
@@ -481,9 +530,15 @@ def post_comment(cfg, body):
     headers = {"Authorization": "Bearer " + cfg["github_token"],
                "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28",
                "Content-Type": "application/json", "User-Agent": "fueledbychai-rs-review"}
+    seconds = cfg["post_timeout"]
+    end = time.monotonic() + seconds
     try:
-        status, response = http_json(url, {"body": body}, headers, cfg["timeout"])
+        status, response = bounded(seconds, http_json, url, {"body": body}, headers, seconds)
+    except TimedOut:
+        raise Incomplete("posting the comment failed: no answer within %g s" % seconds)
     except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
+        if time.monotonic() >= end:  # the socket timeout fired as the bound did
+            raise Incomplete("posting the comment failed: no answer within %g s" % seconds)
         raise Incomplete("posting the comment failed: %s" % (getattr(e, "reason", None) or
                                                              type(e).__name__))
     if status != 201:
@@ -492,6 +547,7 @@ def post_comment(cfg, body):
 
 
 def main():
+    started = time.monotonic()
     key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     github_token = os.environ.get("GITHUB_TOKEN", "").strip()
     redact = Redactor(key, github_token)
@@ -507,7 +563,7 @@ def main():
         "repo": os.environ.get("REVIEW_REPO_DIR", "").strip() or ".",
         "api_base": os.environ.get("DEEPSEEK_API_BASE", "").strip() or DEFAULT_API_BASE,
         "model": os.environ.get("DEEPSEEK_MODEL", "").strip() or DEFAULT_MODEL,
-        "timeout": 600,
+        "timeout": 600, "post_timeout": DEFAULT_POST_TIMEOUT,
     }
     if not (github_token and re.match(r"^[\w.-]+/[\w.-]+$", cfg["repository"])
             and cfg["pr"].isdigit() and SHA_RE.match(cfg["head"])):
@@ -515,8 +571,17 @@ def main():
               "PR_HEAD_SHA are required; nothing posted", file=sys.stderr)
         return 2
     try:
+        cfg["post_timeout"] = env_float("DEEPSEEK_POST_TIMEOUT", DEFAULT_POST_TIMEOUT) or \
+            DEFAULT_POST_TIMEOUT
+    except Incomplete as e:
+        print("deepseek-review: %s; nothing posted" % e, file=sys.stderr)
+        return 2
+    try:
         try:
-            cfg.update(budget=env_int("DEEPSEEK_TOKEN_BUDGET", 120000, 1),
+            cfg.update(deadline=env_float("DEEPSEEK_DEADLINE", DEFAULT_DEADLINE) or
+                       DEFAULT_DEADLINE)
+            cfg.update(deadline_at=started + cfg["deadline"],
+                       budget=env_int("DEEPSEEK_TOKEN_BUDGET", 120000, 1),
                        max_chunks=env_int("DEEPSEEK_MAX_CHUNKS", 4, 1),
                        max_output=env_int("DEEPSEEK_MAX_OUTPUT_TOKENS", 65536, 1),
                        timeout=env_float("DEEPSEEK_TIMEOUT", 600.0) or 600.0,
