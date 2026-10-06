@@ -16,8 +16,14 @@
 //!   SETTLE_MARKET and BLOCK_TRADE are the venue's: pushed with no client-id match whatever
 //!   client id the frame carries. How the OMS counts them is FBC-5uk's. Any other type is
 //!   refused.
-//! - The fill id and the order id (none when empty, as a position transfer's may be) through
-//!   the scope; FillEvent states no remaining size, so no cumulative quantity after the fill.
+//! - The fill id, keyed as `<fillType>:<fillId>` (for example `FILL:8615262148007718001`) for
+//!   every type: Paradex states a fill id "Unique string ID of fill per FillType" (AsyncAPI
+//!   `ResponsesFillResult.id`), so the id alone could merge a FILL and a LIQUIDATION into one
+//!   ledger key and drop the second. The type names hold no `:`, so the spelling is one-to-one;
+//!   any later REST fills decoder spells it the same. An empty id is refused, and so is one too
+//!   long for the core once prefixed (Paradex's are 19 digits). The order id (none when empty,
+//!   as a position transfer's may be) through the scope; FillEvent states no remaining size,
+//!   so no cumulative quantity after the fill.
 //! - `side` the account's side, as the Java library reads it; `price` and `size` on the
 //!   instrument's grid and size step; `liquidity` MAKER or TAKER, NON_REPRESENTABLE the venue
 //!   not saying.
@@ -83,11 +89,15 @@ pub fn decode_fill_event(
         NULL_I64 => None,
         n => Some(seq(n)?),
     };
-    let own = match block.u8_at(16) {
+    let (fill_type, own) = match block.u8_at(16) {
         // FILL and RPI: the account's own executions.
-        Some(1 | 5) => true,
+        Some(1) => ("FILL", true),
+        Some(5) => ("RPI", true),
         // LIQUIDATION, UNWIND_TRANSFER, SETTLE_MARKET, BLOCK_TRADE: the venue's.
-        Some(2 | 3 | 4 | 6) => false,
+        Some(2) => ("LIQUIDATION", false),
+        Some(3) => ("UNWIND_TRANSFER", false),
+        Some(4) => ("SETTLE_MARKET", false),
+        Some(6) => ("BLOCK_TRADE", false),
         _ => return Err(DecodeError::Malformed("fill type")),
     };
     let side = match block.u8_at(17) {
@@ -115,7 +125,10 @@ pub fn decode_fill_event(
     let fee = scope
         .fee(fee_raw, fee_asset)
         .map_err(DecodeError::FeeRefused)?;
-    let fill = scope.fill_id(fill_id)?;
+    // The id as the venue sent it is checked first, so an empty one is refused, not keyed as
+    // the bare prefix; then the key names the fill type before it.
+    scope.fill_id(fill_id)?;
+    let fill = scope.fill_id(&format!("{fill_type}:{fill_id}"))?;
     let vid = if order_id.is_empty() {
         None
     } else {
