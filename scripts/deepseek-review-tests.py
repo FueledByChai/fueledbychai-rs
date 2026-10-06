@@ -318,6 +318,66 @@ class ReviewTest(unittest.TestCase):
         self.assertIn("`a'b.rs:3`", body)
         self.assertNotIn("\n## heading", body)
 
+    def test_model_text_cannot_mention_people(self):
+        """Reviewer B, B5: model text (steerable by the diff) must not ping GitHub users or
+        teams from the bot's comment."""
+        head = self.change()
+        self.chat.answer = lambda path, body: completion(findings_json(
+            finding("F1", "P2", "@team/x.rs", 3, "ping @octocat and @org/team", "ask @someone")))
+        self.run_review(head)
+        body = self.one_comment()
+        self.assertIsNone(re.search(r"@[A-Za-z0-9]", body), body)
+        self.assertIn("ping @\u200boctocat and @\u200borg/team", body)
+        self.github.requests.clear()
+        self.chat.answer = lambda path, body: (500, b"cc @octocat")
+        self.run_review(head, DEEPSEEK_RETRIES="0")
+        body = self.assert_incomplete(head, "cc @\u200boctocat")
+        self.assertIsNone(re.search(r"@[A-Za-z0-9]", body), body)
+
+    def findings_log(self, head):
+        prefix = "deepseek-review: findings for head %s: " % head
+        lines = [l for l in self.out.splitlines() if l.startswith(prefix)]
+        self.assertEqual(len(lines), 1, self.out)
+        return json.loads(lines[0][len(prefix):])
+
+    def test_findings_past_the_comment_limit_are_truncated_and_all_kept_in_the_job_log(self):
+        """Reviewer B, B3: findings the comment has no room for exist in the job log, and the
+        comment's marker says status=truncated, which does not count as a complete review."""
+        head = self.change()
+        many = [finding("F%d" % n, "P1", "crates/a/src/lib.rs", n,
+                        "problem %d %s" % (n, "p" * 3000), "fix %d %s" % (n, "x" * 3000))
+                for n in range(1, 21)]
+        many[19]["problem"] += " echoed " + KEY  # the log is redacted like the comment
+        self.chat.answer = lambda path, body: completion(findings_json(*many))
+        self.run_review(head)
+        self.assertEqual(self.rc, 1, self.out + self.err)
+        body = self.one_comment()
+        shown = len(re.findall(r"^- \*\*DS-\d+\*\* P1 ", body, re.M))
+        self.assertTrue(0 < shown < 20, shown)
+        self.assertIn("<!-- deepseek-review head=%s status=truncated findings=20 shown=%d -->"
+                      % (head, shown), body)
+        self.assertNotIn("status=complete", body)
+        self.assertIn("%d further findings omitted: the comment size limit" % (20 - shown), body)
+        self.assertIn("This is not a complete review", body)
+        self.assertIn("truncated, 20 findings", self.out)
+        logged = self.findings_log(head)
+        self.assertEqual([f["id"] for f in logged], ["DS-%d" % n for n in range(1, 21)])
+        problems = {f["problem"].split()[1]: f for f in logged}
+        for n in range(1, 21):
+            self.assertEqual(problems[str(n)]["fix"], "fix %d %s" % (n, "x" * 3000))
+        self.assertTrue(problems["20"]["problem"].endswith(" echoed ***"))
+
+    def test_a_complete_review_also_logs_its_findings(self):
+        head = self.change()
+        self.chat.answer = lambda path, body: completion(findings_json(
+            finding("F1", "P2", "crates/a/src/lib.rs", 2, "a problem")))
+        self.run_review(head)
+        self.assertEqual(self.rc, 0, self.err)
+        self.assertIn("status=complete findings=1 -->", self.one_comment())
+        self.assertEqual(self.findings_log(head), [
+            {"id": "DS-1", "severity": "P2", "file": "crates/a/src/lib.rs", "line": 2,
+             "problem": "a problem", "fix": "fix it"}])
+
     def test_empty_change_is_a_complete_review_with_no_call(self):
         self.run_review(self.base)
         self.assertEqual(self.rc, 0, self.err)
@@ -434,10 +494,38 @@ class ReviewTest(unittest.TestCase):
 
     def test_a_client_error_is_not_retried(self):
         head = self.change()
-        self.chat.answer = lambda path, body: (401, b'{"error": "invalid key"}')
+        self.chat.answer = lambda path, body: (400, b'{"error": "bad request"}')
         self.run_review(head, DEEPSEEK_RETRIES="2")
-        self.assert_incomplete(head, "HTTP 401", "invalid key")
+        self.assert_incomplete(head, "HTTP 400", "bad request")
         self.assertEqual(len(self.chat.requests), 1)
+
+    def test_an_auth_failure_posts_only_its_status_and_error_type_and_code(self):
+        """Reviewer B, B4: a 401 or 403 body can echo a fragment of the key, which the redactor
+        (exact key only) would not catch; only the status and the error's type and code are
+        posted or printed, never its text."""
+        head = self.change()
+        fragment = "****" + KEY[-4:]
+        cases = [
+            ({"error": {"message": "Authentication Fails, Your api key: %s is invalid" % fragment,
+                        "type": "authentication_error", "code": "invalid_api_key"}},
+             "(type authentication_error, code invalid_api_key)"),
+            # A type or code that is not a plain identifier is dropped, not posted.
+            ({"error": {"message": "denied", "type": "key %s" % fragment, "code": 1234}},
+             "(code 1234)"),
+            ("Your api key %s is invalid" % fragment, None),
+        ]
+        for status in (401, 403):
+            for answer, detail in cases:
+                self.github.requests.clear()
+                raw = (json.dumps(answer) if isinstance(answer, dict) else answer).encode()
+                self.chat.answer = lambda path, body, s=status, r=raw: (s, r)
+                self.run_review(head, DEEPSEEK_RETRIES="2")
+                expected = "the DeepSeek API answered HTTP %d" % status
+                body = self.assert_incomplete(head, expected + (" " + detail if detail else "."))
+                for text in (body, self.out, self.err):
+                    self.assertNotIn(KEY[-4:], text)
+                    self.assertNotIn("Your api key", text)
+                    self.assertNotIn("denied", text)
 
     def test_a_rate_limit_is_retried_until_it_succeeds(self):
         head = self.change()
@@ -560,11 +648,30 @@ class ReviewTest(unittest.TestCase):
         head = self.big_change()
 
         def answer(path, body):
-            self.chat.release.wait(5)
+            self.chat.release.wait(60)
             return completion(findings_json())
         self.chat.answer = answer
         self.run_review(head, DEEPSEEK_TOKEN_BUDGET="5000", DEEPSEEK_DEADLINE="2")
-        self.assert_incomplete(head, "the review deadline of 2 s passed")
+        # The script's own comment says part 1 was the one cut; no later part was sent.
+        self.assert_incomplete(head, "part 1 of ", "the review deadline of 2 s passed")
+        self.assertLessEqual(len(self.chat.requests), 1)
+        users = [r["body"]["messages"][1]["content"] for r in self.chat.requests]
+        self.assertFalse([u for u in users if "This is part 1 of" not in u], users)
+
+    def test_the_deadline_starts_at_the_first_request(self):
+        """Reviewer B, B7: the time spent on git work before the first request does not count
+        against the deadline, so a slow runner cannot end a review before it starts."""
+        head = self.change()
+        bindir = self.dir / "bin"
+        bindir.mkdir()
+        slow_git = bindir / "git"
+        slow_git.write_text('#!/bin/sh\ncase "$*" in *--name-status*) sleep 4 ;; esac\n'
+                            'exec "%s" "$@"\n' % shutil.which("git"))
+        slow_git.chmod(0o755)
+        self.run_review(head, DEEPSEEK_DEADLINE="3",
+                        PATH=str(bindir) + os.pathsep + os.environ["PATH"])
+        self.assertEqual(self.rc, 0, self.out + self.err)
+        self.assertIn("head=%s status=complete findings=0" % head, self.one_comment())
         self.assertEqual(len(self.chat.requests), 1)
 
     def test_a_stalled_comments_api_ends_without_hanging(self):
@@ -661,11 +768,34 @@ class CommentSizeTest(unittest.TestCase):
                      "problem": "p" * 3000, "fix": "x" * 3000} for n in range(1, 40)]
         report = {"chunks": 4, "files": 3000, "diff_only": ["d%04d.rs" % n for n in range(1000)],
                   "not_reviewed": {"n%04d.rs" % n: "past the limit" for n in range(3000)}}
-        body = module.complete_comment(cfg, findings, report)
+        body, shown = module.complete_comment(cfg, findings, report)
         self.assertLessEqual(len(body), 65536)
         self.assertIn("further findings omitted: the comment size limit", body)
         self.assertRegex(body, r"\.\.\. \d+ further lines omitted: the comment size limit\.\n$")
-        self.assertIn("**DS-1** P2", body)
+        self.assertTrue(0 < shown < len(findings), shown)
+        self.assertIn("status=truncated findings=39 shown=%d" % shown, body)
+        # Every finding counted as shown is in the comment whole, never cut by the size cap.
+        for n in range(1, shown + 1):
+            self.assertIn("- **DS-%d** P2 `f.rs:%d`: %s [...]\n  - Fix: %s [...]"
+                          % (n, n, "p" * 2000, "x" * 2000), body)
+        self.assertNotIn("**DS-%d** P2" % (shown + 1), body)
+
+    def test_the_size_check_never_cuts_a_finding_it_counted_as_shown(self):
+        spec = importlib.util.spec_from_file_location("deepseek_review", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        cfg = {"head": "a" * 40, "base": "b" * 40, "model": "m"}
+        report = {"chunks": 1, "files": 1, "diff_only": [], "not_reviewed": {}}
+        # Every finding length around the boundary: a finding is either shown whole and counted,
+        # or omitted and counted as omitted; the marker always agrees with the body.
+        for size in range(1, 400, 7):
+            findings = [{"id": "DS-%d" % n, "severity": "P3", "file": "f.rs", "line": None,
+                         "problem": "q" * size, "fix": ""} for n in range(1, 3000)]
+            body, shown = module.complete_comment(cfg, findings, report)
+            self.assertLessEqual(len(body), module.BODY_CAP + 1)
+            self.assertEqual(len(re.findall(r"^- \*\*DS-\d+\*\* P3 ", body, re.M)), shown, size)
+            self.assertIn("shown=%d -->" % shown, body)
+            self.assertNotIn("further lines omitted", body)
 
 
 class WorkflowTest(unittest.TestCase):
@@ -705,6 +835,13 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(self.block("concurrency"), [
             "group: deepseek-review-${{ github.event.pull_request.number }}",
             "cancel-in-progress: true"])
+
+    def test_every_action_is_pinned_to_a_full_commit_sha(self):
+        """Reviewer B, B6: a moving tag runs right before the step that holds the key."""
+        uses = [l.strip() for l in self.lines if re.match(r"^\s*(- )?uses:", l)]
+        self.assertTrue(uses)
+        for line in uses:
+            self.assertRegex(line, r"^(- )?uses: [\w.-]+/[\w.-]+@[0-9a-f]{40} # v\d+(\.\d+)*$")
 
     def test_the_secret_reaches_only_the_review_step(self):
         secrets = [l.strip() for l in self.lines if "secrets." in l]

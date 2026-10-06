@@ -9,10 +9,12 @@ name: DeepSeek review
 # secret. The key comes only from the DEEPSEEK_API_KEY secret (0009); GitHub masks it in logs
 # and scripts/deepseek-review.py never prints, writes or posts it. DEEPSEEK_MODEL is a
 # repository variable (default deepseek-v4-pro when unset).
-# The script runs from the PR head, so only branches of this repository run it: whoever can push
-# one can already run any workflow with the repository's secrets. -I (isolated mode) keeps a
-# file merged beside the script, such as scripts/secrets.py, from shadowing a standard-library
-# module and running with the key. The script's own 45-minute deadline ends every run in a
+# The script runs from the PR head, so only branches of this repository run it. The trust
+# boundary is push access, and the key is a CI-only DeepSeek key (owner decision 2026-10-05,
+# FBC-omhd). -I (isolated mode) keeps a file merged beside the script, such as
+# scripts/secrets.py, from shadowing a standard-library module and running with the key. Every
+# action is pinned to a full commit SHA, since it runs right before the step holding the key.
+# The script's own 45-minute deadline, counted from its first request, ends every run in a
 # comment well inside timeout-minutes.
 
 on:
@@ -35,7 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
