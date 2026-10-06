@@ -487,6 +487,7 @@ dependencies = [
  "fbc-book",
  "fbc-core",
  "fbc-journal",
+ "fbc-oms",
  "futures-util",
  "hmac",
  "http-body-util",
@@ -500,6 +501,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
+ "trybuild",
  "webpki-roots",
  "zstd",
 ]
