@@ -20,6 +20,8 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet, VecDeque};
 use std::fmt;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use fbc_core::{AccountKey, RpcCall, RpcId, VenueCommand};
 use fbc_oms::{Authorization, ControlCommand};
@@ -55,11 +57,41 @@ pub(crate) struct Queued {
     pub(crate) epoch: Option<u32>,
 }
 
+/// The request ids one account's order-entry sessions give, counted up across them: the
+/// consumer builds one per account and hands a clone to each session it builds for the account
+/// ([`ExecSessionConfig::rpc_ids`](crate::ExecSessionConfig::rpc_ids)), so an answer or an
+/// `Unknown` for one session's request is never matched to an earlier session's request whose
+/// fate fbc-oms still waits on (decision 0057; PR #87 Reviewer B B2).
+#[derive(Clone, Debug, Default)]
+pub struct RpcIds {
+    /// The last id given; the first is one past the counter's start.
+    last: Arc<AtomicU64>,
+}
+
+impl RpcIds {
+    /// Ids from one past `last` on: for a consumer that resumes the account's ids from where its
+    /// journal left them. [`RpcIds::default`] gives ids from 1.
+    pub fn after(last: RpcId) -> RpcIds {
+        RpcIds {
+            last: Arc::new(AtomicU64::new(last.0)),
+        }
+    }
+
+    /// The next id.
+    fn next(&self) -> RpcId {
+        let give = |last: u64| last.checked_add(1);
+        let last = self
+            .last
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, give);
+        RpcId(last.expect("an account gives fewer than u64::MAX request ids") + 1)
+    }
+}
+
 /// What [`ExecOrders`] and its session share, on the session's thread.
 pub(crate) struct Shared {
     acct: AccountKey,
-    /// The last request id given; the first is 1.
-    last: Cell<u64>,
+    /// Where request ids are given from.
+    ids: RpcIds,
     queue: RefCell<VecDeque<Queued>>,
     /// Wakes the session when a command is submitted.
     pub(crate) wake: Notify,
@@ -69,10 +101,10 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    pub(crate) fn new(acct: AccountKey) -> Rc<Shared> {
+    pub(crate) fn new(acct: AccountKey, ids: RpcIds) -> Rc<Shared> {
         Rc::new(Shared {
             acct,
-            last: Cell::new(0),
+            ids,
             queue: RefCell::default(),
             wake: Notify::new(),
             ready: Cell::new(None),
@@ -85,13 +117,7 @@ impl Shared {
         if self.ended.get() {
             return Err(SubmitRefusal::Ended);
         }
-        let rpc = self
-            .last
-            .get()
-            .checked_add(1)
-            .expect("a session gives fewer than u64::MAX request ids");
-        self.last.set(rpc);
-        let rpc = RpcId(rpc);
+        let rpc = self.ids.next();
         let epoch = self.ready.get();
         self.queue
             .borrow_mut()
@@ -108,6 +134,12 @@ impl Shared {
     /// Whether a command waits.
     pub(crate) fn waiting(&self) -> bool {
         !self.queue.borrow().is_empty()
+    }
+
+    /// One turn per command waiting now: a turn takes only those, so what is submitted while
+    /// it runs waits for the next.
+    pub(crate) fn waiting_now(&self) -> std::iter::RepeatN<()> {
+        std::iter::repeat_n((), self.queue.borrow().len())
     }
 
     /// The epoch whose stream is authenticated, if one is.
@@ -272,8 +304,27 @@ mod tests {
     }
 
     #[test]
+    fn request_ids_count_up_across_the_sessions_sharing_them_from_where_they_start() {
+        let ids = RpcIds::default();
+        let (first, second) = (
+            Shared::new(AccountKey::new(2), ids.clone()),
+            Shared::new(AccountKey::new(2), ids),
+        );
+        assert_eq!(first.push(VenueCommand::FeeQuery), Ok(RpcId(1)));
+        assert_eq!(second.push(VenueCommand::FeeQuery), Ok(RpcId(2)));
+        assert_eq!(RpcIds::after(RpcId(41)).next(), RpcId(42));
+        assert!(format!("{:?}", RpcIds::default()).starts_with("RpcIds"));
+    }
+
+    #[test]
+    #[should_panic(expected = "fewer than u64::MAX request ids")]
+    fn request_ids_never_wrap() {
+        RpcIds::after(RpcId(u64::MAX)).next();
+    }
+
+    #[test]
     fn orders_give_increasing_request_ids_and_none_once_ended() {
-        let shared = Shared::new(AccountKey::new(2));
+        let shared = Shared::new(AccountKey::new(2), RpcIds::default());
         let orders = ExecOrders {
             shared: Rc::clone(&shared),
         };

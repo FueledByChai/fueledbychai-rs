@@ -94,7 +94,7 @@ use tokio::time::Instant;
 
 use crate::connector::Connector;
 use crate::epoch::{Admit, EpochError, Epochs, Input};
-use crate::exec_orders::{ExecOrders, Queued, Rpcs, Shared};
+use crate::exec_orders::{ExecOrders, Queued, RpcIds, Rpcs, Shared};
 use crate::pacing::ReconnectPacing;
 use crate::ratelimit::{RateError, RateLimiter, Refused, Request};
 use crate::session::SessionError;
@@ -118,11 +118,19 @@ pub trait ExecHandler {
         let _ = key;
     }
 
-    /// What became of a command submitted through the session's [`ExecOrders`]: called once
-    /// per submission, in submission order, before any event answering its request (decision
-    /// 0057). `handle.receipt` holds the nonces the encode used when it was sent, or why it was
-    /// not. A consumer whose OMS awaits a command's outcome implements it: a command not sent is
-    /// reported here only. Nothing by default.
+    /// What became of a command submitted through the session's [`ExecOrders`]: called at most
+    /// once per submission, in submission order, before any event answering its request
+    /// (decision 0057). `handle.receipt` holds the nonces the encode used when it was sent, or
+    /// why it was not. A consumer whose OMS awaits a command's outcome implements it: a command
+    /// not sent is reported here only.
+    ///
+    /// Once the session ends (a stop or an error) nothing more is reported: not the commands
+    /// still waiting, nor the one whose nonces the source mis-reserved, and a command reported
+    /// sent as the control dropped may never have been written. The consumer treats every
+    /// submission not reported, and every one reported sent and not answered, as unresolved
+    /// until the venue is read again (0013 rule 1). A command submitted from this call waits for
+    /// the session's next turn; one not sent is never resubmitted as it was (0013 rule 1).
+    /// Nothing by default.
     fn on_submitted(&mut self, handle: SubmitHandle) {
         let _ = handle;
     }
@@ -142,6 +150,9 @@ pub struct ExecSessionConfig {
     pub creds: Secrets,
     /// The account they reach: [`ExecOrders::submit`] takes only its authorizations.
     pub acct: AccountKey,
+    /// Where the session's request ids are given from: the account's one [`RpcIds`], a clone
+    /// handed to every session built for it, so ids never repeat for the account (0057).
+    pub rpc_ids: RpcIds,
     /// The engine namespace the account's client ids are minted under, which the decode scope
     /// reads ours by.
     pub ns: Namespace,
@@ -387,7 +398,7 @@ impl<H: ExecHandler> ExecSession<H> {
             specs: config.specs,
             nonces: config.nonces,
             decode_errors: 0,
-            orders: Shared::new(config.acct),
+            orders: Shared::new(config.acct, config.rpc_ids),
             rpcs: Rpcs::default(),
             clock,
             stop,
@@ -756,20 +767,26 @@ impl<H: ExecHandler> ExecSession<H> {
         self.fault.take().map_or(Ok(()), Err)
     }
 
-    /// Takes every command waiting, in submission order, on epoch `key` ([`Self::send`]), until
-    /// the epoch ends or the session stops; what still waits then is the next turn's. False when
-    /// the epoch ended.
+    /// Takes the commands waiting as the turn began, in submission order, on epoch `key`
+    /// ([`Self::send`]), until the epoch ends or the session stops; what still waits then,
+    /// including what the handler submitted meanwhile, is the next turn's, and the session
+    /// yields first, so a handler that submits again from `on_submitted` cannot hold it (PR #87
+    /// Reviewer B B5). False when the epoch ended.
     async fn send_queued(
         &mut self,
         ws: &mut Option<WebSocket>,
         key: ConnKey,
     ) -> Result<bool, ExecSessionError> {
         let mut open = true;
+        let mut turn = self.orders.waiting_now();
         while open
             && !self.stopped()
-            && let Some(queued) = self.orders.pop()
+            && let Some(queued) = turn.next().and_then(|()| self.orders.pop())
         {
             open = self.send(ws, key, queued).await?;
+        }
+        if open && self.orders.waiting() {
+            tokio::task::yield_now().await;
         }
         Ok(open)
     }
@@ -885,11 +902,13 @@ fn reserve(nonces: &mut dyn NonceSource, asked: u16) -> Result<NonceBlock, ExecS
 /// Whether `fx`, an encode's effects for request `rpc` of traffic class `class`, may be executed:
 /// they carry the request ([`Effects::carry_request`]), every frame goes to the session's own
 /// stream `own`, and none asks to reconnect, which would leave a frame of the request unwritten
-/// with its outcome unreported (0014 item 3).
+/// with its outcome unreported (0014 item 3), or is an HTTP request: order entry is
+/// WebSocket-only (0057), since an HTTP request gets no deadline here and its result is dropped
+/// once its epoch ends, so it could never come back `Unknown`.
 fn carries(fx: &Effects, rpc: RpcId, class: fbc_core::TrafficClass, own: StreamId) -> bool {
     let elsewhere = |effect: &Effect| match effect {
         Effect::Send { stream, .. } => *stream != own,
-        other => matches!(other, Effect::Reconnect { .. }),
+        other => matches!(other, Effect::Reconnect { .. } | Effect::Http { .. }),
     };
     !fx.as_slice().iter().any(elsewhere) && fx.carry_request(rpc, class)
 }
@@ -920,18 +939,23 @@ impl<H: ExecHandler> Control for Between<'_, H> {
     /// control dropped.
     async fn changed(&mut self) -> bool {
         let (due, waiting) = (self.rpcs.next_deadline(), self.orders.waiting());
+        // What waits is taken after a yield, so a handler that submits again from
+        // `on_submitted` cannot hold the task (PR #87 Reviewer B B5).
         tokio::select! {
             biased;
             r = self.stop.changed() => r.is_ok(),
-            () = std::future::ready(()), if waiting => true,
-            _ = self.orders.wake.notified() => true,
+            () = tokio::task::yield_now(), if waiting => true,
+            _ = self.orders.wake.notified(), if !waiting => true,
             _ = sleep_or_never(due) => true,
         }
     }
 
     fn apply(&mut self) {
+        // Only what waited as the turn began: what the handler submits meanwhile is the next
+        // turn's.
+        let mut turn = self.orders.waiting_now();
         while !self.stopped()
-            && let Some(queued) = self.orders.pop()
+            && let Some(queued) = turn.next().and_then(|()| self.orders.pop())
         {
             let receipt = Err(NotSentReason::Disconnected);
             let rpc = queued.rpc;
