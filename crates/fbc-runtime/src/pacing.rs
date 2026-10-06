@@ -169,7 +169,7 @@ impl Pacer {
 
     /// The next attempt starts no sooner than `at`, as well as everything else that paces it:
     /// the moment the venue's buckets admit what an order-entry epoch opens with (decision
-    /// 0052). The latest hold wins; the next attempt to start releases it.
+    /// 0053). The latest hold wins; the next attempt to start releases it.
     pub(crate) fn hold_until(&mut self, at: Instant) {
         self.held = Some(self.held.map_or(at, |held| held.max(at)));
     }

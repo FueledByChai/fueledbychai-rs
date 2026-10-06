@@ -185,7 +185,7 @@ rather than guess.
     receive time beneath TLS and WebSocket (nix, Linux only), so a frame's stamp carries
     `kernel_rx`, and a session reports each Safety write attributed to such a frame, the
     codec's or one the handler issues through its `Outbox`, as a `TickToWire` (0031);
-    `ExecSession` drives one account's order-entry connection as `plan_exec` plans it (0052):
+    `ExecSession` drives one account's order-entry connection as `plan_exec` plans it (0053):
     one `ExecCodec` across its epochs, `on_open` given exactly the nonces it asks for from the
     consumer's `NonceSource`, frames decoded inside `dispatch`, events stamped and handed to the
     consumer's `ExecHandler` inline, a stop ending the epoch at once, reconnects paced (its

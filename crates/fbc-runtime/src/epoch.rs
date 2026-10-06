@@ -143,7 +143,7 @@ impl Epochs {
 
     /// Drops and counts an input of kind `input` that arrived after the current epoch ended
     /// but before the next opened: an event an order-entry codec pushes once its session
-    /// stopped (decision 0052).
+    /// stopped (decision 0053).
     pub(crate) fn drop_ended(&mut self, input: Input) {
         let count = &mut self.stale[input.index()];
         *count = count.saturating_add(1);
