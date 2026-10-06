@@ -8,10 +8,12 @@
 //! refuses every place, batch of places and amend; a cancel, a cancel-many, an instrument
 //! cancel-all and every control command go through. An arm the venue rejects, that is not sent,
 //! or that is unanswered at its deadline fails the epoch, which the session then ends as a drop.
+//! Only a final acceptance accepts the arm: a two-phase venue's provisional one leaves it
+//! pending under its deadline, which still stands, since the venue may yet reject it.
 //! Where the venue's protection outlives a connection (`rearm_on_reconnect: false`), the first
 //! accepted arm covers every later epoch, which still resyncs.
 
-use fbc_core::{ExecEvent, RpcId, SubmitOutcome, VenueCommand};
+use fbc_core::{AckLevel, ExecEvent, RpcId, SubmitOutcome, VenueCommand};
 
 /// What an event settles for its epoch once it reaches the handler.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -122,13 +124,22 @@ impl Gate {
         self.update(epoch, |e| e.resync = Resync::Asked);
     }
 
-    /// What `ev`, of `epoch`, settles once it reaches the handler: the answer to the epoch's
-    /// arm, or the end of its resync; `None` for anything else, read without copying `ev`.
+    /// What `ev`, of `epoch`, settles as it is handed to the handler: the answer to the epoch's
+    /// arm, or the end of its resync; `None` for anything else, a provisional acceptance of the
+    /// arm included, read without copying `ev`.
     pub(crate) fn settles(&self, epoch: u32, ev: &ExecEvent) -> Option<Settled> {
         let e = self.of(epoch)?;
         match ev {
             ExecEvent::Outcome { rpc, outcome, .. } if e.arm == Arm::Pending(*rpc) => {
-                let accepted = matches!(outcome, SubmitOutcome::Accepted { .. });
+                let accepted = match outcome {
+                    SubmitOutcome::Accepted {
+                        ack: AckLevel::Provisional,
+                    } => return None,
+                    SubmitOutcome::Accepted {
+                        ack: AckLevel::Final,
+                    } => true,
+                    _ => false,
+                };
                 Some(Settled::Arm { accepted })
             }
             ExecEvent::ResyncEnd if e.resync == Resync::Asked => Some(Settled::Resync),
@@ -136,7 +147,21 @@ impl Gate {
         }
     }
 
-    /// What an event of `epoch` settled has reached the handler.
+    /// Whether `ev` provisionally accepts the pending arm: it does not answer the arm, whose
+    /// deadline still stands until the venue's final answer (PR #90 Reviewer A A2).
+    pub(crate) fn provisional_arm(&self, ev: &ExecEvent) -> bool {
+        let provisional = SubmitOutcome::Accepted {
+            ack: AckLevel::Provisional,
+        };
+        match (ev, self.current) {
+            (ExecEvent::Outcome { rpc, outcome, .. }, Some(e)) => {
+                e.arm == Arm::Pending(*rpc) && *outcome == provisional
+            }
+            _ => false,
+        }
+    }
+
+    /// What an event of `epoch` settled is being handed to the handler.
     pub(crate) fn settle(&mut self, epoch: u32, settled: Settled) {
         match settled {
             Settled::Arm { accepted } => {
@@ -397,6 +422,46 @@ mod tests {
         let mut gate = Gate::new(true);
         gate.timed_out(RpcId(1));
         assert!(!gate.failed(0));
+    }
+
+    #[test]
+    fn a_provisional_acceptance_leaves_the_arm_pending_until_its_final_answer_or_deadline() {
+        let provisional = outcome(
+            1,
+            SubmitOutcome::Accepted {
+                ack: AckLevel::Provisional,
+            },
+        );
+        let reject = Reject {
+            kind: RejectKind::Margin,
+            venue_code: None,
+            raw: "".into(),
+        };
+        let rejected = outcome(1, SubmitOutcome::Rejected(reject));
+        // Each answer that may follow it, and whether the epoch then takes places.
+        type Then<'a> = (&'a dyn Fn(&mut Gate), bool);
+        let after: [Then<'_>; 3] = [
+            (&|g| g.heard(0, &accepted(1)), true),
+            (&|g| g.heard(0, &rejected), false),
+            (&|g| g.timed_out(RpcId(1)), false),
+        ];
+        for (answer, placing) in after {
+            let mut gate = Gate::new(true);
+            gate.authenticated(0);
+            assert!(!gate.provisional_arm(&provisional));
+            gate.arm_sent(0, RpcId(1));
+            gate.resync_asked(0);
+            gate.heard(0, &ExecEvent::ResyncEnd);
+            assert!(gate.provisional_arm(&provisional));
+            assert!(!gate.provisional_arm(&accepted(1)));
+            assert!(!gate.provisional_arm(&ExecEvent::ResyncEnd));
+            gate.heard(0, &provisional);
+            assert!(!gate.placing(0) && !gate.failed(0));
+            assert!(gate.provisional_arm(&provisional));
+            answer(&mut gate);
+            assert_eq!((gate.placing(0), gate.failed(0)), (placing, !placing));
+            assert!(!gate.provisional_arm(&provisional));
+        }
     }
 
     #[test]

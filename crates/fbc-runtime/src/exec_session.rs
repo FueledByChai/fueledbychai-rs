@@ -89,11 +89,12 @@
 //! `on_open`'s are (buckets that refuse them for now end the epoch as a drop, opened again no
 //! sooner than they would admit them; frames that never fit end the session,
 //! [`ExecSessionError::ResyncNeverFits`]). The arm's and the resync's events reach the handler
-//! as any other. Until the venue has accepted the arm and the resync's `ResyncEnd` has reached
-//! the handler, the epoch takes no place, batch of places or amend: each is
-//! `NotSent(Disconnected)`, counted ([`ExecCounters::unready_refusals`]), with no nonce reserved
-//! and nothing written, while cancels and control commands go out
-//! ([`ExecOrders::may_place`]). An arm the codec refuses, the buckets do not admit, the venue
+//! as any other. Until the venue has finally accepted the arm (a provisional acceptance leaves it
+//! pending, its deadline standing) and the resync's `ResyncEnd` has been handed to the handler,
+//! the epoch takes no place, batch of places or amend: each is `NotSent(Disconnected)`, counted
+//! ([`ExecCounters::unready_refusals`]), with no nonce reserved and nothing written, while
+//! cancels and control commands go out ([`ExecOrders::may_place`], true already as the handler
+//! hears the event that opens the epoch; what it submits then goes out once it returns). An arm the codec refuses, the buckets do not admit, the venue
 //! rejects, or that is unanswered at its deadline fails the epoch: once the input being handled
 //! and the commands waiting are taken (a cancel among them goes out), the epoch ends as a drop,
 //! counted ([`ExecCounters::arm_failures`]), and the next opens through the pacing.
@@ -1259,7 +1260,11 @@ struct Sink<'a, H> {
 
 impl<H: ExecHandler> ExecSink for Sink<'_, H> {
     fn push(&mut self, meta: VenueMeta, ev: ExecEvent) {
-        if let Some(rpc) = ev.answers() {
+        // A provisional acceptance of the arm answers nothing yet: the venue may still reject
+        // it, so its deadline stands (PR #90 Reviewer A A2).
+        if let Some(rpc) = ev.answers()
+            && !self.orders.gate.borrow().provisional_arm(&ev)
+        {
             self.rpcs.answered(rpc);
         }
         if self.stop.has_changed().is_err() {
@@ -1275,12 +1280,15 @@ impl<H: ExecHandler> ExecSink for Sink<'_, H> {
                     self.orders.gate.borrow_mut().authenticated(epoch);
                 }
             }
-            // The arm's answer and the resync's end count once the handler has the event.
+            // The arm's answer and the resync's end count as the handler is handed the event,
+            // so the handler hearing the one that opens the epoch sees places taken (PR #90
+            // Reviewer B B1). What it submits then still goes out only once it has returned,
+            // so after fbc-oms has applied the ResyncEnd.
             let settled = self.orders.gate.borrow().settles(epoch, &ev);
-            self.handler.on_exec(Envelope::new(self.stamp, meta, ev));
             if let Some(settled) = settled {
                 self.orders.gate.borrow_mut().settle(epoch, settled);
             }
+            self.handler.on_exec(Envelope::new(self.stamp, meta, ev));
         }
     }
 }

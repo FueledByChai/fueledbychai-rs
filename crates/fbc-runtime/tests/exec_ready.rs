@@ -1,7 +1,8 @@
 //! FBC-w19's done line (decision 0058): on every epoch the order-entry session sends
 //! `ArmCancelOnDisconnect(true)` once the codec reports the stream `Authenticated`, then runs the
 //! codec's resync, and its epoch takes no place or amend (`ExecOrders::may_place` is false) until
-//! the venue has accepted the arm and the epoch's `ResyncEnd` has reached the handler; an arm
+//! the venue has finally accepted the arm and the epoch's `ResyncEnd` has been handed to the
+//! handler (which, hearing the event that opens the epoch, already sees places taken); an arm
 //! rejected or unanswered by its deadline leaves the epoch refusing orders, counted, and ends it
 //! as a drop reconnected through the pacing, while a command that is not a place or amend still
 //! goes out; a venue declaring cancel-on-disconnect `None` or `DeadMan` is refused when the
@@ -10,8 +11,10 @@
 //! The conformance toy declares cancel-on-disconnect per connection, re-armed on reconnect.
 //! Nothing outside fbc-oms issues an `Authorization` yet (FBC-afd), so the commands submitted
 //! here are control commands: an order query, a safety command like a cancel, which the gate
-//! lets through as it does a cancel. That the gate refuses a place and an amend, with no nonce
-//! reserved and no byte written, is shown in `exec_gate.rs`'s unit tests.
+//! lets through as it does a cancel. That the session refuses a place and an amend, counted,
+//! with no nonce reserved and no byte written, while a cancel goes out, is shown by a unit test
+//! inside fbc-runtime that queues them as a submission would (`src/exec_held_tests.rs`), and on
+//! the gate by `exec_gate.rs`'s unit tests.
 
 mod common;
 #[path = "../../fbc-conformance/src/toy/mod.rs"]
@@ -240,6 +243,24 @@ impl ExecCodec for Logged {
         sink: &mut dyn ExecSink,
         fx: &mut Effects,
     ) -> Result<(), DecodeError> {
+        // A two-phase venue's provisional acceptance of request `rpc`'s one item, which the toy
+        // never sends.
+        if let RawFrame::Text(text) = f
+            && let Some(rpc) = text.strip_prefix("prov|rpc=")
+        {
+            let rpc = RpcId(rpc.parse().unwrap());
+            let outcome = SubmitOutcome::Accepted {
+                ack: AckLevel::Provisional,
+            };
+            let item = Some(fbc_core::ItemRef {
+                idx: 0,
+                cid: None,
+                vid: None,
+            });
+            let ev = ExecEvent::Outcome { rpc, item, outcome };
+            sink.push(fbc_core::VenueMeta::NONE, ev);
+            return Ok(());
+        }
         self.inner.on_frame(stream, f, scope, specs, sink, fx)
     }
 
@@ -536,6 +557,12 @@ fn accepted(rpc: u64) -> String {
     format!("item|rpc={rpc}|i=0|res=ok")
 }
 
+/// A two-phase venue's provisional acceptance of request `rpc`'s one item, which it may still
+/// reject.
+fn provisional(rpc: u64) -> String {
+    format!("prov|rpc={rpc}")
+}
+
 /// The venue's refusal of request `rpc`'s one item, for margin.
 fn rejected(rpc: u64) -> String {
     format!("item|rpc={rpc}|i=0|res=rej|code=1005")
@@ -673,8 +700,9 @@ async fn each_epoch_arms_after_authentication_and_takes_places_only_once_armed_a
     assert_eq!(second_ctx.nonces.as_slice(), [2]);
     assert_eq!(*reserved.lock().unwrap(), [vec![0], vec![1], vec![2]]);
     // The handler heard each epoch authenticated, the arm accepted and the resync, and the
-    // session took places only from the moment each epoch's ResyncEnd had reached the handler:
-    // not while it was being handed over.
+    // session took places from the moment each epoch's ResyncEnd, the last of its two settling
+    // events, was handed over: the handler hearing it already sees places taken (PR #90
+    // Reviewer B B1), and whatever it submits then goes out only once it has returned.
     let accepted = SubmitOutcome::Accepted {
         ack: AckLevel::Final,
     };
@@ -698,11 +726,11 @@ async fn each_epoch_arms_after_authentication_and_takes_places_only_once_armed_a
             (AUTHENTICATED, key(0), false),
             (outcome(1), key(0), false),
             (begin(wm0), key(0), false),
-            (ExecEvent::ResyncEnd, key(0), false),
+            (ExecEvent::ResyncEnd, key(0), true),
             (AUTHENTICATED, key(1), false),
             (outcome(3), key(1), false),
             (begin(wm1), key(1), false),
-            (ExecEvent::ResyncEnd, key(1), false),
+            (ExecEvent::ResyncEnd, key(1), true),
             (
                 ExecEvent::Outcome {
                     rpc: asked,
@@ -823,6 +851,123 @@ async fn an_arm_unanswered_by_its_deadline_ends_the_epoch_as_a_drop_and_the_next
     assert_eq!(outcomes(&log), [unknown]);
     assert_eq!(ends(&log), [key(0), key(1)]);
     assert_eq!(session.counters().arm_failures, 1);
+}
+
+/// A two-phase venue's provisional acceptance of the arm is no acceptance (PR #90 Reviewer A
+/// A2): the arm stays pending under its deadline, so a rejection that follows it ends the epoch
+/// as a drop, and so does no final answer by the deadline. Only the final acceptance opens an
+/// epoch, and when it is the last of the epoch's two settling events the handler hearing it
+/// already sees places taken (Reviewer B B1).
+#[tokio::test(start_paused = true)]
+async fn an_arm_accepted_only_provisionally_stays_pending_under_its_deadline() {
+    let frozen = freeze();
+    let mut server = ScriptedWs::start().await;
+    let venue = ReadyToy::leak();
+    let log = Log::default();
+    let (mut session, control, orders, _) = session(venue, &server.url(), &[], &log, None);
+    let watch = Rc::clone(&log);
+    let script = async move {
+        // Provisional, then rejected: the epoch ends as a drop.
+        let mut peer = server.accept().await;
+        peer.recv().await;
+        peer.send(AUTH_ACK);
+        assert_eq!(peer.recv().await, arm(1));
+        let resync = peer.recv().await;
+        peer.send_all(resynced(watermark(&resync)));
+        settle(|| resync_ends(&watch) == 1).await;
+        peer.send(&provisional(1));
+        settle(|| outcomes(&watch).len() == 1).await;
+        assert!(!orders.may_place());
+        peer.send(&rejected(1));
+        settle(|| ends(&watch).len() == 1).await;
+        assert!(!orders.may_place());
+
+        // Provisional, then nothing by the deadline: the epoch ends as a drop at it.
+        advance(ms(100)).await;
+        let mut peer = server.accept().await;
+        peer.recv().await;
+        peer.send(AUTH_ACK);
+        assert_eq!(peer.recv().await, arm(2));
+        let resync = peer.recv().await;
+        peer.send_all(resynced(watermark(&resync)));
+        settle(|| resync_ends(&watch) == 2).await;
+        peer.send(&provisional(2));
+        settle(|| outcomes(&watch).len() == 3).await;
+        assert!(!orders.may_place());
+        advance(RPC_TIMEOUT - ms(1)).await;
+        churn().await;
+        assert_eq!(ends(&watch).len(), 1);
+        advance(ms(1)).await;
+        settle(|| ends(&watch).len() == 2).await;
+        assert!(!orders.may_place());
+
+        // Provisional, then final: the epoch, resynced first, takes places as the handler hears
+        // the final acceptance, and its arm's deadline ends nothing.
+        advance(ms(100)).await;
+        let mut peer = server.accept().await;
+        peer.recv().await;
+        peer.send(AUTH_ACK);
+        assert_eq!(peer.recv().await, arm(3));
+        let resync = peer.recv().await;
+        peer.send_all(resynced(watermark(&resync)));
+        settle(|| resync_ends(&watch) == 3).await;
+        peer.send(&provisional(3));
+        settle(|| outcomes(&watch).len() == 5).await;
+        assert!(!orders.may_place());
+        peer.send(&accepted(3));
+        settle(|| outcomes(&watch).len() == 6).await;
+        assert!(orders.may_place());
+        advance(RPC_TIMEOUT).await;
+        churn().await;
+        assert_eq!(ends(&watch).len(), 2);
+        assert!(orders.may_place());
+        drop(control);
+    };
+    let ((), run) = tokio::join!(script, session.run());
+    run.unwrap();
+    drop(frozen);
+
+    let provisional = SubmitOutcome::Accepted {
+        ack: AckLevel::Provisional,
+    };
+    let last = SubmitOutcome::Accepted {
+        ack: AckLevel::Final,
+    };
+    let heard = outcomes(&log);
+    let [
+        (RpcId(1), p1),
+        (RpcId(1), SubmitOutcome::Rejected(_)),
+        (RpcId(2), p2),
+        (RpcId(2), SubmitOutcome::Unknown),
+        (RpcId(3), p3),
+        (RpcId(3), f3),
+    ] = &heard[..]
+    else {
+        panic!("{heard:?}");
+    };
+    assert_eq!(
+        [p1, p2, p3, f3],
+        [&provisional, &provisional, &provisional, &last]
+    );
+    // Only the final acceptance was handed over with places taken.
+    let taken: Vec<_> = events(&log).into_iter().filter(|(_, _, m)| *m).collect();
+    let [
+        (
+            ExecEvent::Outcome {
+                rpc: RpcId(3),
+                outcome,
+                ..
+            },
+            at,
+            true,
+        ),
+    ] = &taken[..]
+    else {
+        panic!("{taken:?}");
+    };
+    assert_eq!((outcome, *at), (&last, key(2)));
+    assert_eq!(ends(&log), [key(0), key(1), key(2)]);
+    assert_eq!(session.counters().arm_failures, 2);
 }
 
 /// A codec that refuses to encode the arm leaves it unsent: the epoch ends as a drop, counted,
