@@ -1,0 +1,13 @@
+# FillEvent (template 21): a version-2 header declaring a 116-byte block, the frame ending 43 bytes into it
+# Hand-built from paradex_1_0.xml at tradeparadex/paradex-py b8248fb747e278d2167ac2f056b339a287d5ef30.
+# SYNTHETIC: the account is 32 made-up bytes (a0..bf), no Paradex account. Little-endian; '#' starts a comment.
+74 00 15 00 01 00 02 00                           # header: blockLength=116 templateId=21 (FillEvent) schemaId=1 version=2
+6e 23 80 84 41 40 06 00                           # @0 ts int64 = 1759500000306030 us
+8e 17 00 00 00 00 00 00                           # @8 seq int64 (optional) = 6030
+01                                                # @16 fillType uint8 = 1 (FILL)
+01                                                # @17 side uint8 = 1 (BUY)
+01                                                # @18 liquidity uint8 = 1 (MAKER)
+00 30 cc 8c a3 05 00 00                           # @19 price Price8 = 6200000000000 (62000)
+40 4b 4c 00 00 00 00 00                           # @27 size Qty8 = 5000000 (0.05)
+10 45 fb ff ff ff ff ff                           # @35 fee Value8 = -310000 (-0.0031; positive = paid, negative = rebate)
+# the frame ends here: 43 of the 116 block bytes the header declares
