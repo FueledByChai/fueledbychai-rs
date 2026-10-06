@@ -460,8 +460,9 @@ Privacy and review (0001, 0009):
   `exec.rs`. A ticket that needs credential code anywhere else names that module `auth` or adds
   its path to `review_paths` in the same change (0009).
 - Always leave changes to venue signers and to JWT and API-key handling
-  (`crates/venues/*/src/sign*`, `crates/*/src/auth*`) for the owner's review; every other pull
-  request auto-merges when green.
+  (`crates/venues/*/src/sign*`, `crates/*/src/auth*`, and the DeepSeek reviewer's
+  `scripts/deepseek-review.py` and `.github/workflows/deepseek-review.yml`, which inject its API
+  key) for the owner's review; every other pull request auto-merges when green.
 
 Design rules the records fix:
 
