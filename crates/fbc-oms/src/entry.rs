@@ -344,8 +344,9 @@ impl Entries {
 
     /// Whether the leases armed `market` holds are still covered by the names the registry has
     /// now: its market lease, and the account lease where the nonce scope is per account
-    /// (Reviewer B's RB86-1 on PR #86). An account lease the registry holds is this account's
-    /// whenever a market lease is, since no market arms while it is another's.
+    /// (Reviewer B's RB86-1 on PR #86). The account lease must be the current names' account,
+    /// not merely some account's: a market armed while no account lease was needed never
+    /// checked the one the registry holds now (Reviewer B's RB86-5 on PR #86).
     fn held_covered(&self, market: InstrumentId) -> Result<(), ArmRefusal> {
         let keys = self.named(market)?;
         if !self
@@ -355,8 +356,14 @@ impl Entries {
         {
             return Err(ArmRefusal::WrongMarketLease(market));
         }
-        if keys.needs_account_lease() && self.account_lease.is_none() {
-            return Err(ArmRefusal::NoAccountLease(market));
+        if keys.needs_account_lease() {
+            match &self.account_lease {
+                None => return Err(ArmRefusal::NoAccountLease(market)),
+                Some(held) if !keys.covers_account(held) => {
+                    return Err(ArmRefusal::WrongAccountLease(market));
+                }
+                Some(_) => {}
+            }
         }
         Ok(())
     }
