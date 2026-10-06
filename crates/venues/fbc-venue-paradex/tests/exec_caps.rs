@@ -308,6 +308,7 @@ fn the_record_cites_a_paradex_page_for_every_order_method_and_lists_each_undocum
         "snapshot_source",
         "keeps_priority",
         "LimitScope::Ip",
+        "RateCharge::weight",
         "qty_semantics",
     ] {
         assert!(

@@ -40,9 +40,10 @@ pub const ORDER_OPS: [OpKind; 4] = [
 ];
 
 /// Paradex's per-account order rate limits, both windows: "API" rate limits, "`POST, DELETE,
-/// PUT /orders` | 800 req/s OR 17250 req/m | Account". A batch counts once ("Rate limit is
-/// consumed once for the entire batch", `order-create-batch`), so a codec charges a batch one
-/// unit. The per-IP limit the market-data caps already declare counts these methods too
+/// PUT /orders` | 800 req/s OR 17250 req/m | Account". This limit counts a batch once ("Rate
+/// limit is consumed once for the entire batch", `order-create-batch`); no page says the per-IP
+/// limit does, so a codec charges a batch its item count (decision 0054). The per-IP limit the
+/// market-data caps already declare counts these methods too
 /// ([`caps_with_order_entry`](crate::factory::caps_with_order_entry)).
 pub fn order_limits() -> [RateLimit; 2] {
     let account = |per, units| RateLimit {
