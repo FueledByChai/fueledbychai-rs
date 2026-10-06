@@ -352,7 +352,8 @@ loop's checks (every loop script's `--self-test`, `scripts/prompt-check.sh`,
 proof gate: a change under `crates/` brings a change under `crates/*/tests/` or `fixtures/`, a
 `#[test]` or `#[cfg(test)]` line, or `No new test: <reason>` in the commit body), then the
 privacy check (`scripts/privacy-check.sh --self-test`, then the scan for JWTs, bearer tokens,
-key- and address-shaped hex, PEM headers and master-key bytes; 0009), then, once `Cargo.toml`
+key- and address-shaped hex, PEM headers and master-key bytes; 0009), then the external
+reviewer's offline proof (`scripts/deepseek-review-tests.py`, below), then, once `Cargo.toml`
 exists, `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
 `cargo test --workspace`, `cargo build --workspace --release` and the credential placement
 check (a venue crate's source outside `src/sign*` and `src/auth*` that names a JWT, bearer
@@ -380,6 +381,42 @@ licence step fails naming the install command when it is missing or another vers
 moving it is a ticket. The one planned step still marked TODO in the script is the
 golden-refresh flag. It stays open now that `fbc-journal` exists: exact-replay goldens compare
 outbound bytes, which need the exec path (BT-402).
+
+### External model review (DeepSeek)
+
+Codex ran out of credits on 2026-10-05, so a model of another family reviews every pull
+request in its place (owner decision 2026-10-06): `.github/workflows/deepseek-review.yml` runs
+`scripts/deepseek-review.py` on every push to a ready pull request from this repository's own
+branches (`pull_request` opened, ready_for_review, synchronize and reopened; drafts and forks
+run nothing, and there is no `pull_request_target`). A new head cancels the run for the old one.
+The script sends the diff against the base, the full text of each touched file, this file's
+Project rules and the decisions index to DeepSeek's OpenAI-compatible chat completions endpoint,
+splitting a change over the token budget into several requests and merging their findings, and
+posts one comment headed `DeepSeek review` that names the reviewed head SHA and lists findings
+`DS-1`, `DS-2`, ... with severity P1, P2 or P3, file, line, problem and fix, or says there are
+none. Files that did not fit are named under **Not reviewed**. A missing key, an API error or an
+answer that is not the asked JSON posts a comment saying the review did not complete for that
+SHA, never a pass, and fails only that job. The job is not a required status check.
+`scripts/deepseek-review-tests.py` proves all of this offline in the check.
+
+- Secret `DEEPSEEK_API_KEY` (the owner sets it: `gh secret set DEEPSEEK_API_KEY`). It is read
+  only from the secret, sent only in the request's authorization header, removed from anything
+  the script prints or posts, and never written to a file, a comment or the queue (0009).
+- Repository variable `DEEPSEEK_MODEL`, default `deepseek-v4-pro`: DeepSeek's most capable
+  model on its OpenAI-compatible API, with JSON output and thinking on by default (the API's
+  change log of 2026-09-10 retired `deepseek-chat` and `deepseek-reasoner`; `deepseek-flash` is
+  the cheaper alternative). Set it with `gh variable set DEEPSEEK_MODEL --body <model>`; an
+  unset variable takes the default. Optional variables: `DEEPSEEK_API_BASE` (default
+  `https://api.deepseek.com`) and `DEEPSEEK_TOKEN_BUDGET` (estimated prompt tokens per request,
+  characters / 3, default 120000; at most 4 requests per review).
+- How the loop treats the comment: as it treated Codex's review. Where a loop prompt asks for a
+  completed Codex review of the head, read the newest `DeepSeek review` comment instead. It
+  counts only when it names the PR's current head SHA and is complete (the marker line under
+  the heading says `status=complete`). Every P1 and P2 finding is fixed, with a test, or
+  answered with evidence in a reply naming its id before merge; P3s are fixed or answered. A
+  comment saying the review did not complete is not a review: re-run the workflow for that head
+  or report the cause. The comment is advisory input from a model reading untrusted pull
+  request text; it does not replace the independent reviewers.
 
 ### Rules
 

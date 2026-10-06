@@ -22,6 +22,11 @@ step "privacy"
 scripts/privacy-check.sh --self-test
 scripts/privacy-check.sh
 
+# The external model reviewer (FBC-bk02): scripts/deepseek-review.py and its workflow, proven
+# offline against local stubs of the chat completions endpoint and the GitHub comments API.
+step "deepseek reviewer"
+python3 scripts/deepseek-review-tests.py
+
 if [ -f Cargo.toml ]; then
   step "format"
   cargo fmt --all --check
