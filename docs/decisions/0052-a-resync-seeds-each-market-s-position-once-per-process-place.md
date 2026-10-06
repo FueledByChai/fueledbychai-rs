@@ -42,11 +42,15 @@ position, which its fill count must not count again (FBC-2e4, Codex r4189028838)
   by the watermark, or the order was at the venue before the request (the order was not open
   when the venue read the account, so every fill of it came before). An earlier run's order the
   registry does not hold was (0013's cancel-on-disconnect ends one in flight with its
-  connection), as was one a snapshot showed; an order the registry held before the seed that
-  no snapshot showed (registered by the consumer, a journal's, say) may have reached the venue
-  after its read, so only the arrival or time rules place its fills. It does not hold a fill of
+  connection), as was one a resync registered from its snapshot; an order the registry held
+  before the seed otherwise (registered by the consumer, a journal's, say) may have reached the
+  venue after its read, so only the arrival or time rules place its fills, even when an earlier
+  snapshot showed it (stricter than needed, on the safe side). It does not hold a fill of
   an order it shows with a lower cumulative fill, nor any fill of an order placed after the
-  seed. The seed is the snapshot's position plus the
+  seed. The second rule needs the snapshot's open orders and positions read at one instant:
+  a fill landing between two reads would show in the order's cumulative fill and not in the
+  position, or the reverse, and count never or twice. A consumer gives a resync only from such
+  a read (FBC-k7t7 makes a venue declare it). The seed is the snapshot's position plus the
   fills it does not hold, and an order it shows counts its shown cumulative fill plus those.
   After the seed the same rules place each fill: one the seed holds is kept by the ledger and
   counted on its order, never on the inventory.
@@ -100,6 +104,9 @@ position, which its fill count must not count again (FBC-2e4, Codex r4189028838)
 - An order the consumer registers before the seed, and the snapshot does not show, leaves its
   market unknown once it fills after the watermark: conservative, and rare while nothing is
   sent before the seed.
+- A venue whose resync reads positions and open orders in separate requests does not meet the
+  second rule's precondition: until FBC-k7t7 lets it declare that and refuses the rule there,
+  its consumer must not resync from it (Reviewer B's RB80-2 on PR #80).
 - FBC-c4v refuses arming while the position is unknown; FBC-840 acts on the open orders of ours
   a later resync reports that the registry does not hold.
 

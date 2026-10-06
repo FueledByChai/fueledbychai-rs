@@ -17,14 +17,17 @@
 //! 1. the fill arrived before the resync was requested;
 //! 2. the snapshot shows the fill's order with a cumulative fill at least the fill's
 //!    `cum_after` (when the fill reports none: its matching-engine time is at or before the
-//!    watermark);
+//!    watermark). This needs the snapshot's open orders and positions read at one instant
+//!    ([`ResyncSnapshot`]): a fill landing between two reads would show in the one and not the
+//!    other;
 //! 3. the snapshot does not show the fill's order, and its matching-engine time is at or before
 //!    the watermark, or the order was at the venue before the request: it was not open when
 //!    the venue read the account, so every fill of it came before. An order the registry held
-//!    before the seed that no snapshot showed it may have reached the venue after the read, so
-//!    only its time places it; an earlier run's order the registry does not hold, or one a
-//!    snapshot showed, was there (0013's cancel-on-disconnect ends an earlier run's orders in
-//!    flight).
+//!    before the seed, unless a resync registered it from its snapshot, may have reached the
+//!    venue after the read, so only its time places it (one an earlier snapshot showed too:
+//!    stricter than needed, on the safe side); an earlier run's order the registry does not
+//!    hold, or one a resync registered from its snapshot, was there (0013's
+//!    cancel-on-disconnect ends an earlier run's orders in flight).
 //!
 //! It does not hold a fill of an order it shows with a cumulative fill below the fill's
 //! `cum_after`, nor any fill of an order placed after the seed. A fill none of these rules
@@ -56,6 +59,12 @@ use crate::record::{OrderKey, OrderRecord};
 use crate::registry::Registry;
 
 /// One resync's answer, as the consumer collected it from the `Resync*` events.
+///
+/// Its open orders and positions must be one read of the account, at one instant: the seed
+/// compares an order's shown cumulative fill with the position read beside it (rule 2 in the
+/// module documentation; decision 0052). A venue whose resync reads them in two requests can
+/// have a fill land between the reads, shown in the one and not in the other, and the seed then
+/// count it never or twice. Such a venue does not meet this yet; FBC-k7t7 makes it declared.
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub struct ResyncSnapshot {
     /// `ResyncBegin`'s watermark: the request's `EncodeCtx.wall` (decision 0014).
@@ -229,9 +238,10 @@ impl Seed {
 struct SeedRef {
     watermark: WallNs,
     requested_at: MonoNs,
-    /// The orders the registry held on the market before the seed that no snapshot showed it:
-    /// one may have reached the venue after it read the account, so the snapshot not showing
-    /// it does not place its fills (Reviewer B's P1 on PR #80).
+    /// The orders the registry held on the market before the seed, except those a resync
+    /// registered from its snapshot: one may have reached the venue after it read the account,
+    /// so the snapshot not showing it does not place its fills (Reviewer B's P1 on PR #80).
+    /// One an earlier snapshot showed is among them too: stricter than needed, the safe side.
     unsure: HashSet<ClientOrderId>,
     /// Our orders it showed, with their cumulative fill.
     shown: HashMap<ClientOrderId, Lots>,
