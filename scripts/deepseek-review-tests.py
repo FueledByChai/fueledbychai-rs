@@ -32,7 +32,8 @@ INDEX_MARK = "INDEX-MARK: 0009 secrets never enter this repository"
 
 
 class Stub:
-    """A local HTTP server: `answer(path, body)` returns (status, bytes); every request kept."""
+    """A local HTTP server: `answer(path, body)` returns (status, bytes) or (status, bytes,
+    extra headers); every request kept, a GET (a followed redirect) with body None."""
 
     def __init__(self, answer):
         self.answer, self.requests = answer, []
@@ -40,12 +41,15 @@ class Stub:
         stub = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.do_POST()
+
             def do_POST(self):
                 raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
-                body = json.loads(raw.decode("utf-8"))
+                body = json.loads(raw.decode("utf-8")) if raw else None
                 stub.requests.append({"path": self.path, "headers": dict(self.headers),
-                                      "body": body})
-                status, out = stub.answer(self.path, body)
+                                      "body": body, "method": self.command})
+                status, out, *extra = stub.answer(self.path, body)
                 if callable(out):  # a stalling or trickling peer: out() yields the pieces
                     self.send_response(status)
                     self.send_header("Content-Type", "application/json")
@@ -59,6 +63,8 @@ class Stub:
                         pass  # the client gave up, as it should
                     return
                 self.send_response(status)
+                for name, value in (extra[0] if extra else {}).items():
+                    self.send_header(name, value)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(out)))
                 self.end_headers()
@@ -593,6 +599,8 @@ class ReviewTest(unittest.TestCase):
             (findings_json(finding("F1", "P1", "", 1, "p")), "invalid file"),
             (findings_json(finding("F1", "P1", "a.rs", "12", "p")), "invalid line"),
             (findings_json(finding("F1", "P1", "a.rs", True, "p")), "invalid line"),
+            (findings_json(finding("F1", "P1", "a.rs", 0, "p")), "invalid line"),
+            (findings_json(finding("F1", "P1", "a.rs", -3, "p")), "invalid line"),
             (findings_json(finding("F1", "P1", "a.rs", 1, " ")), "invalid problem"),
             (findings_json(finding("", "P1", "a.rs", 1, "p")), "invalid id"),
             (findings_json(finding("F1", "P1", "a.rs", 1, "p", None)), "invalid fix"),
@@ -619,12 +627,60 @@ class ReviewTest(unittest.TestCase):
         self.run_review(head, DEEPSEEK_TOKEN_BUDGET="lots")
         self.assert_incomplete(head, "DEEPSEEK_TOKEN_BUDGET is not a whole number")
 
+    def test_a_setting_that_is_not_finite_is_incomplete(self):
+        """DeepSeek DS-2 on 1328157: a NaN or infinite deadline would never pass."""
+        head = self.change()
+        for name in ("DEEPSEEK_DEADLINE", "DEEPSEEK_SETUP_TIMEOUT", "DEEPSEEK_TIMEOUT",
+                     "DEEPSEEK_RETRY_DELAY"):
+            for value in ("nan", "inf", "-inf", "Infinity"):
+                self.github.requests.clear()
+                self.chat.requests.clear()
+                self.run_review(head, **{name: value})
+                self.assert_incomplete(head, "%s is not a finite number" % name)
+                self.assertEqual(self.chat.requests, [])
+        for value in ("nan", "inf"):
+            self.github.requests.clear()
+            self.run_review(head, DEEPSEEK_POST_TIMEOUT=value)
+            self.assertEqual(self.rc, 2)
+            self.assertIn("DEEPSEEK_POST_TIMEOUT is not a finite number", self.err)
+            self.assertEqual(self.comments(), [])
+
     def test_a_failed_post_exits_non_zero_without_leaking(self):
         head = self.change()
         self.github.answer = lambda path, body: (403, ("denied %s" % GH_TOKEN).encode())
         self.run_review(head)
         self.assertEqual(self.rc, 1)
         self.assertIn("posting the comment failed: HTTP 403 denied ***", self.err)
+
+    def test_a_redirect_is_not_followed_and_the_key_goes_nowhere_else(self):
+        """Reviewer B, B8: urllib's default handler follows 301, 302, 303 (and 307, 308 for
+        some methods) and copies the Authorization header to the new host. Neither the API
+        call nor the comment post follows a redirect: the key and the GitHub token reach only
+        the configured endpoint, and the other host's answer is never taken as a review."""
+        head = self.change()
+        elsewhere = Stub(lambda path, body: completion(findings_json()))
+        try:
+            for code in (301, 302, 303, 307, 308):
+                self.github.requests.clear()
+                self.chat.requests.clear()
+                self.chat.answer = lambda path, body, c=code: (
+                    c, b"{}", {"Location": elsewhere.url + "/elsewhere"})
+                self.run_review(head, DEEPSEEK_RETRIES="2")
+                self.assert_incomplete(head, "the DeepSeek API answered HTTP %d." % code)
+                self.assertEqual(len(self.chat.requests), 1)  # not retried either
+                self.assertEqual(elsewhere.requests, [])
+            self.chat.answer = lambda path, body: completion(findings_json())
+            for code in (301, 302, 303, 307, 308):
+                self.github.requests.clear()
+                self.github.answer = lambda path, body, c=code: (
+                    c, b"{}", {"Location": elsewhere.url + "/elsewhere"})
+                self.run_review(head)
+                self.assertEqual(self.rc, 1, self.out + self.err)
+                self.assertIn("posting the comment failed: HTTP %d" % code, self.err)
+                self.assertEqual(len(self.github.requests), 1)
+                self.assertEqual(elsewhere.requests, [])
+        finally:
+            elsewhere.close()
 
     def test_without_the_pull_request_context_nothing_is_posted(self):
         head = self.change()
@@ -703,6 +759,23 @@ class ReviewTest(unittest.TestCase):
         self.assertIn("head=%s status=complete findings=0" % head, self.one_comment())
         self.assertEqual(len(self.chat.requests), 1)
 
+    def test_hung_git_work_before_the_first_request_ends_in_an_incomplete_review(self):
+        """DeepSeek DS-1 on 1328157: the git work before the first request has its own bound,
+        DEEPSEEK_SETUP_TIMEOUT, so a hung git ends in a comment, not GitHub's job timeout."""
+        head = self.change()
+        bindir = self.dir / "bin"
+        bindir.mkdir()
+        hung_git = bindir / "git"
+        hung_git.write_text('#!/bin/sh\ncase "$*" in *--name-status*) exec sleep 60 ;; esac\n'
+                            'exec "%s" "$@"\n' % shutil.which("git"))
+        hung_git.chmod(0o755)
+        self.run_review(head, DEEPSEEK_SETUP_TIMEOUT="2",
+                        PATH=str(bindir) + os.pathsep + os.environ["PATH"])
+        self.assert_incomplete(head, "the git work before the first request did not finish "
+                                     "within 2 s")
+        self.assertEqual(self.chat.requests, [])
+        self.assertLess(self.elapsed, 15)
+
     def test_a_stalled_comments_api_ends_without_hanging(self):
         head = self.change()
         def stalled():
@@ -722,9 +795,10 @@ class DeadlineTest(unittest.TestCase):
         spec.loader.exec_module(module)
         minutes = re.findall(r"^\s*timeout-minutes:\s*(\d+)\s*$", WORKFLOW.read_text(), re.M)
         self.assertEqual(len(minutes), 1, minutes)
-        # Ten minutes are left for the runner, the checkout and the git work before the review.
-        self.assertLessEqual(module.DEFAULT_DEADLINE + module.DEFAULT_POST_TIMEOUT,
-                             int(minutes[0]) * 60 - 600)
+        # The git work before the first request, the requests and the post each have a bound;
+        # five minutes are left for the runner, the checkout and Python's start.
+        self.assertLessEqual(module.DEFAULT_SETUP_TIMEOUT + module.DEFAULT_DEADLINE +
+                             module.DEFAULT_POST_TIMEOUT, int(minutes[0]) * 60 - 300)
 
 
 class IsolationTest(unittest.TestCase):
