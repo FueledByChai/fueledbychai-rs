@@ -298,15 +298,11 @@ fn sent() -> Vec<(VenueCommand, String)> {
         ),
         (
             VenueCommand::ArmCancelOnDisconnect(true),
-            "deadman|rpc=11|ttl_ms=10000".to_owned(),
+            "cod|rpc=11|on=1".to_owned(),
         ),
         (
             VenueCommand::ArmCancelOnDisconnect(false),
-            "deadman|rpc=11|ttl_ms=0".to_owned(),
-        ),
-        (
-            VenueCommand::RefreshDeadMan,
-            "heartbeat|rpc=11|ttl_ms=10000".to_owned(),
+            "cod|rpc=11|on=0".to_owned(),
         ),
         (
             VenueCommand::Query(QueryOrder {
@@ -346,9 +342,8 @@ fn charge_of(cmd: &VenueCommand) -> RateCharge {
         // Both cancels name one instrument.
         VenueCommand::CancelMany(_) => weighted(OpKind::Cancel, Some(INST_A), 2),
         VenueCommand::CancelAll(_) => RateCharge::one(OpKind::CancelAll, Some(INST_B)),
-        VenueCommand::ArmCancelOnDisconnect(_) | VenueCommand::RefreshDeadMan => {
-            RateCharge::one(OpKind::Control, None)
-        }
+        VenueCommand::ArmCancelOnDisconnect(_) => RateCharge::one(OpKind::Control, None),
+        VenueCommand::RefreshDeadMan => unreachable!("the toy refreshes no dead-man timer"),
         VenueCommand::Query(q) => RateCharge::one(OpKind::Query, Some(q.inst)),
         VenueCommand::FeeQuery => RateCharge::one(OpKind::Query, None),
     }
@@ -365,7 +360,11 @@ fn every_command_kind_encodes_through_the_toy_with_a_fixed_encode_ctx() {
         .iter()
         .map(|(cmd, _)| std::mem::discriminant(cmd))
         .collect();
-    assert_eq!(kinds.len(), 10, "every VenueCommand kind is encoded");
+    assert_eq!(
+        kinds.len(),
+        9,
+        "every VenueCommand kind but a dead-man refresh is encoded"
+    );
     for (cmd, golden) in &sent {
         let encoded = encode(cmd);
         assert!(encoded.result.is_ok(), "{cmd:?}: {:?}", encoded.result);
@@ -373,10 +372,20 @@ fn every_command_kind_encodes_through_the_toy_with_a_fixed_encode_ctx() {
         // The same command under the same context encodes to the same bytes.
         assert_eq!(encode(cmd).fx, encoded.fx, "{cmd:?}");
     }
-    // The only kind refused is the account-wide cancel-all, which the toy does not declare.
-    let account = encode(&VenueCommand::CancelAll(CancelScope::Account));
-    assert_eq!(account.result, Err(NotSentReason::Unsupported));
-    assert!(account.fx.is_empty());
+    // The only kinds refused are the account-wide cancel-all and a dead-man refresh, which the
+    // toy does not declare (its cancel-on-disconnect is per connection).
+    for undeclared in [
+        VenueCommand::CancelAll(CancelScope::Account),
+        VenueCommand::RefreshDeadMan,
+    ] {
+        let refused = encode(&undeclared);
+        assert_eq!(
+            refused.result,
+            Err(NotSentReason::Unsupported),
+            "{undeclared:?}"
+        );
+        assert!(refused.fx.is_empty(), "{undeclared:?}");
+    }
 }
 
 #[test]

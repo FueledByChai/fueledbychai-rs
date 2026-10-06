@@ -78,8 +78,9 @@
 //! 0053): one [`ExecCodec`](fbc_core::ExecCodec) for the session's life, its `on_open` called on
 //! each new epoch with exactly the nonces it asks for, frames decoded inside the venue's decode
 //! scope, every event stamped and handed to the consumer's [`ExecHandler`] inline, and reconnects
-//! paced by the consumer's [`ReconnectPacing`]. Command submission, its HTTP requests, timers and
-//! keepalives, and its journal come with later tickets.
+//! paced by the consumer's [`ReconnectPacing`]. It takes only a venue whose cancel-on-disconnect
+//! is per connection, and on every epoch arms it and resyncs before it places or amends
+//! (FBC-w19, decision 0058). Its journal comes with a later ticket.
 //!
 //! Not here yet: client certificates and certificate pinning.
 //! Apart from a codec's HTTP request (its own timeout) and a session's connection attempts and
@@ -90,6 +91,7 @@ mod books;
 mod connector;
 mod epoch;
 mod error;
+mod exec_gate;
 mod exec_orders;
 mod exec_session;
 pub mod http;

@@ -61,8 +61,6 @@ pub const SYMBOL_A: &str = "TOYA-PERP";
 pub const SYMBOL_B: &str = "TOYB-PERP";
 /// The longest batch of placements or cancels the toy takes.
 pub const MAX_BATCH: u16 = 4;
-/// The dead-man timer cancel-on-disconnect arms and each refresh restarts.
-pub const DEAD_MAN_TTL: Duration = Duration::from_secs(10);
 /// The token the toy authenticates with: synthetic, of no account and no venue. It stands for
 /// a session credential, so it goes out in a redaction span and `redact_inbound` names it in
 /// the acknowledgement that echoes it (decision 0028).
@@ -136,8 +134,10 @@ pub fn caps_for(fill_ids: FillIds) -> VenueCaps {
                 }),
                 cancel_all_account: Support::Unsupported,
                 cancel_all_instrument: Support::Native,
-                cancel_on_disconnect: CancelOnDisconnect::DeadMan {
-                    max_ttl: DEAD_MAN_TTL,
+                // Protection per connection, requested again on each (FBC-w19): the order-entry
+                // session arms it after every epoch's authentication.
+                cancel_on_disconnect: CancelOnDisconnect::PerConnection {
+                    rearm_on_reconnect: true,
                 },
                 ack: AckModel::SinglePhase,
                 client_id: ClientIdFormat::Alnum {

@@ -9,10 +9,11 @@
 //! batch item or an amend) of a kind, time in force, channel or flag its caps do not declare
 //! (and as `NotSent(FlagConflict)` one combining a pair its caps declare in conflict),
 //! an amend or cancel whose only references are undeclared for it (a batch cancel's
-//! references are narrower than a single cancel's), a batch longer than its `max_items`, and an
-//! account-wide cancel-all. What cannot be written is `Unencodable`: an instrument missing from
-//! the spec table, a missing nonce, an empty batch, and an amend to its filled quantity or
-//! below, which leaves nothing to rest. A signer that fails is `SignFailed`.
+//! references are narrower than a single cancel's), a batch longer than its `max_items`, an
+//! account-wide cancel-all, and a dead-man refresh (its cancel-on-disconnect is per
+//! connection). What cannot be written is `Unencodable`: an instrument missing from the spec
+//! table, a missing nonce, an empty batch, and an amend to its filled quantity or below, which
+//! leaves nothing to rest. A signer that fails is `SignFailed`.
 
 use fbc_core::{
     AmendOrder, AmendRef, AmendWire, CancelOrder, CancelRef, CancelScope, CancelWire, Channel,
@@ -25,7 +26,7 @@ use fbc_core::{
 };
 
 use super::session::{self, Answers};
-use super::{DEAD_MAN_TTL, EXEC_STREAM, FillIds, RPC_TIMEOUT, caps_for, decode, weight};
+use super::{EXEC_STREAM, FillIds, RPC_TIMEOUT, caps_for, decode, weight};
 
 use NotSentReason::{FlagConflict, SignFailed, Unencodable, Unsupported};
 
@@ -295,18 +296,13 @@ impl ToyExec {
                 let charge = RateCharge::one(OpKind::CancelAll, Some(inst));
                 (format!("cancelall|rpc={n}|sym={sym}"), charge)
             }
-            // Cancel-on-disconnect is a dead-man timer: arming sets it, disarming clears it, and
-            // each refresh restarts it.
+            // Cancel-on-disconnect protects the orders of the connection it is asked on, until it
+            // drops; the toy has no dead-man timer, so it refreshes none.
             VenueCommand::ArmCancelOnDisconnect(on) => {
-                let ttl = if *on { DEAD_MAN_TTL.as_millis() } else { 0 };
                 let charge = RateCharge::one(OpKind::Control, None);
-                (format!("deadman|rpc={n}|ttl_ms={ttl}"), charge)
+                (format!("cod|rpc={n}|on={}", u8::from(*on)), charge)
             }
-            VenueCommand::RefreshDeadMan => {
-                let ttl = DEAD_MAN_TTL.as_millis();
-                let charge = RateCharge::one(OpKind::Control, None);
-                (format!("heartbeat|rpc={n}|ttl_ms={ttl}"), charge)
-            }
+            VenueCommand::RefreshDeadMan => return Err(Unsupported),
             VenueCommand::Query(q) => {
                 let chosen = q.reference(self.order.query_refs).ok_or(Unsupported)?;
                 let spec = specs.get(q.inst).ok_or(Unencodable)?;
