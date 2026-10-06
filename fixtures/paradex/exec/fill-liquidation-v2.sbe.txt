@@ -1,0 +1,32 @@
+# FillEvent (template 21): a LIQUIDATION at version 2: the venue closed 0.15 of a long at 61000.0; the frame carries one of our client ids, which a venue-initiated fill does not match
+# Hand-built from paradex_1_0.xml at tradeparadex/paradex-py b8248fb747e278d2167ac2f056b339a287d5ef30.
+# SYNTHETIC: the account is 32 made-up bytes (a0..bf), no Paradex account. Little-endian; '#' starts a comment.
+74 00 15 00 01 00 02 00                           # header: blockLength=116 templateId=21 (FillEvent) schemaId=1 version=2
+55 23 80 84 41 40 06 00                           # @0 ts int64 = 1759500000306005 us
+75 17 00 00 00 00 00 00                           # @8 seq int64 (optional) = 6005
+02                                                # @16 fillType uint8 = 2 (LIQUIDATION)
+02                                                # @17 side uint8 = 2 (SELL)
+02                                                # @18 liquidity uint8 = 2 (TAKER)
+00 48 55 44 8c 05 00 00                           # @19 price Price8 = 6100000000000 (61000)
+c0 e1 e4 00 00 00 00 00                           # @27 size Qty8 = 15000000 (0.15)
+18 cf 45 00 00 00 00 00                           # @35 fee Value8 = 4575000 (0.04575; positive = paid, negative = rebate)
+00 2a ee 81 fc ff ff ff                           # @43 realizedPnl Value8NULL = -15000000000 (-150)
+2d 23 80 84 41 40 06 00                           # @51 createdAt int64 = 1759500000305965 us (not read)
+a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 aa ab ac ad ae af   # @59 account [32] bytes 0-15 (SYNTHETIC, not read)
+b0 b1 b2 b3 b4 b5 b6 b7 b8 b9 ba bb bc bd be bf   # @75 account [32] bytes 16-31 (SYNTHETIC, not read)
+00 66 31 51 a3 05 00 00                           # @91 underlyingPrice Price8 = 6199000000000 (61990, not read)
+80 3c 36 fe ff ff ff ff                           # @99 realizedFunding Value8 = -30000000 (-0.3)
+00                                                # @107 flags uint8 = 0x00 (none, not read), sinceVersion 2
+75 17 00 00 00 00 00 00                           # @108 orderbookSeqNo uint64 = 6005 (not read), sinceVersion 2
+13                                                # fillId varString8 length = 19
+38 36 31 35 32 36 32 31 34 38 30 30 37 37 31 38 30 30 35 # fillId = "8615262148007718005"
+13                                                # orderId varString8 length = 19
+31 37 35 39 35 30 30 30 30 30 30 30 30 30 30 30 30 30 39 # orderId = "1759500000000000009"
+24                                                # clientOrderId varString8 length = 36
+30 31 30 30 30 37 30 30 2d 31 39 39 62 2d 38 31 61 62 2d 38 32 30 30 2d 30 30 30 35 34 64 30 61 61 33 66 35 # clientOrderId = "01000700-199b-81ab-8200-00054d0aa3f5"
+13                                                # tradeId varString8 length = 19
+39 36 31 35 32 36 32 31 34 38 30 30 37 37 31 38 30 30 35 # tradeId = "9615262148007718005"
+0c                                                # market varString8 length = 12
+42 54 43 2d 55 53 44 2d 50 45 52 50               # market = "BTC-USD-PERP"
+04                                                # feeCurrency varString8 length = 4
+55 53 44 43                                       # feeCurrency = "USDC"

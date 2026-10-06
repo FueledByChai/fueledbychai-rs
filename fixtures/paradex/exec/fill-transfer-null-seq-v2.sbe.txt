@@ -1,0 +1,30 @@
+# FillEvent (template 21): an UNWIND_TRANSFER at version 2: a position transfer of 0.05 at 62000.0 with a null seq, no order id, no client id, no fee
+# Hand-built from paradex_1_0.xml at tradeparadex/paradex-py b8248fb747e278d2167ac2f056b339a287d5ef30.
+# SYNTHETIC: the account is 32 made-up bytes (a0..bf), no Paradex account. Little-endian; '#' starts a comment.
+74 00 15 00 01 00 02 00                           # header: blockLength=116 templateId=21 (FillEvent) schemaId=1 version=2
+08 2f 80 84 41 40 06 00                           # @0 ts int64 = 1759500000309000 us
+00 00 00 00 00 00 00 80                           # @8 seq int64 (optional) = null (a position transfer carries no sequence)
+03                                                # @16 fillType uint8 = 3 (UNWIND_TRANSFER)
+01                                                # @17 side uint8 = 1 (BUY)
+fe                                                # @18 liquidity uint8 = 254 (NON_REPRESENTABLE)
+00 30 cc 8c a3 05 00 00                           # @19 price Price8 = 6200000000000 (62000)
+40 4b 4c 00 00 00 00 00                           # @27 size Qty8 = 5000000 (0.05)
+00 00 00 00 00 00 00 00                           # @35 fee Value8 = 0 (0; positive = paid, negative = rebate)
+00 d3 ce fe ff ff ff ff                           # @43 realizedPnl Value8NULL = -20000000 (-0.2)
+e0 2e 80 84 41 40 06 00                           # @51 createdAt int64 = 1759500000308960 us (not read)
+a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 aa ab ac ad ae af   # @59 account [32] bytes 0-15 (SYNTHETIC, not read)
+b0 b1 b2 b3 b4 b5 b6 b7 b8 b9 ba bb bc bd be bf   # @75 account [32] bytes 16-31 (SYNTHETIC, not read)
+00 66 31 51 a3 05 00 00                           # @91 underlyingPrice Price8 = 6199000000000 (61990, not read)
+00 00 00 00 00 00 00 00                           # @99 realizedFunding Value8 = 0 (0)
+00                                                # @107 flags uint8 = 0x00 (none, not read), sinceVersion 2
+00 00 00 00 00 00 00 00                           # @108 orderbookSeqNo uint64 = 0 (not read), sinceVersion 2
+13                                                # fillId varString8 length = 19
+38 36 31 35 32 36 32 31 34 38 30 30 37 37 31 38 30 30 36 # fillId = "8615262148007718006"
+00                                                # orderId varString8 length = 0
+00                                                # clientOrderId varString8 length = 0
+13                                                # tradeId varString8 length = 19
+39 36 31 35 32 36 32 31 34 38 30 30 37 37 31 38 30 30 36 # tradeId = "9615262148007718006"
+0c                                                # market varString8 length = 12
+42 54 43 2d 55 53 44 2d 50 45 52 50               # market = "BTC-USD-PERP"
+04                                                # feeCurrency varString8 length = 4
+55 53 44 43                                       # feeCurrency = "USDC"
