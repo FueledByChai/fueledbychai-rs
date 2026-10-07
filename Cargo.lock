@@ -461,6 +461,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fbc-examples"
+version = "0.0.1"
+dependencies = [
+ "fbc-conformance",
+ "fbc-core",
+ "fbc-runtime",
+ "fbc-venue-binance-usdm",
+ "fbc-venue-paradex",
+ "rust_decimal",
+ "tokio",
+]
+
+[[package]]
 name = "fbc-journal"
 version = "0.0.1"
 dependencies = [

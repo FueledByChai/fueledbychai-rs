@@ -6,7 +6,7 @@ with one crate per venue. The Rust counterpart of
 
 First venues: Paradex, then Hibachi; Binance USD-M futures for reference market data.
 
-Status: scaffolding. The Cargo workspace exists with eight crates:
+Status: scaffolding. The Cargo workspace exists with nine crates:
 
 | Crate | Status |
 | --- | --- |
@@ -19,8 +19,16 @@ Status: scaffolding. The Cargo workspace exists with eight crates:
 | `fbc-venue-binance-usdm` | Binance USD-M futures, market data only (the reference feed, never traded; decisions 0015, 0016): capabilities with `exec: None` and the documented rate limits (request weight per IP, messages per connection, new connections per IP), configuration for the base URLs, the partial-depth stream and the diff-depth snapshot, subscriptions planned on the `/public` combined-stream endpoint, and a codec that subscribes live and decodes `bookTicker` into touches, partial depth into complete book snapshots, and the diff-depth book anchored on a REST snapshot with its gaps, duplicates and out-of-order events detected and resynced |
 | `fbc-conformance` | A public stub venue server for tests, on 127.0.0.1 ephemeral ports: a WebSocket endpoint that plays a fault script of typed steps (accept, read, push, close, go silent, each naming its connection) and records every connection and data frame, and an HTTP/1.1 endpoint with fixed responses by path; the 340-reconnect storm script, and a check of the attempts a stub saw against the client's reconnect pacing (decision 0025); the conformance toy venue (`src/toy/`, decision 0044), so far its order entry: every command kind encoded and signed through `ExecCodec`, each declared order capability checked before signing, its order updates, fills, rejects and venue modes decoded through `DecodeScope`, and its answers: queries, batch items answered in separate frames, resyncs and authentication |
 | `fbc-venue-paradex` | The Paradex signer (`src/sign`, owner-reviewed): the SNIP-12 revision 0 typed-data hash of `Order`, `ModifyOrder` and the auth `Request` and its Stark-curve ECDSA signature with RFC 6979 nonces, behind `OrderSigner`, held to the Java library's vectors in `fixtures/paradex/signing/`. Market data (`src/md`): an SBE reader gated on each frame's stated block lengths, `bbo` and `trades` decoded into touches and trades, the `order_book` deltas channels into book events with every seq_no discontinuity reported and resynced by reconnect (0022), the REST `/orderbook` snapshot at depth 15 with offline book and bbo-touch agreement checks against the delta-built book (`tests/oracle/`), a decoder-replay test (`tests/replay.rs`) that runs the codec through a session against the conformance stub and rebuilds two markets' books byte-identically from the session's journal (0006), authentication (`src/auth`, owner-reviewed): the `/auth` login signed from `Secrets` with its signature expiry, the session token named for the journal and sent only redacted, its refresh on a configured timer, and Test Connection as a two-round plan (0048), order entry's capabilities (`src/exec`: `ExecCaps` with every value cited, the order rate limits, and the order socket's SBE schema 1:2, 0054, not yet declared by the factory), the REST resync of open orders and positions and the order query by client id from `/orders-history`, decoded whole into the resync events and a `QueryResult` (`src/exec/rest.rs`), the read-only private-stream codec, which logs in, authenticates the socket with the token in a redaction span, subscribes the orders, fills, positions and account channels once per connection, decodes them and refuses every command (`src/exec/read_only.rs`, 0061), and a `VenueFactory` declaring market data only (`exec: None`), held to hand-built frames in `fixtures/paradex/md/` and responses in `fixtures/paradex/rest/` |
+| `fbc-examples` | Owner-run sample programs, built by CI but never run against a venue: `md_watch` subscribes to a Paradex market (bbo, trades, `deltas` book) and a Binance USD-M symbol (`bookTicker`, diff-depth book) through `fbc-runtime`, keeps one book per channel, and prints a line per touch, book change, trade, feed health change and reconnect; it never sends an order or reads a credential, and its wiring is tested against the conformance stub |
 
 No venue is supported yet: Paradex has its signer, its authentication and its bbo, trades and order book market data, not yet order entry; Binance USD-M
 decodes its touch, partial depth and diff-depth book; `MdSession` makes the diff-depth book's REST snapshot request (the
 codec's `Effect::Http`, decision 0027), and `tests/replay.rs` runs that codec through a session against the
 conformance stub and rebuilds its books byte-identically by decoder replay of the session's journal (0006).
+
+To watch live market data (public channels only, no credentials):
+
+```
+cargo run -p fbc-examples --example md_watch -- --paradex BTC-USD-PERP --binance BTCUSDT
+cargo run -p fbc-examples --example md_watch -- --help
+```
