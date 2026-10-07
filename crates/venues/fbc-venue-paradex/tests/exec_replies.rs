@@ -244,14 +244,25 @@ fn a_mixed_batch_is_answered_item_by_item_in_one_call() {
         events,
         vec![
             outcome(13, item(0, Some(cid(0)), Some(vid(OID))), PROVISIONAL),
-            // The item's error is a message without a code: a refusal of that item alone.
-            outcome(
-                13,
-                item(1, Some(cid(1)), None),
-                rejected(RejectKind::Other, None, "synthetic: order rejected")
-            ),
+            // The item's error is a message without a code: no page says the venue left the
+            // item undone, so it is Unknown, as an undocumented code is (DeepSeek DS-2).
+            outcome(13, item(1, Some(cid(1)), None), SubmitOutcome::Unknown),
         ]
     );
+}
+
+#[test]
+fn a_batch_whose_every_item_errors_is_unknown_item_by_item_and_its_timeout_adds_nothing() {
+    let mut replies = sent(13, VenueCommand::PlaceBatch(vec![order(0), order(1)]));
+    let text = r#"{"jsonrpc":"2.0","result":{"results":[{"error":"synthetic a"},{"error":"synthetic b"}]},"id":13}"#;
+    assert_eq!(
+        answered(&mut replies, text),
+        vec![
+            outcome(13, item(0, Some(cid(0)), None), SubmitOutcome::Unknown),
+            outcome(13, item(1, Some(cid(1)), None), SubmitOutcome::Unknown),
+        ]
+    );
+    assert_eq!(timed_out(&mut replies, 13), vec![]);
 }
 
 #[test]

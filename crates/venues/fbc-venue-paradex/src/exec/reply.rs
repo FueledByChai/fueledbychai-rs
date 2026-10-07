@@ -12,7 +12,7 @@
 //! | Method | Result | Outcome per item |
 //! | --- | --- | --- |
 //! | `order.create` | `{"order":{..}}` (or a bare `{"id":..}`, as the Java library tolerates) | Accepted, provisional, under the order's `id` |
-//! | `order.create_batch` | `{"results":[..]}` in request order, each an `order` or an `error` message | per item: Accepted, provisional; or Rejected `Other` (a message, no code) |
+//! | `order.create_batch` | `{"results":[..]}` in request order, each an `order` or an `error` message | per item: Accepted, provisional; or `Unknown` for an error (a message, no code) |
 //! | `order.modify` | `{"order":{..}}` | Accepted, provisional: the amend is final only on its order event (0054) |
 //! | `order.cancel` | `{"order_id":..,"status":"QUEUED_FOR_CANCELLATION"}` | Accepted, provisional: queued is not done |
 //! | `order.cancel_batch` | `{"results":[{"id","status"}..]}` in request order | QUEUED_FOR_CANCELLATION accepted, provisional; ALREADY_CLOSED and NOT_FOUND refused through [`REJECT_CODES`](super::REJECT_CODES) |
@@ -27,8 +27,8 @@
 //!
 //! An error with the request's id refuses the whole request (`item: None`) as the kind its
 //! code maps to; a code [`REJECT_CODES`](super::REJECT_CODES) does not hold (an internal error,
-//! or one no page documents) is `Unknown` instead, since the venue may have acted, and so is an
-//! item status no page documents. An error with no id (absent or null) answers no request: it
+//! or one no page documents) is `Unknown` instead, since the venue may have acted, and so are an
+//! item status no page documents and a batch item's error, a message with no code. An error with no id (absent or null) answers no request: it
 //! is an [`ExecEvent::UncorrelatedError`] keeping its code. A frame with an id no request
 //! waits on (the auth frame's, a subscription's) or with neither id nor error (a channel
 //! message) is not this tracker's ([`ReplyRead::NotOurs`]).
@@ -295,14 +295,11 @@ fn answer(
                 let (vid, outcome) = match results.get(usize::from(idx)) {
                     Some(item) => match (item.get("order"), item.get("error")) {
                         (Some(_), None) => (Some(created(item, *cid, scope)?), PROVISIONAL),
+                        // A message with no code: no page says the venue left the item
+                        // undone, so it is Unknown, as an undocumented code is (0066).
                         (None, Some(error)) => {
-                            let raw = error.as_str().ok_or(Malformed("item error"))?;
-                            let reject = Reject {
-                                kind: RejectKind::Other,
-                                venue_code: None,
-                                raw: raw.into(),
-                            };
-                            (None, SubmitOutcome::Rejected(reject))
+                            error.as_str().ok_or(Malformed("item error"))?;
+                            (None, SubmitOutcome::Unknown)
                         }
                         _ => return Err(Malformed("a result is an order or an error")),
                     },

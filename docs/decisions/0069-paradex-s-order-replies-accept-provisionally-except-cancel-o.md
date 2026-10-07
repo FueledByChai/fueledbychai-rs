@@ -36,11 +36,12 @@ so a refusal the venue did not mean leaves an order resting that the OMS believe
    ALREADY_CLOSED `RejectKind::AlreadyTerminal(TerminalHint::Unspecified)` and NOT_FOUND
    `RejectKind::NotFound`, which leave the cancelled order as it was (0014 item 6). An error
    frame with the request's id refuses the whole request (`item: None`) as its code's kind. A
-   batch item's `error` message refuses that item as `RejectKind::Other` with no code, as the
-   page documents it a failure of the item.
+   batch item's `error` is a message with no code, so it is item 3's `Unknown`, not a refusal:
+   the page calls it a failure without saying the venue left the item undone (DeepSeek DS-2 on
+   PR #104).
 3. **Everything else is Unknown.** -32603 (internal error) does not say the venue left the
    request undone, so it is not in the table; it and every code or item status no page
-   documents are `SubmitOutcome::Unknown`, resolved by the Unknown ladder and never resent
+   documents, and a batch item's error message, are `SubmitOutcome::Unknown`, resolved by the Unknown ladder and never resent
    (0005). A request whose every item was reported `Unknown` from its reply gets nothing more
    at its timeout. A batch reply with fewer results than items answers its items and is
    `Unknown` for the rest, in the same call.
