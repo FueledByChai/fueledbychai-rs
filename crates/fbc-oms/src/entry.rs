@@ -33,8 +33,9 @@
 //! has seeded it yet, or a fill since could not be placed against the seed), and for a market
 //! seeded by hand ([`Registry::seed_position`](crate::Registry::seed_position)) unless the
 //! registry was built for a declared owner-assisted testnet run ([`Registry::for_testnet_run`],
-//! decision 0067). A refused call changes nothing. The registry holds the leases while the market is armed and drops them when
-//! it is disarmed; the account lease while any market is armed.
+//! decision 0067). A refused call changes nothing. The registry holds the leases while the
+//! market is armed and drops them when it is disarmed; the account lease while any market is
+//! armed.
 //!
 //! Every change of a market's armed flag or state advances its [`StateGeneration`], which an
 //! [`Authorization`](crate::Authorization) carries; a call that changes nothing does not. Lease
@@ -210,8 +211,8 @@ impl Leases {
 /// The consumer's declaration that this process is an owner-assisted testnet run, the only
 /// run in which a market seeded by hand ([`Registry::seed_position`]) may be armed (decision
 /// 0067; the owner's answer C to RB-olg-3). Given to [`Registry::for_testnet_run`] when the
-/// registry is built; nothing in the library makes one, and a consumer trading a live venue
-/// never does.
+/// registry is built; only the consumer makes one, and a consumer trading a live venue never
+/// does.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct TestnetRun {
     _declared: (),
