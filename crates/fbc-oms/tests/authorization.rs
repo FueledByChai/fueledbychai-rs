@@ -10,9 +10,12 @@
 //! submit with nothing recorded, so a kill switch turned on in the middle of a quote ladder
 //! stops its remaining authorized places. A cancel and a cancel-many still reach the gateway
 //! under the kill switch, built before it or after; the kill switch's instrument cancel-all
-//! reaches it only while 0005's I7 guard it was built under still holds (no state change, no
-//! order not ours seen on the market since). No authorization is ever issued for an
-//! account-scope cancel-all, in any state, though the venue declares one.
+//! reaches it while 0005's I7 inputs are as they were when it was built (the registry's hold of
+//! the market's exclusive lease unchanged: no disarm, no arming again, no lease names given
+//! again that uncover it; no order not ours seen on the market since), whatever else of the
+//! market's state changed: built before the kill switch went on, or under it and then the
+//! switch lifted, it is still written (Reviewer B's RB94-1). No authorization is ever issued
+//! for an account-scope cancel-all, in any state, though the venue declares one.
 //!
 //! The values are the owner's first test values: a $50 inventory cap on a synthetic market
 //! where one lot is worth $1, so 50 lots; the resting cap is $11 per side, 11 lots.
@@ -34,8 +37,9 @@ use fbc_core::{
 };
 use fbc_oms::{
     AmendRefusal, Authorization, CancelChoice, CancelEverything, CapRefusal, ControlCommand,
-    EntryState, LadderConfig, Leases, MarketCapsConfig, OmsError, OrderGateway, OrderKey, OrderOp,
-    PermittedCommand, PreTradeCaps, Registry, ResyncSnapshot, StaleAuthorization, StateRefusal,
+    EntryState, ExitKind, LadderConfig, Leases, MarketCapsConfig, OmsError, OrderGateway, OrderKey,
+    OrderOp, PermittedCommand, PreTradeCaps, Registry, ResyncSnapshot, StaleAuthorization,
+    StateRefusal,
 };
 
 const INST: InstrumentId = InstrumentId::new(1);
@@ -62,6 +66,8 @@ enum Why {
     State(InstrumentId, u64, u64),
     /// An order not ours was seen on the cancel-all's market.
     Foreign(InstrumentId),
+    /// The registry's hold of the cancel-all's market's exclusive lease changed.
+    Lease(InstrumentId),
 }
 
 impl From<StaleAuthorization> for Why {
@@ -71,6 +77,7 @@ impl From<StaleAuthorization> for Why {
                 Why::State(market, built.get(), now.get())
             }
             StaleAuthorization::ForeignSeen(market) => Why::Foreign(market),
+            StaleAuthorization::ExclusiveLeaseChanged(market) => Why::Lease(market),
         }
     }
 }
@@ -560,18 +567,138 @@ fn the_kill_switchs_cancel_everything_reaches_the_gateway_within_0005s_guards() 
     assert_eq!(gw.refused().len(), 1);
 
     // A cancel-all built, then the market disarmed (its lease dropped) before it is written:
-    // refused too, as the market's state changed since it was built.
+    // refused too, as the guard it was built under no longer holds.
     let mut reg = quoting();
     reg.kill(INST);
     let CancelEverything::CancelAll { command, .. } = reg.cancel_everything(INST, &venue()) else {
         panic!("the guard holds")
     };
-    let built = reg.entry(INST).generation().get();
     let auth = reg.authorize(ACCT, command).unwrap();
     reg.disarm(INST);
     let mut gw = Recording::default();
     gw.send(auth);
-    assert_eq!(gw.refused(), vec![stale(INST, built, built + 1)]);
+    assert_eq!(gw.refused(), vec![Why::Lease(INST)]);
+}
+
+#[test]
+fn a_cancel_all_still_reaches_the_gateway_after_a_state_change_that_leaves_0005s_i7_guard_holding()
+{
+    // Reviewer B's RB94-1 on PR #94: I7's inputs are the market's exclusive lease (armed, its
+    // held leases covered by the names now), the trustworthy resync, and the orders not ours in
+    // view. The kill switch, its lift, Flatten and Wind-down on an armed market change none of
+    // them, so a cancel-all built before them is still written: holding it back would leave
+    // our Open orders resting on a Killed market.
+    type Change = fn(&mut Registry);
+    let changes: [(&str, Change, EntryState); 4] = [
+        (
+            "kill switch",
+            |reg| {
+                reg.kill(INST);
+            },
+            EntryState::Killed,
+        ),
+        (
+            "flatten",
+            |reg| {
+                reg.flatten(INST, Leases::none()).unwrap();
+            },
+            EntryState::Exit(ExitKind::Flatten),
+        ),
+        (
+            "wind-down",
+            |reg| {
+                reg.wind_down(INST, Leases::none()).unwrap();
+            },
+            EntryState::Exit(ExitKind::WindDown),
+        ),
+        (
+            "kill switch on and lifted",
+            |reg| {
+                reg.kill(INST);
+                reg.lift_kill(INST);
+            },
+            EntryState::CancelOnly,
+        ),
+    ];
+    for (name, change, state) in changes {
+        let mut reg = quoting();
+        let mut gw = Recording::default();
+        open(&mut reg, &mut gw, bid(100, 1), "v-a");
+        let CancelEverything::CancelAll { command, .. } = reg.cancel_everything(INST, &venue())
+        else {
+            panic!("{name}: the guard holds")
+        };
+        let auth = reg.authorize(ACCT, command).unwrap();
+        let built = reg.entry(INST).generation();
+        change(&mut reg);
+        assert_eq!(reg.entry(INST).state(), state, "{name}");
+        assert!(reg.entry(INST).armed(), "{name}");
+        assert!(reg.entry(INST).generation() > built, "{name}");
+        gw.send(auth);
+        assert!(gw.refused().is_empty(), "{name}: {:?}", gw.refused());
+        assert_eq!(
+            gw.written().last(),
+            Some(&&VenueCommand::CancelAll(CancelScope::Instrument(INST))),
+            "{name}"
+        );
+    }
+
+    // Built under the kill switch, then the switch lifted before it is written: written too.
+    let mut reg = quoting();
+    let mut gw = Recording::default();
+    open(&mut reg, &mut gw, bid(100, 1), "v-a");
+    reg.kill(INST);
+    let CancelEverything::CancelAll { command, .. } = reg.cancel_everything(INST, &venue()) else {
+        panic!("the guard holds")
+    };
+    let auth = reg.authorize(ACCT, command).unwrap();
+    reg.lift_kill(INST);
+    gw.send(auth);
+    assert!(gw.refused().is_empty(), "{:?}", gw.refused());
+    assert_eq!(
+        gw.written().last(),
+        Some(&&VenueCommand::CancelAll(CancelScope::Instrument(INST)))
+    );
+}
+
+#[test]
+fn a_cancel_all_built_before_the_market_lease_was_dropped_taken_again_or_uncovered_is_refused() {
+    // What does undo I7's guard: a disarm (the lease dropped), a disarm and Start (a lease
+    // taken again since), lease names given again that no longer cover the held leases.
+    type Change = fn(Registry) -> Registry;
+    let changes: [(&str, Change); 4] = [
+        ("disarm", |mut reg| {
+            reg.disarm(INST);
+            reg
+        }),
+        ("kill switch on, then disarm", |mut reg| {
+            reg.kill(INST);
+            reg.disarm(INST);
+            reg
+        }),
+        ("disarmed and started again", |mut reg| {
+            reg.disarm(INST);
+            start(&mut reg, INST);
+            reg
+        }),
+        ("lease names given again", |reg| {
+            reg.with_lease_keys(lease_keys(NonceScope::PerAccountMonotonic))
+        }),
+    ];
+    for (name, change) in changes {
+        let mut reg = quoting();
+        let CancelEverything::CancelAll { command, .. } = reg.cancel_everything(INST, &venue())
+        else {
+            panic!("{name}: the guard holds")
+        };
+        let auth = reg.authorize(ACCT, command).unwrap();
+        let reg = change(reg);
+        let mut gw = Recording::default();
+        gw.send(auth);
+        assert_eq!(gw.refused(), vec![Why::Lease(INST)], "{name}");
+        assert!(gw.written().is_empty(), "{name}");
+        drop(reg);
+    }
 }
 
 #[test]

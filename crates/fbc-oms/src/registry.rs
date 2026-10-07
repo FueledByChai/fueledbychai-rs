@@ -295,10 +295,7 @@ impl Registry {
     /// The guard of a place, a batch or an amend built now on `market`: its state generation,
     /// checked again at submit (decision 0060).
     fn state_guard(&mut self, market: InstrumentId) -> Guard {
-        Guard {
-            state: Some(self.entries.watch(market)),
-            foreign: None,
-        }
+        Guard::state(self.entries.watch(market))
     }
 
     fn admit_placement(&self, order: &NewOrder) -> Result<(), OmsError> {
