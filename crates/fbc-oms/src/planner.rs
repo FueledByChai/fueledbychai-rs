@@ -9,9 +9,11 @@
 //! - a level wanted with no order of ours there is placed (an add, or a reducing order when
 //!   the quote reduces);
 //! - a level whose order is PendingNew or Unknown, on the Unknown ladder, has a command in
-//!   flight, an amend built and not reported sent, or a cancel waiting for its
-//!   acknowledgement, is occupied: nothing is placed, amended or replaced there until that
-//!   settles ([`HeldReason`]);
+//!   flight, or an amend built and not reported sent, is occupied: nothing is placed, amended
+//!   or replaced there until that settles ([`HeldReason`]);
+//! - a level whose order has a cancel waiting for its acknowledgement (the level was pulled
+//!   before it) is replaced, wanted again or not: the cancel is built once the acknowledgement
+//!   lands and the level waits for the order's terminal state;
 //! - a resting order whose price moved by at least the configured basis points of its price,
 //!   or whose resting quantity moved by at least the configured lots, or whose flags differ,
 //!   is changed once it is at least the configured minimum age (since the planner placed or
@@ -241,8 +243,7 @@ pub enum HeldReason {
     /// The order is PendingNew or Unknown, or on the Unknown ladder: the level is occupied
     /// until it is terminal or resting.
     Unsettled(OrdState),
-    /// An amend or cancel is in flight, an amend was built and not reported sent, or a cancel
-    /// waits for the acknowledgement.
+    /// An amend or cancel is in flight, or an amend was built and not reported sent.
     InFlight,
     /// The order differs from the quote but is younger than the minimum age.
     Young,
@@ -285,7 +286,8 @@ pub struct Refused {
 pub struct Plan {
     /// The commands, in 0005's order: cancels, reducing orders, amends, adds.
     pub commands: Vec<Planned>,
-    /// The orders whose cancel waits for their acknowledgement (built again at a later pass).
+    /// The orders whose cancel waits for their acknowledgement: tried again at every later pass
+    /// until it is built, whether or not the level is wanted again.
     pub awaiting_ack: Vec<ClientOrderId>,
     /// The levels left as they are.
     pub held: Vec<Held>,
@@ -299,7 +301,8 @@ struct Slot {
     cid: ClientOrderId,
     /// When the planner last placed or amended it.
     changed_at: MonoNs,
-    /// It is cancelled to be replaced: the level waits for its terminal state.
+    /// It is cancelled to be replaced, or its cancel waited for the acknowledgement when the
+    /// level was wanted again: the level waits for its terminal state.
     replacing: bool,
 }
 
@@ -394,6 +397,14 @@ impl ExecutionPlanner {
                 }
                 continue;
             };
+            // A cancel decided for the order and waiting for its acknowledgement is carried
+            // through: the level is replaced once the order is terminal, never left resting at
+            // the price the cancel was decided against.
+            if rec.cancel_awaits_ack() {
+                slot.replacing = true;
+                actions.push((Stage::Cancel, at, Action::Cancel(slot.cid)));
+                continue;
+            }
             if let Some(why) = unsettled(rec) {
                 plan.held.push(hold(why));
                 continue;
@@ -533,8 +544,7 @@ fn unsettled(rec: &OrderRecord) -> Option<HeldReason> {
         state if rec.unknown_since().is_some() => return Some(HeldReason::Unsettled(state)),
         _ => {}
     }
-    let in_flight =
-        rec.intent() != Intent::None || rec.amend_built().is_some() || rec.cancel_awaits_ack();
+    let in_flight = rec.intent() != Intent::None || rec.amend_built().is_some();
     in_flight.then_some(HeldReason::InFlight)
 }
 
