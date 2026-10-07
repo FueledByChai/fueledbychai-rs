@@ -43,7 +43,8 @@ use fbc_core::{
 use fbc_oms::ControlCommand;
 use fbc_runtime::{
     Connector, ExecHandler, ExecOrders, ExecSession, ExecSessionConfig, ExecSessionError,
-    IngestClock, ProxyConfig, RateLimiter, ReconnectPacing, RpcIds, SafetyReserve, WriteStall,
+    IngestClock, ProxyConfig, RateLimiter, ReconnectPacing, RpcIds, SafetyReserve, ScopeCounts,
+    WriteStall,
 };
 use tokio::time::advance;
 
@@ -1237,6 +1238,50 @@ async fn a_resync_read_the_buckets_admit_goes_out_charged_only_once() {
     let ((), run) = tokio::join!(script, session.run());
     run.unwrap();
     assert_eq!(venue.resyncs(), 1);
+}
+
+/// A venue's 429 or 418 to an order-entry session's HTTP request is counted under the scopes
+/// the request was charged to (FBC-e8i, decision 0030): the toy's account limit charges the
+/// resync read, so its 429 counts under the account, and nothing is counted as refused. On the
+/// real clock, so the read meets a local server.
+#[tokio::test]
+async fn a_429_to_an_order_entry_read_is_counted_under_the_scope_it_was_charged_to() {
+    let mut server = ScriptedWs::start().await;
+    let mut http = ScriptedHttp::start().await;
+    let venue = ReadyToy::leak();
+    let log = Log::default();
+    let url = http.url("/orders");
+    let cfg = [(HTTP_RESYNC, "1"), (HTTP_RESYNC_URL, url.as_str())];
+    let (config, _) = setup(venue, &server.url(), &cfg);
+    let rates = config.limiter.clone();
+    let keep = Keep::new(&log, &Orders::default());
+    let (mut session, control) = ExecSession::new(config, keep).unwrap();
+    let watch = rates.clone();
+    let script = async move {
+        let mut peer = server.accept().await;
+        peer.recv().await;
+        peer.send(AUTH_ACK);
+        assert_eq!(peer.recv().await, arm(1));
+        let exchange = tokio::time::timeout(Duration::from_secs(10), http.request());
+        let exchange = exchange.await.expect("the read never came");
+        exchange.answer("HTTP/1.1 429 Too Many Requests", "").await;
+        for _ in 0..1_000 {
+            if watch.counts().rejected.account == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        drop(control);
+    };
+    let ((), run) = tokio::join!(script, session.run());
+    run.unwrap();
+    let account = ScopeCounts {
+        account: 1,
+        ..ScopeCounts::default()
+    };
+    let counts = rates.counts();
+    assert_eq!(counts.rejected, account);
+    assert_eq!(counts.refused, ScopeCounts::default());
 }
 
 /// A resync read that weighs more than the buckets ever admit ends the session, as a resync
