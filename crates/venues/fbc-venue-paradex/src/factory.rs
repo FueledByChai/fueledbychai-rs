@@ -1,13 +1,20 @@
-//! The Paradex venue factory: capabilities, configuration schema and market-data plan
-//! (decisions 0003, 0015, 0016).
+//! The Paradex venue factory: capabilities, configuration schema, market-data plan, and order
+//! entry's endpoint, codec and Test Connection (decisions 0003, 0015, 0016, 0072).
 //!
-//! Paradex is market data only here until order entry lands (BT-402): [`caps`] declares
-//! `exec: None`, and there is no order-entry codec or endpoint. [`caps_with_order_entry`] is
-//! what the factory declares once they exist (FBC-xzp): the same market data with
-//! [`exec::exec_caps`] and the order rate limits (decision 0054). Each capability cites the
-//! document it comes from: docs.paradex.trade, or the SBE schema `paradex_1_0.xml` in
-//! tradeparadex/paradex-py at commit `b8248fb747e278d2167ac2f056b339a287d5ef30` ("the
-//! schema" below).
+//! [`caps`] declares Paradex's market data with order entry: [`exec::exec_caps`], the order
+//! rate limits, and the per-IP limit counting the order methods too (decision 0054).
+//! [`market_data_caps`] is the same without order entry. Each capability cites the document it
+//! comes from: docs.paradex.trade, or the SBE schema `paradex_1_0.xml` in tradeparadex/paradex-py
+//! at commit `b8248fb747e278d2167ac2f056b339a287d5ef30` ("the schema" below).
+//!
+//! Order entry (decision 0072): [`plan_exec`](VenueFactory::plan_exec) plans one WebSocket
+//! connection ([`EXEC_STREAM`]) at [`EXEC_URL`] with the SBE 1:2 negotiation;
+//! [`exec_codec`](VenueFactory::exec_codec) builds, as [`EXEC_MODE`] says, the order-entry codec
+//! ([`exec::ParadexExec`], each request awaiting its reply for [`RPC_TIMEOUT`]) or the read-only
+//! one ([`exec::ReadOnlyExec`]), handing the consumer's `Secrets` to src/auth's functions and
+//! reading none of them here. The snapshot source stays `Untrustworthy` (decision 0054): no
+//! resync seeds a Paradex position, so every place and amend is refused until a market is
+//! seeded by hand for the owner-assisted testnet run.
 
 use core::time::Duration;
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,7 +30,7 @@ use fbc_core::{
 };
 
 use crate::auth;
-use crate::exec;
+use crate::exec::{self, ParadexExec, ReadOnlyExec};
 use crate::md::book::BOOK_CHANNELS;
 use crate::md::{self, ParadexMd, sbe};
 
@@ -37,6 +44,33 @@ pub const MD_URL: &str = "paradex.md.url";
 /// `StreamId(1)`, and so on.
 pub const MD_STREAM: StreamId = StreamId(0);
 
+/// The configuration key of the order-entry WebSocket URL, without the SBE negotiation
+/// parameters, which the adapter adds: the same endpoint as market data,
+/// `wss://ws.api.prod.paradex.trade/v1` on mainnet and `wss://ws.api.testnet.paradex.trade/v1`
+/// on testnet (docs.paradex.trade, WebSocket "Introduction").
+pub const EXEC_URL: &str = "paradex.exec.url";
+
+/// The configuration key of what the order-entry session's codec may do: `orders` (place,
+/// amend, cancel, with the private channels) or `read-only` (the private channels alone, every
+/// command refused). Required: there is no default.
+pub const EXEC_MODE: &str = "paradex.exec.mode";
+
+/// The configuration key of how long an order request awaits its reply before it is `Unknown`
+/// (`2500ms` or `3s`), in the `orders` mode.
+pub const RPC_TIMEOUT: &str = "paradex.exec.rpc.timeout";
+
+/// The stream of the one order-entry connection [`plan_exec`](VenueFactory::plan_exec) plans.
+pub const EXEC_STREAM: StreamId = StreamId(0);
+
+/// What the order-entry session's codec may do ([`EXEC_MODE`]).
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum ExecMode {
+    /// `orders`: the order-entry codec ([`exec::ParadexExec`]).
+    Orders,
+    /// `read-only`: the read-only private-stream codec ([`exec::ReadOnlyExec`]).
+    ReadOnly,
+}
+
 const SCHEMA: &[FieldSpec] = &[
     FieldSpec {
         key: MD_URL,
@@ -44,6 +78,27 @@ const SCHEMA: &[FieldSpec] = &[
         unit: FieldUnit::Dimensionless,
         doc: "Public WebSocket URL (wss://), without query parameters; the adapter appends the \
               SBE negotiation (sbeSchemaId=1&sbeSchemaVersion=1).",
+    },
+    FieldSpec {
+        key: EXEC_URL,
+        scope: ConfigScope::Account,
+        unit: FieldUnit::Dimensionless,
+        doc: "Order-entry WebSocket URL (wss://), without query parameters; the adapter \
+              appends the SBE negotiation (sbeSchemaId=1&sbeSchemaVersion=2).",
+    },
+    FieldSpec {
+        key: EXEC_MODE,
+        scope: ConfigScope::Account,
+        unit: FieldUnit::Dimensionless,
+        doc: "What the order-entry session may do: orders (place, amend and cancel, with the \
+              private channels) or read-only (the private channels alone); no default",
+    },
+    FieldSpec {
+        key: RPC_TIMEOUT,
+        scope: ConfigScope::Account,
+        unit: FieldUnit::Duration,
+        doc: "how long an order request awaits its reply before it is Unknown (e.g. 2500ms or \
+              3s); read in the orders mode",
     },
     auth::REST_URL_FIELD,
     auth::CHAIN_ID_FIELD,
@@ -61,24 +116,83 @@ pub struct ParadexFactory;
 impl ParadexFactory {
     /// The public WebSocket URL from `cfg`, with the SBE negotiation parameters appended.
     pub fn md_url(cfg: &VenueConfig) -> Result<WireUrl, ConfigError> {
-        let url = cfg.get(MD_URL).ok_or(ConfigError::Missing(MD_URL))?;
-        let invalid = |reason| ConfigError::Invalid {
-            key: MD_URL,
-            reason,
-        };
-        if !url.starts_with("wss://") && !url.starts_with("ws://") {
-            return Err(invalid("not a ws:// or wss:// URL"));
+        socket_url(cfg, MD_URL, sbe::SCHEMA_VERSION)
+    }
+
+    /// The order-entry WebSocket URL from `cfg`, with the SBE 1:2 negotiation appended
+    /// ([`exec::ORDER_SBE_SCHEMA_VERSION`], decision 0054).
+    pub fn exec_url(cfg: &VenueConfig) -> Result<WireUrl, ConfigError> {
+        socket_url(cfg, EXEC_URL, exec::ORDER_SBE_SCHEMA_VERSION)
+    }
+
+    /// What the order-entry session's codec may do, from `cfg` ([`EXEC_MODE`]).
+    pub fn exec_mode(cfg: &VenueConfig) -> Result<ExecMode, ConfigError> {
+        match cfg.get(EXEC_MODE).ok_or(ConfigError::Missing(EXEC_MODE))? {
+            "orders" => Ok(ExecMode::Orders),
+            "read-only" => Ok(ExecMode::ReadOnly),
+            _ => Err(ConfigError::Invalid {
+                key: EXEC_MODE,
+                reason: "not orders or read-only",
+            }),
         }
-        if url.contains(['?', '#']) {
-            return Err(invalid(
-                "the adapter writes the query; give the URL without one",
-            ));
+    }
+
+    /// How long an order request awaits its reply, from `cfg` ([`RPC_TIMEOUT`]).
+    pub fn rpc_timeout(cfg: &VenueConfig) -> Result<Duration, ConfigError> {
+        let text = cfg
+            .get(RPC_TIMEOUT)
+            .ok_or(ConfigError::Missing(RPC_TIMEOUT))?;
+        duration(text).ok_or(ConfigError::Invalid {
+            key: RPC_TIMEOUT,
+            reason: "not a positive whole <n>s or <n>ms",
+        })
+    }
+}
+
+/// The WebSocket URL under `key` in `cfg`, with the SBE negotiation for schema version
+/// `version` appended.
+fn socket_url(cfg: &VenueConfig, key: &'static str, version: u16) -> Result<WireUrl, ConfigError> {
+    let url = cfg.get(key).ok_or(ConfigError::Missing(key))?;
+    let invalid = |reason| ConfigError::Invalid { key, reason };
+    if !url.starts_with("wss://") && !url.starts_with("ws://") {
+        return Err(invalid("not a ws:// or wss:// URL"));
+    }
+    if url.contains(['?', '#']) {
+        return Err(invalid(
+            "the adapter writes the query; give the URL without one",
+        ));
+    }
+    Ok(WireUrl::plain(format!(
+        "{url}?sbeSchemaId={}&sbeSchemaVersion={version}",
+        sbe::SCHEMA_ID,
+    )))
+}
+
+/// A positive, whole number of seconds (`<n>s`) or milliseconds (`<n>ms`).
+fn duration(text: &str) -> Option<Duration> {
+    let (digits, unit): (&str, fn(u64) -> Duration) = match text.strip_suffix("ms") {
+        Some(digits) => (digits, Duration::from_millis),
+        None => (text.strip_suffix('s')?, Duration::from_secs),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: u64 = digits.parse().ok()?;
+    (n > 0).then(|| unit(n))
+}
+
+/// The codec [`EXEC_MODE`] names for the account `creds` hold. The credentials go to src/auth's
+/// functions only: the order signer reads them ([`auth::order_signer`]), then the login takes
+/// them (`Login::new`, inside the codec).
+fn exec_codec(cfg: &VenueConfig, creds: Secrets) -> Result<Box<dyn ExecCodec>, VenueError> {
+    match ParadexFactory::exec_mode(cfg)? {
+        ExecMode::ReadOnly => Ok(Box::new(ReadOnlyExec::new(cfg, creds)?)),
+        ExecMode::Orders => {
+            let rpc_timeout = ParadexFactory::rpc_timeout(cfg)?;
+            let signer = Box::new(auth::order_signer(cfg, &creds)?);
+            let codec = ParadexExec::new(cfg, creds, signer, EXEC_STREAM, rpc_timeout)?;
+            Ok(Box::new(codec))
         }
-        Ok(WireUrl::plain(format!(
-            "{url}?sbeSchemaId={}&sbeSchemaVersion={}",
-            sbe::SCHEMA_ID,
-            sbe::SCHEMA_VERSION
-        )))
     }
 }
 
@@ -91,6 +205,7 @@ impl VenueFactory for ParadexFactory {
         SCHEMA
     }
 
+    /// [`caps`]: market data and order entry, whatever the mode.
     fn caps(&self, _cfg: &VenueConfig) -> Result<VenueCaps, ConfigError> {
         Ok(caps())
     }
@@ -154,19 +269,25 @@ impl VenueFactory for ParadexFactory {
         Box::new(ParadexMd::new(ep.stream))
     }
 
-    /// None until order entry lands (BT-402).
-    fn plan_exec(&self, _cfg: &VenueConfig) -> Result<Vec<ExecEndpoint>, VenueError> {
-        Ok(Vec::new())
+    /// One connection, [`EXEC_STREAM`] at [`ParadexFactory::exec_url`]: order entry and the
+    /// private channels share it (decision 0071), in either mode.
+    fn plan_exec(&self, cfg: &VenueConfig) -> Result<Vec<ExecEndpoint>, VenueError> {
+        let url = ParadexFactory::exec_url(cfg)?;
+        Ok(vec![ExecEndpoint {
+            stream: EXEC_STREAM,
+            url,
+        }])
     }
 
-    /// None: market data only until order entry lands (BT-402); the credentials are dropped,
-    /// and so zeroed, unread.
+    /// The order-entry codec, or the read-only one, as [`EXEC_MODE`] says; refused naming a
+    /// missing or invalid key, never a value. A refusal drops the credentials, and so zeroes
+    /// them.
     fn exec_codec(
         &self,
-        _cfg: &VenueConfig,
-        _creds: Secrets,
+        cfg: &VenueConfig,
+        creds: Secrets,
     ) -> Option<Result<Box<dyn ExecCodec>, VenueError>> {
-        None
+        Some(exec_codec(cfg, creds))
     }
 
     /// The login, then the account read with the token it gave ([`auth::connection_plan`],
@@ -201,18 +322,17 @@ fn book(channel: &'static str, includes: &[Channel]) -> BookCaps {
     }
 }
 
-/// What Paradex market data offers through this adapter, each value cited: what
-/// [`ParadexFactory`] declares until order entry is wired (FBC-xzp).
+/// What [`ParadexFactory`] declares, each value cited: [`market_data_caps`]'s market data and
+/// matching, with [`exec::exec_caps`], the per-account order limits ([`exec::order_limits`]),
+/// and the per-IP limit counting the order methods too (decision 0054).
 pub fn caps() -> VenueCaps {
-    venue_caps(None)
+    venue_caps(Some(exec::exec_caps()))
 }
 
-/// What Paradex offers with order entry: [`caps`]'s market data and matching, with
-/// [`exec::exec_caps`], the per-account order limits ([`exec::order_limits`]), and the per-IP
-/// limit counting the order methods too (decision 0054). Not yet what [`ParadexFactory`]
-/// declares: FBC-xzp wires it with the order-entry codec.
-pub fn caps_with_order_entry() -> VenueCaps {
-    venue_caps(Some(exec::exec_caps()))
+/// What Paradex market data offers through this adapter, without order entry (`exec: None`):
+/// what [`ParadexFactory`] declared before order entry was wired.
+pub fn market_data_caps() -> VenueCaps {
+    venue_caps(None)
 }
 
 /// Paradex's caps with `exec` as given; the order limits come with order entry.

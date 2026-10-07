@@ -27,7 +27,7 @@ use fbc_core::{
     VenueMeta, VenueOrderId, VenueOrderSnapshot, VenueOrderState, WallNs, dispatch,
 };
 use fbc_venue_paradex::exec::{RestAnswer, ResyncTags, query_plan, resync_plan};
-use fbc_venue_paradex::factory::caps_with_order_entry;
+use fbc_venue_paradex::factory::caps;
 use md::{BTC, ETH};
 use serde_json::Value;
 
@@ -90,10 +90,7 @@ fn ours() -> [ClientOrderId; 2] {
 }
 
 fn vid(wire: &str) -> VenueOrderId {
-    dispatch(&caps_with_order_entry(), OWN, |scope| {
-        scope.venue_order_id(wire)
-    })
-    .unwrap()
+    dispatch(&caps(), OWN, |scope| scope.venue_order_id(wire)).unwrap()
 }
 
 fn ctx() -> EncodeCtx {
@@ -140,9 +137,7 @@ fn answer(plan: HttpPlan<RestAnswer>, answers: &[Result<(u16, Vec<u8>), HttpFail
         })
         .collect();
     let mut sink = Sink::default();
-    let parsed = dispatch(&caps_with_order_entry(), OWN, |scope| {
-        plan.parse(&answers, scope)
-    });
+    let parsed = dispatch(&caps(), OWN, |scope| plan.parse(&answers, scope));
     let result = parsed.map(|step| {
         let answer = step.done().expect("a plan of one round");
         answer.push_into(&mut sink);
@@ -363,12 +358,10 @@ fn an_answer_shows_the_events_it_pushes_in_order() {
             (*tag, Ok(resp))
         })
         .collect();
-    let answer = dispatch(&caps_with_order_entry(), OWN, |scope| {
-        plan.parse(&answers, scope)
-    })
-    .unwrap()
-    .done()
-    .unwrap();
+    let answer = dispatch(&caps(), OWN, |scope| plan.parse(&answers, scope))
+        .unwrap()
+        .done()
+        .unwrap();
     let shown = answer.events().to_vec();
     let mut sink = Sink::default();
     answer.push_into(&mut sink);
@@ -389,7 +382,7 @@ fn open_orders_and_positions_decode_into_one_complete_resync_with_the_requests_w
         "a REST snapshot carries no venue sequence"
     );
     let events: Vec<ExecEvent> = events.into_iter().map(|(_, ev)| ev).collect();
-    let foreign = dispatch(&caps_with_order_entry(), OWN, |scope| {
+    let foreign = dispatch(&caps(), OWN, |scope| {
         scope.client_order_id("3f2504e0-4f89-41d3-9a0c-0305e82c3301")
     });
     // A random UUID is no canonical client id: not ours.
@@ -872,7 +865,7 @@ fn history_with(change: impl FnOnce(&mut Value)) -> Vec<u8> {
 fn a_history_answer_that_names_another_or_no_single_order_is_refused() {
     let [_, second] = ours();
     let wire_second = {
-        let caps = caps_with_order_entry();
+        let caps = caps();
         let format = caps.exec.unwrap().order.client_id;
         fbc_core::encode_cid(&format, second).unwrap()
     };

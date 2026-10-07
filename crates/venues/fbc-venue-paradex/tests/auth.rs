@@ -26,7 +26,7 @@ use fbc_venue_paradex::auth::{
     ACCOUNT_ADDRESS, CHAIN_ID, LOGIN_TAG, Login, LoginCycle, LoginError, REFRESH, REST_URL,
     SIGNATURE_LIFETIME, SIGNING_KEY, SessionToken, TIMEOUT, token_spans,
 };
-use fbc_venue_paradex::factory::{MD_URL, caps};
+use fbc_venue_paradex::factory::{EXEC_MODE, EXEC_URL, MD_URL, RPC_TIMEOUT, caps};
 
 const REST: &str = "https://api.prod.paradex.trade/v1";
 /// Made-up session tokens: the JWT alphabet, never a JWT's shape.
@@ -766,6 +766,9 @@ fn the_factory_names_every_auth_setting_in_its_schema_at_account_scope() {
         keys,
         [
             MD_URL,
+            EXEC_URL,
+            EXEC_MODE,
+            RPC_TIMEOUT,
             REST_URL,
             CHAIN_ID,
             SIGNATURE_LIFETIME,
@@ -780,8 +783,8 @@ fn the_factory_names_every_auth_setting_in_its_schema_at_account_scope() {
     for key in [SIGNATURE_LIFETIME, REFRESH, TIMEOUT] {
         assert_eq!(unit(key), FieldUnit::Duration, "{key}");
     }
-    // Market data alone is still all the venue declares (order entry is FBC-xzp).
-    assert!(ParadexFactory.caps(&cfg()).unwrap().exec.is_none());
+    // Order entry is declared (FBC-xzp, tests/factory_exec.rs).
+    assert!(ParadexFactory.caps(&cfg()).unwrap().exec.is_some());
     assert_eq!(ParadexFactory.caps(&cfg()).unwrap(), caps());
 }
 

@@ -14,7 +14,7 @@ use fbc_core::{
     VenueFactory, WallNs, dispatch_market_data,
 };
 use fbc_venue_paradex::ParadexFactory;
-use fbc_venue_paradex::factory::{MD_STREAM, MD_URL, caps};
+use fbc_venue_paradex::factory::{MD_STREAM, MD_URL, caps, market_data_caps};
 use fbc_venue_paradex::md::BBO;
 use md::{BTC, Collect, ETH, specs};
 use serde_json::Value;
@@ -143,12 +143,18 @@ fn the_url_is_configuration_and_the_adapter_writes_its_query() {
 }
 
 #[test]
-fn the_factory_declares_market_data_only_with_its_cited_limits() {
+fn the_factory_declares_market_data_with_its_cited_limits() {
     let declared = ParadexFactory.caps(&cfg()).unwrap();
     assert_eq!(declared, caps());
     assert_eq!(ParadexFactory.id(), "PARADEX");
-    assert!(declared.exec.is_none());
-    assert!(ParadexFactory.exec_codec(&cfg(), Secrets::new()).is_none());
+    // Order entry is declared too (FBC-xzp, tests/factory_exec.rs); its codec needs its
+    // settings, and says which is missing.
+    assert!(declared.exec.is_some());
+    let codec = ParadexFactory.exec_codec(&cfg(), Secrets::new());
+    let Some(Err(VenueError::Config(ConfigError::Missing(key)))) = codec else {
+        panic!("Paradex takes orders, once configured")
+    };
+    assert_eq!(key, fbc_venue_paradex::factory::EXEC_MODE);
     // Test Connection logs in (FBC-mz1, auth.rs); without its settings it says which is
     // missing.
     let tested = ParadexFactory.test_connection(&cfg(), Secrets::new());
@@ -156,7 +162,9 @@ fn the_factory_declares_market_data_only_with_its_cited_limits() {
         panic!("Paradex proves credentials, once configured")
     };
     assert_eq!(key, fbc_venue_paradex::auth::REST_URL);
-    assert_eq!(ParadexFactory.plan_exec(&cfg()), Ok(Vec::new()));
+    let planned = ParadexFactory.plan_exec(&cfg());
+    let missing = ConfigError::Missing(fbc_venue_paradex::factory::EXEC_URL);
+    assert_eq!(planned, Err(VenueError::Config(missing)));
     // Discovery and the Java-era ticker rule are not built yet (FBC-l5o): both say so.
     let ticker = ParadexFactory.parse_fbc_common_symbol("BTC/USDT");
     assert_eq!(ticker, Err(SymbolError::NoRule));
@@ -180,8 +188,9 @@ fn the_factory_declares_market_data_only_with_its_cited_limits() {
     );
     // "20 connections per second or 600 connections per minute per IP address"; the REST
     // table (Codex r4185685704): POST /auth 600 req/m per IP, private GET /* 120 req/s or
-    // 600 req/m per account, and 1500 req/m per IP across public and private requests.
-    let limits: Vec<_> = declared
+    // 600 req/m per account, and 1500 req/m per IP across public and private requests. These
+    // are market data's; what order entry adds is tests/exec_caps.rs's.
+    let limits: Vec<_> = market_data_caps()
         .limits
         .iter()
         .map(|l| (l.scope, l.ops, l.per, l.units))

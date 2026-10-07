@@ -128,7 +128,7 @@ rather than guess.
   the execution planner, 0065),
   `crates/venues/fbc-venue-paradex` with its signer (`src/sign`), SBE market data (`src/md`: bbo,
   trades and the order book), its order-entry capabilities (`src/exec`, 0054) and its factory
-  (`src/factory.rs`, market data only),
+  (`src/factory.rs`, market data and order entry, 0072),
   and `crates/venues/fbc-venue-binance-usdm` with its market-data-only factory and codec,
   and `crates/fbc-examples` with the owner-run samples; the
   rest are planned. Members are the `crates/fbc-*` and
@@ -356,7 +356,11 @@ rather than guess.
     `order.cancel_all`, `order.cancel_on_disconnect`) from the command and `EncodeCtx` only
     (`src/exec/encode.rs`, `ParadexEncoder`); the order-entry codec, `ParadexExec`, which puts
     the read-only codec's connection, the encoder, the replies (`src/exec/reply.rs`, 0069), the
-    resync and the order query together on one connection (`src/exec/codec.rs`, 0071); and, in
+    resync and the order query together on one connection (`src/exec/codec.rs`, 0071); the
+    factory's order entry: `caps()` with the `ExecCaps`, one order-entry endpoint on SBE 1:2,
+    and the order-entry or read-only codec as `paradex.exec.mode` says, its order signer from
+    `auth::order_signer` so no credential is read outside `src/auth` (`src/factory.rs`, 0072);
+    and, in
     `tests/oracle/` with `fbc-book` as a dev-dependency only, the
     BT-401 book and bbo-touch agreement checks), later `crates/venues/fbc-venue-hibachi`
     (0016).

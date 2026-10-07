@@ -22,7 +22,7 @@ use fbc_core::{
 use fbc_venue_paradex::exec::{
     TEMPLATE_ACCOUNT, TEMPLATE_POSITION, decode_account_event, decode_position_event,
 };
-use fbc_venue_paradex::factory::caps_with_order_entry;
+use fbc_venue_paradex::factory::caps;
 use md::BTC;
 
 /// The engine namespace the order-entry dispatch is lent under.
@@ -60,7 +60,7 @@ type Decoded = (Result<(), DecodeError>, Vec<(VenueMeta, ExecEvent)>);
 fn decode_position(bytes: &[u8]) -> Decoded {
     let specs = md::specs();
     let mut sink = Sink::default();
-    let result = dispatch(&caps_with_order_entry(), OWN, |scope| {
+    let result = dispatch(&caps(), OWN, |scope| {
         decode_position_event(bytes, scope, &specs, &mut sink)
     });
     (result, sink.0)
@@ -69,7 +69,7 @@ fn decode_position(bytes: &[u8]) -> Decoded {
 /// Decodes `bytes` as an `AccountEvent`, as [`decode_position`] does a position.
 fn decode_account(bytes: &[u8]) -> Decoded {
     let mut sink = Sink::default();
-    let result = dispatch(&caps_with_order_entry(), OWN, |scope| {
+    let result = dispatch(&caps(), OWN, |scope| {
         decode_account_event(bytes, scope, &mut sink)
     });
     (result, sink.0)

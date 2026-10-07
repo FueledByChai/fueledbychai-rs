@@ -19,10 +19,10 @@
 //! by [`ParadexReplies`], each venue error code mapped to a reject kind through
 //! [`REJECT_CODES`] (decision 0069). [`ParadexExec`] is the order-entry codec that sends them
 //! (decision 0071): the read-only codec's connection, which also carries the private channels,
-//! with these frames, their replies, the REST resync and the order query added. The factory
-//! declares these caps, plans the endpoint and builds the codec in FBC-xzp, until when
-//! [`ParadexFactory`](crate::ParadexFactory)'s caps stay market data only and
-//! [`caps_with_order_entry`](crate::factory::caps_with_order_entry) is what it will declare.
+//! with these frames, their replies, the REST resync and the order query added.
+//! [`ParadexFactory`](crate::ParadexFactory) declares these caps
+//! ([`caps`](crate::factory::caps)), plans the endpoint and builds this codec, or the read-only
+//! one, from the consumer's configuration and credentials (decision 0072).
 
 mod account;
 mod caps;

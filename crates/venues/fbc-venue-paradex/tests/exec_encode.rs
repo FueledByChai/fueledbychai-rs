@@ -28,7 +28,7 @@ use fbc_core::{
     TrafficClass, VenueCommand, VenueOrderId, WallNs, dispatch, encode_cid,
 };
 use fbc_venue_paradex::exec::ParadexEncoder;
-use fbc_venue_paradex::factory::caps_with_order_entry;
+use fbc_venue_paradex::factory::caps;
 use fbc_venue_paradex::sign::{OrderMessage, ParadexOrderType, ParadexSigner};
 use md::{BTC, ETH};
 use rust_decimal::Decimal;
@@ -89,10 +89,7 @@ fn uuid(seq: u64) -> String {
 }
 
 fn vid(text: &str) -> VenueOrderId {
-    dispatch(&caps_with_order_entry(), OWN, |scope| {
-        scope.venue_order_id(text)
-    })
-    .unwrap()
+    dispatch(&caps(), OWN, |scope| scope.venue_order_id(text)).unwrap()
 }
 
 /// The synthetic signer, a second instance for the expected signatures.

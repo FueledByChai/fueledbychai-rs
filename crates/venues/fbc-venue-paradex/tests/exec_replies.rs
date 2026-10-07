@@ -25,7 +25,7 @@ use fbc_core::{
     VenueCommand, VenueMeta, VenueOrderId, WallNs, dispatch,
 };
 use fbc_venue_paradex::exec::{ParadexReplies, REJECT_CODES, ReplyRead};
-use fbc_venue_paradex::factory::caps_with_order_entry;
+use fbc_venue_paradex::factory::caps;
 use md::BTC;
 
 const OWN: Namespace = Namespace::new(7);
@@ -59,10 +59,7 @@ fn cid(n: usize) -> ClientOrderId {
 }
 
 fn vid(wire: &str) -> VenueOrderId {
-    dispatch(&caps_with_order_entry(), OWN, |scope| {
-        scope.venue_order_id(wire)
-    })
-    .unwrap()
+    dispatch(&caps(), OWN, |scope| scope.venue_order_id(wire)).unwrap()
 }
 
 fn order(n: usize) -> NewOrder {
@@ -125,7 +122,7 @@ fn read(
     text: &str,
 ) -> (Result<ReplyRead, DecodeError>, Vec<ExecEvent>) {
     let mut sink = Sink::default();
-    let result = dispatch(&caps_with_order_entry(), OWN, |scope| {
+    let result = dispatch(&caps(), OWN, |scope| {
         replies.on_reply(text, scope, &mut sink)
     });
     (result, sink.0)

@@ -15,6 +15,9 @@
 //!   to mint a token. The refresh interval (Java's `paradex.jwt.refresh.seconds`, 60 s) is how
 //!   often a login is made again, because the token itself lapses long before the signed
 //!   request does.
+//! - [`order_signer`] is the order-entry codec's signer: the same account and main key, read
+//!   from the consumer's [`Secrets`] without taking them, so they can then go to the login
+//!   (decision 0072).
 //! - [`LoginCycle`] makes the logins as effects: one when started, and one each time the
 //!   refresh timer it sets after every answer fires. The timer follows the configured interval
 //!   alone, never the token's bytes, which replay blanks (0028).
@@ -180,6 +183,42 @@ fn hex_felt(text: &str) -> Option<Felt> {
     message_felt(text).ok()
 }
 
+/// The account `address` names and its signer on `chain_id`, signing with `key`.
+fn account_signer(
+    chain_id: Felt,
+    address: &Secret,
+    key: &Secret,
+) -> Result<(Felt, ParadexSigner), ConfigError> {
+    let account = hex_felt(address.expose()).ok_or(invalid(
+        ACCOUNT_ADDRESS,
+        "not 0x and hex digits below the prime",
+    ))?;
+    let key = StarkKey::from_hex(key.expose()).map_err(|err| match err {
+        crate::sign::KeyError::NotHex => invalid(SIGNING_KEY, "not 0x and hex digits"),
+        crate::sign::KeyError::OutOfRange => invalid(SIGNING_KEY, "not a Stark key in range"),
+    })?;
+    Ok((account, ParadexSigner::new(account, chain_id, key)))
+}
+
+/// The order signer for the account `creds` hold, on the chain `cfg` names (decision 0072):
+/// the account and the main key the login takes ([`Login::new`]), read without being taken, so
+/// `creds` can then go to the login. Refused naming a missing or invalid key, never a value.
+pub fn order_signer(cfg: &VenueConfig, creds: &Secrets) -> Result<ParadexSigner, VenueError> {
+    let chain_id = chain(cfg)?;
+    let get = |key| creds.get(key).ok_or(ConfigError::Missing(key));
+    let (address, key) = (get(ACCOUNT_ADDRESS)?, get(SIGNING_KEY)?);
+    Ok(account_signer(chain_id, address, key)?.1)
+}
+
+/// The chain id `cfg` names.
+fn chain(cfg: &VenueConfig) -> Result<Felt, ConfigError> {
+    let text = cfg.get(CHAIN_ID).ok_or(ConfigError::Missing(CHAIN_ID))?;
+    chain_felt(text).ok_or(invalid(
+        CHAIN_ID,
+        "not 0x and hex digits, decimal digits or a chain name",
+    ))
+}
+
 /// A chain id: hex, decimal, or a name of capitals, digits and underscores (a short string).
 fn chain_felt(text: &str) -> Option<Felt> {
     if text.starts_with("0x") {
@@ -321,10 +360,7 @@ impl Login {
     pub fn new(cfg: &VenueConfig, mut creds: Secrets) -> Result<Login, VenueError> {
         let get = |key| cfg.get(key).ok_or(ConfigError::Missing(key));
         let rest = rest_base(get(REST_URL)?)?;
-        let chain_id = chain_felt(get(CHAIN_ID)?).ok_or(invalid(
-            CHAIN_ID,
-            "not 0x and hex digits, decimal digits or a chain name",
-        ))?;
+        let chain_id = chain(cfg)?;
         let interval =
             |key| duration(get(key)?).ok_or(invalid(key, "not a positive whole <n>s or <n>ms"));
         let lifetime = interval(SIGNATURE_LIFETIME)?;
@@ -339,17 +375,10 @@ impl Login {
 
         let mut take = |key| creds.take(key).ok_or(ConfigError::Missing(key));
         let (address, key) = (take(ACCOUNT_ADDRESS)?, take(SIGNING_KEY)?);
-        let account = hex_felt(address.expose()).ok_or(invalid(
-            ACCOUNT_ADDRESS,
-            "not 0x and hex digits below the prime",
-        ))?;
-        let key = StarkKey::from_hex(key.expose()).map_err(|err| match err {
-            crate::sign::KeyError::NotHex => invalid(SIGNING_KEY, "not 0x and hex digits"),
-            crate::sign::KeyError::OutOfRange => invalid(SIGNING_KEY, "not a Stark key in range"),
-        })?;
+        let (account, signer) = account_signer(chain_id, &address, &key)?;
         Ok(Login {
             account: Secret::new(account.to_hex_string()),
-            signer: ParadexSigner::new(account, chain_id, key),
+            signer,
             rest,
             lifetime,
             refresh,

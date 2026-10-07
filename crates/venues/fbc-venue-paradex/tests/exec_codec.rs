@@ -37,7 +37,7 @@ use fbc_venue_paradex::exec::{
     CONTROL_IDS, LOGIN_REQUEST, PRIVATE_CHANNELS, ParadexEncoder, ParadexExec, REFRESH_TIMER,
     decode_order_event, decode_order_query, decode_resync,
 };
-use fbc_venue_paradex::factory::caps_with_order_entry;
+use fbc_venue_paradex::factory::caps;
 use md::BTC;
 use serde_json::Value;
 
@@ -164,10 +164,7 @@ fn uuid(n: usize) -> String {
 }
 
 fn vid(wire: &str) -> VenueOrderId {
-    dispatch(&caps_with_order_entry(), OWN, |scope| {
-        scope.venue_order_id(wire)
-    })
-    .unwrap()
+    dispatch(&caps(), OWN, |scope| scope.venue_order_id(wire)).unwrap()
 }
 
 fn place() -> VenueCommand {
@@ -235,7 +232,7 @@ fn answer(
 ) -> Call {
     let specs = md::specs();
     let (mut sink, mut fx) = (Sink::default(), Effects::new());
-    let result = dispatch(&caps_with_order_entry(), OWN, |scope| {
+    let result = dispatch(&caps(), OWN, |scope| {
         codec.on_http(tag, resp, scope, &specs, &mut sink, &mut fx)
     });
     Call {
@@ -248,7 +245,7 @@ fn answer(
 fn frame(codec: &mut ParadexExec, f: RawFrame<'_>) -> Call {
     let specs = md::specs();
     let (mut sink, mut fx) = (Sink::default(), Effects::new());
-    let result = dispatch(&caps_with_order_entry(), OWN, |scope| {
+    let result = dispatch(&caps(), OWN, |scope| {
         codec.on_frame(STREAM, f, scope, &specs, &mut sink, &mut fx)
     });
     Call {
@@ -559,7 +556,7 @@ fn a_command_while_no_connection_is_authenticated_is_not_sent_and_falls_back_to_
     let auth: Value = serde_json::from_slice(frame.bytes()).unwrap();
     let specs = md::specs();
     let mut sink = Sink::default();
-    dispatch(&caps_with_order_entry(), OWN, |scope| {
+    dispatch(&caps(), OWN, |scope| {
         codec.on_frame(
             StreamId(9),
             RawFrame::Text(&reply(auth["id"].as_u64().unwrap())),
@@ -662,7 +659,7 @@ fn the_resync_reads_orders_and_positions_with_the_token_only_in_a_redacted_heade
     assert!(second.fx.is_empty());
     // The two decoded whole, at the watermark of the context the reads were built with.
     let specs = md::specs();
-    let direct = dispatch(&caps_with_order_entry(), OWN, |scope| {
+    let direct = dispatch(&caps(), OWN, |scope| {
         decode_resync(ctx().wall, &orders, &positions, scope, &specs)
     })
     .unwrap();
@@ -698,7 +695,7 @@ fn the_order_query_is_the_orders_history_read_with_the_token_only_in_a_redacted_
     let VenueCommand::Query(q) = &cmd else {
         unreachable!()
     };
-    let direct = dispatch(&caps_with_order_entry(), OWN, |scope| {
+    let direct = dispatch(&caps(), OWN, |scope| {
         decode_order_query(RpcId(12), q, &body, scope, &specs)
     })
     .unwrap();
@@ -979,7 +976,7 @@ fn private_events_decode_on_the_same_connection() {
     let bytes = sbe("order-new-v1.sbe.txt");
     let specs: SpecTable = md::specs();
     let mut direct = Sink::default();
-    dispatch(&caps_with_order_entry(), OWN, |scope| {
+    dispatch(&caps(), OWN, |scope| {
         decode_order_event(&bytes, scope, &specs, &mut direct)
     })
     .unwrap();

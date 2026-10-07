@@ -74,3 +74,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0069](0069-paradex-s-order-replies-accept-provisionally-except-cancel-o.md) Paradex's order replies accept provisionally except cancel-on-disconnect's, refuse by a table keyed by code, and leave every other error Unknown — accepted
 - [0070](0070-an-amend-replaced-in-flight-and-not-yet-settled-occupies-its.md) An amend replaced in flight and not yet settled occupies its level, augmenting 0065 — accepted
 - [0071](0071-paradex-order-entry-and-the-private-channels-share-one-conne.md) Paradex order entry and the private channels share one connection, the codec's own JSON-RPC ids start at 2^52, and a failed resync read reconnects — accepted
+- [0072](0072-paradex-s-factory-builds-the-order-entry-or-the-read-only-co.md) Paradex's factory builds the order-entry or the read-only codec as a required mode key says, on one endpoint, signing orders with the login's main key — accepted
