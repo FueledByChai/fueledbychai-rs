@@ -84,7 +84,8 @@ impl From<StaleAuthorization> for Why {
 
 /// A gateway that runs fbc-oms's check at submit immediately before it would encode, as a live
 /// gateway does (decision 0060), and records what it would have written. A refused one is
-/// reported not sent with a stand-in reason: the reason a live session reports is FBC-j5bw's.
+/// reported `NotSent(StaleAuthorization)`, as fbc-runtime's order-entry session reports it
+/// (decision 0062).
 #[derive(Default)]
 struct Recording {
     seen: Vec<Seen>,
@@ -150,7 +151,7 @@ impl OrderGateway for Recording {
                 self.seen.push(Seen::Refused(why.into()));
                 SubmitHandle {
                     rpc,
-                    receipt: Err(NotSentReason::Unsupported),
+                    receipt: Err(NotSentReason::StaleAuthorization),
                 }
             }
         }
@@ -369,8 +370,8 @@ fn a_place_authorized_before_the_kill_switch_went_on_is_refused_at_submit_with_n
         assert_eq!(auth.generation().get(), built);
         assert_eq!(
             gw.send(auth).receipt,
-            Err(NotSentReason::Unsupported),
-            "the recording gateway's stand-in for not sent"
+            Err(NotSentReason::StaleAuthorization),
+            "the reason the order-entry session reports (decision 0062)"
         );
     }
     assert_eq!(gw.written().len(), 2);
