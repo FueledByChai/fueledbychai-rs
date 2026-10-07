@@ -46,9 +46,13 @@ authorization (0045, 0060) already exist; the planner must go through them, neve
    replacement while the old order may rest, so the cost comparison of N amends against a
    cancel batch plus a create batch is FBC-hht's with batching.
 5. **Occupied levels.** A level whose order is PendingNew or Unknown, on the Unknown ladder,
-   with an amend or cancel in flight, an amend built and not reported sent, or a cancel waiting
-   for its acknowledgement, gets no place, amend or replace until that settles. A level no
-   longer wanted has its order cancelled unless a cancel is already in flight.
+   with an amend or cancel in flight, or an amend built and not reported sent, gets no place,
+   amend or replace until that settles. A level no longer wanted has its order cancelled unless
+   a cancel is already in flight. A cancel waiting for the order's acknowledgement is carried
+   through whether or not the level is wanted again: the planner tries it at every pass, builds
+   it once the acknowledgement lands, and the level waits for the order's terminal state before
+   anything is placed there, so a pulled order never rests at its old price. The consumer need
+   not drive `Registry::cancels_due` for the planner's orders.
 6. **The order and the checks.** One pass decides every level first, then builds in 0005's
    order (cancels, then places and amends that reduce, then amends, then adds; each group by
    side, bids first, then level), so each command is judged with the earlier ones counted.

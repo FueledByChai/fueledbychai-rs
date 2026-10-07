@@ -752,6 +752,51 @@ fn a_level_no_longer_wanted_is_cancelled_once_and_its_order_awaits_its_acknowled
     assert_eq!(p.order_at(INST, Side::Buy, 0), None);
 }
 
+/// Reviewer A RA103-1, Reviewer B RB-0j3-1 (PR #103): a level pulled before its order's
+/// acknowledgement and wanted again has its cancel carried through, then the new quote placed;
+/// the order is never left resting at its old price.
+#[test]
+fn a_level_pulled_before_the_acknowledgement_and_wanted_again_is_cancelled_then_placed() {
+    let mut reg = quoting(WIDE, 0);
+    let mut mint = mint();
+    let mut p = planner();
+    let first = plan_and_send(
+        &mut p,
+        &book().with(Side::Buy, 0, quote(10_000, 5)),
+        &mut reg,
+        &amending(),
+        &mut mint,
+        MonoNs(0),
+    );
+    let old = first.commands[0].cid;
+    // Pulled before the acknowledgement: the cancel waits for it.
+    let pulled = plan_and_send(&mut p, &book(), &mut reg, &amending(), &mut mint, LATER);
+    assert_eq!(pulled.awaiting_ack, vec![old]);
+    // Wanted again at a new price, still unacknowledged: the cancel still waits.
+    let moved = book().with(Side::Buy, 0, quote(10_020, 5));
+    let again = plan_and_send(&mut p, &moved, &mut reg, &amending(), &mut mint, LATER);
+    assert!(again.commands.is_empty());
+    assert_eq!(again.awaiting_ack, vec![old]);
+    // Acknowledged: the cancel is built, not an amend and not a hold.
+    ack(&mut reg, old, "v-Buy-0");
+    let plan = plan_and_send(&mut p, &moved, &mut reg, &amending(), &mut mint, LATER);
+    assert_eq!(shape(&plan), vec![(Stage::Cancel, "cancel", Side::Buy, 0)]);
+    assert_eq!(plan.commands[0].cid, old);
+    assert!(plan.held.is_empty() && plan.awaiting_ack.is_empty());
+    // Sent: the level is replacing until the old order is terminal.
+    let waiting = plan_and_send(&mut p, &moved, &mut reg, &amending(), &mut mint, LATER);
+    assert!(waiting.commands.is_empty());
+    assert_eq!(held(&waiting), vec![(Side::Buy, 0, HeldReason::Replacing)]);
+    // Terminal: the wanted quote is placed.
+    cancelled(&mut reg, old, Side::Buy, "v-Buy-0", 10);
+    let placed = plan_and_send(&mut p, &moved, &mut reg, &amending(), &mut mint, LATER);
+    assert_eq!(shape(&placed), vec![(Stage::Add, "place", Side::Buy, 0)]);
+    match placed.commands[0].auth.command() {
+        VenueCommand::Place(o) => assert_eq!(o.kind, OrderKind::Limit { px: Ticks(10_020) }),
+        other => panic!("expected a place, got {other:?}"),
+    }
+}
+
 #[test]
 fn an_order_is_changed_only_past_a_threshold_and_once_it_is_the_minimum_age() {
     let mut reg = quoting(WIDE, 0);
