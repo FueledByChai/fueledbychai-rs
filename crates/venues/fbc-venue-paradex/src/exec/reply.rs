@@ -289,7 +289,7 @@ const PROVISIONAL: SubmitOutcome = SubmitOutcome::Accepted {
 };
 
 /// Member `name` of `object`, absent when it is JSON `null` (module documentation).
-fn member<'a>(object: &'a Value, name: &str) -> Option<&'a Value> {
+pub(super) fn member<'a>(object: &'a Value, name: &str) -> Option<&'a Value> {
     object.get(name).filter(|value| !value.is_null())
 }
 

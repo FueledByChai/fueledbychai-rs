@@ -1056,3 +1056,90 @@ fn no_call_asks_for_a_nonce_and_the_codec_shows_no_credential() {
     let err = ParadexExec::new(&partial, creds(), signer, STREAM, RPC_TIMEOUT).unwrap_err();
     assert_eq!(err, VenueError::Config(ConfigError::Missing(REFRESH)));
 }
+
+/// `reply` with `"<name>": null` beside its members, as Paradex may write the member it does
+/// not fill.
+fn with_null(reply: &str, name: &str) -> String {
+    let at = reply.rfind("\"id\":").expect("a reply with an id");
+    format!("{}\"{name}\":null,{}", &reply[..at], &reply[at..])
+}
+
+#[test]
+fn an_auth_and_a_subscribe_reply_read_a_json_null_error_or_result_as_absent() {
+    // A result beside "error": null is the result: the auth reply authenticates, each
+    // subscribe reply is consumed, and a command is then encoded.
+    let mut codec = fresh();
+    open(&mut codec);
+    let body = login_body(TOKEN);
+    let auth = auth_frame(
+        &answer(&mut codec, LOGIN_REQUEST, ok(body.as_bytes())).fx,
+        TOKEN,
+    );
+    let call = text(&mut codec, &with_null(&reply(auth), "error"));
+    call.result.unwrap();
+    assert_eq!(
+        call.events,
+        [ExecEvent::Conn {
+            stream: STREAM,
+            state: ConnState::Authenticated
+        }]
+    );
+    let subs = sends(&call.fx);
+    assert_eq!(subs.len(), PRIVATE_CHANNELS.len());
+    for (json, _) in subs {
+        let id = json["id"].as_u64().unwrap();
+        let channel = json["params"]["channel"].as_str().unwrap();
+        let call = text(&mut codec, &with_null(&subscribed(id, channel), "error"));
+        call.result.unwrap();
+        assert!(call.events.is_empty() && call.fx.is_empty());
+    }
+    let (result, _) = encode(&mut codec, &place(), RpcId(1));
+    result.unwrap();
+    // An error beside "result": null is that error: the auth reply is refused with its code.
+    let mut codec = fresh();
+    open(&mut codec);
+    let auth = auth_frame(
+        &answer(&mut codec, LOGIN_REQUEST, ok(body.as_bytes())).fx,
+        TOKEN,
+    );
+    let refused = with_null(&error(auth, 40111, "Invalid Bearer Token"), "result");
+    let call = text(&mut codec, &refused);
+    call.result.unwrap();
+    assert_eq!(reconnects(&call.fx), 1);
+    let [
+        ExecEvent::UncorrelatedError(reject),
+        ExecEvent::Conn { state, .. },
+    ] = call.events.as_slice()
+    else {
+        panic!("{:?}", call.events)
+    };
+    assert_eq!(
+        (reject.venue_code.as_deref(), *state),
+        (Some("40111"), ConnState::Closed)
+    );
+    not_sent(&mut codec, &place(), RpcId(1), NotSentReason::Disconnected);
+    // And a subscribe reply's.
+    let mut codec = fresh();
+    open(&mut codec);
+    let auth = auth_frame(
+        &answer(&mut codec, LOGIN_REQUEST, ok(body.as_bytes())).fx,
+        TOKEN,
+    );
+    let subs = sends(&text(&mut codec, &reply(auth)).fx);
+    let sub = subs[0].0["id"].as_u64().unwrap();
+    let refused = with_null(&error(sub, -32602, "Invalid parameters"), "result");
+    let call = text(&mut codec, &refused);
+    call.result.unwrap();
+    assert_eq!(reconnects(&call.fx), 1);
+    let [
+        ExecEvent::UncorrelatedError(reject),
+        ExecEvent::Conn { state, .. },
+    ] = call.events.as_slice()
+    else {
+        panic!("{:?}", call.events)
+    };
+    assert_eq!(
+        (reject.venue_code.as_deref(), *state),
+        (Some("-32602"), ConnState::Closed)
+    );
+}
