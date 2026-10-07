@@ -21,7 +21,10 @@
 //!   cancelled, the level then waiting for the order's terminal state before the new order is
 //!   placed, so the old order counts as resting and as exposure until it is terminal and the
 //!   new one from when it is built (0005's I6);
-//! - a level no longer wanted (or wanted at quantity zero) has its order cancelled.
+//! - a level no longer wanted (or wanted at quantity zero) has its order cancelled;
+//! - in a market in Exit, an order on a side that does not reduce the position (either side
+//!   while the position is flat or unknown) is cancelled, wanted or not: Exit builds nothing
+//!   there, so the planner never leaves it resting nor tries to amend it (0063).
 //!
 //! The commands come out in 0005's order: cancels, then reducing orders (places and amends
 //! that reduce), then amends, then adds, each group in side (bids first) and level order, and
@@ -45,6 +48,7 @@ use fbc_core::{
     NewOrder, OrderCaps, OrderKind, Side, Ticks, Tif,
 };
 
+use crate::entry::EntryState;
 use crate::grant::Authorization;
 use crate::permit::{self, AmendRefusal, CancelChoice, PermitRefusal, PermittedCommand};
 use crate::record::{Intent, OrdState, OrderRecord};
@@ -362,6 +366,16 @@ impl ExecutionPlanner {
         // An order seen terminal frees its level.
         slots.retain(|_, slot| reg.get(slot.cid).is_some_and(|r| !r.state().is_terminal()));
 
+        // In Exit, the side that reduces the known position; none while it is flat or unknown,
+        // when every order adds to it (0063).
+        let exit_reduces = matches!(reg.entry(market).state(), EntryState::Exit(_)).then(|| {
+            reg.position(market).and_then(|pos| match pos.0.signum() {
+                1 => Some(Side::Sell),
+                -1 => Some(Side::Buy),
+                _ => None,
+            })
+        });
+
         let mut plan = Plan::default();
         let mut actions: Vec<(Stage, Level, Action)> = Vec::new();
         let levels: BTreeSet<Level> = slots.keys().chain(desired.levels.keys()).copied().collect();
@@ -387,7 +401,10 @@ impl ExecutionPlanner {
                 cid: slot.cid,
                 why,
             };
-            let Some(q) = want.filter(|_| !slot.replacing) else {
+            // In Exit, an order on a side that does not reduce the position is cancelled
+            // whatever the book wants there: Exit builds nothing on that side (0063).
+            let adds_in_exit = exit_reduces.is_some_and(|reduces| reduces != Some(at.side()));
+            let Some(q) = want.filter(|_| !slot.replacing && !adds_in_exit) else {
                 if matches!(rec.intent(), Intent::PendingCancel { .. }) {
                     if slot.replacing {
                         plan.held.push(hold(HeldReason::Replacing));

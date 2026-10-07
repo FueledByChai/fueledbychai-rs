@@ -63,6 +63,15 @@ authorization (0045, 0060) already exist; the planner must go through them, neve
 7. **The consumer reports what it sends.** As for any command, the consumer reports a place's
    outcome, an amend's `Registry::amend_sent` and a cancel's `Registry::cancel_sent` before the
    next pass; a cancel not reported sent is built again at the next pass.
+8. **Exit cancels what adds.** In a market in Exit, the planner cancels each order it holds on
+   a side that does not reduce the position, whatever the desired book wants at that level:
+   the side that adds to it, and both sides while the position is flat or unknown (0063's
+   Consequences). It never leaves such an order resting and never tries to amend it, since
+   Exit would refuse the amend; a quote the book still wants there is placed once the order is
+   terminal and is then refused by Exit's admission like any order. Orders on the reducing
+   side are planned as in any state, each place and amend judged by Exit's admission; one
+   placed there before Exit that is unmarked, or larger than the position, is left as it is
+   for now (FBC-mfcm).
 
 ## Alternatives
 
@@ -75,6 +84,9 @@ authorization (0045, 0060) already exist; the planner must go through them, neve
 - Place the replacement while the old order's cancel is in flight (counting both): deferred to
   FBC-hht, where batching makes it cheaper; awaiting the terminal state never doubles the
   exposure a level may hold.
+- In Exit, leave an order on the adding side to the consumer (an empty book side) or refuse
+  its amend and leave it resting: rejected. It can fill and grow the position the owner asked
+  to exit, and 0063 assigns its cancel to the planner.
 - Let the planner manage every order on the market, including ones it did not place: rejected.
   Orphans are 0005's I7 and the resync's (0055); the consumer's own orders are the consumer's.
 
@@ -89,6 +101,8 @@ authorization (0045, 0060) already exist; the planner must go through them, neve
 
 ## What would show this was wrong
 
+- An order the planner placed left resting in Exit on a side that does not reduce the
+  position, after a pass over that market.
 - A replacement left empty for so long that the quote's time at the touch matters, on a venue
   where an amend or a cancel-and-create batch would have kept it: then FBC-hht's cost
   comparison is needed earlier.

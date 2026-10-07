@@ -5,7 +5,8 @@
 //! new one is placed, the old order counted as resting and as exposure until it is terminal
 //! and the new one from when it is built; a level whose order is PendingNew or Unknown is
 //! occupied until it is terminal; and no place or amend is built for a market in Cancel-only
-//! or Killed, or for an item over a cap, while cancels still are.
+//! or Killed, or for an item over a cap, while cancels still are; and in Exit every order on a
+//! side that does not reduce the position is cancelled.
 //!
 //! The values are the owner's first test values: a $50 inventory cap on a synthetic market
 //! where one lot is worth $1, so 50 lots; the resting cap is $11 per side, 11 lots, where a
@@ -19,18 +20,18 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use arm::{leases, start};
-use common::{lease_dir, lots, order_caps, vid};
+use common::{cid, fill, fill_id, lease_dir, lots, order_caps, placement, vid};
 use fbc_core::{
     AccountKey, AckLevel, AmendAck, AmendCaps, AmendQty, Bps, CancelReason, Channel, CidMatch,
-    CidMint, ClientOrderId, InstrumentId, ItemRef, Lots, MonoNs, Namespace, NamespaceLease,
-    OrderCaps, OrderKind, OrderRef, OrderUpdate, RefKind, RpcId, Side, SignedLots, SubmitOutcome,
-    TagSet, Ticks, Tif, VenueCommand, VenueOrderState, WallNs,
+    CidMint, ClientOrderId, ExchNs, ExchTsKind, FillIdent, InstrumentId, ItemRef, Lots, MonoNs,
+    Namespace, NamespaceLease, OrderCaps, OrderKind, OrderRef, OrderUpdate, RefKind, RpcId, Side,
+    SignedLots, SubmitOutcome, TagSet, Ticks, Tif, VenueCommand, VenueOrderState, WallNs,
 };
 use fbc_oms::{
-    AmendRefusal, CapRefusal, DesiredBook, DesiredQuote, ExecutionPlanner, ExitRefusal, HeldReason,
-    LadderConfig, MarketCapsConfig, OmsError, OrdState, OrderKey, OrderOp, Plan, PlanRefusal,
-    PlannerConfig, PlannerConfigError, PreTradeCaps, Refused, Registry, ResyncSnapshot, Stage,
-    StateRefusal,
+    Admission, AmendRefusal, CapRefusal, DesiredBook, DesiredQuote, ExecutionPlanner, ExitRefusal,
+    FillLedger, FillRouted, FillTime, HeldReason, LadderConfig, LedgerConfig, MarketCapsConfig,
+    OmsError, OrdState, OrderKey, OrderOp, Plan, PlanRefusal, PlannerConfig, PlannerConfigError,
+    PreTradeCaps, Refused, Registry, ResyncSnapshot, Stage, StateRefusal,
 };
 
 const INST: InstrumentId = InstrumentId::new(1);
@@ -906,6 +907,159 @@ fn a_market_in_exit_gets_only_its_exit_orders() {
             )))
         )]
     );
+}
+
+/// Moves the Quoting market `INST` to Exit by the owner's Flatten.
+fn flatten(reg: &mut Registry) {
+    reg.disarm(INST);
+    let given = leases(reg, INST);
+    reg.flatten(INST, given).unwrap();
+}
+
+#[test]
+fn a_market_in_exit_has_its_order_on_the_side_that_adds_to_the_position_cancelled() {
+    // Long 10: a bid and a reduce-only ask placed and acknowledged while Quoting, then Flatten.
+    // Whether the desired bid is unchanged or moved, the bid is cancelled, never left resting
+    // nor tried as an amend; the ask, which reduces, stays.
+    let quoted =
+        book()
+            .with(Side::Buy, 0, quote(10_000, 5))
+            .with(Side::Sell, 0, reducing(quote(10_010, 5)));
+    let moved = quoted.clone().with(Side::Buy, 0, quote(9_990, 5));
+    for desired in [&quoted, &moved] {
+        let mut reg = quoting(WIDE, 10);
+        let mut mint = mint();
+        let mut p = planner();
+        open_book(&mut p, &quoted, &mut reg, &amending(), &mut mint);
+        let bid = p.order_at(INST, Side::Buy, 0).unwrap();
+        let ask = p.order_at(INST, Side::Sell, 0).unwrap();
+        flatten(&mut reg);
+        let plan = plan_and_send(&mut p, desired, &mut reg, &amending(), &mut mint, LATER);
+        assert_eq!(shape(&plan), vec![(Stage::Cancel, "cancel", Side::Buy, 0)]);
+        assert_eq!(plan.commands[0].cid, bid);
+        assert!(refused(&plan).is_empty());
+        // Its cancel in flight, nothing more is built for it.
+        let plan = plan_and_send(&mut p, desired, &mut reg, &amending(), &mut mint, LATER);
+        assert!(plan.commands.is_empty());
+        assert!(refused(&plan).is_empty());
+        // Once it is terminal, the desired bid is refused as any order adding in Exit is.
+        cancelled(&mut reg, bid, Side::Buy, &venue_id(Side::Buy, 0), 10);
+        let plan = p.plan(desired, &mut reg, &amending(), ACCT, &mut mint, LATER);
+        assert!(plan.commands.is_empty());
+        assert_eq!(
+            refused(&plan),
+            vec![(
+                Side::Buy,
+                0,
+                PlanRefusal::Place(OmsError::State(StateRefusal::Exit(
+                    ExitRefusal::Increasing {
+                        inst: INST,
+                        side: Side::Buy
+                    }
+                )))
+            )]
+        );
+        assert_eq!(p.order_at(INST, Side::Buy, 0), None);
+        assert_eq!(p.order_at(INST, Side::Sell, 0), Some(ask));
+        assert_eq!(reg.get(ask).unwrap().state(), OrdState::Open);
+    }
+}
+
+#[test]
+fn a_market_in_exit_has_every_order_cancelled_while_its_position_is_flat() {
+    // Flat: every order adds to the position, so Flatten cancels both sides.
+    let mut reg = quoting(WIDE, 0);
+    let mut mint = mint();
+    let mut p = planner();
+    let quoted = book()
+        .with(Side::Buy, 0, quote(10_000, 5))
+        .with(Side::Sell, 0, quote(10_010, 5));
+    open_book(&mut p, &quoted, &mut reg, &amending(), &mut mint);
+    flatten(&mut reg);
+    let plan = plan_and_send(&mut p, &quoted, &mut reg, &amending(), &mut mint, LATER);
+    assert_eq!(
+        shape(&plan),
+        vec![
+            (Stage::Cancel, "cancel", Side::Buy, 0),
+            (Stage::Cancel, "cancel", Side::Sell, 0),
+        ]
+    );
+    assert!(refused(&plan).is_empty());
+}
+
+#[test]
+fn a_market_in_exit_has_every_order_cancelled_while_its_position_is_unknown() {
+    // Long 10, a reduce-only ask and a bid resting, then Flatten; a fill that falls between
+    // the resync's request and its answer, of an order the snapshot did not show, leaves the
+    // position unknown (decision 0055): no side can be said to reduce it, so both are
+    // cancelled.
+    let caps = PreTradeCaps::new()
+        .with_market(
+            INST,
+            MarketCapsConfig {
+                inventory: Some(lots(CAP)),
+                resting: Some(lots(WIDE)),
+            },
+        )
+        .unwrap();
+    let mut reg = arm::named(Registry::with_caps(caps));
+    let early = cid();
+    reg.insert(placement(early, 10_000, 1)).unwrap();
+    let snap = ResyncSnapshot {
+        watermark: WallNs(1_000),
+        requested_at: MonoNs(1_000),
+        orders: vec![],
+        positions: vec![(INST, SignedLots(10))],
+    };
+    reg.resync(&ladder_cfg(), &amending(), &snap, key(1))
+        .unwrap();
+    start(&mut reg, INST);
+    let mut mint = mint();
+    let mut p = planner();
+    let quoted =
+        book()
+            .with(Side::Buy, 0, quote(9_990, 5))
+            .with(Side::Sell, 0, reducing(quote(10_010, 5)));
+    open_book(&mut p, &quoted, &mut reg, &amending(), &mut mint);
+    flatten(&mut reg);
+    let straddling = fill(
+        Some(early),
+        FillIdent::Venue {
+            fill: fill_id("x"),
+            vid: Some(vid("g")),
+            cum_after: Some(lots(1)),
+        },
+        Side::Buy,
+        1,
+        false,
+    );
+    let time = Some(FillTime {
+        exch: ExchNs(1_500),
+        kind: ExchTsKind::MatchingEngine,
+        aligned: WallNs(1_500),
+    });
+    let mut l = FillLedger::new(
+        LedgerConfig {
+            max_age: Duration::from_secs(3600),
+            max_entries: 1_000,
+        },
+        WallNs(0),
+    )
+    .unwrap();
+    match l.admit(&straddling, time, MonoNs(1_100)) {
+        Admission::Apply(a) => assert_eq!(reg.apply_fill(a), Ok(FillRouted::Unsettled(early))),
+        other => panic!("expected the fill accepted, got {other:?}"),
+    }
+    assert_eq!(reg.position(INST), None);
+    let plan = plan_and_send(&mut p, &quoted, &mut reg, &amending(), &mut mint, LATER);
+    assert_eq!(
+        shape(&plan),
+        vec![
+            (Stage::Cancel, "cancel", Side::Buy, 0),
+            (Stage::Cancel, "cancel", Side::Sell, 0),
+        ]
+    );
+    assert!(refused(&plan).is_empty());
 }
 
 #[test]

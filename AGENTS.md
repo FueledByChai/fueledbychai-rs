@@ -258,7 +258,8 @@ rather than guess.
     where the venue's `OrderCaps` admit it and otherwise a cancel then, once the old order is
     terminal, a place, a PendingNew, Unknown or in-flight order occupying its level, every
     command built through the one pre-trade path and the permits and emitted as an
-    `Authorization`, cancels then reducing orders then amends then adds; still planned: batching,
+    `Authorization`, cancels then reducing orders then amends then adds, in Exit every order
+    on a side that does not reduce the position cancelled; still planned: batching,
     venue modes, the safety floor and flag-conflict fallbacks; 0005, 0013), `crates/fbc-journal` (0006; it depends on
     `fbc-core`, and `hmac` and `sha2` for its keyed hashes and `zstd` for its closed segments, only: the records the runtime writes, length-prefixed in a hand-written
     little-endian format with a version, a writer of one subdirectory per UTC day with segments
