@@ -1,0 +1,55 @@
+{
+  "results": [
+    {
+      "account": "0xa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+      "average_entry_price": "61234.56789012",
+      "average_entry_price_usd": "61234.56789012",
+      "average_exit_price": "0",
+      "cached_funding_index": "12.5",
+      "closed_at": 0,
+      "cost": "0",
+      "cost_usd": "0",
+      "created_at": 1759622300000,
+      "id": "BTC-USD-PERP-position",
+      "last_fill_id": "fill-BTC-USD-PERP",
+      "last_updated_at": 1759622390000,
+      "leverage": "",
+      "liquidation_price": "",
+      "market": "BTC-USD-PERP",
+      "realized_positional_funding_pnl": "0",
+      "realized_positional_pnl": "0",
+      "seq_no": 7,
+      "side": "LONG",
+      "size": "0.15",
+      "status": "OPEN",
+      "unrealized_funding_pnl": "0",
+      "unrealized_pnl": "0"
+    }
+    ,
+    {
+      "account": "0xa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+      "average_entry_price": "3000.05",
+      "average_entry_price_usd": "3000.05",
+      "average_exit_price": "0",
+      "cached_funding_index": "12.5",
+      "closed_at": 0,
+      "cost": "0",
+      "cost_usd": "0",
+      "created_at": 1759622300000,
+      "id": "ETH-USD-PERP-position",
+      "last_fill_id": "fill-ETH-USD-PERP",
+      "last_updated_at": 1759622390000,
+      "leverage": "",
+      "liquidation_price": "",
+      "market": "ETH-USD-PERP",
+      "realized_positional_funding_pnl": "0",
+      "realized_positional_pnl": "0",
+      "seq_no": 7,
+      "side": "SHORT",
+      "size": "-0.0505",
+      "status": "OPEN",
+      "unrealized_funding_pnl": "0",
+      "unrealized_pnl": "0"
+    }
+  ]
+}

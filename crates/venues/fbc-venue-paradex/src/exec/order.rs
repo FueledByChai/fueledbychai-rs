@@ -185,7 +185,7 @@ pub fn decode_order_event(
 /// and nothing is open (`filled`); cancelled by the venue when none is stated and part is open.
 /// The reasons mapped are the ones a source names (`fixtures/paradex/exec/README.md`): no
 /// Paradex page lists them all, so any other is the venue's.
-fn closed(reason: &str, filled: bool) -> VenueOrderState {
+pub(super) fn closed(reason: &str, filled: bool) -> VenueOrderState {
     match reason {
         "" if filled => VenueOrderState::Filled,
         "USER_CANCELED" => VenueOrderState::Canceled(CancelReason::Requested),

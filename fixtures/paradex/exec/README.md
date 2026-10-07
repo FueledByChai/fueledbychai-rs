@@ -72,3 +72,25 @@ The fill and trade ids, and every position and account amount, are made up. The 
 (`crates/venues/fbc-venue-paradex/tests/exec_order_events.rs`, `exec_fill_events.rs` and
 `exec_position_account_events.rs`) also change single bytes of these frames to reach the
 decoders' refusals.
+
+## REST responses
+
+Hand-built in the shapes docs.paradex.trade documents: "Get open orders" (`GET /v1/orders`:
+`results`, a list of `OrderResp`), "List open positions" (`GET /v1/positions`: `results`, a
+list of `PositionResp`, whose `size` carries the position's sign) and "Get orders history"
+(`GET /v1/orders-history`, query `client_id`: `next`, `prev` and `results`). Every field the
+pages list is present; the `account` is the made-up bytes a0..bf in hex. Prices are on the test
+specs' 0.1 tick and sizes on their 0.001 step.
+
+| File | What it is |
+| --- | --- |
+| `rest-orders-open.json` | Three open orders: ours (the first client id), a reduce-only GTC sell of 0.15 at 62000 with 0.1 open; a POST_ONLY ETH buy of 1.25 at 3000.5, NEW, under a random UUID; and an RPI BTC buy of 0.05 at 61990.5 with an empty client id |
+| `rest-positions.json` | Long 0.15 BTC at 61234.56789012, short 0.05 ETH (size `-0.05`) at 3000.05, and a CLOSED SOL position of size 0 (a market the specs do not hold) |
+| `rest-positions-bad-second.json` | The BTC position, then an ETH one of `-0.0505`, off the size step: the answer fails on its last entry |
+| `rest-orders-history-filled.json` | Our order in the history: a POST_ONLY buy of 0.15 at 62000, CLOSED with nothing open and no cancel reason (filled) |
+| `rest-orders-history-canceled.json` | The same order CLOSED by `USER_CANCELED` with 0.1 open |
+| `rest-orders-history-open.json` | The same order OPEN with 0.1 open |
+| `rest-orders-history-empty.json` | A history listing no order |
+
+`crates/venues/fbc-venue-paradex/tests/exec_rest.rs` decodes them and changes single fields to
+reach the decoders' refusals.
