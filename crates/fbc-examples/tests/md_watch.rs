@@ -358,6 +358,14 @@ fn the_command_line_is_parsed_with_defaults_and_refused_with_a_reason() {
     );
     assert_eq!(opts.paradex, None);
 
+    // RA98-2: Paradex spells some markets with a lowercase prefix, as the Java library's
+    // signing vectors do (`kBONK-USD-PERP`), and passes the name through as typed.
+    let parsed = args::parse(strings(&["--paradex", "kBONK-USD-PERP"]));
+    let Ok(Parsed::Watch(opts)) = parsed else {
+        panic!("{parsed:?}")
+    };
+    assert_eq!(opts.paradex.unwrap().symbol, "kBONK-USD-PERP");
+
     for (args, why) in [
         (&[][..], "name a market"),
         (&["--seconds", "5"][..], "name a market"),
@@ -396,6 +404,11 @@ fn the_command_line_is_parsed_with_defaults_and_refused_with_a_reason() {
             &["--binance", "btcusdt"][..],
             "--binance btcusdt: not a market as the venue spells it",
         ),
+        // RA98-2: the capitals rule stays for Binance, whose frames name the symbol in capitals.
+        (
+            &["--binance", "kBONKUSDT"][..],
+            "--binance kBONKUSDT: not a market as the venue spells it",
+        ),
         (
             &["--paradex", "BTC-USD-PERP "][..],
             "not a market as the venue spells it",
@@ -416,17 +429,18 @@ fn the_command_line_is_parsed_with_defaults_and_refused_with_a_reason() {
     }
 }
 
-/// Standard output as `| head` leaves it: the first line is taken, then the reader is gone and
-/// every write fails with a broken pipe.
-struct ClosedAfterFirstLine {
+/// Standard output that takes the first line, then fails every write with `kind`: a broken
+/// pipe is what `| head` leaves, a full disk what `> watch.log` can.
+struct FailsAfterFirstLine {
     taken: Rc<RefCell<Vec<u8>>>,
+    kind: std::io::ErrorKind,
 }
 
-impl std::io::Write for ClosedAfterFirstLine {
+impl std::io::Write for FailsAfterFirstLine {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let mut taken = self.taken.borrow_mut();
         if taken.contains(&b'\n') {
-            return Err(std::io::ErrorKind::BrokenPipe.into());
+            return Err(self.kind.into());
         }
         taken.extend_from_slice(buf);
         Ok(buf.len())
@@ -437,11 +451,10 @@ impl std::io::Write for ClosedAfterFirstLine {
     }
 }
 
-/// RB98-4: `md_watch ... | head` ends. Run with no stop of its own, md_watch prints its header,
-/// and the first line the venue's frames call for fails to write: md_watch stops, closing the
-/// connection, instead of watching forever with nowhere to print.
-#[tokio::test]
-async fn md_watch_stops_once_standard_output_is_closed() {
+/// Runs md_watch, with no stop of its own, against a stub that sends Paradex's subscribe acks
+/// and a bbo frame, writing to standard output that fails with `kind` after the header line.
+/// Returns what `run` returned and the bytes standard output took.
+async fn run_until_standard_output_fails(kind: std::io::ErrorKind) -> (Result<(), String>, String) {
     let mut steps = vec![Step::Accept];
     steps.extend((0..3).map(|_| Step::Read { conn: 0 }));
     steps.extend((1..=3).map(|id| Step::Push {
@@ -466,21 +479,43 @@ async fn md_watch_stops_once_standard_output_is_closed() {
         panic!("not a watch: {parsed:?}")
     };
     let taken = Rc::new(RefCell::new(Vec::new()));
-    let out: watch::Out = Rc::new(RefCell::new(ClosedAfterFirstLine {
+    let out: watch::Out = Rc::new(RefCell::new(FailsAfterFirstLine {
         taken: taken.clone(),
+        kind,
     }));
     let run = watch::run(&opts, out, false, std::future::pending());
     let Ok(ran) = tokio::time::timeout(Duration::from_secs(60), run).await else {
-        panic!("md_watch kept running for 60 s after its standard output closed")
+        panic!("md_watch kept running for 60 s after its standard output failed ({kind:?})")
     };
-    ran.unwrap();
     paradex.finished().await.unwrap();
-    assert_eq!(
-        String::from_utf8(taken.borrow().clone()).unwrap(),
-        "md_watch: paradex BTC-USD-PERP (bbo, trades, deltas book); market data only, no order \
-         is ever sent\n"
-    );
     assert_eq!(paradex.connections().len(), 1);
+    let taken = String::from_utf8(taken.borrow().clone()).unwrap();
+    (ran, taken)
+}
+
+const HEADER: &str = "md_watch: paradex BTC-USD-PERP (bbo, trades, deltas book); market data \
+                      only, no order is ever sent\n";
+
+/// RB98-4: `md_watch ... | head` ends. Run with no stop of its own, md_watch prints its header,
+/// and the first line the venue's frames call for fails to write: md_watch stops, closing the
+/// connection, instead of watching forever with nowhere to print. A closed pipe is the reader
+/// leaving, not a failure, so md_watch ends quietly.
+#[tokio::test]
+async fn md_watch_stops_once_standard_output_is_closed() {
+    let (ran, taken) = run_until_standard_output_fails(std::io::ErrorKind::BrokenPipe).await;
+    assert_eq!(ran, Ok(()));
+    assert_eq!(taken, HEADER);
+}
+
+/// RB98-6: any other write error (a full disk under `> watch.log`) also stops md_watch, and is
+/// returned as a failure naming standard output, so the log's end is explained and the exit
+/// status is not success.
+#[tokio::test]
+async fn md_watch_reports_a_write_error_other_than_a_closed_pipe() {
+    let (ran, taken) = run_until_standard_output_fails(std::io::ErrorKind::StorageFull).await;
+    let err = ran.expect_err("a full disk ended md_watch as a success");
+    assert!(err.starts_with("standard output: "), "{err}");
+    assert_eq!(taken, HEADER);
 }
 
 #[test]
