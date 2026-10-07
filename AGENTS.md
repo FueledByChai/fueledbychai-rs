@@ -326,7 +326,10 @@ rather than guess.
     resync (`GET /orders`, `GET /positions`) and the order query by client id
     (`GET /orders-history`), as requests carrying only the caller's headers and as plans, their
     answers decoded whole into the `Resync*` events and a `QueryResult` (`src/exec/rest.rs`, held
-    to the hand-built `rest-*.json` responses in `fixtures/paradex/exec/`); and, in `tests/oracle/` with `fbc-book` as a dev-dependency only, the
+    to the hand-built `rest-*.json` responses in `fixtures/paradex/exec/`); the read-only
+    private-stream codec, an `ExecCodec` that logs in, authenticates its socket, subscribes the
+    private channels once per connection, decodes them and refuses every command
+    (`src/exec/read_only.rs`, 0061); and, in `tests/oracle/` with `fbc-book` as a dev-dependency only, the
     BT-401 book and bbo-touch agreement checks), later `crates/venues/fbc-venue-hibachi`
     (0016).
   - Dependency direction (design §3): `fbc-core`, `fbc-book`, `fbc-oms`, `fbc-journal` and

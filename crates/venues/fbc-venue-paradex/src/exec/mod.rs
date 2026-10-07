@@ -7,11 +7,13 @@
 //! `AccountEvent` into its balance ([`decode_account_event`]); and its REST reads, the resync of
 //! open orders and positions and the order query by client id, as requests and plans whose
 //! answers decode whole into the resync events and a query result ([`resync_plan`],
-//! [`query_plan`]). Funding reaches the account only
+//! [`query_plan`]); and the read-only private-stream codec, which logs in, authenticates the
+//! socket, subscribes the private channels and refuses every command ([`ReadOnlyExec`],
+//! decision 0061). Funding reaches the account only
 //! as each fill's realized funding (decision 0059). Order entry is WebSocket-only: every place,
 //! amend and cancel is one of the socket's JSON-RPC methods, with no REST fallback.
 //!
-//! The order-entry codec is FBC-xvf's; the factory declares these caps, plans the endpoint and
+//! The full order-entry codec is FBC-xvf's; the factory declares these caps, plans the endpoint and
 //! builds the codec in FBC-xzp, until when [`ParadexFactory`](crate::ParadexFactory)'s caps stay
 //! market data only and [`caps_with_order_entry`](crate::factory::caps_with_order_entry) is
 //! what it will declare.
@@ -20,6 +22,7 @@ mod account;
 mod caps;
 mod fill;
 mod order;
+mod read_only;
 mod rest;
 
 pub use account::{
@@ -28,6 +31,7 @@ pub use account::{
 pub use caps::{ORDER_OPS, exec_caps, order_limits};
 pub use fill::{TEMPLATE_FILL, decode_fill_event};
 pub use order::{TEMPLATE_ORDER, decode_order_event};
+pub use read_only::{LOGIN_REQUEST, PRIVATE_CHANNELS, REFRESH_TIMER, ReadOnlyExec};
 pub use rest::{
     RestAnswer, ResyncTags, decode_order_query, decode_resync, open_orders_request,
     order_history_request, positions_request, query_plan, query_request, resync_plan,
