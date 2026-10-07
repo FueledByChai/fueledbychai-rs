@@ -242,7 +242,12 @@ rather than guess.
     or Quoting, a fresh registry disarmed and Cancel-only, the state checked before the caps,
     Start, Flatten and Wind-down arming with the market lease (and the account lease where
     nonces are per account) and refused while Killed or the position is unknown, every change
-    advancing the market's `StateGeneration`; still planned: Exit's admission (FBC-7gl) and
+    advancing the market's `StateGeneration`; cancels and fills in every state (0012;
+    `src/sweep.rs`, `tests/sweep.rs`): the kill switch's cancel everything an instrument
+    cancel-all only under the held market lease after a trustworthy resync with no order not
+    ours in view, otherwise our orders cancelled by explicit reference, named again on each
+    resync while Killed, never an account cancel-all, and own fills counted once in every state
+    while foreign ones are flagged; still planned: Exit's admission (FBC-7gl) and
     `ExecutionPlanner`; 0005, 0013), `crates/fbc-journal` (0006; it depends on
     `fbc-core`, and `hmac` and `sha2` for its keyed hashes and `zstd` for its closed segments, only: the records the runtime writes, length-prefixed in a hand-written
     little-endian format with a version, a writer of one subdirectory per UTC day with segments

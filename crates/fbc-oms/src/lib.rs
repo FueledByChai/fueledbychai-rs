@@ -122,6 +122,18 @@
 //! [`Registry::lift_kill`] (to Cancel-only, never further). Every change advances the market's
 //! [`StateGeneration`]; no resync, fill or timer changes a market's state.
 //!
+//! Cancels and fills in every state (decision 0012; 0005's I4 and I7; `tests/sweep.rs`): the
+//! kill switch's cancel everything for a market ([`Registry::cancel_everything`]) is an
+//! instrument cancel-all only while the registry holds the market's exclusive lease, a
+//! trustworthy resync has shown the account's open orders and no order not ours is in view on
+//! the market ([`Registry::foreign_in_view`]); otherwise our orders on it are cancelled by
+//! explicit reference in a cancel-many ([`CancelEverything`], [`CancelAllRefusal`]), and no
+//! foreign-namespace order is ever cancelled. Each resync names the Killed markets, whose
+//! cancel everything goes out again ([`ResyncReport::cancel_everything`]). No account cancel-all
+//! is ever built, and an instrument one is authorized only as built here. An own-namespace
+//! fill moves the inventory once in every state, Killed included; a foreign one is flagged and
+//! moves nothing.
+//!
 //! Not here yet: issuing an authorization after the market's state and caps, and its check at
 //! submit (FBC-afd).
 
@@ -135,6 +147,7 @@ mod permit;
 mod record;
 mod registry;
 mod resync;
+mod sweep;
 
 /// The helpers the integration tests share, once for the unit tests too: one namespace lease
 /// per test binary.
@@ -161,3 +174,4 @@ pub use record::{
 };
 pub use registry::{FillRouted, OmsError, Registry, Routed};
 pub use resync::{PositionCheck, ResyncError, ResyncReport, ResyncSnapshot};
+pub use sweep::{CancelAllRefusal, CancelEverything};

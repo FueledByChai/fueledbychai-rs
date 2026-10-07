@@ -5,8 +5,9 @@
 //! gateway does not take one for an order: [`OrderGateway::submit`](crate::OrderGateway::submit)
 //! takes an [`Authorization`], which only this crate can issue. It is issued for one account
 //! and one market, for a place, an amend, a batch of places, a cancel, a cancel-many or an
-//! instrument cancel-all; never for an account cancel-all, which no record admits (0005's I7
-//! admits only the instrument one). It carries the market's [`StateGeneration`] at issue, so
+//! instrument cancel-all, each only as the [`PermittedCommand`] this crate built (the
+//! instrument cancel-all under 0005's I7 guard); never for an account cancel-all, which no
+//! record admits (0005's I7 admits only the instrument one). It carries the market's [`StateGeneration`] at issue, so
 //! the check at submit can refuse it once the market's state has moved on (FBC-afd). It has
 //! no `Clone`, no public constructor and no way to edit its command, and submitting consumes
 //! it, so each one is spent once (the compile-fail cases in `tests/ui_authorization/`).
@@ -77,9 +78,10 @@ pub(crate) enum IssueRefusal {
     /// A batch whose items name more than one market: an authorization carries one market's
     /// generation.
     MixedMarkets,
-    /// A place, a batch of places, an amend, a cancel or a cancel-many this crate did not
-    /// build: it is authorized only as the [`PermittedCommand`] its permit or the pre-trade
-    /// caps built (decision 0005, FBC-lrc, 0013 rule 2).
+    /// A place, a batch of places, an amend, a cancel, a cancel-many or an instrument
+    /// cancel-all this crate did not build: it is authorized only as the [`PermittedCommand`]
+    /// its permit, the pre-trade caps or 0005's I7 guard built (decision 0005, FBC-lrc,
+    /// FBC-gzm, 0013 rule 2).
     NeedsPermit,
 }
 
@@ -96,13 +98,11 @@ pub struct Authorization {
 }
 
 impl Authorization {
-    /// Issues an authorization for `cmd` on `acct`, carrying the generation `generations` holds
-    /// for the command's market: only an instrument cancel-all is issued from a plain command.
-    /// Refused for a command that affects no order and an account cancel-all, and for a place,
-    /// a batch of places, an amend, a cancel and a cancel-many, which are issued only from the
-    /// [`PermittedCommand`] built under the pre-trade caps or a permit
-    /// ([`Authorization::issue_permitted`]). The kill switch is checked before this is called
-    /// (FBC-c4v, FBC-afd).
+    /// Refuses an authorization for a plain command `cmd` on `acct`: one that affects no order,
+    /// an account cancel-all, and every order-affecting command, which is issued only from the
+    /// [`PermittedCommand`] built under the pre-trade caps, a permit or 0005's I7 guard
+    /// ([`Authorization::issue_permitted`]); an instrument cancel-all included since FBC-gzm.
+    /// The kill switch is checked before a command is built (FBC-c4v, FBC-afd).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn issue(
         acct: AccountKey,
@@ -115,9 +115,10 @@ impl Authorization {
         Authorization::issue_any(acct, cmd, generations)
     }
 
-    /// Issues an authorization for the place or batch the pre-trade caps admitted, or the
-    /// amend, cancel or cancel-many a permit built, as [`Authorization::issue`] does for an
-    /// instrument cancel-all.
+    /// Issues an authorization for the place or batch the pre-trade caps admitted, the amend,
+    /// cancel or cancel-many a permit built, or the instrument cancel-all the kill switch's
+    /// cancel everything built under 0005's I7 guard, carrying the generation `generations`
+    /// holds for the command's market.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn issue_permitted(
         acct: AccountKey,
@@ -163,7 +164,8 @@ impl Authorization {
 }
 
 /// Whether `cmd` is authorized only as a [`PermittedCommand`]: a place, a batch of places, an
-/// amend, a cancel or a cancel-many.
+/// amend, a cancel, a cancel-many or an instrument cancel-all (the last built only under 0005's
+/// I7 guard, [`Registry::cancel_everything`](crate::Registry::cancel_everything)).
 fn permitted_kind(cmd: &VenueCommand) -> bool {
     matches!(
         cmd,
@@ -172,6 +174,7 @@ fn permitted_kind(cmd: &VenueCommand) -> bool {
             | VenueCommand::Amend(_)
             | VenueCommand::Cancel(_)
             | VenueCommand::CancelMany(_)
+            | VenueCommand::CancelAll(CancelScope::Instrument(_))
     )
 }
 
@@ -283,6 +286,26 @@ mod tests {
             .unwrap();
             assert_eq!(auth.command(), &cmd);
         }
+    }
+
+    #[test]
+    fn an_instrument_cancel_all_is_authorized_only_as_the_registry_built_it() {
+        // 0005's I7 guards whose orders a cancel-all reaches, so it is authorized only from
+        // the command the kill switch's cancel everything built under that guard (FBC-gzm).
+        let generations = Generations::default();
+        let btc = InstrumentId::new(1);
+        let cmd = VenueCommand::CancelAll(CancelScope::Instrument(btc));
+        assert_eq!(
+            Authorization::issue(ACCT, cmd.clone(), &generations).unwrap_err(),
+            IssueRefusal::NeedsPermit
+        );
+        let auth = Authorization::issue_permitted(
+            ACCT,
+            PermittedCommand::for_test(cmd.clone()),
+            &generations,
+        )
+        .unwrap();
+        assert_eq!(auth.command(), &cmd);
     }
 
     #[test]
