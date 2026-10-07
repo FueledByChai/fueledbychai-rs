@@ -533,8 +533,27 @@ impl Core {
         charged: bool,
         origin: Option<Stamp>,
     ) -> Result<bool, SessionError> {
+        // `charged` speaks for the frames alone: each HTTP request is charged as it starts.
         let effects = fx.take().into_iter();
-        let effects = effects.map(|e| (e, charged, origin)).collect();
+        let effects = effects
+            .map(|e| {
+                let frame_charged = charged && !is_http(&e);
+                (e, frame_charged, origin)
+            })
+            .collect();
+        self.run_effects(ws, inputs, effects).await
+    }
+
+    /// Executes `fx` as [`Self::execute`] does, attributed to no input, every frame and HTTP
+    /// request in it already charged with the connection each request opens ([`http_of`]), so
+    /// none is charged again (PR #90 Reviewer B B7).
+    pub(crate) async fn execute_all_charged(
+        &mut self,
+        ws: &mut Option<WebSocket>,
+        inputs: &mut dyn EpochInputs,
+        mut fx: Effects,
+    ) -> Result<bool, SessionError> {
+        let effects = fx.take().into_iter().map(|e| (e, true, None)).collect();
         self.run_effects(ws, inputs, effects).await
     }
 
@@ -554,7 +573,7 @@ impl Core {
         let own = self.own;
         let mut open = self.stop.has_changed().is_ok() && !inputs.halted();
         while open
-            && let Some((effect, origin)) =
+            && let Some((effect, charged, origin)) =
                 next_admitted(&mut effects, &self.rates, key, own, ws.is_some())
         {
             match (effect, ws.as_mut()) {
@@ -613,7 +632,7 @@ impl Core {
                     close(ws, &self.rates, key);
                     open = false;
                 }
-                (ask @ Effect::Http { .. }, _) => self.ask(epoch, ask),
+                (ask @ Effect::Http { .. }, _) => self.ask(epoch, ask, charged),
                 (Effect::Send { .. } | Effect::Reconnect { .. }, _) => {
                     self.counters.refused_effects += 1;
                 }
@@ -687,7 +706,7 @@ impl Core {
                 for effect in more.take() {
                     ends |= ends_epoch(&effect, own);
                     match effect {
-                        ask @ Effect::Http { .. } if !ends => self.ask(epoch, ask),
+                        ask @ Effect::Http { .. } if !ends => self.ask(epoch, ask, false),
                         other => effects.push_back((other, false, Some(stamp))),
                     }
                 }
@@ -696,8 +715,9 @@ impl Core {
     }
 
     /// Starts the HTTP request `ask` for the codec of `epoch` ([`start_http`]), journaled as it
-    /// starts, under its class and the epoch that asked.
-    fn ask(&mut self, epoch: u32, ask: Effect) {
+    /// starts, under its class and the epoch that asked; `charged` when it and the connection it
+    /// opens were charged already.
+    fn ask(&mut self, epoch: u32, ask: Effect, charged: bool) {
         // The timeout runs from the ask, so journaling the request counts against it (Codex
         // r4178197281).
         let now = Instant::now();
@@ -735,6 +755,7 @@ impl Core {
             rates,
             connector,
             self.http_max_body,
+            charged,
         ));
     }
 
@@ -895,20 +916,38 @@ pub(crate) fn frame_of(effect: &Effect, own: StreamId, socket: bool) -> Option<R
     Request::of(effect).filter(|_| frame)
 }
 
-/// The next of `effects` to execute, with the input it is attributed to: a frame on stream
-/// `own` of a socket endpoint is charged on connection `key` as its turn comes, unless it was
-/// already, and one the buckets refuse is dropped unwritten (decision 0030).
+/// Whether `effect` is an HTTP request.
+fn is_http(effect: &Effect) -> bool {
+    matches!(effect, Effect::Http { .. })
+}
+
+/// What the HTTP effect `effect` is charged: the request and the connection it opens, which a
+/// limit on new connections counts too (Codex r4179474175), both or neither. `None` for any
+/// other effect.
+pub(crate) fn http_of(effect: &Effect) -> Option<[Request; 2]> {
+    let request = Request::of(effect).filter(|_| is_http(effect))?;
+    let connect = Request {
+        charge: RateCharge::one(OpKind::Connect, None),
+        ..request
+    };
+    Some([request, connect])
+}
+
+/// The next of `effects` to execute, with whether it was charged already and the input it is
+/// attributed to: a frame on stream `own` of a socket endpoint is charged on connection `key`
+/// as its turn comes, unless it was already, and one the buckets refuse is dropped unwritten
+/// (decision 0030); an HTTP request is charged as it starts ([`start_http`]).
 fn next_admitted(
     effects: &mut VecDeque<(Effect, bool, Option<Stamp>)>,
     rates: &RateLimiter,
     key: ConnKey,
     own: StreamId,
     socket: bool,
-) -> Option<(Effect, Option<Stamp>)> {
+) -> Option<(Effect, bool, Option<Stamp>)> {
     std::iter::from_fn(|| effects.pop_front()).find_map(|(effect, charged, origin)| {
         let request = frame_of(&effect, own, socket).filter(|_| !charged);
         let admitted = request.is_none_or(|r| rates.charge(Instant::now(), key, &[r]).is_ok());
-        admitted.then_some((effect, origin))
+        admitted.then_some((effect, charged, origin))
     })
 }
 
@@ -916,8 +955,9 @@ fn next_admitted(
 /// session until it is answered, fails or times out. Its timeout runs from `now`, when the
 /// codec asked; one past the end of the clock bounds nothing, so the request is not sent, nor is one
 /// the runtime cannot make, both before anything is charged (Codex r4179682244), nor one the
-/// buckets refuse (decision 0030): each comes back as [`HttpFailure::NotSent`]. A 429 or 418
-/// to it is counted under the scopes it was charged to. `None` for any other effect.
+/// buckets refuse (decision 0030): each comes back as [`HttpFailure::NotSent`]; one `charged`
+/// already, with the connection it opens ([`http_of`]), is not charged again. A 429 or 418 to
+/// it is counted under the scopes it was charged to. `None` for any other effect.
 fn start_http(
     ask: Effect,
     key: ConnKey,
@@ -925,8 +965,9 @@ fn start_http(
     rates: &RateLimiter,
     connector: &Connector,
     max_body: usize,
+    charged: bool,
 ) -> Option<Pending> {
-    let request = Request::of(&ask);
+    let charges = http_of(&ask);
     let Effect::Http {
         tag,
         req,
@@ -939,17 +980,13 @@ fn start_http(
     };
     let epoch = key.epoch;
     let deadline = now.checked_add(timeout);
-    // The request opens a connection of its own, which a limit on new connections counts too
-    // (Codex r4179474175); both are charged or neither. A 429 or 418 answers the request, so it
-    // is counted under the request's scopes alone (Codex r4179558360).
-    let connect = request.map(|r| Request {
-        charge: RateCharge::one(OpKind::Connect, None),
-        ..r
-    });
+    // The request and the connection it opens are charged together ([`http_of`]). A 429 or 418
+    // answers the request, so it is counted under the request's scopes alone (Codex
+    // r4179558360).
     let ready = deadline.zip(http::ready(&req));
-    let go = ready.zip(request.zip(connect)).and_then(|(ready, (r, c))| {
-        let charged = rates.charge(now, key, &[r, c]).ok();
-        charged.map(|_| (ready, rates.scopes(key, &r)))
+    let go = ready.zip(charges).and_then(|(ready, [r, c])| {
+        let admitted = charged || rates.charge(now, key, &[r, c]).is_ok();
+        admitted.then(|| (ready, rates.scopes(key, &r)))
     });
     let (rates, connector) = (rates.clone(), connector.clone());
     Some(Box::pin(async move {

@@ -27,17 +27,18 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::ScriptedWs;
 use common::toy::ToyVenue;
+use common::{ScriptedHttp, ScriptedWs};
 use exec_toy::{INST_A, OWN_NS, RPC_TIMEOUT, ToyExec, ToySigner};
 use fbc_core::{
     AccountKey, AccountSummary, AckLevel, AssetKey, CancelOnDisconnect, ConfigError, ConnKey,
     ConnState, CtxCall, DecodeError, DecodeScope, Effect, Effects, EncodeCtx, EncodeReceipt,
     EndpointPlan, Envelope, ExecCodec, ExecEndpoint, ExecEvent, ExecSink, FieldSpec, HttpFailure,
-    HttpPlan, HttpResponse, HttpTag, Inbound, InboundSpans, InstrumentSpecDraft, MdCodec,
-    NonceBlock, NonceSource, NotSentReason, OrderRef, PathStamps, QueryOrder, RateCharge, RawFrame,
-    RejectKind, RpcId, Secrets, SpecTable, StreamId, SubmitHandle, SubmitOutcome, Subscription,
-    SymbolError, TimerTag, VenueCaps, VenueCommand, VenueConfig, VenueError, VenueFactory, WireUrl,
+    HttpMethod, HttpPlan, HttpRequest, HttpResponse, HttpTag, Inbound, InboundSpans,
+    InstrumentSpecDraft, MdCodec, NonceBlock, NonceSource, NotSentReason, OpKind, OrderRef,
+    PathStamps, QueryOrder, RateCharge, RawFrame, RejectKind, RpcId, Secrets, SpecTable, StreamId,
+    SubmitHandle, SubmitOutcome, Subscription, SymbolError, TimerTag, TrafficClass, VenueCaps,
+    VenueCommand, VenueConfig, VenueError, VenueFactory, WireSlice, WireUrl,
 };
 use fbc_oms::ControlCommand;
 use fbc_runtime::{
@@ -63,6 +64,11 @@ const REFUSE_ARM: &str = "ready.refuse_arm";
 const HEAVY_RESYNC: &str = "ready.heavy_resync";
 /// Any value: the codec's arm frame weighs more than the toy's account limit ever admits.
 const HEAVY_ARM: &str = "ready.heavy_arm";
+/// A number: the codec's resync is one HTTP read of this weight, as Paradex's REST resync is
+/// (FBC-0sc), in place of the toy's frame.
+const HTTP_RESYNC: &str = "ready.http_resync";
+/// The URL the HTTP resync reads; by default one never reached.
+const HTTP_RESYNC_URL: &str = "ready.http_resync_url";
 
 const ACCT: AccountKey = AccountKey::new(4);
 
@@ -184,6 +190,12 @@ impl VenueFactory for ReadyToy {
             refuse_arm: cfg.get(REFUSE_ARM).is_some(),
             heavy_resync: cfg.get(HEAVY_RESYNC).is_some(),
             heavy_arm: cfg.get(HEAVY_ARM).is_some(),
+            http_resync: cfg.get(HTTP_RESYNC).map(|w| {
+                let url = cfg
+                    .get(HTTP_RESYNC_URL)
+                    .unwrap_or("https://venue.invalid/orders");
+                (w.parse().unwrap(), url.to_owned())
+            }),
         })))
     }
 
@@ -197,14 +209,15 @@ impl VenueFactory for ReadyToy {
 }
 
 /// The toy's codec, logging each encode and resync; with `refuse_arm` it refuses to encode an
-/// arm, with `heavy_resync` its resync frame weighs 51 units, and with `heavy_arm` its arm frame
-/// does.
+/// arm, with `heavy_resync` its resync frame weighs 51 units, with `heavy_arm` its arm frame
+/// does, and with `http_resync` its resync is one HTTP read of that weight from that URL.
 struct Logged {
     inner: ToyExec,
     calls: Calls,
     refuse_arm: bool,
     heavy_resync: bool,
     heavy_arm: bool,
+    http_resync: Option<(u32, String)>,
 }
 
 impl ExecCodec for Logged {
@@ -298,6 +311,10 @@ impl ExecCodec for Logged {
         if self.heavy_resync {
             heavy(fx);
         }
+        if let Some((weight, url)) = &self.http_resync {
+            fx.take();
+            fx.push(read(*weight, url));
+        }
     }
 
     fn redact_inbound(&self, input: Inbound<'_>) -> InboundSpans {
@@ -327,6 +344,27 @@ fn heavy(fx: &mut Effects) {
             },
             other => other,
         });
+    }
+}
+
+/// A resync read of `weight` units from `url` over HTTP, which the toy's account limit counts
+/// as a query.
+fn read(weight: u32, url: &str) -> Effect {
+    Effect::Http {
+        tag: HttpTag(77),
+        req: HttpRequest {
+            method: HttpMethod::Get,
+            url: WireUrl::plain(url),
+            headers: vec![],
+            body: WireSlice::plain(Vec::new()),
+        },
+        rpc: None,
+        timeout: Duration::from_secs(5),
+        class: TrafficClass::Safety,
+        charge: RateCharge {
+            weight: NonZeroU32::new(weight).unwrap(),
+            ..RateCharge::one(OpKind::Query, None)
+        },
     }
 }
 
@@ -1127,6 +1165,112 @@ async fn a_resync_that_can_never_fit_ends_the_session() {
     let ((), run) = tokio::join!(script, session.run());
     drop(frozen);
     assert_eq!(run, Err(ExecSessionError::ResyncNeverFits));
+}
+
+/// A resync made of HTTP reads, as Paradex's is (FBC-0sc), is charged together as a resync's
+/// frames are: buckets that refuse its read for now end the epoch as a drop, rather than leave
+/// it connected and refusing places with no resync under way, and the next attempt waits until
+/// they would admit it as well as the pacing allows (PR #90 Reviewer B B7).
+#[tokio::test(start_paused = true)]
+async fn a_resync_read_the_buckets_refuse_for_now_ends_the_epoch_and_holds_the_next_attempt() {
+    let frozen = freeze();
+    let mut server = ScriptedWs::start().await;
+    let venue = ReadyToy::leak();
+    let log = Log::default();
+    // Two units a second: the authentication and the arm take them.
+    let cfg = [(UNITS, "2"), (HTTP_RESYNC, "1")];
+    let (mut session, control, _, _) = session(venue, &server.url(), &cfg, &log, None);
+    let watch = Rc::clone(&log);
+    let script = async move {
+        let mut peer = server.accept().await;
+        peer.recv().await;
+        peer.send(AUTH_ACK);
+        assert_eq!(peer.recv().await, arm(1));
+        settle(|| ends(&watch).len() == 1).await;
+        assert_eq!(peer.next().await, None);
+        // Well past the pacing's floor, but not yet a second after the first frame.
+        advance(ms(900)).await;
+        churn().await;
+        assert!(server.try_accept().is_none());
+        advance(ms(200)).await;
+        let mut next = server.accept().await;
+        assert!(next.recv().await.starts_with("auth|ts="));
+        drop(control);
+    };
+    let ((), run) = tokio::join!(script, session.run());
+    run.unwrap();
+    drop(frozen);
+
+    assert_eq!(venue.resyncs(), 1);
+    assert_eq!(session.counters().arm_failures, 0);
+}
+
+/// A resync read the buckets admit goes out, charged once: with the frames, not again as it
+/// starts. The account's three units a second take the authentication, the arm and the read
+/// (PR #90 Reviewer B B7). On the real clock, so the read meets a local server.
+#[tokio::test]
+async fn a_resync_read_the_buckets_admit_goes_out_charged_only_once() {
+    let mut server = ScriptedWs::start().await;
+    let mut http = ScriptedHttp::start().await;
+    let venue = ReadyToy::leak();
+    let log = Log::default();
+    let url = http.url("/orders");
+    let cfg = [
+        (UNITS, "3"),
+        (HTTP_RESYNC, "1"),
+        (HTTP_RESYNC_URL, url.as_str()),
+    ];
+    let (mut session, control, _, _) = session(venue, &server.url(), &cfg, &log, None);
+    let script = async move {
+        let mut peer = server.accept().await;
+        peer.recv().await;
+        peer.send(AUTH_ACK);
+        assert_eq!(peer.recv().await, arm(1));
+        let exchange = tokio::time::timeout(Duration::from_secs(10), http.request());
+        assert_eq!(
+            exchange.await.expect("the read never came").line,
+            "GET /orders"
+        );
+        assert_eq!(http.connections(), 1);
+        drop(control);
+    };
+    let ((), run) = tokio::join!(script, session.run());
+    run.unwrap();
+    assert_eq!(venue.resyncs(), 1);
+}
+
+/// A resync read that weighs more than the buckets ever admit ends the session, as a resync
+/// frame's would (PR #90 Reviewer B B7).
+#[tokio::test(start_paused = true)]
+async fn a_resync_read_that_can_never_fit_ends_the_session() {
+    let frozen = freeze();
+    let mut server = ScriptedWs::start().await;
+    let venue = ReadyToy::leak();
+    let log = Log::default();
+    let cfg = [(HTTP_RESYNC, "51")];
+    let (mut session, _control, _, _) = session(venue, &server.url(), &cfg, &log, None);
+    let ended = Rc::new(std::cell::Cell::new(false));
+    let run = {
+        let ended = Rc::clone(&ended);
+        async move {
+            let run = session.run().await;
+            ended.set(true);
+            run
+        }
+    };
+    let script = async move {
+        let mut peer = server.accept().await;
+        peer.recv().await;
+        peer.send(AUTH_ACK);
+        assert_eq!(peer.recv().await, arm(1));
+        peer.send(&accepted(1));
+        settle(|| ended.get()).await;
+        assert_eq!(peer.next().await, None);
+    };
+    let ((), run) = tokio::join!(script, run);
+    drop(frozen);
+    assert_eq!(run, Err(ExecSessionError::ResyncNeverFits));
+    assert_eq!(venue.resyncs(), 1);
 }
 
 /// A venue whose protection outlives a reconnect is armed on the first epoch only: the next
