@@ -68,6 +68,8 @@ enum Why {
     Foreign(InstrumentId),
     /// The registry's hold of the cancel-all's market's exclusive lease changed.
     Lease(InstrumentId),
+    /// An Exit command's market's position moved (tests/exit_submit.rs).
+    Position(InstrumentId),
 }
 
 impl From<StaleAuthorization> for Why {
@@ -78,6 +80,7 @@ impl From<StaleAuthorization> for Why {
             }
             StaleAuthorization::ForeignSeen(market) => Why::Foreign(market),
             StaleAuthorization::ExclusiveLeaseChanged(market) => Why::Lease(market),
+            StaleAuthorization::PositionMoved(market) => Why::Position(market),
         }
     }
 }
