@@ -32,7 +32,7 @@ use fbc_core::{
 use fbc_oms::{
     Admission, CancelAllRefusal, CancelEverything, CancelPlan, EntryState, FillLedger, FillRouted,
     Intent, LadderConfig, Leases, LedgerConfig, MarketCapsConfig, OrdState, OrderKey, OrderOp,
-    PreTradeCaps, Registry, ResyncSnapshot,
+    PreTradeCaps, Registry, ResyncSnapshot, TestnetRun,
 };
 
 const INST: InstrumentId = InstrumentId::new(1);
@@ -508,9 +508,11 @@ fn otherwise_our_orders_are_cancelled_by_explicit_reference_and_no_foreign_order
         &[bid, ask],
     );
 
-    // No trustworthy resync has shown the account's open orders: a hand seed, and a resync
-    // from a snapshot source that can be stale, show nothing of what rests.
-    let mut hand = arm::named(Registry::with_caps(caps()));
+    // No trustworthy resync has shown the account's open orders: a hand seed (armable only in
+    // a declared owner-assisted testnet run, decision 0067), and a resync from a snapshot
+    // source that can be stale, show nothing of what rests.
+    let mut hand =
+        arm::named(Registry::with_caps(caps()).for_testnet_run(TestnetRun::owner_assisted()));
     hand.seed_position(INST, SignedLots(LONG)).unwrap();
     hand.seed_position(OTHER, SignedLots(0)).unwrap();
     resync_from(&mut hand, SnapshotSource::Untrustworthy, 1_500, vec![]);

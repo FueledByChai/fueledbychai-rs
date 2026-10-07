@@ -31,7 +31,7 @@ use fbc_core::{
 use fbc_oms::{
     AmendRefusal, ArmRefusal, CancelChoice, CapRefusal, CapsConfigError, FillLedger, FillRouted,
     LedgerConfig, MarketCapsConfig, OmsError, OrdState, OrderKey, OrderOp, PermittedCommand,
-    PreTradeCaps, Registry, StateRefusal,
+    PreTradeCaps, Registry, StateRefusal, TestnetRun,
 };
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, RngSeed};
@@ -66,9 +66,12 @@ fn registry(inventory: i64, resting: i64) -> Registry {
     armed(Registry::with_caps(caps(inventory, resting)), &[INST])
 }
 
-/// `reg` named for its leases, each of `markets` seeded flat and started.
+/// `reg` named for its leases, each of `markets` seeded flat by hand and started: the tests
+/// here move the position by fills of orders the registry does not hold ([`position`]), which
+/// a hand seed counts, so `reg` is declared an owner-assisted testnet run, the only run in which
+/// a hand-seeded market arms (decision 0067).
 fn armed(reg: Registry, markets: &[InstrumentId]) -> Registry {
-    let mut reg = arm::named(reg);
+    let mut reg = arm::named(reg.for_testnet_run(TestnetRun::owner_assisted()));
     for &market in markets {
         reg.seed_position(market, SignedLots(0)).unwrap();
         arm::start(&mut reg, market);
@@ -718,7 +721,7 @@ fn a_market_admits_nothing_until_its_position_is_seeded_from_the_venue() {
         Err(AmendRefusal::State(StateRefusal::CancelOnly(INST)))
     );
     // Seeded long 50 under a cap of 50, and started: no more bids, though offers reduce it.
-    reg.seed_position(INST, SignedLots(50)).unwrap();
+    arm::seed(&mut reg, &[(INST, 50)]);
     assert!(reg.position_known(INST));
     arm::start(&mut reg, INST);
     assert_eq!(reg.inventory(INST), SignedLots(50));

@@ -24,7 +24,7 @@ mod common;
 
 use std::time::Duration;
 
-use arm::{account_lease, lease_keys, leases, market_lease, named, scoped, start, wire};
+use arm::{account_lease, lease_keys, leases, market_lease, named, scoped, seed, start, wire};
 use common::{cid, lease_dir, lots, order_caps, placement, symbol, vid};
 use fbc_core::{
     AckLevel, AmendAck, AmendCaps, AmendQty, CancelBatch, ClientOrderId, InstrumentId, ItemRef,
@@ -64,11 +64,11 @@ fn unseeded() -> Registry {
     named(Registry::with_caps(caps()))
 }
 
-/// A named registry under the caps, `INST` and `OTHER` seeded long `LONG` and flat.
+/// A named registry under the caps, `INST` and `OTHER` seeded long `LONG` and flat by a
+/// trustworthy resync.
 fn seeded() -> Registry {
     let mut reg = unseeded();
-    reg.seed_position(INST, SignedLots(LONG)).unwrap();
-    reg.seed_position(OTHER, SignedLots(0)).unwrap();
+    seed(&mut reg, &[(INST, LONG), (OTHER, 0)]);
     reg
 }
 
@@ -705,7 +705,7 @@ fn names_given_again_for_another_account_stop_an_armed_market_building() {
 #[test]
 fn a_nonce_scope_given_again_as_per_account_stops_a_market_armed_without_the_account_lease() {
     let mut reg = Registry::with_caps(caps()).with_lease_keys(lease_keys(NonceScope::Random));
-    reg.seed_position(INST, SignedLots(LONG)).unwrap();
+    seed(&mut reg, &[(INST, LONG)]);
     let lease = Leases::market(market_lease(&reg, INST));
     reg.start(INST, lease).unwrap();
     let bid = open(&mut reg, placement(cid(), 100, 5), "v-bid");
@@ -734,8 +734,7 @@ fn a_nonce_scope_given_again_as_per_account_stops_a_market_armed_without_the_acc
 fn an_account_lease_held_for_another_account_never_covers_an_armed_market() {
     let a = lease_keys(NonceScope::Random);
     let mut reg = Registry::with_caps(caps()).with_lease_keys(a.clone());
-    reg.seed_position(INST, SignedLots(LONG)).unwrap();
-    reg.seed_position(OTHER, SignedLots(0)).unwrap();
+    seed(&mut reg, &[(INST, LONG), (OTHER, 0)]);
     let lease = Leases::market(market_lease(&reg, INST));
     reg.start(INST, lease).unwrap();
     let bid = open(&mut reg, placement(cid(), 100, 5), "v-bid");
@@ -796,7 +795,7 @@ fn lease_names_take_the_nonce_scope_from_the_venues_order_caps() {
     let keys = LeaseKeys::new(arm::VENUE, &account, &venue).with_market(INST, symbol(&wire(INST)));
     assert_eq!(keys.nonce_scope(), venue.nonce_scope);
     let mut reg = Registry::with_caps(caps()).with_lease_keys(keys);
-    reg.seed_position(INST, SignedLots(0)).unwrap();
+    seed(&mut reg, &[(INST, 0)]);
     let lease = Leases::market(market_lease(&reg, INST));
     assert_eq!(
         reg.start(INST, lease),
@@ -963,7 +962,7 @@ fn arming_is_refused_without_the_account_lease_where_the_nonce_scope_is_per_acco
     for scope in [NonceScope::PerSigner, NonceScope::Random, NonceScope::None] {
         for (name, call) in arming_calls() {
             let mut reg = Registry::with_caps(caps()).with_lease_keys(lease_keys(scope));
-            reg.seed_position(INST, SignedLots(0)).unwrap();
+            seed(&mut reg, &[(INST, 0)]);
             let lease = Leases::market(market_lease(&reg, INST));
             assert!(
                 call(&mut reg, INST, lease).unwrap().armed(),
@@ -978,7 +977,7 @@ fn arming_is_refused_for_a_market_the_lease_names_do_not_cover() {
     for (name, call) in arming_calls() {
         // No names at all.
         let mut reg = Registry::with_caps(caps());
-        reg.seed_position(INST, SignedLots(0)).unwrap();
+        seed(&mut reg, &[(INST, 0)]);
         let throwaway = lease_keys(NonceScope::PerSigner);
         let lease = MarketLease::acquire(
             &lease_dir(),
@@ -998,7 +997,7 @@ fn arming_is_refused_for_a_market_the_lease_names_do_not_cover() {
         // Names that leave the market out.
         let keys = LeaseKeys::new("synthetic", "acct-unnamed", &scoped(NonceScope::PerSigner));
         let mut reg = Registry::with_caps(caps()).with_lease_keys(keys);
-        reg.seed_position(INST, SignedLots(0)).unwrap();
+        seed(&mut reg, &[(INST, 0)]);
         refused(
             &mut reg,
             name,

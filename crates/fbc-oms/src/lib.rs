@@ -121,7 +121,9 @@
 //! [`Registry::flatten`] and [`Registry::wind_down`] (straight into Exit), each arming a
 //! disarmed market with its market lease, and the account lease where the venue's nonces are
 //! per account, checked against the consumer's [`LeaseKeys`], and each refused, changing
-//! nothing, for a Killed market or while the market's position is unknown ([`ArmRefusal`]);
+//! nothing, for a Killed market, while the market's position is unknown, and for a market
+//! seeded by hand outside a declared testnet run ([`ArmRefusal`], decision 0067,
+//! `tests/hand_seed.rs`);
 //! [`Registry::disarm`] (to Cancel-only, the leases dropped), [`Registry::kill`] and
 //! [`Registry::lift_kill`] (to Cancel-only, never further). Every change advances the market's
 //! [`StateGeneration`]; no resync, fill or timer changes a market's state.
@@ -185,6 +187,7 @@ mod common;
 pub use caps::{CapRefusal, CapsConfigError, MarketCaps, MarketCapsConfig, PreTradeCaps};
 pub use entry::{
     ArmRefusal, EntryState, ExitKind, ExitRefusal, LeaseKeys, Leases, MarketEntry, StateRefusal,
+    TestnetRun,
 };
 pub use gateway::{ControlCommand, ManagedGateway, OrderGateway};
 pub use grant::{Authorization, IssueRefusal, StaleAuthorization, StateGeneration};

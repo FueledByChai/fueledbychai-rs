@@ -30,8 +30,10 @@
 //! ([`NonceScope::PerAccountMonotonic`]), each checked against the names the consumer gave the
 //! registry ([`LeaseKeys`]); they are refused for a Killed market and while the market's
 //! position is unknown ([`Registry::position`](crate::Registry::position): no trustworthy resync
-//! has seeded it yet, or a fill since could not be placed against the seed). A refused call
-//! changes nothing. The registry holds the leases while the market is armed and drops them when
+//! has seeded it yet, or a fill since could not be placed against the seed), and for a market
+//! seeded by hand ([`Registry::seed_position`](crate::Registry::seed_position)) unless the
+//! registry was built for a declared owner-assisted testnet run ([`Registry::for_testnet_run`],
+//! decision 0067). A refused call changes nothing. The registry holds the leases while the market is armed and drops them when
 //! it is disarmed; the account lease while any market is armed.
 //!
 //! Every change of a market's armed flag or state advances its [`StateGeneration`], which an
@@ -205,6 +207,36 @@ impl Leases {
     }
 }
 
+/// The consumer's declaration that this process is an owner-assisted testnet run, the only
+/// run in which a market seeded by hand ([`Registry::seed_position`]) may be armed (decision
+/// 0067; the owner's answer C to RB-olg-3). Given to [`Registry::for_testnet_run`] when the
+/// registry is built; nothing in the library makes one, and a consumer trading a live venue
+/// never does.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct TestnetRun {
+    _declared: (),
+}
+
+impl TestnetRun {
+    /// Declares an owner-assisted testnet run: the owner is present, the venue is its testnet,
+    /// and positions may be seeded by hand because the venue's snapshot source is not yet
+    /// trustworthy (decision 0055).
+    pub fn owner_assisted() -> TestnetRun {
+        TestnetRun { _declared: () }
+    }
+}
+
+/// How a market's position stands for arming (decision 0067).
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub(crate) enum Seeding {
+    /// Seeded by a trustworthy resync, or by hand in a declared testnet run.
+    Armable,
+    /// Not known ([`ArmRefusal::PositionUnknown`]).
+    Unknown,
+    /// Seeded by hand outside a declared testnet run ([`ArmRefusal::SeededByHand`]).
+    ByHand,
+}
+
 /// Why Start, Flatten or Wind-down was refused: the market's armed flag, state and generation
 /// are as they were.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
@@ -214,6 +246,11 @@ pub enum ArmRefusal {
     /// The market's position is not known: no trustworthy resync seeded it yet, or a fill since
     /// could not be placed against the seed (decision 0055).
     PositionUnknown(InstrumentId),
+    /// The market's position was seeded by hand ([`Registry::seed_position`]), not by a
+    /// trustworthy resync, and the registry was not built for a declared owner-assisted testnet
+    /// run ([`Registry::for_testnet_run`]): a hand seed never arms a live market (decision
+    /// 0067). A later resync only compares the seed, so this holds for the process's life.
+    SeededByHand(InstrumentId),
     /// The registry has no [`LeaseKeys`] naming the market, so no lease can be checked.
     NotNamed(InstrumentId),
     /// The market is disarmed and the call carried no market lease.
@@ -238,6 +275,11 @@ impl fmt::Display for ArmRefusal {
             ArmRefusal::PositionUnknown(inst) => write!(
                 f,
                 "the position on {inst:?} is not known: no trustworthy resync has seeded it"
+            ),
+            ArmRefusal::SeededByHand(inst) => write!(
+                f,
+                "the position on {inst:?} was seeded by hand, not by a trustworthy resync: \
+                 only a declared owner-assisted testnet run arms such a market"
             ),
             ArmRefusal::NotNamed(inst) => {
                 write!(f, "no lease names are configured for {inst:?}")
@@ -581,10 +623,10 @@ impl Entries {
         market: InstrumentId,
         to: EntryState,
         leases: Leases,
-        position_known: bool,
+        seeding: Seeding,
     ) -> Result<MarketEntry, ArmRefusal> {
         let before = self.exclusive_held();
-        let armed = self.arm_leased(market, to, leases, position_known);
+        let armed = self.arm_leased(market, to, leases, seeding);
         self.exclusive_changed(&before);
         armed
     }
@@ -594,13 +636,15 @@ impl Entries {
         market: InstrumentId,
         to: EntryState,
         leases: Leases,
-        position_known: bool,
+        seeding: Seeding,
     ) -> Result<MarketEntry, ArmRefusal> {
         if self.state(market) == EntryState::Killed {
             return Err(ArmRefusal::Killed(market));
         }
-        if !position_known {
-            return Err(ArmRefusal::PositionUnknown(market));
+        match seeding {
+            Seeding::Armable => {}
+            Seeding::Unknown => return Err(ArmRefusal::PositionUnknown(market)),
+            Seeding::ByHand => return Err(ArmRefusal::SeededByHand(market)),
         }
         let was_armed = self.armed(market);
         if was_armed {
@@ -671,6 +715,33 @@ impl Registry {
         self
     }
 
+    /// This registry for a declared owner-assisted testnet run (decision 0067): a market seeded
+    /// by hand ([`Registry::seed_position`]) may then be armed by Start, Flatten and Wind-down,
+    /// which otherwise refuse it ([`ArmRefusal::SeededByHand`]). Given when the registry is
+    /// built, for the owner's testnet runs only (the `testnet_trade` sample, FBC-x69b); it
+    /// changes nothing else, and never arms a market whose position is unknown.
+    pub fn for_testnet_run(mut self, run: TestnetRun) -> Registry {
+        self.testnet_run = Some(run);
+        self
+    }
+
+    /// Whether the registry was built for a declared testnet run ([`Registry::for_testnet_run`]).
+    pub fn testnet_run(&self) -> bool {
+        self.testnet_run.is_some()
+    }
+
+    /// How `market`'s position stands for arming: known and seeded by a trustworthy resync, or
+    /// by hand in a declared testnet run (decision 0067).
+    fn seeding(&self, market: InstrumentId) -> Seeding {
+        if !self.position_known(market) {
+            Seeding::Unknown
+        } else if self.seeded_by_hand(market) && !self.testnet_run() {
+            Seeding::ByHand
+        } else {
+            Seeding::Armable
+        }
+    }
+
     /// The names arming checks leases against, if given.
     pub fn lease_keys(&self) -> Option<&LeaseKeys> {
         self.entries.keys()
@@ -685,15 +756,17 @@ impl Registry {
     /// The owner's Start (decision 0012): arms a disarmed market with `leases` and moves it to
     /// Quoting; on an armed market, moves it to Quoting. The only call that reaches Quoting.
     /// Refused, changing nothing, for a Killed market, while the market's position is unknown,
-    /// and, on a disarmed market, without the market's lease, or without the account's lease
+    /// for a market seeded by hand outside a declared testnet run (decision 0067), and, on a
+    /// disarmed market, without the market's lease, or without the account's lease
     /// where the venue's nonce scope is per account and the registry does not hold it.
     pub fn start(
         &mut self,
         market: InstrumentId,
         leases: Leases,
     ) -> Result<MarketEntry, ArmRefusal> {
-        let known = self.position_known(market);
-        self.entries.arm(market, EntryState::Quoting, leases, known)
+        let seeding = self.seeding(market);
+        self.entries
+            .arm(market, EntryState::Quoting, leases, seeding)
     }
 
     /// The owner's Flatten (decision 0012): arms a disarmed market straight into Exit, never
@@ -703,9 +776,9 @@ impl Registry {
         market: InstrumentId,
         leases: Leases,
     ) -> Result<MarketEntry, ArmRefusal> {
-        let known = self.position_known(market);
+        let seeding = self.seeding(market);
         self.entries
-            .arm(market, EntryState::Exit(ExitKind::Flatten), leases, known)
+            .arm(market, EntryState::Exit(ExitKind::Flatten), leases, seeding)
     }
 
     /// The owner's Wind-down (decision 0012): as [`Registry::flatten`], into Exit.
@@ -714,9 +787,13 @@ impl Registry {
         market: InstrumentId,
         leases: Leases,
     ) -> Result<MarketEntry, ArmRefusal> {
-        let known = self.position_known(market);
-        self.entries
-            .arm(market, EntryState::Exit(ExitKind::WindDown), leases, known)
+        let seeding = self.seeding(market);
+        self.entries.arm(
+            market,
+            EntryState::Exit(ExitKind::WindDown),
+            leases,
+            seeding,
+        )
     }
 
     /// The consumer's disarm: the market is disarmed and its leases dropped; Exit and Quoting

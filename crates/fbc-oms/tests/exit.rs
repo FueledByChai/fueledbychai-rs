@@ -64,7 +64,7 @@ fn seeded(pos: i64) -> Registry {
 
 fn seeded_under(inventory: i64, resting: i64, pos: i64) -> Registry {
     let mut reg = registry(inventory, resting);
-    reg.seed_position(INST, SignedLots(pos)).unwrap();
+    arm::seed(&mut reg, &[(INST, pos)]);
     reg
 }
 
@@ -583,7 +583,7 @@ fn exit_still_refuses_every_order_a_cap_refuses() {
 
     // A market the configuration gives no caps admits no exit either.
     let mut reg = seeded(POS);
-    reg.seed_position(OTHER, SignedLots(POS)).unwrap();
+    arm::seed(&mut reg, &[(OTHER, POS)]);
     into_exit(&mut reg, OTHER, exits()[0]);
     assert_eq!(
         reg.place(NewOrder {

@@ -40,7 +40,7 @@ fn registry() -> Registry {
             )
             .unwrap(),
     );
-    reg.seed_position(INST, SignedLots(0)).unwrap();
+    arm::seed(&mut reg, &[(INST, 0)]);
     // The owner's Start (decision 0012): the market's state admits amends.
     let mut reg = arm::named(reg);
     arm::start(&mut reg, INST);
