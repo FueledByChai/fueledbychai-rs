@@ -322,7 +322,11 @@ rather than guess.
     (`src/md/rest.rs`); order entry's `ExecCaps` with each value cited and the undocumented ones
     declared conservatively (`src/exec/`, 0054); the private `OrderEvent` at SBE 1:2 decoded
     into order updates, a modify's SUCCESS an amend and its REJECTED an asynchronous reject
-    (`src/exec/order.rs`, held to the hand-built frames in `fixtures/paradex/exec/`); and, in `tests/oracle/` with `fbc-book` as a dev-dependency only, the
+    (`src/exec/order.rs`, held to the hand-built frames in `fixtures/paradex/exec/`); the REST
+    resync (`GET /orders`, `GET /positions`) and the order query by client id
+    (`GET /orders-history`), as requests carrying only the caller's headers and as plans, their
+    answers decoded whole into the `Resync*` events and a `QueryResult` (`src/exec/rest.rs`, held
+    to the hand-built `rest-*.json` responses in `fixtures/paradex/exec/`); and, in `tests/oracle/` with `fbc-book` as a dev-dependency only, the
     BT-401 book and bbo-touch agreement checks), later `crates/venues/fbc-venue-hibachi`
     (0016).
   - Dependency direction (design §3): `fbc-core`, `fbc-book`, `fbc-oms`, `fbc-journal` and
@@ -341,7 +345,8 @@ rather than guess.
   recorded Paradex frames go elsewhere under `fixtures/paradex/`; `fixtures/paradex/md/` holds
   SBE frames hand-built from Paradex's published schema, and one captured public book frame
   whose provenance its README gives; `fixtures/paradex/exec/` (marked `SYNTHETIC`: each frame's
-  account is 32 made-up bytes) hand-built private `OrderEvent` frames; `fixtures/paradex/rest/` a hand-built `/orderbook` response
+  account is 32 made-up bytes) hand-built private `OrderEvent` frames and REST order and
+  position responses; `fixtures/paradex/rest/` a hand-built `/orderbook` response
   in Paradex's documented shape. `fixtures/binance-usdm/` holds hand-written frames (`md/`) and REST
   responses (`rest/`) in Binance's documented shapes, its README citing the pages.
   `fixtures/licence-gate/` is a standalone two-crate workspace the licence gate's self-test

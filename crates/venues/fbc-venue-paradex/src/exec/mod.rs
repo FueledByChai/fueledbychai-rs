@@ -4,7 +4,10 @@
 //! into order updates, a modify's request_info included ([`decode_order_event`]); `FillEvent`
 //! into fills with the venue's realized P&L and funding ([`decode_fill_event`]);
 //! `PositionEvent` into the account's position in a market ([`decode_position_event`]); and
-//! `AccountEvent` into its balance ([`decode_account_event`]). Funding reaches the account only
+//! `AccountEvent` into its balance ([`decode_account_event`]); and its REST reads, the resync of
+//! open orders and positions and the order query by client id, as requests and plans whose
+//! answers decode whole into the resync events and a query result ([`resync_plan`],
+//! [`query_plan`]). Funding reaches the account only
 //! as each fill's realized funding (decision 0059). Order entry is WebSocket-only: every place,
 //! amend and cancel is one of the socket's JSON-RPC methods, with no REST fallback.
 //!
@@ -17,6 +20,7 @@ mod account;
 mod caps;
 mod fill;
 mod order;
+mod rest;
 
 pub use account::{
     TEMPLATE_ACCOUNT, TEMPLATE_POSITION, decode_account_event, decode_position_event,
@@ -24,6 +28,11 @@ pub use account::{
 pub use caps::{ORDER_OPS, exec_caps, order_limits};
 pub use fill::{TEMPLATE_FILL, decode_fill_event};
 pub use order::{TEMPLATE_ORDER, decode_order_event};
+pub use rest::{
+    RestAnswer, ResyncTags, decode_order_query, decode_resync, open_orders_request,
+    order_history_request, positions_request, query_plan, query_request, resync_plan,
+    resync_requests,
+};
 
 /// The SBE schema version the order socket negotiates (`sbeSchemaVersion=2`, schema id
 /// [`sbe::SCHEMA_ID`](crate::md::sbe::SCHEMA_ID)): `OrderEvent`'s request_info

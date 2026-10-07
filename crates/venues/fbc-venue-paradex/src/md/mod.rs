@@ -555,7 +555,7 @@ pub(crate) fn lots(spec: &InstrumentSpec, mantissa: i64) -> Result<Lots, DecodeE
 }
 
 /// A size as lots of the instrument's size step; refused off the step or negative.
-fn lots_of(spec: &InstrumentSpec, value: Decimal) -> Result<Lots, DecodeError> {
+pub(crate) fn lots_of(spec: &InstrumentSpec, value: Decimal) -> Result<Lots, DecodeError> {
     let off = DecodeError::Malformed("size off the instrument's size step");
     let step = spec.size_step.get();
     let count = value.checked_div(step).ok_or(off)?;
