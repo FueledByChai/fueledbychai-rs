@@ -256,6 +256,16 @@ impl ParadexReplies {
         Ok(ReplyRead::Decoded)
     }
 
+    /// A new order-entry connection opened: no reply to a request sent on an earlier one can
+    /// reach it (0027), so the requests still waiting are dropped, and a deadline the runtime
+    /// still names for one is `Unknown` with no record of it. A request already reported
+    /// `Unknown` from its reply is kept, so its timeout still adds nothing; the runtime times
+    /// every such request out once (no `Unknown` answers it), which removes it.
+    pub fn on_new_connection(&mut self) {
+        self.slots
+            .retain(|_, slot| matches!(slot, Slot::ReportedUnknown));
+    }
+
     /// Request `rpc`'s deadline passed with no answer: the tracker drops the request, so a
     /// reply arriving after it is [`ReplyRead::NotOurs`] and adds no second outcome, and pushes
     /// `Unknown` for every item, unless every item was already reported `Unknown` from its

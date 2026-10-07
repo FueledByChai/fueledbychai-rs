@@ -11,8 +11,9 @@
 //!   as one JSON-RPC frame on the authenticated connection, cancel-on-disconnect's arm included
 //!   (the runtime sends it, FBC-w19), and recorded with [`ParadexReplies`] (FBC-0l9), which
 //!   decodes its reply into one outcome per item and reports `Unknown` at its deadline for what
-//!   went unanswered. A new connection drops what the one before sent, whose replies never
-//!   reach it. Order entry is WebSocket only: a frame command while no connection is
+//!   went unanswered. A new connection drops what the one before sent and still awaits, whose
+//!   replies never reach it, and keeps what was already reported `Unknown`, so its timeout
+//!   still adds nothing. Order entry is WebSocket only: a frame command while no connection is
 //!   authenticated is `NotSent(Disconnected)`, as the runtime reports it, with no REST
 //!   fallback; one whose rpc is not below [`CONTROL_IDS`] is `NotSent(Unencodable)`, since its
 //!   reply could not be told from the codec's own.
@@ -159,12 +160,14 @@ impl ExecCodec for ParadexExec {
     }
 
     /// The read-only codec's: the login, or the auth frame with a token already held. The
-    /// requests and queries of an earlier connection are dropped, as its resync is: no reply
-    /// or answer of theirs reaches a later epoch (0027), and a deadline the runtime still
-    /// names is `Unknown` with no record of the request (decision 0071).
+    /// requests still awaiting a reply and the queries of an earlier connection are dropped,
+    /// as its resync is: no reply or answer of theirs reaches a later epoch (0027), and a
+    /// deadline the runtime still names is `Unknown` with no record of the request (decision
+    /// 0071). A request whose reply already reported `Unknown` is kept, so its timeout still
+    /// adds nothing ([`ParadexReplies::on_new_connection`]).
     fn on_open(&mut self, stream: StreamId, ctx: &EncodeCtx, fx: &mut Effects) {
         self.queries.clear();
-        self.replies = ParadexReplies::new();
+        self.replies.on_new_connection();
         self.session.on_open(stream, ctx, fx);
     }
 

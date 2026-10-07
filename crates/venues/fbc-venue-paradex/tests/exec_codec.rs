@@ -858,6 +858,31 @@ fn a_new_connection_drops_the_requests_and_reads_of_the_one_before() {
 }
 
 #[test]
+fn a_request_whose_reply_was_unknown_adds_nothing_at_its_timeout_after_a_new_connection() {
+    // A reply with every item Unknown answers nothing, so the runtime still times the request
+    // out, on whichever connection is open then; that timeout adds nothing, and a reconnect in
+    // between does not make it report a second Unknown (Reviewer B RB-xvf-1 on PR #109).
+    for reconnect in [false, true] {
+        let mut codec = authenticated();
+        encode(&mut codec, &place(), RpcId(11)).0.unwrap();
+        let replied = text(&mut codec, &error(11, -32603, "internal error"));
+        replied.result.unwrap();
+        let unknown = ExecEvent::Outcome {
+            rpc: RpcId(11),
+            item: None,
+            outcome: SubmitOutcome::Unknown,
+        };
+        assert_eq!(replied.events, [unknown]);
+        if reconnect {
+            open(&mut codec);
+        }
+        let mut sink = Sink::default();
+        codec.on_rpc_timeout(RpcId(11), &mut sink);
+        assert!(sink.0.is_empty(), "reconnect {reconnect}: {:?}", sink.0);
+    }
+}
+
+#[test]
 fn a_resync_with_no_token_reads_nothing_and_asks_for_the_connection_again() {
     let mut codec = fresh();
     // No connection at all: nothing.
