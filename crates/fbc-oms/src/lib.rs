@@ -110,9 +110,13 @@
 //! market is armed or not and in one of Killed, Cancel-only, Exit or Quoting
 //! ([`EntryState`], [`Registry::entry`]); a fresh registry has every market disarmed and in
 //! Cancel-only. A place, amend, replace or batch item is built only on an armed market in
-//! Quoting, the market's state checked before either cap ([`StateRefusal`]): Killed and
-//! Cancel-only build none, reduce-only and reducing ones included, and Exit none until its
-//! admission is built (FBC-7gl); cancels are built in every state. The consumer's calls on the
+//! Quoting or Exit, the market's state checked before either cap ([`StateRefusal`]): Killed
+//! and Cancel-only build none, reduce-only and reducing ones included, and Exit only exit
+//! orders (decision 0063, `tests/exit.rs`): reduce-only or classified reducing, on the side that reduces
+//! the position, sized so that the position plus every order on that side that may still
+//! move it, the new one included, never crosses zero, then judged by both caps; none once the
+//! position is flat or while it is unknown, and no ordinary order ([`ExitRefusal`]). Cancels
+//! are built in every state. The consumer's calls on the
 //! owner's action move it: [`Registry::start`] (the only way to Quoting),
 //! [`Registry::flatten`] and [`Registry::wind_down`] (straight into Exit), each arming a
 //! disarmed market with its market lease, and the account lease where the venue's nonces are
@@ -164,7 +168,9 @@ mod sweep;
 mod common;
 
 pub use caps::{CapRefusal, CapsConfigError, MarketCaps, MarketCapsConfig, PreTradeCaps};
-pub use entry::{ArmRefusal, EntryState, ExitKind, LeaseKeys, Leases, MarketEntry, StateRefusal};
+pub use entry::{
+    ArmRefusal, EntryState, ExitKind, ExitRefusal, LeaseKeys, Leases, MarketEntry, StateRefusal,
+};
 pub use gateway::{ControlCommand, ManagedGateway, OrderGateway};
 pub use grant::{Authorization, IssueRefusal, StaleAuthorization, StateGeneration};
 pub use ladder::{LadderConfig, LadderConfigError, LadderPlan, LadderResolution, ResyncApplied};

@@ -8,9 +8,14 @@
 //!   reduce-only, I6-reducing, flatten, force-close and wind-down ones included.
 //! - **Cancel-only**: the same for places and amends. Lifting the kill switch leads here and
 //!   nowhere else, and a disarm leads here from Exit or Quoting.
-//! - **Exit**: entered only by the owner's Flatten or Wind-down. Exit's admission (orders on the
-//!   side that reduces the position only, never crossing zero, every cap still applied) is
-//!   FBC-7gl's; until it is built, Exit builds no place or amend ([`StateRefusal::Exit`]).
+//! - **Exit**: entered only by the owner's Flatten or Wind-down. Only exit orders are built: a
+//!   place, amend, replace or batch item carrying the venue's reduce-only flag or the OMS's
+//!   reducing classification ([`NewOrder::reduces`](fbc_core::NewOrder::reduces)), on the side
+//!   that reduces the position, sized so that the position plus every order on that side that
+//!   may still move it, the new one included, never crosses zero; each still passes both
+//!   pre-trade caps, judged after it. Once the position is flat, or while it is unknown, Exit
+//!   builds nothing ([`ExitRefusal`], decision 0063). This is an added restriction, never a bypass: the
+//!   classification it asks for exempts an order from no check.
 //! - **Quoting**: entered only by the owner's Start.
 //!
 //! A place or amend is built only on a market that is armed and in Exit or Quoting, under
@@ -46,8 +51,11 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
-use fbc_core::{AccountLease, InstrumentId, MarketLease, NonceScope, OrderCaps, VenueSymbol};
+use fbc_core::{
+    AccountLease, InstrumentId, Lots, MarketLease, NonceScope, OrderCaps, Side, VenueSymbol,
+};
 
+use crate::caps::Exposure;
 use crate::grant::{Counters, Generations, StateGeneration, Watch};
 use crate::registry::Registry;
 
@@ -264,8 +272,9 @@ pub enum StateRefusal {
     Killed(InstrumentId),
     /// The market is in Cancel-only.
     CancelOnly(InstrumentId),
-    /// The market is in Exit, whose admission (FBC-7gl) is not built yet: nothing is built.
-    Exit(InstrumentId),
+    /// The market is in Exit, which builds only exit orders, and this is not one, or would
+    /// take its side past zero (decision 0012).
+    Exit(ExitRefusal),
     /// The market is armed under leases the registry's lease names no longer cover: names
     /// given since ([`Registry::with_lease_keys`]) are for another venue or account, leave the
     /// market out, or make the nonces per account while the registry holds no account lease.
@@ -279,9 +288,7 @@ impl fmt::Display for StateRefusal {
         match self {
             StateRefusal::Killed(inst) => write!(f, "the kill switch is on for {inst:?}"),
             StateRefusal::CancelOnly(inst) => write!(f, "{inst:?} is cancel-only"),
-            StateRefusal::Exit(inst) => {
-                write!(f, "{inst:?} is in Exit, which builds no order yet")
-            }
+            StateRefusal::Exit(why) => write!(f, "{why}"),
             StateRefusal::Unleased(inst) => write!(
                 f,
                 "{inst:?} is armed under leases its lease names no longer cover: disarm it and arm it again"
@@ -291,6 +298,110 @@ impl fmt::Display for StateRefusal {
 }
 
 impl std::error::Error for StateRefusal {}
+
+/// Why a market in Exit built no place, amend, replace or batch item (decisions 0012, 0063): Exit
+/// builds only exit orders, on the side that reduces the position, never past zero. Judged
+/// after the market's state admitted Exit and before either pre-trade cap.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum ExitRefusal {
+    /// The market's position is not known (a fill since its seed could not be placed against
+    /// it; decision 0055): which side reduces it, and by how much, is not known.
+    PositionUnknown(InstrumentId),
+    /// The position is flat: Exit builds nothing more.
+    Flat(InstrumentId),
+    /// The order is on `side`, which adds to the position.
+    Increasing { inst: InstrumentId, side: Side },
+    /// The order carries neither the venue's reduce-only flag nor the OMS's reducing
+    /// classification: an ordinary order, which Exit never builds, even on the side that
+    /// reduces the position.
+    Ordinary { inst: InstrumentId, side: Side },
+    /// Our orders on `side` that may still move the position would total `total` lots with
+    /// the order (`None` when that does not fit a lot count), more than the position's
+    /// `position`: the position would cross zero if they all filled.
+    CrossesZero {
+        inst: InstrumentId,
+        side: Side,
+        total: Option<Lots>,
+        position: Lots,
+    },
+}
+
+impl fmt::Display for ExitRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExitRefusal::PositionUnknown(inst) => write!(
+                f,
+                "{inst:?} is in Exit and its position is not known, so no order reduces it"
+            ),
+            ExitRefusal::Flat(inst) => {
+                write!(f, "{inst:?} is in Exit and flat: nothing more is built")
+            }
+            ExitRefusal::Increasing { inst, side } => write!(
+                f,
+                "{inst:?} is in Exit and a {side:?} order adds to its position"
+            ),
+            ExitRefusal::Ordinary { inst, side } => write!(
+                f,
+                "{inst:?} is in Exit and the {side:?} order is neither reduce-only nor \
+                 classified reducing: Exit builds no ordinary order"
+            ),
+            ExitRefusal::CrossesZero {
+                inst,
+                side,
+                total: Some(total),
+                position,
+            } => write!(
+                f,
+                "{inst:?} is in Exit and our {side:?} orders would total {} lots with the \
+                 order, past the position's {} lots: it would cross zero",
+                total.get(),
+                position.get()
+            ),
+            ExitRefusal::CrossesZero {
+                inst,
+                side,
+                total: None,
+                position,
+            } => write!(
+                f,
+                "{inst:?} is in Exit and what our {side:?} orders would total with the order \
+                 does not fit a lot count, so it cannot be held within the position's {} lots",
+                position.get()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ExitRefusal {}
+
+/// What a market's state admits once it admits a place or amend at all.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub(crate) enum Admits {
+    /// Quoting: any order the caps admit.
+    Any,
+    /// Exit: only exit orders ([`ExitRefusal`]).
+    ExitOnly,
+}
+
+impl Admits {
+    /// Whether an order on `exposure`'s side, which `marked` says is reduce-only or classified
+    /// reducing, adding `adds` to what the side may still move the position by, is admitted by
+    /// the market's state: anything in Quoting; in Exit, only an exit order on the side that
+    /// reduces the position, the side's total within the position's size (decision 0012).
+    pub(crate) fn judge(
+        self,
+        exposure: &Exposure,
+        marked: bool,
+        adds: Lots,
+    ) -> Result<(), StateRefusal> {
+        match self {
+            Admits::Any => Ok(()),
+            Admits::ExitOnly => exposure
+                .admit_exit(marked, adds)
+                .map_err(StateRefusal::Exit),
+        }
+    }
+}
 
 /// Every market's state and the leases its arming took.
 #[derive(Debug, Default)]
@@ -389,13 +500,14 @@ impl Entries {
         self.generations.watch(market)
     }
 
-    /// Whether `market`'s state admits a place or amend at all, before the caps.
-    pub(crate) fn admits(&self, market: InstrumentId) -> Result<(), StateRefusal> {
+    /// Whether `market`'s state admits a place or amend at all, before the caps, and which:
+    /// any in Quoting, exit orders alone in Exit ([`Admits::judge`]).
+    pub(crate) fn admits(&self, market: InstrumentId) -> Result<Admits, StateRefusal> {
         match (self.armed(market), self.state(market)) {
             (_, EntryState::Killed) => Err(StateRefusal::Killed(market)),
             (true, _) if self.held_covered(market).is_err() => Err(StateRefusal::Unleased(market)),
-            (true, EntryState::Quoting) => Ok(()),
-            (true, EntryState::Exit(_)) => Err(StateRefusal::Exit(market)),
+            (true, EntryState::Quoting) => Ok(Admits::Any),
+            (true, EntryState::Exit(_)) => Ok(Admits::ExitOnly),
             _ => Err(StateRefusal::CancelOnly(market)),
         }
     }

@@ -244,8 +244,11 @@ impl Registry {
         }
     }
 
-    /// Builds the place of `order` when its market's pre-trade caps admit it, and registers
-    /// it PendingNew, so every later check counts it in full. Refused, never built and never
+    /// Builds the place of `order` when its market's state and pre-trade caps admit it, and
+    /// registers it PendingNew, so every later check counts it in full. Refused, never built
+    /// and never registered, when the market's state builds no place, or, in Exit, when it is
+    /// not an exit order on the side that reduces the position within the position's size
+    /// ([`OmsError::State`]); refused, never built and never
     /// registered, when it would take the worst case on its side past the inventory cap, or
     /// what its side has resting past the resting cap, or its market has no caps
     /// ([`OmsError::Capped`]), reducing and reduce-only orders included,
@@ -298,14 +301,19 @@ impl Registry {
         Guard::state(self.entries.watch(market))
     }
 
+    /// The one pre-trade path of a place and a batch item: the market's state first (decision
+    /// 0012), then, in Exit, Exit's admission, then both caps (0013 rule 2).
     fn admit_placement(&self, order: &NewOrder) -> Result<(), OmsError> {
-        self.entries.admits(order.inst).map_err(OmsError::State)?;
+        let admits = self.entries.admits(order.inst).map_err(OmsError::State)?;
         if self.orders.contains_key(&order.cid) {
             return Err(OmsError::DuplicateCid(order.cid));
         }
-        self.exposure(order.inst, order.side, None)
-            .admit(Adds::placing(order.qty))
-            .map_err(OmsError::Capped)
+        let exposure = self.exposure(order.inst, order.side, None);
+        let adds = Adds::placing(order.qty);
+        admits
+            .judge(&exposure, order.reduces(), adds.exposure)
+            .map_err(OmsError::State)?;
+        exposure.admit(adds).map_err(OmsError::Capped)
     }
 
     /// Registers a placement about to be sent, PendingNew, without building its command (an
