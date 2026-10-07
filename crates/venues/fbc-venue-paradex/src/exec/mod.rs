@@ -16,9 +16,9 @@
 //! Commands are encoded as the socket's JSON-RPC frames by [`ParadexEncoder`] (place, batch
 //! place, modify, cancel, batch cancel, cancel-all and cancel-on-disconnect), from the command
 //! and the `EncodeCtx` only. The order-entry codec that sends them is FBC-xvf's; the factory
-//! declares these caps, plans the endpoint and builds the codec in FBC-xzp, until when [`ParadexFactory`](crate::ParadexFactory)'s caps stay
-//! market data only and [`caps_with_order_entry`](crate::factory::caps_with_order_entry) is
-//! what it will declare.
+//! declares these caps, plans the endpoint and builds the codec in FBC-xzp, until when
+//! [`ParadexFactory`](crate::ParadexFactory)'s caps stay market data only and
+//! [`caps_with_order_entry`](crate::factory::caps_with_order_entry) is what it will declare.
 
 mod account;
 mod caps;

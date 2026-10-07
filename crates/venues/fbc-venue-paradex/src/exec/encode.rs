@@ -36,7 +36,8 @@
 //! and a fee query; an order combining a pair the caps declare in conflict is
 //! `NotSent(FlagConflict)`. What cannot be written is `Unencodable`: an instrument missing from
 //! the spec table, an empty batch, a size of zero or out of range, a price off the grid, a wall
-//! time before 1970, and an amend to its filled quantity or below. A signer that fails is `SignFailed`. A refusal pushes no effect.
+//! time before 1970, and an amend to its filled quantity or below. A signer that fails is
+//! `SignFailed`. A refusal pushes no effect.
 //!
 //! An order query is not a frame: the order-entry codec (FBC-xvf) builds it as the REST
 //! request FBC-0sc defines, so this encoder refuses it as `NotSent(Unsupported)`.
@@ -202,6 +203,11 @@ impl ParadexEncoder {
                         charge: RateCharge::one(OpKind::CancelAll, Some(inst)),
                     }
                 }
+                // The account one is encoded because the caps declare it Native (decision
+                // 0054) and the conformance suite holds a Native capability to being sent. It
+                // never reaches this codec: `ExecOrders` takes an order-affecting command only
+                // as the grant fbc-oms issues for it (0045, 0057), which it refuses here
+                // (`IssueRefusal::AccountCancelAll`), and a `ControlCommand` has no cancel-all.
                 CancelScope::Account => Request {
                     method: "order.cancel_all",
                     params: "{}".to_owned(),
@@ -316,6 +322,10 @@ impl ParadexEncoder {
         ctx: &EncodeCtx,
         t: &mut PathStamps<'_>,
     ) -> Result<String, NotSentReason> {
+        // `order.modify` writes no instruction or flags (caps `amend.flags` false): the order
+        // keeps the ones it was placed with. The amend's tif, channel and flags are that order's
+        // (fbc-oms builds them from the placed order and never amends flags), so they are
+        // checked against the caps here and not written.
         let caps = self.order.amend.ok_or(Unsupported)?;
         self.declared(
             OrderKindTag::Limit,
