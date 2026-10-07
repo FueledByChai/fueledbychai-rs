@@ -92,7 +92,7 @@ const FAILURES: [HttpFailure; 3] = [
     HttpFailure::TimedOut,
     HttpFailure::Lost,
 ];
-const NOT_SENT: [NotSentReason; 7] = [
+const NOT_SENT: [NotSentReason; 8] = [
     NotSentReason::Disconnected,
     NotSentReason::Backpressure,
     NotSentReason::RateBudget,
@@ -100,6 +100,7 @@ const NOT_SENT: [NotSentReason; 7] = [
     NotSentReason::FlagConflict,
     NotSentReason::Unencodable,
     NotSentReason::SignFailed,
+    NotSentReason::StaleAuthorization,
 ];
 
 fn opcode_byte(v: Opcode) -> u8 {
@@ -135,6 +136,7 @@ fn not_sent_byte(v: NotSentReason) -> u8 {
         NotSentReason::FlagConflict => 4,
         NotSentReason::Unencodable => 5,
         NotSentReason::SignFailed => 6,
+        NotSentReason::StaleAuthorization => 7,
     }
 }
 

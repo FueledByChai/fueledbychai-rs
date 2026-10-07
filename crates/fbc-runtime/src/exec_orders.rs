@@ -51,9 +51,9 @@ impl fmt::Display for SubmitRefusal {
 impl std::error::Error for SubmitRefusal {}
 
 /// What was submitted: the authorization fbc-oms issued for an order-affecting command, kept
-/// until the command is encoded so fbc-oms's submit-time re-check (FBC-afd, called by
-/// FBC-j5bw) can run then, in `ExecSession::send` just before the encode, not at queue time
-/// (decision 0057; PR #87 Reviewer B B7), or a command that affects no order.
+/// until the command is encoded so fbc-oms's submit-time re-check (decision 0060) runs then, in
+/// `ExecSession::send` just before the encode, not at queue time (decisions 0057, 0062; PR #87
+/// Reviewer B B7), or a command that affects no order.
 pub(crate) enum Submitted {
     Authorized(Authorization),
     Control(VenueCommand),
@@ -221,8 +221,8 @@ impl ExecOrders {
     /// Submits the order-affecting command fbc-oms authorized, spending the authorization: its
     /// request id, or why nothing was submitted (an authorization for another account, or a
     /// session that has ended). The session keeps the authorization until it encodes the
-    /// command, where fbc-oms's submit-time re-check runs (FBC-afd, called there by FBC-j5bw;
-    /// decision 0057).
+    /// command, where fbc-oms's submit-time re-check runs: one it refuses is reported
+    /// `NotSent(StaleAuthorization)`, nothing reserved or written (decisions 0057, 0060, 0062).
     pub fn submit(&self, auth: Authorization) -> Result<RpcId, SubmitRefusal> {
         if auth.account() != self.shared.acct {
             return Err(SubmitRefusal::OtherAccount);

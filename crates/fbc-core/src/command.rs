@@ -306,6 +306,12 @@ pub enum NotSentReason {
     Unencodable,
     /// The signer refused or failed.
     SignFailed,
+    /// The order-entry session's re-check of the command's authorization refused it just
+    /// before encoding: its market's state changed since the command was built (the kill
+    /// switch, a disarm, an arming call), or, for an instrument cancel-all, the guard it was
+    /// built under no longer holds (decisions 0060, 0062). Build it again from the market's
+    /// state now.
+    StaleAuthorization,
 }
 
 /// What became of one command, or one item of a batch.

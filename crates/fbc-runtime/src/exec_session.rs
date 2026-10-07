@@ -53,13 +53,18 @@
 //! **Submitting commands (FBC-0ga, decision 0057).** Commands reach the codec only through the
 //! session's [`ExecOrders`] ([`ExecSession::orders`]): an order-affecting one only as the
 //! fbc-oms [`Authorization`](fbc_oms::Authorization) issued for it, for the session's account
-//! (0013 rule 2, 0045), kept until its command is encoded, where fbc-oms's submit-time
-//! re-check belongs (FBC-afd; called there by FBC-j5bw), and one that affects no order as a
+//! (0013 rule 2, 0045), kept until its command is encoded, and one that affects no order as a
 //! [`ControlCommand`](fbc_oms::ControlCommand). Each is given its [`RpcId`] at once and is
 //! taken on the session's next turn, after the input being handled: one submitted while the
 //! stream had no epoch the codec reported authenticated
 //! ([`ConnState::Authenticated`](fbc_core::ConnState::Authenticated)), or on an epoch that has
-//! since ended, is `NotSent(Disconnected)`; otherwise it is encoded with an [`EncodeCtx`]
+//! since ended, is `NotSent(Disconnected)`. An authorization fbc-oms's check at submit
+//! ([`Authorization::check_at_submit`](fbc_oms::Authorization::check_at_submit), decision
+//! 0060) refuses, run here just before the encode and not when it was queued, is
+//! `NotSent(StaleAuthorization)` with no nonce reserved and nothing written: a place, a batch
+//! or an amend whose market's state changed since it was built (the kill switch, a disarm, an
+//! arming call), or an instrument cancel-all whose I7 guard moved; a cancel and a cancel-many
+//! always pass (FBC-j5bw, decision 0062). Otherwise it is encoded with an [`EncodeCtx`]
 //! holding exactly [`VenueCommand::items`](fbc_core::VenueCommand::items) nonces reserved from
 //! the consumer's [`NonceSource`] and the shard clock's time. What the codec refuses is
 //! `NotSent` for its reason; effects that do not carry the request
@@ -120,7 +125,7 @@ use tokio::time::Instant;
 
 use crate::connector::Connector;
 use crate::epoch::{Admit, EpochError, Epochs, Input};
-use crate::exec_orders::{ExecOrders, Queued, RpcIds, Rpcs, Shared};
+use crate::exec_orders::{ExecOrders, Queued, RpcIds, Rpcs, Shared, Submitted};
 use crate::pacing::ReconnectPacing;
 use crate::ratelimit::{RateError, RateLimiter, Refused, Request};
 use crate::session::SessionError;
@@ -901,12 +906,6 @@ impl<H: ExecHandler> ExecSession<H> {
             rpc,
             receipt: Err(reason),
         };
-        // fbc-oms's submit-time re-check of an authorization,
-        // `Authorization::check_at_submit` (FBC-afd, decision 0060; FBC-j5bw calls it), belongs
-        // here, at encode and before any nonce is reserved, not where
-        // `ExecOrders::submit` queued it: the kill switch or the market's StateGeneration may
-        // have moved since (decision 0057; PR #87 Reviewer B B7). The authorization is spent
-        // when this returns.
         let cmd = item.command();
         let current = self.orders.ready() == Some(key.epoch) && epoch == Some(key.epoch);
         // No place or amend before the epoch's arm is accepted and its resync has ended
@@ -916,6 +915,18 @@ impl<H: ExecHandler> ExecSession<H> {
         if !current || held {
             self.handler
                 .on_submitted(not_sent(NotSentReason::Disconnected));
+            return Ok(true);
+        }
+        // fbc-oms's re-check of an authorization (decision 0060), here at encode, before any
+        // nonce is reserved, not where `ExecOrders::submit` queued it: the kill switch, a
+        // disarm or another change of the market's state may have come since (decisions 0057,
+        // 0062; PR #87 Reviewer B B7). A refusal is `NotSent(StaleAuthorization)`, nothing
+        // reserved or written. The authorization is spent when this returns.
+        if let Submitted::Authorized(auth) = &item
+            && auth.check_at_submit().is_err()
+        {
+            self.handler
+                .on_submitted(not_sent(NotSentReason::StaleAuthorization));
             return Ok(true);
         }
         match self.encode(cmd, rpc, key)? {
