@@ -41,7 +41,13 @@ venue's to state: an amended update tied to it by a later venue ordering key con
 the total it states, or, stating none, at the record's filled quantity (already raised to the
 update's cumulative fill) plus the wire quantity, so later fills reduce the count from there;
 an amended update stating a total whose remainder at its own cumulative fill is the wire
-quantity confirms it too. An update that is not an amended one never confirms it. A refusal of
+quantity confirms it too, but only when no amend replaced in flight before it is unsettled and
+its cumulative fill is larger than any amended update applied before it stated. A remaining-
+quantity amend is not idempotent at the venue: the same remainder at the same price is the
+routine "top back up" amend, so an earlier amend's acknowledgement, replaced in flight or
+delivered again (a duplicate or a delayed one), must not confirm the one in flight (Reviewer
+A RA102-1 and Reviewer B RB-w5n-1 on PR #102). An update that is not an amended one never
+confirms it. A refusal of
 it, a later-keyed total stated with nothing in flight, or the order's end retires its wire
 quantity, as they retire an amend's total today.
 
@@ -62,6 +68,12 @@ the venue confirms it, so near the cap such amends are refused where an amend st
 total would be built. An amended update's cumulative fill becomes load-bearing on such a venue:
 a codec that turns an RPC reply into the amended event (`AmendAck::RpcReplyOnly`) must report
 the venue's cumulative fill, never a guess, or state the total.
+
+The guard costs liveness, never the count: on a feed without venue ordering keys, an amend
+acknowledged at the same cumulative fill as an earlier amended update, or acknowledged while an
+amend replaced in flight is unsettled, stays in flight and counted until a refusal, a later-
+keyed total or the order's end; neither a ladder query nor a resync snapshot confirms it
+(FBC-2tiv).
 
 ## What would show this was wrong
 

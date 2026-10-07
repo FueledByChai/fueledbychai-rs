@@ -236,6 +236,10 @@ pub struct OrderRecord {
     /// The wire quantity of the amend in flight when it states the remaining quantity
     /// ([`AmendQty::Remaining`](fbc_core::AmendQty::Remaining)); `None` for an amend stating the total, or no amend.
     intent_wire: Option<Lots>,
+    /// The largest cumulative fill an amended update applied to the record stated: a later
+    /// delivery of one of them (a duplicate or a delayed one) states no more, so only an
+    /// amended update stating more is surely new (FBC-w5n, RA102-1 and RB-w5n-1 on PR #102).
+    amended_cum: Option<Lots>,
     last_key: Option<OrderKey>,
     unknown_since: Option<MonoNs>,
     /// The nonce the placement was sent with, for venues that cancel by it.
@@ -297,6 +301,7 @@ impl OrderRecord {
             state: OrdState::PendingNew,
             intent: Intent::None,
             intent_wire: None,
+            amended_cum: None,
             last_key: None,
             unknown_since: None,
             placement_nonce: None,
@@ -739,7 +744,12 @@ impl OrderRecord {
     /// unconfirmed, and it carries a venue ordering key later than the last update's. Without
     /// that it may be a duplicate, or a late notice, of an older amend's confirmation (a new
     /// venue id first seen here included), and the amend stays in flight, counted
-    /// ([`Self::resting`]). A total stated while no command is in flight settles the amends
+    /// ([`Self::resting`]). A remaining-quantity amend ([`AmendQty::Remaining`](fbc_core::AmendQty::Remaining))
+    /// is confirmed only by an amended update: one tied to it so, or one stating a total whose
+    /// remainder at its cumulative fill is the amend's wire quantity, when nothing replaced in
+    /// flight is unsettled and its cumulative fill is larger than any amended update applied
+    /// before it stated; an equal one may repeat an earlier amend's (FBC-w5n, decision 0064).
+    /// A total stated while no command is in flight settles the amends
     /// replaced in flight before it, but only under a venue ordering key later than every one
     /// applied when they were replaced or while a command was in flight since: a delayed or
     /// duplicate update, or one on a feed without venue keys, may predate them. Either kind of update ends the order Filled when its
@@ -821,8 +831,18 @@ impl OrderRecord {
         }
         if let VenueOrderState::Amended { .. } = u.state {
             // Whether the update is the remaining-quantity amend in flight's: tied to it, or
-            // stating a total whose remainder at the update's cumulative fill is its wire.
+            // stating a total whose remainder at the update's cumulative fill is its wire, from
+            // an update no other amend can have produced. An amend replaced in flight before it
+            // may leave the same remainder (none is unsettled), and a duplicate or delayed
+            // delivery of an earlier amend's update states no larger cumulative fill than one
+            // already applied: such an update leaves the amend in flight, counted (RA102-1,
+            // RB-w5n-1 on PR #102). A remaining-quantity amend is not idempotent at the venue,
+            // so a wrong confirmation would drop its wire quantity while it may still rest.
+            let fresh = self.amended_cum.is_none_or(|c| u.cum_filled > c);
+            self.amended_cum = self.amended_cum.max(Some(u.cum_filled));
             let mut ties = stated
+                && fresh
+                && !self.has_unsettled()
                 && self.intent_wire.is_some()
                 && u.qty.and_then(|q| q.checked_sub(u.cum_filled)) == self.intent_wire;
             if let Intent::PendingAmend { px, qty, .. } = self.intent
@@ -999,7 +1019,8 @@ impl OrderRecord {
     /// price and total: the venue applied it, and with it every amend sent before it. A
     /// remaining-quantity amend's total is the venue's to state, so such an amend is resolved
     /// at its price by an amended update that `ties` to it instead: tied by ordering, or
-    /// stating its wire quantity as the remainder.
+    /// stating its wire quantity as the remainder with nothing replaced in flight unsettled
+    /// and a cumulative fill larger than any amended update applied before it stated.
     fn confirm_if_stated(&mut self, stated: bool, ties: bool) {
         if let Intent::PendingAmend { px, qty, rpc, .. } = self.intent
             && stated

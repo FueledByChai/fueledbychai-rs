@@ -173,6 +173,17 @@ fn resting(reg: &Registry) -> Lots {
     reg.resting_on(INST, Side::Buy).unwrap()
 }
 
+fn unkeyed(ingest: u64) -> OrderKey {
+    OrderKey {
+        venue: None,
+        ingest,
+    }
+}
+
+fn in_flight(reg: &Registry, c: ClientOrderId) -> bool {
+    matches!(reg.get(c).unwrap().intent(), Intent::PendingAmend { .. })
+}
+
 #[test]
 fn the_venue_rests_the_wire_quantity_on_top_of_fills_it_took_before_the_amend_applied() {
     // Codex r4172303663 on PR #8: 4 lots filled, the total amended to 10, the wire 6; 2 more
@@ -346,39 +357,33 @@ fn without_venue_ordering_keys_only_an_acknowledgement_stating_the_wire_as_remai
     let a = open(&mut reg, 10);
     fill_of(&mut reg, &mut l, a, 4, "f1");
     amend(&mut reg, a, 101, 10, 7);
-    let unkeyed = |n| OrderKey {
-        venue: None,
-        ingest: n,
-    };
     // A bare acknowledgement may be a duplicate of an older one: the amend stays in flight.
     reg.apply_update(&venue_update(a, amended(), 4, None, None), unkeyed(1));
-    assert!(matches!(
-        reg.get(a).unwrap().intent(),
-        Intent::PendingAmend { .. }
-    ));
+    assert!(in_flight(&reg, a));
     // Nor does an update other than an amended one confirm it, whatever it states.
     reg.apply_update(
         &venue_update(a, VenueOrderState::Open, 6, Some(101), Some(12)),
         unkeyed(2),
     );
-    assert!(matches!(
-        reg.get(a).unwrap().intent(),
-        Intent::PendingAmend { .. }
-    ));
+    assert!(in_flight(&reg, a));
     assert_eq!(resting(&reg), lots(6));
     // An amended update whose total leaves another remainder is not this amend's.
     reg.apply_update(
-        &venue_update(a, amended(), 6, Some(101), Some(11)),
+        &venue_update(a, amended(), 5, Some(101), Some(10)),
         unkeyed(3),
     );
-    assert!(matches!(
-        reg.get(a).unwrap().intent(),
-        Intent::PendingAmend { .. }
-    ));
-    // One leaving the wire quantity as the remainder is.
+    assert!(in_flight(&reg, a));
+    // Nor is one leaving the wire quantity at a cumulative fill an amended update applied
+    // already stated: it may repeat an earlier amend's (RA102-1, RB-w5n-1 on PR #102).
+    reg.apply_update(
+        &venue_update(a, amended(), 5, Some(101), Some(11)),
+        unkeyed(4),
+    );
+    assert!(in_flight(&reg, a));
+    // One leaving the wire quantity as the remainder at a larger cumulative fill is.
     reg.apply_update(
         &venue_update(a, amended(), 6, Some(101), Some(12)),
-        unkeyed(4),
+        unkeyed(5),
     );
     assert_eq!(reg.get(a).unwrap().intent(), Intent::None);
     assert_eq!(reg.get(a).unwrap().qty(), lots(12));
@@ -427,6 +432,77 @@ fn a_remaining_amend_replaced_in_flight_counts_until_the_venue_states_the_total_
     );
 }
 
+#[test]
+fn the_acknowledgement_of_an_amend_replaced_in_flight_does_not_confirm_the_amend_after_it() {
+    // Reviewer A RA102-1 (1) and Reviewer B RB-w5n-1 (3) on PR #102: A1 is replaced in flight
+    // by a refused cancel, and A2, at the same price and wire quantity, follows it. A1's
+    // acknowledgement leaves A2's wire quantity as the remainder: it is still not A2's.
+    let mut reg = registry(CAP, WIDE);
+    let mut l = ledger();
+    let a = open(&mut reg, 10);
+    reg.apply_update(
+        &venue_update(a, VenueOrderState::Open, 0, None, None),
+        keyed(1),
+    );
+    fill_of(&mut reg, &mut l, a, 4, "f1");
+    assert_eq!(amend(&mut reg, a, 101, 10, 7), lots(6));
+    assert!(reg.cancel_sent(a, RpcId(8), MonoNs(3)).unwrap());
+    outcome(&mut reg, a, OrderOp::Cancel(RpcId(8)), &refused());
+    assert_eq!(amend(&mut reg, a, 101, 10, 9), lots(6));
+    reg.apply_update(
+        &venue_update(a, amended(), 4, Some(101), Some(10)),
+        keyed(2),
+    );
+    assert!(in_flight(&reg, a), "A1's acknowledgement confirmed A2");
+    // 3 fill after A1 applied; A2 then rests its whole 6.
+    fill_of(&mut reg, &mut l, a, 3, "f2");
+    assert_eq!(resting(&reg), lots(6));
+    reg.apply_update(
+        &venue_update(a, amended(), 7, Some(101), Some(13)),
+        keyed(3),
+    );
+    assert_eq!(resting(&reg), lots(6));
+}
+
+#[test]
+fn a_duplicate_of_an_earlier_amends_acknowledgement_does_not_confirm_the_amend_in_flight() {
+    // Reviewer B RB-w5n-1 (1) and Reviewer A RA102-1 (2) on PR #102: A0 rests 6 and is
+    // confirmed; 2 fill; A1 tops the order back up to 6 at the same price. A0's
+    // acknowledgement delivered again leaves 6 as the remainder too.
+    for keys in [true, false] {
+        let key = |n: u64| if keys { keyed(n) } else { unkeyed(n) };
+        let mut reg = registry(CAP, WIDE);
+        let mut l = ledger();
+        let a = open(&mut reg, 6);
+        assert_eq!(amend(&mut reg, a, 101, 6, 7), lots(6));
+        let ack = venue_update(a, amended(), 0, Some(101), Some(6));
+        reg.apply_update(&ack, key(2));
+        assert!(!in_flight(&reg, a));
+        fill_of(&mut reg, &mut l, a, 2, "f1");
+        assert_eq!(resting(&reg), lots(4));
+        assert_eq!(amend(&mut reg, a, 101, 8, 8), lots(6));
+        // Delivered again: under the same venue key, or, without keys, later in ingest order.
+        let again = OrderKey {
+            venue: key(2).venue,
+            ingest: 3,
+        };
+        reg.apply_update(&ack, again);
+        assert!(
+            in_flight(&reg, a),
+            "a duplicate confirmed A1 (keys: {keys})"
+        );
+        assert_eq!(resting(&reg), lots(6));
+        // The venue applies A1 on its 2 filled, resting 6, then fills 4 more: 2 still rest.
+        fill_of(&mut reg, &mut l, a, 4, "f2");
+        assert_eq!(reg.get(a).unwrap().state(), OrdState::PartiallyFilled);
+        assert!(resting(&reg) >= lots(2));
+        // A1's own acknowledgement, at a cumulative fill no earlier one stated, confirms it.
+        reg.apply_update(&venue_update(a, amended(), 2, Some(101), Some(8)), key(4));
+        assert!(!in_flight(&reg, a));
+        assert_eq!(resting(&reg), lots(2));
+    }
+}
+
 // ---- generated interleavings ----
 
 fn config(cases: u32, seed: u64) -> ProptestConfig {
@@ -438,16 +514,20 @@ fn config(cases: u32, seed: u64) -> ProptestConfig {
     }
 }
 
-/// One step of a run: the OMS builds an amend; the venue fills, applies the amend in its
-/// queue, or reports the order; the OMS reads its fill feed or its order feed.
+/// One step of a run: the OMS builds an amend, or sends a cancel over the amend in flight; the
+/// venue fills, applies the amend in its queue, or reports the order; the OMS reads its fill
+/// feed or its order feed, or an order event it already read is delivered again.
 #[derive(Clone, Debug)]
 enum Step {
     /// The OMS amends the order to `qty` total at price 100 + `px`.
     Amend(i64, i64),
+    /// The OMS tops the order back up: an amend at the last amend's price whose wire carries
+    /// the last amend's wire quantity again (a market maker keeping the same size resting).
+    TopUp,
     /// The venue fills up to `qty` of what it rests.
     VenueFill(i64),
-    /// The venue applies the oldest amend sent to it; its acknowledgement states the total
-    /// when `states`.
+    /// The venue takes the oldest command sent to it: it applies an amend, its
+    /// acknowledgement stating the total when `states`, and refuses a cancel.
     Apply(bool),
     /// The venue reports the order, stating its total.
     Report,
@@ -455,16 +535,25 @@ enum Step {
     ReadFill,
     /// The OMS reads the next order event or command outcome.
     ReadOrder,
+    /// The OMS sends a cancel over the amend in flight, which the venue refuses when it
+    /// takes it: the amend is replaced in flight, and the venue applies it first.
+    Cancel,
+    /// An order event the OMS already read is delivered again (the `n`th of them, cycling):
+    /// a duplicate under its venue key, or, without venue keys, later in ingest order.
+    Redeliver(usize),
 }
 
 fn step() -> impl Strategy<Value = Step> {
     prop_oneof![
         2 => (1..30i64, 0..3i64).prop_map(|(q, p)| Step::Amend(q, p)),
+        1 => Just(Step::TopUp),
         3 => (1..8i64).prop_map(Step::VenueFill),
         2 => any::<bool>().prop_map(Step::Apply),
         1 => Just(Step::Report),
         3 => Just(Step::ReadFill),
         3 => Just(Step::ReadOrder),
+        1 => Just(Step::Cancel),
+        1 => any::<usize>().prop_map(Step::Redeliver),
     ]
 }
 
@@ -472,17 +561,26 @@ fn step() -> impl Strategy<Value = Step> {
 enum OrderMsg {
     Update(OrderUpdate, OrderKey),
     Refused(RpcId),
+    CancelRefused(RpcId),
+}
+
+/// A command the venue has not taken yet: an amend (request, price and wire quantity) or a
+/// cancel.
+enum Cmd {
+    Amend(RpcId, i64, i64),
+    Cancel(RpcId),
 }
 
 /// The venue: one order, its total, its fills and its price, and what it has sent on each
-/// feed; each feed delivers in order, the two in any order between them.
+/// feed; it takes commands in the order sent, each feed delivers in order, the two in any
+/// order between them.
 struct Venue {
     qty: i64,
     cum: i64,
     px: i64,
     live: bool,
-    /// The amends sent to it and not yet applied: request, price and wire quantity.
-    inbox: VecDeque<(RpcId, i64, i64)>,
+    /// The commands sent to it and not yet taken.
+    inbox: VecDeque<Cmd>,
     fills: VecDeque<i64>,
     orders: VecDeque<OrderMsg>,
     /// The venue's ordering key of the next order event, when it gives them.
@@ -520,6 +618,10 @@ proptest! {
         let mut reg = registry(CAP, WIDE);
         let mut l = ledger();
         let a = open(&mut reg, start);
+        // The order events the OMS read, for delivering again.
+        let mut read: Vec<(OrderUpdate, OrderKey)> = Vec::new();
+        // The last amend's price offset and wire quantity, for topping up.
+        let mut last: Option<(i64, i64)> = None;
         let mut v = Venue {
             qty: start,
             cum: 0,
@@ -532,6 +634,13 @@ proptest! {
         };
         for (n, step) in steps.into_iter().enumerate() {
             let n = n as u64 + 10;
+            let step = match (step, last) {
+                (Step::TopUp, Some((p, wire))) => {
+                    Step::Amend(reg.get(a).unwrap().filled().get() + wire, p)
+                }
+                (Step::TopUp, None) => continue,
+                (other, _) => other,
+            };
             match step {
                 Step::Amend(qty, p) => {
                     let worst = reg.inventory(INST).0 + reg.get(a).unwrap().exposure().get();
@@ -548,8 +657,10 @@ proptest! {
                     // on the position, fit the cap.
                     prop_assert!(worst + wire.get() <= CAP);
                     reg.amend_sent(a, Ticks(100 + p), lots(qty), RpcId(n), MonoNs(n)).unwrap();
-                    v.inbox.push_back((RpcId(n), 100 + p, wire.get()));
+                    v.inbox.push_back(Cmd::Amend(RpcId(n), 100 + p, wire.get()));
+                    last = Some((p, wire.get()));
                 }
+                Step::TopUp => unreachable!("made an amend above"),
                 Step::VenueFill(q) => {
                     let q = q.min(v.resting());
                     if q > 0 {
@@ -566,7 +677,14 @@ proptest! {
                     }
                 }
                 Step::Apply(states) => {
-                    let Some((rpc, px, wire)) = v.inbox.pop_front() else { continue };
+                    let (rpc, px, wire) = match v.inbox.pop_front() {
+                        Some(Cmd::Amend(rpc, px, wire)) => (rpc, px, wire),
+                        Some(Cmd::Cancel(rpc)) => {
+                            v.orders.push_back(OrderMsg::CancelRefused(rpc));
+                            continue;
+                        }
+                        None => continue,
+                    };
                     if !v.live {
                         v.orders.push_back(OrderMsg::Refused(rpc));
                         continue;
@@ -597,12 +715,40 @@ proptest! {
                 Step::ReadOrder => match v.orders.pop_front() {
                     Some(OrderMsg::Update(u, key)) => {
                         reg.apply_update(&u, key);
+                        read.push((u, key));
                     }
                     Some(OrderMsg::Refused(rpc)) => {
                         outcome(&mut reg, a, OrderOp::Amend(rpc), &refused());
                     }
+                    Some(OrderMsg::CancelRefused(rpc)) => {
+                        outcome(&mut reg, a, OrderOp::Cancel(rpc), &refused());
+                    }
                     None => {}
                 },
+                Step::Cancel => {
+                    if matches!(reg.get(a).unwrap().intent(), Intent::PendingAmend { .. }) {
+                        reg.cancel_sent(a, RpcId(n), MonoNs(n)).unwrap();
+                        v.inbox.push_back(Cmd::Cancel(RpcId(n)));
+                    }
+                }
+                Step::Redeliver(i) => {
+                    // Without venue keys, an older event read again while nothing is in flight
+                    // may lower any total (0005's unordered feeds, not this ticket's): only the
+                    // last one read is delivered again then.
+                    let pending = matches!(
+                        reg.get(a).unwrap().intent(),
+                        Intent::PendingAmend { .. }
+                    );
+                    let pick = match read.len() {
+                        0 => None,
+                        len if keys || pending => Some(i % len),
+                        len => Some(len - 1),
+                    };
+                    if let Some(i) = pick {
+                        let (u, key) = read[i].clone();
+                        reg.apply_update(&u, OrderKey { venue: key.venue, ingest: n });
+                    }
+                }
             }
             let counted = reg.resting_on(INST, Side::Buy).unwrap().get();
             prop_assert!(
