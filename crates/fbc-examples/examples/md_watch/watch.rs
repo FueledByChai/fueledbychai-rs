@@ -37,20 +37,36 @@ use crate::args::{Market, Options};
 /// Where the lines go: standard output when run, a buffer under test.
 pub type Out = Rc<RefCell<dyn Write>>;
 
-/// The lines' destination and what ends md_watch when it is closed: the first write that fails
-/// (standard output closed, as `md_watch ... | head` closes it) wakes the stop, since nothing
-/// md_watch prints after that is seen.
+/// The lines' destination and what ends md_watch when it fails: the first write that fails
+/// wakes the stop, since nothing md_watch prints after that is seen, and is kept so `run` can
+/// report it. Standard output closed (`md_watch ... | head`) is the reader leaving, not a
+/// failure; any other error (a full disk under `> watch.log`) is returned.
 #[derive(Clone)]
 struct Sink {
     out: Out,
     closed: Rc<Notify>,
+    failed: Rc<RefCell<Option<std::io::Error>>>,
 }
 
 impl Sink {
     fn write_line(&self, line: std::fmt::Arguments<'_>) {
-        if writeln!(self.out.borrow_mut(), "{line}").is_err() {
-            // A permit is kept if the stop is not waiting yet, so no failure is missed.
-            self.closed.notify_one();
+        if let Err(e) = writeln!(self.out.borrow_mut(), "{line}") {
+            let mut failed = self.failed.borrow_mut();
+            if failed.is_none() {
+                *failed = Some(e);
+                // A permit is kept if the stop is not waiting yet, so no failure is missed.
+                self.closed.notify_one();
+            }
+        }
+    }
+
+    /// The first write error, unless it was standard output closing.
+    fn error(&self) -> Result<(), String> {
+        match self.failed.borrow().as_ref() {
+            Some(e) if e.kind() != std::io::ErrorKind::BrokenPipe => {
+                Err(format!("standard output: {e}"))
+            }
+            _ => Ok(()),
         }
     }
 }
@@ -567,7 +583,7 @@ async fn drive(wired: Option<&mut Wired>) -> Result<(), String> {
 
 /// Watches the markets `opts` names, printing to `out` (each line led by its UTC time when
 /// `stamps`), until `stop` completes, a write to `out` fails or a venue's sessions fail; a
-/// failure of the sessions is returned as text.
+/// failure of the sessions, or a write error other than a closed pipe, is returned as text.
 pub async fn run(
     opts: &Options,
     out: Out,
@@ -577,6 +593,7 @@ pub async fn run(
     let out = Sink {
         out,
         closed: Rc::new(Notify::new()),
+        failed: Rc::new(RefCell::new(None)),
     };
     let shard = Shard {
         opts,
@@ -656,5 +673,6 @@ pub async fn run(
         never = flusher => never,
     };
     flush(&watchers);
-    ran
+    ran?;
+    out.error()
 }
