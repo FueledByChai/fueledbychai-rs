@@ -148,6 +148,20 @@
 //! cancel-all only once 0005's I7 guard it was built under moved (the registry's hold of the
 //! market's exclusive lease changed, or an order not ours was seen on the market), never for
 //! the kill switch alone; and a cancel or a cancel-many always goes through.
+//!
+//! The execution planner (decision 0005's one planner, decision 0065; `tests/planner.rs`):
+//! the consumer's [`DesiredBook`], a [`DesiredQuote`] per side and level, defined here so
+//! strategy code produces it and this crate depends on no strategy (0001). The
+//! [`ExecutionPlanner`] diffs it against the orders it placed, per side and level, under the
+//! consumer's [`PlannerConfig`] (price and quantity replace thresholds and a minimum age, no
+//! default), and builds what closes the difference, each command through the one pre-trade
+//! path and the permits above and leaving as an [`Authorization`]: cancels, then reducing
+//! orders, then amends, then adds ([`Stage`]). A change is an amend where the venue's
+//! [`OrderCaps`](fbc_core::OrderCaps) admit it, otherwise a cancel, the level then waiting
+//! for the order's terminal state before the new one is placed; a level whose order is
+//! PendingNew or Unknown, or has a command in flight, is occupied until it settles
+//! ([`HeldReason`]); a place or amend the market's state or a cap refuses is never built
+//! ([`PlanRefusal`]).
 
 mod caps;
 mod entry;
@@ -156,6 +170,7 @@ mod grant;
 mod ladder;
 mod ledger;
 mod permit;
+mod planner;
 mod record;
 mod registry;
 mod resync;
@@ -181,6 +196,10 @@ pub use ledger::{
 pub use permit::{
     AmendRefusal, CancelChoice, CancelPlan, Cancellable, Live, PermitRefusal, PermittedCommand,
     PlacePlan,
+};
+pub use planner::{
+    DesiredBook, DesiredQuote, ExecutionPlanner, Held, HeldReason, Plan, PlanRefusal, Planned,
+    PlannerConfig, PlannerConfigError, Refused, Stage,
 };
 pub use record::{
     Applied, FillApplied, Intent, LadderStep, OrdState, OrderKey, OrderOp, OrderRecord,

@@ -295,49 +295,8 @@ impl<'r> Live<'r> {
     ) -> Result<PermittedCommand, AmendRefusal> {
         let admits = self.state.map_err(AmendRefusal::State)?;
         let rec = &*self.rec;
-        let amend_caps = caps.amend.as_ref().ok_or(AmendRefusal::NotAmendable)?;
-        if rec.placed().kind == OrderKind::Market {
-            return Err(AmendRefusal::NotLimit);
-        }
-        let filled = rec.filled();
-        if filled > Lots::ZERO && !amend_caps.when_partially_filled {
-            return Err(AmendRefusal::PartiallyFilled);
-        }
-        if rec.px() != Some(px) && !amend_caps.price {
-            return Err(AmendRefusal::PriceNotAmendable);
-        }
-        if qty != rec.qty() && !amend_caps.qty {
-            return Err(AmendRefusal::QtyNotAmendable);
-        }
-        if qty <= filled {
-            return Err(AmendRefusal::NothingToRest);
-        }
         let placed = rec.placed();
-        let amend = AmendOrder {
-            target: rec.order_ref(caps),
-            inst: placed.inst,
-            side: placed.side,
-            tif: placed.tif,
-            channel: placed.channel,
-            post_only: placed.post_only,
-            reduce_only: placed.reduce_only,
-            reducing,
-            px,
-            qty,
-            cum_filled: filled,
-        };
-        if amend.reference(amend_caps).is_none() {
-            return Err(AmendRefusal::NoDeclaredReference);
-        }
-        // On a venue whose amend states the remaining quantity, what its wire carries (FBC-w5n).
-        let wire = match amend_caps.qty_semantics {
-            AmendQty::Remaining => Some(
-                amend
-                    .wire_qty(AmendQty::Remaining)
-                    .ok_or(AmendRefusal::NothingToRest)?,
-            ),
-            AmendQty::TotalIncludingFilled => None,
-        };
+        let (amend, wire) = amend_shape(rec, caps, px, qty, reducing)?;
         let exposure = rec.exposure_if_amended(qty, wire);
         admits
             .judge(&self.exposure, reducing || placed.reduce_only, exposure)
@@ -356,6 +315,63 @@ impl<'r> Live<'r> {
             guard: Guard::state(self.generation),
         })
     }
+}
+
+/// The amend of `rec` to `px` and the total `qty` the venue's caps admit, with the quantity its
+/// wire carries on a venue whose amend states the remaining quantity: everything
+/// [`Live::amend`] judges before the market's state and the caps, which it changes nothing to
+/// judge, so the planner asks it before choosing an amend over a cancel and replace.
+pub(crate) fn amend_shape(
+    rec: &OrderRecord,
+    caps: &OrderCaps,
+    px: Ticks,
+    qty: Lots,
+    reducing: bool,
+) -> Result<(AmendOrder, Option<Lots>), AmendRefusal> {
+    let amend_caps = caps.amend.as_ref().ok_or(AmendRefusal::NotAmendable)?;
+    let placed = rec.placed();
+    if placed.kind == OrderKind::Market {
+        return Err(AmendRefusal::NotLimit);
+    }
+    let filled = rec.filled();
+    if filled > Lots::ZERO && !amend_caps.when_partially_filled {
+        return Err(AmendRefusal::PartiallyFilled);
+    }
+    if rec.px() != Some(px) && !amend_caps.price {
+        return Err(AmendRefusal::PriceNotAmendable);
+    }
+    if qty != rec.qty() && !amend_caps.qty {
+        return Err(AmendRefusal::QtyNotAmendable);
+    }
+    if qty <= filled {
+        return Err(AmendRefusal::NothingToRest);
+    }
+    let amend = AmendOrder {
+        target: rec.order_ref(caps),
+        inst: placed.inst,
+        side: placed.side,
+        tif: placed.tif,
+        channel: placed.channel,
+        post_only: placed.post_only,
+        reduce_only: placed.reduce_only,
+        reducing,
+        px,
+        qty,
+        cum_filled: filled,
+    };
+    if amend.reference(amend_caps).is_none() {
+        return Err(AmendRefusal::NoDeclaredReference);
+    }
+    // On a venue whose amend states the remaining quantity, what its wire carries (FBC-w5n).
+    let wire = match amend_caps.qty_semantics {
+        AmendQty::Remaining => Some(
+            amend
+                .wire_qty(AmendQty::Remaining)
+                .ok_or(AmendRefusal::NothingToRest)?,
+        ),
+        AmendQty::TotalIncludingFilled => None,
+    };
+    Ok((amend, wire))
 }
 
 /// The permit to cancel an order: it is not terminal. Only the
