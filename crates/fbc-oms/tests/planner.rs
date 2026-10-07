@@ -24,14 +24,16 @@ use common::{cid, fill, fill_id, lease_dir, lots, order_caps, placement, vid};
 use fbc_core::{
     AccountKey, AckLevel, AmendAck, AmendCaps, AmendQty, Bps, CancelReason, Channel, CidMatch,
     CidMint, ClientOrderId, ExchNs, ExchTsKind, FillIdent, InstrumentId, ItemRef, Lots, MonoNs,
-    Namespace, NamespaceLease, OrderCaps, OrderKind, OrderRef, OrderUpdate, RefKind, RpcId, Side,
-    SignedLots, SubmitOutcome, TagSet, Ticks, Tif, VenueCommand, VenueOrderState, WallNs,
+    Namespace, NamespaceLease, NotSentReason, OrderCaps, OrderKind, OrderRef, OrderUpdate, RefKind,
+    Reject, RejectKind, RpcId, Side, SignedLots, SubmitOutcome, TagSet, Ticks, Tif, VenueCommand,
+    VenueOrderState, WallNs,
 };
 use fbc_oms::{
     Admission, AmendRefusal, CapRefusal, DesiredBook, DesiredQuote, ExecutionPlanner, ExitRefusal,
-    FillLedger, FillRouted, FillTime, HeldReason, LadderConfig, LedgerConfig, MarketCapsConfig,
-    OmsError, OrdState, OrderKey, OrderOp, Plan, PlanError, PlanRefusal, PlannerConfig,
-    PlannerConfigError, PreTradeCaps, Refused, Registry, ResyncSnapshot, Stage, StateRefusal,
+    FillLedger, FillRouted, FillTime, HeldReason, Intent, LadderConfig, LedgerConfig,
+    MarketCapsConfig, OmsError, OrdState, OrderKey, OrderOp, Plan, PlanError, PlanRefusal,
+    PlannerConfig, PlannerConfigError, PreTradeCaps, Refused, Registry, ResyncSnapshot, Stage,
+    StateRefusal,
 };
 
 const INST: InstrumentId = InstrumentId::new(1);
@@ -816,6 +818,126 @@ fn a_level_pulled_before_the_acknowledgement_and_wanted_again_is_cancelled_then_
         VenueCommand::Place(o) => assert_eq!(o.kind, OrderKind::Limit { px: Ticks(10_020) }),
         other => panic!("expected a place, got {other:?}"),
     }
+}
+
+/// FBC-cit6 (Codex P1 on PR #103, r4206969090): an amend sent, then replaced in flight by a
+/// cancel when the level is pulled, the cancel then refused (`refused`): nothing is in flight,
+/// but the amend may still reach the venue. A level wanted again is held, with no second amend
+/// built over the unconfirmed one, whether at a new price or at the order's pre-amend price,
+/// until a venue update ordered after it settles the amend; then it is amended.
+fn a_level_whose_replaced_amend_is_unconfirmed_is_held_until_it_settles(refused: SubmitOutcome) {
+    let mut reg = quoting(WIDE, 0);
+    let mut mint = mint();
+    let mut p = planner();
+    let opened = open_book(
+        &mut p,
+        &book().with(Side::Buy, 0, quote(10_000, 5)),
+        &mut reg,
+        &amending(),
+        &mut mint,
+    );
+    let c = opened.commands[0].cid;
+    // Resting, under a venue ordering key.
+    let ordered = |venue, ingest| OrderKey {
+        venue: Some(venue),
+        ingest,
+    };
+    reg.apply_update(
+        &update(c, Side::Buy, "v-Buy-0", VenueOrderState::Open, 0),
+        ordered(1, 2),
+    );
+    // Amended to 10 004 and sent.
+    let amended = p
+        .plan(
+            &book().with(Side::Buy, 0, quote(10_004, 5)),
+            &mut reg,
+            &amending(),
+            ACCT,
+            &mut mint,
+            LATER,
+        )
+        .unwrap();
+    assert_eq!(shape(&amended), vec![(Stage::Amend, "amend", Side::Buy, 0)]);
+    assert!(
+        reg.amend_sent(c, Ticks(10_004), lots(5), RpcId(1), LATER)
+            .unwrap()
+    );
+    // Pulled while the amend is in flight: a cancel, sent, then refused or never sent.
+    let pulled = p
+        .plan(&book(), &mut reg, &amending(), ACCT, &mut mint, LATER)
+        .unwrap();
+    assert_eq!(
+        shape(&pulled),
+        vec![(Stage::Cancel, "cancel", Side::Buy, 0)]
+    );
+    assert!(reg.cancel_sent(c, RpcId(2), LATER).unwrap());
+    let item = ItemRef {
+        idx: 0,
+        cid: None,
+        vid: None,
+    };
+    reg.on_outcome(c, OrderOp::Cancel(RpcId(2)), &item, &refused, LATER)
+        .unwrap();
+    let rec = reg.get(c).unwrap();
+    assert_eq!(rec.intent(), Intent::None);
+    assert!(rec.amend_unconfirmed());
+    // Wanted again, at a new price or at the pre-amend one: held, nothing built.
+    let then = MonoNs(LATER.0 * 2);
+    for px in [10_020, 10_000] {
+        let again = p
+            .plan(
+                &book().with(Side::Buy, 0, quote(px, 5)),
+                &mut reg,
+                &amending(),
+                ACCT,
+                &mut mint,
+                then,
+            )
+            .unwrap();
+        assert!(again.commands.is_empty(), "at {px}: {:?}", shape(&again));
+        assert_eq!(held(&again), vec![(Side::Buy, 0, HeldReason::InFlight)]);
+    }
+    // An update under an earlier venue key settles nothing: still held.
+    let mut stated = update(c, Side::Buy, "v-Buy-0", VenueOrderState::Open, 0);
+    stated.px = Some(Ticks(10_004));
+    stated.qty = Some(lots(5));
+    reg.apply_update(&stated, ordered(1, 3));
+    let moved = book().with(Side::Buy, 0, quote(10_020, 5));
+    let still = p
+        .plan(&moved, &mut reg, &amending(), ACCT, &mut mint, then)
+        .unwrap();
+    assert!(still.commands.is_empty());
+    assert_eq!(held(&still), vec![(Side::Buy, 0, HeldReason::InFlight)]);
+    // The venue states the amended order under a later key: settled, and amended once more.
+    reg.apply_update(&stated, ordered(2, 4));
+    assert!(!reg.get(c).unwrap().amend_unconfirmed());
+    let settled = p
+        .plan(&moved, &mut reg, &amending(), ACCT, &mut mint, then)
+        .unwrap();
+    assert_eq!(shape(&settled), vec![(Stage::Amend, "amend", Side::Buy, 0)]);
+    assert!(settled.held.is_empty());
+    match settled.commands[0].auth.command() {
+        VenueCommand::Amend(a) => assert_eq!((a.px, a.qty), (Ticks(10_020), lots(5))),
+        other => panic!("expected an amend, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_level_whose_replaced_amend_is_unconfirmed_after_a_rejected_cancel_is_held_until_it_settles() {
+    a_level_whose_replaced_amend_is_unconfirmed_is_held_until_it_settles(SubmitOutcome::Rejected(
+        Reject {
+            kind: RejectKind::Other,
+            venue_code: None,
+            raw: "refused".into(),
+        },
+    ));
+}
+
+#[test]
+fn a_level_whose_replaced_amend_is_unconfirmed_after_a_cancel_not_sent_is_held_until_it_settles() {
+    a_level_whose_replaced_amend_is_unconfirmed_is_held_until_it_settles(SubmitOutcome::NotSent(
+        NotSentReason::Disconnected,
+    ));
 }
 
 #[test]
