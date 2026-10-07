@@ -349,7 +349,11 @@ rather than guess.
     to the hand-built `rest-*.json` responses in `fixtures/paradex/exec/`); the read-only
     private-stream codec, an `ExecCodec` that logs in, authenticates its socket, subscribes the
     private channels once per connection, decodes them and refuses every command
-    (`src/exec/read_only.rs`, 0061); and, in `tests/oracle/` with `fbc-book` as a dev-dependency only, the
+    (`src/exec/read_only.rs`, 0061); its order-entry commands encoded as the socket's signed
+    JSON-RPC frames (`order.create`, `order.create_batch`, `order.modify`, `order.cancel`,
+    `order.cancel_batch`, `order.cancel_all`, `order.cancel_on_disconnect`) from the command and
+    `EncodeCtx` only (`src/exec/encode.rs`, `ParadexEncoder`, for FBC-xvf's codec); and, in
+    `tests/oracle/` with `fbc-book` as a dev-dependency only, the
     BT-401 book and bbo-touch agreement checks), later `crates/venues/fbc-venue-hibachi`
     (0016).
   - Dependency direction (design §3): `fbc-core`, `fbc-book`, `fbc-oms`, `fbc-journal` and
