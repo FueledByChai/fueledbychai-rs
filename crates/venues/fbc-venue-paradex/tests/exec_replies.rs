@@ -7,7 +7,8 @@
 //! cancel_on_disconnect's answers. Each error code docs.paradex.trade's WebSocket "Error
 //! Handling" page documents as a refusal maps to its `RejectKind` by code; an internal error
 //! and an undocumented code are `Unknown`, as is the timeout of a request no reply answered,
-//! and an error frame with no id is an `UncorrelatedError`.
+//! and an error frame with no id is an `UncorrelatedError`. FBC-cexu: a JSON null member
+//! (error, result, order, a batch item's error) is absent, and a refusal keeps `error.data`.
 //!
 //! The frames are the hand-built ones in `fixtures/paradex/exec/` (SYNTHETIC).
 
@@ -507,7 +508,13 @@ fn a_method_error_refuses_a_cancel_and_leaves_the_order_as_it_was() {
         vec![outcome(
             20,
             None,
-            rejected(RejectKind::Other, Some("100"), "method error")
+            // The error's data is kept beside its message, as the Java client keeps it
+            // (FBC-cexu, Reviewer B RB-3 on PR #104).
+            rejected(
+                RejectKind::Other,
+                Some("100"),
+                r#"method error "synthetic detail""#
+            )
         )]
     );
     // A refusal is the command's outcome: no order update comes of it.
@@ -740,5 +747,124 @@ fn a_modify_reply_naming_another_client_id_or_a_batch_error_that_is_not_text_is_
     assert_eq!(
         refused(&mut replies, &text),
         DecodeError::Malformed("item error")
+    );
+}
+
+/// FBC-cexu (Reviewer B RB-1 on PR #104): a JSON null member is absent, as the Java client
+/// reads it (`ParadexOrderWebSocketClient`: `has("error") && !get("error").isJsonNull()`).
+#[test]
+fn a_result_beside_a_null_error_decodes_as_the_result_s_outcome() {
+    let mut replies = sent(11, VenueCommand::Place(order(0)));
+    let text = fixture("reply-create.json").replace(r#""id":11}"#, r#""error":null,"id":11}"#);
+    // An ack carrying "error": null confirms; it does not wait for its timeout.
+    assert_eq!(
+        answered(&mut replies, &text),
+        vec![outcome(
+            11,
+            item(0, Some(cid(0)), Some(vid(OID))),
+            PROVISIONAL
+        )]
+    );
+    assert_eq!(format!("{replies:?}"), "ParadexReplies { requests: 0, .. }");
+
+    let mut replies = sent(18, VenueCommand::Cancel(cancel(OrderRef::Venue(vid(OID)))));
+    let text = format!(
+        r#"{{"jsonrpc":"2.0","error":null,"result":{{"order_id":"{OID}","status":"QUEUED_FOR_CANCELLATION"}},"id":18}}"#
+    );
+    assert_eq!(
+        answered(&mut replies, &text),
+        vec![outcome(18, item(0, None, Some(vid(OID))), PROVISIONAL)]
+    );
+
+    // A frame with no id whose error is null is no error: not this tracker's.
+    let (result, events) = read(&mut replies, r#"{"jsonrpc":"2.0","error":null}"#);
+    assert_eq!((result, events), (Ok(ReplyRead::NotOurs), vec![]));
+}
+
+#[test]
+fn a_create_batch_item_with_an_order_beside_a_null_error_is_created() {
+    let mut replies = sent(13, VenueCommand::PlaceBatch(vec![order(0), order(1)]));
+    let text = fixture("reply-create-batch-mixed.json").replace(
+        r#","received_at":1759622400124001000},{"error""#,
+        r#","received_at":1759622400124001000,"error":null},{"order":null,"error""#,
+    );
+    assert_eq!(
+        answered(&mut replies, &text),
+        vec![
+            outcome(13, item(0, Some(cid(0)), Some(vid(OID))), PROVISIONAL),
+            outcome(13, item(1, Some(cid(1)), None), SubmitOutcome::Unknown),
+        ]
+    );
+    // An item whose order and error are both null is neither: refused.
+    let mut replies = sent(13, VenueCommand::PlaceBatch(vec![order(0)]));
+    let text = r#"{"jsonrpc":"2.0","result":{"results":[{"order":null,"error":null}]},"id":13}"#;
+    assert_eq!(
+        refused(&mut replies, text),
+        DecodeError::Malformed("a result is an order or an error")
+    );
+}
+
+#[test]
+fn a_null_result_beside_a_real_error_decodes_as_that_error() {
+    let mut replies = sent(20, VenueCommand::Cancel(cancel(OrderRef::Venue(vid(OID)))));
+    let text =
+        r#"{"jsonrpc":"2.0","result":null,"error":{"code":100,"message":"method error"},"id":20}"#;
+    assert_eq!(
+        answered(&mut replies, text),
+        vec![outcome(
+            20,
+            None,
+            rejected(RejectKind::Other, Some("100"), "method error")
+        )]
+    );
+    // Both null is neither a result nor an error: refused, and the request still waits.
+    let mut replies = sent(11, VenueCommand::Place(order(0)));
+    let text = r#"{"jsonrpc":"2.0","result":null,"error":null,"id":11}"#;
+    assert_eq!(
+        refused(&mut replies, text),
+        DecodeError::Malformed("a reply is a result or an error")
+    );
+    assert_eq!(timed_out(&mut replies, 11), unknown_whole(11));
+}
+
+#[test]
+fn a_rejected_reply_s_raw_keeps_error_data_when_present() {
+    // Data of any JSON type is kept as its JSON text after the message, as the Java client
+    // builds its exception message; a null data is absent.
+    for (data, raw) in [
+        (
+            r#","data":{"reason":"synthetic"}"#,
+            r#"Rate limit exceeded {"reason":"synthetic"}"#,
+        ),
+        (
+            r#","data":"synthetic""#,
+            r#"Rate limit exceeded "synthetic""#,
+        ),
+        (r#","data":null"#, "Rate limit exceeded"),
+        ("", "Rate limit exceeded"),
+    ] {
+        let mut replies = sent(32, VenueCommand::Place(order(0)));
+        let text = format!(
+            r#"{{"jsonrpc":"2.0","error":{{"code":42901,"message":"Rate limit exceeded"{data}}},"id":32}}"#
+        );
+        let limited = RejectKind::RateLimited { retry_after: None };
+        assert_eq!(
+            answered(&mut replies, &text),
+            vec![outcome(32, None, rejected(limited, Some("42901"), raw))],
+            "{text}"
+        );
+    }
+    // An error with no id keeps its data too.
+    let mut replies = ParadexReplies::new();
+    let text =
+        r#"{"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error","data":"synthetic"}}"#;
+    let parse = Reject {
+        kind: RejectKind::Other,
+        venue_code: Some("-32700".into()),
+        raw: r#"Parse error "synthetic""#.into(),
+    };
+    assert_eq!(
+        answered(&mut replies, text),
+        vec![ExecEvent::UncorrelatedError(parse)]
     );
 }
