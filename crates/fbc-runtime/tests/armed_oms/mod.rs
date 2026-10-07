@@ -21,8 +21,8 @@ use fbc_core::{
     VenueFactory, VenueOrderSnapshot, VenueOrderState, WallNs, WireUrl,
 };
 use fbc_oms::{
-    Authorization, CancelChoice, LadderConfig, LeaseKeys, Leases, MarketCapsConfig, OrderKey,
-    OrderOp, PreTradeCaps, Registry, ResyncSnapshot,
+    Authorization, CancelChoice, CancelEverything, LadderConfig, LeaseKeys, Leases,
+    MarketCapsConfig, OrderKey, OrderOp, PreTradeCaps, Registry, ResyncSnapshot,
 };
 use fbc_runtime::{
     Connector, ExecSessionConfig, IngestClock, ProxyConfig, RateLimiter, ReconnectPacing, RpcIds,
@@ -264,6 +264,22 @@ impl Oms {
             panic!("a cancel of an acknowledged order is sent");
         };
         self.reg.authorize(ACCT, cmd).unwrap()
+    }
+
+    /// The kill switch's instrument cancel-all of the toy's market, built and authorized: the
+    /// toy has one, the registry holds the market's exclusive lease, a resync showed the
+    /// account's open orders and no order not ours is in view (0005's I7), and every order of
+    /// ours on it is acknowledged, so no explicit cancel comes with it.
+    pub fn cancel_all(&mut self) -> Authorization {
+        let CancelEverything::CancelAll {
+            command,
+            unanswered,
+        } = self.reg.cancel_everything(INST_A, &order_caps())
+        else {
+            panic!("0005's I7 guard holds");
+        };
+        assert!(unanswered.commands.is_empty(), "{unanswered:?}");
+        self.reg.authorize(ACCT, command).unwrap()
     }
 
     /// A batch of `n` post-only buys of 5 lots each at successive prices, built and authorized.
