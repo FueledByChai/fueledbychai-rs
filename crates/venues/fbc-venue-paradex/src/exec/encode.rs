@@ -32,11 +32,11 @@
 //! Before anything is signed, an order (a placement, a batch item or an amend) of a time in
 //! force, kind or channel the caps do not declare is `NotSent(Unsupported)`, as is an amend or a
 //! cancel whose references are undeclared for it (a batch cancel takes venue ids only), a batch
-//! longer than its declared maximum, a dead-man refresh and a fee query; an order combining a
-//! pair the caps declare in conflict is `NotSent(FlagConflict)`. What cannot be written is
-//! `Unencodable`: an instrument missing from the spec table, an empty batch, a size of zero or
-//! out of range, a price off the grid, a wall time before 1970, and an amend to its filled
-//! quantity or below. A signer that fails is `SignFailed`. A refusal pushes no effect.
+//! longer than its declared maximum, a market order that is post-only or RPI, a dead-man refresh
+//! and a fee query; an order combining a pair the caps declare in conflict is
+//! `NotSent(FlagConflict)`. What cannot be written is `Unencodable`: an instrument missing from
+//! the spec table, an empty batch, a size of zero or out of range, a price off the grid, a wall
+//! time before 1970, and an amend to its filled quantity or below. A signer that fails is `SignFailed`. A refusal pushes no effect.
 //!
 //! An order query is not a frame: the order-entry codec (FBC-xvf) builds it as the REST
 //! request FBC-0sc defines, so this encoder refuses it as `NotSent(Unsupported)`.
@@ -245,8 +245,15 @@ impl ParadexEncoder {
         (!conflict).then_some(()).ok_or(FlagConflict)
     }
 
+    /// Refuses a placement [`Self::declared`] refuses, and a market order that is post-only or
+    /// on the RPI channel: both instructions rest on the book, which a market order never does
+    /// (docs.paradex.trade `trading/orders/order-instructions`), and the caps cannot pair a
+    /// feature with a kind.
     fn check_place(&self, o: &NewOrder) -> Result<(), NotSentReason> {
-        self.declared(o.kind.tag(), o.tif, o.channel, (o.post_only, o.reduce_only))
+        self.declared(o.kind.tag(), o.tif, o.channel, (o.post_only, o.reduce_only))?;
+        let resting = o.post_only || o.channel == Channel::Rpi;
+        let market = matches!(o.kind, OrderKind::Market);
+        (!(market && resting)).then_some(()).ok_or(Unsupported)
     }
 
     fn cid(&self, cid: ClientOrderId) -> Result<WireCid, NotSentReason> {
