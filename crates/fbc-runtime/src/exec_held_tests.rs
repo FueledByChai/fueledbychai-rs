@@ -14,9 +14,6 @@
 #[path = "../tests/common/mod.rs"]
 #[allow(unused_imports)]
 mod common;
-#[path = "../../fbc-conformance/src/toy/mod.rs"]
-#[allow(dead_code, unused_imports)]
-mod toy;
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -25,6 +22,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use common::ScriptedWs;
+use fbc_conformance::toy::{self, INST_A, OWN_NS, ToyExec, ToySigner};
 use fbc_core::{
     AccountKey, AccountSummary, AmendOrder, AssetKey, CancelOrder, Channel, CidMint, ClientOrderId,
     ConfigError, EndpointPlan, Envelope, ExecCodec, ExecEndpoint, ExecEvent, FieldSpec, HttpPlan,
@@ -33,7 +31,6 @@ use fbc_core::{
     SubmitOutcome, Subscription, SymbolError, Ticks, Tif, VenueCaps, VenueCommand, VenueConfig,
     VenueError, VenueFactory, WallNs, WireUrl,
 };
-use toy::{INST_A, OWN_NS, ToyExec, ToySigner};
 
 use super::Submitted;
 use crate::{
