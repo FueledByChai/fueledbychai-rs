@@ -41,9 +41,17 @@
 //! `Unknown` for every item of a request no reply answered, and adds nothing to one whose every
 //! item was already reported `Unknown`. Replies state no venue time or sequence of their own,
 //! so their events carry [`VenueMeta::NONE`].
+//!
+//! A member that is JSON `null` is read as absent, as the Java client on this socket reads it
+//! (`ParadexOrderWebSocketClient`): `"error": null` beside a result is a result, `"result":
+//! null` beside an error is an error, and so are a batch item's `"error": null` beside its
+//! order and `"order": null` beside its error. A refusal's `raw` is the error's message
+//! followed, when the error states a `data` member that is not null, by a space and that
+//! member's JSON text, as the Java client builds its exception message.
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use fbc_core::{
     AckLevel, ChosenRef, ClientOrderId, DecodeError, DecodeScope, ExecEvent, ExecSink, ItemRef,
@@ -195,8 +203,8 @@ impl ParadexReplies {
     ) -> Result<ReplyRead, DecodeError> {
         let reply: Value =
             serde_json::from_str(text).map_err(|_| Malformed("text frame is not JSON"))?;
-        let (result, error) = (reply.get("result"), reply.get("error"));
-        let id = reply.get("id").filter(|id| !id.is_null());
+        let (result, error) = (member(&reply, "result"), member(&reply, "error"));
+        let id = member(&reply, "id");
         let Some(id) = id else {
             let Some(error) = error else {
                 return Ok(ReplyRead::NotOurs);
@@ -206,7 +214,7 @@ impl ParadexReplies {
             let reject = Reject {
                 kind,
                 venue_code: Some(code.into()),
-                raw: raw.into(),
+                raw,
             };
             sink.push(VenueMeta::NONE, ExecEvent::UncorrelatedError(reject));
             return Ok(ReplyRead::Decoded);
@@ -218,14 +226,14 @@ impl ParadexReplies {
             return Ok(ReplyRead::NotOurs);
         };
         let outcomes = match (result, error) {
-            (Some(result), None) if !result.is_null() => answer(request, result, scope)?,
+            (Some(result), None) => answer(request, result, scope)?,
             (None, Some(error)) => {
                 let (code, raw) = error_of(error)?;
                 let outcome = match reject_kind(&code) {
                     Some(kind) => SubmitOutcome::Rejected(Reject {
                         kind,
                         venue_code: Some(code.into()),
-                        raw: raw.into(),
+                        raw,
                     }),
                     None => SubmitOutcome::Unknown,
                 };
@@ -270,14 +278,24 @@ const PROVISIONAL: SubmitOutcome = SubmitOutcome::Accepted {
     ack: AckLevel::Provisional,
 };
 
-/// A JSON-RPC `error` object's code, as text, and its message.
-fn error_of(error: &Value) -> Result<(String, &str), DecodeError> {
+/// Member `name` of `object`, absent when it is JSON `null` (module documentation).
+fn member<'a>(object: &'a Value, name: &str) -> Option<&'a Value> {
+    object.get(name).filter(|value| !value.is_null())
+}
+
+/// A JSON-RPC `error` object's code, as text, and its message followed by its `data`'s JSON
+/// text when it states one (module documentation).
+fn error_of(error: &Value) -> Result<(String, Arc<str>), DecodeError> {
     let code = error
         .get("code")
         .and_then(Value::as_i64)
         .ok_or(Malformed("error code"))?;
     let message = error.get("message").and_then(Value::as_str).unwrap_or("");
-    Ok((code.to_string(), message))
+    let raw = match member(error, "data") {
+        Some(data) => format!("{message} {data}").into(),
+        None => message.into(),
+    };
+    Ok((code.to_string(), raw))
 }
 
 /// The item outcomes `result` states for `request`.
@@ -297,7 +315,7 @@ fn answer(
             let mut out = Vec::with_capacity(cids.len());
             for (idx, cid) in (0u16..).zip(cids) {
                 let (vid, outcome) = match results.get(usize::from(idx)) {
-                    Some(item) => match (item.get("order"), item.get("error")) {
+                    Some(item) => match (member(item, "order"), member(item, "error")) {
                         (Some(_), None) => (Some(created(item, *cid, scope)?), PROVISIONAL),
                         // A message with no code: no page says the venue left the item
                         // undone, so it is Unknown, as an undocumented code is (0069).
@@ -319,7 +337,7 @@ fn answer(
             out
         }
         Request::Modify { cid, vid } => {
-            let order = result.get("order").unwrap_or(result);
+            let order = member(result, "order").unwrap_or(result);
             let named = order_id(order, scope)?;
             if named != *vid {
                 return Err(Malformed("the reply names another order"));
@@ -425,7 +443,7 @@ fn created(
     cid: ClientOrderId,
     scope: &DecodeScope<'_>,
 ) -> Result<VenueOrderId, DecodeError> {
-    let order = reply.get("order").unwrap_or(reply);
+    let order = member(reply, "order").unwrap_or(reply);
     let vid = order_id(order, scope)?;
     same_client(order, cid, scope)?;
     Ok(vid)
