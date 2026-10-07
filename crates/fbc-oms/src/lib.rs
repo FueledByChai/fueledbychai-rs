@@ -140,16 +140,19 @@
 //! fill moves the inventory once in every state, Killed included; a foreign one is flagged and
 //! moves nothing.
 //!
-//! Authorizations and their check at submit (decisions 0045 and 0060; `tests/authorization.rs`):
+//! Authorizations and their check at submit (decisions 0045, 0060 and 0066;
+//! `tests/authorization.rs`, `tests/exit_submit.rs`):
 //! [`Registry::authorize`] issues the [`Authorization`] for a command this crate built, so a
 //! command the market's state or a cap refused never receives one, and none is ever issued for
 //! an account cancel-all. It carries the market's [`StateGeneration`] at the command's build,
 //! and the gateway runs [`Authorization::check_at_submit`] immediately before encoding: a
 //! place, a batch or an amend whose market changed state since (the kill switch, a disarm, an
-//! arming call, lease names given again) is refused with nothing written; an instrument
-//! cancel-all only once 0005's I7 guard it was built under moved (the registry's hold of the
-//! market's exclusive lease changed, or an order not ours was seen on the market), never for
-//! the kill switch alone; and a cancel or a cancel-many always goes through.
+//! arming call, lease names given again) is refused with nothing written, and one built in
+//! Exit also once a fill or a seed moved its market's inventory since (its position revision,
+//! decision 0066); an instrument cancel-all only once 0005's I7 guard it was built under
+//! moved (the registry's hold of the market's exclusive lease changed, or an order not ours
+//! was seen on the market), never for the kill switch alone; and a cancel or a cancel-many
+//! always goes through.
 //!
 //! The execution planner (decision 0005's one planner, decision 0065; `tests/planner.rs`):
 //! the consumer's [`DesiredBook`], a [`DesiredQuote`] per side and level, defined here so
