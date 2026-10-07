@@ -24,7 +24,7 @@ use fbc_core::{
     NamespaceLease, Side, Ticks, VenueMeta, VenueOrderId, WallNs, dispatch,
 };
 use fbc_venue_paradex::exec::{TEMPLATE_FILL, decode_fill_event};
-use fbc_venue_paradex::factory::caps_with_order_entry;
+use fbc_venue_paradex::factory::caps;
 use md::BTC;
 
 const OWN: Namespace = Namespace::new(7);
@@ -98,7 +98,7 @@ impl ExecSink for Sink {
 /// Decodes `bytes` through the core's dispatch under Paradex's order-entry caps: what the
 /// decoder returned and every event it pushed.
 fn decode(bytes: &[u8]) -> (Result<(), DecodeError>, Vec<(VenueMeta, ExecEvent)>) {
-    let caps = caps_with_order_entry();
+    let caps = caps();
     let specs = md::specs();
     let mut sink = Sink::default();
     let result = dispatch(&caps, OWN, |scope| {
@@ -126,23 +126,17 @@ fn refused(bytes: &[u8]) -> DecodeError {
 }
 
 fn vid(wire: &str) -> VenueOrderId {
-    dispatch(&caps_with_order_entry(), OWN, |scope| {
-        scope.venue_order_id(wire)
-    })
-    .unwrap()
+    dispatch(&caps(), OWN, |scope| scope.venue_order_id(wire)).unwrap()
 }
 
 fn fid(wire: &str) -> FillId {
-    dispatch(&caps_with_order_entry(), OWN, |scope| scope.fill_id(wire)).unwrap()
+    dispatch(&caps(), OWN, |scope| scope.fill_id(wire)).unwrap()
 }
 
 /// The fee the venue's raw `nanos` of `asset` mean under Paradex's declared sign.
 fn fee(nanos: i128, asset: &str) -> Fee {
     let asset = AssetSym::new(asset).unwrap();
-    dispatch(&caps_with_order_entry(), OWN, |scope| {
-        scope.fee(nanos, asset)
-    })
-    .unwrap()
+    dispatch(&caps(), OWN, |scope| scope.fee(nanos, asset)).unwrap()
 }
 
 fn usd_nanos(nanos: i128) -> Money {

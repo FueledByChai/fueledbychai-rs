@@ -44,7 +44,7 @@ pub const ORDER_OPS: [OpKind; 4] = [
 /// limit is consumed once for the entire batch", `order-create-batch`); no page says the per-IP
 /// limit does, so a codec charges a batch its item count (decision 0054). The per-IP limit the
 /// market-data caps already declare counts these methods too
-/// ([`caps_with_order_entry`](crate::factory::caps_with_order_entry)).
+/// ([`caps`](crate::factory::caps)).
 pub fn order_limits() -> [RateLimit; 2] {
     let account = |per, units| RateLimit {
         scope: LimitScope::Account,

@@ -22,7 +22,7 @@ use fbc_core::{
     RejectKind, Side, Ticks, VenueMeta, VenueOrderId, VenueOrderState, WallNs, dispatch,
 };
 use fbc_venue_paradex::exec::{TEMPLATE_ORDER, decode_order_event};
-use fbc_venue_paradex::factory::caps_with_order_entry;
+use fbc_venue_paradex::factory::caps;
 use md::BTC;
 
 const OWN: Namespace = Namespace::new(7);
@@ -95,7 +95,7 @@ impl ExecSink for Sink {
 /// Decodes `bytes` through the core's dispatch under Paradex's order-entry caps: what the
 /// decoder returned and every event it pushed.
 fn decode(bytes: &[u8]) -> (Result<(), DecodeError>, Vec<(VenueMeta, ExecEvent)>) {
-    let caps = caps_with_order_entry();
+    let caps = caps();
     let specs = md::specs();
     let mut sink = Sink::default();
     let result = dispatch(&caps, OWN, |scope| {
@@ -123,10 +123,7 @@ fn refused(bytes: &[u8]) -> DecodeError {
 }
 
 fn vid(wire: &str) -> VenueOrderId {
-    dispatch(&caps_with_order_entry(), OWN, |scope| {
-        scope.venue_order_id(wire)
-    })
-    .unwrap()
+    dispatch(&caps(), OWN, |scope| scope.venue_order_id(wire)).unwrap()
 }
 
 fn lots(n: i64) -> Lots {

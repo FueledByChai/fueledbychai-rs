@@ -19,7 +19,7 @@ use fbc_core::{
     VenueFeeSign, Via, WallNs, dispatch,
 };
 use fbc_venue_paradex::exec::{self, ORDER_SBE_SCHEMA_VERSION};
-use fbc_venue_paradex::factory::{caps, caps_with_order_entry};
+use fbc_venue_paradex::factory::{caps, market_data_caps};
 use fbc_venue_paradex::md::sbe;
 
 const OWN: Namespace = Namespace::new(7);
@@ -68,7 +68,7 @@ fn value8_nanos(mantissa: i64) -> i128 {
 
 #[test]
 fn paradex_exec_caps_build_venue_caps_that_decode_fees_and_client_ids_as_paradex_sends_them() {
-    let caps: VenueCaps = caps_with_order_entry();
+    let caps: VenueCaps = caps();
     let exec = caps.exec.as_ref().expect("Paradex declares order entry");
     assert_eq!(exec, &exec::exec_caps());
     // FillEvent.fee: "Fee charged (positive = paid, negative = rebate)".
@@ -193,8 +193,8 @@ fn every_order_and_fill_capability_is_the_value_the_record_states() {
 
 #[test]
 fn order_entry_adds_its_rate_limits_and_counts_order_methods_against_the_ip_limit() {
-    let md = caps();
-    let full = caps_with_order_entry();
+    let md = market_data_caps();
+    let full = caps();
     // Order entry changes nothing about market data or matching.
     assert_eq!(md.exec, None);
     assert_eq!((&full.md, full.matching), (&md.md, md.matching));

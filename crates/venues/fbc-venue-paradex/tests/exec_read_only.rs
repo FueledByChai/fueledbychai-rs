@@ -37,7 +37,7 @@ use fbc_venue_paradex::exec::{
     LOGIN_REQUEST, PRIVATE_CHANNELS, REFRESH_TIMER, ReadOnlyExec, decode_account_event,
     decode_fill_event, decode_order_event, decode_position_event,
 };
-use fbc_venue_paradex::factory::caps_with_order_entry;
+use fbc_venue_paradex::factory::caps;
 use md::BTC;
 use serde_json::Value;
 
@@ -127,7 +127,7 @@ fn open(codec: &mut ReadOnlyExec) -> Vec<Effect> {
 fn answer(codec: &mut ReadOnlyExec, resp: Result<HttpResponse<'_>, HttpFailure>) -> Call {
     let specs = md::specs();
     let (mut sink, mut fx) = (Sink::default(), Effects::new());
-    let result = dispatch(&caps_with_order_entry(), OWN, |scope| {
+    let result = dispatch(&caps(), OWN, |scope| {
         codec.on_http(LOGIN_REQUEST, resp, scope, &specs, &mut sink, &mut fx)
     });
     Call {
@@ -140,7 +140,7 @@ fn answer(codec: &mut ReadOnlyExec, resp: Result<HttpResponse<'_>, HttpFailure>)
 fn frame(codec: &mut ReadOnlyExec, f: RawFrame<'_>) -> Call {
     let specs = md::specs();
     let (mut sink, mut fx) = (Sink::default(), Effects::new());
-    let result = dispatch(&caps_with_order_entry(), OWN, |scope| {
+    let result = dispatch(&caps(), OWN, |scope| {
         codec.on_frame(STREAM, f, scope, &specs, &mut sink, &mut fx)
     });
     Call {
@@ -737,7 +737,7 @@ fn private_frames_decode_as_their_decoders_do_and_other_templates_are_skipped() 
     for (name, decoder) in cases {
         let bytes = fixture(name);
         let mut direct = Sink::default();
-        dispatch(&caps_with_order_entry(), OWN, |scope| {
+        dispatch(&caps(), OWN, |scope| {
             decoder(&bytes, scope, &specs, &mut direct)
         })
         .unwrap();
@@ -791,7 +791,7 @@ fn an_answer_to_no_login_is_refused() {
     let specs = md::specs();
     let (mut sink, mut fx) = (Sink::default(), Effects::new());
     let body = login_body(TOKEN);
-    let result = dispatch(&caps_with_order_entry(), OWN, |scope| {
+    let result = dispatch(&caps(), OWN, |scope| {
         codec.on_http(
             HttpTag(42),
             ok(body.as_bytes()),
