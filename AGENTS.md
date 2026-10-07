@@ -312,7 +312,8 @@ rather than guess.
     conformance stub. So far `examples/md_watch/`: a Paradex market's bbo, trades and `deltas`
     book and a Binance USD-M symbol's `bookTicker` and diff-depth book through `MdVenue`, one
     `MdBooks` per venue, a line per update; no order, no credential (`tests/md_watch.rs`).
-  - `crates/venues/fbc-venues` (the registry, the only crate that sees concrete venues),
+  - `crates/venues/fbc-venues` (the registry, the only crate with a normal dependency on a
+    concrete venue; `crates/fbc-examples` reaches them only as dev-dependencies),
     `crates/venues/fbc-venue-binance-usdm` (market data only:
     `exec: None` caps citing Binance's USD-M pages, `plan_md` on the `/public` combined-stream
     endpoint, live SUBSCRIBE/UNSUBSCRIBE, `bookTicker` touches, partial-depth snapshots, and
