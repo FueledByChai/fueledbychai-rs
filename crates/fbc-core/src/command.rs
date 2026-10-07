@@ -223,7 +223,11 @@ pub enum VenueCommand {
     Cancel(CancelOrder),
     CancelMany(Vec<CancelOrder>),
     CancelAll(CancelScope),
-    /// Turn the venue's cancel-on-disconnect protection on or off.
+    /// Turn the venue's cancel-on-disconnect protection on or off. A codec answers it with one
+    /// `ExecEvent::Outcome` naming its request: `Accepted` at `AckLevel::Final` once the venue
+    /// has turned the protection on, `Rejected` or `Unknown`, and never `Provisional` without a
+    /// later final `Outcome` for the same request, since an order-entry session takes no place
+    /// until a final acceptance (decision 0058).
     ArmCancelOnDisconnect(bool),
     /// Refresh the venue's dead-man timer.
     RefreshDeadMan,

@@ -9,12 +9,11 @@
 //! session starts, naming it; and nothing written before a drop is written again after it.
 //!
 //! The conformance toy declares cancel-on-disconnect per connection, re-armed on reconnect.
-//! Nothing outside fbc-oms issues an `Authorization` yet (FBC-afd), so the commands submitted
-//! here are control commands: an order query, a safety command like a cancel, which the gate
-//! lets through as it does a cancel. That the session refuses a place and an amend, counted,
-//! with no nonce reserved and no byte written, while a cancel goes out, is shown by a unit test
-//! inside fbc-runtime that queues them as a submission would (`src/exec_held_tests.rs`), and on
-//! the gate by `exec_gate.rs`'s unit tests.
+//! The commands submitted here are control commands: an order query, a safety command like a
+//! cancel, which the gate lets through as it does a cancel. That the session refuses a place and
+//! an amend fbc-oms authorized, counted, with no nonce reserved and no byte written, while an
+//! authorized cancel goes out, is shown in `exec_held.rs`, and on the gate by `exec_gate.rs`'s
+//! unit tests.
 
 mod common;
 #[path = "../../fbc-conformance/src/toy/mod.rs"]
@@ -62,6 +61,8 @@ const UNITS: &str = "ready.units";
 const REFUSE_ARM: &str = "ready.refuse_arm";
 /// Any value: the codec's resync frame weighs more than the toy's account limit ever admits.
 const HEAVY_RESYNC: &str = "ready.heavy_resync";
+/// Any value: the codec's arm frame weighs more than the toy's account limit ever admits.
+const HEAVY_ARM: &str = "ready.heavy_arm";
 
 const ACCT: AccountKey = AccountKey::new(4);
 
@@ -182,6 +183,7 @@ impl VenueFactory for ReadyToy {
             calls: Arc::clone(&self.calls),
             refuse_arm: cfg.get(REFUSE_ARM).is_some(),
             heavy_resync: cfg.get(HEAVY_RESYNC).is_some(),
+            heavy_arm: cfg.get(HEAVY_ARM).is_some(),
         })))
     }
 
@@ -195,12 +197,14 @@ impl VenueFactory for ReadyToy {
 }
 
 /// The toy's codec, logging each encode and resync; with `refuse_arm` it refuses to encode an
-/// arm, and with `heavy_resync` its resync frame weighs 51 units.
+/// arm, with `heavy_resync` its resync frame weighs 51 units, and with `heavy_arm` its arm frame
+/// does.
 struct Logged {
     inner: ToyExec,
     calls: Calls,
     refuse_arm: bool,
     heavy_resync: bool,
+    heavy_arm: bool,
 }
 
 impl ExecCodec for Logged {
@@ -231,7 +235,11 @@ impl ExecCodec for Logged {
         if arm && self.refuse_arm {
             return Err(NotSentReason::Unsupported);
         }
-        self.inner.encode(&cmd, rpc, specs, &ctx, t, fx)
+        let receipt = self.inner.encode(&cmd, rpc, specs, &ctx, t, fx)?;
+        if arm && self.heavy_arm {
+            heavy(fx);
+        }
+        Ok(receipt)
     }
 
     fn on_frame(
@@ -288,32 +296,37 @@ impl ExecCodec for Logged {
         self.calls.lock().unwrap().push(Call::Resync(ctx.clone()));
         self.inner.resync(ctx, fx);
         if self.heavy_resync {
-            for effect in fx.take() {
-                fx.push(match effect {
-                    Effect::Send {
-                        stream,
-                        frame,
-                        rpc,
-                        class,
-                        charge,
-                    } => Effect::Send {
-                        stream,
-                        frame,
-                        rpc,
-                        class,
-                        charge: RateCharge {
-                            weight: NonZeroU32::new(51).unwrap(),
-                            ..charge
-                        },
-                    },
-                    other => other,
-                });
-            }
+            heavy(fx);
         }
     }
 
     fn redact_inbound(&self, input: Inbound<'_>) -> InboundSpans {
         self.inner.redact_inbound(input)
+    }
+}
+
+/// Makes every frame in `fx` weigh 51 units, more than the toy's account limit ever admits.
+fn heavy(fx: &mut Effects) {
+    for effect in fx.take() {
+        fx.push(match effect {
+            Effect::Send {
+                stream,
+                frame,
+                rpc,
+                class,
+                charge,
+            } => Effect::Send {
+                stream,
+                frame,
+                rpc,
+                class,
+                charge: RateCharge {
+                    weight: NonZeroU32::new(51).unwrap(),
+                    ..charge
+                },
+            },
+            other => other,
+        });
     }
 }
 
@@ -1000,9 +1013,11 @@ async fn an_arm_the_codec_refuses_ends_the_epoch_as_a_drop_with_nothing_written(
     assert_eq!(session.counters().arm_failures, 1);
 }
 
-/// Buckets that cannot take the arm leave it unsent, as a codec's refusal does.
+/// Buckets that cannot take the arm for now leave it unsent, as a codec's refusal does, and the
+/// next attempt waits until they would admit it as well as the pacing allows (PR #90 Reviewer B
+/// B3).
 #[tokio::test(start_paused = true)]
-async fn an_arm_the_buckets_refuse_ends_the_epoch_as_a_drop() {
+async fn an_arm_the_buckets_refuse_for_now_ends_the_epoch_and_holds_the_next_attempt() {
     let frozen = freeze();
     let mut server = ScriptedWs::start().await;
     let venue = ReadyToy::leak();
@@ -1016,15 +1031,45 @@ async fn an_arm_the_buckets_refuse_ends_the_epoch_as_a_drop() {
         peer.send(AUTH_ACK);
         settle(|| ends(&watch).len() == 1).await;
         assert_eq!(peer.next().await, None);
+        // Well past the pacing's floor, but not yet a second after the authentication.
+        advance(ms(900)).await;
+        churn().await;
+        assert!(server.try_accept().is_none());
+        advance(ms(200)).await;
+        let mut next = server.accept().await;
+        assert!(next.recv().await.starts_with("auth|ts="));
         drop(control);
     };
     let ((), run) = tokio::join!(script, session.run());
     run.unwrap();
     drop(frozen);
 
+    assert_eq!(venue.encoded()[0], (arm_cmd(), RpcId(1)));
+    assert_eq!(venue.resyncs(), 0);
+    assert!(session.counters().arm_failures >= 1);
+}
+
+/// An arm whose frames weigh more than the buckets ever admit ends the session, as a resync's
+/// would, rather than reconnect forever (PR #90 Reviewer B B3).
+#[tokio::test(start_paused = true)]
+async fn an_arm_that_can_never_fit_ends_the_session() {
+    let frozen = freeze();
+    let mut server = ScriptedWs::start().await;
+    let venue = ReadyToy::leak();
+    let log = Log::default();
+    let cfg = [(HEAVY_ARM, "1")];
+    let (mut session, _control, _, _) = session(venue, &server.url(), &cfg, &log, None);
+    let script = async move {
+        let mut peer = server.accept().await;
+        peer.recv().await;
+        peer.send(AUTH_ACK);
+        assert_eq!(peer.next().await, None);
+    };
+    let ((), run) = tokio::join!(script, session.run());
+    drop(frozen);
+    assert_eq!(run, Err(ExecSessionError::ArmNeverFits));
     assert_eq!(venue.encoded(), [(arm_cmd(), RpcId(1))]);
     assert_eq!(venue.resyncs(), 0);
-    assert_eq!(session.counters().arm_failures, 1);
 }
 
 /// A resync whose frames the buckets refuse for now ends the epoch as a drop, and the next

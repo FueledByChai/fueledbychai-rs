@@ -94,10 +94,13 @@
 //! the epoch takes no place, batch of places or amend: each is `NotSent(Disconnected)`, counted
 //! ([`ExecCounters::unready_refusals`]), with no nonce reserved and nothing written, while
 //! cancels and control commands go out ([`ExecOrders::may_place`], true already as the handler
-//! hears the event that opens the epoch; what it submits then goes out once it returns). An arm the codec refuses, the buckets do not admit, the venue
-//! rejects, or that is unanswered at its deadline fails the epoch: once the input being handled
-//! and the commands waiting are taken (a cancel among them goes out), the epoch ends as a drop,
-//! counted ([`ExecCounters::arm_failures`]), and the next opens through the pacing.
+//! hears the event that opens the epoch; what it submits then goes out once it returns). An arm
+//! the codec refuses, the buckets do not admit, the venue rejects, or that is unanswered at its
+//! deadline fails the epoch: once the input being handled and the commands waiting are taken (a
+//! cancel among them goes out), the epoch ends as a drop, counted
+//! ([`ExecCounters::arm_failures`]), and the next opens through the pacing, no sooner than the
+//! buckets would admit the arm when they refused it for now; an arm whose frames never fit ends
+//! the session ([`ExecSessionError::ArmNeverFits`]).
 //!
 //! One thread drives a session (design §5.1): [`ExecSession::run`] spawns no task.
 
@@ -223,6 +226,9 @@ pub enum ExecSessionError {
     /// The frames the codec's resync asks for weigh more together than the venue's buckets ever
     /// admit, so no epoch could take places.
     ResyncNeverFits,
+    /// The frames the codec's cancel-on-disconnect arm asks for weigh more than the venue's
+    /// buckets ever admit, so no epoch could take places (PR #90 Reviewer B B3).
+    ArmNeverFits,
     /// The session has run: it runs once, and a new one is built to run again.
     Ended,
 }
@@ -259,6 +265,10 @@ impl fmt::Display for ExecSessionError {
             }
             ExecSessionError::ResyncNeverFits => f.write_str(
                 "the frames the resync asks for weigh more together than the buckets ever admit",
+            ),
+            ExecSessionError::ArmNeverFits => f.write_str(
+                "the frames the cancel-on-disconnect arm asks for weigh more than the buckets ever \
+                 admit",
             ),
         }
     }
@@ -901,8 +911,8 @@ impl<H: ExecHandler> ExecSession<H> {
                 self.handler.on_submitted(SubmitHandle { rpc, receipt });
                 self.execute(ws, fx, true, None).await
             }
-            Err(reason) => {
-                self.handler.on_submitted(not_sent(reason));
+            Err(unsent) => {
+                self.handler.on_submitted(not_sent(unsent.reason()));
                 Ok(true)
             }
         }
@@ -917,7 +927,7 @@ impl<H: ExecHandler> ExecSession<H> {
         cmd: &VenueCommand,
         rpc: RpcId,
         key: ConnKey,
-    ) -> Result<Result<(EncodeReceipt, Effects), NotSentReason>, ExecSessionError> {
+    ) -> Result<Result<(EncodeReceipt, Effects), Unsent>, ExecSessionError> {
         // A batch longer than u16::MAX items, which no venue takes, has no nonce block.
         let items = cmd.items().map(|n| reserve(&mut *self.nonces, n));
         let mut fx = Effects::new();
@@ -935,20 +945,15 @@ impl<H: ExecHandler> ExecSession<H> {
             Ok(receipt) if carries(&fx, rpc, cmd.traffic_class(), self.stream, Instant::now()) => {
                 receipt
             }
-            Ok(_) => return Ok(Err(NotSentReason::Unencodable)),
-            Err(reason) => return Ok(Err(reason)),
+            Ok(_) => return Ok(Err(Unsent::Codec(NotSentReason::Unencodable))),
+            Err(reason) => return Ok(Err(Unsent::Codec(reason))),
         };
         // Its frames go together or not at all, so the codec's request is either written whole
         // or reported not sent.
         let own = |e: &Effect| frame_of(e, self.stream, true);
         let frames: Vec<_> = fx.as_slice().iter().filter_map(own).collect();
-        if self
-            .core
-            .rates
-            .charge(Instant::now(), key, &frames)
-            .is_err()
-        {
-            return Ok(Err(NotSentReason::RateBudget));
+        if let Err(refused) = self.core.rates.charge(Instant::now(), key, &frames) {
+            return Ok(Err(Unsent::Budget(refused)));
         }
         Ok(Ok((receipt, fx)))
     }
@@ -979,7 +984,10 @@ impl<H: ExecHandler> ExecSession<H> {
     }
 
     /// Sends `ArmCancelOnDisconnect(true)` on epoch `key` as a request of the session's own; one
-    /// not sent fails the epoch. False when the epoch ended.
+    /// not sent fails the epoch. Buckets that refuse it for now hold the next attempt until they
+    /// would admit it, as for `on_open` and the resync; frames that can never fit end the
+    /// session with [`ExecSessionError::ArmNeverFits`] (PR #90 Reviewer B B3). False when the
+    /// epoch ended.
     async fn arm(
         &mut self,
         ws: &mut Option<WebSocket>,
@@ -992,7 +1000,11 @@ impl<H: ExecHandler> ExecSession<H> {
                 self.orders.gate.borrow_mut().arm_sent(key.epoch, rpc);
                 self.execute(ws, fx, true, None).await
             }
-            Err(_) => {
+            Err(Unsent::Budget(Refused { ready_at: None })) => Err(ExecSessionError::ArmNeverFits),
+            Err(unsent) => {
+                if let Unsent::Budget(Refused { ready_at: Some(at) }) = unsent {
+                    self.core.pacer.hold_until(at);
+                }
                 self.orders.gate.borrow_mut().arm_not_sent(key.epoch);
                 Ok(true)
             }
@@ -1032,6 +1044,23 @@ impl<H: ExecHandler> ExecSession<H> {
                 own: self.stream,
             };
             self.codec.on_rpc_timeout(rpc, &mut sink);
+        }
+    }
+}
+
+/// Why a request was not sent, nothing of it written: the codec's reason, or the buckets'
+/// refusal of its frames.
+enum Unsent {
+    Codec(NotSentReason),
+    Budget(Refused),
+}
+
+impl Unsent {
+    /// The reason the submitter is told.
+    fn reason(&self) -> NotSentReason {
+        match self {
+            Unsent::Codec(reason) => *reason,
+            Unsent::Budget(_) => NotSentReason::RateBudget,
         }
     }
 }
@@ -1333,6 +1362,11 @@ mod tests {
             (
                 ExecSessionError::ResyncNeverFits,
                 "the frames the resync asks for weigh more together than the buckets ever admit",
+            ),
+            (
+                ExecSessionError::ArmNeverFits,
+                "the frames the cancel-on-disconnect arm asks for weigh more than the buckets ever \
+                 admit",
             ),
             (ExecSessionError::Ended, "the session has run; it runs once"),
             (
