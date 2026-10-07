@@ -15,17 +15,21 @@
 //!
 //! Commands are encoded as the socket's JSON-RPC frames by [`ParadexEncoder`] (place, batch
 //! place, modify, cancel, batch cancel, cancel-all and cancel-on-disconnect), from the command
-//! and the `EncodeCtx` only. The order-entry codec that sends them is FBC-xvf's; the factory
-//! declares these caps, plans the endpoint and builds the codec in FBC-xzp, until when
+//! and the `EncodeCtx` only, and their JSON-RPC replies are decoded into one outcome per item
+//! by [`ParadexReplies`], each venue error code mapped to a reject kind through
+//! [`REJECT_CODES`] (decision 0069). The order-entry codec that sends them is FBC-xvf's; the
+//! factory declares these caps, plans the endpoint and builds the codec in FBC-xzp, until when
 //! [`ParadexFactory`](crate::ParadexFactory)'s caps stay market data only and
 //! [`caps_with_order_entry`](crate::factory::caps_with_order_entry) is what it will declare.
 
 mod account;
 mod caps;
 mod encode;
+mod errors;
 mod fill;
 mod order;
 mod read_only;
+mod reply;
 mod rest;
 
 pub use account::{
@@ -33,9 +37,11 @@ pub use account::{
 };
 pub use caps::{ORDER_OPS, exec_caps, order_limits};
 pub use encode::ParadexEncoder;
+pub use errors::REJECT_CODES;
 pub use fill::{TEMPLATE_FILL, decode_fill_event};
 pub use order::{TEMPLATE_ORDER, decode_order_event};
 pub use read_only::{LOGIN_REQUEST, PRIVATE_CHANNELS, REFRESH_TIMER, ReadOnlyExec};
+pub use reply::{ParadexReplies, ReplyRead};
 pub use rest::{
     RestAnswer, ResyncTags, decode_order_query, decode_resync, open_orders_request,
     order_history_request, positions_request, query_plan, query_request, resync_plan,
