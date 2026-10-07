@@ -6,8 +6,9 @@
 //! authentication ([`auth`], a review path, 0009): the login signed from the consumer's
 //! credentials, the session token it gives, its refresh, and Test Connection (decision 0048).
 //! Order entry ([`exec`], BT-402) declares its capabilities and the SBE schema version its
-//! socket negotiates (decision 0054), and decodes the private `OrderEvent` into order updates;
-//! its codec and the factory's wiring come in later tickets.
+//! socket negotiates (decision 0054), encodes commands as the socket's signed JSON-RPC frames
+//! ([`exec::ParadexEncoder`]), and decodes the private `OrderEvent` into order updates; its
+//! codec and the factory's wiring come in later tickets.
 
 pub mod auth;
 pub mod exec;

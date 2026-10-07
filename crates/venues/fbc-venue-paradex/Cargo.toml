@@ -1,6 +1,6 @@
 [package]
 name = "fbc-venue-paradex"
-description = "The Paradex venue adapter: its signer (SNIP-12 revision 0 hash and Stark-curve signature), SBE market data (touches, trades and order books), its order-entry capabilities and its private order events."
+description = "The Paradex venue adapter: its signer (SNIP-12 revision 0 hash and Stark-curve signature), SBE market data (touches, trades and order books), its order-entry capabilities, its order-entry frames and its private order events."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -13,13 +13,16 @@
 //! as each fill's realized funding (decision 0059). Order entry is WebSocket-only: every place,
 //! amend and cancel is one of the socket's JSON-RPC methods, with no REST fallback.
 //!
-//! The full order-entry codec is FBC-xvf's; the factory declares these caps, plans the endpoint and
-//! builds the codec in FBC-xzp, until when [`ParadexFactory`](crate::ParadexFactory)'s caps stay
+//! Commands are encoded as the socket's JSON-RPC frames by [`ParadexEncoder`] (place, batch
+//! place, modify, cancel, batch cancel, cancel-all and cancel-on-disconnect), from the command
+//! and the `EncodeCtx` only. The order-entry codec that sends them is FBC-xvf's; the factory
+//! declares these caps, plans the endpoint and builds the codec in FBC-xzp, until when [`ParadexFactory`](crate::ParadexFactory)'s caps stay
 //! market data only and [`caps_with_order_entry`](crate::factory::caps_with_order_entry) is
 //! what it will declare.
 
 mod account;
 mod caps;
+mod encode;
 mod fill;
 mod order;
 mod read_only;
@@ -29,6 +32,7 @@ pub use account::{
     TEMPLATE_ACCOUNT, TEMPLATE_POSITION, decode_account_event, decode_position_event,
 };
 pub use caps::{ORDER_OPS, exec_caps, order_limits};
+pub use encode::ParadexEncoder;
 pub use fill::{TEMPLATE_FILL, decode_fill_event};
 pub use order::{TEMPLATE_ORDER, decode_order_event};
 pub use read_only::{LOGIN_REQUEST, PRIVATE_CHANNELS, REFRESH_TIMER, ReadOnlyExec};
