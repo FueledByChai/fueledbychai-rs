@@ -19,7 +19,7 @@ fbc-runtime = { path = "../fbc-runtime" }
 fbc-venue-binance-usdm = { path = "../venues/fbc-venue-binance-usdm" }
 fbc-venue-paradex = { path = "../venues/fbc-venue-paradex" }
 rust_decimal.workspace = true
-tokio = { workspace = true, features = ["rt", "macros", "time"] }
+tokio = { workspace = true, features = ["rt", "macros", "time", "sync"] }
 
 [[example]]
 name = "md_watch"

@@ -33,17 +33,23 @@ Options:
   --binance-step <DEC>    size step the Binance symbol is decoded on (default 0.00000001)
   -h, --help              print this help
 
-A price or size off its grid is refused as a decode error. The default grids are the finest
-either venue publishes (8 decimal places), so every market decodes without looking its grid
-up; giving the market's own tick and step only makes the refusal stricter.
+A market is spelled as the venue spells it, in capitals, digits and '-'; a frame for any
+other spelling would be refused, so md_watch refuses the spelling instead. A price or size off
+its grid is refused as a decode error, and its frame prints nothing. The default grids are the
+finest either venue publishes (8 decimal places), so every market decodes without looking its
+grid up; giving the market's own tick and step only makes the refusal stricter.
 
 Lines:
   TOUCH <venue> <market> <channel> bid <px> x <size> ask <px> x <size> mid <px> spread <bps>bps
   BOOK <venue> <market> <channel> ...   the book's touch, once per frame that changed what is shown
+    <rank> bid <px> x <size> | ask <px> x <size>   under it, the book's best levels with --top
   TRADE <venue> <market> <buy|sell|unknown> <size> @ <px>
   HEALTH <venue> <market> <channel> <live|gap|stale|refused>
   RECONNECT <venue> conn <n> epoch <e> ended   the connection dropped; its books are invalid
                                                until their next snapshot
+  CLOSED <venue> conn <n> epoch <e> ended      md_watch stopped and closed the connection
+
+md_watch stops once standard output is closed, so `md_watch ... | head` ends.
 ";
 
 /// The finest grid either venue publishes: Paradex's SBE prices and sizes are mantissas of
@@ -102,14 +108,15 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         if flag == "-h" || flag == "--help" {
             return Ok(Parsed::Help);
         }
+        // A value that starts with `--` is the next flag: the value was left out.
         let mut value = || {
             args.next()
-                .filter(|v| !v.is_empty())
+                .filter(|v| !v.is_empty() && !v.starts_with("--"))
                 .ok_or_else(|| format!("{flag} needs a value"))
         };
         match flag.as_str() {
-            "--paradex" => paradex = Some(value()?),
-            "--binance" => binance = Some(value()?),
+            "--paradex" => paradex = Some(symbol(&flag, value()?)?),
+            "--binance" => binance = Some(symbol(&flag, value()?)?),
             "--socks5" => proxy = socks5(&value()?)?,
             "--seconds" => {
                 let n = value()?;
@@ -150,6 +157,23 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         binance_ws,
         binance_rest,
     })))
+}
+
+/// A market as both venues spell it on the wire: capitals, digits and `-`. Binance's frames
+/// name the symbol in capitals whatever the subscription said, and the spec table matches the
+/// name exactly, so `btcusdt` would subscribe and then have every frame refused unseen.
+fn symbol(flag: &str, value: String) -> Result<String, String> {
+    if value
+        .bytes()
+        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-')
+    {
+        Ok(value)
+    } else {
+        Err(format!(
+            "{flag} {value}: not a market as the venue spells it (capitals, digits and '-', \
+             e.g. BTC-USD-PERP or BTCUSDT)"
+        ))
+    }
 }
 
 /// `host:port`, the port from 1 to 65535.

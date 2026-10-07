@@ -6,7 +6,7 @@ with one crate per venue. The Rust counterpart of
 
 First venues: Paradex, then Hibachi; Binance USD-M futures for reference market data.
 
-Status: scaffolding. The Cargo workspace exists with nine crates:
+Status: scaffolding. The Cargo workspace exists with ten crates:
 
 | Crate | Status |
 | --- | --- |
