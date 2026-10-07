@@ -377,13 +377,15 @@ impl ParadexEncoder {
 
 /// The instruction an order's time in force, channel and post-only flag make: RPI for an order
 /// on the RPI channel (post-only by the venue's rule), then POST_ONLY, then the time in force.
+/// Fill-or-kill has no instruction and is refused first, whatever the channel or flag, so it is
+/// never written as a resting order even if the caps came to declare it.
 fn instruction(tif: Tif, channel: Channel, post_only: bool) -> Result<&'static str, NotSentReason> {
-    Ok(match (channel, post_only, tif) {
-        (Channel::Rpi, _, _) => "RPI",
-        (Channel::Public, true, _) => "POST_ONLY",
-        (Channel::Public, false, Tif::Gtc) => "GTC",
-        (Channel::Public, false, Tif::Ioc) => "IOC",
-        (Channel::Public, false, Tif::Fok) => return Err(Unsupported),
+    Ok(match (tif, channel, post_only) {
+        (Tif::Fok, _, _) => return Err(Unsupported),
+        (_, Channel::Rpi, _) => "RPI",
+        (_, Channel::Public, true) => "POST_ONLY",
+        (Tif::Gtc, Channel::Public, false) => "GTC",
+        (Tif::Ioc, Channel::Public, false) => "IOC",
     })
 }
 
@@ -487,6 +489,24 @@ mod tests {
             instruction(Tif::Fok, Channel::Public, false),
             Err(Unsupported)
         );
+    }
+
+    #[test]
+    fn a_fill_or_kill_order_is_unsupported_on_any_channel_post_only_or_not() {
+        // No Paradex instruction kills an unfilled order whole: a post-only or RPI FOK must not
+        // be written as a resting POST_ONLY or RPI order (DeepSeek DS-2 on 66235b2).
+        for (channel, post_only) in [
+            (Channel::Public, false),
+            (Channel::Public, true),
+            (Channel::Rpi, false),
+            (Channel::Rpi, true),
+        ] {
+            assert_eq!(
+                instruction(Tif::Fok, channel, post_only),
+                Err(Unsupported),
+                "{channel:?} post_only={post_only}"
+            );
+        }
     }
 
     #[test]
