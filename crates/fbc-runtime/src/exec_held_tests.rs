@@ -2,7 +2,8 @@
 //! amend submitted on an authenticated epoch that is not yet armed and resynced are
 //! `NotSent(Disconnected)`, counted in `unready_refusals`, with no nonce reserved and no byte
 //! written, while a cancel submitted with them goes out; once the epoch is armed and resynced a
-//! place is written.
+//! place is written; and on an epoch whose arm the venue rejected, a place is held and a cancel
+//! still goes out before the epoch ends as a drop.
 //!
 //! Nothing outside fbc-oms issues an `Authorization` yet (FBC-afd), so no integration test can
 //! submit a place, an amend or a cancel. This unit test queues them into the session's shared
@@ -29,8 +30,8 @@ use fbc_core::{
     ConfigError, EndpointPlan, Envelope, ExecCodec, ExecEndpoint, ExecEvent, FieldSpec, HttpPlan,
     InstrumentSpecDraft, Lots, MdCodec, NamespaceLease, NewOrder, NonceBlock, NonceSource,
     NotSentReason, OrderKind, OrderRef, RpcId, Secrets, Side, SpecTable, SubmitHandle,
-    Subscription, SymbolError, Ticks, Tif, VenueCaps, VenueCommand, VenueConfig, VenueError,
-    VenueFactory, WallNs, WireUrl,
+    SubmitOutcome, Subscription, SymbolError, Ticks, Tif, VenueCaps, VenueCommand, VenueConfig,
+    VenueError, VenueFactory, WallNs, WireUrl,
 };
 use toy::{INST_A, OWN_NS, ToyExec, ToySigner};
 
@@ -121,15 +122,30 @@ impl NonceSource for Counting {
 }
 
 type Handles = Rc<RefCell<Vec<SubmitHandle>>>;
+type Events = Rc<RefCell<Vec<ExecEvent>>>;
+type Orders = Rc<RefCell<Option<ExecOrders>>>;
 
-/// Keeps each submission's handle and the events it hears.
+/// Keeps each submission's handle and the events it hears; on hearing a request rejected it
+/// queues a place and then a cancel through the session's orders.
 struct Keep {
     handles: Handles,
-    events: Rc<RefCell<Vec<ExecEvent>>>,
+    events: Events,
+    orders: Orders,
 }
 
 impl ExecHandler for Keep {
     fn on_exec(&mut self, env: Envelope<ExecEvent>) {
+        let rejected = matches!(
+            env.body,
+            ExecEvent::Outcome {
+                outcome: SubmitOutcome::Rejected(_),
+                ..
+            }
+        );
+        if rejected && let Some(orders) = self.orders.borrow().as_ref() {
+            queue(orders, place());
+            queue(orders, cancel());
+        }
         self.events.borrow_mut().push(env.body);
     }
 
@@ -217,14 +233,18 @@ async fn settle(done: impl Fn() -> bool) {
     panic!("not settled");
 }
 
-#[tokio::test(start_paused = true)]
-async fn a_place_and_an_amend_are_held_with_nothing_reserved_or_written_until_ready_and_a_cancel_is_not()
- {
-    let (thaw, frozen) = std::sync::mpsc::channel::<()>();
-    tokio::task::spawn_blocking(move || frozen.recv());
-    let mut server = ScriptedWs::start().await;
+/// What a test reads of its session: the handles and events its handler kept, and its nonce
+/// reservations.
+struct Seen {
+    handles: Handles,
+    events: Events,
+    reserved: Reserved,
+}
+
+/// A session of the toy at `url`, its orders also its handler's.
+fn held_session(url: &str) -> (ExecSession<Keep>, crate::ExecControl, ExecOrders, Seen) {
     let mut cfg = VenueConfig::new();
-    cfg.insert(URL, &server.url());
+    cfg.insert(URL, url);
     let reserved = Reserved::default();
     let limits = Held.caps(&cfg).unwrap().limits;
     let config = ExecSessionConfig {
@@ -254,14 +274,35 @@ async fn a_place_and_an_amend_are_held_with_nothing_reserved_or_written_until_re
         write_stall: WriteStall::new(Duration::from_secs(3_600)).unwrap(),
         http_max_body: 4096,
     };
-    let handles = Handles::default();
-    let events = Rc::default();
-    let keep = Keep {
-        handles: Rc::clone(&handles),
-        events: Rc::clone(&events),
+    let seen = Seen {
+        handles: Handles::default(),
+        events: Events::default(),
+        reserved,
     };
-    let (mut session, control) = ExecSession::new(config, keep).unwrap();
+    let slot = Orders::default();
+    let keep = Keep {
+        handles: Rc::clone(&seen.handles),
+        events: Rc::clone(&seen.events),
+        orders: Rc::clone(&slot),
+    };
+    let (session, control) = ExecSession::new(config, keep).unwrap();
     let orders = session.orders();
+    *slot.borrow_mut() = Some(orders.clone());
+    (session, control, orders, seen)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_place_and_an_amend_are_held_with_nothing_reserved_or_written_until_ready_and_a_cancel_is_not()
+ {
+    let (thaw, frozen) = std::sync::mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || frozen.recv());
+    let mut server = ScriptedWs::start().await;
+    let (mut session, control, orders, seen) = held_session(&server.url());
+    let Seen {
+        handles,
+        events,
+        reserved,
+    } = seen;
     let watch = Rc::clone(&handles);
     let heard = Rc::clone(&events);
     let log = Arc::clone(&reserved);
@@ -330,4 +371,50 @@ async fn a_place_and_an_amend_are_held_with_nothing_reserved_or_written_until_re
     assert!(sent_place.receipt.is_ok());
     assert_eq!(session.counters().unready_refusals, 2);
     assert_eq!(session.counters().arm_failures, 0);
+}
+
+/// The venue rejects the arm of an epoch already resynced: a place and a cancel the handler
+/// queues on hearing it are taken before the epoch ends as a drop, the place held, counted, with
+/// no nonce reserved and nothing written, and the cancel written.
+#[tokio::test(start_paused = true)]
+async fn on_an_epoch_whose_arm_was_rejected_a_place_is_held_and_a_cancel_still_goes_out() {
+    let (thaw, frozen) = std::sync::mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || frozen.recv());
+    let mut server = ScriptedWs::start().await;
+    let (mut session, control, orders, seen) = held_session(&server.url());
+    let script = async move {
+        let mut peer = server.accept().await;
+        peer.recv().await;
+        peer.send("auth|ok=1|token=toy-session-token");
+        assert_eq!(peer.recv().await, "cod|rpc=1|on=1");
+        let resync = peer.recv().await;
+        let wm = resync.strip_prefix("resync|ts=").unwrap().to_owned();
+        peer.send(&format!("rsbegin|wm={wm}"));
+        peer.send("rsend");
+        peer.send("item|rpc=1|i=0|res=rej|code=1005");
+        let written = peer.recv().await;
+        assert!(written.starts_with("cancel|rpc=3|"), "{written}");
+        assert_eq!(peer.next().await, None);
+        assert!(!orders.may_place());
+        drop(control);
+    };
+    let ((), run) = tokio::join!(script, session.run());
+    run.unwrap();
+    drop(thaw);
+
+    let handles = seen.handles.borrow();
+    let [held_place, sent_cancel] = &handles[..] else {
+        panic!("{handles:?}");
+    };
+    let disconnected = Err(NotSentReason::Disconnected);
+    assert_eq!(
+        (held_place.rpc, &held_place.receipt),
+        (RpcId(2), &disconnected)
+    );
+    assert_eq!(sent_cancel.rpc, RpcId(3));
+    assert!(sent_cancel.receipt.is_ok());
+    // The arm's nonce and the cancel's: none for the place.
+    assert_eq!(*seen.reserved.lock().unwrap(), [vec![0], vec![1]]);
+    assert_eq!(session.counters().unready_refusals, 1);
+    assert_eq!(session.counters().arm_failures, 1);
 }
