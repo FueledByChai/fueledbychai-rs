@@ -124,7 +124,8 @@ rather than guess.
   effects, poll endpoints and plans, 0027; journaling and decoder replay, 0006; rate-limit buckets with a safety reserve, 0030), `crates/fbc-conformance` with its stub venue server (0025),
   `crates/fbc-oms` with its first slices (the order lattice, item outcomes and the registry by
   client id; the fill ledger, the two fill counters and the inventory; 0005, property-tested
-  with proptest, 0037; the gateway traits and the authorization order entry needs, 0045),
+  with proptest, 0037; the gateway traits and the authorization order entry needs, 0045;
+  the execution planner, 0065),
   `crates/venues/fbc-venue-paradex` with its signer (`src/sign`), SBE market data (`src/md`: bbo,
   trades and the order book), its order-entry capabilities (`src/exec`, 0054) and its factory
   (`src/factory.rs`, market data only),
@@ -250,8 +251,15 @@ rather than guess.
     resync while Killed, never an account cancel-all, and own fills counted once in every state
     while foreign ones are flagged; Exit's admission (0012, 0063; `tests/exit.rs`): only reduce-only or
     reducing-classified orders on the side that reduces the position, the position plus that
-    side's orders never crossing zero, every cap still applied, nothing once flat; still planned:
-    `ExecutionPlanner`; 0005, 0013), `crates/fbc-journal` (0006; it depends on
+    side's orders never crossing zero, every cap still applied, nothing once flat; the
+    `ExecutionPlanner` (0005, 0065; `src/planner.rs`, `tests/planner.rs`): the consumer's
+    `DesiredBook` diffed per side and level against the orders it placed, under the consumer's
+    `PlannerConfig` (basis-point and lot replace thresholds, a minimum age), a change an amend
+    where the venue's `OrderCaps` admit it and otherwise a cancel then, once the old order is
+    terminal, a place, a PendingNew, Unknown or in-flight order occupying its level, every
+    command built through the one pre-trade path and the permits and emitted as an
+    `Authorization`, cancels then reducing orders then amends then adds; still planned: batching,
+    venue modes, the safety floor and flag-conflict fallbacks; 0005, 0013), `crates/fbc-journal` (0006; it depends on
     `fbc-core`, and `hmac` and `sha2` for its keyed hashes and `zstd` for its closed segments, only: the records the runtime writes, length-prefixed in a hand-written
     little-endian format with a version, a writer of one subdirectory per UTC day with segments
     named `<shard>-<seq>.fbcj` and time from the caller, rolled at every UTC hour, each closed
