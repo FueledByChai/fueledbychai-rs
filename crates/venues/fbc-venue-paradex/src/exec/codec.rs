@@ -11,9 +11,8 @@
 //!   as one JSON-RPC frame on the authenticated connection, cancel-on-disconnect's arm included
 //!   (the runtime sends it, FBC-w19), and recorded with [`ParadexReplies`] (FBC-0l9), which
 //!   decodes its reply into one outcome per item and reports `Unknown` at its deadline for what
-//!   went unanswered; one still held when a later command's encode finds twice the request
-//!   timeout gone was never written (the session refused its frame for the rate budget) and is
-//!   forgotten. Order entry is WebSocket only: a frame command while no connection is
+//!   went unanswered. A new connection drops what the one before sent, whose replies never
+//!   reach it. Order entry is WebSocket only: a frame command while no connection is
 //!   authenticated is `NotSent(Disconnected)`, as the runtime reports it, with no REST
 //!   fallback; one whose rpc is not below [`CONTROL_IDS`] is `NotSent(Unencodable)`, since its
 //!   reply could not be told from the codec's own.
@@ -23,10 +22,7 @@
 //!   `QueryResult` for its rpc ([`decode_order_query`]). As `on_http`'s contract asks, a read
 //!   that was never sent is `NotSent(Disconnected)` for its rpc, and one that failed afterwards,
 //!   was answered with an error status or does not decode is `Unknown`. With no token yet it is
-//!   `NotSent(Disconnected)`. A query is held until its answer, its deadline, a new connection
-//!   (0027) or a later query's encode finding twice its read's timeout gone, by when the
-//!   runtime has settled every read it made: until FBC-m8vm the session refuses an encode that
-//!   carries a read, and nothing else would drop it.
+//!   `NotSent(Disconnected)`. A new connection drops the queries of the one before.
 //! - **The resync** is the read-only codec's: `GET /orders` and `GET /positions` with the
 //!   current token in a redacted header, decoded whole at the watermark `ctx.wall`.
 //! - **The token** in every REST read is the one the latest login gave, read when the request is
@@ -35,13 +31,13 @@
 //!
 //! Paradex signs a timestamp, never a nonce: no call asks for one.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
 use fbc_core::{
     CtxCall, DecodeError, DecodeScope, Effects, EncodeCtx, EncodeReceipt, ExecCodec, ExecEvent,
-    ExecSink, HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans, MonoNs, NotSentReason,
+    ExecSink, HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans, NotSentReason,
     OrderSigner, PathStamps, QueryOrder, RawFrame, RpcId, Secrets, SpecTable, StreamId,
     SubmitOutcome, TimerTag, VenueCommand, VenueConfig, VenueError, VenueMeta,
 };
@@ -66,20 +62,7 @@ pub struct ParadexExec {
     /// The stream the encoder writes to: commands go out only once it is authenticated.
     stream: StreamId,
     /// The order queries sent and not yet answered, by their read's tag.
-    queries: BTreeMap<HttpTag, Query>,
-    /// How long a frame request waits for its reply.
-    rpc_timeout: Duration,
-    /// The frame requests encoded, oldest first, with when: each is forgotten by the replies
-    /// once twice the request timeout is gone ([`ParadexExec::forget_unsent`]).
-    encoded: VecDeque<(RpcId, MonoNs)>,
-}
-
-/// An order query whose read was asked for: its rpc, the query, and when it was encoded.
-#[derive(Debug)]
-struct Query {
-    rpc: RpcId,
-    query: QueryOrder,
-    at: MonoNs,
+    queries: BTreeMap<HttpTag, (RpcId, QueryOrder)>,
 }
 
 impl fmt::Debug for ParadexExec {
@@ -111,8 +94,6 @@ impl ParadexExec {
             replies: ParadexReplies::new(),
             stream,
             queries: BTreeMap::new(),
-            rpc_timeout,
-            encoded: VecDeque::new(),
         })
     }
 
@@ -123,7 +104,6 @@ impl ParadexExec {
         query: &QueryOrder,
         rpc: RpcId,
         specs: &SpecTable,
-        ctx: &EncodeCtx,
         fx: &mut Effects,
     ) -> Result<EncodeReceipt, NotSentReason> {
         if specs.get(query.inst).is_none() {
@@ -139,30 +119,8 @@ impl ParadexExec {
         for effect in query_request(query, rpc, base, &[header], timeout, tag)?.take() {
             fx.push(effect);
         }
-        // A read the runtime made has been answered or timed out once twice its timeout is
-        // gone; one still held then was never made (until FBC-m8vm the session refuses an
-        // encode that carries a read), and nothing else would ever drop it.
-        self.queries
-            .retain(|_, held| ctx.mono - held.at < timeout.saturating_mul(2));
-        let query = query.clone();
-        let at = ctx.mono;
-        self.queries.insert(tag, Query { rpc, query, at });
+        self.queries.insert(tag, (rpc, query.clone()));
         Ok(EncodeReceipt::new())
-    }
-
-    /// Forgets every frame request encoded twice the request timeout or more before `now`.
-    /// The runtime has answered or timed out every frame it wrote by then (its deadline is the
-    /// timeout); a request still held was never written (the session refused the frame after
-    /// the encode, for its rate budget), and nothing else would ever drop it.
-    fn forget_unsent(&mut self, now: MonoNs) {
-        let held = self.rpc_timeout.saturating_mul(2);
-        while let Some(&(rpc, at)) = self.encoded.front() {
-            if now - at < held {
-                break;
-            }
-            self.replies.forget(rpc);
-            self.encoded.pop_front();
-        }
     }
 
     /// The answer to query `rpc`: its `QueryResult`, or `NotSent`/`Unknown` for a read that
@@ -201,10 +159,12 @@ impl ExecCodec for ParadexExec {
     }
 
     /// The read-only codec's: the login, or the auth frame with a token already held. The
-    /// queries of an earlier connection are dropped, as its resync is: their answers come back
-    /// only to the epoch that asked (0027).
+    /// requests and queries of an earlier connection are dropped, as its resync is: no reply
+    /// or answer of theirs reaches a later epoch (0027), and a deadline the runtime still
+    /// names is `Unknown` with no record of the request (decision 0071).
     fn on_open(&mut self, stream: StreamId, ctx: &EncodeCtx, fx: &mut Effects) {
         self.queries.clear();
+        self.replies = ParadexReplies::new();
         self.session.on_open(stream, ctx, fx);
     }
 
@@ -220,7 +180,7 @@ impl ExecCodec for ParadexExec {
         fx: &mut Effects,
     ) -> Result<EncodeReceipt, NotSentReason> {
         if let VenueCommand::Query(query) = cmd {
-            return self.query(query, rpc, specs, ctx, fx);
+            return self.query(query, rpc, specs, fx);
         }
         if self.session.authenticated() != Some(self.stream) {
             return Err(NotSentReason::Disconnected);
@@ -228,10 +188,8 @@ impl ExecCodec for ParadexExec {
         if rpc.0 >= CONTROL_IDS {
             return Err(NotSentReason::Unencodable);
         }
-        self.forget_unsent(ctx.mono);
         let receipt = self.encoder.encode(cmd, rpc, specs, ctx, t, fx)?;
         self.replies.sent(rpc, cmd);
-        self.encoded.push_back((rpc, ctx.mono));
         Ok(receipt)
     }
 
@@ -273,7 +231,7 @@ impl ExecCodec for ParadexExec {
         fx: &mut Effects,
     ) -> Result<(), DecodeError> {
         match self.queries.remove(&tag) {
-            Some(Query { rpc, query, .. }) => {
+            Some((rpc, query)) => {
                 ParadexExec::on_query_answer(rpc, &query, resp, scope, specs, sink);
                 Ok(())
             }
@@ -288,7 +246,7 @@ impl ExecCodec for ParadexExec {
 
     /// `Unknown` for every item of request `rpc` no reply answered ([`ParadexReplies`]).
     fn on_rpc_timeout(&mut self, rpc: RpcId, sink: &mut dyn ExecSink) {
-        self.queries.retain(|_, held| held.rpc != rpc);
+        self.queries.retain(|_, (sent, _)| *sent != rpc);
         self.replies.on_rpc_timeout(rpc, sink);
     }
 

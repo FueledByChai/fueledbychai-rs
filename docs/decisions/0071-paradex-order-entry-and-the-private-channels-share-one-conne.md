@@ -42,20 +42,21 @@ FBC-0sc's REST resync and order query. Three things were the ticket's to choose:
    status or does not decode drops that resync with nothing pushed and asks for the connection
    again (with a fresh login next), so the epoch ends and the next one resyncs; each resync's two
    reads go out under tags of their own, so an answer to an earlier resync is never paired with a
-   later one. A new connection drops the resync and the order queries of the one before, whose
-   answers come back only to the epoch that asked (0027). The read-only codec resyncs the same
-   way, so a read-only session seeds positions too.
+   later one. A new connection drops the resync, the order queries and the order requests of
+   the one before, whose replies and answers never reach a later epoch (0027); a deadline the
+   runtime still names for one is `Unknown`. The read-only codec resyncs the same way, so a
+   read-only session seeds positions too.
+5. **What the session refuses after an encode is held until the connection ends.** The
+   session can refuse a request after its encode returned `Ok` (a frame for its rate budget, an
+   encode carrying a read until FBC-m8vm), and nothing tells the codec, so the codec holds it
+   until a new connection. It does not guess from elapsed time: a frame written during a long
+   write stall would be dropped while its reply is still coming (Codex on PR #109). The
+   runtime telling a codec of such refusals is FBC-9r5o.
 4. **The token as built.** Every REST read (the resync's two, the order query) carries the
    token the latest login gave, read when the request is built, in a redacted header and
    nowhere else. The order query's read that was never sent is `NotSent(Disconnected)` for its
    rpc; one that failed afterwards, was answered with an error status or does not decode is
-   `Unknown`. A query is held until its answer, its deadline, a new connection, or a later
-   query's encode that finds twice its read's timeout gone: by then the runtime has settled
-   every read it made, and until FBC-m8vm it makes none (it refuses an encode that carries a
-   read), so nothing else would drop it. A frame request is likewise forgotten once a later
-   command's encode finds twice the request timeout gone: the runtime has answered or timed out
-   every frame it wrote by then, and one still held was refused after its encode (its rate
-   budget), which nothing tells the codec of yet (FBC-9r5o).
+   `Unknown`.
 
 ## Alternatives
 
@@ -79,6 +80,9 @@ FBC-0sc's REST resync and order query. Three things were the ticket's to choose:
   runtime's backpressure (`NotSent(Backpressure)`) is what a full buffer gives.
 - A transient REST error during a resync costs a reconnect (and with it the cancel-on-disconnect
   of whatever rests), paced by the session's `ReconnectPacing`.
+- Within one connection, requests and queries the session refused after their encode are held
+  until it ends: a long-lived connection under sustained rate refusals grows that record until
+  FBC-9r5o.
 - The order query is an HTTP request out of `encode`; until FBC-m8vm the runtime refuses such an
   encode `NotSent(Unencodable)`, so the Unknown ladder's query step cannot reach Paradex yet.
 
