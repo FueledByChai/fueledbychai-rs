@@ -34,6 +34,8 @@ use std::fmt;
 
 use fbc_core::{InstrumentId, Lots, Side, SignedLots};
 
+use crate::entry::ExitRefusal;
+
 /// One market's caps as the consumer's configuration states them (0009), each one possibly
 /// absent. Both are required: [`PreTradeCaps::with_market`] refuses a market missing either,
 /// and nothing in code supplies a default.
@@ -262,6 +264,44 @@ impl Adds {
 }
 
 impl Exposure {
+    /// Exit's admission (decision 0012): the order is reduce-only or classified reducing
+    /// (`marked`), on the side that reduces the known, non-zero position, and what our orders
+    /// on that side may still move the position by ([`OrderRecord::exposure`](crate::OrderRecord::exposure):
+    /// PendingNew and Unknown orders in full, remainders, and fills the venue reported that
+    /// the inventory does not hold yet), with the `adds` the order brings, stays within the
+    /// position's size, so the position never crosses zero if they all fill. The caps are
+    /// judged after it, as for any order.
+    pub(crate) fn admit_exit(&self, marked: bool, adds: Lots) -> Result<(), ExitRefusal> {
+        let (inst, side) = (self.inst, self.side);
+        let pos = self.pos.ok_or(ExitRefusal::PositionUnknown(inst))?;
+        let reduces = match pos.0.signum() {
+            0 => return Err(ExitRefusal::Flat(inst)),
+            1 => Side::Sell,
+            _ => Side::Buy,
+        };
+        if side != reduces {
+            return Err(ExitRefusal::Increasing { inst, side });
+        }
+        if !marked {
+            return Err(ExitRefusal::Ordinary { inst, side });
+        }
+        // A position of i64::MIN lots has no size as a lot count; every order on it is
+        // judged against the largest one, which is still short of crossing zero.
+        let position = pos
+            .abs_lots()
+            .unwrap_or(Lots::new(i64::MAX).expect("non-negative"));
+        let total = self.others.and_then(|others| others.checked_add(adds));
+        match total {
+            Some(total) if total <= position => Ok(()),
+            total => Err(ExitRefusal::CrossesZero {
+                inst,
+                side,
+                total,
+                position,
+            }),
+        }
+    }
+
     /// Whether the order `new` brings keeps the side within both of the market's caps: the
     /// inventory cap (0005's I6), `|pos + Σ resting same side + new| ≤ cap`, then the resting
     /// cap, `Σ resting same side + new ≤ cap`. Nothing is exempt: a reducing order passes only

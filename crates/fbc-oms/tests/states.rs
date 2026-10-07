@@ -32,9 +32,9 @@ use fbc_core::{
     SnapshotSource, SubmitOutcome, TagSet, Ticks, Tif, VenueCommand, WallNs,
 };
 use fbc_oms::{
-    AmendRefusal, ArmRefusal, CancelChoice, EntryState, ExitKind, LadderConfig, LeaseKeys, Leases,
-    MarketCapsConfig, MarketEntry, OmsError, OrderKey, OrderOp, PreTradeCaps, Registry,
-    ResyncSnapshot, StateRefusal,
+    AmendRefusal, ArmRefusal, CancelChoice, EntryState, ExitKind, ExitRefusal, LadderConfig,
+    LeaseKeys, Leases, MarketCapsConfig, MarketEntry, OmsError, OrderKey, OrderOp, PreTradeCaps,
+    Registry, ResyncSnapshot, StateRefusal,
 };
 
 const INST: InstrumentId = InstrumentId::new(1);
@@ -384,11 +384,16 @@ fn flatten_or_wind_down_on_a_disarmed_market_arms_it_straight_into_exit() {
             seen(call(&mut reg, INST, leases).unwrap()),
             entry(true, EntryState::Exit(kind), 1)
         );
-        // No ordinary order is built in Exit (its own admission is FBC-7gl's; until then Exit
-        // builds nothing).
+        // No ordinary order is built in Exit: a buy adds to the long position (Exit's own
+        // admission is tests/exit.rs's).
         assert_eq!(
             reg.place(placement(cid(), 100, 1)),
-            Err(OmsError::State(StateRefusal::Exit(INST)))
+            Err(OmsError::State(StateRefusal::Exit(
+                ExitRefusal::Increasing {
+                    inst: INST,
+                    side: Side::Buy,
+                }
+            )))
         );
         let plan = reg.place_batch(vec![placement(cid(), 100, 1)]).unwrap();
         assert_eq!(plan.command, None);
@@ -410,54 +415,114 @@ fn flatten_or_wind_down_on_a_disarmed_market_arms_it_straight_into_exit() {
     }
 }
 
-#[test]
-fn exit_refuses_an_amend_until_its_admission_is_built() {
-    let (mut reg, bid, ask) = quoting();
-    reg.flatten(INST, Leases::none()).unwrap();
-    for amend in amends() {
-        assert_eq!(
-            try_amend(&mut reg, (bid, ask), amend),
-            Err(AmendRefusal::State(StateRefusal::Exit(INST))),
-            "{}",
-            amend.0
-        );
+/// What Exit does with each of the scenario's shapes on the long position, `None` when it is
+/// built (decision 0012; tests/exit.rs judges Exit's admission in full): the ordinary buy adds
+/// to the position; the I6-reducing sell is an ordinary order, neither reduce-only nor
+/// classified reducing; the reduce-only exits are built, each fitting beside the resting ask.
+fn in_exit(name: &str) -> Option<ExitRefusal> {
+    match name {
+        "ordinary" => Some(ExitRefusal::Increasing {
+            inst: INST,
+            side: Side::Buy,
+        }),
+        "I6-reducing" => Some(ExitRefusal::Ordinary {
+            inst: INST,
+            side: Side::Sell,
+        }),
+        _ => None,
     }
 }
 
 #[test]
-fn exit_builds_no_place_or_batch_item_of_any_kind_but_builds_cancels() {
-    // Flatten and Wind-down, each from Quoting with the control's resting orders and position.
-    // Every shape 0012 names, the reducing exits included, is refused until FBC-7gl builds
-    // Exit's own admission; single cancels and cancel-many are built all the same.
+fn exit_amends_only_the_scenarios_reducing_exits() {
+    // The bid adds to the long position, whatever the amend's classification; the ask,
+    // amended as a reducing exit, is built.
+    for amend in amends() {
+        let (mut reg, bid, ask) = quoting();
+        reg.flatten(INST, Leases::none()).unwrap();
+        let (name, _, on_bid, ..) = amend;
+        let built = try_amend(&mut reg, (bid, ask), amend);
+        if on_bid {
+            assert_eq!(
+                built,
+                Err(AmendRefusal::State(StateRefusal::Exit(
+                    ExitRefusal::Increasing {
+                        inst: INST,
+                        side: Side::Buy,
+                    }
+                ))),
+                "{name}"
+            );
+        } else {
+            assert!(built.is_ok(), "{name}: {built:?}");
+        }
+    }
+}
+
+#[test]
+fn exit_builds_only_the_reducing_exits_of_every_shape_but_builds_every_cancel() {
+    // Flatten and Wind-down, each from Quoting with the control's resting orders and position
+    // (long 20, an ask of 5 resting). Of every shape 0012 names, through place and through
+    // place_batch, only the reducing exits are built (DeepSeek's DS-2 on PR #86); single
+    // cancels and cancel-many are built all the same.
     type Call = fn(&mut Registry, InstrumentId, Leases) -> Result<MarketEntry, ArmRefusal>;
     let calls: [(&str, Call); 2] = [
         ("flatten", Registry::flatten),
         ("wind-down", Registry::wind_down),
     ];
     for (case, call) in calls {
+        for (name, order) in places() {
+            let (mut reg, _, _) = quoting();
+            call(&mut reg, INST, Leases::none()).unwrap();
+            let before = reg.len();
+            let built = reg.place(order.clone()).map(|cmd| cmd.command().clone());
+            match in_exit(name) {
+                None => {
+                    assert_eq!(built, Ok(VenueCommand::Place(order)), "{case}: {name}");
+                    assert_eq!(reg.len(), before + 1, "{case}: {name}");
+                }
+                Some(why) => {
+                    assert_eq!(
+                        built,
+                        Err(OmsError::State(StateRefusal::Exit(why))),
+                        "{case}: {name}"
+                    );
+                    assert_eq!(reg.len(), before, "{case}: {name}");
+                }
+            }
+        }
+
+        // In one batch, each item judged with the earlier ones admitted: the reduce-only
+        // sell of 5 fits beside the resting ask (10 of 20); each exit of 15 after it would
+        // take the side to 25, past zero.
         let (mut reg, bid, ask) = quoting();
         call(&mut reg, INST, Leases::none()).unwrap();
         let before = reg.len();
-        for (name, order) in places() {
-            assert_eq!(
-                reg.place(order),
-                Err(OmsError::State(StateRefusal::Exit(INST))),
-                "{case}: {name}"
-            );
-        }
+        let all = places();
         let plan = reg
-            .place_batch(places().into_iter().map(|(_, o)| o).collect())
+            .place_batch(all.iter().map(|(_, o)| o.clone()).collect())
             .unwrap();
-        assert_eq!(plan.command, None, "{case}");
-        assert_eq!(plan.refused.len(), places().len(), "{case}");
-        for (c, why) in &plan.refused {
-            assert_eq!(
-                why,
-                &OmsError::State(StateRefusal::Exit(INST)),
-                "{case}: {c:?}"
-            );
-        }
-        assert_eq!(reg.len(), before, "{case}");
+        assert_eq!(
+            plan.command.map(|cmd| cmd.command().clone()),
+            Some(VenueCommand::PlaceBatch(vec![all[1].1.clone()])),
+            "{case}"
+        );
+        let crosses = ExitRefusal::CrossesZero {
+            inst: INST,
+            side: Side::Sell,
+            total: Some(lots(25)),
+            position: lots(LONG),
+        };
+        let expected: Vec<(ClientOrderId, OmsError)> = all
+            .iter()
+            .filter(|(name, _)| *name != "reduce-only")
+            .map(|(name, o)| {
+                let why = in_exit(name).unwrap_or(crosses);
+                (o.cid, OmsError::State(StateRefusal::Exit(why)))
+            })
+            .collect();
+        assert_eq!(plan.refused, expected, "{case}");
+        assert_eq!(reg.len(), before + 1, "{case}");
 
         let caps = venue(false);
         let plan = reg.cancel_many(&[bid, ask], &caps);
@@ -1087,7 +1152,7 @@ fn every_refusal_says_what_refused_it() {
         Box::new(ArmRefusal::WrongAccountLease(INST)),
         Box::new(StateRefusal::Killed(INST)),
         Box::new(StateRefusal::CancelOnly(INST)),
-        Box::new(StateRefusal::Exit(INST)),
+        Box::new(StateRefusal::Exit(ExitRefusal::Flat(INST))),
         Box::new(StateRefusal::Unleased(INST)),
         Box::new(OmsError::State(StateRefusal::Killed(INST))),
     ];

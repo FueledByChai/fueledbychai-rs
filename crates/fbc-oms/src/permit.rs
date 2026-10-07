@@ -33,7 +33,7 @@ use fbc_core::{
 };
 
 use crate::caps::{Adds, CapRefusal, Exposure};
-use crate::entry::StateRefusal;
+use crate::entry::{Admits, StateRefusal};
 use crate::grant::{Guard, Watch};
 use crate::record::{Intent, OrdState, OrderRecord};
 
@@ -101,7 +101,7 @@ pub enum AmendRefusal {
     /// inventory cap, so no amend is built (FBC-b0z9).
     RemainingQty,
     /// The market's state refused it before either cap was consulted (decision 0012): Killed,
-    /// Cancel-only, or Exit, whose admission is not built yet.
+    /// Cancel-only, or Exit, which amends only exit orders ([`ExitRefusal`](crate::ExitRefusal)).
     State(StateRefusal),
     /// A pre-trade cap refused it (0013 rule 2): the amend would take the worst case on the
     /// order's side past the inventory cap, or what the side has resting past the resting
@@ -212,7 +212,7 @@ pub struct Live<'r> {
     rec: &'r mut OrderRecord,
     /// What the market's state admits, read when the permit was given: nothing changes it
     /// while the permit holds the registry.
-    state: Result<(), StateRefusal>,
+    state: Result<Admits, StateRefusal>,
     /// The market's state generation then, which the amend's authorization is checked against
     /// at submit (decision 0060).
     generation: Watch,
@@ -222,7 +222,7 @@ pub struct Live<'r> {
 impl<'r> Live<'r> {
     pub(crate) fn check(
         rec: &'r mut OrderRecord,
-        state: Result<(), StateRefusal>,
+        state: Result<Admits, StateRefusal>,
         generation: Watch,
         exposure: Exposure,
     ) -> Result<Live<'r>, PermitRefusal> {
@@ -268,8 +268,11 @@ impl<'r> Live<'r> {
     /// it chooses the traffic class only and exempts the amend from no check (0013 rule 2).
     ///
     /// Refused, never built, before anything else is judged, when the market's state builds no
-    /// amend (Killed, Cancel-only, or Exit until its admission is built; decision 0012,
-    /// [`AmendRefusal::State`]), whatever `reducing` says.
+    /// amend (Killed or Cancel-only; decision 0012, [`AmendRefusal::State`]), whatever
+    /// `reducing` says. In Exit, refused before either cap unless the amended order is an exit
+    /// order: reduce-only as placed or `reducing` here, on the side that reduces the position,
+    /// the side's orders, this one at what it may fill once amended, within the position's size
+    /// ([`ExitRefusal`](crate::ExitRefusal)).
     ///
     /// Refused, never built, when the amend would take the worst case on the order's side past
     /// its market's inventory cap (0005's I6), or what the side has resting past its resting
@@ -288,7 +291,7 @@ impl<'r> Live<'r> {
         qty: Lots,
         reducing: bool,
     ) -> Result<PermittedCommand, AmendRefusal> {
-        self.state.map_err(AmendRefusal::State)?;
+        let admits = self.state.map_err(AmendRefusal::State)?;
         let rec = &*self.rec;
         let amend_caps = caps.amend.as_ref().ok_or(AmendRefusal::NotAmendable)?;
         if amend_caps.qty_semantics == AmendQty::Remaining {
@@ -327,9 +330,13 @@ impl<'r> Live<'r> {
         if amend.reference(amend_caps).is_none() {
             return Err(AmendRefusal::NoDeclaredReference);
         }
+        let exposure = rec.exposure_if_amended(qty);
+        admits
+            .judge(&self.exposure, reducing || placed.reduce_only, exposure)
+            .map_err(AmendRefusal::State)?;
         self.exposure
             .admit(Adds {
-                exposure: rec.exposure_if_amended(qty),
+                exposure,
                 resting: rec.resting_if_amended(qty),
             })
             .map_err(AmendRefusal::Capped)?;

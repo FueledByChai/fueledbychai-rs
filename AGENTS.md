@@ -248,7 +248,9 @@ rather than guess.
     cancel-all only under the held market lease after a trustworthy resync with no order not
     ours in view, otherwise our orders cancelled by explicit reference, named again on each
     resync while Killed, never an account cancel-all, and own fills counted once in every state
-    while foreign ones are flagged; still planned: Exit's admission (FBC-7gl) and
+    while foreign ones are flagged; Exit's admission (0012, 0063; `tests/exit.rs`): only reduce-only or
+    reducing-classified orders on the side that reduces the position, the position plus that
+    side's orders never crossing zero, every cap still applied, nothing once flat; still planned:
     `ExecutionPlanner`; 0005, 0013), `crates/fbc-journal` (0006; it depends on
     `fbc-core`, and `hmac` and `sha2` for its keyed hashes and `zstd` for its closed segments, only: the records the runtime writes, length-prefixed in a hand-written
     little-endian format with a version, a writer of one subdirectory per UTC day with segments
