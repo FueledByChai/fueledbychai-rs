@@ -396,6 +396,47 @@ fn a_market_order_is_written_and_signed_at_price_zero() {
 }
 
 #[test]
+fn a_post_only_or_rpi_market_order_is_unsupported_before_signing() {
+    // Post-only and RPI rest on the book; a market order never rests, so the pair is refused
+    // alone and as a batch item, before any item is signed.
+    let market = |seq: u64| NewOrder {
+        kind: OrderKind::Market,
+        ..order(seq)
+    };
+    let post_only = NewOrder {
+        post_only: true,
+        ..market(32)
+    };
+    let rpi = NewOrder {
+        channel: Channel::Rpi,
+        ..market(33)
+    };
+    for bad in [post_only, rpi] {
+        refused(
+            &VenueCommand::Place(bad.clone()),
+            NotSentReason::Unsupported,
+        );
+        refused(
+            &VenueCommand::PlaceBatch(vec![order(34), bad]),
+            NotSentReason::Unsupported,
+        );
+    }
+    // A market order at the default time in force is still written, as GTC.
+    let sig = order_sig(Side::Buy, ParadexOrderType::Market, "0.005", "0");
+    let want = rpc_frame(
+        "order.create",
+        &format!(
+            r#"{{"client_id":"{}","market":"BTC-USD-PERP","side":"BUY","signature_timestamp":1759622400123,"size":"0.005","type":"MARKET","price":"0","instruction":"GTC","signature":{sig}}}"#,
+            uuid(35)
+        ),
+    );
+    assert_eq!(
+        frame(&VenueCommand::Place(market(35)), place_charge(BTC)),
+        want
+    );
+}
+
+#[test]
 fn a_batch_is_order_create_batch_with_each_item_signed_and_charged_its_item_count() {
     let item = |seq: u64, side: Side, size: &str| {
         let sig = order_sig(side, ParadexOrderType::Limit, size, "62000.5");
