@@ -4,8 +4,9 @@
 //! at submit refuses, because the kill switch went on, the market was disarmed or its state
 //! changed after it was issued, comes back `NotSent(StaleAuthorization)` with no nonce reserved
 //! and no byte written, since `ExecSession::send` runs `Authorization::check_at_submit` before
-//! encoding every authorized command; and a cancel issued before the change still goes out,
-//! as the check passes every cancel.
+//! encoding every authorized command, so a change while the command waits in the session's
+//! queue is seen too; and a cancel issued before the change still goes out, as the check passes
+//! every cancel.
 //!
 //! Every order command is one fbc-oms built and authorized through its public path,
 //! `Registry::authorize` (FBC-afd): a registry armed on the toy's market (`armed_oms`). The
@@ -143,11 +144,22 @@ async fn an_authorized_place_and_batch_are_encoded_with_one_reserved_nonce_per_i
     assert_eq!(session.counters().unready_refusals, 0);
 }
 
+/// When a test's change of the market's state comes.
+#[derive(Clone, Copy)]
+enum When {
+    /// After the commands are authorized and before they are submitted.
+    BeforeSubmit,
+    /// After they are submitted and queued, before the session's turn takes them: only a check
+    /// at encode, not one where `ExecOrders::submit` queues them, sees it (decisions 0057, 0062;
+    /// PR #87 Reviewer B B7, PR #100 Reviewer B B1).
+    WhileQueued,
+}
+
 /// On an epoch armed and resynced, a place, an amend, a batch of two and a cancel are built and
-/// authorized, then `change` moves the market's state before they are submitted: the three
-/// whose authorization is stale come back `NotSent(StaleAuthorization)` with no nonce reserved
-/// and nothing written, and the cancel is written with the one nonce reserved after the arm's.
-async fn stale_after(change: fn(&mut Registry)) {
+/// authorized, then `change` moves the market's state `when` the test says: the three whose
+/// authorization is stale come back `NotSent(StaleAuthorization)` with no nonce reserved and
+/// nothing written, and the cancel is written with the one nonce reserved after the arm's.
+async fn stale_after(when: When, change: fn(&mut Registry)) {
     // A blocked thread keeps the paused clock from auto-advancing while the sockets are idle.
     let (thaw, frozen) = std::sync::mpsc::channel::<()>();
     tokio::task::spawn_blocking(move || frozen.recv());
@@ -167,13 +179,19 @@ async fn stale_after(change: fn(&mut Registry)) {
         let mut peer = server.accept().await;
         armed_and_resynced(&mut peer, &orders, &events).await;
         let (place, amend, batch, cancel) = (oms.place(), oms.amend(), oms.batch(2), oms.cancel());
-        change(&mut oms.reg);
+        if let When::BeforeSubmit = when {
+            change(&mut oms.reg);
+        }
         let submitted = [
             orders.submit(place).unwrap(),
             orders.submit(amend).unwrap(),
             orders.submit(batch).unwrap(),
             orders.submit(cancel).unwrap(),
         ];
+        // No await since the submits: the session has not had its turn, so all four still wait.
+        if let When::WhileQueued = when {
+            change(&mut oms.reg);
+        }
         let written = peer.recv().await;
         let cancelled = submitted[3];
         assert!(
@@ -211,7 +229,7 @@ async fn stale_after(change: fn(&mut Registry)) {
 #[tokio::test(start_paused = true)]
 async fn an_authorization_issued_before_the_kill_switch_went_on_is_not_sent_with_no_nonce_reserved_and_nothing_written()
  {
-    stale_after(|reg| {
+    stale_after(When::BeforeSubmit, |reg| {
         reg.kill(INST_A);
     })
     .await;
@@ -220,7 +238,7 @@ async fn an_authorization_issued_before_the_kill_switch_went_on_is_not_sent_with
 #[tokio::test(start_paused = true)]
 async fn an_authorization_issued_before_a_disarm_is_not_sent_with_no_nonce_reserved_and_nothing_written()
  {
-    stale_after(|reg| {
+    stale_after(When::BeforeSubmit, |reg| {
         reg.disarm(INST_A);
     })
     .await;
@@ -230,7 +248,34 @@ async fn an_authorization_issued_before_a_disarm_is_not_sent_with_no_nonce_reser
 async fn an_authorization_issued_before_a_state_change_is_not_sent_with_no_nonce_reserved_and_nothing_written()
  {
     // The owner's Wind-down on the armed market: Quoting becomes Exit.
-    stale_after(|reg| {
+    stale_after(When::BeforeSubmit, |reg| {
+        reg.wind_down(INST_A, Leases::none()).unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_authorization_queued_before_the_kill_switch_went_on_is_not_sent_with_no_nonce_reserved_and_nothing_written()
+ {
+    stale_after(When::WhileQueued, |reg| {
+        reg.kill(INST_A);
+    })
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_authorization_queued_before_a_disarm_is_not_sent_with_no_nonce_reserved_and_nothing_written()
+ {
+    stale_after(When::WhileQueued, |reg| {
+        reg.disarm(INST_A);
+    })
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_authorization_queued_before_a_state_change_is_not_sent_with_no_nonce_reserved_and_nothing_written()
+ {
+    stale_after(When::WhileQueued, |reg| {
         reg.wind_down(INST_A, Leases::none()).unwrap();
     })
     .await;
