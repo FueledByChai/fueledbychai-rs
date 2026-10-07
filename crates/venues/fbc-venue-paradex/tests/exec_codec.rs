@@ -822,6 +822,47 @@ fn a_resync_read_that_fails_is_refused_or_does_not_decode_pushes_nothing_and_ask
     .refused();
 }
 
+/// `codec` encoding the order query as request `rpc` at monotonic time `mono`: its read's tag.
+fn query_at(codec: &mut ParadexExec, rpc: RpcId, mono: MonoNs) -> HttpTag {
+    let mut fx = Effects::new();
+    let ctx = EncodeCtx { mono, ..ctx() };
+    let cmd = query();
+    let receipt = codec.encode(
+        &cmd,
+        rpc,
+        &md::specs(),
+        &ctx,
+        &mut PathStamps::off(),
+        &mut fx,
+    );
+    receipt.unwrap();
+    let [(tag, ..)]: [_; 1] = reads(fx.as_slice(), TOKEN).try_into().unwrap();
+    tag
+}
+
+#[test]
+fn a_query_whose_read_was_never_made_is_not_held_past_twice_its_timeout() {
+    // Until FBC-m8vm the session refuses an encode that carries a read (NotSent(Unencodable)),
+    // so neither an answer nor a deadline ever reaches the codec for it (Codex 4211490398 on
+    // PR #109). A query is held until a later query's encode finds twice its read's timeout
+    // gone: the runtime has answered or timed out every read it made by then.
+    let mut codec = authenticated();
+    let start = MonoNs(1_000);
+    let refused = query_at(&mut codec, RpcId(12), start);
+    let kept = query_at(&mut codec, RpcId(13), start + READ_TIMEOUT);
+    // Just short of twice the first's timeout: both are held.
+    let almost = start + (READ_TIMEOUT * 2 - Duration::from_nanos(1));
+    let third = query_at(&mut codec, RpcId(14), almost);
+    let body = fixture("rest-orders-history-filled.json");
+    answer(&mut codec, third, ok(&body)).result.unwrap();
+    // Twice its timeout gone: the first is dropped, the second still held.
+    query_at(&mut codec, RpcId(15), start + READ_TIMEOUT * 2);
+    answer(&mut codec, refused, ok(&body)).refused();
+    let call = answer(&mut codec, kept, ok(&body));
+    call.result.unwrap();
+    assert_eq!(call.events.len(), 1);
+}
+
 #[test]
 fn a_new_connection_drops_the_reads_of_the_one_before() {
     // Answers come back only to the epoch that asked (0027): a new connection holds no earlier

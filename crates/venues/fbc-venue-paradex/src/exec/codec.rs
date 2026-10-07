@@ -21,7 +21,10 @@
 //!   `QueryResult` for its rpc ([`decode_order_query`]). As `on_http`'s contract asks, a read
 //!   that was never sent is `NotSent(Disconnected)` for its rpc, and one that failed afterwards,
 //!   was answered with an error status or does not decode is `Unknown`. With no token yet it is
-//!   `NotSent(Disconnected)`.
+//!   `NotSent(Disconnected)`. A query is held until its answer, its deadline, a new connection
+//!   (0027) or a later query's encode finding twice its read's timeout gone, by when the
+//!   runtime has settled every read it made: until FBC-m8vm the session refuses an encode that
+//!   carries a read, and nothing else would drop it.
 //! - **The resync** is the read-only codec's: `GET /orders` and `GET /positions` with the
 //!   current token in a redacted header, decoded whole at the watermark `ctx.wall`.
 //! - **The token** in every REST read is the one the latest login gave, read when the request is
@@ -36,7 +39,7 @@ use std::time::Duration;
 
 use fbc_core::{
     CtxCall, DecodeError, DecodeScope, Effects, EncodeCtx, EncodeReceipt, ExecCodec, ExecEvent,
-    ExecSink, HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans, NotSentReason,
+    ExecSink, HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans, MonoNs, NotSentReason,
     OrderSigner, PathStamps, QueryOrder, RawFrame, RpcId, Secrets, SpecTable, StreamId,
     SubmitOutcome, TimerTag, VenueCommand, VenueConfig, VenueError, VenueMeta,
 };
@@ -61,7 +64,15 @@ pub struct ParadexExec {
     /// The stream the encoder writes to: commands go out only once it is authenticated.
     stream: StreamId,
     /// The order queries sent and not yet answered, by their read's tag.
-    queries: BTreeMap<HttpTag, (RpcId, QueryOrder)>,
+    queries: BTreeMap<HttpTag, Query>,
+}
+
+/// An order query whose read was asked for: its rpc, the query, and when it was encoded.
+#[derive(Debug)]
+struct Query {
+    rpc: RpcId,
+    query: QueryOrder,
+    at: MonoNs,
 }
 
 impl fmt::Debug for ParadexExec {
@@ -103,6 +114,7 @@ impl ParadexExec {
         query: &QueryOrder,
         rpc: RpcId,
         specs: &SpecTable,
+        ctx: &EncodeCtx,
         fx: &mut Effects,
     ) -> Result<EncodeReceipt, NotSentReason> {
         if specs.get(query.inst).is_none() {
@@ -118,7 +130,14 @@ impl ParadexExec {
         for effect in query_request(query, rpc, base, &[header], timeout, tag)?.take() {
             fx.push(effect);
         }
-        self.queries.insert(tag, (rpc, query.clone()));
+        // A read the runtime made has been answered or timed out once twice its timeout is
+        // gone; one still held then was never made (until FBC-m8vm the session refuses an
+        // encode that carries a read), and nothing else would ever drop it.
+        self.queries
+            .retain(|_, held| ctx.mono - held.at < timeout.saturating_mul(2));
+        let query = query.clone();
+        let at = ctx.mono;
+        self.queries.insert(tag, Query { rpc, query, at });
         Ok(EncodeReceipt::new())
     }
 
@@ -177,7 +196,7 @@ impl ExecCodec for ParadexExec {
         fx: &mut Effects,
     ) -> Result<EncodeReceipt, NotSentReason> {
         if let VenueCommand::Query(query) = cmd {
-            return self.query(query, rpc, specs, fx);
+            return self.query(query, rpc, specs, ctx, fx);
         }
         if self.session.authenticated() != Some(self.stream) {
             return Err(NotSentReason::Disconnected);
@@ -228,7 +247,7 @@ impl ExecCodec for ParadexExec {
         fx: &mut Effects,
     ) -> Result<(), DecodeError> {
         match self.queries.remove(&tag) {
-            Some((rpc, query)) => {
+            Some(Query { rpc, query, .. }) => {
                 ParadexExec::on_query_answer(rpc, &query, resp, scope, specs, sink);
                 Ok(())
             }
@@ -243,7 +262,7 @@ impl ExecCodec for ParadexExec {
 
     /// `Unknown` for every item of request `rpc` no reply answered ([`ParadexReplies`]).
     fn on_rpc_timeout(&mut self, rpc: RpcId, sink: &mut dyn ExecSink) {
-        self.queries.retain(|_, (sent, _)| *sent != rpc);
+        self.queries.retain(|_, held| held.rpc != rpc);
         self.replies.on_rpc_timeout(rpc, sink);
     }
 
