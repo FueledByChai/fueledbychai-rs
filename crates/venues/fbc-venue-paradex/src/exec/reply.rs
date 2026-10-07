@@ -248,10 +248,14 @@ impl ParadexReplies {
         Ok(ReplyRead::Decoded)
     }
 
-    /// Request `rpc`'s deadline passed with no answer: `Unknown` for every item, unless every
-    /// item was already reported `Unknown` from its reply, which this adds nothing to.
+    /// Request `rpc`'s deadline passed with no answer: the tracker drops the request, so a
+    /// reply arriving after it is [`ReplyRead::NotOurs`] and adds no second outcome, and pushes
+    /// `Unknown` for every item, unless every item was already reported `Unknown` from its
+    /// reply, which this adds nothing to.
     pub fn on_rpc_timeout(&mut self, rpc: RpcId, sink: &mut dyn ExecSink) {
-        if let Some(Slot::ReportedUnknown) = self.slots.remove(&rpc) {
+        // Removed whichever slot it is: a timed-out request is never held again.
+        let slot = self.slots.remove(&rpc);
+        if let Some(Slot::ReportedUnknown) = slot {
             return;
         }
         let (item, outcome) = (None, SubmitOutcome::Unknown);
@@ -296,7 +300,7 @@ fn answer(
                     Some(item) => match (item.get("order"), item.get("error")) {
                         (Some(_), None) => (Some(created(item, *cid, scope)?), PROVISIONAL),
                         // A message with no code: no page says the venue left the item
-                        // undone, so it is Unknown, as an undocumented code is (0066).
+                        // undone, so it is Unknown, as an undocumented code is (0069).
                         (None, Some(error)) => {
                             error.as_str().ok_or(Malformed("item error"))?;
                             (None, SubmitOutcome::Unknown)

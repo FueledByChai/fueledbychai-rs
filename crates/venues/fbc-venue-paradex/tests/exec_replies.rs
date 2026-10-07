@@ -450,9 +450,11 @@ fn a_cancel_all_answered_other_than_ok_is_unknown() {
 }
 
 /// Each code docs.paradex.trade's WebSocket "Error Handling" page lists that refuses a
-/// request, with the kind it maps to, written out here apart from the table; the
-/// cancel_batch statuses ALREADY_CLOSED and NOT_FOUND are its method page's.
-const DOCUMENTED: [(&str, RejectKind); 10] = [
+/// request, and the two Paradex's WebSocket OpenRPC specification adds for every order method
+/// (40300 authentication required, 42901 rate limit exceeded), with the kind it maps to,
+/// written out here apart from the table; the cancel_batch statuses ALREADY_CLOSED and
+/// NOT_FOUND are its method page's.
+const DOCUMENTED: [(&str, RejectKind); 12] = [
     ("-32700", RejectKind::Other),
     ("-32600", RejectKind::Other),
     ("-32601", RejectKind::Unsupported),
@@ -461,6 +463,8 @@ const DOCUMENTED: [(&str, RejectKind); 10] = [
     ("40110", RejectKind::Other),
     ("40111", RejectKind::Other),
     ("40112", RejectKind::Other),
+    ("40300", RejectKind::Other),
+    ("42901", RejectKind::RateLimited { retry_after: None }),
     (
         "ALREADY_CLOSED",
         RejectKind::AlreadyTerminal(TerminalHint::Unspecified),
@@ -470,7 +474,7 @@ const DOCUMENTED: [(&str, RejectKind); 10] = [
 
 #[test]
 fn the_reject_table_maps_each_documented_code_to_its_kind() {
-    assert_eq!(REJECT_CODES, DOCUMENTED);
+    assert_eq!(REJECT_CODES.as_slice(), DOCUMENTED.as_slice());
 }
 
 #[test]
@@ -561,6 +565,47 @@ fn the_timeout_of_an_unanswered_request_is_unknown_for_every_item() {
     assert_eq!(timed_out(&mut replies, 13), unknown_whole(13));
     // A request the tracker never sent is Unknown too: it holds no outcome for it.
     assert_eq!(timed_out(&mut replies, 99), unknown_whole(99));
+}
+
+#[test]
+fn a_rate_limited_placement_is_refused_rate_limited_and_its_request_is_answered() {
+    let mut replies = sent(32, VenueCommand::Place(order(0)));
+    let text =
+        r#"{"jsonrpc":"2.0","error":{"code":42901,"message":"Rate limit exceeded"},"id":32}"#;
+    let limited = RejectKind::RateLimited { retry_after: None };
+    let events = answered(&mut replies, text);
+    assert_eq!(
+        events,
+        vec![outcome(
+            32,
+            None,
+            rejected(limited, Some("42901"), "Rate limit exceeded")
+        )]
+    );
+    // A refusal answers the request: no timeout follows it, and a repeat is not this
+    // tracker's.
+    assert_eq!(format!("{replies:?}"), "ParadexReplies { requests: 0, .. }");
+    let (result, events) = read(&mut replies, text);
+    assert_eq!((result, events), (Ok(ReplyRead::NotOurs), vec![]));
+}
+
+#[test]
+fn a_timeout_consumes_its_request_so_a_late_reply_is_not_this_tracker_s() {
+    let mut replies = sent(33, VenueCommand::Place(order(0)));
+    replies.sent(
+        RpcId(34),
+        &VenueCommand::PlaceBatch(vec![order(0), order(1)]),
+    );
+    assert_eq!(timed_out(&mut replies, 33), unknown_whole(33));
+    assert_eq!(timed_out(&mut replies, 34), unknown_whole(34));
+    // Each request timed out is dropped: the tracker holds nothing for an outage's
+    // unanswered requests.
+    assert_eq!(format!("{replies:?}"), "ParadexReplies { requests: 0, .. }");
+    // A reply arriving after its timeout adds no second outcome to the Unknown already
+    // reported; the order events and the Unknown ladder settle it (0005).
+    let late = fixture("reply-create.json").replace(r#""id":11"#, r#""id":33"#);
+    let (result, events) = read(&mut replies, &late);
+    assert_eq!((result, events), (Ok(ReplyRead::NotOurs), vec![]));
 }
 
 #[test]
