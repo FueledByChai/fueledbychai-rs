@@ -94,3 +94,32 @@ specs' 0.1 tick and sizes on their 0.001 step.
 
 `crates/venues/fbc-venue-paradex/tests/exec_rest.rs` decodes them and changes single fields to
 reach the decoders' refusals.
+
+## JSON-RPC replies
+
+Hand-built, every one, in the shapes docs.paradex.trade documents for the order socket: the
+envelope of the WebSocket "Error Handling" page (`jsonrpc`, `result` or `error`, `usIn`,
+`usOut`, `usDiff`, `id`), and each method's result from its page under
+`ws/web-socket-channels/`. Each order object carries every field the page lists; its `account`
+is the made-up bytes a0..bf in hex, and its client id the first tests' id above. The JSON-RPC
+ids are the request ids the tests send under. Order ids are `1759500000000000001` to `...03`.
+
+| File | What it is |
+| --- | --- |
+| `reply-create.json` | `order.create` (id 11): the created order, NEW, a POST_ONLY buy of 0.15 at 62000 under our first client id |
+| `reply-create-bare-id.json` | `order.create` (id 12) answered with a bare `{"id":..}`, which the Java library's `extractOrderId` tolerates |
+| `reply-create-batch-mixed.json` | `order.create_batch` (id 13): the first item created as above, the second refused with an `error` message |
+| `reply-create-batch-short.json` | `order.create_batch` (id 14) with one result for a two-item batch |
+| `reply-modify.json` | `order.modify` (id 15): the order OPEN at 61999.5 for 0.2 |
+| `reply-cancel.json` | `order.cancel` (id 16): `QUEUED_FOR_CANCELLATION` for the first order id |
+| `reply-cancel-batch.json` | `order.cancel_batch` (id 17): the three order ids QUEUED_FOR_CANCELLATION, ALREADY_CLOSED and NOT_FOUND (no `market`, as the page says) |
+| `reply-cancel-all.json` | `order.cancel_all` (id 18): `{"status":"ok"}` |
+| `reply-cancel-on-disconnect.json` | `order.cancel_on_disconnect` (id 19): `{"enabled":true}` |
+| `error-method.json` | Error 100, method error, with `data` (id 20) |
+| `error-internal.json` | Error -32603, internal error (id 21) |
+| `error-undocumented.json` | Error 4290, a code no page documents (id 22) |
+| `error-no-id.json` | Error -32700, parse error, with no `id` |
+| `error-null-id.json` | Error 40111, invalid bearer token, with a null `id` |
+
+`crates/venues/fbc-venue-paradex/tests/exec_replies.rs` decodes them and changes single fields
+to reach the decoder's refusals.

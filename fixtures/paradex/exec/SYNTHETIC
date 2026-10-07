@@ -7,6 +7,9 @@ directory was received from Paradex or belongs to an account.
   of the owner or of anyone else.
 - The REST responses (`rest-*.json`) are hand-built in the shapes docs.paradex.trade
   documents; each order's and position's `account` is the same made-up bytes a0 ... bf, in hex.
+- The JSON-RPC replies (`reply-*.json`, `error-*.json`) are hand-built in the shapes
+  docs.paradex.trade documents; each order's `account` is the same made-up bytes a0 ... bf, in
+  hex, and the error messages marked `synthetic` are made up.
 - The client ids are either ids this library mints in the tests' namespace (computed from the
   test's namespace, account key and start time, see the test) or a random version 4 UUID; the
   order ids, fill and trade ids, request ids, sequences, timestamps, prices, sizes, fees and

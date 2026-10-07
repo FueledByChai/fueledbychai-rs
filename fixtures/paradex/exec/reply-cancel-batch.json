@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","result":{"results":[{"id":"1759500000000000001","market":"BTC-USD-PERP","status":"QUEUED_FOR_CANCELLATION"},{"id":"1759500000000000002","market":"BTC-USD-PERP","status":"ALREADY_CLOSED"},{"id":"1759500000000000003","status":"NOT_FOUND"}]},"usIn":1759622400124001,"usOut":1759622400124038,"usDiff":37,"id":17}
