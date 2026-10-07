@@ -9,8 +9,9 @@
 //! - a level wanted with no order of ours there is placed (an add, or a reducing order when
 //!   the quote reduces);
 //! - a level whose order is PendingNew or Unknown, on the Unknown ladder, has a command in
-//!   flight, or an amend built and not reported sent, is occupied: nothing is placed, amended
-//!   or replaced there until that settles ([`HeldReason`]);
+//!   flight, an amend built and not reported sent, or an amend replaced in flight and not yet
+//!   settled by an ordered venue update ([`OrderRecord::amend_unconfirmed`]), is occupied:
+//!   nothing is placed, amended or replaced there until that settles ([`HeldReason`]);
 //! - a level whose order has a cancel waiting for its acknowledgement (the level was pulled
 //!   before it) is replaced, wanted again or not: the cancel is built once the acknowledgement
 //!   lands and the level waits for the order's terminal state;
@@ -253,7 +254,8 @@ pub enum HeldReason {
     /// The order is PendingNew or Unknown, or on the Unknown ladder: the level is occupied
     /// until it is terminal or resting.
     Unsettled(OrdState),
-    /// An amend or cancel is in flight, or an amend was built and not reported sent.
+    /// An amend or cancel is in flight, an amend was built and not reported sent, or an amend
+    /// replaced in flight is not yet settled ([`OrderRecord::amend_unconfirmed`]).
     InFlight,
     /// The order differs from the quote but is younger than the minimum age.
     Young,
@@ -631,7 +633,10 @@ fn unsettled(rec: &OrderRecord) -> Option<HeldReason> {
         state if rec.unknown_since().is_some() => return Some(HeldReason::Unsettled(state)),
         _ => {}
     }
-    let in_flight = rec.intent() != Intent::None || rec.amend_built().is_some();
+    // An amend replaced in flight (by a cancel the venue then refused, or never sent) may
+    // still reach the venue until an ordered update settles it: no second amend goes over it,
+    // and the record's price may not be the venue's (FBC-cit6).
+    let in_flight = rec.intent() != Intent::None || rec.amend_unconfirmed();
     in_flight.then_some(HeldReason::InFlight)
 }
 

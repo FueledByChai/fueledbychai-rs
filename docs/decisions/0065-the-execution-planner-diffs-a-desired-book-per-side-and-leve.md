@@ -46,8 +46,10 @@ authorization (0045, 0060) already exist; the planner must go through them, neve
    replacement while the old order may rest, so the cost comparison of N amends against a
    cancel batch plus a create batch is FBC-hht's with batching.
 5. **Occupied levels.** A level whose order is PendingNew or Unknown, on the Unknown ladder,
-   with an amend or cancel in flight, or an amend built and not reported sent, gets no place,
-   amend or replace until that settles. A level no longer wanted has its order cancelled unless
+   with an amend or cancel in flight, an amend built and not reported sent, or an amend
+   replaced in flight (by a cancel the venue refused or that was never sent) not yet settled by
+   a venue update ordered after it, gets no place, amend or replace until that settles: the
+   replaced amend may still reach the venue, so no second amend goes over it (FBC-cit6). A level no longer wanted has its order cancelled unless
    a cancel is already in flight. A cancel waiting for the order's acknowledgement is carried
    through whether or not the level is wanted again: the planner tries it at every pass, builds
    it once the acknowledgement lands, and the level waits for the order's terminal state before
