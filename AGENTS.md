@@ -252,11 +252,12 @@ rather than guess.
     while foreign ones are flagged; Exit's admission (0012, 0063; `tests/exit.rs`): only reduce-only or
     reducing-classified orders on the side that reduces the position, the position plus that
     side's orders never crossing zero, every cap still applied, nothing once flat; the
-    `ExecutionPlanner` (0005, 0065; `src/planner.rs`, `tests/planner.rs`): the consumer's
-    `DesiredBook` diffed per side and level against the orders it placed, under the consumer's
-    `PlannerConfig` (basis-point and lot replace thresholds, a minimum age), a change an amend
-    where the venue's `OrderCaps` admit it and otherwise a cancel then, once the old order is
-    terminal, a place, a PendingNew, Unknown or in-flight order occupying its level, every
+    `ExecutionPlanner` (0005, 0065, 0068; `src/planner.rs`, `tests/planner.rs`): the
+    consumer's `DesiredBook` diffed per side and level against the orders it placed for that
+    account (each account's apart, nothing built through a registry that does not hold them),
+    under the consumer's `PlannerConfig` (basis-point and lot replace thresholds, a minimum
+    age), a change an amend where the venue's `OrderCaps` admit it and otherwise a cancel
+    then, once the old order is terminal, a place, a PendingNew, Unknown or in-flight order occupying its level, every
     command built through the one pre-trade path and the permits and emitted as an
     `Authorization`, cancels then reducing orders then amends then adds, in Exit every order
     on a side that does not reduce the position cancelled; still planned: batching,

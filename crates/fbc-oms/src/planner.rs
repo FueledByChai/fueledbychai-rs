@@ -38,6 +38,11 @@
 //! sends before the next pass, as for any command: a place's outcome, an amend's
 //! [`Registry::amend_sent`] and a cancel's [`Registry::cancel_sent`]. A cancel not reported
 //! sent is built again at the next pass.
+//!
+//! One planner may serve several accounts: it holds the orders it placed per account and
+//! market, each account planned through its own registry, so a pass for one account never
+//! frees another's levels. A registry that does not hold an order the planner placed for the
+//! account is not the one it was placed through, and the pass builds nothing (0068).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -275,6 +280,10 @@ pub enum PlanRefusal {
     Permit(PermitRefusal),
     /// No client id could be minted.
     Mint(IdError),
+    /// The registry does not hold the order the planner placed at the level for this account:
+    /// it is not the registry the planner placed it through (another account's, or one
+    /// rebuilt), and the pass builds nothing for the market (decision 0068).
+    NotInRegistry(ClientOrderId),
 }
 
 /// A level the planner built nothing for this pass, and why.
@@ -322,12 +331,12 @@ enum Action {
     Place(DesiredQuote),
 }
 
-/// The planner (decision 0005's one planner; 0065): the orders it placed, by market, side and
-/// level, and the consumer's thresholds.
+/// The planner (decision 0005's one planner; 0065): the orders it placed, by account, market,
+/// side and level (0068), and the consumer's thresholds.
 #[derive(Debug)]
 pub struct ExecutionPlanner {
     config: PlannerConfig,
-    slots: HashMap<InstrumentId, BTreeMap<Level, Slot>>,
+    slots: HashMap<(AccountKey, InstrumentId), BTreeMap<Level, Slot>>,
 }
 
 impl ExecutionPlanner {
@@ -339,10 +348,17 @@ impl ExecutionPlanner {
         }
     }
 
-    /// The order the planner holds at `level` of `side` on `market`, until it is seen terminal.
-    pub fn order_at(&self, market: InstrumentId, side: Side, level: u16) -> Option<ClientOrderId> {
+    /// The order the planner holds for `acct` at `level` of `side` on `market`, until it is seen
+    /// terminal.
+    pub fn order_at(
+        &self,
+        acct: AccountKey,
+        market: InstrumentId,
+        side: Side,
+        level: u16,
+    ) -> Option<ClientOrderId> {
         self.slots
-            .get(&market)?
+            .get(&(acct, market))?
             .get(&Level::new(side, level))
             .map(|s| s.cid)
     }
@@ -351,6 +367,11 @@ impl ExecutionPlanner {
     /// order, each command through `reg` (places with client ids from `mint`, amends from
     /// [`Live`](crate::Live) permits, cancels from [`Cancellable`](crate::Cancellable) ones,
     /// all under the venue's `caps`) and authorizes it for `acct`.
+    ///
+    /// `reg` is `acct`'s registry: the planner holds each account's orders apart, so a pass for
+    /// one account never frees another's levels. A registry that does not hold an order the
+    /// planner placed for `acct` on the market is not the one it was placed through, and the
+    /// pass builds nothing, reporting each such level ([`PlanRefusal::NotInRegistry`]; 0068).
     pub fn plan(
         &mut self,
         desired: &DesiredBook,
@@ -362,7 +383,22 @@ impl ExecutionPlanner {
     ) -> Plan {
         let market = desired.market;
         let config = self.config;
-        let slots = self.slots.entry(market).or_default();
+        let slots = self.slots.entry((acct, market)).or_default();
+        let mut plan = Plan::default();
+        // A registry never forgets an order, so one that does not hold an order the planner
+        // placed through it is another: nothing is freed or built (0068).
+        for (at, slot) in slots.iter() {
+            if reg.get(slot.cid).is_none() {
+                plan.refused.push(Refused {
+                    side: at.side(),
+                    level: at.level,
+                    why: PlanRefusal::NotInRegistry(slot.cid),
+                });
+            }
+        }
+        if !plan.refused.is_empty() {
+            return plan;
+        }
         // An order seen terminal frees its level.
         slots.retain(|_, slot| reg.get(slot.cid).is_some_and(|r| !r.state().is_terminal()));
 
@@ -376,7 +412,6 @@ impl ExecutionPlanner {
             })
         });
 
-        let mut plan = Plan::default();
         let mut actions: Vec<(Stage, Level, Action)> = Vec::new();
         let levels: BTreeSet<Level> = slots.keys().chain(desired.levels.keys()).copied().collect();
         for at in levels {
