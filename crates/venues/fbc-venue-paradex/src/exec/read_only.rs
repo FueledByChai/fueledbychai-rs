@@ -31,7 +31,11 @@
 //! - **Decoding.** Binary frames are the SBE templates of schema 1:2 (0054): `OrderEvent`,
 //!   `FillEvent`, `PositionEvent` and `AccountEvent` through their decoders; a heartbeat and any
 //!   template not decoded are skipped, as the schema's versioning policy requires. Text frames
-//!   are the JSON-RPC replies to the codec's own requests.
+//!   are the JSON-RPC replies to the codec's own requests. A reply member that is JSON `null`
+//!   is read as absent, as the order replies read it (FBC-cexu) and as the Java client reads
+//!   the auth reply (`ParadexOrderWebSocketClient.onAuthResponse`): a `result` beside
+//!   `"error": null` is that result, and an `error` beside `"result": null` is that error
+//!   (FBC-4lp7).
 //! - **Nothing order-affecting.** Every frame the codec writes is one of the two methods of
 //!   [`ReadMethod`], which has no variant for an order; `encode` refuses every command
 //!   `NotSent(Unsupported)` with no effect, and no call asks for a nonce.
@@ -64,6 +68,7 @@ use serde_json::{Value, json};
 use crate::auth::{Login, LoginCycle, REST_URL, SessionToken, TIMEOUT, token_spans};
 use crate::md::sbe::Message;
 
+use super::reply::member;
 use super::{
     ResyncTags, TEMPLATE_ACCOUNT, TEMPLATE_FILL, TEMPLATE_ORDER, TEMPLATE_POSITION,
     decode_account_event, decode_fill_event, decode_order_event, decode_position_event,
@@ -293,8 +298,8 @@ impl ReadOnlyExec {
         let reply: Value = serde_json::from_str(text)
             .map_err(|_| DecodeError::Malformed("text frame is not JSON"))?;
         let id = reply.get("id").and_then(Value::as_u64);
-        let refusal = match (reply.get("result"), reply.get("error")) {
-            (Some(result), None) if !result.is_null() => None,
+        let refusal = match (member(&reply, "result"), member(&reply, "error")) {
+            (Some(_), None) => None,
             (None, Some(error)) => Some(reject(error)?),
             _ => {
                 return Err(DecodeError::Malformed(

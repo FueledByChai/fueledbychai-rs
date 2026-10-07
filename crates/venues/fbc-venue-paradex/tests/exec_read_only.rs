@@ -823,3 +823,71 @@ fn the_codec_is_refused_naming_a_missing_key_and_shows_no_credential() {
         assert!(!shown.contains(secret), "{shown}");
     }
 }
+
+/// `reply` with `"<name>": null` beside its members, as Paradex may write the member it does
+/// not fill.
+fn with_null(reply: &str, name: &str) -> String {
+    let at = reply.rfind("\"id\":").expect("a reply with an id");
+    format!("{}\"{name}\":null,{}", &reply[..at], &reply[at..])
+}
+
+#[test]
+fn an_auth_and_a_subscribe_reply_read_a_json_null_error_or_result_as_absent() {
+    // A result beside "error": null is the result: the auth reply authenticates and each
+    // subscribe reply is consumed.
+    let mut codec = crate::codec();
+    open(&mut codec);
+    let body = login_body(TOKEN);
+    let id = auth_frame(&answer(&mut codec, ok(body.as_bytes())).fx, TOKEN);
+    let call = text(&mut codec, &with_null(&reply(id), "error"));
+    call.result.unwrap();
+    assert_eq!(
+        call.events,
+        vec![ExecEvent::Conn {
+            stream: STREAM,
+            state: ConnState::Authenticated
+        }]
+    );
+    let subs = subscribes(&call.fx);
+    assert_eq!(subs.len(), PRIVATE_CHANNELS.len());
+    for (channel, id) in &subs {
+        let call = text(&mut codec, &with_null(&subscribed(*id, channel), "error"));
+        call.result.unwrap();
+        assert!(call.events.is_empty() && call.fx.is_empty());
+    }
+    // An error beside "result": null is that error: the auth reply is refused with its code.
+    let mut codec = crate::codec();
+    open(&mut codec);
+    let id = auth_frame(&answer(&mut codec, ok(body.as_bytes())).fx, TOKEN);
+    let refused = with_null(&error(id, 40111, "Invalid Bearer Token"), "result");
+    let call = text(&mut codec, &refused);
+    closed_and_reconnecting(&call);
+    let [ExecEvent::UncorrelatedError(reject), _] = call.events.as_slice() else {
+        panic!("{:?}", call.events)
+    };
+    assert_eq!(reject.venue_code.as_deref(), Some("40111"));
+    // And a subscribe reply's.
+    let mut codec = crate::codec();
+    open(&mut codec);
+    let id = auth_frame(&answer(&mut codec, ok(body.as_bytes())).fx, TOKEN);
+    let subs = subscribes(&text(&mut codec, &reply(id)).fx);
+    let refused = with_null(&error(subs[0].1, -32602, "Invalid parameters"), "result");
+    let call = text(&mut codec, &refused);
+    closed_and_reconnecting(&call);
+    let [ExecEvent::UncorrelatedError(reject), _] = call.events.as_slice() else {
+        panic!("{:?}", call.events)
+    };
+    assert_eq!(reject.venue_code.as_deref(), Some("-32602"));
+    // Both null, or both stated, is neither a reply nor an error.
+    let mut codec = authenticated();
+    let fx = open(&mut codec);
+    let id = auth_frame(&fx, TOKEN);
+    for bad in [
+        format!(r#"{{"jsonrpc":"2.0","result":null,"error":null,"id":{id}}}"#),
+        format!(r#"{{"jsonrpc":"2.0","result":{{}},"error":{{"code":1}},"id":{id}}}"#),
+    ] {
+        let call = text(&mut codec, &bad);
+        assert!(call.result.is_err(), "{bad}");
+        assert!(call.events.is_empty() && call.fx.is_empty(), "{bad}");
+    }
+}
