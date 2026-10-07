@@ -42,12 +42,19 @@ Hibachi. No planned venue needs a dead-man timer.
   then goes out only once it has returned.
 - **Only a final acceptance arms.** A two-phase venue's provisional acceptance of the arm
   (`AckLevel::Provisional`) leaves it pending and does not clear its deadline: the venue's
-  final acceptance accepts it, and a rejection or the deadline fails it.
+  final acceptance accepts it, and a rejection or the deadline fails it. A codec therefore
+  answers the arm `Accepted` at `AckLevel::Final`, `Rejected` or `Unknown`, and answers it
+  `Provisional` only when a final `Outcome` for the same request follows; fbc-core's
+  `VenueCommand::ArmCancelOnDisconnect` says so. A codec that answered `Provisional` alone
+  would fail every epoch at the arm's deadline (counted in `arm_failures`), never placing.
 - **A failed arm ends the epoch.** An arm the codec refuses, the buckets do not admit, the venue
   rejects, or that is unanswered at its deadline (whatever the codec reports for it) leaves the
   epoch refusing places and amends. Once the input being handled and the commands waiting are
   taken, so a cancel submitted meanwhile still goes out, the epoch ends as a drop, counted
-  (`ExecCounters::arm_failures`), and the next opens through `ReconnectPacing`.
+  (`ExecCounters::arm_failures`), and the next opens through `ReconnectPacing`, no sooner than
+  the buckets would admit the arm when they refused it for now. An arm whose frames weigh more
+  than the buckets ever admit ends the session (`ExecSessionError::ArmNeverFits`), as a resync's
+  does.
 - **Nothing written again.** A reconnect re-sends nothing (0057): the next epoch writes its own
   authentication, a new arm under a new request id, and its own resync.
 - **The conformance toy** declares cancel-on-disconnect `PerConnection { rearm_on_reconnect:
@@ -71,11 +78,10 @@ Hibachi. No planned venue needs a dead-man timer.
 
 ## Consequences
 
-- No order-affecting command can reach a session today (0057: nothing outside fbc-oms issues an
-  `Authorization` until FBC-afd), so the session's refusal of a place and an amend, and its
-  letting a cancel through, are proven by a unit test inside fbc-runtime that queues those
-  commands as a submission would (`exec_held_tests.rs`), on the gate itself (`exec_gate.rs`'s
-  tests) and, in `tests/`, with control commands, which take the same path as a cancel.
+- The session's refusal of a place and an amend, and its letting a cancel through, are proven
+  in fbc-runtime's `tests/exec_held.rs` with order commands fbc-oms built and authorized (FBC-afd
+  issues them; FBC-j5bw adds the submit-time check), on the gate itself (`exec_gate.rs`'s
+  tests) and, in `tests/exec_ready.rs`, with control commands.
 - A resync the venue never ends leaves its epoch connected and refusing places with no
   deadline; FBC-nwpr gives it one.
 - The handler hears the session's own arm's outcome, an `ExecEvent::Outcome` for a request it

@@ -396,9 +396,3 @@ mod tests {
         );
     }
 }
-
-// A held place and amend at the session, queued as `ExecOrders::submit` would queue them
-// (FBC-w19; PR #90 Reviewer B B2).
-#[cfg(test)]
-#[path = "exec_held_tests.rs"]
-mod held_tests;
