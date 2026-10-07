@@ -13,6 +13,7 @@ use fbc_core::{
 
 use crate::caps::{Adds, CapRefusal, Exposure, PreTradeCaps};
 use crate::entry::{Entries, StateRefusal};
+use crate::grant::Guard;
 use crate::ladder;
 use crate::ledger::AcceptedFill;
 use crate::permit::{
@@ -253,7 +254,8 @@ impl Registry {
     pub fn place(&mut self, order: NewOrder) -> Result<PermittedCommand, OmsError> {
         self.admit_placement(&order)?;
         self.insert(order.clone())?;
-        Ok(PermittedCommand::admitted(VenueCommand::Place(order)))
+        let guard = self.state_guard(order.inst);
+        Ok(PermittedCommand::guarded(VenueCommand::Place(order), guard))
     }
 
     /// Builds a batch of places of one market from the items the pre-trade caps admit, in the
@@ -280,12 +282,23 @@ impl Registry {
                 Err(refusal) => plan.refused.push((cid, refusal)),
             }
         }
-        if !admitted.is_empty() {
-            plan.command = Some(PermittedCommand::admitted(VenueCommand::PlaceBatch(
-                admitted,
-            )));
+        if let Some(first) = admitted.first() {
+            let guard = self.state_guard(first.inst);
+            plan.command = Some(PermittedCommand::guarded(
+                VenueCommand::PlaceBatch(admitted),
+                guard,
+            ));
         }
         Ok(plan)
+    }
+
+    /// The guard of a place, a batch or an amend built now on `market`: its state generation,
+    /// checked again at submit (decision 0060).
+    fn state_guard(&mut self, market: InstrumentId) -> Guard {
+        Guard {
+            state: Some(self.entries.watch(market)),
+            foreign: None,
+        }
     }
 
     fn admit_placement(&self, order: &NewOrder) -> Result<(), OmsError> {
@@ -599,11 +612,12 @@ impl Registry {
             .placed();
         let exposure = self.exposure(placed.inst, placed.side, Some(cid));
         let state = self.entries.admits(placed.inst);
+        let generation = self.entries.watch(placed.inst);
         let rec = self
             .orders
             .get_mut(&cid)
             .expect("the order was found above");
-        Live::check(rec, state, exposure)
+        Live::check(rec, state, generation, exposure)
     }
 
     /// The permit to cancel our order `cid`: it is not terminal (PendingNew, Unknown and an

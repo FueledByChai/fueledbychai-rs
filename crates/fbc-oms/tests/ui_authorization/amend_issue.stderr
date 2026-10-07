@@ -8,7 +8,31 @@ error[E0624]: associated function `issue` is private
   |
   | /     pub(crate) fn issue(
   | |         acct: AccountKey,
-  | |         cmd: VenueCommand,
-  | |         generations: &Generations,
+  | |         cmd: PermittedCommand,
+  | |         current: StateGeneration,
   | |     ) -> Result<Authorization, IssueRefusal> {
   | |____________________________________________- private associated function defined here
+
+error[E0308]: arguments to this function are incorrect
+ --> tests/ui_authorization/amend_issue.rs:7:5
+  |
+7 |     Authorization::issue(acct, VenueCommand::Amend(amend), &Default::default()).unwrap()
+  |     ^^^^^^^^^^^^^^^^^^^^       -------------------------- expected `PermittedCommand`, found `VenueCommand`
+  |
+note: expected `StateGeneration`, found `&_`
+ --> tests/ui_authorization/amend_issue.rs:7:60
+  |
+7 |     Authorization::issue(acct, VenueCommand::Amend(amend), &Default::default()).unwrap()
+  |                                                            ^^^^^^^^^^^^^^^^^^^
+  = note: expected struct `StateGeneration`
+          found reference `&_`
+note: associated function defined here
+ --> src/grant.rs
+  |
+  |     pub(crate) fn issue(
+  |                   ^^^^^
+help: consider removing the borrow
+  |
+7 -     Authorization::issue(acct, VenueCommand::Amend(amend), &Default::default()).unwrap()
+7 +     Authorization::issue(acct, VenueCommand::Amend(amend), Default::default()).unwrap()
+  |

@@ -34,6 +34,7 @@ use fbc_core::{
 
 use crate::caps::{Adds, CapRefusal, Exposure};
 use crate::entry::StateRefusal;
+use crate::grant::{Guard, Watch};
 use crate::record::{Intent, OrdState, OrderRecord};
 
 /// Why the registry gives no permit for an order.
@@ -121,6 +122,10 @@ pub struct PermittedCommand {
     /// For an amend, its order and the build's number, by which alone its reservation is
     /// released ([`Registry::amend_not_submitted`]).
     built: Option<(ClientOrderId, u64)>,
+    /// What its authorization is checked against at submit: the market's state generation at
+    /// build for a place, a batch, an amend or an instrument cancel-all, and the foreign orders
+    /// seen for the last (decision 0060); nothing for a cancel or a cancel-many.
+    guard: Guard,
 }
 
 impl PermittedCommand {
@@ -129,14 +134,33 @@ impl PermittedCommand {
         &self.cmd
     }
 
-    /// The command, for the authorization issued from it.
-    pub(crate) fn into_command(self) -> VenueCommand {
-        self.cmd
+    /// The command and its guard, for the authorization issued from it.
+    pub(crate) fn into_parts(self) -> (VenueCommand, Guard) {
+        (self.cmd, self.guard)
     }
 
-    /// A place or a batch of places the pre-trade caps admitted.
-    pub(crate) fn admitted(cmd: VenueCommand) -> PermittedCommand {
-        PermittedCommand { cmd, built: None }
+    /// A cancel or a cancel-many a [`Cancellable`] permit built, which nothing holds back at
+    /// submit.
+    pub(crate) fn cancel(cmd: VenueCommand) -> PermittedCommand {
+        debug_assert!(matches!(
+            cmd,
+            VenueCommand::Cancel(_) | VenueCommand::CancelMany(_)
+        ));
+        PermittedCommand {
+            cmd,
+            built: None,
+            guard: Guard::default(),
+        }
+    }
+
+    /// A place or a batch of places the market's state and the pre-trade caps admitted, or an
+    /// instrument cancel-all built under 0005's I7 guard, checked at submit against `guard`.
+    pub(crate) fn guarded(cmd: VenueCommand, guard: Guard) -> PermittedCommand {
+        PermittedCommand {
+            cmd,
+            built: None,
+            guard,
+        }
     }
 
     /// For an amend, its order and the build's number.
@@ -188,6 +212,9 @@ pub struct Live<'r> {
     /// What the market's state admits, read when the permit was given: nothing changes it
     /// while the permit holds the registry.
     state: Result<(), StateRefusal>,
+    /// The market's state generation then, which the amend's authorization is checked against
+    /// at submit (decision 0060).
+    generation: Watch,
     exposure: Exposure,
 }
 
@@ -195,6 +222,7 @@ impl<'r> Live<'r> {
     pub(crate) fn check(
         rec: &'r mut OrderRecord,
         state: Result<(), StateRefusal>,
+        generation: Watch,
         exposure: Exposure,
     ) -> Result<Live<'r>, PermitRefusal> {
         let cid = rec.cid();
@@ -217,6 +245,7 @@ impl<'r> Live<'r> {
         Ok(Live {
             rec,
             state,
+            generation,
             exposure,
         })
     }
@@ -308,6 +337,10 @@ impl<'r> Live<'r> {
         Ok(PermittedCommand {
             cmd: VenueCommand::Amend(amend),
             built: Some((cid, build)),
+            guard: Guard {
+                state: Some(self.generation),
+                foreign: None,
+            },
         })
     }
 }
@@ -341,7 +374,7 @@ impl<'r> Cancellable<'r> {
         match cancel_of(self.rec, caps, caps.cancel_refs) {
             Some(cancel) => {
                 self.rec.set_cancel_awaits_ack(false);
-                CancelChoice::Send(PermittedCommand::admitted(VenueCommand::Cancel(cancel)))
+                CancelChoice::Send(PermittedCommand::cancel(VenueCommand::Cancel(cancel)))
             }
             None => {
                 self.rec.set_cancel_awaits_ack(true);
@@ -396,15 +429,14 @@ pub(crate) fn tombstone_of(rec: &OrderRecord, caps: &OrderCaps) -> Option<Permit
         return None;
     }
     let placed = rec.placed();
-    Some(PermittedCommand {
-        cmd: VenueCommand::Cancel(CancelOrder {
+    Some(PermittedCommand::cancel(VenueCommand::Cancel(
+        CancelOrder {
             target: OrderRef::Client(rec.cid()),
             inst: placed.inst,
             side: placed.side,
             placement_nonce: None,
-        }),
-        built: None,
-    })
+        },
+    )))
 }
 
 /// Splits `items` into cancel-many commands of one market each, at most `max_items` (above 0)
@@ -420,7 +452,7 @@ pub(crate) fn batches(items: Vec<CancelOrder>, max_items: u16) -> Vec<PermittedC
         .flat_map(|items| {
             items
                 .chunks(size)
-                .map(|chunk| PermittedCommand::admitted(VenueCommand::CancelMany(chunk.to_vec())))
+                .map(|chunk| PermittedCommand::cancel(VenueCommand::CancelMany(chunk.to_vec())))
                 .collect::<Vec<_>>()
         })
         .collect()
@@ -441,8 +473,9 @@ impl OrderRecord {
 
 #[cfg(test)]
 impl PermittedCommand {
-    /// A permitted command from any command, for the authorization's own tests.
-    pub(crate) fn for_test(cmd: VenueCommand) -> PermittedCommand {
-        PermittedCommand::admitted(cmd)
+    /// A permitted command from any command, guarded by `guard`, for the authorization's own
+    /// tests.
+    pub(crate) fn for_test(cmd: VenueCommand, guard: Guard) -> PermittedCommand {
+        PermittedCommand::guarded(cmd, guard)
     }
 }
