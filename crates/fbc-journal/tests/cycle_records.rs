@@ -3,7 +3,9 @@
 //! (format version 2, `fixtures/journal/v2`) still reads back unchanged (0006, 0014 item 1).
 //! So does a journal written in format version 3 (`fixtures/journal/v3`), before inbound
 //! redaction spans (FBC-7lm, decision 0028), and one in format version 4
-//! (`fixtures/journal/v4`), before outbound frames kept the kind they were sent as (FBC-q7b).
+//! (`fixtures/journal/v4`), before outbound frames kept the kind they were sent as (FBC-q7b),
+//! and one in format version 5 (`fixtures/journal/v5`), before a write result could be not sent
+//! for a stale authorization (FBC-j5bw, decision 0062).
 //!
 //! Every secret here is synthetic, and each is assembled at run time so no credential-shaped
 //! literal sits in the source.
@@ -19,8 +21,9 @@ use fbc_core::{
 };
 use fbc_journal::format::{MAGIC, VERSION};
 use fbc_journal::{
-    ControlEvent, Entry, HttpRequestRec, HttpResponseRec, JournalError, JournalReader,
+    CloseRec, ControlEvent, Entry, HttpRequestRec, HttpResponseRec, JournalError, JournalReader,
     JournalWriter, Marker, NonceSourceId, Opaque, Opcode, Record, RedactionKey, WriteRes,
+    WsControl,
 };
 
 const SEC: i64 = 1_000_000_000;
@@ -264,6 +267,40 @@ fn v4_records(inside_kind: Opcode) -> Vec<(WallNs, Record)> {
     out
 }
 
+/// What `fixtures/journal/v5` holds: the version 4 records, the binary frame whose only bytes
+/// that are not UTF-8 lie inside its span kept as binary as version 5 keeps it, with, after the
+/// first write result, a ping and a close frame received, each payload a credential, and a
+/// write result not sent for the last reason version 5 has, all written by the version 5 writer
+/// (its README says how).
+fn v5_records() -> Vec<(WallNs, Record)> {
+    let mut out = v4_records(Opcode::Binary);
+    let at = 1 + out
+        .iter()
+        .position(|(_, r)| matches!(r, Record::WriteResult { .. }))
+        .unwrap();
+    let new = [
+        Record::InboundControl {
+            stamp: stamp(4, NOON),
+            frame: WsControl::Ping(Opaque(secret("ping").into_bytes())),
+        },
+        Record::InboundControl {
+            stamp: stamp(5, NOON),
+            frame: WsControl::Close(Some(CloseRec {
+                code: 1001,
+                reason: secret("close"),
+            })),
+        },
+        Record::WriteResult {
+            at: MonoNs(90),
+            conn: conn(),
+            rpc: Some(RpcId(9)),
+            result: WriteRes::NotSent(NotSentReason::SignFailed),
+        },
+    ];
+    out.splice(at..at, new.into_iter().map(|r| (NOON, r)));
+    out
+}
+
 /// A frame written at `at` as `opcode`, with its credential span.
 fn binary_outbound(at: u64, bytes: Vec<u8>, span: std::ops::Range<u32>, opcode: Opcode) -> Record {
     Record::Outbound {
@@ -302,6 +339,14 @@ fn a_journal_written_before_inbound_redaction_spans_reads_back_unchanged() {
 #[test]
 fn a_journal_written_before_outbound_opcodes_reads_back_with_the_kind_its_bytes_imply() {
     reads_back_unchanged("v4", 4, v4_records(Opcode::Text));
+}
+
+/// FBC-j5bw (DeepSeek's DS-1 on PR #100): a journal written in format version 5, before the
+/// stale-authorization reason, reads back unchanged, its received control frames and its last
+/// not-sent reason included.
+#[test]
+fn a_journal_written_before_the_stale_authorization_reason_reads_back_unchanged() {
+    reads_back_unchanged("v5", 5, v5_records());
 }
 
 /// FBC-q7b's done line: a binary frame whose only bytes that are not UTF-8 lie inside its

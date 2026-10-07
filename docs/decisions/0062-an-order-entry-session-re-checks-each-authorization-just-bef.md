@@ -23,7 +23,11 @@ resent".
 - **What a refusal reports.** A new `NotSentReason::StaleAuthorization`: the handler's
   `on_submitted` gets `Err(StaleAuthorization)` for its request id, no nonce is reserved and no
   byte is written. The authorization is spent. `fbc-journal`'s `NOT_SENT` table gives it byte 7,
-  after the seven reasons before it, so journals already written read the same.
+  after the seven reasons before it, in journal format version 6: the format's rule is that a
+  reader refuses a version it does not know at the segment's header, so a reader of version 5
+  refuses a journal that may hold the new byte rather than failing part way through, and a
+  version 2 to 5 segment holding it is malformed (DeepSeek's DS-1 on PR #100). Journals already
+  written read back unchanged (`fixtures/journal/v5`, written by the version 5 writer).
 - **Order of refusals.** A command the epoch does not take (not current, or a place or amend
   held by 0058) is `NotSent(Disconnected)` as before, and counted in `unready_refusals`; only one
   the epoch would take is re-checked. Either way it is never resent.
@@ -52,6 +56,8 @@ resent".
   a cancel issued before the change goes out. The fixture those tests share with
   `tests/exec_held.rs` is `tests/armed_oms/`.
 - `fbc-oms`'s recording gateway (`tests/authorization.rs`) reports the same reason.
+- `fbc-journal` writes format version 6; a tool built before it refuses this ticket's journals
+  at their header.
 - Any exhaustive match on `NotSentReason` outside this workspace gains a variant.
 
 ## What would show this was wrong
