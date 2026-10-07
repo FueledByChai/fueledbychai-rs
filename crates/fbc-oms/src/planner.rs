@@ -10,7 +10,7 @@
 //!   the quote reduces);
 //! - a level whose order is PendingNew or Unknown, on the Unknown ladder, has a command in
 //!   flight, an amend built and not reported sent, or an amend replaced in flight and not yet
-//!   settled by an ordered venue update ([`OrderRecord::amend_unconfirmed`]), is occupied:
+//!   settled by an ordered venue update ([`OrderRecord::amend_unconfirmed`]; 0070), is occupied:
 //!   nothing is placed, amended or replaced there until that settles ([`HeldReason`]);
 //! - a level whose order has a cancel waiting for its acknowledgement (the level was pulled
 //!   before it) is replaced, wanted again or not: the cancel is built once the acknowledgement
@@ -635,7 +635,7 @@ fn unsettled(rec: &OrderRecord) -> Option<HeldReason> {
     }
     // An amend replaced in flight (by a cancel the venue then refused, or never sent) may
     // still reach the venue until an ordered update settles it: no second amend goes over it,
-    // and the record's price may not be the venue's (FBC-cit6).
+    // and the record's price may not be the venue's (0070).
     let in_flight = rec.intent() != Intent::None || rec.amend_unconfirmed();
     in_flight.then_some(HeldReason::InFlight)
 }
