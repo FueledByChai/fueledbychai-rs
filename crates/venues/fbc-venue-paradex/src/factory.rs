@@ -83,8 +83,9 @@ const SCHEMA: &[FieldSpec] = &[
         key: EXEC_URL,
         scope: ConfigScope::Account,
         unit: FieldUnit::Dimensionless,
-        doc: "Order-entry WebSocket URL (wss://), without query parameters; the adapter \
-              appends the SBE negotiation (sbeSchemaId=1&sbeSchemaVersion=2).",
+        doc: "Order-entry WebSocket URL (wss://, or ws:// to a loopback test stub only), \
+              without query parameters; the adapter appends the SBE negotiation \
+              (sbeSchemaId=1&sbeSchemaVersion=2).",
     },
     FieldSpec {
         key: EXEC_MODE,
@@ -120,9 +121,25 @@ impl ParadexFactory {
     }
 
     /// The order-entry WebSocket URL from `cfg`, with the SBE 1:2 negotiation appended
-    /// ([`exec::ORDER_SBE_SCHEMA_VERSION`], decision 0054).
+    /// ([`exec::ORDER_SBE_SCHEMA_VERSION`], decision 0054). Plain `ws://` only to a loopback
+    /// test stub: the socket carries the session token and every signed order, as src/auth
+    /// refuses plain `http://` for the REST base (the owner's review).
     pub fn exec_url(cfg: &VenueConfig) -> Result<WireUrl, ConfigError> {
-        socket_url(cfg, EXEC_URL, exec::ORDER_SBE_SCHEMA_VERSION)
+        let url = socket_url(cfg, EXEC_URL, exec::ORDER_SBE_SCHEMA_VERSION)?;
+        if let Some(after) = cfg
+            .get(EXEC_URL)
+            .and_then(|text| text.strip_prefix("ws://"))
+        {
+            let authority = &after[..after.find('/').unwrap_or(after.len())];
+            if !auth::is_loopback_authority(authority) {
+                return Err(ConfigError::Invalid {
+                    key: EXEC_URL,
+                    reason: "ws:// is for a loopback test stub only (127.0.0.0/8, ::1 or \
+                             localhost): give a wss:// URL",
+                });
+            }
+        }
+        Ok(url)
     }
 
     /// What the order-entry session's codec may do, from `cfg` ([`EXEC_MODE`]).

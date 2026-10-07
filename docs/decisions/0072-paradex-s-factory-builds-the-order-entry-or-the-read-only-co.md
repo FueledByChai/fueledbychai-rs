@@ -35,8 +35,10 @@ ticket's to choose, and no record fixed them:
    no credential: it passes `Secrets` straight to src/auth's functions. Orders are signed with the
    main key, the key the login uses (the owner's rule that Paradex logs in with the main key;
    a trading subkey is FBC-2vhg's).
-3. **Two order-entry settings.** `paradex.exec.url` is the order socket's URL without a query;
-   the adapter appends `sbeSchemaId=1&sbeSchemaVersion=2` (0054), while market data stays on 1:1
+3. **Two order-entry settings.** `paradex.exec.url` is the order socket's URL without a query,
+   `wss://`, or `ws://` to a loopback test stub only, since the socket carries the session token
+   and every signed order (as src/auth refuses plain `http://` for the REST base); the adapter
+   appends `sbeSchemaId=1&sbeSchemaVersion=2` (0054), while market data stays on 1:1
    under its own key. `paradex.exec.rpc.timeout` (`<n>s` or `<n>ms`, positive) is how long an
    order request awaits its reply; it is read in the `orders` mode only. Both have no default.
 4. **One stream.** `plan_exec` plans one endpoint, stream 0 (`EXEC_STREAM`), in either mode;

@@ -13,16 +13,17 @@ mod common;
 mod md;
 
 use std::fs;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use common::Vectors;
 use fbc_core::{
-    AccountKey, CancelOnDisconnect, Channel, CidMint, ConfigError, ConnState, Effect, Effects,
-    EncodeCtx, ExecCodec, ExecEndpoint, ExecEvent, ExecSink, FieldUnit, HttpFailure, HttpPlan,
-    HttpResponse, HttpTag, Lots, MonoNs, Namespace, NamespaceLease, NewOrder, NonceBlock,
-    NotSentReason, OrderKind, PathStamps, PlanError, PlanStep, RawFrame, RpcCall, RpcId, Secret,
-    Secrets, Side, SnapshotSource, Ticks, Tif, VenueCommand, VenueConfig, VenueError, VenueFactory,
-    VenueMeta, WallNs, WireUrl, dispatch, dispatch_market_data,
+    AccountKey, CancelOnDisconnect, Channel, CidMint, ClientOrderId, ConfigError, ConnState,
+    Effect, Effects, EncodeCtx, ExecCodec, ExecEndpoint, ExecEvent, ExecSink, FieldUnit,
+    HttpFailure, HttpPlan, HttpResponse, HttpTag, Lots, MonoNs, Namespace, NamespaceLease,
+    NewOrder, NonceBlock, NotSentReason, OrderKind, PathStamps, PlanError, PlanStep, RawFrame,
+    RpcCall, RpcId, Secret, Secrets, Side, SnapshotSource, Ticks, Tif, VenueCommand, VenueConfig,
+    VenueError, VenueFactory, VenueMeta, WallNs, WireUrl, dispatch, dispatch_market_data,
 };
 use fbc_venue_paradex::ParadexFactory;
 use fbc_venue_paradex::auth::{
@@ -214,16 +215,22 @@ fn authenticate(codec: &mut dyn ExecCodec) {
     assert_eq!(sends(&fx.take()).len(), PRIVATE_CHANNELS.len());
 }
 
-/// A post-only buy of 150 lots at tick 620000, under a client id minted in [`OWN`].
+/// A post-only buy of 150 lots at tick 620000, under a client id minted in [`OWN`] once per
+/// test process: the tests run in parallel, and two leases on one directory would collide
+/// (Reviewer B RB-xzp-2 on PR #111).
 fn place() -> VenueCommand {
-    let dir = std::env::temp_dir().join(format!("fbc-paradex-factory-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    let lease = NamespaceLease::acquire(&dir, AccountKey::new(3), OWN).unwrap();
-    let mut mint = CidMint::new(lease, 0, 0, WallNs(1_759_622_400_000_000_000));
-    let cid = mint.mint().unwrap();
-    drop(mint);
-    let _ = fs::remove_dir_all(&dir);
+    static CID: OnceLock<ClientOrderId> = OnceLock::new();
+    let cid = *CID.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("fbc-paradex-factory-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let lease = NamespaceLease::acquire(&dir, AccountKey::new(3), OWN).unwrap();
+        let mut mint = CidMint::new(lease, 0, 0, WallNs(1_759_622_400_000_000_000));
+        let cid = mint.mint().unwrap();
+        drop(mint);
+        let _ = fs::remove_dir_all(&dir);
+        cid
+    });
     VenueCommand::Place(NewOrder {
         cid,
         inst: BTC,
@@ -347,6 +354,50 @@ fn plan_exec_gives_one_order_entry_endpoint_from_the_configuration_on_sbe_1_2() 
                 }))
             ),
             "{url}: {refused:?}"
+        );
+    }
+}
+
+/// The order socket carries the session token and every signed order, so plain `ws://` is for a
+/// loopback test stub only, as plain `http://` is for the REST base (Reviewer B RB-xzp-1 on
+/// PR #111).
+#[test]
+fn plan_exec_refuses_plain_ws_to_a_remote_host_and_takes_it_to_a_loopback_stub() {
+    for url in [
+        "ws://ws.api.prod.paradex.trade/v1",
+        "ws://10.0.0.1/v1",
+        "ws://[2001:db8::1]:443/v1",
+        "ws://localhost.example.com/v1",
+        "ws://user@127.0.0.1/v1",
+        "ws://127.0.0.1:0/v1",
+        "ws:///v1",
+    ] {
+        let refused = ParadexFactory.plan_exec(&cfg_with("orders", EXEC_URL, Some(url)));
+        assert!(
+            matches!(
+                refused,
+                Err(VenueError::Config(ConfigError::Invalid {
+                    key: EXEC_URL,
+                    ..
+                }))
+            ),
+            "{url}: {refused:?}"
+        );
+    }
+    for url in [
+        "ws://127.0.0.1:8080/v1",
+        "ws://127.5.6.7/v1",
+        "ws://localhost:9001",
+        "ws://LOCALHOST/v1",
+        "ws://[::1]:9001/v1",
+    ] {
+        let planned = ParadexFactory.plan_exec(&cfg_with("orders", EXEC_URL, Some(url)));
+        assert_eq!(
+            planned.map(|endpoints| endpoints[0].url.clone()),
+            Ok(WireUrl::plain(format!(
+                "{url}?sbeSchemaId=1&sbeSchemaVersion=2"
+            ))),
+            "{url}"
         );
     }
 }

@@ -319,6 +319,12 @@ fn host(authority: &str) -> Option<Host<'_>> {
     Some(host)
 }
 
+/// Whether `authority` names this machine (`127.0.0.0/8`, `::1` or `localhost`, then
+/// optionally a port from 1 to 65535): what a plain-text socket may be opened to.
+pub(crate) fn is_loopback_authority(authority: &str) -> bool {
+    host(authority).is_some_and(|host| host.is_loopback())
+}
+
 /// A host an authority names.
 enum Host<'a> {
     Name(&'a str),
