@@ -20,6 +20,7 @@ use crate::permit::{
 };
 use crate::record::{Applied, FillApplied, OrderKey, OrderOp, OrderRecord, OutcomeApplied};
 use crate::resync::{MarketState, Placed, Placement, Seed};
+use crate::sweep::ForeignView;
 
 /// Our orders, by client id, with an index of every venue id they were known by, the
 /// inventory per instrument that the fills the ledger accepted moved, and the Unknown ladder's
@@ -43,6 +44,9 @@ pub struct Registry {
     /// Each market's armed flag and order-entry state, and the leases arming took (decision
     /// 0012).
     pub(crate) entries: Entries,
+    /// The orders not ours in view, which decide whether the kill switch's cancel everything
+    /// may be an instrument cancel-all (0005's I7; [`Registry::cancel_everything`]).
+    pub(crate) foreign: ForeignView,
 }
 
 /// Where [`Registry::apply_fill`] sent a fill the ledger accepted.
@@ -331,15 +335,28 @@ impl Registry {
     /// Routes a venue order update to its order and applies it there
     /// ([`OrderRecord::apply_update`]). One of our client ids the registry holds names the
     /// order; otherwise the venue id does, current or superseded. Another namespace's or a
-    /// non-canonical client id names none of ours.
+    /// non-canonical client id names none of ours. An update of an order not ours (another
+    /// namespace's, a non-canonical client id, or no client id and a venue id no order of ours
+    /// had) moves that order into or out of view ([`Registry::foreign_in_view`]).
     pub fn apply_update(&mut self, u: &OrderUpdate, key: OrderKey) -> Routed {
         let cid = match u.cid {
-            Some(CidMatch::Foreign(ns)) => return Routed::Foreign(ns),
-            Some(CidMatch::Unparseable) => return Routed::NotCanonical,
+            Some(CidMatch::Foreign(ns)) => {
+                self.foreign.update(u);
+                return Routed::Foreign(ns);
+            }
+            Some(CidMatch::Unparseable) => {
+                self.foreign.update(u);
+                return Routed::NotCanonical;
+            }
             Some(CidMatch::Ours(cid)) if self.orders.contains_key(&cid) => cid,
             Some(CidMatch::Ours(_)) | None => match u.vid.as_ref().and_then(|v| self.cid_of(v)) {
                 Some(cid) => cid,
-                None => return Routed::Untracked,
+                None => {
+                    if u.cid.is_none() {
+                        self.foreign.update(u);
+                    }
+                    return Routed::Untracked;
+                }
             },
         };
         let applied = self.with_record(cid, |rec| rec.apply_update(u, key));
@@ -391,7 +408,9 @@ impl Registry {
     /// for no order the registry holds moves the inventory only; another namespace's, a
     /// non-canonical or an unattributed one, one whose client id and venue id name different
     /// orders, or one whose instrument or side is not its order's, moves nothing and is
-    /// flagged. The ledger records
+    /// flagged; the first three put their order in view ([`Registry::foreign_in_view`]). None
+    /// of this depends on the market's state: a fill in Killed or Cancel-only counts as in
+    /// any other (decision 0012). The ledger records
     /// only a fill that counted, once it is applied: a flagged fill is not kept, so it never
     /// moves the retention horizon, and delivered again it is routed again (an unattributed
     /// fill reaches its order once the registry knows the order's venue id). Refused, counting
@@ -407,8 +426,14 @@ impl Registry {
         let fill = accepted.fill();
         let by_vid = fill.vid().and_then(|v| self.cid_of(v));
         let (cid, ours) = match fill.cid {
-            Some(CidMatch::Foreign(ns)) => return Ok(FillRouted::Foreign(ns)),
-            Some(CidMatch::Unparseable) => return Ok(FillRouted::NotCanonical),
+            Some(CidMatch::Foreign(ns)) => {
+                self.foreign.open(fill.inst, fill.vid());
+                return Ok(FillRouted::Foreign(ns));
+            }
+            Some(CidMatch::Unparseable) => {
+                self.foreign.open(fill.inst, fill.vid());
+                return Ok(FillRouted::NotCanonical);
+            }
             Some(CidMatch::Ours(cid)) => match by_vid {
                 Some(other) if other != cid => {
                     return Ok(FillRouted::Conflicting { cid, by_vid: other });
@@ -418,7 +443,10 @@ impl Registry {
             },
             None => match by_vid {
                 Some(cid) => (Some(cid), cid),
-                None => return Ok(FillRouted::Unattributed),
+                None => {
+                    self.foreign.open(fill.inst, fill.vid());
+                    return Ok(FillRouted::Unattributed);
+                }
             },
         };
         if let Some(cid) = cid {

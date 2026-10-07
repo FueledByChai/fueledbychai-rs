@@ -342,6 +342,24 @@ impl Entries {
             .ok_or(ArmRefusal::NotNamed(market))
     }
 
+    /// Whether the registry holds `market`'s exclusive lease under the names it has now: the
+    /// market is armed and its held leases are still covered (0005's I7).
+    pub(crate) fn holds_exclusive(&self, market: InstrumentId) -> bool {
+        self.armed(market) && self.held_covered(market).is_ok()
+    }
+
+    /// The markets in Killed, in id order.
+    pub(crate) fn killed(&self) -> Vec<InstrumentId> {
+        let mut killed: Vec<InstrumentId> = self
+            .states
+            .iter()
+            .filter(|(_, s)| **s == EntryState::Killed)
+            .map(|(m, _)| *m)
+            .collect();
+        killed.sort();
+        killed
+    }
+
     /// Whether the leases armed `market` holds are still covered by the names the registry has
     /// now: its market lease, and the account lease where the nonce scope is per account
     /// (Reviewer B's RB86-1 on PR #86). The account lease must be the current names' account,

@@ -152,6 +152,9 @@ pub struct ResyncReport {
     /// venue offers none): the resync seeded no market, so their positions stay unknown and
     /// nothing is built on them (decision 0055).
     pub untrustworthy: bool,
+    /// The markets in Killed, in id order: the kill switch's cancel everything goes out again
+    /// for each ([`Registry::cancel_everything`]), repeated on each resync (decision 0012).
+    pub cancel_everything: Vec<InstrumentId>,
 }
 
 /// A market's position, as the registry knows it.
@@ -377,6 +380,7 @@ impl Registry {
         }
         let mut report = ResyncReport {
             untrustworthy: caps.snapshot_source != SnapshotSource::Trustworthy,
+            cancel_everything: self.entries.killed(),
             ..ResyncReport::default()
         };
         let seeds = if report.untrustworthy {
@@ -424,6 +428,17 @@ impl Registry {
         }
         report.untracked.sort_by_key(|(cid, _)| *cid);
 
+        // The orders not ours it shows open come into view, from any source; only a
+        // trustworthy one shows the account's open orders (FBC-gzm).
+        for o in &snap.orders {
+            if o.state == VenueOrderState::Open && self.not_ours(o) {
+                self.foreign.open(o.inst, Some(&o.vid));
+            }
+        }
+        if !report.untrustworthy {
+            self.foreign.viewed();
+        }
+
         self.register_shown(snap, key, &mut report);
         for plan in seeds {
             self.seed(plan, &mut report);
@@ -443,6 +458,16 @@ impl Registry {
                 by_vid.is_none_or(|v| v == cid).then_some(cid)
             }
             Some(CidMatch::Ours(_)) | None => by_vid,
+        }
+    }
+
+    /// Whether a snapshot order is not ours: another namespace's or a non-canonical client id,
+    /// or none and a venue id no order of ours had.
+    fn not_ours(&self, o: &VenueOrderSnapshot) -> bool {
+        match o.cid {
+            Some(CidMatch::Foreign(_) | CidMatch::Unparseable) => true,
+            Some(CidMatch::Ours(_)) => false,
+            None => self.cid_of(&o.vid).is_none(),
         }
     }
 

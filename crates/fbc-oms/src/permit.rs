@@ -109,11 +109,12 @@ pub enum AmendRefusal {
 }
 
 /// A venue command this crate built: an amend, a cancel or a cancel-many of one market from a
-/// permit, every field from the order's record, or a place or a batch of places the
-/// pre-trade caps admitted ([`Registry::place`], [`Registry::place_batch`]). Only this crate
+/// permit, every field from the order's record, a place or a batch of places the
+/// pre-trade caps admitted ([`Registry::place`], [`Registry::place_batch`]), or an instrument
+/// cancel-all built under 0005's I7 guard
+/// ([`Registry::cancel_everything`](crate::Registry::cancel_everything)). Only this crate
 /// builds one; it can be read, not edited, and an authorization for an order-affecting
-/// command other than an instrument cancel-all is issued only from one (0045). It has no
-/// `Clone`: each one is authorized once.
+/// command is issued only from one (0045). It has no `Clone`: each one is authorized once.
 #[derive(Eq, PartialEq, Debug)]
 pub struct PermittedCommand {
     cmd: VenueCommand,
