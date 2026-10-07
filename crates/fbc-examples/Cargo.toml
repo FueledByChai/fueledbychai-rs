@@ -1,0 +1,26 @@
+[package]
+name = "fbc-examples"
+description = "Sample programs the owner runs by hand, never CI: md_watch prints live Paradex and Binance USD-M touches and top-of-book through fbc-runtime. The library target is empty; each sample is an example target."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# The samples wire concrete venues, so everything they use is a dev-dependency: examples and
+# tests may use them, and the library target, which is empty, has no dependency at all. A crate
+# outside crates/venues/ never has a normal dependency on a venue crate (design §3,
+# scripts/check-deps.sh, which does not count dev-dependencies).
+[dev-dependencies]
+fbc-conformance = { path = "../fbc-conformance" }
+fbc-core = { path = "../fbc-core" }
+fbc-runtime = { path = "../fbc-runtime" }
+fbc-venue-binance-usdm = { path = "../venues/fbc-venue-binance-usdm" }
+fbc-venue-paradex = { path = "../venues/fbc-venue-paradex" }
+rust_decimal.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
+
+[[example]]
+name = "md_watch"
+path = "examples/md_watch/main.rs"

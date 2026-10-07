@@ -128,7 +128,8 @@ rather than guess.
   `crates/venues/fbc-venue-paradex` with its signer (`src/sign`), SBE market data (`src/md`: bbo,
   trades and the order book), its order-entry capabilities (`src/exec`, 0054) and its factory
   (`src/factory.rs`, market data only),
-  and `crates/venues/fbc-venue-binance-usdm` with its market-data-only factory and codec; the
+  and `crates/venues/fbc-venue-binance-usdm` with its market-data-only factory and codec,
+  and `crates/fbc-examples` with the owner-run samples; the
   rest are planned. Members are the `crates/fbc-*` and
   `crates/venues/fbc-*` globs, and `fixtures/` is excluded from the workspace:
   - `crates/fbc-core`: the contract. Time, units, price grids and exact prices, sealed ids and
@@ -304,6 +305,13 @@ rather than guess.
     `commands_selfcontained` (every amend, cancel and query by each declared reference encoded
     by a fresh codec, alike after it saw the placement); still planned: the suite's other checks
     and the rest of the conformance toy).
+  - `crates/fbc-examples`: sample programs the owner runs by hand, never CI (FBC-u4so). Its
+    library target is empty and every dependency is a dev-dependency, so it is outside
+    `crates/venues/` yet wires concrete venues without a normal dependency on one; each sample is
+    an example target whose wiring a test in `tests/` includes by path and runs against the
+    conformance stub. So far `examples/md_watch/`: a Paradex market's bbo, trades and `deltas`
+    book and a Binance USD-M symbol's `bookTicker` and diff-depth book through `MdVenue`, one
+    `MdBooks` per venue, a line per update; no order, no credential (`tests/md_watch.rs`).
   - `crates/venues/fbc-venues` (the registry, the only crate that sees concrete venues),
     `crates/venues/fbc-venue-binance-usdm` (market data only:
     `exec: None` caps citing Binance's USD-M pages, `plan_md` on the `/public` combined-stream
@@ -370,7 +378,8 @@ rather than guess.
 - Build and test: `cargo build --workspace` and `cargo test --workspace`. The toolchain is pinned in `rust-toolchain.toml` (Rust 1.97,
   edition 2024; 0008), so rustup installs the right compiler on first use.
 - Run and restart: nothing. This is a library with no binary and no service; the private
-  consumer runs it.
+  consumer runs it. The owner-run samples in `crates/fbc-examples` are example targets, run by
+  hand (`cargo run -p fbc-examples --example md_watch -- --help`); nothing restarts them.
 - Network tests reach the venues only through the runtime, with the SOCKS5 proxy the caller
   configures (0002); no test in the check touches a live venue.
 - Release: the owner tags `vMAJOR.MINOR.PATCH` on `main`; the consumer pins that tag as a git
