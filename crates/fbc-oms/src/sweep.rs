@@ -40,6 +40,7 @@ use fbc_core::{
     VenueOrderId, VenueOrderState,
 };
 
+use crate::grant::{Counters, Guard, Watch};
 use crate::permit::{CancelPlan, PermittedCommand};
 use crate::record::{OrdState, OrderRecord};
 use crate::registry::Registry;
@@ -109,6 +110,9 @@ pub(crate) struct ForeignView {
     by_market: HashMap<InstrumentId, HashSet<VenueOrderId>>,
     /// Markets on which an order not ours was seen with no venue id.
     nameless: HashSet<InstrumentId>,
+    /// Per market, how many events showed an order not ours open there, which an instrument
+    /// cancel-all's authorization is checked against at submit (decision 0060).
+    seen: Counters,
 }
 
 impl ForeignView {
@@ -119,6 +123,7 @@ impl ForeignView {
 
     /// An order not ours shown open on `market` under `vid`.
     pub(crate) fn open(&mut self, market: InstrumentId, vid: Option<&VenueOrderId>) {
+        self.seen.advance(market);
         match vid {
             Some(v) => {
                 self.by_market.entry(market).or_default().insert(v.clone());
@@ -151,6 +156,12 @@ impl ForeignView {
         if let (Some(v), Some(seen)) = (vid, self.by_market.get_mut(&market)) {
             seen.remove(v);
         }
+    }
+
+    /// How many events showed an order not ours open on `market` so far, watched for an
+    /// instrument cancel-all about to be built.
+    pub(crate) fn watch(&mut self, market: InstrumentId) -> Watch {
+        self.seen.watch(market)
     }
 
     pub(crate) fn in_view(&self, market: InstrumentId) -> bool {
@@ -195,10 +206,17 @@ impl Registry {
                 let unanswered = self.ours_on(market, |state| {
                     matches!(state, OrdState::PendingNew | OrdState::Unknown)
                 });
+                // Checked at submit against the market's state and the foreign orders seen
+                // since now: either moving may undo the guard it was built under (0060).
+                let guard = Guard {
+                    state: Some(self.entries.watch(market)),
+                    foreign: Some(self.foreign.watch(market)),
+                };
                 CancelEverything::CancelAll {
-                    command: PermittedCommand::admitted(VenueCommand::CancelAll(
-                        CancelScope::Instrument(market),
-                    )),
+                    command: PermittedCommand::guarded(
+                        VenueCommand::CancelAll(CancelScope::Instrument(market)),
+                        guard,
+                    ),
                     unanswered: self.cancel_many(&unanswered, caps),
                 }
             }

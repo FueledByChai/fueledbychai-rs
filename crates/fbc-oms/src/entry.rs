@@ -30,15 +30,17 @@
 //! it is disarmed; the account lease while any market is armed.
 //!
 //! Every change of a market's armed flag or state advances its [`StateGeneration`], which an
-//! [`Authorization`](crate::Authorization) carries; a call that changes nothing does not.
-//! Nothing else in the library, and no resync, fill, outcome or ladder timer, changes either.
+//! [`Authorization`](crate::Authorization) carries; a call that changes nothing does not. Lease
+//! names given again advance it too for every armed market whose held leases they cover
+//! differently, since what the market admits changed (decision 0060). Nothing else in the
+//! library, and no resync, fill, outcome or ladder timer, changes either.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use fbc_core::{AccountLease, InstrumentId, MarketLease, NonceScope, OrderCaps, VenueSymbol};
 
-use crate::grant::{Generations, StateGeneration};
+use crate::grant::{Generations, StateGeneration, Watch};
 use crate::registry::Registry;
 
 /// A market's order-entry state (decision 0012).
@@ -296,8 +298,23 @@ pub(crate) struct Entries {
 }
 
 impl Entries {
+    /// Gives the registry the names `keys`, advancing the generation of every armed market
+    /// whose held leases they cover differently from the names before: what it admits changed
+    /// (decision 0060; Reviewer B's RB86-3 on PR #86), so a command built before is refused at
+    /// submit.
     pub(crate) fn set_keys(&mut self, keys: LeaseKeys) {
+        let mut armed: Vec<InstrumentId> = self.market_leases.keys().copied().collect();
+        armed.sort();
+        let before: Vec<bool> = armed
+            .iter()
+            .map(|m| self.held_covered(*m).is_ok())
+            .collect();
         self.keys = Some(keys);
+        for (market, was) in armed.into_iter().zip(before) {
+            if self.held_covered(market).is_ok() != was {
+                self.generations.advance(market);
+            }
+        }
     }
 
     pub(crate) fn keys(&self) -> Option<&LeaseKeys> {
@@ -321,6 +338,17 @@ impl Entries {
             state: self.state(market),
             generation: self.generations.of(market),
         }
+    }
+
+    /// `market`'s state generation now.
+    pub(crate) fn generation(&self, market: InstrumentId) -> StateGeneration {
+        self.generations.of(market)
+    }
+
+    /// `market`'s state generation now, watched for a command about to be built under it,
+    /// which its authorization is checked against at submit (decision 0060).
+    pub(crate) fn watch(&mut self, market: InstrumentId) -> Watch {
+        self.generations.watch(market)
     }
 
     /// Whether `market`'s state admits a place or amend at all, before the caps.
@@ -469,7 +497,9 @@ impl Registry {
     /// place or amend while its held leases are not covered by them
     /// ([`StateRefusal::Unleased`]), Start, Flatten and Wind-down on it are refused, and while
     /// an account lease held under other names is held no market is armed
-    /// ([`ArmRefusal::WrongAccountLease`]): such a market is disarmed and armed again.
+    /// ([`ArmRefusal::WrongAccountLease`]): such a market is disarmed and armed again. Names
+    /// that cover an armed market's held leases differently from the names before advance its
+    /// [`StateGeneration`], so a command built before is refused at submit (decision 0060).
     pub fn with_lease_keys(mut self, keys: LeaseKeys) -> Registry {
         self.entries.set_keys(keys);
         self

@@ -1,13 +1,15 @@
-error[E0451]: fields `acct`, `market`, `generation` and `cmd` of struct `Authorization` are private
-  --> tests/ui_authorization/place_literal.rs:8:9
+error: cannot construct `Authorization` with struct literal syntax due to private fields
+  --> tests/ui_authorization/place_literal.rs:7:5
    |
  7 |     Authorization {
-   |     ------------- in this type
+   |     ^^^^^^^^^^^^^
  8 |         acct,
-   |         ^^^^ private field
+   |         ---- private field
  9 |         market: order.inst,
-   |         ^^^^^^ private field
+   |         ------------------ private field
 10 |         generation: other.generation(),
-   |         ^^^^^^^^^^ private field
+   |         ------------------------------ private field
 11 |         cmd: VenueCommand::Place(order),
-   |         ^^^ private field
+   |         ------------------------------- private field
+   |
+   = note: ...and other private field `guard` that was not provided

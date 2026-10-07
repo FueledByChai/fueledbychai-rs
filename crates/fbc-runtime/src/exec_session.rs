@@ -812,8 +812,9 @@ impl<H: ExecHandler> ExecSession<H> {
                 .on_submitted(not_sent(NotSentReason::Disconnected));
             return Ok(true);
         }
-        // fbc-oms's submit-time re-check of an authorization (FBC-afd; FBC-j5bw calls it)
-        // belongs here, at encode and before any nonce is reserved, not where
+        // fbc-oms's submit-time re-check of an authorization,
+        // `Authorization::check_at_submit` (FBC-afd, decision 0060; FBC-j5bw calls it), belongs
+        // here, at encode and before any nonce is reserved, not where
         // `ExecOrders::submit` queued it: the kill switch or the market's StateGeneration may
         // have moved since (decision 0057; PR #87 Reviewer B B7). The authorization is spent
         // when this returns.

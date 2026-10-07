@@ -134,8 +134,15 @@
 //! fill moves the inventory once in every state, Killed included; a foreign one is flagged and
 //! moves nothing.
 //!
-//! Not here yet: issuing an authorization after the market's state and caps, and its check at
-//! submit (FBC-afd).
+//! Authorizations and their check at submit (decisions 0045 and 0060; `tests/authorization.rs`):
+//! [`Registry::authorize`] issues the [`Authorization`] for a command this crate built, so a
+//! command the market's state or a cap refused never receives one, and none is ever issued for
+//! an account cancel-all. It carries the market's [`StateGeneration`] at the command's build,
+//! and the gateway runs [`Authorization::check_at_submit`] immediately before encoding: a
+//! place, a batch or an amend whose market changed state since (the kill switch, a disarm, an
+//! arming call, lease names given again) is refused with nothing written, an instrument
+//! cancel-all also once an order not ours was seen on its market, and a cancel or a
+//! cancel-many always goes through.
 
 mod caps;
 mod entry;
@@ -158,7 +165,7 @@ mod common;
 pub use caps::{CapRefusal, CapsConfigError, MarketCaps, MarketCapsConfig, PreTradeCaps};
 pub use entry::{ArmRefusal, EntryState, ExitKind, LeaseKeys, Leases, MarketEntry, StateRefusal};
 pub use gateway::{ControlCommand, ManagedGateway, OrderGateway};
-pub use grant::{Authorization, StateGeneration};
+pub use grant::{Authorization, IssueRefusal, StaleAuthorization, StateGeneration};
 pub use ladder::{LadderConfig, LadderConfigError, LadderPlan, LadderResolution, ResyncApplied};
 pub use ledger::{
     AcceptedFill, Admission, FillLedger, FillTime, Horizon, LedgerConfig, LedgerConfigError,
