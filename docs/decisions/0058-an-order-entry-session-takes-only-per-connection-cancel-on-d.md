@@ -29,9 +29,10 @@ Hibachi. No planned venue needs a dead-man timer.
   one arm is accepted. The arm's events reach the handler as any other.
 - **The resync, once authenticated, every epoch.** Right after the arm, the session calls the
   codec's `resync` once for the epoch, with exactly the nonces `nonces_for(CtxCall::Resync)`
-  asks for, its frames charged together as `on_open`'s are: buckets that refuse them for now
-  end the epoch as a drop, opened again no sooner than they would admit them, and frames that
-  never fit end the session (`ExecSessionError::ResyncNeverFits`).
+  asks for, its frames and HTTP reads (each read with the connection it opens) charged together
+  as `on_open`'s are: buckets that refuse them for now end the epoch as a drop, opened again no
+  sooner than they would admit them, and what never fits ends the session
+  (`ExecSessionError::ResyncNeverFits`). A read so charged is not charged again as it starts.
 - **No place or amend until both.** Until the venue has accepted the epoch's arm and the
   `ResyncEnd` of the resync the session asked for on the epoch has been handed to the handler
   (so fbc-oms has applied it), every place, batch of places and amend taken on the epoch is
@@ -83,7 +84,10 @@ Hibachi. No planned venue needs a dead-man timer.
   issues them; FBC-j5bw adds the submit-time check), on the gate itself (`exec_gate.rs`'s
   tests) and, in `tests/exec_ready.rs`, with control commands.
 - A resync the venue never ends leaves its epoch connected and refusing places with no
-  deadline; FBC-nwpr gives it one.
+  deadline; FBC-nwpr gives it one. That includes a resync read that comes back
+  `HttpFailure::NotSent` for a reason other than the buckets (a timeout past the end of the
+  clock, a request the runtime cannot make): a codec whose resync is read over HTTP, as
+  Paradex's is, should ask to reconnect on it.
 - The handler hears the session's own arm's outcome, an `ExecEvent::Outcome` for a request it
   never submitted; a consumer ignores outcomes for request ids it does not hold.
 - Every order-entry codec answers `ArmCancelOnDisconnect(true)` with an outcome naming its

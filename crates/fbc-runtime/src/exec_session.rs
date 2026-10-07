@@ -85,22 +85,22 @@
 //! as a request of its own (its id from the account's [`RpcIds`], one nonce reserved, its frames
 //! charged together), on every epoch where the protection lapses with the connection and
 //! otherwise until an arm is accepted, then calls the codec's `resync` with exactly the nonces
-//! [`ExecCodec::nonces_for`] asks for with [`CtxCall::Resync`], its frames charged together as
-//! `on_open`'s are (buckets that refuse them for now end the epoch as a drop, opened again no
-//! sooner than they would admit them; frames that never fit end the session,
-//! [`ExecSessionError::ResyncNeverFits`]). The arm's and the resync's events reach the handler
-//! as any other. Until the venue has finally accepted the arm (a provisional acceptance leaves it
-//! pending, its deadline standing) and the resync's `ResyncEnd` has been handed to the handler,
-//! the epoch takes no place, batch of places or amend: each is `NotSent(Disconnected)`, counted
-//! ([`ExecCounters::unready_refusals`]), with no nonce reserved and nothing written, while
-//! cancels and control commands go out ([`ExecOrders::may_place`], true already as the handler
-//! hears the event that opens the epoch; what it submits then goes out once it returns). An arm
-//! the codec refuses, the buckets do not admit, the venue rejects, or that is unanswered at its
-//! deadline fails the epoch: once the input being handled and the commands waiting are taken (a
-//! cancel among them goes out), the epoch ends as a drop, counted
-//! ([`ExecCounters::arm_failures`]), and the next opens through the pacing, no sooner than the
-//! buckets would admit the arm when they refused it for now; an arm whose frames never fit ends
-//! the session ([`ExecSessionError::ArmNeverFits`]).
+//! [`ExecCodec::nonces_for`] asks for with [`CtxCall::Resync`], its frames and HTTP reads (each
+//! with the connection it opens) charged together as `on_open`'s are (buckets that refuse them
+//! for now end the epoch as a drop, opened again no sooner than they would admit them; what
+//! never fits ends the session, [`ExecSessionError::ResyncNeverFits`]). The arm's and the
+//! resync's events reach the handler as any other. Until the venue has finally accepted the arm
+//! (a provisional acceptance leaves it pending, its deadline standing) and the resync's
+//! `ResyncEnd` has been handed to the handler, the epoch takes no place, batch of places or
+//! amend: each is `NotSent(Disconnected)`, counted ([`ExecCounters::unready_refusals`]), with
+//! no nonce reserved and nothing written, while cancels and control commands go out
+//! ([`ExecOrders::may_place`], true already as the handler hears the event that opens the
+//! epoch; what it submits then goes out once it returns). An arm the codec refuses, the buckets
+//! do not admit, the venue rejects, or that is unanswered at its deadline fails the epoch: once
+//! the input being handled and the commands waiting are taken (a cancel among them goes out),
+//! the epoch ends as a drop, counted ([`ExecCounters::arm_failures`]), and the next opens
+//! through the pacing, no sooner than the buckets would admit the arm when they refused it for
+//! now; an arm whose frames never fit ends the session ([`ExecSessionError::ArmNeverFits`]).
 //!
 //! One thread drives a session (design §5.1): [`ExecSession::run`] spawns no task.
 
@@ -126,7 +126,7 @@ use crate::ratelimit::{RateError, RateLimiter, Refused, Request};
 use crate::session::SessionError;
 use crate::session_core::{
     Answered, Control, Core, CoreConfig, EpochInputs, IngestClock, TickToWire, close, frame_of,
-    next_frame, sleep_or_never, with_response,
+    http_of, next_frame, sleep_or_never, with_response,
 };
 use crate::stall::WriteStall;
 use crate::ws::{self, Message, WebSocket};
@@ -719,12 +719,15 @@ impl<H: ExecHandler> ExecSession<H> {
         Some(stamp)
     }
 
-    /// Executes what `on_open` or the codec's resync asked for on epoch `key`. Its frames are
-    /// charged together first, so all of them go or none does (Codex r4188802873): buckets that
+    /// Executes what `on_open` or the codec's resync asked for on epoch `key`. Its frames and
+    /// HTTP requests, each request with the connection it opens, are charged together first, so
+    /// all of them go or none does (Codex r4188802873; PR #90 Reviewer B B7): buckets that
     /// refuse them for now end the epoch as a drop, which reconnects through the pacing, no
     /// sooner than the buckets would admit them, and calls `on_open` (and the resync) again,
-    /// rather than leave the codec believing it sent what it never did; frames that can never
-    /// fit together end the session with `never`. False when the epoch ended.
+    /// rather than leave the codec believing it sent what it never did, or waiting on a read
+    /// that never went; what can never fit together ends the session with `never`. A request
+    /// that then does not start (its timeout past the end of the clock, or one the runtime
+    /// cannot make) stays charged. False when the epoch ended.
     async fn execute_together(
         &mut self,
         ws: &mut Option<WebSocket>,
@@ -741,10 +744,15 @@ impl<H: ExecHandler> ExecSession<H> {
             effects.truncate(at + 1);
         }
         let own = |e: &Effect| frame_of(e, stream, true);
-        let frames: Vec<Request> = effects.iter().filter_map(own).collect();
+        let requests = |e: &Effect| {
+            own(e)
+                .map(|f| vec![f])
+                .or_else(|| http_of(e).map(Vec::from))
+        };
+        let all: Vec<Request> = effects.iter().filter_map(requests).flatten().collect();
         // A stop that came while `on_open` ran charges nothing (Codex r4189174483).
         let now = Instant::now();
-        let charged = (!self.stopped()).then(|| self.core.rates.charge(now, key, &frames));
+        let charged = (!self.stopped()).then(|| self.core.rates.charge(now, key, &all));
         match charged {
             Some(Ok(_)) => {}
             None => return Ok(false),
@@ -758,7 +766,12 @@ impl<H: ExecHandler> ExecSession<H> {
             Some(Err(Refused { ready_at: None })) => return Err(never),
         }
         effects.into_iter().for_each(|e| fx.push(e));
-        self.execute(ws, fx, true, None).await
+        let open = self
+            .core
+            .execute_all_charged(ws, &mut feed!(self), fx)
+            .await?;
+        self.faulted()?;
+        Ok(open)
     }
 
     /// Executes `fx` in order ([`Core::execute`]), as one batch, attributed to the input
