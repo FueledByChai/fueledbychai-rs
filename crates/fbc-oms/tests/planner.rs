@@ -30,8 +30,8 @@ use fbc_core::{
 use fbc_oms::{
     Admission, AmendRefusal, CapRefusal, DesiredBook, DesiredQuote, ExecutionPlanner, ExitRefusal,
     FillLedger, FillRouted, FillTime, HeldReason, LadderConfig, LedgerConfig, MarketCapsConfig,
-    OmsError, OrdState, OrderKey, OrderOp, Plan, PlanRefusal, PlannerConfig, PlannerConfigError,
-    PreTradeCaps, Refused, Registry, ResyncSnapshot, Stage, StateRefusal,
+    OmsError, OrdState, OrderKey, OrderOp, Plan, PlanError, PlanRefusal, PlannerConfig,
+    PlannerConfigError, PreTradeCaps, Refused, Registry, ResyncSnapshot, Stage, StateRefusal,
 };
 
 const INST: InstrumentId = InstrumentId::new(1);
@@ -224,7 +224,7 @@ fn plan_and_send(
     mint: &mut CidMint,
     now: MonoNs,
 ) -> Plan {
-    let plan = planner.plan(desired, reg, caps, ACCT, mint, now);
+    let plan = planner.plan(desired, reg, caps, ACCT, mint, now).unwrap();
     for (n, p) in plan.commands.iter().enumerate() {
         let rpc = RpcId(1_000 + n as u64);
         match p.auth.command() {
@@ -299,7 +299,9 @@ fn the_plan_comes_out_cancels_then_reducing_orders_then_amends_then_adds() {
         .with(Side::Buy, 2, quote(9_980, 4))
         .with(Side::Sell, 0, reducing(quote(10_010, 2)))
         .with(Side::Sell, 1, reducing(quote(10_015, 3)));
-    let plan = p.plan(&next, &mut reg, &amending(), ACCT, &mut mint, LATER);
+    let plan = p
+        .plan(&next, &mut reg, &amending(), ACCT, &mut mint, LATER)
+        .unwrap();
     assert_eq!(
         shape(&plan),
         vec![
@@ -394,14 +396,16 @@ fn a_change_amends_where_the_venues_order_caps_allow_it() {
     assert_eq!(shape(&plan), vec![(Stage::Amend, "amend", Side::Buy, 0)]);
     assert_eq!(plan.commands[0].cid, c);
     // In flight: the level is held, nothing more is built for it.
-    let again = p.plan(
-        &book().with(Side::Buy, 0, quote(10_010, 8)),
-        &mut reg,
-        &amending(),
-        ACCT,
-        &mut mint,
-        LATER,
-    );
+    let again = p
+        .plan(
+            &book().with(Side::Buy, 0, quote(10_010, 8)),
+            &mut reg,
+            &amending(),
+            ACCT,
+            &mut mint,
+            LATER,
+        )
+        .unwrap();
     assert!(again.commands.is_empty());
     assert_eq!(held(&again), vec![(Side::Buy, 0, HeldReason::InFlight)]);
 }
@@ -634,7 +638,9 @@ fn nothing_is_placed_at_a_level_whose_order_is_pending_new_or_unknown_until_it_i
         let c = first.commands[0].cid;
         let moved = book().with(Side::Buy, 0, quote(10_010, 7));
         // PendingNew: occupied, however long the wait.
-        let plan = p.plan(&moved, &mut reg, &amending(), ACCT, &mut mint, LATER);
+        let plan = p
+            .plan(&moved, &mut reg, &amending(), ACCT, &mut mint, LATER)
+            .unwrap();
         assert!(plan.commands.is_empty());
         assert_eq!(
             held(&plan),
@@ -648,7 +654,9 @@ fn nothing_is_placed_at_a_level_whose_order_is_pending_new_or_unknown_until_it_i
             };
             reg.on_outcome(c, OrderOp::Place, &item, &SubmitOutcome::Unknown, MonoNs(2))
                 .unwrap();
-            let plan = p.plan(&moved, &mut reg, &amending(), ACCT, &mut mint, LATER);
+            let plan = p
+                .plan(&moved, &mut reg, &amending(), ACCT, &mut mint, LATER)
+                .unwrap();
             assert!(plan.commands.is_empty());
             assert_eq!(
                 held(&plan),
@@ -658,7 +666,9 @@ fn nothing_is_placed_at_a_level_whose_order_is_pending_new_or_unknown_until_it_i
         assert_eq!(p.order_at(ACCT, INST, Side::Buy, 0), Some(c));
         // Terminal (the venue ended it): the level is free and the quote is placed.
         cancelled(&mut reg, c, Side::Buy, "v-pending", 10);
-        let plan = p.plan(&moved, &mut reg, &amending(), ACCT, &mut mint, LATER);
+        let plan = p
+            .plan(&moved, &mut reg, &amending(), ACCT, &mut mint, LATER)
+            .unwrap();
         assert_eq!(shape(&plan), vec![(Stage::Add, "place", Side::Buy, 0)]);
         assert_ne!(plan.commands[0].cid, c);
     }
@@ -702,14 +712,16 @@ fn an_order_on_the_unknown_ladder_holds_its_level() {
     )
     .unwrap();
     assert!(reg.get(c).unwrap().unknown_since().is_some());
-    let plan = p.plan(
-        &book().with(Side::Buy, 0, quote(10_020, 5)),
-        &mut reg,
-        &amending(),
-        ACCT,
-        &mut mint,
-        LATER,
-    );
+    let plan = p
+        .plan(
+            &book().with(Side::Buy, 0, quote(10_020, 5)),
+            &mut reg,
+            &amending(),
+            ACCT,
+            &mut mint,
+            LATER,
+        )
+        .unwrap();
     assert!(plan.commands.is_empty());
     assert_eq!(
         held(&plan),
@@ -740,6 +752,7 @@ fn a_level_no_longer_wanted_is_cancelled_once_and_its_order_awaits_its_acknowled
     let zero = book().with(Side::Buy, 0, quote(10_000, 0));
     assert_eq!(
         p.plan(&zero, &mut reg, &amending(), ACCT, &mut mint, LATER)
+            .unwrap()
             .awaiting_ack,
         vec![c]
     );
@@ -753,6 +766,7 @@ fn a_level_no_longer_wanted_is_cancelled_once_and_its_order_awaits_its_acknowled
     cancelled(&mut reg, c, Side::Buy, "v-Buy-0", 10);
     assert!(
         p.plan(&empty, &mut reg, &amending(), ACCT, &mut mint, LATER)
+            .unwrap()
             .commands
             .is_empty()
     );
@@ -818,7 +832,9 @@ fn an_order_is_changed_only_past_a_threshold_and_once_it_is_the_minimum_age() {
     );
     // 1 tick (1 bp) and 1 lot: under both thresholds, kept, however old.
     let small = book().with(Side::Buy, 0, quote(10_001, 6));
-    let plan = p.plan(&small, &mut reg, &amending(), ACCT, &mut mint, LATER);
+    let plan = p
+        .plan(&small, &mut reg, &amending(), ACCT, &mut mint, LATER)
+        .unwrap();
     assert!(plan.commands.is_empty() && plan.held.is_empty());
     // 2 ticks (2 bp), or 2 lots: changed, but not before the minimum age.
     let young = MonoNs(MIN_AGE.as_nanos() as u64 - 1);
@@ -826,7 +842,9 @@ fn an_order_is_changed_only_past_a_threshold_and_once_it_is_the_minimum_age() {
         book().with(Side::Buy, 0, quote(10_002, 5)),
         book().with(Side::Buy, 0, quote(10_000, 3)),
     ] {
-        let plan = p.plan(&desired, &mut reg, &amending(), ACCT, &mut mint, young);
+        let plan = p
+            .plan(&desired, &mut reg, &amending(), ACCT, &mut mint, young)
+            .unwrap();
         assert!(plan.commands.is_empty());
         assert_eq!(held(&plan), vec![(Side::Buy, 0, HeldReason::Young)]);
     }
@@ -869,7 +887,9 @@ fn a_market_in_cancel_only_or_killed_gets_no_place_or_amend_but_gets_its_cancels
             .with(Side::Buy, 0, quote(9_995, 5))
             .with(Side::Buy, 2, quote(9_980, 5))
             .with(Side::Sell, 0, reducing(quote(10_010, 5)));
-        let plan = p.plan(&desired, &mut reg, &amending(), ACCT, &mut mint, LATER);
+        let plan = p
+            .plan(&desired, &mut reg, &amending(), ACCT, &mut mint, LATER)
+            .unwrap();
         assert_eq!(shape(&plan), vec![(Stage::Cancel, "cancel", Side::Buy, 1)]);
         assert_eq!(
             refused(&plan),
@@ -895,7 +915,9 @@ fn a_market_in_exit_gets_only_its_exit_orders() {
         book()
             .with(Side::Buy, 0, quote(9_990, 5))
             .with(Side::Sell, 0, reducing(quote(10_010, 5)));
-    let plan = p.plan(&desired, &mut reg, &amending(), ACCT, &mut mint, LATER);
+    let plan = p
+        .plan(&desired, &mut reg, &amending(), ACCT, &mut mint, LATER)
+        .unwrap();
     assert_eq!(
         shape(&plan),
         vec![(Stage::Reducing, "place", Side::Sell, 0)]
@@ -950,7 +972,9 @@ fn a_market_in_exit_has_its_order_on_the_side_that_adds_to_the_position_cancelle
         assert!(refused(&plan).is_empty());
         // Once it is terminal, the desired bid is refused as any order adding in Exit is.
         cancelled(&mut reg, bid, Side::Buy, &venue_id(Side::Buy, 0), 10);
-        let plan = p.plan(desired, &mut reg, &amending(), ACCT, &mut mint, LATER);
+        let plan = p
+            .plan(desired, &mut reg, &amending(), ACCT, &mut mint, LATER)
+            .unwrap();
         assert!(plan.commands.is_empty());
         assert_eq!(
             refused(&plan),
@@ -1079,7 +1103,9 @@ fn an_item_over_a_cap_is_never_built() {
         0,
         quote(10_010, CAP + 1),
     );
-    let plan = p.plan(&over, &mut reg, &amending(), ACCT, &mut mint, MonoNs(0));
+    let plan = p
+        .plan(&over, &mut reg, &amending(), ACCT, &mut mint, MonoNs(0))
+        .unwrap();
     assert!(plan.commands.is_empty());
     let why: Vec<_> = refused(&plan)
         .into_iter()
@@ -1096,14 +1122,16 @@ fn an_item_over_a_cap_is_never_built() {
         &mut mint,
     );
     let c = opened.commands[0].cid;
-    let plan = p.plan(
-        &book().with(Side::Buy, 0, quote(10_000, RESTING + 1)),
-        &mut reg,
-        &amending(),
-        ACCT,
-        &mut mint,
-        LATER,
-    );
+    let plan = p
+        .plan(
+            &book().with(Side::Buy, 0, quote(10_000, RESTING + 1)),
+            &mut reg,
+            &amending(),
+            ACCT,
+            &mut mint,
+            LATER,
+        )
+        .unwrap();
     assert!(plan.commands.is_empty());
     assert_eq!(
         refused(&plan),
@@ -1151,14 +1179,16 @@ fn a_planner_config_takes_a_finite_non_negative_price_threshold() {
         &amending(),
         &mut mint,
     );
-    let plan = p.plan(
-        &book().with(Side::Buy, 0, quote(10_001, 5)),
-        &mut reg,
-        &amending(),
-        ACCT,
-        &mut mint,
-        MonoNs(0),
-    );
+    let plan = p
+        .plan(
+            &book().with(Side::Buy, 0, quote(10_001, 5)),
+            &mut reg,
+            &amending(),
+            ACCT,
+            &mut mint,
+            MonoNs(0),
+        )
+        .unwrap();
     assert_eq!(shape(&plan), vec![(Stage::Amend, "amend", Side::Buy, 0)]);
 }
 
@@ -1182,7 +1212,9 @@ fn open_book_for(
     acct: AccountKey,
     mint: &mut CidMint,
 ) -> Vec<ClientOrderId> {
-    let plan = planner.plan(desired, reg, &amending(), acct, mint, MonoNs(0));
+    let plan = planner
+        .plan(desired, reg, &amending(), acct, mint, MonoNs(0))
+        .unwrap();
     assert!(refused(&plan).is_empty());
     plan.commands
         .iter()
@@ -1221,7 +1253,9 @@ fn one_planner_keeps_each_accounts_orders_on_the_same_market() {
     assert_eq!(a.resting_on(INST, Side::Buy), Some(lots(5)));
 
     // B again: its orders too.
-    let plan = p.plan(&quoted, &mut b, &amending(), OTHER, &mut mint_b, LATER);
+    let plan = p
+        .plan(&quoted, &mut b, &amending(), OTHER, &mut mint_b, LATER)
+        .unwrap();
     assert!(plan.commands.is_empty());
 
     // A's bid level pulled: A's bid is cancelled.
@@ -1232,7 +1266,9 @@ fn one_planner_keeps_each_accounts_orders_on_the_same_market() {
     cancelled(&mut a, bid, Side::Buy, &venue_id(Side::Buy, 0), 10);
 
     // B in between, then Exit on A (flat, so its ask adds): A's ask is cancelled.
-    let plan = p.plan(&quoted, &mut b, &amending(), OTHER, &mut mint_b, LATER);
+    let plan = p
+        .plan(&quoted, &mut b, &amending(), OTHER, &mut mint_b, LATER)
+        .unwrap();
     assert!(plan.commands.is_empty());
     flatten(&mut a);
     let plan = plan_and_send(&mut p, &pulled, &mut a, &amending(), &mut mint_a, LATER);
@@ -1246,11 +1282,11 @@ fn one_planner_keeps_each_accounts_orders_on_the_same_market() {
 }
 
 #[test]
-fn a_planner_refuses_a_registry_that_does_not_hold_its_orders() {
+fn a_planner_refuses_an_account_through_a_second_registry() {
     // The same account's book planned through a second registry (rebuilt, say), which does not
-    // hold the orders the planner placed through the first: the pass builds nothing and
-    // reports each such level, rather than taking the levels for free and placing over orders
-    // that still rest. The first registry is planned as before.
+    // hold the orders the planner placed through the first: the pass is refused with nothing
+    // built or freed, rather than taking the levels for free and placing over orders that
+    // still rest. The first registry is planned as before.
     let mut first = quoting(WIDE, 0);
     let mut second = quoting(WIDE, 0);
     let mut mint = mint();
@@ -1259,18 +1295,87 @@ fn a_planner_refuses_a_registry_that_does_not_hold_its_orders() {
         .with(Side::Buy, 0, quote(10_000, 5))
         .with(Side::Sell, 0, quote(10_010, 5));
     let ours = open_book_for(&mut p, &quoted, &mut first, ACCT, &mut mint);
-    let plan = p.plan(&quoted, &mut second, &amending(), ACCT, &mut mint, LATER);
-    assert!(plan.commands.is_empty(), "{:?}", shape(&plan));
-    assert_eq!(
-        refused(&plan),
-        vec![
-            (Side::Buy, 0, PlanRefusal::NotInRegistry(ours[0])),
-            (Side::Sell, 0, PlanRefusal::NotInRegistry(ours[1])),
-        ]
-    );
+    let refused = p
+        .plan(&quoted, &mut second, &amending(), ACCT, &mut mint, LATER)
+        .unwrap_err();
+    assert_eq!(refused, PlanError::OtherRegistry { acct: ACCT });
+    assert!(refused.to_string().contains("another registry"));
     assert_eq!(second.resting_on(INST, Side::Buy), Some(Lots::ZERO));
     // The first registry: its orders are still the planner's.
     let plan = plan_and_send(&mut p, &quoted, &mut first, &amending(), &mut mint, LATER);
     assert!(plan.commands.is_empty());
     assert_eq!(p.order_at(ACCT, INST, Side::Buy, 0), Some(ours[0]));
+    assert_eq!(p.order_at(ACCT, INST, Side::Sell, 0), Some(ours[1]));
+}
+
+/// A client-id mint under namespace `ns` leased for the account `acct`: two accounts may lease
+/// the same namespace, and their mints then issue the same client ids.
+fn mint_for(acct: AccountKey, ns: u16) -> CidMint {
+    let lease = NamespaceLease::acquire(&lease_dir(), acct, Namespace::new(ns)).unwrap();
+    CidMint::new(lease, 0, 0, WallNs(0))
+}
+
+#[test]
+fn a_planner_refuses_an_account_planned_through_another_accounts_registry() {
+    // Codex's P1 on PR #107: accounts A and B lease the same namespace, so their first orders
+    // share a client id. B's book planned by mistake through A's registry, where that client
+    // id names A's order, already terminal, must never free B's level: B's next pass through
+    // its own registry would place over B's order still resting.
+    const OTHER: AccountKey = AccountKey::new(7);
+    let mut a = quoting(WIDE, 0);
+    let mut b = quoting(WIDE, 0);
+    let mut mint_a = mint_for(AccountKey::new(11), 900);
+    let mut mint_b = mint_for(AccountKey::new(12), 900);
+    let bid = book().with(Side::Buy, 0, quote(10_000, 5));
+    let mut p = planner();
+    let theirs = open_book_for(&mut p, &bid, &mut b, OTHER, &mut mint_b);
+    let ours = open_book_for(&mut p, &bid, &mut a, ACCT, &mut mint_a);
+    assert_eq!(ours, theirs, "the two accounts' first client ids collide");
+    cancelled(&mut a, ours[0], Side::Buy, &venue_id(Side::Buy, 0), 10);
+    // B through A's registry: refused, nothing built or freed.
+    let refused = p
+        .plan(&bid, &mut a, &amending(), OTHER, &mut mint_b, LATER)
+        .unwrap_err();
+    assert_eq!(
+        refused,
+        PlanError::OtherRegistry { acct: OTHER },
+        "{refused}"
+    );
+    assert_eq!(p.order_at(OTHER, INST, Side::Buy, 0), Some(theirs[0]));
+    // B through its own registry: its order is still diffed, nothing placed over it.
+    let plan = p
+        .plan(&bid, &mut b, &amending(), OTHER, &mut mint_b, LATER)
+        .unwrap();
+    assert!(plan.commands.is_empty(), "{:?}", plan.commands);
+    assert_eq!(b.resting_on(INST, Side::Buy), Some(lots(5)));
+}
+
+#[test]
+fn a_planner_refuses_a_registry_bound_to_another_account() {
+    // A registry planned for A, then a pass for an account never planned through it: refused
+    // with nothing built, so the account is not bound to A's registry.
+    const OTHER: AccountKey = AccountKey::new(7);
+    let mut a = quoting(WIDE, 0);
+    let mut mint = mint();
+    let mut p = planner();
+    let bid = book().with(Side::Buy, 0, quote(10_000, 5));
+    open_book_for(&mut p, &bid, &mut a, ACCT, &mut mint);
+    let refused = p
+        .plan(&bid, &mut a, &amending(), OTHER, &mut mint, LATER)
+        .unwrap_err();
+    assert_eq!(
+        refused,
+        PlanError::OtherAccount {
+            acct: OTHER,
+            bound: ACCT
+        }
+    );
+    assert!(refused.to_string().contains("planned for account"));
+    assert_eq!(a.resting_on(INST, Side::Buy), Some(lots(5)));
+    // OTHER is still unbound: its own registry is accepted.
+    let mut b = quoting(WIDE, 0);
+    let plan = p
+        .plan(&bid, &mut b, &amending(), OTHER, &mut mint, LATER)
+        .unwrap();
+    assert_eq!(plan.commands.len(), 1);
 }

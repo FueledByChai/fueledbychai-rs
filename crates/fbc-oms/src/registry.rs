@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use fbc_core::{
     CidMatch, ClientOrderId, InstrumentId, ItemRef, Lots, MonoNs, Namespace, NewOrder, OrderCaps,
@@ -54,6 +55,20 @@ pub struct Registry {
     /// Per market, how many times its inventory moved: an Exit command's authorization is
     /// refused at submit once it moved since the build (decision 0066).
     positions: Counters,
+    /// Which of the process's registries this is: the execution planner plans each account
+    /// through one registry only (decision 0068).
+    instance: Instance,
+}
+
+/// One registry among every registry the process built: drawn fresh for each.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub(crate) struct Instance(u64);
+
+impl Default for Instance {
+    fn default() -> Instance {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Instance(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
 }
 
 /// Where [`Registry::apply_fill`] sent a fill the ledger accepted.
@@ -205,6 +220,11 @@ impl Registry {
     /// The pre-trade caps every place, amend and batch item is checked against.
     pub fn caps(&self) -> &PreTradeCaps {
         &self.caps
+    }
+
+    /// Which of the process's registries this is (decision 0068).
+    pub(crate) fn instance(&self) -> Instance {
+        self.instance
     }
 
     /// The quantity our orders on `inst` and `side` may have resting: each order's
