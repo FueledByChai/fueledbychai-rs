@@ -16,9 +16,9 @@ use fbc_core::{
     AccountKey, AccountLease, AccountSummary, AckLevel, AmendQty, AssetKey, Channel, CidMatch,
     CidMint, ClientOrderId, ConfigError, EndpointPlan, ExecCodec, ExecEndpoint, FieldSpec,
     HttpPlan, InstrumentSpecDraft, ItemRef, Lots, MarketLease, MdCodec, MonoNs, NamespaceLease,
-    NewOrder, NonceBlock, NonceSource, OrderCaps, OrderKind, Secrets, Side, SignedLots, SpecTable,
-    SubmitOutcome, Subscription, SymbolError, Ticks, Tif, VenueCaps, VenueConfig, VenueError,
-    VenueFactory, VenueOrderSnapshot, VenueOrderState, WallNs, WireUrl,
+    NewOrder, NonceBlock, NonceSource, OrderCaps, OrderKind, RateLimit, Secrets, Side, SignedLots,
+    SpecTable, SubmitOutcome, Subscription, SymbolError, Ticks, Tif, VenueCaps, VenueConfig,
+    VenueError, VenueFactory, VenueOrderSnapshot, VenueOrderState, WallNs, WireUrl,
 };
 use fbc_oms::{
     Authorization, CancelChoice, CancelEverything, LadderConfig, LeaseKeys, Leases,
@@ -37,8 +37,23 @@ pub const ACCT: AccountKey = AccountKey::new(4);
 /// The registry's caps on the toy's market, in lots: wide enough for every order here.
 const CAP: i64 = 1_000;
 
-/// The conformance toy's order entry at the configured URL.
-pub struct Held;
+/// The conformance toy's order entry at the configured URL, declaring the toy's own rate limits
+/// or, built [`Held::with_limits`], others.
+pub struct Held {
+    limits: Option<Vec<RateLimit>>,
+}
+
+/// The toy as it declares itself.
+static HELD: Held = Held { limits: None };
+
+impl Held {
+    /// A venue of the test's own: the toy declaring `limits` in place of its own.
+    pub fn with_limits(limits: Vec<RateLimit>) -> &'static Held {
+        Box::leak(Box::new(Held {
+            limits: Some(limits),
+        }))
+    }
+}
 
 impl VenueFactory for Held {
     fn id(&self) -> &'static str {
@@ -50,7 +65,11 @@ impl VenueFactory for Held {
     }
 
     fn caps(&self, _: &VenueConfig) -> Result<VenueCaps, ConfigError> {
-        Ok(held_caps())
+        let mut caps = held_caps();
+        if let Some(limits) = &self.limits {
+            caps.limits.clone_from(limits);
+        }
+        Ok(caps)
     }
 
     fn parse_fbc_common_symbol(&self, _: &str) -> Result<AssetKey, SymbolError> {
@@ -332,11 +351,22 @@ impl NonceSource for Counting {
 /// The configuration of a session of the toy at `url` for [`ACCT`], its nonces counted up from
 /// 0 and each reservation logged in `reserved`.
 pub fn session_config(url: &str, reserved: &Reserved) -> ExecSessionConfig {
+    session_config_for(&HELD, SafetyReserve::percent(0).unwrap(), url, reserved)
+}
+
+/// [`session_config`] for `venue`, its limiter keeping `reserve` of each bucket for safety
+/// traffic.
+pub fn session_config_for(
+    venue: &'static Held,
+    reserve: SafetyReserve,
+    url: &str,
+    reserved: &Reserved,
+) -> ExecSessionConfig {
     let mut cfg = VenueConfig::new();
     cfg.insert(URL, url);
-    let limits = held_caps().limits;
+    let limits = venue.caps(&cfg).unwrap().limits;
     ExecSessionConfig {
-        venue: &Held,
+        venue,
         cfg,
         creds: Secrets::new(),
         acct: ACCT,
@@ -358,7 +388,7 @@ pub fn session_config(url: &str, reserved: &Reserved) -> ExecSessionConfig {
             log: Arc::clone(reserved),
         }),
         conn: 6,
-        limiter: RateLimiter::new(&limits, SafetyReserve::percent(0).unwrap()).unwrap(),
+        limiter: RateLimiter::new(&limits, reserve).unwrap(),
         write_stall: WriteStall::new(Duration::from_secs(3_600)).unwrap(),
         http_max_body: 4096,
     }

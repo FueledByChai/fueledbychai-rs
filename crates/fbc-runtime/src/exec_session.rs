@@ -71,6 +71,10 @@
 //! ([`Effects::carry_request`]), or that name another stream, a reconnect, an HTTP request or
 //! a request whose deadline is past the end of the clock, are `NotSent(Unencodable)`, and
 //! frames the buckets do not admit together `NotSent(RateBudget)`, each with nothing written.
+//! The frames are charged in the class of their command (FBC-e8i, decision 0073): a normal
+//! place, amend or order query stops at each bucket's safety reserve, while a cancel, a
+//! reducing order and the session's cancel-on-disconnect arm may use it until the bucket is
+//! empty; each refusal is counted under the scope whose bucket refused it.
 //! Otherwise the handler is told it was sent, with the nonces it used
 //! ([`ExecHandler::on_submitted`]), and its effects are executed. A request's deadline runs
 //! from just before its frame is written; the first event that answers it
@@ -116,8 +120,8 @@ use fbc_core::{
     AccountKey, CancelOnDisconnect, ConnKey, ConnState, CtxCall, Effect, Effects, EncodeCtx,
     EncodeReceipt, Envelope, ExecCodec, ExecEvent, ExecSink, Inbound, InboundSpans, KernelRxNs,
     MonoNs, Namespace, NonceBlock, NonceSource, NotSentReason, PathStamps, RpcCall, RpcId, Secrets,
-    SpecTable, Stamp, StreamId, SubmitHandle, TimerTag, VenueCaps, VenueCommand, VenueConfig,
-    VenueError, VenueFactory, VenueMeta, WallNs, dispatch,
+    SpecTable, Stamp, StreamId, SubmitHandle, TimerTag, TrafficClass, VenueCaps, VenueCommand,
+    VenueConfig, VenueError, VenueFactory, VenueMeta, WallNs, dispatch,
 };
 use futures_util::{FutureExt, StreamExt};
 use tokio::sync::watch;
@@ -973,8 +977,9 @@ impl<H: ExecHandler> ExecSession<H> {
             Err(reason) => return Ok(Err(Unsent::Codec(reason))),
         };
         // Its frames go together or not at all, so the codec's request is either written whole
-        // or reported not sent.
-        let own = |e: &Effect| frame_of(e, self.stream, true);
+        // or reported not sent, charged as the budget class of its command (decision 0073).
+        let class = budget_class(cmd);
+        let own = |e: &Effect| frame_of(e, self.stream, true).map(|r| Request { class, ..r });
         let frames: Vec<_> = fx.as_slice().iter().filter_map(own).collect();
         if let Err(refused) = self.core.rates.charge(Instant::now(), key, &frames) {
             return Ok(Err(Unsent::Budget(refused)));
@@ -1086,6 +1091,18 @@ impl Unsent {
             Unsent::Codec(reason) => *reason,
             Unsent::Budget(_) => NotSentReason::RateBudget,
         }
+    }
+}
+
+/// The traffic class `cmd`'s frames are charged as (decision 0073): its own
+/// ([`VenueCommand::traffic_class`]), except an order query's, which is normal traffic. The
+/// Unknown ladder sends queries as often as orders go unresolved, so they stop at each bucket's
+/// safety floor and never drain what cancels and reducing orders need (design §4.10 step 7);
+/// the cancel-on-disconnect arm, one per epoch, keeps its safety class.
+fn budget_class(cmd: &VenueCommand) -> TrafficClass {
+    match cmd {
+        VenueCommand::Query(_) => TrafficClass::Normal,
+        other => other.traffic_class(),
     }
 }
 

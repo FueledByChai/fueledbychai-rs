@@ -75,3 +75,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0070](0070-an-amend-replaced-in-flight-and-not-yet-settled-occupies-its.md) An amend replaced in flight and not yet settled occupies its level, augmenting 0065 — accepted
 - [0071](0071-paradex-order-entry-and-the-private-channels-share-one-conne.md) Paradex order entry and the private channels share one connection, the codec's own JSON-RPC ids start at 2^52, and a failed resync read reconnects — accepted
 - [0072](0072-paradex-s-factory-builds-the-order-entry-or-the-read-only-co.md) Paradex's factory builds the order-entry or the read-only codec as a required mode key says, on one endpoint, signing orders with the login's main key — accepted
+- [0073](0073-an-order-query-is-normal-traffic-at-the-safety-floor-and-the-.md) An order query is normal traffic at the safety floor, and the cancel-on-disconnect arm and the resync may use the reserve — accepted
