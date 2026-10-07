@@ -14,8 +14,11 @@ cancel's `QUEUED_FOR_CANCELLATION`, cancel-all's `{"status":"ok"}` or cancel-on-
 `AckLevel::Final`, and the runtime counts an arm only at `Final` (0058). Second, which errors
 are refusals. docs.paradex.trade's WebSocket "Error Handling" page
 (`ws/general-information/error-handling`) documents the JSON-RPC codes -32700, -32600, -32601,
--32602 and -32603 and Paradex's 100 (method error), 40110, 40111 and 40112, with no finer reason
-(no post-only, price, size or margin code); `order.create_batch`'s page gives a failed item an
+-32602 and -32603 and Paradex's 100 (method error), 40110, 40111 and 40112, and Paradex's
+WebSocket OpenRPC specification (`fern/apis/prod_ws/openrpc.json` in tradeparadex/paradex-docs,
+commit 5dac8d3) adds 40300 (permission denied, authentication required) and 42901 (rate limit
+exceeded) to every order method, with no finer reason (no post-only, price, size or margin
+code); `order.create_batch`'s page gives a failed item an
 `error` message and no code; `order.cancel_batch`'s gives each order QUEUED_FOR_CANCELLATION,
 ALREADY_CLOSED or NOT_FOUND. A refusal of a placement ends the order (`TerminalKind::Rejected`),
 so a refusal the venue did not mean leaves an order resting that the OMS believes ended.
@@ -31,8 +34,10 @@ so a refusal the venue did not mean leaves an order resting that the OMS believe
    `Accepted { ack: Final }` when that state is the one asked for; any other reply to it is
    refused as malformed and the request times out `Unknown`.
 2. **The reject table.** `fbc_venue_paradex::exec::REJECT_CODES`, keyed by the venue's code
-   (design §6 step 9), never by message text: -32700, -32600, -32602, 100, 40110, 40111 and
-   40112 are `RejectKind::Other`; -32601 (method not found) `RejectKind::Unsupported`;
+   (design §6 step 9), never by message text: -32700, -32600, -32602, 100, 40110, 40111,
+   40112 and 40300 are `RejectKind::Other`; -32601 (method not found) `RejectKind::Unsupported`;
+   42901 (rate limit exceeded) `RejectKind::RateLimited { retry_after: None }`, since the venue
+   states no retry time (Codex on PR #104);
    ALREADY_CLOSED `RejectKind::AlreadyTerminal(TerminalHint::Unspecified)` and NOT_FOUND
    `RejectKind::NotFound`, which leave the cancelled order as it was (0014 item 6). An error
    frame with the request's id refuses the whole request (`item: None`) as its code's kind. A
@@ -43,7 +48,8 @@ so a refusal the venue did not mean leaves an order resting that the OMS believe
    request undone, so it is not in the table; it and every code or item status no page
    documents, and a batch item's error message, are `SubmitOutcome::Unknown`, resolved by the Unknown ladder and never resent
    (0005). A request whose every item was reported `Unknown` from its reply gets nothing more
-   at its timeout. A batch reply with fewer results than items answers its items and is
+   at its timeout. A timeout drops its request, so a reply arriving after it is not the
+   tracker's and adds no second outcome to the `Unknown` already reported. A batch reply with fewer results than items answers its items and is
    `Unknown` for the rest, in the same call.
 4. **No id.** An error frame whose id is absent or null answers no request: it is an
    `ExecEvent::UncorrelatedError` keeping its code, its kind from the table or

@@ -108,7 +108,7 @@ ids are the request ids the tests send under. Order ids are `1759500000000000001
 | --- | --- |
 | `reply-create.json` | `order.create` (id 11): the created order, NEW, a POST_ONLY buy of 0.15 at 62000 under our first client id |
 | `reply-create-bare-id.json` | `order.create` (id 12) answered with a bare `{"id":..}`, which the Java library's `extractOrderId` tolerates |
-| `reply-create-batch-mixed.json` | `order.create_batch` (id 13): the first item created as above, the second answered with an `error` message (no code: Unknown, 0066) |
+| `reply-create-batch-mixed.json` | `order.create_batch` (id 13): the first item created as above, the second answered with an `error` message (no code: Unknown, 0069) |
 | `reply-create-batch-short.json` | `order.create_batch` (id 14) with one result for a two-item batch |
 | `reply-modify.json` | `order.modify` (id 15): the order OPEN at 61999.5 for 0.2 |
 | `reply-cancel.json` | `order.cancel` (id 16): `QUEUED_FOR_CANCELLATION` for the first order id |
