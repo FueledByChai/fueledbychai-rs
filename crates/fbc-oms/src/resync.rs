@@ -306,6 +306,18 @@ impl Registry {
         }
     }
 
+    /// Whether `inst` is seeded by hand ([`Registry::seed_position`]), not by a resync's
+    /// snapshot (decision 0067).
+    pub(crate) fn seeded_by_hand(&self, inst: InstrumentId) -> bool {
+        matches!(
+            self.markets.get(&inst),
+            Some(MarketState::Seeded(Seed {
+                reference: None,
+                ..
+            }))
+        )
+    }
+
     /// Where a fill of `inst` the ledger accepted stands, `registered` when its order is one
     /// the registry holds.
     pub(crate) fn placement(&self, inst: InstrumentId, registered: bool, f: &Placed) -> Placement {

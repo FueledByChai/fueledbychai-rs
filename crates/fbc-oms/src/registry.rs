@@ -12,7 +12,7 @@ use fbc_core::{
 };
 
 use crate::caps::{Adds, CapRefusal, Exposure, PreTradeCaps};
-use crate::entry::{Entries, StateRefusal};
+use crate::entry::{Entries, StateRefusal, TestnetRun};
 use crate::grant::Guard;
 use crate::ladder;
 use crate::ledger::AcceptedFill;
@@ -48,6 +48,9 @@ pub struct Registry {
     /// The orders not ours in view, which decide whether the kill switch's cancel everything
     /// may be an instrument cancel-all (0005's I7; [`Registry::cancel_everything`]).
     pub(crate) foreign: ForeignView,
+    /// The consumer's declaration of an owner-assisted testnet run, under which a market seeded
+    /// by hand may be armed (decision 0067; [`Registry::for_testnet_run`]).
+    pub(crate) testnet_run: Option<TestnetRun>,
 }
 
 /// Where [`Registry::apply_fill`] sent a fill the ledger accepted.
@@ -390,7 +393,12 @@ impl Registry {
     ///
     /// For tests, fixtures and an owner-assisted testnet run only: a hand seed is never a way
     /// around the rule that nothing is sent after a restart until the first trustworthy resync
-    /// (decision 0055's Consequences, Reviewer B's RB80-10 on PR #80).
+    /// (decision 0055's Consequences, Reviewer B's RB80-10 on PR #80). Enforced at arming: Start,
+    /// Flatten and Wind-down refuse a market seeded by hand ([`ArmRefusal::SeededByHand`])
+    /// unless the registry was built for a declared testnet run ([`Registry::for_testnet_run`],
+    /// decision 0067), so nothing is placed or amended on it.
+    ///
+    /// [`ArmRefusal::SeededByHand`]: crate::ArmRefusal::SeededByHand
     pub fn seed_position(&mut self, inst: InstrumentId, pos: SignedLots) -> Result<(), OmsError> {
         match self.markets.get(&inst) {
             Some(MarketState::Seeded(_) | MarketState::Unsettled) => {

@@ -5,9 +5,15 @@
 #![allow(dead_code)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-use fbc_core::{AccountLease, InstrumentId, MarketLease, NamedLeaseError, NonceScope, OrderCaps};
-use fbc_oms::{LeaseKeys, Leases, MarketEntry, Registry};
+use fbc_core::{
+    AccountLease, InstrumentId, MarketLease, MonoNs, NamedLeaseError, NonceScope, OrderCaps,
+    SignedLots, SnapshotSource, WallNs,
+};
+use fbc_oms::{
+    LadderConfig, LeaseKeys, Leases, MarketEntry, OrderKey, Registry, ResyncReport, ResyncSnapshot,
+};
 
 use crate::common::{lease_dir, order_caps, symbol};
 
@@ -72,6 +78,42 @@ pub fn leases(reg: &Registry, market: InstrumentId) -> Leases {
         Some(account) => lease.with_account(account),
         None => lease,
     }
+}
+
+/// Seeds `positions` on `reg` as the first trustworthy resync does (decision 0055), the only
+/// seed a market arms from outside a declared testnet run (decision 0067): a snapshot of no
+/// orders, requested at monotonic 0 with watermark 0, so every fill after it counts.
+pub fn seed(reg: &mut Registry, positions: &[(InstrumentId, i64)]) -> ResyncReport {
+    let cfg = LadderConfig::new(
+        Duration::from_secs(1),
+        Duration::ZERO,
+        Duration::from_secs(10),
+        1,
+    )
+    .unwrap();
+    let caps = OrderCaps {
+        snapshot_source: SnapshotSource::Trustworthy,
+        ..order_caps()
+    };
+    let snap = ResyncSnapshot {
+        watermark: WallNs(0),
+        requested_at: MonoNs(0),
+        orders: vec![],
+        positions: positions.iter().map(|&(m, p)| (m, SignedLots(p))).collect(),
+    };
+    let report = reg
+        .resync(
+            &cfg,
+            &caps,
+            &snap,
+            OrderKey {
+                venue: None,
+                ingest: 0,
+            },
+        )
+        .unwrap();
+    assert!(!report.untrustworthy);
+    report
 }
 
 /// The owner's Start on `market`, with its leases: armed, Quoting.

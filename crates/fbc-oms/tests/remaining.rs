@@ -44,7 +44,7 @@ fn registry(inventory: i64, resting: i64) -> Registry {
         )
         .unwrap();
     let mut reg = arm::named(Registry::with_caps(caps));
-    reg.seed_position(INST, SignedLots(0)).unwrap();
+    arm::seed(&mut reg, &[(INST, 0)]);
     arm::start(&mut reg, INST);
     reg
 }
