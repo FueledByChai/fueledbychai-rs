@@ -102,9 +102,10 @@ impl VenueFactory for Held {
 // fbc-oms: a registry armed on the toy's market, which builds and authorizes every order command.
 // ---------------------------------------------------------------------------------------------
 
-/// The toy's caps, its amend stating the total quantity: fbc-oms builds no amend for a venue
-/// whose amend states the quantity still to fill (FBC-b0z9), as the toy's does. Every amend
-/// here is of an order nothing filled, which the toy's codec writes the same either way.
+/// The toy's caps, its amend stating the total quantity rather than the quantity still to
+/// fill, as the toy's does, so an amend counts against the caps by its total (fbc-oms counts
+/// a remaining-quantity amend by its wire quantity, decision 0064). Every amend here is of an
+/// order nothing filled, which the toy's codec writes the same either way.
 pub fn held_caps() -> VenueCaps {
     let mut caps = exec_toy::caps();
     let exec = caps.exec.as_mut().unwrap();

@@ -96,10 +96,6 @@ pub enum AmendRefusal {
     /// The order carries no reference the venue's amend can name
     /// ([`AmendCaps::refs`](fbc_core::AmendCaps::refs)).
     NoDeclaredReference,
-    /// The venue's amend states the quantity still to fill ([`AmendQty::Remaining`]): what it
-    /// may rest once fills arrive while the amend is on its way is not modelled against the
-    /// inventory cap, so no amend is built (FBC-b0z9).
-    RemainingQty,
     /// The market's state refused it before either cap was consulted (decision 0012): Killed,
     /// Cancel-only, or Exit, which amends only exit orders ([`ExitRefusal`](crate::ExitRefusal)).
     State(StateRefusal),
@@ -279,7 +275,13 @@ impl<'r> Live<'r> {
     /// cap (0052), the order counted at the larger of its resting quantity now and the
     /// amend's, as it is while the amend is in flight, or when its market has no caps
     /// configured ([`AmendRefusal::Capped`]). A replace (an amend on a venue whose amend gives
-    /// the order a new id) is checked the same way. An amend built counts at once
+    /// the order a new id) is checked the same way. On a venue whose amend states the
+    /// remaining quantity ([`AmendQty::Remaining`]), the amend's wire carries `qty` less the
+    /// filled quantity, which the venue rests whole on top of any fills it takes before the
+    /// amend applies: the order is counted, for the inventory cap, at what it may add now
+    /// plus that wire quantity, and for the resting cap at the larger of its resting quantity
+    /// now and that wire quantity ([`OrderRecord::exposure`], [`OrderRecord::resting`];
+    /// FBC-w5n, decision 0064). An amend built counts at once
     /// ([`OrderRecord::amend_built`]), so a check after it, of this order or another, sees
     /// it; it becomes the amend in flight when it is reported sent
     /// ([`Registry::amend_sent`](crate::Registry::amend_sent)), and an order whose amend was
@@ -294,9 +296,6 @@ impl<'r> Live<'r> {
         let admits = self.state.map_err(AmendRefusal::State)?;
         let rec = &*self.rec;
         let amend_caps = caps.amend.as_ref().ok_or(AmendRefusal::NotAmendable)?;
-        if amend_caps.qty_semantics == AmendQty::Remaining {
-            return Err(AmendRefusal::RemainingQty);
-        }
         if rec.placed().kind == OrderKind::Market {
             return Err(AmendRefusal::NotLimit);
         }
@@ -330,18 +329,27 @@ impl<'r> Live<'r> {
         if amend.reference(amend_caps).is_none() {
             return Err(AmendRefusal::NoDeclaredReference);
         }
-        let exposure = rec.exposure_if_amended(qty);
+        // On a venue whose amend states the remaining quantity, what its wire carries (FBC-w5n).
+        let wire = match amend_caps.qty_semantics {
+            AmendQty::Remaining => Some(
+                amend
+                    .wire_qty(AmendQty::Remaining)
+                    .ok_or(AmendRefusal::NothingToRest)?,
+            ),
+            AmendQty::TotalIncludingFilled => None,
+        };
+        let exposure = rec.exposure_if_amended(qty, wire);
         admits
             .judge(&self.exposure, reducing || placed.reduce_only, exposure)
             .map_err(AmendRefusal::State)?;
         self.exposure
             .admit(Adds {
                 exposure,
-                resting: rec.resting_if_amended(qty),
+                resting: rec.resting_if_amended(qty, wire),
             })
             .map_err(AmendRefusal::Capped)?;
         let cid = rec.cid();
-        let build = self.rec.set_amend_built(qty);
+        let build = self.rec.set_amend_built(qty, wire);
         Ok(PermittedCommand {
             cmd: VenueCommand::Amend(amend),
             built: Some((cid, build)),

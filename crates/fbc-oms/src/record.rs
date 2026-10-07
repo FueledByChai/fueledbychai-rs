@@ -189,6 +189,15 @@ pub enum FillApplied {
     AfterEnd,
 }
 
+/// An amend built and not yet reported sent: its total, the build's number, and, on a venue
+/// whose amend states the remaining quantity, the quantity its wire carries.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+struct Built {
+    qty: Lots,
+    build: u64,
+    wire: Option<Lots>,
+}
+
 /// One of our orders, as the OMS knows it.
 ///
 /// The fields are private and change only through [`apply_update`](OrderRecord::apply_update),
@@ -209,10 +218,13 @@ pub struct OrderRecord {
     /// The largest total of the amends a later command replaced in flight, before anything
     /// tied a confirmation to them: any of them may rest at the venue.
     unsettled: Option<Lots>,
-    /// The total of an amend built ([`Live::amend`](crate::Live::amend)) and not yet reported
-    /// sent, with the build's number: counted as resting from when it is built, so a later
-    /// check sees it.
-    built: Option<(Lots, u64)>,
+    /// The wire quantities of the remaining-quantity amends ([`AmendQty::Remaining`](fbc_core::AmendQty::Remaining)) a later
+    /// command replaced in flight, before anything tied a confirmation to them: the venue may
+    /// rest any of them on top of fills it took before applying it (FBC-w5n, decision 0064).
+    unsettled_wires: Vec<Lots>,
+    /// The amend built ([`Live::amend`](crate::Live::amend)) and not yet reported sent:
+    /// counted as resting from when it is built, so a later check sees it.
+    built: Option<Built>,
     /// How many amends were built for the order: the next build's number.
     builds: u64,
     /// The latest venue ordering key applied when an amend was replaced in flight, or since
@@ -221,6 +233,9 @@ pub struct OrderRecord {
     unsettled_bar: Option<u64>,
     state: OrdState,
     intent: Intent,
+    /// The wire quantity of the amend in flight when it states the remaining quantity
+    /// ([`AmendQty::Remaining`](fbc_core::AmendQty::Remaining)); `None` for an amend stating the total, or no amend.
+    intent_wire: Option<Lots>,
     last_key: Option<OrderKey>,
     unknown_since: Option<MonoNs>,
     /// The nonce the placement was sent with, for venues that cancel by it.
@@ -275,11 +290,13 @@ impl OrderRecord {
             cum_venue: Lots::ZERO,
             cum_fills: Lots::ZERO,
             unsettled: None,
+            unsettled_wires: Vec::new(),
             built: None,
             builds: 0,
             unsettled_bar: None,
             state: OrdState::PendingNew,
             intent: Intent::None,
+            intent_wire: None,
             last_key: None,
             unknown_since: None,
             placement_nonce: None,
@@ -406,6 +423,12 @@ impl OrderRecord {
     /// confirms an amend sent at or after it, or states the total once no command is in flight
     /// under a venue ordering key later than any applied while the amend was on its way, or the
     /// amend is refused while it is the only one unconfirmed, or the order ends (I6).
+    ///
+    /// On a venue whose amend states the remaining quantity
+    /// ([`AmendQty::Remaining`](fbc_core::AmendQty::Remaining)), the venue rests the whole
+    /// quantity the amend's wire carries whatever filled before it applied, so until the same
+    /// events settle such an amend the order counts at least that wire quantity, however many
+    /// fills arrive meanwhile (FBC-w5n, decision 0064).
     pub fn resting(&self) -> Lots {
         if self.state.is_terminal() {
             Lots::ZERO
@@ -413,6 +436,7 @@ impl OrderRecord {
             self.ceiling()
                 .checked_sub(self.filled())
                 .unwrap_or(Lots::ZERO)
+                .max(self.wire_floor())
         }
     }
 
@@ -422,52 +446,75 @@ impl OrderRecord {
     /// the inventory does not hold until their fill events arrive; a terminal order keeps
     /// those until then. That is the largest total the venue may hold, or the venue's
     /// cumulative fill when larger, less the fills counted (`cum_fills`).
+    ///
+    /// Plus, in full, the wire quantity of every remaining-quantity amend not yet settled
+    /// ([`Self::resting`]): before one applies, fills the record has not seen may take all
+    /// but the last lot of what rests, and the venue then rests the whole wire quantity on
+    /// top of them, so the order may still add what rests now and every such wire quantity
+    /// (FBC-w5n, decision 0064).
     pub fn exposure(&self) -> Lots {
         let held = if self.state.is_terminal() {
             self.cum_venue
         } else {
             self.ceiling().max(self.cum_venue)
         };
-        held.checked_sub(self.cum_fills).unwrap_or(Lots::ZERO)
+        plus(
+            held.checked_sub(self.cum_fills).unwrap_or(Lots::ZERO),
+            self.wire_sum(),
+        )
     }
 
     /// What [`Self::exposure`] would be once an amend to the total `qty` is built: the larger
-    /// of the order's total now and the amend's, until it is acknowledged.
-    pub(crate) fn exposure_if_amended(&self, qty: Lots) -> Lots {
-        self.ceiling()
-            .max(qty)
-            .max(self.cum_venue)
-            .checked_sub(self.cum_fills)
-            .unwrap_or(Lots::ZERO)
+    /// of the order's total now and the amend's, until it is acknowledged; for an amend whose
+    /// wire carries the remaining quantity `wire`, the exposure now plus that quantity.
+    pub(crate) fn exposure_if_amended(&self, qty: Lots, wire: Option<Lots>) -> Lots {
+        match wire {
+            Some(wire) => plus(self.exposure(), wire),
+            None => plus(
+                self.ceiling()
+                    .max(qty)
+                    .max(self.cum_venue)
+                    .checked_sub(self.cum_fills)
+                    .unwrap_or(Lots::ZERO),
+                self.wire_sum(),
+            ),
+        }
     }
 
     /// What [`Self::resting`] would be once an amend to the total `qty` is built, for an order
     /// that is not terminal: the larger of the order's total now and the amend's, less the
-    /// filled part, until it is acknowledged.
-    pub(crate) fn resting_if_amended(&self, qty: Lots) -> Lots {
-        self.ceiling()
-            .max(qty)
-            .checked_sub(self.filled())
-            .unwrap_or(Lots::ZERO)
+    /// filled part, until it is acknowledged; for an amend whose wire carries the remaining
+    /// quantity `wire`, the larger of the resting quantity now and that quantity.
+    pub(crate) fn resting_if_amended(&self, qty: Lots, wire: Option<Lots>) -> Lots {
+        match wire {
+            Some(wire) => self.resting().max(wire),
+            None => self
+                .ceiling()
+                .max(qty)
+                .checked_sub(self.filled())
+                .unwrap_or(Lots::ZERO)
+                .max(self.wire_floor()),
+        }
     }
 
     /// The total of the amend built and not yet reported sent ([`Self::amend_sent`]), if any.
     pub fn amend_built(&self) -> Option<Lots> {
-        self.built.map(|(qty, _)| qty)
+        self.built.map(|b| b.qty)
     }
 
-    /// Records an amend to the total `qty` built, and returns the build's number.
-    pub(crate) fn set_amend_built(&mut self, qty: Lots) -> u64 {
+    /// Records an amend to the total `qty` built, its wire carrying `wire` on a venue whose
+    /// amend states the remaining quantity, and returns the build's number.
+    pub(crate) fn set_amend_built(&mut self, qty: Lots, wire: Option<Lots>) -> u64 {
         let build = self.builds;
         self.builds += 1;
-        self.built = Some((qty, build));
+        self.built = Some(Built { qty, build, wire });
         build
     }
 
     /// Releases the amend built as number `build` and never handed to a gateway; whether it
     /// was the one built and not yet reported sent.
     pub(crate) fn withdraw_built(&mut self, build: u64) -> bool {
-        let ours = self.built.is_some_and(|(_, b)| b == build);
+        let ours = self.built.is_some_and(|b| b.build == build);
         if ours {
             self.built = None;
         }
@@ -476,16 +523,48 @@ impl OrderRecord {
 
     /// The largest total the venue may hold: the order's total, the amend in flight's, an
     /// amend built and not yet reported sent, and those of the amends replaced in flight
-    /// before they were confirmed.
+    /// before they were confirmed. A remaining-quantity amend's total is not among them: what
+    /// the venue holds once it applies is counted by its wire quantity instead
+    /// ([`Self::wire_floor`], [`Self::wire_sum`]).
     fn ceiling(&self) -> Lots {
         let pending = match self.intent {
-            Intent::PendingAmend { qty, .. } => qty,
+            Intent::PendingAmend { qty, .. } if self.intent_wire.is_none() => qty,
             _ => Lots::ZERO,
         };
+        let built = self
+            .built
+            .filter(|b| b.wire.is_none())
+            .map_or(Lots::ZERO, |b| b.qty);
         self.qty
             .max(pending)
-            .max(self.amend_built().unwrap_or(Lots::ZERO))
+            .max(built)
             .max(self.unsettled.unwrap_or(Lots::ZERO))
+    }
+
+    /// The wire quantities of the remaining-quantity amends not yet settled: the one in
+    /// flight, the one built and not yet reported sent, and those replaced in flight.
+    fn wires(&self) -> impl Iterator<Item = Lots> + '_ {
+        self.intent_wire
+            .into_iter()
+            .chain(self.built.and_then(|b| b.wire))
+            .chain(self.unsettled_wires.iter().copied())
+    }
+
+    /// The least the order rests while a remaining-quantity amend is not settled: the largest
+    /// of their wire quantities, any of which the venue may rest whole.
+    fn wire_floor(&self) -> Lots {
+        self.wires().max().unwrap_or(Lots::ZERO)
+    }
+
+    /// What the remaining-quantity amends not yet settled may add to the position beyond
+    /// what rests now: the sum of their wire quantities.
+    fn wire_sum(&self) -> Lots {
+        self.wires().fold(Lots::ZERO, plus)
+    }
+
+    /// Whether an amend replaced in flight is not yet settled.
+    fn has_unsettled(&self) -> bool {
+        self.unsettled.is_some() || !self.unsettled_wires.is_empty()
     }
 
     /// Where the order stands.
@@ -546,7 +625,7 @@ impl OrderRecord {
     /// has not learnt.
     pub fn amend_unconfirmed(&self) -> bool {
         matches!(self.intent, Intent::PendingAmend { .. })
-            || self.unsettled.is_some()
+            || self.has_unsettled()
             || self.built.is_some()
     }
 
@@ -572,7 +651,9 @@ impl OrderRecord {
     }
 
     /// Records an amend to `px` and `qty` sent at `now` under `rpc`. Refused (false) once the
-    /// order is terminal.
+    /// order is terminal. When it is the amend built and not yet reported sent (the same total),
+    /// it is counted as that build was: on a venue whose amend states the remaining quantity,
+    /// by the quantity its wire carries ([`Self::resting`]).
     pub fn amend_sent(&mut self, px: Ticks, qty: Lots, rpc: RpcId, now: MonoNs) -> bool {
         self.set_intent(Intent::PendingAmend {
             px,
@@ -598,22 +679,41 @@ impl OrderRecord {
         }
         // An amend built and not reported sent becomes the amend in flight when this is it;
         // otherwise, like an amend replaced in flight, it may still reach the venue.
-        let built = self
-            .built
-            .take()
-            .map(|(qty, _)| qty)
-            .filter(|b| !matches!(intent, Intent::PendingAmend { qty, .. } if qty == *b));
+        let (sent, built): (Option<Built>, Option<Built>) = match self.built.take() {
+            Some(b) if matches!(intent, Intent::PendingAmend { qty, .. } if qty == b.qty) => {
+                (Some(b), None)
+            }
+            other => (None, other),
+        };
         let replaced = match self.intent {
-            Intent::PendingAmend { qty, .. } => Some(qty),
+            Intent::PendingAmend { qty, .. } => Some((qty, self.intent_wire)),
             _ => None,
         };
-        if let Some(qty) = replaced.max(built) {
+        let mut totals = None;
+        let mut any = false;
+        for (qty, wire) in replaced.into_iter().chain(built.map(|b| (b.qty, b.wire))) {
+            any = true;
+            match wire {
+                Some(wire) => self.unsettled_wires.push(wire),
+                None => totals = totals.max(Some(qty)),
+            }
+        }
+        if let Some(qty) = totals {
             // Replaced before anything confirmed it: the amend may still reach the venue.
             self.unsettled = Some(self.unsettled.map_or(qty, |u| u.max(qty)));
+        }
+        if any {
             self.unsettled_bar = self.unsettled_bar.max(self.last_key.and_then(|k| k.venue));
         }
         self.intent = intent;
+        self.intent_wire = sent.and_then(|b| b.wire);
         true
+    }
+
+    /// Nothing is in flight any more.
+    fn clear_intent(&mut self) {
+        self.intent = Intent::None;
+        self.intent_wire = None;
     }
 
     /// Applies one venue order update arriving under `key`.
@@ -708,7 +808,7 @@ impl OrderRecord {
                 }
             }
         }
-        if self.unsettled.is_some() && self.intent != Intent::None {
+        if self.has_unsettled() && self.intent != Intent::None {
             self.unsettled_bar = self.unsettled_bar.max(key.venue);
         }
         self.last_key = Some(key);
@@ -720,22 +820,34 @@ impl OrderRecord {
             return Applied::Advanced;
         }
         if let VenueOrderState::Amended { .. } = u.state {
+            // Whether the update is the remaining-quantity amend in flight's: tied to it, or
+            // stating a total whose remainder at the update's cumulative fill is its wire.
+            let mut ties = stated
+                && self.intent_wire.is_some()
+                && u.qty.and_then(|q| q.checked_sub(u.cum_filled)) == self.intent_wire;
             if let Intent::PendingAmend { px, qty, .. } = self.intent
-                && self.unsettled.is_none()
+                && !self.has_unsettled()
                 && later
             {
                 // Tied to the amend in flight: what the venue does not echo is what was sent.
+                // A remaining-quantity amend rests its wire quantity on top of what had filled
+                // when it applied, which the update's cumulative fill counts (FBC-w5n): the
+                // total is at most what the record holds filled now plus the wire.
                 self.px = Some(u.px.unwrap_or(px));
-                self.qty = u.qty.unwrap_or(qty);
+                self.qty = match self.intent_wire {
+                    Some(wire) => u.qty.unwrap_or(plus(self.filled(), wire)),
+                    None => u.qty.unwrap_or(qty),
+                };
                 stated = true;
+                ties = true;
             }
-            self.confirm_if_stated(stated);
+            self.confirm_if_stated(stated, ties);
             self.complete_if_covered();
             return Applied::Amended;
         }
         self.placement_settled();
         self.state = self.live_state();
-        self.confirm_if_stated(stated);
+        self.confirm_if_stated(stated, false);
         self.complete_if_covered();
         Applied::Advanced
     }
@@ -823,7 +935,7 @@ impl OrderRecord {
                     // An earlier command's: the command in flight is still unanswered.
                     return OutcomeApplied::Unchanged;
                 }
-                self.intent = Intent::None;
+                self.clear_intent();
                 self.intent_settled(op.rpc());
                 self.complete_if_covered();
                 OutcomeApplied::IntentCleared
@@ -884,14 +996,21 @@ impl OrderRecord {
     }
 
     /// Resolves the amend in flight once an update that `stated` values leaves the order at its
-    /// price and total: the venue applied it, and with it every amend sent before it.
-    fn confirm_if_stated(&mut self, stated: bool) {
+    /// price and total: the venue applied it, and with it every amend sent before it. A
+    /// remaining-quantity amend's total is the venue's to state, so such an amend is resolved
+    /// at its price by an amended update that `ties` to it instead: tied by ordering, or
+    /// stating its wire quantity as the remainder.
+    fn confirm_if_stated(&mut self, stated: bool, ties: bool) {
         if let Intent::PendingAmend { px, qty, rpc, .. } = self.intent
             && stated
             && self.px == Some(px)
-            && self.qty == qty
+            && if self.intent_wire.is_some() {
+                ties
+            } else {
+                self.qty == qty
+            }
         {
-            self.intent = Intent::None;
+            self.clear_intent();
             self.settle();
             self.intent_settled(Some(rpc));
         }
@@ -912,17 +1031,22 @@ impl OrderRecord {
         }
     }
 
-    /// Retires the totals of the amends replaced in flight.
+    /// Retires the totals and wire quantities of the amends replaced in flight.
     fn settle(&mut self) {
         self.unsettled = None;
+        self.unsettled_wires.clear();
         self.unsettled_bar = None;
     }
 
     /// Ends a live order Filled when its fills alone cover every total the venue may hold
     /// (its own, the amend in flight's and any unconfirmed earlier amend's); whether it did.
-    /// Checked whenever the fills, the total or the amends in flight change.
+    /// Never while a remaining-quantity amend is not settled: the venue may rest its whole
+    /// wire quantity whatever has filled. Checked whenever the fills, the total or the amends
+    /// in flight change.
     fn complete_if_covered(&mut self) -> bool {
-        let covered = !self.state.is_terminal() && self.cum_fills >= self.ceiling();
+        let covered = !self.state.is_terminal()
+            && self.cum_fills >= self.ceiling()
+            && self.wires().next().is_none();
         if covered {
             self.end(TerminalKind::Filled);
         }
@@ -1043,7 +1167,7 @@ impl OrderRecord {
 
     fn end(&mut self, kind: TerminalKind) {
         self.state = OrdState::Terminal(kind);
-        self.intent = Intent::None;
+        self.clear_intent();
         self.built = None;
         self.cancel_awaits_ack = false;
         self.settle();
@@ -1084,6 +1208,17 @@ impl OrderRecord {
         }
         at.clone()
     }
+}
+
+/// The largest lot count.
+const MAX_LOTS: Lots = match Lots::new(i64::MAX) {
+    Some(max) => max,
+    None => Lots::ZERO,
+};
+
+/// `a + b`, or the largest lot count when that overflows: a count that errs only upward.
+fn plus(a: Lots, b: Lots) -> Lots {
+    a.checked_add(b).unwrap_or(MAX_LOTS)
 }
 
 /// The terminal kind an update's state ends an order with, `None` for a live state.
