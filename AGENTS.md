@@ -254,7 +254,7 @@ rather than guess.
     side's orders never crossing zero, every cap still applied, nothing once flat; the
     `ExecutionPlanner` (0005, 0065, 0068; `src/planner.rs`, `tests/planner.rs`): the
     consumer's `DesiredBook` diffed per side and level against the orders it placed for that
-    account (each account's apart, nothing built through a registry that does not hold them),
+    account (each account's apart, planned through the one registry the account is bound to),
     under the consumer's `PlannerConfig` (basis-point and lot replace thresholds, a minimum
     age), a change an amend where the venue's `OrderCaps` admit it and otherwise a cancel
     then, once the old order is terminal, a place, a PendingNew, Unknown or in-flight order occupying its level, every

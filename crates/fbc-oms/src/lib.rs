@@ -158,7 +158,7 @@
 //! `tests/planner.rs`): the consumer's [`DesiredBook`], a [`DesiredQuote`] per side and level,
 //! defined here so strategy code produces it and this crate depends on no strategy (0001). The
 //! [`ExecutionPlanner`] diffs it against the orders it placed for the account (each account's
-//! apart; nothing is built through a registry that does not hold them), per side and level,
+//! apart, through the one registry it is bound to, [`PlanError`]), per side and level,
 //! under the consumer's [`PlannerConfig`] (price and quantity replace thresholds and a minimum
 //! age, no default), and builds what closes the difference, each command through the one pre-trade
 //! path and the permits above and leaving as an [`Authorization`]: cancels, then reducing
@@ -205,8 +205,8 @@ pub use permit::{
     PlacePlan,
 };
 pub use planner::{
-    DesiredBook, DesiredQuote, ExecutionPlanner, Held, HeldReason, Plan, PlanRefusal, Planned,
-    PlannerConfig, PlannerConfigError, Refused, Stage,
+    DesiredBook, DesiredQuote, ExecutionPlanner, Held, HeldReason, Plan, PlanError, PlanRefusal,
+    Planned, PlannerConfig, PlannerConfigError, Refused, Stage,
 };
 pub use record::{
     Applied, FillApplied, Intent, LadderStep, OrdState, OrderKey, OrderOp, OrderRecord,

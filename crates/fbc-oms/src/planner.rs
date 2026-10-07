@@ -40,9 +40,10 @@
 //! sent is built again at the next pass.
 //!
 //! One planner may serve several accounts: it holds the orders it placed per account and
-//! market, each account planned through its own registry, so a pass for one account never
-//! frees another's levels. A registry that does not hold an order the planner placed for the
-//! account is not the one it was placed through, and the pass builds nothing (0068).
+//! market, so a pass for one account never frees another's levels, and binds each account to
+//! the registry of its first pass. A pass for an account through another registry, or through
+//! a registry bound to another account, is refused with nothing built or freed ([`PlanError`];
+//! 0068).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -57,7 +58,7 @@ use crate::entry::EntryState;
 use crate::grant::Authorization;
 use crate::permit::{self, AmendRefusal, CancelChoice, PermitRefusal, PermittedCommand};
 use crate::record::{Intent, OrdState, OrderRecord};
-use crate::registry::{OmsError, Registry};
+use crate::registry::{Instance, OmsError, Registry};
 
 /// What the consumer wants resting at one level of one side.
 #[derive(Clone, Eq, PartialEq, Debug)]
@@ -280,11 +281,36 @@ pub enum PlanRefusal {
     Permit(PermitRefusal),
     /// No client id could be minted.
     Mint(IdError),
-    /// The registry does not hold the order the planner placed at the level for this account:
-    /// it is not the registry the planner placed it through (another account's, or one
-    /// rebuilt), and the pass builds nothing for the market (decision 0068).
-    NotInRegistry(ClientOrderId),
 }
+
+/// Why a whole [`ExecutionPlanner::plan`] pass was refused, nothing built or freed: the
+/// planner plans each account through one registry and each registry for one account
+/// (decision 0068).
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum PlanError {
+    /// The account was planned through another registry before: this one does not hold its
+    /// orders (another account's registry, or one rebuilt).
+    OtherRegistry { acct: AccountKey },
+    /// The registry was planned for another account before.
+    OtherAccount { acct: AccountKey, bound: AccountKey },
+}
+
+impl fmt::Display for PlanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PlanError::OtherRegistry { acct } => write!(
+                f,
+                "account {acct:?} was planned through another registry; nothing is planned through this one"
+            ),
+            PlanError::OtherAccount { acct, bound } => write!(
+                f,
+                "the registry was planned for account {bound:?}; nothing is planned through it for {acct:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PlanError {}
 
 /// A level the planner built nothing for this pass, and why.
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
@@ -332,11 +358,14 @@ enum Action {
 }
 
 /// The planner (decision 0005's one planner; 0065): the orders it placed, by account, market,
-/// side and level (0068), and the consumer's thresholds.
+/// side and level, the registry each account is planned through (0068), and the consumer's
+/// thresholds.
 #[derive(Debug)]
 pub struct ExecutionPlanner {
     config: PlannerConfig,
     slots: HashMap<(AccountKey, InstrumentId), BTreeMap<Level, Slot>>,
+    /// Each account's registry, bound at the account's first pass.
+    bound: HashMap<AccountKey, Instance>,
 }
 
 impl ExecutionPlanner {
@@ -345,6 +374,7 @@ impl ExecutionPlanner {
         ExecutionPlanner {
             config,
             slots: HashMap::new(),
+            bound: HashMap::new(),
         }
     }
 
@@ -369,9 +399,9 @@ impl ExecutionPlanner {
     /// all under the venue's `caps`) and authorizes it for `acct`.
     ///
     /// `reg` is `acct`'s registry: the planner holds each account's orders apart, so a pass for
-    /// one account never frees another's levels. A registry that does not hold an order the
-    /// planner placed for `acct` on the market is not the one it was placed through, and the
-    /// pass builds nothing, reporting each such level ([`PlanRefusal::NotInRegistry`]; 0068).
+    /// one account never frees another's levels, and binds `acct` to `reg` at its first pass.
+    /// A pass for `acct` through another registry, or through `reg` for another account, is
+    /// refused with nothing built or freed ([`PlanError`]; 0068).
     pub fn plan(
         &mut self,
         desired: &DesiredBook,
@@ -380,25 +410,12 @@ impl ExecutionPlanner {
         acct: AccountKey,
         mint: &mut CidMint,
         now: MonoNs,
-    ) -> Plan {
+    ) -> Result<Plan, PlanError> {
+        self.bind(acct, reg.instance())?;
         let market = desired.market;
         let config = self.config;
         let slots = self.slots.entry((acct, market)).or_default();
         let mut plan = Plan::default();
-        // A registry never forgets an order, so one that does not hold an order the planner
-        // placed through it is another: nothing is freed or built (0068).
-        for (at, slot) in slots.iter() {
-            if reg.get(slot.cid).is_none() {
-                plan.refused.push(Refused {
-                    side: at.side(),
-                    level: at.level,
-                    why: PlanRefusal::NotInRegistry(slot.cid),
-                });
-            }
-        }
-        if !plan.refused.is_empty() {
-            return plan;
-        }
         // An order seen terminal frees its level.
         slots.retain(|_, slot| reg.get(slot.cid).is_some_and(|r| !r.state().is_terminal()));
 
@@ -565,7 +582,25 @@ impl ExecutionPlanner {
                 Err(why) => plan.refused.push(refuse(why)),
             }
         }
-        plan
+        Ok(plan)
+    }
+
+    /// Binds `acct` to the registry `instance` at its first pass; refuses another registry for
+    /// `acct`, or `instance` for another account. Client ids alone cannot tell two accounts'
+    /// registries apart: accounts may lease the same namespace (0068).
+    fn bind(&mut self, acct: AccountKey, instance: Instance) -> Result<(), PlanError> {
+        if let Some(bound) = self.bound.get(&acct) {
+            return if *bound == instance {
+                Ok(())
+            } else {
+                Err(PlanError::OtherRegistry { acct })
+            };
+        }
+        if let Some((&bound, _)) = self.bound.iter().find(|(_, i)| **i == instance) {
+            return Err(PlanError::OtherAccount { acct, bound });
+        }
+        self.bound.insert(acct, instance);
+        Ok(())
     }
 }
 
