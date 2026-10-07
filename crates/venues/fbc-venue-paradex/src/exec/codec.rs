@@ -11,7 +11,9 @@
 //!   as one JSON-RPC frame on the authenticated connection, cancel-on-disconnect's arm included
 //!   (the runtime sends it, FBC-w19), and recorded with [`ParadexReplies`] (FBC-0l9), which
 //!   decodes its reply into one outcome per item and reports `Unknown` at its deadline for what
-//!   went unanswered. Order entry is WebSocket only: a frame command while no connection is
+//!   went unanswered; one still held when a later command's encode finds twice the request
+//!   timeout gone was never written (the session refused its frame for the rate budget) and is
+//!   forgotten. Order entry is WebSocket only: a frame command while no connection is
 //!   authenticated is `NotSent(Disconnected)`, as the runtime reports it, with no REST
 //!   fallback; one whose rpc is not below [`CONTROL_IDS`] is `NotSent(Unencodable)`, since its
 //!   reply could not be told from the codec's own.
@@ -33,7 +35,7 @@
 //!
 //! Paradex signs a timestamp, never a nonce: no call asks for one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::time::Duration;
 
@@ -65,6 +67,11 @@ pub struct ParadexExec {
     stream: StreamId,
     /// The order queries sent and not yet answered, by their read's tag.
     queries: BTreeMap<HttpTag, Query>,
+    /// How long a frame request waits for its reply.
+    rpc_timeout: Duration,
+    /// The frame requests encoded, oldest first, with when: each is forgotten by the replies
+    /// once twice the request timeout is gone ([`ParadexExec::forget_unsent`]).
+    encoded: VecDeque<(RpcId, MonoNs)>,
 }
 
 /// An order query whose read was asked for: its rpc, the query, and when it was encoded.
@@ -104,6 +111,8 @@ impl ParadexExec {
             replies: ParadexReplies::new(),
             stream,
             queries: BTreeMap::new(),
+            rpc_timeout,
+            encoded: VecDeque::new(),
         })
     }
 
@@ -139,6 +148,21 @@ impl ParadexExec {
         let at = ctx.mono;
         self.queries.insert(tag, Query { rpc, query, at });
         Ok(EncodeReceipt::new())
+    }
+
+    /// Forgets every frame request encoded twice the request timeout or more before `now`.
+    /// The runtime has answered or timed out every frame it wrote by then (its deadline is the
+    /// timeout); a request still held was never written (the session refused the frame after
+    /// the encode, for its rate budget), and nothing else would ever drop it.
+    fn forget_unsent(&mut self, now: MonoNs) {
+        let held = self.rpc_timeout.saturating_mul(2);
+        while let Some(&(rpc, at)) = self.encoded.front() {
+            if now - at < held {
+                break;
+            }
+            self.replies.forget(rpc);
+            self.encoded.pop_front();
+        }
     }
 
     /// The answer to query `rpc`: its `QueryResult`, or `NotSent`/`Unknown` for a read that
@@ -204,8 +228,10 @@ impl ExecCodec for ParadexExec {
         if rpc.0 >= CONTROL_IDS {
             return Err(NotSentReason::Unencodable);
         }
+        self.forget_unsent(ctx.mono);
         let receipt = self.encoder.encode(cmd, rpc, specs, ctx, t, fx)?;
         self.replies.sent(rpc, cmd);
+        self.encoded.push_back((rpc, ctx.mono));
         Ok(receipt)
     }
 

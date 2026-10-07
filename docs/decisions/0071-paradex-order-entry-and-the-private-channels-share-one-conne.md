@@ -52,7 +52,10 @@ FBC-0sc's REST resync and order query. Three things were the ticket's to choose:
    `Unknown`. A query is held until its answer, its deadline, a new connection, or a later
    query's encode that finds twice its read's timeout gone: by then the runtime has settled
    every read it made, and until FBC-m8vm it makes none (it refuses an encode that carries a
-   read), so nothing else would drop it.
+   read), so nothing else would drop it. A frame request is likewise forgotten once a later
+   command's encode finds twice the request timeout gone: the runtime has answered or timed out
+   every frame it wrote by then, and one still held was refused after its encode (its rate
+   budget), which nothing tells the codec of yet (FBC-9r5o).
 
 ## Alternatives
 

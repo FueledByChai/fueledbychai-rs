@@ -863,6 +863,51 @@ fn a_query_whose_read_was_never_made_is_not_held_past_twice_its_timeout() {
     assert_eq!(call.events.len(), 1);
 }
 
+/// `codec` encoding the order placement as request `rpc` at monotonic time `mono`.
+fn place_at(codec: &mut ParadexExec, rpc: RpcId, mono: MonoNs) {
+    let mut fx = Effects::new();
+    let ctx = EncodeCtx { mono, ..ctx() };
+    let receipt = codec.encode(
+        &place(),
+        rpc,
+        &md::specs(),
+        &ctx,
+        &mut PathStamps::off(),
+        &mut fx,
+    );
+    receipt.unwrap();
+    assert_eq!(sends(fx.as_slice()).len(), 1);
+}
+
+#[test]
+fn a_request_whose_frame_was_never_written_is_not_held_past_twice_its_timeout() {
+    // The session can refuse an encoded frame afterwards (NotSent(RateBudget) when its bucket
+    // is spent): no deadline is set, so no reply or timeout ever reaches the codec for it
+    // (Codex 4211642782 on PR #109). A request is held until a later command's encode finds
+    // twice the request timeout gone: by then the runtime has answered or timed out every
+    // frame it wrote.
+    let reply = fixture_text("reply-create.json");
+    let start = MonoNs(1_000);
+    // Just short of twice the timeout: still held, so its reply is decoded.
+    let mut codec = authenticated();
+    place_at(&mut codec, RpcId(11), start);
+    place_at(
+        &mut codec,
+        RpcId(12),
+        start + (RPC_TIMEOUT * 2 - Duration::from_nanos(1)),
+    );
+    assert_eq!(text(&mut codec, &reply).events.len(), 1);
+    // Twice the timeout gone: dropped, its reply answers nothing; later requests stay held.
+    let mut codec = authenticated();
+    place_at(&mut codec, RpcId(11), start);
+    place_at(&mut codec, RpcId(12), start + RPC_TIMEOUT);
+    place_at(&mut codec, RpcId(13), start + RPC_TIMEOUT * 2);
+    text(&mut codec, &reply).refused();
+    let mut sink = Sink::default();
+    codec.on_rpc_timeout(RpcId(12), &mut sink);
+    assert_eq!(sink.0.len(), 1);
+}
+
 #[test]
 fn a_new_connection_drops_the_reads_of_the_one_before() {
     // Answers come back only to the epoch that asked (0027): a new connection holds no earlier

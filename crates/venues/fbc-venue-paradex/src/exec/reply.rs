@@ -256,6 +256,13 @@ impl ParadexReplies {
         Ok(ReplyRead::Decoded)
     }
 
+    /// Drops request `rpc` with nothing pushed: the order-entry codec's, for a request the
+    /// runtime never wrote (it refused the frame after the encode), which no reply or deadline
+    /// will ever settle.
+    pub fn forget(&mut self, rpc: RpcId) {
+        self.slots.remove(&rpc);
+    }
+
     /// Request `rpc`'s deadline passed with no answer: the tracker drops the request, so a
     /// reply arriving after it is [`ReplyRead::NotOurs`] and adds no second outcome, and pushes
     /// `Unknown` for every item, unless every item was already reported `Unknown` from its
