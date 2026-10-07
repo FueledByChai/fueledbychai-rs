@@ -60,7 +60,7 @@ any other state carries no revision; cancels and the instrument cancel-all are u
 
 ## What would show this was wrong
 
-- An Exit place, batch or amend built before a fill moved its market's position reaching a
-  venue.
+- An Exit place, batch or amend built before a fill the registry had applied before the
+  command was encoded reaching a venue.
 - Exit unable to complete on a venue whose fills arrive so often that every Exit command is
   refused at submit before it is written.

@@ -21,7 +21,10 @@
 //! - a place, a batch of places or an amend goes through only while its market's
 //!   [`StateGeneration`] is still the one it was built under: the kill switch, a disarm, an
 //!   arming call, lease names given again that change what the market admits, or any other
-//!   change of the market's state since its build refuses it;
+//!   change of the market's state since its build refuses it; one built while its market is
+//!   in Exit goes through only while the market's position revision is also still the one it
+//!   was built under: a fill or a seed that moved the inventory since refuses it (decision
+//!   0066);
 //! - an instrument cancel-all goes through only while 0005's I7 guard it was built under still
 //!   holds ([`Registry::cancel_everything`]): the registry's hold of the market's exclusive
 //!   lease has not changed since (no disarm, no arming of the disarmed market, no lease names
