@@ -29,6 +29,10 @@ webpki-roots.workspace = true
 nix.workspace = true
 
 [dev-dependencies]
+# The conformance toy for src/exec_held_tests.rs, which as a unit test cannot include it by path:
+# llvm-cov would count a second copy under crates/fbc-runtime/src/../../fbc-conformance/ (PR #90
+# B5). Cargo allows this dev-dependency cycle; the toy uses fbc-core types only.
+fbc-conformance = { path = "../fbc-conformance" }
 tokio = { workspace = true, features = ["rt", "net", "io-util", "macros", "sync", "time", "test-util"] }
 tokio-tungstenite.workspace = true
 rust_decimal.workspace = true
