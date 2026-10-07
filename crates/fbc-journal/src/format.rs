@@ -31,7 +31,13 @@
 //! which is binary when a byte that is not UTF-8 lies outside the spans or a span splits a
 //! character. Version 5 also adds the `InboundControl` kind (FBC-drf, decision 0041): a ping,
 //! pong or close frame a session received, at its stamp, its payload or close reason written as
-//! a [`WireSlice`] whose one span covers it all; a version 2 to 4 segment cannot hold one. The reader reads versions 2 to 5, so a journal written before reads back unchanged.
+//! a [`WireSlice`] whose one span covers it all; a version 2 to 4 segment cannot hold one.
+//!
+//! Version 6 (FBC-j5bw, decision 0062) adds a reason a `WriteResult` may be not sent for,
+//! [`NotSentReason::StaleAuthorization`], as byte 7 after the seven before it, and changes
+//! nothing else; a version 2 to 5 segment holding it is malformed, and a reader of version 5
+//! refuses a version 6 segment at its header, rather than part way through. The reader reads
+//! versions 2 to 6, so a journal written before reads back unchanged.
 
 use core::ops::Range;
 
@@ -54,8 +60,9 @@ pub const MAGIC: [u8; 4] = *b"FBCJ";
 /// version 2 writes each span's keyed hash (FBC-apz); version 3 adds the `Nonce`, `EncodeCtx`
 /// and `Cycle` kinds (FBC-ec9); version 4 hashes the spans a codec names in inbound frames,
 /// response bodies and response header names (FBC-7lm); version 5 keeps the kind an outbound
-/// frame was sent as (FBC-q7b) and adds the `InboundControl` kind (FBC-drf).
-pub const VERSION: u16 = 5;
+/// frame was sent as (FBC-q7b) and adds the `InboundControl` kind (FBC-drf); version 6 adds the
+/// `StaleAuthorization` reason a write result may be not sent for (FBC-j5bw).
+pub const VERSION: u16 = 6;
 /// The oldest format version this crate reads: version 1 is refused (0024).
 pub const OLDEST_READABLE: u16 = 2;
 /// The most bytes one record may redact, its spans and secret header values together.
@@ -980,7 +987,13 @@ pub(crate) fn decode_version(body: &[u8], version: u16) -> Result<(Record, Vec<S
             rpc: d.rpc()?,
             result: match d.u8()? {
                 0 => WriteRes::Written,
-                1 => WriteRes::NotSent(d.pick(&NOT_SENT, "write result")?),
+                1 => match d.pick(&NOT_SENT, "write result")? {
+                    // Version 6's reason: no earlier writer wrote it.
+                    NotSentReason::StaleAuthorization if version < 6 => {
+                        return Err("write result");
+                    }
+                    why => WriteRes::NotSent(why),
+                },
                 _ => return Err("write result"),
             },
         },
@@ -1513,6 +1526,39 @@ mod tests {
         }
     }
 
+    /// FBC-j5bw (DeepSeek's DS-1 on PR #100): a write result not sent for a stale authorization
+    /// is a version 6 value; a segment of version 5 or earlier, which no writer of it could have
+    /// written it in, refuses it, and reads every reason before it as version 6 does.
+    #[test]
+    fn a_stale_authorization_not_sent_is_refused_before_version_6() {
+        let body_of = |why| {
+            let r = Record::WriteResult {
+                at: MonoNs(1),
+                conn: conn(),
+                rpc: None,
+                result: WriteRes::NotSent(why),
+            };
+            let mut body = Vec::new();
+            encode(&r, &RedactionKey::new(&[7; 32]).unwrap(), &mut body).unwrap();
+            (r, body)
+        };
+        assert_eq!(VERSION, 6);
+        let (stale, body) = body_of(NotSentReason::StaleAuthorization);
+        assert_eq!(decode_version(&body, 6).unwrap().0, stale);
+        for version in OLDEST_READABLE..6 {
+            assert_eq!(decode_version(&body, version), Err("write result"));
+        }
+        for why in NOT_SENT
+            .into_iter()
+            .filter(|w| *w != NotSentReason::StaleAuthorization)
+        {
+            let (r, body) = body_of(why);
+            for version in OLDEST_READABLE..=VERSION {
+                assert_eq!(decode_version(&body, version).unwrap().0, r);
+            }
+        }
+    }
+
     #[test]
     fn every_feed_round_trips() {
         let feeds = [
@@ -1876,9 +1922,10 @@ mod tests {
             assert_eq!(digests, hashed);
             assert_eq!(record.digests(&key()), hashed);
             assert!(!secret.is_empty() || body.len() == 1 + 8 + 1 + 8 + 8 + 6 + 1);
-            for version in OLDEST_READABLE..VERSION {
+            for version in OLDEST_READABLE..5 {
                 assert_eq!(decode_version(&body, version), Err("record kind"));
             }
+            assert_eq!(decode_version(&body, 5).unwrap().0, want);
         }
     }
 
