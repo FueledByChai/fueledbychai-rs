@@ -822,97 +822,16 @@ fn a_resync_read_that_fails_is_refused_or_does_not_decode_pushes_nothing_and_ask
     .refused();
 }
 
-/// `codec` encoding the order query as request `rpc` at monotonic time `mono`: its read's tag.
-fn query_at(codec: &mut ParadexExec, rpc: RpcId, mono: MonoNs) -> HttpTag {
-    let mut fx = Effects::new();
-    let ctx = EncodeCtx { mono, ..ctx() };
-    let cmd = query();
-    let receipt = codec.encode(
-        &cmd,
-        rpc,
-        &md::specs(),
-        &ctx,
-        &mut PathStamps::off(),
-        &mut fx,
-    );
-    receipt.unwrap();
-    let [(tag, ..)]: [_; 1] = reads(fx.as_slice(), TOKEN).try_into().unwrap();
-    tag
-}
-
 #[test]
-fn a_query_whose_read_was_never_made_is_not_held_past_twice_its_timeout() {
-    // Until FBC-m8vm the session refuses an encode that carries a read (NotSent(Unencodable)),
-    // so neither an answer nor a deadline ever reaches the codec for it (Codex 4211490398 on
-    // PR #109). A query is held until a later query's encode finds twice its read's timeout
-    // gone: the runtime has answered or timed out every read it made by then.
+fn a_new_connection_drops_the_requests_and_reads_of_the_one_before() {
+    // Replies and answers come back only to the epoch that asked (0027): a new connection holds
+    // nothing an earlier one sent, so what the session refused after its encode (a frame for its
+    // rate budget, a read until FBC-m8vm) is held no longer than its connection (Codex
+    // 4211490398, 4211642782 and 4211822659 on PR #109; the runtime telling the codec is
+    // FBC-9r5o).
     let mut codec = authenticated();
-    let start = MonoNs(1_000);
-    let refused = query_at(&mut codec, RpcId(12), start);
-    let kept = query_at(&mut codec, RpcId(13), start + READ_TIMEOUT);
-    // Just short of twice the first's timeout: both are held.
-    let almost = start + (READ_TIMEOUT * 2 - Duration::from_nanos(1));
-    let third = query_at(&mut codec, RpcId(14), almost);
-    let body = fixture("rest-orders-history-filled.json");
-    answer(&mut codec, third, ok(&body)).result.unwrap();
-    // Twice its timeout gone: the first is dropped, the second still held.
-    query_at(&mut codec, RpcId(15), start + READ_TIMEOUT * 2);
-    answer(&mut codec, refused, ok(&body)).refused();
-    let call = answer(&mut codec, kept, ok(&body));
-    call.result.unwrap();
-    assert_eq!(call.events.len(), 1);
-}
-
-/// `codec` encoding the order placement as request `rpc` at monotonic time `mono`.
-fn place_at(codec: &mut ParadexExec, rpc: RpcId, mono: MonoNs) {
-    let mut fx = Effects::new();
-    let ctx = EncodeCtx { mono, ..ctx() };
-    let receipt = codec.encode(
-        &place(),
-        rpc,
-        &md::specs(),
-        &ctx,
-        &mut PathStamps::off(),
-        &mut fx,
-    );
-    receipt.unwrap();
-    assert_eq!(sends(fx.as_slice()).len(), 1);
-}
-
-#[test]
-fn a_request_whose_frame_was_never_written_is_not_held_past_twice_its_timeout() {
-    // The session can refuse an encoded frame afterwards (NotSent(RateBudget) when its bucket
-    // is spent): no deadline is set, so no reply or timeout ever reaches the codec for it
-    // (Codex 4211642782 on PR #109). A request is held until a later command's encode finds
-    // twice the request timeout gone: by then the runtime has answered or timed out every
-    // frame it wrote.
-    let reply = fixture_text("reply-create.json");
-    let start = MonoNs(1_000);
-    // Just short of twice the timeout: still held, so its reply is decoded.
-    let mut codec = authenticated();
-    place_at(&mut codec, RpcId(11), start);
-    place_at(
-        &mut codec,
-        RpcId(12),
-        start + (RPC_TIMEOUT * 2 - Duration::from_nanos(1)),
-    );
-    assert_eq!(text(&mut codec, &reply).events.len(), 1);
-    // Twice the timeout gone: dropped, its reply answers nothing; later requests stay held.
-    let mut codec = authenticated();
-    place_at(&mut codec, RpcId(11), start);
-    place_at(&mut codec, RpcId(12), start + RPC_TIMEOUT);
-    place_at(&mut codec, RpcId(13), start + RPC_TIMEOUT * 2);
-    text(&mut codec, &reply).refused();
-    let mut sink = Sink::default();
-    codec.on_rpc_timeout(RpcId(12), &mut sink);
-    assert_eq!(sink.0.len(), 1);
-}
-
-#[test]
-fn a_new_connection_drops_the_reads_of_the_one_before() {
-    // Answers come back only to the epoch that asked (0027): a new connection holds no earlier
-    // read, so nothing waits on one forever.
-    let mut codec = authenticated();
+    let (result, _) = encode(&mut codec, &place(), RpcId(11));
+    result.unwrap();
     let resync_reads = reads(&resync(&mut codec), TOKEN);
     let (_, fx) = encode(&mut codec, &query(), RpcId(12));
     let [(query_tag, ..)]: [_; 1] = reads(fx.as_slice(), TOKEN).try_into().unwrap();
@@ -926,6 +845,16 @@ fn a_new_connection_drops_the_reads_of_the_one_before() {
     for (tag, ..) in resync_reads {
         answer(&mut codec, tag, ok(&fixture("rest-positions.json"))).refused();
     }
+    // The request's reply is no longer awaited; a deadline the runtime still names is Unknown.
+    text(&mut codec, &fixture_text("reply-create.json")).refused();
+    let mut sink = Sink::default();
+    codec.on_rpc_timeout(RpcId(11), &mut sink);
+    let unknown = ExecEvent::Outcome {
+        rpc: RpcId(11),
+        item: None,
+        outcome: SubmitOutcome::Unknown,
+    };
+    assert_eq!(sink.0, [(VenueMeta::NONE, unknown)]);
 }
 
 #[test]
