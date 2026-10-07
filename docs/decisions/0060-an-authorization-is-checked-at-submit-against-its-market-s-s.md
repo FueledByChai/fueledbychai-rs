@@ -1,4 +1,4 @@
-# 0060 — An authorization is checked at submit against its market's state generation at build, an instrument cancel-all also against the foreign orders seen, and cancels always pass, augmenting 0045
+# 0060 — An authorization is checked at submit against its market's state generation at build, an instrument cancel-all against 0005's I7 inputs, and cancels always pass, augmenting 0045
 
 Status: accepted
 Date: 2026-10-06
@@ -25,15 +25,22 @@ and lease names given again can leave an armed market unleased without changing 
   order). It does not itself refuse a stale command: the check at submit does, so a stale
   command has one fate, not sent, which the consumer already resolves through `on_outcome`.
 - **What it carries.** A place, a batch or an amend carries its market's generation as read when
-  it was built, and a live handle to that market's counter; an instrument cancel-all also the
-  count of events that showed an order not ours open on the market, at build. A cancel or a
-  cancel-many carries the generation at issue and no handle.
+  it was built, and a live handle to that market's counter. An instrument cancel-all carries
+  0005's I7 inputs instead, each as a count at build with a live handle: how many times the
+  registry's hold of the market's exclusive lease changed (it advances on arming a disarmed
+  market, on disarming an armed one, and on lease names given again that cover its held leases
+  differently), and how many events showed an order not ours open on the market. A cancel, a
+  cancel-many and a cancel-all carry the generation at issue, for the record only.
 - **The check.** `Authorization::check_at_submit()`, run by the gateway immediately before
   encoding, writing nothing when it refuses: a place, a batch or an amend passes only while its
   market's generation is unchanged (`StaleAuthorization::StateChanged`); an instrument
-  cancel-all also only while no order not ours was seen on its market
-  (`StaleAuthorization::ForeignSeen`), since 0005's I7 guard it was built under may no longer
-  hold; a cancel and a cancel-many always pass, as 0012 builds cancels in every state and their
+  cancel-all only while the registry's hold of its market's exclusive lease is unchanged
+  (`StaleAuthorization::ExclusiveLeaseChanged`) and no order not ours was seen on its market
+  (`StaleAuthorization::ForeignSeen`), since either moving may undo the I7 guard it was built
+  under, and not for any other change of the market's state: the kill switch, its lift, and
+  Flatten or Wind-down on the armed market leave I7 holding, and holding the cancel-all back
+  would leave our Open orders resting on a Killed market (Reviewer B's RB94-1 on PR #94); a
+  cancel and a cancel-many always pass, as 0012 builds cancels in every state and their
   targets are our orders by explicit reference (I4). A command of a guarded kind that carries
   no guard is refused (fail closed). The counters are shared atomics, so the check needs no
   registry and runs on any thread.
@@ -50,6 +57,10 @@ and lease names given again can leave an armed market unleased without changing 
   flight, PR #87 Reviewer B B6); one refusal point keeps one release path.
 - Hold back cancels whose market changed state: rejected. The kill switch exists to stop
   orders, and holding back a cancel under it is the failure it guards against (0012).
+- Guard the instrument cancel-all with the state generation as a place is: rejected (RB94-1).
+  The kill switch and its lift change the generation but none of I7's inputs, so a cancel-all
+  built just before the switch went on would be refused and our Open orders left resting
+  until the next resync built it again.
 - Advance the generation on every foreign order seen instead of a second counter: rejected. The
   generation counts state changes (0012), which no resync or fill makes, and a place does not
   reach orders not ours.
@@ -67,4 +78,8 @@ and lease names given again can leave an armed market unleased without changing 
 
 - A place, batch or amend built before a change of its market's state reaching a venue.
 - A cancel or cancel-many held back by the kill switch or any other state.
-- An instrument cancel-all reaching an order not ours that was in view before it was written.
+- An instrument cancel-all held back by a change of its market's state that left the registry's
+  hold of the exclusive lease and the orders not ours in view as they were.
+- An instrument cancel-all reaching an order not ours that was in view before it was written,
+  or written after the registry's hold of its market's exclusive lease changed since its
+  build.

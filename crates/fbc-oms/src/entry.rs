@@ -34,13 +34,21 @@
 //! names given again advance it too for every armed market whose held leases they cover
 //! differently, since what the market admits changed (decision 0060). Nothing else in the
 //! library, and no resync, fill, outcome or ladder timer, changes either.
+//!
+//! A second count per market follows only whether the registry holds the market's exclusive
+//! lease under the names it has now (0005's I7, [`Registry::cancel_everything`]): it advances
+//! each time that changes, on arming a disarmed market, on disarming an armed one, and on
+//! lease names given again that cover its held leases differently. An instrument cancel-all is
+//! checked against it at submit, not against the state generation, so the kill switch and its
+//! lift, which leave the lease as it was, never hold one back (decision 0060; Reviewer B's
+//! RB94-1 on PR #94).
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use fbc_core::{AccountLease, InstrumentId, MarketLease, NonceScope, OrderCaps, VenueSymbol};
 
-use crate::grant::{Generations, StateGeneration, Watch};
+use crate::grant::{Counters, Generations, StateGeneration, Watch};
 use crate::registry::Registry;
 
 /// A market's order-entry state (decision 0012).
@@ -295,6 +303,8 @@ pub(crate) struct Entries {
     /// The account lease, while any market is armed.
     account_lease: Option<AccountLease>,
     generations: Generations,
+    /// Per market, how many times whether the registry holds its exclusive lease changed.
+    exclusive: Counters,
 }
 
 impl Entries {
@@ -303,18 +313,46 @@ impl Entries {
     /// (decision 0060; Reviewer B's RB86-3 on PR #86), so a command built before is refused at
     /// submit.
     pub(crate) fn set_keys(&mut self, keys: LeaseKeys) {
-        let mut armed: Vec<InstrumentId> = self.market_leases.keys().copied().collect();
-        armed.sort();
-        let before: Vec<bool> = armed
-            .iter()
-            .map(|m| self.held_covered(*m).is_ok())
-            .collect();
+        let before = self.exclusive_held();
         self.keys = Some(keys);
-        for (market, was) in armed.into_iter().zip(before) {
-            if self.held_covered(market).is_ok() != was {
-                self.generations.advance(market);
-            }
+        // The armed markets are the same, so each whose exclusive hold changed is one whose
+        // held leases the new names cover differently.
+        for market in self.exclusive_changed(&before) {
+            self.generations.advance(market);
         }
+    }
+
+    /// The armed markets, each with whether the registry holds its exclusive lease now.
+    fn exclusive_held(&self) -> BTreeMap<InstrumentId, bool> {
+        self.market_leases
+            .keys()
+            .map(|m| (*m, self.holds_exclusive(*m)))
+            .collect()
+    }
+
+    /// Advances the exclusive-lease count of every market whose exclusive hold changed since
+    /// `before` ([`Entries::exclusive_held`]), and returns them in id order.
+    fn exclusive_changed(&mut self, before: &BTreeMap<InstrumentId, bool>) -> Vec<InstrumentId> {
+        let after = self.exclusive_held();
+        let held = |map: &BTreeMap<InstrumentId, bool>, m| map.get(m).copied().unwrap_or(false);
+        let mut changed: Vec<InstrumentId> = before
+            .keys()
+            .chain(after.keys())
+            .filter(|m| held(before, m) != held(&after, m))
+            .copied()
+            .collect();
+        changed.sort();
+        changed.dedup();
+        for market in &changed {
+            self.exclusive.advance(*market);
+        }
+        changed
+    }
+
+    /// How many times whether the registry holds `market`'s exclusive lease changed, watched
+    /// for an instrument cancel-all about to be built under it (decision 0060).
+    pub(crate) fn watch_exclusive(&mut self, market: InstrumentId) -> Watch {
+        self.exclusive.watch(market)
     }
 
     pub(crate) fn keys(&self) -> Option<&LeaseKeys> {
@@ -424,8 +462,22 @@ impl Entries {
         self.entry(market)
     }
 
-    /// Arms `market` into `to` (Quoting or Exit), as Start, Flatten and Wind-down do.
+    /// Arms `market` into `to` (Quoting or Exit), as Start, Flatten and Wind-down do, advancing
+    /// the exclusive-lease count of each market whose exclusive hold that changed.
     fn arm(
+        &mut self,
+        market: InstrumentId,
+        to: EntryState,
+        leases: Leases,
+        position_known: bool,
+    ) -> Result<MarketEntry, ArmRefusal> {
+        let before = self.exclusive_held();
+        let armed = self.arm_leased(market, to, leases, position_known);
+        self.exclusive_changed(&before);
+        armed
+    }
+
+    fn arm_leased(
         &mut self,
         market: InstrumentId,
         to: EntryState,
@@ -478,6 +530,7 @@ impl Entries {
     /// Disarms `market`: Exit and Quoting become Cancel-only, Killed stays; its market lease is
     /// dropped, and the account lease with the last armed market's.
     fn disarm(&mut self, market: InstrumentId) -> MarketEntry {
+        let before = self.exclusive_held();
         let was_armed = self.market_leases.remove(&market).is_some();
         if self.market_leases.is_empty() {
             self.account_lease = None;
@@ -486,6 +539,7 @@ impl Entries {
             EntryState::Killed => EntryState::Killed,
             _ => EntryState::CancelOnly,
         };
+        self.exclusive_changed(&before);
         self.set(market, state, was_armed)
     }
 }

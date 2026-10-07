@@ -123,8 +123,9 @@ pub struct PermittedCommand {
     /// released ([`Registry::amend_not_submitted`]).
     built: Option<(ClientOrderId, u64)>,
     /// What its authorization is checked against at submit: the market's state generation at
-    /// build for a place, a batch, an amend or an instrument cancel-all, and the foreign orders
-    /// seen for the last (decision 0060); nothing for a cancel or a cancel-many.
+    /// build for a place, a batch or an amend, 0005's I7 inputs (the exclusive lease's changes
+    /// and the foreign orders seen) for an instrument cancel-all (decision 0060); nothing for a
+    /// cancel or a cancel-many.
     guard: Guard,
 }
 
@@ -337,10 +338,7 @@ impl<'r> Live<'r> {
         Ok(PermittedCommand {
             cmd: VenueCommand::Amend(amend),
             built: Some((cid, build)),
-            guard: Guard {
-                state: Some(self.generation),
-                foreign: None,
-            },
+            guard: Guard::state(self.generation),
         })
     }
 }

@@ -140,9 +140,10 @@
 //! an account cancel-all. It carries the market's [`StateGeneration`] at the command's build,
 //! and the gateway runs [`Authorization::check_at_submit`] immediately before encoding: a
 //! place, a batch or an amend whose market changed state since (the kill switch, a disarm, an
-//! arming call, lease names given again) is refused with nothing written, an instrument
-//! cancel-all also once an order not ours was seen on its market, and a cancel or a
-//! cancel-many always goes through.
+//! arming call, lease names given again) is refused with nothing written; an instrument
+//! cancel-all only once 0005's I7 guard it was built under moved (the registry's hold of the
+//! market's exclusive lease changed, or an order not ours was seen on the market), never for
+//! the kill switch alone; and a cancel or a cancel-many always goes through.
 
 mod caps;
 mod entry;

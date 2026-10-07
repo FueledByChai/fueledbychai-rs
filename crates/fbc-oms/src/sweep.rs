@@ -206,12 +206,14 @@ impl Registry {
                 let unanswered = self.ours_on(market, |state| {
                     matches!(state, OrdState::PendingNew | OrdState::Unknown)
                 });
-                // Checked at submit against the market's state and the foreign orders seen
-                // since now: either moving may undo the guard it was built under (0060).
-                let guard = Guard {
-                    state: Some(self.entries.watch(market)),
-                    foreign: Some(self.foreign.watch(market)),
-                };
+                // Checked at submit against I7's inputs as they are now: the registry's hold
+                // of the market's exclusive lease and the foreign orders seen. Either moving
+                // may undo the guard it was built under; a change of state that leaves both
+                // (the kill switch, its lift) must not hold it back (0060; RB94-1).
+                let guard = Guard::exclusive(
+                    self.entries.watch_exclusive(market),
+                    self.foreign.watch(market),
+                );
                 CancelEverything::CancelAll {
                     command: PermittedCommand::guarded(
                         VenueCommand::CancelAll(CancelScope::Instrument(market)),

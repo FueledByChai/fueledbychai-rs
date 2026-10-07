@@ -22,8 +22,13 @@
 //!   [`StateGeneration`] is still the one it was built under: the kill switch, a disarm, an
 //!   arming call, lease names given again that change what the market admits, or any other
 //!   change of the market's state since its build refuses it;
-//! - an instrument cancel-all, as a place, and also only while no event has shown an order not
-//!   ours on the market since it was built (0005's I7, [`Registry::cancel_everything`]);
+//! - an instrument cancel-all goes through only while 0005's I7 guard it was built under still
+//!   holds ([`Registry::cancel_everything`]): the registry's hold of the market's exclusive
+//!   lease has not changed since (no disarm, no arming of the disarmed market, no lease names
+//!   given again that cover its held leases differently) and no event has shown an order not
+//!   ours on the market since. A change of the market's state that leaves those as they were
+//!   (the kill switch, its lift, Flatten or Wind-down on the armed market) does not hold it
+//!   back: the kill switch must not keep our orders resting (0012; Reviewer B's RB94-1);
 //! - a cancel or a cancel-many always goes through: cancels are built in every state, within
 //!   0005's I4 (they name our orders only) and I7 (no account cancel-all is ever built), and
 //!   the kill switch must never hold one back (0012).
@@ -147,13 +152,37 @@ impl Generations {
 
 /// What a built command is re-checked against at submit ([`Authorization::check_at_submit`]):
 /// nothing for a cancel or a cancel-many, the market's state generation for a place, a batch or
-/// an amend, and that and the foreign orders seen for an instrument cancel-all.
+/// an amend, and 0005's I7 inputs for an instrument cancel-all: the changes of the registry's
+/// hold of the market's exclusive lease and the foreign orders seen.
 #[derive(Default, Eq, PartialEq, Debug)]
 pub(crate) struct Guard {
-    /// The market's state generation at build.
+    /// The market's state generation at build: a place, a batch or an amend.
     pub(crate) state: Option<Watch>,
-    /// The count of events that showed an order not ours on the market, at build.
+    /// How many times the registry's hold of the market's exclusive lease changed, at build:
+    /// an instrument cancel-all.
+    pub(crate) lease: Option<Watch>,
+    /// The count of events that showed an order not ours on the market, at build: an
+    /// instrument cancel-all.
     pub(crate) foreign: Option<Watch>,
+}
+
+impl Guard {
+    /// A place's, a batch's or an amend's guard: the market's state generation.
+    pub(crate) fn state(state: Watch) -> Guard {
+        Guard {
+            state: Some(state),
+            ..Guard::default()
+        }
+    }
+
+    /// An instrument cancel-all's guard: 0005's I7 inputs.
+    pub(crate) fn exclusive(lease: Watch, foreign: Watch) -> Guard {
+        Guard {
+            state: None,
+            lease: Some(lease),
+            foreign: Some(foreign),
+        }
+    }
 }
 
 /// Why `fbc-oms` issues no authorization for a command.
@@ -200,6 +229,10 @@ pub enum StaleAuthorization {
     /// An instrument cancel-all's market showed an order not ours since it was built, which
     /// the cancel-all would reach (0005's I7).
     ForeignSeen(InstrumentId),
+    /// The registry's hold of an instrument cancel-all's market's exclusive lease changed since
+    /// it was built: the market was disarmed (its lease dropped), armed again (a lease taken
+    /// since), or lease names given again cover its held leases differently (0005's I7).
+    ExclusiveLeaseChanged(InstrumentId),
 }
 
 impl fmt::Display for StaleAuthorization {
@@ -215,6 +248,11 @@ impl fmt::Display for StaleAuthorization {
             StaleAuthorization::ForeignSeen(market) => write!(
                 f,
                 "an order not ours was seen on market {} since the cancel-all was built",
+                market.get()
+            ),
+            StaleAuthorization::ExclusiveLeaseChanged(market) => write!(
+                f,
+                "the exclusive lease on market {} was dropped, taken again or uncovered since the cancel-all was built",
                 market.get()
             ),
         }
@@ -248,7 +286,8 @@ impl Registry {
     /// never receives one.
     ///
     /// It carries the market's [`StateGeneration`] when the command was built (when the
-    /// authorization was issued, for a cancel or a cancel-many, which no state holds back).
+    /// authorization was issued, for a cancel, a cancel-many or an instrument cancel-all, which
+    /// no state holds back).
     /// It does not refuse a command whose market changed state since its build: the check at
     /// submit does ([`Authorization::check_at_submit`]), so a stale command has one fate, not
     /// sent, whichever comes first (decision 0060).
@@ -291,40 +330,35 @@ impl Authorization {
     /// The check at submit (decision 0060), which the gateway runs immediately before it
     /// encodes the command, writing nothing when it refuses: a place, a batch or an amend whose
     /// market changed state since the command was built is refused
-    /// ([`StaleAuthorization::StateChanged`]), an instrument cancel-all also once an order not
-    /// ours was seen on its market since ([`StaleAuthorization::ForeignSeen`]), and a cancel
-    /// or a cancel-many always goes through. It reads the market's live state without the
-    /// registry, from any thread.
+    /// ([`StaleAuthorization::StateChanged`]); an instrument cancel-all once the registry's
+    /// hold of its market's exclusive lease changed since
+    /// ([`StaleAuthorization::ExclusiveLeaseChanged`]) or an order not ours was seen on its
+    /// market since ([`StaleAuthorization::ForeignSeen`]), and not for any other change of
+    /// state; a cancel or a cancel-many always goes through. It reads the market's live
+    /// counters without the registry, from any thread. A command that needs a guard and
+    /// carries none is refused: it was not built here.
     pub fn check_at_submit(&self) -> Result<(), StaleAuthorization> {
-        let cancel_all = match &self.cmd {
-            VenueCommand::Cancel(_) | VenueCommand::CancelMany(_) => return Ok(()),
-            VenueCommand::CancelAll(_) => true,
-            _ => false,
-        };
-        let stale = |now| StaleAuthorization::StateChanged {
-            market: self.market,
-            built: self.generation,
-            now: StateGeneration(now),
-        };
-        // A command that needs a guard and carries none is refused: it was not built here.
-        match &self.guard.state {
-            None => return Err(stale(self.generation.get())),
-            Some(state) => {
-                if let Some(now) = state.moved() {
-                    return Err(stale(now));
+        let moved = |watch: &Option<Watch>| watch.as_ref().is_none_or(|w| w.moved().is_some());
+        match &self.cmd {
+            VenueCommand::Cancel(_) | VenueCommand::CancelMany(_) => Ok(()),
+            VenueCommand::CancelAll(_) => {
+                if moved(&self.guard.lease) {
+                    Err(StaleAuthorization::ExclusiveLeaseChanged(self.market))
+                } else if moved(&self.guard.foreign) {
+                    Err(StaleAuthorization::ForeignSeen(self.market))
+                } else {
+                    Ok(())
                 }
             }
+            _ => match self.guard.state.as_ref().map(Watch::moved) {
+                Some(None) => Ok(()),
+                now => Err(StaleAuthorization::StateChanged {
+                    market: self.market,
+                    built: self.generation,
+                    now: StateGeneration(now.flatten().unwrap_or(self.generation.get())),
+                }),
+            },
         }
-        if cancel_all
-            && self
-                .guard
-                .foreign
-                .as_ref()
-                .is_none_or(|seen| seen.moved().is_some())
-        {
-            return Err(StaleAuthorization::ForeignSeen(self.market));
-        }
-        Ok(())
     }
 
     /// The account the command is for.
@@ -337,8 +371,8 @@ impl Authorization {
         self.market
     }
 
-    /// The market's state generation when the command was built (for a cancel or a
-    /// cancel-many, when the authorization was issued).
+    /// The market's state generation when the command was built (for a cancel, a cancel-many
+    /// or an instrument cancel-all, when the authorization was issued).
     pub fn generation(&self) -> StateGeneration {
         self.generation
     }
@@ -430,37 +464,39 @@ mod tests {
         ]
     }
 
-    /// Issues `cmd` as this crate builds it: a place, a batch, an amend or an instrument
-    /// cancel-all guarded by the market's generation (and, for the last, the foreign orders
-    /// seen), a cancel or a cancel-many unguarded, carrying `current`.
-    fn issue(
-        cmd: VenueCommand,
-        generations: &mut Generations,
-        seen: &mut Counters,
-    ) -> Result<Authorization, IssueRefusal> {
+    /// The counters a registry keeps per market: its state generation, the changes of its
+    /// exclusive lease's hold, and the foreign orders seen.
+    #[derive(Default)]
+    struct Counts {
+        generations: Generations,
+        lease: Counters,
+        seen: Counters,
+    }
+
+    /// Issues `cmd` as this crate builds it: a place, a batch or an amend guarded by the
+    /// market's generation, an instrument cancel-all by 0005's I7 inputs (the exclusive lease's
+    /// changes and the foreign orders seen), a cancel or a cancel-many unguarded, carrying the
+    /// generation now.
+    fn issue(cmd: VenueCommand, c: &mut Counts) -> Result<Authorization, IssueRefusal> {
         let market = market_of(&cmd).ok();
-        let current = market.map_or(StateGeneration(0), |m| generations.of(m));
+        let current = market.map_or(StateGeneration(0), |m| c.generations.of(m));
         let guard = match (&cmd, market) {
             (VenueCommand::Cancel(_) | VenueCommand::CancelMany(_), _) | (_, None) => {
                 Guard::default()
             }
-            (VenueCommand::CancelAll(_), Some(m)) => Guard {
-                state: Some(generations.watch(m)),
-                foreign: Some(seen.watch(m)),
-            },
-            (_, Some(m)) => Guard {
-                state: Some(generations.watch(m)),
-                foreign: None,
-            },
+            (VenueCommand::CancelAll(_), Some(m)) => {
+                Guard::exclusive(c.lease.watch(m), c.seen.watch(m))
+            }
+            (_, Some(m)) => Guard::state(c.generations.watch(m)),
         };
         Authorization::issue(ACCT, PermittedCommand::for_test(cmd, guard), current)
     }
 
     #[test]
     fn an_authorization_carries_the_command_as_this_crate_built_it() {
-        let (mut generations, mut seen) = (Generations::default(), Counters::default());
+        let mut c = Counts::default();
         for cmd in order_commands(InstrumentId::new(1)) {
-            let auth = issue(cmd.clone(), &mut generations, &mut seen).unwrap();
+            let auth = issue(cmd.clone(), &mut c).unwrap();
             assert_eq!(auth.command(), &cmd);
             assert_eq!(auth.account(), ACCT);
         }
@@ -469,16 +505,16 @@ mod tests {
     #[test]
     fn an_authorization_carries_the_state_generation_of_the_market_it_was_issued_for() {
         let (btc, eth) = (InstrumentId::new(1), InstrumentId::new(2));
-        let (mut generations, mut seen) = (Generations::default(), Counters::default());
-        assert_eq!(generations.of(btc).get(), 0);
+        let mut c = Counts::default();
+        assert_eq!(c.generations.of(btc).get(), 0);
         // BTC's state changes twice, ETH's once: each market keeps its own count.
-        assert_eq!(generations.advance(btc).get(), 1);
-        assert_eq!(generations.advance(eth).get(), 1);
-        assert_eq!(generations.advance(btc).get(), 2);
+        assert_eq!(c.generations.advance(btc).get(), 1);
+        assert_eq!(c.generations.advance(eth).get(), 1);
+        assert_eq!(c.generations.advance(btc).get(), 2);
 
         for (market, generation) in [(btc, 2), (eth, 1)] {
             for cmd in order_commands(market) {
-                let auth = issue(cmd.clone(), &mut generations, &mut seen).unwrap();
+                let auth = issue(cmd.clone(), &mut c).unwrap();
                 assert_eq!(auth.market(), market, "{cmd:?}");
                 assert_eq!(auth.generation().get(), generation, "{cmd:?}");
                 assert_eq!(auth.check_at_submit(), Ok(()), "{cmd:?}");
@@ -488,33 +524,37 @@ mod tests {
         // One built before a state change keeps the generation it was built under, so the
         // check at submit can tell it is stale; one built after carries the new one.
         let place = || VenueCommand::Place(on(btc, placement(cid(), 100, 1)));
-        let before = issue(place(), &mut generations, &mut seen).unwrap();
-        let killed = generations.advance(btc);
-        let after = issue(place(), &mut generations, &mut seen).unwrap();
+        let before = issue(place(), &mut c).unwrap();
+        let killed = c.generations.advance(btc);
+        let after = issue(place(), &mut c).unwrap();
         assert_eq!(before.generation().get(), 2);
         assert_eq!((after.generation(), killed.get()), (killed, 3));
         assert!(before.generation() < after.generation());
         // ETH's generation did not move with BTC's.
-        assert_eq!(generations.of(eth).get(), 1);
+        assert_eq!(c.generations.of(eth).get(), 1);
     }
 
     #[test]
-    fn at_submit_a_place_batch_amend_or_cancel_all_built_before_a_state_change_is_refused() {
+    fn at_submit_a_place_batch_or_amend_built_before_a_state_change_is_refused() {
         let (btc, eth) = (InstrumentId::new(1), InstrumentId::new(2));
-        let (mut generations, mut seen) = (Generations::default(), Counters::default());
+        let mut c = Counts::default();
         let auths: Vec<Authorization> = order_commands(btc)
             .into_iter()
-            .map(|cmd| issue(cmd, &mut generations, &mut seen).unwrap())
+            .map(|cmd| issue(cmd, &mut c).unwrap())
             .collect();
         // Another market's change leaves them all standing.
-        generations.advance(eth);
+        c.generations.advance(eth);
         assert!(auths.iter().all(|a| a.check_at_submit().is_ok()));
 
-        generations.advance(btc);
+        // A change of state that leaves 0005's I7 inputs as they were (the kill switch, its
+        // lift) holds back no cancel and no instrument cancel-all (RB94-1).
+        c.generations.advance(btc);
         for auth in &auths {
             let checked = auth.check_at_submit();
             match auth.command() {
-                VenueCommand::Cancel(_) | VenueCommand::CancelMany(_) => {
+                VenueCommand::Cancel(_)
+                | VenueCommand::CancelMany(_)
+                | VenueCommand::CancelAll(_) => {
                     assert_eq!(checked, Ok(()), "{auth:?}");
                 }
                 _ => assert_eq!(
@@ -531,24 +571,47 @@ mod tests {
     }
 
     #[test]
+    fn at_submit_an_instrument_cancel_all_is_refused_once_its_exclusive_lease_hold_changed() {
+        let (btc, eth) = (InstrumentId::new(1), InstrumentId::new(2));
+        let mut c = Counts::default();
+        let auths: Vec<Authorization> = order_commands(btc)
+            .into_iter()
+            .map(|cmd| issue(cmd, &mut c).unwrap())
+            .collect();
+        c.lease.advance(eth);
+        assert!(auths.iter().all(|a| a.check_at_submit().is_ok()));
+        // Only the cancel-all depends on the exclusive lease (0005's I7).
+        c.lease.advance(btc);
+        for auth in &auths {
+            let checked = auth.check_at_submit();
+            match auth.command() {
+                VenueCommand::CancelAll(_) => assert_eq!(
+                    checked,
+                    Err(StaleAuthorization::ExclusiveLeaseChanged(btc)),
+                    "{auth:?}"
+                ),
+                _ => assert_eq!(checked, Ok(()), "{auth:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn at_submit_an_instrument_cancel_all_is_refused_once_an_order_not_ours_was_seen() {
         let (btc, eth) = (InstrumentId::new(1), InstrumentId::new(2));
-        let (mut generations, mut seen) = (Generations::default(), Counters::default());
+        let mut c = Counts::default();
         let cancel_all = issue(
             VenueCommand::CancelAll(CancelScope::Instrument(btc)),
-            &mut generations,
-            &mut seen,
+            &mut c,
         )
         .unwrap();
         let place = issue(
             VenueCommand::Place(on(btc, placement(cid(), 100, 1))),
-            &mut generations,
-            &mut seen,
+            &mut c,
         )
         .unwrap();
-        seen.advance(eth);
+        c.seen.advance(eth);
         assert_eq!(cancel_all.check_at_submit(), Ok(()));
-        seen.advance(btc);
+        c.seen.advance(btc);
         assert_eq!(
             cancel_all.check_at_submit(),
             Err(StaleAuthorization::ForeignSeen(btc))
@@ -561,19 +624,22 @@ mod tests {
     fn at_submit_a_command_that_needs_a_guard_and_carries_none_is_refused() {
         // Fail closed: every place, batch, amend and cancel-all this crate builds is guarded.
         let btc = InstrumentId::new(1);
-        let unguarded = |cmd| {
+        let with = |cmd, guard| {
             Authorization::issue(
                 ACCT,
-                PermittedCommand::for_test(cmd, Guard::default()),
+                PermittedCommand::for_test(cmd, guard),
                 StateGeneration(4),
             )
             .unwrap()
         };
         for cmd in order_commands(btc) {
-            let checked = unguarded(cmd.clone()).check_at_submit();
+            let checked = with(cmd.clone(), Guard::default()).check_at_submit();
             match cmd {
                 VenueCommand::Cancel(_) | VenueCommand::CancelMany(_) => {
                     assert_eq!(checked, Ok(()));
+                }
+                VenueCommand::CancelAll(_) => {
+                    assert_eq!(checked, Err(StaleAuthorization::ExclusiveLeaseChanged(btc)))
                 }
                 _ => assert_eq!(
                     checked,
@@ -586,23 +652,43 @@ mod tests {
                 ),
             }
         }
-        // A cancel-all guarded by the state but not by what is seen is refused too.
-        let mut generations = Generations::default();
-        let half = Authorization::issue(
-            ACCT,
-            PermittedCommand::for_test(
-                VenueCommand::CancelAll(CancelScope::Instrument(btc)),
-                Guard {
-                    state: Some(generations.watch(btc)),
-                    foreign: None,
-                },
-            ),
-            StateGeneration(0),
-        )
-        .unwrap();
+        // A cancel-all guarded by only one of I7's inputs, or by the state as a place is, is
+        // refused too; so is a place guarded as a cancel-all is.
+        let mut c = Counts::default();
+        let cancel_all = || VenueCommand::CancelAll(CancelScope::Instrument(btc));
+        let lease_only = Guard {
+            lease: Some(c.lease.watch(btc)),
+            ..Guard::default()
+        };
         assert_eq!(
-            half.check_at_submit(),
+            with(cancel_all(), lease_only).check_at_submit(),
             Err(StaleAuthorization::ForeignSeen(btc))
+        );
+        let seen_only = Guard {
+            foreign: Some(c.seen.watch(btc)),
+            ..Guard::default()
+        };
+        assert_eq!(
+            with(cancel_all(), seen_only).check_at_submit(),
+            Err(StaleAuthorization::ExclusiveLeaseChanged(btc))
+        );
+        let state_only = Guard::state(c.generations.watch(btc));
+        assert_eq!(
+            with(cancel_all(), state_only).check_at_submit(),
+            Err(StaleAuthorization::ExclusiveLeaseChanged(btc))
+        );
+        let exclusive = Guard::exclusive(c.lease.watch(btc), c.seen.watch(btc));
+        assert_eq!(
+            with(
+                VenueCommand::Place(on(btc, placement(cid(), 100, 1))),
+                exclusive
+            )
+            .check_at_submit(),
+            Err(StaleAuthorization::StateChanged {
+                market: btc,
+                built: StateGeneration(4),
+                now: StateGeneration(4),
+            })
         );
     }
 
@@ -621,6 +707,10 @@ mod tests {
         assert_eq!(
             StaleAuthorization::ForeignSeen(btc).to_string(),
             "an order not ours was seen on market 1 since the cancel-all was built"
+        );
+        assert_eq!(
+            StaleAuthorization::ExclusiveLeaseChanged(btc).to_string(),
+            "the exclusive lease on market 1 was dropped, taken again or uncovered since the cancel-all was built"
         );
         for (refusal, text) in [
             (
@@ -646,9 +736,9 @@ mod tests {
 
     #[test]
     fn no_authorization_for_a_command_that_names_no_single_market_or_affects_no_order() {
-        let (mut generations, mut seen) = (Generations::default(), Counters::default());
+        let mut c = Counts::default();
         let (btc, eth) = (InstrumentId::new(1), InstrumentId::new(2));
-        let mut refused = |cmd| issue(cmd, &mut generations, &mut seen).unwrap_err();
+        let mut refused = |cmd| issue(cmd, &mut c).unwrap_err();
         // No record admits an account cancel-all (0005's I7 admits only the instrument one).
         assert_eq!(
             refused(VenueCommand::CancelAll(CancelScope::Account)),
