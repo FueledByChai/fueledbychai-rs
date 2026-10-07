@@ -293,6 +293,18 @@ fn help_documents_every_argument() {
     ] {
         assert!(USAGE.contains(flag), "--help does not document {flag}");
     }
+    // Every kind of line md_watch prints, the --top level rows and the stop's CLOSED included.
+    for line in [
+        "TOUCH <venue>",
+        "BOOK <venue>",
+        "<rank> bid <px> x <size> | ask <px> x <size>",
+        "TRADE <venue>",
+        "HEALTH <venue>",
+        "RECONNECT <venue> conn <n> epoch <e> ended",
+        "CLOSED <venue> conn <n> epoch <e> ended",
+    ] {
+        assert!(USAGE.contains(line), "--help does not document {line}");
+    }
     assert!(USAGE.contains("never sends an order and never reads a credential"));
 }
 
@@ -378,10 +390,97 @@ fn the_command_line_is_parsed_with_defaults_and_refused_with_a_reason() {
             &["--paradex", "X", "--key", "k"][..],
             "unknown argument --key",
         ),
+        // RB98-1: Binance's frames name the symbol in capitals, so a lowercase one would
+        // subscribe and then have every frame refused unseen.
+        (
+            &["--binance", "btcusdt"][..],
+            "--binance btcusdt: not a market as the venue spells it",
+        ),
+        (
+            &["--paradex", "BTC-USD-PERP "][..],
+            "not a market as the venue spells it",
+        ),
+        (
+            &["--paradex", "BTC_USD_PERP"][..],
+            "not a market as the venue spells it",
+        ),
+        // A flag where a value belongs: the value was left out.
+        (&["--binance", "--top", "2"][..], "--binance needs a value"),
+        (
+            &["--paradex", "X", "--paradex-url", "--seconds", "5"][..],
+            "--paradex-url needs a value",
+        ),
     ] {
         let err = args::parse(strings(args)).unwrap_err();
         assert!(err.contains(why), "{args:?}: {err}");
     }
+}
+
+/// Standard output as `| head` leaves it: the first line is taken, then the reader is gone and
+/// every write fails with a broken pipe.
+struct ClosedAfterFirstLine {
+    taken: Rc<RefCell<Vec<u8>>>,
+}
+
+impl std::io::Write for ClosedAfterFirstLine {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut taken = self.taken.borrow_mut();
+        if taken.contains(&b'\n') {
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
+        taken.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// RB98-4: `md_watch ... | head` ends. Run with no stop of its own, md_watch prints its header,
+/// and the first line the venue's frames call for fails to write: md_watch stops, closing the
+/// connection, instead of watching forever with nowhere to print.
+#[tokio::test]
+async fn md_watch_stops_once_standard_output_is_closed() {
+    let mut steps = vec![Step::Accept];
+    steps.extend((0..3).map(|_| Step::Read { conn: 0 }));
+    steps.extend((1..=3).map(|id| Step::Push {
+        conn: 0,
+        frame: Frame::text(format!(r#"{{"jsonrpc":"2.0","result":{{}},"id":{id}}}"#)),
+    }));
+    steps.push(Step::Push {
+        conn: 0,
+        frame: sbe("bbo.sbe.txt"),
+    });
+    let paradex = StubServer::start(WsScript::new(steps), HttpRoutes::new())
+        .await
+        .unwrap();
+    let parsed = args::parse(strings(&[
+        "--paradex",
+        "BTC-USD-PERP",
+        "--paradex-url",
+        &paradex.ws_url("/v1"),
+    ]))
+    .unwrap();
+    let Parsed::Watch(opts) = parsed else {
+        panic!("not a watch: {parsed:?}")
+    };
+    let taken = Rc::new(RefCell::new(Vec::new()));
+    let out: watch::Out = Rc::new(RefCell::new(ClosedAfterFirstLine {
+        taken: taken.clone(),
+    }));
+    let run = watch::run(&opts, out, false, std::future::pending());
+    let Ok(ran) = tokio::time::timeout(Duration::from_secs(60), run).await else {
+        panic!("md_watch kept running for 60 s after its standard output closed")
+    };
+    ran.unwrap();
+    paradex.finished().await.unwrap();
+    assert_eq!(
+        String::from_utf8(taken.borrow().clone()).unwrap(),
+        "md_watch: paradex BTC-USD-PERP (bbo, trades, deltas book); market data only, no order \
+         is ever sent\n"
+    );
+    assert_eq!(paradex.connections().len(), 1);
 }
 
 #[test]

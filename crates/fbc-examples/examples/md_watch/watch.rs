@@ -30,11 +30,30 @@ use fbc_venue_paradex::ParadexFactory;
 use fbc_venue_paradex::factory::MD_URL;
 use fbc_venue_paradex::md::{BBO, DELTAS};
 use rust_decimal::Decimal;
+use tokio::sync::Notify;
 
 use crate::args::{Market, Options};
 
 /// Where the lines go: standard output when run, a buffer under test.
 pub type Out = Rc<RefCell<dyn Write>>;
+
+/// The lines' destination and what ends md_watch when it is closed: the first write that fails
+/// (standard output closed, as `md_watch ... | head` closes it) wakes the stop, since nothing
+/// md_watch prints after that is seen.
+#[derive(Clone)]
+struct Sink {
+    out: Out,
+    closed: Rc<Notify>,
+}
+
+impl Sink {
+    fn write_line(&self, line: std::fmt::Arguments<'_>) {
+        if writeln!(self.out.borrow_mut(), "{line}").is_err() {
+            // A permit is kept if the stop is not waiting yet, so no failure is missed.
+            self.closed.notify_one();
+        }
+    }
+}
 
 /// The Paradex market's and the Binance symbol's instrument ids; each venue has its own spec
 /// table, and the ids differ so a line can never be printed under the wrong one.
@@ -58,12 +77,20 @@ fn pacing() -> ReconnectPacing {
     .expect("valid pacing")
 }
 
-/// A stream that hears nothing, the venues' pings included, for 90 s is reported stale and
-/// reconnected: longer than Paradex's 55-second server ping. A connection rotates 5 minutes
-/// before a venue's declared lifetime (Binance's 24 hours; Paradex declares none).
-fn liveness() -> Liveness {
-    Liveness::new(Duration::from_secs(90), Duration::from_secs(300)).expect("valid liveness")
+/// A stream that hears nothing, the venue's pings included, for longer than `silence` is
+/// reported stale and reconnected. A connection rotates 5 minutes before a venue's declared
+/// lifetime (Binance's 24 hours; Paradex declares none).
+fn liveness(silence: Duration) -> Liveness {
+    Liveness::new(silence, Duration::from_secs(300)).expect("valid liveness")
 }
+
+/// Paradex's server pings every 55 s, so 90 s of silence means the stream is dead.
+const PARADEX_SILENCE: Duration = Duration::from_secs(90);
+
+/// Binance's server pings only every 3 minutes, and a quiet symbol can send nothing else for
+/// that long, so its window is longer than 3 minutes: a shorter one would reconnect a quiet
+/// symbol, and re-ask its diff-depth snapshot, over and over.
+const BINANCE_SILENCE: Duration = Duration::from_secs(200);
 
 /// A write the venue stops reading ends its connection after 10 s; md_watch writes only
 /// subscriptions.
@@ -181,7 +208,7 @@ pub struct Watcher {
     /// The book text printed last; an update that leaves it unchanged prints nothing.
     shown: Option<String>,
     stopping: Rc<Cell<bool>>,
-    out: Out,
+    out: Sink,
 }
 
 impl Watcher {
@@ -190,7 +217,7 @@ impl Watcher {
         opts: &Options,
         stamps: bool,
         stopping: Rc<Cell<bool>>,
-        out: Out,
+        out: Sink,
     ) -> Watcher {
         let trading = TradingBooks::new([(labels.inst, labels.book)]).expect("one book");
         Watcher {
@@ -206,13 +233,11 @@ impl Watcher {
     }
 
     fn print(&self, at: WallNs, line: &str) {
-        let mut out = self.out.borrow_mut();
-        // A closed standard output ends nothing: md_watch keeps no state worth stopping for.
-        let _ = if self.stamps {
-            writeln!(out, "{} {line}", clock(at))
+        if self.stamps {
+            self.out.write_line(format_args!("{} {line}", clock(at)));
         } else {
-            writeln!(out, "{line}")
-        };
+            self.out.write_line(format_args!("{line}"));
+        }
     }
 
     /// `KIND venue market` and the rest of a line.
@@ -419,6 +444,7 @@ struct Plan {
     specs: SpecTable,
     subs: Vec<Subscription>,
     conns: Range<u16>,
+    silence: Duration,
     labels: Labels,
 }
 
@@ -428,7 +454,7 @@ struct Shard<'a> {
     connector: Connector,
     stamps: bool,
     stopping: Rc<Cell<bool>>,
-    out: Out,
+    out: Sink,
 }
 
 impl Shard<'_> {
@@ -447,7 +473,7 @@ impl Shard<'_> {
             http_max_body: HTTP_MAX_BODY,
             conns: plan.conns,
             limiter,
-            liveness: liveness(),
+            liveness: liveness(plan.silence),
             write_stall: write_stall(),
         };
         let watcher = Watcher::new(
@@ -483,6 +509,7 @@ impl Shard<'_> {
                 sub(Feed::Book(DELTAS)),
             ],
             conns: PARADEX_CONNS,
+            silence: PARADEX_SILENCE,
             labels: Labels {
                 venue: "paradex",
                 symbol: market.symbol.clone(),
@@ -514,6 +541,7 @@ impl Shard<'_> {
                 sub(Feed::Book(BOOK_DIFF)),
             ],
             conns: BINANCE_CONNS,
+            silence: BINANCE_SILENCE,
             labels: Labels {
                 venue: "binance",
                 symbol: market.symbol.clone(),
@@ -538,13 +566,18 @@ async fn drive(wired: Option<&mut Wired>) -> Result<(), String> {
 }
 
 /// Watches the markets `opts` names, printing to `out` (each line led by its UTC time when
-/// `stamps`), until `stop` completes or a venue's sessions fail; a failure is returned as text.
+/// `stamps`), until `stop` completes, a write to `out` fails or a venue's sessions fail; a
+/// failure of the sessions is returned as text.
 pub async fn run(
     opts: &Options,
     out: Out,
     stamps: bool,
     stop: impl Future<Output = ()>,
 ) -> Result<(), String> {
+    let out = Sink {
+        out,
+        closed: Rc::new(Notify::new()),
+    };
     let shard = Shard {
         opts,
         clock: IngestClock::new(),
@@ -581,19 +614,22 @@ pub async fn run(
             m.symbol
         ));
     }
-    let _ = writeln!(
-        out.borrow_mut(),
+    out.write_line(format_args!(
         "md_watch: {}; market data only, no order is ever sent",
         watching.join(", ")
-    );
+    ));
     let watchers: Vec<_> = paradex
         .iter()
         .chain(&binance)
         .map(|w| w.watcher.clone())
         .collect();
     let stopping = shard.stopping.clone();
+    let closed = out.closed.clone();
     let stopper = async move {
-        stop.await;
+        tokio::select! {
+            () = stop => {}
+            () = closed.notified() => {}
+        }
         stopping.set(true);
         drop(controls);
         Ok::<(), String>(())
