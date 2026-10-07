@@ -359,8 +359,14 @@ fn the_plan_comes_out_cancels_then_reducing_orders_then_amends_then_adds() {
         other => panic!("expected a place, got {other:?}"),
     }
     // The planner holds the new orders at their levels.
-    assert_eq!(p.order_at(INST, Side::Sell, 0), Some(plan.commands[1].cid));
-    assert_eq!(p.order_at(INST, Side::Buy, 2), Some(plan.commands[4].cid));
+    assert_eq!(
+        p.order_at(ACCT, INST, Side::Sell, 0),
+        Some(plan.commands[1].cid)
+    );
+    assert_eq!(
+        p.order_at(ACCT, INST, Side::Buy, 2),
+        Some(plan.commands[4].cid)
+    );
 }
 
 #[test]
@@ -477,7 +483,7 @@ fn a_change_the_venue_cannot_amend_is_a_cancel_then_a_place_once_the_old_order_i
             }
             other => panic!("{name}: expected a place, got {other:?}"),
         }
-        assert_eq!(p.order_at(INST, Side::Buy, 0), Some(new), "{name}");
+        assert_eq!(p.order_at(ACCT, INST, Side::Buy, 0), Some(new), "{name}");
         assert_eq!(reg.resting_on(INST, Side::Buy), Some(moved.qty), "{name}");
     }
 }
@@ -649,7 +655,7 @@ fn nothing_is_placed_at_a_level_whose_order_is_pending_new_or_unknown_until_it_i
                 vec![(Side::Buy, 0, HeldReason::Unsettled(OrdState::Unknown))]
             );
         }
-        assert_eq!(p.order_at(INST, Side::Buy, 0), Some(c));
+        assert_eq!(p.order_at(ACCT, INST, Side::Buy, 0), Some(c));
         // Terminal (the venue ended it): the level is free and the quote is placed.
         cancelled(&mut reg, c, Side::Buy, "v-pending", 10);
         let plan = p.plan(&moved, &mut reg, &amending(), ACCT, &mut mint, LATER);
@@ -750,7 +756,7 @@ fn a_level_no_longer_wanted_is_cancelled_once_and_its_order_awaits_its_acknowled
             .commands
             .is_empty()
     );
-    assert_eq!(p.order_at(INST, Side::Buy, 0), None);
+    assert_eq!(p.order_at(ACCT, INST, Side::Buy, 0), None);
 }
 
 /// Reviewer A RA103-1, Reviewer B RB-0j3-1 (PR #103): a level pulled before its order's
@@ -931,8 +937,8 @@ fn a_market_in_exit_has_its_order_on_the_side_that_adds_to_the_position_cancelle
         let mut mint = mint();
         let mut p = planner();
         open_book(&mut p, &quoted, &mut reg, &amending(), &mut mint);
-        let bid = p.order_at(INST, Side::Buy, 0).unwrap();
-        let ask = p.order_at(INST, Side::Sell, 0).unwrap();
+        let bid = p.order_at(ACCT, INST, Side::Buy, 0).unwrap();
+        let ask = p.order_at(ACCT, INST, Side::Sell, 0).unwrap();
         flatten(&mut reg);
         let plan = plan_and_send(&mut p, desired, &mut reg, &amending(), &mut mint, LATER);
         assert_eq!(shape(&plan), vec![(Stage::Cancel, "cancel", Side::Buy, 0)]);
@@ -959,8 +965,8 @@ fn a_market_in_exit_has_its_order_on_the_side_that_adds_to_the_position_cancelle
                 )))
             )]
         );
-        assert_eq!(p.order_at(INST, Side::Buy, 0), None);
-        assert_eq!(p.order_at(INST, Side::Sell, 0), Some(ask));
+        assert_eq!(p.order_at(ACCT, INST, Side::Buy, 0), None);
+        assert_eq!(p.order_at(ACCT, INST, Side::Sell, 0), Some(ask));
         assert_eq!(reg.get(ask).unwrap().state(), OrdState::Open);
     }
 }
@@ -1165,4 +1171,106 @@ fn a_desired_book_sets_and_removes_quotes_by_side_and_level() {
     assert_eq!(b.quote(Side::Sell, 3), Some(&quote(10_010, 2)));
     b.remove(Side::Buy, 0);
     assert_eq!(b.quote(Side::Buy, 0), None);
+}
+
+/// Places `desired` for the account `acct` at `MonoNs(0)` and acknowledges each order placed,
+/// as [`open_book`] does for `ACCT`.
+fn open_book_for(
+    planner: &mut ExecutionPlanner,
+    desired: &DesiredBook,
+    reg: &mut Registry,
+    acct: AccountKey,
+    mint: &mut CidMint,
+) -> Vec<ClientOrderId> {
+    let plan = planner.plan(desired, reg, &amending(), acct, mint, MonoNs(0));
+    assert!(refused(&plan).is_empty());
+    plan.commands
+        .iter()
+        .map(|p| {
+            assert!(matches!(p.auth.command(), VenueCommand::Place(_)));
+            assert_eq!(p.auth.account(), acct);
+            ack(reg, p.cid, &venue_id(p.side, p.level));
+            p.cid
+        })
+        .collect()
+}
+
+#[test]
+fn one_planner_keeps_each_accounts_orders_on_the_same_market() {
+    // Codex's P1 on PR #103 (FBC-0qgb): one planner plans account A, then account B, each
+    // through its own registry, on the same market, then A again. B's pass never drops A's
+    // orders: A's are still diffed (nothing placed again at their levels), a pulled level
+    // cancels A's order there, and Exit cancels A's adding orders; B's are untouched.
+    const OTHER: AccountKey = AccountKey::new(7);
+    let mut a = quoting(WIDE, 0);
+    let mut b = quoting(WIDE, 0);
+    let (mut mint_a, mut mint_b) = (mint(), mint());
+    let mut p = planner();
+    let quoted = book()
+        .with(Side::Buy, 0, quote(10_000, 5))
+        .with(Side::Sell, 0, quote(10_010, 5));
+    let ours = open_book_for(&mut p, &quoted, &mut a, ACCT, &mut mint_a);
+    let theirs = open_book_for(&mut p, &quoted, &mut b, OTHER, &mut mint_b);
+    assert_eq!((ours.len(), theirs.len()), (2, 2));
+    let (bid, ask) = (ours[0], ours[1]);
+
+    // A again, the same book: its orders are still the planner's, so nothing is built.
+    let plan = plan_and_send(&mut p, &quoted, &mut a, &amending(), &mut mint_a, LATER);
+    assert!(plan.commands.is_empty(), "{:?}", shape(&plan));
+    assert!(held(&plan).is_empty() && refused(&plan).is_empty());
+    assert_eq!(a.resting_on(INST, Side::Buy), Some(lots(5)));
+
+    // B again: its orders too.
+    let plan = p.plan(&quoted, &mut b, &amending(), OTHER, &mut mint_b, LATER);
+    assert!(plan.commands.is_empty());
+
+    // A's bid level pulled: A's bid is cancelled.
+    let pulled = book().with(Side::Sell, 0, quote(10_010, 5));
+    let plan = plan_and_send(&mut p, &pulled, &mut a, &amending(), &mut mint_a, LATER);
+    assert_eq!(shape(&plan), vec![(Stage::Cancel, "cancel", Side::Buy, 0)]);
+    assert_eq!(plan.commands[0].cid, bid);
+    cancelled(&mut a, bid, Side::Buy, &venue_id(Side::Buy, 0), 10);
+
+    // B in between, then Exit on A (flat, so its ask adds): A's ask is cancelled.
+    let plan = p.plan(&quoted, &mut b, &amending(), OTHER, &mut mint_b, LATER);
+    assert!(plan.commands.is_empty());
+    flatten(&mut a);
+    let plan = plan_and_send(&mut p, &pulled, &mut a, &amending(), &mut mint_a, LATER);
+    assert_eq!(shape(&plan), vec![(Stage::Cancel, "cancel", Side::Sell, 0)]);
+    assert_eq!(plan.commands[0].cid, ask);
+
+    // B's orders were never touched.
+    for c in theirs {
+        assert_eq!(b.get(c).unwrap().state(), OrdState::Open);
+    }
+}
+
+#[test]
+fn a_planner_refuses_a_registry_that_does_not_hold_its_orders() {
+    // The same account's book planned through a second registry (rebuilt, say), which does not
+    // hold the orders the planner placed through the first: the pass builds nothing and
+    // reports each such level, rather than taking the levels for free and placing over orders
+    // that still rest. The first registry is planned as before.
+    let mut first = quoting(WIDE, 0);
+    let mut second = quoting(WIDE, 0);
+    let mut mint = mint();
+    let mut p = planner();
+    let quoted = book()
+        .with(Side::Buy, 0, quote(10_000, 5))
+        .with(Side::Sell, 0, quote(10_010, 5));
+    let ours = open_book_for(&mut p, &quoted, &mut first, ACCT, &mut mint);
+    let plan = p.plan(&quoted, &mut second, &amending(), ACCT, &mut mint, LATER);
+    assert!(plan.commands.is_empty(), "{:?}", shape(&plan));
+    assert_eq!(
+        refused(&plan),
+        vec![
+            (Side::Buy, 0, PlanRefusal::NotInRegistry(ours[0])),
+            (Side::Sell, 0, PlanRefusal::NotInRegistry(ours[1])),
+        ]
+    );
+    assert_eq!(second.resting_on(INST, Side::Buy), Some(Lots::ZERO));
+    // The first registry: its orders are still the planner's.
+    let plan = plan_and_send(&mut p, &quoted, &mut first, &amending(), &mut mint, LATER);
+    assert!(plan.commands.is_empty());
+    assert_eq!(p.order_at(ACCT, INST, Side::Buy, 0), Some(ours[0]));
 }

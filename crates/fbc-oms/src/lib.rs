@@ -154,12 +154,13 @@
 //! was seen on the market), never for the kill switch alone; and a cancel or a cancel-many
 //! always goes through.
 //!
-//! The execution planner (decision 0005's one planner, decision 0065; `tests/planner.rs`):
-//! the consumer's [`DesiredBook`], a [`DesiredQuote`] per side and level, defined here so
-//! strategy code produces it and this crate depends on no strategy (0001). The
-//! [`ExecutionPlanner`] diffs it against the orders it placed, per side and level, under the
-//! consumer's [`PlannerConfig`] (price and quantity replace thresholds and a minimum age, no
-//! default), and builds what closes the difference, each command through the one pre-trade
+//! The execution planner (decision 0005's one planner, decisions 0065 and 0068;
+//! `tests/planner.rs`): the consumer's [`DesiredBook`], a [`DesiredQuote`] per side and level,
+//! defined here so strategy code produces it and this crate depends on no strategy (0001). The
+//! [`ExecutionPlanner`] diffs it against the orders it placed for the account (each account's
+//! apart; nothing is built through a registry that does not hold them), per side and level,
+//! under the consumer's [`PlannerConfig`] (price and quantity replace thresholds and a minimum
+//! age, no default), and builds what closes the difference, each command through the one pre-trade
 //! path and the permits above and leaving as an [`Authorization`]: cancels, then reducing
 //! orders, then amends, then adds ([`Stage`]). A change is an amend where the venue's
 //! [`OrderCaps`](fbc_core::OrderCaps) admit it, otherwise a cancel, the level then waiting
