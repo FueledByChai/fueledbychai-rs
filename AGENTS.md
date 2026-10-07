@@ -349,11 +349,14 @@ rather than guess.
     answers decoded whole into the `Resync*` events and a `QueryResult` (`src/exec/rest.rs`, held
     to the hand-built `rest-*.json` responses in `fixtures/paradex/exec/`); the read-only
     private-stream codec, an `ExecCodec` that logs in, authenticates its socket, subscribes the
-    private channels once per connection, decodes them and refuses every command
-    (`src/exec/read_only.rs`, 0061); its order-entry commands encoded as the socket's signed
-    JSON-RPC frames (`order.create`, `order.create_batch`, `order.modify`, `order.cancel`,
-    `order.cancel_batch`, `order.cancel_all`, `order.cancel_on_disconnect`) from the command and
-    `EncodeCtx` only (`src/exec/encode.rs`, `ParadexEncoder`, for FBC-xvf's codec); and, in
+    private channels once per connection, decodes them, resyncs over REST with the token in a
+    redacted header and refuses every command (`src/exec/read_only.rs`, 0061, 0071); its
+    order-entry commands encoded as the socket's signed JSON-RPC frames (`order.create`,
+    `order.create_batch`, `order.modify`, `order.cancel`, `order.cancel_batch`,
+    `order.cancel_all`, `order.cancel_on_disconnect`) from the command and `EncodeCtx` only
+    (`src/exec/encode.rs`, `ParadexEncoder`); the order-entry codec, `ParadexExec`, which puts
+    the read-only codec's connection, the encoder, the replies (`src/exec/reply.rs`, 0069), the
+    resync and the order query together on one connection (`src/exec/codec.rs`, 0071); and, in
     `tests/oracle/` with `fbc-book` as a dev-dependency only, the
     BT-401 book and bbo-touch agreement checks), later `crates/venues/fbc-venue-hibachi`
     (0016).

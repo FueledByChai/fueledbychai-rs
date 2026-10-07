@@ -35,10 +35,18 @@
 //! - **Nothing order-affecting.** Every frame the codec writes is one of the two methods of
 //!   [`ReadMethod`], which has no variant for an order; `encode` refuses every command
 //!   `NotSent(Unsupported)` with no effect, and no call asks for a nonce.
-//! - **Not built here.** `resync` asks for nothing: the REST resync with the token in a
-//!   redacted header is the full codec's (FBC-xvf). No client ping is sent: Paradex pings every
-//!   55 seconds and the WebSocket layer answers, and an order-entry codec cannot ask the runtime
-//!   for a WebSocket ping (0056); a configured client ping is FBC-jkly's.
+//! - **The resync.** `resync` reads the open orders and positions over REST (FBC-0sc's
+//!   [`resync_requests`]), each read carrying the current token in a redacted header
+//!   ([`SessionToken::header`]) and none elsewhere, under tags of their own for that resync, so
+//!   an answer to an earlier resync is never paired with a later one. The two answers decode
+//!   whole into the resync events at the watermark `ctx.wall` ([`decode_resync`]) once both
+//!   are in; a read that fails, is answered with an error status or does not decode pushes
+//!   nothing and asks for the connection again, so the epoch ends rather than waiting on a
+//!   resync that will never end (FBC-xvf, decision 0071). A read-only session thus seeds
+//!   positions as the order-entry codec does.
+//! - **Not built here.** No client ping is sent: Paradex pings every 55 seconds and the
+//!   WebSocket layer answers, and an order-entry codec cannot ask the runtime for a WebSocket
+//!   ping (0056); a configured client ping is FBC-jkly's.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -49,16 +57,17 @@ use fbc_core::{
     ExecCodec, ExecEvent, ExecSink, HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans,
     NotSentReason, OpKind, PathStamps, RateCharge, RawFrame, Reject, RejectKind, RpcId, Secrets,
     SpecTable, StreamId, SubmitOutcome, TimerTag, TrafficClass, VenueCommand, VenueConfig,
-    VenueError, VenueMeta, WireSlice,
+    VenueError, VenueMeta, WallNs, WireSlice,
 };
 use serde_json::{Value, json};
 
-use crate::auth::{Login, LoginCycle, token_spans};
+use crate::auth::{Login, LoginCycle, REST_URL, SessionToken, TIMEOUT, token_spans};
 use crate::md::sbe::Message;
 
 use super::{
-    TEMPLATE_ACCOUNT, TEMPLATE_FILL, TEMPLATE_ORDER, TEMPLATE_POSITION, decode_account_event,
-    decode_fill_event, decode_order_event, decode_position_event,
+    ResyncTags, TEMPLATE_ACCOUNT, TEMPLATE_FILL, TEMPLATE_ORDER, TEMPLATE_POSITION,
+    decode_account_event, decode_fill_event, decode_order_event, decode_position_event,
+    decode_resync, resync_requests,
 };
 
 /// The tag of every login this codec asks for.
@@ -93,7 +102,23 @@ struct Conn {
     auth_sent: bool,
     /// The subscribe requests sent on it and not yet answered, by JSON-RPC id.
     subscribing: BTreeMap<u64, &'static str>,
+    /// Whether the venue acknowledged its auth frame.
+    authenticated: bool,
 }
+
+/// A resync asked for and not yet decoded: its two reads' tags, its watermark, and the answers
+/// in so far.
+#[derive(Debug)]
+struct Resync {
+    tags: ResyncTags,
+    watermark: WallNs,
+    orders: Option<Vec<u8>>,
+    positions: Option<Vec<u8>>,
+}
+
+/// The first tag a resync's or a query's read is given: [`LOGIN_REQUEST`] is the only one
+/// below it.
+const FIRST_READ_TAG: u64 = 2;
 
 /// Paradex's read-only private-stream codec (module documentation). Its `Debug` shows no
 /// account, key or token.
@@ -106,6 +131,12 @@ pub struct ReadOnlyExec {
     /// that gave one, cleared by a refresh that gave none and by a refused auth frame.
     reuse: bool,
     next_id: u64,
+    /// The REST base (no trailing slash) and how long a read waits, as the login's.
+    rest: String,
+    timeout: Duration,
+    /// The resync in flight, if any.
+    resync: Option<Resync>,
+    next_tag: u64,
 }
 
 impl fmt::Debug for ReadOnlyExec {
@@ -114,6 +145,7 @@ impl fmt::Debug for ReadOnlyExec {
             .field("refresh", &self.refresh)
             .field("conn", &self.conn)
             .field("reuse", &self.reuse)
+            .field("resync", &self.resync.as_ref().map(|r| r.tags))
             .finish_non_exhaustive()
     }
 }
@@ -123,15 +155,55 @@ impl ReadOnlyExec {
     /// chain id, signature lifetime, refresh interval and request timeout). Refused naming a
     /// missing or invalid key, never a value.
     pub fn new(cfg: &VenueConfig, creds: Secrets) -> Result<ReadOnlyExec, VenueError> {
+        ReadOnlyExec::with_first_id(cfg, creds, 1)
+    }
+
+    /// The codec, its JSON-RPC ids counted up from `first_id`: the order-entry codec keeps
+    /// them apart from its requests' ids ([`CONTROL_IDS`](super::CONTROL_IDS)).
+    pub(super) fn with_first_id(
+        cfg: &VenueConfig,
+        creds: Secrets,
+        first_id: u64,
+    ) -> Result<ReadOnlyExec, VenueError> {
         let login = Login::new(cfg, creds)?;
         let refresh = login.refresh_interval();
+        let (rest, timeout) = rest_reads(cfg);
         Ok(ReadOnlyExec {
             cycle: LoginCycle::new(login, LOGIN_REQUEST, REFRESH_TIMER),
             refresh,
             conn: None,
             reuse: false,
-            next_id: 1,
+            next_id: first_id,
+            rest,
+            timeout,
+            resync: None,
+            next_tag: FIRST_READ_TAG,
         })
+    }
+
+    /// The stream of the open connection once the venue acknowledged its auth frame.
+    pub(super) fn authenticated(&self) -> Option<StreamId> {
+        self.conn
+            .as_ref()
+            .filter(|c| c.authenticated)
+            .map(|c| c.stream)
+    }
+
+    /// The token the latest login gave, which every REST read carries.
+    pub(super) fn token(&self) -> Option<&SessionToken> {
+        self.cycle.token()
+    }
+
+    /// The REST base, no trailing slash, and how long a read waits for its answer.
+    pub(super) fn rest(&self) -> (&str, Duration) {
+        (&self.rest, self.timeout)
+    }
+
+    /// A tag no read of this codec had before: never [`LOGIN_REQUEST`], never repeated.
+    pub(super) fn read_tag(&mut self) -> HttpTag {
+        let tag = HttpTag(self.next_tag);
+        self.next_tag += 1;
+        tag
     }
 
     /// The next JSON-RPC id: never repeated over the codec's life, so a reply names one request.
@@ -212,7 +284,7 @@ impl ReadOnlyExec {
     }
 
     /// A JSON-RPC reply: the auth frame's, or a subscribe's.
-    fn on_text(
+    pub(super) fn on_text(
         &mut self,
         text: &str,
         sink: &mut dyn ExecSink,
@@ -239,6 +311,7 @@ impl ReadOnlyExec {
             conn.auth = None;
             match refusal {
                 None => {
+                    conn.authenticated = true;
                     let (stream, state) = (conn.stream, ConnState::Authenticated);
                     sink.push(VenueMeta::NONE, ExecEvent::Conn { stream, state });
                     for channel in PRIVATE_CHANNELS {
@@ -274,6 +347,104 @@ fn reject(error: &Value) -> Result<Reject, DecodeError> {
     })
 }
 
+/// The REST base, without a trailing slash, and the read timeout, from the keys
+/// [`Login::new`] has already accepted (an `https://` base and a positive whole `<n>s` or
+/// `<n>ms`), so neither is refused here.
+fn rest_reads(cfg: &VenueConfig) -> (String, Duration) {
+    let rest = cfg.get(REST_URL).unwrap_or_default();
+    let text = cfg.get(TIMEOUT).unwrap_or_default();
+    let timeout = match text.strip_suffix("ms") {
+        Some(ms) => Duration::from_millis(ms.parse().unwrap_or_default()),
+        None => Duration::from_secs(text.trim_end_matches('s').parse().unwrap_or_default()),
+    };
+    (rest.trim_end_matches('/').to_owned(), timeout)
+}
+
+impl ReadOnlyExec {
+    /// Asks for the resync's two reads, each with the current token in a redacted header,
+    /// under tags of their own; `ctx.wall` is its watermark. With no token, or a connection
+    /// gone, nothing is read and the connection is asked for again.
+    fn start_resync(&mut self, ctx: &EncodeCtx, fx: &mut Effects) {
+        self.resync = None;
+        let Some(header) = self.token().map(SessionToken::header) else {
+            self.drop_resync("no Paradex token for the resync", fx);
+            return;
+        };
+        let tags = ResyncTags {
+            orders: self.read_tag(),
+            positions: self.read_tag(),
+        };
+        for effect in resync_requests(&self.rest, &[header], self.timeout, tags).take() {
+            fx.push(effect);
+        }
+        self.resync = Some(Resync {
+            tags,
+            watermark: ctx.wall,
+            orders: None,
+            positions: None,
+        });
+    }
+
+    /// Ends the resync in flight with nothing pushed, and asks for the open connection again
+    /// with a fresh login, so the epoch ends instead of waiting on a resync that never ends.
+    fn drop_resync(&mut self, reason: &'static str, fx: &mut Effects) {
+        self.resync = None;
+        self.reuse = false;
+        if let Some(stream) = self.conn.as_ref().map(|c| c.stream) {
+            fx.push(Effect::Reconnect { stream, reason });
+        }
+    }
+
+    /// Whether `tag` is a read of the resync in flight.
+    fn resync_read(&self, tag: HttpTag) -> bool {
+        self.resync
+            .as_ref()
+            .is_some_and(|r| r.tags.orders == tag || r.tags.positions == tag)
+    }
+
+    /// One of the resync's two answers: held until the other is in, then both decoded whole
+    /// and pushed. A failed, refused or undecodable read drops the resync ([`drop_resync`]).
+    ///
+    /// [`drop_resync`]: ReadOnlyExec::drop_resync
+    fn on_resync_answer(
+        &mut self,
+        tag: HttpTag,
+        resp: Result<HttpResponse<'_>, HttpFailure>,
+        scope: &DecodeScope<'_>,
+        specs: &SpecTable,
+        sink: &mut dyn ExecSink,
+        fx: &mut Effects,
+    ) -> Result<(), DecodeError> {
+        let body = match resp {
+            Ok(resp) if (200..300).contains(&resp.status) => resp.body.to_vec(),
+            _ => {
+                self.drop_resync("a Paradex resync read failed", fx);
+                return Ok(());
+            }
+        };
+        let resync = self.resync.as_mut().expect("checked by resync_read");
+        if tag == resync.tags.orders {
+            resync.orders = Some(body);
+        } else {
+            resync.positions = Some(body);
+        }
+        let (Some(orders), Some(positions)) = (&resync.orders, &resync.positions) else {
+            return Ok(());
+        };
+        match decode_resync(resync.watermark, orders, positions, scope, specs) {
+            Ok(answer) => {
+                self.resync = None;
+                answer.push_into(sink);
+                Ok(())
+            }
+            Err(err) => {
+                self.drop_resync("a Paradex resync answer did not decode", fx);
+                Err(err)
+            }
+        }
+    }
+}
+
 impl ExecCodec for ReadOnlyExec {
     /// None: the login signs a timestamp, not a nonce, and nothing else is signed.
     fn nonces_for(&self, _call: CtxCall) -> u16 {
@@ -282,13 +453,17 @@ impl ExecCodec for ReadOnlyExec {
 
     /// With a token a login gave and nothing since refused, the auth frame at once and the
     /// refresh timer, since a timer of an earlier connection fires into nothing (0056);
-    /// otherwise the login. A login that cannot be signed asks for the connection again.
+    /// otherwise the login. A login that cannot be signed asks for the connection again. A
+    /// resync of an earlier connection is dropped: its answers come back only to the epoch that
+    /// asked (0027).
     fn on_open(&mut self, stream: StreamId, ctx: &EncodeCtx, fx: &mut Effects) {
+        self.resync = None;
         self.conn = Some(Conn {
             stream,
             auth: None,
             auth_sent: false,
             subscribing: BTreeMap::new(),
+            authenticated: false,
         });
         if self.reuse && self.cycle.token().is_some() {
             self.send(ReadMethod::Auth, fx);
@@ -338,18 +513,22 @@ impl ExecCodec for ReadOnlyExec {
         }
     }
 
-    /// A login's answer. The connection waiting on it gets the auth frame, or is closed and
-    /// asked for again when no token came; for a connection already authenticating, it is a
-    /// refresh: a token is kept for the next connection, and none means the next one logs in.
+    /// A resync read's answer (the module documentation's resync), or a login's. The connection
+    /// waiting on a login gets the auth frame, or is closed and asked for again when no token
+    /// came; for a connection already authenticating, it is a refresh: a token is kept for the
+    /// next connection, and none means the next one logs in.
     fn on_http(
         &mut self,
         tag: HttpTag,
         resp: Result<HttpResponse<'_>, HttpFailure>,
-        _scope: &DecodeScope<'_>,
-        _specs: &SpecTable,
+        scope: &DecodeScope<'_>,
+        specs: &SpecTable,
         sink: &mut dyn ExecSink,
         fx: &mut Effects,
     ) -> Result<(), DecodeError> {
+        if self.resync_read(tag) {
+            return self.on_resync_answer(tag, resp, scope, specs, sink, fx);
+        }
         if tag != LOGIN_REQUEST {
             return Err(DecodeError::Malformed("an answer to no request asked"));
         }
@@ -384,15 +563,19 @@ impl ExecCodec for ReadOnlyExec {
         sink.push(VenueMeta::NONE, event);
     }
 
-    /// Nothing: the REST resync is the full codec's (FBC-xvf).
-    fn resync(&mut self, _ctx: &EncodeCtx, _fx: &mut Effects) {}
+    /// The open orders and positions, read over REST with the current token (the module
+    /// documentation's resync), as of `ctx.wall`.
+    fn resync(&mut self, ctx: &EncodeCtx, fx: &mut Effects) {
+        self.start_resync(ctx, fx);
+    }
 
-    /// A login answer's token ([`token_spans`]); the frames carry none (the auth frame's reply
-    /// does not echo the token).
+    /// A login answer's token ([`token_spans`]); nothing else carries one: the frames do not
+    /// (the auth frame's reply does not echo the token), nor do the resync's answers, which are
+    /// never blanked whatever they hold.
     fn redact_inbound(&self, input: Inbound<'_>) -> InboundSpans {
         match input {
-            Inbound::Http(_, resp) => token_spans(&resp),
-            Inbound::Frame(_) => InboundSpans::NONE,
+            Inbound::Http(LOGIN_REQUEST, resp) => token_spans(&resp),
+            Inbound::Http(..) | Inbound::Frame(_) => InboundSpans::NONE,
         }
     }
 }

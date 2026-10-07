@@ -17,13 +17,16 @@
 //! place, modify, cancel, batch cancel, cancel-all and cancel-on-disconnect), from the command
 //! and the `EncodeCtx` only, and their JSON-RPC replies are decoded into one outcome per item
 //! by [`ParadexReplies`], each venue error code mapped to a reject kind through
-//! [`REJECT_CODES`] (decision 0069). The order-entry codec that sends them is FBC-xvf's; the
-//! factory declares these caps, plans the endpoint and builds the codec in FBC-xzp, until when
+//! [`REJECT_CODES`] (decision 0069). [`ParadexExec`] is the order-entry codec that sends them
+//! (decision 0071): the read-only codec's connection, which also carries the private channels,
+//! with these frames, their replies, the REST resync and the order query added. The factory
+//! declares these caps, plans the endpoint and builds the codec in FBC-xzp, until when
 //! [`ParadexFactory`](crate::ParadexFactory)'s caps stay market data only and
 //! [`caps_with_order_entry`](crate::factory::caps_with_order_entry) is what it will declare.
 
 mod account;
 mod caps;
+mod codec;
 mod encode;
 mod errors;
 mod fill;
@@ -36,6 +39,7 @@ pub use account::{
     TEMPLATE_ACCOUNT, TEMPLATE_POSITION, decode_account_event, decode_position_event,
 };
 pub use caps::{ORDER_OPS, exec_caps, order_limits};
+pub use codec::{CONTROL_IDS, ParadexExec};
 pub use encode::ParadexEncoder;
 pub use errors::REJECT_CODES;
 pub use fill::{TEMPLATE_FILL, decode_fill_event};
