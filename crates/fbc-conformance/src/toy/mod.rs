@@ -14,7 +14,11 @@
 //! [`DecodeScope`] it is lent; and the answers (FBC-sal): order queries by venue id or placement
 //! nonce answered with the query's rpc, a request's items answered in separate frames held and
 //! pushed in one call, a resync answered in frames and pushed whole at its end, and an
-//! authentication with [`TOY_TOKEN`] acknowledged. Market data arrives with FBC-u1d and FBC-z2s.
+//! authentication with [`TOY_TOKEN`] acknowledged; and its books (FBC-u1d): [`ToyMd`] keeps two
+//! book channels apart on one connection, [`BOOK`] snapshotted in one frame decoded whole or not
+//! at all and [`ANCHORED_BOOK`] anchored on an HTTP snapshot, refuses a book id its caps do not
+//! declare with nothing sent, reports a gap on the channel that broke, and declares a keepalive.
+//! Trades, funding, mark, index and stats arrive with FBC-z2s.
 //!
 //! Protocol: its own, describing no real venue, as `fbc-core`'s toy: one record per line,
 //! `kind|key=value|...`. A request's first record names its `rpc`; a batch's first record
@@ -25,6 +29,7 @@
 mod decode;
 mod exec;
 mod factory;
+mod md;
 mod session;
 mod signer;
 
@@ -32,19 +37,21 @@ use core::num::NonZeroU32;
 use core::time::Duration;
 
 use fbc_core::{
-    AckModel, AmendAck, AmendCaps, AmendQty, AssetSym, Batch, CancelBatch, CancelOnDisconnect,
-    Channel, Charset, ClientIdFormat, ConnTopology, DecodeScope, Encoding, ExecCaps, Feature,
-    FeedSource, FillCaps, FillSource, FundingCaps, FundingSpec, InstrumentId, InstrumentKind,
-    InstrumentSpec, LimitScope, Lots, MatchingCaps, MdCaps, Namespace, NonceScope, OpKind,
-    OrderCaps, OrderKindTag, OrderingKey, PriceGrid, RateLimit, Readiness, RefKind, SizeStep,
-    SnapshotSource, SpecTable, StpScope, StreamId, Support, TagSet, TifTag, TradeCaps,
-    TradingStatus, UnderlyingId, VenueCaps, VenueFeeSign, VenueId, WallNs, dispatch,
+    AckModel, AmendAck, AmendCaps, AmendQty, AssetSym, Batch, BookCaps, BookId, Cadence,
+    CancelBatch, CancelOnDisconnect, Channel, Charset, ClientIdFormat, ConnTopology, Continuity,
+    DecodeScope, Encoding, ExecCaps, Feature, FeedSource, FillCaps, FillSource, FundingCaps,
+    FundingSpec, InstrumentId, InstrumentKind, InstrumentSpec, LimitScope, Lots, MatchingCaps,
+    MdCaps, Namespace, NonceScope, OpKind, OrderCaps, OrderKindTag, OrderingKey, PriceGrid,
+    QueueModelQuality, RateLimit, Readiness, RefKind, SizeStep, SnapshotSource, SpecTable,
+    StpScope, StreamId, Support, TagSet, TifTag, TradeCaps, TradingStatus, UnderlyingId, VenueCaps,
+    VenueFeeSign, VenueId, WallNs, dispatch,
 };
 use rust_decimal::Decimal;
 
 pub use decode::{REJECT_CODES, reject_kind};
 pub use exec::ToyExec;
-pub use factory::{EXEC_URL_KEY, NoMd, ToyFactory};
+pub use factory::{EXEC_URL_KEY, MD_URL_KEY, ToyFactory};
+pub use md::ToyMd;
 pub use signer::ToySigner;
 
 /// The order-entry stream every request is written to.
@@ -66,6 +73,21 @@ pub const MAX_BATCH: u16 = 4;
 /// the acknowledgement that echoes it (decision 0028).
 pub const TOY_TOKEN: &str = "toy-session-token";
 
+/// The book channel whose snapshot comes in one frame.
+pub const BOOK: BookId = BookId(0);
+/// The book channel anchored on an HTTP snapshot (`BookCaps::rest_anchor`).
+pub const ANCHORED_BOOK: BookId = BookId(1);
+/// How often the market-data codec's keepalive frame goes out.
+pub const KEEPALIVE_EVERY: Duration = Duration::from_secs(20);
+/// How long an anchor's request may take.
+pub const ANCHOR_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long after a failed anchor it is asked for again.
+pub const ANCHOR_RETRY: Duration = Duration::from_secs(1);
+/// The most deltas an anchored channel holds while its anchor is asked for; one more asks again.
+pub const MAX_HELD: usize = 64;
+/// The configuration key FBC-ja3 reads the anchors' base URL from.
+pub const ANCHOR_URL_KEY: &str = "toy.md.anchor_url";
+
 /// Whether the toy's fills carry a venue fill id ([`FillCaps::fill_id`]). Venues differ here,
 /// and the flag is one per venue, so the toy is declared either way and its frames keep to the
 /// declaration it was built with (Codex r4172835753).
@@ -77,8 +99,8 @@ pub enum FillIds {
     Derived,
 }
 
-/// What the toy declares, its fills carrying venue fill ids. Order entry and order and fill
-/// events are what its codec exercises so far; it declares no market data yet.
+/// What the toy declares, its fills carrying venue fill ids. Of market data it declares its two
+/// book channels so far; FBC-z2s adds the other feeds.
 pub fn caps() -> VenueCaps {
     caps_for(FillIds::Venue)
 }
@@ -169,7 +191,7 @@ pub fn caps_for(fill_ids: FillIds) -> VenueCaps {
         md: MdCaps {
             encoding: Encoding::Text,
             touch_sources: Vec::new(),
-            books: Vec::new(),
+            books: vec![book_caps("book", false), book_caps("rpi_book", true)],
             trades: TradeCaps {
                 source: FeedSource::None,
                 aggressor: false,
@@ -204,6 +226,25 @@ pub fn caps_for(fill_ids: FillIds) -> VenueCaps {
             units: 50,
         }],
         readiness_ceiling: Readiness::Record,
+    }
+}
+
+/// One of the toy's book channels: realtime, sequenced plus one, unwindowed; `anchored` is
+/// [`ANCHORED_BOOK`], which also shows RPI liquidity.
+fn book_caps(channel: &'static str, anchored: bool) -> BookCaps {
+    let channels: &[Channel] = match anchored {
+        true => &[Channel::Public, Channel::Rpi],
+        false => &[Channel::Public],
+    };
+    BookCaps {
+        channel,
+        max_depth: 50,
+        cadence: Cadence::Realtime,
+        continuity: Continuity::PlusOne,
+        windowed: false,
+        rest_anchor: anchored,
+        includes_channels: TagSet::of(channels),
+        queue_model: QueueModelQuality::BracketOnly,
     }
 }
 

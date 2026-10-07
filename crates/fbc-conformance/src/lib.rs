@@ -22,8 +22,10 @@
 //! - [`toy`], the conformance toy venue (decision 0044): so far its order entry, every
 //!   declared order capability exercised through `ExecCodec` (FBC-7lx), its order updates,
 //!   fills, request rejects and venue modes decoded through `DecodeScope` (FBC-7ce), its answers
-//!   to queries, batches, resyncs and authentication (FBC-sal), and [`toy::ToyFactory`], the
-//!   factory the named suite builds it from (FBC-8ew).
+//!   to queries, batches, resyncs and authentication (FBC-sal), [`toy::ToyFactory`], the
+//!   factory the named suite builds it from (FBC-8ew), and [`toy::ToyMd`], its market-data
+//!   codec: two book channels on one connection, whole-frame snapshots, refused book ids, a REST
+//!   anchor, gap health and a keepalive (FBC-u1d).
 //! - [`suite`], the named conformance suite (design §6, FBC-8ew): [`suite!`], which an adapter
 //!   crate's `tests/conformance.rs` invokes with its factory, its fixture directory (whose
 //!   layout [`suite`] documents) and the setup its fixtures assume, each named check becoming a
