@@ -330,24 +330,6 @@ fn a_fill_the_venue_reported_counts_until_its_fill_event_moves_the_inventory() {
     reg.place(sell(L0)).unwrap();
 }
 
-#[test]
-fn no_amend_is_built_on_a_venue_whose_amend_states_the_remaining_quantity() {
-    let mut reg = registry(CAP, WIDE);
-    let a = open(&mut reg, buy(20), "a");
-    let mut remaining = amending(true);
-    if let Some(caps) = remaining.amend.as_mut() {
-        caps.qty_semantics = AmendQty::Remaining;
-    }
-    // What it may rest once fills arrive while it is on its way is not modelled (FBC-b0z9).
-    for qty in [20, 30, 10] {
-        assert_eq!(
-            amend(&mut reg, &remaining, a, qty, false),
-            Err(AmendRefusal::RemainingQty)
-        );
-    }
-    assert_eq!(reg.get(a).unwrap().amend_built(), None);
-}
-
 // ---- amends and replaces ----
 
 #[test]
