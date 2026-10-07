@@ -34,7 +34,7 @@ use fbc_core::{
 
 use crate::caps::{Adds, CapRefusal, Exposure};
 use crate::entry::{Admits, StateRefusal};
-use crate::grant::{Guard, Watch};
+use crate::grant::Guard;
 use crate::record::{Intent, OrdState, OrderRecord};
 
 /// Why the registry gives no permit for an order.
@@ -119,7 +119,8 @@ pub struct PermittedCommand {
     /// released ([`Registry::amend_not_submitted`]).
     built: Option<(ClientOrderId, u64)>,
     /// What its authorization is checked against at submit: the market's state generation at
-    /// build for a place, a batch or an amend, 0005's I7 inputs (the exclusive lease's changes
+    /// build for a place, a batch or an amend, with its position revision when built in Exit
+    /// (decision 0066), 0005's I7 inputs (the exclusive lease's changes
     /// and the foreign orders seen) for an instrument cancel-all (decision 0060); nothing for a
     /// cancel or a cancel-many.
     guard: Guard,
@@ -209,9 +210,9 @@ pub struct Live<'r> {
     /// What the market's state admits, read when the permit was given: nothing changes it
     /// while the permit holds the registry.
     state: Result<Admits, StateRefusal>,
-    /// The market's state generation then, which the amend's authorization is checked against
-    /// at submit (decision 0060).
-    generation: Watch,
+    /// The market's state generation then, and in Exit its position revision, which the
+    /// amend's authorization is checked against at submit (decisions 0060, 0066).
+    guard: Guard,
     exposure: Exposure,
 }
 
@@ -219,7 +220,7 @@ impl<'r> Live<'r> {
     pub(crate) fn check(
         rec: &'r mut OrderRecord,
         state: Result<Admits, StateRefusal>,
-        generation: Watch,
+        guard: Guard,
         exposure: Exposure,
     ) -> Result<Live<'r>, PermitRefusal> {
         let cid = rec.cid();
@@ -242,7 +243,7 @@ impl<'r> Live<'r> {
         Ok(Live {
             rec,
             state,
-            generation,
+            guard,
             exposure,
         })
     }
@@ -312,7 +313,7 @@ impl<'r> Live<'r> {
         Ok(PermittedCommand {
             cmd: VenueCommand::Amend(amend),
             built: Some((cid, build)),
-            guard: Guard::state(self.generation),
+            guard: self.guard,
         })
     }
 }

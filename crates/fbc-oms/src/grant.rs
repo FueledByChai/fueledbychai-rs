@@ -152,12 +152,16 @@ impl Generations {
 
 /// What a built command is re-checked against at submit ([`Authorization::check_at_submit`]):
 /// nothing for a cancel or a cancel-many, the market's state generation for a place, a batch or
-/// an amend, and 0005's I7 inputs for an instrument cancel-all: the changes of the registry's
-/// hold of the market's exclusive lease and the foreign orders seen.
+/// an amend, with its position revision too when built in Exit (decision 0066), and 0005's I7
+/// inputs for an instrument cancel-all: the changes of the registry's hold of the market's
+/// exclusive lease and the foreign orders seen.
 #[derive(Default, Eq, PartialEq, Debug)]
 pub(crate) struct Guard {
     /// The market's state generation at build: a place, a batch or an amend.
     pub(crate) state: Option<Watch>,
+    /// How many times the market's inventory moved, at build: a place, a batch or an amend
+    /// built in Exit, which Exit sized against the position then (decision 0066).
+    pub(crate) position: Option<Watch>,
     /// How many times the registry's hold of the market's exclusive lease changed, at build:
     /// an instrument cancel-all.
     pub(crate) lease: Option<Watch>,
@@ -167,10 +171,12 @@ pub(crate) struct Guard {
 }
 
 impl Guard {
-    /// A place's, a batch's or an amend's guard: the market's state generation.
-    pub(crate) fn state(state: Watch) -> Guard {
+    /// A place's, a batch's or an amend's guard: the market's state generation, and, when it
+    /// was built in Exit, the market's position revision (decision 0066).
+    pub(crate) fn state(state: Watch, position: Option<Watch>) -> Guard {
         Guard {
             state: Some(state),
+            position,
             ..Guard::default()
         }
     }
@@ -179,6 +185,7 @@ impl Guard {
     pub(crate) fn exclusive(lease: Watch, foreign: Watch) -> Guard {
         Guard {
             state: None,
+            position: None,
             lease: Some(lease),
             foreign: Some(foreign),
         }
@@ -233,6 +240,10 @@ pub enum StaleAuthorization {
     /// it was built: the market was disarmed (its lease dropped), armed again (a lease taken
     /// since), or lease names given again cover its held leases differently (0005's I7).
     ExclusiveLeaseChanged(InstrumentId),
+    /// A place, a batch or an amend built in Exit, which Exit sized against the market's
+    /// position then, and a fill or a resync moved the market's inventory since: sent, it
+    /// could take the position across zero (decision 0066).
+    PositionMoved(InstrumentId),
 }
 
 impl fmt::Display for StaleAuthorization {
@@ -253,6 +264,11 @@ impl fmt::Display for StaleAuthorization {
             StaleAuthorization::ExclusiveLeaseChanged(market) => write!(
                 f,
                 "the exclusive lease on market {} was dropped, taken again or uncovered since the cancel-all was built",
+                market.get()
+            ),
+            StaleAuthorization::PositionMoved(market) => write!(
+                f,
+                "the position on market {} moved since the exit command was built",
                 market.get()
             ),
         }
@@ -330,7 +346,9 @@ impl Authorization {
     /// The check at submit (decision 0060), which the gateway runs immediately before it
     /// encodes the command, writing nothing when it refuses: a place, a batch or an amend whose
     /// market changed state since the command was built is refused
-    /// ([`StaleAuthorization::StateChanged`]); an instrument cancel-all once the registry's
+    /// ([`StaleAuthorization::StateChanged`]), and one built in Exit also once a fill or a
+    /// resync moved its market's inventory since ([`StaleAuthorization::PositionMoved`],
+    /// decision 0066); an instrument cancel-all once the registry's
     /// hold of its market's exclusive lease changed since
     /// ([`StaleAuthorization::ExclusiveLeaseChanged`]) or an order not ours was seen on its
     /// market since ([`StaleAuthorization::ForeignSeen`]), and not for any other change of
@@ -351,6 +369,16 @@ impl Authorization {
                 }
             }
             _ => match self.guard.state.as_ref().map(Watch::moved) {
+                Some(None)
+                    if self
+                        .guard
+                        .position
+                        .as_ref()
+                        .and_then(Watch::moved)
+                        .is_some() =>
+                {
+                    Err(StaleAuthorization::PositionMoved(self.market))
+                }
                 Some(None) => Ok(()),
                 now => Err(StaleAuthorization::StateChanged {
                     market: self.market,
@@ -487,7 +515,7 @@ mod tests {
             (VenueCommand::CancelAll(_), Some(m)) => {
                 Guard::exclusive(c.lease.watch(m), c.seen.watch(m))
             }
-            (_, Some(m)) => Guard::state(c.generations.watch(m)),
+            (_, Some(m)) => Guard::state(c.generations.watch(m), None),
         };
         Authorization::issue(ACCT, PermittedCommand::for_test(cmd, guard), current)
     }
@@ -672,7 +700,7 @@ mod tests {
             with(cancel_all(), seen_only).check_at_submit(),
             Err(StaleAuthorization::ExclusiveLeaseChanged(btc))
         );
-        let state_only = Guard::state(c.generations.watch(btc));
+        let state_only = Guard::state(c.generations.watch(btc), Some(c.lease.watch(btc)));
         assert_eq!(
             with(cancel_all(), state_only).check_at_submit(),
             Err(StaleAuthorization::ExclusiveLeaseChanged(btc))
@@ -690,6 +718,70 @@ mod tests {
                 now: StateGeneration(4),
             })
         );
+    }
+
+    #[test]
+    fn at_submit_an_exit_command_is_refused_once_its_market_s_position_moved() {
+        // Decision 0066: a place, a batch or an amend built in Exit carries the market's
+        // position revision as well as its state generation; the state is judged first.
+        let (btc, eth) = (InstrumentId::new(1), InstrumentId::new(2));
+        let mut c = Counts::default();
+        let mut positions = Counters::default();
+        let guarded = |cmd: VenueCommand, c: &mut Counts, positions: &mut Counters| {
+            let market = market_of(&cmd).unwrap();
+            let guard = Guard::state(c.generations.watch(market), Some(positions.watch(market)));
+            Authorization::issue(
+                ACCT,
+                PermittedCommand::for_test(cmd, guard),
+                c.generations.of(market),
+            )
+            .unwrap()
+        };
+        let exits = |c: &mut Counts, positions: &mut Counters| {
+            order_commands(btc)
+                .into_iter()
+                .filter(|cmd| {
+                    matches!(
+                        cmd,
+                        VenueCommand::Place(_)
+                            | VenueCommand::PlaceBatch(_)
+                            | VenueCommand::Amend(_)
+                    )
+                })
+                .map(|cmd| guarded(cmd, c, positions))
+                .collect::<Vec<_>>()
+        };
+        let built = exits(&mut c, &mut positions);
+        // Another market's position moving leaves them passing.
+        positions.advance(eth);
+        for auth in &built {
+            assert_eq!(auth.check_at_submit(), Ok(()), "{:?}", auth.command());
+        }
+        positions.advance(btc);
+        for auth in &built {
+            assert_eq!(
+                auth.check_at_submit(),
+                Err(StaleAuthorization::PositionMoved(btc)),
+                "{:?}",
+                auth.command()
+            );
+        }
+        // Both moved: the change of state is named.
+        let built = exits(&mut c, &mut positions);
+        positions.advance(btc);
+        c.generations.advance(btc);
+        for auth in &built {
+            assert_eq!(
+                auth.check_at_submit(),
+                Err(StaleAuthorization::StateChanged {
+                    market: btc,
+                    built: StateGeneration(0),
+                    now: StateGeneration(1),
+                }),
+                "{:?}",
+                auth.command()
+            );
+        }
     }
 
     #[test]
@@ -711,6 +803,10 @@ mod tests {
         assert_eq!(
             StaleAuthorization::ExclusiveLeaseChanged(btc).to_string(),
             "the exclusive lease on market 1 was dropped, taken again or uncovered since the cancel-all was built"
+        );
+        assert_eq!(
+            StaleAuthorization::PositionMoved(btc).to_string(),
+            "the position on market 1 moved since the exit command was built"
         );
         for (refusal, text) in [
             (

@@ -629,7 +629,7 @@ impl Registry {
             .filter(|rec| rec.placed().inst == inst)
             .map(OrderRecord::cid)
             .collect();
-        self.inventory.insert(inst, pos);
+        self.set_inventory(inst, pos);
         self.markets.insert(
             inst,
             MarketState::Seeded(Seed {

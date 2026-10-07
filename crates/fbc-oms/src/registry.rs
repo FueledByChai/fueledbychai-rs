@@ -12,8 +12,8 @@ use fbc_core::{
 };
 
 use crate::caps::{Adds, CapRefusal, Exposure, PreTradeCaps};
-use crate::entry::{Entries, StateRefusal, TestnetRun};
-use crate::grant::Guard;
+use crate::entry::{Admits, Entries, StateRefusal, TestnetRun};
+use crate::grant::{Counters, Guard, Watch};
 use crate::ladder;
 use crate::ledger::AcceptedFill;
 use crate::permit::{
@@ -51,6 +51,9 @@ pub struct Registry {
     /// The consumer's declaration of an owner-assisted testnet run, under which a market seeded
     /// by hand may be armed (decision 0067; [`Registry::for_testnet_run`]).
     pub(crate) testnet_run: Option<TestnetRun>,
+    /// Per market, how many times its inventory moved: an Exit command's authorization is
+    /// refused at submit once it moved since the build (decision 0066).
+    positions: Counters,
 }
 
 /// Where [`Registry::apply_fill`] sent a fill the ledger accepted.
@@ -299,9 +302,26 @@ impl Registry {
     }
 
     /// The guard of a place, a batch or an amend built now on `market`: its state generation,
-    /// checked again at submit (decision 0060).
+    /// checked again at submit (decision 0060), and, in Exit, its position revision (0066).
     fn state_guard(&mut self, market: InstrumentId) -> Guard {
-        Guard::state(self.entries.watch(market))
+        let position = self.exit_position_watch(market);
+        Guard::state(self.entries.watch(market), position)
+    }
+
+    /// `market`'s position revision now, watched for a command about to be built under it,
+    /// while the market is in Exit, whose admission is judged against the position: an Exit
+    /// command is refused at submit once a fill or a resync moved the inventory since
+    /// (decision 0066). `None` in any other state, whose builds the position does not size.
+    fn exit_position_watch(&mut self, market: InstrumentId) -> Option<Watch> {
+        (self.entries.admits(market) == Ok(Admits::ExitOnly)).then(|| self.positions.watch(market))
+    }
+
+    /// Sets the inventory on `inst` to `pos`, advancing the market's position revision when it
+    /// moved (decision 0066): the only way the inventory is written.
+    pub(crate) fn set_inventory(&mut self, inst: InstrumentId, pos: SignedLots) {
+        if self.inventory.insert(inst, pos).unwrap_or(SignedLots(0)) != pos {
+            self.positions.advance(inst);
+        }
     }
 
     /// The one pre-trade path of a place and a batch item: the market's state first (decision
@@ -407,7 +427,7 @@ impl Registry {
             Some(MarketState::Unseeded(_)) => return Err(OmsError::PositionMoved(inst)),
             None => {}
         }
-        self.inventory.insert(inst, pos);
+        self.set_inventory(inst, pos);
         self.markets
             .insert(inst, MarketState::Seeded(Seed::by_hand(pos)));
         Ok(())
@@ -507,7 +527,7 @@ impl Registry {
             None => None,
         };
         accepted.commit();
-        self.inventory.insert(fill.inst, inventory);
+        self.set_inventory(fill.inst, inventory);
         self.fill_counted(fill.inst, fill.key(), placed, signed, placement);
         let routed = match (cid, cum) {
             (Some(cid), Some(cum)) => {
@@ -625,12 +645,12 @@ impl Registry {
             .placed();
         let exposure = self.exposure(placed.inst, placed.side, Some(cid));
         let state = self.entries.admits(placed.inst);
-        let generation = self.entries.watch(placed.inst);
+        let guard = self.state_guard(placed.inst);
         let rec = self
             .orders
             .get_mut(&cid)
             .expect("the order was found above");
-        Live::check(rec, state, generation, exposure)
+        Live::check(rec, state, guard, exposure)
     }
 
     /// The permit to cancel our order `cid`: it is not terminal (PendingNew, Unknown and an
