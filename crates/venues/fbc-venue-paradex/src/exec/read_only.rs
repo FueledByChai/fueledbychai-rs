@@ -42,8 +42,8 @@
 //!   whole into the resync events at the watermark `ctx.wall` ([`decode_resync`]) once both
 //!   are in; a read that fails, is answered with an error status or does not decode pushes
 //!   nothing and asks for the connection again, so the epoch ends rather than waiting on a
-//!   resync that will never end (FBC-xvf, decision 0071). A read-only session thus seeds
-//!   positions as the order-entry codec does.
+//!   resync that will never end (FBC-xvf, decision 0071). The read-only codec can thus seed
+//!   positions as the order-entry codec does, once a session asks it to resync.
 //! - **Not built here.** No client ping is sent: Paradex pings every 55 seconds and the
 //!   WebSocket layer answers, and an order-entry codec cannot ask the runtime for a WebSocket
 //!   ping (0056); a configured client ping is FBC-jkly's.

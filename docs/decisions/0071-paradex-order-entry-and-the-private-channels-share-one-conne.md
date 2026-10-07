@@ -43,20 +43,22 @@ FBC-0sc's REST resync and order query. Three things were the ticket's to choose:
    again (with a fresh login next), so the epoch ends and the next one resyncs; each resync's two
    reads go out under tags of their own, so an answer to an earlier resync is never paired with a
    later one. A new connection drops the resync, the order queries and the order requests of
-   the one before, whose replies and answers never reach a later epoch (0027); a deadline the
-   runtime still names for one is `Unknown`. The read-only codec resyncs the same way, so a
-   read-only session seeds positions too.
+   the one before that still await a reply or answer, which never reaches a later epoch (0027);
+   a deadline the runtime still names for one is `Unknown`. A request whose reply already
+   reported `Unknown` is kept until its deadline, so that timeout adds nothing (Reviewer B on
+   PR #109). The read-only codec resyncs the same way, so it can seed positions once a session
+   asks it to resync.
+4. **The token as built.** Every REST read (the resync's two, the order query) carries the
+   token the latest login gave, read when the request is built, in a redacted header and
+   nowhere else. The order query's read that was never sent is `NotSent(Disconnected)` for its
+   rpc; one that failed afterwards, was answered with an error status or does not decode is
+   `Unknown`.
 5. **What the session refuses after an encode is held until the connection ends.** The
    session can refuse a request after its encode returned `Ok` (a frame for its rate budget, an
    encode carrying a read until FBC-m8vm), and nothing tells the codec, so the codec holds it
    until a new connection. It does not guess from elapsed time: a frame written during a long
    write stall would be dropped while its reply is still coming (Codex on PR #109). The
    runtime telling a codec of such refusals is FBC-9r5o.
-4. **The token as built.** Every REST read (the resync's two, the order query) carries the
-   token the latest login gave, read when the request is built, in a redacted header and
-   nowhere else. The order query's read that was never sent is `NotSent(Disconnected)` for its
-   rpc; one that failed afterwards, was answered with an error status or does not decode is
-   `Unknown`.
 
 ## Alternatives
 
