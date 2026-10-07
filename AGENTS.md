@@ -313,7 +313,11 @@ rather than guess.
     queries answered with the query's rpc, a request's items answered in separate frames held
     and pushed in one call (`on_rpc_timeout` pushing `Unknown` only for the unanswered ones), a
     resync answered in frames and pushed whole at its end, and an authentication whose token
-    `redact_inbound` names; and its factory, `ToyFactory`; and `src/suite/`, the named suite:
+    `redact_inbound` names; and its factory, `ToyFactory`; and its market data, `ToyMd`: two
+    book channels on one connection kept apart, a snapshot frame decoded whole or not at all, a
+    book id outside its declared channels refused with nothing sent, a `rest_anchor` channel
+    anchored on an HTTP snapshot, a gap reported as the health of the channel that broke, and a
+    keepalive frame; and `src/suite/`, the named suite:
     `suite!`, invoked from an adapter's `tests/conformance.rs` with its factory, its fixture
     directory (one subdirectory per check that reads recorded data) and the setup its fixtures
     assume, one test per check, each check also a public function returning what it probed or

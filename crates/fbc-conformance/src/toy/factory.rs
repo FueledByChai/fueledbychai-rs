@@ -3,27 +3,27 @@
 //! instruments, [`specs`]), reads Java-era tickers by a rule of its own, takes no credentials
 //! (its signer holds no key) and builds a fresh [`ToyExec`] each time it is asked.
 //!
-//! Not modelled yet, and refused rather than guessed: the order-entry URL, which FBC-ja3 takes
-//! from the configuration with its redaction spans, and market data, which arrives with
-//! FBC-u1d and FBC-z2s; until then [`NoMd`] stands in, and every feed is refused, as the caps'
-//! empty `md` declares.
+//! Its market-data codec is [`ToyMd`], with no anchor URL. Not modelled yet, and refused rather
+//! than guessed: the order-entry, market-data and anchor URLs, which FBC-ja3 takes from the
+//! configuration with their redaction spans; and the feeds other than books, which arrive with
+//! FBC-z2s.
 //!
 //! [`specs`]: super::specs
 
 use std::collections::BTreeSet;
 
 use fbc_core::{
-    AccountSummary, AssetKey, ConfigError, DecodeError, DecodeScope, Effects, EndpointPlan,
-    ExecCodec, ExecEndpoint, FieldSpec, HttpFailure, HttpPlan, HttpResponse, HttpTag, Inbound,
-    InboundSpans, InstrumentKind, InstrumentSpecDraft, Keepalive, MdCodec, MdSink, MonoNs,
-    RawFrame, Secrets, SpecTable, Subscription, SymbolError, TimerTag, VenueCaps, VenueConfig,
-    VenueError, VenueFactory, WallNs, common_symbol_parts,
+    AccountSummary, AssetKey, ConfigError, EndpointPlan, ExecCodec, ExecEndpoint, Feed, FieldSpec,
+    HttpPlan, InstrumentKind, InstrumentSpecDraft, MdCodec, Secrets, SpecTable, Subscription,
+    SymbolError, VenueCaps, VenueConfig, VenueError, VenueFactory, common_symbol_parts,
 };
 
-use super::{ToyExec, ToySigner, caps};
+use super::{ToyExec, ToyMd, ToySigner, caps};
 
 /// The configuration key FBC-ja3 reads the toy's order-entry URL from.
 pub const EXEC_URL_KEY: &str = "toy.exec.url";
+/// The configuration key FBC-ja3 reads the toy's market-data URL from.
+pub const MD_URL_KEY: &str = "toy.md.url";
 
 /// The conformance toy's factory.
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
@@ -63,21 +63,33 @@ impl VenueFactory for ToyFactory {
         Err(VenueError::NoDiscovery)
     }
 
-    /// Nothing to plan for no subscription; every feed is refused, since the toy declares none.
+    /// Nothing to plan for no subscription. A feed the caps do not declare is refused as
+    /// unsupported; a declared book channel as configuration, since the market-data URL is not
+    /// modelled until FBC-ja3.
     fn plan_md(
         &self,
         _cfg: &VenueConfig,
         _specs: &SpecTable,
         subs: &BTreeSet<Subscription>,
     ) -> Result<Vec<EndpointPlan>, VenueError> {
-        match subs.first() {
-            Some(sub) => Err(VenueError::UnsupportedFeed(*sub)),
-            None => Ok(Vec::new()),
+        let books = caps().md.books.len();
+        let declared =
+            |s: &Subscription| matches!(s.feed, Feed::Book(b) if usize::from(b.0) < books);
+        if let Some(sub) = subs.iter().find(|s| !declared(s)) {
+            return Err(VenueError::UnsupportedFeed(*sub));
+        }
+        match subs.is_empty() {
+            true => Ok(Vec::new()),
+            false => Err(VenueError::Config(ConfigError::Invalid {
+                key: MD_URL_KEY,
+                reason: "the conformance toy plans no market-data connection yet (FBC-ja3)",
+            })),
         }
     }
 
-    fn md_codec(&self, _cfg: &VenueConfig, _ep: &EndpointPlan) -> Box<dyn MdCodec> {
-        Box::new(NoMd)
+    /// A fresh [`ToyMd`] on the endpoint's stream, with no anchor URL (FBC-ja3).
+    fn md_codec(&self, _cfg: &VenueConfig, ep: &EndpointPlan) -> Box<dyn MdCodec> {
+        Box::new(ToyMd::new(ep.stream))
     }
 
     /// Refused, whatever the configuration holds: the toy's order-entry URL is not modelled
@@ -108,72 +120,5 @@ impl VenueFactory for ToyFactory {
         _creds: Secrets,
     ) -> Option<Result<HttpPlan<AccountSummary>, VenueError>> {
         None
-    }
-}
-
-/// The toy's market-data codec until FBC-u1d: it subscribes to nothing, decodes nothing and
-/// asks for nothing, as the toy's caps declare no feed.
-#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
-pub struct NoMd;
-
-impl MdCodec for NoMd {
-    fn on_open(&mut self, _fx: &mut Effects) {}
-
-    /// Refuses the first subscription asked for; an unsubscription of nothing subscribed is
-    /// nothing to do.
-    fn subscribe(
-        &mut self,
-        add: &[Subscription],
-        _remove: &[Subscription],
-        _specs: &SpecTable,
-        _fx: &mut Effects,
-    ) -> Result<(), VenueError> {
-        match add.first() {
-            Some(sub) => Err(VenueError::UnsupportedFeed(*sub)),
-            None => Ok(()),
-        }
-    }
-
-    fn on_frame(
-        &mut self,
-        _f: RawFrame<'_>,
-        _scope: &DecodeScope<'_>,
-        _specs: &SpecTable,
-        _sink: &mut dyn MdSink,
-        _fx: &mut Effects,
-    ) -> Result<(), DecodeError> {
-        Err(DecodeError::Malformed("the toy publishes no market data"))
-    }
-
-    fn on_http(
-        &mut self,
-        _tag: HttpTag,
-        _resp: Result<HttpResponse<'_>, HttpFailure>,
-        _scope: &DecodeScope<'_>,
-        _specs: &SpecTable,
-        _sink: &mut dyn MdSink,
-        _fx: &mut Effects,
-    ) -> Result<(), DecodeError> {
-        Err(DecodeError::Malformed(
-            "the toy's market data asks for no HTTP",
-        ))
-    }
-
-    fn on_timer(
-        &mut self,
-        _tag: TimerTag,
-        _now: MonoNs,
-        _wall: WallNs,
-        _sink: &mut dyn MdSink,
-        _fx: &mut Effects,
-    ) {
-    }
-
-    fn keepalive(&self) -> Option<Keepalive> {
-        None
-    }
-
-    fn redact_inbound(&self, _input: Inbound<'_>) -> InboundSpans {
-        InboundSpans::NONE
     }
 }

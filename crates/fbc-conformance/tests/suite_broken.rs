@@ -1159,7 +1159,9 @@ fn the_broken_toy_otherwise_delegates_to_the_toy() {
         },
         subs: Vec::new(),
     };
-    assert!(b.md_codec(&cfg, &ep).keepalive().is_none());
+    let toys = ToyFactory.md_codec(&cfg, &ep).keepalive();
+    assert_eq!(b.md_codec(&cfg, &ep).keepalive(), toys);
+    assert!(toys.is_some());
     assert!(b.plan_exec(&cfg).is_err());
     assert!(b.test_connection(&cfg, Secrets::new()).is_none());
 
