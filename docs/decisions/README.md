@@ -73,3 +73,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0068](0068-the-execution-planner-holds-its-orders-per-account-and-marke.md) The execution planner holds its orders per account and market and plans each account through one registry, augmenting 0065 — accepted
 - [0069](0069-paradex-s-order-replies-accept-provisionally-except-cancel-o.md) Paradex's order replies accept provisionally except cancel-on-disconnect's, refuse by a table keyed by code, and leave every other error Unknown — accepted
 - [0070](0070-an-amend-replaced-in-flight-and-not-yet-settled-occupies-its.md) An amend replaced in flight and not yet settled occupies its level, augmenting 0065 — accepted
+- [0071](0071-paradex-order-entry-and-the-private-channels-share-one-conne.md) Paradex order entry and the private channels share one connection, the codec's own JSON-RPC ids start at 2^52, and a failed resync read reconnects — accepted

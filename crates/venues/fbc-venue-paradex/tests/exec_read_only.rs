@@ -607,10 +607,14 @@ fn every_command_is_refused_unsupported_with_no_effect_and_no_call_asks_for_a_no
     ] {
         assert_eq!(codec.nonces_for(call), 0);
     }
-    // The resync is the full codec's: nothing asked for.
+    // The resync only reads (FBC-xvf, tests/exec_codec.rs): two GETs, nothing written.
     let mut fx = Effects::new();
     codec.resync(&ctx(), &mut fx);
-    assert!(fx.is_empty());
+    assert!(sends(fx.as_slice()).is_empty());
+    let reads = fx.as_slice().iter().filter(
+        |e| matches!(e, Effect::Http { req, rpc: None, .. } if req.method == HttpMethod::Get),
+    );
+    assert_eq!((reads.count(), fx.len()), (2, 2));
     // A deadline the runtime names anyway is Unknown.
     let mut sink = Sink::default();
     codec.on_rpc_timeout(RpcId(7), &mut sink);
