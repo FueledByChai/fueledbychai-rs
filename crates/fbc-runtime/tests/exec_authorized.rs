@@ -6,7 +6,9 @@
 //! and no byte written, since `ExecSession::send` runs `Authorization::check_at_submit` before
 //! encoding every authorized command, so a change while the command waits in the session's
 //! queue is seen too; and a cancel issued before the change still goes out, as the check passes
-//! every cancel.
+//! every cancel. The kill switch's instrument cancel-all is checked against 0005's I7 guard it
+//! was built under: one queued before a disarm, which gives up the market's exclusive lease, is
+//! not sent, and one queued before the kill switch went on is still written (the Stop path).
 //!
 //! Every order command is one fbc-oms built and authorized through its public path,
 //! `Registry::authorize` (FBC-afd): a registry armed on the toy's market (`armed_oms`). The
@@ -278,5 +280,108 @@ async fn an_authorization_queued_before_a_state_change_is_not_sent_with_no_nonce
     stale_after(When::WhileQueued, |reg| {
         reg.wind_down(INST_A, Leases::none()).unwrap();
     })
+    .await;
+}
+
+/// On an epoch armed and resynced, the kill switch's instrument cancel-all of the market and a
+/// cancel are built and authorized and submitted in that order, then `change` moves the
+/// market's state while both still wait in the session's queue. The cancel-all is checked at
+/// encode against 0005's I7 guard it was built under, not the market's state generation
+/// (decision 0060): when `sent`, the change left that guard as it was and the cancel-all is
+/// written first, its one nonce reserved after the arm's, then the cancel; otherwise the guard
+/// moved, the cancel-all comes back `NotSent(StaleAuthorization)` with no nonce reserved and
+/// nothing written, and the cancel is the first frame (PR #100 Reviewer B B3).
+async fn cancel_all_queued(change: fn(&mut Registry), sent: bool) {
+    // A blocked thread keeps the paused clock from auto-advancing while the sockets are idle.
+    let (thaw, frozen) = std::sync::mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || frozen.recv());
+    let mut server = ScriptedWs::start().await;
+    let reserved = Reserved::default();
+    let (handles, events) = (Handles::default(), Events::default());
+    let keep = Keep {
+        handles: Rc::clone(&handles),
+        events: Rc::clone(&events),
+    };
+    let config = session_config(&server.url(), &reserved);
+    let (mut session, control) = fbc_runtime::ExecSession::new(config, keep).unwrap();
+    let orders = session.orders();
+    let mut oms = Oms::armed();
+    let watch = Rc::clone(&handles);
+    let script = async move {
+        let mut peer = server.accept().await;
+        armed_and_resynced(&mut peer, &orders, &events).await;
+        let (cancel_all, cancel) = (oms.cancel_all(), oms.cancel());
+        let submitted = [
+            orders.submit(cancel_all).unwrap(),
+            orders.submit(cancel).unwrap(),
+        ];
+        // No await since the submits: the session has not had its turn, so both still wait.
+        change(&mut oms.reg);
+        if sent {
+            let written = peer.recv().await;
+            assert!(
+                written.starts_with(&format!("cancelall|rpc={}|", submitted[0].0)),
+                "{written}"
+            );
+        }
+        let written = peer.recv().await;
+        assert!(
+            written.starts_with(&format!("cancel|rpc={}|", submitted[1].0)),
+            "{written}"
+        );
+        assert_eq!(nonce(&written), if sent { 2 } else { 1 });
+        settle(|| watch.borrow().len() == 2).await;
+        churn().await;
+        assert!(peer.quiet());
+        drop(control);
+        submitted
+    };
+    let (run, submitted) = tokio::join!(session.run(), script);
+    run.unwrap();
+    drop(thaw);
+
+    let handles = handles.borrow();
+    let [cancel_all, cancel] = &handles[..] else {
+        panic!("{handles:?}");
+    };
+    assert_eq!(cancel_all.rpc, submitted[0]);
+    assert_eq!(cancel.rpc, submitted[1]);
+    assert!(cancel.receipt.is_ok(), "{cancel:?}");
+    if sent {
+        assert!(cancel_all.receipt.is_ok(), "{cancel_all:?}");
+        // The arm's nonce, the cancel-all's and the cancel's.
+        assert_eq!(*reserved.lock().unwrap(), [vec![0], vec![1], vec![2]]);
+    } else {
+        let stale = Err(NotSentReason::StaleAuthorization);
+        assert_eq!(cancel_all.receipt, stale);
+        // The arm's nonce and the cancel's: none for the refused cancel-all.
+        assert_eq!(*reserved.lock().unwrap(), [vec![0], vec![1]]);
+    }
+    assert_eq!(session.counters().unready_refusals, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_instrument_cancel_all_queued_before_a_disarm_is_not_sent_with_no_nonce_reserved_and_nothing_written()
+ {
+    // The disarm gives up the market's exclusive lease, which the cancel-all was built under.
+    cancel_all_queued(
+        |reg| {
+            reg.disarm(INST_A);
+        },
+        false,
+    )
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_instrument_cancel_all_queued_before_the_kill_switch_went_on_is_still_written() {
+    // The Stop path: the kill switch leaves the lease and the foreign orders seen as they were,
+    // and must not keep our orders resting (decision 0012).
+    cancel_all_queued(
+        |reg| {
+            reg.kill(INST_A);
+        },
+        true,
+    )
     .await;
 }
