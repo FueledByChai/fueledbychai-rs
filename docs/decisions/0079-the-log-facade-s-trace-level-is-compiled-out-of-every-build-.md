@@ -32,7 +32,16 @@ anywhere in the consumer's build that enables `release_max_level_trace` brings T
 release. fbc-runtime therefore also asserts at compile time (`const _: () = assert!(..)` in its
 lib.rs) that the facade's static maximum is DEBUG or below. The guarantee is enforced at build
 time: such a build fails to compile with an error naming this record, rather than running with
-TRACE. A stricter level (`release_max_level_info` and below) passes. fbc-runtime cannot also set
+TRACE. A stricter level (`release_max_level_info` and below) passes.
+
+The cap and the assertion act on one `log` package, and it is the one tungstenite logs through:
+Cargo never selects two semver-compatible versions of one package in a build, so every `log`
+0.4 requirement in the consumer's graph (tungstenite's `^0.4.17`, fbc-runtime's exact pin, the
+consumer's own) resolves to the same package, and a consumer pinning another 0.4 release fails
+to resolve rather than getting a second, uncapped copy (Codex r4217150467 on PR #119, checked
+with a scratch consumer pinning `log = "=0.4.33"`: "failed to select a version for `log`").
+`scripts/check-deps.sh` also refuses this workspace's graph if it ever holds a second `log`
+package (another major or another source) or if tungstenite's `log` edge is not fbc-runtime's. fbc-runtime cannot also set
 `release_max_level_debug`, since `log` refuses two `release_max_level_*` features in one build,
 which would break a consumer that sets a stricter one.
 
@@ -65,7 +74,11 @@ which would break a consumer that sets a stricter one.
   the whole session and finds no token, login signature or key in what was logged;
   `crates/fbc-runtime/src/ws.rs`'s `the_log_facade_s_trace_level_is_compiled_out` fails if the
   feature is dropped, and the assertion in `crates/fbc-runtime/src/lib.rs` fails the build
-  (error E0080) when a release build's features raise the level to TRACE.
+  (error E0080) when a release build's features raise the level to TRACE;
+  `crates/fbc-runtime/tests/log_facade.rs` installs a logger through fbc-runtime's `log` at
+  TRACE, receives tungstenite's own DEBUG records over an in-memory WebSocket (so tungstenite
+  logs through that facade) and none at TRACE or carrying the frame's payload; and
+  `scripts/check-deps.sh` (with its self-test) finds exactly one `log` package in the graph.
 - Moving tungstenite or `log` re-runs the rehearsal, which reads what the new version logs.
 
 ## What would show this was wrong
