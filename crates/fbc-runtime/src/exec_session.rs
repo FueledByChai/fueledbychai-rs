@@ -46,7 +46,11 @@
 //! under Safety, since an order-entry stream carries acks and fills that cannot be told apart
 //! before they are decoded; a write under its frame's class; an encode's nonces and context
 //! under its command's class, so a cancel's or a reducing order's are Safety; the rest under
-//! Normal. Nothing waits on the journal: a record the sink has no room for is dropped and
+//! Normal. An input that came as the control dropped follows the epoch's `Closed`, reaching no
+//! codec; spans a codec names that do not fit their input are counted
+//! ([`ExecCounters::refused_redactions`]) and that input is hashed whole. An encode's time is
+//! read once its nonces are reserved. Nothing waits on the journal: a record the sink has no
+//! room for is dropped and
 //! counted there (0006). A request's deadline firing is stamped but not yet journaled
 //! (FBC-0hfl).
 //!
@@ -352,6 +356,9 @@ pub struct ExecCounters {
     /// Places, batches of places and amends refused because their epoch was not yet armed and
     /// resynced.
     pub unready_refusals: u64,
+    /// Inbound frames and HTTP responses whose codec named credential spans that do not fit
+    /// them (a codec defect): journaled with the whole body and every header hashed.
+    pub refused_redactions: u64,
 }
 
 /// One account's order-entry connection, driven by [`ExecSession::run`].
@@ -413,6 +420,9 @@ impl<H: ExecHandler> Drop for ExecSession<H> {
 /// How a connected epoch ended.
 enum End {
     Stop,
+    /// Stopped, the epoch already journaled closed, ahead of the inputs that came with the stop
+    /// (Codex P1 on PR #115).
+    StopClosed,
     Dropped,
 }
 
@@ -557,6 +567,7 @@ impl<H: ExecHandler> ExecSession<H> {
             write_stalls: core.write_stalls,
             arm_failures: self.arm_failures,
             unready_refusals: self.unready_refusals,
+            refused_redactions: self.core.refused_redactions(),
         }
     }
 
@@ -604,7 +615,7 @@ impl<H: ExecHandler> ExecSession<H> {
             let end = self.connected(ws).await;
             match end {
                 // `connected` forgot the epoch's buckets.
-                Ok(End::Stop) => return Ok(()),
+                Ok(End::Stop | End::StopClosed) => return Ok(()),
                 Ok(End::Dropped) => self.retire(key)?,
                 // The run's own error, not one retiring the epoch might add.
                 Err(e) => {
@@ -650,7 +661,13 @@ impl<H: ExecHandler> ExecSession<H> {
         // (Codex r4189618551).
         self.in_epoch = None;
         self.core.rates.closed(key);
-        self.core.control(|| ControlEvent::Closed(key));
+        let end = match end {
+            Ok(End::StopClosed) => Ok(End::Stop),
+            end => {
+                self.core.control(|| ControlEvent::Closed(key));
+                end
+            }
+        };
         self.handler.on_epoch_end(key);
         end
     }
@@ -658,6 +675,8 @@ impl<H: ExecHandler> ExecSession<H> {
     /// The epoch `key`, opened on `ws`.
     async fn epoch(&mut self, ws: WebSocket, key: ConnKey) -> Result<End, ExecSessionError> {
         let mut ws = Some(ws);
+        // Whether the epoch was journaled closed as the control dropped.
+        let mut closed = false;
         // A control that dropped as the connection opened stops the session before the codec
         // is told of it, so nothing is reserved or sent.
         let mut open = !self.stopped() && {
@@ -682,8 +701,12 @@ impl<H: ExecHandler> ExecSession<H> {
             let rx = ws.as_ref().and_then(|ws| ws.get_ref().kernel_rx());
             open = match wake {
                 // What woke as the control dropped is stamped, so it keeps its place in ingest
-                // order, but reaches no codec; so does a frame waiting then.
+                // order, but reaches no codec; so does a frame waiting then. The epoch is
+                // journaled closed first, so replay, which feeds a closed epoch nothing, feeds
+                // them to no codec either, as on a market-data session (Codex P1 on PR #115).
                 _ if self.stopped() => {
+                    self.core.control(|| ControlEvent::Closed(key));
+                    closed = true;
                     self.take_stopped(&mut ws, key, rx, wake)?;
                     false
                 }
@@ -724,7 +747,7 @@ impl<H: ExecHandler> ExecSession<H> {
         if let Some(socket) = ws.as_mut() {
             close(socket, &self.core.rates, key);
         }
-        Ok(End::Stop)
+        Ok(if closed { End::StopClosed } else { End::Stop })
     }
 
     /// Calls the codec's `on_open` for the session's stream with exactly the nonces it asks
@@ -1003,17 +1026,18 @@ impl<H: ExecHandler> ExecSession<H> {
         // Its nonces and context are journaled under the command's own class, so a cancel's
         // and a reducing order's are Safety (decision 0078).
         let journaled = cmd.traffic_class();
-        let (mono, wall) = self.core.clock.now();
-        // A batch longer than u16::MAX items, which no venue takes, has no nonce block.
-        let rec = &self.rec;
+        // A batch longer than u16::MAX items, which no venue takes, has no nonce block. Its time
+        // is read once its nonces are reserved, so a source that takes its time leaves the
+        // encode no stale time (Codex P2 on PR #115).
+        let (rec, clock) = (&self.rec, &self.core.clock);
         let items = cmd
             .items()
-            .map(|n| reserve(&mut *self.nonces, n, rec, journaled, wall));
+            .map(|n| reserve(&mut *self.nonces, n, rec, journaled, || clock.now()));
         let mut fx = Effects::new();
         let encoded = items
             .transpose()?
             .ok_or(NotSentReason::Unencodable)
-            .and_then(|nonces| {
+            .and_then(|(nonces, (mono, wall))| {
                 let ctx = EncodeCtx { wall, mono, nonces };
                 self.rec.ctx(journaled, Some(rpc), &ctx);
                 let mut t = PathStamps::off();
@@ -1201,32 +1225,34 @@ fn context(
     wall: WallNs,
 ) -> Result<EncodeCtx, ExecSessionError> {
     let class = TrafficClass::Normal;
-    let nonces = reserve(nonces, codec.nonces_for(call), rec, class, wall)?;
+    let (nonces, _) = reserve(nonces, codec.nonces_for(call), rec, class, || (mono, wall))?;
     let ctx = EncodeCtx { wall, mono, nonces };
     rec.ctx(class, None, &ctx);
     Ok(ctx)
 }
 
-/// Exactly `asked` nonces from `nonces` (none reserved when `asked` is 0), or why not. What the
-/// source reserved is journaled through `rec` under `class`, filed under `wall`, even when it
-/// is not what was asked for: those values are spent all the same (0006).
+/// Exactly `asked` nonces from `nonces` (none reserved when `asked` is 0) with the time `now`
+/// gives once they are reserved, or why not. What the source reserved is journaled through
+/// `rec` under `class`, filed under that time, even when it is not what was asked for: those
+/// values are spent all the same (0006).
 fn reserve(
     nonces: &mut dyn NonceSource,
     asked: u16,
     rec: &Recorder,
     class: TrafficClass,
-    wall: WallNs,
-) -> Result<NonceBlock, ExecSessionError> {
+    now: impl FnOnce() -> (MonoNs, WallNs),
+) -> Result<(NonceBlock, (MonoNs, WallNs)), ExecSessionError> {
     let block = match asked {
         0 => NonceBlock::EMPTY,
         n => nonces.reserve(n),
     };
-    rec.nonces(class, wall, &block);
+    let at = now();
+    rec.nonces(class, at.1, &block);
     if block.len() != usize::from(asked) {
         let reserved = block.len();
         return Err(ExecSessionError::Nonces { asked, reserved });
     }
-    Ok(block)
+    Ok((block, at))
 }
 
 /// Whether `fx`, an encode's effects for request `rpc` of traffic class `class`, may be executed:
