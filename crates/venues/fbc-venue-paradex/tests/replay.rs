@@ -286,9 +286,9 @@ async fn decoder_replay_of_the_journal_rebuilds_the_paradex_books_byte_identical
             channels,
             [
                 "bbo.BTC-USD-PERP",
-                "order_book.BTC-USD-PERP.deltas@15@50ms",
+                "order_book.BTC-USD-PERP.deltas",
                 "trades.BTC-USD-PERP",
-                "order_book.ETH-USD-PERP.deltas@15@50ms",
+                "order_book.ETH-USD-PERP.deltas",
             ]
         );
     }

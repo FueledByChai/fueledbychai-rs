@@ -3,7 +3,7 @@
 //! subscribe requests, their acknowledgements and errors stay JSON).
 //!
 //! [`ParadexMd`] subscribes with one JSON-RPC `subscribe` text frame per channel
-//! (`bbo.{market}`, `trades.{market}`, `order_book.{market}.{feed_type}@15@50ms`), and decodes
+//! (`bbo.{market}`, `trades.{market}`, `order_book.{market}.{feed_type}`), and decodes
 //! `BboEvent` (template 2) into [`MdEvent::Touch`], `TradeEvent` (template 1) into
 //! [`MdEvent::Trade`], `BookEvent` (template 3) into book events ([`book`]) and
 //! `MarketSummaryEvent` (template 4, `markets_summary.{market}`) into [`MdEvent::Mark`] and

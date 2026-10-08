@@ -3,7 +3,9 @@
 //!
 //! A frame does not name its channel, only its market, so each connection carries at most one
 //! book channel per market (the factory's `plan_md` spreads them; [`ParadexMd`]'s `subscribe`
-//! refuses a second), and a frame's book is the one its market holds on the connection.
+//! refuses a second), and a frame's book is the one its market holds on the connection. The
+//! venue enforces the same: a second `order_book` channel of a market "cannot share an SBE
+//! session" with the first (decision 0074).
 //!
 //! seq_no is tracked per book. A snapshot (`pkgType` SNAPSHOT, the channel's update type `s`)
 //! becomes `BookSnapshotBegin`, its levels and `BookSnapshotEnd`, and anchors the sequence. A
@@ -24,14 +26,16 @@ use fbc_core::{
 use super::sbe::{Block, Message};
 use super::{lots, market, micros, price, required, seq};
 
-/// The `order_book.{market}.deltas@15@50ms` channel: index 0 of the caps' `books`.
+/// The `order_book.{market}.deltas` channel: index 0 of the caps' `books`.
 pub const DELTAS: BookId = BookId(0);
-/// The `order_book.{market}.interactive_deltas@15@50ms` channel: index 1 of the caps' `books`.
+/// The `order_book.{market}.interactive_deltas` channel: index 1 of the caps' `books`.
 pub const INTERACTIVE_DELTAS: BookId = BookId(1);
 
-/// Each book channel's feed type and parameters, as docs.paradex.trade spells the channel
-/// `order_book.{market_symbol}.{feed_type}@15@{refresh_rate}`, indexed by [`BookId`].
-pub const BOOK_CHANNELS: [&str; 2] = ["deltas@15@50ms", "interactive_deltas@15@50ms"];
+/// Each book channel's feed type, the channel being `order_book.{market_symbol}.{feed_type}`,
+/// indexed by [`BookId`]. No `@{depth}@{refresh_rate}` suffix: docs.paradex.trade spells one,
+/// but on the SBE socket the venue refuses it ("no parameters expected for deltas topic.") and
+/// acknowledges the bare names, which carry the whole book on every change (decision 0074).
+pub const BOOK_CHANNELS: [&str; 2] = ["deltas", "interactive_deltas"];
 
 /// What the codec asks the runtime when a book's sequence breaks.
 pub const RESYNC_REASON: &str = "Paradex book seq_no discontinuity";

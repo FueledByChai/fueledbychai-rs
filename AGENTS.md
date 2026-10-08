@@ -341,8 +341,9 @@ rather than guess.
     only redacted, the refresh timer apart from the signature's expiry, and Test Connection as a
     two-round plan, 0048; and market data: an SBE reader gated on each
     frame's block lengths, bbo and trades decoded into touches and trades, the order book
-    deltas into book events with seq_no continuity (0022), held to the hand-built frames and one
-    captured public frame in `fixtures/paradex/md/`; the REST `/orderbook` snapshot at depth 15
+    deltas into book events with seq_no continuity (0022), held to the hand-built frames and
+    captured public frames and sessions in `fixtures/paradex/md/` (the bare `deltas` and
+    `interactive_deltas` channels, 0074); the REST `/orderbook` snapshot at depth 15
     (`src/md/rest.rs`); order entry's `ExecCaps` with each value cited and the undocumented ones
     declared conservatively (`src/exec/`, 0054); the private `OrderEvent` at SBE 1:2 decoded
     into order updates, a modify's SUCCESS an amend and its REJECTED an asynchronous reject

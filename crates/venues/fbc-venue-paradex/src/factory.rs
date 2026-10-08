@@ -318,23 +318,26 @@ impl VenueFactory for ParadexFactory {
     }
 }
 
-/// One `order_book` channel at depth 15 and the 50ms refresh rate (decision 0022).
+/// One `order_book` channel: the whole book on every change (decision 0074).
 fn book(channel: &'static str, includes: &[Channel]) -> BookCaps {
     BookCaps {
         channel,
-        // The channel's "@15".
-        max_depth: 15,
-        // The channel's refresh rate: changes published at most every 50ms.
-        cadence: Cadence::Capped(Duration::from_millis(50)),
+        // No depth: the bare channel's snapshot is the whole book (the 2026-10-08 captures:
+        // 115 bids and 60 asks, 120 and 64), and its deltas keep it whole.
+        max_depth: u16::MAX,
+        // A frame per change of the orderbook sequence: consecutive seq_nos, frames under a
+        // millisecond apart in the captures (no refresh-rate parameter is accepted).
+        cadence: Cadence::Realtime,
         // Decision 0022: the schema's BookEvent.seq ("DELTA must be applied in order") advances
-        // by one per frame, as FueledByChaiTrading's recorder (BookEpochSequencer) holds it.
+        // by one per frame, as FueledByChaiTrading's recorder (BookEpochSequencer) holds it,
+        // and as the captures show (decision 0074).
         continuity: Continuity::PlusOne,
-        // The venue keeps the top 15 itself with deltas; it sends no window bounds.
+        // The whole book: no window, and no window bounds sent.
         windowed: false,
         // The channel starts with a snapshot (update type "s"); no REST anchor.
         rest_anchor: false,
         includes_channels: TagSet::of(includes),
-        // Aggregated levels at a 50ms cadence: queue position only brackets.
+        // Aggregated price levels: queue position only brackets.
         queue_model: QueueModelQuality::BracketOnly,
     }
 }
@@ -420,9 +423,10 @@ fn venue_caps(exec: Option<ExecCaps>) -> VenueCaps {
                 // (BookEvent.bestBidPrice); bbo is the public book's.
                 includes_channels: TagSet::of(&[Channel::Public]),
             }],
-            // docs.paradex.trade, "order_book.{market_symbol}.{feed_type}@15@{refresh_rate}":
-            // feed types `deltas` and `interactive_deltas` at the 50ms refresh rate, both
-            // carried as the schema's BookEvent (template 3).
+            // `order_book.{market_symbol}.{feed_type}` with feed types `deltas` and
+            // `interactive_deltas`, both carried as the schema's BookEvent (template 3). The
+            // `@15@{refresh_rate}` suffix docs.paradex.trade spells is refused on the SBE socket
+            // (decision 0074).
             // The schema's BookEvent: the interactive feed's best prices are "including RPI",
             // so its levels show RPI liquidity too.
             books: vec![
@@ -460,8 +464,9 @@ fn venue_caps(exec: Option<ExecCaps>) -> VenueCaps {
             // it belongs to ("Binary Encoding (SBE)": "Frames do not explicitly identify their
             // channel"). bbo, trades and one book channel per market share a connection; a
             // market's second book channel goes on another (decision 0022), as plan_md plans
-            // and the codec's subscribe enforces. docs.paradex.trade states no cap on
-            // subscriptions per connection.
+            // and the codec's subscribe enforces. The venue refuses it too: a market's second
+            // order_book channel "cannot share an SBE session" (decision 0074).
+            // docs.paradex.trade states no cap on subscriptions per connection.
             topology: ConnTopology::SharedOneBookPerInstrument {
                 max_subscriptions: None,
             },

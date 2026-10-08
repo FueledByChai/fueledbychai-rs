@@ -14,7 +14,8 @@ use serde_json::{Map, Value};
 
 use super::{lots_of, market};
 
-/// The depth asked for: the 15 levels per side the `@15` book channels carry.
+/// The depth asked for: 15 levels per side, compared with the top 15 of the stream-built book,
+/// which carries the whole book (decision 0074).
 pub const ORDERBOOK_DEPTH: usize = 15;
 
 /// The order channels the response's `bids` and `asks` show: the public book. The response

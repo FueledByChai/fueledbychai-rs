@@ -359,7 +359,10 @@ fn malformed_book_frames_are_refused_with_nothing_pushed_and_the_sequence_kept()
 }
 
 #[test]
-fn the_codec_subscribes_each_book_channel_by_its_documented_name() {
+fn the_codec_subscribes_each_book_channel_by_the_name_the_venue_accepts() {
+    // FBC-yj56: Paradex refuses the documented `deltas@15@50ms` ("no parameters expected for
+    // deltas topic.") and accepts the bare names (decision 0074; the captured acknowledgements
+    // in tests/md_live_capture.rs).
     let mut codec = ParadexMd::new(STREAM);
     let mut fx = fbc_core::Effects::new();
     let subs = [
@@ -381,8 +384,8 @@ fn the_codec_subscribes_each_book_channel_by_its_documented_name() {
     assert_eq!(
         channels,
         [
-            "order_book.BTC-USD-PERP.deltas@15@50ms",
-            "order_book.ETH-USD-PERP.interactive_deltas@15@50ms"
+            "order_book.BTC-USD-PERP.deltas",
+            "order_book.ETH-USD-PERP.interactive_deltas"
         ]
     );
 }
@@ -492,13 +495,12 @@ fn the_factory_declares_both_book_channels_with_their_continuity() {
     use fbc_core::{Cadence, Channel, Continuity, QueueModelQuality, SeqDomain, TagSet};
     let md = caps().md;
     let channels: Vec<_> = md.books.iter().map(|b| b.channel).collect();
-    assert_eq!(channels, ["deltas@15@50ms", "interactive_deltas@15@50ms"]);
+    assert_eq!(channels, ["deltas", "interactive_deltas"]);
     for book in &md.books {
-        assert_eq!(book.max_depth, 15);
-        assert_eq!(
-            book.cadence,
-            Cadence::Capped(std::time::Duration::from_millis(50))
-        );
+        // The bare channels carry the whole book on every change (decision 0074): the captured
+        // snapshots hold 115 and 120 bids, and frames arrive under a millisecond apart.
+        assert_eq!(book.max_depth, u16::MAX);
+        assert_eq!(book.cadence, Cadence::Realtime);
         assert_eq!(book.continuity, Continuity::PlusOne);
         assert!(!book.windowed && !book.rest_anchor);
         assert_eq!(book.queue_model, QueueModelQuality::BracketOnly);

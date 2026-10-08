@@ -1,8 +1,9 @@
 # Paradex SBE market-data frames
 
-Hand-built, except two captured frames: each `.sbe.txt` file is one binary frame written as
-whitespace-separated hex bytes, one field per line, `#` to the end of a line a comment, and each
-`.sbe` file is a frame's raw bytes. No account, order or fill frame and no account value is
+Hand-built, except the captured frames: each `.sbe.txt` file is one binary frame written as
+whitespace-separated hex bytes, one field per line, `#` to the end of a line a comment, each
+`.sbe` file is a frame's raw bytes, and each `.jsonl` file a captured session's frames, one JSON
+object per line (see below). No account, order or fill frame and no account value is
 here (0009).
 
 Layouts follow Paradex's published schema, `paradex_1_0.xml` in
@@ -37,6 +38,8 @@ that file describes for versions below 2.
 | `markets-summary-v0.sbe.txt` | `MarketSummaryEvent` (template 4) at schema version 0: a 216-byte root block, fundingRate only at 8 decimals |
 | `markets-summary-v1.sbe.txt` | The same values at schema version 1: a 240-byte root block, with `forwardRate`, `riskFreeRate` and `fundingRatePrecise` appended |
 | `eth-markets-summary-2026-09-23.sbe` | Captured, raw bytes, version 1: see below |
+| `btc-order-book-deltas-2026-10-08.jsonl` | Captured: BTC-USD-PERP's `order_book.BTC-USD-PERP.deltas` session, see below |
+| `btc-order-book-interactive-deltas-2026-10-08.jsonl` | Captured: BTC-USD-PERP's `order_book.BTC-USD-PERP.interactive_deltas` session, see below |
 
 The snapshot and the deltas at 1001, 1002 and 1003 are a continuous sequence; 1004 after 1002
 is a skipped seq_no, and 1001 or 1002 after 1002 a backwards one (`tests/md_book.rs`).
@@ -72,3 +75,16 @@ received from the same WebSocket and URL on 2026-09-23 and kept as the
 `LIVE_MARKET_SUMMARY_ETH` hex constant of the same Java test. It is public market data, a
 market's ticker, with no account, order or fill in it. The bytes here are that constant,
 unchanged.
+
+`btc-order-book-deltas-2026-10-08.jsonl` and `btc-order-book-interactive-deltas-2026-10-08.jsonl`
+are two sessions of Paradex's public production WebSocket, at the same URL, captured on
+2026-10-08 (UTC) for FBC-yj56 by subscribing one channel each: `order_book.BTC-USD-PERP.deltas`
+(about 30 s) and `order_book.BTC-USD-PERP.interactive_deltas` (about 25 s). Each line is one
+frame as received: `t_ns` (the capturing machine's receive time, nanoseconds since the Unix
+epoch), `opcode` (`text` or `binary`), and the frame, in `text` or in standard base64 in `b64`.
+The first line is the subscribe acknowledgement naming the channel; then 289 and 299
+`BookEvent` frames, each a SNAPSHOT of the whole book (115 bids and 60 asks; 120 and 64)
+followed by DELTAs at consecutive seq_nos (7687289234 to 7687289522; 7687289525 to
+7687289823). It is public market data: order book levels of a public channel and the venue's
+acknowledgement, with no account, order, fill, credential or token in it. The files are the
+capture, unchanged (`tests/md_live_capture.rs`, decision 0074).
