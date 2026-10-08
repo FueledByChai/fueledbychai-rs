@@ -115,6 +115,8 @@ enum Twist {
     OpenAgreesAfterAmend,
     /// An amended order's update is followed by a fill of a lot of the order.
     FillsOnAmend,
+    /// A placement's acceptance is followed by a fill of a lot of the order.
+    FillsOnPlacement,
     /// An amended order's update is followed by another naming another new venue id.
     RenamedTwice,
     /// Every acceptance naming no venue id (the arm's, the amend's) names a stranger's.
@@ -352,6 +354,10 @@ static RENAMED_TWICE: Variant = Variant {
 static FILLS_ON_AMEND: Variant = Variant {
     caps: |_| {},
     twist: Twist::FillsOnAmend,
+};
+static FILLS_ON_PLACEMENT: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::FillsOnPlacement,
 };
 /// The toy declaring that an amended order keeps its venue id, which its events still replace.
 static KEEPS_VID: Variant = Variant {
@@ -869,19 +875,45 @@ fn fills_on_amend(ev: ExecEvent) -> Vec<ExecEvent> {
     let VenueOrderState::Amended { new_vid } = &u.state else {
         return vec![ev];
     };
+    let fill = fill_of(new_vid.clone(), u.cid, u.px.unwrap_or(fbc_core::Ticks(1)));
+    vec![ev, fill]
+}
+
+/// A placement's acceptance naming its venue id, then a fill of a lot of the order under it,
+/// naming no client id.
+fn fills_on_placement(ev: ExecEvent) -> Vec<ExecEvent> {
+    let ExecEvent::Outcome {
+        item: Some(ItemRef { vid: Some(vid), .. }),
+        outcome: SubmitOutcome::Accepted { .. },
+        ..
+    } = &ev
+    else {
+        return vec![ev];
+    };
+    let fill = fill_of(Some(vid.clone()), None, fbc_core::Ticks(1));
+    vec![ev, fill]
+}
+
+/// A maker fill of a lot of the toy's buy on its first instrument, naming the order by `vid`
+/// and `cid`, at `px`.
+fn fill_of(
+    vid: Option<fbc_core::VenueOrderId>,
+    cid: Option<fbc_core::CidMatch>,
+    px: fbc_core::Ticks,
+) -> ExecEvent {
     let usdc = fbc_core::AssetSym::new("USDC").unwrap();
     let fee = toy::with_scope(|scope| scope.fee(0, usdc)).unwrap();
     let fill_id = toy::with_scope(|scope| scope.fill_id("toy-fill")).unwrap();
     let fill = fbc_core::FillEvent {
         ident: fbc_core::FillIdent::Venue {
             fill: fill_id,
-            vid: new_vid.clone(),
+            vid,
             cum_after: None,
         },
-        cid: u.cid,
-        inst: u.inst,
-        side: u.side,
-        px: u.px.unwrap_or(fbc_core::Ticks(1)),
+        cid,
+        inst: toy::INST_A,
+        side: fbc_core::Side::Buy,
+        px,
         qty: fbc_core::Lots::new(1).unwrap(),
         liquidity: fbc_core::Liquidity3::Maker,
         fee,
@@ -889,7 +921,7 @@ fn fills_on_amend(ev: ExecEvent) -> Vec<ExecEvent> {
         realized_funding: None,
         replay: false,
     };
-    vec![ev, ExecEvent::Fill(fill)]
+    ExecEvent::Fill(fill)
 }
 
 /// Every acceptance naming no venue id, naming a stranger's.
@@ -1210,6 +1242,7 @@ impl ExecCodec for Twisted {
             Twist::OpenAfterAmend => open_after_amend,
             Twist::OpenAgreesAfterAmend => open_agrees_after_amend,
             Twist::FillsOnAmend => fills_on_amend,
+            Twist::FillsOnPlacement => fills_on_placement,
             Twist::RenamedTwice => renamed_twice,
             Twist::StrangerVidOnAck => stranger_vid_on_ack,
             _ => kept,
@@ -2139,6 +2172,15 @@ fn amend_ack_passes_a_toy_whose_open_update_after_the_amend_states_what_it_asked
 #[test]
 fn amend_ack_fails_a_toy_that_reports_a_fill_of_the_order_it_amends() {
     let failure = failed(suite::amend_ack(&FILLS_ON_AMEND.subject(assumed)));
+    assert!(
+        says(&failure, "ExecEvent::Fill", "the stub filled nothing"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn amend_ack_fails_a_toy_that_reports_a_fill_of_the_order_it_places() {
+    let failure = failed(suite::amend_ack(&FILLS_ON_PLACEMENT.subject(assumed)));
     assert!(
         says(&failure, "ExecEvent::Fill", "the stub filled nothing"),
         "{failure}"

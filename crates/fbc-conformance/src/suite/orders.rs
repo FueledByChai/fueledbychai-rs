@@ -18,9 +18,9 @@
 //!   `cid_echoed_on_events`, and nothing is written beyond the two requests. Where the amended order gets a new venue id
 //!   (`AmendCaps.keeps_venue_id` false), every update names the same one; where it keeps its id, the update
 //!   names no new one. The placement's acceptance is its one item's, or the whole request's,
-//!   once as `OrderCaps.ack` has it. Once the amend is sent, nothing refuses the order (an
-//!   `AsyncReject` naming it), ends it (a terminal `OrderUpdate`) or fills it (an
-//!   `ExecEvent::Fill` naming it).
+//!   once as `OrderCaps.ack` has it. Nothing fills the order (an `ExecEvent::Fill` naming it),
+//!   in the placement's answer or later; once the amend is sent, nothing refuses it (an
+//!   `AsyncReject` naming it) or ends it (a terminal `OrderUpdate`).
 //! - `mixed_batch`: a batch of three placements is answered item by item, the first accepted,
 //!   the second rejected and the third never; once its deadline passes, the first is
 //!   `Accepted`, the second `Rejected` and the third `Unknown`, each by its index, and nothing
@@ -34,9 +34,9 @@
 use std::time::Duration;
 
 use fbc_core::{
-    AckLevel, AckModel, AmendAck, AmendCaps, CidMatch, ClientOrderId, ExecEvent, ItemRef, Lots,
-    OpKind, OrderKindTag, OrderUpdate, RpcId, Side, SubmitOutcome, Ticks, TifTag, VenueOrderId,
-    VenueOrderState,
+    AckLevel, AckModel, AmendAck, AmendCaps, CidMatch, ClientOrderId, ExecEvent, FillEvent,
+    ItemRef, Lots, OpKind, OrderKindTag, OrderUpdate, RpcId, Side, SubmitOutcome, Ticks, TifTag,
+    VenueOrderId, VenueOrderState,
 };
 
 use super::harness::{Harness, Shape};
@@ -158,6 +158,9 @@ pub fn amend_ack(subject: &Subject<'static>) -> Result<Verdict, Failure> {
             breaches.push(Breach::new("ExecCodec: never resent", what));
         }
         breaches.extend(contradicted(&c.events()[before..], &asked, &updates));
+        // The placement's answer, which the replay above applies no fill of, fills nothing
+        // either: a consumer's fill ledger would apply one (Codex r4224934341).
+        breaches.extend(filled(&c.events()[..before], &asked));
         Ok(breaches)
     })?;
     verdict(AMEND_ACK, breaches, || {
@@ -466,6 +469,27 @@ fn contradicted(events: &[ExecEvent], asked: &Asked, updates: &[OrderUpdate]) ->
         }
     }
     breaches
+}
+
+/// The fills, of `events` (those reported before the amend was sent), naming the order the
+/// stub rested and filled nothing of, by its client id or the venue id it was placed under.
+fn filled(events: &[ExecEvent], asked: &Asked) -> Vec<Breach> {
+    let names = |fill: &FillEvent| {
+        fill.cid == Some(CidMatch::Ours(asked.cid))
+            || (asked.placed.is_some() && fill.vid() == asked.placed.as_ref())
+    };
+    let fills = events.iter().filter_map(|event| match event {
+        ExecEvent::Fill(fill) if names(fill) => Some(fill),
+        _ => None,
+    });
+    let breach = |fill| {
+        let what = format!(
+            "a fill {fill:?} of the order the stub placed was reported before its amend; the \
+             stub filled nothing"
+        );
+        Breach::new("ExecEvent::Fill", what)
+    };
+    fills.map(breach).collect()
 }
 
 /// Whether `state` ends an order.
