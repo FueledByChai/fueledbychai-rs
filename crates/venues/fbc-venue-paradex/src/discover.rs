@@ -45,8 +45,9 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde_json::{Map, Value};
 
-use crate::auth::{self, REST_URL, TIMEOUT};
+use crate::auth::{REST_URL, TIMEOUT};
 use crate::factory::duration;
+use crate::url;
 
 /// The tag of discovery's one request.
 pub const MARKETS_TAG: HttpTag = HttpTag(1);
@@ -81,8 +82,9 @@ const OTHER_KINDS: &[&str] = &["PERP_OPTION", "OPTION", "FUTURE", "SPOT"];
 const NANOS: i64 = 1_000_000_000;
 
 /// The market list's URL: the REST base ([`REST_URL`]) and [`MARKETS_PATH`]. The base is read
-/// as src/auth reads it for the login: `https://`, or `http://` to a loopback test stub; a host,
-/// an optional port and the path `/v1` alone; no query, fragment or user. Refused naming
+/// as src/auth reads it for the login: `https://`, or `http://` to a loopback test stub; a host
+/// the runtime opens (a DNS name, an IPv4 address or a bracketed IPv6 address), an optional
+/// port from 1 to 65535 and the path `/v1` alone; no query, fragment or user. Refused naming
 /// [`REST_URL`], never echoing the value.
 pub fn markets_url(cfg: &VenueConfig) -> Result<WireUrl, ConfigError> {
     let text = cfg.get(REST_URL).ok_or(ConfigError::Missing(REST_URL))?;
@@ -106,10 +108,16 @@ pub fn markets_url(cfg: &VenueConfig) -> Result<WireUrl, ConfigError> {
         ));
     }
     let (authority, path) = after.split_at(after.find('/').unwrap_or(after.len()));
-    if authority.is_empty() || path != "/v1" {
+    if path != "/v1" {
         return Err(invalid("give a host and the path /v1 alone"));
     }
-    if plain && !auth::is_loopback_authority(authority) {
+    // Parsed here, so a base the runtime could not open is refused when it is configured, not
+    // found as a request never sent (Codex r4218015211).
+    let host = url::host(authority).ok_or(invalid(
+        "the REST base's host is not a DNS name, an IPv4 address or a bracketed IPv6 address, \
+         with an optional port from 1 to 65535",
+    ))?;
+    if plain && !host.is_loopback() {
         return Err(invalid(
             "http:// is for a loopback test stub only (127.0.0.0/8, ::1 or localhost): give an \
              https:// base",

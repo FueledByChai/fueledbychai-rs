@@ -19,5 +19,6 @@ pub mod exec;
 pub mod factory;
 pub mod md;
 pub mod sign;
+mod url;
 
 pub use factory::ParadexFactory;
