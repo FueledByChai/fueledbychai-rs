@@ -49,6 +49,7 @@ use fbc_core::{
     SignedLots, SizeStep, SpecTable, SubmitOutcome, Ticks, Tif, TradingStatus, UnderlyingId,
     VenueConfig, VenueFactory, VenueId, WallNs, dispatch_market_data,
 };
+use fbc_journal::NonceSourceId;
 use fbc_oms::{
     CancelChoice, CancelEverything, FillLedger, LadderConfig, LeaseKeys, Leases, LedgerConfig,
     MarketCapsConfig, OrdState, PositionCheck, PreTradeCaps, Registry, ResyncReport,
@@ -665,6 +666,9 @@ fn session_config(
         .expect("valid pacing"),
         clock: IngestClock::new(),
         nonces: Box::new(Counting(1)),
+        // One source for the account: Paradex's scope is `NonceScope::None`, so the one
+        // `Counting` this run reserves from is the account's, journaled under its number (0078).
+        nonce_source: NonceSourceId(u32::from(ACCT.get())),
         conn: 0,
         limiter,
         write_stall: WriteStall::new(Duration::from_secs(10)).expect("a non-zero window"),

@@ -248,7 +248,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             _ if flag_name(&flag).is_some() => {
                 return Err(match flag.split_once('=') {
                     Some((name, _)) => format!(
-                        "unknown argument {name} typed with '=' (the value is not shown: it may                          be a secret); give a flag's value as the next argument; --help lists                          them"
+                        "unknown argument {name} typed with '=' (the value is not shown: it may \
+                         be a secret); give a flag's value as the next argument; --help lists \
+                         them"
                     ),
                     None => format!("unknown argument {flag}; --help lists them"),
                 });
@@ -329,11 +331,11 @@ pub enum Target {
     LoopbackStub,
 }
 
-/// The testnet guard, run before anything connects: the REST base must be `https://` to
-/// Paradex's testnet REST host and the WebSocket `wss://` to its testnet WebSocket host, or both
-/// a loopback host (a test stub), and the chain id (`PARADEX_CHAIN_ID` when set, else the
-/// testnet's) must be [`TESTNET_CHAIN`], by name or as its felt in decimal or hex. Refused
-/// naming what is not testnet.
+/// The testnet guard, run before anything connects: the REST base must be exactly
+/// [`TESTNET_REST`] and the WebSocket exactly [`TESTNET_WS`], or both a loopback stub's (a test
+/// stub on this machine, its path exactly `/v1`), and the chain id (`PARADEX_CHAIN_ID` when
+/// set, else the testnet's) must be [`TESTNET_CHAIN`], by name or as its felt in decimal or hex.
+/// Refused naming what is not testnet.
 pub fn testnet_guard(rest: &str, ws: &str, chain: Option<&str>) -> Result<Target, String> {
     let target = testnet_urls(rest, ws)?;
     match chain {
@@ -416,12 +418,14 @@ fn testnet_urls(rest: &str, ws: &str) -> Result<Target, String> {
         (false, false) => {
             if rest != TESTNET_REST {
                 return Err(format!(
-                    "--rest-url: not Paradex's testnet REST base, exactly {TESTNET_REST}, or a                      loopback stub's; testnet_trade is testnet only{SHOWN_NOT}"
+                    "--rest-url: not Paradex's testnet REST base, exactly {TESTNET_REST}, or a \
+                     loopback stub's; testnet_trade is testnet only{SHOWN_NOT}"
                 ));
             }
             if ws != TESTNET_WS {
                 return Err(format!(
-                    "--ws-url: not Paradex's testnet WebSocket, exactly {TESTNET_WS}, or a                      loopback stub's; testnet_trade is testnet only{SHOWN_NOT}"
+                    "--ws-url: not Paradex's testnet WebSocket, exactly {TESTNET_WS}, or a \
+                     loopback stub's; testnet_trade is testnet only{SHOWN_NOT}"
                 ));
             }
             Ok(Target::Testnet)

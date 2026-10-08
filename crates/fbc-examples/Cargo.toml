@@ -15,6 +15,7 @@ publish = false
 [dev-dependencies]
 fbc-conformance = { path = "../fbc-conformance" }
 fbc-core = { path = "../fbc-core" }
+fbc-journal = { path = "../fbc-journal" }
 fbc-oms = { path = "../fbc-oms" }
 fbc-runtime = { path = "../fbc-runtime" }
 fbc-venue-binance-usdm = { path = "../venues/fbc-venue-binance-usdm" }
