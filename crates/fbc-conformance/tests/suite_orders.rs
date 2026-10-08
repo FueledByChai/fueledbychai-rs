@@ -89,6 +89,10 @@ enum Twist {
     NoFlagsOnAmend,
     /// 70 ms after the connection opens, a maintenance frame is written.
     MaintainsAt70Ms,
+    /// An amended order's update carries no client id.
+    NoCidOnAmend,
+    /// The first frame read after an amend is written writes the amend again.
+    ResendsAmend,
     /// An amended order's update states a price one tick above the amend's.
     WrongPx,
     /// A frame `early` reports the last request it wrote timed out, at once, long before its
@@ -268,6 +272,14 @@ static FIFTY_MS_WINDOW: Variant = Variant {
         });
     },
     twist: Twist::MaintainsAt70Ms,
+};
+static NO_CID_ON_AMEND: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::NoCidOnAmend,
+};
+static RESENDS_AMEND: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::ResendsAmend,
 };
 static FILLED_ON_AMEND: Variant = Variant {
     caps: |_| {},
@@ -471,6 +483,7 @@ impl VenueFactory for Variant {
                 reconnected: false,
                 rpc: None,
                 early: None,
+                amend: None,
             };
             Box::new(twisted) as Box<dyn ExecCodec>
         }))
@@ -504,6 +517,8 @@ struct Twisted {
     rpc: Option<RpcId>,
     /// The request it reported timed out early, for [`Twist::EagerTimeout`].
     early: Option<RpcId>,
+    /// The amend frame it wrote and has not written again, for [`Twist::ResendsAmend`].
+    amend: Option<Vec<u8>>,
 }
 
 /// A sink handing `inner` the events `f` rewrites each into.
@@ -737,6 +752,17 @@ fn post_only_on_amend(ev: ExecEvent) -> Vec<ExecEvent> {
     vec![match ev {
         ExecEvent::Order(mut u) if matches!(u.state, VenueOrderState::Amended { .. }) => {
             u.post_only = Some(true);
+            ExecEvent::Order(u)
+        }
+        other => other,
+    }]
+}
+
+/// An amended order's update without its client id.
+fn no_cid_on_amend(ev: ExecEvent) -> Vec<ExecEvent> {
+    vec![match ev {
+        ExecEvent::Order(mut u) if matches!(u.state, VenueOrderState::Amended { .. }) => {
+            u.cid = None;
             ExecEvent::Order(u)
         }
         other => other,
@@ -999,6 +1025,11 @@ impl ExecCodec for Twisted {
             {
                 self.last = Some(frame.bytes().to_vec());
             }
+            if let Effect::Send { frame, .. } = &effect
+                && matches!(cmd, VenueCommand::Amend(_))
+            {
+                self.amend = Some(frame.bytes().to_vec());
+            }
             fx.push(effect);
         }
         Ok(receipt)
@@ -1037,11 +1068,18 @@ impl ExecCodec for Twisted {
             Twist::AmendedTwice => amended_twice,
             Twist::PostOnlyOnAmend => post_only_on_amend,
             Twist::NoFlagsOnAmend => no_flags_on_amend,
+            Twist::NoCidOnAmend => no_cid_on_amend,
             Twist::WrongPx => wrong_px,
             _ => kept,
         };
         let sink = &mut Rewrite { inner: sink, f: f_ };
-        self.inner.on_frame(stream, f, scope, specs, sink, fx)
+        let decoded = self.inner.on_frame(stream, f, scope, specs, sink, fx);
+        if self.twist == Twist::ResendsAmend
+            && let Some(frame) = self.amend.take()
+        {
+            fx.push(again(&frame));
+        }
+        decoded
     }
 
     fn on_http(
@@ -1917,4 +1955,26 @@ fn amend_ack_fails_a_toy_whose_amended_update_misstates_or_omits_the_flags_it_ec
 fn a_limit_is_waited_out_by_its_window_and_no_more() {
     let passed = suite::amend_ack(&FIFTY_MS_WINDOW.subject(assumed));
     assert!(matches!(passed, Ok(Verdict::Passed { .. })), "{passed:?}");
+}
+
+#[test]
+fn amend_ack_fails_a_toy_whose_amended_update_omits_the_client_id_it_echoes() {
+    let failure = failed(suite::amend_ack(&NO_CID_ON_AMEND.subject(assumed)));
+    assert!(
+        says(&failure, "OrderUpdate", "names the amended order by"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn amend_ack_fails_a_toy_that_writes_the_amend_again_once_answered() {
+    let failure = failed(suite::amend_ack(&RESENDS_AMEND.subject(assumed)));
+    assert!(
+        says(
+            &failure,
+            "ExecCodec: never resent",
+            "the check never asked for"
+        ),
+        "{failure}"
+    );
 }
