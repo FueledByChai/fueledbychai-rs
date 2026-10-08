@@ -361,13 +361,13 @@ fn testnet_urls(rest: &str, ws: &str) -> Result<Target, String> {
         (false, false) => {
             if rest_host != TESTNET_REST_HOST || plain(rest) {
                 return Err(format!(
-                    "--rest-url {rest}: not Paradex's testnet REST base (https://{TESTNET_REST_HOST}/v1) \
+                    "--rest-url (host {rest_host}): not Paradex's testnet REST base (https://{TESTNET_REST_HOST}/v1) \
                      or a loopback stub; testnet_trade is testnet only"
                 ));
             }
             if ws_host != TESTNET_WS_HOST || plain(ws) {
                 return Err(format!(
-                    "--ws-url {ws}: not Paradex's testnet WebSocket (wss://{TESTNET_WS_HOST}/v1) \
+                    "--ws-url (host {ws_host}): not Paradex's testnet WebSocket (wss://{TESTNET_WS_HOST}/v1) \
                      or a loopback stub; testnet_trade is testnet only"
                 ));
             }
@@ -382,9 +382,10 @@ fn testnet_urls(rest: &str, ws: &str) -> Result<Target, String> {
 }
 
 /// The lowercased host of `url` (without port), which must start with one of `schemes` and name
-/// no user.
+/// no user, query or fragment. A refusal names the flag, never the URL: what was typed may carry
+/// a secret (a password, a token).
 fn host_of(url: &str, schemes: &[&str], flag: &str) -> Result<String, String> {
-    let bad = |why: &str| format!("{flag} {url}: {why}");
+    let bad = |why: &str| format!("{flag}: {why} (the URL is not shown: it may carry a secret)");
     let rest = schemes
         .iter()
         .find_map(|s| url.strip_prefix(s))
@@ -392,6 +393,9 @@ fn host_of(url: &str, schemes: &[&str], flag: &str) -> Result<String, String> {
     let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
     if authority.contains('@') {
         return Err(bad("a URL with a user is refused"));
+    }
+    if rest.contains(['?', '#']) {
+        return Err(bad("a URL with a query or a fragment is refused"));
     }
     let host = match authority.strip_prefix('[') {
         Some(v6) => format!(
@@ -402,6 +406,13 @@ fn host_of(url: &str, schemes: &[&str], flag: &str) -> Result<String, String> {
     };
     if host.is_empty() {
         return Err(bad("no host"));
+    }
+    // Printed in a later refusal: a host name's characters only.
+    if !host
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"-.[]:".contains(&b))
+    {
+        return Err(bad("not a host name"));
     }
     Ok(host.to_ascii_lowercase())
 }
@@ -433,7 +444,9 @@ fn bounded(flag: &str, value: &str, lo: u64, hi: u64) -> Result<u64, String> {
 
 /// `host:port`, the port from 1 to 65535.
 fn socks5(value: &str) -> Result<ProxyConfig, String> {
-    let bad = || format!("--socks5 {value}: not host:port");
+    // Never echoed: a proxy typed with a user and password would print them.
+    let bad =
+        || "--socks5: not host:port (the value is not shown: it may carry a secret)".to_owned();
     let (host, port) = value.rsplit_once(':').ok_or_else(bad)?;
     let port = port
         .parse::<u16>()
