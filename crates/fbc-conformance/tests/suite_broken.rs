@@ -31,6 +31,7 @@ fn assumed() -> Setup {
         specs: toy::specs(),
         cfg: VenueConfig::new(),
         creds: Secrets::new(),
+        goldens: Vec::new(),
     }
 }
 
@@ -1143,8 +1144,8 @@ fn the_broken_toy_otherwise_delegates_to_the_toy() {
     let cfg = VenueConfig::new();
     assert_eq!(b.config_schema(), ToyFactory.config_schema());
     assert_eq!(
-        b.parse_fbc_common_symbol("BTC/USDT"),
-        Err(SymbolError::NoRule)
+        b.parse_fbc_common_symbol("BTC/USD"),
+        Err(SymbolError::Unmapped)
     );
     assert!(matches!(b.discover(&cfg), Err(VenueError::NoDiscovery)));
     assert!(

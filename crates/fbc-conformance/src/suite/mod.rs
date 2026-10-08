@@ -23,9 +23,18 @@
 //!
 //! `fixtures` is a directory, relative to the adapter crate's manifest, that must exist. A
 //! check that reads recorded data reads it from a subdirectory named after the check
-//! (`<fixtures>/<check>/`), which that check's documentation describes. The checks so far
-//! read none: [`caps_truthful`] and [`commands_selfcontained`] need only the factory and the
-//! [`Setup`] the `setup` function gives, called afresh wherever a check builds a codec.
+//! (`<fixtures>/<check>/`), which that check's documentation describes:
+//!
+//! - `signing_golden/`: one `<name>.golden` file per [`Golden`] command the [`Setup`] lists,
+//!   holding the exact bytes of the frame it encodes to, and a `SYNTHETIC` file saying where
+//!   the credentials and values come from (decision 0009: golden signing vectors live in a
+//!   directory marked synthetic). The commands themselves are typed Rust values in the
+//!   [`Setup`], as fault scripts are (decision 0025).
+//! - `legacy_symbols/tickers.txt`: the Java-era ticker values, one per line; blank lines and
+//!   lines starting with `#` are ignored.
+//!
+//! [`caps_truthful`] and [`commands_selfcontained`] read no file: they need only the factory
+//! and the [`Setup`] the `setup` function gives, called afresh wherever a check builds a codec.
 //!
 //! # The checks so far
 //!
@@ -35,17 +44,25 @@
 //!   widened to the account (decision 0003).
 //! - [`commands_selfcontained`]: every amend, cancel and query encodes from the command and
 //!   the spec table alone, with a freshly built codec (decisions 0005, 0014 item 5).
+//! - [`signing_golden`]: every [`Golden`] command, encoded with its own [`EncodeCtx`] by a
+//!   freshly built codec, gives exactly the committed golden bytes, signatures included.
+//! - [`legacy_symbols`]: every Java-era ticker in the fixtures parses through the factory's
+//!   [`parse_fbc_common_symbol`](VenueFactory::parse_fbc_common_symbol) (design §4.4).
 
 mod caps_truthful;
+mod golden;
 mod harness;
+mod legacy;
 mod selfcontained;
 
 use core::fmt;
 use std::path::{Path, PathBuf};
 
-use fbc_core::{Secrets, SpecTable, VenueConfig, VenueFactory};
+use fbc_core::{EncodeCtx, RpcId, Secrets, SpecTable, VenueCommand, VenueConfig, VenueFactory};
 
 pub use caps_truthful::caps_truthful;
+pub use golden::signing_golden;
+pub use legacy::legacy_symbols;
 pub use selfcontained::commands_selfcontained;
 
 /// What the fixtures assume: the instruments, the configuration and the credentials the
@@ -58,6 +75,24 @@ pub struct Setup {
     pub cfg: VenueConfig,
     /// Synthetic credentials for `exec_codec`; empty for a venue that takes none.
     pub creds: Secrets,
+    /// The commands [`signing_golden`] encodes, each against its golden bytes; empty for a
+    /// venue that declares no order entry.
+    pub goldens: Vec<Golden>,
+}
+
+/// A command whose encoding is committed as golden bytes: [`signing_golden`] encodes it as
+/// request `rpc` under `ctx` with a freshly built codec, and its one frame must equal
+/// `<fixtures>/signing_golden/<name>.golden` byte for byte.
+#[derive(Clone, Debug)]
+pub struct Golden {
+    /// The golden file's name without `.golden`: letters, digits, `-` and `_` only.
+    pub name: &'static str,
+    /// The request id it is encoded as.
+    pub rpc: RpcId,
+    /// The time and nonces it is encoded with.
+    pub ctx: EncodeCtx,
+    /// The command.
+    pub cmd: VenueCommand,
 }
 
 /// The venue a check runs against: its factory, its fixture directory and the [`Setup`] its
@@ -227,6 +262,26 @@ macro_rules! suite {
         fn commands_selfcontained() {
             $crate::suite::run(
                 $crate::suite::commands_selfcontained,
+                &$factory,
+                concat!(env!("CARGO_MANIFEST_DIR"), "/", $fixtures),
+                $setup,
+            );
+        }
+
+        #[test]
+        fn signing_golden() {
+            $crate::suite::run(
+                $crate::suite::signing_golden,
+                &$factory,
+                concat!(env!("CARGO_MANIFEST_DIR"), "/", $fixtures),
+                $setup,
+            );
+        }
+
+        #[test]
+        fn legacy_symbols() {
+            $crate::suite::run(
+                $crate::suite::legacy_symbols,
                 &$factory,
                 concat!(env!("CARGO_MANIFEST_DIR"), "/", $fixtures),
                 $setup,

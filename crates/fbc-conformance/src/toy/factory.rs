@@ -1,7 +1,7 @@
 //! The toy's factory: what the named suite builds the toy from (`suite!`), as an adapter
 //! crate's suite builds its venue. It declares [`caps`], discovers nothing (the tests state the
-//! instruments, [`specs`]), takes no credentials (its signer holds no key) and builds a fresh
-//! [`ToyExec`] each time it is asked.
+//! instruments, [`specs`]), reads Java-era tickers by a rule of its own, takes no credentials
+//! (its signer holds no key) and builds a fresh [`ToyExec`] each time it is asked.
 //!
 //! Not modelled yet, and refused rather than guessed: the order-entry URL, which FBC-ja3 takes
 //! from the configuration with its redaction spans, and market data, which arrives with
@@ -15,9 +15,9 @@ use std::collections::BTreeSet;
 use fbc_core::{
     AccountSummary, AssetKey, ConfigError, DecodeError, DecodeScope, Effects, EndpointPlan,
     ExecCodec, ExecEndpoint, FieldSpec, HttpFailure, HttpPlan, HttpResponse, HttpTag, Inbound,
-    InboundSpans, InstrumentSpecDraft, Keepalive, MdCodec, MdSink, MonoNs, RawFrame, Secrets,
-    SpecTable, Subscription, SymbolError, TimerTag, VenueCaps, VenueConfig, VenueError,
-    VenueFactory, WallNs,
+    InboundSpans, InstrumentKind, InstrumentSpecDraft, Keepalive, MdCodec, MdSink, MonoNs,
+    RawFrame, Secrets, SpecTable, Subscription, SymbolError, TimerTag, VenueCaps, VenueConfig,
+    VenueError, VenueFactory, WallNs, common_symbol_parts,
 };
 
 use super::{ToyExec, ToySigner, caps};
@@ -43,9 +43,16 @@ impl VenueFactory for ToyFactory {
         Ok(caps())
     }
 
-    /// The toy has no Java-era tickers.
-    fn parse_fbc_common_symbol(&self, _s: &str) -> Result<AssetKey, SymbolError> {
-        Err(SymbolError::NoRule)
+    /// The toy's own rule, made up as the toy is, so `legacy_symbols` has something to read:
+    /// `X/USDT` is the perpetual on `X` quoted in `USDT` (`TOYA/USDT` names `TOYA-PERP`); any
+    /// other quote maps to no instrument, and a ticker not in `BASE/QUOTE` form is refused.
+    fn parse_fbc_common_symbol(&self, s: &str) -> Result<AssetKey, SymbolError> {
+        let (base, quote) = common_symbol_parts(s)?;
+        if quote.as_str() != "USDT" {
+            return Err(SymbolError::Unmapped);
+        }
+        let kind = InstrumentKind::Perpetual;
+        Ok(AssetKey { base, quote, kind })
     }
 
     /// The tests state the toy's instruments.

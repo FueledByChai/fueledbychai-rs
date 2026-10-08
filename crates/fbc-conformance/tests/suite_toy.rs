@@ -1,25 +1,14 @@
-//! FBC-8ew's done line, its first half: the named suite runs on the conformance toy venue
-//! through the suite macro (BT-502, design §6), `caps_truthful` and `commands_selfcontained`
-//! each a test, and both pass. The checks are run directly too, to show what they probed: a
+//! FBC-8ew's and FBC-onw's done lines, their first halves: the named suite runs on the
+//! conformance toy venue through the suite macro with its fixture directory (BT-502, design §6),
+//! `caps_truthful`, `commands_selfcontained`, `signing_golden` and `legacy_symbols` each a
+//! test, and all pass. The checks are run directly too, to show what they probed: a
 //! pass that probed nothing would prove nothing.
 
-use fbc_conformance::suite::{self, Setup, Subject, Verdict};
-use fbc_conformance::toy::{self, ToyFactory};
-use fbc_core::{Secrets, VenueConfig};
+mod toy_setup;
 
-/// What the toy's fixtures assume: its two instruments, no configuration, no credentials.
-fn assumed() -> Setup {
-    Setup {
-        specs: toy::specs(),
-        cfg: VenueConfig::new(),
-        creds: Secrets::new(),
-    }
-}
-
-const FIXTURES: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../fixtures/conformance-toy"
-);
+use fbc_conformance::suite::{self, Subject, Verdict};
+use fbc_conformance::toy::ToyFactory;
+use toy_setup::{FIXTURES, assumed};
 
 fbc_conformance::suite! {
     factory: ToyFactory,
@@ -99,6 +88,31 @@ fn commands_selfcontained_encodes_every_declared_reference_on_the_toy() {
             "CancelBatch.refs has PlacementNonce: a batch cancel",
             "OrderCaps.query_refs has Venue: a query",
             "OrderCaps.query_refs has PlacementNonce: a query",
+        ]
+    );
+}
+
+#[test]
+fn signing_golden_compares_every_golden_command_on_the_toy() {
+    assert_eq!(
+        probed(suite::signing_golden),
+        [
+            "golden place",
+            "golden place-batch",
+            "golden amend",
+            "golden cancel",
+            "golden cancel-batch",
+        ]
+    );
+}
+
+#[test]
+fn legacy_symbols_reads_every_ticker_in_the_toys_fixture() {
+    assert_eq!(
+        probed(suite::legacy_symbols),
+        [
+            "TOYA/USDT: TOYA/USDT Perpetual",
+            "TOYB/USDT: TOYB/USDT Perpetual",
         ]
     );
 }

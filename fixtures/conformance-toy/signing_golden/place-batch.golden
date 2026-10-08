@@ -1,0 +1,3 @@
+batch|rpc=22|n=2
+place|i=0|cid=00SKqVfAYJZQgpjNhBR9t|sym=TOYA-PERP|side=B|px=130865|qty=25|tif=gtc|ch=public|po=1|ro=0|ts=1759363200000000000|nonce=501|sig=6866b940bccd9328
+place|i=1|cid=00SKqVfAYJZQgpjSqbDXv|sym=TOYB-PERP|side=B|px=130865|qty=25|tif=gtc|ch=public|po=1|ro=0|ts=1759363200000000000|nonce=502|sig=d3d3ea2a628dbf47

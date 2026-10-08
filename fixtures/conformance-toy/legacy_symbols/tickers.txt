@@ -1,0 +1,6 @@
+# Java-era ticker values for the conformance toy (fbc_conformance::suite::legacy_symbols).
+# The toy describes no real venue and the Java stack never traded it: these are the values its
+# own made-up rule (X/USDT is the perpetual on X) reads, standing in for the ticker and
+# reference.exchanges values a real venue's fixtures list from exported Java configurations.
+TOYA/USDT
+TOYB/USDT
