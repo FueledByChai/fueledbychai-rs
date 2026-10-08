@@ -376,6 +376,23 @@ mod tests {
         assert_eq!(admits_all(&gate, 1), Some(false));
     }
 
+    /// The resync may end before the venue answers the arm (the order PR #119's CI run saw):
+    /// the epoch still holds every place and amend until the arm's final acceptance, which then
+    /// opens it.
+    #[test]
+    fn a_resync_that_ends_before_the_arm_is_answered_holds_places_until_the_arm_is_accepted() {
+        let mut gate = Gate::new(true);
+        gate.authenticated(0);
+        gate.arm_sent(0, RpcId(1));
+        gate.resync_asked(0);
+        gate.heard(0, &ExecEvent::ResyncEnd);
+        assert!(!gate.placing(0));
+        assert_eq!(admits_all(&gate, 0), Some(false));
+        gate.heard(0, &accepted(1));
+        assert!(gate.placing(0));
+        assert_eq!(admits_all(&gate, 0), Some(true));
+    }
+
     #[test]
     fn a_resync_ended_before_it_was_asked_for_on_the_epoch_does_not_count() {
         let mut gate = Gate::new(true);

@@ -37,10 +37,10 @@ use std::time::Duration;
 
 use common::Vectors;
 use fbc_core::{
-    AccountKey, Bps, Channel, CidMint, ClientOrderId, ConnState, InstrumentId, Lots, MarketLease,
-    Namespace, NamespaceLease, NewOrder, NonceBlock, NonceSource, OrderCaps, OrderKind, Secret,
-    Secrets, Side, SignedLots, SizeStep, SpecTable, SubmitOutcome, Ticks, Tif, VenueConfig,
-    VenueFactory, VenueSymbol, encode_cid,
+    AccountKey, AckLevel, Bps, Channel, CidMint, ClientOrderId, ConnState, InstrumentId, Lots,
+    MarketLease, Namespace, NamespaceLease, NewOrder, NonceBlock, NonceSource, OrderCaps,
+    OrderKind, Secret, Secrets, Side, SignedLots, SizeStep, SpecTable, SubmitOutcome, Ticks, Tif,
+    VenueConfig, VenueFactory, VenueSymbol, encode_cid,
 };
 use fbc_journal::{
     JournalWriter, NonceSourceId, RedactionKey, SinkConfig, WriterThread, journal_queue,
@@ -243,6 +243,12 @@ fn journal_clean(writer: WriterThread, dir: &std::path::Path, signatures: &[Stri
     );
     assert!(journal.contains("order.cancel_on_disconnect"));
     assert!(journal.contains("order.create"));
+    // The login's HTTP answer, the other record that carries the session token (Reviewer B
+    // RB-8mv-11 on PR #119).
+    assert!(
+        journal.contains("jwt_token"),
+        "the login answer is journaled"
+    );
     secrets_absent(&journal, signatures, "the journal");
 }
 
@@ -307,6 +313,7 @@ fn wire(stub: &Stub, reg: Registry) -> Wired {
         .unwrap();
     session.set_journal(Journal::new(Rc::new(RefCell::new(sink))));
     let orders = session.orders();
+    glue.borrow_mut().watch(orders.clone());
     Wired {
         glue,
         session,
@@ -329,17 +336,25 @@ async fn drive<T>(session: &mut ExecSession<GlueHandler>, driver: impl Future<Ou
     }
 }
 
-/// Waits, letting the session run, until `done` holds of the glue.
+/// Waits, letting the session run, until `done` holds of the glue: checked again each time the
+/// session hands the handler something, never on a clock; [`STEP`] only bounds the wait.
 async fn until(glue: &Rc<RefCell<Glue>>, what: &str, done: impl Fn(&Glue) -> bool) {
     let deadline = tokio::time::Instant::now() + STEP;
-    while !done(&glue.borrow()) {
-        if tokio::time::Instant::now() > deadline {
+    let changed = Rc::clone(&glue.borrow().changed);
+    loop {
+        // Registered before the check, so a change between the two is not missed.
+        let next = changed.notified();
+        tokio::pin!(next);
+        next.as_mut().enable();
+        if done(&glue.borrow()) {
+            return;
+        }
+        if tokio::time::timeout_at(deadline, next).await.is_err() {
             panic!(
                 "timed out waiting for {what}; notes: {:#?}",
                 glue.borrow().notes
             );
         }
-        tokio::time::sleep(Duration::from_millis(2)).await;
     }
 }
 
@@ -348,6 +363,65 @@ fn resyncs(g: &Glue) -> usize {
         .iter()
         .filter(|n| matches!(n, Note::Resynced { .. }))
         .count()
+}
+
+/// Whether `n` is the venue's final acceptance of the session's cancel-on-disconnect arm: the
+/// session's own request (no other it sends is reported as an `Outcome`; the codec answers the
+/// auth and subscribe frames otherwise).
+fn arm_accepted(n: &Note) -> bool {
+    matches!(
+        n,
+        Note::Outcome {
+            ours: false,
+            outcome: SubmitOutcome::Accepted {
+                ack: AckLevel::Final
+            },
+            ..
+        }
+    )
+}
+
+/// The index in `g.notes` of the `nth` (from 1) note `is` holds of.
+fn nth(g: &Glue, nth: usize, is: impl Fn(&Note) -> bool) -> Option<usize> {
+    g.notes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| is(n))
+        .nth(nth - 1)
+        .map(|(i, _)| i)
+}
+
+/// Waits, letting the session run, until it takes places for the `epoch`th time (from 1), then
+/// checks the order of what opened it: the session took places only once that epoch had
+/// authenticated, the venue had finally accepted its arm and its resync had been applied, and
+/// from the moment it was handed whichever of those two came last. The resync may end before the
+/// arm is answered (as on PR #119's first CI run), so nothing here assumes which comes first.
+async fn until_ready(glue: &Rc<RefCell<Glue>>, orders: &ExecOrders, epoch: usize) {
+    let ready = |n: &Note| matches!(n, Note::Placing(true));
+    until(glue, &format!("epoch {epoch} taking places"), |g| {
+        nth(g, epoch, ready).is_some()
+    })
+    .await;
+    assert!(orders.may_place());
+    let g = glue.borrow();
+    let opened = nth(&g, epoch, ready).unwrap();
+    let authenticated = nth(&g, epoch, |n| {
+        matches!(n, Note::Conn(ConnState::Authenticated))
+    })
+    .unwrap();
+    let since = &g.notes[authenticated..opened];
+    let armed = since.iter().filter(|n| arm_accepted(n)).count();
+    let resynced = since
+        .iter()
+        .filter(|n| matches!(n, Note::Resynced { .. }))
+        .count();
+    assert_eq!((armed, resynced), (1, 1), "{:#?}", g.notes);
+    let last = &g.notes[opened - 1];
+    assert!(
+        arm_accepted(last) || matches!(last, Note::Resynced { .. }),
+        "{:#?}",
+        g.notes
+    );
 }
 
 fn state_of(g: &Glue, cid: ClientOrderId) -> Option<OrdState> {
@@ -601,9 +675,9 @@ async fn from_a_fresh_start_every_safety_rule_holds_against_the_stub() {
         // The session takes no place or amend until its epoch's arm is accepted and its
         // resync has ended.
         assert!(!orders.may_place());
-        // The first epoch: login, auth, subscriptions, the arm and the resync.
-        until(&glue, "the first resync", |g| resyncs(g) == 1).await;
-        assert!(orders.may_place());
+        // The first epoch: login, auth, subscriptions, the arm and the resync, the arm's answer
+        // and the resync's end in either order.
+        until_ready(&glue, &orders, 1).await;
         {
             let mut g = glue.borrow_mut();
             let (report, snapshot) =
@@ -784,16 +858,8 @@ async fn from_a_fresh_start_every_safety_rule_holds_against_the_stub() {
         );
         {
             let g = glue.borrow();
-            let armed = g.notes.iter().position(|n| {
-                matches!(
-                    n,
-                    Note::Outcome {
-                        ours: false,
-                        outcome: SubmitOutcome::Accepted { .. },
-                        ..
-                    }
-                )
-            });
+            // The arm is the session's own request (see `arm_accepted`; Reviewer A on PR #119).
+            let armed = g.notes.iter().position(arm_accepted);
             let first_order = g.notes.iter().position(
                 |n| matches!(n, Note::Submitted { rpc, sent: Ok(()) } if g.is_ours(*rpc)),
             );
@@ -804,9 +870,10 @@ async fn from_a_fresh_start_every_safety_rule_holds_against_the_stub() {
         // RB-8mv-5 on PR #119): the session reconnects, authenticates again, re-arms and
         // resyncs, and writes nothing else, neither C again nor anything for it. The stub does
         // not model cancel-on-disconnect, so the resync finds C still resting.
-        until(&glue, "the second resync", |g| resyncs(g) == 2).await;
-        // A while for anything the reconnect might still write.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        until_ready(&glue, &orders, 2).await;
+        assert_eq!(resyncs(&glue.borrow()), 2);
+        // Re-armed and resynced: the opening six are written and answered, and nothing else.
+        // Anything written later still shows in the kill switch's check below.
         let conn1 = stub.methods(1);
         opening(&conn1);
         {
@@ -984,7 +1051,7 @@ async fn after_a_restart_flatten_writes_only_reduce_only_exits_that_never_cross_
     let kept = Arc::clone(&book);
     let script = async move {
         let glue = g;
-        until(&glue, "the first resync", |g| resyncs(g) == 1).await;
+        until_ready(&glue, &orders, 1).await;
         let exit = {
             let mut g = glue.borrow_mut();
             let pos = match g.notes.iter().find(|n| matches!(n, Note::Resynced { .. })) {
