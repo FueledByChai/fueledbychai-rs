@@ -24,12 +24,12 @@
 use std::time::Duration;
 
 use fbc_core::{
-    AckLevel, AmendAck, AmendCaps, CidMatch, ClientOrderId, ExecEvent, ItemRef, Lots, OrderUpdate,
-    RpcId, SubmitOutcome, Ticks, VenueOrderId, VenueOrderState,
+    AckLevel, AmendAck, AmendCaps, CidMatch, ClientOrderId, ExecEvent, ItemRef, Lots, OpKind,
+    OrderUpdate, RpcId, SubmitOutcome, Ticks, VenueOrderId, VenueOrderState,
 };
 
 use super::harness::Harness;
-use super::live::{Ctx, Live, STEP, WAIT};
+use super::live::{Ctx, Live, WAIT};
 use super::stub::Answer::{Accept, Reject, Silent};
 use super::{Breach, Failure, Subject, Verdict};
 
@@ -63,18 +63,25 @@ pub fn amend_ack(subject: &Subject<'static>) -> Result<Verdict, Failure> {
     let breaches = live.run(vec![vec![Accept], vec![Accept]], async |c| {
         c.ready().await?;
         let (cid, auth) = c.oms.place(c.h)?;
-        let placed = c.send(auth).await?;
+        let placed = c.send(auth, OpKind::Place).await?;
         c.settle(|c| !c.outcomes(placed).is_empty()).await;
         let outcomes = c.outcomes(placed);
-        let Some((Some(item), outcome @ SubmitOutcome::Accepted { .. })) = outcomes.first() else {
+        let Some((item, outcome @ SubmitOutcome::Accepted { .. })) = outcomes.first() else {
             let what = format!("the placement the stub accepted was reported {outcomes:?}");
             return Err(c.h.fail("ExecCodec::on_frame", what));
         };
-        c.oms.placed(c.h, cid, item, outcome)?;
+        // An acceptance of the whole request is the one item's (Codex r4222379990).
+        let whole = ItemRef {
+            idx: 0,
+            cid: None,
+            vid: None,
+        };
+        let item = item.clone().unwrap_or(whole);
+        c.oms.placed(c.h, cid, &item, outcome)?;
         let auth = c.oms.amend(c.h, cid, px, qty)?;
         // Only what the session reports from here on answers the amend (Codex r4222138050).
         let before = c.events().len();
-        let rpc = c.send(auth).await?;
+        let rpc = c.send(auth, OpKind::Amend).await?;
         c.answered().await?;
         let names = |u: &OrderUpdate| {
             u.cid == Some(CidMatch::Ours(cid)) || (item.vid.is_some() && u.vid == item.vid)
@@ -212,7 +219,7 @@ pub fn mixed_batch(subject: &Subject<'static>) -> Result<Verdict, Failure> {
     let breaches = live.run(vec![vec![Accept, Reject, Silent]], async |c| {
         c.ready().await?;
         let (cids, auth) = c.oms.batch(c.h, usize::from(ITEMS))?;
-        let rpc = c.send(auth).await?;
+        let rpc = c.send(auth, OpKind::Place).await?;
         c.answered().await?;
         let every = |c: &Ctx<'_>| {
             let outcomes = c.outcomes(rpc);
@@ -224,9 +231,10 @@ pub fn mixed_batch(subject: &Subject<'static>) -> Result<Verdict, Failure> {
             (0..ITEMS).all(has)
         };
         let moved = c.advance_until(every).await;
-        // As long again, so an outcome reported twice, or a resend, shows.
-        if let Some(moved) = moved {
-            c.advance(moved + STEP).await;
+        // The longest deadline again, so an outcome reported twice, or a resend however late,
+        // shows (Codex r4222379980).
+        if moved.is_some() {
+            c.advance(WAIT).await;
         }
         Ok(judge_batch(c, rpc, &cids, moved))
     })?;
@@ -291,6 +299,18 @@ fn judge_batch(
         );
         breaches.push(Breach::new("ExecCodec::on_rpc_timeout", what));
     }
+    // Each item names its own order, where it names one (Codex r4222379976): fbc-oms routes an
+    // outcome by it.
+    let named = |(it, _): &&(Option<ItemRef>, SubmitOutcome)| {
+        let it = it.as_ref()?;
+        let cid = it.cid?;
+        (cids.get(usize::from(it.idx)) != Some(&cid)).then_some(it.idx)
+    };
+    let misnamed: Vec<u16> = outcomes.iter().filter_map(|o| named(&o)).collect();
+    if !misnamed.is_empty() {
+        let what = format!("items {misnamed:?} name another order's client id than their own");
+        breaches.push(Breach::new("ItemRef.cid", what));
+    }
     let beyond: Vec<_> = outcomes
         .iter()
         .filter(|(it, _)| it.as_ref().is_some_and(|it| it.idx >= ITEMS))
@@ -314,12 +334,13 @@ pub fn unknown_on_timeout(subject: &Subject<'static>) -> Result<Verdict, Failure
     let breaches = live.run(vec![vec![Silent]], async |c| {
         c.ready().await?;
         let (cid, auth) = c.oms.place(c.h)?;
-        let rpc = c.send(auth).await?;
+        let rpc = c.send(auth, OpKind::Place).await?;
         c.answered().await?;
         let moved = c.advance_until(|c| !c.outcomes(rpc).is_empty()).await;
-        // As long again, so an outcome reported twice, or a resend, shows.
-        if let Some(moved) = moved {
-            c.advance(moved + STEP).await;
+        // The longest deadline again, so an outcome reported twice, or a resend however late,
+        // shows (Codex r4222379980).
+        if moved.is_some() {
+            c.advance(WAIT).await;
         }
         let mut breaches = Vec::new();
         let outcomes = c.outcomes(rpc);

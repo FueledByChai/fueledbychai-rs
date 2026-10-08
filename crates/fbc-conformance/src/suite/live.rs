@@ -7,7 +7,7 @@
 //! sockets are idle: a request's deadline passes only when a check moves the clock past it,
 //! never while the stub's answer is still on its way.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -16,8 +16,9 @@ use std::time::Duration;
 
 use fbc_core::{
     AccountKey, AccountLease, ClientOrderId, Envelope, ExecEvent, ItemRef, Lots, MarketLease,
-    MonoNs, NewOrder, NonceBlock, NonceSource, OrderCaps, OrderKind, OrderKindTag, RpcId, Side,
-    SignedLots, SubmitHandle, SubmitOutcome, Ticks, VenueCaps, VenueFactory, WallNs, encode_cid,
+    MonoNs, NewOrder, NonceBlock, NonceSource, OpKind, OrderCaps, OrderKind, OrderKindTag,
+    RateLimit, RpcId, Side, SignedLots, SubmitHandle, SubmitOutcome, Ticks, VenueCaps,
+    VenueFactory, WallNs, encode_cid,
 };
 use fbc_oms::{
     Authorization, LadderConfig, LeaseKeys, Leases, MarketCapsConfig, OrderKey, OrderOp,
@@ -155,6 +156,7 @@ impl<'s> Live<'s> {
                 oms: Oms::new(&self.h, self.venue.id(), &self.order)?,
                 server: &server,
                 opening,
+                sent: Cell::new(0),
             };
             let script = async {
                 let out = scenario(&mut ctx).await;
@@ -246,6 +248,8 @@ pub(crate) struct Ctx<'a> {
     server: &'a StubServer,
     /// How many frames the stub answers as the epoch opens, before the first request.
     opening: usize,
+    /// How many requests the check has sent.
+    sent: Cell<usize>,
 }
 
 impl Ctx<'_> {
@@ -273,13 +277,19 @@ impl Ctx<'_> {
         Err(self.h.fail("OrderEntryStub.opening", what))
     }
 
-    /// Moves the clock on by the longest window of the venue's declared limits, so every bucket
-    /// has room again for one request (Codex r4222138060), then submits `auth` to the session
-    /// and waits until it reports the request sent: its request id, or a failure when the
-    /// session refuses it, reports it not sent, or never reports it.
-    pub async fn send(&self, auth: Authorization) -> Result<RpcId, Failure> {
-        let window = self.h.caps.limits.iter().map(|l| l.per).max();
+    /// Submits `auth`, a request of `op`, to the session and waits until it reports the
+    /// request sent: its request id, or a failure when the session refuses it, reports it not
+    /// sent, or never reports it. First, where a limit counting `op` allows no more units than
+    /// the frames the session has written so far (the opening's and the check's earlier
+    /// requests, each counted as one unit whatever it is), the clock moves on by that limit's
+    /// window, so its bucket has room again (Codex r4222138060); and only then, so a keepalive
+    /// the codec sends meanwhile is not read in a request's place (Codex r4222379993).
+    pub async fn send(&self, auth: Authorization, op: OpKind) -> Result<RpcId, Failure> {
+        let written = self.opening + self.sent.get();
+        let full = |l: &&RateLimit| l.ops.contains(op) && l.units as usize <= written;
+        let window = self.h.caps.limits.iter().filter(full).map(|l| l.per).max();
         self.advance(window.unwrap_or_default()).await;
+        self.sent.set(self.sent.get() + 1);
         let rpc = self.orders.submit(auth);
         let handle = |c: &Ctx<'_>| {
             let rpc = rpc.as_ref().ok()?;
@@ -343,12 +353,14 @@ impl Ctx<'_> {
         done(self).then_some(moved)
     }
 
-    /// Moves the clock on by `by`, in [`STEP`]s, letting the session run after each.
+    /// Moves the clock on by `by`, in [`STEP`]s and after [`FINE`] in [`COARSE`] ones, letting
+    /// the session run after each.
     pub async fn advance(&self, by: Duration) {
         let mut moved = Duration::ZERO;
         while moved < by {
-            tokio::time::advance(STEP).await;
-            moved += STEP;
+            let step = if moved < FINE { STEP } else { COARSE };
+            tokio::time::advance(step).await;
+            moved += step;
             for _ in 0..CHURN {
                 tokio::task::yield_now().await;
             }
@@ -399,14 +411,11 @@ impl Ctx<'_> {
         }
     }
 
-    /// Every frame the stub received on the session's first connection, in order.
+    /// Every frame the stub received, on every connection the session opened, in accept order
+    /// (Codex r4222379985: a request written again after a reconnect counts too).
     pub fn frames(&self) -> Vec<Frame> {
         let conns = self.server.connections();
-        conns
-            .into_iter()
-            .next()
-            .map(|c| c.received)
-            .unwrap_or_default()
+        conns.into_iter().flat_map(|c| c.received).collect()
     }
 }
 

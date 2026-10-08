@@ -55,6 +55,16 @@ enum Twist {
     /// Once a request timed out, the next second asks for a reconnect whose opening frame
     /// never fits the venue's buckets, which ends the session with an error.
     FailsAfterTimeout,
+    /// As [`Twist::Resends`], but twenty seconds after the connection opened, long after the
+    /// toy's five-second deadline.
+    ResendsLate,
+    /// Once a request timed out, the next second asks for a reconnect, and the new connection's
+    /// opening writes the last placement again, signed again.
+    ReplacesOnReconnect,
+    /// Each timed-out batch's items 0 and 1 swap indices, each keeping its client id.
+    SwapsItems,
+    /// A placement's acceptance is reported for the whole request, naming no item.
+    WholeAcceptance,
 }
 
 /// The toy with its caps edited by `caps` and its codec twisted by `twist`.
@@ -90,6 +100,35 @@ static SAME_VID: Variant = Variant {
 static EARLY_AMENDED: Variant = Variant {
     caps: |_| {},
     twist: Twist::EarlyAmended,
+};
+static RESENDS_LATE: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::ResendsLate,
+};
+static REPLACES_ON_RECONNECT: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::ReplacesOnReconnect,
+};
+static SWAPS_ITEMS: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::SwapsItems,
+};
+static WHOLE_ACCEPTANCE: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::WholeAcceptance,
+};
+/// The toy with a second limit, a minute's window that counts placements and never fills here:
+/// a check need not wait it out, and through the toy's 15-second ping.
+static MINUTE_WINDOW: Variant = Variant {
+    caps: |c| {
+        c.limits.push(fbc_core::RateLimit {
+            scope: fbc_core::LimitScope::Account,
+            ops: TagSet::of(&[OpKind::Place, OpKind::Amend]),
+            per: Duration::from_secs(60),
+            units: 1_000,
+        });
+    },
+    twist: Twist::None,
 };
 static FAILS_AFTER_TIMEOUT: Variant = Variant {
     caps: |_| {},
@@ -253,6 +292,7 @@ impl VenueFactory for Variant {
                 twist,
                 last,
                 failed,
+                reconnected: false,
             };
             Box::new(twisted) as Box<dyn ExecCodec>
         }))
@@ -278,6 +318,8 @@ struct Twisted {
     last: Option<Vec<u8>>,
     /// Whether a request timed out, for [`Twist::FailsAfterTimeout`].
     failed: bool,
+    /// Whether it asked for the reconnect, for [`Twist::ReplacesOnReconnect`].
+    reconnected: bool,
 }
 
 /// A sink handing `inner` the events `f` rewrites each into.
@@ -406,6 +448,53 @@ fn resend_timer() -> Effect {
     }
 }
 
+/// A placement frame signed again, as a rebuilt retry would be: other bytes, the same orders
+/// (Codex r4222138042).
+fn again(frame: &[u8]) -> Effect {
+    Effect::Send {
+        stream: EXEC_STREAM,
+        frame: WireSlice::plain([frame, b"|again"].concat()),
+        rpc: None,
+        class: TrafficClass::Normal,
+        charge: RateCharge::one(OpKind::Place, None),
+    }
+}
+
+/// Item 0 reported as item 1 and item 1 as item 0, each keeping its client id.
+fn swapped(ev: ExecEvent) -> Vec<ExecEvent> {
+    vec![match ev {
+        ExecEvent::Outcome {
+            rpc,
+            item: Some(mut it),
+            outcome,
+        } if it.idx < 2 => {
+            it.idx = 1 - it.idx;
+            ExecEvent::Outcome {
+                rpc,
+                item: Some(it),
+                outcome,
+            }
+        }
+        other => other,
+    }]
+}
+
+/// A placement's acceptance for the whole request.
+fn whole_acceptance(ev: ExecEvent) -> Vec<ExecEvent> {
+    vec![match ev {
+        ExecEvent::Outcome {
+            rpc,
+            item: Some(it),
+            outcome: outcome @ SubmitOutcome::Accepted { .. },
+        } if it.cid.is_some() => ExecEvent::Outcome {
+            rpc,
+            item: None,
+            outcome,
+        },
+        other => other,
+    }]
+}
+
 impl ExecCodec for Twisted {
     fn nonces_for(&self, call: CtxCall) -> u16 {
         self.inner.nonces_for(call)
@@ -413,7 +502,7 @@ impl ExecCodec for Twisted {
 
     fn on_open(&mut self, stream: StreamId, ctx: &EncodeCtx, fx: &mut Effects) {
         self.inner.on_open(stream, ctx, fx);
-        if self.failed {
+        if self.failed && self.twist == Twist::FailsAfterTimeout {
             // Heavier than the toy's one bucket ever admits.
             let weight = core::num::NonZeroU32::new(1_000).unwrap();
             fx.push(Effect::Send {
@@ -428,8 +517,20 @@ impl ExecCodec for Twisted {
                 },
             });
         }
-        if matches!(self.twist, Twist::Resends | Twist::FailsAfterTimeout) {
-            fx.push(resend_timer());
+        if self.reconnected
+            && let Some(frame) = self.last.take()
+        {
+            fx.push(again(&frame));
+        }
+        match self.twist {
+            Twist::Resends | Twist::FailsAfterTimeout | Twist::ReplacesOnReconnect => {
+                fx.push(resend_timer());
+            }
+            Twist::ResendsLate => fx.push(Effect::Timer {
+                tag: RESEND,
+                after: Duration::from_secs(20),
+            }),
+            _ => {}
         }
     }
 
@@ -472,6 +573,7 @@ impl ExecCodec for Twisted {
             Twist::NoNewVid => no_new_vid,
             Twist::SameVid => same_vid,
             Twist::EarlyAmended => early_amended,
+            Twist::WholeAcceptance => whole_acceptance,
             _ => kept,
         };
         let sink = &mut Rewrite { inner: sink, f: f_ };
@@ -494,23 +596,17 @@ impl ExecCodec for Twisted {
         if tag != RESEND {
             return self.inner.on_timer(tag, ctx, fx);
         }
-        if self.failed {
+        if self.failed && !self.reconnected {
+            self.reconnected = self.twist == Twist::ReplacesOnReconnect;
             let reason = "a twisted toy reconnects after a timeout";
             return fx.push(Effect::Reconnect {
                 stream: EXEC_STREAM,
                 reason,
             });
         }
-        if let Some(frame) = self.last.as_ref().filter(|_| self.twist == Twist::Resends) {
-            fx.push(Effect::Send {
-                stream: EXEC_STREAM,
-                // Signed again, as a rebuilt retry would be: other bytes, the same orders
-                // (Codex r4222138042).
-                frame: WireSlice::plain([&frame[..], b"|again"].concat()),
-                rpc: None,
-                class: TrafficClass::Normal,
-                charge: RateCharge::one(OpKind::Place, None),
-            });
+        let resends = matches!(self.twist, Twist::Resends | Twist::ResendsLate);
+        if let Some(frame) = self.last.as_ref().filter(|_| resends) {
+            fx.push(again(frame));
         }
         fx.push(resend_timer());
     }
@@ -521,10 +617,11 @@ impl ExecCodec for Twisted {
             Twist::SilentOnTimeout => dropped,
             Twist::Garbled => garbled,
             Twist::Doubled => doubled,
-            Twist::FailsAfterTimeout => {
+            Twist::FailsAfterTimeout | Twist::ReplacesOnReconnect => {
                 self.failed = true;
                 kept
             }
+            Twist::SwapsItems => swapped,
             _ => return self.inner.on_rpc_timeout(rpc, sink),
         };
         self.inner
@@ -1024,4 +1121,53 @@ fn a_session_that_ends_with_an_error_fails_a_check_whose_scenario_saw_everything
 fn a_venue_whose_frames_carry_no_client_id_the_suite_can_find_is_judged_by_the_frames_bytes() {
     let passed = suite::unknown_on_timeout(&OTHER_CID_FORMAT.subject(assumed));
     assert!(matches!(passed, Ok(Verdict::Passed { .. })), "{passed:?}");
+}
+
+#[test]
+fn mixed_batch_fails_a_toy_whose_items_name_each_others_client_ids() {
+    let failure = failed(suite::mixed_batch(&SWAPS_ITEMS.subject(assumed)));
+    assert!(says(&failure, "ItemRef.cid", "items [1, 0]"), "{failure}");
+}
+
+#[test]
+fn unknown_on_timeout_sees_a_request_written_again_long_after_its_deadline() {
+    let failure = failed(suite::unknown_on_timeout(&RESENDS_LATE.subject(assumed)));
+    assert!(failure.names("ExecCodec: never resent"), "{failure}");
+}
+
+#[test]
+fn unknown_on_timeout_sees_a_request_written_again_on_the_next_connection() {
+    let failure = failed(suite::unknown_on_timeout(
+        &REPLACES_ON_RECONNECT.subject(assumed),
+    ));
+    assert!(
+        says(&failure, "ExecCodec: never resent", "written 2 times"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn amend_ack_takes_an_acceptance_of_the_whole_placement_as_its_one_items() {
+    // The toy's amend names the order by its venue id, which an acceptance naming no item
+    // does not give: fbc-oms refuses the amend, past the placement.
+    let failure = failed(suite::amend_ack(&WHOLE_ACCEPTANCE.subject(assumed)));
+    assert!(says(&failure, "fbc-oms", "refused the amend"), "{failure}");
+    assert!(
+        !failure
+            .to_string()
+            .contains("the placement the stub accepted"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn a_limit_whose_bucket_never_fills_is_not_waited_out() {
+    for check in [
+        suite::amend_ack,
+        suite::mixed_batch,
+        suite::unknown_on_timeout,
+    ] {
+        let passed = check(&MINUTE_WINDOW.subject(assumed));
+        assert!(matches!(passed, Ok(Verdict::Passed { .. })), "{passed:?}");
+    }
 }
