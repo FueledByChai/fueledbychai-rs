@@ -15,7 +15,7 @@
 //!   flags the order's, stated where `events_echo_flags`). A venue
 //!   allowing no limit order is skipped. The client id is stated where
 //!   `cid_echoed_on_events`, and nothing is written beyond the two requests. Where the amended order gets a new venue id
-//!   (`AmendCaps.keeps_venue_id` false), the update names it; where it keeps its id, the update
+//!   (`AmendCaps.keeps_venue_id` false), every update names the same one; where it keeps its id, the update
 //!   names no new one. The placement's acceptance is its one item's, or the whole request's,
 //!   once as `OrderCaps.ack` has it. Once the amend is sent, nothing refuses the order (an
 //!   `AsyncReject` naming it), ends it (a terminal `OrderUpdate`) or fills it (an
@@ -164,7 +164,7 @@ pub fn amend_ack(subject: &Subject<'static>) -> Result<Verdict, Failure> {
 }
 
 /// The price and quantity an order the harness places is amended to: a valid price one step
-/// away where the price is amendable, else twice the quantity, or the largest order where that
+/// away where the price is amendable and one is valid, else twice the quantity, or the largest order where that
 /// is less (Codex r4222779033), where the quantity is; why there is none otherwise.
 fn amended(h: &Harness<'_>, amend: &AmendCaps) -> Result<(Ticks, Lots), &'static str> {
     let spec = h.specs().get(h.inst).expect("the harness's instrument");
@@ -178,10 +178,13 @@ fn amended(h: &Harness<'_>, amend: &AmendCaps) -> Result<(Ticks, Lots), &'static
             h.px.0
                 .checked_add(1)
                 .and_then(|px| grid.ceil_valid(Ticks(px)));
-        let none = "no valid price lies one step from the harness's";
-        return below.or(above).map(|px| (px, h.qty)).ok_or(none);
-    }
-    if !amend.qty {
+        // Where no other price is valid, the quantity, where amendable (Codex r4224395215).
+        match below.or(above) {
+            Some(px) => return Ok((px, h.qty)),
+            None if !amend.qty => return Err("no valid price lies one step from the harness's"),
+            None => {}
+        }
+    } else if !amend.qty {
         return Err("AmendCaps declares neither the price nor the quantity amendable");
     }
     let doubled = Lots::new(h.qty.get().saturating_mul(2)).expect("a count");
@@ -318,6 +321,17 @@ fn judge_amend(
         breaches.push(Breach::new(ack, what));
     }
     let vids = order_vids(asked, updates);
+    // One amend names one new venue id, however often it is reported (Codex r4224395207):
+    // fbc-oms would follow each.
+    let mut new_vids: Vec<&VenueOrderId> = vids
+        .iter()
+        .filter(|v| Some(*v) != asked.placed.as_ref())
+        .collect();
+    new_vids.dedup();
+    if !amend.keeps_venue_id && new_vids.len() > 1 {
+        let what = format!("the updates of one amend name new venue ids {new_vids:?}, not one");
+        breaches.push(Breach::new("AmendCaps.keeps_venue_id is false", what));
+    }
     for update in resting {
         breaches.extend(judge_update(c, update, asked, &vids, amend));
     }
