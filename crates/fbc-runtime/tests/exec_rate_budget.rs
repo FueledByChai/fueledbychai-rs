@@ -1,9 +1,10 @@
 //! FBC-e8i's done line (decisions 0018, 0030, 0073): an order-entry session charges each
 //! request it writes to the buckets that count it, the conformance toy declaring an account
-//! limit, a per-pair order limit and a connect limit. A normal place, amend or order query
-//! that would take a bucket into the consumer's safety reserve is `NotSent(RateBudget)` with
-//! no byte written; cancels and reducing orders are written until the bucket is empty; the
-//! session's own cancel-on-disconnect arm and resync may use the reserve too (0073); and every
+//! limit, a per-pair order limit and a connect limit. A normal place or amend, and any control
+//! command (an order query, a consumer's arm), that would take a bucket into the consumer's
+//! safety reserve is `NotSent(RateBudget)` with no byte written; cancels and reducing orders are
+//! written until the bucket is empty; the session's own cancel-on-disconnect arm and resync may
+//! use the reserve too (0073); and every
 //! refusal is counted under the scope whose bucket refused it. (A 429 to an order-entry read
 //! is counted in `exec_ready.rs`.)
 //!
@@ -399,4 +400,51 @@ async fn the_cancel_on_disconnect_arm_and_the_resync_may_use_the_safety_reserve(
     };
     assert_eq!(rates.counts().refused, account);
     assert_eq!(session.counters().arm_failures, 0);
+}
+
+/// The account bucket holds 6 units and the consumer keeps half for safety traffic, so the
+/// login, the session's own arm and its resync take it to its floor. A cancel-on-disconnect arm
+/// the consumer submits is a control command, charged as normal traffic whatever its label
+/// (0073, Reviewer B RB-e8i-1 on PR #113): `NotSent(RateBudget)`, nothing written, counted under
+/// the account scope, so repeated consumer arms cannot drain the reserve. A cancel then still
+/// goes out, from the reserve.
+#[tokio::test(start_paused = true)]
+async fn a_consumer_arm_is_normal_traffic_and_stops_at_the_safety_floor() {
+    let thaw = freeze();
+    let mut server = ScriptedWs::start().await;
+    let (mut session, control, rates, orders, handles, events) =
+        session(&server, limits(6, 50), 50);
+    let mut oms = Oms::armed();
+    let watch = rates.clone();
+    let script = async move {
+        let mut peer = server.accept().await;
+        armed_and_resynced(&mut peer, &orders, &events).await;
+        let rates = watch;
+        assert_eq!(used(&rates, ACCOUNT, BucketKey::Shared), 3);
+
+        let armed = orders
+            .submit_control(ControlCommand::ArmCancelOnDisconnect)
+            .unwrap();
+        assert_eq!(
+            outcome(&handles, armed).await,
+            Err(NotSentReason::RateBudget)
+        );
+        churn().await;
+        assert!(peer.quiet());
+        assert_eq!(used(&rates, ACCOUNT, BucketKey::Shared), 3);
+
+        let cancelled = orders.submit(oms.cancel()).unwrap();
+        assert_eq!(outcome(&handles, cancelled).await, Ok(()));
+        written(&mut peer, "cancel", cancelled).await;
+        assert_eq!(used(&rates, ACCOUNT, BucketKey::Shared), 4);
+        drop(control);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    drop(thaw);
+    let account = ScopeCounts {
+        account: 1,
+        ..ScopeCounts::default()
+    };
+    assert_eq!(rates.counts().refused, account);
 }

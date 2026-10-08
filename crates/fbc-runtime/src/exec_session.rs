@@ -72,9 +72,10 @@
 //! a request whose deadline is past the end of the clock, are `NotSent(Unencodable)`, and
 //! frames the buckets do not admit together `NotSent(RateBudget)`, each with nothing written.
 //! The frames are charged in the class of their command (FBC-e8i, decision 0073): a normal
-//! place, amend or order query stops at each bucket's safety reserve, while a cancel, a
-//! reducing order and the session's cancel-on-disconnect arm may use it until the bucket is
-//! empty; each refusal is counted under the scope whose bucket refused it.
+//! place or amend and every control command the consumer submits (an order query, an arm, a
+//! dead-man refresh, the fee query) stop at each bucket's safety reserve, while a cancel, a
+//! reducing order and the session's own cancel-on-disconnect arm may use it until the bucket
+//! is empty; each refusal is counted under the scope whose bucket refused it.
 //! Otherwise the handler is told it was sent, with the nonces it used
 //! ([`ExecHandler::on_submitted`]), and its effects are executed. A request's deadline runs
 //! from just before its frame is written; the first event that answers it
@@ -933,7 +934,7 @@ impl<H: ExecHandler> ExecSession<H> {
                 .on_submitted(not_sent(NotSentReason::StaleAuthorization));
             return Ok(true);
         }
-        match self.encode(cmd, rpc, key)? {
+        match self.encode(cmd, budget_class(&item), rpc, key)? {
             Ok((receipt, fx)) => {
                 let receipt = Ok(receipt);
                 self.handler.on_submitted(SubmitHandle { rpc, receipt });
@@ -947,12 +948,14 @@ impl<H: ExecHandler> ExecSession<H> {
     }
 
     /// Encodes `cmd` as request `rpc` for epoch `key`, with an [`EncodeCtx`] holding exactly
-    /// its items' nonces, and charges its frames together: its receipt and effects, ready to
+    /// its items' nonces, and charges its frames together as `class` (decision 0073): its
+    /// receipt and effects, ready to
     /// execute, or why it is not sent, nothing written (the module docs say which). The
     /// session's error when the nonce source reserved another count.
     fn encode(
         &mut self,
         cmd: &VenueCommand,
+        class: TrafficClass,
         rpc: RpcId,
         key: ConnKey,
     ) -> Result<Result<(EncodeReceipt, Effects), Unsent>, ExecSessionError> {
@@ -977,8 +980,7 @@ impl<H: ExecHandler> ExecSession<H> {
             Err(reason) => return Ok(Err(Unsent::Codec(reason))),
         };
         // Its frames go together or not at all, so the codec's request is either written whole
-        // or reported not sent, charged as the budget class of its command (decision 0073).
-        let class = budget_class(cmd);
+        // or reported not sent, charged as `class`.
         let own = |e: &Effect| frame_of(e, self.stream, true).map(|r| Request { class, ..r });
         let frames: Vec<_> = fx.as_slice().iter().filter_map(own).collect();
         if let Err(refused) = self.core.rates.charge(Instant::now(), key, &frames) {
@@ -1024,7 +1026,8 @@ impl<H: ExecHandler> ExecSession<H> {
     ) -> Result<bool, ExecSessionError> {
         let rpc = self.orders.next_rpc();
         let cmd = VenueCommand::ArmCancelOnDisconnect(true);
-        match self.encode(&cmd, rpc, key)? {
+        // The session's own arm, one per epoch, may use the safety reserve (decision 0073).
+        match self.encode(&cmd, cmd.traffic_class(), rpc, key)? {
             Ok((_, fx)) => {
                 self.orders.gate.borrow_mut().arm_sent(key.epoch, rpc);
                 self.execute(ws, fx, true, None).await
@@ -1094,15 +1097,18 @@ impl Unsent {
     }
 }
 
-/// The traffic class `cmd`'s frames are charged as (decision 0073): its own
-/// ([`VenueCommand::traffic_class`]), except an order query's, which is normal traffic. The
-/// Unknown ladder sends queries as often as orders go unresolved, so they stop at each bucket's
-/// safety floor and never drain what cancels and reducing orders need (design §4.10 step 7);
-/// the cancel-on-disconnect arm, one per epoch, keeps its safety class.
-fn budget_class(cmd: &VenueCommand) -> TrafficClass {
-    match cmd {
-        VenueCommand::Query(_) => TrafficClass::Normal,
-        other => other.traffic_class(),
+/// The traffic class a submitted command's frames are charged as (decision 0073): an
+/// authorized order command's own ([`VenueCommand::traffic_class`]), so cancels and reducing
+/// orders may use the safety reserve; every control command normal traffic, whatever its
+/// label. The consumer submits control commands without authorization or count (the Unknown
+/// ladder's order queries, an arm, a dead-man refresh, the fee query), so they stop at each
+/// bucket's safety floor and never drain what cancels and reducing orders need (design §4.10
+/// step 7; Reviewer B RB-e8i-1 on PR #113). The session's own arm, one per epoch, is charged
+/// its label in `arm`.
+fn budget_class(item: &Submitted) -> TrafficClass {
+    match item {
+        Submitted::Authorized(auth) => auth.command().traffic_class(),
+        Submitted::Control(_) => TrafficClass::Normal,
     }
 }
 

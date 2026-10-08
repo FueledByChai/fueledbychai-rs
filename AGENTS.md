@@ -198,9 +198,10 @@ rather than guess.
     `ControlCommand`, each encoded on its next turn with one reserved nonce per item and
     reported at most once to `ExecHandler::on_submitted` (sent, or `NotSent` with nothing
     written: no authenticated epoch, the codec's refusal, effects that do not carry the request,
-    make an HTTP request or give it a deadline past the end of the clock, the buckets: an
-    order query, like a place or amend, stops at the safety reserve, while cancels, reducing
-    orders, the cancel-on-disconnect arm and the resync may use it, 0073), an
+    make an HTTP request or give it a deadline past the end of the clock, the buckets: every
+    control command, like a place or amend, stops at the safety reserve, while cancels,
+    reducing orders, the session's own cancel-on-disconnect arm and the resync may use it,
+    0073), an
     authorization kept until its command is encoded, request ids from the account's `RpcIds`
     shared by its sessions, and each unanswered request handed to `on_rpc_timeout` once at its
     deadline, across a reconnect too, never written again (0057; compile-fail cases in
