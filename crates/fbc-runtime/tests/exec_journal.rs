@@ -1169,3 +1169,117 @@ async fn spans_that_do_not_fit_a_frame_are_counted_and_the_frame_is_hashed_whole
     let whole = format!("hello|key={in_frame}").len();
     assert_eq!(frame.unwrap(), blank(whole).into_bytes());
 }
+
+/// What a journal under `root` holds, read back once its writer is closed.
+fn read_back(root: &Path) -> Vec<Seen> {
+    let entries: Vec<Entry> = JournalReader::open(root, SHARD)
+        .unwrap()
+        .entries()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    entries.iter().map(|e| seen(&e.record)).collect()
+}
+
+/// A journal queue writing under a fresh `root`, and its writer.
+fn queue_at(root: &Path) -> (QueueSink, fbc_journal::WriterThread) {
+    let sink = SinkConfig {
+        budget_bytes: 1 << 20,
+        soft_limit_pct: 85,
+    };
+    let (queue, drain) = journal_queue(sink, redaction_key()).unwrap();
+    let writer = drain
+        .spawn(JournalWriter::create(root, SHARD, redaction_key()).unwrap())
+        .unwrap();
+    (queue, writer)
+}
+
+/// Codex P2 r4213946637 on PR #115: a session dropped as a panic unwinds through it (its
+/// handler panicked mid-epoch) still journals the epoch closed, best effort, though its handler
+/// is not called.
+#[test]
+fn an_epoch_a_panic_unwinds_through_is_journaled_closed() {
+    let root = fresh_dir("exec_journal_panic");
+    let (queue, writer) = queue_at(&root);
+    let queue = Rc::new(RefCell::new(queue));
+    let journal = Journal::new(Rc::clone(&queue));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.block_on(async {
+            let mut server = ScriptedWs::start().await;
+            let venue = Venue::leak(conformance_toy);
+            let config = config(venue, &server.url(), &[], Counting::new());
+            let handler = |_: Envelope<ExecEvent>| panic!("the handler fails");
+            let (mut session, _control) = ExecSession::new(config, handler).unwrap();
+            session.set_journal(journal);
+            let script = async move {
+                let mut peer = server.accept().await;
+                recv_text(&mut peer).await;
+                peer.send(AUTH_ACK);
+                std::future::pending::<()>().await;
+            };
+            let _ = tokio::join!(session.run(), script);
+        })
+    }));
+    assert!(unwound.is_err());
+    drop(rt);
+    drop(queue);
+    writer.close().unwrap();
+    let read = read_back(&root);
+    fs::remove_dir_all(&root).unwrap();
+    assert_eq!(read.first(), Some(&Seen::Opened(key(0))));
+    assert_eq!(read.last(), Some(&Seen::Closed(key(0))), "{read:#?}");
+}
+
+/// Codex P2 r4213946641 on PR #115: a journal set while a dropped run's epoch is still open
+/// ends that epoch first, so its `Closed` goes to the journal its `Opened` is in, and the new
+/// journal gets nothing of it.
+#[tokio::test]
+async fn a_journal_set_after_a_dropped_run_gets_none_of_its_epoch() {
+    let mut server = ScriptedWs::start().await;
+    let venue = Venue::leak(conformance_toy);
+    let config = config(venue, &server.url(), &[], Counting::new());
+    let (first, second) = (
+        fresh_dir("exec_journal_first"),
+        fresh_dir("exec_journal_second"),
+    );
+    let (queue, writer) = queue_at(&first);
+    let (next, next_writer) = queue_at(&second);
+    let ended = Rc::new(RefCell::new(Vec::new()));
+    struct Ends(Rc<RefCell<Vec<ConnKey>>>);
+    impl fbc_runtime::ExecHandler for Ends {
+        fn on_exec(&mut self, _: Envelope<ExecEvent>) {}
+        fn on_epoch_end(&mut self, key: ConnKey) {
+            self.0.borrow_mut().push(key);
+        }
+    }
+    let (mut session, _control) = ExecSession::new(config, Ends(Rc::clone(&ended))).unwrap();
+    session.set_journal(Journal::new(Rc::new(RefCell::new(queue))));
+    {
+        let run = session.run();
+        tokio::pin!(run);
+        let accepted = async {
+            let mut peer = server.accept().await;
+            recv_text(&mut peer).await;
+            peer
+        };
+        let _peer = tokio::select! {
+            _ = &mut run => panic!("the run ended"),
+            peer = accepted => peer,
+        };
+    }
+    session.set_journal(Journal::new(Rc::new(RefCell::new(next))));
+    assert_eq!(*ended.borrow(), [key(0)]);
+    drop(session);
+    assert_eq!(*ended.borrow(), [key(0)]);
+    writer.close().unwrap();
+    next_writer.close().unwrap();
+    let (read, read_next) = (read_back(&first), read_back(&second));
+    fs::remove_dir_all(&first).unwrap();
+    fs::remove_dir_all(&second).unwrap();
+    assert_eq!(read.first(), Some(&Seen::Opened(key(0))));
+    assert_eq!(read.last(), Some(&Seen::Closed(key(0))), "{read:#?}");
+    assert!(read_next.is_empty(), "{read_next:#?}");
+}

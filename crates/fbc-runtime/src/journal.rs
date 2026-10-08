@@ -38,6 +38,14 @@ impl Journal {
         let _ = self.sink.borrow_mut().record(class, now, record);
     }
 
+    /// Offers `record` under `class` if the sink is not borrowed now, as it may be when a panic
+    /// unwinds out of a record call: a best effort that never panics on the borrow.
+    pub(crate) fn try_record(&self, class: TrafficClass, now: WallNs, record: &Record) {
+        if let Ok(mut sink) = self.sink.try_borrow_mut() {
+            let _ = sink.record(class, now, record);
+        }
+    }
+
     /// Offers `record`, whose large contents it borrows, so a sink with no room for it
     /// refuses it before they are copied ([`JournalSink::record_ref`]).
     pub(crate) fn record_ref(&self, class: TrafficClass, now: WallNs, record: RecordRef<'_>) {
