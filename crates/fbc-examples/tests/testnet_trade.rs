@@ -162,6 +162,22 @@ fn order_closed(seq: i64, vid: &str, cid: &str, price: &str, size: &str) -> Vec<
 
 /// As [`order_closed`], on `side` (1 BUY, 2 SELL).
 fn order_closed_on(side: u8, seq: i64, vid: &str, cid: &str, price: &str, size: &str) -> Vec<u8> {
+    order_event(side, seq, vid, cid, price, size, size, "USER_CANCELED")
+}
+
+/// An `OrderEvent` CLOSED with `open` of `size` still open and the cancel reason `reason`
+/// (empty and nothing open: filled).
+#[allow(clippy::too_many_arguments)]
+fn order_event(
+    side: u8,
+    seq: i64,
+    vid: &str,
+    cid: &str,
+    price: &str,
+    size: &str,
+    open: &str,
+    reason: &str,
+) -> Vec<u8> {
     let null = i64::MIN;
     let ts = 1_759_500_000_205_011i64;
     let mut f = Vec::new();
@@ -174,7 +190,7 @@ fn order_closed_on(side: u8, seq: i64, vid: &str, cid: &str, price: &str, size: 
     f.extend(e8(price).to_le_bytes());
     f.extend(null.to_le_bytes()); // triggerPrice
     f.extend(e8(size).to_le_bytes()); // size
-    f.extend(e8(size).to_le_bytes()); // sizeOpen: nothing filled
+    f.extend(e8(open).to_le_bytes()); // sizeOpen
     f.extend(null.to_le_bytes()); // avgFillPrice
     f.extend(ts.to_le_bytes()); // createdAt
     f.extend(ts.to_le_bytes()); // updatedAt
@@ -183,7 +199,7 @@ fn order_closed_on(side: u8, seq: i64, vid: &str, cid: &str, price: &str, size: 
     f.extend(ts.to_le_bytes()); // publishedAt
     f.extend([0u8, 0, 0, 0]); // stp, flags, requestStatus, requestType
     assert_eq!(f.len(), 8 + 128);
-    for s in [vid, cid, MARKET, "USER_CANCELED", "", ""] {
+    for s in [vid, cid, MARKET, reason, "", ""] {
         f.push(u8::try_from(s.len()).unwrap());
         f.extend(s.as_bytes());
     }
@@ -202,7 +218,7 @@ struct Placed {
 /// subscriptions with an empty result, the arm with `enabled: true`, the place with its order
 /// under [`VID`], the cancel queued and then the order event closing the order.
 fn responder(placed: Arc<Mutex<Placed>>) -> Responder {
-    responder_with(placed, Arc::new(Vec::new()), true)
+    responder_with(placed, Arc::new(Vec::new()), true, false)
 }
 
 /// An open order of ours an earlier run left: its venue id and wire client id, a post-only sell
@@ -214,11 +230,13 @@ struct Restored {
 
 /// As [`responder`], answering a batch cancel of `restored` too: every item queued and then
 /// each order's event closing it when `close`, otherwise the second item `ALREADY_CLOSED` and no
-/// order event.
+/// order event. When `fills`, the order event after the cancel's reply reports the placed
+/// order FILLED (closed with nothing open and no cancel reason): the fill raced the cancel.
 fn responder_with(
     placed: Arc<Mutex<Placed>>,
     restored: Arc<Vec<Restored>>,
     close: bool,
+    fills: bool,
 ) -> Responder {
     Responder::new(move |frame| {
         let Frame::Text(text) = frame else {
@@ -248,7 +266,11 @@ fn responder_with(
             "order.cancel" => {
                 let p = placed.lock().unwrap();
                 let queued = ok(json!({"order_id": VID, "status": "QUEUED_FOR_CANCELLATION"}));
-                let closed = order_closed(5_001, VID, &p.cid, &p.price, &p.size);
+                let closed = if fills {
+                    order_event(1, 5_001, VID, &p.cid, &p.price, &p.size, "0", "")
+                } else {
+                    order_closed(5_001, VID, &p.cid, &p.price, &p.size)
+                };
                 Ok(vec![queued, Frame::Binary(closed)])
             }
             "order.cancel_batch" => {
@@ -313,7 +335,7 @@ fn restored() -> (Vec<Restored>, String) {
 
 /// The happy script with the batch cancel of the restored orders after it.
 fn restored_script(placed: Arc<Mutex<Placed>>, restored: Vec<Restored>, close: bool) -> WsScript {
-    let with = responder_with(placed, Arc::new(restored), close);
+    let with = responder_with(placed, Arc::new(restored), close, false);
     let mut steps = vec![Step::Accept];
     steps.extend((0..9).map(|_| Step::Respond {
         conn: 0,
@@ -947,4 +969,28 @@ fn the_snapshot_floor_is_the_highest_of_our_ids_it_shows() {
         open(None, "V-4"),
     ];
     assert_eq!(trade::snapshot_max(&snap), 43);
+}
+
+#[tokio::test]
+async fn an_order_that_fills_instead_of_cancelling_fails_the_run() {
+    let placed = Arc::new(Mutex::new(Placed::default()));
+    let with = responder_with(Arc::clone(&placed), Arc::new(Vec::new()), true, true);
+    let mut script = vec![Step::Accept];
+    script.extend((0..8).map(|_| Step::Respond {
+        conn: 0,
+        with: with.clone(),
+    }));
+    let stub = StubServer::start(WsScript::new(script), routes())
+        .await
+        .unwrap();
+    let opts = options(&stub, "10");
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(!report.ok, "{printed}");
+    assert!(
+        printed.contains("the order ended without being cancelled: Filled"),
+        "{printed}"
+    );
+    assert!(!printed.contains("STEP closed"), "{printed}");
+    assert!(printed.contains("DONE failed"), "{printed}");
 }
