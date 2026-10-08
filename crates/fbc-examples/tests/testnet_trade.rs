@@ -2588,3 +2588,34 @@ fn a_refused_chain_id_or_argument_is_never_echoed() {
             .starts_with("unknown argument --no-such-flag")
     );
 }
+
+#[test]
+fn a_market_not_shaped_like_a_paradex_market_is_refused_before_any_request() {
+    // Codex r4216890750: a private key pasted as --market would be sent in GET /orderbook's
+    // path; only Paradex's shape (upper-case letters and digits in three or more parts joined
+    // by '-') is taken, and a refusal never echoes the value.
+    for good in ["BTC-USD-PERP", "ETH-USD-PERP", "BTC-USD-27JUN25-100000-C"] {
+        let mut argv = strings(&MARKET_ARGS);
+        argv.extend(strings(&["--market", good]));
+        let Ok(Parsed::Trade(opts)) = args::parse(argv) else {
+            panic!("{good} is a market");
+        };
+        assert_eq!(opts.market, good);
+    }
+    for bad in [
+        "0xSYNTHETIC0hunter2",
+        "0X0123456789ABCDEF0123456789ABCDEF",
+        "0123456789ABCDEF0123456789ABCDEF",
+        "btc-usd-perp",
+        "ETH-USD",
+        "BTC--PERP",
+        "-BTC-USD-PERP",
+        "BTC-USD-0123456789ABCDEF0123456789ABCDEF",
+    ] {
+        let mut argv = strings(&MARKET_ARGS);
+        argv.extend(strings(&["--market", bad]));
+        let err = args::parse(argv).unwrap_err();
+        assert!(err.starts_with("--market"), "{bad}: {err}");
+        assert!(!err.contains(bad), "{bad}: {err}");
+    }
+}
