@@ -31,7 +31,7 @@ use fbc_core::{
 };
 
 use super::session::{self, Answers};
-use super::url::{echoed, secrets};
+use super::url::{echoed, occurrences, secrets};
 use super::{EXEC_STREAM, FillIds, PING_EVERY, PING_TAG, RPC_TIMEOUT, caps_for, decode, weight};
 
 use NotSentReason::{FlagConflict, SignFailed, Unencodable, Unsupported};
@@ -49,6 +49,9 @@ pub struct ToyExec {
     ping: bool,
     /// The stream the last `on_open` opened, which the ping goes out on.
     opened: Option<StreamId>,
+    /// The credentials of the URLs it was given, named wherever a frame or response echoes
+    /// them (Codex r4219753519, r4219929319).
+    secrets: Vec<String>,
 }
 
 /// A request's frame and the charge it carries.
@@ -72,6 +75,7 @@ impl ToyExec {
             rest: None,
             ping: false,
             opened: None,
+            secrets: Vec::new(),
         }
     }
 
@@ -85,9 +89,17 @@ impl ToyExec {
 
     /// This codec, resyncing over REST under `base`, whose credential spans every request
     /// keeps (`session.rs`; Codex r4172917335, r4172917294).
-    pub fn rest_resync(self, base: WireUrl) -> ToyExec {
+    pub fn rest_resync(mut self, base: WireUrl) -> ToyExec {
+        self.secrets.extend(secrets(&base));
         let rest = Some(base);
         ToyExec { rest, ..self }
+    }
+
+    /// This codec, on the order-entry connection at `url`: its credentials are named wherever
+    /// a frame echoes them.
+    pub fn socket_url(mut self, url: &WireUrl) -> ToyExec {
+        self.secrets.extend(secrets(url));
+        self
     }
 
     /// Refuses an order of a kind, time in force, channel or flag the caps do not declare
@@ -549,12 +561,15 @@ impl ExecCodec for ToyExec {
     }
 
     /// The toy's token wherever a text frame carries one (the authentication acknowledgement
-    /// echoes it), and the REST base's credentials wherever an HTTP response echoes them.
+    /// echoes it), and the credentials of the URLs it was given wherever a frame or an HTTP
+    /// response echoes them.
     fn redact_inbound(&self, input: Inbound<'_>) -> InboundSpans {
-        match (input, &self.rest) {
-            (Inbound::Http(_, resp), Some(base)) => echoed(&resp, &secrets(base)),
-            (Inbound::Http(..), None) => InboundSpans::NONE,
-            (Inbound::Frame(_), _) => session::token_spans(input),
+        match input {
+            Inbound::Http(_, resp) => echoed(&resp, &self.secrets),
+            Inbound::Frame(frame) => {
+                let token = session::token_spans(input);
+                InboundSpans::frame(occurrences(frame.bytes(), &self.secrets, token.body()))
+            }
         }
     }
 }

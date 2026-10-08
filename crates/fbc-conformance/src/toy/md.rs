@@ -47,7 +47,7 @@ use fbc_core::{
 };
 
 use super::decode::{Record, record};
-use super::url::{echoed, join, secrets};
+use super::url::{echoed, join, occurrences, secrets};
 use super::{
     ANCHOR_RETRY, ANCHOR_TIMEOUT, ANCHOR_URL_KEY, ANCHORED_BOOK, BOOK, KEEPALIVE_EVERY, MAX_HELD,
     caps,
@@ -94,6 +94,9 @@ pub struct ToyMd {
     next_tag: u64,
     /// The snapshots pushed, each one's `epoch`.
     snapshots: u32,
+    /// The credentials of the URLs it was given, named wherever a frame or response echoes
+    /// them (Codex r4219753519, r4219929319).
+    secrets: Vec<String>,
 }
 
 impl ToyMd {
@@ -106,6 +109,7 @@ impl ToyMd {
             chans: BTreeMap::new(),
             next_tag: 1,
             snapshots: 0,
+            secrets: Vec::new(),
         }
     }
 
@@ -119,9 +123,17 @@ impl ToyMd {
     /// keeping its credential spans (FBC-ja3, Codex r4172917294).
     pub fn with_anchor_url(stream: StreamId, base: WireUrl) -> ToyMd {
         ToyMd {
+            secrets: secrets(&base),
             anchor: Some(base),
             ..ToyMd::new(stream)
         }
+    }
+
+    /// This codec, on the connection at `url`: its credentials are named wherever a frame
+    /// echoes them.
+    pub fn socket_url(mut self, url: &WireUrl) -> ToyMd {
+        self.secrets.extend(secrets(url));
+        self
     }
 
     /// `sub` is a declared channel of an instrument in `specs`; its wire spelling.
@@ -523,12 +535,14 @@ impl MdCodec for ToyMd {
         })
     }
 
-    /// Public market data names no credential; an anchor's response echoing the anchors'
-    /// base's credentials names them (Codex r4219753519).
+    /// Public market data names no credential of its own; a frame or an anchor's response
+    /// echoing the credentials of the URLs it was given names them.
     fn redact_inbound(&self, input: Inbound<'_>) -> InboundSpans {
-        match (input, &self.anchor) {
-            (Inbound::Http(_, resp), Some(base)) => echoed(&resp, &secrets(base)),
-            _ => InboundSpans::NONE,
+        match input {
+            Inbound::Http(_, resp) => echoed(&resp, &self.secrets),
+            Inbound::Frame(frame) => {
+                InboundSpans::frame(occurrences(frame.bytes(), &self.secrets, &[]))
+            }
         }
     }
 }

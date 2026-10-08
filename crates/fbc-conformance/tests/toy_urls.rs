@@ -16,8 +16,8 @@ use fbc_conformance::toy::{
 use fbc_core::{
     ConfigError, ConfigScope, Effect, Effects, EncodeCtx, EndpointPlan, ExecEndpoint, Feed,
     FieldUnit, HeaderMark, HttpResponse, HttpTag, Inbound, InboundSpans, MdTransport, MonoNs,
-    NonceBlock, Secrets, StreamId, Subscription, VenueConfig, VenueError, VenueFactory, WallNs,
-    WireUrl,
+    NonceBlock, RawFrame, Secrets, StreamId, Subscription, VenueConfig, VenueError, VenueFactory,
+    WallNs, WireUrl,
 };
 
 /// A synthetic credential, of no account and no venue.
@@ -202,6 +202,15 @@ fn a_url_with_user_information_a_query_or_spans_it_cannot_keep_is_refused() {
         ("wss://[1:2:3]/x", None, EXEC_URL_KEY),
         ("wss://999.1.1.1/x", None, EXEC_URL_KEY),
         ("wss://1.2.3/x", None, EXEC_URL_KEY),
+        // A path the runtime's URI parser would refuse (Codex r4219929307): a space, a
+        // character outside ASCII, a bare or short percent escape, a character URIs never hold.
+        ("wss://toy.invalid/a b", None, EXEC_URL_KEY),
+        ("wss://toy.invalid/a%", None, EXEC_URL_KEY),
+        ("wss://toy.invalid/a%2", None, EXEC_URL_KEY),
+        ("wss://toy.invalid/a%zz", None, EXEC_URL_KEY),
+        ("wss://toy.invalid/a\"b", None, EXEC_URL_KEY),
+        ("wss://toy.invalid/a<b>", None, EXEC_URL_KEY),
+        ("wss://toy.invalid/a\\b", None, EXEC_URL_KEY),
         // Spans the toy cannot keep: not ranges, outside the path, past the end, out of order,
         // overlapping, empty.
         ("wss://toy.invalid/abcdef", Some("x"), EXEC_URL_REDACT_KEY),
@@ -241,11 +250,8 @@ fn a_url_with_user_information_a_query_or_spans_it_cannot_keep_is_refused() {
             Some("20..20"),
             EXEC_URL_REDACT_KEY,
         ),
-        (
-            "wss://toy.invalid/\u{e9}tat",
-            Some("18..19"),
-            EXEC_URL_REDACT_KEY,
-        ),
+        // A character outside ASCII is refused in the URL, before any span is read.
+        ("wss://toy.invalid/\u{e9}tat", Some("18..19"), EXEC_URL_KEY),
     ] {
         assert_eq!(
             refused(&invalid(EXEC_URL_KEY, value, redact)),
@@ -301,6 +307,7 @@ fn a_url_with_user_information_a_query_or_spans_it_cannot_keep_is_refused() {
         "wss://[2001:db8::7]/x",
         "ws://127.0.0.1:65535",
         "wss://toy-1.example_x.invalid:443",
+        "wss://toy.invalid/a-b._~!$&'()*+,;=:@/%2F%e9",
     ] {
         ok.insert(EXEC_URL_KEY, exec);
         assert_eq!(
@@ -437,8 +444,63 @@ fn a_configured_credential_echoed_in_an_http_response_is_named_for_redaction() {
         .unwrap()
         .unwrap();
     assert_eq!(exec.redact_inbound(input), InboundSpans::NONE);
-    assert_eq!(
-        ToyFactory.md_codec(&bare, &ep).redact_inbound(input),
-        InboundSpans::NONE
-    );
+    let plain = EndpointPlan {
+        transport: MdTransport::Socket {
+            url: WireUrl::plain("ws://127.0.0.1:9/md"),
+        },
+        ..ep.clone()
+    };
+    let md = ToyFactory.md_codec(&bare, &plain);
+    assert_eq!(md.redact_inbound(input), InboundSpans::NONE);
+    // The endpoint's own URL holds the credential: an echo of it is named too.
+    assert_eq!(ToyFactory.md_codec(&bare, &ep).redact_inbound(input), want);
+}
+
+#[test]
+fn a_configured_socket_credential_echoed_in_a_frame_is_named_for_redaction() {
+    // Codex r4219929319: the WebSocket peer echoing the order-entry or market-data URL's path
+    // credential in a welcome or error frame; each codec names every occurrence, beside the
+    // toy token the order-entry codec names already.
+    let cfg = cfg();
+    let text = format!("err|path={SECRET}|token=SYNTHETIC-TOKEN|again={SECRET}");
+    let at = |n: usize| text.match_indices(SECRET).nth(n).unwrap().0 as u32;
+    let len = SECRET.len() as u32;
+    let token = text.find("SYNTHETIC-TOKEN").unwrap() as u32;
+    let frame = Inbound::Frame(RawFrame::Text(&text));
+    let exec = ToyFactory
+        .exec_codec(&cfg, Secrets::new())
+        .unwrap()
+        .unwrap();
+    let want = InboundSpans::frame(vec![
+        at(0)..at(0) + len,
+        token..token + "SYNTHETIC-TOKEN".len() as u32,
+        at(1)..at(1) + len,
+    ]);
+    assert_eq!(exec.redact_inbound(frame), want);
+    let plans = ToyFactory
+        .plan_md(&cfg, &toy::specs(), &BTreeSet::from([sub(INST_A, BOOK)]))
+        .unwrap();
+    let md = ToyFactory.md_codec(&cfg, &plans[0]);
+    let want = InboundSpans::frame(vec![at(0)..at(0) + len, at(1)..at(1) + len]);
+    assert_eq!(md.redact_inbound(frame), want);
+    assert_eq!(want.check(frame), Ok(()));
+    // A binary frame is searched too.
+    let binary = Inbound::Frame(RawFrame::Binary(text.as_bytes()));
+    assert_eq!(md.redact_inbound(binary), want);
+    // A codec whose URLs hold no credential names none in a frame without the token.
+    let bare = VenueConfig::new();
+    let exec = ToyFactory
+        .exec_codec(&bare, Secrets::new())
+        .unwrap()
+        .unwrap();
+    let plain = Inbound::Frame(RawFrame::Text("err|path=SYNTHETIC-URL-PATH-KEY"));
+    assert_eq!(exec.redact_inbound(plain), InboundSpans::NONE);
+    // An order-entry URL configured and refused refuses the codec, as plan_exec does.
+    let mut bad = VenueConfig::new();
+    bad.insert(EXEC_URL_KEY, "wss://u@toy.invalid/x");
+    let built = ToyFactory.exec_codec(&bad, Secrets::new()).unwrap();
+    let Err(VenueError::Config(ConfigError::Invalid { key, .. })) = built else {
+        panic!("built");
+    };
+    assert_eq!(key, EXEC_URL_KEY);
 }
