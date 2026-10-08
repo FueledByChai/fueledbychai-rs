@@ -36,7 +36,7 @@ use fbc_core::{
 use fbc_oms::{
     CancelChoice, CancelEverything, FillLedger, LadderConfig, LeaseKeys, Leases, LedgerConfig,
     MarketCapsConfig, OrdState, PreTradeCaps, Registry, ResyncReport, ResyncSnapshot, Routed,
-    TestnetRun,
+    TerminalKind, TestnetRun,
 };
 use fbc_runtime::http::{Bytes, Method, Request};
 use fbc_runtime::{
@@ -572,17 +572,27 @@ impl HighWater {
         }
     }
 
-    /// Keeps `mark`, written whole to a file beside it and renamed over the mark.
+    /// Keeps `mark`: written whole to a file beside it and synced, renamed over the mark, and
+    /// the directory synced, so the mark is on the disk when this returns.
     pub fn write(&self, mark: u64) -> Result<(), String> {
+        use std::io::Write as _;
         let tmp = self.path.with_extension("tmp");
-        fs::write(&tmp, mark.to_string())
-            .and_then(|()| fs::rename(&tmp, &self.path))
-            .map_err(|e| {
-                format!(
-                    "{}: cannot keep the client-id high-water mark: {e}",
-                    self.path.display()
-                )
-            })
+        let durable = || -> std::io::Result<()> {
+            // The new mark reaches the disk before it replaces the old, and the rename does
+            // before the order goes out: a power loss leaves the old mark or the new, never none.
+            let mut file = fs::File::create(&tmp)?;
+            file.write_all(mark.to_string().as_bytes())?;
+            file.sync_all()?;
+            fs::rename(&tmp, &self.path)?;
+            let dir = self.path.parent().unwrap_or(std::path::Path::new("."));
+            fs::File::open(dir)?.sync_all()
+        };
+        durable().map_err(|e| {
+            format!(
+                "{}: cannot keep the client-id high-water mark: {e}",
+                self.path.display()
+            )
+        })
     }
 }
 
@@ -943,12 +953,22 @@ impl Driver {
             })
             .await;
         match closed {
-            Some(kind) => {
+            Some(kind @ TerminalKind::Canceled(_)) => {
                 self.lines.step(
                     "closed",
                     format_args!("the order event reports it ended: {kind:?}"),
                 );
                 true
+            }
+            Some(kind) => {
+                // A fill (or a reject or expiry) is not the round trip asked for: a filled
+                // order leaves a position, so the run fails.
+                let position = self.link.borrow_mut().reg().inventory(INST).0;
+                self.note(format_args!(
+                    "the order ended without being cancelled: {kind:?}; inventory now {position} \
+                     lots"
+                ));
+                false
             }
             None => {
                 self.timed_out("closed", "the order event reporting the order ended");
