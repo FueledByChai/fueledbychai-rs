@@ -13,12 +13,23 @@
 # dependencies are checked; dev-dependencies are not, since a venue crate's tests use
 # fbc-runtime, fbc-journal, fbc-book and the conformance kit (design §6 step 12).
 #
+#   3. One `log` (decision 0079): the resolved graph, every target and dependency kind, holds
+#      exactly one package named `log`, and tungstenite's `log` dependency resolves to the
+#      package fbc-runtime depends on. fbc-runtime caps that facade's static level at DEBUG
+#      because tungstenite logs each frame at TRACE; the cap holds only on the facade
+#      tungstenite logs through. Cargo never selects two semver-compatible versions of one
+#      package (a consumer pinning another 0.4 release fails to resolve), so a second `log`
+#      would be another major (0.3) or another source; the check refuses either.
+#
 #   scripts/check-deps.sh                      check this workspace
 #   scripts/check-deps.sh --manifest-path <p>  check another workspace (the self-test's)
 #   scripts/check-deps.sh --self-test          prove the check fails on fixtures/dep-direction,
 #                                              naming exactly its three forbidden edges, and
 #                                              refuses a workspace with no venue crate
-#                                              (fixtures/licence-gate)
+#                                              (fixtures/licence-gate), and that the one-log
+#                                              check refuses a graph with two `log` packages
+#                                              and one where tungstenite's `log` is not
+#                                              fbc-runtime's (synthetic metadata)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -72,6 +83,66 @@ print(f"dependency direction: ok ({edges} workspace edges; outside crates/venues
 PY
 }
 
+one_log() {  # one_log [metadata-json]; reads `cargo metadata` of this workspace when none is given
+  # The whole graph's metadata is too long for an argument; python reads it from a file.
+  local file rc=0
+  file="$(mktemp)"
+  if [ -n "${1:-}" ]; then printf '%s' "$1" >"$file"
+  else cargo metadata --format-version 1 --offline --locked >"$file"; fi
+  python3 - "$file" <<'PY' || rc=$?
+import json, sys
+
+with open(sys.argv[1]) as f:
+    meta = json.load(f)
+names = {p["id"]: (p["name"], p["version"]) for p in meta["packages"]}
+logs = sorted(i for i, (n, _) in names.items() if n == "log")
+bad = []
+if len(logs) != 1:
+    found = ", ".join(f"log {names[i][1]} ({i})" for i in logs) or "none"
+    bad.append(f"the graph holds {len(logs)} log packages, not one: {found}")
+
+def log_of(name):  # the `log` package each package called `name` resolves its `log` edge to
+    out = set()
+    for node in meta["resolve"]["nodes"]:
+        if names[node["id"]][0] != name:
+            continue
+        for dep in node["deps"]:
+            if names[dep["pkg"]][0] == "log":
+                out.add(dep["pkg"])
+    return out
+
+runtime, tungstenite = log_of("fbc-runtime"), log_of("tungstenite")
+if not runtime or not tungstenite:
+    bad.append("fbc-runtime or tungstenite has no log dependency; the check cannot compare them")
+elif runtime != tungstenite:
+    bad.append(f"tungstenite logs through {sorted(tungstenite)}, fbc-runtime caps {sorted(runtime)}")
+for line in bad:
+    print("one log: " + line)
+if bad:
+    sys.exit(1)
+print(f"one log: ok (log {names[logs[0]][1]}, the facade tungstenite logs through and "
+      "fbc-runtime caps)")
+PY
+  rm -f "$file"
+  return "$rc"
+}
+
+# Synthetic `cargo metadata` for the one-log self-test: fbc-runtime and tungstenite each with
+# a `log` edge, to the package ids given.
+log_meta() {  # log_meta <fbc-runtime's log id> <tungstenite's log id>
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+
+rt, tg = sys.argv[1], sys.argv[2]
+pkgs = [("fbc-runtime", "0.0.1", "rt"), ("tungstenite", "0.30.0", "tg")]
+pkgs += [("log", i.split("@")[1], i) for i in sorted({rt, tg})]
+nodes = [{"id": "rt", "deps": [{"pkg": rt}]}, {"id": "tg", "deps": [{"pkg": tg}]}]
+nodes += [{"id": i, "deps": []} for i in sorted({rt, tg})]
+print(json.dumps({"packages": [{"id": i, "name": n, "version": v} for n, v, i in pkgs],
+                  "resolve": {"nodes": nodes}}))
+PY
+}
+
 self_test() {
   local out rc
   set +e
@@ -103,13 +174,26 @@ self_test() {
     echo "dependency self-test: a workspace without venue crates was not refused" >&2
     echo "$out" >&2; exit 1 ;;
   esac
+  # One log: a graph where tungstenite's log is another package than fbc-runtime's is refused,
+  # naming both, and one where they are the same package passes.
+  set +e
+  out="$(one_log "$(log_meta log@0.4.34 log@0.3.9)" 2>&1)"
+  rc=$?
+  set -e
+  case "$rc:$out" in
+    1:*"holds 2 log packages"*"tungstenite logs through ['log@0.3.9'], fbc-runtime caps ['log@0.4.34']"*) ;;
+    *) echo "dependency self-test: two log packages were not refused" >&2; echo "$out" >&2; exit 1 ;;
+  esac
+  out="$(one_log "$(log_meta log@0.4.34 log@0.4.34)")" || {
+    echo "dependency self-test: one shared log package was refused" >&2; echo "$out" >&2; exit 1; }
   echo "dependency self-test: ok (refused fbc-core -> fbc-venue-a, fbc-book -> fbc-venues" \
     "(build), fbc-venue-b -> fbc-venue-a; allowed dev-dependencies and the registry;" \
-    "refused a workspace without venue crates)"
+    "refused a workspace without venue crates; refused a second log package under" \
+    "tungstenite, passed one shared)"
 }
 
 case "${1:-}" in
-  "") check ;;
+  "") check; one_log ;;
   --manifest-path) [ -n "${2:-}" ] || { echo "usage: --manifest-path <Cargo.toml>" >&2; exit 2; }; check "$2" ;;
   --self-test) self_test ;;
   *) echo "usage: scripts/check-deps.sh [--self-test | --manifest-path <Cargo.toml>]" >&2; exit 2 ;;

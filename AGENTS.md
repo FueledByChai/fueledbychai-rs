@@ -455,7 +455,9 @@ permissive allowlist; 0017), then the dependency-direction check
 in the `fixtures/dep-direction` workspace and refuses a workspace with no venue crate, then
 `scripts/check-deps.sh` on the workspace: from `cargo metadata`, no crate outside
 `crates/venues/` has a normal or build dependency on a venue crate, and a concrete venue crate
-depends on no workspace crate but `fbc-core`; dev-dependencies are not checked; design §3),
+depends on no workspace crate but `fbc-core`; dev-dependencies are not checked; design §3;
+and the resolved graph holds one `log` package, the one tungstenite logs through and
+fbc-runtime caps; 0079),
 then the coverage
 ratchet (`scripts/coverage.sh`, workspace line coverage from cargo-llvm-cov, against
 `coverage-floor.txt` with 0.2 points of slack; the workspace ticket records the first floor

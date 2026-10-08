@@ -58,6 +58,7 @@ if [ -f Cargo.toml ]; then
   # and a concrete venue crate depends on fbc-core (and protocol crates) only, so only
   # crates/venues/fbc-venues sees concrete venues; dev-dependencies are not checked. The
   # self-test proves the check fails naming each forbidden edge in fixtures/dep-direction.
+  # It also finds one `log` package in the graph, the one tungstenite logs through (0079).
   step "dependency direction"
   scripts/check-deps.sh --self-test
   scripts/check-deps.sh
