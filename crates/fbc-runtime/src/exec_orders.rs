@@ -268,7 +268,7 @@ impl ExecOrders {
         let gate = self.shared.gate.borrow();
         let ready = self.shared.ready().is_some_and(|epoch| gate.placing(epoch));
         if ready {
-            gate.unprotected().to_vec()
+            gate.unprotected()
         } else {
             Vec::new()
         }

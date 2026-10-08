@@ -47,11 +47,17 @@ bound the answer.
   `ExecHandler::on_unprotected`; the consumer cancels each with a Safety cancel fbc-oms builds
   and authorizes (the session cannot authorize a command itself, 0013 rule 2).
 - **What releases the market.** An order event, or an order query's answer, of the epoch that
-  shows the order filled, cancelled, rejected or expired; an answer to a query by our client id
-  names the order by it, under whatever venue id it has now. An amend the venue reports under a
-  new venue id moves the order to it. An event naming a venue id names that order only, so an
-  end reported late under an id an amend superseded releases nothing whatever client id it
-  carries; one naming no venue id names our order by its client id. What the epoch's events
+  shows the order filled, cancelled, rejected or expired. An amend the venue reports under a
+  new venue id moves the order to it, and the gate keeps the ids each held order was moved from
+  (no more of them than amends heard of it). An event naming a venue id names that order only,
+  so an end reported late under an id an amend superseded releases nothing whatever client id
+  it carries; one naming no venue id names our order by its client id, unless an amend moved
+  the order, since the end may then report the superseded order (the consumer then queries
+  it). An answer to a query by our client id is the order's state now: it names the order by
+  that id and moves it to the venue id the answer shows, then applies the state shown, unless
+  an amend moved the order away from that id, when the answer shows the superseded order and
+  changes nothing. A later epoch's snapshot of an order under an id it was moved from adds
+  nothing. What the epoch's events
   showed before its resync ended (ends, and amends to new ids, by venue id or, for an event
   naming none, by our client id) is kept until it ends, so a snapshot read after them (a resync
   over HTTP while the stream runs) does not undo them. Nothing else releases a market: a cancel
