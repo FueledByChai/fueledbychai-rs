@@ -72,11 +72,13 @@ Lines (each step with the milliseconds since the start):
   STEP ack           Paradex answered the place (provisional: queued for its risk check)
   STEP cancel        the cancel was handed to the session
   STEP cancel-ack    Paradex answered the cancel (provisional: queued for cancellation)
-  STEP closed        the order event reporting the order ended arrived
+  STEP closed        the order event reporting the order cancelled, nothing of it filled
   STEP stop          kill switch on, cancel all sent for what is still open, session closed
   TIMEOUT <step>     the step did not happen in time; the sample Stops
   NOTE ...           something worth knowing (an unexpected event, a refusal)
-  DONE ok|failed     the outcome; the exit status is 0 only for ok
+  DONE ok|failed     the outcome; ok only when every step happened, every order Stop
+                     cancelled ended cancelled with nothing filled, and the inventory did
+                     not move; the exit status is 0 only for ok
 
 Ctrl-C aborts at once: the socket closes and Paradex's cancel-on-disconnect cancels the order.
 ";
