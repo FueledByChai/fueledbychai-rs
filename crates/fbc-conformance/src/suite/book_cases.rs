@@ -10,7 +10,8 @@
 //! table, in order, as one connection carries under the venue's
 //! [`ConnTopology`](fbc_core::ConnTopology): the first alone for `PerInstrument`, the first
 //! `max_subscriptions` for a capped shared connection, every one otherwise. A case's frames
-//! name those instruments only. A channel whose
+//! name those instruments only: an event on another instrument, or a `gap=` tag naming one, is
+//! a breach (Codex r4217991939). A channel whose
 //! [`BookCaps::rest_anchor`] is true is skipped by name, saying why: its snapshot comes in an
 //! HTTP answer, which these case files do not carry (FBC-fhk4).
 //!
@@ -29,7 +30,8 @@
 //! ```
 //!
 //! - `gap=<symbol>`: the frame breaks the sequence of the instrument whose venue symbol is
-//!   `<symbol>` on its book ([`continuity`](super::continuity));
+//!   `<symbol>` on its book ([`continuity`](super::continuity)); a frame batching several
+//!   instruments may carry one such tag for each whose sequence it breaks;
 //! - `ts`: the frame carries the venue's timestamp
 //!   ([`no_exch_ts_synthesized`](super::no_exch_ts_synthesized));
 //! - `public`, `rpi`: the order channels whose liquidity the frame shows
@@ -45,8 +47,8 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use fbc_core::{
-    BookCaps, BookId, Channel, DecodeError, Effects, MdEvent, MdSink, RawFrame, SpecTable,
-    VenueMeta,
+    BookCaps, BookId, Channel, DecodeError, Effects, InstrumentId, MdEvent, MdSink, RawFrame,
+    SpecTable, VenueMeta,
 };
 
 use super::frames::{self, EXT, unhex};
@@ -60,8 +62,8 @@ pub(crate) const ANCHORED: &str = "BookCaps.rest_anchor is true: its snapshot co
 /// What the fixture states of one frame.
 #[derive(Clone, Eq, PartialEq, Debug, Default)]
 pub(crate) struct Tags {
-    /// It breaks the sequence of the instrument this venue symbol names.
-    pub gap: Option<String>,
+    /// It breaks the sequences of the instruments these venue symbols name.
+    pub gaps: BTreeSet<String>,
     /// It carries the venue's timestamp.
     pub ts: bool,
     /// The order channels whose liquidity it shows.
@@ -72,7 +74,7 @@ impl Tags {
     /// Adds the tag `word`; `false` when it is none.
     fn add(&mut self, word: &str) -> bool {
         if let Some(symbol) = word.strip_prefix("gap=").filter(|s| !s.is_empty()) {
-            self.gap = Some(symbol.to_owned());
+            self.gaps.insert(symbol.to_owned());
             return true;
         }
         match word {
@@ -182,6 +184,8 @@ pub(crate) fn books(
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) struct Step {
     pub line: usize,
+    /// The frame was binary.
+    pub binary: bool,
     pub tags: Tags,
     pub result: Result<(), DecodeError>,
     pub events: Vec<(VenueMeta, MdEvent)>,
@@ -219,6 +223,7 @@ pub(crate) fn decode(h: &Harness<'_>, book: &Book, case: &[Line]) -> Result<Vec<
             let result = codec.on_frame(frame, scope, specs, &mut sink, &mut fx);
             steps.push(Step {
                 line: line.line,
+                binary: matches!(line.frame, Frame::Binary(_)),
                 tags: line.tags.clone(),
                 result,
                 events: sink.0,
@@ -226,6 +231,23 @@ pub(crate) fn decode(h: &Harness<'_>, book: &Book, case: &[Line]) -> Result<Vec<
         }
         steps
     }))
+}
+
+/// The instrument `ev` is on.
+fn inst_of(ev: &MdEvent) -> InstrumentId {
+    match *ev {
+        MdEvent::Touch { inst, .. }
+        | MdEvent::BookSnapshotBegin { inst, .. }
+        | MdEvent::BookSnapshotEnd { inst, .. }
+        | MdEvent::Level { inst, .. }
+        | MdEvent::Window { inst, .. }
+        | MdEvent::Trade { inst, .. }
+        | MdEvent::Mark { inst, .. }
+        | MdEvent::Index { inst, .. }
+        | MdEvent::Funding { inst, .. }
+        | MdEvent::Stats { inst, .. }
+        | MdEvent::Health { inst, .. } => inst,
+    }
 }
 
 /// Judges one channel's decoded case, read from the file named, under the setup's spec table:
@@ -276,9 +298,31 @@ impl PerBook<'_> {
                 }
             };
             let steps = decode(h, book, &case)?;
+            let subscribed: BTreeSet<InstrumentId> =
+                h.book_subs(book.id).iter().map(|s| s.inst).collect();
+            let specs = h.specs();
             for step in &steps {
+                let line = step.line;
                 if let Err(e) = &step.result {
-                    let what = format!("line {} refused: {e}", step.line);
+                    breaches.push(Breach::new(&file, format!("line {line} refused: {e}")));
+                }
+                // Only what this connection subscribed (Codex r4217991939).
+                let gapped = step.tags.gaps.iter().map(|sym| (sym, specs.by_symbol(sym)));
+                for (sym, _) in
+                    gapped.filter(|(_, s)| s.is_some_and(|s| !subscribed.contains(&s.id)))
+                {
+                    let what = format!(
+                        "line {line}: `gap={sym}` names an instrument this \
+                                        connection did not subscribe"
+                    );
+                    breaches.push(Breach::new(&file, what));
+                }
+                let outside = step.events.iter().map(|(_, ev)| inst_of(ev));
+                for inst in outside.filter(|i| !subscribed.contains(i)) {
+                    let what = format!(
+                        "line {line}: an event on {inst:?}, which this connection \
+                                        did not subscribe"
+                    );
                     breaches.push(Breach::new(&file, what));
                 }
             }
@@ -345,7 +389,7 @@ mod tests {
                 Line {
                     line: 4,
                     tags: Tags {
-                        gap: Some("X".to_owned()),
+                        gaps: ["X".to_owned()].into(),
                         ts: true,
                         ..Tags::default()
                     },
