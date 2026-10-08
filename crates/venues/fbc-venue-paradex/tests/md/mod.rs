@@ -14,6 +14,7 @@ use fbc_core::{
 use fbc_venue_paradex::factory::caps;
 use fbc_venue_paradex::md::ParadexMd;
 use rust_decimal::Decimal;
+use serde_json::Value;
 
 pub const BTC: InstrumentId = InstrumentId::new(1);
 pub const ETH: InstrumentId = InstrumentId::new(2);
@@ -133,4 +134,63 @@ pub fn rpc_error(id: u64) -> String {
 pub fn refused_sub(inst: InstrumentId, feed: fbc_core::Feed) -> (VenueMeta, MdEvent) {
     let h = fbc_core::FeedHealth::Refused;
     (VenueMeta::NONE, MdEvent::Health { inst, feed, h })
+}
+
+/// One frame of a capture, as the WebSocket delivered it.
+pub enum Captured {
+    Text(String),
+    Binary(Vec<u8>),
+}
+
+/// The frames of capture `name`: one JSON object per line, `opcode` `text` with the frame in
+/// `text`, or `binary` with its bytes in standard base64 in `b64`.
+pub fn capture(name: &str) -> Vec<Captured> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../fixtures/paradex/md")
+        .join(name);
+    let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    text.lines()
+        .map(|line| {
+            let v: Value = serde_json::from_str(line).unwrap();
+            match v["opcode"].as_str() {
+                Some("text") => Captured::Text(v["text"].as_str().unwrap().to_owned()),
+                Some("binary") => Captured::Binary(base64(v["b64"].as_str().unwrap())),
+                other => panic!("opcode {other:?}"),
+            }
+        })
+        .collect()
+}
+
+/// Standard base64 (RFC 4648 §4, `=` padding) decoded; panics on any other character.
+pub fn base64(text: &str) -> Vec<u8> {
+    let value = |c: u8| match c {
+        b'A'..=b'Z' => c - b'A',
+        b'a'..=b'z' => c - b'a' + 26,
+        b'0'..=b'9' => c - b'0' + 52,
+        b'+' => 62,
+        b'/' => 63,
+        _ => panic!("not base64: {c}"),
+    };
+    let digits = text.trim_end_matches('=').as_bytes();
+    let mut out = Vec::with_capacity(digits.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for &c in digits {
+        acc = (acc << 6) | u32::from(value(c));
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    out
+}
+
+/// BTC-USD-PERP on Paradex's grid: a 0.1 price tick and a 0.00001 size step, the grid every
+/// level in both captures lies on (the greatest common divisor of their prices and sizes).
+pub fn live_specs() -> SpecTable {
+    let mut btc = spec(BTC, "BTC-USD-PERP");
+    btc.size_step = SizeStep::new(Decimal::new(1, 5)).unwrap();
+    let mut table = SpecTable::new();
+    table.insert(btc);
+    table
 }

@@ -21,8 +21,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
-use args::{Market, Options, Parsed, USAGE};
-use fbc_conformance::{Frame, HttpReply, HttpRoutes, Step, StubServer, WsScript};
+use args::{Market, Options, ParadexTouch, Parsed, USAGE};
+use fbc_conformance::{Frame, HttpReply, HttpRoutes, Responder, Step, StubServer, WsScript};
 use fbc_core::WallNs;
 use fbc_runtime::ProxyConfig;
 use rust_decimal::Decimal;
@@ -278,6 +278,7 @@ fn help_documents_every_argument() {
     );
     for flag in [
         "--paradex <MARKET>",
+        "--paradex-touch <WHICH>",
         "--binance <SYMBOL>",
         "--socks5 <HOST:PORT>",
         "--seconds <N>",
@@ -318,6 +319,7 @@ fn the_command_line_is_parsed_with_defaults_and_refused_with_a_reason() {
             tick: finest,
             step: finest,
         }),
+        paradex_touch: ParadexTouch::Bbo,
         binance: None,
         proxy: ProxyConfig::Direct,
         seconds: Some(30),
@@ -365,6 +367,19 @@ fn the_command_line_is_parsed_with_defaults_and_refused_with_a_reason() {
         panic!("{parsed:?}")
     };
     assert_eq!(opts.paradex.unwrap().symbol, "kBONK-USD-PERP");
+
+    // FBC-taxd: which of the Paradex market's touches; bbo when not given.
+    for (which, want) in [
+        ("bbo", ParadexTouch::Bbo),
+        ("interactive", ParadexTouch::Interactive),
+        ("both", ParadexTouch::Both),
+    ] {
+        let parsed = args::parse(strings(&["--paradex", "X", "--paradex-touch", which]));
+        let Ok(Parsed::Watch(opts)) = parsed else {
+            panic!("{parsed:?}")
+        };
+        assert_eq!(opts.paradex_touch, want);
+    }
 
     for (args, why) in [
         (&[][..], "name a market"),
@@ -416,6 +431,10 @@ fn the_command_line_is_parsed_with_defaults_and_refused_with_a_reason() {
         (
             &["--paradex", "BTC_USD_PERP"][..],
             "not a market as the venue spells it",
+        ),
+        (
+            &["--paradex", "X", "--paradex-touch", "rpi"][..],
+            "--paradex-touch rpi: not bbo, interactive or both",
         ),
         // A flag where a value belongs: the value was left out.
         (&["--binance", "--top", "2"][..], "--binance needs a value"),
@@ -526,4 +545,182 @@ fn a_line_is_stamped_with_its_utc_time_to_the_millisecond() {
         "22:13:20.123"
     );
     assert_eq!(watch::clock(WallNs(0)), "00:00:00.000");
+}
+
+/// The binary frames of the Paradex capture `name` (`fixtures/paradex/md/`, one JSON object
+/// per line, a binary frame's bytes in standard base64 in `b64`), after its acknowledgement.
+fn captured(name: &str) -> Vec<Frame> {
+    let path = fixture_path(&format!("paradex/md/{name}"));
+    let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let base64 = |text: &str| {
+        let value = |c: u8| match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => panic!("not base64: {c}"),
+        };
+        let (mut out, mut acc, mut bits) = (Vec::new(), 0u32, 0u32);
+        for &c in text.trim_end_matches('=').as_bytes() {
+            acc = (acc << 6) | u32::from(value(c));
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((acc >> bits) as u8);
+            }
+        }
+        out
+    };
+    // `"b64": "<digits>"`: the acknowledgement, a text frame, has none.
+    text.lines()
+        .filter_map(|line| {
+            let (_, rest) = line.split_once(r#""b64": ""#)?;
+            let (b64, _) = rest.split_once('"').unwrap();
+            Some(Frame::Binary(base64(b64)))
+        })
+        .collect()
+}
+
+/// FBC-taxd: `--paradex-touch interactive` subscribes the RPI-inclusive touch,
+/// `bbo.<MARKET>.interactive`, in place of the plain bbo, and prints its frames (the first two
+/// of the 2026-10-08 production capture) under its own channel name, `bbo.interactive`. The
+/// interactive touch has the second connection to itself, the trades and the book the first
+/// (Codex r4214305885); the two may be accepted in either order, so the stub answers each
+/// connection's first subscribe by what it names: an acknowledgement, and the captured frames
+/// after the interactive touch's.
+#[tokio::test]
+async fn md_watch_prints_the_interactive_touch_under_its_own_channel_name() {
+    let frames = captured("btc-bbo-interactive-2026-10-08.jsonl");
+    let first_two: Vec<Frame> = frames.into_iter().take(2).collect();
+    let answer = Responder::new(move |frame| {
+        let Frame::Text(text) = frame else {
+            return Err("a subscribe is a text frame".to_owned());
+        };
+        let field = |name: &str, end: char| {
+            let (_, rest) = text.split_once(name)?;
+            Some(rest.split_once(end)?.0.to_owned())
+        };
+        let id = field(r#""id":"#, ',').or_else(|| field(r#""id":"#, '}'));
+        let channel = field(r#""channel":""#, '"').ok_or("no channel")?;
+        let id = id.ok_or("no id")?;
+        let mut out = vec![Frame::text(format!(
+            r#"{{"jsonrpc":"2.0","result":{{"channel":"{channel}"}},"id":{id}}}"#
+        ))];
+        if channel.ends_with(".interactive") {
+            out.extend(first_two.iter().cloned());
+        }
+        Ok(out)
+    });
+    let steps = vec![
+        Step::Accept,
+        Step::Accept,
+        Step::Respond {
+            conn: 0,
+            with: answer.clone(),
+        },
+        Step::Respond {
+            conn: 1,
+            with: answer,
+        },
+    ];
+    let paradex = StubServer::start(WsScript::new(steps), HttpRoutes::new())
+        .await
+        .unwrap();
+    let parsed = args::parse(strings(&[
+        "--paradex",
+        "BTC-USD-PERP",
+        "--paradex-touch",
+        "interactive",
+        "--paradex-url",
+        &paradex.ws_url("/v1"),
+    ]))
+    .unwrap();
+    let Parsed::Watch(opts) = parsed else {
+        panic!("not a watch: {parsed:?}")
+    };
+    let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let out: watch::Out = buf.clone();
+    let text = || String::from_utf8(buf.borrow().clone()).unwrap();
+    let second = "TOUCH paradex BTC-USD-PERP bbo.interactive bid 83422.7 x 0.00015 \
+                  ask 83442.3 x 0.00015 mid 83432.5 spread 2.35bps";
+    let stop = async {
+        paradex.finished().await.unwrap();
+        while !text().contains(second) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    let run = watch::run(&opts, out, false, stop);
+    let Ok(ran) = tokio::time::timeout(Duration::from_secs(60), run).await else {
+        panic!(
+            "md_watch did not print the interactive touches within 60 s:\n{}",
+            text()
+        )
+    };
+    ran.unwrap();
+    let printed = text();
+    let lines: Vec<&str> = printed.lines().collect();
+    assert_eq!(
+        lines[..3],
+        [
+            "md_watch: paradex BTC-USD-PERP (bbo.interactive, trades, deltas book); market \
+             data only, no order is ever sent",
+            "TOUCH paradex BTC-USD-PERP bbo.interactive bid 83422.7 x 0.00015 \
+             ask 83452.9 x 0.00031 mid 83437.8 spread 3.62bps",
+            second,
+        ]
+    );
+    // Then md_watch's stop closes both connections, in either order.
+    let mut closed = lines[3..].to_vec();
+    closed.sort_unstable();
+    assert_eq!(
+        closed,
+        [
+            "CLOSED paradex conn 0 epoch 0 ended",
+            "CLOSED paradex conn 1 epoch 0 ended",
+        ]
+    );
+    // The connection carrying the interactive touch subscribed exactly
+    // bbo.BTC-USD-PERP.interactive and nothing else; no connection subscribed the plain bbo.
+    let subscribes = |conn: &fbc_conformance::ConnRecord| -> Vec<String> {
+        conn.received
+            .iter()
+            .filter_map(|frame| match frame {
+                Frame::Text(t) if t.contains(r#""method":"subscribe""#) => {
+                    let (_, rest) = t.split_once(r#""channel":""#).unwrap();
+                    Some(rest.split_once('"').unwrap().0.to_owned())
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let conns = paradex.connections();
+    assert_eq!(conns.len(), 2);
+    let channels: Vec<Vec<String>> = conns.iter().map(subscribes).collect();
+    let interactive = ["bbo.BTC-USD-PERP.interactive".to_owned()];
+    assert!(
+        channels.iter().any(|c| c[..] == interactive),
+        "{channels:?}"
+    );
+    assert!(
+        channels.iter().flatten().all(|c| c != "bbo.BTC-USD-PERP"),
+        "{channels:?}"
+    );
+}
+
+/// FBC-taxd: `--paradex-touch both` subscribes the plain and the interactive touch, each under
+/// its own channel name; the venue plans them on two connections (the Paradex crate's
+/// `tests/md_touch_interactive.rs`).
+#[test]
+fn both_paradex_touches_are_named_apart() {
+    use fbc_venue_paradex::md::{BBO, BBO_INTERACTIVE};
+    assert_eq!(watch::paradex_touches(ParadexTouch::Bbo), [(BBO, "bbo")]);
+    assert_eq!(
+        watch::paradex_touches(ParadexTouch::Interactive),
+        [(BBO_INTERACTIVE, "bbo.interactive")]
+    );
+    assert_eq!(
+        watch::paradex_touches(ParadexTouch::Both),
+        [(BBO, "bbo"), (BBO_INTERACTIVE, "bbo.interactive")]
+    );
 }

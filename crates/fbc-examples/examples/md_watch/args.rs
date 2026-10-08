@@ -18,6 +18,10 @@ Markets (at least one):
 Options:
   --socks5 <HOST:PORT>    connect through this SOCKS5 proxy, which resolves the venues' names
                           (default: connect directly)
+  --paradex-touch <WHICH> the Paradex market's touch: bbo (default, the bbo.<MARKET>
+                          channel), interactive (bbo.<MARKET>.interactive, the touch
+                          including RPI orders, printed as bbo.interactive) or both; the
+                          interactive touch has a connection of its own
   --seconds <N>           stop after N seconds (default: run until Ctrl-C)
   --top <N>               under each book line, print the book's best N levels per side,
                           0 to 15 (default 0: the touch line only)
@@ -74,10 +78,22 @@ pub struct Market {
     pub step: Decimal,
 }
 
+/// Which of a Paradex market's touch channels to watch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParadexTouch {
+    /// `bbo.{market}`, the public book's touch.
+    Bbo,
+    /// `bbo.{market}.interactive`, the touch including RPI orders.
+    Interactive,
+    /// Both, each printed under its own channel name.
+    Both,
+}
+
 /// What to watch and how.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Options {
     pub paradex: Option<Market>,
+    pub paradex_touch: ParadexTouch,
     pub binance: Option<Market>,
     pub proxy: ProxyConfig,
     pub seconds: Option<u64>,
@@ -97,6 +113,7 @@ pub enum Parsed {
 /// Parses the arguments after the program name; an error says which argument is wrong.
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     let mut paradex = None;
+    let mut paradex_touch = ParadexTouch::Bbo;
     let mut binance = None;
     let mut proxy = ProxyConfig::Direct;
     let mut seconds = None;
@@ -120,6 +137,18 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         match flag.as_str() {
             "--paradex" => paradex = Some(symbol(&flag, value()?, Spelling::Paradex)?),
             "--binance" => binance = Some(symbol(&flag, value()?, Spelling::Binance)?),
+            "--paradex-touch" => {
+                paradex_touch = match value()?.as_str() {
+                    "bbo" => ParadexTouch::Bbo,
+                    "interactive" => ParadexTouch::Interactive,
+                    "both" => ParadexTouch::Both,
+                    other => {
+                        return Err(format!(
+                            "--paradex-touch {other}: not bbo, interactive or both"
+                        ));
+                    }
+                }
+            }
             "--socks5" => proxy = socks5(&value()?)?,
             "--seconds" => {
                 let n = value()?;
@@ -152,6 +181,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         |symbol: Option<String>, tick, step| symbol.map(|symbol| Market { symbol, tick, step });
     Ok(Parsed::Watch(Box::new(Options {
         paradex: market(paradex, grids[0], grids[1]),
+        paradex_touch,
         binance: market(binance, grids[2], grids[3]),
         proxy,
         seconds,

@@ -78,3 +78,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0073](0073-an-order-query-is-normal-traffic-at-the-safety-floor-and-the-.md) An order query is normal traffic at the safety floor, and the cancel-on-disconnect arm and the resync may use the reserve — accepted
 - [0074](0074-paradex-s-book-channels-are-the-bare-order-book-market-delta.md) Paradex's book channels are the bare order_book.{market}.deltas and .interactive_deltas, the whole book on every change, one per market per SBE session — accepted
 - [0075](0075-a-replace-whose-cancel-was-sent-and-came-back-not-sent-or-re.md) A replace whose cancel was sent and came back not sent or refused is over, augmenting 0065 — accepted
+- [0076](0076-paradex-s-rpi-inclusive-touch-bbo-market-interactive-is-a-se.md) Paradex's RPI-inclusive touch bbo.{market}.interactive is a second touch source, one touch source per market per connection — accepted

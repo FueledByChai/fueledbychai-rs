@@ -14,8 +14,8 @@ use std::time::Duration;
 use fbc_core::{
     Aggressor, AssetSym, BookId, ConnKey, Envelope, Feed, FeedHealth, FundingSpec, InstrumentId,
     InstrumentKind, InstrumentSpec, Lots, Lvl, MdEvent, PriceGrid, SizeStep, SpecTable,
-    Subscription, Ticks, TradingStatus, UnderlyingId, VenueConfig, VenueFactory, VenueId, WallNs,
-    dispatch_market_data,
+    Subscription, Ticks, TouchSourceId, TradingStatus, UnderlyingId, VenueConfig, VenueFactory,
+    VenueId, WallNs, dispatch_market_data,
 };
 use fbc_runtime::{
     Connector, IngestClock, Liveness, MdBooks, MdHandler, MdVenue, MdVenueConfig, MdVenueControl,
@@ -28,11 +28,11 @@ use fbc_venue_binance_usdm::{
 };
 use fbc_venue_paradex::ParadexFactory;
 use fbc_venue_paradex::factory::MD_URL;
-use fbc_venue_paradex::md::{BBO, DELTAS};
+use fbc_venue_paradex::md::{BBO, BBO_INTERACTIVE, DELTAS};
 use rust_decimal::Decimal;
 use tokio::sync::Notify;
 
-use crate::args::{Market, Options};
+use crate::args::{Market, Options, ParadexTouch};
 
 /// Where the lines go: standard output when run, a buffer under test.
 pub type Out = Rc<RefCell<dyn Write>>;
@@ -197,12 +197,25 @@ fn specs(
     Ok(table)
 }
 
+/// The Paradex touch sources `touch` asks for, each with the channel name md_watch prints it
+/// under: `bbo` for `bbo.{market}`, `bbo.interactive` for `bbo.{market}.interactive`.
+pub fn paradex_touches(touch: ParadexTouch) -> Vec<(TouchSourceId, &'static str)> {
+    let bbo = (BBO, "bbo");
+    let interactive = (BBO_INTERACTIVE, "bbo.interactive");
+    match touch {
+        ParadexTouch::Bbo => vec![bbo],
+        ParadexTouch::Interactive => vec![interactive],
+        ParadexTouch::Both => vec![bbo, interactive],
+    }
+}
+
 /// One venue's market as md_watch prints it.
 struct Labels {
     venue: &'static str,
     symbol: String,
     inst: InstrumentId,
-    touch: &'static str,
+    /// Each touch source subscribed, and its channel name.
+    touches: Vec<(TouchSourceId, &'static str)>,
     book: BookId,
     book_name: &'static str,
     tick: Decimal,
@@ -260,6 +273,12 @@ impl Watcher {
     fn line(&self, at: WallNs, kind: &str, rest: &str) {
         let l = &self.labels;
         self.print(at, &format!("{kind} {} {} {rest}", l.venue, l.symbol));
+    }
+
+    /// The channel name of touch `source`.
+    fn touch_name(&self, source: TouchSourceId) -> &'static str {
+        let named = self.labels.touches.iter().find(|(s, _)| *s == source);
+        named.map_or("touch", |(_, name)| name)
     }
 
     fn px(&self, px: Ticks) -> Decimal {
@@ -340,7 +359,7 @@ impl Watcher {
 
     fn feed(&self, feed: Feed) -> &'static str {
         match feed {
-            Feed::Touch(_) => self.labels.touch,
+            Feed::Touch(source) => self.touch_name(source),
             Feed::Book(_) => self.labels.book_name,
             Feed::Trades => "trades",
             Feed::Mark => "mark",
@@ -358,8 +377,10 @@ impl Watcher {
         // A refused event is counted in the books; the line is printed all the same.
         let _ = self.books.apply(env.stamp.conn, &env.body);
         match env.body {
-            MdEvent::Touch { bid, ask, .. } => {
-                let rest = format!("{} {}", self.labels.touch, self.touch(bid, ask));
+            MdEvent::Touch {
+                bid, ask, source, ..
+            } => {
+                let rest = format!("{} {}", self.touch_name(source), self.touch(bid, ask));
                 self.line(at, "TOUCH", &rest);
             }
             MdEvent::Trade {
@@ -515,22 +536,21 @@ impl Shard<'_> {
             inst: PARADEX_INST,
             feed,
         };
+        let touches = paradex_touches(self.opts.paradex_touch);
+        let mut subs: Vec<_> = touches.iter().map(|(s, _)| sub(Feed::Touch(*s))).collect();
+        subs.extend([sub(Feed::Trades), sub(Feed::Book(DELTAS))]);
         self.wire(Plan {
             factory,
             cfg,
             specs,
-            subs: vec![
-                sub(Feed::Touch(BBO)),
-                sub(Feed::Trades),
-                sub(Feed::Book(DELTAS)),
-            ],
+            subs,
             conns: PARADEX_CONNS,
             silence: PARADEX_SILENCE,
             labels: Labels {
                 venue: "paradex",
                 symbol: market.symbol.clone(),
                 inst: PARADEX_INST,
-                touch: "bbo",
+                touches,
                 book: DELTAS,
                 book_name: "deltas",
                 tick: market.tick,
@@ -562,7 +582,7 @@ impl Shard<'_> {
                 venue: "binance",
                 symbol: market.symbol.clone(),
                 inst: BINANCE_INST,
-                touch: "bookTicker",
+                touches: vec![(TOUCH_BOOK_TICKER, "bookTicker")],
                 book: BOOK_DIFF,
                 book_name: "diff-depth",
                 tick: market.tick,
@@ -623,7 +643,13 @@ pub async fn run(
     let (mut paradex, mut binance) = (wire(paradex), wire(binance));
     let mut watching = Vec::new();
     if let Some(m) = &opts.paradex {
-        watching.push(format!("paradex {} (bbo, trades, deltas book)", m.symbol));
+        let touches = paradex_touches(opts.paradex_touch);
+        let names: Vec<_> = touches.iter().map(|(_, name)| *name).collect();
+        watching.push(format!(
+            "paradex {} ({}, trades, deltas book)",
+            m.symbol,
+            names.join(", ")
+        ));
     }
     if let Some(m) = &opts.binance {
         watching.push(format!(

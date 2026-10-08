@@ -414,7 +414,10 @@ pub enum ConnTopology {
     /// ([`Feed::Book`](crate::Feed::Book)) per instrument: the venue's book frames name their
     /// instrument but not their channel, so two book channels of one instrument on one
     /// connection could not be told apart (decision 0022). A second book channel of an
-    /// instrument goes on another connection.
+    /// instrument goes on another connection. Where the venue declares more than one touch
+    /// source, its touch frames are alike too, and the same holds for them: at most one touch
+    /// source ([`Feed::Touch`](crate::Feed::Touch)) per instrument on a connection (decision
+    /// 0076).
     SharedOneBookPerInstrument {
         /// The most subscriptions one connection carries, `None` where there is no cap.
         max_subscriptions: Option<u32>,

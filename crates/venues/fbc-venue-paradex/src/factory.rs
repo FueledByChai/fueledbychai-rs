@@ -240,12 +240,16 @@ impl VenueFactory for ParadexFactory {
         Err(VenueError::NoDiscovery)
     }
 
-    /// As few connections as can carry `subs` with at most one book channel per market on
-    /// each: a binary frame names its message by template id and its market by `market`, but
-    /// not which book channel it is on (see [`caps`], `topology`). The first connection
-    /// ([`MD_STREAM`]) carries every bbo and trades subscription and each market's first book
-    /// channel; connection `k` carries each market's book channel number `k`, in `BookId`
-    /// order.
+    /// Connections that carry `subs` with at most one book channel and one touch source per
+    /// market on each: a binary frame names its message by template id and its market by
+    /// `market`, but not which book or bbo channel it is on (see [`caps`], `topology`;
+    /// decision 0076). The first connection ([`MD_STREAM`]) carries every trades, mark and
+    /// funding subscription and each market's first book channel; connection `k` carries each
+    /// market's book channel number `k`, in `BookId` order. A touch source goes on the
+    /// connection of its own index, whatever else is subscribed: `bbo` on the first,
+    /// `bbo.{market}.interactive` on the second, so a change of the desired set never moves
+    /// a touch source to a connection whose codec holds the market's other one (Codex
+    /// r4214305885). A connection with nothing to carry is not planned.
     fn plan_md(
         &self,
         cfg: &VenueConfig,
@@ -263,6 +267,7 @@ impl VenueFactory for ParadexFactory {
                     *books += 1;
                     *books - 1
                 }
+                Feed::Touch(source) => usize::from(source.0),
                 _ => 0,
             };
             if conns.len() <= conn {
@@ -270,10 +275,12 @@ impl VenueFactory for ParadexFactory {
             }
             conns[conn].push(*sub);
         }
-        // At most as many connections as declared book channels, so the index fits a u16.
+        // At most as many connections as declared book channels or touch sources, so the index
+        // fits a u16.
         let plans = conns
             .into_iter()
             .zip(0u16..)
+            .filter(|(subs, _)| !subs.is_empty())
             .map(|(subs, stream)| EndpointPlan {
                 stream: StreamId(stream),
                 transport: MdTransport::Socket { url: url.clone() },
@@ -315,6 +322,30 @@ impl VenueFactory for ParadexFactory {
         creds: Secrets,
     ) -> Option<Result<HttpPlan<AccountSummary>, VenueError>> {
         Some(auth::connection_plan(cfg, creds))
+    }
+}
+
+/// One bbo channel: BboEvent (template 2) on every best-price change. `bbo.{market}` is the
+/// public book's touch; `bbo.{market}.interactive` carries the same template, including RPI
+/// orders (decision 0076).
+fn touch(channel: &'static str, includes: &[Channel]) -> TouchSourceCaps {
+    TouchSourceCaps {
+        channel,
+        // The schema's BboEvent: "Emitted on every best-price change".
+        cadence: Cadence::Realtime,
+        // The schema's TradeEvent.seq is "the same counter BboEvent.seq reports", the
+        // orderbook sequence number (the bbo channel's seq_no, "Sequence number of the
+        // orderbook"); decision 0022 takes BookEvent.seq to be that counter too. The interactive
+        // touch's is the same BboEvent.seq: the 2026-10-08 captures of the two run on in one
+        // series (decision 0076).
+        seq_domain: SeqDomain::SharedWithBook,
+        // BboEvent has one timestamp, `ts`; the schema's TradeEvent calls the same field the
+        // "Feed publish timestamp".
+        ts_kind: ExchTsKind::Publish,
+        // The schema carries prices including RPI on the interactive order book
+        // (BookEvent.bestBidPrice); bbo is the public book's, and its interactive twin shows
+        // what the interactive book does.
+        includes_channels: TagSet::of(includes),
     }
 }
 
@@ -408,21 +439,15 @@ fn venue_caps(exec: Option<ExecCaps>) -> VenueCaps {
         md: MdCaps {
             // "Binary Encoding (SBE)": public channel payloads are SBE since 2026-09-21.
             encoding: Encoding::Sbe,
-            touch_sources: vec![TouchSourceCaps {
-                channel: "bbo",
-                // The schema's BboEvent: "Emitted on every best-price change".
-                cadence: Cadence::Realtime,
-                // The schema's TradeEvent.seq is "the same counter BboEvent.seq reports", the
-                // orderbook sequence number (the bbo channel's seq_no, "Sequence number of the
-                // orderbook"); decision 0022 takes BookEvent.seq to be that counter too.
-                seq_domain: SeqDomain::SharedWithBook,
-                // BboEvent has one timestamp, `ts`; the schema's TradeEvent calls the same
-                // field the "Feed publish timestamp".
-                ts_kind: ExchTsKind::Publish,
-                // The schema carries prices including RPI only on the interactive order book
-                // (BookEvent.bestBidPrice); bbo is the public book's.
-                includes_channels: TagSet::of(&[Channel::Public]),
-            }],
+            // Indexed by TouchSourceId: md::BBO, then md::BBO_INTERACTIVE.
+            touch_sources: vec![
+                touch("bbo", &[Channel::Public]),
+                // `bbo.{market}.interactive`, exactly so spelled (decision 0076): the venue
+                // acknowledges it and streams BboEvent (template 2) on it, the touch including
+                // RPI orders, as the interactive order book shows them; its REST twin is
+                // `GET /v1/bbo/{market}/interactive`, not used here.
+                touch("bbo.interactive", &[Channel::Public, Channel::Rpi]),
+            ],
             // `order_book.{market_symbol}.{feed_type}` with feed types `deltas` and
             // `interactive_deltas`, both carried as the schema's BookEvent (template 3). The
             // `@15@{refresh_rate}` suffix docs.paradex.trade spells is refused on the SBE socket
@@ -462,10 +487,12 @@ fn venue_caps(exec: Option<ExecCaps>) -> VenueCaps {
             // A frame names its message by template id and its instrument by `market`, but a
             // BookEvent does not say which order-book channel (snapshot, deltas, interactive)
             // it belongs to ("Binary Encoding (SBE)": "Frames do not explicitly identify their
-            // channel"). bbo, trades and one book channel per market share a connection; a
-            // market's second book channel goes on another (decision 0022), as plan_md plans
-            // and the codec's subscribe enforces. The venue refuses it too: a market's second
-            // order_book channel "cannot share an SBE session" (decision 0074).
+            // channel"), nor does a BboEvent say whether it is bbo or bbo's interactive twin.
+            // Trades and one book channel and one touch source per market share a connection;
+            // a market's second book channel (decision 0022) or second touch source (decision
+            // 0076) goes on another, as plan_md plans and the codec's subscribe enforces. The
+            // venue refuses a second book channel too: a market's second order_book channel
+            // "cannot share an SBE session" (decision 0074).
             // docs.paradex.trade states no cap on subscriptions per connection.
             topology: ConnTopology::SharedOneBookPerInstrument {
                 max_subscriptions: None,
