@@ -23,10 +23,10 @@
 //!    find the order, or shows it with a command still in flight) leaves it to resyncs, and the
 //!    ladder asks for one on every pass ([`LadderPlan::resync`]). A resync showing the order
 //!    applies there as the query's answer would. An order whose venue id an unconfirmed amend
-//!    may have replaced, on a venue whose amend gives a new id, shown under another id than
-//!    the one its record holds, is not settled by it: nothing of the snapshot applies, since its price and
-//!    total would confirm the amend while the record kept the retired id, and a tombstone by
-//!    client id follows. With a [`SnapshotSource::Trustworthy`] source, an order absent from
+//!    may have replaced, on a venue whose amend gives a new id, shown resting under another
+//!    id than the one its record holds, is not settled by it: only the snapshot's cumulative
+//!    fill counts, since its price and total would confirm the amend while the record kept
+//!    the retired id, and a tombstone by client id follows. With a [`SnapshotSource::Trustworthy`] source, an order absent from
 //!    the configured number of snapshots in a row, each with a watermark at least its sent
 //!    time plus the settle time, ends [`TerminalKind::Lost`] and is counted
 //!    ([`Registry::lost`]). An order whose sent time was never recorded
@@ -49,7 +49,8 @@ use std::time::Duration;
 
 use fbc_core::{
     CidMatch, ClientOrderId, MonoNs, OrderCaps, OrderUpdate, QueryAnswer, QueryOrder, RefKind,
-    RpcId, SnapshotSource, SubmitOutcome, VenueOrderId, VenueOrderSnapshot, WallNs,
+    RpcId, SnapshotSource, SubmitOutcome, VenueOrderId, VenueOrderSnapshot, VenueOrderState,
+    WallNs,
 };
 
 use crate::gateway::ControlCommand;
@@ -277,9 +278,10 @@ impl Registry {
     /// the venue `caps` describe. The order the venue shows applies as its order update would
     /// ([`OrderRecord::apply_update`](crate::OrderRecord::apply_update)); resting with nothing
     /// in flight, or ended, the order leaves the ladder. Not found, or shown with a command
-    /// still in flight, it is left to resyncs; so it is, nothing of the answer applying, when
-    /// shown under another venue id than the record's while, on a venue whose amend gives the
-    /// order a new id, an unconfirmed amend may have replaced the record's (FBC-wua8). An
+    /// still in flight, it is left to resyncs; so it is, only the answer's cumulative fill
+    /// counting, when shown resting under another venue id than the record's while, on a
+    /// venue whose amend gives the order a new id, an unconfirmed amend may have replaced the
+    /// record's (FBC-wua8). An
     /// answer naming another order than the one queried (another client id, or a venue id
     /// another order of ours holds, in its target or in its snapshot) applies nothing to
     /// either order: the query is spent and resyncs decide
@@ -311,7 +313,8 @@ impl Registry {
             Some(snap) => {
                 let u = update_of(snap);
                 self.with_record(cid, |rec| {
-                    if rec.shown_elsewhere(caps, &snap.vid) {
+                    if rec.shown_elsewhere(caps, snap) {
+                        rec.count_venue_fill(snap.cum_filled);
                         rec.set_ladder_step(LadderStep::Resync);
                         return LadderResolution::Inconclusive;
                     }
@@ -344,10 +347,10 @@ impl Registry {
     ///
     /// An order on the ladder the snapshot shows (by our client id, or by a venue id it had)
     /// applies there as an order update would; resting with nothing in flight, or ended, it
-    /// leaves the ladder. An order whose client id and venue id the snapshot names apart, or
-    /// that it shows under another venue id than the record's while an unconfirmed amend may
-    /// have replaced the record's on a venue whose amend gives a new id, is only counted as
-    /// shown. With a [`SnapshotSource::Trustworthy`] source, an order on the ladder the
+    /// leaves the ladder. An order whose client id and venue id the snapshot names apart is
+    /// only counted as shown; so is one it shows resting under another venue id than the
+    /// record's while an unconfirmed amend may have replaced the record's on a venue whose
+    /// amend gives a new id, its cumulative fill counted too. With a [`SnapshotSource::Trustworthy`] source, an order on the ladder the
     /// snapshot does not show, sent at least the settle time before the watermark,
     /// counts one absence, and the configured number in a row ends it Lost, counted; a
     /// snapshot showing it starts the count again. An order with no recorded sent time, or
@@ -382,8 +385,15 @@ impl Registry {
                 (Some(cid), _) | (None, Some(cid)) => cid,
                 (None, None) => continue,
             };
-            let rec = &self.orders[&cid];
-            if rec.unknown_since().is_none() || rec.shown_elsewhere(caps, &snap.vid) {
+            let rec = self
+                .orders
+                .get_mut(&cid)
+                .expect("held, by client or venue id");
+            if rec.unknown_since().is_none() {
+                continue;
+            }
+            if rec.shown_elsewhere(caps, snap) {
+                rec.count_venue_fill(snap.cum_filled);
                 continue;
             }
             let u = update_of(snap);
@@ -573,15 +583,22 @@ impl OrderRecord {
             && (self.amend_unconfirmed() || self.vid_retired())
     }
 
-    /// Whether a snapshot shows the order under `vid` while the record holds another venue id
-    /// an unconfirmed amend, or one confirmed without naming the new id, may have retired
-    /// ([`Self::id_may_have_moved`]). Applied, its price and total could confirm the amend and
-    /// settle the order while the record keeps the retired id, which later commands would
-    /// name (FBC-wua8). Such a snapshot is inconclusive: the order stays on the ladder, and a
-    /// tombstone by client id follows. A record holding no venue id has none to retire: the
-    /// snapshot teaches it one as an update would (Codex r4224963871 on PR #134).
-    fn shown_elsewhere(&self, caps: &OrderCaps, vid: &VenueOrderId) -> bool {
-        self.id_may_have_moved(caps) && self.vid().is_some_and(|held| held != vid)
+    /// Whether `snap` shows the order resting under another venue id than the one the record
+    /// holds, while an unconfirmed amend, or one confirmed without naming the new id, may
+    /// have retired the record's ([`Self::id_may_have_moved`]). Applied, its price and total
+    /// could confirm the amend and settle the order while the record keeps the retired id,
+    /// which later commands would name (FBC-wua8). Such a snapshot is inconclusive: only its
+    /// cumulative fill counts ([`Self::count_venue_fill`]), the order stays on the ladder,
+    /// and a tombstone by client id follows. A record holding no venue id has none to retire:
+    /// the snapshot teaches it one as an update would (Codex r4224963871 on PR #134); nor does
+    /// one showing the order ended leave an id for a later command: it ends the order as its
+    /// update would (Codex r4225065388).
+    fn shown_elsewhere(&self, caps: &OrderCaps, snap: &VenueOrderSnapshot) -> bool {
+        let resting = matches!(
+            snap.state,
+            VenueOrderState::Open | VenueOrderState::Amended { .. }
+        );
+        resting && self.id_may_have_moved(caps) && self.vid().is_some_and(|held| *held != snap.vid)
     }
 }
 
