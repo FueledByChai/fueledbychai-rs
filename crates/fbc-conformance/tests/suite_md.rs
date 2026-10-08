@@ -15,14 +15,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fbc_conformance::suite::{self, Failure, Subject, Verdict};
-use fbc_conformance::toy::{ANCHORED_BOOK, ToyFactory};
+use fbc_conformance::toy::{ANCHORED_BOOK, INST_A, INST_B, ToyFactory};
 use fbc_core::{
-    AccountSummary, AssetKey, BookId, Channel, ConfigError, Continuity, DecodeError, DecodeScope,
-    Effects, Encoding, EndpointPlan, ExchNs, ExecCodec, ExecEndpoint, Feed, FeedHealth, FieldSpec,
-    HttpFailure, HttpPlan, HttpResponse, HttpTag, Inbound, InboundSpans, InstrumentSpecDraft,
-    Keepalive, MdCodec, MdEvent, MdSink, MonoNs, RawFrame, Secrets, SpecTable, Subscription,
-    SymbolError, TagSet, TimerTag, VenueCaps, VenueConfig, VenueError, VenueFactory, VenueMeta,
-    WallNs,
+    AccountSummary, AssetKey, BookId, Channel, ConfigError, ConnTopology, Continuity, DecodeError,
+    DecodeScope, Effect, Effects, Encoding, EndpointPlan, ExchNs, ExecCodec, ExecEndpoint, Feed,
+    FeedHealth, FieldSpec, HttpFailure, HttpPlan, HttpResponse, HttpTag, Inbound, InboundSpans,
+    InstrumentSpecDraft, Keepalive, MdCodec, MdEvent, MdSink, MonoNs, RawFrame, Secrets, SpecTable,
+    Subscription, SymbolError, TagSet, TimerTag, VenueCaps, VenueConfig, VenueError, VenueFactory,
+    VenueMeta, WallNs, WireSlice,
 };
 use toy_setup::{FIXTURES, assumed};
 
@@ -52,6 +52,14 @@ enum Twist {
     OtherBook,
     /// It refuses every subscription.
     RefusesSubscribe,
+    /// Every gap it reports names the other instrument (TOYA's for TOYB's, and the reverse).
+    WrongInstrument,
+    /// It refuses a subscribe call naming more than one instrument, as a venue with one
+    /// connection per instrument may.
+    OneInstrument,
+    /// Each codec its factory builds after the first sends its subscribe frame twice, in one
+    /// effect, as one that remembered the last connection's subscriptions in its payload would.
+    StalePayload,
     /// Each codec its factory builds subscribes once more for every codec built before it, as
     /// one that remembered the last connection's subscriptions would.
     PilesUp,
@@ -187,6 +195,14 @@ impl MdSink for Rewrite<'_> {
             ) => return,
             (Twist::StampsTime, _) if meta.exch_ts.is_none() => meta.exch_ts = Some(ExchNs(7)),
             (
+                Twist::WrongInstrument,
+                MdEvent::Health {
+                    inst,
+                    h: FeedHealth::Gap,
+                    ..
+                },
+            ) => *inst = if *inst == INST_A { INST_B } else { INST_A },
+            (
                 Twist::OtherBook,
                 MdEvent::Level { book, .. }
                 | MdEvent::BookSnapshotBegin { book, .. }
@@ -212,6 +228,37 @@ impl MdCodec for Twisted {
     ) -> Result<(), VenueError> {
         if self.twist == Twist::RefusesSubscribe {
             return Err(VenueError::UnsupportedFeed(add[0]));
+        }
+        if self.twist == Twist::OneInstrument && add.len() > 1 {
+            return Err(VenueError::UnsupportedFeed(add[1]));
+        }
+        if self.twist == Twist::StalePayload && self.built > 0 {
+            let mut once = Effects::new();
+            self.inner.subscribe(add, remove, specs, &mut once)?;
+            for effect in once.take() {
+                let Effect::Send {
+                    stream,
+                    frame,
+                    rpc,
+                    class,
+                    charge,
+                } = effect
+                else {
+                    fx.push(effect);
+                    continue;
+                };
+                let mut twice = frame.bytes().to_vec();
+                twice.extend_from_slice(frame.bytes());
+                let frame = WireSlice::plain(twice);
+                fx.push(Effect::Send {
+                    stream,
+                    frame,
+                    rpc,
+                    class,
+                    charge,
+                });
+            }
+            return Ok(());
         }
         if self.twist == Twist::PilesUp {
             for _ in 0..self.built {
@@ -386,9 +433,12 @@ fn continuity_fails_a_toy_variant_that_ignores_a_sequence_break_naming_every_bre
     assert_eq!(
         said(&failure, PLUS_ONE),
         [
-            "continuity/book.frames line 10 breaks the sequence, yet no gap was reported on book",
-            "continuity/book.frames line 16 breaks the sequence, yet no gap was reported on book",
-            "continuity/book.frames line 17 breaks the sequence, yet no gap was reported on book",
+            "continuity/book.frames line 10 breaks TOYA-PERP's sequence, yet no gap on book was \
+             reported for it",
+            "continuity/book.frames line 16 breaks TOYA-PERP's sequence, yet no gap on book was \
+             reported for it",
+            "continuity/book.frames line 17 breaks TOYB-PERP's sequence, yet no gap on book was \
+             reported for it",
         ]
     );
 }
@@ -411,8 +461,9 @@ fn the_suite_test_for_continuity_panics_naming_the_declared_continuity() {
 #[test]
 fn continuity_fails_a_toy_that_reports_a_gap_in_sequence() {
     let failure = failed(Variant::twisted(Twist::GapsAlways).run(suite::continuity));
-    // Every frame not marked: eleven frames, three of them breaks.
-    assert_eq!(named(&failure), [PLUS_ONE; 8]);
+    // Every frame not marked (eleven frames, three of them breaks), and TOYB's break, which
+    // also reports a gap on TOYA.
+    assert_eq!(named(&failure), [PLUS_ONE; 9]);
     assert_eq!(
         said(&failure, PLUS_ONE)[0],
         "continuity/book.frames line 3 is in sequence, yet a gap was reported"
@@ -483,6 +534,31 @@ fn book_channels_fails_a_frame_that_pushes_levels_without_stating_its_channels()
 }
 
 #[test]
+fn book_channels_fails_a_channel_stated_on_a_frame_that_pushes_no_level() {
+    // Codex r4217682460: a tag shows a channel only on a frame that shows liquidity.
+    let declares_rpi = || {
+        Variant::declaring(|caps| {
+            caps.md.books[0].includes_channels = TagSet::of(&[Channel::Public, Channel::Rpi]);
+        })
+    };
+    let scratch = Scratch::toy("rpi-on-nothing");
+    scratch.write(
+        "book_channels/book.frames",
+        "public text snap|sym=TOYA-PERP|book=0|seq=10|bid=100:3|ask=101:2\n\
+         rpi text delta|sym=TOYA-PERP|book=0|seq=11|bid=|ask=\n",
+    );
+    let failure = failed(declares_rpi().run_in(suite::book_channels, &scratch.0));
+    assert_eq!(
+        said(&failure, "book_channels/book.frames"),
+        ["line 2 states order channels, yet pushes no level"]
+    );
+    assert_eq!(
+        said(&failure, "BookCaps.includes_channels has Rpi"),
+        ["no frame of book_channels/book.frames shows it"]
+    );
+}
+
+#[test]
 fn subscriptions_idempotent_fails_a_codec_that_refuses_the_set() {
     let variant = Variant::twisted(Twist::RefusesSubscribe);
     let failure = failed(variant.run(suite::subscriptions_idempotent));
@@ -503,11 +579,70 @@ fn subscriptions_idempotent_fails_a_codec_that_refuses_the_set() {
 }
 
 #[test]
+fn continuity_fails_a_toy_that_reports_a_break_on_the_wrong_instrument() {
+    // Codex r4217682431: a gap must name the instrument whose sequence broke.
+    let failure = failed(Variant::twisted(Twist::WrongInstrument).run(suite::continuity));
+    let said = said(&failure, PLUS_ONE);
+    assert_eq!(said.len(), 6, "{said:#?}");
+    assert_eq!(
+        said[..2],
+        [
+            "continuity/book.frames line 10 breaks TOYA-PERP's sequence, yet no gap on book was \
+             reported for it",
+            "continuity/book.frames line 10 breaks TOYA-PERP's sequence, yet a gap was reported \
+             on TOYB-PERP",
+        ]
+    );
+}
+
+#[test]
+fn the_checks_drive_one_connection_as_the_topology_allows() {
+    // Codex r4217682420: a venue with a connection per instrument is subscribed one instrument
+    // per codec, and its cases name that instrument only.
+    let per_instrument = || {
+        let mut v = Variant::twisted(Twist::OneInstrument);
+        v.caps = |caps| caps.md.topology = ConnTopology::PerInstrument;
+        v
+    };
+    let scratch = Scratch::toy("per-instrument");
+    scratch.write(
+        "continuity/book.frames",
+        "text snap|sym=TOYA-PERP|book=0|seq=10|bid=100:3|ask=101:2\n\
+         gap=TOYA-PERP text delta|sym=TOYA-PERP|book=0|seq=12|bid=100:4|ask=\n",
+    );
+    probed(per_instrument().run_in(suite::continuity, &scratch.0));
+    let sent = probed(per_instrument().run(suite::subscriptions_idempotent));
+    assert!(sent[1].starts_with("book: 1 subscriptions"), "{sent:?}");
+    // A capped shared connection takes as many as its cap.
+    let capped = Variant::declaring(|caps| {
+        caps.md.topology = ConnTopology::Shared {
+            max_subscriptions: Some(1),
+        };
+    });
+    let sent = probed(capped.run(suite::subscriptions_idempotent));
+    assert!(sent[1].starts_with("book: 1 subscriptions"), "{sent:?}");
+    // The toy, its two instruments on one connection, fails a codec that takes one only.
+    let failure = failed(Variant::twisted(Twist::OneInstrument).run(suite::continuity));
+    assert!(said(&failure, "MdCodec::subscribe")[0].starts_with("refused book"));
+}
+
+#[test]
+fn subscriptions_idempotent_fails_a_codec_whose_reconnect_sends_other_subscriptions() {
+    // Codex r4217682449: the same number of effects, but the payload doubled.
+    let failure =
+        failed(Variant::twisted(Twist::StalePayload).run(suite::subscriptions_idempotent));
+    assert_eq!(
+        said(&failure, "MdCodec::subscribe"),
+        ["book: the reconnect's subscribe asked for other effects than the first epoch's"]
+    );
+}
+
+#[test]
 fn subscriptions_idempotent_fails_a_codec_that_sends_the_last_connections_subscriptions_again() {
     let failure = failed(Variant::twisted(Twist::PilesUp).run(suite::subscriptions_idempotent));
     assert_eq!(
         said(&failure, "MdCodec::subscribe"),
-        ["book: the reconnect's subscribe asked for 2 effects, the first epoch's for 1"]
+        ["book: the reconnect's subscribe asked for other effects than the first epoch's"]
     );
 }
 
@@ -582,14 +717,16 @@ fn continuity_reads_a_binary_venues_longer_blocks() {
         ["continuity/longer_block/book.frames: 2 frames, 0 breaking the sequence"]
     );
 
+    // Codex r4217682441: every frame must push something, not just one.
     scratch.write(
         "continuity/longer_block/book.frames",
-        "text delta|sym=TOYA-PERP|book=0|seq=11|bid=100:4|ask=\n",
+        "text snap|sym=TOYA-PERP|book=0|seq=10|bid=100:3|ask=101:2\n\
+         text delta|sym=TOYA-PERP|book=0|seq=11|bid=|ask=\n",
     );
     let failure = failed(binary().run_in(suite::continuity, &scratch.0));
     assert_eq!(
         said(&failure, "continuity/longer_block/book.frames"),
-        ["decodes to no event: a case that decodes nothing proves nothing"]
+        ["line 2 decodes to no event: a longer block must be read, not dropped"]
     );
 }
 
@@ -647,7 +784,7 @@ fn a_check_fails_a_missing_case_a_malformed_one_and_a_case_it_never_reads() {
     let failure = failed(scratch.run(suite::no_exch_ts_synthesized));
     assert_eq!(
         said(&failure, "no_exch_ts_synthesized/book.frames"),
-        ["line 1: `tz` is neither a frame nor a tag (gap, ts, public, rpi)"]
+        ["line 1: `tz` is neither a frame nor a tag (gap=<symbol>, ts, public, rpi)"]
     );
 }
 
@@ -663,8 +800,18 @@ fn a_check_fails_a_refused_frame_and_a_case_that_states_nothing() {
         said(&failure, "continuity/book.frames"),
         [
             "line 2 refused: malformed frame: sym",
-            "marks no frame `gap`: a case that breaks no sequence proves nothing",
+            "marks no frame `gap=<symbol>`: a case that breaks no sequence proves nothing",
         ]
+    );
+
+    scratch.write(
+        "continuity/book.frames",
+        "gap=TOYC-PERP text snap|sym=TOYA-PERP|book=0|seq=10|bid=100:3|ask=101:2\n",
+    );
+    let failure = failed(scratch.run(suite::continuity));
+    assert_eq!(
+        said(&failure, "continuity/book.frames"),
+        ["line 1: `gap=TOYC-PERP` names no instrument of the setup"]
     );
 
     scratch.write(

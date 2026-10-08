@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use fbc_core::{
     AccountKey, AmendOrder, BookId, CancelOrder, CapTag, Channel, CidMint, ClientOrderId,
-    DecodeScope, Effects, EncodeCtx, EncodeReceipt, EndpointPlan, ExecCodec, Feature, Feed,
-    InstrumentId, Lots, MdCodec, MdTransport, MonoNs, Namespace, NamespaceLease, NewOrder,
+    ConnTopology, DecodeScope, Effects, EncodeCtx, EncodeReceipt, EndpointPlan, ExecCodec, Feature,
+    Feed, InstrumentId, Lots, MdCodec, MdTransport, MonoNs, Namespace, NamespaceLease, NewOrder,
     NonceBlock, NotSentReason, OrderCaps, OrderKind, OrderKindTag, OrderRef, PathStamps,
     QueryOrder, RefKind, RpcId, Side, SpecTable, StreamId, Subscription, TagSet, Ticks, TifTag,
     VenueCaps, VenueCommand, VenueOrderId, WallNs, WireUrl, dispatch, dispatch_market_data,
@@ -125,11 +125,22 @@ impl<'s> Harness<'s> {
         })
     }
 
-    /// Book channel `book` on every instrument of the setup, in the spec table's order.
+    /// Book channel `book` on as many instruments of the setup, in the spec table's order, as
+    /// one connection carries under the venue's [`ConnTopology`] (Codex r4217682420): the first
+    /// instrument alone where each has its own connection, the first `max_subscriptions` where
+    /// a shared connection is capped, every one otherwise.
     pub fn book_subs(&self, book: BookId) -> Vec<Subscription> {
         let feed = Feed::Book(book);
+        let cap = match self.caps.md.topology {
+            ConnTopology::PerInstrument => Some(1),
+            ConnTopology::Shared { max_subscriptions }
+            | ConnTopology::SharedOneBookPerInstrument { max_subscriptions } => max_subscriptions,
+            ConnTopology::PerChannel => None,
+        };
+        let cap = cap.map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(usize::MAX));
         self.specs
             .iter()
+            .take(cap)
             .map(|spec| Subscription {
                 inst: spec.id,
                 feed,

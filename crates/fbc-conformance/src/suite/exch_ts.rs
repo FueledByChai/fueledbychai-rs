@@ -22,7 +22,7 @@ pub fn no_exch_ts_synthesized(subject: &Subject<'_>) -> Result<Verdict, Failure>
     let per_book = PerBook {
         check: CHECK,
         dir: CHECK,
-        judge: &|_, file, steps, breaches| {
+        judge: &|_, file, steps, _, breaches| {
             let mut judged = 0usize;
             for step in steps.iter().filter(|s| !s.tags.ts) {
                 for (meta, _) in &step.events {
