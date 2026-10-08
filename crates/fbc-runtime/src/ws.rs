@@ -272,4 +272,12 @@ mod tests {
             refused
         );
     }
+
+    /// Decision 0079: tungstenite logs each frame it writes and reads at TRACE, the auth
+    /// frame's session token included, so the log facade's TRACE is compiled out of every build
+    /// that links this crate.
+    #[test]
+    fn the_log_facade_s_trace_level_is_compiled_out() {
+        assert!(log::STATIC_MAX_LEVEL <= log::LevelFilter::Debug);
+    }
 }
