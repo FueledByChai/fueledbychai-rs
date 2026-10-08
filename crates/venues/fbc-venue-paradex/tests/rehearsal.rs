@@ -4,7 +4,8 @@
 //! `ParadexFactory` from synthetic credentials, run against fbc-conformance's stub server
 //! standing in for Paradex (`rehearsal/venue.rs`), wired as a consumer wires them
 //! (`rehearsal/glue.rs`), with everything the stack logs captured at TRACE
-//! (`rehearsal/capture.rs`).
+//! (`rehearsal/capture.rs`) and everything the session sends and receives journaled (FBC-2pr's
+//! journal, credential spans kept only as keyed hashes, decision 0006).
 //!
 //! **The seed.** Paradex's snapshot source stays `Untrustworthy` (decision 0054; the owner's
 //! answer C to RB-olg-3), so a resync seeds no position and Start stays refused after it. The
@@ -41,6 +42,9 @@ use fbc_core::{
     Secrets, Side, SignedLots, SizeStep, SpecTable, SubmitOutcome, Ticks, Tif, VenueConfig,
     VenueFactory, VenueSymbol, encode_cid,
 };
+use fbc_journal::{
+    JournalWriter, NonceSourceId, RedactionKey, SinkConfig, WriterThread, journal_queue,
+};
 use fbc_oms::{
     AmendRefusal, ArmRefusal, CancelChoice, CancelEverything, CapRefusal, DesiredBook,
     DesiredQuote, EntryState, ExecutionPlanner, ExitKind, ExitRefusal, FillLedger, LadderConfig,
@@ -48,8 +52,8 @@ use fbc_oms::{
     PlannerConfig, PositionCheck, PreTradeCaps, Registry, Stage, StateRefusal, TestnetRun,
 };
 use fbc_runtime::{
-    Connector, ExecControl, ExecOrders, ExecSession, ExecSessionConfig, IngestClock, ProxyConfig,
-    RateLimiter, ReconnectPacing, RpcIds, SafetyReserve, WriteStall,
+    Connector, ExecControl, ExecOrders, ExecSession, ExecSessionConfig, IngestClock, Journal,
+    ProxyConfig, RateLimiter, ReconnectPacing, RpcIds, SafetyReserve, WriteStall,
 };
 use fbc_venue_paradex::ParadexFactory;
 use fbc_venue_paradex::auth::{
@@ -174,12 +178,54 @@ fn market_lease(dir: &std::path::Path) -> Leases {
     Leases::market(MarketLease::acquire(dir, VENUE, ACCOUNT_LABEL, &symbol()).unwrap())
 }
 
-/// A wired session: the glue (registry and ledger), the session, its orders and its control.
+/// A wired session: the glue (registry and ledger), the session, its orders and its control,
+/// and its journal: the writer and the directory it writes.
 struct Wired {
     glue: Rc<RefCell<Glue>>,
     session: ExecSession<GlueHandler>,
     orders: ExecOrders,
     control: ExecControl,
+    writer: WriterThread,
+    journal: PathBuf,
+}
+
+/// The shard whose journal the session writes.
+const SHARD: u16 = 0;
+
+/// Every byte the journal under `dir` holds as written, in path order, a closed segment
+/// decompressed.
+fn journal_bytes(dir: &std::path::Path) -> Vec<u8> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    paths.sort();
+    let mut out = Vec::new();
+    for path in paths {
+        if path.is_dir() {
+            out.extend(journal_bytes(&path));
+        } else if path.extension().is_some_and(|e| e == "zst") {
+            out.extend(zstd::decode_all(std::fs::File::open(&path).unwrap()).unwrap());
+        } else {
+            out.extend(std::fs::read(&path).unwrap());
+        }
+    }
+    out
+}
+
+/// Closes `writer` and reads back the journal under `dir` as text (every credential the
+/// rehearsal knows is ASCII, so a lossy read keeps it if it is there): it recorded the auth
+/// frame and the order frames, and no token, login signature or key.
+fn journal_clean(writer: WriterThread, dir: &std::path::Path, signatures: &[String]) {
+    writer.close().unwrap();
+    let journal = String::from_utf8_lossy(&journal_bytes(dir)).into_owned();
+    assert!(
+        journal.contains(r#""method":"auth""#),
+        "the auth frame is journaled"
+    );
+    assert!(journal.contains("order.cancel_on_disconnect"));
+    assert!(journal.contains("order.create"));
+    secrets_absent(&journal, signatures, "the journal");
 }
 
 fn wire(stub: &Stub, reg: Registry) -> Wired {
@@ -221,18 +267,35 @@ fn wire(stub: &Stub, reg: Registry) -> Wired {
         .unwrap(),
         clock: IngestClock::new(),
         nonces: Box::new(Counting(1)),
+        nonce_source: NonceSourceId(1),
         conn: 0,
         limiter: RateLimiter::new(&caps.limits, SafetyReserve::percent(10).unwrap()).unwrap(),
         write_stall: WriteStall::new(Duration::from_secs(10)).unwrap(),
         http_max_body: 1 << 20,
     };
-    let (session, control) = ExecSession::new(session_cfg, GlueHandler(Rc::clone(&glue))).unwrap();
+    let (mut session, control) =
+        ExecSession::new(session_cfg, GlueHandler(Rc::clone(&glue))).unwrap();
+    // The session journals everything it sends and receives (FBC-2pr), credential spans as
+    // keyed hashes.
+    let journal = lease_dir().join("journal");
+    let key = Arc::new(RedactionKey::new(&[9; 32]).unwrap());
+    let sink_config = SinkConfig {
+        budget_bytes: 4 << 20,
+        soft_limit_pct: 85,
+    };
+    let (sink, drain) = journal_queue(sink_config, Arc::clone(&key)).unwrap();
+    let writer = drain
+        .spawn(JournalWriter::create(&journal, SHARD, key).unwrap())
+        .unwrap();
+    session.set_journal(Journal::new(Rc::new(RefCell::new(sink))));
     let orders = session.orders();
     Wired {
         glue,
         session,
         orders,
         control,
+        writer,
+        journal,
     }
 }
 
@@ -506,6 +569,8 @@ async fn from_a_fresh_start_every_safety_rule_holds_against_the_stub() {
         mut session,
         orders,
         control,
+        writer,
+        journal,
     } = wire(&stub, reg);
     let mut planner = planner();
     let caps = order_caps();
@@ -835,6 +900,7 @@ async fn from_a_fresh_start_every_safety_rule_holds_against_the_stub() {
         "the capture missed this thread's records"
     );
     secrets_absent(&traced, &signatures, "the TRACE output");
+    journal_clean(writer, &journal, &signatures);
     let auth_frames: Vec<String> = stub
         .texts()
         .into_iter()
@@ -879,6 +945,8 @@ async fn after_a_restart_flatten_writes_only_reduce_only_exits_that_never_cross_
         mut session,
         orders,
         control,
+        writer,
+        journal,
     } = wire(&stub, reg);
     let mut planner = planner();
     let caps = order_caps();
@@ -991,4 +1059,5 @@ async fn after_a_restart_flatten_writes_only_reduce_only_exits_that_never_cross_
         "the capture missed this thread's records"
     );
     secrets_absent(&traced, &signatures, "the TRACE output");
+    journal_clean(writer, &journal, &signatures);
 }

@@ -562,6 +562,7 @@ dependencies = [
  "starknet-crypto",
  "tokio",
  "zeroize",
+ "zstd",
 ]
 
 [[package]]

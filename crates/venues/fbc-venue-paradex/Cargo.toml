@@ -21,7 +21,8 @@ serde_json.workspace = true
 # journals the session, and rebuilds fbc-book's books from the journal (design §6 step 12).
 # fbc-oms and log are test-only too: the offline rehearsal (tests/rehearsal.rs, FBC-8mv) runs
 # fbc-oms, the order-entry session and this codec against the stub, reading the log facade at
-# TRACE. scripts/check-deps.sh does not count dev-dependencies.
+# TRACE and its journal's files, closed segments decompressed with zstd. scripts/check-deps.sh
+# does not count dev-dependencies.
 [dev-dependencies]
 fbc-book = { path = "../../fbc-book" }
 fbc-conformance = { path = "../../fbc-conformance" }
@@ -31,3 +32,4 @@ fbc-runtime = { path = "../../fbc-runtime" }
 log = { workspace = true, features = ["std"] }
 starknet-core.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "time", "sync"] }
+zstd.workspace = true
