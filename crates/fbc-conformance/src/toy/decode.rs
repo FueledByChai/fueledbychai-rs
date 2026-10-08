@@ -274,7 +274,7 @@ pub(super) struct Record<'a> {
 }
 
 impl<'a> Record<'a> {
-    fn parse(line: &'a str) -> Result<Record<'a>, DecodeError> {
+    pub(super) fn parse(line: &'a str) -> Result<Record<'a>, DecodeError> {
         let mut parts = line.split('|');
         let kind = parts.next().filter(|kind| !kind.is_empty());
         let kind = kind.ok_or(Malformed("kind"))?;

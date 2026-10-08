@@ -14,6 +14,11 @@
 //! connection). What cannot be written is `Unencodable`: an instrument missing from the spec
 //! table, a missing nonce, an empty batch, and an amend to its filled quantity or below, which
 //! leaves nothing to rest. A signer that fails is `SignFailed`.
+//!
+//! As [`ToyExec::new`] builds it, it resyncs in frames on its stream and sets no timer; its
+//! factory builds it [`pinging`](ToyExec::pinging), a `ping|ts=<wall>` sent on the opened
+//! stream every [`PING_EVERY`] (Codex r4172835747), and, given a REST base, resyncing
+//! [over REST](ToyExec::rest_resync) (`session.rs`, Codex r4172917335).
 
 use fbc_core::{
     AmendOrder, AmendRef, AmendWire, CancelOrder, CancelRef, CancelScope, CancelWire, Channel,
@@ -21,12 +26,15 @@ use fbc_core::{
     EncodeReceipt, ExecCodec, ExecEvent, ExecSink, Feature, FillCaps, HttpFailure, HttpResponse,
     HttpTag, Inbound, InboundSpans, InstrumentId, NewOrder, NotSentReason, OpKind, OrderCaps,
     OrderKindTag, OrderSigner, PathStage, PathStamps, PlaceWire, RateCharge, RawFrame, RefKind,
-    RpcCall, RpcId, Side, SpecTable, StreamId, TagSet, Tif, TimerTag, VenueCommand, VenueOrderId,
-    WireCid, WireSlice, encode_cid,
+    RpcCall, RpcId, Side, SpecTable, StreamId, TagSet, Tif, TimerTag, TrafficClass, VenueCommand,
+    VenueOrderId, WireCid, WireSlice, WireUrl, encode_cid,
 };
 
 use super::session::{self, Answers};
-use super::{EXEC_STREAM, FillIds, RPC_TIMEOUT, caps_for, decode, weight};
+use super::{
+    EXEC_STREAM, FillIds, PING_EVERY, PING_TAG, RESYNC_RETRY_TAG, RPC_TIMEOUT, caps_for, decode,
+    weight,
+};
 
 use NotSentReason::{FlagConflict, SignFailed, Unencodable, Unsupported};
 
@@ -37,6 +45,12 @@ pub struct ToyExec {
     fills: FillCaps,
     signer: Box<dyn OrderSigner>,
     answers: Answers,
+    /// The base a resync is asked for under over REST; `None` resyncs in frames.
+    rest: Option<WireUrl>,
+    /// Whether `on_open` arms a ping.
+    ping: bool,
+    /// The stream the last `on_open` opened, which the ping goes out on.
+    opened: Option<StreamId>,
 }
 
 /// A request's frame and the charge it carries.
@@ -57,7 +71,25 @@ impl ToyExec {
             fills,
             signer,
             answers: Answers::default(),
+            rest: None,
+            ping: false,
+            opened: None,
         }
+    }
+
+    /// This codec, keeping its order-entry connection alive (Codex r4172835747): `on_open`
+    /// arms [`PING_TAG`], and each firing sends `ping|ts=<wall>` on the opened stream (one
+    /// `Control` unit, safety traffic, answered by nothing) and arms it again, [`PING_EVERY`]
+    /// apart.
+    pub fn pinging(self) -> ToyExec {
+        ToyExec { ping: true, ..self }
+    }
+
+    /// This codec, resyncing over REST under `base`, whose credential spans every request
+    /// keeps (`session.rs`; Codex r4172917335, r4172917294).
+    pub fn rest_resync(self, base: WireUrl) -> ToyExec {
+        let rest = Some(base);
+        ToyExec { rest, ..self }
     }
 
     /// Refuses an order of a kind, time in force, channel or flag the caps do not declare
@@ -319,6 +351,14 @@ impl ToyExec {
     }
 }
 
+/// The ping's next firing.
+fn ping_timer() -> Effect {
+    Effect::Timer {
+        tag: PING_TAG,
+        after: PING_EVERY,
+    }
+}
+
 /// A batch's weight, its item count: refused when the venue takes no batch or it is longer than
 /// the venue takes, and unencodable when empty.
 fn batch_weight(
@@ -391,9 +431,14 @@ impl ExecCodec for ToyExec {
     }
 
     /// Authenticates with the toy's token in a redaction span; Authenticated waits for the
-    /// venue's acknowledgement. A resync still being read was cut short by the reconnect.
+    /// venue's acknowledgement. A resync still being read or asked for was cut short by the
+    /// reconnect. A pinging codec arms its ping.
     fn on_open(&mut self, stream: StreamId, ctx: &EncodeCtx, fx: &mut Effects) {
         self.answers.ask_auth(stream, ctx, fx);
+        self.opened = Some(stream);
+        if self.ping {
+            fx.push(ping_timer());
+        }
     }
 
     fn encode(
@@ -454,20 +499,40 @@ impl ExecCodec for ToyExec {
         }
     }
 
+    /// A resync over REST's response; a codec resyncing in frames asks for no HTTP.
     fn on_http(
         &mut self,
-        _tag: HttpTag,
-        _resp: Result<HttpResponse<'_>, HttpFailure>,
-        _scope: &DecodeScope<'_>,
-        _specs: &SpecTable,
-        _sink: &mut dyn ExecSink,
-        _fx: &mut Effects,
+        tag: HttpTag,
+        resp: Result<HttpResponse<'_>, HttpFailure>,
+        scope: &DecodeScope<'_>,
+        specs: &SpecTable,
+        sink: &mut dyn ExecSink,
+        fx: &mut Effects,
     ) -> Result<(), DecodeError> {
-        Err(DecodeError::Malformed("the toy asks for no HTTP"))
+        if self.rest.is_none() {
+            return Err(DecodeError::Malformed("the toy asks for no HTTP"));
+        }
+        self.answers.rest_answer(tag, resp, scope, specs, sink, fx)
     }
 
-    /// The toy sets no timer.
-    fn on_timer(&mut self, _tag: TimerTag, _ctx: &EncodeCtx, _fx: &mut Effects) {}
+    /// The ping, sent and armed again; a resync over REST asked again. Any other tag is none
+    /// of the toy's.
+    fn on_timer(&mut self, tag: TimerTag, ctx: &EncodeCtx, fx: &mut Effects) {
+        match (tag, &self.rest, self.opened) {
+            (PING_TAG, _, Some(stream)) if self.ping => {
+                fx.push(Effect::Send {
+                    stream,
+                    frame: WireSlice::plain(format!("ping|ts={}", ctx.wall.0).into_bytes()),
+                    rpc: None,
+                    class: TrafficClass::Safety,
+                    charge: RateCharge::one(OpKind::Control, None),
+                });
+                fx.push(ping_timer());
+            }
+            (RESYNC_RETRY_TAG, Some(base), _) => self.answers.retry_rest(base, ctx, fx),
+            _ => {}
+        }
+    }
 
     /// The outcomes held for `rpc`'s answered items, then `Unknown` for every item still
     /// unanswered; `Unknown` for the whole request when none was answered (0014 item 3).
@@ -475,9 +540,13 @@ impl ExecCodec for ToyExec {
         self.answers.timed_out(rpc, sink);
     }
 
-    /// Asks for the open orders and positions as of `ctx.wall`, the resync's watermark.
+    /// Asks for the open orders and positions as of `ctx.wall`, the resync's watermark: over
+    /// REST when built with a base, otherwise in frames.
     fn resync(&mut self, ctx: &EncodeCtx, fx: &mut Effects) {
-        self.answers.ask_resync(EXEC_STREAM, ctx, fx);
+        match &self.rest {
+            Some(base) => self.answers.ask_rest_resync(base, ctx, fx),
+            None => self.answers.ask_resync(EXEC_STREAM, ctx, fx),
+        }
     }
 
     /// The toy's token wherever a text frame carries one (the authentication acknowledgement
