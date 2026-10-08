@@ -5,8 +5,10 @@
 //! 0014 item 8).
 //!
 //! The `.redact` value is a comma-separated list of `start..end` byte ranges of the URL, each
-//! inside its path, in order, not overlapping and at least [`MIN_CREDENTIAL_LEN`] bytes long
-//! (an empty value or none marks nothing). A codec names a credential wherever a frame or
+//! inside its path, in order, not overlapping, at least [`MIN_CREDENTIAL_LEN`] bytes long and
+//! clear of every `%XX` escape (an empty value or none marks nothing). A server that decodes the
+//! path could echo an escaped credential in its decoded spelling, which a codec, looking for the
+//! configured one, would not name (Codex r4220333334). A codec names a credential wherever a frame or
 //! response holds it, so a shorter one would mark unrelated bytes, such as prices and sequence
 //! numbers, that the journal then keeps only as hashes (Codex r4220116602). The
 //! toy marks credentials in the path only, so it refuses a URL with user information (which the
@@ -88,11 +90,23 @@ pub(super) fn configured(cfg: &VenueConfig, key: UrlKey) -> Result<WireUrl, Conf
         reason: "a span past the URL's end, out of order, overlapping or splitting a character",
     })?;
     let short = |r: &Range<u32>| ((r.end - r.start) as usize) < MIN_CREDENTIAL_LEN;
-    match url.redactions().iter().any(short) {
-        true => Err(ConfigError::Invalid {
+    if url.redactions().iter().any(short) {
+        return Err(ConfigError::Invalid {
             key: key.redact,
             reason: "a span shorter than 16 bytes, which the toy would name wherever a frame or \
                      response holds it, unrelated bytes included",
+        });
+    }
+    let escapes: Vec<usize> = text.match_indices('%').map(|(at, _)| at).collect();
+    let escaped = |r: &Range<u32>| {
+        let (start, end) = (r.start as usize, r.end as usize);
+        escapes.iter().any(|&at| at < end && at + 3 > start)
+    };
+    match url.redactions().iter().any(escaped) {
+        true => Err(ConfigError::Invalid {
+            key: key.redact,
+            reason: "a span holding or splitting a %XX escape, whose decoded spelling a server \
+                     could echo where the toy looks for the configured one",
         }),
         false => Ok(url),
     }

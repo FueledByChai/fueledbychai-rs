@@ -86,6 +86,9 @@ fn http_urls(fx: Vec<Effect>) -> Vec<WireUrl> {
 /// A URL whose path, from byte 18, is 46 characters long, with no credential of its own.
 const LONG: &str = "wss://toy.invalid/0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJ";
 
+/// A path with a percent escape at bytes 38..41, between two 20-byte runs.
+const ESCAPED: &str = "wss://toy.invalid/0123456789abcdefghij%2D0123456789abcdefghij";
+
 fn hidden(shown: String) {
     assert!(!shown.contains(SECRET), "{shown}");
 }
@@ -259,6 +262,27 @@ fn a_url_with_user_information_a_query_or_spans_it_cannot_keep_is_refused() {
                      response holds it, unrelated bytes included",
         }))
     );
+    // A span holding a percent escape, or splitting one, is refused (Codex r4220333334): a
+    // server that decodes the path could echo the credential's decoded spelling, which the toy,
+    // looking for the configured one, would not name. Spans beside the escape are kept.
+    for spans in [
+        "30..50", "38..60", "39..60", "40..60", "18..39", "18..40", "18..41",
+    ] {
+        let escaped = invalid(EXEC_URL_KEY, ESCAPED, Some(spans));
+        assert_eq!(
+            ToyFactory.plan_exec(&escaped),
+            Err(VenueError::Config(ConfigError::Invalid {
+                key: EXEC_URL_REDACT_KEY,
+                reason: "a span holding or splitting a %XX escape, whose decoded spelling a \
+                         server could echo where the toy looks for the configured one",
+            })),
+            "{spans}"
+        );
+    }
+    for spans in ["18..38", "41..61", "18..38,41..61"] {
+        let beside = invalid(EXEC_URL_KEY, ESCAPED, Some(spans));
+        assert!(ToyFactory.plan_exec(&beside).is_ok(), "{spans}");
+    }
     // Nothing configured is missing.
     assert_eq!(
         ToyFactory.plan_exec(&VenueConfig::new()),

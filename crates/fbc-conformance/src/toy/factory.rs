@@ -82,7 +82,8 @@ const fn url_fields(key: UrlKey, doc: &'static str) -> [FieldSpec; 2] {
         field(
             key.redact,
             "the credential spans in that URL: comma-separated start..end byte ranges, each in \
-             its path and at least 16 bytes long; empty or absent marks none",
+             its path, at least 16 bytes long and clear of %XX escapes; empty or absent marks \
+             none",
         ),
     ]
 }
