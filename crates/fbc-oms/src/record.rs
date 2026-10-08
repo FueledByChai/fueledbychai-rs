@@ -227,6 +227,11 @@ pub struct OrderRecord {
     built: Option<Built>,
     /// How many amends were built for the order: the next build's number.
     builds: u64,
+    /// Its place was built ([`Registry::place`](crate::Registry::place),
+    /// [`Registry::place_batch`](crate::Registry::place_batch)) and its command is held: no
+    /// authorization was issued for it and it was not withdrawn. Until then nothing was sent,
+    /// so no outcome naming it by client id ends it; only its command does (decision 0082).
+    unissued: bool,
     /// The latest venue ordering key applied when an amend was replaced in flight, or since
     /// while a command was in flight: only a total stated under a later key, with no command
     /// in flight, settles `unsettled`.
@@ -303,6 +308,7 @@ impl OrderRecord {
             unsettled_wires: Vec::new(),
             built: None,
             builds: 0,
+            unissued: false,
             unsettled_bar: None,
             state: OrdState::PendingNew,
             intent: Intent::None,
@@ -522,6 +528,34 @@ impl OrderRecord {
         self.builds += 1;
         self.built = Some(Built { qty, build, wire });
         build
+    }
+
+    /// Whether the amend built as number `build` is the one built and not yet reported sent:
+    /// it still holds the reservation its build made.
+    pub(crate) fn holds_build(&self, build: u64) -> bool {
+        self.built.is_some_and(|b| b.build == build)
+    }
+
+    /// Whether its place was built and its command is held, neither authorized nor withdrawn
+    /// (decision 0082).
+    pub(crate) fn unissued(&self) -> bool {
+        self.unissued
+    }
+
+    /// Marks its place built and its command held, or, `false`, the command spent by the
+    /// authorization issued for it.
+    pub(crate) fn set_unissued(&mut self, unissued: bool) {
+        self.unissued = unissued;
+    }
+
+    /// Ends the order not sent for `reason`, its place built and its command, never handed to
+    /// a gateway, withdrawn or refused at authorization; whether its command was still held.
+    pub(crate) fn withdraw_place(&mut self, reason: NotSentReason) -> bool {
+        let held = self.unissued;
+        if held {
+            self.end(TerminalKind::NotSent(reason));
+        }
+        held
     }
 
     /// Releases the amend built as number `build` and never handed to a gateway; whether it
@@ -1226,6 +1260,7 @@ impl OrderRecord {
         self.state = OrdState::Terminal(kind);
         self.clear_intent();
         self.built = None;
+        self.unissued = false;
         self.cancel_awaits_ack = false;
         self.settle();
         self.leave_ladder();

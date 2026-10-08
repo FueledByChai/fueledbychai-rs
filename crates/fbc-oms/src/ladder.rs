@@ -235,6 +235,7 @@ impl Registry {
             .map(|(cid, _)| *cid)
             .collect();
         cids.sort();
+        let origin = self.instance();
         for cid in cids {
             let rec = self.orders.get_mut(&cid).expect("listed above");
             if rec.unknown_since().is_none() {
@@ -250,7 +251,7 @@ impl Registry {
                 .expect("the order is on the ladder");
             if now >= since + cfg.max_unknown {
                 rec.set_tombstone_at(now);
-                match permit::tombstone_of(rec, caps) {
+                match permit::tombstone_of(rec, caps, origin) {
                     Some(cmd) => plan.tombstones.push((cid, cmd)),
                     None => plan.no_tombstone.push(cid),
                 }

@@ -218,6 +218,7 @@ impl Registry {
                     command: PermittedCommand::guarded(
                         VenueCommand::CancelAll(CancelScope::Instrument(market)),
                         guard,
+                        self.instance(),
                     ),
                     unanswered: self.cancel_many(&unanswered, caps),
                 }

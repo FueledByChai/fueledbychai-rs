@@ -8,13 +8,14 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fbc_core::{
-    CidMatch, ClientOrderId, InstrumentId, ItemRef, Lots, MonoNs, Namespace, NewOrder, OrderCaps,
-    OrderUpdate, RpcId, Side, SignedLots, SubmitOutcome, Ticks, VenueCommand, VenueOrderId,
+    AccountKey, CidMatch, ClientOrderId, InstrumentId, ItemRef, Lots, MonoNs, Namespace, NewOrder,
+    NotSentReason, OrderCaps, OrderUpdate, RpcId, Side, SignedLots, SubmitOutcome, Ticks,
+    VenueCommand, VenueOrderId,
 };
 
 use crate::caps::{Adds, CapRefusal, Exposure, PreTradeCaps};
 use crate::entry::{Admits, Entries, StateRefusal, TestnetRun};
-use crate::grant::{Counters, Guard, Watch};
+use crate::grant::{Counters, Guard, IssueRefusal, Watch};
 use crate::ladder;
 use crate::ledger::AcceptedFill;
 use crate::permit::{
@@ -56,8 +57,12 @@ pub struct Registry {
     /// refused at submit once it moved since the build (decision 0066).
     positions: Counters,
     /// Which of the process's registries this is: the execution planner plans each account
-    /// through one registry only (decision 0068).
+    /// through one registry only (decision 0068), and only this registry authorizes or
+    /// releases what it built (decision 0082).
     instance: Instance,
+    /// The account the registry is for: given at construction ([`Registry::for_account`]) or
+    /// bound by its first authorization; every authorization is for it (decision 0082).
+    account: Option<AccountKey>,
 }
 
 /// One registry among every registry the process built: drawn fresh for each.
@@ -154,6 +159,10 @@ pub enum OmsError {
     MixedMarkets,
     /// The market's position was already seeded.
     PositionSeeded(InstrumentId),
+    /// A placement's outcome reports not sent or refused an order whose place was built and
+    /// whose command is still held, never authorized: nothing of it was sent, and it is
+    /// withdrawn only with its command ([`Registry::place_not_submitted`]; decision 0082).
+    NotIssued(ClientOrderId),
     /// A fill moved the market's inventory before its position was seeded.
     PositionMoved(InstrumentId),
 }
@@ -192,6 +201,10 @@ impl fmt::Display for OmsError {
             OmsError::PositionSeeded(inst) => {
                 write!(f, "the position on {inst:?} was already seeded")
             }
+            OmsError::NotIssued(cid) => write!(
+                f,
+                "the place of {cid:?} was never authorized: it is withdrawn only with its command"
+            ),
             OmsError::PositionMoved(inst) => write!(
                 f,
                 "a fill moved the inventory on {inst:?} before its position was seeded"
@@ -217,6 +230,20 @@ impl Registry {
         }
     }
 
+    /// This registry for the account `acct`: every authorization it issues is for `acct`, its
+    /// first included, and one for another account is refused (decision 0082). A registry not
+    /// built for an account is bound to the account of its first authorization.
+    pub fn for_account(mut self, acct: AccountKey) -> Registry {
+        self.account = Some(acct);
+        self
+    }
+
+    /// The account the registry is for: the one it was built for, or else the one its first
+    /// authorization bound it to; `None` before either.
+    pub fn account(&self) -> Option<AccountKey> {
+        self.account
+    }
+
     /// The pre-trade caps every place, amend and batch item is checked against.
     pub fn caps(&self) -> &PreTradeCaps {
         &self.caps
@@ -235,31 +262,32 @@ impl Registry {
     /// the inventory cap counts each order's [`OrderRecord::exposure`]: this, plus the fills
     /// the venue reported that the inventory does not hold yet.
     pub fn resting_on(&self, inst: InstrumentId, side: Side) -> Option<Lots> {
-        self.sum_on(inst, side, None, OrderRecord::resting)
+        self.sum_on(inst, side, &[], OrderRecord::resting)
     }
 
-    /// The sum of `each` over our orders on `inst` and `side` but `except`; `None` when it
-    /// does not fit a lot count.
+    /// The sum of `each` over our orders on `inst` and `side` but those in `except`; `None`
+    /// when it does not fit a lot count.
     fn sum_on(
         &self,
         inst: InstrumentId,
         side: Side,
-        except: Option<ClientOrderId>,
+        except: &[ClientOrderId],
         each: fn(&OrderRecord) -> Lots,
     ) -> Option<Lots> {
         self.orders
             .values()
             .filter(|rec| {
                 let placed = rec.placed();
-                placed.inst == inst && placed.side == side && Some(placed.cid) != except
+                placed.inst == inst && placed.side == side && !except.contains(&placed.cid)
             })
             .try_fold(Lots::ZERO, |sum, rec| sum.checked_add(each(rec)))
     }
 
     /// What `inst` and `side` hold before an order is judged against the pre-trade caps: the
-    /// market's caps, the position, and what our orders on the side but `except` (the order
-    /// an amend changes) may add to the position and have resting.
-    fn exposure(&self, inst: InstrumentId, side: Side, except: Option<ClientOrderId>) -> Exposure {
+    /// market's caps, the position, and what our orders on the side but those in `except` (the
+    /// order an amend changes, or a command's own orders judged again at authorization) may
+    /// add to the position and have resting.
+    fn exposure(&self, inst: InstrumentId, side: Side, except: &[ClientOrderId]) -> Exposure {
         Exposure {
             inst,
             side,
@@ -280,11 +308,28 @@ impl Registry {
     /// ([`OmsError::Capped`]), reducing and reduce-only orders included,
     /// or when an order is already registered under its client id. A place built and then not
     /// sent is reported as such ([`Registry::on_outcome`]), which ends the order.
+    ///
+    /// The command is held until it is authorized ([`Registry::authorize`], which judges it
+    /// against the caps again) or withdrawn with [`Registry::place_not_submitted`]; until then
+    /// no outcome naming the order by client id ends it ([`OmsError::NotIssued`], decision
+    /// 0082).
     pub fn place(&mut self, order: NewOrder) -> Result<PermittedCommand, OmsError> {
         self.admit_placement(&order)?;
         self.insert(order.clone())?;
+        self.held(order.cid);
         let guard = self.state_guard(order.inst);
-        Ok(PermittedCommand::guarded(VenueCommand::Place(order), guard))
+        Ok(PermittedCommand::guarded(
+            VenueCommand::Place(order),
+            guard,
+            self.instance,
+        ))
+    }
+
+    /// Marks the order `cid`'s place built and its command held (decision 0082).
+    fn held(&mut self, cid: ClientOrderId) {
+        if let Some(rec) = self.orders.get_mut(&cid) {
+            rec.set_unissued(true);
+        }
     }
 
     /// Builds a batch of places of one market from the items the pre-trade caps admit, in the
@@ -293,6 +338,7 @@ impl Registry {
     /// client id already registered (an earlier item's included), is never built and listed
     /// in [`PlacePlan::refused`]. Refused whole, nothing registered, when the items name more
     /// than one market. An empty batch, or one whose every item is refused, builds nothing.
+    /// The batch's command is held as a place's is ([`Registry::place`]).
     pub fn place_batch(&mut self, orders: Vec<NewOrder>) -> Result<PlacePlan, OmsError> {
         if let Some(first) = orders.first()
             && orders.iter().any(|o| o.inst != first.inst)
@@ -307,7 +353,10 @@ impl Registry {
                 .admit_placement(&order)
                 .and_then(|()| self.insert(order.clone()).map(|_| ()))
             {
-                Ok(()) => admitted.push(order),
+                Ok(()) => {
+                    self.held(cid);
+                    admitted.push(order);
+                }
                 Err(refusal) => plan.refused.push((cid, refusal)),
             }
         }
@@ -316,6 +365,7 @@ impl Registry {
             plan.command = Some(PermittedCommand::guarded(
                 VenueCommand::PlaceBatch(admitted),
                 guard,
+                self.instance,
             ));
         }
         Ok(plan)
@@ -351,7 +401,7 @@ impl Registry {
         if self.orders.contains_key(&order.cid) {
             return Err(OmsError::DuplicateCid(order.cid));
         }
-        let exposure = self.exposure(order.inst, order.side, None);
+        let exposure = self.exposure(order.inst, order.side, &[]);
         let adds = Adds::placing(order.qty);
         admits
             .judge(&exposure, order.reduces(), adds.exposure)
@@ -573,6 +623,12 @@ impl Registry {
     /// Applies the outcome of one command item to the order `cid` it was sent for
     /// ([`OrderRecord::on_outcome`]): `item` is the item as the reply names it. Refused when
     /// no order is registered under `cid`, or when the item names another client id.
+    ///
+    /// Refused, changing nothing, for a placement not sent or refused whose place was built and
+    /// whose command is still held, never authorized ([`OmsError::NotIssued`]): nothing of it
+    /// was sent, and ending it by client id would free what it counts while its command could
+    /// still be authorized. Such a place is withdrawn with its command
+    /// ([`Registry::place_not_submitted`]; decision 0082).
     pub fn on_outcome(
         &mut self,
         cid: ClientOrderId,
@@ -586,8 +642,15 @@ impl Registry {
         {
             return Err(OmsError::ItemNamesAnother { cid, item: named });
         }
-        if !self.orders.contains_key(&cid) {
-            return Err(OmsError::UnknownCid(cid));
+        let rec = self.orders.get(&cid).ok_or(OmsError::UnknownCid(cid))?;
+        if op == OrderOp::Place
+            && rec.unissued()
+            && matches!(
+                outcome,
+                SubmitOutcome::NotSent(_) | SubmitOutcome::Rejected(_)
+            )
+        {
+            return Err(OmsError::NotIssued(cid));
         }
         let applied = self.with_record(cid, |rec| {
             rec.on_outcome(op, item.vid.as_ref(), outcome, now)
@@ -633,12 +696,123 @@ impl Registry {
     /// when it is not an amend, or not the one its order has built and not yet reported sent.
     /// An amend a gateway took is reported with [`Registry::amend_sent`] instead, under the
     /// request the gateway gave it, and its outcome resolves it, a not-sent one included.
+    ///
+    /// Only this registry's amend releases anything: its build token names the registry with
+    /// the order and the build's number, so another registry's amend of an order under the
+    /// same client id, at the same build number, releases nothing here (decision 0082).
     pub fn amend_not_submitted(&mut self, cmd: PermittedCommand) -> bool {
+        if cmd.origin() != self.instance {
+            return false;
+        }
         cmd.built().is_some_and(|(cid, build)| {
             self.orders
                 .get_mut(&cid)
                 .is_some_and(|rec| rec.withdraw_built(build))
         })
+    }
+
+    /// Withdraws a place or a batch of places this registry built and that was never handed
+    /// to a gateway, consuming its command, so it can no longer be authorized: each of its
+    /// orders whose command was still held ends not sent for `reason`
+    /// ([`TerminalKind::NotSent`](crate::TerminalKind::NotSent)) and no longer counts. True
+    /// when one did; false, the command dropped all the same, when it is not a place or a batch
+    /// this registry built, or none of its orders still held its command. A place a gateway
+    /// took, its command spent by the authorization, is reported with
+    /// [`Registry::on_outcome`] instead (decision 0082).
+    pub fn place_not_submitted(&mut self, cmd: PermittedCommand, reason: NotSentReason) -> bool {
+        if cmd.origin() != self.instance {
+            return false;
+        }
+        let cids = places_of(cmd.command());
+        let mut any = false;
+        for cid in cids {
+            if let Some(rec) = self.orders.get_mut(&cid) {
+                any |= rec.withdraw_place(reason);
+            }
+        }
+        any
+    }
+
+    /// Judges `cmd`, a command this registry built, again as it is authorized (decision
+    /// 0082): a place or a batch item must still hold its command, and an amend must still be
+    /// the build its order holds ([`IssueRefusal::Released`]); then, on each side the
+    /// command's orders take, the position and our other orders on the side as they are now,
+    /// with what the command's orders may add and have resting as their records count them
+    /// now, must stay within both caps ([`IssueRefusal::Capped`]). Cancels and cancel-alls
+    /// pass, as they pass at build.
+    pub(crate) fn rejudge(&self, cmd: &PermittedCommand) -> Result<(), IssueRefusal> {
+        let cids = match (cmd.command(), cmd.built()) {
+            (VenueCommand::Amend(_), Some((cid, build))) => {
+                if !self.orders.get(&cid).is_some_and(|r| r.holds_build(build)) {
+                    return Err(IssueRefusal::Released(cid));
+                }
+                vec![cid]
+            }
+            (VenueCommand::Place(_) | VenueCommand::PlaceBatch(_), _) => {
+                let cids = places_of(cmd.command());
+                if let Some(&cid) = cids
+                    .iter()
+                    .find(|c| !self.orders.get(c).is_some_and(OrderRecord::unissued))
+                {
+                    return Err(IssueRefusal::Released(cid));
+                }
+                cids
+            }
+            _ => return Ok(()),
+        };
+        for side in [Side::Buy, Side::Sell] {
+            let ours: Vec<&OrderRecord> = cids
+                .iter()
+                .map(|c| &self.orders[c])
+                .filter(|r| r.placed().side == side)
+                .collect();
+            let Some(first) = ours.first() else {
+                continue;
+            };
+            // A sum past a lot count is judged as the largest one, which no cap admits.
+            let sum = |each: fn(&OrderRecord) -> Lots| {
+                ours.iter()
+                    .try_fold(Lots::ZERO, |sum, r| sum.checked_add(each(r)))
+                    .unwrap_or(Lots::new(i64::MAX).expect("non-negative"))
+            };
+            let adds = Adds {
+                exposure: sum(OrderRecord::exposure),
+                resting: sum(OrderRecord::resting),
+            };
+            self.exposure(first.placed().inst, side, &cids)
+                .admit(adds)
+                .map_err(IssueRefusal::Capped)?;
+        }
+        Ok(())
+    }
+
+    /// Releases what `cmd`, a command this registry built and refused at authorization,
+    /// reserved, as it is never sent: each place or batch item still holding its command ends
+    /// not sent ([`NotSentReason::StaleAuthorization`]); an amend still the build its order
+    /// holds is withdrawn.
+    pub(crate) fn release(&mut self, cmd: &PermittedCommand) {
+        if let (VenueCommand::Amend(_), Some((cid, build))) = (cmd.command(), cmd.built()) {
+            if let Some(rec) = self.orders.get_mut(&cid) {
+                rec.withdraw_built(build);
+            }
+            return;
+        }
+        for cid in places_of(cmd.command()) {
+            if let Some(rec) = self.orders.get_mut(&cid) {
+                rec.withdraw_place(NotSentReason::StaleAuthorization);
+            }
+        }
+    }
+
+    /// Records the authorization issued for `cmd` for `acct`: the registry is bound to `acct`
+    /// from now on, and each place or batch item's command is spent, so its outcomes apply.
+    pub(crate) fn issued(&mut self, acct: AccountKey, cmd: &PermittedCommand) {
+        self.account = Some(acct);
+        for cid in places_of(cmd.command()) {
+            if let Some(rec) = self.orders.get_mut(&cid) {
+                rec.set_unissued(false);
+            }
+        }
     }
 
     /// Records the cancel of `cid` sent at `now` under `rpc` ([`OrderRecord::cancel_sent`]):
@@ -663,24 +837,26 @@ impl Registry {
             .get(&cid)
             .ok_or(PermitRefusal::UnknownCid(cid))?
             .placed();
-        let exposure = self.exposure(placed.inst, placed.side, Some(cid));
+        let exposure = self.exposure(placed.inst, placed.side, &[cid]);
         let state = self.entries.admits(placed.inst);
         let guard = self.state_guard(placed.inst);
+        let origin = self.instance;
         let rec = self
             .orders
             .get_mut(&cid)
             .expect("the order was found above");
-        Live::check(rec, state, guard, exposure)
+        Live::check(rec, origin, state, guard, exposure)
     }
 
     /// The permit to cancel our order `cid`: it is not terminal (PendingNew, Unknown and an
     /// order with a command in flight included).
     pub fn cancellable(&mut self, cid: ClientOrderId) -> Result<Cancellable<'_>, PermitRefusal> {
+        let origin = self.instance;
         let rec = self
             .orders
             .get_mut(&cid)
             .ok_or(PermitRefusal::UnknownCid(cid))?;
-        Cancellable::check(rec)
+        Cancellable::check(rec, origin)
     }
 
     /// The permit to cancel an order the venue shows (an update, a fill or a snapshot), named
@@ -751,7 +927,7 @@ impl Registry {
             }
         }
         if let Some(b) = batch {
-            plan.commands = permit::batches(items, b.max_items);
+            plan.commands = permit::batches(items, b.max_items, self.instance);
         }
         plan.commands.extend(singles);
         plan
@@ -788,5 +964,14 @@ impl Registry {
             self.by_vid.entry(vid.clone()).or_insert(cid);
         }
         out
+    }
+}
+
+/// The client ids of the orders a place or a batch of places opens; none for any other command.
+fn places_of(cmd: &VenueCommand) -> Vec<ClientOrderId> {
+    match cmd {
+        VenueCommand::Place(order) => vec![order.cid],
+        VenueCommand::PlaceBatch(orders) => orders.iter().map(|o| o.cid).collect(),
+        _ => Vec::new(),
     }
 }

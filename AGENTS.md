@@ -236,7 +236,10 @@ rather than guess.
     the gateway traits
     `OrderGateway` and `ManagedGateway`, moved here from `fbc-core`, whose `submit` takes an
     `Authorization` only `fbc-oms` issues, for one order-affecting command on one market with
-    that market's `StateGeneration`, not `Clone` and consumed on submit, and whose
+    that market's `StateGeneration`, not `Clone` and consumed on submit, issued only by the
+    registry that built the command, for the one account that registry is for, a place, batch
+    or amend judged against the caps again at issue and released when refused, a place built
+    and not yet authorized withdrawn only with its command (0082; `tests/retained.rs`), and whose
     `submit_control` takes a `ControlCommand` that carries no order-affecting command (0045,
     compile-fail cases in `tests/ui_authorization/`); the `Live` and `Cancellable` permits
     the registry gives, through which alone an amend or a cancel is built, each cancel naming

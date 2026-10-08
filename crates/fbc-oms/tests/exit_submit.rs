@@ -145,7 +145,7 @@ fn open(reg: &mut Registry, order: NewOrder, v: &str) -> ClientOrderId {
     c
 }
 
-fn authorize(reg: &Registry, cmd: PermittedCommand) -> Authorization {
+fn authorize(reg: &mut Registry, cmd: PermittedCommand) -> Authorization {
     reg.authorize(ACCT, cmd).unwrap()
 }
 
@@ -300,9 +300,9 @@ fn after_any_fill_that_moved_the_position_exit_builds_again_and_cancels_still_pa
         let mut reg = flattening(pos);
         let resting = open(&mut reg, exit_of(side, 4), "v-rest");
         let place = reg.place(exit_of(side, 3)).unwrap();
-        let place = authorize(&reg, place);
+        let place = authorize(&mut reg, place);
         let early = match reg.cancellable(resting).unwrap().cancel(&order_caps()) {
-            CancelChoice::Send(cmd) => authorize(&reg, cmd),
+            CancelChoice::Send(cmd) => authorize(&mut reg, cmd),
             other => panic!("expected a cancel to send, got {other:?}"),
         };
 
@@ -325,7 +325,7 @@ fn after_any_fill_that_moved_the_position_exit_builds_again_and_cancels_still_pa
 
         // Built again after the fill, against the position it left, it passes.
         let again = reg.place(exit_of(side, 3)).unwrap();
-        let again = authorize(&reg, again);
+        let again = authorize(&mut reg, again);
         assert_eq!(
             again.check_at_submit(),
             Ok(()),
@@ -371,7 +371,7 @@ fn on_a_resync_seeded_market_a_fill_refuses_an_exit_built_before_it_and_a_later_
         flatten(&mut reg, INST);
         let resting = open(&mut reg, exit_of(side, 4), "v-seeded");
         let place = reg.place(exit_of(side, POS - 4)).unwrap();
-        let place = authorize(&reg, place);
+        let place = authorize(&mut reg, place);
         resync(&mut reg, pos, 2);
         assert_eq!(place.check_at_submit(), Ok(()), "{pos}: a later resync");
         let mut l = ledger();
@@ -405,7 +405,7 @@ fn a_quoting_place_is_not_held_back_by_a_fill() {
     reg.seed_position(INST, SignedLots(POS)).unwrap();
     start(&mut reg, INST);
     let place = reg.place(placement(cid(), 100, 2)).unwrap();
-    let place = authorize(&reg, place);
+    let place = authorize(&mut reg, place);
     let mut l = ledger();
     apply(&mut reg, &mut l, (INST, cid(), false), Side::Sell, 3, "f-q");
     assert_eq!(reg.inventory(INST), SignedLots(POS - 3));
@@ -424,6 +424,6 @@ fn an_exit_built_after_the_fill_passes() {
     assert_eq!(reg.inventory(INST), SignedLots(POS - 3));
     flatten(&mut reg, INST);
     let place = reg.place(exit_of(Side::Sell, POS - 3)).unwrap();
-    let place = authorize(&reg, place);
+    let place = authorize(&mut reg, place);
     assert_eq!(place.check_at_submit(), Ok(()));
 }

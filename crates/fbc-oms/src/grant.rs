@@ -13,6 +13,13 @@
 //! public constructor and no way to edit its command, and submitting consumes it, so each one
 //! is spent once (the compile-fail cases in `tests/ui_authorization/`).
 //!
+//! **At issue** (decision 0082). Only the registry that built a command authorizes it, and a
+//! registry is one account's: the account it was built for ([`Registry::for_account`]) or else
+//! the one its first authorization bound it to. A place, a batch or an amend is judged against
+//! the pre-trade caps again, with the position and our orders as they are when it is
+//! authorized, so one retained after its build while a fill moved the position is refused.
+//! A command refused at issue is never sent: what it reserved is released.
+//!
 //! **At submit** (decision 0060). The shard host interleaves handler work between the commands
 //! of one decide pass, so the kill switch can go on between an authorization's issue and its
 //! write. The gateway calls [`Authorization::check_at_submit`] immediately before encoding and
@@ -48,9 +55,9 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use fbc_core::{AccountKey, CancelScope, InstrumentId, VenueCommand};
+use fbc_core::{AccountKey, CancelScope, ClientOrderId, InstrumentId, VenueCommand};
 
-use crate::{PermittedCommand, Registry};
+use crate::{CapRefusal, PermittedCommand, Registry};
 
 /// How many times a market's state has changed: the kill switch, an arming call, a disarm or
 /// any other move of its order-entry state (0012). An [`Authorization`] carries the value its
@@ -198,6 +205,22 @@ impl Guard {
 /// Why `fbc-oms` issues no authorization for a command.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum IssueRefusal {
+    /// Another registry built the command: its caps, not this registry's, judged it, and its
+    /// orders are counted there (decision 0082). Nothing here changes; what it reserved there
+    /// stays reserved.
+    OtherRegistry,
+    /// The registry is `bound`'s, and the command was to be authorized for `acct` (decision
+    /// 0082). What it reserved is released.
+    OtherAccount { acct: AccountKey, bound: AccountKey },
+    /// Judged again as it is authorized, the place, batch or amend would take the worst case
+    /// on its side past the inventory cap, or what the side has resting past the resting cap,
+    /// with the position and our orders as they are now: a fill or another order moved them
+    /// since its build (decision 0082). What it reserved is released.
+    Capped(CapRefusal),
+    /// The order `cid` no longer holds what the command's build reserved: it ended since, or,
+    /// for an amend, a later command was reported sent over the build (decision 0082). Nothing
+    /// of the command is sent; what any other of its orders reserved is released.
+    Released(ClientOrderId),
     /// The command affects no order (a query, a fee query, a dead-man refresh, cancel-on-
     /// disconnect): it goes through the gateway's control path, unauthorized.
     NotOrderAffecting,
@@ -213,6 +236,24 @@ pub enum IssueRefusal {
 impl fmt::Display for IssueRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            IssueRefusal::OtherRegistry => {
+                "the command was built by another registry, whose caps judged it"
+            }
+            IssueRefusal::OtherAccount { acct, bound } => {
+                return write!(
+                    f,
+                    "the registry is bound to account {bound:?}; nothing is authorized through it for {acct:?}"
+                );
+            }
+            IssueRefusal::Capped(refusal) => {
+                return write!(f, "refused by a pre-trade cap at authorization: {refusal}");
+            }
+            IssueRefusal::Released(cid) => {
+                return write!(
+                    f,
+                    "{cid:?} no longer holds what the command's build reserved"
+                );
+            }
             IssueRefusal::NotOrderAffecting => "the command affects no order",
             IssueRefusal::AccountCancelAll => "no record admits an account cancel-all",
             IssueRefusal::EmptyBatch => "a batch with no item names no market",
@@ -311,14 +352,39 @@ impl Registry {
     /// submit does ([`Authorization::check_at_submit`]), so a stale command has one fate, not
     /// sent, whichever comes first (decision 0060).
     ///
+    /// Refused for a command another registry built ([`IssueRefusal::OtherRegistry`]),
+    /// changing nothing here. Refused for another account than the registry's: the one it was
+    /// built for ([`Registry::for_account`]), or else the one its first authorization bound it
+    /// to ([`IssueRefusal::OtherAccount`]). A place, a batch or an amend is judged again
+    /// against the caps: refused once its order no longer holds what its build reserved
+    /// ([`IssueRefusal::Released`]), or once the position and our orders as they are now would
+    /// take it past a cap ([`IssueRefusal::Capped`]). A command of this registry refused is
+    /// never sent, so what it reserved is released: a place or batch item ends not sent
+    /// ([`NotSentReason::StaleAuthorization`](fbc_core::NotSentReason::StaleAuthorization)),
+    /// an amend's build is withdrawn (decision 0082). An authorization issued spends each place
+    /// or batch item's command, so its outcomes then apply ([`Registry::on_outcome`]).
+    ///
     /// Refused for a command that affects no order, an account cancel-all, an empty batch or a
     /// batch naming more than one market, none of which this crate builds.
     pub fn authorize(
-        &self,
+        &mut self,
         acct: AccountKey,
         cmd: PermittedCommand,
     ) -> Result<Authorization, IssueRefusal> {
-        let generation = self.entries.generation(market_of(cmd.command())?);
+        if cmd.origin() != self.instance() {
+            return Err(IssueRefusal::OtherRegistry);
+        }
+        let market = market_of(cmd.command())?;
+        let judged = match self.account() {
+            Some(bound) if bound != acct => Err(IssueRefusal::OtherAccount { acct, bound }),
+            _ => self.rejudge(&cmd),
+        };
+        if let Err(refusal) = judged {
+            self.release(&cmd);
+            return Err(refusal);
+        }
+        self.issued(acct, &cmd);
+        let generation = self.entries.generation(market);
         Authorization::issue(acct, cmd, generation)
     }
 }
@@ -827,6 +893,10 @@ mod tests {
             (
                 IssueRefusal::MixedMarkets,
                 "the batch's items name more than one market",
+            ),
+            (
+                IssueRefusal::OtherRegistry,
+                "the command was built by another registry, whose caps judged it",
             ),
         ] {
             assert_eq!(refusal.to_string(), text);
