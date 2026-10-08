@@ -56,6 +56,11 @@ which would break a consumer that sets a stricter one.
 - No crate in a build that links fbc-runtime logs at TRACE through `log`, the consumer's own
   `log::trace!` calls included; a build whose features would allow it does not compile. A `tracing` subscriber still receives `tracing`'s own TRACE
   events, which do not pass through the facade's static maximum.
+- A consumer cannot set a `max_level_*` feature of its own, a stricter one included: `log`
+  refuses two `max_level_*` features in one build (`compile_error!("multiple max_level_*
+  features set")` in log 0.4.34), so that build does not compile. Such a consumer sets a
+  stricter level with a `release_max_level_*` feature, which applies to release builds, or with
+  its logger's runtime filter, which applies to every build.
 - Proof: `crates/venues/fbc-venue-paradex/tests/rehearsal.rs` installs a logger at TRACE for
   the whole session and finds no token, login signature or key in what was logged;
   `crates/fbc-runtime/src/ws.rs`'s `the_log_facade_s_trace_level_is_compiled_out` fails if the
