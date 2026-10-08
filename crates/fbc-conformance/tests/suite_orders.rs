@@ -65,6 +65,13 @@ enum Twist {
     SwapsItems,
     /// A placement's acceptance is reported for the whole request, naming no item.
     WholeAcceptance,
+    /// Every acceptance a timed-out request reports is provisional.
+    ProvisionalOnTimeout,
+    /// Every acceptance a frame brings (the arm's, the placement's, the amend's) is reported
+    /// twice.
+    DoubledAck,
+    /// An amended order's update states a price one tick above the amend's.
+    WrongPx,
 }
 
 /// The toy with its caps edited by `caps` and its codec twisted by `twist`.
@@ -129,6 +136,28 @@ static MINUTE_WINDOW: Variant = Variant {
         });
     },
     twist: Twist::None,
+};
+static PROVISIONAL_ON_TIMEOUT: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::ProvisionalOnTimeout,
+};
+/// The toy declaring two-phase acknowledgements, its timed-out acceptances provisional.
+static TWO_PHASE: Variant = Variant {
+    caps: |c| {
+        let window = Duration::from_secs(1);
+        c.exec.as_mut().unwrap().order.ack = fbc_core::AckModel::TwoPhase {
+            risk_reject_window: window,
+        };
+    },
+    twist: Twist::ProvisionalOnTimeout,
+};
+static DOUBLED_AMEND_ACK: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::DoubledAck,
+};
+static WRONG_PX: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::WrongPx,
 };
 static FAILS_AFTER_TIMEOUT: Variant = Variant {
     caps: |_| {},
@@ -430,6 +459,51 @@ fn early_amended(ev: ExecEvent) -> Vec<ExecEvent> {
     vec![ev, ExecEvent::Order(update)]
 }
 
+/// Every acceptance provisional.
+fn provisional(ev: ExecEvent) -> Vec<ExecEvent> {
+    vec![match ev {
+        ExecEvent::Outcome {
+            rpc,
+            item,
+            outcome: SubmitOutcome::Accepted { .. },
+        } => ExecEvent::Outcome {
+            rpc,
+            item,
+            outcome: SubmitOutcome::Accepted {
+                ack: AckLevel::Provisional,
+            },
+        },
+        other => other,
+    }]
+}
+
+/// Every acceptance a frame brings, twice.
+fn doubled_ack(ev: ExecEvent) -> Vec<ExecEvent> {
+    let accepted = matches!(
+        &ev,
+        ExecEvent::Outcome {
+            outcome: SubmitOutcome::Accepted { .. },
+            ..
+        }
+    );
+    if accepted {
+        vec![ev.clone(), ev]
+    } else {
+        vec![ev]
+    }
+}
+
+/// An amended order's update a tick above its price.
+fn wrong_px(ev: ExecEvent) -> Vec<ExecEvent> {
+    vec![match ev {
+        ExecEvent::Order(mut u) if matches!(u.state, VenueOrderState::Amended { .. }) => {
+            u.px = u.px.map(|px| fbc_core::Ticks(px.0 + 1));
+            ExecEvent::Order(u)
+        }
+        other => other,
+    }]
+}
+
 /// An amended order's update without its new venue id.
 fn no_new_vid(ev: ExecEvent) -> Vec<ExecEvent> {
     vec![match ev {
@@ -574,6 +648,8 @@ impl ExecCodec for Twisted {
             Twist::SameVid => same_vid,
             Twist::EarlyAmended => early_amended,
             Twist::WholeAcceptance => whole_acceptance,
+            Twist::DoubledAck => doubled_ack,
+            Twist::WrongPx => wrong_px,
             _ => kept,
         };
         let sink = &mut Rewrite { inner: sink, f: f_ };
@@ -622,6 +698,7 @@ impl ExecCodec for Twisted {
                 kept
             }
             Twist::SwapsItems => swapped,
+            Twist::ProvisionalOnTimeout => provisional,
             _ => return self.inner.on_rpc_timeout(rpc, sink),
         };
         self.inner
@@ -1170,4 +1247,41 @@ fn a_limit_whose_bucket_never_fills_is_not_waited_out() {
         let passed = check(&MINUTE_WINDOW.subject(assumed));
         assert!(matches!(passed, Ok(Verdict::Passed { .. })), "{passed:?}");
     }
+}
+
+#[test]
+fn mixed_batch_takes_a_provisional_acceptance_only_on_a_two_phase_venue() {
+    let passed = suite::mixed_batch(&TWO_PHASE.subject(assumed));
+    assert!(matches!(passed, Ok(Verdict::Passed { .. })), "{passed:?}");
+    let failure = failed(suite::mixed_batch(&PROVISIONAL_ON_TIMEOUT.subject(assumed)));
+    assert!(
+        says(
+            &failure,
+            "OrderCaps.batch_place",
+            "item 0, which the stub accepted"
+        ),
+        "{failure}"
+    );
+}
+
+#[test]
+fn amend_ack_fails_a_toy_that_reports_the_amends_acceptance_twice() {
+    let failure = failed(suite::amend_ack(&DOUBLED_AMEND_ACK.subject(assumed)));
+    assert!(
+        says(
+            &failure,
+            "ExecCodec::on_frame",
+            "the amend the stub accepted"
+        ),
+        "{failure}"
+    );
+}
+
+#[test]
+fn amend_ack_fails_a_toy_whose_amended_update_states_another_price() {
+    let failure = failed(suite::amend_ack(&WRONG_PX.subject(assumed)));
+    assert!(
+        says(&failure, "OrderUpdate", "contradicts the amend"),
+        "{failure}"
+    );
 }
