@@ -526,6 +526,8 @@ impl<H: ExecHandler> ExecSession<H> {
             } => (rearm_on_reconnect, covers_open_orders),
             other => return Err(ExecSessionError::CancelOnDisconnect(other)),
         };
+        // Our client id names one venue order where amends keep the venue id (decision 0080).
+        let one_id = exec.order.amend.is_none_or(|amend| amend.keeps_venue_id);
         config.limiter.check(&caps.limits)?;
         let mut plan = venue.plan_exec(cfg).map_err(ExecSessionError::Venue)?;
         let endpoint = match (plan.pop(), plan.len()) {
@@ -569,7 +571,7 @@ impl<H: ExecHandler> ExecSession<H> {
             arm_failures: 0,
             unready_refusals: 0,
             unprotected_refusals: 0,
-            orders: Shared::new(config.acct, config.rpc_ids, rearm, covers_open),
+            orders: Shared::new(config.acct, config.rpc_ids, rearm, covers_open, one_id),
             rpcs: Rpcs::default(),
             clock,
             stop,

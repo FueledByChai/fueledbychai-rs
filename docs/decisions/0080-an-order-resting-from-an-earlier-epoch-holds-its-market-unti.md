@@ -46,32 +46,34 @@ bound the answer.
   epoch, right after it hands over the event that lets the epoch place, through
   `ExecHandler::on_unprotected`; the consumer cancels each with a Safety cancel fbc-oms builds
   and authorizes (the session cannot authorize a command itself, 0013 rule 2).
-- **What releases the market.** An order event, or an order query's answer, of the epoch that
-  shows the order filled, cancelled, rejected or expired. An amend the venue reports under a
-  new venue id moves the order to it, and the gate keeps the ids each held order was moved from
-  (no more of them than amends heard of it). An event naming a venue id names that order only,
-  so an end reported late under an id an amend superseded releases nothing whatever client id
-  it carries; one naming no venue id names our order by its client id, unless an amend moved
-  the order, since the end may then report the superseded order (the consumer then queries
-  it). An answer to a query by our client id is the order's state now: it names the order by
-  that id and moves it to the venue id the answer shows, then applies the state shown, unless
-  an amend moved the order away from that id, when the answer shows the superseded order and
-  changes nothing. A later epoch's snapshot of a held order is matched to it by our client
-  id: one under an id an amend moved the order from changes nothing, and one under another
-  id moves the order there (it was amended meanwhile), keeping what was heard of its amends.
-  An answer to a query by our client id heard before the resync ended is kept too: an older
-  snapshot of the order adds nothing if the answer showed the order ended under an id no amend
-  moved it from; otherwise it is moved to the id the answer showed and on along the amends
-  heard from it. What the epoch's events
-  showed before its resync ended (ends, and amends to new ids, by venue id or, for an event
-  naming none, by our client id) is kept until it ends, so a snapshot read after them (a resync
-  over HTTP while the stream runs) does not undo them. Nothing else releases a market: a cancel
-  the venue refuses (an order it no longer knows, or one already terminal) leaves it held until
-  the consumer queries the order. The same holds for an order a snapshot shows resting after an
-  event on an earlier epoch ended it (a snapshot lagging the stream): the consumer's registry
-  holds it ended and builds no cancel, so the consumer queries it, and the venue's answer
-  showing it ended releases the market. The runtime keeps no record of the ends of earlier
-  epochs, which would grow with every order the session ever saw end.
+- **What releases the market.** The order having ended under every venue id it was seen
+  under. For each unprotected order the gate keeps the ids it was seen under (the snapshot's,
+  each new id an amend of it was reported under, each id an order event or an order query's
+  answer naming our client id showed) and those an order event or a query answer, of any
+  epoch, showed filled, cancelled, rejected or expired, or replaced by an amend under a new id.
+  No evidence removes an id, so the order in which evidence arrives does not matter: an end
+  reported late under an id an amend superseded, a snapshot lagging what was heard, a query
+  answer showing a predecessor, and amends reported out of order each leave the market held
+  while some id the order was seen under is not shown ended (Reviewer B RB-nvxn-4 on PR #127,
+  after seven rounds in which ordering rules each exposed a sibling case). Evidence naming only
+  our client id adds the id it shows and ends nothing, since on a venue whose amends issue new
+  venue ids it may report an order an amend superseded; where the venue's amends keep the
+  venue id (Paradex), or it amends nothing, our client id names one venue order and an end
+  naming it ends the order. What order events and query answers show of venue ids is kept
+  while a resync runs, and after it for the markets an order is held on, so evidence heard
+  before the snapshot, or before the amend that links an id to the order, is applied when
+  they arrive (a resync over HTTP while the stream runs); it is dropped once nothing is held
+  after the resync. A later epoch's snapshot of a held order is matched to it by our client id
+  and adds its id. Each order is told to the consumer under the latest id it was seen under not
+  shown ended. Nothing else releases a market: a cancel the venue refuses (an order it no
+  longer knows, or one already terminal) leaves it held until the consumer queries the order.
+  The same holds for an order a snapshot shows resting after an event ended it while nothing
+  was held (a snapshot lagging the stream): the consumer's registry holds it ended and builds
+  no cancel, so the consumer queries it, and the venue's answer showing it ended releases the
+  market. The runtime keeps no record of ends heard while nothing is held, which would grow
+  with every order the session ever saw end. An order seen under an id the venue never reports
+  ended (a lagging id on a venue whose amends issue new ids) stays held; FBC-066c (a
+  trustworthy resync that leaves it out releases it) and FBC-41iu cover releasing it.
 
 ## Alternatives
 

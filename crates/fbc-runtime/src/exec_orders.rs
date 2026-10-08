@@ -127,15 +127,22 @@ pub(crate) struct Shared {
 impl Shared {
     /// What the session for `acct` shares with its orders, its request ids from `ids`, its
     /// venue's protection per connection, re-armed on each when `rearm` and covering the
-    /// orders already open when `covers_open`.
-    pub(crate) fn new(acct: AccountKey, ids: RpcIds, rearm: bool, covers_open: bool) -> Rc<Shared> {
+    /// orders already open when `covers_open`, its venue's amends keeping the venue id (or
+    /// none taken) when `one_id`.
+    pub(crate) fn new(
+        acct: AccountKey,
+        ids: RpcIds,
+        rearm: bool,
+        covers_open: bool,
+        one_id: bool,
+    ) -> Rc<Shared> {
         Rc::new(Shared {
             acct,
             ids,
             queue: RefCell::default(),
             wake: Notify::new(),
             ready: Cell::new(None),
-            gate: RefCell::new(Gate::new(rearm, covers_open)),
+            gate: RefCell::new(Gate::new(rearm, covers_open, one_id)),
             ended: Cell::new(false),
         })
     }
@@ -381,8 +388,8 @@ mod tests {
     fn request_ids_count_up_across_the_sessions_sharing_them_from_where_they_start() {
         let ids = RpcIds::default();
         let (first, second) = (
-            Shared::new(AccountKey::new(2), ids.clone(), true, false),
-            Shared::new(AccountKey::new(2), ids, true, false),
+            Shared::new(AccountKey::new(2), ids.clone(), true, false, true),
+            Shared::new(AccountKey::new(2), ids, true, false, true),
         );
         let fee = || Submitted::Control(VenueCommand::FeeQuery);
         assert_eq!(first.push(fee()), Ok(RpcId(1)));
@@ -399,7 +406,7 @@ mod tests {
 
     #[test]
     fn orders_give_increasing_request_ids_and_none_once_ended() {
-        let shared = Shared::new(AccountKey::new(2), RpcIds::default(), true, false);
+        let shared = Shared::new(AccountKey::new(2), RpcIds::default(), true, false, true);
         let orders = ExecOrders {
             shared: Rc::clone(&shared),
         };
