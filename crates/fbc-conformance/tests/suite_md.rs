@@ -68,6 +68,13 @@ enum Twist {
     /// Opening, it sends the subscribe frame for the toy's two instruments on `book`, which
     /// its subscribe then sends again.
     OpensWithSubscribe,
+    /// Each gap it reports on a book comes after a snapshot of that book begins, and is followed
+    /// by a level, the snapshot's end and `Live`: the gap discards that snapshot.
+    SnapshotBeforeGap,
+    /// It pushes the gaps it reports and nothing else.
+    OnlyGaps,
+    /// It takes every subscription and sends nothing for it.
+    SubscribesSilently,
     /// It reads a binary frame's bytes as the toy's text.
     BinaryText,
     /// Each codec its factory builds after the first also asks for a timer when it opens.
@@ -265,6 +272,37 @@ struct Rewrite<'a> {
 
 impl MdSink for Rewrite<'_> {
     fn push(&mut self, mut meta: VenueMeta, mut ev: MdEvent) {
+        let gap = matches!(
+            ev,
+            MdEvent::Health {
+                h: FeedHealth::Gap,
+                ..
+            }
+        );
+        if self.twist == Twist::OnlyGaps && !gap {
+            return;
+        }
+        if let (
+            Twist::SnapshotBeforeGap,
+            MdEvent::Health {
+                inst,
+                feed: Feed::Book(book),
+                h: FeedHealth::Gap,
+            },
+        ) = (self.twist, ev)
+        {
+            let epoch = 99;
+            self.sink
+                .push(meta, MdEvent::BookSnapshotBegin { inst, book, epoch });
+            self.sink.push(meta, ev);
+            self.sink.push(meta, stray_level(inst, book));
+            self.sink
+                .push(meta, MdEvent::BookSnapshotEnd { inst, book });
+            let feed = Feed::Book(book);
+            let h = FeedHealth::Live;
+            self.sink.push(meta, MdEvent::Health { inst, feed, h });
+            return;
+        }
         match (self.twist, &mut ev) {
             (
                 Twist::IgnoresBreaks,
@@ -387,6 +425,11 @@ impl MdCodec for Twisted {
                 });
             }
             return Ok(());
+        }
+        if self.twist == Twist::SubscribesSilently {
+            return self
+                .inner
+                .subscribe(add, remove, specs, &mut Effects::new());
         }
         if self.twist == Twist::PilesUp {
             for _ in 0..self.built {
@@ -861,6 +904,79 @@ fn continuity_reads_the_longer_blocks_of_a_binary_venues_unchained_books() {
 }
 
 #[test]
+fn continuity_holds_a_book_broken_after_a_snapshot_began_in_the_same_frame() {
+    // Codex r4218744557: a gap discards the snapshot begun before it, so only a snapshot begun
+    // after the gap mends the book.
+    let failure = failed(Variant::twisted(Twist::SnapshotBeforeGap).run(suite::continuity));
+    let level = |line: u32, sym: &str| {
+        format!(
+            "continuity/book.frames line {line} pushes a level of {sym}'s book while its \
+             sequence is broken: a broken book takes nothing until its next snapshot"
+        )
+    };
+    let live = |line: u32, sym: &str| {
+        format!(
+            "continuity/book.frames line {line} reports {sym}'s book Live while its sequence is \
+             broken: it is Live again only once its next snapshot ends"
+        )
+    };
+    assert_eq!(
+        said(&failure, PLUS_ONE),
+        [
+            level(10, "TOYA-PERP"),
+            live(10, "TOYA-PERP"),
+            level(16, "TOYA-PERP"),
+            live(16, "TOYA-PERP"),
+            level(17, "TOYB-PERP"),
+            live(17, "TOYB-PERP"),
+        ]
+    );
+}
+
+#[test]
+fn continuity_fails_a_case_whose_frames_in_sequence_push_nothing_of_the_book() {
+    // Codex r4218744571: a case proves the codec takes the sequence as well as breaks in it.
+    let failure = failed(Variant::twisted(Twist::OnlyGaps).run(suite::continuity));
+    assert_eq!(
+        said(&failure, "continuity/book.frames"),
+        [
+            "no frame in sequence pushes an event of book: a case must show the codec taking \
+             the sequence, not only breaking it"
+        ]
+    );
+    // A case whose every frame is marked proves no more.
+    let scratch = Scratch::toy("all-marked");
+    scratch.write(
+        "continuity/book.frames",
+        "gap=TOYA-PERP text delta|sym=TOYA-PERP|book=0|seq=12|bid=100:4|ask=\n",
+    );
+    let failure = failed(scratch.run(suite::continuity));
+    assert_eq!(
+        said(&failure, "continuity/book.frames"),
+        [
+            "no frame in sequence pushes an event of book: a case must show the codec taking \
+             the sequence, not only breaking it"
+        ]
+    );
+}
+
+#[test]
+fn subscriptions_idempotent_fails_a_codec_that_sends_no_subscribe_request() {
+    // Codex r4218744576: a set taken and never sent is no subscription.
+    let failure =
+        failed(Variant::twisted(Twist::SubscribesSilently).run(suite::subscriptions_idempotent));
+    assert_eq!(
+        said(&failure, "MdCodec::subscribe"),
+        [
+            "book: epoch 0 sends no subscribe request (a Send charged OpKind::Subscribe), \
+             opening or subscribing",
+            "book: epoch 1 sends no subscribe request (a Send charged OpKind::Subscribe), \
+             opening or subscribing",
+        ]
+    );
+}
+
+#[test]
 fn the_checks_drive_one_connection_as_the_topology_allows() {
     // Codex r4217682420: a venue with a connection per instrument is subscribed one instrument
     // per codec, and its cases name that instrument only.
@@ -1168,7 +1284,12 @@ fn a_check_fails_a_refused_frame_and_a_case_that_states_nothing() {
     let failure = failed(scratch.run(suite::continuity));
     assert_eq!(
         said(&failure, "continuity/book.frames"),
-        ["line 1: `gap=TOYC-PERP` names no instrument of the setup"]
+        [
+            "line 1: `gap=TOYC-PERP` names no instrument of the setup",
+            // Its one frame is marked (Codex r4218744571).
+            "no frame in sequence pushes an event of book: a case must show the codec taking \
+             the sequence, not only breaking it",
+        ]
     );
 
     scratch.write(
