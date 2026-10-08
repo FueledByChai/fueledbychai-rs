@@ -208,7 +208,7 @@ pub trait ExecHandler {
         let _ = handle;
     }
 
-    /// The orders of ours the current epoch's resync showed resting, placed on an earlier
+    /// The orders of ours this or an earlier epoch's resync showed resting, placed on an earlier
     /// epoch, which the epoch's cancel-on-disconnect arm may not cover (FBC-nvxn, decision
     /// 0080): called once per epoch, right after the handler is handed the event that lets the
     /// epoch place (the arm's acceptance or the resync's end, whichever comes last), when there
@@ -219,9 +219,8 @@ pub trait ExecHandler {
     /// built and authorized by fbc-oms ([`ExecOrders::submit`]); one whose registry already
     /// holds the order ended (a snapshot lagging an end heard on an earlier epoch) queries it
     /// instead (`ControlCommand::Query`), and the venue's answer showing it ended releases the
-    /// market. One it neither cancels nor queries keeps its market held until the next epoch
-    /// that sends an arm reads the venue again (an epoch that sends none keeps it held and
-    /// tells it again). Nothing by default.
+    /// market. One it neither cancels nor queries keeps its market held, and is told again on
+    /// each later epoch. Nothing by default.
     fn on_unprotected(&mut self, orders: &[VenueOrderSnapshot]) {
         let _ = orders;
     }
