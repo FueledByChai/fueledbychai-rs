@@ -5,10 +5,10 @@
 
 use std::collections::BTreeSet;
 
-use fbc_conformance::toy::{self, EXEC_URL_KEY, INST_A, ToyFactory};
+use fbc_conformance::toy::{self, BOOK, EXEC_URL_KEY, INST_A, ToyFactory};
 use fbc_core::{
-    ConfigError, Effects, EndpointPlan, Feed, InstrumentKind, MdTransport, Secrets, StreamId,
-    Subscription, SymbolError, VenueConfig, VenueError, VenueFactory, WireUrl,
+    ConfigError, Effects, EndpointPlan, Feed, InstrumentId, InstrumentKind, MdTransport, Secrets,
+    StreamId, Subscription, SymbolError, VenueConfig, VenueError, VenueFactory, WireUrl,
 };
 
 fn trades() -> Subscription {
@@ -61,6 +61,17 @@ fn the_toy_factory_refuses_what_it_does_not_model_yet() {
     let subs = BTreeSet::from([trades()]);
     let refused = ToyFactory.plan_md(&cfg, &specs, &subs);
     assert!(matches!(refused, Err(VenueError::UnsupportedFeed(sub)) if sub == trades()));
+    // An instrument missing from the spec table is named as such, before its feed or the
+    // market-data URL (Codex r4203051296).
+    let unknown = InstrumentId::new(99);
+    for feed in [Feed::Book(BOOK), Feed::Trades] {
+        let subs = BTreeSet::from([Subscription {
+            inst: unknown,
+            feed,
+        }]);
+        let refused = ToyFactory.plan_md(&cfg, &specs, &subs);
+        assert_eq!(refused, Err(VenueError::UnknownInstrument(unknown)));
+    }
     let ep = EndpointPlan {
         stream: StreamId(2),
         transport: MdTransport::Socket {

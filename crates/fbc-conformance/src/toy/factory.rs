@@ -63,20 +63,25 @@ impl VenueFactory for ToyFactory {
         Err(VenueError::NoDiscovery)
     }
 
-    /// Nothing to plan for no subscription. A feed the caps do not declare is refused as
-    /// unsupported; a declared book channel as configuration, since the market-data URL is not
-    /// modelled until FBC-ja3.
+    /// Nothing to plan for no subscription. Each subscription is checked in turn, as
+    /// [`ToyMd`]'s subscribe checks it: an instrument missing from `specs` is refused as unknown
+    /// (Codex r4203051296), a feed the caps do not declare as unsupported. A declared book
+    /// channel is then refused as configuration, since the market-data URL is not modelled
+    /// until FBC-ja3.
     fn plan_md(
         &self,
         _cfg: &VenueConfig,
-        _specs: &SpecTable,
+        specs: &SpecTable,
         subs: &BTreeSet<Subscription>,
     ) -> Result<Vec<EndpointPlan>, VenueError> {
         let books = caps().md.books.len();
-        let declared =
-            |s: &Subscription| matches!(s.feed, Feed::Book(b) if usize::from(b.0) < books);
-        if let Some(sub) = subs.iter().find(|s| !declared(s)) {
-            return Err(VenueError::UnsupportedFeed(*sub));
+        for sub in subs {
+            if specs.get(sub.inst).is_none() {
+                return Err(VenueError::UnknownInstrument(sub.inst));
+            }
+            if !matches!(sub.feed, Feed::Book(b) if usize::from(b.0) < books) {
+                return Err(VenueError::UnsupportedFeed(*sub));
+            }
         }
         match subs.is_empty() {
             true => Ok(Vec::new()),

@@ -532,6 +532,92 @@ fn an_anchor_older_than_a_held_delta_or_one_past_the_held_bound_is_asked_again()
     assert!(rig.pushed().is_empty() && rig.fx.is_empty());
 }
 
+#[test]
+fn the_delta_past_the_held_bound_is_held_for_the_anchor_asked_again() {
+    // Codex r4203051298: the delta that overflows the bound is the first the replacement anchor
+    // must reach, so an anchor older than it is asked for again, never pushed as live.
+    let mut rig = Rig::new();
+    rig.subscribe(&[sub(INST_B, ANCHORED_BOOK)], &[]).unwrap();
+    rig.fx.take();
+    let over = 20 + MAX_HELD as u64;
+    for seq in 20..=over {
+        let d = format!(
+            "delta|sym=TOYB-PERP|book=1|seq={seq}|bid=50:{}|ask=",
+            seq % 7 + 1
+        );
+        rig.frame(&d).unwrap();
+    }
+    assert_eq!(rig.fx.take(), [anchor_get(2, INST_B, "TOYB-PERP")]);
+    // An anchor two before the overflowing delta missed the one between: asked again.
+    let stale = format!("anchor|sym=TOYB-PERP|seq={}|bid=50:9|ask=", over - 2);
+    rig.http(2, Ok((200, &stale))).unwrap();
+    assert!(rig.pushed().is_empty());
+    assert_eq!(rig.fx.take(), [anchor_get(3, INST_B, "TOYB-PERP")]);
+    // The overflowing delta is still held for the anchor after that: one just before it is
+    // followed by it.
+    let fresh = format!("anchor|sym=TOYB-PERP|seq={}|bid=50:9|ask=", over - 1);
+    rig.frame(&format!(
+        "delta|sym=TOYB-PERP|book=1|seq={}|bid=51:1|ask=",
+        over + 1
+    ))
+    .unwrap();
+    rig.http(3, Ok((200, &fresh))).unwrap();
+    let b = (INST_B, ANCHORED_BOOK);
+    assert_eq!(
+        rig.pushed(),
+        [
+            MdEvent::BookSnapshotBegin {
+                inst: b.0,
+                book: b.1,
+                epoch: 0
+            },
+            level(b.0, b.1, BID, 50, 9),
+            MdEvent::BookSnapshotEnd {
+                inst: b.0,
+                book: b.1
+            },
+            level(b.0, b.1, BID, 50, (over % 7 + 1) as i64),
+            level(b.0, b.1, BID, 51, 1),
+        ]
+    );
+    assert!(rig.fx.is_empty());
+}
+
+#[test]
+fn an_anchor_at_the_last_sequence_is_pushed_and_the_delta_after_it_is_a_gap() {
+    // Codex r4203051299: no sequence follows u64::MAX, so nothing chains onto such an anchor;
+    // nothing overflows on the way.
+    let mut rig = Rig::new();
+    rig.subscribe(&[sub(INST_A, ANCHORED_BOOK)], &[]).unwrap();
+    rig.fx.take();
+    rig.frame("delta|sym=TOYA-PERP|book=1|seq=0|bid=100:1|ask=")
+        .unwrap();
+    let last = format!("anchor|sym=TOYA-PERP|seq={}|bid=100:2|ask=", u64::MAX);
+    rig.http(1, Ok((200, &last))).unwrap();
+    let a = (INST_A, ANCHORED_BOOK);
+    assert_eq!(
+        rig.pushed(),
+        [
+            MdEvent::BookSnapshotBegin {
+                inst: a.0,
+                book: a.1,
+                epoch: 0
+            },
+            level(a.0, a.1, BID, 100, 2),
+            MdEvent::BookSnapshotEnd {
+                inst: a.0,
+                book: a.1
+            },
+        ]
+    );
+    assert!(rig.fx.is_empty());
+    // A delta at 0 does not follow u64::MAX: a gap, and the anchor asked for again.
+    rig.frame("delta|sym=TOYA-PERP|book=1|seq=0|bid=100:3|ask=")
+        .unwrap();
+    assert_eq!(rig.pushed(), [gap(INST_A, ANCHORED_BOOK)]);
+    assert_eq!(rig.fx.take(), [anchor_get(2, INST_A, "TOYA-PERP")]);
+}
+
 /// Applies the events pushed since the last call to `books`, from one connection, and returns
 /// them.
 fn feed(books: &mut MdBooks, rig: &mut Rig) -> Vec<MdEvent> {
@@ -589,6 +675,16 @@ fn a_gap_reports_health_naming_the_book_that_broke_and_leaves_the_other_alone() 
     assert_eq!(rig.fx.take(), [anchor_get(2, INST_A, "TOYA-PERP")]);
     assert!(book(&books, ANCHORED_BOOK).is_err());
     assert_eq!(book(&books, BOOK), Ok(Some(lots(2))));
+    // The delta that broke it is held for the new anchor: one at 6 misses 7 and is asked for
+    // again; one at 7 is followed by it.
+    rig.http(2, Ok((200, "anchor|sym=TOYA-PERP|seq=6|bid=100:8|ask=")))
+        .unwrap();
+    assert!(rig.pushed().is_empty());
+    assert_eq!(rig.fx.take(), [anchor_get(3, INST_A, "TOYA-PERP")]);
+    rig.http(3, Ok((200, "anchor|sym=TOYA-PERP|seq=7|bid=100:1|ask=")))
+        .unwrap();
+    feed(&mut books, &mut rig);
+    assert_eq!(book(&books, ANCHORED_BOOK), Ok(Some(lots(9))));
 }
 
 // ---------------------------------------------------------------------------------------------
