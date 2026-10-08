@@ -50,7 +50,8 @@ Options:
                             with loopback stub URLs, which the proxy would resolve on its host
   --lease-dir <DIR>         where the market, account and client-id leases are taken, and the
                             client-id high-water mark is kept across runs
-                            (default: <temp dir>/fbc-testnet-trade)
+                            (default: $HOME/.fueledbychai/testnet_trade; kept across reboots,
+                            unlike a temporary directory)
   -h, --help                print this help
 
 The URLs must name Paradex's testnet hosts (api.testnet.paradex.trade and
@@ -139,7 +140,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     let mut rest_url = TESTNET_REST.to_owned();
     let mut ws_url = TESTNET_WS.to_owned();
     let mut proxy = ProxyConfig::Direct;
-    let mut lease_dir = std::env::temp_dir().join("fbc-testnet-trade");
+    let mut lease_dir = None;
     let mut sole_trader = false;
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
@@ -180,7 +181,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             "--rest-url" => rest_url = value()?,
             "--ws-url" => ws_url = value()?,
             "--socks5" => proxy = socks5(&value()?)?,
-            "--lease-dir" => lease_dir = PathBuf::from(value()?),
+            "--lease-dir" => lease_dir = Some(PathBuf::from(value()?)),
             _ => return Err(format!("unknown argument {flag}; --help lists them")),
         }
     }
@@ -197,13 +198,27 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         rest_url,
         ws_url,
         proxy,
-        lease_dir,
+        lease_dir: match lease_dir {
+            Some(dir) => dir,
+            None => default_lease_dir()?,
+        },
         sole_trader,
     };
     let target = testnet_urls(&opts.rest_url, &opts.ws_url)?;
     direct_to_stub(target, &opts.proxy)?;
     sole(&opts)?;
     Ok(Parsed::Trade(Box::new(opts)))
+}
+
+/// `$HOME/.fueledbychai/testnet_trade`: durable, so the client-id high-water mark kept there
+/// outlives a reboot or a temporary-directory cleanup.
+fn default_lease_dir() -> Result<PathBuf, String> {
+    match std::env::var_os("HOME") {
+        Some(home) if !home.is_empty() => Ok(PathBuf::from(home)
+            .join(".fueledbychai")
+            .join("testnet_trade")),
+        _ => Err("HOME is not set: give --lease-dir, a directory kept across reboots".to_owned()),
+    }
 }
 
 /// What the testnet guard admitted: whether the URLs are a loopback test stub.

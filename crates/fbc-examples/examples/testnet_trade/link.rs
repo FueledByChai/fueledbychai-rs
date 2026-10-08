@@ -52,6 +52,8 @@ pub enum Note {
     /// session's own request (its cancel-on-disconnect arm).
     Outcome {
         rpc: RpcId,
+        /// The item it answers, `None` for the whole request.
+        item: Option<u16>,
         outcome: SubmitOutcome,
         ours: bool,
     },
@@ -148,6 +150,53 @@ impl Link {
         counts
     }
 
+    /// What became of request `rpc`, submitted here, once every item is answered: not sent;
+    /// the whole request's outcome; or, item by item, `Accepted` (at the first item's level)
+    /// when every item was accepted and otherwise the first item's outcome that was not. `None`
+    /// while an item is unanswered, so a batch is never judged by its first item alone.
+    pub fn outcome_of(&self, rpc: RpcId) -> Option<SubmitOutcome> {
+        let items = self.sent.get(&rpc)?.len().max(1);
+        let mut by_item: HashMap<u16, &SubmitOutcome> = HashMap::new();
+        for note in &self.notes {
+            match note {
+                Note::Submitted {
+                    rpc: r,
+                    sent: Err(reason),
+                } if *r == rpc => return Some(SubmitOutcome::NotSent(*reason)),
+                Note::Outcome {
+                    rpc: r,
+                    item,
+                    outcome,
+                    ours: true,
+                } if *r == rpc => match item {
+                    None => return Some(outcome.clone()),
+                    Some(idx) => {
+                        by_item.entry(*idx).or_insert(outcome);
+                    }
+                },
+                _ => {}
+            }
+        }
+        if by_item.len() < items {
+            return None;
+        }
+        let mut answered: Vec<(&u16, &&SubmitOutcome)> = by_item.iter().collect();
+        answered.sort_by_key(|(idx, _)| **idx);
+        let refused = answered
+            .iter()
+            .find(|(_, o)| !matches!(o, SubmitOutcome::Accepted { .. }));
+        Some(match refused {
+            Some((_, o)) => (**o).clone(),
+            None => (*answered[0].1).clone(),
+        })
+    }
+
+    /// The orders request `rpc`, submitted here, names.
+    pub fn cids_of(&self, rpc: RpcId) -> Vec<ClientOrderId> {
+        let items = self.sent.get(&rpc).map_or(&[][..], Vec::as_slice);
+        items.iter().map(|it| Link::op(*it, rpc).0).collect()
+    }
+
     /// Now, on the monotonic clock from the glue's origin and on the wall clock.
     pub fn now(&self) -> (MonoNs, WallNs) {
         let mono = u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -241,6 +290,7 @@ impl Link {
         let Some(items) = self.sent.get(&rpc).cloned() else {
             self.notes.push(Note::Outcome {
                 rpc,
+                item: item.map(|i| i.idx),
                 outcome,
                 ours: false,
             });
@@ -274,6 +324,7 @@ impl Link {
         }
         self.notes.push(Note::Outcome {
             rpc,
+            item: item.map(|i| i.idx),
             outcome,
             ours: true,
         });
