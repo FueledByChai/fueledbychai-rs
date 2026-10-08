@@ -4,8 +4,9 @@
 //! `Accepted`, a request written again after its deadline, an amend whose reply alone is declared
 //! to report it (`RpcReplyOnly`) with no update synthesized, an amended order's new venue id
 //! missing, a placement refused or answered wrongly, a setup stating no replies, an opening that
-//! never readies the epoch and a reply that refuses its request; and where each is skipped with
-//! nothing to check.
+//! never readies the epoch and a reply that refuses its request, an unanswered request reported
+//! before its deadline, an `Unknown` or an amended update naming another order; and where each
+//! is skipped with nothing to check.
 
 mod toy_setup;
 
@@ -72,6 +73,16 @@ enum Twist {
     DoubledAck,
     /// An amended order's update states a price one tick above the amend's.
     WrongPx,
+    /// A frame `early` reports the last request it wrote timed out, at once, long before its
+    /// deadline; its deadline then reports nothing more.
+    EagerTimeout,
+    /// A placement's acceptance names no venue id; an `Open` update of the order, with it,
+    /// follows.
+    VidOnUpdate,
+    /// An amended order's update names it by its venue id with a client id not canonical.
+    StrangerAmended,
+    /// A timed-out placement's `Unknown` names another order's client id.
+    StrangerOnTimeout,
 }
 
 /// The toy with its caps edited by `caps` and its codec twisted by `twist`.
@@ -158,6 +169,22 @@ static DOUBLED_AMEND_ACK: Variant = Variant {
 static WRONG_PX: Variant = Variant {
     caps: |_| {},
     twist: Twist::WrongPx,
+};
+static EAGER_TIMEOUT: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::EagerTimeout,
+};
+static VID_ON_UPDATE: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::VidOnUpdate,
+};
+static STRANGER_AMENDED: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::StrangerAmended,
+};
+static STRANGER_ON_TIMEOUT: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::StrangerOnTimeout,
 };
 static FAILS_AFTER_TIMEOUT: Variant = Variant {
     caps: |_| {},
@@ -322,6 +349,8 @@ impl VenueFactory for Variant {
                 last,
                 failed,
                 reconnected: false,
+                rpc: None,
+                early: None,
             };
             Box::new(twisted) as Box<dyn ExecCodec>
         }))
@@ -349,6 +378,10 @@ struct Twisted {
     failed: bool,
     /// Whether it asked for the reconnect, for [`Twist::ReplacesOnReconnect`].
     reconnected: bool,
+    /// The last request it wrote, for [`Twist::EagerTimeout`].
+    rpc: Option<RpcId>,
+    /// The request it reported timed out early, for [`Twist::EagerTimeout`].
+    early: Option<RpcId>,
 }
 
 /// A sink handing `inner` the events `f` rewrites each into.
@@ -569,6 +602,92 @@ fn whole_acceptance(ev: ExecEvent) -> Vec<ExecEvent> {
     }]
 }
 
+/// A placement's acceptance naming no venue id, then an `Open` update of the order with it.
+fn vid_on_update(ev: ExecEvent) -> Vec<ExecEvent> {
+    let ExecEvent::Outcome {
+        rpc,
+        item:
+            Some(ItemRef {
+                idx,
+                cid: Some(cid),
+                vid: vid @ Some(_),
+            }),
+        outcome: outcome @ SubmitOutcome::Accepted { .. },
+    } = ev
+    else {
+        return vec![ev];
+    };
+    let item = Some(ItemRef {
+        idx,
+        cid: Some(cid),
+        vid: None,
+    });
+    let update = fbc_core::OrderUpdate {
+        cid: Some(fbc_core::CidMatch::Ours(cid)),
+        vid,
+        inst: toy::INST_A,
+        side: fbc_core::Side::Buy,
+        state: VenueOrderState::Open,
+        cum_filled: fbc_core::Lots::ZERO,
+        px: None,
+        qty: None,
+        post_only: None,
+        reduce_only: None,
+    };
+    let outcome = ExecEvent::Outcome { rpc, item, outcome };
+    vec![outcome, ExecEvent::Order(update)]
+}
+
+/// An amended order's update with a client id not canonical.
+fn stranger_amended(ev: ExecEvent) -> Vec<ExecEvent> {
+    vec![match ev {
+        ExecEvent::Order(mut u) if matches!(u.state, VenueOrderState::Amended { .. }) => {
+            u.cid = Some(fbc_core::CidMatch::Unparseable);
+            ExecEvent::Order(u)
+        }
+        other => other,
+    }]
+}
+
+/// A whole request's `Unknown` as its item 0's, naming another order's client id.
+fn stranger_on_timeout(ev: ExecEvent) -> Vec<ExecEvent> {
+    vec![match ev {
+        ExecEvent::Outcome {
+            rpc,
+            item: None,
+            outcome: outcome @ SubmitOutcome::Unknown,
+        } => {
+            let item = Some(ItemRef {
+                idx: 0,
+                cid: Some(stranger()),
+                vid: None,
+            });
+            ExecEvent::Outcome { rpc, item, outcome }
+        }
+        other => other,
+    }]
+}
+
+/// A client id of another engine's, minted under a lease of its own.
+fn stranger() -> fbc_core::ClientOrderId {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let k = NEXT.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("fbc-stranger-{}-{k}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ns = fbc_core::Namespace::new(7);
+    let lease = fbc_core::NamespaceLease::acquire(&dir, fbc_core::AccountKey::new(9), ns);
+    let start = fbc_core::WallNs(0);
+    let cid = fbc_core::CidMint::new(lease.unwrap(), 0, 0, start)
+        .mint()
+        .unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    cid
+}
+
+/// The frame a stub sends, after its answer, for [`Twist::EagerTimeout`].
+const EARLY: &str = "early";
+
 impl ExecCodec for Twisted {
     fn nonces_for(&self, call: CtxCall) -> u16 {
         self.inner.nonces_for(call)
@@ -622,6 +741,7 @@ impl ExecCodec for Twisted {
         }
         let mut mine = Effects::new();
         let receipt = self.inner.encode(cmd, rpc, specs, ctx, t, &mut mine)?;
+        self.rpc = Some(rpc);
         for effect in mine.take() {
             let placing = matches!(cmd, VenueCommand::Place(_) | VenueCommand::PlaceBatch(_));
             if let Effect::Send { frame, .. } = &effect
@@ -643,8 +763,17 @@ impl ExecCodec for Twisted {
         sink: &mut dyn ExecSink,
         fx: &mut Effects,
     ) -> Result<(), DecodeError> {
+        if self.twist == Twist::EagerTimeout && f.bytes() == EARLY.as_bytes() {
+            if let Some(rpc) = self.rpc {
+                self.inner.on_rpc_timeout(rpc, sink);
+                self.early = Some(rpc);
+            }
+            return Ok(());
+        }
         let f_ = match self.twist {
             Twist::NoNewVid => no_new_vid,
+            Twist::VidOnUpdate => vid_on_update,
+            Twist::StrangerAmended => stranger_amended,
             Twist::SameVid => same_vid,
             Twist::EarlyAmended => early_amended,
             Twist::WholeAcceptance => whole_acceptance,
@@ -688,6 +817,9 @@ impl ExecCodec for Twisted {
     }
 
     fn on_rpc_timeout(&mut self, rpc: RpcId, sink: &mut dyn ExecSink) {
+        if self.early == Some(rpc) {
+            return;
+        }
         let f = match self.twist {
             Twist::AcceptsOnTimeout => accepted,
             Twist::SilentOnTimeout => dropped,
@@ -699,6 +831,7 @@ impl ExecCodec for Twisted {
             }
             Twist::SwapsItems => swapped,
             Twist::ProvisionalOnTimeout => provisional,
+            Twist::StrangerOnTimeout => stranger_on_timeout,
             _ => return self.inner.on_rpc_timeout(rpc, sink),
         };
         self.inner
@@ -776,6 +909,48 @@ fn rejecting_amends() -> Setup {
         inner.reply(frame, if amend { &rejects } else { answers })
     });
     Setup {
+        order_entry: Some(stub),
+        ..assumed()
+    }
+}
+
+/// The toy's setup whose stub sends, after its answer to each request, a frame `early`.
+fn early() -> Setup {
+    let mut stub = order_entry();
+    let inner = stub.reply.clone();
+    stub.reply = Replier::new(move |frame, answers| {
+        let mut frames = inner.reply(frame, answers)?;
+        frames.push(Frame::Text(EARLY.into()));
+        Ok(frames)
+    });
+    Setup {
+        order_entry: Some(stub),
+        ..assumed()
+    }
+}
+
+/// The toy's setup on an instrument whose orders are 6 to `max` lots, its stub rejecting an
+/// amend to more.
+fn sized(max: i64) -> Setup {
+    let mut specs = toy::specs();
+    let mut a = specs.get(toy::INST_A).unwrap().clone();
+    a.min_size = fbc_core::Lots::new(6).unwrap();
+    a.max_order_size = Some(fbc_core::Lots::new(max).unwrap());
+    specs.insert(a);
+    let mut stub = order_entry();
+    let inner = stub.reply.clone();
+    stub.reply = Replier::new(move |frame, answers| {
+        let over = |t: &str| {
+            let qty = t.split('|').find_map(|kv| kv.strip_prefix("qty="));
+            qty.and_then(|q| q.parse::<i64>().ok())
+                .is_some_and(|q| q > max)
+        };
+        let amend = matches!(frame, Frame::Text(t) if t.starts_with("amend|") && over(t));
+        let rejects = vec![suite::Answer::Reject; answers.len()];
+        inner.reply(frame, if amend { &rejects } else { answers })
+    });
+    Setup {
+        specs,
         order_entry: Some(stub),
         ..assumed()
     }
@@ -1283,5 +1458,72 @@ fn amend_ack_fails_a_toy_whose_amended_update_states_another_price() {
     assert!(
         says(&failure, "OrderUpdate", "contradicts the amend"),
         "{failure}"
+    );
+}
+
+#[test]
+fn mixed_batch_fails_a_toy_that_reports_the_unanswered_item_unknown_before_its_deadline() {
+    let failure = failed(suite::mixed_batch(&EAGER_TIMEOUT.subject(early)));
+    assert!(
+        says(
+            &failure,
+            "ExecCodec::on_rpc_timeout",
+            "item 2, which the stub never answered, was reported before its deadline"
+        ),
+        "{failure}"
+    );
+    // Without the frame that brings it early, the same codec passes.
+    let passed = suite::mixed_batch(&EAGER_TIMEOUT.subject(assumed));
+    assert!(matches!(passed, Ok(Verdict::Passed { .. })), "{passed:?}");
+}
+
+#[test]
+fn unknown_on_timeout_fails_a_toy_that_reports_the_placement_unknown_before_its_deadline() {
+    let failure = failed(suite::unknown_on_timeout(&EAGER_TIMEOUT.subject(early)));
+    assert!(
+        says(
+            &failure,
+            "ExecCodec::on_rpc_timeout",
+            "before its deadline, before the clock moved"
+        ),
+        "{failure}"
+    );
+}
+
+#[test]
+fn unknown_on_timeout_fails_a_toy_whose_unknown_names_another_orders_client_id() {
+    let failure = failed(suite::unknown_on_timeout(
+        &STRANGER_ON_TIMEOUT.subject(assumed),
+    ));
+    assert!(
+        says(&failure, "ExecCodec::on_rpc_timeout", "not Unknown once"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn amend_ack_fails_a_toy_whose_amended_update_names_the_order_with_a_stranger_client_id() {
+    let failure = failed(suite::amend_ack(&STRANGER_AMENDED.subject(assumed)));
+    assert!(
+        says(&failure, "OrderUpdate", "names the amended order by"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn amend_ack_learns_the_venue_id_from_the_placements_order_update() {
+    let passed = suite::amend_ack(&VID_ON_UPDATE.subject(assumed));
+    assert!(matches!(passed, Ok(Verdict::Passed { .. })), "{passed:?}");
+}
+
+#[test]
+fn amend_ack_amends_the_quantity_within_the_instruments_largest_order() {
+    let passed = suite::amend_ack(&QTY_ONLY.subject(|| sized(10)));
+    assert!(matches!(passed, Ok(Verdict::Passed { .. })), "{passed:?}");
+    // No other size fits: nothing to amend to.
+    let skipped = suite::amend_ack(&QTY_ONLY.subject(|| sized(6)));
+    assert!(
+        matches!(skipped, Ok(Verdict::Skipped { why, .. }) if why.contains("max_order_size")),
+        "{skipped:?}"
     );
 }

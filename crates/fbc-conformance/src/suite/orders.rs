@@ -9,15 +9,16 @@
 //! - `amend_ack`: an order the stub accepted is amended, and the stub accepts the amend. The
 //!   amend's outcome is `Accepted`, and an `OrderUpdate` in state `Amended` names the order:
 //!   from the venue's event reporting the replaced order where `AmendCaps.ack` is
-//!   `ReplacedEvent`, synthesized by the codec from the reply where it is `RpcReplyOnly`. Where
-//!   the amended order gets a new venue id (`AmendCaps.keeps_venue_id` false), the update names
-//!   it.
+//!   `ReplacedEvent`, synthesized by the codec from the reply where it is `RpcReplyOnly`. Every
+//!   identity the update states is the order's. Where the amended order gets a new venue id
+//!   (`AmendCaps.keeps_venue_id` false), the update names it.
 //! - `mixed_batch`: a batch of three placements is answered item by item, the first accepted,
 //!   the second rejected and the third never; once its deadline passes, the first is
 //!   `Accepted`, the second `Rejected` and the third `Unknown`, each by its index, and nothing
-//!   is reported for the whole request.
+//!   is reported for the whole request. The third has no outcome before the clock moves.
 //! - `unknown_on_timeout`: a placement the stub never answers is reported `Unknown` once at its
-//!   deadline, and is never written a second time, however long the clock then runs.
+//!   deadline (nothing before the clock moves), naming no other order, and is never written a
+//!   second time, however long the clock then runs.
 //!
 //! None reads a fixture file.
 
@@ -52,12 +53,14 @@ pub fn amend_ack(subject: &Subject<'static>) -> Result<Verdict, Failure> {
             why,
         });
     };
-    let Some((px, qty)) = amended(&live.h, &amend) else {
-        let why = "AmendCaps declares neither the price nor the quantity amendable";
-        return Ok(Verdict::Skipped {
-            check: AMEND_ACK,
-            why,
-        });
+    let (px, qty) = match amended(&live.h, &amend) {
+        Ok(to) => to,
+        Err(why) => {
+            return Ok(Verdict::Skipped {
+                check: AMEND_ACK,
+                why,
+            });
+        }
     };
     let ack = format!("AmendCaps.ack is {:?}", amend.ack);
     let model = live.order.ack;
@@ -67,32 +70,30 @@ pub fn amend_ack(subject: &Subject<'static>) -> Result<Verdict, Failure> {
         let placed = c.send(auth, OpKind::Place).await?;
         c.settle(|c| !c.outcomes(placed).is_empty()).await;
         let outcomes = c.outcomes(placed);
-        let Some((item, outcome @ SubmitOutcome::Accepted { .. })) = outcomes.first() else {
+        let Some((_, SubmitOutcome::Accepted { .. })) = outcomes.first() else {
             let what = format!("the placement the stub accepted was reported {outcomes:?}");
             return Err(c.h.fail("ExecCodec::on_frame", what));
         };
-        // An acceptance of the whole request is the one item's (Codex r4222379990).
-        let whole = ItemRef {
-            idx: 0,
-            cid: None,
-            vid: None,
-        };
-        let item = item.clone().unwrap_or(whole);
-        c.oms.placed(c.h, cid, &item, outcome)?;
+        // What the placement's answer brings, every outcome and order update in the order it
+        // came, applied as a live consumer applies them (Codex r4222779025): the venue id an
+        // update states names the order where the acceptance names none.
+        c.churn().await;
+        c.oms.replay(c.h, cid, placed, &c.events())?;
+        let placed_vid = c.oms.vid(cid);
         let auth = c.oms.amend(c.h, cid, px, qty)?;
         // Only what the session reports from here on answers the amend (Codex r4222138050).
         let before = c.events().len();
         let rpc = c.send(auth, OpKind::Amend).await?;
         c.answered().await?;
         let names = |u: &OrderUpdate| {
-            u.cid == Some(CidMatch::Ours(cid)) || (item.vid.is_some() && u.vid == item.vid)
+            u.cid == Some(CidMatch::Ours(cid)) || (placed_vid.is_some() && u.vid == placed_vid)
         };
         let update = |c: &Ctx<'_>| amended_update(&c.events()[before..], names);
         c.settle(|c| !c.outcomes(rpc).is_empty() && update(c).is_some())
             .await;
         let asked = Asked {
             cid,
-            placed: item.vid.clone(),
+            placed: placed_vid.clone(),
             px,
             qty,
             model,
@@ -113,10 +114,12 @@ pub fn amend_ack(subject: &Subject<'static>) -> Result<Verdict, Failure> {
 }
 
 /// The price and quantity an order the harness places is amended to: a valid price one step
-/// away where the price is amendable, else twice the quantity where that is.
-fn amended(h: &Harness<'_>, amend: &AmendCaps) -> Option<(Ticks, Lots)> {
+/// away where the price is amendable, else twice the quantity, or the largest order where that
+/// is less (Codex r4222779033), where the quantity is; why there is none otherwise.
+fn amended(h: &Harness<'_>, amend: &AmendCaps) -> Result<(Ticks, Lots), &'static str> {
+    let spec = h.specs().get(h.inst).expect("the harness's instrument");
     if amend.price {
-        let grid = &h.specs().get(h.inst)?.price_grid;
+        let grid = &spec.price_grid;
         let below =
             h.px.0
                 .checked_sub(1)
@@ -125,13 +128,16 @@ fn amended(h: &Harness<'_>, amend: &AmendCaps) -> Option<(Ticks, Lots)> {
             h.px.0
                 .checked_add(1)
                 .and_then(|px| grid.ceil_valid(Ticks(px)));
-        return below.or(above).map(|px| (px, h.qty));
+        let none = "no valid price lies one step from the harness's";
+        return below.or(above).map(|px| (px, h.qty)).ok_or(none);
     }
-    amend
-        .qty
-        .then(|| h.qty.checked_add(h.qty))
-        .flatten()
-        .map(|qty| (h.px, qty))
+    if !amend.qty {
+        return Err("AmendCaps declares neither the price nor the quantity amendable");
+    }
+    let doubled = Lots::new(h.qty.get().saturating_mul(2)).expect("a count");
+    let qty = spec.max_order_size.map_or(doubled, |max| doubled.min(max));
+    let none = "InstrumentSpec.max_order_size admits no size but the harness's own to amend to";
+    (qty > h.qty).then_some((h.px, qty)).ok_or(none)
 }
 
 /// The update in state `Amended` that `names` the order, if any.
@@ -212,6 +218,20 @@ fn judge_amend(
         breaches.push(Breach::new(ack, what));
         return breaches;
     };
+    // Every identity the update states is the amended order's (Codex r4222779011): fbc-oms
+    // routes an update by its client id first, and a stranger's or a non-canonical one routes
+    // it to no order of ours.
+    let cid_agrees = update.cid.is_none_or(|m| m == CidMatch::Ours(asked.cid));
+    let vid_agrees = update.vid.is_none() || asked.placed.is_none() || update.vid == asked.placed;
+    if !cid_agrees || !vid_agrees {
+        let (cid, placed) = (asked.cid, &asked.placed);
+        let what = format!(
+            "the update names the amended order by client id {:?} and venue id {:?}; the order \
+             is {cid:?}, placed under {placed:?}",
+            update.cid, update.vid
+        );
+        breaches.push(Breach::new("OrderUpdate", what));
+    }
     // The update states the amended order where it states it (Codex r4222568860).
     let agrees = update.inst == c.h.inst
         && update.side == Side::Buy
@@ -268,6 +288,9 @@ pub fn mixed_batch(subject: &Subject<'static>) -> Result<Verdict, Failure> {
         let (cids, auth) = c.oms.batch(c.h, usize::from(ITEMS))?;
         let rpc = c.send(auth, OpKind::Place).await?;
         c.answered().await?;
+        // The clock has not moved since the batch was sent: no deadline has passed, so the item
+        // the stub never answered has no outcome yet (Reviewer B RB-3il-1).
+        let early = of(&c.outcomes(rpc), 2).len();
         let every = |c: &Ctx<'_>| {
             let outcomes = c.outcomes(rpc);
             let has = |i| {
@@ -283,7 +306,7 @@ pub fn mixed_batch(subject: &Subject<'static>) -> Result<Verdict, Failure> {
         if moved.is_some() {
             c.advance(WAIT).await;
         }
-        Ok(judge_batch(c, rpc, &cids, model, moved))
+        Ok(judge_batch(c, rpc, &cids, model, moved, early))
     })?;
     verdict(MIXED_BATCH, breaches, || {
         vec![
@@ -294,17 +317,35 @@ pub fn mixed_batch(subject: &Subject<'static>) -> Result<Verdict, Failure> {
     })
 }
 
-/// What broke `mixed_batch`: each item's outcomes, an outcome for the whole request, a
-/// resend.
+/// The outcomes of item `i` among `outcomes`.
+fn of(outcomes: &[(Option<ItemRef>, SubmitOutcome)], i: u16) -> Vec<&SubmitOutcome> {
+    let item = |it: &Option<ItemRef>| it.as_ref().is_some_and(|it| it.idx == i);
+    outcomes
+        .iter()
+        .filter(|(it, _)| item(it))
+        .map(|(_, o)| o)
+        .collect()
+}
+
+/// What broke `mixed_batch`: each item's outcomes, an outcome for the whole request, an
+/// outcome for the unanswered item before the clock moved (`early` of them), a resend.
 fn judge_batch(
     c: &Ctx<'_>,
     rpc: RpcId,
     cids: &[ClientOrderId],
     model: AckModel,
     moved: Option<Duration>,
+    early: usize,
 ) -> Vec<Breach> {
     let mut breaches = Vec::new();
     let outcomes = c.outcomes(rpc);
+    if early > 0 {
+        let what = format!(
+            "item 2, which the stub never answered, was reported before its deadline: {early} \
+             outcome(s) before the clock moved"
+        );
+        breaches.push(Breach::new("ExecCodec::on_rpc_timeout", what));
+    }
     if moved.is_none() {
         let what = format!(
             "not every item had an outcome {WAIT:?} after the batch was answered: {outcomes:?}"
@@ -316,14 +357,7 @@ fn judge_batch(
         let what = format!("outcomes for the whole batch, not its items by index: {whole:?}");
         breaches.push(Breach::new("ExecCodec::on_rpc_timeout", what));
     }
-    let of = |i: u16| -> Vec<&SubmitOutcome> {
-        let item = |it: &Option<ItemRef>| it.as_ref().is_some_and(|it| it.idx == i);
-        outcomes
-            .iter()
-            .filter(|(it, _)| item(it))
-            .map(|(_, o)| o)
-            .collect()
-    };
+    let of = |i: u16| of(&outcomes, i);
     // Each answered item once (Codex r4222138014): the acceptance final once, after at most one
     // provisional acceptance (a two-phase venue's), and the rejection once.
     let accepted = of(0);
@@ -381,6 +415,9 @@ pub fn unknown_on_timeout(subject: &Subject<'static>) -> Result<Verdict, Failure
         let (cid, auth) = c.oms.place(c.h)?;
         let rpc = c.send(auth, OpKind::Place).await?;
         c.answered().await?;
+        // The clock has not moved since the placement was sent: no deadline has passed, so it
+        // has no outcome yet (Codex r4222779000).
+        let early = c.outcomes(rpc);
         let moved = c.advance_until(|c| !c.outcomes(rpc).is_empty()).await;
         // The longest deadline again, so an outcome reported twice, or a resend however late,
         // shows (Codex r4222379980).
@@ -388,9 +425,18 @@ pub fn unknown_on_timeout(subject: &Subject<'static>) -> Result<Verdict, Failure
             c.advance(WAIT).await;
         }
         let mut breaches = Vec::new();
+        if !early.is_empty() {
+            let what = format!(
+                "the placement the stub never answered was reported {early:?} before its \
+                 deadline, before the clock moved"
+            );
+            breaches.push(Breach::new("ExecCodec::on_rpc_timeout", what));
+        }
         let outcomes = c.outcomes(rpc);
+        // Its one item, naming the placement where it names an order (Codex r4222779007).
         let unknown = |(it, o): &(Option<ItemRef>, SubmitOutcome)| {
-            *o == SubmitOutcome::Unknown && it.as_ref().is_none_or(|it| it.idx == 0)
+            let own = |it: &ItemRef| it.idx == 0 && it.cid.is_none_or(|named| named == cid);
+            *o == SubmitOutcome::Unknown && it.as_ref().is_none_or(own)
         };
         if outcomes.len() != 1 || !outcomes.iter().all(unknown) {
             let what = format!(

@@ -18,7 +18,7 @@ use fbc_core::{
     AccountKey, AccountLease, ClientOrderId, Envelope, ExecEvent, ItemRef, Lots, MarketLease,
     MonoNs, NewOrder, NonceBlock, NonceSource, OpKind, OrderCaps, OrderKind, OrderKindTag,
     RateLimit, RpcId, Side, SignedLots, SubmitHandle, SubmitOutcome, Ticks, VenueCaps,
-    VenueFactory, WallNs, encode_cid,
+    VenueFactory, VenueOrderId, WallNs, encode_cid,
 };
 use fbc_oms::{
     Authorization, LadderConfig, LeaseKeys, Leases, MarketCapsConfig, OrderKey, OrderOp,
@@ -334,6 +334,14 @@ impl Ctx<'_> {
         }
     }
 
+    /// Lets every task run, without moving the clock, for what the stub's answer brings to
+    /// reach the session.
+    pub async fn churn(&self) {
+        for _ in 0..CHURN {
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Moves the clock on, in [`STEP`]s and after [`FINE`] in [`COARSE`] ones, letting the
     /// session run after each, until `done` holds or [`WAIT`] has passed: how far it moved, or
     /// `None` when `done` never held.
@@ -549,20 +557,52 @@ impl Oms {
         Ok((cids, self.authorize(h, cmd.ok_or_else(refused)?)?))
     }
 
-    /// Order `cid`'s placement answered with `item` and `outcome`, as the session reported it.
-    pub fn placed(
+    /// The session's `events` applied in the order reported, as a live consumer applies them:
+    /// each outcome of request `rpc`, order `cid`'s placement, and each order update
+    /// (Codex r4222779025). An outcome for the whole request is its one item's (Codex
+    /// r4222379990).
+    pub fn replay(
         &mut self,
         h: &Harness<'_>,
         cid: ClientOrderId,
-        item: &ItemRef,
-        outcome: &SubmitOutcome,
+        rpc: RpcId,
+        events: &[ExecEvent],
     ) -> Result<(), Failure> {
-        let applied = self
-            .reg
-            .on_outcome(cid, OrderOp::Place, item, outcome, MonoNs(2_000));
-        applied
-            .map(drop)
-            .map_err(|e| h.fail("fbc-oms", format!("refused the placement's outcome: {e:?}")))
+        let whole = ItemRef {
+            idx: 0,
+            cid: None,
+            vid: None,
+        };
+        for (ingest, event) in (0..).zip(events) {
+            match event {
+                ExecEvent::Outcome {
+                    rpc: r,
+                    item,
+                    outcome,
+                } if *r == rpc => {
+                    let item = item.as_ref().unwrap_or(&whole);
+                    let now = MonoNs(2_000);
+                    let applied = self.reg.on_outcome(cid, OrderOp::Place, item, outcome, now);
+                    let refused =
+                        |e| h.fail("fbc-oms", format!("refused the placement's outcome: {e:?}"));
+                    applied.map_err(refused)?;
+                }
+                ExecEvent::Order(u) => {
+                    let key = OrderKey {
+                        venue: None,
+                        ingest,
+                    };
+                    self.reg.apply_update(u, key);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// The venue id fbc-oms knows order `cid` by, if any.
+    pub fn vid(&self, cid: ClientOrderId) -> Option<VenueOrderId> {
+        self.reg.get(cid).and_then(|o| o.vid().cloned())
     }
 
     /// An amend of resting order `cid` to `px` and `qty`, built and authorized.

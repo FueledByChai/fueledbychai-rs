@@ -36,8 +36,11 @@ venue for the program's life (`ExecSessionConfig::venue` is `&'static dyn VenueF
   normal dependencies; it is only ever a dev-dependency of the crates it checks.
 - **fbc-oms authorizes every command.** A registry under lease names of its own is resynced
   flat, started on the setup's first instrument with leases in a directory the check removes,
-  and builds and authorizes each place, batch and amend through `Registry::authorize`; a
-  placement's outcome is handed back to it before its amend. fbc-conformance depends on fbc-oms,
+  and builds and authorizes each place, batch and amend through `Registry::authorize`; what a
+  placement's answer brought (its outcomes and every order update, in the order reported) is
+  handed back to it before its amend, so a venue id an update states names the order. A
+  quantity amend goes to twice the order's size, or the instrument's largest order where that
+  is less, and is skipped where no other size fits. fbc-conformance depends on fbc-oms,
   and on fbc-journal for the session's nonce source id.
 - **The factory lives for the program.** The three checks take `Subject<'static>` and run
   through `suite::run_live`; the macro's factory is a constant expression (a unit struct or a
@@ -46,11 +49,15 @@ venue for the program's life (`ExecSessionConfig::venue` is `&'static dyn VenueF
   the frames the session has written so far (each counted as one unit), the check moves the
   clock by that limit's window, so its bucket has room again; otherwise the clock stays, so a
   keepalive is not written where the stub reads a request.
+- Until the check first moves the clock after the stub has answered, no deadline has passed: an
+  outcome for an unanswered request (or item) by then was reported before its deadline and fails
+  the check.
 - Once a deadline has passed, the check runs the clock on by the longest deadline it waits for
   (600 s), so a late retry shows.
 - Each check judges what the session reported (outcomes by request and item, each answered item
   once and naming its own order, an acceptance of the whole request taken as its one item's,
-  order updates reported after the amend) and what the stub received on every connection: an
+  order updates reported after the amend, every identity an amended update states the amended
+  order's) and what the stub received on every connection: an
   order written once, counted by the frames carrying our client id as the venue's wire spells
   it, so a request rebuilt and signed again counts too (byte-equal frames where the venue sends
   no such id).
