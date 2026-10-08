@@ -21,7 +21,9 @@ Environment (read once at start; no value is ever printed):
   PARADEX_ACCOUNT_ADDRESS   the testnet account's Starknet address (0x and hex digits)
   PARADEX_PRIVATE_KEY       the account's own Stark private key (0x and hex digits): the main
                             key, not a trading subkey
-  PARADEX_CHAIN_ID          optional; when set it must be PRIVATE_SN_POTC_SEPOLIA (testnet)
+  PARADEX_CHAIN_ID          optional; when set it must be the testnet's,
+                            PRIVATE_SN_POTC_SEPOLIA, by name or as its felt in decimal (as the
+                            Java library writes it) or 0x hex
 
 Required confirmation and namespace:
   --sole-trader             you confirm that no other process, Java or Rust, trades this
@@ -108,6 +110,23 @@ const TESTNET_WS_HOST: &str = "ws.api.testnet.paradex.trade";
 
 /// The testnet's Starknet chain id, the only one the guard admits.
 pub const TESTNET_CHAIN: &str = "PRIVATE_SN_POTC_SEPOLIA";
+
+/// [`TESTNET_CHAIN`]'s felt (its ASCII bytes as one big-endian number) in decimal, as the Java
+/// library writes `PARADEX_CHAIN_ID`, and in hex, lower case without `0x`.
+const TESTNET_CHAIN_DECIMAL: &str = "7693264728749915528729180568779831130134670232771119425";
+const TESTNET_CHAIN_HEX: &str = "505249564154455f534e5f504f54435f5345504f4c4941";
+
+/// Whether `chain` names the testnet's chain: [`TESTNET_CHAIN`] by name, or its felt in
+/// decimal or in `0x` hex (either case). Nothing else, not even another spelling of the felt.
+fn is_testnet_chain(chain: &str) -> bool {
+    let hex = chain
+        .strip_prefix("0x")
+        .or_else(|| chain.strip_prefix("0X"))
+        .map(str::to_ascii_lowercase);
+    chain == TESTNET_CHAIN
+        || chain == TESTNET_CHAIN_DECIMAL
+        || hex.as_deref() == Some(TESTNET_CHAIN_HEX)
+}
 
 /// The environment variable of the chain id (optional).
 pub const CHAIN_VAR: &str = "PARADEX_CHAIN_ID";
@@ -268,12 +287,13 @@ pub enum Target {
 /// The testnet guard, run before anything connects: the REST base must be `https://` to
 /// Paradex's testnet REST host and the WebSocket `wss://` to its testnet WebSocket host, or both
 /// a loopback host (a test stub), and the chain id (`PARADEX_CHAIN_ID` when set, else the
-/// testnet's) must be [`TESTNET_CHAIN`]. Refused naming what is not testnet.
+/// testnet's) must be [`TESTNET_CHAIN`], by name or as its felt in decimal or hex. Refused
+/// naming what is not testnet.
 pub fn testnet_guard(rest: &str, ws: &str, chain: Option<&str>) -> Result<Target, String> {
     let target = testnet_urls(rest, ws)?;
     match chain {
         None => {}
-        Some(TESTNET_CHAIN) => {}
+        Some(chain) if is_testnet_chain(chain) => {}
         Some(other) => {
             return Err(format!(
                 "{CHAIN_VAR}={other}: not the testnet chain id {TESTNET_CHAIN}; testnet_trade \

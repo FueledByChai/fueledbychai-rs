@@ -14,8 +14,9 @@
 //! **Its size.** `--order-usd` (required, no default, at most the resting cap) at the order's
 //! price, floored onto the size step. Refused when that is no lot, or its notional is below the
 //! market's `--min-notional` (the encoder does not check a minimum, FBC-98fc). The resting cap
-//! per side (`--resting-cap-usd`) and the inventory cap (`--inventory-cap-usd`), both required,
-//! are converted to lots at the same price.
+//! per side (`--resting-cap-usd`) is converted to lots at the same price, and the inventory cap
+//! (`--inventory-cap-usd`), both required, at the higher of that price and the ask, so a
+//! position is never worth more than the cap at the market.
 //!
 //! **Its client ids** are minted, decoded as ours, leased and kept under the namespace the
 //! consumer allocates (`--namespace`, required): an order on the market under another
@@ -495,21 +496,24 @@ fn away_from(opts: &Options, book: &OrderbookSnapshot) -> Result<Touch, String> 
 }
 
 /// The order `--away-bps` behind the touch on the tick and `--order-usd`'s size on the size
-/// step, with the caps in lots at its price, or why it cannot be placed: no touch to stay away
+/// step, with the caps in lots (the resting cap at its price, the inventory cap at the higher of
+/// its price and the ask), or why it cannot be placed: no touch to stay away
 /// from ([`away_from`]), no lot in the size, or a notional below the market's minimum.
 fn price(opts: &Options, book: &OrderbookSnapshot) -> Result<Priced, String> {
     let Touch { bid, ask, away } = away_from(opts, book)?;
     let ticks = away;
     let px = Decimal::from(ticks.0) * opts.tick;
-    let lots_for = |usd: Decimal| -> Result<Lots, String> {
-        let n = (usd / (px * opts.step)).floor();
+    let lots_for = |usd: Decimal, at: Decimal| -> Result<Lots, String> {
+        let n = (usd / (at * opts.step)).floor();
         Lots::new(n.to_i64().ok_or("an amount does not fit")?)
             .ok_or_else(|| "a negative amount".to_owned())
     };
     let order_usd = opts.order_usd;
-    let qty = lots_for(order_usd)?;
-    let resting = lots_for(opts.resting_cap_usd)?;
-    let inventory = lots_for(opts.inventory_cap_usd)?;
+    let qty = lots_for(order_usd, px)?;
+    // The resting cap at the order's price, where it rests; the inventory cap at the higher of
+    // that and the ask, so a position is never worth more than the cap at the market.
+    let resting = lots_for(opts.resting_cap_usd, px)?;
+    let inventory = lots_for(opts.inventory_cap_usd, px.max(ask))?;
     let size = Decimal::from(qty.get()) * opts.step;
     let notional = size * px;
     if qty.get() == 0 {
@@ -634,13 +638,100 @@ fn session_config(
     })
 }
 
-/// The latest resync applied: once the session takes places, the one whose end opened the
-/// current epoch's gate, never an earlier epoch's.
-pub fn latest_resync(notes: &[Note]) -> Option<(&ResyncReport, &ResyncSnapshot)> {
+/// An applied resync: its report and the snapshot it applied.
+pub type Applied<'a> = (&'a ResyncReport, &'a ResyncSnapshot);
+
+/// The latest resync, applied or refused (why): once the session takes places, the one whose
+/// end opened the current epoch's gate, never an earlier epoch's. A refused one means the gate
+/// is open with no resync applied behind it.
+pub fn latest_resync(notes: &[Note]) -> Option<Result<Applied<'_>, &str>> {
     notes.iter().rev().find_map(|n| match n {
-        Note::Resynced { report, snapshot } => Some((report, snapshot)),
+        Note::Resynced { report, snapshot } => Some(Ok((report, snapshot))),
+        Note::ResyncRefused(why) => Some(Err(why.as_str())),
         _ => None,
     })
+}
+
+/// What shows the account changed since the seed, or might hold what the run cannot see, in
+/// `notes` and `reg`: a reconnect's resync disagreeing with the inventory
+/// ([`resync_disagreements`]) or refused by the registry, an order in our namespace that the
+/// registry does not hold (shown by a resync or an order event), a fill not of our orders, a
+/// position event other than `start` (the market's position seeded at Start; flat on any other
+/// market), or an order not ours in view on the market. Empty when nothing does.
+pub fn account_changes(notes: &[Note], reg: &Registry, start: Option<SignedLots>) -> Vec<String> {
+    let mut changes: Vec<String> = resync_disagreements(notes)
+        .into_iter()
+        .map(|what| format!("a resync found the position other than the registry's: {what}"))
+        .collect();
+    let orphan = |cid: ClientOrderId, vid: Option<&fbc_core::VenueOrderId>| {
+        format!(
+            "an order in our namespace that the registry does not hold was reported (client \
+             id sequence {}, venue order {}): Stop cannot cancel it nor the run count its \
+             fills",
+            cid.seq(),
+            vid.map_or("unknown".to_owned(), |v| format!("{v:?}"))
+        )
+    };
+    for note in notes {
+        match note {
+            Note::ResyncRefused(why) => changes.push(format!(
+                "a resync was refused ({why}): what the registry holds may no longer be the \
+                 account's"
+            )),
+            Note::Resynced { report, .. } => {
+                for (cid, vid) in &report.untracked {
+                    changes.push(orphan(*cid, Some(vid)));
+                }
+            }
+            Note::Orphan { cid, vid } => changes.push(orphan(*cid, vid.as_ref())),
+            Note::Fill {
+                seen,
+                unexplained: true,
+            } => changes.push(format!("a fill not of our orders came in: {seen}")),
+            Note::Position { inst, qty } => {
+                // The resync refuses an account with a position on another market.
+                let expected = if *inst == INST {
+                    start
+                } else {
+                    Some(SignedLots(0))
+                };
+                if expected != Some(*qty) {
+                    changes.push(format!(
+                        "the venue reported the account's position in instrument {} as {} \
+                         lots, not the {} lots the run expects",
+                        inst.get(),
+                        qty.0,
+                        expected.map_or("(no Start)".to_owned(), |e| e.0.to_string())
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    if reg.foreign_in_view(INST) {
+        changes.push(
+            "an order not ours is in view on the market (an order event showed it open): \
+             Stop cannot cancel it nor the run count its fills"
+                .to_owned(),
+        );
+    }
+    changes
+}
+
+/// Runs `work` on a thread of its own and waits up to `timeout` for its result: `None` when it
+/// did not finish in time (or panicked). The thread is detached, never a runtime's blocking
+/// pool, so work stalled past the timeout (a `sync_all` on a stalled disk) never holds up the
+/// runtime's end, and so the sample's exit.
+pub async fn off_thread<T: Send + 'static>(
+    timeout: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        // The receiver is gone when the wait timed out: the result is then dropped.
+        let _ = tx.send(work());
+    });
+    tokio::time::timeout(timeout, rx).await.ok()?.ok()
 }
 
 /// The highest sequence of our namespace's client ids among the open orders `snapshot` shows, 0
@@ -816,6 +907,14 @@ impl Driver {
                     inst.get(),
                     qty.0
                 )),
+                Note::ResyncRefused(why) => {
+                    self.note(format_args!("the resync was refused: {why}"));
+                }
+                Note::Orphan { cid, .. } => self.note(format_args!(
+                    "an order event of an order in our namespace that the registry does not \
+                     hold (client id sequence {})",
+                    cid.seq()
+                )),
                 Note::Order(routed) if !matches!(routed, Routed::Ours(..)) => {
                     self.note(format_args!(
                         "an order event of an order not ours: {routed:?}"
@@ -889,11 +988,9 @@ impl Driver {
         left.is_empty()
     }
 
-    /// True unless a fill that is not of our orders came in (a liquidation, a settlement,
-    /// another system's order), the venue reported the account's position other than the
-    /// position seeded at Start (or on another market), a reconnect's resync disagreed with
-    /// the registry's inventory ([`resync_disagreements`]), or an order not ours is in view on
-    /// the market ([`Driver::account_changes`]).
+    /// True unless anything [`account_changes`] reports happened: a fill not of our orders, a
+    /// position other than the seeded one, a reconnect's resync that disagreed or was refused,
+    /// an order of ours the registry does not hold, or an order not ours in view.
     fn account_unmoved(&self) -> bool {
         let changes = self.account_changes();
         for what in &changes {
@@ -902,51 +999,11 @@ impl Driver {
         changes.is_empty()
     }
 
-    /// What shows the account changed since the seed, or might hold what the run cannot see:
-    /// a reconnect's resync disagreeing with the inventory ([`resync_disagreements`]), a fill
-    /// not of our orders, a position event other than the seeded position (or not flat on
-    /// another market), or an order not ours in view on the market. Empty when nothing does.
+    /// [`account_changes`] of the link's notes and registry, against the position seeded at
+    /// Start.
     fn account_changes(&self) -> Vec<String> {
         let link = self.link.borrow();
-        let mut changes: Vec<String> = resync_disagreements(link.notes())
-            .into_iter()
-            .map(|what| format!("a resync found the position other than the registry's: {what}"))
-            .collect();
-        for note in link.notes() {
-            match note {
-                Note::Fill {
-                    seen,
-                    unexplained: true,
-                } => changes.push(format!("a fill not of our orders came in: {seen}")),
-                Note::Position { inst, qty } => {
-                    // The market's position as seeded at Start; flat on any other market (the
-                    // resync refuses an account with a position elsewhere).
-                    let expected = if *inst == INST {
-                        self.start_position
-                    } else {
-                        Some(SignedLots(0))
-                    };
-                    if expected != Some(*qty) {
-                        changes.push(format!(
-                            "the venue reported the account's position in instrument {} as {} \
-                             lots, not the {} lots the run expects",
-                            inst.get(),
-                            qty.0,
-                            expected.map_or("(no Start)".to_owned(), |e| e.0.to_string())
-                        ));
-                    }
-                }
-                _ => {}
-            }
-        }
-        if link.registry().foreign_in_view(INST) {
-            changes.push(
-                "an order not ours is in view on the market (an order event showed it open): \
-                 Stop cannot cancel it nor the run count its fills"
-                    .to_owned(),
-            );
-        }
-        changes
+        account_changes(link.notes(), link.registry(), self.start_position)
     }
 
     /// True unless an order of ours on the market filled during the run, the resync's
@@ -1045,7 +1102,8 @@ impl Driver {
                 if !orders.may_place() {
                     return None;
                 }
-                latest_resync(l.notes()).map(|(report, snapshot)| {
+                let latest = latest_resync(l.notes())?;
+                Some(latest.map_err(str::to_owned).map(|(report, snapshot)| {
                     (
                         snapshot_max(snapshot),
                         report.untrustworthy,
@@ -1073,18 +1131,30 @@ impl Driver {
                             .find(|(inst, _)| *inst == INST)
                             .map_or(SignedLots(0), |(_, qty)| *qty),
                     )
-                })
+                }))
             })
             .await;
-        let Some((ours_max, untrustworthy, on_market, open, not_ours, ours, position)) = resynced
-        else {
-            self.timed_out(
-                "resync",
-                "the REST resync (an open order or position on a market other than --market \
-                 refuses it whole)",
-            );
-            return false;
+        let resynced = match resynced {
+            Some(Ok(resynced)) => resynced,
+            Some(Err(_)) => {
+                // The session opened its gate at the resync's end, but the registry applied
+                // nothing of it (the NOTE above says why): nothing is built on it.
+                self.note(format_args!(
+                    "the registry applied no resync behind the session's open gate; nothing \
+                     placed"
+                ));
+                return false;
+            }
+            None => {
+                self.timed_out(
+                    "resync",
+                    "the REST resync (an open order or position on a market other than \
+                     --market refuses it whole)",
+                );
+                return false;
+            }
         };
+        let (ours_max, untrustworthy, on_market, open, not_ours, ours, position) = resynced;
         self.lines.step(
             "resync",
             format_args!(
@@ -1154,8 +1224,40 @@ impl Driver {
             }
         }
 
-        // The touch again, just before the place: the login, the arm and the resync took
-        // time, and the order goes out only if it is still --away-bps behind it.
+        // The client id, and its mark kept, first: the write is the one wait left before the
+        // place, so the touch's second read and the account audit come after it, and nothing
+        // waits between the audit and the place.
+        // The mint, floored by the mark kept from earlier runs, the highest of our ids the
+        // resync shows, and the wall clock.
+        let mut mint = CidMint::new(ns_lease, persisted, ours_max, wall_now());
+        let cid = match mint.mint() {
+            Ok(cid) => cid,
+            Err(e) => {
+                self.note(format_args!("no client id: {e:?}"));
+                return false;
+            }
+        };
+        // Kept before the id goes out, so no later run mints it again: written and synced on
+        // a thread of its own ([`off_thread`]), so a slow disk never stalls the runtime the
+        // session runs on, for at most the step timeout, nor holds up the exit after it.
+        let hwm = self.hwm.clone();
+        let mark = mint.high_water();
+        let kept = off_thread(self.timeout, move || hwm.write(mark))
+            .await
+            .unwrap_or_else(
+                || Err("the high-water mark's write did not finish in time".to_owned()),
+            );
+        if let Err(e) = kept {
+            self.note(format_args!("{e}; nothing placed"));
+            return false;
+        }
+        self.lines.line(format_args!(
+            "MARK client-id high-water mark {mark} kept in the lease directory"
+        ));
+
+        // The touch again, just before the place: the login, the arm, the resync and the
+        // mark's write took time, and the order goes out only if it is still --away-bps
+        // behind it.
         match self.recheck.still_away(order.px).await {
             Ok((now, seq)) => self.lines.line(format_args!(
                 "BBO again bid {} ask {} (GET /orderbook seq {seq}): the order is still {} bps or \
@@ -1167,10 +1269,11 @@ impl Driver {
                 return false;
             }
         }
-        // The account changed since the seed (a reconnect's resync disagreeing, a position
-        // event, a fill not of ours) or an order not ours came into view: the caps would judge
-        // the place against an inventory that is no longer the account's, so nothing is
-        // placed. The run's end reports what it was.
+        // The account changed since the seed (a reconnect's resync disagreeing or refused, a
+        // position event, a fill not of ours, an order of ours the registry does not hold) or
+        // an order not ours came into view: the caps would judge the place against an
+        // inventory that is no longer the account's, so nothing is placed. The run's end
+        // reports what it was. Nothing waits between this audit and the place below.
         if !self.account_changes().is_empty() {
             self.note(format_args!(
                 "the account changed since the seed, or an order not ours is in view; nothing \
@@ -1180,36 +1283,7 @@ impl Driver {
         }
 
         // The place: built and authorized by fbc-oms, then handed to the session.
-        // The mint, floored by the mark kept from earlier runs, the highest of our ids the
-        // resync shows, and the wall clock.
-        let mut mint = CidMint::new(ns_lease, persisted, ours_max, wall_now());
-        let cid = match mint.mint() {
-            Ok(cid) => cid,
-            Err(e) => {
-                self.note(format_args!("no client id: {e:?}"));
-                return false;
-            }
-        };
         self.owned.push((cid, Lots::ZERO));
-        // Kept before the id goes out, so no later run mints it again: written and synced on
-        // a blocking thread, so a slow disk never stalls the runtime the session runs on, for
-        // at most the step timeout.
-        let hwm = self.hwm.clone();
-        let mark = mint.high_water();
-        let kept = tokio::time::timeout(
-            self.timeout,
-            tokio::task::spawn_blocking(move || hwm.write(mark)),
-        )
-        .await;
-        let kept = match kept {
-            Ok(Ok(written)) => written,
-            Ok(Err(e)) => Err(format!("the high-water mark's write failed: {e}")),
-            Err(_) => Err("the high-water mark's write did not finish in time".to_owned()),
-        };
-        if let Err(e) = kept {
-            self.note(format_args!("{e}; nothing placed"));
-            return false;
-        }
         let placed = {
             let mut link = self.link.borrow_mut();
             let new = NewOrder {

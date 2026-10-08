@@ -78,13 +78,29 @@ fn secrets() -> Secrets {
     creds
 }
 
-/// A lease directory of the test's own.
+/// A directory removed when it is dropped.
+struct Removed(PathBuf);
+
+impl Drop for Removed {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+thread_local! {
+    /// The lease directories the test on this thread made: removed when the test's thread
+    /// ends, so no run leaves its lease files and high-water mark behind.
+    static MADE: RefCell<Vec<Removed>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A lease directory of the test's own, removed when the test's thread ends.
 fn lease_dir() -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     let dir =
         std::env::temp_dir().join(format!("fbc-testnet-trade-test-{}-{n}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
+    MADE.with(|made| made.borrow_mut().push(Removed(dir.clone())));
     dir
 }
 
@@ -626,6 +642,14 @@ async fn testnet_trade_places_one_post_only_order_and_cancels_it_against_the_stu
     assert_eq!(create["params"]["side"], "BUY");
     assert_eq!(create["params"]["price"], "60140.1");
     assert_eq!(create["params"]["size"], "0.00018");
+    // The resting cap is in lots at the order's price ($20 at 60140.1: 33 lots), where it
+    // rests; the inventory cap at the higher of that price and the ask ($50 at 62000.5: 80
+    // lots, not the 83 at the order's price), so a position is never worth more than the cap
+    // at the market.
+    assert!(
+        printed.contains("caps: resting 33 lots per side, inventory 80 lots"),
+        "{printed}"
+    );
     // The steps print what the owner needs.
     assert!(
         printed.contains("TESTNET a loopback test stub"),
@@ -928,7 +952,27 @@ fn the_guard_admits_only_the_testnet_chain_id() {
         args::testnet_guard(rest, ws, Some(TESTNET_CHAIN)),
         Ok(args::Target::Testnet)
     );
-    for chain in ["PRIVATE_SN_PARACLEAR_MAINNET", "0x1", ""] {
+    // The same chain id as the Java library writes it (the decimal felt) and in hex.
+    for chain in [
+        "7693264728749915528729180568779831130134670232771119425",
+        "0x505249564154455f534e5f504f54435f5345504f4c4941",
+        "0X505249564154455F534E5F504F54435F5345504F4C4941",
+    ] {
+        assert_eq!(
+            args::testnet_guard(rest, ws, Some(chain)),
+            Ok(args::Target::Testnet),
+            "{chain}"
+        );
+    }
+    // Mainnet's, by name, in decimal and in hex; and anything else.
+    for chain in [
+        "PRIVATE_SN_PARACLEAR_MAINNET",
+        "8458834024819506728615521019831122032732688838300957472069977523540",
+        "0x505249564154455f534e5f50415241434c4541525f4d41494e4e4554",
+        "0x1",
+        "7693264728749915528729180568779831130134670232771119426",
+        "",
+    ] {
         let err = args::testnet_guard(rest, ws, Some(chain)).unwrap_err();
         assert!(err.contains("not the testnet chain id"), "{chain}: {err}");
     }
@@ -1081,13 +1125,26 @@ fn the_resync_the_run_seeds_from_is_the_latest() {
     };
     assert!(trade::latest_resync(&[]).is_none());
     // An earlier epoch's resync, a reconnect, then the current epoch's.
-    let notes = [
+    let mut notes = vec![
         resynced(3),
         link::Note::EpochEnd(fbc_core::ConnKey { conn: 0, epoch: 1 }),
         resynced(-2),
     ];
-    let (_, snap) = trade::latest_resync(&notes).unwrap();
+    let (_, snap) = trade::latest_resync(&notes).unwrap().unwrap();
     assert_eq!(snap.positions, [(InstrumentId::new(1), SignedLots(-2))]);
+    // A later resync the registry refused: the latest is that refusal, never the one before.
+    notes.push(link::Note::EpochEnd(fbc_core::ConnKey {
+        conn: 0,
+        epoch: 2,
+    }));
+    notes.push(link::Note::ResyncRefused("duplicate".to_owned()));
+    assert_eq!(
+        trade::latest_resync(&notes).unwrap().unwrap_err(),
+        "duplicate"
+    );
+    notes.push(resynced(4));
+    let (_, snap) = trade::latest_resync(&notes).unwrap().unwrap();
+    assert_eq!(snap.positions, [(InstrumentId::new(1), SignedLots(4))]);
 }
 
 #[tokio::test]
@@ -1546,6 +1603,11 @@ async fn a_touch_that_moved_toward_the_order_before_the_place_stops_the_run_with
         printed.contains("the touch moved toward the order (bid 61000.2, ask 61000.5)"),
         "{printed}"
     );
+    // The client-id mark was kept before the touch's second read, not between it and the place.
+    assert!(
+        printed_before(&printed, "MARK ", "the touch moved"),
+        "{printed}"
+    );
     assert!(printed.contains("nothing placed"), "{printed}");
     assert_eq!(
         steps(&printed),
@@ -1792,4 +1854,206 @@ async fn a_moved_position_or_an_order_not_ours_seen_before_the_place_stops_the_r
         );
         assert!(!methods(&stub).iter().any(|m| m == "order.create"));
     }
+}
+
+/// An `OrderEvent` reporting order `vid` (client id `cid`), a post-only sell of 0.00001 at
+/// 70000, OPEN with all of it open.
+fn order_open(seq: i64, vid: &str, cid: &str) -> Vec<u8> {
+    let mut f = order_event(2, seq, vid, cid, "70000", "0.00001", "0.00001", "");
+    f[8 + 16] = 3; // OPEN
+    f
+}
+
+/// Whether line `first` is printed before line `then`.
+fn printed_before(printed: &str, first: &str, then: &str) -> bool {
+    match (printed.find(first), printed.find(then)) {
+        (Some(a), Some(b)) => a < b,
+        _ => false,
+    }
+}
+
+#[tokio::test]
+async fn an_order_of_ours_the_registry_does_not_hold_refuses_the_place_or_fails_the_run() {
+    // An earlier run's order in our namespace that the (untrustworthy) resync did not show,
+    // reported open by an order event: the registry holds no record of it, so Stop would not
+    // cancel it nor the run count its fills.
+    let (orphans, _) = restored();
+    let orphan = || order_open(5_200, &orphans[0].vid, &orphans[0].cid);
+    let said = "an order in our namespace that the registry does not hold";
+
+    // Before the place: it comes with the arm's reply.
+    let with = responder_arm_extra(Arc::new(Mutex::new(Placed::default())), vec![orphan()]);
+    let mut script = vec![Step::Accept];
+    script.extend((0..6).map(|_| Step::Respond {
+        conn: 0,
+        with: with.clone(),
+    }));
+    let stub = StubServer::start(WsScript::new(script), routes())
+        .await
+        .unwrap();
+    let opts = options(&stub, "10");
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(!report.ok, "{printed}");
+    assert!(printed.contains(said), "{printed}");
+    assert!(
+        printed.contains(
+            "the account changed since the seed, or an order not ours is in view; nothing placed"
+        ),
+        "{printed}"
+    );
+    assert_eq!(
+        steps(&printed),
+        ["login", "arm", "resync", "start", "stop"],
+        "{printed}"
+    );
+    assert!(!methods(&stub).iter().any(|m| m == "order.create"));
+    // The client-id mark was kept before the last checks, so nothing waits between them and
+    // the place.
+    assert!(printed_before(&printed, "MARK ", "BBO again"), "{printed}");
+
+    // During the round trip: it comes with the placed order's cancel.
+    let with = responder_extra(Arc::new(Mutex::new(Placed::default())), vec![orphan()]);
+    let mut script = vec![Step::Accept];
+    script.extend((0..8).map(|_| Step::Respond {
+        conn: 0,
+        with: with.clone(),
+    }));
+    let stub = StubServer::start(WsScript::new(script), routes())
+        .await
+        .unwrap();
+    let opts = options(&stub, "10");
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(printed.contains("STEP closed"), "{printed}");
+    assert!(!report.ok, "{printed}");
+    assert!(printed.contains(said), "{printed}");
+    assert!(printed.contains("DONE failed"), "{printed}");
+}
+
+#[tokio::test]
+async fn a_resync_the_registry_refuses_stops_the_run_with_nothing_placed() {
+    // `GET /orders` lists the same order of ours twice: the registry refuses the snapshot, so
+    // the gate the session opened at its end has no resync applied behind it.
+    let (orders, _) = restored();
+    let row = json!({
+        "id": orders[0].vid, "client_id": orders[0].cid, "market": MARKET, "side": "SELL",
+        "type": "LIMIT", "instruction": "POST_ONLY", "price": "70000", "size": "0.00001",
+        "remaining_size": "0.00001", "status": "OPEN", "flags": [],
+    });
+    let twice = json!({ "results": [row.clone(), row] }).to_string();
+    let with = responder(Arc::new(Mutex::new(Placed::default())));
+    let mut script = vec![Step::Accept];
+    script.extend((0..6).map(|_| Step::Respond {
+        conn: 0,
+        with: with.clone(),
+    }));
+    let stub = StubServer::start(WsScript::new(script), routes_with(twice))
+        .await
+        .unwrap();
+    let opts = options(&stub, "10");
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(!report.ok, "{printed}");
+    assert!(printed.contains("the resync was refused"), "{printed}");
+    assert!(!printed.contains("TIMEOUT"), "{printed}");
+    assert_eq!(steps(&printed), ["login", "arm", "stop"], "{printed}");
+    assert!(!methods(&stub).iter().any(|m| m == "order.create"));
+    assert!(printed.contains("DONE failed"), "{printed}");
+}
+
+#[test]
+fn the_account_audit_counts_a_refused_resync_and_orders_of_ours_the_registry_does_not_hold() {
+    use fbc_core::{AccountKey, CidMint, MonoNs, Namespace, NamespaceLease, SignedLots, WallNs};
+    use fbc_oms::{Registry, ResyncReport, ResyncSnapshot};
+    let resynced = |report| link::Note::Resynced {
+        report,
+        snapshot: ResyncSnapshot {
+            watermark: WallNs(0),
+            requested_at: MonoNs(0),
+            orders: Vec::new(),
+            positions: Vec::new(),
+        },
+    };
+    let reg = Registry::new();
+    let start = Some(SignedLots(0));
+    assert!(trade::account_changes(&[resynced(ResyncReport::default())], &reg, start).is_empty());
+
+    // A reconnect's resync the registry refused: what it holds may no longer be the account's.
+    let refused = [
+        resynced(ResyncReport::default()),
+        link::Note::ResyncRefused("the resync lists the order twice".to_owned()),
+    ];
+    let found = trade::account_changes(&refused, &reg, start);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("a resync was refused"), "{found:?}");
+
+    // A reconnect's resync showing an open order of ours the registry does not hold, and an
+    // order event of another.
+    let lease =
+        NamespaceLease::acquire(&lease_dir(), AccountKey::new(1), Namespace::new(1)).unwrap();
+    let mut mint = CidMint::new(lease, 0, 0, WallNs(0));
+    let (a, b) = (mint.mint().unwrap(), mint.mint().unwrap());
+    let caps = fbc_venue_paradex::factory::caps();
+    let vid = fbc_core::dispatch(&caps, Namespace::new(1), |s| s.venue_order_id("V-9")).unwrap();
+    let untracked = [
+        resynced(ResyncReport {
+            untracked: vec![(a, vid.clone())],
+            ..ResyncReport::default()
+        }),
+        link::Note::Orphan {
+            cid: b,
+            vid: Some(vid),
+        },
+    ];
+    let found = trade::account_changes(&untracked, &reg, start);
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(
+        found
+            .iter()
+            .all(|f| f.contains("an order in our namespace that the registry does not hold")),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn a_blocking_write_that_outlives_its_timeout_does_not_hold_up_the_runtimes_end() {
+    use std::sync::mpsc;
+    // Work blocked until the test releases it, as a `sync_all` on a stalled disk would be.
+    let (release, held) = mpsc::channel::<()>();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let got = runtime.block_on(trade::off_thread(Duration::from_millis(50), move || {
+        held.recv().is_ok()
+    }));
+    assert_eq!(got, None);
+    // The runtime ends although the work is still blocked: the sample's exit never waits on it.
+    let (ended, ending) = mpsc::channel();
+    std::thread::spawn(move || {
+        drop(runtime);
+        let _ = ended.send(());
+    });
+    let dropped = ending.recv_timeout(Duration::from_secs(10));
+    let _ = release.send(());
+    assert!(
+        dropped.is_ok(),
+        "the runtime's end waited for the blocked work"
+    );
+    // Work that ends in time hands back its result.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    assert_eq!(
+        runtime.block_on(trade::off_thread(Duration::from_secs(10), || 7)),
+        Some(7)
+    );
+}
+
+#[test]
+fn a_tests_lease_directories_are_removed_when_its_thread_ends() {
+    let dir = std::thread::spawn(lease_dir).join().unwrap();
+    assert!(!dir.exists(), "{}", dir.display());
 }
