@@ -2483,3 +2483,108 @@ fn the_fill_baseline_of_an_order_the_resync_restored_is_the_snapshots() {
     let owned = trade::restored_baseline(&first);
     assert_eq!(trade::traded(&reg, &owned), [(a, Lots::new(2).unwrap())]);
 }
+
+#[test]
+fn nothing_is_placed_while_the_current_connections_gate_is_closed() {
+    // Codex r4216636810: a reconnect after the resync step leaves the new connection's gate
+    // closed until its resync ends, and that resync has left no note for the account audit to
+    // judge yet; the place is refused, not queued to go out when the gate opens.
+    use fbc_core::{AccountKey, CidMint, Lots, Namespace, NamespaceLease, WallNs};
+    let lease =
+        NamespaceLease::acquire(&lease_dir(), AccountKey::new(1), Namespace::new(1)).unwrap();
+    let mut mint = CidMint::new(lease, 0, 0, WallNs(0));
+    let resting = [(mint.mint().unwrap(), Lots::new(9).unwrap())];
+    let changed = ["a fill not of our orders came in".to_owned()];
+    // The gate closed: refused whatever the audit and the side show.
+    let closed = trade::place_refusal(false, &[], &[]).expect("a closed gate refuses");
+    assert!(
+        closed.starts_with("the order socket's current connection takes no place yet"),
+        "{closed}"
+    );
+    assert_eq!(
+        trade::place_refusal(false, &changed, &resting).as_deref(),
+        Some(closed.as_str())
+    );
+    // Open: the audit, then an order of ours resting on the side, refuse it; nothing else.
+    assert!(
+        trade::place_refusal(true, &changed, &resting)
+            .unwrap()
+            .starts_with("the account changed since the seed")
+    );
+    assert!(
+        trade::place_refusal(true, &[], &resting)
+            .unwrap()
+            .starts_with("1 orders of ours (9 lots) rest on the order's side")
+    );
+    assert_eq!(trade::place_refusal(true, &[], &[]), None);
+}
+
+#[tokio::test]
+async fn the_testnet_line_names_the_hosts_never_the_urls() {
+    // Codex r4216636821: an accepted URL may still carry a token in its path; the TESTNET line
+    // names each host only.
+    let stub = StubServer::start(WsScript::new(vec![]), routes())
+        .await
+        .unwrap();
+    let mut opts = options(&stub, "100");
+    opts.ws_url = stub.ws_url("/v1/SYNTHETIC-path-token-hunter2");
+    let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let out: trade::Out = buf.clone();
+    // Refused before the session connects (below the minimum notional), after the line.
+    let refused = trade::run(&opts, None, secrets(), out).await.unwrap_err();
+    let printed = String::from_utf8(buf.borrow().clone()).unwrap();
+    assert!(
+        printed.contains(&format!(
+            "TESTNET a loopback test stub, not Paradex: REST host 127.0.0.1 WS host 127.0.0.1 \
+             chain {TESTNET_CHAIN}"
+        )),
+        "{printed}"
+    );
+    assert!(!printed.contains("hunter2"), "{printed}");
+    assert!(!refused.contains("hunter2"), "{refused}");
+}
+
+#[test]
+fn a_refused_chain_id_or_argument_is_never_echoed() {
+    // Codex r4216636829 and Reviewer B's RB114-10: a private key pasted into PARADEX_CHAIN_ID,
+    // as a stray argument or as a flag's value is refused naming the variable, the position
+    // or the flag, never with what was typed.
+    let key = "0xSYNTHETIC-pasted-secret-hunter2";
+    let (rest, ws) = (args::TESTNET_REST, args::TESTNET_WS);
+    let err = args::testnet_guard(rest, ws, Some(key)).unwrap_err();
+    assert!(err.starts_with("PARADEX_CHAIN_ID"), "{err}");
+    assert!(err.contains("not the testnet chain id"), "{err}");
+    assert!(!err.contains(key), "{err}");
+    let mut argv = strings(&MARKET_ARGS);
+    argv.push(key.to_owned());
+    let err = args::parse(argv).unwrap_err();
+    assert!(err.starts_with("argument 22"), "{err}");
+    assert!(!err.contains(key), "{err}");
+    for flag in [
+        "--tick",
+        "--min-notional",
+        "--resting-cap-usd",
+        "--away-bps",
+        "--namespace",
+        "--side",
+    ] {
+        let mut argv = strings(&MARKET_ARGS);
+        argv.extend(strings(&[flag, key]));
+        let err = args::parse(argv).unwrap_err();
+        assert!(err.starts_with(flag), "{flag}: {err}");
+        assert!(!err.contains(key), "{flag}: {err}");
+    }
+    let mut argv = strings(&MARKET_ARGS);
+    argv.extend(strings(&["--market", "0x0123/not-a-market"]));
+    let err = args::parse(argv).unwrap_err();
+    assert!(err.starts_with("--market"), "{err}");
+    assert!(!err.contains("0x0123"), "{err}");
+    // An unknown flag is still named: it starts with '-', so it is a flag, not a value.
+    let mut argv = strings(&MARKET_ARGS);
+    argv.push("--no-such-flag".to_owned());
+    assert!(
+        args::parse(argv)
+            .unwrap_err()
+            .starts_with("unknown argument --no-such-flag")
+    );
+}
