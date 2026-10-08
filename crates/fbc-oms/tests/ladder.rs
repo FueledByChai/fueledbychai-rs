@@ -310,7 +310,7 @@ fn a_query_answer_resolves_the_order_and_one_finding_it_open_still_counts_agains
     let shown = snap(Some(c), "r1", VenueOrderState::Open, 3);
     let answer = QueryAnswer::new(RpcId(1), target, Some(shown)).unwrap();
     assert_eq!(
-        reg.on_query_answer(&answer, key(1)),
+        reg.on_query_answer(&caps(), &answer, key(1)),
         LadderResolution::Resolved(OrdState::PartiallyFilled)
     );
     let rec = reg.get(c).unwrap();
@@ -323,7 +323,7 @@ fn a_query_answer_resolves_the_order_and_one_finding_it_open_still_counts_agains
     assert!(reg.live(c).is_ok());
     // A second answer to the same query changes nothing.
     assert_eq!(
-        reg.on_query_answer(&answer, key(2)),
+        reg.on_query_answer(&caps(), &answer, key(2)),
         LadderResolution::Ignored
     );
 
@@ -338,7 +338,7 @@ fn a_query_answer_resolves_the_order_and_one_finding_it_open_still_counts_agains
     )
     .unwrap();
     assert_eq!(
-        reg.on_query_answer(&answer, key(3)),
+        reg.on_query_answer(&caps(), &answer, key(3)),
         LadderResolution::Resolved(OrdState::Terminal(TerminalKind::Canceled(
             CancelReason::Requested
         )))
@@ -351,7 +351,7 @@ fn a_query_answer_resolves_the_order_and_one_finding_it_open_still_counts_agains
     reg.query_sent(c, RpcId(3)).unwrap();
     let answer = QueryAnswer::new(RpcId(3), OrderRef::Client(c), None).unwrap();
     assert_eq!(
-        reg.on_query_answer(&answer, key(4)),
+        reg.on_query_answer(&caps(), &answer, key(4)),
         LadderResolution::Inconclusive
     );
     let rec = reg.get(c).unwrap();
@@ -403,7 +403,7 @@ fn a_query_unanswered_unsent_or_refused_is_inconclusive_and_an_accepted_one_wait
     )
     .unwrap();
     assert_eq!(
-        reg.on_query_answer(&answer, key(1)),
+        reg.on_query_answer(&caps(), &answer, key(1)),
         LadderResolution::Resolved(OrdState::Open)
     );
 
@@ -414,7 +414,7 @@ fn a_query_unanswered_unsent_or_refused_is_inconclusive_and_an_accepted_one_wait
     );
     let stray = QueryAnswer::new(RpcId(98), OrderRef::Client(c), None).unwrap();
     assert_eq!(
-        reg.on_query_answer(&stray, key(2)),
+        reg.on_query_answer(&caps(), &stray, key(2)),
         LadderResolution::Ignored
     );
 
@@ -426,7 +426,7 @@ fn a_query_unanswered_unsent_or_refused_is_inconclusive_and_an_accepted_one_wait
     assert_eq!(reg.get(c).unwrap().ladder_step(), None);
     let late = QueryAnswer::new(RpcId(4), OrderRef::Client(c), None).unwrap();
     assert_eq!(
-        reg.on_query_answer(&late, key(4)),
+        reg.on_query_answer(&caps(), &late, key(4)),
         LadderResolution::Ignored
     );
     assert_eq!(reg.get(c).unwrap().state(), OrdState::Open);
@@ -445,7 +445,7 @@ fn a_query_showing_the_order_with_its_command_still_in_flight_is_inconclusive() 
     )
     .unwrap();
     assert_eq!(
-        reg.on_query_answer(&answer, key(1)),
+        reg.on_query_answer(&caps(), &answer, key(1)),
         LadderResolution::Inconclusive
     );
     let rec = reg.get(c).unwrap();
@@ -778,7 +778,7 @@ fn nothing_for_an_unknown_order_is_ever_placed_or_amended_again() {
     let shown = snap(Some(c), "n1", VenueOrderState::Open, 0);
     let answer = QueryAnswer::new(RpcId(4), OrderRef::Both(c, vid("n1")), Some(shown)).unwrap();
     assert_eq!(
-        reg.on_query_answer(&answer, key(6)),
+        reg.on_query_answer(&caps(), &answer, key(6)),
         LadderResolution::Resolved(OrdState::Open)
     );
     assert!(reg.live(c).is_ok());
@@ -877,7 +877,7 @@ fn a_query_acknowledged_but_never_answered_leaves_the_order_to_resyncs_after_the
     // A result arriving after that is no longer awaited.
     let late = QueryAnswer::new(RpcId(1), OrderRef::Client(c), None).unwrap();
     assert_eq!(
-        reg.on_query_answer(&late, key(1)),
+        reg.on_query_answer(&caps(), &late, key(1)),
         LadderResolution::Ignored
     );
 }
@@ -964,7 +964,7 @@ fn a_stale_intent_escalates_within_its_timeout_plus_one_query() {
     )
     .unwrap();
     assert!(matches!(
-        reg.on_query_answer(&answer, key(1)),
+        reg.on_query_answer(&caps(), &answer, key(1)),
         LadderResolution::Resolved(OrdState::Terminal(_))
     ));
 }
@@ -1051,7 +1051,7 @@ fn a_query_answer_naming_another_order_than_the_one_queried_is_never_applied() {
     )
     .unwrap();
     assert_eq!(
-        reg.on_query_answer(&answer, key(1)),
+        reg.on_query_answer(&caps(), &answer, key(1)),
         LadderResolution::TargetMismatch
     );
     let rec = reg.get(c).unwrap();
@@ -1071,7 +1071,7 @@ fn a_query_answer_naming_another_order_than_the_one_queried_is_never_applied() {
     )
     .unwrap();
     assert_eq!(
-        reg.on_query_answer(&answer, key(2)),
+        reg.on_query_answer(&caps(), &answer, key(2)),
         LadderResolution::TargetMismatch
     );
     assert_eq!(reg.get(c).unwrap().state(), OrdState::Unknown);
@@ -1094,7 +1094,7 @@ fn a_query_by_client_id_answered_with_a_venue_id_another_order_of_ours_holds_app
         let shown = snap(shown_cid.then_some(c), "g9", canceled(), 4);
         let answer = QueryAnswer::new(RpcId(1), OrderRef::Client(c), Some(shown)).unwrap();
         assert_eq!(
-            reg.on_query_answer(&answer, key(1)),
+            reg.on_query_answer(&caps(), &answer, key(1)),
             LadderResolution::TargetMismatch,
             "client id shown: {shown_cid}"
         );
@@ -1113,7 +1113,7 @@ fn a_query_by_client_id_answered_with_a_venue_id_another_order_of_ours_holds_app
         assert_eq!(held.unknown_since(), None);
         // The query is spent: the same answer again changes nothing.
         assert_eq!(
-            reg.on_query_answer(&answer, key(2)),
+            reg.on_query_answer(&caps(), &answer, key(2)),
             LadderResolution::Ignored
         );
         assert_eq!(reg.queries_awaited(), 0);
@@ -1197,7 +1197,7 @@ fn an_order_shown_resting_with_its_cancel_still_unresolved_stays_on_the_ladder()
     )
     .unwrap();
     assert_eq!(
-        reg.on_query_answer(&answer, key(1)),
+        reg.on_query_answer(&caps(), &answer, key(1)),
         LadderResolution::Inconclusive
     );
     let rec = reg.get(c).unwrap();
@@ -1347,7 +1347,7 @@ fn a_query_awaited_for_an_order_that_left_the_ladder_is_forgotten_on_the_next_pa
     )
     .unwrap();
     assert_eq!(
-        reg.on_query_answer(&late, key(11)),
+        reg.on_query_answer(&caps(), &late, key(11)),
         LadderResolution::Ignored
     );
     assert_eq!(reg.get(c).unwrap().state(), OrdState::Open);
@@ -1415,7 +1415,7 @@ fn an_order_with_an_earlier_tombstone_unanswered_stays_on_the_ladder_until_it_an
                     let answer =
                         QueryAnswer::new(RpcId(1), OrderRef::Client(c), Some(shown)).unwrap();
                     assert_eq!(
-                        reg.on_query_answer(&answer, key(1)),
+                        reg.on_query_answer(&caps(), &answer, key(1)),
                         LadderResolution::Inconclusive,
                         "{case}"
                     );
@@ -1489,7 +1489,7 @@ fn an_order_whose_every_tombstone_was_answered_leaves_the_ladder_as_the_venue_sh
         let shown = snap(Some(c), "e2", VenueOrderState::Open, 0);
         let answer = QueryAnswer::new(RpcId(1), OrderRef::Client(c), Some(shown)).unwrap();
         assert_eq!(
-            reg.on_query_answer(&answer, key(1)),
+            reg.on_query_answer(&caps(), &answer, key(1)),
             LadderResolution::Resolved(OrdState::Open),
             "{later:?}"
         );
@@ -1525,4 +1525,181 @@ fn a_tombstone_whose_fate_is_unknown_or_only_provisionally_accepted_stays_outsta
             "{answer:?}"
         );
     }
+}
+
+/// The open order `m1` with an amend to 101 sent at 10 ms that went unanswered at 15 ms, on the
+/// ladder with its amend unconfirmed, and queried at 16 ms on the venue `venue`: the query's
+/// target.
+fn amend_unanswered(reg: &mut Registry, venue: &OrderCaps) -> (ClientOrderId, OrderRef) {
+    let c = open(reg, "m1");
+    reg.amend_sent(c, Ticks(101), lots(10), RpcId(7), at(10))
+        .unwrap();
+    reg.on_outcome(
+        c,
+        OrderOp::Amend(RpcId(7)),
+        &item(Some(c), None),
+        &SubmitOutcome::Unknown,
+        at(15),
+    )
+    .unwrap();
+    let rec = reg.get(c).unwrap();
+    assert!(rec.amend_unconfirmed());
+    assert_eq!(rec.unknown_since(), Some(at(15)));
+    assert_eq!(reg.live(c).unwrap_err(), PermitRefusal::IntentPending(c));
+    let plan = reg.ladder(&cfg(), venue, at(16));
+    let target = query_of(&plan, c).target.clone();
+    reg.query_sent(c, RpcId(8)).unwrap();
+    (c, target)
+}
+
+/// Every command the ladder builds for `c` in passes at `passes` ms names it by client id,
+/// never by the venue id an unconfirmed amend may have retired, and a tombstone is among them.
+fn names_only_the_client_id(
+    reg: &mut Registry,
+    replacing: &OrderCaps,
+    c: ClientOrderId,
+    passes: &[u64],
+) {
+    let mut tombstoned = false;
+    for t in passes {
+        let plan = reg.ladder(&cfg(), replacing, at(*t));
+        places_or_amends_nothing(&plan);
+        for (_, query) in &plan.queries {
+            let ControlCommand::Query(query) = query else {
+                panic!("not a query: {query:?}");
+            };
+            assert_eq!(query.target, OrderRef::Client(c));
+        }
+        for (named, cmd) in &plan.tombstones {
+            assert_eq!(*named, c);
+            let VenueCommand::Cancel(cancel) = cmd.command() else {
+                panic!("a tombstone is a single cancel: {:?}", cmd.command());
+            };
+            assert_eq!(cancel.target, OrderRef::Client(c));
+            assert_eq!(
+                cancel.reference(replacing.cancel_refs),
+                Some(ChosenRef::Client(c))
+            );
+            tombstoned = true;
+        }
+    }
+    assert!(tombstoned, "a tombstone by client id follows");
+    // Nor can a permit build an amend or a cancel naming it: it stays off the permits.
+    assert!(reg.live(c).is_err());
+}
+
+#[test]
+fn a_snapshot_showing_an_order_under_another_venue_id_while_its_amend_may_have_moved_it_resolves_nothing()
+ {
+    // FBC-wua8 (Codex r4188432405 on PR #72): on a venue whose amend replaces the venue id, a
+    // query answer or a resync may show an order with an unconfirmed amend under its new id.
+    // Applied, its price and total would confirm the amend and take the order off the ladder
+    // while the record keeps the retired id, which later commands would then name. The
+    // snapshot is inconclusive instead: the order stays on the ladder, the amend in flight,
+    // and a tombstone by client id follows.
+    let replacing = OrderCaps {
+        amend: Some(amend_caps(false)),
+        ..caps()
+    };
+    // Under a venue ordering key later than any applied: nothing marks the snapshot as stale.
+    let later = OrderKey {
+        venue: Some(5),
+        ingest: 5,
+    };
+    // Our order `c` shown resting as `v` at the amend's price and total.
+    let amended = |c: ClientOrderId, v: &str| {
+        let mut shown = snap(Some(c), v, VenueOrderState::Open, 0);
+        shown.px = Some(Ticks(101));
+        shown
+    };
+
+    // A query answer: the query named the order by client id alone, the amend may have
+    // replaced `m1`.
+    let mut reg = Registry::new();
+    let (c, target) = amend_unanswered(&mut reg, &replacing);
+    assert_eq!(target, OrderRef::Client(c));
+    let shown = amended(c, "m2");
+    let answer = QueryAnswer::new(RpcId(8), OrderRef::Client(c), Some(shown.clone())).unwrap();
+    assert_eq!(
+        reg.on_query_answer(&replacing, &answer, later),
+        LadderResolution::Inconclusive
+    );
+    let rec = reg.get(c).unwrap();
+    assert_eq!(rec.vid(), Some(&vid("m1")));
+    assert!(matches!(rec.intent(), Intent::PendingAmend { .. }));
+    assert_eq!((rec.px(), rec.qty()), (Some(Ticks(100)), lots(10)));
+    assert_eq!(rec.unknown_since(), Some(at(15)));
+    assert_eq!(rec.ladder_step(), Some(LadderStep::Resync));
+    // A resync showing it so resolves nothing either, nor counts it absent.
+    for n in 0..3 {
+        let applied = reg.on_resync(
+            &cfg(),
+            &replacing,
+            wall(5_000 + n),
+            std::slice::from_ref(&shown),
+            OrderKey {
+                venue: Some(6 + n as u64),
+                ingest: 6 + n as u64,
+            },
+        );
+        assert_eq!(applied, ResyncApplied::default());
+    }
+    let rec = reg.get(c).unwrap();
+    assert_eq!(rec.vid(), Some(&vid("m1")));
+    assert!(matches!(rec.intent(), Intent::PendingAmend { .. }));
+    assert_eq!(rec.unknown_since(), Some(at(15)));
+    assert_eq!(rec.absent_snapshots(), 0);
+    assert_eq!(reg.lost(), 0);
+    names_only_the_client_id(&mut reg, &replacing, c, &[17, 500, 1_015, 1_016]);
+
+    // A resync, the query having gone unanswered.
+    let mut reg = Registry::new();
+    let (c, _) = amend_unanswered(&mut reg, &replacing);
+    let shown = amended(c, "m2");
+    assert_eq!(
+        reg.on_query_outcome(RpcId(8), &SubmitOutcome::Unknown),
+        LadderResolution::Inconclusive
+    );
+    let applied = reg.on_resync(
+        &cfg(),
+        &replacing,
+        wall(5_000),
+        std::slice::from_ref(&shown),
+        later,
+    );
+    assert_eq!(applied, ResyncApplied::default());
+    let rec = reg.get(c).unwrap();
+    assert_eq!(rec.vid(), Some(&vid("m1")));
+    assert!(matches!(rec.intent(), Intent::PendingAmend { .. }));
+    assert_eq!(rec.unknown_since(), Some(at(15)));
+    assert_eq!(rec.ladder_step(), Some(LadderStep::Resync));
+    assert_eq!(rec.absent_snapshots(), 0);
+    names_only_the_client_id(&mut reg, &replacing, c, &[17, 500, 1_015]);
+
+    // Shown under the record's own id, the snapshot applies as its update would: here it
+    // confirms the amend and settles the order.
+    let mut reg = Registry::new();
+    let (c, _) = amend_unanswered(&mut reg, &replacing);
+    let answer = QueryAnswer::new(RpcId(8), OrderRef::Client(c), Some(amended(c, "m1"))).unwrap();
+    assert_eq!(
+        reg.on_query_answer(&replacing, &answer, later),
+        LadderResolution::Resolved(OrdState::Open)
+    );
+    assert_eq!(reg.get(c).unwrap().vid(), Some(&vid("m1")));
+    assert_eq!(reg.get(c).unwrap().px(), Some(Ticks(101)));
+
+    // On a venue whose amend keeps the id, the record's id is never retired: a snapshot under
+    // another id applies as its update would.
+    let keeping = OrderCaps {
+        amend: Some(amend_caps(true)),
+        ..caps()
+    };
+    let mut reg = Registry::new();
+    let (c, target) = amend_unanswered(&mut reg, &keeping);
+    assert_eq!(target, OrderRef::Both(c, vid("m1")));
+    let answer = QueryAnswer::new(RpcId(8), OrderRef::Client(c), Some(amended(c, "m2"))).unwrap();
+    assert_eq!(
+        reg.on_query_answer(&keeping, &answer, later),
+        LadderResolution::Resolved(OrdState::Open)
+    );
 }
