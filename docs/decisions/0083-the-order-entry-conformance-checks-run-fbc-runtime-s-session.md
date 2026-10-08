@@ -42,12 +42,18 @@ venue for the program's life (`ExecSessionConfig::venue` is `&'static dyn VenueF
 - **The factory lives for the program.** The three checks take `Subject<'static>` and run
   through `suite::run_live`; the macro's factory is a constant expression (a unit struct or a
   `static`), so `&$factory` is `'static`. The other checks keep `Subject<'_>`.
-- Before each request the check moves the clock by the longest window of the venue's declared
-  limits, so a bucket a previous request filled has room again.
+- Before a request, where a declared limit counting its operation allows no more units than
+  the frames the session has written so far (each counted as one unit), the check moves the
+  clock by that limit's window, so its bucket has room again; otherwise the clock stays, so a
+  keepalive is not written where the stub reads a request.
+- Once a deadline has passed, the check runs the clock on by the longest deadline it waits for
+  (600 s), so a late retry shows.
 - Each check judges what the session reported (outcomes by request and item, each answered item
-  once, order updates reported after the amend) and what the stub received: an order written
-  once, counted by the frames carrying our client id as the venue's wire spells it, so a request
-  rebuilt and signed again counts too (byte-equal frames where the venue sends no such id).
+  once and naming its own order, an acceptance of the whole request taken as its one item's,
+  order updates reported after the amend) and what the stub received on every connection: an
+  order written once, counted by the frames carrying our client id as the venue's wire spells
+  it, so a request rebuilt and signed again counts too (byte-equal frames where the venue sends
+  no such id).
 
 ## Alternatives
 
