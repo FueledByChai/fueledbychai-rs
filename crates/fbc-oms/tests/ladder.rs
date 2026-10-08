@@ -1296,3 +1296,177 @@ fn a_query_awaited_for_an_order_that_left_the_ladder_is_forgotten_on_the_next_pa
     );
     assert_eq!(reg.get(c).unwrap().state(), OrdState::Open);
 }
+
+// ---- FBC-e90m: every tombstone sent must be answered before the order leaves the ladder ----
+
+/// The ways a later tombstone is answered without ending the order: not sent, or refused for
+/// another reason than the order having ended.
+fn later_tombstone_answers() -> [SubmitOutcome; 2] {
+    [
+        SubmitOutcome::NotSent(fbc_core::NotSentReason::Backpressure),
+        refused(RejectKind::Other),
+    ]
+}
+
+/// The consumer's numbers with a query awaited 5 s, so its answer can arrive after two
+/// tombstones a second apart.
+fn slow_query_cfg() -> LadderConfig {
+    LadderConfig::new(ms(5_000), ms(50), ms(1_000), 2).unwrap()
+}
+
+/// `c` on the ladder (entered at 5 or 15 ms) queried at its first pass under request 1, with a
+/// tombstone 9 sent at 1020 ms and left unanswered, and a later tombstone 10 sent at 2020 ms
+/// answered by `later`: whatever the venue shows next, tombstone 9 may still remove it.
+fn earlier_tombstone_unanswered(reg: &mut Registry, c: ClientOrderId, later: &SubmitOutcome) {
+    let cfg = slow_query_cfg();
+    let plan = reg.ladder(&cfg, &caps(), at(20));
+    assert_eq!(plan.queries.len(), 1);
+    reg.query_sent(c, RpcId(1)).unwrap();
+    assert_eq!(reg.ladder(&cfg, &caps(), at(1_020)).tombstones.len(), 1);
+    reg.tombstone_sent(c, RpcId(9), at(1_020)).unwrap();
+    assert_eq!(reg.ladder(&cfg, &caps(), at(2_020)).tombstones.len(), 1);
+    reg.tombstone_sent(c, RpcId(10), at(2_020)).unwrap();
+    reg.on_outcome(
+        c,
+        OrderOp::Cancel(RpcId(10)),
+        &item(Some(c), None),
+        later,
+        at(2_021),
+    )
+    .unwrap();
+    let rec = reg.get(c).unwrap();
+    assert!(rec.unknown_since().is_some());
+    assert_eq!(rec.intent(), Intent::None);
+}
+
+#[test]
+fn an_order_with_an_earlier_tombstone_unanswered_stays_on_the_ladder_until_it_answers() {
+    for later in later_tombstone_answers() {
+        for by_query in [true, false] {
+            for placement_unknown in [true, false] {
+                let case = format!("{later:?}, query {by_query}, unknown {placement_unknown}");
+                let mut reg = Registry::new();
+                let c = if placement_unknown {
+                    unknown(&mut reg)
+                } else {
+                    cancel_unanswered(&mut reg, "e1")
+                };
+                earlier_tombstone_unanswered(&mut reg, c, &later);
+
+                // The venue shows it Open: the earlier tombstone may yet remove it.
+                let shown = snap(Some(c), "e1", VenueOrderState::Open, 0);
+                if by_query {
+                    let answer =
+                        QueryAnswer::new(RpcId(1), OrderRef::Client(c), Some(shown)).unwrap();
+                    assert_eq!(
+                        reg.on_query_answer(&answer, key(1)),
+                        LadderResolution::Inconclusive,
+                        "{case}"
+                    );
+                } else {
+                    let applied =
+                        reg.on_resync(&slow_query_cfg(), &caps(), wall(3_000), &[shown], key(1));
+                    assert!(applied.resolved.is_empty(), "{case}");
+                }
+                let rec = reg.get(c).unwrap();
+                assert_eq!(rec.state(), OrdState::Open, "{case}");
+                assert!(rec.unknown_since().is_some(), "{case}");
+                assert_eq!(rec.ladder_step(), Some(LadderStep::Resync), "{case}");
+                assert_eq!(rec.resting(), lots(10), "{case}");
+                assert_eq!(
+                    reg.live(c).unwrap_err(),
+                    PermitRefusal::OnLadder(c),
+                    "{case}"
+                );
+                // A late acknowledgement of the placement settles nothing more.
+                reg.on_outcome(
+                    c,
+                    OrderOp::Place,
+                    &item(None, Some(vid("e1"))),
+                    &accepted(),
+                    at(2_028),
+                )
+                .unwrap();
+                assert!(reg.get(c).unwrap().unknown_since().is_some(), "{case}");
+                assert!(
+                    reg.ladder(&slow_query_cfg(), &caps(), at(2_030)).resync,
+                    "{case}"
+                );
+
+                // The earlier tombstone's final acceptance ends it Canceled.
+                assert_eq!(
+                    reg.on_outcome(
+                        c,
+                        OrderOp::Cancel(RpcId(9)),
+                        &item(Some(c), None),
+                        &accepted(),
+                        at(2_040)
+                    ),
+                    Ok(OutcomeApplied::TombstoneResolved),
+                    "{case}"
+                );
+                assert_eq!(
+                    reg.get(c).unwrap().state(),
+                    OrdState::Terminal(TerminalKind::Canceled(CancelReason::Requested)),
+                    "{case}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn an_order_whose_every_tombstone_was_answered_leaves_the_ladder_as_the_venue_shows_it() {
+    for later in later_tombstone_answers() {
+        let mut reg = Registry::new();
+        let c = unknown(&mut reg);
+        earlier_tombstone_unanswered(&mut reg, c, &later);
+        // The earlier tombstone refused too, but not because the order ended.
+        reg.on_outcome(
+            c,
+            OrderOp::Cancel(RpcId(9)),
+            &item(Some(c), None),
+            &refused(RejectKind::Other),
+            at(2_027),
+        )
+        .unwrap();
+        let shown = snap(Some(c), "e2", VenueOrderState::Open, 0);
+        let answer = QueryAnswer::new(RpcId(1), OrderRef::Client(c), Some(shown)).unwrap();
+        assert_eq!(
+            reg.on_query_answer(&answer, key(1)),
+            LadderResolution::Resolved(OrdState::Open),
+            "{later:?}"
+        );
+        assert!(reg.live(c).is_ok(), "{later:?}");
+    }
+}
+
+#[test]
+fn a_tombstone_whose_fate_is_unknown_or_only_provisionally_accepted_stays_outstanding() {
+    for answer in [
+        SubmitOutcome::Unknown,
+        SubmitOutcome::Accepted {
+            ack: AckLevel::Provisional,
+        },
+    ] {
+        let mut reg = Registry::new();
+        let c = unknown(&mut reg);
+        earlier_tombstone_unanswered(&mut reg, c, &refused(RejectKind::Other));
+        reg.on_outcome(
+            c,
+            OrderOp::Cancel(RpcId(9)),
+            &item(Some(c), None),
+            &answer,
+            at(2_027),
+        )
+        .unwrap();
+        let shown = [snap(Some(c), "e3", VenueOrderState::Open, 0)];
+        let applied = reg.on_resync(&slow_query_cfg(), &caps(), wall(3_000), &shown, key(1));
+        assert!(applied.resolved.is_empty(), "{answer:?}");
+        assert_eq!(
+            reg.live(c).unwrap_err(),
+            PermitRefusal::OnLadder(c),
+            "{answer:?}"
+        );
+    }
+}

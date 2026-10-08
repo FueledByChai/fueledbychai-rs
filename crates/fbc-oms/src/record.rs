@@ -265,6 +265,10 @@ pub struct OrderRecord {
     /// The requests of the tombstone cancels sent while the order is on the ladder: any of
     /// them may answer.
     tombstones: Vec<RpcId>,
+    /// The tombstone cancels sent and not yet answered (not sent, refused, or accepted for
+    /// good): while one is, it may still remove the order, so the order stays on the ladder
+    /// whatever the venue shows of it (FBC-e90m).
+    tombstones_unanswered: Vec<RpcId>,
     /// When the ladder built the order's query: an acknowledged query clears its request's
     /// deadline, so the ladder keeps its own.
     queried_at: Option<MonoNs>,
@@ -315,6 +319,7 @@ impl OrderRecord {
             absent: 0,
             tombstone_at: None,
             tombstones: Vec::new(),
+            tombstones_unanswered: Vec::new(),
             queried_at: None,
             query_rpc: None,
             ladder_cause: None,
@@ -910,6 +915,14 @@ impl OrderRecord {
         if let OrderOp::Cancel(rpc) = op
             && self.tombstones.contains(&rpc)
         {
+            // Not sent or refused, the tombstone removed nothing: it is answered. Unanswered,
+            // or accepted only provisionally, it may still remove the order.
+            if matches!(
+                outcome,
+                SubmitOutcome::NotSent(_) | SubmitOutcome::Rejected(_)
+            ) {
+                self.tombstones_unanswered.retain(|t| *t != rpc);
+            }
             let ended = match outcome {
                 SubmitOutcome::Accepted {
                     ack: AckLevel::Final,
@@ -1052,12 +1065,14 @@ impl OrderRecord {
     /// the one whose fate put a resting order on the Unknown ladder, nothing about the order is
     /// unknown any more and it leaves. A later command settled (a safety cancel failing, a
     /// tombstone refused) leaves the first one's fate open, and an Unknown or PendingNew order
-    /// stays while its placement is the ladder's.
+    /// stays while its placement is the ladder's. A tombstone sent and not yet answered keeps
+    /// the order on the ladder either way ([`Self::tombstone_unanswered`]).
     fn intent_settled(&mut self, rpc: Option<RpcId>) {
         if self.state.rank() > 0
             && !self.state.is_terminal()
             && rpc.is_some()
             && self.ladder_cause == rpc
+            && !self.tombstone_unanswered()
         {
             self.leave_ladder();
         }
@@ -1101,10 +1116,10 @@ impl OrderRecord {
     }
 
     /// Called as the venue shows a PendingNew or Unknown order resting: it leaves the Unknown
-    /// ladder, unless a cancel is in flight on it, whose fate is still the ladder's to settle
-    /// (its tombstone clock running on).
+    /// ladder, unless a cancel is in flight on it, or a tombstone sent is not yet answered,
+    /// whose fate is still the ladder's to settle (its tombstone clock running on).
     fn placement_settled(&mut self) {
-        if self.state.rank() == 0 && self.intent == Intent::None {
+        if self.state.rank() == 0 && self.intent == Intent::None && !self.tombstone_unanswered() {
             self.leave_ladder();
         }
     }
@@ -1125,6 +1140,7 @@ impl OrderRecord {
         self.absent = 0;
         self.tombstone_at = None;
         self.tombstones.clear();
+        self.tombstones_unanswered.clear();
         self.queried_at = None;
         self.query_rpc = None;
         self.ladder_cause = None;
@@ -1193,8 +1209,17 @@ impl OrderRecord {
         let sent = self.cancel_sent(rpc, now);
         if sent {
             self.tombstones.push(rpc);
+            self.tombstones_unanswered.push(rpc);
         }
         sent
+    }
+
+    /// Whether a tombstone cancel was sent and not yet answered: not sent, refused, or
+    /// accepted for good. While one is, the order stays on the ladder (FBC-e90m): a later
+    /// tombstone's refusal clears the command in flight, but this one may still remove the
+    /// order, so neither the venue showing it resting nor a command settling takes it off.
+    pub(crate) fn tombstone_unanswered(&self) -> bool {
+        !self.tombstones_unanswered.is_empty()
     }
 
     fn end(&mut self, kind: TerminalKind) {

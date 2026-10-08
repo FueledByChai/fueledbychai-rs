@@ -31,8 +31,11 @@
 //!    under an id the record does not know.
 //! 3. Still on the ladder after the configured maximum, a tombstone cancel names it by client
 //!    id, and again each maximum after; accepted for good it ends the order Canceled, refused
-//!    because the order already ended, Lost ([`Registry::tombstone_sent`]). A venue whose
-//!    cancels cannot name a client id gets none ([`LadderPlan::no_tombstone`]).
+//!    because the order already ended, Lost ([`Registry::tombstone_sent`]). Until every
+//!    tombstone sent is answered (not sent, refused, or accepted for good), the order stays
+//!    on the ladder whatever a query answer or resync shows of it: an earlier one, unanswered,
+//!    may still remove it after a later one is refused. A venue whose cancels cannot name a
+//!    client id gets none ([`LadderPlan::no_tombstone`]).
 //!
 //! Every number is the consumer's ([`LadderConfig`], decision 0009). The OMS reads no clock:
 //! the consumer runs [`Registry::ladder`] on its journaled timer with the timer's time.
@@ -504,8 +507,10 @@ fn step(
 fn resolve(rec: &mut OrderRecord) -> Option<OrdState> {
     let state = rec.state();
     // Resting is Open or PartiallyFilled: a PendingNew order (a cancel of it unanswered) is
-    // no more settled than an Unknown one.
-    let settled = state.is_terminal() || (state.rank() > 0 && rec.intent() == Intent::None);
+    // no more settled than an Unknown one. A tombstone sent and not yet answered may still
+    // remove the order, even once a later one's refusal cleared the command in flight.
+    let settled = state.is_terminal()
+        || (state.rank() > 0 && rec.intent() == Intent::None && !rec.tombstone_unanswered());
     if settled {
         rec.leave_ladder();
         Some(state)
