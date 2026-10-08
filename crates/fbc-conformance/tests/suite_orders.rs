@@ -115,6 +115,8 @@ enum Twist {
     OpenAgreesAfterAmend,
     /// An amended order's update is followed by a fill of a lot of the order.
     FillsOnAmend,
+    /// An amended order's update is followed by another naming another new venue id.
+    RenamedTwice,
 }
 
 /// The toy with its caps edited by `caps` and its codec twisted by `twist`.
@@ -329,6 +331,10 @@ static OPEN_AGREES_AFTER_AMEND: Variant = Variant {
     caps: |_| {},
     twist: Twist::OpenAgreesAfterAmend,
 };
+static RENAMED_TWICE: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::RenamedTwice,
+};
 static FILLS_ON_AMEND: Variant = Variant {
     caps: |_| {},
     twist: Twist::FillsOnAmend,
@@ -418,6 +424,11 @@ static NOTHING_AMENDABLE: Variant = Variant {
 /// The toy amending quantities only.
 static QTY_ONLY: Variant = Variant {
     caps: |c| amend(c).price = false,
+    twist: Twist::None,
+};
+/// The toy amending prices only.
+static PRICE_ONLY: Variant = Variant {
+    caps: |c| amend(c).qty = false,
     twist: Twist::None,
 };
 static NO_BATCH: Variant = Variant {
@@ -867,6 +878,20 @@ fn fills_on_amend(ev: ExecEvent) -> Vec<ExecEvent> {
     vec![ev, ExecEvent::Fill(fill)]
 }
 
+/// An amended order's update, then another naming another new venue id.
+fn renamed_twice(ev: ExecEvent) -> Vec<ExecEvent> {
+    let ExecEvent::Order(u) = &ev else {
+        return vec![ev];
+    };
+    if !matches!(u.state, VenueOrderState::Amended { .. }) {
+        return vec![ev];
+    }
+    let mut again = u.clone();
+    let new_vid = toy::with_scope(|scope| scope.venue_order_id("toy-other")).ok();
+    again.state = VenueOrderState::Amended { new_vid };
+    vec![ev, ExecEvent::Order(again)]
+}
+
 /// An amended order's update without its new venue id.
 fn no_new_vid(ev: ExecEvent) -> Vec<ExecEvent> {
     vec![match ev {
@@ -1150,6 +1175,7 @@ impl ExecCodec for Twisted {
             Twist::OpenAfterAmend => open_after_amend,
             Twist::OpenAgreesAfterAmend => open_agrees_after_amend,
             Twist::FillsOnAmend => fills_on_amend,
+            Twist::RenamedTwice => renamed_twice,
             _ => kept,
         };
         let sink = &mut Rewrite { inner: sink, f: f_ };
@@ -2097,4 +2123,46 @@ fn the_order_entry_checks_skip_a_venue_taking_no_orders_whose_setup_lists_no_ins
             "{skipped:?}"
         );
     }
+}
+
+#[test]
+fn amend_ack_fails_a_toy_reporting_two_new_venue_ids_for_one_amend() {
+    let failure = failed(suite::amend_ack(&RENAMED_TWICE.subject(assumed)));
+    assert!(
+        says(
+            &failure,
+            "AmendCaps.keeps_venue_id is false",
+            "new venue ids"
+        ),
+        "{failure}"
+    );
+}
+
+/// The toy's setup with its first instrument's grid allowing no price but the harness's, one
+/// tick up overflowing and none below: a band whose step is 2^62 ticks starting at tick 1, then
+/// one starting at 2^62 + 2 whose first multiple, 2^63 + 2 ticks, fits no `i64`.
+fn one_price() -> Setup {
+    let mut setup = assumed();
+    let mut spec = setup.specs.get(toy::INST_A).unwrap().clone();
+    let f = |ticks: i128| rust_decimal::Decimal::from_i128_with_scale(ticks, 18);
+    let bands = [(f(1), f(1 << 62)), (f((1 << 62) + 2), f((1 << 62) + 1))];
+    spec.price_grid = fbc_core::PriceGrid::banded(&bands).unwrap();
+    setup.specs.insert(spec);
+    setup
+}
+
+#[test]
+fn amend_ack_amends_the_quantity_where_no_other_price_is_valid() {
+    let passed = suite::amend_ack(&ToyFactory.subject_for(one_price));
+    assert!(matches!(passed, Ok(Verdict::Passed { .. })), "{passed:?}");
+}
+
+#[test]
+fn amend_ack_skips_a_venue_amending_prices_only_where_no_other_price_is_valid() {
+    let skipped = suite::amend_ack(&PRICE_ONLY.subject(one_price));
+    let why = "no valid price lies one step from the harness's";
+    assert!(
+        matches!(skipped, Ok(Verdict::Skipped { why: w, .. }) if w == why),
+        "{skipped:?}"
+    );
 }

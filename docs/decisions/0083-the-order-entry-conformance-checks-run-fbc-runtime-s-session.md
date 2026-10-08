@@ -38,8 +38,9 @@ venue for the program's life (`ExecSessionConfig::venue` is `&'static dyn VenueF
   flat, started on the setup's first instrument with leases in a directory the check removes,
   and builds and authorizes each place, batch and amend through `Registry::authorize`; what a
   placement's answer brought (its outcomes and every order update, in the order reported) is
-  handed back to it before its amend, so a venue id an update states names the order. A
-  quantity amend goes to twice the order's size, or the instrument's largest order where that
+  handed back to it before its amend, so a venue id an update states names the order. The
+  amend moves the price one valid step where the price is amendable and such a price exists;
+  otherwise a quantity amend goes to twice the order's size, or the instrument's largest order where that
   is less, and is skipped where no other size fits. fbc-conformance depends on fbc-oms,
   and on fbc-journal for the session's nonce source id.
 - **The factory lives for the program.** The three checks take `Subject<'static>` and run
@@ -63,7 +64,7 @@ venue for the program's life (`ExecSessionConfig::venue` is `&'static dyn VenueF
   amended order and leaving it resting (`Amended` or `Open`) states the amended order's, nothing
   filled, the flags the order's and stated where `OrderCaps.events_echo_flags`, the client id
   stated where `OrderCaps.cid_echoed_on_events`, nothing written once the amend is answered, a
-  new venue id only where `AmendCaps.keeps_venue_id` is false, the placement accepted once as
+  new venue id only where `AmendCaps.keeps_venue_id` is false and the same one in every update, the placement accepted once as
   `OrderCaps.ack` has it, and no refusal naming the amended order, update ending it nor fill of
   it once the amend is sent) and what the stub received on every connection: an
   order written once, counted by the frames carrying our client id as the venue's wire spells
