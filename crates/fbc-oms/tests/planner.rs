@@ -954,7 +954,7 @@ fn refuse_cancel(reg: &mut Registry, c: ClientOrderId, rpc: RpcId, refused: &Sub
     assert_eq!(rec.state(), OrdState::Open);
 }
 
-/// FBC-ubsw (Codex on PR #103, r4206675085): a replace whose cancel was sent and came back
+/// FBC-ubsw, decision 0075 (Codex on PR #103, r4206675085): a replace whose cancel was sent and came back
 /// refused or not sent (`refused`) is over; the order still rests, so a later pass wanting a
 /// quote equal to it builds nothing and keeps it, and a later change amends it as usual. A
 /// replace cancel built and not reported sent is still built again at the next pass (0065
@@ -1016,9 +1016,10 @@ fn a_refused_replace_cancel_leaves_the_order_to_be_planned_afresh(refused: Submi
     }
 }
 
-/// FBC-ubsw: a cancel carried through after the acknowledgement (the level pulled before it
-/// and wanted again; 0065 rule 5), sent and then refused or not sent (`refused`), is over
-/// too: the order rests, a quote equal to it builds nothing, and a later change amends it.
+/// FBC-ubsw, decision 0075: a cancel carried through after the acknowledgement (the level
+/// pulled before it and wanted again; 0065 rule 5), sent and then refused or not sent
+/// (`refused`), is over too: the order rests, a quote equal to it builds nothing, and a later
+/// change amends it.
 fn a_refused_carried_through_cancel_leaves_the_order_to_be_planned_afresh(refused: SubmitOutcome) {
     let mut reg = quoting(WIDE, 0);
     let mut mint = mint();
