@@ -35,7 +35,8 @@ use fbc_core::{
 };
 use fbc_oms::{
     CancelChoice, CancelEverything, FillLedger, LadderConfig, LeaseKeys, Leases, LedgerConfig,
-    MarketCapsConfig, OrdState, PreTradeCaps, Registry, Routed, TestnetRun,
+    MarketCapsConfig, OrdState, PreTradeCaps, Registry, ResyncReport, ResyncSnapshot, Routed,
+    TestnetRun,
 };
 use fbc_runtime::http::{Bytes, Method, Request};
 use fbc_runtime::{
@@ -50,7 +51,7 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use tokio::sync::Notify;
 
-use crate::args::{Options, OrderSide, TESTNET_CHAIN, Target, testnet_guard};
+use crate::args::{Options, OrderSide, TESTNET_CHAIN, Target, direct_to_stub, sole, testnet_guard};
 use crate::link::{Link, LinkHandler, Note};
 
 /// Where the lines go: standard output when run, a buffer under test.
@@ -113,6 +114,8 @@ pub async fn run(
     out: Out,
 ) -> Result<Report, String> {
     let target = testnet_guard(&opts.rest_url, &opts.ws_url, chain)?;
+    direct_to_stub(target, &opts.proxy)?;
+    sole(opts)?;
     let lines = Lines {
         out,
         t0: Instant::now(),
@@ -190,7 +193,8 @@ pub async fn run(
         )
     };
     let ns_lease = NamespaceLease::acquire(&opts.lease_dir, ACCT, NS).map_err(|e| held(&e))?;
-    let mint = CidMint::new(ns_lease, 0, 0, wall_now());
+    let hwm = HighWater::at(&opts.lease_dir);
+    let mint = CidMint::new(ns_lease, hwm.read()?, 0, wall_now());
     let market = MarketLease::acquire(&opts.lease_dir, VENUE, ACCOUNT_LABEL, &symbol)
         .map_err(|e| held(&e))?;
     let mut leases = Leases::market(market);
@@ -231,6 +235,7 @@ pub async fn run(
         lines: lines.clone(),
         timeout: Duration::from_secs(opts.step_timeout_secs),
         hold: Duration::from_secs(opts.hold_secs),
+        hwm,
         told: std::cell::Cell::new(0),
     };
     let order = Planned {
@@ -510,6 +515,57 @@ fn session_config(
     })
 }
 
+/// The latest resync applied: once the session takes places, the one whose end opened the
+/// current epoch's gate, never an earlier epoch's.
+pub fn latest_resync(notes: &[Note]) -> Option<(&ResyncReport, &ResyncSnapshot)> {
+    notes.iter().rev().find_map(|n| match n {
+        Note::Resynced { report, snapshot } => Some((report, snapshot)),
+        _ => None,
+    })
+}
+
+/// The client-id mint's high-water mark, kept in a file of the lease directory across runs, so
+/// a run whose wall clock stepped back never mints an id an earlier run used (the namespace
+/// lease keeps two minters apart, not two runs).
+pub struct HighWater {
+    path: std::path::PathBuf,
+}
+
+impl HighWater {
+    /// The mark kept in `dir`.
+    pub fn at(dir: &std::path::Path) -> HighWater {
+        let name = format!("cid-high-water-account-{}-ns-{}", ACCT.get(), NS.get());
+        HighWater {
+            path: dir.join(name),
+        }
+    }
+
+    /// The mark kept, 0 when none was.
+    pub fn read(&self) -> Result<u64, String> {
+        match fs::read_to_string(&self.path) {
+            Ok(text) => text
+                .trim()
+                .parse()
+                .map_err(|_| format!("{}: not a high-water mark", self.path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(e) => Err(format!("{}: {e}", self.path.display())),
+        }
+    }
+
+    /// Keeps `mark`, written whole to a file beside it and renamed over the mark.
+    pub fn write(&self, mark: u64) -> Result<(), String> {
+        let tmp = self.path.with_extension("tmp");
+        fs::write(&tmp, mark.to_string())
+            .and_then(|()| fs::rename(&tmp, &self.path))
+            .map_err(|e| {
+                format!(
+                    "{}: cannot keep the client-id high-water mark: {e}",
+                    self.path.display()
+                )
+            })
+    }
+}
+
 /// The order to place: its side, price and size.
 struct Planned {
     side: Side,
@@ -525,6 +581,8 @@ struct Driver {
     lines: Lines,
     timeout: Duration,
     hold: Duration,
+    /// Where the client-id high-water mark is kept.
+    hwm: HighWater,
     /// How many of the link's notes were looked at for [`Driver::tell`].
     told: std::cell::Cell<usize>,
 }
@@ -663,8 +721,8 @@ impl Driver {
                 if !orders.may_place() {
                     return None;
                 }
-                l.notes().iter().find_map(|n| match n {
-                    Note::Resynced { report, snapshot } => Some((
+                latest_resync(l.notes()).map(|(report, snapshot)| {
+                    (
                         report.untrustworthy,
                         snapshot.orders.iter().filter(|o| o.inst == INST).count(),
                         snapshot.orders.len(),
@@ -673,8 +731,7 @@ impl Driver {
                             .iter()
                             .find(|(inst, _)| *inst == INST)
                             .map_or(SignedLots(0), |(_, qty)| *qty),
-                    )),
-                    _ => None,
+                    )
                 })
             })
             .await;
@@ -740,6 +797,11 @@ impl Driver {
                 return false;
             }
         };
+        // Kept before the id goes out, so no later run mints it again.
+        if let Err(e) = self.hwm.write(mint.high_water()) {
+            self.note(format_args!("{e}; nothing placed"));
+            return false;
+        }
         let placed = {
             let mut link = self.link.borrow_mut();
             let new = NewOrder {

@@ -23,6 +23,11 @@ Environment (read once at start; no value is ever printed):
                             key, not a trading subkey
   PARADEX_CHAIN_ID          optional; when set it must be PRIVATE_SN_POTC_SEPOLIA (testnet)
 
+Required confirmation:
+  --sole-trader             you confirm that no other process, Java or Rust, trades this
+                            account (the lease files guard only against another testnet_trade
+                            using the same --lease-dir); refused without it
+
 The market (required; read them from GET https://api.testnet.paradex.trade/v1/markets):
   --market <MARKET>         the Paradex market, e.g. BTC-USD-PERP
   --tick <DEC>              its price_tick_size, e.g. 0.1
@@ -41,8 +46,10 @@ Options:
   --rest-url <URL>          REST base (default https://api.testnet.paradex.trade/v1)
   --ws-url <URL>            order-entry WebSocket, without a query
                             (default wss://ws.api.testnet.paradex.trade/v1)
-  --socks5 <HOST:PORT>      connect through this SOCKS5 proxy (default: directly)
-  --lease-dir <DIR>         where the market, account and client-id leases are taken
+  --socks5 <HOST:PORT>      connect through this SOCKS5 proxy (default: directly); refused
+                            with loopback stub URLs, which the proxy would resolve on its host
+  --lease-dir <DIR>         where the market, account and client-id leases are taken, and the
+                            client-id high-water mark is kept across runs
                             (default: <temp dir>/fbc-testnet-trade)
   -h, --help                print this help
 
@@ -109,6 +116,8 @@ pub struct Options {
     pub ws_url: String,
     pub proxy: ProxyConfig,
     pub lease_dir: PathBuf,
+    /// The owner's confirmation that no other process trades the account.
+    pub sole_trader: bool,
 }
 
 /// What the command line asked for.
@@ -131,6 +140,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     let mut ws_url = TESTNET_WS.to_owned();
     let mut proxy = ProxyConfig::Direct;
     let mut lease_dir = std::env::temp_dir().join("fbc-testnet-trade");
+    let mut sole_trader = false;
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         if flag == "-h" || flag == "--help" {
@@ -142,6 +152,10 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
                 .filter(|v| !v.is_empty() && !v.starts_with("--"))
                 .ok_or_else(|| format!("{flag} needs a value"))
         };
+        if flag == "--sole-trader" {
+            sole_trader = true;
+            continue;
+        }
         match flag.as_str() {
             "--market" => market = Some(symbol(&value()?)?),
             "--tick" => tick = Some(positive(&flag, &value()?)?),
@@ -184,8 +198,11 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         ws_url,
         proxy,
         lease_dir,
+        sole_trader,
     };
-    testnet_urls(&opts.rest_url, &opts.ws_url)?;
+    let target = testnet_urls(&opts.rest_url, &opts.ws_url)?;
+    direct_to_stub(target, &opts.proxy)?;
+    sole(&opts)?;
     Ok(Parsed::Trade(Box::new(opts)))
 }
 
@@ -215,6 +232,34 @@ pub fn testnet_guard(rest: &str, ws: &str, chain: Option<&str>) -> Result<Target
         }
     }
     Ok(target)
+}
+
+/// Refuses a SOCKS5 proxy with loopback stub URLs: the proxy would connect to its own host's
+/// loopback, not this machine's, and hand it the login and the signed orders.
+pub fn direct_to_stub(target: Target, proxy: &ProxyConfig) -> Result<(), String> {
+    match (target, proxy) {
+        (Target::LoopbackStub, ProxyConfig::Socks5 { .. }) => Err(
+            "--socks5 with loopback stub URLs: the proxy would reach its own host's loopback, \
+             not this machine's; connect to a stub directly"
+                .to_owned(),
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// Refuses a run the owner has not confirmed is the account's only trader (`--sole-trader`):
+/// one quoter per market and account, and the lease files see only another testnet_trade
+/// sharing the lease directory, never a Java or Rust process trading the account elsewhere.
+pub fn sole(opts: &Options) -> Result<(), String> {
+    if opts.sole_trader {
+        Ok(())
+    } else {
+        Err(
+            "--sole-trader is required: confirm that no other process, Java or Rust, trades \
+             this account (the leases cannot see one that does not share --lease-dir)"
+                .to_owned(),
+        )
+    }
 }
 
 /// The URL half of [`testnet_guard`].

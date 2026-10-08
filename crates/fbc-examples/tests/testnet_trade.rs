@@ -102,6 +102,7 @@ fn options(stub: &StubServer, min_notional: &str) -> Options {
         ws_url: stub.ws_url("/v1"),
         proxy: ProxyConfig::Direct,
         lease_dir: lease_dir(),
+        sole_trader: true,
     }
 }
 
@@ -498,7 +499,8 @@ fn strings(args: &[&str]) -> Vec<String> {
     args.iter().map(|a| (*a).to_owned()).collect()
 }
 
-const MARKET_ARGS: [&str; 8] = [
+const MARKET_ARGS: [&str; 9] = [
+    "--sole-trader",
     "--market",
     "BTC-USD-PERP",
     "--tick",
@@ -540,6 +542,27 @@ fn the_command_line_defaults_to_testnet_and_refuses_mainnet_urls() {
             .contains("one is a loopback stub")
     );
     // Every market flag is required, and the bounds hold.
+    let mut argv = strings(&MARKET_ARGS);
+    argv.remove(0);
+    assert!(
+        args::parse(argv)
+            .unwrap_err()
+            .starts_with("--sole-trader is required")
+    );
+    let mut argv = strings(&MARKET_ARGS);
+    argv.extend(strings(&[
+        "--rest-url",
+        "http://127.0.0.1:9/v1",
+        "--ws-url",
+        "ws://127.0.0.1:9/v1",
+        "--socks5",
+        "proxy.example:1080",
+    ]));
+    assert!(
+        args::parse(argv)
+            .unwrap_err()
+            .starts_with("--socks5 with loopback stub URLs")
+    );
     for missing in ["--market", "--tick", "--step", "--min-notional"] {
         let i = MARKET_ARGS.iter().position(|a| *a == missing).unwrap();
         let mut argv = strings(&MARKET_ARGS);
@@ -592,6 +615,7 @@ fn help_names_the_environment_the_flags_and_every_line() {
         "--ws-url",
         "--socks5",
         "--lease-dir",
+        "--sole-trader",
         "STEP login",
         "STEP arm",
         "STEP resync",
@@ -633,4 +657,90 @@ fn credentials_come_from_the_two_variables_and_a_missing_one_is_named_not_shown(
         "{err}"
     );
     assert!(!err.contains(&key[2..]));
+}
+
+#[tokio::test]
+async fn a_run_without_the_sole_trader_confirmation_or_through_a_proxy_to_a_stub_is_refused() {
+    let stub = StubServer::start(WsScript::new(vec![]), routes())
+        .await
+        .unwrap();
+    let mut opts = options(&stub, "10");
+    opts.sole_trader = false;
+    let out: trade::Out = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let refused = trade::run(&opts, None, secrets(), out).await.unwrap_err();
+    assert!(
+        refused.starts_with("--sole-trader is required"),
+        "{refused}"
+    );
+    // A SOCKS5 proxy would reach its own host's loopback, not the stub on this machine.
+    let mut opts = options(&stub, "10");
+    opts.proxy = ProxyConfig::Socks5 {
+        host: "127.0.0.1".to_owned(),
+        port: 9,
+    };
+    let out: trade::Out = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let refused = trade::run(&opts, None, secrets(), out).await.unwrap_err();
+    assert!(
+        refused.starts_with("--socks5 with loopback stub URLs"),
+        "{refused}"
+    );
+    assert!(stub.connections().is_empty());
+    assert!(stub.http_requests().is_empty());
+}
+
+#[tokio::test]
+async fn the_client_id_high_water_mark_is_read_before_minting_and_kept_after() {
+    // A mark far above the wall-clock floor, as an earlier run would leave after its clock ran
+    // ahead: the run mints above it and keeps the new mark before the place goes out.
+    let placed = Arc::new(Mutex::new(Placed::default()));
+    let stub = StubServer::start(script(Arc::clone(&placed)), routes())
+        .await
+        .unwrap();
+    let opts = options(&stub, "10");
+    let hwm = trade::HighWater::at(&opts.lease_dir);
+    let mark = 1u64 << 60;
+    hwm.write(mark).unwrap();
+    let (report, printed) = run_against(&opts).await;
+    assert!(report.ok, "{printed}");
+    assert_eq!(hwm.read().unwrap(), mark + 1);
+    // A mark that is not a number is refused before anything is sent.
+    fs::write(
+        opts.lease_dir.join("cid-high-water-account-1-ns-1"),
+        "not a number",
+    )
+    .unwrap();
+    let dir = opts.lease_dir.clone();
+    let stub = StubServer::start(WsScript::new(vec![]), routes())
+        .await
+        .unwrap();
+    let mut opts = options(&stub, "10");
+    opts.lease_dir = dir;
+    let out: trade::Out = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let refused = trade::run(&opts, None, secrets(), out).await.unwrap_err();
+    assert!(refused.contains("not a high-water mark"), "{refused}");
+    assert!(stub.connections().is_empty());
+}
+
+#[test]
+fn the_resync_the_run_seeds_from_is_the_latest() {
+    use fbc_core::{InstrumentId, MonoNs, SignedLots, WallNs};
+    use fbc_oms::{ResyncReport, ResyncSnapshot};
+    let resynced = |pos: i64| link::Note::Resynced {
+        report: ResyncReport::default(),
+        snapshot: ResyncSnapshot {
+            watermark: WallNs(pos),
+            requested_at: MonoNs(0),
+            orders: Vec::new(),
+            positions: vec![(InstrumentId::new(1), SignedLots(pos))],
+        },
+    };
+    assert!(trade::latest_resync(&[]).is_none());
+    // An earlier epoch's resync, a reconnect, then the current epoch's.
+    let notes = [
+        resynced(3),
+        link::Note::EpochEnd(fbc_core::ConnKey { conn: 0, epoch: 1 }),
+        resynced(-2),
+    ];
+    let (_, snap) = trade::latest_resync(&notes).unwrap();
+    assert_eq!(snap.positions, [(InstrumentId::new(1), SignedLots(-2))]);
 }
