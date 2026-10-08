@@ -19,7 +19,11 @@
 //!   through the [`FillLedger`] and, accepted, to [`Registry::apply_fill`]. The `Resync*` events
 //!   are collected into one [`ResyncSnapshot`] and applied at `ResyncEnd`
 //!   ([`Registry::resync`]); its `requested_at` is the receive time of the event reporting the
-//!   socket authenticated, which comes before the session asks for the resync.
+//!   socket authenticated, which comes before the session asks for the resync. A snapshot the
+//!   registry refuses is noted as refused ([`Note::ResyncRefused`]): the session opened its
+//!   gate at `ResyncEnd` all the same, so the driver must not place on it.
+//!   An order event of an order in our namespace that the registry does not hold is noted as
+//!   such ([`Note::Orphan`]): Stop would not cancel it nor the run count its fills.
 //!   The account's position events are noted as they come, for the driver to compare with
 //!   the position it seeded.
 //! - **Notes.** Everything the driver may wait on is appended to [`Link::notes`], in order.
@@ -35,8 +39,9 @@ use std::rc::Rc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fbc_core::{
-    ClientOrderId, ConnKey, ConnState, Envelope, ExecEvent, InstrumentId, ItemRef, MonoNs,
-    NotSentReason, OrderCaps, RpcId, SignedLots, SubmitHandle, SubmitOutcome, VenueCommand, WallNs,
+    CidMatch, ClientOrderId, ConnKey, ConnState, Envelope, ExecEvent, InstrumentId, ItemRef,
+    MonoNs, NotSentReason, OrderCaps, RpcId, SignedLots, SubmitHandle, SubmitOutcome, VenueCommand,
+    VenueOrderId, WallNs,
 };
 use fbc_oms::{
     Admission, Authorization, FillLedger, FillRouted, FillTime, LadderConfig, OrderKey, OrderOp,
@@ -64,8 +69,15 @@ pub enum Note {
         rpc: RpcId,
         sent: Result<(), NotSentReason>,
     },
-    /// An order event, where it went.
+    /// An order event, where it went: anything but an order in our namespace that the
+    /// registry does not hold ([`Note::Orphan`]).
     Order(Routed),
+    /// An order event of an order in our namespace that the registry does not hold (an
+    /// earlier run's the resync did not show): its client id and venue id.
+    Orphan {
+        cid: ClientOrderId,
+        vid: Option<VenueOrderId>,
+    },
     /// A fill, where it went (or why the ledger did not apply it): `unexplained` unless it was
     /// counted on an order of ours, held by the resync's position, or one the ledger already
     /// held (a duplicate, or a replay the starting position holds).
@@ -77,6 +89,8 @@ pub enum Note {
         report: ResyncReport,
         snapshot: ResyncSnapshot,
     },
+    /// A resync the registry refused, and why: nothing of it was applied.
+    ResyncRefused(String),
     /// A refusal from the venue that no outcome carries, or something the glue could not apply.
     Problem(String),
     /// A connection epoch ended.
@@ -349,7 +363,7 @@ impl Link {
         let key = OrderKey { venue, ingest };
         match self.reg.resync(&self.ladder, &self.caps, &snapshot, key) {
             Ok(report) => self.notes.push(Note::Resynced { report, snapshot }),
-            Err(e) => self.problem(format!("resync refused: {e:?}")),
+            Err(e) => self.notes.push(Note::ResyncRefused(e.to_string())),
         }
     }
 
@@ -362,8 +376,13 @@ impl Link {
         match env.body {
             ExecEvent::Outcome { rpc, item, outcome } => self.on_outcome(rpc, item, outcome, now),
             ExecEvent::Order(u) => {
-                let routed = self.reg.apply_update(&u, key);
-                self.notes.push(Note::Order(routed));
+                let note = match (self.reg.apply_update(&u, key), u.cid) {
+                    (Routed::Untracked, Some(CidMatch::Ours(cid))) => {
+                        Note::Orphan { cid, vid: u.vid }
+                    }
+                    (routed, _) => Note::Order(routed),
+                };
+                self.notes.push(note);
             }
             ExecEvent::Fill(f) => {
                 let time = env.exch_ts.map(|exch| FillTime {
