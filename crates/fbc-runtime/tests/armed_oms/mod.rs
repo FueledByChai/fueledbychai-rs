@@ -89,8 +89,9 @@ impl VenueFactory for Held {
         Ok(Vec::new())
     }
 
-    fn md_codec(&self, _: &VenueConfig, _: &EndpointPlan) -> Box<dyn MdCodec> {
-        Box::new(exec_toy::NoMd)
+    /// Never built: nothing is planned for market data. The conformance toy's codec stands in.
+    fn md_codec(&self, _: &VenueConfig, ep: &EndpointPlan) -> Box<dyn MdCodec> {
+        Box::new(exec_toy::ToyMd::new(ep.stream))
     }
 
     fn plan_exec(&self, cfg: &VenueConfig) -> Result<Vec<ExecEndpoint>, VenueError> {
