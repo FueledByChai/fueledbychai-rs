@@ -72,7 +72,7 @@ ws.api.testnet.paradex.trade) or a loopback host (127.0.0.0/8, ::1, localhost: a
 anything else, mainnet included, is refused, as is any chain id but PRIVATE_SN_POTC_SEPOLIA.
 
 Lines (each step with the milliseconds since the start):
-  TESTNET ...        what the guard accepted
+  TESTNET ...        the hosts the guard accepted (never the URLs: a path may carry a token)
   OWNER-ASSISTED ... this is a declared owner-assisted testnet run (decision 0067)
   BBO ...            the touch read from GET /orderbook before the order is priced
   BBO again ...      the touch read again just before the place: the order must still be
@@ -127,6 +127,9 @@ fn is_testnet_chain(chain: &str) -> bool {
         || chain == TESTNET_CHAIN_DECIMAL
         || hex.as_deref() == Some(TESTNET_CHAIN_HEX)
 }
+
+/// Ends a refusal of a value: what was typed is never shown, as it may be a pasted secret.
+const UNSHOWN: &str = " (the value is not shown: it may be a secret)";
 
 /// The environment variable of the chain id (optional).
 pub const CHAIN_VAR: &str = "PARADEX_CHAIN_ID";
@@ -188,12 +191,16 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     let mut lease_dir = None;
     let mut sole_trader = false;
     let mut args = args.into_iter();
+    // The position of the argument read last, from 1: a refusal names it, not what was typed.
+    let mut at = 0usize;
     while let Some(flag) = args.next() {
+        at += 1;
         if flag == "-h" || flag == "--help" {
             return Ok(Parsed::Help);
         }
         // A value that starts with `--` is the next flag: the value was left out.
         let mut value = || {
+            at += 1;
             args.next()
                 .filter(|v| !v.is_empty() && !v.starts_with("--"))
                 .ok_or_else(|| format!("{flag} needs a value"))
@@ -210,7 +217,11 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
                 let v = value()?;
                 match v.parse::<Decimal>() {
                     Ok(d) if d >= Decimal::ZERO => min_notional = Some(d),
-                    _ => return Err(format!("--min-notional {v}: not a decimal of 0 or more")),
+                    _ => {
+                        return Err(format!(
+                            "--min-notional: not a decimal of 0 or more{UNSHOWN}"
+                        ));
+                    }
                 }
             }
             "--resting-cap-usd" => resting_cap_usd = Some(positive(&flag, &value()?)?),
@@ -221,7 +232,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
                 side = Some(match value()?.as_str() {
                     "buy" => OrderSide::Buy,
                     "sell" => OrderSide::Sell,
-                    other => return Err(format!("--side {other}: not buy or sell")),
+                    _ => return Err(format!("--side: not buy or sell{UNSHOWN}")),
                 })
             }
             "--away-bps" => away_bps = Some(bounded(&flag, &value()?, 100, 2000)? as u32),
@@ -231,7 +242,16 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             "--ws-url" => ws_url = value()?,
             "--socks5" => proxy = socks5(&value()?)?,
             "--lease-dir" => lease_dir = Some(PathBuf::from(value()?)),
-            _ => return Err(format!("unknown argument {flag}; --help lists them")),
+            // A flag (it starts with '-') is named; anything else may be a pasted secret.
+            _ if flag.starts_with('-') => {
+                return Err(format!("unknown argument {flag}; --help lists them"));
+            }
+            _ => {
+                return Err(format!(
+                    "argument {at}: not a flag (the argument is not shown: it may be a secret); \
+                     --help lists them"
+                ));
+            }
         }
     }
     let need = |name: &str| format!("{name} is required; --help says where to read it");
@@ -294,10 +314,12 @@ pub fn testnet_guard(rest: &str, ws: &str, chain: Option<&str>) -> Result<Target
     match chain {
         None => {}
         Some(chain) if is_testnet_chain(chain) => {}
-        Some(other) => {
+        // The value is never shown: a private key pasted there by mistake would be printed.
+        Some(_) => {
             return Err(format!(
-                "{CHAIN_VAR}={other}: not the testnet chain id {TESTNET_CHAIN}; testnet_trade \
-                 never signs for another chain (mainnet is PRIVATE_SN_PARACLEAR_MAINNET)"
+                "{CHAIN_VAR}: not the testnet chain id {TESTNET_CHAIN} (the value is not shown: \
+                 it may be a secret); testnet_trade never signs for another chain (mainnet is \
+                 PRIVATE_SN_PARACLEAR_MAINNET)"
             ));
         }
     }
@@ -344,10 +366,18 @@ pub fn within_cap(opts: &Options) -> Result<(), String> {
     }
 }
 
+/// The hosts of the REST and WebSocket URLs, all of them a run prints: an accepted URL's path
+/// may still carry a token.
+pub fn hosts(rest: &str, ws: &str) -> Result<(String, String), String> {
+    Ok((
+        host_of(rest, &["https://", "http://"], "--rest-url")?,
+        host_of(ws, &["wss://", "ws://"], "--ws-url")?,
+    ))
+}
+
 /// The URL half of [`testnet_guard`].
 fn testnet_urls(rest: &str, ws: &str) -> Result<Target, String> {
-    let rest_host = host_of(rest, &["https://", "http://"], "--rest-url")?;
-    let ws_host = host_of(ws, &["wss://", "ws://"], "--ws-url")?;
+    let (rest_host, ws_host) = hosts(rest, ws)?;
     let loopback = |host: &str| {
         host == "localhost"
             || host == "[::1]"
@@ -426,8 +456,8 @@ fn symbol(value: &str) -> Result<String, String> {
         Ok(value.to_owned())
     } else {
         Err(format!(
-            "--market {value}: not a market as Paradex spells it (letters, digits and '-', e.g. \
-             BTC-USD-PERP)"
+            "--market: not a market as Paradex spells it (letters, digits and '-', e.g. \
+             BTC-USD-PERP){UNSHOWN}"
         ))
     }
 }
@@ -437,7 +467,7 @@ fn bounded(flag: &str, value: &str, lo: u64, hi: u64) -> Result<u64, String> {
     match value.parse::<u64>() {
         Ok(n) if (lo..=hi).contains(&n) => Ok(n),
         _ => Err(format!(
-            "{flag} {value}: not a whole number from {lo} to {hi}"
+            "{flag}: not a whole number from {lo} to {hi}{UNSHOWN}"
         )),
     }
 }
@@ -466,6 +496,6 @@ fn socks5(value: &str) -> Result<ProxyConfig, String> {
 fn positive(flag: &str, value: &str) -> Result<Decimal, String> {
     match value.parse::<Decimal>() {
         Ok(d) if d > Decimal::ZERO => Ok(d),
-        _ => Err(format!("{flag} {value}: not a positive decimal")),
+        _ => Err(format!("{flag}: not a positive decimal{UNSHOWN}")),
     }
 }

@@ -68,7 +68,9 @@ use rust_decimal::prelude::ToPrimitive;
 use std::sync::mpsc;
 use tokio::sync::Notify;
 
-use crate::args::{Options, OrderSide, TESTNET_CHAIN, Target, direct_to_stub, sole, testnet_guard};
+use crate::args::{
+    Options, OrderSide, TESTNET_CHAIN, Target, direct_to_stub, hosts, sole, testnet_guard,
+};
 use crate::link::{Link, LinkHandler, Note};
 
 /// Where the lines go: standard output when run, a buffer under test.
@@ -166,9 +168,10 @@ pub async fn run(
         Target::Testnet => "Paradex testnet",
         Target::LoopbackStub => "a loopback test stub, not Paradex",
     };
+    // The hosts only: an accepted URL's path may still carry a token.
+    let (rest_host, ws_host) = hosts(&opts.rest_url, &opts.ws_url)?;
     lines.line(format_args!(
-        "TESTNET {what}: REST {} WS {} chain {TESTNET_CHAIN}",
-        opts.rest_url, opts.ws_url
+        "TESTNET {what}: REST host {rest_host} WS host {ws_host} chain {TESTNET_CHAIN}"
     ));
     lines.line(format_args!(
         "OWNER-ASSISTED testnet run (decision 0067): Paradex's snapshot source is untrustworthy, \
@@ -870,6 +873,52 @@ pub fn restored_baseline(snapshot: &ResyncSnapshot) -> Vec<(ClientOrderId, Lots)
         .collect()
 }
 
+/// Why the place must not go out, judged just before it with nothing awaited in between, or
+/// `None`:
+/// - `gate_open` false: the order socket's current connection does not take places yet (a
+///   reconnect since the resync step, its own resync still to end). That resync has left no
+///   note for the audit to judge, and a place queued now would go out once it ends, against
+///   an inventory it may contradict.
+/// - `changes` ([`account_changes`]) not empty: the account changed since the seed (a
+///   reconnect's resync disagreeing or refused, a position event, a fill not of ours, an order
+///   of ours the registry does not hold, an order of ours that filled since the run took it
+///   on) or an order not ours was reported, so the caps would judge the place against an
+///   inventory that is no longer the account's. The run's end reports what it was.
+/// - `same_side` ([`resting_on_side`]) not empty: an order of ours (an earlier run's, restored
+///   by the resync) still rests on the order's side. The registry sums resting lots on a side
+///   and the resting cap is in lots at the new order's price, so one resting nearer the touch
+///   would count at less than its own price and the dollars resting could exceed
+///   --resting-cap-usd. Stop cancels them.
+pub fn place_refusal(
+    gate_open: bool,
+    changes: &[String],
+    same_side: &[(ClientOrderId, Lots)],
+) -> Option<String> {
+    if !gate_open {
+        return Some(
+            "the order socket's current connection takes no place yet (a reconnect since the \
+             resync step, its resync not ended): the audit cannot judge what that resync finds"
+                .to_owned(),
+        );
+    }
+    if !changes.is_empty() {
+        return Some(
+            "the account changed since the seed, an order of ours traded, or an order not ours \
+             is in view"
+                .to_owned(),
+        );
+    }
+    if !same_side.is_empty() {
+        let lots: i64 = same_side.iter().map(|(_, l)| l.get()).sum();
+        return Some(format!(
+            "{} orders of ours ({lots} lots) rest on the order's side: the resting cap is \
+             counted in lots at the order's price, not theirs; cancel them first",
+            same_side.len()
+        ));
+    }
+    None
+}
+
 /// Those of `owned` (our orders on the market) resting on `side`, each with what of it rests
 /// ([`OrderRecord::resting`](fbc_oms::OrderRecord::resting)); one the registry does not hold
 /// is not among them.
@@ -1353,38 +1402,22 @@ impl Driver {
                 return false;
             }
         }
-        // The account changed since the seed (a reconnect's resync disagreeing or refused, a
-        // position event, a fill not of ours, an order of ours the registry does not hold, an
-        // order of ours that filled since the run took it on) or an order not ours came into
-        // view: the caps would judge the place against an
-        // inventory that is no longer the account's, so nothing is placed. The run's end
-        // reports what it was. Nothing waits between this audit and the place below.
-        if !self.account_changes().is_empty() {
-            self.note(format_args!(
-                "the account changed since the seed, an order of ours traded, or an order not \
-                 ours is in view; nothing placed"
-            ));
-            return false;
-        }
-
-        // An order of ours (an earlier run's, restored by the resync) still resting on the
-        // order's side: the registry sums resting lots on a side, and the resting cap is in
-        // lots at the new order's price, so one resting nearer the touch would count at less
-        // than its own price and the dollars resting could exceed --resting-cap-usd. Nothing is
-        // placed until they are cancelled (Stop cancels them). Nothing waits between this and
-        // the place below.
-        let same_side = {
+        // The last checks, with nothing awaited between them and the place below
+        // ([`place_refusal`]): the current connection's gate, the account audit, and an
+        // order of ours resting on the order's side.
+        let refusal = {
             let link = self.link.borrow();
-            resting_on_side(link.registry(), &self.owned, order.side)
+            let changes = account_changes(
+                link.notes(),
+                link.registry(),
+                self.start_position,
+                &self.owned,
+            );
+            let same_side = resting_on_side(link.registry(), &self.owned, order.side);
+            place_refusal(self.orders.may_place(), &changes, &same_side)
         };
-        if !same_side.is_empty() {
-            let lots: i64 = same_side.iter().map(|(_, l)| l.get()).sum();
-            self.note(format_args!(
-                "{} orders of ours ({lots} lots) rest on the order's side: the resting cap is \
-                 counted in lots at the order's price, not theirs; cancel them first; nothing \
-                 placed",
-                same_side.len()
-            ));
+        if let Some(why) = refusal {
+            self.note(format_args!("{why}; nothing placed"));
             return false;
         }
 
