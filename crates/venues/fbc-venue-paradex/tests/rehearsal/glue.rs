@@ -3,7 +3,8 @@
 //! the venue's sequence, fills through the [`FillLedger`], the `Resync*` events collected into
 //! one [`ResyncSnapshot`] applied at `ResyncEnd`), and the one path commands take to the
 //! session, so the registry knows which request each answer names. What the session reported is
-//! kept in order in [`Glue::notes`], which the tests read.
+//! kept in order in [`Glue::notes`], which the tests read, with each change of whether the
+//! session takes places ([`ExecOrders::may_place`]) as it is handed the event that made it.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -19,6 +20,7 @@ use fbc_oms::{
     Registry, ResyncReport, ResyncSnapshot, Routed,
 };
 use fbc_runtime::{ExecHandler, ExecOrders};
+use tokio::sync::Notify;
 
 /// Something the session reported, as the glue saw it. Every field shows in a failing test's
 /// notes, read or not.
@@ -50,6 +52,10 @@ pub enum Note {
     Problem(String),
     /// A connection epoch ended.
     EpochEnd(ConnKey),
+    /// Whether the session takes places and amends changed ([`ExecOrders::may_place`]), read
+    /// after each event and each epoch's end the handler is handed: it begins to once the
+    /// epoch's arm is accepted and its resync has ended, whichever comes last.
+    Placing(bool),
 }
 
 /// One item of a submitted command.
@@ -68,7 +74,13 @@ pub struct Glue {
     collecting: Option<ResyncSnapshot>,
     authenticated_at: Option<MonoNs>,
     origin: Instant,
+    /// The session's orders, watched for [`Note::Placing`] once [`Glue::watch`] hands them over.
+    orders: Option<ExecOrders>,
+    placing: bool,
     pub notes: Vec<Note>,
+    /// Woken each time the session has handed the handler something, so a test waits on what
+    /// happened rather than on a clock.
+    pub changed: Rc<Notify>,
 }
 
 impl Glue {
@@ -82,7 +94,27 @@ impl Glue {
             collecting: None,
             authenticated_at: None,
             origin: Instant::now(),
+            orders: None,
+            placing: false,
             notes: Vec::new(),
+            changed: Rc::new(Notify::new()),
+        }
+    }
+
+    /// Watches `orders` (the session's) for whether the session takes places.
+    pub fn watch(&mut self, orders: ExecOrders) {
+        self.placing = orders.may_place();
+        self.orders = Some(orders);
+    }
+
+    /// Notes a change of whether the session takes places.
+    fn note_placing(&mut self) {
+        let Some(placing) = self.orders.as_ref().map(ExecOrders::may_place) else {
+            return;
+        };
+        if placing != self.placing {
+            self.placing = placing;
+            self.notes.push(Note::Placing(placing));
         }
     }
 
@@ -323,14 +355,22 @@ pub struct GlueHandler(pub Rc<RefCell<Glue>>);
 
 impl ExecHandler for GlueHandler {
     fn on_exec(&mut self, env: Envelope<ExecEvent>) {
-        self.0.borrow_mut().on_event(env);
+        let mut glue = self.0.borrow_mut();
+        glue.on_event(env);
+        glue.note_placing();
+        glue.changed.notify_waiters();
     }
 
     fn on_epoch_end(&mut self, key: ConnKey) {
-        self.0.borrow_mut().notes.push(Note::EpochEnd(key));
+        let mut glue = self.0.borrow_mut();
+        glue.notes.push(Note::EpochEnd(key));
+        glue.note_placing();
+        glue.changed.notify_waiters();
     }
 
     fn on_submitted(&mut self, handle: SubmitHandle) {
-        self.0.borrow_mut().on_submitted(handle);
+        let mut glue = self.0.borrow_mut();
+        glue.on_submitted(handle);
+        glue.changed.notify_waiters();
     }
 }
