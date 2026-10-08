@@ -13,7 +13,8 @@
 //!   such update, and every `Open` one naming the order once the amend is sent, is judged:
 //!   every identity it states is the order's, and every field the amend's (nothing filled, the
 //!   flags the order's, stated where `events_echo_flags`). A venue
-//!   allowing no limit order is skipped. The client id is stated where
+//!   allowing no limit order good till cancelled is skipped. The amend's acceptance names no
+//!   venue id but one the order goes by. The client id is stated where
 //!   `cid_echoed_on_events`, and nothing is written beyond the two requests. Where the amended order gets a new venue id
 //!   (`AmendCaps.keeps_venue_id` false), every update names the same one; where it keeps its id, the update
 //!   names no new one. The placement's acceptance is its one item's, or the whole request's,
@@ -34,7 +35,7 @@ use std::time::Duration;
 
 use fbc_core::{
     AckLevel, AckModel, AmendAck, AmendCaps, CidMatch, ClientOrderId, ExecEvent, ItemRef, Lots,
-    OpKind, OrderKindTag, OrderUpdate, RpcId, Side, SubmitOutcome, Ticks, VenueOrderId,
+    OpKind, OrderKindTag, OrderUpdate, RpcId, Side, SubmitOutcome, Ticks, TifTag, VenueOrderId,
     VenueOrderState,
 };
 
@@ -62,9 +63,18 @@ pub fn amend_ack(subject: &Subject<'static>) -> Result<Verdict, Failure> {
             why,
         });
     };
-    // Only a resting limit order is amended (Codex r4223839082).
-    if Shape::sendable(&live.order, &[OrderKindTag::Limit]).is_none() {
+    // Only a resting limit order is amended (Codex r4223839082), one good till cancelled
+    // (Codex r4224547232); the registry places the plainest order the caps allow, which is
+    // then that one, a limit and good till cancelled coming first.
+    let Some(limit) = Shape::sendable(&live.order, &[OrderKindTag::Limit]) else {
         let why = "OrderCaps allows no limit order to amend";
+        return Ok(Verdict::Skipped {
+            check: AMEND_ACK,
+            why,
+        });
+    };
+    if limit.tif != TifTag::Gtc {
+        let why = "OrderCaps allows no limit order good till cancelled to amend";
         return Ok(Verdict::Skipped {
             check: AMEND_ACK,
             why,
@@ -298,9 +308,14 @@ fn judge_amend(
     let outcomes = c.outcomes(rpc);
     // The amend's one item, once, naming the amended order where it names one (Codex
     // r4222568847); an outcome for the whole request is that item's.
+    // A venue id it names is one the order goes by (Codex r4224547225).
+    let vids = order_vids(asked, updates);
     let own = |it: &Option<ItemRef>| {
-        it.as_ref()
-            .is_none_or(|it| it.idx == 0 && it.cid.is_none_or(|cid| cid == asked.cid))
+        it.as_ref().is_none_or(|it| {
+            it.idx == 0
+                && it.cid.is_none_or(|cid| cid == asked.cid)
+                && it.vid.as_ref().is_none_or(|vid| vids.contains(vid))
+        })
     };
     let acks: Vec<&SubmitOutcome> = outcomes.iter().map(|(_, o)| o).collect();
     if !outcomes.iter().all(|(it, _)| own(it)) || !accepted_once(&acks, asked.model) {
@@ -320,7 +335,6 @@ fn judge_amend(
         };
         breaches.push(Breach::new(ack, what));
     }
-    let vids = order_vids(asked, updates);
     // One amend names one new venue id, however often it is reported (Codex r4224395207):
     // fbc-oms would follow each.
     let mut new_vids: Vec<&VenueOrderId> = vids
