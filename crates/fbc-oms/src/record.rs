@@ -765,6 +765,14 @@ impl OrderRecord {
         true
     }
 
+    /// Counts the cumulative fill `cum` the venue reported for the order on a snapshot that
+    /// applies nothing else ([`Registry::on_query_answer`](crate::Registry::on_query_answer),
+    /// [`Registry::on_resync`](crate::Registry::on_resync)): `cum_venue` keeps the largest, as
+    /// an order update's does.
+    pub(crate) fn count_venue_fill(&mut self, cum: Lots) {
+        self.cum_venue = self.cum_venue.max(cum);
+    }
+
     /// Nothing is in flight any more.
     fn clear_intent(&mut self) {
         self.intent = Intent::None;

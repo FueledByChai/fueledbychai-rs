@@ -1735,3 +1735,91 @@ fn a_snapshot_showing_an_order_under_another_venue_id_while_its_amend_may_have_m
         LadderResolution::Resolved(OrdState::Open)
     );
 }
+
+#[test]
+fn a_snapshot_under_another_venue_id_while_an_amend_may_have_moved_the_order_still_ends_it_and_counts_its_fills()
+ {
+    // Codex r4225065388 and r4225065395 on PR #134: the snapshot an unconfirmed amend makes
+    // ambiguous is a resting one. One showing the order ended under another venue id ends it
+    // as its update would (it names no id later commands could carry), and one showing it
+    // resting there still counts the venue's cumulative fill, the amend left unconfirmed.
+    let replacing = OrderCaps {
+        amend: Some(amend_caps(false)),
+        ..caps()
+    };
+    let later = OrderKey {
+        venue: Some(5),
+        ingest: 5,
+    };
+
+    // A query answer showing it filled under the replacement id.
+    let mut reg = Registry::new();
+    let (c, _) = amend_unanswered(&mut reg, &replacing);
+    let filled = snap(Some(c), "m2", VenueOrderState::Filled, 10);
+    let answer = QueryAnswer::new(RpcId(8), OrderRef::Client(c), Some(filled)).unwrap();
+    let ended = OrdState::Terminal(TerminalKind::Filled);
+    assert_eq!(
+        reg.on_query_answer(&replacing, &answer, later),
+        LadderResolution::Resolved(ended)
+    );
+    let rec = reg.get(c).unwrap();
+    assert_eq!(rec.state(), ended);
+    assert_eq!(rec.vid(), Some(&vid("m2")));
+    assert_eq!(rec.cum_venue(), lots(10));
+    assert_eq!(rec.ladder_step(), None);
+
+    // A resync showing it canceled under the replacement id.
+    let mut reg = Registry::new();
+    let (c, _) = amend_unanswered(&mut reg, &replacing);
+    reg.on_query_outcome(RpcId(8), &SubmitOutcome::Unknown);
+    let gone = snap(Some(c), "m2", canceled(), 3);
+    let applied = reg.on_resync(
+        &cfg(),
+        &replacing,
+        wall(5_000),
+        std::slice::from_ref(&gone),
+        later,
+    );
+    let ended = OrdState::Terminal(TerminalKind::Canceled(CancelReason::Requested));
+    assert_eq!(applied.resolved, vec![(c, ended)]);
+    assert_eq!(reg.get(c).unwrap().vid(), Some(&vid("m2")));
+    assert_eq!(reg.get(c).unwrap().cum_venue(), lots(3));
+
+    // Shown resting there, partly filled: the fill counts, nothing else applies.
+    let mut reg = Registry::new();
+    let (c, _) = amend_unanswered(&mut reg, &replacing);
+    let mut part = snap(Some(c), "m2", VenueOrderState::Open, 4);
+    part.px = Some(Ticks(101));
+    let answer = QueryAnswer::new(RpcId(8), OrderRef::Client(c), Some(part.clone())).unwrap();
+    assert_eq!(
+        reg.on_query_answer(&replacing, &answer, later),
+        LadderResolution::Inconclusive
+    );
+    let rec = reg.get(c).unwrap();
+    assert_eq!((rec.cum_venue(), rec.filled()), (lots(4), lots(4)));
+    assert_eq!(rec.resting(), lots(6));
+    assert_eq!(rec.vid(), Some(&vid("m1")));
+    assert!(matches!(rec.intent(), Intent::PendingAmend { .. }));
+    assert_eq!(rec.px(), Some(Ticks(100)));
+    assert_eq!(rec.unknown_since(), Some(at(15)));
+    // A resync showing more filled counts it; one showing less takes nothing back.
+    for (cum, n) in [(6, 6), (2, 7)] {
+        part.cum_filled = lots(cum);
+        let applied = reg.on_resync(
+            &cfg(),
+            &replacing,
+            wall(5_000),
+            std::slice::from_ref(&part),
+            OrderKey {
+                venue: Some(n),
+                ingest: n,
+            },
+        );
+        assert_eq!(applied, ResyncApplied::default());
+        assert_eq!(reg.get(c).unwrap().cum_venue(), lots(6));
+    }
+    let rec = reg.get(c).unwrap();
+    assert_eq!(rec.vid(), Some(&vid("m1")));
+    assert!(matches!(rec.intent(), Intent::PendingAmend { .. }));
+    assert_eq!(rec.unknown_since(), Some(at(15)));
+}
