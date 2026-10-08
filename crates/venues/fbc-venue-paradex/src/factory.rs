@@ -29,10 +29,10 @@ use fbc_core::{
     VenueCaps, VenueConfig, VenueError, VenueFactory, WireUrl,
 };
 
-use crate::auth;
 use crate::exec::{self, ParadexExec, ReadOnlyExec};
 use crate::md::book::BOOK_CHANNELS;
 use crate::md::{self, ParadexMd, sbe};
+use crate::{auth, discover};
 
 /// The configuration key of the public WebSocket URL, without the SBE negotiation
 /// parameters, which the adapter adds: `wss://ws.api.prod.paradex.trade/v1` on mainnet,
@@ -186,7 +186,7 @@ fn socket_url(cfg: &VenueConfig, key: &'static str, version: u16) -> Result<Wire
 }
 
 /// A positive, whole number of seconds (`<n>s`) or milliseconds (`<n>ms`).
-fn duration(text: &str) -> Option<Duration> {
+pub(crate) fn duration(text: &str) -> Option<Duration> {
     let (digits, unit): (&str, fn(u64) -> Duration) = match text.strip_suffix("ms") {
         Some(digits) => (digits, Duration::from_millis),
         None => (text.strip_suffix('s')?, Duration::from_secs),
@@ -227,17 +227,18 @@ impl VenueFactory for ParadexFactory {
         Ok(caps())
     }
 
-    /// None yet: Paradex's FBC rule (`X/USDT` is `X-USD-PERP`) is FBC-l5o.
-    fn parse_fbc_common_symbol(&self, _s: &str) -> Result<AssetKey, SymbolError> {
-        Err(SymbolError::NoRule)
+    /// FBC's Java-era rule: `X/USDT` is `X-USD-PERP` ([`discover::parse_fbc_common_symbol`]).
+    fn parse_fbc_common_symbol(&self, s: &str) -> Result<AssetKey, SymbolError> {
+        discover::parse_fbc_common_symbol(s)
     }
 
-    /// None yet: discovery from `GET /markets` is FBC-l5o.
+    /// One `GET /markets` under the REST base, read into a draft per order-book perpetual
+    /// ([`discover::plan`]).
     fn discover(
         &self,
-        _cfg: &VenueConfig,
+        cfg: &VenueConfig,
     ) -> Result<HttpPlan<Vec<InstrumentSpecDraft>>, VenueError> {
-        Err(VenueError::NoDiscovery)
+        discover::plan(cfg)
     }
 
     /// Connections that carry `subs` with at most one book channel and one touch source per
@@ -414,7 +415,8 @@ fn venue_caps(exec: Option<ExecCaps>) -> VenueCaps {
         per(1, 20),
         per(60, 600),
         // "API Rate Limits": "POST /auth | 600 req/m | IP address". The login (auth.rs)
-        // is this adapter's only `Rest` request.
+        // charges `Rest`, and so does discovery's public GET /markets (discover.rs), which
+        // this bucket overcounts: public requests have only the per-IP 1500 req/m below.
         limit(LimitScope::Ip, &[OpKind::Rest], 60, 600),
         // "GET /* | 120 req/s OR 600 req/m | Account": the account read (auth.rs) and
         // every later private GET charge `Query`. Both windows are declared.

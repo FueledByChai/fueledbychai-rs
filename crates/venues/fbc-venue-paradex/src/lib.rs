@@ -9,9 +9,12 @@
 //! socket negotiates (decision 0054), encodes commands as the socket's signed JSON-RPC frames
 //! ([`exec::ParadexEncoder`]), and decodes the private `OrderEvent` into order updates; its
 //! codec ([`exec::ParadexExec`]) is what the factory builds from the consumer's configuration
-//! and credentials, or the read-only one, with one order-entry endpoint (decision 0072).
+//! and credentials, or the read-only one, with one order-entry endpoint (decision 0072). Its
+//! instruments are discovered from `GET /markets` ([`discover`]), which also holds FBC's
+//! Java-era ticker rule (`X/USDT` is `X-USD-PERP`).
 
 pub mod auth;
+pub mod discover;
 pub mod exec;
 pub mod factory;
 pub mod md;
