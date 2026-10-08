@@ -15,6 +15,14 @@
 //!   its watermark (0014's alternatives). Its events are held until `rsend` and then pushed in
 //!   one call, so nothing is pushed from a resync cut short (0014 item 2): a reconnect, a new
 //!   resync, or any frame of it refused drops it whole.
+//! - A resync over REST (FBC-ja3, Codex r4172917335), for a codec built with
+//!   [`ToyExec::rest_resync`](super::ToyExec::rest_resync): `GET <base>/resync?ts=<wall>`, its
+//!   response body those same records one per line, `rsbegin` first and `rsend` last. The whole
+//!   body is decoded, its envelope included, before anything is pushed, all in one call. An
+//!   [`HttpFailure`], a status other than 200 or a body it cannot decode whole pushes nothing
+//!   and asks again after [`RESYNC_RETRY`], at the instant of the retry, which is the new
+//!   resync's watermark. A response to a request superseded (a new resync, a reconnect) or
+//!   already answered is ignored.
 //! - `auth|ok|token?|code?|msg?`: the answer to the authentication `on_open` sends, `ok` `1`
 //!   echoing the toy's token (whose span [`token_spans`] names, 0028) or `0` with the
 //!   venue's code. Only an acknowledgement of an authentication asked for reports the stream
@@ -25,13 +33,14 @@ use std::ops::Range;
 
 use fbc_core::{
     AckLevel, ClientOrderId, ConnState, DecodeError, DecodeScope, Effect, Effects, EncodeCtx,
-    ExecEvent, ExecSink, Inbound, InboundSpans, ItemRef, OpKind, OrderRef, QueryAnswer, RateCharge,
-    RawFrame, RpcId, SpecTable, StreamId, SubmitOutcome, TrafficClass, VenueCommand, VenueMeta,
-    WallNs, WireSlice,
+    ExecEvent, ExecSink, HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag, Inbound,
+    InboundSpans, ItemRef, OpKind, OrderRef, QueryAnswer, RateCharge, RawFrame, RpcId, SpecTable,
+    StreamId, SubmitOutcome, TrafficClass, VenueCommand, VenueMeta, WallNs, WireSlice, WireUrl,
 };
 
-use super::TOY_TOKEN;
 use super::decode::{self, Record};
+use super::url::join;
+use super::{RESYNC_RETRY, RESYNC_RETRY_TAG, RESYNC_TIMEOUT, TOY_TOKEN};
 
 use DecodeError::Malformed;
 
@@ -59,11 +68,22 @@ struct Resync {
     held: Option<Vec<(VenueMeta, ExecEvent)>>,
 }
 
+/// A resync asked for over REST at `watermark` under `tag`; `retrying` once its request failed
+/// or came back unreadable, until its retry timer fires.
+struct RestResync {
+    tag: HttpTag,
+    watermark: WallNs,
+    retrying: bool,
+}
+
 /// The session state the toy's codec answers requests from.
 #[derive(Default)]
 pub(super) struct Answers {
     waiting: HashMap<RpcId, Waiting>,
     resync: Option<Resync>,
+    rest: Option<RestResync>,
+    /// The tag of the last HTTP request asked for.
+    last_tag: u64,
     auth_asked: bool,
 }
 
@@ -240,13 +260,84 @@ impl Answers {
         }
         let held = resync.ok().and_then(|resync| resync.held.as_mut());
         let held = held.ok_or(Malformed("no resync begun"))?;
-        let event = match r.kind {
-            "rsorder" => ExecEvent::ResyncOrder(decode::snapshot(r, scope, specs)?),
-            "rspos" => decode::position(r, specs)?,
-            _ => ExecEvent::ResyncEnd,
-        };
-        held.push((r.meta(false)?, event));
+        held.push(resync_event(r, scope, specs)?);
         Ok((r.kind == "rsend").then(|| core::mem::take(held)))
+    }
+
+    /// Asks over REST, under `base`, for the venue's open orders and positions as of
+    /// `ctx.wall`, dropping any resync still being read or asked for.
+    pub(super) fn ask_rest_resync(&mut self, base: &WireUrl, ctx: &EncodeCtx, fx: &mut Effects) {
+        let watermark = ctx.wall;
+        self.resync = None;
+        self.last_tag += 1;
+        let tag = HttpTag(self.last_tag);
+        self.rest = Some(RestResync {
+            tag,
+            watermark,
+            retrying: false,
+        });
+        fx.push(Effect::Http {
+            tag,
+            req: HttpRequest {
+                method: HttpMethod::Get,
+                url: join(base, &format!("/resync?ts={}", watermark.0)),
+                headers: Vec::new(),
+                body: WireSlice::plain(Vec::new()),
+            },
+            rpc: None,
+            timeout: RESYNC_TIMEOUT,
+            class: TrafficClass::Safety,
+            charge: RateCharge::one(OpKind::Rest, None),
+        });
+    }
+
+    /// The response to the HTTP request tagged `tag`: a resync over REST decoded whole and
+    /// pushed in one call, or, failed or unreadable, nothing pushed and asked again after
+    /// [`RESYNC_RETRY`]. One to a request no longer waited for is ignored.
+    pub(super) fn rest_answer(
+        &mut self,
+        tag: HttpTag,
+        resp: Result<HttpResponse<'_>, HttpFailure>,
+        scope: &DecodeScope<'_>,
+        specs: &SpecTable,
+        sink: &mut dyn ExecSink,
+        fx: &mut Effects,
+    ) -> Result<(), DecodeError> {
+        let waiting = self.rest.as_mut().filter(|r| r.tag == tag && !r.retrying);
+        let Some(asked) = waiting else {
+            return Ok(());
+        };
+        let read = match resp {
+            Ok(resp) if resp.status == 200 => {
+                Some(rest_body(resp.body, asked.watermark, scope, specs))
+            }
+            _ => None,
+        };
+        match read {
+            Some(Ok(events)) => {
+                self.rest = None;
+                for (meta, ev) in events {
+                    sink.push(meta, ev);
+                }
+                Ok(())
+            }
+            unread => {
+                asked.retrying = true;
+                fx.push(Effect::Timer {
+                    tag: RESYNC_RETRY_TAG,
+                    after: RESYNC_RETRY,
+                });
+                unread.map_or(Ok(()), |refused| refused.map(drop))
+            }
+        }
+    }
+
+    /// The retry timer of a resync over REST fired: asked again under `base` at `ctx.wall`,
+    /// unless it was answered or superseded meanwhile.
+    pub(super) fn retry_rest(&mut self, base: &WireUrl, ctx: &EncodeCtx, fx: &mut Effects) {
+        if self.rest.as_ref().is_some_and(|r| r.retrying) {
+            self.ask_rest_resync(base, ctx, fx);
+        }
     }
 
     /// Authenticates on `stream` with the toy's token, in a redaction span; a resync still
@@ -254,6 +345,7 @@ impl Answers {
     pub(super) fn ask_auth(&mut self, stream: StreamId, ctx: &EncodeCtx, fx: &mut Effects) {
         self.auth_asked = true;
         self.resync = None;
+        self.rest = None;
         let head = format!("auth|ts={}|{TOKEN_FIELD}", ctx.wall.0);
         let text = format!("{head}{TOY_TOKEN}");
         let span = span(head.len()..text.len()).expect("an authentication shorter than 4 GiB");
@@ -294,6 +386,51 @@ impl Answers {
         self.auth_asked = false;
         sink.push(meta, event);
         Ok(())
+    }
+}
+
+/// One record of a resync after its `rsbegin`: an order, a position or its end.
+fn resync_event(
+    r: &Record<'_>,
+    scope: &DecodeScope<'_>,
+    specs: &SpecTable,
+) -> Result<(VenueMeta, ExecEvent), DecodeError> {
+    let event = match r.kind {
+        "rsorder" => ExecEvent::ResyncOrder(decode::snapshot(r, scope, specs)?),
+        "rspos" => decode::position(r, specs)?,
+        "rsend" => ExecEvent::ResyncEnd,
+        "rsbegin" => return Err(Malformed("resync begun twice")),
+        _ => return Err(Malformed("kind")),
+    };
+    Ok((r.meta(false)?, event))
+}
+
+/// A resync over REST's response body, decoded whole: `rsbegin` echoing `watermark` first,
+/// orders and positions, `rsend` last, one record per line.
+fn rest_body(
+    body: &[u8],
+    watermark: WallNs,
+    scope: &DecodeScope<'_>,
+    specs: &SpecTable,
+) -> Result<Vec<(VenueMeta, ExecEvent)>, DecodeError> {
+    let text = core::str::from_utf8(body).map_err(|_| Malformed("body"))?;
+    let mut lines = text.lines().map(Record::parse);
+    let begin = lines.next().transpose()?;
+    let begin = begin.filter(|r| r.kind == "rsbegin");
+    let begin = begin.ok_or(Malformed("a resync begins with rsbegin"))?;
+    if WallNs(begin.num("wm")?) != watermark {
+        return Err(Malformed("resync for another request"));
+    }
+    let mut events = vec![(begin.meta(false)?, ExecEvent::ResyncBegin { watermark })];
+    for r in lines {
+        if matches!(events.last(), Some((_, ExecEvent::ResyncEnd))) {
+            return Err(Malformed("a record after rsend"));
+        }
+        events.push(resync_event(&r?, scope, specs)?);
+    }
+    match events.last() {
+        Some((_, ExecEvent::ResyncEnd)) => Ok(events),
+        _ => Err(Malformed("a resync ends with rsend")),
     }
 }
 

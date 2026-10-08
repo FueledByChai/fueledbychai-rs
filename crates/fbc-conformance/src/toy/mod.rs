@@ -17,8 +17,11 @@
 //! authentication with [`TOY_TOKEN`] acknowledged; and its books (FBC-u1d): [`ToyMd`] keeps two
 //! book channels apart on one connection, [`BOOK`] snapshotted in one frame decoded whole or not
 //! at all and [`ANCHORED_BOOK`] anchored on an HTTP snapshot, refuses a book id its caps do not
-//! declare with nothing sent, reports a gap on the channel that broke, and declares a keepalive.
-//! Trades, funding, mark, index and stats arrive with FBC-z2s.
+//! declare with nothing sent, reports a gap on the channel that broke, and declares a keepalive;
+//! and (FBC-ja3) its URLs from the configuration with the credential spans it marks
+//! (`url.rs`), a resync over REST retried until it is decoded whole ([`ToyExec::rest_resync`])
+//! and a ping on its order-entry connection ([`ToyExec::pinging`]), both as its factory builds
+//! it. Trades, funding, mark, index and stats arrive with FBC-z2s.
 //!
 //! Protocol: its own, describing no real venue, as `fbc-core`'s toy: one record per line,
 //! `kind|key=value|...`. A request's first record names its `rpc`; a batch's first record
@@ -32,6 +35,7 @@ mod factory;
 mod md;
 mod session;
 mod signer;
+mod url;
 
 use core::num::NonZeroU32;
 use core::time::Duration;
@@ -43,14 +47,17 @@ use fbc_core::{
     FundingSpec, InstrumentId, InstrumentKind, InstrumentSpec, LimitScope, Lots, MatchingCaps,
     MdCaps, Namespace, NonceScope, OpKind, OrderCaps, OrderKindTag, OrderingKey, PriceGrid,
     QueueModelQuality, RateLimit, Readiness, RefKind, SizeStep, SnapshotSource, SpecTable,
-    StpScope, StreamId, Support, TagSet, TifTag, TradeCaps, TradingStatus, UnderlyingId, VenueCaps,
-    VenueFeeSign, VenueId, WallNs, dispatch,
+    StpScope, StreamId, Support, TagSet, TifTag, TimerTag, TradeCaps, TradingStatus, UnderlyingId,
+    VenueCaps, VenueFeeSign, VenueId, WallNs, dispatch,
 };
 use rust_decimal::Decimal;
 
 pub use decode::{REJECT_CODES, reject_kind};
 pub use exec::ToyExec;
-pub use factory::{EXEC_URL_KEY, MD_URL_KEY, ToyFactory};
+pub use factory::{
+    EXEC_URL_KEY, EXEC_URL_REDACT_KEY, MD_STREAM, MD_URL_KEY, MD_URL_REDACT_KEY, REST_URL_KEY,
+    REST_URL_REDACT_KEY, ToyFactory,
+};
 pub use md::ToyMd;
 pub use signer::ToySigner;
 
@@ -85,8 +92,22 @@ pub const ANCHOR_TIMEOUT: Duration = Duration::from_secs(2);
 pub const ANCHOR_RETRY: Duration = Duration::from_secs(1);
 /// The most deltas an anchored channel holds while its anchor is asked for; one more asks again.
 pub const MAX_HELD: usize = 64;
-/// The configuration key FBC-ja3 reads the anchors' base URL from.
+/// The configuration key of the anchors' base URL (`http://` or `https://`): an anchor is
+/// asked for at `<base>/book/<sym>`.
 pub const ANCHOR_URL_KEY: &str = "toy.md.anchor_url";
+/// The configuration key of the credential spans in [`ANCHOR_URL_KEY`]'s URL (`url.rs`).
+pub const ANCHOR_URL_REDACT_KEY: &str = "toy.md.anchor_url.redact";
+
+/// How often a pinging order-entry codec sends its ping ([`ToyExec::pinging`]).
+pub const PING_EVERY: Duration = Duration::from_secs(15);
+/// The timer a pinging order-entry codec sends its ping on.
+pub const PING_TAG: TimerTag = TimerTag(1);
+/// How long a resync over REST may take ([`ToyExec::rest_resync`]).
+pub const RESYNC_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long after a resync over REST that failed, or came back unreadable, it is asked again.
+pub const RESYNC_RETRY: Duration = Duration::from_secs(1);
+/// The timer a resync over REST is asked again on.
+pub const RESYNC_RETRY_TAG: TimerTag = TimerTag(2);
 
 /// Whether the toy's fills carry a venue fill id ([`FillCaps::fill_id`]). Venues differ here,
 /// and the flag is one per venue, so the toy is declared either way and its frames keep to the

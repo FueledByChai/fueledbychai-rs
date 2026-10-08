@@ -47,6 +47,7 @@ use fbc_core::{
 };
 
 use super::decode::{Record, record};
+use super::url::join;
 use super::{
     ANCHOR_RETRY, ANCHOR_TIMEOUT, ANCHOR_URL_KEY, ANCHORED_BOOK, BOOK, KEEPALIVE_EVERY, MAX_HELD,
     caps,
@@ -65,7 +66,7 @@ enum Chan {
     /// again: it would move the book back (Codex r4216139627).
     Anchoring {
         tag: u64,
-        url: String,
+        url: WireUrl,
         held: Vec<Levels>,
         floor: u64,
     },
@@ -85,8 +86,9 @@ struct Levels {
 #[derive(Clone, Debug)]
 pub struct ToyMd {
     stream: StreamId,
-    /// The base URL anchors are asked under; without one an anchored channel is refused.
-    anchor: Option<String>,
+    /// The base URL anchors are asked under, with its credential spans; without one an
+    /// anchored channel is refused.
+    anchor: Option<WireUrl>,
     chans: BTreeMap<(InstrumentId, BookId), Chan>,
     /// The next tag an anchor's request and its retry timer share.
     next_tag: u64,
@@ -95,8 +97,8 @@ pub struct ToyMd {
 }
 
 impl ToyMd {
-    /// A codec on `stream` with no anchor URL: [`ANCHORED_BOOK`] is refused, its URL being
-    /// configuration the toy does not model yet (FBC-ja3).
+    /// A codec on `stream` with no anchor URL: [`ANCHORED_BOOK`] is refused as configuration
+    /// ([`ANCHOR_URL_KEY`]).
     pub fn new(stream: StreamId) -> ToyMd {
         ToyMd {
             stream,
@@ -107,10 +109,17 @@ impl ToyMd {
         }
     }
 
-    /// A codec on `stream` asking [`ANCHORED_BOOK`]'s anchors under `base`.
+    /// A codec on `stream` asking [`ANCHORED_BOOK`]'s anchors under `base`, which holds no
+    /// credential.
     pub fn with_anchor(stream: StreamId, base: impl Into<String>) -> ToyMd {
+        ToyMd::with_anchor_url(stream, WireUrl::plain(base))
+    }
+
+    /// A codec on `stream` asking [`ANCHORED_BOOK`]'s anchors under `base`, every anchor's URL
+    /// keeping its credential spans (FBC-ja3, Codex r4172917294).
+    pub fn with_anchor_url(stream: StreamId, base: WireUrl) -> ToyMd {
         ToyMd {
-            anchor: Some(base.into()),
+            anchor: Some(base),
             ..ToyMd::new(stream)
         }
     }
@@ -127,21 +136,21 @@ impl ToyMd {
         if declared.rest_anchor && self.anchor.is_none() {
             return Err(VenueError::Config(ConfigError::Invalid {
                 key: ANCHOR_URL_KEY,
-                reason: "the conformance toy plans no anchor URL yet (FBC-ja3)",
+                reason: "no anchor URL is configured for the anchored book channel",
             }));
         }
         Ok(format!("{}@{}", spec.venue_symbol.as_wire(), book.0))
     }
 
     /// Asks for `inst`'s anchor at `url` under a fresh tag, which it returns.
-    fn ask_anchor(&mut self, inst: InstrumentId, url: &str, fx: &mut Effects) -> u64 {
+    fn ask_anchor(&mut self, inst: InstrumentId, url: &WireUrl, fx: &mut Effects) -> u64 {
         let tag = self.next_tag;
         self.next_tag += 1;
         fx.push(Effect::Http {
             tag: HttpTag(tag),
             req: HttpRequest {
                 method: HttpMethod::Get,
-                url: WireUrl::plain(url),
+                url: url.clone(),
                 headers: Vec::new(),
                 body: WireSlice::plain(Vec::new()),
             },
@@ -213,10 +222,10 @@ impl ToyMd {
         (held, floor): (Vec<Levels>, u64),
         fx: &mut Effects,
     ) -> Chan {
-        let base = self.anchor.as_deref().filter(|_| book == ANCHORED_BOOK);
+        let base = self.anchor.as_ref().filter(|_| book == ANCHORED_BOOK);
         match (base, specs.get(inst)) {
             (Some(base), Some(spec)) => {
-                let url = format!("{base}/book/{}", spec.venue_symbol.as_wire());
+                let url = join(base, &format!("/book/{}", spec.venue_symbol.as_wire()));
                 let tag = self.ask_anchor(inst, &url, fx);
                 Chan::Anchoring {
                     tag,

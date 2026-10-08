@@ -25,7 +25,9 @@
 //!   to queries, batches, resyncs and authentication (FBC-sal), [`toy::ToyFactory`], the
 //!   factory the named suite builds it from (FBC-8ew), and [`toy::ToyMd`], its market-data
 //!   codec: two book channels on one connection, whole-frame snapshots, refused book ids, a REST
-//!   anchor, gap health and a keepalive (FBC-u1d).
+//!   anchor, gap health and a keepalive (FBC-u1d); and its URLs from the configuration with the
+//!   credential spans it marks, a resync over REST retried until decoded whole, and a ping on
+//!   its order-entry connection (FBC-ja3).
 //! - [`suite`], the named conformance suite (design §6, FBC-8ew): [`suite!`], which an adapter
 //!   crate's `tests/conformance.rs` invokes with its factory, its fixture directory (whose
 //!   layout [`suite`] documents) and the setup its fixtures assume, each named check becoming a

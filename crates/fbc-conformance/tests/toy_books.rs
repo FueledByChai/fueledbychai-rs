@@ -352,8 +352,8 @@ fn a_book_id_outside_the_declared_channels_is_refused_with_nothing_sent() {
     assert_eq!(rig.subscribe(&[], &[]), Ok(()));
     assert!(rig.fx.is_empty());
 
-    // The factory's codec has no anchor URL (FBC-ja3): the anchored channel is refused as
-    // configuration, with nothing sent.
+    // The factory's codec under a configuration with no anchor URL: the anchored channel is
+    // refused as configuration, with nothing sent.
     let cfg = VenueConfig::new();
     let ep = EndpointPlan {
         stream: STREAM,
@@ -374,13 +374,13 @@ fn a_book_id_outside_the_declared_channels_is_refused_with_nothing_sent() {
         panic!("{refused:?}");
     };
     assert_eq!(key, ANCHOR_URL_KEY);
-    assert!(reason.contains("FBC-ja3"), "{reason}");
+    assert!(reason.contains("anchor URL"), "{reason}");
     assert!(fx.is_empty());
     md.on_open(&mut fx);
     assert!(fx.is_empty());
 
     // The factory plans nothing for nothing, refuses an undeclared channel as unsupported and a
-    // declared one as configuration, its market-data URL not modelled until FBC-ja3.
+    // declared one as configuration while no market-data URL is configured.
     let specs = toy::specs();
     let plan = |subs: &[Subscription]| {
         ToyFactory.plan_md(&cfg, &specs, &BTreeSet::from_iter(subs.iter().copied()))
@@ -390,11 +390,10 @@ fn a_book_id_outside_the_declared_channels_is_refused_with_nothing_sent() {
         plan(&[sub(INST_A, BOOK), outside]),
         Err(VenueError::UnsupportedFeed(outside))
     );
-    let Err(VenueError::Config(ConfigError::Invalid { key, .. })) = plan(&[sub(INST_B, BOOK)])
-    else {
-        panic!("planned");
-    };
-    assert_eq!(key, MD_URL_KEY);
+    assert_eq!(
+        plan(&[sub(INST_B, BOOK)]),
+        Err(VenueError::Config(ConfigError::Missing(MD_URL_KEY)))
+    );
 }
 
 #[test]
