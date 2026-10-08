@@ -117,6 +117,8 @@ enum Twist {
     FillsOnAmend,
     /// An amended order's update is followed by another naming another new venue id.
     RenamedTwice,
+    /// Every acceptance naming no venue id (the arm's, the amend's) names a stranger's.
+    StrangerVidOnAck,
 }
 
 /// The toy with its caps edited by `caps` and its codec twisted by `twist`.
@@ -330,6 +332,18 @@ static OPEN_AFTER_AMEND: Variant = Variant {
 static OPEN_AGREES_AFTER_AMEND: Variant = Variant {
     caps: |_| {},
     twist: Twist::OpenAgreesAfterAmend,
+};
+static STRANGER_VID_ON_ACK: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::StrangerVidOnAck,
+};
+/// The toy allowing limit orders only immediate or cancel.
+static IOC_LIMITS: Variant = Variant {
+    caps: |c| {
+        let order = &mut c.exec.as_mut().unwrap().order;
+        order.tifs = TagSet::of(&[fbc_core::TifTag::Ioc]);
+    },
+    twist: Twist::None,
 };
 static RENAMED_TWICE: Variant = Variant {
     caps: |_| {},
@@ -878,6 +892,27 @@ fn fills_on_amend(ev: ExecEvent) -> Vec<ExecEvent> {
     vec![ev, ExecEvent::Fill(fill)]
 }
 
+/// Every acceptance naming no venue id, naming a stranger's.
+fn stranger_vid_on_ack(ev: ExecEvent) -> Vec<ExecEvent> {
+    if !acceptance(&ev, false) {
+        return vec![ev];
+    }
+    let ExecEvent::Outcome {
+        rpc,
+        item: Some(mut item),
+        outcome,
+    } = ev
+    else {
+        return vec![ev];
+    };
+    item.vid = toy::with_scope(|scope| scope.venue_order_id("toy-stranger")).ok();
+    vec![ExecEvent::Outcome {
+        rpc,
+        item: Some(item),
+        outcome,
+    }]
+}
+
 /// An amended order's update, then another naming another new venue id.
 fn renamed_twice(ev: ExecEvent) -> Vec<ExecEvent> {
     let ExecEvent::Order(u) = &ev else {
@@ -1176,6 +1211,7 @@ impl ExecCodec for Twisted {
             Twist::OpenAgreesAfterAmend => open_agrees_after_amend,
             Twist::FillsOnAmend => fills_on_amend,
             Twist::RenamedTwice => renamed_twice,
+            Twist::StrangerVidOnAck => stranger_vid_on_ack,
             _ => kept,
         };
         let sink = &mut Rewrite { inner: sink, f: f_ };
@@ -2161,6 +2197,29 @@ fn amend_ack_amends_the_quantity_where_no_other_price_is_valid() {
 fn amend_ack_skips_a_venue_amending_prices_only_where_no_other_price_is_valid() {
     let skipped = suite::amend_ack(&PRICE_ONLY.subject(one_price));
     let why = "no valid price lies one step from the harness's";
+    assert!(
+        matches!(skipped, Ok(Verdict::Skipped { why: w, .. }) if w == why),
+        "{skipped:?}"
+    );
+}
+
+#[test]
+fn amend_ack_fails_a_toy_whose_amend_acceptance_names_a_strangers_venue_id() {
+    let failure = failed(suite::amend_ack(&STRANGER_VID_ON_ACK.subject(assumed)));
+    assert!(
+        says(
+            &failure,
+            "ExecCodec::on_frame",
+            "the amend the stub accepted"
+        ),
+        "{failure}"
+    );
+}
+
+#[test]
+fn amend_ack_skips_a_venue_whose_limit_orders_cannot_rest() {
+    let skipped = suite::amend_ack(&IOC_LIMITS.subject(assumed));
+    let why = "OrderCaps allows no limit order good till cancelled to amend";
     assert!(
         matches!(skipped, Ok(Verdict::Skipped { why: w, .. }) if w == why),
         "{skipped:?}"

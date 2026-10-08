@@ -52,7 +52,7 @@ venue for the program's life (`ExecSessionConfig::venue` is `&'static dyn VenueF
   that limit's window, so its bucket has room again; otherwise the clock stays, so a keepalive
   is not written where the stub reads a request. The clock moves by no more than the window,
   so a timer due just past it stays unfired. `amend_ack` is skipped where the caps allow no
-  limit order.
+  limit order good till cancelled, the only one that rests to be amended.
 - Until the check first moves the clock after the stub has answered, no deadline has passed: an
   outcome for an unanswered request (or item) by then was reported before its deadline and fails
   the check.
@@ -65,7 +65,7 @@ venue for the program's life (`ExecSessionConfig::venue` is `&'static dyn VenueF
   filled, the flags the order's and stated where `OrderCaps.events_echo_flags`, the client id
   stated where `OrderCaps.cid_echoed_on_events`, nothing written once the amend is answered, a
   new venue id only where `AmendCaps.keeps_venue_id` is false and the same one in every update, the placement accepted once as
-  `OrderCaps.ack` has it, and no refusal naming the amended order, update ending it nor fill of
+  `OrderCaps.ack` has it, the amend's acceptance naming no venue id but one the order goes by, and no refusal naming the amended order, update ending it nor fill of
   it once the amend is sent) and what the stub received on every connection: an
   order written once, counted by the frames carrying our client id as the venue's wire spells
   it, so a request rebuilt and signed again counts too (byte-equal frames where the venue sends
