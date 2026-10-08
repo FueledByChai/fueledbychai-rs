@@ -10,8 +10,9 @@
 //! journal files hold none of the synthetic credentials, only their keyed hashes.
 //!
 //! What an order-entry stream brings is journaled under Safety, since it carries the acks and
-//! fills 0006 reserves room for; an encode's nonces and context under its command's class; the
-//! rest under Normal. Error paths: a nonce source that reserves fewer than asked has what it did
+//! fills 0006 reserves room for, and so are each epoch's opening and closing and every nonce; an
+//! encode's context goes under its command's class (an adding order's Normal); the rest under
+//! Normal. Error paths: a nonce source that reserves fewer than asked has what it did
 //! reserve journaled and no context, and a run dropped mid-epoch has its epoch journaled closed
 //! when the session drops.
 //!
@@ -19,6 +20,7 @@
 //! conformance toy's token is its own synthetic constant. The expected hashes are computed with
 //! `hmac` and `sha2` directly, not through the journal's own code.
 
+mod armed_oms;
 #[path = "../../fbc-core/tests/auth_toy/mod.rs"]
 mod auth_toy;
 mod common;
@@ -694,9 +696,9 @@ fn query_answered(heard: &Heard) -> bool {
 /// and write; the resync's context, frame and write; the venue's answers; the query's nonce,
 /// context, frame and write; its answer; the epoch closing. Every stamped record carries the
 /// next ingest sequence of the epoch. The toy's token is in no file, its keyed hash is. What the
-/// stream brought is Safety; the ping, the connection changes and the contexts of `on_open` and
-/// the resync are Normal; the arm's and the query's nonces and contexts are their commands'
-/// class, Safety.
+/// stream brought is Safety, as are the epoch's opening and closing and every nonce; the ping
+/// and the contexts of `on_open` and the resync are Normal; the arm's and the query's contexts
+/// are their commands' class, Safety.
 #[tokio::test]
 async fn the_conformance_toys_order_entry_session_journals_what_crosses_it_in_order_with_no_credential()
  {
@@ -976,6 +978,69 @@ async fn the_auth_toys_order_entry_session_journals_its_logins_timer_nonces_and_
     // Reviewer B RB-2pr-4 on PR #115: a call's nonces are Safety, so a restart reads them all.
     let nonce = |r: &Record| matches!(r, Record::Nonce { .. });
     assert_eq!(run.classes(nonce), [TrafficClass::Safety; 3]);
+}
+
+/// Reviewer B RB-2pr-10 on PR #115: an adding order, a post-only buy fbc-oms built and
+/// authorized (`armed_oms`), splits its records across the classes. Its nonce is Safety, as every
+/// nonce is, so a `Degraded` span keeps it; its context goes under its command's class, Normal,
+/// as its frame does; the arm's nonce and context are both Safety.
+#[tokio::test]
+async fn an_adding_orders_nonce_is_journaled_under_safety_and_its_context_under_normal() {
+    let mut server = ScriptedWs::start().await;
+    let reserved = armed_oms::Reserved::default();
+    let mut config = armed_oms::session_config(&server.url(), &reserved);
+    config.nonce_source = SOURCE;
+    let place = armed_oms::Oms::armed().place();
+    let placed = Rc::new(std::cell::Cell::new(None));
+    let keep = Rc::clone(&placed);
+    let run = journaled(
+        "exec_journal_adding_order",
+        config,
+        |orders, control, heard| async move {
+            let mut peer = server.accept().await;
+            assert!(recv_text(&mut peer).await.starts_with("auth|ts="));
+            peer.send(AUTH_ACK);
+            assert_eq!(recv_text(&mut peer).await, "cod|rpc=1|on=1");
+            let wm = armed_oms::watermark(&recv_text(&mut peer).await);
+            peer.send("item|rpc=1|i=0|res=ok");
+            peer.send_all([format!("rsbegin|wm={wm}"), "rsend".to_owned()]);
+            until(|| is_resync_end(&heard)).await;
+            assert!(orders.may_place());
+            let rpc = orders.submit(place).unwrap();
+            keep.set(Some(rpc));
+            let written = recv_text(&mut peer).await;
+            let prefix = format!("place|rpc={}|", rpc.0);
+            assert!(written.starts_with(&prefix), "{written}");
+            drop(control);
+            while peer.next().await.is_some() {}
+        },
+    )
+    .await;
+    run.ended.as_ref().unwrap();
+    let rpc = placed.get().unwrap();
+    assert_eq!(*reserved.lock().unwrap(), [vec![0], vec![1]]);
+
+    // The arm's and the place's nonces, in order, both Safety.
+    let nonce = |r: &Record| matches!(r, Record::Nonce { .. });
+    let offered = run.offered.iter().map(|(_, r)| r);
+    let nonces: Vec<Seen> = offered.filter(|r| nonce(r)).map(seen).collect();
+    assert_eq!(nonces, [Seen::Nonce(0), Seen::Nonce(1)]);
+    assert_eq!(run.classes(nonce), [TrafficClass::Safety; 2]);
+    // The arm's context is Safety; the place's, carrying its nonce, is Normal.
+    let arm = |r: &Record| {
+        matches!(
+            r,
+            Record::EncodeCtx {
+                rpc: Some(RpcId(1)),
+                ..
+            }
+        )
+    };
+    assert_eq!(run.classes(arm), [TrafficClass::Safety]);
+    let adding = |r: &Record| matches!(r, Record::EncodeCtx { rpc: Some(id), .. } if *id == rpc);
+    assert_eq!(run.classes(adding), [TrafficClass::Normal]);
+    let read: Vec<Seen> = run.entries.iter().map(|e| seen(&e.record)).collect();
+    assert!(read.contains(&Seen::Ctx(Some(rpc), vec![1])), "{read:#?}");
 }
 
 // ---------------------------------------------------------------------------------------------
