@@ -414,7 +414,6 @@ fn credential_needles(signatures: &[String]) -> Vec<String> {
 }
 
 /// Every record this thread logged, one per line.
-/// Every record this thread logged, one per line.
 fn trace_output() -> String {
     capture::of_this_thread()
         .iter()
