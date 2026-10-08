@@ -18,7 +18,7 @@ use fbc_conformance::toy::{ToyExec, ToyFactory, ToySigner};
 use fbc_core::{
     AccountSummary, AssetKey, ConfigError, CtxCall, DecodeError, DecodeScope, Effect, Effects,
     EncodeCtx, EncodeReceipt, EndpointPlan, ExecCodec, ExecEndpoint, ExecEvent, ExecSink,
-    FieldSpec, HttpFailure, HttpPlan, HttpResponse, HttpTag, Inbound, InboundSpans,
+    FieldSpec, FillSource, HttpFailure, HttpPlan, HttpResponse, HttpTag, Inbound, InboundSpans,
     InstrumentSpecDraft, Liquidity3, MdCodec, NotSentReason, PathStamps, RawFrame, RpcId, Secrets,
     SignedLots, SpecTable, StreamId, Subscription, SymbolError, TimerTag, VenueCaps, VenueCommand,
     VenueConfig, VenueError, VenueFactory, VenueFeeSign, VenueMeta,
@@ -409,17 +409,36 @@ fn decoder_deterministic_fails_a_toy_variant_that_decodes_nondeterministically()
     let variant = Variant::twisted(Twist::SeqDrifts);
     let failure = failed(variant.run(suite::decoder_deterministic));
     assert_eq!(failure.check, "decoder_deterministic");
-    // Every case pushes an event at its first frame but the long and short positions, which
-    // the toy holds until the resync's end; the resync line before them differs in nothing.
-    assert_eq!(named(&failure), ["ExecCodec::on_frame"; 7]);
+    // Every line that pushes an event differs, each named (Codex r4216777885): two in the
+    // rebate and maker cases, four in the orders case (its last frame is refused alike), one
+    // in every other case; the position cases only at the resync's end, which pushes what the
+    // toy held, so their resync line and the frames before differ in nothing.
+    assert_eq!(named(&failure), ["ExecCodec::on_frame"; 12]);
     let said = said(&failure, "ExecCodec::on_frame");
+    let lines: Vec<&str> = said
+        .iter()
+        .map(|what| what.split(" decoded").next().unwrap())
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "fee_sign/paid.frames line 3",
+            "fee_sign/rebate.frames line 4",
+            "fee_sign/rebate.frames line 5",
+            "liquidity_reported/maker.frames line 2",
+            "liquidity_reported/maker.frames line 3",
+            "liquidity_reported/taker.frames line 2",
+            "position_signed/long.frames line 8",
+            "position_signed/short.frames line 5",
+            "decoder_deterministic/orders.frames line 4",
+            "decoder_deterministic/orders.frames line 5",
+            "decoder_deterministic/orders.frames line 6",
+            "decoder_deterministic/orders.frames line 7",
+        ]
+    );
     assert_eq!(
         said[0],
         "fee_sign/paid.frames line 3 decoded differently on two runs: the events pushed"
-    );
-    assert_eq!(
-        said[4],
-        "position_signed/long.frames line 8 decoded differently on two runs: the events pushed"
     );
     // The frame's bytes are never shown: a frame can carry a credential.
     assert!(!failure.to_string().contains("fid="), "{failure}");
@@ -641,5 +660,39 @@ fn events_of_another_kind_in_a_case_are_not_judged() {
     assert!(
         matches!(&verdict, Verdict::Passed { probed, .. } if probed[1] == "fee_sign/paid.frames: 1 fill"),
         "{verdict:?}"
+    );
+}
+
+#[test]
+fn fill_checks_are_skipped_for_fills_derived_from_order_status() {
+    // Codex r4216777891: such a venue's codec pushes order updates, never a fill event, so the
+    // checks that judge fill events have nothing to judge; positions are still judged.
+    let variant = Variant::declaring(|caps| {
+        caps.exec.as_mut().unwrap().fills.source = FillSource::DerivedFromOrderStatus;
+    });
+    for check in [suite::fee_sign, suite::liquidity_reported] {
+        let verdict = variant.run(check).unwrap();
+        assert!(
+            matches!(verdict, Verdict::Skipped { why, .. } if why.contains("DerivedFromOrderStatus")),
+            "{verdict:?}"
+        );
+    }
+    assert!(matches!(
+        variant.run(suite::position_signed),
+        Ok(Verdict::Passed { .. })
+    ));
+}
+
+#[test]
+fn decoder_deterministic_fails_a_case_that_hands_the_codec_nothing() {
+    // Codex r4216777870: a case of comments alone decodes nothing, so it proves nothing.
+    let scratch = Scratch::empty("empty-case");
+    fs::create_dir_all(scratch.at("decoder_deterministic")).unwrap();
+    scratch.write("decoder_deterministic/empty.frames", "# nothing\n\n");
+    let failure = failed(scratch.run(suite::decoder_deterministic));
+    assert_eq!(named(&failure), ["decoder_deterministic/empty.frames"]);
+    assert_eq!(
+        said(&failure, "decoder_deterministic/empty.frames"),
+        ["hands the codec nothing: a case that decodes nothing proves nothing"]
     );
 }
