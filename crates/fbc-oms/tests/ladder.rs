@@ -1688,6 +1688,38 @@ fn a_snapshot_showing_an_order_under_another_venue_id_while_its_amend_may_have_m
     assert_eq!(reg.get(c).unwrap().vid(), Some(&vid("m1")));
     assert_eq!(reg.get(c).unwrap().px(), Some(Ticks(101)));
 
+    // A record that holds no venue id yet (the placement accepted without one) has none to
+    // retire: the snapshot teaches it the id and settles the order as its update would (Codex
+    // r4224963871 on PR #134).
+    let mut reg = Registry::new();
+    let c = reg.insert(placement(cid(), 100, 10)).unwrap().cid();
+    reg.placement_sent(c, at(0), wall(1_000)).unwrap();
+    reg.on_outcome(c, OrderOp::Place, &item(None, None), &accepted(), at(1))
+        .unwrap();
+    assert_eq!(reg.get(c).unwrap().vid(), None);
+    reg.amend_sent(c, Ticks(101), lots(10), RpcId(7), at(10))
+        .unwrap();
+    reg.on_outcome(
+        c,
+        OrderOp::Amend(RpcId(7)),
+        &item(Some(c), None),
+        &SubmitOutcome::Unknown,
+        at(15),
+    )
+    .unwrap();
+    let plan = reg.ladder(&cfg(), &replacing, at(16));
+    assert_eq!(query_of(&plan, c).target, OrderRef::Client(c));
+    reg.query_sent(c, RpcId(8)).unwrap();
+    let answer = QueryAnswer::new(RpcId(8), OrderRef::Client(c), Some(amended(c, "m2"))).unwrap();
+    assert_eq!(
+        reg.on_query_answer(&replacing, &answer, later),
+        LadderResolution::Resolved(OrdState::Open)
+    );
+    let rec = reg.get(c).unwrap();
+    assert_eq!(rec.vid(), Some(&vid("m2")));
+    assert_eq!(rec.intent(), Intent::None);
+    assert_eq!(rec.px(), Some(Ticks(101)));
+
     // On a venue whose amend keeps the id, the record's id is never retired: a snapshot under
     // another id applies as its update would.
     let keeping = OrderCaps {

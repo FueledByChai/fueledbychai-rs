@@ -24,7 +24,7 @@
 //!    ladder asks for one on every pass ([`LadderPlan::resync`]). A resync showing the order
 //!    applies there as the query's answer would. An order whose venue id an unconfirmed amend
 //!    may have replaced, on a venue whose amend gives a new id, shown under another id than
-//!    its record's, is not settled by it: nothing of the snapshot applies, since its price and
+//!    the one its record holds, is not settled by it: nothing of the snapshot applies, since its price and
 //!    total would confirm the amend while the record kept the retired id, and a tombstone by
 //!    client id follows. With a [`SnapshotSource::Trustworthy`] source, an order absent from
 //!    the configured number of snapshots in a row, each with a watermark at least its sent
@@ -573,14 +573,15 @@ impl OrderRecord {
             && (self.amend_unconfirmed() || self.vid_retired())
     }
 
-    /// Whether a snapshot showing the order under `vid` cannot be told apart from one showing
-    /// it under an id an unconfirmed amend gave it, or one confirmed without naming it
-    /// ([`Self::id_may_have_moved`]): `vid` is not the record's id. Applied, its price and
-    /// total could confirm the amend and settle the order while the record keeps the retired
-    /// id, which later commands would name (FBC-wua8). Such a snapshot is inconclusive: the
-    /// order stays on the ladder, and a tombstone by client id follows.
+    /// Whether a snapshot shows the order under `vid` while the record holds another venue id
+    /// an unconfirmed amend, or one confirmed without naming the new id, may have retired
+    /// ([`Self::id_may_have_moved`]). Applied, its price and total could confirm the amend and
+    /// settle the order while the record keeps the retired id, which later commands would
+    /// name (FBC-wua8). Such a snapshot is inconclusive: the order stays on the ladder, and a
+    /// tombstone by client id follows. A record holding no venue id has none to retire: the
+    /// snapshot teaches it one as an update would (Codex r4224963871 on PR #134).
     fn shown_elsewhere(&self, caps: &OrderCaps, vid: &VenueOrderId) -> bool {
-        self.id_may_have_moved(caps) && self.vid() != Some(vid)
+        self.id_may_have_moved(caps) && self.vid().is_some_and(|held| held != vid)
     }
 }
 
