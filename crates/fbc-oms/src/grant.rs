@@ -14,7 +14,7 @@
 //! is spent once (the compile-fail cases in `tests/ui_authorization/`).
 //!
 //! **At issue** (decision 0082). Only the registry that built a command authorizes it, and a
-//! registry is one account's: the account it was built for ([`Registry::for_account`]) or else
+//! registry is one account's: the account it was bound to ([`Registry::bind_account`]) or else
 //! the one its first authorization bound it to. A place, a batch or an amend is judged against
 //! the pre-trade caps again, with the position and our orders as they are when it is
 //! authorized, so one retained after its build while a fill moved the position is refused.
@@ -354,7 +354,7 @@ impl Registry {
     ///
     /// Refused for a command another registry built ([`IssueRefusal::OtherRegistry`]),
     /// changing nothing here. Refused for another account than the registry's: the one it was
-    /// built for ([`Registry::for_account`]), or else the one its first authorization bound it
+    /// bound to ([`Registry::bind_account`]), or else the one its first authorization bound it
     /// to ([`IssueRefusal::OtherAccount`]). A place, a batch or an amend is judged again
     /// against the caps: refused once its order no longer holds what its build reserved
     /// ([`IssueRefusal::Released`]), or once the position and our orders as they are now would

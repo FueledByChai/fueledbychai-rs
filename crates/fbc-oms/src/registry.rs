@@ -60,7 +60,8 @@ pub struct Registry {
     /// through one registry only (decision 0068), and only this registry authorizes or
     /// releases what it built (decision 0082).
     instance: Instance,
-    /// The account the registry is for: given at construction ([`Registry::for_account`]) or
+    /// The account the registry is for: bound before its first authorization
+    /// ([`Registry::bind_account`]) or
     /// bound by its first authorization; every authorization is for it (decision 0082).
     account: Option<AccountKey>,
 }
@@ -163,6 +164,10 @@ pub enum OmsError {
     /// whose command is still held, never authorized: nothing of it was sent, and it is
     /// withdrawn only with its command ([`Registry::place_not_submitted`]; decision 0082).
     NotIssued(ClientOrderId),
+    /// The registry is already bound to the account `bound`, by [`Registry::bind_account`] or
+    /// its first authorization, and was to be bound to `acct`: a binding never changes
+    /// (decision 0082).
+    AccountBound { acct: AccountKey, bound: AccountKey },
     /// A fill moved the market's inventory before its position was seeded.
     PositionMoved(InstrumentId),
 }
@@ -201,6 +206,10 @@ impl fmt::Display for OmsError {
             OmsError::PositionSeeded(inst) => {
                 write!(f, "the position on {inst:?} was already seeded")
             }
+            OmsError::AccountBound { acct, bound } => write!(
+                f,
+                "the registry is already bound to account {bound:?}; it is not bound to {acct:?}"
+            ),
             OmsError::NotIssued(cid) => write!(
                 f,
                 "the place of {cid:?} was never authorized: it is withdrawn only with its command"
@@ -230,16 +239,24 @@ impl Registry {
         }
     }
 
-    /// This registry for the account `acct`: every authorization it issues is for `acct`, its
-    /// first included, and one for another account is refused (decision 0082). A registry not
-    /// built for an account is bound to the account of its first authorization.
-    pub fn for_account(mut self, acct: AccountKey) -> Registry {
-        self.account = Some(acct);
-        self
+    /// Binds the registry to the account `acct`, before its first authorization: every
+    /// authorization it issues is then for `acct`, its first included, and one for another
+    /// account is refused (decision 0082). A registry never bound is bound to the account of
+    /// its first authorization. A binding never changes: binding a registry already bound to
+    /// another account is refused ([`OmsError::AccountBound`]) and changes nothing; the same
+    /// account again changes nothing.
+    pub fn bind_account(&mut self, acct: AccountKey) -> Result<(), OmsError> {
+        match self.account {
+            Some(bound) if bound != acct => Err(OmsError::AccountBound { acct, bound }),
+            _ => {
+                self.account = Some(acct);
+                Ok(())
+            }
+        }
     }
 
-    /// The account the registry is for: the one it was built for, or else the one its first
-    /// authorization bound it to; `None` before either.
+    /// The account the registry is for: the one it was bound to ([`Registry::bind_account`]),
+    /// or else the one its first authorization bound it to; `None` before either.
     pub fn account(&self) -> Option<AccountKey> {
         self.account
     }

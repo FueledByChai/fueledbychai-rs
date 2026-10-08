@@ -156,7 +156,7 @@
 //!
 //! A command is bound to the registry that built it and a registry to one account (decision
 //! 0082; `tests/retained.rs`): only that registry authorizes it, for the account the registry
-//! was built for ([`Registry::for_account`]) or else first authorized for ([`IssueRefusal`]),
+//! was bound to ([`Registry::bind_account`]) or else first authorized for ([`IssueRefusal`]),
 //! and a place, a batch or an amend is judged against the caps again as it is authorized, so
 //! one retained while a fill moved the position is refused, its reservation released. A place
 //! or batch item built and not yet authorized is withdrawn only with its command

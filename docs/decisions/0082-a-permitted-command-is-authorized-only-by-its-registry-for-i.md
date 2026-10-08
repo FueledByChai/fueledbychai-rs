@@ -33,8 +33,11 @@ takes. The caps were judged once, when a command was built. Codex's four P1s on 
    reserved in its own registry stays reserved there (fail closed). An amend's build token is
    (registry, client id, build number): `Registry::amend_not_submitted` releases nothing for
    another registry's amend.
-2. **A registry is one account's.** A registry is for the account given at construction
-   (`Registry::for_account`), or else the account of its first authorization, which binds it.
+2. **A registry is one account's.** A registry is for the account it is bound to before its
+   first authorization (`Registry::bind_account`), or else the account of its first
+   authorization, which binds it. A binding never changes: `bind_account` for another account
+   than the bound one is refused (`OmsError::AccountBound`) and changes nothing (Codex's P1
+   r4224412861 on PR #133).
    An authorization for any other account is refused (`IssueRefusal::OtherAccount`), cancels
    included. The execution planner refuses a pass for an account through a registry bound to
    another (`PlanError::OtherAccount`, as in 0068), before anything is built.
@@ -74,7 +77,8 @@ takes. The caps were judged once, when a command was built. Codex's four P1s on 
 - Make the account mandatory at construction: deferred. `fbc-runtime`'s and Paradex's tests
   and the owner's `testnet_trade` sample (PR #114) build registries without one; binding at
   the first authorization keeps one account per registry from then on, and a consumer that
-  builds with `for_account` has no first-authorization window. Follow-up ticket FBC-xz9m.
+  binds with `bind_account` before its first authorization has no first-authorization
+  window. Follow-up ticket FBC-xz9m.
 - Hand a command refused for another registry back to the caller: rejected. Another
   registry's command reaching this one is a wiring error; dropping it keeps its reservation
   held in its own registry, which overcounts, which fails closed.

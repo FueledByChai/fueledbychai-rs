@@ -334,7 +334,8 @@ fn a_command_from_one_registry_is_refused_when_authorized_for_another_account() 
 #[test]
 fn a_registry_built_for_an_account_refuses_its_first_authorization_for_another() {
     // Bound at construction, not only at its first authorization.
-    let mut reg = registry().for_account(ACCT);
+    let mut reg = registry();
+    reg.bind_account(ACCT).unwrap();
     assert_eq!(reg.account(), Some(ACCT));
     let cmd = reg.place(buy(5)).unwrap();
     assert_eq!(
@@ -550,4 +551,46 @@ fn the_refusals_say_what_was_refused() {
         OmsError::NotIssued(c).to_string(),
         format!("the place of {c:?} was never authorized: it is withdrawn only with its command")
     );
+}
+
+#[test]
+fn a_registry_bound_to_an_account_is_never_bound_to_another() {
+    // Codex P1 r4224412861 on PR #133: bound by its first authorization, a registry bound to
+    // another account afterwards would authorize commands judged against the first one's
+    // position. Refused, and the binding and the registry stay as they were.
+    let mut reg = registry();
+    let order = buy(5);
+    let c = order.cid;
+    let retained = reg.place(order).unwrap();
+    open(&mut reg, ACCT, buy(1), "a");
+    let refused = reg.bind_account(OTHER_ACCT).unwrap_err();
+    assert_eq!(
+        refused,
+        OmsError::AccountBound {
+            acct: OTHER_ACCT,
+            bound: ACCT
+        }
+    );
+    assert!(
+        refused.to_string().contains("already bound to account"),
+        "{refused}"
+    );
+    assert_eq!(reg.account(), Some(ACCT));
+    assert!(matches!(
+        reg.authorize(OTHER_ACCT, retained),
+        Err(IssueRefusal::OtherAccount { .. })
+    ));
+    assert!(reg.get(c).unwrap().state().is_terminal());
+    // Bound before any authorization, the same: the same account again is accepted.
+    let mut reg = registry();
+    reg.bind_account(ACCT).unwrap();
+    reg.bind_account(ACCT).unwrap();
+    assert_eq!(
+        reg.bind_account(OTHER_ACCT),
+        Err(OmsError::AccountBound {
+            acct: OTHER_ACCT,
+            bound: ACCT
+        })
+    );
+    assert_eq!(reg.account(), Some(ACCT));
 }
