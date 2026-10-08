@@ -704,6 +704,7 @@ pub fn not_cancelled(
 /// The client-id mint's high-water mark, kept in a file of the lease directory across runs, so
 /// a run whose wall clock stepped back never mints an id an earlier run used (the namespace
 /// lease keeps two minters apart, not two runs).
+#[derive(Clone)]
 pub struct HighWater {
     path: std::path::PathBuf,
 }
@@ -890,26 +891,33 @@ impl Driver {
 
     /// True unless a fill that is not of our orders came in (a liquidation, a settlement,
     /// another system's order), the venue reported the account's position other than the
-    /// position seeded at Start (or on another market), or a reconnect's resync disagreed
-    /// with the registry's inventory ([`resync_disagreements`]).
+    /// position seeded at Start (or on another market), a reconnect's resync disagreed with
+    /// the registry's inventory ([`resync_disagreements`]), or an order not ours is in view on
+    /// the market ([`Driver::account_changes`]).
     fn account_unmoved(&self) -> bool {
-        let link = self.link.borrow();
-        let disagreements = resync_disagreements(link.notes());
-        let mut unmoved = disagreements.is_empty();
-        for what in &disagreements {
-            self.note(format_args!(
-                "a resync found the position other than the registry's: {what}"
-            ));
+        let changes = self.account_changes();
+        for what in &changes {
+            self.note(format_args!("{what}"));
         }
+        changes.is_empty()
+    }
+
+    /// What shows the account changed since the seed, or might hold what the run cannot see:
+    /// a reconnect's resync disagreeing with the inventory ([`resync_disagreements`]), a fill
+    /// not of our orders, a position event other than the seeded position (or not flat on
+    /// another market), or an order not ours in view on the market. Empty when nothing does.
+    fn account_changes(&self) -> Vec<String> {
+        let link = self.link.borrow();
+        let mut changes: Vec<String> = resync_disagreements(link.notes())
+            .into_iter()
+            .map(|what| format!("a resync found the position other than the registry's: {what}"))
+            .collect();
         for note in link.notes() {
             match note {
                 Note::Fill {
                     seen,
                     unexplained: true,
-                } => {
-                    unmoved = false;
-                    self.note(format_args!("a fill not of our orders came in: {seen}"));
-                }
+                } => changes.push(format!("a fill not of our orders came in: {seen}")),
                 Note::Position { inst, qty } => {
                     // The market's position as seeded at Start; flat on any other market (the
                     // resync refuses an account with a position elsewhere).
@@ -919,8 +927,7 @@ impl Driver {
                         Some(SignedLots(0))
                     };
                     if expected != Some(*qty) {
-                        unmoved = false;
-                        self.note(format_args!(
+                        changes.push(format!(
                             "the venue reported the account's position in instrument {} as {} \
                              lots, not the {} lots the run expects",
                             inst.get(),
@@ -932,7 +939,14 @@ impl Driver {
                 _ => {}
             }
         }
-        unmoved
+        if link.registry().foreign_in_view(INST) {
+            changes.push(
+                "an order not ours is in view on the market (an order event showed it open): \
+                 Stop cannot cancel it nor the run count its fills"
+                    .to_owned(),
+            );
+        }
+        changes
     }
 
     /// True unless an order of ours on the market filled during the run, the resync's
@@ -1153,14 +1167,14 @@ impl Driver {
                 return false;
             }
         }
-        // A reconnect's resync since Start that disagrees with the inventory the caps judge
-        // the place against: nothing is placed on it.
-        let disagreements = resync_disagreements(self.link.borrow().notes());
-        if !disagreements.is_empty() {
+        // The account changed since the seed (a reconnect's resync disagreeing, a position
+        // event, a fill not of ours) or an order not ours came into view: the caps would judge
+        // the place against an inventory that is no longer the account's, so nothing is
+        // placed. The run's end reports what it was.
+        if !self.account_changes().is_empty() {
             self.note(format_args!(
-                "a resync since the seed found the position other than the registry's \
-                 ({}); nothing placed",
-                disagreements.join(", ")
+                "the account changed since the seed, or an order not ours is in view; nothing \
+                 placed"
             ));
             return false;
         }
@@ -1177,8 +1191,22 @@ impl Driver {
             }
         };
         self.owned.push((cid, Lots::ZERO));
-        // Kept before the id goes out, so no later run mints it again.
-        if let Err(e) = self.hwm.write(mint.high_water()) {
+        // Kept before the id goes out, so no later run mints it again: written and synced on
+        // a blocking thread, so a slow disk never stalls the runtime the session runs on, for
+        // at most the step timeout.
+        let hwm = self.hwm.clone();
+        let mark = mint.high_water();
+        let kept = tokio::time::timeout(
+            self.timeout,
+            tokio::task::spawn_blocking(move || hwm.write(mark)),
+        )
+        .await;
+        let kept = match kept {
+            Ok(Ok(written)) => written,
+            Ok(Err(e)) => Err(format!("the high-water mark's write failed: {e}")),
+            Err(_) => Err("the high-water mark's write did not finish in time".to_owned()),
+        };
+        if let Err(e) = kept {
             self.note(format_args!("{e}; nothing placed"));
             return false;
         }

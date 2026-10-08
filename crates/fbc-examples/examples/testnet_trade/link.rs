@@ -129,6 +129,11 @@ impl Link {
         &mut self.reg
     }
 
+    /// The registry, to read.
+    pub fn registry(&self) -> &Registry {
+        &self.reg
+    }
+
     /// The venue's order caps.
     pub fn caps(&self) -> &OrderCaps {
         &self.caps
