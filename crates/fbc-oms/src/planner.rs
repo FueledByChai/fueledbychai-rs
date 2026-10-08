@@ -420,7 +420,7 @@ impl ExecutionPlanner {
         mint: &mut CidMint,
         now: MonoNs,
     ) -> Result<Plan, PlanError> {
-        self.bind(acct, reg.instance())?;
+        self.bind(acct, reg)?;
         let market = desired.market;
         let config = self.config;
         let slots = self.slots.entry((acct, market)).or_default();
@@ -607,18 +607,22 @@ impl ExecutionPlanner {
         Ok(plan)
     }
 
-    /// Binds `acct` to the registry `instance` at its first pass; refuses another registry for
-    /// `acct`, or `instance` for another account. Client ids alone cannot tell two accounts'
-    /// registries apart: accounts may lease the same namespace (0068).
-    fn bind(&mut self, acct: AccountKey, instance: Instance) -> Result<(), PlanError> {
-        if let Some(bound) = self.bound.get(&acct) {
-            return if *bound == instance {
-                Ok(())
-            } else {
-                Err(PlanError::OtherRegistry { acct })
-            };
+    /// Binds `acct` to the registry `reg` at its first pass; refuses another registry for
+    /// `acct`, or `reg` for another account: one the planner bound it to, or the one the
+    /// registry is for (decision 0082). Client ids alone cannot tell two accounts' registries
+    /// apart: accounts may lease the same namespace (0068).
+    fn bind(&mut self, acct: AccountKey, reg: &Registry) -> Result<(), PlanError> {
+        let instance = reg.instance();
+        match self.bound.get(&acct) {
+            Some(bound) if *bound != instance => return Err(PlanError::OtherRegistry { acct }),
+            Some(_) => {}
+            None => {
+                if let Some((&bound, _)) = self.bound.iter().find(|(_, i)| **i == instance) {
+                    return Err(PlanError::OtherAccount { acct, bound });
+                }
+            }
         }
-        if let Some((&bound, _)) = self.bound.iter().find(|(_, i)| **i == instance) {
+        if let Some(bound) = reg.account().filter(|bound| *bound != acct) {
             return Err(PlanError::OtherAccount { acct, bound });
         }
         self.bound.insert(acct, instance);
@@ -704,8 +708,10 @@ fn new_order(market: InstrumentId, side: Side, cid: ClientOrderId, q: &DesiredQu
 }
 
 /// The authorization of a place, an amend or a cancel of one market the registry built, which
-/// it always issues.
-fn authorize(reg: &Registry, acct: AccountKey, cmd: PermittedCommand) -> Authorization {
+/// it always issues: the registry built it, for the account it is bound to or with none bound
+/// ([`ExecutionPlanner::bind`]), and nothing changed between its build and now, so judged again
+/// it is admitted as it was at its build (decision 0082).
+fn authorize(reg: &mut Registry, acct: AccountKey, cmd: PermittedCommand) -> Authorization {
     reg.authorize(acct, cmd)
         .expect("a place, an amend or a cancel of one market is always authorized")
 }

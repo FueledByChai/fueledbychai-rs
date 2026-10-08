@@ -4,4 +4,4 @@ error: cannot construct `fbc_oms::Live<'_>` with struct literal syntax due to pr
 6 |     Live { rec }
   |     ^^^^   --- private field
   |
-  = note: ...and other private fields `state`, `guard` and `exposure` that were not provided
+  = note: ...and other private fields `origin`, `state`, `guard` and `exposure` that were not provided
