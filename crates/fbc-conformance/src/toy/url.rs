@@ -10,8 +10,11 @@
 //! runtime never sends either, decision 0029) and one with a query or fragment (the toy appends
 //! its own paths and query to the base), rather than plan an address with a credential it
 //! cannot mark. It also refuses, at configuration time rather than at the first connection or
-//! request, an authority without a usable host or port, and an HTTP base ending in `/`, which
-//! the paths it appends would double (Codex r4219602934, r4219602924).
+//! request, an authority without a usable host or port, a path with a character a URI never
+//! holds, and an HTTP base ending in `/`, which the paths it appends would double (Codex
+//! r4219602934, r4219753503, r4219929307, r4219602924). A codec given a configured URL names
+//! its credentials wherever a frame or an HTTP response echoes them (r4219753519,
+//! r4219929319).
 
 use core::ops::Range;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -63,12 +66,17 @@ pub(super) fn configured(cfg: &VenueConfig, key: UrlKey) -> Result<WireUrl, Conf
              from 1 to 65535",
         ));
     }
+    let path_at = text.len() - rest.len() + authority.len();
+    if !path(&text[path_at..]) {
+        return Err(invalid(
+            "a path with a character a URI never holds: escape it as %XX",
+        ));
+    }
     if !key.socket && text.ends_with('/') {
         return Err(invalid(
             "a trailing /: the toy appends its own paths, each starting with one",
         ));
     }
-    let path_at = text.len() - rest.len() + authority.len();
     let spans = spans(cfg.get(key.redact).unwrap_or(""), key.redact, path_at)?;
     WireUrl::redacted(text.to_owned(), spans).map_err(|_| ConfigError::Invalid {
         key: key.redact,
@@ -117,6 +125,26 @@ fn named_host(host: &str) -> bool {
     }
 }
 
+/// Whether `path` is RFC 3986 path characters only (Codex r4219929307): unreserved, sub-delims,
+/// `:`, `@`, `/` and `%` escapes of two hex digits, so the runtime's URI parser takes it.
+fn path(path: &str) -> bool {
+    let mut bytes = path.bytes();
+    while let Some(b) = bytes.next() {
+        let ok = match b {
+            b'%' => {
+                let hex = |b: Option<u8>| b.is_some_and(|b| b.is_ascii_hexdigit());
+                hex(bytes.next()) && hex(bytes.next())
+            }
+            b if b.is_ascii_alphanumeric() => true,
+            _ => b"-._~!$&'()*+,;=:@/".contains(&b),
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
 /// The credentials `url`'s spans hold.
 pub(super) fn secrets(url: &WireUrl) -> Vec<String> {
     let text = url.as_str();
@@ -125,6 +153,37 @@ pub(super) fn secrets(url: &WireUrl) -> Vec<String> {
             .map(str::to_owned)
     };
     url.redactions().iter().filter_map(span).collect()
+}
+
+/// Every occurrence of any of `secrets` in `bytes` and every span of `also`, overlapping or
+/// adjacent ones as one span, in order.
+pub(super) fn occurrences(
+    bytes: &[u8],
+    secrets: &[String],
+    also: &[Range<u32>],
+) -> Vec<Range<u32>> {
+    let to_u32 = |at: usize| u32::try_from(at).unwrap_or(u32::MAX);
+    let mut found: Vec<Range<u32>> = also.to_vec();
+    for secret in secrets
+        .iter()
+        .map(String::as_bytes)
+        .filter(|s| !s.is_empty())
+    {
+        let hits = bytes
+            .windows(secret.len())
+            .enumerate()
+            .filter(|&(_, w)| w == secret);
+        found.extend(hits.map(|(i, _)| to_u32(i)..to_u32(i + secret.len())));
+    }
+    found.sort_by_key(|r| r.start);
+    let mut merged: Vec<Range<u32>> = Vec::new();
+    for r in found {
+        match merged.last_mut() {
+            Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+            _ => merged.push(r),
+        }
+    }
+    merged
 }
 
 /// What of an HTTP response holds any of `secrets` (Codex r4219753519): every occurrence in
@@ -140,22 +199,7 @@ pub(super) fn echoed(resp: &HttpResponse<'_>, secrets: &[String]) -> InboundSpan
             (false, false) => None,
         });
     let headers: Vec<_> = headers.collect();
-    let mut found: Vec<Range<usize>> = Vec::new();
-    for secret in secrets.iter().map(String::as_bytes) {
-        let at = resp.body.windows(secret.len().max(1)).enumerate();
-        let hits = at.filter(|&(_, w)| !secret.is_empty() && w == secret);
-        found.extend(hits.map(|(i, _)| i..i + secret.len()));
-    }
-    found.sort_by_key(|r| r.start);
-    let mut body: Vec<Range<u32>> = Vec::new();
-    for r in found {
-        let r =
-            u32::try_from(r.start).unwrap_or(u32::MAX)..u32::try_from(r.end).unwrap_or(u32::MAX);
-        match body.last_mut() {
-            Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
-            _ => body.push(r),
-        }
-    }
+    let body = occurrences(resp.body, secrets, &[]);
     InboundSpans::response(headers, body)
 }
 

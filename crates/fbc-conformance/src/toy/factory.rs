@@ -184,11 +184,14 @@ impl VenueFactory for ToyFactory {
 
     /// A fresh [`ToyMd`] on the endpoint's stream, anchored under the configured base; with
     /// none, or one refused, the anchored channel is refused when subscribed.
+    /// Its endpoint's URL's credentials are named wherever a frame echoes them.
     fn md_codec(&self, cfg: &VenueConfig, ep: &EndpointPlan) -> Box<dyn MdCodec> {
-        Box::new(match configured(cfg, ANCHOR_URL) {
+        let codec = match configured(cfg, ANCHOR_URL) {
             Ok(base) => ToyMd::with_anchor_url(ep.stream, base),
             Err(_) => ToyMd::new(ep.stream),
-        })
+        };
+        let (MdTransport::Socket { url } | MdTransport::Poll { base_url: url }) = &ep.transport;
+        Box::new(codec.socket_url(url))
     }
 
     /// One connection, [`EXEC_STREAM`] at the configured order-entry URL.
@@ -201,18 +204,23 @@ impl VenueFactory for ToyFactory {
     }
 
     /// A fresh codec signing with [`ToySigner`], which holds no key: the credentials are
-    /// dropped, and so zeroed, unread. It pings, and resyncs over REST under the configured
-    /// base when there is one; one configured and refused refuses the codec.
+    /// dropped, and so zeroed, unread. It pings, resyncs over REST under the configured base
+    /// when there is one, and names the configured URLs' credentials wherever a frame or
+    /// response echoes them; a URL configured and refused refuses the codec.
     fn exec_codec(
         &self,
         cfg: &VenueConfig,
         _creds: Secrets,
     ) -> Option<Result<Box<dyn ExecCodec>, VenueError>> {
         let codec = ToyExec::new(Box::new(ToySigner)).pinging();
-        let codec = match cfg.get(REST_URL_KEY) {
+        let codec = match cfg.get(EXEC_URL_KEY) {
+            None => Ok(codec),
+            Some(_) => configured(cfg, EXEC_URL).map(|url| codec.socket_url(&url)),
+        };
+        let codec = codec.and_then(|codec| match cfg.get(REST_URL_KEY) {
             None => Ok(codec),
             Some(_) => configured(cfg, REST_URL).map(|base| codec.rest_resync(base)),
-        };
+        });
         Some(
             codec
                 .map(|c| Box::new(c) as Box<dyn ExecCodec>)
