@@ -31,9 +31,11 @@ bound the answer.
   every order the epoch's resync shows `Open` whose client id is ours (`CidMatch::Ours`) is
   unprotected. 0058 holds every place until the resync has ended, so each of them was placed on
   an earlier epoch, or by an earlier process. An order another namespace or system placed (I4),
-  or one shown without a client id, is not ours to protect and is not counted. Where the
-  protection outlives a connection, an epoch that sends no arm (one was accepted earlier) keeps
-  the orders an earlier epoch found unprotected, since no arm covered them, and adds none.
+  or one shown without a client id, is not ours to protect and is not counted. A later epoch
+  keeps every order an earlier one found unprotected until an event or a query answer ends it:
+  no later arm covers it (where the protection outlives the connection, a later epoch sends no
+  arm at all), and a later snapshot may omit an order still resting (Paradex's is
+  untrustworthy, 0054). A later epoch that sends an arm adds what its own resync shows.
 - **Its market is held.** Once the epoch is placing (0058: its arm accepted and its resync
   ended), a place, a batch of places with any item, or an amend on the market of an
   unprotected order is `NotSent(Disconnected)`, with no nonce reserved and nothing written,
@@ -45,19 +47,20 @@ bound the answer.
   `ExecHandler::on_unprotected`; the consumer cancels each with a Safety cancel fbc-oms builds
   and authorizes (the session cannot authorize a command itself, 0013 rule 2).
 - **What releases the market.** An order event, or an order query's answer, of the epoch that
-  shows the order filled, cancelled, rejected or expired. An amend the venue reports under a new
-  venue id moves the order to it. An event naming a venue id names that order only, so an end
-  reported late under an id an amend superseded releases nothing whatever client id it
+  shows the order filled, cancelled, rejected or expired; an answer to a query by our client id
+  names the order by it, under whatever venue id it has now. An amend the venue reports under a
+  new venue id moves the order to it. An event naming a venue id names that order only, so an
+  end reported late under an id an amend superseded releases nothing whatever client id it
   carries; one naming no venue id names our order by its client id. What the epoch's events
-  showed before its resync ended (ends, and amends to new ids) is kept until it ends, so a
-  snapshot read after them (a resync over HTTP while the stream runs) does not undo them.
-  Nothing else releases a market: a cancel the venue refuses (an order it no longer knows, or
-  one already terminal) leaves it held until the consumer queries the order or the next epoch
-  that sends an arm reads the venue again. The same holds for an order a snapshot shows resting
-  after an event on an earlier epoch ended it (a snapshot lagging the stream): the consumer's
-  registry holds it ended and builds no cancel, so the consumer queries it, and the venue's
-  answer showing it ended releases the market. The runtime keeps no record of the ends of
-  earlier epochs, which would grow with every order the session ever saw end.
+  showed before its resync ended (ends, and amends to new ids, by venue id or, for an event
+  naming none, by our client id) is kept until it ends, so a snapshot read after them (a resync
+  over HTTP while the stream runs) does not undo them. Nothing else releases a market: a cancel
+  the venue refuses (an order it no longer knows, or one already terminal) leaves it held until
+  the consumer queries the order. The same holds for an order a snapshot shows resting after an
+  event on an earlier epoch ended it (a snapshot lagging the stream): the consumer's registry
+  holds it ended and builds no cancel, so the consumer queries it, and the venue's answer
+  showing it ended releases the market. The runtime keeps no record of the ends of earlier
+  epochs, which would grow with every order the session ever saw end.
 
 ## Alternatives
 

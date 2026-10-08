@@ -25,9 +25,10 @@
 //! id names that order only; one naming none names our order by its client id. What the epoch's
 //! events showed before its resync ended is kept, so an older snapshot of an order does not
 //! undo it. The consumer is told them once per epoch ([`Gate::notice`]) and cancels them through
-//! fbc-oms's authorizations; nothing else releases a market before the next epoch that sends an
-//! arm reads the venue again, and an epoch that sends none (the protection outliving the
-//! connection) keeps them held, since no arm covered them.
+//! fbc-oms's authorizations, or queries one its registry holds ended. Nothing else releases a
+//! market: a later epoch keeps every order an earlier one found unprotected, since no later arm
+//! covers it and a later snapshot may omit an order still resting, and adds what its own resync
+//! shows.
 
 use std::collections::{HashMap, HashSet};
 
@@ -98,9 +99,8 @@ pub(crate) struct Gate {
     /// An arm was accepted on some epoch.
     armed_once: bool,
     current: Option<Epoch>,
-    /// The orders of ours the latest epoch's resync showed resting, while no event of the
-    /// epoch has shown them ended; carried over a reconnect that sends no arm, since no arm
-    /// covered them.
+    /// The orders of ours a resync showed resting unprotected, while no event or query answer
+    /// has shown them ended, kept across epochs.
     unprotected: Vec<VenueOrderSnapshot>,
     /// What the latest epoch's events showed before its resync ended, so an older snapshot of
     /// an order does not undo it (Codex P1 r4219106981 on PR #127): the venue ids shown ended,
@@ -115,15 +115,21 @@ struct Early {
     ended: HashSet<VenueOrderId>,
     ended_cids: HashSet<ClientOrderId>,
     moved: HashMap<VenueOrderId, VenueOrderId>,
+    /// The venue id an amend naming our client id and no old venue id moved the order to.
+    moved_cids: HashMap<ClientOrderId, VenueOrderId>,
 }
 
 impl Early {
     /// Where the order shown as `vid` rests now, or `None` when an event showed it ended.
     fn now(&self, mut vid: VenueOrderId, cid: Option<CidMatch>) -> Option<VenueOrderId> {
-        if let Some(CidMatch::Ours(cid)) = cid
-            && self.ended_cids.contains(&cid)
-        {
-            return None;
+        if let Some(CidMatch::Ours(cid)) = cid {
+            if self.ended_cids.contains(&cid) {
+                return None;
+            }
+            // Codex P2 r4219551539 on PR #127.
+            if let Some(moved) = self.moved_cids.get(&cid) {
+                vid = moved.clone();
+            }
         }
         // Each step follows one amend; there are no more steps than amends heard. An amend away
         // from an id comes before an end heard under it, which names the superseded order
@@ -183,12 +189,9 @@ impl Gate {
             checks: arm == Arm::Due && !self.covers_open,
             told: false,
         });
-        // An epoch that sends an arm reads every order resting anew from its resync. One that
-        // sends none, where the protection outlives the connection, keeps what no arm covered
-        // (Codex P1 r4219106969 on PR #127).
-        if arm == Arm::Due {
-            self.unprotected.clear();
-        }
+        // What an earlier epoch found unprotected stays so until an event or a query answer
+        // ends it: no later arm covers it, and a later snapshot may omit an order still resting
+        // (Codex P1 r4219106969, r4219551549 on PR #127). The epoch's resync adds what it shows.
         self.early = Early::default();
     }
 
@@ -342,11 +345,16 @@ impl Gate {
                 }
             }
             ExecEvent::Order(u) => self.shown(u.cid, u.vid.as_ref(), &u.state, early),
-            ExecEvent::QueryResult(answer) => {
-                if let Some(found) = answer.found() {
-                    self.shown(found.cid, Some(&found.vid), &found.state, early);
+            // An answer to a query by our client id names the order by it, under whatever venue
+            // id it has now (Codex P2 r4219551529 on PR #127); the answer is the order's state
+            // now, never a late report under a superseded id.
+            ExecEvent::QueryResult(answer) => match (answer.found(), answer.target().client()) {
+                (Some(found), Some(cid)) => {
+                    self.shown(Some(CidMatch::Ours(cid)), None, &found.state, early);
                 }
-            }
+                (Some(found), None) => self.shown(found.cid, Some(&found.vid), &found.state, early),
+                (None, _) => {}
+            },
             _ => {}
         }
     }
@@ -375,8 +383,16 @@ impl Gate {
             VenueOrderState::Amended {
                 new_vid: Some(new_vid),
             } => {
-                if early && let Some(vid) = vid {
-                    self.early.moved.insert(vid.clone(), new_vid.clone());
+                if early {
+                    match (vid, ours) {
+                        (Some(vid), _) => {
+                            self.early.moved.insert(vid.clone(), new_vid.clone());
+                        }
+                        (None, Some(cid)) => {
+                            self.early.moved_cids.insert(cid, new_vid.clone());
+                        }
+                        (None, None) => {}
+                    }
                 }
                 self.unprotected
                     .iter_mut()
@@ -1007,12 +1023,15 @@ mod tests {
     }
 
     #[test]
-    fn the_next_epoch_reads_its_own_resync_and_holds_nothing_until_it_is_placing() {
+    /// Codex P1 r4219551549 on PR #127: a re-armed epoch's resync adds what it shows, and keeps
+    /// what an earlier epoch found unprotected even when it does not show it (an untrustworthy
+    /// snapshot may omit an order still resting), until an event or a query answer ends it.
+    fn the_next_epoch_adds_its_own_resync_keeps_what_was_unprotected_and_holds_nothing_until_it_is_placing()
+     {
         let mut gate = Gate::new(true, false);
         resynced(&mut gate, &[ours("V-1")]);
         assert!(gate.unprotected_on(INST));
         gate.authenticated(1);
-        assert!(gate.unprotected().is_empty());
         gate.arm_sent(1, RpcId(2));
         gate.resync_asked(1);
         gate.observe(1, &ExecEvent::ResyncOrder(ours("V-2")));
@@ -1021,7 +1040,51 @@ mod tests {
         assert_eq!(gate.notice(1), None);
         gate.heard(1, &ExecEvent::ResyncEnd);
         gate.heard(1, &accepted(2));
-        assert_eq!(gate.notice(1), Some(vec![ours("V-2")]));
+        assert_eq!(gate.notice(1), Some(vec![ours("V-1"), ours("V-2")]));
+        let cancelled = VenueOrderState::Canceled(CancelReason::Requested);
+        gate.observe(1, &update(None, Some("V-2"), cancelled));
+        assert!(gate.unprotected_on(INST));
+        let filled = snap(
+            Some(CidMatch::Ours(cid())),
+            "V-1",
+            INST,
+            VenueOrderState::Filled,
+        );
+        let answer = QueryAnswer::new(RpcId(9), OrderRef::Venue(vid("V-1")), Some(filled));
+        gate.observe(1, &ExecEvent::QueryResult(answer.unwrap()));
+        assert!(!gate.unprotected_on(INST));
+    }
+
+    /// Codex P2 r4219551529 on PR #127: an answer to a query by our client id names the order by
+    /// that id, under whatever venue id an amend gave it meanwhile.
+    #[test]
+    fn a_query_by_our_client_id_ends_the_order_under_its_new_venue_id() {
+        let mut gate = Gate::new(true, false);
+        resynced(&mut gate, &[ours("V-1")]);
+        let mine = Some(CidMatch::Ours(cid()));
+        let filled = snap(mine, "V-2", INST, VenueOrderState::Filled);
+        let answer = QueryAnswer::new(RpcId(9), OrderRef::Client(cid()), Some(filled));
+        gate.observe(0, &ExecEvent::QueryResult(answer.unwrap()));
+        assert!(!gate.unprotected_on(INST));
+    }
+
+    /// Codex P2 r4219551539 on PR #127: an amend heard before the snapshot that names our client
+    /// id and its new venue id but not the old one still moves the order the snapshot shows.
+    #[test]
+    fn an_early_amend_naming_only_our_client_id_moves_the_order_the_snapshot_shows() {
+        let mut gate = Gate::new(true, false);
+        gate.authenticated(0);
+        gate.arm_sent(0, RpcId(1));
+        gate.resync_asked(0);
+        let mine = Some(CidMatch::Ours(cid()));
+        let to_v2 = VenueOrderState::Amended {
+            new_vid: Some(vid("V-2")),
+        };
+        gate.observe(0, &update(None, None, to_v2.clone()));
+        gate.observe(0, &update(mine, None, to_v2));
+        gate.observe(0, &ExecEvent::ResyncOrder(ours("V-1")));
+        let vids: Vec<_> = gate.unprotected().iter().map(|o| o.vid.clone()).collect();
+        assert_eq!(vids, [vid("V-2")]);
     }
 
     #[test]

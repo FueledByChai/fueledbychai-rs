@@ -258,7 +258,7 @@ impl ExecOrders {
         self.may_place() && !self.shared.gate.borrow().unprotected_on(inst)
     }
 
-    /// The orders of ours the current epoch's resync showed resting that rest still
+    /// The orders of ours this or an earlier epoch's resync showed resting that rest still
     /// unprotected: placed on an earlier epoch, so the epoch's cancel-on-disconnect arm may not
     /// cover them, on a venue that does not declare that it does (`covers_open_orders`). Each
     /// holds its market until an order event or an order query's answer shows it ended; the
