@@ -1,5 +1,5 @@
 # The toy's `book` channel (BOOK), sequenced plus one per instrument (BookCaps.continuity
-# PlusOne): each `gap` frame breaks its instrument's sequence, and only those do.
+# PlusOne): each `gap=<symbol>` frame breaks that instrument's sequence, and only those do.
 text snap|sym=TOYA-PERP|book=0|seq=10|bid=100:3,98:5|ask=101:2
 text delta|sym=TOYA-PERP|book=0|seq=11|bid=100:4|ask=
 text snap|sym=TOYB-PERP|book=0|seq=500|bid=40:1|ask=42:1
@@ -7,11 +7,11 @@ text delta|sym=TOYA-PERP|book=0|seq=12|bid=|ask=101:0
 # TOYB's sequence is its own: 501 follows its 500, whatever TOYA's stands at.
 text delta|sym=TOYB-PERP|book=0|seq=501|bid=41:2|ask=
 # 13 never came.
-gap text delta|sym=TOYA-PERP|book=0|seq=14|bid=99:1|ask=
+gap=TOYA-PERP text delta|sym=TOYA-PERP|book=0|seq=14|bid=99:1|ask=
 # Waiting for its next snapshot: a delta is dropped, with no second gap.
 text delta|sym=TOYA-PERP|book=0|seq=15|bid=99:2|ask=
 text snap|sym=TOYA-PERP|book=0|seq=20|bid=100:1|ask=101:1
 text delta|sym=TOYA-PERP|book=0|seq=21|bid=100:2|ask=
 # A repeat breaks it too, and so does a sequence gone back.
-gap text delta|sym=TOYA-PERP|book=0|seq=21|bid=100:3|ask=
-gap text delta|sym=TOYB-PERP|book=0|seq=499|bid=41:0|ask=
+gap=TOYA-PERP text delta|sym=TOYA-PERP|book=0|seq=21|bid=100:3|ask=
+gap=TOYB-PERP text delta|sym=TOYB-PERP|book=0|seq=499|bid=41:0|ask=

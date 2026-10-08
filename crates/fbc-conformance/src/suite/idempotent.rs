@@ -5,14 +5,14 @@
 //! them with them.
 //!
 //! For every book channel the suite drives ([`book_cases`](super::book_cases)), the set is that
-//! channel on every instrument of the setup. In each of two epochs a codec built fresh from the
+//! channel on the instruments one connection carries. In each of two epochs a codec built fresh from the
 //! factory (one per epoch, as the runtime builds them) is opened, and the reconciler's call for
 //! the set is handed to its [`subscribe`](fbc_core::MdCodec::subscribe), which must take it,
-//! asking after the reconnect for as many effects as on the first connection (a codec that
-//! remembers the last connection's subscriptions sends them twice); then the same set is
+//! asking after the reconnect for exactly the effects it asked for on the first connection (a
+//! codec that remembers the last connection's subscriptions sends them twice); then the same set is
 //! desired again, and any call the reconciler yields is a breach. It reads no fixture file.
 
-use fbc_core::{ConnKey, Effects, MdCodec, SpecTable, VenueError};
+use fbc_core::{ConnKey, Effect, Effects, MdCodec, SpecTable, VenueError};
 use fbc_runtime::{Reconciler, SubscribeCall};
 
 use super::book_cases::{self, Book, NO_BOOK};
@@ -65,13 +65,12 @@ fn book_twice(h: &Harness<'_>, book: &Book, breaches: &mut Vec<Breach>) -> Optio
             }
         };
         let after = rec.sent(call).expect("the call of the current epoch");
-        // A reconnect's codec is fresh: it sends the set as the first did, nothing piled up.
-        if let Some(&before) = sent.first()
-            && before != first
-        {
+        // A reconnect's codec is fresh: it asks for exactly what the first did, nothing piled up
+        // in a payload or beside it (Codex r4217682449).
+        if sent.first().is_some_and(|before| *before != first) {
             let what = format!(
-                "{channel}: the reconnect's subscribe asked for {first} effects, the first \
-                 epoch's for {before}"
+                "{channel}: the reconnect's subscribe asked for other effects than the first \
+                 epoch's"
             );
             breaches.push(Breach::new("MdCodec::subscribe", what));
         }
@@ -90,19 +89,20 @@ fn book_twice(h: &Harness<'_>, book: &Book, breaches: &mut Vec<Breach>) -> Optio
         }
     }
     Some(format!(
-        "{channel}: {} subscriptions sent once in each of {EPOCHS} epochs ({sent:?} effects), \
+        "{channel}: {} subscriptions sent once in each of {EPOCHS} epochs ({:?} effects), \
          nothing for the same set again",
-        subs.len()
+        subs.len(),
+        sent.iter().map(Vec::len).collect::<Vec<_>>()
     ))
 }
 
-/// `call` handed to `codec`: how many effects it asked for, or why it refused.
+/// `call` handed to `codec`: the effects it asked for, or why it refused.
 fn handed(
     codec: &mut dyn MdCodec,
     call: &SubscribeCall,
     specs: &SpecTable,
-) -> Result<usize, VenueError> {
+) -> Result<Vec<Effect>, VenueError> {
     let mut fx = Effects::new();
     codec.subscribe(call.add(), call.remove(), specs, &mut fx)?;
-    Ok(fx.len())
+    Ok(fx.take())
 }

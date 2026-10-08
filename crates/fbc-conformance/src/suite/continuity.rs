@@ -2,10 +2,12 @@
 //! detected as the caps declare. For every book channel the suite drives
 //! ([`book_cases`](super::book_cases)) whose [`BookCaps::continuity`] chains its frames
 //! ([`Continuity::PlusOne`] or [`Continuity::PrevId`]), `continuity/<channel>.frames` marks
-//! with the `gap` tag each frame that breaks the book's sequence (a number skipped, repeated or
-//! gone back). The codec must push `Health { feed: Book(<that channel>), h: Gap }` from each
-//! marked frame, and no gap from any other frame: a break missed leaves a broken book trusted,
-//! and a gap reported in sequence throws a good one away. A case that marks no break proves
+//! with the `gap=<symbol>` tag each frame that breaks the sequence of that instrument's book (a
+//! number skipped, repeated or gone back). The codec must push `Health { inst: <that
+//! instrument>, feed: Book(<that channel>), h: Gap }` from each marked frame, a gap on no other
+//! instrument from it (Codex r4217682431), and no gap from any other frame: a break missed or
+//! put on another instrument leaves a broken book trusted, and a gap reported in sequence
+//! throws a good one away. A case that marks no break proves
 //! nothing and fails. A channel declared [`Continuity::Windowed`] or [`Continuity::Unsequenced`]
 //! has nothing to chain and is skipped by name.
 //!
@@ -14,13 +16,15 @@
 //! A venue whose market data is binary ([`Encoding::Sbe`] or [`Encoding::Protobuf`]) also
 //! gives `continuity/longer_block/<channel>.frames` for each channel: frames whose binary block
 //! is longer than the schema the codec was written against (a field the venue added). The codec
-//! must decode every one, pushing something, and report a gap exactly where the case marks one,
-//! if anywhere: a longer block is read by its declared length, never taken for a break or
+//! must decode every one, each pushing something (Codex r4217682441), and report a gap exactly
+//! where the case marks one, if anywhere: a longer block is read by its declared length, never taken for a break or
 //! refused. A text venue ([`Encoding::Json`] or [`Encoding::Text`]) has no binary block: the
 //! sub-case is skipped by name, and a `longer_block/` directory in its fixtures fails, as a
 //! case never read.
 
-use fbc_core::{BookCaps, Continuity, Encoding, Feed, FeedHealth, MdEvent};
+use fbc_core::{
+    BookCaps, Continuity, Encoding, Feed, FeedHealth, InstrumentId, MdEvent, SpecTable,
+};
 
 use super::book_cases::{self, Book, PerBook, Step};
 use super::harness::Harness;
@@ -63,7 +67,9 @@ fn run(
     let breaks = PerBook {
         check: CHECK,
         dir: CHECK,
-        judge: &|book, file, steps, breaches| judge(book, file, steps, breaches, true),
+        judge: &|book, file, steps, specs, breaches| {
+            judge(book, file, steps, specs, breaches, true)
+        },
     };
     let (mut probed, mut breaches) = breaks.run(h, subject, books, skipped)?;
     let dir = format!("{CHECK}/{LONGER}");
@@ -72,7 +78,9 @@ fn run(
             let longer = PerBook {
                 check: CHECK,
                 dir: &dir,
-                judge: &|book, file, steps, breaches| judge(book, file, steps, breaches, false),
+                judge: &|book, file, steps, specs, breaches| {
+                    judge(book, file, steps, specs, breaches, false)
+                },
             };
             let (more, broken) = longer.run(h, subject, books, Vec::new())?;
             probed.extend(more);
@@ -96,64 +104,82 @@ fn run(
     Ok((probed, breaches))
 }
 
-/// Whether `step` reported a gap on `book`'s channel, and whether it reported one on any feed.
-fn gaps(book: &Book, step: &Step) -> (bool, bool) {
-    let mut on_book = false;
-    let mut any = false;
-    for (_, ev) in &step.events {
-        if let MdEvent::Health {
-            feed,
-            h: FeedHealth::Gap,
-            ..
-        } = ev
-        {
-            any = true;
-            on_book |= *feed == Feed::Book(book.id);
-        }
-    }
-    (on_book, any)
-}
-
-/// Holds `book`'s case, read from `file`, to the gaps it marks: one reported from each marked
-/// frame and none from the others. `breaks` is the main case, which must mark one; the
-/// longer-block case must instead push something.
+/// Holds `book`'s case, read from `file`, to the gaps it marks: from each marked frame a gap on
+/// the instrument it names and no other, and none from the other frames. `breaks` is the main
+/// case, which must mark one; in the longer-block case every frame must instead push something.
 fn judge(
     book: &Book,
     file: &str,
     steps: &[Step],
+    specs: &SpecTable,
     breaches: &mut Vec<Breach>,
     breaks: bool,
 ) -> String {
     let capability = format!("BookCaps.continuity is {:?}", book.caps.continuity);
     let channel = book.caps.channel;
+    let symbol = |inst: InstrumentId| {
+        specs.get(inst).map_or_else(
+            || format!("{inst:?}"),
+            |s| s.venue_symbol.as_wire().to_owned(),
+        )
+    };
     let mut marked = 0usize;
     for step in steps {
-        let (on_book, any) = gaps(book, step);
         let line = step.line;
-        if step.tags.gap {
-            marked += 1;
-            if !on_book {
-                let what = format!(
-                    "{file} line {line} breaks the sequence, yet no gap was reported on {channel}"
-                );
+        // The instruments a gap was reported on, on this channel or any other feed.
+        let gapped: Vec<(InstrumentId, bool)> = step
+            .events
+            .iter()
+            .filter_map(|(_, ev)| match ev {
+                MdEvent::Health {
+                    inst,
+                    feed,
+                    h: FeedHealth::Gap,
+                } => Some((*inst, *feed == Feed::Book(book.id))),
+                _ => None,
+            })
+            .collect();
+        let Some(sym) = &step.tags.gap else {
+            if !gapped.is_empty() {
+                let what = format!("{file} line {line} is in sequence, yet a gap was reported");
                 breaches.push(Breach::new(&capability, what));
             }
-        } else if any {
-            let what = format!("{file} line {line} is in sequence, yet a gap was reported");
+            if !breaks && step.events.is_empty() {
+                let what = format!(
+                    "line {line} decodes to no event: a longer block must be read, not dropped"
+                );
+                breaches.push(Breach::new(file, what));
+            }
+            continue;
+        };
+        marked += 1;
+        let Some(inst) = specs.by_symbol(sym).map(|s| s.id) else {
+            let what = format!("line {line}: `gap={sym}` names no instrument of the setup");
+            breaches.push(Breach::new(file, what));
+            continue;
+        };
+        if !gapped.contains(&(inst, true)) {
+            let what = format!(
+                "{file} line {line} breaks {sym}'s sequence, yet no gap on {channel} was reported \
+                 for it"
+            );
+            breaches.push(Breach::new(&capability, what));
+        }
+        for (other, _) in gapped.iter().filter(|(i, _)| *i != inst) {
+            let what = format!(
+                "{file} line {line} breaks {sym}'s sequence, yet a gap was reported on {}",
+                symbol(*other)
+            );
             breaches.push(Breach::new(&capability, what));
         }
     }
     let frames = steps.len();
-    if breaks {
-        if marked == 0 {
-            let what = "marks no frame `gap`: a case that breaks no sequence proves nothing";
-            breaches.push(Breach::new(file, what));
-        }
-        return format!("{file}: {marked} of {frames} frames break the sequence");
+    if !breaks {
+        return format!("{file}: {frames} frames, {marked} breaking the sequence");
     }
-    if steps.iter().all(|s| s.events.is_empty()) {
-        let what = "decodes to no event: a case that decodes nothing proves nothing";
+    if marked == 0 {
+        let what = "marks no frame `gap=<symbol>`: a case that breaks no sequence proves nothing";
         breaches.push(Breach::new(file, what));
     }
-    format!("{file}: {frames} frames, {marked} breaking the sequence")
+    format!("{file}: {marked} of {frames} frames break the sequence")
 }

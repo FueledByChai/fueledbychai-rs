@@ -10,7 +10,7 @@
 //!
 //! - every channel a frame shows is one the book declares;
 //! - every channel the book declares is shown by some frame of the case;
-//! - every frame that pushes a level states its channels;
+//! - every frame that pushes a level states its channels, and only such a frame states any;
 //! - every book event a frame pushes (snapshot, level, window) is on the channel's own
 //!   [`BookId`](fbc_core::BookId).
 
@@ -31,7 +31,7 @@ pub fn book_channels(subject: &Subject<'_>) -> Result<Verdict, Failure> {
     let per_book = PerBook {
         check: CHECK,
         dir: CHECK,
-        judge: &|book, file, steps, breaches| {
+        judge: &|book, file, steps, _, breaches| {
             let declared = book.caps.includes_channels;
             let channel = book.caps.channel;
             let mut shown = BTreeSet::new();
@@ -57,6 +57,12 @@ pub fn book_channels(subject: &Subject<'_>) -> Result<Verdict, Failure> {
                         "line {line} pushes levels, yet states no order channel (public, rpi)"
                     );
                     breaches.push(Breach::new(file, what));
+                }
+                // A frame shows liquidity only in its levels (Codex r4217682460).
+                if !levels && !step.tags.shows.is_empty() {
+                    let what = format!("line {line} states order channels, yet pushes no level");
+                    breaches.push(Breach::new(file, what));
+                    continue;
                 }
                 for &c in &step.tags.shows {
                     shown.insert(c);

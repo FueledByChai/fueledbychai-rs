@@ -43,7 +43,7 @@ A check that reads recorded data reads it from a subdirectory named after the ch
   book channel the suite drives (`<channel>.frames`, in the format
   `crates/fbc-conformance/src/suite/book_cases.rs` documents), written by hand in the toy's own
   protocol (`crates/fbc-conformance/src/toy/md.rs`), each frame tagged with what the fixture
-  knows of it: the toy's `book` channel with its sequence breaks marked `gap`
+  knows of it: the toy's `book` channel with its sequence breaks marked `gap=<symbol>`
   (`continuity/book`), its frames carrying a timestamp marked `ts`
   (`no_exch_ts_synthesized/book`), and its frames marked with the order channels whose
   liquidity they show, public only (`book_channels/book`). The toy's `rpi_book` is anchored on

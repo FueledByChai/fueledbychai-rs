@@ -5,8 +5,12 @@
 //! # The book channels driven
 //!
 //! Each book channel the caps declare ([`MdCaps::books`](fbc_core::MdCaps), by
-//! [`BookId`] its index) is driven on its own: one codec, subscribed to that channel on every
-//! instrument of the [`Setup`](super::Setup)'s spec table. A channel whose
+//! [`BookId`] its index) is driven on its own: one codec, standing for one connection,
+//! subscribed to that channel on as many instruments of the [`Setup`](super::Setup)'s spec
+//! table, in order, as one connection carries under the venue's
+//! [`ConnTopology`](fbc_core::ConnTopology): the first alone for `PerInstrument`, the first
+//! `max_subscriptions` for a capped shared connection, every one otherwise. A case's frames
+//! name those instruments only. A channel whose
 //! [`BookCaps::rest_anchor`] is true is skipped by name, saying why: its snapshot comes in an
 //! HTTP answer, which these case files do not carry (FBC-fhk4).
 //!
@@ -24,7 +28,8 @@
 //! [<tag> ...] hex <bytes>
 //! ```
 //!
-//! - `gap`: the frame breaks its book's sequence ([`continuity`](super::continuity));
+//! - `gap=<symbol>`: the frame breaks the sequence of the instrument whose venue symbol is
+//!   `<symbol>` on its book ([`continuity`](super::continuity));
 //! - `ts`: the frame carries the venue's timestamp
 //!   ([`no_exch_ts_synthesized`](super::no_exch_ts_synthesized));
 //! - `public`, `rpi`: the order channels whose liquidity the frame shows
@@ -40,7 +45,8 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use fbc_core::{
-    BookCaps, BookId, Channel, DecodeError, Effects, MdEvent, MdSink, RawFrame, VenueMeta,
+    BookCaps, BookId, Channel, DecodeError, Effects, MdEvent, MdSink, RawFrame, SpecTable,
+    VenueMeta,
 };
 
 use super::frames::{self, EXT, unhex};
@@ -54,8 +60,8 @@ pub(crate) const ANCHORED: &str = "BookCaps.rest_anchor is true: its snapshot co
 /// What the fixture states of one frame.
 #[derive(Clone, Eq, PartialEq, Debug, Default)]
 pub(crate) struct Tags {
-    /// It breaks its book's sequence.
-    pub gap: bool,
+    /// It breaks the sequence of the instrument this venue symbol names.
+    pub gap: Option<String>,
     /// It carries the venue's timestamp.
     pub ts: bool,
     /// The order channels whose liquidity it shows.
@@ -65,8 +71,11 @@ pub(crate) struct Tags {
 impl Tags {
     /// Adds the tag `word`; `false` when it is none.
     fn add(&mut self, word: &str) -> bool {
+        if let Some(symbol) = word.strip_prefix("gap=").filter(|s| !s.is_empty()) {
+            self.gap = Some(symbol.to_owned());
+            return true;
+        }
         match word {
-            "gap" => self.gap = true,
             "ts" => self.ts = true,
             "public" => _ = self.shows.insert(Channel::Public),
             "rpi" => _ = self.shows.insert(Channel::Rpi),
@@ -116,7 +125,7 @@ pub(crate) fn parse(text: &str) -> Result<Vec<Line>, String> {
             };
             if !tags.add(word) {
                 return Err(format!(
-                    "line {n}: `{word}` is neither a frame nor a tag (gap, ts, public, rpi)"
+                    "line {n}: `{word}` is neither a frame nor a tag (gap=<symbol>, ts, public, rpi)"
                 ));
             }
             rest = after.trim_start();
@@ -218,9 +227,9 @@ pub(crate) fn decode(h: &Harness<'_>, book: &Book, case: &[Line]) -> Result<Vec<
     }))
 }
 
-/// Judges one channel's decoded case, read from the file named: pushes what breaks the check
-/// and gives what it probed.
-pub(crate) type Judge = dyn Fn(&Book, &str, &[Step], &mut Vec<Breach>) -> String;
+/// Judges one channel's decoded case, read from the file named, under the setup's spec table:
+/// pushes what breaks the check and gives what it probed.
+pub(crate) type Judge = dyn Fn(&Book, &str, &[Step], &SpecTable, &mut Vec<Breach>) -> String;
 
 /// A check that reads one case per driven book channel from `<fixtures>/<dir>/`.
 pub(crate) struct PerBook<'a> {
@@ -272,7 +281,7 @@ impl PerBook<'_> {
                     breaches.push(Breach::new(&file, what));
                 }
             }
-            probed.push((self.judge)(book, &file, &steps, &mut breaches));
+            probed.push((self.judge)(book, &file, &steps, h.specs(), &mut breaches));
         }
         let driven: BTreeSet<&str> = books.iter().map(|b| b.caps.channel).collect();
         for stem in on_disk.iter().filter(|s| !driven.contains(s.as_str())) {
@@ -318,7 +327,8 @@ mod tests {
 
     #[test]
     fn a_case_reads_tags_before_text_and_hex_frames_and_skips_comments() {
-        let case = parse("# c\n\ntext a|b=1\ngap ts text  c d\n public  rpi hex 0a ff\n").unwrap();
+        let case =
+            parse("# c\n\ntext a|b=1\ngap=X ts text  c d\n public  rpi hex 0a ff\n").unwrap();
         let rpi = Tags {
             shows: [Channel::Public, Channel::Rpi].into(),
             ..Tags::default()
@@ -334,7 +344,7 @@ mod tests {
                 Line {
                     line: 4,
                     tags: Tags {
-                        gap: true,
+                        gap: Some("X".to_owned()),
                         ts: true,
                         ..Tags::default()
                     },
@@ -352,15 +362,19 @@ mod tests {
     #[test]
     fn a_line_of_no_frame_an_unknown_tag_or_bad_hex_is_refused_by_number() {
         assert_eq!(
-            parse("text a\ngap").unwrap_err(),
+            parse("text a\ngap=X").unwrap_err(),
             "line 2: holds no `text ` or `hex ` frame"
         );
+        for bad in ["late", "gap", "gap="] {
+            assert_eq!(
+                parse(&format!("{bad} text a")).unwrap_err(),
+                format!(
+                    "line 1: `{bad}` is neither a frame nor a tag (gap=<symbol>, ts, public, rpi)"
+                )
+            );
+        }
         assert_eq!(
-            parse("late text a").unwrap_err(),
-            "line 1: `late` is neither a frame nor a tag (gap, ts, public, rpi)"
-        );
-        assert_eq!(
-            parse("gap hex zz").unwrap_err(),
+            parse("gap=X hex zz").unwrap_err(),
             "line 1: not hexadecimal bytes"
         );
     }
