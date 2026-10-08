@@ -306,7 +306,7 @@ fn a_snapshot_frame_it_cannot_decode_whole_pushes_nothing() {
     assert!(rig.fx.is_empty());
 
     // Nothing was anchored: a delta is dropped until a snapshot decodes whole.
-    rig.frame("delta|sym=TOYA-PERP|book=0|seq=11|bid=100:1|ask=")
+    rig.frame("delta|sym=TOYA-PERP|book=0|seq=10|bid=100:1|ask=")
         .unwrap();
     assert!(rig.pushed().is_empty());
     rig.frame("snap|sym=TOYA-PERP|book=0|seq=10|ts=7|bid=100:3|ask=")
@@ -750,9 +750,9 @@ fn the_held_high_water_mark_outlives_the_held_bound() {
 }
 
 #[test]
-fn a_book_snapshot_behind_what_the_channel_already_applied_is_dropped() {
-    // Codex r4216289341: a snapshot frame may not move BOOK back behind the sequence it had
-    // reached, after a gap or while live.
+fn a_book_snapshot_behind_a_sequence_already_seen_is_dropped() {
+    // Codex r4216289341, r4216898616: a snapshot frame may not move BOOK back behind the
+    // sequence it had applied, nor behind a delta it dropped, the one that broke it included.
     let mut rig = Rig::new();
     rig.subscribe(&[sub(INST_A, BOOK)], &[]).unwrap();
     rig.fx.take();
@@ -762,19 +762,26 @@ fn a_book_snapshot_behind_what_the_channel_already_applied_is_dropped() {
     rig.frame("delta|sym=TOYA-PERP|book=0|seq=12|bid=100:2|ask=")
         .unwrap();
     assert_eq!(rig.pushed(), [gap(INST_A, BOOK)]);
-    // A snapshot at 7 is behind 10: dropped, and the channel still waits.
-    rig.frame("snap|sym=TOYA-PERP|book=0|seq=7|bid=100:3|ask=")
+    // A snapshot at 7 is behind 10, one at 10 behind the dropped 12: both dropped, and the
+    // channel still waits.
+    for frame in [
+        "snap|sym=TOYA-PERP|book=0|seq=7|bid=100:3|ask=",
+        "delta|sym=TOYA-PERP|book=0|seq=8|bid=100:4|ask=",
+        "snap|sym=TOYA-PERP|book=0|seq=10|bid=100:3|ask=",
+    ] {
+        rig.frame(frame).unwrap();
+    }
+    assert!(rig.pushed().is_empty());
+    // A delta dropped while waiting raises the floor too: 13 is seen, so 12 is behind it.
+    rig.frame("delta|sym=TOYA-PERP|book=0|seq=13|bid=100:4|ask=")
         .unwrap();
-    rig.frame("delta|sym=TOYA-PERP|book=0|seq=8|bid=100:4|ask=")
+    rig.frame("snap|sym=TOYA-PERP|book=0|seq=12|bid=100:3|ask=")
         .unwrap();
     assert!(rig.pushed().is_empty());
-    // The floor outlives a dropped snapshot; one at 10 is live again, and 11 follows it.
-    rig.frame("snap|sym=TOYA-PERP|book=0|seq=9|bid=100:3|ask=")
+    // One at 13 is live again, and 14 follows it.
+    rig.frame("snap|sym=TOYA-PERP|book=0|seq=13|bid=100:5|ask=")
         .unwrap();
-    assert!(rig.pushed().is_empty());
-    rig.frame("snap|sym=TOYA-PERP|book=0|seq=10|bid=100:5|ask=")
-        .unwrap();
-    rig.frame("delta|sym=TOYA-PERP|book=0|seq=11|bid=100:6|ask=")
+    rig.frame("delta|sym=TOYA-PERP|book=0|seq=14|bid=100:6|ask=")
         .unwrap();
     let a = (INST_A, BOOK);
     assert_eq!(
@@ -793,10 +800,10 @@ fn a_book_snapshot_behind_what_the_channel_already_applied_is_dropped() {
             level(a.0, a.1, BID, 100, 6),
         ]
     );
-    // Live at 11, a snapshot at 10 is behind it too: dropped, and 12 still follows 11.
-    rig.frame("snap|sym=TOYA-PERP|book=0|seq=10|bid=100:7|ask=")
+    // Live at 14, a snapshot at 13 is behind it too: dropped, and 15 still follows 14.
+    rig.frame("snap|sym=TOYA-PERP|book=0|seq=13|bid=100:7|ask=")
         .unwrap();
-    rig.frame("delta|sym=TOYA-PERP|book=0|seq=12|bid=100:8|ask=")
+    rig.frame("delta|sym=TOYA-PERP|book=0|seq=15|bid=100:8|ask=")
         .unwrap();
     assert_eq!(rig.pushed(), [level(INST_A, BOOK, BID, 100, 8)]);
     assert!(rig.fx.is_empty());
