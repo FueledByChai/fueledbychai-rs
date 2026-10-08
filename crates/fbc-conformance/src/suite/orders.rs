@@ -256,7 +256,7 @@ fn judge_amend(
     };
     let placed = asked.placed.as_ref();
     // A new venue id is another than the one the order was placed under (Codex r4222138032).
-    if !amend.keeps_venue_id && (new_vid.is_none() || new_vid == placed) {
+    if !amend.keeps_venue_id && !renamed(new_vid, placed, update.vid.as_ref()) {
         let what = format!(
             "the amended order gets a new venue id, yet the update names {new_vid:?}, the \
              order having been placed under {placed:?}"
@@ -273,6 +273,18 @@ fn judge_amend(
         breaches.push(Breach::new("AmendCaps.keeps_venue_id is true", what));
     }
     breaches
+}
+
+/// Whether an amended update names a new venue id, `new_vid`: one, and another than both the
+/// id the order was placed under (`placed`, where fbc-oms knows it) and the id the update names
+/// the order by (`current`), so an unchanged id passes for a new one neither way (Codex
+/// r4222138032, r4223252204).
+fn renamed(
+    new_vid: Option<&VenueOrderId>,
+    placed: Option<&VenueOrderId>,
+    current: Option<&VenueOrderId>,
+) -> bool {
+    new_vid.is_some() && new_vid != placed && new_vid != current
 }
 
 /// Runs `mixed_batch` against `subject`.
@@ -491,5 +503,28 @@ fn verdict(
         Ok(Verdict::Passed { check, probed })
     } else {
         Err(Failure { check, breaches })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fbc_core::VenueOrderId;
+
+    use super::renamed;
+
+    fn vid(s: &str) -> VenueOrderId {
+        crate::toy::with_scope(|scope| scope.venue_order_id(s)).unwrap()
+    }
+
+    #[test]
+    fn a_new_venue_id_is_another_than_the_placed_one_and_the_one_the_update_names() {
+        let (a, b) = (vid("toy-1"), vid("toy-2"));
+        assert!(renamed(Some(&b), Some(&a), Some(&a)));
+        assert!(renamed(Some(&b), None, None));
+        assert!(!renamed(None, Some(&a), Some(&a)));
+        assert!(!renamed(Some(&a), Some(&a), None));
+        // The placement taught fbc-oms no venue id: the update's own is the old one (Codex
+        // r4223252204).
+        assert!(!renamed(Some(&a), None, Some(&a)));
     }
 }
