@@ -163,6 +163,17 @@ pub(crate) trait Control {
     async fn changed(&mut self) -> bool;
     /// Takes the control's latest state in.
     fn apply(&mut self);
+    /// Whether the session's codec outlives its epochs, so it still names the credentials in an
+    /// ended epoch's HTTP result ([`Control::spans`]); false by default, when the codec ended
+    /// with its epoch and such a result is hashed whole.
+    fn redacts(&self) -> bool {
+        false
+    }
+    /// The credentials the session's codec names in `input`, when [`Control::redacts`].
+    fn spans(&self, input: Inbound<'_>) -> InboundSpans {
+        let _ = input;
+        InboundSpans::NONE
+    }
 }
 
 /// What a session counted in its core.
@@ -208,6 +219,10 @@ pub(crate) struct Core {
     /// fills 0006 reserves room for and cannot be told apart before they are decoded (decision
     /// 0078).
     pub(crate) inbound: TrafficClass,
+    /// Whether one codec serves every epoch (an order-entry session's, 0053), so an ended
+    /// epoch's HTTP result is journaled with the spans that codec names, not hashed whole
+    /// (Codex P2 r4214053451 on PR #115).
+    pub(crate) one_codec: bool,
 }
 
 /// An HTTP request in flight.
@@ -264,6 +279,7 @@ impl Core {
             rates: config.rates,
             journal: None,
             inbound: TrafficClass::Normal,
+            one_codec: false,
         }
     }
 
@@ -334,7 +350,7 @@ impl Core {
                     _ = sleep_or_never(at) => Idle::Attempt,
                     _ = sleep_or_never(timer) => Idle::Timer,
                     Some(done) = self.http.next() => {
-                        let done = self.stamp_http(None, done);
+                        let done = self.stamp_idle(ctl, done);
                         let _ = self.admit_http(done)?;
                         Idle::Http
                     }
@@ -382,7 +398,7 @@ impl Core {
                             let _ = self.take_timer()?;
                         }
                         Some(done) = self.http.next() => {
-                            let done = self.stamp_http(None, done);
+                            let done = self.stamp_idle(ctl, done);
                             let _ = self.admit_http(done)?;
                         }
                     }
@@ -775,11 +791,20 @@ impl Core {
         ));
     }
 
+    /// Stamps an HTTP result that came back while the session waits to connect
+    /// ([`Self::stamp_http`]), with the spans `ctl`'s codec names in it when that codec outlives
+    /// its epochs.
+    fn stamp_idle(&self, ctl: &impl Control, done: Answered) -> (Stamp, Answered) {
+        let redact = |input: Inbound<'_>| ctl.spans(input);
+        let redact: Option<Redact<'_>> = ctl.redacts().then_some(&redact);
+        self.stamp_http(redact, done)
+    }
+
     /// Stamps an HTTP result as it comes back, under the epoch that asked for it, so it takes
     /// its place in the shard's ingest order even when it is dropped, and journals it there
     /// with the credentials the codec of that epoch names in it: `redact`, the current epoch's
-    /// codec's when one is running. A result of an ended epoch has no codec left to ask: all
-    /// of it is hashed ([`inbound_spans`]).
+    /// codec's when one is running. A result of an ended epoch has no codec left to ask, unless
+    /// one codec serves every epoch (`one_codec`): all of it is hashed ([`inbound_spans`]).
     pub(crate) fn stamp_http(
         &self,
         redact: Option<Redact<'_>>,
@@ -795,7 +820,7 @@ impl Core {
         // handed them, and so does the codec, asked for its spans first. A failure holds no byte
         // of a response and has nothing to name.
         if let Some(journal) = &self.journal {
-            let redact = redact.filter(|_| done.epoch == self.current().epoch);
+            let redact = redact.filter(|_| self.one_codec || done.epoch == self.current().epoch);
             let spans = with_response(&done.result, |resp| {
                 resp.map(|r| self.spans(redact, Inbound::Http(done.tag, r)))
             })

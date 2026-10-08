@@ -387,6 +387,7 @@ pub fn session_config_for(
             next: 0,
             log: Arc::clone(reserved),
         }),
+        nonce_source: fbc_journal::NonceSourceId(0),
         conn: 6,
         limiter: RateLimiter::new(&limits, reserve).unwrap(),
         write_stall: WriteStall::new(Duration::from_secs(3_600)).unwrap(),

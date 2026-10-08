@@ -40,8 +40,8 @@
 //! its kind and redaction spans and the result of the write (none for a write that failed,
 //! stalled or was interrupted, whose outcome is unknown, 0036), every HTTP request with its
 //! request id, and every codec timer that fires. It also records each nonce it reserves from
-//! the consumer's [`NonceSource`], one `Nonce` record per value under the account's number as
-//! the source, as it is reserved (a short reservation's values included), and the
+//! the consumer's [`NonceSource`], one `Nonce` record per value under the number the consumer
+//! gives that source ([`ExecSessionConfig::nonce_source`]), as it is reserved (a short reservation's values included), and the
 //! [`EncodeCtx`] it then hands `on_open`, `on_timer`, the resync or an `encode`, the encode's
 //! with its request id, just before the call. An inbound frame or HTTP result is journaled
 //! under Safety, since an order-entry stream carries acks and fills that cannot be told apart
@@ -223,6 +223,11 @@ pub struct ExecSessionConfig {
     pub clock: IngestClock,
     /// Where the nonces each epoch's `on_open` asks for are reserved.
     pub nonces: Box<dyn NonceSource>,
+    /// The number the journal names `nonces` by: one per scope the venue's
+    /// [`NonceScope`](fbc_core::NonceScope) names (an account, a signing key), the same for every
+    /// session that shares that source's sequence, so a restart reads every value it spent
+    /// (Codex P2 r4214053442 on PR #115).
+    pub nonce_source: NonceSourceId,
     /// The connection number stamped on this session's inputs, unique on its shard.
     pub conn: u16,
     /// The buckets of the venue's declared limits, shared with every session that counts
@@ -450,6 +455,7 @@ macro_rules! feed {
             handler: &mut $s.handler,
             nonces: &mut *$s.nonces,
             rec: &$s.rec,
+            clock: &$s.clock,
             caps: &$s.caps,
             ns: $s.ns,
             specs: &$s.specs,
@@ -505,9 +511,10 @@ impl<H: ExecHandler> ExecSession<H> {
         });
         // What an order-entry stream brings carries acks and fills (decision 0078).
         core.inbound = TrafficClass::Safety;
+        core.one_codec = true;
         let rec = Recorder {
             journal: None,
-            source: NonceSourceId(u32::from(config.acct.get())),
+            source: config.nonce_source,
         };
         let session = ExecSession {
             core,
@@ -761,7 +768,16 @@ impl<H: ExecHandler> ExecSession<H> {
     fn open(&mut self) -> Result<Effects, ExecSessionError> {
         let call = CtxCall::Open(self.stream);
         let (mono, wall) = self.core.clock.now();
-        let ctx = context(&*self.codec, &mut *self.nonces, &self.rec, call, mono, wall)?;
+        let (rec, clock) = (&self.rec, &self.clock);
+        let ctx = context(
+            &*self.codec,
+            &mut *self.nonces,
+            rec,
+            clock,
+            call,
+            mono,
+            wall,
+        )?;
         let mut fx = Effects::new();
         self.codec.on_open(self.stream, &ctx, &mut fx);
         Ok(fx)
@@ -1045,7 +1061,7 @@ impl<H: ExecHandler> ExecSession<H> {
             .ok_or(NotSentReason::Unencodable)
             .and_then(|(nonces, (mono, wall))| {
                 let ctx = EncodeCtx { wall, mono, nonces };
-                self.rec.ctx(journaled, Some(rpc), &ctx);
+                self.rec.ctx(journaled, wall, Some(rpc), &ctx);
                 let mut t = PathStamps::off();
                 self.codec
                     .encode(cmd, rpc, &self.specs, &ctx, &mut t, &mut fx)
@@ -1129,8 +1145,16 @@ impl<H: ExecHandler> ExecSession<H> {
         key: ConnKey,
     ) -> Result<bool, ExecSessionError> {
         let (mono, wall) = self.core.clock.now();
-        let call = CtxCall::Resync;
-        let ctx = context(&*self.codec, &mut *self.nonces, &self.rec, call, mono, wall)?;
+        let (call, rec, clock) = (CtxCall::Resync, &self.rec, &self.clock);
+        let ctx = context(
+            &*self.codec,
+            &mut *self.nonces,
+            rec,
+            clock,
+            call,
+            mono,
+            wall,
+        )?;
         let mut fx = Effects::new();
         self.codec.resync(&ctx, &mut fx);
         self.orders.gate.borrow_mut().resync_asked(key.epoch);
@@ -1161,7 +1185,7 @@ impl<H: ExecHandler> ExecSession<H> {
 
 /// Where an order-entry session journals the nonces it reserves and the contexts it gives its
 /// codec (FBC-2pr, decision 0078): nothing until the consumer sets a journal. The session's
-/// nonce source is journaled as the source numbered by its account.
+/// nonce source is journaled by the number the consumer gives it.
 struct Recorder {
     journal: Option<Journal>,
     source: NonceSourceId,
@@ -1178,11 +1202,12 @@ impl Recorder {
         }
     }
 
-    /// The context `ctx` given to a call, under `class`; `rpc` names an encode's request.
-    fn ctx(&self, class: TrafficClass, rpc: Option<RpcId>, ctx: &EncodeCtx) {
+    /// The context `ctx` given to a call, under `class`, filed under `wall`; `rpc` names an
+    /// encode's request.
+    fn ctx(&self, class: TrafficClass, wall: WallNs, rpc: Option<RpcId>, ctx: &EncodeCtx) {
         if let Some(journal) = &self.journal {
             let ctx = ctx.clone();
-            journal.record(class, ctx.wall, &Record::EncodeCtx { rpc, ctx });
+            journal.record(class, wall, &Record::EncodeCtx { rpc, ctx });
         }
     }
 }
@@ -1221,19 +1246,22 @@ fn budget_class(item: &Submitted) -> TrafficClass {
 
 /// The context for the codec's `call` at `mono` and `wall`: exactly the nonces it asks for,
 /// reserved from `nonces` (none when it asks for none), or why they could not be (0014 item 1).
-/// The nonces and the context are journaled through `rec` under Normal (decision 0078).
+/// The nonces and the context are journaled through `rec` under Normal (decision 0078), filed
+/// under `clock`'s time once the nonces are reserved (Codex P2 r4214053432 on PR #115).
 fn context(
     codec: &dyn ExecCodec,
     nonces: &mut dyn NonceSource,
     rec: &Recorder,
+    clock: &IngestClock,
     call: CtxCall,
     mono: MonoNs,
     wall: WallNs,
 ) -> Result<EncodeCtx, ExecSessionError> {
     let class = TrafficClass::Normal;
-    let (nonces, _) = reserve(nonces, codec.nonces_for(call), rec, class, || (mono, wall))?;
+    let asked = codec.nonces_for(call);
+    let (nonces, (_, filed)) = reserve(nonces, asked, rec, class, || clock.now())?;
     let ctx = EncodeCtx { wall, mono, nonces };
-    rec.ctx(class, None, &ctx);
+    rec.ctx(class, filed, None, &ctx);
     Ok(ctx)
 }
 
@@ -1307,6 +1335,15 @@ impl<H> Between<'_, H> {
 }
 
 impl<H: ExecHandler> Control for Between<'_, H> {
+    /// The session's one codec names the credentials in an ended epoch's result too.
+    fn redacts(&self) -> bool {
+        true
+    }
+
+    fn spans(&self, input: Inbound<'_>) -> InboundSpans {
+        self.codec.redact_inbound(input)
+    }
+
     /// True when there is something to report (at once when it already waits), false once the
     /// control dropped.
     async fn changed(&mut self) -> bool {
@@ -1371,6 +1408,7 @@ struct Feed<'a, H> {
     handler: &'a mut H,
     nonces: &'a mut dyn NonceSource,
     rec: &'a Recorder,
+    clock: &'a IngestClock,
     caps: &'a VenueCaps,
     ns: Namespace,
     specs: &'a SpecTable,
@@ -1402,7 +1440,16 @@ impl<H: ExecHandler> EpochInputs for Feed<'_, H> {
         }
         let call = CtxCall::Timer(tag);
         let (mono, wall) = (stamp.recv_mono, stamp.recv_wall);
-        match context(&*self.codec, &mut *self.nonces, self.rec, call, mono, wall) {
+        let (rec, clock) = (self.rec, self.clock);
+        match context(
+            &*self.codec,
+            &mut *self.nonces,
+            rec,
+            clock,
+            call,
+            mono,
+            wall,
+        ) {
             Ok(ctx) => self.codec.on_timer(tag, &ctx, fx),
             Err(e) => *self.fault = Some(e),
         }

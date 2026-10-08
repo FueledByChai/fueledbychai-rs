@@ -587,6 +587,7 @@ fn setup(
         pacing,
         clock: IngestClock::new(),
         nonces: Box::new(nonces),
+        nonce_source: fbc_journal::NonceSourceId(0),
         conn: CONN,
         limiter: limiter(),
         write_stall: WriteStall::new(Duration::from_secs(3_600)).unwrap(),
