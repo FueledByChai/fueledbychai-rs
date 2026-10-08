@@ -17,12 +17,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use fbc_conformance::suite::{self, Failure, Subject, Verdict};
 use fbc_conformance::toy::{ANCHORED_BOOK, INST_A, INST_B, ToyFactory};
 use fbc_core::{
-    AccountSummary, AssetKey, BookId, Channel, ConfigError, ConnTopology, Continuity, DecodeError,
-    DecodeScope, Effect, Effects, Encoding, EndpointPlan, ExchNs, ExecCodec, ExecEndpoint, Feed,
-    FeedHealth, FieldSpec, HttpFailure, HttpPlan, HttpResponse, HttpTag, Inbound, InboundSpans,
-    InstrumentSpecDraft, Keepalive, MdCodec, MdEvent, MdSink, MonoNs, RawFrame, Secrets, SpecTable,
-    Subscription, SymbolError, TagSet, TimerTag, VenueCaps, VenueConfig, VenueError, VenueFactory,
-    VenueMeta, WallNs, WireSlice,
+    AccountSummary, AssetKey, BookId, BookSide, Channel, ConfigError, ConnTopology, Continuity,
+    DecodeError, DecodeScope, Effect, Effects, Encoding, EndpointPlan, ExchNs, ExecCodec,
+    ExecEndpoint, Feed, FeedHealth, FieldSpec, HttpFailure, HttpPlan, HttpResponse, HttpTag,
+    Inbound, InboundSpans, InstrumentId, InstrumentSpecDraft, Keepalive, Lots, MdCodec, MdEvent,
+    MdSink, MonoNs, RawFrame, Secrets, SpecTable, Subscription, SymbolError, TagSet, Ticks,
+    TimerTag, VenueCaps, VenueConfig, VenueError, VenueFactory, VenueMeta, WallNs, WireSlice,
 };
 use toy_setup::{FIXTURES, assumed};
 
@@ -56,6 +56,9 @@ enum Twist {
     WrongInstrument,
     /// Every gap it reports on a book is also reported on the same instrument's trades.
     GapsTradesToo,
+    /// It keeps a broken book live: each gap it reports on a book is preceded by a level of
+    /// that book, and every later frame pushes one too until the book's next snapshot begins.
+    KeepsApplying,
     /// It reads a binary frame's bytes as the toy's text.
     BinaryText,
     /// Each codec its factory builds after the first also asks for a timer when it opens.
@@ -151,6 +154,7 @@ impl VenueFactory for Variant {
                 inner,
                 twist,
                 built: self.builds.fetch_add(1, Ordering::Relaxed),
+                broken: BTreeSet::new(),
             }),
         }
     }
@@ -182,6 +186,66 @@ struct Twisted {
     twist: Twist,
     /// How many codecs its factory built before it.
     built: u64,
+    /// The books it reported a gap on and has had no snapshot of since ([`Twist::KeepsApplying`]).
+    broken: BTreeSet<(InstrumentId, BookId)>,
+}
+
+/// The events a twisted codec's toy pushed from one call.
+struct Collect(Vec<(VenueMeta, MdEvent)>);
+
+impl MdSink for Collect {
+    fn push(&mut self, meta: VenueMeta, ev: MdEvent) {
+        self.0.push((meta, ev));
+    }
+}
+
+/// A level of `book` on `inst`, as a codec that keeps a broken book live would push.
+fn stray_level(inst: InstrumentId, book: BookId) -> MdEvent {
+    MdEvent::Level {
+        inst,
+        book,
+        side: BookSide::Bid,
+        px: Ticks(1),
+        qty: Lots::new(1).unwrap(),
+    }
+}
+
+impl Twisted {
+    /// [`Twist::KeepsApplying`]'s frame: the toy's events, a level before each gap on a book,
+    /// and a level of every book still broken from an earlier frame.
+    fn keep_applying(
+        &mut self,
+        f: RawFrame<'_>,
+        scope: &DecodeScope<'_>,
+        specs: &SpecTable,
+        sink: &mut dyn MdSink,
+        fx: &mut Effects,
+    ) -> Result<(), DecodeError> {
+        let mut toy = Collect(Vec::new());
+        let outcome = self.inner.on_frame(f, scope, specs, &mut toy, fx);
+        let before = self.broken.clone();
+        for (meta, ev) in toy.0 {
+            match ev {
+                MdEvent::Health {
+                    inst,
+                    feed: Feed::Book(book),
+                    h: FeedHealth::Gap,
+                } => {
+                    sink.push(meta, stray_level(inst, book));
+                    self.broken.insert((inst, book));
+                }
+                MdEvent::BookSnapshotBegin { inst, book, .. } => {
+                    self.broken.remove(&(inst, book));
+                }
+                _ => {}
+            }
+            sink.push(meta, ev);
+        }
+        for &(inst, book) in before.intersection(&self.broken) {
+            sink.push(VenueMeta::NONE, stray_level(inst, book));
+        }
+        outcome
+    }
 }
 
 /// A sink that rewrites what a twisted codec pushes.
@@ -301,6 +365,9 @@ impl MdCodec for Twisted {
         fx: &mut Effects,
     ) -> Result<(), DecodeError> {
         let twist = self.twist;
+        if twist == Twist::KeepsApplying {
+            return self.keep_applying(f, scope, specs, sink, fx);
+        }
         let text;
         let f = match (twist, f) {
             (Twist::BinaryText, RawFrame::Binary(bytes)) => {
@@ -637,6 +704,31 @@ fn continuity_fails_a_toy_that_reports_a_break_on_another_feed_too() {
         said[0],
         "continuity/book.frames line 10 breaks TOYA-PERP's sequence, yet a gap was reported on \
          TOYA-PERP's Trades"
+    );
+}
+
+#[test]
+fn continuity_fails_a_toy_that_keeps_a_broken_book_live_until_its_snapshot() {
+    // Codex r4218167354: a level of a broken book, from the frame that breaks it (before its
+    // gap) or from any later frame before its next snapshot begins, is applied by a consumer
+    // that trusts it.
+    let failure = failed(Variant::twisted(Twist::KeepsApplying).run(suite::continuity));
+    assert_eq!(named(&failure), [PLUS_ONE; 5]);
+    let broken = |line: u32, sym: &str| {
+        format!(
+            "continuity/book.frames line {line} pushes a level of {sym}'s book while its \
+             sequence is broken: a broken book takes nothing until its next snapshot"
+        )
+    };
+    assert_eq!(
+        said(&failure, PLUS_ONE),
+        [
+            broken(10, "TOYA-PERP"),
+            broken(12, "TOYA-PERP"),
+            broken(16, "TOYA-PERP"),
+            broken(17, "TOYB-PERP"),
+            broken(17, "TOYA-PERP"),
+        ]
     );
 }
 
