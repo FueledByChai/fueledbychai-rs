@@ -61,8 +61,8 @@ Options:
                             (default wss://ws.api.testnet.paradex.trade/v1)
   --socks5 <HOST:PORT>      connect through this SOCKS5 proxy (default: directly); refused
                             with loopback stub URLs, which the proxy would resolve on its host
-  --lease-dir <DIR>         where the market, account and client-id leases are taken, and the
-                            client-id high-water mark is kept across runs
+  --lease-dir <DIR>         an absolute path where the market, account and client-id leases
+                            are taken, and the client-id high-water mark is kept across runs
                             (default: $HOME/.fueledbychai/testnet_trade; kept across reboots,
                             unlike a temporary directory)
   -h, --help                print this help
@@ -241,7 +241,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             "--rest-url" => rest_url = value()?,
             "--ws-url" => ws_url = value()?,
             "--socks5" => proxy = socks5(&value()?)?,
-            "--lease-dir" => lease_dir = Some(PathBuf::from(value()?)),
+            "--lease-dir" => lease_dir = Some(absolute(&value()?)?),
             // A flag (it starts with '-') is named; anything else may be a pasted secret.
             _ if flag.starts_with('-') => {
                 return Err(format!("unknown argument {flag}; --help lists them"));
@@ -494,13 +494,47 @@ fn socks5(value: &str) -> Result<ProxyConfig, String> {
         .ok()
         .filter(|p| *p > 0)
         .ok_or_else(bad)?;
-    if host.is_empty() {
+    if !proxy_host(host) {
         return Err(bad());
     }
     Ok(ProxyConfig::Socks5 {
         host: host.to_owned(),
         port,
     })
+}
+
+/// Whether `host` is an IPv4 address, a bracketed IPv6 one, or a DNS name (labels of 1 to 63
+/// ASCII letters, digits and '-', none starting or ending with '-', 253 characters at most).
+/// A pasted key or token (a label longer than DNS allows, or other characters) is refused
+/// before it reaches a resolver.
+fn proxy_host(host: &str) -> bool {
+    if let Some(v6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return v6.parse::<std::net::Ipv6Addr>().is_ok();
+    }
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return true;
+    }
+    host.len() <= 253
+        && host.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
+/// `--lease-dir`'s value, which must be an absolute path: a relative one is refused, so a
+/// value pasted there by mistake (a key) never becomes a directory in the working directory
+/// nor appears in a later error. The refusal never shows the value.
+fn absolute(value: &str) -> Result<PathBuf, String> {
+    let dir = PathBuf::from(value);
+    if dir.is_absolute() {
+        Ok(dir)
+    } else {
+        Err(format!("--lease-dir: not an absolute path{UNSHOWN}"))
+    }
 }
 
 /// A positive decimal.
