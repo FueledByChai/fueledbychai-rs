@@ -113,8 +113,14 @@ fn reply(status: u16, body: impl Into<Vec<u8>>) -> HttpReply {
     }
 }
 
-/// The stub's HTTP answers: the login, the order book and the resync's two reads.
+/// The stub's HTTP answers: the login, the order book and the resync's two reads (no open
+/// order, no position).
 fn routes() -> HttpRouter {
+    routes_with(r#"{"results":[]}"#.to_owned())
+}
+
+/// As [`routes`], `GET /orders` answering `orders`.
+fn routes_with(orders: String) -> HttpRouter {
     let book = fs::read(fixture("paradex/rest/orderbook-btc-2002.json")).unwrap();
     let empty = r#"{"results":[]}"#;
     HttpRouter::new()
@@ -131,7 +137,7 @@ fn routes() -> HttpRouter {
         .route(
             Method::GET,
             PathPattern::exact("/v1/orders"),
-            reply(200, empty),
+            reply(200, orders),
         )
         .route(
             Method::GET,
@@ -151,6 +157,11 @@ fn e8(text: &str) -> i64 {
 /// `price`, venue id `vid`, CLOSED by USER_CANCELED with nothing filled. The account is 32
 /// made-up bytes.
 fn order_closed(seq: i64, vid: &str, cid: &str, price: &str, size: &str) -> Vec<u8> {
+    order_closed_on(1, seq, vid, cid, price, size)
+}
+
+/// As [`order_closed`], on `side` (1 BUY, 2 SELL).
+fn order_closed_on(side: u8, seq: i64, vid: &str, cid: &str, price: &str, size: &str) -> Vec<u8> {
     let null = i64::MIN;
     let ts = 1_759_500_000_205_011i64;
     let mut f = Vec::new();
@@ -159,7 +170,7 @@ fn order_closed(seq: i64, vid: &str, cid: &str, price: &str, size: &str) -> Vec<
     }
     f.extend(ts.to_le_bytes());
     f.extend(seq.to_le_bytes());
-    f.extend([4u8, 1, 1, 3]); // CLOSED, BUY, LIMIT, POST_ONLY
+    f.extend([4u8, side, 1, 3]); // CLOSED, the side, LIMIT, POST_ONLY
     f.extend(e8(price).to_le_bytes());
     f.extend(null.to_le_bytes()); // triggerPrice
     f.extend(e8(size).to_le_bytes()); // size
@@ -191,6 +202,24 @@ struct Placed {
 /// subscriptions with an empty result, the arm with `enabled: true`, the place with its order
 /// under [`VID`], the cancel queued and then the order event closing the order.
 fn responder(placed: Arc<Mutex<Placed>>) -> Responder {
+    responder_with(placed, Arc::new(Vec::new()), true)
+}
+
+/// An open order of ours an earlier run left: its venue id and wire client id, a post-only sell
+/// of 0.00001 at 70000.
+struct Restored {
+    vid: String,
+    cid: String,
+}
+
+/// As [`responder`], answering a batch cancel of `restored` too: every item queued and then
+/// each order's event closing it when `close`, otherwise the second item `ALREADY_CLOSED` and no
+/// order event.
+fn responder_with(
+    placed: Arc<Mutex<Placed>>,
+    restored: Arc<Vec<Restored>>,
+    close: bool,
+) -> Responder {
     Responder::new(move |frame| {
         let Frame::Text(text) = frame else {
             return Err("a binary frame from the client".to_owned());
@@ -222,9 +251,75 @@ fn responder(placed: Arc<Mutex<Placed>>) -> Responder {
                 let closed = order_closed(5_001, VID, &p.cid, &p.price, &p.size);
                 Ok(vec![queued, Frame::Binary(closed)])
             }
+            "order.cancel_batch" => {
+                let ids = params["order_ids"].as_array().cloned().unwrap_or_default();
+                let mut results = Vec::new();
+                let mut events = Vec::new();
+                for (i, id) in ids.iter().enumerate() {
+                    let vid = id.as_str().unwrap_or("");
+                    let ours = restored
+                        .iter()
+                        .find(|r| r.vid == vid)
+                        .ok_or("not restored")?;
+                    let status = if close || i == 0 {
+                        "QUEUED_FOR_CANCELLATION"
+                    } else {
+                        "ALREADY_CLOSED"
+                    };
+                    results.push(json!({"id": vid, "market": MARKET, "status": status}));
+                    if close {
+                        let seq = 6_000 + i64::try_from(i).unwrap();
+                        let ev = order_closed_on(2, seq, vid, &ours.cid, "70000", "0.00001");
+                        events.push(Frame::Binary(ev));
+                    }
+                }
+                let mut frames = vec![ok(json!({"results": results}))];
+                frames.extend(events);
+                Ok(frames)
+            }
             other => Err(format!("an unexpected method {other}")),
         }
     })
+}
+
+/// Two open orders of ours an earlier run left on the market, their client ids minted in our
+/// namespace (account 1, namespace 1) under a lease of their own, and the `GET /orders`
+/// answer that shows them.
+fn restored() -> (Vec<Restored>, String) {
+    use fbc_core::{AccountKey, CidMint, Namespace, NamespaceLease, WallNs, encode_cid};
+    let lease =
+        NamespaceLease::acquire(&lease_dir(), AccountKey::new(1), Namespace::new(1)).unwrap();
+    let mut mint = CidMint::new(lease, 0, 0, WallNs(1_000_000_000));
+    let fmt = fbc_venue_paradex::exec::exec_caps().order.client_id;
+    let orders: Vec<Restored> = ["1759500000000000901", "1759500000000000902"]
+        .into_iter()
+        .map(|vid| Restored {
+            vid: vid.to_owned(),
+            cid: encode_cid(&fmt, mint.mint().unwrap()).unwrap().to_string(),
+        })
+        .collect();
+    let results: Vec<Value> = orders
+        .iter()
+        .map(|o| {
+            json!({
+                "id": o.vid, "client_id": o.cid, "market": MARKET, "side": "SELL",
+                "type": "LIMIT", "instruction": "POST_ONLY", "price": "70000",
+                "size": "0.00001", "remaining_size": "0.00001", "status": "OPEN", "flags": [],
+            })
+        })
+        .collect();
+    (orders, json!({ "results": results }).to_string())
+}
+
+/// The happy script with the batch cancel of the restored orders after it.
+fn restored_script(placed: Arc<Mutex<Placed>>, restored: Vec<Restored>, close: bool) -> WsScript {
+    let with = responder_with(placed, Arc::new(restored), close);
+    let mut steps = vec![Step::Accept];
+    steps.extend((0..9).map(|_| Step::Respond {
+        conn: 0,
+        with: with.clone(),
+    }));
+    WsScript::new(steps)
 }
 
 /// The order socket's script: one connection, eight frames answered (auth, four
@@ -519,6 +614,12 @@ fn the_command_line_defaults_to_testnet_and_refuses_mainnet_urls() {
     assert_eq!(opts.rest_url, "https://api.testnet.paradex.trade/v1");
     assert_eq!(opts.ws_url, "wss://ws.api.testnet.paradex.trade/v1");
     assert_eq!((opts.side, opts.away_bps), (OrderSide::Buy, 300));
+    // The leases and the client-id high-water mark default to a directory that outlives a
+    // reboot, never the temporary directory.
+    assert!(
+        opts.lease_dir.ends_with(".fueledbychai/testnet_trade"),
+        "{opts:?}"
+    );
     for (flag, url) in [
         ("--rest-url", "https://api.prod.paradex.trade/v1"),
         ("--ws-url", "wss://ws.api.prod.paradex.trade/v1"),
@@ -743,4 +844,107 @@ fn the_resync_the_run_seeds_from_is_the_latest() {
     ];
     let (_, snap) = trade::latest_resync(&notes).unwrap();
     assert_eq!(snap.positions, [(InstrumentId::new(1), SignedLots(-2))]);
+}
+
+#[tokio::test]
+async fn stop_cancels_an_earlier_runs_orders_and_waits_for_them_to_end() {
+    let (orders, body) = restored();
+    let cids: Vec<String> = orders.iter().map(|o| o.cid.clone()).collect();
+    let placed = Arc::new(Mutex::new(Placed::default()));
+    let stub = StubServer::start(
+        restored_script(Arc::clone(&placed), orders, true),
+        routes_with(body),
+    )
+    .await
+    .unwrap();
+    let opts = options(&stub, "10");
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(report.ok, "{printed}");
+    assert!(
+        printed.contains("2 open orders (2 on the market)"),
+        "{printed}"
+    );
+    assert!(printed.contains("cancel all: 1 cancels sent"), "{printed}");
+    assert_eq!(
+        (report.places_sent, report.cancels_sent),
+        (1, 2),
+        "{printed}"
+    );
+    assert_eq!(
+        methods(&stub)
+            .iter()
+            .filter(|m| *m == "order.cancel_batch")
+            .count(),
+        1
+    );
+    // The mint is floored by the restored ids the resync showed: the place reuses neither.
+    let p = placed.lock().unwrap();
+    assert!(!cids.contains(&p.cid), "{}", p.cid);
+}
+
+#[tokio::test]
+async fn a_batch_cancel_with_an_item_refused_and_no_order_event_fails_the_stop() {
+    let (orders, body) = restored();
+    let placed = Arc::new(Mutex::new(Placed::default()));
+    let stub = StubServer::start(
+        restored_script(Arc::clone(&placed), orders, false),
+        routes_with(body),
+    )
+    .await
+    .unwrap();
+    let mut opts = options(&stub, "10");
+    opts.step_timeout_secs = 1;
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    // Every step of the round trip happened, but Stop did not cancel what it found: the second
+    // item is refused, so the batch is not accepted on its first item alone, and no order event
+    // reports either ended.
+    assert!(!report.ok, "{printed}");
+    assert!(printed.contains("came back Rejected"), "{printed}");
+    assert!(printed.contains("TIMEOUT stop"), "{printed}");
+    assert!(printed.contains("DONE failed"), "{printed}");
+}
+
+#[test]
+fn the_snapshot_floor_is_the_highest_of_our_ids_it_shows() {
+    use fbc_core::{
+        AccountKey, CidMatch, CidMint, InstrumentId, Lots, MonoNs, Namespace, NamespaceLease, Side,
+        VenueOrderSnapshot, VenueOrderState, WallNs,
+    };
+    use fbc_oms::ResyncSnapshot;
+    let lease =
+        NamespaceLease::acquire(&lease_dir(), AccountKey::new(1), Namespace::new(1)).unwrap();
+    let mut mint = CidMint::new(lease, 41, 0, WallNs(0));
+    let (a, b) = (mint.mint().unwrap(), mint.mint().unwrap());
+    let vid = |v: &str| {
+        let caps = fbc_venue_paradex::factory::caps();
+        fbc_core::dispatch(&caps, Namespace::new(1), |scope| scope.venue_order_id(v)).unwrap()
+    };
+    let open = |cid, v: &str| VenueOrderSnapshot {
+        cid,
+        vid: vid(v),
+        inst: InstrumentId::new(1),
+        side: Side::Sell,
+        state: VenueOrderState::Open,
+        px: None,
+        qty: Lots::new(1).unwrap(),
+        cum_filled: Lots::new(0).unwrap(),
+        post_only: None,
+        reduce_only: None,
+    };
+    let mut snap = ResyncSnapshot {
+        watermark: WallNs(0),
+        requested_at: MonoNs(0),
+        orders: vec![],
+        positions: vec![],
+    };
+    assert_eq!(trade::snapshot_max(&snap), 0);
+    snap.orders = vec![
+        open(Some(CidMatch::Ours(b)), "V-2"),
+        open(Some(CidMatch::Foreign(Namespace::new(9))), "V-3"),
+        open(Some(CidMatch::Ours(a)), "V-1"),
+        open(None, "V-4"),
+    ];
+    assert_eq!(trade::snapshot_max(&snap), 43);
 }

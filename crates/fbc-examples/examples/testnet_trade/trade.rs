@@ -194,7 +194,9 @@ pub async fn run(
     };
     let ns_lease = NamespaceLease::acquire(&opts.lease_dir, ACCT, NS).map_err(|e| held(&e))?;
     let hwm = HighWater::at(&opts.lease_dir);
-    let mint = CidMint::new(ns_lease, hwm.read()?, 0, wall_now());
+    // Read now, so a mark that cannot be read refuses the run before anything connects; the
+    // mint is built after the resync, which also floors it (the highest of our ids it shows).
+    let persisted = hwm.read()?;
     let market = MarketLease::acquire(&opts.lease_dir, VENUE, ACCOUNT_LABEL, &symbol)
         .map_err(|e| held(&e))?;
     let mut leases = Leases::market(market);
@@ -246,7 +248,11 @@ pub async fn run(
         px: order.ticks,
         qty: order.qty,
     };
-    let ran = drive_with(&mut session, driver.run(order, mint, leases, control)).await;
+    let ran = drive_with(
+        &mut session,
+        driver.run(order, ns_lease, persisted, leases, control),
+    )
+    .await;
     let ok = ran.unwrap_or_else(|ended| {
         lines.line(format_args!(
             "NOTE the session ended before the run did: {ended}; nothing more can be sent, and \
@@ -524,6 +530,20 @@ pub fn latest_resync(notes: &[Note]) -> Option<(&ResyncReport, &ResyncSnapshot)>
     })
 }
 
+/// The highest sequence of our namespace's client ids among the open orders `snapshot` shows, 0
+/// when it shows none.
+pub fn snapshot_max(snapshot: &ResyncSnapshot) -> u64 {
+    snapshot
+        .orders
+        .iter()
+        .filter_map(|o| match o.cid {
+            Some(fbc_core::CidMatch::Ours(cid)) => Some(cid.seq()),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// The client-id mint's high-water mark, kept in a file of the lease directory across runs, so
 /// a run whose wall clock stepped back never mints an id an earlier run used (the namespace
 /// lease keeps two minters apart, not two runs).
@@ -641,20 +661,9 @@ impl Driver {
         self.lines.line(format_args!("NOTE {text}"));
     }
 
-    /// The outcome request `rpc` was given: the venue's answer, or not sent.
+    /// What became of request `rpc` once every item is answered ([`Link::outcome_of`]).
     fn outcome_of(link: &Link, rpc: RpcId) -> Option<SubmitOutcome> {
-        link.notes().iter().find_map(|n| match n {
-            Note::Outcome {
-                rpc: r,
-                outcome,
-                ours: true,
-            } if *r == rpc => Some(outcome.clone()),
-            Note::Submitted {
-                rpc: r,
-                sent: Err(reason),
-            } if *r == rpc => Some(SubmitOutcome::NotSent(*reason)),
-            _ => None,
-        })
+        link.outcome_of(rpc)
     }
 
     /// The run: every step, then Stop whatever happened; true when every step happened and
@@ -662,11 +671,12 @@ impl Driver {
     async fn run(
         mut self,
         order: Planned,
-        mut mint: CidMint,
+        ns_lease: NamespaceLease,
+        persisted: u64,
         leases: Leases,
         control: ExecControl,
     ) -> bool {
-        let ok = self.steps(order, &mut mint, leases).await;
+        let ok = self.steps(order, ns_lease, persisted, leases).await;
         let stopped = self.stop().await;
         drop(control);
         ok && stopped
@@ -674,7 +684,13 @@ impl Driver {
 
     /// Login, arm, resync, seed, Start, place, ack, cancel, cancel ack, closed: false at the
     /// first step that does not happen.
-    async fn steps(&mut self, order: Planned, mint: &mut CidMint, leases: Leases) -> bool {
+    async fn steps(
+        &mut self,
+        order: Planned,
+        ns_lease: NamespaceLease,
+        persisted: u64,
+        leases: Leases,
+    ) -> bool {
         let authenticated = self
             .wait(|l| {
                 l.notes()
@@ -723,6 +739,7 @@ impl Driver {
                 }
                 latest_resync(l.notes()).map(|(report, snapshot)| {
                     (
+                        snapshot_max(snapshot),
                         report.untrustworthy,
                         snapshot.orders.iter().filter(|o| o.inst == INST).count(),
                         snapshot.orders.len(),
@@ -735,7 +752,7 @@ impl Driver {
                 })
             })
             .await;
-        let Some((untrustworthy, on_market, open, position)) = resynced else {
+        let Some((ours_max, untrustworthy, on_market, open, position)) = resynced else {
             self.timed_out(
                 "resync",
                 "the REST resync (an open order or position on a market other than --market \
@@ -790,6 +807,9 @@ impl Driver {
         }
 
         // The place: built and authorized by fbc-oms, then handed to the session.
+        // The mint, floored by the mark kept from earlier runs, the highest of our ids the
+        // resync shows, and the wall clock.
+        let mut mint = CidMint::new(ns_lease, persisted, ours_max, wall_now());
         let cid = match mint.mint() {
             Ok(cid) => cid,
             Err(e) => {
@@ -1061,6 +1081,30 @@ impl Driver {
                     accepted = false;
                     self.timed_out("stop", "a Stop cancel's acknowledgement");
                 }
+            }
+        }
+        // A queued cancel is not a done one: every order a Stop cancel named must be reported
+        // ended before Stop counts as done.
+        let named: Vec<ClientOrderId> = {
+            let link = self.link.borrow();
+            rpcs.iter().flat_map(|rpc| link.cids_of(*rpc)).collect()
+        };
+        if !named.is_empty() {
+            let ended = self
+                .wait(|l| {
+                    let reg = l.reg();
+                    named
+                        .iter()
+                        .all(|cid| reg.get(*cid).is_none_or(|r| r.state().is_terminal()))
+                        .then_some(())
+                })
+                .await;
+            if ended.is_none() {
+                accepted = false;
+                self.timed_out(
+                    "stop",
+                    "the order events reporting Stop's cancelled orders ended",
+                );
             }
         }
         self.link.borrow_mut().reg().disarm(INST);
