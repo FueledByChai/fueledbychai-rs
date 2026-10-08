@@ -246,6 +246,8 @@ pub struct OrderRecord {
     placement_nonce: Option<u64>,
     /// A cancel was asked for and waits for the order's acknowledgement (design §4.9).
     cancel_awaits_ack: bool,
+    /// How many cancels were reported sent for the order ([`Self::cancel_sent`]).
+    cancels_sent: u64,
     /// An amended update named no new venue id: on a venue whose amend gives a new id, the
     /// current id may be retired, and the record does not know the new one. Kept until the
     /// order ends: a later replacement may arrive out of order.
@@ -306,6 +308,7 @@ impl OrderRecord {
             unknown_since: None,
             placement_nonce: None,
             cancel_awaits_ack: false,
+            cancels_sent: 0,
             vid_retired: false,
             sent: None,
             ladder: LadderStep::Query,
@@ -647,6 +650,13 @@ impl OrderRecord {
         self.cancel_awaits_ack
     }
 
+    /// How many cancels were reported sent for the order ([`Self::cancel_sent`]): a count
+    /// that moved past one taken when a cancel was built means a cancel was sent since, so a
+    /// live order with none in flight had it answered without ending (not sent, or refused).
+    pub fn cancels_sent(&self) -> u64 {
+        self.cancels_sent
+    }
+
     pub(crate) fn set_cancel_awaits_ack(&mut self, awaits: bool) {
         self.cancel_awaits_ack = awaits;
     }
@@ -674,6 +684,7 @@ impl OrderRecord {
         let sent = self.set_intent(Intent::PendingCancel { rpc, since: now });
         if sent {
             self.cancel_awaits_ack = false;
+            self.cancels_sent += 1;
         }
         sent
     }

@@ -940,6 +940,146 @@ fn a_level_whose_replaced_amend_is_unconfirmed_after_a_cancel_not_sent_is_held_u
     ));
 }
 
+/// Refuses (`refused`) the cancel of `c` sent under `rpc`: the order rests as it was.
+fn refuse_cancel(reg: &mut Registry, c: ClientOrderId, rpc: RpcId, refused: &SubmitOutcome) {
+    let item = ItemRef {
+        idx: 0,
+        cid: None,
+        vid: None,
+    };
+    reg.on_outcome(c, OrderOp::Cancel(rpc), &item, refused, LATER)
+        .unwrap();
+    let rec = reg.get(c).unwrap();
+    assert_eq!(rec.intent(), Intent::None);
+    assert_eq!(rec.state(), OrdState::Open);
+}
+
+/// FBC-ubsw (Codex on PR #103, r4206675085): a replace whose cancel was sent and came back
+/// refused or not sent (`refused`) is over; the order still rests, so a later pass wanting a
+/// quote equal to it builds nothing and keeps it, and a later change amends it as usual. A
+/// replace cancel built and not reported sent is still built again at the next pass (0065
+/// rule 7).
+fn a_refused_replace_cancel_leaves_the_order_to_be_planned_afresh(refused: SubmitOutcome) {
+    let mut reg = quoting(WIDE, 0);
+    let mut mint = mint();
+    let mut p = planner();
+    let resting = quote(10_000, 5);
+    let opened = open_book(
+        &mut p,
+        &book().with(Side::Buy, 0, resting.clone()),
+        &mut reg,
+        &amending(),
+        &mut mint,
+    );
+    let c = opened.commands[0].cid;
+    let same = book().with(Side::Buy, 0, resting.clone());
+    // Wanted with other flags, which no amend changes: a replace, its cancel built.
+    let ioc = book().with(
+        Side::Buy,
+        0,
+        DesiredQuote {
+            tif: Tif::Ioc,
+            ..resting.clone()
+        },
+    );
+    let replace = p
+        .plan(&ioc, &mut reg, &amending(), ACCT, &mut mint, LATER)
+        .unwrap();
+    assert_eq!(
+        shape(&replace),
+        vec![(Stage::Cancel, "cancel", Side::Buy, 0)]
+    );
+    // Not reported sent: built again at the next pass, whatever the level wants.
+    let unreported = p
+        .plan(&same, &mut reg, &amending(), ACCT, &mut mint, LATER)
+        .unwrap();
+    assert_eq!(
+        shape(&unreported),
+        vec![(Stage::Cancel, "cancel", Side::Buy, 0)]
+    );
+    // Sent, then refused or never sent: the order rests, and nothing is built for a quote
+    // equal to it.
+    assert!(reg.cancel_sent(c, RpcId(7), LATER).unwrap());
+    refuse_cancel(&mut reg, c, RpcId(7), &refused);
+    let kept = plan_and_send(&mut p, &same, &mut reg, &amending(), &mut mint, LATER);
+    assert!(kept.commands.is_empty(), "{:?}", shape(&kept));
+    assert!(kept.held.is_empty() && kept.awaiting_ack.is_empty());
+    assert_eq!(p.order_at(ACCT, INST, Side::Buy, 0), Some(c));
+    // A later change amends it as usual.
+    let moved = book().with(Side::Buy, 0, quote(10_004, 5));
+    let amended = plan_and_send(&mut p, &moved, &mut reg, &amending(), &mut mint, LATER);
+    assert_eq!(shape(&amended), vec![(Stage::Amend, "amend", Side::Buy, 0)]);
+    assert_eq!(amended.commands[0].cid, c);
+    match amended.commands[0].auth.command() {
+        VenueCommand::Amend(a) => assert_eq!((a.px, a.qty), (Ticks(10_004), lots(5))),
+        other => panic!("expected an amend, got {other:?}"),
+    }
+}
+
+/// FBC-ubsw: a cancel carried through after the acknowledgement (the level pulled before it
+/// and wanted again; 0065 rule 5), sent and then refused or not sent (`refused`), is over
+/// too: the order rests, a quote equal to it builds nothing, and a later change amends it.
+fn a_refused_carried_through_cancel_leaves_the_order_to_be_planned_afresh(refused: SubmitOutcome) {
+    let mut reg = quoting(WIDE, 0);
+    let mut mint = mint();
+    let mut p = planner();
+    let same = book().with(Side::Buy, 0, quote(10_000, 5));
+    let first = plan_and_send(&mut p, &same, &mut reg, &amending(), &mut mint, MonoNs(0));
+    let c = first.commands[0].cid;
+    let pulled = plan_and_send(&mut p, &book(), &mut reg, &amending(), &mut mint, LATER);
+    assert_eq!(pulled.awaiting_ack, vec![c]);
+    ack(&mut reg, c, "v-Buy-0");
+    let carried = p
+        .plan(&same, &mut reg, &amending(), ACCT, &mut mint, LATER)
+        .unwrap();
+    assert_eq!(
+        shape(&carried),
+        vec![(Stage::Cancel, "cancel", Side::Buy, 0)]
+    );
+    assert!(reg.cancel_sent(c, RpcId(7), LATER).unwrap());
+    refuse_cancel(&mut reg, c, RpcId(7), &refused);
+    let kept = plan_and_send(&mut p, &same, &mut reg, &amending(), &mut mint, LATER);
+    assert!(kept.commands.is_empty(), "{:?}", shape(&kept));
+    assert!(kept.held.is_empty() && kept.awaiting_ack.is_empty());
+    assert_eq!(p.order_at(ACCT, INST, Side::Buy, 0), Some(c));
+    let moved = book().with(Side::Buy, 0, quote(10_004, 5));
+    let amended = plan_and_send(&mut p, &moved, &mut reg, &amending(), &mut mint, LATER);
+    assert_eq!(shape(&amended), vec![(Stage::Amend, "amend", Side::Buy, 0)]);
+    assert_eq!(amended.commands[0].cid, c);
+}
+
+fn cancel_rejected() -> SubmitOutcome {
+    SubmitOutcome::Rejected(Reject {
+        kind: RejectKind::Other,
+        venue_code: None,
+        raw: "refused".into(),
+    })
+}
+
+#[test]
+fn a_rejected_replace_cancel_leaves_the_order_resting_and_planned_afresh() {
+    a_refused_replace_cancel_leaves_the_order_to_be_planned_afresh(cancel_rejected());
+}
+
+#[test]
+fn a_replace_cancel_not_sent_leaves_the_order_resting_and_planned_afresh() {
+    a_refused_replace_cancel_leaves_the_order_to_be_planned_afresh(SubmitOutcome::NotSent(
+        NotSentReason::Disconnected,
+    ));
+}
+
+#[test]
+fn a_rejected_carried_through_cancel_leaves_the_order_resting_and_planned_afresh() {
+    a_refused_carried_through_cancel_leaves_the_order_to_be_planned_afresh(cancel_rejected());
+}
+
+#[test]
+fn a_carried_through_cancel_not_sent_leaves_the_order_resting_and_planned_afresh() {
+    a_refused_carried_through_cancel_leaves_the_order_to_be_planned_afresh(SubmitOutcome::NotSent(
+        NotSentReason::Disconnected,
+    ));
+}
+
 #[test]
 fn an_order_is_changed_only_past_a_threshold_and_once_it_is_the_minimum_age() {
     let mut reg = quoting(WIDE, 0);
