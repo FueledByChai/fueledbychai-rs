@@ -72,6 +72,17 @@ fn the_toy_factory_refuses_what_it_does_not_model_yet() {
         let refused = ToyFactory.plan_md(&cfg, &specs, &subs);
         assert_eq!(refused, Err(VenueError::UnknownInstrument(unknown)));
     }
+    // Even when a known instrument's undeclared feed sorts first (Codex r4216473740).
+    let mixed = BTreeSet::from([
+        trades(),
+        Subscription {
+            inst: unknown,
+            feed: Feed::Book(BOOK),
+        },
+    ]);
+    assert_eq!(mixed.first(), Some(&trades()));
+    let refused = ToyFactory.plan_md(&cfg, &specs, &mixed);
+    assert_eq!(refused, Err(VenueError::UnknownInstrument(unknown)));
     let ep = EndpointPlan {
         stream: StreamId(2),
         transport: MdTransport::Socket {
