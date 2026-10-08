@@ -35,7 +35,7 @@ Required confirmation and namespace:
                             namespace on the market refuses the run)
 
 The market (required; read them from GET https://api.testnet.paradex.trade/v1/markets):
-  --market <MARKET>         the Paradex market, e.g. BTC-USD-PERP
+  --market <MARKET>         the Paradex market as Paradex spells it, e.g. BTC-USD-PERP
   --tick <DEC>              its price_tick_size, e.g. 0.1
   --step <DEC>              its order_size_increment, e.g. 0.001
   --min-notional <USD>      its min_notional, e.g. 10 (0 when it states none)
@@ -447,17 +447,28 @@ fn host_of(url: &str, schemes: &[&str], flag: &str) -> Result<String, String> {
     Ok(host.to_ascii_lowercase())
 }
 
-/// A Paradex market as typed: ASCII letters, digits and `-`.
+/// The longest part of a market name between its '-'s: Paradex's are short (`BTC`, `PERP`,
+/// `27JUN25`, `100000`), and a longer one is more likely a pasted secret than a market.
+const MARKET_PART_MAX: usize = 12;
+
+/// A Paradex market as Paradex spells it: three or more parts of upper-case ASCII letters and
+/// digits, each at most [`MARKET_PART_MAX`] long, joined by '-' (`BTC-USD-PERP`). Anything else
+/// is refused before it is put in a request path, where a pasted private key would be sent to
+/// the venue; the refusal never shows the value.
 fn symbol(value: &str) -> Result<String, String> {
-    if value
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    {
+    let parts: Vec<&str> = value.split('-').collect();
+    let shaped = parts.len() >= 3
+        && parts.iter().all(|p| {
+            (1..=MARKET_PART_MAX).contains(&p.len())
+                && p.bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        });
+    if shaped {
         Ok(value.to_owned())
     } else {
         Err(format!(
-            "--market: not a market as Paradex spells it (letters, digits and '-', e.g. \
-             BTC-USD-PERP){UNSHOWN}"
+            "--market: not a market as Paradex spells it (upper-case letters and digits in three \
+             or more parts joined by '-', e.g. BTC-USD-PERP){UNSHOWN}"
         ))
     }
 }
