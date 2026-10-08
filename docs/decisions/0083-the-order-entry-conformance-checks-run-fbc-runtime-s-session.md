@@ -34,8 +34,8 @@ venue for the program's life (`ExecSessionConfig::venue` is `&'static dyn VenueF
   steps after the first 30 s), up to 600 s, only once the stub has answered, so a deadline passes when the check says and never
   while an answer is on its way. fbc-conformance therefore takes tokio's `test-util` in its
   normal dependencies; it is only ever a dev-dependency of the crates it checks.
-- **fbc-oms authorizes every command.** A registry under lease names of its own is resynced
-  flat, started on the setup's first instrument with leases in a directory the check removes,
+- **fbc-oms authorizes every command.** A registry under lease names of its own is bound to
+  the session's account (`Registry::bind_account`, 0082), resynced flat, started on the setup's first instrument with leases in a directory the check removes,
   and builds and authorizes each place, batch and amend through `Registry::authorize`; what a
   placement's answer brought (its outcomes and every order update, in the order reported) is
   handed back to it before its amend, so a venue id an update states names the order. The

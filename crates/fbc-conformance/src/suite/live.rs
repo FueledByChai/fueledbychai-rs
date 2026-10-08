@@ -516,6 +516,10 @@ impl Oms {
         let pre_trade = PreTradeCaps::new().with_market(h.inst, limits);
         let pre_trade = pre_trade.expect("positive caps");
         let mut reg = Registry::with_caps(pre_trade).with_lease_keys(keys);
+        // Bound to the session's account before anything is built, as a live consumer binds
+        // its registry (decision 0082): every authorization is for that account alone.
+        reg.bind_account(ACCT)
+            .expect("a fresh registry binds to any account");
         let snap = ResyncSnapshot {
             watermark: WallNs(1_000),
             requested_at: MonoNs(1_000),
@@ -669,7 +673,7 @@ impl Oms {
     }
 
     fn authorize(
-        &self,
+        &mut self,
         h: &Harness<'_>,
         cmd: fbc_oms::PermittedCommand,
     ) -> Result<Authorization, Failure> {
