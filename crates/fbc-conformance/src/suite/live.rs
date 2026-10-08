@@ -396,7 +396,9 @@ impl Ctx<'_> {
     pub async fn advance(&self, by: Duration) {
         let mut moved = Duration::ZERO;
         while moved < by {
+            // No further than `by` (Codex r4223839090): a timer due just past it stays unfired.
             let step = if moved < FINE { STEP } else { COARSE };
+            let step = step.min(by - moved);
             tokio::time::advance(step).await;
             moved += step;
             for _ in 0..CHURN {
@@ -628,6 +630,11 @@ impl Oms {
             }
         }
         Ok(())
+    }
+
+    /// The post-only and reduce-only flags of every order it builds.
+    pub fn flags(&self) -> (bool, bool) {
+        (self.shape.post_only, self.shape.reduce_only)
     }
 
     /// The venue id fbc-oms knows order `cid` by, if any.

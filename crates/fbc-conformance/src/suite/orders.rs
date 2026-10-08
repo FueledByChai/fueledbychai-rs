@@ -11,7 +11,8 @@
 //!   from the venue's event reporting the replaced order where `AmendCaps.ack` is
 //!   `ReplacedEvent`, synthesized by the codec from the reply where it is `RpcReplyOnly`. Every
 //!   such update is judged: every identity it states is the order's, and every field the
-//!   amend's (nothing filled). Where the amended order gets a new venue id
+//!   amend's (nothing filled, the flags the order's, stated where `events_echo_flags`). A venue
+//!   allowing no limit order is skipped. Where the amended order gets a new venue id
 //!   (`AmendCaps.keeps_venue_id` false), the update names it; where it keeps its id, the update
 //!   names no new one. The placement's acceptance is its one item's, or the whole request's,
 //!   once as `OrderCaps.ack` has it. Once the amend is sent, nothing refuses the order (an
@@ -30,10 +31,11 @@ use std::time::Duration;
 
 use fbc_core::{
     AckLevel, AckModel, AmendAck, AmendCaps, CidMatch, ClientOrderId, ExecEvent, ItemRef, Lots,
-    OpKind, OrderUpdate, RpcId, Side, SubmitOutcome, Ticks, VenueOrderId, VenueOrderState,
+    OpKind, OrderKindTag, OrderUpdate, RpcId, Side, SubmitOutcome, Ticks, VenueOrderId,
+    VenueOrderState,
 };
 
-use super::harness::Harness;
+use super::harness::{Harness, Shape};
 use super::live::{Ctx, Live, WAIT};
 use super::stub::Answer::{Accept, Reject, Silent};
 use super::{Breach, Failure, Subject, Verdict};
@@ -57,6 +59,14 @@ pub fn amend_ack(subject: &Subject<'static>) -> Result<Verdict, Failure> {
             why,
         });
     };
+    // Only a resting limit order is amended (Codex r4223839082).
+    if Shape::sendable(&live.order, &[OrderKindTag::Limit]).is_none() {
+        let why = "OrderCaps allows no limit order to amend";
+        return Ok(Verdict::Skipped {
+            check: AMEND_ACK,
+            why,
+        });
+    }
     let (px, qty) = match amended(&live.h, &amend) {
         Ok(to) => to,
         Err(why) => {
@@ -68,6 +78,7 @@ pub fn amend_ack(subject: &Subject<'static>) -> Result<Verdict, Failure> {
     };
     let ack = format!("AmendCaps.ack is {:?}", amend.ack);
     let model = live.order.ack;
+    let echo = live.order.events_echo_flags;
     let breaches = live.run(vec![vec![Accept], vec![Accept]], async |c| {
         c.ready().await?;
         let (cid, auth) = c.oms.place(c.h)?;
@@ -103,12 +114,18 @@ pub fn amend_ack(subject: &Subject<'static>) -> Result<Verdict, Failure> {
             .await;
         // What the amend's answer brings with them has come.
         c.churn().await;
+        let (post_only, reduce_only) = c.oms.flags();
         let asked = Asked {
             cid,
             placed: placed_vid.clone(),
             px,
             qty,
             model,
+            flags: Flags {
+                post_only,
+                reduce_only,
+                echo,
+            },
         };
         let updates = updates(c);
         let mut breaches = judge_amend(c, rpc, &updates, &asked, &amend, &ack);
@@ -170,14 +187,32 @@ fn amended_updates(events: &[ExecEvent], names: impl Fn(&OrderUpdate) -> bool) -
         .collect()
 }
 
-/// The amend `amend_ack` sent: of order `cid`, placed under venue id `placed`, to `px` and
-/// `qty`, on a venue acknowledging as `model`.
+/// The amend `amend_ack` sent: of order `cid`, placed under venue id `placed` with `flags`, to
+/// `px` and `qty`, on a venue acknowledging as `model`.
 struct Asked {
     cid: ClientOrderId,
     placed: Option<VenueOrderId>,
     px: Ticks,
     qty: Lots,
     model: AckModel,
+    flags: Flags,
+}
+
+/// The flags of the order `amend_ack` placed, and whether its venue's order events echo them
+/// (`OrderCaps.events_echo_flags`).
+struct Flags {
+    post_only: bool,
+    reduce_only: bool,
+    echo: bool,
+}
+
+impl Flags {
+    /// Whether the flags an update states, `post_only` and `reduce_only`, are the order's, and
+    /// stated where the venue echoes them (Codex r4223839103).
+    fn agree(&self, post_only: Option<bool>, reduce_only: Option<bool>) -> bool {
+        let agrees = |got: Option<bool>, placed| got.map_or(!self.echo, |got| got == placed);
+        agrees(post_only, self.post_only) && agrees(reduce_only, self.reduce_only)
+    }
 }
 
 /// Whether an item's outcomes are one acceptance as `model` has it (Codex r4222568826): one
@@ -265,6 +300,7 @@ fn judge_update(
     let agrees = update.inst == c.h.inst
         && update.side == Side::Buy
         && update.cum_filled == Lots::ZERO
+        && asked.flags.agree(update.post_only, update.reduce_only)
         && update.px.is_none_or(|px| px == asked.px)
         && update.qty.is_none_or(|qty| qty == asked.qty);
     if !agrees {
