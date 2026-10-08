@@ -81,12 +81,12 @@ unchanged.
 `btc-order-book-deltas-2026-10-08.jsonl` and `btc-order-book-interactive-deltas-2026-10-08.jsonl`
 are two sessions of Paradex's public production WebSocket, at the same URL, captured on
 2026-10-08 (UTC) for FBC-yj56 by subscribing one channel each: `order_book.BTC-USD-PERP.deltas`
-(about 30 s) and `order_book.BTC-USD-PERP.interactive_deltas` (about 25 s). Each line is one
+(30.1 s) and `order_book.BTC-USD-PERP.interactive_deltas` (23.9 s). Each line is one
 frame as received: `t_ns` (the capturing machine's receive time, nanoseconds since the Unix
 epoch), `opcode` (`text` or `binary`), and the frame, in `text` or in standard base64 in `b64`.
 The first line is the subscribe acknowledgement naming the channel; then 289 and 299
-`BookEvent` frames, each a SNAPSHOT of the whole book (115 bids and 60 asks; 120 and 64)
-followed by DELTAs at consecutive seq_nos (7687289234 to 7687289522; 7687289525 to
+`BookEvent` frames (about 9.6 and 12.5 a second), each capture opening with a SNAPSHOT of the
+whole book (115 bids and 60 asks; 120 and 64) followed by DELTAs at consecutive seq_nos (7687289234 to 7687289522; 7687289525 to
 7687289823). It is public market data: order book levels of a public channel and the venue's
 acknowledgement, with no account, order, fill, credential or token in it. The files are the
 capture, unchanged (`tests/md_live_capture.rs`, decision 0074).
@@ -100,3 +100,18 @@ line is the subscribe acknowledgement naming the channel; then 299 `BboEvent` fr
 data: the best bid and offer of a public channel and the venue's acknowledgement, with no
 account, order, fill, credential or token in it. The files are the capture, unchanged
 (`tests/md_touch_interactive.rs`, decision 0076).
+
+`multimarket-order-book-2026-10-08.jsonl` is one session of the same WebSocket and URL, captured
+on 2026-10-08 from 02:53:08 UTC (about 15 s) for FBC-2976. It subscribed three book channels of
+three markets in turn: `order_book.BTC-USD-PERP.deltas` (JSON-RPC id 1),
+`order_book.ETH-USD-PERP.deltas` (id 2) and `order_book.SOL-USD-PERP.interactive_deltas` (id 3).
+The line format is the book captures'. Three lines are the acknowledgements, one per id, each
+naming its channel; the first comes before BTC's first frame and the other two just after it.
+The other 155 lines are `BookEvent` frames, interleaved as they arrived: 89 for BTC (seq
+7687353140 to 7687353228), 63 for ETH (8106617644 to 8106617706) and 3 for SOL (6182946936 to
+6182946938). Each market's frames open with a SNAPSHOT of its whole book (100 bids and 67 asks;
+124 and 30; 87 and 29) followed by DELTAs at consecutive seq_nos. Every level lies on a 0.1
+price tick and a 0.00001 size step for BTC, 0.01 and 0.0001 for ETH, and 0.001 and 0.01 for
+SOL. It is public market data: order book levels of public channels and the venue's
+acknowledgements, with no account, order, fill, credential or token in it. The file is the
+capture, unchanged (`tests/md_live_multimarket.rs`, decision 0077).

@@ -492,7 +492,8 @@ fn venue_caps(exec: Option<ExecCaps>) -> VenueCaps {
             // a market's second book channel (decision 0022) or second touch source (decision
             // 0076) goes on another, as plan_md plans and the codec's subscribe enforces. The
             // venue refuses a second book channel too: a market's second order_book channel
-            // "cannot share an SBE session" (decision 0074).
+            // "cannot share an SBE session" (decision 0074); book channels of different markets
+            // share one, as a captured production session shows (decision 0077).
             // docs.paradex.trade states no cap on subscriptions per connection.
             topology: ConnTopology::SharedOneBookPerInstrument {
                 max_subscriptions: None,
