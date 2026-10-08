@@ -667,7 +667,8 @@ impl Core {
     /// firing. A request behind a reconnect of this stream, still queued in `effects` or asked
     /// for first, waits too: that reconnect ends the epoch before its turn, so it is never sent
     /// (Codex r4177934308); so does one asked for once the control has dropped or the inputs
-    /// halted, which no effect follows (Reviewer B, B6).
+    /// halted, which no effect follows (Reviewer B, B6). Once the inputs halted, no further
+    /// result or firing is taken while the write waits.
     async fn write(
         &mut self,
         ws: &mut WebSocket,
@@ -685,16 +686,19 @@ impl Core {
             // end, even when the session first runs again past both (Codex r4180583622).
             let timer = self.next_deadline();
             let timer = timer.filter(|at| stalled.is_none_or(|stalled| *at <= stalled));
+            // Inputs that halted take no more: each input taken is journaled in the open epoch,
+            // so it must reach the codec (Codex P1 r4215753453 on PR #115).
+            let halted = inputs.halted();
             let woke = tokio::select! {
                 biased;
                 sent = &mut send => return Ok(sent.is_ok()),
                 _ = self.stop.changed() => return Ok(false),
-                _ = sleep_or_never(timer) => None,
+                _ = sleep_or_never(timer), if !halted => None,
                 _ = sleep_or_never(stalled) => {
                     self.counters.write_stalls += 1;
                     return Ok(false);
                 }
-                Some(done) = self.http.next() => Some(done),
+                Some(done) = self.http.next(), if !halted => Some(done),
             };
             let mut more = Effects::new();
             let stamp = match woke {

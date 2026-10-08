@@ -1386,9 +1386,14 @@ impl<H: ExecHandler> ExecSink for Late<'_, H> {
 }
 
 /// What the core hands a current epoch's timer firings and HTTP results to: the session's one
-/// codec, inside the venue's decode scope for a result, and its handler. Once the control has
-/// dropped, or a timer's nonces were mis-reserved, nothing reaches the codec. Tick-to-wire on
-/// order entry is FBC-qfm's.
+/// codec, inside the venue's decode scope for a result, and its handler. Once a timer's nonces
+/// were mis-reserved nothing reaches the codec, and the core takes no more inputs. The stop is
+/// read where an input is taken, by the session's loop or as a write waits, not again here: an
+/// input taken while the control stood is journaled in its open epoch, so it reaches the codec
+/// even when the control drops before it is handed on, from another thread or as the codec
+/// redacts it, and replay, which feeds an open epoch's inputs, feeds the codec what it was
+/// handed live (Codex P1 r4215753453 on PR #115). Its effects are not executed after the stop,
+/// nor its events handed on. Tick-to-wire on order entry is FBC-qfm's.
 struct Feed<'a, H> {
     codec: &'a mut dyn ExecCodec,
     handler: &'a mut H,
@@ -1407,9 +1412,9 @@ struct Feed<'a, H> {
 }
 
 impl<H> Feed<'_, H> {
-    /// Whether an input may still reach the codec.
+    /// Whether an input may still reach the codec: no timer's nonces were mis-reserved.
     fn live(&self) -> bool {
-        self.stop.has_changed().is_ok() && self.fault.is_none()
+        self.fault.is_none()
     }
 }
 

@@ -61,7 +61,12 @@ also:
 4. **A stop's inputs follow the close.** When the control drops as a frame, timer firing or
    HTTP result wakes the epoch, or a frame waits then, the epoch's `Closed` is written first
    and those inputs, which reach no codec, after it, as the market-data session does, so replay
-   feeds them to no codec either. Spans a codec names that do not fit their input are counted
+   feeds them to no codec either. The stop is read once, where an input is taken (in the
+   session's loop, or as a write waits): an input taken while the control stood is journaled
+   in the open epoch and reaches the codec even when the control drops before it is handed on,
+   from another thread or as the codec redacts it, so replay feeds the codec what it was handed
+   live (Codex P1 r4215753453); its effects are not executed after the stop. Once a timer's
+   nonces are mis-reserved, no further input is taken while a write waits. Spans a codec names that do not fit their input are counted
    (`ExecCounters::refused_redactions`) and that input is hashed whole, as on market data.
    An HTTP result that comes back after its epoch ended is hashed whole, as on market data,
    although one codec serves every epoch (0053): any call that codec took after the request
