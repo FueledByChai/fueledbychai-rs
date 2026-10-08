@@ -40,6 +40,8 @@ that file describes for versions below 2.
 | `eth-markets-summary-2026-09-23.sbe` | Captured, raw bytes, version 1: see below |
 | `btc-order-book-deltas-2026-10-08.jsonl` | Captured: BTC-USD-PERP's `order_book.BTC-USD-PERP.deltas` session, see below |
 | `btc-order-book-interactive-deltas-2026-10-08.jsonl` | Captured: BTC-USD-PERP's `order_book.BTC-USD-PERP.interactive_deltas` session, see below |
+| `btc-bbo-interactive-2026-10-08.jsonl` | Captured: BTC-USD-PERP's `bbo.BTC-USD-PERP.interactive` session, see below |
+| `btc-bbo-2026-10-08.jsonl` | Captured: BTC-USD-PERP's `bbo.BTC-USD-PERP` session, see below |
 
 The snapshot and the deltas at 1001, 1002 and 1003 are a continuous sequence; 1004 after 1002
 is a skipped seq_no, and 1001 or 1002 after 1002 a backwards one (`tests/md_book.rs`).
@@ -88,3 +90,13 @@ followed by DELTAs at consecutive seq_nos (7687289234 to 7687289522; 7687289525 
 7687289823). It is public market data: order book levels of a public channel and the venue's
 acknowledgement, with no account, order, fill, credential or token in it. The files are the
 capture, unchanged (`tests/md_live_capture.rs`, decision 0074).
+
+`btc-bbo-interactive-2026-10-08.jsonl` and `btc-bbo-2026-10-08.jsonl` are two more sessions of
+the same WebSocket and URL, captured on 2026-10-08 (UTC) for FBC-taxd, one after the other, by
+subscribing one channel each: `bbo.BTC-USD-PERP.interactive` (about 25 s, from 01:11:36) and
+`bbo.BTC-USD-PERP` (about 12 s, from 01:12:03). The line format is the book captures'. The first
+line is the subscribe acknowledgement naming the channel; then 299 `BboEvent` frames each
+(template 2), seq 7687292177 to 7687292528 and 7687292570 to 7687292898. It is public market
+data: the best bid and offer of a public channel and the venue's acknowledgement, with no
+account, order, fill, credential or token in it. The files are the capture, unchanged
+(`tests/md_touch_interactive.rs`, decision 0076).

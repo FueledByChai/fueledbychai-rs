@@ -3,9 +3,12 @@
 //! subscribe requests, their acknowledgements and errors stay JSON).
 //!
 //! [`ParadexMd`] subscribes with one JSON-RPC `subscribe` text frame per channel
-//! (`bbo.{market}`, `trades.{market}`, `order_book.{market}.{feed_type}`), and decodes
-//! `BboEvent` (template 2) into [`MdEvent::Touch`], `TradeEvent` (template 1) into
-//! [`MdEvent::Trade`], `BookEvent` (template 3) into book events ([`book`]) and
+//! (`bbo.{market}`, `bbo.{market}.interactive`, `trades.{market}`,
+//! `order_book.{market}.{feed_type}`), and decodes `BboEvent` (template 2) into
+//! [`MdEvent::Touch`] of the touch source the market holds on the connection ([`BBO`] or
+//! [`BBO_INTERACTIVE`]: both channels carry the same template and a frame names only its
+//! market, so a connection carries at most one of a market's, decision 0076), `TradeEvent`
+//! (template 1) into [`MdEvent::Trade`], `BookEvent` (template 3) into book events ([`book`]) and
 //! `MarketSummaryEvent` (template 4, `markets_summary.{market}`) into [`MdEvent::Mark`] and
 //! [`MdEvent::Funding`] ([`summary`]), each pushed while its feed is subscribed. Heartbeats
 //! (template 40) and templates it does not decode are skipped. A subscribe acknowledgement is
@@ -47,8 +50,23 @@ pub const TEMPLATE_BOOK: u16 = 3;
 /// `HeartbeatEvent`'s template id: skipped.
 pub const TEMPLATE_HEARTBEAT: u16 = 40;
 
-/// The one touch source: the `bbo.{market}` channel, index 0 of the caps' `touch_sources`.
+/// The `bbo.{market}` channel, the public book's touch: index 0 of the caps' `touch_sources`.
 pub const BBO: TouchSourceId = TouchSourceId(0);
+/// The `bbo.{market}.interactive` channel, the touch including RPI orders: index 1 of the caps'
+/// `touch_sources` (decision 0076).
+pub const BBO_INTERACTIVE: TouchSourceId = TouchSourceId(1);
+
+/// The channel name of touch `source` of the market spelled `symbol`, or `None` for an
+/// undeclared one. The interactive touch is exactly `bbo.{market}.interactive`: the venue
+/// acknowledges `bbo.interactive.{market}` and `bbo.{market}@interactive` too but streams
+/// nothing on them (decision 0076).
+fn touch_channel(source: TouchSourceId, symbol: &str) -> Option<String> {
+    match source {
+        BBO => Some(format!("bbo.{symbol}")),
+        BBO_INTERACTIVE => Some(format!("bbo.{symbol}.interactive")),
+        _ => None,
+    }
+}
 
 /// The schema's fixed decimal exponent for prices and quantities (`Price8`, `Qty8`).
 const EXP: i8 = -8;
@@ -57,7 +75,7 @@ const EXP: i8 = -8;
 /// not decode, or an instrument missing from `specs`.
 pub fn channel(sub: Subscription, specs: &SpecTable) -> Result<String, VenueError> {
     let spell = |symbol: &str| match sub.feed {
-        Feed::Touch(BBO) => Some(format!("bbo.{symbol}")),
+        Feed::Touch(source) => touch_channel(source, symbol),
         Feed::Trades => Some(format!("trades.{symbol}")),
         // One channel carries both: MarketSummaryEvent has the mark price and the funding rate.
         Feed::Mark | Feed::Funding => Some(format!("markets_summary.{symbol}")),
@@ -100,6 +118,10 @@ pub struct ParadexMd {
     /// subscription here fixes it, and an unsubscribe keeps it, since frames of the old channel
     /// can still arrive and name only their market.
     channel_of: BTreeMap<InstrumentId, BookId>,
+    /// The one touch source each market may have on this connection, fixed and kept as
+    /// `channel_of` is: a bbo frame is the touch of the source its market holds here
+    /// (decision 0076).
+    touch_of: BTreeMap<InstrumentId, TouchSourceId>,
     /// The books subscribed now, and their sequences.
     books: BTreeMap<InstrumentId, BookFeed>,
     /// The mark and funding feeds subscribed now: a market's `markets_summary` channel is
@@ -121,6 +143,7 @@ impl ParadexMd {
             next_id: 1,
             pending: BTreeMap::new(),
             channel_of: BTreeMap::new(),
+            touch_of: BTreeMap::new(),
             books: BTreeMap::new(),
             summary: BTreeSet::new(),
             refused: BTreeSet::new(),
@@ -128,23 +151,31 @@ impl ParadexMd {
         }
     }
 
-    /// Each market's book channel, and the markets with a book subscribed, once `add` (sent
-    /// first) and `remove` are taken. A market has at most one book channel on a connection,
-    /// since a frame names its market and not its channel: another is refused as a feed this
-    /// connection cannot carry, even after the first is removed (Codex r4176866128).
-    fn books_after(
+    /// Each market's book channel and touch source, and the markets with a book subscribed,
+    /// once `add` (sent first) and `remove` are taken. A market has at most one book channel
+    /// and one touch source on a connection, since a frame names its market and not its
+    /// channel: another is refused as a feed this connection cannot carry, even after the
+    /// first is removed (Codex r4176866128, decision 0076).
+    fn channels_after(
         &self,
         add: &[Subscription],
         remove: &[Subscription],
-    ) -> Result<(BTreeMap<InstrumentId, BookId>, BTreeSet<InstrumentId>), VenueError> {
+    ) -> Result<Channels, VenueError> {
         let mut channel_of = self.channel_of.clone();
+        let mut touch_of = self.touch_of.clone();
         let mut active: BTreeSet<_> = self.books.keys().copied().collect();
         for sub in add {
-            if let Feed::Book(book) = sub.feed {
-                if *channel_of.entry(sub.inst).or_insert(book) != book {
-                    return Err(VenueError::UnsupportedFeed(*sub));
+            // Whether the market already holds another channel of the kind here.
+            let other = match sub.feed {
+                Feed::Book(book) => {
+                    active.insert(sub.inst);
+                    *channel_of.entry(sub.inst).or_insert(book) != book
                 }
-                active.insert(sub.inst);
+                Feed::Touch(source) => *touch_of.entry(sub.inst).or_insert(source) != source,
+                _ => false,
+            };
+            if other {
+                return Err(VenueError::UnsupportedFeed(*sub));
             }
         }
         for sub in remove {
@@ -154,7 +185,11 @@ impl ParadexMd {
                 active.remove(&sub.inst);
             }
         }
-        Ok((channel_of, active))
+        Ok(Channels {
+            channel_of,
+            touch_of,
+            active,
+        })
     }
 
     /// Consumes a JSON-RPC text frame: an acknowledgement is consumed; a refused subscribe is
@@ -243,8 +278,13 @@ impl MdCodec for ParadexMd {
                 frames.push((request, channel, *sub));
             }
         }
-        let (channel_of, active) = self.books_after(add, remove)?;
+        let Channels {
+            channel_of,
+            touch_of,
+            active,
+        } = self.channels_after(add, remove)?;
         self.summary = summary;
+        self.touch_of = touch_of;
         self.books.retain(|inst, _| active.contains(inst));
         for inst in active {
             let book = channel_of[&inst];
@@ -301,7 +341,7 @@ impl MdCodec for ParadexMd {
         };
         let msg = Message::parse(frame)?;
         let (meta, event, sub) = match msg.header().template_id {
-            TEMPLATE_BBO => decode_bbo(&msg, specs)?,
+            TEMPLATE_BBO => decode_bbo(&msg, specs, &self.touch_of)?,
             TEMPLATE_TRADE => decode_trade(&msg, specs)?,
             TEMPLATE_SUMMARY => {
                 let s = decode_summary(&msg, specs)?;
@@ -380,6 +420,16 @@ impl MdCodec for ParadexMd {
     }
 }
 
+/// What a subscribe leaves each market's channels on a connection.
+struct Channels {
+    /// Each market's one book channel.
+    channel_of: BTreeMap<InstrumentId, BookId>,
+    /// Each market's one touch source.
+    touch_of: BTreeMap<InstrumentId, TouchSourceId>,
+    /// The markets with a book subscribed.
+    active: BTreeSet<InstrumentId>,
+}
+
 /// A feed carried by the `markets_summary` channel.
 fn summary_feed(feed: Feed) -> bool {
     matches!(feed, Feed::Mark | Feed::Funding)
@@ -423,7 +473,12 @@ fn request_method(request: Request) -> &'static str {
 type Decoded = (VenueMeta, MdEvent, Subscription);
 
 /// `BboEvent`: ts@0, seq@8, bidPrice@16, bidSize@24, askPrice@32, askSize@40, then `market`.
-fn decode_bbo(msg: &Message<'_>, specs: &SpecTable) -> Result<Decoded, DecodeError> {
+/// The touch is of the source `touch_of` holds for the market, [`BBO`] where it holds none.
+fn decode_bbo(
+    msg: &Message<'_>,
+    specs: &SpecTable,
+    touch_of: &BTreeMap<InstrumentId, TouchSourceId>,
+) -> Result<Decoded, DecodeError> {
     let block = msg.block();
     let spec = frame_market(msg, specs)?;
     let bid = level(spec, &block, 16, "bbo bid")?;
@@ -433,13 +488,14 @@ fn decode_bbo(msg: &Message<'_>, specs: &SpecTable) -> Result<Decoded, DecodeErr
         exch_ts_kind: ExchTsKind::Publish,
         venue_seq: Some(seq(required(&block, 8, "bbo seq")?)?),
     };
+    let source = touch_of.get(&spec.id).copied().unwrap_or(BBO);
     let event = MdEvent::Touch {
         inst: spec.id,
         bid,
         ask,
-        source: BBO,
+        source,
     };
-    let feed = Feed::Touch(BBO);
+    let feed = Feed::Touch(source);
     Ok((
         meta,
         event,

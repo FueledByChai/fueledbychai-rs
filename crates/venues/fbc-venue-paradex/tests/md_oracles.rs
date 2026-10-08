@@ -547,7 +547,7 @@ fn touch_agreement_refuses_an_undeclared_source_or_book_other_channels_or_anothe
     let check = |md: &fbc_core::MdCaps, source, book: &DeltaBook| {
         touch_agreement(md, source, book, &[]).unwrap_err()
     };
-    assert_eq!(check(&md, TouchSourceId(1), &book), OracleError::Undeclared);
+    assert_eq!(check(&md, TouchSourceId(2), &book), OracleError::Undeclared);
     let undeclared = DeltaBook::new(BTC, fbc_core::BookId(2));
     assert_eq!(check(&md, BBO, &undeclared), OracleError::Undeclared);
     assert_eq!(

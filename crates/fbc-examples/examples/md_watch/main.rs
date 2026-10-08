@@ -6,6 +6,7 @@
 //!
 //! ```text
 //! cargo run -p fbc-examples --example md_watch -- --paradex BTC-USD-PERP --binance BTCUSDT
+//! cargo run -p fbc-examples --example md_watch -- --paradex BTC-USD-PERP --paradex-touch both
 //! cargo run -p fbc-examples --example md_watch -- --help
 //! ```
 

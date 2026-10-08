@@ -97,7 +97,7 @@ fn nothing_is_planned_or_sent_for_a_feed_or_instrument_it_cannot_spell() {
     let specs = specs();
     let index = sub(BTC, Feed::Index);
     let unknown = sub(fbc_core::InstrumentId::new(9), Feed::Trades);
-    let other_touch = sub(BTC, Feed::Touch(fbc_core::TouchSourceId(1)));
+    let other_touch = sub(BTC, Feed::Touch(fbc_core::TouchSourceId(2)));
     for (bad, err) in [
         (index, VenueError::UnsupportedFeed(index)),
         (other_touch, VenueError::UnsupportedFeed(other_touch)),
@@ -172,7 +172,11 @@ fn the_factory_declares_market_data_with_its_cited_limits() {
     assert_eq!(discovered, Some(VenueError::NoDiscovery));
     let md = &declared.md;
     assert_eq!(md.encoding, Encoding::Sbe);
-    assert_eq!(md.touch_sources.len(), 1);
+    assert_eq!(
+        md.touch_sources.len(),
+        2,
+        "bbo and its interactive twin (md_touch_interactive.rs)"
+    );
     assert_eq!(md.touch_sources[0].channel, "bbo");
     assert_eq!(md.trades.source, FeedSource::Stream);
     assert_eq!(
