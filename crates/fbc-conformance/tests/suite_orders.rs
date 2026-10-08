@@ -83,6 +83,12 @@ enum Twist {
     FilledOnAmend,
     /// An amended order's update is followed by another, a tick above its price.
     AmendedTwice,
+    /// An amended order's update reports it post-only.
+    PostOnlyOnAmend,
+    /// An amended order's update carries no flags.
+    NoFlagsOnAmend,
+    /// 70 ms after the connection opens, a maintenance frame is written.
+    MaintainsAt70Ms,
     /// An amended order's update states a price one tick above the amend's.
     WrongPx,
     /// A frame `early` reports the last request it wrote timed out, at once, long before its
@@ -233,6 +239,35 @@ static REFUSES_AMEND_TOO: Variant = Variant {
 static CANCELS_ON_AMEND: Variant = Variant {
     caps: |_| {},
     twist: Twist::CancelsOnAmend,
+};
+static POST_ONLY_ON_AMEND: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::PostOnlyOnAmend,
+};
+static NO_FLAGS_ON_AMEND: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::NoFlagsOnAmend,
+};
+/// The toy declaring market orders alone.
+static MARKET_ONLY: Variant = Variant {
+    caps: |c| {
+        let order = &mut c.exec.as_mut().unwrap().order;
+        order.kinds = TagSet::of(&[fbc_core::OrderKindTag::Market]);
+    },
+    twist: Twist::None,
+};
+/// The toy with a second limit, one placement or amend in 50 ms, writing a maintenance frame
+/// 70 ms after the connection opens.
+static FIFTY_MS_WINDOW: Variant = Variant {
+    caps: |c| {
+        c.limits.push(fbc_core::RateLimit {
+            scope: fbc_core::LimitScope::Account,
+            ops: TagSet::of(&[OpKind::Place, OpKind::Amend]),
+            per: Duration::from_millis(50),
+            units: 1,
+        });
+    },
+    twist: Twist::MaintainsAt70Ms,
 };
 static FILLED_ON_AMEND: Variant = Variant {
     caps: |_| {},
@@ -452,6 +487,8 @@ impl VenueFactory for Variant {
 
 /// The timer a resending codec writes its last request again on.
 const RESEND: TimerTag = TimerTag(77);
+/// The timer of [`Twist::MaintainsAt70Ms`].
+const MAINTAIN: TimerTag = TimerTag(78);
 
 /// The toy's codec, as its factory builds it, with a twist.
 struct Twisted {
@@ -695,6 +732,29 @@ fn filled_on_amend(ev: ExecEvent) -> Vec<ExecEvent> {
     }]
 }
 
+/// An amended order's update reporting it post-only.
+fn post_only_on_amend(ev: ExecEvent) -> Vec<ExecEvent> {
+    vec![match ev {
+        ExecEvent::Order(mut u) if matches!(u.state, VenueOrderState::Amended { .. }) => {
+            u.post_only = Some(true);
+            ExecEvent::Order(u)
+        }
+        other => other,
+    }]
+}
+
+/// An amended order's update without its flags.
+fn no_flags_on_amend(ev: ExecEvent) -> Vec<ExecEvent> {
+    vec![match ev {
+        ExecEvent::Order(mut u) if matches!(u.state, VenueOrderState::Amended { .. }) => {
+            u.post_only = None;
+            u.reduce_only = None;
+            ExecEvent::Order(u)
+        }
+        other => other,
+    }]
+}
+
 /// An amended order's update, then another a tick above its price.
 fn amended_twice(ev: ExecEvent) -> Vec<ExecEvent> {
     let mut out = vec![ev.clone()];
@@ -909,6 +969,10 @@ impl ExecCodec for Twisted {
                 tag: RESEND,
                 after: Duration::from_secs(20),
             }),
+            Twist::MaintainsAt70Ms => fx.push(Effect::Timer {
+                tag: MAINTAIN,
+                after: Duration::from_millis(70),
+            }),
             _ => {}
         }
     }
@@ -971,6 +1035,8 @@ impl ExecCodec for Twisted {
             Twist::CancelsOnAmend => cancels_on_amend,
             Twist::FilledOnAmend => filled_on_amend,
             Twist::AmendedTwice => amended_twice,
+            Twist::PostOnlyOnAmend => post_only_on_amend,
+            Twist::NoFlagsOnAmend => no_flags_on_amend,
             Twist::WrongPx => wrong_px,
             _ => kept,
         };
@@ -991,6 +1057,15 @@ impl ExecCodec for Twisted {
     }
 
     fn on_timer(&mut self, tag: TimerTag, ctx: &EncodeCtx, fx: &mut Effects) {
+        if tag == MAINTAIN {
+            return fx.push(Effect::Send {
+                stream: EXEC_STREAM,
+                frame: WireSlice::plain(b"maintain".to_vec()),
+                rpc: None,
+                class: TrafficClass::Normal,
+                charge: RateCharge::one(OpKind::Control, None),
+            });
+        }
         if tag != RESEND {
             return self.inner.on_timer(tag, ctx, fx);
         }
@@ -1816,4 +1891,30 @@ fn amend_ack_fails_a_toy_whose_second_amended_update_states_another_price() {
         says(&failure, "OrderUpdate", "contradicts the amend"),
         "{failure}"
     );
+}
+
+#[test]
+fn amend_ack_skips_a_venue_whose_caps_allow_no_limit_order() {
+    let skipped = suite::amend_ack(&MARKET_ONLY.subject(assumed));
+    assert!(
+        matches!(skipped, Ok(Verdict::Skipped { why, .. }) if why.contains("no limit order")),
+        "{skipped:?}"
+    );
+}
+
+#[test]
+fn amend_ack_fails_a_toy_whose_amended_update_misstates_or_omits_the_flags_it_echoes() {
+    for variant in [&POST_ONLY_ON_AMEND, &NO_FLAGS_ON_AMEND] {
+        let failure = failed(suite::amend_ack(&variant.subject(assumed)));
+        assert!(
+            says(&failure, "OrderUpdate", "contradicts the amend"),
+            "{failure}"
+        );
+    }
+}
+
+#[test]
+fn a_limit_is_waited_out_by_its_window_and_no_more() {
+    let passed = suite::amend_ack(&FIFTY_MS_WINDOW.subject(assumed));
+    assert!(matches!(passed, Ok(Verdict::Passed { .. })), "{passed:?}");
 }
