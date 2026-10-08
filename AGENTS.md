@@ -205,7 +205,10 @@ rather than guess.
     authorization kept until its command is encoded, request ids from the account's `RpcIds`
     shared by its sessions, and each unanswered request handed to `on_rpc_timeout` once at its
     deadline, across a reconnect too, never written again (0057; compile-fail cases in
-    `tests/ui_submit/`) (its tests include the conformance toy by path);
+    `tests/ui_submit/`) (its tests include the conformance toy by path); with a `Journal` set,
+    it journals what it sends and receives as a market-data session does, each epoch's opening
+    and closing, each nonce it reserves and each context it gives its codec, what its stream
+    brings under Safety (0078);
     `tests/common/toy.rs` is the toy market-data venue later runtime tests reuse.
   - `crates/fbc-book` (it depends on `fbc-core` only: one tick-indexed L2 book per
     instrument and `BookId`, built from book events the same live and in replay, with
