@@ -5,7 +5,8 @@
 //! book channel per market (the factory's `plan_md` spreads them; [`ParadexMd`]'s `subscribe`
 //! refuses a second), and a frame's book is the one its market holds on the connection. The
 //! venue enforces the same: a second `order_book` channel of a market "cannot share an SBE
-//! session" with the first (decision 0074).
+//! session" with the first (decision 0074), while book channels of different markets share
+//! one, as a captured production session shows (decision 0077).
 //!
 //! seq_no is tracked per book. A snapshot (`pkgType` SNAPSHOT, the channel's update type `s`)
 //! becomes `BookSnapshotBegin`, its levels and `BookSnapshotEnd`, and anchors the sequence. A
