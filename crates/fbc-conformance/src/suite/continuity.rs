@@ -5,22 +5,22 @@
 //! with the `gap=<symbol>` tag each frame that breaks the sequence of that instrument's book (a
 //! number skipped, repeated or gone back). The codec must push `Health { inst: <that
 //! instrument>, feed: Book(<that channel>), h: Gap }` from each marked frame, a gap on no other
-//! instrument from it (Codex r4217682431), and no gap from any other frame: a break missed or
-//! put on another instrument leaves a broken book trusted, and a gap reported in sequence
-//! throws a good one away. A case that marks no break proves
-//! nothing and fails. A channel declared [`Continuity::Windowed`] or [`Continuity::Unsequenced`]
-//! has nothing to chain and is skipped by name.
+//! instrument or feed from it (Codex r4217682431, r4217839174), and no gap from any other
+//! frame: a break missed or put elsewhere leaves a broken book trusted, and a gap reported in
+//! sequence throws a good one away. A case that marks no break proves nothing and fails. A
+//! channel declared [`Continuity::Windowed`] or [`Continuity::Unsequenced`] has nothing to
+//! chain and is skipped by name.
 //!
 //! # The longer-block sub-case
 //!
 //! A venue whose market data is binary ([`Encoding::Sbe`] or [`Encoding::Protobuf`]) also
 //! gives `continuity/longer_block/<channel>.frames` for each channel: frames whose binary block
-//! is longer than the schema the codec was written against (a field the venue added). The codec
-//! must decode every one, each pushing something (Codex r4217682441), and report a gap exactly
-//! where the case marks one, if anywhere: a longer block is read by its declared length, never taken for a break or
-//! refused. A text venue ([`Encoding::Json`] or [`Encoding::Text`]) has no binary block: the
-//! sub-case is skipped by name, and a `longer_block/` directory in its fixtures fails, as a
-//! case never read.
+//! is longer than the schema the codec was written against (a field the venue added). The case
+//! must hold a frame, and the codec must decode every one, each pushing something (Codex
+//! r4217682441, r4217839165), and report a gap exactly where the case marks one, if anywhere: a
+//! longer block is read by its declared length, never taken for a break, refused or dropped. A
+//! text venue ([`Encoding::Json`] or [`Encoding::Text`]) has no binary block: the sub-case is
+//! skipped by name, and a `longer_block/` directory in its fixtures fails, as a case never read.
 
 use fbc_core::{
     BookCaps, Continuity, Encoding, Feed, FeedHealth, InstrumentId, MdEvent, SpecTable,
@@ -126,8 +126,8 @@ fn judge(
     let mut marked = 0usize;
     for step in steps {
         let line = step.line;
-        // The instruments a gap was reported on, on this channel or any other feed.
-        let gapped: Vec<(InstrumentId, bool)> = step
+        // The instruments and feeds a gap was reported on.
+        let gapped: Vec<(InstrumentId, Feed)> = step
             .events
             .iter()
             .filter_map(|(_, ev)| match ev {
@@ -135,7 +135,7 @@ fn judge(
                     inst,
                     feed,
                     h: FeedHealth::Gap,
-                } => Some((*inst, *feed == Feed::Book(book.id))),
+                } => Some((*inst, *feed)),
                 _ => None,
             })
             .collect();
@@ -158,23 +158,33 @@ fn judge(
             breaches.push(Breach::new(file, what));
             continue;
         };
-        if !gapped.contains(&(inst, true)) {
+        let own = (inst, Feed::Book(book.id));
+        if !gapped.contains(&own) {
             let what = format!(
                 "{file} line {line} breaks {sym}'s sequence, yet no gap on {channel} was reported \
                  for it"
             );
             breaches.push(Breach::new(&capability, what));
         }
-        for (other, _) in gapped.iter().filter(|(i, _)| *i != inst) {
+        // A gap on another instrument, or on another feed of this one (Codex r4217839174).
+        for &(other, feed) in gapped.iter().filter(|g| **g != own) {
+            let on = match feed == own.1 {
+                true => symbol(other),
+                false => format!("{}'s {feed:?}", symbol(other)),
+            };
             let what = format!(
-                "{file} line {line} breaks {sym}'s sequence, yet a gap was reported on {}",
-                symbol(*other)
+                "{file} line {line} breaks {sym}'s sequence, yet a gap was reported on {on}"
             );
             breaches.push(Breach::new(&capability, what));
         }
     }
     let frames = steps.len();
     if !breaks {
+        if frames == 0 {
+            // Codex r4217839165.
+            let what = "hands the codec no frame: a case that decodes nothing proves nothing";
+            breaches.push(Breach::new(file, what));
+        }
         return format!("{file}: {frames} frames, {marked} breaking the sequence");
     }
     if marked == 0 {

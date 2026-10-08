@@ -5,12 +5,14 @@
 //! them with them.
 //!
 //! For every book channel the suite drives ([`book_cases`](super::book_cases)), the set is that
-//! channel on the instruments one connection carries. In each of two epochs a codec built fresh from the
-//! factory (one per epoch, as the runtime builds them) is opened, and the reconciler's call for
-//! the set is handed to its [`subscribe`](fbc_core::MdCodec::subscribe), which must take it,
-//! asking after the reconnect for exactly the effects it asked for on the first connection (a
-//! codec that remembers the last connection's subscriptions sends them twice); then the same set is
-//! desired again, and any call the reconciler yields is a breach. It reads no fixture file.
+//! channel on the instruments one connection carries. In each of two epochs a codec built fresh
+//! from the factory (one per epoch, as the runtime builds them) is opened, and the reconciler's
+//! call for the set is handed to its [`subscribe`](fbc_core::MdCodec::subscribe), which must
+//! take it. After the reconnect it must ask for exactly the effects it asked for on the first
+//! connection: an [`MdCodec`] is deterministic given its inputs and prior state, and a fresh one
+//! has none, so anything else is state carried over (a codec that remembers the last
+//! connection's subscriptions sends them twice). Then the same set is desired again, and any
+//! call the reconciler yields is a breach. It reads no fixture file.
 
 use fbc_core::{ConnKey, Effect, Effects, MdCodec, SpecTable, VenueError};
 use fbc_runtime::{Reconciler, SubscribeCall};

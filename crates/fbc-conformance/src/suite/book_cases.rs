@@ -20,7 +20,7 @@
 //! [`BookCaps::channel`] spells it: what one fresh codec is handed, in order, after it is
 //! opened ([`on_open`](fbc_core::MdCodec::on_open)) and subscribed to the channel
 //! ([`subscribe`](fbc_core::MdCodec::subscribe), one call). A line is a frame, as in an
-//! order-entry case ([`frames`](super::frames)), after the tags that state what the fixture
+//! order-entry case ([`super::frames`]), after the tags that state what the fixture
 //! knows of it:
 //!
 //! ```text
@@ -124,8 +124,9 @@ pub(crate) fn parse(text: &str) -> Result<Vec<Line>, String> {
                 return Err(format!("line {n}: holds no `text ` or `hex ` frame"));
             };
             if !tags.add(word) {
+                let tags = "gap=<symbol>, ts, public, rpi";
                 return Err(format!(
-                    "line {n}: `{word}` is neither a frame nor a tag (gap=<symbol>, ts, public, rpi)"
+                    "line {n}: `{word}` is neither a frame nor a tag ({tags})"
                 ));
             }
             rest = after.trim_start();
