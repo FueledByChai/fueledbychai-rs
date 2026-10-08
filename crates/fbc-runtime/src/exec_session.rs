@@ -217,7 +217,8 @@ pub trait ExecHandler {
     /// ended, the session takes no place or amend on its market
     /// ([`ExecOrders::may_place_on`]). The consumer cancels them, a Safety cancel per order
     /// built and authorized by fbc-oms ([`ExecOrders::submit`]); one it does not cancel keeps
-    /// its market held until the next epoch's resync. Nothing by default.
+    /// its market held until the next epoch that sends an arm reads the venue again (an epoch
+    /// that sends none keeps it held and tells it again). Nothing by default.
     fn on_unprotected(&mut self, orders: &[VenueOrderSnapshot]) {
         let _ = orders;
     }

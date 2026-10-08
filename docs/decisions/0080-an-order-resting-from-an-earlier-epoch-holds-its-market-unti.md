@@ -31,7 +31,9 @@ bound the answer.
   every order the epoch's resync shows `Open` whose client id is ours (`CidMatch::Ours`) is
   unprotected. 0058 holds every place until the resync has ended, so each of them was placed on
   an earlier epoch, or by an earlier process. An order another namespace or system placed (I4),
-  or one shown without a client id, is not ours to protect and is not counted.
+  or one shown without a client id, is not ours to protect and is not counted. Where the
+  protection outlives a connection, an epoch that sends no arm (one was accepted earlier) keeps
+  the orders an earlier epoch found unprotected, since no arm covered them, and adds none.
 - **Its market is held.** Once the epoch is placing (0058: its arm accepted and its resync
   ended), a place, a batch of places with any item, or an amend on the market of an
   unprotected order is `NotSent(Disconnected)`, with no nonce reserved and nothing written,
@@ -44,9 +46,14 @@ bound the answer.
   and authorizes (the session cannot authorize a command itself, 0013 rule 2).
 - **What releases the market.** An order event, or an order query's answer, of the epoch that
   shows the order filled, cancelled, rejected or expired. An amend the venue reports under a new
-  venue id moves the order to it. Nothing else releases it: a cancel the venue refuses (an
-  order it no longer knows, or one already terminal) leaves the market held until the consumer
-  queries the order or the next epoch's resync reads the venue again.
+  venue id moves the order to it. An event naming a venue id names that order only, so an end
+  reported late under an id an amend superseded releases nothing whatever client id it
+  carries; one naming no venue id names our order by its client id. What the epoch's events
+  showed before its resync ended (ends, and amends to new ids) is kept until it ends, so a
+  snapshot read after them (a resync over HTTP while the stream runs) does not undo them.
+  Nothing else releases a market: a cancel the venue refuses (an order it no longer knows, or
+  one already terminal) leaves it held until the consumer queries the order or the next epoch
+  that sends an arm reads the venue again.
 
 ## Alternatives
 
