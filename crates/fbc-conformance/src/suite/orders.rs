@@ -24,8 +24,8 @@
 use std::time::Duration;
 
 use fbc_core::{
-    AmendAck, AmendCaps, CidMatch, ExecEvent, ItemRef, Lots, OrderUpdate, RpcId, SubmitOutcome,
-    Ticks, VenueOrderState,
+    AckLevel, AmendAck, AmendCaps, CidMatch, ClientOrderId, ExecEvent, ItemRef, Lots, OrderUpdate,
+    RpcId, SubmitOutcome, Ticks, VenueOrderId, VenueOrderState,
 };
 
 use super::harness::Harness;
@@ -72,15 +72,24 @@ pub fn amend_ack(subject: &Subject<'static>) -> Result<Verdict, Failure> {
         };
         c.oms.placed(c.h, cid, item, outcome)?;
         let auth = c.oms.amend(c.h, cid, px, qty)?;
+        // Only what the session reports from here on answers the amend (Codex r4222138050).
+        let before = c.events().len();
         let rpc = c.send(auth).await?;
         c.answered().await?;
         let names = |u: &OrderUpdate| {
             u.cid == Some(CidMatch::Ours(cid)) || (item.vid.is_some() && u.vid == item.vid)
         };
-        let update = |c: &Ctx<'_>| amended_update(&c.events(), names);
+        let update = |c: &Ctx<'_>| amended_update(&c.events()[before..], names);
         c.settle(|c| !c.outcomes(rpc).is_empty() && update(c).is_some())
             .await;
-        Ok(judge_amend(c, rpc, update(c), &amend, &ack))
+        Ok(judge_amend(
+            c,
+            rpc,
+            update(c),
+            item.vid.as_ref(),
+            &amend,
+            &ack,
+        ))
     })?;
     verdict(AMEND_ACK, breaches, || {
         let mut probed = vec![format!(
@@ -138,6 +147,7 @@ fn judge_amend(
     c: &Ctx<'_>,
     rpc: RpcId,
     update: Option<OrderUpdate>,
+    placed: Option<&VenueOrderId>,
     amend: &AmendCaps,
     ack: &str,
 ) -> Vec<Breach> {
@@ -167,8 +177,12 @@ fn judge_amend(
         VenueOrderState::Amended { new_vid } => new_vid.as_ref(),
         _ => None,
     };
-    if !amend.keeps_venue_id && new_vid.is_none() {
-        let what = "the amended order gets a new venue id, yet the update names none";
+    // A new venue id is another than the one the order was placed under (Codex r4222138032).
+    if !amend.keeps_venue_id && (new_vid.is_none() || new_vid == placed) {
+        let what = format!(
+            "the amended order gets a new venue id, yet the update names {new_vid:?}, the \
+             order having been placed under {placed:?}"
+        );
         breaches.push(Breach::new("AmendCaps.keeps_venue_id is false", what));
     }
     breaches
@@ -197,7 +211,7 @@ pub fn mixed_batch(subject: &Subject<'static>) -> Result<Verdict, Failure> {
     }
     let breaches = live.run(vec![vec![Accept, Reject, Silent]], async |c| {
         c.ready().await?;
-        let auth = c.oms.batch(c.h, usize::from(ITEMS))?;
+        let (cids, auth) = c.oms.batch(c.h, usize::from(ITEMS))?;
         let rpc = c.send(auth).await?;
         c.answered().await?;
         let every = |c: &Ctx<'_>| {
@@ -214,7 +228,7 @@ pub fn mixed_batch(subject: &Subject<'static>) -> Result<Verdict, Failure> {
         if let Some(moved) = moved {
             c.advance(moved + STEP).await;
         }
-        Ok(judge_batch(c, rpc, moved))
+        Ok(judge_batch(c, rpc, &cids, moved))
     })?;
     verdict(MIXED_BATCH, breaches, || {
         vec![
@@ -227,7 +241,12 @@ pub fn mixed_batch(subject: &Subject<'static>) -> Result<Verdict, Failure> {
 
 /// What broke `mixed_batch`: each item's outcomes, an outcome for the whole request, a
 /// resend.
-fn judge_batch(c: &Ctx<'_>, rpc: RpcId, moved: Option<Duration>) -> Vec<Breach> {
+fn judge_batch(
+    c: &Ctx<'_>,
+    rpc: RpcId,
+    cids: &[ClientOrderId],
+    moved: Option<Duration>,
+) -> Vec<Breach> {
     let mut breaches = Vec::new();
     let outcomes = c.outcomes(rpc);
     if moved.is_none() {
@@ -249,22 +268,19 @@ fn judge_batch(c: &Ctx<'_>, rpc: RpcId, moved: Option<Duration>) -> Vec<Breach> 
             .map(|(_, o)| o)
             .collect()
     };
+    // Each answered item once (Codex r4222138014): the acceptance final once, after at most one
+    // provisional acceptance (a two-phase venue's), and the rejection once.
     let accepted = of(0);
-    if accepted.is_empty()
-        || !accepted
-            .iter()
-            .all(|o| matches!(o, SubmitOutcome::Accepted { .. }))
-    {
-        let what = format!("item 0, which the stub accepted, was reported {accepted:?}");
+    let ack = |level| move |o: &&&SubmitOutcome| **o == &SubmitOutcome::Accepted { ack: level };
+    let finals = accepted.iter().filter(ack(AckLevel::Final)).count();
+    let provisional = accepted.iter().filter(ack(AckLevel::Provisional)).count();
+    if finals != 1 || provisional > 1 || finals + provisional != accepted.len() {
+        let what = format!("item 0, which the stub accepted, was reported {accepted:?}, not once");
         breaches.push(Breach::new("OrderCaps.batch_place", what));
     }
     let rejected = of(1);
-    if rejected.is_empty()
-        || !rejected
-            .iter()
-            .all(|o| matches!(o, SubmitOutcome::Rejected(_)))
-    {
-        let what = format!("item 1, which the stub rejected, was reported {rejected:?}");
+    if rejected.len() != 1 || !matches!(rejected[0], SubmitOutcome::Rejected(_)) {
+        let what = format!("item 1, which the stub rejected, was reported {rejected:?}, not once");
         breaches.push(Breach::new("OrderCaps.batch_place", what));
     }
     let unanswered = of(2);
@@ -283,7 +299,9 @@ fn judge_batch(c: &Ctx<'_>, rpc: RpcId, moved: Option<Duration>) -> Vec<Breach> 
         let what = format!("outcomes for items the batch does not hold: {beyond:?}");
         breaches.push(Breach::new("ExecCodec::on_frame", what));
     }
-    breaches.extend(resent(c, 0, "the batch"));
+    for (i, &cid) in cids.iter().enumerate() {
+        breaches.extend(resent(c, cid, &format!("item {i} of the batch")));
+    }
     breaches
 }
 
@@ -295,7 +313,7 @@ pub fn unknown_on_timeout(subject: &Subject<'static>) -> Result<Verdict, Failure
     };
     let breaches = live.run(vec![vec![Silent]], async |c| {
         c.ready().await?;
-        let (_, auth) = c.oms.place(c.h)?;
+        let (cid, auth) = c.oms.place(c.h)?;
         let rpc = c.send(auth).await?;
         c.answered().await?;
         let moved = c.advance_until(|c| !c.outcomes(rpc).is_empty()).await;
@@ -315,7 +333,7 @@ pub fn unknown_on_timeout(subject: &Subject<'static>) -> Result<Verdict, Failure
             );
             breaches.push(Breach::new("ExecCodec::on_rpc_timeout", what));
         }
-        breaches.extend(resent(c, 0, "the unanswered placement"));
+        breaches.extend(resent(c, cid, "the unanswered placement"));
         Ok(breaches)
     })?;
     verdict(UNKNOWN_ON_TIMEOUT, breaches, || {
@@ -325,12 +343,10 @@ pub fn unknown_on_timeout(subject: &Subject<'static>) -> Result<Verdict, Failure
     })
 }
 
-/// A breach when request `n` (from 0, in the order the stub answers them) was written more
-/// than once.
-fn resent(c: &Ctx<'_>, n: usize, what: &str) -> Option<Breach> {
-    let frames = c.frames();
-    let frame = frames.get(c.opening() + n)?;
-    let times = frames.iter().filter(|f| *f == frame).count();
+/// A breach when the order `cid` names was written more than once, as [`Ctx::written`] counts
+/// it.
+fn resent(c: &Ctx<'_>, cid: ClientOrderId, what: &str) -> Option<Breach> {
+    let times = c.written(cid);
     (times > 1).then(|| {
         let what = format!("{what} was written {times} times; a request is never resent");
         Breach::new("ExecCodec: never resent", what)

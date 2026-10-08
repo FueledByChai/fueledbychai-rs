@@ -34,7 +34,8 @@ enum Twist {
     None,
     /// Every outcome a timed-out request reports is `Accepted`.
     AcceptsOnTimeout,
-    /// The last request it wrote is written again every second.
+    /// The last placement it wrote is written again every second, its bytes changed as a
+    /// request signed again would be.
     Resends,
     /// An amended order's update names no new venue id.
     NoNewVid,
@@ -45,6 +46,15 @@ enum Twist {
     /// Each item a timed-out request reports `Unknown` is reported again for the whole request
     /// and for an index three past its own.
     Garbled,
+    /// Every outcome a timed-out request reports is reported twice.
+    Doubled,
+    /// An amended order's update names, as its new venue id, the one it was placed under.
+    SameVid,
+    /// An accepted placement is reported amended at once, under another venue id.
+    EarlyAmended,
+    /// Once a request timed out, the next second asks for a reconnect whose opening frame
+    /// never fits the venue's buckets, which ends the session with an error.
+    FailsAfterTimeout,
 }
 
 /// The toy with its caps edited by `caps` and its codec twisted by `twist`.
@@ -68,6 +78,46 @@ static NO_NEW_VID: Variant = Variant {
 static REFUSES_PLACEMENTS: Variant = Variant {
     caps: |_| {},
     twist: Twist::RefusesPlacements,
+};
+static DOUBLED: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::Doubled,
+};
+static SAME_VID: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::SameVid,
+};
+static EARLY_AMENDED: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::EarlyAmended,
+};
+static FAILS_AFTER_TIMEOUT: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::FailsAfterTimeout,
+};
+/// The toy with a second limit: one placement or amend a second.
+static ONE_ORDER_A_SECOND: Variant = Variant {
+    caps: |c| {
+        c.limits.push(fbc_core::RateLimit {
+            scope: fbc_core::LimitScope::Account,
+            ops: TagSet::of(&[OpKind::Place, OpKind::Amend]),
+            per: Duration::from_secs(1),
+            units: 1,
+        });
+    },
+    twist: Twist::None,
+};
+/// The toy declaring client ids in base 36, which its codec, writing base 62, never sends: the
+/// frames carry no id the suite can find, so a request is told by its bytes.
+static OTHER_CID_FORMAT: Variant = Variant {
+    caps: |c| {
+        let order = &mut c.exec.as_mut().unwrap().order;
+        order.client_id = fbc_core::ClientIdFormat::Alnum {
+            max_len: 32,
+            charset: fbc_core::Charset::LowerAlphanumeric,
+        };
+    },
+    twist: Twist::None,
 };
 static SILENT_ON_TIMEOUT: Variant = Variant {
     caps: |_| {},
@@ -197,8 +247,14 @@ impl VenueFactory for Variant {
         let twist = self.twist;
         let codec = ToyFactory.exec_codec(cfg, creds)?;
         Some(codec.map(|inner| {
-            let last = None;
-            Box::new(Twisted { inner, twist, last }) as Box<dyn ExecCodec>
+            let (last, failed) = (None, false);
+            let twisted = Twisted {
+                inner,
+                twist,
+                last,
+                failed,
+            };
+            Box::new(twisted) as Box<dyn ExecCodec>
         }))
     }
 
@@ -220,6 +276,8 @@ struct Twisted {
     twist: Twist,
     /// The last request frame it wrote, for [`Twist::Resends`].
     last: Option<Vec<u8>>,
+    /// Whether a request timed out, for [`Twist::FailsAfterTimeout`].
+    failed: bool,
 }
 
 /// A sink handing `inner` the events `f` rewrites each into.
@@ -281,6 +339,55 @@ fn garbled(ev: ExecEvent) -> Vec<ExecEvent> {
     vec![unknown(None), unknown(Some(beyond)), unknown(Some(item))]
 }
 
+/// Every event twice.
+fn doubled(ev: ExecEvent) -> Vec<ExecEvent> {
+    vec![ev.clone(), ev]
+}
+
+/// An amended order's update naming the venue id it was placed under as its new one.
+fn same_vid(ev: ExecEvent) -> Vec<ExecEvent> {
+    vec![match ev {
+        ExecEvent::Order(mut u) if matches!(u.state, VenueOrderState::Amended { .. }) => {
+            u.state = VenueOrderState::Amended {
+                new_vid: u.vid.clone(),
+            };
+            ExecEvent::Order(u)
+        }
+        other => other,
+    }]
+}
+
+/// An accepted placement's outcome, then an update reporting that order amended.
+fn early_amended(ev: ExecEvent) -> Vec<ExecEvent> {
+    let ExecEvent::Outcome {
+        item:
+            Some(ItemRef {
+                cid: Some(cid),
+                vid: Some(vid),
+                ..
+            }),
+        outcome: SubmitOutcome::Accepted { .. },
+        ..
+    } = &ev
+    else {
+        return vec![ev];
+    };
+    let new_vid = toy::with_scope(|scope| scope.venue_order_id("toy-early")).ok();
+    let update = fbc_core::OrderUpdate {
+        cid: Some(fbc_core::CidMatch::Ours(*cid)),
+        vid: Some(vid.clone()),
+        inst: toy::INST_A,
+        side: fbc_core::Side::Buy,
+        state: VenueOrderState::Amended { new_vid },
+        cum_filled: fbc_core::Lots::ZERO,
+        px: None,
+        qty: None,
+        post_only: None,
+        reduce_only: None,
+    };
+    vec![ev, ExecEvent::Order(update)]
+}
+
 /// An amended order's update without its new venue id.
 fn no_new_vid(ev: ExecEvent) -> Vec<ExecEvent> {
     vec![match ev {
@@ -306,7 +413,22 @@ impl ExecCodec for Twisted {
 
     fn on_open(&mut self, stream: StreamId, ctx: &EncodeCtx, fx: &mut Effects) {
         self.inner.on_open(stream, ctx, fx);
-        if self.twist == Twist::Resends {
+        if self.failed {
+            // Heavier than the toy's one bucket ever admits.
+            let weight = core::num::NonZeroU32::new(1_000).unwrap();
+            fx.push(Effect::Send {
+                stream,
+                frame: WireSlice::plain(b"heavy".to_vec()),
+                rpc: None,
+                class: TrafficClass::Safety,
+                charge: RateCharge {
+                    op: OpKind::Control,
+                    inst: None,
+                    weight,
+                },
+            });
+        }
+        if matches!(self.twist, Twist::Resends | Twist::FailsAfterTimeout) {
             fx.push(resend_timer());
         }
     }
@@ -326,7 +448,10 @@ impl ExecCodec for Twisted {
         let mut mine = Effects::new();
         let receipt = self.inner.encode(cmd, rpc, specs, ctx, t, &mut mine)?;
         for effect in mine.take() {
-            if let Effect::Send { frame, .. } = &effect {
+            let placing = matches!(cmd, VenueCommand::Place(_) | VenueCommand::PlaceBatch(_));
+            if let Effect::Send { frame, .. } = &effect
+                && placing
+            {
                 self.last = Some(frame.bytes().to_vec());
             }
             fx.push(effect);
@@ -343,10 +468,11 @@ impl ExecCodec for Twisted {
         sink: &mut dyn ExecSink,
         fx: &mut Effects,
     ) -> Result<(), DecodeError> {
-        let f_ = if self.twist == Twist::NoNewVid {
-            no_new_vid
-        } else {
-            kept
+        let f_ = match self.twist {
+            Twist::NoNewVid => no_new_vid,
+            Twist::SameVid => same_vid,
+            Twist::EarlyAmended => early_amended,
+            _ => kept,
         };
         let sink = &mut Rewrite { inner: sink, f: f_ };
         self.inner.on_frame(stream, f, scope, specs, sink, fx)
@@ -368,10 +494,19 @@ impl ExecCodec for Twisted {
         if tag != RESEND {
             return self.inner.on_timer(tag, ctx, fx);
         }
-        if let Some(frame) = &self.last {
+        if self.failed {
+            let reason = "a twisted toy reconnects after a timeout";
+            return fx.push(Effect::Reconnect {
+                stream: EXEC_STREAM,
+                reason,
+            });
+        }
+        if let Some(frame) = self.last.as_ref().filter(|_| self.twist == Twist::Resends) {
             fx.push(Effect::Send {
                 stream: EXEC_STREAM,
-                frame: WireSlice::plain(frame.clone()),
+                // Signed again, as a rebuilt retry would be: other bytes, the same orders
+                // (Codex r4222138042).
+                frame: WireSlice::plain([&frame[..], b"|again"].concat()),
                 rpc: None,
                 class: TrafficClass::Normal,
                 charge: RateCharge::one(OpKind::Place, None),
@@ -385,6 +520,11 @@ impl ExecCodec for Twisted {
             Twist::AcceptsOnTimeout => accepted,
             Twist::SilentOnTimeout => dropped,
             Twist::Garbled => garbled,
+            Twist::Doubled => doubled,
+            Twist::FailsAfterTimeout => {
+                self.failed = true;
+                kept
+            }
             _ => return self.inner.on_rpc_timeout(rpc, sink),
         };
         self.inner
@@ -816,4 +956,72 @@ fn a_setup_with_no_instrument_or_a_limit_admitting_nothing_fails_before_any_sess
 fn amend_ack_fails_when_fbc_oms_cannot_name_the_order_by_any_reference_the_amend_takes() {
     let failure = failed(suite::amend_ack(&AMEND_BY_NONCE.subject(assumed)));
     assert!(says(&failure, "fbc-oms", "refused the amend"), "{failure}");
+}
+
+#[test]
+fn mixed_batch_fails_a_toy_that_reports_each_answered_item_twice() {
+    let failure = failed(suite::mixed_batch(&DOUBLED.subject(assumed)));
+    for item in [
+        "item 0, which the stub accepted",
+        "item 1, which the stub rejected",
+    ] {
+        assert!(says(&failure, "OrderCaps.batch_place", item), "{failure}");
+    }
+}
+
+#[test]
+fn amend_ack_fails_a_toy_whose_amended_order_keeps_the_venue_id_it_declares_replaced() {
+    let failure = failed(suite::amend_ack(&SAME_VID.subject(assumed)));
+    assert!(
+        says(
+            &failure,
+            "AmendCaps.keeps_venue_id is false",
+            "having been placed under"
+        ),
+        "{failure}"
+    );
+}
+
+#[test]
+fn amend_ack_takes_no_amended_update_reported_before_the_amend() {
+    // The update the placement brought is no answer to the amend, which brings none.
+    let failure = failed(suite::amend_ack(&EARLY_AMENDED.subject(reply_only)));
+    assert!(failure.names("AmendCaps.ack is ReplacedEvent"), "{failure}");
+}
+
+#[test]
+fn amend_ack_waits_out_a_limit_of_one_order_a_second_before_amending() {
+    let passed = suite::amend_ack(&ONE_ORDER_A_SECOND.subject(assumed));
+    assert!(matches!(passed, Ok(Verdict::Passed { .. })), "{passed:?}");
+}
+
+#[test]
+fn mixed_batch_passes_on_an_instrument_whose_minimum_size_is_two_million_lots() {
+    fn huge() -> Setup {
+        let mut specs = toy::specs();
+        let mut a = specs.get(toy::INST_A).unwrap().clone();
+        a.min_size = fbc_core::Lots::new(2_000_000).unwrap();
+        specs.insert(a);
+        Setup { specs, ..assumed() }
+    }
+    let passed = suite::mixed_batch(&ToyFactory.subject_for(huge));
+    assert!(matches!(passed, Ok(Verdict::Passed { .. })), "{passed:?}");
+}
+
+#[test]
+fn a_session_that_ends_with_an_error_fails_a_check_whose_scenario_saw_everything() {
+    let failure = failed(suite::unknown_on_timeout(
+        &FAILS_AFTER_TIMEOUT.subject(assumed),
+    ));
+    assert!(
+        says(&failure, "ExecSession::run", "OpenNeverFits"),
+        "{failure}"
+    );
+    assert_eq!(failure.breaches.len(), 1, "{failure}");
+}
+
+#[test]
+fn a_venue_whose_frames_carry_no_client_id_the_suite_can_find_is_judged_by_the_frames_bytes() {
+    let passed = suite::unknown_on_timeout(&OTHER_CID_FORMAT.subject(assumed));
+    assert!(matches!(passed, Ok(Verdict::Passed { .. })), "{passed:?}");
 }

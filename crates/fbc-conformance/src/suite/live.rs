@@ -17,7 +17,7 @@ use std::time::Duration;
 use fbc_core::{
     AccountKey, AccountLease, ClientOrderId, Envelope, ExecEvent, ItemRef, Lots, MarketLease,
     MonoNs, NewOrder, NonceBlock, NonceSource, OrderCaps, OrderKind, OrderKindTag, RpcId, Side,
-    SignedLots, SubmitHandle, SubmitOutcome, Ticks, VenueCaps, VenueFactory, WallNs,
+    SignedLots, SubmitHandle, SubmitOutcome, Ticks, VenueCaps, VenueFactory, WallNs, encode_cid,
 };
 use fbc_oms::{
     Authorization, LadderConfig, LeaseKeys, Leases, MarketCapsConfig, OrderKey, OrderOp,
@@ -37,9 +37,10 @@ use crate::server::StubServer;
 
 /// The account the session trades and fbc-oms authorizes for.
 const ACCT: AccountKey = AccountKey::new(1);
-/// The registry's inventory and resting caps on the instrument, in lots: wide enough for every
-/// order a check places.
-const CAP: i64 = 1_000_000;
+/// The registry's inventory and resting caps on the instrument, in orders of the harness's size:
+/// room for every order a check places, whatever the instrument's minimum size (Codex
+/// r4222138063).
+const CAP_ORDERS: i64 = 8;
 /// How far the clock moves at a time while a check waits for a deadline, for its first
 /// [`FINE`]; [`COARSE`] after that, where a deadline that has not passed is long and only its
 /// passing is waited for.
@@ -162,17 +163,27 @@ impl<'s> Live<'s> {
             };
             let (ran, out) = tokio::join!(session.run(), script);
             drop(thaw);
-            out.map_err(|mut failure| {
-                if let Err(e) = ran {
-                    let what = format!("the session ended with {e:?}");
-                    failure.breaches.push(Breach::new("ExecSession::run", what));
+            // A session that ended with an error fails the check, whatever the scenario saw
+            // (Codex r4222138070).
+            let ended = ran.err().map(|e| {
+                let what = format!("the session ended with {e:?}");
+                Breach::new("ExecSession::run", what)
+            });
+            let mut failure = match out {
+                Ok(seen) => match ended {
+                    None => return Ok(seen),
+                    Some(breach) => self.h.fail(&breach.capability, breach.what),
+                },
+                Err(mut failure) => {
+                    failure.breaches.extend(ended);
+                    failure
                 }
-                if let Some(Err(e)) = server.finished().now_or_never() {
-                    let what = format!("the stub's script stopped: {e}");
-                    failure.breaches.push(Breach::new("OrderEntryStub", what));
-                }
-                failure
-            })
+            };
+            if let Some(Err(e)) = server.finished().now_or_never() {
+                let what = format!("the stub's script stopped: {e}");
+                failure.breaches.push(Breach::new("OrderEntryStub", what));
+            }
+            Err(failure)
         })
     }
 
@@ -262,9 +273,13 @@ impl Ctx<'_> {
         Err(self.h.fail("OrderEntryStub.opening", what))
     }
 
-    /// Submits `auth` to the session and waits until it reports the request sent: its request
-    /// id, or a failure when the session refuses it, reports it not sent, or never reports it.
+    /// Moves the clock on by the longest window of the venue's declared limits, so every bucket
+    /// has room again for one request (Codex r4222138060), then submits `auth` to the session
+    /// and waits until it reports the request sent: its request id, or a failure when the
+    /// session refuses it, reports it not sent, or never reports it.
     pub async fn send(&self, auth: Authorization) -> Result<RpcId, Failure> {
+        let window = self.h.caps.limits.iter().map(|l| l.per).max();
+        self.advance(window.unwrap_or_default()).await;
         let rpc = self.orders.submit(auth);
         let handle = |c: &Ctx<'_>| {
             let rpc = rpc.as_ref().ok()?;
@@ -359,10 +374,29 @@ impl Ctx<'_> {
         self.heard.events.borrow().clone()
     }
 
-    /// How many frames the stub answers as the epoch opens: request `n`'s frame is the frame
-    /// received after them, `n` places on.
-    pub fn opening(&self) -> usize {
-        self.opening
+    /// How many frames the stub received on the session's first connection that carry `cid` as
+    /// the venue's wire spells it (Codex r4222138042: a request rebuilt and signed again is
+    /// another frame carrying the same order); where none does, the venue does not send our
+    /// id as text, and the frames equal to the first request's (the first frame after the
+    /// opening, the one request a check sends that carries `cid`) are counted instead.
+    pub fn written(&self, cid: ClientOrderId) -> usize {
+        let frames = self.frames();
+        let wire = encode_cid(&self.oms.order.client_id, cid).ok();
+        let carries = |f: &Frame| {
+            let bytes = match f {
+                Frame::Text(t) => t.as_bytes(),
+                Frame::Binary(b) => b,
+            };
+            let wire = wire.as_ref().map_or(&[][..], |w| w.as_bytes());
+            !wire.is_empty() && bytes.windows(wire.len()).any(|w| w == wire)
+        };
+        match frames.iter().filter(|f| carries(f)).count() {
+            0 => {
+                let request = frames.get(self.opening);
+                frames.iter().filter(|f| Some(*f) == request).count()
+            }
+            times => times,
+        }
     }
 
     /// Every frame the stub received on the session's first connection, in order.
@@ -413,7 +447,8 @@ impl Oms {
         let spec = h.specs().get(h.inst).expect("the harness's instrument");
         let symbol = spec.venue_symbol.clone();
         let keys = LeaseKeys::new(venue, &name, order).with_market(h.inst, symbol.clone());
-        let cap = Some(Lots::new(CAP).expect("a count"));
+        let cap = h.qty.get().saturating_mul(CAP_ORDERS);
+        let cap = Some(Lots::new(cap).expect("a count"));
         let limits = MarketCapsConfig {
             inventory: cap,
             resting: cap,
@@ -491,13 +526,18 @@ impl Oms {
         Ok((cid, self.authorize(h, cmd)?))
     }
 
-    /// A batch of `n` placements, built and authorized.
-    pub fn batch(&mut self, h: &Harness<'_>, n: usize) -> Result<Authorization, Failure> {
-        let orders = (0..n).map(|_| self.new_order(h)).collect();
+    /// A batch of `n` placements, built and authorized: their client ids and its authorization.
+    pub fn batch(
+        &mut self,
+        h: &Harness<'_>,
+        n: usize,
+    ) -> Result<(Vec<ClientOrderId>, Authorization), Failure> {
+        let orders: Vec<_> = (0..n).map(|_| self.new_order(h)).collect();
+        let cids = orders.iter().map(|o| o.cid).collect();
         let plan = self.reg.place_batch(orders).expect("a batch of one market");
         let cmd = plan.command.filter(|_| plan.refused.is_empty());
         let refused = || h.fail("fbc-oms", format!("refused items: {:?}", plan.refused));
-        self.authorize(h, cmd.ok_or_else(refused)?)
+        Ok((cids, self.authorize(h, cmd.ok_or_else(refused)?)?))
     }
 
     /// Order `cid`'s placement answered with `item` and `outcome`, as the session reported it.
