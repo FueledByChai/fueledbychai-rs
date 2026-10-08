@@ -8,7 +8,7 @@
 //! ```text
 //! export PARADEX_ACCOUNT_ADDRESS=...   # the testnet account
 //! export PARADEX_PRIVATE_KEY=...       # its main Stark key
-//! cargo run -p fbc-examples --example testnet_trade -- \
+//! cargo run -p fbc-examples --example testnet_trade -- --sole-trader \
 //!     --market BTC-USD-PERP --tick <price_tick_size> --step <order_size_increment> \
 //!     --min-notional <min_notional>    # the market's, from GET /v1/markets
 //! cargo run -p fbc-examples --example testnet_trade -- --help
