@@ -27,12 +27,12 @@
 //! by our client id is the order's state now: it names the order by that id and moves it to the
 //! venue id it shows, unless an amend moved it away from that id. What the epoch's events and
 //! client-id query answers showed before its resync ended is kept, so an older snapshot of an
-//! order does not undo it, and a later snapshot of a held order keeps what was heard of its
-//! amends. The consumer is told them once per epoch ([`Gate::notice`]) and cancels them through
-//! fbc-oms's authorizations, or queries one its registry holds ended. Nothing else releases a
-//! market: a later epoch keeps every order an earlier one found unprotected, since no later arm
-//! covers it and a later snapshot may omit an order still resting, and adds what its own resync
-//! shows.
+//! order does not undo it, and a later snapshot of a held order, matched by our client id,
+//! keeps what was heard of its amends. The consumer is told them once per epoch
+//! ([`Gate::notice`]) and cancels them through fbc-oms's authorizations, or queries one its
+//! registry holds ended. Nothing else releases a market: a later epoch keeps every order an
+//! earlier one found unprotected, since no later arm covers it and a later snapshot may omit an
+//! order still resting, and adds what its own resync shows.
 
 use std::collections::{HashMap, HashSet};
 
@@ -140,16 +140,21 @@ impl Held {
         }
     }
 
-    /// A newer snapshot of the same order: what it shows, keeping what was heard of its amends
-    /// (Codex P1 r4220079804 on PR #127).
+    /// A later snapshot of the same order, by our client id: what it shows, keeping what was
+    /// heard of its amends (Codex P1 r4220079804 on PR #127); under a new venue id, the order
+    /// was amended meanwhile (Codex P2 r4220412802 on PR #127); under an id an amend moved it
+    /// from, it lags what was heard and changes nothing.
     fn refresh(&mut self, newer: Held) {
+        if self.superseded.contains(&newer.order.vid) {
+            return;
+        }
         let older = std::mem::replace(self, newer);
-        for old in older.superseded {
+        for old in older.superseded.into_iter().chain([older.order.vid]) {
             if old != self.order.vid && !self.superseded.contains(&old) {
                 self.superseded.push(old);
             }
         }
-        self.amended |= older.amended;
+        self.amended |= older.amended || !self.superseded.is_empty();
     }
 }
 
@@ -179,17 +184,16 @@ impl Early {
         {
             superseded.push(std::mem::replace(&mut vid, moved.clone()));
         }
-        // An answer to a query by our client id is the order's state when it was given, unless
-        // it shows an id an amend moved the order from (Codex P2 r4220079832 on PR #127).
-        if let Some((at, ended)) = self.queried.get(&cid)
-            && !self.moved.contains_key(at)
-        {
-            if *ended {
-                return None;
-            }
-            if *at != vid {
+        // An answer to a query by our client id is the order's state when it was given (Codex
+        // P2 r4220079832 on PR #127): open, the order rests on from the id it showed, following
+        // the amends heard from it (Codex P2 r4220412819 on PR #127); ended, it ended, unless an
+        // amend moved the order from the id it showed, so it showed the superseded order.
+        match self.queried.get(&cid) {
+            Some((at, false)) if *at != vid => {
                 superseded.push(std::mem::replace(&mut vid, at.clone()));
             }
+            Some((at, true)) if !self.moved.contains_key(at) => return None,
+            _ => {}
         }
         // Each step follows one amend; there are no more steps than amends heard. An amend away
         // from an id comes before an end heard under it, which names the superseded order
@@ -431,17 +435,8 @@ impl Gate {
                 else {
                     return;
                 };
-                // A snapshot under an id an amend moved the order from lags what was heard.
-                let lags = |o: &Held| o.is(cid) && o.superseded.contains(&snap.vid);
-                if self.unprotected.iter().any(lags) {
-                    return;
-                }
                 if let Some(held) = self.early.now(snap, cid) {
-                    match self
-                        .unprotected
-                        .iter_mut()
-                        .find(|o| o.order.vid == held.order.vid)
-                    {
+                    match self.unprotected.iter_mut().find(|o| o.is(cid)) {
                         Some(known) => known.refresh(held),
                         None => self.unprotected.push(held),
                     }
@@ -567,20 +562,25 @@ mod tests {
 
     const INST: InstrumentId = InstrumentId::new(7);
 
-    /// One of our client ids, minted once under a namespace lease held in a directory of its
-    /// own.
-    fn cid() -> ClientOrderId {
-        static CID: std::sync::OnceLock<ClientOrderId> = std::sync::OnceLock::new();
-        *CID.get_or_init(|| {
+    /// Our client ids, one per order, minted once under a namespace lease held in a directory
+    /// of its own.
+    fn cids() -> &'static [ClientOrderId; 4] {
+        static CIDS: std::sync::OnceLock<[ClientOrderId; 4]> = std::sync::OnceLock::new();
+        CIDS.get_or_init(|| {
             let name = format!("fbc-runtime-gate-{}", std::process::id());
             let dir = std::env::temp_dir().join(name);
             std::fs::create_dir_all(&dir).unwrap();
             let ns = Namespace::new(5);
             let lease = NamespaceLease::acquire(&dir, AccountKey::new(1), ns).unwrap();
-            let cid = CidMint::new(lease, 0, 0, WallNs(1)).mint().unwrap();
+            let mut mint = CidMint::new(lease, 0, 0, WallNs(1));
+            let cids = std::array::from_fn(|_| mint.mint().unwrap());
             let _ = std::fs::remove_dir_all(&dir);
-            cid
+            cids
         })
+    }
+
+    fn cid() -> ClientOrderId {
+        cids()[0]
     }
 
     fn order(cid: ClientOrderId) -> NewOrder {
@@ -859,13 +859,19 @@ mod tests {
         }
     }
 
-    fn ours(wire: &str) -> VenueOrderSnapshot {
+    /// Our order `n` resting under `wire`.
+    fn ours_as(n: usize, wire: &str) -> VenueOrderSnapshot {
         snap(
-            Some(CidMatch::Ours(cid())),
+            Some(CidMatch::Ours(cids()[n])),
             wire,
             INST,
             VenueOrderState::Open,
         )
+    }
+
+    /// Our order 0 resting under `wire`.
+    fn ours(wire: &str) -> VenueOrderSnapshot {
+        ours_as(0, wire)
     }
 
     /// An order event for `cid` or `wire` in `state`.
@@ -1080,8 +1086,8 @@ mod tests {
             ),
         );
         gate.observe(0, &update(None, Some("V-7"), cancelled));
-        for wire in ["V-1", "V-2", "V-3", "V-4"] {
-            gate.observe(0, &ExecEvent::ResyncOrder(ours(wire)));
+        for (n, wire) in ["V-1", "V-2", "V-3", "V-4"].into_iter().enumerate() {
+            gate.observe(0, &ExecEvent::ResyncOrder(ours_as(n, wire)));
         }
         gate.heard(0, &accepted(1));
         gate.heard(0, &ExecEvent::ResyncEnd);
@@ -1121,8 +1127,9 @@ mod tests {
         gate.observe(0, &update(None, Some("V-9"), to("V-8")));
         gate.observe(0, &ExecEvent::ResyncOrder(ours("V-8")));
         assert_eq!(gate.unprotected().len(), 1);
-        gate.observe(0, &update(Some(CidMatch::Ours(cid())), None, cancelled));
-        gate.observe(0, &ExecEvent::ResyncOrder(ours("V-1")));
+        let other = Some(CidMatch::Ours(cids()[1]));
+        gate.observe(0, &update(other, None, cancelled));
+        gate.observe(0, &ExecEvent::ResyncOrder(ours_as(1, "V-1")));
         assert_eq!(gate.unprotected().len(), 1);
         assert_ne!(gate.unprotected()[0].vid, vid("V-1"));
     }
@@ -1159,13 +1166,13 @@ mod tests {
         gate.authenticated(1);
         gate.arm_sent(1, RpcId(2));
         gate.resync_asked(1);
-        gate.observe(1, &ExecEvent::ResyncOrder(ours("V-2")));
+        gate.observe(1, &ExecEvent::ResyncOrder(ours_as(1, "V-2")));
         // Not placing yet: the place waits for the arm, and the consumer is told nothing.
         assert_eq!(gate.admits(&place_on(INST), 1), Err(Hold::Unready));
         assert_eq!(gate.notice(1), None);
         gate.heard(1, &ExecEvent::ResyncEnd);
         gate.heard(1, &accepted(2));
-        assert_eq!(gate.notice(1), Some(vec![ours("V-1"), ours("V-2")]));
+        assert_eq!(gate.notice(1), Some(vec![ours("V-1"), ours_as(1, "V-2")]));
         let cancelled = VenueOrderState::Canceled(CancelReason::Requested);
         gate.observe(1, &update(None, Some("V-2"), cancelled));
         assert!(gate.unprotected_on(INST));
@@ -1407,6 +1414,49 @@ mod tests {
         gate.observe(0, &by_cid("V-1", cancelled));
         gate.observe(0, &ExecEvent::ResyncOrder(ours("V-1")));
         assert_eq!(gate.unprotected()[0].vid, vid("V-2"));
+    }
+
+    /// Codex P2 r4220412802 on PR #127: a later snapshot of a held order under a new venue id
+    /// no event reported (amended while disconnected) is the same order, by our client id: it
+    /// moves the held order there rather than holding a second one.
+    #[test]
+    fn a_later_snapshot_of_a_held_order_under_a_new_venue_id_moves_it_there() {
+        let mut gate = Gate::new(true, false);
+        resynced(&mut gate, &[ours("V-1")]);
+        gate.authenticated(1);
+        gate.arm_sent(1, RpcId(2));
+        gate.resync_asked(1);
+        gate.observe(1, &ExecEvent::ResyncOrder(ours("V-2")));
+        ended(&mut gate, 1, 2);
+        assert_eq!(gate.unprotected(), [ours("V-2")]);
+        // An end naming only our client id may report V-1, and a query answer showing V-1 ended
+        // shows the superseded order: neither releases it.
+        let mine = Some(CidMatch::Ours(cid()));
+        let cancelled = VenueOrderState::Canceled(CancelReason::Requested);
+        gate.observe(1, &update(mine, None, cancelled.clone()));
+        gate.observe(1, &by_cid("V-1", cancelled.clone()));
+        assert!(gate.unprotected_on(INST));
+        gate.observe(1, &update(None, Some("V-2"), cancelled));
+        assert!(gate.unprotected().is_empty());
+    }
+
+    /// Codex P2 r4220412819 on PR #127: an amend heard after an answer to a query by our client
+    /// id, both before the snapshot, moves the order on from the id the answer showed.
+    #[test]
+    fn an_amend_heard_after_an_early_client_id_query_answer_moves_the_order_on() {
+        let mut gate = Gate::new(true, false);
+        resyncing(&mut gate);
+        gate.observe(0, &by_cid("V-2", VenueOrderState::Open));
+        let to_v3 = VenueOrderState::Amended {
+            new_vid: Some(vid("V-3")),
+        };
+        gate.observe(0, &update(None, Some("V-2"), to_v3));
+        gate.observe(0, &ExecEvent::ResyncOrder(ours("V-1")));
+        ended(&mut gate, 0, 1);
+        assert_eq!(gate.unprotected()[0].vid, vid("V-3"));
+        let cancelled = VenueOrderState::Canceled(CancelReason::Requested);
+        gate.observe(0, &update(None, Some("V-3"), cancelled));
+        assert!(gate.unprotected().is_empty());
     }
 
     #[test]

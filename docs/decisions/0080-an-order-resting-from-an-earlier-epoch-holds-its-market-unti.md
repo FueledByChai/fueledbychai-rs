@@ -56,10 +56,12 @@ bound the answer.
   it). An answer to a query by our client id is the order's state now: it names the order by
   that id and moves it to the venue id the answer shows, then applies the state shown, unless
   an amend moved the order away from that id, when the answer shows the superseded order and
-  changes nothing. A later epoch's snapshot of an order under an id it was moved from adds
-  nothing, and one under the id it rests under keeps what was heard of its amends. An answer
-  to a query by our client id heard before the resync ended is kept too: an older snapshot
-  of the order is moved to the id the answer showed, or, if the answer showed it ended, adds
+  changes nothing. A later epoch's snapshot of a held order is matched to it by our client
+  id: one under an id an amend moved the order from changes nothing, and one under another
+  id moves the order there (it was amended meanwhile), keeping what was heard of its amends.
+  An answer to a query by our client id heard before the resync ended is kept too: an older
+  snapshot of the order is moved to the id the answer showed and on along the amends heard
+  from it, or, if the answer showed the order ended under an id no amend moved it from, adds
   nothing. What the epoch's events
   showed before its resync ended (ends, and amends to new ids, by venue id or, for an event
   naming none, by our client id) is kept until it ends, so a snapshot read after them (a resync
