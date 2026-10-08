@@ -9,9 +9,9 @@ use rust_decimal::Decimal;
 
 /// The help text `--help` prints.
 pub const USAGE: &str = "\
-testnet_trade: places ONE post-only limit order, sized to the resting cap you give, well away
-from the touch on a Paradex TESTNET market through fbc-oms, waits for its acknowledgement, cancels it, waits for the
-cancel's acknowledgement, then Stops (kill switch + cancel all) and exits. TESTNET ONLY: a
+testnet_trade: places ONE post-only limit order of the size you give, well away from the touch
+on a Paradex TESTNET market through fbc-oms, waits for its acknowledgement, cancels it, waits
+for the cancel's acknowledgement, then Stops (kill switch + cancel all) and exits. TESTNET ONLY: a
 mainnet URL or chain id is refused before anything connects. An owner-assisted testnet run:
 the market's position is seeded by hand from the venue's own REST position (decision 0067).
 
@@ -23,10 +23,14 @@ Environment (read once at start; no value is ever printed):
                             key, not a trading subkey
   PARADEX_CHAIN_ID          optional; when set it must be PRIVATE_SN_POTC_SEPOLIA (testnet)
 
-Required confirmation:
+Required confirmation and namespace:
   --sole-trader             you confirm that no other process, Java or Rust, trades this
                             account (the lease files guard only against another testnet_trade
                             using the same --lease-dir); refused without it
+  --namespace <N>           the client-id namespace your configuration allocates this sample
+                            on the account, 1 to 65535: its orders are minted, recognised as
+                            ours, leased and kept under it (no default; an id of another
+                            namespace on the market refuses the run)
 
 The market (required; read them from GET https://api.testnet.paradex.trade/v1/markets):
   --market <MARKET>         the Paradex market, e.g. BTC-USD-PERP
@@ -35,10 +39,12 @@ The market (required; read them from GET https://api.testnet.paradex.trade/v1/ma
   --min-notional <USD>      its min_notional, e.g. 10 (0 when it states none)
 
 The caps (required; your own limits, in USD, no defaults):
-  --resting-cap-usd <USD>   the resting cap per side; the order is the largest it admits
+  --resting-cap-usd <USD>   the resting cap per side
   --inventory-cap-usd <USD> the inventory cap
 
 The order (required; no defaults):
+  --order-usd <USD>         the order's size in USD at its price, floored onto the size step;
+                            at most --resting-cap-usd
   --side <buy|sell>         the order's side (buy: below the best bid; sell: above the best ask)
   --away-bps <N>            how far from the touch the order rests, in basis points, from 100
                             to 2000 (300: 3% below the best bid for a buy)
@@ -67,6 +73,8 @@ Lines (each step with the milliseconds since the start):
   TESTNET ...        what the guard accepted
   OWNER-ASSISTED ... this is a declared owner-assisted testnet run (decision 0067)
   BBO ...            the touch read from GET /orderbook before the order is priced
+  BBO again ...      the touch read again just before the place: the order must still be
+                     at least --away-bps behind it, or nothing is placed
   ORDER ...          the order to be placed: side, size, price, notional, distance from the touch
   STEP login         the login answered and the order socket is authenticated
   STEP arm           Paradex accepted cancel-on-disconnect for the socket
@@ -81,9 +89,11 @@ Lines (each step with the milliseconds since the start):
   STEP stop          kill switch on, cancel all sent for what is still open, session closed
   TIMEOUT <step>     the step did not happen in time; the sample Stops
   NOTE ...           something worth knowing (an unexpected event, a refusal)
-  DONE ok|failed     the outcome; ok only when every step happened, every order Stop
-                     cancelled ended cancelled with nothing filled, and the inventory did
-                     not move; the exit status is 0 only for ok
+  DONE ok|failed     the outcome; ok only when every step happened, every order of ours
+                     on the market ended cancelled with nothing filled during the run, every
+                     Stop cancel was sent and accepted, the inventory did not move, and no
+                     fill not of our orders or position change came in; the exit status is
+                     0 only for ok
 
 Ctrl-C aborts at once: the socket closes and Paradex's cancel-on-disconnect cancels the order.
 ";
@@ -116,10 +126,14 @@ pub struct Options {
     pub tick: Decimal,
     pub step: Decimal,
     pub min_notional: Decimal,
-    /// The resting cap per side, in USD: the order is the largest it admits.
+    /// The resting cap per side, in USD.
     pub resting_cap_usd: Decimal,
     /// The inventory cap, in USD.
     pub inventory_cap_usd: Decimal,
+    /// The order's size in USD at its price, at most the resting cap.
+    pub order_usd: Decimal,
+    /// The client-id namespace the consumer allocates this sample on the account.
+    pub namespace: u16,
     pub side: OrderSide,
     pub away_bps: u32,
     pub hold_secs: u64,
@@ -146,6 +160,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     let (mut tick, mut step, mut min_notional) = (None, None, None);
     let (mut resting_cap_usd, mut inventory_cap_usd) = (None, None);
     let (mut side, mut away_bps) = (None, None);
+    let (mut order_usd, mut namespace) = (None, None);
     let mut hold_secs = 0;
     let mut step_timeout_secs = 15;
     let mut rest_url = TESTNET_REST.to_owned();
@@ -181,6 +196,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             }
             "--resting-cap-usd" => resting_cap_usd = Some(positive(&flag, &value()?)?),
             "--inventory-cap-usd" => inventory_cap_usd = Some(positive(&flag, &value()?)?),
+            "--order-usd" => order_usd = Some(positive(&flag, &value()?)?),
+            "--namespace" => namespace = Some(bounded(&flag, &value()?, 1, 65_535)? as u16),
             "--side" => {
                 side = Some(match value()?.as_str() {
                     "buy" => OrderSide::Buy,
@@ -206,6 +223,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         min_notional: min_notional.ok_or_else(|| need("--min-notional"))?,
         resting_cap_usd: resting_cap_usd.ok_or_else(|| need("--resting-cap-usd"))?,
         inventory_cap_usd: inventory_cap_usd.ok_or_else(|| need("--inventory-cap-usd"))?,
+        order_usd: order_usd.ok_or_else(|| need("--order-usd"))?,
+        namespace: namespace.ok_or_else(|| need("--namespace"))?,
         side: side.ok_or_else(|| need("--side"))?,
         away_bps: away_bps.ok_or_else(|| need("--away-bps"))?,
         hold_secs,
@@ -222,6 +241,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     let target = testnet_urls(&opts.rest_url, &opts.ws_url)?;
     direct_to_stub(target, &opts.proxy)?;
     sole(&opts)?;
+    within_cap(&opts)?;
     Ok(Parsed::Trade(Box::new(opts)))
 }
 
@@ -289,6 +309,18 @@ pub fn sole(opts: &Options) -> Result<(), String> {
              this account (the leases cannot see one that does not share --lease-dir)"
                 .to_owned(),
         )
+    }
+}
+
+/// Refuses an order larger than the resting cap: `--order-usd` above `--resting-cap-usd`.
+pub fn within_cap(opts: &Options) -> Result<(), String> {
+    if opts.order_usd <= opts.resting_cap_usd {
+        Ok(())
+    } else {
+        Err(format!(
+            "--order-usd {} is above --resting-cap-usd {}: the cap bounds the order",
+            opts.order_usd, opts.resting_cap_usd
+        ))
     }
 }
 

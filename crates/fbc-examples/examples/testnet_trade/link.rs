@@ -20,6 +20,8 @@
 //!   are collected into one [`ResyncSnapshot`] and applied at `ResyncEnd`
 //!   ([`Registry::resync`]); its `requested_at` is the receive time of the event reporting the
 //!   socket authenticated, which comes before the session asks for the resync.
+//!   The account's position events are noted as they come, for the driver to compare with
+//!   the position it seeded.
 //! - **Notes.** Everything the driver may wait on is appended to [`Link::notes`], in order.
 //!
 //! Times on the shard's monotonic clock are taken from each event's stamp; a submission's send
@@ -33,8 +35,8 @@ use std::rc::Rc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fbc_core::{
-    ClientOrderId, ConnKey, ConnState, Envelope, ExecEvent, ItemRef, MonoNs, NotSentReason,
-    OrderCaps, RpcId, SubmitHandle, SubmitOutcome, VenueCommand, WallNs,
+    ClientOrderId, ConnKey, ConnState, Envelope, ExecEvent, InstrumentId, ItemRef, MonoNs,
+    NotSentReason, OrderCaps, RpcId, SignedLots, SubmitHandle, SubmitOutcome, VenueCommand, WallNs,
 };
 use fbc_oms::{
     Admission, Authorization, FillLedger, FillRouted, FillTime, LadderConfig, OrderKey, OrderOp,
@@ -64,8 +66,12 @@ pub enum Note {
     },
     /// An order event, where it went.
     Order(Routed),
-    /// A fill, where it went (or why the ledger did not apply it).
-    Fill(String),
+    /// A fill, where it went (or why the ledger did not apply it): `unexplained` unless it was
+    /// counted on an order of ours, held by the resync's position, or one the ledger already
+    /// held (a duplicate, or a replay the starting position holds).
+    Fill { seen: String, unexplained: bool },
+    /// The account's position in an instrument, as the venue's position stream reported it.
+    Position { inst: InstrumentId, qty: SignedLots },
     /// A resync was applied: its report, and the positions and open orders it showed.
     Resynced {
         report: ResyncReport,
@@ -360,14 +366,20 @@ impl Link {
                     kind: env.exch_ts_kind,
                     aligned: WallNs(exch.0),
                 });
-                let seen = match self.ledger.admit(&f, time, now) {
+                let (seen, unexplained) = match self.ledger.admit(&f, time, now) {
                     Admission::Apply(accepted) => match self.reg.apply_fill(accepted) {
-                        Ok(routed) => describe_fill(&routed),
-                        Err(e) => format!("refused by the registry: {e:?}"),
+                        Ok(routed) => (
+                            describe_fill(&routed),
+                            !matches!(routed, FillRouted::Ours(..) | FillRouted::InSnapshot(_)),
+                        ),
+                        Err(e) => (format!("refused by the registry: {e:?}"), true),
                     },
-                    other => format!("not applied: {other:?}"),
+                    held @ (Admission::Duplicate | Admission::BeforeWatermark) => {
+                        (format!("not applied: {held:?}"), false)
+                    }
+                    other => (format!("not applied: {other:?}"), true),
                 };
-                self.notes.push(Note::Fill(seen));
+                self.notes.push(Note::Fill { seen, unexplained });
             }
             ExecEvent::ResyncBegin { watermark } => {
                 let requested_at = self.authenticated_at.unwrap_or(now);
@@ -393,6 +405,9 @@ impl Link {
                 }
                 self.notes.push(Note::Conn(state));
             }
+            ExecEvent::Position { inst, qty, .. } => {
+                self.notes.push(Note::Position { inst, qty });
+            }
             ExecEvent::AsyncReject { op, reject, .. } => {
                 self.problem(format!(
                     "asynchronous reject of a {op:?}: {:?}",
@@ -402,8 +417,8 @@ impl Link {
             ExecEvent::UncorrelatedError(reject) => {
                 self.problem(format!("venue error naming no request: {:?}", reject.kind));
             }
-            // The account's positions, balances, funding, modes, query answers and fee rates
-            // move nothing the registry holds here.
+            // The account's balances, funding, modes, query answers and fee rates move nothing
+            // the registry holds here.
             _ => {}
         }
     }
