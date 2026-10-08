@@ -79,6 +79,10 @@ enum Twist {
     RefusesAmendToo,
     /// An amended order's update is preceded by an update reporting the order canceled.
     CancelsOnAmend,
+    /// An amended order's update states a lot of it filled.
+    FilledOnAmend,
+    /// An amended order's update is followed by another, a tick above its price.
+    AmendedTwice,
     /// An amended order's update states a price one tick above the amend's.
     WrongPx,
     /// A frame `early` reports the last request it wrote timed out, at once, long before its
@@ -158,6 +162,44 @@ static MINUTE_WINDOW: Variant = Variant {
     },
     twist: Twist::None,
 };
+/// The toy with a second limit, one placement a minute: the opening's frames are no
+/// placements, so its bucket is empty when the first placement goes, and waiting its window out
+/// would let the toy's 15-second ping reach the stub in that placement's place.
+static ONE_PLACEMENT_A_MINUTE: Variant = Variant {
+    caps: |c| {
+        c.limits.push(fbc_core::RateLimit {
+            scope: fbc_core::LimitScope::Account,
+            ops: TagSet::of(&[OpKind::Place]),
+            per: Duration::from_secs(60),
+            units: 1,
+        });
+    },
+    twist: Twist::None,
+};
+/// The toy with a second limit: one placement or amend a second on the instrument.
+static ONE_ORDER_A_SECOND_A_PAIR: Variant = Variant {
+    caps: |c| {
+        c.limits.push(fbc_core::RateLimit {
+            scope: fbc_core::LimitScope::Pair,
+            ops: TagSet::of(&[OpKind::Place, OpKind::Amend]),
+            per: Duration::from_secs(1),
+            units: 1,
+        });
+    },
+    twist: Twist::None,
+};
+/// The toy with a second limit: one placement or amend a second on the connection.
+static ONE_ORDER_A_SECOND_A_CONNECTION: Variant = Variant {
+    caps: |c| {
+        c.limits.push(fbc_core::RateLimit {
+            scope: fbc_core::LimitScope::Connection,
+            ops: TagSet::of(&[OpKind::Place, OpKind::Amend]),
+            per: Duration::from_secs(1),
+            units: 1,
+        });
+    },
+    twist: Twist::None,
+};
 static PROVISIONAL_ON_TIMEOUT: Variant = Variant {
     caps: |_| {},
     twist: Twist::ProvisionalOnTimeout,
@@ -191,6 +233,14 @@ static REFUSES_AMEND_TOO: Variant = Variant {
 static CANCELS_ON_AMEND: Variant = Variant {
     caps: |_| {},
     twist: Twist::CancelsOnAmend,
+};
+static FILLED_ON_AMEND: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::FilledOnAmend,
+};
+static AMENDED_TWICE: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::AmendedTwice,
 };
 static WRONG_PX: Variant = Variant {
     caps: |_| {},
@@ -634,6 +684,26 @@ fn wrong_px(ev: ExecEvent) -> Vec<ExecEvent> {
     }]
 }
 
+/// An amended order's update stating a lot of it filled.
+fn filled_on_amend(ev: ExecEvent) -> Vec<ExecEvent> {
+    vec![match ev {
+        ExecEvent::Order(mut u) if matches!(u.state, VenueOrderState::Amended { .. }) => {
+            u.cum_filled = fbc_core::Lots::new(1).unwrap();
+            ExecEvent::Order(u)
+        }
+        other => other,
+    }]
+}
+
+/// An amended order's update, then another a tick above its price.
+fn amended_twice(ev: ExecEvent) -> Vec<ExecEvent> {
+    let mut out = vec![ev.clone()];
+    out.extend(wrong_px(ev).into_iter().filter(
+        |e| matches!(e, ExecEvent::Order(u) if matches!(u.state, VenueOrderState::Amended { .. })),
+    ));
+    out
+}
+
 /// An amended order's update without its new venue id.
 fn no_new_vid(ev: ExecEvent) -> Vec<ExecEvent> {
     vec![match ev {
@@ -899,6 +969,8 @@ impl ExecCodec for Twisted {
             Twist::ProvisionalPlacement => provisional_placement,
             Twist::RefusesAmendToo => refuses_amend_too,
             Twist::CancelsOnAmend => cancels_on_amend,
+            Twist::FilledOnAmend => filled_on_amend,
+            Twist::AmendedTwice => amended_twice,
             Twist::WrongPx => wrong_px,
             _ => kept,
         };
@@ -1461,8 +1533,15 @@ fn amend_ack_takes_no_amended_update_reported_before_the_amend() {
 
 #[test]
 fn amend_ack_waits_out_a_limit_of_one_order_a_second_before_amending() {
-    let passed = suite::amend_ack(&ONE_ORDER_A_SECOND.subject(assumed));
-    assert!(matches!(passed, Ok(Verdict::Passed { .. })), "{passed:?}");
+    // The account's bucket, the instrument's and the connection's (Codex r4223629855).
+    for variant in [
+        &ONE_ORDER_A_SECOND,
+        &ONE_ORDER_A_SECOND_A_PAIR,
+        &ONE_ORDER_A_SECOND_A_CONNECTION,
+    ] {
+        let passed = suite::amend_ack(&variant.subject(assumed));
+        assert!(matches!(passed, Ok(Verdict::Passed { .. })), "{passed:?}");
+    }
 }
 
 #[test]
@@ -1709,6 +1788,32 @@ fn amend_ack_fails_a_toy_that_reports_the_amended_order_canceled() {
     let failure = failed(suite::amend_ack(&CANCELS_ON_AMEND.subject(assumed)));
     assert!(
         says(&failure, "OrderUpdate", "ended the order"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn a_limit_the_opening_frames_never_charge_is_not_waited_out_before_the_first_placement() {
+    for check in [suite::amend_ack, suite::unknown_on_timeout] {
+        let passed = check(&ONE_PLACEMENT_A_MINUTE.subject(assumed));
+        assert!(matches!(passed, Ok(Verdict::Passed { .. })), "{passed:?}");
+    }
+}
+
+#[test]
+fn amend_ack_fails_a_toy_whose_amended_update_states_a_fill_the_stub_never_made() {
+    let failure = failed(suite::amend_ack(&FILLED_ON_AMEND.subject(assumed)));
+    assert!(
+        says(&failure, "OrderUpdate", "contradicts the amend"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn amend_ack_fails_a_toy_whose_second_amended_update_states_another_price() {
+    let failure = failed(suite::amend_ack(&AMENDED_TWICE.subject(assumed)));
+    assert!(
+        says(&failure, "OrderUpdate", "contradicts the amend"),
         "{failure}"
     );
 }
