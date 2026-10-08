@@ -1,0 +1,5 @@
+# Maker fills the toy paid us a rebate on. The toy reports fees as a cost
+# (VenueFeeSign::PositiveIsCost), so a rebate is a negative fee: each must decode
+# to a Fee below zero. Amounts are nanos of USDC.
+text fill|fid=toy-f-101|vid=toy-7001|cum=4|cid=c-1|sym=TOYA-PERP|side=B|px=130865|qty=4|liq=M|fee=-5234600|fa=USDC|pnl=0|fund=0|ts=1759363200100000000|seq=11
+text fill|fid=toy-f-102|vid=toy-7002|cum=25|cid=c-2|sym=TOYB-PERP|side=S|px=130870|qty=25|liq=M|fee=-32717500|fa=USDC|pnl=1250000|fund=-3000|seq=12

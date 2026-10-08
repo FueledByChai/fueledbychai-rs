@@ -1,0 +1,3 @@
+# A taker fill we paid a fee on: a positive fee under the toy's PositiveIsCost,
+# which must decode to a Fee above zero.
+text fill|fid=toy-f-103|vid=toy-7003|cum=10|cid=c-3|sym=TOYA-PERP|side=S|px=130860|qty=10|liq=T|fee=58887000|fa=USDC|pnl=-500000|fund=0|ts=1759363200200000000|seq=13

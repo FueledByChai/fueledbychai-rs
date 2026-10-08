@@ -1,0 +1,8 @@
+# More of what the toy sends, for decoder_deterministic alone: order updates, a
+# request refused whole, a venue mode, and a frame the toy refuses (unknown
+# instrument), which both runs must refuse alike.
+text order|cid=c-6|vid=toy-7201|sym=TOYA-PERP|side=B|st=open|cum=0|px=130865|qty=25|po=1|ro=0|ts=1759363200300000000|seq=31
+text order|cid=c-6|vid=toy-7201|sym=TOYA-PERP|side=B|st=canceled|why=requested|cum=0|px=130865|qty=25|po=1|ro=0|seq=32
+text reject|rpc=21|code=1001|msg=would cross
+text mode|m=reduceonly|sym=TOYB-PERP
+text order|cid=c-7|sym=NOPE-PERP|side=B|st=open|cum=0|po=0|ro=0|seq=33

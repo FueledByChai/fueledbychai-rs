@@ -1,6 +1,7 @@
-//! FBC-8ew's and FBC-onw's done lines, their first halves: the named suite runs on the
-//! conformance toy venue through the suite macro with its fixture directory (BT-502, design §6),
-//! `caps_truthful`, `commands_selfcontained`, `signing_golden` and `legacy_symbols` each a
+//! FBC-8ew's, FBC-onw's and FBC-whw's done lines, their first halves: the named suite runs on
+//! the conformance toy venue through the suite macro with its fixture directory (BT-502,
+//! design §6), `caps_truthful`, `commands_selfcontained`, `signing_golden`, `legacy_symbols`,
+//! `fee_sign`, `liquidity_reported`, `position_signed` and `decoder_deterministic` each a
 //! test, and all pass. The checks are run directly too, to show what they probed: a
 //! pass that probed nothing would prove nothing.
 
@@ -113,6 +114,55 @@ fn legacy_symbols_reads_every_ticker_in_the_toys_fixture() {
         [
             "TOYA/USDT: TOYA/USDT Perpetual",
             "TOYB/USDT: TOYB/USDT Perpetual",
+        ]
+    );
+}
+
+#[test]
+fn fee_sign_judges_the_fee_of_every_fill_in_both_cases_on_the_toy() {
+    assert_eq!(
+        probed(suite::fee_sign),
+        [
+            "fee_sign/rebate.frames: 2 fills",
+            "fee_sign/paid.frames: 1 fill"
+        ]
+    );
+}
+
+#[test]
+fn liquidity_reported_judges_every_fill_in_both_cases_on_the_toy() {
+    assert_eq!(
+        probed(suite::liquidity_reported),
+        [
+            "liquidity_reported/maker.frames: 2 fills",
+            "liquidity_reported/taker.frames: 1 fill",
+        ]
+    );
+}
+
+#[test]
+fn position_signed_judges_every_position_in_both_cases_on_the_toy() {
+    assert_eq!(
+        probed(suite::position_signed),
+        [
+            "position_signed/long.frames: 2 positions",
+            "position_signed/short.frames: 1 position",
+        ]
+    );
+}
+
+#[test]
+fn decoder_deterministic_decodes_every_case_of_the_toys_fixtures_twice() {
+    assert_eq!(
+        probed(suite::decoder_deterministic),
+        [
+            "fee_sign/paid.frames: 1 line",
+            "fee_sign/rebate.frames: 2 lines",
+            "liquidity_reported/maker.frames: 2 lines",
+            "liquidity_reported/taker.frames: 1 line",
+            "position_signed/long.frames: 5 lines",
+            "position_signed/short.frames: 4 lines",
+            "decoder_deterministic/orders.frames: 5 lines",
         ]
     );
 }

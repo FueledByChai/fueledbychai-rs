@@ -16,6 +16,18 @@ A check that reads recorded data reads it from a subdirectory named after the ch
   (`X/USDT`); the Java stack never traded the toy, so these stand in for the values a real
   venue's fixtures list from exported Java configurations.
 
+- `fee_sign/`, `liquidity_reported/`, `position_signed/` and `decoder_deterministic/`: case
+  files (`<case>.frames`, one frame the toy sends per `text` line, in the format
+  `crates/fbc-conformance/src/suite/frames.rs` documents), written by hand in the toy's own
+  protocol (`crates/fbc-conformance/src/toy/decode.rs`): maker fills with a rebate and a
+  taker fill paying a fee (`fee_sign/rebate`, `fee_sign/paid`), maker and taker fills
+  (`liquidity_reported/maker`, `liquidity_reported/taker`), long and short positions in a
+  resync's answer, asked for by the `resync` line before them (`position_signed/long`,
+  `position_signed/short`), and order updates, a refused request, a venue mode and a frame the
+  toy refuses, which `decoder_deterministic` decodes with all the others
+  (`decoder_deterministic/orders`). Client ids in them are arbitrary text, never one the suite
+  minted.
+
 `caps_truthful` and `commands_selfcontained` read no file: they need only the toy's factory
 and the setup the suite's test gives (the toy's spec table, an empty configuration and no
 credentials).

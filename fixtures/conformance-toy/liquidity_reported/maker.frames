@@ -1,0 +1,3 @@
+# Fills the frames state made liquidity (liq=M): each must report Liquidity3::Maker.
+text fill|fid=toy-f-201|vid=toy-7101|cum=4|cid=c-4|sym=TOYA-PERP|side=B|px=130865|qty=4|liq=M|fee=-5234600|fa=USDC|pnl=0|fund=0|seq=21
+text refill|fid=toy-f-201|vid=toy-7101|cum=4|cid=c-4|sym=TOYA-PERP|side=B|px=130865|qty=4|liq=M|fee=-5234600|fa=USDC|pnl=0|fund=0|seq=21

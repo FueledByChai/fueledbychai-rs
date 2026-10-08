@@ -32,6 +32,7 @@ fn assumed() -> Setup {
         cfg: VenueConfig::new(),
         creds: Secrets::new(),
         goldens: Vec::new(),
+        exec_stream: toy::EXEC_STREAM,
     }
 }
 

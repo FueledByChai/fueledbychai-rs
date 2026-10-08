@@ -1,0 +1,2 @@
+# A fill the frame states took liquidity (liq=T): it must report Liquidity3::Taker.
+text fill|fid=toy-f-202|vid=toy-7102|cum=10|cid=c-5|sym=TOYB-PERP|side=S|px=130860|qty=10|liq=T|fee=58887000|fa=USDC|pnl=0|fund=0|seq=22

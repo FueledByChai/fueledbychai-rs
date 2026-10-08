@@ -1,0 +1,5 @@
+# Sold 12 lots: short, the position below zero.
+resync
+text rsbegin|wm=1759363200000000000
+text rspos|sym=TOYA-PERP|qty=-12|avg=13090
+text rsend

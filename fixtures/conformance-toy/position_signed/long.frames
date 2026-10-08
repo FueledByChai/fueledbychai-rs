@@ -1,0 +1,8 @@
+# The toy reports positions only in a resync's answer, so the case asks for one
+# first; its watermark echoes the suite's fixed encode time. Bought 25 lots and
+# 3 lots: long, each position above zero.
+resync
+text rsbegin|wm=1759363200000000000
+text rspos|sym=TOYA-PERP|qty=25|avg=13086.5
+text rspos|sym=TOYB-PERP|qty=3
+text rsend

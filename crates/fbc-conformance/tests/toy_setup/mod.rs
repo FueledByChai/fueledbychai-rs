@@ -1,6 +1,7 @@
 //! What the conformance toy's fixtures (`fixtures/conformance-toy`) assume, shared by the suite's
-//! tests on the toy: its two instruments, no configuration, no credentials, and the golden
-//! commands whose encodings `signing_golden/` holds.
+//! tests on the toy: its two instruments, no configuration, no credentials, the golden
+//! commands whose encodings `signing_golden/` holds, and its order-entry stream, which the
+//! case files' frames are handed on.
 
 use std::sync::OnceLock;
 
@@ -28,6 +29,7 @@ pub fn assumed() -> Setup {
         cfg: VenueConfig::new(),
         creds: Secrets::new(),
         goldens: goldens(),
+        exec_stream: toy::EXEC_STREAM,
     }
 }
 

@@ -32,6 +32,13 @@
 //!   [`Setup`], as fault scripts are (decision 0025).
 //! - `legacy_symbols/tickers.txt`: the Java-era ticker values, one per line; blank lines and
 //!   lines starting with `#` are ignored.
+//! - `fee_sign/`, `liquidity_reported/` and `position_signed/`: the case files their checks
+//!   read, each a `<case>.frames` file of frames the venue sends (the format is
+//!   [`frames`]'s): `fee_sign/rebate.frames` and `fee_sign/paid.frames`,
+//!   `liquidity_reported/maker.frames` and `liquidity_reported/taker.frames`,
+//!   `position_signed/long.frames` and `position_signed/short.frames`.
+//! - `decoder_deterministic/`: optional, more `<case>.frames` files for
+//!   [`decoder_deterministic`], which also decodes every case of the three directories above.
 //!
 //! [`caps_truthful`] and [`commands_selfcontained`] read no file: they need only the factory
 //! and the [`Setup`] the `setup` function gives, called afresh wherever a check builds a codec.
@@ -48,8 +55,17 @@
 //!   freshly built codec, gives exactly the committed golden bytes, signatures included.
 //! - [`legacy_symbols`]: every Java-era ticker in the fixtures parses through the factory's
 //!   [`parse_fbc_common_symbol`](VenueFactory::parse_fbc_common_symbol) (design §4.4).
+//! - [`fee_sign`]: a rebate fill decodes to a fee below zero and a fill we paid for to one
+//!   above zero (decision 0004).
+//! - [`liquidity_reported`]: fills carry the liquidity their frames state.
+//! - [`position_signed`]: positions are signed, positive long.
+//! - [`decoder_deterministic`]: the same frames decode to identical events on two runs, each
+//!   with a freshly built codec (decision 0006).
 
 mod caps_truthful;
+mod decoded;
+mod deterministic;
+pub mod frames;
 mod golden;
 mod harness;
 mod legacy;
@@ -58,9 +74,13 @@ mod selfcontained;
 use core::fmt;
 use std::path::{Path, PathBuf};
 
-use fbc_core::{EncodeCtx, RpcId, Secrets, SpecTable, VenueCommand, VenueConfig, VenueFactory};
+use fbc_core::{
+    EncodeCtx, RpcId, Secrets, SpecTable, StreamId, VenueCommand, VenueConfig, VenueFactory,
+};
 
 pub use caps_truthful::caps_truthful;
+pub use decoded::{fee_sign, liquidity_reported, position_signed};
+pub use deterministic::decoder_deterministic;
 pub use golden::signing_golden;
 pub use legacy::legacy_symbols;
 pub use selfcontained::commands_selfcontained;
@@ -78,6 +98,9 @@ pub struct Setup {
     /// The commands [`signing_golden`] encodes, each against its golden bytes; empty for a
     /// venue that declares no order entry.
     pub goldens: Vec<Golden>,
+    /// The stream the fixture frames are handed to the order-entry codec on: the order-entry
+    /// connection's, as the venue's [`plan_exec`](VenueFactory::plan_exec) numbers it.
+    pub exec_stream: StreamId,
 }
 
 /// A command whose encoding is committed as golden bytes: [`signing_golden`] encodes it as
@@ -183,15 +206,22 @@ pub struct Failure {
     pub breaches: Vec<Breach>,
 }
 
+impl Breach {
+    /// A breach of `capability`.
+    fn new(capability: &str, what: impl Into<String>) -> Breach {
+        Breach {
+            capability: capability.to_owned(),
+            what: what.into(),
+        }
+    }
+}
+
 impl Failure {
     /// A failure with the one breach of `capability`.
     fn one(check: &'static str, capability: &str, what: impl Into<String>) -> Failure {
         Failure {
             check,
-            breaches: vec![Breach {
-                capability: capability.to_owned(),
-                what: what.into(),
-            }],
+            breaches: vec![Breach::new(capability, what)],
         }
     }
 
@@ -282,6 +312,46 @@ macro_rules! suite {
         fn legacy_symbols() {
             $crate::suite::run(
                 $crate::suite::legacy_symbols,
+                &$factory,
+                concat!(env!("CARGO_MANIFEST_DIR"), "/", $fixtures),
+                $setup,
+            );
+        }
+
+        #[test]
+        fn fee_sign() {
+            $crate::suite::run(
+                $crate::suite::fee_sign,
+                &$factory,
+                concat!(env!("CARGO_MANIFEST_DIR"), "/", $fixtures),
+                $setup,
+            );
+        }
+
+        #[test]
+        fn liquidity_reported() {
+            $crate::suite::run(
+                $crate::suite::liquidity_reported,
+                &$factory,
+                concat!(env!("CARGO_MANIFEST_DIR"), "/", $fixtures),
+                $setup,
+            );
+        }
+
+        #[test]
+        fn position_signed() {
+            $crate::suite::run(
+                $crate::suite::position_signed,
+                &$factory,
+                concat!(env!("CARGO_MANIFEST_DIR"), "/", $fixtures),
+                $setup,
+            );
+        }
+
+        #[test]
+        fn decoder_deterministic() {
+            $crate::suite::run(
+                $crate::suite::decoder_deterministic,
                 &$factory,
                 concat!(env!("CARGO_MANIFEST_DIR"), "/", $fixtures),
                 $setup,
