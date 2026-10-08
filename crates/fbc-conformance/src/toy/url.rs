@@ -5,7 +5,10 @@
 //! 0014 item 8).
 //!
 //! The `.redact` value is a comma-separated list of `start..end` byte ranges of the URL, each
-//! inside its path, in order and not overlapping (an empty value or none marks nothing). The
+//! inside its path, in order, not overlapping and at least [`MIN_CREDENTIAL_LEN`] bytes long
+//! (an empty value or none marks nothing). A codec names a credential wherever a frame or
+//! response holds it, so a shorter one would mark unrelated bytes, such as prices and sequence
+//! numbers, that the journal then keeps only as hashes (Codex r4220116602). The
 //! toy marks credentials in the path only, so it refuses a URL with user information (which the
 //! runtime never sends either, decision 0029) and one with a query or fragment (the toy appends
 //! its own paths and query to the base), rather than plan an address with a credential it
@@ -20,6 +23,8 @@ use core::ops::Range;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use fbc_core::{ConfigError, HeaderMark, HttpResponse, InboundSpans, VenueConfig, WireUrl};
+
+use super::MIN_CREDENTIAL_LEN;
 
 /// A configured URL's keys and the schemes it takes.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
@@ -78,10 +83,19 @@ pub(super) fn configured(cfg: &VenueConfig, key: UrlKey) -> Result<WireUrl, Conf
         ));
     }
     let spans = spans(cfg.get(key.redact).unwrap_or(""), key.redact, path_at)?;
-    WireUrl::redacted(text.to_owned(), spans).map_err(|_| ConfigError::Invalid {
+    let url = WireUrl::redacted(text.to_owned(), spans).map_err(|_| ConfigError::Invalid {
         key: key.redact,
         reason: "a span past the URL's end, out of order, overlapping or splitting a character",
-    })
+    })?;
+    let short = |r: &Range<u32>| ((r.end - r.start) as usize) < MIN_CREDENTIAL_LEN;
+    match url.redactions().iter().any(short) {
+        true => Err(ConfigError::Invalid {
+            key: key.redact,
+            reason: "a span shorter than 16 bytes, which the toy would name wherever a frame or \
+                     response holds it, unrelated bytes included",
+        }),
+        false => Ok(url),
+    }
 }
 
 /// Whether `authority` is a host, then at most `:` and a port from 1 to 65535 (Codex
@@ -155,7 +169,8 @@ pub(super) fn secrets(url: &WireUrl) -> Vec<String> {
     url.redactions().iter().filter_map(span).collect()
 }
 
-/// Every occurrence of any of `secrets` in `bytes` and every span of `also`, overlapping or
+/// Every occurrence of any of `secrets` in `bytes` (each at least [`MIN_CREDENTIAL_LEN`] bytes
+/// when configured; a codec built directly is given such spans by its caller) and every span of `also`, overlapping or
 /// adjacent ones as one span, in order.
 pub(super) fn occurrences(
     bytes: &[u8],
