@@ -134,14 +134,32 @@ fn config(stub: &Stub) -> VenueConfig {
     cfg
 }
 
-/// A lease directory of the test's own.
-fn lease_dir() -> PathBuf {
+/// A directory of the test's own under the system's temporary directory, removed with
+/// everything in it when dropped, the test failing or not (Reviewer B RB-8mv-8 on PR #119).
+struct TempDir(PathBuf);
+
+impl std::ops::Deref for TempDir {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A lease (or journal) directory of the test's own.
+fn lease_dir() -> TempDir {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     let dir =
         std::env::temp_dir().join(format!("fbc-paradex-rehearsal-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    dir
+    TempDir(dir)
 }
 
 /// Nonces counted up from 1 (Paradex asks for none).
@@ -186,7 +204,7 @@ struct Wired {
     orders: ExecOrders,
     control: ExecControl,
     writer: WriterThread,
-    journal: PathBuf,
+    journal: TempDir,
 }
 
 /// The shard whose journal the session writes.
@@ -277,7 +295,7 @@ fn wire(stub: &Stub, reg: Registry) -> Wired {
         ExecSession::new(session_cfg, GlueHandler(Rc::clone(&glue))).unwrap();
     // The session journals everything it sends and receives (FBC-2pr), credential spans as
     // keyed hashes.
-    let journal = lease_dir().join("journal");
+    let journal = lease_dir();
     let key = Arc::new(RedactionKey::new(&[9; 32]).unwrap());
     let sink_config = SinkConfig {
         budget_bytes: 4 << 20,
@@ -285,7 +303,7 @@ fn wire(stub: &Stub, reg: Registry) -> Wired {
     };
     let (sink, drain) = journal_queue(sink_config, Arc::clone(&key)).unwrap();
     let writer = drain
-        .spawn(JournalWriter::create(&journal, SHARD, key).unwrap())
+        .spawn(JournalWriter::create(&*journal, SHARD, key).unwrap())
         .unwrap();
     session.set_journal(Journal::new(Rc::new(RefCell::new(sink))));
     let orders = session.orders();
@@ -518,19 +536,20 @@ fn the_secret_search_sees_a_field_element_in_every_form_it_prints() {
 /// arm accepted before the first order frame; an earlier run's order cancelled on the disarmed
 /// market before Start; a placed order acknowledged and filled moving the inventory once, its
 /// fill repeated; a place over the resting cap, a place or amend while Killed and any ordinary
-/// order once the switch is lifted never written while a cancel is; a reconnect
-/// re-authenticating, re-arming and resyncing with nothing re-placed; a second holder of the
-/// market lease unable to arm; and no token, login signature or key in the TRACE output.
+/// order once the switch is lifted never written while a cancel is; a reconnect while an order
+/// rests on a Quoting market re-authenticating, re-arming and resyncing with nothing re-placed; a
+/// second holder of the market lease unable to arm; and no token, login signature or key in the
+/// TRACE output or the journal.
 #[tokio::test]
 async fn from_a_fresh_start_every_safety_rule_holds_against_the_stub() {
     capture::install();
     log::debug!(target: "rehearsal", "{LIVE}");
     let dir = lease_dir();
     let book: Shared = Arc::new(Mutex::new(Book::default()));
-    // Connection 0: the opening six, the orphan's cancel, A's place, B's place, B's cancel,
-    // C's place and the kill switch's cancel of C; then the stub closes it. Connection 1: the
-    // opening six only.
-    let stub = Stub::start(&book, &[12, 6]);
+    // Connection 0: the opening six, the orphan's cancel, A's place, B's place, B's cancel and
+    // C's place; then the stub closes it, C resting on a Quoting market. Connection 1: the
+    // opening six and the kill switch's cancel of C.
+    let stub = Stub::start(&book, &[11, 7]);
     let mut mint = CidMint::new(
         NamespaceLease::acquire(&dir, ACCT, NS).unwrap(),
         0,
@@ -734,8 +753,7 @@ async fn from_a_fresh_start_every_safety_rule_holds_against_the_stub() {
         }
         until(&glue, "B cancelled", |g| is_terminal(g, b)).await;
 
-        // C rests; the kill switch: no place, no amend, no planned order; its cancel
-        // everything is written. Lifted: Cancel-only, so still no ordinary order.
+        // C rests, and the stub closes the connection once C's place is answered.
         lock(&book).fates.push_back(Fate::Rest);
         let c = {
             let mut g = glue.borrow_mut();
@@ -749,6 +767,85 @@ async fn from_a_fresh_start_every_safety_rule_holds_against_the_stub() {
             cid
         };
         until(&glue, "C open", |g| is_open(g, c)).await;
+        // On the wire: the opening six, then the orphan's cancel, A, B, B's cancel and C; the
+        // arm accepted before the first order frame.
+        let conn0 = stub.methods(0);
+        opening(&conn0[..6]);
+        assert_eq!(
+            order_methods(&conn0),
+            [
+                "order.cancel",
+                "order.create",
+                "order.create",
+                "order.cancel",
+                "order.create"
+            ],
+            "{conn0:?}"
+        );
+        {
+            let g = glue.borrow();
+            let armed = g.notes.iter().position(|n| {
+                matches!(
+                    n,
+                    Note::Outcome {
+                        ours: false,
+                        outcome: SubmitOutcome::Accepted { .. },
+                        ..
+                    }
+                )
+            });
+            let first_order = g.notes.iter().position(
+                |n| matches!(n, Note::Submitted { rpc, sent: Ok(()) } if g.is_ours(*rpc)),
+            );
+            assert!(armed.unwrap() < first_order.unwrap(), "{:#?}", g.notes);
+        }
+
+        // The stub closes the connection with C resting and the market Quoting (Reviewer B
+        // RB-8mv-5 on PR #119): the session reconnects, authenticates again, re-arms and
+        // resyncs, and writes nothing else, neither C again nor anything for it. The stub does
+        // not model cancel-on-disconnect, so the resync finds C still resting.
+        until(&glue, "the second resync", |g| resyncs(g) == 2).await;
+        // A while for anything the reconnect might still write.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let conn1 = stub.methods(1);
+        opening(&conn1);
+        {
+            let g = glue.borrow();
+            let Some(Note::Resynced { report, snapshot }) = g
+                .notes
+                .iter()
+                .rev()
+                .find(|n| matches!(n, Note::Resynced { .. }))
+            else {
+                unreachable!()
+            };
+            // The venue's position agrees with the inventory, which moved once, and C is the one
+            // order the venue holds, still open in the registry.
+            assert_eq!(g.reg.inventory(INST), SignedLots(10));
+            assert_eq!(
+                report.checks,
+                [PositionCheck::Agrees {
+                    inst: INST,
+                    position: SignedLots(10)
+                }],
+                "{report:?}"
+            );
+            assert_eq!(snapshot.orders.len(), 1, "{snapshot:?}");
+            assert!(is_open(&g, c));
+            assert_eq!(g.reg.entry(INST).state(), EntryState::Quoting);
+            assert_eq!(
+                g.notes
+                    .iter()
+                    .filter(|n| matches!(n, Note::Conn(ConnState::Authenticated)))
+                    .count(),
+                2
+            );
+        }
+        // One login: the reconnect authenticates with the token it already holds.
+        assert_eq!(lock(&book).login_signatures.len(), 1);
+
+        // The kill switch: no place, no amend, no planned order; its cancel everything is
+        // written. Lifted: Cancel-only, so still no ordinary order.
         {
             let mut g = glue.borrow_mut();
             g.reg.kill(INST);
@@ -796,82 +893,14 @@ async fn from_a_fresh_start_every_safety_rule_holds_against_the_stub() {
                 .unwrap();
             assert!(plan.commands.is_empty(), "{plan:?}");
         }
-        // On the wire: the opening six, then the orphan's cancel, A, B, B's cancel, C and C's
-        // cancel; the arm accepted before the first order frame.
-        let conn0 = stub.methods(0);
-        opening(&conn0[..6]);
-        assert_eq!(
-            order_methods(&conn0),
-            [
-                "order.cancel",
-                "order.create",
-                "order.create",
-                "order.cancel",
-                "order.create",
-                "order.cancel_batch"
-            ],
-            "{conn0:?}"
-        );
-        {
-            let g = glue.borrow();
-            let armed = g.notes.iter().position(|n| {
-                matches!(
-                    n,
-                    Note::Outcome {
-                        ours: false,
-                        outcome: SubmitOutcome::Accepted { .. },
-                        ..
-                    }
-                )
-            });
-            let first_order = g.notes.iter().position(
-                |n| matches!(n, Note::Submitted { rpc, sent: Ok(()) } if g.is_ours(*rpc)),
-            );
-            assert!(armed.unwrap() < first_order.unwrap(), "{:#?}", g.notes);
-        }
-
-        // The stub closes the connection after C's cancel: the session reconnects,
-        // authenticates again, re-arms and resyncs, and writes nothing else.
-        until(&glue, "the second resync", |g| resyncs(g) == 2).await;
-        // A while for anything the reconnect might still write.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // On the second connection: the opening six, then only the kill switch's cancel of C.
         let conn1 = stub.methods(1);
-        opening(&conn1);
+        opening(&conn1[..6]);
+        assert_eq!(order_methods(&conn1), ["order.cancel_batch"], "{conn1:?}");
         {
             let g = glue.borrow();
-            let Some(Note::Resynced { report, .. }) = g
-                .notes
-                .iter()
-                .rev()
-                .find(|n| matches!(n, Note::Resynced { .. }))
-            else {
-                unreachable!()
-            };
-            // The venue's position agrees with the inventory, which moved once.
-            assert_eq!(g.reg.inventory(INST), SignedLots(10));
-            assert_eq!(
-                report.checks,
-                [PositionCheck::Agrees {
-                    inst: INST,
-                    position: SignedLots(10)
-                }],
-                "{report:?}"
-            );
-            // The market is as the kill switch left it: armed, Cancel-only.
-            let entry = g.reg.entry(INST);
-            assert!(entry.armed());
-            assert_eq!(entry.state(), EntryState::CancelOnly);
-            assert_eq!(
-                g.notes
-                    .iter()
-                    .filter(|n| matches!(n, Note::Conn(ConnState::Authenticated)))
-                    .count(),
-                2
-            );
             assert!(problems(&g).is_empty(), "{:?}", problems(&g));
         }
-        // One login: the reconnect authenticates with the token it already holds.
-        assert_eq!(lock(&book).login_signatures.len(), 1);
 
         // A second holder of the market lease cannot arm: the lease is held, and a registry
         // without it is refused.
@@ -1001,7 +1030,9 @@ async fn after_a_restart_flatten_writes_only_reduce_only_exits_that_never_cross_
                 match (r.side, r.level) {
                     (Side::Buy, 0) => assert!(matches!(why, ExitRefusal::Increasing { .. })),
                     (Side::Sell, 1) => assert!(matches!(why, ExitRefusal::Ordinary { .. })),
-                    _ => {} // past zero: refused by Exit's admission
+                    // Reduce-only, but past zero (Reviewer B RB-8mv-6 on PR #119).
+                    (Side::Sell, 0) => assert!(matches!(why, ExitRefusal::CrossesZero { .. })),
+                    other => panic!("an unexpected refusal at {other:?}: {plan:?}"),
                 }
             }
 
@@ -1030,7 +1061,18 @@ async fn after_a_restart_flatten_writes_only_reduce_only_exits_that_never_cross_
                 .plan(&want, &mut g.reg, &caps, ACCT, &mut mint, now)
                 .unwrap();
             assert!(plan.commands.is_empty(), "{plan:?}");
-            assert_eq!(plan.refused.len(), 1, "{plan:?}");
+            assert!(
+                matches!(
+                    plan.refused.as_slice(),
+                    [r] if (r.side, r.level) == (Side::Sell, 1) && matches!(
+                        r.why,
+                        PlanRefusal::Place(OmsError::State(StateRefusal::Exit(
+                            ExitRefusal::CrossesZero { .. }
+                        )))
+                    )
+                ),
+                "{plan:?}"
+            );
             assert!(problems(&g).is_empty(), "{:?}", problems(&g));
         }
         let conn0 = stub.methods(0);

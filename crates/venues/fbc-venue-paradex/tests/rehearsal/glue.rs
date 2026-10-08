@@ -16,7 +16,7 @@ use fbc_core::{
 };
 use fbc_oms::{
     Admission, Authorization, FillLedger, FillRouted, FillTime, LadderConfig, OrderKey, OrderOp,
-    Registry, ResyncReport, ResyncSnapshot,
+    Registry, ResyncReport, ResyncSnapshot, Routed,
 };
 use fbc_runtime::{ExecHandler, ExecOrders};
 
@@ -220,9 +220,13 @@ impl Glue {
         };
         match env.body {
             ExecEvent::Outcome { rpc, item, outcome } => self.on_outcome(rpc, item, outcome, now),
-            ExecEvent::Order(u) => {
-                self.reg.apply_update(&u, key);
-            }
+            // An update the registry routes anywhere but to an order of ours is a problem here:
+            // the rehearsal's venue holds no other engine's or system's order (Reviewer B
+            // RB-8mv-7 on PR #119).
+            ExecEvent::Order(u) => match self.reg.apply_update(&u, key) {
+                Routed::Ours(..) => {}
+                other => self.problem(format!("an order update routed {other:?}: {u:?}")),
+            },
             ExecEvent::Fill(f) => {
                 let time = env.exch_ts.map(|exch| FillTime {
                     exch,
@@ -295,7 +299,12 @@ impl Glue {
             ExecEvent::UncorrelatedError(reject) => {
                 self.problem(format!("venue error naming no request: {:?}", reject.kind));
             }
-            _ => {}
+            // What the account holds: the registry reads none of it.
+            ExecEvent::Position { .. }
+            | ExecEvent::Balance { .. }
+            | ExecEvent::FundingPaid { .. }
+            | ExecEvent::FeeRates { .. } => {}
+            other => self.problem(format!("an event this glue does not model: {other:?}")),
         }
     }
 }
