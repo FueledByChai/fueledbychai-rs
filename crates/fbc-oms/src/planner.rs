@@ -15,6 +15,9 @@
 //! - a level whose order has a cancel waiting for its acknowledgement (the level was pulled
 //!   before it) is replaced, wanted again or not: the cancel is built once the acknowledgement
 //!   lands and the level waits for the order's terminal state;
+//! - a replace whose cancel was reported sent and answered without ending the order (not sent,
+//!   or refused) is over: the order rests as it was and its level is decided afresh, so a
+//!   quote equal to it keeps it and a later change amends it where the caps allow;
 //! - a resting order whose price moved by at least the configured basis points of its price,
 //!   or whose resting quantity moved by at least the configured lots, or whose flags differ,
 //!   is changed once it is at least the configured minimum age (since the planner placed or
@@ -345,6 +348,10 @@ struct Slot {
     /// It is cancelled to be replaced, or its cancel waited for the acknowledgement when the
     /// level was wanted again: the level waits for its terminal state.
     replacing: bool,
+    /// The order's [`OrderRecord::cancels_sent`] when the replace's cancel was last decided: a
+    /// count past it with no cancel in flight means that cancel was sent and answered without
+    /// ending the order (not sent, or refused), so the replace is over.
+    cancels_sent: u64,
 }
 
 /// What a pass decided for a level, before anything is built.
@@ -449,6 +456,15 @@ impl ExecutionPlanner {
             let rec = reg
                 .get(slot.cid)
                 .expect("terminal and unknown orders were freed");
+            // A replace whose cancel was sent and answered without ending the order (not sent,
+            // or refused) is over: the order rests as it was and the level is decided afresh.
+            // A cancel built and not reported sent is built again (0065 rules 5 and 7).
+            if slot.replacing
+                && !matches!(rec.intent(), Intent::PendingCancel { .. })
+                && rec.cancels_sent() > slot.cancels_sent
+            {
+                slot.replacing = false;
+            }
             let hold = |why| Held {
                 side: at.side(),
                 level: at.level,
@@ -464,6 +480,7 @@ impl ExecutionPlanner {
                         plan.held.push(hold(HeldReason::Replacing));
                     }
                 } else {
+                    slot.cancels_sent = rec.cancels_sent();
                     actions.push((Stage::Cancel, at, Action::Cancel(slot.cid)));
                 }
                 continue;
@@ -473,6 +490,7 @@ impl ExecutionPlanner {
             // the price the cancel was decided against.
             if rec.cancel_awaits_ack() {
                 slot.replacing = true;
+                slot.cancels_sent = rec.cancels_sent();
                 actions.push((Stage::Cancel, at, Action::Cancel(slot.cid)));
                 continue;
             }
@@ -510,6 +528,7 @@ impl ExecutionPlanner {
                 }
                 None => {
                     slot.replacing = true;
+                    slot.cancels_sent = rec.cancels_sent();
                     actions.push((Stage::Cancel, at, Action::Cancel(slot.cid)));
                 }
             }
@@ -568,6 +587,7 @@ impl ExecutionPlanner {
                                 cid,
                                 changed_at: now,
                                 replacing: false,
+                                cancels_sent: 0,
                             },
                         );
                         (cid, cmd)
