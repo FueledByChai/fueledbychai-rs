@@ -94,6 +94,8 @@ fn options(stub: &StubServer, min_notional: &str) -> Options {
         tick: Decimal::from_str("0.1").unwrap(),
         step: Decimal::from_str("0.00001").unwrap(),
         min_notional: Decimal::from_str(min_notional).unwrap(),
+        resting_cap_usd: Decimal::from(11),
+        inventory_cap_usd: Decimal::from(50),
         side: OrderSide::Buy,
         away_bps: 300,
         hold_secs: 0,
@@ -506,7 +508,7 @@ async fn testnet_trade_places_one_post_only_order_and_cancels_it_against_the_stu
     assert_eq!(count("order.cancel_on_disconnect"), 1, "{sent:?}");
     assert_eq!(stub.connections().len(), 1);
     // The order: post-only, priced 3% under the fixture's best bid of 62000.2 on the 0.1 tick
-    // (60140.1 after the floor), sized to the $11 resting cap on the 0.00001 step: 18 lots.
+    // (60140.1 after the floor), sized to the test's $11 resting cap on the 0.00001 step: 18 lots.
     let create = stub.connections()[0]
         .received
         .iter()
@@ -685,8 +687,12 @@ fn strings(args: &[&str]) -> Vec<String> {
     args.iter().map(|a| (*a).to_owned()).collect()
 }
 
-const MARKET_ARGS: [&str; 9] = [
+const MARKET_ARGS: [&str; 13] = [
     "--sole-trader",
+    "--resting-cap-usd",
+    "11",
+    "--inventory-cap-usd",
+    "50",
     "--market",
     "BTC-USD-PERP",
     "--tick",
@@ -755,14 +761,28 @@ fn the_command_line_defaults_to_testnet_and_refuses_mainnet_urls() {
             .unwrap_err()
             .starts_with("--socks5 with loopback stub URLs")
     );
-    for missing in ["--market", "--tick", "--step", "--min-notional"] {
+    // The caps, too: the consumer's own limits, with no default.
+    for missing in [
+        "--market",
+        "--tick",
+        "--step",
+        "--min-notional",
+        "--resting-cap-usd",
+        "--inventory-cap-usd",
+    ] {
         let i = MARKET_ARGS.iter().position(|a| *a == missing).unwrap();
         let mut argv = strings(&MARKET_ARGS);
         argv.drain(i..i + 2);
         let err = args::parse(argv).unwrap_err();
         assert!(err.starts_with(missing), "{err}");
     }
-    for (flag, bad) in [("--away-bps", "99"), ("--hold", "61"), ("--side", "both")] {
+    for (flag, bad) in [
+        ("--away-bps", "99"),
+        ("--hold", "61"),
+        ("--side", "both"),
+        ("--resting-cap-usd", "0"),
+        ("--inventory-cap-usd", "-50"),
+    ] {
         let mut argv = strings(&MARKET_ARGS);
         argv.extend(strings(&[flag, bad]));
         assert!(args::parse(argv).unwrap_err().starts_with(flag));
@@ -799,6 +819,8 @@ fn help_names_the_environment_the_flags_and_every_line() {
         "--tick",
         "--step",
         "--min-notional",
+        "--resting-cap-usd",
+        "--inventory-cap-usd",
         "--side",
         "--away-bps",
         "--hold",
@@ -1126,4 +1148,51 @@ async fn stop_fails_when_an_earlier_runs_orders_fill_instead_of_cancelling() {
         assert_eq!(printed.matches(said).count(), 2, "{printed}");
         assert!(printed.contains("DONE failed"), "{printed}");
     }
+}
+
+#[tokio::test]
+async fn an_order_on_the_market_that_is_not_ours_refuses_the_run_before_start() {
+    // A random UUID client id: another system's order (the Java brokers, the venue's UI). The
+    // registry would neither cancel it nor count its fills.
+    let foreign = json!({ "results": [{
+        "id": "1759500000000000903", "client_id": "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+        "market": MARKET, "side": "SELL", "type": "LIMIT", "instruction": "POST_ONLY",
+        "price": "70000", "size": "0.00001", "remaining_size": "0.00001", "status": "OPEN",
+        "flags": [],
+    }]});
+    let placed = Arc::new(Mutex::new(Placed::default()));
+    let with = responder(Arc::clone(&placed));
+    // Auth, four subscriptions and the arm: nothing after them.
+    let mut script = vec![Step::Accept];
+    script.extend((0..6).map(|_| Step::Respond {
+        conn: 0,
+        with: with.clone(),
+    }));
+    let stub = StubServer::start(WsScript::new(script), routes_with(foreign.to_string()))
+        .await
+        .unwrap();
+    let opts = options(&stub, "10");
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(!report.ok, "{printed}");
+    assert!(
+        printed.contains("1 open orders on the market are not ours"),
+        "{printed}"
+    );
+    assert_eq!(
+        steps(&printed),
+        ["login", "arm", "resync", "stop"],
+        "{printed}"
+    );
+    assert_eq!(
+        (report.places_sent, report.cancels_sent),
+        (0, 0),
+        "{printed}"
+    );
+    assert!(
+        !methods(&stub)
+            .iter()
+            .any(|m| m.starts_with("order.c") && m != "order.cancel_on_disconnect")
+    );
+    assert!(printed.contains("DONE failed"), "{printed}");
 }

@@ -1,5 +1,5 @@
-//! testnet_trade: logs in to Paradex TESTNET, resyncs, places ONE post-only limit order of about
-//! $11 well away from the touch through fbc-oms, waits for its acknowledgement, cancels it,
+//! testnet_trade: logs in to Paradex TESTNET, resyncs, places ONE post-only limit order, sized to
+//! the resting cap given on the command line, well away from the touch through fbc-oms, waits for its acknowledgement, cancels it,
 //! waits for the cancel's acknowledgement, then Stops (kill switch + cancel all) and exits,
 //! printing each step with its time. TESTNET ONLY: a mainnet URL or chain id is refused before
 //! anything connects. An owner-run sample: CI builds it, and its wiring is tested against the

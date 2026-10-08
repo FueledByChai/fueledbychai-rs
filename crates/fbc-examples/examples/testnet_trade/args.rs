@@ -9,8 +9,8 @@ use rust_decimal::Decimal;
 
 /// The help text `--help` prints.
 pub const USAGE: &str = "\
-testnet_trade: places ONE post-only limit order of about $11 well away from the touch on a
-Paradex TESTNET market through fbc-oms, waits for its acknowledgement, cancels it, waits for the
+testnet_trade: places ONE post-only limit order, sized to the resting cap you give, well away
+from the touch on a Paradex TESTNET market through fbc-oms, waits for its acknowledgement, cancels it, waits for the
 cancel's acknowledgement, then Stops (kill switch + cancel all) and exits. TESTNET ONLY: a
 mainnet URL or chain id is refused before anything connects. An owner-assisted testnet run:
 the market's position is seeded by hand from the venue's own REST position (decision 0067).
@@ -33,6 +33,10 @@ The market (required; read them from GET https://api.testnet.paradex.trade/v1/ma
   --tick <DEC>              its price_tick_size, e.g. 0.1
   --step <DEC>              its order_size_increment, e.g. 0.001
   --min-notional <USD>      its min_notional, e.g. 10 (0 when it states none)
+
+The caps (required; your own limits, in USD, no defaults):
+  --resting-cap-usd <USD>   the resting cap per side; the order is the largest it admits
+  --inventory-cap-usd <USD> the inventory cap
 
 Options:
   --side <buy|sell>         the order's side (default buy: below the best bid; sell: above the
@@ -111,6 +115,10 @@ pub struct Options {
     pub tick: Decimal,
     pub step: Decimal,
     pub min_notional: Decimal,
+    /// The resting cap per side, in USD: the order is the largest it admits.
+    pub resting_cap_usd: Decimal,
+    /// The inventory cap, in USD.
+    pub inventory_cap_usd: Decimal,
     pub side: OrderSide,
     pub away_bps: u32,
     pub hold_secs: u64,
@@ -135,6 +143,7 @@ pub enum Parsed {
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     let mut market = None;
     let (mut tick, mut step, mut min_notional) = (None, None, None);
+    let (mut resting_cap_usd, mut inventory_cap_usd) = (None, None);
     let mut side = OrderSide::Buy;
     let mut away_bps = 300;
     let mut hold_secs = 0;
@@ -170,6 +179,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
                     _ => return Err(format!("--min-notional {v}: not a decimal of 0 or more")),
                 }
             }
+            "--resting-cap-usd" => resting_cap_usd = Some(positive(&flag, &value()?)?),
+            "--inventory-cap-usd" => inventory_cap_usd = Some(positive(&flag, &value()?)?),
             "--side" => {
                 side = match value()?.as_str() {
                     "buy" => OrderSide::Buy,
@@ -193,6 +204,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         tick: tick.ok_or_else(|| need("--tick"))?,
         step: step.ok_or_else(|| need("--step"))?,
         min_notional: min_notional.ok_or_else(|| need("--min-notional"))?,
+        resting_cap_usd: resting_cap_usd.ok_or_else(|| need("--resting-cap-usd"))?,
+        inventory_cap_usd: inventory_cap_usd.ok_or_else(|| need("--inventory-cap-usd"))?,
         side,
         away_bps,
         hold_secs,
