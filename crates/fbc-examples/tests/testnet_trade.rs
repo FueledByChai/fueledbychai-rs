@@ -344,7 +344,8 @@ fn responder_with(
                 if matches!(placed_end, End::PartlyFilled) {
                     frames.push(Frame::Binary(fill_event(5_000, VID, &p.cid, &p.price)));
                 }
-                frames.push(Frame::Binary(closed));
+                // Before the placed order's event, on the same socket: the run sees them
+                // before its closed step, so before Stop builds its plan.
                 if matches!(restored_end, End::FilledBeforeStop) {
                     for (i, r) in restored.iter().enumerate() {
                         let seq = 5_100 + i64::try_from(i).unwrap();
@@ -353,6 +354,7 @@ fn responder_with(
                         frames.push(Frame::Binary(ev));
                     }
                 }
+                frames.push(Frame::Binary(closed));
                 Ok(frames)
             }
             "order.cancel_batch" => {
