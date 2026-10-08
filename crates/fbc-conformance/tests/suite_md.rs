@@ -54,6 +54,8 @@ enum Twist {
     RefusesSubscribe,
     /// Every gap it reports names the other instrument (TOYA's for TOYB's, and the reverse).
     WrongInstrument,
+    /// Every gap it reports on a book is also reported on the same instrument's trades.
+    GapsTradesToo,
     /// It refuses a subscribe call naming more than one instrument, as a venue with one
     /// connection per instrument may.
     OneInstrument,
@@ -211,6 +213,19 @@ impl MdSink for Rewrite<'_> {
             _ => {}
         }
         self.sink.push(meta, ev);
+        if let (
+            Twist::GapsTradesToo,
+            MdEvent::Health {
+                inst,
+                h: FeedHealth::Gap,
+                ..
+            },
+        ) = (self.twist, ev)
+        {
+            let feed = Feed::Trades;
+            let h = FeedHealth::Gap;
+            self.sink.push(meta, MdEvent::Health { inst, feed, h });
+        }
     }
 }
 
@@ -596,6 +611,19 @@ fn continuity_fails_a_toy_that_reports_a_break_on_the_wrong_instrument() {
 }
 
 #[test]
+fn continuity_fails_a_toy_that_reports_a_break_on_another_feed_too() {
+    // Codex r4217839174: the instrument's trades are not broken by its book's gap.
+    let failure = failed(Variant::twisted(Twist::GapsTradesToo).run(suite::continuity));
+    let said = said(&failure, PLUS_ONE);
+    assert_eq!(said.len(), 3, "{said:#?}");
+    assert_eq!(
+        said[0],
+        "continuity/book.frames line 10 breaks TOYA-PERP's sequence, yet a gap was reported on \
+         TOYA-PERP's Trades"
+    );
+}
+
+#[test]
 fn the_checks_drive_one_connection_as_the_topology_allows() {
     // Codex r4217682420: a venue with a connection per instrument is subscribed one instrument
     // per codec, and its cases name that instrument only.
@@ -712,6 +740,14 @@ fn continuity_reads_a_binary_venues_longer_blocks() {
          text delta|sym=TOYA-PERP|book=0|seq=11|bid=100:4|ask=\n",
     );
     let read = probed(binary().run_in(suite::continuity, &scratch.0));
+    // Codex r4217839165: an empty longer-block case fails.
+    let empty = Scratch::toy("longer-empty");
+    empty.write("continuity/longer_block/book.frames", "# nothing\n");
+    let failure = failed(binary().run_in(suite::continuity, &empty.0));
+    assert_eq!(
+        said(&failure, "continuity/longer_block/book.frames"),
+        ["hands the codec no frame: a case that decodes nothing proves nothing"]
+    );
     assert_eq!(
         read[2..],
         ["continuity/longer_block/book.frames: 2 frames, 0 breaking the sequence"]
