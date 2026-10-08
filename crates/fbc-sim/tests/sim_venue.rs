@@ -2342,9 +2342,11 @@ fn a_venue_that_cancels_on_disconnect_is_not_stood_in_for_yet() {
     for on_disconnect in [
         CancelOnDisconnect::PerConnection {
             rearm_on_reconnect: false,
+            covers_open_orders: false,
         },
         CancelOnDisconnect::PerConnection {
             rearm_on_reconnect: true,
+            covers_open_orders: false,
         },
         CancelOnDisconnect::DeadMan {
             max_ttl: Duration::from_secs(5),

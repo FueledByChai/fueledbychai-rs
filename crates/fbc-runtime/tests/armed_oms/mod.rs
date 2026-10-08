@@ -13,12 +13,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use fbc_core::{
-    AccountKey, AccountLease, AccountSummary, AckLevel, AmendQty, AssetKey, Channel, CidMatch,
-    CidMint, ClientOrderId, ConfigError, EndpointPlan, ExecCodec, ExecEndpoint, FieldSpec,
-    HttpPlan, InstrumentSpecDraft, ItemRef, Lots, MarketLease, MdCodec, MonoNs, NamespaceLease,
-    NewOrder, NonceBlock, NonceSource, OrderCaps, OrderKind, RateLimit, Secrets, Side, SignedLots,
-    SpecTable, SubmitOutcome, Subscription, SymbolError, Ticks, Tif, VenueCaps, VenueConfig,
-    VenueError, VenueFactory, VenueOrderSnapshot, VenueOrderState, WallNs, WireUrl,
+    AccountKey, AccountLease, AccountSummary, AckLevel, AmendQty, AssetKey, CancelOnDisconnect,
+    Channel, CidMatch, CidMint, ClientOrderId, ConfigError, EndpointPlan, ExecCodec, ExecEndpoint,
+    FieldSpec, HttpPlan, InstrumentSpecDraft, ItemRef, Lots, MarketLease, MdCodec, MonoNs,
+    NamespaceLease, NewOrder, NonceBlock, NonceSource, OrderCaps, OrderKind, RateLimit, Secrets,
+    Side, SignedLots, SpecTable, SubmitOutcome, Subscription, SymbolError, Ticks, Tif, VenueCaps,
+    VenueConfig, VenueError, VenueFactory, VenueOrderSnapshot, VenueOrderState, WallNs, WireUrl,
 };
 use fbc_oms::{
     Authorization, CancelChoice, CancelEverything, LadderConfig, LeaseKeys, Leases,
@@ -38,19 +38,31 @@ pub const ACCT: AccountKey = AccountKey::new(4);
 const CAP: i64 = 1_000;
 
 /// The conformance toy's order entry at the configured URL, declaring the toy's own rate limits
-/// or, built [`Held::with_limits`], others.
+/// or, built [`Held::with_limits`], others, and, built [`Held::covering`], an arm that covers
+/// the orders already open (FBC-nvxn).
 pub struct Held {
     limits: Option<Vec<RateLimit>>,
+    covers_open_orders: bool,
 }
 
 /// The toy as it declares itself.
-static HELD: Held = Held { limits: None };
+pub static HELD: Held = Held {
+    limits: None,
+    covers_open_orders: false,
+};
+
+/// The toy declaring that an accepted cancel-on-disconnect arm covers the orders already open.
+pub static COVERING: Held = Held {
+    limits: None,
+    covers_open_orders: true,
+};
 
 impl Held {
     /// A venue of the test's own: the toy declaring `limits` in place of its own.
     pub fn with_limits(limits: Vec<RateLimit>) -> &'static Held {
         Box::leak(Box::new(Held {
             limits: Some(limits),
+            covers_open_orders: false,
         }))
     }
 }
@@ -68,6 +80,13 @@ impl VenueFactory for Held {
         let mut caps = held_caps();
         if let Some(limits) = &self.limits {
             caps.limits.clone_from(limits);
+        }
+        if self.covers_open_orders {
+            let order = &mut caps.exec.as_mut().unwrap().order;
+            order.cancel_on_disconnect = CancelOnDisconnect::PerConnection {
+                rearm_on_reconnect: true,
+                covers_open_orders: true,
+            };
         }
         Ok(caps)
     }

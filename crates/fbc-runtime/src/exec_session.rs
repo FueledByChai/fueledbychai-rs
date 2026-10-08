@@ -136,6 +136,16 @@
 //! through the pacing, no sooner than the buckets would admit the arm when they refused it for
 //! now; an arm whose frames never fit ends the session ([`ExecSessionError::ArmNeverFits`]).
 //!
+//! **Orders resting from an earlier epoch (FBC-nvxn, decision 0080).** An arm may cover only
+//! the orders placed after it. On a venue that does not declare that it covers the orders
+//! already open (`CancelOnDisconnect::PerConnection::covers_open_orders`), every order of ours
+//! the resync of an epoch that sent an arm shows resting was placed on an earlier epoch and is
+//! unprotected: once the epoch takes places, the handler is told them, once
+//! ([`ExecHandler::on_unprotected`]), and cancels them through fbc-oms, and until an order event
+//! or an order query's answer shows each ended, a place, a batch with an item, or an amend on
+//! its market is `NotSent(Disconnected)`, counted ([`ExecCounters::unprotected_refusals`]), with
+//! no nonce reserved and nothing written ([`ExecOrders::may_place_on`]). Other markets place.
+//!
 //! One thread drives a session (design §5.1): [`ExecSession::run`] spawns no task.
 
 use std::fmt;
@@ -146,7 +156,7 @@ use fbc_core::{
     EncodeReceipt, Envelope, ExecCodec, ExecEvent, ExecSink, Inbound, InboundSpans, KernelRxNs,
     MonoNs, Namespace, NonceBlock, NonceSource, NotSentReason, PathStamps, RpcCall, RpcId, Secrets,
     SpecTable, Stamp, StreamId, SubmitHandle, TimerTag, TrafficClass, VenueCaps, VenueCommand,
-    VenueConfig, VenueError, VenueFactory, VenueMeta, WallNs, dispatch,
+    VenueConfig, VenueError, VenueFactory, VenueMeta, VenueOrderSnapshot, WallNs, dispatch,
 };
 use fbc_journal::{ControlEvent, NonceSourceId, Record};
 use futures_util::{FutureExt, StreamExt};
@@ -155,6 +165,7 @@ use tokio::time::Instant;
 
 use crate::connector::Connector;
 use crate::epoch::{Admit, EpochError, Epochs, Input};
+use crate::exec_gate::Hold;
 use crate::exec_orders::{ExecOrders, Queued, RpcIds, Rpcs, Shared, Submitted};
 use crate::journal::Journal;
 use crate::pacing::ReconnectPacing;
@@ -195,6 +206,20 @@ pub trait ExecHandler {
     /// Nothing by default.
     fn on_submitted(&mut self, handle: SubmitHandle) {
         let _ = handle;
+    }
+
+    /// The orders of ours the current epoch's resync showed resting, placed on an earlier
+    /// epoch, which the epoch's cancel-on-disconnect arm may not cover (FBC-nvxn, decision
+    /// 0080): called once per epoch, right after the handler is handed the event that lets the
+    /// epoch place (the arm's acceptance or the resync's end, whichever comes last), when there
+    /// are any, on a venue that does not declare that an arm covers the orders already open
+    /// (`covers_open_orders`). Until an order event or an order query's answer shows each
+    /// ended, the session takes no place or amend on its market
+    /// ([`ExecOrders::may_place_on`]). The consumer cancels them, a Safety cancel per order
+    /// built and authorized by fbc-oms ([`ExecOrders::submit`]); one it does not cancel keeps
+    /// its market held until the next epoch's resync. Nothing by default.
+    fn on_unprotected(&mut self, orders: &[VenueOrderSnapshot]) {
+        let _ = orders;
     }
 }
 
@@ -363,6 +388,9 @@ pub struct ExecCounters {
     /// Places, batches of places and amends refused because their epoch was not yet armed and
     /// resynced.
     pub unready_refusals: u64,
+    /// Places, batches of places and amends refused on an armed and resynced epoch because an
+    /// order of ours on their market rests unprotected from an earlier epoch (FBC-nvxn).
+    pub unprotected_refusals: u64,
     /// Inbound frames and HTTP responses whose codec named credential spans that do not fit
     /// them (a codec defect): journaled with the whole body and every header hashed.
     pub refused_redactions: u64,
@@ -387,6 +415,8 @@ pub struct ExecSession<H: ExecHandler> {
     arm_failures: u64,
     /// Places and amends refused on an epoch not yet armed and resynced.
     unready_refusals: u64,
+    /// Places and amends refused on a market an order rests unprotected on.
+    unprotected_refusals: u64,
     /// What [`ExecOrders`] and the session share: the commands waiting, the authenticated
     /// epoch.
     orders: Rc<Shared>,
@@ -486,8 +516,11 @@ impl<H: ExecHandler> ExecSession<H> {
         let Some(exec) = &caps.exec else {
             return Err(ExecSessionError::NoOrderEntry);
         };
-        let rearm = match exec.order.cancel_on_disconnect {
-            CancelOnDisconnect::PerConnection { rearm_on_reconnect } => rearm_on_reconnect,
+        let (rearm, covers_open) = match exec.order.cancel_on_disconnect {
+            CancelOnDisconnect::PerConnection {
+                rearm_on_reconnect,
+                covers_open_orders,
+            } => (rearm_on_reconnect, covers_open_orders),
             other => return Err(ExecSessionError::CancelOnDisconnect(other)),
         };
         config.limiter.check(&caps.limits)?;
@@ -532,7 +565,8 @@ impl<H: ExecHandler> ExecSession<H> {
             decode_errors: 0,
             arm_failures: 0,
             unready_refusals: 0,
-            orders: Shared::new(config.acct, config.rpc_ids, rearm),
+            unprotected_refusals: 0,
+            orders: Shared::new(config.acct, config.rpc_ids, rearm, covers_open),
             rpcs: Rpcs::default(),
             clock,
             stop,
@@ -584,6 +618,7 @@ impl<H: ExecHandler> ExecSession<H> {
             write_stalls: core.write_stalls,
             arm_failures: self.arm_failures,
             unready_refusals: self.unready_refusals,
+            unprotected_refusals: self.unprotected_refusals,
             refused_redactions: self.core.refused_redactions(),
         }
     }
@@ -1001,10 +1036,19 @@ impl<H: ExecHandler> ExecSession<H> {
         let cmd = item.command();
         let current = self.orders.ready() == Some(key.epoch) && epoch == Some(key.epoch);
         // No place or amend before the epoch's arm is accepted and its resync has ended
-        // (decision 0058): counted, no nonce reserved, nothing written.
-        let held = current && !self.orders.gate.borrow().admits(cmd, key.epoch);
-        self.unready_refusals += u64::from(held);
-        if !current || held {
+        // (decision 0058), nor on a market an order of ours rests unprotected on from an
+        // earlier epoch (FBC-nvxn, decision 0080): counted, no nonce reserved, nothing written.
+        let held = if current {
+            self.orders.gate.borrow().admits(cmd, key.epoch).err()
+        } else {
+            None
+        };
+        match held {
+            Some(Hold::Unready) => self.unready_refusals += 1,
+            Some(Hold::Unprotected) => self.unprotected_refusals += 1,
+            None => {}
+        }
+        if !current || held.is_some() {
             self.handler
                 .on_submitted(not_sent(NotSentReason::Disconnected));
             return Ok(true);
@@ -1518,7 +1562,18 @@ impl<H: ExecHandler> ExecSink for Sink<'_, H> {
             if let Some(settled) = settled {
                 self.orders.gate.borrow_mut().settle(epoch, settled);
             }
+            // What the event shows of the orders resting from an earlier epoch counts as it is
+            // handed over too (FBC-nvxn).
+            self.orders.gate.borrow_mut().observe(epoch, &ev);
             self.handler.on_exec(Envelope::new(self.stamp, meta, ev));
+            // The epoch just became placing with orders unprotected: the handler is told them
+            // once, unless it stopped the session as it took the event.
+            let notice = self.orders.gate.borrow_mut().notice(epoch);
+            if let Some(unprotected) = notice
+                && self.stop.has_changed().is_ok()
+            {
+                self.handler.on_unprotected(&unprotected);
+            }
         }
     }
 }
@@ -1549,6 +1604,7 @@ mod tests {
             (
                 ExecSessionError::CancelOnDisconnect(CancelOnDisconnect::PerConnection {
                     rearm_on_reconnect: false,
+                    covers_open_orders: false,
                 }),
                 "the venue declares cancel-on-disconnect PerConnection; a session places orders \
                  only behind per-connection protection",

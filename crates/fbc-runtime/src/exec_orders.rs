@@ -23,7 +23,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use fbc_core::{AccountKey, RpcCall, RpcId, VenueCommand};
+use fbc_core::{AccountKey, InstrumentId, RpcCall, RpcId, VenueCommand, VenueOrderSnapshot};
 use fbc_oms::{Authorization, ControlCommand};
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -126,15 +126,16 @@ pub(crate) struct Shared {
 
 impl Shared {
     /// What the session for `acct` shares with its orders, its request ids from `ids`, its
-    /// venue's protection per connection and re-armed on each when `rearm`.
-    pub(crate) fn new(acct: AccountKey, ids: RpcIds, rearm: bool) -> Rc<Shared> {
+    /// venue's protection per connection, re-armed on each when `rearm` and covering the
+    /// orders already open when `covers_open`.
+    pub(crate) fn new(acct: AccountKey, ids: RpcIds, rearm: bool, covers_open: bool) -> Rc<Shared> {
         Rc::new(Shared {
             acct,
             ids,
             queue: RefCell::default(),
             wake: Notify::new(),
             ready: Cell::new(None),
-            gate: RefCell::new(Gate::new(rearm)),
+            gate: RefCell::new(Gate::new(rearm, covers_open)),
             ended: Cell::new(false),
         })
     }
@@ -247,6 +248,31 @@ impl ExecOrders {
         let gate = self.shared.gate.borrow();
         self.shared.ready().is_some_and(|epoch| gate.placing(epoch))
     }
+
+    /// Whether the session's current epoch takes places and amends on `inst`: it
+    /// [may place](ExecOrders::may_place), and no order of ours on `inst` that its resync
+    /// showed resting rests still unprotected (FBC-nvxn, decision 0080). Until then a place, a
+    /// batch with an item on `inst`, or an amend on `inst` is `NotSent(Disconnected)`, counted
+    /// ([`ExecCounters::unprotected_refusals`](crate::ExecCounters::unprotected_refusals)).
+    pub fn may_place_on(&self, inst: InstrumentId) -> bool {
+        self.may_place() && !self.shared.gate.borrow().unprotected_on(inst)
+    }
+
+    /// The orders of ours the current epoch's resync showed resting that rest still
+    /// unprotected: placed on an earlier epoch, so the epoch's cancel-on-disconnect arm may not
+    /// cover them, on a venue that does not declare that it does (`covers_open_orders`). Each
+    /// holds its market until an order event or an order query's answer shows it ended; the
+    /// consumer cancels them through fbc-oms ([`ExecHandler::on_unprotected`]
+    /// (crate::ExecHandler::on_unprotected)). Empty before the resync has ended.
+    pub fn unprotected(&self) -> Vec<VenueOrderSnapshot> {
+        let gate = self.shared.gate.borrow();
+        let ready = self.shared.ready().is_some_and(|epoch| gate.placing(epoch));
+        if ready {
+            gate.unprotected().to_vec()
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 /// The deadlines of the requests a session wrote, each until the first event that answers it.
@@ -355,8 +381,8 @@ mod tests {
     fn request_ids_count_up_across_the_sessions_sharing_them_from_where_they_start() {
         let ids = RpcIds::default();
         let (first, second) = (
-            Shared::new(AccountKey::new(2), ids.clone(), true),
-            Shared::new(AccountKey::new(2), ids, true),
+            Shared::new(AccountKey::new(2), ids.clone(), true, false),
+            Shared::new(AccountKey::new(2), ids, true, false),
         );
         let fee = || Submitted::Control(VenueCommand::FeeQuery);
         assert_eq!(first.push(fee()), Ok(RpcId(1)));
@@ -373,12 +399,15 @@ mod tests {
 
     #[test]
     fn orders_give_increasing_request_ids_and_none_once_ended() {
-        let shared = Shared::new(AccountKey::new(2), RpcIds::default(), true);
+        let shared = Shared::new(AccountKey::new(2), RpcIds::default(), true, false);
         let orders = ExecOrders {
             shared: Rc::clone(&shared),
         };
         assert_eq!(orders.account(), AccountKey::new(2));
         assert!(format!("{orders:?}").starts_with("ExecOrders"));
+        // No epoch authenticated: no market takes places, and nothing is unprotected.
+        assert!(!orders.may_place_on(InstrumentId::new(1)));
+        assert!(orders.unprotected().is_empty());
         shared.set_ready(Some(3));
         let first = orders.submit_control(ControlCommand::FeeQuery);
         let second = orders.submit_control(ControlCommand::RefreshDeadMan);

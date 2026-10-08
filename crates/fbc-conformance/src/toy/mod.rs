@@ -184,9 +184,12 @@ pub fn caps_for(fill_ids: FillIds) -> VenueCaps {
                 cancel_all_account: Support::Unsupported,
                 cancel_all_instrument: Support::Native,
                 // Protection per connection, requested again on each (FBC-w19): the order-entry
-                // session arms it after every epoch's authentication.
+                // session arms it after every epoch's authentication. An arm covers only the
+                // orders placed after it, so the session cancels what a resync shows resting
+                // before it places on those markets (FBC-nvxn).
                 cancel_on_disconnect: CancelOnDisconnect::PerConnection {
                     rearm_on_reconnect: true,
+                    covers_open_orders: false,
                 },
                 ack: AckModel::SinglePhase,
                 client_id: ClientIdFormat::Alnum {
