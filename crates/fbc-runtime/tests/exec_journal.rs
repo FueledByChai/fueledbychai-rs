@@ -197,11 +197,44 @@ impl Run {
 /// The events the handler heard.
 type Heard = Rc<RefCell<Vec<ExecEvent>>>;
 
+/// What the session has offered its journal so far, as a test waits on it.
+#[derive(Clone)]
+struct Offered(Rc<RefCell<Tee>>);
+
+impl Offered {
+    /// Whether epoch `key` has been journaled closed.
+    fn closed(&self, key: ConnKey) -> bool {
+        let tee = self.0.borrow();
+        tee.offered.iter().any(
+            |(_, r)| matches!(r, Record::Control { ev: ControlEvent::Closed(k), .. } if *k == key),
+        )
+    }
+
+    /// How many HTTP results have been journaled.
+    fn answers(&self) -> usize {
+        let tee = self.0.borrow();
+        let answers = tee.offered.iter();
+        answers
+            .filter(|(_, r)| matches!(r, Record::HttpResult { .. }))
+            .count()
+    }
+}
+
 /// Runs a session built from `config` with a journal, while `play` drives the venue with the
 /// session's orders, its control and what its handler hears, and reads back what it journaled.
 async fn journaled<F, Fut>(name: &str, config: ExecSessionConfig, play: F) -> Run
 where
     F: FnOnce(ExecOrders, ExecControl, Heard) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let play = |orders, control, heard, _: Offered| play(orders, control, heard);
+    journaled_seeing(name, config, play).await
+}
+
+/// [`journaled`], `play` also seeing what the session has offered its journal so far.
+async fn journaled_seeing<F, Fut>(name: &str, config: ExecSessionConfig, play: F) -> Run
+where
+    F: FnOnce(ExecOrders, ExecControl, Heard, Offered) -> Fut,
     Fut: Future<Output = ()>,
 {
     let root = fresh_dir(name);
@@ -224,7 +257,8 @@ where
     let (mut session, control) = ExecSession::new(config, handler).unwrap();
     session.set_journal(Journal::new(tee.clone()));
     let orders = session.orders();
-    let (ended, ()) = tokio::join!(session.run(), play(orders, control, heard));
+    let offered = Offered(Rc::clone(&tee));
+    let (ended, ()) = tokio::join!(session.run(), play(orders, control, heard, offered));
     drop(session);
     writer.close().unwrap();
     let entries: Vec<Entry> = JournalReader::open(&root, SHARD)
@@ -776,7 +810,8 @@ async fn the_conformance_toys_order_entry_session_journals_what_crosses_it_in_or
     }
     assert!(stamps.iter().all(|s| s.conn == key(0)));
 
-    // Classes: what the stream brought is Safety, as are the commands' nonces and contexts.
+    // Classes: what the stream brought is Safety, as are the epoch's opening and closing, every
+    // nonce, and the commands' contexts.
     let inbound = |r: &Record| matches!(r, Record::Inbound { .. });
     assert_eq!(run.classes(inbound), [TrafficClass::Safety; 5]);
     let ping = |r: &Record| matches!(r, Record::InboundControl { .. });
@@ -788,7 +823,7 @@ async fn the_conformance_toys_order_entry_session_journals_what_crosses_it_in_or
     let call = |r: &Record| matches!(r, Record::EncodeCtx { rpc: None, .. });
     assert_eq!(run.classes(call), [TrafficClass::Normal; 2]);
     let control = |r: &Record| matches!(r, Record::Control { .. });
-    assert_eq!(run.classes(control), [TrafficClass::Normal; 2]);
+    assert_eq!(run.classes(control), [TrafficClass::Safety; 2]);
 }
 
 /// The `auth_toy` session journals, in order: the epoch opening; `on_open`'s nonce and context
@@ -797,7 +832,8 @@ async fn the_conformance_toys_order_entry_session_journals_what_crosses_it_in_or
 /// timer's firing, `on_timer`'s nonce and context and the second login with its result; the
 /// venue's frame echoing a key (a span); the epoch closing. None of the synthetic credentials
 /// is in a file; each keyed hash is. The login results are Safety, as everything the stream
-/// brings; the timer is Normal.
+/// brings, and so are the nonces `on_open` and `on_timer` reserve; the timer and those calls'
+/// contexts are Normal.
 #[tokio::test]
 async fn the_auth_toys_order_entry_session_journals_its_logins_timer_nonces_and_contexts_with_no_credential()
  {
@@ -937,6 +973,9 @@ async fn the_auth_toys_order_entry_session_journals_its_logins_timer_nonces_and_
     assert_eq!(run.classes(timer), [TrafficClass::Normal]);
     let call = |r: &Record| matches!(r, Record::EncodeCtx { rpc: None, .. });
     assert_eq!(run.classes(call), [TrafficClass::Normal; 3]);
+    // Reviewer B RB-2pr-4 on PR #115: a call's nonces are Safety, so a restart reads them all.
+    let nonce = |r: &Record| matches!(r, Record::Nonce { .. });
+    assert_eq!(run.classes(nonce), [TrafficClass::Safety; 3]);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1314,8 +1353,9 @@ async fn a_journal_set_after_a_dropped_run_gets_none_of_its_epoch() {
 }
 
 /// Codex P2 r4214053432 on PR #115: the nonces `on_open` asks for, and its context, are filed
-/// under the time the source returned them at, while the context keeps the time its call was
-/// given: a source that takes its time across midnight files them under the new day.
+/// under the time the source returned them at, so a source that takes its time across midnight
+/// files them under the new day; and the context's own time is read then too, as an encode's
+/// is, so the codec signs no stale time (Reviewer B RB-2pr-3).
 #[tokio::test]
 async fn a_calls_nonces_are_filed_after_they_are_reserved() {
     let mut server = ScriptedWs::start().await;
@@ -1354,17 +1394,16 @@ async fn a_calls_nonces_are_filed_after_they_are_reserved() {
     let Record::EncodeCtx { ctx, .. } = ctx else {
         unreachable!()
     };
-    assert!(
-        ctx.wall < returned,
-        "the call's time is the one it was given"
-    );
+    assert!(ctx.wall >= returned, "{:?} before {returned:?}", ctx.wall);
 }
 
-/// Codex P2 r4214053451 on PR #115: an HTTP result that comes back after its epoch ended, while
-/// the session waits to reconnect, is journaled with the spans the session's one codec names in
-/// it, the rest verbatim, not hashed whole as a market-data session's ended codec leaves it.
+/// Codex P2 r4214053451 on PR #115, answered by P1 r4215070431: an HTTP result that comes back
+/// after its epoch ended, while the session waits to reconnect, is hashed whole, all of its body
+/// and every header, as a market-data session's is, although one codec serves every epoch: that
+/// codec is never handed the result, and any call it took since the request may have changed
+/// what its redaction names.
 #[tokio::test]
-async fn an_ended_epochs_http_result_keeps_what_the_one_codec_does_not_name() {
+async fn an_ended_epochs_http_result_is_hashed_whole_while_the_session_waits_to_reconnect() {
     let token = secret("staletoken");
     let mut server = ScriptedWs::start().await;
     let mut http = ScriptedHttp::start().await;
@@ -1373,18 +1412,18 @@ async fn an_ended_epochs_http_result_keeps_what_the_one_codec_does_not_name() {
     let config = config(venue, &server.url(), &cfg, Counting::new());
     let body = format!("auth|token={token}|refresh=3600");
     let live_body = body.clone();
-    let run = journaled(
+    let run = journaled_seeing(
         "exec_journal_stale_http",
         config,
-        |_, control, _| async move {
+        |_, control, _, offered| async move {
             let peer = server.accept().await;
             let login = http.request().await;
             peer.drop_conn();
             // The epoch ends as the drop is read; the session then waits a minute to reconnect.
-            tokio::time::sleep(ms(200)).await;
+            until(|| offered.closed(key(0))).await;
             let answered = login.answer("HTTP/1.1 200 OK\r\nX-Toy: yes", &live_body);
             let _ = tokio::time::timeout(ms(500), answered).await;
-            tokio::time::sleep(ms(100)).await;
+            until(|| offered.answers() == 1).await;
             drop(control);
         },
     )
@@ -1400,10 +1439,8 @@ async fn an_ended_epochs_http_result_keeps_what_the_one_codec_does_not_name() {
         _ => None,
     });
     let resp = resp.unwrap();
-    let kept = body.replace(&token, &blank(token.len()));
-    assert_eq!(resp.body.0, kept.as_bytes());
-    let toy = resp.headers.iter().find(|h| h.name == "x-toy").unwrap();
-    assert_eq!((toy.value.as_str(), toy.redact), ("yes", false));
+    assert_eq!(resp.body.0, blank(body.len()).as_bytes());
+    assert!(resp.headers.iter().all(|h| h.redact), "{:#?}", resp.headers);
 }
 
 /// Codex P1 r4214607580 on PR #115: once the one codec's `on_open` has run for a later epoch,
@@ -1423,10 +1460,10 @@ async fn an_ended_epochs_http_result_is_hashed_whole_once_the_codec_opened_a_lat
     };
     let body = format!("auth|token={token}|refresh=3600");
     let live_body = body.clone();
-    let run = journaled(
+    let run = journaled_seeing(
         "exec_journal_stale_reopened",
         config,
-        |_, control, _| async move {
+        |_, control, _, offered| async move {
             let first = server.accept().await;
             let login = http.request().await;
             first.drop_conn();
@@ -1435,7 +1472,7 @@ async fn an_ended_epochs_http_result_is_hashed_whole_once_the_codec_opened_a_lat
             let _relogin = http.request().await;
             let answered = login.answer("HTTP/1.1 200 OK\r\nX-Toy: yes", &live_body);
             let _ = tokio::time::timeout(ms(500), answered).await;
-            tokio::time::sleep(ms(100)).await;
+            until(|| offered.answers() == 1).await;
             drop(control);
         },
     )
@@ -1457,9 +1494,29 @@ async fn an_ended_epochs_http_result_is_hashed_whole_once_the_codec_opened_a_lat
 
 /// Codex P1 r4214784284 on PR #115: a request's deadline that falls due while the session waits
 /// to reconnect calls the codec's `on_rpc_timeout`, which may change the state its redaction
-/// reads, so an ended epoch's HTTP result that comes back after that is hashed whole.
+/// reads; an ended epoch's HTTP result that comes back after that is hashed whole.
 #[tokio::test]
 async fn an_ended_epochs_http_result_is_hashed_whole_once_a_deadline_reached_the_codec() {
+    let body = stale_after_a_deadline("exec_journal_stale_timed_out", false).await;
+    assert_eq!(body.0, blank(body.1).as_bytes());
+}
+
+/// Codex P1 r4215070431 on PR #115 (Reviewer B RB-2pr-7): so is one whose epoch was still
+/// connected when the deadline reached the codec, here the arm's, which fails the epoch.
+#[tokio::test]
+async fn an_ended_epochs_http_result_is_hashed_whole_after_a_deadline_reached_the_connected_codec()
+{
+    let body = stale_after_a_deadline("exec_journal_stale_timed_out_connected", true).await;
+    assert_eq!(body.0, blank(body.1).as_bytes());
+}
+
+/// Runs an `auth_toy` session whose first login asks to be refreshed at once and whose arm is
+/// unanswered at its 300 ms deadline: with `connected`, the deadline falls due in the epoch and
+/// fails it; else the venue drops the connection first and it falls due while the session waits
+/// to reconnect. The refresh is answered once the epoch is journaled closed and the deadline
+/// has reached the codec. Returns the refresh result's journaled body and the length of the one
+/// sent, having checked that no credential is in the journal and every header is hashed.
+async fn stale_after_a_deadline(name: &str, connected: bool) -> (Vec<u8>, usize) {
     let token = secret("staletimedout");
     let mut server = ScriptedWs::start().await;
     let mut http = ScriptedHttp::start().await;
@@ -1472,41 +1529,47 @@ async fn an_ended_epochs_http_result_is_hashed_whole_once_a_deadline_reached_the
     let config = config(venue, &server.url(), &cfg, Counting::new());
     let body = format!("auth|token={token}|refresh=3600");
     let live_body = body.clone();
-    let run = journaled(
-        "exec_journal_stale_timed_out",
-        config,
-        |_, control, heard| async move {
-            let mut peer = server.accept().await;
-            // A login that asks to be refreshed at once: its refresh waits unanswered.
-            let first = "auth|token=tokenfirst|refresh=0";
-            http.request().await.answer("HTTP/1.1 200 OK", first).await;
-            assert_eq!(recv_text(&mut peer).await, "cod|rpc=1");
-            let refresh = http.request().await;
-            peer.drop_conn();
-            // The arm's deadline falls due while the session waits a minute to reconnect.
-            let unknown = ExecEvent::Outcome {
-                rpc: RpcId(1),
-                item: None,
-                outcome: SubmitOutcome::Unknown,
-            };
+    let run = journaled_seeing(name, config, |_, control, heard, offered| async move {
+        let mut peer = server.accept().await;
+        // A login that asks to be refreshed at once: its refresh waits unanswered.
+        let first = "auth|token=tokenfirst|refresh=0";
+        http.request().await.answer("HTTP/1.1 200 OK", first).await;
+        assert_eq!(recv_text(&mut peer).await, "cod|rpc=1");
+        let refresh = http.request().await;
+        let unknown = ExecEvent::Outcome {
+            rpc: RpcId(1),
+            item: None,
+            outcome: SubmitOutcome::Unknown,
+        };
+        if connected {
             until(|| heard.borrow().contains(&unknown)).await;
-            let answered = refresh.answer("HTTP/1.1 200 OK\r\nX-Toy: yes", &live_body);
-            let _ = tokio::time::timeout(ms(500), answered).await;
-            tokio::time::sleep(ms(100)).await;
-            drop(control);
-        },
-    )
+            until(|| offered.closed(key(0))).await;
+        } else {
+            peer.drop_conn();
+            until(|| offered.closed(key(0))).await;
+            until(|| heard.borrow().contains(&unknown)).await;
+        }
+        let answered = refresh.answer("HTTP/1.1 200 OK\r\nX-Toy: yes", &live_body);
+        let _ = tokio::time::timeout(ms(500), answered).await;
+        until(|| offered.answers() == 2).await;
+        drop(control);
+    })
     .await;
     run.ended.as_ref().unwrap();
     assert!(!contains(&run.files, token.as_bytes()));
-    // The last result journaled is the refresh's.
+    // The last result journaled is the refresh's, stamped under the ended epoch.
     let resp = run.entries.iter().rev().find_map(|e| match &e.record {
-        Record::HttpResult { result: Ok(r), .. } => Some(r.clone()),
+        Record::HttpResult {
+            stamp,
+            result: Ok(r),
+            ..
+        } => Some((stamp.conn, r.clone())),
         _ => None,
     });
-    let resp = resp.expect("the refresh's result is journaled");
-    assert_eq!(resp.body.0, blank(body.len()).as_bytes());
+    let (conn, resp) = resp.expect("the refresh's result is journaled");
+    assert_eq!(conn, key(0));
     assert!(resp.headers.iter().all(|h| h.redact), "{:#?}", resp.headers);
+    (resp.body.0, body.len())
 }
 
 /// Codex P2 r4214243083 on PR #115 (Reviewer A, Reviewer B RB-2pr-1): an epoch journaled closed

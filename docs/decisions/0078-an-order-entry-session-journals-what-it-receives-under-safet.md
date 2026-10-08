@@ -24,7 +24,8 @@ the same core with no journal (FBC-2pr). Three things were not decided by the ma
 This augments 0006, 0053, 0056 and 0057 (it supersedes nothing). With a journal set
 (`ExecSession::set_journal`), an order-entry session journals as the market-data session does
 (each epoch's `Opened` and `Closed`; every frame and HTTP result it receives at its stamp, a
-stale one included, with the credentials its codec names in it as keyed hashes, 0028; every
+stale one included, with the credentials its codec names in it as keyed hashes, 0028, and a
+stale HTTP result hashed whole; every
 ping, pong and close frame, 0041; every frame it writes with its kind and spans and the
 write's result; every HTTP request with its request id; every codec timer that fires), and
 also:
@@ -36,33 +37,38 @@ also:
    `ExecSessionError::Nonces`. The session's one source is journaled by the `NonceSourceId`
    the consumer gives it (`ExecSessionConfig::nonce_source`): one per scope the venue's
    `NonceScope` names, an account or a signing key, the same for every session sharing that
-   sequence, so a restart reads every value spent through it. An encode's time is read once
-   its nonces are reserved, so a source that takes its time (persisting what it reserved)
-   leaves the signed request no stale time; every nonce and context record is filed under the
-   time the reservation returned at.
+   sequence, so a restart reads every value spent through it. Every `Nonce` record goes under
+   Safety, whatever the call, so a `Degraded` span, which drops Normal records, keeps them. The time of an encode, of
+   `on_open` and of the resync is read once its nonces are reserved, so a source that takes
+   its time (persisting what it reserved) leaves the signed request no stale time; a timer's
+   context carries its firing's stamp. Every nonce and context record is filed under the time
+   the reservation returned at.
 2. **Each context just before its call.** The `EncodeCtx` the session hands `on_open`,
    `on_timer`, the resync or an `encode`, the encode's with its request id, `None` for the
    others (which replay matches by place). A call that is not made (a short reservation, an
    authorization refused at submit, a batch with no nonce block) has no context written.
 3. **Classes.** What the order-entry stream brings, every data frame and HTTP result, is
    journaled under Safety, since the session cannot tell an ack or a fill apart before it is
-   decoded. An encode's nonces and context go under its command's own class
-   (`VenueCommand::traffic_class`), the class its frames are labelled and journaled with, so a
-   cancel's, a reducing order's and the arm's are Safety; this is the journal's class, not the
-   rate-limit class 0073 gives control commands. The ping, pong and close frames received, the
-   connection changes, the codec's timer firings and the contexts and nonces of `on_open`,
-   `on_timer` and the resync go under Normal. A market-data session's inputs stay Normal.
+   decoded. Each epoch's `Opened` and `Closed` go under Safety too: replay feeds a record of an
+   epoch the journal holds no opening for to no codec, so an epoch opened in a `Degraded` span
+   would otherwise leave its acks and fills unplaceable. Every nonce is Safety (item 1). An
+   encode's context goes under its command's own class (`VenueCommand::traffic_class`), the
+   class its frames are labelled and journaled with, so a cancel's, a reducing order's and the
+   arm's are Safety; this is the journal's class, not the rate-limit class 0073 gives control
+   commands. The ping, pong and close frames received, the codec's timer firings and the
+   contexts of `on_open`, `on_timer` and the resync go under Normal. A market-data session's
+   inputs and connection changes stay Normal.
 4. **A stop's inputs follow the close.** When the control drops as a frame, timer firing or
    HTTP result wakes the epoch, or a frame waits then, the epoch's `Closed` is written first
    and those inputs, which reach no codec, after it, as the market-data session does, so replay
    feeds them to no codec either. Spans a codec names that do not fit their input are counted
    (`ExecCounters::refused_redactions`) and that input is hashed whole, as on market data.
-   Since one codec serves every epoch (0053), an HTTP result that comes back after its epoch
-   ended is journaled with the spans that codec names in it, not hashed whole as a market-data
-   session's ended codec leaves it, but only until that codec is called again after the epoch
-   ended, to time a request out (`on_rpc_timeout`) or to open a later epoch (`on_open`): either
-   may change the state its redaction reads, so from then on such a result is hashed whole. An epoch a dropped run left connected ends the session's orders
-   when it is ended, since the session runs once and could never send them.
+   An HTTP result that comes back after its epoch ended is hashed whole, as on market data,
+   although one codec serves every epoch (0053): any call that codec took after the request
+   was sent (a frame, a result, a timer, an encode, the resync, a deadline, a later epoch's
+   `on_open`) may have changed the state its redaction reads, and it is never handed that
+   result, so it owes it no spans. An epoch a dropped run left connected ends the session's
+   orders when it is ended, since the session runs once and could never send them.
    Every `Opened` has exactly one `Closed`, in the same journal: an epoch a dropped run left
    connected is ended before `set_journal` changes the journal, one a panic unwinds through is
    journaled closed as the session drops, if the sink is not borrowed then, and one journaled
@@ -79,6 +85,11 @@ also:
 - Journal an inbound frame after decoding, under the class its events imply: the record
   would follow the codec's events and effects, not precede them, so replay could not feed it
   where it was read, and a frame that fails to decode would have no class at all.
+- Journal an ended epoch's HTTP result with the spans the one codec names in it, keeping its
+  nonsecret bytes: tried on PR #115 (Codex P2 r4214053451) and dropped, because the codec's
+  redaction reads state that every later call may change, so each narrowing (until a later
+  `on_open`, until a deadline) left another call that could make it name nothing and write a
+  credential verbatim (Codex P1 r4214607580, r4214784284, r4215070431).
 - One `Nonce` record per block rather than per value: the format already writes one per value
   (FBC-ec9), so a restarted source reads where the live one stood without a block layout.
 - Write the context only for encodes: `on_open`'s and the resync's contexts carry the wall
@@ -89,8 +100,9 @@ also:
 
 - A journal now holds every nonce and context an order-entry session used, so exact replay of
   its outbound bytes (0006) has what it needs from the session.
-- An order-entry session's inputs can use the journal's safety reserve; a large resync answer
-  read over HTTP is Safety too.
+- An order-entry session's inputs, its epochs' openings and closings and every nonce it
+  reserves can use the journal's safety reserve; a large resync answer read over HTTP is Safety
+  too.
 - A request's deadline firing (`on_rpc_timeout`) is stamped but not yet journaled, so the
   ingest sequence it takes is a gap no marker explains: FBC-0hfl adds its record. Resuming an
   account's `RpcIds` from the journal's request ids is FBC-gqyb.
