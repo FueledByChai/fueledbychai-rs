@@ -12,8 +12,9 @@
 //! ticks, sizes lots, either list possibly empty):
 //!
 //! - `snap|sym|book|seq|ts?|<levels>`: [`BOOK`]'s whole snapshot, decoded whole or not at all
-//!   (record 0014 item 2). One before the sequence the channel had reached is dropped, after a
-//!   gap or while live: sequences never go back on a connection (Codex r4216289341).
+//!   (record 0014 item 2). One before a sequence the channel had already seen, applied or
+//!   dropped while it waited (the delta that broke it included), is dropped: sequences never
+//!   go back on a connection (Codex r4216289341, r4216898616).
 //! - `delta|sym|book|seq|ts?|<levels>`: levels set (zero removes one) on either channel. A
 //!   `seq` other than the channel's last plus one is a gap: `Health { feed: Feed::Book(book),
 //!   h: Gap }` names the channel that broke, the other is untouched, and the broken one waits
@@ -56,7 +57,8 @@ use DecodeError::Malformed;
 #[derive(Clone, Debug)]
 enum Chan {
     /// No snapshot yet, or a gap since the last: deltas are dropped, and a snapshot before
-    /// `floor`, the sequence the channel had already reached, too (Codex r4216289341).
+    /// `floor`, the highest sequence the channel had seen, too (Codex r4216289341,
+    /// r4216898616).
     Waiting { floor: u64 },
     /// An anchor is asked for at `url` under `tag`; deltas are held in order until it comes.
     /// An anchor before `floor`, the sequence the channel had already reached, is asked for
@@ -200,8 +202,9 @@ impl ToyMd {
 
     /// Where a channel starts, or starts again: [`ANCHORED_BOOK`] asks for its anchor, holding
     /// `held`, deltas already seen that the anchor must reach (Codex r4203051298), and refusing
-    /// an anchor before `floor`; a channel snapshotted in its own frames drops them. Subscribe
-    /// checked that the instrument is in `specs` and the anchor's base is set.
+    /// an anchor before `floor`; a channel snapshotted in its own frames drops them, raising
+    /// its floor to the highest (Codex r4216898616). Subscribe checked that the instrument is
+    /// in `specs` and the anchor's base is set.
     fn restart(
         &mut self,
         inst: InstrumentId,
@@ -222,7 +225,9 @@ impl ToyMd {
                     floor,
                 }
             }
-            _ => Chan::Waiting { floor },
+            _ => Chan::Waiting {
+                floor: held.iter().map(|h| h.seq).fold(floor, u64::max),
+            },
         }
     }
 
@@ -235,7 +240,9 @@ impl ToyMd {
         fx: &mut Effects,
     ) {
         match self.chans.get_mut(&key) {
-            None | Some(Chan::Waiting { .. }) => {}
+            None => {}
+            // Dropped, but seen: a snapshot must reach it (Codex r4216898616).
+            Some(Chan::Waiting { floor }) => *floor = d.seq.max(*floor),
             Some(Chan::Anchoring { held, .. }) if held.len() < MAX_HELD => held.push(d),
             // Held past the bound: ask again rather than grow, holding `d` as the first delta
             // the new anchor must reach (Codex r4203051298), and refusing one before the
