@@ -153,14 +153,9 @@ fn e8(text: &str) -> i64 {
 }
 
 /// An `OrderEvent` (template 20) at schema 1:2 in its 128-byte block layout, as
-/// `fixtures/paradex/exec/README.md` describes it: our post-only limit buy `cid` of `size` at
-/// `price`, venue id `vid`, CLOSED by USER_CANCELED with nothing filled. The account is 32
-/// made-up bytes.
-fn order_closed(seq: i64, vid: &str, cid: &str, price: &str, size: &str) -> Vec<u8> {
-    order_closed_on(1, seq, vid, cid, price, size)
-}
-
-/// As [`order_closed`], on `side` (1 BUY, 2 SELL).
+/// `fixtures/paradex/exec/README.md` describes it: our post-only limit order `cid` on `side`
+/// (1 BUY, 2 SELL) of `size` at `price`, venue id `vid`, CLOSED by USER_CANCELED with nothing
+/// filled. The account is 32 made-up bytes.
 fn order_closed_on(side: u8, seq: i64, vid: &str, cid: &str, price: &str, size: &str) -> Vec<u8> {
     order_event(side, seq, vid, cid, price, size, size, "USER_CANCELED")
 }
@@ -206,6 +201,40 @@ fn order_event(
     f
 }
 
+/// A `FillEvent` (template 21) at version 1 in its 107-byte block layout, as
+/// `fixtures/paradex/exec/README.md` describes it: our buy `cid` (venue id `vid`) made one step
+/// (0.00001) at `price` for no fee. The account is 32 made-up bytes.
+fn fill_event(seq: i64, vid: &str, cid: &str, price: &str) -> Vec<u8> {
+    let ts = 1_759_500_000_204_011i64;
+    let mut f = Vec::new();
+    for v in [107u16, 21, 1, 1] {
+        f.extend(v.to_le_bytes());
+    }
+    f.extend(ts.to_le_bytes());
+    f.extend(seq.to_le_bytes());
+    f.extend([1u8, 1, 1]); // FILL, BUY, MAKER
+    f.extend(e8(price).to_le_bytes());
+    f.extend(e8("0.00001").to_le_bytes()); // size
+    f.extend(0i64.to_le_bytes()); // fee
+    f.extend(i64::MIN.to_le_bytes()); // realizedPnl: null
+    f.extend(ts.to_le_bytes()); // createdAt
+    f.extend(0xa0u8..=0xbf); // account, made up
+    f.extend(e8(price).to_le_bytes()); // underlyingPrice
+    f.extend(0i64.to_le_bytes()); // realizedFunding
+    assert_eq!(f.len(), 8 + 107);
+    for s in [
+        "8615262148007719001",
+        vid,
+        cid,
+        "9615262148007719001",
+        MARKET,
+    ] {
+        f.push(u8::try_from(s.len()).unwrap());
+        f.extend(s.as_bytes());
+    }
+    f
+}
+
 /// What the stub saw of the place, for the cancel's order event.
 #[derive(Default)]
 struct Placed {
@@ -218,7 +247,44 @@ struct Placed {
 /// subscriptions with an empty result, the arm with `enabled: true`, the place with its order
 /// under [`VID`], the cancel queued and then the order event closing the order.
 fn responder(placed: Arc<Mutex<Placed>>) -> Responder {
-    responder_with(placed, Arc::new(Vec::new()), true, false)
+    responder_with(placed, Arc::new(Vec::new()), End::Canceled, End::Canceled)
+}
+
+/// How the stub ends an order it is asked to cancel, in the order event after the cancel's
+/// reply.
+#[derive(Clone, Copy)]
+enum End {
+    /// CLOSED by USER_CANCELED with nothing filled.
+    Canceled,
+    /// CLOSED by USER_CANCELED with one step (0.00001) of it filled first; for the placed
+    /// order the fill's own event comes before the order event.
+    PartlyFilled,
+    /// CLOSED with nothing open and no cancel reason: a fill raced the cancel.
+    Filled,
+    /// A batch's restored orders only: the second item `ALREADY_CLOSED` and no order event.
+    Refused,
+}
+
+/// The order event ending an order of `size` at `price` as `end` says.
+#[allow(clippy::too_many_arguments)]
+fn order_ended(
+    end: End,
+    side: u8,
+    seq: i64,
+    vid: &str,
+    cid: &str,
+    price: &str,
+    size: &str,
+) -> Vec<u8> {
+    match end {
+        End::Canceled | End::Refused => order_closed_on(side, seq, vid, cid, price, size),
+        End::PartlyFilled => {
+            let open = Decimal::from_str(size).unwrap() - Decimal::from_str("0.00001").unwrap();
+            let open = open.to_string();
+            order_event(side, seq, vid, cid, price, size, &open, "USER_CANCELED")
+        }
+        End::Filled => order_event(side, seq, vid, cid, price, size, "0", ""),
+    }
 }
 
 /// An open order of ours an earlier run left: its venue id and wire client id, a post-only sell
@@ -229,15 +295,16 @@ struct Restored {
 }
 
 /// As [`responder`], answering a batch cancel of `restored` too: every item queued and then
-/// each order's event closing it when `close`, otherwise the second item `ALREADY_CLOSED` and no
-/// order event. When `fills`, the order event after the cancel's reply reports the placed
-/// order FILLED (closed with nothing open and no cancel reason): the fill raced the cancel.
+/// each order's event ending it as `restored_end` says, or, for [`End::Refused`], the second
+/// item `ALREADY_CLOSED` and no order event. The placed order's cancel is answered by an order
+/// event ending it as `placed_end` says.
 fn responder_with(
     placed: Arc<Mutex<Placed>>,
     restored: Arc<Vec<Restored>>,
-    close: bool,
-    fills: bool,
+    placed_end: End,
+    restored_end: End,
 ) -> Responder {
+    let close = !matches!(restored_end, End::Refused);
     Responder::new(move |frame| {
         let Frame::Text(text) = frame else {
             return Err("a binary frame from the client".to_owned());
@@ -266,12 +333,13 @@ fn responder_with(
             "order.cancel" => {
                 let p = placed.lock().unwrap();
                 let queued = ok(json!({"order_id": VID, "status": "QUEUED_FOR_CANCELLATION"}));
-                let closed = if fills {
-                    order_event(1, 5_001, VID, &p.cid, &p.price, &p.size, "0", "")
-                } else {
-                    order_closed(5_001, VID, &p.cid, &p.price, &p.size)
-                };
-                Ok(vec![queued, Frame::Binary(closed)])
+                let closed = order_ended(placed_end, 1, 5_001, VID, &p.cid, &p.price, &p.size);
+                let mut frames = vec![queued];
+                if matches!(placed_end, End::PartlyFilled) {
+                    frames.push(Frame::Binary(fill_event(5_000, VID, &p.cid, &p.price)));
+                }
+                frames.push(Frame::Binary(closed));
+                Ok(frames)
             }
             "order.cancel_batch" => {
                 let ids = params["order_ids"].as_array().cloned().unwrap_or_default();
@@ -291,7 +359,8 @@ fn responder_with(
                     results.push(json!({"id": vid, "market": MARKET, "status": status}));
                     if close {
                         let seq = 6_000 + i64::try_from(i).unwrap();
-                        let ev = order_closed_on(2, seq, vid, &ours.cid, "70000", "0.00001");
+                        let ev =
+                            order_ended(restored_end, 2, seq, vid, &ours.cid, "70000", "0.00001");
                         events.push(Frame::Binary(ev));
                     }
                 }
@@ -334,8 +403,8 @@ fn restored() -> (Vec<Restored>, String) {
 }
 
 /// The happy script with the batch cancel of the restored orders after it.
-fn restored_script(placed: Arc<Mutex<Placed>>, restored: Vec<Restored>, close: bool) -> WsScript {
-    let with = responder_with(placed, Arc::new(restored), close, false);
+fn restored_script(placed: Arc<Mutex<Placed>>, restored: Vec<Restored>, end: End) -> WsScript {
+    let with = responder_with(placed, Arc::new(restored), End::Canceled, end);
     let mut steps = vec![Step::Accept];
     steps.extend((0..9).map(|_| Step::Respond {
         conn: 0,
@@ -874,7 +943,7 @@ async fn stop_cancels_an_earlier_runs_orders_and_waits_for_them_to_end() {
     let cids: Vec<String> = orders.iter().map(|o| o.cid.clone()).collect();
     let placed = Arc::new(Mutex::new(Placed::default()));
     let stub = StubServer::start(
-        restored_script(Arc::clone(&placed), orders, true),
+        restored_script(Arc::clone(&placed), orders, End::Canceled),
         routes_with(body),
     )
     .await
@@ -910,7 +979,7 @@ async fn a_batch_cancel_with_an_item_refused_and_no_order_event_fails_the_stop()
     let (orders, body) = restored();
     let placed = Arc::new(Mutex::new(Placed::default()));
     let stub = StubServer::start(
-        restored_script(Arc::clone(&placed), orders, false),
+        restored_script(Arc::clone(&placed), orders, End::Refused),
         routes_with(body),
     )
     .await
@@ -971,10 +1040,16 @@ fn the_snapshot_floor_is_the_highest_of_our_ids_it_shows() {
     assert_eq!(trade::snapshot_max(&snap), 43);
 }
 
-#[tokio::test]
-async fn an_order_that_fills_instead_of_cancelling_fails_the_run() {
+/// Runs testnet_trade against a stub whose cancel of the placed order ends it as `end`, with
+/// no open order or position on the market: its report and what it printed.
+async fn run_with_placed_end(end: End) -> (trade::Report, String) {
     let placed = Arc::new(Mutex::new(Placed::default()));
-    let with = responder_with(Arc::clone(&placed), Arc::new(Vec::new()), true, true);
+    let with = responder_with(
+        Arc::clone(&placed),
+        Arc::new(Vec::new()),
+        end,
+        End::Canceled,
+    );
     let mut script = vec![Step::Accept];
     script.extend((0..8).map(|_| Step::Respond {
         conn: 0,
@@ -984,8 +1059,14 @@ async fn an_order_that_fills_instead_of_cancelling_fails_the_run() {
         .await
         .unwrap();
     let opts = options(&stub, "10");
-    let (report, printed) = run_against(&opts).await;
+    let ran = run_against(&opts).await;
     stub.finished().await.unwrap();
+    ran
+}
+
+#[tokio::test]
+async fn an_order_that_fills_instead_of_cancelling_fails_the_run() {
+    let (report, printed) = run_with_placed_end(End::Filled).await;
     assert!(!report.ok, "{printed}");
     assert!(
         printed.contains("the order ended without being cancelled: Filled"),
@@ -993,4 +1074,56 @@ async fn an_order_that_fills_instead_of_cancelling_fails_the_run() {
     );
     assert!(!printed.contains("STEP closed"), "{printed}");
     assert!(printed.contains("DONE failed"), "{printed}");
+}
+
+#[tokio::test]
+async fn an_order_cancelled_after_a_partial_fill_fails_the_run() {
+    // Paradex ends a post-only order whose remainder was cancelled after a maker fill CLOSED
+    // by USER_CANCELED with less than its size open: a trade happened, so the round trip did
+    // not.
+    let (report, printed) = run_with_placed_end(End::PartlyFilled).await;
+    assert!(!report.ok, "{printed}");
+    assert!(
+        printed.contains("the order was cancelled after 1 lots of it filled; inventory now 1 lots"),
+        "{printed}"
+    );
+    // The backstop sees the fill too.
+    assert!(
+        printed.contains("the inventory moved from 0 to 1 lots during the run"),
+        "{printed}"
+    );
+    assert!(!printed.contains("STEP closed"), "{printed}");
+    assert!(printed.contains("DONE failed"), "{printed}");
+}
+
+#[tokio::test]
+async fn stop_fails_when_an_earlier_runs_orders_fill_instead_of_cancelling() {
+    for (end, said) in [
+        (
+            End::Filled,
+            "a Stop cancel's order ended without being cancelled: Filled",
+        ),
+        (
+            End::PartlyFilled,
+            "a Stop cancel's order was cancelled after 1 lots of it filled",
+        ),
+    ] {
+        let (orders, body) = restored();
+        let placed = Arc::new(Mutex::new(Placed::default()));
+        let stub = StubServer::start(
+            restored_script(Arc::clone(&placed), orders, end),
+            routes_with(body),
+        )
+        .await
+        .unwrap();
+        let opts = options(&stub, "10");
+        let (report, printed) = run_against(&opts).await;
+        stub.finished().await.unwrap();
+        // The new order's round trip happened, and both restored orders ended, but not by the
+        // cancel alone: Stop did not cancel them untouched.
+        assert!(printed.contains("STEP closed"), "{printed}");
+        assert!(!report.ok, "{printed}");
+        assert_eq!(printed.matches(said).count(), 2, "{printed}");
+        assert!(printed.contains("DONE failed"), "{printed}");
+    }
 }

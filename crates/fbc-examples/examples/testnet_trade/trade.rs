@@ -239,6 +239,7 @@ pub async fn run(
         hold: Duration::from_secs(opts.hold_secs),
         hwm,
         told: std::cell::Cell::new(0),
+        start_position: None,
     };
     let order = Planned {
         side: match opts.side {
@@ -615,6 +616,8 @@ struct Driver {
     hwm: HighWater,
     /// How many of the link's notes were looked at for [`Driver::tell`].
     told: std::cell::Cell<usize>,
+    /// The market's inventory once Start armed it: a round trip leaves it unchanged.
+    start_position: Option<SignedLots>,
 }
 
 impl Driver {
@@ -676,8 +679,8 @@ impl Driver {
         link.outcome_of(rpc)
     }
 
-    /// The run: every step, then Stop whatever happened; true when every step happened and
-    /// Stop cancelled what was left.
+    /// The run: every step, then Stop whatever happened; true when every step happened, Stop
+    /// cancelled what was left, and no fill moved the inventory.
     async fn run(
         mut self,
         order: Planned,
@@ -688,8 +691,26 @@ impl Driver {
     ) -> bool {
         let ok = self.steps(order, ns_lease, persisted, leases).await;
         let stopped = self.stop().await;
+        let unmoved = self.inventory_unmoved();
         drop(control);
-        ok && stopped
+        ok && stopped && unmoved
+    }
+
+    /// True unless the market's inventory now differs from what it was at Start: a backstop
+    /// for a fill the order checks did not see.
+    fn inventory_unmoved(&self) -> bool {
+        let Some(start) = self.start_position else {
+            return true;
+        };
+        let now = self.link.borrow_mut().reg().inventory(INST);
+        if now == start {
+            return true;
+        }
+        self.note(format_args!(
+            "the inventory moved from {} to {} lots during the run: a fill happened",
+            start.0, now.0
+        ));
+        false
     }
 
     /// Login, arm, resync, seed, Start, place, ack, cancel, cancel ack, closed: false at the
@@ -800,14 +821,17 @@ impl Driver {
                 ));
             }
             match reg.start(INST, leases) {
-                Ok(entry) => self.lines.step(
-                    "start",
-                    format_args!(
-                        "armed: {:?}, generation {}",
-                        entry.state(),
-                        entry.generation().get()
-                    ),
-                ),
+                Ok(entry) => {
+                    self.lines.step(
+                        "start",
+                        format_args!(
+                            "armed: {:?}, generation {}",
+                            entry.state(),
+                            entry.generation().get()
+                        ),
+                    );
+                    self.start_position = Some(reg.inventory(INST));
+                }
                 Err(refusal) => {
                     drop(link);
                     self.note(format_args!("Start was refused: {refusal:?}"));
@@ -947,20 +971,33 @@ impl Driver {
         }
 
         let closed = self
-            .wait(|l| match l.reg().get(cid).map(|r| r.state()) {
-                Some(OrdState::Terminal(kind)) => Some(kind),
-                _ => None,
-            })
+            .wait(
+                |l| match l.reg().get(cid).map(|r| (r.state(), r.filled())) {
+                    Some((OrdState::Terminal(kind), filled)) => Some((kind, filled)),
+                    _ => None,
+                },
+            )
             .await;
         match closed {
-            Some(kind @ TerminalKind::Canceled(_)) => {
+            Some((kind @ TerminalKind::Canceled(_), Lots::ZERO)) => {
                 self.lines.step(
                     "closed",
                     format_args!("the order event reports it ended: {kind:?}"),
                 );
                 true
             }
-            Some(kind) => {
+            Some((TerminalKind::Canceled(_), filled)) => {
+                // Cancelled after a maker fill: a trade happened and left a position, so the
+                // round trip did not.
+                let position = self.link.borrow_mut().reg().inventory(INST).0;
+                self.note(format_args!(
+                    "the order was cancelled after {} lots of it filled; inventory now \
+                     {position} lots",
+                    filled.get()
+                ));
+                false
+            }
+            Some((kind, _)) => {
                 // A fill (or a reject or expiry) is not the round trip asked for: a filled
                 // order leaves a position, so the run fails.
                 let position = self.link.borrow_mut().reg().inventory(INST).0;
@@ -1041,6 +1078,9 @@ impl Driver {
             self.submit_stop_cancel(cmd, &mut rpcs);
         }
         let mut waiting = waiting;
+        // Orders that ended while their cancel waited for an acknowledgement: no cancel was
+        // sent for them, so how they ended is checked with the cancelled ones.
+        let mut ended_waiting = Vec::new();
         if !waiting.is_empty() {
             self.note(format_args!(
                 "{} orders not yet acknowledged: their cancels wait for the acknowledgement \
@@ -1076,6 +1116,7 @@ impl Driver {
                 break;
             };
             waiting.retain(|cid| !ended.contains(cid) && !due.contains(cid));
+            ended_waiting.extend(ended);
             for cid in due {
                 let built = {
                     let mut link = self.link.borrow_mut();
@@ -1104,10 +1145,14 @@ impl Driver {
             }
         }
         // A queued cancel is not a done one: every order a Stop cancel named must be reported
-        // ended before Stop counts as done.
+        // cancelled, with nothing of it filled, before Stop counts as done; a fill racing the
+        // cancel leaves a position.
         let named: Vec<ClientOrderId> = {
             let link = self.link.borrow();
-            rpcs.iter().flat_map(|rpc| link.cids_of(*rpc)).collect()
+            rpcs.iter()
+                .flat_map(|rpc| link.cids_of(*rpc))
+                .chain(ended_waiting)
+                .collect()
         };
         if !named.is_empty() {
             let ended = self
@@ -1125,6 +1170,37 @@ impl Driver {
                     "stop",
                     "the order events reporting Stop's cancelled orders ended",
                 );
+            } else {
+                let ends: Vec<(TerminalKind, Lots)> = {
+                    let mut link = self.link.borrow_mut();
+                    let reg = link.reg();
+                    named
+                        .iter()
+                        .filter_map(|cid| reg.get(*cid))
+                        .filter_map(|r| match r.state() {
+                            OrdState::Terminal(kind) => Some((kind, r.filled())),
+                            _ => None,
+                        })
+                        .collect()
+                };
+                for end in ends {
+                    match end {
+                        (TerminalKind::Canceled(_), Lots::ZERO) => {}
+                        (TerminalKind::Canceled(_), filled) => {
+                            accepted = false;
+                            self.note(format_args!(
+                                "a Stop cancel's order was cancelled after {} lots of it filled",
+                                filled.get()
+                            ));
+                        }
+                        (kind, _) => {
+                            accepted = false;
+                            self.note(format_args!(
+                                "a Stop cancel's order ended without being cancelled: {kind:?}"
+                            ));
+                        }
+                    }
+                }
             }
         }
         self.link.borrow_mut().reg().disarm(INST);
