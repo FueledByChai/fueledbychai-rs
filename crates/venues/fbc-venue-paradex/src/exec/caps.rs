@@ -144,9 +144,14 @@ pub fn exec_caps() -> ExecCaps {
             cancel_all_instrument: Support::Native,
             // `order-cancel-on-disconnect`: orders placed or tracked during the connection are
             // cancelled "if the WebSocket disconnects unexpectedly", and the state "does not
-            // persist across reconnects", so it is requested again on every connection.
+            // persist across reconnects", so it is requested again on every connection. No
+            // page says whether an arm on a new connection covers the orders already open when
+            // it is enabled, so it is declared not to: the session cancels what a resync shows
+            // resting before it places or amends on those markets, until FBC-8xr's testnet run
+            // shows otherwise and a new record flips it (FBC-nvxn).
             cancel_on_disconnect: CancelOnDisconnect::PerConnection {
                 rearm_on_reconnect: true,
+                covers_open_orders: false,
             },
             // "Create batch of orders": "Orders are queued for risk checking independently",
             // so an accepted order (status NEW) can still be closed by the risk check. The

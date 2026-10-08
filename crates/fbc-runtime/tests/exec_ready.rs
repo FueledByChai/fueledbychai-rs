@@ -140,6 +140,7 @@ impl VenueFactory for ReadyToy {
             Some("once") => {
                 let once = CancelOnDisconnect::PerConnection {
                     rearm_on_reconnect: false,
+                    covers_open_orders: false,
                 };
                 order.cancel_on_disconnect = once;
             }

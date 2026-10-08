@@ -586,6 +586,7 @@ fn caps_truthful_names_limits_and_references_narrower_than_the_toy_takes() {
         o.query_refs = TagSet::of(&[RefKind::Venue]);
         o.cancel_on_disconnect = CancelOnDisconnect::PerConnection {
             rearm_on_reconnect: true,
+            covers_open_orders: false,
         };
         // No one order is both IOC and FOK: the pair is not probed. An RPI FOK order is
         // refused for its undeclared parts before its conflict.

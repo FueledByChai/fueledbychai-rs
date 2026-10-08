@@ -169,7 +169,8 @@ fn every_order_and_fill_capability_is_the_value_the_record_states() {
     assert_eq!(
         o.cancel_on_disconnect,
         CancelOnDisconnect::PerConnection {
-            rearm_on_reconnect: true
+            rearm_on_reconnect: true,
+            covers_open_orders: false,
         }
     );
     assert_eq!(

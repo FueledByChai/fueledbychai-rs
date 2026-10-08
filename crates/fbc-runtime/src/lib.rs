@@ -112,6 +112,14 @@ mod tls;
 mod transport;
 pub mod ws;
 
+/// The conformance toy, whose decode scope builds the venue ids the unit tests need. Its path
+/// goes through `tests/`, as the integration tests' include of it does, so the coverage report
+/// leaves it out as it leaves theirs (the toy is measured in fbc-conformance).
+#[cfg(test)]
+#[path = "../tests/../../fbc-conformance/src/toy/mod.rs"]
+#[allow(dead_code, unused_imports)]
+mod toy;
+
 // Decision 0079: a build that links this crate never has the log facade's TRACE level, since
 // tungstenite writes each frame, the auth frame's session token included, at TRACE. This crate
 // sets `max_level_debug`, but in a build without debug assertions `log` takes a consumer's

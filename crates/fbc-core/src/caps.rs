@@ -121,6 +121,11 @@ pub enum CancelOnDisconnect {
     PerConnection {
         /// The protection lapses with the connection and is requested again on the next.
         rearm_on_reconnect: bool,
+        /// An accepted arm also covers the orders already open on the account when it is
+        /// accepted, not only those placed on the connection after it. Where no venue document
+        /// says so it is `false`, and the order-entry session cancels the orders its resync
+        /// shows resting before it places or amends on their markets (FBC-nvxn).
+        covers_open_orders: bool,
     },
     /// Everything, unless a dead-man timer of at most `max_ttl` is refreshed in time.
     DeadMan {
