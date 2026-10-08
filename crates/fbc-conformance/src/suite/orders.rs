@@ -23,8 +23,8 @@
 //!   `AsyncReject` naming it) or ends it (a terminal `OrderUpdate`).
 //! - `mixed_batch`: a batch of three placements is answered item by item, the first accepted,
 //!   the second rejected and the third never; once its deadline passes, the first is
-//!   `Accepted`, the second `Rejected` and the third `Unknown`, each by its index, and nothing
-//!   is reported for the whole request. The third has no outcome before the clock moves.
+//!   `Accepted`, the second `Rejected` and the third `Unknown`, each by its index (the third
+//!   naming no venue id), and nothing is reported for the whole request. The third has no outcome before the clock moves.
 //! - `unknown_on_timeout`: a placement the stub never answers is reported `Unknown` once at its
 //!   deadline (nothing before the clock moves), naming no other order and no venue id, and is never written a
 //!   second time, however long the clock then runs.
@@ -640,6 +640,22 @@ fn judge_batch(
     if !misnamed.is_empty() {
         let what = format!("items {misnamed:?} name another order's client id than their own");
         breaches.push(Breach::new("ItemRef.cid", what));
+    }
+    // The item the stub never answered names no venue id: the stub sent none (Codex
+    // r4225194879).
+    let fabricated: Vec<_> = outcomes
+        .iter()
+        .filter(|(it, _)| {
+            it.as_ref()
+                .is_some_and(|it| it.idx == 2 && it.vid.is_some())
+        })
+        .collect();
+    if !fabricated.is_empty() {
+        let what = format!(
+            "item 2, which the stub never answered, names a venue id the stub never sent: \
+             {fabricated:?}"
+        );
+        breaches.push(Breach::new("ItemRef.vid", what));
     }
     let beyond: Vec<_> = outcomes
         .iter()
