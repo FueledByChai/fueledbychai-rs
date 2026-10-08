@@ -200,13 +200,17 @@ rather than guess.
     `ControlCommand`, each encoded on its next turn with one reserved nonce per item and
     reported at most once to `ExecHandler::on_submitted` (sent, or `NotSent` with nothing
     written: no authenticated epoch, the codec's refusal, effects that do not carry the request,
-    make an HTTP request or give it a deadline past the end of the clock, the buckets: every
+    make an HTTP request (except a consumer's order query or fee query carried as exactly one
+    HTTP request and no frame, its request and the connection it opens charged with the encode,
+    0081) or give it a deadline past the end of the clock, the buckets: every
     control command, like a place or amend, stops at the safety reserve, while cancels,
     reducing orders, the session's own cancel-on-disconnect arm and the resync may use it,
     0073), an
     authorization kept until its command is encoded, request ids from the account's `RpcIds`
     shared by its sessions, and each unanswered request handed to `on_rpc_timeout` once at its
-    deadline, across a reconnect too, never written again (0057; compile-fail cases in
+    deadline, across a reconnect too, never written again (an HTTP query's deadline standing
+    only once the epoch that asked has ended, and cleared by the `on_http` call for it, 0081)
+    (0057; compile-fail cases in
     `tests/ui_submit/`) (its tests include the conformance toy by path); with a `Journal` set,
     it journals what it sends and receives as a market-data session does, each epoch's opening
     and closing, each nonce it reserves and each context it gives its codec, what its stream
