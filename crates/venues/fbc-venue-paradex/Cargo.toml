@@ -19,11 +19,15 @@ serde_json.workspace = true
 # fbc-conformance, fbc-journal, fbc-runtime and tokio are test-only: the decoder-replay test
 # (tests/replay.rs) runs the codec in fbc-runtime against the conformance kit's stub server,
 # journals the session, and rebuilds fbc-book's books from the journal (design §6 step 12).
-# scripts/check-deps.sh does not count dev-dependencies.
+# fbc-oms and log are test-only too: the offline rehearsal (tests/rehearsal.rs, FBC-8mv) runs
+# fbc-oms, the order-entry session and this codec against the stub, reading the log facade at
+# TRACE. scripts/check-deps.sh does not count dev-dependencies.
 [dev-dependencies]
 fbc-book = { path = "../../fbc-book" }
 fbc-conformance = { path = "../../fbc-conformance" }
 fbc-journal = { path = "../../fbc-journal" }
+fbc-oms = { path = "../../fbc-oms" }
 fbc-runtime = { path = "../../fbc-runtime" }
+log = { workspace = true, features = ["std"] }
 starknet-core.workspace = true
-tokio = { workspace = true, features = ["rt", "macros", "time"] }
+tokio = { workspace = true, features = ["rt", "macros", "time", "sync"] }

@@ -65,6 +65,11 @@ nix = { version = "=0.31.3", default-features = false, features = ["socket", "ui
 # Property tests (FBC-iv2, decision 0037): dev-only, pinned exactly, default features off (no
 # fork, timeout or tempfile); `std` brings rand, regex-syntax and num-traits, all MIT or Apache-2.0.
 proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
+# The log facade tungstenite reports through, the only diagnostic output this stack has
+# (FBC-8mv): already in the lockfile through tokio-tungstenite, pinned exactly, default features
+# off. fbc-runtime depends on it only to compile TRACE out of every build (decision 0079); the
+# Paradex offline rehearsal installs a logger at TRACE to read what is left.
+log = { version = "=0.4.34", default-features = false }
 
 # Stark-curve arithmetic is unusably slow unoptimized; the signer's tests sign thousands of
 # vectors. Optimizing these dependencies in test builds changes no result, only the time.

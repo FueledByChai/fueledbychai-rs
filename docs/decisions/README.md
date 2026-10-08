@@ -81,3 +81,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0076](0076-paradex-s-rpi-inclusive-touch-bbo-market-interactive-is-a-se.md) Paradex's RPI-inclusive touch bbo.{market}.interactive is a second touch source, one touch source per market per connection — accepted
 - [0077](0077-book-channels-of-different-paradex-markets-share-one-sbe-ses.md) Book channels of different Paradex markets share one SBE session, as a captured production session shows, augmenting 0022 and 0074 — accepted
 - [0078](0078-an-order-entry-session-journals-what-it-receives-under-safet.md) An order-entry session journals what it receives under Safety, and each nonce it reserves and context it gives where the call takes it — accepted
+- [0079](0079-the-log-facade-s-trace-level-is-compiled-out-of-every-build-.md) The log facade's TRACE level is compiled out of every build that links fbc-runtime, since tungstenite logs each frame at TRACE — accepted

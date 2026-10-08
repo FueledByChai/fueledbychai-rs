@@ -178,6 +178,8 @@ rather than guess.
     that epoch fed is then gapped until its next snapshot (0039);
     a `Journal` (the consumer's `fbc-journal` sink) set on a session or venue records every input,
     output and connection change under its traffic class and is never waited on (0006);
+    the `log` facade's TRACE level compiled out of every build that links it, since tungstenite
+    logs each frame at TRACE (0079);
     `RateLimiter` keeps a sliding-window bucket per declared limit and scope key, charged by
     each frame's, request's and connection attempt's rate charge, normal traffic stopping at
     the consumer's `SafetyReserve`, refusals and 429/418 counted by scope (0030);
@@ -376,7 +378,9 @@ rather than guess.
     factory's order entry: `caps()` with the `ExecCaps`, one order-entry endpoint on SBE 1:2,
     and the order-entry or read-only codec as `paradex.exec.mode` says, its order signer from
     `auth::order_signer` so no credential is read outside `src/auth` (`src/factory.rs`, 0072);
-    and, in
+    the offline rehearsal (`tests/rehearsal.rs`, FBC-8mv): fbc-oms, the order-entry session and
+    this codec against the conformance stub, the market seeded by hand under a declared testnet
+    run (0067), every record the log facade emits read at TRACE; and, in
     `tests/oracle/` with `fbc-book` as a dev-dependency only, the
     BT-401 book and bbo-touch agreement checks), later `crates/venues/fbc-venue-hibachi`
     (0016).
