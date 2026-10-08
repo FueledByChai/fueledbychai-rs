@@ -1,0 +1,308 @@
+{
+  "results": [
+    {
+      "asset_kind": "PERP",
+      "base_currency": "BTC",
+      "clamp_rate": "0.05",
+      "delta1_cross_margin_params": {
+        "imf_base": "0.11",
+        "imf_factor": "0",
+        "imf_shift": "0",
+        "mmf_factor": "0.51"
+      },
+      "expiry_at": 0,
+      "fee_config": {
+        "api_fee": {
+          "maker_fee": {
+            "fee": "0.00003",
+            "fee_cap": "0.5",
+            "fee_floor": "-0.5"
+          },
+          "taker_fee": {
+            "fee": "0.0003",
+            "fee_cap": "0.5",
+            "fee_floor": "-0.5"
+          }
+        },
+        "interactive_fee": {
+          "maker_fee": {
+            "fee": "0.00003",
+            "fee_cap": "0.5",
+            "fee_floor": "-0.5"
+          },
+          "taker_fee": {
+            "fee": "0.0003",
+            "fee_cap": "0.5",
+            "fee_floor": "-0.5"
+          }
+        },
+        "rpi_fee": {
+          "maker_fee": {
+            "fee": "0.00003",
+            "fee_cap": "0.5",
+            "fee_floor": "-0.5"
+          },
+          "taker_fee": {
+            "fee": "0.0003",
+            "fee_cap": "0.5",
+            "fee_floor": "-0.5"
+          }
+        }
+      },
+      "funding_multiplier": 1,
+      "funding_period_hours": 8,
+      "interest_rate": "0.01",
+      "iv_bands_width": "",
+      "market_kind": "cross",
+      "max_funding_rate": "0.05",
+      "max_funding_rate_change": "0.0005",
+      "max_open_orders": 100,
+      "max_order_size": "50",
+      "max_slippage": "0.05",
+      "max_tob_spread": "0.2",
+      "min_notional": "10",
+      "open_at": 1700000000000,
+      "oracle_ewma_factor": "0.2",
+      "order_size_increment": "0.00001",
+      "position_limit": "100.000015",
+      "price_bands_width": "0.05",
+      "price_feed_id": "SYNTHETIC-FEED-ID",
+      "price_tick_size": "0.1",
+      "quote_currency": "USD",
+      "settlement_currency": "USDC",
+      "strike_price": "",
+      "option_type": "",
+      "symbol": "BTC-USD-PERP",
+      "tags": [],
+      "trading_mode": "STANDARD"
+    },
+    {
+      "asset_kind": "PERP",
+      "base_currency": "ETH",
+      "clamp_rate": "0.05",
+      "delta1_cross_margin_params": {
+        "imf_base": "0.11",
+        "imf_factor": "0",
+        "imf_shift": "0",
+        "mmf_factor": "0.51"
+      },
+      "expiry_at": 0,
+      "fee_config": {
+        "api_fee": {
+          "maker_fee": {
+            "fee": "0.00003",
+            "fee_cap": "0.5",
+            "fee_floor": "-0.5"
+          },
+          "taker_fee": {
+            "fee": "0.0003",
+            "fee_cap": "0.5",
+            "fee_floor": "-0.5"
+          }
+        },
+        "interactive_fee": {
+          "maker_fee": {
+            "fee": "0.00003",
+            "fee_cap": "0.5",
+            "fee_floor": "-0.5"
+          },
+          "taker_fee": {
+            "fee": "0.0003",
+            "fee_cap": "0.5",
+            "fee_floor": "-0.5"
+          }
+        },
+        "rpi_fee": {
+          "maker_fee": {
+            "fee": "0.00003",
+            "fee_cap": "0.5",
+            "fee_floor": "-0.5"
+          },
+          "taker_fee": {
+            "fee": "0.0003",
+            "fee_cap": "0.5",
+            "fee_floor": "-0.5"
+          }
+        }
+      },
+      "funding_multiplier": 1,
+      "funding_period_hours": 1,
+      "interest_rate": "0.01",
+      "iv_bands_width": "",
+      "market_kind": "cross",
+      "max_funding_rate": "0.05",
+      "max_funding_rate_change": "0.0005",
+      "max_open_orders": 50,
+      "max_order_size": "500",
+      "max_slippage": "0.05",
+      "max_tob_spread": "0.2",
+      "min_notional": "10",
+      "open_at": 1700000000000,
+      "oracle_ewma_factor": "0.2",
+      "order_size_increment": "0.001",
+      "position_limit": "2000",
+      "price_bands_width": "0.025",
+      "price_feed_id": "SYNTHETIC-FEED-ID",
+      "price_tick_size": "0.01",
+      "quote_currency": "USD",
+      "settlement_currency": "USDC",
+      "strike_price": "",
+      "option_type": "",
+      "symbol": "ETH-USD-PERP",
+      "tags": [],
+      "trading_mode": "STANDARD"
+    },
+    {
+      "asset_kind": "PERP_OPTION",
+      "base_currency": "BTC",
+      "clamp_rate": "0.05",
+      "delta1_cross_margin_params": {
+        "imf_base": "0.11",
+        "imf_factor": "0",
+        "imf_shift": "0",
+        "mmf_factor": "0.51"
+      },
+      "expiry_at": 0,
+      "fee_config": {
+        "api_fee": {
+          "maker_fee": {
+            "fee": "0.00003",
+            "fee_cap": "0.5",
+            "fee_floor": "-0.5"
+          },
+          "taker_fee": {
+            "fee": "0.0003",
+            "fee_cap": "0.5",
+            "fee_floor": "-0.5"
+          }
+        },
+        "interactive_fee": {
+          "maker_fee": {
+            "fee": "0.00003",
+            "fee_cap": "0.5",
+            "fee_floor": "-0.5"
+          },
+          "taker_fee": {
+            "fee": "0.0003",
+            "fee_cap": "0.5",
+            "fee_floor": "-0.5"
+          }
+        },
+        "rpi_fee": {
+          "maker_fee": {
+            "fee": "0.00003",
+            "fee_cap": "0.5",
+            "fee_floor": "-0.5"
+          },
+          "taker_fee": {
+            "fee": "0.0003",
+            "fee_cap": "0.5",
+            "fee_floor": "-0.5"
+          }
+        }
+      },
+      "funding_multiplier": 1,
+      "funding_period_hours": 24,
+      "interest_rate": "0.01",
+      "iv_bands_width": "0.05",
+      "market_kind": "cross",
+      "max_funding_rate": "0.05",
+      "max_funding_rate_change": "0.0005",
+      "max_open_orders": 100,
+      "max_order_size": "100",
+      "max_slippage": "0.05",
+      "max_tob_spread": "0.2",
+      "min_notional": "10",
+      "open_at": 1700000000000,
+      "oracle_ewma_factor": "0.2",
+      "order_size_increment": "0.001",
+      "position_limit": "100",
+      "price_bands_width": "0.05",
+      "price_feed_id": "SYNTHETIC-FEED-ID",
+      "price_tick_size": "0.5",
+      "quote_currency": "USD",
+      "settlement_currency": "USDC",
+      "strike_price": "67000",
+      "option_type": "CALL",
+      "symbol": "BTC-USD-67000-C",
+      "tags": [],
+      "trading_mode": "STANDARD"
+    },
+    {
+      "asset_kind": "PERP",
+      "base_currency": "SOL",
+      "clamp_rate": "0.05",
+      "delta1_cross_margin_params": {
+        "imf_base": "0.11",
+        "imf_factor": "0",
+        "imf_shift": "0",
+        "mmf_factor": "0.51"
+      },
+      "expiry_at": 0,
+      "fee_config": {
+        "api_fee": {
+          "maker_fee": {
+            "fee": "0.00003",
+            "fee_cap": "0.5",
+            "fee_floor": "-0.5"
+          },
+          "taker_fee": {
+            "fee": "0.0003",
+            "fee_cap": "0.5",
+            "fee_floor": "-0.5"
+          }
+        },
+        "interactive_fee": {
+          "maker_fee": {
+            "fee": "0.00003",
+            "fee_cap": "0.5",
+            "fee_floor": "-0.5"
+          },
+          "taker_fee": {
+            "fee": "0.0003",
+            "fee_cap": "0.5",
+            "fee_floor": "-0.5"
+          }
+        },
+        "rpi_fee": {
+          "maker_fee": {
+            "fee": "0.00003",
+            "fee_cap": "0.5",
+            "fee_floor": "-0.5"
+          },
+          "taker_fee": {
+            "fee": "0.0003",
+            "fee_cap": "0.5",
+            "fee_floor": "-0.5"
+          }
+        }
+      },
+      "funding_multiplier": 1,
+      "funding_period_hours": 8,
+      "interest_rate": "0.01",
+      "iv_bands_width": "",
+      "market_kind": "cross",
+      "max_funding_rate": "0.05",
+      "max_funding_rate_change": "0.0005",
+      "max_open_orders": 100,
+      "max_order_size": "5000",
+      "max_slippage": "0.05",
+      "max_tob_spread": "0.2",
+      "min_notional": "10",
+      "open_at": 1700000000000,
+      "oracle_ewma_factor": "0.2",
+      "order_size_increment": "0.01",
+      "position_limit": "50000",
+      "price_bands_width": "0.05",
+      "price_feed_id": "SYNTHETIC-FEED-ID",
+      "price_tick_size": "0.001",
+      "quote_currency": "USD",
+      "settlement_currency": "USDC",
+      "strike_price": "",
+      "option_type": "",
+      "symbol": "SOL-USD-PERP",
+      "tags": [],
+      "trading_mode": "RFQ_ONLY"
+    }
+  ]
+}

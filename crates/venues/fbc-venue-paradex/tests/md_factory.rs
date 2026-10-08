@@ -165,11 +165,13 @@ fn the_factory_declares_market_data_with_its_cited_limits() {
     let planned = ParadexFactory.plan_exec(&cfg());
     let missing = ConfigError::Missing(fbc_venue_paradex::factory::EXEC_URL);
     assert_eq!(planned, Err(VenueError::Config(missing)));
-    // Discovery and the Java-era ticker rule are not built yet (FBC-l5o): both say so.
+    // Discovery and the Java-era ticker rule (FBC-l5o, discover.rs): discovery needs the REST
+    // base, and says so.
     let ticker = ParadexFactory.parse_fbc_common_symbol("BTC/USDT");
-    assert_eq!(ticker, Err(SymbolError::NoRule));
+    assert_ne!(ticker, Err(SymbolError::NoRule));
     let discovered = ParadexFactory.discover(&cfg()).err();
-    assert_eq!(discovered, Some(VenueError::NoDiscovery));
+    let missing = ConfigError::Missing(fbc_venue_paradex::auth::REST_URL);
+    assert_eq!(discovered, Some(VenueError::Config(missing)));
     let md = &declared.md;
     assert_eq!(md.encoding, Encoding::Sbe);
     assert_eq!(
