@@ -83,6 +83,8 @@ enum Twist {
     StrangerAmended,
     /// A timed-out placement's `Unknown` names another order's client id.
     StrangerOnTimeout,
+    /// A placement's acceptance names item 1 of its single command.
+    PlacedAsItemOne,
 }
 
 /// The toy with its caps edited by `caps` and its codec twisted by `twist`.
@@ -185,6 +187,15 @@ static STRANGER_AMENDED: Variant = Variant {
 static STRANGER_ON_TIMEOUT: Variant = Variant {
     caps: |_| {},
     twist: Twist::StrangerOnTimeout,
+};
+static PLACED_AS_ITEM_ONE: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::PlacedAsItemOne,
+};
+/// The toy declaring that an amended order keeps its venue id, which its events still replace.
+static KEEPS_VID: Variant = Variant {
+    caps: |c| amend(c).keeps_venue_id = true,
+    twist: Twist::None,
 };
 static FAILS_AFTER_TIMEOUT: Variant = Variant {
     caps: |_| {},
@@ -638,6 +649,25 @@ fn vid_on_update(ev: ExecEvent) -> Vec<ExecEvent> {
     vec![outcome, ExecEvent::Order(update)]
 }
 
+/// A placement's acceptance as item 1.
+fn placed_as_item_one(ev: ExecEvent) -> Vec<ExecEvent> {
+    vec![match ev {
+        ExecEvent::Outcome {
+            rpc,
+            item: Some(mut it),
+            outcome: outcome @ SubmitOutcome::Accepted { .. },
+        } if it.vid.is_some() => {
+            it.idx = 1;
+            ExecEvent::Outcome {
+                rpc,
+                item: Some(it),
+                outcome,
+            }
+        }
+        other => other,
+    }]
+}
+
 /// An amended order's update with a client id not canonical.
 fn stranger_amended(ev: ExecEvent) -> Vec<ExecEvent> {
     vec![match ev {
@@ -774,6 +804,7 @@ impl ExecCodec for Twisted {
             Twist::NoNewVid => no_new_vid,
             Twist::VidOnUpdate => vid_on_update,
             Twist::StrangerAmended => stranger_amended,
+            Twist::PlacedAsItemOne => placed_as_item_one,
             Twist::SameVid => same_vid,
             Twist::EarlyAmended => early_amended,
             Twist::WholeAcceptance => whole_acceptance,
@@ -1525,5 +1556,31 @@ fn amend_ack_amends_the_quantity_within_the_instruments_largest_order() {
     assert!(
         matches!(skipped, Ok(Verdict::Skipped { why, .. }) if why.contains("max_order_size")),
         "{skipped:?}"
+    );
+}
+
+#[test]
+fn amend_ack_fails_a_toy_whose_placement_acceptance_names_another_item() {
+    let failure = failed(suite::amend_ack(&PLACED_AS_ITEM_ONE.subject(assumed)));
+    assert!(
+        says(
+            &failure,
+            "ExecCodec::on_frame",
+            "the placement the stub accepted was reported"
+        ),
+        "{failure}"
+    );
+}
+
+#[test]
+fn amend_ack_fails_a_toy_declaring_its_amend_keeps_the_venue_id_that_names_a_new_one() {
+    let failure = failed(suite::amend_ack(&KEEPS_VID.subject(assumed)));
+    assert!(
+        says(
+            &failure,
+            "AmendCaps.keeps_venue_id is true",
+            "names a new venue id"
+        ),
+        "{failure}"
     );
 }

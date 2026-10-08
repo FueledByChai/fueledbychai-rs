@@ -57,7 +57,7 @@ venue for the program's life (`ExecSessionConfig::venue` is `&'static dyn VenueF
 - Each check judges what the session reported (outcomes by request and item, each answered item
   once and naming its own order, an acceptance of the whole request taken as its one item's,
   order updates reported after the amend, every identity an amended update states the amended
-  order's) and what the stub received on every connection: an
+  order's, a new venue id only where `AmendCaps.keeps_venue_id` is false) and what the stub received on every connection: an
   order written once, counted by the frames carrying our client id as the venue's wire spells
   it, so a request rebuilt and signed again counts too (byte-equal frames where the venue sends
   no such id).
