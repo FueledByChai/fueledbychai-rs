@@ -53,7 +53,24 @@
 //!
 //! [`caps_truthful`], [`commands_selfcontained`], [`encode_deterministic`], [`price_grid`] and
 //! [`subscriptions_idempotent`] read no file: they need only the factory and the [`Setup`] the
-//! `setup` function gives, called afresh wherever a check builds a codec.
+//! `setup` function gives, called afresh wherever a check builds a codec. Nor do the
+//! order-entry checks, [`amend_ack`], [`mixed_batch`] and [`unknown_on_timeout`]: they run
+//! fbc-runtime's order-entry session against the [`StubServer`](crate::StubServer), which
+//! answers as the setup's [`OrderEntryStub`] says.
+//!
+//! # The order-entry checks
+//!
+//! The suite knows no venue's protocol, so a venue that declares order entry states, in
+//! [`Setup::order_entry`], how its order entry answers: where its configuration points at the
+//! stub, the HTTP routes it reads, the answer to each frame its session writes as an epoch opens
+//! (authentication, the cancel-on-disconnect arm, a resync showing the account flat with nothing
+//! resting), and its [`Replier`], the venue's answer to a request whose items are each answered
+//! as an [`Answer`] says (decision 0083). Each check builds a fresh setup, so a replier keeping state starts
+//! clean. The session runs on a paused clock the check moves itself, every order command built
+//! and authorized by an fbc-oms registry armed on the first instrument, as a live consumer's are.
+//! These checks take the venue for the program's life, as fbc-runtime's session does
+//! ([`Subject<'static>`](Subject), which the macro's factory, a constant, gives), build a runtime
+//! of their own, and so are not called from inside one.
 //!
 //! # The checks so far
 //!
@@ -90,6 +107,13 @@
 //!   its frame does.
 //! - [`book_channels`]: a book's frames show the order channels its `BookCaps.includes_channels`
 //!   declares, and decode onto that book.
+//! - [`amend_ack`]: an accepted amend surfaces as an `OrderUpdate` in state `Amended`, from the
+//!   venue's event where `AmendCaps.ack` is `ReplacedEvent` and synthesized from the reply where
+//!   it is `RpcReplyOnly`, naming the new venue id where the venue issues one.
+//! - [`mixed_batch`]: a batch with an item accepted, one rejected and one unanswered gives each
+//!   item its outcome, and the timeout marks the unanswered one `Unknown` (decision 0014).
+//! - [`unknown_on_timeout`]: an unanswered request becomes `Unknown` once at its deadline and is
+//!   never written a second time (decision 0005).
 //!
 //! The four market-data checks skip by name a book channel anchored on REST (FBC-fhk4), and a
 //! check's sub-case skipped (a text venue's longer blocks) is listed by name among what it
@@ -110,7 +134,10 @@ mod harness;
 mod idempotent;
 mod ids;
 mod legacy;
+mod live;
+mod orders;
 mod selfcontained;
+mod stub;
 
 use core::fmt;
 use std::path::{Path, PathBuf};
@@ -131,7 +158,9 @@ pub use grid::price_grid;
 pub use idempotent::subscriptions_idempotent;
 pub use ids::{MINTED_BEFORE, ids_roundtrip, restart_cid};
 pub use legacy::legacy_symbols;
+pub use orders::{amend_ack, mixed_batch, unknown_on_timeout};
 pub use selfcontained::commands_selfcontained;
+pub use stub::{Answer, OrderEntryStub, Replier};
 
 /// What the fixtures assume: the instruments, the configuration and the credentials the
 /// factory is given. Credentials here are synthetic, never a real account's (decision 0009).
@@ -149,6 +178,10 @@ pub struct Setup {
     /// The stream the fixture frames are handed to the order-entry codec on: the order-entry
     /// connection's, as the venue's [`plan_exec`](VenueFactory::plan_exec) numbers it.
     pub exec_stream: StreamId,
+    /// How the venue's order entry answers over the stub server, for [`amend_ack`],
+    /// [`mixed_batch`] and [`unknown_on_timeout`]; `None` for a venue that declares no order
+    /// entry (those checks then fail a venue that declares one).
+    pub order_entry: Option<OrderEntryStub>,
 }
 
 /// A command whose encoding is committed as golden bytes: [`signing_golden`] encodes it as
@@ -316,9 +349,24 @@ pub fn run(
     expect(Subject::new(factory, fixtures, setup).and_then(|subject| check(&subject)));
 }
 
+/// Runs `check`, one of the order-entry checks, against the venue `factory` builds, as [`run`]
+/// does: the factory lives for the program, as fbc-runtime's session takes it. The body of the
+/// tests [`suite!`](crate::suite!) writes for [`amend_ack`], [`mixed_batch`] and
+/// [`unknown_on_timeout`].
+pub fn run_live(
+    check: fn(&Subject<'static>) -> Result<Verdict, Failure>,
+    factory: &'static dyn VenueFactory,
+    fixtures: &str,
+    setup: fn() -> Setup,
+) {
+    expect(Subject::new(factory, fixtures, setup).and_then(|subject| check(&subject)));
+}
+
 /// The named suite, one test per check, for the venue `factory` builds: `fixtures` is the
 /// fixture directory relative to the invoking crate's manifest (a string literal), and
-/// `setup` a `fn() -> Setup` giving what the fixtures assume.
+/// `setup` a `fn() -> Setup` giving what the fixtures assume. The factory is a constant
+/// expression (a unit struct, or a `static`), since the order-entry checks take it for the
+/// program's life.
 ///
 /// ```ignore
 /// fbc_conformance::suite! {
@@ -484,6 +532,36 @@ macro_rules! suite {
         fn book_channels() {
             $crate::suite::run(
                 $crate::suite::book_channels,
+                &$factory,
+                concat!(env!("CARGO_MANIFEST_DIR"), "/", $fixtures),
+                $setup,
+            );
+        }
+
+        #[test]
+        fn amend_ack() {
+            $crate::suite::run_live(
+                $crate::suite::amend_ack,
+                &$factory,
+                concat!(env!("CARGO_MANIFEST_DIR"), "/", $fixtures),
+                $setup,
+            );
+        }
+
+        #[test]
+        fn mixed_batch() {
+            $crate::suite::run_live(
+                $crate::suite::mixed_batch,
+                &$factory,
+                concat!(env!("CARGO_MANIFEST_DIR"), "/", $fixtures),
+                $setup,
+            );
+        }
+
+        #[test]
+        fn unknown_on_timeout() {
+            $crate::suite::run_live(
+                $crate::suite::unknown_on_timeout,
                 &$factory,
                 concat!(env!("CARGO_MANIFEST_DIR"), "/", $fixtures),
                 $setup,

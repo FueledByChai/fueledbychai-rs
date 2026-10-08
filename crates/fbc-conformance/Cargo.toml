@@ -1,6 +1,6 @@
 [package]
 name = "fbc-conformance"
-description = "The adapter conformance kit: so far a stub venue server on 127.0.0.1 that plays WebSocket fault scripts, replies computed from the frame read, and HTTP replies by method and path pattern, the reconnect-storm, duplicate-ack and silence-after-subscription scripts, a check of connection attempts against reconnect pacing, the conformance toy venue's order entry, its order and fill events, its answers to queries, batches, resyncs and authentication, its factory and its book channels with their REST anchor and keepalive, and the named conformance suite as a macro with caps_truthful, commands_selfcontained, signing_golden, legacy_symbols, fee_sign, liquidity_reported, position_signed, decoder_deterministic, encode_deterministic, ids_roundtrip, restart_cid, price_grid, continuity, subscriptions_idempotent, no_exch_ts_synthesized and book_channels."
+description = "The adapter conformance kit: so far a stub venue server on 127.0.0.1 that plays WebSocket fault scripts, replies computed from the frame read, and HTTP replies by method and path pattern, the reconnect-storm, duplicate-ack and silence-after-subscription scripts, a check of connection attempts against reconnect pacing, the conformance toy venue's order entry, its order and fill events, its answers to queries, batches, resyncs and authentication, its factory and its book channels with their REST anchor and keepalive, and the named conformance suite as a macro with caps_truthful, commands_selfcontained, signing_golden, legacy_symbols, fee_sign, liquidity_reported, position_signed, decoder_deterministic, encode_deterministic, ids_roundtrip, restart_cid, price_grid, continuity, subscriptions_idempotent, no_exch_ts_synthesized, book_channels, and the order-entry checks amend_ack, mixed_batch and unknown_on_timeout run on fbc-runtime's order-entry session against the stub with fbc-oms authorizing."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,9 +13,17 @@ publish = false
 [dependencies]
 fbc-core = { path = "../fbc-core" }
 fbc-runtime = { path = "../fbc-runtime" }
+# The order-entry checks (amend_ack, mixed_batch, unknown_on_timeout) build and authorize every
+# order command through fbc-oms's registry, as a live consumer does, and name the session's
+# nonce source as the journal does.
+fbc-oms = { path = "../fbc-oms" }
+fbc-journal = { path = "../fbc-journal" }
 # The conformance toy's instrument specs (price grids and size steps are decimals).
 rust_decimal.workspace = true
-tokio = { workspace = true, features = ["rt", "net", "io-util", "macros", "sync", "time"] }
+# test-util: the order-entry checks run fbc-runtime's session on a paused clock they move
+# themselves, so a request's deadline passes when the check says and at no other time. This
+# crate is only ever a dev-dependency of the crates it checks (design §6 step 12).
+tokio = { workspace = true, features = ["rt", "net", "io-util", "macros", "sync", "time", "test-util"] }
 tokio-tungstenite.workspace = true
 futures-util = { workspace = true, features = ["sink", "std"] }
 

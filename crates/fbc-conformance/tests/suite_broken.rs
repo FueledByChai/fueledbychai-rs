@@ -33,6 +33,7 @@ fn assumed() -> Setup {
         creds: Secrets::new(),
         goldens: Vec::new(),
         exec_stream: toy::EXEC_STREAM,
+        order_entry: None,
     }
 }
 
