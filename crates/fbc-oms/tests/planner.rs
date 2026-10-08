@@ -1200,6 +1200,37 @@ fn a_market_in_exit_gets_only_its_exit_orders() {
     );
 }
 
+#[test]
+fn a_short_market_in_exit_gets_only_its_reducing_bids_and_a_level_wanting_nothing_builds_nothing() {
+    // Short 10, Flatten: a bid that reduces is built, an ask is not; a level asking for zero
+    // lots, with no order there, builds nothing.
+    let mut reg = quoting(WIDE, -10);
+    flatten(&mut reg);
+    let mut mint = mint();
+    let mut p = planner();
+    let desired = book()
+        .with(Side::Buy, 0, reducing(quote(9_990, 5)))
+        .with(Side::Buy, 1, quote(9_980, 0))
+        .with(Side::Sell, 0, quote(10_010, 5));
+    let plan = p
+        .plan(&desired, &mut reg, &amending(), ACCT, &mut mint, LATER)
+        .unwrap();
+    assert_eq!(shape(&plan), vec![(Stage::Reducing, "place", Side::Buy, 0)]);
+    assert_eq!(
+        refused(&plan),
+        vec![(
+            Side::Sell,
+            0,
+            PlanRefusal::Place(OmsError::State(StateRefusal::Exit(
+                ExitRefusal::Increasing {
+                    inst: INST,
+                    side: Side::Sell
+                }
+            )))
+        )]
+    );
+}
+
 /// Moves the Quoting market `INST` to Exit by the owner's Flatten.
 fn flatten(reg: &mut Registry) {
     reg.disarm(INST);
