@@ -338,11 +338,14 @@ fn order_ended(
     }
 }
 
-/// An open order of ours an earlier run left: its venue id and wire client id, a post-only sell
-/// of 0.00001 at 70000.
+/// An open order of ours an earlier run left: its venue id and wire client id, a post-only
+/// limit order (a sell at 70000 unless said otherwise).
 struct Restored {
     vid: String,
     cid: String,
+    /// Its side (1 BUY, 2 SELL) and limit price.
+    side: u8,
+    price: &'static str,
     /// Its size and what of it is open (less when it filled in part before the run).
     size: &'static str,
     open: &'static str,
@@ -421,8 +424,15 @@ fn responder_full(
                 if matches!(restored_end, End::FilledBeforeStop) {
                     for (i, r) in restored.iter().enumerate() {
                         let seq = 5_100 + i64::try_from(i).unwrap();
-                        let ev =
-                            order_ended(restored_end, 2, seq, &r.vid, &r.cid, "70000", "0.00001");
+                        let ev = order_ended(
+                            restored_end,
+                            r.side,
+                            seq,
+                            &r.vid,
+                            &r.cid,
+                            r.price,
+                            "0.00001",
+                        );
                         frames.push(Frame::Binary(ev));
                     }
                 }
@@ -451,22 +461,22 @@ fn responder_full(
                         // Cancelled with what was open: an earlier fill stays filled.
                         let ev = match restored_end {
                             End::Canceled => order_event(
-                                2,
+                                ours.side,
                                 seq,
                                 vid,
                                 &ours.cid,
-                                "70000",
+                                ours.price,
                                 ours.size,
                                 ours.open,
                                 "USER_CANCELED",
                             ),
                             _ => order_ended(
                                 restored_end,
-                                2,
+                                ours.side,
                                 seq,
                                 vid,
                                 &ours.cid,
-                                "70000",
+                                ours.price,
                                 "0.00001",
                             ),
                         };
@@ -491,6 +501,17 @@ fn restored() -> (Vec<Restored>, String) {
 
 /// As [`restored`], each order of `size` with `open` of it open.
 fn restored_sized(size: &'static str, open: &'static str) -> (Vec<Restored>, String) {
+    restored_as(2, "70000", size, open)
+}
+
+/// As [`restored`], each order on `side` (1 BUY, 2 SELL) at `price`, of `size` with `open` of
+/// it open.
+fn restored_as(
+    side: u8,
+    price: &'static str,
+    size: &'static str,
+    open: &'static str,
+) -> (Vec<Restored>, String) {
     use fbc_core::{AccountKey, CidMint, Namespace, NamespaceLease, WallNs, encode_cid};
     let lease =
         NamespaceLease::acquire(&lease_dir(), AccountKey::new(1), Namespace::new(1)).unwrap();
@@ -501,6 +522,8 @@ fn restored_sized(size: &'static str, open: &'static str) -> (Vec<Restored>, Str
         .map(|vid| Restored {
             vid: vid.to_owned(),
             cid: encode_cid(&fmt, mint.mint().unwrap()).unwrap().to_string(),
+            side,
+            price,
             size,
             open,
         })
@@ -509,8 +532,9 @@ fn restored_sized(size: &'static str, open: &'static str) -> (Vec<Restored>, Str
         .iter()
         .map(|o| {
             json!({
-                "id": o.vid, "client_id": o.cid, "market": MARKET, "side": "SELL",
-                "type": "LIMIT", "instruction": "POST_ONLY", "price": "70000",
+                "id": o.vid, "client_id": o.cid, "market": MARKET,
+                "side": if o.side == 1 { "BUY" } else { "SELL" },
+                "type": "LIMIT", "instruction": "POST_ONLY", "price": o.price,
                 "size": o.size, "remaining_size": o.open, "status": "OPEN", "flags": [],
             })
         })
@@ -2197,5 +2221,117 @@ fn an_order_of_ours_that_filled_since_the_run_took_it_on_is_reported_traded() {
     assert_eq!(
         trade::account_changes(&[], &reg, None, &owned),
         ["an order of ours traded during the run: venue order V-1 has 2 lots filled"]
+    );
+}
+
+#[tokio::test]
+async fn an_order_of_ours_resting_on_the_orders_side_refuses_the_place() {
+    // Codex r4215880971: the registry sums resting lots, and the run converts --resting-cap-usd
+    // to lots at the new order's price only. Two restored buys of 9 lots each at 62000, near
+    // the touch, and the new buy of 22 lots at 49600.1 (2000 bps behind the bid of 62000.2)
+    // make 40 lots, the $20 cap's 40 at 49600.1, so the registry admits them, yet $22.07 would
+    // rest. The run refuses to place while an order of ours rests on the order's side, and Stop
+    // cancels the restored ones.
+    let (orders, body) = restored_as(1, "62000", "0.00009", "0.00009");
+    let placed = Arc::new(Mutex::new(Placed::default()));
+    let with = responder_with(
+        Arc::clone(&placed),
+        Arc::new(orders),
+        End::Canceled,
+        End::Canceled,
+    );
+    // Auth, four subscriptions, the arm and Stop's batch cancel of the restored orders.
+    let mut script = vec![Step::Accept];
+    script.extend((0..7).map(|_| Step::Respond {
+        conn: 0,
+        with: with.clone(),
+    }));
+    let stub = StubServer::start(WsScript::new(script), routes_with(body))
+        .await
+        .unwrap();
+    let mut opts = options(&stub, "10");
+    opts.away_bps = 2000;
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(!report.ok, "{printed}");
+    assert!(
+        printed.contains(
+            "2 orders of ours (18 lots) rest on the order's side: the resting cap is counted \
+             in lots at the order's price, not theirs; cancel them first; nothing placed"
+        ),
+        "{printed}"
+    );
+    // Stop's one batch cancel ended both restored orders.
+    assert_eq!(
+        (report.places_sent, report.cancels_sent),
+        (0, 1),
+        "{printed}"
+    );
+    assert!(!printed.contains("did not end cancelled"), "{printed}");
+    assert!(!methods(&stub).iter().any(|m| m == "order.create"));
+    assert!(printed.contains("DONE failed"), "{printed}");
+}
+
+#[test]
+fn the_orders_of_ours_resting_on_a_side_are_those_open_on_it() {
+    // A restored buy of 3 lots with 1 filled, a restored sell of 4, and an id the registry does
+    // not hold: on each side, the restored order there with what of it rests.
+    use fbc_core::{
+        AccountKey, CidMatch, CidMint, InstrumentId, Lots, MonoNs, Namespace, NamespaceLease, Side,
+        VenueOrderSnapshot, VenueOrderState, WallNs,
+    };
+    use fbc_oms::{LadderConfig, OrderKey, Registry, ResyncSnapshot};
+    let lease =
+        NamespaceLease::acquire(&lease_dir(), AccountKey::new(1), Namespace::new(1)).unwrap();
+    let mut mint = CidMint::new(lease, 0, 0, WallNs(0));
+    let (buy, sell, unheld) = (
+        mint.mint().unwrap(),
+        mint.mint().unwrap(),
+        mint.mint().unwrap(),
+    );
+    let caps = fbc_venue_paradex::factory::caps();
+    let shown = |cid, vid: &str, side, qty, filled| VenueOrderSnapshot {
+        cid: Some(CidMatch::Ours(cid)),
+        vid: fbc_core::dispatch(&caps, Namespace::new(1), |s| s.venue_order_id(vid)).unwrap(),
+        inst: InstrumentId::new(1),
+        side,
+        state: VenueOrderState::Open,
+        px: None,
+        qty: Lots::new(qty).unwrap(),
+        cum_filled: Lots::new(filled).unwrap(),
+        post_only: None,
+        reduce_only: None,
+    };
+    let order_caps = caps.exec.clone().unwrap().order;
+    let ladder = LadderConfig::new(
+        Duration::from_secs(5),
+        Duration::from_secs(1),
+        Duration::from_secs(60),
+        2,
+    )
+    .unwrap();
+    let mut reg = Registry::new();
+    let snap = ResyncSnapshot {
+        watermark: WallNs(0),
+        requested_at: MonoNs(0),
+        orders: vec![
+            shown(buy, "V-1", Side::Buy, 3, 1),
+            shown(sell, "V-2", Side::Sell, 4, 0),
+        ],
+        positions: vec![],
+    };
+    let key = OrderKey {
+        venue: Some(1),
+        ingest: 1,
+    };
+    reg.resync(&ladder, &order_caps, &snap, key).unwrap();
+    let owned = [(buy, Lots::ZERO), (sell, Lots::ZERO), (unheld, Lots::ZERO)];
+    assert_eq!(
+        trade::resting_on_side(&reg, &owned, Side::Buy),
+        [(buy, Lots::new(2).unwrap())]
+    );
+    assert_eq!(
+        trade::resting_on_side(&reg, &owned, Side::Sell),
+        [(sell, Lots::new(4).unwrap())]
     );
 }
