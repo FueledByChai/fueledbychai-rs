@@ -53,7 +53,11 @@ bound the answer.
   snapshot read after them (a resync over HTTP while the stream runs) does not undo them.
   Nothing else releases a market: a cancel the venue refuses (an order it no longer knows, or
   one already terminal) leaves it held until the consumer queries the order or the next epoch
-  that sends an arm reads the venue again.
+  that sends an arm reads the venue again. The same holds for an order a snapshot shows resting
+  after an event on an earlier epoch ended it (a snapshot lagging the stream): the consumer's
+  registry holds it ended and builds no cancel, so the consumer queries it, and the venue's
+  answer showing it ended releases the market. The runtime keeps no record of the ends of
+  earlier epochs, which would grow with every order the session ever saw end.
 
 ## Alternatives
 
