@@ -76,6 +76,8 @@ const CALL_NONCES: &str = "call.nonces";
 /// Any value: the `auth_toy` session's codec names a span past the end of every frame (a codec
 /// defect).
 const BAD_SPANS: &str = "bad.spans";
+/// A frame the `auth_toy` session's codec panics redacting (a codec defect).
+const PANIC_ON: &str = "panic.on";
 /// The conformance toy's acknowledgement of its authentication, echoing its token.
 const AUTH_ACK: &str = "auth|ok=1|token=toy-session-token";
 
@@ -344,6 +346,7 @@ fn auth_toy(cfg: &VenueConfig) -> Box<dyn ExecCodec> {
         login: cfg.get(LOGIN).unwrap().to_owned(),
         call_nonces: cfg.get(CALL_NONCES).unwrap().parse().unwrap(),
         bad_spans: cfg.get(BAD_SPANS).is_some(),
+        panic_on: cfg.get(PANIC_ON).map(str::to_owned),
     })
 }
 
@@ -355,6 +358,7 @@ struct AuthWrap {
     login: String,
     call_nonces: u16,
     bad_spans: bool,
+    panic_on: Option<String>,
 }
 
 impl AuthWrap {
@@ -465,6 +469,9 @@ impl ExecCodec for AuthWrap {
 
     fn redact_inbound(&self, input: Inbound<'_>) -> InboundSpans {
         match input {
+            Inbound::Frame(f) if self.panic_on.as_deref().map(str::as_bytes) == Some(f.bytes()) => {
+                panic!("the codec fails redacting")
+            }
             Inbound::Frame(f) if self.bad_spans => {
                 let past = u32::try_from(f.bytes().len()).unwrap() + 1;
                 let span = 0..past;
@@ -1391,4 +1398,79 @@ async fn an_ended_epochs_http_result_keeps_what_the_one_codec_does_not_name() {
     assert_eq!(resp.body.0, kept.as_bytes());
     let toy = resp.headers.iter().find(|h| h.name == "x-toy").unwrap();
     assert_eq!((toy.value.as_str(), toy.redact), ("yes", false));
+}
+
+/// Codex P2 r4214243083 on PR #115 (Reviewer A, Reviewer B RB-2pr-1): an epoch journaled closed
+/// as the control drops stays closed once, when the codec panics redacting the frame waiting
+/// then and the session is dropped as the panic unwinds.
+#[test]
+fn an_epoch_closed_at_a_stop_is_journaled_closed_once_when_redacting_a_waiting_frame_panics() {
+    let root = fresh_dir("exec_journal_stop_panic");
+    let (queue, writer) = queue_at(&root);
+    let queue = Rc::new(RefCell::new(queue));
+    let journal = Journal::new(Rc::clone(&queue));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let boom = "boom";
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.block_on(async {
+            let mut server = ScriptedWs::start().await;
+            let http = ScriptedHttp::start().await;
+            let venue = Venue::leak(auth_toy);
+            let cfg = [
+                (LOGIN, http.url("/auth")),
+                (CALL_NONCES, "0".to_owned()),
+                (PANIC_ON, boom.to_owned()),
+            ];
+            let config = config(venue, &server.url(), &cfg, Counting::new());
+            let heard = Heard::default();
+            let keep = Rc::clone(&heard);
+            let handler = move |env: Envelope<ExecEvent>| keep.borrow_mut().push(env.body);
+            let (mut session, control) = ExecSession::new(config, handler).unwrap();
+            session.set_journal(journal);
+            let held = Rc::new(std::cell::Cell::new(false));
+            let run = session.run();
+            tokio::pin!(run);
+            let hold = Rc::clone(&held);
+            // The run, not polled while `held` is set, so the frame waits as the control drops.
+            let gated = std::future::poll_fn(move |cx| {
+                if hold.get() {
+                    return std::task::Poll::Pending;
+                }
+                run.as_mut().poll(cx)
+            });
+            let script = async move {
+                let mut peer = server.accept().await;
+                peer.send("hello|key=k");
+                let open = ExecEvent::Conn {
+                    stream: auth_toy::EXEC_STREAM,
+                    state: ConnState::Open,
+                };
+                until(|| heard.borrow().contains(&open)).await;
+                held.set(true);
+                peer.send(boom);
+                tokio::time::sleep(ms(100)).await;
+                drop(control);
+                held.set(false);
+                while peer.next().await.is_some() {}
+            };
+            let _ = tokio::join!(gated, script);
+        })
+    }));
+    let why = unwound.unwrap_err();
+    assert_eq!(
+        why.downcast_ref::<&str>(),
+        Some(&"the codec fails redacting")
+    );
+    drop(rt);
+    drop(queue);
+    writer.close().unwrap();
+    let read = read_back(&root);
+    fs::remove_dir_all(&root).unwrap();
+    assert_eq!(read.first(), Some(&Seen::Opened(key(0))));
+    assert_eq!(read.last(), Some(&Seen::Closed(key(0))), "{read:#?}");
+    let closed = |s: &&Seen| matches!(s, Seen::Closed(_));
+    assert_eq!(read.iter().filter(closed).count(), 1, "{read:#?}");
 }
