@@ -468,10 +468,12 @@ version = "0.0.1"
 dependencies = [
  "fbc-conformance",
  "fbc-core",
+ "fbc-oms",
  "fbc-runtime",
  "fbc-venue-binance-usdm",
  "fbc-venue-paradex",
  "rust_decimal",
+ "serde_json",
  "tokio",
 ]
 

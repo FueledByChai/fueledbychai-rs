@@ -1,6 +1,6 @@
 [package]
 name = "fbc-examples"
-description = "Sample programs the owner runs by hand, never CI: md_watch prints live Paradex and Binance USD-M touches and top-of-book through fbc-runtime. The library target is empty; each sample is an example target."
+description = "Sample programs the owner runs by hand, never CI: md_watch prints live Paradex and Binance USD-M touches and top-of-book through fbc-runtime; testnet_trade places and cancels one post-only order on Paradex testnet through fbc-oms. The library target is empty; each sample is an example target."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,12 +15,18 @@ publish = false
 [dev-dependencies]
 fbc-conformance = { path = "../fbc-conformance" }
 fbc-core = { path = "../fbc-core" }
+fbc-oms = { path = "../fbc-oms" }
 fbc-runtime = { path = "../fbc-runtime" }
 fbc-venue-binance-usdm = { path = "../venues/fbc-venue-binance-usdm" }
 fbc-venue-paradex = { path = "../venues/fbc-venue-paradex" }
 rust_decimal.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "time", "sync"] }
 
 [[example]]
 name = "md_watch"
 path = "examples/md_watch/main.rs"
+
+[[example]]
+name = "testnet_trade"
+path = "examples/testnet_trade/main.rs"

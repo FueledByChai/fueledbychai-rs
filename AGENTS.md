@@ -356,7 +356,15 @@ rather than guess.
     an example target whose wiring a test in `tests/` includes by path and runs against the
     conformance stub. So far `examples/md_watch/`: a Paradex market's bbo, trades and `deltas`
     book and a Binance USD-M symbol's `bookTicker` and diff-depth book through `MdVenue`, one
-    `MdBooks` per venue, a line per update; no order, no credential (`tests/md_watch.rs`).
+    `MdBooks` per venue, a line per update; no order, no credential (`tests/md_watch.rs`); and
+    `examples/testnet_trade/` (FBC-x69b): Paradex TESTNET only (the URLs and chain id checked
+    before anything connects), an fbc-oms registry declared an owner-assisted testnet run
+    (decision 0067) behind one `ExecSession`, its events routed into the registry by
+    `link.rs` (the ExecHandler-to-Registry glue a later sample can promote), one post-only order
+    placed well away from the touch read from `GET /orderbook`, cancelled, then Stop
+    (`tests/testnet_trade.rs`, against a Paradex-shaped conformance stub). Its credentials come
+    from environment variables through `src/auth.rs`, a review path included by path, not a
+    module of the empty library target.
   - `crates/venues/fbc-venues` (the registry, the only crate with a normal dependency on a
     concrete venue; `crates/fbc-examples` reaches them only as dev-dependencies),
     `crates/venues/fbc-venue-binance-usdm` (market data only:
