@@ -47,7 +47,7 @@ use fbc_core::{
 };
 
 use super::decode::{Record, record};
-use super::url::join;
+use super::url::{echoed, join, secrets};
 use super::{
     ANCHOR_RETRY, ANCHOR_TIMEOUT, ANCHOR_URL_KEY, ANCHORED_BOOK, BOOK, KEEPALIVE_EVERY, MAX_HELD,
     caps,
@@ -523,8 +523,12 @@ impl MdCodec for ToyMd {
         })
     }
 
-    /// Public market data names no credential.
-    fn redact_inbound(&self, _input: Inbound<'_>) -> InboundSpans {
-        InboundSpans::NONE
+    /// Public market data names no credential; an anchor's response echoing the anchors'
+    /// base's credentials names them (Codex r4219753519).
+    fn redact_inbound(&self, input: Inbound<'_>) -> InboundSpans {
+        match (input, &self.anchor) {
+            (Inbound::Http(_, resp), Some(base)) => echoed(&resp, &secrets(base)),
+            _ => InboundSpans::NONE,
+        }
     }
 }
