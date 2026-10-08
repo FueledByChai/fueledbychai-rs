@@ -1838,7 +1838,7 @@ async fn a_moved_position_or_an_order_not_ours_seen_before_the_place_stops_the_r
         stub.finished().await.unwrap();
         assert!(!report.ok, "{printed}");
         assert!(
-            printed.contains("the account changed since the seed, or an order not ours is in view; nothing placed"),
+            printed.contains("the account changed since the seed, an order of ours traded, or an order not ours is in view; nothing placed"),
             "{printed}"
         );
         assert!(printed.contains(said), "{printed}");
@@ -1898,7 +1898,7 @@ async fn an_order_of_ours_the_registry_does_not_hold_refuses_the_place_or_fails_
     assert!(printed.contains(said), "{printed}");
     assert!(
         printed.contains(
-            "the account changed since the seed, or an order not ours is in view; nothing placed"
+            "the account changed since the seed, an order of ours traded, or an order not ours is in view; nothing placed"
         ),
         "{printed}"
     );
@@ -1977,14 +1977,16 @@ fn the_account_audit_counts_a_refused_resync_and_orders_of_ours_the_registry_doe
     };
     let reg = Registry::new();
     let start = Some(SignedLots(0));
-    assert!(trade::account_changes(&[resynced(ResyncReport::default())], &reg, start).is_empty());
+    assert!(
+        trade::account_changes(&[resynced(ResyncReport::default())], &reg, start, &[]).is_empty()
+    );
 
     // A reconnect's resync the registry refused: what it holds may no longer be the account's.
     let refused = [
         resynced(ResyncReport::default()),
         link::Note::ResyncRefused("the resync lists the order twice".to_owned()),
     ];
-    let found = trade::account_changes(&refused, &reg, start);
+    let found = trade::account_changes(&refused, &reg, start, &[]);
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].contains("a resync was refused"), "{found:?}");
 
@@ -2006,7 +2008,7 @@ fn the_account_audit_counts_a_refused_resync_and_orders_of_ours_the_registry_doe
             vid: Some(vid),
         },
     ];
-    let found = trade::account_changes(&untracked, &reg, start);
+    let found = trade::account_changes(&untracked, &reg, start, &[]);
     assert_eq!(found.len(), 2, "{found:?}");
     assert!(
         found
@@ -2134,4 +2136,66 @@ async fn an_ask_that_rose_past_the_inventory_cap_before_the_place_stops_the_run_
         "{printed}"
     );
     assert!(!sent.iter().any(|m| m == "order.create"));
+}
+
+#[test]
+fn an_order_of_ours_that_filled_since_the_run_took_it_on_is_reported_traded() {
+    // An earlier run's order the resync restored, one lot of two filled before the run: only a
+    // fill beyond that, reported after the run took it on, counts as traded. The run checks it
+    // before the place as well as after Stop.
+    use fbc_core::{
+        AccountKey, CidMatch, CidMint, InstrumentId, Lots, MonoNs, Namespace, NamespaceLease, Side,
+        VenueOrderSnapshot, VenueOrderState, WallNs,
+    };
+    use fbc_oms::{LadderConfig, OrderKey, Registry, ResyncSnapshot};
+    let lease =
+        NamespaceLease::acquire(&lease_dir(), AccountKey::new(1), Namespace::new(1)).unwrap();
+    let mut mint = CidMint::new(lease, 0, 0, WallNs(0));
+    let a = mint.mint().unwrap();
+    let caps = fbc_venue_paradex::factory::caps();
+    let vid = fbc_core::dispatch(&caps, Namespace::new(1), |s| s.venue_order_id("V-1")).unwrap();
+    let shown = |filled| VenueOrderSnapshot {
+        cid: Some(CidMatch::Ours(a)),
+        vid: vid.clone(),
+        inst: InstrumentId::new(1),
+        side: Side::Sell,
+        state: VenueOrderState::Open,
+        px: None,
+        qty: Lots::new(2).unwrap(),
+        cum_filled: Lots::new(filled).unwrap(),
+        post_only: None,
+        reduce_only: None,
+    };
+    let order_caps = caps.exec.clone().unwrap().order;
+    let ladder = LadderConfig::new(
+        Duration::from_secs(5),
+        Duration::from_secs(1),
+        Duration::from_secs(60),
+        2,
+    )
+    .unwrap();
+    let mut reg = Registry::new();
+    let resync = |reg: &mut Registry, filled, n| {
+        let snap = ResyncSnapshot {
+            watermark: WallNs(0),
+            requested_at: MonoNs(0),
+            orders: vec![shown(filled)],
+            positions: vec![],
+        };
+        let key = OrderKey {
+            venue: Some(n),
+            ingest: n,
+        };
+        reg.resync(&ladder, &order_caps, &snap, key).unwrap();
+    };
+    resync(&mut reg, 1, 1);
+    let owned = [(a, Lots::new(1).unwrap())];
+    assert!(trade::traded(&reg, &owned).is_empty());
+    assert!(trade::account_changes(&[], &reg, None, &owned).is_empty());
+    resync(&mut reg, 2, 2);
+    assert_eq!(trade::traded(&reg, &owned), [(a, Lots::new(2).unwrap())]);
+    assert_eq!(
+        trade::account_changes(&[], &reg, None, &owned),
+        ["an order of ours traded during the run: venue order V-1 has 2 lots filled"]
+    );
 }
