@@ -2335,3 +2335,53 @@ fn the_orders_of_ours_resting_on_a_side_are_those_open_on_it() {
         [(sell, Lots::new(4).unwrap())]
     );
 }
+
+#[tokio::test]
+async fn an_order_not_ours_that_opened_and_ended_during_the_run_fails_it() {
+    // Codex r4216297514: another system's order (a random UUID client id) opens and is cancelled
+    // while the placed order's cancel is answered, after the audit before the place: by the
+    // run's end it is no longer in view, but it was there, so the run fails.
+    let uuid = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
+    let vid = "1759500000000000998";
+    let opened = order_open(4_000, vid, uuid);
+    let closed = order_closed_on(2, 4_001, vid, uuid, "70000", "0.00001");
+    let placed = Arc::new(Mutex::new(Placed::default()));
+    let with = responder_extra(Arc::clone(&placed), vec![opened, closed]);
+    let mut script = vec![Step::Accept];
+    script.extend((0..8).map(|_| Step::Respond {
+        conn: 0,
+        with: with.clone(),
+    }));
+    let stub = StubServer::start(WsScript::new(script), routes())
+        .await
+        .unwrap();
+    let opts = options(&stub, "10");
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(printed.contains("STEP closed"), "{printed}");
+    assert!(!report.ok, "{printed}");
+    assert!(
+        printed.contains("an order not ours was reported during the run"),
+        "{printed}"
+    );
+    assert!(printed.contains("DONE failed"), "{printed}");
+}
+
+#[test]
+fn the_account_audit_counts_every_order_not_ours_reported_not_only_those_in_view() {
+    use fbc_core::Namespace;
+    use fbc_oms::{Registry, Routed};
+    let reg = Registry::new();
+    for routed in [
+        Routed::Foreign(Namespace::new(2)),
+        Routed::NotCanonical,
+        Routed::Untracked,
+    ] {
+        let changes = trade::account_changes(&[link::Note::Order(routed)], &reg, None, &[]);
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert!(
+            changes[0].starts_with("an order not ours was reported during the run"),
+            "{changes:?}"
+        );
+    }
+}
