@@ -61,13 +61,7 @@ impl<'s> Harness<'s> {
     /// The venue's caps and its first instrument under the assumed setup.
     pub fn new(check: &'static str, subject: &'s Subject<'s>) -> Result<Harness<'s>, Failure> {
         let setup = subject.setup();
-        let caps = subject.factory().caps(&setup.cfg).map_err(|e| {
-            Failure::one(
-                check,
-                "VenueFactory::caps",
-                format!("refused the setup: {e}"),
-            )
-        })?;
+        let caps = Harness::caps(check, subject)?;
         let Some(spec) = setup.specs.iter().next() else {
             return Err(Failure::one(
                 check,
@@ -94,6 +88,18 @@ impl<'s> Harness<'s> {
             exec_stream: setup.exec_stream,
             qty,
             px,
+        })
+    }
+
+    /// The venue's caps under the assumed setup, read before anything needs an instrument.
+    pub fn caps(check: &'static str, subject: &Subject<'_>) -> Result<VenueCaps, Failure> {
+        let setup = subject.setup();
+        subject.factory().caps(&setup.cfg).map_err(|e| {
+            Failure::one(
+                check,
+                "VenueFactory::caps",
+                format!("refused the setup: {e}"),
+            )
         })
     }
 

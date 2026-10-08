@@ -107,6 +107,14 @@ enum Twist {
     StrangerOnTimeout,
     /// A placement's acceptance names item 1 of its single command.
     PlacedAsItemOne,
+    /// An amended order's update is followed by an `Open` update of the order under its new
+    /// venue id, a tick above the amend's price.
+    OpenAfterAmend,
+    /// An amended order's update is followed by an `Open` update of the order under its new
+    /// venue id, stating what the amend asked for.
+    OpenAgreesAfterAmend,
+    /// An amended order's update is followed by a fill of a lot of the order.
+    FillsOnAmend,
 }
 
 /// The toy with its caps edited by `caps` and its codec twisted by `twist`.
@@ -312,6 +320,18 @@ static STRANGER_ON_TIMEOUT: Variant = Variant {
 static PLACED_AS_ITEM_ONE: Variant = Variant {
     caps: |_| {},
     twist: Twist::PlacedAsItemOne,
+};
+static OPEN_AFTER_AMEND: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::OpenAfterAmend,
+};
+static OPEN_AGREES_AFTER_AMEND: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::OpenAgreesAfterAmend,
+};
+static FILLS_ON_AMEND: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::FillsOnAmend,
 };
 /// The toy declaring that an amended order keeps its venue id, which its events still replace.
 static KEEPS_VID: Variant = Variant {
@@ -790,6 +810,63 @@ fn amended_twice(ev: ExecEvent) -> Vec<ExecEvent> {
     out
 }
 
+/// An amended order's update, then an `Open` update of the order under its new venue id, as
+/// `edit` leaves it.
+fn open_after(ev: ExecEvent, edit: fn(&mut fbc_core::OrderUpdate)) -> Vec<ExecEvent> {
+    let ExecEvent::Order(u) = &ev else {
+        return vec![ev];
+    };
+    let VenueOrderState::Amended { new_vid } = &u.state else {
+        return vec![ev];
+    };
+    let mut open = u.clone();
+    open.vid = new_vid.clone();
+    open.state = VenueOrderState::Open;
+    edit(&mut open);
+    vec![ev, ExecEvent::Order(open)]
+}
+
+/// An amended order's update, then an `Open` update of it a tick above the amend's price.
+fn open_after_amend(ev: ExecEvent) -> Vec<ExecEvent> {
+    open_after(ev, |u| u.px = u.px.map(|px| fbc_core::Ticks(px.0 + 1)))
+}
+
+/// An amended order's update, then an `Open` update of it stating what the amend asked for.
+fn open_agrees_after_amend(ev: ExecEvent) -> Vec<ExecEvent> {
+    open_after(ev, |_| {})
+}
+
+/// An amended order's update, then a fill of a lot of the order under its new venue id.
+fn fills_on_amend(ev: ExecEvent) -> Vec<ExecEvent> {
+    let ExecEvent::Order(u) = &ev else {
+        return vec![ev];
+    };
+    let VenueOrderState::Amended { new_vid } = &u.state else {
+        return vec![ev];
+    };
+    let usdc = fbc_core::AssetSym::new("USDC").unwrap();
+    let fee = toy::with_scope(|scope| scope.fee(0, usdc)).unwrap();
+    let fill_id = toy::with_scope(|scope| scope.fill_id("toy-fill")).unwrap();
+    let fill = fbc_core::FillEvent {
+        ident: fbc_core::FillIdent::Venue {
+            fill: fill_id,
+            vid: new_vid.clone(),
+            cum_after: None,
+        },
+        cid: u.cid,
+        inst: u.inst,
+        side: u.side,
+        px: u.px.unwrap_or(fbc_core::Ticks(1)),
+        qty: fbc_core::Lots::new(1).unwrap(),
+        liquidity: fbc_core::Liquidity3::Maker,
+        fee,
+        realized_pnl: None,
+        realized_funding: None,
+        replay: false,
+    };
+    vec![ev, ExecEvent::Fill(fill)]
+}
+
 /// An amended order's update without its new venue id.
 fn no_new_vid(ev: ExecEvent) -> Vec<ExecEvent> {
     vec![match ev {
@@ -1070,6 +1147,9 @@ impl ExecCodec for Twisted {
             Twist::NoFlagsOnAmend => no_flags_on_amend,
             Twist::NoCidOnAmend => no_cid_on_amend,
             Twist::WrongPx => wrong_px,
+            Twist::OpenAfterAmend => open_after_amend,
+            Twist::OpenAgreesAfterAmend => open_agrees_after_amend,
+            Twist::FillsOnAmend => fills_on_amend,
             _ => kept,
         };
         let sink = &mut Rewrite { inner: sink, f: f_ };
@@ -1977,4 +2057,44 @@ fn amend_ack_fails_a_toy_that_writes_the_amend_again_once_answered() {
         ),
         "{failure}"
     );
+}
+
+#[test]
+fn amend_ack_fails_a_toy_whose_open_update_after_the_amend_states_another_price() {
+    let failure = failed(suite::amend_ack(&OPEN_AFTER_AMEND.subject(assumed)));
+    assert!(
+        says(&failure, "OrderUpdate", "contradicts the amend"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn amend_ack_passes_a_toy_whose_open_update_after_the_amend_states_what_it_asked_for() {
+    let passed = suite::amend_ack(&OPEN_AGREES_AFTER_AMEND.subject(assumed));
+    assert!(matches!(passed, Ok(Verdict::Passed { .. })), "{passed:?}");
+}
+
+#[test]
+fn amend_ack_fails_a_toy_that_reports_a_fill_of_the_order_it_amends() {
+    let failure = failed(suite::amend_ack(&FILLS_ON_AMEND.subject(assumed)));
+    assert!(
+        says(&failure, "ExecEvent::Fill", "the stub filled nothing"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn the_order_entry_checks_skip_a_venue_taking_no_orders_whose_setup_lists_no_instrument() {
+    for check in [
+        suite::amend_ack,
+        suite::mixed_batch,
+        suite::unknown_on_timeout,
+    ] {
+        let skipped = check(&NO_EXEC.subject(no_instruments));
+        let why = "VenueCaps.exec is None: the venue takes no orders";
+        assert!(
+            matches!(skipped, Ok(Verdict::Skipped { why: w, .. }) if w == why),
+            "{skipped:?}"
+        );
+    }
 }
