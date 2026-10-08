@@ -237,6 +237,7 @@ pub async fn run(
         hwm,
         told: std::cell::Cell::new(0),
         start_position: None,
+        owned: Vec::new(),
     };
     let order = Planned {
         side: match opts.side {
@@ -616,6 +617,9 @@ struct Driver {
     told: std::cell::Cell<usize>,
     /// The market's inventory once Start armed it: a round trip leaves it unchanged.
     start_position: Option<SignedLots>,
+    /// Our orders on the market (the resync's and the one placed), each with what of it had
+    /// filled when the run took it on: a fill of any of them during the run fails it.
+    owned: Vec<(ClientOrderId, Lots)>,
 }
 
 impl Driver {
@@ -690,8 +694,33 @@ impl Driver {
         let ok = self.steps(order, ns_lease, persisted, leases).await;
         let stopped = self.stop().await;
         let unmoved = self.inventory_unmoved();
+        let untraded = self.owned_untraded();
         drop(control);
-        ok && stopped && unmoved
+        ok && stopped && unmoved && untraded
+    }
+
+    /// True unless an order of ours on the market filled during the run, the resync's
+    /// included, even one that ended before Stop or whose fills left the inventory where it was.
+    fn owned_untraded(&self) -> bool {
+        let traded: Vec<(ClientOrderId, Lots)> = {
+            let mut link = self.link.borrow_mut();
+            let reg = link.reg();
+            self.owned
+                .iter()
+                .filter_map(|(cid, before)| {
+                    let now = reg.get(*cid).map_or(*before, |r| r.filled());
+                    (now > *before).then_some((*cid, now))
+                })
+                .collect()
+        };
+        for (cid, filled) in &traded {
+            self.note(format_args!(
+                "an order of ours traded during the run: venue order {} has {} lots filled",
+                self.vid_of(*cid),
+                filled.get()
+            ));
+        }
+        traded.is_empty()
     }
 
     /// True unless the market's inventory now differs from what it was at Start: a backstop
@@ -780,6 +809,15 @@ impl Driver {
                             .filter(|o| o.inst == INST && !matches!(o.cid, Some(CidMatch::Ours(_))))
                             .count(),
                         snapshot
+                            .orders
+                            .iter()
+                            .filter(|o| o.inst == INST)
+                            .filter_map(|o| match o.cid {
+                                Some(CidMatch::Ours(cid)) => Some(cid),
+                                _ => None,
+                            })
+                            .collect::<Vec<ClientOrderId>>(),
+                        snapshot
                             .positions
                             .iter()
                             .find(|(inst, _)| *inst == INST)
@@ -788,7 +826,8 @@ impl Driver {
                 })
             })
             .await;
-        let Some((ours_max, untrustworthy, on_market, open, not_ours, position)) = resynced else {
+        let Some((ours_max, untrustworthy, on_market, open, not_ours, ours, position)) = resynced
+        else {
             self.timed_out(
                 "resync",
                 "the REST resync (an open order or position on a market other than --market \
@@ -810,6 +849,14 @@ impl Driver {
             ),
         );
 
+        {
+            let mut link = self.link.borrow_mut();
+            let reg = link.reg();
+            self.owned = ours
+                .into_iter()
+                .map(|cid| (cid, reg.get(cid).map_or(Lots::ZERO, |r| r.filled())))
+                .collect();
+        }
         if not_ours > 0 {
             // The registry neither cancels nor counts the fills of an order it cannot own: one
             // could fill during the run and stay open after Stop, so the run is refused before
@@ -868,6 +915,7 @@ impl Driver {
                 return false;
             }
         };
+        self.owned.push((cid, Lots::ZERO));
         // Kept before the id goes out, so no later run mints it again.
         if let Err(e) = self.hwm.write(mint.high_water()) {
             self.note(format_args!("{e}; nothing placed"));

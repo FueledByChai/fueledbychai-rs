@@ -38,11 +38,12 @@ The caps (required; your own limits, in USD, no defaults):
   --resting-cap-usd <USD>   the resting cap per side; the order is the largest it admits
   --inventory-cap-usd <USD> the inventory cap
 
-Options:
-  --side <buy|sell>         the order's side (default buy: below the best bid; sell: above the
-                            best ask)
+The order (required; no defaults):
+  --side <buy|sell>         the order's side (buy: below the best bid; sell: above the best ask)
   --away-bps <N>            how far from the touch the order rests, in basis points, from 100
-                            to 2000 (default 300: 3% below the best bid for a buy)
+                            to 2000 (300: 3% below the best bid for a buy)
+
+Options:
   --hold <SECONDS>          how long the acknowledged order rests before the cancel, 0 to 60
                             (default 0)
   --step-timeout <SECONDS>  how long each awaited step may take before the sample gives up and
@@ -144,8 +145,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     let mut market = None;
     let (mut tick, mut step, mut min_notional) = (None, None, None);
     let (mut resting_cap_usd, mut inventory_cap_usd) = (None, None);
-    let mut side = OrderSide::Buy;
-    let mut away_bps = 300;
+    let (mut side, mut away_bps) = (None, None);
     let mut hold_secs = 0;
     let mut step_timeout_secs = 15;
     let mut rest_url = TESTNET_REST.to_owned();
@@ -182,13 +182,13 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             "--resting-cap-usd" => resting_cap_usd = Some(positive(&flag, &value()?)?),
             "--inventory-cap-usd" => inventory_cap_usd = Some(positive(&flag, &value()?)?),
             "--side" => {
-                side = match value()?.as_str() {
+                side = Some(match value()?.as_str() {
                     "buy" => OrderSide::Buy,
                     "sell" => OrderSide::Sell,
                     other => return Err(format!("--side {other}: not buy or sell")),
-                }
+                })
             }
-            "--away-bps" => away_bps = bounded(&flag, &value()?, 100, 2000)? as u32,
+            "--away-bps" => away_bps = Some(bounded(&flag, &value()?, 100, 2000)? as u32),
             "--hold" => hold_secs = bounded(&flag, &value()?, 0, 60)?,
             "--step-timeout" => step_timeout_secs = bounded(&flag, &value()?, 1, 120)?,
             "--rest-url" => rest_url = value()?,
@@ -206,8 +206,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         min_notional: min_notional.ok_or_else(|| need("--min-notional"))?,
         resting_cap_usd: resting_cap_usd.ok_or_else(|| need("--resting-cap-usd"))?,
         inventory_cap_usd: inventory_cap_usd.ok_or_else(|| need("--inventory-cap-usd"))?,
-        side,
-        away_bps,
+        side: side.ok_or_else(|| need("--side"))?,
+        away_bps: away_bps.ok_or_else(|| need("--away-bps"))?,
         hold_secs,
         step_timeout_secs,
         rest_url,
