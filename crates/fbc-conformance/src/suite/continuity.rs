@@ -7,7 +7,10 @@
 //! instrument>, feed: Book(<that channel>), h: Gap }` from each marked frame, a gap on no other
 //! instrument or feed from it (Codex r4217682431, r4217839174), and no gap from any other
 //! frame: a break missed or put elsewhere leaves a broken book trusted, and a gap reported in
-//! sequence throws a good one away. A case that marks no break proves nothing and fails. A
+//! sequence throws a good one away. From the frame that breaks a book, its first event
+//! included, until a snapshot of that book begins, the codec must push no level or window of it
+//! (Codex r4218167354): the consumer applies events as they come, so a delta of a broken book
+//! is trusted. A case that marks no break proves nothing and fails. A
 //! channel declared [`Continuity::Windowed`] or [`Continuity::Unsequenced`] has nothing to
 //! chain and is skipped by name.
 //!
@@ -21,6 +24,8 @@
 //! longer block is read by its declared length, never taken for a break, refused or dropped. A
 //! text venue ([`Encoding::Json`] or [`Encoding::Text`]) has no binary block: the sub-case is
 //! skipped by name, and a `longer_block/` directory in its fixtures fails, as a case never read.
+
+use std::collections::BTreeSet;
 
 use fbc_core::{
     BookCaps, Continuity, Encoding, Feed, FeedHealth, InstrumentId, MdEvent, SpecTable,
@@ -124,6 +129,8 @@ fn judge(
         )
     };
     let mut marked = 0usize;
+    // The instruments whose book a frame broke, until a snapshot of it begins.
+    let mut broken = BTreeSet::new();
     for step in steps {
         let line = step.line;
         // The instruments and feeds a gap was reported on.
@@ -155,6 +162,15 @@ fn judge(
                 );
                 breaches.push(Breach::new(file, what));
             }
+            kept_live(
+                &mut broken,
+                book,
+                file,
+                step,
+                &capability,
+                &symbol,
+                breaches,
+            );
             continue;
         }
         marked += 1;
@@ -168,6 +184,7 @@ fn judge(
                 continue;
             };
             own.push((inst, Feed::Book(book.id)));
+            broken.insert(inst);
             if !gapped.contains(&(inst, Feed::Book(book.id))) {
                 let what = format!(
                     "{file} line {line} breaks {sym}'s sequence, yet no gap on {channel} was \
@@ -194,6 +211,15 @@ fn judge(
             );
             breaches.push(Breach::new(&capability, what));
         }
+        kept_live(
+            &mut broken,
+            book,
+            file,
+            step,
+            &capability,
+            &symbol,
+            breaches,
+        );
     }
     let frames = steps.len();
     if !breaks {
@@ -209,4 +235,39 @@ fn judge(
         breaches.push(Breach::new(file, what));
     }
     format!("{file}: {marked} of {frames} frames break the sequence")
+}
+
+/// Holds `step` to the books broken before it or by it, which `broken` holds: none takes a
+/// level or window until a snapshot of it begins, the snapshot's own levels being the recovery
+/// (Codex r4218167354). The frame that breaks a book is held from its first event, as a level
+/// pushed before the gap reaches the consumer first. A snapshot's begin moves a book out of
+/// `broken`.
+fn kept_live(
+    broken: &mut BTreeSet<InstrumentId>,
+    book: &Book,
+    file: &str,
+    step: &Step,
+    capability: &str,
+    symbol: &dyn Fn(InstrumentId) -> String,
+    breaches: &mut Vec<Breach>,
+) {
+    for (_, ev) in &step.events {
+        match *ev {
+            MdEvent::BookSnapshotBegin { inst, book: b, .. } if b == book.id => {
+                broken.remove(&inst);
+            }
+            MdEvent::Level { inst, book: b, .. } | MdEvent::Window { inst, book: b, .. }
+                if b == book.id && broken.contains(&inst) =>
+            {
+                let what = format!(
+                    "{file} line {} pushes a level of {}'s book while its sequence is broken: a \
+                     broken book takes nothing until its next snapshot",
+                    step.line,
+                    symbol(inst)
+                );
+                breaches.push(Breach::new(capability, what));
+            }
+            _ => {}
+        }
+    }
 }
