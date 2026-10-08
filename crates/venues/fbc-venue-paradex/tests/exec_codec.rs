@@ -1140,3 +1140,103 @@ fn an_auth_and_a_subscribe_reply_read_a_json_null_error_or_result_as_absent() {
         (Some("-32602"), ConnState::Closed)
     );
 }
+
+/// Replies to request `id` that read as neither a result nor a readable refusal, each with the
+/// venue code of the refusal it reports first (`Some(None)`: a refusal with no code), if any.
+/// An error stated at all is the venue's refusal, as the Java client reads the auth reply
+/// (`ParadexOrderWebSocketClient.onAuthResponse`: any non-null `error`).
+fn unreadable(id: u64) -> Vec<(String, Option<Option<&'static str>>)> {
+    vec![
+        // Neither member, or both null.
+        (format!(r#"{{"jsonrpc":"2.0","id":{id}}}"#), None),
+        (
+            format!(r#"{{"jsonrpc":"2.0","result":null,"error":null,"id":{id}}}"#),
+            None,
+        ),
+        // A result beside an error: the error.
+        (
+            format!(
+                r#"{{"jsonrpc":"2.0","result":{{}},"error":{{"code":40111,"message":"Invalid Bearer Token"}},"id":{id}}}"#
+            ),
+            Some(Some("40111")),
+        ),
+        // An error whose code is not an integer, or that has none, or is no object.
+        (
+            format!(
+                r#"{{"jsonrpc":"2.0","error":{{"code":"40111","message":"Invalid Bearer Token"}},"id":{id}}}"#
+            ),
+            Some(None),
+        ),
+        (
+            format!(r#"{{"jsonrpc":"2.0","error":{{"message":"no code"}},"id":{id}}}"#),
+            Some(None),
+        ),
+        (
+            format!(r#"{{"jsonrpc":"2.0","error":"denied","id":{id}}}"#),
+            Some(None),
+        ),
+    ]
+}
+
+/// Asserts `call` closed the stream and asked for a reconnect, writing nothing, after the
+/// refusal `refusal` names (`unreadable`), or nothing else.
+fn closed_as(call: &Call, refusal: Option<Option<&str>>, bad: &str) {
+    call.result.as_ref().unwrap();
+    assert_eq!(reconnects(&call.fx), 1, "{bad}: {:?}", call.fx);
+    assert!(sends(&call.fx).is_empty(), "{bad}");
+    let closed = ExecEvent::Conn {
+        stream: STREAM,
+        state: ConnState::Closed,
+    };
+    match (refusal, call.events.as_slice()) {
+        (None, [last]) => assert_eq!(last, &closed, "{bad}"),
+        (Some(code), [ExecEvent::UncorrelatedError(reject), last]) => {
+            assert_eq!(last, &closed, "{bad}");
+            assert_eq!(reject.kind, RejectKind::Other, "{bad}");
+            assert_eq!(reject.venue_code.as_deref(), code, "{bad}");
+        }
+        _ => panic!("{bad}: {:?}", call.events),
+    }
+}
+
+#[test]
+fn an_unreadable_auth_or_subscribe_reply_reports_closed_and_asks_for_a_reconnect() {
+    let body = login_body(TOKEN);
+    // The auth reply: the connection is closed and asked for again, no command is sent on it,
+    // and its token is not reused, so the next connection logs in.
+    for case in 0..unreadable(0).len() {
+        let mut codec = fresh();
+        open(&mut codec);
+        let login = answer(&mut codec, LOGIN_REQUEST, ok(body.as_bytes()));
+        let auth = auth_frame(&login.fx, TOKEN);
+        let (bad, refusal) = unreadable(auth).swap_remove(case);
+        let call = text(&mut codec, &bad);
+        closed_as(&call, refusal, &bad);
+        not_sent(&mut codec, &place(), RpcId(1), NotSentReason::Disconnected);
+        text(&mut codec, &reply(auth)).refused();
+        let fx = open(&mut codec);
+        assert_eq!(logins(&fx), 1, "{bad}");
+        assert!(sends(&fx).is_empty(), "{bad}");
+    }
+    // A subscribe reply: the same, on an authenticated connection.
+    for case in 0..unreadable(0).len() {
+        let mut codec = fresh();
+        open(&mut codec);
+        let login = answer(&mut codec, LOGIN_REQUEST, ok(body.as_bytes()));
+        let auth = auth_frame(&login.fx, TOKEN);
+        let subs = sends(&text(&mut codec, &reply(auth)).fx);
+        let sub = subs[2].0["id"].as_u64().unwrap();
+        let (bad, refusal) = unreadable(sub).swap_remove(case);
+        let call = text(&mut codec, &bad);
+        closed_as(&call, refusal, &bad);
+        not_sent(&mut codec, &place(), RpcId(1), NotSentReason::Disconnected);
+        let first = subs[0].0["id"].as_u64().unwrap();
+        text(&mut codec, &subscribed(first, PRIVATE_CHANNELS[0])).refused();
+        assert_eq!(logins(&open(&mut codec)), 1, "{bad}");
+    }
+    // A readable auth reply still authenticates, and a command is then encoded.
+    let mut codec = fresh();
+    authenticate(&mut codec, TOKEN);
+    let (result, _) = encode(&mut codec, &place(), RpcId(1));
+    result.unwrap();
+}

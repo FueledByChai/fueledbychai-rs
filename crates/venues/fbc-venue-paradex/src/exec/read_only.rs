@@ -26,8 +26,13 @@
 //!   auth frame and a refused private channel each report the stream [`ConnState::Closed`] and
 //!   ask for a reconnect (WebSocket "Error Handling": on an authentication error, log in
 //!   again and reconnect); a refusal the venue sent is reported first as
-//!   an [`ExecEvent::UncorrelatedError`] with its code. A login that cannot be signed asks for
-//!   the reconnect alone, since `on_open` has no sink.
+//!   an [`ExecEvent::UncorrelatedError`] with its code. A reply to the auth frame or a
+//!   subscribe is a refusal whenever it carries an `error`, beside a `result` too and whatever
+//!   the error holds (its code when that is an integer), as the Java client fails the auth on
+//!   any non-null error (`ParadexOrderWebSocketClient.onAuthResponse`); one with neither
+//!   member closes the stream the same way with nothing reported first, so no connection
+//!   waits silently on a reply it could not read (FBC-z5om). A login that cannot be signed
+//!   asks for the reconnect alone, since `on_open` has no sink.
 //! - **Decoding.** Binary frames are the SBE templates of schema 1:2 (0054): `OrderEvent`,
 //!   `FillEvent`, `PositionEvent` and `AccountEvent` through their decoders; a heartbeat and any
 //!   template not decoded are skipped, as the schema's versioning policy requires. Text frames
@@ -288,7 +293,10 @@ impl ReadOnlyExec {
         fx.push(Effect::Reconnect { stream, reason });
     }
 
-    /// A JSON-RPC reply: the auth frame's, or a subscribe's.
+    /// A JSON-RPC reply: the auth frame's, or a subscribe's. One that is neither a result nor a
+    /// refusal closes the stream as a refusal does (module documentation), so a connection
+    /// never waits on a reply it could not read; a reply naming no request this connection
+    /// awaits is refused with nothing pushed.
     pub(super) fn on_text(
         &mut self,
         text: &str,
@@ -297,25 +305,18 @@ impl ReadOnlyExec {
     ) -> Result<(), DecodeError> {
         let reply: Value = serde_json::from_str(text)
             .map_err(|_| DecodeError::Malformed("text frame is not JSON"))?;
-        let id = reply.get("id").and_then(Value::as_u64);
-        let refusal = match (member(&reply, "result"), member(&reply, "error")) {
-            (Some(_), None) => None,
-            (None, Some(error)) => Some(reject(error)?),
-            _ => {
-                return Err(DecodeError::Malformed(
-                    "text frame is neither a reply nor an error",
-                ));
-            }
-        };
         let conn = self
             .conn
             .as_mut()
             .ok_or(DecodeError::Malformed("a reply with no connection open"))?;
-        let id = id.ok_or(DecodeError::Malformed("a reply without an id"))?;
+        let id = reply
+            .get("id")
+            .and_then(Value::as_u64)
+            .ok_or(DecodeError::Malformed("a reply without an id"))?;
         if conn.auth == Some(id) {
             conn.auth = None;
-            match refusal {
-                None => {
+            match Reply::read(&reply) {
+                Reply::Result => {
                     conn.authenticated = true;
                     let (stream, state) = (conn.stream, ConnState::Authenticated);
                     sink.push(VenueMeta::NONE, ExecEvent::Conn { stream, state });
@@ -323,33 +324,71 @@ impl ReadOnlyExec {
                         self.send(ReadMethod::Subscribe(channel), fx);
                     }
                 }
-                Some(reject) => self.close(Some(reject), "Paradex refused the auth", sink, fx),
+                Reply::Refused(reject) => {
+                    self.close(Some(reject), "Paradex refused the auth", sink, fx);
+                }
+                Reply::Unreadable => {
+                    let reason = "a Paradex auth reply could not be read";
+                    self.close(None, reason, sink, fx);
+                }
             }
             return Ok(());
         }
         if conn.subscribing.remove(&id).is_none() {
             return Err(DecodeError::Malformed("a reply to no request sent"));
         }
-        if let Some(reject) = refusal {
-            let reason = "Paradex refused a private channel";
-            self.close(Some(reject), reason, sink, fx);
+        match Reply::read(&reply) {
+            Reply::Result => {}
+            Reply::Refused(reject) => {
+                let reason = "Paradex refused a private channel";
+                self.close(Some(reject), reason, sink, fx);
+            }
+            Reply::Unreadable => {
+                let reason = "a Paradex subscribe reply could not be read";
+                self.close(None, reason, sink, fx);
+            }
         }
         Ok(())
     }
 }
 
-/// A JSON-RPC `error` object as a refusal: its `code` (a number) and `message`.
-fn reject(error: &Value) -> Result<Reject, DecodeError> {
-    let code = error
-        .get("code")
-        .and_then(Value::as_i64)
-        .ok_or(DecodeError::Malformed("error code"))?;
-    let message = error.get("message").and_then(Value::as_str).unwrap_or("");
-    Ok(Reject {
+/// What a reply to the auth frame or a subscribe says.
+enum Reply {
+    /// A `result` and no `error`: the request was accepted.
+    Result,
+    /// An `error`, whatever else the reply holds: the venue refused the request.
+    Refused(Reject),
+    /// Neither member: nothing the codec can read.
+    Unreadable,
+}
+
+impl Reply {
+    /// Reads `reply`, a member that is JSON `null` as absent (FBC-4lp7). Any `error` is a
+    /// refusal, beside a `result` too, as the Java client reads the auth reply
+    /// (`ParadexOrderWebSocketClient.onAuthResponse`: any non-null `error` fails it).
+    fn read(reply: &Value) -> Reply {
+        match (member(reply, "result"), member(reply, "error")) {
+            (_, Some(error)) => Reply::Refused(reject(error)),
+            (Some(_), None) => Reply::Result,
+            (None, None) => Reply::Unreadable,
+        }
+    }
+}
+
+/// A JSON-RPC `error` as a refusal: its `code` when it is an integer, none otherwise, and its
+/// `message` (the error itself when it is a string).
+fn reject(error: &Value) -> Reject {
+    let code = error.get("code").and_then(Value::as_i64);
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| error.as_str())
+        .unwrap_or("");
+    Reject {
         kind: RejectKind::Other,
-        venue_code: Some(code.to_string().into()),
+        venue_code: code.map(|code| code.to_string().into()),
         raw: message.into(),
-    })
+    }
 }
 
 /// The REST base, without a trailing slash, and the read timeout, from the keys
