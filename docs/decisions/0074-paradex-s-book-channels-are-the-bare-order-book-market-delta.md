@@ -21,7 +21,10 @@ found:
   (template 3), about 19 a second on mainnet; testnet accepts them too.
 - A second `order_book` channel of the same market on one SBE session is refused: "channel
   '...snapshot@15@100ms' cannot share an SBE session with 'order_bo...'". The interactive
-  (snapshot) channels take only 100ms, 200ms or 400ms.
+  (snapshot) channels take only 100ms, 200ms or 400ms. The probe paired only channels of one
+  market (BTC), and the venue's error text is cut short, so it does not show whether the rule
+  is one `order_book` channel per market or one per session. Book channels of different
+  markets on one SBE session have not been tried against the venue.
 
 Two captures of the bare channels (BTC-USD-PERP, 2026-10-08 UTC, about 30 s each, kept in
 `fixtures/paradex/md/`) show what they carry: each opens with a SNAPSHOT of the whole book (115
@@ -43,6 +46,10 @@ never crossed.
    separate connections.** `plan_md` puts a market's second book channel on a second
    connection and the codec's `subscribe` refuses a second book channel of a market locally,
    sending nothing. This was the smaller change (none): the venue's own rule now matches it.
+   Book channels of different markets still share a connection, as 0022 item 4 has them
+   ("any number of markets share them"). That part is untested against the venue (Context);
+   FBC-2976 is the read-only probe that settles it, and a multi-market Paradex book consumer
+   (the chaiwala-rs recorder redeploy) waits for it.
 
 ## Alternatives
 
@@ -70,3 +77,7 @@ never crossed.
 - A recording of a bare channel in which seq_no skips without a lost frame, or a SNAPSHOT that
   is not the whole book (a capped depth would make `max_depth: u16::MAX` false).
 - A Paradex frame that names its channel, which would let book channels share a connection.
+- The venue refusing a book channel of a second market on an SBE session that already carries
+  another market's book channel (for example `order_book.ETH-USD-PERP.deltas` after
+  `order_book.BTC-USD-PERP.deltas`). The rule would then be one book channel per session, and
+  `plan_md` would have to give every market's book its own connection.
