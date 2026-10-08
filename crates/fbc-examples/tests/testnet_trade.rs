@@ -265,6 +265,9 @@ enum End {
     Filled,
     /// A batch's restored orders only: the second item `ALREADY_CLOSED` and no order event.
     Refused,
+    /// Restored orders only: each FILLED by an order event that comes with the placed order's
+    /// cancel, so Stop finds nothing of theirs to cancel.
+    FilledBeforeStop,
 }
 
 /// The order event ending an order of `size` at `price` as `end` says.
@@ -280,6 +283,7 @@ fn order_ended(
 ) -> Vec<u8> {
     match end {
         End::Canceled | End::Refused => order_closed_on(side, seq, vid, cid, price, size),
+        End::FilledBeforeStop => order_event(side, seq, vid, cid, price, size, "0", ""),
         End::PartlyFilled => {
             let open = Decimal::from_str(size).unwrap() - Decimal::from_str("0.00001").unwrap();
             let open = open.to_string();
@@ -341,6 +345,14 @@ fn responder_with(
                     frames.push(Frame::Binary(fill_event(5_000, VID, &p.cid, &p.price)));
                 }
                 frames.push(Frame::Binary(closed));
+                if matches!(restored_end, End::FilledBeforeStop) {
+                    for (i, r) in restored.iter().enumerate() {
+                        let seq = 5_100 + i64::try_from(i).unwrap();
+                        let ev =
+                            order_ended(restored_end, 2, seq, &r.vid, &r.cid, "70000", "0.00001");
+                        frames.push(Frame::Binary(ev));
+                    }
+                }
                 Ok(frames)
             }
             "order.cancel_batch" => {
@@ -407,8 +419,14 @@ fn restored() -> (Vec<Restored>, String) {
 /// The happy script with the batch cancel of the restored orders after it.
 fn restored_script(placed: Arc<Mutex<Placed>>, restored: Vec<Restored>, end: End) -> WsScript {
     let with = responder_with(placed, Arc::new(restored), End::Canceled, end);
+    // The batch cancel is the ninth frame, unless the orders ended before Stop.
+    let frames = if matches!(end, End::FilledBeforeStop) {
+        8
+    } else {
+        9
+    };
     let mut steps = vec![Step::Accept];
-    steps.extend((0..9).map(|_| Step::Respond {
+    steps.extend((0..frames).map(|_| Step::Respond {
         conn: 0,
         with: with.clone(),
     }));
@@ -687,8 +705,12 @@ fn strings(args: &[&str]) -> Vec<String> {
     args.iter().map(|a| (*a).to_owned()).collect()
 }
 
-const MARKET_ARGS: [&str; 13] = [
+const MARKET_ARGS: [&str; 17] = [
     "--sole-trader",
+    "--side",
+    "buy",
+    "--away-bps",
+    "300",
     "--resting-cap-usd",
     "11",
     "--inventory-cap-usd",
@@ -761,7 +783,7 @@ fn the_command_line_defaults_to_testnet_and_refuses_mainnet_urls() {
             .unwrap_err()
             .starts_with("--socks5 with loopback stub URLs")
     );
-    // The caps, too: the consumer's own limits, with no default.
+    // The caps and the order's side and distance, too: the consumer's own, with no default.
     for missing in [
         "--market",
         "--tick",
@@ -769,6 +791,8 @@ fn the_command_line_defaults_to_testnet_and_refuses_mainnet_urls() {
         "--min-notional",
         "--resting-cap-usd",
         "--inventory-cap-usd",
+        "--side",
+        "--away-bps",
     ] {
         let i = MARKET_ARGS.iter().position(|a| *a == missing).unwrap();
         let mut argv = strings(&MARKET_ARGS);
@@ -1193,6 +1217,34 @@ async fn an_order_on_the_market_that_is_not_ours_refuses_the_run_before_start() 
         !methods(&stub)
             .iter()
             .any(|m| m.starts_with("order.c") && m != "order.cancel_on_disconnect")
+    );
+    assert!(printed.contains("DONE failed"), "{printed}");
+}
+
+#[tokio::test]
+async fn an_earlier_runs_order_that_fills_before_stop_fails_the_run() {
+    // Both restored orders fill (as the placed order's cancel goes out), so Stop has nothing
+    // of theirs to cancel and no fill event moves the inventory: the run still traded.
+    let (orders, body) = restored();
+    let placed = Arc::new(Mutex::new(Placed::default()));
+    let stub = StubServer::start(
+        restored_script(Arc::clone(&placed), orders, End::FilledBeforeStop),
+        routes_with(body),
+    )
+    .await
+    .unwrap();
+    let opts = options(&stub, "10");
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(printed.contains("STEP closed"), "{printed}");
+    assert!(printed.contains("cancel all: 0 cancels sent"), "{printed}");
+    assert!(!report.ok, "{printed}");
+    assert_eq!(
+        printed
+            .matches("an order of ours traded during the run")
+            .count(),
+        2,
+        "{printed}"
     );
     assert!(printed.contains("DONE failed"), "{printed}");
 }
