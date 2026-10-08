@@ -112,6 +112,18 @@ mod tls;
 mod transport;
 pub mod ws;
 
+// Decision 0079: a build that links this crate never has the log facade's TRACE level, since
+// tungstenite writes each frame, the auth frame's session token included, at TRACE. This crate
+// sets `max_level_debug`, but in a build without debug assertions `log` takes a consumer's
+// `release_max_level_*` first, so `release_max_level_trace` anywhere in the build would bring
+// TRACE back in release; that build fails here instead.
+const _: () = assert!(
+    (log::STATIC_MAX_LEVEL as usize) <= (log::LevelFilter::Debug as usize),
+    "decision 0079: TRACE must stay compiled out of the log facade in every build that links \
+     fbc-runtime (tungstenite logs each frame, the session token included, at TRACE); remove \
+     log's release_max_level_trace feature from this build"
+);
+
 pub use books::{BookHandler, BookKeeper, MdBooks, TradingBookConflict, TradingBooks};
 pub use connector::{Connector, ProxyConfig};
 pub use epoch::{Admit, EpochError, Epochs, Input};
