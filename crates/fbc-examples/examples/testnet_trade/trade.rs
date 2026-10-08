@@ -17,7 +17,10 @@
 //! market's `--min-notional` (the encoder does not check a minimum, FBC-98fc). The resting cap
 //! per side (`--resting-cap-usd`) is converted to lots at the same price, and the inventory cap
 //! (`--inventory-cap-usd`), both required, at the higher of that price and the ask, so a
-//! position is never worth more than the cap at the market.
+//! position is never worth more than the cap at the market. The registry sums resting lots on a side, so
+//! an order of ours an earlier run left resting on the order's side (restored by the resync,
+//! perhaps at a price nearer the touch) would count at the new order's price, not its own:
+//! while one rests there, nothing is placed (Stop cancels it).
 //!
 //! **Its client ids** are minted, decoded as ours, leased and kept under the namespace the
 //! consumer allocates (`--namespace`, required): an order on the market under another
@@ -835,6 +838,24 @@ pub fn traded(reg: &Registry, owned: &[(ClientOrderId, Lots)]) -> Vec<(ClientOrd
         .collect()
 }
 
+/// Those of `owned` (our orders on the market) resting on `side`, each with what of it rests
+/// ([`OrderRecord::resting`](fbc_oms::OrderRecord::resting)); one the registry does not hold
+/// is not among them.
+pub fn resting_on_side(
+    reg: &Registry,
+    owned: &[(ClientOrderId, Lots)],
+    side: Side,
+) -> Vec<(ClientOrderId, Lots)> {
+    owned
+        .iter()
+        .filter_map(|(cid, _)| {
+            let rec = reg.get(*cid)?;
+            let rests = rec.resting();
+            (rec.placed().side == side && rests > Lots::ZERO).then_some((*cid, rests))
+        })
+        .collect()
+}
+
 /// Those of `owned` (our orders on the market) that did not end cancelled, each with its state
 /// (`None`: the registry holds no record of it): still open, or ended another way.
 pub fn not_cancelled(
@@ -1323,6 +1344,27 @@ impl Driver {
             self.note(format_args!(
                 "the account changed since the seed, an order of ours traded, or an order not \
                  ours is in view; nothing placed"
+            ));
+            return false;
+        }
+
+        // An order of ours (an earlier run's, restored by the resync) still resting on the
+        // order's side: the registry sums resting lots on a side, and the resting cap is in
+        // lots at the new order's price, so one resting nearer the touch would count at less
+        // than its own price and the dollars resting could exceed --resting-cap-usd. Nothing is
+        // placed until they are cancelled (Stop cancels them). Nothing waits between this and
+        // the place below.
+        let same_side = {
+            let link = self.link.borrow();
+            resting_on_side(link.registry(), &self.owned, order.side)
+        };
+        if !same_side.is_empty() {
+            let lots: i64 = same_side.iter().map(|(_, l)| l.get()).sum();
+            self.note(format_args!(
+                "{} orders of ours ({lots} lots) rest on the order's side: the resting cap is \
+                 counted in lots at the order's price, not theirs; cancel them first; nothing \
+                 placed",
+                same_side.len()
             ));
             return false;
         }
