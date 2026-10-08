@@ -11,7 +11,8 @@
 //!   from the venue's event reporting the replaced order where `AmendCaps.ack` is
 //!   `ReplacedEvent`, synthesized by the codec from the reply where it is `RpcReplyOnly`. Every
 //!   identity the update states is the order's. Where the amended order gets a new venue id
-//!   (`AmendCaps.keeps_venue_id` false), the update names it.
+//!   (`AmendCaps.keeps_venue_id` false), the update names it; where it keeps its id, the update
+//!   names no new one. The placement's acceptance is its one item's, or the whole request's.
 //! - `mixed_batch`: a batch of three placements is answered item by item, the first accepted,
 //!   the second rejected and the third never; once its deadline passes, the first is
 //!   `Accepted`, the second `Rejected` and the third `Unknown`, each by its index, and nothing
@@ -70,7 +71,11 @@ pub fn amend_ack(subject: &Subject<'static>) -> Result<Verdict, Failure> {
         let placed = c.send(auth, OpKind::Place).await?;
         c.settle(|c| !c.outcomes(placed).is_empty()).await;
         let outcomes = c.outcomes(placed);
-        let Some((_, SubmitOutcome::Accepted { .. })) = outcomes.first() else {
+        // The single command's one item, or the whole request (Codex r4223068215).
+        let one =
+            |(it, _): &(Option<ItemRef>, SubmitOutcome)| it.as_ref().is_none_or(|it| it.idx == 0);
+        let first = outcomes.first().filter(|_| outcomes.iter().all(one));
+        let Some((_, SubmitOutcome::Accepted { .. })) = first else {
             let what = format!("the placement the stub accepted was reported {outcomes:?}");
             return Err(c.h.fail("ExecCodec::on_frame", what));
         };
@@ -257,6 +262,15 @@ fn judge_amend(
              order having been placed under {placed:?}"
         );
         breaches.push(Breach::new("AmendCaps.keeps_venue_id is false", what));
+    }
+    // An order that keeps its venue id is given no new one (Codex r4223068206): fbc-oms would
+    // retire the id the order still rests under.
+    if amend.keeps_venue_id && new_vid.is_some() {
+        let what = format!(
+            "the amended order keeps its venue id, yet the update names a new venue id \
+             {new_vid:?}, the order having been placed under {placed:?}"
+        );
+        breaches.push(Breach::new("AmendCaps.keeps_venue_id is true", what));
     }
     breaches
 }
