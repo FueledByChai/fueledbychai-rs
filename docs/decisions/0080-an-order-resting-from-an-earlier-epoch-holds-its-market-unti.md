@@ -60,9 +60,9 @@ bound the answer.
   id: one under an id an amend moved the order from changes nothing, and one under another
   id moves the order there (it was amended meanwhile), keeping what was heard of its amends.
   An answer to a query by our client id heard before the resync ended is kept too: an older
-  snapshot of the order is moved to the id the answer showed and on along the amends heard
-  from it, or, if the answer showed the order ended under an id no amend moved it from, adds
-  nothing. What the epoch's events
+  snapshot of the order adds nothing if the answer showed the order ended under an id no amend
+  moved it from; otherwise it is moved to the id the answer showed and on along the amends
+  heard from it. What the epoch's events
   showed before its resync ended (ends, and amends to new ids, by venue id or, for an event
   naming none, by our client id) is kept until it ends, so a snapshot read after them (a resync
   over HTTP while the stream runs) does not undo them. Nothing else releases a market: a cancel

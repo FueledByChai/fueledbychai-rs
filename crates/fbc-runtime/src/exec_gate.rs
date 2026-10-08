@@ -185,14 +185,15 @@ impl Early {
             superseded.push(std::mem::replace(&mut vid, moved.clone()));
         }
         // An answer to a query by our client id is the order's state when it was given (Codex
-        // P2 r4220079832 on PR #127): open, the order rests on from the id it showed, following
-        // the amends heard from it (Codex P2 r4220412819 on PR #127); ended, it ended, unless an
-        // amend moved the order from the id it showed, so it showed the superseded order.
+        // P2 r4220079832 on PR #127): ended, it ended, unless an amend moved the order from the
+        // id it showed, so it showed the superseded order; otherwise the order rests on from the
+        // id it showed, following the amends heard from it (Codex P2 r4220412819, P1 r4220699833
+        // on PR #127).
         match self.queried.get(&cid) {
-            Some((at, false)) if *at != vid => {
+            Some((at, true)) if !self.moved.contains_key(at) => return None,
+            Some((at, _)) if *at != vid => {
                 superseded.push(std::mem::replace(&mut vid, at.clone()));
             }
-            Some((at, true)) if !self.moved.contains_key(at) => return None,
             _ => {}
         }
         // Each step follows one amend; there are no more steps than amends heard. An amend away
@@ -1455,6 +1456,28 @@ mod tests {
         ended(&mut gate, 0, 1);
         assert_eq!(gate.unprotected()[0].vid, vid("V-3"));
         let cancelled = VenueOrderState::Canceled(CancelReason::Requested);
+        gate.observe(0, &update(None, Some("V-3"), cancelled));
+        assert!(gate.unprotected().is_empty());
+    }
+
+    /// Codex P1 r4220699833 on PR #127: an early answer to a query by our client id showing the
+    /// order ended under an id an amend then moved it from shows the superseded order, so the
+    /// order rests on from that id, following the amends heard from it.
+    #[test]
+    fn an_early_client_id_query_answer_showing_an_end_an_amend_superseded_starts_the_amend_chain() {
+        let cancelled = VenueOrderState::Canceled(CancelReason::Requested);
+        let mut gate = Gate::new(true, false);
+        resyncing(&mut gate);
+        gate.observe(0, &by_cid("V-2", cancelled.clone()));
+        let to_v3 = VenueOrderState::Amended {
+            new_vid: Some(vid("V-3")),
+        };
+        gate.observe(0, &update(None, Some("V-2"), to_v3));
+        gate.observe(0, &ExecEvent::ResyncOrder(ours("V-1")));
+        ended(&mut gate, 0, 1);
+        assert_eq!(gate.unprotected()[0].vid, vid("V-3"));
+        gate.observe(0, &update(None, Some("V-1"), cancelled.clone()));
+        assert!(gate.unprotected_on(INST));
         gate.observe(0, &update(None, Some("V-3"), cancelled));
         assert!(gate.unprotected().is_empty());
     }
