@@ -12,7 +12,9 @@
 //!   `ReplacedEvent`, synthesized by the codec from the reply where it is `RpcReplyOnly`. Every
 //!   identity the update states is the order's. Where the amended order gets a new venue id
 //!   (`AmendCaps.keeps_venue_id` false), the update names it; where it keeps its id, the update
-//!   names no new one. The placement's acceptance is its one item's, or the whole request's.
+//!   names no new one. The placement's acceptance is its one item's, or the whole request's,
+//!   once as `OrderCaps.ack` has it. Once the amend is sent, nothing refuses the order (an
+//!   `AsyncReject` naming it) or ends it (a terminal `OrderUpdate`).
 //! - `mixed_batch`: a batch of three placements is answered item by item, the first accepted,
 //!   the second rejected and the third never; once its deadline passes, the first is
 //!   `Accepted`, the second `Rejected` and the third `Unknown`, each by its index, and nothing
@@ -70,19 +72,21 @@ pub fn amend_ack(subject: &Subject<'static>) -> Result<Verdict, Failure> {
         let (cid, auth) = c.oms.place(c.h)?;
         let placed = c.send(auth, OpKind::Place).await?;
         c.settle(|c| !c.outcomes(placed).is_empty()).await;
+        // What the placement's answer brings, every outcome and order update, has come.
+        c.churn().await;
         let outcomes = c.outcomes(placed);
-        // The single command's one item, or the whole request (Codex r4223068215).
+        // The single command's one item, or the whole request (Codex r4223068215), accepted
+        // once as the venue acknowledges (Codex r4223435588).
         let one =
             |(it, _): &(Option<ItemRef>, SubmitOutcome)| it.as_ref().is_none_or(|it| it.idx == 0);
-        let first = outcomes.first().filter(|_| outcomes.iter().all(one));
-        let Some((_, SubmitOutcome::Accepted { .. })) = first else {
-            let what = format!("the placement the stub accepted was reported {outcomes:?}");
+        let acks: Vec<&SubmitOutcome> = outcomes.iter().map(|(_, o)| o).collect();
+        if !outcomes.iter().all(one) || !accepted_once(&acks, model) {
+            let what =
+                format!("the placement the stub accepted was reported {outcomes:?}, not once");
             return Err(c.h.fail("ExecCodec::on_frame", what));
-        };
-        // What the placement's answer brings, every outcome and order update in the order it
-        // came, applied as a live consumer applies them (Codex r4222779025): the venue id an
-        // update states names the order where the acceptance names none.
-        c.churn().await;
+        }
+        // Applied in the order it came, as a live consumer applies it (Codex r4222779025): the
+        // venue id an update states names the order where the acceptance names none.
         c.oms.replay(c.h, cid, placed, &c.events())?;
         let placed_vid = c.oms.vid(cid);
         let auth = c.oms.amend(c.h, cid, px, qty)?;
@@ -96,6 +100,8 @@ pub fn amend_ack(subject: &Subject<'static>) -> Result<Verdict, Failure> {
         let update = |c: &Ctx<'_>| amended_update(&c.events()[before..], names);
         c.settle(|c| !c.outcomes(rpc).is_empty() && update(c).is_some())
             .await;
+        // What the amend's answer brings with them has come.
+        c.churn().await;
         let asked = Asked {
             cid,
             placed: placed_vid.clone(),
@@ -103,7 +109,10 @@ pub fn amend_ack(subject: &Subject<'static>) -> Result<Verdict, Failure> {
             qty,
             model,
         };
-        Ok(judge_amend(c, rpc, update(c), &asked, &amend, &ack))
+        let update = update(c);
+        let mut breaches = judge_amend(c, rpc, update.clone(), &asked, &amend, &ack);
+        breaches.extend(contradicted(&c.events()[before..], &asked, update.as_ref()));
+        Ok(breaches)
     })?;
     verdict(AMEND_ACK, breaches, || {
         let mut probed = vec![format!(
@@ -273,6 +282,55 @@ fn judge_amend(
         breaches.push(Breach::new("AmendCaps.keeps_venue_id is true", what));
     }
     breaches
+}
+
+/// What, of `events` (those reported once the amend was sent), says the amend the stub accepted
+/// failed: a refusal naming the order, of any operation (Codex r4223435612), or an update
+/// ending it (Reviewer B RB-3il-5), on a cancel-replace venue an end of the old order reported
+/// before its replacement, which fbc-oms takes as the order's end, releasing the cap it holds
+/// while it still rests under its new venue id. The order is named by its client id, the id it
+/// was placed under, or the new one the amended `update` names.
+fn contradicted(events: &[ExecEvent], asked: &Asked, update: Option<&OrderUpdate>) -> Vec<Breach> {
+    let new_vid = update.and_then(|u| match &u.state {
+        VenueOrderState::Amended { new_vid } => new_vid.as_ref(),
+        _ => None,
+    });
+    let vids: Vec<&VenueOrderId> = asked.placed.iter().chain(new_vid).collect();
+    let by_vid = |vid: Option<&VenueOrderId>| vid.is_some_and(|vid| vids.contains(&vid));
+    let mut breaches = Vec::new();
+    for event in events {
+        match event {
+            ExecEvent::AsyncReject { target, op, .. }
+                if target.client() == Some(asked.cid) || by_vid(target.venue()) =>
+            {
+                let what = format!(
+                    "the amend the stub accepted, and nothing else, was followed by a refusal \
+                     of {op:?} naming the order, {target:?}"
+                );
+                breaches.push(Breach::new("ExecEvent::AsyncReject", what));
+            }
+            ExecEvent::Order(u)
+                if ended(&u.state)
+                    && (u.cid == Some(CidMatch::Ours(asked.cid)) || by_vid(u.vid.as_ref())) =>
+            {
+                let what = format!(
+                    "an update {:?} ended the order the stub amended, which still rests",
+                    u.state
+                );
+                breaches.push(Breach::new("OrderUpdate", what));
+            }
+            _ => {}
+        }
+    }
+    breaches
+}
+
+/// Whether `state` ends an order.
+fn ended(state: &VenueOrderState) -> bool {
+    !matches!(
+        state,
+        VenueOrderState::Open | VenueOrderState::Amended { .. }
+    )
 }
 
 /// Whether an amended update names a new venue id, `new_vid`: one, and another than both the
