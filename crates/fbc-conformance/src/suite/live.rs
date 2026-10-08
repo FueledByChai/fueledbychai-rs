@@ -77,12 +77,15 @@ impl<'s> Live<'s> {
         check: &'static str,
         subject: &'s Subject<'static>,
     ) -> Result<Result<Live<'s>, Verdict>, Failure> {
-        let h = Harness::new(check, subject)?;
-        let Some(exec) = &h.caps.exec else {
+        // The caps first: a venue taking no orders is skipped whatever instrument its setup
+        // lists, none included (Codex r4224199070).
+        let caps = Harness::caps(check, subject)?;
+        let Some(exec) = caps.exec else {
             let why = "VenueCaps.exec is None: the venue takes no orders";
             return Ok(Err(Verdict::Skipped { check, why }));
         };
-        let order = exec.order.clone();
+        let order = exec.order;
+        let h = Harness::new(check, subject)?;
         if subject.setup().order_entry.is_none() {
             let what = "the venue declares order entry, yet the setup states no OrderEntryStub \
                         for the stub server to answer it with";
@@ -426,7 +429,7 @@ impl Ctx<'_> {
         self.heard.events.borrow().clone()
     }
 
-    /// How many frames the stub received on the session's first connection that carry `cid` as
+    /// How many frames the stub received on every connection of the session that carry `cid` as
     /// the venue's wire spells it (Codex r4222138042: a request rebuilt and signed again is
     /// another frame carrying the same order); where none does, the venue does not send our
     /// id as text, and the frames equal to the first request's (the first frame after the

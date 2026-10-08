@@ -59,12 +59,13 @@ venue for the program's life (`ExecSessionConfig::venue` is `&'static dyn VenueF
   (600 s), so a late retry shows.
 - Each check judges what the session reported (outcomes by request and item, each answered item
   once and naming its own order, an acceptance of the whole request taken as its one item's,
-  order updates reported after the amend, every identity and field each amended update states the
-  amended order's, nothing filled, the flags the order's and stated where
-  `OrderCaps.events_echo_flags`, the client id stated where `OrderCaps.cid_echoed_on_events`,
-  nothing written once the amend is answered, a new venue id only where `AmendCaps.keeps_venue_id` is false, the placement accepted
-  once as `OrderCaps.ack` has it, and no refusal naming the amended order nor update ending it
-  once the amend is sent) and what the stub received on every connection: an
+  order updates reported after the amend, every identity and field each update naming the
+  amended order and leaving it resting (`Amended` or `Open`) states the amended order's, nothing
+  filled, the flags the order's and stated where `OrderCaps.events_echo_flags`, the client id
+  stated where `OrderCaps.cid_echoed_on_events`, nothing written once the amend is answered, a
+  new venue id only where `AmendCaps.keeps_venue_id` is false, the placement accepted once as
+  `OrderCaps.ack` has it, and no refusal naming the amended order, update ending it nor fill of
+  it once the amend is sent) and what the stub received on every connection: an
   order written once, counted by the frames carrying our client id as the venue's wire spells
   it, so a request rebuilt and signed again counts too (byte-equal frames where the venue sends
   no such id).
