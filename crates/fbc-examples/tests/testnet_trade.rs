@@ -2385,3 +2385,101 @@ fn the_account_audit_counts_every_order_not_ours_reported_not_only_those_in_view
         );
     }
 }
+
+#[test]
+fn a_refused_url_or_proxy_is_never_echoed() {
+    // Codex r4216452827: a URL or proxy that carries a secret (a user and password, a token in
+    // the query or the fragment) is refused naming its flag, never with what was typed. A
+    // testnet URL with a query or a fragment is refused too, so none is printed later.
+    let secret = "hunter2";
+    for (flag, value) in [
+        (
+            "--rest-url",
+            "https://user:hunter2@api.testnet.paradex.trade/v1",
+        ),
+        (
+            "--ws-url",
+            "wss://user:hunter2@ws.api.testnet.paradex.trade/v1",
+        ),
+        (
+            "--rest-url",
+            "https://api.prod.paradex.trade/v1?token=hunter2",
+        ),
+        ("--ws-url", "wss://ws.api.prod.paradex.trade/v1#hunter2"),
+        (
+            "--rest-url",
+            "https://api.testnet.paradex.trade/v1?token=hunter2",
+        ),
+        ("--ws-url", "wss://ws.api.testnet.paradex.trade/v1#hunter2"),
+        (
+            "--rest-url",
+            "ftp://user:hunter2@api.testnet.paradex.trade/v1",
+        ),
+        ("--rest-url", "https://[hunter2/v1"),
+        ("--socks5", "user:hunter2@proxy.example:x"),
+    ] {
+        let mut argv = strings(&MARKET_ARGS);
+        argv.extend(strings(&[flag, value]));
+        let err = args::parse(argv).unwrap_err();
+        assert!(err.starts_with(flag), "{flag} {value}: {err}");
+        assert!(!err.contains(secret), "{flag} {value}: {err}");
+    }
+}
+
+#[test]
+fn the_fill_baseline_of_an_order_the_resync_restored_is_the_snapshots() {
+    // Codex r4216452822: an order event can raise a restored order's fill in the registry
+    // before the run takes the order on; the baseline is what the snapshot showed, so that
+    // fill still counts as traded.
+    use fbc_core::{
+        AccountKey, CidMatch, CidMint, InstrumentId, Lots, MonoNs, Namespace, NamespaceLease, Side,
+        VenueOrderSnapshot, VenueOrderState, WallNs,
+    };
+    use fbc_oms::{LadderConfig, OrderKey, Registry, ResyncSnapshot};
+    let lease =
+        NamespaceLease::acquire(&lease_dir(), AccountKey::new(1), Namespace::new(1)).unwrap();
+    let mut mint = CidMint::new(lease, 0, 0, WallNs(0));
+    let (a, other) = (mint.mint().unwrap(), mint.mint().unwrap());
+    let caps = fbc_venue_paradex::factory::caps();
+    let shown = |cid, vid: &str, inst, filled| VenueOrderSnapshot {
+        cid: Some(CidMatch::Ours(cid)),
+        vid: fbc_core::dispatch(&caps, Namespace::new(1), |s| s.venue_order_id(vid)).unwrap(),
+        inst: InstrumentId::new(inst),
+        side: Side::Sell,
+        state: VenueOrderState::Open,
+        px: None,
+        qty: Lots::new(3).unwrap(),
+        cum_filled: Lots::new(filled).unwrap(),
+        post_only: None,
+        reduce_only: None,
+    };
+    let snapshot = |filled| ResyncSnapshot {
+        watermark: WallNs(0),
+        requested_at: MonoNs(0),
+        orders: vec![shown(a, "V-1", 1, filled), shown(other, "V-2", 2, 0)],
+        positions: vec![],
+    };
+    // Only the market's orders: the other instrument's is not taken on.
+    let first = snapshot(1);
+    assert_eq!(
+        trade::restored_baseline(&first),
+        [(a, Lots::new(1).unwrap())]
+    );
+    // The registry has since seen 2 filled: the snapshot's 1 stays the baseline.
+    let order_caps = caps.exec.clone().unwrap().order;
+    let ladder = LadderConfig::new(
+        Duration::from_secs(5),
+        Duration::from_secs(1),
+        Duration::from_secs(60),
+        2,
+    )
+    .unwrap();
+    let mut reg = Registry::new();
+    let key = OrderKey {
+        venue: Some(1),
+        ingest: 1,
+    };
+    reg.resync(&ladder, &order_caps, &snapshot(2), key).unwrap();
+    let owned = trade::restored_baseline(&first);
+    assert_eq!(trade::traded(&reg, &owned), [(a, Lots::new(2).unwrap())]);
+}

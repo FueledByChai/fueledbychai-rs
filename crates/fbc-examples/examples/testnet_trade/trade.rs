@@ -856,6 +856,20 @@ pub fn traded(reg: &Registry, owned: &[(ClientOrderId, Lots)]) -> Vec<(ClientOrd
         .collect()
 }
 
+/// Our orders on the market that `snapshot` shows, each with what of it had filled then: the
+/// baseline [`traded`] counts from.
+pub fn restored_baseline(snapshot: &ResyncSnapshot) -> Vec<(ClientOrderId, Lots)> {
+    snapshot
+        .orders
+        .iter()
+        .filter(|o| o.inst == INST)
+        .filter_map(|o| match o.cid {
+            Some(CidMatch::Ours(cid)) => Some((cid, o.cum_filled)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Those of `owned` (our orders on the market) resting on `side`, each with what of it rests
 /// ([`OrderRecord::resting`](fbc_oms::OrderRecord::resting)); one the registry does not hold
 /// is not among them.
@@ -1196,15 +1210,9 @@ impl Driver {
                             .iter()
                             .filter(|o| o.inst == INST && !matches!(o.cid, Some(CidMatch::Ours(_))))
                             .count(),
-                        snapshot
-                            .orders
-                            .iter()
-                            .filter(|o| o.inst == INST)
-                            .filter_map(|o| match o.cid {
-                                Some(CidMatch::Ours(cid)) => Some(cid),
-                                _ => None,
-                            })
-                            .collect::<Vec<ClientOrderId>>(),
+                        // Each with what the snapshot showed filled: an order event may have
+                        // raised the registry's count since, and that fill is this run's.
+                        restored_baseline(snapshot),
                         snapshot
                             .positions
                             .iter()
@@ -1249,14 +1257,7 @@ impl Driver {
             ),
         );
 
-        {
-            let mut link = self.link.borrow_mut();
-            let reg = link.reg();
-            self.owned = ours
-                .into_iter()
-                .map(|cid| (cid, reg.get(cid).map_or(Lots::ZERO, |r| r.filled())))
-                .collect();
-        }
+        self.owned = ours;
         if not_ours > 0 {
             // The registry neither cancels nor counts the fills of an order it cannot own: one
             // could fill during the run and stay open after Stop, so the run is refused before
