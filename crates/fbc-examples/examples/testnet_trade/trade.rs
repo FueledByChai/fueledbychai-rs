@@ -9,7 +9,8 @@
 //! best bid for a buy (above the best ask for a sell) read from `GET /orderbook` before the
 //! session starts, floored (ceiled) onto the tick, and refused unless it lies strictly behind
 //! the touch. The touch is read again once the market is Started, just before the place: the
-//! order goes out only if it is still at least `--away-bps` behind it.
+//! order goes out only if it is still at least `--away-bps` behind it, and the inventory cap
+//! at the fresh ask is still no fewer lots than the caps hold.
 //!
 //! **Its size.** `--order-usd` (required, no default, at most the resting cap) at the order's
 //! price, floored onto the size step. Refused when that is no lot, or its notional is below the
@@ -271,6 +272,7 @@ pub async fn run(
         opts: opts.clone(),
         specs: specs.clone(),
         first_seq: book.seq_no,
+        inventory: order.inventory,
     };
     let session_cfg = session_config(factory, cfg, creds, specs, opts)?;
     let (mut session, control) =
@@ -550,11 +552,14 @@ struct Recheck {
     specs: SpecTable,
     /// The first read's book sequence: the second must not be older.
     first_seq: u64,
+    /// The inventory cap in lots the registry holds, from the first read.
+    inventory: Lots,
 }
 
 impl Recheck {
     /// Reads the touch again and checks the order at `px` is still at least `--away-bps` behind
-    /// it: the touch it reports, or why the order must not go out.
+    /// it, and the inventory cap at the higher of `px` and the fresh ask is no fewer lots than
+    /// the caps hold: the touch it reports, or why the order must not go out.
     async fn still_away(&self, px: Ticks) -> Result<(Touch, u64), String> {
         let book = touch(&self.opts, &self.specs).await?;
         if book.seq_no < self.first_seq {
@@ -569,18 +574,30 @@ impl Recheck {
             OrderSide::Buy => px <= now.away,
             OrderSide::Sell => px >= now.away,
         };
-        if far_enough {
-            Ok((now, book.seq_no))
-        } else {
-            Err(format!(
+        if !far_enough {
+            return Err(format!(
                 "the touch moved toward the order (bid {}, ask {}): at {} it would be less than \
                  {} bps behind it",
                 now.bid,
                 now.ask,
                 Decimal::from(px.0) * self.opts.tick,
                 self.opts.away_bps
-            ))
+            ));
         }
+        // The inventory cap in lots at the fresh market: never fewer than the registry holds,
+        // or its check would admit a position worth more than the cap now.
+        let at = (Decimal::from(px.0) * self.opts.tick).max(now.ask);
+        let usd = self.opts.inventory_cap_usd;
+        let lots = (usd / (at * self.opts.step)).floor().to_i64().unwrap_or(0);
+        if lots < self.inventory.get() {
+            return Err(format!(
+                "the inventory cap of ${usd} is now {lots} lots at the ask of {}, fewer than the \
+                 {} lots the caps hold from the first read",
+                now.ask,
+                self.inventory.get()
+            ));
+        }
+        Ok((now, book.seq_no))
     }
 }
 
@@ -716,6 +733,21 @@ pub fn account_changes(notes: &[Note], reg: &Registry, start: Option<SignedLots>
         );
     }
     changes
+}
+
+/// As [`off_thread`], holding `held` until `work` ends, even past the timeout: a lease `work`
+/// relies on stays held while it runs.
+pub async fn off_thread_holding<H: Send + 'static, T: Send + 'static>(
+    timeout: Duration,
+    held: H,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    off_thread(timeout, move || {
+        let done = work();
+        drop(held);
+        done
+    })
+    .await
 }
 
 /// Runs `work` on a thread of its own and waits up to `timeout` for its result: `None` when it
@@ -1242,7 +1274,10 @@ impl Driver {
         // session runs on, for at most the step timeout, nor holds up the exit after it.
         let hwm = self.hwm.clone();
         let mark = mint.high_water();
-        let kept = off_thread(self.timeout, move || hwm.write(mark))
+        // The mint, holding the namespace lease, goes with the write: the lease is held until
+        // the write ends, even one that outlives the timeout, so no other run takes the
+        // namespace and keeps a newer mark that this late write would then replace.
+        let kept = off_thread_holding(self.timeout, mint, move || hwm.write(mark))
             .await
             .unwrap_or_else(
                 || Err("the high-water mark's write did not finish in time".to_owned()),
