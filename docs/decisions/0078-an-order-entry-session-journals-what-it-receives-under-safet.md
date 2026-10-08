@@ -59,7 +59,10 @@ also:
    (`ExecCounters::refused_redactions`) and that input is hashed whole, as on market data.
    Since one codec serves every epoch (0053), an HTTP result that comes back after its epoch
    ended is journaled with the spans that codec names in it, not hashed whole as a market-data
-   session's ended codec leaves it.
+   session's ended codec leaves it, but only until that codec's `on_open` is called for a
+   later epoch: opening may change the state its redaction reads, so from then on such a
+   result is hashed whole. An epoch a dropped run left connected ends the session's orders
+   when it is ended, since the session runs once and could never send them.
    Every `Opened` has exactly one `Closed`, in the same journal: an epoch a dropped run left
    connected is ended before `set_journal` changes the journal, one a panic unwinds through is
    journaled closed as the session drops, if the sink is not borrowed then, and one journaled

@@ -1400,6 +1400,55 @@ async fn an_ended_epochs_http_result_keeps_what_the_one_codec_does_not_name() {
     assert_eq!((toy.value.as_str(), toy.redact), ("yes", false));
 }
 
+/// Codex P1 r4214607580 on PR #115: once the one codec's `on_open` has run for a later epoch,
+/// its state may no longer name what an ended epoch's result carries, so a result of an epoch
+/// before the one the codec was last opened for is hashed whole.
+#[tokio::test]
+async fn an_ended_epochs_http_result_is_hashed_whole_once_the_codec_opened_a_later_epoch() {
+    let token = secret("stalereopened");
+    let mut server = ScriptedWs::start().await;
+    let mut http = ScriptedHttp::start().await;
+    let venue = Venue::leak(auth_toy);
+    let cfg = [(LOGIN, http.url("/auth")), (CALL_NONCES, "0".to_owned())];
+    let quick = ReconnectPacing::new(ms(20), ms(20), 100, ms(60_000), ms(5_000)).unwrap();
+    let config = ExecSessionConfig {
+        pacing: quick,
+        ..config(venue, &server.url(), &cfg, Counting::new())
+    };
+    let body = format!("auth|token={token}|refresh=3600");
+    let live_body = body.clone();
+    let run = journaled(
+        "exec_journal_stale_reopened",
+        config,
+        |_, control, _| async move {
+            let first = server.accept().await;
+            let login = http.request().await;
+            first.drop_conn();
+            // The next epoch opens and its `on_open` asks for its own login.
+            let _second = server.accept().await;
+            let _relogin = http.request().await;
+            let answered = login.answer("HTTP/1.1 200 OK\r\nX-Toy: yes", &live_body);
+            let _ = tokio::time::timeout(ms(500), answered).await;
+            tokio::time::sleep(ms(100)).await;
+            drop(control);
+        },
+    )
+    .await;
+    run.ended.as_ref().unwrap();
+    assert!(!contains(&run.files, token.as_bytes()));
+    let resp = run.entries.iter().find_map(|e| match &e.record {
+        Record::HttpResult {
+            stamp,
+            result: Ok(r),
+            ..
+        } if stamp.conn == key(0) => Some(r.clone()),
+        _ => None,
+    });
+    let resp = resp.expect("epoch 0's login result is journaled");
+    assert_eq!(resp.body.0, blank(body.len()).as_bytes());
+    assert!(resp.headers.iter().all(|h| h.redact), "{:#?}", resp.headers);
+}
+
 /// Codex P2 r4214243083 on PR #115 (Reviewer A, Reviewer B RB-2pr-1): an epoch journaled closed
 /// as the control drops stays closed once, when the codec panics redacting the frame waiting
 /// then and the session is dropped as the panic unwinds.
