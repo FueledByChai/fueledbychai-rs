@@ -357,8 +357,8 @@ rather than guess.
     conformance stub. So far `examples/md_watch/`: a Paradex market's bbo, trades and `deltas`
     book and a Binance USD-M symbol's `bookTicker` and diff-depth book through `MdVenue`, one
     `MdBooks` per venue, a line per update; no order, no credential (`tests/md_watch.rs`); and
-    `examples/testnet_trade/` (FBC-x69b): Paradex TESTNET only (the URLs and chain id checked
-    before anything connects), an fbc-oms registry declared an owner-assisted testnet run
+    `examples/testnet_trade/` (FBC-x69b): Paradex TESTNET only (the URLs, exactly the
+    testnet's or a loopback stub's at `/v1`, and the chain id checked before anything connects), an fbc-oms registry declared an owner-assisted testnet run
     (decision 0067) behind one `ExecSession`, its events routed into the registry by
     `link.rs` (the ExecHandler-to-Registry glue a later sample can promote), one post-only order
     placed well away from the touch read from `GET /orderbook` (read again just before the

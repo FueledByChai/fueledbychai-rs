@@ -295,6 +295,7 @@ pub async fn run(
         start_position: None,
         owned: Vec::new(),
         recheck,
+        mint: None,
     };
     let order = Planned {
         side: match opts.side {
@@ -787,18 +788,15 @@ pub fn account_changes(
 }
 
 /// As [`off_thread`], holding `held` until `work` ends, even past the timeout: a lease `work`
-/// relies on stays held while it runs.
+/// relies on stays held while it runs. Work that ends in time hands `held` back with its
+/// result, for the caller to keep; past the timeout it is dropped on the work's thread once
+/// the work ends.
 pub async fn off_thread_holding<H: Send + 'static, T: Send + 'static>(
     timeout: Duration,
     held: H,
     work: impl FnOnce() -> T + Send + 'static,
-) -> Option<T> {
-    off_thread(timeout, move || {
-        let done = work();
-        drop(held);
-        done
-    })
-    .await
+) -> Option<(T, H)> {
+    off_thread(timeout, move || (work(), held)).await
 }
 
 /// Runs `work` on a thread of its own and waits up to `timeout` for its result: `None` when it
@@ -1045,6 +1043,10 @@ struct Driver {
     owned: Vec<(ClientOrderId, Lots)>,
     /// The touch's second read, just before the place.
     recheck: Recheck,
+    /// The client-id mint once its mark was kept, holding the namespace lease: dropped with
+    /// the driver, when the run ends, Stop included (Reviewer B's RB114-7), so no other
+    /// testnet_trade takes the namespace while this one trades.
+    mint: Option<CidMint>,
 }
 
 impl Driver {
@@ -1384,12 +1386,15 @@ impl Driver {
         let mark = mint.high_water();
         // The mint, holding the namespace lease, goes with the write: the lease is held until
         // the write ends, even one that outlives the timeout, so no other run takes the
-        // namespace and keeps a newer mark that this late write would then replace.
-        let kept = off_thread_holding(self.timeout, mint, move || hwm.write(mark))
-            .await
-            .unwrap_or_else(
-                || Err("the high-water mark's write did not finish in time".to_owned()),
-            );
+        // namespace and keeps a newer mark that this late write would then replace. A write
+        // that ends in time hands the mint back, kept until the run ends ([`Driver::mint`]).
+        let kept = match off_thread_holding(self.timeout, mint, move || hwm.write(mark)).await {
+            Some((kept, mint)) => {
+                self.mint = Some(mint);
+                kept
+            }
+            None => Err("the high-water mark's write did not finish in time".to_owned()),
+        };
         if let Err(e) = kept {
             self.note(format_args!("{e}; nothing placed"));
             return false;
