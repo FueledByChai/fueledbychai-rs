@@ -13,11 +13,13 @@
 //! [`Rpcs`] holds each written request's deadline until the first event that answers it
 //! ([`ExecEvent::answers`](fbc_core::ExecEvent::answers)); one still unanswered at its deadline
 //! is handed to the codec's `on_rpc_timeout`, once, which reports it `Unknown` (0005, 0014
-//! item 3).
+//! item 3). A request asked as an HTTP request is also cleared by the call to the codec's
+//! `on_http` for it, and its deadline stands only once the epoch that asked has ended, since
+//! until then its result always comes back to `on_http` (FBC-m8vm, decision 0081).
 
 use std::cell::{Cell, RefCell};
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -288,6 +290,9 @@ pub(crate) struct Rpcs {
     due: BinaryHeap<Reverse<(Instant, RpcId)>>,
     /// The requests written and neither answered nor timed out.
     live: HashSet<RpcId>,
+    /// The requests asked as HTTP requests whose epoch has not ended: the epoch that asked and
+    /// the deadline, which stands once that epoch ends (decision 0081).
+    held: HashMap<RpcId, (u32, Option<Instant>)>,
 }
 
 impl Rpcs {
@@ -303,9 +308,38 @@ impl Rpcs {
         }
     }
 
-    /// Request `rpc` was answered: it reaches no deadline.
+    /// Request `call` is asked as an HTTP request of epoch `epoch` at `now`: its deadline is
+    /// `call.timeout` from then, standing only once that epoch has ended ([`Self::ended`]),
+    /// since until then its result, or the failure that stands for one, always reaches the
+    /// codec's `on_http` (decision 0081). A request already waiting keeps its first deadline.
+    pub(crate) fn asked(&mut self, call: RpcCall, epoch: u32, now: Instant) {
+        if self.live.insert(call.id) {
+            let at = now.checked_add(call.timeout);
+            self.held.insert(call.id, (epoch, at));
+        }
+    }
+
+    /// Epoch `epoch` ended: the deadlines of the HTTP requests it asked stand, since a result
+    /// coming back now is dropped and never reaches the codec.
+    pub(crate) fn ended(&mut self, epoch: u32) {
+        let ended: Vec<RpcId> = self
+            .held
+            .iter()
+            .filter(|(_, (asked, _))| *asked == epoch)
+            .map(|(rpc, _)| *rpc)
+            .collect();
+        for rpc in ended {
+            if let Some((_, Some(at))) = self.held.remove(&rpc) {
+                self.due.push(Reverse((at, rpc)));
+            }
+        }
+    }
+
+    /// Request `rpc` was answered, or its HTTP result handed to the codec: it reaches no
+    /// deadline.
     pub(crate) fn answered(&mut self, rpc: RpcId) {
         self.live.remove(&rpc);
+        self.held.remove(&rpc);
     }
 
     /// When the earliest deadline falls due; it may be an answered request's, which falls due
@@ -358,6 +392,38 @@ mod tests {
         assert_eq!(rpcs.take_due(now + ms(25)), [RpcId(2), RpcId(1)]);
         // The answered one falls due into nothing, and nothing falls due twice.
         assert_eq!(rpcs.take_due(now + ms(60)), []);
+        assert_eq!(rpcs.next_deadline(), None);
+    }
+
+    #[test]
+    fn an_http_requests_deadline_stands_only_once_its_epoch_ended_and_never_once_handed_over() {
+        let now = Instant::now();
+        let ms = Duration::from_millis;
+        let mut rpcs = Rpcs::default();
+        // Asked on epoch 0: two still out, one handed over, one of epoch 1.
+        rpcs.asked(call(1, 10), 0, now);
+        rpcs.asked(call(2, 20), 0, now);
+        rpcs.asked(call(3, 10), 0, now);
+        rpcs.asked(call(4, 10), 1, now);
+        // A second ask of request 1 keeps its first deadline; a frame of it sets none.
+        rpcs.asked(call(1, 5), 0, now);
+        rpcs.sent(call(1, 5), now);
+        rpcs.answered(RpcId(3));
+        // While epoch 0 lasts, nothing falls due.
+        assert_eq!(rpcs.next_deadline(), None);
+        assert!(rpcs.take_due(now + ms(60)).is_empty());
+        rpcs.ended(0);
+        assert_eq!(rpcs.next_deadline(), Some(now + ms(10)));
+        assert_eq!(rpcs.take_due(now + ms(25)), [RpcId(1), RpcId(2)]);
+        // Epoch 1's still waits, and one whose deadline the clock cannot hold never falls due.
+        let never = RpcCall {
+            id: RpcId(5),
+            timeout: Duration::MAX,
+        };
+        rpcs.asked(never, 1, now);
+        assert!(rpcs.take_due(now + ms(60)).is_empty());
+        rpcs.ended(1);
+        assert_eq!(rpcs.take_due(now + ms(60)), [RpcId(4)]);
         assert_eq!(rpcs.next_deadline(), None);
     }
 
