@@ -203,6 +203,11 @@ pub(crate) struct Core {
     refused_redactions: Cell<u64>,
     pub(crate) rates: RateLimiter,
     pub(crate) journal: Option<Journal>,
+    /// The class an inbound data frame and an HTTP result are journaled under: Normal on a
+    /// market-data session; Safety on an order-entry session, whose inputs carry the acks and
+    /// fills 0006 reserves room for and cannot be told apart before they are decoded (decision
+    /// 0078).
+    pub(crate) inbound: TrafficClass,
 }
 
 /// An HTTP request in flight.
@@ -258,6 +263,7 @@ impl Core {
             refused_redactions: Cell::new(0),
             rates: config.rates,
             journal: None,
+            inbound: TrafficClass::Normal,
         }
     }
 
@@ -459,7 +465,7 @@ impl Core {
                 frame: raw,
                 redact: spans.body(),
             };
-            journal.record_ref(TrafficClass::Normal, stamp.recv_wall, frame);
+            journal.record_ref(self.inbound, stamp.recv_wall, frame);
         }
         Some((stamp, raw))
     }
@@ -804,7 +810,12 @@ impl Core {
                 tag: done.tag,
                 result,
             };
-            journal.record_ref(done.class, stamp.recv_wall, answer);
+            // Under its request's class, or Safety on an order-entry session (decision 0078).
+            let class = match self.inbound {
+                TrafficClass::Safety => TrafficClass::Safety,
+                TrafficClass::Normal => done.class,
+            };
+            journal.record_ref(class, stamp.recv_wall, answer);
         }
         (stamp, done)
     }
