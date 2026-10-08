@@ -111,7 +111,7 @@ pub fn commands_selfcontained(subject: &Subject<'_>) -> Result<Verdict, Failure>
 }
 
 /// Every command to encode, named by the operation and the reference it names its order by.
-fn commands(h: &Harness<'_>, o: &OrderCaps, ids: &Ids) -> Vec<(String, VenueCommand)> {
+pub(crate) fn commands(h: &Harness<'_>, o: &OrderCaps, ids: &Ids) -> Vec<(String, VenueCommand)> {
     let mut out = Vec::new();
     // An amend targets a resting limit order: none to amend where the caps allow none.
     let limit = Shape::sendable(o, &[OrderKindTag::Limit]);

@@ -28,6 +28,17 @@ A check that reads recorded data reads it from a subdirectory named after the ch
   (`decoder_deterministic/orders`). Client ids in them are arbitrary text, never one the suite
   minted.
 
-`caps_truthful` and `commands_selfcontained` read no file: they need only the toy's factory
-and the setup the suite's test gives (the toy's spec table, an empty configuration and no
-credentials).
+- `ids_roundtrip/java_era.txt`: client ids another system would send the toy, each of which
+  `ids_roundtrip` must read as `Unparseable`: Java-style millisecond counters, a random UUID,
+  a typed-in label and one of the suite's own ids with its last character changed. The Java
+  stack never traded the toy, so these stand in for a real venue's Java-era ids.
+- `restart_cid/resting.frames`: a case in the same format of what the toy shows a process
+  restarted after the suite's mint issued our first eight ids: order updates for two of them
+  (filled, canceled) and a resync's answer with two resting, the newest among them, beside an
+  order whose client id is not ours. The client ids are the toy's spelling (base 62, 21
+  characters) of the suite's sequence numbers 5 to 8 in its namespace 1, computed with
+  `fbc_core::encode_cid`; nothing here is a real account's.
+
+`caps_truthful`, `commands_selfcontained`, `encode_deterministic` and `price_grid` read no
+file: they need only the toy's factory and the setup the suite's test gives (the toy's spec
+table, an empty configuration and no credentials).

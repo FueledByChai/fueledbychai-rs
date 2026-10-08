@@ -1,0 +1,13 @@
+# What the toy shows a process restarted after the suite's mint issued our ids 1 to 8 (the
+# toy's spelling of sequence numbers 1 to 8 in the suite's namespace, 1). First the order
+# updates it sent just before the restart: our id 6 filled and our id 7 canceled (recent ids).
+text order|cid=00SKjrSqeFPTfblTmfeWm|vid=toy-7306|sym=TOYA-PERP|side=B|st=filled|cum=25|px=130865|qty=25|po=1|ro=0|seq=41
+text order|cid=00SKjrSqeFPTfblWv0U21|vid=toy-7307|sym=TOYB-PERP|side=S|st=canceled|why=requested|cum=0|px=130880|qty=3|po=1|ro=0|seq=42
+# Then the restarted process's resync: our ids 8 (the newest) and 5 rest, beside an order
+# the Java stack left, whose client id is not ours.
+resync
+text rsbegin|wm=1759363200000000000
+text rsorder|cid=00SKjrSqeFPTfblbZHsMS|vid=toy-7308|sym=TOYA-PERP|side=B|st=open|px=130860|qty=25|cum=0|po=1|ro=0
+text rsorder|cid=00SKjrSqeFPTfblNYkHZx|vid=toy-7305|sym=TOYB-PERP|side=S|st=open|px=130875|qty=3|cum=1|po=1|ro=0
+text rsorder|cid=1759363199123|vid=toy-6001|sym=TOYA-PERP|side=B|st=open|px=130800|qty=2|cum=0|po=0|ro=0
+text rsend

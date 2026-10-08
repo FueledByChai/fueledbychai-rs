@@ -30,13 +30,15 @@
 //!   crate's `tests/conformance.rs` invokes with its factory, its fixture directory (whose
 //!   layout [`suite`] documents) and the setup its fixtures assume, each named check becoming a
 //!   test; and each check as a public function. So far `caps_truthful`,
-//!   `commands_selfcontained`, `signing_golden` and `legacy_symbols` (FBC-onw), and `fee_sign`,
+//!   `commands_selfcontained`, `signing_golden` and `legacy_symbols` (FBC-onw), `fee_sign`,
 //!   `liquidity_reported`, `position_signed` and `decoder_deterministic`, which read the
-//!   venue's fixture frames (FBC-whw); the conformance toy passes all eight, a deliberately
-//!   broken toy fails `caps_truthful` (`tests/suite_broken.rs`), a toy whose signer changes one
-//!   signed byte fails `signing_golden` (`tests/suite_golden.rs`), and toys that flip a fee's
-//!   sign or decode nondeterministically fail `fee_sign` and `decoder_deterministic`
-//!   (`tests/suite_frames.rs`).
+//!   venue's fixture frames (FBC-whw), and `encode_deterministic`, `ids_roundtrip`,
+//!   `restart_cid` and `price_grid` (FBC-2re); the conformance toy passes all twelve, a
+//!   deliberately broken toy fails `caps_truthful` (`tests/suite_broken.rs`), a toy whose
+//!   signer changes one signed byte fails `signing_golden` (`tests/suite_golden.rs`), toys
+//!   that flip a fee's sign or decode nondeterministically fail `fee_sign` and
+//!   `decoder_deterministic` (`tests/suite_frames.rs`), and a toy whose encode reads the real
+//!   time fails `encode_deterministic` (`tests/suite_ids_grid.rs`).
 //!
 //! Not here yet: the suite's other checks, and the rest of the conformance toy venue.
 

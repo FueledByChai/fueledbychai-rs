@@ -1,8 +1,9 @@
-//! FBC-8ew's, FBC-onw's and FBC-whw's done lines, their first halves: the named suite runs on
-//! the conformance toy venue through the suite macro with its fixture directory (BT-502,
-//! design §6), `caps_truthful`, `commands_selfcontained`, `signing_golden`, `legacy_symbols`,
-//! `fee_sign`, `liquidity_reported`, `position_signed` and `decoder_deterministic` each a
-//! test, and all pass. The checks are run directly too, to show what they probed: a
+//! FBC-8ew's, FBC-onw's, FBC-whw's and FBC-2re's done lines, their first halves: the named
+//! suite runs on the conformance toy venue through the suite macro with its fixture directory
+//! (BT-502, design §6), `caps_truthful`, `commands_selfcontained`, `signing_golden`,
+//! `legacy_symbols`, `fee_sign`, `liquidity_reported`, `position_signed`,
+//! `decoder_deterministic`, `encode_deterministic`, `ids_roundtrip`, `restart_cid` and
+//! `price_grid` each a test, and all pass. The checks are run directly too, to show what they probed: a
 //! pass that probed nothing would prove nothing.
 
 mod toy_setup;
@@ -165,4 +166,60 @@ fn decoder_deterministic_decodes_every_case_of_the_toys_fixtures_twice() {
             "decoder_deterministic/orders.frames: 5 lines",
         ]
     );
+}
+
+#[test]
+fn encode_deterministic_encodes_every_golden_and_built_command_twice_on_the_toy() {
+    let probed = probed(suite::encode_deterministic);
+    assert_eq!(
+        probed,
+        [
+            "golden place",
+            "golden place-batch",
+            "golden amend",
+            "golden cancel",
+            "golden cancel-batch",
+            "the plainest order",
+            "AmendCaps.refs has Venue: an amend",
+            "OrderCaps.cancel_refs has Venue: a cancel",
+            "OrderCaps.cancel_refs has Client: a cancel",
+            "CancelBatch.refs has Venue: a batch cancel",
+            "CancelBatch.refs has PlacementNonce: a batch cancel",
+            "OrderCaps.query_refs has Venue: a query",
+            "OrderCaps.query_refs has PlacementNonce: a query",
+        ]
+    );
+}
+
+#[test]
+fn ids_roundtrip_round_trips_minted_ids_and_reads_every_java_era_id_as_unparseable() {
+    assert_eq!(
+        probed(suite::ids_roundtrip),
+        [
+            "OrderCaps.client_id is Alnum { max_len: 32, charset: Alphanumeric }: 9 minted ids",
+            "ids_roundtrip/java_era.txt: 5 Java-era ids",
+        ]
+    );
+}
+
+#[test]
+fn restart_cid_restarts_the_mint_above_every_id_of_ours_the_toys_resync_shows() {
+    assert_eq!(
+        probed(suite::restart_cid),
+        ["restart_cid/resting.frames: 2 of ours resting, 4 shown, restarted above 8"]
+    );
+}
+
+#[test]
+fn price_grid_quantizes_and_sends_every_boundary_price_on_both_of_the_toys_instruments() {
+    let probed = probed(suite::price_grid);
+    assert_eq!(probed.len(), 2, "{probed:#?}");
+    for (p, symbol) in probed.iter().zip(["TOYA-PERP", "TOYB-PERP"]) {
+        assert_eq!(
+            *p,
+            format!(
+                "{symbol}: 45 model prices quantized to 54 order prices, 54 post-only orders sent"
+            )
+        );
+    }
 }
