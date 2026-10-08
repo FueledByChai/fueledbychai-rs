@@ -2619,3 +2619,70 @@ fn a_market_not_shaped_like_a_paradex_market_is_refused_before_any_request() {
         assert!(!err.contains(bad), "{bad}: {err}");
     }
 }
+
+#[tokio::test]
+async fn a_frame_the_codec_could_not_decode_fails_the_run() {
+    // Codex r4217056359: a frame the codec could not decode may have held a fill, a position
+    // or an order event the run never saw; the round trip otherwise whole, the run fails.
+    let placed = Arc::new(Mutex::new(Placed::default()));
+    let with = responder_extra(Arc::clone(&placed), vec![vec![0xff, 0x00, 0x13]]);
+    let mut script = vec![Step::Accept];
+    script.extend((0..8).map(|_| Step::Respond {
+        conn: 0,
+        with: with.clone(),
+    }));
+    let stub = StubServer::start(WsScript::new(script), routes())
+        .await
+        .unwrap();
+    let opts = options(&stub, "10");
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(printed.contains("STEP closed"), "{printed}");
+    assert!(!report.ok, "{printed}");
+    assert!(
+        printed.contains("NOTE 1 frames or HTTP answers could not be decoded"),
+        "{printed}"
+    );
+    assert!(printed.contains("DONE failed"), "{printed}");
+}
+
+#[test]
+fn a_secret_shaped_proxy_host_or_a_relative_lease_directory_is_refused_unshown() {
+    // Codex r4217056333 and r4217056342: a key pasted as the --socks5 host would be resolved
+    // through DNS, and one pasted as --lease-dir would become a directory in the checkout and
+    // appear in errors; neither is taken, and the refusal never shows it.
+    // Built at run time: no key-shaped literal sits in this crate.
+    let hex64 = "0123456789abcdef".repeat(4);
+    for value in [
+        format!("0x{hex64}:1080"),
+        format!("{hex64}:1080"),
+        "proxy_host!:1080".to_owned(),
+        "-proxy.example:1080".to_owned(),
+        "proxy..example:1080".to_owned(),
+    ] {
+        let mut argv = strings(&MARKET_ARGS);
+        argv.extend(["--socks5".to_owned(), value.clone()]);
+        let err = args::parse(argv).unwrap_err();
+        assert!(err.starts_with("--socks5"), "{value}: {err}");
+        assert!(!err.contains(&value[..8]), "{value}: {err}");
+    }
+    for good in ["proxy.example:1080", "10.0.0.1:1080", "[::1]:1080"] {
+        let mut argv = strings(&MARKET_ARGS);
+        argv.extend(strings(&["--socks5", good]));
+        assert!(args::parse(argv).is_ok(), "{good}");
+    }
+    let mut argv = strings(&MARKET_ARGS);
+    argv.extend(strings(&[
+        "--lease-dir",
+        "0xSYNTHETIC-pasted-secret-hunter2",
+    ]));
+    let err = args::parse(argv).unwrap_err();
+    assert!(err.starts_with("--lease-dir"), "{err}");
+    assert!(!err.contains("hunter2"), "{err}");
+    let mut argv = strings(&MARKET_ARGS);
+    argv.extend(strings(&["--lease-dir", "/var/tmp/testnet_trade"]));
+    let Ok(Parsed::Trade(opts)) = args::parse(argv) else {
+        panic!("an absolute --lease-dir is taken");
+    };
+    assert_eq!(opts.lease_dir, PathBuf::from("/var/tmp/testnet_trade"));
+}

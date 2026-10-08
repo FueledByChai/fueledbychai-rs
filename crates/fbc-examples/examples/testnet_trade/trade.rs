@@ -309,13 +309,23 @@ pub async fn run(
         driver.run(order, ns_lease, persisted, leases, control),
     )
     .await;
-    let ok = ran.unwrap_or_else(|ended| {
+    let mut ok = ran.unwrap_or_else(|ended| {
         lines.line(format_args!(
             "NOTE the session ended before the run did: {ended}; nothing more can be sent, and \
              Paradex's cancel-on-disconnect cancels what the closed socket left resting"
         ));
         false
     });
+    // A frame or HTTP answer the codec could not decode may have held a fill, a position or
+    // an order event the run never saw: the run cannot say the account did not move.
+    let undecoded = session.counters().decode_errors;
+    if undecoded > 0 {
+        lines.line(format_args!(
+            "NOTE {undecoded} frames or HTTP answers could not be decoded: one may have held a \
+             fill, a position or an order event the run never saw"
+        ));
+        ok = false;
+    }
     drop(session);
     let (places_sent, cancels_sent) = link.borrow().sent_counts();
     let report = Report {
