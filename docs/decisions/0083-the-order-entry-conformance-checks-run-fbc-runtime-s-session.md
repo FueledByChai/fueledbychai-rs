@@ -45,10 +45,11 @@ venue for the program's life (`ExecSessionConfig::venue` is `&'static dyn VenueF
 - **The factory lives for the program.** The three checks take `Subject<'static>` and run
   through `suite::run_live`; the macro's factory is a constant expression (a unit struct or a
   `static`), so `&$factory` is `'static`. The other checks keep `Subject<'_>`.
-- Before a request, where a declared limit counting its operation allows no more units than
-  the frames the session has written so far (each counted as one unit), the check moves the
-  clock by that limit's window, so its bucket has room again; otherwise the clock stays, so a
-  keepalive is not written where the stub reads a request.
+- Before a request, where a declared limit counting its operation has already counted as many
+  units as it allows in the bucket the request falls in (the session's own limiter, shared with
+  the check, so a frame that limit never charged fills nothing), the check moves the clock by
+  that limit's window, so its bucket has room again; otherwise the clock stays, so a keepalive
+  is not written where the stub reads a request.
 - Until the check first moves the clock after the stub has answered, no deadline has passed: an
   outcome for an unanswered request (or item) by then was reported before its deadline and fails
   the check.
@@ -56,8 +57,8 @@ venue for the program's life (`ExecSessionConfig::venue` is `&'static dyn VenueF
   (600 s), so a late retry shows.
 - Each check judges what the session reported (outcomes by request and item, each answered item
   once and naming its own order, an acceptance of the whole request taken as its one item's,
-  order updates reported after the amend, every identity an amended update states the amended
-  order's, a new venue id only where `AmendCaps.keeps_venue_id` is false, the placement accepted
+  order updates reported after the amend, every identity and field each amended update states the
+  amended order's, nothing filled, a new venue id only where `AmendCaps.keeps_venue_id` is false, the placement accepted
   once as `OrderCaps.ack` has it, and no refusal naming the amended order nor update ending it
   once the amend is sent) and what the stub received on every connection: an
   order written once, counted by the frames carrying our client id as the venue's wire spells

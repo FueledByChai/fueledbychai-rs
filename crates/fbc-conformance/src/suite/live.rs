@@ -15,18 +15,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fbc_core::{
-    AccountKey, AccountLease, ClientOrderId, Envelope, ExecEvent, ItemRef, Lots, MarketLease,
-    MonoNs, NewOrder, NonceBlock, NonceSource, OpKind, OrderCaps, OrderKind, OrderKindTag,
-    RateLimit, RpcId, Side, SignedLots, SubmitHandle, SubmitOutcome, Ticks, VenueCaps,
-    VenueFactory, VenueOrderId, WallNs, encode_cid,
+    AccountKey, AccountLease, ClientOrderId, ConnKey, Envelope, ExecEvent, ItemRef, LimitScope,
+    Lots, MarketLease, MonoNs, NewOrder, NonceBlock, NonceSource, OpKind, OrderCaps, OrderKind,
+    OrderKindTag, RateLimit, RpcId, Side, SignedLots, SubmitHandle, SubmitOutcome, Ticks,
+    VenueCaps, VenueFactory, VenueOrderId, WallNs, encode_cid,
 };
 use fbc_oms::{
     Authorization, LadderConfig, LeaseKeys, Leases, MarketCapsConfig, OrderKey, OrderOp,
     PreTradeCaps, Registry, ResyncSnapshot,
 };
 use fbc_runtime::{
-    Connector, ExecHandler, ExecOrders, ExecSession, ExecSessionConfig, IngestClock, ProxyConfig,
-    RateLimiter, ReconnectPacing, RpcIds, SafetyReserve, WriteStall,
+    BucketKey, Connector, ExecHandler, ExecOrders, ExecSession, ExecSessionConfig, IngestClock,
+    ProxyConfig, RateLimiter, ReconnectPacing, RpcIds, SafetyReserve, WriteStall,
 };
 use futures_util::FutureExt;
 
@@ -53,6 +53,9 @@ pub(crate) const WAIT: Duration = Duration::from_secs(600);
 /// How many times a check lets every task run, without moving the clock, before it gives up
 /// waiting for something the stub's answer should bring.
 const TURNS: usize = 100_000;
+/// The most connection epochs a check's session opens: its first and the reconnects a codec
+/// asks for.
+const EPOCHS: u32 = 64;
 /// How many times a check lets every task run after the stub has answered, or the clock moved,
 /// for what that brings to reach the session.
 const CHURN: usize = 200;
@@ -118,6 +121,7 @@ impl<'s> Live<'s> {
             .expect("a current-thread runtime builds outside any other");
         let mut cfg = setup.cfg;
         let creds = setup.creds;
+        let rates = self.limiter()?;
         rt.block_on(async move {
             // A blocked thread keeps the paused clock from moving on its own.
             let (thaw, frozen) = std::sync::mpsc::channel::<()>();
@@ -140,7 +144,7 @@ impl<'s> Live<'s> {
                 nonces: Box::new(Counting(1)),
                 nonce_source: fbc_journal::NonceSourceId(0),
                 conn: 0,
-                limiter: self.limiter()?,
+                limiter: rates.clone(),
                 write_stall: WriteStall::new(Duration::from_secs(3_600)).expect("a window"),
                 http_max_body: 1 << 20,
             };
@@ -157,6 +161,7 @@ impl<'s> Live<'s> {
                 server: &server,
                 opening,
                 sent: Cell::new(0),
+                rates,
             };
             let script = async {
                 let out = scenario(&mut ctx).await;
@@ -250,6 +255,8 @@ pub(crate) struct Ctx<'a> {
     opening: usize,
     /// How many requests the check has sent.
     sent: Cell<usize>,
+    /// The session's buckets, shared with it: what each limit has counted.
+    rates: RateLimiter,
 }
 
 impl Ctx<'_> {
@@ -279,15 +286,18 @@ impl Ctx<'_> {
 
     /// Submits `auth`, a request of `op`, to the session and waits until it reports the
     /// request sent: its request id, or a failure when the session refuses it, reports it not
-    /// sent, or never reports it. First, where a limit counting `op` allows no more units than
-    /// the frames the session has written so far (the opening's and the check's earlier
-    /// requests, each counted as one unit whatever it is), the clock moves on by that limit's
-    /// window, so its bucket has room again (Codex r4222138060); and only then, so a keepalive
-    /// the codec sends meanwhile is not read in a request's place (Codex r4222379993).
+    /// sent, or never reports it. First, where a limit counting `op` has already counted as
+    /// many units as it allows in its bucket for this request, the clock moves on by that
+    /// limit's window, so its bucket has room again (Codex r4222138060); and only then, so a
+    /// keepalive the codec sends meanwhile is not read in a request's place (Codex
+    /// r4222379993). A bucket's count is the session's own, so a frame no limit counting `op`
+    /// charged (the opening's authentication, arm and resync) fills none (Codex r4223629855).
     pub async fn send(&self, auth: Authorization, op: OpKind) -> Result<RpcId, Failure> {
-        let written = self.opening + self.sent.get();
-        let full = |l: &&RateLimit| l.ops.contains(op) && l.units as usize <= written;
-        let window = self.h.caps.limits.iter().filter(full).map(|l| l.per).max();
+        let full = |(i, l): &(usize, &RateLimit)| {
+            l.ops.contains(op) && u64::from(l.units) <= self.used(*i, l.scope)
+        };
+        let limits = self.h.caps.limits.iter().enumerate();
+        let window = limits.filter(full).map(|(_, l)| l.per).max();
         self.advance(window.unwrap_or_default()).await;
         self.sent.set(self.sent.get() + 1);
         let rpc = self.orders.submit(auth);
@@ -303,6 +313,26 @@ impl Ctx<'_> {
             (receipt, rpc) => {
                 let what = format!("request {rpc:?} was not sent: {receipt:?}");
                 Err(self.h.fail("ExecCodec::encode", what))
+            }
+        }
+    }
+
+    /// The units the `i`th declared limit, of `scope`, has counted in the bucket a request of
+    /// the harness's instrument falls in: the account's or IP's one, the instrument's, or the
+    /// open connection's. Only the open connection keeps a bucket of a per-connection limit
+    /// (the limiter drops a closed one's), so the most any of the session's epochs counts is
+    /// its.
+    fn used(&self, i: usize, scope: LimitScope) -> u64 {
+        let now = tokio::time::Instant::now();
+        let used = |key| self.rates.used(now, i, key);
+        match scope {
+            LimitScope::Pair => used(BucketKey::Pair(self.h.inst)),
+            LimitScope::Connection => (0..=EPOCHS)
+                .map(|epoch| used(BucketKey::Connection(ConnKey { conn: 0, epoch })))
+                .max()
+                .unwrap_or_default(),
+            LimitScope::Account | LimitScope::Ip | LimitScope::AddressVolume { .. } => {
+                used(BucketKey::Shared)
             }
         }
     }

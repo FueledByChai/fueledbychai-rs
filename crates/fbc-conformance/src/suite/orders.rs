@@ -10,7 +10,8 @@
 //!   amend's outcome is `Accepted`, and an `OrderUpdate` in state `Amended` names the order:
 //!   from the venue's event reporting the replaced order where `AmendCaps.ack` is
 //!   `ReplacedEvent`, synthesized by the codec from the reply where it is `RpcReplyOnly`. Every
-//!   identity the update states is the order's. Where the amended order gets a new venue id
+//!   such update is judged: every identity it states is the order's, and every field the
+//!   amend's (nothing filled). Where the amended order gets a new venue id
 //!   (`AmendCaps.keeps_venue_id` false), the update names it; where it keeps its id, the update
 //!   names no new one. The placement's acceptance is its one item's, or the whole request's,
 //!   once as `OrderCaps.ack` has it. Once the amend is sent, nothing refuses the order (an
@@ -97,8 +98,8 @@ pub fn amend_ack(subject: &Subject<'static>) -> Result<Verdict, Failure> {
         let names = |u: &OrderUpdate| {
             u.cid == Some(CidMatch::Ours(cid)) || (placed_vid.is_some() && u.vid == placed_vid)
         };
-        let update = |c: &Ctx<'_>| amended_update(&c.events()[before..], names);
-        c.settle(|c| !c.outcomes(rpc).is_empty() && update(c).is_some())
+        let updates = |c: &Ctx<'_>| amended_updates(&c.events()[before..], names);
+        c.settle(|c| !c.outcomes(rpc).is_empty() && !updates(c).is_empty())
             .await;
         // What the amend's answer brings with them has come.
         c.churn().await;
@@ -109,9 +110,9 @@ pub fn amend_ack(subject: &Subject<'static>) -> Result<Verdict, Failure> {
             qty,
             model,
         };
-        let update = update(c);
-        let mut breaches = judge_amend(c, rpc, update.clone(), &asked, &amend, &ack);
-        breaches.extend(contradicted(&c.events()[before..], &asked, update.as_ref()));
+        let updates = updates(c);
+        let mut breaches = judge_amend(c, rpc, &updates, &asked, &amend, &ack);
+        breaches.extend(contradicted(&c.events()[before..], &asked, &updates));
         Ok(breaches)
     })?;
     verdict(AMEND_ACK, breaches, || {
@@ -154,11 +155,9 @@ fn amended(h: &Harness<'_>, amend: &AmendCaps) -> Result<(Ticks, Lots), &'static
     (qty > h.qty).then_some((h.px, qty)).ok_or(none)
 }
 
-/// The update in state `Amended` that `names` the order, if any.
-fn amended_update(
-    events: &[ExecEvent],
-    names: impl Fn(&OrderUpdate) -> bool,
-) -> Option<OrderUpdate> {
+/// Every update in state `Amended` that `names` the order, in the order reported: a consumer
+/// applies each (Codex r4223629875).
+fn amended_updates(events: &[ExecEvent], names: impl Fn(&OrderUpdate) -> bool) -> Vec<OrderUpdate> {
     let update = |e: &ExecEvent| match e {
         ExecEvent::Order(u) => Some(u.clone()),
         _ => None,
@@ -167,7 +166,8 @@ fn amended_update(
     events
         .iter()
         .filter_map(update)
-        .find(|u| amended(u) && names(u))
+        .filter(|u| amended(u) && names(u))
+        .collect()
 }
 
 /// The amend `amend_ack` sent: of order `cid`, placed under venue id `placed`, to `px` and
@@ -196,11 +196,11 @@ fn accepted_once(outcomes: &[&SubmitOutcome], model: AckModel) -> bool {
     }
 }
 
-/// What broke `amend_ack`: the amend's outcome, the update, its new venue id.
+/// What broke `amend_ack`: the amend's outcome, and each of its `updates` and its new venue id.
 fn judge_amend(
     c: &Ctx<'_>,
     rpc: RpcId,
-    update: Option<OrderUpdate>,
+    updates: &[OrderUpdate],
     asked: &Asked,
     amend: &AmendCaps,
     ack: &str,
@@ -218,7 +218,7 @@ fn judge_amend(
         let what = format!("the amend the stub accepted was reported {outcomes:?}, not once");
         breaches.push(Breach::new("ExecCodec::on_frame", what));
     }
-    let Some(update) = update else {
+    if updates.is_empty() {
         let what = match amend.ack {
             AmendAck::ReplacedEvent => {
                 "the venue's event reporting the replaced order surfaced no OrderUpdate \
@@ -230,8 +230,22 @@ fn judge_amend(
             }
         };
         breaches.push(Breach::new(ack, what));
-        return breaches;
-    };
+    }
+    for update in updates {
+        breaches.extend(judge_update(c, update, asked, amend));
+    }
+    breaches
+}
+
+/// What broke `amend_ack` in one `update` reporting the order amended: an identity of another
+/// order, a field the amend did not ask for, its new venue id.
+fn judge_update(
+    c: &Ctx<'_>,
+    update: &OrderUpdate,
+    asked: &Asked,
+    amend: &AmendCaps,
+) -> Vec<Breach> {
+    let mut breaches = Vec::new();
     // Every identity the update states is the amended order's (Codex r4222779011): fbc-oms
     // routes an update by its client id first, and a stranger's or a non-canonical one routes
     // it to no order of ours.
@@ -246,9 +260,11 @@ fn judge_amend(
         );
         breaches.push(Breach::new("OrderUpdate", what));
     }
-    // The update states the amended order where it states it (Codex r4222568860).
+    // The update states the amended order where it states it (Codex r4222568860), of which the
+    // stub filled nothing (Codex r4223629862): fbc-oms raises its filled count from it.
     let agrees = update.inst == c.h.inst
         && update.side == Side::Buy
+        && update.cum_filled == Lots::ZERO
         && update.px.is_none_or(|px| px == asked.px)
         && update.qty.is_none_or(|qty| qty == asked.qty);
     if !agrees {
@@ -289,13 +305,14 @@ fn judge_amend(
 /// ending it (Reviewer B RB-3il-5), on a cancel-replace venue an end of the old order reported
 /// before its replacement, which fbc-oms takes as the order's end, releasing the cap it holds
 /// while it still rests under its new venue id. The order is named by its client id, the id it
-/// was placed under, or the new one the amended `update` names.
-fn contradicted(events: &[ExecEvent], asked: &Asked, update: Option<&OrderUpdate>) -> Vec<Breach> {
-    let new_vid = update.and_then(|u| match &u.state {
-        VenueOrderState::Amended { new_vid } => new_vid.as_ref(),
+/// was placed under, or a new one an amended update of `updates` names.
+fn contradicted(events: &[ExecEvent], asked: &Asked, updates: &[OrderUpdate]) -> Vec<Breach> {
+    let new_vid = |u: &'_ OrderUpdate| match &u.state {
+        VenueOrderState::Amended { new_vid } => new_vid.clone(),
         _ => None,
-    });
-    let vids: Vec<&VenueOrderId> = asked.placed.iter().chain(new_vid).collect();
+    };
+    let new_vids: Vec<VenueOrderId> = updates.iter().filter_map(new_vid).collect();
+    let vids: Vec<&VenueOrderId> = asked.placed.iter().chain(&new_vids).collect();
     let by_vid = |vid: Option<&VenueOrderId>| vid.is_some_and(|vid| vids.contains(&vid));
     let mut breaches = Vec::new();
     for event in events {
