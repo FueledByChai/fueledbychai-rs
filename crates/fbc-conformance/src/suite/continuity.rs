@@ -16,7 +16,7 @@
 //! A venue whose market data is binary ([`Encoding::Sbe`] or [`Encoding::Protobuf`]) also
 //! gives `continuity/longer_block/<channel>.frames` for each channel: frames whose binary block
 //! is longer than the schema the codec was written against (a field the venue added). The case
-//! must hold a frame, and the codec must decode every one, each pushing something (Codex
+//! must hold a frame, every one binary (Codex r4217991970), and the codec must decode every one, each pushing something (Codex
 //! r4217682441, r4217839165), and report a gap exactly where the case marks one, if anywhere: a
 //! longer block is read by its declared length, never taken for a break, refused or dropped. A
 //! text venue ([`Encoding::Json`] or [`Encoding::Text`]) has no binary block: the sub-case is
@@ -139,7 +139,12 @@ fn judge(
                 _ => None,
             })
             .collect();
-        let Some(sym) = &step.tags.gap else {
+        if !breaks && !step.binary {
+            // Codex r4217991970: a longer block is a binary frame's.
+            let what = format!("line {line} is a text frame: a longer block is binary");
+            breaches.push(Breach::new(file, what));
+        }
+        if step.tags.gaps.is_empty() {
             if !gapped.is_empty() {
                 let what = format!("{file} line {line} is in sequence, yet a gap was reported");
                 breaches.push(Breach::new(&capability, what));
@@ -151,29 +156,41 @@ fn judge(
                 breaches.push(Breach::new(file, what));
             }
             continue;
-        };
-        marked += 1;
-        let Some(inst) = specs.by_symbol(sym).map(|s| s.id) else {
-            let what = format!("line {line}: `gap={sym}` names no instrument of the setup");
-            breaches.push(Breach::new(file, what));
-            continue;
-        };
-        let own = (inst, Feed::Book(book.id));
-        if !gapped.contains(&own) {
-            let what = format!(
-                "{file} line {line} breaks {sym}'s sequence, yet no gap on {channel} was reported \
-                 for it"
-            );
-            breaches.push(Breach::new(&capability, what));
         }
-        // A gap on another instrument, or on another feed of this one (Codex r4217839174).
-        for &(other, feed) in gapped.iter().filter(|g| **g != own) {
-            let on = match feed == own.1 {
+        marked += 1;
+        // Each instrument whose sequence the frame breaks, by its own book (Codex
+        // r4217991957: a batched frame may break several).
+        let mut own = Vec::new();
+        for sym in &step.tags.gaps {
+            let Some(inst) = specs.by_symbol(sym).map(|s| s.id) else {
+                let what = format!("line {line}: `gap={sym}` names no instrument of the setup");
+                breaches.push(Breach::new(file, what));
+                continue;
+            };
+            own.push((inst, Feed::Book(book.id)));
+            if !gapped.contains(&(inst, Feed::Book(book.id))) {
+                let what = format!(
+                    "{file} line {line} breaks {sym}'s sequence, yet no gap on {channel} was \
+                     reported for it"
+                );
+                breaches.push(Breach::new(&capability, what));
+            }
+        }
+        // A gap on another instrument, or on another feed of one (Codex r4217839174).
+        let broke = step
+            .tags
+            .gaps
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        for &(other, feed) in gapped.iter().filter(|g| !own.contains(g)) {
+            let on = match feed == Feed::Book(book.id) {
                 true => symbol(other),
                 false => format!("{}'s {feed:?}", symbol(other)),
             };
             let what = format!(
-                "{file} line {line} breaks {sym}'s sequence, yet a gap was reported on {on}"
+                "{file} line {line} breaks {broke}'s sequence, yet a gap was reported on {on}"
             );
             breaches.push(Breach::new(&capability, what));
         }

@@ -56,6 +56,10 @@ enum Twist {
     WrongInstrument,
     /// Every gap it reports on a book is also reported on the same instrument's trades.
     GapsTradesToo,
+    /// It reads a binary frame's bytes as the toy's text.
+    BinaryText,
+    /// Each codec its factory builds after the first also asks for a timer when it opens.
+    OpenDrifts,
     /// It refuses a subscribe call naming more than one instrument, as a venue with one
     /// connection per instrument may.
     OneInstrument,
@@ -231,6 +235,11 @@ impl MdSink for Rewrite<'_> {
 
 impl MdCodec for Twisted {
     fn on_open(&mut self, fx: &mut Effects) {
+        if self.twist == Twist::OpenDrifts && self.built > 0 {
+            let tag = TimerTag(self.built);
+            let after = core::time::Duration::from_secs(1);
+            fx.push(Effect::Timer { tag, after });
+        }
         self.inner.on_open(fx);
     }
 
@@ -292,6 +301,14 @@ impl MdCodec for Twisted {
         fx: &mut Effects,
     ) -> Result<(), DecodeError> {
         let twist = self.twist;
+        let text;
+        let f = match (twist, f) {
+            (Twist::BinaryText, RawFrame::Binary(bytes)) => {
+                text = String::from_utf8(bytes.to_vec()).unwrap();
+                RawFrame::Text(&text)
+            }
+            (_, f) => f,
+        };
         let rewrite = &mut Rewrite { sink, twist };
         self.inner.on_frame(f, scope, specs, rewrite, fx)?;
         if twist == Twist::GapsAlways {
@@ -655,6 +672,71 @@ fn the_checks_drive_one_connection_as_the_topology_allows() {
 }
 
 #[test]
+fn subscriptions_idempotent_fails_a_codec_whose_reconnect_opens_differently() {
+    // Codex r4217991947: what opening asks for is compared too.
+    let failure = failed(Variant::twisted(Twist::OpenDrifts).run(suite::subscriptions_idempotent));
+    assert_eq!(
+        said(&failure, "MdCodec::on_open"),
+        ["book: the reconnect's on_open asked for other effects than the first epoch's"]
+    );
+}
+
+#[test]
+fn a_case_on_an_instrument_its_connection_did_not_subscribe_fails() {
+    // Codex r4217991939: one instrument per connection, and a case of the other's frames.
+    let mut per_instrument = Variant::declaring(|_| {});
+    per_instrument.caps = |caps| caps.md.topology = ConnTopology::PerInstrument;
+    let scratch = Scratch::toy("unsubscribed");
+    // A tag naming the instrument the connection did not subscribe.
+    scratch.write(
+        "continuity/book.frames",
+        "text snap|sym=TOYA-PERP|book=0|seq=10|bid=100:3|ask=101:2\n\
+         gap=TOYA-PERP gap=TOYB-PERP text delta|sym=TOYA-PERP|book=0|seq=12|bid=100:4|ask=\n",
+    );
+    let failure = failed(per_instrument.run_in(suite::continuity, &scratch.0));
+    assert_eq!(
+        said(&failure, "continuity/book.frames"),
+        ["line 2: `gap=TOYB-PERP` names an instrument this connection did not subscribe"]
+    );
+    // An event on it: the toy drops frames of a channel not subscribed, so a toy that puts its
+    // gap on the other instrument stands in for a codec decoding them.
+    let mut gaps_b = Variant::twisted(Twist::WrongInstrument);
+    gaps_b.caps = |caps| caps.md.topology = ConnTopology::PerInstrument;
+    scratch.write(
+        "continuity/book.frames",
+        "text snap|sym=TOYA-PERP|book=0|seq=10|bid=100:3|ask=101:2\n\
+         gap=TOYA-PERP text delta|sym=TOYA-PERP|book=0|seq=12|bid=100:4|ask=\n",
+    );
+    let failure = failed(gaps_b.run_in(suite::continuity, &scratch.0));
+    assert_eq!(
+        said(&failure, "continuity/book.frames"),
+        [format!(
+            "line 2: an event on {INST_B:?}, which this connection did not subscribe"
+        )]
+    );
+}
+
+#[test]
+fn continuity_reads_every_gap_tag_of_a_frame() {
+    // Codex r4217991957: a frame may break several instruments' sequences; each tag counts.
+    let scratch = Scratch::toy("two-gaps");
+    scratch.write(
+        "continuity/book.frames",
+        "text snap|sym=TOYA-PERP|book=0|seq=10|bid=100:3|ask=101:2\n\
+         text snap|sym=TOYB-PERP|book=0|seq=10|bid=100:3|ask=101:2\n\
+         gap=TOYA-PERP gap=TOYB-PERP text delta|sym=TOYA-PERP|book=0|seq=12|bid=100:4|ask=\n",
+    );
+    let failure = failed(scratch.run(suite::continuity));
+    assert_eq!(
+        said(&failure, PLUS_ONE),
+        [
+            "continuity/book.frames line 3 breaks TOYB-PERP's sequence, yet no gap on book was \
+          reported for it"
+        ]
+    );
+}
+
+#[test]
 fn subscriptions_idempotent_fails_a_codec_whose_reconnect_sends_other_subscriptions() {
     // Codex r4217682449: the same number of effects, but the payload doubled.
     let failure =
@@ -722,9 +804,19 @@ fn continuity_skips_a_channel_whose_frames_nothing_chains() {
     );
 }
 
-/// The toy declaring its market data binary.
+/// The toy declaring its market data binary, its codec reading a binary frame's bytes as the
+/// toy's text: a stand-in for a binary venue whose blocks run longer.
 fn binary() -> Variant {
-    Variant::declaring(|caps| caps.md.encoding = Encoding::Sbe)
+    Variant {
+        caps: |caps| caps.md.encoding = Encoding::Sbe,
+        ..Variant::twisted(Twist::BinaryText)
+    }
+}
+
+/// A `hex` line carrying `text`'s bytes.
+fn hex(text: &str) -> String {
+    let bytes: Vec<String> = text.bytes().map(|b| format!("{b:02x}")).collect();
+    format!("hex {}\n", bytes.join(" "))
 }
 
 #[test]
@@ -733,36 +825,40 @@ fn continuity_reads_a_binary_venues_longer_blocks() {
     let failure = failed(binary().run_in(suite::continuity, &scratch.0));
     assert!(said(&failure, "continuity")[0].contains("holds no continuity/longer_block/"));
 
-    // Toy frames stand in for longer blocks: decoded, and gapped only where marked.
-    scratch.write(
-        "continuity/longer_block/book.frames",
-        "text snap|sym=TOYA-PERP|book=0|seq=10|bid=100:3|ask=101:2\n\
-         text delta|sym=TOYA-PERP|book=0|seq=11|bid=100:4|ask=\n",
-    );
+    // Binary frames, decoded, and gapped only where marked.
+    let snap = "snap|sym=TOYA-PERP|book=0|seq=10|bid=100:3|ask=101:2";
+    let delta = "delta|sym=TOYA-PERP|book=0|seq=11|bid=100:4|ask=";
+    let empty_delta = "delta|sym=TOYA-PERP|book=0|seq=11|bid=|ask=";
+    let file = "continuity/longer_block/book.frames";
+    scratch.write(file, &(hex(snap) + &hex(delta)));
     let read = probed(binary().run_in(suite::continuity, &scratch.0));
-    // Codex r4217839165: an empty longer-block case fails.
-    let empty = Scratch::toy("longer-empty");
-    empty.write("continuity/longer_block/book.frames", "# nothing\n");
-    let failure = failed(binary().run_in(suite::continuity, &empty.0));
-    assert_eq!(
-        said(&failure, "continuity/longer_block/book.frames"),
-        ["hands the codec no frame: a case that decodes nothing proves nothing"]
-    );
     assert_eq!(
         read[2..],
         ["continuity/longer_block/book.frames: 2 frames, 0 breaking the sequence"]
     );
 
-    // Codex r4217682441: every frame must push something, not just one.
-    scratch.write(
-        "continuity/longer_block/book.frames",
-        "text snap|sym=TOYA-PERP|book=0|seq=10|bid=100:3|ask=101:2\n\
-         text delta|sym=TOYA-PERP|book=0|seq=11|bid=|ask=\n",
-    );
+    // Codex r4217839165: an empty longer-block case fails.
+    scratch.write(file, "# nothing\n");
     let failure = failed(binary().run_in(suite::continuity, &scratch.0));
     assert_eq!(
-        said(&failure, "continuity/longer_block/book.frames"),
+        said(&failure, file),
+        ["hands the codec no frame: a case that decodes nothing proves nothing"]
+    );
+
+    // Codex r4217682441: every frame must push something, not just one.
+    scratch.write(file, &(hex(snap) + &hex(empty_delta)));
+    let failure = failed(binary().run_in(suite::continuity, &scratch.0));
+    assert_eq!(
+        said(&failure, file),
         ["line 2 decodes to no event: a longer block must be read, not dropped"]
+    );
+
+    // Codex r4217991970: a text frame is no longer block.
+    scratch.write(file, &format!("{}text {delta}\n", hex(snap)));
+    let failure = failed(binary().run_in(suite::continuity, &scratch.0));
+    assert_eq!(
+        said(&failure, file),
+        ["line 2 is a text frame: a longer block is binary"]
     );
 }
 

@@ -8,8 +8,8 @@
 //! channel on the instruments one connection carries. In each of two epochs a codec built fresh
 //! from the factory (one per epoch, as the runtime builds them) is opened, and the reconciler's
 //! call for the set is handed to its [`subscribe`](fbc_core::MdCodec::subscribe), which must
-//! take it. After the reconnect it must ask for exactly the effects it asked for on the first
-//! connection: an [`MdCodec`] is deterministic given its inputs and prior state, and a fresh one
+//! take it. After the reconnect it must ask, opening and subscribing, for exactly the effects it
+//! asked for on the first connection: an [`MdCodec`] is deterministic given its inputs and prior state, and a fresh one
 //! has none, so anything else is state carried over (a codec that remembers the last
 //! connection's subscriptions sends them twice). Then the same set is desired again, and any
 //! call the reconciler yields is a breach. It reads no fixture file.
@@ -46,6 +46,7 @@ fn book_twice(h: &Harness<'_>, book: &Book, breaches: &mut Vec<Breach>) -> Optio
     let conn = MD_STREAM.0;
     let mut rec = Reconciler::new(ConnKey { conn, epoch: 0 });
     let mut sent = Vec::new();
+    let mut opens: Vec<Vec<Effect>> = Vec::new();
     for epoch in 0..EPOCHS {
         let key = ConnKey { conn, epoch };
         if epoch > 0 {
@@ -54,6 +55,17 @@ fn book_twice(h: &Harness<'_>, book: &Book, breaches: &mut Vec<Breach>) -> Optio
         let mut codec = h.md_codec(subs.clone());
         let mut fx = Effects::new();
         codec.on_open(&mut fx);
+        let open = fx.take();
+        // What opening asks for counts too: a codec subscribing there from its plan would send
+        // the set twice with the subscribe (Codex r4217991947).
+        if opens.first().is_some_and(|before| *before != open) {
+            let what = format!(
+                "{channel}: the reconnect's on_open asked for other effects than the first \
+                 epoch's"
+            );
+            breaches.push(Breach::new("MdCodec::on_open", what));
+        }
+        opens.push(open);
         let opened = rec.opened(key).expect("the current epoch opened");
         let call = opened
             .or_else(|| rec.set_desired(subs.iter().copied()))
