@@ -105,7 +105,7 @@ enum Twist {
     StrangerAmended,
     /// A timed-out placement's `Unknown` names another order's client id.
     StrangerOnTimeout,
-    /// A timed-out placement's `Unknown` names its item 0 with a venue id the stub never sent.
+    /// A timed-out request's `Unknown` names its item with a venue id the stub never sent.
     VidOnTimeout,
     /// A placement's acceptance names item 1 of its single command.
     PlacedAsItemOne,
@@ -1115,20 +1115,22 @@ fn stranger_on_timeout(ev: ExecEvent) -> Vec<ExecEvent> {
     }]
 }
 
-/// A timed-out request's `Unknown` for the whole request as item 0, naming no client id and a
-/// venue id the stub never sent.
+/// A timed-out request's `Unknown` naming its item, or the whole request as item 0 with no
+/// client id, by a venue id the stub never sent.
 fn vid_on_timeout(ev: ExecEvent) -> Vec<ExecEvent> {
     vec![match ev {
         ExecEvent::Outcome {
             rpc,
-            item: None,
+            item,
             outcome: outcome @ SubmitOutcome::Unknown,
         } => {
-            let item = Some(ItemRef {
+            let mut item = item.unwrap_or(ItemRef {
                 idx: 0,
                 cid: None,
-                vid: toy::with_scope(|scope| scope.venue_order_id("toy-stranger")).ok(),
+                vid: None,
             });
+            item.vid = toy::with_scope(|scope| scope.venue_order_id("toy-stranger")).ok();
+            let item = Some(item);
             ExecEvent::Outcome { rpc, item, outcome }
         }
         other => other,
@@ -2012,6 +2014,19 @@ fn unknown_on_timeout_fails_a_toy_whose_unknown_names_another_orders_client_id()
     ));
     assert!(
         says(&failure, "ExecCodec::on_rpc_timeout", "not Unknown once"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn mixed_batch_fails_a_toy_whose_unknown_item_names_a_venue_id() {
+    let failure = failed(suite::mixed_batch(&VID_ON_TIMEOUT.subject(assumed)));
+    assert!(
+        says(
+            &failure,
+            "ItemRef.vid",
+            "item 2, which the stub never answered"
+        ),
         "{failure}"
     );
 }
