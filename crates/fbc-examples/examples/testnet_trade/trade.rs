@@ -674,8 +674,15 @@ pub fn latest_resync(notes: &[Note]) -> Option<Result<Applied<'_>, &str>> {
 /// ([`resync_disagreements`]) or refused by the registry, an order in our namespace that the
 /// registry does not hold (shown by a resync or an order event), a fill not of our orders, a
 /// position event other than `start` (the market's position seeded at Start; flat on any other
-/// market), or an order not ours in view on the market. Empty when nothing does.
-pub fn account_changes(notes: &[Note], reg: &Registry, start: Option<SignedLots>) -> Vec<String> {
+/// market), an order of `owned` that filled since the run took it on ([`traded`]: the round
+/// trip can no longer be clean), or an order not ours in view on the market. Empty when
+/// nothing does.
+pub fn account_changes(
+    notes: &[Note],
+    reg: &Registry,
+    start: Option<SignedLots>,
+    owned: &[(ClientOrderId, Lots)],
+) -> Vec<String> {
     let mut changes: Vec<String> = resync_disagreements(notes)
         .into_iter()
         .map(|what| format!("a resync found the position other than the registry's: {what}"))
@@ -724,6 +731,16 @@ pub fn account_changes(notes: &[Note], reg: &Registry, start: Option<SignedLots>
             }
             _ => {}
         }
+    }
+    for (cid, filled) in traded(reg, owned) {
+        let vid = reg
+            .get(cid)
+            .and_then(|r| r.vid().map(|v| v.as_str().to_owned()));
+        changes.push(format!(
+            "an order of ours traded during the run: venue order {} has {} lots filled",
+            vid.unwrap_or_else(|| "none".to_owned()),
+            filled.get()
+        ));
     }
     if reg.foreign_in_view(INST) {
         changes.push(
@@ -802,6 +819,18 @@ pub fn resync_disagreements(notes: &[Note]) -> Vec<String> {
                 .iter()
                 .map(|(inst, _)| format!("Unsettled fill on instrument {}", inst.get()));
             checks.chain(unsettled).collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Those of `owned` (our orders on the market, each with what of it had filled when the run
+/// took it on) that filled more since, each with what it has filled now.
+pub fn traded(reg: &Registry, owned: &[(ClientOrderId, Lots)]) -> Vec<(ClientOrderId, Lots)> {
+    owned
+        .iter()
+        .filter_map(|(cid, before)| {
+            let now = reg.get(*cid).map_or(*before, |r| r.filled());
+            (now > *before).then_some((*cid, now))
         })
         .collect()
 }
@@ -993,11 +1022,10 @@ impl Driver {
         let ok = self.steps(order, ns_lease, persisted, leases).await;
         let stopped = self.stop().await;
         let unmoved = self.inventory_unmoved();
-        let untraded = self.owned_untraded();
         let cancelled = self.owned_cancelled();
         let account = self.account_unmoved();
         drop(control);
-        ok && stopped && unmoved && untraded && cancelled && account
+        ok && stopped && unmoved && cancelled && account
     }
 
     /// True when every order of ours on the market ended cancelled: one still open, or ended
@@ -1035,31 +1063,12 @@ impl Driver {
     /// Start.
     fn account_changes(&self) -> Vec<String> {
         let link = self.link.borrow();
-        account_changes(link.notes(), link.registry(), self.start_position)
-    }
-
-    /// True unless an order of ours on the market filled during the run, the resync's
-    /// included, even one that ended before Stop or whose fills left the inventory where it was.
-    fn owned_untraded(&self) -> bool {
-        let traded: Vec<(ClientOrderId, Lots)> = {
-            let mut link = self.link.borrow_mut();
-            let reg = link.reg();
-            self.owned
-                .iter()
-                .filter_map(|(cid, before)| {
-                    let now = reg.get(*cid).map_or(*before, |r| r.filled());
-                    (now > *before).then_some((*cid, now))
-                })
-                .collect()
-        };
-        for (cid, filled) in &traded {
-            self.note(format_args!(
-                "an order of ours traded during the run: venue order {} has {} lots filled",
-                self.vid_of(*cid),
-                filled.get()
-            ));
-        }
-        traded.is_empty()
+        account_changes(
+            link.notes(),
+            link.registry(),
+            self.start_position,
+            &self.owned,
+        )
     }
 
     /// True unless the market's inventory now differs from what it was at Start: a backstop
@@ -1305,14 +1314,15 @@ impl Driver {
             }
         }
         // The account changed since the seed (a reconnect's resync disagreeing or refused, a
-        // position event, a fill not of ours, an order of ours the registry does not hold) or
-        // an order not ours came into view: the caps would judge the place against an
+        // position event, a fill not of ours, an order of ours the registry does not hold, an
+        // order of ours that filled since the run took it on) or an order not ours came into
+        // view: the caps would judge the place against an
         // inventory that is no longer the account's, so nothing is placed. The run's end
         // reports what it was. Nothing waits between this audit and the place below.
         if !self.account_changes().is_empty() {
             self.note(format_args!(
-                "the account changed since the seed, or an order not ours is in view; nothing \
-                 placed"
+                "the account changed since the seed, an order of ours traded, or an order not \
+                 ours is in view; nothing placed"
             ));
             return false;
         }
