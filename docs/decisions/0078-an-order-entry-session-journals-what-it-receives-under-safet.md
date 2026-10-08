@@ -34,7 +34,8 @@ also:
    encode, written as the reservation returns. A reservation of another count than asked is
    written too (those values are spent) before the session ends with
    `ExecSessionError::Nonces`. The session's one source is journaled as the `NonceSourceId`
-   of its account's number.
+   of its account's number. An encode's time is read once its nonces are reserved, so a source
+   that takes its time (persisting what it reserved) leaves the signed request no stale time.
 2. **Each context just before its call.** The `EncodeCtx` the session hands `on_open`,
    `on_timer`, the resync or an `encode`, the encode's with its request id, `None` for the
    others (which replay matches by place). A call that is not made (a short reservation, an
@@ -47,6 +48,11 @@ also:
    rate-limit class 0073 gives control commands. The ping, pong and close frames received, the
    connection changes, the codec's timer firings and the contexts and nonces of `on_open`,
    `on_timer` and the resync go under Normal. A market-data session's inputs stay Normal.
+4. **A stop's inputs follow the close.** When the control drops as a frame, timer firing or
+   HTTP result wakes the epoch, or a frame waits then, the epoch's `Closed` is written first
+   and those inputs, which reach no codec, after it, as the market-data session does, so replay
+   feeds them to no codec either. Spans a codec names that do not fit their input are counted
+   (`ExecCounters::refused_redactions`) and that input is hashed whole, as on market data.
 
 ## Alternatives
 

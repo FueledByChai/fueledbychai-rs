@@ -71,6 +71,9 @@ const URL: &str = "exec.url";
 const LOGIN: &str = "login.url";
 /// How many nonces the `auth_toy` session's `on_open` and `on_timer` ask for.
 const CALL_NONCES: &str = "call.nonces";
+/// Any value: the `auth_toy` session's codec names a span past the end of every frame (a codec
+/// defect).
+const BAD_SPANS: &str = "bad.spans";
 /// The conformance toy's acknowledgement of its authentication, echoing its token.
 const AUTH_ACK: &str = "auth|ok=1|token=toy-session-token";
 
@@ -330,6 +333,7 @@ fn auth_toy(cfg: &VenueConfig) -> Box<dyn ExecCodec> {
     Box::new(AuthWrap {
         login: cfg.get(LOGIN).unwrap().to_owned(),
         call_nonces: cfg.get(CALL_NONCES).unwrap().parse().unwrap(),
+        bad_spans: cfg.get(BAD_SPANS).is_some(),
     })
 }
 
@@ -340,6 +344,7 @@ fn auth_toy(cfg: &VenueConfig) -> Box<dyn ExecCodec> {
 struct AuthWrap {
     login: String,
     call_nonces: u16,
+    bad_spans: bool,
 }
 
 impl AuthWrap {
@@ -449,21 +454,46 @@ impl ExecCodec for AuthWrap {
     }
 
     fn redact_inbound(&self, input: Inbound<'_>) -> InboundSpans {
-        auth_toy::AuthToy.redact_inbound(input)
+        match input {
+            Inbound::Frame(f) if self.bad_spans => {
+                let past = u32::try_from(f.bytes().len()).unwrap() + 1;
+                let span = 0..past;
+                InboundSpans::frame(vec![span])
+            }
+            _ => auth_toy::AuthToy.redact_inbound(input),
+        }
     }
 }
 
-/// Nonces counted up from 100; with `short`, one fewer than asked.
+/// Nonces counted up from 100; with `short`, one fewer than asked. Each reservation takes
+/// `delay` of wall time, as a source persisting its nonces might, and logs the wall time it
+/// returned at.
+#[derive(Default)]
 struct Counting {
-    next: u64,
     short: bool,
+    delay: Duration,
+    returned: Arc<std::sync::Mutex<Vec<WallNs>>>,
+    next: u64,
+}
+
+impl Counting {
+    fn new() -> Counting {
+        Counting {
+            next: 100,
+            ..Counting::default()
+        }
+    }
 }
 
 impl NonceSource for Counting {
     fn reserve(&mut self, len: u16) -> NonceBlock {
+        std::thread::sleep(self.delay);
         let len = len - u16::from(self.short);
         let block = NonceBlock::consecutive(self.next, len).unwrap();
         self.next += u64::from(len);
+        let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+        let now = WallNs(i64::try_from(since.unwrap().as_nanos()).unwrap());
+        self.returned.lock().unwrap().push(now);
         block
     }
 }
@@ -474,7 +504,7 @@ fn config(
     venue: &'static Venue,
     url: &str,
     cfg: &[(&'static str, String)],
-    short: bool,
+    nonces: Counting,
 ) -> ExecSessionConfig {
     let mut venue_cfg = VenueConfig::new();
     venue_cfg.insert(URL, url);
@@ -494,7 +524,7 @@ fn config(
         connector: Connector::new(ProxyConfig::Direct),
         pacing: ReconnectPacing::new(minute, minute, 100, minute * 10, ms(5_000)).unwrap(),
         clock: IngestClock::new(),
-        nonces: Box::new(Counting { next: 100, short }),
+        nonces: Box::new(nonces),
         conn: CONN,
         limiter: RateLimiter::new(&limits, SafetyReserve::percent(0).unwrap()).unwrap(),
         write_stall: WriteStall::new(Duration::from_secs(3_600)).unwrap(),
@@ -609,7 +639,7 @@ async fn the_conformance_toys_order_entry_session_journals_what_crosses_it_in_or
  {
     let mut server = ScriptedWs::start().await;
     let venue = Venue::leak(conformance_toy);
-    let config = config(venue, &server.url(), &[], false);
+    let config = config(venue, &server.url(), &[], Counting::new());
     let (arm, rpc) = (RpcId(1), RpcId(2));
     let run = journaled(
         "exec_journal_conformance",
@@ -751,7 +781,7 @@ async fn the_auth_toys_order_entry_session_journals_its_logins_timer_nonces_and_
     let mut http = ScriptedHttp::start().await;
     let venue = Venue::leak(auth_toy);
     let cfg = [(LOGIN, http.url("/auth")), (CALL_NONCES, "1".to_owned())];
-    let config = config(venue, &server.url(), &cfg, false);
+    let config = config(venue, &server.url(), &cfg, Counting::new());
     let arm = RpcId(1);
     let first = format!("HTTP/1.1 200 OK\r\nSet-Cookie: {cookie}\r\n{echoed}: {echoed_value}");
     let bodies = [
@@ -893,7 +923,11 @@ async fn a_short_reservation_is_journaled_value_by_value_with_no_context() {
     let http = ScriptedHttp::start().await;
     let venue = Venue::leak(auth_toy);
     let cfg = [(LOGIN, http.url("/auth")), (CALL_NONCES, "3".to_owned())];
-    let config = config(venue, &server.url(), &cfg, true);
+    let short = Counting {
+        short: true,
+        ..Counting::new()
+    };
+    let config = config(venue, &server.url(), &cfg, short);
     let run = journaled("exec_journal_short", config, |_, control, _| async move {
         let mut peer = server.accept().await;
         assert_eq!(peer.next().await, None);
@@ -922,7 +956,7 @@ async fn a_short_reservation_is_journaled_value_by_value_with_no_context() {
 async fn an_epoch_a_dropped_run_left_connected_is_journaled_closed_when_the_session_drops() {
     let mut server = ScriptedWs::start().await;
     let venue = Venue::leak(conformance_toy);
-    let config = config(venue, &server.url(), &[], false);
+    let config = config(venue, &server.url(), &[], Counting::new());
     let root = fresh_dir("exec_journal_dropped_run");
     let sink = SinkConfig {
         budget_bytes: 1 << 20,
@@ -969,4 +1003,169 @@ async fn an_epoch_a_dropped_run_left_connected_is_journaled_closed_when_the_sess
     let last = entries.last().map(|e| seen(&e.record));
     assert_eq!(last, Some(Seen::Closed(key(0))));
     assert_eq!(seen(&entries[0].record), Seen::Opened(key(0)));
+}
+
+/// Codex P1 on PR #115: a frame waiting as the control drops is journaled, reaching no codec,
+/// after the epoch's `Closed`, so replay, which feeds a closed epoch nothing, feeds it to no
+/// codec either, as the market-data session journals it. The frame is in the session's socket
+/// before the session runs again: the session's run is held unpolled while the server writes
+/// it and the control drops.
+#[tokio::test]
+async fn a_frame_waiting_as_the_control_drops_is_journaled_after_the_epoch_closed() {
+    let mut server = ScriptedWs::start().await;
+    let venue = Venue::leak(conformance_toy);
+    let config = config(venue, &server.url(), &[], Counting::new());
+    let root = fresh_dir("exec_journal_stop_frame");
+    let sink = SinkConfig {
+        budget_bytes: 1 << 20,
+        soft_limit_pct: 85,
+    };
+    let (queue, drain) = journal_queue(sink, redaction_key()).unwrap();
+    let writer = drain
+        .spawn(JournalWriter::create(&root, SHARD, redaction_key()).unwrap())
+        .unwrap();
+    let heard = Heard::default();
+    let keep = Rc::clone(&heard);
+    let handler = move |env: Envelope<ExecEvent>| keep.borrow_mut().push(env.body);
+    let (mut session, control) = ExecSession::new(config, handler).unwrap();
+    session.set_journal(Journal::new(Rc::new(RefCell::new(queue))));
+    let late = "qres|rpc=99|found=0";
+    let held = Rc::new(std::cell::Cell::new(false));
+    let ended = {
+        let run = session.run();
+        tokio::pin!(run);
+        let hold = Rc::clone(&held);
+        // The run, not polled while `held` is set; `tokio::join!` polls it again on the task's
+        // next wake once it is cleared.
+        let gated = std::future::poll_fn(move |cx| {
+            if hold.get() {
+                return std::task::Poll::Pending;
+            }
+            run.as_mut().poll(cx)
+        });
+        let script = async move {
+            let mut peer = server.accept().await;
+            assert!(recv_text(&mut peer).await.starts_with("auth|ts="));
+            held.set(true);
+            peer.send(late);
+            tokio::time::sleep(ms(100)).await;
+            drop(control);
+            held.set(false);
+            while peer.next().await.is_some() {}
+        };
+        let (ended, ()) = tokio::join!(gated, script);
+        ended
+    };
+    ended.unwrap();
+    assert!(heard.borrow().is_empty());
+    drop(session);
+    writer.close().unwrap();
+    let entries: Vec<Entry> = JournalReader::open(&root, SHARD)
+        .unwrap()
+        .entries()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    fs::remove_dir_all(&root).unwrap();
+    let read: Vec<Seen> = entries.iter().map(|e| seen(&e.record)).collect();
+    let tail = [Seen::Closed(key(0)), Seen::In(late.to_owned(), 0)];
+    assert!(read.ends_with(&tail), "{read:#?}");
+    let closed = |s: &&Seen| matches!(s, Seen::Closed(_));
+    assert_eq!(read.iter().filter(closed).count(), 1, "{read:#?}");
+}
+
+/// Codex P2 on PR #115: an encode's context, and its nonces' filing time, come from the clock
+/// once the source has reserved them, not before: a source that takes its time (persisting its
+/// nonces) leaves the encode a time no earlier than its return.
+#[tokio::test]
+async fn an_encodes_context_is_timed_after_its_nonces_are_reserved() {
+    let mut server = ScriptedWs::start().await;
+    let venue = Venue::leak(conformance_toy);
+    let slow = Counting {
+        delay: ms(30),
+        ..Counting::new()
+    };
+    let returned = Arc::clone(&slow.returned);
+    let config = config(venue, &server.url(), &[], slow);
+    let run = journaled(
+        "exec_journal_slow_source",
+        config,
+        |_, control, _| async move {
+            let mut peer = server.accept().await;
+            assert!(recv_text(&mut peer).await.starts_with("auth|ts="));
+            peer.send(AUTH_ACK);
+            assert!(recv_text(&mut peer).await.starts_with("cod|rpc="));
+            drop(control);
+            while peer.next().await.is_some() {}
+        },
+    )
+    .await;
+    run.ended.as_ref().unwrap();
+    let returned = returned.lock().unwrap().clone();
+    let arm = run.entries.iter().find_map(|e| match &e.record {
+        Record::EncodeCtx { rpc: Some(_), ctx } => Some(ctx.wall),
+        _ => None,
+    });
+    assert_eq!(returned.len(), 1);
+    assert!(arm.unwrap() >= returned[0], "{arm:?} before {returned:?}");
+}
+
+/// Codex P2 on PR #115: a codec whose spans do not fit what it named them in is counted, as on a
+/// market-data session, and that frame is journaled with all of it hashed.
+#[tokio::test]
+async fn spans_that_do_not_fit_a_frame_are_counted_and_the_frame_is_hashed_whole() {
+    let in_frame = secret("defect");
+    let mut server = ScriptedWs::start().await;
+    let http = ScriptedHttp::start().await;
+    let venue = Venue::leak(auth_toy);
+    let cfg = [
+        (LOGIN, http.url("/auth")),
+        (CALL_NONCES, "0".to_owned()),
+        (BAD_SPANS, "1".to_owned()),
+    ];
+    let config = config(venue, &server.url(), &cfg, Counting::new());
+    let root = fresh_dir("exec_journal_bad_spans");
+    let sink = SinkConfig {
+        budget_bytes: 1 << 20,
+        soft_limit_pct: 85,
+    };
+    let (queue, drain) = journal_queue(sink, redaction_key()).unwrap();
+    let writer = drain
+        .spawn(JournalWriter::create(&root, SHARD, redaction_key()).unwrap())
+        .unwrap();
+    let heard = Heard::default();
+    let keep = Rc::clone(&heard);
+    let handler = move |env: Envelope<ExecEvent>| keep.borrow_mut().push(env.body);
+    let (mut session, control) = ExecSession::new(config, handler).unwrap();
+    session.set_journal(Journal::new(Rc::new(RefCell::new(queue))));
+    let hello = format!("hello|key={in_frame}");
+    let script = async move {
+        let mut peer = server.accept().await;
+        peer.send(&hello);
+        let open = ExecEvent::Conn {
+            stream: auth_toy::EXEC_STREAM,
+            state: ConnState::Open,
+        };
+        until(|| heard.borrow().contains(&open)).await;
+        drop(control);
+        while peer.next().await.is_some() {}
+    };
+    let (ended, ()) = tokio::join!(session.run(), script);
+    ended.unwrap();
+    assert_eq!(session.counters().refused_redactions, 1);
+    drop(session);
+    writer.close().unwrap();
+    let files = written_bytes(&root);
+    let entries: Vec<Entry> = JournalReader::open(&root, SHARD)
+        .unwrap()
+        .entries()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    fs::remove_dir_all(&root).unwrap();
+    assert!(!contains(&files, in_frame.as_bytes()));
+    let frame = entries.iter().find_map(|e| match &e.record {
+        Record::Inbound { bytes, .. } => Some(bytes.0.clone()),
+        _ => None,
+    });
+    let whole = format!("hello|key={in_frame}").len();
+    assert_eq!(frame.unwrap(), blank(whole).into_bytes());
 }
