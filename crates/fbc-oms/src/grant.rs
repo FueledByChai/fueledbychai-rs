@@ -854,6 +854,17 @@ mod tests {
     }
 
     #[test]
+    fn two_commands_built_under_the_same_count_carry_equal_guards() {
+        let btc = InstrumentId::new(1);
+        let mut c = Counts::default();
+        let first = Guard::state(c.generations.watch(btc), None);
+        let second = Guard::state(c.generations.watch(btc), None);
+        assert_eq!(first, second);
+        c.generations.advance(btc);
+        assert_ne!(first, Guard::state(c.generations.watch(btc), None));
+    }
+
+    #[test]
     fn refusals_say_what_was_refused() {
         let btc = InstrumentId::new(1);
         let stale = StaleAuthorization::StateChanged {
