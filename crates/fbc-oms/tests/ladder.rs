@@ -1798,6 +1798,8 @@ fn a_snapshot_under_another_venue_id_while_an_amend_may_have_moved_the_order_sti
     let rec = reg.get(c).unwrap();
     assert_eq!((rec.cum_venue(), rec.filled()), (lots(4), lots(4)));
     assert_eq!(rec.resting(), lots(6));
+    // Partly filled, as a fill or an update would show it (Codex r4225165100).
+    assert_eq!(rec.state(), OrdState::PartiallyFilled);
     assert_eq!(rec.vid(), Some(&vid("m1")));
     assert!(matches!(rec.intent(), Intent::PendingAmend { .. }));
     assert_eq!(rec.px(), Some(Ticks(100)));

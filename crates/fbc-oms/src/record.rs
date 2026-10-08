@@ -768,9 +768,14 @@ impl OrderRecord {
     /// Counts the cumulative fill `cum` the venue reported for the order on a snapshot that
     /// applies nothing else ([`Registry::on_query_answer`](crate::Registry::on_query_answer),
     /// [`Registry::on_resync`](crate::Registry::on_resync)): `cum_venue` keeps the largest, as
-    /// an order update's does.
+    /// an order update's does, and an Open order something has filled is PartiallyFilled, as
+    /// a fill would leave it (Codex r4225165100 on PR #134). Nothing else moves: an amend in
+    /// flight stays in flight and the order stays on the ladder.
     pub(crate) fn count_venue_fill(&mut self, cum: Lots) {
         self.cum_venue = self.cum_venue.max(cum);
+        if self.state == OrdState::Open {
+            self.state = self.live_state();
+        }
     }
 
     /// Nothing is in flight any more.
