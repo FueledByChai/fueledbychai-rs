@@ -313,6 +313,9 @@ fn order_ended(
 struct Restored {
     vid: String,
     cid: String,
+    /// Its size and what of it is open (less when it filled in part before the run).
+    size: &'static str,
+    open: &'static str,
 }
 
 /// As [`responder`], answering a batch cancel of `restored` too: every item queued and then
@@ -409,8 +412,28 @@ fn responder_full(
                     results.push(json!({"id": vid, "market": MARKET, "status": status}));
                     if close {
                         let seq = 6_000 + i64::try_from(i).unwrap();
-                        let ev =
-                            order_ended(restored_end, 2, seq, vid, &ours.cid, "70000", "0.00001");
+                        // Cancelled with what was open: an earlier fill stays filled.
+                        let ev = match restored_end {
+                            End::Canceled => order_event(
+                                2,
+                                seq,
+                                vid,
+                                &ours.cid,
+                                "70000",
+                                ours.size,
+                                ours.open,
+                                "USER_CANCELED",
+                            ),
+                            _ => order_ended(
+                                restored_end,
+                                2,
+                                seq,
+                                vid,
+                                &ours.cid,
+                                "70000",
+                                "0.00001",
+                            ),
+                        };
                         events.push(Frame::Binary(ev));
                     }
                 }
@@ -427,6 +450,11 @@ fn responder_full(
 /// namespace (account 1, namespace 1) under a lease of their own, and the `GET /orders`
 /// answer that shows them.
 fn restored() -> (Vec<Restored>, String) {
+    restored_sized("0.00001", "0.00001")
+}
+
+/// As [`restored`], each order of `size` with `open` of it open.
+fn restored_sized(size: &'static str, open: &'static str) -> (Vec<Restored>, String) {
     use fbc_core::{AccountKey, CidMint, Namespace, NamespaceLease, WallNs, encode_cid};
     let lease =
         NamespaceLease::acquire(&lease_dir(), AccountKey::new(1), Namespace::new(1)).unwrap();
@@ -437,6 +465,8 @@ fn restored() -> (Vec<Restored>, String) {
         .map(|vid| Restored {
             vid: vid.to_owned(),
             cid: encode_cid(&fmt, mint.mint().unwrap()).unwrap().to_string(),
+            size,
+            open,
         })
         .collect();
     let results: Vec<Value> = orders
@@ -445,7 +475,7 @@ fn restored() -> (Vec<Restored>, String) {
             json!({
                 "id": o.vid, "client_id": o.cid, "market": MARKET, "side": "SELL",
                 "type": "LIMIT", "instruction": "POST_ONLY", "price": "70000",
-                "size": "0.00001", "remaining_size": "0.00001", "status": "OPEN", "flags": [],
+                "size": o.size, "remaining_size": o.open, "status": "OPEN", "flags": [],
             })
         })
         .collect();
@@ -1426,20 +1456,11 @@ async fn orders_under_another_namespace_than_the_one_allocated_refuse_the_run_be
     );
 }
 
-#[tokio::test]
-async fn a_touch_that_moved_toward_the_order_before_the_place_stops_the_run_with_nothing_placed() {
-    // The first read prices the order at 60140.1, 3% under 62000.2; by the second the bid is
-    // 61000.2, so the order would rest only about 1.4% behind it.
+/// Runs testnet_trade against a stub whose second `GET /orderbook` answers `second` (the first
+/// answers the fixture) and whose socket answers nothing after the arm: its report, what it
+/// printed and the methods it sent.
+async fn run_with_second_book(second: String) -> (trade::Report, String, Vec<String>) {
     let book = fs::read_to_string(fixture("paradex/rest/orderbook-btc-2002.json")).unwrap();
-    let mut moved: Value = serde_json::from_str(&book).unwrap();
-    moved["bids"] = json!([["61000.2", "0.333"]]);
-    moved["asks"] = json!([["61000.5", "0.1"]]);
-    moved["best_bid_api"] = json!(["61000.2", "0.333"]);
-    moved["best_bid_interactive"] = json!(["61000.2", "0.333"]);
-    moved["best_ask_api"] = json!(["61000.5", "0.1"]);
-    moved["best_ask_interactive"] = json!(["61000.5", "0.1"]);
-    moved["seq_no"] = json!(2003);
-    let moved = moved.to_string();
     let reads = Arc::new(AtomicU64::new(0));
     let empty = r#"{"results":[]}"#;
     let routes = HttpRouter::new()
@@ -1455,7 +1476,7 @@ async fn a_touch_that_moved_toward_the_order_before_the_place_stops_the_run_with
                 if reads.fetch_add(1, Ordering::SeqCst) == 0 {
                     reply(200, book.clone())
                 } else {
-                    reply(200, moved.clone())
+                    reply(200, second.clone())
                 }
             },
         )
@@ -1482,6 +1503,24 @@ async fn a_touch_that_moved_toward_the_order_before_the_place_stops_the_run_with
     let opts = options(&stub, "10");
     let (report, printed) = run_against(&opts).await;
     stub.finished().await.unwrap();
+    let sent = methods(&stub);
+    (report, printed, sent)
+}
+
+#[tokio::test]
+async fn a_touch_that_moved_toward_the_order_before_the_place_stops_the_run_with_nothing_placed() {
+    // The first read prices the order at 60140.1, 3% under 62000.2; by the second the bid is
+    // 61000.2, so the order would rest only about 1.4% behind it.
+    let book = fs::read_to_string(fixture("paradex/rest/orderbook-btc-2002.json")).unwrap();
+    let mut moved: Value = serde_json::from_str(&book).unwrap();
+    moved["bids"] = json!([["61000.2", "0.333"]]);
+    moved["asks"] = json!([["61000.5", "0.1"]]);
+    moved["best_bid_api"] = json!(["61000.2", "0.333"]);
+    moved["best_bid_interactive"] = json!(["61000.2", "0.333"]);
+    moved["best_ask_api"] = json!(["61000.5", "0.1"]);
+    moved["best_ask_interactive"] = json!(["61000.5", "0.1"]);
+    moved["seq_no"] = json!(2003);
+    let (report, printed, sent) = run_with_second_book(moved.to_string()).await;
     assert!(!report.ok, "{printed}");
     assert!(
         printed.contains("the touch moved toward the order (bid 61000.2, ask 61000.5)"),
@@ -1498,7 +1537,7 @@ async fn a_touch_that_moved_toward_the_order_before_the_place_stops_the_run_with
         (0, 0),
         "{printed}"
     );
-    assert!(!methods(&stub).iter().any(|m| m == "order.create"));
+    assert!(!sent.iter().any(|m| m == "order.create"));
 }
 
 /// A frame of `fixtures/paradex/exec`: whitespace-separated hex bytes, `#` to the end of a
@@ -1606,4 +1645,82 @@ fn the_output_writer_never_waits_for_a_stalled_sink() {
         String::from_utf8(got.lock().unwrap().clone()).unwrap(),
         expected
     );
+}
+
+#[tokio::test]
+async fn an_earlier_runs_order_filled_in_part_before_the_run_and_cancelled_by_stop_is_a_clean_run()
+{
+    // Each restored order is 2 lots with 1 filled before this run: Stop cancels the open lot,
+    // and the fill from before is not this run's.
+    let (orders, body) = restored_sized("0.00002", "0.00001");
+    let placed = Arc::new(Mutex::new(Placed::default()));
+    let stub = StubServer::start(
+        restored_script(Arc::clone(&placed), orders, End::Canceled),
+        routes_with(body),
+    )
+    .await
+    .unwrap();
+    let opts = options(&stub, "10");
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(report.ok, "{printed}");
+    assert!(printed.contains("cancel all: 1 cancels sent"), "{printed}");
+    assert!(!printed.contains("filled during the run"), "{printed}");
+}
+
+#[test]
+fn a_resync_after_the_seed_that_disagrees_with_the_inventory_is_reported() {
+    use fbc_core::{InstrumentId, MonoNs, SignedLots, WallNs};
+    use fbc_oms::{PositionCheck, ResyncReport, ResyncSnapshot};
+    let inst = InstrumentId::new(1);
+    let resynced = |checks| link::Note::Resynced {
+        report: ResyncReport {
+            checks,
+            ..ResyncReport::default()
+        },
+        snapshot: ResyncSnapshot {
+            watermark: WallNs(0),
+            requested_at: MonoNs(0),
+            orders: Vec::new(),
+            positions: Vec::new(),
+        },
+    };
+    // The first resync (nothing seeded, nothing compared), then a reconnect's that agrees.
+    let agrees = PositionCheck::Agrees {
+        inst,
+        position: SignedLots(0),
+    };
+    let mut notes = vec![resynced(vec![]), resynced(vec![agrees])];
+    assert!(trade::resync_disagreements(&notes).is_empty());
+    // A reconnect's resync showing the account long 5 lots where the registry holds 0.
+    notes.push(resynced(vec![PositionCheck::Desync {
+        inst,
+        venue: SignedLots(5),
+        ledger: Some(SignedLots(0)),
+    }]));
+    notes.push(resynced(vec![PositionCheck::Unsettled(inst)]));
+    let found = trade::resync_disagreements(&notes);
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(found[0].starts_with("Desync"), "{found:?}");
+    assert!(found[1].starts_with("Unsettled"), "{found:?}");
+}
+
+#[tokio::test]
+async fn a_second_order_book_older_than_the_first_stops_the_run_with_nothing_placed() {
+    // The same touch, but seq 2001 after the first read's 2002: a stale answer.
+    let book = fs::read_to_string(fixture("paradex/rest/orderbook-btc-2002.json")).unwrap();
+    let mut stale: Value = serde_json::from_str(&book).unwrap();
+    stale["seq_no"] = json!(2001);
+    let (report, printed, sent) = run_with_second_book(stale.to_string()).await;
+    assert!(!report.ok, "{printed}");
+    assert!(
+        printed.contains("the second order book (seq 2001) is older than the first (seq 2002)"),
+        "{printed}"
+    );
+    assert_eq!(
+        steps(&printed),
+        ["login", "arm", "resync", "start", "stop"],
+        "{printed}"
+    );
+    assert!(!sent.iter().any(|m| m == "order.create"));
 }

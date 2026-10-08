@@ -46,8 +46,8 @@ use fbc_core::{
 };
 use fbc_oms::{
     CancelChoice, CancelEverything, FillLedger, LadderConfig, LeaseKeys, Leases, LedgerConfig,
-    MarketCapsConfig, OrdState, PreTradeCaps, Registry, ResyncReport, ResyncSnapshot, Routed,
-    TerminalKind, TestnetRun,
+    MarketCapsConfig, OrdState, PositionCheck, PreTradeCaps, Registry, ResyncReport,
+    ResyncSnapshot, Routed, TerminalKind, TestnetRun,
 };
 use fbc_runtime::http::{Bytes, Method, Request};
 use fbc_runtime::{
@@ -269,6 +269,7 @@ pub async fn run(
     let recheck = Recheck {
         opts: opts.clone(),
         specs: specs.clone(),
+        first_seq: book.seq_no,
     };
     let session_cfg = session_config(factory, cfg, creds, specs, opts)?;
     let (mut session, control) =
@@ -543,6 +544,8 @@ fn price(opts: &Options, book: &OrderbookSnapshot) -> Result<Priced, String> {
 struct Recheck {
     opts: Options,
     specs: SpecTable,
+    /// The first read's book sequence: the second must not be older.
+    first_seq: u64,
 }
 
 impl Recheck {
@@ -550,6 +553,13 @@ impl Recheck {
     /// it: the touch it reports, or why the order must not go out.
     async fn still_away(&self, px: Ticks) -> Result<(Touch, u64), String> {
         let book = touch(&self.opts, &self.specs).await?;
+        if book.seq_no < self.first_seq {
+            return Err(format!(
+                "the second order book (seq {}) is older than the first (seq {}): a stale \
+                 answer shows no current touch",
+                book.seq_no, self.first_seq
+            ));
+        }
         let now = away_from(&self.opts, &book)?;
         let far_enough = match self.opts.side {
             OrderSide::Buy => px <= now.away,
@@ -645,6 +655,32 @@ pub fn snapshot_max(snapshot: &ResyncSnapshot) -> u64 {
         })
         .max()
         .unwrap_or(0)
+}
+
+/// What the resyncs after the first (a reconnect's) found wrong with the positions the
+/// registry holds: a market whose venue position differs from its inventory (`Desync`), or
+/// could not be compared (`Stale`, `Unsettled`), or a fill the resync could not place. A later
+/// resync never overwrites the inventory, so the run cannot go on from it.
+pub fn resync_disagreements(notes: &[Note]) -> Vec<String> {
+    notes
+        .iter()
+        .filter_map(|n| match n {
+            Note::Resynced { report, .. } => Some(report),
+            _ => None,
+        })
+        .flat_map(|report| {
+            let checks = report
+                .checks
+                .iter()
+                .filter(|c| !matches!(c, PositionCheck::Agrees { .. }))
+                .map(|c| format!("{c:?}"));
+            let unsettled = report
+                .unsettled
+                .iter()
+                .map(|(inst, _)| format!("Unsettled fill on instrument {}", inst.get()));
+            checks.chain(unsettled).collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// Those of `owned` (our orders on the market) that did not end cancelled, each with its state
@@ -853,11 +889,18 @@ impl Driver {
     }
 
     /// True unless a fill that is not of our orders came in (a liquidation, a settlement,
-    /// another system's order), or the venue reported the account's position other than the
-    /// position seeded at Start (or on another market).
+    /// another system's order), the venue reported the account's position other than the
+    /// position seeded at Start (or on another market), or a reconnect's resync disagreed
+    /// with the registry's inventory ([`resync_disagreements`]).
     fn account_unmoved(&self) -> bool {
-        let mut unmoved = true;
         let link = self.link.borrow();
+        let disagreements = resync_disagreements(link.notes());
+        let mut unmoved = disagreements.is_empty();
+        for what in &disagreements {
+            self.note(format_args!(
+                "a resync found the position other than the registry's: {what}"
+            ));
+        }
         for note in link.notes() {
             match note {
                 Note::Fill {
@@ -1109,6 +1152,17 @@ impl Driver {
                 self.note(format_args!("{e}; nothing placed"));
                 return false;
             }
+        }
+        // A reconnect's resync since Start that disagrees with the inventory the caps judge
+        // the place against: nothing is placed on it.
+        let disagreements = resync_disagreements(self.link.borrow().notes());
+        if !disagreements.is_empty() {
+            self.note(format_args!(
+                "a resync since the seed found the position other than the registry's \
+                 ({}); nothing placed",
+                disagreements.join(", ")
+            ));
+            return false;
         }
 
         // The place: built and authorized by fbc-oms, then handed to the session.
@@ -1451,29 +1505,38 @@ impl Driver {
                     "the order events reporting Stop's cancelled orders ended",
                 );
             } else {
-                let ends: Vec<(TerminalKind, Lots)> = {
+                // What of each had filled when the run took it on (an earlier run's order may
+                // have filled in part before): only a fill since then is this run's.
+                let before = |cid: ClientOrderId| {
+                    self.owned
+                        .iter()
+                        .find(|(c, _)| *c == cid)
+                        .map_or(Lots::ZERO, |(_, b)| *b)
+                };
+                let ends: Vec<(TerminalKind, Lots, Lots)> = {
                     let mut link = self.link.borrow_mut();
                     let reg = link.reg();
                     named
                         .iter()
-                        .filter_map(|cid| reg.get(*cid))
-                        .filter_map(|r| match r.state() {
-                            OrdState::Terminal(kind) => Some((kind, r.filled())),
+                        .filter_map(|cid| reg.get(*cid).map(|r| (r, before(*cid))))
+                        .filter_map(|(r, before)| match r.state() {
+                            OrdState::Terminal(kind) => Some((kind, r.filled(), before)),
                             _ => None,
                         })
                         .collect()
                 };
                 for end in ends {
                     match end {
-                        (TerminalKind::Canceled(_), Lots::ZERO) => {}
-                        (TerminalKind::Canceled(_), filled) => {
+                        (TerminalKind::Canceled(_), filled, before) if filled <= before => {}
+                        (TerminalKind::Canceled(_), filled, before) => {
                             accepted = false;
                             self.note(format_args!(
-                                "a Stop cancel's order was cancelled after {} lots of it filled",
-                                filled.get()
+                                "a Stop cancel's order was cancelled after {} lots of it filled \
+                                 during the run",
+                                filled.get() - before.get()
                             ));
                         }
-                        (kind, _) => {
+                        (kind, _, _) => {
                             accepted = false;
                             self.note(format_args!(
                                 "a Stop cancel's order ended without being cancelled: {kind:?}"
