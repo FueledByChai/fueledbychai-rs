@@ -21,24 +21,26 @@ order queries and the arm may use the floor, since §4.10 names only cancels and
 
 The two differ in how many there can be. The Unknown ladder (0005) queries an order for as long
 as it stays unresolved, and many orders can go Unknown at once (a stalled write, a reconnect, a
-venue outage), so queries come in storms the runtime does not bound. The arm is sent by the
-session itself, once per connection epoch (0058), and epochs are paced (`ReconnectPacing`) and,
-where the venue counts them, charged `Connect`; the codec's resync, also once per epoch, is the
-same.
+venue outage), so queries come in storms the runtime does not bound. The session's own arm is
+sent once per connection epoch (0058), and epochs are paced (`ReconnectPacing`) and, where the
+venue counts them, charged `Connect`; the codec's resync, also once per epoch, is the same. A
+consumer may also submit the arm, a dead-man refresh or the fee query as a `ControlCommand`
+(`ExecOrders::submit_control`), which needs no authorization and has no count: those are
+unbounded like the queries (Reviewer B RB-e8i-1 on PR #113).
 
 ## Decision
 
-1. **An order query is charged as normal traffic.** The order-entry session charges a
-   `VenueCommand::Query`'s frames as `TrafficClass::Normal`, whatever its label: at a bucket's
-   safety floor it is `NotSent(RateBudget)`, nothing written, counted under the scope that
-   refused it, as a normal place or amend is. The frames keep their Safety label for everything
-   else (the journal, tick-to-wire). The fee query is normal already.
-2. **The arm and the resync keep the reserve.** The session's `ArmCancelOnDisconnect(true)`
-   and the codec's resync are charged as their codec labels them, Safety for the conformance
-   toy's and Paradex's, so they may use the reserve: an epoch opened with its buckets at the
-   floor still arms its protection and resyncs, and so still takes cancels and, once the
-   buckets refill, places. The dead-man refresh would be charged as labelled too; no session
-   takes a dead-man venue (0058).
+1. **Every control command is charged as normal traffic.** The order-entry session charges the
+   frames of each `ControlCommand` the consumer submits (an order query, the fee query, a
+   dead-man refresh, a cancel-on-disconnect arm) as `TrafficClass::Normal`, whatever its label:
+   at a bucket's safety floor it is `NotSent(RateBudget)`, nothing written, counted under the
+   scope that refused it, as a normal place or amend is. The frames keep their Safety label for
+   everything else (the journal, tick-to-wire). None of them is a cancel or a reducing order.
+2. **The session's own arm and the resync keep the reserve.** The `ArmCancelOnDisconnect(true)`
+   the session itself sends on each epoch and the codec's resync are charged as their codec
+   labels them, Safety for the conformance toy's and Paradex's, so they may use the reserve:
+   an epoch opened with its buckets at the floor still arms its protection and resyncs, and so
+   still takes cancels and, once the buckets refill, places.
 3. **Cancels and reducing orders use the reserve, as §4.10 says.** A cancel, a cancel-many, an
    instrument cancel-all, and a place, batch or amend that only reduces the position are Safety
    by `traffic_class` and are charged so, until the bucket is empty.
@@ -56,19 +58,24 @@ codec labels it, as 0030 already has it.
   is the runtime's concern, so the runtime decides it.
 - A separate reserve for queries inside the safety reserve: a second consumer setting with no
   observed need; refused until a venue's numbers show one.
-- Arming as normal traffic: an epoch opened at the floor would fail its arm, end as a drop and
+- Charging a consumer's control commands by their label (this record's first version): a
+  consumer re-arming or refreshing in a loop could empty the reserve, as the query storm could.
+- Arming the session's own arm as normal traffic: an epoch opened at the floor would fail its arm, end as a drop and
   reconnect, which costs another `Connect` and leaves cancels and places waiting, to save at
   most one unit per epoch.
 
 ## Consequences
 
+- A consumer's dead-man refresh refused at the floor lets the venue's timer run on; when it
+  fires the venue cancels, which is the safe direction. No session takes a dead-man venue yet
+  (0058).
 - While normal traffic holds a bucket at its floor, the Unknown ladder's queries wait with the
   places: an Unknown order resolves later, and fbc-oms keeps counting it at its worst case
   (0005), so the caps stay safe; the consumer's quoting rate, not the query, is what to slow.
-- A reconnect storm can take at most one arm and one resync per epoch from the reserve, bounded
+- A reconnect storm can take at most the session's own arm and one resync per epoch from the reserve, bounded
   by the pacing.
 - When order entry over HTTP arrives (FBC-m8vm), an order query's HTTP request must be charged
-  the same way: normal, whatever its label.
+  the same way, as every control command's: normal, whatever its label.
 
 ## What would show this was wrong
 
