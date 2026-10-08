@@ -1,0 +1,7 @@
+# The toy's `book` channel (BOOK) shows public liquidity only (BookCaps.includes_channels):
+# every frame that pushes a level says so.
+public text snap|sym=TOYA-PERP|book=0|seq=10|bid=100:3,98:5|ask=101:2
+public text delta|sym=TOYA-PERP|book=0|seq=11|bid=100:4|ask=
+public text snap|sym=TOYB-PERP|book=0|seq=500|bid=40:1|ask=42:1
+# A delta setting no level shows nothing.
+text delta|sym=TOYB-PERP|book=0|seq=501|bid=|ask=

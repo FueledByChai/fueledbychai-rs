@@ -39,6 +39,17 @@ A check that reads recorded data reads it from a subdirectory named after the ch
   characters) of the suite's sequence numbers 5 to 8 in its namespace 1, computed with
   `fbc_core::encode_cid`; nothing here is a real account's.
 
-`caps_truthful`, `commands_selfcontained`, `encode_deterministic` and `price_grid` read no
-file: they need only the toy's factory and the setup the suite's test gives (the toy's spec
-table, an empty configuration and no credentials).
+- `continuity/`, `no_exch_ts_synthesized/` and `book_channels/`: market-data case files, one per
+  book channel the suite drives (`<channel>.frames`, in the format
+  `crates/fbc-conformance/src/suite/book_cases.rs` documents), written by hand in the toy's own
+  protocol (`crates/fbc-conformance/src/toy/md.rs`), each frame tagged with what the fixture
+  knows of it: the toy's `book` channel with its sequence breaks marked `gap`
+  (`continuity/book`), its frames carrying a timestamp marked `ts`
+  (`no_exch_ts_synthesized/book`), and its frames marked with the order channels whose
+  liquidity they show, public only (`book_channels/book`). The toy's `rpi_book` is anchored on
+  REST, which the suite does not drive yet (FBC-fhk4), so it has no case; the toy's market
+  data is text, so `continuity` has no `longer_block/` sub-case here.
+
+`caps_truthful`, `commands_selfcontained`, `encode_deterministic`, `price_grid` and
+`subscriptions_idempotent` read no file: they need only the toy's factory and the setup the
+suite's test gives (the toy's spec table, an empty configuration and no credentials).

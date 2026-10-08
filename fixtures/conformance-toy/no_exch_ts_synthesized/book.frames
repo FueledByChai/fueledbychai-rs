@@ -1,0 +1,8 @@
+# The toy's `book` channel (BOOK): the frames tagged `ts` carry the venue's timestamp (`ts=`);
+# the events of the others must carry none.
+ts text snap|sym=TOYA-PERP|book=0|seq=10|ts=1759363200000000000|bid=100:3|ask=101:2
+text delta|sym=TOYA-PERP|book=0|seq=11|bid=100:4|ask=
+ts text delta|sym=TOYA-PERP|book=0|seq=12|ts=1759363200000000500|bid=|ask=101:0
+text snap|sym=TOYB-PERP|book=0|seq=500|bid=40:1|ask=42:1
+# A gap reported from a frame without a timestamp carries none either.
+text delta|sym=TOYB-PERP|book=0|seq=502|bid=41:2|ask=

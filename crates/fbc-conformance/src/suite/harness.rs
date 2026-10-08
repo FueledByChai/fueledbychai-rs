@@ -7,11 +7,12 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fbc_core::{
-    AccountKey, AmendOrder, CancelOrder, CapTag, Channel, CidMint, ClientOrderId, DecodeScope,
-    Effects, EncodeCtx, EncodeReceipt, ExecCodec, Feature, InstrumentId, Lots, MonoNs, Namespace,
-    NamespaceLease, NewOrder, NonceBlock, NotSentReason, OrderCaps, OrderKind, OrderKindTag,
-    OrderRef, PathStamps, QueryOrder, RefKind, RpcId, Side, SpecTable, StreamId, TagSet, Ticks,
-    TifTag, VenueCaps, VenueCommand, VenueOrderId, WallNs, dispatch,
+    AccountKey, AmendOrder, BookId, CancelOrder, CapTag, Channel, CidMint, ClientOrderId,
+    DecodeScope, Effects, EncodeCtx, EncodeReceipt, EndpointPlan, ExecCodec, Feature, Feed,
+    InstrumentId, Lots, MdCodec, MdTransport, MonoNs, Namespace, NamespaceLease, NewOrder,
+    NonceBlock, NotSentReason, OrderCaps, OrderKind, OrderKindTag, OrderRef, PathStamps,
+    QueryOrder, RefKind, RpcId, Side, SpecTable, StreamId, Subscription, TagSet, Ticks, TifTag,
+    VenueCaps, VenueCommand, VenueOrderId, WallNs, WireUrl, dispatch, dispatch_market_data,
 };
 
 use super::{Failure, Subject};
@@ -23,6 +24,11 @@ const ACCOUNT: AccountKey = AccountKey::new(1);
 pub(crate) const NAMESPACE: Namespace = Namespace::new(1);
 /// The fixed encode time.
 pub(crate) const WALL: WallNs = WallNs(1_759_363_200_000_000_000);
+/// The stream a market-data codec the suite builds is on.
+pub(crate) const MD_STREAM: StreamId = StreamId(0);
+/// The address of the endpoint a market-data codec the suite builds is planned for: never
+/// opened, the suite driving the codec itself.
+const MD_URL: &str = "wss://conformance.invalid/md";
 /// The first placement nonce an order carries; item `i`'s is this plus `i`.
 const PLACEMENT_NONCE: u64 = 1_000;
 /// The limit price aimed at: the valid price at or above it on the instrument's grid is used.
@@ -117,6 +123,38 @@ impl<'s> Harness<'s> {
                 "declares order entry, yet exec_codec builds no codec",
             )
         })
+    }
+
+    /// Book channel `book` on every instrument of the setup, in the spec table's order.
+    pub fn book_subs(&self, book: BookId) -> Vec<Subscription> {
+        let feed = Feed::Book(book);
+        self.specs
+            .iter()
+            .map(|spec| Subscription {
+                inst: spec.id,
+                feed,
+            })
+            .collect()
+    }
+
+    /// A market-data codec built fresh under the setup, for a socket endpoint on [`MD_STREAM`]
+    /// planned with `subs`.
+    pub fn md_codec(&self, subs: Vec<Subscription>) -> Box<dyn MdCodec> {
+        let plan = EndpointPlan {
+            stream: MD_STREAM,
+            transport: MdTransport::Socket {
+                url: WireUrl::plain(MD_URL),
+            },
+            subs,
+        };
+        self.subject
+            .factory()
+            .md_codec(&self.subject.setup().cfg, &plan)
+    }
+
+    /// Runs `f` in the decode scope the core lends a market-data session for the venue's caps.
+    pub fn md_scope<R>(&self, f: impl for<'a> FnOnce(&'a DecodeScope<'a>) -> R) -> R {
+        dispatch_market_data(&self.caps, f)
     }
 
     /// The spec table the setup gives.

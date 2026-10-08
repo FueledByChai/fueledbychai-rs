@@ -1,9 +1,11 @@
-//! FBC-8ew's, FBC-onw's, FBC-whw's and FBC-2re's done lines, their first halves: the named
-//! suite runs on the conformance toy venue through the suite macro with its fixture directory
-//! (BT-502, design §6), `caps_truthful`, `commands_selfcontained`, `signing_golden`,
+//! FBC-8ew's, FBC-onw's, FBC-whw's, FBC-2re's and FBC-vmw's done lines, their first halves: the
+//! named suite runs on the conformance toy venue through the suite macro with its fixture
+//! directory (BT-502, design §6), `caps_truthful`, `commands_selfcontained`, `signing_golden`,
 //! `legacy_symbols`, `fee_sign`, `liquidity_reported`, `position_signed`,
-//! `decoder_deterministic`, `encode_deterministic`, `ids_roundtrip`, `restart_cid` and
-//! `price_grid` each a test, and all pass. The checks are run directly too, to show what they probed: a
+//! `decoder_deterministic`, `encode_deterministic`, `ids_roundtrip`, `restart_cid`,
+//! `price_grid`, `continuity`, `subscriptions_idempotent`, `no_exch_ts_synthesized` and
+//! `book_channels` each a test, and all pass; `continuity`'s longer-block sub-case reports
+//! itself skipped by name for the toy's text protocol. The checks are run directly too, to show what they probed: a
 //! pass that probed nothing would prove nothing.
 
 mod toy_setup;
@@ -222,4 +224,51 @@ fn price_grid_quantizes_and_sends_every_boundary_price_on_both_of_the_toys_instr
             )
         );
     }
+}
+
+/// Why the toy's `rpi_book` is skipped by every market-data check.
+const ANCHORED: &str = "rpi_book: skipped: BookCaps.rest_anchor is true: its snapshot comes in \
+                        an HTTP answer, which the suite does not carry yet (FBC-fhk4)";
+
+#[test]
+fn continuity_detects_every_marked_break_and_skips_the_longer_block_sub_case_by_name() {
+    assert_eq!(
+        probed(suite::continuity),
+        [
+            ANCHORED,
+            "continuity/book.frames: 3 of 11 frames break the sequence",
+            "longer_block: skipped: MdCaps.encoding is Text: its frames carry no binary block",
+        ]
+    );
+}
+
+#[test]
+fn subscriptions_idempotent_sends_the_toys_book_once_per_epoch() {
+    assert_eq!(
+        probed(suite::subscriptions_idempotent),
+        [
+            ANCHORED,
+            "book: 2 subscriptions sent once in each of 2 epochs ([1, 1] effects), nothing for \
+             the same set again",
+        ]
+    );
+}
+
+#[test]
+fn no_exch_ts_synthesized_judges_every_event_of_a_frame_without_a_timestamp_on_the_toy() {
+    assert_eq!(
+        probed(suite::no_exch_ts_synthesized),
+        [
+            ANCHORED,
+            "no_exch_ts_synthesized/book.frames: 6 events from frames without a timestamp",
+        ]
+    );
+}
+
+#[test]
+fn book_channels_holds_the_toys_book_to_public_liquidity() {
+    assert_eq!(
+        probed(suite::book_channels),
+        [ANCHORED, "book_channels/book.frames: shows [Public]"]
+    );
 }
