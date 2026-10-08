@@ -91,9 +91,9 @@ Lines (each step with the milliseconds since the start):
   NOTE ...           something worth knowing (an unexpected event, a refusal)
   DONE ok|failed     the outcome; ok only when every step happened, every order of ours
                      on the market ended cancelled with nothing filled during the run, every
-                     Stop cancel was sent and accepted, the inventory did not move, and no
-                     fill not of our orders or position change came in; the exit status is
-                     0 only for ok
+                     Stop cancel was sent and accepted, the inventory did not move, no fill
+                     not of our orders or position change came in, and no order not ours
+                     came into view; the exit status is 0 only for ok
 
 Ctrl-C aborts at once: the socket closes and Paradex's cancel-on-disconnect cancels the order.
 ";
