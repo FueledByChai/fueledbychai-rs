@@ -20,7 +20,7 @@ use super::{Failure, Subject};
 pub(crate) const RPC: RpcId = RpcId(1);
 /// The account and namespace the suite mints its client ids under, in a directory of its own.
 const ACCOUNT: AccountKey = AccountKey::new(1);
-const NAMESPACE: Namespace = Namespace::new(1);
+pub(crate) const NAMESPACE: Namespace = Namespace::new(1);
 /// The fixed encode time.
 pub(crate) const WALL: WallNs = WallNs(1_759_363_200_000_000_000);
 /// The first placement nonce an order carries; item `i`'s is this plus `i`.
@@ -149,9 +149,22 @@ impl<'s> Harness<'s> {
         Encoded { result, fx }
     }
 
-    /// Our first `n` client ids.
+    /// Our first `n` client ids: sequence numbers 1 to `n`, as a mint with no high-water mark
+    /// started at the epoch issues them.
     pub fn cids(&self, n: usize) -> Result<Vec<ClientOrderId>, Failure> {
-        mint(n).map_err(|why| self.fail("setup", why))
+        self.cids_from(0, 0, WallNs(0), n)
+    }
+
+    /// `n` client ids from a mint seeded with the high-water mark `hwm`, the snapshot's highest
+    /// sequence number `snapshot_max` and the start time `start` ([`CidMint::new`]).
+    pub fn cids_from(
+        &self,
+        hwm: u64,
+        snapshot_max: u64,
+        start: WallNs,
+        n: usize,
+    ) -> Result<Vec<ClientOrderId>, Failure> {
+        mint(hwm, snapshot_max, start, n).map_err(|why| self.fail("setup", why))
     }
 
     /// The venue's order ids `conformance-0` to `conformance-<n-1>`.
@@ -382,26 +395,33 @@ pub(crate) fn undeclared(declared: TagSet<RefKind>, all: &[RefKind]) -> Vec<RefK
         .collect()
 }
 
-/// `n` client ids minted under the suite's own lease, in a directory made for them and removed
-/// after.
-fn mint(n: usize) -> Result<Vec<ClientOrderId>, String> {
+/// `n` client ids minted under the suite's own lease, from a mint seeded as
+/// [`Harness::cids_from`] says, in a directory made for them and removed after.
+fn mint(
+    hwm: u64,
+    snapshot_max: u64,
+    start: WallNs,
+    n: usize,
+) -> Result<Vec<ClientOrderId>, String> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let k = NEXT.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("fbc-conformance-{}-{k}", std::process::id()));
-    let cids = mint_in(&dir, n);
+    let cids = mint_in(&dir, (hwm, snapshot_max, start), n);
     let _ = fs::remove_dir_all(&dir);
     cids
 }
 
-/// `n` client ids minted under a lease taken in `dir`, created if missing.
-fn mint_in(dir: &Path, n: usize) -> Result<Vec<ClientOrderId>, String> {
+/// `n` client ids minted under a lease taken in `dir`, created if missing, from a mint seeded
+/// with `seed` (the high-water mark, the snapshot's highest sequence number, the start time).
+fn mint_in(dir: &Path, seed: (u64, u64, WallNs), n: usize) -> Result<Vec<ClientOrderId>, String> {
     let shown = dir.display();
     fs::create_dir_all(dir).map_err(|e| format!("cannot create {shown}: {e}"))?;
     let lease = NamespaceLease::acquire(dir, ACCOUNT, NAMESPACE);
     let lease = lease.map_err(|e| format!("cannot mint client ids in {shown}: {e}"))?;
-    let mut mint = CidMint::new(lease, 0, 0, WallNs(0));
+    let (hwm, snapshot_max, start) = seed;
+    let mut mint = CidMint::new(lease, hwm, snapshot_max, start);
     (0..n)
-        .map(|_| mint.mint().map_err(|e| format!("cannot mint: {e:?}")))
+        .map(|_| mint.mint().map_err(|e| format!("cannot mint: {e}")))
         .collect()
 }
 
@@ -431,7 +451,7 @@ mod tests {
         let file =
             std::env::temp_dir().join(format!("fbc-conformance-file-{}", std::process::id()));
         fs::write(&file, b"not a directory").unwrap();
-        let err = mint_in(&file.join("under"), 1).unwrap_err();
+        let err = mint_in(&file.join("under"), (0, 0, WallNs(0)), 1).unwrap_err();
         let _ = fs::remove_file(&file);
         assert!(err.starts_with("cannot create"), "{err}");
     }
@@ -441,7 +461,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fbc-conformance-held-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let held = NamespaceLease::acquire(&dir, ACCOUNT, NAMESPACE).unwrap();
-        let err = mint_in(&dir, 1).unwrap_err();
+        let err = mint_in(&dir, (0, 0, WallNs(0)), 1).unwrap_err();
         drop(held);
         let _ = fs::remove_dir_all(&dir);
         assert!(err.starts_with("cannot mint client ids"), "{err}");

@@ -1,0 +1,10 @@
+# Client ids another system sent the venue, each of which must read as Unparseable, never as
+# one of ours. The Java stack never traded the toy, so these stand in for the ids a real
+# venue's fixtures list from the Java brokers: client order ids counted up from
+# System.currentTimeMillis(), a random (version 4) UUID, a typed-in label, and one of the
+# suite's own ids with its last character changed (a corrupted id).
+1759363199123
+1759363199124
+3b241101-e2bb-4255-8caf-4136c566a962
+c-1
+00SKjrSqeFPTfbl3hrG0T

@@ -39,9 +39,16 @@
 //!   `position_signed/long.frames` and `position_signed/short.frames`.
 //! - `decoder_deterministic/`: optional, more `<case>.frames` files for
 //!   [`decoder_deterministic`], which also decodes every case of the three directories above.
+//! - `ids_roundtrip/java_era.txt`: client ids another system sent the venue (the Java
+//!   brokers' ids, for a venue the Java stack traded), one per line; blank lines and lines
+//!   starting with `#` are ignored.
+//! - `restart_cid/resting.frames`: a case of what the venue shows a restarted process: a
+//!   resync's answer with orders of ours resting, their client ids the suite's first
+//!   [`MINTED_BEFORE`] ids in its namespace, the newest among them ([`restart_cid`]).
 //!
-//! [`caps_truthful`] and [`commands_selfcontained`] read no file: they need only the factory
-//! and the [`Setup`] the `setup` function gives, called afresh wherever a check builds a codec.
+//! [`caps_truthful`], [`commands_selfcontained`], [`encode_deterministic`] and [`price_grid`]
+//! read no file: they need only the factory and the [`Setup`] the `setup` function gives,
+//! called afresh wherever a check builds a codec.
 //!
 //! # The checks so far
 //!
@@ -61,13 +68,24 @@
 //! - [`position_signed`]: positions are signed, positive long.
 //! - [`decoder_deterministic`]: the same frames decode to identical events on two runs, each
 //!   with a freshly built codec (decision 0006).
+//! - [`encode_deterministic`]: the same command under the same [`EncodeCtx`] encodes to the
+//!   same bytes at two real times, each with a freshly built codec (decision 0006).
+//! - [`ids_roundtrip`]: our ids round-trip through the core's client-id codec under the
+//!   venue's wire format, and the fixtures' Java-era ids read as `Unparseable` (decision 0004).
+//! - [`restart_cid`]: a mint restarted while our orders rest, its high-water mark lost, issues
+//!   no live or recent id again, held above them by the venue's resync answer (decision 0004).
+//! - [`price_grid`]: every price quantized at the venue's grid boundaries is valid and
+//!   maker-safe, and each is sent as a post-only order at the price it was given.
 
 mod caps_truthful;
 mod decoded;
 mod deterministic;
+mod encode;
 pub mod frames;
 mod golden;
+mod grid;
 mod harness;
+mod ids;
 mod legacy;
 mod selfcontained;
 
@@ -81,7 +99,10 @@ use fbc_core::{
 pub use caps_truthful::caps_truthful;
 pub use decoded::{fee_sign, liquidity_reported, position_signed};
 pub use deterministic::decoder_deterministic;
+pub use encode::{APART, encode_deterministic};
 pub use golden::signing_golden;
+pub use grid::price_grid;
+pub use ids::{MINTED_BEFORE, ids_roundtrip, restart_cid};
 pub use legacy::legacy_symbols;
 pub use selfcontained::commands_selfcontained;
 
@@ -352,6 +373,46 @@ macro_rules! suite {
         fn decoder_deterministic() {
             $crate::suite::run(
                 $crate::suite::decoder_deterministic,
+                &$factory,
+                concat!(env!("CARGO_MANIFEST_DIR"), "/", $fixtures),
+                $setup,
+            );
+        }
+
+        #[test]
+        fn encode_deterministic() {
+            $crate::suite::run(
+                $crate::suite::encode_deterministic,
+                &$factory,
+                concat!(env!("CARGO_MANIFEST_DIR"), "/", $fixtures),
+                $setup,
+            );
+        }
+
+        #[test]
+        fn ids_roundtrip() {
+            $crate::suite::run(
+                $crate::suite::ids_roundtrip,
+                &$factory,
+                concat!(env!("CARGO_MANIFEST_DIR"), "/", $fixtures),
+                $setup,
+            );
+        }
+
+        #[test]
+        fn restart_cid() {
+            $crate::suite::run(
+                $crate::suite::restart_cid,
+                &$factory,
+                concat!(env!("CARGO_MANIFEST_DIR"), "/", $fixtures),
+                $setup,
+            );
+        }
+
+        #[test]
+        fn price_grid() {
+            $crate::suite::run(
+                $crate::suite::price_grid,
                 &$factory,
                 concat!(env!("CARGO_MANIFEST_DIR"), "/", $fixtures),
                 $setup,
