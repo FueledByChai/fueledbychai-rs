@@ -401,6 +401,10 @@ pub struct ExecSession<H: ExecHandler> {
     /// The epoch a run is connected in, until it ends: still set when a run starts, it was
     /// left by a run cancelled mid-epoch.
     in_epoch: Option<ConnKey>,
+    /// The epoch journaled closed as the control dropped, ahead of the inputs that came with
+    /// the stop: neither the run's end nor a drop journals it closed again, even if stamping
+    /// those inputs fails or panics (Codex P2 r4214243083 on PR #115).
+    closed_early: Option<ConnKey>,
     /// Whether [`ExecSession::run`] was called.
     ran: bool,
     handler: H,
@@ -417,7 +421,9 @@ impl<H: ExecHandler> Drop for ExecSession<H> {
         if std::thread::panicking() {
             if let Some(key) = self.in_epoch.take() {
                 self.core.rates.closed(key);
-                self.core.closed_unwinding(key);
+                if !self.was_closed_early(key) {
+                    self.core.closed_unwinding(key);
+                }
             }
         } else {
             self.end_left_epoch();
@@ -428,9 +434,6 @@ impl<H: ExecHandler> Drop for ExecSession<H> {
 /// How a connected epoch ended.
 enum End {
     Stop,
-    /// Stopped, the epoch already journaled closed, ahead of the inputs that came with the stop
-    /// (Codex P1 on PR #115).
-    StopClosed,
     Dropped,
 }
 
@@ -535,6 +538,7 @@ impl<H: ExecHandler> ExecSession<H> {
             stop,
             fault: None,
             in_epoch: None,
+            closed_early: None,
             ran: false,
             handler,
         };
@@ -628,7 +632,7 @@ impl<H: ExecHandler> ExecSession<H> {
             let end = self.connected(ws).await;
             match end {
                 // `connected` forgot the epoch's buckets.
-                Ok(End::Stop | End::StopClosed) => return Ok(()),
+                Ok(End::Stop) => return Ok(()),
                 Ok(End::Dropped) => self.retire(key)?,
                 // The run's own error, not one retiring the epoch might add.
                 Err(e) => {
@@ -644,9 +648,16 @@ impl<H: ExecHandler> ExecSession<H> {
     fn end_left_epoch(&mut self) {
         if let Some(key) = self.in_epoch.take() {
             self.core.rates.closed(key);
-            self.core.control(|| ControlEvent::Closed(key));
+            if !self.was_closed_early(key) {
+                self.core.control(|| ControlEvent::Closed(key));
+            }
             self.handler.on_epoch_end(key);
         }
+    }
+
+    /// Whether epoch `key` was journaled closed as the control dropped; forgets it either way.
+    fn was_closed_early(&mut self, key: ConnKey) -> bool {
+        self.closed_early.take() == Some(key)
     }
 
     /// Ends connected epoch `key` as a drop: its buckets forgotten, the pacing told, the next
@@ -674,13 +685,9 @@ impl<H: ExecHandler> ExecSession<H> {
         // (Codex r4189618551).
         self.in_epoch = None;
         self.core.rates.closed(key);
-        let end = match end {
-            Ok(End::StopClosed) => Ok(End::Stop),
-            end => {
-                self.core.control(|| ControlEvent::Closed(key));
-                end
-            }
-        };
+        if !self.was_closed_early(key) {
+            self.core.control(|| ControlEvent::Closed(key));
+        }
         self.handler.on_epoch_end(key);
         end
     }
@@ -688,8 +695,6 @@ impl<H: ExecHandler> ExecSession<H> {
     /// The epoch `key`, opened on `ws`.
     async fn epoch(&mut self, ws: WebSocket, key: ConnKey) -> Result<End, ExecSessionError> {
         let mut ws = Some(ws);
-        // Whether the epoch was journaled closed as the control dropped.
-        let mut closed = false;
         // A control that dropped as the connection opened stops the session before the codec
         // is told of it, so nothing is reserved or sent.
         let mut open = !self.stopped() && {
@@ -717,9 +722,12 @@ impl<H: ExecHandler> ExecSession<H> {
                 // order, but reaches no codec; so does a frame waiting then. The epoch is
                 // journaled closed first, so replay, which feeds a closed epoch nothing, feeds
                 // them to no codec either, as on a market-data session (Codex P1 on PR #115).
+                // That is noted before they are stamped, so a codec panicking as it redacts
+                // them, or an error stamping them, leaves the epoch closed once (Codex P2
+                // r4214243083 on PR #115).
                 _ if self.stopped() => {
                     self.core.control(|| ControlEvent::Closed(key));
-                    closed = true;
+                    self.closed_early = Some(key);
                     self.take_stopped(&mut ws, key, rx, wake)?;
                     false
                 }
@@ -760,7 +768,7 @@ impl<H: ExecHandler> ExecSession<H> {
         if let Some(socket) = ws.as_mut() {
             close(socket, &self.core.rates, key);
         }
-        Ok(if closed { End::StopClosed } else { End::Stop })
+        Ok(End::Stop)
     }
 
     /// Calls the codec's `on_open` for the session's stream with exactly the nonces it asks
