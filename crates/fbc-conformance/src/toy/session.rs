@@ -20,8 +20,9 @@
 //!   response body those same records one per line, `rsbegin` first and `rsend` last. The whole
 //!   body is decoded, its envelope included, before anything is pushed, all in one call. An
 //!   [`HttpFailure`], a status other than 200 or a body it cannot decode whole pushes nothing
-//!   and asks again after [`RESYNC_RETRY`], at the instant of the retry, which is the new
-//!   resync's watermark. A response to a request superseded (a new resync, a reconnect) or
+//!   and asks again after [`RESYNC_RETRY`], on a timer carrying the failed request's tag (Codex
+//!   r4219602910: a superseded resync's timer retries nothing), at the instant of the retry,
+//!   which is the new resync's watermark. A response to a request superseded (a new resync, a reconnect) or
 //!   already answered is ignored.
 //! - `auth|ok|token?|code?|msg?`: the answer to the authentication `on_open` sends, `ok` `1`
 //!   echoing the toy's token (whose span [`token_spans`] names, 0028) or `0` with the
@@ -35,12 +36,13 @@ use fbc_core::{
     AckLevel, ClientOrderId, ConnState, DecodeError, DecodeScope, Effect, Effects, EncodeCtx,
     ExecEvent, ExecSink, HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag, Inbound,
     InboundSpans, ItemRef, OpKind, OrderRef, QueryAnswer, RateCharge, RawFrame, RpcId, SpecTable,
-    StreamId, SubmitOutcome, TrafficClass, VenueCommand, VenueMeta, WallNs, WireSlice, WireUrl,
+    StreamId, SubmitOutcome, TimerTag, TrafficClass, VenueCommand, VenueMeta, WallNs, WireSlice,
+    WireUrl,
 };
 
 use super::decode::{self, Record};
 use super::url::join;
-use super::{RESYNC_RETRY, RESYNC_RETRY_TAG, RESYNC_TIMEOUT, TOY_TOKEN};
+use super::{RESYNC_RETRY, RESYNC_TIMEOUT, TOY_TOKEN};
 
 use DecodeError::Malformed;
 
@@ -324,7 +326,7 @@ impl Answers {
             unread => {
                 asked.retrying = true;
                 fx.push(Effect::Timer {
-                    tag: RESYNC_RETRY_TAG,
+                    tag: TimerTag(tag.0),
                     after: RESYNC_RETRY,
                 });
                 unread.map_or(Ok(()), |refused| refused.map(drop))
@@ -332,10 +334,17 @@ impl Answers {
         }
     }
 
-    /// The retry timer of a resync over REST fired: asked again under `base` at `ctx.wall`,
-    /// unless it was answered or superseded meanwhile.
-    pub(super) fn retry_rest(&mut self, base: &WireUrl, ctx: &EncodeCtx, fx: &mut Effects) {
-        if self.rest.as_ref().is_some_and(|r| r.retrying) {
+    /// Timer `tag` fired: the resync over REST whose request carried that tag, failed, is asked
+    /// again under `base` at `ctx.wall`, unless it was superseded meanwhile.
+    pub(super) fn retry_rest(
+        &mut self,
+        tag: TimerTag,
+        base: &WireUrl,
+        ctx: &EncodeCtx,
+        fx: &mut Effects,
+    ) {
+        let due = |r: &RestResync| r.retrying && r.tag.0 == tag.0;
+        if self.rest.as_ref().is_some_and(due) {
             self.ask_rest_resync(base, ctx, fx);
         }
     }

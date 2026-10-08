@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 
 use fbc_conformance::toy::{
     self, EXEC_STREAM, FillIds, INST_A, INST_B, OWN_NS, PING_EVERY, PING_TAG, RESYNC_RETRY,
-    RESYNC_RETRY_TAG, RESYNC_TIMEOUT, TOY_TOKEN, ToyExec, ToySigner,
+    RESYNC_TIMEOUT, TOY_TOKEN, ToyExec, ToySigner,
 };
 use fbc_core::{
     AccountKey, CidMatch, CidMint, ClientOrderId, DecodeError, Effect, Effects, EncodeCtx,
@@ -161,9 +161,10 @@ fn asked(tag: u64, wm: i64) -> Effect {
     }
 }
 
-fn retry() -> Vec<Effect> {
+/// The retry timer of the resync asked for under HTTP tag `tag`, which it carries.
+fn retry(tag: u64) -> Vec<Effect> {
     vec![Effect::Timer {
-        tag: RESYNC_RETRY_TAG,
+        tag: TimerTag(tag),
         after: RESYNC_RETRY,
     }]
 }
@@ -248,7 +249,7 @@ fn a_resync_over_rest_keeps_the_bases_spans_and_is_pushed_whole_in_one_call() {
     // Answered, the resync waits for nothing: its response again, or its retry, does nothing.
     let (result, pushed, fx) = rig.answer(HttpTag(1), &body(WM));
     assert_eq!((result, pushed, fx), (Ok(()), Vec::new(), Vec::new()));
-    assert!(rig.timer(RESYNC_RETRY_TAG, WM + 9).is_empty());
+    assert!(rig.timer(TimerTag(1), WM + 9).is_empty());
     // A record answering the frame resync is refused: none is being read in frames.
     let (mut fx, mut sink, specs) = (Effects::new(), Collect::default(), toy::specs());
     let frame = RawFrame::Text("rsend");
@@ -279,16 +280,16 @@ fn a_resync_over_rest_is_retried_on_an_http_failure_or_another_status_at_the_ret
     for (n, resp) in (1..).zip(refusals) {
         let (result, pushed, fx) = rig.http(HttpTag(tag), resp);
         assert_eq!((result, pushed), (Ok(()), Vec::new()), "{resp:?}");
-        assert_eq!(fx, retry(), "{resp:?}");
+        assert_eq!(fx, retry(tag), "{resp:?}");
         // Waiting for its retry, a late response to the failed request is ignored.
         let (result, pushed, fx) = rig.answer(HttpTag(tag), &body(WM));
         assert_eq!((result, pushed, fx), (Ok(()), Vec::new(), Vec::new()));
         // The retry asks again, as of its own instant, under a fresh tag.
-        tag += 1;
         let again = WM + n;
-        assert_eq!(rig.timer(RESYNC_RETRY_TAG, again), [asked(tag, again)]);
-        // A timer that is not the retry asks nothing more.
-        assert!(rig.timer(RESYNC_RETRY_TAG, again).is_empty());
+        assert_eq!(rig.timer(TimerTag(tag), again), [asked(tag + 1, again)]);
+        // That retry's timer again, or one that is not the retry, asks nothing more.
+        assert!(rig.timer(TimerTag(tag), again).is_empty());
+        tag += 1;
         assert!(rig.timer(TimerTag(99), again).is_empty());
     }
     // The last retry, answered, pushes the resync it asked for.
@@ -337,9 +338,9 @@ fn a_resync_over_rest_pushes_nothing_from_a_body_it_cannot_decode_whole() {
         let (result, pushed, fx) = rig.answer(HttpTag(1), &bad);
         assert_eq!(result, Err(DecodeError::Malformed(what)), "{bad}");
         assert!(pushed.is_empty(), "{bad} pushed {pushed:?}");
-        assert_eq!(fx, retry(), "{bad}");
+        assert_eq!(fx, retry(1), "{bad}");
         // Asked again, the resync can still complete.
-        assert_eq!(rig.timer(RESYNC_RETRY_TAG, WM + 1), [asked(2, WM + 1)]);
+        assert_eq!(rig.timer(TimerTag(1), WM + 1), [asked(2, WM + 1)]);
         let (result, pushed, _) = rig.answer(HttpTag(2), &body(WM + 1));
         assert_eq!((result, pushed), (Ok(()), resynced(WM + 1)), "{bad}");
     }
@@ -354,7 +355,7 @@ fn a_resync_over_rest_pushes_nothing_from_a_body_it_cannot_decode_whole() {
     let (result, pushed, fx) = rig.http(HttpTag(1), Ok(resp));
     assert_eq!(result, Err(DecodeError::Malformed("body")));
     assert!(pushed.is_empty());
-    assert_eq!(fx, retry());
+    assert_eq!(fx, retry(1));
 }
 
 #[test]
@@ -374,9 +375,20 @@ fn a_resync_over_rest_superseded_or_cut_short_by_a_reconnect_is_ignored() {
     // A failure retried, then a reconnect: the retry's timer asks nothing.
     rig.resync(WM + 2);
     let (_, _, fx) = rig.http(HttpTag(3), Err(HttpFailure::TimedOut));
-    assert_eq!(fx, retry());
+    assert_eq!(fx, retry(3));
     rig.open(EXEC_STREAM);
-    assert!(rig.timer(RESYNC_RETRY_TAG, WM + 3).is_empty());
+    assert!(rig.timer(TimerTag(3), WM + 3).is_empty());
+    // A failed resync superseded by another that failed too (Codex r4219602910): the first's
+    // timer asks nothing, so the second is retried only on its own, RESYNC_RETRY after it
+    // failed.
+    rig.resync(WM + 4);
+    let (_, _, fx) = rig.http(HttpTag(4), Err(HttpFailure::Lost));
+    assert_eq!(fx, retry(4));
+    rig.resync(WM + 5);
+    let (_, _, fx) = rig.http(HttpTag(5), Err(HttpFailure::NotSent));
+    assert_eq!(fx, retry(5));
+    assert!(rig.timer(TimerTag(4), WM + 6).is_empty());
+    assert_eq!(rig.timer(TimerTag(5), WM + 7), [asked(6, WM + 7)]);
     // A codec resyncing in frames asks for no HTTP, and refuses a response.
     let mut frames = ToyExec::new(Box::new(ToySigner));
     let (mut fx, mut sink, specs) = (Effects::new(), Collect::default(), toy::specs());
@@ -397,7 +409,7 @@ fn a_resync_over_rest_superseded_or_cut_short_by_a_reconnect_is_ignored() {
         Err(DecodeError::Malformed("the toy asks for no HTTP"))
     );
     assert!(fx.is_empty() && sink.0.is_empty());
-    frames.on_timer(RESYNC_RETRY_TAG, &ctx_at(WM), &mut fx);
+    frames.on_timer(TimerTag(1), &ctx_at(WM), &mut fx);
     assert!(fx.is_empty());
 }
 
