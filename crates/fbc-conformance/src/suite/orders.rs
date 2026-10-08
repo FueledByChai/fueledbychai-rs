@@ -24,8 +24,8 @@
 use std::time::Duration;
 
 use fbc_core::{
-    AckLevel, AmendAck, AmendCaps, CidMatch, ClientOrderId, ExecEvent, ItemRef, Lots, OpKind,
-    OrderUpdate, RpcId, SubmitOutcome, Ticks, VenueOrderId, VenueOrderState,
+    AckLevel, AckModel, AmendAck, AmendCaps, CidMatch, ClientOrderId, ExecEvent, ItemRef, Lots,
+    OpKind, OrderUpdate, RpcId, Side, SubmitOutcome, Ticks, VenueOrderId, VenueOrderState,
 };
 
 use super::harness::Harness;
@@ -60,6 +60,7 @@ pub fn amend_ack(subject: &Subject<'static>) -> Result<Verdict, Failure> {
         });
     };
     let ack = format!("AmendCaps.ack is {:?}", amend.ack);
+    let model = live.order.ack;
     let breaches = live.run(vec![vec![Accept], vec![Accept]], async |c| {
         c.ready().await?;
         let (cid, auth) = c.oms.place(c.h)?;
@@ -89,14 +90,14 @@ pub fn amend_ack(subject: &Subject<'static>) -> Result<Verdict, Failure> {
         let update = |c: &Ctx<'_>| amended_update(&c.events()[before..], names);
         c.settle(|c| !c.outcomes(rpc).is_empty() && update(c).is_some())
             .await;
-        Ok(judge_amend(
-            c,
-            rpc,
-            update(c),
-            item.vid.as_ref(),
-            &amend,
-            &ack,
-        ))
+        let asked = Asked {
+            cid,
+            placed: item.vid.clone(),
+            px,
+            qty,
+            model,
+        };
+        Ok(judge_amend(c, rpc, update(c), &asked, &amend, &ack))
     })?;
     verdict(AMEND_ACK, breaches, || {
         let mut probed = vec![format!(
@@ -149,21 +150,52 @@ fn amended_update(
         .find(|u| amended(u) && names(u))
 }
 
+/// The amend `amend_ack` sent: of order `cid`, placed under venue id `placed`, to `px` and
+/// `qty`, on a venue acknowledging as `model`.
+struct Asked {
+    cid: ClientOrderId,
+    placed: Option<VenueOrderId>,
+    px: Ticks,
+    qty: Lots,
+    model: AckModel,
+}
+
+/// Whether an item's outcomes are one acceptance as `model` has it (Codex r4222568826): one
+/// final acceptance, or, on a two-phase venue, a provisional one, then at most one final.
+fn accepted_once(outcomes: &[&SubmitOutcome], model: AckModel) -> bool {
+    let level = |o: &&SubmitOutcome| match o {
+        SubmitOutcome::Accepted { ack } => Some(*ack),
+        _ => None,
+    };
+    let levels: Option<Vec<AckLevel>> = outcomes.iter().map(level).collect();
+    let two_phase = matches!(model, AckModel::TwoPhase { .. });
+    match levels.as_deref() {
+        Some([AckLevel::Final]) => true,
+        Some([AckLevel::Provisional] | [AckLevel::Provisional, AckLevel::Final]) => two_phase,
+        _ => false,
+    }
+}
+
 /// What broke `amend_ack`: the amend's outcome, the update, its new venue id.
 fn judge_amend(
     c: &Ctx<'_>,
     rpc: RpcId,
     update: Option<OrderUpdate>,
-    placed: Option<&VenueOrderId>,
+    asked: &Asked,
     amend: &AmendCaps,
     ack: &str,
 ) -> Vec<Breach> {
     let mut breaches = Vec::new();
     let outcomes = c.outcomes(rpc);
-    let accepted =
-        |(_, o): &(Option<ItemRef>, SubmitOutcome)| matches!(o, SubmitOutcome::Accepted { .. });
-    if outcomes.is_empty() || !outcomes.iter().all(accepted) {
-        let what = format!("the amend the stub accepted was reported {outcomes:?}");
+    // The amend's one item, once, naming the amended order where it names one (Codex
+    // r4222568847); an outcome for the whole request is that item's.
+    let own = |it: &Option<ItemRef>| {
+        it.as_ref()
+            .is_none_or(|it| it.idx == 0 && it.cid.is_none_or(|cid| cid == asked.cid))
+    };
+    let acks: Vec<&SubmitOutcome> = outcomes.iter().map(|(_, o)| o).collect();
+    if !outcomes.iter().all(|(it, _)| own(it)) || !accepted_once(&acks, asked.model) {
+        let what = format!("the amend the stub accepted was reported {outcomes:?}, not once");
         breaches.push(Breach::new("ExecCodec::on_frame", what));
     }
     let Some(update) = update else {
@@ -180,10 +212,24 @@ fn judge_amend(
         breaches.push(Breach::new(ack, what));
         return breaches;
     };
+    // The update states the amended order where it states it (Codex r4222568860).
+    let agrees = update.inst == c.h.inst
+        && update.side == Side::Buy
+        && update.px.is_none_or(|px| px == asked.px)
+        && update.qty.is_none_or(|qty| qty == asked.qty);
+    if !agrees {
+        let (px, qty) = (asked.px, asked.qty);
+        let what = format!(
+            "the update {update:?} contradicts the amend of a buy on {:?} to {px:?} and {qty:?}",
+            c.h.inst
+        );
+        breaches.push(Breach::new("OrderUpdate", what));
+    }
     let new_vid = match &update.state {
         VenueOrderState::Amended { new_vid } => new_vid.as_ref(),
         _ => None,
     };
+    let placed = asked.placed.as_ref();
     // A new venue id is another than the one the order was placed under (Codex r4222138032).
     if !amend.keeps_venue_id && (new_vid.is_none() || new_vid == placed) {
         let what = format!(
@@ -216,6 +262,7 @@ pub fn mixed_batch(subject: &Subject<'static>) -> Result<Verdict, Failure> {
             why,
         });
     }
+    let model = live.order.ack;
     let breaches = live.run(vec![vec![Accept, Reject, Silent]], async |c| {
         c.ready().await?;
         let (cids, auth) = c.oms.batch(c.h, usize::from(ITEMS))?;
@@ -236,7 +283,7 @@ pub fn mixed_batch(subject: &Subject<'static>) -> Result<Verdict, Failure> {
         if moved.is_some() {
             c.advance(WAIT).await;
         }
-        Ok(judge_batch(c, rpc, &cids, moved))
+        Ok(judge_batch(c, rpc, &cids, model, moved))
     })?;
     verdict(MIXED_BATCH, breaches, || {
         vec![
@@ -253,6 +300,7 @@ fn judge_batch(
     c: &Ctx<'_>,
     rpc: RpcId,
     cids: &[ClientOrderId],
+    model: AckModel,
     moved: Option<Duration>,
 ) -> Vec<Breach> {
     let mut breaches = Vec::new();
@@ -279,10 +327,7 @@ fn judge_batch(
     // Each answered item once (Codex r4222138014): the acceptance final once, after at most one
     // provisional acceptance (a two-phase venue's), and the rejection once.
     let accepted = of(0);
-    let ack = |level| move |o: &&&SubmitOutcome| **o == &SubmitOutcome::Accepted { ack: level };
-    let finals = accepted.iter().filter(ack(AckLevel::Final)).count();
-    let provisional = accepted.iter().filter(ack(AckLevel::Provisional)).count();
-    if finals != 1 || provisional > 1 || finals + provisional != accepted.len() {
+    if !accepted_once(&accepted, model) {
         let what = format!("item 0, which the stub accepted, was reported {accepted:?}, not once");
         breaches.push(Breach::new("OrderCaps.batch_place", what));
     }
