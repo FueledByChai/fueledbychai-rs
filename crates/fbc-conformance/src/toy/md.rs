@@ -82,8 +82,9 @@ struct Levels {
     levels: Vec<(BookSide, Ticks, Lots)>,
 }
 
-/// The conformance toy's market-data codec, one per connection epoch.
-#[derive(Clone, Debug)]
+/// The conformance toy's market-data codec, one per connection epoch. Its `Debug` counts the
+/// credentials it holds and shows none (Codex r4220116591).
+#[derive(Clone)]
 pub struct ToyMd {
     stream: StreamId,
     /// The base URL anchors are asked under, with its credential spans; without one an
@@ -97,6 +98,19 @@ pub struct ToyMd {
     /// The credentials of the URLs it was given, named wherever a frame or response echoes
     /// them (Codex r4219753519, r4219929319).
     secrets: Vec<String>,
+}
+
+impl core::fmt::Debug for ToyMd {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ToyMd")
+            .field("stream", &self.stream)
+            .field("anchor", &self.anchor)
+            .field("chans", &self.chans)
+            .field("next_tag", &self.next_tag)
+            .field("snapshots", &self.snapshots)
+            .field("secrets", &self.secrets.len())
+            .finish()
+    }
 }
 
 impl ToyMd {

@@ -10,8 +10,8 @@ use std::ops::Range;
 
 use fbc_conformance::toy::{
     self, ANCHOR_URL_KEY, ANCHOR_URL_REDACT_KEY, ANCHORED_BOOK, BOOK, EXEC_STREAM, EXEC_URL_KEY,
-    EXEC_URL_REDACT_KEY, INST_A, INST_B, MD_STREAM, MD_URL_KEY, MD_URL_REDACT_KEY, REST_URL_KEY,
-    REST_URL_REDACT_KEY, ToyFactory,
+    EXEC_URL_REDACT_KEY, INST_A, INST_B, MD_STREAM, MD_URL_KEY, MD_URL_REDACT_KEY,
+    MIN_CREDENTIAL_LEN, REST_URL_KEY, REST_URL_REDACT_KEY, ToyFactory, ToyMd,
 };
 use fbc_core::{
     ConfigError, ConfigScope, Effect, Effects, EncodeCtx, EndpointPlan, ExecEndpoint, Feed,
@@ -83,6 +83,9 @@ fn http_urls(fx: Vec<Effect>) -> Vec<WireUrl> {
     urls.collect()
 }
 
+/// A URL whose path, from byte 18, is 46 characters long, with no credential of its own.
+const LONG: &str = "wss://toy.invalid/0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJ";
+
 fn hidden(shown: String) {
     assert!(!shown.contains(SECRET), "{shown}");
 }
@@ -150,11 +153,13 @@ fn configured_urls_keep_the_spans_their_configuration_marks() {
         ToyFactory.plan_exec(&cfg).unwrap()[0].url,
         WireUrl::plain("ws://127.0.0.1:9")
     );
-    // Two spans, in order, each in the path.
-    let text = "wss://toy.invalid/a/SECRET1/b/SECRET2";
+    // Two spans, in order, each in the path, each the shortest a credential may be.
+    let text = "wss://toy.invalid/a/SYNTHETIC-KEY-01/b/SYNTHETIC-KEY-02";
     cfg.insert(EXEC_URL_KEY, text);
-    cfg.insert(EXEC_URL_REDACT_KEY, "20..27, 30..37");
-    let want = WireUrl::redacted(text.into(), vec![20..27, 30..37]).unwrap();
+    cfg.insert(EXEC_URL_REDACT_KEY, "20..36, 39..55");
+    assert_eq!(&text[20..36], "SYNTHETIC-KEY-01");
+    assert_eq!(36 - 20, MIN_CREDENTIAL_LEN);
+    let want = WireUrl::redacted(text.into(), vec![20..36, 39..55]).unwrap();
     assert_eq!(ToyFactory.plan_exec(&cfg).unwrap()[0].url, want);
 }
 
@@ -212,44 +217,22 @@ fn a_url_with_user_information_a_query_or_spans_it_cannot_keep_is_refused() {
         ("wss://toy.invalid/a<b>", None, EXEC_URL_KEY),
         ("wss://toy.invalid/a\\b", None, EXEC_URL_KEY),
         // Spans the toy cannot keep: not ranges, outside the path, past the end, out of order,
-        // overlapping, empty.
-        ("wss://toy.invalid/abcdef", Some("x"), EXEC_URL_REDACT_KEY),
-        ("wss://toy.invalid/abcdef", Some("18"), EXEC_URL_REDACT_KEY),
-        (
-            "wss://toy.invalid/abcdef",
-            Some("18..x"),
-            EXEC_URL_REDACT_KEY,
-        ),
-        (
-            "wss://toy.invalid/abcdef",
-            Some("18..20,"),
-            EXEC_URL_REDACT_KEY,
-        ),
-        (
-            "wss://toy.invalid/abcdef",
-            Some("6..17"),
-            EXEC_URL_REDACT_KEY,
-        ),
-        (
-            "wss://toy.invalid/abcdef",
-            Some("18..99"),
-            EXEC_URL_REDACT_KEY,
-        ),
-        (
-            "wss://toy.invalid/abcdef",
-            Some("21..23,18..20"),
-            EXEC_URL_REDACT_KEY,
-        ),
-        (
-            "wss://toy.invalid/abcdef",
-            Some("18..21,20..23"),
-            EXEC_URL_REDACT_KEY,
-        ),
-        (
-            "wss://toy.invalid/abcdef",
-            Some("20..20"),
-            EXEC_URL_REDACT_KEY,
-        ),
+        // overlapping, empty. The path is long enough that each span but the empty one is
+        // long enough to name (Codex r4220116602).
+        (LONG, Some("x"), EXEC_URL_REDACT_KEY),
+        (LONG, Some("18"), EXEC_URL_REDACT_KEY),
+        (LONG, Some("18..x"), EXEC_URL_REDACT_KEY),
+        (LONG, Some("18..38,"), EXEC_URL_REDACT_KEY),
+        (LONG, Some("6..30"), EXEC_URL_REDACT_KEY),
+        (LONG, Some("18..99"), EXEC_URL_REDACT_KEY),
+        (LONG, Some("40..60,18..38"), EXEC_URL_REDACT_KEY),
+        (LONG, Some("18..38,30..50"), EXEC_URL_REDACT_KEY),
+        (LONG, Some("20..20"), EXEC_URL_REDACT_KEY),
+        // A span shorter than a credential may be (Codex r4220116602): a short value would be
+        // named wherever a frame or response holds it, prices and sequence numbers included.
+        (LONG, Some("18..19"), EXEC_URL_REDACT_KEY),
+        (LONG, Some("18..33"), EXEC_URL_REDACT_KEY),
+        (LONG, Some("18..38,40..55"), EXEC_URL_REDACT_KEY),
         // A character outside ASCII is refused in the URL, before any span is read.
         ("wss://toy.invalid/\u{e9}tat", Some("18..19"), EXEC_URL_KEY),
     ] {
@@ -259,6 +242,23 @@ fn a_url_with_user_information_a_query_or_spans_it_cannot_keep_is_refused() {
             "{value}"
         );
     }
+    // The spans those refusals took, each on its own ground, are kept where they are long
+    // enough: the shortest a credential may be is kept.
+    let mut ok = cfg();
+    for spans in ["18..34", "18..38,40..60", ""] {
+        ok.insert(EXEC_URL_KEY, LONG);
+        ok.insert(EXEC_URL_REDACT_KEY, spans);
+        assert!(ToyFactory.plan_exec(&ok).is_ok(), "{spans}");
+    }
+    let short = invalid(EXEC_URL_KEY, LONG, Some("18..33"));
+    assert_eq!(
+        ToyFactory.plan_exec(&short),
+        Err(VenueError::Config(ConfigError::Invalid {
+            key: EXEC_URL_REDACT_KEY,
+            reason: "a span shorter than 16 bytes, which the toy would name wherever a frame or \
+                     response holds it, unrelated bytes included",
+        }))
+    );
     // Nothing configured is missing.
     assert_eq!(
         ToyFactory.plan_exec(&VenueConfig::new()),
@@ -503,4 +503,28 @@ fn a_configured_socket_credential_echoed_in_a_frame_is_named_for_redaction() {
         panic!("built");
     };
     assert_eq!(key, EXEC_URL_KEY);
+}
+
+#[test]
+fn a_market_data_codec_holding_a_configured_credential_shows_none_in_its_debug() {
+    // Codex r4220116591: the codec keeps the plaintext of its URLs' credentials to name them
+    // when echoed; its Debug, which a panic or a log may print, shows none of them.
+    let cfg = cfg();
+    let plans = ToyFactory
+        .plan_md(&cfg, &toy::specs(), &BTreeSet::from([sub(INST_A, BOOK)]))
+        .unwrap();
+    let MdTransport::Socket { url: socket } = &plans[0].transport else {
+        panic!("{plans:?}");
+    };
+    let md =
+        ToyMd::with_anchor_url(MD_STREAM, url("https://toy.invalid/rest/", "")).socket_url(socket);
+    let shown = format!("{md:?}");
+    hidden(shown.clone());
+    hidden(format!("{md:#?}"));
+    // The rest of it is still shown, the credentials only counted.
+    assert!(shown.contains("ToyMd"), "{shown}");
+    assert!(shown.contains("secrets: 2"), "{shown}");
+    // A codec given only the socket URL hides its credential too.
+    let socket_only = ToyMd::new(MD_STREAM).socket_url(socket);
+    hidden(format!("{socket_only:?}"));
 }

@@ -98,6 +98,11 @@ pub const ANCHOR_URL_KEY: &str = "toy.md.anchor_url";
 /// The configuration key of the credential spans in [`ANCHOR_URL_KEY`]'s URL (`url.rs`).
 pub const ANCHOR_URL_REDACT_KEY: &str = "toy.md.anchor_url.redact";
 
+/// The fewest bytes a credential span in a configured URL may hold (`url.rs`; Codex
+/// r4220116602): each codec names a credential wherever a frame or response holds it, and a
+/// shorter value would match unrelated bytes, such as prices, sequence numbers and timestamps.
+pub const MIN_CREDENTIAL_LEN: usize = 16;
+
 /// How often a pinging order-entry codec sends its ping ([`ToyExec::pinging`]).
 pub const PING_EVERY: Duration = Duration::from_secs(15);
 /// The timer a pinging order-entry codec sends its ping on. A resync over REST's retry timer
