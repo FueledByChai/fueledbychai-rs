@@ -52,9 +52,9 @@ pub(crate) struct Harness<'s> {
     pub other_inst: Option<InstrumentId>,
     /// The stream fixture frames are handed to the codec on.
     pub exec_stream: StreamId,
-    qty: Lots,
+    pub(crate) qty: Lots,
     /// A valid limit price on the instrument's grid (Codex r4189256906).
-    px: Ticks,
+    pub(crate) px: Ticks,
 }
 
 impl<'s> Harness<'s> {

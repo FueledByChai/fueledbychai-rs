@@ -308,7 +308,8 @@ rather than guess.
     there, 0051;
     still planned: amends, batches, queries and injected
     orders, FBC-nv2), `crates/fbc-conformance` (the adapter conformance kit,
-    0025; it depends on `fbc-runtime` and `fbc-core`, never on a venue crate: so
+    0025; it depends on `fbc-runtime`, `fbc-oms`, `fbc-journal` and `fbc-core`, never on a
+    venue crate: so
     far a public stub venue server on 127.0.0.1 ephemeral ports, a WebSocket endpoint that plays
     a fault script of typed steps and records every connection and data frame, and an HTTP/1.1
     endpoint with fixed responses by path; the reconnect-storm script and a check of connection
@@ -339,8 +340,11 @@ rather than guess.
     `<fixtures>/signing_golden/<name>.golden`, a directory marked SYNTHETIC with no golden no
     command names) and `legacy_symbols` (every ticker in
     `<fixtures>/legacy_symbols/tickers.txt` parses through `parse_fbc_common_symbol`; the toy
-    reads `X/USDT` by a rule of its own); still planned: the suite's other checks and the rest
-    of the conformance toy).
+    reads `X/USDT` by a rule of its own); and the order-entry checks `amend_ack`, `mixed_batch`
+    and `unknown_on_timeout`, which run `ExecSession` against the stub as the setup's
+    `OrderEntryStub` says, on a paused clock the check moves, fbc-oms authorizing every order
+    command (0083); still planned: the suite's other checks and the rest of the conformance
+    toy).
   - `crates/fbc-examples`: sample programs the owner runs by hand, never CI (FBC-u4so). Its
     library target is empty and every dependency is a dev-dependency, so it is outside
     `crates/venues/` yet wires concrete venues without a normal dependency on one; each sample is

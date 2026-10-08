@@ -442,6 +442,8 @@ name = "fbc-conformance"
 version = "0.0.1"
 dependencies = [
  "fbc-core",
+ "fbc-journal",
+ "fbc-oms",
  "fbc-runtime",
  "futures-util",
  "rust_decimal",

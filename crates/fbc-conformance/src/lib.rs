@@ -43,7 +43,12 @@
 //!   nondeterministically fail `fee_sign` and `decoder_deterministic` (`tests/suite_frames.rs`),
 //!   a toy whose encode reads the real time fails `encode_deterministic`
 //!   (`tests/suite_ids_grid.rs`), and a toy variant that ignores a sequence break fails
-//!   `continuity` (`tests/suite_md.rs`).
+//!   `continuity` (`tests/suite_md.rs`). And the order-entry checks `amend_ack`, `mixed_batch`
+//!   and `unknown_on_timeout` (FBC-3il, decision 0083), which run fbc-runtime's order-entry
+//!   session against the stub, answering as the setup's [`suite::OrderEntryStub`] states, on a
+//!   paused clock the check moves, every order command authorized by fbc-oms; a toy variant
+//!   that reports every item of a timed-out batch `Accepted` fails `mixed_batch`
+//!   (`tests/suite_orders.rs`).
 //!
 //! Not here yet: the suite's other checks, and the rest of the conformance toy venue.
 

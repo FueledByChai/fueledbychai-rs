@@ -1,10 +1,12 @@
-//! FBC-8ew's, FBC-onw's, FBC-whw's, FBC-2re's and FBC-vmw's done lines, their first halves: the
-//! named suite runs on the conformance toy venue through the suite macro with its fixture
-//! directory (BT-502, design §6), `caps_truthful`, `commands_selfcontained`, `signing_golden`,
-//! `legacy_symbols`, `fee_sign`, `liquidity_reported`, `position_signed`,
+//! FBC-8ew's, FBC-onw's, FBC-whw's, FBC-2re's, FBC-vmw's and FBC-3il's done lines, their first
+//! halves: the named suite runs on the conformance toy venue through the suite macro with its
+//! fixture directory (BT-502, design §6), `caps_truthful`, `commands_selfcontained`,
+//! `signing_golden`, `legacy_symbols`, `fee_sign`, `liquidity_reported`, `position_signed`,
 //! `decoder_deterministic`, `encode_deterministic`, `ids_roundtrip`, `restart_cid`,
-//! `price_grid`, `continuity`, `subscriptions_idempotent`, `no_exch_ts_synthesized` and
-//! `book_channels` each a test, and all pass; `continuity`'s longer-block sub-case reports
+//! `price_grid`, `continuity`, `subscriptions_idempotent`, `no_exch_ts_synthesized`,
+//! `book_channels`, `amend_ack`, `mixed_batch` and `unknown_on_timeout` each a test, and all
+//! pass; the last three run fbc-runtime's order-entry session against the stub server, which
+//! answers the toy's requests with replies computed from them (`toy_setup::order_entry`); `continuity`'s longer-block sub-case reports
 //! itself skipped by name for the toy's text protocol. The checks are run directly too, to show what they probed: a
 //! pass that probed nothing would prove nothing.
 
@@ -18,6 +20,15 @@ fbc_conformance::suite! {
     factory: ToyFactory,
     fixtures: "../../fixtures/conformance-toy",
     setup: assumed,
+}
+
+/// What `check`, an order-entry check, probed on the toy, which must pass.
+fn probed_live(check: fn(&Subject<'static>) -> Result<Verdict, suite::Failure>) -> Vec<String> {
+    let subject = Subject::new(&ToyFactory, FIXTURES, assumed).unwrap();
+    match check(&subject) {
+        Ok(Verdict::Passed { probed, .. }) => probed,
+        other => panic!("{other:?}"),
+    }
 }
 
 /// What `check` probed on the toy, which must pass.
@@ -270,5 +281,36 @@ fn book_channels_holds_the_toys_book_to_public_liquidity() {
     assert_eq!(
         probed(suite::book_channels),
         [ANCHORED, "book_channels/book.frames: shows [Public]"]
+    );
+}
+
+#[test]
+fn amend_ack_sees_the_toys_replaced_order_event_with_its_new_venue_id() {
+    assert_eq!(
+        probed_live(suite::amend_ack),
+        [
+            "AmendCaps.ack is ReplacedEvent: an accepted amend surfaced as OrderUpdate Amended",
+            "AmendCaps.keeps_venue_id is false: the update named the new venue id",
+        ]
+    );
+}
+
+#[test]
+fn mixed_batch_gives_each_item_of_the_toys_batch_its_outcome() {
+    assert_eq!(
+        probed_live(suite::mixed_batch),
+        [
+            "Batch: an item accepted is Accepted",
+            "Batch: an item rejected is Rejected",
+            "Batch: an item unanswered is Unknown at the deadline, once",
+        ]
+    );
+}
+
+#[test]
+fn unknown_on_timeout_sees_the_toys_unanswered_placement_unknown_once() {
+    assert_eq!(
+        probed_live(suite::unknown_on_timeout),
+        ["a request unanswered is Unknown at its deadline, once, and never written again"]
     );
 }

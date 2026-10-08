@@ -52,4 +52,7 @@ A check that reads recorded data reads it from a subdirectory named after the ch
 
 `caps_truthful`, `commands_selfcontained`, `encode_deterministic`, `price_grid` and
 `subscriptions_idempotent` read no file: they need only the toy's factory and the setup the
-suite's test gives (the toy's spec table, an empty configuration and no credentials).
+suite's test gives (the toy's spec table, an empty configuration and no credentials). Nor do
+`amend_ack`, `mixed_batch` and `unknown_on_timeout`: they run the order-entry session against
+the stub server, which answers as the setup's order-entry stub states
+(`crates/fbc-conformance/tests/toy_setup/mod.rs`, decision 0083).
