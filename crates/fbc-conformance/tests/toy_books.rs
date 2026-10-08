@@ -397,6 +397,33 @@ fn a_book_id_outside_the_declared_channels_is_refused_with_nothing_sent() {
     assert_eq!(key, MD_URL_KEY);
 }
 
+#[test]
+fn an_unknown_instrument_is_named_before_any_feed_in_either_list() {
+    // Codex r4216704345: the codec checks every instrument, added or removed, before any feed,
+    // so a missing one is named even behind a known instrument's undeclared feed.
+    let trades = Subscription {
+        inst: INST_A,
+        feed: Feed::Trades,
+    };
+    let unknown = sub(InstrumentId::new(99), BOOK);
+    let mut rig = Rig::new();
+    let calls: [(&[Subscription], &[Subscription]); 4] = [
+        (&[trades, unknown], &[]),
+        (&[trades], &[unknown]),
+        (&[], &[trades, unknown]),
+        (&[sub(INST_A, BookId(2))], &[unknown]),
+    ];
+    for (add, remove) in calls {
+        let refused = rig.subscribe(add, remove);
+        assert_eq!(
+            refused,
+            Err(VenueError::UnknownInstrument(unknown.inst)),
+            "{add:?} {remove:?}"
+        );
+    }
+    assert!(rig.fx.is_empty());
+}
+
 // ---------------------------------------------------------------------------------------------
 // The REST anchor.
 // ---------------------------------------------------------------------------------------------
@@ -668,6 +695,165 @@ fn an_anchor_behind_what_the_channel_already_applied_is_asked_again() {
             level(a.0, a.1, BID, 100, 5),
         ]
     );
+    assert!(rig.fx.is_empty());
+}
+
+#[test]
+fn the_held_high_water_mark_outlives_the_held_bound() {
+    // Codex r4216289348: a repeated delta overflowing the bound is held, and the anchor asked
+    // again must still reach every delta already seen, the highest held before it included.
+    let mut rig = Rig::new();
+    rig.subscribe(&[sub(INST_B, ANCHORED_BOOK)], &[]).unwrap();
+    rig.fx.take();
+    let high = 20 + MAX_HELD as u64 - 1;
+    for seq in 20..=high {
+        rig.frame(&format!(
+            "delta|sym=TOYB-PERP|book=1|seq={seq}|bid=50:1|ask="
+        ))
+        .unwrap();
+    }
+    assert!(rig.fx.is_empty());
+    rig.frame("delta|sym=TOYB-PERP|book=1|seq=25|bid=50:2|ask=")
+        .unwrap();
+    assert_eq!(rig.fx.take(), [anchor_get(2, INST_B, "TOYB-PERP")]);
+    // An anchor at 24 chains onto the held 25 but is behind 26..=high: asked again.
+    rig.http(2, Ok((200, "anchor|sym=TOYB-PERP|seq=24|bid=50:9|ask=")))
+        .unwrap();
+    assert!(rig.pushed().is_empty());
+    assert_eq!(rig.fx.take(), [anchor_get(3, INST_B, "TOYB-PERP")]);
+    // One at the highest delta seen is live, and the next follows it.
+    let fresh = format!("anchor|sym=TOYB-PERP|seq={high}|bid=50:9|ask=");
+    rig.http(3, Ok((200, &fresh))).unwrap();
+    rig.frame(&format!(
+        "delta|sym=TOYB-PERP|book=1|seq={}|bid=51:1|ask=",
+        high + 1
+    ))
+    .unwrap();
+    let b = (INST_B, ANCHORED_BOOK);
+    assert_eq!(
+        rig.pushed(),
+        [
+            MdEvent::BookSnapshotBegin {
+                inst: b.0,
+                book: b.1,
+                epoch: 0
+            },
+            level(b.0, b.1, BID, 50, 9),
+            MdEvent::BookSnapshotEnd {
+                inst: b.0,
+                book: b.1
+            },
+            level(b.0, b.1, BID, 51, 1),
+        ]
+    );
+    assert!(rig.fx.is_empty());
+}
+
+#[test]
+fn a_book_snapshot_behind_what_the_channel_already_applied_is_dropped() {
+    // Codex r4216289341: a snapshot frame may not move BOOK back behind the sequence it had
+    // reached, after a gap or while live.
+    let mut rig = Rig::new();
+    rig.subscribe(&[sub(INST_A, BOOK)], &[]).unwrap();
+    rig.fx.take();
+    rig.frame("snap|sym=TOYA-PERP|book=0|seq=10|bid=100:1|ask=")
+        .unwrap();
+    assert_eq!(rig.pushed().len(), 3);
+    rig.frame("delta|sym=TOYA-PERP|book=0|seq=12|bid=100:2|ask=")
+        .unwrap();
+    assert_eq!(rig.pushed(), [gap(INST_A, BOOK)]);
+    // A snapshot at 7 is behind 10: dropped, and the channel still waits.
+    rig.frame("snap|sym=TOYA-PERP|book=0|seq=7|bid=100:3|ask=")
+        .unwrap();
+    rig.frame("delta|sym=TOYA-PERP|book=0|seq=8|bid=100:4|ask=")
+        .unwrap();
+    assert!(rig.pushed().is_empty());
+    // The floor outlives a dropped snapshot; one at 10 is live again, and 11 follows it.
+    rig.frame("snap|sym=TOYA-PERP|book=0|seq=9|bid=100:3|ask=")
+        .unwrap();
+    assert!(rig.pushed().is_empty());
+    rig.frame("snap|sym=TOYA-PERP|book=0|seq=10|bid=100:5|ask=")
+        .unwrap();
+    rig.frame("delta|sym=TOYA-PERP|book=0|seq=11|bid=100:6|ask=")
+        .unwrap();
+    let a = (INST_A, BOOK);
+    assert_eq!(
+        rig.pushed(),
+        [
+            MdEvent::BookSnapshotBegin {
+                inst: a.0,
+                book: a.1,
+                epoch: 1
+            },
+            level(a.0, a.1, BID, 100, 5),
+            MdEvent::BookSnapshotEnd {
+                inst: a.0,
+                book: a.1
+            },
+            level(a.0, a.1, BID, 100, 6),
+        ]
+    );
+    // Live at 11, a snapshot at 10 is behind it too: dropped, and 12 still follows 11.
+    rig.frame("snap|sym=TOYA-PERP|book=0|seq=10|bid=100:7|ask=")
+        .unwrap();
+    rig.frame("delta|sym=TOYA-PERP|book=0|seq=12|bid=100:8|ask=")
+        .unwrap();
+    assert_eq!(rig.pushed(), [level(INST_A, BOOK, BID, 100, 8)]);
+    assert!(rig.fx.is_empty());
+}
+
+#[test]
+fn a_record_deeper_than_the_declared_depth_is_refused_whole() {
+    // Codex r4216289357: no snapshot, anchor or delta carries more levels per side than the
+    // channel's declared max_depth.
+    let depth = usize::from(toy::caps().md.books[usize::from(BOOK.0)].max_depth);
+    assert_eq!(
+        depth,
+        usize::from(toy::caps().md.books[usize::from(ANCHORED_BOOK.0)].max_depth)
+    );
+    let side = |n: usize| {
+        (0..n)
+            .map(|i| format!("{}:1", 100 + i))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let mut rig = Rig::new();
+    rig.subscribe(&[sub(INST_A, BOOK), sub(INST_A, ANCHORED_BOOK)], &[])
+        .unwrap();
+    rig.fx.take();
+    let deep = format!(
+        "snap|sym=TOYA-PERP|book=0|seq=1|bid={}|ask=",
+        side(depth + 1)
+    );
+    assert_eq!(rig.frame(&deep), Err(Malformed("depth")));
+    let deep = format!(
+        "snap|sym=TOYA-PERP|book=0|seq=1|bid=|ask={}",
+        side(depth + 1)
+    );
+    assert_eq!(rig.frame(&deep), Err(Malformed("depth")));
+    assert!(rig.pushed().is_empty());
+    // An anchor deeper than declared is asked for again after the retry.
+    let deep = format!("anchor|sym=TOYA-PERP|seq=1|bid=|ask={}", side(depth + 1));
+    assert_eq!(rig.http(1, Ok((200, &deep))), Err(Malformed("depth")));
+    assert!(rig.pushed().is_empty());
+    assert_eq!(rig.fx.take(), [retry(1)]);
+    // At the declared depth on both sides, a snapshot is pushed whole; a delta past it is not.
+    let full = format!(
+        "snap|sym=TOYA-PERP|book=0|seq=1|bid={}|ask={}",
+        side(depth),
+        side(depth)
+    );
+    rig.frame(&full).unwrap();
+    assert_eq!(rig.pushed().len(), 2 * depth + 2);
+    let deep = format!(
+        "delta|sym=TOYA-PERP|book=0|seq=2|bid={}|ask=",
+        side(depth + 1)
+    );
+    assert_eq!(rig.frame(&deep), Err(Malformed("depth")));
+    assert!(rig.pushed().is_empty());
+    rig.frame("delta|sym=TOYA-PERP|book=0|seq=2|bid=100:2|ask=")
+        .unwrap();
+    assert_eq!(rig.pushed(), [level(INST_A, BOOK, BID, 100, 2)]);
     assert!(rig.fx.is_empty());
 }
 
