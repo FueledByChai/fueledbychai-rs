@@ -9,10 +9,11 @@
 //! best bid for a buy (above the best ask for a sell) read from `GET /orderbook` just before,
 //! floored (ceiled) onto the tick, and refused unless it lies strictly behind the touch.
 //!
-//! **Its size.** The resting cap, $11 per side, at the order's price, floored onto the size step:
-//! the largest order the cap admits. Refused when that is no lot, or its notional is below the
-//! market's `--min-notional` (the encoder does not check a minimum, FBC-98fc). The inventory
-//! cap is $50 at the same price.
+//! **Its size.** The resting cap per side (`--resting-cap-usd`, required, no default) at the
+//! order's price, floored onto the size step: the largest order the cap admits. Refused when
+//! that is no lot, or its notional is below the market's `--min-notional` (the encoder does not
+//! check a minimum, FBC-98fc). The inventory cap (`--inventory-cap-usd`, required) is converted
+//! at the same price.
 //!
 //! **What is not built here.** No order query on the Unknown ladder yet (FBC-m8vm): an order
 //! whose acknowledgement times out is `Unknown`, and Stop's cancel of every order of ours on the
@@ -27,11 +28,11 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use fbc_core::{
-    AccountKey, AssetSym, Channel, CidMint, ClientOrderId, ConnState, FundingSpec, InstrumentId,
-    InstrumentKind, InstrumentSpec, Lots, MarketLease, Namespace, NamespaceLease, NewOrder,
-    NonceBlock, NonceScope, NonceSource, OrderKind, PriceGrid, RpcId, Secrets, Side, SignedLots,
-    SizeStep, SpecTable, SubmitOutcome, Ticks, Tif, TradingStatus, UnderlyingId, VenueConfig,
-    VenueFactory, VenueId, WallNs, dispatch_market_data,
+    AccountKey, AssetSym, Channel, CidMatch, CidMint, ClientOrderId, ConnState, FundingSpec,
+    InstrumentId, InstrumentKind, InstrumentSpec, Lots, MarketLease, Namespace, NamespaceLease,
+    NewOrder, NonceBlock, NonceScope, NonceSource, OrderKind, PriceGrid, RpcId, Secrets, Side,
+    SignedLots, SizeStep, SpecTable, SubmitOutcome, Ticks, Tif, TradingStatus, UnderlyingId,
+    VenueConfig, VenueFactory, VenueId, WallNs, dispatch_market_data,
 };
 use fbc_oms::{
     CancelChoice, CancelEverything, FillLedger, LadderConfig, LeaseKeys, Leases, LedgerConfig,
@@ -67,10 +68,6 @@ const NS: Namespace = Namespace::new(1);
 /// the account's address.
 const VENUE: &str = "PARADEX";
 const ACCOUNT_LABEL: &str = "testnet";
-
-/// The caps, in USD (the owner's: $11 resting per side, $50 inventory).
-const RESTING_USD: i64 = 11;
-const INVENTORY_USD: i64 = 50;
 
 /// How long an order request awaits its reply before it is `Unknown`.
 const RPC_WAIT: &str = "5000ms";
@@ -432,24 +429,25 @@ fn price(opts: &Options, book: &OrderbookSnapshot) -> Result<Priced, String> {
         ));
     }
     let px = of(ticks);
-    let lots_for = |usd: i64| -> Result<Lots, String> {
-        let n = (Decimal::from(usd) / (px * opts.step)).floor();
+    let lots_for = |usd: Decimal| -> Result<Lots, String> {
+        let n = (usd / (px * opts.step)).floor();
         Lots::new(n.to_i64().ok_or("a cap does not fit")?)
             .ok_or_else(|| "a negative cap".to_owned())
     };
-    let qty = lots_for(RESTING_USD)?;
-    let inventory = lots_for(INVENTORY_USD)?;
+    let resting_usd = opts.resting_cap_usd;
+    let qty = lots_for(resting_usd)?;
+    let inventory = lots_for(opts.inventory_cap_usd)?;
     let size = Decimal::from(qty.get()) * opts.step;
     let notional = size * px;
     if qty.get() == 0 {
         return Err(format!(
-            "${RESTING_USD} at {px} is less than one size step ({}); refused",
+            "${resting_usd} at {px} is less than one size step ({}); refused",
             opts.step
         ));
     }
     if notional < opts.min_notional {
         return Err(format!(
-            "the order's notional ${} (the ${RESTING_USD} resting cap at {px}, {size} on the \
+            "the order's notional ${} (the ${resting_usd} resting cap at {px}, {size} on the \
              {} step) is below the market's minimum ${}; refused",
             notional.round_dp(4),
             opts.step,
@@ -774,6 +772,13 @@ impl Driver {
                         report.untrustworthy,
                         snapshot.orders.iter().filter(|o| o.inst == INST).count(),
                         snapshot.orders.len(),
+                        // Orders on the market the registry cannot own: another namespace's,
+                        // a non-canonical client id's, or one with none.
+                        snapshot
+                            .orders
+                            .iter()
+                            .filter(|o| o.inst == INST && !matches!(o.cid, Some(CidMatch::Ours(_))))
+                            .count(),
                         snapshot
                             .positions
                             .iter()
@@ -783,7 +788,7 @@ impl Driver {
                 })
             })
             .await;
-        let Some((ours_max, untrustworthy, on_market, open, position)) = resynced else {
+        let Some((ours_max, untrustworthy, on_market, open, not_ours, position)) = resynced else {
             self.timed_out(
                 "resync",
                 "the REST resync (an open order or position on a market other than --market \
@@ -804,6 +809,18 @@ impl Driver {
                 }
             ),
         );
+
+        if not_ours > 0 {
+            // The registry neither cancels nor counts the fills of an order it cannot own: one
+            // could fill during the run and stay open after Stop, so the run is refused before
+            // Start.
+            self.note(format_args!(
+                "{not_ours} open orders on the market are not ours (another namespace's, a \
+                 non-canonical client id's, or one with none): Stop could not cancel them nor \
+                 the run count their fills, so it is refused before Start; cancel them first"
+            ));
+            return false;
+        }
 
         {
             let mut link = self.link.borrow_mut();
