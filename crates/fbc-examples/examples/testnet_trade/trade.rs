@@ -677,7 +677,8 @@ pub fn latest_resync(notes: &[Note]) -> Option<Result<Applied<'_>, &str>> {
 /// ([`resync_disagreements`]) or refused by the registry, an order in our namespace that the
 /// registry does not hold (shown by a resync or an order event), a fill not of our orders, a
 /// position event other than `start` (the market's position seeded at Start; flat on any other
-/// market), an order of `owned` that filled since the run took it on ([`traded`]: the round
+/// market), an order not ours that an order event reported (even one ended since), an order of
+/// `owned` that filled since the run took it on ([`traded`]: the round
 /// trip can no longer be clean), or an order not ours in view on the market. Empty when
 /// nothing does.
 pub fn account_changes(
@@ -711,6 +712,23 @@ pub fn account_changes(
                 }
             }
             Note::Orphan { cid, vid } => changes.push(orphan(*cid, vid.as_ref())),
+            // Every order not ours an order event reported, not only those still in view: the
+            // registry's view forgets one once it ends, but another trader still operated on
+            // the account during the run. (An untracked order in our namespace is an Orphan.)
+            Note::Order(
+                routed @ (Routed::Foreign(_) | Routed::NotCanonical | Routed::Untracked),
+            ) => {
+                let whose = match routed {
+                    Routed::Foreign(ns) => format!("namespace {}'s", ns.get()),
+                    Routed::NotCanonical => "a non-canonical client id's".to_owned(),
+                    _ => "one with no client id".to_owned(),
+                };
+                changes.push(format!(
+                    "an order not ours was reported during the run ({whose}): another trader \
+                     operated on the account, so Stop could not cancel it nor the run count its \
+                     fills"
+                ));
+            }
             Note::Fill {
                 seen,
                 unexplained: true,
