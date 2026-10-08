@@ -1056,7 +1056,12 @@ pub trait ExecCodec: Send {
     /// keeps only as keyed hashes ([`InboundSpans`]). Pure: it depends on `input` and the
     /// codec's state alone and changes nothing. Replay hands the codec the journaled input
     /// with these spans blanked, so what it decodes must not depend on their bytes beyond
-    /// holding them (a token kept for later requests is kept blanked).
+    /// holding them (a token kept for later requests is kept blanked). The runtime asks only
+    /// about an input of the epoch the codec serves, as it is read: one it hands the codec
+    /// next, or one that came as the session stopped and reaches no codec. A result that comes
+    /// back after its epoch ended is never asked about: the journal hashes it whole, since the
+    /// codec's state may have moved on since the request (decision 0078; Reviewer B RB-2pr-2
+    /// on PR #115).
     fn redact_inbound(&self, input: Inbound<'_>) -> InboundSpans;
 }
 

@@ -35,7 +35,7 @@
 //! **The journal (FBC-2pr, decisions 0006, 0078).** With a [`Journal`] set
 //! ([`ExecSession::set_journal`]), the session records what crosses its boundary as a market-data
 //! session does: each epoch's opening and closing, every frame and HTTP result it receives at its
-//! stamp (a stale one too, hashed whole once the codec was called again after its epoch) with the
+//! stamp (an ended epoch's hashed whole, since the codec is never handed it) with the
 //! credentials the codec names in it as keyed hashes (0028), every ping, pong and close frame it
 //! receives (0041), every frame it writes with its kind and redaction spans and the result of the
 //! write (none for a write that failed, stalled or was interrupted, whose outcome is unknown,
@@ -45,12 +45,14 @@
 //! reserved (a short reservation's values included), and the [`EncodeCtx`] it then hands `on_open`,
 //! `on_timer`, the resync or an `encode`, the encode's with its request id, just before the call.
 //! An inbound frame or HTTP result is journaled under Safety, since an order-entry stream carries
-//! acks and fills that cannot be told apart before they are decoded; a write under its frame's
-//! class; an encode's nonces and context under its command's class, so a cancel's or a reducing
-//! order's are Safety; the rest under Normal. An input that came as the control dropped follows the
-//! epoch's `Closed`, reaching no codec; spans a codec names that do not fit their input are counted
-//! ([`ExecCounters::refused_redactions`]) and that input is hashed whole. An encode's time is read
-//! once its nonces are reserved. Nothing waits on the journal: a record the sink has no room for is
+//! acks and fills that cannot be told apart before they are decoded, and so are each epoch's
+//! opening and closing, which replay places them in, and every nonce, so a restart reads every
+//! value spent; a write under its frame's class; an encode's context under its command's class,
+//! so a cancel's or a reducing order's is Safety; the rest under Normal. An input that came as the
+//! control dropped follows the epoch's `Closed`, reaching no codec; spans a codec names that do not
+//! fit their input are counted ([`ExecCounters::refused_redactions`]) and that input is hashed
+//! whole. The time of an encode, `on_open` or the resync is read once its nonces are reserved; a
+//! timer's is its firing's. Nothing waits on the journal: a record the sink has no room for is
 //! dropped and counted there (0006). A request's deadline firing is stamped but not yet journaled
 //! (FBC-0hfl).
 //!
@@ -621,15 +623,8 @@ impl<H: ExecHandler> ExecSession<H> {
                 handler: &mut self.handler,
                 clock: &self.clock,
                 key: self.core.current(),
-                touched: false,
             };
-            let opened = self.core.connect(&self.url, &mut ctl).await;
-            // A codec a deadline reached since its epoch ended no longer vouches for that
-            // epoch's results (Codex P1 r4214784284 on PR #115).
-            if ctl.touched {
-                self.core.codec_epoch = None;
-            }
-            let Some(ws) = opened? else {
+            let Some(ws) = self.core.connect(&self.url, &mut ctl).await? else {
                 return Ok(());
             };
             let key = self.current();
@@ -782,20 +777,9 @@ impl<H: ExecHandler> ExecSession<H> {
     /// for; its effects.
     fn open(&mut self) -> Result<Effects, ExecSessionError> {
         let call = CtxCall::Open(self.stream);
-        let (mono, wall) = self.core.clock.now();
         let (rec, clock) = (&self.rec, &self.clock);
-        let ctx = context(
-            &*self.codec,
-            &mut *self.nonces,
-            rec,
-            clock,
-            call,
-            mono,
-            wall,
-        )?;
+        let ctx = context(&*self.codec, &mut *self.nonces, rec, clock, call, None)?;
         let mut fx = Effects::new();
-        // From here an ended epoch's result is hashed whole (Codex P1 r4214607580 on PR #115).
-        self.core.codec_epoch = Some(self.current().epoch);
         self.codec.on_open(self.stream, &ctx, &mut fx);
         Ok(fx)
     }
@@ -1062,8 +1046,8 @@ impl<H: ExecHandler> ExecSession<H> {
         rpc: RpcId,
         key: ConnKey,
     ) -> Result<Result<(EncodeReceipt, Effects), Unsent>, ExecSessionError> {
-        // Its nonces and context are journaled under the command's own class, so a cancel's
-        // and a reducing order's are Safety (decision 0078).
+        // Its context is journaled under the command's own class, so a cancel's and a reducing
+        // order's is Safety; its nonces under Safety (decision 0078).
         let journaled = cmd.traffic_class();
         // A batch longer than u16::MAX items, which no venue takes, has no nonce block. Its time
         // is read once its nonces are reserved, so a source that takes its time leaves the
@@ -1071,7 +1055,7 @@ impl<H: ExecHandler> ExecSession<H> {
         let (rec, clock) = (&self.rec, &self.core.clock);
         let items = cmd
             .items()
-            .map(|n| reserve(&mut *self.nonces, n, rec, journaled, || clock.now()));
+            .map(|n| reserve(&mut *self.nonces, n, rec, || clock.now()));
         let mut fx = Effects::new();
         let encoded = items
             .transpose()?
@@ -1161,17 +1145,8 @@ impl<H: ExecHandler> ExecSession<H> {
         ws: &mut Option<WebSocket>,
         key: ConnKey,
     ) -> Result<bool, ExecSessionError> {
-        let (mono, wall) = self.core.clock.now();
         let (call, rec, clock) = (CtxCall::Resync, &self.rec, &self.clock);
-        let ctx = context(
-            &*self.codec,
-            &mut *self.nonces,
-            rec,
-            clock,
-            call,
-            mono,
-            wall,
-        )?;
+        let ctx = context(&*self.codec, &mut *self.nonces, rec, clock, call, None)?;
         let mut fx = Effects::new();
         self.codec.resync(&ctx, &mut fx);
         self.orders.gate.borrow_mut().resync_asked(key.epoch);
@@ -1209,11 +1184,14 @@ struct Recorder {
 }
 
 impl Recorder {
-    /// One `Nonce` record per value of `block`, in the order reserved, under `class`.
-    fn nonces(&self, class: TrafficClass, wall: WallNs, block: &NonceBlock) {
+    /// One `Nonce` record per value of `block`, in the order reserved, under Safety whatever
+    /// the call, so a restart reads every value spent, a Degraded span's included (decision
+    /// 0078 item 1; Reviewer B RB-2pr-4 on PR #115).
+    fn nonces(&self, wall: WallNs, block: &NonceBlock) {
         if let Some(journal) = &self.journal {
             for &value in block.as_slice() {
                 let source = self.source;
+                let class = TrafficClass::Safety;
                 journal.record(class, wall, &Record::Nonce { source, value });
             }
         }
@@ -1261,36 +1239,36 @@ fn budget_class(item: &Submitted) -> TrafficClass {
     }
 }
 
-/// The context for the codec's `call` at `mono` and `wall`: exactly the nonces it asks for,
-/// reserved from `nonces` (none when it asks for none), or why they could not be (0014 item 1).
-/// The nonces and the context are journaled through `rec` under Normal (decision 0078), filed
-/// under `clock`'s time once the nonces are reserved (Codex P2 r4214053432 on PR #115).
+/// The context for the codec's `call`: exactly the nonces it asks for, reserved from `nonces`
+/// (none when it asks for none), or why they could not be (0014 item 1), at `at`, a timer
+/// firing's stamp, or else at `clock`'s time once the nonces are reserved, as an encode's is
+/// (Reviewer B RB-2pr-3 on PR #115). The context is journaled through `rec` under Normal
+/// (decision 0078), filed under `clock`'s time once the nonces are reserved (Codex P2
+/// r4214053432 on PR #115).
 fn context(
     codec: &dyn ExecCodec,
     nonces: &mut dyn NonceSource,
     rec: &Recorder,
     clock: &IngestClock,
     call: CtxCall,
-    mono: MonoNs,
-    wall: WallNs,
+    at: Option<(MonoNs, WallNs)>,
 ) -> Result<EncodeCtx, ExecSessionError> {
-    let class = TrafficClass::Normal;
     let asked = codec.nonces_for(call);
-    let (nonces, (_, filed)) = reserve(nonces, asked, rec, class, || clock.now())?;
+    let (nonces, reserved) = reserve(nonces, asked, rec, || clock.now())?;
+    let (mono, wall) = at.unwrap_or(reserved);
     let ctx = EncodeCtx { wall, mono, nonces };
-    rec.ctx(class, filed, None, &ctx);
+    rec.ctx(TrafficClass::Normal, reserved.1, None, &ctx);
     Ok(ctx)
 }
 
 /// Exactly `asked` nonces from `nonces` (none reserved when `asked` is 0) with the time `now`
 /// gives once they are reserved, or why not. What the source reserved is journaled through
-/// `rec` under `class`, filed under that time, even when it is not what was asked for: those
-/// values are spent all the same (0006).
+/// `rec`, filed under that time, even when it is not what was asked for: those values are
+/// spent all the same (0006).
 fn reserve(
     nonces: &mut dyn NonceSource,
     asked: u16,
     rec: &Recorder,
-    class: TrafficClass,
     now: impl FnOnce() -> (MonoNs, WallNs),
 ) -> Result<(NonceBlock, (MonoNs, WallNs)), ExecSessionError> {
     let block = match asked {
@@ -1298,7 +1276,7 @@ fn reserve(
         n => nonces.reserve(n),
     };
     let at = now();
-    rec.nonces(class, at.1, &block);
+    rec.nonces(at.1, &block);
     if block.len() != usize::from(asked) {
         let reserved = block.len();
         return Err(ExecSessionError::Nonces { asked, reserved });
@@ -1343,9 +1321,6 @@ struct Between<'a, H> {
     handler: &'a mut H,
     clock: &'a IngestClock,
     key: ConnKey,
-    /// Whether a deadline has reached the codec's `on_rpc_timeout` meanwhile, which may change
-    /// the state its redaction reads.
-    touched: bool,
 }
 
 impl<H> Between<'_, H> {
@@ -1355,16 +1330,6 @@ impl<H> Between<'_, H> {
 }
 
 impl<H: ExecHandler> Control for Between<'_, H> {
-    /// The session's one codec names the credentials in an ended epoch's result too, until it
-    /// is called again: for a deadline here, or to open a later epoch (`Core::codec_epoch`).
-    fn redacts(&self) -> bool {
-        !self.touched
-    }
-
-    fn spans(&self, input: Inbound<'_>) -> InboundSpans {
-        self.codec.redact_inbound(input)
-    }
-
     /// True when there is something to report (at once when it already waits), false once the
     /// control dropped.
     async fn changed(&mut self) -> bool {
@@ -1399,7 +1364,6 @@ impl<H: ExecHandler> Control for Between<'_, H> {
                 stop: &self.stop,
                 stamp,
             };
-            self.touched = true;
             self.codec.on_rpc_timeout(rpc, &mut sink);
         }
     }
@@ -1461,17 +1425,9 @@ impl<H: ExecHandler> EpochInputs for Feed<'_, H> {
             return;
         }
         let call = CtxCall::Timer(tag);
-        let (mono, wall) = (stamp.recv_mono, stamp.recv_wall);
+        let at = Some((stamp.recv_mono, stamp.recv_wall));
         let (rec, clock) = (self.rec, self.clock);
-        match context(
-            &*self.codec,
-            &mut *self.nonces,
-            rec,
-            clock,
-            call,
-            mono,
-            wall,
-        ) {
+        match context(&*self.codec, &mut *self.nonces, rec, clock, call, at) {
             Ok(ctx) => self.codec.on_timer(tag, &ctx, fx),
             Err(e) => *self.fault = Some(e),
         }
