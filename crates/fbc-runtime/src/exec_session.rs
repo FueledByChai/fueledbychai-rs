@@ -37,7 +37,8 @@
 //! market-data session does: each epoch's opening and closing, every frame and HTTP result it
 //! receives at its stamp (a stale one too) with the credentials the codec names in it as keyed
 //! hashes (0028), every ping, pong and close frame it receives (0041), every frame it writes with
-//! its kind and redaction spans and the result of the write, every HTTP request with its
+//! its kind and redaction spans and the result of the write (none for a write that failed,
+//! stalled or was interrupted, whose outcome is unknown, 0036), every HTTP request with its
 //! request id, and every codec timer that fires. It also records each nonce it reserves from
 //! the consumer's [`NonceSource`], one `Nonce` record per value under the account's number as
 //! the source, as it is reserved (a short reservation's values included), and the
@@ -401,15 +402,17 @@ pub struct ExecSession<H: ExecHandler> {
 }
 
 /// A session dropped while a dropped run left its epoch connected tells the handler it ended
-/// (Codex r4189174470), unless it is dropped as a panic unwinds: its buckets are forgotten,
-/// but the handler, which may have panicked itself, is not called, since a second panic would
-/// abort the process (Reviewer B, B2).
+/// (Codex r4189174470), unless it is dropped as a panic unwinds: its buckets are forgotten and
+/// the epoch is journaled closed if the journal is not borrowed then (Codex P2 r4213946637 on
+/// PR #115), but the handler, which may have panicked itself, is not called, since a second
+/// panic would abort the process (Reviewer B, B2).
 impl<H: ExecHandler> Drop for ExecSession<H> {
     fn drop(&mut self) {
         self.orders.end();
         if std::thread::panicking() {
             if let Some(key) = self.in_epoch.take() {
                 self.core.rates.closed(key);
+                self.core.closed_unwinding(key);
             }
         } else {
             self.end_left_epoch();
@@ -538,8 +541,11 @@ impl<H: ExecHandler> ExecSession<H> {
 
     /// Records everything the session sends and receives into `journal` from now on, with the
     /// nonces it reserves and the contexts it gives its codec (0006); the module docs say what
-    /// is recorded, and under which class.
+    /// is recorded, and under which class. An epoch a dropped run left connected is ended first,
+    /// the handler told, so its `Closed` goes to the journal that holds its `Opened` (Codex P2
+    /// r4213946641 on PR #115).
     pub fn set_journal(&mut self, journal: Journal) {
+        self.end_left_epoch();
         self.rec.journal = Some(journal.clone());
         self.core.journal = Some(journal);
     }

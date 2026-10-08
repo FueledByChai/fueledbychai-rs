@@ -293,6 +293,16 @@ impl Core {
         spans
     }
 
+    /// Records connection `key`'s close as a panic unwinds, if the sink is not borrowed then
+    /// ([`Journal::try_record`]).
+    pub(crate) fn closed_unwinding(&self, key: ConnKey) {
+        if let Some(journal) = &self.journal {
+            let (at, now) = self.clock.now();
+            let ev = ControlEvent::Closed(key);
+            journal.try_record(TrafficClass::Normal, now, &Record::Control { at, ev });
+        }
+    }
+
     /// Records a connection change or a subscribe call.
     pub(crate) fn control(&self, ev: impl FnOnce() -> ControlEvent) {
         let (at, now) = self.clock.now();

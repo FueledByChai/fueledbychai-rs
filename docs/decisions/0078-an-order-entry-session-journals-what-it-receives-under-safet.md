@@ -53,6 +53,11 @@ also:
    and those inputs, which reach no codec, after it, as the market-data session does, so replay
    feeds them to no codec either. Spans a codec names that do not fit their input are counted
    (`ExecCounters::refused_redactions`) and that input is hashed whole, as on market data.
+   Every `Opened` has its `Closed` in the same journal: an epoch a dropped run left connected
+   is ended before `set_journal` changes the journal, and one a panic unwinds through is
+   journaled closed as the session drops, if the sink is not borrowed then. A write that
+   failed, stalled or was interrupted has no write result, as 0036 has it: its outcome is
+   unknown, and the request's deadline reports it `Unknown` (0057).
 
 ## Alternatives
 
