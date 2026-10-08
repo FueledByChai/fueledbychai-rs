@@ -101,12 +101,12 @@ const SCHEMA: [[FieldSpec; 2]; 4] = [
     url_fields(
         ANCHOR_URL,
         "the anchored book channel's REST base (http:// or https://), without user \
-         information, query or fragment; read when that channel is subscribed",
+         information, query, fragment or trailing /; read when that channel is subscribed",
     ),
     url_fields(
         REST_URL,
         "the REST base a resync is asked for under (http:// or https://), without user \
-         information, query or fragment; without it the toy resyncs in frames",
+         information, query, fragment or trailing /; without it the toy resyncs in frames",
     ),
 ];
 

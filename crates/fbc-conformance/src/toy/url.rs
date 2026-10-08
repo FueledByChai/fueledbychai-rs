@@ -9,7 +9,9 @@
 //! toy marks credentials in the path only, so it refuses a URL with user information (which the
 //! runtime never sends either, decision 0029) and one with a query or fragment (the toy appends
 //! its own paths and query to the base), rather than plan an address with a credential it
-//! cannot mark.
+//! cannot mark. It also refuses, at configuration time rather than at the first connection or
+//! request, an authority without a usable host or port, and an HTTP base ending in `/`, which
+//! the paths it appends would double (Codex r4219602934, r4219602924).
 
 use core::ops::Range;
 
@@ -54,8 +56,16 @@ pub(super) fn configured(cfg: &VenueConfig, key: UrlKey) -> Result<WireUrl, Conf
              credential in the path and mark it",
         ));
     }
-    if authority.is_empty() {
-        return Err(invalid("no host"));
+    if !usable(authority) {
+        return Err(invalid(
+            "no usable host: a name or an IPv4 or bracketed IPv6 literal, then at most a port \
+             from 1 to 65535",
+        ));
+    }
+    if !key.socket && text.ends_with('/') {
+        return Err(invalid(
+            "a trailing /: the toy appends its own paths, each starting with one",
+        ));
     }
     let path_at = text.len() - rest.len() + authority.len();
     let spans = spans(cfg.get(key.redact).unwrap_or(""), key.redact, path_at)?;
@@ -63,6 +73,34 @@ pub(super) fn configured(cfg: &VenueConfig, key: UrlKey) -> Result<WireUrl, Conf
         key: key.redact,
         reason: "a span past the URL's end, out of order, overlapping or splitting a character",
     })
+}
+
+/// Whether `authority` is a host, then at most `:` and a port from 1 to 65535 (Codex
+/// r4219602934): a name or IPv4 literal of letters, digits, `.`, `-` and `_`, or an IPv6
+/// literal in brackets.
+fn usable(authority: &str) -> bool {
+    let named = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_');
+    let v6 = |c: char| c.is_ascii_hexdigit() || matches!(c, ':' | '.');
+    let (host_ok, port) = match authority.strip_prefix('[') {
+        Some(v6_and_port) => match v6_and_port.split_once(']') {
+            Some((inside, "")) => (!inside.is_empty() && inside.chars().all(v6), None),
+            Some((inside, after)) => match after.strip_prefix(':') {
+                Some(port) => (!inside.is_empty() && inside.chars().all(v6), Some(port)),
+                None => return false,
+            },
+            None => return false,
+        },
+        None => {
+            let (host, port) = match authority.rsplit_once(':') {
+                Some((host, port)) => (host, Some(port)),
+                None => (authority, None),
+            };
+            (!host.is_empty() && host.chars().all(named), port)
+        }
+    };
+    let port_ok =
+        |p: &str| p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok_and(|p| p > 0);
+    host_ok && port.is_none_or(port_ok)
 }
 
 /// `base` with `suffix` appended, its spans kept where they were.

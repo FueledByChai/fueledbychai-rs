@@ -185,6 +185,17 @@ fn a_url_with_user_information_a_query_or_spans_it_cannot_keep_is_refused() {
         ("https://toy.invalid/x", None, EXEC_URL_KEY),
         ("toy.invalid/x", None, EXEC_URL_KEY),
         ("wss:///x", None, EXEC_URL_KEY),
+        // A host that cannot be used (Codex r4219602934): none before a port, a port that is
+        // not one, an IPv6 literal left open or followed by anything but a port.
+        ("wss://:443/x", None, EXEC_URL_KEY),
+        ("wss://toy.invalid:/x", None, EXEC_URL_KEY),
+        ("wss://toy.invalid:0/x", None, EXEC_URL_KEY),
+        ("wss://toy.invalid:65536/x", None, EXEC_URL_KEY),
+        ("wss://toy.invalid:44x/x", None, EXEC_URL_KEY),
+        ("wss://[::1/x", None, EXEC_URL_KEY),
+        ("wss://[::1]x/x", None, EXEC_URL_KEY),
+        ("wss://[]/x", None, EXEC_URL_KEY),
+        ("wss://toy invalid/x", None, EXEC_URL_KEY),
         // Spans the toy cannot keep: not ranges, outside the path, past the end, out of order,
         // overlapping, empty.
         ("wss://toy.invalid/abcdef", Some("x"), EXEC_URL_REDACT_KEY),
@@ -262,6 +273,33 @@ fn a_url_with_user_information_a_query_or_spans_it_cannot_keep_is_refused() {
     assert_eq!(key, ANCHOR_URL_KEY);
     // The plain book needs no anchor base.
     assert!(plan(&query, BOOK).is_ok());
+    // A base the toy appends its paths to cannot end in a slash, which would double it
+    // (Codex r4219602924); a socket URL can.
+    let slash = invalid(ANCHOR_URL_KEY, "https://toy.invalid/rest/", None);
+    let Err(VenueError::Config(ConfigError::Invalid { key, .. })) = plan(&slash, ANCHORED_BOOK)
+    else {
+        panic!("planned");
+    };
+    assert_eq!(key, ANCHOR_URL_KEY);
+    let slash = invalid(REST_URL_KEY, "https://toy.invalid/", None);
+    assert!(
+        ToyFactory
+            .exec_codec(&slash, Secrets::new())
+            .unwrap()
+            .is_err()
+    );
+    let mut ok = VenueConfig::new();
+    for exec in [
+        "wss://toy.invalid/x/",
+        "wss://[::1]:9/x",
+        "ws://127.0.0.1:65535",
+    ] {
+        ok.insert(EXEC_URL_KEY, exec);
+        assert_eq!(
+            ToyFactory.plan_exec(&ok).unwrap()[0].url,
+            WireUrl::plain(exec)
+        );
+    }
     let socket = invalid(ANCHOR_URL_KEY, "wss://toy.invalid/rest", None);
     assert!(plan(&socket, ANCHORED_BOOK).is_err());
     let mut none = cfg();

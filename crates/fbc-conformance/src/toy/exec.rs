@@ -31,10 +31,7 @@ use fbc_core::{
 };
 
 use super::session::{self, Answers};
-use super::{
-    EXEC_STREAM, FillIds, PING_EVERY, PING_TAG, RESYNC_RETRY_TAG, RPC_TIMEOUT, caps_for, decode,
-    weight,
-};
+use super::{EXEC_STREAM, FillIds, PING_EVERY, PING_TAG, RPC_TIMEOUT, caps_for, decode, weight};
 
 use NotSentReason::{FlagConflict, SignFailed, Unencodable, Unsupported};
 
@@ -515,8 +512,8 @@ impl ExecCodec for ToyExec {
         self.answers.rest_answer(tag, resp, scope, specs, sink, fx)
     }
 
-    /// The ping, sent and armed again; a resync over REST asked again. Any other tag is none
-    /// of the toy's.
+    /// The ping, sent and armed again; a resync over REST asked again on the timer carrying its
+    /// failed request's tag. Any other tag asks nothing.
     fn on_timer(&mut self, tag: TimerTag, ctx: &EncodeCtx, fx: &mut Effects) {
         match (tag, &self.rest, self.opened) {
             (PING_TAG, _, Some(stream)) if self.ping => {
@@ -529,7 +526,8 @@ impl ExecCodec for ToyExec {
                 });
                 fx.push(ping_timer());
             }
-            (RESYNC_RETRY_TAG, Some(base), _) => self.answers.retry_rest(base, ctx, fx),
+            (PING_TAG, ..) => {}
+            (_, Some(base), _) => self.answers.retry_rest(tag, base, ctx, fx),
             _ => {}
         }
     }

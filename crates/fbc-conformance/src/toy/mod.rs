@@ -100,14 +100,15 @@ pub const ANCHOR_URL_REDACT_KEY: &str = "toy.md.anchor_url.redact";
 
 /// How often a pinging order-entry codec sends its ping ([`ToyExec::pinging`]).
 pub const PING_EVERY: Duration = Duration::from_secs(15);
-/// The timer a pinging order-entry codec sends its ping on.
-pub const PING_TAG: TimerTag = TimerTag(1);
+/// The timer a pinging order-entry codec sends its ping on. A resync over REST's retry timer
+/// carries its request's [`HttpTag`](fbc_core::HttpTag), which starts at 1, so the two never
+/// meet.
+pub const PING_TAG: TimerTag = TimerTag(0);
 /// How long a resync over REST may take ([`ToyExec::rest_resync`]).
 pub const RESYNC_TIMEOUT: Duration = Duration::from_secs(2);
-/// How long after a resync over REST that failed, or came back unreadable, it is asked again.
+/// How long after a resync over REST that failed, or came back unreadable, it is asked again,
+/// on a timer carrying the failed request's tag.
 pub const RESYNC_RETRY: Duration = Duration::from_secs(1);
-/// The timer a resync over REST is asked again on.
-pub const RESYNC_RETRY_TAG: TimerTag = TimerTag(2);
 
 /// Whether the toy's fills carry a venue fill id ([`FillCaps::fill_id`]). Venues differ here,
 /// and the flag is one per venue, so the toy is declared either way and its frames keep to the
