@@ -6,7 +6,16 @@ conformance toy venue (`crates/fbc-conformance/src/toy/`, decision 0044), in
 is recorded from one.
 
 A check that reads recorded data reads it from a subdirectory named after the check
-(`<check>/`), described in that check's documentation in `crates/fbc-conformance/src/suite/`.
-The checks so far, `caps_truthful` and `commands_selfcontained`, read none: they need only the
-toy's factory and the setup the suite's test gives (the toy's spec table, an empty
-configuration and no credentials), so the directory holds only this file.
+(`<check>/`), described in that check's documentation in `crates/fbc-conformance/src/suite/`:
+
+- `signing_golden/`: one `<name>.golden` per golden command the suite's setup lists
+  (`crates/fbc-conformance/tests/toy_setup/mod.rs`, `goldens()`), holding the exact bytes of
+  the frame the toy encodes it to, signature included, and the `SYNTHETIC` marker decision 0009
+  asks of golden signing vectors. The toy's signer holds no key; its signature is a hash.
+- `legacy_symbols/tickers.txt`: Java-era ticker values the toy's own made-up rule reads
+  (`X/USDT`); the Java stack never traded the toy, so these stand in for the values a real
+  venue's fixtures list from exported Java configurations.
+
+`caps_truthful` and `commands_selfcontained` read no file: they need only the toy's factory
+and the setup the suite's test gives (the toy's spec table, an empty configuration and no
+credentials).

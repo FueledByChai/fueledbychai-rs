@@ -27,9 +27,11 @@
 //! - [`suite`], the named conformance suite (design §6, FBC-8ew): [`suite!`], which an adapter
 //!   crate's `tests/conformance.rs` invokes with its factory, its fixture directory (whose
 //!   layout [`suite`] documents) and the setup its fixtures assume, each named check becoming a
-//!   test; and each check as a public function. So far `caps_truthful` and
-//!   `commands_selfcontained`; the conformance toy passes both, and a deliberately broken toy
-//!   fails `caps_truthful` (`tests/suite_broken.rs`).
+//!   test; and each check as a public function. So far `caps_truthful`,
+//!   `commands_selfcontained`, `signing_golden` and `legacy_symbols` (FBC-onw); the conformance
+//!   toy passes all four, a deliberately broken toy fails `caps_truthful`
+//!   (`tests/suite_broken.rs`), and a toy whose signer changes one signed byte fails
+//!   `signing_golden` (`tests/suite_golden.rs`).
 //!
 //! Not here yet: the suite's other checks, and the rest of the conformance toy venue.
 

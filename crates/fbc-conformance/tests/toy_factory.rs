@@ -8,8 +8,9 @@ use std::collections::BTreeSet;
 use fbc_conformance::toy::{self, EXEC_URL_KEY, INST_A, NoMd, ToyFactory};
 use fbc_core::{
     ConfigError, DecodeError, Effects, EndpointPlan, Feed, HttpFailure, HttpTag, Inbound,
-    InboundSpans, MdEvent, MdSink, MdTransport, MonoNs, RawFrame, Secrets, StreamId, Subscription,
-    SymbolError, TimerTag, VenueConfig, VenueError, VenueFactory, VenueMeta, WallNs, WireUrl,
+    InboundSpans, InstrumentKind, MdEvent, MdSink, MdTransport, MonoNs, RawFrame, Secrets,
+    StreamId, Subscription, SymbolError, TimerTag, VenueConfig, VenueError, VenueFactory,
+    VenueMeta, WallNs, WireUrl,
 };
 
 /// A sink that keeps nothing: the toy's market data pushes nothing.
@@ -34,9 +35,18 @@ fn the_toy_factory_declares_the_toys_caps_and_builds_its_codec_without_credentia
     assert_eq!(ToyFactory.id(), "TOY-CONFORMANCE");
     assert!(ToyFactory.config_schema().is_empty());
     assert_eq!(ToyFactory.caps(&cfg), Ok(toy::caps()));
+    let usdt = ToyFactory.parse_fbc_common_symbol("TOYA/USDT").unwrap();
     assert_eq!(
-        ToyFactory.parse_fbc_common_symbol("BTC/USDT"),
-        Err(SymbolError::NoRule)
+        (usdt.base.as_str(), usdt.quote.as_str(), usdt.kind),
+        ("TOYA", "USDT", InstrumentKind::Perpetual)
+    );
+    assert_eq!(
+        ToyFactory.parse_fbc_common_symbol("TOYA/USD"),
+        Err(SymbolError::Unmapped)
+    );
+    assert_eq!(
+        ToyFactory.parse_fbc_common_symbol("TOYA-PERP"),
+        Err(SymbolError::NotCommonForm)
     );
     assert!(matches!(
         ToyFactory.discover(&cfg),

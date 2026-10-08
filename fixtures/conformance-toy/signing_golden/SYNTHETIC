@@ -1,0 +1,8 @@
+Synthetic signing fixtures (decision 0009). Nothing in this directory belongs to an account.
+
+The conformance toy (crates/fbc-conformance/src/toy/) describes no real venue. Its signer holds
+no key: a signature here is an FNV-1a hash, in hexadecimal, of the request's signed fields. The
+orders, prices, sizes, nonces, request ids and the signing time are made-up inputs, stated in
+crates/fbc-conformance/tests/toy_setup/mod.rs (goldens()). Each <name>.golden file holds the exact
+bytes of the one frame the toy encodes that command to, as fbc_conformance::suite::signing_golden
+reads them.

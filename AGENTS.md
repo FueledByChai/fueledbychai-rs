@@ -321,8 +321,13 @@ rather than guess.
     `NotSent(Unsupported)` with no effect, every flag conflict `NotSent(FlagConflict)`, an
     instrument cancel-all never widened, a control per operation sent) and
     `commands_selfcontained` (every amend, cancel and query by each declared reference encoded
-    by a fresh codec, alike after it saw the placement); still planned: the suite's other checks
-    and the rest of the conformance toy).
+    by a fresh codec, alike after it saw the placement), `signing_golden` (each golden command
+    the setup lists, encoded under its own `EncodeCtx` by a fresh codec, is one frame equal to
+    `<fixtures>/signing_golden/<name>.golden`, a directory marked SYNTHETIC with no golden no
+    command names) and `legacy_symbols` (every ticker in
+    `<fixtures>/legacy_symbols/tickers.txt` parses through `parse_fbc_common_symbol`; the toy
+    reads `X/USDT` by a rule of its own); still planned: the suite's other checks and the rest
+    of the conformance toy).
   - `crates/fbc-examples`: sample programs the owner runs by hand, never CI (FBC-u4so). Its
     library target is empty and every dependency is a dev-dependency, so it is outside
     `crates/venues/` yet wires concrete venues without a normal dependency on one; each sample is
