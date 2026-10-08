@@ -80,6 +80,9 @@ const CALL_NONCES: &str = "call.nonces";
 const BAD_SPANS: &str = "bad.spans";
 /// A frame the `auth_toy` session's codec panics redacting (a codec defect).
 const PANIC_ON: &str = "panic.on";
+/// Any value: the `auth_toy` session's codec drops the control in [`STOP`] as it redacts an
+/// HTTP result, as a control dropped on another thread may be then.
+const DROP_ON_HTTP: &str = "drop.on.http";
 /// How many milliseconds the `auth_toy` session's arm waits for its answer; an hour by default.
 const ARM_TIMEOUT_MS: &str = "arm.timeout.ms";
 /// The conformance toy's acknowledgement of its authentication, echoing its token.
@@ -385,6 +388,7 @@ fn auth_toy(cfg: &VenueConfig) -> Box<dyn ExecCodec> {
         call_nonces: cfg.get(CALL_NONCES).unwrap().parse().unwrap(),
         bad_spans: cfg.get(BAD_SPANS).is_some(),
         panic_on: cfg.get(PANIC_ON).map(str::to_owned),
+        drop_on_http: cfg.get(DROP_ON_HTTP).is_some(),
         arm_timeout: cfg
             .get(ARM_TIMEOUT_MS)
             .map_or(Duration::from_secs(3_600), |v| ms(v.parse().unwrap())),
@@ -400,7 +404,16 @@ struct AuthWrap {
     call_nonces: u16,
     bad_spans: bool,
     panic_on: Option<String>,
+    drop_on_http: bool,
     arm_timeout: Duration,
+}
+
+thread_local! {
+    /// The control the `auth_toy` session's codec drops as it redacts an HTTP result, with
+    /// [`DROP_ON_HTTP`].
+    static STOP: RefCell<Option<ExecControl>> = const { RefCell::new(None) };
+    /// How many HTTP results the `auth_toy` session's codec was handed.
+    static DECODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl AuthWrap {
@@ -492,6 +505,7 @@ impl ExecCodec for AuthWrap {
         sink: &mut dyn ExecSink,
         fx: &mut Effects,
     ) -> Result<(), DecodeError> {
+        DECODED.with(|n| n.set(n.get() + 1));
         auth_toy::AuthToy.on_http(tag, resp, scope, specs, sink, fx)
     }
 
@@ -518,6 +532,10 @@ impl ExecCodec for AuthWrap {
                 let past = u32::try_from(f.bytes().len()).unwrap() + 1;
                 let span = 0..past;
                 InboundSpans::frame(vec![span])
+            }
+            Inbound::Http(..) if self.drop_on_http => {
+                drop(STOP.with(|stop| stop.borrow_mut().take()));
+                auth_toy::AuthToy.redact_inbound(input)
             }
             _ => auth_toy::AuthToy.redact_inbound(input),
         }
@@ -1460,6 +1478,46 @@ async fn a_calls_nonces_are_filed_after_they_are_reserved() {
         unreachable!()
     };
     assert!(ctx.wall >= returned, "{:?} before {returned:?}", ctx.wall);
+}
+
+/// Codex P1 r4215753453 on PR #115: an HTTP result the session took while the control stood
+/// reaches the codec even when the control drops before it is handed on (here as the codec
+/// redacts it, as a drop on another thread may come then). The stop is read once, where the
+/// input is taken, so the journal, which holds the result in the open epoch before its
+/// `Closed`, never shows the codec an input it was not handed live.
+#[tokio::test]
+async fn a_result_taken_before_the_control_drops_reaches_the_codec_before_the_epoch_closes() {
+    let token = secret("takentoken");
+    let mut server = ScriptedWs::start().await;
+    let mut http = ScriptedHttp::start().await;
+    let venue = Venue::leak(auth_toy);
+    let cfg = [
+        (LOGIN, http.url("/auth")),
+        (CALL_NONCES, "0".to_owned()),
+        (DROP_ON_HTTP, "1".to_owned()),
+    ];
+    let config = config(venue, &server.url(), &cfg, Counting::new());
+    let body = format!("auth|token={token}|refresh=3600");
+    DECODED.with(|n| n.set(0));
+    let run = journaled(
+        "exec_journal_taken_http",
+        config,
+        |_, control, _| async move {
+            STOP.with(|stop| *stop.borrow_mut() = Some(control));
+            let mut peer = server.accept().await;
+            http.request().await.answer("HTTP/1.1 200 OK", &body).await;
+            while peer.next().await.is_some() {}
+        },
+    )
+    .await;
+    run.ended.as_ref().unwrap();
+    assert!(STOP.with(|stop| stop.borrow().is_none()));
+    assert_eq!(DECODED.with(std::cell::Cell::get), 1);
+    let read: Vec<Seen> = run.entries.iter().map(|e| seen(&e.record)).collect();
+    let answer = read.iter().position(|s| matches!(s, Seen::Answer(..)));
+    let closed = read.iter().position(|s| *s == Seen::Closed(key(0)));
+    assert!(answer.unwrap() < closed.unwrap(), "{read:#?}");
+    assert!(!contains(&run.files, token.as_bytes()));
 }
 
 /// Codex P2 r4214053451 on PR #115, answered by P1 r4215070431: an HTTP result that comes back
