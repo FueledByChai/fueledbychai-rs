@@ -264,6 +264,20 @@ fn responder_extra(placed: Arc<Mutex<Placed>>, extra: Vec<Vec<u8>>) -> Responder
         End::Canceled,
         End::Canceled,
         Arc::new(extra),
+        Arc::new(Vec::new()),
+    )
+}
+
+/// As [`responder`], the cancel-on-disconnect arm answered with `extra` frames after its
+/// reply: they reach the run before its resync ends, so before the place.
+fn responder_arm_extra(placed: Arc<Mutex<Placed>>, extra: Vec<Vec<u8>>) -> Responder {
+    responder_full(
+        placed,
+        Arc::new(Vec::new()),
+        End::Canceled,
+        End::Canceled,
+        Arc::new(Vec::new()),
+        Arc::new(extra),
     )
 }
 
@@ -334,17 +348,19 @@ fn responder_with(
         placed_end,
         restored_end,
         Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
     )
 }
 
 /// As [`responder_with`], with `extra` frames sent with the placed order's cancel, before the
-/// order event closing it.
+/// order event closing it, and `arm_extra` frames after the arm's reply.
 fn responder_full(
     placed: Arc<Mutex<Placed>>,
     restored: Arc<Vec<Restored>>,
     placed_end: End,
     restored_end: End,
     extra: Arc<Vec<Vec<u8>>>,
+    arm_extra: Arc<Vec<Vec<u8>>>,
 ) -> Responder {
     let close = !matches!(restored_end, End::Refused);
     Responder::new(move |frame| {
@@ -359,7 +375,11 @@ fn responder_full(
         };
         match req["method"].as_str().unwrap_or("") {
             "auth" | "subscribe" => Ok(vec![ok(json!({}))]),
-            "order.cancel_on_disconnect" => Ok(vec![ok(json!({"enabled": true}))]),
+            "order.cancel_on_disconnect" => {
+                let mut frames = vec![ok(json!({"enabled": true}))];
+                frames.extend(arm_extra.iter().cloned().map(Frame::Binary));
+                Ok(frames)
+            }
             "order.create" => {
                 let mut p = placed.lock().unwrap();
                 p.cid = params["client_id"].as_str().unwrap_or("").to_owned();
@@ -1723,4 +1743,53 @@ async fn a_second_order_book_older_than_the_first_stops_the_run_with_nothing_pla
         "{printed}"
     );
     assert!(!sent.iter().any(|m| m == "order.create"));
+}
+
+#[tokio::test]
+async fn a_moved_position_or_an_order_not_ours_seen_before_the_place_stops_the_run_with_nothing_placed()
+ {
+    // Each arrives with the arm's reply, before the place: the venue reporting the account
+    // long 0.15 when the REST position seeded it flat, and an order event showing another
+    // system's order (a random UUID client id) open on the market.
+    for (frame, said) in [
+        (
+            sbe_fixture("position-long-v2.sbe.txt"),
+            "the venue reported the account's position in instrument 1 as 15000 lots",
+        ),
+        (
+            sbe_fixture("order-foreign-cid-v1.sbe.txt"),
+            "an order not ours is in view on the market",
+        ),
+    ] {
+        let with = responder_arm_extra(Arc::new(Mutex::new(Placed::default())), vec![frame]);
+        // Auth, four subscriptions and the arm: nothing after them.
+        let mut script = vec![Step::Accept];
+        script.extend((0..6).map(|_| Step::Respond {
+            conn: 0,
+            with: with.clone(),
+        }));
+        let stub = StubServer::start(WsScript::new(script), routes())
+            .await
+            .unwrap();
+        let opts = options(&stub, "10");
+        let (report, printed) = run_against(&opts).await;
+        stub.finished().await.unwrap();
+        assert!(!report.ok, "{printed}");
+        assert!(
+            printed.contains("the account changed since the seed, or an order not ours is in view; nothing placed"),
+            "{printed}"
+        );
+        assert!(printed.contains(said), "{printed}");
+        assert_eq!(
+            steps(&printed),
+            ["login", "arm", "resync", "start", "stop"],
+            "{printed}"
+        );
+        assert_eq!(
+            (report.places_sent, report.cancels_sent),
+            (0, 0),
+            "{printed}"
+        );
+        assert!(!methods(&stub).iter().any(|m| m == "order.create"));
+    }
 }
