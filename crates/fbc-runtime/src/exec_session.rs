@@ -216,9 +216,12 @@ pub trait ExecHandler {
     /// (`covers_open_orders`). Until an order event or an order query's answer shows each
     /// ended, the session takes no place or amend on its market
     /// ([`ExecOrders::may_place_on`]). The consumer cancels them, a Safety cancel per order
-    /// built and authorized by fbc-oms ([`ExecOrders::submit`]); one it does not cancel keeps
-    /// its market held until the next epoch that sends an arm reads the venue again (an epoch
-    /// that sends none keeps it held and tells it again). Nothing by default.
+    /// built and authorized by fbc-oms ([`ExecOrders::submit`]); one whose registry already
+    /// holds the order ended (a snapshot lagging an end heard on an earlier epoch) queries it
+    /// instead (`ControlCommand::Query`), and the venue's answer showing it ended releases the
+    /// market. One it neither cancels nor queries keeps its market held until the next epoch
+    /// that sends an arm reads the venue again (an epoch that sends none keeps it held and
+    /// tells it again). Nothing by default.
     fn on_unprotected(&mut self, orders: &[VenueOrderSnapshot]) {
         let _ = orders;
     }

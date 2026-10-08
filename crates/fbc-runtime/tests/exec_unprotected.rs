@@ -30,10 +30,11 @@ use armed_oms::{
 use common::{Peer, ScriptedWs};
 use exec_toy::INST_A;
 use fbc_core::{
-    AckLevel, CidMatch, ClientOrderId, Envelope, ExecEvent, ItemRef, MonoNs, NotSentReason, RpcId,
-    SubmitHandle, SubmitOutcome, VenueCommand, VenueOrderSnapshot, VenueOrderState, encode_cid,
+    AckLevel, CidMatch, ClientOrderId, Envelope, ExecEvent, ItemRef, MonoNs, NotSentReason,
+    OrderRef, QueryOrder, RpcId, SubmitHandle, SubmitOutcome, VenueCommand, VenueOrderSnapshot,
+    VenueOrderState, encode_cid,
 };
-use fbc_oms::{CancelChoice, OrderOp};
+use fbc_oms::{CancelChoice, ControlCommand, OrderOp};
 use fbc_runtime::{ExecControl, ExecHandler, ExecOrders, ExecSession, SafetyReserve};
 
 type Handles = Rc<RefCell<Vec<SubmitHandle>>>;
@@ -43,13 +44,15 @@ type Shared = Rc<RefCell<Oms>>;
 type Told = Rc<RefCell<Vec<Vec<VenueOrderSnapshot>>>>;
 
 /// Keeps each submission's handle, the events it hears and the unprotected orders it is told;
-/// cancels each of those through fbc-oms, one authorized cancel per order.
+/// cancels each of those through fbc-oms, one authorized cancel per order, or, built to `query`,
+/// queries each instead, as a consumer whose registry already holds the order ended does.
 struct Keep {
     handles: Handles,
     events: Events,
     told: Told,
     orders: Orders,
     oms: Shared,
+    query: bool,
 }
 
 impl ExecHandler for Keep {
@@ -65,6 +68,17 @@ impl ExecHandler for Keep {
         self.told.borrow_mut().push(unprotected.to_vec());
         let orders = self.orders.borrow();
         let orders = orders.as_ref().unwrap();
+        if self.query {
+            for order in unprotected {
+                let query = QueryOrder {
+                    target: OrderRef::Venue(order.vid.clone()),
+                    inst: order.inst,
+                    placement_nonce: None,
+                };
+                orders.submit_control(ControlCommand::Query(query)).unwrap();
+            }
+            return;
+        }
         let mut oms = self.oms.borrow_mut();
         for order in unprotected {
             let Some(CidMatch::Ours(cid)) = order.cid else {
@@ -89,8 +103,18 @@ struct Seen {
     oms: Shared,
 }
 
-/// A session of `venue` at `url`, its orders also its handler's.
+/// A session of `venue` at `url`, its orders also its handler's, which cancels what it is told.
 fn session(venue: &'static Held, url: &str) -> (ExecSession<Keep>, ExecControl, ExecOrders, Seen) {
+    session_querying(venue, url, false)
+}
+
+/// A session of `venue` at `url`, its orders also its handler's, which queries what it is told
+/// when `query`, and cancels it otherwise.
+fn session_querying(
+    venue: &'static Held,
+    url: &str,
+    query: bool,
+) -> (ExecSession<Keep>, ExecControl, ExecOrders, Seen) {
     let reserve = SafetyReserve::percent(0).unwrap();
     let config = session_config_for(venue, reserve, url, &Reserved::default());
     let seen = Seen {
@@ -106,6 +130,7 @@ fn session(venue: &'static Held, url: &str) -> (ExecSession<Keep>, ExecControl, 
         told: Rc::clone(&seen.told),
         orders: Rc::clone(&slot),
         oms: Rc::clone(&seen.oms),
+        query,
     };
     let (session, control) = ExecSession::new(config, keep).unwrap();
     let orders = session.orders();
@@ -307,6 +332,49 @@ async fn an_order_resting_from_an_earlier_epoch_is_kept_where_the_caps_declare_a
     drop(thaw);
 
     assert!(seen.told.borrow().is_empty());
+    assert!(seen.handles.borrow().iter().all(|h| h.receipt.is_ok()));
+    assert_eq!(session.counters().unprotected_refusals, 0);
+}
+
+/// Codex P1 r4219340070 on PR #127: a snapshot can show an order resting that an event on an
+/// earlier epoch already ended (a snapshot lagging the stream), so the consumer's registry holds
+/// it ended and builds no cancel. The consumer queries it instead, and the venue's answer
+/// showing it ended releases the market.
+#[tokio::test(start_paused = true)]
+async fn an_order_a_lagging_snapshot_shows_resting_is_released_by_a_query_answer_showing_it_ended()
+{
+    let (thaw, frozen) = std::sync::mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || frozen.recv());
+    let mut server = ScriptedWs::start().await;
+    let (mut session, control, orders, seen) = session_querying(&HELD, &server.url(), true);
+    let (oms, events, handles) = (
+        Rc::clone(&seen.oms),
+        Rc::clone(&seen.events),
+        Rc::clone(&seen.handles),
+    );
+    let script = async move {
+        let (cid, mut peer) = placed_then_dropped(&mut server, &orders, &oms, &events).await;
+        assert!(!orders.may_place_on(INST_A));
+        let written = peer.recv().await;
+        assert!(written.starts_with("query|rpc=4|vid=V-3|"), "{written}");
+        peer.send(&format!(
+            "qres|rpc=4|found=1|cid={}|vid=V-3|sym=TOYA-PERP|side=B|st=canceled|why=disconnect\
+             |px=130865|qty=25|cum=0|po=1|ro=0",
+            wire(cid)
+        ));
+        settle(|| orders.may_place_on(INST_A)).await;
+        let auth = oms.borrow_mut().place();
+        assert_eq!(orders.submit(auth), Ok(RpcId(5)));
+        let written = peer.recv().await;
+        assert!(written.starts_with("place|rpc=5|"), "{written}");
+        settle(|| handles.borrow().len() == 3).await;
+        drop(control);
+    };
+    let ((), run) = tokio::join!(script, session.run());
+    run.unwrap();
+    drop(thaw);
+
+    assert_eq!(seen.told.borrow().len(), 1);
     assert!(seen.handles.borrow().iter().all(|h| h.receipt.is_ok()));
     assert_eq!(session.counters().unprotected_refusals, 0);
 }

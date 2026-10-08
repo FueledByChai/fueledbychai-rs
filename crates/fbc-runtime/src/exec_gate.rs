@@ -125,13 +125,13 @@ impl Early {
         {
             return None;
         }
-        // Each step follows one amend; there are no more steps than amends heard.
+        // Each step follows one amend; there are no more steps than amends heard. An amend away
+        // from an id comes before an end heard under it, which names the superseded order
+        // (Codex P1 r4219340075 on PR #127).
         for _ in 0..=self.moved.len() {
-            if self.ended.contains(&vid) {
-                return None;
-            }
             match self.moved.get(&vid) {
                 Some(next) => vid = next.clone(),
+                None if self.ended.contains(&vid) => return None,
                 None => return Some(vid),
             }
         }
@@ -949,6 +949,22 @@ mod tests {
         // V-1 and V-3 (moved to V-7) ended; V-2 rests as V-6; V-4 rests as shown.
         let vids: Vec<_> = gate.unprotected().iter().map(|o| o.vid.clone()).collect();
         assert_eq!(vids, [vid("V-6"), vid("V-4")]);
+
+        // Codex P1 r4219340075 on PR #127: an end heard late under the id an amend superseded,
+        // before the snapshot, ends nothing: the order rests under its new id.
+        let mut gate = Gate::new(true, false);
+        gate.authenticated(0);
+        gate.arm_sent(0, RpcId(1));
+        gate.resync_asked(0);
+        let cancelled = VenueOrderState::Canceled(CancelReason::Requested);
+        let to_v2 = VenueOrderState::Amended {
+            new_vid: Some(vid("V-2")),
+        };
+        gate.observe(0, &update(None, Some("V-1"), to_v2));
+        gate.observe(0, &update(None, Some("V-1"), cancelled));
+        gate.observe(0, &ExecEvent::ResyncOrder(ours("V-1")));
+        let vids: Vec<_> = gate.unprotected().iter().map(|o| o.vid.clone()).collect();
+        assert_eq!(vids, [vid("V-2")]);
 
         // An end naming no venue id ends our order by its client id; one naming neither
         // names nothing. Amends no venue reports, in a cycle, leave the order resting.
