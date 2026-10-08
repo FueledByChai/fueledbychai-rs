@@ -95,7 +95,12 @@
 //! ([`Effects::carry_request`]), or that name another stream, a reconnect, an HTTP request or
 //! a request whose deadline is past the end of the clock, are `NotSent(Unencodable)`, and
 //! frames the buckets do not admit together `NotSent(RateBudget)`, each with nothing written.
-//! The frames are charged in the class of their command (FBC-e8i, decision 0073): a normal
+//! An order query or the fee query the consumer submits may instead be carried as exactly one
+//! HTTP request and no frame (FBC-m8vm, decision 0081); every other command over HTTP, an
+//! order-affecting one until FBC-4nfb, stays `NotSent(Unencodable)`, nothing requested.
+//! The frames, or the HTTP request with the connection it opens, are charged together in the
+//! class of their command (FBC-e8i, decision 0073), so a refused HTTP query is
+//! `NotSent(RateBudget)` with nothing requested: a normal
 //! place or amend and every control command the consumer submits (an order query, an arm, a
 //! dead-man refresh, the fee query) stop at each bucket's safety reserve, while a cancel, a
 //! reducing order and the session's own cancel-on-disconnect arm may use it until the bucket
@@ -111,6 +116,13 @@
 //! command twice, and a reconnect never re-sends one (0005, 0013 rule 1). A deadline that falls
 //! due while a write waits on a stalled peer is handled once the write ends, within the
 //! write-stall window. Once the session has stopped, nothing more is reported.
+//!
+//! An HTTP query's deadline runs from just before its request starts, and is cleared by the
+//! call to the codec's `on_http` for it, whatever the codec pushes, as well as by an event
+//! answering it. While the epoch that asked lasts its result always comes back (the request's
+//! own timeout bounds it), so its deadline stands only once that epoch ends: then its result is
+//! dropped, and the query is handed to `on_rpc_timeout` once at its deadline, on a later epoch
+//! or while the session waits to reconnect, and never requested again (decision 0081).
 //!
 //! **Cancel-on-disconnect and the resync, every epoch (FBC-w19, decision 0058).** A session
 //! takes only a venue whose cancel-on-disconnect is per connection: one declaring `None` or
@@ -723,6 +735,8 @@ impl<H: ExecHandler> ExecSession<H> {
         self.core.control(|| ControlEvent::Opened(key));
         let end = self.epoch(ws, key).await;
         self.orders.set_ready(None);
+        // What the epoch asked over HTTP comes back to no codec now (decision 0081).
+        self.rpcs.ended(key.epoch);
         // Cleared before the handler is called, so a handler that panics is never told twice
         // (Codex r4189618551).
         self.in_epoch = None;
@@ -935,6 +949,22 @@ impl<H: ExecHandler> ExecSession<H> {
         Ok(open)
     }
 
+    /// Executes an encode's effects `fx`, every frame and HTTP request in them, with the
+    /// connection each request opens, charged already ([`Self::encode`]), attributed to no
+    /// input. False when the epoch ended.
+    async fn execute_charged(
+        &mut self,
+        ws: &mut Option<WebSocket>,
+        fx: Effects,
+    ) -> Result<bool, ExecSessionError> {
+        let open = self
+            .core
+            .execute_all_charged(ws, &mut feed!(self), fx)
+            .await?;
+        self.faulted()?;
+        Ok(open)
+    }
+
     /// Fires the earliest timer, which is due: an ended epoch's into nothing (dropped and
     /// counted), the current epoch's into the codec's `on_timer`, and its effects executed.
     /// False when the epoch ended.
@@ -1070,11 +1100,11 @@ impl<H: ExecHandler> ExecSession<H> {
                 .on_submitted(not_sent(NotSentReason::StaleAuthorization));
             return Ok(true);
         }
-        match self.encode(cmd, budget_class(&item), rpc, key)? {
+        match self.encode(cmd, budget_class(&item), over_http(&item), rpc, key)? {
             Ok((receipt, fx)) => {
                 let receipt = Ok(receipt);
                 self.handler.on_submitted(SubmitHandle { rpc, receipt });
-                self.execute(ws, fx, true, None).await
+                self.execute_charged(ws, fx).await
             }
             Err(unsent) => {
                 self.handler.on_submitted(not_sent(unsent.reason()));
@@ -1084,14 +1114,17 @@ impl<H: ExecHandler> ExecSession<H> {
     }
 
     /// Encodes `cmd` as request `rpc` for epoch `key`, with an [`EncodeCtx`] holding exactly
-    /// its items' nonces, and charges its frames together as `class` (decision 0073): its
-    /// receipt and effects, ready to
-    /// execute, or why it is not sent, nothing written (the module docs say which). The
-    /// session's error when the nonce source reserved another count.
+    /// its items' nonces, carried as one HTTP request only when `http` allows it (decision
+    /// 0081), and charges its frames, or its HTTP request with the connection it opens,
+    /// together as `class` (decisions 0073, 0081): its receipt and effects, ready to execute,
+    /// every frame and request in them charged, or why it is not sent, nothing written or
+    /// requested (the module docs say which). The session's error when the nonce source
+    /// reserved another count.
     fn encode(
         &mut self,
         cmd: &VenueCommand,
         class: TrafficClass,
+        http: bool,
         rpc: RpcId,
         key: ConnKey,
     ) -> Result<Result<(EncodeReceipt, Effects), Unsent>, ExecSessionError> {
@@ -1116,18 +1149,26 @@ impl<H: ExecHandler> ExecSession<H> {
                 self.codec
                     .encode(cmd, rpc, &self.specs, &ctx, &mut t, &mut fx)
             });
+        let carried = |fx: &Effects| {
+            let now = Instant::now();
+            carries(fx, rpc, cmd.traffic_class(), self.stream, http, now)
+        };
         let receipt = match encoded {
-            Ok(receipt) if carries(&fx, rpc, cmd.traffic_class(), self.stream, Instant::now()) => {
-                receipt
-            }
+            Ok(receipt) if carried(&fx) => receipt,
             Ok(_) => return Ok(Err(Unsent::Codec(NotSentReason::Unencodable))),
             Err(reason) => return Ok(Err(Unsent::Codec(reason))),
         };
-        // Its frames go together or not at all, so the codec's request is either written whole
-        // or reported not sent, charged as `class`.
-        let own = |e: &Effect| frame_of(e, self.stream, true).map(|r| Request { class, ..r });
-        let frames: Vec<_> = fx.as_slice().iter().filter_map(own).collect();
-        if let Err(refused) = self.core.rates.charge(Instant::now(), key, &frames) {
+        // Its frames, or its HTTP request with the connection it opens, go together or not at
+        // all, so the codec's request is either sent whole or reported not sent, charged as
+        // `class` (decision 0081).
+        let own = |e: &Effect| {
+            let requests = frame_of(e, self.stream, true)
+                .map(|f| vec![f])
+                .or_else(|| http_of(e).map(Vec::from));
+            requests.map(|rs| rs.into_iter().map(|r| Request { class, ..r }))
+        };
+        let charged: Vec<_> = fx.as_slice().iter().filter_map(own).flatten().collect();
+        if let Err(refused) = self.core.rates.charge(Instant::now(), key, &charged) {
             return Ok(Err(Unsent::Budget(refused)));
         }
         Ok(Ok((receipt, fx)))
@@ -1171,10 +1212,10 @@ impl<H: ExecHandler> ExecSession<H> {
         let rpc = self.orders.next_rpc();
         let cmd = VenueCommand::ArmCancelOnDisconnect(true);
         // The session's own arm, one per epoch, may use the safety reserve (decision 0073).
-        match self.encode(&cmd, cmd.traffic_class(), rpc, key)? {
+        match self.encode(&cmd, cmd.traffic_class(), false, rpc, key)? {
             Ok((_, fx)) => {
                 self.orders.gate.borrow_mut().arm_sent(key.epoch, rpc);
-                self.execute(ws, fx, true, None).await
+                self.execute_charged(ws, fx).await
             }
             Err(Unsent::Budget(Refused { ready_at: None })) => Err(ExecSessionError::ArmNeverFits),
             Err(unsent) => {
@@ -1288,6 +1329,17 @@ fn budget_class(item: &Submitted) -> TrafficClass {
     }
 }
 
+/// Whether a submitted command may be carried as one HTTP request (FBC-m8vm, decision 0081):
+/// only a read the consumer submits as a control command, an order query or the fee query.
+/// An order-affecting command stays WebSocket-only until FBC-4nfb (0057), and a consumer's
+/// cancel-on-disconnect arm over HTTP would arm another connection than the session's.
+fn over_http(item: &Submitted) -> bool {
+    matches!(
+        item,
+        Submitted::Control(VenueCommand::Query(_) | VenueCommand::FeeQuery)
+    )
+}
+
 /// The context for the codec's `call`: exactly the nonces it asks for, reserved from `nonces`
 /// (none when it asks for none), or why they could not be (0014 item 1), at `at`, a timer
 /// firing's stamp, or else at `clock`'s time once the nonces are reserved, as an encode's is
@@ -1336,25 +1388,38 @@ fn reserve(
 /// Whether `fx`, an encode's effects for request `rpc` of traffic class `class`, may be executed:
 /// they carry the request ([`Effects::carry_request`]), every frame goes to the session's own
 /// stream `own`, and none asks to reconnect, which would leave a frame of the request unwritten
-/// with its outcome unreported (0014 item 3), or is an HTTP request: order entry is
-/// WebSocket-only (0057), since an HTTP request gets no deadline here and its result is dropped
-/// once its epoch ends, so it could never come back `Unknown`. Nor does a frame name a request
-/// whose deadline, its timeout from `now`, is past the end of the clock: that request would
-/// never come back `Unknown` either (PR #87 Reviewer B B9).
+/// with its outcome unreported (0014 item 3). An HTTP request is admitted only when `http`
+/// allows it (an order query or the fee query, decision 0081), and then as the request's only
+/// effect that goes out: one HTTP request and no frame, so the call to `on_http` for it, or its
+/// deadline once its epoch ended, settles the whole request. Otherwise order entry is
+/// WebSocket-only (0057). Nor does a frame or the HTTP request name a request whose deadline,
+/// its timeout from `now`, is past the end of the clock: that request would never come back
+/// `Unknown` (PR #87 Reviewer B B9).
 fn carries(
     fx: &Effects,
     rpc: RpcId,
     class: fbc_core::TrafficClass,
     own: StreamId,
+    http: bool,
     now: Instant,
 ) -> bool {
-    let elsewhere = |effect: &Effect| match effect {
+    let unbounded = |timeout| now.checked_add(timeout).is_none();
+    let refused = |effect: &Effect| match effect {
         Effect::Send { stream, rpc, .. } => {
-            *stream != own || rpc.is_some_and(|call| now.checked_add(call.timeout).is_none())
+            *stream != own || rpc.is_some_and(|call| unbounded(call.timeout))
         }
-        other => matches!(other, Effect::Reconnect { .. } | Effect::Http { .. }),
+        Effect::Http { timeout, .. } => !http || unbounded(*timeout),
+        Effect::Reconnect { .. } => true,
+        Effect::Timer { .. } => false,
     };
-    !fx.as_slice().iter().any(elsewhere) && fx.carry_request(rpc, class)
+    let effects = fx.as_slice();
+    let asks = effects.iter().filter(|e| matches!(e, Effect::Http { .. }));
+    let writes = effects.iter().any(|e| matches!(e, Effect::Send { .. }));
+    let one_way = match asks.count() {
+        0 => true,
+        n => n == 1 && !writes,
+    };
+    one_way && !effects.iter().any(refused) && fx.carry_request(rpc, class)
 }
 
 /// The order-entry session as the core waits to connect: the control's drop, and what still
@@ -1487,9 +1552,17 @@ impl<H: ExecHandler> EpochInputs for Feed<'_, H> {
         }
     }
 
+    /// Hands a current epoch's HTTP result to the codec's `on_http`, inside the venue's decode
+    /// scope. A result of an order-entry request clears its deadline first, whatever the codec
+    /// then pushes: `on_http` reports that request's outcome, `Unknown` included, which answers
+    /// no request, so `on_rpc_timeout` must not report it again (Codex 4212123422 on PR #109,
+    /// decision 0081).
     fn answer(&mut self, epochs: &mut Epochs, stamp: Stamp, done: Answered, fx: &mut Effects) {
         if !self.live() {
             return;
+        }
+        if let Some(rpc) = done.rpc {
+            self.rpcs.answered(rpc);
         }
         let mut sink = Sink {
             handler: &mut *self.handler,
@@ -1515,6 +1588,10 @@ impl<H: ExecHandler> EpochInputs for Feed<'_, H> {
 
     fn sent_rpc(&mut self, call: RpcCall) {
         self.rpcs.sent(call, Instant::now());
+    }
+
+    fn asked_rpc(&mut self, call: RpcCall, epoch: u32) {
+        self.rpcs.asked(call, epoch, Instant::now());
     }
 
     /// A timer's mis-reserved nonces end the session before another effect is executed.
@@ -1652,5 +1729,57 @@ mod tests {
         }
         let epoch = ExecSessionError::from(EpochError::Exhausted { conn: 3 });
         assert_eq!(epoch.to_string(), "connection 3 has no epoch left to open");
+    }
+
+    /// Decision 0081: an encode may carry its request as exactly one HTTP request, with no frame
+    /// beside it and a deadline the clock can hold, and only where the command allows it.
+    #[test]
+    fn an_encode_carries_its_request_as_one_http_request_only_where_allowed() {
+        use fbc_core::{HttpMethod, HttpRequest, HttpTag, OpKind, RateCharge, WireSlice, WireUrl};
+        use std::time::Duration;
+        let (rpc, own, class) = (RpcId(7), StreamId(1), TrafficClass::Safety);
+        let charge = RateCharge::one(OpKind::Query, None);
+        let http = |timeout| Effect::Http {
+            tag: HttpTag(7),
+            req: HttpRequest {
+                method: HttpMethod::Get,
+                url: WireUrl::plain("http://127.0.0.1:9/orders"),
+                headers: Vec::new(),
+                body: WireSlice::plain(Vec::new()),
+            },
+            rpc: Some(rpc),
+            timeout,
+            class,
+            charge,
+        };
+        let frame = Effect::Send {
+            stream: own,
+            frame: WireSlice::plain(b"query".to_vec()),
+            rpc: Some(RpcCall {
+                id: rpc,
+                timeout: Duration::from_secs(5),
+            }),
+            class,
+            charge,
+        };
+        let timer = Effect::Timer {
+            tag: TimerTag(1),
+            after: Duration::from_secs(1),
+        };
+        let fx = |effects: &[Effect]| {
+            let mut fx = Effects::new();
+            effects.iter().cloned().for_each(|e| fx.push(e));
+            fx
+        };
+        let now = Instant::now();
+        let carried =
+            |effects: &[Effect], allowed| carries(&fx(effects), rpc, class, own, allowed, now);
+        let five = Duration::from_secs(5);
+        assert!(carried(&[http(five), timer.clone()], true));
+        assert!(!carried(&[http(five)], false));
+        assert!(!carried(&[http(five), http(five)], true));
+        assert!(!carried(&[frame.clone(), http(five)], true));
+        assert!(!carried(&[http(Duration::MAX)], true));
+        assert!(carried(&[frame, timer], false));
     }
 }

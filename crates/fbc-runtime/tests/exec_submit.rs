@@ -57,7 +57,7 @@ const STRIP: &str = "submit.strip";
 const TIMER: &str = "submit.timer";
 /// A number: the toy's account limit admits this many units a second, not 50.
 const UNITS: &str = "submit.units";
-/// Any value: the codec's encodes carry their request as an HTTP request, not a frame.
+/// Any value: the codec's encodes carry their request as an HTTP request as well as a frame.
 const HTTP: &str = "submit.http";
 /// Any value: the codec's encodes give their request a timeout past the end of the clock.
 const NEVER: &str = "submit.never";
@@ -172,9 +172,9 @@ impl VenueFactory for SubmitToy {
 
 /// The toy's codec, logging each encode and timeout but the session's own arm, which it encodes
 /// as the toy does; with `strip`, an encode's frames name no
-/// request, with `timer`, an encode also sets a timer, with `http`, an encode's frames go as
-/// HTTP requests naming the request instead, and with `never`, an encode's frames give the
-/// request a timeout past the end of the clock.
+/// request, with `timer`, an encode also sets a timer, with `http`, an encode's frames are
+/// followed by HTTP requests naming the request too, and with `never`, an encode's frames give
+/// the request a timeout past the end of the clock.
 struct Logged {
     inner: ToyExec,
     calls: Calls,
@@ -261,6 +261,7 @@ impl ExecCodec for Logged {
         }
         if self.http {
             for effect in fx.take() {
+                fx.push(effect.clone());
                 fx.push(match effect {
                     Effect::Send {
                         frame,
@@ -900,12 +901,14 @@ async fn a_command_whose_effects_do_not_carry_its_request_is_not_sent_with_no_by
     assert!(outcomes(&log).is_empty());
 }
 
-/// A command whose encode carries its request as an HTTP request is `NotSent(Unencodable)`:
-/// order entry is WebSocket-only (decision 0057), since an HTTP request gets no deadline and
-/// its result is dropped once its epoch ends, so it could never come back `Unknown` (PR #87
-/// Reviewer A, Reviewer B B1). Nothing is written or requested, and no `Unknown` follows.
+/// A command whose encode carries its request as a frame and an HTTP request both is
+/// `NotSent(Unencodable)`: an order query may go as one HTTP request (decision 0081), but then
+/// as its only effect that goes out, so one call to `on_http`, or its deadline once its epoch
+/// ended, settles it; a frame beside it would leave two answers to one request. Nothing is
+/// written or requested, and no `Unknown` follows. (HTTP queries: `exec_http_control.rs`.)
 #[tokio::test(start_paused = true)]
-async fn a_command_whose_encode_carries_its_request_over_http_is_not_sent_with_nothing_requested() {
+async fn a_command_whose_encode_mixes_a_frame_and_an_http_request_is_not_sent_with_nothing_requested()
+ {
     let frozen = freeze();
     let mut server = ScriptedWs::start().await;
     let venue = SubmitToy::leak();

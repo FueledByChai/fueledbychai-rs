@@ -548,7 +548,10 @@ pub enum Effect {
     /// [`HttpFailure`] when none came: `timeout`, which every request has, passing without a
     /// response is [`HttpFailure::TimedOut`]. `rpc` names an order-entry request (journal and
     /// rate scope); unlike [`Effect::Send`], its timeout comes back to `on_http`, not
-    /// `on_rpc_timeout`.
+    /// `on_rpc_timeout`, while the connection epoch that asked lasts. Once that epoch has
+    /// ended, its result is dropped and the runtime hands the request to `on_rpc_timeout` at
+    /// its deadline, `timeout` from when it started, unless `on_http` was already called for
+    /// it (decision 0081).
     Http {
         tag: HttpTag,
         req: HttpRequest,
@@ -1040,7 +1043,9 @@ pub trait ExecCodec: Send {
     ) -> Result<(), DecodeError>;
     /// A timer the codec set fired (token refresh, keepalive, dead-man refresh).
     fn on_timer(&mut self, tag: TimerTag, ctx: &EncodeCtx, fx: &mut Effects);
-    /// Request `rpc`, sent as a frame ([`Effect::Send`]), timed out unanswered: report
+    /// Request `rpc`, sent as a frame ([`Effect::Send`]), or asked as an HTTP request
+    /// ([`Effect::Http`]) whose result never reached `on_http` because its connection epoch
+    /// ended first (decision 0081), timed out unanswered: report
     /// `Unknown` for every item still unanswered, and keep every answer already decoded. That is
     /// `Outcome { item: None, Unknown }` when the codec holds no item outcome for `rpc`. For a
     /// batch whose items the venue answers in separate frames, the codec has held the outcomes

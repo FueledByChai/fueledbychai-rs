@@ -822,8 +822,8 @@ fn a_resync_read_that_fails_is_refused_or_does_not_decode_pushes_nothing_and_ask
 #[test]
 fn a_new_connection_drops_the_requests_and_reads_of_the_one_before() {
     // Replies and answers come back only to the epoch that asked (0027): a new connection holds
-    // nothing an earlier one sent, so what the session refused after its encode (a frame for its
-    // rate budget, a read until FBC-m8vm) is held no longer than its connection (Codex
+    // nothing an earlier one sent, so what the session refused after its encode (a frame or a
+    // read for its rate budget) is held no longer than its connection (Codex
     // 4211490398, 4211642782 and 4211822659 on PR #109; the runtime telling the codec is
     // FBC-9r5o).
     let mut codec = authenticated();

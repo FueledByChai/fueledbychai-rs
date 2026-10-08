@@ -27,7 +27,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fbc_core::{
     ConnKey, Effect, Effects, HeaderMark, HttpFailure, HttpResponse, HttpTag, Inbound,
     InboundSpans, Keepalive, KeepaliveKind, KernelRxNs, MonoNs, OpKind, RateCharge, RawFrame,
-    RpcCall, Stamp, StreamId, TimerTag, TrafficClass, Via, WallNs,
+    RpcCall, RpcId, Stamp, StreamId, TimerTag, TrafficClass, Via, WallNs,
 };
 use fbc_journal::{CloseRec, ControlEvent, Opaque, Opcode, Record, RecordRef, ResponseRef};
 use fbc_journal::{WriteRes, WsControl};
@@ -150,6 +150,12 @@ pub(crate) trait EpochInputs {
     fn sent_rpc(&mut self, call: RpcCall) {
         let _ = call;
     }
+    /// An HTTP request of order-entry request `call` for the codec of `epoch` is about to start,
+    /// so the request's deadline runs from now, standing once that epoch has ended (FBC-m8vm,
+    /// decision 0081). Nothing, by default: no market-data request awaits an answer.
+    fn asked_rpc(&mut self, call: RpcCall, epoch: u32) {
+        let _ = (call, epoch);
+    }
     /// Whether an input handed on while a write waited ended the session, so the core executes
     /// none of the rest of the batch. Never, by default.
     fn halted(&self) -> bool {
@@ -213,11 +219,12 @@ pub(crate) struct Core {
 /// An HTTP request in flight.
 pub(crate) type Pending = Pin<Box<dyn Future<Output = Answered>>>;
 
-/// An HTTP request's result, with the epoch and tag of the codec call that asked for it and
-/// the request's traffic class.
+/// An HTTP request's result, with the epoch and tag of the codec call that asked for it, the
+/// order-entry request it carries, if any, and the request's traffic class.
 pub(crate) struct Answered {
     pub(crate) epoch: u32,
     pub(crate) tag: HttpTag,
+    pub(crate) rpc: Option<RpcId>,
     pub(crate) class: TrafficClass,
     pub(crate) result: Result<Response<Bytes>, HttpFailure>,
 }
@@ -646,7 +653,7 @@ impl Core {
                     close(ws, &self.rates, key);
                     open = false;
                 }
-                (ask @ Effect::Http { .. }, _) => self.ask(epoch, ask, charged),
+                (ask @ Effect::Http { .. }, _) => self.ask(inputs, epoch, ask, charged),
                 (Effect::Send { .. } | Effect::Reconnect { .. }, _) => {
                     self.counters.refused_effects += 1;
                 }
@@ -724,7 +731,9 @@ impl Core {
                 for effect in more.take() {
                     ends |= ends_epoch(&effect, own);
                     match effect {
-                        ask @ Effect::Http { .. } if !ends => self.ask(epoch, ask, false),
+                        ask @ Effect::Http { .. } if !ends => {
+                            self.ask(inputs, epoch, ask, false);
+                        }
                         other => effects.push_back((other, false, Some(stamp))),
                     }
                 }
@@ -734,11 +743,24 @@ impl Core {
 
     /// Starts the HTTP request `ask` for the codec of `epoch` ([`start_http`]), journaled as it
     /// starts, under its class and the epoch that asked; `charged` when it and the connection it
-    /// opens were charged already.
-    fn ask(&mut self, epoch: u32, ask: Effect, charged: bool) {
+    /// opens were charged already. One that carries an order-entry request tells `inputs`, so
+    /// the request's deadline runs from now ([`EpochInputs::asked_rpc`]).
+    fn ask(&mut self, inputs: &mut dyn EpochInputs, epoch: u32, ask: Effect, charged: bool) {
         // The timeout runs from the ask, so journaling the request counts against it (Codex
         // r4178197281).
         let now = Instant::now();
+        if let Effect::Http {
+            rpc: Some(id),
+            timeout,
+            ..
+        } = &ask
+        {
+            let call = RpcCall {
+                id: *id,
+                timeout: *timeout,
+            };
+            inputs.asked_rpc(call, epoch);
+        }
         let key = ConnKey {
             epoch,
             ..self.current()
@@ -997,6 +1019,7 @@ fn start_http(
     let Effect::Http {
         tag,
         req,
+        rpc,
         timeout,
         class,
         ..
@@ -1033,6 +1056,7 @@ fn start_http(
         Answered {
             epoch,
             tag,
+            rpc,
             class,
             result,
         }
@@ -1245,10 +1269,13 @@ mod tests {
             .await;
         assert_eq!((open, core.next_deadline().is_some()), (Ok(true), true));
         // No market-data request awaits an answer: a frame of one is nothing to the inputs.
-        Nothing(false).sent_rpc(fbc_core::RpcCall {
+        let call = fbc_core::RpcCall {
             id: fbc_core::RpcId(1),
             timeout: Duration::ZERO,
-        });
+        };
+        Nothing(false).sent_rpc(call);
+        // Nor is one asked as an HTTP request.
+        Nothing(false).asked_rpc(call, 0);
         let fired = core.fire(&mut None, &mut Nothing(false)).await;
         assert_eq!((fired, core.next_deadline()), (Ok(true), None));
         let mut fx = Effects::new();

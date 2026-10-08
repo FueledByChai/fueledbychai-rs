@@ -83,3 +83,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0078](0078-an-order-entry-session-journals-what-it-receives-under-safet.md) An order-entry session journals what it receives under Safety, and each nonce it reserves and context it gives where the call takes it — accepted
 - [0079](0079-the-log-facade-s-trace-level-is-compiled-out-of-every-build-.md) The log facade's TRACE level is compiled out of every build that links fbc-runtime, since tungstenite logs each frame at TRACE — accepted
 - [0080](0080-an-order-resting-from-an-earlier-epoch-holds-its-market-unti.md) An order resting from an earlier epoch holds its market until the venue shows it ended, unless the venue declares that an arm covers open orders, augmenting 0058 — accepted
+- [0081](0081-an-order-query-or-fee-query-may-go-as-one-http-request-its-d.md) An order query or fee query may go as one HTTP request, its deadline standing once its epoch ends, amending 0057 — accepted
