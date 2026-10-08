@@ -68,9 +68,17 @@ enum Twist {
     WholeAcceptance,
     /// Every acceptance a timed-out request reports is provisional.
     ProvisionalOnTimeout,
-    /// Every acceptance a frame brings (the arm's, the placement's, the amend's) is reported
+    /// Every acceptance a frame brings naming no venue id (the arm's, the amend's) is reported
     /// twice.
     DoubledAck,
+    /// A placement's acceptance, naming its venue id, is reported twice.
+    DoubledPlacementAck,
+    /// A placement's acceptance is provisional, on a venue declaring single-phase acceptances.
+    ProvisionalPlacement,
+    /// An amended order's update is followed by a refusal of the amend naming the order.
+    RefusesAmendToo,
+    /// An amended order's update is preceded by an update reporting the order canceled.
+    CancelsOnAmend,
     /// An amended order's update states a price one tick above the amend's.
     WrongPx,
     /// A frame `early` reports the last request it wrote timed out, at once, long before its
@@ -167,6 +175,22 @@ static TWO_PHASE: Variant = Variant {
 static DOUBLED_AMEND_ACK: Variant = Variant {
     caps: |_| {},
     twist: Twist::DoubledAck,
+};
+static DOUBLED_PLACEMENT_ACK: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::DoubledPlacementAck,
+};
+static PROVISIONAL_PLACEMENT: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::ProvisionalPlacement,
+};
+static REFUSES_AMEND_TOO: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::RefusesAmendToo,
+};
+static CANCELS_ON_AMEND: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::CancelsOnAmend,
 };
 static WRONG_PX: Variant = Variant {
     caps: |_| {},
@@ -521,20 +545,82 @@ fn provisional(ev: ExecEvent) -> Vec<ExecEvent> {
     }]
 }
 
-/// Every acceptance a frame brings, twice.
+/// Whether `ev` is an acceptance whose item names a venue id (`named`) or none (`!named`): the
+/// toy's placement acceptance names one, its amend's and its arm's none.
+fn acceptance(ev: &ExecEvent, named: bool) -> bool {
+    let ExecEvent::Outcome {
+        item,
+        outcome: SubmitOutcome::Accepted { .. },
+        ..
+    } = ev
+    else {
+        return false;
+    };
+    item.as_ref().is_some_and(|it| it.vid.is_some()) == named
+}
+
+/// Every acceptance a frame brings naming no venue id, twice.
 fn doubled_ack(ev: ExecEvent) -> Vec<ExecEvent> {
-    let accepted = matches!(
-        &ev,
-        ExecEvent::Outcome {
-            outcome: SubmitOutcome::Accepted { .. },
-            ..
-        }
-    );
-    if accepted {
+    if acceptance(&ev, false) {
         vec![ev.clone(), ev]
     } else {
         vec![ev]
     }
+}
+
+/// A placement's acceptance, naming its venue id, twice.
+fn doubled_placement_ack(ev: ExecEvent) -> Vec<ExecEvent> {
+    if acceptance(&ev, true) {
+        vec![ev.clone(), ev]
+    } else {
+        vec![ev]
+    }
+}
+
+/// A placement's acceptance, naming its venue id, provisional.
+fn provisional_placement(ev: ExecEvent) -> Vec<ExecEvent> {
+    if acceptance(&ev, true) {
+        provisional(ev)
+    } else {
+        vec![ev]
+    }
+}
+
+/// An amended order's update, then a refusal of the amend naming the order by both its ids.
+fn refuses_amend_too(ev: ExecEvent) -> Vec<ExecEvent> {
+    let ExecEvent::Order(u) = &ev else {
+        return vec![ev];
+    };
+    let (VenueOrderState::Amended { .. }, Some(fbc_core::CidMatch::Ours(cid)), Some(vid)) =
+        (&u.state, u.cid, u.vid.clone())
+    else {
+        return vec![ev];
+    };
+    let reject = fbc_core::Reject {
+        kind: fbc_core::RejectKind::InvalidPrice,
+        venue_code: None,
+        raw: "refused".into(),
+    };
+    let refusal = ExecEvent::AsyncReject {
+        target: fbc_core::OrderRef::Both(cid, vid),
+        op: OpKind::Amend,
+        reject,
+    };
+    vec![ev, refusal]
+}
+
+/// An amended order's update, after an update reporting the order canceled under the venue id
+/// it was placed under.
+fn cancels_on_amend(ev: ExecEvent) -> Vec<ExecEvent> {
+    let ExecEvent::Order(u) = &ev else {
+        return vec![ev];
+    };
+    if !matches!(u.state, VenueOrderState::Amended { .. }) {
+        return vec![ev];
+    }
+    let mut canceled = u.clone();
+    canceled.state = VenueOrderState::Canceled(fbc_core::CancelReason::Requested);
+    vec![ExecEvent::Order(canceled), ev]
 }
 
 /// An amended order's update a tick above its price.
@@ -809,6 +895,10 @@ impl ExecCodec for Twisted {
             Twist::EarlyAmended => early_amended,
             Twist::WholeAcceptance => whole_acceptance,
             Twist::DoubledAck => doubled_ack,
+            Twist::DoubledPlacementAck => doubled_placement_ack,
+            Twist::ProvisionalPlacement => provisional_placement,
+            Twist::RefusesAmendToo => refuses_amend_too,
+            Twist::CancelsOnAmend => cancels_on_amend,
             Twist::WrongPx => wrong_px,
             _ => kept,
         };
@@ -1581,6 +1671,44 @@ fn amend_ack_fails_a_toy_declaring_its_amend_keeps_the_venue_id_that_names_a_new
             "AmendCaps.keeps_venue_id is true",
             "names a new venue id"
         ),
+        "{failure}"
+    );
+}
+
+#[test]
+fn amend_ack_fails_a_toy_whose_placement_acceptance_comes_twice_or_provisional_on_a_single_phase_venue()
+ {
+    for variant in [&DOUBLED_PLACEMENT_ACK, &PROVISIONAL_PLACEMENT] {
+        let failure = failed(suite::amend_ack(&variant.subject(assumed)));
+        assert!(
+            says(
+                &failure,
+                "ExecCodec::on_frame",
+                "the placement the stub accepted was reported"
+            ),
+            "{failure}"
+        );
+    }
+}
+
+#[test]
+fn amend_ack_fails_a_toy_that_reports_the_amend_it_reports_amended_refused_too() {
+    let failure = failed(suite::amend_ack(&REFUSES_AMEND_TOO.subject(assumed)));
+    assert!(
+        says(
+            &failure,
+            "ExecEvent::AsyncReject",
+            "the amend the stub accepted"
+        ),
+        "{failure}"
+    );
+}
+
+#[test]
+fn amend_ack_fails_a_toy_that_reports_the_amended_order_canceled() {
+    let failure = failed(suite::amend_ack(&CANCELS_ON_AMEND.subject(assumed)));
+    assert!(
+        says(&failure, "OrderUpdate", "ended the order"),
         "{failure}"
     );
 }
