@@ -16,11 +16,13 @@
 //! A case with no event of its kind fails (a pass that judged nothing would prove nothing), and
 //! so does a frame the codec refuses, a case file the check does not read, and a missing
 //! subdirectory or case. Each is skipped only for a venue whose caps declare no order entry (it
-//! has no fills and no positions); `liquidity_reported` also for a venue whose caps declare its
-//! fills carry no liquidity flag (`FillCaps.liquidity_flag` false: each reports
-//! [`Liquidity3::Unknown`]).
+//! has no fills and no positions); `fee_sign` and `liquidity_reported` also for a venue whose
+//! fills are derived from its order updates (`FillCaps.source` is
+//! [`FillSource::DerivedFromOrderStatus`]: its codec decodes no fill event), and
+//! `liquidity_reported` for one whose caps declare its fills carry no liquidity flag
+//! (`FillCaps.liquidity_flag` false: each reports [`Liquidity3::Unknown`]).
 
-use fbc_core::{ExecEvent, FillEvent, Liquidity3, SignedLots};
+use fbc_core::{ExecEvent, FillEvent, FillSource, Liquidity3, SignedLots, VenueCaps};
 
 use super::frames::{Cases, Expect};
 use super::harness::Harness;
@@ -30,15 +32,27 @@ use super::{Failure, Subject, Verdict};
 const NO_EXEC: &str =
     "the caps declare no order entry (VenueCaps.exec is None): no fill or position is decoded";
 
+/// Why a check judging fill events is skipped for a venue whose fills are derived from its
+/// order updates (Codex r4216777891).
+const DERIVED: &str = "the caps declare fills derived from order updates \
+                       (FillCaps.source is DerivedFromOrderStatus): the codec decodes no fill event";
+
+/// Why a check judging fill events has nothing to judge on a venue declaring `caps`, if it has
+/// not: no order entry, or fills derived from order updates rather than decoded.
+fn no_fill_events(caps: &VenueCaps) -> Option<&'static str> {
+    match &caps.exec {
+        None => Some(NO_EXEC),
+        Some(exec) if exec.fills.source == FillSource::DerivedFromOrderStatus => Some(DERIVED),
+        Some(_) => None,
+    }
+}
+
 /// Runs `fee_sign` against `subject`.
 pub fn fee_sign(subject: &Subject<'_>) -> Result<Verdict, Failure> {
     const CHECK: &str = "fee_sign";
     let h = Harness::new(CHECK, subject)?;
-    if h.caps.exec.is_none() {
-        return Ok(Verdict::Skipped {
-            check: CHECK,
-            why: NO_EXEC,
-        });
+    if let Some(why) = no_fill_events(&h.caps) {
+        return Ok(Verdict::Skipped { check: CHECK, why });
     }
     let cases = Cases {
         check: CHECK,
@@ -62,13 +76,14 @@ pub fn fee_sign(subject: &Subject<'_>) -> Result<Verdict, Failure> {
 pub fn liquidity_reported(subject: &Subject<'_>) -> Result<Verdict, Failure> {
     const CHECK: &str = "liquidity_reported";
     let h = Harness::new(CHECK, subject)?;
-    let Some(exec) = &h.caps.exec else {
-        return Ok(Verdict::Skipped {
-            check: CHECK,
-            why: NO_EXEC,
-        });
-    };
-    if !exec.fills.liquidity_flag {
+    if let Some(why) = no_fill_events(&h.caps) {
+        return Ok(Verdict::Skipped { check: CHECK, why });
+    }
+    if h.caps
+        .exec
+        .as_ref()
+        .is_some_and(|e| !e.fills.liquidity_flag)
+    {
         return Ok(Verdict::Skipped {
             check: CHECK,
             why: "the caps declare fills carry no liquidity (FillCaps.liquidity_flag is false)",

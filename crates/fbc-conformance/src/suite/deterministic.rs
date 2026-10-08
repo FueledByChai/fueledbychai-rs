@@ -7,8 +7,9 @@
 //! updates, rejects, anything the venue decodes) is handed, line by line, to two order-entry
 //! codecs built fresh from the factory. For every line both runs must give the same result, push
 //! the same events with the same [`VenueMeta`](fbc_core::VenueMeta) and ask for the same
-//! effects; a frame refused is no breach, as long as both runs refuse it alike. A breach names
-//! the case and line and which of the three differs, never the frame's bytes.
+//! effects; a frame refused is no breach, as long as both runs refuse it alike. Each line that
+//! differs is a breach naming the case and line and which of the three differs, never the
+//! frame's bytes; a case that hands the codec nothing (comments alone) is a breach too.
 //!
 //! Any of the four subdirectories may be absent, but together they must hold a case: a pass
 //! that decoded nothing would prove nothing. Skipped for a venue whose caps declare no order
@@ -58,18 +59,26 @@ pub fn decoder_deterministic(subject: &Subject<'_>) -> Result<Verdict, Failure> 
                     continue;
                 }
             };
+            if case.is_empty() {
+                // Codex r4216777870: a case of comments alone decodes nothing.
+                let what = "hands the codec nothing: a case that decodes nothing proves nothing";
+                breaches.push(Breach::new(&file, what));
+                continue;
+            }
             let (first, second) = (frames::decode(&h, &case)?, frames::decode(&h, &case)?);
-            match first.iter().zip(&second).find(|(a, b)| a != b) {
-                None if case.len() == 1 => probed.push(format!("{file}: 1 line")),
-                None => probed.push(format!("{file}: {} lines", case.len())),
-                Some((a, b)) => breaches.push(Breach::new(
-                    a.call,
-                    format!(
-                        "{file} line {} decoded differently on two runs: {}",
-                        a.line,
-                        differs(a, b)
-                    ),
-                )),
+            // Every line that differs, not the first alone (Codex r4216777885).
+            let before = breaches.len();
+            for (a, b) in first.iter().zip(&second).filter(|(a, b)| a != b) {
+                let what = format!(
+                    "{file} line {} decoded differently on two runs: {}",
+                    a.line,
+                    differs(a, b)
+                );
+                breaches.push(Breach::new(a.call, what));
+            }
+            if breaches.len() == before {
+                let lines = if case.len() == 1 { "line" } else { "lines" };
+                probed.push(format!("{file}: {} {lines}", case.len()));
             }
         }
     }
