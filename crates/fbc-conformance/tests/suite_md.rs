@@ -21,8 +21,9 @@ use fbc_core::{
     DecodeError, DecodeScope, Effect, Effects, Encoding, EndpointPlan, ExchNs, ExecCodec,
     ExecEndpoint, Feed, FeedHealth, FieldSpec, HttpFailure, HttpPlan, HttpResponse, HttpTag,
     Inbound, InboundSpans, InstrumentId, InstrumentSpecDraft, Keepalive, Lots, MdCodec, MdEvent,
-    MdSink, MonoNs, RawFrame, Secrets, SpecTable, Subscription, SymbolError, TagSet, Ticks,
-    TimerTag, VenueCaps, VenueConfig, VenueError, VenueFactory, VenueMeta, WallNs, WireSlice,
+    MdSink, MonoNs, OpKind, RateCharge, RawFrame, Secrets, SpecTable, StreamId, Subscription,
+    SymbolError, TagSet, Ticks, TimerTag, TrafficClass, VenueCaps, VenueConfig, VenueError,
+    VenueFactory, VenueMeta, WallNs, WireSlice,
 };
 use toy_setup::{FIXTURES, assumed};
 
@@ -59,6 +60,14 @@ enum Twist {
     /// It keeps a broken book live: each gap it reports on a book is preceded by a level of
     /// that book, and every later frame pushes one too until the book's next snapshot begins.
     KeepsApplying,
+    /// Each gap it reports on a book is followed by `Live` on that book, and so is each
+    /// snapshot's begin: it tells the consumer to trust a book still broken.
+    LiveTooSoon,
+    /// Each gap it reports on a book is put on the anchored book instead.
+    GapOtherBook,
+    /// Opening, it sends the subscribe frame for the toy's two instruments on `book`, which
+    /// its subscribe then sends again.
+    OpensWithSubscribe,
     /// It reads a binary frame's bytes as the toy's text.
     BinaryText,
     /// Each codec its factory builds after the first also asks for a timer when it opens.
@@ -273,6 +282,14 @@ impl MdSink for Rewrite<'_> {
                 },
             ) => *inst = if *inst == INST_A { INST_B } else { INST_A },
             (
+                Twist::GapOtherBook,
+                MdEvent::Health {
+                    feed,
+                    h: FeedHealth::Gap,
+                    ..
+                },
+            ) => *feed = Feed::Book(ANCHORED_BOOK),
+            (
                 Twist::OtherBook,
                 MdEvent::Level { book, .. }
                 | MdEvent::BookSnapshotBegin { book, .. }
@@ -281,6 +298,20 @@ impl MdSink for Rewrite<'_> {
             _ => {}
         }
         self.sink.push(meta, ev);
+        if let (
+            Twist::LiveTooSoon,
+            MdEvent::Health {
+                inst,
+                feed: Feed::Book(book),
+                h: FeedHealth::Gap,
+            }
+            | MdEvent::BookSnapshotBegin { inst, book, .. },
+        ) = (self.twist, ev)
+        {
+            let feed = Feed::Book(book);
+            let h = FeedHealth::Live;
+            self.sink.push(meta, MdEvent::Health { inst, feed, h });
+        }
         if let (
             Twist::GapsTradesToo,
             MdEvent::Health {
@@ -299,6 +330,15 @@ impl MdSink for Rewrite<'_> {
 
 impl MdCodec for Twisted {
     fn on_open(&mut self, fx: &mut Effects) {
+        if self.twist == Twist::OpensWithSubscribe {
+            fx.push(Effect::Send {
+                stream: StreamId(0),
+                frame: WireSlice::plain(b"sub|add=TOYA-PERP@0,TOYB-PERP@0".to_vec()),
+                rpc: None,
+                class: TrafficClass::Normal,
+                charge: RateCharge::one(OpKind::Subscribe, None),
+            });
+        }
         if self.twist == Twist::OpenDrifts && self.built > 0 {
             let tag = TimerTag(self.built);
             let after = core::time::Duration::from_secs(1);
@@ -733,6 +773,94 @@ fn continuity_fails_a_toy_that_keeps_a_broken_book_live_until_its_snapshot() {
 }
 
 #[test]
+fn continuity_fails_a_toy_that_reports_a_broken_book_live_before_its_snapshot_ends() {
+    // Codex r4218492690: Live says no gap since the last snapshot, so a broken book is Live only
+    // once its next snapshot is complete.
+    let failure = failed(Variant::twisted(Twist::LiveTooSoon).run(suite::continuity));
+    let live = |line: u32, sym: &str| {
+        format!(
+            "continuity/book.frames line {line} reports {sym}'s book Live while its sequence is \
+             broken: it is Live again only once its next snapshot ends"
+        )
+    };
+    assert_eq!(
+        said(&failure, PLUS_ONE),
+        [
+            live(10, "TOYA-PERP"),
+            live(13, "TOYA-PERP"),
+            live(16, "TOYA-PERP"),
+            live(17, "TOYB-PERP"),
+        ]
+    );
+}
+
+#[test]
+fn book_channels_fails_a_toy_that_reports_a_books_health_on_another_book() {
+    // Codex r4218492678: a book's health is routed by its book too.
+    let scratch = Scratch::toy("gap-other-book");
+    scratch.write(
+        "book_channels/book.frames",
+        "public text snap|sym=TOYA-PERP|book=0|seq=10|bid=100:3|ask=101:2\n\
+         text delta|sym=TOYA-PERP|book=0|seq=12|bid=100:4|ask=\n",
+    );
+    probed(scratch.run(suite::book_channels));
+    let failure =
+        failed(Variant::twisted(Twist::GapOtherBook).run_in(suite::book_channels, &scratch.0));
+    assert_eq!(
+        said(&failure, "BookCaps.channel"),
+        ["book_channels/book.frames line 2, a frame of book (book 0), decoded onto book 1"]
+    );
+}
+
+#[test]
+fn subscriptions_idempotent_fails_a_codec_that_sends_its_subscribe_opening_and_subscribing() {
+    // Codex r4218492650: within one epoch, opening and subscribing send a frame once.
+    let failure =
+        failed(Variant::twisted(Twist::OpensWithSubscribe).run(suite::subscriptions_idempotent));
+    assert_eq!(
+        said(&failure, "MdCodec::subscribe"),
+        [
+            "book: epoch 0 sends the same frame twice, opening and subscribing",
+            "book: epoch 1 sends the same frame twice, opening and subscribing",
+        ]
+    );
+}
+
+#[test]
+fn continuity_reads_the_longer_blocks_of_a_binary_venues_unchained_books() {
+    // Codex r4218492670: the longer-block sub-case is no sequence's, so an unchained book of a
+    // binary venue has one too.
+    let unsequenced = || Variant {
+        caps: |caps| {
+            caps.md.encoding = Encoding::Sbe;
+            caps.md.books[0].continuity = Continuity::Unsequenced;
+        },
+        ..Variant::twisted(Twist::BinaryText)
+    };
+    let scratch = Scratch::empty("unchained-longer");
+    let file = "continuity/longer_block/book.frames";
+    let snap = "snap|sym=TOYA-PERP|book=0|seq=10|bid=100:3|ask=101:2";
+    scratch.write(file, &hex(snap));
+    let read = probed(unsequenced().run_in(suite::continuity, &scratch.0));
+    assert_eq!(
+        read,
+        [
+            "book: skipped: BookCaps.continuity is Unsequenced: nothing chains its frames",
+            "rpi_book: skipped: BookCaps.rest_anchor is true: its snapshot comes in an HTTP \
+             answer, which the suite does not carry yet (FBC-fhk4)",
+            "continuity/longer_block/book.frames: 1 frames, 0 breaking the sequence",
+        ]
+    );
+    // A breach in it is reported, not discarded.
+    scratch.write(file, &format!("text {snap}\n"));
+    let failure = failed(unsequenced().run_in(suite::continuity, &scratch.0));
+    assert_eq!(
+        said(&failure, file),
+        ["line 1 is a text frame: a longer block is binary"]
+    );
+}
+
+#[test]
 fn the_checks_drive_one_connection_as_the_topology_allows() {
     // Codex r4217682420: a venue with a connection per instrument is subscribed one instrument
     // per codec, and its cases name that instrument only.
@@ -842,9 +970,14 @@ fn subscriptions_idempotent_fails_a_codec_whose_reconnect_sends_other_subscripti
 #[test]
 fn subscriptions_idempotent_fails_a_codec_that_sends_the_last_connections_subscriptions_again() {
     let failure = failed(Variant::twisted(Twist::PilesUp).run(suite::subscriptions_idempotent));
+    // Its reconnect differs from the first epoch, and sends its frame twice within the epoch
+    // (Codex r4218492650).
     assert_eq!(
         said(&failure, "MdCodec::subscribe"),
-        ["book: the reconnect's subscribe asked for other effects than the first epoch's"]
+        [
+            "book: the reconnect's subscribe asked for other effects than the first epoch's",
+            "book: epoch 1 sends the same frame twice, opening and subscribing",
+        ]
     );
 }
 

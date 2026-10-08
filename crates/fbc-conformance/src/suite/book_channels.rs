@@ -11,12 +11,13 @@
 //! - every channel a frame shows is one the book declares;
 //! - every channel the book declares is shown by some frame of the case;
 //! - every frame that pushes a level states its channels, and only such a frame states any;
-//! - every book event a frame pushes (snapshot, level, window) is on the channel's own
-//!   [`BookId`](fbc_core::BookId).
+//! - every book event a frame pushes (snapshot, level, window, and the book's health) is on the
+//!   channel's own [`BookId`](fbc_core::BookId): the runtime routes each by its book (Codex
+//!   r4218492678).
 
 use std::collections::BTreeSet;
 
-use fbc_core::{BookId, Channel, MdEvent};
+use fbc_core::{BookId, Channel, Feed, MdEvent};
 
 use super::book_cases::{self, NO_BOOK, PerBook};
 use super::harness::Harness;
@@ -92,7 +93,11 @@ fn book_of(ev: &MdEvent) -> Option<(BookId, bool)> {
         MdEvent::Level { book, .. } => Some((*book, true)),
         MdEvent::BookSnapshotBegin { book, .. }
         | MdEvent::BookSnapshotEnd { book, .. }
-        | MdEvent::Window { book, .. } => Some((*book, false)),
+        | MdEvent::Window { book, .. }
+        | MdEvent::Health {
+            feed: Feed::Book(book),
+            ..
+        } => Some((*book, false)),
         _ => None,
     }
 }
