@@ -35,7 +35,7 @@
 //! **The journal (FBC-2pr, decisions 0006, 0078).** With a [`Journal`] set
 //! ([`ExecSession::set_journal`]), the session records what crosses its boundary as a market-data
 //! session does: each epoch's opening and closing, every frame and HTTP result it receives at its
-//! stamp (a stale one too, hashed whole once the codec has opened a later epoch) with the
+//! stamp (a stale one too, hashed whole once the codec was called again after its epoch) with the
 //! credentials the codec names in it as keyed hashes (0028), every ping, pong and close frame it
 //! receives (0041), every frame it writes with its kind and redaction spans and the result of the
 //! write (none for a write that failed, stalled or was interrupted, whose outcome is unknown,
@@ -621,8 +621,15 @@ impl<H: ExecHandler> ExecSession<H> {
                 handler: &mut self.handler,
                 clock: &self.clock,
                 key: self.core.current(),
+                touched: false,
             };
-            let Some(ws) = self.core.connect(&self.url, &mut ctl).await? else {
+            let opened = self.core.connect(&self.url, &mut ctl).await;
+            // A codec a deadline reached since its epoch ended no longer vouches for that
+            // epoch's results (Codex P1 r4214784284 on PR #115).
+            if ctl.touched {
+                self.core.codec_epoch = None;
+            }
+            let Some(ws) = opened? else {
                 return Ok(());
             };
             let key = self.current();
@@ -1336,6 +1343,9 @@ struct Between<'a, H> {
     handler: &'a mut H,
     clock: &'a IngestClock,
     key: ConnKey,
+    /// Whether a deadline has reached the codec's `on_rpc_timeout` meanwhile, which may change
+    /// the state its redaction reads.
+    touched: bool,
 }
 
 impl<H> Between<'_, H> {
@@ -1346,9 +1356,9 @@ impl<H> Between<'_, H> {
 
 impl<H: ExecHandler> Control for Between<'_, H> {
     /// The session's one codec names the credentials in an ended epoch's result too, until it
-    /// opens a later epoch (`Core::codec_epoch`).
+    /// is called again: for a deadline here, or to open a later epoch (`Core::codec_epoch`).
     fn redacts(&self) -> bool {
-        true
+        !self.touched
     }
 
     fn spans(&self, input: Inbound<'_>) -> InboundSpans {
@@ -1389,6 +1399,7 @@ impl<H: ExecHandler> Control for Between<'_, H> {
                 stop: &self.stop,
                 stamp,
             };
+            self.touched = true;
             self.codec.on_rpc_timeout(rpc, &mut sink);
         }
     }

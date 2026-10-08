@@ -220,9 +220,10 @@ pub(crate) struct Core {
     /// 0078).
     pub(crate) inbound: TrafficClass,
     /// When one codec serves every epoch (an order-entry session's, 0053), the epoch whose
-    /// `on_open` it was last called for: an ended epoch's HTTP result is journaled with the
-    /// spans that codec names only while it is that epoch's, since the codec's state may change
-    /// as it opens the next (Codex P2 r4214053451, P1 r4214607580 on PR #115). `None` when the
+    /// `on_open` it was last called for, until a deadline reaches it after that epoch ended: an
+    /// ended epoch's HTTP result is journaled with the spans that codec names only while it is
+    /// that epoch's, since the codec's state may change as it opens the next or times a request
+    /// out (Codex P2 r4214053451, P1 r4214607580, P1 r4214784284 on PR #115). `None` when the
     /// codec ends with its epoch (a market-data session's).
     pub(crate) codec_epoch: Option<u32>,
 }
