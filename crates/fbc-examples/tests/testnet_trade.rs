@@ -381,8 +381,27 @@ fn responder_full(
     extra: Arc<Vec<Vec<u8>>>,
     arm_extra: Arc<Vec<Vec<u8>>>,
 ) -> Responder {
+    Responder::new(respond_full(
+        placed,
+        restored,
+        placed_end,
+        restored_end,
+        extra,
+        arm_extra,
+    ))
+}
+
+/// [`responder_full`]'s answers, for a test that wraps them.
+fn respond_full(
+    placed: Arc<Mutex<Placed>>,
+    restored: Arc<Vec<Restored>>,
+    placed_end: End,
+    restored_end: End,
+    extra: Arc<Vec<Vec<u8>>>,
+    arm_extra: Arc<Vec<Vec<u8>>>,
+) -> impl Fn(&Frame) -> Result<Vec<Frame>, String> + Send + Sync + 'static {
     let close = !matches!(restored_end, End::Refused);
-    Responder::new(move |frame| {
+    move |frame| {
         let Frame::Text(text) = frame else {
             return Err("a binary frame from the client".to_owned());
         };
@@ -489,7 +508,7 @@ fn responder_full(
             }
             other => Err(format!("an unexpected method {other}")),
         }
-    })
+    }
 }
 
 /// Two open orders of ours an earlier run left on the market, their client ids minted in our
@@ -725,7 +744,14 @@ async fn an_unanswered_auth_frame_times_out_the_login_and_stops_with_nothing_pla
     assert_eq!(steps(&printed), ["stop"], "{printed}");
     assert!(printed.contains("cancel all: 0 cancels sent"), "{printed}");
     assert!(printed.contains("DONE failed"), "{printed}");
-    assert_eq!(methods(&stub), ["auth"]);
+    // Reviewer B's RB114-16: whether the auth frame went out before the one-second step
+    // timeout depends on the machine's load (the HTTP login and the connect come first), so
+    // the test holds either way: nothing but the auth frame was sent, never more than once.
+    let sent = methods(&stub);
+    assert!(
+        sent.len() <= 1 && sent.iter().all(|m| m == "auth"),
+        "{sent:?}"
+    );
 }
 
 #[tokio::test]
@@ -2103,7 +2129,7 @@ fn a_timed_out_write_keeps_what_it_holds_until_it_ends() {
         lease,
         move || held.recv().is_ok(),
     ));
-    assert_eq!(got, None);
+    assert!(got.is_none());
     // Timed out, but the write still runs: the namespace is still leased.
     assert!(NamespaceLease::acquire(&dir, acct, ns).is_err());
     release.send(()).unwrap();
@@ -2119,16 +2145,19 @@ fn a_timed_out_write_keeps_what_it_holds_until_it_ends() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-    // Work that ends in time hands back its result, and what it held is released.
+    // Work that ends in time hands back its result and what it held (RB114-7: the caller
+    // keeps the lease for the rest of its run); dropping that releases it.
     let lease = NamespaceLease::acquire(&dir, acct, ns).unwrap();
-    assert_eq!(
-        runtime.block_on(trade::off_thread_holding(
+    let (got, kept) = runtime
+        .block_on(trade::off_thread_holding(
             Duration::from_secs(10),
             lease,
-            || 7
-        )),
-        Some(7)
-    );
+            || 7,
+        ))
+        .expect("in time");
+    assert_eq!(got, 7);
+    assert!(NamespaceLease::acquire(&dir, acct, ns).is_err());
+    drop(kept);
     assert!(NamespaceLease::acquire(&dir, acct, ns).is_ok());
 }
 
@@ -2526,8 +2555,18 @@ async fn the_testnet_line_names_the_hosts_never_the_urls() {
     let stub = StubServer::start(WsScript::new(vec![]), routes())
         .await
         .unwrap();
+    // A path other than /v1 is refused before anything is printed or connects (Codex
+    // r4217231772): no token in a path is ever sent or shown.
     let mut opts = options(&stub, "100");
     opts.ws_url = stub.ws_url("/v1/SYNTHETIC-path-token-hunter2");
+    let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let out: trade::Out = buf.clone();
+    let refused = trade::run(&opts, None, secrets(), out).await.unwrap_err();
+    assert!(refused.starts_with("--ws-url"), "{refused}");
+    assert!(!refused.contains("hunter2"), "{refused}");
+    assert!(buf.borrow().is_empty());
+    assert!(stub.http_requests().is_empty());
+    let opts = options(&stub, "100");
     let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
     let out: trade::Out = buf.clone();
     // Refused before the session connects (below the minimum notional), after the line.
@@ -2587,6 +2626,38 @@ fn a_refused_chain_id_or_argument_is_never_echoed() {
             .unwrap_err()
             .starts_with("unknown argument --no-such-flag")
     );
+    // Reviewer B's RB114-15: a flag typed with its value after '=' is named by the flag part
+    // only; an argument that starts with '-' but is not shaped like a flag by its position.
+    for (typed, flag) in [
+        (
+            "--socks5=SYNTHETIC-user:hunter2@proxy.example:1080",
+            "--socks5",
+        ),
+        (
+            "--private-key=0xSYNTHETIC-pasted-secret-hunter2",
+            "--private-key",
+        ),
+        (
+            "--rest-url=https://api.testnet.paradex.trade/hunter2",
+            "--rest-url",
+        ),
+    ] {
+        let mut argv = strings(&MARKET_ARGS);
+        argv.push(typed.to_owned());
+        let err = args::parse(argv).unwrap_err();
+        assert!(
+            err.starts_with(&format!("unknown argument {flag} ")),
+            "{typed}: {err}"
+        );
+        assert!(!err.contains("hunter2"), "{typed}: {err}");
+    }
+    for typed in ["-0xSYNTHETIC-hunter2", "--SYNTHETIC0hunter2", "--x/hunter2"] {
+        let mut argv = strings(&MARKET_ARGS);
+        argv.push(typed.to_owned());
+        let err = args::parse(argv).unwrap_err();
+        assert!(err.starts_with("argument 22"), "{typed}: {err}");
+        assert!(!err.contains("hunter2"), "{typed}: {err}");
+    }
 }
 
 #[test]
@@ -2594,7 +2665,15 @@ fn a_market_not_shaped_like_a_paradex_market_is_refused_before_any_request() {
     // Codex r4216890750: a private key pasted as --market would be sent in GET /orderbook's
     // path; only Paradex's shape (upper-case letters and digits in three or more parts joined
     // by '-') is taken, and a refusal never echoes the value.
-    for good in ["BTC-USD-PERP", "ETH-USD-PERP", "BTC-USD-27JUN25-100000-C"] {
+    // Reviewer B's RB114-14: some Paradex markets carry a lower-case prefix (kBONK-USD-PERP);
+    // the letters are md_watch's Paradex spelling, either case.
+    for good in [
+        "BTC-USD-PERP",
+        "ETH-USD-PERP",
+        "BTC-USD-27JUN25-100000-C",
+        "kBONK-USD-PERP",
+        "kPEPE-USD-PERP",
+    ] {
         let mut argv = strings(&MARKET_ARGS);
         argv.extend(strings(&["--market", good]));
         let Ok(Parsed::Trade(opts)) = args::parse(argv) else {
@@ -2606,8 +2685,9 @@ fn a_market_not_shaped_like_a_paradex_market_is_refused_before_any_request() {
         "0xSYNTHETIC0hunter2",
         "0X0123456789ABCDEF0123456789ABCDEF",
         "0123456789ABCDEF0123456789ABCDEF",
-        "btc-usd-perp",
         "ETH-USD",
+        "BTC-USD-PERP/",
+        "BTC_USD-PERP",
         "BTC--PERP",
         "-BTC-USD-PERP",
         "BTC-USD-0123456789ABCDEF0123456789ABCDEF",
@@ -2685,4 +2765,185 @@ fn a_secret_shaped_proxy_host_or_a_relative_lease_directory_is_refused_unshown()
         panic!("an absolute --lease-dir is taken");
     };
     assert_eq!(opts.lease_dir, PathBuf::from("/var/tmp/testnet_trade"));
+}
+
+#[test]
+fn a_testnet_url_is_exactly_the_testnet_base_and_a_stub_path_exactly_v1() {
+    // Codex r4217231772 and Reviewer B's RB114-13: whatever sits in a URL's path is sent to the
+    // venue (in the REST requests' paths and the WebSocket upgrade), so a testnet URL must be
+    // exactly Paradex's and a loopback stub's path exactly /v1, on both flags; the refusal
+    // names the flag and never shows the URL.
+    let secret = "0xSYNTHETIC-pasted-secret-hunter2";
+    let (rest, ws) = (args::TESTNET_REST, args::TESTNET_WS);
+    let (stub_rest, stub_ws) = ("http://127.0.0.1:9/v1", "ws://127.0.0.1:9/v1");
+    assert_eq!(
+        args::testnet_guard(rest, ws, None),
+        Ok(args::Target::Testnet)
+    );
+    for (r, w) in [
+        (stub_rest, stub_ws),
+        ("https://localhost:9/v1", "wss://[::1]:9/v1"),
+        ("http://127.0.0.2/v1", "ws://localhost/v1"),
+    ] {
+        assert_eq!(
+            args::testnet_guard(r, w, None),
+            Ok(args::Target::LoopbackStub),
+            "{r} {w}"
+        );
+    }
+    for (flag, r, w) in [
+        (
+            "--rest-url",
+            format!("https://api.testnet.paradex.trade/{secret}/v1"),
+            ws.to_owned(),
+        ),
+        (
+            "--rest-url",
+            format!("https://api.testnet.paradex.trade/v1/{secret}"),
+            ws.to_owned(),
+        ),
+        (
+            "--rest-url",
+            "https://api.testnet.paradex.trade/v1/".to_owned(),
+            ws.to_owned(),
+        ),
+        (
+            "--rest-url",
+            "https://api.testnet.paradex.trade:443/v1".to_owned(),
+            ws.to_owned(),
+        ),
+        (
+            "--rest-url",
+            "https://api.testnet.paradex.trade".to_owned(),
+            ws.to_owned(),
+        ),
+        (
+            "--ws-url",
+            rest.to_owned(),
+            format!("wss://ws.api.testnet.paradex.trade/{secret}"),
+        ),
+        (
+            "--ws-url",
+            rest.to_owned(),
+            format!("wss://ws.api.testnet.paradex.trade/v1/{secret}"),
+        ),
+        (
+            "--ws-url",
+            rest.to_owned(),
+            "wss://ws.api.testnet.paradex.trade".to_owned(),
+        ),
+        (
+            "--rest-url",
+            format!("http://127.0.0.1:9/{secret}/v1"),
+            stub_ws.to_owned(),
+        ),
+        (
+            "--rest-url",
+            "http://127.0.0.1:9/".to_owned(),
+            stub_ws.to_owned(),
+        ),
+        (
+            "--rest-url",
+            "http://127.0.0.1:9x/v1".to_owned(),
+            stub_ws.to_owned(),
+        ),
+        (
+            "--ws-url",
+            stub_rest.to_owned(),
+            format!("ws://127.0.0.1:9/v1/{secret}"),
+        ),
+        (
+            "--ws-url",
+            stub_rest.to_owned(),
+            "ws://127.0.0.1:9".to_owned(),
+        ),
+    ] {
+        let err = args::testnet_guard(&r, &w, None).unwrap_err();
+        assert!(err.starts_with(flag), "{r} {w}: {err}");
+        assert!(!err.contains("hunter2"), "{r} {w}: {err}");
+        let mut argv = strings(&MARKET_ARGS);
+        argv.extend(["--rest-url".to_owned(), r.clone(), "--ws-url".to_owned(), w]);
+        let err = args::parse(argv).unwrap_err();
+        assert!(err.starts_with(flag), "{r}: {err}");
+        assert!(!err.contains("hunter2"), "{r}: {err}");
+    }
+}
+
+#[test]
+fn a_refused_url_never_names_its_host() {
+    // Codex r4217231780 and Reviewer B's RB114-12: a key pasted as a URL's host (with or
+    // without 0x; a Stark key without 0x fits in one DNS label) is refused naming the flag and
+    // the expected URL only, never the host typed.
+    // Built at run time: no key-shaped literal sits in this crate.
+    let hex64 = "0123456789abcdef".repeat(4);
+    let shown = &hex64[1..9];
+    for host in [
+        format!("0x{hex64}"),
+        hex64[1..].to_owned(),
+        format!("{}.example", &hex64[1..]),
+        format!("{}:9", &hex64[1..]),
+    ] {
+        for (flag, r, w) in [
+            (
+                "--rest-url",
+                format!("https://{host}/v1"),
+                args::TESTNET_WS.to_owned(),
+            ),
+            (
+                "--ws-url",
+                args::TESTNET_REST.to_owned(),
+                format!("wss://{host}/v1"),
+            ),
+        ] {
+            let err = args::testnet_guard(&r, &w, None).unwrap_err();
+            assert!(err.starts_with(flag), "{r} {w}: {err}");
+            assert!(!err.contains(shown), "{r} {w}: {err}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_namespace_lease_is_held_until_the_run_ends() {
+    // Reviewer B's RB114-7: the namespace lease stays held for the whole run, not only until
+    // the client-id mark is kept, so another testnet_trade with the same --namespace and
+    // --lease-dir on another market is refused while this one trades.
+    use fbc_core::{AccountKey, Namespace, NamespaceLease};
+    let placed = Arc::new(Mutex::new(Placed::default()));
+    let dir = lease_dir();
+    let probed = Arc::new(Mutex::new(None::<bool>));
+    let inner = respond_full(
+        Arc::clone(&placed),
+        Arc::new(Vec::new()),
+        End::Canceled,
+        End::Canceled,
+        Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+    );
+    let (at, seen) = (dir.clone(), Arc::clone(&probed));
+    let with = Responder::new(move |frame| {
+        if let Frame::Text(text) = frame
+            && text.contains("\"order.cancel\"")
+        {
+            // Long after the mark was kept: another run's take of the namespace.
+            let free = NamespaceLease::acquire(&at, AccountKey::new(1), Namespace::new(1)).is_ok();
+            *seen.lock().unwrap() = Some(free);
+        }
+        inner(frame)
+    });
+    let mut script = vec![Step::Accept];
+    script.extend((0..8).map(|_| Step::Respond {
+        conn: 0,
+        with: with.clone(),
+    }));
+    let stub = StubServer::start(WsScript::new(script), routes())
+        .await
+        .unwrap();
+    let mut opts = options(&stub, "10");
+    opts.lease_dir = dir.clone();
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(report.ok, "{printed}");
+    assert_eq!(*probed.lock().unwrap(), Some(false), "{printed}");
+    // Released once the run ended.
+    assert!(NamespaceLease::acquire(&dir, AccountKey::new(1), Namespace::new(1)).is_ok());
 }
