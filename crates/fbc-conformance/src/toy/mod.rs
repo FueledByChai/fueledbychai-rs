@@ -211,7 +211,8 @@ pub fn caps_for(fill_ids: FillIds) -> VenueCaps {
             },
             max_conn_lifetime: None,
         },
-        // One account budget counts every request the codec writes (decision 0018).
+        // One account budget counts every request the codecs write (decision 0018), market
+        // data's subscriptions and anchors included (Codex r4216139636).
         limits: vec![RateLimit {
             scope: LimitScope::Account,
             ops: TagSet::of(&[
@@ -220,6 +221,8 @@ pub fn caps_for(fill_ids: FillIds) -> VenueCaps {
                 OpKind::Cancel,
                 OpKind::CancelAll,
                 OpKind::Query,
+                OpKind::Subscribe,
+                OpKind::Rest,
                 OpKind::Control,
             ]),
             per: Duration::from_secs(1),
