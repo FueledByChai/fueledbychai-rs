@@ -26,9 +26,10 @@ use std::rc::Rc;
 use armed_oms::{Oms, Reserved, churn, session_config, settle, watermark};
 use common::{Peer, ScriptedWs};
 use exec_toy::INST_A;
-use fbc_core::{Envelope, ExecEvent, NotSentReason, RpcId, SubmitHandle};
+use fbc_core::{Envelope, ExecEvent, NotSentReason, RpcId, SubmitHandle, TrafficClass, WallNs};
+use fbc_journal::{JournalSink, Record, Recorded};
 use fbc_oms::{Leases, Registry};
-use fbc_runtime::{ExecHandler, ExecOrders};
+use fbc_runtime::{ExecHandler, ExecOrders, Journal, SubmitRefusal};
 
 type Handles = Rc<RefCell<Vec<SubmitHandle>>>;
 type Events = Rc<RefCell<Vec<ExecEvent>>>;
@@ -144,6 +145,60 @@ async fn an_authorized_place_and_batch_are_encoded_with_one_reserved_nonce_per_i
         [vec![0], vec![1], vec![2, 3, 4], vec![5, 6]]
     );
     assert_eq!(session.counters().unready_refusals, 0);
+}
+
+/// Codex P2 r4214607587 on PR #115: a run dropped on an epoch that takes places leaves the
+/// session to end that epoch when a journal is set; its orders end with it, so nothing is taken
+/// that the run-once session could never send.
+#[tokio::test(start_paused = true)]
+async fn a_journal_set_after_a_run_dropped_on_a_ready_epoch_ends_its_orders() {
+    // A blocked thread keeps the paused clock from auto-advancing while the sockets are idle.
+    let (thaw, frozen) = std::sync::mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || frozen.recv());
+    let mut server = ScriptedWs::start().await;
+    let reserved = Reserved::default();
+    let (handles, events) = (Handles::default(), Events::default());
+    let keep = Keep {
+        handles: Rc::clone(&handles),
+        events: Rc::clone(&events),
+    };
+    let config = session_config(&server.url(), &reserved);
+    let (mut session, _control) = fbc_runtime::ExecSession::new(config, keep).unwrap();
+    let orders = session.orders();
+    let mut oms = Oms::armed();
+    {
+        let run = session.run();
+        tokio::pin!(run);
+        let ready = async {
+            let mut peer = server.accept().await;
+            armed_and_resynced(&mut peer, &orders, &events).await;
+            peer
+        };
+        let _peer = tokio::select! {
+            _ = &mut run => panic!("the run ended"),
+            peer = ready => peer,
+        };
+    }
+    assert!(orders.may_place());
+    session.set_journal(Journal::new(Rc::new(RefCell::new(Offered))));
+    drop(thaw);
+    assert!(!orders.may_place());
+    let refused = orders.submit(oms.place());
+    assert!(matches!(refused, Err(SubmitRefusal::Ended)), "{refused:?}");
+    assert!(handles.borrow().is_empty());
+}
+
+/// A journal sink that takes every record and keeps none.
+struct Offered;
+
+impl JournalSink for Offered {
+    fn record(&mut self, _: TrafficClass, _: WallNs, _: &Record) -> Recorded {
+        Recorded::Ok
+    }
+
+    fn omit(&mut self, _: TrafficClass, _: WallNs) -> Recorded {
+        Recorded::Ok
+    }
 }
 
 /// When a test's change of the market's state comes.

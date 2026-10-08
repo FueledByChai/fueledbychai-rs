@@ -219,10 +219,12 @@ pub(crate) struct Core {
     /// fills 0006 reserves room for and cannot be told apart before they are decoded (decision
     /// 0078).
     pub(crate) inbound: TrafficClass,
-    /// Whether one codec serves every epoch (an order-entry session's, 0053), so an ended
-    /// epoch's HTTP result is journaled with the spans that codec names, not hashed whole
-    /// (Codex P2 r4214053451 on PR #115).
-    pub(crate) one_codec: bool,
+    /// When one codec serves every epoch (an order-entry session's, 0053), the epoch whose
+    /// `on_open` it was last called for: an ended epoch's HTTP result is journaled with the
+    /// spans that codec names only while it is that epoch's, since the codec's state may change
+    /// as it opens the next (Codex P2 r4214053451, P1 r4214607580 on PR #115). `None` when the
+    /// codec ends with its epoch (a market-data session's).
+    pub(crate) codec_epoch: Option<u32>,
 }
 
 /// An HTTP request in flight.
@@ -279,7 +281,7 @@ impl Core {
             rates: config.rates,
             journal: None,
             inbound: TrafficClass::Normal,
-            one_codec: false,
+            codec_epoch: None,
         }
     }
 
@@ -804,7 +806,8 @@ impl Core {
     /// its place in the shard's ingest order even when it is dropped, and journals it there
     /// with the credentials the codec of that epoch names in it: `redact`, the current epoch's
     /// codec's when one is running. A result of an ended epoch has no codec left to ask, unless
-    /// one codec serves every epoch (`one_codec`): all of it is hashed ([`inbound_spans`]).
+    /// one codec serves every epoch and has opened none since (`codec_epoch`): all of it is
+    /// hashed ([`inbound_spans`]).
     pub(crate) fn stamp_http(
         &self,
         redact: Option<Redact<'_>>,
@@ -820,7 +823,8 @@ impl Core {
         // handed them, and so does the codec, asked for its spans first. A failure holds no byte
         // of a response and has nothing to name.
         if let Some(journal) = &self.journal {
-            let redact = redact.filter(|_| self.one_codec || done.epoch == self.current().epoch);
+            let opened = self.codec_epoch == Some(done.epoch);
+            let redact = redact.filter(|_| opened || done.epoch == self.current().epoch);
             let spans = with_response(&done.result, |resp| {
                 resp.map(|r| self.spans(redact, Inbound::Http(done.tag, r)))
             })

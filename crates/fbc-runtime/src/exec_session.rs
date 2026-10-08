@@ -33,26 +33,25 @@
 //! (0036).
 //!
 //! **The journal (FBC-2pr, decisions 0006, 0078).** With a [`Journal`] set
-//! ([`ExecSession::set_journal`]), the session records what crosses its boundary as a
-//! market-data session does: each epoch's opening and closing, every frame and HTTP result it
-//! receives at its stamp (a stale one too) with the credentials the codec names in it as keyed
-//! hashes (0028), every ping, pong and close frame it receives (0041), every frame it writes with
-//! its kind and redaction spans and the result of the write (none for a write that failed,
-//! stalled or was interrupted, whose outcome is unknown, 0036), every HTTP request with its
-//! request id, and every codec timer that fires. It also records each nonce it reserves from
-//! the consumer's [`NonceSource`], one `Nonce` record per value under the number the consumer
-//! gives that source ([`ExecSessionConfig::nonce_source`]), as it is reserved (a short reservation's values included), and the
-//! [`EncodeCtx`] it then hands `on_open`, `on_timer`, the resync or an `encode`, the encode's
-//! with its request id, just before the call. An inbound frame or HTTP result is journaled
-//! under Safety, since an order-entry stream carries acks and fills that cannot be told apart
-//! before they are decoded; a write under its frame's class; an encode's nonces and context
-//! under its command's class, so a cancel's or a reducing order's are Safety; the rest under
-//! Normal. An input that came as the control dropped follows the epoch's `Closed`, reaching no
-//! codec; spans a codec names that do not fit their input are counted
-//! ([`ExecCounters::refused_redactions`]) and that input is hashed whole. An encode's time is
-//! read once its nonces are reserved. Nothing waits on the journal: a record the sink has no
-//! room for is dropped and
-//! counted there (0006). A request's deadline firing is stamped but not yet journaled
+//! ([`ExecSession::set_journal`]), the session records what crosses its boundary as a market-data
+//! session does: each epoch's opening and closing, every frame and HTTP result it receives at its
+//! stamp (a stale one too, hashed whole once the codec has opened a later epoch) with the
+//! credentials the codec names in it as keyed hashes (0028), every ping, pong and close frame it
+//! receives (0041), every frame it writes with its kind and redaction spans and the result of the
+//! write (none for a write that failed, stalled or was interrupted, whose outcome is unknown,
+//! 0036), every HTTP request with its request id, and every codec timer that fires. It also records
+//! each nonce it reserves from the consumer's [`NonceSource`], one `Nonce` record per value under
+//! the number the consumer gives that source ([`ExecSessionConfig::nonce_source`]), as it is
+//! reserved (a short reservation's values included), and the [`EncodeCtx`] it then hands `on_open`,
+//! `on_timer`, the resync or an `encode`, the encode's with its request id, just before the call.
+//! An inbound frame or HTTP result is journaled under Safety, since an order-entry stream carries
+//! acks and fills that cannot be told apart before they are decoded; a write under its frame's
+//! class; an encode's nonces and context under its command's class, so a cancel's or a reducing
+//! order's are Safety; the rest under Normal. An input that came as the control dropped follows the
+//! epoch's `Closed`, reaching no codec; spans a codec names that do not fit their input are counted
+//! ([`ExecCounters::refused_redactions`]) and that input is hashed whole. An encode's time is read
+//! once its nonces are reserved. Nothing waits on the journal: a record the sink has no room for is
+//! dropped and counted there (0006). A request's deadline firing is stamped but not yet journaled
 //! (FBC-0hfl).
 //!
 //! **HTTP requests, timers and keepalives (FBC-bnl, decision 0056).** A request the codec asks
@@ -514,7 +513,6 @@ impl<H: ExecHandler> ExecSession<H> {
         });
         // What an order-entry stream brings carries acks and fills (decision 0078).
         core.inbound = TrafficClass::Safety;
-        core.one_codec = true;
         let rec = Recorder {
             journal: None,
             source: config.nonce_source,
@@ -643,10 +641,12 @@ impl<H: ExecHandler> ExecSession<H> {
         }
     }
 
-    /// Ends the epoch a dropped run left connected, if one did: its per-connection buckets
-    /// forgotten (Codex r4189428438) and the handler told.
+    /// Ends the epoch a dropped run left connected, if one did: its orders ended, since the
+    /// session runs once and can never send them (Codex P2 r4214607587 on PR #115), its
+    /// per-connection buckets forgotten (Codex r4189428438) and the handler told.
     fn end_left_epoch(&mut self) {
         if let Some(key) = self.in_epoch.take() {
+            self.orders.end();
             self.core.rates.closed(key);
             if !self.was_closed_early(key) {
                 self.core.control(|| ControlEvent::Closed(key));
@@ -787,6 +787,8 @@ impl<H: ExecHandler> ExecSession<H> {
             wall,
         )?;
         let mut fx = Effects::new();
+        // From here an ended epoch's result is hashed whole (Codex P1 r4214607580 on PR #115).
+        self.core.codec_epoch = Some(self.current().epoch);
         self.codec.on_open(self.stream, &ctx, &mut fx);
         Ok(fx)
     }
@@ -1343,7 +1345,8 @@ impl<H> Between<'_, H> {
 }
 
 impl<H: ExecHandler> Control for Between<'_, H> {
-    /// The session's one codec names the credentials in an ended epoch's result too.
+    /// The session's one codec names the credentials in an ended epoch's result too, until it
+    /// opens a later epoch (`Core::codec_epoch`).
     fn redacts(&self) -> bool {
         true
     }
