@@ -77,3 +77,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0072](0072-paradex-s-factory-builds-the-order-entry-or-the-read-only-co.md) Paradex's factory builds the order-entry or the read-only codec as a required mode key says, on one endpoint, signing orders with the login's main key — accepted
 - [0073](0073-an-order-query-is-normal-traffic-at-the-safety-floor-and-the-.md) An order query is normal traffic at the safety floor, and the cancel-on-disconnect arm and the resync may use the reserve — accepted
 - [0074](0074-paradex-s-book-channels-are-the-bare-order-book-market-delta.md) Paradex's book channels are the bare order_book.{market}.deltas and .interactive_deltas, the whole book on every change, one per market per SBE session — accepted
+- [0075](0075-a-replace-whose-cancel-was-sent-and-came-back-not-sent-or-re.md) A replace whose cancel was sent and came back not sent or refused is over, augmenting 0065 — accepted

@@ -17,7 +17,7 @@
 //!   lands and the level waits for the order's terminal state;
 //! - a replace whose cancel was reported sent and answered without ending the order (not sent,
 //!   or refused) is over: the order rests as it was and its level is decided afresh, so a
-//!   quote equal to it keeps it and a later change amends it where the caps allow;
+//!   quote equal to it keeps it and a later change amends it where the caps allow (0075);
 //! - a resting order whose price moved by at least the configured basis points of its price,
 //!   or whose resting quantity moved by at least the configured lots, or whose flags differ,
 //!   is changed once it is at least the configured minimum age (since the planner placed or
@@ -457,8 +457,8 @@ impl ExecutionPlanner {
                 .get(slot.cid)
                 .expect("terminal and unknown orders were freed");
             // A replace whose cancel was sent and answered without ending the order (not sent,
-            // or refused) is over: the order rests as it was and the level is decided afresh.
-            // A cancel built and not reported sent is built again (0065 rules 5 and 7).
+            // or refused) is over: the order rests as it was and the level is decided afresh
+            // (0075). A cancel built and not reported sent is built again (0065 rule 7).
             if slot.replacing
                 && !matches!(rec.intent(), Intent::PendingCancel { .. })
                 && rec.cancels_sent() > slot.cancels_sent

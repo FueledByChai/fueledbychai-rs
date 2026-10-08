@@ -52,12 +52,7 @@ authorization (0045, 0060) already exist; the planner must go through them, neve
    through whether or not the level is wanted again: the planner tries it at every pass, builds
    it once the acknowledgement lands, and the level waits for the order's terminal state before
    anything is placed there, so a pulled order never rests at its old price. The consumer need
-   not drive `Registry::cancels_due` for the planner's orders. A replace (or a carried-through
-   cancel) whose cancel was reported sent and came back not sent or refused, leaving the order
-   resting with nothing in flight, is over: the level is decided afresh, so a quote equal to
-   the order keeps it and a later change amends it where the caps allow (FBC-ubsw); the
-   planner tells that from a cancel built and not reported sent by the order's count of
-   cancels sent (`OrderRecord::cancels_sent`).
+   not drive `Registry::cancels_due` for the planner's orders.
 6. **The order and the checks.** One pass decides every level first, then builds in 0005's
    order (cancels, then places and amends that reduce, then amends, then adds; each group by
    side, bids first, then level), so each command is judged with the earlier ones counted.
