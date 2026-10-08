@@ -28,10 +28,13 @@
 //!   crate's `tests/conformance.rs` invokes with its factory, its fixture directory (whose
 //!   layout [`suite`] documents) and the setup its fixtures assume, each named check becoming a
 //!   test; and each check as a public function. So far `caps_truthful`,
-//!   `commands_selfcontained`, `signing_golden` and `legacy_symbols` (FBC-onw); the conformance
-//!   toy passes all four, a deliberately broken toy fails `caps_truthful`
-//!   (`tests/suite_broken.rs`), and a toy whose signer changes one signed byte fails
-//!   `signing_golden` (`tests/suite_golden.rs`).
+//!   `commands_selfcontained`, `signing_golden` and `legacy_symbols` (FBC-onw), and `fee_sign`,
+//!   `liquidity_reported`, `position_signed` and `decoder_deterministic`, which read the
+//!   venue's fixture frames (FBC-whw); the conformance toy passes all eight, a deliberately
+//!   broken toy fails `caps_truthful` (`tests/suite_broken.rs`), a toy whose signer changes one
+//!   signed byte fails `signing_golden` (`tests/suite_golden.rs`), and toys that flip a fee's
+//!   sign or decode nondeterministically fail `fee_sign` and `decoder_deterministic`
+//!   (`tests/suite_frames.rs`).
 //!
 //! Not here yet: the suite's other checks, and the rest of the conformance toy venue.
 

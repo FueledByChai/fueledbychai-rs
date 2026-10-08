@@ -7,11 +7,11 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fbc_core::{
-    AccountKey, AmendOrder, CancelOrder, CapTag, Channel, CidMint, ClientOrderId, Effects,
-    EncodeCtx, EncodeReceipt, ExecCodec, Feature, InstrumentId, Lots, MonoNs, Namespace,
+    AccountKey, AmendOrder, CancelOrder, CapTag, Channel, CidMint, ClientOrderId, DecodeScope,
+    Effects, EncodeCtx, EncodeReceipt, ExecCodec, Feature, InstrumentId, Lots, MonoNs, Namespace,
     NamespaceLease, NewOrder, NonceBlock, NotSentReason, OrderCaps, OrderKind, OrderKindTag,
-    OrderRef, PathStamps, QueryOrder, RefKind, RpcId, Side, SpecTable, TagSet, Ticks, TifTag,
-    VenueCaps, VenueCommand, VenueOrderId, WallNs, dispatch,
+    OrderRef, PathStamps, QueryOrder, RefKind, RpcId, Side, SpecTable, StreamId, TagSet, Ticks,
+    TifTag, VenueCaps, VenueCommand, VenueOrderId, WallNs, dispatch,
 };
 
 use super::{Failure, Subject};
@@ -22,7 +22,7 @@ pub(crate) const RPC: RpcId = RpcId(1);
 const ACCOUNT: AccountKey = AccountKey::new(1);
 const NAMESPACE: Namespace = Namespace::new(1);
 /// The fixed encode time.
-const WALL: WallNs = WallNs(1_759_363_200_000_000_000);
+pub(crate) const WALL: WallNs = WallNs(1_759_363_200_000_000_000);
 /// The first placement nonce an order carries; item `i`'s is this plus `i`.
 const PLACEMENT_NONCE: u64 = 1_000;
 /// The limit price aimed at: the valid price at or above it on the instrument's grid is used.
@@ -44,6 +44,8 @@ pub(crate) struct Harness<'s> {
     pub inst: InstrumentId,
     /// The second instrument by id, where the setup lists one.
     pub other_inst: Option<InstrumentId>,
+    /// The stream fixture frames are handed to the codec on.
+    pub exec_stream: StreamId,
     qty: Lots,
     /// A valid limit price on the instrument's grid (Codex r4189256906).
     px: Ticks,
@@ -83,6 +85,7 @@ impl<'s> Harness<'s> {
             specs: setup.specs,
             inst,
             other_inst,
+            exec_stream: setup.exec_stream,
             qty,
             px,
         })
@@ -116,16 +119,30 @@ impl<'s> Harness<'s> {
         })
     }
 
+    /// The spec table the setup gives.
+    pub fn specs(&self) -> &SpecTable {
+        &self.specs
+    }
+
+    /// The fixed encode time with the nonces `1..=n`.
+    pub fn ctx(&self, n: u16) -> EncodeCtx {
+        EncodeCtx {
+            wall: WALL,
+            mono: MonoNs(1),
+            nonces: NonceBlock::new((1..=u64::from(n)).collect()),
+        }
+    }
+
+    /// Runs `f` in the decode scope the core lends for the venue's caps, in the suite's own
+    /// namespace.
+    pub fn decode_scope<R>(&self, f: impl for<'a> FnOnce(&'a DecodeScope<'a>) -> R) -> R {
+        dispatch(&self.caps, NAMESPACE, f)
+    }
+
     /// `cmd` encoded by `codec` as request `rpc` at the fixed time, with one nonce per item, and
     /// the effects it asked for.
     pub fn encode(&self, codec: &mut dyn ExecCodec, cmd: &VenueCommand, rpc: RpcId) -> Encoded {
-        let items = u64::from(cmd.items().unwrap_or(u16::MAX));
-        let nonces = NonceBlock::new((1..=items).collect());
-        let ctx = EncodeCtx {
-            wall: WALL,
-            mono: MonoNs(1),
-            nonces,
-        };
+        let ctx = self.ctx(cmd.items().unwrap_or(u16::MAX));
         let mut fx = Effects::new();
         let stamps = &mut PathStamps::off();
         let result = codec.encode(cmd, rpc, &self.specs, &ctx, stamps, &mut fx);
