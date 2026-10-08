@@ -45,7 +45,7 @@ use std::time::Duration;
 
 use fbc_core::{
     CidMatch, ClientOrderId, MonoNs, OrderCaps, OrderUpdate, QueryAnswer, QueryOrder, RefKind,
-    RpcId, SnapshotSource, SubmitOutcome, VenueOrderSnapshot, WallNs,
+    RpcId, SnapshotSource, SubmitOutcome, VenueOrderId, VenueOrderSnapshot, WallNs,
 };
 
 use crate::gateway::ControlCommand;
@@ -175,8 +175,9 @@ pub enum LadderResolution {
     /// The venue did not settle it: resyncs decide ([`LadderPlan::resync`]).
     Inconclusive,
     /// The answer carries the query's request but names another order than the one queried
-    /// (another client id, or a venue id another order of ours holds): nothing of it applies,
-    /// the query is spent and resyncs decide.
+    /// (another client id, or a venue id another order of ours holds, in the query's target or
+    /// in the snapshot answering a query by client id alone): nothing of it applies to either
+    /// order, the query is spent and resyncs decide.
     TargetMismatch,
     /// Not the answer to a ladder query the registry holds, or its order is no longer on the
     /// ladder: nothing changed.
@@ -271,17 +272,24 @@ impl Registry {
     /// The order the venue shows applies as its order update would
     /// ([`OrderRecord::apply_update`](crate::OrderRecord::apply_update)); resting with nothing
     /// in flight, or ended, the order leaves the ladder. Not found, or shown with a command
-    /// still in flight, it is left to resyncs.
+    /// still in flight, it is left to resyncs. An answer naming another order than the one
+    /// queried (another client id, or a venue id another order of ours holds, in its target
+    /// or in its snapshot) applies nothing to either order: the query is spent and resyncs
+    /// decide ([`LadderResolution::TargetMismatch`]).
     pub fn on_query_answer(&mut self, answer: &QueryAnswer, key: OrderKey) -> LadderResolution {
         let Some(cid) = self.ladder_query(answer.rpc()) else {
             return LadderResolution::Ignored;
         };
-        // Our queries always name the order by our client id, with a venue id it has.
+        // Our queries always name the order by our client id, with a venue id it has. A venue
+        // id another order of ours holds names that order, whether the query or the snapshot
+        // carries it: a query by client id alone accepts a snapshot under any venue id
+        // ([`QueryAnswer::new`]), and applying one held by another order would hand the
+        // queried record that order's id and state (FBC-k2w9). As in a resync, it is refused.
         let target = answer.target();
+        let ours_or_free = |v: &VenueOrderId| self.cid_of(v).is_none_or(|by_vid| by_vid == cid);
         let names_it = target.client() == Some(cid)
-            && target
-                .venue()
-                .is_none_or(|v| self.cid_of(v).is_none_or(|by_vid| by_vid == cid));
+            && target.venue().is_none_or(ours_or_free)
+            && answer.found().is_none_or(|snap| ours_or_free(&snap.vid));
         if !names_it {
             self.with_record(cid, |rec| rec.set_ladder_step(LadderStep::Resync));
             return LadderResolution::TargetMismatch;

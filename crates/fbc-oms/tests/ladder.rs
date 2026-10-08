@@ -1079,6 +1079,62 @@ fn a_query_answer_naming_another_order_than_the_one_queried_is_never_applied() {
 }
 
 #[test]
+fn a_query_by_client_id_answered_with_a_venue_id_another_order_of_ours_holds_applies_nothing() {
+    // FBC-k2w9 (Codex r4188432397 on PR #72): an Unknown order has no venue id, so its query
+    // names it by client id alone and QueryAnswer::new accepts a snapshot carrying any venue
+    // id. One another order of ours holds names that order: applying it would give the
+    // queried record the other order's id and state, take it off the ladder, and later
+    // commands on it would name the wrong order.
+    for shown_cid in [true, false] {
+        let mut reg = Registry::new();
+        let c = unknown(&mut reg);
+        let other = open(&mut reg, "g9");
+        reg.ladder(&cfg(), &caps(), at(6));
+        reg.query_sent(c, RpcId(1)).unwrap();
+        let shown = snap(shown_cid.then_some(c), "g9", canceled(), 4);
+        let answer = QueryAnswer::new(RpcId(1), OrderRef::Client(c), Some(shown)).unwrap();
+        assert_eq!(
+            reg.on_query_answer(&answer, key(1)),
+            LadderResolution::TargetMismatch,
+            "client id shown: {shown_cid}"
+        );
+        // Nothing applies to the queried order: still Unknown, no venue id, on the ladder.
+        let rec = reg.get(c).unwrap();
+        assert_eq!(rec.state(), OrdState::Unknown);
+        assert_eq!(rec.vid(), None);
+        assert_eq!(rec.filled(), lots(0));
+        assert_eq!(rec.unknown_since(), Some(at(5)));
+        assert_eq!(rec.ladder_step(), Some(LadderStep::Resync));
+        // Nor to the order holding that venue id.
+        let held = reg.get(other).unwrap();
+        assert_eq!(held.state(), OrdState::Open);
+        assert_eq!(held.vid(), Some(&vid("g9")));
+        assert_eq!(held.filled(), lots(0));
+        assert_eq!(held.unknown_since(), None);
+        // The query is spent: the same answer again changes nothing.
+        assert_eq!(
+            reg.on_query_answer(&answer, key(2)),
+            LadderResolution::Ignored
+        );
+        assert_eq!(reg.queries_awaited(), 0);
+        // Resyncs decide: the next pass asks for one and queries nothing again.
+        let plan = reg.ladder(&cfg(), &caps(), at(7));
+        assert!(plan.resync);
+        assert!(plan.queries.is_empty() && plan.escalated.is_empty());
+        // A resync showing the order under its own venue id resolves it; the other is untouched.
+        let entries = [
+            snap(Some(c), "g10", VenueOrderState::Open, 0),
+            snap(Some(other), "g9", VenueOrderState::Open, 0),
+        ];
+        let applied = reg.on_resync(&cfg(), &caps(), wall(2_000), &entries, key(3));
+        assert_eq!(applied.resolved, vec![(c, OrdState::Open)]);
+        assert_eq!(reg.get(c).unwrap().vid(), Some(&vid("g10")));
+        assert_eq!(reg.get(other).unwrap().vid(), Some(&vid("g9")));
+        assert_eq!(reg.get(other).unwrap().state(), OrdState::Open);
+    }
+}
+
+#[test]
 fn a_snapshot_entry_under_another_namespaces_or_a_non_canonical_client_id_is_never_routed_by_venue_id()
  {
     for seen in [CidMatch::Foreign(Namespace::new(9)), CidMatch::Unparseable] {
