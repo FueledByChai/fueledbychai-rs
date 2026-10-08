@@ -2057,3 +2057,81 @@ fn a_tests_lease_directories_are_removed_when_its_thread_ends() {
     let dir = std::thread::spawn(lease_dir).join().unwrap();
     assert!(!dir.exists(), "{}", dir.display());
 }
+
+#[test]
+fn a_timed_out_write_keeps_what_it_holds_until_it_ends() {
+    // The mint's namespace lease stays held while a mark's write runs past its timeout, so no
+    // other run can take the namespace and keep a newer mark that the late write would replace.
+    use fbc_core::{AccountKey, Namespace, NamespaceLease};
+    use std::sync::mpsc;
+    let dir = lease_dir();
+    let (acct, ns) = (AccountKey::new(1), Namespace::new(1));
+    let lease = NamespaceLease::acquire(&dir, acct, ns).unwrap();
+    let (release, held) = mpsc::channel::<()>();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let got = runtime.block_on(trade::off_thread_holding(
+        Duration::from_millis(50),
+        lease,
+        move || held.recv().is_ok(),
+    ));
+    assert_eq!(got, None);
+    // Timed out, but the write still runs: the namespace is still leased.
+    assert!(NamespaceLease::acquire(&dir, acct, ns).is_err());
+    release.send(()).unwrap();
+    // Once it ends, the lease is released.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if NamespaceLease::acquire(&dir, acct, ns).is_ok() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the lease was never released"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Work that ends in time hands back its result, and what it held is released.
+    let lease = NamespaceLease::acquire(&dir, acct, ns).unwrap();
+    assert_eq!(
+        runtime.block_on(trade::off_thread_holding(
+            Duration::from_secs(10),
+            lease,
+            || 7
+        )),
+        Some(7)
+    );
+    assert!(NamespaceLease::acquire(&dir, acct, ns).is_ok());
+}
+
+#[tokio::test]
+async fn an_ask_that_rose_past_the_inventory_cap_before_the_place_stops_the_run_with_nothing_placed()
+ {
+    // The first read gives the inventory cap of $50 as 80 lots at the ask of 62000.5. By the
+    // second the touch rose (bid 63000.2, ask 63000.5): the buy at 60140.1 is still more than
+    // 300 bps behind it, but $50 is now 79 lots at the ask, fewer than the caps hold.
+    let book = fs::read_to_string(fixture("paradex/rest/orderbook-btc-2002.json")).unwrap();
+    let mut rose: Value = serde_json::from_str(&book).unwrap();
+    rose["bids"] = json!([["63000.2", "0.333"]]);
+    rose["asks"] = json!([["63000.5", "0.1"]]);
+    rose["best_bid_api"] = json!(["63000.2", "0.333"]);
+    rose["best_bid_interactive"] = json!(["63000.2", "0.333"]);
+    rose["best_ask_api"] = json!(["63000.5", "0.1"]);
+    rose["best_ask_interactive"] = json!(["63000.5", "0.1"]);
+    rose["seq_no"] = json!(2003);
+    let (report, printed, sent) = run_with_second_book(rose.to_string()).await;
+    assert!(!report.ok, "{printed}");
+    assert!(
+        printed.contains("the inventory cap of $50 is now 79 lots at the ask of 63000.5"),
+        "{printed}"
+    );
+    assert!(printed.contains("nothing placed"), "{printed}");
+    assert_eq!(
+        steps(&printed),
+        ["login", "arm", "resync", "start", "stop"],
+        "{printed}"
+    );
+    assert!(!sent.iter().any(|m| m == "order.create"));
+}
