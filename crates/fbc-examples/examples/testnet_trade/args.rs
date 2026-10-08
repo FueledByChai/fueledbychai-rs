@@ -35,7 +35,8 @@ Required confirmation and namespace:
                             namespace on the market refuses the run)
 
 The market (required; read them from GET https://api.testnet.paradex.trade/v1/markets):
-  --market <MARKET>         the Paradex market as Paradex spells it, e.g. BTC-USD-PERP
+  --market <MARKET>         the Paradex market as Paradex spells it, e.g. BTC-USD-PERP or
+                            kBONK-USD-PERP
   --tick <DEC>              its price_tick_size, e.g. 0.1
   --step <DEC>              its order_size_increment, e.g. 0.001
   --min-notional <USD>      its min_notional, e.g. 10 (0 when it states none)
@@ -56,9 +57,10 @@ Options:
                             (default 0)
   --step-timeout <SECONDS>  how long each awaited step may take before the sample gives up and
                             Stops, 1 to 120 (default 15)
-  --rest-url <URL>          REST base (default https://api.testnet.paradex.trade/v1)
-  --ws-url <URL>            order-entry WebSocket, without a query
-                            (default wss://ws.api.testnet.paradex.trade/v1)
+  --rest-url <URL>          REST base: https://api.testnet.paradex.trade/v1 (the default)
+                            or a loopback stub's
+  --ws-url <URL>            order-entry WebSocket: wss://ws.api.testnet.paradex.trade/v1
+                            (the default) or a loopback stub's
   --socks5 <HOST:PORT>      connect through this SOCKS5 proxy (default: directly); refused
                             with loopback stub URLs, which the proxy would resolve on its host
   --lease-dir <DIR>         an absolute path where the market, account and client-id leases
@@ -67,9 +69,11 @@ Options:
                             unlike a temporary directory)
   -h, --help                print this help
 
-The URLs must name Paradex's testnet hosts (api.testnet.paradex.trade and
-ws.api.testnet.paradex.trade) or a loopback host (127.0.0.0/8, ::1, localhost: a test stub);
-anything else, mainnet included, is refused, as is any chain id but PRIVATE_SN_POTC_SEPOLIA.
+The URLs must be exactly Paradex's testnet ones (above), or both a loopback stub's (host
+127.0.0.0/8, [::1] or localhost, any port, the path exactly /v1): whatever sits in a path is
+sent to the venue, so no other path is taken. Anything else, mainnet included, is refused, as
+is any chain id but PRIVATE_SN_POTC_SEPOLIA. A flag's value goes in the next argument, never
+after '='.
 
 Lines (each step with the milliseconds since the start):
   TESTNET ...        the hosts the guard accepted (never the URLs: a path may carry a token)
@@ -100,13 +104,10 @@ Lines (each step with the milliseconds since the start):
 Ctrl-C aborts at once: the socket closes and Paradex's cancel-on-disconnect cancels the order.
 ";
 
-/// The testnet's REST base and order-entry WebSocket.
+/// The testnet's REST base and order-entry WebSocket: the only non-loopback URLs the guard
+/// admits, exactly.
 pub const TESTNET_REST: &str = "https://api.testnet.paradex.trade/v1";
 pub const TESTNET_WS: &str = "wss://ws.api.testnet.paradex.trade/v1";
-
-/// The testnet's hosts: the only non-loopback hosts the guard admits.
-const TESTNET_REST_HOST: &str = "api.testnet.paradex.trade";
-const TESTNET_WS_HOST: &str = "ws.api.testnet.paradex.trade";
 
 /// The testnet's Starknet chain id, the only one the guard admits.
 pub const TESTNET_CHAIN: &str = "PRIVATE_SN_POTC_SEPOLIA";
@@ -242,9 +243,15 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             "--ws-url" => ws_url = value()?,
             "--socks5" => proxy = socks5(&value()?)?,
             "--lease-dir" => lease_dir = Some(absolute(&value()?)?),
-            // A flag (it starts with '-') is named; anything else may be a pasted secret.
-            _ if flag.starts_with('-') => {
-                return Err(format!("unknown argument {flag}; --help lists them"));
+            // A flag (shaped like one) is named, by its part before any '=' only: what follows
+            // may be a pasted secret, as may anything else, which is named by its position.
+            _ if flag_name(&flag).is_some() => {
+                return Err(match flag.split_once('=') {
+                    Some((name, _)) => format!(
+                        "unknown argument {name} typed with '=' (the value is not shown: it may                          be a secret); give a flag's value as the next argument; --help lists                          them"
+                    ),
+                    None => format!("unknown argument {flag}; --help lists them"),
+                });
             }
             _ => {
                 return Err(format!(
@@ -282,6 +289,24 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     sole(&opts)?;
     within_cap(&opts)?;
     Ok(Parsed::Trade(Box::new(opts)))
+}
+
+/// The longest argument [`flag_name`] names: every flag of this sample is shorter, and a pasted
+/// key longer.
+const FLAG_MAX: usize = 24;
+
+/// `arg`'s part before any '=' when it is shaped like a flag: '-' or '--', a lower-case letter,
+/// then lower-case letters, digits and '-', at most [`FLAG_MAX`] long. Anything else (a key
+/// pasted after a '-', say) is not a flag and is never named.
+fn flag_name(arg: &str) -> Option<&str> {
+    let name = arg.split_once('=').map_or(arg, |(name, _)| name);
+    let bare = name.strip_prefix("--").or_else(|| name.strip_prefix('-'))?;
+    let shaped = name.len() <= FLAG_MAX
+        && bare.bytes().next().is_some_and(|b| b.is_ascii_lowercase())
+        && bare
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    shaped.then_some(name)
 }
 
 /// `$HOME/.fueledbychai/testnet_trade`: durable, so the client-id high-water mark kept there
@@ -366,39 +391,37 @@ pub fn within_cap(opts: &Options) -> Result<(), String> {
     }
 }
 
-/// The hosts of the REST and WebSocket URLs, all of them a run prints: an accepted URL's path
-/// may still carry a token.
+/// The hosts of the REST and WebSocket URLs, all of them a run prints: the guard admits only
+/// the testnet's exact URLs or a loopback stub's, so each is a testnet host or a loopback one.
 pub fn hosts(rest: &str, ws: &str) -> Result<(String, String), String> {
     Ok((
-        host_of(rest, &["https://", "http://"], "--rest-url")?,
-        host_of(ws, &["wss://", "ws://"], "--ws-url")?,
+        split(rest, ["https://", "http://"], "--rest-url")?.host,
+        split(ws, ["wss://", "ws://"], "--ws-url")?.host,
     ))
 }
 
-/// The URL half of [`testnet_guard`].
+/// The URL half of [`testnet_guard`]: both URLs exactly the testnet's ([`TESTNET_REST`] and
+/// [`TESTNET_WS`]), or both a loopback stub's with the path exactly `/v1`. Whatever sits in a
+/// URL's path is sent to the venue (the REST requests' paths, the WebSocket upgrade), so no
+/// other path is taken. A refusal names the flag and what is expected, never what was typed.
 fn testnet_urls(rest: &str, ws: &str) -> Result<Target, String> {
-    let (rest_host, ws_host) = hosts(rest, ws)?;
-    let loopback = |host: &str| {
-        host == "localhost"
-            || host == "[::1]"
-            || host
-                .parse::<std::net::Ipv4Addr>()
-                .is_ok_and(|ip| ip.is_loopback())
-    };
-    let plain = |url: &str| url.starts_with("http://") || url.starts_with("ws://");
-    match (loopback(&rest_host), loopback(&ws_host)) {
-        (true, true) => Ok(Target::LoopbackStub),
+    let rest_url = split(rest, ["https://", "http://"], "--rest-url")?;
+    let ws_url = split(ws, ["wss://", "ws://"], "--ws-url")?;
+    match (rest_url.loopback(), ws_url.loopback()) {
+        (true, true) => {
+            rest_url.stub("--rest-url")?;
+            ws_url.stub("--ws-url")?;
+            Ok(Target::LoopbackStub)
+        }
         (false, false) => {
-            if rest_host != TESTNET_REST_HOST || plain(rest) {
+            if rest != TESTNET_REST {
                 return Err(format!(
-                    "--rest-url (host {rest_host}): not Paradex's testnet REST base (https://{TESTNET_REST_HOST}/v1) \
-                     or a loopback stub; testnet_trade is testnet only"
+                    "--rest-url: not Paradex's testnet REST base, exactly {TESTNET_REST}, or a                      loopback stub's; testnet_trade is testnet only{SHOWN_NOT}"
                 ));
             }
-            if ws_host != TESTNET_WS_HOST || plain(ws) {
+            if ws != TESTNET_WS {
                 return Err(format!(
-                    "--ws-url (host {ws_host}): not Paradex's testnet WebSocket (wss://{TESTNET_WS_HOST}/v1) \
-                     or a loopback stub; testnet_trade is testnet only"
+                    "--ws-url: not Paradex's testnet WebSocket, exactly {TESTNET_WS}, or a                      loopback stub's; testnet_trade is testnet only{SHOWN_NOT}"
                 ));
             }
             Ok(Target::Testnet)
@@ -411,64 +434,109 @@ fn testnet_urls(rest: &str, ws: &str) -> Result<Target, String> {
     }
 }
 
-/// The lowercased host of `url` (without port), which must start with one of `schemes` and name
-/// no user, query or fragment. A refusal names the flag, never the URL: what was typed may carry
-/// a secret (a password, a token).
-fn host_of(url: &str, schemes: &[&str], flag: &str) -> Result<String, String> {
-    let bad = |why: &str| format!("{flag}: {why} (the URL is not shown: it may carry a secret)");
+/// Ends a refusal of a URL: what was typed is never shown.
+const SHOWN_NOT: &str = " (the URL is not shown: it may carry a secret)";
+
+/// A URL [`split`] took apart.
+struct Url<'a> {
+    /// The lowercased host, a host name's shape ([`proxy_host`]).
+    host: String,
+    /// The port, when one was given.
+    port: Option<&'a str>,
+    /// Everything after the host and port: empty, or from its '/'.
+    path: &'a str,
+}
+
+impl Url<'_> {
+    /// Whether the host is a loopback one: a test stub on this machine.
+    fn loopback(&self) -> bool {
+        self.host == "localhost"
+            || self.host == "[::1]"
+            || self
+                .host
+                .parse::<std::net::Ipv4Addr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    }
+
+    /// Refuses a loopback stub's URL unless its path is exactly `/v1` and its port, if any, a
+    /// port number.
+    fn stub(&self, flag: &str) -> Result<(), String> {
+        if self
+            .port
+            .is_some_and(|p| !p.parse::<u16>().is_ok_and(|p| p > 0))
+        {
+            return Err(format!(
+                "{flag}: a loopback stub's port is not a port{SHOWN_NOT}"
+            ));
+        }
+        if self.path != "/v1" {
+            return Err(format!(
+                "{flag}: a loopback stub's path must be exactly /v1{SHOWN_NOT}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// `url` taken apart: it must start with one of `schemes`, name no user, query or fragment, and
+/// its host must be shaped like a host name ([`proxy_host`]). A refusal names the flag, never
+/// the URL nor its host: what was typed may carry a secret (a password, a token, a pasted key).
+fn split<'a>(url: &'a str, schemes: [&str; 2], flag: &str) -> Result<Url<'a>, String> {
+    let bad = |why: &str| format!("{flag}: {why}{SHOWN_NOT}");
     let rest = schemes
         .iter()
         .find_map(|s| url.strip_prefix(s))
         .ok_or_else(|| bad(&format!("not a {} URL", schemes.join(" or "))))?;
-    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
-    if authority.contains('@') {
-        return Err(bad("a URL with a user is refused"));
-    }
     if rest.contains(['?', '#']) {
         return Err(bad("a URL with a query or a fragment is refused"));
     }
-    let host = match authority.strip_prefix('[') {
-        Some(v6) => format!(
-            "[{}]",
-            &v6[..v6.find(']').ok_or_else(|| bad("no closing ]"))?]
-        ),
-        None => authority[..authority.find(':').unwrap_or(authority.len())].to_owned(),
-    };
-    if host.is_empty() {
-        return Err(bad("no host"));
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    if authority.contains('@') {
+        return Err(bad("a URL with a user is refused"));
     }
-    // Printed in a later refusal: a host name's characters only.
-    if !host
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b"-.[]:".contains(&b))
-    {
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(v6) => {
+            let close = v6.find(']').ok_or_else(|| bad("no closing ]"))?;
+            (&authority[..close + 2], &v6[close + 1..])
+        }
+        None => authority.split_at(authority.find(':').unwrap_or(authority.len())),
+    };
+    let port = match port.strip_prefix(':') {
+        Some(port) => Some(port),
+        None if port.is_empty() => None,
+        None => return Err(bad("not a host and port")),
+    };
+    if !proxy_host(host) {
         return Err(bad("not a host name"));
     }
-    Ok(host.to_ascii_lowercase())
+    Ok(Url {
+        host: host.to_ascii_lowercase(),
+        port,
+        path,
+    })
 }
 
 /// The longest part of a market name between its '-'s: Paradex's are short (`BTC`, `PERP`,
 /// `27JUN25`, `100000`), and a longer one is more likely a pasted secret than a market.
 const MARKET_PART_MAX: usize = 12;
 
-/// A Paradex market as Paradex spells it: three or more parts of upper-case ASCII letters and
-/// digits, each at most [`MARKET_PART_MAX`] long, joined by '-' (`BTC-USD-PERP`). Anything else
-/// is refused before it is put in a request path, where a pasted private key would be sent to
-/// the venue; the refusal never shows the value.
+/// A Paradex market as Paradex spells it: three or more parts of ASCII letters and digits,
+/// each at most [`MARKET_PART_MAX`] long, joined by '-' (`BTC-USD-PERP`, `kBONK-USD-PERP`: the
+/// letters as md_watch's Paradex spelling takes them, either case, since some markets carry a
+/// lower-case prefix). Anything else is refused before it is put in a request path, where a
+/// pasted private key would be sent to the venue; the refusal never shows the value.
 fn symbol(value: &str) -> Result<String, String> {
     let parts: Vec<&str> = value.split('-').collect();
     let shaped = parts.len() >= 3
         && parts.iter().all(|p| {
-            (1..=MARKET_PART_MAX).contains(&p.len())
-                && p.bytes()
-                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+            (1..=MARKET_PART_MAX).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_alphanumeric())
         });
     if shaped {
         Ok(value.to_owned())
     } else {
         Err(format!(
-            "--market: not a market as Paradex spells it (upper-case letters and digits in three \
-             or more parts joined by '-', e.g. BTC-USD-PERP){UNSHOWN}"
+            "--market: not a market as Paradex spells it (letters and digits in three or more \
+             parts joined by '-', e.g. BTC-USD-PERP or kBONK-USD-PERP){UNSHOWN}"
         ))
     }
 }
