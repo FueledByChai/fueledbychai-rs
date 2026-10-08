@@ -12,7 +12,8 @@
 //! ticks, sizes lots, either list possibly empty):
 //!
 //! - `snap|sym|book|seq|ts?|<levels>`: [`BOOK`]'s whole snapshot, decoded whole or not at all
-//!   (record 0014 item 2).
+//!   (record 0014 item 2). One before the sequence the channel had reached is dropped, after a
+//!   gap or while live: sequences never go back on a connection (Codex r4216289341).
 //! - `delta|sym|book|seq|ts?|<levels>`: levels set (zero removes one) on either channel. A
 //!   `seq` other than the channel's last plus one is a gap: `Health { feed: Feed::Book(book),
 //!   h: Gap }` names the channel that broke, the other is untouched, and the broken one waits
@@ -21,10 +22,15 @@
 //!   up to `seq` are dropped and the rest must follow it plus one, or the anchor is asked for
 //!   again and nothing is pushed, those after it still held. Past [`MAX_HELD`] deltas, or at a
 //!   gap, the anchor is asked for again holding the delta that overflowed or broke the
-//!   sequence, the first the new anchor must reach. After a gap an anchor before the sequence
+//!   sequence, the first the new anchor must reach, and an anchor before the highest delta it
+//!   held is asked for again (Codex r4216289348). After a gap an anchor before the sequence
 //!   the channel had reached is asked for again too: sequences never go back on a connection.
-//!   No sequence follows `u64::MAX`: a delta after an anchor or delta there is a gap. A failure, a status other than 200 or a body it cannot decode
-//!   asks again after [`ANCHOR_RETRY`].
+//!   No sequence follows `u64::MAX`: a delta after an anchor or delta there is a gap. A
+//!   failure, a status other than 200 or a body it cannot decode asks again after
+//!   [`ANCHOR_RETRY`].
+//!
+//! A record with more levels on a side than its channel's declared `max_depth` is malformed,
+//! nothing of it pushed (Codex r4216289357).
 //!
 //! A frame for a channel not subscribed is dropped; an anchor answered after its subscription
 //! was removed, or superseded, is ignored.
@@ -49,8 +55,9 @@ use DecodeError::Malformed;
 /// Where one subscribed channel stands.
 #[derive(Clone, Debug)]
 enum Chan {
-    /// No snapshot yet, or a gap since the last: deltas are dropped.
-    Waiting,
+    /// No snapshot yet, or a gap since the last: deltas are dropped, and a snapshot before
+    /// `floor`, the sequence the channel had already reached, too (Codex r4216289341).
+    Waiting { floor: u64 },
     /// An anchor is asked for at `url` under `tag`; deltas are held in order until it comes.
     /// An anchor before `floor`, the sequence the channel had already reached, is asked for
     /// again: it would move the book back (Codex r4216139627).
@@ -215,7 +222,7 @@ impl ToyMd {
                     floor,
                 }
             }
-            _ => Chan::Waiting,
+            _ => Chan::Waiting { floor },
         }
     }
 
@@ -228,11 +235,13 @@ impl ToyMd {
         fx: &mut Effects,
     ) {
         match self.chans.get_mut(&key) {
-            None | Some(Chan::Waiting) => {}
+            None | Some(Chan::Waiting { .. }) => {}
             Some(Chan::Anchoring { held, .. }) if held.len() < MAX_HELD => held.push(d),
             // Held past the bound: ask again rather than grow, holding `d` as the first delta
-            // the new anchor must reach (Codex r4203051298).
-            Some(&mut Chan::Anchoring { floor, .. }) => {
+            // the new anchor must reach (Codex r4203051298), and refusing one before the
+            // highest delta held, which `d` may be behind (Codex r4216289348).
+            Some(Chan::Anchoring { held, floor, .. }) => {
+                let floor = held.iter().map(|h| h.seq).fold(*floor, u64::max);
                 let next = self.restart(key.0, key.1, specs, (vec![d], floor), fx);
                 self.chans.insert(key, next);
             }
@@ -259,7 +268,7 @@ impl ToyMd {
         if r.kind != "anchor" || specs.by_symbol(r.get("sym")?).map(|s| s.id) != Some(inst) {
             return Err(Malformed("anchor"));
         }
-        let snap = levels(&r)?;
+        let snap = levels(&r, depth(ANCHORED_BOOK))?;
         let Some(&Chan::Anchoring {
             ref held, floor, ..
         }) = self.chans.get(&key)
@@ -309,13 +318,24 @@ fn push_levels(inst: InstrumentId, book: BookId, s: &Levels, sink: &mut dyn MdSi
     }
 }
 
-/// The sequence, time and levels of a `snap`, `delta` or `anchor` record, all or nothing.
-fn levels(r: &Record<'_>) -> Result<Levels, DecodeError> {
+/// The most levels per side `book` declares; zero for a book it does not declare.
+fn depth(book: BookId) -> usize {
+    let declared = caps().md.books.get(usize::from(book.0)).copied();
+    declared.map_or(0, |b| usize::from(b.max_depth))
+}
+
+/// The sequence, time and levels of a `snap`, `delta` or `anchor` record, all or nothing, no
+/// side past `depth` levels.
+fn levels(r: &Record<'_>, depth: usize) -> Result<Levels, DecodeError> {
     let meta = r.meta(true)?;
     let seq = r.num("seq")?;
     let mut levels = Vec::new();
     for (key, side) in [("bid", BookSide::Bid), ("ask", BookSide::Ask)] {
-        for level in r.get(key)?.split(',').filter(|l| !l.is_empty()) {
+        let listed = r.get(key)?.split(',').filter(|l| !l.is_empty());
+        if listed.clone().count() > depth {
+            return Err(Malformed("depth"));
+        }
+        for level in listed {
             let (px, qty) = level.split_once(':').ok_or(Malformed(key))?;
             let px = Ticks(px.parse().map_err(|_| Malformed(key))?);
             let qty = qty.parse().ok().and_then(Lots::new).ok_or(Malformed(key))?;
@@ -331,7 +351,9 @@ impl MdCodec for ToyMd {
 
     /// Checks every subscription before asking for anything: an instrument missing from
     /// `specs`, a feed other than a declared book channel, or [`ANCHORED_BOOK`] without an
-    /// anchor URL is refused, nothing sent (Codex r4172917339).
+    /// anchor URL is refused, nothing sent (Codex r4172917339). Every instrument, added or
+    /// removed, is checked before any feed, so a missing one is named first (Codex
+    /// r4216704345).
     fn subscribe(
         &mut self,
         add: &[Subscription],
@@ -339,6 +361,13 @@ impl MdCodec for ToyMd {
         specs: &SpecTable,
         fx: &mut Effects,
     ) -> Result<(), VenueError> {
+        let unknown = add
+            .iter()
+            .chain(remove)
+            .find(|s| specs.get(s.inst).is_none());
+        if let Some(s) = unknown {
+            return Err(VenueError::UnknownInstrument(s.inst));
+        }
         let spell = |subs: &[Subscription]| -> Result<Vec<String>, VenueError> {
             subs.iter().map(|s| self.check(s, specs)).collect()
         };
@@ -393,10 +422,16 @@ impl MdCodec for ToyMd {
             return Err(Malformed("book"));
         }
         // The whole record is read before anything is pushed.
-        let s = levels(&r)?;
+        let s = levels(&r, depth(book))?;
         match r.kind {
             "snap" if book == BOOK => {
-                if self.chans.contains_key(&(inst, book)) {
+                // A snapshot before the sequence the channel had reached is dropped.
+                let floor = match self.chans.get(&(inst, book)) {
+                    Some(&Chan::Waiting { floor }) => Some(floor),
+                    Some(&Chan::Live { seq }) => Some(seq),
+                    _ => None,
+                };
+                if floor.is_some_and(|floor| floor <= s.seq) {
                     self.push_snapshot(inst, book, &s, sink);
                     self.chans.insert((inst, book), Chan::Live { seq: s.seq });
                 }
