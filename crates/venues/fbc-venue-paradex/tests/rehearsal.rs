@@ -60,6 +60,7 @@ use fbc_venue_paradex::factory::{EXEC_MODE, EXEC_URL, RPC_TIMEOUT};
 use glue::{Glue, GlueHandler, Note, wall_now};
 use rust_decimal::Decimal;
 use serde_json::Value;
+use starknet_crypto::Felt;
 use venue::{Book, Fate, MARKET, Order, Shared, Stub, TOKEN, lock};
 
 const INST: InstrumentId = md::BTC;
@@ -359,35 +360,60 @@ fn opening(methods: &[String]) {
 /// (as hex, with or without `0x`, any case), the stub's token, and each part of each login
 /// signature the stub read.
 fn secrets_absent(text: &str, signatures: &[String], what: &str) {
+    let lower = text.to_ascii_lowercase();
+    for needle in credential_needles(signatures) {
+        assert!(
+            !lower.contains(&needle),
+            "{what} shows a credential, the token or a login signature"
+        );
+    }
+}
+
+/// What [`secrets_absent`] looks for, lowercase: the account, the key, the session token and the
+/// login signatures' numbers, each as text and as the hex of its bytes, as tungstenite dumps a
+/// payload. A number is also looked for as starknet's `Felt` prints it: in hex without leading
+/// zeros (which `{:x}`, `{:#x}` and any zero-padded form contain) and in decimal.
+fn credential_needles(signatures: &[String]) -> Vec<String> {
     let (account, key) = synthetic();
-    let mut secrets = vec![
-        account.trim_start_matches("0x").to_owned(),
-        key.trim_start_matches("0x").to_owned(),
-        TOKEN.to_owned(),
-    ];
+    let mut numbers = vec![account, key];
     for sig in signatures {
         assert!(!sig.is_empty(), "the stub read no login signature");
         // The signature's numbers, not its punctuation or a short fragment.
         let parts = sig.split(|c: char| !c.is_ascii_alphanumeric());
-        secrets.extend(
+        numbers.extend(
             parts
-                .map(|p| p.trim_start_matches("0x").to_owned())
-                .filter(|p| p.len() >= 16),
+                .filter(|p| p.trim_start_matches("0x").len() >= 16)
+                .map(str::to_owned),
         );
     }
-    let lower = text.to_ascii_lowercase();
-    for secret in secrets {
-        // As text, in any case, and as the hex of its bytes, as tungstenite dumps a payload.
-        let hex: String = secret.bytes().map(|b| format!("{b:02x}")).collect();
-        for needle in [secret.to_ascii_lowercase(), hex] {
-            assert!(
-                !lower.contains(&needle),
-                "{what} shows a credential, the token or a login signature"
-            );
-        }
+    let mut secrets = vec![TOKEN.to_owned()];
+    for number in numbers {
+        let digits = number.trim_start_matches("0x");
+        let felt = if number.starts_with("0x") || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            Felt::from_hex(&format!("0x{digits}"))
+        } else {
+            Felt::from_dec_str(digits)
+        };
+        let felt = felt.unwrap_or_else(|_| panic!("{number} is not a field element"));
+        secrets.push(digits.to_owned());
+        secrets.push(
+            format!("{felt:x}")
+                .trim_start_matches("0x")
+                .trim_start_matches('0')
+                .to_owned(),
+        );
+        secrets.push(format!("{felt}"));
     }
+    let mut needles = Vec::new();
+    for secret in secrets {
+        let hex: String = secret.bytes().map(|b| format!("{b:02x}")).collect();
+        needles.push(secret.to_ascii_lowercase());
+        needles.push(hex);
+    }
+    needles
 }
 
+/// Every record this thread logged, one per line.
 /// Every record this thread logged, one per line.
 fn trace_output() -> String {
     capture::of_this_thread()
@@ -395,6 +421,34 @@ fn trace_output() -> String {
         .map(|l| format!("{} {} {}", l.level, l.target, l.text))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// A field element is how the account, the key and a signature's numbers would most likely reach
+/// a log: printed by starknet's `Felt`, in hex without the leading zeros the fixture keeps, or in
+/// decimal (Reviewer B RB-8mv-2 on PR #119). [`secrets_absent`] has to see every such form.
+#[test]
+fn the_secret_search_sees_a_field_element_in_every_form_it_prints() {
+    let (account, key) = synthetic();
+    let needles = credential_needles(&[]);
+    for value in [account, key] {
+        let felt = Felt::from_hex(&value).unwrap();
+        for printed in [
+            format!("{felt}"),
+            format!("{felt:?}"),
+            format!("{felt:x}"),
+            format!("{felt:#x}"),
+            format!("{felt:#064x}"),
+        ] {
+            let printed = printed.to_ascii_lowercase();
+            let hex: String = printed.bytes().map(|b| format!("{b:02x}")).collect();
+            for shown in [&printed, &hex] {
+                assert!(
+                    needles.iter().any(|n| shown.contains(n.as_str())),
+                    "the search misses {value} printed as {printed}"
+                );
+            }
+        }
+    }
 }
 
 /// From a fresh start: no place or amend frame until Start; Start refused until the first
