@@ -94,8 +94,11 @@ fn options(stub: &StubServer, min_notional: &str) -> Options {
         tick: Decimal::from_str("0.1").unwrap(),
         step: Decimal::from_str("0.00001").unwrap(),
         min_notional: Decimal::from_str(min_notional).unwrap(),
-        resting_cap_usd: Decimal::from(11),
+        // A resting cap above the order: the order's size is --order-usd's, never the cap's.
+        resting_cap_usd: Decimal::from(20),
         inventory_cap_usd: Decimal::from(50),
+        order_usd: Decimal::from(11),
+        namespace: 1,
         side: OrderSide::Buy,
         away_bps: 300,
         hold_secs: 0,
@@ -252,6 +255,18 @@ fn responder(placed: Arc<Mutex<Placed>>) -> Responder {
     responder_with(placed, Arc::new(Vec::new()), End::Canceled, End::Canceled)
 }
 
+/// As [`responder`], the placed order's cancel answered with `extra` frames before the order
+/// event closing it.
+fn responder_extra(placed: Arc<Mutex<Placed>>, extra: Vec<Vec<u8>>) -> Responder {
+    responder_full(
+        placed,
+        Arc::new(Vec::new()),
+        End::Canceled,
+        End::Canceled,
+        Arc::new(extra),
+    )
+}
+
 /// How the stub ends an order it is asked to cancel, in the order event after the cancel's
 /// reply.
 #[derive(Clone, Copy)]
@@ -310,6 +325,24 @@ fn responder_with(
     placed_end: End,
     restored_end: End,
 ) -> Responder {
+    responder_full(
+        placed,
+        restored,
+        placed_end,
+        restored_end,
+        Arc::new(Vec::new()),
+    )
+}
+
+/// As [`responder_with`], with `extra` frames sent with the placed order's cancel, before the
+/// order event closing it.
+fn responder_full(
+    placed: Arc<Mutex<Placed>>,
+    restored: Arc<Vec<Restored>>,
+    placed_end: End,
+    restored_end: End,
+    extra: Arc<Vec<Vec<u8>>>,
+) -> Responder {
     let close = !matches!(restored_end, End::Refused);
     Responder::new(move |frame| {
         let Frame::Text(text) = frame else {
@@ -354,6 +387,7 @@ fn responder_with(
                         frames.push(Frame::Binary(ev));
                     }
                 }
+                frames.extend(extra.iter().cloned().map(Frame::Binary));
                 frames.push(Frame::Binary(closed));
                 Ok(frames)
             }
@@ -528,7 +562,8 @@ async fn testnet_trade_places_one_post_only_order_and_cancels_it_against_the_stu
     assert_eq!(count("order.cancel_on_disconnect"), 1, "{sent:?}");
     assert_eq!(stub.connections().len(), 1);
     // The order: post-only, priced 3% under the fixture's best bid of 62000.2 on the 0.1 tick
-    // (60140.1 after the floor), sized to the test's $11 resting cap on the 0.00001 step: 18 lots.
+    // (60140.1 after the floor), sized to the test's $11 --order-usd on the 0.00001 step: 18
+    // lots (the $20 resting cap would admit 33).
     let create = stub.connections()[0]
         .received
         .iter()
@@ -554,6 +589,13 @@ async fn testnet_trade_places_one_post_only_order_and_cancels_it_against_the_stu
     assert!(
         printed.contains("DONE ok places sent 1 cancels sent 1"),
         "{printed}"
+    );
+    // The touch was read twice: to price the order, and just before the place.
+    assert!(printed.contains("BBO again bid 62000.2"), "{printed}");
+    let book = format!("GET /v1/orderbook/{MARKET}?depth=15");
+    assert_eq!(
+        stub.http_requests().iter().filter(|r| **r == book).count(),
+        2
     );
     // No credential, and not the session token, appears in what it printed.
     let (account, key) = synthetic();
@@ -707,8 +749,12 @@ fn strings(args: &[&str]) -> Vec<String> {
     args.iter().map(|a| (*a).to_owned()).collect()
 }
 
-const MARKET_ARGS: [&str; 17] = [
+const MARKET_ARGS: [&str; 21] = [
     "--sole-trader",
+    "--namespace",
+    "1",
+    "--order-usd",
+    "11",
     "--side",
     "buy",
     "--away-bps",
@@ -795,6 +841,8 @@ fn the_command_line_defaults_to_testnet_and_refuses_mainnet_urls() {
         "--inventory-cap-usd",
         "--side",
         "--away-bps",
+        "--order-usd",
+        "--namespace",
     ] {
         let i = MARKET_ARGS.iter().position(|a| *a == missing).unwrap();
         let mut argv = strings(&MARKET_ARGS);
@@ -808,6 +856,10 @@ fn the_command_line_defaults_to_testnet_and_refuses_mainnet_urls() {
         ("--side", "both"),
         ("--resting-cap-usd", "0"),
         ("--inventory-cap-usd", "-50"),
+        ("--namespace", "0"),
+        ("--namespace", "65536"),
+        // Above the $11 resting cap: the cap bounds the order.
+        ("--order-usd", "12"),
     ] {
         let mut argv = strings(&MARKET_ARGS);
         argv.extend(strings(&[flag, bad]));
@@ -856,6 +908,9 @@ fn help_names_the_environment_the_flags_and_every_line() {
         "--socks5",
         "--lease-dir",
         "--sole-trader",
+        "--namespace",
+        "--order-usd",
+        "BBO again",
         "STEP login",
         "STEP arm",
         "STEP resync",
@@ -937,7 +992,7 @@ async fn the_client_id_high_water_mark_is_read_before_minting_and_kept_after() {
         .await
         .unwrap();
     let opts = options(&stub, "10");
-    let hwm = trade::HighWater::at(&opts.lease_dir);
+    let hwm = trade::HighWater::at(&opts.lease_dir, fbc_core::Namespace::new(1));
     let mark = 1u64 << 60;
     hwm.write(mark).unwrap();
     let (report, printed) = run_against(&opts).await;
@@ -1249,4 +1304,306 @@ async fn an_earlier_runs_order_that_fills_before_stop_fails_the_run() {
         "{printed}"
     );
     assert!(printed.contains("DONE failed"), "{printed}");
+}
+
+#[test]
+fn an_order_of_ours_not_cancelled_when_the_run_ends_fails_it() {
+    // Stop's cancel of an order can go unsent (the session ended before it took it, say), with
+    // no acknowledgement or order event left to wait for: the run's end judges every order of
+    // ours on the market by its state, so one still open fails the run.
+    use fbc_core::{
+        AccountKey, CancelReason, CidMatch, CidMint, InstrumentId, Lots, MonoNs, Namespace,
+        NamespaceLease, Side, VenueOrderSnapshot, VenueOrderState, WallNs,
+    };
+    use fbc_oms::{LadderConfig, OrdState, OrderKey, Registry, ResyncSnapshot};
+    let lease =
+        NamespaceLease::acquire(&lease_dir(), AccountKey::new(1), Namespace::new(1)).unwrap();
+    let mut mint = CidMint::new(lease, 0, 0, WallNs(0));
+    let (a, b) = (mint.mint().unwrap(), mint.mint().unwrap());
+    let caps = fbc_venue_paradex::factory::caps();
+    let vid = |v: &str| {
+        fbc_core::dispatch(&caps, Namespace::new(1), |scope| scope.venue_order_id(v)).unwrap()
+    };
+    let shown = |cid, v: &str, state| VenueOrderSnapshot {
+        cid: Some(CidMatch::Ours(cid)),
+        vid: vid(v),
+        inst: InstrumentId::new(1),
+        side: Side::Sell,
+        state,
+        px: None,
+        qty: Lots::new(1).unwrap(),
+        cum_filled: Lots::new(0).unwrap(),
+        post_only: None,
+        reduce_only: None,
+    };
+    let order_caps = caps.exec.clone().unwrap().order;
+    let ladder = LadderConfig::new(
+        Duration::from_secs(5),
+        Duration::from_secs(1),
+        Duration::from_secs(60),
+        2,
+    )
+    .unwrap();
+    let mut reg = Registry::new();
+    let snapshot = |orders| ResyncSnapshot {
+        watermark: WallNs(0),
+        requested_at: MonoNs(0),
+        orders,
+        positions: vec![],
+    };
+    let key = |n| OrderKey {
+        venue: Some(n),
+        ingest: n,
+    };
+    reg.resync(
+        &ladder,
+        &order_caps,
+        &snapshot(vec![
+            shown(a, "V-1", VenueOrderState::Open),
+            shown(b, "V-2", VenueOrderState::Open),
+        ]),
+        key(1),
+    )
+    .unwrap();
+    let owned = [(a, Lots::ZERO), (b, Lots::ZERO)];
+    let left = trade::not_cancelled(&reg, &owned);
+    assert_eq!(left.iter().map(|(cid, _)| *cid).collect::<Vec<_>>(), [a, b]);
+    assert!(
+        left.iter().all(|(_, s)| *s == Some(OrdState::Open)),
+        "{left:?}"
+    );
+    // `a` cancelled, `b` still open: only `b` is left.
+    reg.resync(
+        &ladder,
+        &order_caps,
+        &snapshot(vec![
+            shown(a, "V-1", VenueOrderState::Canceled(CancelReason::Requested)),
+            shown(b, "V-2", VenueOrderState::Open),
+        ]),
+        key(2),
+    )
+    .unwrap();
+    let left = trade::not_cancelled(&reg, &owned);
+    assert_eq!(left.iter().map(|(cid, _)| *cid).collect::<Vec<_>>(), [b]);
+    // An order the registry holds no record of is not known to be cancelled either.
+    let c = mint.mint().unwrap();
+    assert_eq!(trade::not_cancelled(&reg, &[(c, Lots::ZERO)]), [(c, None)]);
+}
+
+#[tokio::test]
+async fn orders_under_another_namespace_than_the_one_allocated_refuse_the_run_before_start() {
+    // The earlier run's orders were minted under namespace 1; this run is allocated 2, so they
+    // are another consumer's: never registered, never cancelled as ours.
+    let (_, body) = restored();
+    let placed = Arc::new(Mutex::new(Placed::default()));
+    let with = responder(Arc::clone(&placed));
+    let mut script = vec![Step::Accept];
+    script.extend((0..6).map(|_| Step::Respond {
+        conn: 0,
+        with: with.clone(),
+    }));
+    let stub = StubServer::start(WsScript::new(script), routes_with(body))
+        .await
+        .unwrap();
+    let mut opts = options(&stub, "10");
+    opts.namespace = 2;
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(!report.ok, "{printed}");
+    assert!(
+        printed.contains("2 open orders on the market are not ours"),
+        "{printed}"
+    );
+    assert_eq!(
+        steps(&printed),
+        ["login", "arm", "resync", "stop"],
+        "{printed}"
+    );
+    assert_eq!(
+        (report.places_sent, report.cancels_sent),
+        (0, 0),
+        "{printed}"
+    );
+}
+
+#[tokio::test]
+async fn a_touch_that_moved_toward_the_order_before_the_place_stops_the_run_with_nothing_placed() {
+    // The first read prices the order at 60140.1, 3% under 62000.2; by the second the bid is
+    // 61000.2, so the order would rest only about 1.4% behind it.
+    let book = fs::read_to_string(fixture("paradex/rest/orderbook-btc-2002.json")).unwrap();
+    let mut moved: Value = serde_json::from_str(&book).unwrap();
+    moved["bids"] = json!([["61000.2", "0.333"]]);
+    moved["asks"] = json!([["61000.5", "0.1"]]);
+    moved["best_bid_api"] = json!(["61000.2", "0.333"]);
+    moved["best_bid_interactive"] = json!(["61000.2", "0.333"]);
+    moved["best_ask_api"] = json!(["61000.5", "0.1"]);
+    moved["best_ask_interactive"] = json!(["61000.5", "0.1"]);
+    moved["seq_no"] = json!(2003);
+    let moved = moved.to_string();
+    let reads = Arc::new(AtomicU64::new(0));
+    let empty = r#"{"results":[]}"#;
+    let routes = HttpRouter::new()
+        .route(
+            Method::POST,
+            PathPattern::exact("/v1/auth"),
+            reply(200, format!(r#"{{"jwt_token":"{TOKEN}"}}"#)),
+        )
+        .route_fn(
+            Method::GET,
+            PathPattern::exact(&format!("/v1/orderbook/{MARKET}")),
+            move |_| {
+                if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                    reply(200, book.clone())
+                } else {
+                    reply(200, moved.clone())
+                }
+            },
+        )
+        .route(
+            Method::GET,
+            PathPattern::exact("/v1/orders"),
+            reply(200, empty),
+        )
+        .route(
+            Method::GET,
+            PathPattern::exact("/v1/positions"),
+            reply(200, empty),
+        );
+    let with = responder(Arc::new(Mutex::new(Placed::default())));
+    // Auth, four subscriptions and the arm: nothing after them.
+    let mut script = vec![Step::Accept];
+    script.extend((0..6).map(|_| Step::Respond {
+        conn: 0,
+        with: with.clone(),
+    }));
+    let stub = StubServer::start(WsScript::new(script), routes)
+        .await
+        .unwrap();
+    let opts = options(&stub, "10");
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(!report.ok, "{printed}");
+    assert!(
+        printed.contains("the touch moved toward the order (bid 61000.2, ask 61000.5)"),
+        "{printed}"
+    );
+    assert!(printed.contains("nothing placed"), "{printed}");
+    assert_eq!(
+        steps(&printed),
+        ["login", "arm", "resync", "start", "stop"],
+        "{printed}"
+    );
+    assert_eq!(
+        (report.places_sent, report.cancels_sent),
+        (0, 0),
+        "{printed}"
+    );
+    assert!(!methods(&stub).iter().any(|m| m == "order.create"));
+}
+
+/// A frame of `fixtures/paradex/exec`: whitespace-separated hex bytes, `#` to the end of a
+/// line a comment.
+fn sbe_fixture(name: &str) -> Vec<u8> {
+    let text = fs::read_to_string(fixture(&format!("paradex/exec/{name}"))).unwrap();
+    text.lines()
+        .map(|l| l.split('#').next().unwrap())
+        .flat_map(str::split_whitespace)
+        .map(|b| u8::from_str_radix(b, 16).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_fill_not_of_our_orders_or_a_moved_position_fails_the_run() {
+    // Each comes in while the placed order's cancel is answered, the round trip otherwise
+    // whole: another system's fill on the account (a random UUID client id, an order the
+    // registry does not hold), then the venue reporting the account long 0.15 when the run
+    // seeded it flat.
+    let foreign = fill_event(
+        4_000,
+        "1759500000000000999",
+        "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+        "62000",
+    );
+    let position = sbe_fixture("position-long-v2.sbe.txt");
+    for (extra, said) in [
+        (foreign, "a fill not of our orders came in"),
+        (
+            position,
+            "the venue reported the account's position in instrument 1 as 15000 lots, not the 0",
+        ),
+    ] {
+        let placed = Arc::new(Mutex::new(Placed::default()));
+        let with = responder_extra(Arc::clone(&placed), vec![extra]);
+        let mut script = vec![Step::Accept];
+        script.extend((0..8).map(|_| Step::Respond {
+            conn: 0,
+            with: with.clone(),
+        }));
+        let stub = StubServer::start(WsScript::new(script), routes())
+            .await
+            .unwrap();
+        let opts = options(&stub, "10");
+        let (report, printed) = run_against(&opts).await;
+        stub.finished().await.unwrap();
+        assert!(printed.contains("STEP closed"), "{printed}");
+        assert!(!report.ok, "{printed}");
+        assert!(printed.contains(said), "{printed}");
+        assert!(printed.contains("DONE failed"), "{printed}");
+    }
+}
+
+#[test]
+fn the_output_writer_never_waits_for_a_stalled_sink() {
+    use std::io::Write;
+    use std::sync::mpsc;
+    /// A sink whose first write waits until the test releases it.
+    struct Stalled {
+        release: mpsc::Receiver<()>,
+        held: bool,
+        got: Arc<Mutex<Vec<u8>>>,
+    }
+    impl Write for Stalled {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if !self.held {
+                self.held = true;
+                self.release.recv().unwrap();
+            }
+            self.got.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let (release, rx) = mpsc::channel();
+    let got = Arc::new(Mutex::new(Vec::new()));
+    let sink = Stalled {
+        release: rx,
+        held: false,
+        got: Arc::clone(&got),
+    };
+    let (mut writer, printing) = trade::detached(sink);
+    // Every line is handed over while the sink is stalled on the first: none waits for it.
+    let (done, wrote) = mpsc::channel();
+    let lines = std::thread::spawn(move || {
+        for i in 0..1_000 {
+            writeln!(writer, "line {i}").unwrap();
+        }
+        done.send(()).unwrap();
+        writer
+    });
+    wrote
+        .recv_timeout(Duration::from_secs(30))
+        .expect("a write waited for the stalled sink");
+    let writer = lines.join().unwrap();
+    assert!(got.lock().unwrap().is_empty());
+    // Released, the sink gets every line in order; the thread ends once the writer is dropped.
+    release.send(()).unwrap();
+    drop(writer);
+    printing.join().unwrap();
+    let expected: String = (0..1_000).map(|i| format!("line {i}\n")).collect();
+    assert_eq!(
+        String::from_utf8(got.lock().unwrap().clone()).unwrap(),
+        expected
+    );
 }

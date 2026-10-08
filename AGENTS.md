@@ -361,7 +361,9 @@ rather than guess.
     before anything connects), an fbc-oms registry declared an owner-assisted testnet run
     (decision 0067) behind one `ExecSession`, its events routed into the registry by
     `link.rs` (the ExecHandler-to-Registry glue a later sample can promote), one post-only order
-    placed well away from the touch read from `GET /orderbook`, cancelled, then Stop
+    placed well away from the touch read from `GET /orderbook` (read again just before the
+    place), its size, caps, side, distance and client-id namespace all required flags,
+    cancelled, then Stop
     (`tests/testnet_trade.rs`, against a Paradex-shaped conformance stub). Its credentials come
     from environment variables through `src/auth.rs`, a review path included by path, not a
     module of the empty library target.

@@ -1,6 +1,6 @@
-//! testnet_trade: logs in to Paradex TESTNET, resyncs, places ONE post-only limit order, sized to
-//! the resting cap given on the command line, well away from the touch through fbc-oms, waits for its acknowledgement, cancels it,
-//! waits for the cancel's acknowledgement, then Stops (kill switch + cancel all) and exits,
+//! testnet_trade: logs in to Paradex TESTNET, resyncs, places ONE post-only limit order of the
+//! size given on the command line, well away from the touch through fbc-oms, waits for its
+//! acknowledgement, cancels it, waits for the cancel's acknowledgement, then Stops (kill switch + cancel all) and exits,
 //! printing each step with its time. TESTNET ONLY: a mainnet URL or chain id is refused before
 //! anything connects. An owner-run sample: CI builds it, and its wiring is tested against the
 //! conformance stub (`tests/testnet_trade.rs`), but nothing runs it against a venue.
@@ -8,9 +8,11 @@
 //! ```text
 //! export PARADEX_ACCOUNT_ADDRESS=...   # the testnet account
 //! export PARADEX_PRIVATE_KEY=...       # its main Stark key
-//! cargo run -p fbc-examples --example testnet_trade -- --sole-trader \
+//! cargo run -p fbc-examples --example testnet_trade -- --sole-trader --namespace <N> \
 //!     --market BTC-USD-PERP --tick <price_tick_size> --step <order_size_increment> \
-//!     --min-notional <min_notional>    # the market's, from GET /v1/markets
+//!     --min-notional <min_notional> \
+//!     --resting-cap-usd <USD> --inventory-cap-usd <USD> --order-usd <USD> \
+//!     --side <buy|sell> --away-bps <N>
 //! cargo run -p fbc-examples --example testnet_trade -- --help
 //! ```
 
@@ -64,8 +66,15 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let out: trade::Out = Rc::new(RefCell::new(io::stdout()));
-    match runtime.block_on(trade::run(&opts, chain.as_deref(), creds, out)) {
+    // Written by a thread of its own: a stalled standard output never blocks the runtime the
+    // session, the timeouts and the cancels run on.
+    let (writer, printing) = trade::detached(io::stdout());
+    let out: trade::Out = Rc::new(RefCell::new(writer));
+    let ran = runtime.block_on(trade::run(&opts, chain.as_deref(), creds, out));
+    // Every line handed over is written before the exit (the run, and its socket, ended).
+    drop(runtime);
+    let _ = printing.join();
+    match ran {
         Ok(report) if report.ok => ExitCode::SUCCESS,
         Ok(_) => ExitCode::FAILURE,
         Err(e) => {

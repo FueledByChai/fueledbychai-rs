@@ -6,14 +6,24 @@
 //!
 //! **Never a crossing order.** The order is a post-only limit (Paradex's `POST_ONLY`
 //! instruction, which the venue cancels rather than let it take), priced `--away-bps` below the
-//! best bid for a buy (above the best ask for a sell) read from `GET /orderbook` just before,
-//! floored (ceiled) onto the tick, and refused unless it lies strictly behind the touch.
+//! best bid for a buy (above the best ask for a sell) read from `GET /orderbook` before the
+//! session starts, floored (ceiled) onto the tick, and refused unless it lies strictly behind
+//! the touch. The touch is read again once the market is Started, just before the place: the
+//! order goes out only if it is still at least `--away-bps` behind it.
 //!
-//! **Its size.** The resting cap per side (`--resting-cap-usd`, required, no default) at the
-//! order's price, floored onto the size step: the largest order the cap admits. Refused when
-//! that is no lot, or its notional is below the market's `--min-notional` (the encoder does not
-//! check a minimum, FBC-98fc). The inventory cap (`--inventory-cap-usd`, required) is converted
-//! at the same price.
+//! **Its size.** `--order-usd` (required, no default, at most the resting cap) at the order's
+//! price, floored onto the size step. Refused when that is no lot, or its notional is below the
+//! market's `--min-notional` (the encoder does not check a minimum, FBC-98fc). The resting cap
+//! per side (`--resting-cap-usd`) and the inventory cap (`--inventory-cap-usd`), both required,
+//! are converted to lots at the same price.
+//!
+//! **Its client ids** are minted, decoded as ours, leased and kept under the namespace the
+//! consumer allocates (`--namespace`, required): an order on the market under another
+//! namespace's id refuses the run before Start.
+//!
+//! **Its output** goes through [`detached`] when run: a thread of its own writes it, so a stalled
+//! standard output never blocks the one-thread runtime the session, the timeouts and the
+//! cancels run on.
 //!
 //! **What is not built here.** No order query on the Unknown ladder yet (FBC-m8vm): an order
 //! whose acknowledgement times out is `Unknown`, and Stop's cancel of every order of ours on the
@@ -50,6 +60,7 @@ use fbc_venue_paradex::factory::{EXEC_MODE, EXEC_URL, RPC_TIMEOUT};
 use fbc_venue_paradex::md::rest::{OrderbookSnapshot, decode_orderbook, orderbook_path};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use std::sync::mpsc;
 use tokio::sync::Notify;
 
 use crate::args::{Options, OrderSide, TESTNET_CHAIN, Target, direct_to_stub, sole, testnet_guard};
@@ -58,11 +69,9 @@ use crate::link::{Link, LinkHandler, Note};
 /// Where the lines go: standard output when run, a buffer under test.
 pub type Out = Rc<RefCell<dyn Write>>;
 
-/// The one market's instrument id, the account's number and the engine namespace the client
-/// ids are minted under.
+/// The one market's instrument id and the account's number.
 pub const INST: InstrumentId = InstrumentId::new(1);
 const ACCT: AccountKey = AccountKey::new(1);
-const NS: Namespace = Namespace::new(1);
 
 /// The venue's id as the lease files name it, and the account's name in them: a label, never
 /// the account's address.
@@ -79,6 +88,37 @@ pub struct Report {
     pub ok: bool,
     pub places_sent: usize,
     pub cancels_sent: usize,
+}
+
+/// A writer that never blocks its caller: each write is handed to a thread of its own that
+/// writes it to the sink, in order, and flushes. Dropping it (every clone of the [`Out`] holding
+/// it) ends the thread once it has written everything; join the handle to wait for that.
+pub struct Detached(mpsc::Sender<Vec<u8>>);
+
+/// A [`Detached`] writer over `sink`, and its thread.
+pub fn detached<W: Write + Send + 'static>(mut sink: W) -> (Detached, std::thread::JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let thread = std::thread::spawn(move || {
+        for chunk in rx {
+            // A sink that fails loses the line; the run goes on to its Stop regardless.
+            let _ = sink.write_all(&chunk).and_then(|()| sink.flush());
+        }
+    });
+    (Detached(tx), thread)
+}
+
+impl Write for Detached {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // The channel is unbounded, so this never waits; it fails only once the thread ended.
+        self.0
+            .send(buf.to_vec())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Lines with the milliseconds since the start.
@@ -141,8 +181,8 @@ pub async fn run(
         order.bid, order.ask, book.seq_no
     ));
     lines.line(format_args!(
-        "ORDER {} {} @ {} post-only, notional ${}, {} bps behind the touch; caps: resting {} \
-         lots per side, inventory {} lots",
+        "ORDER {} {} @ {} post-only, notional ${}, {} bps behind the touch, {} lots; caps: \
+         resting {} lots per side, inventory {} lots",
         match opts.side {
             OrderSide::Buy => "buy",
             OrderSide::Sell => "sell",
@@ -152,6 +192,7 @@ pub async fn run(
         order.notional.round_dp(4),
         opts.away_bps,
         order.qty.get(),
+        order.resting.get(),
         order.inventory.get(),
     ));
 
@@ -169,7 +210,7 @@ pub async fn run(
         .clone();
     let limits = MarketCapsConfig {
         inventory: Some(order.inventory),
-        resting: Some(order.qty),
+        resting: Some(order.resting),
     };
     let caps = PreTradeCaps::new()
         .with_market(INST, limits)
@@ -189,8 +230,9 @@ pub async fn run(
             opts.lease_dir.display()
         )
     };
-    let ns_lease = NamespaceLease::acquire(&opts.lease_dir, ACCT, NS).map_err(|e| held(&e))?;
-    let hwm = HighWater::at(&opts.lease_dir);
+    let ns = Namespace::new(opts.namespace);
+    let ns_lease = NamespaceLease::acquire(&opts.lease_dir, ACCT, ns).map_err(|e| held(&e))?;
+    let hwm = HighWater::at(&opts.lease_dir, ns);
     // Read now, so a mark that cannot be read refuses the run before anything connects; the
     // mint is built after the resync, which also floors it (the highest of our ids it shows).
     let persisted = hwm.read()?;
@@ -224,6 +266,10 @@ pub async fn run(
         link: Rc::clone(&link),
         wake: Rc::clone(&wake),
     };
+    let recheck = Recheck {
+        opts: opts.clone(),
+        specs: specs.clone(),
+    };
     let session_cfg = session_config(factory, cfg, creds, specs, opts)?;
     let (mut session, control) =
         ExecSession::new(session_cfg, handler).map_err(|e| format!("session: {e}"))?;
@@ -238,6 +284,7 @@ pub async fn run(
         told: std::cell::Cell::new(0),
         start_position: None,
         owned: Vec::new(),
+        recheck,
     };
     let order = Planned {
         side: match opts.side {
@@ -362,7 +409,8 @@ fn specs(venue: &dyn VenueFactory, cfg: &VenueConfig, opts: &Options) -> Result<
     Ok(table)
 }
 
-/// The market's REST order book (`GET /orderbook`), read once before the order is priced.
+/// The market's REST order book (`GET /orderbook`), read before the order is priced and again
+/// just before it is placed.
 async fn touch(opts: &Options, specs: &SpecTable) -> Result<OrderbookSnapshot, String> {
     let origin = opts
         .rest_url
@@ -396,13 +444,22 @@ struct Priced {
     qty: Lots,
     size: Decimal,
     notional: Decimal,
+    resting: Lots,
     inventory: Lots,
 }
 
-/// The order `--away-bps` behind the touch on the tick and the resting cap's size on the size
-/// step, or why it cannot be placed: an empty side, a price that would not rest strictly behind
-/// the touch, no lot within the cap, or a notional below the market's minimum.
-fn price(opts: &Options, book: &OrderbookSnapshot) -> Result<Priced, String> {
+/// The touch `book` shows on the tick, as prices: its best bid and ask.
+struct Touch {
+    bid: Decimal,
+    ask: Decimal,
+    /// The price `--away-bps` behind it on the order's side, floored (a buy) or ceiled (a sell)
+    /// onto the tick: an order there or further away rests at least that far behind it.
+    away: Ticks,
+}
+
+/// `book`'s touch and the price `--away-bps` behind it, or why there is none to stay away from:
+/// an empty side, or a price that would not rest strictly behind the touch.
+fn away_from(opts: &Options, book: &OrderbookSnapshot) -> Result<Touch, String> {
     let (best_bid, best_ask) = match (book.bids.first(), book.asks.first()) {
         (Some(b), Some(a)) => (b.px, a.px),
         _ => return Err("GET /orderbook: a side is empty; no touch to stay away from".to_owned()),
@@ -429,27 +486,41 @@ fn price(opts: &Options, book: &OrderbookSnapshot) -> Result<Priced, String> {
             of(ticks)
         ));
     }
-    let px = of(ticks);
+    Ok(Touch {
+        bid,
+        ask,
+        away: ticks,
+    })
+}
+
+/// The order `--away-bps` behind the touch on the tick and `--order-usd`'s size on the size
+/// step, with the caps in lots at its price, or why it cannot be placed: no touch to stay away
+/// from ([`away_from`]), no lot in the size, or a notional below the market's minimum.
+fn price(opts: &Options, book: &OrderbookSnapshot) -> Result<Priced, String> {
+    let Touch { bid, ask, away } = away_from(opts, book)?;
+    let ticks = away;
+    let px = Decimal::from(ticks.0) * opts.tick;
     let lots_for = |usd: Decimal| -> Result<Lots, String> {
         let n = (usd / (px * opts.step)).floor();
-        Lots::new(n.to_i64().ok_or("a cap does not fit")?)
-            .ok_or_else(|| "a negative cap".to_owned())
+        Lots::new(n.to_i64().ok_or("an amount does not fit")?)
+            .ok_or_else(|| "a negative amount".to_owned())
     };
-    let resting_usd = opts.resting_cap_usd;
-    let qty = lots_for(resting_usd)?;
+    let order_usd = opts.order_usd;
+    let qty = lots_for(order_usd)?;
+    let resting = lots_for(opts.resting_cap_usd)?;
     let inventory = lots_for(opts.inventory_cap_usd)?;
     let size = Decimal::from(qty.get()) * opts.step;
     let notional = size * px;
     if qty.get() == 0 {
         return Err(format!(
-            "${resting_usd} at {px} is less than one size step ({}); refused",
+            "${order_usd} at {px} is less than one size step ({}); refused",
             opts.step
         ));
     }
     if notional < opts.min_notional {
         return Err(format!(
-            "the order's notional ${} (the ${resting_usd} resting cap at {px}, {size} on the \
-             {} step) is below the market's minimum ${}; refused",
+            "the order's notional ${} (--order-usd ${order_usd} at {px}, {size} on the {} step) \
+             is below the market's minimum ${}; refused",
             notional.round_dp(4),
             opts.step,
             opts.min_notional
@@ -463,8 +534,40 @@ fn price(opts: &Options, book: &OrderbookSnapshot) -> Result<Priced, String> {
         qty,
         size,
         notional,
+        resting,
         inventory,
     })
+}
+
+/// What the touch's second read needs: the command line and the market's spec.
+struct Recheck {
+    opts: Options,
+    specs: SpecTable,
+}
+
+impl Recheck {
+    /// Reads the touch again and checks the order at `px` is still at least `--away-bps` behind
+    /// it: the touch it reports, or why the order must not go out.
+    async fn still_away(&self, px: Ticks) -> Result<(Touch, u64), String> {
+        let book = touch(&self.opts, &self.specs).await?;
+        let now = away_from(&self.opts, &book)?;
+        let far_enough = match self.opts.side {
+            OrderSide::Buy => px <= now.away,
+            OrderSide::Sell => px >= now.away,
+        };
+        if far_enough {
+            Ok((now, book.seq_no))
+        } else {
+            Err(format!(
+                "the touch moved toward the order (bid {}, ask {}): at {} it would be less than \
+                 {} bps behind it",
+                now.bid,
+                now.ask,
+                Decimal::from(px.0) * self.opts.tick,
+                self.opts.away_bps
+            ))
+        }
+    }
 }
 
 /// Nonces counted up from 1: Paradex asks for none, but the session reserves one per item and
@@ -501,7 +604,7 @@ fn session_config(
         creds,
         acct: ACCT,
         rpc_ids: RpcIds::default(),
-        ns: NS,
+        ns: Namespace::new(opts.namespace),
         specs,
         connector: Connector::new(opts.proxy.clone()),
         pacing: ReconnectPacing::new(
@@ -544,6 +647,24 @@ pub fn snapshot_max(snapshot: &ResyncSnapshot) -> u64 {
         .unwrap_or(0)
 }
 
+/// Those of `owned` (our orders on the market) that did not end cancelled, each with its state
+/// (`None`: the registry holds no record of it): still open, or ended another way.
+pub fn not_cancelled(
+    reg: &Registry,
+    owned: &[(ClientOrderId, Lots)],
+) -> Vec<(ClientOrderId, Option<OrdState>)> {
+    owned
+        .iter()
+        .filter_map(|(cid, _)| {
+            let state = reg.get(*cid).map(|r| r.state());
+            match state {
+                Some(OrdState::Terminal(TerminalKind::Canceled(_))) => None,
+                other => Some((*cid, other)),
+            }
+        })
+        .collect()
+}
+
 /// The client-id mint's high-water mark, kept in a file of the lease directory across runs, so
 /// a run whose wall clock stepped back never mints an id an earlier run used (the namespace
 /// lease keeps two minters apart, not two runs).
@@ -552,9 +673,9 @@ pub struct HighWater {
 }
 
 impl HighWater {
-    /// The mark kept in `dir`.
-    pub fn at(dir: &std::path::Path) -> HighWater {
-        let name = format!("cid-high-water-account-{}-ns-{}", ACCT.get(), NS.get());
+    /// The mark of namespace `ns` kept in `dir`.
+    pub fn at(dir: &std::path::Path, ns: Namespace) -> HighWater {
+        let name = format!("cid-high-water-account-{}-ns-{}", ACCT.get(), ns.get());
         HighWater {
             path: dir.join(name),
         }
@@ -618,8 +739,11 @@ struct Driver {
     /// The market's inventory once Start armed it: a round trip leaves it unchanged.
     start_position: Option<SignedLots>,
     /// Our orders on the market (the resync's and the one placed), each with what of it had
-    /// filled when the run took it on: a fill of any of them during the run fails it.
+    /// filled when the run took it on: a fill of any of them during the run fails it, and so
+    /// does one not cancelled when the run ends.
     owned: Vec<(ClientOrderId, Lots)>,
+    /// The touch's second read, just before the place.
+    recheck: Recheck,
 }
 
 impl Driver {
@@ -649,7 +773,12 @@ impl Driver {
         for note in notes {
             match note {
                 Note::Problem(what) => self.note(format_args!("{what}")),
-                Note::Fill(routed) => self.note(format_args!("a fill: {routed}")),
+                Note::Fill { seen, .. } => self.note(format_args!("a fill: {seen}")),
+                Note::Position { inst, qty } => self.note(format_args!(
+                    "the account's position in instrument {} is {} lots",
+                    inst.get(),
+                    qty.0
+                )),
                 Note::Order(routed) if !matches!(routed, Routed::Ours(..)) => {
                     self.note(format_args!(
                         "an order event of an order not ours: {routed:?}"
@@ -682,7 +811,9 @@ impl Driver {
     }
 
     /// The run: every step, then Stop whatever happened; true when every step happened, Stop
-    /// cancelled what was left, and no fill moved the inventory.
+    /// sent every cancel and each was accepted, every order of ours on the market ended
+    /// cancelled, none of them filled during the run, no fill moved the inventory, and no fill
+    /// not of our orders or position change came in.
     async fn run(
         mut self,
         order: Planned,
@@ -695,8 +826,70 @@ impl Driver {
         let stopped = self.stop().await;
         let unmoved = self.inventory_unmoved();
         let untraded = self.owned_untraded();
+        let cancelled = self.owned_cancelled();
+        let account = self.account_unmoved();
         drop(control);
-        ok && stopped && unmoved && untraded
+        ok && stopped && unmoved && untraded && cancelled && account
+    }
+
+    /// True when every order of ours on the market ended cancelled: one still open, or ended
+    /// otherwise, after Stop fails the run, whatever Stop managed to send.
+    fn owned_cancelled(&self) -> bool {
+        let left = {
+            let mut link = self.link.borrow_mut();
+            not_cancelled(link.reg(), &self.owned)
+        };
+        for (cid, state) in &left {
+            self.note(format_args!(
+                "an order of ours did not end cancelled: venue order {} is {}",
+                self.vid_of(*cid),
+                match state {
+                    Some(state) => format!("{state:?}"),
+                    None => "not held by the registry".to_owned(),
+                }
+            ));
+        }
+        left.is_empty()
+    }
+
+    /// True unless a fill that is not of our orders came in (a liquidation, a settlement,
+    /// another system's order), or the venue reported the account's position other than the
+    /// position seeded at Start (or on another market).
+    fn account_unmoved(&self) -> bool {
+        let mut unmoved = true;
+        let link = self.link.borrow();
+        for note in link.notes() {
+            match note {
+                Note::Fill {
+                    seen,
+                    unexplained: true,
+                } => {
+                    unmoved = false;
+                    self.note(format_args!("a fill not of our orders came in: {seen}"));
+                }
+                Note::Position { inst, qty } => {
+                    // The market's position as seeded at Start; flat on any other market (the
+                    // resync refuses an account with a position elsewhere).
+                    let expected = if *inst == INST {
+                        self.start_position
+                    } else {
+                        Some(SignedLots(0))
+                    };
+                    if expected != Some(*qty) {
+                        unmoved = false;
+                        self.note(format_args!(
+                            "the venue reported the account's position in instrument {} as {} \
+                             lots, not the {} lots the run expects",
+                            inst.get(),
+                            qty.0,
+                            expected.map_or("(no Start)".to_owned(), |e| e.0.to_string())
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        unmoved
     }
 
     /// True unless an order of ours on the market filled during the run, the resync's
@@ -904,6 +1097,20 @@ impl Driver {
             }
         }
 
+        // The touch again, just before the place: the login, the arm and the resync took
+        // time, and the order goes out only if it is still --away-bps behind it.
+        match self.recheck.still_away(order.px).await {
+            Ok((now, seq)) => self.lines.line(format_args!(
+                "BBO again bid {} ask {} (GET /orderbook seq {seq}): the order is still {} bps or \
+                 more behind the touch",
+                now.bid, now.ask, self.recheck.opts.away_bps
+            )),
+            Err(e) => {
+                self.note(format_args!("{e}; nothing placed"));
+                return false;
+            }
+        }
+
         // The place: built and authorized by fbc-oms, then handed to the session.
         // The mint, floored by the mark kept from earlier runs, the highest of our ids the
         // resync shows, and the wall clock.
@@ -1107,7 +1314,8 @@ impl Driver {
     /// acknowledgement, built the moment it lands ([`Registry::cancels_due`]), for at most the
     /// step timeout; one still waiting then is left to cancel-on-disconnect, which the socket's
     /// close sets off. Then the market is disarmed and its leases released. True when every
-    /// order was cancelled or ended and every cancel sent was accepted.
+    /// order was cancelled or ended and every cancel was built, sent and accepted: a cancel
+    /// refused by the registry or not handed to the session fails it.
     async fn stop(&mut self) -> bool {
         let mut refusals = Vec::new();
         let (cmds, waiting, how) = {
@@ -1135,12 +1343,14 @@ impl Driver {
                 }
             }
         };
+        // Every cancel built and handed to the session, or Stop fails.
+        let mut sent_all = refusals.is_empty();
         for refused in refusals {
             self.note(format_args!("no Stop cancel for {refused}"));
         }
         let mut rpcs = Vec::new();
         for cmd in cmds {
-            self.submit_stop_cancel(cmd, &mut rpcs);
+            sent_all &= self.submit_stop_cancel(cmd, &mut rpcs);
         }
         let mut waiting = waiting;
         // Orders that ended while their cancel waited for an acknowledgement: no cancel was
@@ -1189,13 +1399,18 @@ impl Driver {
                     link.reg().cancellable(cid).map(|p| p.cancel(&caps))
                 };
                 match built {
-                    Ok(CancelChoice::Send(cmd)) => self.submit_stop_cancel(cmd, &mut rpcs),
+                    Ok(CancelChoice::Send(cmd)) => {
+                        sent_all &= self.submit_stop_cancel(cmd, &mut rpcs);
+                    }
                     Ok(CancelChoice::AwaitAck) => waiting.push(cid),
-                    Err(refusal) => self.note(format_args!("no Stop cancel: {refusal:?}")),
+                    Err(refusal) => {
+                        sent_all = false;
+                        self.note(format_args!("no Stop cancel: {refusal:?}"));
+                    }
                 }
             }
         }
-        let mut accepted = waiting.is_empty();
+        let mut accepted = sent_all && waiting.is_empty();
         for rpc in &rpcs {
             match self.wait(|l| Driver::outcome_of(l, *rpc)).await {
                 Some(SubmitOutcome::Accepted { .. }) => {}
@@ -1280,8 +1495,13 @@ impl Driver {
         accepted
     }
 
-    /// Authorizes and submits one of Stop's cancels, adding its request to `rpcs`.
-    fn submit_stop_cancel(&mut self, cmd: fbc_oms::PermittedCommand, rpcs: &mut Vec<RpcId>) {
+    /// Authorizes and submits one of Stop's cancels, adding its request to `rpcs`: false when it
+    /// was not handed to the session.
+    fn submit_stop_cancel(
+        &mut self,
+        cmd: fbc_oms::PermittedCommand,
+        rpcs: &mut Vec<RpcId>,
+    ) -> bool {
         let submitted = {
             let mut link = self.link.borrow_mut();
             let auth = link
@@ -1291,8 +1511,14 @@ impl Driver {
             auth.and_then(|auth| link.submit(&self.orders, auth))
         };
         match submitted {
-            Ok(rpc) => rpcs.push(rpc),
-            Err(e) => self.note(format_args!("a Stop cancel was not submitted: {e}")),
+            Ok(rpc) => {
+                rpcs.push(rpc);
+                true
+            }
+            Err(e) => {
+                self.note(format_args!("a Stop cancel was not submitted: {e}"));
+                false
+            }
         }
     }
 }
