@@ -15,8 +15,9 @@ use fbc_conformance::toy::{
 };
 use fbc_core::{
     ConfigError, ConfigScope, Effect, Effects, EncodeCtx, EndpointPlan, ExecEndpoint, Feed,
-    FieldUnit, MdTransport, MonoNs, NonceBlock, Secrets, StreamId, Subscription, VenueConfig,
-    VenueError, VenueFactory, WallNs, WireUrl,
+    FieldUnit, HeaderMark, HttpResponse, HttpTag, Inbound, InboundSpans, MdTransport, MonoNs,
+    NonceBlock, Secrets, StreamId, Subscription, VenueConfig, VenueError, VenueFactory, WallNs,
+    WireUrl,
 };
 
 /// A synthetic credential, of no account and no venue.
@@ -196,6 +197,11 @@ fn a_url_with_user_information_a_query_or_spans_it_cannot_keep_is_refused() {
         ("wss://[::1]x/x", None, EXEC_URL_KEY),
         ("wss://[]/x", None, EXEC_URL_KEY),
         ("wss://toy invalid/x", None, EXEC_URL_KEY),
+        // Literals that are not addresses (Codex r4219753503).
+        ("wss://[::::]/x", None, EXEC_URL_KEY),
+        ("wss://[1:2:3]/x", None, EXEC_URL_KEY),
+        ("wss://999.1.1.1/x", None, EXEC_URL_KEY),
+        ("wss://1.2.3/x", None, EXEC_URL_KEY),
         // Spans the toy cannot keep: not ranges, outside the path, past the end, out of order,
         // overlapping, empty.
         ("wss://toy.invalid/abcdef", Some("x"), EXEC_URL_REDACT_KEY),
@@ -292,7 +298,9 @@ fn a_url_with_user_information_a_query_or_spans_it_cannot_keep_is_refused() {
     for exec in [
         "wss://toy.invalid/x/",
         "wss://[::1]:9/x",
+        "wss://[2001:db8::7]/x",
         "ws://127.0.0.1:65535",
+        "wss://toy-1.example_x.invalid:443",
     ] {
         ok.insert(EXEC_URL_KEY, exec);
         assert_eq!(
@@ -370,4 +378,67 @@ fn the_factorys_schema_names_every_url_and_its_spans() {
             assert!(field.doc.contains("start..end"), "{}", field.doc);
         }
     }
+}
+
+#[test]
+fn a_configured_credential_echoed_in_an_http_response_is_named_for_redaction() {
+    // Codex r4219753519: a venue or a proxy echoing the path credential in a response's body or
+    // headers; the codec that asked under that base names every occurrence, so the journal
+    // keeps it only as a keyed hash.
+    let cfg = cfg();
+    let body = format!("err|path=/rest/{SECRET}|again={SECRET}{SECRET}|end");
+    let at = |n: usize| body.match_indices(SECRET).nth(n).unwrap().0 as u32;
+    let len = SECRET.len() as u32;
+    let name = format!("x-{SECRET}");
+    let headers = [
+        ("content-type", "text/plain"),
+        ("x-echo", SECRET),
+        (name.as_str(), "1"),
+        ("x-other", "SYNTHETIC-NOT-IT"),
+    ];
+    let resp = HttpResponse {
+        status: 404,
+        headers: &headers,
+        body: body.as_bytes(),
+    };
+    let input = Inbound::Http(HttpTag(1), resp);
+    // Two occurrences side by side are one span.
+    let want = InboundSpans::response(
+        vec![(1, HeaderMark::Value), (2, HeaderMark::NameAndValue)],
+        vec![at(0)..at(0) + len, at(1)..at(1) + 2 * len],
+    );
+    let exec = ToyFactory
+        .exec_codec(&cfg, Secrets::new())
+        .unwrap()
+        .unwrap();
+    let ep = EndpointPlan {
+        stream: MD_STREAM,
+        transport: MdTransport::Socket {
+            url: url("ws://127.0.0.1:9/md/", ""),
+        },
+        subs: Vec::new(),
+    };
+    let md = ToyFactory.md_codec(&cfg, &ep);
+    for named in [exec.redact_inbound(input), md.redact_inbound(input)] {
+        assert_eq!(named, want);
+        assert_eq!(named.check(input), Ok(()));
+    }
+    // A response holding none names nothing, and a codec with no configured base names none.
+    let clean = HttpResponse {
+        status: 200,
+        headers: &[],
+        body: b"rsend",
+    };
+    let clean = Inbound::Http(HttpTag(1), clean);
+    assert_eq!(exec.redact_inbound(clean), InboundSpans::NONE);
+    let bare = VenueConfig::new();
+    let exec = ToyFactory
+        .exec_codec(&bare, Secrets::new())
+        .unwrap()
+        .unwrap();
+    assert_eq!(exec.redact_inbound(input), InboundSpans::NONE);
+    assert_eq!(
+        ToyFactory.md_codec(&bare, &ep).redact_inbound(input),
+        InboundSpans::NONE
+    );
 }

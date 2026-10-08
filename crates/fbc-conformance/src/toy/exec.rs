@@ -31,6 +31,7 @@ use fbc_core::{
 };
 
 use super::session::{self, Answers};
+use super::url::{echoed, secrets};
 use super::{EXEC_STREAM, FillIds, PING_EVERY, PING_TAG, RPC_TIMEOUT, caps_for, decode, weight};
 
 use NotSentReason::{FlagConflict, SignFailed, Unencodable, Unsupported};
@@ -548,8 +549,12 @@ impl ExecCodec for ToyExec {
     }
 
     /// The toy's token wherever a text frame carries one (the authentication acknowledgement
-    /// echoes it).
+    /// echoes it), and the REST base's credentials wherever an HTTP response echoes them.
     fn redact_inbound(&self, input: Inbound<'_>) -> InboundSpans {
-        session::token_spans(input)
+        match (input, &self.rest) {
+            (Inbound::Http(_, resp), Some(base)) => echoed(&resp, &secrets(base)),
+            (Inbound::Http(..), None) => InboundSpans::NONE,
+            (Inbound::Frame(_), _) => session::token_spans(input),
+        }
     }
 }

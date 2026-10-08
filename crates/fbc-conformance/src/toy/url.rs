@@ -14,8 +14,9 @@
 //! the paths it appends would double (Codex r4219602934, r4219602924).
 
 use core::ops::Range;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
-use fbc_core::{ConfigError, VenueConfig, WireUrl};
+use fbc_core::{ConfigError, HeaderMark, HttpResponse, InboundSpans, VenueConfig, WireUrl};
 
 /// A configured URL's keys and the schemes it takes.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
@@ -79,28 +80,83 @@ pub(super) fn configured(cfg: &VenueConfig, key: UrlKey) -> Result<WireUrl, Conf
 /// r4219602934): a name or IPv4 literal of letters, digits, `.`, `-` and `_`, or an IPv6
 /// literal in brackets.
 fn usable(authority: &str) -> bool {
-    let named = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_');
-    let v6 = |c: char| c.is_ascii_hexdigit() || matches!(c, ':' | '.');
     let (host_ok, port) = match authority.strip_prefix('[') {
-        Some(v6_and_port) => match v6_and_port.split_once(']') {
-            Some((inside, "")) => (!inside.is_empty() && inside.chars().all(v6), None),
-            Some((inside, after)) => match after.strip_prefix(':') {
-                Some(port) => (!inside.is_empty() && inside.chars().all(v6), Some(port)),
-                None => return false,
-            },
-            None => return false,
-        },
+        Some(v6_and_port) => {
+            let Some((inside, after)) = v6_and_port.split_once(']') else {
+                return false;
+            };
+            let port = match after {
+                "" => None,
+                after => match after.strip_prefix(':') {
+                    Some(port) => Some(port),
+                    None => return false,
+                },
+            };
+            (inside.parse::<Ipv6Addr>().is_ok(), port)
+        }
         None => {
             let (host, port) = match authority.rsplit_once(':') {
                 Some((host, port)) => (host, Some(port)),
                 None => (authority, None),
             };
-            (!host.is_empty() && host.chars().all(named), port)
+            (named_host(host), port)
         }
     };
     let port_ok =
         |p: &str| p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok_and(|p| p > 0);
     host_ok && port.is_none_or(port_ok)
+}
+
+/// A name of letters, digits, `.`, `-` and `_`, or, all digits and dots, an IPv4 address
+/// (Codex r4219753503: a literal is parsed, not only its characters checked).
+fn named_host(host: &str) -> bool {
+    let named = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_');
+    match host.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        true => host.parse::<Ipv4Addr>().is_ok(),
+        false => !host.is_empty() && host.chars().all(named),
+    }
+}
+
+/// The credentials `url`'s spans hold.
+pub(super) fn secrets(url: &WireUrl) -> Vec<String> {
+    let text = url.as_str();
+    let span = |r: &Range<u32>| {
+        text.get(r.start as usize..r.end as usize)
+            .map(str::to_owned)
+    };
+    url.redactions().iter().filter_map(span).collect()
+}
+
+/// What of an HTTP response holds any of `secrets` (Codex r4219753519): every occurrence in
+/// its body, overlapping or adjacent ones as one span, and each header whose value holds one,
+/// or whose name does, a proxy echoing it there.
+pub(super) fn echoed(resp: &HttpResponse<'_>, secrets: &[String]) -> InboundSpans {
+    let holds = |text: &str| secrets.iter().any(|s| text.contains(s.as_str()));
+    let headers = (0u32..)
+        .zip(resp.headers)
+        .filter_map(|(at, &(name, value))| match (holds(name), holds(value)) {
+            (true, _) => Some((at, HeaderMark::NameAndValue)),
+            (false, true) => Some((at, HeaderMark::Value)),
+            (false, false) => None,
+        });
+    let headers: Vec<_> = headers.collect();
+    let mut found: Vec<Range<usize>> = Vec::new();
+    for secret in secrets.iter().map(String::as_bytes) {
+        let at = resp.body.windows(secret.len().max(1)).enumerate();
+        let hits = at.filter(|&(_, w)| !secret.is_empty() && w == secret);
+        found.extend(hits.map(|(i, _)| i..i + secret.len()));
+    }
+    found.sort_by_key(|r| r.start);
+    let mut body: Vec<Range<u32>> = Vec::new();
+    for r in found {
+        let r =
+            u32::try_from(r.start).unwrap_or(u32::MAX)..u32::try_from(r.end).unwrap_or(u32::MAX);
+        match body.last_mut() {
+            Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+            _ => body.push(r),
+        }
+    }
+    InboundSpans::response(headers, body)
 }
 
 /// `base` with `suffix` appended, its spans kept where they were.
