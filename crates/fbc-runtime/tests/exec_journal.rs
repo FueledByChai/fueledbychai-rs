@@ -62,9 +62,11 @@ use sha2::Sha256;
 const SHARD: u16 = 3;
 /// The connection number the sessions stamp.
 const CONN: u16 = 6;
-/// The account the sessions trade: the journal's nonce source is numbered by it.
+/// The account the sessions trade.
 const ACCT: AccountKey = AccountKey::new(9);
-const SOURCE: NonceSourceId = NonceSourceId(9);
+/// The number the consumer gives the sessions' nonce source in the journal: its own, not the
+/// account's.
+const SOURCE: NonceSourceId = NonceSourceId(41);
 /// The order-entry endpoint's URL; required.
 const URL: &str = "exec.url";
 /// The `auth_toy` login's URL, the scripted HTTP server's.
@@ -143,20 +145,24 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)
 }
 
-/// The journal queue's sink, keeping each record it is offered with its class.
+/// The journal queue's sink, keeping each record it is offered with its class and the wall
+/// time it is filed under.
 struct Tee {
     queue: QueueSink,
     offered: Vec<(TrafficClass, Record)>,
+    filed: Vec<WallNs>,
 }
 
 impl JournalSink for Tee {
     fn record(&mut self, class: TrafficClass, now: WallNs, record: &Record) -> Recorded {
         self.offered.push((class, record.clone()));
+        self.filed.push(now);
         self.queue.record(class, now, record)
     }
 
     fn record_ref(&mut self, class: TrafficClass, now: WallNs, record: RecordRef<'_>) -> Recorded {
         self.offered.push((class, record.to_record()));
+        self.filed.push(now);
         self.queue.record_ref(class, now, record)
     }
 
@@ -171,6 +177,8 @@ struct Run {
     entries: Vec<Entry>,
     files: Vec<u8>,
     offered: Vec<(TrafficClass, Record)>,
+    /// The wall time each offered record was filed under.
+    filed: Vec<WallNs>,
     ended: Result<(), ExecSessionError>,
 }
 
@@ -204,6 +212,7 @@ where
     let tee = Rc::new(RefCell::new(Tee {
         queue,
         offered: Vec::new(),
+        filed: Vec::new(),
     }));
     let heard = Heard::default();
     let keep = Rc::clone(&heard);
@@ -221,11 +230,12 @@ where
         .unwrap();
     let files = written_bytes(&root);
     fs::remove_dir_all(&root).unwrap();
-    let offered = Rc::try_unwrap(tee).ok().unwrap().into_inner().offered;
+    let tee = Rc::try_unwrap(tee).ok().unwrap().into_inner();
     Run {
         entries,
         files,
-        offered,
+        offered: tee.offered,
+        filed: tee.filed,
         ended,
     }
 }
@@ -525,6 +535,7 @@ fn config(
         pacing: ReconnectPacing::new(minute, minute, 100, minute * 10, ms(5_000)).unwrap(),
         clock: IngestClock::new(),
         nonces: Box::new(nonces),
+        nonce_source: SOURCE,
         conn: CONN,
         limiter: RateLimiter::new(&limits, SafetyReserve::percent(0).unwrap()).unwrap(),
         write_stall: WriteStall::new(Duration::from_secs(3_600)).unwrap(),
@@ -552,6 +563,7 @@ enum Seen {
     Ask(HttpTag, Option<RpcId>),
     Answer(HttpTag, u16),
     Ping,
+    Close,
     Opened(ConnKey),
     Closed(ConnKey),
 }
@@ -578,6 +590,10 @@ fn seen(record: &Record) -> Seen {
             frame: WsControl::Ping(_),
             ..
         } => Seen::Ping,
+        Record::InboundControl {
+            frame: WsControl::Close(_),
+            ..
+        } => Seen::Close,
         Record::Control {
             ev: ControlEvent::Opened(key),
             ..
@@ -1282,4 +1298,97 @@ async fn a_journal_set_after_a_dropped_run_gets_none_of_its_epoch() {
     assert_eq!(read.first(), Some(&Seen::Opened(key(0))));
     assert_eq!(read.last(), Some(&Seen::Closed(key(0))), "{read:#?}");
     assert!(read_next.is_empty(), "{read_next:#?}");
+}
+
+/// Codex P2 r4214053432 on PR #115: the nonces `on_open` asks for, and its context, are filed
+/// under the time the source returned them at, while the context keeps the time its call was
+/// given: a source that takes its time across midnight files them under the new day.
+#[tokio::test]
+async fn a_calls_nonces_are_filed_after_they_are_reserved() {
+    let mut server = ScriptedWs::start().await;
+    let http = ScriptedHttp::start().await;
+    let venue = Venue::leak(auth_toy);
+    let cfg = [(LOGIN, http.url("/auth")), (CALL_NONCES, "1".to_owned())];
+    let slow = Counting {
+        delay: ms(30),
+        ..Counting::new()
+    };
+    let returned = Arc::clone(&slow.returned);
+    let config = config(venue, &server.url(), &cfg, slow);
+    let run = journaled(
+        "exec_journal_slow_call",
+        config,
+        |_, control, _| async move {
+            let _peer = server.accept().await;
+            until(|| http.connections() == 1).await;
+            drop(control);
+        },
+    )
+    .await;
+    run.ended.as_ref().unwrap();
+    let returned = returned.lock().unwrap()[0];
+    let at = |pick: fn(&Record) -> bool| {
+        let i = run.offered.iter().position(|(_, r)| pick(r)).unwrap();
+        (run.filed[i], run.offered[i].1.clone())
+    };
+    let (nonce_filed, _) = at(|r| matches!(r, Record::Nonce { .. }));
+    let (ctx_filed, ctx) = at(|r| matches!(r, Record::EncodeCtx { .. }));
+    assert!(
+        nonce_filed >= returned,
+        "{nonce_filed:?} before {returned:?}"
+    );
+    assert!(ctx_filed >= returned, "{ctx_filed:?} before {returned:?}");
+    let Record::EncodeCtx { ctx, .. } = ctx else {
+        unreachable!()
+    };
+    assert!(
+        ctx.wall < returned,
+        "the call's time is the one it was given"
+    );
+}
+
+/// Codex P2 r4214053451 on PR #115: an HTTP result that comes back after its epoch ended, while
+/// the session waits to reconnect, is journaled with the spans the session's one codec names in
+/// it, the rest verbatim, not hashed whole as a market-data session's ended codec leaves it.
+#[tokio::test]
+async fn an_ended_epochs_http_result_keeps_what_the_one_codec_does_not_name() {
+    let token = secret("staletoken");
+    let mut server = ScriptedWs::start().await;
+    let mut http = ScriptedHttp::start().await;
+    let venue = Venue::leak(auth_toy);
+    let cfg = [(LOGIN, http.url("/auth")), (CALL_NONCES, "0".to_owned())];
+    let config = config(venue, &server.url(), &cfg, Counting::new());
+    let body = format!("auth|token={token}|refresh=3600");
+    let live_body = body.clone();
+    let run = journaled(
+        "exec_journal_stale_http",
+        config,
+        |_, control, _| async move {
+            let peer = server.accept().await;
+            let login = http.request().await;
+            peer.drop_conn();
+            // The epoch ends as the drop is read; the session then waits a minute to reconnect.
+            tokio::time::sleep(ms(200)).await;
+            let answered = login.answer("HTTP/1.1 200 OK\r\nX-Toy: yes", &live_body);
+            let _ = tokio::time::timeout(ms(500), answered).await;
+            tokio::time::sleep(ms(100)).await;
+            drop(control);
+        },
+    )
+    .await;
+    run.ended.as_ref().unwrap();
+    assert!(!contains(&run.files, token.as_bytes()));
+    let read: Vec<Seen> = run.entries.iter().map(|e| seen(&e.record)).collect();
+    let closed = read.iter().position(|s| *s == Seen::Closed(key(0)));
+    let answer = read.iter().position(|s| matches!(s, Seen::Answer(..)));
+    assert!(closed < answer, "{read:#?}");
+    let resp = run.entries.iter().find_map(|e| match &e.record {
+        Record::HttpResult { result: Ok(r), .. } => Some(r.clone()),
+        _ => None,
+    });
+    let resp = resp.unwrap();
+    let kept = body.replace(&token, &blank(token.len()));
+    assert_eq!(resp.body.0, kept.as_bytes());
+    let toy = resp.headers.iter().find(|h| h.name == "x-toy").unwrap();
+    assert_eq!((toy.value.as_str(), toy.redact), ("yes", false));
 }

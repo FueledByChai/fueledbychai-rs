@@ -33,9 +33,13 @@ also:
    consumer's `NonceSource` reserved them, for `on_open`, `on_timer`, the resync and every
    encode, written as the reservation returns. A reservation of another count than asked is
    written too (those values are spent) before the session ends with
-   `ExecSessionError::Nonces`. The session's one source is journaled as the `NonceSourceId`
-   of its account's number. An encode's time is read once its nonces are reserved, so a source
-   that takes its time (persisting what it reserved) leaves the signed request no stale time.
+   `ExecSessionError::Nonces`. The session's one source is journaled by the `NonceSourceId`
+   the consumer gives it (`ExecSessionConfig::nonce_source`): one per scope the venue's
+   `NonceScope` names, an account or a signing key, the same for every session sharing that
+   sequence, so a restart reads every value spent through it. An encode's time is read once
+   its nonces are reserved, so a source that takes its time (persisting what it reserved)
+   leaves the signed request no stale time; every nonce and context record is filed under the
+   time the reservation returned at.
 2. **Each context just before its call.** The `EncodeCtx` the session hands `on_open`,
    `on_timer`, the resync or an `encode`, the encode's with its request id, `None` for the
    others (which replay matches by place). A call that is not made (a short reservation, an
@@ -53,6 +57,9 @@ also:
    and those inputs, which reach no codec, after it, as the market-data session does, so replay
    feeds them to no codec either. Spans a codec names that do not fit their input are counted
    (`ExecCounters::refused_redactions`) and that input is hashed whole, as on market data.
+   Since one codec serves every epoch (0053), an HTTP result that comes back after its epoch
+   ended is journaled with the spans that codec names in it, not hashed whole as a market-data
+   session's ended codec leaves it.
    Every `Opened` has its `Closed` in the same journal: an epoch a dropped run left connected
    is ended before `set_journal` changes the journal, and one a panic unwinds through is
    journaled closed as the session drops, if the sink is not borrowed then. A write that
