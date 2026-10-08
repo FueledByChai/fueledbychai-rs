@@ -12,7 +12,8 @@
 //!   `ReplacedEvent`, synthesized by the codec from the reply where it is `RpcReplyOnly`. Every
 //!   such update is judged: every identity it states is the order's, and every field the
 //!   amend's (nothing filled, the flags the order's, stated where `events_echo_flags`). A venue
-//!   allowing no limit order is skipped. Where the amended order gets a new venue id
+//!   allowing no limit order is skipped. The client id is stated where
+//!   `cid_echoed_on_events`, and nothing is written beyond the two requests. Where the amended order gets a new venue id
 //!   (`AmendCaps.keeps_venue_id` false), the update names it; where it keeps its id, the update
 //!   names no new one. The placement's acceptance is its one item's, or the whole request's,
 //!   once as `OrderCaps.ack` has it. Once the amend is sent, nothing refuses the order (an
@@ -79,6 +80,7 @@ pub fn amend_ack(subject: &Subject<'static>) -> Result<Verdict, Failure> {
     let ack = format!("AmendCaps.ack is {:?}", amend.ack);
     let model = live.order.ack;
     let echo = live.order.events_echo_flags;
+    let echoes_cid = live.order.cid_echoed_on_events;
     let breaches = live.run(vec![vec![Accept], vec![Accept]], async |c| {
         c.ready().await?;
         let (cid, auth) = c.oms.place(c.h)?;
@@ -121,6 +123,7 @@ pub fn amend_ack(subject: &Subject<'static>) -> Result<Verdict, Failure> {
             px,
             qty,
             model,
+            echoes_cid,
             flags: Flags {
                 post_only,
                 reduce_only,
@@ -129,6 +132,16 @@ pub fn amend_ack(subject: &Subject<'static>) -> Result<Verdict, Failure> {
         };
         let updates = updates(c);
         let mut breaches = judge_amend(c, rpc, &updates, &asked, &amend, &ack);
+        // Nothing written after the amend: the clock has not moved since, so no keepalive is
+        // due, and a request written again shows (Codex r4224021315).
+        let unasked = c.unasked();
+        if unasked > 0 {
+            let what = format!(
+                "{unasked} frame(s) the check never asked for were written once the amend was \
+                 answered; a request is never resent"
+            );
+            breaches.push(Breach::new("ExecCodec: never resent", what));
+        }
         breaches.extend(contradicted(&c.events()[before..], &asked, &updates));
         Ok(breaches)
     })?;
@@ -195,6 +208,8 @@ struct Asked {
     px: Ticks,
     qty: Lots,
     model: AckModel,
+    /// Whether the venue's order events carry the client id (`OrderCaps.cid_echoed_on_events`).
+    echoes_cid: bool,
     flags: Flags,
 }
 
@@ -284,7 +299,10 @@ fn judge_update(
     // Every identity the update states is the amended order's (Codex r4222779011): fbc-oms
     // routes an update by its client id first, and a stranger's or a non-canonical one routes
     // it to no order of ours.
-    let cid_agrees = update.cid.is_none_or(|m| m == CidMatch::Ours(asked.cid));
+    // A venue whose events carry the client id states it (Codex r4224021308).
+    let cid_agrees = update
+        .cid
+        .map_or(!asked.echoes_cid, |m| m == CidMatch::Ours(asked.cid));
     let vid_agrees = update.vid.is_none() || asked.placed.is_none() || update.vid == asked.placed;
     if !cid_agrees || !vid_agrees {
         let (cid, placed) = (asked.cid, &asked.placed);

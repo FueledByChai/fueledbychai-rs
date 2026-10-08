@@ -451,6 +451,14 @@ impl Ctx<'_> {
         }
     }
 
+    /// How many frames the stub received beyond the opening's and one for each request the
+    /// check sent: frames the session wrote that no step of the check asked for, which a check
+    /// that never moves the clock after its last request expects none of (Codex r4224021315).
+    pub fn unasked(&self) -> usize {
+        let asked = self.opening + self.sent.get();
+        self.frames().len().saturating_sub(asked)
+    }
+
     /// Every frame the stub received, on every connection the session opened, in accept order
     /// (Codex r4222379985: a request written again after a reconnect counts too).
     pub fn frames(&self) -> Vec<Frame> {

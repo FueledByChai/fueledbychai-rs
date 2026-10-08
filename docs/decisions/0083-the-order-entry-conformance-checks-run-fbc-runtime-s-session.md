@@ -61,7 +61,8 @@ venue for the program's life (`ExecSessionConfig::venue` is `&'static dyn VenueF
   once and naming its own order, an acceptance of the whole request taken as its one item's,
   order updates reported after the amend, every identity and field each amended update states the
   amended order's, nothing filled, the flags the order's and stated where
-  `OrderCaps.events_echo_flags`, a new venue id only where `AmendCaps.keeps_venue_id` is false, the placement accepted
+  `OrderCaps.events_echo_flags`, the client id stated where `OrderCaps.cid_echoed_on_events`,
+  nothing written once the amend is answered, a new venue id only where `AmendCaps.keeps_venue_id` is false, the placement accepted
   once as `OrderCaps.ack` has it, and no refusal naming the amended order nor update ending it
   once the amend is sent) and what the stub received on every connection: an
   order written once, counted by the frames carrying our client id as the venue's wire spells
