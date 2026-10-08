@@ -16,8 +16,8 @@ use fbc_core::{
     Feed, FeedHealth, HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag, Inbound,
     InboundSpans, InstrumentId, Keepalive, KeepaliveKind, Lots, MdCodec, MdEvent, MdSink,
     MdTransport, MonoNs, OpKind, RateCharge, RawFrame, StreamId, Subscription, Ticks, TimerTag,
-    TrafficClass, VenueConfig, VenueError, VenueFactory, VenueMeta, WallNs, WireSlice, WireUrl,
-    dispatch_market_data,
+    TrafficClass, VenueConfig, VenueError, VenueFactory, VenueMeta, Via, WallNs, WireSlice,
+    WireUrl, dispatch_market_data,
 };
 use fbc_runtime::{MdBooks, TradingBooks};
 
@@ -618,6 +618,59 @@ fn an_anchor_at_the_last_sequence_is_pushed_and_the_delta_after_it_is_a_gap() {
     assert_eq!(rig.fx.take(), [anchor_get(2, INST_A, "TOYA-PERP")]);
 }
 
+#[test]
+fn an_anchor_behind_what_the_channel_already_applied_is_asked_again() {
+    // Codex r4216139627: a delta repeated or going back is a gap, and the next anchor must not
+    // move the channel back behind the sequence it had reached.
+    let mut rig = Rig::new();
+    rig.subscribe(&[sub(INST_A, ANCHORED_BOOK)], &[]).unwrap();
+    rig.fx.take();
+    rig.http(1, Ok((200, "anchor|sym=TOYA-PERP|seq=10|bid=100:1|ask=")))
+        .unwrap();
+    assert_eq!(rig.pushed().len(), 3);
+    rig.frame("delta|sym=TOYA-PERP|book=1|seq=8|bid=100:2|ask=")
+        .unwrap();
+    assert_eq!(rig.pushed(), [gap(INST_A, ANCHORED_BOOK)]);
+    assert_eq!(rig.fx.take(), [anchor_get(2, INST_A, "TOYA-PERP")]);
+    // An anchor at 7 would chain onto the held 8 but is behind 10: asked again.
+    rig.http(2, Ok((200, "anchor|sym=TOYA-PERP|seq=7|bid=100:3|ask=")))
+        .unwrap();
+    assert!(rig.pushed().is_empty());
+    assert_eq!(rig.fx.take(), [anchor_get(3, INST_A, "TOYA-PERP")]);
+    // The floor outlives a failed anchor and its retry.
+    rig.http(3, Err(HttpFailure::TimedOut)).unwrap();
+    assert_eq!(rig.fx.take(), [retry(3)]);
+    rig.timer(3);
+    assert_eq!(rig.fx.take(), [anchor_get(4, INST_A, "TOYA-PERP")]);
+    rig.http(4, Ok((200, "anchor|sym=TOYA-PERP|seq=9|bid=100:3|ask=")))
+        .unwrap();
+    assert!(rig.pushed().is_empty());
+    assert_eq!(rig.fx.take(), [anchor_get(5, INST_A, "TOYA-PERP")]);
+    // One at 10 is live again, and 11 follows it.
+    rig.http(5, Ok((200, "anchor|sym=TOYA-PERP|seq=10|bid=100:4|ask=")))
+        .unwrap();
+    rig.frame("delta|sym=TOYA-PERP|book=1|seq=11|bid=100:5|ask=")
+        .unwrap();
+    let a = (INST_A, ANCHORED_BOOK);
+    assert_eq!(
+        rig.pushed(),
+        [
+            MdEvent::BookSnapshotBegin {
+                inst: a.0,
+                book: a.1,
+                epoch: 1
+            },
+            level(a.0, a.1, BID, 100, 4),
+            MdEvent::BookSnapshotEnd {
+                inst: a.0,
+                book: a.1
+            },
+            level(a.0, a.1, BID, 100, 5),
+        ]
+    );
+    assert!(rig.fx.is_empty());
+}
+
 /// Applies the events pushed since the last call to `books`, from one connection, and returns
 /// them.
 fn feed(books: &mut MdBooks, rig: &mut Rig) -> Vec<MdEvent> {
@@ -685,6 +738,28 @@ fn a_gap_reports_health_naming_the_book_that_broke_and_leaves_the_other_alone() 
         .unwrap();
     feed(&mut books, &mut rig);
     assert_eq!(book(&books, ANCHORED_BOOK), Ok(Some(lots(9))));
+}
+
+#[test]
+fn every_market_data_request_is_counted_by_a_declared_limit() {
+    // Codex r4216139636: the subscribe frame, the anchor's GET and the keepalive each fall in
+    // a bucket the toy declares, so a session's limiter throttles them.
+    let limits = toy::caps().limits;
+    let counted = |charge: &RateCharge, via| limits.iter().any(|l| l.counts(charge, via));
+    let mut rig = Rig::new();
+    rig.subscribe(&[sub(INST_A, BOOK), sub(INST_A, ANCHORED_BOOK)], &[])
+        .unwrap();
+    let fx = rig.fx.take();
+    assert_eq!(fx.len(), 2);
+    for effect in &fx {
+        match effect {
+            Effect::Send { charge, .. } => assert!(counted(charge, Via::Frame), "{effect:?}"),
+            Effect::Http { charge, .. } => assert!(counted(charge, Via::Http), "{effect:?}"),
+            other => panic!("{other:?}"),
+        }
+    }
+    let ping = rig.md.keepalive().unwrap();
+    assert!(counted(&ping.charge, Via::Frame));
 }
 
 // ---------------------------------------------------------------------------------------------

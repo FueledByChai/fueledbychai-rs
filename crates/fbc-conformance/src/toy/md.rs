@@ -21,8 +21,9 @@
 //!   up to `seq` are dropped and the rest must follow it plus one, or the anchor is asked for
 //!   again and nothing is pushed, those after it still held. Past [`MAX_HELD`] deltas, or at a
 //!   gap, the anchor is asked for again holding the delta that overflowed or broke the
-//!   sequence, the first the new anchor must reach. No sequence follows `u64::MAX`: a delta
-//!   after an anchor or delta there is a gap. A failure, a status other than 200 or a body it cannot decode
+//!   sequence, the first the new anchor must reach. After a gap an anchor before the sequence
+//!   the channel had reached is asked for again too: sequences never go back on a connection.
+//!   No sequence follows `u64::MAX`: a delta after an anchor or delta there is a gap. A failure, a status other than 200 or a body it cannot decode
 //!   asks again after [`ANCHOR_RETRY`].
 //!
 //! A frame for a channel not subscribed is dropped; an anchor answered after its subscription
@@ -51,10 +52,13 @@ enum Chan {
     /// No snapshot yet, or a gap since the last: deltas are dropped.
     Waiting,
     /// An anchor is asked for at `url` under `tag`; deltas are held in order until it comes.
+    /// An anchor before `floor`, the sequence the channel had already reached, is asked for
+    /// again: it would move the book back (Codex r4216139627).
     Anchoring {
         tag: u64,
         url: String,
         held: Vec<Levels>,
+        floor: u64,
     },
     /// Anchored at this sequence.
     Live { seq: u64 },
@@ -163,11 +167,12 @@ impl ToyMd {
         sink.push(s.meta, MdEvent::BookSnapshotEnd { inst, book });
     }
 
-    /// A gap on `book` at the delta `d`: reported, and the channel waits for its next
-    /// snapshot, an anchor having to reach `d`.
+    /// A gap on `book`, live at `seq`, at the delta `d`: reported, and the channel waits for
+    /// its next snapshot, an anchor having to reach both.
     fn gap(
         &mut self,
         (inst, book): (InstrumentId, BookId),
+        seq: u64,
         d: Levels,
         specs: &SpecTable,
         sink: &mut dyn MdSink,
@@ -182,20 +187,20 @@ impl ToyMd {
                 h: FeedHealth::Gap,
             },
         );
-        let next = self.restart(inst, book, specs, vec![d], fx);
+        let next = self.restart(inst, book, specs, (vec![d], seq), fx);
         self.chans.insert((inst, book), next);
     }
 
     /// Where a channel starts, or starts again: [`ANCHORED_BOOK`] asks for its anchor, holding
-    /// `held`, deltas already seen that the anchor must reach (Codex r4203051298); a channel
-    /// snapshotted in its own frames drops them. Subscribe checked that the instrument is in
-    /// `specs` and the anchor's base is set.
+    /// `held`, deltas already seen that the anchor must reach (Codex r4203051298), and refusing
+    /// an anchor before `floor`; a channel snapshotted in its own frames drops them. Subscribe
+    /// checked that the instrument is in `specs` and the anchor's base is set.
     fn restart(
         &mut self,
         inst: InstrumentId,
         book: BookId,
         specs: &SpecTable,
-        held: Vec<Levels>,
+        (held, floor): (Vec<Levels>, u64),
         fx: &mut Effects,
     ) -> Chan {
         let base = self.anchor.as_deref().filter(|_| book == ANCHORED_BOOK);
@@ -203,7 +208,12 @@ impl ToyMd {
             (Some(base), Some(spec)) => {
                 let url = format!("{base}/book/{}", spec.venue_symbol.as_wire());
                 let tag = self.ask_anchor(inst, &url, fx);
-                Chan::Anchoring { tag, url, held }
+                Chan::Anchoring {
+                    tag,
+                    url,
+                    held,
+                    floor,
+                }
             }
             _ => Chan::Waiting,
         }
@@ -222,15 +232,15 @@ impl ToyMd {
             Some(Chan::Anchoring { held, .. }) if held.len() < MAX_HELD => held.push(d),
             // Held past the bound: ask again rather than grow, holding `d` as the first delta
             // the new anchor must reach (Codex r4203051298).
-            Some(Chan::Anchoring { .. }) => {
-                let next = self.restart(key.0, key.1, specs, vec![d], fx);
+            Some(&mut Chan::Anchoring { floor, .. }) => {
+                let next = self.restart(key.0, key.1, specs, (vec![d], floor), fx);
                 self.chans.insert(key, next);
             }
             Some(Chan::Live { seq }) if seq.checked_add(1) == Some(d.seq) => {
                 *seq = d.seq;
                 push_levels(key.0, key.1, &d, sink);
             }
-            Some(Chan::Live { .. }) => self.gap(key, d, specs, sink, fx),
+            Some(&mut Chan::Live { seq }) => self.gap(key, seq, d, specs, sink, fx),
         }
     }
 
@@ -250,7 +260,10 @@ impl ToyMd {
             return Err(Malformed("anchor"));
         }
         let snap = levels(&r)?;
-        let Some(Chan::Anchoring { held, .. }) = self.chans.get(&key) else {
+        let Some(&Chan::Anchoring {
+            ref held, floor, ..
+        }) = self.chans.get(&key)
+        else {
             return Ok(());
         };
         let after: Vec<Levels> = held.iter().filter(|d| d.seq > snap.seq).cloned().collect();
@@ -262,10 +275,10 @@ impl ToyMd {
             last = d.seq;
             follows
         });
-        if !chained {
-            // The snapshot is older than a delta already missed: ask again, push nothing, and
-            // keep holding the deltas after it for the next anchor to reach.
-            let next = self.restart(inst, ANCHORED_BOOK, specs, after, fx);
+        if !chained || snap.seq < floor {
+            // The snapshot is older than a delta already missed, or than the book had reached:
+            // ask again, push nothing, and keep holding the deltas after it.
+            let next = self.restart(inst, ANCHORED_BOOK, specs, (after, floor), fx);
             self.chans.insert(key, next);
             return Ok(());
         }
@@ -357,7 +370,7 @@ impl MdCodec for ToyMd {
             if let Feed::Book(book) = sub.feed
                 && !self.chans.contains_key(&(sub.inst, book))
             {
-                let chan = self.restart(sub.inst, book, specs, Vec::new(), fx);
+                let chan = self.restart(sub.inst, book, specs, (Vec::new(), 0), fx);
                 self.chans.insert((sub.inst, book), chan);
             }
         }
