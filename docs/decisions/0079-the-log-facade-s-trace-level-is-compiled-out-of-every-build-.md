@@ -26,6 +26,16 @@ static maximum level is DEBUG: each `trace!` in any crate of that build compiles
 no logger, whatever level it sets, can receive a TRACE record. What tungstenite logs at DEBUG
 and above (handshake done, close frames) carries no frame payload.
 
+The feature alone does not hold in every build. In a build without debug assertions (a release
+build) `log` takes a `release_max_level_*` feature before any `max_level_*` one, so a crate
+anywhere in the consumer's build that enables `release_max_level_trace` brings TRACE back in
+release. fbc-runtime therefore also asserts at compile time (`const _: () = assert!(..)` in its
+lib.rs) that the facade's static maximum is DEBUG or below. The guarantee is enforced at build
+time: such a build fails to compile with an error naming this record, rather than running with
+TRACE. A stricter level (`release_max_level_info` and below) passes. fbc-runtime cannot also set
+`release_max_level_debug`, since `log` refuses two `release_max_level_*` features in one build,
+which would break a consumer that sets a stricter one.
+
 ## Alternatives
 
 - Tell consumers never to enable TRACE for tungstenite's targets: a rule in a document, broken
@@ -33,18 +43,24 @@ and above (handshake done, close frames) carries no frame payload.
   file.
 - `release_max_level_debug` only: debug builds, which an owner may run against testnet with
   real credentials, would still log every frame.
+- `release_max_level_debug` beside `max_level_debug`: `log` refuses two `release_max_level_*`
+  features in one build, so a consumer setting a stricter release level could not build.
+- The feature without the compile-time assertion: a release build with
+  `release_max_level_trace` anywhere in it would log every frame (Reviewer B RB-8mv-1 on PR #119,
+  reproduced with log 0.4.34: DEBUG in the debug build, TRACE in the release build).
 - Redact inside the runtime: the records are made inside tungstenite, before any code here sees
   them. Replacing or forking tungstenite to remove its logging is a far larger change than this.
 
 ## Consequences
 
 - No crate in a build that links fbc-runtime logs at TRACE through `log`, the consumer's own
-  `log::trace!` calls included. A `tracing` subscriber still receives `tracing`'s own TRACE
+  `log::trace!` calls included; a build whose features would allow it does not compile. A `tracing` subscriber still receives `tracing`'s own TRACE
   events, which do not pass through the facade's static maximum.
 - Proof: `crates/venues/fbc-venue-paradex/tests/rehearsal.rs` installs a logger at TRACE for
   the whole session and finds no token, login signature or key in what was logged;
   `crates/fbc-runtime/src/ws.rs`'s `the_log_facade_s_trace_level_is_compiled_out` fails if the
-  feature is dropped.
+  feature is dropped, and the assertion in `crates/fbc-runtime/src/lib.rs` fails the build
+  (error E0080) when a release build's features raise the level to TRACE.
 - Moving tungstenite or `log` re-runs the rehearsal, which reads what the new version logs.
 
 ## What would show this was wrong

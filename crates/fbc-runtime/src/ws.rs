@@ -275,7 +275,9 @@ mod tests {
 
     /// Decision 0079: tungstenite logs each frame it writes and reads at TRACE, the auth
     /// frame's session token included, so the log facade's TRACE is compiled out of every build
-    /// that links this crate.
+    /// that links this crate. This fails if the `max_level_debug` feature is dropped; the
+    /// build-time assertion in lib.rs also covers builds without debug assertions, where a
+    /// `release_max_level_*` feature takes precedence.
     #[test]
     fn the_log_facade_s_trace_level_is_compiled_out() {
         assert!(log::STATIC_MAX_LEVEL <= log::LevelFilter::Debug);
