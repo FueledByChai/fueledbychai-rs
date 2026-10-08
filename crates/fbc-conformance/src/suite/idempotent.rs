@@ -11,8 +11,12 @@
 //! take it. After the reconnect it must ask, opening and subscribing, for exactly the effects it
 //! asked for on the first connection: an [`MdCodec`] is deterministic given its inputs and prior state, and a fresh one
 //! has none, so anything else is state carried over (a codec that remembers the last
-//! connection's subscriptions sends them twice). Then the same set is desired again, and any
-//! call the reconciler yields is a breach. It reads no fixture file.
+//! connection's subscriptions sends them twice). Within each epoch, opening and subscribing
+//! together send each frame once: one sent from both would subscribe twice (Codex
+//! r4218492650). Then the same set is desired again, and any call the reconciler yields is a
+//! breach. It reads no fixture file.
+
+use std::collections::BTreeSet;
 
 use fbc_core::{ConnKey, Effect, Effects, MdCodec, SpecTable, VenueError};
 use fbc_runtime::{Reconciler, SubscribeCall};
@@ -88,6 +92,13 @@ fn book_twice(h: &Harness<'_>, book: &Book, breaches: &mut Vec<Breach>) -> Optio
             );
             breaches.push(Breach::new("MdCodec::subscribe", what));
         }
+        // Within the epoch, a frame sent once (Codex r4218492650).
+        if repeats(opens.last().into_iter().flatten().chain(&first)) {
+            let what = format!(
+                "{channel}: epoch {epoch} sends the same frame twice, opening and subscribing"
+            );
+            breaches.push(Breach::new("MdCodec::subscribe", what));
+        }
         sent.push(first);
         // The same set again: no call, nor any after the first.
         let again: Vec<SubscribeCall> = after
@@ -119,4 +130,15 @@ fn handed(
     let mut fx = Effects::new();
     codec.subscribe(call.add(), call.remove(), specs, &mut fx)?;
     Ok(fx.take())
+}
+
+/// Whether `effects` send the same frame on the same stream more than once.
+fn repeats<'a>(effects: impl Iterator<Item = &'a Effect>) -> bool {
+    let mut seen = BTreeSet::new();
+    effects
+        .filter_map(|e| match e {
+            Effect::Send { stream, frame, .. } => Some((*stream, frame.bytes())),
+            _ => None,
+        })
+        .any(|sent| !seen.insert(sent))
 }

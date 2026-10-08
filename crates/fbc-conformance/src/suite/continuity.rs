@@ -10,20 +10,23 @@
 //! sequence throws a good one away. From the frame that breaks a book, its first event
 //! included, until a snapshot of that book begins, the codec must push no level or window of it
 //! (Codex r4218167354): the consumer applies events as they come, so a delta of a broken book
-//! is trusted. A case that marks no break proves nothing and fails. A
-//! channel declared [`Continuity::Windowed`] or [`Continuity::Unsequenced`] has nothing to
-//! chain and is skipped by name.
+//! is trusted. Nor may it report the book [`FeedHealth::Live`] before that snapshot ends (Codex
+//! r4218492690): `Live` says no gap since the last snapshot. A case that marks no break proves
+//! nothing and fails. A channel declared [`Continuity::Windowed`] or
+//! [`Continuity::Unsequenced`] has nothing to chain and is skipped by name.
 //!
 //! # The longer-block sub-case
 //!
 //! A venue whose market data is binary ([`Encoding::Sbe`] or [`Encoding::Protobuf`]) also
-//! gives `continuity/longer_block/<channel>.frames` for each channel: frames whose binary block
-//! is longer than the schema the codec was written against (a field the venue added). The case
-//! must hold a frame, every one binary (Codex r4217991970), and the codec must decode every one, each pushing something (Codex
-//! r4217682441, r4217839165), and report a gap exactly where the case marks one, if anywhere: a
-//! longer block is read by its declared length, never taken for a break, refused or dropped. A
-//! text venue ([`Encoding::Json`] or [`Encoding::Text`]) has no binary block: the sub-case is
-//! skipped by name, and a `longer_block/` directory in its fixtures fails, as a case never read.
+//! gives `continuity/longer_block/<channel>.frames` for each channel the suite drives, its
+//! continuity chained or not (Codex r4218492670): frames whose binary block is longer than the
+//! schema the codec was written against (a field the venue added). The case must hold a frame,
+//! every one binary (Codex r4217991970), and the codec must decode every one, each pushing
+//! something (Codex r4217682441, r4217839165), and report a gap exactly where the case marks
+//! one, if anywhere: a longer block is read by its declared length, never taken for a break,
+//! refused or dropped. A text venue ([`Encoding::Json`] or [`Encoding::Text`]) has no binary
+//! block: the sub-case is skipped by name, and a `longer_block/` directory in its fixtures
+//! fails, as a case never read.
 
 use std::collections::BTreeSet;
 
@@ -31,7 +34,7 @@ use fbc_core::{
     BookCaps, Continuity, Encoding, Feed, FeedHealth, InstrumentId, MdEvent, SpecTable,
 };
 
-use super::book_cases::{self, Book, PerBook, Step};
+use super::book_cases::{self, Book, NO_BOOK, PerBook, Step};
 use super::harness::Harness;
 use super::{Breach, Failure, Subject, Verdict};
 
@@ -47,9 +50,15 @@ const NOTHING_CHAINED: &str = "the caps declare no book channel the suite drives
 /// Runs `continuity` against `subject`.
 pub fn continuity(subject: &Subject<'_>) -> Result<Verdict, Failure> {
     let h = Harness::new(CHECK, subject)?;
-    let (books, skipped) = book_cases::books(&h, unchained);
-    let outcome = run(&h, subject, &books, skipped);
-    book_cases::verdict(CHECK, &books, NOTHING_CHAINED, outcome)
+    let (chained, skipped) = book_cases::books(&h, unchained);
+    // A binary venue's longer blocks are read on every channel the suite drives, chained or
+    // not (Codex r4218492670): the check runs while there is one.
+    let (driven, why) = match h.caps.md.encoding {
+        Encoding::Sbe | Encoding::Protobuf => (book_cases::books(&h, |_| None).0, NO_BOOK),
+        Encoding::Json | Encoding::Text => (chained.clone(), NOTHING_CHAINED),
+    };
+    let outcome = run(&h, subject, (&chained, &driven), skipped);
+    book_cases::verdict(CHECK, &driven, why, outcome)
 }
 
 /// Why a channel declaring `caps` has no sequence to break, if it has none.
@@ -62,11 +71,11 @@ fn unchained(caps: &BookCaps) -> Option<String> {
     }
 }
 
-/// Both cases of every driven channel: the breaks, then the longer blocks.
+/// The breaks of every `chained` channel, then the longer blocks of every `driven` one.
 fn run(
     h: &Harness<'_>,
     subject: &Subject<'_>,
-    books: &[Book],
+    (chained, driven): (&[Book], &[Book]),
     skipped: Vec<String>,
 ) -> Result<(Vec<String>, Vec<Breach>), Failure> {
     let breaks = PerBook {
@@ -76,7 +85,7 @@ fn run(
             judge(book, file, steps, specs, breaches, true)
         },
     };
-    let (mut probed, mut breaches) = breaks.run(h, subject, books, skipped)?;
+    let (mut probed, mut breaches) = breaks.run(h, subject, chained, skipped)?;
     let dir = format!("{CHECK}/{LONGER}");
     match h.caps.md.encoding {
         Encoding::Sbe | Encoding::Protobuf => {
@@ -87,7 +96,7 @@ fn run(
                     judge(book, file, steps, specs, breaches, false)
                 },
             };
-            let (more, broken) = longer.run(h, subject, books, Vec::new())?;
+            let (more, broken) = longer.run(h, subject, driven, Vec::new())?;
             probed.extend(more);
             breaches.extend(broken);
         }
@@ -129,8 +138,8 @@ fn judge(
         )
     };
     let mut marked = 0usize;
-    // The instruments whose book a frame broke, until a snapshot of it begins.
-    let mut broken = BTreeSet::new();
+    // The instruments whose book a frame broke, until a snapshot of it begins, then ends.
+    let mut broken = Broken::default();
     for step in steps {
         let line = step.line;
         // The instruments and feeds a gap was reported on.
@@ -184,7 +193,7 @@ fn judge(
                 continue;
             };
             own.push((inst, Feed::Book(book.id)));
-            broken.insert(inst);
+            broken.held.insert(inst);
             if !gapped.contains(&(inst, Feed::Book(book.id))) {
                 let what = format!(
                     "{file} line {line} breaks {sym}'s sequence, yet no gap on {channel} was \
@@ -237,13 +246,20 @@ fn judge(
     format!("{file}: {marked} of {frames} frames break the sequence")
 }
 
-/// Holds `step` to the books broken before it or by it, which `broken` holds: none takes a
-/// level or window until a snapshot of it begins, the snapshot's own levels being the recovery
-/// (Codex r4218167354). The frame that breaks a book is held from its first event, as a level
-/// pushed before the gap reaches the consumer first. A snapshot's begin moves a book out of
-/// `broken`.
+/// The instruments whose book is broken: `held` until a snapshot of it begins, `healing` until
+/// that snapshot ends.
+#[derive(Default)]
+struct Broken {
+    held: BTreeSet<InstrumentId>,
+    healing: BTreeSet<InstrumentId>,
+}
+
+/// Holds `step` to the books broken before it or by it: none takes a level or window until a
+/// snapshot of it begins, the snapshot's own levels being the recovery (Codex r4218167354), nor
+/// is reported `Live` until that snapshot ends (Codex r4218492690). The frame that breaks a book
+/// is held from its first event, as a level pushed before the gap reaches the consumer first.
 fn kept_live(
-    broken: &mut BTreeSet<InstrumentId>,
+    broken: &mut Broken,
     book: &Book,
     file: &str,
     step: &Step,
@@ -251,18 +267,37 @@ fn kept_live(
     symbol: &dyn Fn(InstrumentId) -> String,
     breaches: &mut Vec<Breach>,
 ) {
+    let line = step.line;
     for (_, ev) in &step.events {
         match *ev {
-            MdEvent::BookSnapshotBegin { inst, book: b, .. } if b == book.id => {
-                broken.remove(&inst);
+            MdEvent::BookSnapshotBegin { inst, book: b, .. }
+                if b == book.id && broken.held.remove(&inst) =>
+            {
+                broken.healing.insert(inst);
+            }
+            MdEvent::BookSnapshotEnd { inst, book: b } if b == book.id => {
+                broken.healing.remove(&inst);
             }
             MdEvent::Level { inst, book: b, .. } | MdEvent::Window { inst, book: b, .. }
-                if b == book.id && broken.contains(&inst) =>
+                if b == book.id && broken.held.contains(&inst) =>
             {
                 let what = format!(
-                    "{file} line {} pushes a level of {}'s book while its sequence is broken: a \
-                     broken book takes nothing until its next snapshot",
-                    step.line,
+                    "{file} line {line} pushes a level of {}'s book while its sequence is \
+                     broken: a broken book takes nothing until its next snapshot",
+                    symbol(inst)
+                );
+                breaches.push(Breach::new(capability, what));
+            }
+            MdEvent::Health {
+                inst,
+                feed: Feed::Book(b),
+                h: FeedHealth::Live,
+            } if b == book.id
+                && (broken.held.contains(&inst) || broken.healing.contains(&inst)) =>
+            {
+                let what = format!(
+                    "{file} line {line} reports {}'s book Live while its sequence is broken: \
+                     it is Live again only once its next snapshot ends",
                     symbol(inst)
                 );
                 breaches.push(Breach::new(capability, what));
