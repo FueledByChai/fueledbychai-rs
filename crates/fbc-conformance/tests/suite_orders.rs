@@ -105,6 +105,8 @@ enum Twist {
     StrangerAmended,
     /// A timed-out placement's `Unknown` names another order's client id.
     StrangerOnTimeout,
+    /// A timed-out placement's `Unknown` names its item 0 with a venue id the stub never sent.
+    VidOnTimeout,
     /// A placement's acceptance names item 1 of its single command.
     PlacedAsItemOne,
     /// An amended order's update is followed by an `Open` update of the order under its new
@@ -322,6 +324,10 @@ static STRANGER_AMENDED: Variant = Variant {
 static STRANGER_ON_TIMEOUT: Variant = Variant {
     caps: |_| {},
     twist: Twist::StrangerOnTimeout,
+};
+static VID_ON_TIMEOUT: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::VidOnTimeout,
 };
 static PLACED_AS_ITEM_ONE: Variant = Variant {
     caps: |_| {},
@@ -1109,6 +1115,26 @@ fn stranger_on_timeout(ev: ExecEvent) -> Vec<ExecEvent> {
     }]
 }
 
+/// A timed-out request's `Unknown` for the whole request as item 0, naming no client id and a
+/// venue id the stub never sent.
+fn vid_on_timeout(ev: ExecEvent) -> Vec<ExecEvent> {
+    vec![match ev {
+        ExecEvent::Outcome {
+            rpc,
+            item: None,
+            outcome: outcome @ SubmitOutcome::Unknown,
+        } => {
+            let item = Some(ItemRef {
+                idx: 0,
+                cid: None,
+                vid: toy::with_scope(|scope| scope.venue_order_id("toy-stranger")).ok(),
+            });
+            ExecEvent::Outcome { rpc, item, outcome }
+        }
+        other => other,
+    }]
+}
+
 /// A client id of another engine's, minted under a lease of its own.
 fn stranger() -> fbc_core::ClientOrderId {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1313,6 +1339,7 @@ impl ExecCodec for Twisted {
             Twist::SwapsItems => swapped,
             Twist::ProvisionalOnTimeout => provisional,
             Twist::StrangerOnTimeout => stranger_on_timeout,
+            Twist::VidOnTimeout => vid_on_timeout,
             _ => return self.inner.on_rpc_timeout(rpc, sink),
         };
         self.inner
@@ -1983,6 +2010,15 @@ fn unknown_on_timeout_fails_a_toy_whose_unknown_names_another_orders_client_id()
     let failure = failed(suite::unknown_on_timeout(
         &STRANGER_ON_TIMEOUT.subject(assumed),
     ));
+    assert!(
+        says(&failure, "ExecCodec::on_rpc_timeout", "not Unknown once"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn unknown_on_timeout_fails_a_toy_whose_unknown_names_a_venue_id() {
+    let failure = failed(suite::unknown_on_timeout(&VID_ON_TIMEOUT.subject(assumed)));
     assert!(
         says(&failure, "ExecCodec::on_rpc_timeout", "not Unknown once"),
         "{failure}"

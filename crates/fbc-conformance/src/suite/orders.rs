@@ -26,7 +26,7 @@
 //!   `Accepted`, the second `Rejected` and the third `Unknown`, each by its index, and nothing
 //!   is reported for the whole request. The third has no outcome before the clock moves.
 //! - `unknown_on_timeout`: a placement the stub never answers is reported `Unknown` once at its
-//!   deadline (nothing before the clock moves), naming no other order, and is never written a
+//!   deadline (nothing before the clock moves), naming no other order and no venue id, and is never written a
 //!   second time, however long the clock then runs.
 //!
 //! None reads a fixture file.
@@ -684,9 +684,12 @@ pub fn unknown_on_timeout(subject: &Subject<'static>) -> Result<Verdict, Failure
             breaches.push(Breach::new("ExecCodec::on_rpc_timeout", what));
         }
         let outcomes = c.outcomes(rpc);
-        // Its one item, naming the placement where it names an order (Codex r4222779007).
+        // Its one item, naming the placement where it names an order (Codex r4222779007), by
+        // no venue id: the stub sent none (Codex r4225066536).
         let unknown = |(it, o): &(Option<ItemRef>, SubmitOutcome)| {
-            let own = |it: &ItemRef| it.idx == 0 && it.cid.is_none_or(|named| named == cid);
+            let own = |it: &ItemRef| {
+                it.idx == 0 && it.cid.is_none_or(|named| named == cid) && it.vid.is_none()
+            };
             *o == SubmitOutcome::Unknown && it.as_ref().is_none_or(own)
         };
         if outcomes.len() != 1 || !outcomes.iter().all(unknown) {
