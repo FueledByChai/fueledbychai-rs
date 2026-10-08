@@ -42,8 +42,8 @@ use fbc_core::{
     ExecEndpoint, ExecEvent, ExecSink, FieldSpec, HttpFailure, HttpPlan, HttpResponse, HttpTag,
     Inbound, InboundSpans, InstrumentSpecDraft, MdCodec, NonceBlock, NonceSource, NotSentReason,
     OpKind, PathStamps, RateCharge, RawFrame, RpcCall, RpcId, Secrets, SpecTable, StreamId,
-    Subscription, SymbolError, TimerTag, TrafficClass, VenueCaps, VenueCommand, VenueConfig,
-    VenueError, VenueFactory, WallNs, WireSlice, WireUrl,
+    SubmitOutcome, Subscription, SymbolError, TimerTag, TrafficClass, VenueCaps, VenueCommand,
+    VenueConfig, VenueError, VenueFactory, WallNs, WireSlice, WireUrl,
 };
 use fbc_journal::{
     BLANK, ControlEvent, Entry, HeaderRec, JournalReader, JournalSink, JournalWriter,
@@ -78,6 +78,8 @@ const CALL_NONCES: &str = "call.nonces";
 const BAD_SPANS: &str = "bad.spans";
 /// A frame the `auth_toy` session's codec panics redacting (a codec defect).
 const PANIC_ON: &str = "panic.on";
+/// How many milliseconds the `auth_toy` session's arm waits for its answer; an hour by default.
+const ARM_TIMEOUT_MS: &str = "arm.timeout.ms";
 /// The conformance toy's acknowledgement of its authentication, echoing its token.
 const AUTH_ACK: &str = "auth|ok=1|token=toy-session-token";
 
@@ -347,6 +349,9 @@ fn auth_toy(cfg: &VenueConfig) -> Box<dyn ExecCodec> {
         call_nonces: cfg.get(CALL_NONCES).unwrap().parse().unwrap(),
         bad_spans: cfg.get(BAD_SPANS).is_some(),
         panic_on: cfg.get(PANIC_ON).map(str::to_owned),
+        arm_timeout: cfg
+            .get(ARM_TIMEOUT_MS)
+            .map_or(Duration::from_secs(3_600), |v| ms(v.parse().unwrap())),
     })
 }
 
@@ -359,6 +364,7 @@ struct AuthWrap {
     call_nonces: u16,
     bad_spans: bool,
     panic_on: Option<String>,
+    arm_timeout: Duration,
 }
 
 impl AuthWrap {
@@ -421,7 +427,7 @@ impl ExecCodec for AuthWrap {
             frame: WireSlice::plain(format!("cod|rpc={}", rpc.0).into_bytes()),
             rpc: Some(RpcCall {
                 id: rpc,
-                timeout: Duration::from_secs(3_600),
+                timeout: self.arm_timeout,
             }),
             class: cmd.traffic_class(),
             charge: RateCharge::one(OpKind::Control, None),
@@ -1445,6 +1451,60 @@ async fn an_ended_epochs_http_result_is_hashed_whole_once_the_codec_opened_a_lat
         _ => None,
     });
     let resp = resp.expect("epoch 0's login result is journaled");
+    assert_eq!(resp.body.0, blank(body.len()).as_bytes());
+    assert!(resp.headers.iter().all(|h| h.redact), "{:#?}", resp.headers);
+}
+
+/// Codex P1 r4214784284 on PR #115: a request's deadline that falls due while the session waits
+/// to reconnect calls the codec's `on_rpc_timeout`, which may change the state its redaction
+/// reads, so an ended epoch's HTTP result that comes back after that is hashed whole.
+#[tokio::test]
+async fn an_ended_epochs_http_result_is_hashed_whole_once_a_deadline_reached_the_codec() {
+    let token = secret("staletimedout");
+    let mut server = ScriptedWs::start().await;
+    let mut http = ScriptedHttp::start().await;
+    let venue = Venue::leak(auth_toy);
+    let cfg = [
+        (LOGIN, http.url("/auth")),
+        (CALL_NONCES, "0".to_owned()),
+        (ARM_TIMEOUT_MS, "300".to_owned()),
+    ];
+    let config = config(venue, &server.url(), &cfg, Counting::new());
+    let body = format!("auth|token={token}|refresh=3600");
+    let live_body = body.clone();
+    let run = journaled(
+        "exec_journal_stale_timed_out",
+        config,
+        |_, control, heard| async move {
+            let mut peer = server.accept().await;
+            // A login that asks to be refreshed at once: its refresh waits unanswered.
+            let first = "auth|token=tokenfirst|refresh=0";
+            http.request().await.answer("HTTP/1.1 200 OK", first).await;
+            assert_eq!(recv_text(&mut peer).await, "cod|rpc=1");
+            let refresh = http.request().await;
+            peer.drop_conn();
+            // The arm's deadline falls due while the session waits a minute to reconnect.
+            let unknown = ExecEvent::Outcome {
+                rpc: RpcId(1),
+                item: None,
+                outcome: SubmitOutcome::Unknown,
+            };
+            until(|| heard.borrow().contains(&unknown)).await;
+            let answered = refresh.answer("HTTP/1.1 200 OK\r\nX-Toy: yes", &live_body);
+            let _ = tokio::time::timeout(ms(500), answered).await;
+            tokio::time::sleep(ms(100)).await;
+            drop(control);
+        },
+    )
+    .await;
+    run.ended.as_ref().unwrap();
+    assert!(!contains(&run.files, token.as_bytes()));
+    // The last result journaled is the refresh's.
+    let resp = run.entries.iter().rev().find_map(|e| match &e.record {
+        Record::HttpResult { result: Ok(r), .. } => Some(r.clone()),
+        _ => None,
+    });
+    let resp = resp.expect("the refresh's result is journaled");
     assert_eq!(resp.body.0, blank(body.len()).as_bytes());
     assert!(resp.headers.iter().all(|h| h.redact), "{:#?}", resp.headers);
 }
