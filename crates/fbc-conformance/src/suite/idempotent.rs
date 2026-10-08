@@ -1,0 +1,108 @@
+//! `subscriptions_idempotent` (design §6, decision 0002): subscribing the same set twice
+//! through the runtime's [`Reconciler`] sends nothing the second time, on the first connection
+//! epoch and after a reconnect. The Java stack resubscribed on every reconnect without asking
+//! what the connection already had, so duplicate subscriptions piled up, and the work behind
+//! them with them.
+//!
+//! For every book channel the suite drives ([`book_cases`](super::book_cases)), the set is that
+//! channel on every instrument of the setup. In each of two epochs a codec built fresh from the
+//! factory (one per epoch, as the runtime builds them) is opened, and the reconciler's call for
+//! the set is handed to its [`subscribe`](fbc_core::MdCodec::subscribe), which must take it,
+//! asking after the reconnect for as many effects as on the first connection (a codec that
+//! remembers the last connection's subscriptions sends them twice); then the same set is
+//! desired again, and any call the reconciler yields is a breach. It reads no fixture file.
+
+use fbc_core::{ConnKey, Effects, MdCodec, SpecTable, VenueError};
+use fbc_runtime::{Reconciler, SubscribeCall};
+
+use super::book_cases::{self, Book, NO_BOOK};
+use super::harness::{Harness, MD_STREAM};
+use super::{Breach, Failure, Subject, Verdict};
+
+const CHECK: &str = "subscriptions_idempotent";
+/// The epochs each channel is subscribed in: the first connection, and one reconnect.
+const EPOCHS: u32 = 2;
+
+/// Runs `subscriptions_idempotent` against `subject`.
+pub fn subscriptions_idempotent(subject: &Subject<'_>) -> Result<Verdict, Failure> {
+    let h = Harness::new(CHECK, subject)?;
+    let (books, mut probed) = book_cases::books(&h, |_| None);
+    let mut breaches = Vec::new();
+    for book in &books {
+        if let Some(sent) = book_twice(&h, book, &mut breaches) {
+            probed.push(sent);
+        }
+    }
+    book_cases::verdict(CHECK, &books, NO_BOOK, Ok((probed, breaches)))
+}
+
+/// `book` on every instrument, desired twice in each epoch: what was sent, or `None` when the
+/// codec refused the set.
+fn book_twice(h: &Harness<'_>, book: &Book, breaches: &mut Vec<Breach>) -> Option<String> {
+    let subs = h.book_subs(book.id);
+    let channel = book.caps.channel;
+    let conn = MD_STREAM.0;
+    let mut rec = Reconciler::new(ConnKey { conn, epoch: 0 });
+    let mut sent = Vec::new();
+    for epoch in 0..EPOCHS {
+        let key = ConnKey { conn, epoch };
+        if epoch > 0 {
+            rec.begin_epoch(key).expect("each epoch is after the last");
+        }
+        let mut codec = h.md_codec(subs.clone());
+        let mut fx = Effects::new();
+        codec.on_open(&mut fx);
+        let opened = rec.opened(key).expect("the current epoch opened");
+        let call = opened
+            .or_else(|| rec.set_desired(subs.iter().copied()))
+            .expect("a set not yet subscribed is a call");
+        let first = match handed(&mut *codec, &call, h.specs()) {
+            Ok(n) => n,
+            Err(e) => {
+                let what = format!("refused {channel} on every instrument in epoch {epoch}: {e}");
+                breaches.push(Breach::new("MdCodec::subscribe", what));
+                return None;
+            }
+        };
+        let after = rec.sent(call).expect("the call of the current epoch");
+        // A reconnect's codec is fresh: it sends the set as the first did, nothing piled up.
+        if let Some(&before) = sent.first()
+            && before != first
+        {
+            let what = format!(
+                "{channel}: the reconnect's subscribe asked for {first} effects, the first \
+                 epoch's for {before}"
+            );
+            breaches.push(Breach::new("MdCodec::subscribe", what));
+        }
+        sent.push(first);
+        // The same set again: no call, nor any after the first.
+        let again: Vec<SubscribeCall> = after
+            .into_iter()
+            .chain(rec.set_desired(subs.iter().copied()))
+            .collect();
+        if !again.is_empty() {
+            let what = format!(
+                "{channel}: the same set desired again in epoch {epoch} made {} more calls",
+                again.len()
+            );
+            breaches.push(Breach::new("Reconciler", what));
+        }
+    }
+    Some(format!(
+        "{channel}: {} subscriptions sent once in each of {EPOCHS} epochs ({sent:?} effects), \
+         nothing for the same set again",
+        subs.len()
+    ))
+}
+
+/// `call` handed to `codec`: how many effects it asked for, or why it refused.
+fn handed(
+    codec: &mut dyn MdCodec,
+    call: &SubscribeCall,
+    specs: &SpecTable,
+) -> Result<usize, VenueError> {
+    let mut fx = Effects::new();
+    codec.subscribe(call.add(), call.remove(), specs, &mut fx)?;
+    Ok(fx.len())
+}

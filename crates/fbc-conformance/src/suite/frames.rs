@@ -87,7 +87,7 @@ pub(crate) fn parse(text: &str) -> Result<Case, String> {
 
 /// The bytes `hex` spells, spaces between them allowed; `None` when it spells none, has an odd
 /// number of digits or anything but hexadecimal digits and spaces.
-fn unhex(hex: &str) -> Option<Vec<u8>> {
+pub(crate) fn unhex(hex: &str) -> Option<Vec<u8>> {
     let digits: Vec<u8> = hex.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     if digits.is_empty() || !digits.len().is_multiple_of(2) {
         return None;

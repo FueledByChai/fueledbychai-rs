@@ -32,13 +32,16 @@
 //!   test; and each check as a public function. So far `caps_truthful`,
 //!   `commands_selfcontained`, `signing_golden` and `legacy_symbols` (FBC-onw), `fee_sign`,
 //!   `liquidity_reported`, `position_signed` and `decoder_deterministic`, which read the
-//!   venue's fixture frames (FBC-whw), and `encode_deterministic`, `ids_roundtrip`,
-//!   `restart_cid` and `price_grid` (FBC-2re); the conformance toy passes all twelve, a
-//!   deliberately broken toy fails `caps_truthful` (`tests/suite_broken.rs`), a toy whose
-//!   signer changes one signed byte fails `signing_golden` (`tests/suite_golden.rs`), toys
-//!   that flip a fee's sign or decode nondeterministically fail `fee_sign` and
-//!   `decoder_deterministic` (`tests/suite_frames.rs`), and a toy whose encode reads the real
-//!   time fails `encode_deterministic` (`tests/suite_ids_grid.rs`).
+//!   venue's fixture frames (FBC-whw), `encode_deterministic`, `ids_roundtrip`, `restart_cid`
+//!   and `price_grid` (FBC-2re), and the market-data checks `continuity`,
+//!   `subscriptions_idempotent`, `no_exch_ts_synthesized` and `book_channels` (FBC-vmw); the
+//!   conformance toy passes all sixteen, a deliberately broken toy fails `caps_truthful`
+//!   (`tests/suite_broken.rs`), a toy whose signer changes one signed byte fails
+//!   `signing_golden` (`tests/suite_golden.rs`), toys that flip a fee's sign or decode
+//!   nondeterministically fail `fee_sign` and `decoder_deterministic` (`tests/suite_frames.rs`),
+//!   a toy whose encode reads the real time fails `encode_deterministic`
+//!   (`tests/suite_ids_grid.rs`), and a toy variant that ignores a sequence break fails
+//!   `continuity` (`tests/suite_md.rs`).
 //!
 //! Not here yet: the suite's other checks, and the rest of the conformance toy venue.
 

@@ -45,10 +45,15 @@
 //! - `restart_cid/resting.frames`: a case of what the venue shows a restarted process: a
 //!   resync's answer with orders of ours resting, their client ids the suite's first
 //!   [`MINTED_BEFORE`] ids in its namespace, the newest among them ([`restart_cid`]).
+//! - `continuity/`, `no_exch_ts_synthesized/` and `book_channels/`: one market-data case per
+//!   book channel the suite drives, `<channel>.frames`, its frames tagged with what the fixture
+//!   knows of them (the format is [`book_cases`]'s); and, for a venue whose market data is
+//!   binary, `continuity/longer_block/<channel>.frames`, frames whose binary block is longer
+//!   than expected.
 //!
-//! [`caps_truthful`], [`commands_selfcontained`], [`encode_deterministic`] and [`price_grid`]
-//! read no file: they need only the factory and the [`Setup`] the `setup` function gives,
-//! called afresh wherever a check builds a codec.
+//! [`caps_truthful`], [`commands_selfcontained`], [`encode_deterministic`], [`price_grid`] and
+//! [`subscriptions_idempotent`] read no file: they need only the factory and the [`Setup`] the
+//! `setup` function gives, called afresh wherever a check builds a codec.
 //!
 //! # The checks so far
 //!
@@ -76,15 +81,33 @@
 //!   no live or recent id again, held above them by the venue's resync answer (decision 0004).
 //! - [`price_grid`]: every price quantized at the venue's grid boundaries is valid and
 //!   maker-safe, and each is sent as a post-only order at the price it was given.
+//! - [`continuity`]: the fixture's sequence breaks are detected as each book channel's
+//!   `BookCaps.continuity` declares, and nothing else is taken for one; a binary venue's longer
+//!   blocks are read, never taken for a break (decision 0022).
+//! - [`subscriptions_idempotent`]: subscribing the same set twice through the runtime's
+//!   reconciler sends nothing the second time, before and after a reconnect (decision 0002).
+//! - [`no_exch_ts_synthesized`]: a market-data event carries the venue's timestamp only when
+//!   its frame does.
+//! - [`book_channels`]: a book's frames show the order channels its `BookCaps.includes_channels`
+//!   declares, and decode onto that book.
+//!
+//! The four market-data checks skip by name a book channel anchored on REST (FBC-fhk4), and a
+//! check's sub-case skipped (a text venue's longer blocks) is listed by name among what it
+//! probed.
 
+pub mod book_cases;
+mod book_channels;
 mod caps_truthful;
+mod continuity;
 mod decoded;
 mod deterministic;
 mod encode;
+mod exch_ts;
 pub mod frames;
 mod golden;
 mod grid;
 mod harness;
+mod idempotent;
 mod ids;
 mod legacy;
 mod selfcontained;
@@ -96,12 +119,16 @@ use fbc_core::{
     EncodeCtx, RpcId, Secrets, SpecTable, StreamId, VenueCommand, VenueConfig, VenueFactory,
 };
 
+pub use book_channels::book_channels;
 pub use caps_truthful::caps_truthful;
+pub use continuity::continuity;
 pub use decoded::{fee_sign, liquidity_reported, position_signed};
 pub use deterministic::decoder_deterministic;
 pub use encode::{APART, encode_deterministic};
+pub use exch_ts::no_exch_ts_synthesized;
 pub use golden::signing_golden;
 pub use grid::price_grid;
+pub use idempotent::subscriptions_idempotent;
 pub use ids::{MINTED_BEFORE, ids_roundtrip, restart_cid};
 pub use legacy::legacy_symbols;
 pub use selfcontained::commands_selfcontained;
@@ -265,10 +292,14 @@ impl fmt::Display for Failure {
 impl std::error::Error for Failure {}
 
 /// What a check gave, as a test: a failure panics with every breach, a skip prints its
-/// reason, and a pass returns.
+/// reason, and a pass returns, printing any part of it skipped by name.
 pub fn expect(outcome: Result<Verdict, Failure>) {
     match outcome {
-        Ok(Verdict::Passed { .. }) => {}
+        Ok(Verdict::Passed { check, probed }) => {
+            for skipped in probed.iter().filter(|p| p.contains(": skipped: ")) {
+                eprintln!("{check}: {skipped}");
+            }
+        }
         Ok(Verdict::Skipped { check, why }) => eprintln!("{check}: skipped: {why}"),
         Err(failure) => panic!("{failure}"),
     }
@@ -413,6 +444,46 @@ macro_rules! suite {
         fn price_grid() {
             $crate::suite::run(
                 $crate::suite::price_grid,
+                &$factory,
+                concat!(env!("CARGO_MANIFEST_DIR"), "/", $fixtures),
+                $setup,
+            );
+        }
+
+        #[test]
+        fn continuity() {
+            $crate::suite::run(
+                $crate::suite::continuity,
+                &$factory,
+                concat!(env!("CARGO_MANIFEST_DIR"), "/", $fixtures),
+                $setup,
+            );
+        }
+
+        #[test]
+        fn subscriptions_idempotent() {
+            $crate::suite::run(
+                $crate::suite::subscriptions_idempotent,
+                &$factory,
+                concat!(env!("CARGO_MANIFEST_DIR"), "/", $fixtures),
+                $setup,
+            );
+        }
+
+        #[test]
+        fn no_exch_ts_synthesized() {
+            $crate::suite::run(
+                $crate::suite::no_exch_ts_synthesized,
+                &$factory,
+                concat!(env!("CARGO_MANIFEST_DIR"), "/", $fixtures),
+                $setup,
+            );
+        }
+
+        #[test]
+        fn book_channels() {
+            $crate::suite::run(
+                $crate::suite::book_channels,
                 &$factory,
                 concat!(env!("CARGO_MANIFEST_DIR"), "/", $fixtures),
                 $setup,
