@@ -133,6 +133,23 @@ fn discovery_refuses_a_configuration_it_cannot_send_by_the_key_at_fault() {
         "https://api.testnet.paradex.trade",
         "https://api.testnet.paradex.trade/v2",
         "https:///v1",
+        // A host the runtime could not open is refused here, not found as a request never
+        // sent (Codex r4218015211): not a DNS name, an IPv4 address or a bracketed IPv6
+        // address, or a port outside 1 to 65535.
+        "https://bad host/v1",
+        "https://-bad.example/v1",
+        "https://bad-.example/v1",
+        "https://api..paradex.trade/v1",
+        "https://1.2.3/v1",
+        "https://[::1/v1",
+        "https://[not-v6]/v1",
+        "https://[::1]x/v1",
+        "https://api.paradex.trade:0/v1",
+        "https://api.paradex.trade:65536/v1",
+        "https://api.paradex.trade:/v1",
+        "https://api.paradex.trade:80a/v1",
+        "http://[::2]/v1",
+        "http://10.0.0.1/v1",
     ] {
         let Some(VenueError::Config(ConfigError::Invalid { key, .. })) =
             refused(REST_URL, Some(bad))
@@ -140,6 +157,18 @@ fn discovery_refuses_a_configuration_it_cannot_send_by_the_key_at_fault() {
             panic!("{bad} is refused")
         };
         assert_eq!(key, REST_URL, "{bad}");
+    }
+    // Each form of host the runtime opens is accepted, with a port or without; plain HTTP to
+    // any loopback form.
+    for good in [
+        "https://api.prod.paradex.trade:443/v1",
+        "https://203.0.113.7/v1",
+        "https://[2001:db8::1]:8443/v1",
+        "http://localhost:9000/v1",
+        "http://127.0.0.2/v1",
+        "http://[::1]:9000/v1",
+    ] {
+        assert_eq!(refused(REST_URL, Some(good)), None, "{good}");
     }
     for bad in ["5", "0s", "fast"] {
         let Some(VenueError::Config(ConfigError::Invalid { key, .. })) =
