@@ -221,16 +221,15 @@ impl ExecCodec for ParadexExec {
         sink: &mut dyn ExecSink,
         fx: &mut Effects,
     ) -> Result<(), DecodeError> {
-        let RawFrame::Text(text) = f else {
-            let phase = match f {
-                RawFrame::Binary(bytes) => phase(bytes),
-                RawFrame::Text(_) => None,
-            };
-            let mut held = Held::default();
-            self.session
-                .on_frame(stream, f, scope, specs, &mut held, fx)?;
-            self.placements.on_event(phase, held, sink);
-            return Ok(());
+        let text = match f {
+            RawFrame::Text(text) => text,
+            RawFrame::Binary(bytes) => {
+                let mut held = Held::default();
+                self.session
+                    .on_frame(stream, f, scope, specs, &mut held, fx)?;
+                self.placements.on_event(phase(bytes), held, sink);
+                return Ok(());
+            }
         };
         let reply: Value = serde_json::from_str(text)
             .map_err(|_| DecodeError::Malformed("text frame is not JSON"))?;

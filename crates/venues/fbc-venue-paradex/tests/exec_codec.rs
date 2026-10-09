@@ -1609,3 +1609,47 @@ fn an_event_naming_another_venue_id_settles_no_placement() {
     expected.extend(decoded(&open));
     assert_eq!(call.events, expected);
 }
+
+#[test]
+fn a_placement_we_cancel_before_its_reply_is_provisional_at_the_reply_and_awaits_nothing_more() {
+    // CLOSED by USER_CANCELED with nothing filled, before the reply: withdrawn, so the reply
+    // is its provisional acceptance alone, and a later event of the order settles nothing.
+    let canceled = with_reason(
+        sbe("order-closed-post-only-v2.sbe.txt"),
+        "POST_ONLY_WOULD_CROSS",
+        "USER_CANCELED",
+    );
+    let mut codec = authenticated();
+    encode(&mut codec, &place(), RpcId(11)).0.unwrap();
+    let call = frame(&mut codec, RawFrame::Binary(&canceled));
+    assert_eq!(call.events, decoded(&canceled));
+    let call = text(&mut codec, &fixture_text("reply-create.json"));
+    call.result.unwrap();
+    assert_eq!(call.events, [accepted(11, AckLevel::Provisional)]);
+    let open = new_event_as(3);
+    let call = frame(&mut codec, RawFrame::Binary(&open));
+    assert_eq!(call.events, decoded(&open));
+}
+
+#[test]
+fn an_order_event_of_a_status_not_modelled_is_refused_and_settles_no_placement() {
+    // UNTRIGGERED (2), a stop order's status (decision 0054): the frame is refused whole, and
+    // the placement stays provisional until an event of a modelled status settles it.
+    let untriggered = new_event_as(2);
+    let mut codec = placed();
+    let call = frame(&mut codec, RawFrame::Binary(&untriggered));
+    assert!(
+        matches!(
+            call.result,
+            Err(DecodeError::Malformed("order status not modelled"))
+        ),
+        "{:?}",
+        call.result
+    );
+    assert!(call.events.is_empty(), "{:?}", call.events);
+    let open = new_event_as(3);
+    let call = frame(&mut codec, RawFrame::Binary(&open));
+    let mut expected = vec![accepted(11, AckLevel::Final)];
+    expected.extend(decoded(&open));
+    assert_eq!(call.events, expected);
+}
