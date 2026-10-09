@@ -37,14 +37,15 @@
 //! 3. Still on the ladder after the configured maximum, a tombstone cancel names it by client
 //!    id, and again each maximum after; accepted for good it ends the order Canceled, refused
 //!    because the order already ended, Lost ([`Registry::tombstone_sent`]). Until every
-//!    tombstone sent, and every amend or cancel that went unanswered or stayed in flight past
-//!    the intent timeout (the one that put the order on the ladder among them), is answered
-//!    (not sent, refused other than as already ended, or accepted for good), the order stays
-//!    on the ladder whatever a query answer or resync shows of it: an earlier command,
-//!    unanswered, may still remove it after a later one is refused (FBC-e90m, FBC-tjey). Such
-//!    a cancel, no longer the command in flight, accepted for good ends the order Canceled
-//!    ([`OutcomeApplied::LadderCancelResolved`](crate::OutcomeApplied::LadderCancelResolved)).
-//!    A venue whose cancels cannot name a client id gets none ([`LadderPlan::no_tombstone`]).
+//!    tombstone sent, every amend or cancel whose outcome went unanswered (the one that put
+//!    the order on the ladder among them), and every one replaced in flight while the order is
+//!    on the ladder, is answered (not sent, refused other than as already ended, confirmed,
+//!    or, an amend, accepted for good or settled by a later total), the order stays on the
+//!    ladder whatever a query answer or resync shows of it: an earlier command, unanswered,
+//!    may still remove it after a later one is refused (FBC-e90m, FBC-tjey). A cancel's
+//!    acceptance is not the order ended (a fill may race it, 0080): its terminal event, a
+//!    trustworthy resync's absence or a tombstone ends it. A venue whose cancels cannot name
+//!    a client id gets none ([`LadderPlan::no_tombstone`]).
 //!
 //! Every number is the consumer's ([`LadderConfig`], decision 0009). The OMS reads no clock:
 //! the consumer runs [`Registry::ladder`] on its journaled timer with the timer's time.
@@ -509,10 +510,6 @@ fn escalate(rec: &mut OrderRecord, cfg: &LadderConfig, now: MonoNs) -> bool {
         rec.time_out_placement(now);
     } else {
         rec.enter_ladder(now, cause);
-    }
-    // The amend or cancel in flight that long may still land: its fate is the ladder's.
-    if let Some(rpc) = cause {
-        rec.await_answer(rpc);
     }
     true
 }

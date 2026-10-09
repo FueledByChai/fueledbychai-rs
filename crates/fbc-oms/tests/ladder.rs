@@ -1941,7 +1941,10 @@ fn an_open_order_whose_cancel_went_unanswered_stays_on_the_ladder_after_a_later_
                 "{case}"
             );
 
-            // Cancel 50's late final acceptance ends it Canceled.
+            // Cancel 50's late final acceptance is not the order ended (a fill may race it,
+            // 0080; Codex r4228419828 on PR #146): the order stays held, counted fully
+            // resting, a resync showing it Open still settling nothing, until its terminal
+            // event ends it Canceled.
             assert_eq!(
                 reg.on_outcome(
                     c,
@@ -1950,9 +1953,12 @@ fn an_open_order_whose_cancel_went_unanswered_stays_on_the_ladder_after_a_later_
                     &accepted(),
                     at(1_030)
                 ),
-                Ok(OutcomeApplied::LadderCancelResolved),
+                Ok(OutcomeApplied::Unchanged),
                 "{case}"
             );
+            assert!(!shown_open(&mut reg, c, false, "u1"), "{case}");
+            held_on_the_ladder(&mut reg, c, &case);
+            reg.apply_update(&update(Some(c), canceled(), 0), key(2));
             let rec = reg.get(c).unwrap();
             assert_eq!(
                 rec.state(),
@@ -2114,4 +2120,91 @@ fn an_amend_or_cancel_whose_fate_is_unknown_holds_the_order_whichever_way_it_got
         .unwrap();
         assert!(reg.get(c).unwrap().unknown_since().is_some(), "{case}");
     }
+}
+
+#[test]
+fn a_command_replaced_on_the_ladder_holds_the_order_until_answered_or_settled_by_a_later_total() {
+    // Codex r4228419870 on PR #146: an order already on the ladder for its placement, whose
+    // cancel 50 is still in flight (past the intent timeout or not) when a safety cancel
+    // replaces it and is refused: cancel 50 may still remove it.
+    for pass in [false, true] {
+        let case = format!("timed-out pass {pass}");
+        let mut reg = Registry::new();
+        let c = unknown(&mut reg);
+        reg.cancel_sent(c, RpcId(50), at(10)).unwrap();
+        if pass {
+            places_or_amends_nothing(&reg.ladder(&cfg(), &caps(), at(200)));
+        }
+        reg.cancel_sent(c, RpcId(4), at(300)).unwrap();
+        reg.on_outcome(
+            c,
+            OrderOp::Cancel(RpcId(4)),
+            &item(Some(c), None),
+            &refused(RejectKind::Other),
+            at(301),
+        )
+        .unwrap();
+        let shown = snap(Some(c), "r1", VenueOrderState::Open, 0);
+        let applied = reg.on_resync(
+            &cfg(),
+            &caps(),
+            wall(2_000),
+            std::slice::from_ref(&shown),
+            key(1),
+        );
+        assert!(applied.resolved.is_empty(), "{case}");
+        assert_eq!(
+            reg.live(c).unwrap_err(),
+            PermitRefusal::OnLadder(c),
+            "{case}"
+        );
+        // Refused, cancel 50 changed nothing: the next resync resolves it.
+        reg.on_outcome(
+            c,
+            OrderOp::Cancel(RpcId(50)),
+            &item(Some(c), None),
+            &refused(RejectKind::Other),
+            at(302),
+        )
+        .unwrap();
+        let applied = reg.on_resync(&cfg(), &caps(), wall(2_100), &[shown], key(2));
+        assert_eq!(applied.resolved, vec![(c, OrdState::Open)], "{case}");
+        assert!(reg.live(c).is_ok(), "{case}");
+    }
+
+    // Codex r4228419857 on PR #146: an amend whose fate went unknown, replaced by a cancel
+    // that is refused, is settled once the venue states the total under a later venue key with
+    // nothing in flight, as every amend replaced in flight is; an earlier key settles nothing.
+    let ordered = |venue| OrderKey {
+        venue: Some(venue),
+        ingest: venue,
+    };
+    let mut reg = Registry::new();
+    let c = open(&mut reg, "s1");
+    reg.apply_update(&update(Some(c), VenueOrderState::Open, 0), ordered(1));
+    reg.amend_sent(c, Ticks(101), lots(10), RpcId(50), at(10))
+        .unwrap();
+    reg.on_outcome(
+        c,
+        OrderOp::Amend(RpcId(50)),
+        &item(Some(c), None),
+        &SubmitOutcome::Unknown,
+        at(15),
+    )
+    .unwrap();
+    later_command_settled(&mut reg, c, Later::SafetyRefused);
+    let mut shown = snap(Some(c), "s1", VenueOrderState::Open, 0);
+    shown.px = Some(Ticks(101));
+    let stale = reg.on_resync(
+        &cfg(),
+        &caps(),
+        wall(3_000),
+        std::slice::from_ref(&shown),
+        ordered(1),
+    );
+    assert!(stale.resolved.is_empty());
+    assert_eq!(reg.live(c).unwrap_err(), PermitRefusal::OnLadder(c));
+    let applied = reg.on_resync(&cfg(), &caps(), wall(3_100), &[shown], ordered(2));
+    assert_eq!(applied.resolved, vec![(c, OrdState::Open)]);
+    assert!(reg.live(c).is_ok());
 }

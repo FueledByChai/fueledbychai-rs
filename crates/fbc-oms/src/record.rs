@@ -162,10 +162,14 @@ pub enum OutcomeApplied {
     /// The Unknown ladder's tombstone cancel was answered: accepted for good, the order ended
     /// Canceled; refused because the order had already ended, it ended Lost.
     TombstoneResolved,
-    /// A cancel whose fate held the order on the Unknown ladder (it went unanswered, or stayed
-    /// in flight past the intent timeout), no longer the command in flight, was accepted for
-    /// good: the order ended Canceled, as a tombstone's acceptance would end it (FBC-tjey).
-    LadderCancelResolved,
+}
+
+/// The kind of an amend or cancel whose fate the Unknown ladder waits on
+/// ([`OrderRecord::fate_unanswered`]).
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+enum Fate {
+    Amend,
+    Cancel,
 }
 
 /// Where an order on the Unknown ladder stands (design §4.9): entered, it is queried; a query
@@ -274,13 +278,13 @@ pub struct OrderRecord {
     /// The requests of the tombstone cancels sent while the order is on the ladder: any of
     /// them may answer.
     tombstones: Vec<RpcId>,
-    /// The amends and cancels whose fate the ladder waits on: every tombstone cancel sent, and
-    /// an amend or cancel that went unanswered or stayed in flight past the intent timeout
-    /// ([`Self::await_answer`]), each until it is not sent, refused (other than as already
-    /// ended), or accepted for good. While one is, it may still remove or change the order, so
-    /// the order stays on the ladder whatever the venue shows of it, even once a later
-    /// command's refusal cleared the command in flight (FBC-e90m, FBC-tjey).
-    unanswered: Vec<RpcId>,
+    /// The amends and cancels whose fate the ladder waits on ([`Self::fate_unanswered`]):
+    /// every tombstone cancel sent, every amend or cancel whose outcome went unanswered, and
+    /// every one replaced in flight while the order is on the ladder. While one is, it may
+    /// still remove or change the order, so the order stays on the ladder whatever the venue
+    /// shows of it, even once a later command's refusal cleared the command in flight
+    /// (FBC-e90m, FBC-tjey).
+    unanswered: Vec<(RpcId, Fate)>,
     /// When the ladder built the order's query: an acknowledged query clears its request's
     /// deadline, so the ladder keeps its own.
     queried_at: Option<MonoNs>,
@@ -751,6 +755,15 @@ impl OrderRecord {
             Intent::PendingAmend { qty, .. } => Some((qty, self.intent_wire)),
             _ => None,
         };
+        // Replaced in flight while the order is on the ladder, the command may still land:
+        // its fate is the ladder's to settle (FBC-tjey; Codex r4228419870 on PR #146).
+        if self.unknown_since.is_some() {
+            match self.intent {
+                Intent::PendingAmend { rpc, .. } => self.await_answer(rpc, Fate::Amend),
+                Intent::PendingCancel { rpc, .. } => self.await_answer(rpc, Fate::Cancel),
+                Intent::None => {}
+            }
+        }
         let mut totals = None;
         let mut any = false;
         for (qty, wire) in replaced.into_iter().chain(built.map(|b| (b.qty, b.wire))) {
@@ -956,8 +969,7 @@ impl OrderRecord {
     /// command in flight's, which leaves that command in flight; unanswered or not known to the venue, it is left
     /// to the Unknown ladder, its fate awaited ([`Self::fate_unanswered`]). The ladder's
     /// tombstone cancel, accepted for good, ends the order Canceled, and refused because the
-    /// order already ended, ends it Lost. A cancel whose fate was awaited, no longer the
-    /// command in flight, accepted for good, ends it Canceled too.
+    /// order already ended, ends it Lost.
     pub fn on_outcome(
         &mut self,
         op: OrderOp,
@@ -968,14 +980,12 @@ impl OrderRecord {
         if self.state.is_terminal() {
             return OutcomeApplied::Unchanged;
         }
-        let awaited = op.rpc().is_some_and(|rpc| self.unanswered.contains(&rpc));
-        if let Some(rpc) = op.rpc()
-            && awaited
-        {
+        if let Some(rpc) = op.rpc() {
             // Not sent or refused, the command changed nothing; an amend accepted for good
-            // changed the order but removed nothing: either way it is answered. Unanswered,
-            // accepted only provisionally, or a cancel refused as already ended (the order's
-            // terminal event or the ladder settles that), it may still remove the order.
+            // changed the order but removed nothing: either way its fate is answered.
+            // Unanswered, accepted only provisionally, a cancel accepted (not the order ended:
+            // a fill may race it, 0080) or refused as already ended, it is not: the order's
+            // terminal event, or the ladder, settles that.
             let answered = match outcome {
                 SubmitOutcome::NotSent(_) => true,
                 SubmitOutcome::Rejected(r) => !matches!(r.kind, RejectKind::AlreadyTerminal(_)),
@@ -985,33 +995,24 @@ impl OrderRecord {
                 _ => false,
             };
             if answered {
-                self.unanswered.retain(|t| *t != rpc);
+                self.unanswered.retain(|(t, _)| *t != rpc);
             }
         }
-        if let OrderOp::Cancel(rpc) = op {
-            let tombstone = self.tombstones.contains(&rpc);
-            // A cancel whose fate held the order on the ladder, no longer the command in
-            // flight, is answered by nothing else: accepted for good, it removed the order. In
-            // flight, its acceptance waits for the order's terminal event, as any cancel's.
-            let replaced = awaited && !self.answers_intent(op);
+        if let OrderOp::Cancel(rpc) = op
+            && self.tombstones.contains(&rpc)
+        {
             let ended = match outcome {
                 SubmitOutcome::Accepted {
                     ack: AckLevel::Final,
-                } if tombstone || replaced => Some(TerminalKind::Canceled(CancelReason::Requested)),
-                SubmitOutcome::Rejected(r)
-                    if tombstone && matches!(r.kind, RejectKind::AlreadyTerminal(_)) =>
-                {
+                } => Some(TerminalKind::Canceled(CancelReason::Requested)),
+                SubmitOutcome::Rejected(r) if matches!(r.kind, RejectKind::AlreadyTerminal(_)) => {
                     Some(TerminalKind::Lost)
                 }
                 _ => None,
             };
             if let Some(kind) = ended {
                 self.end(kind);
-                return if tombstone {
-                    OutcomeApplied::TombstoneResolved
-                } else {
-                    OutcomeApplied::LadderCancelResolved
-                };
+                return OutcomeApplied::TombstoneResolved;
             }
         }
         match (op, outcome) {
@@ -1062,8 +1063,10 @@ impl OrderRecord {
                 OutcomeApplied::IntentCleared
             }
             (_, SubmitOutcome::Unknown) => {
-                if let Some(rpc) = op.rpc() {
-                    self.await_answer(rpc);
+                match op {
+                    OrderOp::Amend(rpc) => self.await_answer(rpc, Fate::Amend),
+                    OrderOp::Cancel(rpc) => self.await_answer(rpc, Fate::Cancel),
+                    OrderOp::Place => {}
                 }
                 self.await_ladder(op, now)
             }
@@ -1152,7 +1155,7 @@ impl OrderRecord {
     /// ladder either way ([`Self::fate_unanswered`]).
     fn intent_settled(&mut self, rpc: Option<RpcId>) {
         if let Some(rpc) = rpc {
-            self.unanswered.retain(|t| *t != rpc);
+            self.unanswered.retain(|(t, _)| *t != rpc);
         }
         if self.state.rank() > 0
             && !self.state.is_terminal()
@@ -1165,7 +1168,9 @@ impl OrderRecord {
     }
 
     /// Retires the totals and wire quantities of the amends replaced in flight.
+    /// Their fates are settled with them: the venue's total is past them.
     fn settle(&mut self) {
+        self.unanswered.retain(|(_, fate)| *fate == Fate::Cancel);
         self.unsettled = None;
         self.unsettled_wires.clear();
         self.unsettled_bar = None;
@@ -1296,26 +1301,30 @@ impl OrderRecord {
         let sent = self.cancel_sent(rpc, now);
         if sent {
             self.tombstones.push(rpc);
-            self.await_answer(rpc);
+            self.await_answer(rpc, Fate::Cancel);
         }
         sent
     }
 
     /// Records that the fate of the amend or cancel sent under `rpc` is not known: it went
-    /// unanswered, stayed in flight past the intent timeout, or is a tombstone just sent. Until
-    /// it is answered (not sent, refused other than as already ended, or accepted for good),
-    /// the order stays on the ladder ([`Self::fate_unanswered`]).
-    pub(crate) fn await_answer(&mut self, rpc: RpcId) {
-        if !self.unanswered.contains(&rpc) {
-            self.unanswered.push(rpc);
+    /// unanswered, was replaced in flight while the order is on the ladder, or is a tombstone
+    /// just sent ([`Self::fate_unanswered`]).
+    fn await_answer(&mut self, rpc: RpcId, fate: Fate) {
+        if !self.unanswered.iter().any(|(t, _)| *t == rpc) {
+            self.unanswered.push((rpc, fate));
         }
     }
 
-    /// Whether an amend or cancel whose fate is unknown, a tombstone included, is not yet
-    /// answered ([`Self::await_answer`]). While one is, the order stays on the ladder (FBC-e90m,
-    /// FBC-tjey): a later command's refusal clears the command in flight, but this one may
-    /// still remove the order, so neither the venue showing it resting nor a command settling
-    /// takes it off, and a cancel's final acceptance then ends it Canceled.
+    /// Whether an amend or cancel whose fate is unknown is not yet answered: a tombstone sent,
+    /// one whose outcome went unanswered, or one replaced in flight while the order is on the
+    /// ladder. Each is answered when it is not sent, refused other than as already ended,
+    /// confirmed by an update, or, an amend, accepted for good or settled by a total the venue
+    /// states later ([`Self::settle`]); a tombstone also when it ends the order. While one is
+    /// not, the order stays on the ladder (FBC-e90m, FBC-tjey): a later command's refusal
+    /// clears the command in flight, but this one may still remove the order, so neither the
+    /// venue showing it resting nor a command settling takes it off. A cancel's acceptance is
+    /// not the order ended (a fill may race it, 0080): the order's terminal event, a trustworthy
+    /// resync's absence or a tombstone ends it.
     pub(crate) fn fate_unanswered(&self) -> bool {
         !self.unanswered.is_empty()
     }
