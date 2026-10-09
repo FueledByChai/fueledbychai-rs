@@ -356,8 +356,8 @@ impl Gate {
     }
 
     /// The orders of ours resting unprotected from an earlier epoch, while they may rest under
-    /// a venue id they were seen under that no event or query answer, of any epoch, has shown
-    /// ended.
+    /// a venue id they were seen under that no order event or query answer has shown ended, of
+    /// those the gate kept for their market (decision 0088).
     pub(crate) fn unprotected(&self) -> Vec<VenueOrderSnapshot> {
         self.unprotected.iter().map(Held::told).collect()
     }
