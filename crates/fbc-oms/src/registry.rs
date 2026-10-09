@@ -1008,9 +1008,10 @@ impl Registry {
 
     /// Ends not sent ([`NotSentReason::StaleAuthorization`]) each order whose place or batch
     /// command was dropped while it still held it, neither authorized nor withdrawn, freeing
-    /// what it counted (decision 0084). Every mutating call runs it first, so a dropped command's
-    /// orders count in no build, judgement, plan or event after its drop; a read of the
-    /// registry before its next mutating call still shows them held.
+    /// what it counted (decision 0084). Every mutating call, the consuming builders included,
+    /// runs it first, so a dropped command's orders count in no build, judgement, plan or event
+    /// after its drop; a read of the registry before its next mutating call still shows them
+    /// held.
     pub(crate) fn reap_dropped(&mut self) {
         for cid in self.dropped.take() {
             if let Some(rec) = self.orders.get_mut(&cid) {

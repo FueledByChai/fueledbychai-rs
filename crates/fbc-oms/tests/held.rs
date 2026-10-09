@@ -29,8 +29,8 @@ use std::time::Duration;
 use common::{cid, lots, order_caps, placement};
 use fbc_core::{
     AccountKey, AckLevel, Bps, Channel, CidMint, ClientOrderId, InstrumentId, ItemRef, Lots,
-    MonoNs, Namespace, NamespaceLease, NewOrder, NotSentReason, Side, SignedLots, SubmitOutcome,
-    Ticks, Tif, VenueCommand, WallNs,
+    MonoNs, Namespace, NamespaceLease, NewOrder, NonceScope, NotSentReason, Side, SignedLots,
+    SubmitOutcome, Ticks, Tif, VenueCommand, WallNs,
 };
 use fbc_oms::{
     CancelChoice, CapRefusal, DesiredBook, DesiredQuote, ExecutionPlanner, IssueRefusal,
@@ -176,6 +176,25 @@ fn withdrawing_one_place_releases_another_dropped_before() {
     drop(dropped);
     assert!(reg.place_not_submitted(withdrawn, NotSentReason::Backpressure));
     assert_eq!(reg.get(a).unwrap().state(), released());
+    assert_eq!(reg.resting_on(INST, Side::Buy), Some(Lots::ZERO));
+}
+
+#[test]
+fn a_registry_passed_through_a_builder_releases_a_place_dropped_before() {
+    // Codex P2 r4226054244 on PR #137: the consuming builders are mutating calls too.
+    let mut reg = registry();
+    let order = buy(RESTING);
+    let c = order.cid;
+    drop(reg.place(order).unwrap());
+    let reg = reg.for_testnet_run(TestnetRun::owner_assisted());
+    assert_eq!(reg.get(c).unwrap().state(), released());
+    assert_eq!(reg.resting_on(INST, Side::Buy), Some(Lots::ZERO));
+    let mut reg = reg;
+    let order = buy(RESTING);
+    let c = order.cid;
+    drop(reg.place(order).unwrap());
+    let reg = reg.with_lease_keys(arm::lease_keys(NonceScope::PerAccountMonotonic));
+    assert_eq!(reg.get(c).unwrap().state(), released());
     assert_eq!(reg.resting_on(INST, Side::Buy), Some(Lots::ZERO));
 }
 

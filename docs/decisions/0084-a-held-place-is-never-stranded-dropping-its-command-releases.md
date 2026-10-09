@@ -25,11 +25,11 @@ Reviewer B on PR #133 (FBC-0d9k), filed as FBC-657c, found two gaps:
    orders. Dropped while it still holds them, neither authorized nor withdrawn, wherever it was
    dropped and on whatever thread, it hands them back to the registry that built it. The
    registry ends each one still held `NotSent(StaleAuthorization)` at the start of its next
-   mutating call (every build, event, outcome, authorization, ladder tick, resync, arming call
-   and planner pass), freeing what it counted. A read of the registry before that call
-   (`get`, `resting_on`) still shows the order held. This amends 0082's point 1: a command
-   refused for another registry no longer keeps its reservation held there; it is released
-   when the command is dropped.
+   mutating call (every build, event, outcome, authorization, ladder tick, resync, arming call,
+   planner pass, and the builders `with_lease_keys` and `for_testnet_run`), freeing what it
+   counted. A read of the registry before that call (`get`, `resting_on`) still shows the order
+   held. This amends 0082's point 1: a command refused for another registry no longer keeps its
+   reservation held there; it is released when the command is dropped.
 2. **No outcome of a held place applies.** `Registry::on_outcome` refuses every placement
    outcome for a held place with `OmsError::NotIssued`. Only an authorization reaches a gateway
    (0045), so nothing of it was sent. A not-sent or refused outcome changes nothing, as in
