@@ -65,7 +65,10 @@ pub fn decoder_deterministic(subject: &Subject<'_>) -> Result<Verdict, Failure> 
                 breaches.push(Breach::new(&file, what));
                 continue;
             }
-            let (first, second) = (frames::decode(&h, &case)?, frames::decode(&h, &case)?);
+            let (first, second) = (
+                frames::decode(&h, &file, &case)?,
+                frames::decode(&h, &file, &case)?,
+            );
             // Every line that differs, not the first alone (Codex r4216777885).
             let before = breaches.len();
             for (a, b) in first.iter().zip(&second).filter(|(a, b)| a != b) {

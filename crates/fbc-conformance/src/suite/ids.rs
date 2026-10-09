@@ -24,8 +24,9 @@
 //! numbers 1 to 8 in the suite's namespace, 1). The case
 //! `<fixtures>/restart_cid/resting.frames` ([`frames`](super::frames)) is what the venue shows
 //! a restarted process of them: a resync's answer with our orders resting, the newest id among
-//! them, and any other frames the venue sends at startup. It is decoded by a codec built fresh
-//! from the factory.
+//! them, and any other frames the venue sends at startup. A venue that answers a resync over
+//! REST has its answer handed to the codec by the case's `http` lines after its `resync` line
+//! (FBC-2905). It is decoded by a codec built fresh from the factory.
 //!
 //! The restarted mint is seeded as [`CidMint::new`] is, in the worst case: its high-water mark
 //! was lost and its clock stands at the epoch, so only the highest sequence number of ours the
@@ -34,8 +35,8 @@
 //! codec that loses a client id from a resync, or reads it as another's, lets the mint issue it
 //! again, and an id the venue might still match is sent twice.
 //!
-//! The case must decode with no frame refused and show at least one order of ours resting in
-//! a resync's answer, or it proves nothing.
+//! The case must decode with no frame or response refused and show at least one order of ours
+//! resting in a resync's answer, or it proves nothing.
 //!
 //! Both are skipped for a venue whose caps declare no order entry: it sends no client id.
 
@@ -148,7 +149,7 @@ pub fn restart_cid(subject: &Subject<'_>) -> Result<Verdict, Failure> {
     let mut breaches = Vec::new();
     // Every id of ours the frames show, and those resting in a resync's answer.
     let (mut shown, mut live) = (BTreeSet::new(), BTreeSet::new());
-    for step in frames::decode(&h, &case)? {
+    for step in frames::decode(&h, &file, &case)? {
         if let Err(e) = step.result {
             let what = format!("line {} refused: {e}", step.line);
             breaches.push(Breach::new(&file, what));
