@@ -760,7 +760,8 @@ fn nothing_for_an_unknown_order_is_ever_placed_or_amended_again() {
     }
 
     // A cancel's outcome Unknown for an order the record holds no cancel in flight for: the
-    // order is off the permits until the ladder resolves it.
+    // order is off the permits until the ladder resolves it, and the venue showing it Open
+    // does not while that cancel may still remove it (FBC-tjey); once refused, it does.
     let c = open(&mut reg, "n1");
     reg.on_outcome(
         c,
@@ -776,11 +777,23 @@ fn nothing_for_an_unknown_order_is_ever_placed_or_amended_again() {
     places_or_amends_nothing(&plan);
     reg.query_sent(c, RpcId(4)).unwrap();
     let shown = snap(Some(c), "n1", VenueOrderState::Open, 0);
-    let answer = QueryAnswer::new(RpcId(4), OrderRef::Both(c, vid("n1")), Some(shown)).unwrap();
+    let answer =
+        QueryAnswer::new(RpcId(4), OrderRef::Both(c, vid("n1")), Some(shown.clone())).unwrap();
     assert_eq!(
         reg.on_query_answer(&caps(), &answer, key(6)),
-        LadderResolution::Resolved(OrdState::Open)
+        LadderResolution::Inconclusive
     );
+    assert_eq!(reg.live(c).unwrap_err(), PermitRefusal::OnLadder(c));
+    reg.on_outcome(
+        c,
+        OrderOp::Cancel(RpcId(3)),
+        &item(None, None),
+        &refused(RejectKind::Other),
+        at(17),
+    )
+    .unwrap();
+    let applied = reg.on_resync(&cfg(), &caps(), wall(2_000), &[shown], key(7));
+    assert_eq!(applied.resolved, vec![(c, OrdState::Open)]);
     assert!(reg.live(c).is_ok());
 }
 
@@ -1824,4 +1837,281 @@ fn a_snapshot_under_another_venue_id_while_an_amend_may_have_moved_the_order_sti
     assert_eq!(rec.vid(), Some(&vid("m1")));
     assert!(matches!(rec.intent(), Intent::PendingAmend { .. }));
     assert_eq!(rec.unknown_since(), Some(at(15)));
+}
+
+// ---- FBC-tjey: the amend or cancel whose fate is unknown must be answered too ----
+
+/// What a later command does to an order on the ladder without ending it: a safety cancel 4
+/// sent at 30 ms and not sent or refused, or a tombstone 9 sent at 1015 ms and refused.
+#[derive(Debug, Clone, Copy)]
+enum Later {
+    SafetyNotSent,
+    SafetyRefused,
+    TombstoneRefused,
+}
+
+const LATER: [Later; 3] = [
+    Later::SafetyNotSent,
+    Later::SafetyRefused,
+    Later::TombstoneRefused,
+];
+
+/// `c`, on the ladder since 15 ms and queried at its first pass under request 1, takes the
+/// `later` command, which clears the command in flight without answering the first one.
+fn later_command_settled(reg: &mut Registry, c: ClientOrderId, later: Later) {
+    let cfg = slow_query_cfg();
+    assert_eq!(reg.ladder(&cfg, &caps(), at(20)).queries.len(), 1);
+    reg.query_sent(c, RpcId(1)).unwrap();
+    let (rpc, outcome, now) = match later {
+        Later::SafetyNotSent | Later::SafetyRefused => {
+            reg.cancel_sent(c, RpcId(4), at(30)).unwrap();
+            let outcome = match later {
+                Later::SafetyNotSent => {
+                    SubmitOutcome::NotSent(fbc_core::NotSentReason::Disconnected)
+                }
+                _ => refused(RejectKind::Other),
+            };
+            (RpcId(4), outcome, at(31))
+        }
+        Later::TombstoneRefused => {
+            assert_eq!(reg.ladder(&cfg, &caps(), at(1_015)).tombstones.len(), 1);
+            reg.tombstone_sent(c, RpcId(9), at(1_015)).unwrap();
+            (RpcId(9), refused(RejectKind::Other), at(1_016))
+        }
+    };
+    reg.on_outcome(c, OrderOp::Cancel(rpc), &item(Some(c), None), &outcome, now)
+        .unwrap();
+    let rec = reg.get(c).unwrap();
+    assert_eq!(rec.intent(), Intent::None, "{later:?}");
+    assert_eq!(rec.unknown_since(), Some(at(15)), "{later:?}");
+}
+
+/// The venue shows `c` Open, by the answer to query 1 or by a resync: whether it resolved it.
+fn shown_open(reg: &mut Registry, c: ClientOrderId, by_query: bool, v: &str) -> bool {
+    let shown = snap(Some(c), v, VenueOrderState::Open, 0);
+    if by_query {
+        let answer = QueryAnswer::new(RpcId(1), OrderRef::Client(c), Some(shown)).unwrap();
+        match reg.on_query_answer(&caps(), &answer, key(1)) {
+            LadderResolution::Resolved(state) => {
+                assert_eq!(state, OrdState::Open);
+                true
+            }
+            other => {
+                assert_eq!(other, LadderResolution::Inconclusive);
+                false
+            }
+        }
+    } else {
+        let applied = reg.on_resync(&slow_query_cfg(), &caps(), wall(3_000), &[shown], key(1));
+        assert!(applied.lost.is_empty());
+        !applied.resolved.is_empty()
+    }
+}
+
+/// `c` stays on the ladder, Open and counted fully resting, with no Live permit.
+fn held_on_the_ladder(reg: &mut Registry, c: ClientOrderId, case: &str) {
+    let rec = reg.get(c).unwrap();
+    assert_eq!(rec.state(), OrdState::Open, "{case}");
+    assert_eq!(rec.unknown_since(), Some(at(15)), "{case}");
+    assert_eq!(rec.ladder_step(), Some(LadderStep::Resync), "{case}");
+    assert_eq!(rec.resting(), lots(10), "{case}");
+    assert_eq!(
+        reg.live(c).unwrap_err(),
+        PermitRefusal::OnLadder(c),
+        "{case}"
+    );
+}
+
+#[test]
+fn an_open_order_whose_cancel_went_unanswered_stays_on_the_ladder_after_a_later_command_is_refused()
+{
+    for later in LATER {
+        for by_query in [true, false] {
+            let case = format!("{later:?}, query {by_query}");
+            let mut reg = Registry::new();
+            // Cancel 50, sent at 10 ms, went unanswered at 15 ms.
+            let c = cancel_unanswered(&mut reg, "u1");
+            later_command_settled(&mut reg, c, later);
+
+            // The venue shows it Open: cancel 50 may yet remove it.
+            assert!(!shown_open(&mut reg, c, by_query, "u1"), "{case}");
+            held_on_the_ladder(&mut reg, c, &case);
+            assert!(
+                reg.ladder(&slow_query_cfg(), &caps(), at(1_020)).resync,
+                "{case}"
+            );
+
+            // Cancel 50's late final acceptance ends it Canceled.
+            assert_eq!(
+                reg.on_outcome(
+                    c,
+                    OrderOp::Cancel(RpcId(50)),
+                    &item(Some(c), None),
+                    &accepted(),
+                    at(1_030)
+                ),
+                Ok(OutcomeApplied::LadderCancelResolved),
+                "{case}"
+            );
+            let rec = reg.get(c).unwrap();
+            assert_eq!(
+                rec.state(),
+                OrdState::Terminal(TerminalKind::Canceled(CancelReason::Requested)),
+                "{case}"
+            );
+            assert_eq!(rec.unknown_since(), None, "{case}");
+            assert_eq!(rec.resting(), lots(0), "{case}");
+            assert_eq!(reg.lost(), 0, "{case}");
+        }
+    }
+}
+
+#[test]
+fn an_order_whose_unanswered_amend_or_cancel_is_answered_leaves_the_ladder_as_the_venue_shows_it() {
+    // Refused (NotFound included) or not sent, the first command changed nothing: the order
+    // leaves the ladder as the venue shows it, with a Live permit.
+    for answer in [
+        refused(RejectKind::Other),
+        refused(RejectKind::NotFound),
+        SubmitOutcome::NotSent(fbc_core::NotSentReason::Backpressure),
+    ] {
+        for later in LATER {
+            let case = format!("{answer:?}, {later:?}");
+            let mut reg = Registry::new();
+            let c = cancel_unanswered(&mut reg, "a1");
+            later_command_settled(&mut reg, c, later);
+            reg.on_outcome(
+                c,
+                OrderOp::Cancel(RpcId(50)),
+                &item(Some(c), None),
+                &answer,
+                at(1_020),
+            )
+            .unwrap();
+            assert!(shown_open(&mut reg, c, false, "a1"), "{case}");
+            assert_eq!(reg.get(c).unwrap().unknown_since(), None, "{case}");
+            assert!(reg.live(c).is_ok(), "{case}");
+        }
+    }
+
+    // An amend whose fate went unknown holds the order the same way until it is answered:
+    // accepted for good, it changed the order but removed nothing.
+    for answer in [refused(RejectKind::Other), accepted()] {
+        let case = format!("amend {answer:?}");
+        let mut reg = Registry::new();
+        let c = open(&mut reg, "a2");
+        reg.amend_sent(c, Ticks(101), lots(10), RpcId(50), at(10))
+            .unwrap();
+        reg.on_outcome(
+            c,
+            OrderOp::Amend(RpcId(50)),
+            &item(Some(c), None),
+            &SubmitOutcome::Unknown,
+            at(15),
+        )
+        .unwrap();
+        later_command_settled(&mut reg, c, Later::SafetyRefused);
+        assert!(!shown_open(&mut reg, c, true, "a2"), "{case}");
+        held_on_the_ladder(&mut reg, c, &case);
+        reg.on_outcome(
+            c,
+            OrderOp::Amend(RpcId(50)),
+            &item(Some(c), None),
+            &answer,
+            at(40),
+        )
+        .unwrap();
+        assert!(shown_open(&mut reg, c, false, "a2"), "{case}");
+        assert!(reg.live(c).is_ok(), "{case}");
+    }
+}
+
+#[test]
+fn an_amend_or_cancel_whose_fate_is_unknown_holds_the_order_whichever_way_it_got_there() {
+    // A cancel past the intent timeout, never answered; a cancel on an order already on the
+    // ladder for its placement, unanswered; a first cancel answered only provisionally,
+    // unanswered again, or refused as already ended (its terminal event or a tombstone
+    // settles that): each may still remove the order, or have.
+    for how in 0..5 {
+        let mut reg = Registry::new();
+        let c = match how {
+            0 => {
+                let c = open(&mut reg, "w1");
+                reg.cancel_sent(c, RpcId(50), at(10)).unwrap();
+                // Past the 100 ms intent timeout: escalated, its query built.
+                assert_eq!(reg.ladder(&cfg(), &caps(), at(110)).escalated, vec![c]);
+                c
+            }
+            1 => {
+                let c = unknown(&mut reg);
+                reg.cancel_sent(c, RpcId(50), at(10)).unwrap();
+                reg.on_outcome(
+                    c,
+                    OrderOp::Cancel(RpcId(50)),
+                    &item(Some(c), None),
+                    &SubmitOutcome::Unknown,
+                    at(12),
+                )
+                .unwrap();
+                c
+            }
+            _ => {
+                let c = cancel_unanswered(&mut reg, "w1");
+                let again = match how {
+                    2 => SubmitOutcome::Accepted {
+                        ack: AckLevel::Provisional,
+                    },
+                    3 => SubmitOutcome::Unknown,
+                    _ => refused(RejectKind::AlreadyTerminal(TerminalHint::Unspecified)),
+                };
+                reg.on_outcome(
+                    c,
+                    OrderOp::Cancel(RpcId(50)),
+                    &item(Some(c), None),
+                    &again,
+                    at(16),
+                )
+                .unwrap();
+                c
+            }
+        };
+        let case = format!("case {how}");
+        let since = reg.get(c).unwrap().unknown_since().unwrap();
+        let cfg = slow_query_cfg();
+        if how == 0 {
+            // The pass that escalated it built its query.
+            reg.query_sent(c, RpcId(1)).unwrap();
+        } else {
+            assert_eq!(reg.ladder(&cfg, &caps(), at(20)).queries.len(), 1);
+            reg.query_sent(c, RpcId(1)).unwrap();
+        }
+        reg.cancel_sent(c, RpcId(4), at(30)).unwrap();
+        reg.on_outcome(
+            c,
+            OrderOp::Cancel(RpcId(4)),
+            &item(Some(c), None),
+            &refused(RejectKind::Other),
+            at(31),
+        )
+        .unwrap();
+        assert!(!shown_open(&mut reg, c, how % 2 == 0, "w1"), "{case}");
+        let rec = reg.get(c).unwrap();
+        assert_eq!(rec.state(), OrdState::Open, "{case}");
+        assert_eq!(rec.unknown_since(), Some(since), "{case}");
+        assert_eq!(
+            reg.live(c).unwrap_err(),
+            PermitRefusal::OnLadder(c),
+            "{case}"
+        );
+        // A late placement acknowledgement settles nothing more.
+        reg.on_outcome(
+            c,
+            OrderOp::Place,
+            &item(None, Some(vid("w1"))),
+            &accepted(),
+            at(32),
+        )
+        .unwrap();
+        assert!(reg.get(c).unwrap().unknown_since().is_some(), "{case}");
+    }
 }
