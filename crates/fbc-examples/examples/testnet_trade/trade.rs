@@ -11,22 +11,26 @@
 //! the touch. Only the side the order rests behind is needed: a buy on a book with no asks (a
 //! testnet market nobody sells on) rests behind the bid all the same. The touch is read again
 //! once the market is Started, just before the place: the order goes out only if it is still
-//! at least `--away-bps` behind it, and the inventory cap at the fresh ask (the order's price
-//! when no ask rests) is still no fewer lots than the caps hold.
+//! at least `--away-bps` behind it, and the inventory cap at the fresh touch is still no fewer
+//! lots than the caps hold.
 //!
 //! **Its size.** `--order-usd` (required, no default, at most the resting cap) at the order's
 //! price, floored onto the size step. Refused when that is no lot, or its notional is below the
 //! market's `--min-notional` (the encoder does not check a minimum, FBC-98fc). The resting cap
 //! per side (`--resting-cap-usd`) is converted to lots at the same price, and the inventory cap
-//! (`--inventory-cap-usd`), both required, at the higher of that price and the ask (the
-//! order's price when no ask rests), so a position is never worth more than the cap at the
-//! market. The registry sums resting lots on a side, so
-//! an order of ours an earlier run left resting on the order's side (restored by the resync,
-//! perhaps at a price nearer the touch) would count at the new order's price, not its own:
-//! while one rests there, nothing is placed (Stop cancels it). Any order of ours an earlier
-//! run left resting on the market holds it anyway: this connection's cancel-on-disconnect may
-//! not cover it, so the session takes no place there until it ends (decision 0080), and the run
-//! places nothing, says why, and leaves it to Stop's cancel; a run after that places.
+//! (`--inventory-cap-usd`), both required, at the highest of that price, the bid and the ask
+//! (those that rest), so a position is never worth more than the cap at the market.
+//!
+//! **Orders of ours from an earlier connection or run** (decision 0080). This connection's
+//! cancel-on-disconnect may not cover an order of ours its resync shows resting, so the session
+//! tells it unprotected and takes no place on its market until it ends, and the link cancels it
+//! at once, a Safety cancel fbc-oms builds and authorizes ([`Link`]). An earlier run's: the run
+//! places nothing beside it, waits for it to end (Stop cancels it when it does not, within the
+//! step timeout), and says why; a run after that places. The run's own, after a reconnect: its
+//! Safety cancel ends the hold and is the round trip's cancel. The registry sums resting lots
+//! on a side, so one still resting on the order's side at the place (perhaps at a price nearer
+//! the touch) would count at the new order's price, not its own: nothing is placed then
+//! either.
 //!
 //! **Its client ids** are minted, decoded as ours, leased and kept under the namespace the
 //! consumer allocates (`--namespace`, required): an order on the market under another
@@ -306,6 +310,8 @@ pub async fn run(
     let session_cfg = session_config(factory, cfg, creds, specs, opts)?;
     let (mut session, control) =
         ExecSession::new(session_cfg, handler).map_err(|e| format!("session: {e}"))?;
+    // Where the link's Safety cancels of unprotected orders go (decision 0080).
+    link.borrow_mut().attach(session.orders(), ACCT);
     let driver = Driver {
         link: Rc::clone(&link),
         wake,
@@ -567,11 +573,18 @@ fn away_from(opts: &Options, book: &OrderbookSnapshot) -> Result<Touch, String> 
     })
 }
 
+/// The price the inventory cap is converted at: the highest of the order's price `px` and the
+/// touch's sides that rest, so a position is never worth more than the cap at the market. A
+/// buy's own price is below the bid, so on a book with no asks the bid is the market's price
+/// (Codex r4226246459 on PR #114).
+pub fn inventory_price(px: Decimal, bid: Option<Decimal>, ask: Option<Decimal>) -> Decimal {
+    [bid, ask].into_iter().flatten().fold(px, Decimal::max)
+}
+
 /// The order `--away-bps` behind the touch on the tick and `--order-usd`'s size on the size
-/// step, with the caps in lots (the resting cap at its price, the inventory cap at the higher of
-/// its price and the ask, or at its price when no ask rests), or why it cannot be placed: no
-/// touch to stay away from ([`away_from`]), no lot in the size, or a notional below the
-/// market's minimum.
+/// step, with the caps in lots (the resting cap at its price, the inventory cap at
+/// [`inventory_price`]), or why it cannot be placed: no touch to stay away from
+/// ([`away_from`]), no lot in the size, or a notional below the market's minimum.
 pub fn price(opts: &Options, book: &OrderbookSnapshot) -> Result<Priced, String> {
     let Touch { bid, ask, away } = away_from(opts, book)?;
     let ticks = away;
@@ -583,11 +596,11 @@ pub fn price(opts: &Options, book: &OrderbookSnapshot) -> Result<Priced, String>
     };
     let order_usd = opts.order_usd;
     let qty = lots_for(order_usd, px)?;
-    // The resting cap at the order's price, where it rests; the inventory cap at the higher of
-    // that and the ask (the order's price when no ask rests: a sell is above any bid), so a
-    // position is never worth more than the cap at the market.
+    // The resting cap at the order's price, where it rests; the inventory cap at the highest
+    // of that, the bid and the ask, so a position is never worth more than the cap at the
+    // market.
     let resting = lots_for(opts.resting_cap_usd, px)?;
-    let inventory = lots_for(opts.inventory_cap_usd, ask.map_or(px, |ask| px.max(ask)))?;
+    let inventory = lots_for(opts.inventory_cap_usd, inventory_price(px, bid, ask))?;
     let size = Decimal::from(qty.get()) * opts.step;
     let notional = size * px;
     if qty.get() == 0 {
@@ -630,8 +643,8 @@ struct Recheck {
 
 impl Recheck {
     /// Reads the touch again and checks the order at `px` is still at least `--away-bps` behind
-    /// it, and the inventory cap at the higher of `px` and the fresh ask is no fewer lots than
-    /// the caps hold: the touch it reports, or why the order must not go out.
+    /// it, and the inventory cap at [`inventory_price`] of `px` and the fresh touch is no fewer
+    /// lots than the caps hold: the touch it reports, or why the order must not go out.
     async fn still_away(&self, px: Ticks) -> Result<(Touch, u64), String> {
         let book = touch(&self.opts, &self.specs).await?;
         if book.seq_no < self.first_seq {
@@ -657,16 +670,17 @@ impl Recheck {
             ));
         }
         // The inventory cap in lots at the fresh market: never fewer than the registry holds,
-        // or its check would admit a position worth more than the cap now. At the order's
-        // price when no ask rests.
+        // or its check would admit a position worth more than the cap now.
         let price = Decimal::from(px.0) * self.opts.tick;
-        let at = now.ask.map_or(price, |ask| price.max(ask));
+        let at = inventory_price(price, now.bid, now.ask);
         let usd = self.opts.inventory_cap_usd;
         let lots = (usd / (at * self.opts.step)).floor().to_i64().unwrap_or(0);
         if lots < self.inventory.get() {
             return Err(format!(
-                "the inventory cap of ${usd} is now {lots} lots at the ask of {}, fewer than the \
-                 {} lots the caps hold from the first read",
+                "the inventory cap of ${usd} is now {lots} lots at {at}, the highest of the \
+                 order's price and the touch (bid {}, ask {}), fewer than the {} lots the caps \
+                 hold from the first read",
+                px_or_none(now.bid),
                 px_or_none(now.ask),
                 self.inventory.get()
             ));
@@ -957,10 +971,11 @@ pub fn restored_baseline(snapshot: &ResyncSnapshot) -> Vec<(ClientOrderId, Lots)
 ///   and the resting cap is in lots at the new order's price, so one resting nearer the touch
 ///   would count at less than its own price and the dollars resting could exceed
 ///   --resting-cap-usd. Stop cancels them.
-/// - `held` not 0: that many orders of ours that the resync showed resting (an earlier run's)
+/// - `held` not 0: that many orders of ours a resync showed resting from an earlier connection
 ///   rest still on the market, where this connection's cancel-on-disconnect may not cover them,
 ///   so the session takes no place on the market until they end (decision 0080: it would
-///   refuse the place as `NotSent(Disconnected)`). Stop cancels them; a run after that places.
+///   refuse the place as `NotSent(Disconnected)`). Their Safety cancels went out as the
+///   connection opened; Stop cancels what is left.
 pub fn place_refusal(
     gate_open: bool,
     held: usize,
@@ -991,9 +1006,10 @@ pub fn place_refusal(
     }
     if held > 0 {
         return Some(format!(
-            "{held} orders of ours an earlier run left rest on the market, where this \
+            "{held} orders of ours rest on the market from an earlier connection, where this \
              connection's cancel-on-disconnect may not cover them, so the session takes no place \
-             on it until they end (decision 0080); Stop cancels them, then run again"
+             on it until they end (decision 0080); their Safety cancels went out as it opened, \
+             and Stop cancels what is left"
         ));
     }
     None
@@ -1123,8 +1139,17 @@ struct Driver {
 
 impl Driver {
     /// Waits until `found` finds what it looks for in the link, or the step timeout passes.
-    async fn wait<T>(&self, mut found: impl FnMut(&mut Link) -> Option<T>) -> Option<T> {
-        let deadline = tokio::time::Instant::now() + self.timeout;
+    async fn wait<T>(&self, found: impl FnMut(&mut Link) -> Option<T>) -> Option<T> {
+        self.wait_for(self.timeout, found).await
+    }
+
+    /// Waits until `found` finds what it looks for in the link, or `within` passes.
+    async fn wait_for<T>(
+        &self,
+        within: Duration,
+        mut found: impl FnMut(&mut Link) -> Option<T>,
+    ) -> Option<T> {
+        let deadline = tokio::time::Instant::now() + within;
         loop {
             // Created before the check, so a wake between the check and the await is kept.
             let woken = self.wake.notified();
@@ -1171,6 +1196,17 @@ impl Driver {
                     "the order socket's connection {key:?} ended: {why}; the session reconnects, \
                      logs in and arms again"
                 )),
+                Note::Unprotected { told, rpcs, left } => {
+                    let requests: Vec<String> = rpcs.iter().map(|r| r.0.to_string()).collect();
+                    self.note(format_args!(
+                        "{} orders of ours rest from an earlier connection or run, which this \
+                         connection's cancel-on-disconnect may not cover (decision 0080): Safety \
+                         cancel requests [{}] sent for them at once{}",
+                        told.len(),
+                        requests.join(", "),
+                        left.iter().map(|l| format!("; {l}")).collect::<String>()
+                    ));
+                }
                 _ => {}
             }
         }
@@ -1458,6 +1494,30 @@ impl Driver {
             }
         }
 
+        // Orders of ours an earlier run left on the market: the session told them unprotected
+        // when the epoch opened and the link sent their Safety cancels then (decision 0080).
+        // The run places nothing beside them; it waits, for at most the step timeout, until
+        // the session shows them ended, so Stop finds them so.
+        let told = self.link.borrow().told_on(INST);
+        if told > 0 {
+            let orders = self.orders.clone();
+            let ended = self
+                .wait(|_| orders.may_place_on(INST).then_some(()))
+                .await
+                .is_some();
+            self.note(format_args!(
+                "{told} orders of ours an earlier run left rest on the market, where this \
+                 connection's cancel-on-disconnect may not cover them: Safety-cancelled as it \
+                 opened (decision 0080), {}; nothing placed, run again",
+                if ended {
+                    "and shown ended"
+                } else {
+                    "not shown ended within the step timeout, so Stop cancels them"
+                }
+            ));
+            return false;
+        }
+
         // The client id, and its mark kept, first: the write is the one wait left before the
         // place, so the touch's second read and the account audit come after it, and nothing
         // waits between the audit and the place.
@@ -1600,33 +1660,41 @@ impl Driver {
             }
         }
 
+        // The hold, ended early by a reconnect whose resync showed the order resting: the
+        // session told it unprotected and the link Safety-cancelled it (decision 0080), and that
+        // cancel is the round trip's.
         if !self.hold.is_zero() {
-            tokio::time::sleep(self.hold).await;
+            self.wait_for(self.hold, |l| l.safety_cancel_of(cid)).await;
         }
 
         let cancelled = {
             let mut link = self.link.borrow_mut();
+            let safety = link.safety_cancel_of(cid);
             let caps = link.caps().clone();
-            let choice = link
-                .reg()
-                .cancellable(cid)
-                .map(|permit| permit.cancel(&caps));
-            match choice {
-                Ok(CancelChoice::Send(cmd)) => {
-                    let auth = link
-                        .reg()
-                        .authorize(ACCT, cmd)
-                        .map_err(|e| format!("{e:?}"));
-                    auth.and_then(|auth| link.submit(&self.orders, auth))
-                }
-                Ok(CancelChoice::AwaitAck) => {
-                    Err("the cancel waits for an acknowledgement".to_owned())
-                }
-                Err(refusal) => Err(format!("{refusal:?}")),
+            match safety {
+                Some(rpc) => Ok((rpc, true)),
+                None => match link
+                    .reg()
+                    .cancellable(cid)
+                    .map(|permit| permit.cancel(&caps))
+                {
+                    Ok(CancelChoice::Send(cmd)) => {
+                        let auth = link
+                            .reg()
+                            .authorize(ACCT, cmd)
+                            .map_err(|e| format!("{e:?}"));
+                        auth.and_then(|auth| link.submit(&self.orders, auth))
+                            .map(|rpc| (rpc, false))
+                    }
+                    Ok(CancelChoice::AwaitAck) => {
+                        Err("the cancel waits for an acknowledgement".to_owned())
+                    }
+                    Err(refusal) => Err(format!("{refusal:?}")),
+                },
             }
         };
-        let cancel = match cancelled {
-            Ok(rpc) => rpc,
+        let (cancel, safety) = match cancelled {
+            Ok(sent) => sent,
             Err(e) => {
                 // The order ended meanwhile (a post-only order the venue would not rest), or
                 // cannot be cancelled now: Stop's cancel everything sees what is left.
@@ -1636,7 +1704,16 @@ impl Driver {
         };
         self.lines.step(
             "cancel",
-            format_args!("request {}: the cancel handed to the session", cancel.0),
+            format_args!(
+                "request {}: {}",
+                cancel.0,
+                if safety {
+                    "the Safety cancel sent when a reconnect's resync showed the order resting \
+                     (decision 0080)"
+                } else {
+                    "the cancel handed to the session"
+                }
+            ),
         );
 
         match self.wait(|l| Driver::outcome_of(l, cancel)).await {
