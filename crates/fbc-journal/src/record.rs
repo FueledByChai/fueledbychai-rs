@@ -408,6 +408,13 @@ pub enum Record {
     /// for it: its ingest sequence, the `now` and `wall` the codec's `on_timer` was called
     /// with, and the connection epoch whose codec set the timer.
     Timer { stamp: Stamp, tag: TimerTag },
+    /// A request's deadline fell due unanswered and an order-entry session handed it to its
+    /// codec's `on_rpc_timeout`, which reports it `Unknown` (FBC-0hfl, decision 0090). `stamp`
+    /// is the one the runtime gave the events the codec pushed for it: its ingest sequence,
+    /// when the deadline was taken (both clocks), and the epoch it was stamped under, the
+    /// connected one or, while the session waits to reconnect, the one it waits to open. A
+    /// deadline is not a codec timer: its tag space is the codec's, this one the runtime's.
+    RpcTimeout { stamp: Stamp, rpc: RpcId },
     /// A connection change or a subscription call.
     Control { at: MonoNs, ev: ControlEvent },
     /// A marker.

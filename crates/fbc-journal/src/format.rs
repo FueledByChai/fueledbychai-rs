@@ -36,8 +36,13 @@
 //! Version 6 (FBC-j5bw, decision 0062) adds a reason a `WriteResult` may be not sent for,
 //! [`NotSentReason::StaleAuthorization`], as byte 7 after the seven before it, and changes
 //! nothing else; a version 2 to 5 segment holding it is malformed, and a reader of version 5
-//! refuses a version 6 segment at its header, rather than part way through. The reader reads
-//! versions 2 to 6, so a journal written before reads back unchanged.
+//! refuses a version 6 segment at its header, rather than part way through.
+//!
+//! Version 7 (FBC-0hfl, decision 0090) adds the `RpcTimeout` kind and changes nothing else: a
+//! request deadline an order-entry session fired into its codec's `on_rpc_timeout`, at the
+//! stamp its events carry, and the request it names. A version 2 to 6 segment holding it is
+//! malformed, and a reader of version 6 refuses a version 7 segment at its header. The reader
+//! reads versions 2 to 7, so a journal written before reads back unchanged.
 
 use core::ops::Range;
 
@@ -61,8 +66,9 @@ pub const MAGIC: [u8; 4] = *b"FBCJ";
 /// and `Cycle` kinds (FBC-ec9); version 4 hashes the spans a codec names in inbound frames,
 /// response bodies and response header names (FBC-7lm); version 5 keeps the kind an outbound
 /// frame was sent as (FBC-q7b) and adds the `InboundControl` kind (FBC-drf); version 6 adds the
-/// `StaleAuthorization` reason a write result may be not sent for (FBC-j5bw).
-pub const VERSION: u16 = 6;
+/// `StaleAuthorization` reason a write result may be not sent for (FBC-j5bw); version 7 adds the
+/// `RpcTimeout` kind (FBC-0hfl).
+pub const VERSION: u16 = 7;
 /// The oldest format version this crate reads: version 1 is refused (0024).
 pub const OLDEST_READABLE: u16 = 2;
 /// The most bytes one record may redact, its spans and secret header values together.
@@ -84,6 +90,8 @@ const ENCODE_CTX: u8 = 10;
 const CYCLE: u8 = 11;
 // Version 5.
 const INBOUND_CONTROL: u8 = 12;
+// Version 7.
+const RPC_TIMEOUT: u8 = 13;
 
 // Field-less enums are a byte: the value's place in its table. Encoding matches exhaustively,
 // so a new variant fails to compile until it has a byte; decoding indexes the table.
@@ -434,6 +442,11 @@ fn encode_body(
                     e.whole(close.reason.as_bytes())?;
                 }
             }
+        }
+        Record::RpcTimeout { stamp, rpc } => {
+            e.u8(RPC_TIMEOUT);
+            e.stamp(stamp);
+            e.u64(rpc.0);
         }
     }
     e.within()
@@ -943,7 +956,10 @@ pub(crate) fn decode_version(body: &[u8], version: u16) -> Result<(Record, Vec<S
         version,
     };
     let kind = d.u8()?;
-    if (kind >= NONCE && version < 3) || (kind >= INBOUND_CONTROL && version < 5) {
+    if (kind >= NONCE && version < 3)
+        || (kind >= INBOUND_CONTROL && version < 5)
+        || (kind >= RPC_TIMEOUT && version < 7)
+    {
         return Err("record kind");
     }
     let record = match kind {
@@ -1090,6 +1106,10 @@ pub(crate) fn decode_version(body: &[u8], version: u16) -> Result<(Record, Vec<S
                 })),
                 _ => return Err("control frame"),
             },
+        },
+        RPC_TIMEOUT => Record::RpcTimeout {
+            stamp: d.stamp()?,
+            rpc: RpcId(d.u64()?),
         },
         _ => return Err("record kind"),
     };
@@ -1542,9 +1562,10 @@ mod tests {
             encode(&r, &RedactionKey::new(&[7; 32]).unwrap(), &mut body).unwrap();
             (r, body)
         };
-        assert_eq!(VERSION, 6);
         let (stale, body) = body_of(NotSentReason::StaleAuthorization);
-        assert_eq!(decode_version(&body, 6).unwrap().0, stale);
+        for version in 6..=VERSION {
+            assert_eq!(decode_version(&body, version).unwrap().0, stale);
+        }
         for version in OLDEST_READABLE..6 {
             assert_eq!(decode_version(&body, version), Err("write result"));
         }
@@ -1927,6 +1948,34 @@ mod tests {
             }
             assert_eq!(decode_version(&body, 5).unwrap().0, want);
         }
+    }
+
+    /// FBC-0hfl: a request deadline's firing round-trips at its stamp with the request it names,
+    /// nothing in it redacted; a segment of version 6 or earlier, which cannot hold one, refuses
+    /// it as a kind it does not have.
+    #[test]
+    fn an_rpc_timeout_round_trips_and_is_refused_before_version_7() {
+        assert_eq!(VERSION, 7);
+        let record = Record::RpcTimeout {
+            stamp: stamp(),
+            rpc: RpcId(u64::MAX - 1),
+        };
+        assert_eq!(record.blanked(), record);
+        assert!(record.digests(&key()).is_empty());
+        let mut body = Vec::new();
+        encode(&record, &key(), &mut body).unwrap();
+        // The kind, the stamp and the request id: nothing else.
+        assert_eq!(body.len(), 1 + 8 + 1 + 8 + 8 + 6 + 8);
+        assert_eq!(body[0], RPC_TIMEOUT);
+        assert_eq!(decode(&body).unwrap(), (record.clone(), Vec::new()));
+        for version in OLDEST_READABLE..7 {
+            assert_eq!(decode_version(&body, version), Err("record kind"));
+        }
+        // A body cut short, or with a byte after the request id, is refused.
+        assert!(decode(&body[..body.len() - 1]).is_err());
+        let mut long = body.clone();
+        long.push(0);
+        assert_eq!(decode(&long), Err("bytes after the record"));
     }
 
     /// FBC-drf: a control frame's payload is too large for the room left like any record's,
@@ -2536,7 +2585,7 @@ mod tests {
 
         /// One owned record of a kind no [`RecordRef`] borrows.
         fn owned(&mut self) -> Record {
-            match self.below(10) {
+            match self.below(11) {
                 0 => Record::Outbound {
                     at: MonoNs(self.next()),
                     conn: conn(),
@@ -2582,6 +2631,10 @@ mod tests {
                 },
                 6 => encode_ctx((0..self.below(6)).map(|_| self.next()).collect()),
                 7 => cycle(self.below(6) as u32),
+                9 => Record::RpcTimeout {
+                    stamp: self.stamp(),
+                    rpc: RpcId(self.next()),
+                },
                 8 => Record::InboundControl {
                     stamp: self.stamp(),
                     frame: match self.below(4) {
