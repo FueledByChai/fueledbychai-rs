@@ -283,7 +283,8 @@ pub struct OrderRecord {
     /// them may answer.
     tombstones: Vec<RpcId>,
     /// The amends and cancels whose fate the ladder waits on ([`Self::fate_unanswered`]):
-    /// every tombstone cancel sent, every amend or cancel whose outcome went unanswered, and
+    /// every tombstone cancel sent, every amend or cancel whose outcome went unanswered (an
+    /// amend only while it can still land: in flight, or replaced and not yet settled), and
     /// every one replaced in flight while the order is on the ladder. While one is, it may
     /// still remove or change the order, so the order stays on the ladder whatever the venue
     /// shows of it, even once a later command's refusal cleared the command in flight
@@ -1074,7 +1075,13 @@ impl OrderRecord {
             }
             (_, SubmitOutcome::Unknown) => {
                 match op {
-                    OrderOp::Amend(rpc) => self.await_answer(rpc, Fate::Amend),
+                    // An amend only while it can still land: the amend in flight, or one
+                    // replaced in flight not yet settled. One an update confirmed, itself or
+                    // by a later amend's total settling it, is answered (RB-tjey-1 on PR #146).
+                    OrderOp::Amend(rpc) if self.answers_intent(op) || self.has_unsettled() => {
+                        self.await_answer(rpc, Fate::Amend);
+                    }
+                    OrderOp::Amend(_) => {}
                     OrderOp::Cancel(rpc) => self.await_answer(rpc, Fate::Cancel),
                     OrderOp::Place => {}
                 }

@@ -2251,3 +2251,62 @@ fn a_command_answered_while_still_in_flight_is_not_awaited_once_replaced() {
         assert!(reg.live(c).is_ok(), "{case}");
     }
 }
+
+#[test]
+fn an_amend_confirmed_before_its_unknown_outcome_does_not_hold_the_order() {
+    // RB-tjey-1 on PR #146: an update confirmed amend 50 (or amend 51, which replaced it in
+    // flight, settling it with its total) before amend 50's outcome came back Unknown. Nothing
+    // can answer amend 50 after that, and it can no longer move the order: the late Unknown
+    // puts the order on the ladder, as before FBC-tjey, and the venue showing it resting
+    // resolves it, with a Live permit.
+    let ordered = |venue| OrderKey {
+        venue: Some(venue),
+        ingest: venue,
+    };
+    for replaced in [false, true] {
+        let case = format!("replaced {replaced}");
+        let mut reg = Registry::new();
+        let c = open(&mut reg, "z1");
+        reg.amend_sent(c, Ticks(101), lots(10), RpcId(50), at(10))
+            .unwrap();
+        let px = if replaced {
+            reg.amend_sent(c, Ticks(102), lots(10), RpcId(51), at(11))
+                .unwrap();
+            102
+        } else {
+            101
+        };
+        let mut confirmed = update(Some(c), VenueOrderState::Amended { new_vid: None }, 0);
+        confirmed.px = Some(Ticks(px));
+        confirmed.qty = Some(lots(10));
+        reg.apply_update(&confirmed, ordered(1));
+        let rec = reg.get(c).unwrap();
+        assert_eq!(rec.intent(), Intent::None, "{case}");
+        assert!(!rec.amend_unconfirmed(), "{case}");
+        reg.on_outcome(
+            c,
+            OrderOp::Amend(RpcId(50)),
+            &item(Some(c), None),
+            &SubmitOutcome::Unknown,
+            at(15),
+        )
+        .unwrap();
+        assert_eq!(reg.get(c).unwrap().unknown_since(), Some(at(15)), "{case}");
+        assert_eq!(
+            reg.ladder(&cfg(), &caps(), at(20)).queries.len(),
+            1,
+            "{case}"
+        );
+        reg.query_sent(c, RpcId(1)).unwrap();
+        let mut shown = snap(Some(c), "z1", VenueOrderState::Open, 0);
+        shown.px = Some(Ticks(px));
+        let answer = QueryAnswer::new(RpcId(1), OrderRef::Client(c), Some(shown)).unwrap();
+        assert_eq!(
+            reg.on_query_answer(&caps(), &answer, ordered(2)),
+            LadderResolution::Resolved(OrdState::Open),
+            "{case}"
+        );
+        assert_eq!(reg.get(c).unwrap().unknown_since(), None, "{case}");
+        assert!(reg.live(c).is_ok(), "{case}");
+    }
+}
