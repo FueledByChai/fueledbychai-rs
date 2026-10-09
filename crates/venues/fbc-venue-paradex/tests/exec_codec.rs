@@ -1375,6 +1375,53 @@ fn a_placement_whose_order_event_shows_it_closed_with_nothing_filled_is_rejected
     }
 }
 
+/// Order event `bytes` with its cancel reason `from` (non-empty) stated as `to` instead.
+fn with_reason(mut bytes: Vec<u8>, from: &str, to: &str) -> Vec<u8> {
+    let from = from.as_bytes();
+    let at = bytes.windows(from.len()).position(|w| w == from).unwrap();
+    let len = u8::try_from(to.len()).unwrap();
+    bytes.splice(
+        at - 1..at + from.len(),
+        [&[len][..], to.as_bytes()].concat(),
+    );
+    bytes
+}
+
+#[test]
+fn an_ioc_or_market_order_closed_unfilled_for_no_known_refusal_is_final_not_rejected() {
+    // A MARKET IOC buy that found nothing to fill: `sizeOpen` (block offset 44) equal to its
+    // `size` (36), CLOSED with no cancel reason. It passed the risk check and expired.
+    let mut market = sbe("order-market-ioc-v1.sbe.txt");
+    let size = market[8 + 36..8 + 44].to_vec();
+    market[8 + 44..8 + 52].copy_from_slice(&size);
+    // A LIMIT IOC that crossed nothing: the margin fixture's POST_ONLY (19) made IOC, and its
+    // reason one no source names as a refusal.
+    let mut limit = sbe("order-closed-margin-v2.sbe.txt");
+    assert_eq!(limit[8 + 19], 3, "order-closed-margin-v2 is POST_ONLY");
+    limit[8 + 19] = 2;
+    let limit = with_reason(limit, "NOT_ENOUGH_MARGIN", "SOME_UNLISTED_REASON");
+    for (name, bytes) in [("market IOC", market), ("limit IOC", limit)] {
+        let mut codec = placed();
+        let call = frame(&mut codec, RawFrame::Binary(&bytes));
+        call.result.unwrap();
+        let mut expected = vec![accepted(11, AckLevel::Final)];
+        expected.extend(decoded(&bytes));
+        assert_eq!(call.events, expected, "{name}");
+    }
+}
+
+#[test]
+fn an_ioc_order_closed_unfilled_for_want_of_margin_is_still_rejected_asynchronously() {
+    let mut ioc = sbe("order-closed-margin-v2.sbe.txt");
+    ioc[8 + 19] = 2;
+    let mut codec = placed();
+    let call = frame(&mut codec, RawFrame::Binary(&ioc));
+    call.result.unwrap();
+    let mut expected = vec![place_refused(RejectKind::Other, "NOT_ENOUGH_MARGIN")];
+    expected.extend(decoded(&ioc));
+    assert_eq!(call.events, expected);
+}
+
 #[test]
 fn a_placement_we_cancel_before_its_risk_check_is_neither_final_nor_rejected() {
     // CLOSED by USER_CANCELED with nothing filled: our own cancel, not the venue's refusal.

@@ -342,14 +342,22 @@ fn modify_of(status: u8) -> Modify {
 pub(crate) enum Phase {
     /// NEW: received, before the risk check.
     Pending,
-    /// OPEN, or CLOSED with anything filled: past the risk check.
+    /// OPEN, or CLOSED with anything filled: past the risk check. So is an IOC or MARKET
+    /// order CLOSED with nothing filled for any reason but a refusal ([`REFUSALS`]) or our own
+    /// cancel: it found nothing to fill and expired.
     Passed,
     /// CLOSED with nothing filled, for the stated reason (empty when none is stated), other
-    /// than our own cancel: the venue refused the order after accepting it.
+    /// than our own cancel: the venue refused the order after accepting it. An IOC or MARKET
+    /// order is refused only for a reason in [`REFUSALS`].
     Refused(Box<str>),
     /// CLOSED with nothing filled by our own cancel (USER_CANCELED): neither passed nor refused.
     Withdrawn,
 }
+
+/// The cancel reasons a source names as the risk check's refusal of an order
+/// (`fixtures/paradex/exec/README.md`): the only ones taken as refusing an IOC or MARKET order
+/// closed with nothing filled, which otherwise expired past the risk check (decision 0091).
+const REFUSALS: [&str; 1] = ["NOT_ENOUGH_MARGIN"];
 
 /// What the `OrderEvent` `frame` shows of its order's placement; `None` for a frame that is not
 /// an `OrderEvent` or that [`decode_order_event`] refuses for its status, sizes or strings.
@@ -360,6 +368,8 @@ pub(crate) fn phase(frame: &[u8]) -> Option<Phase> {
     }
     let block = msg.block();
     let filled = block.i64_at(44)? < block.i64_at(36)?;
+    // MARKET (`orderType` 2), or IOC (`timeInForce` 2): an order that never rests.
+    let immediate = block.u8_at(18)? == 2 || block.u8_at(19)? == 2;
     let mut tail = msg.tail();
     // `orderId`, `clientOrderId` and `market`, then `cancelReason`.
     for _ in 0..3 {
@@ -371,6 +381,7 @@ pub(crate) fn phase(frame: &[u8]) -> Option<Phase> {
         3 => Phase::Passed,
         4 if filled => Phase::Passed,
         4 if reason == "USER_CANCELED" => Phase::Withdrawn,
+        4 if immediate && !REFUSALS.contains(&reason) => Phase::Passed,
         4 => Phase::Refused(reason.into()),
         _ => return None,
     })
