@@ -34,8 +34,8 @@ use fbc_venue_paradex::auth::{
     ACCOUNT_ADDRESS, CHAIN_ID, REFRESH, REST_URL, SIGNATURE_LIFETIME, SIGNING_KEY, TIMEOUT,
 };
 use fbc_venue_paradex::exec::{
-    LOGIN_REQUEST, PRIVATE_CHANNELS, REFRESH_TIMER, ReadOnlyExec, decode_account_event,
-    decode_fill_event, decode_order_event, decode_position_event,
+    LOGIN_REQUEST, ModifyRequests, PRIVATE_CHANNELS, REFRESH_TIMER, ReadOnlyExec,
+    decode_account_event, decode_fill_event, decode_order_event, decode_position_event,
 };
 use fbc_venue_paradex::factory::caps;
 use md::BTC;
@@ -1049,8 +1049,11 @@ type Decoder =
 #[test]
 fn private_frames_decode_as_their_decoders_do_and_other_templates_are_skipped() {
     let account: Decoder = |f, scope, _specs, sink| decode_account_event(f, scope, sink);
+    let order: Decoder = |f, scope, specs, sink| {
+        decode_order_event(f, scope, specs, &mut ModifyRequests::new(), sink)
+    };
     let cases: [(&str, Decoder); 4] = [
-        ("order-new-v1.sbe.txt", decode_order_event),
+        ("order-new-v1.sbe.txt", order),
         ("fill-rpi-v2.sbe.txt", decode_fill_event),
         ("position-long-v2.sbe.txt", decode_position_event),
         ("account-v2.sbe.txt", account),
@@ -1299,4 +1302,52 @@ fn an_unreadable_auth_or_subscribe_reply_reports_closed_and_asks_for_a_reconnect
         }]
     );
     assert_eq!(subscribes(&call.fx).len(), PRIVATE_CHANNELS.len());
+}
+
+/// FBC-g3bw: the codec keeps what each order's modify request_info last said across its frames
+/// and its connections, so a later update repeating an earlier modify's REJECTED, even on the
+/// next connection, is not a second reject of the amend; a new requestId's is.
+#[test]
+fn a_repeated_modify_rejection_is_reported_once_across_frames_and_a_reconnect() {
+    let mut codec = authenticated();
+    let rejected = fixture("order-modify-rejected-v2.sbe.txt");
+    let fill = fixture("order-modify-rejected-fill-v2.sbe.txt");
+    let kinds = |call: Call| -> Vec<&'static str> {
+        call.result.unwrap();
+        call.events
+            .iter()
+            .map(|ev| match ev {
+                ExecEvent::AsyncReject { .. } => "reject",
+                ExecEvent::Order(_) => "order",
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    };
+    assert_eq!(
+        kinds(frame(&mut codec, RawFrame::Binary(&rejected))),
+        ["reject", "order"]
+    );
+    assert_eq!(kinds(frame(&mut codec, RawFrame::Binary(&fill))), ["order"]);
+    // The next connection, authenticated with the token reused.
+    let id = auth_frame(&open(&mut codec), TOKEN);
+    text(&mut codec, &reply(id)).result.unwrap();
+    assert_eq!(kinds(frame(&mut codec, RawFrame::Binary(&fill))), ["order"]);
+    // Another modify of the order, rejected: reported.
+    let block = usize::from(u16::from_le_bytes([fill[0], fill[1]]));
+    let mut fresh = fill[..8 + block].to_vec();
+    for var in [
+        "1759500000000000001",
+        "01000700-199b-81ab-8200-00054d0aa3f5",
+        "BTC-USD-PERP",
+        "",
+        "req-7003",
+        "",
+    ] {
+        fresh.push(u8::try_from(var.len()).unwrap());
+        fresh.extend_from_slice(var.as_bytes());
+    }
+    assert_eq!(
+        kinds(frame(&mut codec, RawFrame::Binary(&fresh))),
+        ["reject", "order"]
+    );
 }

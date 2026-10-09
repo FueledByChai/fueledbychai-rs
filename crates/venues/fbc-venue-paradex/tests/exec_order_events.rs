@@ -21,7 +21,7 @@ use fbc_core::{
     ExecEvent, ExecSink, Lots, Namespace, NamespaceLease, OpKind, OrderRef, OrderUpdate, Reject,
     RejectKind, Side, Ticks, VenueMeta, VenueOrderId, VenueOrderState, WallNs, dispatch,
 };
-use fbc_venue_paradex::exec::{TEMPLATE_ORDER, decode_order_event};
+use fbc_venue_paradex::exec::{ModifyRequests, TEMPLATE_ORDER, decode_order_event};
 use fbc_venue_paradex::factory::caps;
 use md::BTC;
 
@@ -92,16 +92,37 @@ impl ExecSink for Sink {
     }
 }
 
-/// Decodes `bytes` through the core's dispatch under Paradex's order-entry caps: what the
-/// decoder returned and every event it pushed.
+/// Decodes `bytes` through the core's dispatch under Paradex's order-entry caps, with no
+/// request_info seen before: what the decoder returned and every event it pushed.
 fn decode(bytes: &[u8]) -> (Result<(), DecodeError>, Vec<(VenueMeta, ExecEvent)>) {
+    decode_after(&mut ModifyRequests::new(), bytes)
+}
+
+/// Decodes `bytes` as [`decode`] does, after the frames `seen` was given.
+fn decode_after(
+    seen: &mut ModifyRequests,
+    bytes: &[u8],
+) -> (Result<(), DecodeError>, Vec<(VenueMeta, ExecEvent)>) {
     let caps = caps();
     let specs = md::specs();
     let mut sink = Sink::default();
     let result = dispatch(&caps, OWN, |scope| {
-        decode_order_event(bytes, scope, &specs, &mut sink)
+        decode_order_event(bytes, scope, &specs, seen, &mut sink)
     });
     (result, sink.0)
+}
+
+/// The events each of `frames` decodes into, in turn, under one [`ModifyRequests`], without
+/// their metas; every frame decodes.
+fn decode_each(seen: &mut ModifyRequests, frames: &[&[u8]]) -> Vec<Vec<ExecEvent>> {
+    frames
+        .iter()
+        .map(|bytes| {
+            let (result, events) = decode_after(seen, bytes);
+            result.unwrap();
+            events.into_iter().map(|(_, ev)| ev).collect()
+        })
+        .collect()
 }
 
 /// The one order update `bytes` decodes into, and what the venue said about it.
@@ -471,4 +492,234 @@ fn a_frame_the_decoder_cannot_read_whole_is_refused_with_nothing_pushed() {
     let last = bad.len() - 1;
     bad[last] = 0xff;
     assert!(malformed(bad));
+}
+
+// FBC-g3bw (Reviewer B's RB85-1 on PR #85): a later event of the same order still carrying an
+// earlier modify's request_info (its requestId and requestStatus unchanged) reports nothing of
+// that modify again, and is the order update in the order's own state; a new requestId's, or a
+// new status's, is reported.
+
+/// Our first client id as the fixtures carry it.
+const FIRST_CID: &str = "01000700-199b-81ab-8200-00054d0aa3f5";
+
+/// The order update the `-fill-v2` fixtures describe: open after 0.05 filled, at `px` for a
+/// total of `qty`, in `state`.
+fn after_fill(cid: ClientOrderId, state: VenueOrderState, px: Ticks, qty: i64) -> OrderUpdate {
+    OrderUpdate {
+        cum_filled: lots(50),
+        ..resting(cid, state, px, qty)
+    }
+}
+
+/// `bytes`, a version-2 frame of our first order, with its requestId set to `request_id` and
+/// its requestMessage to `message`.
+fn with_request(bytes: &[u8], request_id: &str, message: &str) -> Vec<u8> {
+    with_vars(
+        bytes,
+        &[OID, FIRST_CID, "BTC-USD-PERP", "", request_id, message],
+    )
+}
+
+/// The asynchronous reject of an amend of our first order with `message`.
+fn amend_rejected(cid: ClientOrderId, message: &str) -> ExecEvent {
+    ExecEvent::AsyncReject {
+        target: OrderRef::Both(cid, vid(OID)),
+        op: OpKind::Amend,
+        reject: Reject {
+            kind: RejectKind::Other,
+            venue_code: None,
+            raw: message.into(),
+        },
+    }
+}
+
+#[test]
+fn a_later_fill_update_still_carrying_a_rejected_modify_is_not_a_second_reject_of_the_amend() {
+    let [first, _] = ours();
+    let message = "synthetic rejection message";
+    let rejected = frame("order-modify-rejected-v2.sbe.txt");
+    let fill = frame("order-modify-rejected-fill-v2.sbe.txt");
+    // The later update carries the same request: requestId req-7002, REJECTED, MODIFY_ORDER.
+    assert_eq!((fill[HEADER + 126], fill[HEADER + 127]), (3, 1));
+    let fresh = with_request(&fill, "req-7003", message);
+    let mut seen = ModifyRequests::new();
+    let events = decode_each(&mut seen, &[&rejected, &fill, &fresh, &fresh]);
+    let open = |update| ExecEvent::Order(update);
+    assert_eq!(
+        events,
+        vec![
+            // The reject, once, beside the order as it rests.
+            vec![
+                amend_rejected(first, message),
+                open(resting(first, VenueOrderState::Open, PX, 150)),
+            ],
+            // The fill update: the order in its own state, no second reject.
+            vec![open(after_fill(first, VenueOrderState::Open, PX, 150))],
+            // A new requestId's REJECTED is another modify's: reported again.
+            vec![
+                amend_rejected(first, message),
+                open(after_fill(first, VenueOrderState::Open, PX, 150)),
+            ],
+            // And not a third time.
+            vec![open(after_fill(first, VenueOrderState::Open, PX, 150))],
+        ]
+    );
+    assert_eq!(seen.len(), 1);
+}
+
+#[test]
+fn a_later_fill_update_still_carrying_a_successful_modify_is_not_a_second_amend() {
+    let [first, _] = ours();
+    let success = frame("order-modify-success-v2.sbe.txt");
+    let fill = frame("order-modify-success-fill-v2.sbe.txt");
+    assert_eq!((fill[HEADER + 126], fill[HEADER + 127]), (4, 1));
+    let fresh = with_request(&fill, "req-7004", "");
+    let mut seen = ModifyRequests::new();
+    let events = decode_each(&mut seen, &[&success, &fill, &fresh, &fresh]);
+    let amended = VenueOrderState::Amended { new_vid: None };
+    let open = VenueOrderState::Open;
+    assert_eq!(
+        events,
+        vec![
+            // The amend's confirmation, once.
+            vec![ExecEvent::Order(resting(
+                first,
+                amended.clone(),
+                PX_AMENDED,
+                200
+            ))],
+            // The fill update: open, at the amended price and size, no second amend.
+            vec![ExecEvent::Order(after_fill(
+                first,
+                open.clone(),
+                PX_AMENDED,
+                200
+            ))],
+            // A new requestId's SUCCESS confirms another amend.
+            vec![ExecEvent::Order(after_fill(
+                first, amended, PX_AMENDED, 200
+            ))],
+            vec![ExecEvent::Order(after_fill(first, open, PX_AMENDED, 200))],
+        ]
+    );
+}
+
+#[test]
+fn a_modify_moving_from_pending_to_success_is_reported_and_an_event_without_request_info_forgets_nothing()
+ {
+    let [first, _] = ours();
+    // PENDING then SUCCESS of the same requestId (req-7001): the status changed, so the
+    // SUCCESS is the amend's confirmation.
+    let pending = frame("order-modify-pending-v2.sbe.txt");
+    let success = frame("order-modify-success-v2.sbe.txt");
+    // An update of the same order with no request_info in between (the 1:2 layout without it,
+    // and a version-1 frame) does not make the next repeat news.
+    let without = frame("order-v2-without-request-info.sbe.txt");
+    let v1 = frame("order-new-v1.sbe.txt");
+    let fill = frame("order-modify-success-fill-v2.sbe.txt");
+    let mut seen = ModifyRequests::new();
+    let events = decode_each(&mut seen, &[&pending, &success, &without, &v1, &fill]);
+    let state = |events: &Vec<ExecEvent>| match &events[..] {
+        [ExecEvent::Order(update)] => update.state.clone(),
+        other => panic!("{other:?}"),
+    };
+    let amended = VenueOrderState::Amended { new_vid: None };
+    let open = VenueOrderState::Open;
+    let states: Vec<_> = events.iter().map(state).collect();
+    assert_eq!(
+        states,
+        [
+            open.clone(),
+            amended.clone(),
+            open.clone(),
+            open.clone(),
+            open
+        ]
+    );
+    assert_eq!(
+        events[1],
+        [ExecEvent::Order(resting(first, amended, PX_AMENDED, 200))]
+    );
+}
+
+#[test]
+fn a_modify_without_a_request_id_is_reported_once_and_a_closed_order_is_forgotten() {
+    let [first, _] = ours();
+    let message = "synthetic rejection message";
+    // REJECTED for MODIFY_ORDER with no requestId (absent appended var data): repeats cannot be
+    // told from a new modify, so only the first is reported, and the amend after it waits for
+    // its own answer (the OMS's ladder) rather than settle on a repeat.
+    let no_id = with_vars(
+        &frame("order-modify-rejected-v2.sbe.txt"),
+        &[OID, FIRST_CID, "BTC-USD-PERP", ""],
+    );
+    let mut seen = ModifyRequests::new();
+    let events = decode_each(&mut seen, &[&no_id, &no_id]);
+    assert_eq!(events[0][0], amend_rejected(first, ""));
+    assert_eq!(events[1].len(), 1);
+    // A requestId after none is a change: reported.
+    let named = frame("order-modify-rejected-v2.sbe.txt");
+    let events = decode_each(&mut seen, &[&named]);
+    assert_eq!(events[0][0], amend_rejected(first, message));
+    assert_eq!(seen.len(), 1);
+    // The order closed: nothing of it is kept.
+    let closed = frame("order-closed-filled-v2.sbe.txt");
+    let events = decode_each(&mut seen, &[&closed]);
+    assert!(matches!(
+        &events[0][..],
+        [ExecEvent::Order(OrderUpdate {
+            state: VenueOrderState::Filled,
+            ..
+        })]
+    ));
+    assert!(seen.is_empty());
+    // A closing event that is itself a modify's news reports it, and keeps nothing either.
+    let closing = with_byte(with_i64(named.clone(), 44, 0), 16, 4);
+    let mut seen = ModifyRequests::new();
+    let events = decode_each(&mut seen, &[&closing]);
+    assert_eq!(events[0][0], amend_rejected(first, message));
+    assert!(seen.is_empty());
+}
+
+#[test]
+fn a_refused_frame_records_no_request_info_and_other_orders_are_apart() {
+    let [first, second] = ours();
+    let message = "synthetic rejection message";
+    let rejected = frame("order-modify-rejected-v2.sbe.txt");
+    let mut seen = ModifyRequests::new();
+    // Refused for a market missing from the specs, after its request_info was read: nothing
+    // pushed and nothing recorded, so the whole frame after it is the modify's news.
+    let unknown = with_vars(
+        &rejected,
+        &[OID, FIRST_CID, "SOL-USD-PERP", "", "req-7002", message],
+    );
+    let (result, events) = decode_after(&mut seen, &unknown);
+    assert_eq!(result, Err(DecodeError::UnknownInstrument));
+    assert!(events.is_empty());
+    assert!(seen.is_empty());
+    // A frame refused after its request_info and order id were read (an off-grid price).
+    let off_grid = with_i64(rejected.clone(), 20, 6_200_000_000_001);
+    assert!(decode_after(&mut seen, &off_grid).0.is_err());
+    assert!(seen.is_empty());
+    let events = decode_each(&mut seen, &[&rejected]);
+    assert_eq!(events[0][0], amend_rejected(first, message));
+    // Another order carrying the same requestId and status is its own news.
+    let other = with_vars(
+        &rejected,
+        &[
+            "1759500000000000002",
+            "01000700-199b-81ab-8200-00099b9bf518",
+            "BTC-USD-PERP",
+            "",
+            "req-7002",
+            message,
+        ],
+    );
+    let events = decode_each(&mut seen, &[&other]);
+    let target = OrderRef::Both(second, vid("1759500000000000002"));
+    assert!(matches!(
+        &events[0][0],
+        ExecEvent::AsyncReject { target: t, .. } if *t == target
+    ));
+    assert_eq!(seen.len(), 2);
 }

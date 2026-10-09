@@ -43,6 +43,8 @@ Every frame is for BTC-USD-PERP. The client id `01000700-199b-81ab-8200-00054d0a
 | `order-modify-pending-v2.sbe.txt` | OPEN while a modify is PENDING |
 | `order-modify-success-v2.sbe.txt` | OPEN, modify SUCCESS for MODIFY_ORDER, at 61999.5 for 0.2 |
 | `order-modify-rejected-v2.sbe.txt` | OPEN, modify REJECTED for MODIFY_ORDER with a request message; the order as it was |
+| `order-modify-rejected-fill-v2.sbe.txt` | The same order, OPEN after 0.05 filled, still carrying `order-modify-rejected-v2`'s REJECTED for MODIFY_ORDER and its `requestId` (`req-7002`): a later update repeating an earlier modify's request_info |
+| `order-modify-success-fill-v2.sbe.txt` | The same order, OPEN after 0.05 of the amended 0.2 filled, still carrying `order-modify-success-v2`'s SUCCESS for MODIFY_ORDER and its `requestId` (`req-7001`) |
 | `order-modify-success-longer-block.sbe.txt` | The SUCCESS frame with a 136-byte block: 8 bytes past the known fields, skipped |
 | `order-short-block.sbe.txt` | A version-2 header declaring a 128-byte block, the frame ending 60 bytes into it |
 | `fill-maker-v1.sbe.txt` | FILL at version 1: our buy made 0.05 at 62000.0 for a 0.0031 rebate, realizedPnl null, no fee currency |

@@ -34,8 +34,8 @@ use fbc_venue_paradex::auth::{
     ACCOUNT_ADDRESS, CHAIN_ID, REFRESH, REST_URL, SIGNATURE_LIFETIME, SIGNING_KEY, TIMEOUT,
 };
 use fbc_venue_paradex::exec::{
-    CONTROL_IDS, LOGIN_REQUEST, PRIVATE_CHANNELS, ParadexEncoder, ParadexExec, REFRESH_TIMER,
-    decode_order_event, decode_order_query, decode_resync,
+    CONTROL_IDS, LOGIN_REQUEST, ModifyRequests, PRIVATE_CHANNELS, ParadexEncoder, ParadexExec,
+    REFRESH_TIMER, decode_order_event, decode_order_query, decode_resync,
 };
 use fbc_venue_paradex::factory::caps;
 use md::BTC;
@@ -977,7 +977,13 @@ fn private_events_decode_on_the_same_connection() {
     let specs: SpecTable = md::specs();
     let mut direct = Sink::default();
     dispatch(&caps(), OWN, |scope| {
-        decode_order_event(&bytes, scope, &specs, &mut direct)
+        decode_order_event(
+            &bytes,
+            scope,
+            &specs,
+            &mut ModifyRequests::new(),
+            &mut direct,
+        )
     })
     .unwrap();
     let call = frame(&mut codec, RawFrame::Binary(&bytes));

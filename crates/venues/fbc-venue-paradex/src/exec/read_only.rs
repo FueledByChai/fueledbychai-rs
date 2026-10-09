@@ -43,7 +43,9 @@
 //!   its connection stays as it is. A login that cannot be signed asks for the reconnect alone,
 //!   since `on_open` has no sink.
 //! - **Decoding.** Binary frames are the SBE templates of schema 1:2 (0054): `OrderEvent`,
-//!   `FillEvent`, `PositionEvent` and `AccountEvent` through their decoders; a heartbeat and any
+//!   `FillEvent`, `PositionEvent` and `AccountEvent` through their decoders, `OrderEvent`'s
+//!   with the codec's [`ModifyRequests`](super::ModifyRequests), kept across its connections, so
+//!   a modify's request_info is reported once per order and request (0086); a heartbeat and any
 //!   template not decoded are skipped, as the schema's versioning policy requires. Text frames
 //!   are the JSON-RPC replies to the codec's own requests. A reply member that is JSON `null`
 //!   is read as absent, as the order replies read it (FBC-cexu) and as the Java client reads
@@ -84,7 +86,7 @@ use crate::md::sbe::Message;
 
 use super::reply::member;
 use super::{
-    ResyncTags, TEMPLATE_ACCOUNT, TEMPLATE_FILL, TEMPLATE_ORDER, TEMPLATE_POSITION,
+    ModifyRequests, ResyncTags, TEMPLATE_ACCOUNT, TEMPLATE_FILL, TEMPLATE_ORDER, TEMPLATE_POSITION,
     decode_account_event, decode_fill_event, decode_order_event, decode_position_event,
     decode_resync, resync_requests,
 };
@@ -156,6 +158,9 @@ pub struct ReadOnlyExec {
     /// The resync in flight, if any.
     resync: Option<Resync>,
     next_tag: u64,
+    /// The MODIFY_ORDER request_info each order's events last carried, kept across connections
+    /// so a later update repeating it is not reported again (decision 0086).
+    modifies: ModifyRequests,
 }
 
 impl fmt::Debug for ReadOnlyExec {
@@ -197,6 +202,7 @@ impl ReadOnlyExec {
             timeout,
             resync: None,
             next_tag: FIRST_READ_TAG,
+            modifies: ModifyRequests::new(),
         })
     }
 
@@ -734,7 +740,7 @@ impl ExecCodec for ReadOnlyExec {
             RawFrame::Binary(frame) => frame,
         };
         match Message::parse(frame)?.header().template_id {
-            TEMPLATE_ORDER => decode_order_event(frame, scope, specs, sink),
+            TEMPLATE_ORDER => decode_order_event(frame, scope, specs, &mut self.modifies, sink),
             TEMPLATE_FILL => decode_fill_event(frame, scope, specs, sink),
             TEMPLATE_POSITION => decode_position_event(frame, scope, specs, sink),
             TEMPLATE_ACCOUNT => decode_account_event(frame, scope, sink),
