@@ -153,6 +153,33 @@ fn a_dropped_batch_command_releases_every_item() {
 }
 
 #[test]
+fn a_batch_after_a_dropped_place_takes_the_side_it_freed() {
+    // Codex P1 r4225966569 on PR #137: the batch's first cap check reaps the dropped command.
+    let mut reg = registry();
+    let dropped = buy(RESTING);
+    let c = dropped.cid;
+    drop(reg.place(dropped).unwrap());
+    let plan = reg.place_batch(vec![buy(5), buy(6)]).unwrap();
+    assert!(plan.refused.is_empty(), "{:?}", plan.refused);
+    assert!(reg.authorize(ACCT, plan.command.unwrap()).is_ok());
+    assert_eq!(reg.get(c).unwrap().state(), released());
+}
+
+#[test]
+fn withdrawing_one_place_releases_another_dropped_before() {
+    // Codex P2 r4225966574 on PR #137: place_not_submitted is a mutating call, so it reaps too.
+    let mut reg = registry();
+    let first = buy(5);
+    let a = first.cid;
+    let dropped = reg.place(first).unwrap();
+    let withdrawn = reg.place(buy(6)).unwrap();
+    drop(dropped);
+    assert!(reg.place_not_submitted(withdrawn, NotSentReason::Backpressure));
+    assert_eq!(reg.get(a).unwrap().state(), released());
+    assert_eq!(reg.resting_on(INST, Side::Buy), Some(Lots::ZERO));
+}
+
+#[test]
 fn a_place_passed_to_amend_not_submitted_is_released() {
     let mut reg = registry();
     let order = buy(RESTING);
