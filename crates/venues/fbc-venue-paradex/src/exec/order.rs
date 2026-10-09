@@ -43,9 +43,14 @@
 //! status of one, is news. An event without MODIFY_ORDER request_info leaves what is held as it
 //! is, and a CLOSED order's entries are dropped once its event is decoded.
 //!
+//! What is held of an order stays bounded however often it is amended (decision 0091,
+//! FBC-ypq9): only a SUCCESS or REJECTED is held, since a PENDING or PROCESSED confirms nothing
+//! whether it is news or not, and only the order's latest [`MODIFY_OUTCOMES_HELD`] of them; an
+//! older one repeated is reported again.
+//!
 //! The whole frame is read before anything is pushed, so a refused frame pushes nothing.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, VecDeque};
 
 use fbc_core::{
     CancelReason, CidMatch, DecodeError, DecodeScope, ExchTsKind, ExecEvent, ExecSink, OpKind,
@@ -68,14 +73,22 @@ const REQUEST_REJECTED: u8 = 3;
 const REQUEST_SUCCESS: u8 = 4;
 const MODIFY_ORDER: u8 = 1;
 
-/// Every MODIFY_ORDER request_info each order's events carried, by venue order id (decision
+/// The most SUCCESS or REJECTED outcomes of MODIFY_ORDER request_info held of one order
+/// (decision 0091): its latest ones, in the order they were first seen. A re-delivery repeats
+/// what the order carried when the venue published it, its latest modify's outcome then; to
+/// repeat one this many outcomes older, an event must have been published before this many
+/// later modifies of the order were answered and decoded after them all.
+pub const MODIFY_OUTCOMES_HELD: usize = 32;
+
+/// The MODIFY_ORDER request_info each order's events carried, by venue order id (decision
 /// 0086): what makes a modify's SUCCESS or REJECTED news once, not again on a later update of
 /// the order that still carries it, even after another modify's (Codex r4226495973 on PR #139).
 /// One per order-entry codec, kept across its frames and connections; an order's entries go
-/// once an event shows it CLOSED.
+/// once an event shows it CLOSED. Bounded per order (decision 0091): only outcomes are held,
+/// the order's latest [`MODIFY_OUTCOMES_HELD`].
 #[derive(Debug, Default)]
 pub struct ModifyRequests {
-    seen: HashMap<VenueOrderId, HashSet<Request>>,
+    seen: HashMap<VenueOrderId, VecDeque<Request>>,
 }
 
 /// One MODIFY_ORDER request_info: its `requestId` (`None` when the frame carries none) and its
@@ -102,12 +115,27 @@ impl ModifyRequests {
         self.seen.is_empty()
     }
 
-    /// Whether no earlier event of `vid` carried `request`, holding it from now on.
+    /// The number of modify outcomes held, over every order: at most [`MODIFY_OUTCOMES_HELD`]
+    /// for each of [`len`](Self::len) orders.
+    pub fn outcomes(&self) -> usize {
+        self.seen.values().map(VecDeque::len).sum()
+    }
+
+    /// Whether the outcome `request` (a SUCCESS or REJECTED) is not one held of `vid`, holding
+    /// it from now on as the order's latest and dropping the order's oldest beyond
+    /// [`MODIFY_OUTCOMES_HELD`].
     fn is_news(&mut self, vid: &VenueOrderId, request: Request) -> bool {
-        if let Some(held) = self.seen.get_mut(vid) {
-            return held.insert(request);
+        let Some(held) = self.seen.get_mut(vid) else {
+            self.seen.insert(vid.clone(), VecDeque::from([request]));
+            return true;
+        };
+        if held.contains(&request) {
+            return false;
         }
-        self.seen.insert(vid.clone(), HashSet::from([request]));
+        if held.len() == MODIFY_OUTCOMES_HELD {
+            held.pop_front();
+        }
+        held.push_back(request);
         true
     }
 
@@ -216,18 +244,22 @@ pub fn decode_order_event(
     let cid = (!client_id.is_empty()).then(|| scope.client_order_id(client_id));
     let vid = scope.venue_order_id(order_id)?;
     // The frame is read whole: only now is what `seen` holds of the order changed.
+    // Only an outcome is held (decision 0091): any other status confirms nothing, news or not.
     let modify = match request_status {
-        Some(status) => {
-            let request = Request {
-                id: request_id.map(Box::from),
-                status,
-            };
-            if seen.is_news(&vid, request) {
-                modify_of(status)
-            } else {
-                Modify::Nothing
+        Some(status) => match modify_of(status) {
+            Modify::Nothing => Modify::Nothing,
+            outcome => {
+                let request = Request {
+                    id: request_id.map(Box::from),
+                    status,
+                };
+                if seen.is_news(&vid, request) {
+                    outcome
+                } else {
+                    Modify::Nothing
+                }
             }
-        }
+        },
         None => Modify::Nothing,
     };
     let state = if is_closed {
@@ -294,7 +326,7 @@ fn modify_status(msg: &Message<'_>, block: &Block<'_>) -> Option<u8> {
     }
 }
 
-/// What a MODIFY_ORDER request_info's `status`, when it is news, says about the amend.
+/// What a MODIFY_ORDER request_info's `status` says about the amend when it is news.
 fn modify_of(status: u8) -> Modify {
     match status {
         REQUEST_SUCCESS => Modify::Succeeded,

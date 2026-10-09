@@ -21,7 +21,9 @@ use fbc_core::{
     ExecEvent, ExecSink, Lots, Namespace, NamespaceLease, OpKind, OrderRef, OrderUpdate, Reject,
     RejectKind, Side, Ticks, VenueMeta, VenueOrderId, VenueOrderState, WallNs, dispatch,
 };
-use fbc_venue_paradex::exec::{ModifyRequests, TEMPLATE_ORDER, decode_order_event};
+use fbc_venue_paradex::exec::{
+    MODIFY_OUTCOMES_HELD, ModifyRequests, TEMPLATE_ORDER, decode_order_event,
+};
 use fbc_venue_paradex::factory::caps;
 use md::BTC;
 
@@ -770,4 +772,105 @@ fn an_earlier_modifys_outcome_repeated_after_a_later_modify_is_not_news_again() 
             200
         ))]
     );
+}
+
+// FBC-ypq9 (Reviewer B's RB139-1 on PR #139): a resting order requoted by amending keeps what
+// is held of it bounded. Only a modify's SUCCESS or REJECTED is held (PENDING and PROCESSED
+// confirm nothing, news or not), and only the order's latest MODIFY_OUTCOMES_HELD of them; a
+// repeat of any of those is still not news (decision 0086's rule), and only one older than the
+// window is reported again (decision 0091's stated consequence).
+
+#[test]
+fn an_order_amended_thousands_of_times_holds_a_bounded_window_and_a_repeat_within_it_is_not_news() {
+    let [first, _] = ours();
+    let message = "synthetic rejection message";
+    let success = frame("order-modify-success-v2.sbe.txt");
+    let success_fill = frame("order-modify-success-fill-v2.sbe.txt");
+    let rejected = frame("order-modify-rejected-v2.sbe.txt");
+    let rejected_fill = frame("order-modify-rejected-fill-v2.sbe.txt");
+    let request = |n: usize| format!("req-{n}");
+    // Amend `n`: PENDING, then its outcome (every third one REJECTED), then a later fill
+    // update still carrying that outcome.
+    let amend = |n: usize| -> [Vec<u8>; 3] {
+        let id = request(n);
+        let (outcome, fill, msg) = if n % 3 == 2 {
+            (&rejected, &rejected_fill, message)
+        } else {
+            (&success, &success_fill, "")
+        };
+        [
+            with_byte(with_request(outcome, &id, ""), 126, 1),
+            with_request(outcome, &id, msg),
+            with_request(fill, &id, msg),
+        ]
+    };
+    let state = |events: &[ExecEvent]| match events {
+        [ExecEvent::Order(update)] => update.state.clone(),
+        [
+            ExecEvent::AsyncReject {
+                op: OpKind::Amend, ..
+            },
+            ExecEvent::Order(update),
+        ] => {
+            assert_eq!(update.state, VenueOrderState::Open);
+            VenueOrderState::Canceled(CancelReason::Venue)
+        }
+        other => panic!("{other:?}"),
+    };
+    // The reject is marked by a stand-in state, so each amend reads as one row.
+    let reported = |n: usize| {
+        if n % 3 == 2 {
+            VenueOrderState::Canceled(CancelReason::Venue)
+        } else {
+            VenueOrderState::Amended { new_vid: None }
+        }
+    };
+    let open = VenueOrderState::Open;
+    let mut seen = ModifyRequests::new();
+    // A PENDING alone is not held.
+    let [pending, _, _] = amend(0);
+    decode_each(&mut seen, &[&pending]);
+    assert_eq!(seen.outcomes(), 0);
+    let amends = 5_000;
+    let mut most = 0;
+    for n in 0..amends {
+        let [pending, outcome, fill] = amend(n);
+        let events = decode_each(&mut seen, &[&pending, &outcome, &fill]);
+        let states: Vec<_> = events.iter().map(|e| state(e)).collect();
+        assert_eq!(
+            states,
+            [open.clone(), reported(n), open.clone()],
+            "amend {n}"
+        );
+        most = most.max(seen.outcomes());
+    }
+    // The stated bound: the order holds its latest MODIFY_OUTCOMES_HELD outcomes, no more.
+    assert_eq!(most, MODIFY_OUTCOMES_HELD);
+    assert_eq!((seen.len(), seen.outcomes()), (1, MODIFY_OUTCOMES_HELD));
+    // Within the window, the latest and the oldest held outcome repeated: not news.
+    let oldest_held = amends - MODIFY_OUTCOMES_HELD;
+    for n in [
+        amends - 1,
+        amends - 2,
+        amends - 3,
+        oldest_held + 1,
+        oldest_held,
+    ] {
+        let [_, outcome, fill] = amend(n);
+        let events = decode_each(&mut seen, &[&outcome, &fill]);
+        let states: Vec<_> = events.iter().map(|e| state(e)).collect();
+        assert_eq!(states, [open.clone(), open.clone()], "repeat of amend {n}");
+    }
+    assert_eq!(seen.outcomes(), MODIFY_OUTCOMES_HELD);
+    // One older than the window is reported again, held again, and the window stays bounded.
+    let evicted = oldest_held - 1;
+    let [_, outcome, fill] = amend(evicted);
+    let events = decode_each(&mut seen, &[&outcome, &fill]);
+    assert_eq!(events[0].len(), 2);
+    assert_eq!(events[0][0], amend_rejected(first, message));
+    assert_eq!(state(&events[1]), open);
+    assert_eq!(seen.outcomes(), MODIFY_OUTCOMES_HELD);
+    // The order closed: nothing of it is kept.
+    decode_each(&mut seen, &[&frame("order-closed-filled-v2.sbe.txt")]);
+    assert_eq!((seen.len(), seen.outcomes()), (0, 0));
 }

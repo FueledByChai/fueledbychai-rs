@@ -44,7 +44,7 @@ pub use codec::{CONTROL_IDS, ParadexExec};
 pub use encode::ParadexEncoder;
 pub use errors::REJECT_CODES;
 pub use fill::{TEMPLATE_FILL, decode_fill_event};
-pub use order::{ModifyRequests, TEMPLATE_ORDER, decode_order_event};
+pub use order::{MODIFY_OUTCOMES_HELD, ModifyRequests, TEMPLATE_ORDER, decode_order_event};
 pub use read_only::{LOGIN_REQUEST, PRIVATE_CHANNELS, REFRESH_TIMER, ReadOnlyExec};
 pub use reply::{ParadexReplies, ReplyRead};
 pub use rest::{
