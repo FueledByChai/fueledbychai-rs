@@ -1056,8 +1056,10 @@ fn batch_items_i6_admits_are_refused_once_together_they_pass_the_resting_cap() {
     // Ten $2 bids make 20, under I6's 50: the first five fit the resting cap's 11.
     let items: Vec<NewOrder> = (0..10).map(|_| buy(2)).collect();
     let plan = reg.place_batch(items.clone()).unwrap();
+    // Held, so its five bids still count below.
+    let held = plan.command.unwrap();
     assert_eq!(
-        plan.command.unwrap().command(),
+        held.command(),
         &VenueCommand::PlaceBatch(items[..5].to_vec())
     );
     assert_eq!(

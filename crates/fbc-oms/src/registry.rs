@@ -371,6 +371,7 @@ impl Registry {
     /// than one market. An empty batch, or one whose every item is refused, builds nothing.
     /// The batch's command is held as a place's is ([`Registry::place`]).
     pub fn place_batch(&mut self, orders: Vec<NewOrder>) -> Result<PlacePlan, OmsError> {
+        self.reap_dropped();
         if let Some(first) = orders.first()
             && orders.iter().any(|o| o.inst != first.inst)
         {
@@ -678,12 +679,12 @@ impl Registry {
         outcome: &SubmitOutcome,
         now: MonoNs,
     ) -> Result<OutcomeApplied, OmsError> {
+        self.reap_dropped();
         if let Some(named) = item.cid
             && named != cid
         {
             return Err(OmsError::ItemNamesAnother { cid, item: named });
         }
-        self.reap_dropped();
         let rec = self.orders.get_mut(&cid).ok_or(OmsError::UnknownCid(cid))?;
         if op == OrderOp::Place && rec.unissued() {
             match outcome {
@@ -769,6 +770,7 @@ impl Registry {
         mut cmd: PermittedCommand,
         reason: NotSentReason,
     ) -> bool {
+        self.reap_dropped();
         if cmd.origin() != self.instance {
             return false;
         }
