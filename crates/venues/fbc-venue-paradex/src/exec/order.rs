@@ -33,11 +33,24 @@
 //! as the rejection left it (`reject_keeps_original`); PENDING, PROCESSED and any other value
 //! confirm nothing.
 //!
+//! A modify's request_info is news once (decision 0086, FBC-g3bw): Paradex's order carries
+//! `request_info` as one of its fields ("Get order"), so a later update of the same order (a
+//! fill, say) may still carry an earlier modify's. [`ModifyRequests`], kept by the codec across
+//! its frames and connections, holds the `(requestId, requestStatus)` of the MODIFY_ORDER
+//! request_info each order's events last carried; an event repeating it reports nothing of the
+//! modify again and is the order update in the order's own state (Open, not Amended, and no
+//! second asynchronous reject). A new requestId, or a new status of the same one, is news. An
+//! event without MODIFY_ORDER request_info leaves what is held as it is, and a CLOSED order's
+//! entry is dropped once its event is decoded.
+//!
 //! The whole frame is read before anything is pushed, so a refused frame pushes nothing.
+
+use std::collections::HashMap;
 
 use fbc_core::{
     CancelReason, CidMatch, DecodeError, DecodeScope, ExchTsKind, ExecEvent, ExecSink, OpKind,
-    OrderRef, OrderUpdate, Reject, RejectKind, Side, SpecTable, VenueMeta, VenueOrderState,
+    OrderRef, OrderUpdate, Reject, RejectKind, Side, SpecTable, VenueMeta, VenueOrderId,
+    VenueOrderState,
 };
 
 use crate::md::sbe::{Block, Message, NULL_I64};
@@ -55,10 +68,59 @@ const REQUEST_REJECTED: u8 = 3;
 const REQUEST_SUCCESS: u8 = 4;
 const MODIFY_ORDER: u8 = 1;
 
+/// The MODIFY_ORDER request_info each order's events last carried, by venue order id
+/// (decision 0086): what makes a modify's SUCCESS or REJECTED news once, not again on every
+/// later update of the order that still carries it. One per order-entry codec, kept across its
+/// frames and connections; an order's entry goes once an event shows it CLOSED.
+#[derive(Debug, Default)]
+pub struct ModifyRequests {
+    last: HashMap<VenueOrderId, Request>,
+}
+
+/// One MODIFY_ORDER request_info: its `requestId` (`None` when the frame carries none) and its
+/// `requestStatus`.
+#[derive(Clone, Eq, PartialEq, Debug)]
+struct Request {
+    id: Option<Box<str>>,
+    status: u8,
+}
+
+impl ModifyRequests {
+    /// Nothing seen yet.
+    pub fn new() -> ModifyRequests {
+        ModifyRequests::default()
+    }
+
+    /// The number of orders whose MODIFY_ORDER request_info is held.
+    pub fn len(&self) -> usize {
+        self.last.len()
+    }
+
+    /// Whether none is held.
+    pub fn is_empty(&self) -> bool {
+        self.last.is_empty()
+    }
+
+    /// Whether `request` differs from what `vid`'s events last carried, holding it from now on.
+    fn is_news(&mut self, vid: &VenueOrderId, request: Request) -> bool {
+        if self.last.get(vid) == Some(&request) {
+            return false;
+        }
+        self.last.insert(vid.clone(), request);
+        true
+    }
+
+    /// Drops what is held of `vid`, an order now closed.
+    fn forget(&mut self, vid: &VenueOrderId) {
+        self.last.remove(vid);
+    }
+}
+
 /// What a modify's request_info says about the amend, as decision 0054 reads it.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 enum Modify {
-    /// No request_info, or one that confirms nothing (PENDING, PROCESSED, another request).
+    /// No request_info, one that confirms nothing (PENDING, PROCESSED, another request), or
+    /// one an earlier event of the order already carried (decision 0086).
     Nothing,
     /// SUCCESS for MODIFY_ORDER: the amend is final.
     Succeeded,
@@ -67,14 +129,17 @@ enum Modify {
 }
 
 /// Decodes one `OrderEvent` frame into the order update it states, preceded by an
-/// [`ExecEvent::AsyncReject`] of the amend when its request_info reports a modify REJECTED.
-/// Refused, with nothing pushed, when the frame is not an `OrderEvent`, is shorter than its
-/// header or its declared block, states a value outside the schema's or one not modelled, or
-/// names a market missing from `specs`.
+/// [`ExecEvent::AsyncReject`] of the amend when its request_info reports a modify REJECTED that
+/// `seen` does not hold for the order (decision 0086); a decoded frame's MODIFY_ORDER
+/// request_info is held in `seen` from then on. Refused, with nothing pushed and `seen`
+/// unchanged, when the frame is not an `OrderEvent`, is shorter than its header or its declared
+/// block, states a value outside the schema's or one not modelled, or names a market missing
+/// from `specs`.
 pub fn decode_order_event(
     frame: &[u8],
     scope: &DecodeScope<'_>,
     specs: &SpecTable,
+    seen: &mut ModifyRequests,
     sink: &mut dyn ExecSink,
 ) -> Result<(), DecodeError> {
     let msg = Message::parse(frame)?;
@@ -82,7 +147,7 @@ pub fn decode_order_event(
         return Err(DecodeError::Malformed("not an OrderEvent"));
     }
     let block = msg.block();
-    let modify = modify(&msg, &block);
+    let request_status = modify_status(&msg, &block);
     let mut tail = msg.tail();
     let mut var = |what: &'static str| tail.var_str()?.ok_or(DecodeError::Malformed(what));
     let order_id = var("order id")?;
@@ -91,7 +156,7 @@ pub fn decode_order_event(
     let cancel_reason = var("cancel reason")?;
     // At version 2, `requestId` then `requestMessage`, each missing when absent. Read whenever
     // the frame carries them, so a frame whose strings run past it is refused alike.
-    let (_request_id, request_message) = if msg.header().version >= 2 {
+    let (request_id, request_message) = if msg.header().version >= 2 {
         (tail.var_str()?, tail.var_str()?)
     } else {
         (None, None)
@@ -135,12 +200,10 @@ pub fn decode_order_event(
     let cum_filled = qty
         .checked_sub(open)
         .ok_or(DecodeError::Malformed("order size open above its size"))?;
-    let state = match block.u8_at(16) {
-        // A closed order is ended whatever its request says.
-        Some(4) => closed(cancel_reason, open.get() == 0),
+    let is_closed = match block.u8_at(16) {
+        Some(4) => true,
         // NEW and OPEN.
-        Some(1 | 3) if modify == Modify::Succeeded => VenueOrderState::Amended { new_vid: None },
-        Some(1 | 3) => VenueOrderState::Open,
+        Some(1 | 3) => false,
         // UNTRIGGERED (a stop order's) is not modelled (0054).
         _ => return Err(DecodeError::Malformed("order status not modelled")),
     };
@@ -151,6 +214,30 @@ pub fn decode_order_event(
     };
     let cid = (!client_id.is_empty()).then(|| scope.client_order_id(client_id));
     let vid = scope.venue_order_id(order_id)?;
+    // The frame is read whole: only now is what `seen` holds of the order changed.
+    let modify = match request_status {
+        Some(status) => {
+            let request = Request {
+                id: request_id.map(Box::from),
+                status,
+            };
+            if seen.is_news(&vid, request) {
+                modify_of(status)
+            } else {
+                Modify::Nothing
+            }
+        }
+        None => Modify::Nothing,
+    };
+    let state = if is_closed {
+        // A closed order is ended whatever its request says, and nothing of it is kept.
+        seen.forget(&vid);
+        closed(cancel_reason, open.get() == 0)
+    } else if modify == Modify::Succeeded {
+        VenueOrderState::Amended { new_vid: None }
+    } else {
+        VenueOrderState::Open
+    };
     let update = OrderUpdate {
         cid,
         vid: Some(vid.clone()),
@@ -194,14 +281,23 @@ pub(super) fn closed(reason: &str, filled: bool) -> VenueOrderState {
     }
 }
 
-/// What `msg`'s request_info says: read only from a version-2 frame whose root block holds it.
-fn modify(msg: &Message<'_>, block: &Block<'_>) -> Modify {
+/// The `requestStatus` of `msg`'s request_info when its `requestType` is MODIFY_ORDER: read
+/// only from a version-2 frame whose root block holds it.
+fn modify_status(msg: &Message<'_>, block: &Block<'_>) -> Option<u8> {
     if msg.header().version < 2 {
-        return Modify::Nothing;
+        return None;
     }
     match (block.u8_at(REQUEST_STATUS), block.u8_at(REQUEST_TYPE)) {
-        (Some(REQUEST_SUCCESS), Some(MODIFY_ORDER)) => Modify::Succeeded,
-        (Some(REQUEST_REJECTED), Some(MODIFY_ORDER)) => Modify::Rejected,
+        (Some(status), Some(MODIFY_ORDER)) => Some(status),
+        _ => None,
+    }
+}
+
+/// What a MODIFY_ORDER request_info's `status`, when it is news, says about the amend.
+fn modify_of(status: u8) -> Modify {
+    match status {
+        REQUEST_SUCCESS => Modify::Succeeded,
+        REQUEST_REJECTED => Modify::Rejected,
         _ => Modify::Nothing,
     }
 }

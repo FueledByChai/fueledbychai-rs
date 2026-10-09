@@ -376,8 +376,10 @@ rather than guess.
     `interactive_deltas` channels, 0074); the REST `/orderbook` snapshot at depth 15
     (`src/md/rest.rs`); order entry's `ExecCaps` with each value cited and the undocumented ones
     declared conservatively (`src/exec/`, 0054); the private `OrderEvent` at SBE 1:2 decoded
-    into order updates, a modify's SUCCESS an amend and its REJECTED an asynchronous reject
-    (`src/exec/order.rs`, held to the hand-built frames in `fixtures/paradex/exec/`); the REST
+    into order updates, a modify's SUCCESS an amend and its REJECTED an asynchronous reject,
+    each reported once per order and request, a later event repeating it the order update alone
+    (`ModifyRequests`, kept by the codec, 0086) (`src/exec/order.rs`, held to the hand-built
+    frames in `fixtures/paradex/exec/`); the REST
     resync (`GET /orders`, `GET /positions`) and the order query by client id
     (`GET /orders-history`), as requests carrying only the caller's headers and as plans, their
     answers decoded whole into the `Resync*` events and a `QueryResult` (`src/exec/rest.rs`, held
