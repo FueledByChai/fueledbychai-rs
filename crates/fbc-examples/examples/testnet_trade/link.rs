@@ -26,6 +26,15 @@
 //!   such ([`Note::Orphan`]): Stop would not cancel it nor the run count its fills.
 //!   The account's position events are noted as they come, for the driver to compare with
 //!   the position it seeded.
+//! - **Refusals and connection ends.** A venue error naming no request
+//!   ([`ExecEvent::UncorrelatedError`]) that comes before the connection authenticated is a
+//!   refused login ([`Note::LoginRefused`]: the REST login refused or unanswered, or the auth
+//!   frame refused); after it, a problem. Either is kept as the reason its connection ended,
+//!   which [`Note::EpochEnd`] carries; with none, the end names what the session saw: its codec
+//!   closed the connection, or the socket ended and fbc-runtime does not say why (FBC-dmlw).
+//!   A venue error is shown through [`shown`]: Paradex's codec withholds a login refusal's
+//!   echoed words itself, but an auth frame's refusal is the venue's message as received, and
+//!   that frame carries the session token.
 //! - **Notes.** Everything the driver may wait on is appended to [`Link::notes`], in order.
 //!
 //! Times on the shard's monotonic clock are taken from each event's stamp; a submission's send
@@ -40,8 +49,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fbc_core::{
     CidMatch, ClientOrderId, ConnKey, ConnState, Envelope, ExecEvent, InstrumentId, ItemRef,
-    MonoNs, NotSentReason, OrderCaps, RpcId, SignedLots, SubmitHandle, SubmitOutcome, VenueCommand,
-    VenueOrderId, WallNs,
+    MonoNs, NotSentReason, OrderCaps, Reject, RpcId, SignedLots, SubmitHandle, SubmitOutcome,
+    VenueCommand, VenueOrderId, WallNs,
 };
 use fbc_oms::{
     Admission, Authorization, FillLedger, FillRouted, FillTime, LadderConfig, OrderKey, OrderOp,
@@ -93,8 +102,124 @@ pub enum Note {
     ResyncRefused(String),
     /// A refusal from the venue that no outcome carries, or something the glue could not apply.
     Problem(String),
-    /// A connection epoch ended.
-    EpochEnd(ConnKey),
+    /// The login was refused before the connection authenticated (module documentation): the
+    /// venue's error as [`described`] shows it.
+    LoginRefused(String),
+    /// A connection epoch ended, and why, as far as the session reported it.
+    EpochEnd { key: ConnKey, why: String },
+}
+
+/// Why a connection ended when the session reported no venue error with it: its codec
+/// closed it ([`CODEC_CLOSED`]), or nothing the handler is told says ([`ENDED_UNSAID`]: the
+/// codec asks for a reconnect with no event when a login cannot be signed; FBC-dmlw).
+pub const CODEC_CLOSED: &str = "the session closed it to log in again, with no venue error";
+pub const ENDED_UNSAID: &str = concat!(
+    "the socket closed or failed, a write stalled, or the login could not be signed ",
+    "(fbc-runtime does not say which yet, FBC-dmlw)"
+);
+
+/// The longest word of a venue's text [`shown`] shows: a longer one could hold an echoed
+/// credential (a session token, a key, a signature, an account), so it is withheld, as
+/// Paradex's codec withholds a login refusal's words.
+const LONGEST_SHOWN_WORD: usize = 15;
+/// The longest number [`shown`] shows (an HTTP status, a JSON-RPC code).
+const LONGEST_NUMBER: usize = 6;
+/// The most characters of a venue's text [`shown`] shows.
+const MOST_SHOWN: usize = 200;
+/// The longest error code [`described`] shows.
+const LONGEST_CODE: usize = 64;
+
+/// Whether `word` could hold a secret: longer than [`LONGEST_SHOWN_WORD`], holding anything but
+/// printable ASCII, or holding a digit unless it is a short number (an optional '-' and at most
+/// [`LONGEST_NUMBER`] digits), or a run of six or more hex digits. A word of capitals joined by
+/// '_' (an error code's shape, `STARKNET_SIGNATURE_VERIFICATION_FAILED`) is judged part by
+/// part: no key, signature or token is written in capitals alone.
+fn withheld(word: &str) -> bool {
+    let code = word.contains('_')
+        && word.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
+        && !word.split('_').any(str::is_empty);
+    if code {
+        return word.split('_').any(withheld);
+    }
+    let digits = word.strip_prefix('-').unwrap_or(word);
+    let number = !digits.is_empty()
+        && digits.len() <= LONGEST_NUMBER
+        && digits.bytes().all(|b| b.is_ascii_digit());
+    word.len() > LONGEST_SHOWN_WORD
+        || word.bytes().any(|b| !b.is_ascii_graphic())
+        || (word.bytes().any(|b| b.is_ascii_digit()) && !number)
+        || (word.len() >= 6 && word.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// `text` as the run prints a venue's words: each word that could hold a secret ([`withheld`])
+/// replaced by `<withheld>`, control characters and whitespace as spaces, cut at [`MOST_SHOWN`]
+/// characters. Words are split at whitespace and at punctuation that cannot sit inside a
+/// token; a token's '.', '-' and '_' keep it one (long) word.
+pub fn shown(text: &str) -> String {
+    let (mut out, mut word) = (String::new(), String::new());
+    let flush = |word: &mut String, out: &mut String| {
+        if !word.is_empty() {
+            out.push_str(if withheld(word) { "<withheld>" } else { word });
+        }
+        word.clear();
+    };
+    for c in text.chars() {
+        if c.is_whitespace() || c.is_control() {
+            flush(&mut word, &mut out);
+            out.push(' ');
+        } else if matches!(
+            c,
+            ',' | ';'
+                | ':'
+                | '"'
+                | '\''
+                | '`'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '<'
+                | '>'
+                | '='
+                | '|'
+        ) {
+            flush(&mut word, &mut out);
+            out.push(c);
+        } else {
+            word.push(c);
+        }
+    }
+    flush(&mut word, &mut out);
+    match out.char_indices().nth(MOST_SHOWN) {
+        Some((at, _)) => format!("{}...", &out[..at]),
+        None => out,
+    }
+}
+
+/// A venue error as the run prints it: its code (when plain: letters, digits, '_' and '-', no
+/// part withheld; `<withheld>` otherwise) unless its text already names it, then its text,
+/// both through [`shown`].
+pub fn described(reject: &Reject) -> String {
+    let raw = shown(&reject.raw);
+    let Some(code) = reject.venue_code.as_deref() else {
+        return raw;
+    };
+    let plain = code.len() <= LONGEST_CODE
+        && !code.is_empty()
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        && !code.split('_').any(withheld);
+    if !plain {
+        return format!("<withheld>: {raw}");
+    }
+    if raw.contains(code) {
+        raw
+    } else {
+        format!("{code}: {raw}")
+    }
 }
 
 /// One item of a submitted command, as the registry knows it.
@@ -116,6 +241,11 @@ pub struct Link {
     collecting: Option<ResyncSnapshot>,
     /// When the socket was last reported authenticated.
     authenticated_at: Option<MonoNs>,
+    /// The current connection: whether it authenticated, whether the codec closed it, and the
+    /// last venue error naming no request it reported (its end's reason).
+    epoch_authenticated: bool,
+    epoch_closed: bool,
+    epoch_error: Option<String>,
     origin: Instant,
     notes: Vec<Note>,
 }
@@ -133,6 +263,9 @@ impl Link {
             sent: HashMap::new(),
             collecting: None,
             authenticated_at: None,
+            epoch_authenticated: false,
+            epoch_closed: false,
+            epoch_error: None,
             origin: Instant::now(),
             notes: Vec::new(),
         }
@@ -220,6 +353,24 @@ impl Link {
     pub fn cids_of(&self, rpc: RpcId) -> Vec<ClientOrderId> {
         let items = self.sent.get(&rpc).map_or(&[][..], Vec::as_slice);
         items.iter().map(|it| Link::op(*it, rpc).0).collect()
+    }
+
+    /// How many logins were refused in a row since a connection last authenticated, and the
+    /// last refusal: `None` when none was.
+    pub fn login_refusals(&self) -> Option<(usize, &str)> {
+        let since = self
+            .notes
+            .iter()
+            .rposition(|n| matches!(n, Note::Conn(ConnState::Authenticated)))
+            .map_or(0, |at| at + 1);
+        let refused: Vec<&str> = self.notes[since..]
+            .iter()
+            .filter_map(|n| match n {
+                Note::LoginRefused(why) => Some(why.as_str()),
+                _ => None,
+            })
+            .collect();
+        refused.last().map(|last| (refused.len(), *last))
     }
 
     /// Now, on the monotonic clock from the glue's origin and on the wall clock.
@@ -424,8 +575,13 @@ impl Link {
             },
             ExecEvent::ResyncEnd => self.on_resync_end(env.stamp.ingest_seq, env.venue_seq),
             ExecEvent::Conn { state, .. } => {
-                if state == ConnState::Authenticated {
-                    self.authenticated_at = Some(now);
+                match state {
+                    ConnState::Authenticated => {
+                        self.authenticated_at = Some(now);
+                        self.epoch_authenticated = true;
+                    }
+                    ConnState::Closed => self.epoch_closed = true,
+                    _ => {}
                 }
                 self.notes.push(Note::Conn(state));
             }
@@ -439,12 +595,34 @@ impl Link {
                 ));
             }
             ExecEvent::UncorrelatedError(reject) => {
-                self.problem(format!("venue error naming no request: {:?}", reject.kind));
+                let why = described(&reject);
+                self.epoch_error = Some(why.clone());
+                if self.epoch_authenticated {
+                    self.problem(format!(
+                        "venue error naming no request: {:?}, {why}",
+                        reject.kind
+                    ));
+                } else {
+                    self.notes.push(Note::LoginRefused(why));
+                }
             }
             // The account's balances, funding, modes, query answers and fee rates move nothing
             // the registry holds here.
             _ => {}
         }
+    }
+
+    /// Connection epoch `key` ended: noted with why ([`Note::EpochEnd`]), and the next starts
+    /// unauthenticated with nothing said.
+    fn on_epoch_end(&mut self, key: ConnKey) {
+        let why = match (self.epoch_error.take(), self.epoch_closed) {
+            (Some(error), _) => error,
+            (None, true) => CODEC_CLOSED.to_owned(),
+            (None, false) => ENDED_UNSAID.to_owned(),
+        };
+        self.epoch_authenticated = false;
+        self.epoch_closed = false;
+        self.notes.push(Note::EpochEnd { key, why });
     }
 }
 
@@ -485,7 +663,7 @@ impl ExecHandler for LinkHandler {
     }
 
     fn on_epoch_end(&mut self, key: ConnKey) {
-        self.link.borrow_mut().notes.push(Note::EpochEnd(key));
+        self.link.borrow_mut().on_epoch_end(key);
         self.wake.notify_waiters();
     }
 
