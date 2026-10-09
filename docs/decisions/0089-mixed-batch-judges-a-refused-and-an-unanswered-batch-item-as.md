@@ -25,7 +25,8 @@ PR #129; FBC-3pv6), and FBC-6oj runs the suite on Paradex.
   `AtDeadline` the unanswered item has no outcome before the check first moves the clock and is
   `Unknown` once after (0083 unchanged); under `InReply` it is `Unknown` exactly once by the time
   the stub's script has played (the reply read, the clock not yet moved), and nothing more is
-  reported for it once the clock has run on by the longest deadline. Everything else 0083 judges
+  reported for it once the clock has run on by the longest deadline; the refused item, too, has
+  its outcome by then, since the reply answers the batch whole (Codex r4227105351). Everything else 0083 judges
   (the accepted item, no outcome for the whole request, client ids, no venue id on the
   unanswered item, nothing resent) is judged alike under every declaration.
 - The unanswered item stays the batch's last, so a venue answering a batch in one list, in item

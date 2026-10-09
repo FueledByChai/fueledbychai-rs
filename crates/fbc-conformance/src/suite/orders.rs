@@ -28,7 +28,8 @@
 //!   for the whole request. The second is `Rejected` or `Unknown` ([`RefusedItem`]); the third
 //!   is `Unknown` once, with no outcome before the clock moves
 //!   ([`UnansweredItem::AtDeadline`]) or reported with the reply, before the clock moves
-//!   ([`UnansweredItem::InReply`], decision 0069's Paradex).
+//!   ([`UnansweredItem::InReply`], decision 0069's Paradex), where the second has an outcome by
+//!   then too: the reply answers the batch whole.
 //! - `unknown_on_timeout`: a placement the stub never answers is reported `Unknown` once at its
 //!   deadline (nothing before the clock moves), naming no other order and no venue id, and is never written a
 //!   second time, however long the clock then runs.
@@ -551,6 +552,9 @@ pub fn mixed_batch(subject: &Subject<'static>) -> Result<Verdict, Failure> {
         // The clock has not moved since the batch was sent: no deadline has passed, so what the
         // item the stub never answered has by now came with the reply (Reviewer B RB-3il-1).
         let early: Vec<SubmitOutcome> = of(&c.outcomes(rpc), 2).into_iter().cloned().collect();
+        // Whether the refused item has an outcome yet: where the reply answers the batch whole,
+        // it came with the reply (Codex r4227105351).
+        let refused_early = !of(&c.outcomes(rpc), 1).is_empty();
         let every = |c: &Ctx<'_>| {
             let outcomes = c.outcomes(rpc);
             let has = |i| {
@@ -571,7 +575,13 @@ pub fn mixed_batch(subject: &Subject<'static>) -> Result<Verdict, Failure> {
             model,
             declared,
         };
-        Ok(judge_batch(c, rpc, &asked, moved, &early))
+        let mut breaches = judge_batch(c, rpc, &asked, moved, &early);
+        if declared.unanswered == UnansweredItem::InReply && !refused_early {
+            let what = "item 1, which the stub rejected, had no outcome once the reply was read; \
+                        BatchFailures.unanswered is InReply: the reply answers the batch whole";
+            breaches.push(Breach::new("ExecCodec::on_frame", what));
+        }
+        Ok(breaches)
     })?;
     verdict(MIXED_BATCH, breaches, || {
         let refused = match declared.refused {

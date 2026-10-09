@@ -39,31 +39,45 @@ enum Rest {
 
 /// The toy, its codec reading a batch's reply whole: a refused item `Unknown` where
 /// `refused_unknown` (Paradex's per-item error, a message with no code), the items the reply
-/// leaves out as `rest` says.
+/// leaves out as `rest` says. Where `holds_refusal`, a refused item is not reported from the
+/// reply but held for the request's deadline, which never comes for a request its reply
+/// answered (Codex r4227105351).
 struct PerReply {
     refused_unknown: bool,
     rest: Rest,
+    holds_refusal: bool,
 }
 
 /// Decision 0069's Paradex: a refused item `Unknown`, an item left out `Unknown` in the reply.
 static PARADEX_LIKE: PerReply = PerReply {
     refused_unknown: true,
     rest: Rest::UnknownInReply,
+    holds_refusal: false,
 };
 /// A refused item `Unknown`, an item left out `Unknown` at the deadline.
 static UNKNOWN_REFUSAL: PerReply = PerReply {
     refused_unknown: true,
     rest: Rest::AtDeadline,
+    holds_refusal: false,
 };
 /// A refused item `Rejected`, an item left out `Unknown` in the reply.
 static REST_IN_REPLY: PerReply = PerReply {
     refused_unknown: false,
     rest: Rest::UnknownInReply,
+    holds_refusal: false,
+};
+/// As [`PARADEX_LIKE`], but a refused item is held for the deadline, which a request the reply
+/// answered never reaches (Codex r4227105351).
+static HOLDS_THE_REFUSAL: PerReply = PerReply {
+    refused_unknown: true,
+    rest: Rest::UnknownInReply,
+    holds_refusal: true,
 };
 /// As [`PARADEX_LIKE`], but an item the reply leaves out is reported `Accepted`.
 static ACCEPTS_THE_REST: PerReply = PerReply {
     refused_unknown: true,
     rest: Rest::AcceptedInReply,
+    holds_refusal: false,
 };
 
 impl PerReply {
@@ -119,6 +133,7 @@ impl VenueFactory for PerReply {
         creds: Secrets,
     ) -> Option<Result<Box<dyn ExecCodec>, VenueError>> {
         let (refused_unknown, rest) = (self.refused_unknown, self.rest);
+        let holds_refusal = self.holds_refusal;
         let codec = ToyFactory.exec_codec(cfg, creds)?;
         Some(codec.map(|inner| {
             let batches = HashMap::new();
@@ -126,6 +141,7 @@ impl VenueFactory for PerReply {
                 inner,
                 refused_unknown,
                 rest,
+                holds_refusal,
                 batches,
             };
             Box::new(codec) as Box<dyn ExecCodec>
@@ -147,19 +163,22 @@ struct WholeReply {
     inner: Box<dyn ExecCodec>,
     refused_unknown: bool,
     rest: Rest,
+    holds_refusal: bool,
     /// Each batch sent and not yet answered: its item count.
     batches: HashMap<RpcId, usize>,
 }
 
-/// A sink handing `inner` each event as `f` rewrites it.
+/// A sink handing `inner` each event as `f` rewrites it, and none where `f` holds it.
 struct Map<'a> {
     inner: &'a mut dyn ExecSink,
-    f: &'a dyn Fn(ExecEvent) -> ExecEvent,
+    f: &'a dyn Fn(ExecEvent) -> Option<ExecEvent>,
 }
 
 impl ExecSink for Map<'_> {
     fn push(&mut self, meta: VenueMeta, ev: ExecEvent) {
-        self.inner.push(meta, (self.f)(ev));
+        if let Some(ev) = (self.f)(ev) {
+            self.inner.push(meta, ev);
+        }
     }
 }
 
@@ -177,6 +196,11 @@ fn item_outcome(ev: ExecEvent, from: fn(&SubmitOutcome) -> bool, to: SubmitOutco
         },
         other => other,
     }
+}
+
+/// Whether `ev` is an item's outcome `which` holds of.
+fn is_outcome(ev: &ExecEvent, which: fn(&SubmitOutcome) -> bool) -> bool {
+    matches!(ev, ExecEvent::Outcome { item: Some(_), outcome, .. } if which(outcome))
 }
 
 /// The value of `key` in a `kind|key=value|...` record.
@@ -234,19 +258,25 @@ impl ExecCodec for WholeReply {
         };
         let refused_unknown = self.refused_unknown;
         let rest = self.rest;
+        let holds_refusal = self.holds_refusal;
         // The items left out first, which the toy reports `Unknown`, then a refused one.
-        let rewrite = move |ev| {
+        let rewrite = |ev| {
             let unknown = |o: &SubmitOutcome| *o == SubmitOutcome::Unknown;
             let ev = match rest {
                 Rest::AcceptedInReply => item_outcome(ev, unknown, accepted()),
                 _ => ev,
             };
             let refused = |o: &SubmitOutcome| matches!(o, SubmitOutcome::Rejected(_));
-            if refused_unknown {
+            // Held for a deadline the runtime never hands it: the reply's other outcomes
+            // answered the request (fbc-runtime's exec_session `Sink::push`).
+            if holds_refusal && is_outcome(&ev, refused) {
+                return None;
+            }
+            Some(if refused_unknown {
                 item_outcome(ev, refused, SubmitOutcome::Unknown)
             } else {
                 ev
-            }
+            })
         };
         let sink = &mut Map {
             inner: sink,
@@ -285,11 +315,11 @@ impl ExecCodec for WholeReply {
         let refused_unknown = self.refused_unknown;
         let rewrite = move |ev| {
             let refused = |o: &SubmitOutcome| matches!(o, SubmitOutcome::Rejected(_));
-            if refused_unknown {
+            Some(if refused_unknown {
                 item_outcome(ev, refused, SubmitOutcome::Unknown)
             } else {
                 ev
-            }
+            })
         };
         self.batches.remove(&rpc);
         let sink = &mut Map {
@@ -518,6 +548,21 @@ fn mixed_batch_fails_a_paradex_like_toy_reporting_the_item_its_reply_left_out_ac
             &failure,
             "ExecCodec::on_frame",
             "item 2, which the stub's reply left out, was reported [Accepted"
+        ),
+        "{failure}"
+    );
+}
+
+#[test]
+fn mixed_batch_fails_a_paradex_like_toy_holding_the_refused_item_past_the_reply() {
+    // Codex r4227105351: the reply answers the batch whole, so the refused item is reported
+    // with it, before the clock moves; a codec holding it for the deadline fails.
+    let failure = failed(suite::mixed_batch(&HOLDS_THE_REFUSAL.subject(paradex)));
+    assert!(
+        says(
+            &failure,
+            "ExecCodec::on_frame",
+            "item 1, which the stub rejected, had no outcome once the reply was read"
         ),
         "{failure}"
     );
