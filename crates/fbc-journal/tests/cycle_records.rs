@@ -5,7 +5,8 @@
 //! redaction spans (FBC-7lm, decision 0028), and one in format version 4
 //! (`fixtures/journal/v4`), before outbound frames kept the kind they were sent as (FBC-q7b),
 //! and one in format version 5 (`fixtures/journal/v5`), before a write result could be not sent
-//! for a stale authorization (FBC-j5bw, decision 0062).
+//! for a stale authorization (FBC-j5bw, decision 0062), and one in format version 6
+//! (`fixtures/journal/v6`), before a request deadline's firing was a record (FBC-0hfl).
 //!
 //! Every secret here is synthetic, and each is assembled at run time so no credential-shaped
 //! literal sits in the source.
@@ -301,6 +302,33 @@ fn v5_records() -> Vec<(WallNs, Record)> {
     out
 }
 
+/// What `fixtures/journal/v6` holds: the version 5 records with, after the `SignFailed` write
+/// result, a write result not sent for the stale-authorization reason version 6 added, all
+/// written by the version 6 writer (its README says how).
+fn v6_records() -> Vec<(WallNs, Record)> {
+    let mut out = v5_records();
+    let at = 1 + out
+        .iter()
+        .position(|(_, r)| {
+            matches!(
+                r,
+                Record::WriteResult {
+                    result: WriteRes::NotSent(NotSentReason::SignFailed),
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    let stale = Record::WriteResult {
+        at: MonoNs(91),
+        conn: conn(),
+        rpc: Some(RpcId(10)),
+        result: WriteRes::NotSent(NotSentReason::StaleAuthorization),
+    };
+    out.insert(at, (NOON, stale));
+    out
+}
+
 /// A frame written at `at` as `opcode`, with its credential span.
 fn binary_outbound(at: u64, bytes: Vec<u8>, span: std::ops::Range<u32>, opcode: Opcode) -> Record {
     Record::Outbound {
@@ -347,6 +375,13 @@ fn a_journal_written_before_outbound_opcodes_reads_back_with_the_kind_its_bytes_
 #[test]
 fn a_journal_written_before_the_stale_authorization_reason_reads_back_unchanged() {
     reads_back_unchanged("v5", 5, v5_records());
+}
+
+/// FBC-0hfl: a journal written in format version 6, before the request deadline firing's kind,
+/// reads back unchanged, its stale-authorization write result included.
+#[test]
+fn a_journal_written_before_the_rpc_timeout_kind_reads_back_unchanged() {
+    reads_back_unchanged("v6", 6, v6_records());
 }
 
 /// FBC-q7b's done line: a binary frame whose only bytes that are not UTF-8 lie inside its

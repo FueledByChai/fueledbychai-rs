@@ -188,6 +188,8 @@ struct Run {
     offered: Vec<(TrafficClass, Record)>,
     /// The wall time each offered record was filed under.
     filed: Vec<WallNs>,
+    /// Every event the handler heard, with the stamp it carried.
+    stamped: Vec<(fbc_core::Stamp, ExecEvent)>,
     ended: Result<(), ExecSessionError>,
 }
 
@@ -258,7 +260,14 @@ where
     }));
     let heard = Heard::default();
     let keep = Rc::clone(&heard);
-    let handler = move |env: Envelope<ExecEvent>| keep.borrow_mut().push(env.body);
+    let stamped = Rc::new(RefCell::new(Vec::new()));
+    let keep_stamped = Rc::clone(&stamped);
+    let handler = move |env: Envelope<ExecEvent>| {
+        keep_stamped
+            .borrow_mut()
+            .push((env.stamp, env.body.clone()));
+        keep.borrow_mut().push(env.body);
+    };
     let (mut session, control) = ExecSession::new(config, handler).unwrap();
     session.set_journal(Journal::new(tee.clone()));
     let orders = session.orders();
@@ -279,6 +288,7 @@ where
         files,
         offered: tee.offered,
         filed: tee.filed,
+        stamped: stamped.take(),
         ended,
     }
 }
@@ -634,6 +644,7 @@ enum Seen {
     Close,
     Opened(ConnKey),
     Closed(ConnKey),
+    TimedOut(RpcId),
 }
 
 fn seen(record: &Record) -> Seen {
@@ -670,6 +681,7 @@ fn seen(record: &Record) -> Seen {
             ev: ControlEvent::Closed(key),
             ..
         } => Seen::Closed(*key),
+        Record::RpcTimeout { rpc, .. } => Seen::TimedOut(*rpc),
         other => panic!("not expected here: {other:?}"),
     }
 }
@@ -680,7 +692,8 @@ fn stamps(entries: &[Entry]) -> Vec<fbc_core::Stamp> {
         Record::Inbound { stamp, .. }
         | Record::InboundControl { stamp, .. }
         | Record::HttpResult { stamp, .. }
-        | Record::Timer { stamp, .. } => Some(*stamp),
+        | Record::Timer { stamp, .. }
+        | Record::RpcTimeout { stamp, .. } => Some(*stamp),
         _ => None,
     };
     entries.iter().filter_map(stamp).collect()
@@ -1769,4 +1782,154 @@ fn an_epoch_closed_at_a_stop_is_journaled_closed_once_when_redacting_a_waiting_f
     assert_eq!(read.last(), Some(&Seen::Closed(key(0))), "{read:#?}");
     let closed = |s: &&Seen| matches!(s, Seen::Closed(_));
     assert_eq!(read.iter().filter(closed).count(), 1, "{read:#?}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// FBC-0hfl: a request deadline the session fires into `on_rpc_timeout` is a record.
+// ---------------------------------------------------------------------------------------------
+
+/// FBC-0hfl's done line, connected: the `auth_toy` session's arm, unanswered at its deadline,
+/// is handed to the codec's `on_rpc_timeout` in its epoch, and the firing is journaled under
+/// Safety, inside the epoch, naming the arm at the stamp its `Unknown` carried, with no gap in
+/// the session's ingest sequences.
+#[tokio::test]
+async fn a_deadline_fired_while_connected_is_journaled_at_the_stamp_its_unknown_carried() {
+    let run = deadline_fired("exec_journal_deadline_connected", true).await;
+    let read: Vec<Seen> = run.entries.iter().map(|e| seen(&e.record)).collect();
+    let at = |want: Seen| read.iter().position(|s| *s == want).unwrap();
+    let fired = at(Seen::TimedOut(RpcId(1)));
+    assert!(at(Seen::Opened(key(0))) < fired, "{read:#?}");
+    assert!(fired < at(Seen::Closed(key(0))), "{read:#?}");
+    assert_eq!(fired_stamp(&run).conn, key(0));
+}
+
+/// FBC-0hfl's done line, waiting to reconnect: the venue drops the connection before the arm's
+/// deadline, which falls due while the session waits to open the next epoch; the firing is
+/// journaled after the dropped epoch's `Closed`, under the epoch the session waits to open, at
+/// the stamp its `Unknown` carried, with no gap in the session's ingest sequences.
+#[tokio::test]
+async fn a_deadline_fired_while_waiting_to_reconnect_is_journaled_at_the_stamp_its_unknown_carried()
+{
+    let run = deadline_fired("exec_journal_deadline_between", false).await;
+    let read: Vec<Seen> = run.entries.iter().map(|e| seen(&e.record)).collect();
+    let at = |want: Seen| read.iter().position(|s| *s == want).unwrap();
+    let fired = at(Seen::TimedOut(RpcId(1)));
+    assert!(at(Seen::Closed(key(0))) < fired, "{read:#?}");
+    assert!(!read.contains(&Seen::Opened(key(1))), "{read:#?}");
+    assert_eq!(fired_stamp(&run).conn, key(1));
+}
+
+/// FBC-0hfl's done line, the older format: a journal of format version 6, written before a
+/// deadline firing was a record (`fixtures/journal/v6`), still reads, every record of it, with
+/// the reader that reads the firings above.
+#[test]
+fn a_journal_of_the_previous_format_version_still_reads() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/journal/v6");
+    let open = fs::read(root.join("20261003/1-000001.fbcj")).unwrap();
+    assert_eq!(open[..4], fbc_journal::format::MAGIC);
+    assert_eq!(u16::from_le_bytes([open[4], open[5]]), 6);
+    assert!(fbc_journal::format::VERSION > 6);
+    let entries: Vec<Entry> = JournalReader::open(&root, 1)
+        .unwrap()
+        .entries()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(entries.len(), 27);
+    let stale = |e: &Entry| {
+        matches!(
+            e.record,
+            Record::WriteResult {
+                result: WriteRes::NotSent(NotSentReason::StaleAuthorization),
+                ..
+            }
+        )
+    };
+    assert_eq!(entries.iter().filter(|e| stale(e)).count(), 1);
+    let fired = |e: &Entry| matches!(e.record, Record::RpcTimeout { .. });
+    assert!(!entries.iter().any(fired));
+}
+
+/// The one deadline firing `run` journaled, having checked it names the arm at the stamp the
+/// handler's `Unknown` for it carried, was offered under Safety filed under that stamp's wall
+/// time, and that the run's stamped records' ingest sequences run on with no gap and no
+/// `Degraded` marker to explain one.
+fn fired_stamp(run: &Run) -> fbc_core::Stamp {
+    let fired: Vec<(fbc_core::Stamp, RpcId)> = run
+        .entries
+        .iter()
+        .filter_map(|e| match &e.record {
+            Record::RpcTimeout { stamp, rpc } => Some((*stamp, *rpc)),
+            _ => None,
+        })
+        .collect();
+    let [(stamp, rpc)] = fired[..] else {
+        panic!("one deadline firing: {fired:?}")
+    };
+    assert_eq!(rpc, RpcId(1));
+    let unknown = ExecEvent::Outcome {
+        rpc,
+        item: None,
+        outcome: SubmitOutcome::Unknown,
+    };
+    let carried: Vec<_> = run
+        .stamped
+        .iter()
+        .filter(|(_, ev)| *ev == unknown)
+        .collect();
+    assert_eq!(carried.len(), 1, "{:?}", run.stamped);
+    assert_eq!(carried[0].0, stamp);
+    // Under Safety, filed under the stamp's wall time.
+    let timed_out = |r: &Record| matches!(r, Record::RpcTimeout { .. });
+    assert_eq!(run.classes(timed_out), [TrafficClass::Safety]);
+    let offered = run.offered.iter().position(|(_, r)| timed_out(r)).unwrap();
+    assert_eq!(run.filed[offered], stamp.recv_wall);
+    // Every ingest sequence the session gave is journaled, in order, none marked dropped.
+    let marker = |e: &Entry| matches!(e.record, Record::Marker(_));
+    assert!(!run.entries.iter().any(marker));
+    let stamps = stamps(&run.entries);
+    assert!(stamps.len() >= 2, "{stamps:?}");
+    for pair in stamps.windows(2) {
+        assert_eq!(pair[1].ingest_seq, pair[0].ingest_seq + 1, "{stamps:?}");
+    }
+    stamp
+}
+
+/// Runs an `auth_toy` session whose login is answered and whose arm is unanswered at its
+/// deadline: with `connected`, the deadline falls due in the epoch, which the arm's failure
+/// then ends; else the venue drops the connection as the arm arrives and the deadline falls
+/// due while the session waits a minute to reconnect. The control drops once the handler has
+/// heard the arm `Unknown` and the epoch is journaled closed.
+async fn deadline_fired(name: &str, connected: bool) -> Run {
+    let mut server = ScriptedWs::start().await;
+    let mut http = ScriptedHttp::start().await;
+    let venue = Venue::leak(auth_toy);
+    // Long enough that the drop is read before it, while the session waits to reconnect.
+    let timeout = if connected { "300" } else { "1500" };
+    let cfg = [
+        (LOGIN, http.url("/auth")),
+        (CALL_NONCES, "0".to_owned()),
+        (ARM_TIMEOUT_MS, timeout.to_owned()),
+    ];
+    let config = config(venue, &server.url(), &cfg, Counting::new());
+    let run = journaled_seeing(name, config, |_, control, heard, offered| async move {
+        let mut peer = server.accept().await;
+        let login = "auth|token=tokenfirst|refresh=3600";
+        http.request().await.answer("HTTP/1.1 200 OK", login).await;
+        assert_eq!(recv_text(&mut peer).await, "cod|rpc=1");
+        if !connected {
+            peer.drop_conn();
+            until(|| offered.closed(key(0))).await;
+        }
+        let unknown = ExecEvent::Outcome {
+            rpc: RpcId(1),
+            item: None,
+            outcome: SubmitOutcome::Unknown,
+        };
+        until(|| heard.borrow().contains(&unknown)).await;
+        until(|| offered.closed(key(0))).await;
+        drop(control);
+    })
+    .await;
+    run.ended.as_ref().unwrap();
+    run
 }

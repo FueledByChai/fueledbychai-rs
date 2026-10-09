@@ -214,7 +214,7 @@ rather than guess.
     `tests/ui_submit/`) (its tests include the conformance toy by path); with a `Journal` set,
     it journals what it sends and receives as a market-data session does, each epoch's opening
     and closing, each nonce it reserves and each context it gives its codec, what its stream
-    brings under Safety (0078);
+    brings under Safety (0078), and each request deadline it fires at its stamp (0090);
     `tests/common/toy.rs` is the toy market-data venue later runtime tests reuse.
   - `crates/fbc-book` (it depends on `fbc-core` only: one tick-indexed L2 book per
     instrument and `BookId`, built from book events the same live and in replay, with
@@ -290,9 +290,10 @@ rather than guess.
     limit for Normal records and a Safety reserve, drops counted by class, a `Degraded` marker
     once space returns, and a writer thread draining it; the nonce, encode-context and cycle
     records arrived in format version 3, and the keyed hashes of the credential spans a codec
-    names in inbound frames and responses (`redact_inbound`, 0028) in version 4, and the kind
-    each outbound frame was sent as in version 5, whose reader still reads version 2 to 4
-    journals), `crates/fbc-sim` (simulated venue and queue-position
+    names in inbound frames and responses (`redact_inbound`, 0028) in version 4, the kind
+    each outbound frame was sent as and the control frames received in version 5, the
+    stale-authorization reason in version 6, and a request deadline's firing in version 7
+    (0090), whose reader still reads version 2 to 6 journals), `crates/fbc-sim` (simulated venue and queue-position
     fill-model code, never calibrations; it depends on `fbc-core` and `fbc-book` only: so far
     `QueueModel`, each modelled order's place in its level's queue under a `Bracket`
     (Pessimistic, Middle, Optimistic) from a `QueueConfig` with no `Default`, queued on arrival

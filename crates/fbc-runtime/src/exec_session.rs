@@ -52,9 +52,11 @@
 //! control dropped follows the epoch's `Closed`, reaching no codec; spans a codec names that do not
 //! fit their input are counted ([`ExecCounters::refused_redactions`]) and that input is hashed
 //! whole. The time of an encode, `on_open` or the resync is read once its nonces are reserved; a
-//! timer's is its firing's. Nothing waits on the journal: a record the sink has no room for is
-//! dropped and counted there (0006). A request's deadline firing is stamped but not yet journaled
-//! (FBC-0hfl).
+//! timer's is its firing's. Each request deadline the session hands `on_rpc_timeout` is journaled
+//! under Safety as an `RpcTimeout` record at the stamp its events carry, just before the call,
+//! connected or waiting to reconnect, so no ingest sequence the session gives goes unjournaled
+//! (FBC-0hfl, decision 0090). Nothing waits on the journal: a record the sink has no room for is
+//! dropped and counted there (0006).
 //!
 //! **HTTP requests, timers and keepalives (FBC-bnl, decision 0056).** A request the codec asks
 //! for runs beside the session's reads with its own timeout, charged to the buckets, and its
@@ -674,6 +676,7 @@ impl<H: ExecHandler> ExecSession<H> {
                 codec: &mut *self.codec,
                 handler: &mut self.handler,
                 clock: &self.clock,
+                rec: &self.rec,
                 key: self.core.current(),
             };
             let Some(ws) = self.core.connect(&self.url, &mut ctl).await? else {
@@ -1245,12 +1248,14 @@ impl<H: ExecHandler> ExecSession<H> {
     }
 
     /// Hands each request whose deadline fell due unanswered to the codec's `on_rpc_timeout`,
-    /// its events stamped under epoch `key`; once the session has stopped, the sink drops them.
+    /// its events stamped under epoch `key` and the firing journaled at that stamp first
+    /// (decision 0090); once the session has stopped, the sink drops them.
     fn time_out(&mut self, key: ConnKey) {
         for rpc in self.rpcs.take_due(Instant::now()) {
             // An arm unanswered at its deadline fails its epoch, whatever the codec reports.
             self.orders.gate.borrow_mut().timed_out(rpc);
             let stamp = self.core.clock.stamp(key, None);
+            self.rec.timed_out(stamp, rpc);
             let mut sink = Sink {
                 handler: &mut self.handler,
                 epochs: &mut self.core.epochs,
@@ -1284,6 +1289,16 @@ impl Recorder {
                 let class = TrafficClass::Safety;
                 journal.record(class, wall, &Record::Nonce { source, value });
             }
+        }
+    }
+
+    /// The firing of request `rpc`'s deadline, at the stamp the events `on_rpc_timeout` pushes
+    /// for it carry, under Safety, since it settles an order-affecting request to `Unknown`
+    /// (FBC-0hfl, decision 0090): no ingest sequence the session gives goes unjournaled.
+    fn timed_out(&self, stamp: Stamp, rpc: RpcId) {
+        if let Some(journal) = &self.journal {
+            let record = Record::RpcTimeout { stamp, rpc };
+            journal.record(TrafficClass::Safety, stamp.recv_wall, &record);
         }
     }
 
@@ -1425,8 +1440,8 @@ fn carries(
 /// The order-entry session as the core waits to connect: the control's drop, and what still
 /// reaches the handler meanwhile (FBC-0ga). A command submitted is `NotSent(Disconnected)`, and
 /// a request whose deadline falls due is handed to the codec's `on_rpc_timeout`, its events
-/// stamped under `key`, the epoch the session waits to open; once the control has dropped,
-/// neither.
+/// stamped under `key`, the epoch the session waits to open, and the firing journaled at that
+/// stamp first (decision 0090); once the control has dropped, the handler is told neither.
 struct Between<'a, H> {
     stop: watch::Receiver<()>,
     orders: &'a Shared,
@@ -1434,6 +1449,7 @@ struct Between<'a, H> {
     codec: &'a mut dyn ExecCodec,
     handler: &'a mut H,
     clock: &'a IngestClock,
+    rec: &'a Recorder,
     key: ConnKey,
 }
 
@@ -1473,6 +1489,7 @@ impl<H: ExecHandler> Control for Between<'_, H> {
         // Once the control has dropped, the sink hands the handler nothing.
         for rpc in self.rpcs.take_due(Instant::now()) {
             let stamp = self.clock.stamp(self.key, None);
+            self.rec.timed_out(stamp, rpc);
             let mut sink = Late {
                 handler: &mut *self.handler,
                 stop: &self.stop,
