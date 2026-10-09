@@ -595,9 +595,51 @@ fn a_refusal_without_paradexs_error_reports_its_status_and_never_the_body() {
     }
 }
 
+/// Codex r4225701545 (P1) and r4225701546 (P2) on PR #135: a credential the venue echoes is
+/// withheld whatever its length, as every field element the login carries (the account, `0x` and
+/// hex, and the signature's numbers) is written with a digit, and a run of hex digits is withheld
+/// even without one; and the text shown is plain ASCII on one line: every whitespace character,
+/// Unicode line and paragraph separators included, becomes a space, and a word holding any
+/// other character outside printable ASCII (a format control such as a bidi override or a
+/// zero-width space) is withheld.
+#[test]
+fn a_short_echo_is_withheld_and_the_text_shown_is_one_line_of_plain_ascii() {
+    let message = "Account 0x1 and 0x0abc, signature [\"12345\",\"0xf\"], key 7, felt deadbeefcafe \
+                   expired\u{2028}forged line\u{2029}para \u{202e}evil\u{202c} zero\u{200b}width \
+                   caf\u{e9} done";
+    let mut one = codec();
+    open(&mut one);
+    let body = paradex_error("INVALID_SIGNATURE", message);
+    let call = answer(&mut one, refused(401, body.as_bytes()));
+    closed_and_reconnecting(&call);
+    let reject = login_refusal(&call);
+    assert_eq!(
+        &*reject.raw,
+        "the Paradex login was refused: HTTP 401, INVALID_SIGNATURE: Account <withheld> and \
+         <withheld>, signature [\"<withheld>\",\"<withheld>\"], key <withheld>, felt <withheld> \
+         expired forged line para <withheld> <withheld> <withheld> done"
+    );
+    assert!(
+        reject
+            .raw
+            .bytes()
+            .all(|b| b == b' ' || b.is_ascii_graphic()),
+        "{}",
+        reject.raw
+    );
+    // A code holding a digit-only or hex run is not shown.
+    for code in ["0x1", "ABC_0x1f", "DEADBEEF", "E_1234567890123456"] {
+        let mut codec = codec();
+        open(&mut codec);
+        let body = paradex_error(code, "Unauthorized");
+        let reject = login_refusal(&answer(&mut codec, refused(401, body.as_bytes())));
+        assert_eq!(reject.venue_code, None, "{code}");
+    }
+}
+
 /// A refused login never reports the token, the login's signature, the key or the account,
 /// even when the venue's answer echoes them in its code and message, checked by the rehearsal's
-/// secret search: every word of the venue's text long enough to hold one is withheld, the rest
+/// secret search: every word of the venue's text that could hold one is withheld, the rest
 /// shown, control characters become spaces, and the message is cut at a bound.
 #[test]
 fn a_refused_login_reports_no_token_signature_key_or_account_even_when_the_venue_echoes_them() {
@@ -666,10 +708,10 @@ fn a_refused_login_reports_no_token_signature_key_or_account_even_when_the_venue
         assert!(reject.raw.contains("for account"), "{}", reject.raw);
         assert!(!reject.raw.contains('\n'), "{}", reject.raw);
     }
-    // A long message is cut at its bound, on a character boundary.
+    // A long message is cut at its bound.
     let mut codec = codec();
     open(&mut codec);
-    let long = "é word ".repeat(200);
+    let long = "a word ".repeat(200);
     let body = paradex_error("VALIDATION_ERROR", &long);
     let call = answer(&mut codec, refused(400, body.as_bytes()));
     let reject = login_refusal(&call);
