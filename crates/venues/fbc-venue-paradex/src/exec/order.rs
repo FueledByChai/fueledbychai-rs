@@ -36,16 +36,16 @@
 //! A modify's request_info is news once (decision 0086, FBC-g3bw): Paradex's order carries
 //! `request_info` as one of its fields ("Get order"), so a later update of the same order (a
 //! fill, say) may still carry an earlier modify's. [`ModifyRequests`], kept by the codec across
-//! its frames and connections, holds the `(requestId, requestStatus)` of the MODIFY_ORDER
-//! request_info each order's events last carried; an event repeating it reports nothing of the
-//! modify again and is the order update in the order's own state (Open, not Amended, and no
-//! second asynchronous reject). A new requestId, or a new status of the same one, is news. An
-//! event without MODIFY_ORDER request_info leaves what is held as it is, and a CLOSED order's
-//! entry is dropped once its event is decoded.
+//! its frames and connections, holds every `(requestId, requestStatus)` of MODIFY_ORDER
+//! request_info each order's events carried; an event repeating one of them, the latest or an
+//! earlier modify's, reports nothing of the modify again and is the order update in the order's
+//! own state (Open, not Amended, and no second asynchronous reject). A new requestId, or a new
+//! status of one, is news. An event without MODIFY_ORDER request_info leaves what is held as it
+//! is, and a CLOSED order's entries are dropped once its event is decoded.
 //!
 //! The whole frame is read before anything is pushed, so a refused frame pushes nothing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use fbc_core::{
     CancelReason, CidMatch, DecodeError, DecodeScope, ExchTsKind, ExecEvent, ExecSink, OpKind,
@@ -68,18 +68,19 @@ const REQUEST_REJECTED: u8 = 3;
 const REQUEST_SUCCESS: u8 = 4;
 const MODIFY_ORDER: u8 = 1;
 
-/// The MODIFY_ORDER request_info each order's events last carried, by venue order id
-/// (decision 0086): what makes a modify's SUCCESS or REJECTED news once, not again on every
-/// later update of the order that still carries it. One per order-entry codec, kept across its
-/// frames and connections; an order's entry goes once an event shows it CLOSED.
+/// Every MODIFY_ORDER request_info each order's events carried, by venue order id (decision
+/// 0086): what makes a modify's SUCCESS or REJECTED news once, not again on a later update of
+/// the order that still carries it, even after another modify's (Codex r4226495973 on PR #139).
+/// One per order-entry codec, kept across its frames and connections; an order's entries go
+/// once an event shows it CLOSED.
 #[derive(Debug, Default)]
 pub struct ModifyRequests {
-    last: HashMap<VenueOrderId, Request>,
+    seen: HashMap<VenueOrderId, HashSet<Request>>,
 }
 
 /// One MODIFY_ORDER request_info: its `requestId` (`None` when the frame carries none) and its
 /// `requestStatus`.
-#[derive(Clone, Eq, PartialEq, Debug)]
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
 struct Request {
     id: Option<Box<str>>,
     status: u8,
@@ -93,26 +94,26 @@ impl ModifyRequests {
 
     /// The number of orders whose MODIFY_ORDER request_info is held.
     pub fn len(&self) -> usize {
-        self.last.len()
+        self.seen.len()
     }
 
     /// Whether none is held.
     pub fn is_empty(&self) -> bool {
-        self.last.is_empty()
+        self.seen.is_empty()
     }
 
-    /// Whether `request` differs from what `vid`'s events last carried, holding it from now on.
+    /// Whether no earlier event of `vid` carried `request`, holding it from now on.
     fn is_news(&mut self, vid: &VenueOrderId, request: Request) -> bool {
-        if self.last.get(vid) == Some(&request) {
-            return false;
+        if let Some(held) = self.seen.get_mut(vid) {
+            return held.insert(request);
         }
-        self.last.insert(vid.clone(), request);
+        self.seen.insert(vid.clone(), HashSet::from([request]));
         true
     }
 
     /// Drops what is held of `vid`, an order now closed.
     fn forget(&mut self, vid: &VenueOrderId) {
-        self.last.remove(vid);
+        self.seen.remove(vid);
     }
 }
 
