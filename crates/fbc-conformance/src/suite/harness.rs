@@ -1,21 +1,24 @@
 //! What the checks share: the venue's caps and first instrument under the assumed setup,
-//! codecs built fresh from the factory, client ids minted under a lease of the suite's own,
-//! venue ids made in the venue's decode scope, and the commands built from them.
+//! codecs built fresh from the factory and taken through the setup's bootstrap, client ids
+//! minted under a lease of the suite's own, venue ids made in the venue's decode scope, and
+//! the commands built from them.
 
+use std::collections::VecDeque;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fbc_core::{
     AccountKey, AmendOrder, BookId, CancelOrder, CapTag, Channel, CidMint, ClientOrderId,
-    ConnTopology, DecodeScope, Effects, EncodeCtx, EncodeReceipt, EndpointPlan, ExecCodec, Feature,
-    Feed, InstrumentId, Lots, MdCodec, MdTransport, MonoNs, Namespace, NamespaceLease, NewOrder,
-    NonceBlock, NotSentReason, OrderCaps, OrderKind, OrderKindTag, OrderRef, PathStamps,
-    QueryOrder, RefKind, RpcId, Side, SpecTable, StreamId, Subscription, TagSet, Ticks, TifTag,
-    VenueCaps, VenueCommand, VenueOrderId, WallNs, WireUrl, dispatch, dispatch_market_data,
+    ConnTopology, CtxCall, DecodeScope, Effect, Effects, EncodeCtx, EncodeReceipt, EndpointPlan,
+    ExecCodec, ExecEvent, ExecSink, Feature, Feed, HttpResponse, HttpTag, InstrumentId, Lots,
+    MdCodec, MdTransport, MonoNs, Namespace, NamespaceLease, NewOrder, NonceBlock, NotSentReason,
+    OrderCaps, OrderKind, OrderKindTag, OrderRef, PathStamps, QueryOrder, RawFrame, RefKind, RpcId,
+    Side, SpecTable, StreamId, Subscription, TagSet, Ticks, TifTag, VenueCaps, VenueCommand,
+    VenueMeta, VenueOrderId, WallNs, WireUrl, dispatch, dispatch_market_data,
 };
 
-use super::{Failure, Subject};
+use super::{BootReply, Bootstrap, Failure, Subject};
 
 /// The request id every probed command is encoded as.
 pub(crate) const RPC: RpcId = RpcId(1);
@@ -108,17 +111,84 @@ impl<'s> Harness<'s> {
         Failure::one(self.check, capability, what)
     }
 
-    /// A codec built fresh under the setup: `None` when the factory builds none.
+    /// A codec built fresh under the setup and taken through its bootstrap, where it has one
+    /// (FBC-648o): `None` when the factory builds none.
     pub fn codec(&self) -> Result<Option<Box<dyn ExecCodec>>, Failure> {
         let setup = self.subject.setup();
         match self.subject.factory().exec_codec(&setup.cfg, setup.creds) {
             None => Ok(None),
-            Some(Ok(codec)) => Ok(Some(codec)),
+            Some(Ok(mut codec)) => {
+                if let Some(boot) = &setup.bootstrap {
+                    self.bootstrap(codec.as_mut(), boot)?;
+                }
+                Ok(Some(codec))
+            }
             Some(Err(e)) => Err(self.fail(
                 "VenueFactory::exec_codec",
                 format!("refused the setup: {e}"),
             )),
         }
+    }
+
+    /// `codec` opened on the order-entry stream at the fixed encode time and handed each of
+    /// `boot`'s replies in turn, in the decode scope the core lends for the venue's caps: a
+    /// frame on that stream, an HTTP response answering the earliest request the codec asked
+    /// for that no reply has answered yet. What it pushes and asks for otherwise is dropped. A
+    /// reply it refuses, or a response with no request to answer, breaks `Setup.bootstrap`,
+    /// named by its position and kind, never its bytes (it may echo a credential).
+    fn bootstrap(&self, codec: &mut dyn ExecCodec, boot: &Bootstrap) -> Result<(), Failure> {
+        let stream = self.exec_stream;
+        let ctx = self.ctx(codec.nonces_for(CtxCall::Open(stream)));
+        let mut fx = Effects::new();
+        codec.on_open(stream, &ctx, &mut fx);
+        let mut asked: VecDeque<HttpTag> = VecDeque::new();
+        asked.extend(http_tags(&mut fx));
+        let specs = &self.specs;
+        self.decode_scope(|scope| {
+            for (i, reply) in boot.replies.iter().enumerate() {
+                let (mut sink, mut fx) = (Dropped, Effects::new());
+                let result = match reply {
+                    BootReply::Text(text) => {
+                        let frame = RawFrame::Text(text);
+                        codec.on_frame(stream, frame, scope, specs, &mut sink, &mut fx)
+                    }
+                    BootReply::Binary(bytes) => {
+                        let frame = RawFrame::Binary(bytes);
+                        codec.on_frame(stream, frame, scope, specs, &mut sink, &mut fx)
+                    }
+                    BootReply::Http {
+                        status,
+                        headers,
+                        body,
+                    } => {
+                        let Some(tag) = asked.pop_front() else {
+                            let what = format!(
+                                "reply {i} is an HTTP response, but the codec has asked for no \
+                                 HTTP request it is still waiting on"
+                            );
+                            return Err(self.fail("Setup.bootstrap", what));
+                        };
+                        let headers: Vec<(&str, &str)> = headers
+                            .iter()
+                            .map(|(k, v)| (k.as_str(), v.as_str()))
+                            .collect();
+                        let resp = HttpResponse {
+                            status: *status,
+                            headers: &headers,
+                            body,
+                        };
+                        codec.on_http(tag, Ok(resp), scope, specs, &mut sink, &mut fx)
+                    }
+                };
+                if let Err(e) = result {
+                    let kind = reply.kind();
+                    let what = format!("reply {i} ({kind}) refused by the codec: {e}");
+                    return Err(self.fail("Setup.bootstrap", what));
+                }
+                asked.extend(http_tags(&mut fx));
+            }
+            Ok(())
+        })
     }
 
     /// A codec built fresh, for a venue whose caps declare order entry.
@@ -231,6 +301,24 @@ impl<'s> Harness<'s> {
         })
         .expect("a short non-empty venue id")
     }
+}
+
+/// A sink dropping what a bootstrap reply pushes: only the state the codec reaches matters.
+struct Dropped;
+
+impl ExecSink for Dropped {
+    fn push(&mut self, _meta: VenueMeta, _ev: ExecEvent) {}
+}
+
+/// The tags of the HTTP requests `fx` asks for, in order.
+fn http_tags(fx: &mut Effects) -> Vec<HttpTag> {
+    fx.take()
+        .into_iter()
+        .filter_map(|effect| match effect {
+            Effect::Http { tag, .. } => Some(tag),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The parts of an order a venue's caps refuse or allow: its kind, time in force, channel and

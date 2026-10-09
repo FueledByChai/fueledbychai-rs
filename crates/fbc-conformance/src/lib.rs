@@ -48,7 +48,11 @@
 //!   session against the stub, answering as the setup's [`suite::OrderEntryStub`] states, on a
 //!   paused clock the check moves, every order command authorized by fbc-oms; a toy variant
 //!   that reports every item of a timed-out batch `Accepted` fails `mixed_batch`
-//!   (`tests/suite_orders.rs`).
+//!   (`tests/suite_orders.rs`). A [`suite::Bootstrap`] in the setup takes every order-entry
+//!   codec the suite builds to its authenticated state before a check uses it (FBC-648o): a toy
+//!   variant refusing `NotSent(Disconnected)` until authenticated passes `caps_truthful`,
+//!   `commands_selfcontained` and `signing_golden` with one and fails each without
+//!   (`tests/suite_bootstrap.rs`).
 //!
 //! Not here yet: the suite's other checks, and the rest of the conformance toy venue.
 

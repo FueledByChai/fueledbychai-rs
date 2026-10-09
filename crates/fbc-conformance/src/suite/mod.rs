@@ -62,6 +62,23 @@
 //! [`OrderEntryStub`] says. [`reject_coverage`] does too, refusing a placement under each code
 //! its table lists.
 //!
+//! # A codec built fresh, and the bootstrap
+//!
+//! Wherever a check builds an order-entry codec from the factory ("a freshly built codec" in
+//! the checks' documentation), the suite first takes it through the setup's [`Bootstrap`], when
+//! it has one (FBC-648o): a venue whose codec refuses every command until its session has
+//! authenticated on the connection (Paradex's answers `NotSent(Disconnected)` until then)
+//! states there the replies that bring it to its authenticated state. The codec is opened on
+//! [`Setup::exec_stream`] at the suite's fixed encode time, then handed each reply in order: a
+//! frame to [`on_frame`](fbc_core::ExecCodec::on_frame) on that stream, an HTTP response to
+//! [`on_http`](fbc_core::ExecCodec::on_http) as the answer to the earliest HTTP request the
+//! codec asked for and no reply has answered yet, each in the decode scope the core lends for
+//! the venue's caps. What the codec pushes and asks for meanwhile is dropped: only the state
+//! it reaches matters. A reply the codec refuses, or an HTTP response with no request to
+//! answer, fails the check naming `Setup.bootstrap` and the reply's position, never its bytes.
+//! An authenticated session holds no order state, so a bootstrapped codec has still seen
+//! nothing of any order. Without a bootstrap the codec is used as built, never opened.
+//!
 //! # The order-entry checks
 //!
 //! The suite knows no venue's protocol, so a venue that declares order entry states, in
@@ -83,7 +100,8 @@
 //!   declared flag conflict `NotSent(FlagConflict)`, and an instrument cancel-all is never
 //!   widened to the account (decision 0003).
 //! - [`commands_selfcontained`]: every amend, cancel and query encodes from the command and
-//!   the spec table alone, with a freshly built codec (decisions 0005, 0014 item 5).
+//!   the spec table alone, with a freshly built codec (decisions 0005, 0014 item 5), taken
+//!   through the setup's [`Bootstrap`] where it has one.
 //! - [`signing_golden`]: every [`Golden`] command, encoded with its own [`EncodeCtx`] by a
 //!   freshly built codec, gives exactly the committed golden bytes, signatures included.
 //! - [`legacy_symbols`]: every Java-era ticker in the fixtures parses through the factory's
@@ -201,6 +219,64 @@ pub struct Setup {
     /// [`two_phase_ack`], [`reject_coverage`]); `None` for a venue that declares no order entry
     /// (those checks then fail a venue that declares one).
     pub order_entry: Option<OrderEntryStub>,
+    /// What brings each order-entry codec the suite builds to the state its encoding checks
+    /// assume, its session authenticated; `None` for a venue whose codec encodes as built
+    /// (the module documentation says how it is applied).
+    pub bootstrap: Option<Bootstrap>,
+}
+
+/// The venue's recorded replies that take a freshly built order-entry codec, opened on
+/// [`Setup::exec_stream`], to its authenticated state, in the order the venue sends them
+/// (the module documentation says how the suite applies it). Typed Rust values, as the
+/// [`Golden`] commands are; they may echo a credential, so it is synthetic (decision 0009) and
+/// never shown.
+#[derive(Clone, Default)]
+pub struct Bootstrap {
+    /// The replies, each handed to the codec in turn.
+    pub replies: Vec<BootReply>,
+}
+
+/// One reply a [`Bootstrap`] hands the codec.
+#[derive(Clone)]
+pub enum BootReply {
+    /// A text frame on the order-entry stream.
+    Text(String),
+    /// A binary frame on the order-entry stream.
+    Binary(Vec<u8>),
+    /// The response to the earliest HTTP request the codec asked for that no reply has
+    /// answered yet (a login).
+    Http {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    },
+}
+
+impl BootReply {
+    /// What the reply is, never its bytes: `text frame`, `binary frame` or `HTTP response`.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            BootReply::Text(_) => "text frame",
+            BootReply::Binary(_) => "binary frame",
+            BootReply::Http { .. } => "HTTP response",
+        }
+    }
+}
+
+impl fmt::Debug for BootReply {
+    /// The kind only: a reply may echo a credential.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.kind())
+    }
+}
+
+impl fmt::Debug for Bootstrap {
+    /// The replies by kind only: a reply may echo a credential.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Bootstrap")
+            .field("replies", &self.replies)
+            .finish()
+    }
 }
 
 /// A command whose encoding is committed as golden bytes: [`signing_golden`] encodes it as
