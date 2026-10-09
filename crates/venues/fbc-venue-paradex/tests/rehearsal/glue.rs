@@ -328,8 +328,15 @@ impl Glue {
                     reject.kind
                 ));
             }
+            // Shown as a consumer shows it: its kind, the venue's code and the codec's text
+            // (a refused login's status, code and message, FBC-3f8z).
             ExecEvent::UncorrelatedError(reject) => {
-                self.problem(format!("venue error naming no request: {:?}", reject.kind));
+                self.problem(format!(
+                    "venue error naming no request: {:?} {}: {}",
+                    reject.kind,
+                    reject.venue_code.as_deref().unwrap_or("no code"),
+                    reject.raw
+                ));
             }
             // What the account holds: the registry reads none of it.
             ExecEvent::Position { .. }

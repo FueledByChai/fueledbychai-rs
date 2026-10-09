@@ -20,13 +20,13 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use common::Vectors;
+use common::{Vectors, secrets};
 use fbc_core::{
     AmendOrder, CancelOrder, CancelScope, Channel, CidMint, ClientOrderId, ConfigError, ConnState,
     CtxCall, DecodeError, Effect, Effects, EncodeCtx, ExecCodec, ExecEvent, ExecSink, HttpFailure,
     HttpMethod, HttpResponse, HttpTag, Inbound, InboundSpans, Lots, MonoNs, NamespaceLease,
     NewOrder, NonceBlock, NotSentReason, OpKind, OrderKind, OrderRef, PathStamps, QueryOrder,
-    RateCharge, RawFrame, RejectKind, RpcId, Secret, Secrets, Side, SpecTable, StreamId,
+    RateCharge, RawFrame, Reject, RejectKind, RpcId, Secret, Secrets, Side, SpecTable, StreamId,
     SubmitOutcome, Ticks, Tif, TimerTag, TrafficClass, VenueCommand, VenueConfig, VenueError,
     VenueMeta, WallNs, WireSlice, dispatch,
 };
@@ -432,12 +432,251 @@ fn a_login_that_gives_no_token_reports_closed_and_asks_for_a_reconnect() {
         open(&mut codec);
         let call = answer(&mut codec, resp);
         closed_and_reconnecting(&call);
-        assert_eq!(call.events.len(), 1, "no venue code to report");
+        // Why no token came is reported first (FBC-3f8z), then the stream closed.
+        login_refusal(&call);
+        assert_eq!(call.events.len(), 2, "{:?}", call.events);
         // The next connection logs in first.
         let fx = open(&mut codec);
         assert_eq!(logins(&fx), 1);
         assert!(sends(&fx).is_empty());
     }
+}
+
+/// The refusal a login that gave no token reports before the stream's `Closed` (FBC-3f8z): an
+/// uncorrelated error of kind `Other`, its text the codec's own sentence.
+fn login_refusal(call: &Call) -> Reject {
+    let [ExecEvent::UncorrelatedError(reject), ExecEvent::Conn { .. }] = call.events.as_slice()
+    else {
+        panic!("{:?}", call.events)
+    };
+    assert_eq!(reject.kind, RejectKind::Other);
+    assert!(
+        reject.raw.starts_with("the Paradex login "),
+        "{}",
+        reject.raw
+    );
+    reject.clone()
+}
+
+/// A login refused with an HTTP status and Paradex's error body.
+fn refused(status: u16, body: &[u8]) -> Result<HttpResponse<'_>, HttpFailure> {
+    Ok(HttpResponse {
+        status,
+        headers: &[],
+        body,
+    })
+}
+
+/// Paradex's REST error body (docs.paradex.trade "Errors": `error`, `message`, `data`).
+fn paradex_error(code: &str, message: &str) -> String {
+    serde_json::json!({ "error": code, "message": message, "data": null }).to_string()
+}
+
+/// The owner's first testnet run (FBC-3f8z): the login was refused and nothing said why. A
+/// refusal with Paradex's error body is reported with its HTTP status, Paradex's code (also as
+/// the reject's `venue_code`) and its message, before the stream closes and asks for a
+/// reconnect; the next connection logs in again.
+#[test]
+fn a_refused_login_reports_its_http_status_and_paradexs_error_code_and_message() {
+    let cases = [
+        (
+            401,
+            "INVALID_STARKNET_SIGNATURE",
+            "Invalid Starknet signature",
+        ),
+        (
+            400,
+            "NOT_ONBOARDED",
+            "User has never called /onboarding endpoint",
+        ),
+        (403, "ACCOUNT_NOT_FOUND", "Account not found"),
+        (429, "RATE_LIMIT_EXCEEDED", "Too many requests"),
+    ];
+    for (status, code, message) in cases {
+        let mut codec = codec();
+        open(&mut codec);
+        let body = paradex_error(code, message);
+        let call = answer(&mut codec, refused(status, body.as_bytes()));
+        closed_and_reconnecting(&call);
+        let reject = login_refusal(&call);
+        assert_eq!(reject.venue_code.as_deref(), Some(code));
+        assert_eq!(
+            &*reject.raw,
+            format!("the Paradex login was refused: HTTP {status}, {code}: {message}")
+        );
+        // Connection close and the paced reconnect are as before: one reconnect, and the next
+        // connection logs in first.
+        let fx = open(&mut codec);
+        assert_eq!(logins(&fx), 1);
+        assert!(sends(&fx).is_empty());
+    }
+}
+
+/// A login that got no response names how it failed; no status or venue code exists to name.
+#[test]
+fn a_login_with_no_response_reports_how_the_transport_failed() {
+    let cases = [
+        (HttpFailure::NotSent, "the request was never sent"),
+        (HttpFailure::TimedOut, "no answer came within the timeout"),
+        (
+            HttpFailure::Lost,
+            "the connection failed after the request was sent",
+        ),
+    ];
+    for (failure, why) in cases {
+        let mut codec = codec();
+        open(&mut codec);
+        let call = answer(&mut codec, Err(failure));
+        closed_and_reconnecting(&call);
+        let reject = login_refusal(&call);
+        assert_eq!(reject.venue_code, None);
+        assert_eq!(
+            &*reject.raw,
+            format!("the Paradex login got no response: {why}")
+        );
+        assert_eq!(logins(&open(&mut codec)), 1);
+    }
+}
+
+/// A refusal whose body is not Paradex's error (a proxy's page, an empty body, an error with no
+/// readable member) is reported with its status alone, never the body; an answer of 2xx with no
+/// token names its status and the part that did not read. A code that is not a plain
+/// identifier is not shown, its message still is.
+#[test]
+fn a_refusal_without_paradexs_error_reports_its_status_and_never_the_body() {
+    let page = b"<html><body>403 Forbidden by a made-up proxy</body></html>";
+    let cases: [(u16, &[u8], Option<&str>, &str); 6] = [
+        (
+            403,
+            page,
+            None,
+            "the Paradex login was refused: HTTP 403, with no Paradex error in the answer",
+        ),
+        (
+            502,
+            b"",
+            None,
+            "the Paradex login was refused: HTTP 502, with no Paradex error in the answer",
+        ),
+        (
+            401,
+            br#"{"error":{"nested":true},"message":42}"#,
+            None,
+            "the Paradex login was refused: HTTP 401, with no Paradex error in the answer",
+        ),
+        (
+            401,
+            br#"{"error":"NOT AN IDENTIFIER","message":"Unauthorized"}"#,
+            None,
+            "the Paradex login was refused: HTTP 401, no error code: Unauthorized",
+        ),
+        (
+            400,
+            br#"{"error":"VALIDATION_ERROR"}"#,
+            Some("VALIDATION_ERROR"),
+            "the Paradex login was refused: HTTP 400, VALIDATION_ERROR: no message",
+        ),
+        (
+            200,
+            br#"{"no_token": "here"}"#,
+            None,
+            "the Paradex login answer held no token: HTTP 200, malformed frame: jwt_token",
+        ),
+    ];
+    for (status, body, code, text) in cases {
+        let mut codec = codec();
+        open(&mut codec);
+        let call = answer(&mut codec, refused(status, body));
+        closed_and_reconnecting(&call);
+        let reject = login_refusal(&call);
+        assert_eq!(reject.venue_code.as_deref(), code);
+        assert_eq!(&*reject.raw, text);
+        assert!(!reject.raw.contains("proxy"), "the body is never shown");
+    }
+}
+
+/// A refused login never reports the token, the login's signature, the key or the account,
+/// even when the venue's answer echoes them in its code and message, checked by the rehearsal's
+/// secret search: every word of the venue's text long enough to hold one is withheld, the rest
+/// shown, control characters become spaces, and the message is cut at a bound.
+#[test]
+fn a_refused_login_reports_no_token_signature_key_or_account_even_when_the_venue_echoes_them() {
+    let (account, key) = secrets::synthetic();
+    let fx = open(&mut codec());
+    let signature = fx
+        .iter()
+        .find_map(|e| match e {
+            Effect::Http { req, .. } => req
+                .headers
+                .iter()
+                .find(|h| h.name == "PARADEX-STARKNET-SIGNATURE")
+                .map(|h| h.value.clone()),
+            _ => None,
+        })
+        .expect("the login carries its signature");
+    let numbers = secrets::signature_numbers(&signature);
+    assert!(!numbers.is_empty());
+    let felt = |hex: &str| fbc_venue_paradex::sign::Felt::from_hex(hex).unwrap();
+    let message = format!(
+        "Invalid signature {signature} for account {account} (0x{:x}, {}) key={key}\n\
+         token:{TOKEN} [{}] {OTHER_TOKEN}",
+        felt(&account),
+        felt(&key),
+        numbers.join(",")
+    );
+    let codes = [
+        account.clone(),
+        key.clone(),
+        TOKEN.to_owned(),
+        numbers[0].clone(),
+    ];
+    for code in codes {
+        let mut codec = codec();
+        open(&mut codec);
+        let body = paradex_error(&code, &message);
+        let call = answer(&mut codec, refused(401, body.as_bytes()));
+        closed_and_reconnecting(&call);
+        let reject = login_refusal(&call);
+        assert_eq!(
+            reject.venue_code, None,
+            "a code holding a secret is not shown"
+        );
+        let shown = format!(
+            "{} {} {:?} {:?}",
+            reject.venue_code.as_deref().unwrap_or(""),
+            reject.raw,
+            call.events,
+            call.fx
+        );
+        secrets::secrets_absent(
+            &shown,
+            TOKEN,
+            std::slice::from_ref(&signature),
+            "the login refusal",
+        );
+        secrets::secrets_absent(&shown, OTHER_TOKEN, &[], "the login refusal");
+        assert!(
+            reject.raw.starts_with(
+                "the Paradex login was refused: HTTP 401, no error code: Invalid signature "
+            ),
+            "{}",
+            reject.raw
+        );
+        assert!(reject.raw.contains("<withheld>"), "{}", reject.raw);
+        assert!(reject.raw.contains("for account"), "{}", reject.raw);
+        assert!(!reject.raw.contains('\n'), "{}", reject.raw);
+    }
+    // A long message is cut at its bound, on a character boundary.
+    let mut codec = codec();
+    open(&mut codec);
+    let long = "é word ".repeat(200);
+    let body = paradex_error("VALIDATION_ERROR", &long);
+    let call = answer(&mut codec, refused(400, body.as_bytes()));
+    let reject = login_refusal(&call);
+    let prefix = "the Paradex login was refused: HTTP 400, VALIDATION_ERROR: ";
+    let shown = reject.raw.strip_prefix(prefix).expect("the prefix");
+    assert!(shown.ends_with("..."), "{shown}");
+    assert!(shown.chars().count() <= 203, "{}", shown.chars().count());
 }
 
 #[test]
