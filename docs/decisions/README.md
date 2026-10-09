@@ -93,3 +93,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0088](0088-the-unprotected-order-gate-keeps-venue-id-evidence-by-market.md) The unprotected-order gate keeps venue-id evidence by market, after a resync only for markets an order is held on, augmenting 0080 — accepted
 - [0089](0089-mixed-batch-judges-a-refused-and-an-unanswered-batch-item-as.md) mixed_batch judges a refused and an unanswered batch item as the setup declares its venue reports them, augmenting 0083 — accepted
 - [0090](0090-an-order-entry-session-journals-each-request-deadline-it-fir.md) An order-entry session journals each request deadline it fires at the stamp its events carry, in format version 7, augmenting 0041, 0057 and 0078 — accepted
+- [0091](0091-a-paradex-order-s-modify-outcomes-are-held-in-a-window-of-it.md) A Paradex order's modify outcomes are held in a window of its latest 32, a PENDING not at all, augmenting 0086 — accepted
