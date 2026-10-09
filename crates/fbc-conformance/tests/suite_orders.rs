@@ -146,6 +146,14 @@ enum Twist {
     /// A placement's acceptance is provisional, then final, then refused by the venue's risk
     /// check.
     FinalAndRiskReject,
+    /// A placement's acceptance is preceded by the venue's risk check refusing it, then reported
+    /// provisional (Codex r4225971611).
+    RiskRejectFirst,
+    /// Every refusal's item names a stranger's client id (Codex r4225971615).
+    StrangerOnReject,
+    /// A placement's acceptance is followed by a stray resync end, and every resync frame on a
+    /// later connection is ignored (Codex r4225971621).
+    StrayResyncEnd,
 }
 
 /// The toy with its caps edited by `caps` and its codec twisted by `twist`.
@@ -522,6 +530,18 @@ static TWO_PHASE_RISK_REJECT: Variant = Variant {
 static TWO_PHASE_BOTH: Variant = Variant {
     caps: two_phase,
     twist: Twist::FinalAndRiskReject,
+};
+static TWO_PHASE_REJECT_FIRST: Variant = Variant {
+    caps: two_phase,
+    twist: Twist::RiskRejectFirst,
+};
+static STRANGER_ON_REJECT: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::StrangerOnReject,
+};
+static STRAY_RESYNC_END: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::StrayResyncEnd,
 };
 static TWO_PHASE_DANGLING: Variant = Variant {
     caps: two_phase,
@@ -1286,6 +1306,39 @@ fn final_and_risk_reject(ev: ExecEvent) -> Vec<ExecEvent> {
     out
 }
 
+/// A placement's acceptance, naming its venue id, preceded by the venue's risk check refusing
+/// it, and reported provisional.
+fn risk_reject_first(ev: ExecEvent) -> Vec<ExecEvent> {
+    let mut out = provisional_then_risk_reject(ev);
+    out.reverse();
+    out
+}
+
+/// Every refusal's item naming a stranger's client id.
+fn stranger_on_reject(ev: ExecEvent) -> Vec<ExecEvent> {
+    vec![match ev {
+        ExecEvent::Outcome {
+            rpc,
+            item: Some(item),
+            outcome: outcome @ SubmitOutcome::Rejected(_),
+        } => {
+            let cid = Some(stranger());
+            let item = Some(ItemRef { cid, ..item });
+            ExecEvent::Outcome { rpc, item, outcome }
+        }
+        other => other,
+    }]
+}
+
+/// A placement's acceptance, naming its venue id, followed by a stray resync end.
+fn stray_resync_end(ev: ExecEvent) -> Vec<ExecEvent> {
+    if acceptance(&ev, true) {
+        vec![ev, ExecEvent::ResyncEnd]
+    } else {
+        vec![ev]
+    }
+}
+
 /// The frame a stub sends, after its answer, for [`Twist::EagerTimeout`].
 const EARLY: &str = "early";
 
@@ -1410,10 +1463,17 @@ impl ExecCodec for Twisted {
             Twist::ProvisionalThenFinal => provisional_then_final,
             Twist::ProvisionalThenRiskReject => provisional_then_risk_reject,
             Twist::FinalAndRiskReject => final_and_risk_reject,
+            Twist::RiskRejectFirst => risk_reject_first,
+            Twist::StrangerOnReject => stranger_on_reject,
+            Twist::StrayResyncEnd => stray_resync_end,
             _ => kept,
         };
         // The toy's resync ends with this frame.
         let resync_ended = f.bytes() == b"rsend";
+        let resync_frame = f.bytes().starts_with(b"rs");
+        if self.twist == Twist::StrayResyncEnd && self.opens > 1 && resync_frame {
+            return Ok(());
+        }
         let sink = &mut Rewrite { inner: sink, f: f_ };
         let decoded = self.inner.on_frame(stream, f, scope, specs, sink, fx);
         if self.twist == Twist::ReplacesAfterResync
@@ -2697,5 +2757,48 @@ fn reject_coverage_fails_a_table_that_is_missing_lists_no_code_or_names_no_kind(
     assert!(
         says(&kindless, file, "the line \"1002\" names no kind"),
         "{kindless}"
+    );
+}
+
+#[test]
+fn two_phase_ack_fails_a_two_phase_toy_whose_risk_reject_comes_before_its_provisional_acceptance() {
+    let failure = failed(suite::two_phase_ack(
+        &TWO_PHASE_REJECT_FIRST.subject(assumed),
+    ));
+    assert!(
+        says(
+            &failure,
+            "AckModel is TwoPhase { risk_reject_window: 1s }",
+            "followed by neither a final acceptance nor an asynchronous reject"
+        ),
+        "{failure}"
+    );
+}
+
+#[test]
+fn reject_coverage_fails_a_toy_whose_refusals_name_a_strangers_client_id() {
+    let failure = failed(suite::reject_coverage(&STRANGER_ON_REJECT.subject(assumed)));
+    assert!(
+        says(
+            &failure,
+            "reject_coverage/table.txt: 1001",
+            "not the placement's one item"
+        ),
+        "{failure}"
+    );
+}
+
+#[test]
+fn resync_after_reconnect_takes_no_resync_end_of_the_first_connection_for_the_reconnects() {
+    let failure = failed(suite::resync_after_reconnect(
+        &STRAY_RESYNC_END.subject(assumed),
+    ));
+    assert!(
+        says(
+            &failure,
+            "ExecCodec::resync",
+            "no resync ended once the stub closed the connection"
+        ),
+        "{failure}"
     );
 }

@@ -27,8 +27,9 @@ outcome, 0069), and how the fixture states a kind with a payload.
   cancel-on-disconnect cancelled what rested on the closed connection.
 - **`resync_after_reconnect`** places one order the stub accepts, then the stub closes the
   connection and answers the next one's opening. It fails where the placement is not accepted
-  once as `OrderCaps.ack` has it, where no resync ends (`ExecEvent::ResyncEnd`) after the first
-  connection's (which the session hands over before that epoch places, 0058), where the stub's script does not play to its end, and where
+  once as `OrderCaps.ack` has it, where no resync ends (`ExecEvent::ResyncEnd`) on a later
+  connection epoch than the placement's answer came on (the epoch the runtime stamps on each
+  event's envelope, so a stray resync end on the first connection does not count), where the stub's script does not play to its end, and where
   the order is written more than once over both connections, counted as 0083 counts a request
   written again.
 - **A final acceptance is `SubmitOutcome::Accepted` at `AckLevel::Final` for the placement's
@@ -39,14 +40,16 @@ outcome, 0069), and how the fixture states a kind with a payload.
   any request (the arm's included) is provisional, and the placement is accepted once, final. On
   `TwoPhase` the placement is accepted once as the model has it; where provisionally, the check
   moves the clock no further than `risk_reject_window` once the stub has answered, and by then
-  the final acceptance or the asynchronous reject has come, not both. A venue accepting final at once
+  the final acceptance or the asynchronous reject has come after the provisional acceptance,
+  not both. A venue accepting final at once
   waits for nothing, and the check says so.
 - **The reject table is a fixture file**, `<fixtures>/reject_coverage/table.txt`: a code, then
   the kind as `RejectKind`'s `Debug` spells it, so a kind with a payload
   (`RateLimited { retry_after: None }`, `AlreadyTerminal(Unspecified)`) needs no parser.
   `reject_coverage` places one order per code, in the table's order, the stub refusing each under
   its code (`Answer::RejectCode`, so `Answer` is `Clone`, no longer `Copy`). Each placement's
-  outcome is one `Rejected` of its one item or of the whole request, carrying the code as
+  outcome is one `Rejected` of its one item (naming no other order's client id) or of the whole
+  request, carrying the code as
   `Reject::venue_code` and exactly the table's kind. A table missing, listing no code, or with a
   line naming no kind fails. The check's registry has room for as many orders as the table has
   codes (`Live::orders`).

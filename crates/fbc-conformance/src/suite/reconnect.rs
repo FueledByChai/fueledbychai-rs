@@ -7,8 +7,8 @@
 //! close has cancelled what rested on the connection).
 //!
 //! It fails where the placement's acceptance is not reported once as `OrderCaps.ack` has it,
-//! where no resync ends once the first connection's has (its end reaches the handler before the
-//! epoch takes places, decision 0058), where the stub's script does not play to its end (the new
+//! where no resync ends on a later connection epoch than the one the placement was answered on
+//! (the runtime stamps each event with its epoch), where the stub's script does not play to its end (the new
 //! connection's opening never written or never answered), and where
 //! the order is written more than once over both connections, as the other checks count a
 //! request written again: by the frames carrying its client id as the venue's wire spells it,
@@ -36,9 +36,6 @@ pub fn resync_after_reconnect(subject: &Subject<'static>) -> Result<Verdict, Fai
     let epochs = vec![vec![vec![Accept]], Vec::new()];
     let breaches = live.run_epochs(epochs, async |c| {
         c.ready().await?;
-        // The first connection's resync has ended: the session hands its end over before the
-        // epoch takes places (decision 0058). A resync ending from here on is a later one's.
-        let before = c.events().len();
         let (cid, auth) = c.oms.place(c.h)?;
         let placed = c.send(auth, OpKind::Place).await?;
         // The stub accepts it, closes the connection, and answers the next one's opening.
@@ -51,8 +48,17 @@ pub fn resync_after_reconnect(subject: &Subject<'static>) -> Result<Verdict, Fai
                 format!("the placement the stub accepted was reported {outcomes:?}, not once");
             breaches.push(Breach::new("ExecCodec::on_frame", what));
         }
-        let ended = |e: &ExecEvent| matches!(e, ExecEvent::ResyncEnd);
-        if !c.events()[before..].iter().any(ended) {
+        // A resync ending on a later connection epoch than the placement's answer came on, as
+        // the runtime stamps each event: one the reconnect led to (Codex r4225971621).
+        let events = c.events();
+        let epochs = c.epochs();
+        let answered =
+            |e: &ExecEvent| matches!(e, ExecEvent::Outcome { rpc, .. } if *rpc == placed);
+        let first = events.iter().position(answered).map(|i| epochs[i]);
+        let reconnected = |(e, epoch): (&ExecEvent, &u32)| {
+            matches!(e, ExecEvent::ResyncEnd) && first.is_some_and(|first| *epoch > first)
+        };
+        if !events.iter().zip(&epochs).any(reconnected) {
             let what = "no resync ended once the stub closed the connection and the session \
                         reconnected: a reconnect leads to a resync";
             breaches.push(Breach::new("ExecCodec::resync", what));
