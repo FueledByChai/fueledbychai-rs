@@ -27,22 +27,23 @@ outcome, 0069), and how the fixture states a kind with a payload.
   cancel-on-disconnect cancelled what rested on the closed connection.
 - **`resync_after_reconnect`** places one order the stub accepts, then the stub closes the
   connection and answers the next one's opening. It fails where the placement is not accepted
-  once as `OrderCaps.ack` has it, where no resync ends (`ExecEvent::ResyncEnd`) on a later
-  connection epoch than the placement's answer came on (the epoch the runtime stamps on each
-  event's envelope, so a stray resync end on the first connection does not count), where the stub's script does not play to its end, and where
-  the order is written more than once over both connections, counted as 0083 counts a request
-  written again.
+  once as `OrderCaps.ack` has it (naming its one item), where no resync begins and then ends
+  (`ExecEvent::ResyncBegin`, then `ExecEvent::ResyncEnd`) on a later connection epoch than the
+  placement's answer came on (the epoch the runtime stamps on each event's envelope, so a
+  stray resync end does not count), where the stub's script does not play to its end, and
+  where the order is written more than once over both connections, counted as 0083 counts a
+  request written again.
 - **A final acceptance is `SubmitOutcome::Accepted` at `AckLevel::Final` for the placement's
   request; an asynchronous reject is `ExecEvent::AsyncReject` of a placement naming the order**,
   by our client id or a venue id the placement's outcomes name. An order update showing the
   order open is not taken for either: a venue's event may report an order received before its
   risk check. `two_phase_ack` places one order the stub accepts. On `SinglePhase` no outcome of
   any request (the arm's included) is provisional, and the placement is accepted once, final. On
-  `TwoPhase` the placement is accepted once as the model has it; where provisionally, the check
-  moves the clock no further than `risk_reject_window` once the stub has answered, and by then
-  the final acceptance or the asynchronous reject has come after the provisional acceptance,
-  not both. A venue accepting final at once
-  waits for nothing, and the check says so.
+  `TwoPhase` the placement is accepted once as the model has it, naming its one item; where
+  provisionally, the check moves the clock through `risk_reject_window` once the stub has
+  answered, and by then the final acceptance or the asynchronous reject has come after the
+  provisional acceptance, not both. A venue accepting final at once waits for nothing, and the
+  check says so.
 - **The reject table is a fixture file**, `<fixtures>/reject_coverage/table.txt`: a code, then
   the kind as `RejectKind`'s `Debug` spells it, so a kind with a payload
   (`RateLimited { retry_after: None }`, `AlreadyTerminal(Unspecified)`) needs no parser.

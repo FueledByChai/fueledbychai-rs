@@ -8,8 +8,9 @@
 //! - `SinglePhase`: no outcome the session reported, the cancel-on-disconnect arm's included,
 //!   is `Accepted` at `AckLevel::Provisional`, and the placement is accepted once, final.
 //! - `TwoPhase`: the placement is accepted once as the model has it (a provisional acceptance,
-//!   then at most one final; or final at once). Where its acceptance is provisional, the check
-//!   moves the clock no further than the window, and by then the placement has a final
+//!   then at most one final; or final at once), its outcomes naming its one item. Where its
+//!   acceptance is provisional, the check moves the clock through the window, and by then the
+//!   placement has, after that acceptance, a final
 //!   acceptance (`Accepted` at `AckLevel::Final` for its request) or an asynchronous reject
 //!   (`ExecEvent::AsyncReject` of a placement naming the order, by our client id or a venue id
 //!   its outcomes name), not both. Where the venue accepts it final at once, nothing waits for a second
@@ -23,7 +24,7 @@ use fbc_core::{
 };
 
 use super::live::{Ctx, Live};
-use super::orders::{accepted_once, verdict};
+use super::orders::{accepted_once, own_item, verdict};
 use super::stub::Answer::Accept;
 use super::{Breach, Failure, Subject, Verdict};
 
@@ -52,10 +53,10 @@ pub fn two_phase_ack(subject: &Subject<'static>) -> Result<Verdict, Failure> {
         };
         let outcomes = c.outcomes(rpc);
         let acks: Vec<&SubmitOutcome> = outcomes.iter().map(|(_, o)| o).collect();
-        if !accepted_once(&acks, model) {
+        if !own_item(&outcomes, cid) || !accepted_once(&acks, model) {
             let what = format!(
                 "the placement the stub accepted was reported {outcomes:?}, not accepted once \
-                 as {model:?} has it"
+                 as {model:?} has it, naming its one item"
             );
             breaches.push(Breach::new("OrderCaps.ack", what));
         }
@@ -107,13 +108,13 @@ async fn two_phase(
             format!("{model}: the placement was accepted final at once"),
         );
     }
-    let resolved = |c: &Ctx<'_>| second_phase(c, rpc, cid) != (false, false);
-    let moved = c.advance_within(window, resolved).await;
-    let phase = match (moved.is_some(), second_phase(c, rpc, cid)) {
-        (true, (true, false)) => "a final acceptance",
-        (true, (false, true)) => "an asynchronous reject",
+    // The whole window, so a second phase after the first shows too (Codex r4226060233).
+    c.advance(window).await;
+    let phase = match second_phase(c, rpc, cid) {
+        (true, false) => "a final acceptance",
+        (false, true) => "an asynchronous reject",
         // Both: the venue accepted the order for good and refused it.
-        (true, _) => {
+        (true, true) => {
             let what = format!(
                 "the placement's provisional acceptance was followed by both a final acceptance \
                  and an asynchronous reject: {:?}",
@@ -121,7 +122,7 @@ async fn two_phase(
             );
             return (vec![Breach::new(&model, what)], model);
         }
-        (false, _) => {
+        (false, false) => {
             let what = format!(
                 "the placement's provisional acceptance was followed by neither a final \
                  acceptance nor an asynchronous reject within the window: {:?}",

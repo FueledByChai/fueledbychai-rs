@@ -437,23 +437,12 @@ impl Ctx<'_> {
     /// session run after each, until `done` holds or [`WAIT`] has passed: how far it moved, or
     /// `None` when `done` never held.
     pub async fn advance_until(&self, done: impl Fn(&Ctx<'_>) -> bool) -> Option<Duration> {
-        self.advance_within(WAIT, done).await
-    }
-
-    /// Moves the clock on as [`Ctx::advance_until`] does, but no further than `limit`: how far
-    /// it moved, or `None` when `done` did not hold by then.
-    pub async fn advance_within(
-        &self,
-        limit: Duration,
-        done: impl Fn(&Ctx<'_>) -> bool,
-    ) -> Option<Duration> {
         let mut moved = Duration::ZERO;
-        while moved < limit {
+        while moved < WAIT {
             if done(self) {
                 return Some(moved);
             }
             let step = if moved < FINE { STEP } else { COARSE };
-            let step = step.min(limit - moved);
             tokio::time::advance(step).await;
             moved += step;
             for _ in 0..CHURN {
