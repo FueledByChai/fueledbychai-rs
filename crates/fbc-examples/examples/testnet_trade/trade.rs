@@ -8,23 +8,34 @@
 //! instruction, which the venue cancels rather than let it take), priced `--away-bps` below the
 //! best bid for a buy (above the best ask for a sell) read from `GET /orderbook` before the
 //! session starts, floored (ceiled) onto the tick, and refused unless it lies strictly behind
-//! the touch. The touch is read again once the market is Started, just before the place: the
-//! order goes out only if it is still at least `--away-bps` behind it, and the inventory cap
-//! at the fresh ask is still no fewer lots than the caps hold.
+//! the touch. Only the side the order rests behind is needed: a buy on a book with no asks (a
+//! testnet market nobody sells on) rests behind the bid all the same. The touch is read again
+//! once the market is Started, just before the place: the order goes out only if it is still
+//! at least `--away-bps` behind it, and the inventory cap at the fresh ask (the order's price
+//! when no ask rests) is still no fewer lots than the caps hold.
 //!
 //! **Its size.** `--order-usd` (required, no default, at most the resting cap) at the order's
 //! price, floored onto the size step. Refused when that is no lot, or its notional is below the
 //! market's `--min-notional` (the encoder does not check a minimum, FBC-98fc). The resting cap
 //! per side (`--resting-cap-usd`) is converted to lots at the same price, and the inventory cap
-//! (`--inventory-cap-usd`), both required, at the higher of that price and the ask, so a
-//! position is never worth more than the cap at the market. The registry sums resting lots on a side, so
+//! (`--inventory-cap-usd`), both required, at the higher of that price and the ask (the
+//! order's price when no ask rests), so a position is never worth more than the cap at the
+//! market. The registry sums resting lots on a side, so
 //! an order of ours an earlier run left resting on the order's side (restored by the resync,
 //! perhaps at a price nearer the touch) would count at the new order's price, not its own:
-//! while one rests there, nothing is placed (Stop cancels it).
+//! while one rests there, nothing is placed (Stop cancels it). Any order of ours an earlier
+//! run left resting on the market holds it anyway: this connection's cancel-on-disconnect may
+//! not cover it, so the session takes no place there until it ends (decision 0080), and the run
+//! places nothing, says why, and leaves it to Stop's cancel; a run after that places.
 //!
 //! **Its client ids** are minted, decoded as ours, leased and kept under the namespace the
 //! consumer allocates (`--namespace`, required): an order on the market under another
 //! namespace's id refuses the run before Start.
+//!
+//! **A refused login** stops the run at once once [`LOGIN_REFUSALS`] logins in a row were
+//! refused, naming the last refusal (its HTTP status, Paradex's code and message, as the codec
+//! reports it) and the usual causes, instead of reconnecting until the step timeout; each
+//! connection that ends says why, as far as the session reports it ([`Note::EpochEnd`]).
 //!
 //! **Its output** goes through [`detached`] when run: a thread of its own writes it, so a stalled
 //! standard output never blocks the one-thread runtime the session, the timeouts and the
@@ -88,6 +99,15 @@ const ACCOUNT_LABEL: &str = "testnet";
 
 /// How long an order request awaits its reply before it is `Unknown`.
 const RPC_WAIT: &str = "5000ms";
+
+/// How many logins refused in a row stop the run: the venue answered, and a key, an address or
+/// an account it refuses is not mended by reconnecting.
+pub const LOGIN_REFUSALS: usize = 3;
+
+/// The usual causes of a refused login, printed with the refusal (and in `--help`).
+const REFUSAL_CAUSES: &str = "the usual causes: a mainnet key on testnet (Paradex derives the \
+     account's L2 key per network), an Ethereum address instead of the Paradex (Starknet) one in \
+     PARADEX_ACCOUNT_ADDRESS, or an account not onboarded on the testnet, or unfunded";
 
 /// What a run did: whether every step happened, and how many places and cancels the session
 /// reported sent.
@@ -187,7 +207,9 @@ pub async fn run(
     let order = price(opts, &book)?;
     lines.line(format_args!(
         "BBO bid {} ask {} (GET /orderbook seq {})",
-        order.bid, order.ask, book.seq_no
+        px_or_none(order.bid),
+        px_or_none(order.ask),
+        book.seq_no
     ));
     lines.line(format_args!(
         "ORDER {} {} @ {} post-only, notional ${}, {} bps behind the touch, {} lots; caps: \
@@ -376,7 +398,7 @@ fn wall_now() -> WallNs {
 
 /// The Paradex configuration: order entry on the WebSocket, the REST base for the login and
 /// the resync, the testnet chain id, and the timings.
-fn config(opts: &Options) -> VenueConfig {
+pub fn config(opts: &Options) -> VenueConfig {
     let mut cfg = VenueConfig::new();
     for (key, value) in [
         (EXEC_URL, opts.ws_url.as_str()),
@@ -395,7 +417,11 @@ fn config(opts: &Options) -> VenueConfig {
 
 /// The one market's spec, from the command line: its tick, size step and minimum size of one
 /// lot. The minimum notional is checked by [`price`], not here.
-fn specs(venue: &dyn VenueFactory, cfg: &VenueConfig, opts: &Options) -> Result<SpecTable, String> {
+pub fn specs(
+    venue: &dyn VenueFactory,
+    cfg: &VenueConfig,
+    opts: &Options,
+) -> Result<SpecTable, String> {
     let caps = venue.caps(cfg).map_err(|e| e.to_string())?;
     let venue_symbol = dispatch_market_data(&caps, |scope| scope.venue_symbol(&opts.market))
         .map_err(|e| format!("--market {}: {e:?}", opts.market))?;
@@ -458,54 +484,80 @@ async fn touch(opts: &Options, specs: &SpecTable) -> Result<OrderbookSnapshot, S
 }
 
 /// The order as priced and sized, and the caps at its price.
-struct Priced {
-    bid: Decimal,
-    ask: Decimal,
-    ticks: Ticks,
-    px: Decimal,
-    qty: Lots,
-    size: Decimal,
-    notional: Decimal,
-    resting: Lots,
-    inventory: Lots,
+pub struct Priced {
+    /// The touch: the best bid and ask, `None` for a side with nothing resting.
+    pub bid: Option<Decimal>,
+    pub ask: Option<Decimal>,
+    pub ticks: Ticks,
+    pub px: Decimal,
+    pub qty: Lots,
+    pub size: Decimal,
+    pub notional: Decimal,
+    pub resting: Lots,
+    pub inventory: Lots,
 }
 
-/// The touch `book` shows on the tick, as prices: its best bid and ask.
+/// A price, or `none` for a side with nothing resting.
+fn px_or_none(px: Option<Decimal>) -> String {
+    px.map_or_else(|| "none".to_owned(), |px| px.to_string())
+}
+
+/// The touch `book` shows on the tick, as prices: its best bid and ask, `None` for a side with
+/// nothing resting.
 struct Touch {
-    bid: Decimal,
-    ask: Decimal,
+    bid: Option<Decimal>,
+    ask: Option<Decimal>,
     /// The price `--away-bps` behind it on the order's side, floored (a buy) or ceiled (a sell)
     /// onto the tick: an order there or further away rests at least that far behind it.
     away: Ticks,
 }
 
 /// `book`'s touch and the price `--away-bps` behind it, or why there is none to stay away from:
-/// an empty side, or a price that would not rest strictly behind the touch.
+/// no price on the side the order rests behind (a buy needs a bid, a sell an ask; the other
+/// side may be empty), or a price that would not rest strictly behind the touch.
 fn away_from(opts: &Options, book: &OrderbookSnapshot) -> Result<Touch, String> {
-    let (best_bid, best_ask) = match (book.bids.first(), book.asks.first()) {
-        (Some(b), Some(a)) => (b.px, a.px),
-        _ => return Err("GET /orderbook: a side is empty; no touch to stay away from".to_owned()),
-    };
+    let (best_bid, best_ask) = (
+        book.bids.first().map(|b| b.px),
+        book.asks.first().map(|a| a.px),
+    );
     let tick = opts.tick;
     let of = |t: Ticks| Decimal::from(t.0) * tick;
-    let (bid, ask) = (of(best_bid), of(best_ask));
+    let (bid, ask) = (best_bid.map(of), best_ask.map(of));
     let away = Decimal::from(opts.away_bps) / Decimal::from(10_000);
     let ticks = match opts.side {
-        OrderSide::Buy => (bid * (Decimal::ONE - away) / tick).floor(),
-        OrderSide::Sell => (ask * (Decimal::ONE + away) / tick).ceil(),
+        OrderSide::Buy => {
+            let bid = bid.ok_or(
+                "GET /orderbook: no bid rests; a buy is priced behind the best bid, so there is \
+                 no touch to stay away from",
+            )?;
+            (bid * (Decimal::ONE - away) / tick).floor()
+        }
+        OrderSide::Sell => {
+            let ask = ask.ok_or(
+                "GET /orderbook: no ask rests; a sell is priced behind the best ask, so there is \
+                 no touch to stay away from",
+            )?;
+            (ask * (Decimal::ONE + away) / tick).ceil()
+        }
     };
     let ticks = Ticks(ticks.to_i64().ok_or("the price does not fit")?);
     // Never a crossing order: strictly behind the touch on its own side, so also behind the
-    // other side's.
+    // other side's, when one rests there.
     let behind = match opts.side {
-        OrderSide::Buy => ticks.0 > 0 && ticks < best_bid && ticks < best_ask,
-        OrderSide::Sell => ticks > best_ask && ticks > best_bid,
+        OrderSide::Buy => {
+            ticks.0 > 0 && best_bid.is_some_and(|b| ticks < b) && best_ask.is_none_or(|a| ticks < a)
+        }
+        OrderSide::Sell => {
+            best_ask.is_some_and(|a| ticks > a) && best_bid.is_none_or(|b| ticks > b)
+        }
     };
     if !behind {
         return Err(format!(
-            "the order's price {} would not rest strictly behind the touch (bid {bid}, ask {ask}); \
+            "the order's price {} would not rest strictly behind the touch (bid {}, ask {}); \
              refused",
-            of(ticks)
+            of(ticks),
+            px_or_none(bid),
+            px_or_none(ask)
         ));
     }
     Ok(Touch {
@@ -517,9 +569,10 @@ fn away_from(opts: &Options, book: &OrderbookSnapshot) -> Result<Touch, String> 
 
 /// The order `--away-bps` behind the touch on the tick and `--order-usd`'s size on the size
 /// step, with the caps in lots (the resting cap at its price, the inventory cap at the higher of
-/// its price and the ask), or why it cannot be placed: no touch to stay away
-/// from ([`away_from`]), no lot in the size, or a notional below the market's minimum.
-fn price(opts: &Options, book: &OrderbookSnapshot) -> Result<Priced, String> {
+/// its price and the ask, or at its price when no ask rests), or why it cannot be placed: no
+/// touch to stay away from ([`away_from`]), no lot in the size, or a notional below the
+/// market's minimum.
+pub fn price(opts: &Options, book: &OrderbookSnapshot) -> Result<Priced, String> {
     let Touch { bid, ask, away } = away_from(opts, book)?;
     let ticks = away;
     let px = Decimal::from(ticks.0) * opts.tick;
@@ -531,9 +584,10 @@ fn price(opts: &Options, book: &OrderbookSnapshot) -> Result<Priced, String> {
     let order_usd = opts.order_usd;
     let qty = lots_for(order_usd, px)?;
     // The resting cap at the order's price, where it rests; the inventory cap at the higher of
-    // that and the ask, so a position is never worth more than the cap at the market.
+    // that and the ask (the order's price when no ask rests: a sell is above any bid), so a
+    // position is never worth more than the cap at the market.
     let resting = lots_for(opts.resting_cap_usd, px)?;
-    let inventory = lots_for(opts.inventory_cap_usd, px.max(ask))?;
+    let inventory = lots_for(opts.inventory_cap_usd, ask.map_or(px, |ask| px.max(ask)))?;
     let size = Decimal::from(qty.get()) * opts.step;
     let notional = size * px;
     if qty.get() == 0 {
@@ -596,22 +650,24 @@ impl Recheck {
             return Err(format!(
                 "the touch moved toward the order (bid {}, ask {}): at {} it would be less than \
                  {} bps behind it",
-                now.bid,
-                now.ask,
+                px_or_none(now.bid),
+                px_or_none(now.ask),
                 Decimal::from(px.0) * self.opts.tick,
                 self.opts.away_bps
             ));
         }
         // The inventory cap in lots at the fresh market: never fewer than the registry holds,
-        // or its check would admit a position worth more than the cap now.
-        let at = (Decimal::from(px.0) * self.opts.tick).max(now.ask);
+        // or its check would admit a position worth more than the cap now. At the order's
+        // price when no ask rests.
+        let price = Decimal::from(px.0) * self.opts.tick;
+        let at = now.ask.map_or(price, |ask| price.max(ask));
         let usd = self.opts.inventory_cap_usd;
         let lots = (usd / (at * self.opts.step)).floor().to_i64().unwrap_or(0);
         if lots < self.inventory.get() {
             return Err(format!(
                 "the inventory cap of ${usd} is now {lots} lots at the ask of {}, fewer than the \
                  {} lots the caps hold from the first read",
-                now.ask,
+                px_or_none(now.ask),
                 self.inventory.get()
             ));
         }
@@ -901,8 +957,13 @@ pub fn restored_baseline(snapshot: &ResyncSnapshot) -> Vec<(ClientOrderId, Lots)
 ///   and the resting cap is in lots at the new order's price, so one resting nearer the touch
 ///   would count at less than its own price and the dollars resting could exceed
 ///   --resting-cap-usd. Stop cancels them.
+/// - `held` not 0: that many orders of ours that the resync showed resting (an earlier run's)
+///   rest still on the market, where this connection's cancel-on-disconnect may not cover them,
+///   so the session takes no place on the market until they end (decision 0080: it would
+///   refuse the place as `NotSent(Disconnected)`). Stop cancels them; a run after that places.
 pub fn place_refusal(
     gate_open: bool,
+    held: usize,
     changes: &[String],
     same_side: &[(ClientOrderId, Lots)],
 ) -> Option<String> {
@@ -926,6 +987,13 @@ pub fn place_refusal(
             "{} orders of ours ({lots} lots) rest on the order's side: the resting cap is \
              counted in lots at the order's price, not theirs; cancel them first",
             same_side.len()
+        ));
+    }
+    if held > 0 {
+        return Some(format!(
+            "{held} orders of ours an earlier run left rest on the market, where this \
+             connection's cancel-on-disconnect may not cover them, so the session takes no place \
+             on it until they end (decision 0080); Stop cancels them, then run again"
         ));
     }
     None
@@ -1099,9 +1167,9 @@ impl Driver {
                         "an order event of an order not ours: {routed:?}"
                     ));
                 }
-                Note::EpochEnd(key) => self.note(format_args!(
-                    "the order socket's connection {key:?} ended; the session reconnects and \
-                     arms again"
+                Note::EpochEnd { key, why } => self.note(format_args!(
+                    "the order socket's connection {key:?} ended: {why}; the session reconnects, \
+                     logs in and arms again"
                 )),
                 _ => {}
             }
@@ -1138,6 +1206,8 @@ impl Driver {
         control: ExecControl,
     ) -> bool {
         let ok = self.steps(order, ns_lease, persisted, leases).await;
+        // What came in since the last wait (a connection's end, say) before Stop's lines.
+        self.tell();
         let stopped = self.stop().await;
         let unmoved = self.inventory_unmoved();
         let cancelled = self.owned_cancelled();
@@ -1215,17 +1285,35 @@ impl Driver {
         persisted: u64,
         leases: Leases,
     ) -> bool {
-        let authenticated = self
+        // Authenticated, or refused LOGIN_REFUSALS times in a row: reconnecting does not mend a
+        // key, an address or an account the venue refuses.
+        let login = self
             .wait(|l| {
-                l.notes()
+                if l.notes()
                     .iter()
                     .any(|n| matches!(n, Note::Conn(ConnState::Authenticated)))
-                    .then_some(())
+                {
+                    return Some(Ok(()));
+                }
+                match l.login_refusals() {
+                    Some((n, why)) if n >= LOGIN_REFUSALS => Some(Err((n, why.to_owned()))),
+                    _ => None,
+                }
             })
             .await;
-        if authenticated.is_none() {
-            self.timed_out("login", "the login and the socket's authentication");
-            return false;
+        match login {
+            Some(Ok(())) => {}
+            Some(Err((n, why))) => {
+                self.note(format_args!(
+                    "login refused {n} times: {why}; stopping ({REFUSAL_CAUSES}; --help lists \
+                     them)"
+                ));
+                return false;
+            }
+            None => {
+                self.timed_out("login", "the login and the socket's authentication");
+                return false;
+            }
         }
         self.lines.step(
             "login",
@@ -1414,7 +1502,9 @@ impl Driver {
             Ok((now, seq)) => self.lines.line(format_args!(
                 "BBO again bid {} ask {} (GET /orderbook seq {seq}): the order is still {} bps or \
                  more behind the touch",
-                now.bid, now.ask, self.recheck.opts.away_bps
+                px_or_none(now.bid),
+                px_or_none(now.ask),
+                self.recheck.opts.away_bps
             )),
             Err(e) => {
                 self.note(format_args!("{e}; nothing placed"));
@@ -1433,7 +1523,15 @@ impl Driver {
                 &self.owned,
             );
             let same_side = resting_on_side(link.registry(), &self.owned, order.side);
-            place_refusal(self.orders.may_place(), &changes, &same_side)
+            // The orders of ours that hold the market (decision 0080): at least one while the
+            // session takes places but not on the market.
+            let held = if self.orders.may_place() && !self.orders.may_place_on(INST) {
+                let unprotected = self.orders.unprotected();
+                unprotected.iter().filter(|o| o.inst == INST).count().max(1)
+            } else {
+                0
+            };
+            place_refusal(self.orders.may_place(), held, &changes, &same_side)
         };
         if let Some(why) = refusal {
             self.note(format_args!("{why}; nothing placed"));

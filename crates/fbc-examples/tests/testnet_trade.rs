@@ -310,9 +310,6 @@ enum End {
     Filled,
     /// A batch's restored orders only: the second item `ALREADY_CLOSED` and no order event.
     Refused,
-    /// Restored orders only: each FILLED by an order event that comes with the placed order's
-    /// cancel, so Stop finds nothing of theirs to cancel.
-    FilledBeforeStop,
 }
 
 /// The order event ending an order of `size` at `price` as `end` says.
@@ -328,7 +325,6 @@ fn order_ended(
 ) -> Vec<u8> {
     match end {
         End::Canceled | End::Refused => order_closed_on(side, seq, vid, cid, price, size),
-        End::FilledBeforeStop => order_event(side, seq, vid, cid, price, size, "0", ""),
         End::PartlyFilled => {
             let open = Decimal::from_str(size).unwrap() - Decimal::from_str("0.00001").unwrap();
             let open = open.to_string();
@@ -438,23 +434,6 @@ fn respond_full(
                 if matches!(placed_end, End::PartlyFilled) {
                     frames.push(Frame::Binary(fill_event(5_000, VID, &p.cid, &p.price)));
                 }
-                // Before the placed order's event, on the same socket: the run sees them
-                // before its closed step, so before Stop builds its plan.
-                if matches!(restored_end, End::FilledBeforeStop) {
-                    for (i, r) in restored.iter().enumerate() {
-                        let seq = 5_100 + i64::try_from(i).unwrap();
-                        let ev = order_ended(
-                            restored_end,
-                            r.side,
-                            seq,
-                            &r.vid,
-                            &r.cid,
-                            r.price,
-                            "0.00001",
-                        );
-                        frames.push(Frame::Binary(ev));
-                    }
-                }
                 frames.extend(extra.iter().cloned().map(Frame::Binary));
                 frames.push(Frame::Binary(closed));
                 Ok(frames)
@@ -561,17 +540,13 @@ fn restored_as(
     (orders, json!({ "results": results }).to_string())
 }
 
-/// The happy script with the batch cancel of the restored orders after it.
+/// The script of a run that finds orders of ours an earlier run left on the market: the
+/// opening (auth, four subscriptions, the arm), then Stop's batch cancel of the restored
+/// orders, ended as `end` says. Nothing is placed while they rest (decision 0080).
 fn restored_script(placed: Arc<Mutex<Placed>>, restored: Vec<Restored>, end: End) -> WsScript {
     let with = responder_with(placed, Arc::new(restored), End::Canceled, end);
-    // The batch cancel is the ninth frame, unless the orders ended before Stop.
-    let frames = if matches!(end, End::FilledBeforeStop) {
-        8
-    } else {
-        9
-    };
     let mut steps = vec![Step::Accept];
-    steps.extend((0..frames).map(|_| Step::Respond {
+    steps.extend((0..7).map(|_| Step::Respond {
         conn: 0,
         with: with.clone(),
     }));
@@ -1002,11 +977,15 @@ fn the_guard_admits_only_the_testnet_chain_id() {
         args::testnet_guard(rest, ws, Some(TESTNET_CHAIN)),
         Ok(args::Target::Testnet)
     );
+    // The testnet's chain is the one its GET /v1/system/config reports (starknet_chain_id),
+    // PRIVATE_SN_PARACLEAR_TESTNET: signing for any other fails every login with HTTP 401
+    // STARKNET_SIGNATURE_VERIFICATION_FAILED (the owner's first runs, 2026-10-09).
+    assert_eq!(TESTNET_CHAIN, "PRIVATE_SN_PARACLEAR_TESTNET");
     // The same chain id as the Java library writes it (the decimal felt) and in hex.
     for chain in [
-        "7693264728749915528729180568779831130134670232771119425",
-        "0x505249564154455f534e5f504f54435f5345504f4c4941",
-        "0X505249564154455F534E5F504F54435F5345504F4C4941",
+        "8458834024819506728615521019831122032732688838300959446835911345492",
+        "0x505249564154455f534e5f50415241434c4541525f544553544e4554",
+        "0X505249564154455F534E5F50415241434C4541525F544553544E4554",
     ] {
         assert_eq!(
             args::testnet_guard(rest, ws, Some(chain)),
@@ -1020,7 +999,11 @@ fn the_guard_admits_only_the_testnet_chain_id() {
         "8458834024819506728615521019831122032732688838300957472069977523540",
         "0x505249564154455f534e5f50415241434c4541525f4d41494e4e4554",
         "0x1",
-        "7693264728749915528729180568779831130134670232771119426",
+        "8458834024819506728615521019831122032732688838300959446835911345493",
+        // The Java library's stale testnet default, which Paradex's testnet no longer is.
+        "PRIVATE_SN_POTC_SEPOLIA",
+        "7693264728749915528729180568779831130134670232771119425",
+        "0x505249564154455f534e5f504f54435f5345504f4c4941",
         "",
     ] {
         let err = args::testnet_guard(rest, ws, Some(chain)).unwrap_err();
@@ -1036,7 +1019,12 @@ fn help_names_the_environment_the_flags_and_every_line() {
         auth::ACCOUNT_VAR,
         auth::KEY_VAR,
         args::CHAIN_VAR,
-        "PRIVATE_SN_POTC_SEPOLIA",
+        "PRIVATE_SN_PARACLEAR_TESTNET",
+        // A refused login: the line, and the usual causes (FBC-x69b, the owner's first runs).
+        "NOTE login refused",
+        "a mainnet key on testnet",
+        "an Ethereum address",
+        "not onboarded",
         "--market",
         "--tick",
         "--step",
@@ -1177,16 +1165,19 @@ fn the_resync_the_run_seeds_from_is_the_latest() {
     // An earlier epoch's resync, a reconnect, then the current epoch's.
     let mut notes = vec![
         resynced(3),
-        link::Note::EpochEnd(fbc_core::ConnKey { conn: 0, epoch: 1 }),
+        link::Note::EpochEnd {
+            key: fbc_core::ConnKey { conn: 0, epoch: 1 },
+            why: link::ENDED_UNSAID.to_owned(),
+        },
         resynced(-2),
     ];
     let (_, snap) = trade::latest_resync(&notes).unwrap().unwrap();
     assert_eq!(snap.positions, [(InstrumentId::new(1), SignedLots(-2))]);
     // A later resync the registry refused: the latest is that refusal, never the one before.
-    notes.push(link::Note::EpochEnd(fbc_core::ConnKey {
-        conn: 0,
-        epoch: 2,
-    }));
+    notes.push(link::Note::EpochEnd {
+        key: fbc_core::ConnKey { conn: 0, epoch: 2 },
+        why: link::ENDED_UNSAID.to_owned(),
+    });
     notes.push(link::Note::ResyncRefused("duplicate".to_owned()));
     assert_eq!(
         trade::latest_resync(&notes).unwrap().unwrap_err(),
@@ -1198,9 +1189,12 @@ fn the_resync_the_run_seeds_from_is_the_latest() {
 }
 
 #[tokio::test]
-async fn stop_cancels_an_earlier_runs_orders_and_waits_for_them_to_end() {
+async fn an_earlier_runs_orders_hold_the_market_so_nothing_is_placed_and_stop_cancels_them() {
+    // Two sells an earlier run left resting: the session takes no place on their market until
+    // they end, since this connection's cancel-on-disconnect may not cover them (decision
+    // 0080, on main since FBC-nvxn). The run places nothing, says why, and Stop cancels both
+    // and waits for them to end; a run after that places.
     let (orders, body) = restored();
-    let cids: Vec<String> = orders.iter().map(|o| o.cid.clone()).collect();
     let placed = Arc::new(Mutex::new(Placed::default()));
     let stub = StubServer::start(
         restored_script(Arc::clone(&placed), orders, End::Canceled),
@@ -1211,27 +1205,37 @@ async fn stop_cancels_an_earlier_runs_orders_and_waits_for_them_to_end() {
     let opts = options(&stub, "10");
     let (report, printed) = run_against(&opts).await;
     stub.finished().await.unwrap();
-    assert!(report.ok, "{printed}");
+    assert!(!report.ok, "{printed}");
     assert!(
         printed.contains("2 open orders (2 on the market)"),
         "{printed}"
     );
-    assert!(printed.contains("cancel all: 1 cancels sent"), "{printed}");
-    assert_eq!(
-        (report.places_sent, report.cancels_sent),
-        (1, 2),
+    assert!(
+        printed.contains(
+            "2 orders of ours an earlier run left rest on the market, where this connection's \
+             cancel-on-disconnect may not cover them, so the session takes no place on it until \
+             they end (decision 0080); Stop cancels them, then run again; nothing placed"
+        ),
         "{printed}"
     );
     assert_eq!(
-        methods(&stub)
-            .iter()
-            .filter(|m| *m == "order.cancel_batch")
-            .count(),
+        steps(&printed),
+        ["login", "arm", "resync", "start", "stop"],
+        "{printed}"
+    );
+    assert!(printed.contains("cancel all: 1 cancels sent"), "{printed}");
+    assert!(!printed.contains("did not end cancelled"), "{printed}");
+    assert_eq!(
+        (report.places_sent, report.cancels_sent),
+        (0, 1),
+        "{printed}"
+    );
+    let sent = methods(&stub);
+    assert_eq!(
+        sent.iter().filter(|m| *m == "order.cancel_batch").count(),
         1
     );
-    // The mint is floored by the restored ids the resync showed: the place reuses neither.
-    let p = placed.lock().unwrap();
-    assert!(!cids.contains(&p.cid), "{}", p.cid);
+    assert!(!sent.iter().any(|m| m == "order.create"), "{sent:?}");
 }
 
 #[tokio::test]
@@ -1248,9 +1252,9 @@ async fn a_batch_cancel_with_an_item_refused_and_no_order_event_fails_the_stop()
     opts.step_timeout_secs = 1;
     let (report, printed) = run_against(&opts).await;
     stub.finished().await.unwrap();
-    // Every step of the round trip happened, but Stop did not cancel what it found: the second
-    // item is refused, so the batch is not accepted on its first item alone, and no order event
-    // reports either ended.
+    // Nothing was placed (the restored orders hold the market, decision 0080), and Stop did not
+    // cancel what it found: the second item is refused, so the batch is not accepted on its
+    // first item alone, and no order event reports either ended.
     assert!(!report.ok, "{printed}");
     assert!(printed.contains("came back Rejected"), "{printed}");
     assert!(printed.contains("TIMEOUT stop"), "{printed}");
@@ -1379,9 +1383,9 @@ async fn stop_fails_when_an_earlier_runs_orders_fill_instead_of_cancelling() {
         let opts = options(&stub, "10");
         let (report, printed) = run_against(&opts).await;
         stub.finished().await.unwrap();
-        // The new order's round trip happened, and both restored orders ended, but not by the
-        // cancel alone: Stop did not cancel them untouched.
-        assert!(printed.contains("STEP closed"), "{printed}");
+        // Nothing was placed (they held the market), and both restored orders ended, but not
+        // by the cancel alone: Stop did not cancel them untouched.
+        assert!(printed.contains("nothing placed"), "{printed}");
         assert!(!report.ok, "{printed}");
         assert_eq!(printed.matches(said).count(), 2, "{printed}");
         assert!(printed.contains("DONE failed"), "{printed}");
@@ -1431,34 +1435,6 @@ async fn an_order_on_the_market_that_is_not_ours_refuses_the_run_before_start() 
         !methods(&stub)
             .iter()
             .any(|m| m.starts_with("order.c") && m != "order.cancel_on_disconnect")
-    );
-    assert!(printed.contains("DONE failed"), "{printed}");
-}
-
-#[tokio::test]
-async fn an_earlier_runs_order_that_fills_before_stop_fails_the_run() {
-    // Both restored orders fill (as the placed order's cancel goes out), so Stop has nothing
-    // of theirs to cancel and no fill event moves the inventory: the run still traded.
-    let (orders, body) = restored();
-    let placed = Arc::new(Mutex::new(Placed::default()));
-    let stub = StubServer::start(
-        restored_script(Arc::clone(&placed), orders, End::FilledBeforeStop),
-        routes_with(body),
-    )
-    .await
-    .unwrap();
-    let opts = options(&stub, "10");
-    let (report, printed) = run_against(&opts).await;
-    stub.finished().await.unwrap();
-    assert!(printed.contains("STEP closed"), "{printed}");
-    assert!(printed.contains("cancel all: 0 cancels sent"), "{printed}");
-    assert!(!report.ok, "{printed}");
-    assert_eq!(
-        printed
-            .matches("an order of ours traded during the run")
-            .count(),
-        2,
-        "{printed}"
     );
     assert!(printed.contains("DONE failed"), "{printed}");
 }
@@ -1780,10 +1756,11 @@ fn the_output_writer_never_waits_for_a_stalled_sink() {
 }
 
 #[tokio::test]
-async fn an_earlier_runs_order_filled_in_part_before_the_run_and_cancelled_by_stop_is_a_clean_run()
-{
+async fn an_earlier_runs_order_filled_in_part_before_the_run_and_cancelled_by_stop_is_not_this_runs_fill()
+ {
     // Each restored order is 2 lots with 1 filled before this run: Stop cancels the open lot,
-    // and the fill from before is not this run's.
+    // and the fill from before is not this run's. The run itself places nothing (the restored
+    // orders hold the market, decision 0080), so it fails for that alone.
     let (orders, body) = restored_sized("0.00002", "0.00001");
     let placed = Arc::new(Mutex::new(Placed::default()));
     let stub = StubServer::start(
@@ -1795,9 +1772,14 @@ async fn an_earlier_runs_order_filled_in_part_before_the_run_and_cancelled_by_st
     let opts = options(&stub, "10");
     let (report, printed) = run_against(&opts).await;
     stub.finished().await.unwrap();
-    assert!(report.ok, "{printed}");
+    assert!(!report.ok, "{printed}");
+    assert!(printed.contains("(decision 0080)"), "{printed}");
     assert!(printed.contains("cancel all: 1 cancels sent"), "{printed}");
     assert!(!printed.contains("filled during the run"), "{printed}");
+    assert!(!printed.contains("traded during the run"), "{printed}");
+    assert!(!printed.contains("did not end cancelled"), "{printed}");
+    assert!(!printed.contains("inventory moved"), "{printed}");
+    assert!(!printed.contains("TIMEOUT"), "{printed}");
 }
 
 #[test]
@@ -2525,27 +2507,33 @@ fn nothing_is_placed_while_the_current_connections_gate_is_closed() {
     let resting = [(mint.mint().unwrap(), Lots::new(9).unwrap())];
     let changed = ["a fill not of our orders came in".to_owned()];
     // The gate closed: refused whatever the audit and the side show.
-    let closed = trade::place_refusal(false, &[], &[]).expect("a closed gate refuses");
+    let closed = trade::place_refusal(false, 0, &[], &[]).expect("a closed gate refuses");
     assert!(
         closed.starts_with("the order socket's current connection takes no place yet"),
         "{closed}"
     );
     assert_eq!(
-        trade::place_refusal(false, &changed, &resting).as_deref(),
+        trade::place_refusal(false, 2, &changed, &resting).as_deref(),
         Some(closed.as_str())
     );
     // Open: the audit, then an order of ours resting on the side, refuse it; nothing else.
     assert!(
-        trade::place_refusal(true, &changed, &resting)
+        trade::place_refusal(true, 2, &changed, &resting)
             .unwrap()
             .starts_with("the account changed since the seed")
     );
     assert!(
-        trade::place_refusal(true, &[], &resting)
+        trade::place_refusal(true, 2, &[], &resting)
             .unwrap()
             .starts_with("1 orders of ours (9 lots) rest on the order's side")
     );
-    assert_eq!(trade::place_refusal(true, &[], &[]), None);
+    // Orders of ours an earlier run left on the market hold it (decision 0080).
+    assert!(
+        trade::place_refusal(true, 2, &[], &[])
+            .unwrap()
+            .starts_with("2 orders of ours an earlier run left rest on the market")
+    );
+    assert_eq!(trade::place_refusal(true, 0, &[], &[]), None);
 }
 
 #[tokio::test]
@@ -2782,8 +2770,8 @@ fn a_testnet_url_is_exactly_the_testnet_base_and_a_stub_path_exactly_v1() {
     );
     for (r, w) in [
         (stub_rest, stub_ws),
-        ("https://localhost:9/v1", "wss://[::1]:9/v1"),
-        ("http://127.0.0.2/v1", "ws://localhost/v1"),
+        ("https://[::1]:9/v1", "wss://[::1]:9/v1"),
+        ("http://127.0.0.2/v1", "ws://127.255.255.254/v1"),
     ] {
         assert_eq!(
             args::testnet_guard(r, w, None),
@@ -2946,4 +2934,364 @@ async fn the_namespace_lease_is_held_until_the_run_ends() {
     assert_eq!(*probed.lock().unwrap(), Some(false), "{printed}");
     // Released once the run ended.
     assert!(NamespaceLease::acquire(&dir, AccountKey::new(1), Namespace::new(1)).is_ok());
+}
+
+/// As [`routes`], the login answered with `login` and the order book with `book`.
+fn routes_answering(login: HttpReply, book: Vec<u8>) -> HttpRouter {
+    let empty = r#"{"results":[]}"#;
+    HttpRouter::new()
+        .route(Method::POST, PathPattern::exact("/v1/auth"), login)
+        .route(
+            Method::GET,
+            PathPattern::exact(&format!("/v1/orderbook/{MARKET}")),
+            reply(200, book),
+        )
+        .route(
+            Method::GET,
+            PathPattern::exact("/v1/orders"),
+            reply(200, empty),
+        )
+        .route(
+            Method::GET,
+            PathPattern::exact("/v1/positions"),
+            reply(200, empty),
+        )
+}
+
+/// The fixture's order book.
+fn book() -> Vec<u8> {
+    fs::read(fixture("paradex/rest/orderbook-btc-2002.json")).unwrap()
+}
+
+/// No credential, and not the session token, in `printed`.
+fn no_credential_in(printed: &str) {
+    let (account, key) = synthetic();
+    let lower = printed.to_ascii_lowercase();
+    for secret in [&account, &key, &TOKEN.to_owned()] {
+        let bare = secret.trim_start_matches("0x").to_ascii_lowercase();
+        assert!(
+            !lower.contains(&bare),
+            "a credential was printed:\n{printed}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn three_refused_logins_stop_the_run_at_once_naming_the_status_code_and_message() {
+    // The owner's first testnet runs (2026-10-09): every login was refused (HTTP 401,
+    // STARKNET_SIGNATURE_VERIFICATION_FAILED: the sample signed for a stale chain id), the
+    // socket reconnected five times, and the run stopped on 'TIMEOUT login' saying nothing of
+    // why. Now each connection's end names the refusal, and the third refusal in a row stops
+    // the run at once, long before the step timeout. The refusal echoes the account, as some
+    // of Paradex's do: it is withheld.
+    let (account, _) = synthetic();
+    let body = json!({
+        "error": "STARKNET_SIGNATURE_VERIFICATION_FAILED",
+        "message": format!("verification failed on Curve for account {account}"),
+    });
+    let routes = routes_answering(reply(401, body.to_string()), book());
+    let script = WsScript::new(vec![Step::Accept, Step::Accept, Step::Accept]);
+    let stub = StubServer::start(script, routes).await.unwrap();
+    let mut opts = options(&stub, "10");
+    opts.step_timeout_secs = 40;
+    let started = std::time::Instant::now();
+    let (report, printed) = run_against(&opts).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the run waited for its step timeout:\n{printed}"
+    );
+    assert!(!report.ok, "{printed}");
+    assert_eq!(
+        (report.places_sent, report.cancels_sent),
+        (0, 0),
+        "{printed}"
+    );
+    assert!(!printed.contains("TIMEOUT"), "{printed}");
+    assert_eq!(steps(&printed), ["stop"], "{printed}");
+    let refused = "the Paradex login was refused: HTTP 401, \
+                   STARKNET_SIGNATURE_VERIFICATION_FAILED: verification failed on Curve for \
+                   account <withheld>";
+    assert!(
+        printed.contains(&format!("NOTE login refused 3 times: {refused}")),
+        "{printed}"
+    );
+    // The usual causes are named with it.
+    for cause in [
+        "a mainnet key on testnet",
+        "an Ethereum address",
+        "not onboarded",
+    ] {
+        assert!(printed.contains(cause), "{cause}:\n{printed}");
+    }
+    // Each connection that ended before the stop says why.
+    for epoch in 0..2 {
+        let ended = format!("connection ConnKey {{ conn: 0, epoch: {epoch} }} ended: {refused}");
+        assert!(printed.contains(&ended), "{ended}:\n{printed}");
+    }
+    // Nothing was written on any socket: no login gave a token for the auth frame.
+    assert!(methods(&stub).is_empty(), "{:?}", methods(&stub));
+    no_credential_in(&printed);
+}
+
+#[tokio::test]
+async fn a_refused_auth_frame_is_shown_with_its_code_and_never_the_token_it_echoes() {
+    // Reviewer B's RB-3 on PR #135: the auth frame's refusal is the venue's JSON-RPC message
+    // as received, and that frame carries the bearer token, which a refusal may echo. The run
+    // shows the refusal's code and words, never a word that could hold the token.
+    let refuse = Responder::new(|frame| {
+        let Frame::Text(text) = frame else {
+            return Err("a binary frame".to_owned());
+        };
+        let req: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        let error = json!({"code": 40110, "message": format!("invalid bearer {TOKEN}")});
+        let refused = json!({"jsonrpc": "2.0", "error": error, "id": req["id"]});
+        Ok(vec![Frame::text(refused.to_string())])
+    });
+    let mut script = Vec::new();
+    for conn in 0..3 {
+        script.push(Step::Accept);
+        script.push(Step::Respond {
+            conn,
+            with: refuse.clone(),
+        });
+    }
+    let stub = StubServer::start(WsScript::new(script), routes())
+        .await
+        .unwrap();
+    let mut opts = options(&stub, "10");
+    opts.step_timeout_secs = 40;
+    let (report, printed) = run_against(&opts).await;
+    assert!(!report.ok, "{printed}");
+    assert!(!printed.contains("TIMEOUT"), "{printed}");
+    assert!(
+        printed.contains("NOTE login refused 3 times: 40110: invalid bearer <withheld>"),
+        "{printed}"
+    );
+    assert_eq!(methods(&stub), ["auth", "auth", "auth"]);
+    no_credential_in(&printed);
+}
+
+#[tokio::test]
+async fn a_connection_the_venue_closed_is_named_and_the_run_goes_on_on_the_next() {
+    // The venue closes the first connection as it opens: the session reconnects, and the
+    // round trip completes on the second. The run says the first ended, and that the runtime
+    // does not say why (FBC-dmlw).
+    let placed = Arc::new(Mutex::new(Placed::default()));
+    let with = responder(Arc::clone(&placed));
+    let mut script = vec![Step::Accept, Step::Close { conn: 0 }, Step::Accept];
+    script.extend((0..8).map(|_| Step::Respond {
+        conn: 1,
+        with: with.clone(),
+    }));
+    let stub = StubServer::start(WsScript::new(script), routes())
+        .await
+        .unwrap();
+    let opts = options(&stub, "10");
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(
+        printed.contains(
+            "NOTE the order socket's connection ConnKey { conn: 0, epoch: 0 } ended: the socket \
+             closed or failed, a write stalled, or the login could not be signed (fbc-runtime \
+             does not say which yet, FBC-dmlw)"
+        ),
+        "{printed}"
+    );
+    assert!(report.ok, "{printed}");
+    assert_eq!(
+        (report.places_sent, report.cancels_sent),
+        (1, 1),
+        "{printed}"
+    );
+}
+
+#[test]
+fn a_venue_error_is_shown_with_every_word_that_could_hold_a_secret_withheld() {
+    // Kept: the codec's sentence, Paradex's code, an HTTP status and a short JSON-RPC code.
+    let sentence = "the Paradex login was refused: HTTP 401, \
+                    STARKNET_SIGNATURE_VERIFICATION_FAILED: verification failed on Curve";
+    assert_eq!(link::shown(sentence), sentence);
+    assert_eq!(link::shown("code -32600"), "code -32600");
+    // Withheld: a token, a long word, hex, digits mixed with letters; control characters
+    // become spaces.
+    // A token's shape (dotted parts), built at run time: no token-shaped literal sits here.
+    let token = format!("{0}.{0}.{0}", "SyntheticPart");
+    assert_eq!(
+        link::shown(&format!("invalid bearer {token}")),
+        "invalid bearer <withheld>"
+    );
+    assert_eq!(
+        link::shown("key 0x1a2b3c4d and abcdef and a1b2c3 and 12345678"),
+        "key <withheld> and <withheld> and <withheld> and <withheld>"
+    );
+    assert_eq!(link::shown("bad\nline\tbreak"), "bad line break");
+    let long = "word ".repeat(100);
+    assert!(link::shown(&long).ends_with("..."));
+    assert!(link::shown(&long).chars().count() <= 203);
+    // A venue error: its kind, its code (when one is plain) and its words.
+    let reject = |code: Option<&str>, raw: &str| fbc_core::Reject {
+        kind: fbc_core::RejectKind::Other,
+        venue_code: code.map(Into::into),
+        raw: raw.into(),
+    };
+    assert_eq!(link::described(&reject(None, sentence)), sentence);
+    assert_eq!(
+        link::described(&reject(
+            Some("STARKNET_SIGNATURE_VERIFICATION_FAILED"),
+            sentence
+        )),
+        sentence
+    );
+    assert_eq!(
+        link::described(&reject(Some("40110"), &format!("invalid bearer {TOKEN}"))),
+        "40110: invalid bearer <withheld>"
+    );
+    assert_eq!(
+        link::described(&reject(Some(&"A".repeat(80)), "refused")),
+        "<withheld>: refused"
+    );
+}
+
+/// The fixture's order book with `side` (`bids` or `asks`) emptied, as Paradex's testnet
+/// answers a market where nobody rests on that side (`"asks":[]`).
+fn one_sided(side: &str) -> Vec<u8> {
+    let mut book: Value = serde_json::from_slice(&book()).unwrap();
+    book[side] = json!([]);
+    for key in [
+        "best_ask_api",
+        "best_ask_interactive",
+        "best_bid_api",
+        "best_bid_interactive",
+    ] {
+        if key.contains(&side[..3]) {
+            book.as_object_mut().unwrap().remove(key);
+        }
+    }
+    book.to_string().into_bytes()
+}
+
+#[test]
+fn a_buy_needs_only_the_bid_side_and_a_sell_only_the_ask_side() {
+    // The owner's testnet BTC and ETH books have bids but no asks (2026-10-09). A buy rests
+    // behind the best bid and a sell behind the best ask: the other side is not needed, and
+    // the inventory cap is then at the order's price.
+    let opts_on = |side: OrderSide| {
+        let Ok(Parsed::Trade(mut opts)) = args::parse(strings(&MARKET_ARGS)) else {
+            panic!("the market flags parse");
+        };
+        opts.side = side;
+        *opts
+    };
+    let book_of = |bytes: Vec<u8>, opts: &Options| {
+        let specs = trade::specs(
+            &fbc_venue_paradex::ParadexFactory,
+            &trade::config(opts),
+            opts,
+        )
+        .unwrap();
+        fbc_venue_paradex::md::rest::decode_orderbook(&bytes, &specs).unwrap()
+    };
+    let buy = opts_on(OrderSide::Buy);
+    let priced = trade::price(&buy, &book_of(one_sided("asks"), &buy)).unwrap();
+    // 3% under the best bid of 62000.2, floored onto the tick; $50 at that price is 83 lots.
+    assert_eq!(priced.px, Decimal::from_str("60140.1").unwrap());
+    assert_eq!(
+        (priced.bid, priced.ask),
+        (Some(Decimal::from_str("62000.2").unwrap()), None)
+    );
+    assert_eq!(priced.inventory.get(), 83);
+    let sell = opts_on(OrderSide::Sell);
+    let priced = trade::price(&sell, &book_of(one_sided("bids"), &sell)).unwrap();
+    // 3% over the best ask of 62000.5, ceiled onto the tick.
+    assert_eq!(priced.px, Decimal::from_str("63860.6").unwrap());
+    assert_eq!(
+        (priced.bid, priced.ask),
+        (None, Some(Decimal::from_str("62000.5").unwrap()))
+    );
+    // The side the order rests behind is needed.
+    let err = trade::price(&buy, &book_of(one_sided("bids"), &buy))
+        .err()
+        .unwrap();
+    assert!(err.contains("no bid"), "{err}");
+    let err = trade::price(&sell, &book_of(one_sided("asks"), &sell))
+        .err()
+        .unwrap();
+    assert!(err.contains("no ask"), "{err}");
+}
+
+#[tokio::test]
+async fn a_buy_on_a_book_with_no_asks_places_and_cancels_as_on_a_full_book() {
+    let placed = Arc::new(Mutex::new(Placed::default()));
+    let routes = routes_answering(
+        reply(200, format!(r#"{{"jwt_token":"{TOKEN}"}}"#)),
+        one_sided("asks"),
+    );
+    let stub = StubServer::start(script(Arc::clone(&placed)), routes)
+        .await
+        .unwrap();
+    let opts = options(&stub, "10");
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(report.ok, "{printed}");
+    assert!(printed.contains("BBO bid 62000.2 ask none"), "{printed}");
+    assert!(
+        printed.contains("BBO again bid 62000.2 ask none"),
+        "{printed}"
+    );
+    // The inventory cap at the order's price: $50 at 60140.1 is 83 lots.
+    assert!(
+        printed.contains("caps: resting 33 lots per side, inventory 83 lots"),
+        "{printed}"
+    );
+    assert_eq!(
+        (report.places_sent, report.cancels_sent),
+        (1, 1),
+        "{printed}"
+    );
+}
+
+#[test]
+fn a_stub_host_is_a_numeric_loopback_address_never_a_name() {
+    // Codex r4217903067: 'localhost' is a name a resolver may map anywhere, so it is not
+    // taken as a stub on this machine: only 127.0.0.0/8 and [::1] are.
+    for (r, w) in [
+        ("http://localhost:9/v1", "ws://localhost:9/v1"),
+        ("http://LOCALHOST:9/v1", "ws://127.0.0.1:9/v1"),
+        ("http://127.0.0.1:9/v1", "ws://localhost:9/v1"),
+    ] {
+        assert!(args::testnet_guard(r, w, None).is_err(), "{r} {w}");
+    }
+    assert_eq!(
+        args::testnet_guard("http://127.1.2.3:9/v1", "ws://[::1]:9/v1", None),
+        Ok(args::Target::LoopbackStub)
+    );
+}
+
+#[test]
+fn a_bracketed_ipv6_proxy_is_kept_without_its_brackets() {
+    // Codex r4217903060: the connector resolves (host, port), which takes ::1 but not [::1].
+    let mut argv = strings(&MARKET_ARGS);
+    argv.extend(strings(&["--socks5", "[::1]:1080"]));
+    let Ok(Parsed::Trade(opts)) = args::parse(argv) else {
+        panic!("a bracketed IPv6 proxy is taken");
+    };
+    assert_eq!(
+        opts.proxy,
+        ProxyConfig::Socks5 {
+            host: "::1".to_owned(),
+            port: 1080
+        }
+    );
+    let mut argv = strings(&MARKET_ARGS);
+    argv.extend(strings(&["--socks5", "proxy.example:1080"]));
+    let Ok(Parsed::Trade(opts)) = args::parse(argv) else {
+        panic!("a named proxy is taken");
+    };
+    assert_eq!(
+        opts.proxy,
+        ProxyConfig::Socks5 {
+            host: "proxy.example".to_owned(),
+            port: 1080
+        }
+    );
 }
