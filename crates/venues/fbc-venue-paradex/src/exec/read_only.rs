@@ -31,8 +31,16 @@
 //!   the error holds (its code when that is an integer), as the Java client fails the auth on
 //!   any non-null error (`ParadexOrderWebSocketClient.onAuthResponse`); one with neither
 //!   member closes the stream the same way with nothing reported first, so no connection
-//!   waits silently on a reply it could not read (FBC-z5om). A login that cannot be signed
-//!   asks for the reconnect alone, since `on_open` has no sink.
+//!   waits silently on a reply it could not read (FBC-z5om). A login that gives no token for the
+//!   connection waiting on it is reported first too, as an [`ExecEvent::UncorrelatedError`]
+//!   whose text names the HTTP status and Paradex's error code and message, or how the request
+//!   failed when no answer came, and whose `venue_code` is Paradex's code (FBC-3f8z, from the
+//!   owner's first testnet run, which stopped on a refused login with nothing saying why). Of
+//!   the answer it shows only the code, when that is a plain identifier, and the message, every
+//!   word of it long enough to hold an echoed account, key, signature or token withheld; a body
+//!   that is not Paradex's error is never shown. A refresh that gives no token is not reported:
+//!   its connection stays as it is. A login that cannot be signed asks for the reconnect alone,
+//!   since `on_open` has no sink.
 //! - **Decoding.** Binary frames are the SBE templates of schema 1:2 (0054): `OrderEvent`,
 //!   `FillEvent`, `PositionEvent` and `AccountEvent` through their decoders; a heartbeat and any
 //!   template not decoded are skipped, as the schema's versioning policy requires. Text frames
@@ -70,7 +78,7 @@ use fbc_core::{
 };
 use serde_json::{Value, json};
 
-use crate::auth::{Login, LoginCycle, REST_URL, SessionToken, TIMEOUT, token_spans};
+use crate::auth::{Login, LoginCycle, LoginError, REST_URL, SessionToken, TIMEOUT, token_spans};
 use crate::md::sbe::Message;
 
 use super::reply::member;
@@ -391,6 +399,137 @@ fn reject(error: &Value) -> Reject {
     }
 }
 
+/// The longest word of the venue's text a login refusal shows: a longer one could hold a
+/// credential the venue echoed (an account, a key or a signature's number is 16 digits or more,
+/// a session token longer still), so it is withheld.
+const LONGEST_SHOWN_WORD: usize = 15;
+/// The most characters of the venue's message a login refusal shows.
+const MOST_SHOWN: usize = 200;
+/// The longest error code a login refusal shows.
+const LONGEST_CODE: usize = 64;
+
+/// Why a login gave no token, as the [`ExecEvent::UncorrelatedError`] reported before the
+/// stream closes (FBC-3f8z): kind [`RejectKind::Other`], Paradex's error code as the
+/// `venue_code` when the answer gives a plain one, and as `raw` the codec's own sentence naming
+/// the HTTP status, Paradex's code and message (docs.paradex.trade "Errors": `error`, `message`),
+/// or how the request failed when no answer came. Nothing of the request is in it, and of the
+/// answer only the code and message, through [`shown`] and [`plain_code`], so a credential the
+/// venue echoes is not repeated; a body that is not Paradex's error is never shown.
+fn login_refusal(err: LoginError, resp: Result<HttpResponse<'_>, HttpFailure>) -> Reject {
+    let status = resp.map(|r| r.status).unwrap_or_default();
+    let (venue_code, raw) = match err {
+        LoginError::Failed(failure) => {
+            let why = match failure {
+                HttpFailure::NotSent => "the request was never sent",
+                HttpFailure::TimedOut => "no answer came within the timeout",
+                HttpFailure::Lost => "the connection failed after the request was sent",
+            };
+            (None, format!("the Paradex login got no response: {why}"))
+        }
+        LoginError::Status(status) => {
+            let body = resp.map(|r| r.body).unwrap_or_default();
+            match venue_error(body) {
+                Some((code, message)) => {
+                    let text = format!(
+                        "the Paradex login was refused: HTTP {status}, {}: {}",
+                        code.as_deref().unwrap_or("no error code"),
+                        message.as_deref().unwrap_or("no message"),
+                    );
+                    (code, text)
+                }
+                None => (
+                    None,
+                    format!(
+                        "the Paradex login was refused: HTTP {status}, with no Paradex error in the answer"
+                    ),
+                ),
+            }
+        }
+        LoginError::Decode(err) => (
+            None,
+            format!("the Paradex login answer held no token: HTTP {status}, {err}"),
+        ),
+    };
+    Reject {
+        kind: RejectKind::Other,
+        venue_code: venue_code.map(Into::into),
+        raw: raw.into(),
+    }
+}
+
+/// Paradex's REST error in `body`, a JSON object: its `error` code when that is a plain
+/// identifier ([`plain_code`]) and its `message` as [`shown`]; `None` when it holds neither.
+fn venue_error(body: &[u8]) -> Option<(Option<String>, Option<String>)> {
+    let doc: Value = serde_json::from_slice(body).ok()?;
+    let error = member(&doc, "error");
+    let code = error.and_then(Value::as_str);
+    let message = member(&doc, "message").and_then(Value::as_str);
+    if code.is_none() && message.is_none() {
+        return None;
+    }
+    Some((code.and_then(plain_code), message.map(shown)))
+}
+
+/// `code` when it is a plain identifier: a letter, then letters, digits and `_`, at most
+/// [`LONGEST_CODE`] long, no run between underscores longer than [`LONGEST_SHOWN_WORD`] (so
+/// never a key or an account in hex).
+fn plain_code(code: &str) -> Option<String> {
+    let plain = code.len() <= LONGEST_CODE
+        && code.starts_with(|c: char| c.is_ascii_alphabetic())
+        && code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && code.split('_').all(|run| run.len() <= LONGEST_SHOWN_WORD);
+    plain.then(|| code.to_owned())
+}
+
+/// The venue's `text` as a login refusal shows it: a control character becomes a space, every
+/// word (a run between spaces and JSON or list punctuation) longer than [`LONGEST_SHOWN_WORD`]
+/// becomes `<withheld>`, and the result is cut at [`MOST_SHOWN`] characters, `...` marking the
+/// cut.
+fn shown(text: &str) -> String {
+    fn flush(word: &mut String, out: &mut String) {
+        if word.chars().count() > LONGEST_SHOWN_WORD {
+            out.push_str("<withheld>");
+        } else {
+            out.push_str(word);
+        }
+        word.clear();
+    }
+    let (mut out, mut word) = (String::new(), String::new());
+    for c in text.chars() {
+        let separates = c.is_whitespace()
+            || c.is_control()
+            || matches!(
+                c,
+                ',' | ';'
+                    | ':'
+                    | '"'
+                    | '\''
+                    | '`'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
+                    | '='
+                    | '|'
+            );
+        if separates {
+            flush(&mut word, &mut out);
+            out.push(if c.is_control() { ' ' } else { c });
+        } else {
+            word.push(c);
+        }
+    }
+    flush(&mut word, &mut out);
+    match out.char_indices().nth(MOST_SHOWN) {
+        Some((at, _)) => format!("{}...", &out[..at]),
+        None => out,
+    }
+}
+
 /// The REST base, without a trailing slash, and the read timeout, from the keys
 /// [`Login::new`] has already accepted (an `https://` base and a positive whole `<n>s` or
 /// `<n>ms`), so neither is refused here.
@@ -576,12 +715,15 @@ impl ExecCodec for ReadOnlyExec {
         if tag != LOGIN_REQUEST {
             return Err(DecodeError::Malformed("an answer to no request asked"));
         }
-        let answered = self.cycle.on_answer(resp, fx).is_ok();
-        self.reuse = answered;
+        let answer = self.cycle.on_answer(resp, fx);
+        self.reuse = answer.is_ok();
         let waiting = self.conn.as_ref().is_some_and(|c| !c.auth_sent);
-        match (waiting, answered) {
-            (true, true) => self.send(ReadMethod::Auth, fx),
-            (true, false) => self.close(None, "the Paradex login gave no token", sink, fx),
+        match (waiting, answer) {
+            (true, Ok(())) => self.send(ReadMethod::Auth, fx),
+            (true, Err(err)) => {
+                let refusal = login_refusal(err, resp);
+                self.close(Some(refusal), "the Paradex login gave no token", sink, fx);
+            }
             (false, _) => {}
         }
         Ok(())

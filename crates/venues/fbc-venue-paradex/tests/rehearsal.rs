@@ -36,6 +36,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::Vectors;
+use common::secrets::{credential_needles, synthetic};
+use fbc_conformance::{Step, WsScript};
 use fbc_core::{
     AccountKey, AckLevel, Bps, Channel, CidMint, ClientOrderId, ConnState, InstrumentId, Lots,
     MarketLease, Namespace, NamespaceLease, NewOrder, NonceBlock, NonceSource, OrderCaps,
@@ -96,15 +98,6 @@ fn specs() -> SpecTable {
 
 fn symbol() -> VenueSymbol {
     specs().get(INST).unwrap().venue_symbol.clone()
-}
-
-/// The synthetic account and key of `fixtures/paradex/signing`, from the vectors' header.
-fn synthetic() -> (String, String) {
-    let vectors = Vectors::read();
-    (
-        vectors.header["account"].clone(),
-        vectors.header["key"].clone(),
-    )
 }
 
 fn secrets() -> Secrets {
@@ -511,61 +504,10 @@ fn opening(methods: &[String]) {
     );
 }
 
-/// No credential, session token or login signature in `text`: the synthetic account and key
-/// (as hex, with or without `0x`, any case), the stub's token, and each part of each login
-/// signature the stub read.
+/// No credential, the stub's session token or a login signature in `text` (the shared secret
+/// search, `common/secrets.rs`).
 fn secrets_absent(text: &str, signatures: &[String], what: &str) {
-    let lower = text.to_ascii_lowercase();
-    for needle in credential_needles(signatures) {
-        assert!(
-            !lower.contains(&needle),
-            "{what} shows a credential, the token or a login signature"
-        );
-    }
-}
-
-/// What [`secrets_absent`] looks for, lowercase: the account, the key, the session token and the
-/// login signatures' numbers, each as text and as the hex of its bytes, as tungstenite dumps a
-/// payload. A number is also looked for as starknet's `Felt` prints it: in hex without leading
-/// zeros (which `{:x}`, `{:#x}` and any zero-padded form contain) and in decimal.
-fn credential_needles(signatures: &[String]) -> Vec<String> {
-    let (account, key) = synthetic();
-    let mut numbers = vec![account, key];
-    for sig in signatures {
-        assert!(!sig.is_empty(), "the stub read no login signature");
-        // The signature's numbers, not its punctuation or a short fragment.
-        let parts = sig.split(|c: char| !c.is_ascii_alphanumeric());
-        numbers.extend(
-            parts
-                .filter(|p| p.trim_start_matches("0x").len() >= 16)
-                .map(str::to_owned),
-        );
-    }
-    let mut secrets = vec![TOKEN.to_owned()];
-    for number in numbers {
-        let digits = number.trim_start_matches("0x");
-        let felt = if number.starts_with("0x") || !digits.bytes().all(|b| b.is_ascii_digit()) {
-            Felt::from_hex(&format!("0x{digits}"))
-        } else {
-            Felt::from_dec_str(digits)
-        };
-        let felt = felt.unwrap_or_else(|_| panic!("{number} is not a field element"));
-        secrets.push(digits.to_owned());
-        secrets.push(
-            format!("{felt:x}")
-                .trim_start_matches("0x")
-                .trim_start_matches('0')
-                .to_owned(),
-        );
-        secrets.push(format!("{felt}"));
-    }
-    let mut needles = Vec::new();
-    for secret in secrets {
-        let hex: String = secret.bytes().map(|b| format!("{b:02x}")).collect();
-        needles.push(secret.to_ascii_lowercase());
-        needles.push(hex);
-    }
-    needles
+    common::secrets::secrets_absent(text, TOKEN, signatures, what);
 }
 
 /// Every record this thread logged, one per line.
@@ -583,7 +525,7 @@ fn trace_output() -> String {
 #[test]
 fn the_secret_search_sees_a_field_element_in_every_form_it_prints() {
     let (account, key) = synthetic();
-    let needles = credential_needles(&[]);
+    let needles = credential_needles(TOKEN, &[]);
     for value in [account, key] {
         let felt = Felt::from_hex(&value).unwrap();
         for printed in [
@@ -603,6 +545,95 @@ fn the_secret_search_sees_a_field_element_in_every_form_it_prints() {
             }
         }
     }
+}
+
+/// The owner's first testnet run (FBC-3f8z): the order socket's connection ended five times and
+/// the run stopped with nothing saying why. A login the venue refuses now reaches the consumer
+/// as an event naming the HTTP status and Paradex's error code and message, the venue's echo of
+/// the account and the login signature withheld; the connection then closes and the session
+/// reconnects and logs in again as before, the second login authenticating and the opening six
+/// written on the second connection. No token, login signature or key in what the consumer was
+/// shown or in the TRACE output.
+#[tokio::test]
+async fn a_refused_login_reaches_the_consumer_with_its_status_and_paradexs_error_then_the_session_logs_in_again()
+ {
+    capture::install();
+    log::debug!(target: "rehearsal", "{LIVE}");
+    let book: Shared = Arc::new(Mutex::new(Book::default()));
+    let refusal = r#"{"error":"INVALID_STARKNET_SIGNATURE","message":"Invalid signature {signature} for account {account}","data":null}"#;
+    lock(&book)
+        .refused_logins
+        .push_back((401, refusal.to_owned()));
+    // Connection 0: accepted, then closed by the session once its login is refused, with nothing
+    // written on it. Connection 1: the opening six.
+    let with = venue::responder(book.clone());
+    let mut steps = vec![Step::Accept, Step::Accept];
+    steps.extend((0..6).map(|_| Step::Respond {
+        conn: 1,
+        with: with.clone(),
+    }));
+    let stub = Stub::start_with(&book, WsScript::new(steps));
+    let Wired {
+        glue,
+        mut session,
+        control,
+        writer,
+        ..
+    } = wire(&stub, registry());
+
+    let g = Rc::clone(&glue);
+    let script = async move {
+        let glue = g;
+        until(&glue, "the second connection authenticated", |g| {
+            g.notes
+                .iter()
+                .any(|n| matches!(n, Note::Conn(ConnState::Authenticated)))
+        })
+        .await;
+        // The session keeps running until the stub has answered the opening six.
+        tokio::time::timeout(STEP, stub.finished())
+            .await
+            .expect("the opening six within the step")
+            .unwrap();
+        drop(control);
+        stub
+    };
+    let stub = drive(&mut session, script).await;
+    writer.close().unwrap();
+
+    let g = glue.borrow();
+    let shown = problems(&g);
+    let [refused] = shown.as_slice() else {
+        panic!("{shown:?}")
+    };
+    let expected = "venue error naming no request: Other INVALID_STARKNET_SIGNATURE: the Paradex \
+                    login was refused: HTTP 401, INVALID_STARKNET_SIGNATURE: Invalid signature ";
+    assert!(refused.starts_with(expected), "{refused}");
+    assert!(refused.ends_with(" for account <withheld>"), "{refused}");
+    // Reported before the first connection closed, and that before the second authenticated.
+    let at = |is: &dyn Fn(&Note) -> bool| g.notes.iter().position(is).unwrap();
+    let reported = at(&|n| matches!(n, Note::Problem(_)));
+    let closed = at(&|n| matches!(n, Note::Conn(ConnState::Closed)));
+    let authenticated = at(&|n| matches!(n, Note::Conn(ConnState::Authenticated)));
+    assert!(
+        reported < closed && closed < authenticated,
+        "{:#?}",
+        g.notes
+    );
+    // Two connections, two logins, nothing written on the first; the opening six on the second.
+    assert_eq!(stub.connections().len(), 2);
+    assert!(stub.methods(0).is_empty(), "{:?}", stub.methods(0));
+    opening(&stub.methods(1));
+    let signatures = lock(&book).login_signatures.clone();
+    assert_eq!(signatures.len(), 2);
+    // The venue echoed the first login's account and signature; the consumer was shown neither.
+    secrets_absent(refused, &signatures, "the refusal the consumer was shown");
+    let traced = trace_output();
+    assert!(
+        traced.contains(LIVE),
+        "the capture missed this thread's records"
+    );
+    secrets_absent(&traced, &signatures, "the TRACE output");
 }
 
 /// From a fresh start: no place or amend frame until Start; Start refused until the first

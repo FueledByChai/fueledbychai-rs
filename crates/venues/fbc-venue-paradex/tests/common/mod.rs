@@ -11,6 +11,8 @@ use std::path::PathBuf;
 
 use fbc_venue_paradex::sign::{Felt, ParadexSigner, StarkKey};
 
+pub mod secrets;
+
 pub fn vectors_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../../fixtures/paradex/signing/paradex-vectors.tsv")

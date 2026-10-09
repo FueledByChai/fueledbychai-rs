@@ -67,6 +67,10 @@ pub struct Book {
     fill_seq: u64,
     /// Each login's `PARADEX-STARKNET-SIGNATURE` header, as the stub read it.
     pub login_signatures: Vec<String>,
+    /// The logins to refuse, in order, each as an HTTP status and a body in which `{account}`
+    /// and `{signature}` stand for the login's own headers, as a venue echoing them would
+    /// write them (FBC-3f8z); once none is left, a login gives [`TOKEN`].
+    pub refused_logins: VecDeque<(u16, String)>,
 }
 
 impl Book {
@@ -159,8 +163,23 @@ fn routes(book: &Shared) -> HttpRouter {
     HttpRouter::new()
         .route_fn(Method::POST, PathPattern::exact("/v1/auth"), move |req| {
             let signature = req.header("PARADEX-STARKNET-SIGNATURE").unwrap_or("");
-            lock(&login).login_signatures.push(signature.to_owned());
-            reply(200, format!(r#"{{"jwt_token":"{TOKEN}"}}"#))
+            let account = req.header("PARADEX-STARKNET-ACCOUNT").unwrap_or("");
+            let mut book = lock(&login);
+            book.login_signatures.push(signature.to_owned());
+            match book.refused_logins.pop_front() {
+                Some((status, body)) => {
+                    // Each header as the inside of a JSON string, as a venue's echo writes it.
+                    let inside = |text: &str| {
+                        let quoted = Value::String(text.to_owned()).to_string();
+                        quoted[1..quoted.len() - 1].to_owned()
+                    };
+                    let body = body
+                        .replace("{account}", &inside(account))
+                        .replace("{signature}", &inside(signature));
+                    reply(status, body)
+                }
+                None => reply(200, format!(r#"{{"jwt_token":"{TOKEN}"}}"#)),
+            }
         })
         .route_fn(Method::GET, PathPattern::exact("/v1/orders"), move |_| {
             reply(200, lock(&orders).orders_json())
@@ -274,7 +293,7 @@ fn named(book: &Book, params: &Value) -> Option<String> {
 }
 
 /// Answers each JSON-RPC frame by its method (module documentation).
-fn responder(book: Shared) -> Responder {
+pub fn responder(book: Shared) -> Responder {
     Responder::new(move |frame| {
         let Frame::Text(text) = frame else {
             return Err("a binary frame from the client".to_owned());
@@ -410,7 +429,11 @@ pub struct Stub {
 impl Stub {
     /// Starts the stub with `book`, answering `frames_per_conn` frames as [`script`] says.
     pub fn start(book: &Shared, frames_per_conn: &[usize]) -> Stub {
-        let script = script(book, frames_per_conn);
+        Stub::start_with(book, script(book, frames_per_conn))
+    }
+
+    /// Starts the stub with `book`, its socket following `script`.
+    pub fn start_with(book: &Shared, script: WsScript) -> Stub {
         let router = routes(book);
         let (started_tx, started) = std::sync::mpsc::channel();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
