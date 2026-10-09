@@ -31,7 +31,10 @@ the code (RB-nvxn-6).
   the markets held, not by the number of reconnects. The rule 0080 states for nothing held
   (everything dropped) is the case of no market held.
 - **The send-path check allocates nothing.** `Gate::admits` tests each item's market in place,
-  and with nothing unprotected looks at no item of a batch.
+  and with nothing unprotected looks at no item of a batch. This holds by construction (it
+  builds no heap value) and is not proven by a test: counting allocations needs a global
+  allocator whose implementation is unsafe code, which the workspace has none of (0021).
+  FBC-ehkm covers a counting harness.
 - **0080's wording, as the code is.** Where 0080 differs, this record holds:
   - "What releases the market": the ends and replacements that count are those an order event
     or a query answer showed on an epoch while evidence was kept for the order's market (while
