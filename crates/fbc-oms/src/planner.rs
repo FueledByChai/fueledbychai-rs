@@ -410,7 +410,9 @@ impl ExecutionPlanner {
     /// `reg` is `acct`'s registry: the planner holds each account's orders apart, so a pass for
     /// one account never frees another's levels, and binds `acct` to `reg` at its first pass.
     /// A pass for `acct` through another registry, or through `reg` for another account, is
-    /// refused with nothing built or freed ([`PlanError`]; 0068).
+    /// refused with nothing built or freed ([`PlanError`]; 0068). Like every mutating call on
+    /// `reg`, a pass, a refused one included, first releases the places whose commands were
+    /// dropped unspent (decision 0084).
     pub fn plan(
         &mut self,
         desired: &DesiredBook,
@@ -420,8 +422,8 @@ impl ExecutionPlanner {
         mint: &mut CidMint,
         now: MonoNs,
     ) -> Result<Plan, PlanError> {
-        self.bind(acct, reg)?;
         reg.reap_dropped();
+        self.bind(acct, reg)?;
         let market = desired.market;
         let config = self.config;
         let slots = self.slots.entry((acct, market)).or_default();

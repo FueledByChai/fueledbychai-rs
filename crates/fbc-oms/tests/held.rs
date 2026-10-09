@@ -34,8 +34,8 @@ use fbc_core::{
 };
 use fbc_oms::{
     CancelChoice, CapRefusal, DesiredBook, DesiredQuote, ExecutionPlanner, IssueRefusal,
-    MarketCapsConfig, OmsError, OrdState, OrderOp, OutcomeApplied, PermittedCommand, PlannerConfig,
-    PreTradeCaps, Registry, TerminalKind, TestnetRun,
+    MarketCapsConfig, OmsError, OrdState, OrderOp, OutcomeApplied, PermittedCommand, PlanError,
+    PlannerConfig, PreTradeCaps, Registry, TerminalKind, TestnetRun,
 };
 
 const INST: InstrumentId = InstrumentId::new(1);
@@ -324,6 +324,30 @@ fn a_planner_pass_quotes_a_side_a_dropped_place_had_filled() {
     assert!(plan.refused.is_empty(), "{:?}", plan.refused);
     assert_eq!(plan.commands.len(), 1);
     assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(RESTING)));
+}
+
+#[test]
+fn a_refused_planner_pass_still_releases_a_place_dropped_before() {
+    // Codex P2 r4226124571 on PR #137: a pass refused for another registry reaps first.
+    let mut bound = registry();
+    let mut other = registry();
+    let lease = NamespaceLease::acquire(&common::lease_dir(), ACCT, Namespace::new(952)).unwrap();
+    let mut mint = CidMint::new(lease, 0, 0, WallNs(0));
+    let mut p = ExecutionPlanner::new(
+        PlannerConfig::new(Bps(2.0), lots(2), Duration::from_millis(100)).unwrap(),
+    );
+    let book = DesiredBook::new(INST);
+    p.plan(&book, &mut bound, &order_caps(), ACCT, &mut mint, MonoNs(0))
+        .unwrap();
+    let order = buy(RESTING);
+    let c = order.cid;
+    drop(other.place(order).unwrap());
+    assert!(matches!(
+        p.plan(&book, &mut other, &order_caps(), ACCT, &mut mint, MonoNs(1)),
+        Err(PlanError::OtherRegistry { .. })
+    ));
+    assert_eq!(other.get(c).unwrap().state(), released());
+    assert_eq!(other.resting_on(INST, Side::Buy), Some(Lots::ZERO));
 }
 
 // ---- RB133-1: an outcome for a held place is refused, and one saying the venue may hold it
