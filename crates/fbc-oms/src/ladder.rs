@@ -15,10 +15,11 @@
 //! 1. It is queried once, by the reference the venue's `query_refs` declare, and the answer
 //!    is awaited for the intent timeout at most
 //!    ([`QueryOrder::reference`]); a client id always exists. An answer showing the order
-//!    resting with nothing in flight, or ended, resolves it ([`LadderResolution::Resolved`]),
-//!    an open order still counting against the caps; one naming another order than the one
-//!    queried applies nothing ([`LadderResolution::TargetMismatch`]). An Unknown order shown
-//!    resting with a cancel still in flight stays on the ladder.
+//!    resting with nothing in flight and no amend or cancel whose fate is unanswered (step 3),
+//!    or ended, resolves it ([`LadderResolution::Resolved`]), an open order still counting
+//!    against the caps; one naming another order than the one queried applies nothing
+//!    ([`LadderResolution::TargetMismatch`]). An Unknown order shown resting with a cancel
+//!    still in flight stays on the ladder.
 //! 2. A query that cannot be built, goes unanswered or is inconclusive (the venue does not
 //!    find the order, or shows it with a command still in flight) leaves it to resyncs, and the
 //!    ladder asks for one on every pass ([`LadderPlan::resync`]). A resync showing the order
@@ -36,10 +37,14 @@
 //! 3. Still on the ladder after the configured maximum, a tombstone cancel names it by client
 //!    id, and again each maximum after; accepted for good it ends the order Canceled, refused
 //!    because the order already ended, Lost ([`Registry::tombstone_sent`]). Until every
-//!    tombstone sent is answered (not sent, refused, or accepted for good), the order stays
-//!    on the ladder whatever a query answer or resync shows of it: an earlier one, unanswered,
-//!    may still remove it after a later one is refused. A venue whose cancels cannot name a
-//!    client id gets none ([`LadderPlan::no_tombstone`]).
+//!    tombstone sent, and every amend or cancel that went unanswered or stayed in flight past
+//!    the intent timeout (the one that put the order on the ladder among them), is answered
+//!    (not sent, refused other than as already ended, or accepted for good), the order stays
+//!    on the ladder whatever a query answer or resync shows of it: an earlier command,
+//!    unanswered, may still remove it after a later one is refused (FBC-e90m, FBC-tjey). Such
+//!    a cancel, no longer the command in flight, accepted for good ends the order Canceled
+//!    ([`OutcomeApplied::LadderCancelResolved`](crate::OutcomeApplied::LadderCancelResolved)).
+//!    A venue whose cancels cannot name a client id gets none ([`LadderPlan::no_tombstone`]).
 //!
 //! Every number is the consumer's ([`LadderConfig`], decision 0009). The OMS reads no clock:
 //! the consumer runs [`Registry::ladder`] on its journaled timer with the timer's time.
@@ -175,7 +180,7 @@ pub struct LadderPlan {
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum LadderResolution {
     /// The order left the ladder, in this state: the venue showed it resting with nothing in
-    /// flight, or ended.
+    /// flight and no tombstone, amend or cancel whose fate is unanswered, or ended.
     Resolved(OrdState),
     /// The venue did not settle it: resyncs decide ([`LadderPlan::resync`]).
     Inconclusive,
@@ -281,7 +286,9 @@ impl Registry {
     /// the venue `caps` describe. The order the venue shows applies as its order update would
     /// ([`OrderRecord::apply_update`](crate::OrderRecord::apply_update)); resting with nothing
     /// in flight, or ended, the order leaves the ladder. Not found, or shown with a command
-    /// still in flight, it is left to resyncs; so it is, only the answer's cumulative fill
+    /// still in flight, or with a tombstone, amend or cancel whose fate is not yet answered
+    /// (it may still remove the order; FBC-e90m, FBC-tjey), it is left to resyncs; so it is,
+    /// only the answer's cumulative fill
     /// counting, when shown resting under another venue id than the record's while, on a
     /// venue whose amend gives the order a new id, an unconfirmed amend may have replaced the
     /// record's (FBC-wua8). An
@@ -351,7 +358,8 @@ impl Registry {
     /// delivered under `key`, to the orders on the ladder.
     ///
     /// An order on the ladder the snapshot shows (by our client id, or by a venue id it had)
-    /// applies there as an order update would; resting with nothing in flight, or ended, it
+    /// applies there as an order update would; resting with nothing in flight and no
+    /// tombstone, amend or cancel whose fate is unanswered (FBC-e90m, FBC-tjey), or ended, it
     /// leaves the ladder. An order whose client id and venue id the snapshot names apart is
     /// only counted as shown; so is one it shows resting under another venue id than the
     /// record's while an unconfirmed amend may have replaced the record's on a venue whose
@@ -502,6 +510,10 @@ fn escalate(rec: &mut OrderRecord, cfg: &LadderConfig, now: MonoNs) -> bool {
     } else {
         rec.enter_ladder(now, cause);
     }
+    // The amend or cancel in flight that long may still land: its fate is the ladder's.
+    if let Some(rpc) = cause {
+        rec.await_answer(rpc);
+    }
     true
 }
 
@@ -548,14 +560,17 @@ fn step(
 }
 
 /// Takes `rec` off the ladder when what the venue showed settles it: ended, or resting with
-/// nothing in flight; otherwise resyncs decide. The state it was resolved in, if it was.
+/// nothing in flight and no tombstone, amend or cancel whose fate is unanswered; otherwise
+/// resyncs decide. The state it was resolved in, if it was.
 fn resolve(rec: &mut OrderRecord) -> Option<OrdState> {
     let state = rec.state();
     // Resting is Open or PartiallyFilled: a PendingNew order (a cancel of it unanswered) is
-    // no more settled than an Unknown one. A tombstone sent and not yet answered may still
-    // remove the order, even once a later one's refusal cleared the command in flight.
+    // no more settled than an Unknown one. An amend or cancel whose fate is unknown (a
+    // tombstone, or the one that put the order on the ladder) and not yet answered may still
+    // remove or change the order, even once a later command's refusal cleared the command in
+    // flight (FBC-e90m, FBC-tjey).
     let settled = state.is_terminal()
-        || (state.rank() > 0 && rec.intent() == Intent::None && !rec.tombstone_unanswered());
+        || (state.rank() > 0 && rec.intent() == Intent::None && !rec.fate_unanswered());
     if settled {
         rec.leave_ladder();
         Some(state)
