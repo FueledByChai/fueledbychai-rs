@@ -430,7 +430,8 @@ pub fn specs(
 ) -> Result<SpecTable, String> {
     let caps = venue.caps(cfg).map_err(|e| e.to_string())?;
     let venue_symbol = dispatch_market_data(&caps, |scope| scope.venue_symbol(&opts.market))
-        .map_err(|e| format!("--market {}: {e:?}", opts.market))?;
+        // Neither the value nor the venue's error (which may quote it) is shown.
+        .map_err(|_| "--market: not a symbol the Paradex adapter takes (the value is not shown)")?;
     let price_grid = PriceGrid::fixed(opts.tick).map_err(|e| format!("--tick: {e:?}"))?;
     let size_step = SizeStep::new(opts.step).ok_or("--step: not a valid size step")?;
     let usd = AssetSym::new("USD").expect("an asset symbol");

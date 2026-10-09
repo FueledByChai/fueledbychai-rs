@@ -2815,8 +2815,8 @@ fn a_refused_chain_id_or_argument_is_never_echoed() {
 #[test]
 fn a_market_not_shaped_like_a_paradex_market_is_refused_before_any_request() {
     // Codex r4216890750: a private key pasted as --market would be sent in GET /orderbook's
-    // path; only Paradex's shape (upper-case letters and digits in three or more parts joined
-    // by '-') is taken, and a refusal never echoes the value.
+    // path; only Paradex's shape (letters and digits in three to five parts joined by '-', at
+    // most 32 long) is taken, and a refusal never echoes the value.
     // Reviewer B's RB114-14: some Paradex markets carry a lower-case prefix (kBONK-USD-PERP);
     // the letters are md_watch's Paradex spelling, either case.
     for good in [
@@ -2843,6 +2843,11 @@ fn a_market_not_shaped_like_a_paradex_market_is_refused_before_any_request() {
         "BTC--PERP",
         "-BTC-USD-PERP",
         "BTC-USD-0123456789ABCDEF0123456789ABCDEF",
+        // Codex r4226495325: a credential split into parts of at most 12 is still refused, by
+        // the count of parts (at most 5) and the whole length (at most 32).
+        "0123456789AB-CDEF01234567-89ABCDEF0123-456789ABCDEF",
+        "0123-4567-89AB-CDEF-0123-4567-89AB-CDEF-0123-4567-89AB-CDEF-0123-4567-89AB-CDEF",
+        "BTC-USD-PERP-A-B-C",
     ] {
         let mut argv = strings(&MARKET_ARGS);
         argv.extend(strings(&["--market", bad]));
