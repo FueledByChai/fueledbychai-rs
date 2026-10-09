@@ -30,13 +30,19 @@ the reply.
   reason is not a code 0069's table keys on.
 - **Neither.** NEW waits for a later event. CLOSED by USER_CANCELED with nothing filled (our
   cancel before the risk check ended) settles the placement with nothing more.
+- **Its own order.** An event settles a placement only when it names the venue id the
+  placement's reply named (or either states none): our client id under another venue id is
+  not the placement's order. The phase carries the `VenueMeta` of the event that showed it.
 - **Before the reply.** What the first such event shows of a placement sent and not yet
-  answered is held until its reply: passed, the reply's outcome is the final acceptance at
-  once (no provisional one); refused, the provisional acceptance followed by the asynchronous
-  reject; withdrawn, the provisional acceptance alone.
+  answered is held, with its venue id and `VenueMeta`, until its reply; when the reply names
+  that venue id: passed, the reply's outcome is the final acceptance at once (no provisional
+  one); refused, the provisional acceptance followed by the asynchronous reject; withdrawn,
+  the provisional acceptance alone.
 - **Held no longer than needed.** A placement is held by our client id from its encode until
   its event settles it, its reply or timeout reports it anything but accepted, or a new
-  connection opens (the resync then reads what rests, 0027).
+  connection opens (the resync then reads what rests, 0027). A placement the session refuses
+  after its encode (its rate budget) reaches the codec through no call, so it is held until
+  the connection ends, as `ParadexReplies` holds its request (FBC-9r5o).
 
 ## Alternatives
 
