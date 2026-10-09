@@ -198,6 +198,7 @@ pub use grid::price_grid;
 pub use idempotent::subscriptions_idempotent;
 pub use ids::{MINTED_BEFORE, ids_roundtrip, restart_cid};
 pub use legacy::legacy_symbols;
+pub use live::{WATCHDOG, with_watchdog};
 pub use orders::{amend_ack, mixed_batch, unknown_on_timeout};
 pub use reconnect::resync_after_reconnect;
 pub use rejects::reject_coverage;

@@ -116,6 +116,34 @@ async fn a_barrier_ends_only_once_the_client_has_read_past_every_frame_before_it
 }
 
 #[tokio::test(start_paused = true)]
+async fn the_script_position_counts_each_step_played_to_its_end() {
+    let server = stub(vec![
+        Step::Accept,
+        Step::Push {
+            conn: 0,
+            frame: Frame::text("reply"),
+        },
+        Step::Barrier { conn: 0 },
+        Step::Push {
+            conn: 0,
+            frame: Frame::text("next"),
+        },
+    ])
+    .await;
+    assert_eq!(server.played(), 0);
+    let mut ws = connector().websocket(&server.ws_url("/oe")).await.unwrap();
+    // Accepted and pushed; the barrier holds until the client reads past the reply (FBC-pn85).
+    settle().await;
+    assert_eq!(server.played(), 2);
+    assert_eq!(ws.next().await.unwrap().unwrap(), Message::text("reply"));
+    assert!(ws.next().await.unwrap().unwrap().is_ping());
+    ws.flush().await.unwrap();
+    assert_eq!(ws.next().await.unwrap().unwrap(), Message::text("next"));
+    server.finished().await.unwrap();
+    assert_eq!(server.played(), 4);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_barrier_on_a_connection_that_ends_before_its_pong_fails_the_script() {
     let server = stub(vec![Step::Accept, Step::Barrier { conn: 0 }]).await;
     let ws = connector().websocket(&server.ws_url("/oe")).await.unwrap();

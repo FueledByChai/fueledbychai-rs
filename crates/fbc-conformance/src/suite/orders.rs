@@ -103,9 +103,10 @@ pub fn amend_ack(subject: &Subject<'static>) -> Result<Verdict, Failure> {
         c.ready().await?;
         let (cid, auth) = c.oms.place(c.h)?;
         let placed = c.send(auth, OpKind::Place).await?;
-        c.settle(|c| !c.outcomes(placed).is_empty()).await;
-        // What the placement's answer brings, every outcome and order update, has come.
-        c.churn().await;
+        // What the placement's answer brings, every outcome and order update, has come: the
+        // session has read every frame of it, a second frame the host delivered late too
+        // (FBC-pn85: PR #145's CI read the placement's late `Open` as contradicting the amend).
+        c.replied().await?;
         let outcomes = c.outcomes(placed);
         // The single command's one item, or the whole request (Codex r4223068215), accepted
         // once as the venue acknowledges (Codex r4223435588).
@@ -125,15 +126,12 @@ pub fn amend_ack(subject: &Subject<'static>) -> Result<Verdict, Failure> {
         // Only what the session reports from here on answers the amend (Codex r4222138050).
         let before = c.events().len();
         let rpc = c.send(auth, OpKind::Amend).await?;
+        // What the amend's answer brings with it has come: the session has read every frame
+        // the stub sent.
         c.answered().await?;
         let names = |u: &OrderUpdate| {
             u.cid == Some(CidMatch::Ours(cid)) || (placed_vid.is_some() && u.vid == placed_vid)
         };
-        let updates = |c: &Ctx<'_>| amended_updates(&c.events()[before..], names);
-        c.settle(|c| !c.outcomes(rpc).is_empty() && !updates(c).is_empty())
-            .await;
-        // What the amend's answer brings with them has come.
-        c.churn().await;
         let (post_only, reduce_only) = c.oms.flags();
         let asked = Asked {
             cid,
@@ -148,7 +146,7 @@ pub fn amend_ack(subject: &Subject<'static>) -> Result<Verdict, Failure> {
                 echo,
             },
         };
-        let updates = updates(c);
+        let updates = amended_updates(&c.events()[before..], names);
         // Every update that names the order once the amend is sent and leaves it resting, an
         // `Open` one too: a consumer applies each (Codex r4224199060).
         let resting = resting_updates(&c.events()[before..], &asked, &updates);
