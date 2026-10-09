@@ -21,13 +21,13 @@ testnet run (FBC-8xr) is to show both.
 ## Decision
 
 1. **News once per order and request.** The Paradex order-entry codec (the read-only codec and
-   the order-entry codec, which carries it) holds, per venue order id, the `requestId` and
-   `requestStatus` of the MODIFY_ORDER request_info that order's events last carried
+   the order-entry codec, which carries it) holds, per venue order id, every `requestId` and
+   `requestStatus` pair of MODIFY_ORDER request_info that order's events carried
    (`exec::ModifyRequests`), across all its frames and connections. An event whose MODIFY_ORDER
-   request_info equals what is held reports nothing of the modify: it is the order update in
-   the order's own state (Open, not Amended) and no `AsyncReject`. A different `requestId`, or
-   a different status of the same one (PENDING then SUCCESS), is news and is read as 0054
-   says. A `requestId` the frame does not carry is a value of its own: two modifies both
+   request_info is one already held, the latest modify's or an earlier one's, reports nothing
+   of the modify: it is the order update in the order's own state (Open, not Amended) and no
+   `AsyncReject`. A pair not held, a new `requestId` or a new status of one (PENDING then
+   SUCCESS), is news and is read as 0054 says. A `requestId` the frame does not carry is a value of its own: two modifies both
    without one cannot be told apart, so only the first one's outcome is reported.
 2. **What leaves it unchanged.** An event with no MODIFY_ORDER request_info (version 1, the
    1:2 layout without it, or another request type) changes nothing held, so a repeat after it
@@ -46,6 +46,8 @@ testnet run (FBC-8xr) is to show both.
   `AsyncReject` and `OrderUpdate` have no field for it, and nothing yet says whether the venue
   echoes our JSON-RPC id or one of its own, so the consumer could not match it either.
 - Hold nothing and treat every request_info as fresh (FBC-aml): rejected, RB85-1's failure.
+- Hold only the latest pair per order: rejected (Codex on PR #139). With modify A rejected and
+  modify B pending, a fill still carrying A's REJECTED would be news again and look like B's.
 - Clear what is held on each new connection: rejected. The first update of an order after a
   reconnect would report a stale modify outcome again, which is the failure this record closes.
 - Drop what is held of orders a resync does not list as open: not now. A REST answer read before
@@ -59,6 +61,8 @@ testnet run (FBC-8xr) is to show both.
   status as the one before it, is not reported; its amend stays in flight until the Unknown
   ladder or a resync settles it, the direction in which the OMS counts more resting exposure,
   not less.
+- An order's pairs grow with each modify of it until it closes: one small entry per modify
+  outcome seen, a few per amend.
 - What is held of an order whose CLOSED event the codec never sees (closed while disconnected)
   stays for the codec's life: one small entry per such order, gone when the process restarts.
   A new codec (a restart) holds nothing, so a stale outcome on an order's first event after it

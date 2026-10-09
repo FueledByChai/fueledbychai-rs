@@ -158,8 +158,8 @@ pub struct ReadOnlyExec {
     /// The resync in flight, if any.
     resync: Option<Resync>,
     next_tag: u64,
-    /// The MODIFY_ORDER request_info each order's events last carried, kept across connections
-    /// so a later update repeating it is not reported again (decision 0086).
+    /// Every MODIFY_ORDER request_info each order's events carried, kept across connections so
+    /// a later update repeating one is not reported again (decision 0086).
     modifies: ModifyRequests,
 }
 

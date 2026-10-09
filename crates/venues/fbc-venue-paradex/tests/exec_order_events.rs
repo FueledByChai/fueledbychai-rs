@@ -723,3 +723,51 @@ fn a_refused_frame_records_no_request_info_and_other_orders_are_apart() {
     ));
     assert_eq!(seen.len(), 2);
 }
+
+#[test]
+fn an_earlier_modifys_outcome_repeated_after_a_later_modify_is_not_news_again() {
+    // Codex r4226495973 on PR #139: modify A REJECTED, then modify B PENDING, then a fill still
+    // carrying A's REJECTED. Every request_info an order's events carried is held, not just the
+    // last, so A's repeat is no reject of B; B's own outcome is still reported.
+    let [first, _] = ours();
+    let message = "synthetic rejection message";
+    let a_rejected = frame("order-modify-rejected-v2.sbe.txt");
+    let b_pending = with_byte(with_request(&a_rejected, "req-7005", ""), 126, 1);
+    let a_fill = frame("order-modify-rejected-fill-v2.sbe.txt");
+    let b_rejected = with_request(&a_fill, "req-7005", message);
+    let mut seen = ModifyRequests::new();
+    let events = decode_each(&mut seen, &[&a_rejected, &b_pending, &a_fill, &b_rejected]);
+    let open = |update| ExecEvent::Order(update);
+    assert_eq!(
+        events,
+        vec![
+            vec![
+                amend_rejected(first, message),
+                open(resting(first, VenueOrderState::Open, PX, 150)),
+            ],
+            vec![open(resting(first, VenueOrderState::Open, PX, 150))],
+            // A's REJECTED again: not news, so not a reject of B.
+            vec![open(after_fill(first, VenueOrderState::Open, PX, 150))],
+            // B's REJECTED: news.
+            vec![
+                amend_rejected(first, message),
+                open(after_fill(first, VenueOrderState::Open, PX, 150)),
+            ],
+        ]
+    );
+    // A SUCCESS repeated after a later modify is no second amend either.
+    let a_success = frame("order-modify-success-v2.sbe.txt");
+    let b_pending = with_byte(with_request(&a_success, "req-7006", ""), 126, 1);
+    let a_fill = frame("order-modify-success-fill-v2.sbe.txt");
+    let mut seen = ModifyRequests::new();
+    let events = decode_each(&mut seen, &[&a_success, &b_pending, &a_fill]);
+    assert_eq!(
+        events[2],
+        [open(after_fill(
+            first,
+            VenueOrderState::Open,
+            PX_AMENDED,
+            200
+        ))]
+    );
+}
