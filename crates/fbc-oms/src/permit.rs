@@ -666,3 +666,33 @@ impl PermittedCommand {
         PermittedCommand::guarded(cmd, guard, Instance::default())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::{cid, placement};
+
+    #[test]
+    fn a_hold_is_no_part_of_what_a_command_is_and_only_an_unspent_one_hands_its_orders_back() {
+        let origin = Instance::default();
+        let dropped = Arc::new(DroppedPlaces::default());
+        let order = placement(cid(), 100, 1);
+        let c = order.cid;
+        let place = VenueCommand::Place(order);
+        let holding = PermittedCommand::holding(place.clone(), Guard::default(), origin, &dropped);
+        // The same place, held or not, is the same command.
+        assert_eq!(
+            holding,
+            PermittedCommand::guarded(place.clone(), Guard::default(), origin)
+        );
+        assert!(dropped.take().is_empty());
+        drop(holding);
+        assert_eq!(dropped.take(), vec![c]);
+        assert!(dropped.take().is_empty());
+        // Spent, it hands nothing back.
+        let mut spent = PermittedCommand::holding(place, Guard::default(), origin, &dropped);
+        spent.spend_hold();
+        drop(spent);
+        assert!(dropped.take().is_empty());
+    }
+}
