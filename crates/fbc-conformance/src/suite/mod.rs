@@ -71,11 +71,14 @@
 //! states there the replies that bring it to its authenticated state. The codec is opened on
 //! [`Setup::exec_stream`] at the suite's fixed encode time, then handed each reply in order: a
 //! frame to [`on_frame`](fbc_core::ExecCodec::on_frame) on that stream, an HTTP response to
-//! [`on_http`](fbc_core::ExecCodec::on_http) as the answer to the earliest HTTP request the
-//! codec asked for and no reply has answered yet, each in the decode scope the core lends for
-//! the venue's caps. What the codec pushes and asks for meanwhile is dropped: only the state
-//! it reaches matters. A reply the codec refuses, or an HTTP response with no request to
-//! answer, fails the check naming `Setup.bootstrap` and the reply's position, never its bytes.
+//! [`on_http`](fbc_core::ExecCodec::on_http) as the answer to an HTTP request the codec asked
+//! for and no reply has answered yet (the one its tag names, or the earliest), each in the
+//! decode scope the core lends for the venue's caps. What the codec pushes and asks for
+//! meanwhile is dropped: only the state it reaches matters. A reply the codec refuses, an HTTP
+//! response with no such request to answer, and an open or a reply after which the codec
+//! reports its connection closed or asks for a reconnect (a refused login it decoded; Codex
+//! r4226499484) fail the check naming `Setup.bootstrap` and the reply's position, never its
+//! bytes.
 //! An authenticated session holds no order state, so a bootstrapped codec has still seen
 //! nothing of any order. Without a bootstrap the codec is used as built, never opened.
 //!
@@ -176,7 +179,8 @@ use core::fmt;
 use std::path::{Path, PathBuf};
 
 use fbc_core::{
-    EncodeCtx, RpcId, Secrets, SpecTable, StreamId, VenueCommand, VenueConfig, VenueFactory,
+    EncodeCtx, HttpTag, RpcId, Secrets, SpecTable, StreamId, VenueCommand, VenueConfig,
+    VenueFactory,
 };
 
 pub use book_channels::book_channels;
@@ -243,9 +247,10 @@ pub enum BootReply {
     Text(String),
     /// A binary frame on the order-entry stream.
     Binary(Vec<u8>),
-    /// The response to the earliest HTTP request the codec asked for that no reply has
-    /// answered yet (a login).
+    /// The response to an HTTP request the codec asked for that no reply has answered yet (a
+    /// login): the one `tag` names, or, for `None`, the earliest (Codex r4226499486).
     Http {
+        tag: Option<HttpTag>,
         status: u16,
         headers: Vec<(String, String)>,
         body: Vec<u8>,
