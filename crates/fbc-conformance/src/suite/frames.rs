@@ -15,7 +15,8 @@
 //!
 //! and a blank line or one starting with `#` is a comment. Frames are handed to
 //! [`on_frame`](fbc_core::ExecCodec::on_frame) on [`Setup::exec_stream`](super::Setup), in the
-//! decode scope the core lends for the venue's caps; the codec is not opened first. A venue
+//! decode scope the core lends for the venue's caps; the codec is first taken through the setup's
+//! [`Bootstrap`](super::Bootstrap), where it has one, and otherwise not opened. A venue
 //! whose fills or positions arrive only in HTTP responses is not modelled here.
 //!
 //! What a check reports of a frame is its file and line, never its bytes: a frame can carry a

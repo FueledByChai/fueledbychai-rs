@@ -5,7 +5,8 @@
 //!
 //! For each reference the caps declare for amends, cancels, batch-cancel items and queries,
 //! a command naming its order by that reference is encoded by a codec built fresh from the
-//! factory, which has seen nothing: it must be sent, carrying its request on its traffic
+//! factory, which has seen nothing (but the setup's [`Bootstrap`](super::Bootstrap), which
+//! leaves no order state): it must be sent, carrying its request on its traffic
 //! class. The same command is then encoded by another fresh codec that first saw the order
 //! placed, and must give the same result and the same effects: a codec that answers
 //! differently once it has seen the placement depends on state the command does not carry.

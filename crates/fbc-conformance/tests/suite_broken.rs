@@ -34,6 +34,7 @@ fn assumed() -> Setup {
         goldens: Vec::new(),
         exec_stream: toy::EXEC_STREAM,
         order_entry: None,
+        bootstrap: None,
     }
 }
 
