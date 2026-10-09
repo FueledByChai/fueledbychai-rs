@@ -637,6 +637,48 @@ fn a_short_echo_is_withheld_and_the_text_shown_is_one_line_of_plain_ascii() {
     }
 }
 
+/// Codex r4225768727 (P1) on PR #135: a token an earlier login gave is kept after a later login
+/// fails, so the venue knows it and could echo it in a refusal, however short a token it gave.
+/// No word as long as the held token, or longer, is shown: a word shorter than the token cannot
+/// hold it, and the token's alphabet holds none of the characters that split words.
+#[test]
+fn a_refusal_never_shows_the_token_held_however_short() {
+    const SHORT: &str = "secret";
+    let mut first = codec();
+    open(&mut first);
+    let body = login_body(SHORT);
+    let id = auth_frame(&answer(&mut first, ok(body.as_bytes())).fx, SHORT);
+    // The auth frame is refused; the next connection logs in, the token still held.
+    closed_and_reconnecting(&text(&mut first, &error(id, 40111, "Invalid Bearer Token")));
+    assert_eq!(logins(&open(&mut first)), 1);
+    let message = "token secret revoked: Bearer-secret, xsecretx, SECRET bad";
+    let body = paradex_error("INVALID_TOKEN", message);
+    let call = answer(&mut first, refused(401, body.as_bytes()));
+    closed_and_reconnecting(&call);
+    let reject = login_refusal(&call);
+    assert_eq!(
+        &*reject.raw,
+        "the Paradex login was refused: HTTP 401, no error code: token <withheld> <withheld>: \
+         <withheld>, <withheld>, <withheld> bad"
+    );
+    // The code is as long as the token or longer, so it could hold it: not shown.
+    assert_eq!(reject.venue_code, None);
+    let shown = format!("{} {:?}", reject.raw, call.events);
+    secrets::secrets_absent(&shown, SHORT, &[], "the login refusal");
+    // A code-shaped token longer than the longest word shown is never shown as the code.
+    const CODE_SHAPED: &str = "ACCOUNT_IS_NOT_KNOWN";
+    let mut codec = codec();
+    open(&mut codec);
+    let body = login_body(CODE_SHAPED);
+    let id = auth_frame(&answer(&mut codec, ok(body.as_bytes())).fx, CODE_SHAPED);
+    closed_and_reconnecting(&text(&mut codec, &error(id, 40111, "Invalid Bearer Token")));
+    open(&mut codec);
+    let body = paradex_error(CODE_SHAPED, "Unauthorized");
+    let reject = login_refusal(&answer(&mut codec, refused(401, body.as_bytes())));
+    assert_eq!(reject.venue_code, None);
+    assert!(!reject.raw.contains(CODE_SHAPED), "{}", reject.raw);
+}
+
 /// A refused login never reports the token, the login's signature, the key or the account,
 /// even when the venue's answer echoes them in its code and message, checked by the rehearsal's
 /// secret search: every word of the venue's text that could hold one is withheld, the rest
