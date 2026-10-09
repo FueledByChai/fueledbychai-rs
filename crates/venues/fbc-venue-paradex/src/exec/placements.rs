@@ -11,7 +11,9 @@
 //!   id and its venue id, pushed before the order update. Its kind is
 //!   `RejectKind::PostOnlyWouldCross` for `POST_ONLY_WOULD_CROSS` and `RejectKind::Other` for
 //!   any other reason; the reason is its `raw`, and it carries no `venue_code`: Paradex states
-//!   a cancel reason, not one of the codes `REJECT_CODES` keys on (0069).
+//!   a cancel reason, not one of the codes `REJECT_CODES` keys on (0069). An IOC or MARKET
+//!   order closed with nothing filled is refused only for NOT_ENOUGH_MARGIN; for any other
+//!   reason but our cancel it expired past the risk check, and is passed.
 //! - **Withdrawn** (CLOSED with nothing filled by USER_CANCELED) and **Pending** (NEW): neither.
 //!   A withdrawn placement awaits nothing more; a pending one waits for a later event.
 //!

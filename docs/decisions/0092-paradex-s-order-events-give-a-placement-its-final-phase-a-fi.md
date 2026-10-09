@@ -28,6 +28,12 @@ the reply.
   refused modify's is (0054). Its kind is `PostOnlyWouldCross` for POST_ONLY_WOULD_CROSS and
   `Other` for any other reason, the reason its `raw`, and it has no `venue_code`: a cancel
   reason is not a code 0069's table keys on.
+- **An IOC or MARKET order expired.** An IOC or MARKET order (`timeInForce` or `orderType`
+  2) CLOSED with nothing filled found nothing to fill past the risk check: it is passed, not
+  refused, unless its reason is one a source names as the risk check's refusal
+  (NOT_ENOUGH_MARGIN, `fixtures/paradex/exec/README.md`), and the order update alone says it
+  ended `Canceled(Venue)`. No source names the reason Paradex states for an expired IOC, so
+  any reason but that refusal (or USER_CANCELED) is taken as expiry.
 - **Neither.** NEW waits for a later event. CLOSED by USER_CANCELED with nothing filled (our
   cancel before the risk check ended) settles the placement with nothing more.
 - **Its own order.** An event settles a placement only when it names the venue id the
@@ -65,4 +71,7 @@ the reply.
 
 A testnet run (FBC-8xr) showing an OPEN order later refused by the risk check, or a CLOSED
 order with nothing filled that the venue had accepted past its risk check (a self-trade
-prevention cancel, say), which would make one of these phases the wrong one.
+prevention cancel, say), which would make one of these phases the wrong one. Likewise an IOC
+or MARKET order that finds nothing to fill: the run records the cancel reason Paradex states
+for it, and any reason it states for a risk-check refusal of an IOC order other than
+NOT_ENOUGH_MARGIN, which this record would take for expiry.
