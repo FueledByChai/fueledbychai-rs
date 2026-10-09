@@ -261,15 +261,18 @@ impl NonceSource for Counting {
     }
 }
 
-/// What the session told its handler: every event and every submission's handle.
+/// What the session told its handler: every event, the connection epoch each came on, and
+/// every submission's handle.
 #[derive(Clone, Default)]
 pub(crate) struct Heard {
     events: Rc<RefCell<Vec<ExecEvent>>>,
+    epochs: Rc<RefCell<Vec<u32>>>,
     handles: Rc<RefCell<Vec<SubmitHandle>>>,
 }
 
 impl ExecHandler for Heard {
     fn on_exec(&mut self, env: Envelope<ExecEvent>) {
+        self.epochs.borrow_mut().push(env.stamp.conn.epoch);
         self.events.borrow_mut().push(env.body);
     }
 
@@ -493,6 +496,12 @@ impl Ctx<'_> {
     /// Every event the session reported, in order.
     pub fn events(&self) -> Vec<ExecEvent> {
         self.heard.events.borrow().clone()
+    }
+
+    /// The connection epoch each event of [`Ctx::events`] came on, in the same order: the
+    /// runtime stamps it, so a later epoch's events are a reconnect's (Codex r4225971621).
+    pub fn epochs(&self) -> Vec<u32> {
+        self.heard.epochs.borrow().clone()
     }
 
     /// How many frames the stub received on every connection of the session that carry `cid` as

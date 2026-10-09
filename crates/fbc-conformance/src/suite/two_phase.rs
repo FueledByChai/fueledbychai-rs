@@ -136,14 +136,18 @@ async fn two_phase(
 }
 
 /// What followed placement `cid`'s provisional acceptance, request `rpc`, so far: whether a
-/// final acceptance of the request came, and whether an asynchronous reject of a placement
-/// naming the order did, by our client id or a venue id the request's outcomes name.
+/// final acceptance of the request came after it, and whether an asynchronous reject of a
+/// placement naming the order did, by our client id or a venue id the request's outcomes name
+/// (Codex r4225971611: one reported before the provisional acceptance does not follow it).
 fn second_phase(c: &Ctx<'_>, rpc: RpcId, cid: ClientOrderId) -> (bool, bool) {
     let outcomes = c.outcomes(rpc);
-    let fin = SubmitOutcome::Accepted {
-        ack: AckLevel::Final,
-    };
-    let accepted = outcomes.iter().any(|(_, o)| *o == fin);
+    let events = c.events();
+    let level = |ack| SubmitOutcome::Accepted { ack };
+    let of = |e: &ExecEvent, ack| matches!(e, ExecEvent::Outcome { rpc: r, outcome, .. } if *r == rpc && *outcome == level(ack));
+    // Called once a provisional acceptance was reported; none follows where none was.
+    let first = events.iter().position(|e| of(e, AckLevel::Provisional));
+    let after = &events[first.unwrap_or(events.len())..];
+    let accepted = after.iter().any(|e| of(e, AckLevel::Final));
     let vids: Vec<VenueOrderId> = outcomes
         .iter()
         .filter_map(|(it, _)| it.as_ref().and_then(|it: &ItemRef| it.vid.clone()))
@@ -156,5 +160,5 @@ fn second_phase(c: &Ctx<'_>, rpc: RpcId, cid: ClientOrderId) -> (bool, bool) {
         }
         _ => false,
     };
-    (accepted, c.events().iter().any(rejects))
+    (accepted, after.iter().any(rejects))
 }

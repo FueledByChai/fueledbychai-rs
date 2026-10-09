@@ -8,7 +8,7 @@
 //! the kind it maps to as `RejectKind`'s `Debug` spells it (`InvalidPrice`,
 //! `RateLimited { retry_after: None }`, `AlreadyTerminal(Unspecified)`, `Other`); blank lines
 //! and lines starting with `#` are ignored. Each placement's outcome must be one `Rejected` of
-//! its single item (or of the whole request) carrying the code as `Reject::venue_code` and the
+//! its single item (naming no other order's client id) or of the whole request, carrying the code as `Reject::venue_code` and the
 //! table's kind. A table that is missing, lists no code, or has a line with no kind fails: a
 //! pass that probed nothing would prove nothing.
 
@@ -42,14 +42,18 @@ pub fn reject_coverage(subject: &Subject<'static>) -> Result<Verdict, Failure> {
         c.ready().await?;
         let mut sent = Vec::new();
         for _ in &table {
-            let (_, auth) = c.oms.place(c.h)?;
-            sent.push(c.send(auth, OpKind::Place).await?);
+            let (cid, auth) = c.oms.place(c.h)?;
+            sent.push((c.send(auth, OpKind::Place).await?, cid));
         }
         c.answered().await?;
         let mut breaches = Vec::new();
-        for (rpc, (code, kind)) in sent.into_iter().zip(&table) {
+        for ((rpc, cid), (code, kind)) in sent.into_iter().zip(&table) {
             let outcomes = c.outcomes(rpc);
-            let whole = |it: &Option<ItemRef>| it.as_ref().is_none_or(|it| it.idx == 0);
+            // Its one item, naming the placement where it names an order (Codex r4225971615).
+            let whole = |it: &Option<ItemRef>| {
+                it.as_ref()
+                    .is_none_or(|it| it.idx == 0 && it.cid.is_none_or(|named| named == cid))
+            };
             let [(item, SubmitOutcome::Rejected(reject))] = outcomes.as_slice() else {
                 let what = format!(
                     "the placement the stub refused under code {code} was reported \
