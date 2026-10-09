@@ -209,6 +209,7 @@ impl Registry {
         at: MonoNs,
         wall: WallNs,
     ) -> Result<(), OmsError> {
+        self.reap_dropped();
         let rec = self.orders.get_mut(&cid).ok_or(OmsError::UnknownCid(cid))?;
         match rec.sent_at() {
             Some(known) if known != (at, wall) => Err(OmsError::SentRecorded(cid)),
@@ -227,6 +228,7 @@ impl Registry {
     /// resyncs decide, and a tombstone cancel by client id once it has been on the ladder the
     /// maximum time, and again each maximum after. Orders in client id order.
     pub fn ladder(&mut self, cfg: &LadderConfig, caps: &OrderCaps, now: MonoNs) -> LadderPlan {
+        self.reap_dropped();
         let mut plan = LadderPlan::default();
         // Forget the queries no order awaits any more: it left the ladder (an event resolved
         // it, or it ended) or gave its query up, and the result may never come.
@@ -268,6 +270,7 @@ impl Registry {
     /// Records the request the ladder's query for `cid` was sent under, which its answer or
     /// outcome names.
     pub fn query_sent(&mut self, cid: ClientOrderId, rpc: RpcId) -> Result<(), OmsError> {
+        self.reap_dropped();
         let rec = self.orders.get_mut(&cid).ok_or(OmsError::UnknownCid(cid))?;
         rec.set_query_rpc(Some(rpc));
         self.queries.insert(rpc, cid);
@@ -292,6 +295,7 @@ impl Registry {
         answer: &QueryAnswer,
         key: OrderKey,
     ) -> LadderResolution {
+        self.reap_dropped();
         let Some(cid) = self.ladder_query(answer.rpc()) else {
             return LadderResolution::Ignored;
         };
@@ -332,6 +336,7 @@ impl Registry {
     /// Applies the outcome of a ladder query's request: unanswered, not sent or refused, the
     /// query was inconclusive and resyncs decide; accepted, its answer is still to come.
     pub fn on_query_outcome(&mut self, rpc: RpcId, outcome: &SubmitOutcome) -> LadderResolution {
+        self.reap_dropped();
         if matches!(outcome, SubmitOutcome::Accepted { .. }) {
             return LadderResolution::Ignored;
         }
@@ -363,6 +368,7 @@ impl Registry {
         orders: &[VenueOrderSnapshot],
         key: OrderKey,
     ) -> ResyncApplied {
+        self.reap_dropped();
         let mut applied = ResyncApplied::default();
         let mut shown = std::collections::HashSet::new();
         for snap in orders {
@@ -441,6 +447,7 @@ impl Registry {
         rpc: RpcId,
         now: MonoNs,
     ) -> Result<bool, OmsError> {
+        self.reap_dropped();
         let rec = self.orders.get_mut(&cid).ok_or(OmsError::UnknownCid(cid))?;
         Ok(rec.tombstone_sent(rpc, now))
     }

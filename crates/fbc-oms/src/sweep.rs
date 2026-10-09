@@ -190,6 +190,7 @@ impl Registry {
         market: InstrumentId,
         caps: &OrderCaps,
     ) -> CancelEverything {
+        self.reap_dropped();
         let why = if caps.cancel_all_instrument != Support::Native {
             Some(CancelAllRefusal::Unsupported)
         } else if !self.entries.holds_exclusive(market) {

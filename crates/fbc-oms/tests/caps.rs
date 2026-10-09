@@ -154,7 +154,7 @@ fn accepted() -> SubmitOutcome {
 /// Places `order` and acknowledges it under the venue id `v`: Open.
 fn open(reg: &mut Registry, order: NewOrder, v: &str) -> ClientOrderId {
     let c = order.cid;
-    reg.place(order).unwrap();
+    arm::place_issued(reg, order);
     outcome(reg, c, OrderOp::Place, accepted(), Some(v));
     assert_eq!(reg.get(c).unwrap().state(), OrdState::Open);
     c
@@ -215,6 +215,7 @@ fn a_place_whose_admission_would_breach_the_inventory_cap_is_never_built_reduce_
         let built = reg.place(order.clone()).unwrap();
         assert_eq!(built.command(), &VenueCommand::Place(order.clone()));
         assert_eq!(reg.get(order.cid).unwrap().state(), OrdState::PendingNew);
+        arm::issue(&mut reg, built);
     }
     // A fifth would take the worst case to 55: refused, never built, never registered, the
     // venue's reduce-only flag and the OMS's reducing class making no difference.
@@ -226,15 +227,15 @@ fn a_place_whose_admission_would_breach_the_inventory_cap_is_never_built_reduce_
     assert_eq!(reg.len(), 4);
     // Six more fit exactly; seven do not.
     assert_eq!(reg.place(buy(7)), Err(capped(Side::Buy, 51)));
-    reg.place(buy(6)).unwrap();
+    arm::place_issued(&mut reg, buy(6));
     assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(CAP)));
     // The other side has its own worst case: 50 lots of offers rest against no position.
     for _ in 0..4 {
-        reg.place(sell(L0)).unwrap();
+        arm::place_issued(&mut reg, sell(L0));
     }
     assert_eq!(reg.place(sell(7)), Err(capped(Side::Sell, 51)));
     assert_eq!(reg.place(reduce_only(sell(7))), Err(capped(Side::Sell, 51)));
-    reg.place(sell(6)).unwrap();
+    arm::place_issued(&mut reg, sell(6));
     assert_eq!(reg.resting_on(INST, Side::Sell), Some(lots(CAP)));
     // Another market's orders count only on their own market.
     assert_eq!(reg.resting_on(OTHER, Side::Buy), Some(Lots::ZERO));
@@ -245,7 +246,7 @@ fn pending_new_and_unknown_orders_count_as_fully_resting() {
     let mut reg = registry(CAP, WIDE);
     let a = buy(30);
     let a_cid = a.cid;
-    reg.place(a).unwrap();
+    arm::place_issued(&mut reg, a);
     // PendingNew: all 30 count.
     assert_eq!(reg.place(buy(21)), Err(capped(Side::Buy, 51)));
     // Unanswered by its deadline: Unknown, still all 30.
@@ -258,7 +259,7 @@ fn pending_new_and_unknown_orders_count_as_fully_resting() {
     );
     assert_eq!(reg.get(a_cid).unwrap().state(), OrdState::Unknown);
     assert_eq!(reg.place(buy(21)), Err(capped(Side::Buy, 51)));
-    reg.place(buy(20)).unwrap();
+    arm::place_issued(&mut reg, buy(20));
 }
 
 #[test]
@@ -288,7 +289,7 @@ fn a_partly_filled_orders_remainder_counts_until_it_is_terminal() {
     assert!(reg.get(a).unwrap().state().is_terminal());
     assert_eq!(reg.resting_on(INST, Side::Buy), Some(Lots::ZERO));
     assert_eq!(reg.place(buy(41)), Err(capped(Side::Buy, 51)));
-    reg.place(buy(40)).unwrap();
+    arm::place_issued(&mut reg, buy(40));
 }
 
 #[test]
@@ -330,7 +331,7 @@ fn a_fill_the_venue_reported_counts_until_its_fill_event_moves_the_inventory() {
     assert_eq!(reg.inventory(INST), SignedLots(50));
     assert_eq!(reg.get(a).unwrap().exposure(), Lots::ZERO);
     assert_eq!(reg.place(buy(1)), Err(capped(Side::Buy, 51)));
-    reg.place(sell(L0)).unwrap();
+    arm::place_issued(&mut reg, sell(L0));
 }
 
 // ---- amends and replaces ----
@@ -341,7 +342,7 @@ fn an_amend_or_a_replace_whose_admission_would_breach_the_inventory_cap_is_never
         let venue = amending(keeps_venue_id);
         let mut reg = registry(CAP, WIDE);
         let a = open(&mut reg, buy(20), "a");
-        reg.place(buy(20)).unwrap();
+        arm::place_issued(&mut reg, buy(20));
         // 20 more than the other 20 rest is 40; 31 would make 51: refused, the reducing
         // class included, and nothing is in flight on the order.
         for reducing in [false, true] {
@@ -399,7 +400,7 @@ fn an_amend_in_flight_counts_at_the_larger_of_its_old_and_new_quantity() {
         },
     );
     assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(10)));
-    reg.place(buy(40)).unwrap();
+    arm::place_issued(&mut reg, buy(40));
 }
 
 #[test]
@@ -424,7 +425,7 @@ fn an_amend_is_judged_at_the_larger_of_its_old_and_new_quantity_so_shrinking_pas
     // Within the cap, a shrinking amend is built, still judged at its old 30.
     let mut reg = registry(CAP, WIDE);
     let b = open(&mut reg, buy(30), "b");
-    reg.place(buy(20)).unwrap();
+    arm::place_issued(&mut reg, buy(20));
     amend(&mut reg, &venue, b, 10, false).unwrap();
 }
 
@@ -611,10 +612,10 @@ fn an_order_that_genuinely_reduces_the_position_is_admitted_by_the_formula() {
     };
     assert_eq!(reg.place(mislabelled), Err(capped(Side::Buy, 61)));
     // An offer that reduces it is admitted by the formula, |60 - 30| = 30, without any flag.
-    reg.place(sell(30)).unwrap();
+    arm::place_issued(&mut reg, sell(30));
     // The reducing side may rest past the position, until the worst case on the far side of
     // zero reaches the cap: |60 - 30 - 80| = 50.
-    reg.place(sell(80)).unwrap();
+    arm::place_issued(&mut reg, sell(80));
     assert_eq!(reg.place(sell(1)), Err(capped(Side::Sell, 51)));
     assert_eq!(reg.place(reduce_only(sell(1))), Err(capped(Side::Sell, 51)));
 }
@@ -726,7 +727,7 @@ fn a_market_admits_nothing_until_its_position_is_seeded_from_the_venue() {
     arm::start(&mut reg, INST);
     assert_eq!(reg.inventory(INST), SignedLots(50));
     assert_eq!(reg.place(buy(1)), Err(capped(Side::Buy, 52)));
-    reg.place(sell(L0)).unwrap();
+    arm::place_issued(&mut reg, sell(L0));
     // Seeded once only.
     assert_eq!(
         reg.seed_position(INST, SignedLots(0)),
@@ -755,7 +756,7 @@ fn a_worst_case_that_does_not_fit_is_refused() {
     let max = i64::MAX;
     // Resting that would overflow.
     let mut reg = registry(max, max);
-    reg.place(buy(max)).unwrap();
+    arm::place_issued(&mut reg, buy(max));
     assert_eq!(
         reg.place(buy(1)),
         Err(OmsError::Capped(breach(Side::Buy, None, max)))
@@ -845,13 +846,13 @@ fn a_place_i6_admits_is_never_built_past_the_resting_cap_reduce_only_included() 
     // Flat, I6 alone admits a second $11 order on each side: |0 + 22| <= 50.
     let mut wide = registry(CAP, WIDE);
     for order in [buy(L0), buy(L0), sell(L0), sell(L0)] {
-        wide.place(order).unwrap();
+        arm::place_issued(&mut wide, order);
     }
     // The resting cap admits one per side: anything more is refused, never built and never
     // registered, the reduce-only flag and the reducing class making no difference.
     let mut reg = first_config();
-    reg.place(buy(L0)).unwrap();
-    reg.place(sell(L0)).unwrap();
+    arm::place_issued(&mut reg, buy(L0));
+    arm::place_issued(&mut reg, sell(L0));
     for (order, side) in [
         (buy(1), Side::Buy),
         (reduce_only(buy(1)), Side::Buy),
@@ -875,9 +876,9 @@ fn a_reducing_ladder_i6_admits_up_to_twice_the_inventory_cap_is_refused_past_the
     let mut l = ledger();
     position(&mut wide, &mut l, Side::Buy, CAP, "p");
     for _ in 0..9 {
-        wide.place(reduce_only(sell(L0))).unwrap();
+        arm::place_issued(&mut wide, reduce_only(sell(L0)));
     }
-    wide.place(reduce_only(sell(1))).unwrap();
+    arm::place_issued(&mut wide, reduce_only(sell(1)));
     assert_eq!(wide.resting_on(INST, Side::Sell), Some(lots(2 * CAP)));
     assert_eq!(
         wide.place(reduce_only(sell(1))),
@@ -888,7 +889,7 @@ fn a_reducing_ladder_i6_admits_up_to_twice_the_inventory_cap_is_refused_past_the
     let mut reg = first_config();
     let mut l = ledger();
     position(&mut reg, &mut l, Side::Buy, CAP, "p");
-    reg.place(reduce_only(sell(L0))).unwrap();
+    arm::place_issued(&mut reg, reduce_only(sell(L0)));
     for _ in 0..9 {
         let rung = reduce_only(sell(L0));
         let c = rung.cid;
@@ -921,7 +922,7 @@ fn an_amend_or_a_replace_i6_admits_is_never_built_past_the_resting_cap() {
         let venue = amending(keeps_venue_id);
         let mut reg = first_config();
         let a = open(&mut reg, buy(5), "a");
-        reg.place(buy(6)).unwrap();
+        arm::place_issued(&mut reg, buy(6));
         // Growing 5 to 6 would rest 12: I6 admits it (|12| <= 50), the resting cap does not,
         // the reducing class included; nothing is built or in flight on the order.
         for reducing in [false, true] {
@@ -980,7 +981,7 @@ fn an_amend_in_flight_counts_against_the_resting_cap_at_the_larger_of_its_old_an
     // Confirmed at 5: six more fit, seven do not.
     assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(5)));
     assert_eq!(reg.place(buy(7)), Err(resting_capped(Side::Buy, 12)));
-    reg.place(buy(6)).unwrap();
+    arm::place_issued(&mut reg, buy(6));
 }
 
 #[test]
@@ -988,7 +989,7 @@ fn pending_new_unknown_and_a_partly_filled_remainder_count_against_the_resting_c
     let mut reg = first_config();
     let a = buy(L0);
     let a_cid = a.cid;
-    reg.place(a).unwrap();
+    arm::place_issued(&mut reg, a);
     // PendingNew: all 11 rest.
     assert_eq!(reg.place(buy(1)), Err(resting_capped(Side::Buy, 12)));
     // Unanswered by its deadline: Unknown, still all 11.
@@ -1008,7 +1009,7 @@ fn pending_new_unknown_and_a_partly_filled_remainder_count_against_the_resting_c
     fill_of(&mut reg, &mut l, b, Side::Buy, 5, "f1");
     assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(6)));
     assert_eq!(reg.place(buy(6)), Err(resting_capped(Side::Buy, 12)));
-    reg.place(buy(5)).unwrap();
+    arm::place_issued(&mut reg, buy(5));
     let mut done = update(Some(b), canceled(), 5);
     done.vid = Some(vid("b"));
     reg.apply_update(
@@ -1019,7 +1020,7 @@ fn pending_new_unknown_and_a_partly_filled_remainder_count_against_the_resting_c
         },
     );
     assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(5)));
-    reg.place(buy(6)).unwrap();
+    arm::place_issued(&mut reg, buy(6));
 }
 
 #[test]
@@ -1042,10 +1043,10 @@ fn fills_the_venue_reported_count_against_the_inventory_cap_but_no_longer_rest()
     );
     assert_eq!(reg.resting_on(INST, Side::Buy), Some(Lots::ZERO));
     assert_eq!(reg.place(buy(10)), Err(capped(Side::Buy, 51)));
-    reg.place(buy(9)).unwrap();
+    arm::place_issued(&mut reg, buy(9));
     assert_eq!(reg.place(buy(3)), Err(capped(Side::Buy, 53)));
     // Offers reduce the 41 by I6's formula; the resting cap still bounds them.
-    reg.place(sell(L0)).unwrap();
+    arm::place_issued(&mut reg, sell(L0));
     assert_eq!(reg.place(sell(1)), Err(resting_capped(Side::Sell, 12)));
 }
 
@@ -1280,7 +1281,8 @@ proptest! {
                     let before = worst(&reg, &tracked, s, q);
                     let rest_before = resting(&reg, &tracked, s) + q;
                     match reg.place(o.clone()) {
-                        Ok(_) => {
+                        Ok(cmd) => {
+                            arm::issue(&mut reg, cmd);
                             tracked.push(o.cid);
                             prop_assert!(worst(&reg, &tracked, s, 0) <= CAP);
                             prop_assert!(resting(&reg, &tracked, s) <= RCAP);
@@ -1310,6 +1312,9 @@ proptest! {
                         Some(other) => panic!("{other:?}"),
                     };
                     prop_assert_eq!(built.len() + plan.refused.len(), orders.len());
+                    if let Some(cmd) = plan.command {
+                        arm::issue(&mut reg, cmd);
+                    }
                     for o in &orders {
                         let i = usize::from(o.side == Side::Sell);
                         let r = rest[i] + o.qty.get();
@@ -1396,5 +1401,5 @@ fn a_fill_named_by_venue_id_reduces_the_remainder_it_counts() {
     }
     assert_eq!(reg.resting_on(INST, Side::Buy), Some(Lots::ZERO));
     assert_eq!(reg.place(buy(21)), Err(capped(Side::Buy, 51)));
-    reg.place(buy(20)).unwrap();
+    arm::place_issued(&mut reg, buy(20));
 }

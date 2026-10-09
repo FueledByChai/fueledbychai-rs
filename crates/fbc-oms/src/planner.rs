@@ -421,6 +421,7 @@ impl ExecutionPlanner {
         now: MonoNs,
     ) -> Result<Plan, PlanError> {
         self.bind(acct, reg)?;
+        reg.reap_dropped();
         let market = desired.market;
         let config = self.config;
         let slots = self.slots.entry((acct, market)).or_default();

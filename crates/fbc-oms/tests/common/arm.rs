@@ -8,11 +8,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fbc_core::{
-    AccountLease, InstrumentId, MarketLease, MonoNs, NamedLeaseError, NonceScope, OrderCaps,
-    SignedLots, SnapshotSource, WallNs,
+    AccountKey, AccountLease, InstrumentId, MarketLease, MonoNs, NamedLeaseError, NewOrder,
+    NonceScope, OrderCaps, SignedLots, SnapshotSource, WallNs,
 };
 use fbc_oms::{
-    LadderConfig, LeaseKeys, Leases, MarketEntry, OrderKey, Registry, ResyncReport, ResyncSnapshot,
+    LadderConfig, LeaseKeys, Leases, MarketEntry, OrderKey, PermittedCommand, Registry,
+    ResyncReport, ResyncSnapshot,
 };
 
 use crate::common::{lease_dir, order_caps, symbol};
@@ -120,4 +121,21 @@ pub fn seed(reg: &mut Registry, positions: &[(InstrumentId, i64)]) -> ResyncRepo
 pub fn start(reg: &mut Registry, market: InstrumentId) -> MarketEntry {
     let leases = leases(reg, market);
     reg.start(market, leases).unwrap()
+}
+
+/// The account the tests' places are authorized for.
+pub const TEST_ACCT: AccountKey = AccountKey::new(1);
+
+/// Authorizes `cmd` for the tests' account, as a gateway is handed it: the authorization
+/// spends a place's command, so the gateway's outcomes then apply by client id (decision 0082),
+/// and the place is no longer held, so dropping nothing releases it (FBC-657c).
+pub fn issue(reg: &mut Registry, cmd: PermittedCommand) {
+    drop(reg.authorize(TEST_ACCT, cmd).unwrap());
+}
+
+/// Places `order` and authorizes it for the tests' account ([`issue`]): PendingNew, its
+/// outcomes applying.
+pub fn place_issued(reg: &mut Registry, order: NewOrder) {
+    let cmd = reg.place(order).unwrap();
+    issue(reg, cmd);
 }

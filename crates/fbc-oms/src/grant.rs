@@ -371,6 +371,7 @@ impl Registry {
         acct: AccountKey,
         cmd: PermittedCommand,
     ) -> Result<Authorization, IssueRefusal> {
+        self.reap_dropped();
         if cmd.origin() != self.instance() {
             return Err(IssueRefusal::OtherRegistry);
         }

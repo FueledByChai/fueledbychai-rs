@@ -765,6 +765,7 @@ impl Registry {
         market: InstrumentId,
         leases: Leases,
     ) -> Result<MarketEntry, ArmRefusal> {
+        self.reap_dropped();
         let seeding = self.seeding(market);
         self.entries
             .arm(market, EntryState::Quoting, leases, seeding)
@@ -777,6 +778,7 @@ impl Registry {
         market: InstrumentId,
         leases: Leases,
     ) -> Result<MarketEntry, ArmRefusal> {
+        self.reap_dropped();
         let seeding = self.seeding(market);
         self.entries
             .arm(market, EntryState::Exit(ExitKind::Flatten), leases, seeding)
@@ -788,6 +790,7 @@ impl Registry {
         market: InstrumentId,
         leases: Leases,
     ) -> Result<MarketEntry, ArmRefusal> {
+        self.reap_dropped();
         let seeding = self.seeding(market);
         self.entries.arm(
             market,
@@ -801,12 +804,14 @@ impl Registry {
     /// become Cancel-only, so arming again takes Start, Flatten or Wind-down. A Killed market
     /// stays Killed. On a disarmed market it changes nothing.
     pub fn disarm(&mut self, market: InstrumentId) -> MarketEntry {
+        self.reap_dropped();
         self.entries.disarm(market)
     }
 
     /// Turns `market`'s kill switch on: Killed from any state, armed or not, the armed flag
     /// unchanged.
     pub fn kill(&mut self, market: InstrumentId) -> MarketEntry {
+        self.reap_dropped();
         let armed = self.entries.armed(market);
         self.entries.set(market, EntryState::Killed, armed)
     }
@@ -815,6 +820,7 @@ impl Registry {
     /// never resumes order entry; the armed flag is unchanged. On a market not Killed it
     /// changes nothing.
     pub fn lift_kill(&mut self, market: InstrumentId) -> MarketEntry {
+        self.reap_dropped();
         let armed = self.entries.armed(market);
         match self.entries.state(market) {
             EntryState::Killed => self.entries.set(market, EntryState::CancelOnly, armed),

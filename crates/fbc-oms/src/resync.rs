@@ -376,6 +376,7 @@ impl Registry {
         snap: &ResyncSnapshot,
         key: OrderKey,
     ) -> Result<ResyncReport, ResyncError> {
+        self.reap_dropped();
         let mut positions = HashMap::new();
         for &(inst, pos) in &snap.positions {
             if positions.insert(inst, pos).is_some() {

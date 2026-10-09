@@ -13,7 +13,9 @@
 //! is what an amend, a cancel or a cancel-many is authorized from (decision 0045). It records
 //! the registry that built it, and an amend's build token names that registry with its order
 //! and build number, so no other registry authorizes it or releases its reservation (decision
-//! 0082).
+//! 0082). A place's or a batch's command holds its orders: dropped unauthorized and not
+//! withdrawn, it hands them back to its registry, which ends each not sent ([`DroppedPlaces`];
+//! decision 0084), so no held place is stranded.
 //!
 //! A cancel names its order by the reference design §4.9 orders, as the venue's
 //! [`OrderCaps`] declare them (0032): the venue id when it is known and a cancel can name it;
@@ -29,6 +31,8 @@
 //! which the codec would not pick (FBC-03fi).
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use fbc_core::{
     AmendOrder, AmendQty, CancelOrder, ChosenRef, ClientOrderId, InstrumentId, Lots, Namespace,
@@ -118,6 +122,14 @@ pub enum AmendRefusal {
 /// command is issued only from one (0045), only by the registry that built it, which judges a
 /// place, a batch or an amend against its caps again then (decision 0082). It has no `Clone`:
 /// each one is authorized once.
+///
+/// A place's or a batch's command holds its orders until an authorization is issued from it or
+/// it is withdrawn ([`Registry::place_not_submitted`]). Dropped otherwise, wherever it was
+/// dropped (an early return, `let _ =`, passed to [`Registry::amend_not_submitted`], refused by
+/// another registry, on another thread), it hands its orders back to the registry that built
+/// it, which ends each still held not sent
+/// ([`NotSentReason::StaleAuthorization`](fbc_core::NotSentReason::StaleAuthorization)) at
+/// its next mutating call, freeing what it counted (decision 0084).
 #[derive(Eq, PartialEq, Debug)]
 pub struct PermittedCommand {
     cmd: VenueCommand,
@@ -133,6 +145,9 @@ pub struct PermittedCommand {
     /// and the foreign orders seen) for an instrument cancel-all (decision 0060); nothing for a
     /// cancel or a cancel-many.
     guard: Guard,
+    /// For a place or a batch, its hold on its orders, handed back to its registry when the
+    /// command is dropped unauthorized and not withdrawn; nothing for any other command.
+    hold: Hold,
 }
 
 impl PermittedCommand {
@@ -141,9 +156,22 @@ impl PermittedCommand {
         &self.cmd
     }
 
-    /// The command and its guard, for the authorization issued from it.
+    /// The command and its guard, for the authorization issued from it, which spends its
+    /// hold on its orders.
     pub(crate) fn into_parts(self) -> (VenueCommand, Guard) {
-        (self.cmd, self.guard)
+        let PermittedCommand {
+            cmd,
+            guard,
+            mut hold,
+            ..
+        } = self;
+        hold.spend();
+        (cmd, guard)
+    }
+
+    /// Spends its hold on its orders: its registry withdrew them itself.
+    pub(crate) fn spend_hold(&mut self) {
+        self.hold.spend();
     }
 
     /// A cancel or a cancel-many a [`Cancellable`] permit of the registry `origin` built,
@@ -158,6 +186,7 @@ impl PermittedCommand {
             origin,
             built: None,
             guard: Guard::default(),
+            hold: Hold::default(),
         }
     }
 
@@ -170,6 +199,23 @@ impl PermittedCommand {
             origin,
             built: None,
             guard,
+            hold: Hold::default(),
+        }
+    }
+
+    /// A place or a batch of places the registry `origin` admitted, as [`Self::guarded`],
+    /// holding its orders: dropped unauthorized and not withdrawn, it hands them to `dropped`,
+    /// the registry's.
+    pub(crate) fn holding(
+        cmd: VenueCommand,
+        guard: Guard,
+        origin: Instance,
+        dropped: &Arc<DroppedPlaces>,
+    ) -> PermittedCommand {
+        let cids = places_of(&cmd);
+        PermittedCommand {
+            hold: Hold(Some(Box::new((Arc::clone(dropped), cids)))),
+            ..PermittedCommand::guarded(cmd, guard, origin)
         }
     }
 
@@ -183,6 +229,74 @@ impl PermittedCommand {
         self.built
     }
 }
+
+/// The client ids of the orders a place or a batch of places opens; none for any other command.
+pub(crate) fn places_of(cmd: &VenueCommand) -> Vec<ClientOrderId> {
+    match cmd {
+        VenueCommand::Place(order) => vec![order.cid],
+        VenueCommand::PlaceBatch(orders) => orders.iter().map(|o| o.cid).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The orders of a registry whose place or batch command was dropped while it still held
+/// them, neither authorized nor withdrawn (decision 0084): the registry ends each still held not
+/// sent at its next mutating call. Shared by the
+/// registry with the commands it builds, which may be dropped on any thread.
+#[derive(Debug, Default)]
+pub(crate) struct DroppedPlaces {
+    /// Whether `cids` may hold any: read without the lock on every mutating call.
+    any: AtomicBool,
+    cids: Mutex<Vec<ClientOrderId>>,
+}
+
+impl DroppedPlaces {
+    fn hand_back(&self, cids: Vec<ClientOrderId>) {
+        let mut held = self.cids.lock().unwrap_or_else(PoisonError::into_inner);
+        held.extend(cids);
+        self.any.store(true, Ordering::Release);
+    }
+
+    /// The orders handed back since the last call, in the order handed back.
+    pub(crate) fn take(&self) -> Vec<ClientOrderId> {
+        if !self.any.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        let mut held = self.cids.lock().unwrap_or_else(PoisonError::into_inner);
+        self.any.store(false, Ordering::Release);
+        std::mem::take(&mut *held)
+    }
+}
+
+/// A place's or a batch's hold on its orders: dropped unspent, it hands them back to its
+/// registry's [`DroppedPlaces`]. It is not part of what the command is: commands compare
+/// equal whatever their holds. Boxed, so it adds one pointer to every command.
+#[derive(Debug, Default)]
+struct Hold(Option<Box<(Arc<DroppedPlaces>, Vec<ClientOrderId>)>>);
+
+impl Hold {
+    /// The authorization issued from the command, or its withdrawal, took its orders.
+    fn spend(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        if let Some(held) = self.0.take() {
+            let (dropped, cids) = *held;
+            dropped.hand_back(cids);
+        }
+    }
+}
+
+impl PartialEq for Hold {
+    fn eq(&self, _: &Hold) -> bool {
+        true
+    }
+}
+
+impl Eq for Hold {}
 
 /// What a [`Cancellable`] permit built.
 #[derive(Eq, PartialEq, Debug)]
@@ -336,6 +450,7 @@ impl<'r> Live<'r> {
             origin: self.origin,
             built: Some((cid, build)),
             guard: self.guard,
+            hold: Hold::default(),
         })
     }
 }
