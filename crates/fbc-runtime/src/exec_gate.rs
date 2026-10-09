@@ -430,8 +430,9 @@ impl Gate {
     }
 
     /// An event or a query answer of the latest epoch showed an order on `inst` in `state`,
-    /// under `vid` and naming `cid`, where they are given: kept while a resync runs (`early`)
-    /// or an order is held on `inst`, and applied to every held order.
+    /// under `vid` and naming `cid`, where they are given: kept under `inst` while a resync
+    /// runs (`early`) or an order is held on `inst`, and applied to the orders held on `inst`
+    /// (Reviewer B RB-48j7-2 on PR #140).
     fn shown(
         &mut self,
         cid: Option<CidMatch>,
