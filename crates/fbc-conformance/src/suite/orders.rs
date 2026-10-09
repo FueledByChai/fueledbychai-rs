@@ -282,7 +282,7 @@ impl Flags {
 
 /// Whether an item's outcomes are one acceptance as `model` has it (Codex r4222568826): one
 /// final acceptance, or, on a two-phase venue, a provisional one, then at most one final.
-fn accepted_once(outcomes: &[&SubmitOutcome], model: AckModel) -> bool {
+pub(super) fn accepted_once(outcomes: &[&SubmitOutcome], model: AckModel) -> bool {
     let level = |o: &&SubmitOutcome| match o {
         SubmitOutcome::Accepted { ack } => Some(*ack),
         _ => None,
@@ -727,7 +727,7 @@ pub fn unknown_on_timeout(subject: &Subject<'static>) -> Result<Verdict, Failure
 
 /// A breach when the order `cid` names was written more than once, as [`Ctx::written`] counts
 /// it.
-fn resent(c: &Ctx<'_>, cid: ClientOrderId, what: &str) -> Option<Breach> {
+pub(super) fn resent(c: &Ctx<'_>, cid: ClientOrderId, what: &str) -> Option<Breach> {
     let times = c.written(cid);
     (times > 1).then(|| {
         let what = format!("{what} was written {times} times; a request is never resent");
@@ -737,7 +737,7 @@ fn resent(c: &Ctx<'_>, cid: ClientOrderId, what: &str) -> Option<Breach> {
 
 /// `breaches` as the check's verdict: passed, probing what `probed` lists, when there are
 /// none.
-fn verdict(
+pub(super) fn verdict(
     check: &'static str,
     breaches: Vec<Breach>,
     probed: impl FnOnce() -> Vec<String>,

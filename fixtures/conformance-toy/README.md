@@ -49,10 +49,15 @@ A check that reads recorded data reads it from a subdirectory named after the ch
   liquidity they show, public only (`book_channels/book`). The toy's `rpi_book` is anchored on
   REST, which the suite does not drive yet (FBC-fhk4), so it has no case; the toy's market
   data is text, so `continuity` has no `longer_block/` sub-case here.
+- `reject_coverage/table.txt`: the toy's own made-up reject codes (its `REJECT_CODES`, in
+  `crates/fbc-conformance/src/toy/decode.rs`), each followed by the `RejectKind` it maps to as
+  the kind's `Debug` spells it, and one code the toy does not know, which maps to `Other`
+  (decision 0085).
 
 `caps_truthful`, `commands_selfcontained`, `encode_deterministic`, `price_grid` and
 `subscriptions_idempotent` read no file: they need only the toy's factory and the setup the
 suite's test gives (the toy's spec table, an empty configuration and no credentials). Nor do
-`amend_ack`, `mixed_batch` and `unknown_on_timeout`: they run the order-entry session against
-the stub server, which answers as the setup's order-entry stub states
-(`crates/fbc-conformance/tests/toy_setup/mod.rs`, decision 0083).
+`amend_ack`, `mixed_batch`, `unknown_on_timeout`, `resync_after_reconnect` and `two_phase_ack`:
+they run the order-entry session against the stub server, which answers as the setup's
+order-entry stub states (`crates/fbc-conformance/tests/toy_setup/mod.rs`, decisions 0083 and
+0085).
