@@ -35,15 +35,15 @@ outcome, 0069), and how the fixture states a kind with a payload.
   request written again.
 - **A final acceptance is `SubmitOutcome::Accepted` at `AckLevel::Final` for the placement's
   request; an asynchronous reject is `ExecEvent::AsyncReject` of a placement naming the order**,
-  by our client id or a venue id the placement's outcomes name. An order update showing the
-  order open is not taken for either: a venue's event may report an order received before its
-  risk check. `two_phase_ack` places one order the stub accepts. On `SinglePhase` no outcome of
-  any request (the arm's included) is provisional, and the placement is accepted once, final. On
-  `TwoPhase` the placement is accepted once as the model has it, naming its one item; where
-  provisionally, the check moves the clock through `risk_reject_window` once the stub has
-  answered, and by then the final acceptance or the asynchronous reject has come after the
-  provisional acceptance, not both. A venue accepting final at once waits for nothing, and the
-  check says so.
+  every identity it states the order's (our client id, a venue id the placement's outcomes name).
+  An order update showing the order open is not taken for either: a venue's event may report an
+  order received before its risk check. `two_phase_ack` places one order the stub accepts. On
+  `SinglePhase` no outcome of any request (the arm's included) is provisional, and the placement
+  is accepted once, final. On `TwoPhase` the placement is accepted once as the model has it,
+  naming its one item; where provisionally, the check moves the clock through `risk_reject_window`
+  once the stub has answered, and by then the final acceptance or the asynchronous reject has come
+  after the provisional acceptance, not both. A venue accepting final at once waits for nothing,
+  and the check says so.
 - **The reject table is a fixture file**, `<fixtures>/reject_coverage/table.txt`: a code, then
   the kind as `RejectKind`'s `Debug` spells it, so a kind with a payload
   (`RateLimited { retry_after: None }`, `AlreadyTerminal(Unspecified)`) needs no parser.
@@ -75,6 +75,9 @@ outcome, 0069), and how the fixture states a kind with a payload.
   FBC-6oj, which has Paradex pass the suite, meets this.
 - An adapter's setup answers `Answer::RejectCode` in its own protocol, and its fixtures list the
   codes it maps (its table from the venue's documents, 0069 for Paradex).
+- `resync_after_reconnect` counts a re-placement as 0083 counts a resend, so one rebuilt and
+  signed again on a venue whose frames carry no textual client id is not caught yet (FBC-xpup;
+  the toy and Paradex send the id as text).
 - A check that waits out a rate limit's window may let a keepalive fire, as 0083 records; the
   reconnect moves the clock only by the pacing delay, in 100 ms steps.
 

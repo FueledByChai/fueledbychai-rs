@@ -138,7 +138,8 @@ async fn two_phase(
 
 /// What followed placement `cid`'s provisional acceptance, request `rpc`, so far: whether a
 /// final acceptance of the request came after it, and whether an asynchronous reject of a
-/// placement naming the order did, by our client id or a venue id the request's outcomes name
+/// placement naming the order did, every identity it states the order's (our client id, a venue
+/// id the request's outcomes name)
 /// (Codex r4225971611: one reported before the provisional acceptance does not follow it).
 fn second_phase(c: &Ctx<'_>, rpc: RpcId, cid: ClientOrderId) -> (bool, bool) {
     let outcomes = c.outcomes(rpc);
@@ -154,10 +155,13 @@ fn second_phase(c: &Ctx<'_>, rpc: RpcId, cid: ClientOrderId) -> (bool, bool) {
         .filter_map(|(it, _)| it.as_ref().and_then(|it: &ItemRef| it.vid.clone()))
         .collect();
     let rejects = |e: &ExecEvent| match e {
+        // Every identity it states is the order's, and it states one (Codex r4226156929).
         ExecEvent::AsyncReject { target, op, .. } => {
+            let (client, venue) = (target.client(), target.venue());
             *op == OpKind::Place
-                && (target.client() == Some(cid)
-                    || target.venue().is_some_and(|vid| vids.contains(vid)))
+                && client.is_none_or(|named| named == cid)
+                && venue.is_none_or(|vid| vids.contains(vid))
+                && (client.is_some() || venue.is_some())
         }
         _ => false,
     };
