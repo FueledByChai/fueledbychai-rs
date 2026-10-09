@@ -7,6 +7,14 @@
 //! never readies the epoch and a reply that refuses its request, an unanswered request reported
 //! before its deadline, an `Unknown` or an amended update naming another order; and where each
 //! is skipped with nothing to check.
+//!
+//! FBC-y6y's done line, its second half: `resync_after_reconnect` run against a toy variant that
+//! re-places an open order after a reconnect fails, naming the re-placement. Around it: a
+//! reconnect that leads to no resync; `two_phase_ack` on a two-phase toy whose provisional
+//! acceptance is followed by a final one, by an asynchronous reject, by nothing, or that accepts
+//! final at once, and on the single-phase toy reporting a provisional acceptance;
+//! `reject_coverage` against a toy misreading every refusal, a stub answering none, and a table
+//! that is missing, empty or names no kind.
 
 mod toy_setup;
 
@@ -123,6 +131,21 @@ enum Twist {
     RenamedTwice,
     /// Every acceptance naming no venue id (the arm's, the amend's) names a stranger's.
     StrangerVidOnAck,
+    /// On every connection after the first, once its resync has ended, the last placement it
+    /// wrote is written again, signed again: an open order re-placed after a reconnect.
+    ReplacesAfterResync,
+    /// Only the first connection asks for a resync.
+    ResyncsOnce,
+    /// Every refusal names item 1, carries no venue code, and maps to `Other`.
+    MisreadsRejects,
+    /// A placement's acceptance is provisional, then final.
+    ProvisionalThenFinal,
+    /// A placement's acceptance is provisional, then refused by the venue's risk check, naming
+    /// the order by its venue id.
+    ProvisionalThenRiskReject,
+    /// A placement's acceptance is provisional, then final, then refused by the venue's risk
+    /// check.
+    FinalAndRiskReject,
 }
 
 /// The toy with its caps edited by `caps` and its codec twisted by `twist`.
@@ -469,6 +492,46 @@ static SHORT_BATCH: Variant = Variant {
     twist: Twist::None,
 };
 
+static REPLACES_AFTER_RESYNC: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::ReplacesAfterResync,
+};
+static RESYNCS_ONCE: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::ResyncsOnce,
+};
+static MISREADS_REJECTS: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::MisreadsRejects,
+};
+/// The toy declaring two-phase acknowledgements, a risk window of a second.
+fn two_phase(c: &mut VenueCaps) {
+    let window = Duration::from_secs(1);
+    c.exec.as_mut().unwrap().order.ack = fbc_core::AckModel::TwoPhase {
+        risk_reject_window: window,
+    };
+}
+static TWO_PHASE_FINAL: Variant = Variant {
+    caps: two_phase,
+    twist: Twist::ProvisionalThenFinal,
+};
+static TWO_PHASE_RISK_REJECT: Variant = Variant {
+    caps: two_phase,
+    twist: Twist::ProvisionalThenRiskReject,
+};
+static TWO_PHASE_BOTH: Variant = Variant {
+    caps: two_phase,
+    twist: Twist::FinalAndRiskReject,
+};
+static TWO_PHASE_DANGLING: Variant = Variant {
+    caps: two_phase,
+    twist: Twist::ProvisionalPlacement,
+};
+static TWO_PHASE_AT_ONCE: Variant = Variant {
+    caps: two_phase,
+    twist: Twist::None,
+};
+
 fn amend(caps: &mut VenueCaps) -> &mut fbc_core::AmendCaps {
     let order = &mut caps.exec.as_mut().unwrap().order;
     order.amend.as_mut().unwrap()
@@ -541,6 +604,8 @@ impl VenueFactory for Variant {
                 rpc: None,
                 early: None,
                 amend: None,
+                opens: 0,
+                resyncs: 0,
             };
             Box::new(twisted) as Box<dyn ExecCodec>
         }))
@@ -576,6 +641,10 @@ struct Twisted {
     early: Option<RpcId>,
     /// The amend frame it wrote and has not written again, for [`Twist::ResendsAmend`].
     amend: Option<Vec<u8>>,
+    /// The connections it opened, for [`Twist::ReplacesAfterResync`].
+    opens: usize,
+    /// The resyncs it asked for, for [`Twist::ResyncsOnce`].
+    resyncs: usize,
 }
 
 /// A sink handing `inner` the events `f` rewrites each into.
@@ -1154,6 +1223,69 @@ fn stranger() -> fbc_core::ClientOrderId {
     cid
 }
 
+/// Every refusal naming item 1, with no venue code, as `Other`.
+fn misread_rejects(ev: ExecEvent) -> Vec<ExecEvent> {
+    vec![match ev {
+        ExecEvent::Outcome {
+            rpc,
+            item,
+            outcome: SubmitOutcome::Rejected(mut reject),
+        } => {
+            reject.kind = fbc_core::RejectKind::Other;
+            reject.venue_code = None;
+            let item = item.map(|it| ItemRef { idx: 1, ..it });
+            let outcome = SubmitOutcome::Rejected(reject);
+            ExecEvent::Outcome { rpc, item, outcome }
+        }
+        other => other,
+    }]
+}
+
+/// A placement's acceptance, naming its venue id, provisional and then final.
+fn provisional_then_final(ev: ExecEvent) -> Vec<ExecEvent> {
+    if !acceptance(&ev, true) {
+        return vec![ev];
+    }
+    let mut out = provisional(ev.clone());
+    out.push(ev);
+    out
+}
+
+/// A placement's acceptance, naming its venue id, provisional and then refused by the venue's
+/// risk check, naming the order by that venue id.
+fn provisional_then_risk_reject(ev: ExecEvent) -> Vec<ExecEvent> {
+    let ExecEvent::Outcome {
+        item: Some(ItemRef { vid: Some(vid), .. }),
+        outcome: SubmitOutcome::Accepted { .. },
+        ..
+    } = &ev
+    else {
+        return vec![ev];
+    };
+    let reject = ExecEvent::AsyncReject {
+        target: fbc_core::OrderRef::Venue(vid.clone()),
+        op: OpKind::Place,
+        reject: fbc_core::Reject {
+            kind: fbc_core::RejectKind::Margin,
+            venue_code: Some("1005".into()),
+            raw: "".into(),
+        },
+    };
+    let mut out = provisional(ev);
+    out.push(reject);
+    out
+}
+
+/// A placement's acceptance, naming its venue id, provisional, then final, then refused by the
+/// venue's risk check.
+fn final_and_risk_reject(ev: ExecEvent) -> Vec<ExecEvent> {
+    let mut out = provisional_then_risk_reject(ev.clone());
+    if out.len() > 1 {
+        out.insert(1, ev);
+    }
+    out
+}
+
 /// The frame a stub sends, after its answer, for [`Twist::EagerTimeout`].
 const EARLY: &str = "early";
 
@@ -1163,6 +1295,7 @@ impl ExecCodec for Twisted {
     }
 
     fn on_open(&mut self, stream: StreamId, ctx: &EncodeCtx, fx: &mut Effects) {
+        self.opens += 1;
         self.inner.on_open(stream, ctx, fx);
         if self.failed && self.twist == Twist::FailsAfterTimeout {
             // Heavier than the toy's one bucket ever admits.
@@ -1273,10 +1406,23 @@ impl ExecCodec for Twisted {
             Twist::FillsOnPlacement => fills_on_placement,
             Twist::RenamedTwice => renamed_twice,
             Twist::StrangerVidOnAck => stranger_vid_on_ack,
+            Twist::MisreadsRejects => misread_rejects,
+            Twist::ProvisionalThenFinal => provisional_then_final,
+            Twist::ProvisionalThenRiskReject => provisional_then_risk_reject,
+            Twist::FinalAndRiskReject => final_and_risk_reject,
             _ => kept,
         };
+        // The toy's resync ends with this frame.
+        let resync_ended = f.bytes() == b"rsend";
         let sink = &mut Rewrite { inner: sink, f: f_ };
         let decoded = self.inner.on_frame(stream, f, scope, specs, sink, fx);
+        if self.twist == Twist::ReplacesAfterResync
+            && resync_ended
+            && self.opens > 1
+            && let Some(frame) = self.last.take()
+        {
+            fx.push(again(&frame));
+        }
         if self.twist == Twist::ResendsAmend
             && let Some(frame) = self.amend.take()
         {
@@ -1349,6 +1495,10 @@ impl ExecCodec for Twisted {
     }
 
     fn resync(&mut self, ctx: &EncodeCtx, fx: &mut Effects) {
+        self.resyncs += 1;
+        if self.twist == Twist::ResyncsOnce && self.resyncs > 1 {
+            return;
+        }
         self.inner.resync(ctx, fx);
     }
 
@@ -1602,6 +1752,9 @@ fn every_order_entry_check_skips_a_venue_that_takes_no_orders() {
         suite::amend_ack,
         suite::mixed_batch,
         suite::unknown_on_timeout,
+        suite::resync_after_reconnect,
+        suite::two_phase_ack,
+        suite::reject_coverage,
     ] {
         let skipped = check(&NO_EXEC.subject(assumed));
         let why = "VenueCaps.exec is None: the venue takes no orders";
@@ -1647,6 +1800,9 @@ fn a_venue_taking_orders_with_no_order_entry_stub_fails_every_order_entry_check(
         suite::amend_ack,
         suite::mixed_batch,
         suite::unknown_on_timeout,
+        suite::resync_after_reconnect,
+        suite::two_phase_ack,
+        suite::reject_coverage,
     ] {
         let failure = failed(check(&ToyFactory.subject_for(no_stub)));
         assert!(failure.names("Setup.order_entry"), "{failure}");
@@ -2316,5 +2472,230 @@ fn amend_ack_skips_a_venue_whose_limit_orders_cannot_rest() {
     assert!(
         matches!(skipped, Ok(Verdict::Skipped { why: w, .. }) if w == why),
         "{skipped:?}"
+    );
+}
+
+/// The toy's setup whose stub answers nothing it is asked.
+fn silent() -> Setup {
+    let mut stub = order_entry();
+    let inner = stub.reply.clone();
+    stub.reply = Replier::new(move |frame, answers| {
+        let silent = vec![suite::Answer::Silent; answers.len()];
+        inner.reply(frame, &silent)
+    });
+    Setup {
+        order_entry: Some(stub),
+        ..assumed()
+    }
+}
+
+#[test]
+fn resync_after_reconnect_fails_a_toy_that_re_places_an_open_order_after_a_reconnect() {
+    let failure = failed(suite::resync_after_reconnect(
+        &REPLACES_AFTER_RESYNC.subject(assumed),
+    ));
+    assert_eq!(failure.check, "resync_after_reconnect");
+    assert!(
+        says(
+            &failure,
+            "ExecCodec: nothing re-placed",
+            "written 2 times over the 2 connections"
+        ),
+        "{failure}"
+    );
+    // The new connection's opening was answered, and its resync ended: only the re-placement
+    // breaks the check.
+    assert_eq!(failure.breaches.len(), 1, "{failure}");
+}
+
+#[test]
+fn resync_after_reconnect_fails_a_toy_whose_reconnect_leads_to_no_resync() {
+    let failure = failed(suite::resync_after_reconnect(
+        &RESYNCS_ONCE.subject(assumed),
+    ));
+    assert!(
+        says(
+            &failure,
+            "ExecCodec::resync",
+            "no resync ended once the stub closed the connection"
+        ),
+        "{failure}"
+    );
+    // The stub still waits for the new connection's resync request.
+    assert!(
+        says(&failure, "OrderEntryStub", "did not play to its end"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn resync_after_reconnect_fails_when_the_placement_the_stub_accepted_comes_back_rejected() {
+    let failure = failed(suite::resync_after_reconnect(
+        &ToyFactory.subject_for(rejecting),
+    ));
+    assert!(
+        says(
+            &failure,
+            "ExecCodec::on_frame",
+            "the placement the stub accepted was reported"
+        ),
+        "{failure}"
+    );
+}
+
+#[test]
+fn two_phase_ack_fails_a_single_phase_toy_reporting_a_provisional_acceptance() {
+    let failure = failed(suite::two_phase_ack(
+        &PROVISIONAL_PLACEMENT.subject(assumed),
+    ));
+    assert!(
+        says(
+            &failure,
+            "AckModel is SinglePhase",
+            "provisional acceptances were reported"
+        ),
+        "{failure}"
+    );
+    assert!(
+        says(
+            &failure,
+            "OrderCaps.ack",
+            "not accepted once as SinglePhase"
+        ),
+        "{failure}"
+    );
+}
+
+/// What `two_phase_ack` probed on `variant`, which must pass.
+fn two_phase_probed(variant: &'static Variant) -> Vec<String> {
+    match suite::two_phase_ack(&variant.subject(assumed)) {
+        Ok(Verdict::Passed { probed, .. }) => probed,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn two_phase_ack_passes_a_two_phase_toy_whose_provisional_acceptance_is_resolved_in_the_window() {
+    let model = "AckModel is TwoPhase { risk_reject_window: 1s }";
+    assert_eq!(
+        two_phase_probed(&TWO_PHASE_FINAL),
+        [format!(
+            "{model}: a provisional acceptance was followed by a final acceptance within the \
+             window"
+        )]
+    );
+    assert_eq!(
+        two_phase_probed(&TWO_PHASE_RISK_REJECT),
+        [format!(
+            "{model}: a provisional acceptance was followed by an asynchronous reject within \
+             the window"
+        )]
+    );
+    assert_eq!(
+        two_phase_probed(&TWO_PHASE_AT_ONCE),
+        [format!("{model}: the placement was accepted final at once")]
+    );
+}
+
+#[test]
+fn two_phase_ack_fails_a_two_phase_toy_whose_provisional_acceptance_is_never_resolved() {
+    let failure = failed(suite::two_phase_ack(&TWO_PHASE_DANGLING.subject(assumed)));
+    assert!(
+        says(
+            &failure,
+            "AckModel is TwoPhase { risk_reject_window: 1s }",
+            "followed by neither a final acceptance nor an asynchronous reject within the window"
+        ),
+        "{failure}"
+    );
+    // A provisional acceptance alone is an acceptance once as the two-phase model has it.
+    assert_eq!(failure.breaches.len(), 1, "{failure}");
+}
+
+#[test]
+fn two_phase_ack_fails_a_two_phase_toy_that_both_accepts_and_rejects_after_a_provisional_acceptance()
+ {
+    let failure = failed(suite::two_phase_ack(&TWO_PHASE_BOTH.subject(assumed)));
+    assert!(
+        says(
+            &failure,
+            "AckModel is TwoPhase { risk_reject_window: 1s }",
+            "followed by both a final acceptance and an asynchronous reject"
+        ),
+        "{failure}"
+    );
+}
+
+#[test]
+fn reject_coverage_fails_a_toy_that_misreads_every_refusal() {
+    let failure = failed(suite::reject_coverage(&MISREADS_REJECTS.subject(assumed)));
+    let code = "reject_coverage/table.txt: 1001";
+    assert!(
+        says(
+            &failure,
+            code,
+            "the code maps to Other; the table says PostOnlyWouldCross"
+        ),
+        "{failure}"
+    );
+    assert!(
+        says(&failure, code, "does not carry the code the stub sent"),
+        "{failure}"
+    );
+    assert!(
+        says(&failure, code, "not the placement's one item"),
+        "{failure}"
+    );
+    // The code the table maps to Other maps to Other: only its code and item are wrong.
+    let other = "reject_coverage/table.txt: 9999";
+    assert!(!says(&failure, other, "maps to"), "{failure}");
+    assert!(failure.names(other), "{failure}");
+}
+
+#[test]
+fn reject_coverage_fails_when_no_placement_is_refused() {
+    let failure = failed(suite::reject_coverage(&ToyFactory.subject_for(silent)));
+    assert!(
+        says(
+            &failure,
+            "ExecCodec::on_frame",
+            "refused under code 1001 was reported [], not Rejected once"
+        ),
+        "{failure}"
+    );
+}
+
+/// A fixture directory of the test's own holding `table` as the reject table, or none.
+fn fixtures_with(name: &str, table: Option<&str>) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "fbc-conformance-rejects-{name}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("reject_coverage")).unwrap();
+    if let Some(table) = table {
+        std::fs::write(dir.join("reject_coverage/table.txt"), table).unwrap();
+    }
+    dir
+}
+
+#[test]
+fn reject_coverage_fails_a_table_that_is_missing_lists_no_code_or_names_no_kind() {
+    let failure_with = |name, table| {
+        let dir = fixtures_with(name, table);
+        let subject = Subject::new(&ToyFactory, &dir, assumed).unwrap();
+        let failure = failed(suite::reject_coverage(&subject));
+        let _ = std::fs::remove_dir_all(&dir);
+        failure
+    };
+    let file = "reject_coverage/table.txt";
+    let missing = failure_with("missing", None);
+    assert!(says(&missing, file, "cannot read"), "{missing}");
+    let empty = failure_with("empty", Some("# no code\n\n"));
+    assert!(says(&empty, file, "lists no code"), "{empty}");
+    let kindless = failure_with("kindless", Some("1001 InvalidPrice\n1002\n"));
+    assert!(
+        says(&kindless, file, "the line \"1002\" names no kind"),
+        "{kindless}"
     );
 }

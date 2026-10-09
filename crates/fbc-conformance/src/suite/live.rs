@@ -38,10 +38,6 @@ use crate::server::StubServer;
 
 /// The account the session trades and fbc-oms authorizes for.
 const ACCT: AccountKey = AccountKey::new(1);
-/// The registry's inventory and resting caps on the instrument, in orders of the harness's size:
-/// room for every order a check places, whatever the instrument's minimum size (Codex
-/// r4222138063).
-const CAP_ORDERS: i64 = 8;
 /// How far the clock moves at a time while a check waits for a deadline, for its first
 /// [`FINE`]; [`COARSE`] after that, where a deadline that has not passed is long and only its
 /// passing is waited for.
@@ -59,8 +55,11 @@ const EPOCHS: u32 = 64;
 /// How many times a check lets every task run after the stub has answered, or the clock moved,
 /// for what that brings to reach the session.
 const CHURN: usize = 200;
-/// The client ids a check's registry places under.
-const CIDS: usize = 8;
+/// The orders a check's registry places at most, unless the check asks for more
+/// ([`Live::orders`]): its client ids, and its inventory and resting caps on the instrument in
+/// orders of the harness's size, room for every order a check places, whatever the
+/// instrument's minimum size (Codex r4222138063).
+const ORDERS: usize = 8;
 
 /// The venue's order entry under the assumed setup, ready for a run of its session.
 pub(crate) struct Live<'s> {
@@ -68,6 +67,8 @@ pub(crate) struct Live<'s> {
     venue: &'static dyn VenueFactory,
     subject: &'s Subject<'static>,
     pub order: OrderCaps,
+    /// The orders the check's registry places at most.
+    orders: usize,
 }
 
 impl<'s> Live<'s> {
@@ -96,7 +97,15 @@ impl<'s> Live<'s> {
             subject,
             h,
             order,
+            orders: ORDERS,
         }))
+    }
+
+    /// The venue's order entry, its registry placing up to `n` orders (at least [`ORDERS`]):
+    /// a check placing more than eight asks for room for them.
+    pub fn orders(self, n: usize) -> Live<'s> {
+        let orders = n.max(ORDERS);
+        Live { orders, ..self }
     }
 
     /// Runs the venue's order-entry session against the stub: the stub answers the frames the
@@ -109,18 +118,36 @@ impl<'s> Live<'s> {
         requests: Vec<Vec<Answer>>,
         scenario: impl AsyncFnOnce(&mut Ctx<'_>) -> Result<T, Failure>,
     ) -> Result<T, Failure> {
+        self.run_epochs(vec![requests], scenario)
+    }
+
+    /// Runs the venue's order-entry session against the stub as [`Live::run`] does, over one
+    /// connection per entry of `epochs`, each answered as `run` answers its one: the opening,
+    /// then each request in turn, then a barrier, after which the stub closes the connection
+    /// when another epoch follows, so the session reconnects (decision 0085).
+    pub fn run_epochs<T>(
+        &self,
+        epochs: Vec<Vec<Vec<Answer>>>,
+        scenario: impl AsyncFnOnce(&mut Ctx<'_>) -> Result<T, Failure>,
+    ) -> Result<T, Failure> {
         let setup = self.subject.setup();
         let stub = setup.order_entry.expect("Live::new saw an OrderEntryStub");
         let opening = stub.opening.len();
-        let mut steps = vec![Step::Accept];
-        let respond = |with| Step::Respond { conn: 0, with };
-        steps.extend(stub.opening.iter().cloned().map(respond));
-        let replies = requests.into_iter().map(|a| stub.reply.responder(a));
-        steps.extend(replies.map(respond));
-        // Last, a barrier: the script ends only once the session has read every frame the stub
-        // sent, so what a check reads once it has played comes after the session handled them
-        // all, however late the host delivered them (FBC-3il).
-        steps.push(Step::Barrier { conn: 0 });
+        let mut steps = Vec::new();
+        for (conn, requests) in epochs.into_iter().enumerate() {
+            if let Some(before) = conn.checked_sub(1) {
+                steps.push(Step::Close { conn: before });
+            }
+            steps.push(Step::Accept);
+            let respond = |with| Step::Respond { conn, with };
+            steps.extend(stub.opening.iter().cloned().map(respond));
+            let replies = requests.into_iter().map(|a| stub.reply.responder(a));
+            steps.extend(replies.map(respond));
+            // Last, a barrier: the epoch's script ends only once the session has read every
+            // frame the stub sent on it, so what a check reads once it has played comes after
+            // the session handled them all, however late the host delivered them (FBC-3il).
+            steps.push(Step::Barrier { conn });
+        }
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .start_paused(true)
@@ -164,7 +191,7 @@ impl<'s> Live<'s> {
                 h: &self.h,
                 orders: session.orders(),
                 heard: heard.clone(),
-                oms: Oms::new(&self.h, self.venue.id(), &self.order)?,
+                oms: Oms::new(&self.h, self.venue.id(), &self.order, self.orders)?,
                 server: &server,
                 opening,
                 sent: Cell::new(0),
@@ -374,6 +401,27 @@ impl Ctx<'_> {
         }
     }
 
+    /// Moves the clock on, as [`Ctx::advance_until`] does, until the stub has played its script
+    /// to its end, as [`Ctx::answered`] waits for it without moving the clock: a script that
+    /// closes a connection waits for the session to reconnect, which its pacing delays. Then
+    /// lets every task run a while longer. How far the clock moved.
+    pub async fn played(&self) -> Result<Duration, Failure> {
+        let ended = |c: &Ctx<'_>| c.server.finished().now_or_never().is_some();
+        let moved = self.advance_until(ended).await;
+        match (moved, self.server.finished().now_or_never()) {
+            (Some(moved), Some(Ok(()))) => {
+                self.churn().await;
+                Ok(moved)
+            }
+            // The script stopped (a reply refused what it read), or still waits for a
+            // connection or a frame the session never opened or wrote.
+            (_, other) => {
+                let what = format!("the stub's script did not play to its end: {other:?}");
+                Err(self.h.fail("OrderEntryStub", what))
+            }
+        }
+    }
+
     /// Lets every task run, without moving the clock, for what the stub's answer brings to
     /// reach the session.
     pub async fn churn(&self) {
@@ -386,12 +434,23 @@ impl Ctx<'_> {
     /// session run after each, until `done` holds or [`WAIT`] has passed: how far it moved, or
     /// `None` when `done` never held.
     pub async fn advance_until(&self, done: impl Fn(&Ctx<'_>) -> bool) -> Option<Duration> {
+        self.advance_within(WAIT, done).await
+    }
+
+    /// Moves the clock on as [`Ctx::advance_until`] does, but no further than `limit`: how far
+    /// it moved, or `None` when `done` did not hold by then.
+    pub async fn advance_within(
+        &self,
+        limit: Duration,
+        done: impl Fn(&Ctx<'_>) -> bool,
+    ) -> Option<Duration> {
         let mut moved = Duration::ZERO;
-        while moved < WAIT {
+        while moved < limit {
             if done(self) {
                 return Some(moved);
             }
             let step = if moved < FINE { STEP } else { COARSE };
+            let step = step.min(limit - moved);
             tokio::time::advance(step).await;
             moved += step;
             for _ in 0..CHURN {
@@ -500,8 +559,9 @@ impl Drop for LeaseDir {
 }
 
 impl Oms {
-    /// The registry for `venue`'s account, armed on the harness's instrument.
-    fn new(h: &Harness<'_>, venue: &str, order: &OrderCaps) -> Result<Oms, Failure> {
+    /// The registry for `venue`'s account, armed on the harness's instrument, with room for
+    /// `orders` orders.
+    fn new(h: &Harness<'_>, venue: &str, order: &OrderCaps, orders: usize) -> Result<Oms, Failure> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let k = NEXT.fetch_add(1, Ordering::Relaxed);
         let name = format!("fbc-conformance-oms-{}-{k}", std::process::id());
@@ -514,7 +574,8 @@ impl Oms {
         let spec = h.specs().get(h.inst).expect("the harness's instrument");
         let symbol = spec.venue_symbol.clone();
         let keys = LeaseKeys::new(venue, &name, order).with_market(h.inst, symbol.clone());
-        let cap = h.qty.get().saturating_mul(CAP_ORDERS);
+        let room = i64::try_from(orders).expect("a count of orders");
+        let cap = h.qty.get().saturating_mul(room);
         let cap = Some(Lots::new(cap).expect("a count"));
         let limits = MarketCapsConfig {
             inventory: cap,
@@ -551,7 +612,7 @@ impl Oms {
         let refused = |e| h.fail("fbc-oms", format!("refused the owner's Start: {e:?}"));
         started.map_err(refused)?;
         let cids = h
-            .cids(CIDS)
+            .cids(orders)
             .expect("ids minted under the suite's own lease");
         Ok(Oms {
             reg,
@@ -564,7 +625,7 @@ impl Oms {
 
     /// The next of our client ids.
     fn cid(&mut self) -> ClientOrderId {
-        // No check places more than three orders.
+        // No check places more orders than it asked room for (`Live::orders`).
         self.cids.remove(0)
     }
 

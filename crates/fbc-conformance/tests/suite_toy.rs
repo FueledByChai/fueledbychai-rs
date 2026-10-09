@@ -1,12 +1,13 @@
-//! FBC-8ew's, FBC-onw's, FBC-whw's, FBC-2re's, FBC-vmw's and FBC-3il's done lines, their first
-//! halves: the named suite runs on the conformance toy venue through the suite macro with its
-//! fixture directory (BT-502, design §6), `caps_truthful`, `commands_selfcontained`,
+//! FBC-8ew's, FBC-onw's, FBC-whw's, FBC-2re's, FBC-vmw's, FBC-3il's and FBC-y6y's done lines,
+//! their first halves: the named suite runs on the conformance toy venue through the suite macro
+//! with its fixture directory (BT-502, design §6), `caps_truthful`, `commands_selfcontained`,
 //! `signing_golden`, `legacy_symbols`, `fee_sign`, `liquidity_reported`, `position_signed`,
 //! `decoder_deterministic`, `encode_deterministic`, `ids_roundtrip`, `restart_cid`,
 //! `price_grid`, `continuity`, `subscriptions_idempotent`, `no_exch_ts_synthesized`,
-//! `book_channels`, `amend_ack`, `mixed_batch` and `unknown_on_timeout` each a test, and all
-//! pass; the last three run fbc-runtime's order-entry session against the stub server, which
-//! answers the toy's requests with replies computed from them (`toy_setup::order_entry`); `continuity`'s longer-block sub-case reports
+//! `book_channels`, `amend_ack`, `mixed_batch`, `unknown_on_timeout`, `resync_after_reconnect`,
+//! `two_phase_ack` and `reject_coverage` each a test, and all pass; the last six run
+//! fbc-runtime's order-entry session against the stub server, which answers the toy's requests
+//! with replies computed from them (`toy_setup::order_entry`); `continuity`'s longer-block sub-case reports
 //! itself skipped by name for the toy's text protocol. The checks are run directly too, to show what they probed: a
 //! pass that probed nothing would prove nothing.
 
@@ -313,4 +314,35 @@ fn unknown_on_timeout_sees_the_toys_unanswered_placement_unknown_once() {
         probed_live(suite::unknown_on_timeout),
         ["a request unanswered is Unknown at its deadline, once, and never written again"]
     );
+}
+
+#[test]
+fn resync_after_reconnect_sees_the_toy_resync_and_place_nothing_again_after_the_stub_closes() {
+    assert_eq!(
+        probed_live(suite::resync_after_reconnect),
+        ["a reconnect after an accepted placement led to a resync, and nothing was re-placed"]
+    );
+}
+
+#[test]
+fn two_phase_ack_sees_no_provisional_acceptance_on_the_single_phase_toy() {
+    assert_eq!(
+        probed_live(suite::two_phase_ack),
+        ["AckModel is SinglePhase: no provisional acceptance appeared"]
+    );
+}
+
+#[test]
+fn reject_coverage_maps_every_code_of_the_toys_table_to_its_kind() {
+    let probed = probed_live(suite::reject_coverage);
+    assert_eq!(probed.len(), 13, "{probed:#?}");
+    for line in [
+        "reject_coverage/table.txt: 1001 is PostOnlyWouldCross",
+        "reject_coverage/table.txt: 1006 is RateLimited { retry_after: None }",
+        "reject_coverage/table.txt: 2002 is AlreadyTerminal(Unspecified)",
+        "reject_coverage/table.txt: 3001 is VenueMode(ReduceOnly)",
+        "reject_coverage/table.txt: 9999 is Other",
+    ] {
+        assert!(probed.iter().any(|p| p == line), "{line}: {probed:#?}");
+    }
 }

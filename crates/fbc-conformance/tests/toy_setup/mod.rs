@@ -120,7 +120,8 @@ impl Book {
 /// The toy venue's answer to a placement, a batch of placements or an amend, each item as
 /// asked: accepted (a placement under a venue id it gives it; an amend with, where `events`, the
 /// order event reporting the replaced order under a new venue id, as `AmendAck::ReplacedEvent`
-/// has it), rejected with code 1002 (an invalid price), or left unanswered.
+/// has it), rejected with code 1002 (an invalid price) or the code asked for, or left
+/// unanswered.
 pub fn replier(events: bool) -> Replier {
     let book = Arc::new(Mutex::new(Book::default()));
     Replier::new(move |frame, answers| {
@@ -164,6 +165,11 @@ fn reply(book: &mut Book, request: &str, answers: &[Answer], events: bool) -> Re
             Answer::Reject => {
                 out.push(format!(
                     "item|rpc={rpc}|i={i}|res=rej|code=1002|msg=refused"
+                ));
+            }
+            Answer::RejectCode(code) => {
+                out.push(format!(
+                    "item|rpc={rpc}|i={i}|res=rej|code={code}|msg=refused"
                 ));
             }
             Answer::Silent => {}

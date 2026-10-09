@@ -45,6 +45,8 @@
 //! - `restart_cid/resting.frames`: a case of what the venue shows a restarted process: a
 //!   resync's answer with orders of ours resting, their client ids the suite's first
 //!   [`MINTED_BEFORE`] ids in its namespace, the newest among them ([`restart_cid`]).
+//! - `reject_coverage/table.txt`: the venue's reject codes, one per line, each followed by the
+//!   `RejectKind` it maps to as the kind's `Debug` spells it ([`reject_coverage`]).
 //! - `continuity/`, `no_exch_ts_synthesized/` and `book_channels/`: one market-data case per
 //!   book channel the suite drives, `<channel>.frames`, its frames tagged with what the fixture
 //!   knows of them (the format is [`book_cases`]'s); and, for a venue whose market data is
@@ -54,9 +56,11 @@
 //! [`caps_truthful`], [`commands_selfcontained`], [`encode_deterministic`], [`price_grid`] and
 //! [`subscriptions_idempotent`] read no file: they need only the factory and the [`Setup`] the
 //! `setup` function gives, called afresh wherever a check builds a codec. Nor do the
-//! order-entry checks, [`amend_ack`], [`mixed_batch`] and [`unknown_on_timeout`]: they run
-//! fbc-runtime's order-entry session against the [`StubServer`](crate::StubServer), which
-//! answers as the setup's [`OrderEntryStub`] says.
+//! order-entry checks, [`amend_ack`], [`mixed_batch`], [`unknown_on_timeout`],
+//! [`resync_after_reconnect`] and [`two_phase_ack`]: they run fbc-runtime's order-entry session
+//! against the [`StubServer`](crate::StubServer), which answers as the setup's
+//! [`OrderEntryStub`] says. [`reject_coverage`] does too, refusing a placement under each code
+//! its table lists.
 //!
 //! # The order-entry checks
 //!
@@ -114,6 +118,14 @@
 //!   item its outcome, and the timeout marks the unanswered one `Unknown` (decision 0014).
 //! - [`unknown_on_timeout`]: an unanswered request becomes `Unknown` once at its deadline and is
 //!   never written a second time (decision 0005).
+//! - [`resync_after_reconnect`]: once the stub closes the connection an accepted placement rests
+//!   on, the session's reconnect leads to a resync, and the order is never written again
+//!   (decisions 0005, 0013).
+//! - [`two_phase_ack`]: on a `TwoPhase` venue a provisional acceptance is followed by a final one
+//!   or an asynchronous reject within the risk window; on a `SinglePhase` venue no provisional
+//!   acceptance appears.
+//! - [`reject_coverage`]: every code in the fixture's reject table maps to the `RejectKind` the
+//!   table gives it, `Other` only where the table says so (design §6 step 9).
 //!
 //! The four market-data checks skip by name a book channel anchored on REST (FBC-fhk4), and a
 //! check's sub-case skipped (a text venue's longer blocks) is listed by name among what it
@@ -136,8 +148,11 @@ mod ids;
 mod legacy;
 mod live;
 mod orders;
+mod reconnect;
+mod rejects;
 mod selfcontained;
 mod stub;
+mod two_phase;
 
 use core::fmt;
 use std::path::{Path, PathBuf};
@@ -159,8 +174,11 @@ pub use idempotent::subscriptions_idempotent;
 pub use ids::{MINTED_BEFORE, ids_roundtrip, restart_cid};
 pub use legacy::legacy_symbols;
 pub use orders::{amend_ack, mixed_batch, unknown_on_timeout};
+pub use reconnect::resync_after_reconnect;
+pub use rejects::reject_coverage;
 pub use selfcontained::commands_selfcontained;
 pub use stub::{Answer, OrderEntryStub, Replier};
+pub use two_phase::two_phase_ack;
 
 /// What the fixtures assume: the instruments, the configuration and the credentials the
 /// factory is given. Credentials here are synthetic, never a real account's (decision 0009).
@@ -178,9 +196,10 @@ pub struct Setup {
     /// The stream the fixture frames are handed to the order-entry codec on: the order-entry
     /// connection's, as the venue's [`plan_exec`](VenueFactory::plan_exec) numbers it.
     pub exec_stream: StreamId,
-    /// How the venue's order entry answers over the stub server, for [`amend_ack`],
-    /// [`mixed_batch`] and [`unknown_on_timeout`]; `None` for a venue that declares no order
-    /// entry (those checks then fail a venue that declares one).
+    /// How the venue's order entry answers over the stub server, for the order-entry checks
+    /// ([`amend_ack`], [`mixed_batch`], [`unknown_on_timeout`], [`resync_after_reconnect`],
+    /// [`two_phase_ack`], [`reject_coverage`]); `None` for a venue that declares no order entry
+    /// (those checks then fail a venue that declares one).
     pub order_entry: Option<OrderEntryStub>,
 }
 
@@ -351,8 +370,9 @@ pub fn run(
 
 /// Runs `check`, one of the order-entry checks, against the venue `factory` builds, as [`run`]
 /// does: the factory lives for the program, as fbc-runtime's session takes it. The body of the
-/// tests [`suite!`](crate::suite!) writes for [`amend_ack`], [`mixed_batch`] and
-/// [`unknown_on_timeout`].
+/// tests [`suite!`](crate::suite!) writes for [`amend_ack`], [`mixed_batch`],
+/// [`unknown_on_timeout`], [`resync_after_reconnect`], [`two_phase_ack`] and
+/// [`reject_coverage`].
 pub fn run_live(
     check: fn(&Subject<'static>) -> Result<Verdict, Failure>,
     factory: &'static dyn VenueFactory,
@@ -562,6 +582,36 @@ macro_rules! suite {
         fn unknown_on_timeout() {
             $crate::suite::run_live(
                 $crate::suite::unknown_on_timeout,
+                &$factory,
+                concat!(env!("CARGO_MANIFEST_DIR"), "/", $fixtures),
+                $setup,
+            );
+        }
+
+        #[test]
+        fn resync_after_reconnect() {
+            $crate::suite::run_live(
+                $crate::suite::resync_after_reconnect,
+                &$factory,
+                concat!(env!("CARGO_MANIFEST_DIR"), "/", $fixtures),
+                $setup,
+            );
+        }
+
+        #[test]
+        fn two_phase_ack() {
+            $crate::suite::run_live(
+                $crate::suite::two_phase_ack,
+                &$factory,
+                concat!(env!("CARGO_MANIFEST_DIR"), "/", $fixtures),
+                $setup,
+            );
+        }
+
+        #[test]
+        fn reject_coverage() {
+            $crate::suite::run_live(
+                $crate::suite::reject_coverage,
                 &$factory,
                 concat!(env!("CARGO_MANIFEST_DIR"), "/", $fixtures),
                 $setup,

@@ -1,0 +1,16 @@
+# The conformance toy's reject codes and the RejectKind each maps to, as the kind's Debug spells
+# it (crates/fbc-conformance/src/toy/decode.rs, REJECT_CODES). The toy describes no real venue;
+# these are its own made-up codes. A code the toy does not know maps to Other.
+1001 PostOnlyWouldCross
+1002 InvalidPrice
+1003 InvalidQty
+1004 MinNotional
+1005 Margin
+1006 RateLimited { retry_after: None }
+2001 NotFound
+2002 AlreadyTerminal(Unspecified)
+2003 NotAmendable(PartiallyFilled)
+2004 NoChange
+3001 VenueMode(ReduceOnly)
+3002 Unsupported
+9999 Other

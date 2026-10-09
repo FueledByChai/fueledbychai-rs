@@ -343,10 +343,12 @@ rather than guess.
     `<fixtures>/signing_golden/<name>.golden`, a directory marked SYNTHETIC with no golden no
     command names) and `legacy_symbols` (every ticker in
     `<fixtures>/legacy_symbols/tickers.txt` parses through `parse_fbc_common_symbol`; the toy
-    reads `X/USDT` by a rule of its own); and the order-entry checks `amend_ack`, `mixed_batch`
-    and `unknown_on_timeout`, which run `ExecSession` against the stub as the setup's
-    `OrderEntryStub` says, on a paused clock the check moves, fbc-oms authorizing every order
-    command (0083); still planned: the suite's other checks and the rest of the conformance
+    reads `X/USDT` by a rule of its own); and the order-entry checks `amend_ack`, `mixed_batch`,
+    `unknown_on_timeout`, `resync_after_reconnect` (the stub closes the connection; the
+    reconnect resyncs and re-places nothing), `two_phase_ack` and `reject_coverage` (each code of
+    `<fixtures>/reject_coverage/table.txt` refused by the stub maps to the kind listed), which
+    run `ExecSession` against the stub as the setup's `OrderEntryStub` says, on a paused clock
+    the check moves, fbc-oms authorizing every order command (0083, 0085); still planned: the suite's other checks and the rest of the conformance
     toy).
   - `crates/fbc-examples`: sample programs the owner runs by hand, never CI (FBC-u4so). Its
     library target is empty and every dependency is a dev-dependency, so it is outside

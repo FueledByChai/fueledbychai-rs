@@ -1,6 +1,8 @@
 //! How a venue's order entry answers over the stub server, for the checks that run
 //! fbc-runtime's order-entry session against it ([`amend_ack`](super::amend_ack),
-//! [`mixed_batch`](super::mixed_batch), [`unknown_on_timeout`](super::unknown_on_timeout)).
+//! [`mixed_batch`](super::mixed_batch), [`unknown_on_timeout`](super::unknown_on_timeout),
+//! [`resync_after_reconnect`](super::resync_after_reconnect),
+//! [`two_phase_ack`](super::two_phase_ack), [`reject_coverage`](super::reject_coverage)).
 //!
 //! The suite knows no venue's protocol, so the adapter states its replies as typed Rust
 //! functions (decisions 0025, 0047): what its order entry is pointed at, the HTTP routes it reads
@@ -18,7 +20,7 @@ use crate::server::StubServer;
 
 /// How the stub answers one item of a request (an order of a batch; the one item of a single
 /// command).
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub enum Answer {
     /// Accepted, as the venue answers an acceptance: a placement resting under a venue id the
     /// answer assigns; an amend accepted with whatever the venue reports it by, the replaced
@@ -27,6 +29,10 @@ pub enum Answer {
     Accept,
     /// Refused by the venue, under a reject code of its own choosing.
     Reject,
+    /// Refused by the venue under the reject code given, as the venue's wire spells it: a code
+    /// of the fixture's reject table, which [`reject_coverage`](super::reject_coverage) asks
+    /// for one placement at a time.
+    RejectCode(String),
     /// Left unanswered: nothing is sent for it.
     Silent,
 }
@@ -77,7 +83,9 @@ pub struct OrderEntryStub {
     /// The answer to each frame the session writes on its order-entry connection as an epoch
     /// opens, in the order written, until the epoch takes places: its authentication, the
     /// cancel-on-disconnect arm the session sends, and a resync showing the account flat with
-    /// nothing of ours resting. Each answers one frame.
+    /// nothing of ours resting. Each answers one frame. Every epoch opens alike, the one after
+    /// a reconnect too ([`resync_after_reconnect`](super::resync_after_reconnect)): the stub has
+    /// closed the connection, so cancel-on-disconnect has cancelled what rested on it.
     pub opening: Vec<Responder>,
     /// The venue's answer to an order-entry request.
     pub reply: Replier,
