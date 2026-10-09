@@ -28,9 +28,12 @@
 //! naming only our client id adds the id it shows and ends nothing, since it may report an order
 //! an amend superseded, unless the venue's amends keep the venue id: our client id then names
 //! one venue order, and an end naming it ends the order. What events and query answers showed
-//! of venue ids is kept while a resync runs and, after it, on the markets an order is held on,
-//! so what was heard before the snapshot, or before the amend that links an id to the order, is
-//! applied when they arrive; it is dropped once nothing is held after the resync. The consumer
+//! of venue ids is kept by market: while a resync runs, for every market, and after it, for the
+//! markets an order is held on, so what was heard before the snapshot, or before the amend that
+//! links an id to the order, is applied when they arrive. A market's is dropped once no order is
+//! held on it as the resync ends, as the epoch it ran on is replaced, or as its last held order
+//! is released after the resync, so an order held for good keeps only its own market's
+//! (Reviewer B RB-nvxn-5 on PR #127, FBC-48j7, decision 0088). The consumer
 //! is told the orders once per epoch ([`Gate::notice`]) and cancels them through fbc-oms's
 //! authorizations, or queries one its registry holds ended. A later epoch keeps every order an
 //! earlier one found unprotected, since no later arm covers it and a later snapshot may omit an
@@ -112,8 +115,10 @@ pub(crate) struct Gate {
     /// of the venue ids they were seen under, kept across epochs.
     unprotected: Vec<Held>,
     /// What events and query answers showed of venue ids while a resync ran or an order was
-    /// held on their market (Codex P1 r4219106981 on PR #127).
-    facts: Facts,
+    /// held on their market (Codex P1 r4219106981 on PR #127), by market, kept after the window
+    /// in which it was heard only for the markets an order is held on (Reviewer B RB-nvxn-5 on
+    /// PR #127).
+    facts: HashMap<InstrumentId, Facts>,
 }
 
 /// An order of ours resting unprotected.
@@ -207,7 +212,7 @@ impl Gate {
             armed_once: false,
             current: None,
             unprotected: Vec::new(),
-            facts: Facts::default(),
+            facts: HashMap::new(),
         }
     }
 
@@ -228,6 +233,8 @@ impl Gate {
         if self.of(epoch).is_some() {
             return;
         }
+        // The epoch it replaces may have dropped while its resync ran.
+        self.prune();
         let arm = if self.rearm || !self.armed_once {
             Arm::Due
         } else {
@@ -315,7 +322,10 @@ impl Gate {
                 let arm = if accepted { Arm::Accepted } else { Arm::Failed };
                 self.update(epoch, |e| e.arm = arm);
             }
-            Settled::Resync => self.update(epoch, |e| e.resync = Resync::Ended),
+            Settled::Resync => {
+                self.update(epoch, |e| e.resync = Resync::Ended);
+                self.prune();
+            }
         }
     }
 
@@ -345,8 +355,9 @@ impl Gate {
         self.unprotected.iter().any(|o| o.order.inst == inst)
     }
 
-    /// The orders of ours resting unprotected from an earlier epoch, while no event of the
-    /// latest epoch has shown them ended.
+    /// The orders of ours resting unprotected from an earlier epoch, while they may rest under
+    /// a venue id they were seen under that no event or query answer, of any epoch, has shown
+    /// ended.
     pub(crate) fn unprotected(&self) -> Vec<VenueOrderSnapshot> {
         self.unprotected.iter().map(Held::told).collect()
     }
@@ -354,16 +365,21 @@ impl Gate {
     /// Whether `cmd` may be sent on `epoch`, or why it is held: a place, a batch of places or
     /// an amend only once the epoch is [placing](Gate::placing) and no order of ours on its
     /// market (on any item's, for a batch) rests unprotected; anything else always.
+    /// It allocates nothing, and with nothing unprotected looks at no item (Reviewer B
+    /// RB-nvxn-3 on PR #127): it runs on the send path of every place and amend.
     pub(crate) fn admits(&self, cmd: &VenueCommand, epoch: u32) -> Result<(), Hold> {
-        let insts: Vec<InstrumentId> = match cmd {
-            VenueCommand::Place(o) => vec![o.inst],
-            VenueCommand::PlaceBatch(orders) => orders.iter().map(|o| o.inst).collect(),
-            VenueCommand::Amend(a) => vec![a.inst],
+        let held = |inst| self.unprotected_on(inst);
+        let unprotected = match cmd {
+            VenueCommand::Place(o) => held(o.inst),
+            VenueCommand::PlaceBatch(orders) => {
+                !self.unprotected.is_empty() && orders.iter().any(|o| held(o.inst))
+            }
+            VenueCommand::Amend(a) => held(a.inst),
             _ => return Ok(()),
         };
         if !self.placing(epoch) {
             Err(Hold::Unready)
-        } else if insts.into_iter().any(|inst| self.unprotected_on(inst)) {
+        } else if unprotected {
             Err(Hold::Unprotected)
         } else {
             Ok(())
@@ -408,9 +424,6 @@ impl Gate {
             }
             _ => {}
         }
-        if !early && self.unprotected.is_empty() {
-            self.facts = Facts::default();
-        }
     }
 
     /// An event or a query answer of the latest epoch showed an order on `inst` in `state`,
@@ -431,7 +444,7 @@ impl Gate {
             Some(CidMatch::Ours(cid)) => Some(cid),
             _ => None,
         };
-        let facts = &mut self.facts;
+        let facts = self.facts.entry(inst).or_default();
         if let Some(cid) = ours {
             let ids = facts.by_cid.entry(cid).or_default();
             vid.into_iter().for_each(|vid| add(ids, vid));
@@ -462,16 +475,33 @@ impl Gate {
                 }
             }
         }
-        self.learn();
+        if self.learn() && !early {
+            self.prune();
+        }
     }
 
-    /// Applies what is known of venue ids to every held order, and releases each that rests
-    /// under none of the ids it was seen under.
-    fn learn(&mut self) {
+    /// Applies what is known of venue ids on its market to every held order, and releases each
+    /// that rests under none of the ids it was seen under: whether it released any.
+    fn learn(&mut self) -> bool {
         for held in &mut self.unprotected {
-            held.learn(&self.facts, self.one_id);
+            if let Some(facts) = self.facts.get(&held.order.inst) {
+                held.learn(facts, self.one_id);
+            }
         }
+        let before = self.unprotected.len();
         self.unprotected.retain(Held::live);
+        self.unprotected.len() < before
+    }
+
+    /// Drops what is known of venue ids on every market no order is held on, as the window in
+    /// which it was heard closes: a resync's end, the epoch it ran on being replaced, or the
+    /// last order held on the market being released after the resync. What a held order may
+    /// yet need is on its own market, so what is kept is bounded by the evidence heard on the
+    /// markets held, not by the reconnects (Reviewer B RB-nvxn-5 on PR #127).
+    fn prune(&mut self) {
+        let held = &self.unprotected;
+        self.facts
+            .retain(|inst, _| held.iter().any(|o| o.order.inst == *inst));
     }
 
     /// The orders of ours resting unprotected on `epoch`, once, when it has just become
@@ -1511,6 +1541,145 @@ mod tests {
         gate.observe(0, &update(None, Some("V-2"), to("V-3")));
         gate.observe(0, &update(None, Some("V-1"), to("V-2")));
         assert_eq!(held_after_ends(&mut gate, &["V-2", "V-3"]), [true, false]);
+    }
+
+    impl Gate {
+        /// How many venue-id facts the gate keeps, over every market.
+        fn known(&self) -> usize {
+            self.facts.values().map(Facts::len).sum()
+        }
+    }
+
+    impl Facts {
+        fn len(&self) -> usize {
+            let next: usize = self.next.values().map(Vec::len).sum();
+            let by_cid: usize = self.by_cid.values().map(Vec::len).sum();
+            self.ended.len() + next + by_cid + self.ended_cids.len()
+        }
+    }
+
+    /// An order event on `inst` for `cid` or `wire` in `state`.
+    fn update_on(
+        inst: InstrumentId,
+        cid: Option<CidMatch>,
+        wire: Option<&str>,
+        state: VenueOrderState,
+    ) -> ExecEvent {
+        let ExecEvent::Order(u) = update(cid, wire, state) else {
+            unreachable!()
+        };
+        ExecEvent::Order(OrderUpdate { inst, ..u })
+    }
+
+    /// Reviewer B RB-nvxn-5 on PR #127 (FBC-48j7): while one order stays held on INST, every
+    /// reconnect's resync window hears ends, amends and client-id evidence on another market;
+    /// what it heard there is dropped when the window closes (the resync ends, or the epoch
+    /// is replaced before it does), so the facts stay bounded and the held order is still
+    /// released by its own end.
+    #[test]
+    fn facts_stay_bounded_across_many_reconnects_while_one_order_stays_held() {
+        let mut gate = Gate::new(true, false, false);
+        resynced(&mut gate, &[ours("V-1")]);
+        let mine = Some(CidMatch::Ours(cids()[1]));
+        let mut rpc = 1;
+        for epoch in 1..=40u32 {
+            rpc += 1;
+            gate.authenticated(epoch);
+            gate.arm_sent(epoch, RpcId(rpc));
+            gate.resync_asked(epoch);
+            for n in 0..10 {
+                let wire = format!("O-{epoch}-{n}");
+                let next = format!("O-{epoch}-{n}-b");
+                gate.observe(epoch, &update_on(OTHER, None, Some(&wire), to(&next)));
+                gate.observe(epoch, &update_on(OTHER, mine, Some(&next), canceled()));
+            }
+            assert!(gate.known() > 0);
+            // Every other epoch drops before its resync ends.
+            if epoch % 2 == 0 {
+                gate.observe(epoch, &ExecEvent::ResyncOrder(ours("V-1")));
+                ended(&mut gate, epoch, rpc);
+                assert_eq!(gate.known(), 0, "epoch {epoch}");
+                // After the resync, another market's evidence is not kept.
+                gate.observe(epoch, &update_on(OTHER, None, Some("O-x"), canceled()));
+                assert_eq!(gate.known(), 0, "epoch {epoch}");
+            }
+        }
+        assert!(gate.unprotected_on(INST));
+        gate.observe(40, &update(None, Some("V-1"), canceled()));
+        assert!(gate.unprotected().is_empty());
+        assert_eq!(gate.known(), 0);
+    }
+
+    /// FBC-48j7: what was heard on a market an order is held on is kept across the resync's
+    /// end and later epochs, and dropped once its last order there is released, while another
+    /// market stays held.
+    #[test]
+    fn facts_are_kept_for_a_held_market_and_dropped_once_it_is_released() {
+        let mut gate = Gate::new(true, false, false);
+        resyncing(&mut gate);
+        // Heard before the snapshot on each market: the second of two amends on INST, and an
+        // end of an unrelated id on OTHER.
+        gate.observe(0, &update(None, Some("V-2"), to("V-3")));
+        gate.observe(0, &update_on(OTHER, None, Some("W-9"), canceled()));
+        let other = snap(
+            Some(CidMatch::Ours(cids()[1])),
+            "W-1",
+            OTHER,
+            VenueOrderState::Open,
+        );
+        gate.observe(0, &ExecEvent::ResyncOrder(ours("V-1")));
+        gate.observe(0, &ExecEvent::ResyncOrder(other));
+        ended(&mut gate, 0, 1);
+        assert_eq!(gate.known(), 3);
+        // A reconnect that shows both again keeps what was heard on both held markets.
+        gate.authenticated(1);
+        gate.arm_sent(1, RpcId(2));
+        gate.resync_asked(1);
+        ended(&mut gate, 1, 2);
+        assert_eq!(gate.known(), 3);
+        // The first amend, heard late, follows the order to V-3 through the kept fact.
+        gate.observe(1, &update(None, Some("V-1"), to("V-2")));
+        assert_eq!(gate.unprotected()[0].vid, vid("V-3"));
+        // OTHER's order ends: what was heard there is dropped; INST stays held, its facts kept.
+        let before = gate.known();
+        gate.observe(1, &update_on(OTHER, None, Some("W-1"), canceled()));
+        assert!(!gate.unprotected_on(OTHER) && gate.unprotected_on(INST));
+        assert_eq!(gate.known(), before - 1);
+        assert_eq!(
+            held_after_ends_on(&mut gate, 1, &["V-1", "V-2", "V-3"]),
+            [true, true, false]
+        );
+        assert_eq!(gate.known(), 0);
+    }
+
+    /// Whether INST is still held after an end on `epoch` under each of `wires`, in turn.
+    fn held_after_ends_on(gate: &mut Gate, epoch: u32, wires: &[&str]) -> Vec<bool> {
+        wires
+            .iter()
+            .map(|wire| {
+                gate.observe(epoch, &update(None, Some(wire), canceled()));
+                gate.unprotected_on(INST)
+            })
+            .collect()
+    }
+
+    /// RB-nvxn-3 on PR #127 (FBC-48j7): with nothing unprotected, every place, batch and amend
+    /// on a placing epoch is admitted, a batch of any length included.
+    #[test]
+    fn with_nothing_unprotected_every_place_batch_and_amend_is_admitted() {
+        let mut gate = Gate::new(true, false, false);
+        resynced(&mut gate, &[]);
+        assert_eq!(admits_all(&gate, 0), Some(true));
+        let batch = VenueCommand::PlaceBatch((0..64).map(|_| order(cid())).collect());
+        assert_eq!(gate.admits(&batch, 0), Ok(()));
+        assert_eq!(
+            gate.admits(&VenueCommand::PlaceBatch(Vec::new()), 0),
+            Ok(())
+        );
+        assert_eq!(
+            gate.admits(&VenueCommand::PlaceBatch(Vec::new()), 1),
+            Err(Hold::Unready)
+        );
     }
 
     #[test]
