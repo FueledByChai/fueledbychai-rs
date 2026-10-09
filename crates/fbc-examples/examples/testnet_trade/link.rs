@@ -35,6 +35,15 @@
 //!   A venue error is shown through [`shown`]: Paradex's codec withholds a login refusal's
 //!   echoed words itself, but an auth frame's refusal is the venue's message as received, and
 //!   that frame carries the session token.
+//! - **Unprotected orders** ([`ExecHandler::on_unprotected`], decision 0080): the orders of
+//!   ours a connection's resync showed resting from an earlier connection or run, which its
+//!   cancel-on-disconnect may not cover, are cancelled at once: a Safety cancel per order, built
+//!   by the registry's [`Registry::cancel_many`] through each order's cancel permit, authorized
+//!   and submitted through the session's [`ExecOrders`] ([`Link::attach`]), and the request
+//!   remembered for the order ([`Link::safety_cancel_of`]). One the registry holds ended or
+//!   not at all is not cancelled: decision 0080 queries it, and no order query is built here
+//!   yet (FBC-m8vm), so its market stays held, which is safe. [`Note::Unprotected`] says what
+//!   was done.
 //! - **Notes.** Everything the driver may wait on is appended to [`Link::notes`], in order.
 //!
 //! Times on the shard's monotonic clock are taken from each event's stamp; a submission's send
@@ -48,9 +57,9 @@ use std::rc::Rc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fbc_core::{
-    CidMatch, ClientOrderId, ConnKey, ConnState, Envelope, ExecEvent, InstrumentId, ItemRef,
-    MonoNs, NotSentReason, OrderCaps, Reject, RpcId, SignedLots, SubmitHandle, SubmitOutcome,
-    VenueCommand, VenueOrderId, WallNs,
+    AccountKey, CidMatch, ClientOrderId, ConnKey, ConnState, Envelope, ExecEvent, InstrumentId,
+    ItemRef, MonoNs, NotSentReason, OrderCaps, Reject, RpcId, SignedLots, SubmitHandle,
+    SubmitOutcome, VenueCommand, VenueOrderId, VenueOrderSnapshot, WallNs,
 };
 use fbc_oms::{
     Admission, Authorization, FillLedger, FillRouted, FillTime, LadderConfig, OrderKey, OrderOp,
@@ -107,6 +116,14 @@ pub enum Note {
     LoginRefused(String),
     /// A connection epoch ended, and why, as far as the session reported it.
     EpochEnd { key: ConnKey, why: String },
+    /// The session told the orders of ours its connection's cancel-on-disconnect may not cover
+    /// (decision 0080): each with its market, the Safety cancel requests submitted for them,
+    /// and why any was not cancelled.
+    Unprotected {
+        told: Vec<(ClientOrderId, InstrumentId)>,
+        rpcs: Vec<RpcId>,
+        left: Vec<String>,
+    },
 }
 
 /// Why a connection ended when the session reported no venue error with it: its codec
@@ -248,6 +265,10 @@ pub struct Link {
     epoch_error: Option<String>,
     origin: Instant,
     notes: Vec<Note>,
+    /// The session's orders and the account, where Safety cancels go ([`Link::attach`]).
+    session: Option<(ExecOrders, AccountKey)>,
+    /// The Safety cancel request last submitted for each unprotected order.
+    safety: HashMap<ClientOrderId, RpcId>,
 }
 
 impl Link {
@@ -268,7 +289,39 @@ impl Link {
             epoch_error: None,
             origin: Instant::now(),
             notes: Vec::new(),
+            session: None,
+            safety: HashMap::new(),
         }
+    }
+
+    /// Where the Safety cancels of unprotected orders go: the session's `orders`, under the
+    /// account `acct`. Attached before the session runs, so before it tells any.
+    pub fn attach(&mut self, orders: ExecOrders, acct: AccountKey) {
+        self.session = Some((orders, acct));
+    }
+
+    /// The Safety cancel request submitted for our order `cid` when the session told it
+    /// unprotected, if one was.
+    pub fn safety_cancel_of(&self, cid: ClientOrderId) -> Option<RpcId> {
+        self.safety.get(&cid).copied()
+    }
+
+    /// How many orders of ours on `inst` the session told unprotected so far.
+    pub fn told_on(&self, inst: InstrumentId) -> usize {
+        let mut cids: Vec<ClientOrderId> = self
+            .notes
+            .iter()
+            .filter_map(|n| match n {
+                Note::Unprotected { told, .. } => Some(told),
+                _ => None,
+            })
+            .flatten()
+            .filter(|(_, i)| *i == inst)
+            .map(|(cid, _)| *cid)
+            .collect();
+        cids.sort_unstable();
+        cids.dedup();
+        cids.len()
     }
 
     /// The registry, for building commands and arming markets.
@@ -612,6 +665,68 @@ impl Link {
         }
     }
 
+    /// The orders of ours the session told unprotected (module documentation): each the
+    /// registry holds open gets a Safety cancel at once.
+    fn on_unprotected(&mut self, orders: &[VenueOrderSnapshot]) {
+        let told: Vec<(ClientOrderId, InstrumentId)> = orders
+            .iter()
+            .filter_map(|o| match o.cid {
+                Some(CidMatch::Ours(cid)) => Some((cid, o.inst)),
+                _ => None,
+            })
+            .collect();
+        let (open, ended): (Vec<ClientOrderId>, Vec<ClientOrderId>) = told
+            .iter()
+            .map(|(cid, _)| *cid)
+            .partition(|cid| self.reg.get(*cid).is_some_and(|r| !r.state().is_terminal()));
+        let mut left: Vec<String> = ended
+            .iter()
+            .map(|cid| {
+                format!(
+                    "client id sequence {}: the registry holds it ended or not at all, and no \
+                     order query is built here (FBC-m8vm), so its market stays held",
+                    cid.seq()
+                )
+            })
+            .collect();
+        let plan = self.reg.cancel_many(&open, &self.caps);
+        let unbuilt = plan.refused.iter().map(|(cid, r)| (*cid, format!("{r:?}")));
+        let waiting = plan
+            .awaiting_ack
+            .iter()
+            .map(|cid| (*cid, "awaits its ack".to_owned()));
+        for (cid, why) in unbuilt.chain(waiting) {
+            left.push(format!(
+                "client id sequence {}: no cancel built: {why}",
+                cid.seq()
+            ));
+        }
+        let mut rpcs = Vec::new();
+        let session = self.session.clone();
+        for cmd in plan.commands {
+            let submitted = session
+                .as_ref()
+                .ok_or_else(|| "no session attached".to_owned())
+                .and_then(|(orders, acct)| {
+                    let auth = self
+                        .reg
+                        .authorize(*acct, cmd)
+                        .map_err(|e| format!("{e:?}"))?;
+                    self.submit(orders, auth)
+                });
+            match submitted {
+                Ok(rpc) => {
+                    for cid in self.cids_of(rpc) {
+                        self.safety.insert(cid, rpc);
+                    }
+                    rpcs.push(rpc);
+                }
+                Err(e) => left.push(format!("a Safety cancel was not submitted: {e}")),
+            }
+        }
+        self.notes.push(Note::Unprotected { told, rpcs, left });
+    }
+
     /// Connection epoch `key` ended: noted with why ([`Note::EpochEnd`]), and the next starts
     /// unauthenticated with nothing said.
     fn on_epoch_end(&mut self, key: ConnKey) {
@@ -669,6 +784,11 @@ impl ExecHandler for LinkHandler {
 
     fn on_submitted(&mut self, handle: SubmitHandle) {
         self.link.borrow_mut().on_submitted(handle);
+        self.wake.notify_waiters();
+    }
+
+    fn on_unprotected(&mut self, orders: &[VenueOrderSnapshot]) {
+        self.link.borrow_mut().on_unprotected(orders);
         self.wake.notify_waiters();
     }
 }
