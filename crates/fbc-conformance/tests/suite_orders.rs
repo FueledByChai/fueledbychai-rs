@@ -157,6 +157,9 @@ enum Twist {
     /// On every connection after the first, the authentication's answer is followed by a stray
     /// resync end, and every resync frame is ignored (Codex r4226060251).
     StrayResyncEndOnReconnect,
+    /// As [`Twist::ProvisionalThenRiskReject`], the reject naming the order's venue id beside a
+    /// stranger's client id (Codex r4226156929).
+    RiskRejectNamingTwoOrders,
 }
 
 /// The toy with its caps edited by `caps` and its codec twisted by `twist`.
@@ -549,6 +552,10 @@ static STRAY_RESYNC_END: Variant = Variant {
 static STRAY_RESYNC_END_ON_RECONNECT: Variant = Variant {
     caps: |_| {},
     twist: Twist::StrayResyncEndOnReconnect,
+};
+static TWO_PHASE_REJECT_TWO_ORDERS: Variant = Variant {
+    caps: two_phase,
+    twist: Twist::RiskRejectNamingTwoOrders,
 };
 static TWO_PHASE_DANGLING: Variant = Variant {
     caps: two_phase,
@@ -1313,6 +1320,18 @@ fn final_and_risk_reject(ev: ExecEvent) -> Vec<ExecEvent> {
     out
 }
 
+/// As [`provisional_then_risk_reject`], the reject naming a stranger's client id beside the
+/// order's venue id.
+fn risk_reject_naming_two_orders(ev: ExecEvent) -> Vec<ExecEvent> {
+    let mut out = provisional_then_risk_reject(ev);
+    if let Some(ExecEvent::AsyncReject { target, .. }) = out.last_mut()
+        && let Some(vid) = target.venue().cloned()
+    {
+        *target = fbc_core::OrderRef::Both(stranger(), vid);
+    }
+    out
+}
+
 /// A placement's acceptance, naming its venue id, preceded by the venue's risk check refusing
 /// it, and reported provisional.
 fn risk_reject_first(ev: ExecEvent) -> Vec<ExecEvent> {
@@ -1471,6 +1490,7 @@ impl ExecCodec for Twisted {
             Twist::ProvisionalThenRiskReject => provisional_then_risk_reject,
             Twist::FinalAndRiskReject => final_and_risk_reject,
             Twist::RiskRejectFirst => risk_reject_first,
+            Twist::RiskRejectNamingTwoOrders => risk_reject_naming_two_orders,
             Twist::StrangerOnReject => stranger_on_reject,
             Twist::StrayResyncEnd => stray_resync_end,
             _ => kept,
@@ -2849,6 +2869,21 @@ fn two_phase_ack_and_resync_after_reconnect_fail_a_placement_acceptance_naming_i
     ));
     assert!(
         says(&failure, "ExecCodec::on_frame", "naming its one item"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn two_phase_ack_takes_no_risk_reject_naming_another_order_beside_the_placement() {
+    let failure = failed(suite::two_phase_ack(
+        &TWO_PHASE_REJECT_TWO_ORDERS.subject(assumed),
+    ));
+    assert!(
+        says(
+            &failure,
+            "AckModel is TwoPhase { risk_reject_window: 1s }",
+            "followed by neither a final acceptance nor an asynchronous reject"
+        ),
         "{failure}"
     );
 }
