@@ -1470,3 +1470,74 @@ fn a_new_connection_a_timeout_or_an_unaccepted_reply_leaves_no_placement_awaitin
     let call = frame(&mut codec, RawFrame::Binary(&opened));
     assert_eq!(call.events, decoded(&opened));
 }
+
+/// `bytes` with our first order's venue id ([`OID`]) replaced by `other`, as long.
+fn with_vid(bytes: &[u8], other: &str) -> Vec<u8> {
+    let (from, to) = (OID.as_bytes(), other.as_bytes());
+    assert_eq!(from.len(), to.len());
+    let at = bytes.windows(from.len()).position(|w| w == from).unwrap();
+    let mut out = bytes.to_vec();
+    out[at..at + from.len()].copy_from_slice(to);
+    out
+}
+
+/// What `codec` pushed for `f`, with each event's `VenueMeta`.
+fn frame_metas(codec: &mut ParadexExec, f: RawFrame<'_>) -> Vec<(VenueMeta, ExecEvent)> {
+    let specs = md::specs();
+    let (mut sink, mut fx) = (Sink::default(), Effects::new());
+    dispatch(&caps(), OWN, |scope| {
+        codec.on_frame(STREAM, f, scope, &specs, &mut sink, &mut fx)
+    })
+    .unwrap();
+    sink.0
+}
+
+#[test]
+fn a_phase_an_event_before_the_reply_showed_carries_that_events_venue_meta() {
+    // Codex r4228157167 on PR #145: the reply states no venue time or sequence, the event does.
+    let cases = [
+        (new_event_as(3), accepted(11, AckLevel::Final), 0),
+        (
+            sbe("order-closed-post-only-v2.sbe.txt"),
+            place_refused(RejectKind::PostOnlyWouldCross, "POST_ONLY_WOULD_CROSS"),
+            1,
+        ),
+    ];
+    for (event, phase, at) in cases {
+        let mut codec = authenticated();
+        encode(&mut codec, &place(), RpcId(11)).0.unwrap();
+        let shown = frame_metas(&mut codec, RawFrame::Binary(&event));
+        let meta = shown.last().unwrap().0;
+        assert!(meta.venue_seq.is_some() && meta.exch_ts.is_some());
+        let reply = fixture_text("reply-create.json");
+        let pushed = frame_metas(&mut codec, RawFrame::Text(&reply));
+        assert_eq!(pushed[at], (meta, phase));
+    }
+}
+
+#[test]
+fn an_event_naming_another_venue_id_settles_no_placement() {
+    // Codex r4228157178 on PR #145: our client id under a venue id the reply did not name is
+    // not the placement's event, before the reply or after it.
+    let other = "1759500000000000009";
+    let mut codec = placed();
+    let stray = with_vid(&new_event_as(3), other);
+    let call = frame(&mut codec, RawFrame::Binary(&stray));
+    assert_eq!(call.events, decoded(&stray));
+    let open = new_event_as(3);
+    let call = frame(&mut codec, RawFrame::Binary(&open));
+    let mut expected = vec![accepted(11, AckLevel::Final)];
+    expected.extend(decoded(&open));
+    assert_eq!(call.events, expected);
+    // Before the reply: the stray event is not taken for the placement's.
+    let mut codec = authenticated();
+    encode(&mut codec, &place(), RpcId(11)).0.unwrap();
+    let stray = with_vid(&sbe("order-closed-post-only-v2.sbe.txt"), other);
+    frame(&mut codec, RawFrame::Binary(&stray)).result.unwrap();
+    let call = text(&mut codec, &fixture_text("reply-create.json"));
+    assert_eq!(call.events, [accepted(11, AckLevel::Provisional)]);
+    let call = frame(&mut codec, RawFrame::Binary(&open));
+    let mut expected = vec![accepted(11, AckLevel::Final)];
+    expected.extend(decoded(&open));
+    assert_eq!(call.events, expected);
+}
