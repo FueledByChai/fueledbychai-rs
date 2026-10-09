@@ -154,6 +154,9 @@ enum Twist {
     /// A placement's acceptance is followed by a stray resync end, and every resync frame on a
     /// later connection is ignored (Codex r4225971621).
     StrayResyncEnd,
+    /// On every connection after the first, the authentication's answer is followed by a stray
+    /// resync end, and every resync frame is ignored (Codex r4226060251).
+    StrayResyncEndOnReconnect,
 }
 
 /// The toy with its caps edited by `caps` and its codec twisted by `twist`.
@@ -542,6 +545,10 @@ static STRANGER_ON_REJECT: Variant = Variant {
 static STRAY_RESYNC_END: Variant = Variant {
     caps: |_| {},
     twist: Twist::StrayResyncEnd,
+};
+static STRAY_RESYNC_END_ON_RECONNECT: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::StrayResyncEndOnReconnect,
 };
 static TWO_PHASE_DANGLING: Variant = Variant {
     caps: two_phase,
@@ -1471,7 +1478,19 @@ impl ExecCodec for Twisted {
         // The toy's resync ends with this frame.
         let resync_ended = f.bytes() == b"rsend";
         let resync_frame = f.bytes().starts_with(b"rs");
-        if self.twist == Twist::StrayResyncEnd && self.opens > 1 && resync_frame {
+        let strays = matches!(
+            self.twist,
+            Twist::StrayResyncEnd | Twist::StrayResyncEndOnReconnect
+        );
+        if strays && self.opens > 1 && resync_frame {
+            return Ok(());
+        }
+        if self.twist == Twist::StrayResyncEndOnReconnect
+            && self.opens > 1
+            && f.bytes().starts_with(b"auth|")
+        {
+            self.inner.on_frame(stream, f, scope, specs, sink, fx)?;
+            sink.push(VenueMeta::NONE, ExecEvent::ResyncEnd);
             return Ok(());
         }
         let sink = &mut Rewrite { inner: sink, f: f_ };
@@ -2799,6 +2818,37 @@ fn resync_after_reconnect_takes_no_resync_end_of_the_first_connection_for_the_re
             "ExecCodec::resync",
             "no resync ended once the stub closed the connection"
         ),
+        "{failure}"
+    );
+}
+
+#[test]
+fn resync_after_reconnect_takes_no_stray_resync_end_on_the_new_connection_for_a_resync() {
+    let failure = failed(suite::resync_after_reconnect(
+        &STRAY_RESYNC_END_ON_RECONNECT.subject(assumed),
+    ));
+    assert!(
+        says(
+            &failure,
+            "ExecCodec::resync",
+            "no resync ended once the stub closed the connection"
+        ),
+        "{failure}"
+    );
+}
+
+#[test]
+fn two_phase_ack_and_resync_after_reconnect_fail_a_placement_acceptance_naming_item_one() {
+    let failure = failed(suite::two_phase_ack(&PLACED_AS_ITEM_ONE.subject(assumed)));
+    assert!(
+        says(&failure, "OrderCaps.ack", "naming its one item"),
+        "{failure}"
+    );
+    let failure = failed(suite::resync_after_reconnect(
+        &PLACED_AS_ITEM_ONE.subject(assumed),
+    ));
+    assert!(
+        says(&failure, "ExecCodec::on_frame", "naming its one item"),
         "{failure}"
     );
 }

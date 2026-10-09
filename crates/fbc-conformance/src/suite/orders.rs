@@ -725,6 +725,13 @@ pub fn unknown_on_timeout(subject: &Subject<'static>) -> Result<Verdict, Failure
     })
 }
 
+/// Whether every outcome of `outcomes` is the one item of a single command placing order `cid`:
+/// the whole request, or item 0 naming no other client id (Codex r4226060234, r4226060238).
+pub(super) fn own_item(outcomes: &[(Option<ItemRef>, SubmitOutcome)], cid: ClientOrderId) -> bool {
+    let own = |it: &ItemRef| it.idx == 0 && it.cid.is_none_or(|named| named == cid);
+    outcomes.iter().all(|(it, _)| it.as_ref().is_none_or(own))
+}
+
 /// A breach when the order `cid` names was written more than once, as [`Ctx::written`] counts
 /// it.
 pub(super) fn resent(c: &Ctx<'_>, cid: ClientOrderId, what: &str) -> Option<Breach> {
