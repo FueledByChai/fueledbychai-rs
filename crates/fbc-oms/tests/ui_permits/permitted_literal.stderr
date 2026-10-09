@@ -6,7 +6,7 @@ error: cannot construct `PermittedCommand` with struct literal syntax due to pri
 7 |         cmd: VenueCommand::Cancel(cancel),
   |         --------------------------------- private field
   |
-  = note: ...and other private fields `origin`, `built` and `guard` that were not provided
+  = note: ...and other private fields `origin`, `built`, `guard` and `hold` that were not provided
 help: you might have meant to use an associated function to build this type
   |
 6 -     PermittedCommand {
@@ -18,4 +18,9 @@ help: you might have meant to use an associated function to build this type
 7 -         cmd: VenueCommand::Cancel(cancel),
 8 -     }
 6 +     PermittedCommand::guarded(_, _, _)
+  |
+6 -     PermittedCommand {
+7 -         cmd: VenueCommand::Cancel(cancel),
+8 -     }
+6 +     PermittedCommand::holding(_, _, _, _)
   |

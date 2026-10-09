@@ -159,10 +159,12 @@
 //! was bound to ([`Registry::bind_account`]) or else first authorized for ([`IssueRefusal`]),
 //! and a place, a batch or an amend is judged against the caps again as it is authorized, so
 //! one retained while a fill moved the position is refused, its reservation released. A place
-//! or batch item built and not yet authorized is withdrawn only with its command
-//! ([`Registry::place_not_submitted`]; an outcome by client id that would end it is refused,
-//! [`OmsError::NotIssued`]), and an amend's build token names its registry, so another
-//! registry's command releases nothing ([`Registry::amend_not_submitted`]).
+//! or batch item built and not yet authorized is held: withdrawn with its command
+//! ([`Registry::place_not_submitted`]) or, its command dropped, released by the registry's next
+//! mutating call, so it is never stranded; no outcome of it by client id applies
+//! ([`OmsError::NotIssued`]), and an accepted or unknown one voids its command (decision 0084,
+//! `tests/held.rs`). An amend's build token names its registry, so another registry's command
+//! releases nothing ([`Registry::amend_not_submitted`]).
 //!
 //! The execution planner (decision 0005's one planner, decisions 0065 and 0068;
 //! `tests/planner.rs`): the consumer's [`DesiredBook`], a [`DesiredQuote`] per side and level,

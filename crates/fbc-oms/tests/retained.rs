@@ -361,7 +361,8 @@ fn a_command_another_registry_built_is_refused_and_changes_nothing_here() {
         refused.to_string().contains("another registry"),
         "{refused}"
     );
-    // Nothing here was judged or bound; there, the reservation stays held (fail closed).
+    // Nothing here was judged or bound; there, the reservation is held until that registry's
+    // next mutating call releases the dropped command's order (decision 0084).
     assert_eq!(ours.account(), None);
     assert!(ours.get(c).is_none());
     assert_eq!(theirs.resting_on(INST, Side::Buy), Some(lots(CAP)));
@@ -549,7 +550,7 @@ fn the_refusals_say_what_was_refused() {
     );
     assert_eq!(
         OmsError::NotIssued(c).to_string(),
-        format!("the place of {c:?} was never authorized: it is withdrawn only with its command")
+        format!("the place of {c:?} was never authorized: no outcome of it applies")
     );
 }
 

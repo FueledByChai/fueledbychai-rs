@@ -111,7 +111,7 @@ fn refused() -> SubmitOutcome {
 fn open(reg: &mut Registry, qty: i64) -> ClientOrderId {
     let order: NewOrder = placement(cid(), 100, qty);
     let c = order.cid;
-    reg.place(order).unwrap();
+    arm::place_issued(reg, order);
     outcome(
         reg,
         c,

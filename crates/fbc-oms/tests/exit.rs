@@ -150,7 +150,7 @@ fn key(n: u64) -> OrderKey {
 /// Places `order` (admitted) and acknowledges it under the venue id `v`: Open.
 fn open(reg: &mut Registry, order: NewOrder, v: &str) -> ClientOrderId {
     let c = order.cid;
-    reg.place(order).unwrap();
+    arm::place_issued(reg, order);
     let item = ItemRef {
         idx: 0,
         cid: None,
@@ -322,7 +322,7 @@ fn exit_builds_only_exit_orders_on_the_side_that_reduces_the_position() {
                 .filter_map(|(_, o, why)| why.map(|why| (o.cid, refused(why))))
                 .collect();
             assert_eq!(
-                plan.command.map(|cmd| cmd.command().clone()),
+                plan.command.as_ref().map(|cmd| cmd.command().clone()),
                 Some(VenueCommand::PlaceBatch(admitted.clone())),
                 "{case}"
             );
@@ -345,10 +345,10 @@ fn exit_sizes_each_order_so_the_position_plus_every_order_on_its_side_never_cros
             // the fill event arrived (4 resting, 2 the inventory does not hold yet): 16 that
             // may still move the position. The other side's order counts for nothing here.
             open(&mut reg, order(reduces, 5, px(reduces)), "v-open");
-            reg.place(order(reduces, 3, px(reduces))).unwrap();
+            arm::place_issued(&mut reg, order(reduces, 3, px(reduces)));
             let unknown = order(reduces, 2, px(reduces));
             let u = unknown.cid;
-            reg.place(unknown).unwrap();
+            arm::place_issued(&mut reg, unknown);
             let item = ItemRef {
                 idx: 0,
                 cid: None,
@@ -370,7 +370,7 @@ fn exit_sizes_each_order_so_the_position_plus_every_order_on_its_side_never_cros
                 Err(refused(crosses(reduces, 21, POS))),
                 "{case}"
             );
-            reg.place(exit_of(reduces, 4)).unwrap();
+            arm::place_issued(&mut reg, exit_of(reduces, 4));
             assert_eq!(
                 reg.place(exit_of(reduces, 1)),
                 Err(refused(crosses(reduces, 21, POS))),
@@ -388,7 +388,7 @@ fn a_batch_in_exit_judges_each_item_with_the_earlier_ones_admitted() {
         let items = [8, 8, 5, 4].map(|q| exit_of(reduces, q));
         let plan = reg.place_batch(items.to_vec()).unwrap();
         assert_eq!(
-            plan.command.map(|cmd| cmd.command().clone()),
+            plan.command.as_ref().map(|cmd| cmd.command().clone()),
             Some(VenueCommand::PlaceBatch(vec![
                 items[0].clone(),
                 items[1].clone(),
@@ -539,7 +539,7 @@ fn exit_still_refuses_every_order_a_cap_refuses() {
             cap: lots(CAP),
         }))
     );
-    reg.place(exit_of(Side::Sell, 10)).unwrap();
+    arm::place_issued(&mut reg, exit_of(Side::Sell, 10));
 
     // The resting cap, on places, batch items and amends.
     let resting = |total| CapRefusal::RestingCap {
@@ -557,7 +557,7 @@ fn exit_still_refuses_every_order_a_cap_refuses() {
     let items = [5, 4, 3].map(|q| exit_of(Side::Sell, q));
     let plan = reg.place_batch(items.to_vec()).unwrap();
     assert_eq!(
-        plan.command.map(|cmd| cmd.command().clone()),
+        plan.command.as_ref().map(|cmd| cmd.command().clone()),
         Some(VenueCommand::PlaceBatch(vec![
             items[0].clone(),
             items[2].clone()

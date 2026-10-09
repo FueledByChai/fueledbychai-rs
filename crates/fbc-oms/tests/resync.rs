@@ -18,8 +18,8 @@ use fbc_core::{
 use fbc_oms::{
     Admission, ArmRefusal, CapRefusal, EntryState, FillLedger, FillRouted, FillTime, LadderConfig,
     LedgerConfig, MarketCapsConfig, OmsError, OrdState, OrderKey, OrderOp, PermitRefusal,
-    PermittedCommand, PositionCheck, PreTradeCaps, Registry, ResyncError, ResyncReport,
-    ResyncSnapshot, StateRefusal, TerminalKind,
+    PositionCheck, PreTradeCaps, Registry, ResyncError, ResyncReport, ResyncSnapshot, StateRefusal,
+    TerminalKind,
 };
 
 const INST: InstrumentId = InstrumentId::new(1);
@@ -74,11 +74,11 @@ fn untouched(reg: &Registry) {
     );
 }
 
-/// Builds the place of `order`, the owner's Start pressed first once `INST`'s position is known
+/// Builds and authorizes the place of `order`, the owner's Start pressed first once `INST`'s position is known
 /// (decision 0012): until then nothing is armed, and the market's state refuses it. An armed
 /// market must be exactly as `arm` left it, so a resync, fill or ladder tick that armed it, or
 /// moved its state, fails here rather than being hidden by the arming.
-fn place(reg: &mut Registry, order: NewOrder) -> Result<PermittedCommand, OmsError> {
+fn place(reg: &mut Registry, order: NewOrder) -> Result<(), OmsError> {
     let e = reg.entry(INST);
     if e.armed() {
         assert_eq!(
@@ -92,7 +92,9 @@ fn place(reg: &mut Registry, order: NewOrder) -> Result<PermittedCommand, OmsErr
             arm(reg);
         }
     }
-    reg.place(order)
+    // Authorized as a gateway is handed it, so it is not a held place its command's drop
+    // releases (FBC-657c).
+    reg.place(order).map(|cmd| arm::issue(reg, cmd))
 }
 
 /// What refuses a place before the first trustworthy resync: the market cannot be armed

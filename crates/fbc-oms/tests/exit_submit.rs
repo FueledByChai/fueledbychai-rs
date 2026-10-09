@@ -131,7 +131,7 @@ fn venue() -> OrderCaps {
 /// Places `order` (admitted) and acknowledges it under the venue id `v`: Open.
 fn open(reg: &mut Registry, order: NewOrder, v: &str) -> ClientOrderId {
     let c = order.cid;
-    reg.place(order).unwrap();
+    arm::place_issued(reg, order);
     let item = ItemRef {
         idx: 0,
         cid: None,

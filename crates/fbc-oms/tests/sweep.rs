@@ -142,7 +142,7 @@ fn on(market: InstrumentId, order: NewOrder) -> NewOrder {
 /// Places `order` (admitted) and acknowledges it under the venue id `v`: Open.
 fn open(reg: &mut Registry, order: NewOrder, v: &str) -> ClientOrderId {
     let c = order.cid;
-    reg.place(order).unwrap();
+    arm::place_issued(reg, order);
     let item = ItemRef {
         idx: 0,
         cid: None,
@@ -319,10 +319,10 @@ fn a_cancel_all_comes_with_the_explicit_cancels_of_our_orders_the_venue_may_not_
     // One placement unanswered (PendingNew), one whose answer never came (Unknown).
     let pending = placement(cid(), 99, 1);
     let pending_cid = pending.cid;
-    reg.place(pending).unwrap();
+    arm::place_issued(&mut reg, pending);
     let lost = placement(cid(), 98, 1);
     let lost_cid = lost.cid;
-    reg.place(lost).unwrap();
+    arm::place_issued(&mut reg, lost);
     let item = ItemRef {
         idx: 0,
         cid: None,

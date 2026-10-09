@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fbc_core::{
@@ -19,7 +20,8 @@ use crate::grant::{Counters, Guard, IssueRefusal, Watch};
 use crate::ladder;
 use crate::ledger::AcceptedFill;
 use crate::permit::{
-    self, CancelChoice, CancelPlan, Cancellable, Live, PermitRefusal, PermittedCommand, PlacePlan,
+    self, CancelChoice, CancelPlan, Cancellable, DroppedPlaces, Live, PermitRefusal,
+    PermittedCommand, PlacePlan, places_of,
 };
 use crate::record::{Applied, FillApplied, OrderKey, OrderOp, OrderRecord, OutcomeApplied};
 use crate::resync::{MarketState, Placed, Placement, Seed};
@@ -64,6 +66,9 @@ pub struct Registry {
     /// ([`Registry::bind_account`]) or
     /// bound by its first authorization; every authorization is for it (decision 0082).
     account: Option<AccountKey>,
+    /// The orders whose place or batch command was dropped while it held them, which the
+    /// registry ends not sent at its next mutating call (decision 0084).
+    dropped: Arc<DroppedPlaces>,
 }
 
 /// One registry among every registry the process built: drawn fresh for each.
@@ -160,9 +165,12 @@ pub enum OmsError {
     MixedMarkets,
     /// The market's position was already seeded.
     PositionSeeded(InstrumentId),
-    /// A placement's outcome reports not sent or refused an order whose place was built and
-    /// whose command is still held, never authorized: nothing of it was sent, and it is
-    /// withdrawn only with its command ([`Registry::place_not_submitted`]; decision 0082).
+    /// A placement's outcome names an order whose place was built and whose command is still
+    /// held, never authorized: nothing of it was sent, so no outcome of it applies (decision
+    /// 0082, 0084). Not sent or refused, the order and its command are left as they were,
+    /// and it is withdrawn with its command ([`Registry::place_not_submitted`]) or by dropping
+    /// it; accepted or unknown, which say the venue may hold an order never authorized, its
+    /// command is voided: the order ends not sent and the command is never authorized.
     NotIssued(ClientOrderId),
     /// The registry is already bound to the account `bound`, by [`Registry::bind_account`] or
     /// its first authorization, and was to be bound to `acct`: a binding never changes
@@ -212,7 +220,7 @@ impl fmt::Display for OmsError {
             ),
             OmsError::NotIssued(cid) => write!(
                 f,
-                "the place of {cid:?} was never authorized: it is withdrawn only with its command"
+                "the place of {cid:?} was never authorized: no outcome of it applies"
             ),
             OmsError::PositionMoved(inst) => write!(
                 f,
@@ -246,6 +254,7 @@ impl Registry {
     /// another account is refused ([`OmsError::AccountBound`]) and changes nothing; the same
     /// account again changes nothing.
     pub fn bind_account(&mut self, acct: AccountKey) -> Result<(), OmsError> {
+        self.reap_dropped();
         match self.account {
             Some(bound) if bound != acct => Err(OmsError::AccountBound { acct, bound }),
             _ => {
@@ -328,17 +337,22 @@ impl Registry {
     ///
     /// The command is held until it is authorized ([`Registry::authorize`], which judges it
     /// against the caps again) or withdrawn with [`Registry::place_not_submitted`]; until then
-    /// no outcome naming the order by client id ends it ([`OmsError::NotIssued`], decision
-    /// 0082).
+    /// no outcome naming the order by client id applies ([`OmsError::NotIssued`], decision
+    /// 0082). Dropped otherwise, the command hands its order back: the registry's next
+    /// mutating call ends it not sent
+    /// ([`NotSentReason::StaleAuthorization`](fbc_core::NotSentReason::StaleAuthorization)),
+    /// freeing what it counted, so a held place is never stranded (decision 0084).
     pub fn place(&mut self, order: NewOrder) -> Result<PermittedCommand, OmsError> {
+        self.reap_dropped();
         self.admit_placement(&order)?;
         self.insert(order.clone())?;
         self.held(order.cid);
         let guard = self.state_guard(order.inst);
-        Ok(PermittedCommand::guarded(
+        Ok(PermittedCommand::holding(
             VenueCommand::Place(order),
             guard,
             self.instance,
+            &self.dropped,
         ))
     }
 
@@ -379,10 +393,11 @@ impl Registry {
         }
         if let Some(first) = admitted.first() {
             let guard = self.state_guard(first.inst);
-            plan.command = Some(PermittedCommand::guarded(
+            plan.command = Some(PermittedCommand::holding(
                 VenueCommand::PlaceBatch(admitted),
                 guard,
                 self.instance,
+                &self.dropped,
             ));
         }
         Ok(plan)
@@ -431,6 +446,7 @@ impl Registry {
     /// client id. A place is built only through [`Registry::place`] or
     /// [`Registry::place_batch`], under the pre-trade caps.
     pub fn insert(&mut self, placed: NewOrder) -> Result<&OrderRecord, OmsError> {
+        self.reap_dropped();
         let cid = placed.cid;
         match self.orders.entry(cid) {
             std::collections::hash_map::Entry::Occupied(_) => Err(OmsError::DuplicateCid(cid)),
@@ -467,6 +483,7 @@ impl Registry {
     /// namespace's, a non-canonical client id, or no client id and a venue id no order of ours
     /// had) moves that order into or out of view ([`Registry::foreign_in_view`]).
     pub fn apply_update(&mut self, u: &OrderUpdate, key: OrderKey) -> Routed {
+        self.reap_dropped();
         let cid = match u.cid {
             Some(CidMatch::Foreign(ns)) => {
                 self.foreign.update(u);
@@ -507,6 +524,7 @@ impl Registry {
     ///
     /// [`ArmRefusal::SeededByHand`]: crate::ArmRefusal::SeededByHand
     pub fn seed_position(&mut self, inst: InstrumentId, pos: SignedLots) -> Result<(), OmsError> {
+        self.reap_dropped();
         match self.markets.get(&inst) {
             Some(MarketState::Seeded(_) | MarketState::Unsettled) => {
                 return Err(OmsError::PositionSeeded(inst));
@@ -551,6 +569,7 @@ impl Registry {
     /// would overflow, or when the fill comes from another ledger than the first one the
     /// registry took a fill from.
     pub fn apply_fill(&mut self, accepted: AcceptedFill<'_, '_>) -> Result<FillRouted, OmsError> {
+        self.reap_dropped();
         let ledger = accepted.ledger_id();
         if self.ledger.is_some_and(|ours| ours != ledger) {
             return Err(OmsError::OtherLedger);
@@ -641,11 +660,16 @@ impl Registry {
     /// ([`OrderRecord::on_outcome`]): `item` is the item as the reply names it. Refused when
     /// no order is registered under `cid`, or when the item names another client id.
     ///
-    /// Refused, changing nothing, for a placement not sent or refused whose place was built and
-    /// whose command is still held, never authorized ([`OmsError::NotIssued`]): nothing of it
-    /// was sent, and ending it by client id would free what it counts while its command could
-    /// still be authorized. Such a place is withdrawn with its command
-    /// ([`Registry::place_not_submitted`]; decision 0082).
+    /// Refused for a placement whose place was built and whose command is still held, never
+    /// authorized ([`OmsError::NotIssued`]): nothing of it was sent, since only an
+    /// authorization reaches a gateway (0045), so no outcome of it applies. Not sent or
+    /// refused, it changes nothing: ending the order by client id would free what it counts
+    /// while its command could still be authorized, so such a place is withdrawn with its
+    /// command ([`Registry::place_not_submitted`], or by dropping it; decision 0082). Accepted
+    /// or unknown, which say the venue may hold an order never authorized, it voids the
+    /// command, so it is never sent on top of what the report claims: the order ends not sent
+    /// ([`NotSentReason::StaleAuthorization`]), freeing what it counts, and its command, or
+    /// its batch's, is refused at authorization ([`IssueRefusal::Released`]; decision 0084).
     pub fn on_outcome(
         &mut self,
         cid: ClientOrderId,
@@ -659,14 +683,15 @@ impl Registry {
         {
             return Err(OmsError::ItemNamesAnother { cid, item: named });
         }
-        let rec = self.orders.get(&cid).ok_or(OmsError::UnknownCid(cid))?;
-        if op == OrderOp::Place
-            && rec.unissued()
-            && matches!(
-                outcome,
-                SubmitOutcome::NotSent(_) | SubmitOutcome::Rejected(_)
-            )
-        {
+        self.reap_dropped();
+        let rec = self.orders.get_mut(&cid).ok_or(OmsError::UnknownCid(cid))?;
+        if op == OrderOp::Place && rec.unissued() {
+            match outcome {
+                SubmitOutcome::NotSent(_) | SubmitOutcome::Rejected(_) => {}
+                SubmitOutcome::Accepted { .. } | SubmitOutcome::Unknown => {
+                    rec.withdraw_place(NotSentReason::StaleAuthorization);
+                }
+            }
             return Err(OmsError::NotIssued(cid));
         }
         let applied = self.with_record(cid, |rec| {
@@ -683,6 +708,7 @@ impl Registry {
     /// Records the nonce the placement of `cid` was sent with (from its encode receipt), for
     /// venues that cancel by it. The same nonce again changes nothing; another is refused.
     pub fn placement_nonce_used(&mut self, cid: ClientOrderId, nonce: u64) -> Result<(), OmsError> {
+        self.reap_dropped();
         let rec = self.orders.get_mut(&cid).ok_or(OmsError::UnknownCid(cid))?;
         match rec.placement_nonce() {
             Some(known) if known != nonce => Err(OmsError::NonceRecorded(cid)),
@@ -703,6 +729,7 @@ impl Registry {
         rpc: RpcId,
         now: MonoNs,
     ) -> Result<bool, OmsError> {
+        self.reap_dropped();
         let rec = self.orders.get_mut(&cid).ok_or(OmsError::UnknownCid(cid))?;
         Ok(rec.amend_sent(px, qty, rpc, now))
     }
@@ -718,6 +745,7 @@ impl Registry {
     /// the order and the build's number, so another registry's amend of an order under the
     /// same client id, at the same build number, releases nothing here (decision 0082).
     pub fn amend_not_submitted(&mut self, cmd: PermittedCommand) -> bool {
+        self.reap_dropped();
         if cmd.origin() != self.instance {
             return false;
         }
@@ -736,10 +764,15 @@ impl Registry {
     /// this registry built, or none of its orders still held its command. A place a gateway
     /// took, its command spent by the authorization, is reported with
     /// [`Registry::on_outcome`] instead (decision 0082).
-    pub fn place_not_submitted(&mut self, cmd: PermittedCommand, reason: NotSentReason) -> bool {
+    pub fn place_not_submitted(
+        &mut self,
+        mut cmd: PermittedCommand,
+        reason: NotSentReason,
+    ) -> bool {
         if cmd.origin() != self.instance {
             return false;
         }
+        cmd.spend_hold();
         let cids = places_of(cmd.command());
         let mut any = false;
         for cid in cids {
@@ -840,6 +873,7 @@ impl Registry {
         rpc: RpcId,
         now: MonoNs,
     ) -> Result<bool, OmsError> {
+        self.reap_dropped();
         let rec = self.orders.get_mut(&cid).ok_or(OmsError::UnknownCid(cid))?;
         Ok(rec.cancel_sent(rpc, now))
     }
@@ -849,6 +883,7 @@ impl Registry {
     /// acknowledgement. It holds the registry mutably, so nothing changes the orders the
     /// amend is judged against until it is built.
     pub fn live(&mut self, cid: ClientOrderId) -> Result<Live<'_>, PermitRefusal> {
+        self.reap_dropped();
         let placed = self
             .orders
             .get(&cid)
@@ -868,6 +903,7 @@ impl Registry {
     /// The permit to cancel our order `cid`: it is not terminal (PendingNew, Unknown and an
     /// order with a command in flight included).
     pub fn cancellable(&mut self, cid: ClientOrderId) -> Result<Cancellable<'_>, PermitRefusal> {
+        self.reap_dropped();
         let origin = self.instance;
         let rec = self
             .orders
@@ -888,6 +924,7 @@ impl Registry {
         cid: Option<CidMatch>,
         vid: Option<&VenueOrderId>,
     ) -> Result<Cancellable<'_>, PermitRefusal> {
+        self.reap_dropped();
         let cid = match cid {
             Some(CidMatch::Foreign(ns)) => return Err(PermitRefusal::Foreign(ns)),
             Some(CidMatch::Unparseable) => return Err(PermitRefusal::NotCanonical),
@@ -916,6 +953,7 @@ impl Registry {
     /// its market); one with no usable reference yet waits for its acknowledgement
     /// ([`CancelChoice::AwaitAck`]); one with no permit is refused.
     pub fn cancel_many(&mut self, cids: &[ClientOrderId], caps: &OrderCaps) -> CancelPlan {
+        self.reap_dropped();
         let batch = caps.batch_cancel.filter(|b| b.max_items > 0);
         let mut plan = CancelPlan::default();
         let mut items = Vec::new();
@@ -966,6 +1004,19 @@ impl Registry {
         due
     }
 
+    /// Ends not sent ([`NotSentReason::StaleAuthorization`]) each order whose place or batch
+    /// command was dropped while it still held it, neither authorized nor withdrawn, freeing
+    /// what it counted (decision 0084). Every mutating call runs it first, so a dropped command's
+    /// orders count in no build, judgement, plan or event after its drop; a read of the
+    /// registry before its next mutating call still shows them held.
+    pub(crate) fn reap_dropped(&mut self) {
+        for cid in self.dropped.take() {
+            if let Some(rec) = self.orders.get_mut(&cid) {
+                rec.withdraw_place(NotSentReason::StaleAuthorization);
+            }
+        }
+    }
+
     /// Runs `change` on the registered order `cid`, then indexes every venue id it has.
     pub(crate) fn with_record<R>(
         &mut self,
@@ -981,14 +1032,5 @@ impl Registry {
             self.by_vid.entry(vid.clone()).or_insert(cid);
         }
         out
-    }
-}
-
-/// The client ids of the orders a place or a batch of places opens; none for any other command.
-fn places_of(cmd: &VenueCommand) -> Vec<ClientOrderId> {
-    match cmd {
-        VenueCommand::Place(order) => vec![order.cid],
-        VenueCommand::PlaceBatch(orders) => orders.iter().map(|o| o.cid).collect(),
-        _ => Vec::new(),
     }
 }
