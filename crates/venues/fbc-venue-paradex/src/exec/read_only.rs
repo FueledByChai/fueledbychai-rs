@@ -37,9 +37,9 @@
 //!   failed when no answer came, and whose `venue_code` is Paradex's code (FBC-3f8z, from the
 //!   owner's first testnet run, which stopped on a refused login with nothing saying why). Of
 //!   the answer it shows only the code, when that is a plain identifier, and the message as one
-//!   line of printable ASCII, every word of it that could hold an echoed account or signature
-//!   (any word with a digit, a run of hex digits, a long word) withheld; a body that is not
-//!   Paradex's error is never shown. A refresh that gives no token is not reported:
+//!   line of printable ASCII, every word of it that could hold an echoed account, signature or
+//!   held session token (any word with a digit, a run of hex digits, a word as long as the token
+//!   or longer than 15 characters) withheld; a body that is not Paradex's error is never shown. A refresh that gives no token is not reported:
 //!   its connection stays as it is. A login that cannot be signed asks for the reconnect alone,
 //!   since `on_open` has no sink.
 //! - **Decoding.** Binary frames are the SBE templates of schema 1:2 (0054): `OrderEvent`,
@@ -415,9 +415,13 @@ const LONGEST_CODE: usize = 64;
 /// `venue_code` when the answer gives a plain one, and as `raw` the codec's own sentence naming
 /// the HTTP status, Paradex's code and message (docs.paradex.trade "Errors": `error`, `message`),
 /// or how the request failed when no answer came. Nothing of the request is in it, and of the
-/// answer only the code and message, through [`shown`] and [`plain_code`], so a credential the
+/// answer only the code and message, through `withhold` ([`Withhold`]), so a credential the
 /// venue echoes is not repeated; a body that is not Paradex's error is never shown.
-fn login_refusal(err: LoginError, resp: Result<HttpResponse<'_>, HttpFailure>) -> Reject {
+fn login_refusal(
+    err: LoginError,
+    resp: Result<HttpResponse<'_>, HttpFailure>,
+    withhold: Withhold,
+) -> Reject {
     let status = resp.map(|r| r.status).unwrap_or_default();
     let (venue_code, raw) = match err {
         LoginError::Failed(failure) => {
@@ -430,7 +434,7 @@ fn login_refusal(err: LoginError, resp: Result<HttpResponse<'_>, HttpFailure>) -
         }
         LoginError::Status(status) => {
             let body = resp.map(|r| r.body).unwrap_or_default();
-            match venue_error(body) {
+            match withhold.venue_error(body) {
                 Some((code, message)) => {
                     let text = format!(
                         "the Paradex login was refused: HTTP {status}, {}: {}",
@@ -459,92 +463,117 @@ fn login_refusal(err: LoginError, resp: Result<HttpResponse<'_>, HttpFailure>) -
     }
 }
 
-/// Paradex's REST error in `body`, a JSON object: its `error` code when that is a plain
-/// identifier ([`plain_code`]) and its `message` as [`shown`]; `None` when it holds neither.
-fn venue_error(body: &[u8]) -> Option<(Option<String>, Option<String>)> {
-    let doc: Value = serde_json::from_slice(body).ok()?;
-    let error = member(&doc, "error");
-    let code = error.and_then(Value::as_str);
-    let message = member(&doc, "message").and_then(Value::as_str);
-    if code.is_none() && message.is_none() {
-        return None;
+/// What of the venue's text a login refusal withholds (Codex r4225701545, r4225701546,
+/// r4225768727): every word that could hold an echoed field element, every word as long as the
+/// session token the codec holds or longer, and anything that is not printable ASCII.
+#[derive(Copy, Clone, Debug)]
+struct Withhold {
+    /// The longest word shown: [`LONGEST_SHOWN_WORD`], or one less than the held token's
+    /// length when that is shorter. A token an earlier login gave is kept after a later login
+    /// fails, so the venue could echo it; the token's alphabet (letters, digits, `-`, `_`, `.`)
+    /// holds no character that splits words, so a word holding it is at least as long.
+    longest: usize,
+    /// The held token's length in bytes, if a token is held.
+    held: Option<usize>,
+}
+
+impl Withhold {
+    /// Withholding for a codec holding a token of `held` bytes, if any.
+    fn holding(held: Option<usize>) -> Withhold {
+        let longest = match held {
+            Some(len) => LONGEST_SHOWN_WORD.min(len.saturating_sub(1)),
+            None => LONGEST_SHOWN_WORD,
+        };
+        Withhold { longest, held }
     }
-    Some((code.and_then(plain_code), message.map(shown)))
-}
 
-/// `code` when it is a plain identifier: a letter, then letters, digits and `_`, at most
-/// [`LONGEST_CODE`] long, no run between underscores [`withheld`] (so never a field element in
-/// hex or decimal).
-fn plain_code(code: &str) -> Option<String> {
-    let plain = code.len() <= LONGEST_CODE
-        && code.starts_with(|c: char| c.is_ascii_alphabetic())
-        && code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        && !code.split('_').any(withheld);
-    plain.then(|| code.to_owned())
-}
-
-/// Whether a login refusal withholds `word` of the venue's text (Codex r4225701545,
-/// r4225701546): when it holds a decimal digit, as every field element the login carries does
-/// however short (the account is `0x` and hex, the signature's numbers decimal or `0x` and
-/// hex); when it is a run of [`SHORTEST_HEX_WITHHELD`] or more hex digits, which a field element
-/// printed without its `0x` can be with no decimal digit; when it is longer than
-/// [`LONGEST_SHOWN_WORD`]; and when it holds anything but printable ASCII, so no format control
-/// (a bidi override, a zero-width space) reaches the text. The key and the session token are
-/// never in the login request, so the venue has neither to echo.
-fn withheld(word: &str) -> bool {
-    word.len() > LONGEST_SHOWN_WORD
-        || word
-            .bytes()
-            .any(|b| b.is_ascii_digit() || !b.is_ascii_graphic())
-        || (word.len() >= SHORTEST_HEX_WITHHELD && word.bytes().all(|b| b.is_ascii_hexdigit()))
-}
-
-/// The venue's `text` as a login refusal shows it, one line of printable ASCII: every
-/// whitespace or control character (a Unicode line or paragraph separator included) becomes a
-/// space, every word (a run between those and JSON or list punctuation) [`withheld`] becomes
-/// `<withheld>`, and the result is cut at [`MOST_SHOWN`] characters, `...` marking the cut.
-fn shown(text: &str) -> String {
-    fn flush(word: &mut String, out: &mut String) {
-        if withheld(word) {
-            out.push_str("<withheld>");
-        } else {
-            out.push_str(word);
+    /// Paradex's REST error in `body`, a JSON object: its `error` code when that is a plain
+    /// identifier ([`Withhold::code`]) and its `message` as [`Withhold::text`] shows it; `None`
+    /// when it holds neither.
+    fn venue_error(self, body: &[u8]) -> Option<(Option<String>, Option<String>)> {
+        let doc: Value = serde_json::from_slice(body).ok()?;
+        let code = member(&doc, "error").and_then(Value::as_str);
+        let message = member(&doc, "message").and_then(Value::as_str);
+        if code.is_none() && message.is_none() {
+            return None;
         }
-        word.clear();
+        Some((
+            code.and_then(|c| self.code(c)),
+            message.map(|m| self.text(m)),
+        ))
     }
-    let (mut out, mut word) = (String::new(), String::new());
-    for c in text.chars() {
-        if c.is_whitespace() || c.is_control() {
-            flush(&mut word, &mut out);
-            out.push(' ');
-        } else if matches!(
-            c,
-            ',' | ';'
-                | ':'
-                | '"'
-                | '\''
-                | '`'
-                | '('
-                | ')'
-                | '['
-                | ']'
-                | '{'
-                | '}'
-                | '<'
-                | '>'
-                | '='
-                | '|'
-        ) {
-            flush(&mut word, &mut out);
-            out.push(c);
-        } else {
-            word.push(c);
+
+    /// `code` when it is a plain identifier: a letter, then letters, digits and `_`, at most
+    /// [`LONGEST_CODE`] long, shorter than a held token (whose alphabet has `_`), and no run
+    /// between underscores withheld (so never a field element in hex or decimal).
+    fn code(self, code: &str) -> Option<String> {
+        let plain = code.len() <= LONGEST_CODE
+            && self.held.is_none_or(|len| code.len() < len)
+            && code.starts_with(|c: char| c.is_ascii_alphabetic())
+            && code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            && !code.split('_').any(|run| self.word(run));
+        plain.then(|| code.to_owned())
+    }
+
+    /// Whether `word` of the venue's text is withheld: when it holds a decimal digit, as every
+    /// field element the login carries does however short (the account is `0x` and hex, the
+    /// signature's numbers decimal or `0x` and hex); when it is a run of
+    /// [`SHORTEST_HEX_WITHHELD`] or more hex digits, which a field element printed without its
+    /// `0x` can be with no decimal digit; when it is longer than the longest shown; and when it
+    /// holds anything but printable ASCII, so no format control (a bidi override, a zero-width
+    /// space) reaches the text. The key is never sent, so the venue has none to echo.
+    fn word(self, word: &str) -> bool {
+        word.len() > self.longest
+            || word
+                .bytes()
+                .any(|b| b.is_ascii_digit() || !b.is_ascii_graphic())
+            || (word.len() >= SHORTEST_HEX_WITHHELD && word.bytes().all(|b| b.is_ascii_hexdigit()))
+    }
+
+    /// The venue's `text` as a login refusal shows it, one line of printable ASCII: every
+    /// whitespace or control character (a Unicode line or paragraph separator included) becomes
+    /// a space, every word (a run between those and JSON or list punctuation) withheld
+    /// ([`Withhold::word`]) becomes `<withheld>`, and the result is cut at [`MOST_SHOWN`]
+    /// characters, `...` marking the cut.
+    fn text(self, text: &str) -> String {
+        let (mut out, mut word) = (String::new(), String::new());
+        let flush = |word: &mut String, out: &mut String| {
+            out.push_str(if self.word(word) { "<withheld>" } else { word });
+            word.clear();
+        };
+        for c in text.chars() {
+            if c.is_whitespace() || c.is_control() {
+                flush(&mut word, &mut out);
+                out.push(' ');
+            } else if matches!(
+                c,
+                ',' | ';'
+                    | ':'
+                    | '"'
+                    | '\''
+                    | '`'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
+                    | '='
+                    | '|'
+            ) {
+                flush(&mut word, &mut out);
+                out.push(c);
+            } else {
+                word.push(c);
+            }
         }
-    }
-    flush(&mut word, &mut out);
-    match out.char_indices().nth(MOST_SHOWN) {
-        Some((at, _)) => format!("{}...", &out[..at]),
-        None => out,
+        flush(&mut word, &mut out);
+        match out.char_indices().nth(MOST_SHOWN) {
+            Some((at, _)) => format!("{}...", &out[..at]),
+            None => out,
+        }
     }
 }
 
@@ -739,7 +768,8 @@ impl ExecCodec for ReadOnlyExec {
         match (waiting, answer) {
             (true, Ok(())) => self.send(ReadMethod::Auth, fx),
             (true, Err(err)) => {
-                let refusal = login_refusal(err, resp);
+                let held = Withhold::holding(self.cycle.token().map(SessionToken::len));
+                let refusal = login_refusal(err, resp, held);
                 self.close(Some(refusal), "the Paradex login gave no token", sink, fx);
             }
             (false, _) => {}
