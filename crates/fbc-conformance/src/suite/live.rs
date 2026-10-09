@@ -18,8 +18,8 @@ use std::time::Duration;
 use fbc_core::{
     AccountKey, AccountLease, ClientOrderId, ConnKey, Envelope, ExecEvent, ItemRef, LimitScope,
     Lots, MarketLease, MonoNs, NewOrder, NonceBlock, NonceSource, OpKind, OrderCaps, OrderKind,
-    OrderKindTag, RateLimit, RpcId, Side, SignedLots, SubmitHandle, SubmitOutcome, Ticks,
-    VenueCaps, VenueFactory, VenueOrderId, WallNs, encode_cid,
+    OrderKindTag, RateLimit, RpcId, Side, SignedLots, SnapshotSource, SubmitHandle, SubmitOutcome,
+    Ticks, VenueCaps, VenueFactory, VenueOrderId, WallNs, encode_cid,
 };
 use fbc_oms::{
     Authorization, LadderConfig, LeaseKeys, Leases, MarketCapsConfig, OrderKey, OrderOp,
@@ -647,8 +647,17 @@ impl Oms {
             venue: None,
             ingest: 1,
         };
-        // A snapshot of the suite's own making: flat, nothing resting, one position.
-        let resynced = reg.resync(&ladder, order, &snap, key);
+        // A snapshot of the suite's own making: flat, nothing resting, one position. The suite
+        // made it and the stub answers flat by construction, so it is taken as trustworthy
+        // whatever the venue declares of its own snapshots (FBC-wyv2): under a venue's
+        // `Untrustworthy` or `None` the resync would seed no position and the owner's Start
+        // would refuse `PositionUnknown` before any check exercised the venue. The venue's own
+        // caps still build and authorize every command.
+        let ours = OrderCaps {
+            snapshot_source: SnapshotSource::Trustworthy,
+            ..order.clone()
+        };
+        let resynced = reg.resync(&ladder, &ours, &snap, key);
         resynced.expect("a flat resync is taken");
         let market = MarketLease::acquire(&dir.0, venue, &name, &symbol);
         let market = market.expect("a market lease in a directory of the suite's own");

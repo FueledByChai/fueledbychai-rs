@@ -15,6 +15,10 @@
 //! final at once, and on the single-phase toy reporting a provisional acceptance;
 //! `reject_coverage` against a toy misreading every refusal, a stub answering none, and a table
 //! that is missing, empty or names no kind.
+//!
+//! FBC-wyv2's done line: the six order-entry checks start their fbc-oms registry, and pass, on toy
+//! variants declaring their open-order snapshot `Untrustworthy` (as Paradex does) or `None`, as
+//! on the toy declaring it `Trustworthy`.
 
 mod toy_setup;
 
@@ -33,7 +37,7 @@ use fbc_core::{
     VenueCaps, VenueCommand, VenueConfig, VenueError, VenueFactory, VenueMeta, VenueOrderState,
     WireSlice,
 };
-use fbc_core::{CancelOnDisconnect, ItemRef, RefKind, TagSet};
+use fbc_core::{CancelOnDisconnect, ItemRef, RefKind, SnapshotSource, TagSet};
 use toy_setup::{FIXTURES, assumed, order_entry, replier};
 
 /// How a toy variant's codec departs from the toy's.
@@ -578,6 +582,16 @@ static TWO_PHASE_DANGLING: Variant = Variant {
 };
 static TWO_PHASE_AT_ONCE: Variant = Variant {
     caps: two_phase,
+    twist: Twist::None,
+};
+/// The toy declaring its open-order snapshot untrustworthy, as Paradex does (decision 0054).
+static UNTRUSTWORTHY: Variant = Variant {
+    caps: |c| c.exec.as_mut().unwrap().order.snapshot_source = SnapshotSource::Untrustworthy,
+    twist: Twist::None,
+};
+/// The toy declaring it offers no open-order snapshot.
+static NO_SNAPSHOT: Variant = Variant {
+    caps: |c| c.exec.as_mut().unwrap().order.snapshot_source = SnapshotSource::None,
     twist: Twist::None,
 };
 
@@ -1903,6 +1917,38 @@ fn every_order_entry_check_skips_a_venue_that_takes_no_orders() {
             matches!(skipped, Ok(Verdict::Skipped { why: w, .. }) if w == why),
             "{skipped:?}"
         );
+    }
+}
+
+/// An order-entry check.
+type Check = fn(&Subject<'static>) -> Result<Verdict, Failure>;
+
+/// FBC-wyv2's done line: the suite's own fbc-oms registry starts on a venue whose open-order
+/// snapshot is untrustworthy or absent, so each order-entry check exercises the venue rather than
+/// failing at the owner's Start with `PositionUnknown`; each passes there, probing what it probes
+/// on the toy declaring its snapshot trustworthy, which still passes too.
+#[test]
+fn every_order_entry_check_starts_and_passes_whatever_snapshot_source_the_venue_declares() {
+    let checks: [(&str, Check); 6] = [
+        ("amend_ack", suite::amend_ack),
+        ("mixed_batch", suite::mixed_batch),
+        ("unknown_on_timeout", suite::unknown_on_timeout),
+        ("resync_after_reconnect", suite::resync_after_reconnect),
+        ("two_phase_ack", suite::two_phase_ack),
+        ("reject_coverage", suite::reject_coverage),
+    ];
+    let passed = |name: &str, outcome: Result<Verdict, Failure>| match outcome {
+        Ok(Verdict::Passed { probed, .. }) => probed,
+        other => panic!("{name}: {other:?}"),
+    };
+    for (name, check) in checks {
+        let trusted = Subject::new(&ToyFactory, FIXTURES, assumed).unwrap();
+        let trusted = passed(name, check(&trusted));
+        assert!(!trusted.is_empty(), "{name} probed nothing");
+        for variant in [&UNTRUSTWORTHY, &NO_SNAPSHOT] {
+            let probed = passed(name, check(&variant.subject(assumed)));
+            assert_eq!(probed, trusted, "{name}");
+        }
     }
 }
 
