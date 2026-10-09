@@ -3,9 +3,12 @@
 //! `caps_truthful`, `commands_selfcontained` and `signing_golden` with the setup's
 //! [`Bootstrap`] and fails each without it. Two variants: one authenticated by the toy's own
 //! acknowledgement frame, one that also needs an HTTP login answered first (Paradex's shape).
+//! A third asks for two logins at once, so its replies can answer them out of order by tag.
 //! Around them: the bootstrap reaches every codec the suite builds (the frame-reading checks
 //! and the other encoding checks pass with it), and a bootstrap the codec refuses, or whose
-//! HTTP response answers no request, fails naming `Setup.bootstrap` without showing its bytes.
+//! HTTP response answers no request, or that closes the connection (a refused login decoded as
+//! a close, as Paradex's is; Codex r4226499484), fails naming `Setup.bootstrap` without showing
+//! its bytes.
 
 mod toy_setup;
 
@@ -31,21 +34,41 @@ use toy_setup::{FIXTURES, assumed};
 
 /// The tag of the gated variant's login request.
 const LOGIN: HttpTag = HttpTag(900);
+/// The tag of the second login a variant asks for alongside [`LOGIN`].
+const SECOND: HttpTag = HttpTag(901);
 
 // ---------------------------------------------------------------------------------------------
 // The variants.
 // ---------------------------------------------------------------------------------------------
 
-/// The toy, its order-entry codec gated on authentication ([`GatedExec`]); with `login`, its
-/// session also logs in over HTTP before it counts as authenticated.
+/// The toy, its order-entry codec gated on authentication ([`GatedExec`]); its session also
+/// logs in over HTTP, once per tag in `logins`, before it counts as authenticated.
 struct Gated {
-    login: bool,
+    logins: &'static [HttpTag],
+    /// Whether opening the stream asks for a reconnect at once.
+    restless: bool,
 }
 
 /// The toy authenticated by its acknowledgement frame alone.
-const BY_FRAME: Gated = Gated { login: false };
+const BY_FRAME: Gated = Gated {
+    logins: &[],
+    restless: false,
+};
 /// The toy that logs in over HTTP, then is authenticated by its acknowledgement frame.
-const BY_LOGIN: Gated = Gated { login: true };
+const BY_LOGIN: Gated = Gated {
+    logins: &[LOGIN],
+    restless: false,
+};
+/// The toy that asks for two logins at once.
+const BY_TWO: Gated = Gated {
+    logins: &[LOGIN, SECOND],
+    restless: false,
+};
+/// The toy that asks for a reconnect as soon as it is opened.
+const RESTLESS: Gated = Gated {
+    logins: &[],
+    restless: true,
+};
 
 impl VenueFactory for Gated {
     fn id(&self) -> &'static str {
@@ -99,8 +122,9 @@ impl VenueFactory for Gated {
         };
         let gated: Box<dyn ExecCodec> = Box::new(GatedExec {
             inner,
-            login: self.login,
-            logged_in: false,
+            logins: self.logins,
+            restless: self.restless,
+            pending: Vec::new(),
             opened: None,
             acknowledged: false,
         });
@@ -118,19 +142,23 @@ impl VenueFactory for Gated {
 
 /// The toy's codec, refusing every command but a query as `NotSent(Disconnected)` until its
 /// session has authenticated on the stream it opened, as Paradex's does: the toy's
-/// acknowledgement of its authentication frame, and, for a codec that logs in, a login answered
-/// 200 before it. Opening the stream again starts over.
+/// acknowledgement of its authentication frame, and every login it asked for answered 200 with
+/// the login's tag as its body (so a reply handed to the wrong login is refused). Opening the
+/// stream again starts over. A login answered 401 closes the connection, as Paradex's refused
+/// login does, and one answered 403 asks for a reconnect; neither is an error.
 struct GatedExec {
     inner: Box<dyn ExecCodec>,
-    login: bool,
-    logged_in: bool,
+    logins: &'static [HttpTag],
+    restless: bool,
+    /// The logins asked for and not yet answered 200.
+    pending: Vec<HttpTag>,
     opened: Option<StreamId>,
     acknowledged: bool,
 }
 
 impl GatedExec {
     fn authenticated(&self) -> bool {
-        self.opened.is_some() && self.acknowledged && (self.logged_in || !self.login)
+        self.opened.is_some() && self.acknowledged && self.pending.is_empty()
     }
 }
 
@@ -160,14 +188,14 @@ impl ExecCodec for GatedExec {
         self.inner.nonces_for(call)
     }
 
-    /// The login first, for a codec that logs in; then the toy's authentication frame.
+    /// The logins first, in order; then the toy's authentication frame.
     fn on_open(&mut self, stream: StreamId, ctx: &EncodeCtx, fx: &mut Effects) {
         self.opened = Some(stream);
         self.acknowledged = false;
-        self.logged_in = false;
-        if self.login {
+        self.pending = self.logins.to_vec();
+        for &tag in self.logins {
             fx.push(Effect::Http {
-                tag: LOGIN,
+                tag,
                 req: HttpRequest {
                     method: HttpMethod::Post,
                     url: WireUrl::plain("https://toy.invalid/login"),
@@ -181,6 +209,10 @@ impl ExecCodec for GatedExec {
             });
         }
         self.inner.on_open(stream, ctx, fx);
+        if self.restless {
+            let reason = "restless";
+            fx.push(Effect::Reconnect { stream, reason });
+        }
     }
 
     fn encode(
@@ -215,7 +247,8 @@ impl ExecCodec for GatedExec {
         self.inner.on_frame(stream, f, scope, specs, &mut watch, fx)
     }
 
-    /// The login's answer: 200 logs in, anything else is refused; the toy's otherwise.
+    /// A login's answer: 200 with its tag as the body logs in, 401 closes the connection, 403
+    /// asks for a reconnect, anything else is refused; the toy's otherwise.
     fn on_http(
         &mut self,
         tag: HttpTag,
@@ -225,10 +258,23 @@ impl ExecCodec for GatedExec {
         sink: &mut dyn ExecSink,
         fx: &mut Effects,
     ) -> Result<(), DecodeError> {
-        if self.login && tag == LOGIN {
-            return match resp {
-                Ok(resp) if resp.status == 200 => {
-                    self.logged_in = true;
+        if self.logins.contains(&tag) {
+            let status = resp.map(|r| (r.status, r.body == tag.0.to_string().as_bytes()));
+            return match status {
+                Ok((200, true)) => {
+                    self.pending.retain(|&t| t != tag);
+                    Ok(())
+                }
+                Ok((401, _)) => {
+                    let stream = self.opened.expect("a login is asked as the stream opens");
+                    let state = ConnState::Closed;
+                    sink.push(VenueMeta::NONE, ExecEvent::Conn { stream, state });
+                    Ok(())
+                }
+                Ok((403, _)) => {
+                    let stream = self.opened.expect("a login is asked as the stream opens");
+                    let reason = "login refused";
+                    fx.push(Effect::Reconnect { stream, reason });
                     Ok(())
                 }
                 _ => Err(DecodeError::Malformed("login refused")),
@@ -263,12 +309,19 @@ fn acknowledged() -> BootReply {
     BootReply::Text(format!("auth|ok=1|token={TOY_TOKEN}"))
 }
 
-/// A login answered 200.
+/// A login answered 200, for the earliest login still waiting.
 fn logged_in() -> BootReply {
+    answered(None, 200, LOGIN)
+}
+
+/// The login `tag` names (the earliest still waiting, for `None`) answered `status`, with
+/// `body_for`'s tag as its body.
+fn answered(tag: Option<HttpTag>, status: u16, body_for: HttpTag) -> BootReply {
     BootReply::Http {
-        status: 200,
-        headers: vec![("content-type".into(), "application/json".into())],
-        body: br#"{"jwt_token":"synthetic"}"#.to_vec(),
+        tag,
+        status,
+        headers: vec![("content-type".into(), "text/plain".into())],
+        body: body_for.0.to_string().into_bytes(),
     }
 }
 
@@ -431,9 +484,10 @@ fn a_second_http_reply_for_the_one_login_fails() {
 fn a_reply_the_codec_refuses_fails_naming_its_position_and_kind_never_its_bytes() {
     let refused_login = || {
         booting(vec![BootReply::Http {
-            status: 401,
+            tag: None,
+            status: 500,
             headers: Vec::new(),
-            body: b"secret-401-body".to_vec(),
+            body: b"secret-500-body".to_vec(),
         }])
     };
     let what = bootstrap_breach(&failed(
@@ -444,7 +498,7 @@ fn a_reply_the_codec_refuses_fails_naming_its_position_and_kind_never_its_bytes(
         what.starts_with("reply 0 (HTTP response) refused by the codec"),
         "{what}"
     );
-    assert!(!what.contains("secret-401-body"), "{what}");
+    assert!(!what.contains("secret-500-body"), "{what}");
 
     let garbage = || booting(vec![BootReply::Text("secret-text-garbage".into())]);
     let what = bootstrap_breach(&failed(
@@ -477,7 +531,97 @@ fn a_bootstrap_shows_its_replies_by_kind_only() {
         "{shown}"
     );
     assert!(!shown.contains(TOY_TOKEN), "{shown}");
-    assert!(!shown.contains("jwt_token"), "{shown}");
+    assert!(!shown.contains("900"), "{shown}");
     let binary = format!("{:?}", BootReply::Binary(vec![1]));
     assert_eq!(binary, "binary frame");
+}
+
+#[test]
+fn a_reply_that_closes_the_connection_fails_though_the_codec_decoded_it() {
+    // Codex r4226499484: a refused login decoded as a close, not an error.
+    let closed = || booting(vec![answered(None, 401, LOGIN), acknowledged()]);
+    let reconnect = || booting(vec![answered(None, 403, LOGIN), acknowledged()]);
+    for setup in [closed as fn() -> Setup, reconnect] {
+        for (name, check) in THREE {
+            let what = bootstrap_breach(&failed(name, run(check, &BY_LOGIN, setup)));
+            assert!(
+                what.starts_with("reply 0 (HTTP response) closed the connection"),
+                "{what}"
+            );
+        }
+        // encode_deterministic would otherwise compare two refusals as equal and pass.
+        let failure = failed(
+            "encode_deterministic",
+            run(suite::encode_deterministic, &BY_LOGIN, setup),
+        );
+        bootstrap_breach(&failure);
+    }
+}
+
+#[test]
+fn http_replies_answer_the_logins_their_tags_name_in_any_order() {
+    // Codex r4226499486: the second login answered first.
+    let by_tag = || {
+        booting(vec![
+            answered(Some(SECOND), 200, SECOND),
+            answered(Some(LOGIN), 200, LOGIN),
+            acknowledged(),
+        ])
+    };
+    for (name, check) in THREE {
+        passed(name, run(check, &BY_TWO, by_tag));
+    }
+    // Untagged, the same replies answer the earliest login waiting: each the wrong one.
+    let in_order = || {
+        booting(vec![
+            answered(None, 200, SECOND),
+            answered(None, 200, LOGIN),
+            acknowledged(),
+        ])
+    };
+    let what = bootstrap_breach(&failed(
+        "caps_truthful",
+        run(caps_truthful, &BY_TWO, in_order),
+    ));
+    assert!(
+        what.starts_with("reply 0 (HTTP response) refused by the codec"),
+        "{what}"
+    );
+}
+
+#[test]
+fn an_http_reply_naming_a_request_not_waited_on_fails_naming_its_tag() {
+    let stranger = || booting(vec![answered(Some(HttpTag(7)), 200, LOGIN), acknowledged()]);
+    let what = bootstrap_breach(&failed(
+        "signing_golden",
+        run(signing_golden, &BY_LOGIN, stranger),
+    ));
+    assert_eq!(
+        what,
+        "reply 0 answers HTTP request 7, which the codec has not asked for or no longer waits on"
+    );
+    let twice = || {
+        booting(vec![
+            answered(Some(LOGIN), 200, LOGIN),
+            answered(Some(LOGIN), 200, LOGIN),
+            acknowledged(),
+        ])
+    };
+    let what = bootstrap_breach(&failed(
+        "signing_golden",
+        run(signing_golden, &BY_LOGIN, twice),
+    ));
+    assert!(
+        what.starts_with("reply 1 answers HTTP request 900"),
+        "{what}"
+    );
+}
+
+#[test]
+fn a_codec_that_asks_for_a_reconnect_as_it_opens_fails_the_bootstrap() {
+    let what = bootstrap_breach(&failed(
+        "caps_truthful",
+        run(caps_truthful, &RESTLESS, by_frame),
+    ));
+    assert_eq!(what, "the codec, opened, asked for a reconnect");
 }

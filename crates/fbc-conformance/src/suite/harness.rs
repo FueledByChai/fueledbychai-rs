@@ -10,12 +10,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use fbc_core::{
     AccountKey, AmendOrder, BookId, CancelOrder, CapTag, Channel, CidMint, ClientOrderId,
-    ConnTopology, CtxCall, DecodeScope, Effect, Effects, EncodeCtx, EncodeReceipt, EndpointPlan,
-    ExecCodec, ExecEvent, ExecSink, Feature, Feed, HttpResponse, HttpTag, InstrumentId, Lots,
-    MdCodec, MdTransport, MonoNs, Namespace, NamespaceLease, NewOrder, NonceBlock, NotSentReason,
-    OrderCaps, OrderKind, OrderKindTag, OrderRef, PathStamps, QueryOrder, RawFrame, RefKind, RpcId,
-    Side, SpecTable, StreamId, Subscription, TagSet, Ticks, TifTag, VenueCaps, VenueCommand,
-    VenueMeta, VenueOrderId, WallNs, WireUrl, dispatch, dispatch_market_data,
+    ConnState, ConnTopology, CtxCall, DecodeScope, Effect, Effects, EncodeCtx, EncodeReceipt,
+    EndpointPlan, ExecCodec, ExecEvent, ExecSink, Feature, Feed, HttpResponse, HttpTag,
+    InstrumentId, Lots, MdCodec, MdTransport, MonoNs, Namespace, NamespaceLease, NewOrder,
+    NonceBlock, NotSentReason, OrderCaps, OrderKind, OrderKindTag, OrderRef, PathStamps,
+    QueryOrder, RawFrame, RefKind, RpcId, Side, SpecTable, StreamId, Subscription, TagSet, Ticks,
+    TifTag, VenueCaps, VenueCommand, VenueMeta, VenueOrderId, WallNs, WireUrl, dispatch,
+    dispatch_market_data,
 };
 
 use super::{BootReply, Bootstrap, Failure, Subject};
@@ -133,20 +134,25 @@ impl<'s> Harness<'s> {
     /// `codec` opened on the order-entry stream at the fixed encode time and handed each of
     /// `boot`'s replies in turn, in the decode scope the core lends for the venue's caps: a
     /// frame on that stream, an HTTP response answering the earliest request the codec asked
-    /// for that no reply has answered yet. What it pushes and asks for otherwise is dropped. A
-    /// reply it refuses, or a response with no request to answer, breaks `Setup.bootstrap`,
-    /// named by its position and kind, never its bytes (it may echo a credential).
+    /// for that no reply has answered yet, the one its tag names or else the earliest. What it
+    /// pushes and asks for otherwise is dropped. A reply it refuses, a response with no such
+    /// request to answer, and an open or a reply after which the codec reports a connection
+    /// closed or asks for a reconnect break `Setup.bootstrap`, named by position and kind,
+    /// never by bytes (a reply may echo a credential).
     fn bootstrap(&self, codec: &mut dyn ExecCodec, boot: &Bootstrap) -> Result<(), Failure> {
         let stream = self.exec_stream;
         let ctx = self.ctx(codec.nonces_for(CtxCall::Open(stream)));
         let mut fx = Effects::new();
         codec.on_open(stream, &ctx, &mut fx);
         let mut asked: VecDeque<HttpTag> = VecDeque::new();
-        asked.extend(http_tags(&mut fx));
+        if read(&mut fx, &mut asked) {
+            let what = "the codec, opened, asked for a reconnect";
+            return Err(self.fail("Setup.bootstrap", what));
+        }
         let specs = &self.specs;
         self.decode_scope(|scope| {
             for (i, reply) in boot.replies.iter().enumerate() {
-                let (mut sink, mut fx) = (Dropped, Effects::new());
+                let (mut sink, mut fx) = (Watched(false), Effects::new());
                 let result = match reply {
                     BootReply::Text(text) => {
                         let frame = RawFrame::Text(text);
@@ -157,17 +163,28 @@ impl<'s> Harness<'s> {
                         codec.on_frame(stream, frame, scope, specs, &mut sink, &mut fx)
                     }
                     BootReply::Http {
+                        tag,
                         status,
                         headers,
                         body,
                     } => {
-                        let Some(tag) = asked.pop_front() else {
-                            let what = format!(
-                                "reply {i} is an HTTP response, but the codec has asked for no \
-                                 HTTP request it is still waiting on"
-                            );
-                            return Err(self.fail("Setup.bootstrap", what));
+                        let tag = match tag {
+                            None => asked.pop_front().ok_or_else(|| {
+                                format!(
+                                    "reply {i} is an HTTP response, but the codec has asked \
+                                     for no HTTP request it is still waiting on"
+                                )
+                            }),
+                            Some(tag) => match asked.iter().position(|t| t == tag) {
+                                Some(at) => Ok(asked.remove(at).expect("a position held")),
+                                None => Err(format!(
+                                    "reply {i} answers HTTP request {}, which the codec has \
+                                     not asked for or no longer waits on",
+                                    tag.0
+                                )),
+                            },
                         };
+                        let tag = tag.map_err(|what| self.fail("Setup.bootstrap", what))?;
                         let headers: Vec<(&str, &str)> = headers
                             .iter()
                             .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -185,7 +202,14 @@ impl<'s> Harness<'s> {
                     let what = format!("reply {i} ({kind}) refused by the codec: {e}");
                     return Err(self.fail("Setup.bootstrap", what));
                 }
-                asked.extend(http_tags(&mut fx));
+                if read(&mut fx, &mut asked) || sink.0 {
+                    let kind = reply.kind();
+                    let what = format!(
+                        "reply {i} ({kind}) closed the connection: the codec reported it closed \
+                         or asked for a reconnect, so it never authenticated"
+                    );
+                    return Err(self.fail("Setup.bootstrap", what));
+                }
             }
             Ok(())
         })
@@ -303,22 +327,34 @@ impl<'s> Harness<'s> {
     }
 }
 
-/// A sink dropping what a bootstrap reply pushes: only the state the codec reaches matters.
-struct Dropped;
+/// A sink dropping what a bootstrap reply pushes, noting only whether it reported a
+/// connection closed (Codex r4226499484).
+struct Watched(bool);
 
-impl ExecSink for Dropped {
-    fn push(&mut self, _meta: VenueMeta, _ev: ExecEvent) {}
+impl ExecSink for Watched {
+    fn push(&mut self, _meta: VenueMeta, ev: ExecEvent) {
+        if let ExecEvent::Conn {
+            state: ConnState::Closed,
+            ..
+        } = ev
+        {
+            self.0 = true;
+        }
+    }
 }
 
-/// The tags of the HTTP requests `fx` asks for, in order.
-fn http_tags(fx: &mut Effects) -> Vec<HttpTag> {
-    fx.take()
-        .into_iter()
-        .filter_map(|effect| match effect {
-            Effect::Http { tag, .. } => Some(tag),
-            _ => None,
-        })
-        .collect()
+/// The HTTP requests `fx` asks for, their tags appended to `asked` in order; whether it asks
+/// for a reconnect. The rest is dropped.
+fn read(fx: &mut Effects, asked: &mut VecDeque<HttpTag>) -> bool {
+    let mut reconnect = false;
+    for effect in fx.take() {
+        match effect {
+            Effect::Http { tag, .. } => asked.push_back(tag),
+            Effect::Reconnect { .. } => reconnect = true,
+            _ => {}
+        }
+    }
+    reconnect
 }
 
 /// The parts of an order a venue's caps refuse or allow: its kind, time in force, channel and
