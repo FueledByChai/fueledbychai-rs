@@ -31,9 +31,11 @@
 //! of venue ids is kept by market: while a resync runs, for every market, and after it, for the
 //! markets an order is held on, so what was heard before the snapshot, or before the amend that
 //! links an id to the order, is applied when they arrive. A market's is dropped once no order is
-//! held on it as the resync ends, as the epoch it ran on is replaced, or as its last held order
-//! is released after the resync, so an order held for good keeps only its own market's
-//! (Reviewer B RB-nvxn-5 on PR #127, FBC-48j7, decision 0088). The consumer
+//! held on it as a resync ends or as its last held order is released after the resync, so an
+//! order held for good keeps only its own market's (Reviewer B RB-nvxn-5 on PR #127, FBC-48j7,
+//! decision 0088). What an epoch that drops before its resync ends heard is kept until a later
+//! epoch's resync ends, since that epoch's snapshot may still need it (Reviewer B RB-48j7-1 on
+//! PR #140). The consumer
 //! is told the orders once per epoch ([`Gate::notice`]) and cancels them through fbc-oms's
 //! authorizations, or queries one its registry holds ended. A later epoch keeps every order an
 //! earlier one found unprotected, since no later arm covers it and a later snapshot may omit an
@@ -233,8 +235,9 @@ impl Gate {
         if self.of(epoch).is_some() {
             return;
         }
-        // The epoch it replaces may have dropped while its resync ran.
-        self.prune();
+        // What the epoch it replaces heard while its resync ran is kept: if it dropped before
+        // its resync ended, this epoch's snapshot may still need it (Reviewer B RB-48j7-1 on
+        // PR #140). It is dropped when a resync ends.
         let arm = if self.rearm || !self.armed_once {
             Arm::Due
         } else {
@@ -493,11 +496,13 @@ impl Gate {
         self.unprotected.len() < before
     }
 
-    /// Drops what is known of venue ids on every market no order is held on, as the window in
-    /// which it was heard closes: a resync's end, the epoch it ran on being replaced, or the
-    /// last order held on the market being released after the resync. What a held order may
-    /// yet need is on its own market, so what is kept is bounded by the evidence heard on the
-    /// markets held, not by the reconnects (Reviewer B RB-nvxn-5 on PR #127).
+    /// Drops what is known of venue ids on every market no order is held on, as a resync ends
+    /// or the last order held on the market is released after the resync. What a held order
+    /// may yet need is on its own market, so what is kept is bounded by the evidence heard on
+    /// the markets held and that heard since the latest resync ended, not by the reconnects
+    /// whose resyncs end (Reviewer B RB-nvxn-5 on PR #127). An epoch replaced before its
+    /// resync ends drops nothing: the next epoch's snapshot may need what it heard (Reviewer
+    /// B RB-48j7-1 on PR #140).
     fn prune(&mut self) {
         let held = &self.unprotected;
         self.facts
@@ -1573,9 +1578,10 @@ mod tests {
 
     /// Reviewer B RB-nvxn-5 on PR #127 (FBC-48j7): while one order stays held on INST, every
     /// reconnect's resync window hears ends, amends and client-id evidence on another market;
-    /// what it heard there is dropped when the window closes (the resync ends, or the epoch
-    /// is replaced before it does), so the facts stay bounded and the held order is still
-    /// released by its own end.
+    /// what it heard there is dropped when a resync ends, so the facts stay bounded and the
+    /// held order is still released by its own end. What an epoch dropped before its resync
+    /// ended heard is carried into the next epoch's window, and only that (Reviewer B
+    /// RB-48j7-1 and Reviewer A on PR #140).
     #[test]
     fn facts_stay_bounded_across_many_reconnects_while_one_order_stays_held() {
         let mut gate = Gate::new(true, false, false);
@@ -1585,6 +1591,9 @@ mod tests {
         for epoch in 1..=40u32 {
             rpc += 1;
             gate.authenticated(epoch);
+            // Ten amends then ends on OTHER, four facts each, from the epoch dropped before.
+            let carried = if epoch % 2 == 0 { 40 } else { 0 };
+            assert_eq!(gate.known(), carried, "epoch {epoch}");
             gate.arm_sent(epoch, RpcId(rpc));
             gate.resync_asked(epoch);
             for n in 0..10 {
@@ -1593,7 +1602,7 @@ mod tests {
                 gate.observe(epoch, &update_on(OTHER, None, Some(&wire), to(&next)));
                 gate.observe(epoch, &update_on(OTHER, mine, Some(&next), canceled()));
             }
-            assert!(gate.known() > 0);
+            assert_eq!(gate.known(), carried + 40, "epoch {epoch}");
             // Every other epoch drops before its resync ends.
             if epoch % 2 == 0 {
                 gate.observe(epoch, &ExecEvent::ResyncOrder(ours("V-1")));
@@ -1650,6 +1659,31 @@ mod tests {
             [true, true, false]
         );
         assert_eq!(gate.known(), 0);
+    }
+
+    /// Reviewer B RB-48j7-1 on PR #140: what was heard while an epoch's resync ran is kept
+    /// when that epoch, and the next, drop before their resyncs end, so a later epoch's
+    /// snapshot (here under the id the order had before it moved) still learns the id our
+    /// client id was shown under, and an end of the snapshot's id alone releases nothing.
+    #[test]
+    fn evidence_heard_in_resyncs_of_dropped_epochs_is_kept_for_a_later_snapshot() {
+        let mut gate = Gate::new(true, false, false);
+        let mine = Some(CidMatch::Ours(cid()));
+        resyncing(&mut gate);
+        gate.observe(0, &update(mine, Some("V-2"), VenueOrderState::Open));
+        // Epochs 0 and 1 drop before a snapshot shows the order.
+        gate.authenticated(1);
+        gate.arm_sent(1, RpcId(2));
+        gate.resync_asked(1);
+        gate.authenticated(2);
+        gate.arm_sent(2, RpcId(3));
+        gate.resync_asked(2);
+        gate.observe(2, &ExecEvent::ResyncOrder(ours("V-1")));
+        ended(&mut gate, 2, 3);
+        assert_eq!(
+            held_after_ends_on(&mut gate, 2, &["V-1", "V-2"]),
+            [true, false]
+        );
     }
 
     /// Whether INST is still held after an end on `epoch` under each of `wires`, in turn.
