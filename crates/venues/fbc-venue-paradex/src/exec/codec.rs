@@ -18,7 +18,7 @@
 //!   fallback; one whose rpc is not below [`CONTROL_IDS`] is `NotSent(Unencodable)`, since its
 //!   reply could not be told from the codec's own.
 //! - **A placement's final phase.** The reply accepts a placement provisionally; the order's
-//!   own `OrderEvent`s settle it ([`Placements`], decision 0091): a final acceptance of its
+//!   own `OrderEvent`s settle it ([`Placements`], decision 0092): a final acceptance of its
 //!   request once one shows it past the risk check, an asynchronous reject once one shows it
 //!   closed with nothing filled. An event and the reply may come in either order.
 //! - **The query.** The Unknown ladder's order query is FBC-0sc's REST read of

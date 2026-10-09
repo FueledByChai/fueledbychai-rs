@@ -356,7 +356,7 @@ pub(crate) enum Phase {
 
 /// The cancel reasons a source names as the risk check's refusal of an order
 /// (`fixtures/paradex/exec/README.md`): the only ones taken as refusing an IOC or MARKET order
-/// closed with nothing filled, which otherwise expired past the risk check (decision 0091).
+/// closed with nothing filled, which otherwise expired past the risk check (decision 0092).
 const REFUSALS: [&str; 1] = ["NOT_ENOUGH_MARGIN"];
 
 /// What the `OrderEvent` `frame` shows of its order's placement; `None` for a frame that is not
