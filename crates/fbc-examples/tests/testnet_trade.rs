@@ -2562,6 +2562,37 @@ fn the_account_audit_counts_every_order_not_ours_reported_not_only_those_in_view
 }
 
 #[test]
+fn the_account_audit_counts_an_amend_of_ours_and_every_problem_the_link_noted() {
+    // Codex r4226570452: the sample never amends, so an amend of one of our orders was another
+    // process's (the sole-trader assumption broke). Codex r4226570456: a venue error after
+    // login, an asynchronous reject, or an event the registry could not apply leaves the run
+    // uncertain, as an undecodable frame does. Each fails the run.
+    use fbc_core::{AccountKey, CidMint, Namespace, NamespaceLease, WallNs};
+    use fbc_oms::{Applied, Registry, Routed};
+    let lease =
+        NamespaceLease::acquire(&lease_dir(), AccountKey::new(1), Namespace::new(1)).unwrap();
+    let cid = CidMint::new(lease, 0, 0, WallNs(0)).mint().unwrap();
+    let reg = Registry::new();
+    let amended = link::Note::Order(Routed::Ours(cid, Applied::Amended));
+    let changes = trade::account_changes(&[amended], &reg, None, &[]);
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert!(
+        changes[0].starts_with("an order of ours was amended during the run"),
+        "{changes:?}"
+    );
+    let problem = link::Note::Problem("venue error naming no request".to_owned());
+    let changes = trade::account_changes(&[problem], &reg, None, &[]);
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert!(
+        changes[0].starts_with("the run noted a problem: venue error naming no request"),
+        "{changes:?}"
+    );
+    // An ordinary update of ours is not a change.
+    let advanced = link::Note::Order(Routed::Ours(cid, Applied::Advanced));
+    assert!(trade::account_changes(&[advanced], &reg, None, &[]).is_empty());
+}
+
+#[test]
 fn a_refused_url_or_proxy_is_never_echoed() {
     // Codex r4216452827: a URL or proxy that carries a secret (a user and password, a token in
     // the query or the fragment) is refused naming its flag, never with what was typed. A
@@ -2815,14 +2846,13 @@ fn a_refused_chain_id_or_argument_is_never_echoed() {
 #[test]
 fn a_market_not_shaped_like_a_paradex_market_is_refused_before_any_request() {
     // Codex r4216890750: a private key pasted as --market would be sent in GET /orderbook's
-    // path; only Paradex's shape (letters and digits in three to five parts joined by '-', at
-    // most 32 long) is taken, and a refusal never echoes the value.
+    // path; only a Paradex perpetual's shape (BASE-QUOTE-PERP, letters and digits, at most 32
+    // long) is taken, and a refusal never echoes the value.
     // Reviewer B's RB114-14: some Paradex markets carry a lower-case prefix (kBONK-USD-PERP);
     // the letters are md_watch's Paradex spelling, either case.
     for good in [
         "BTC-USD-PERP",
         "ETH-USD-PERP",
-        "BTC-USD-27JUN25-100000-C",
         "kBONK-USD-PERP",
         "kPEPE-USD-PERP",
     ] {
@@ -2848,6 +2878,11 @@ fn a_market_not_shaped_like_a_paradex_market_is_refused_before_any_request() {
         "0123456789AB-CDEF01234567-89ABCDEF0123-456789ABCDEF",
         "0123-4567-89AB-CDEF-0123-4567-89AB-CDEF-0123-4567-89AB-CDEF-0123-4567-89AB-CDEF",
         "BTC-USD-PERP-A-B-C",
+        // Codex r4226570445: the spec is built as a perpetual's, so an option, a future or a
+        // spot market is refused.
+        "BTC-USD-27JUN25-100000-C",
+        "BTC-USD-27JUN25",
+        "ETH-USD-SPOT",
     ] {
         let mut argv = strings(&MARKET_ARGS);
         argv.extend(strings(&["--market", bad]));

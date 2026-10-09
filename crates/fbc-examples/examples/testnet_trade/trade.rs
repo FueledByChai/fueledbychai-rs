@@ -768,8 +768,10 @@ pub fn latest_resync(notes: &[Note]) -> Option<Result<Applied<'_>, &str>> {
 /// position event other than `start` (the market's position seeded at Start; flat on any other
 /// market), an order not ours that an order event reported (even one ended since), an order of
 /// `owned` that filled since the run took it on ([`traded`]: the round
-/// trip can no longer be clean), or an order not ours in view on the market. Empty when
-/// nothing does.
+/// trip can no longer be clean), an amend of an order of ours (the sample never amends), a
+/// problem the link noted ([`Note::Problem`]: a venue error after login, an asynchronous
+/// reject, an event or outcome the registry could not apply), or an order not ours in view on
+/// the market. Empty when nothing does.
 pub fn account_changes(
     notes: &[Note],
     reg: &Registry,
@@ -822,6 +824,16 @@ pub fn account_changes(
                 seen,
                 unexplained: true,
             } => changes.push(format!("a fill not of our orders came in: {seen}")),
+            // The sample never amends: an amend of ours was another process's (Codex
+            // r4226570452 on PR #114).
+            Note::Order(Routed::Ours(_, fbc_oms::Applied::Amended)) => changes.push(
+                "an order of ours was amended during the run, which this sample never does: \
+                 another process operated on it"
+                    .to_owned(),
+            ),
+            // A venue error after login, an asynchronous reject, or what the glue could not
+            // apply leaves the run uncertain (Codex r4226570456 on PR #114).
+            Note::Problem(what) => changes.push(format!("the run noted a problem: {what}")),
             Note::Position { inst, qty } => {
                 // The resync refuses an account with a position on another market.
                 let expected = if *inst == INST {
