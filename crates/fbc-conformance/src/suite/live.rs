@@ -11,7 +11,8 @@ use std::cell::{Cell, RefCell};
 use std::fs;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use fbc_core::{
@@ -33,7 +34,7 @@ use futures_util::FutureExt;
 use super::harness::{Harness, NAMESPACE, Shape};
 use super::stub::Answer;
 use super::{Breach, Failure, Subject, Verdict};
-use crate::script::{Frame, Step, WsScript};
+use crate::script::{Frame, Responder, Step, WsScript};
 use crate::server::StubServer;
 
 /// The account the session trades and fbc-oms authorizes for.
@@ -124,7 +125,10 @@ impl<'s> Live<'s> {
     /// Runs the venue's order-entry session against the stub as [`Live::run`] does, over one
     /// connection per entry of `epochs`, each answered as `run` answers its one: the opening,
     /// then each request in turn, then a barrier, after which the stub closes the connection
-    /// when another epoch follows, so the session reconnects (decision 0085).
+    /// when another epoch follows, so the session reconnects (decision 0085). On a reconnect's
+    /// connection a barrier also comes before the opening's last answer, so that answer is
+    /// given only once the session has handled every frame before it, and an event heard after
+    /// it was given ([`Ctx::opened`]) came of it or of what followed (Codex r4226277849).
     pub fn run_epochs<T>(
         &self,
         epochs: Vec<Vec<Vec<Answer>>>,
@@ -133,6 +137,16 @@ impl<'s> Live<'s> {
         let setup = self.subject.setup();
         let stub = setup.order_entry.expect("Live::new saw an OrderEntryStub");
         let opening = stub.opening.len();
+        // How many of the opening's answers the stub has given, over every connection.
+        let given = Arc::new(AtomicUsize::new(0));
+        let counted = |with: &Responder| {
+            let (with, given) = (with.clone(), given.clone());
+            Responder::new(move |frame| {
+                let answer = with.respond(frame);
+                given.fetch_add(1, Ordering::SeqCst);
+                answer
+            })
+        };
         let mut steps = Vec::new();
         for (conn, requests) in epochs.into_iter().enumerate() {
             if let Some(before) = conn.checked_sub(1) {
@@ -140,7 +154,12 @@ impl<'s> Live<'s> {
             }
             steps.push(Step::Accept);
             let respond = |with| Step::Respond { conn, with };
-            steps.extend(stub.opening.iter().cloned().map(respond));
+            for (i, with) in stub.opening.iter().enumerate() {
+                if conn > 0 && i + 1 == opening {
+                    steps.push(Step::Barrier { conn });
+                }
+                steps.push(respond(counted(with)));
+            }
             let replies = requests.into_iter().map(|a| stub.reply.responder(a));
             steps.extend(replies.map(respond));
             // Last, a barrier: the epoch's script ends only once the session has read every
@@ -163,7 +182,10 @@ impl<'s> Live<'s> {
             let server = StubServer::start(WsScript::new(steps), stub.http).await;
             let server = server.expect("the stub binds two loopback ports");
             (stub.point)(&mut cfg, &server);
-            let heard = Heard::default();
+            let heard = Heard {
+                given: given.clone(),
+                ..Heard::default()
+            };
             let config = ExecSessionConfig {
                 venue: self.venue,
                 cfg,
@@ -261,17 +283,23 @@ impl NonceSource for Counting {
     }
 }
 
-/// What the session told its handler: every event, the connection epoch each came on, and
-/// every submission's handle.
+/// What the session told its handler: every event, the connection epoch each came on, how many
+/// of the opening's answers the stub had given when each was heard, and every submission's
+/// handle.
 #[derive(Clone, Default)]
 pub(crate) struct Heard {
     events: Rc<RefCell<Vec<ExecEvent>>>,
     epochs: Rc<RefCell<Vec<u32>>>,
+    opened: Rc<RefCell<Vec<usize>>>,
+    /// How many of the opening's answers the stub has given, over every connection.
+    given: Arc<AtomicUsize>,
     handles: Rc<RefCell<Vec<SubmitHandle>>>,
 }
 
 impl ExecHandler for Heard {
     fn on_exec(&mut self, env: Envelope<ExecEvent>) {
+        let given = self.given.load(Ordering::SeqCst);
+        self.opened.borrow_mut().push(given);
         self.epochs.borrow_mut().push(env.stamp.conn.epoch);
         self.events.borrow_mut().push(env.body);
     }
@@ -491,6 +519,26 @@ impl Ctx<'_> {
     /// runtime stamps it, so a later epoch's events are a reconnect's (Codex r4225971621).
     pub fn epochs(&self) -> Vec<u32> {
         self.heard.epochs.borrow().clone()
+    }
+
+    /// How many of the opening's answers the stub had given, over every connection, when each
+    /// event of [`Ctx::events`] was heard, in the same order: an event heard once a
+    /// connection's every answer was given came of its last answer or of what followed, since
+    /// on a reconnect that answer is given only once the session has handled every frame
+    /// before it (`Live::run_epochs`; Codex r4226277849).
+    pub fn opened(&self) -> Vec<usize> {
+        self.heard.opened.borrow().clone()
+    }
+
+    /// How many frames the stub answers as each connection opens.
+    pub fn opening(&self) -> usize {
+        self.opening
+    }
+
+    /// Whether the session made any HTTP request of the stub: a venue doing so may resync over
+    /// REST, whose answer the stub does not order against its socket's.
+    pub fn over_http(&self) -> bool {
+        !self.server.http_requests().is_empty()
     }
 
     /// How many frames the stub received on every connection of the session that carry `cid` as

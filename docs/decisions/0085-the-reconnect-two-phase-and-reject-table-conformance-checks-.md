@@ -20,7 +20,9 @@ outcome, 0069), and how the fixture states a kind with a payload.
 ## Decision
 
 - **A reconnect is the stub closing the connection.** `Live::run_epochs` plays one connection
-  per epoch: the opening, the requests, a barrier, then a close when another epoch follows. The
+  per epoch: the opening, the requests, a barrier, then a close when another epoch follows; on a
+  reconnect's connection a barrier also comes before the opening's last answer, so that answer
+  is given only once the session has handled every frame before it. The
   session reconnects as its pacing says, on the clock the check moves (`Ctx::played` moves it
   until the stub's script has ended). Every epoch's opening is answered alike, by the setup's
   `OrderEntryStub::opening`: its resync shows the account flat, since the venue's
@@ -30,9 +32,13 @@ outcome, 0069), and how the fixture states a kind with a payload.
   once as `OrderCaps.ack` has it (naming its one item), where no resync begins and then ends
   (`ExecEvent::ResyncBegin`, then `ExecEvent::ResyncEnd`) on a later connection epoch than the
   placement's answer came on (the epoch the runtime stamps on each event's envelope, so a
-  stray resync end does not count), where the stub's script does not play to its end, and
-  where the order is written more than once over both connections, counted as 0083 counts a
-  request written again.
+  stray resync end does not count) and, where the session read nothing over HTTP so the
+  resync was answered in frames, heard once the stub gave the new connection's last opening
+  answer, the resync's (so a pair decoded from the authentication's or the arm's answer does
+  not count), where the stub's script does not play to its end, and where the order is written
+  more than once over both connections, counted as 0083 counts a request written again, once
+  the clock has moved 5 s past the script's end (fifty times the harness's 100 ms reconnect
+  pacing ceiling), so a re-placement armed on a timer as the resync ends counts too.
 - **A final acceptance is `SubmitOutcome::Accepted` at `AckLevel::Final` for the placement's
   request; an asynchronous reject is `ExecEvent::AsyncReject` of a placement naming the order**,
   every identity it states the order's (our client id, a venue id the placement's outcomes name).
@@ -78,8 +84,11 @@ outcome, 0069), and how the fixture states a kind with a payload.
 - `resync_after_reconnect` counts a re-placement as 0083 counts a resend, so one rebuilt and
   signed again on a venue whose frames carry no textual client id is not caught yet (FBC-xpup;
   the toy and Paradex send the id as text).
+- A resync answered over REST is tied to the reconnect by its epoch alone: the stub does not
+  order its HTTP answers against its socket's (FBC-6cvg; Paradex resyncs over REST).
 - A check that waits out a rate limit's window may let a keepalive fire, as 0083 records; the
-  reconnect moves the clock only by the pacing delay, in 100 ms steps.
+  reconnect moves the clock by the pacing delay, in 100 ms steps, then 5 s more, short of the
+  keepalives a longer wait would let fire unanswered.
 
 ## What would show this was wrong
 
