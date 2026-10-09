@@ -19,7 +19,9 @@
 //!
 //! An event settles a placement only when it names the venue id the placement's reply named:
 //! our client id under another venue id is not the placement's order (Codex r4228157178 on PR
-//! #145). The phase is pushed under the `VenueMeta` of the event that showed it.
+//! #145). An event naming no client id settles the accepted placement whose reply named its
+//! venue id (Codex r4228615867). The phase is pushed under the `VenueMeta` of the event that
+//! showed it.
 //!
 //! An event can come before the reply. What the first such event showed (not Pending) is held
 //! for the placement until its reply, with its venue id and `VenueMeta`: when the reply names
@@ -164,16 +166,32 @@ impl Placements {
 
     /// The events an order-entry frame decoded into, `phase` what it showed when it is an
     /// `OrderEvent`, pushed to `sink`: each order update preceded by its placement's final
-    /// phase when it settles one.
+    /// phase when it settles one. An update naming no client id is matched to an accepted
+    /// placement by the venue id its reply named (Codex r4228615867 on PR #145).
     pub(super) fn on_event(&mut self, phase: Option<Phase>, held: Held, sink: &mut dyn ExecSink) {
         for (meta, ev) in held.0 {
-            if let (Some(phase), ExecEvent::Order(update)) = (&phase, &ev)
-                && let Some(CidMatch::Ours(cid)) = update.cid
-            {
-                self.settle(cid, update.vid.as_ref(), phase, meta, sink);
+            if let (Some(phase), ExecEvent::Order(update)) = (&phase, &ev) {
+                let cid = match update.cid {
+                    Some(CidMatch::Ours(cid)) => Some(cid),
+                    None => update.vid.as_ref().and_then(|vid| self.accepted_as(vid)),
+                    Some(_) => None,
+                };
+                if let Some(cid) = cid {
+                    self.settle(cid, update.vid.as_ref(), phase, meta, sink);
+                }
             }
             sink.push(meta, ev);
         }
+    }
+
+    /// Our client id of the placement accepted provisionally whose reply named the venue id
+    /// `vid`, if one is held. An event before the reply names no venue id a placement is known
+    /// by, so an event naming no client id settles only an accepted placement.
+    fn accepted_as(&self, vid: &VenueOrderId) -> Option<ClientOrderId> {
+        self.accepted
+            .iter()
+            .find(|(_, (_, item))| item.vid.as_ref() == Some(vid))
+            .map(|(cid, _)| *cid)
     }
 
     /// Request `rpc` timed out: whatever of it was unanswered is `Unknown`, never accepted.

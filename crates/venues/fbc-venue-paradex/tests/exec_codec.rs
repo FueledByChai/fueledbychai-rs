@@ -1375,7 +1375,8 @@ fn a_placement_whose_order_event_shows_it_closed_with_nothing_filled_is_rejected
     }
 }
 
-/// Order event `bytes` with its cancel reason `from` (non-empty) stated as `to` instead.
+/// Order event `bytes` with its first string `from` (non-empty, a cancel reason or venue id)
+/// stated as `to` instead.
 fn with_reason(mut bytes: Vec<u8>, from: &str, to: &str) -> Vec<u8> {
     let from = from.as_bytes();
     let at = bytes.windows(from.len()).position(|w| w == from).unwrap();
@@ -1408,6 +1409,26 @@ fn an_ioc_or_market_order_closed_unfilled_for_no_known_refusal_is_final_not_reje
         expected.extend(decoded(&bytes));
         assert_eq!(call.events, expected, "{name}");
     }
+}
+
+#[test]
+fn an_event_naming_no_client_id_settles_the_accepted_placement_of_its_venue_id_and_no_other() {
+    // OPEN with no client id, naming the venue id request 11's reply named: our order's event.
+    let other = sbe("order-no-cid-v1.sbe.txt");
+    let ours = with_reason(other.clone(), "1759500000000000005", OID);
+    let mut codec = placed();
+    // Under another venue id first: not the placement's order, which stays provisional.
+    let call = frame(&mut codec, RawFrame::Binary(&other));
+    call.result.unwrap();
+    assert_eq!(call.events, decoded(&other));
+    let call = frame(&mut codec, RawFrame::Binary(&ours));
+    call.result.unwrap();
+    let mut expected = vec![accepted(11, AckLevel::Final)];
+    expected.extend(decoded(&ours));
+    assert_eq!(call.events, expected);
+    // Settled: the same event again is the update alone.
+    let call = frame(&mut codec, RawFrame::Binary(&ours));
+    assert_eq!(call.events, decoded(&ours));
 }
 
 #[test]

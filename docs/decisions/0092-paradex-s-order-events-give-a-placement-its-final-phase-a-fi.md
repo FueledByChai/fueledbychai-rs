@@ -38,7 +38,9 @@ the reply.
   cancel before the risk check ended) settles the placement with nothing more.
 - **Its own order.** An event settles a placement only when it names the venue id the
   placement's reply named (or either states none): our client id under another venue id is
-  not the placement's order. The phase carries the `VenueMeta` of the event that showed it.
+  not the placement's order. An event naming no client id settles the accepted placement
+  whose reply named its venue id; one before the reply settles nothing, since no venue id is
+  known for the placement yet. The phase carries the `VenueMeta` of the event that showed it.
 - **Before the reply.** What the first such event shows of a placement sent and not yet
   answered is held, with its venue id and `VenueMeta`, until its reply; when the reply names
   that venue id: passed, the reply's outcome is the final acceptance at once (no provisional
