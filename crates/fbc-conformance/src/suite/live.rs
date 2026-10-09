@@ -6,6 +6,13 @@
 //! The clock is tokio's, paused, and a blocked thread keeps it from moving on its own while the
 //! sockets are idle: a request's deadline passes only when a check moves the clock past it,
 //! never while the stub's answer is still on its way.
+//!
+//! A check waits for the stub and the session by events, never by a count of scheduler turns
+//! (FBC-pn85: on a loaded host the frames of an answer reached the session after the turns had
+//! run): the stub's script position, each reply ending in a barrier whose pong says the session
+//! has read every frame of it, the session's report of a request sent, and its epoch taking
+//! places. Each wait is bounded by a wall-clock watchdog ([`WATCHDOG`], or the one
+//! [`with_watchdog`] sets for a test).
 
 use std::cell::{Cell, RefCell};
 use std::fs;
@@ -14,6 +21,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
+use std::time::Instant;
 
 use fbc_core::{
     AccountKey, AccountLease, ClientOrderId, ConnKey, Envelope, ExecEvent, ItemRef, LimitScope,
@@ -47,14 +55,35 @@ const FINE: Duration = Duration::from_secs(30);
 const COARSE: Duration = Duration::from_secs(1);
 /// The longest a check waits for a deadline to pass: longer than any venue's request deadline.
 pub(crate) const WAIT: Duration = Duration::from_secs(600);
-/// How many times a check lets every task run, without moving the clock, before it gives up
-/// waiting for something the stub's answer should bring.
-const TURNS: usize = 100_000;
+/// How long, by the wall clock, a check waits for an event the stub or the session should
+/// bring (the opening taking places, a request reported sent, an answer read) before it fails:
+/// far longer than a loaded host takes, so only an adapter that never brings it fails.
+pub const WATCHDOG: Duration = Duration::from_secs(60);
+
+thread_local! {
+    /// The watchdog [`with_watchdog`] set on this thread, if any.
+    static WATCHDOG_SET: Cell<Option<Duration>> = const { Cell::new(None) };
+}
+
+/// Runs `f` with every order-entry check it runs on this thread waiting `watchdog` instead of
+/// [`WATCHDOG`] before it fails: a test of the suite expecting a check to fail at its watchdog
+/// keeps it short. Each check runs its session on the thread that calls it.
+pub fn with_watchdog<T>(watchdog: Duration, f: impl FnOnce() -> T) -> T {
+    // Put back however `f` ends, a panic included.
+    struct Restore(Option<Duration>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WATCHDOG_SET.set(self.0);
+        }
+    }
+    let _restore = Restore(WATCHDOG_SET.replace(Some(watchdog)));
+    f()
+}
 /// The most connection epochs a check's session opens: its first and the reconnects a codec
 /// asks for.
 const EPOCHS: u32 = 64;
-/// How many times a check lets every task run after the stub has answered, or the clock moved,
-/// for what that brings to reach the session.
+/// How many times a check lets every task run after the clock moved, for the timers it fired to
+/// run.
 const CHURN: usize = 200;
 /// The orders a check's registry places at most, unless the check asks for more
 /// ([`Live::orders`]): its client ids, and its inventory and resting caps on the instrument in
@@ -70,6 +99,8 @@ pub(crate) struct Live<'s> {
     pub order: OrderCaps,
     /// The orders the check's registry places at most.
     orders: usize,
+    /// How long, by the wall clock, the check waits for an event before it fails.
+    watchdog: Duration,
 }
 
 impl<'s> Live<'s> {
@@ -99,6 +130,7 @@ impl<'s> Live<'s> {
             h,
             order,
             orders: ORDERS,
+            watchdog: WATCHDOG_SET.get().unwrap_or(WATCHDOG),
         }))
     }
 
@@ -148,6 +180,8 @@ impl<'s> Live<'s> {
             })
         };
         let mut steps = Vec::new();
+        // How many steps have played once the session has read each reply, in request order.
+        let mut replied = Vec::new();
         for (conn, requests) in epochs.into_iter().enumerate() {
             if let Some(before) = conn.checked_sub(1) {
                 steps.push(Step::Close { conn: before });
@@ -160,12 +194,20 @@ impl<'s> Live<'s> {
                 }
                 steps.push(respond(counted(with)));
             }
-            let replies = requests.into_iter().map(|a| stub.reply.responder(a));
-            steps.extend(replies.map(respond));
-            // Last, a barrier: the epoch's script ends only once the session has read every
-            // frame the stub sent on it, so what a check reads once it has played comes after
-            // the session handled them all, however late the host delivered them (FBC-3il).
-            steps.push(Step::Barrier { conn });
+            // Each reply ends in a barrier: the step after it is played only once the session
+            // has read every frame of the reply, so a check waiting on the stub's position
+            // ([`Ctx::replied`]) reads what the reply brought, however late the host delivered
+            // its frames (FBC-pn85). The epoch's last barrier, after its last reply or, with
+            // none, its opening, ends its script once the session has read every frame the stub
+            // sent on it (FBC-3il).
+            for answers in requests {
+                steps.push(respond(stub.reply.responder(answers)));
+                steps.push(Step::Barrier { conn });
+                replied.push(steps.len());
+            }
+            if steps.last() != Some(&Step::Barrier { conn }) {
+                steps.push(Step::Barrier { conn });
+            }
         }
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -216,8 +258,10 @@ impl<'s> Live<'s> {
                 oms: Oms::new(&self.h, self.venue.id(), &self.order, self.orders)?,
                 server: &server,
                 opening,
+                replied,
                 sent: Cell::new(0),
                 rates,
+                watchdog: self.watchdog,
             };
             let script = async {
                 let out = scenario(&mut ctx).await;
@@ -318,29 +362,43 @@ pub(crate) struct Ctx<'a> {
     server: &'a StubServer,
     /// How many frames the stub answers as the epoch opens, before the first request.
     opening: usize,
+    /// How many of the stub's steps have played once the session has read each reply, in
+    /// request order.
+    replied: Vec<usize>,
     /// How many requests the check has sent.
     sent: Cell<usize>,
     /// The session's buckets, shared with it: what each limit has counted.
     rates: RateLimiter,
+    /// How long, by the wall clock, a wait lasts before the check fails.
+    watchdog: Duration,
 }
 
 impl Ctx<'_> {
-    /// Lets the session run, without moving the clock, until `done` holds: false when it never
-    /// does.
-    pub async fn settle(&self, done: impl Fn(&Ctx<'_>) -> bool) -> bool {
-        for _ in 0..TURNS {
+    /// Lets the session and the stub run, without moving the clock, until `done` holds, or the
+    /// watchdog's wall-clock time has passed: false then.
+    async fn until(&self, done: impl Fn(&Ctx<'_>) -> bool) -> bool {
+        let give_up = Instant::now() + self.watchdog;
+        loop {
             if done(self) {
                 return true;
             }
+            if Instant::now() >= give_up {
+                return false;
+            }
             tokio::task::yield_now().await;
         }
-        done(self)
+    }
+
+    /// Whether the stub's script has ended: played to its end, or stopped.
+    fn ended(&self) -> bool {
+        self.server.finished().now_or_never().is_some()
     }
 
     /// Waits until the session's epoch takes places, as it does once the stub has answered
-    /// the opening.
+    /// the opening; a failure when the stub's script ends first (a reply refused what it read)
+    /// or the watchdog passes.
     pub async fn ready(&self) -> Result<(), Failure> {
-        if self.settle(|c| c.orders.may_place()).await {
+        if self.until(|c| c.orders.may_place() || c.ended()).await && self.orders.may_place() {
             return Ok(());
         }
         let what = "the session's epoch never took places: the opening the stub answered with \
@@ -371,7 +429,7 @@ impl Ctx<'_> {
             let handles = c.heard.handles.borrow();
             handles.iter().find(|h| h.rpc == *rpc).cloned()
         };
-        self.settle(|c| rpc.is_err() || handle(c).is_some()).await;
+        self.until(|c| rpc.is_err() || handle(c).is_some()).await;
         match (handle(self).map(|h| h.receipt), &rpc) {
             (Some(Ok(_)), Ok(rpc)) => Ok(*rpc),
             // Refused by the session, not sent for the reason given, or never reported.
@@ -402,27 +460,37 @@ impl Ctx<'_> {
         }
     }
 
+    /// Waits until the stub has read the last request the check sent and the session has read
+    /// every frame of the stub's answer to it (its handler heard what they bring), by events:
+    /// the stub's script position past the barrier ending that reply, whose pong the session
+    /// sends only once it has read every frame before the barrier's ping (FBC-pn85). A failure
+    /// when the script stops first (a reply refused what it read), or the watchdog passes (it
+    /// waits for a request the session never wrote).
+    pub async fn replied(&self) -> Result<(), Failure> {
+        let last = self.sent.get().checked_sub(1);
+        let at = last.and_then(|i| self.replied.get(i)).copied();
+        let at = at.expect("a check waits for the reply to a request it sent and the stub answers");
+        if self.until(|c| c.server.played() >= at || c.ended()).await && self.server.played() >= at
+        {
+            return Ok(());
+        }
+        let finished = self.server.finished().now_or_never();
+        let what = format!(
+            "the stub never answered request {} and saw it read: {finished:?}",
+            self.sent.get()
+        );
+        Err(self.h.fail("OrderEntryStub", what))
+    }
+
     /// Waits until the stub has played its script to its end: every request it answers read
     /// and answered, and the barrier after them passed, so the session has handled every frame
     /// of the answers (its handler heard what they bring) by an event, the pong to the
-    /// barrier's ping, never by a count of turns (FBC-3il: on a loaded host the answers reached
-    /// the session after the turns had run). Then lets every task run a while longer.
+    /// barrier's ping, never by a count of turns (FBC-3il, FBC-pn85: on a loaded host the
+    /// answers reached the session after the turns had run), or the watchdog passes.
     pub async fn answered(&self) -> Result<(), Failure> {
-        let mut finished = None;
-        for _ in 0..TURNS {
-            finished = self.server.finished().now_or_never();
-            if finished.is_some() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        match finished {
-            Some(Ok(())) => {
-                for _ in 0..CHURN {
-                    tokio::task::yield_now().await;
-                }
-                Ok(())
-            }
+        self.until(|c| c.ended()).await;
+        match self.server.finished().now_or_never() {
+            Some(Ok(())) => Ok(()),
             // The script stopped (a reply refused what it read), or (`None`) still waits for a
             // request the session never wrote.
             other => {
@@ -434,30 +502,19 @@ impl Ctx<'_> {
 
     /// Moves the clock on, as [`Ctx::advance_until`] does, until the stub has played its script
     /// to its end, as [`Ctx::answered`] waits for it without moving the clock: a script that
-    /// closes a connection waits for the session to reconnect, which its pacing delays. Then
-    /// lets every task run a while longer. How far the clock moved.
+    /// closes a connection waits for the session to reconnect, which its pacing delays. Its
+    /// last step, a barrier, says the session has read every frame the stub sent. How far the
+    /// clock moved.
     pub async fn played(&self) -> Result<Duration, Failure> {
-        let ended = |c: &Ctx<'_>| c.server.finished().now_or_never().is_some();
-        let moved = self.advance_until(ended).await;
+        let moved = self.advance_until(|c| c.ended()).await;
         match (moved, self.server.finished().now_or_never()) {
-            (Some(moved), Some(Ok(()))) => {
-                self.churn().await;
-                Ok(moved)
-            }
+            (Some(moved), Some(Ok(()))) => Ok(moved),
             // The script stopped (a reply refused what it read), or still waits for a
             // connection or a frame the session never opened or wrote.
             (_, other) => {
                 let what = format!("the stub's script did not play to its end: {other:?}");
                 Err(self.h.fail("OrderEntryStub", what))
             }
-        }
-    }
-
-    /// Lets every task run, without moving the clock, for what the stub's answer brings to
-    /// reach the session.
-    pub async fn churn(&self) {
-        for _ in 0..CHURN {
-            tokio::task::yield_now().await;
         }
     }
 

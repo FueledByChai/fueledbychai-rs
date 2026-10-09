@@ -6,7 +6,9 @@
 //! - [`StubServer`], a stub venue on two 127.0.0.1 ephemeral ports: a WebSocket endpoint that
 //!   plays a [`WsScript`] (accept, read, push, close, go silent; each step names its connection)
 //!   and records every connection and data frame, and an HTTP/1.1 endpoint that answers fixed
-//!   responses by path, for a venue's REST anchor.
+//!   responses by path, for a venue's REST anchor. [`StubServer::played`] is the script's
+//!   position, which the order-entry checks wait on instead of a count of scheduler turns
+//!   (FBC-pn85).
 //! - Replies computed from the request (FBC-xg7, decision 0047): a [`Step::Respond`] answers the
 //!   frame it reads with what a [`Responder`] computes from it (a reply echoing its request id,
 //!   a batch's outcome per item), and an [`HttpRouter`] answers by method and [`PathPattern`]

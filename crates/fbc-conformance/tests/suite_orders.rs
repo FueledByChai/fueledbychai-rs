@@ -1879,9 +1879,16 @@ fn amend_ack_amends_the_quantity_where_the_price_is_not_amendable() {
 
 #[test]
 fn a_placement_the_codec_refuses_or_the_venue_rejects_fails_each_check() {
+    // The request not sent fails as the session reports it, well within 5 s (FBC-pn85).
+    let started = std::time::Instant::now();
     let failure = failed(suite::unknown_on_timeout(
         &REFUSES_PLACEMENTS.subject(assumed),
     ));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
     assert!(
         says(
             &failure,

@@ -94,6 +94,8 @@ pub struct StubServer {
     /// One slot per HTTP connection in accept order, filled once its request is read.
     requests: Shared<Vec<Option<String>>>,
     result: watch::Receiver<Option<Result<(), ScriptError>>>,
+    /// How many of the script's steps have played to their end.
+    played: watch::Receiver<usize>,
     _stop: watch::Sender<()>,
 }
 
@@ -109,6 +111,7 @@ impl StubServer {
         let requests = Shared::default();
         let (accepted_tx, accepted) = mpsc::unbounded_channel();
         let (result_tx, result) = watch::channel(None);
+        let (played_tx, played) = watch::channel(0);
         tokio::spawn(accept_ws(
             ws_listener,
             conns.clone(),
@@ -124,7 +127,7 @@ impl StubServer {
         tokio::spawn(async move {
             let mut stop = stop;
             tokio::select! {
-                done = play(script.steps, accepted) => {
+                done = play(script.steps, accepted, played_tx) => {
                     result_tx.send_replace(Some(done));
                 }
                 _ = stop.changed() => {}
@@ -136,6 +139,7 @@ impl StubServer {
             conns,
             requests,
             result,
+            played,
             _stop: stop_tx,
         })
     }
@@ -157,6 +161,13 @@ impl StubServer {
         // `&self` prevents, ends it without one.
         let done = result.wait_for(Option::is_some).await;
         done.ok().and_then(|r| r.clone()).unwrap_or(Ok(()))
+    }
+
+    /// How many of the script's steps have played to their end: a [`Step::Respond`] once every
+    /// frame it computed was written, a [`Step::Barrier`] once the client's pong arrived. The
+    /// script's position, which a test waits on instead of a time (FBC-pn85).
+    pub fn played(&self) -> usize {
+        *self.played.borrow()
     }
 
     /// Every connection the WebSocket endpoint accepted, in accept order.
@@ -328,13 +339,18 @@ async fn serve_ws(
     record(&|c| c.open = false);
 }
 
-/// Plays `steps` in order against the connections `accepted` yields.
+/// Plays `steps` in order against the connections `accepted` yields, counting each step played
+/// to its end in `played`.
 async fn play(
     steps: Vec<Step>,
     mut accepted: mpsc::UnboundedReceiver<Ready>,
+    played: watch::Sender<usize>,
 ) -> Result<(), ScriptError> {
     let mut conns: Vec<Conn> = Vec::new();
+    let all = steps.len();
     for (step, action) in steps.into_iter().enumerate() {
+        // Every step before this one played to its end.
+        played.send_replace(step);
         match action {
             Step::Accept => {
                 let opened = next_conn(&mut accepted).await;
@@ -385,6 +401,7 @@ async fn play(
             }
         }
     }
+    played.send_replace(all);
     Ok(())
 }
 
