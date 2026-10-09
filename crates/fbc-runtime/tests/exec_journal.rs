@@ -1828,7 +1828,7 @@ fn a_journal_of_the_previous_format_version_still_reads() {
     let open = fs::read(root.join("20261003/1-000001.fbcj")).unwrap();
     assert_eq!(open[..4], fbc_journal::format::MAGIC);
     assert_eq!(u16::from_le_bytes([open[4], open[5]]), 6);
-    assert!(fbc_journal::format::VERSION > 6);
+    const { assert!(fbc_journal::format::VERSION > 6) };
     let entries: Vec<Entry> = JournalReader::open(&root, 1)
         .unwrap()
         .entries()
