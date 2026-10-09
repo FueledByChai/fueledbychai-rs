@@ -1,0 +1,17 @@
+# Paradex's reject codes a refused order request carries, each followed by the RejectKind it
+# maps to as the kind's Debug spells it (crates/venues/fbc-venue-paradex/src/exec/errors.rs,
+# REJECT_CODES; decisions 0054 and 0069). The stub refuses one placement under each as a
+# JSON-RPC error with the request's id, in the shape docs.paradex.trade's WebSocket "Error
+# Handling" shows. ALREADY_CLOSED and NOT_FOUND are cancel_batch item statuses, never a
+# placement's error code, and an internal error (-32603) or an undocumented code is Unknown,
+# not a refusal (0069): none of them is listed.
+-32700 Other
+-32600 Other
+-32601 Unsupported
+-32602 Other
+100 Other
+40110 Other
+40111 Other
+40112 Other
+40300 Other
+42901 RateLimited { retry_after: None }

@@ -1,0 +1,9 @@
+Synthetic frames and REST answers (decision 0009). Nothing in this directory belongs to a funded
+account.
+
+resting.frames is hand-built: its two order events are fixtures/paradex/exec's
+order-closed-filled-v2 and order-closed-canceled-v2 with the conformance suite's client ids 6
+and 7 (namespace 1) and made-up venue ids put in; its resync answers are in the shapes of
+fixtures/paradex/exec's rest-orders-open.json and rest-positions.json, with the suite's client
+ids 8 and 5, a random version-4 UUID for the Java-era order, made-up venue ids, prices and
+times, and the account 0xa0a1..bf, 32 made-up bytes, as every fixtures/paradex/exec frame has.

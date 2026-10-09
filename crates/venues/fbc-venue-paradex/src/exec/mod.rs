@@ -32,6 +32,7 @@ mod encode;
 mod errors;
 mod fill;
 mod order;
+mod placements;
 mod read_only;
 mod reply;
 mod rest;
@@ -45,6 +46,7 @@ pub use encode::ParadexEncoder;
 pub use errors::REJECT_CODES;
 pub use fill::{TEMPLATE_FILL, decode_fill_event};
 pub use order::{MODIFY_OUTCOMES_HELD, ModifyRequests, TEMPLATE_ORDER, decode_order_event};
+pub(crate) use placements::Placements;
 pub use read_only::{LOGIN_REQUEST, PRIVATE_CHANNELS, REFRESH_TIMER, ReadOnlyExec};
 pub use reply::{ParadexReplies, ReplyRead};
 pub use rest::{

@@ -21,7 +21,9 @@ serde_json.workspace = true
 # journals the session, and rebuilds fbc-book's books from the journal (design §6 step 12).
 # fbc-oms and log are test-only too: the offline rehearsal (tests/rehearsal.rs, FBC-8mv) runs
 # fbc-oms, the order-entry session and this codec against the stub, reading the log facade at
-# TRACE and its journal's files, closed segments decompressed with zstd. scripts/check-deps.sh
+# TRACE and its journal's files, closed segments decompressed with zstd. The conformance suite
+# (tests/conformance.rs, FBC-6oj) runs fbc-conformance's named checks on ParadexFactory, the
+# order-entry ones on fbc-runtime's session and fbc-oms against the stub. scripts/check-deps.sh
 # does not count dev-dependencies.
 [dev-dependencies]
 fbc-book = { path = "../../fbc-book" }

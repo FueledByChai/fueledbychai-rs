@@ -1246,3 +1246,227 @@ fn an_unreadable_auth_or_subscribe_reply_reports_closed_and_asks_for_a_reconnect
     let (result, _) = encode(&mut codec, &place(), RpcId(1));
     result.unwrap();
 }
+
+// FBC-6oj (decision 0085's Consequences): a placement Paradex accepts provisionally gets its
+// final phase from the order's event: `Accepted` at `AckLevel::Final` for its request once an
+// event shows the order past the risk check (OPEN, or anything filled), or an asynchronous
+// reject of the placement once one shows it closed with nothing filled for a reason other than
+// our cancel.
+
+/// Our first order (cid 0, [`OID`]) as its `OrderEvent` shows it: `order-new-v1.sbe.txt`, NEW,
+/// with its status byte set to `status` (1 NEW, 3 OPEN, 4 CLOSED).
+fn new_event_as(status: u8) -> Vec<u8> {
+    let mut bytes = sbe("order-new-v1.sbe.txt");
+    // The 8-byte message header, then `status` at block offset 16.
+    assert_eq!(bytes[8 + 16], 1, "order-new-v1 is NEW");
+    bytes[8 + 16] = status;
+    bytes
+}
+
+/// What the order event `bytes` decodes into on its own, with nothing awaiting its final phase.
+fn decoded(bytes: &[u8]) -> Vec<ExecEvent> {
+    let call = frame(&mut authenticated(), RawFrame::Binary(bytes));
+    call.result.unwrap();
+    call.events
+}
+
+fn item0() -> ItemRef {
+    ItemRef {
+        idx: 0,
+        cid: Some(cid(0)),
+        vid: Some(vid(OID)),
+    }
+}
+
+fn accepted(rpc: u64, ack: AckLevel) -> ExecEvent {
+    ExecEvent::Outcome {
+        rpc: RpcId(rpc),
+        item: Some(item0()),
+        outcome: SubmitOutcome::Accepted { ack },
+    }
+}
+
+/// The asynchronous reject of our first order's placement for `reason`, as `kind`.
+fn place_refused(kind: RejectKind, reason: &str) -> ExecEvent {
+    ExecEvent::AsyncReject {
+        target: OrderRef::Both(cid(0), vid(OID)),
+        op: fbc_core::OpKind::Place,
+        reject: fbc_core::Reject {
+            kind,
+            venue_code: None,
+            raw: reason.into(),
+        },
+    }
+}
+
+/// A codec that placed our first order as request 11 and read its reply, provisional.
+fn placed() -> ParadexExec {
+    let mut codec = authenticated();
+    encode(&mut codec, &place(), RpcId(11)).0.unwrap();
+    let call = text(&mut codec, &fixture_text("reply-create.json"));
+    call.result.unwrap();
+    assert_eq!(call.events, [accepted(11, AckLevel::Provisional)]);
+    codec
+}
+
+#[test]
+fn a_placement_is_final_once_its_order_event_shows_it_open_and_never_again() {
+    let mut codec = placed();
+    // NEW: received, its risk check not yet passed. The order update alone.
+    let new = sbe("order-new-v1.sbe.txt");
+    let call = frame(&mut codec, RawFrame::Binary(&new));
+    call.result.unwrap();
+    assert_eq!(call.events, decoded(&new));
+    // OPEN: past the risk check. The final acceptance of request 11's item, then the update.
+    let open = new_event_as(3);
+    let call = frame(&mut codec, RawFrame::Binary(&open));
+    call.result.unwrap();
+    let mut expected = vec![accepted(11, AckLevel::Final)];
+    expected.extend(decoded(&open));
+    assert_eq!(call.events, expected);
+    // A later event of the order is the update alone: the placement is settled.
+    for later in [open, sbe("order-closed-post-only-v2.sbe.txt")] {
+        let call = frame(&mut codec, RawFrame::Binary(&later));
+        call.result.unwrap();
+        assert_eq!(call.events, decoded(&later));
+    }
+}
+
+#[test]
+fn a_placement_whose_order_event_shows_anything_filled_is_final() {
+    for fixture in [
+        "order-closed-filled-v2.sbe.txt",
+        "order-market-ioc-v1.sbe.txt",
+        "order-closed-canceled-v2.sbe.txt",
+        "order-modify-success-v2.sbe.txt",
+    ] {
+        let mut codec = placed();
+        let bytes = sbe(fixture);
+        let call = frame(&mut codec, RawFrame::Binary(&bytes));
+        call.result.unwrap();
+        let mut expected = vec![accepted(11, AckLevel::Final)];
+        expected.extend(decoded(&bytes));
+        assert_eq!(call.events, expected, "{fixture}");
+    }
+}
+
+#[test]
+fn a_placement_whose_order_event_shows_it_closed_with_nothing_filled_is_rejected_asynchronously() {
+    let cases = [
+        (
+            "order-closed-post-only-v2.sbe.txt",
+            RejectKind::PostOnlyWouldCross,
+            "POST_ONLY_WOULD_CROSS",
+        ),
+        (
+            "order-closed-margin-v2.sbe.txt",
+            RejectKind::Other,
+            "NOT_ENOUGH_MARGIN",
+        ),
+    ];
+    for (fixture, kind, reason) in cases {
+        let mut codec = placed();
+        let bytes = sbe(fixture);
+        let call = frame(&mut codec, RawFrame::Binary(&bytes));
+        call.result.unwrap();
+        let mut expected = vec![place_refused(kind, reason)];
+        expected.extend(decoded(&bytes));
+        assert_eq!(call.events, expected, "{fixture}");
+    }
+}
+
+#[test]
+fn a_placement_we_cancel_before_its_risk_check_is_neither_final_nor_rejected() {
+    // CLOSED by USER_CANCELED with nothing filled: our own cancel, not the venue's refusal.
+    let mut canceled = sbe("order-closed-post-only-v2.sbe.txt");
+    let (from, to) = (
+        b"POST_ONLY_WOULD_CROSS".as_slice(),
+        b"USER_CANCELED".as_slice(),
+    );
+    let at = canceled
+        .windows(from.len())
+        .position(|w| w == from)
+        .unwrap();
+    canceled.splice(at - 1..at + from.len(), [&[13u8][..], to].concat());
+    let mut codec = placed();
+    let call = frame(&mut codec, RawFrame::Binary(&canceled));
+    call.result.unwrap();
+    assert_eq!(call.events, decoded(&canceled));
+    // And it is settled: a later OPEN event of the order (none is sent, but were it) adds nothing.
+    let open = new_event_as(3);
+    let call = frame(&mut codec, RawFrame::Binary(&open));
+    assert_eq!(call.events, decoded(&open));
+}
+
+#[test]
+fn an_order_event_before_the_placements_reply_settles_it_when_the_reply_comes() {
+    // OPEN first: the reply is the final acceptance at once.
+    let mut codec = authenticated();
+    encode(&mut codec, &place(), RpcId(11)).0.unwrap();
+    let open = new_event_as(3);
+    let call = frame(&mut codec, RawFrame::Binary(&open));
+    assert_eq!(call.events, decoded(&open));
+    let call = text(&mut codec, &fixture_text("reply-create.json"));
+    call.result.unwrap();
+    assert_eq!(call.events, [accepted(11, AckLevel::Final)]);
+    // NEW then a refusal first: the reply's provisional acceptance, then the reject.
+    let mut codec = authenticated();
+    encode(&mut codec, &place(), RpcId(11)).0.unwrap();
+    for fixture in ["order-new-v1.sbe.txt", "order-closed-post-only-v2.sbe.txt"] {
+        let bytes = sbe(fixture);
+        let call = frame(&mut codec, RawFrame::Binary(&bytes));
+        assert_eq!(call.events, decoded(&bytes), "{fixture}");
+    }
+    let call = text(&mut codec, &fixture_text("reply-create.json"));
+    call.result.unwrap();
+    let refused = place_refused(RejectKind::PostOnlyWouldCross, "POST_ONLY_WOULD_CROSS");
+    assert_eq!(call.events, [accepted(11, AckLevel::Provisional), refused]);
+}
+
+#[test]
+fn a_batch_items_placement_is_final_on_its_order_event_and_a_refused_item_awaits_nothing() {
+    let mut codec = authenticated();
+    let first = match place() {
+        VenueCommand::Place(o) => o,
+        _ => unreachable!(),
+    };
+    let second = NewOrder {
+        cid: cid(1),
+        ..first.clone()
+    };
+    let batch = VenueCommand::PlaceBatch(vec![first, second]);
+    encode(&mut codec, &batch, RpcId(13)).0.unwrap();
+    let call = text(&mut codec, &fixture_text("reply-create-batch-mixed.json"));
+    call.result.unwrap();
+    assert_eq!(call.events.len(), 2, "{:?}", call.events);
+    let open = new_event_as(3);
+    let call = frame(&mut codec, RawFrame::Binary(&open));
+    let mut expected = vec![accepted(13, AckLevel::Final)];
+    expected.extend(decoded(&open));
+    assert_eq!(call.events, expected);
+}
+
+#[test]
+fn a_new_connection_a_timeout_or_an_unaccepted_reply_leaves_no_placement_awaiting_its_final_phase()
+{
+    let opened = new_event_as(3);
+    // Accepted provisionally, then a new connection: the resync settles what rests now.
+    let mut codec = placed();
+    open(&mut codec);
+    let call = frame(&mut codec, RawFrame::Binary(&opened));
+    assert_eq!(call.events, decoded(&opened));
+    // Sent, then timed out (Unknown): no reply, so no final phase either.
+    let mut codec = authenticated();
+    encode(&mut codec, &place(), RpcId(11)).0.unwrap();
+    codec.on_rpc_timeout(RpcId(11), &mut Sink::default());
+    let call = frame(&mut codec, RawFrame::Binary(&opened));
+    assert_eq!(call.events, decoded(&opened));
+    // Refused by its reply: ended, never accepted.
+    let mut codec = authenticated();
+    encode(&mut codec, &place(), RpcId(11)).0.unwrap();
+    text(&mut codec, &error(11, -32602, "invalid params"))
+        .result
+        .unwrap();
+    let call = frame(&mut codec, RawFrame::Binary(&opened));
+    assert_eq!(call.events, decoded(&opened));
+}

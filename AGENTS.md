@@ -394,13 +394,16 @@ rather than guess.
     `order.cancel_all`, `order.cancel_on_disconnect`) from the command and `EncodeCtx` only
     (`src/exec/encode.rs`, `ParadexEncoder`); the order-entry codec, `ParadexExec`, which puts
     the read-only codec's connection, the encoder, the replies (`src/exec/reply.rs`, 0069), the
-    resync and the order query together on one connection (`src/exec/codec.rs`, 0071); the
+    resync and the order query together on one connection (`src/exec/codec.rs`, 0071), a
+    placement's final phase given by its order events (`src/exec/placements.rs`, 0091); the
     factory's order entry: `caps()` with the `ExecCaps`, one order-entry endpoint on SBE 1:2,
     and the order-entry or read-only codec as `paradex.exec.mode` says, its order signer from
     `auth::order_signer` so no credential is read outside `src/auth` (`src/factory.rs`, 0072);
     the offline rehearsal (`tests/rehearsal.rs`, FBC-8mv): fbc-oms, the order-entry session and
     this codec against the conformance stub, the market seeded by hand under a declared testnet
-    run (0067), every record the log facade emits read at TRACE; and, in
+    run (0067), every record the log facade emits read at TRACE; the named conformance suite
+    (`tests/conformance.rs`, FBC-6oj) on `ParadexFactory`, its fixtures in
+    `fixtures/paradex/conformance/` and what they assume in `tests/conformance/setup.rs`; and, in
     `tests/oracle/` with `fbc-book` as a dev-dependency only, the
     BT-401 book and bbo-touch agreement checks), later `crates/venues/fbc-venue-hibachi`
     (0016).

@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","method":"order.cancel","params":{"client_id":"01000100-199a-8469-9e80-0006305fde70","market":"BTC-USD-PERP"},"id":25}
