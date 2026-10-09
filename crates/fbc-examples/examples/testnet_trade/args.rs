@@ -22,8 +22,9 @@ Environment (read once at start; no value is ever printed):
   PARADEX_PRIVATE_KEY       the account's own Stark private key (0x and hex digits): the main
                             key, not a trading subkey
   PARADEX_CHAIN_ID          optional; when set it must be the testnet's,
-                            PRIVATE_SN_POTC_SEPOLIA, by name or as its felt in decimal (as the
-                            Java library writes it) or 0x hex
+                            PRIVATE_SN_PARACLEAR_TESTNET (the starknet_chain_id of GET
+                            https://api.testnet.paradex.trade/v1/system/config), by name or as
+                            its felt in decimal (as the Java library writes it) or 0x hex
 
 Required confirmation and namespace:
   --sole-trader             you confirm that no other process, Java or Rust, trades this
@@ -70,10 +71,19 @@ Options:
   -h, --help                print this help
 
 The URLs must be exactly Paradex's testnet ones (above), or both a loopback stub's (host
-127.0.0.0/8, [::1] or localhost, any port, the path exactly /v1): whatever sits in a path is
-sent to the venue, so no other path is taken. Anything else, mainnet included, is refused, as
-is any chain id but PRIVATE_SN_POTC_SEPOLIA. A flag's value goes in the next argument, never
-after '='.
+an address in 127.0.0.0/8 or [::1], never a name such as localhost, which a resolver may map
+anywhere; any port; the path exactly /v1): whatever sits in a path is sent to the venue, so no
+other path is taken. Anything else, mainnet included, is refused, as is any chain id but
+PRIVATE_SN_PARACLEAR_TESTNET. A flag's value goes in the next argument, never after '='.
+
+A refused login: each refusal ends the order socket's connection (a NOTE says why: Paradex's
+HTTP status, error code and message), and after 3 in a row the run stops at once with
+NOTE login refused 3 times. The usual causes:
+  - a mainnet key on testnet: Paradex derives the account's L2 (Starknet) key per network, so
+    the testnet account's key differs from the mainnet one, as does its address;
+  - an Ethereum address in PARADEX_ACCOUNT_ADDRESS instead of the Paradex (Starknet) account
+    address the Paradex app shows;
+  - an account not onboarded on the testnet (log in to the testnet app once), or unfunded.
 
 Lines (each step with the milliseconds since the start):
   TESTNET ...        the hosts the guard accepted (never the URLs: a path may carry a token)
@@ -94,7 +104,9 @@ Lines (each step with the milliseconds since the start):
   STEP closed        the order event reporting the order cancelled, nothing of it filled
   STEP stop          kill switch on, cancel all sent for what is still open, session closed
   TIMEOUT <step>     the step did not happen in time; the sample Stops
-  NOTE ...           something worth knowing (an unexpected event, a refusal)
+  NOTE ...           something worth knowing (an unexpected event, a refusal, why a
+                     connection of the order socket ended)
+  NOTE login refused N times: ...  the last refusal; the run stops
   DONE ok|failed     the outcome; ok only when every step happened, every order of ours
                      on the market ended cancelled with nothing filled during the run, every
                      Stop cancel was sent and accepted, the inventory did not move, no fill
@@ -109,13 +121,18 @@ Ctrl-C aborts at once: the socket closes and Paradex's cancel-on-disconnect canc
 pub const TESTNET_REST: &str = "https://api.testnet.paradex.trade/v1";
 pub const TESTNET_WS: &str = "wss://ws.api.testnet.paradex.trade/v1";
 
-/// The testnet's Starknet chain id, the only one the guard admits.
-pub const TESTNET_CHAIN: &str = "PRIVATE_SN_POTC_SEPOLIA";
+/// The testnet's Starknet chain id, the only one the guard admits and the one the login signs
+/// for: the `starknet_chain_id` that GET https://api.testnet.paradex.trade/v1/system/config
+/// reports (2026-10-09). The Java library's `PRIVATE_SN_POTC_SEPOLIA` default is stale:
+/// signing for it fails every login with HTTP 401 `STARKNET_SIGNATURE_VERIFICATION_FAILED`
+/// (the owner's first runs). Reading it from the venue at start is FBC-g544.
+pub const TESTNET_CHAIN: &str = "PRIVATE_SN_PARACLEAR_TESTNET";
 
 /// [`TESTNET_CHAIN`]'s felt (its ASCII bytes as one big-endian number) in decimal, as the Java
 /// library writes `PARADEX_CHAIN_ID`, and in hex, lower case without `0x`.
-const TESTNET_CHAIN_DECIMAL: &str = "7693264728749915528729180568779831130134670232771119425";
-const TESTNET_CHAIN_HEX: &str = "505249564154455f534e5f504f54435f5345504f4c4941";
+const TESTNET_CHAIN_DECIMAL: &str =
+    "8458834024819506728615521019831122032732688838300959446835911345492";
+const TESTNET_CHAIN_HEX: &str = "505249564154455f534e5f50415241434c4541525f544553544e4554";
 
 /// Whether `chain` names the testnet's chain: [`TESTNET_CHAIN`] by name, or its felt in
 /// decimal or in `0x` hex (either case). Nothing else, not even another spelling of the felt.
@@ -452,10 +469,11 @@ struct Url<'a> {
 }
 
 impl Url<'_> {
-    /// Whether the host is a loopback one: a test stub on this machine.
+    /// Whether the host is a loopback address: a test stub on this machine. An address only,
+    /// in 127.0.0.0/8 or `[::1]`: a name (`localhost`) is resolved when the connector connects,
+    /// and a resolver may map it to another machine (Codex r4217903067).
     fn loopback(&self) -> bool {
-        self.host == "localhost"
-            || self.host == "[::1]"
+        self.host == "[::1]"
             || self
                 .host
                 .parse::<std::net::Ipv4Addr>()
@@ -569,6 +587,12 @@ fn socks5(value: &str) -> Result<ProxyConfig, String> {
     if !proxy_host(host) {
         return Err(bad());
     }
+    // A bracketed IPv6 address without its brackets: the connector resolves (host, port),
+    // which takes `::1` but not `[::1]` (Codex r4217903060).
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
     Ok(ProxyConfig::Socks5 {
         host: host.to_owned(),
         port,
