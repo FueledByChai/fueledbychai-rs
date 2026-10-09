@@ -7,7 +7,7 @@ use fbc_conformance::{Frame, HttpReply, HttpRoutes, ScriptError, Step, StubServe
 use fbc_runtime::http::{Bytes, Method, Request, StatusCode};
 use fbc_runtime::ws::Message;
 use fbc_runtime::{Connector, ProxyConfig};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -87,6 +87,42 @@ async fn a_silent_connection_stays_open_reading_nothing_until_the_stub_is_droppe
     // Dropping the stub closes the connection it held.
     drop(server);
     assert!(matches!(ws.next().await, None | Some(Err(_))));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_barrier_ends_only_once_the_client_has_read_past_every_frame_before_it() {
+    let server = stub(vec![
+        Step::Accept,
+        Step::Push {
+            conn: 0,
+            frame: Frame::text("reply"),
+        },
+        Step::Barrier { conn: 0 },
+    ])
+    .await;
+    let mut ws = connector().websocket(&server.ws_url("/oe")).await.unwrap();
+    // A pong the client volunteers, to no ping of the stub's, passes no barrier.
+    ws.send(Message::Pong(b"stray".to_vec().into()))
+        .await
+        .unwrap();
+    // Until the client reads, however long that takes, the barrier holds (FBC-3il).
+    settle().await;
+    assert!(server.finished().now_or_never().is_none());
+    assert_eq!(ws.next().await.unwrap().unwrap(), Message::text("reply"));
+    assert!(ws.next().await.unwrap().unwrap().is_ping());
+    // The pong the WebSocket layer queued goes out as the client flushes.
+    ws.flush().await.unwrap();
+    server.finished().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_barrier_on_a_connection_that_ends_before_its_pong_fails_the_script() {
+    let server = stub(vec![Step::Accept, Step::Barrier { conn: 0 }]).await;
+    let ws = connector().websocket(&server.ws_url("/oe")).await.unwrap();
+    settle().await;
+    drop(ws);
+    let err = server.finished().await.unwrap_err();
+    assert_eq!(err, ScriptError::Closed { step: 1, conn: 0 });
 }
 
 #[tokio::test(start_paused = true)]

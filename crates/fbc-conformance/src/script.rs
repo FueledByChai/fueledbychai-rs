@@ -41,6 +41,11 @@ pub enum Step {
     Close { conn: usize },
     /// Stop reading from and writing to `conn`, holding it open until the stub is dropped.
     Silent { conn: usize },
+    /// Send `conn` a ping and wait for the client's pong to it: an event, never a time, that
+    /// says the client has read every frame the stub sent before the ping. A client that hands
+    /// each frame it reads to its handler before it reads the next has handled them all
+    /// (FBC-3il: the frames of a reply reach the client however late the host delivers them).
+    Barrier { conn: usize },
 }
 
 /// What a responder computes from the frame it was handed: the frames to send, or why it

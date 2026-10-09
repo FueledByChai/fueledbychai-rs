@@ -182,6 +182,8 @@ enum Cmd {
     Push(Frame, oneshot::Sender<bool>),
     Close(oneshot::Sender<bool>),
     Silent(oneshot::Sender<bool>),
+    /// Ping the client; answered true once its pong to that ping arrives.
+    Ping(oneshot::Sender<bool>),
 }
 
 /// The player's handle on an upgraded connection.
@@ -251,12 +253,24 @@ async fn serve_ws(
     let (cmds, mut cmd_rx) = mpsc::unbounded_channel();
     let _ = ready.send(Some(Conn { frames, cmds }));
     let mut player = true;
+    // The ping a barrier waits on the pong to, by payload, and the barrier's answer.
+    let mut pinged: Option<(Vec<u8>, oneshot::Sender<bool>)> = None;
+    let mut pings: u64 = 0;
     loop {
         tokio::select! {
             msg = ws.next() => {
                 let frame = match msg {
                     Some(Ok(Message::Text(text))) => Frame::Text(text.as_str().to_owned()),
                     Some(Ok(Message::Binary(bytes))) => Frame::Binary(bytes.to_vec()),
+                    // The pong to the barrier's ping: the client has read past every frame
+                    // sent before it.
+                    Some(Ok(Message::Pong(payload))) => {
+                        let ours = pinged.as_ref().is_some_and(|(p, _)| *p == payload[..]);
+                        if let Some((_, sent)) = pinged.take_if(|_| ours) {
+                            let _ = sent.send(true);
+                        }
+                        continue;
+                    }
                     Some(Ok(_)) => continue,
                     _ => break,
                 };
@@ -283,6 +297,22 @@ async fn serve_ws(
                         _ = stop.changed() => break,
                     };
                     let _ = sent.send(ok);
+                }
+                Some(Cmd::Ping(sent)) => {
+                    pings += 1;
+                    let payload = format!("barrier-{pings}").into_bytes();
+                    let ok = tokio::select! {
+                        r = ws.send(Message::Ping(payload.clone().into())) => r.is_ok(),
+                        _ = stop.changed() => break,
+                    };
+                    // A ping that did not go is answered false at once; one that went, when
+                    // its pong arrives, or false (the sender dropped) when the connection ends
+                    // first.
+                    if ok {
+                        pinged = Some((payload, sent));
+                    } else {
+                        let _ = sent.send(false);
+                    }
                 }
                 Some(Cmd::Silent(sent)) => {
                     let _ = sent.send(true);
@@ -335,6 +365,14 @@ async fn play(
             Step::Close { conn } => {
                 let (handle, closed) = handle(&mut conns, step, conn)?;
                 if !done(handle, Cmd::Close).await {
+                    return Err(closed);
+                }
+            }
+            // The step ends once the client's pong arrives; a connection that ends first fails
+            // it (FBC-3il).
+            Step::Barrier { conn } => {
+                let (handle, closed) = handle(&mut conns, step, conn)?;
+                if !done(handle, Cmd::Ping).await {
                     return Err(closed);
                 }
             }

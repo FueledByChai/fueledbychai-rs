@@ -53,6 +53,13 @@ venue for the program's life (`ExecSessionConfig::venue` is `&'static dyn VenueF
   is not written where the stub reads a request. The clock moves by no more than the window,
   so a timer due just past it stays unfired. `amend_ack` is skipped where the caps allow no
   limit order good till cancelled, the only one that rests to be amended.
+- **The stub has answered when its barrier passes.** The stub's script ends with a ping on the
+  session's connection (`Step::Barrier`, added to the 0025 steps) and ends only when the pong to
+  it arrives: the session hands each frame it reads to its handler before it reads the next, so
+  by then it has handled every frame of the answers, however late the host delivered them. A
+  check waits for that event, never for a count of turns (on a loaded CI runner the answers
+  reached the session after the turns had run, and an early `Unknown` went unseen). The pong is
+  charged to the session's buckets as a control frame, as a venue's own ping's would be.
 - Until the check first moves the clock after the stub has answered, no deadline has passed: an
   outcome for an unanswered request (or item) by then was reported before its deadline and fails
   the check.
