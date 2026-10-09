@@ -444,6 +444,16 @@ fn respond_full(
                 let mut events = Vec::new();
                 for (i, id) in ids.iter().enumerate() {
                     let vid = id.as_str().unwrap_or("");
+                    if vid == VID {
+                        // The placed order, Safety-cancelled after a reconnect (decision 0080).
+                        let p = placed.lock().unwrap();
+                        let status = "QUEUED_FOR_CANCELLATION";
+                        results.push(json!({"id": vid, "market": MARKET, "status": status}));
+                        let closed =
+                            order_ended(placed_end, 1, 5_001, VID, &p.cid, &p.price, &p.size);
+                        events.push(Frame::Binary(closed));
+                        continue;
+                    }
                     let ours = restored
                         .iter()
                         .find(|r| r.vid == vid)
@@ -541,12 +551,15 @@ fn restored_as(
 }
 
 /// The script of a run that finds orders of ours an earlier run left on the market: the
-/// opening (auth, four subscriptions, the arm), then Stop's batch cancel of the restored
-/// orders, ended as `end` says. Nothing is placed while they rest (decision 0080).
+/// opening (auth, four subscriptions, the arm), then the Safety batch cancel of the restored
+/// orders sent as the connection opens (decision 0080), ended as `end` says. Nothing is placed
+/// beside them. With [`End::Refused`] they are not shown ended, so Stop's batch cancel of them
+/// follows, answered the same way.
 fn restored_script(placed: Arc<Mutex<Placed>>, restored: Vec<Restored>, end: End) -> WsScript {
     let with = responder_with(placed, Arc::new(restored), End::Canceled, end);
+    let frames = if matches!(end, End::Refused) { 8 } else { 7 };
     let mut steps = vec![Step::Accept];
-    steps.extend((0..7).map(|_| Step::Respond {
+    steps.extend((0..frames).map(|_| Step::Respond {
         conn: 0,
         with: with.clone(),
     }));
@@ -661,7 +674,7 @@ async fn testnet_trade_places_one_post_only_order_and_cancels_it_against_the_stu
     assert_eq!(create["params"]["price"], "60140.1");
     assert_eq!(create["params"]["size"], "0.00018");
     // The resting cap is in lots at the order's price ($20 at 60140.1: 33 lots), where it
-    // rests; the inventory cap at the higher of that price and the ask ($50 at 62000.5: 80
+    // rests; the inventory cap at the highest of that price, the bid and the ask ($50 at 62000.5: 80
     // lots, not the 83 at the order's price), so a position is never worth more than the cap
     // at the market.
     assert!(
@@ -1189,11 +1202,14 @@ fn the_resync_the_run_seeds_from_is_the_latest() {
 }
 
 #[tokio::test]
-async fn an_earlier_runs_orders_hold_the_market_so_nothing_is_placed_and_stop_cancels_them() {
-    // Two sells an earlier run left resting: the session takes no place on their market until
-    // they end, since this connection's cancel-on-disconnect may not cover them (decision
-    // 0080, on main since FBC-nvxn). The run places nothing, says why, and Stop cancels both
-    // and waits for them to end; a run after that places.
+async fn an_earlier_runs_orders_are_safety_cancelled_as_the_connection_opens_and_nothing_is_placed()
+{
+    // Two sells an earlier run left resting: this connection's cancel-on-disconnect may not
+    // cover them, so the session tells them unprotected and takes no place on their market
+    // until they end (decision 0080). Codex r4226246463: the run cancels both at once, a
+    // Safety cancel built and authorized by fbc-oms, not at Stop; it places nothing beside
+    // them, waits for them to end, and Stop finds nothing left to cancel. A run after that
+    // places.
     let (orders, body) = restored();
     let placed = Arc::new(Mutex::new(Placed::default()));
     let stub = StubServer::start(
@@ -1212,9 +1228,17 @@ async fn an_earlier_runs_orders_hold_the_market_so_nothing_is_placed_and_stop_ca
     );
     assert!(
         printed.contains(
+            "NOTE 2 orders of ours rest from an earlier connection or run, which this \
+             connection's cancel-on-disconnect may not cover (decision 0080): Safety cancel \
+             requests [2] sent for them at once\n"
+        ),
+        "{printed}"
+    );
+    assert!(
+        printed.contains(
             "2 orders of ours an earlier run left rest on the market, where this connection's \
-             cancel-on-disconnect may not cover them, so the session takes no place on it until \
-             they end (decision 0080); Stop cancels them, then run again; nothing placed"
+             cancel-on-disconnect may not cover them: Safety-cancelled as it opened (decision \
+             0080), and shown ended; nothing placed, run again"
         ),
         "{printed}"
     );
@@ -1223,7 +1247,8 @@ async fn an_earlier_runs_orders_hold_the_market_so_nothing_is_placed_and_stop_ca
         ["login", "arm", "resync", "start", "stop"],
         "{printed}"
     );
-    assert!(printed.contains("cancel all: 1 cancels sent"), "{printed}");
+    // Stop found them ended: its cancel-all sent nothing.
+    assert!(printed.contains("cancel all: 0 cancels sent"), "{printed}");
     assert!(!printed.contains("did not end cancelled"), "{printed}");
     assert_eq!(
         (report.places_sent, report.cancels_sent),
@@ -1252,13 +1277,127 @@ async fn a_batch_cancel_with_an_item_refused_and_no_order_event_fails_the_stop()
     opts.step_timeout_secs = 1;
     let (report, printed) = run_against(&opts).await;
     stub.finished().await.unwrap();
-    // Nothing was placed (the restored orders hold the market, decision 0080), and Stop did not
-    // cancel what it found: the second item is refused, so the batch is not accepted on its
-    // first item alone, and no order event reports either ended.
+    // The Safety batch cancel's second item is refused and no order event reports either
+    // ended, so the market stays held (decision 0080): nothing was placed, and Stop cancels
+    // them again. Its batch is not accepted on its first item alone.
     assert!(!report.ok, "{printed}");
+    assert!(
+        printed.contains("not shown ended within the step timeout, so Stop cancels them"),
+        "{printed}"
+    );
     assert!(printed.contains("came back Rejected"), "{printed}");
     assert!(printed.contains("TIMEOUT stop"), "{printed}");
     assert!(printed.contains("DONE failed"), "{printed}");
+}
+
+#[tokio::test]
+async fn the_runs_order_resting_after_a_reconnect_is_safety_cancelled_at_once_as_its_round_trips_cancel()
+ {
+    // Codex r4226246463: the connection drops after the place's ack, and the next one's resync
+    // shows the order resting, where that connection's cancel-on-disconnect may not cover it
+    // (decision 0080). The link Safety-cancels it as the connection opens, not when the
+    // 30 s hold ends, and the run takes that cancel as the round trip's: one place, one
+    // cancel.
+    let placed = Arc::new(Mutex::new(Placed::default()));
+    let with = responder(Arc::clone(&placed));
+    // Auth, four subscriptions, the arm and the place; then, on the next connection, auth,
+    // four subscriptions, the arm and the Safety batch cancel.
+    let mut script = vec![Step::Accept];
+    script.extend((0..7).map(|_| Step::Respond {
+        conn: 0,
+        with: with.clone(),
+    }));
+    script.extend([Step::Close { conn: 0 }, Step::Accept]);
+    script.extend((0..7).map(|_| Step::Respond {
+        conn: 1,
+        with: with.clone(),
+    }));
+    // `GET /orders`: none before the place; the placed order resting after it.
+    let shown = Arc::clone(&placed);
+    let book = fs::read(fixture("paradex/rest/orderbook-btc-2002.json")).unwrap();
+    let empty = r#"{"results":[]}"#;
+    let routes = HttpRouter::new()
+        .route(
+            Method::POST,
+            PathPattern::exact("/v1/auth"),
+            reply(200, format!(r#"{{"jwt_token":"{TOKEN}"}}"#)),
+        )
+        .route(
+            Method::GET,
+            PathPattern::exact(&format!("/v1/orderbook/{MARKET}")),
+            reply(200, book),
+        )
+        .route_fn(Method::GET, PathPattern::exact("/v1/orders"), move |_| {
+            let p = shown.lock().unwrap();
+            if p.cid.is_empty() {
+                return reply(200, empty);
+            }
+            let row = json!({
+                "id": VID, "client_id": p.cid, "market": MARKET, "side": "BUY",
+                "type": "LIMIT", "instruction": "POST_ONLY", "price": p.price,
+                "size": p.size, "remaining_size": p.size, "status": "OPEN", "flags": [],
+            });
+            reply(200, json!({ "results": [row] }).to_string())
+        })
+        .route(
+            Method::GET,
+            PathPattern::exact("/v1/positions"),
+            reply(200, empty),
+        );
+    let stub = StubServer::start(WsScript::new(script), routes)
+        .await
+        .unwrap();
+    let mut opts = options(&stub, "10");
+    opts.hold_secs = 30;
+    let started = std::time::Instant::now();
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(report.ok, "{printed}");
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the hold was not ended by the Safety cancel: {printed}"
+    );
+    assert!(
+        printed.contains(
+            "NOTE 1 orders of ours rest from an earlier connection or run, which this \
+             connection's cancel-on-disconnect may not cover (decision 0080): Safety cancel \
+             requests ["
+        ),
+        "{printed}"
+    );
+    assert!(
+        printed.contains(
+            "the Safety cancel sent when a reconnect's resync showed the order resting \
+             (decision 0080)"
+        ),
+        "{printed}"
+    );
+    assert_eq!(
+        steps(&printed),
+        [
+            "login",
+            "arm",
+            "resync",
+            "start",
+            "place",
+            "ack",
+            "cancel",
+            "cancel-ack",
+            "closed",
+            "stop"
+        ],
+        "{printed}"
+    );
+    assert_eq!(
+        (report.places_sent, report.cancels_sent),
+        (1, 1),
+        "{printed}"
+    );
+    let sent = methods(&stub);
+    let count = |m: &str| sent.iter().filter(|s| s.as_str() == m).count();
+    assert_eq!(count("order.create"), 1, "{sent:?}");
+    assert_eq!(count("order.cancel_batch"), 1, "{sent:?}");
+    assert_eq!(count("order.cancel"), 0, "{sent:?}");
 }
 
 #[test]
@@ -1361,16 +1500,10 @@ async fn an_order_cancelled_after_a_partial_fill_fails_the_run() {
 }
 
 #[tokio::test]
-async fn stop_fails_when_an_earlier_runs_orders_fill_instead_of_cancelling() {
+async fn an_earlier_runs_orders_that_fill_instead_of_cancelling_fail_the_run() {
     for (end, said) in [
-        (
-            End::Filled,
-            "a Stop cancel's order ended without being cancelled: Filled",
-        ),
-        (
-            End::PartlyFilled,
-            "a Stop cancel's order was cancelled after 1 lots of it filled",
-        ),
+        (End::Filled, "Terminal(Filled)"),
+        (End::PartlyFilled, "an order of ours traded during the run"),
     ] {
         let (orders, body) = restored();
         let placed = Arc::new(Mutex::new(Placed::default()));
@@ -1384,7 +1517,7 @@ async fn stop_fails_when_an_earlier_runs_orders_fill_instead_of_cancelling() {
         let (report, printed) = run_against(&opts).await;
         stub.finished().await.unwrap();
         // Nothing was placed (they held the market), and both restored orders ended, but not
-        // by the cancel alone: Stop did not cancel them untouched.
+        // by their Safety cancel alone: a fill came first.
         assert!(printed.contains("nothing placed"), "{printed}");
         assert!(!report.ok, "{printed}");
         assert_eq!(printed.matches(said).count(), 2, "{printed}");
@@ -1564,6 +1697,11 @@ async fn orders_under_another_namespace_than_the_one_allocated_refuse_the_run_be
 /// printed and the methods it sent.
 async fn run_with_second_book(second: String) -> (trade::Report, String, Vec<String>) {
     let book = fs::read_to_string(fixture("paradex/rest/orderbook-btc-2002.json")).unwrap();
+    run_with_books(book, second).await
+}
+
+/// As [`run_with_second_book`], the first read answering `book`.
+async fn run_with_books(book: String, second: String) -> (trade::Report, String, Vec<String>) {
     let reads = Arc::new(AtomicU64::new(0));
     let empty = r#"{"results":[]}"#;
     let routes = HttpRouter::new()
@@ -1608,6 +1746,32 @@ async fn run_with_second_book(second: String) -> (trade::Report, String, Vec<Str
     stub.finished().await.unwrap();
     let sent = methods(&stub);
     (report, printed, sent)
+}
+
+#[tokio::test]
+async fn a_bid_that_rose_past_the_inventory_cap_on_a_book_with_no_asks_stops_the_run() {
+    // Codex r4226246459: with no ask resting, the inventory cap is at the bid, not at the buy's
+    // own price below it. The first read gives $50 as 80 lots at the bid of 62000.2; by the
+    // second the bid rose to 63000.2 (the buy at 60140.1 is still more than 300 bps behind
+    // it), and $50 is now 79 lots there, fewer than the caps hold.
+    let first = String::from_utf8(one_sided("asks")).unwrap();
+    let mut rose: Value = serde_json::from_str(&first).unwrap();
+    rose["bids"] = json!([["63000.2", "0.333"]]);
+    rose["best_bid_api"] = json!(["63000.2", "0.333"]);
+    rose["best_bid_interactive"] = json!(["63000.2", "0.333"]);
+    rose["seq_no"] = json!(2003);
+    let (report, printed, sent) = run_with_books(first, rose.to_string()).await;
+    assert!(!report.ok, "{printed}");
+    assert!(
+        printed.contains("caps: resting 33 lots per side, inventory 80 lots"),
+        "{printed}"
+    );
+    assert!(
+        printed.contains("the inventory cap of $50 is now 79 lots at 63000.2"),
+        "{printed}"
+    );
+    assert!(printed.contains("nothing placed"), "{printed}");
+    assert!(!sent.iter().any(|m| m == "order.create"));
 }
 
 #[tokio::test]
@@ -1756,11 +1920,11 @@ fn the_output_writer_never_waits_for_a_stalled_sink() {
 }
 
 #[tokio::test]
-async fn an_earlier_runs_order_filled_in_part_before_the_run_and_cancelled_by_stop_is_not_this_runs_fill()
+async fn an_earlier_runs_order_filled_in_part_before_the_run_and_safety_cancelled_is_not_this_runs_fill()
  {
-    // Each restored order is 2 lots with 1 filled before this run: Stop cancels the open lot,
-    // and the fill from before is not this run's. The run itself places nothing (the restored
-    // orders hold the market, decision 0080), so it fails for that alone.
+    // Each restored order is 2 lots with 1 filled before this run: its Safety cancel (decision
+    // 0080) cancels the open lot, and the fill from before is not this run's. The run itself
+    // places nothing beside them, so it fails for that alone.
     let (orders, body) = restored_sized("0.00002", "0.00001");
     let placed = Arc::new(Mutex::new(Placed::default()));
     let stub = StubServer::start(
@@ -1774,7 +1938,7 @@ async fn an_earlier_runs_order_filled_in_part_before_the_run_and_cancelled_by_st
     stub.finished().await.unwrap();
     assert!(!report.ok, "{printed}");
     assert!(printed.contains("(decision 0080)"), "{printed}");
-    assert!(printed.contains("cancel all: 1 cancels sent"), "{printed}");
+    assert!(printed.contains("cancel all: 0 cancels sent"), "{printed}");
     assert!(!printed.contains("filled during the run"), "{printed}");
     assert!(!printed.contains("traded during the run"), "{printed}");
     assert!(!printed.contains("did not end cancelled"), "{printed}");
@@ -2161,7 +2325,7 @@ async fn an_ask_that_rose_past_the_inventory_cap_before_the_place_stops_the_run_
     let (report, printed, sent) = run_with_second_book(rose.to_string()).await;
     assert!(!report.ok, "{printed}");
     assert!(
-        printed.contains("the inventory cap of $50 is now 79 lots at the ask of 63000.5"),
+        printed.contains("the inventory cap of $50 is now 79 lots at 63000.5"),
         "{printed}"
     );
     assert!(printed.contains("nothing placed"), "{printed}");
@@ -2241,8 +2405,9 @@ async fn an_order_of_ours_resting_on_the_orders_side_refuses_the_place() {
     // to lots at the new order's price only. Two restored buys of 9 lots each at 62000, near
     // the touch, and the new buy of 22 lots at 49600.1 (2000 bps behind the bid of 62000.2)
     // make 40 lots, the $20 cap's 40 at 49600.1, so the registry admits them, yet $22.07 would
-    // rest. The run refuses to place while an order of ours rests on the order's side, and Stop
-    // cancels the restored ones.
+    // rest. The restored ones are Safety-cancelled as the connection opens (decision 0080) and
+    // the run places nothing beside them; were one still resting at the place, the same-side
+    // refusal would hold it back (`place_refusal`, tested on its own).
     let (orders, body) = restored_as(1, "62000", "0.00009", "0.00009");
     let placed = Arc::new(Mutex::new(Placed::default()));
     let with = responder_with(
@@ -2251,7 +2416,7 @@ async fn an_order_of_ours_resting_on_the_orders_side_refuses_the_place() {
         End::Canceled,
         End::Canceled,
     );
-    // Auth, four subscriptions, the arm and Stop's batch cancel of the restored orders.
+    // Auth, four subscriptions, the arm and the Safety batch cancel of the restored orders.
     let mut script = vec![Step::Accept];
     script.extend((0..7).map(|_| Step::Respond {
         conn: 0,
@@ -2266,13 +2431,12 @@ async fn an_order_of_ours_resting_on_the_orders_side_refuses_the_place() {
     stub.finished().await.unwrap();
     assert!(!report.ok, "{printed}");
     assert!(
-        printed.contains(
-            "2 orders of ours (18 lots) rest on the order's side: the resting cap is counted \
-             in lots at the order's price, not theirs; cancel them first; nothing placed"
-        ),
+        printed.contains("Safety-cancelled as it opened (decision 0080), and shown ended"),
         "{printed}"
     );
-    // Stop's one batch cancel ended both restored orders.
+    assert!(printed.contains("nothing placed"), "{printed}");
+    // The one Safety batch cancel ended both restored orders; Stop sent none.
+    assert!(printed.contains("cancel all: 0 cancels sent"), "{printed}");
     assert_eq!(
         (report.places_sent, report.cancels_sent),
         (0, 1),
@@ -2531,7 +2695,7 @@ fn nothing_is_placed_while_the_current_connections_gate_is_closed() {
     assert!(
         trade::place_refusal(true, 2, &[], &[])
             .unwrap()
-            .starts_with("2 orders of ours an earlier run left rest on the market")
+            .starts_with("2 orders of ours rest on the market from an earlier connection")
     );
     assert_eq!(trade::place_refusal(true, 0, &[], &[]), None);
 }
@@ -3174,7 +3338,9 @@ fn one_sided(side: &str) -> Vec<u8> {
 fn a_buy_needs_only_the_bid_side_and_a_sell_only_the_ask_side() {
     // The owner's testnet BTC and ETH books have bids but no asks (2026-10-09). A buy rests
     // behind the best bid and a sell behind the best ask: the other side is not needed, and
-    // the inventory cap is then at the order's price.
+    // the inventory cap is then at the higher of the order's price and the bid (Codex
+    // r4226246459: a buy's own price is below the bid, so a position would be worth more than
+    // the cap at the market).
     let opts_on = |side: OrderSide| {
         let Ok(Parsed::Trade(mut opts)) = args::parse(strings(&MARKET_ARGS)) else {
             panic!("the market flags parse");
@@ -3193,13 +3359,14 @@ fn a_buy_needs_only_the_bid_side_and_a_sell_only_the_ask_side() {
     };
     let buy = opts_on(OrderSide::Buy);
     let priced = trade::price(&buy, &book_of(one_sided("asks"), &buy)).unwrap();
-    // 3% under the best bid of 62000.2, floored onto the tick; $50 at that price is 83 lots.
+    // 3% under the best bid of 62000.2, floored onto the tick; $50 at the bid is 80 lots, not
+    // the 83 it is at the order's price.
     assert_eq!(priced.px, Decimal::from_str("60140.1").unwrap());
     assert_eq!(
         (priced.bid, priced.ask),
         (Some(Decimal::from_str("62000.2").unwrap()), None)
     );
-    assert_eq!(priced.inventory.get(), 83);
+    assert_eq!(priced.inventory.get(), 80);
     let sell = opts_on(OrderSide::Sell);
     let priced = trade::price(&sell, &book_of(one_sided("bids"), &sell)).unwrap();
     // 3% over the best ask of 62000.5, ceiled onto the tick.
@@ -3238,9 +3405,9 @@ async fn a_buy_on_a_book_with_no_asks_places_and_cancels_as_on_a_full_book() {
         printed.contains("BBO again bid 62000.2 ask none"),
         "{printed}"
     );
-    // The inventory cap at the order's price: $50 at 60140.1 is 83 lots.
+    // The inventory cap at the bid, above the order's price: $50 at 62000.2 is 80 lots.
     assert!(
-        printed.contains("caps: resting 33 lots per side, inventory 83 lots"),
+        printed.contains("caps: resting 33 lots per side, inventory 80 lots"),
         "{printed}"
     );
     assert_eq!(
@@ -3248,6 +3415,49 @@ async fn a_buy_on_a_book_with_no_asks_places_and_cancels_as_on_a_full_book() {
         (1, 1),
         "{printed}"
     );
+}
+
+#[test]
+fn the_inventory_cap_is_at_the_highest_of_the_orders_price_and_the_touch() {
+    let d = |v: &str| Decimal::from_str(v).unwrap();
+    // A buy below a bid with no ask: the bid (Codex r4226246459).
+    assert_eq!(
+        trade::inventory_price(d("104.5"), Some(d("110")), None),
+        d("110")
+    );
+    // A buy on a full book: the ask.
+    assert_eq!(
+        trade::inventory_price(d("104.5"), Some(d("110")), Some(d("110.1"))),
+        d("110.1")
+    );
+    // A sell above the ask, with or without a bid: its own price.
+    assert_eq!(
+        trade::inventory_price(d("115.6"), None, Some(d("110.1"))),
+        d("115.6")
+    );
+    assert_eq!(
+        trade::inventory_price(d("115.6"), Some(d("110")), Some(d("110.1"))),
+        d("115.6")
+    );
+}
+
+#[test]
+fn the_default_lease_directory_is_under_an_absolute_home_only() {
+    // Codex r4226246468: a relative HOME would put the leases and the client-id mark under
+    // the directory the run starts in, so two runs started in different directories would
+    // not exclude each other. It is refused, as a relative --lease-dir is.
+    assert_eq!(
+        args::lease_dir_under(Some("/home/trader".into())),
+        Ok(PathBuf::from("/home/trader/.fueledbychai/testnet_trade"))
+    );
+    for home in [Some("home/trader".into()), Some("".into()), None] {
+        let err = args::lease_dir_under(home).unwrap_err();
+        assert!(err.contains("give --lease-dir"), "{err}");
+    }
+    let err = args::lease_dir_under(Some("trader".into())).unwrap_err();
+    assert!(err.contains("not an absolute path"), "{err}");
+    // The value itself is never shown.
+    assert!(!err.contains("trader"), "{err}");
 }
 
 #[test]

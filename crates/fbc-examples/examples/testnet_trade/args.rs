@@ -328,13 +328,23 @@ fn flag_name(arg: &str) -> Option<&str> {
     shaped.then_some(name)
 }
 
-/// `$HOME/.fueledbychai/testnet_trade`: durable, so the client-id high-water mark kept there
-/// outlives a reboot or a temporary-directory cleanup.
+/// `$HOME/.fueledbychai/testnet_trade` ([`lease_dir_under`]).
 fn default_lease_dir() -> Result<PathBuf, String> {
-    match std::env::var_os("HOME") {
-        Some(home) if !home.is_empty() => Ok(PathBuf::from(home)
-            .join(".fueledbychai")
-            .join("testnet_trade")),
+    lease_dir_under(std::env::var_os("HOME"))
+}
+
+/// `<home>/.fueledbychai/testnet_trade`: durable, so the client-id high-water mark kept there
+/// outlives a reboot or a temporary-directory cleanup. Refused when `home` is unset, empty or
+/// relative: a relative one would put the leases under the directory the run starts in, so two
+/// runs started in different directories would not exclude each other (Codex r4226246468 on
+/// PR #114). Its value is never shown.
+pub fn lease_dir_under(home: Option<std::ffi::OsString>) -> Result<PathBuf, String> {
+    match home.map(PathBuf::from) {
+        Some(home) if home.is_absolute() => Ok(home.join(".fueledbychai").join("testnet_trade")),
+        Some(home) if !home.as_os_str().is_empty() => Err(format!(
+            "HOME is not an absolute path{UNSHOWN}: give --lease-dir, a directory kept across \
+             reboots"
+        )),
         _ => Err("HOME is not set: give --lease-dir, a directory kept across reboots".to_owned()),
     }
 }
