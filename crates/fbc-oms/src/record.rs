@@ -249,6 +249,10 @@ pub struct OrderRecord {
     /// The wire quantity of the amend in flight when it states the remaining quantity
     /// ([`AmendQty::Remaining`](fbc_core::AmendQty::Remaining)); `None` for an amend stating the total, or no amend.
     intent_wire: Option<Lots>,
+    /// The command in flight's fate is answered though it stays in flight (a cancel or amend
+    /// the venue does not know, an amend accepted for good): replaced, it is not awaited
+    /// (Codex r4228627001 on PR #146).
+    intent_answered: bool,
     /// The largest cumulative fill an amended update applied to the record stated: a later
     /// delivery of one of them (a duplicate or a delayed one) states no more, so only an
     /// amended update stating more is surely new (FBC-w5n, RA102-1 and RB-w5n-1 on PR #102).
@@ -324,6 +328,7 @@ impl OrderRecord {
             state: OrdState::PendingNew,
             intent: Intent::None,
             intent_wire: None,
+            intent_answered: false,
             amended_cum: None,
             last_key: None,
             unknown_since: None,
@@ -757,7 +762,7 @@ impl OrderRecord {
         };
         // Replaced in flight while the order is on the ladder, the command may still land:
         // its fate is the ladder's to settle (FBC-tjey; Codex r4228419870 on PR #146).
-        if self.unknown_since.is_some() {
+        if self.unknown_since.is_some() && !self.intent_answered {
             match self.intent {
                 Intent::PendingAmend { rpc, .. } => self.await_answer(rpc, Fate::Amend),
                 Intent::PendingCancel { rpc, .. } => self.await_answer(rpc, Fate::Cancel),
@@ -782,6 +787,7 @@ impl OrderRecord {
         }
         self.intent = intent;
         self.intent_wire = sent.and_then(|b| b.wire);
+        self.intent_answered = false;
         true
     }
 
@@ -802,6 +808,7 @@ impl OrderRecord {
     fn clear_intent(&mut self) {
         self.intent = Intent::None;
         self.intent_wire = None;
+        self.intent_answered = false;
     }
 
     /// Applies one venue order update arriving under `key`.
@@ -996,6 +1003,9 @@ impl OrderRecord {
             };
             if answered {
                 self.unanswered.retain(|(t, _)| *t != rpc);
+                if self.answers_intent(op) {
+                    self.intent_answered = true;
+                }
             }
         }
         if let OrderOp::Cancel(rpc) = op

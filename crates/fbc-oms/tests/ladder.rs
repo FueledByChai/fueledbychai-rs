@@ -2208,3 +2208,46 @@ fn a_command_replaced_on_the_ladder_holds_the_order_until_answered_or_settled_by
     assert_eq!(applied.resolved, vec![(c, OrdState::Open)]);
     assert!(reg.live(c).is_ok());
 }
+
+#[test]
+fn a_command_answered_while_still_in_flight_is_not_awaited_once_replaced() {
+    // Codex r4228627001 on PR #146: a cancel the venue does not know (NotFound) changed
+    // nothing, and an amend accepted for good removed nothing, though each stays the command
+    // in flight; replaced by a safety cancel that is refused, neither holds the order on the
+    // ladder.
+    for amend in [false, true] {
+        let case = format!("amend {amend}");
+        let mut reg = Registry::new();
+        let c = open(&mut reg, "x1");
+        let (op, answer) = if amend {
+            reg.amend_sent(c, Ticks(100), lots(10), RpcId(50), at(10))
+                .unwrap();
+            (OrderOp::Amend(RpcId(50)), accepted())
+        } else {
+            reg.cancel_sent(c, RpcId(50), at(10)).unwrap();
+            (OrderOp::Cancel(RpcId(50)), refused(RejectKind::NotFound))
+        };
+        // On the ladder: the amend by its timeout, the cancel by the venue not knowing it.
+        if amend {
+            assert_eq!(reg.ladder(&cfg(), &caps(), at(110)).escalated, vec![c]);
+        }
+        reg.on_outcome(c, op, &item(Some(c), None), &answer, at(111))
+            .unwrap();
+        let rec = reg.get(c).unwrap();
+        assert!(rec.unknown_since().is_some(), "{case}");
+        assert_ne!(rec.intent(), Intent::None, "{case}");
+        reg.cancel_sent(c, RpcId(4), at(120)).unwrap();
+        reg.on_outcome(
+            c,
+            OrderOp::Cancel(RpcId(4)),
+            &item(Some(c), None),
+            &refused(RejectKind::Other),
+            at(121),
+        )
+        .unwrap();
+        let shown = [snap(Some(c), "x1", VenueOrderState::Open, 0)];
+        let applied = reg.on_resync(&cfg(), &caps(), wall(2_000), &shown, key(1));
+        assert_eq!(applied.resolved, vec![(c, OrdState::Open)], "{case}");
+        assert!(reg.live(c).is_ok(), "{case}");
+    }
+}
