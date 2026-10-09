@@ -36,9 +36,10 @@
 //!   whose text names the HTTP status and Paradex's error code and message, or how the request
 //!   failed when no answer came, and whose `venue_code` is Paradex's code (FBC-3f8z, from the
 //!   owner's first testnet run, which stopped on a refused login with nothing saying why). Of
-//!   the answer it shows only the code, when that is a plain identifier, and the message, every
-//!   word of it long enough to hold an echoed account, key, signature or token withheld; a body
-//!   that is not Paradex's error is never shown. A refresh that gives no token is not reported:
+//!   the answer it shows only the code, when that is a plain identifier, and the message as one
+//!   line of printable ASCII, every word of it that could hold an echoed account or signature
+//!   (any word with a digit, a run of hex digits, a long word) withheld; a body that is not
+//!   Paradex's error is never shown. A refresh that gives no token is not reported:
 //!   its connection stays as it is. A login that cannot be signed asks for the reconnect alone,
 //!   since `on_open` has no sink.
 //! - **Decoding.** Binary frames are the SBE templates of schema 1:2 (0054): `OrderEvent`,
@@ -400,9 +401,10 @@ fn reject(error: &Value) -> Reject {
 }
 
 /// The longest word of the venue's text a login refusal shows: a longer one could hold a
-/// credential the venue echoed (an account, a key or a signature's number is 16 digits or more,
-/// a session token longer still), so it is withheld.
+/// credential the venue echoed (a session token, say), so it is withheld.
 const LONGEST_SHOWN_WORD: usize = 15;
+/// The shortest run of hex digits withheld though it holds no decimal digit.
+const SHORTEST_HEX_WITHHELD: usize = 6;
 /// The most characters of the venue's message a login refusal shows.
 const MOST_SHOWN: usize = 200;
 /// The longest error code a login refusal shows.
@@ -471,23 +473,39 @@ fn venue_error(body: &[u8]) -> Option<(Option<String>, Option<String>)> {
 }
 
 /// `code` when it is a plain identifier: a letter, then letters, digits and `_`, at most
-/// [`LONGEST_CODE`] long, no run between underscores longer than [`LONGEST_SHOWN_WORD`] (so
-/// never a key or an account in hex).
+/// [`LONGEST_CODE`] long, no run between underscores [`withheld`] (so never a field element in
+/// hex or decimal).
 fn plain_code(code: &str) -> Option<String> {
     let plain = code.len() <= LONGEST_CODE
         && code.starts_with(|c: char| c.is_ascii_alphabetic())
         && code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        && code.split('_').all(|run| run.len() <= LONGEST_SHOWN_WORD);
+        && !code.split('_').any(withheld);
     plain.then(|| code.to_owned())
 }
 
-/// The venue's `text` as a login refusal shows it: a control character becomes a space, every
-/// word (a run between spaces and JSON or list punctuation) longer than [`LONGEST_SHOWN_WORD`]
-/// becomes `<withheld>`, and the result is cut at [`MOST_SHOWN`] characters, `...` marking the
-/// cut.
+/// Whether a login refusal withholds `word` of the venue's text (Codex r4225701545,
+/// r4225701546): when it holds a decimal digit, as every field element the login carries does
+/// however short (the account is `0x` and hex, the signature's numbers decimal or `0x` and
+/// hex); when it is a run of [`SHORTEST_HEX_WITHHELD`] or more hex digits, which a field element
+/// printed without its `0x` can be with no decimal digit; when it is longer than
+/// [`LONGEST_SHOWN_WORD`]; and when it holds anything but printable ASCII, so no format control
+/// (a bidi override, a zero-width space) reaches the text. The key and the session token are
+/// never in the login request, so the venue has neither to echo.
+fn withheld(word: &str) -> bool {
+    word.len() > LONGEST_SHOWN_WORD
+        || word
+            .bytes()
+            .any(|b| b.is_ascii_digit() || !b.is_ascii_graphic())
+        || (word.len() >= SHORTEST_HEX_WITHHELD && word.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// The venue's `text` as a login refusal shows it, one line of printable ASCII: every
+/// whitespace or control character (a Unicode line or paragraph separator included) becomes a
+/// space, every word (a run between those and JSON or list punctuation) [`withheld`] becomes
+/// `<withheld>`, and the result is cut at [`MOST_SHOWN`] characters, `...` marking the cut.
 fn shown(text: &str) -> String {
     fn flush(word: &mut String, out: &mut String) {
-        if word.chars().count() > LONGEST_SHOWN_WORD {
+        if withheld(word) {
             out.push_str("<withheld>");
         } else {
             out.push_str(word);
@@ -496,29 +514,29 @@ fn shown(text: &str) -> String {
     }
     let (mut out, mut word) = (String::new(), String::new());
     for c in text.chars() {
-        let separates = c.is_whitespace()
-            || c.is_control()
-            || matches!(
-                c,
-                ',' | ';'
-                    | ':'
-                    | '"'
-                    | '\''
-                    | '`'
-                    | '('
-                    | ')'
-                    | '['
-                    | ']'
-                    | '{'
-                    | '}'
-                    | '<'
-                    | '>'
-                    | '='
-                    | '|'
-            );
-        if separates {
+        if c.is_whitespace() || c.is_control() {
             flush(&mut word, &mut out);
-            out.push(if c.is_control() { ' ' } else { c });
+            out.push(' ');
+        } else if matches!(
+            c,
+            ',' | ';'
+                | ':'
+                | '"'
+                | '\''
+                | '`'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '<'
+                | '>'
+                | '='
+                | '|'
+        ) {
+            flush(&mut word, &mut out);
+            out.push(c);
         } else {
             word.push(c);
         }
