@@ -21,9 +21,9 @@ mod toy_setup;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use fbc_conformance::Frame;
 use fbc_conformance::suite::{self, Failure, Replier, Setup, Subject, Verdict};
 use fbc_conformance::toy::{self, EXEC_STREAM, ToyFactory};
+use fbc_conformance::{Frame, HttpReply, HttpRequest, HttpRouter, PathPattern};
 use fbc_core::{
     AccountSummary, AckLevel, AmendAck, AssetKey, ConfigError, CtxCall, DecodeError, DecodeScope,
     Effect, Effects, EncodeCtx, EncodeReceipt, EndpointPlan, ExecCodec, ExecEndpoint, ExecEvent,
@@ -160,6 +160,13 @@ enum Twist {
     /// As [`Twist::ProvisionalThenRiskReject`], the reject naming the order's venue id beside a
     /// stranger's client id (Codex r4226156929).
     RiskRejectNamingTwoOrders,
+    /// On every connection after the first, the arm's answer is followed by a stray resync
+    /// begin and end, and every resync frame is ignored (Codex r4226277849).
+    StrayResyncPairOnReconnect,
+    /// On every connection after the first, 200 ms after its resync has ended, the last
+    /// placement it wrote is written again, signed again: an open order re-placed on a timer
+    /// after a reconnect (RB-y6y-1).
+    ReplacesOnTimerAfterResync,
 }
 
 /// The toy with its caps edited by `caps` and its codec twisted by `twist`.
@@ -553,6 +560,14 @@ static STRAY_RESYNC_END_ON_RECONNECT: Variant = Variant {
     caps: |_| {},
     twist: Twist::StrayResyncEndOnReconnect,
 };
+static STRAY_RESYNC_PAIR_ON_RECONNECT: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::StrayResyncPairOnReconnect,
+};
+static REPLACES_ON_TIMER_AFTER_RESYNC: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::ReplacesOnTimerAfterResync,
+};
 static TWO_PHASE_REJECT_TWO_ORDERS: Variant = Variant {
     caps: two_phase,
     twist: Twist::RiskRejectNamingTwoOrders,
@@ -658,6 +673,8 @@ impl VenueFactory for Variant {
 const RESEND: TimerTag = TimerTag(77);
 /// The timer of [`Twist::MaintainsAt70Ms`].
 const MAINTAIN: TimerTag = TimerTag(78);
+/// The timer of [`Twist::ReplacesOnTimerAfterResync`].
+const REPLACE: TimerTag = TimerTag(79);
 
 /// The toy's codec, as its factory builds it, with a twist.
 struct Twisted {
@@ -1500,7 +1517,9 @@ impl ExecCodec for Twisted {
         let resync_frame = f.bytes().starts_with(b"rs");
         let strays = matches!(
             self.twist,
-            Twist::StrayResyncEnd | Twist::StrayResyncEndOnReconnect
+            Twist::StrayResyncEnd
+                | Twist::StrayResyncEndOnReconnect
+                | Twist::StrayResyncPairOnReconnect
         );
         if strays && self.opens > 1 && resync_frame {
             return Ok(());
@@ -1512,6 +1531,23 @@ impl ExecCodec for Twisted {
             self.inner.on_frame(stream, f, scope, specs, sink, fx)?;
             sink.push(VenueMeta::NONE, ExecEvent::ResyncEnd);
             return Ok(());
+        }
+        // On the new connection no request is sent: an item answered is the arm's.
+        if self.twist == Twist::StrayResyncPairOnReconnect
+            && self.opens > 1
+            && f.bytes().starts_with(b"item|")
+        {
+            self.inner.on_frame(stream, f, scope, specs, sink, fx)?;
+            let watermark = fbc_core::WallNs(1_000);
+            sink.push(VenueMeta::NONE, ExecEvent::ResyncBegin { watermark });
+            sink.push(VenueMeta::NONE, ExecEvent::ResyncEnd);
+            return Ok(());
+        }
+        if self.twist == Twist::ReplacesOnTimerAfterResync && resync_ended && self.opens > 1 {
+            fx.push(Effect::Timer {
+                tag: REPLACE,
+                after: Duration::from_millis(200),
+            });
         }
         let sink = &mut Rewrite { inner: sink, f: f_ };
         let decoded = self.inner.on_frame(stream, f, scope, specs, sink, fx);
@@ -1551,6 +1587,12 @@ impl ExecCodec for Twisted {
                 class: TrafficClass::Normal,
                 charge: RateCharge::one(OpKind::Control, None),
             });
+        }
+        if tag == REPLACE {
+            if let Some(frame) = self.last.take() {
+                fx.push(again(&frame));
+            }
+            return;
         }
         if tag != RESEND {
             return self.inner.on_timer(tag, ctx, fx);
@@ -2855,6 +2897,67 @@ fn resync_after_reconnect_takes_no_stray_resync_end_on_the_new_connection_for_a_
         ),
         "{failure}"
     );
+}
+
+#[test]
+fn resync_after_reconnect_takes_no_stray_resync_on_the_arms_answer_for_the_reconnects() {
+    let failure = failed(suite::resync_after_reconnect(
+        &STRAY_RESYNC_PAIR_ON_RECONNECT.subject(assumed),
+    ));
+    assert!(
+        says(
+            &failure,
+            "ExecCodec::resync",
+            "no resync ended once the stub closed the connection"
+        ),
+        "{failure}"
+    );
+}
+
+/// The toy resyncing over REST: its REST base at the stub's HTTP endpoint, each resync answered
+/// there showing the account flat, its opening the authentication and the arm alone.
+fn rest_resyncing() -> Setup {
+    let mut stub = order_entry();
+    stub.point = |cfg, server| {
+        toy_setup::point_at(cfg, server);
+        cfg.insert(toy::REST_URL_KEY, &server.http_url("/rest"));
+    };
+    stub.opening.truncate(2);
+    let resync = |r: &HttpRequest| {
+        let ts = r.query.as_deref().and_then(|q| q.strip_prefix("ts="));
+        HttpReply {
+            status: 200,
+            body: format!("rsbegin|wm={}\nrsend", ts.unwrap_or_default()).into_bytes(),
+        }
+    };
+    let get = fbc_runtime::http::Method::GET;
+    stub.http = HttpRouter::new().route_fn(get, PathPattern::exact("/rest/resync"), resync);
+    Setup {
+        order_entry: Some(stub),
+        ..assumed()
+    }
+}
+
+#[test]
+fn resync_after_reconnect_passes_a_toy_resyncing_over_rest() {
+    let passed = suite::resync_after_reconnect(&ToyFactory.subject_for(rest_resyncing));
+    assert!(matches!(passed, Ok(Verdict::Passed { .. })), "{passed:?}");
+}
+
+#[test]
+fn resync_after_reconnect_fails_a_toy_that_re_places_an_open_order_on_a_timer_after_a_reconnect() {
+    let failure = failed(suite::resync_after_reconnect(
+        &REPLACES_ON_TIMER_AFTER_RESYNC.subject(assumed),
+    ));
+    assert!(
+        says(
+            &failure,
+            "ExecCodec: nothing re-placed",
+            "written 2 times over the 2 connections"
+        ),
+        "{failure}"
+    );
+    assert_eq!(failure.breaches.len(), 1, "{failure}");
 }
 
 #[test]
