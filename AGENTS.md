@@ -348,7 +348,7 @@ rather than guess.
     reconnect resyncs and re-places nothing), `two_phase_ack` and `reject_coverage` (each code of
     `<fixtures>/reject_coverage/table.txt` refused by the stub maps to the kind listed), which
     run `ExecSession` against the stub as the setup's `OrderEntryStub` says, on a paused clock
-    the check moves, fbc-oms authorizing every order command (0083, 0085); still planned: the suite's other checks and the rest of the conformance
+    the check moves, fbc-oms authorizing every order command (0083, 0085), `mixed_batch` reading a refused and an unanswered batch item as the stub's `BatchFailures` declares (0089); still planned: the suite's other checks and the rest of the conformance
     toy).
   - `crates/fbc-examples`: sample programs the owner runs by hand, never CI (FBC-u4so). Its
     library target is empty and every dependency is a dev-dependency, so it is outside
