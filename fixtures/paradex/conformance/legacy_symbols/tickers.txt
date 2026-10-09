@@ -1,0 +1,5 @@
+# Java-era ticker values for Paradex perpetuals (FBC-l5o): the Java stack's configurations name
+# a Paradex perpetual as X/USDT, which the factory's hook reads as X-USD-PERP.
+BTC/USDT
+ETH/USDT
+SOL/USDT

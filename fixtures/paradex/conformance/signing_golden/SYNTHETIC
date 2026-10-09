@@ -1,0 +1,13 @@
+Synthetic golden signing vectors (decision 0009). Nothing in this directory belongs to a funded
+account.
+
+Each .golden file is the exact frame fbc-venue-paradex's order-entry codec writes for one golden
+command the conformance setup lists (crates/venues/fbc-venue-paradex/tests/conformance/setup.rs,
+golden_table). The signed ones carry, as their signature, the Java FueledByChaiTrading signer's
+r and s for a row of fixtures/paradex/signing/paradex-vectors.tsv (written in decimal, as the
+Java signer's toParadexArray writes them): place is sell_limit, place-market is market_sell,
+place-batch is edge_trailing_zeros, amend is modify. Those rows are signed with the synthetic
+key and account that fixtures/paradex/signing/SYNTHETIC describes, over made-up order fields.
+The client ids are the conformance setup's own, minted at a fixed time in namespace 1; the
+venue order ids are made up. cancel and cancel-batch carry no signature: Paradex signs no
+cancel.

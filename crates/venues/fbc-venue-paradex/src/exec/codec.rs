@@ -17,6 +17,10 @@
 //!   authenticated is `NotSent(Disconnected)`, as the runtime reports it, with no REST
 //!   fallback; one whose rpc is not below [`CONTROL_IDS`] is `NotSent(Unencodable)`, since its
 //!   reply could not be told from the codec's own.
+//! - **A placement's final phase.** The reply accepts a placement provisionally; the order's
+//!   own `OrderEvent`s settle it ([`Placements`], decision 0091): a final acceptance of its
+//!   request once one shows it past the risk check, an asynchronous reject once one shows it
+//!   closed with nothing filled. An event and the reply may come in either order.
 //! - **The query.** The Unknown ladder's order query is FBC-0sc's REST read of
 //!   `GET /orders-history` by our client id ([`query_request`]), carrying the current token in a
 //!   redacted header and nowhere else, under a tag of its own; its answer decodes into the
@@ -44,8 +48,11 @@ use fbc_core::{
 };
 use serde_json::Value;
 
+use super::order::phase;
+use super::placements::Held;
 use super::{
-    ParadexEncoder, ParadexReplies, ReadOnlyExec, ReplyRead, decode_order_query, query_request,
+    ParadexEncoder, ParadexReplies, Placements, ReadOnlyExec, ReplyRead, decode_order_query,
+    query_request,
 };
 
 /// The first JSON-RPC id of the codec's own frames (auth and subscribe), 2^52: every id from it
@@ -60,6 +67,8 @@ pub struct ParadexExec {
     session: ReadOnlyExec,
     encoder: ParadexEncoder,
     replies: ParadexReplies,
+    /// The placements awaiting their final phase from their order events.
+    placements: Placements,
     /// The stream the encoder writes to: commands go out only once it is authenticated.
     stream: StreamId,
     /// The order queries sent and not yet answered, by their read's tag.
@@ -72,6 +81,7 @@ impl fmt::Debug for ParadexExec {
             .field("session", &self.session)
             .field("encoder", &self.encoder)
             .field("replies", &self.replies)
+            .field("placements", &self.placements)
             .field("queries", &self.queries.len())
             .finish_non_exhaustive()
     }
@@ -93,6 +103,7 @@ impl ParadexExec {
             session: ReadOnlyExec::with_first_id(cfg, creds, CONTROL_IDS)?,
             encoder: ParadexEncoder::new(signer, stream, rpc_timeout),
             replies: ParadexReplies::new(),
+            placements: Placements::default(),
             stream,
             queries: BTreeMap::new(),
         })
@@ -168,6 +179,7 @@ impl ExecCodec for ParadexExec {
     fn on_open(&mut self, stream: StreamId, ctx: &EncodeCtx, fx: &mut Effects) {
         self.queries.clear();
         self.replies.on_new_connection();
+        self.placements.on_new_connection();
         self.session.on_open(stream, ctx, fx);
     }
 
@@ -193,6 +205,7 @@ impl ExecCodec for ParadexExec {
         }
         let receipt = self.encoder.encode(cmd, rpc, specs, ctx, t, fx)?;
         self.replies.sent(rpc, cmd);
+        self.placements.sent(rpc, cmd);
         Ok(receipt)
     }
 
@@ -209,7 +222,15 @@ impl ExecCodec for ParadexExec {
         fx: &mut Effects,
     ) -> Result<(), DecodeError> {
         let RawFrame::Text(text) = f else {
-            return self.session.on_frame(stream, f, scope, specs, sink, fx);
+            let phase = match f {
+                RawFrame::Binary(bytes) => phase(bytes),
+                RawFrame::Text(_) => None,
+            };
+            let mut held = Held::default();
+            self.session
+                .on_frame(stream, f, scope, specs, &mut held, fx)?;
+            self.placements.on_event(phase, held, sink);
+            return Ok(());
         };
         let reply: Value = serde_json::from_str(text)
             .map_err(|_| DecodeError::Malformed("text frame is not JSON"))?;
@@ -217,8 +238,12 @@ impl ExecCodec for ParadexExec {
         if id.is_some_and(|id| id >= CONTROL_IDS) {
             return self.session.on_text(text, sink, fx);
         }
-        match self.replies.on_reply(text, scope, sink)? {
-            ReplyRead::Decoded => Ok(()),
+        let mut held = Held::default();
+        match self.replies.on_reply(text, scope, &mut held)? {
+            ReplyRead::Decoded => {
+                self.placements.on_reply(held, sink);
+                Ok(())
+            }
             ReplyRead::NotOurs => Err(DecodeError::Malformed("a reply to no request sent")),
         }
     }
@@ -250,6 +275,7 @@ impl ExecCodec for ParadexExec {
     /// `Unknown` for every item of request `rpc` no reply answered ([`ParadexReplies`]).
     fn on_rpc_timeout(&mut self, rpc: RpcId, sink: &mut dyn ExecSink) {
         self.queries.retain(|_, (sent, _)| *sent != rpc);
+        self.placements.on_rpc_timeout(rpc);
         self.replies.on_rpc_timeout(rpc, sink);
     }
 

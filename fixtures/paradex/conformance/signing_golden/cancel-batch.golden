@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","method":"order.cancel_batch","params":{"order_ids":["1759500000000000001","1759500000000000002"]},"id":26}

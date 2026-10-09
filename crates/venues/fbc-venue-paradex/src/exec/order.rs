@@ -334,3 +334,44 @@ fn modify_of(status: u8) -> Modify {
         _ => Modify::Nothing,
     }
 }
+
+/// What an `OrderEvent` shows of its order's placement, which Paradex accepts in two phases
+/// (decisions 0054, 0085): read by the order-entry codec from a frame [`decode_order_event`]
+/// decoded, to give the placement its final phase ([`Placements`](super::Placements)).
+#[derive(Clone, Eq, PartialEq, Debug)]
+pub(crate) enum Phase {
+    /// NEW: received, before the risk check.
+    Pending,
+    /// OPEN, or CLOSED with anything filled: past the risk check.
+    Passed,
+    /// CLOSED with nothing filled, for the stated reason (empty when none is stated), other
+    /// than our own cancel: the venue refused the order after accepting it.
+    Refused(Box<str>),
+    /// CLOSED with nothing filled by our own cancel (USER_CANCELED): neither passed nor refused.
+    Withdrawn,
+}
+
+/// What the `OrderEvent` `frame` shows of its order's placement; `None` for a frame that is not
+/// an `OrderEvent` or that [`decode_order_event`] refuses for its status, sizes or strings.
+pub(crate) fn phase(frame: &[u8]) -> Option<Phase> {
+    let msg = Message::parse(frame).ok()?;
+    if msg.header().template_id != TEMPLATE_ORDER {
+        return None;
+    }
+    let block = msg.block();
+    let filled = block.i64_at(44)? < block.i64_at(36)?;
+    let mut tail = msg.tail();
+    // `orderId`, `clientOrderId` and `market`, then `cancelReason`.
+    for _ in 0..3 {
+        tail.var_str().ok()??;
+    }
+    let reason = tail.var_str().ok()??;
+    Some(match block.u8_at(16)? {
+        1 => Phase::Pending,
+        3 => Phase::Passed,
+        4 if filled => Phase::Passed,
+        4 if reason == "USER_CANCELED" => Phase::Withdrawn,
+        4 => Phase::Refused(reason.into()),
+        _ => return None,
+    })
+}

@@ -1,0 +1,9 @@
+# Client ids the Java brokers sent Paradex, each of which must read as Unparseable, never as one
+# of ours: ParadexBroker.getNextOrderId's random (version 4) UUIDs, ResilientParadexBroker's
+# <symbol without dashes>-<System.currentTimeMillis()>-<System.nanoTime() % 10000>, and the
+# typed-in label ParadexLatencyTest uses. Every value is made up here.
+3b241101-e2bb-4255-8caf-4136c566a962
+9f1c6d2e-7a4b-4c1e-b6f3-2d8e5a0c7b19
+BTCUSDPERP-1759400000123-4521
+ETHUSDPERP-1759400000456-17
+123
