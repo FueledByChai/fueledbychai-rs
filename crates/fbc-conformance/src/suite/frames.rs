@@ -12,22 +12,37 @@
 //! - `resync`: the codec's [`resync`](fbc_core::ExecCodec::resync) asked for at the suite's
 //!   fixed encode time ([`ENCODE_WALL`]), so a venue that answers a resync in frames can be
 //!   handed its answer after it;
+//! - `http <status> text <body>` or `http <status> hex <bytes>` (FBC-2905): the response, with
+//!   status `<status>` (100 to 599), no header and the body everything after `text ` up to the
+//!   end of the line or the bytes `hex ` spells, to the earliest HTTP request
+//!   ([`Effect::Http`](fbc_core::Effect::Http)) the codec asked for on an earlier line of the
+//!   case that no `http` line has answered yet, handed to
+//!   [`on_http`](fbc_core::ExecCodec::on_http) under that request's tag; so a venue that
+//!   answers a resync over REST can be handed its answer after the `resync` line. A body of
+//!   more than one line is written in `hex`. An `http` line with no such request to answer
+//!   fails the check, naming the case and line: the case is wrong, not the codec. The requests
+//!   the bootstrap asked for are its own, never answered here; a request's failure
+//!   ([`HttpFailure`](fbc_core::HttpFailure)), its headers and a tag chosen out of order are
+//!   not modelled;
 //!
 //! and a blank line or one starting with `#` is a comment. Frames are handed to
-//! [`on_frame`](fbc_core::ExecCodec::on_frame) on [`Setup::exec_stream`](super::Setup), in the
-//! decode scope the core lends for the venue's caps; the codec is first taken through the setup's
-//! [`Bootstrap`](super::Bootstrap), where it has one, and otherwise not opened. A venue
-//! whose fills or positions arrive only in HTTP responses is not modelled here.
+//! [`on_frame`](fbc_core::ExecCodec::on_frame) on [`Setup::exec_stream`](super::Setup), and
+//! responses to `on_http`, in the decode scope the core lends for the venue's caps; the codec is
+//! first taken through the setup's [`Bootstrap`](super::Bootstrap), where it has one, and
+//! otherwise not opened.
 //!
 //! What a check reports of a frame is its file and line, never its bytes: a frame can carry a
 //! credential.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
 
-use fbc_core::{CtxCall, DecodeError, Effects, ExecEvent, ExecSink, RawFrame, VenueMeta, WallNs};
+use fbc_core::{
+    CtxCall, DecodeError, Effect, Effects, ExecEvent, ExecSink, HttpResponse, HttpTag, RawFrame,
+    VenueMeta, WallNs,
+};
 
 use super::harness::Harness;
 use super::{Breach, Failure, Subject, Verdict};
@@ -44,6 +59,11 @@ pub(crate) enum Line {
     Text(String),
     Binary(Vec<u8>),
     Resync,
+    /// The response to the earliest HTTP request the codec asked for that no line answered.
+    Http {
+        status: u16,
+        body: Vec<u8>,
+    },
 }
 
 /// A case: its lines that hand the codec something, each with its line number.
@@ -54,7 +74,8 @@ pub(crate) type Case = Vec<(usize, Line)>;
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) struct Step {
     pub line: usize,
-    /// The codec call the line made: `ExecCodec::on_frame` or `ExecCodec::resync`.
+    /// The codec call the line made: `ExecCodec::on_frame`, `ExecCodec::resync` or
+    /// `ExecCodec::on_http`.
     pub call: &'static str,
     pub result: Result<(), DecodeError>,
     pub events: Vec<(VenueMeta, ExecEvent)>,
@@ -76,14 +97,43 @@ pub(crate) fn parse(text: &str) -> Result<Case, String> {
             Line::Text(frame.to_owned())
         } else if let Some(bytes) = raw.strip_prefix("hex ") {
             Line::Binary(unhex(bytes).ok_or_else(|| format!("line {n}: not hexadecimal bytes"))?)
+        } else if let Some(response) = raw
+            .strip_prefix("http ")
+            .or((trimmed == "http").then_some(""))
+        {
+            http(response, n)?
         } else {
             return Err(format!(
-                "line {n}: starts with neither `text `, `hex ` nor `resync`"
+                "line {n}: starts with neither `text `, `hex `, `http ` nor `resync`"
             ));
         };
         case.push((n, line));
     }
     Ok(case)
+}
+
+/// The `http` line `n` whose text after `http ` is `response`, or why it is not one.
+fn http(response: &str, n: usize) -> Result<Line, String> {
+    let shape = || {
+        format!(
+            "line {n}: not `http <status> text <body>` or `http <status> hex <bytes>`, <status> \
+             from 100 to 599"
+        )
+    };
+    let (status, body) = response.split_once(' ').ok_or_else(shape)?;
+    let status = status
+        .parse::<u16>()
+        .ok()
+        .filter(|s| (100..=599).contains(s))
+        .ok_or_else(shape)?;
+    let body = if let Some(text) = body.strip_prefix("text ") {
+        text.as_bytes().to_vec()
+    } else if let Some(bytes) = body.strip_prefix("hex ") {
+        unhex(bytes).ok_or_else(|| format!("line {n}: not hexadecimal bytes"))?
+    } else {
+        return Err(shape());
+    };
+    Ok(Line::Http { status, body })
 }
 
 /// The bytes `hex` spells, spaces between them allowed; `None` when it spells none, has an odd
@@ -133,18 +183,22 @@ impl ExecSink for Collect {
     }
 }
 
-/// `case` handed, line by line, to an order-entry codec built fresh from the factory.
-pub(crate) fn decode(h: &Harness<'_>, case: &Case) -> Result<Vec<Step>, Failure> {
+/// `case`, the case file `file`, handed line by line to an order-entry codec built fresh from
+/// the factory; an `http` line with no request to answer fails, naming `file` and the line.
+pub(crate) fn decode(h: &Harness<'_>, file: &str, case: &Case) -> Result<Vec<Step>, Failure> {
     let mut codec = h.exec_codec()?;
     let (specs, stream) = (h.specs(), h.exec_stream);
-    Ok(h.decode_scope(|scope| {
+    h.decode_scope(|scope| {
         let mut steps = Vec::with_capacity(case.len());
+        // The tags of the HTTP requests asked for and not yet answered, earliest first.
+        let mut asked: VecDeque<HttpTag> = VecDeque::new();
         for (line, input) in case {
             let mut sink = Collect(Vec::new());
             let mut fx = Effects::new();
             let call = match input {
                 Line::Resync => "ExecCodec::resync",
                 Line::Text(_) | Line::Binary(_) => "ExecCodec::on_frame",
+                Line::Http { .. } => "ExecCodec::on_http",
             };
             let result = match input {
                 Line::Text(text) => {
@@ -160,7 +214,26 @@ pub(crate) fn decode(h: &Harness<'_>, case: &Case) -> Result<Vec<Step>, Failure>
                     codec.resync(&ctx, &mut fx);
                     Ok(())
                 }
+                Line::Http { status, body } => {
+                    let Some(tag) = asked.pop_front() else {
+                        let what = format!(
+                            "line {line} answers an HTTP request, but the codec has asked for \
+                             none it still waits on"
+                        );
+                        return Err(h.fail(file, what));
+                    };
+                    let resp = HttpResponse {
+                        status: *status,
+                        headers: &[],
+                        body,
+                    };
+                    codec.on_http(tag, Ok(resp), scope, specs, &mut sink, &mut fx)
+                }
             };
+            asked.extend(fx.as_slice().iter().filter_map(|effect| match effect {
+                Effect::Http { tag, .. } => Some(*tag),
+                _ => None,
+            }));
             steps.push(Step {
                 line: *line,
                 call,
@@ -169,8 +242,8 @@ pub(crate) fn decode(h: &Harness<'_>, case: &Case) -> Result<Vec<Step>, Failure>
                 fx,
             });
         }
-        steps
-    }))
+        Ok(steps)
+    })
 }
 
 /// A case a check reads and what every event of its kind in it must be.
@@ -222,7 +295,7 @@ impl Cases<'_> {
                 }
             };
             let mut judged = 0usize;
-            for step in decode(h, &case)? {
+            for step in decode(h, &file, &case)? {
                 if let Err(e) = step.result {
                     breaches.push(Breach::new(
                         &file,
@@ -294,7 +367,7 @@ mod tests {
     fn a_line_of_no_kind_or_bad_hex_is_refused_by_number() {
         assert_eq!(
             parse("text a\nframe b").unwrap_err(),
-            "line 2: starts with neither `text `, `hex ` nor `resync`"
+            "line 2: starts with neither `text `, `hex `, `http ` nor `resync`"
         );
         for bad in ["hex ", "hex abc", "hex zz", "hex 0x"] {
             assert_eq!(
@@ -303,6 +376,48 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn an_http_line_reads_its_status_and_a_text_or_hex_body() {
+        let case =
+            parse("http 200 text {\"a\": [1, 2]} \nhttp 503 hex 6f 6b\nhttp 204 text \n").unwrap();
+        let http = |status, body: &[u8]| Line::Http {
+            status,
+            body: body.to_vec(),
+        };
+        assert_eq!(
+            case,
+            [
+                (1, http(200, b"{\"a\": [1, 2]} ")),
+                (2, http(503, b"ok")),
+                (3, http(204, b"")),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_http_line_without_a_status_or_body_kind_is_refused_by_number() {
+        for bad in [
+            "http",
+            "http 200",
+            "http two text a",
+            "http 99 text a",
+            "http 600 text a",
+            "http 200 body a",
+            "http 200 text",
+        ] {
+            assert_eq!(
+                parse(bad).unwrap_err(),
+                "line 1: not `http <status> text <body>` or `http <status> hex <bytes>`, \
+                 <status> from 100 to 599",
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            parse("http 200 hex 0").unwrap_err(),
+            "line 1: not hexadecimal bytes"
+        );
     }
 
     #[test]

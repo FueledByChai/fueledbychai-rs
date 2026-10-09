@@ -3,9 +3,11 @@
 //! every other way `encode_deterministic`, `ids_roundtrip`, `restart_cid` and `price_grid`
 //! fail or are skipped: a client-id format too small for our ids, Java-era ids missing or read
 //! as ours, a codec that loses our ids from a resync, a resync case that shows nothing of ours
-//! resting or refuses a frame, a codec that rounds prices, refuses them or sends them without
-//! their request, a banded grid with nothing below it, no post-only order, no order entry, and
-//! no codec built.
+//! resting or refuses a frame, an `http` line answering no request, a codec that rounds prices,
+//! refuses them or sends them without their request, a banded grid with nothing below it, no
+//! post-only order, no order entry, and no codec built. And FBC-2905's done line: a toy
+//! resyncing over REST passes `restart_cid` from a case whose resync an `http` line answers,
+//! and fails it when that answer shows nothing of ours resting.
 
 mod toy_setup;
 
@@ -594,6 +596,118 @@ fn restart_cid_fails_a_refused_frame_and_a_missing_case() {
     let missing = Scratch::with("no-case", &[]);
     let failure = failed(missing.run(&toy, suite::restart_cid));
     assert!(said(&failure, "restart_cid/resting.frames")[0].starts_with("cannot read"));
+}
+
+/// The toy resyncing over REST (FBC-2905): its REST base configured, so its resync asks
+/// `GET <base>/resync?ts=<wall>` and decodes the answer's body.
+fn rest_resyncing() -> Setup {
+    let mut cfg = VenueConfig::new();
+    cfg.insert(toy::REST_URL_KEY, "https://conformance.invalid/toy");
+    Setup { cfg, ..assumed() }
+}
+
+/// The records of a resync over REST's body, one per line, as an `http` line's hex bytes.
+fn http_hex(records: &[&str]) -> String {
+    let body = records.join("\n");
+    body.bytes().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The toy's newest id (8) and id 5 resting, beside an order the Java stack left.
+const RESTING: [&str; 3] = [
+    "rsorder|cid=00SKjrSqeFPTfblbZHsMS|vid=toy-7308|sym=TOYA-PERP|side=B|st=open|px=130860|\
+     qty=25|cum=0|po=1|ro=0",
+    "rsorder|cid=00SKjrSqeFPTfblNYkHZx|vid=toy-7305|sym=TOYB-PERP|side=S|st=open|px=130875|\
+     qty=3|cum=1|po=1|ro=0",
+    "rsorder|cid=1759363199123|vid=toy-6001|sym=TOYA-PERP|side=B|st=open|px=130800|qty=2|\
+     cum=0|po=0|ro=0",
+];
+
+#[test]
+fn restart_cid_passes_a_toy_variant_resyncing_over_http_from_a_case_answered_by_an_http_line() {
+    let mut records = vec!["rsbegin|wm=1759363200000000000"];
+    records.extend(RESTING);
+    records.push("rsend");
+    let case = format!("resync\nhttp 200 hex {}\n", http_hex(&records));
+    let scratch = Scratch::with("http", &[("restart_cid/resting.frames", &case)]);
+    let variant = Variant {
+        setup: rest_resyncing,
+        ..Variant::declaring(|_| {})
+    };
+    assert_eq!(
+        probed(scratch.run(&variant, suite::restart_cid)),
+        ["restart_cid/resting.frames: 2 of ours resting, 2 shown, restarted above 8"]
+    );
+}
+
+#[test]
+fn restart_cid_fails_a_toy_variant_whose_http_answer_shows_nothing_of_ours_resting() {
+    let empty = http_hex(&["rsbegin|wm=1759363200000000000", RESTING[2], "rsend"]);
+    let variant = Variant {
+        setup: rest_resyncing,
+        ..Variant::declaring(|_| {})
+    };
+    for (name, line) in [
+        ("http-empty", format!("http 200 hex {empty}")),
+        (
+            "http-text",
+            "http 200 text rsbegin|wm=1759363200000000000".to_owned(),
+        ),
+    ] {
+        let case = format!("resync\n{line}\n");
+        let scratch = Scratch::with(name, &[("restart_cid/resting.frames", &case)]);
+        let failure = failed(scratch.run(&variant, suite::restart_cid));
+        let said = said(&failure, "restart_cid/resting.frames");
+        assert_eq!(
+            said.last().copied(),
+            Some(
+                "shows no order of ours resting in a resync's answer: a restart with nothing \
+                 resting proves nothing"
+            ),
+            "{name}: {failure}"
+        );
+    }
+}
+
+#[test]
+fn restart_cid_fails_an_http_line_answering_no_request_the_codec_asked_for() {
+    // The toy resyncing in frames asks for no HTTP request; nor does the REST one before its
+    // resync, or once its one request is answered.
+    let body = http_hex(&["rsbegin|wm=1759363200000000000", RESTING[0], "rsend"]);
+    let rest = Variant {
+        setup: rest_resyncing,
+        ..Variant::declaring(|_| {})
+    };
+    for (name, variant, case, line) in [
+        (
+            "http-frames",
+            &Variant::declaring(|_| {}),
+            format!("resync\nhttp 200 hex {body}\n"),
+            2,
+        ),
+        (
+            "http-early",
+            &rest,
+            format!("http 200 hex {body}\nresync\n"),
+            1,
+        ),
+        (
+            "http-twice",
+            &rest,
+            format!("resync\nhttp 200 hex {body}\n\nhttp 200 hex {body}\n"),
+            4,
+        ),
+    ] {
+        let scratch = Scratch::with(name, &[("restart_cid/resting.frames", &case)]);
+        let failure = failed(scratch.run(variant, suite::restart_cid));
+        assert_eq!(
+            said(&failure, "restart_cid/resting.frames"),
+            [format!(
+                "line {line} answers an HTTP request, but the codec has asked for none it still \
+                 waits on"
+            )],
+            "{name}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -43,8 +43,9 @@
 //!   brokers' ids, for a venue the Java stack traded), one per line; blank lines and lines
 //!   starting with `#` are ignored.
 //! - `restart_cid/resting.frames`: a case of what the venue shows a restarted process: a
-//!   resync's answer with orders of ours resting, their client ids the suite's first
-//!   [`MINTED_BEFORE`] ids in its namespace, the newest among them ([`restart_cid`]).
+//!   resync's answer (its frames, or for a venue that resyncs over REST its `http` lines) with
+//!   orders of ours resting, their client ids the suite's first [`MINTED_BEFORE`] ids in its
+//!   namespace, the newest among them ([`restart_cid`]).
 //! - `reject_coverage/table.txt`: the venue's reject codes, one per line, each followed by the
 //!   `RejectKind` it maps to as the kind's `Debug` spells it ([`reject_coverage`]).
 //! - `continuity/`, `no_exch_ts_synthesized/` and `book_channels/`: one market-data case per

@@ -612,7 +612,7 @@ fn a_check_fails_a_malformed_case_naming_its_line() {
     let failure = failed(scratch.run(suite::position_signed));
     assert_eq!(
         said(&failure, "position_signed/short.frames"),
-        ["line 2: starts with neither `text `, `hex ` nor `resync`"]
+        ["line 2: starts with neither `text `, `hex `, `http ` nor `resync`"]
     );
     let failure = failed(scratch.run(suite::decoder_deterministic));
     assert_eq!(named(&failure), ["position_signed/short.frames"]);
