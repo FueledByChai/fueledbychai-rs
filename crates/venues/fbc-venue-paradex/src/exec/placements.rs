@@ -257,10 +257,8 @@ impl Placements {
 /// Whether an event naming the venue id `vid` is of the order `item` names: the same venue id,
 /// or either unstated.
 fn same_order(vid: Option<&VenueOrderId>, item: &ItemRef) -> bool {
-    match (vid, &item.vid) {
-        (Some(event), Some(reply)) => event == reply,
-        _ => true,
-    }
+    vid.zip(item.vid.as_ref())
+        .is_none_or(|(event, reply)| event == reply)
 }
 
 /// The final acceptance of request `rpc`'s `item`.
@@ -277,10 +275,7 @@ fn fin(rpc: RpcId, item: ItemRef) -> ExecEvent {
 /// The asynchronous reject of the placement of our order `cid`, `item`, for `reason` (module
 /// documentation).
 fn refused(cid: ClientOrderId, item: &ItemRef, reason: &str) -> ExecEvent {
-    let target = match &item.vid {
-        Some(vid) => OrderRef::Both(cid, vid.clone()),
-        None => OrderRef::Client(cid),
-    };
+    let target = (item.vid.clone()).map_or(OrderRef::Client(cid), |vid| OrderRef::Both(cid, vid));
     let kind = match reason {
         "POST_ONLY_WOULD_CROSS" => RejectKind::PostOnlyWouldCross,
         _ => RejectKind::Other,
