@@ -117,6 +117,10 @@ impl<'s> Live<'s> {
         steps.extend(stub.opening.iter().cloned().map(respond));
         let replies = requests.into_iter().map(|a| stub.reply.responder(a));
         steps.extend(replies.map(respond));
+        // Last, a barrier: the script ends only once the session has read every frame the stub
+        // sent, so what a check reads once it has played comes after the session handled them
+        // all, however late the host delivered them (FBC-3il).
+        steps.push(Step::Barrier { conn: 0 });
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .start_paused(true)
@@ -340,8 +344,11 @@ impl Ctx<'_> {
         }
     }
 
-    /// Waits until the stub has played its script to its end (every request it answers read
-    /// and answered), then lets the answers reach the session.
+    /// Waits until the stub has played its script to its end: every request it answers read
+    /// and answered, and the barrier after them passed, so the session has handled every frame
+    /// of the answers (its handler heard what they bring) by an event, the pong to the
+    /// barrier's ping, never by a count of turns (FBC-3il: on a loaded host the answers reached
+    /// the session after the turns had run). Then lets every task run a while longer.
     pub async fn answered(&self) -> Result<(), Failure> {
         let mut finished = None;
         for _ in 0..TURNS {
