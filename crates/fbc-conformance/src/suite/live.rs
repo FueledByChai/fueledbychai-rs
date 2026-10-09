@@ -649,7 +649,7 @@ impl Oms {
         };
         // A snapshot of the suite's own making: flat, nothing resting, one position. The suite
         // made it and the stub answers flat by construction, so it is taken as trustworthy
-        // whatever the venue declares of its own snapshots (FBC-wyv2): under a venue's
+        // whatever the venue declares of its own snapshots (decision 0087): under a venue's
         // `Untrustworthy` or `None` the resync would seed no position and the owner's Start
         // would refuse `PositionUnknown` before any check exercised the venue. The venue's own
         // caps still build and authorize every command.
