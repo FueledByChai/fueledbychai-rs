@@ -136,7 +136,9 @@
 //!   venue's event where `AmendCaps.ack` is `ReplacedEvent` and synthesized from the reply where
 //!   it is `RpcReplyOnly`, naming the new venue id where the venue issues one.
 //! - [`mixed_batch`]: a batch with an item accepted, one rejected and one unanswered gives each
-//!   item its outcome, and the timeout marks the unanswered one `Unknown` (decision 0014).
+//!   item its outcome, and the unanswered one is marked `Unknown` (decision 0014): the refused
+//!   item `Rejected` or `Unknown`, the unanswered one at the timeout or with the reply, as the
+//!   setup's [`BatchFailures`] declares the venue reports them (FBC-3pv6).
 //! - [`unknown_on_timeout`]: an unanswered request becomes `Unknown` once at its deadline and is
 //!   never written a second time (decision 0005).
 //! - [`resync_after_reconnect`]: once the stub closes the connection an accepted placement rests
@@ -199,7 +201,7 @@ pub use orders::{amend_ack, mixed_batch, unknown_on_timeout};
 pub use reconnect::resync_after_reconnect;
 pub use rejects::reject_coverage;
 pub use selfcontained::commands_selfcontained;
-pub use stub::{Answer, OrderEntryStub, Replier};
+pub use stub::{Answer, BatchFailures, OrderEntryStub, RefusedItem, Replier, UnansweredItem};
 pub use two_phase::two_phase_ack;
 
 /// What the fixtures assume: the instruments, the configuration and the credentials the

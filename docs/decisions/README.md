@@ -91,3 +91,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0086](0086-a-paradex-modify-s-request-info-is-news-once-per-order-and-r.md) A Paradex modify's request_info is news once per order and request, a later event repeating it the order update alone, augmenting 0054 — accepted
 - [0087](0087-the-order-entry-checks-own-registry-takes-the-suite-s-flat-s.md) The order-entry checks' own registry takes the suite's flat snapshot as trustworthy whatever the venue declares, augmenting 0083 — accepted
 - [0088](0088-the-unprotected-order-gate-keeps-venue-id-evidence-by-market.md) The unprotected-order gate keeps venue-id evidence by market, after a resync only for markets an order is held on, augmenting 0080 — accepted
+- [0089](0089-mixed-batch-judges-a-refused-and-an-unanswered-batch-item-as.md) mixed_batch judges a refused and an unanswered batch item as the setup declares its venue reports them, augmenting 0083 — accepted

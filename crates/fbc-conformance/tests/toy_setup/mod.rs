@@ -9,7 +9,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use fbc_conformance::suite::{Answer, Golden, OrderEntryStub, Replier, Setup};
+use fbc_conformance::suite::{
+    Answer, BatchFailures, Golden, OrderEntryStub, RefusedItem, Replier, Setup, UnansweredItem,
+};
 use fbc_conformance::toy::{self, INST_A, INST_B, OWN_NS, TOY_TOKEN};
 use fbc_conformance::{Frame, HttpRouter, Responded, Responder, StubServer};
 use fbc_core::{
@@ -43,8 +45,9 @@ pub fn assumed() -> Setup {
 /// How the toy's order entry answers over the stub server: its order-entry URL pointed at the
 /// stub's socket, nothing read over HTTP (it resyncs in frames), the opening answered (the
 /// authentication acknowledged with the toy's token, the cancel-on-disconnect arm accepted, the
-/// resync begun at its own instant and ended with nothing resting), and each request's items
-/// answered as asked ([`replier`]).
+/// resync begun at its own instant and ended with nothing resting), each request's items
+/// answered as asked ([`replier`]), and a batch's refused item reported `Rejected`, its
+/// unanswered one `Unknown` at the deadline.
 pub fn order_entry() -> OrderEntryStub {
     OrderEntryStub {
         point: point_at,
@@ -62,6 +65,11 @@ pub fn order_entry() -> OrderEntryStub {
             }),
         ],
         reply: replier(true),
+        // Each item refused with a code and answered on its own (`session.rs`).
+        batch: BatchFailures {
+            refused: RefusedItem::Rejected,
+            unanswered: UnansweredItem::AtDeadline,
+        },
     }
 }
 

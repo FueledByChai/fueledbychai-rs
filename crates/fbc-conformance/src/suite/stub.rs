@@ -7,7 +7,8 @@
 //! The suite knows no venue's protocol, so the adapter states its replies as typed Rust
 //! functions (decisions 0025, 0047): what its order entry is pointed at, the HTTP routes it reads
 //! (a login, a resync over REST), the answer to each frame the session writes as an epoch opens,
-//! and the venue's answer to a request, each of its items answered as the check asks.
+//! the venue's answer to a request, each of its items answered as the check asks, and how its
+//! codec reports a batch's items refused or left unanswered ([`BatchFailures`]).
 
 use core::fmt;
 use std::sync::Arc;
@@ -89,6 +90,46 @@ pub struct OrderEntryStub {
     pub opening: Vec<Responder>,
     /// The venue's answer to an order-entry request.
     pub reply: Replier,
+    /// How the venue's codec reports a batch's items the venue refuses or leaves unanswered,
+    /// which [`mixed_batch`](super::mixed_batch) judges it by (decision 0089).
+    pub batch: BatchFailures,
+}
+
+/// How a venue's codec reports the items of a batch the venue refuses or leaves unanswered:
+/// what a venue's batch protocol lets it say of them (decision 0014 item 3). The toy refuses an
+/// item with a code and answers each item on its own, so it reports a refused item `Rejected`
+/// and an unanswered one `Unknown` at the deadline; Paradex gives a refused item an error
+/// message with no code and answers a batch in one list, so its codec reports both `Unknown`
+/// from the reply (decision 0069).
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct BatchFailures {
+    /// What a batch item the venue refuses is reported as.
+    pub refused: RefusedItem,
+    /// When a batch item the venue's reply leaves unanswered is reported `Unknown`.
+    pub unanswered: UnansweredItem,
+}
+
+/// What a batch item the venue refuses is reported as.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum RefusedItem {
+    /// `SubmitOutcome::Rejected`: the venue's refusal says the item was left undone.
+    Rejected,
+    /// `SubmitOutcome::Unknown`: the venue's refusal does not say the item was left undone (a
+    /// message with no code, decision 0069), so the item is resolved as any `Unknown` is.
+    Unknown,
+}
+
+/// When a batch item the venue's reply leaves unanswered is reported `Unknown`. The item the
+/// check leaves unanswered is the batch's last, so a venue answering a batch in one list, in
+/// the order of its items, leaves it out of a shorter list.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum UnansweredItem {
+    /// At the request's deadline, never before: the venue answers each item on its own, so a
+    /// reply to some items says nothing of the others.
+    AtDeadline,
+    /// With the reply, before the clock moves: the venue answers a batch in one reply, so an
+    /// item that reply leaves out is never answered.
+    InReply,
 }
 
 impl fmt::Debug for OrderEntryStub {

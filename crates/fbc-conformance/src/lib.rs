@@ -48,7 +48,10 @@
 //!   session against the stub, answering as the setup's [`suite::OrderEntryStub`] states, on a
 //!   paused clock the check moves, every order command authorized by fbc-oms; a toy variant
 //!   that reports every item of a timed-out batch `Accepted` fails `mixed_batch`
-//!   (`tests/suite_orders.rs`). A [`suite::Bootstrap`] in the setup takes every order-entry
+//!   (`tests/suite_orders.rs`). `mixed_batch` judges a refused and an unanswered batch item as
+//!   the stub's [`suite::BatchFailures`] declares: a toy variant answering as Paradex does (a
+//!   refused item and one its reply leaves out both `Unknown` from the reply) passes declared
+//!   so, and fails declared as the toy (`tests/suite_batch.rs`, FBC-3pv6). A [`suite::Bootstrap`] in the setup takes every order-entry
 //!   codec the suite builds to its authenticated state before a check uses it (FBC-648o): a toy
 //!   variant refusing `NotSent(Disconnected)` until authenticated passes `caps_truthful`,
 //!   `commands_selfcontained` and `signing_golden` with one and fails each without

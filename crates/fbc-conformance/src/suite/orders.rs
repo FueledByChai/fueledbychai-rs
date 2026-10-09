@@ -22,9 +22,13 @@
 //!   in the placement's answer or later; once the amend is sent, nothing refuses it (an
 //!   `AsyncReject` naming it) or ends it (a terminal `OrderUpdate`).
 //! - `mixed_batch`: a batch of three placements is answered item by item, the first accepted,
-//!   the second rejected and the third never; once its deadline passes, the first is
-//!   `Accepted`, the second `Rejected` and the third `Unknown`, each by its index (the third
-//!   naming no venue id), and nothing is reported for the whole request. The third has no outcome before the clock moves.
+//!   the second refused and the third, the last, never; once its deadline passes, the first is
+//!   `Accepted`, the second and third as the setup's [`BatchFailures`] declares the venue
+//!   reports them, each by its index (the third naming no venue id), and nothing is reported
+//!   for the whole request. The second is `Rejected` or `Unknown` ([`RefusedItem`]); the third
+//!   is `Unknown` once, with no outcome before the clock moves
+//!   ([`UnansweredItem::AtDeadline`]) or reported with the reply, before the clock moves
+//!   ([`UnansweredItem::InReply`], decision 0069's Paradex).
 //! - `unknown_on_timeout`: a placement the stub never answers is reported `Unknown` once at its
 //!   deadline (nothing before the clock moves), naming no other order and no venue id, and is never written a
 //!   second time, however long the clock then runs.
@@ -42,6 +46,7 @@ use fbc_core::{
 use super::harness::{Harness, Shape};
 use super::live::{Ctx, Live, WAIT};
 use super::stub::Answer::{Accept, Reject, Silent};
+use super::stub::{BatchFailures, RefusedItem, UnansweredItem};
 use super::{Breach, Failure, Subject, Verdict};
 
 const AMEND_ACK: &str = "amend_ack";
@@ -534,14 +539,18 @@ pub fn mixed_batch(subject: &Subject<'static>) -> Result<Verdict, Failure> {
         });
     }
     let model = live.order.ack;
+    // How the venue reports a refused and an unanswered item (FBC-3pv6); `Live::new` saw the
+    // stub.
+    let declared = subject.setup().order_entry.map(|stub| stub.batch);
+    let declared = declared.expect("Live::new saw an OrderEntryStub");
     let breaches = live.run(vec![vec![Accept, Reject, Silent]], async |c| {
         c.ready().await?;
         let (cids, auth) = c.oms.batch(c.h, usize::from(ITEMS))?;
         let rpc = c.send(auth, OpKind::Place).await?;
         c.answered().await?;
-        // The clock has not moved since the batch was sent: no deadline has passed, so the item
-        // the stub never answered has no outcome yet (Reviewer B RB-3il-1).
-        let early = of(&c.outcomes(rpc), 2).len();
+        // The clock has not moved since the batch was sent: no deadline has passed, so what the
+        // item the stub never answered has by now came with the reply (Reviewer B RB-3il-1).
+        let early: Vec<SubmitOutcome> = of(&c.outcomes(rpc), 2).into_iter().cloned().collect();
         let every = |c: &Ctx<'_>| {
             let outcomes = c.outcomes(rpc);
             let has = |i| {
@@ -557,15 +566,38 @@ pub fn mixed_batch(subject: &Subject<'static>) -> Result<Verdict, Failure> {
         if moved.is_some() {
             c.advance(WAIT).await;
         }
-        Ok(judge_batch(c, rpc, &cids, model, moved, early))
+        let asked = Batched {
+            cids: &cids,
+            model,
+            declared,
+        };
+        Ok(judge_batch(c, rpc, &asked, moved, &early))
     })?;
     verdict(MIXED_BATCH, breaches, || {
+        let refused = match declared.refused {
+            RefusedItem::Rejected => "Batch: an item rejected is Rejected",
+            RefusedItem::Unknown => "Batch: an item rejected is Unknown",
+        };
+        let unanswered = match declared.unanswered {
+            UnansweredItem::AtDeadline => {
+                "Batch: an item unanswered is Unknown at the deadline, once"
+            }
+            UnansweredItem::InReply => "Batch: an item unanswered is Unknown in the reply, once",
+        };
         vec![
             "Batch: an item accepted is Accepted".into(),
-            "Batch: an item rejected is Rejected".into(),
-            "Batch: an item unanswered is Unknown at the deadline, once".into(),
+            refused.into(),
+            unanswered.into(),
         ]
     })
+}
+
+/// The batch `mixed_batch` sent: its items' client ids, on a venue acknowledging as `model`
+/// and reporting a refused and an unanswered item as `declared`.
+struct Batched<'a> {
+    cids: &'a [ClientOrderId],
+    model: AckModel,
+    declared: BatchFailures,
 }
 
 /// The outcomes of item `i` among `outcomes`.
@@ -578,24 +610,37 @@ fn of(outcomes: &[(Option<ItemRef>, SubmitOutcome)], i: u16) -> Vec<&SubmitOutco
         .collect()
 }
 
-/// What broke `mixed_batch`: each item's outcomes, an outcome for the whole request, an
-/// outcome for the unanswered item before the clock moved (`early` of them), a resend.
+/// What broke `mixed_batch`: each item's outcomes, an outcome for the whole request, the
+/// unanswered item's outcomes before the clock moved (`early`) other than the declaration has
+/// them, a resend.
 fn judge_batch(
     c: &Ctx<'_>,
     rpc: RpcId,
-    cids: &[ClientOrderId],
-    model: AckModel,
+    asked: &Batched<'_>,
     moved: Option<Duration>,
-    early: usize,
+    early: &[SubmitOutcome],
 ) -> Vec<Breach> {
+    let (cids, model) = (asked.cids, asked.model);
     let mut breaches = Vec::new();
     let outcomes = c.outcomes(rpc);
-    if early > 0 {
-        let what = format!(
-            "item 2, which the stub never answered, was reported before its deadline: {early} \
-             outcome(s) before the clock moved"
-        );
-        breaches.push(Breach::new("ExecCodec::on_rpc_timeout", what));
+    match asked.declared.unanswered {
+        UnansweredItem::AtDeadline if !early.is_empty() => {
+            let n = early.len();
+            let what = format!(
+                "item 2, which the stub never answered, was reported before its deadline: {n} \
+                 outcome(s) before the clock moved"
+            );
+            breaches.push(Breach::new("ExecCodec::on_rpc_timeout", what));
+        }
+        // Reported with the reply that left it out (decision 0069), before any deadline.
+        UnansweredItem::InReply if early != [SubmitOutcome::Unknown] => {
+            let what = format!(
+                "item 2, which the stub's reply left out, was reported {early:?} in the reply, \
+                 not Unknown once; BatchFailures.unanswered is InReply"
+            );
+            breaches.push(Breach::new("ExecCodec::on_frame", what));
+        }
+        _ => {}
     }
     if moved.is_none() {
         let what = format!(
@@ -616,9 +661,20 @@ fn judge_batch(
         let what = format!("item 0, which the stub accepted, was reported {accepted:?}, not once");
         breaches.push(Breach::new("OrderCaps.batch_place", what));
     }
-    let rejected = of(1);
-    if rejected.len() != 1 || !matches!(rejected[0], SubmitOutcome::Rejected(_)) {
-        let what = format!("item 1, which the stub rejected, was reported {rejected:?}, not once");
+    // The refused item once, as the venue reports a refusal (FBC-3pv6).
+    let refused = of(1);
+    let (as_declared, declared) = match asked.declared.refused {
+        RefusedItem::Rejected => (
+            matches!(refused[..], [SubmitOutcome::Rejected(_)]),
+            "Rejected",
+        ),
+        RefusedItem::Unknown => (refused == [&SubmitOutcome::Unknown], "Unknown"),
+    };
+    if !as_declared {
+        let what = format!(
+            "item 1, which the stub rejected, was reported {refused:?}, not {declared} once \
+             (BatchFailures.refused is {declared})"
+        );
         breaches.push(Breach::new("OrderCaps.batch_place", what));
     }
     let unanswered = of(2);
