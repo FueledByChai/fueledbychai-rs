@@ -36,7 +36,7 @@ Required confirmation and namespace:
                             namespace on the market refuses the run)
 
 The market (required; read them from GET https://api.testnet.paradex.trade/v1/markets):
-  --market <MARKET>         the Paradex market as Paradex spells it, e.g. BTC-USD-PERP or
+  --market <MARKET>         the Paradex perpetual as Paradex spells it, e.g. BTC-USD-PERP or
                             kBONK-USD-PERP
   --tick <DEC>              its price_tick_size, e.g. 0.1
   --step <DEC>              its order_size_increment, e.g. 0.001
@@ -548,24 +548,24 @@ fn split<'a>(url: &'a str, schemes: [&str; 2], flag: &str) -> Result<Url<'a>, St
     })
 }
 
-/// The longest part of a market name between its '-'s: Paradex's are short (`BTC`, `PERP`,
-/// `27JUN25`, `100000`), and a longer one is more likely a pasted secret than a market.
+/// The longest part of a market name between its '-'s: Paradex's are short (`BTC`, `USD`,
+/// `kBONK`), and a longer one is more likely a pasted secret than a market.
 const MARKET_PART_MAX: usize = 12;
-/// The most parts and the longest whole market name: Paradex's longest are options
-/// (`BTC-USD-27JUN25-100000-C`, five parts, 24 long). A credential split into short parts is
-/// refused by either (Codex r4226495325 on PR #114).
-const MARKET_PARTS_MAX: usize = 5;
+/// The longest whole market name taken (Codex r4226495325 on PR #114).
 const MARKET_MAX: usize = 32;
 
-/// A Paradex market as Paradex spells it: three to [`MARKET_PARTS_MAX`] parts of ASCII letters
-/// and digits, each at most [`MARKET_PART_MAX`] long, joined by '-', at most [`MARKET_MAX`]
-/// long in all (`BTC-USD-PERP`, `kBONK-USD-PERP`: the
-/// letters as md_watch's Paradex spelling takes them, either case, since some markets carry a
-/// lower-case prefix). Anything else is refused before it is put in a request path, where a
-/// pasted private key would be sent to the venue; the refusal never shows the value.
+/// A Paradex perpetual as Paradex spells it: `BASE-QUOTE-PERP`, the base and quote ASCII
+/// letters and digits, each at most [`MARKET_PART_MAX`] long, at most [`MARKET_MAX`] in all
+/// (`BTC-USD-PERP`, `kBONK-USD-PERP`: the letters as md_watch's Paradex spelling takes them,
+/// either case, since some markets carry a lower-case prefix). The spec is built as a
+/// perpetual's ([`crate::trade::specs`]), and Paradex's discovery takes perpetuals only, so an
+/// option, a future or a spot market is refused (Codex r4226570445 on PR #114). Anything else is
+/// refused before it is put in a request path, where a pasted private key would be sent to the
+/// venue; the refusal never shows the value.
 fn symbol(value: &str) -> Result<String, String> {
     let parts: Vec<&str> = value.split('-').collect();
-    let shaped = (3..=MARKET_PARTS_MAX).contains(&parts.len())
+    let shaped = parts.len() == 3
+        && parts[2] == "PERP"
         && value.len() <= MARKET_MAX
         && parts.iter().all(|p| {
             (1..=MARKET_PART_MAX).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_alphanumeric())
@@ -574,8 +574,9 @@ fn symbol(value: &str) -> Result<String, String> {
         Ok(value.to_owned())
     } else {
         Err(format!(
-            "--market: not a market as Paradex spells it (letters and digits in three to five \
-             parts joined by '-', at most 32 long, e.g. BTC-USD-PERP or kBONK-USD-PERP){UNSHOWN}"
+            "--market: not a Paradex perpetual as Paradex spells it (BASE-QUOTE-PERP in letters \
+             and digits, e.g. BTC-USD-PERP or kBONK-USD-PERP; options, futures and spot are not \
+             modelled here){UNSHOWN}"
         ))
     }
 }
