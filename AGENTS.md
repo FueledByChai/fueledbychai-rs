@@ -395,7 +395,7 @@ rather than guess.
     (`src/exec/encode.rs`, `ParadexEncoder`); the order-entry codec, `ParadexExec`, which puts
     the read-only codec's connection, the encoder, the replies (`src/exec/reply.rs`, 0069), the
     resync and the order query together on one connection (`src/exec/codec.rs`, 0071), a
-    placement's final phase given by its order events (`src/exec/placements.rs`, 0091); the
+    placement's final phase given by its order events (`src/exec/placements.rs`, 0092); the
     factory's order entry: `caps()` with the `ExecCaps`, one order-entry endpoint on SBE 1:2,
     and the order-entry or read-only codec as `paradex.exec.mode` says, its order signer from
     `auth::order_signer` so no credential is read outside `src/auth` (`src/factory.rs`, 0072);

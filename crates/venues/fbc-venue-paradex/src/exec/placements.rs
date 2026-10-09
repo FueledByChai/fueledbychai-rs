@@ -1,4 +1,4 @@
-//! The final phase of Paradex's two-phase placements (decisions 0054, 0069, 0085, 0091). The
+//! The final phase of Paradex's two-phase placements (decisions 0054, 0069, 0085, 0092). The
 //! reply to `order.create`, and to each created `order.create_batch` item, accepts the order
 //! provisionally: Paradex queues it for its risk check. The order's own `OrderEvent`s settle it,
 //! and [`Placements`] turns what they show ([`Phase`]) into the placement's final phase:
