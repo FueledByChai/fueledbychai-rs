@@ -239,7 +239,10 @@ rather than guess.
     that market's `StateGeneration`, not `Clone` and consumed on submit, issued only by the
     registry that built the command, for the one account that registry is for, a place, batch
     or amend judged against the caps again at issue and released when refused, a place built
-    and not yet authorized withdrawn only with its command (0082; `tests/retained.rs`), and whose
+    and not yet authorized held by its command: withdrawn with it, or released by the
+    registry's next mutating call once it is dropped unspent, with no outcome of it by client
+    id applied and an accepted or unknown one voiding the command (0082, 0084;
+    `tests/retained.rs`, `tests/held.rs`), and whose
     `submit_control` takes a `ControlCommand` that carries no order-affecting command (0045,
     compile-fail cases in `tests/ui_authorization/`); the `Live` and `Cancellable` permits
     the registry gives, through which alone an amend or a cancel is built, each cancel naming

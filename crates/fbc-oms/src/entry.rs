@@ -712,6 +712,7 @@ impl Registry {
     /// that cover an armed market's held leases differently from the names before advance its
     /// [`StateGeneration`], so a command built before is refused at submit (decision 0060).
     pub fn with_lease_keys(mut self, keys: LeaseKeys) -> Registry {
+        self.reap_dropped();
         self.entries.set_keys(keys);
         self
     }
@@ -722,6 +723,7 @@ impl Registry {
     /// built, for the owner's testnet runs only (the `testnet_trade` sample, FBC-x69b); it
     /// changes nothing else, and never arms a market whose position is unknown.
     pub fn for_testnet_run(mut self, run: TestnetRun) -> Registry {
+        self.reap_dropped();
         self.testnet_run = Some(run);
         self
     }
