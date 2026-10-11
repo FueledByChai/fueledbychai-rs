@@ -1,14 +1,16 @@
 //! The glue between one account's order-entry session and fbc-oms (FBC-x69b): an
 //! [`ExecHandler`] that routes every event the session hands it into the account's
 //! [`Registry`], and the one path commands take to the session, so the registry knows which
-//! request each answer names. It depends on fbc-core, fbc-oms and fbc-runtime only, so a later
-//! sample (FBC-elg7's testnet_quote) can promote it as it is.
+//! request each answer names. It depends on fbc-core, fbc-oms and fbc-runtime only. Shared by
+//! the samples that trade (`testnet_trade`, and FBC-elg7's `testnet_quote`), which include it
+//! by path with their tests; it is not a module of this crate's library target.
 //!
 //! - **Submitting.** [`Link::submit`] hands an fbc-oms [`Authorization`] to the session's
 //!   [`ExecOrders`] and remembers, under the request id it was given, the order each item of
 //!   the command names: a placement by its client id, a cancel by its client id (or the one the
 //!   registry holds for its venue id), an amend by the order it names with its new price and
-//!   total (FBC-xji8's acceptance program amends once; testnet_trade never does).
+//!   total (FBC-xji8's acceptance program amends once; testnet_trade and testnet_quote never
+//!   do, and each treats an amend of an order of ours as trouble).
 //! - **What became of a submission** ([`ExecHandler::on_submitted`]): sent, the placement's send
 //!   time ([`Registry::placement_sent`]), the cancel in flight ([`Registry::cancel_sent`]) or the
 //!   amend in flight ([`Registry::amend_sent`]) is recorded; not sent, every item's order is told
@@ -273,6 +275,8 @@ pub struct Link {
     epoch_error: Option<String>,
     origin: Instant,
     notes: Vec<Note>,
+    /// The places and cancels sent that notes [`Link::forget`] took counted.
+    forgotten: (usize, usize),
     /// The session's orders and the account, where Safety cancels go ([`Link::attach`]).
     session: Option<(ExecOrders, AccountKey)>,
     /// The Safety cancel request last submitted for each unprotected order.
@@ -297,6 +301,7 @@ impl Link {
             epoch_error: None,
             origin: Instant::now(),
             notes: Vec::new(),
+            forgotten: (0, 0),
             session: None,
             safety: HashMap::new(),
         }
@@ -353,11 +358,17 @@ impl Link {
     }
 
     /// How many places (requests whose items are placements) and cancels (cancels,
-    /// cancel-manys, cancel-alls) submitted here the session reported sent; an amend is
-    /// neither.
+    /// cancel-manys, cancel-alls) submitted here the session reported sent, those in notes
+    /// [`Link::forget`] took included; an amend is neither.
     pub fn sent_counts(&self) -> (usize, usize) {
+        let (places, cancels) = self.counted(&self.notes);
+        (self.forgotten.0 + places, self.forgotten.1 + cancels)
+    }
+
+    /// What [`Link::sent_counts`] counts in `notes`.
+    fn counted(&self, notes: &[Note]) -> (usize, usize) {
         let mut counts = (0, 0);
-        for note in &self.notes {
+        for note in notes {
             let Note::Submitted { rpc, sent: Ok(()) } = note else {
                 continue;
             };
@@ -369,6 +380,19 @@ impl Link {
             }
         }
         counts
+    }
+
+    /// Takes the first `upto` notes out and hands them over, for a driver that reads each note
+    /// once and runs for long (testnet_quote): the list then never grows with the run. What
+    /// [`Link::sent_counts`] counts of them is kept; [`Link::outcome_of`],
+    /// [`Link::login_refusals`] and [`Link::told_on`] see only the notes left.
+    pub fn forget(&mut self, upto: usize) -> Vec<Note> {
+        let upto = upto.min(self.notes.len());
+        let taken: Vec<Note> = self.notes.drain(..upto).collect();
+        let (places, cancels) = self.counted(&taken);
+        self.forgotten.0 += places;
+        self.forgotten.1 += cancels;
+        taken
     }
 
     /// What became of request `rpc`, submitted here, once every item is answered: not sent;
