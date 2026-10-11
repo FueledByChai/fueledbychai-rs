@@ -19,7 +19,14 @@
 mod args;
 #[path = "../../src/auth.rs"]
 mod auth;
+// Shared by the samples that trade: each uses a part of it.
+#[allow(dead_code)]
+#[path = "../../src/link.rs"]
 mod link;
+// Shared by the samples that trade: each uses a part of it.
+#[allow(dead_code)]
+#[path = "../../src/testnet.rs"]
+mod testnet;
 mod trade;
 
 use std::cell::RefCell;
@@ -68,8 +75,8 @@ fn main() -> ExitCode {
     };
     // Written by a thread of its own: a stalled standard output never blocks the runtime the
     // session, the timeouts and the cancels run on.
-    let (writer, printing) = trade::detached(io::stdout());
-    let out: trade::Out = Rc::new(RefCell::new(writer));
+    let (writer, printing) = testnet::detached(io::stdout());
+    let out: testnet::Out = Rc::new(RefCell::new(writer));
     let ran = runtime.block_on(trade::run(&opts, chain.as_deref(), creds, out));
     // Every line handed over is written before the exit (the run, and its socket, ended).
     drop(runtime);

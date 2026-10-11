@@ -18,8 +18,14 @@
 mod args;
 #[path = "../src/auth.rs"]
 mod auth;
-#[path = "../examples/testnet_trade/link.rs"]
+// Shared by the samples that trade: each uses a part of it.
+#[allow(dead_code)]
+#[path = "../src/link.rs"]
 mod link;
+// Shared by the samples that trade: each uses a part of it.
+#[allow(dead_code)]
+#[path = "../src/testnet.rs"]
+mod testnet;
 #[path = "../examples/testnet_trade/trade.rs"]
 mod trade;
 
@@ -582,7 +588,7 @@ fn script(placed: Arc<Mutex<Placed>>) -> WsScript {
 /// printed.
 async fn run_against(opts: &Options) -> (trade::Report, String) {
     let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
-    let out: trade::Out = buf.clone();
+    let out: testnet::Out = buf.clone();
     let run = trade::run(opts, None, secrets(), out);
     let ran = tokio::time::timeout(Duration::from_secs(60), run).await;
     let printed = String::from_utf8(buf.borrow().clone()).unwrap();
@@ -801,7 +807,7 @@ async fn a_mainnet_chain_id_or_url_is_refused_before_any_connection() {
         .unwrap();
     // The stub's own URLs, but the mainnet chain id.
     let opts = options(&stub, "10");
-    let out: trade::Out = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let out: testnet::Out = Rc::new(RefCell::new(Vec::<u8>::new()));
     let refused = trade::run(&opts, Some("PRIVATE_SN_PARACLEAR_MAINNET"), secrets(), out)
         .await
         .unwrap_err();
@@ -827,7 +833,7 @@ async fn a_mainnet_chain_id_or_url_is_refused_before_any_connection() {
         let mut opts = options(&stub, "10");
         opts.rest_url = rest.to_owned();
         opts.ws_url = ws.to_owned();
-        let out: trade::Out = Rc::new(RefCell::new(Vec::<u8>::new()));
+        let out: testnet::Out = Rc::new(RefCell::new(Vec::<u8>::new()));
         let refused = trade::run(&opts, None, secrets(), out).await.unwrap_err();
         assert!(refused.starts_with(named), "{refused}");
         assert!(refused.contains("testnet only"), "{refused}");
@@ -843,7 +849,7 @@ async fn an_order_below_the_minimum_notional_is_refused_before_the_session_conne
         .await
         .unwrap();
     let opts = options(&stub, "100");
-    let out: trade::Out = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let out: testnet::Out = Rc::new(RefCell::new(Vec::<u8>::new()));
     let refused = trade::run(&opts, None, secrets(), out).await.unwrap_err();
     assert!(
         refused.contains("below the market's minimum $100"),
@@ -1106,7 +1112,7 @@ async fn a_run_without_the_sole_trader_confirmation_or_through_a_proxy_to_a_stub
         .unwrap();
     let mut opts = options(&stub, "10");
     opts.sole_trader = false;
-    let out: trade::Out = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let out: testnet::Out = Rc::new(RefCell::new(Vec::<u8>::new()));
     let refused = trade::run(&opts, None, secrets(), out).await.unwrap_err();
     assert!(
         refused.starts_with("--sole-trader is required"),
@@ -1118,7 +1124,7 @@ async fn a_run_without_the_sole_trader_confirmation_or_through_a_proxy_to_a_stub
         host: "127.0.0.1".to_owned(),
         port: 9,
     };
-    let out: trade::Out = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let out: testnet::Out = Rc::new(RefCell::new(Vec::<u8>::new()));
     let refused = trade::run(&opts, None, secrets(), out).await.unwrap_err();
     assert!(
         refused.starts_with("--socks5 with loopback stub URLs"),
@@ -1137,7 +1143,7 @@ async fn the_client_id_high_water_mark_is_read_before_minting_and_kept_after() {
         .await
         .unwrap();
     let opts = options(&stub, "10");
-    let hwm = trade::HighWater::at(&opts.lease_dir, fbc_core::Namespace::new(1));
+    let hwm = testnet::HighWater::at(&opts.lease_dir, fbc_core::Namespace::new(1));
     let mark = 1u64 << 60;
     hwm.write(mark).unwrap();
     let (report, printed) = run_against(&opts).await;
@@ -1155,7 +1161,7 @@ async fn the_client_id_high_water_mark_is_read_before_minting_and_kept_after() {
         .unwrap();
     let mut opts = options(&stub, "10");
     opts.lease_dir = dir;
-    let out: trade::Out = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let out: testnet::Out = Rc::new(RefCell::new(Vec::<u8>::new()));
     let refused = trade::run(&opts, None, secrets(), out).await.unwrap_err();
     assert!(refused.contains("not a high-water mark"), "{refused}");
     assert!(stub.connections().is_empty());
@@ -1174,7 +1180,7 @@ fn the_resync_the_run_seeds_from_is_the_latest() {
             positions: vec![(InstrumentId::new(1), SignedLots(pos))],
         },
     };
-    assert!(trade::latest_resync(&[]).is_none());
+    assert!(testnet::latest_resync(&[]).is_none());
     // An earlier epoch's resync, a reconnect, then the current epoch's.
     let mut notes = vec![
         resynced(3),
@@ -1184,7 +1190,7 @@ fn the_resync_the_run_seeds_from_is_the_latest() {
         },
         resynced(-2),
     ];
-    let (_, snap) = trade::latest_resync(&notes).unwrap().unwrap();
+    let (_, snap) = testnet::latest_resync(&notes).unwrap().unwrap();
     assert_eq!(snap.positions, [(InstrumentId::new(1), SignedLots(-2))]);
     // A later resync the registry refused: the latest is that refusal, never the one before.
     notes.push(link::Note::EpochEnd {
@@ -1193,11 +1199,11 @@ fn the_resync_the_run_seeds_from_is_the_latest() {
     });
     notes.push(link::Note::ResyncRefused("duplicate".to_owned()));
     assert_eq!(
-        trade::latest_resync(&notes).unwrap().unwrap_err(),
+        testnet::latest_resync(&notes).unwrap().unwrap_err(),
         "duplicate"
     );
     notes.push(resynced(4));
-    let (_, snap) = trade::latest_resync(&notes).unwrap().unwrap();
+    let (_, snap) = testnet::latest_resync(&notes).unwrap().unwrap();
     assert_eq!(snap.positions, [(InstrumentId::new(1), SignedLots(4))]);
 }
 
@@ -1433,14 +1439,14 @@ fn the_snapshot_floor_is_the_highest_of_our_ids_it_shows() {
         orders: vec![],
         positions: vec![],
     };
-    assert_eq!(trade::snapshot_max(&snap), 0);
+    assert_eq!(testnet::snapshot_max(&snap), 0);
     snap.orders = vec![
         open(Some(CidMatch::Ours(b)), "V-2"),
         open(Some(CidMatch::Foreign(Namespace::new(9))), "V-3"),
         open(Some(CidMatch::Ours(a)), "V-1"),
         open(None, "V-4"),
     ];
-    assert_eq!(trade::snapshot_max(&snap), 43);
+    assert_eq!(testnet::snapshot_max(&snap), 43);
 }
 
 /// Runs testnet_trade against a stub whose cancel of the placed order ends it as `end`, with
@@ -1893,7 +1899,7 @@ fn the_output_writer_never_waits_for_a_stalled_sink() {
         held: false,
         got: Arc::clone(&got),
     };
-    let (mut writer, printing) = trade::detached(sink);
+    let (mut writer, printing) = testnet::detached(sink);
     // Every line is handed over while the sink is stalled on the first: none waits for it.
     let (done, wrote) = mpsc::channel();
     let lines = std::thread::spawn(move || {
@@ -1969,7 +1975,7 @@ fn a_resync_after_the_seed_that_disagrees_with_the_inventory_is_reported() {
         position: SignedLots(0),
     };
     let mut notes = vec![resynced(vec![]), resynced(vec![agrees])];
-    assert!(trade::resync_disagreements(&notes).is_empty());
+    assert!(testnet::resync_disagreements(&notes).is_empty());
     // A reconnect's resync showing the account long 5 lots where the registry holds 0.
     notes.push(resynced(vec![PositionCheck::Desync {
         inst,
@@ -1977,7 +1983,7 @@ fn a_resync_after_the_seed_that_disagrees_with_the_inventory_is_reported() {
         ledger: Some(SignedLots(0)),
     }]));
     notes.push(resynced(vec![PositionCheck::Unsettled(inst)]));
-    let found = trade::resync_disagreements(&notes);
+    let found = testnet::resync_disagreements(&notes);
     assert_eq!(found.len(), 2, "{found:?}");
     assert!(found[0].starts_with("Desync"), "{found:?}");
     assert!(found[1].starts_with("Unsettled"), "{found:?}");
@@ -2223,7 +2229,7 @@ fn a_blocking_write_that_outlives_its_timeout_does_not_hold_up_the_runtimes_end(
         .enable_all()
         .build()
         .unwrap();
-    let got = runtime.block_on(trade::off_thread(Duration::from_millis(50), move || {
+    let got = runtime.block_on(testnet::off_thread(Duration::from_millis(50), move || {
         held.recv().is_ok()
     }));
     assert_eq!(got, None);
@@ -2245,7 +2251,7 @@ fn a_blocking_write_that_outlives_its_timeout_does_not_hold_up_the_runtimes_end(
         .build()
         .unwrap();
     assert_eq!(
-        runtime.block_on(trade::off_thread(Duration::from_secs(10), || 7)),
+        runtime.block_on(testnet::off_thread(Duration::from_secs(10), || 7)),
         Some(7)
     );
 }
@@ -2270,7 +2276,7 @@ fn a_timed_out_write_keeps_what_it_holds_until_it_ends() {
         .enable_all()
         .build()
         .unwrap();
-    let got = runtime.block_on(trade::off_thread_holding(
+    let got = runtime.block_on(testnet::off_thread_holding(
         Duration::from_millis(50),
         lease,
         move || held.recv().is_ok(),
@@ -2295,7 +2301,7 @@ fn a_timed_out_write_keeps_what_it_holds_until_it_ends() {
     // keeps the lease for the rest of its run); dropping that releases it.
     let lease = NamespaceLease::acquire(&dir, acct, ns).unwrap();
     let (got, kept) = runtime
-        .block_on(trade::off_thread_holding(
+        .block_on(testnet::off_thread_holding(
             Duration::from_secs(10),
             lease,
             || 7,
@@ -2743,7 +2749,7 @@ async fn the_testnet_line_names_the_hosts_never_the_urls() {
     let mut opts = options(&stub, "100");
     opts.ws_url = stub.ws_url("/v1/SYNTHETIC-path-token-hunter2");
     let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
-    let out: trade::Out = buf.clone();
+    let out: testnet::Out = buf.clone();
     let refused = trade::run(&opts, None, secrets(), out).await.unwrap_err();
     assert!(refused.starts_with("--ws-url"), "{refused}");
     assert!(!refused.contains("hunter2"), "{refused}");
@@ -2751,7 +2757,7 @@ async fn the_testnet_line_names_the_hosts_never_the_urls() {
     assert!(stub.http_requests().is_empty());
     let opts = options(&stub, "100");
     let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
-    let out: trade::Out = buf.clone();
+    let out: testnet::Out = buf.clone();
     // Refused before the session connects (below the minimum notional), after the line.
     let refused = trade::run(&opts, None, secrets(), out).await.unwrap_err();
     let printed = String::from_utf8(buf.borrow().clone()).unwrap();
@@ -3462,21 +3468,21 @@ fn the_inventory_cap_is_at_the_highest_of_the_orders_price_and_the_touch() {
     let d = |v: &str| Decimal::from_str(v).unwrap();
     // A buy below a bid with no ask: the bid (Codex r4226246459).
     assert_eq!(
-        trade::inventory_price(d("104.5"), Some(d("110")), None),
+        testnet::inventory_price(d("104.5"), Some(d("110")), None),
         d("110")
     );
     // A buy on a full book: the ask.
     assert_eq!(
-        trade::inventory_price(d("104.5"), Some(d("110")), Some(d("110.1"))),
+        testnet::inventory_price(d("104.5"), Some(d("110")), Some(d("110.1"))),
         d("110.1")
     );
     // A sell above the ask, with or without a bid: its own price.
     assert_eq!(
-        trade::inventory_price(d("115.6"), None, Some(d("110.1"))),
+        testnet::inventory_price(d("115.6"), None, Some(d("110.1"))),
         d("115.6")
     );
     assert_eq!(
-        trade::inventory_price(d("115.6"), Some(d("110")), Some(d("110.1"))),
+        testnet::inventory_price(d("115.6"), Some(d("110")), Some(d("110.1"))),
         d("115.6")
     );
 }
@@ -3487,14 +3493,14 @@ fn the_default_lease_directory_is_under_an_absolute_home_only() {
     // the directory the run starts in, so two runs started in different directories would
     // not exclude each other. It is refused, as a relative --lease-dir is.
     assert_eq!(
-        args::lease_dir_under(Some("/home/trader".into())),
+        testnet::lease_dir_under(Some("/home/trader".into())),
         Ok(PathBuf::from("/home/trader/.fueledbychai/testnet_trade"))
     );
     for home in [Some("home/trader".into()), Some("".into()), None] {
-        let err = args::lease_dir_under(home).unwrap_err();
+        let err = testnet::lease_dir_under(home).unwrap_err();
         assert!(err.contains("give --lease-dir"), "{err}");
     }
-    let err = args::lease_dir_under(Some("trader".into())).unwrap_err();
+    let err = testnet::lease_dir_under(Some("trader".into())).unwrap_err();
     assert!(err.contains("not an absolute path"), "{err}");
     // The value itself is never shown.
     assert!(!err.contains("trader"), "{err}");

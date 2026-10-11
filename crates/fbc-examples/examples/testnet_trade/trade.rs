@@ -52,66 +52,69 @@
 
 use std::cell::RefCell;
 use std::fs;
-use std::future::Future;
-use std::io::Write;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use fbc_core::{
-    AccountKey, AssetSym, Channel, CidMatch, CidMint, ClientOrderId, ConnState, FundingSpec,
-    InstrumentId, InstrumentKind, InstrumentSpec, Lots, MarketLease, Namespace, NamespaceLease,
-    NewOrder, NonceBlock, NonceScope, NonceSource, OrderKind, PriceGrid, RpcId, Secrets, Side,
-    SignedLots, SizeStep, SpecTable, SubmitOutcome, Ticks, Tif, TradingStatus, UnderlyingId,
-    VenueConfig, VenueFactory, VenueId, WallNs, dispatch_market_data,
+    Channel, CidMatch, CidMint, ClientOrderId, ConnState, Lots, MarketLease, Namespace,
+    NamespaceLease, NewOrder, NonceScope, OrderKind, RpcId, Secrets, Side, SignedLots, SpecTable,
+    SubmitOutcome, Ticks, Tif, VenueConfig, VenueFactory,
 };
-use fbc_journal::NonceSourceId;
 use fbc_oms::{
     CancelChoice, CancelEverything, FillLedger, LadderConfig, LeaseKeys, Leases, LedgerConfig,
-    MarketCapsConfig, OrdState, PositionCheck, PreTradeCaps, Registry, ResyncReport,
-    ResyncSnapshot, Routed, TerminalKind, TestnetRun,
+    MarketCapsConfig, OrdState, PreTradeCaps, Registry, ResyncSnapshot, Routed, TerminalKind,
+    TestnetRun,
 };
-use fbc_runtime::http::{Bytes, Method, Request};
-use fbc_runtime::{
-    Connector, ExecControl, ExecOrders, ExecSession, ExecSessionConfig, IngestClock, RateLimiter,
-    ReconnectPacing, RpcIds, SafetyReserve, WriteStall,
-};
+use fbc_runtime::{ExecControl, ExecOrders, ExecSession};
 use fbc_venue_paradex::ParadexFactory;
-use fbc_venue_paradex::auth::{CHAIN_ID, REFRESH, REST_URL, SIGNATURE_LIFETIME, TIMEOUT};
-use fbc_venue_paradex::factory::{EXEC_MODE, EXEC_URL, RPC_TIMEOUT};
-use fbc_venue_paradex::md::rest::{OrderbookSnapshot, decode_orderbook, orderbook_path};
+use fbc_venue_paradex::md::rest::OrderbookSnapshot;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
-use std::sync::mpsc;
 use tokio::sync::Notify;
 
 use crate::args::{
     Options, OrderSide, TESTNET_CHAIN, Target, direct_to_stub, hosts, sole, testnet_guard,
 };
 use crate::link::{Link, LinkHandler, Note};
+use crate::testnet::{
+    ACCOUNT_LABEL, ACCT, INST, LOGIN_REFUSALS, Lines, REFUSAL_CAUSES, VENUE, drive_with,
+    px_or_none, wall_now,
+};
+use crate::testnet::{
+    HighWater, Out, inventory_price, latest_resync, off_thread_holding, resync_disagreements,
+    snapshot_max,
+};
 
-/// Where the lines go: standard output when run, a buffer under test.
-pub type Out = Rc<RefCell<dyn Write>>;
+/// The Paradex configuration for `opts`' URLs ([`crate::testnet::config`]).
+pub fn config(opts: &Options) -> VenueConfig {
+    crate::testnet::config(&opts.rest_url, &opts.ws_url)
+}
 
-/// The one market's instrument id and the account's number.
-pub const INST: InstrumentId = InstrumentId::new(1);
-const ACCT: AccountKey = AccountKey::new(1);
+/// The one market's spec from `opts` ([`crate::testnet::specs`]).
+pub fn specs(
+    venue: &dyn VenueFactory,
+    cfg: &VenueConfig,
+    opts: &Options,
+) -> Result<SpecTable, String> {
+    crate::testnet::specs(venue, cfg, &opts.market, opts.tick, opts.step)
+}
 
-/// The venue's id as the lease files name it, and the account's name in them: a label, never
-/// the account's address.
-const VENUE: &str = "PARADEX";
-const ACCOUNT_LABEL: &str = "testnet";
+/// The market's REST order book under `opts` ([`crate::testnet::touch`]).
+async fn touch(opts: &Options, specs: &SpecTable) -> Result<OrderbookSnapshot, String> {
+    let wait = Duration::from_secs(opts.step_timeout_secs);
+    crate::testnet::touch(&opts.rest_url, &opts.market, &opts.proxy, wait, specs).await
+}
 
-/// How long an order request awaits its reply before it is `Unknown`.
-const RPC_WAIT: &str = "5000ms";
-
-/// How many logins refused in a row stop the run: the venue answered, and a key, an address or
-/// an account it refuses is not mended by reconnecting.
-pub const LOGIN_REFUSALS: usize = 3;
-
-/// The usual causes of a refused login, printed with the refusal (and in `--help`).
-const REFUSAL_CAUSES: &str = "the usual causes: a mainnet key on testnet (Paradex derives the \
-     account's L2 key per network), an Ethereum address instead of the Paradex (Starknet) one in \
-     PARADEX_ACCOUNT_ADDRESS, or an account not onboarded on the testnet, or unfunded";
+/// The order-entry session's configuration under `opts` ([`crate::testnet::session_config`]).
+fn session_config(
+    venue: &'static ParadexFactory,
+    cfg: VenueConfig,
+    creds: Secrets,
+    specs: SpecTable,
+    opts: &Options,
+) -> Result<fbc_runtime::ExecSessionConfig, String> {
+    crate::testnet::session_config(venue, cfg, creds, specs, &opts.proxy, opts.namespace)
+}
 
 /// What a run did: whether every step happened, and how many places and cancels the session
 /// reported sent.
@@ -120,56 +123,6 @@ pub struct Report {
     pub ok: bool,
     pub places_sent: usize,
     pub cancels_sent: usize,
-}
-
-/// A writer that never blocks its caller: each write is handed to a thread of its own that
-/// writes it to the sink, in order, and flushes. Dropping it (every clone of the [`Out`] holding
-/// it) ends the thread once it has written everything; join the handle to wait for that.
-pub struct Detached(mpsc::Sender<Vec<u8>>);
-
-/// A [`Detached`] writer over `sink`, and its thread.
-pub fn detached<W: Write + Send + 'static>(mut sink: W) -> (Detached, std::thread::JoinHandle<()>) {
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    let thread = std::thread::spawn(move || {
-        for chunk in rx {
-            // A sink that fails loses the line; the run goes on to its Stop regardless.
-            let _ = sink.write_all(&chunk).and_then(|()| sink.flush());
-        }
-    });
-    (Detached(tx), thread)
-}
-
-impl Write for Detached {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // The channel is unbounded, so this never waits; it fails only once the thread ended.
-        self.0
-            .send(buf.to_vec())
-            .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Lines with the milliseconds since the start.
-#[derive(Clone)]
-struct Lines {
-    out: Out,
-    t0: Instant,
-}
-
-impl Lines {
-    fn line(&self, text: std::fmt::Arguments<'_>) {
-        // A line that cannot be written is lost; the run goes on to its Stop regardless.
-        let _ = writeln!(self.out.borrow_mut(), "{text}");
-    }
-
-    fn step(&self, step: &str, text: std::fmt::Arguments<'_>) {
-        let ms = self.t0.elapsed().as_millis();
-        self.line(format_args!("STEP {step:<10} +{ms}ms  {text}"));
-    }
 }
 
 /// Runs testnet_trade: the guard first, before anything connects; then the touch, the order,
@@ -372,124 +325,6 @@ pub async fn run(
     Ok(report)
 }
 
-/// Runs the session beside `driver` until the driver is done (it drops the session's control,
-/// so the session then stops); the session's end first is an error.
-async fn drive_with<H: fbc_runtime::ExecHandler>(
-    session: &mut ExecSession<H>,
-    driver: impl Future<Output = bool>,
-) -> Result<bool, String> {
-    let running = session.run();
-    tokio::pin!(running);
-    tokio::pin!(driver);
-    tokio::select! {
-        ended = &mut running => Err(match ended {
-            Ok(()) => "stopped".to_owned(),
-            Err(e) => e.to_string(),
-        }),
-        ok = &mut driver => {
-            // The control is dropped: the session closes its socket and returns.
-            let _ = tokio::time::timeout(Duration::from_secs(5), &mut running).await;
-            Ok(ok)
-        }
-    }
-}
-
-/// The wall clock now.
-fn wall_now() -> WallNs {
-    let ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    WallNs(i64::try_from(ns).unwrap_or(i64::MAX))
-}
-
-/// The Paradex configuration: order entry on the WebSocket, the REST base for the login and
-/// the resync, the testnet chain id, and the timings.
-pub fn config(opts: &Options) -> VenueConfig {
-    let mut cfg = VenueConfig::new();
-    for (key, value) in [
-        (EXEC_URL, opts.ws_url.as_str()),
-        (EXEC_MODE, "orders"),
-        (RPC_TIMEOUT, RPC_WAIT),
-        (REST_URL, opts.rest_url.as_str()),
-        (CHAIN_ID, TESTNET_CHAIN),
-        (SIGNATURE_LIFETIME, "600s"),
-        (REFRESH, "60s"),
-        (TIMEOUT, "5000ms"),
-    ] {
-        cfg.insert(key, value);
-    }
-    cfg
-}
-
-/// The one market's spec, from the command line: its tick, size step and minimum size of one
-/// lot. The minimum notional is checked by [`price`], not here.
-pub fn specs(
-    venue: &dyn VenueFactory,
-    cfg: &VenueConfig,
-    opts: &Options,
-) -> Result<SpecTable, String> {
-    let caps = venue.caps(cfg).map_err(|e| e.to_string())?;
-    let venue_symbol = dispatch_market_data(&caps, |scope| scope.venue_symbol(&opts.market))
-        // Neither the value nor the venue's error (which may quote it) is shown.
-        .map_err(|_| "--market: not a symbol the Paradex adapter takes (the value is not shown)")?;
-    let price_grid = PriceGrid::fixed(opts.tick).map_err(|e| format!("--tick: {e:?}"))?;
-    let size_step = SizeStep::new(opts.step).ok_or("--step: not a valid size step")?;
-    let usd = AssetSym::new("USD").expect("an asset symbol");
-    let mut table = SpecTable::new();
-    table.insert(InstrumentSpec {
-        id: INST,
-        venue: VenueId::new(1),
-        venue_symbol,
-        native_id: None,
-        underlying: UnderlyingId::new(INST.get()),
-        kind: InstrumentKind::Perpetual,
-        price_grid,
-        quote_grid: None,
-        size_step,
-        min_size: Lots::new(1).expect("one lot"),
-        min_notional: None,
-        max_order_size: None,
-        position_limit: None,
-        price_band: None,
-        max_open_orders: None,
-        multiplier: Decimal::ONE,
-        quote_ccy: usd,
-        settle_ccy: usd,
-        funding: FundingSpec::Unknown,
-        public_fees: None,
-        status: TradingStatus::Trading,
-        version: 1,
-        fetched_at: WallNs(0),
-    });
-    Ok(table)
-}
-
-/// The market's REST order book (`GET /orderbook`), read before the order is priced and again
-/// just before it is placed.
-async fn touch(opts: &Options, specs: &SpecTable) -> Result<OrderbookSnapshot, String> {
-    let origin = opts
-        .rest_url
-        .trim_end_matches('/')
-        .strip_suffix("/v1")
-        .ok_or("--rest-url: not a base ending in /v1")?;
-    let url = format!("{origin}{}", orderbook_path(&opts.market));
-    let request = Request::builder()
-        .method(Method::GET)
-        .uri(&url)
-        .body(Bytes::new())
-        .map_err(|e| format!("GET /orderbook: {e}"))?;
-    let connector = Connector::new(opts.proxy.clone());
-    let wait = Duration::from_secs(opts.step_timeout_secs);
-    let response = tokio::time::timeout(wait, connector.http(request, 1 << 20))
-        .await
-        .map_err(|_| "GET /orderbook: no answer in time".to_owned())?
-        .map_err(|e| format!("GET /orderbook: {e}"))?;
-    if !response.status().is_success() {
-        return Err(format!("GET /orderbook: status {}", response.status()));
-    }
-    decode_orderbook(response.body(), specs).map_err(|e| format!("GET /orderbook: {e:?}"))
-}
-
 /// The order as priced and sized, and the caps at its price.
 pub struct Priced {
     /// The touch: the best bid and ask, `None` for a side with nothing resting.
@@ -502,11 +337,6 @@ pub struct Priced {
     pub notional: Decimal,
     pub resting: Lots,
     pub inventory: Lots,
-}
-
-/// A price, or `none` for a side with nothing resting.
-fn px_or_none(px: Option<Decimal>) -> String {
-    px.map_or_else(|| "none".to_owned(), |px| px.to_string())
 }
 
 /// The touch `book` shows on the tick, as prices: its best bid and ask, `None` for a side with
@@ -572,14 +402,6 @@ fn away_from(opts: &Options, book: &OrderbookSnapshot) -> Result<Touch, String> 
         ask,
         away: ticks,
     })
-}
-
-/// The price the inventory cap is converted at: the highest of the order's price `px` and the
-/// touch's sides that rest, so a position is never worth more than the cap at the market. A
-/// buy's own price is below the bid, so on a book with no asks the bid is the market's price
-/// (Codex r4226246459 on PR #114).
-pub fn inventory_price(px: Decimal, bid: Option<Decimal>, ask: Option<Decimal>) -> Decimal {
-    [bid, ask].into_iter().flatten().fold(px, Decimal::max)
 }
 
 /// The order `--away-bps` behind the touch on the tick and `--order-usd`'s size on the size
@@ -688,77 +510,6 @@ impl Recheck {
         }
         Ok((now, book.seq_no))
     }
-}
-
-/// Nonces counted up from 1: Paradex asks for none, but the session reserves one per item and
-/// per arm as the contract says.
-struct Counting(u64);
-
-impl NonceSource for Counting {
-    fn reserve(&mut self, len: u16) -> NonceBlock {
-        let block = NonceBlock::consecutive(self.0, len).expect("a block of nonces");
-        self.0 += u64::from(len);
-        block
-    }
-}
-
-/// The order-entry session's configuration: reconnects paced from 250 ms to 5 s, at most 5
-/// attempts a minute, each given 10 s; normal traffic stopping at 90% of each declared limit; a
-/// write a peer stopped reading ends its connection after 10 s.
-fn session_config(
-    venue: &'static ParadexFactory,
-    cfg: VenueConfig,
-    creds: Secrets,
-    specs: SpecTable,
-    opts: &Options,
-) -> Result<ExecSessionConfig, String> {
-    let caps = venue.caps(&cfg).map_err(|e| e.to_string())?;
-    let limiter = RateLimiter::new(
-        &caps.limits,
-        SafetyReserve::percent(10).expect("a valid reserve"),
-    )
-    .map_err(|e| format!("{e:?}"))?;
-    Ok(ExecSessionConfig {
-        venue,
-        cfg,
-        creds,
-        acct: ACCT,
-        rpc_ids: RpcIds::default(),
-        ns: Namespace::new(opts.namespace),
-        specs,
-        connector: Connector::new(opts.proxy.clone()),
-        pacing: ReconnectPacing::new(
-            Duration::from_millis(250),
-            Duration::from_secs(5),
-            5,
-            Duration::from_secs(60),
-            Duration::from_secs(10),
-        )
-        .expect("valid pacing"),
-        clock: IngestClock::new(),
-        nonces: Box::new(Counting(1)),
-        // One source for the account: Paradex's scope is `NonceScope::None`, so the one
-        // `Counting` this run reserves from is the account's, journaled under its number (0078).
-        nonce_source: NonceSourceId(u32::from(ACCT.get())),
-        conn: 0,
-        limiter,
-        write_stall: WriteStall::new(Duration::from_secs(10)).expect("a non-zero window"),
-        http_max_body: 1 << 20,
-    })
-}
-
-/// An applied resync: its report and the snapshot it applied.
-pub type Applied<'a> = (&'a ResyncReport, &'a ResyncSnapshot);
-
-/// The latest resync, applied or refused (why): once the session takes places, the one whose
-/// end opened the current epoch's gate, never an earlier epoch's. A refused one means the gate
-/// is open with no resync applied behind it.
-pub fn latest_resync(notes: &[Note]) -> Option<Result<Applied<'_>, &str>> {
-    notes.iter().rev().find_map(|n| match n {
-        Note::Resynced { report, snapshot } => Some(Ok((report, snapshot))),
-        Note::ResyncRefused(why) => Some(Err(why.as_str())),
-        _ => None,
-    })
 }
 
 /// What shows the account changed since the seed, or might hold what the run cannot see, in
@@ -872,74 +623,6 @@ pub fn account_changes(
         );
     }
     changes
-}
-
-/// As [`off_thread`], holding `held` until `work` ends, even past the timeout: a lease `work`
-/// relies on stays held while it runs. Work that ends in time hands `held` back with its
-/// result, for the caller to keep; past the timeout it is dropped on the work's thread once
-/// the work ends.
-pub async fn off_thread_holding<H: Send + 'static, T: Send + 'static>(
-    timeout: Duration,
-    held: H,
-    work: impl FnOnce() -> T + Send + 'static,
-) -> Option<(T, H)> {
-    off_thread(timeout, move || (work(), held)).await
-}
-
-/// Runs `work` on a thread of its own and waits up to `timeout` for its result: `None` when it
-/// did not finish in time (or panicked). The thread is detached, never a runtime's blocking
-/// pool, so work stalled past the timeout (a `sync_all` on a stalled disk) never holds up the
-/// runtime's end, and so the sample's exit.
-pub async fn off_thread<T: Send + 'static>(
-    timeout: Duration,
-    work: impl FnOnce() -> T + Send + 'static,
-) -> Option<T> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    std::thread::spawn(move || {
-        // The receiver is gone when the wait timed out: the result is then dropped.
-        let _ = tx.send(work());
-    });
-    tokio::time::timeout(timeout, rx).await.ok()?.ok()
-}
-
-/// The highest sequence of our namespace's client ids among the open orders `snapshot` shows, 0
-/// when it shows none.
-pub fn snapshot_max(snapshot: &ResyncSnapshot) -> u64 {
-    snapshot
-        .orders
-        .iter()
-        .filter_map(|o| match o.cid {
-            Some(fbc_core::CidMatch::Ours(cid)) => Some(cid.seq()),
-            _ => None,
-        })
-        .max()
-        .unwrap_or(0)
-}
-
-/// What the resyncs after the first (a reconnect's) found wrong with the positions the
-/// registry holds: a market whose venue position differs from its inventory (`Desync`), or
-/// could not be compared (`Stale`, `Unsettled`), or a fill the resync could not place. A later
-/// resync never overwrites the inventory, so the run cannot go on from it.
-pub fn resync_disagreements(notes: &[Note]) -> Vec<String> {
-    notes
-        .iter()
-        .filter_map(|n| match n {
-            Note::Resynced { report, .. } => Some(report),
-            _ => None,
-        })
-        .flat_map(|report| {
-            let checks = report
-                .checks
-                .iter()
-                .filter(|c| !matches!(c, PositionCheck::Agrees { .. }))
-                .map(|c| format!("{c:?}"));
-            let unsettled = report
-                .unsettled
-                .iter()
-                .map(|(inst, _)| format!("Unsettled fill on instrument {}", inst.get()));
-            checks.chain(unsettled).collect::<Vec<_>>()
-        })
-        .collect()
 }
 
 /// Those of `owned` (our orders on the market, each with what of it had filled when the run
@@ -1062,59 +745,6 @@ pub fn not_cancelled(
             }
         })
         .collect()
-}
-
-/// The client-id mint's high-water mark, kept in a file of the lease directory across runs, so
-/// a run whose wall clock stepped back never mints an id an earlier run used (the namespace
-/// lease keeps two minters apart, not two runs).
-#[derive(Clone)]
-pub struct HighWater {
-    path: std::path::PathBuf,
-}
-
-impl HighWater {
-    /// The mark of namespace `ns` kept in `dir`.
-    pub fn at(dir: &std::path::Path, ns: Namespace) -> HighWater {
-        let name = format!("cid-high-water-account-{}-ns-{}", ACCT.get(), ns.get());
-        HighWater {
-            path: dir.join(name),
-        }
-    }
-
-    /// The mark kept, 0 when none was.
-    pub fn read(&self) -> Result<u64, String> {
-        match fs::read_to_string(&self.path) {
-            Ok(text) => text
-                .trim()
-                .parse()
-                .map_err(|_| format!("{}: not a high-water mark", self.path.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
-            Err(e) => Err(format!("{}: {e}", self.path.display())),
-        }
-    }
-
-    /// Keeps `mark`: written whole to a file beside it and synced, renamed over the mark, and
-    /// the directory synced, so the mark is on the disk when this returns.
-    pub fn write(&self, mark: u64) -> Result<(), String> {
-        use std::io::Write as _;
-        let tmp = self.path.with_extension("tmp");
-        let durable = || -> std::io::Result<()> {
-            // The new mark reaches the disk before it replaces the old, and the rename does
-            // before the order goes out: a power loss leaves the old mark or the new, never none.
-            let mut file = fs::File::create(&tmp)?;
-            file.write_all(mark.to_string().as_bytes())?;
-            file.sync_all()?;
-            fs::rename(&tmp, &self.path)?;
-            let dir = self.path.parent().unwrap_or(std::path::Path::new("."));
-            fs::File::open(dir)?.sync_all()
-        };
-        durable().map_err(|e| {
-            format!(
-                "{}: cannot keep the client-id high-water mark: {e}",
-                self.path.display()
-            )
-        })
-    }
 }
 
 /// The order to place: its side, price and size.

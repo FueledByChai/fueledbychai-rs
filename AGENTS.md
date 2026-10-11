@@ -361,15 +361,15 @@ rather than guess.
     `examples/testnet_trade/` (FBC-x69b): Paradex TESTNET only (the URLs, exactly the testnet's
     or a loopback stub's at `/v1`, and the chain id checked before anything connects), an
     fbc-oms registry declared an owner-assisted testnet run (decision 0067) behind one
-    `ExecSession`, its events routed into the registry by `link.rs` (the ExecHandler-to-Registry
-    glue a later sample can promote), one post-only order placed well away from the touch read
+    `ExecSession`, its events routed into the registry by `src/link.rs` (the ExecHandler-to-Registry
+    glue), one post-only order placed well away from the touch read
     from `GET /orderbook` (read again just before the place), its size, caps, side, distance and
     client-id namespace all required flags, cancelled, then Stop (`tests/testnet_trade.rs`,
     against a Paradex-shaped conformance stub). Its credentials come from environment variables
     through `src/auth.rs`, a review path included by path, not a module of the empty library
     target. And `examples/paradex_testnet_acceptance/` (FBC-xji8): FBC-8xr's owner-run
-    acceptance run on Paradex TESTNET, reusing testnet_trade's flags, guard, glue and helpers
-    by path: place, amend, cancel, batch create, cancel-many, an IOC expiry and
+    acceptance run on Paradex TESTNET, reusing testnet_trade's flags and helpers and the shared
+    glue and guard by path: place, amend, cancel, batch create, cancel-many, an IOC expiry and
     cancel-on-disconnect on a dropped socket and on a graceful close, each through an fbc-oms
     authorization, in three phases (a fresh registry and session each); after every step its
     own authenticated REST reads (`src/auth_rest.rs`, a review path) compare GET /orders and
@@ -377,6 +377,13 @@ rather than guess.
     and a scrubbed fixture slice for `fixtures/paradex/exec-recorded/`
     (`tests/paradex_testnet_acceptance.rs`, against a stub model of the account; how the owner
     runs it, from the deployment box too: `crates/fbc-examples/README.md`).
+    And `examples/testnet_quote/` (FBC-elg7): the same testnet guard and wiring, a
+    PLUMBING TEST, NOT A STRATEGY: one post-only order a side a fixed offset behind the touch,
+    requoted through fbc-oms's `ExecutionPlanner` given Paradex's caps with no amend
+    (cancel-and-replace only), every order of ours still open cancelled after each reconnect
+    before any place, Stop on Ctrl-C, `--duration`, `--cycles`, a resync mismatch, any Unknown
+    order or a refused login (`tests/testnet_quote.rs`). The samples that trade share
+    `src/link.rs` (the glue) and `src/testnet.rs` (guard and wiring), included by path.
   - `crates/venues/fbc-venues` (the registry, the only crate with a normal dependency on a
     concrete venue; `crates/fbc-examples` reaches them only as dev-dependencies),
     `crates/venues/fbc-venue-binance-usdm` (market data only:
