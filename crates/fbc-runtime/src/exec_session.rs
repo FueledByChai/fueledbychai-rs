@@ -238,6 +238,15 @@ pub trait ExecHandler {
     fn on_unprotected(&mut self, orders: &[VenueOrderSnapshot]) {
         let _ = orders;
     }
+
+    /// A frame or HTTP answer of epoch `key` that the codec could not decode, as it is read and
+    /// before the next input (also counted, `ExecCounters::decode_errors`): it may have held a
+    /// fill, a position or an order event the consumer never sees, so a consumer that trades on
+    /// what it heard stops here rather than once the session ended (FBC-elg7). Nothing by
+    /// default.
+    fn on_decode_error(&mut self, key: ConnKey) {
+        let _ = key;
+    }
 }
 
 impl<F: FnMut(Envelope<ExecEvent>)> ExecHandler for F {
@@ -869,6 +878,7 @@ impl<H: ExecHandler> ExecSession<H> {
         });
         if decoded.is_err() {
             self.decode_errors += 1;
+            self.handler.on_decode_error(stamp.conn);
         }
         Some(stamp)
     }
@@ -1598,6 +1608,7 @@ impl<H: ExecHandler> EpochInputs for Feed<'_, H> {
         });
         if decoded.is_err() {
             *self.decode_errors += 1;
+            self.handler.on_decode_error(stamp.conn);
         }
     }
 

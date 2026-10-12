@@ -601,6 +601,8 @@ fn setup(
 enum Heard {
     Event(ThreadId, Box<Envelope<ExecEvent>>),
     End(ConnKey),
+    /// A frame or HTTP answer of the epoch the codec could not decode.
+    Undecoded(ConnKey),
 }
 
 type Log = Rc<RefCell<Vec<Heard>>>;
@@ -632,6 +634,10 @@ impl ExecHandler for Keep {
 
     fn on_epoch_end(&mut self, key: ConnKey) {
         self.log.borrow_mut().push(Heard::End(key));
+    }
+
+    fn on_decode_error(&mut self, key: ConnKey) {
+        self.log.borrow_mut().push(Heard::Undecoded(key));
     }
 }
 
@@ -719,6 +725,7 @@ async fn on_open_gets_exactly_its_nonces_each_epoch_and_events_arrive_stamped_in
     let log = log.borrow();
     let mut envs = Vec::new();
     let mut ends = Vec::new();
+    let mut undecoded = Vec::new();
     for heard in log.iter() {
         match heard {
             Heard::Event(thread, env) => {
@@ -726,9 +733,13 @@ async fn on_open_gets_exactly_its_nonces_each_epoch_and_events_arrive_stamped_in
                 envs.push(env);
             }
             Heard::End(key) => ends.push((envs.len(), *key)),
+            Heard::Undecoded(key) => undecoded.push((envs.len(), *key)),
         }
     }
     assert_eq!(ends, [(3, key(0)), (4, key(1))]);
+    // The undecodable frame is told as it is read, after the events before it and before the
+    // epoch's end (FBC-elg7: a consumer stops on it rather than trade on what it missed).
+    assert_eq!(undecoded, [(3, key(0))]);
     let conns: Vec<_> = envs.iter().map(|e| e.stamp.conn).collect();
     assert_eq!(conns, [key(0), key(0), key(0), key(1)]);
     // The ping, the undecodable frame and the close frame took their places too.
@@ -908,14 +919,15 @@ async fn settle(done: impl Fn() -> bool) {
     panic!("not settled");
 }
 
-/// The epochs the handler heard events of, and its ends, in order.
+/// The epochs the handler heard events of, and its ends, in order (decode errors aside).
 fn heard_conns(log: &Log) -> Vec<(bool, ConnKey)> {
     let log = log.borrow();
     let conn = |heard: &Heard| match heard {
-        Heard::Event(_, env) => (true, env.stamp.conn),
-        Heard::End(key) => (false, *key),
+        Heard::Event(_, env) => Some((true, env.stamp.conn)),
+        Heard::End(key) => Some((false, *key)),
+        Heard::Undecoded(_) => None,
     };
-    log.iter().map(conn).collect()
+    log.iter().filter_map(conn).collect()
 }
 
 #[tokio::test]
@@ -1474,6 +1486,16 @@ async fn stray_effects_are_refused_and_a_reconnect_the_codec_asks_for_opens_the_
     // turn (Codex r4188639448).
     let counters = session.counters();
     assert_eq!((counters.refused_effects, counters.decode_errors), (2, 1));
+    // The HTTP result the toy could not decode was told to the handler, on its epoch.
+    let told: Vec<ConnKey> = log
+        .borrow()
+        .iter()
+        .filter_map(|h| match h {
+            Heard::Undecoded(key) => Some(*key),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(told, [key(0)]);
     let rang: Vec<_> = venue.timers().iter().map(|(tag, _)| *tag).collect();
     assert_eq!(rang, [TimerTag(1)]);
     assert_eq!(session.stale(Input::Timer) + session.stale(Input::Http), 0);
@@ -1483,7 +1505,7 @@ async fn stray_effects_are_refused_and_a_reconnect_the_codec_asks_for_opens_the_
         .iter()
         .filter_map(|h| match h {
             Heard::End(k) => Some(*k),
-            Heard::Event(..) => None,
+            Heard::Event(..) | Heard::Undecoded(_) => None,
         })
         .collect();
     assert_eq!(ends, [key(0), key(1)]);

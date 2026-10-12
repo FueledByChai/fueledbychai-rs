@@ -48,6 +48,8 @@
 //!   not at all is not cancelled: decision 0080 queries it, and no order query is built here
 //!   yet (FBC-m8vm), so its market stays held, which is safe. [`Note::Unprotected`] says what
 //!   was done.
+//! - **Undecodable input** ([`ExecHandler::on_decode_error`]): noted as a problem as it is
+//!   read, so a driver stops trading on what it may have missed.
 //! - **Notes.** Everything the driver may wait on is appended to [`Link::notes`], in order.
 //!
 //! Times on the shard's monotonic clock are taken from each event's stamp; a submission's send
@@ -867,6 +869,16 @@ impl ExecHandler for LinkHandler {
 
     fn on_unprotected(&mut self, orders: &[VenueOrderSnapshot]) {
         self.link.borrow_mut().on_unprotected(orders);
+        self.wake.notify_waiters();
+    }
+
+    /// A frame or HTTP answer the codec could not decode: a problem, which ends the driver's
+    /// trading (it may have held a fill, a position or an order event never seen).
+    fn on_decode_error(&mut self, key: ConnKey) {
+        self.link.borrow_mut().problem(format!(
+            "connection {key:?}: a frame or HTTP answer the codec could not decode (it may have \
+             held a fill, a position or an order event never seen)"
+        ));
         self.wake.notify_waiters();
     }
 }
