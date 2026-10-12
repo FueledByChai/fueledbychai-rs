@@ -75,7 +75,7 @@ use tokio::sync::Notify;
 use crate::args::{
     Options, OrderSide, TESTNET_CHAIN, Target, direct_to_stub, hosts, sole, testnet_guard,
 };
-use crate::link::{Link, LinkHandler, Note};
+use crate::link::{Link, LinkHandler, Note, async_reject};
 use crate::testnet::{
     ACCOUNT_LABEL, ACCT, INST, LOGIN_REFUSALS, Lines, REFUSAL_CAUSES, VENUE, drive_with,
     px_or_none, wall_now,
@@ -520,9 +520,9 @@ impl Recheck {
 /// market), an order not ours that an order event reported (even one ended since), an order of
 /// `owned` that filled since the run took it on ([`traded`]: the round
 /// trip can no longer be clean), an amend of an order of ours (the sample never amends), a
-/// problem the link noted ([`Note::Problem`]: a venue error after login, an asynchronous
-/// reject, an event or outcome the registry could not apply), or an order not ours in view on
-/// the market. Empty when nothing does.
+/// problem the link noted ([`Note::Problem`]: a venue error after login, an event or outcome
+/// the registry could not apply), an asynchronous reject ([`Note::AsyncReject`]), or an order
+/// not ours in view on the market. Empty when nothing does.
 pub fn account_changes(
     notes: &[Note],
     reg: &Registry,
@@ -586,6 +586,10 @@ pub fn account_changes(
             // A venue error after login, an asynchronous reject, or what the glue could not
             // apply leaves the run uncertain (Codex r4226570456 on PR #114).
             Note::Problem(what) => changes.push(format!("the run noted a problem: {what}")),
+            Note::AsyncReject { op, reject, .. } => changes.push(format!(
+                "the run noted a problem: {}",
+                async_reject(*op, reject)
+            )),
             Note::Position { inst, qty } => {
                 // The resync refuses an account with a position on another market.
                 let expected = if *inst == INST {
@@ -817,6 +821,9 @@ impl Driver {
         for note in notes {
             match note {
                 Note::Problem(what) => self.note(format_args!("{what}")),
+                Note::AsyncReject { op, reject, .. } => {
+                    self.note(format_args!("{}", async_reject(*op, reject)));
+                }
                 Note::Fill { seen, .. } => self.note(format_args!("a fill: {seen}")),
                 Note::Position { inst, qty } => self.note(format_args!(
                     "the account's position in instrument {} is {} lots",

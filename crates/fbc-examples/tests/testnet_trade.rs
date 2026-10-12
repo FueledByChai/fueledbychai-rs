@@ -2593,6 +2593,25 @@ fn the_account_audit_counts_an_amend_of_ours_and_every_problem_the_link_noted() 
         changes[0].starts_with("the run noted a problem: venue error naming no request"),
         "{changes:?}"
     );
+    // Every asynchronous reject, a post-only one's too: the sample's one order was refused
+    // after its accept (testnet_quote alone takes POST_ONLY_WOULD_CROSS as a quote's end).
+    let reject = link::Note::AsyncReject {
+        target: fbc_core::OrderRef::Client(cid),
+        op: fbc_core::OpKind::Place,
+        reject: fbc_core::Reject {
+            kind: fbc_core::RejectKind::PostOnlyWouldCross,
+            venue_code: None,
+            raw: "POST_ONLY_WOULD_CROSS".into(),
+        },
+    };
+    let changes = trade::account_changes(&[reject], &reg, None, &[]);
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert_eq!(
+        changes[0],
+        "the run noted a problem: asynchronous reject of a Place: PostOnlyWouldCross \
+         (POST_ONLY_WOULD_CROSS)",
+        "{changes:?}"
+    );
     // An ordinary update of ours is not a change.
     let advanced = link::Note::Order(Routed::Ours(cid, Applied::Advanced));
     assert!(trade::account_changes(&[advanced], &reg, None, &[]).is_empty());

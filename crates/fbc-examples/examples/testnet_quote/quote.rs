@@ -35,8 +35,11 @@
 //! expect ([`Driver::absorb`]): a refused login, a resync that disagrees with the inventory or
 //! that the registry refuses, an order of ours gone Unknown (the loop does not drive the Unknown
 //! ladder: no Paradex order query is wired here), an order or a fill not ours, an amend of ours,
-//! a problem the link noted, a book that does not settle within the step timeout, and the
-//! session's end.
+//! a problem the link noted, an asynchronous reject other than one of our own post-only places
+//! closed POST_ONLY_WOULD_CROSS (that side is left out of the cycle and placed again the next),
+//! a book that does not settle within the step timeout, and the session's end. Each is taken as
+//! it comes: a touch being read is not waited for ([`Driver::touch_unless_ended`]), and a pass
+//! reads the notes again after its waits, before it plans ([`Driver::halted`]).
 //!
 //! **Memory.** The link's notes are read once each ([`Driver::absorb`]) and those read are
 //! forgotten every cycle ([`Link::forget`]), so a long run keeps no growing note list.
@@ -50,8 +53,8 @@ use std::time::{Duration, Instant};
 
 use fbc_core::{
     Bps, Channel, CidMatch, CidMint, ClientOrderId, ConnState, Lots, MarketLease, Namespace,
-    NamespaceLease, NonceScope, OrderCaps, OrderKindTag, RpcId, Secrets, Side, SignedLots,
-    SpecTable, SubmitOutcome, Ticks, Tif, TifTag, VenueFactory,
+    NamespaceLease, NonceScope, OpKind, OrderCaps, OrderKindTag, RejectKind, RpcId, Secrets, Side,
+    SignedLots, SpecTable, SubmitOutcome, Ticks, Tif, TifTag, VenueFactory,
 };
 use fbc_oms::{
     Applied, CancelChoice, CancelEverything, DesiredBook, DesiredQuote, ExecutionPlanner,
@@ -67,7 +70,7 @@ use rust_decimal::prelude::ToPrimitive;
 use tokio::sync::Notify;
 
 use crate::args::{Options, Target, direct_to_stub, hosts, sole, testnet_guard};
-use crate::link::{Link, LinkHandler, Note};
+use crate::link::{Link, LinkHandler, Note, async_reject};
 use crate::testnet::{
     ACCOUNT_LABEL, ACCT, HighWater, INST, Lines, Out, TESTNET_CHAIN, VENUE, config, drive_with,
     inventory_price, off_thread_holding, px_or_none, resync_disagreements, session_config,
@@ -902,6 +905,28 @@ impl Driver {
                 self.resync_due = false;
                 self.trouble(format!("a resync was refused: {why}"));
             }
+            Note::AsyncReject { target, op, reject } => {
+                let what = async_reject(op, &reject);
+                // One of our own post-only places the venue would not rest because the touch
+                // moved through it: an ordinary end of a quote, its side left out of the cycle
+                // and placed again the next (RB-elg7-1 on PR #149). Anything else Stops.
+                let ours = target
+                    .client()
+                    .filter(|cid| self.link.borrow().registry().get(*cid).is_some());
+                match ours {
+                    Some(cid)
+                        if op == OpKind::Place && reject.kind == RejectKind::PostOnlyWouldCross =>
+                    {
+                        self.note(format_args!(
+                            "the {} #{} was not rested: {what}; its side is left out of this \
+                             cycle and placed again the next",
+                            side_name(self.side_of(cid)),
+                            cid.seq()
+                        ));
+                    }
+                    _ => self.trouble(format!("the link noted a problem: {what}")),
+                }
+            }
             Note::Problem(what) => self.trouble(format!("the link noted a problem: {what}")),
             Note::LoginRefused(why) => self.trouble(format!("a login was refused: {why}")),
             Note::EpochEnd { key, why } => {
@@ -1234,20 +1259,49 @@ impl Driver {
                 continue;
             }
             self.compact();
-            let wait = self.timeout;
-            let book = touch(
-                &self.opts.rest_url,
-                &self.opts.market,
-                &self.opts.proxy,
-                wait,
-                &self.specs,
-            )
-            .await?;
+            // Raced against the interrupt, a reason to Stop, a connection's end and
+            // --duration, each taken at the top of the loop (Codex r4243989987).
+            let Some(book) = self.touch_unless_ended().await? else {
+                continue;
+            };
             match self.settle(book).await? {
                 Settled::Done => self.cycles += 1,
                 Settled::Reconnected | Settled::Interrupted | Settled::Ended => continue,
             }
             self.pause().await;
+        }
+    }
+
+    /// Whether the cycle must end before anything more is handed over: the interrupt came, a
+    /// reason to Stop was noted, a connection ended, or `--duration` passed.
+    fn ending(&self) -> bool {
+        self.trouble.is_some()
+            || self.interrupted.get()
+            || self.epochs != self.swept
+            || tokio::time::Instant::now() >= self.deadline
+    }
+
+    /// The touch (`GET /orderbook`), read as the notes come: `None` once the cycle must end
+    /// ([`Driver::ending`]) before it answers, so neither Ctrl-C, a reason to Stop, a
+    /// connection's end nor `--duration` waits up to `--step-timeout` for it while the quotes
+    /// rest (Codex r4243989987 on PR #149).
+    async fn touch_unless_ended(&mut self) -> Result<Option<OrderbookSnapshot>, String> {
+        let (rest_url, market) = (self.opts.rest_url.clone(), self.opts.market.clone());
+        let (proxy, specs) = (self.opts.proxy.clone(), self.specs.clone());
+        let read = touch(&rest_url, &market, &proxy, self.timeout, &specs);
+        tokio::pin!(read);
+        loop {
+            let wake = Rc::clone(&self.wake);
+            let woken = wake.notified();
+            self.absorb();
+            if self.ending() {
+                return Ok(None);
+            }
+            tokio::select! {
+                book = &mut read => return book.map(Some),
+                () = woken => {}
+                () = tokio::time::sleep_until(self.deadline) => return Ok(None),
+            }
         }
     }
 
@@ -1333,7 +1387,10 @@ impl Driver {
     /// to the session, then the next pass at the next wake, until a pass has nothing to send,
     /// hold or await. Each pass judges the quotes again ([`desired`]) at the position as it is
     /// then, and at a fresh touch once a fill moved it since the touch was read (Codex
-    /// r4243853260): a replacement is never placed on a position the cycle did not see. A side
+    /// r4243853260): a replacement is never placed on a position the cycle did not see. The
+    /// notes are read again after the pass's waits and before it plans ([`Driver::halted`]), so
+    /// nothing noted during them (the interrupt, a resync mismatch, a connection's end) lets a
+    /// pass place (Codex r4243989985). A side
     /// whose order placed this cycle ended without a cancel of ours (a post-only order the venue
     /// would not rest, a fill) is not placed again before the next cycle; a place fbc-oms's caps
     /// refuse leaves its side out of the cycle.
@@ -1345,15 +1402,35 @@ impl Driver {
         loop {
             let wake = Rc::clone(&self.wake);
             let woken = wake.notified();
-            self.absorb();
-            if let Some(why) = &self.trouble {
-                return Err(why.clone());
+            if let Some(ended) = self.halted()? {
+                return Ok(ended);
             }
-            if self.interrupted.get() {
-                return Ok(Settled::Interrupted);
+            // The mark's write and a fresh touch for a moved position are this pass's waits;
+            // the notes are read again after them, before anything is planned (below).
+            self.reserve().await?;
+            let inventory = |d: &Driver| d.link.borrow().registry().inventory(INST);
+            let mut position = inventory(self);
+            // A fresh touch for a moved position, read again until no fill moved it while the
+            // touch was being read (Codex r4243908416).
+            let mut cut = false;
+            while position != read_at {
+                let Some(fresh) = self.touch_unless_ended().await? else {
+                    cut = true;
+                    break;
+                };
+                book = fresh;
+                read_at = position;
+                position = inventory(self);
             }
-            if self.epochs != self.swept || !self.orders.may_place() {
-                return Ok(Settled::Reconnected);
+            // Whatever the notes showed during those waits (the interrupt, a reason to Stop, a
+            // connection's end, --duration) is taken now, with nothing awaited between this
+            // read and the commands' hand-over: no pass places after any of them, nor before
+            // a reconnect's sweep (Codex r4243989985 on PR #149).
+            if let Some(ended) = self.halted()? {
+                return Ok(ended);
+            }
+            if cut {
+                continue;
             }
             placed.retain(|(side, cid)| {
                 let link = self.link.borrow();
@@ -1376,29 +1453,6 @@ impl Driver {
                     None => true,
                 }
             });
-            // The mark's write is this pass's last wait before the position is read: nothing
-            // awaited between that read and the commands' hand-over.
-            self.reserve().await?;
-            let inventory = |d: &Driver| d.link.borrow().registry().inventory(INST);
-            let mut position = inventory(self);
-            // A fresh touch for a moved position, read again until no fill moved it while the
-            // touch was being read (Codex r4243908416).
-            while position != read_at {
-                let wait = self.timeout;
-                book = touch(
-                    &self.opts.rest_url,
-                    &self.opts.market,
-                    &self.opts.proxy,
-                    wait,
-                    &self.specs,
-                )
-                .await?;
-                read_at = position;
-                position = inventory(self);
-            }
-            if tokio::time::Instant::now() >= self.deadline {
-                return Ok(Settled::Ended);
-            }
             let mut wanted = desired(&self.opts, self.qty, position, &book);
             for side in &left_out {
                 wanted.book.remove(*side, 0);
@@ -1479,6 +1533,26 @@ impl Driver {
                 }
             }
         }
+    }
+
+    /// Reads the notes and says whether a pass must not plan: `Err` for a reason to Stop, or
+    /// how the cycle ends (the interrupt, a connection's end or a session that takes no place,
+    /// `--duration`).
+    fn halted(&mut self) -> Result<Option<Settled>, String> {
+        self.absorb();
+        if let Some(why) = &self.trouble {
+            return Err(why.clone());
+        }
+        if self.interrupted.get() {
+            return Ok(Some(Settled::Interrupted));
+        }
+        if self.epochs != self.swept || !self.orders.may_place() {
+            return Ok(Some(Settled::Reconnected));
+        }
+        if tokio::time::Instant::now() >= self.deadline {
+            return Ok(Some(Settled::Ended));
+        }
+        Ok(None)
     }
 
     fn timed_out(&self, step: &str, what: &str) -> String {
