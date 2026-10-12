@@ -528,6 +528,7 @@ pub async fn run(
         last: None,
         book_seq: book.seq_no,
         venue_position: None,
+        unfilled: Vec::new(),
     };
     // The interrupt sets a flag the driver reads at each wake, and wakes it.
     let watch = {
@@ -665,6 +666,9 @@ struct Driver {
     /// The market's position as the venue's position stream last reported it, since the last
     /// resync: no pass plans while it differs from the inventory (Codex r4244080127).
     venue_position: Option<SignedLots>,
+    /// Orders of ours that ended with fills the venue reported on an order update that the
+    /// fill stream has not brought yet: no pass plans until it has (Codex r4244145969).
+    unfilled: Vec<ClientOrderId>,
 }
 
 impl Driver {
@@ -1096,12 +1100,21 @@ impl Driver {
             match link.registry().get(cid) {
                 None => None,
                 Some(r) => match r.state() {
-                    OrdState::Terminal(kind) => Some((kind, r.filled(), r.placed().side)),
+                    OrdState::Terminal(kind) => Some((
+                        kind,
+                        r.filled(),
+                        r.placed().side,
+                        r.cum_venue() > r.cum_fills(),
+                    )),
                     _ => return,
                 },
             }
         };
         self.owned.retain(|c| *c != cid);
+        if end.is_some_and(|(.., behind)| behind) {
+            self.unfilled.push(cid);
+        }
+        let end = end.map(|(kind, filled, side, _)| (kind, filled, side));
         let Some((kind, filled, side)) = end else {
             return;
         };
@@ -1276,12 +1289,15 @@ impl Driver {
                 continue;
             }
             self.compact();
+            // The inventory before the touch is read: a fill while it is in flight makes the
+            // first pass read the touch again (Codex r4244145956).
+            let read_at = self.link.borrow().registry().inventory(INST);
             // Raced against the interrupt, a reason to Stop, a connection's end and
             // --duration, each taken at the top of the loop (Codex r4243989987).
             let Some(book) = self.touch_unless_ended(self.timeout).await? else {
                 continue;
             };
-            match self.settle(book).await? {
+            match self.settle(book, read_at).await? {
                 Settled::Done => self.cycles += 1,
                 Settled::Reconnected | Settled::Interrupted | Settled::Ended => continue,
             }
@@ -1394,8 +1410,10 @@ impl Driver {
 
     /// Keeps a high-water mark [`RESERVE`] ids above the mint before a pass may mint past the one
     /// kept: written and synced off the runtime's thread, the mint (and its namespace lease)
-    /// held until the write ends even past the timeout.
-    async fn reserve(&mut self) -> Result<(), String> {
+    /// held until the write ends even past the timeout. The write is raced against what ends a
+    /// cycle ([`Driver::ending`], Codex r4244145961): `Ok(false)` when it came first, the mint
+    /// then dropped on the write's thread once the write ends (nothing is minted after).
+    async fn reserve(&mut self) -> Result<bool, String> {
         let high = self.mint.as_ref().map_or(0, CidMint::high_water);
         // Near u64::MAX no mark can be kept above the mint: refused, the mark kept unchanged,
         // never wrapped (Codex r4244080134).
@@ -1406,11 +1424,26 @@ impl Driver {
             ));
         };
         if next <= self.reserved {
-            return Ok(());
+            return Ok(true);
         }
         let hwm = self.hwm.clone();
         let mint = self.mint.take();
-        match off_thread_holding(self.timeout, mint, move || hwm.write(mark)).await {
+        let write = off_thread_holding(self.timeout, mint, move || hwm.write(mark));
+        tokio::pin!(write);
+        let written = loop {
+            let wake = Rc::clone(&self.wake);
+            let woken = wake.notified();
+            self.absorb();
+            if self.ending() {
+                return Ok(false);
+            }
+            tokio::select! {
+                written = &mut write => break written,
+                () = woken => {}
+                () = tokio::time::sleep_until(self.deadline) => return Ok(false),
+            }
+        };
+        match written {
             Some((kept, mint)) => {
                 self.mint = mint;
                 kept?;
@@ -1418,7 +1451,7 @@ impl Driver {
                 self.lines.line(format_args!(
                     "MARK client-id high-water mark {mark} kept in the lease directory"
                 ));
-                Ok(())
+                Ok(true)
             }
             None => Err("the high-water mark's write did not finish in time".to_owned()),
         }
@@ -1435,9 +1468,12 @@ impl Driver {
     /// whose order placed this cycle ended without a cancel of ours (a post-only order the venue
     /// would not rest, a fill) is not placed again before the next cycle; a place fbc-oms's caps
     /// refuse leaves its side out of the cycle.
-    async fn settle(&mut self, mut book: OrderbookSnapshot) -> Result<Settled, String> {
+    async fn settle(
+        &mut self,
+        mut book: OrderbookSnapshot,
+        mut read_at: SignedLots,
+    ) -> Result<Settled, String> {
         let deadline = tokio::time::Instant::now() + self.timeout;
-        let mut read_at = self.link.borrow().registry().inventory(INST);
         let mut left_out: Vec<Side> = Vec::new();
         let mut placed: Vec<(Side, ClientOrderId)> = Vec::new();
         let mut holding = false;
@@ -1449,13 +1485,12 @@ impl Driver {
             }
             // The mark's write and a fresh touch for a moved position are this pass's waits;
             // the notes are read again after them, before anything is planned (below).
-            self.reserve().await?;
+            let mut cut = !self.reserve().await?;
             let inventory = |d: &Driver| d.link.borrow().registry().inventory(INST);
             let mut position = inventory(self);
             // A fresh touch for a moved position, read again until no fill moved it while the
             // touch was being read (Codex r4243908416).
-            let mut cut = false;
-            while position != read_at {
+            while !cut && position != read_at {
                 let left = deadline.saturating_duration_since(tokio::time::Instant::now());
                 let Some(fresh) = self.touch_unless_ended(left).await? else {
                     cut = true;
@@ -1480,28 +1515,20 @@ impl Driver {
                 return Err(self.timed_out("settle", "the book settling"));
             }
             // A position the venue reported that the inventory does not hold yet (its fill not
-            // read yet, or a change not ours): nothing is planned until they agree, or Stop at
-            // the settling time (Codex r4244080127).
-            if let Some(venue) = self.venue_position.filter(|v| *v != position) {
+            // read yet, or a change not ours), or an order's fills the venue reported on an
+            // order update that the fill stream has not brought yet: nothing is planned until
+            // they agree, or Stop at the settling time (Codex r4244080127, r4244145969).
+            if let Some(what) = self.unreconciled(position) {
                 if !holding {
                     holding = true;
                     self.note(format_args!(
-                        "the venue reports the position {} lots, the inventory holds {}: \
-                         nothing is planned until they agree",
-                        venue.0, position.0
+                        "{what} differ: nothing is planned until they agree"
                     ));
                 }
                 tokio::select! {
                     () = woken => {}
                     () = tokio::time::sleep_until(deadline) => {
-                        return Err(self.timed_out(
-                            "settle",
-                            &format!(
-                                "the venue's position ({} lots) and the inventory ({} lots) \
-                                 agreeing",
-                                venue.0, position.0
-                            ),
-                        ));
+                        return Err(self.timed_out("settle", &format!("{what} agreeing")));
                     }
                 }
                 continue;
@@ -1607,6 +1634,36 @@ impl Driver {
                 }
             }
         }
+    }
+
+    /// What the venue reported that the inventory does not hold yet, if anything: a position
+    /// other than `position`, or fills of an order of ours that the fill stream has not
+    /// brought (its cumulative fill on an order update above the fills read).
+    fn unreconciled(&mut self, position: SignedLots) -> Option<String> {
+        if let Some(venue) = self.venue_position.filter(|v| *v != position) {
+            return Some(format!(
+                "the venue's position ({} lots) and the inventory ({} lots)",
+                venue.0, position.0
+            ));
+        }
+        let link = Rc::clone(&self.link);
+        let link = link.borrow();
+        let reg = link.registry();
+        let behind =
+            |cid: &ClientOrderId| reg.get(*cid).is_some_and(|r| r.cum_venue() > r.cum_fills());
+        self.unfilled.retain(behind);
+        let cid = self
+            .owned
+            .iter()
+            .chain(&self.unfilled)
+            .find(|c| behind(c))?;
+        let r = reg.get(*cid)?;
+        Some(format!(
+            "the venue's fills of #{} ({} lots) and the fills read ({} lots)",
+            cid.seq(),
+            r.cum_venue().get(),
+            r.cum_fills().get()
+        ))
     }
 
     /// Reads the notes and says whether a pass must not plan: `Err` for a reason to Stop, or
