@@ -64,6 +64,8 @@ resting.
 
 The exit status is 0 only when every step passed. A cancel-on-disconnect step passes once it
 has been measured, whatever Paradex did: the report records whether the order was cancelled.
+It is measured only when a GET /orders answer read after the disconnect showed the order gone
+or still listed. If none answered within `--cod-wait`, the step fails as not measured.
 
 The evidence directory holds:
 
@@ -77,8 +79,9 @@ The evidence directory holds:
   run draws and never writes. Keep it local.
 - `fixtures/`: the scrubbed slice of the journal, with its README. Commit it as
   `fixtures/paradex/exec-recorded/`, together with `report.md`, in FBC-8xr's PR. Each file
-  passed the privacy check's patterns before it was written. Run `scripts/privacy-check.sh` again
-  after copying.
+  passed the privacy check's patterns before it was written, and the repository's
+  `scripts/privacy-check.sh` then scanned every file of the directory. Run it again after
+  copying.
 
 ### Run it from the deployment box (design §13.3, the per-IP limit check)
 
@@ -93,7 +96,8 @@ The report's last answer lists, for each comparison, the rate-limit headers Para
 its first GET /orders. Beside them it lists what was sent since the comparison before:
 
 - this program's own REST requests: its reads, its logins and the order-book reads;
-- the WebSocket order methods;
+- the WebSocket order methods: the steps' requests, each connection's cancel-on-disconnect arm,
+  the Safety cancels a reconnect sends and the Stop cancels;
 - the connections opened. Each connection also makes a login and two resync reads, and a login
   every refresh interval (60 s) while it stays open.
 
