@@ -291,6 +291,10 @@ struct Venue {
     garbage_after_create: Option<usize>,
     /// Notified at this `GET /orderbook` read (from 1): the loop's cycle before it settled.
     signal: Option<(usize, Arc<Notify>)>,
+    /// Close the order this place (from 1) created right after its reply, nothing filled, for
+    /// this reason: Paradex's risk check refusing it (`POST_ONLY_WOULD_CROSS`: the touch moved
+    /// through the quote).
+    close_create: Option<(usize, &'static str)>,
     creates: usize,
     /// Every frame the stub sent, with the connection's number, for the wire-order checks.
     log: Vec<(usize, String)>,
@@ -427,6 +431,25 @@ fn responder(venue: &Shared, conn: usize) -> Responder {
                 v.orders.push(held);
                 v.creates += 1;
                 let mut frames = vec![ok(json!({ "order": order }))];
+                if let Some((n, reason)) = v.close_create
+                    && n == v.creates
+                {
+                    let at = v.orders.len() - 1;
+                    v.orders[at].open = false;
+                    v.seq += 1;
+                    let o = v.orders[at].clone();
+                    let side = if o.side == "BUY" { 1 } else { 2 };
+                    frames.push(Frame::Binary(order_event(
+                        side,
+                        5_000 + v.seq,
+                        &o.vid,
+                        &o.cid,
+                        &o.price,
+                        &o.size,
+                        &o.size,
+                        reason,
+                    )));
+                }
                 if v.garbage_after_create == Some(v.creates) {
                     frames.push(Frame::Binary(b"\xff".to_vec()));
                 }
@@ -1234,6 +1257,180 @@ async fn a_frame_the_codec_cannot_decode_stops_it_at_once() {
         sent.iter().filter(|m| *m == "order.create").count(),
         2,
         "{sent:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_quote_the_venue_closes_post_only_would_cross_is_placed_again_next_cycle() {
+    // Paradex's risk check closes cycle 1's first quote POST_ONLY_WOULD_CROSS (the touch moved
+    // through it between GET /orderbook and the place): an asynchronous reject of our own
+    // post-only place, which leaves that side out of the cycle; cycle 2 places it again, and the
+    // run goes on (RB-elg7-1).
+    let venue = venue(vec![b0()]);
+    lock(&venue).close_create = Some((1, "POST_ONLY_WOULD_CROSS"));
+    // The opening six, two places, cycle 2's place again, Stop's cancel.
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 2 + 1 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let opts = options(&stub, 2);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+
+    assert!(report.ok, "{printed}");
+    assert_eq!(report.ended, "--cycles 2 reached", "{printed}");
+    assert_eq!(report.places_sent, 3, "{printed}");
+    assert!(printed.contains("POST_ONLY_WOULD_CROSS"), "{printed}");
+    assert!(printed.contains("DONE ok"), "{printed}");
+    let creates = requests(&venue, 0)
+        .into_iter()
+        .filter(|r| r["method"] == "order.create")
+        .map(|r| r["params"]["side"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    // The side the venue closed is the one placed again.
+    assert_eq!(creates[2], creates[0], "{creates:?}\n{printed}");
+}
+
+#[tokio::test]
+async fn an_asynchronous_reject_other_than_post_only_would_cross_stops_it() {
+    // The risk check closes cycle 1's first quote for another reason: the loop Stops.
+    let venue = venue(vec![b0()]);
+    lock(&venue).close_create = Some((1, "NOT_ENOUGH_MARGIN"));
+    // The opening six, two places, Stop's cancel of the other quote.
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 2 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let opts = options(&stub, 5);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+
+    assert!(!report.ok, "{printed}");
+    assert!(report.ended.contains("asynchronous reject"), "{printed}");
+    assert!(report.ended.contains("NOT_ENOUGH_MARGIN"), "{printed}");
+    assert_eq!(report.places_sent, 2, "{printed}");
+    assert!(printed.contains("DONE failed"), "{printed}");
+}
+
+#[tokio::test]
+async fn the_interrupt_while_a_pass_reads_a_fresh_touch_places_nothing_after() {
+    // As in the fill-during-a-replace test, the bid's cancel races a fill of all of it, so the
+    // pass reads a fresh touch (GET /orderbook read 4); the interrupt comes during that read.
+    // The pass must take it before planning: nothing is placed after (Codex r4243989985).
+    let venue = venue(vec![b0(), b0(), book(2, Some("80000.0"), Some("80000.2"))]);
+    let signal = Arc::new(Notify::new());
+    {
+        let mut v = lock(&venue);
+        v.fill_next_buy_cancel = true;
+        v.signal = Some((4, Arc::clone(&signal)));
+    }
+    // The opening six, two places, two replace cancels; nothing rests for Stop to cancel.
+    let script = one_connection(&venue, 6 + 2 + 2);
+    let stub = StubServer::start(script, routes(&venue, login_ok()))
+        .await
+        .unwrap();
+    let mut opts = options(&stub, 3);
+    opts.order_usd = dec("8");
+    opts.inventory_cap_usd = dec("16");
+    let interrupt = async move { signal.notified().await };
+    let (report, printed) = run_until(&opts, interrupt).await;
+    stub.finished().await.unwrap();
+
+    assert_eq!(lock(&venue).book_reads, 4, "{printed}");
+    assert_eq!(report.ended, "interrupted (Ctrl-C)", "{printed}");
+    assert!(report.ok, "{printed}");
+    let sent = methods(&venue, 0);
+    assert_eq!(
+        sent.iter().filter(|m| *m == "order.create").count(),
+        2,
+        "placed after the interrupt: {sent:?}\n{printed}"
+    );
+    assert_eq!(report.places_sent, 2, "{printed}");
+}
+
+/// A TCP relay in front of the stub's HTTP port (`base`, its `http_url("/v1")`) that never
+/// forwards the `n`th `GET /v1/orderbook` request (from 1), telling `signal` as it holds it: a
+/// touch the venue does not answer. Its own base URL.
+async fn holding_relay(base: &str, n: usize, signal: Arc<Notify>) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let target = base
+        .strip_prefix("http://")
+        .and_then(|s| s.strip_suffix("/v1"))
+        .unwrap()
+        .to_owned();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = Arc::new(AtomicU64::new(0));
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let Ok(server) = tokio::net::TcpStream::connect(&target).await else {
+                return;
+            };
+            let (seen, signal) = (Arc::clone(&seen), Arc::clone(&signal));
+            tokio::spawn(async move {
+                let (mut from_client, mut to_client) = client.into_split();
+                let (mut from_server, mut to_server) = server.into_split();
+                let up = async move {
+                    let mut buf = vec![0u8; 16_384];
+                    loop {
+                        let k = match from_client.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(k) => k,
+                        };
+                        let read = &buf[..k];
+                        if read.windows(17).any(|w| w == b"GET /v1/orderbook") {
+                            let at = seen.fetch_add(1, Ordering::SeqCst) + 1;
+                            if at == n as u64 {
+                                signal.notify_one();
+                                std::future::pending::<()>().await;
+                            }
+                        }
+                        if to_server.write_all(read).await.is_err() {
+                            break;
+                        }
+                    }
+                };
+                let down = async move {
+                    let _ = tokio::io::copy(&mut from_server, &mut to_client).await;
+                };
+                tokio::join!(up, down);
+            });
+        }
+    });
+    format!("http://{addr}/v1")
+}
+
+#[tokio::test]
+async fn the_interrupt_while_the_touch_is_unanswered_stops_it_at_once() {
+    // Cycle 2's GET /orderbook is never answered; the interrupt comes as it is sent. The loop
+    // Stops at once, cancelling the quotes cycle 1 left, instead of waiting out --step-timeout
+    // for the answer (Codex r4243989987).
+    let venue = venue(vec![b0()]);
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 2 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let signal = Arc::new(Notify::new());
+    let mut opts = options(&stub, 1_000);
+    opts.rest_url = holding_relay(&opts.rest_url, 3, Arc::clone(&signal)).await;
+    opts.step_timeout_secs = 20;
+    let interrupt = async move { signal.notified().await };
+    let (report, printed) = run_until(&opts, interrupt).await;
+    stub.finished().await.unwrap();
+
+    assert!(report.ok, "{printed}");
+    assert_eq!(report.ended, "interrupted (Ctrl-C)", "{printed}");
+    assert!(!printed.contains("TIMEOUT"), "{printed}");
+    assert_eq!(
+        (report.places_sent, report.cancels_sent, report.cancelled),
+        (2, 1, 2),
+        "{printed}"
     );
 }
 

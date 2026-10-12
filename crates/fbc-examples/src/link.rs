@@ -30,6 +30,8 @@
 //!   such ([`Note::Orphan`]): Stop would not cancel it nor the run count its fills.
 //!   The account's position events are noted as they come, for the driver to compare with
 //!   the position it seeded.
+//! - **Asynchronous rejects** (a two-phase venue's risk check refusing what it accepted) are
+//!   noted as they come ([`Note::AsyncReject`]) for the driver to judge.
 //! - **Refusals and connection ends.** A venue error naming no request
 //!   ([`ExecEvent::UncorrelatedError`]) that comes before the connection authenticated is a
 //!   refused login ([`Note::LoginRefused`]: the REST login refused or unanswered, or the auth
@@ -64,8 +66,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fbc_core::{
     AccountKey, CidMatch, ClientOrderId, ConnKey, ConnState, Envelope, ExecEvent, InstrumentId,
-    ItemRef, Lots, MonoNs, NotSentReason, OrderCaps, Reject, RpcId, SignedLots, SubmitHandle,
-    SubmitOutcome, Ticks, VenueCommand, VenueOrderId, VenueOrderSnapshot, WallNs,
+    ItemRef, Lots, MonoNs, NotSentReason, OpKind, OrderCaps, OrderRef, Reject, RpcId,
+    SignedLots, SubmitHandle, SubmitOutcome, Ticks, VenueCommand, VenueOrderId,
+    VenueOrderSnapshot, WallNs,
 };
 use fbc_oms::{
     Admission, Authorization, FillLedger, FillRouted, FillTime, LadderConfig, OrderKey, OrderOp,
@@ -120,6 +123,15 @@ pub enum Note {
     },
     /// A resync the registry refused, and why: nothing of it was applied.
     ResyncRefused(String),
+    /// A refusal that came after the venue accepted the request (a two-phase venue's risk
+    /// check): of what, which order, and why. Each driver decides what it means (RB-elg7-1 on
+    /// PR #149): one of its own post-only places closed POST_ONLY_WOULD_CROSS is an ordinary
+    /// end for a quoting loop, a reason to Stop for a one-order round trip.
+    AsyncReject {
+        target: OrderRef,
+        op: OpKind,
+        reject: Reject,
+    },
     /// A refusal from the venue that no outcome carries, or something the glue could not apply.
     Problem(String),
     /// The login was refused before the connection authenticated (module documentation): the
@@ -229,6 +241,16 @@ pub fn shown(text: &str) -> String {
 /// A venue error as the run prints it: its code (when plain: letters, digits, '_' and '-', no
 /// part withheld; `<withheld>` otherwise) unless its text already names it, then its text,
 /// both through [`shown`].
+/// An asynchronous reject ([`Note::AsyncReject`]) as the samples print it: the operation, the
+/// kind, and the venue's reason as [`described`] shows it.
+pub fn async_reject(op: OpKind, reject: &Reject) -> String {
+    format!(
+        "asynchronous reject of a {op:?}: {:?} ({})",
+        reject.kind,
+        described(reject)
+    )
+}
+
 pub fn described(reject: &Reject) -> String {
     let raw = shown(&reject.raw);
     let Some(code) = reject.venue_code.as_deref() else {
@@ -721,11 +743,8 @@ impl Link {
             ExecEvent::Position { inst, qty, .. } => {
                 self.notes.push(Note::Position { inst, qty });
             }
-            ExecEvent::AsyncReject { op, reject, .. } => {
-                self.problem(format!(
-                    "asynchronous reject of a {op:?}: {:?}",
-                    reject.kind
-                ));
+            ExecEvent::AsyncReject { target, op, reject } => {
+                self.notes.push(Note::AsyncReject { target, op, reject });
             }
             ExecEvent::UncorrelatedError(reject) => {
                 let why = described(&reject);
