@@ -312,6 +312,9 @@ struct Venue {
     /// After the reply to this place (from 1), report the account's position long this size,
     /// with no fill: the venue's position stream ahead of the fill, or a change not ours.
     position_after_create: Option<(usize, &'static str)>,
+    /// Answer the next single cancel of a buy queued, then close the buy filled whole on an
+    /// order update, its fill event not sent (the fill stream behind the order stream).
+    filled_unsent_next_buy_cancel: bool,
     creates: usize,
     /// Every frame the stub sent, with the connection's number, for the wire-order checks.
     log: Vec<(usize, String)>,
@@ -509,6 +512,15 @@ fn responder(venue: &Shared, conn: usize) -> Responder {
                         Frame::Binary(fill),
                         Frame::Binary(filled),
                     ]
+                } else if v.filled_unsent_next_buy_cancel && v.orders[at].side == "BUY" {
+                    v.filled_unsent_next_buy_cancel = false;
+                    v.orders[at].open = false;
+                    let o = v.orders[at].clone();
+                    v.seq += 1;
+                    let filled =
+                        order_event(1, 5_000 + v.seq, &o.vid, &o.cid, &o.price, &o.size, "0", "");
+                    let queued = ok(json!({"order_id": vid, "status": "QUEUED_FOR_CANCELLATION"}));
+                    vec![queued, Frame::Binary(filled)]
                 } else if v.already_closed_once {
                     v.already_closed_once = false;
                     vec![ok(json!({"order_id": vid, "status": "ALREADY_CLOSED"}))]
@@ -1410,6 +1422,45 @@ async fn a_venue_position_the_inventory_does_not_hold_plans_nothing() {
         "{sent:?}\n{printed}"
     );
     assert_eq!((report.places_sent, report.cancelled), (2, 2), "{printed}");
+}
+
+#[tokio::test]
+async fn an_order_filled_on_its_update_before_its_fill_is_read_plans_nothing() {
+    // Cycle 2 replaces both quotes; the bid's cancel races a fill of all of it that the order
+    // stream reports (CLOSED, nothing open) but the fill stream never brings: the inventory
+    // stays flat. No pass plans (the bid is not placed again from the flat inventory) while the
+    // venue's fills and those read disagree; the book does not settle in time and the loop
+    // Stops (Codex r4244145969).
+    let venue = venue(vec![b0(), b0(), book(2, Some("80000.0"), Some("80000.2"))]);
+    lock(&venue).filled_unsent_next_buy_cancel = true;
+    // The opening six, two places, two replace cancels; nothing rests for Stop to cancel.
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 2 + 2),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let mut opts = options(&stub, 5);
+    opts.order_usd = dec("8");
+    opts.inventory_cap_usd = dec("16");
+    opts.step_timeout_secs = 1;
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+
+    assert!(!report.ok, "{printed}");
+    assert!(
+        report
+            .ended
+            .contains("(12 lots) and the fills read (0 lots) agreeing"),
+        "{printed}"
+    );
+    let sent = methods(&venue, 0);
+    assert_eq!(
+        sent.iter().filter(|m| *m == "order.create").count(),
+        2,
+        "{sent:?}\n{printed}"
+    );
+    assert_eq!(report.places_sent, 2, "{printed}");
 }
 
 #[tokio::test]
