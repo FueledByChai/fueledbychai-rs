@@ -101,6 +101,9 @@ pub struct Comparison {
     pub rest_since: u64,
     pub ws_since: u64,
     pub connections_since: u64,
+    /// Whether any order was compared: a disconnect's comparison is of the position only (the
+    /// stream saw nothing after the socket ended), and is left out of question (a).
+    pub orders_compared: bool,
 }
 
 /// GET /orders-history?client_id= for one order.
@@ -341,8 +344,10 @@ pub fn scrub_json(v: &mut Value) {
     }
 }
 
-/// What scripts/privacy-check.sh would refuse in `text`, by name (never the value): a `0x`
-/// value of 40 or more hex digits, a bare run of exactly 64 hex digits, a JWT, a bearer token.
+/// What scripts/privacy-check.sh would refuse in `text`, by name (never the value), or more: a
+/// `0x` value of 40 or more hex digits, a bare run of exactly 64 hex digits, anything
+/// JWT-shaped, a bearer token (every occurrence), a PEM private-key header. The program also
+/// runs the check itself over the written fixtures ([`privacy_check`]).
 pub fn privacy_hits(text: &str) -> Vec<&'static str> {
     let bytes = text.as_bytes();
     let mut hits = Vec::new();
@@ -376,15 +381,18 @@ pub fn privacy_hits(text: &str) -> Vec<&'static str> {
     if text.contains("eyJ") {
         hits.push("a JWT-shaped value");
     }
-    let lower = text.to_ascii_lowercase();
-    if let Some(at) = lower.find("bearer ") {
-        let token = bytes[at + 7..]
-            .iter()
-            .take_while(|b| b.is_ascii_alphanumeric() || b"._~+/-".contains(b))
-            .count();
-        if token >= 20 {
-            hits.push("a bearer token");
-        }
+    // Every `bearer ` (either case of its first letter, as the check matches it), not the
+    // first alone.
+    let token_char = |b: &u8| b.is_ascii_alphanumeric() || b"._~+/-".contains(b);
+    let bearer = (0..bytes.len()).any(|at| {
+        (bytes[at..].starts_with(b"Bearer ") || bytes[at..].starts_with(b"bearer "))
+            && bytes[at + 7..].iter().take_while(|b| token_char(b)).count() >= 20
+    });
+    if bearer {
+        hits.push("a bearer token");
+    }
+    if text.contains("-----BEGIN ") && text.contains("PRIVATE KEY-----") {
+        hits.push("a PEM private-key header");
     }
     hits
 }
@@ -549,8 +557,9 @@ pub fn answers(ev: &Evidence) -> Vec<(String, String)> {
                 .chain(s.disconnect.iter().flat_map(|d| &d.history))
         })
         .collect();
-    let all_orders = !comparisons.is_empty() && comparisons.iter().all(|c| c.orders_agreed);
-    let first = comparisons.iter().filter(|c| c.first_read_agreed).count();
+    let of_orders: Vec<&&Comparison> = comparisons.iter().filter(|c| c.orders_compared).collect();
+    let all_orders = !of_orders.is_empty() && of_orders.iter().all(|c| c.orders_agreed);
+    let first = of_orders.iter().filter(|c| c.first_read_agreed).count();
     let max_lag = comparisons.iter().filter_map(|c| c.lag_ms).max();
     let positions = !comparisons.is_empty() && comparisons.iter().all(|c| c.positions_agreed);
     let sides: Vec<String> = comparisons
@@ -704,7 +713,7 @@ pub fn answers(ev: &Evidence) -> Vec<(String, String)> {
                 "{} at every comparison ({} of {} agreed at the first read)",
                 if all_orders { "yes, eventually" } else { "NO" },
                 first,
-                comparisons.len()
+                of_orders.len()
             ),
         ),
         (
@@ -1005,6 +1014,7 @@ pub fn to_json(ev: &Evidence) -> Value {
             "rest_requests_since": c.rest_since,
             "ws_order_methods_since": c.ws_since,
             "connections_since": c.connections_since,
+            "orders_compared": c.orders_compared,
         })
     };
     let history = |h: &History| {
@@ -1077,4 +1087,34 @@ pub fn utc(secs: i64) -> String {
         rem % 3600 / 60,
         rem % 60
     )
+}
+
+/// Runs this repository's scripts/privacy-check.sh over `dir` alone (its own patterns, and the
+/// local master key files it checks by default): `Ok` when it passed, or what it said (file and
+/// line only, never a value). `script` is the check's path.
+pub fn privacy_check(script: &Path, dir: &Path) -> Result<(), String> {
+    if !script.is_file() {
+        return Err(format!(
+            "the privacy check {} is not there: the fixtures were not checked",
+            script.display()
+        ));
+    }
+    let out = std::process::Command::new("bash")
+        .arg(script)
+        .env("LOOP_ROOT", dir)
+        .output()
+        .map_err(|e| format!("the privacy check could not run: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let said: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.starts_with("privacy: "))
+            .map(str::to_owned)
+            .collect();
+        Err(format!(
+            "the privacy check refused the fixtures: {}",
+            said.join("; ")
+        ))
+    }
 }

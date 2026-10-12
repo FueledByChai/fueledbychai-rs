@@ -183,6 +183,8 @@ struct Venue {
     position: Decimal,
     /// Whether the order book shows no ask (a testnet market nobody sells on).
     one_sided: bool,
+    /// Whether an IOC fills instead of expiring (the touch moved under it).
+    ioc_fills: bool,
 }
 
 impl Venue {
@@ -328,7 +330,13 @@ fn responder(venue: Arc<Mutex<Venue>>, conn: usize) -> Responder {
                 frames.push(ok(reply));
                 for mut o in created {
                     let seq = v.next_seq();
-                    if o.tif == 2 {
+                    if o.tif == 2 && v.ioc_fills {
+                        o.status = "CLOSED";
+                        o.open = "0".to_owned();
+                        let size = Decimal::from_str(&o.size).unwrap();
+                        v.position += if o.side == 1 { size } else { -size };
+                        frames.push(Frame::Binary(order_event(&o, seq, 4, None)));
+                    } else if o.tif == 2 {
                         // An IOC priced behind the touch fills nothing: the venue ends it.
                         o.status = "CLOSED";
                         o.cancel_reason = "SYNTHETIC_IOC_EXPIRED".to_owned();
@@ -623,6 +631,7 @@ fn new_venue(cod_on_drop: bool, cod_on_close: bool) -> Arc<Mutex<Venue>> {
         fill_on_drop: false,
         position: Decimal::ZERO,
         one_sided: false,
+        ioc_fills: false,
     }))
 }
 
@@ -833,7 +842,7 @@ async fn the_program_runs_every_step_once_maps_each_to_the_lattice_and_writes_sc
     for name in ["cod-dropped", "cod-graceful"] {
         let c = step(name).comparisons.last().unwrap();
         assert!(
-            c.after.ends_with("after the disconnect") && c.orders_agreed && c.positions_agreed,
+            c.after.ends_with("(position only)") && !c.orders_compared && c.positions_agreed,
             "{name}: {c:?}"
         );
     }
@@ -1218,4 +1227,87 @@ fn an_output_not_written_fails_the_run() {
         .push("no fixtures written: synthetic".to_owned());
     assert!(!ev.ok());
     assert!(evidence::markdown(&ev).contains("Outputs not written (the run fails)"));
+}
+
+#[tokio::test]
+async fn an_ioc_that_fills_exercised_no_expiry_and_fails_its_step() {
+    let venue = new_venue(true, true);
+    venue.lock().unwrap().ioc_fills = true;
+    let stub = stub_for(&venue, MAIN, 0, 0).await;
+    let (evidence_dir, _e) = temp_dir("evidence-ioc-filled");
+    let (lease_dir, _l) = temp_dir("lease-ioc-filled");
+    let opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
+    let (outcome, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    let ioc = outcome
+        .evidence
+        .steps
+        .iter()
+        .find(|s| s.name == "ioc")
+        .unwrap();
+    assert!(!ioc.pass, "{ioc:?}");
+    assert!(
+        ioc.notes
+            .iter()
+            .any(|n| n.contains("did not expire unfilled")),
+        "{ioc:?}"
+    );
+    assert!(!outcome.ok, "{printed}");
+}
+
+#[test]
+fn the_fixture_scan_finds_every_bearer_token_and_a_pem_header_and_the_check_runs() {
+    let late = format!("bearer x; {} {}", "Bearer", "abcdefghij".repeat(2));
+    assert!(evidence::privacy_hits(&late).contains(&"a bearer token"));
+    let pem = format!("-----BEGIN {}PRIVATE KEY-----", "EC ");
+    assert!(evidence::privacy_hits(&pem).contains(&"a PEM private-key header"));
+    // The repository's check itself, over a directory: what it refuses is refused here too.
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/privacy-check.sh");
+    let (clean, _c) = temp_dir("check-clean");
+    fs::write(clean.join("a.json"), r#"{"account":"SCRUBBED"}"#).unwrap();
+    assert_eq!(evidence::privacy_check(&script, &clean), Ok(()));
+    let (dirty, _d) = temp_dir("check-dirty");
+    fs::write(
+        dirty.join("a.json"),
+        json!({"account": synthetic().0}).to_string(),
+    )
+    .unwrap();
+    let refused = evidence::privacy_check(&script, &dirty).unwrap_err();
+    assert!(refused.contains("a.json"), "{refused}");
+    assert!(
+        !refused
+            .to_ascii_lowercase()
+            .contains(&synthetic().0[2..].to_ascii_lowercase())
+    );
+    assert!(evidence::privacy_check(&dirty.join("no-such-script"), &clean).is_err());
+}
+
+#[test]
+fn a_disconnect_is_credited_only_with_a_readable_unfilled_history() {
+    let history = |listed: bool, filled: Option<bool>| evidence::History {
+        listed,
+        filled,
+        status: Some("CLOSED".to_owned()),
+        ..evidence::History::default()
+    };
+    assert!(accept::disconnect_cancelled(
+        true,
+        &history(true, Some(false))
+    ));
+    assert!(
+        !accept::disconnect_cancelled(true, &history(true, None)),
+        "unreadable quantities are not 'nothing filled'"
+    );
+    assert!(!accept::disconnect_cancelled(
+        true,
+        &history(true, Some(true))
+    ));
+    assert!(!accept::disconnect_cancelled(
+        true,
+        &history(false, Some(false))
+    ));
+    assert!(!accept::disconnect_cancelled(
+        false,
+        &history(true, Some(false))
+    ));
 }
