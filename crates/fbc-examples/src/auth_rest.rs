@@ -25,7 +25,7 @@ use fbc_core::{
 };
 use fbc_runtime::Connector;
 use fbc_runtime::http::{Bytes, Method, Request};
-use fbc_venue_paradex::auth::{Login, SessionToken};
+use fbc_venue_paradex::auth::{Login, SessionToken, TIMEOUT};
 
 /// The tag the login goes out under: the program reads its answer itself, so any tag serves.
 const LOGIN: fbc_core::HttpTag = fbc_core::HttpTag(1);
@@ -52,11 +52,14 @@ pub struct RestAnswer {
 pub struct RestReader {
     login: Login,
     connector: Connector,
+    /// The adapter's configured request timeout (`paradex.rest.timeout`).
     timeout: Duration,
     /// The token the last login gave and when; a login older than the refresh interval is
     /// made again before the next read.
     token: Option<(SessionToken, Instant)>,
     origin: Instant,
+    /// How many requests this reader sent, logins included ([`RestReader::requests`]).
+    sent: u64,
 }
 
 impl std::fmt::Debug for RestReader {
@@ -70,44 +73,61 @@ impl std::fmt::Debug for RestReader {
 
 impl RestReader {
     /// A reader for the account `creds` hold under `cfg` (the adapter's REST base, chain id,
-    /// signature lifetime, refresh interval and timeout), connecting through `connector`. The
-    /// credentials are moved into the adapter's [`Login`]; refused naming a missing or invalid
-    /// key, never a value.
+    /// signature lifetime, refresh interval and request timeout), connecting through
+    /// `connector`. The credentials are moved into the adapter's [`Login`]; refused naming a
+    /// missing or invalid key, never a value.
     pub fn new(
         cfg: &VenueConfig,
         creds: Secrets,
         connector: Connector,
     ) -> Result<RestReader, String> {
         let login = Login::new(cfg, creds).map_err(|e| format!("the REST login: {e}"))?;
-        let timeout = Duration::from_secs(10);
+        // `Login::new` has checked the value is a whole `<n>s` or `<n>ms`.
+        let timeout = cfg
+            .get(TIMEOUT)
+            .and_then(duration)
+            .ok_or("the REST timeout is not configured")?;
         Ok(RestReader {
             login,
             connector,
             timeout,
             token: None,
             origin: Instant::now(),
+            sent: 0,
         })
     }
 
+    /// The configured request timeout: what one request may take.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// How many requests this reader has sent, its logins included: what a rate-limit count
+    /// moved by is judged against (design §13.3).
+    pub fn requests(&self) -> u64 {
+        self.sent
+    }
+
     /// `req` (one of the adapter's account reads) sent with the session token's header, logging
-    /// in first when no token is held or the one held is older than the refresh interval.
-    pub async fn get(&mut self, mut req: HttpRequest) -> Result<RestAnswer, String> {
+    /// in first when no token is held or the one held is older than the refresh interval. Each
+    /// request waits at most the configured timeout and never past `by`.
+    pub async fn get(&mut self, mut req: HttpRequest, by: Instant) -> Result<RestAnswer, String> {
         let fresh = self
             .token
             .as_ref()
             .is_some_and(|(_, at)| at.elapsed() < self.login.refresh_interval());
         if !fresh {
             self.token = None;
-            let token = self.log_in().await?;
+            let token = self.log_in(by).await?;
             self.token = Some((token, Instant::now()));
         }
         let (token, _) = self.token.as_ref().expect("a token was just kept");
         req.headers.push(token.header());
-        self.send(&req).await
+        self.send(&req, by).await
     }
 
     /// The login: the adapter's signed `POST /auth`, its answer read for the token only.
-    async fn log_in(&mut self) -> Result<SessionToken, String> {
+    async fn log_in(&mut self, by: Instant) -> Result<SessionToken, String> {
         let wall = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
@@ -124,7 +144,7 @@ impl RestReader {
         let fbc_core::Effect::Http { req, .. } = effect else {
             return Err("the REST login is not an HTTP request".to_owned());
         };
-        let (status, body) = self.exchange(&req).await?;
+        let (status, body) = self.exchange(&req, by).await?;
         if !(200..300).contains(&status) {
             return Err(format!("the REST login was refused with status {status}"));
         }
@@ -132,8 +152,8 @@ impl RestReader {
     }
 
     /// Sends `req` and reads its answer, keeping the rate-limit headers.
-    async fn send(&self, req: &HttpRequest) -> Result<RestAnswer, String> {
-        let response = self.call(req).await?;
+    async fn send(&mut self, req: &HttpRequest, by: Instant) -> Result<RestAnswer, String> {
+        let response = self.call(req, by).await?;
         let limits = response
             .headers()
             .iter()
@@ -162,14 +182,19 @@ impl RestReader {
     }
 
     /// Sends `req` and reads its status and body.
-    async fn exchange(&self, req: &HttpRequest) -> Result<(u16, Vec<u8>), String> {
-        let response = self.call(req).await?;
+    async fn exchange(&mut self, req: &HttpRequest, by: Instant) -> Result<(u16, Vec<u8>), String> {
+        let response = self.call(req, by).await?;
         Ok((response.status().as_u16(), response.body().to_vec()))
     }
 
-    /// `req` made through the connector within the timeout. A failure names the request's
-    /// method and path only: its headers carry the credentials.
-    async fn call(&self, req: &HttpRequest) -> Result<fbc_runtime::http::Response<Bytes>, String> {
+    /// `req` made through the connector within the timeout, and never past `by` (counted as
+    /// sent once it is handed to the connector). A failure names the request's method and path
+    /// only: its headers carry the credentials.
+    async fn call(
+        &mut self,
+        req: &HttpRequest,
+        by: Instant,
+    ) -> Result<fbc_runtime::http::Response<Bytes>, String> {
         let path = path_of(req.url.as_str());
         let method = match req.method {
             HttpMethod::Get => Method::GET,
@@ -185,10 +210,29 @@ impl RestReader {
         let request = builder
             .body(Bytes::copy_from_slice(req.body.bytes()))
             .map_err(|_| format!("{what}: the request could not be built"))?;
-        tokio::time::timeout(self.timeout, self.connector.http(request, MAX_BODY))
+        let wait = self
+            .timeout
+            .min(by.saturating_duration_since(Instant::now()));
+        if wait.is_zero() {
+            return Err(format!("{what}: not sent, the wait had passed"));
+        }
+        self.sent += 1;
+        tokio::time::timeout(wait, self.connector.http(request, MAX_BODY))
             .await
-            .map_err(|_| format!("{what}: no answer within {} s", self.timeout.as_secs()))?
+            .map_err(|_| format!("{what}: no answer within {} ms", wait.as_millis()))?
             .map_err(|e| format!("{what}: {e}"))
+    }
+}
+
+/// A configured `<n>s` or `<n>ms`.
+fn duration(text: &str) -> Option<Duration> {
+    match text.strip_suffix("ms") {
+        Some(ms) => ms.parse().ok().map(Duration::from_millis),
+        None => text
+            .strip_suffix('s')?
+            .parse()
+            .ok()
+            .map(Duration::from_secs),
     }
 }
 
@@ -200,7 +244,15 @@ fn path_of(url: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::path_of;
+    use super::{duration, path_of};
+    use std::time::Duration;
+
+    #[test]
+    fn the_configured_timeout_is_read_in_seconds_or_milliseconds() {
+        assert_eq!(duration("5000ms"), Some(Duration::from_millis(5000)));
+        assert_eq!(duration("5s"), Some(Duration::from_secs(5)));
+        assert_eq!(duration("5"), None);
+    }
 
     #[test]
     fn a_request_is_named_by_its_path_and_query() {

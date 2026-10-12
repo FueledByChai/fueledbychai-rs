@@ -176,6 +176,13 @@ struct Venue {
     /// closed with a close frame.
     cod_on_drop: bool,
     cod_on_close: bool,
+    /// Whether an order a dropped socket left resting fills instead (a fill racing the
+    /// disconnect), moving the account's position.
+    fill_on_drop: bool,
+    /// The account's signed position in the market.
+    position: Decimal,
+    /// Whether the order book shows no ask (a testnet market nobody sells on).
+    one_sided: bool,
 }
 
 impl Venue {
@@ -190,7 +197,12 @@ impl Venue {
             } else {
                 self.cod_on_drop
             };
-            if !c.open && cancels {
+            if !c.open && !c.client_closed && self.fill_on_drop {
+                o.status = "CLOSED";
+                o.open = "0".to_owned();
+                let size = Decimal::from_str(&o.size).unwrap();
+                self.position += if o.side == 1 { size } else { -size };
+            } else if !c.open && cancels {
                 o.status = "CLOSED";
                 o.cancel_reason = "SYNTHETIC_DISCONNECT".to_owned();
                 o.open = o.size.clone();
@@ -398,8 +410,15 @@ fn authorized(req: &HttpRequest) -> bool {
 
 /// The stub's HTTP answers, computed from the model.
 fn routes(venue: Arc<Mutex<Venue>>) -> HttpRouter {
-    let book = fs::read(fixture("paradex/rest/orderbook-btc-2002.json")).unwrap();
+    let mut book: Value =
+        serde_json::from_slice(&fs::read(fixture("paradex/rest/orderbook-btc-2002.json")).unwrap())
+            .unwrap();
+    if venue.lock().unwrap().one_sided {
+        book["asks"] = json!([]);
+    }
+    let book = book.to_string();
     let (orders, history) = (Arc::clone(&venue), Arc::clone(&venue));
+    let positions = Arc::clone(&venue);
     HttpRouter::new()
         .route(
             Method::POST,
@@ -454,7 +473,7 @@ fn routes(venue: Arc<Mutex<Venue>>) -> HttpRouter {
                 )
             },
         )
-        // Nothing fills far from the touch: the account stays flat.
+        // Flat unless an order filled (far from the touch, only as `fill_on_drop` says).
         .route_fn(
             Method::GET,
             PathPattern::exact("/v1/positions"),
@@ -462,7 +481,23 @@ fn routes(venue: Arc<Mutex<Venue>>) -> HttpRouter {
                 if !authorized(req) {
                     return reply(401, "{}");
                 }
-                reply(200, r#"{"results":[]}"#)
+                let mut v = positions.lock().unwrap();
+                v.disconnects();
+                let rows: Vec<Value> = if v.position.is_zero() {
+                    Vec::new()
+                } else {
+                    let side = if v.position > Decimal::ZERO {
+                        "LONG"
+                    } else {
+                        "SHORT"
+                    };
+                    vec![json!({
+                        "account": v.account, "market": MARKET, "side": side,
+                        "size": v.position.to_string(), "status": "OPEN",
+                        "average_entry_price": "60140.1",
+                    })]
+                };
+                reply(200, json!({ "results": rows }).to_string())
             },
         )
 }
@@ -471,9 +506,14 @@ fn routes(venue: Arc<Mutex<Venue>>) -> HttpRouter {
 /// modify, cancel, batch, cancel-many, the IOC and the order left for the dropped socket), the
 /// graceful phase's (the opening, `extra_graceful` Safety cancels, one place) and the stop
 /// phase's (the opening, `extra_stop` Safety cancels).
-fn script(venue: &Arc<Mutex<Venue>>, extra_graceful: usize, extra_stop: usize) -> WsScript {
+fn script(
+    venue: &Arc<Mutex<Venue>>,
+    main: usize,
+    extra_graceful: usize,
+    extra_stop: usize,
+) -> WsScript {
     let mut steps = Vec::new();
-    for (conn, frames) in [(0, 13), (1, 7 + extra_graceful), (2, 6 + extra_stop)] {
+    for (conn, frames) in [(0, main), (1, 7 + extra_graceful), (2, 6 + extra_stop)] {
         steps.push(Step::Accept);
         let with = responder(Arc::clone(venue), conn);
         steps.extend((0..frames).map(|_| Step::Respond {
@@ -580,16 +620,24 @@ fn new_venue(cod_on_drop: bool, cod_on_close: bool) -> Arc<Mutex<Venue>> {
         conns: Arc::new(OnceLock::new()),
         cod_on_drop,
         cod_on_close,
+        fill_on_drop: false,
+        position: Decimal::ZERO,
+        one_sided: false,
     }))
 }
 
+/// The main connection's frames: the opening's six, then place, modify, cancel, batch,
+/// cancel-many, the IOC and the order left for the dropped socket.
+const MAIN: usize = 13;
+
 async fn stub_for(
     venue: &Arc<Mutex<Venue>>,
+    main: usize,
     extra_graceful: usize,
     extra_stop: usize,
 ) -> StubServer {
     let stub = StubServer::start(
-        script(venue, extra_graceful, extra_stop),
+        script(venue, main, extra_graceful, extra_stop),
         routes(Arc::clone(venue)),
     )
     .await
@@ -602,7 +650,7 @@ async fn stub_for(
 #[tokio::test]
 async fn the_program_runs_every_step_once_maps_each_to_the_lattice_and_writes_scrubbed_evidence() {
     let venue = new_venue(true, true);
-    let stub = stub_for(&venue, 0, 0).await;
+    let stub = stub_for(&venue, MAIN, 0, 0).await;
     let (evidence_dir, _e) = temp_dir("evidence");
     let (lease_dir, _l) = temp_dir("lease");
     let opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
@@ -675,6 +723,32 @@ async fn the_program_runs_every_step_once_maps_each_to_the_lattice_and_writes_sc
             .collect()
     };
     assert_eq!(sent_kinds("place"), [("place".to_owned(), 1)]);
+    // Each placement's final phase (0092), from its order event, after the reply's
+    // provisional acceptance.
+    for name in ["place", "ioc", "cod-dropped", "cod-graceful"] {
+        let outcomes = &step(name).sent[0].outcomes;
+        assert!(
+            outcomes.iter().any(|o| o.contains("Final")),
+            "{name}: {outcomes:?}"
+        );
+    }
+    // The per-IP limit check's counts: what was sent before each comparison.
+    let first = &step("place").comparisons[0];
+    assert_eq!(
+        (first.ws_since, first.connections_since),
+        (1, 1),
+        "{first:?}"
+    );
+    assert!(
+        first.rest_since >= 2,
+        "the order-book reads at least: {first:?}"
+    );
+    let amend = &step("amend").comparisons[0];
+    assert_eq!(
+        (amend.ws_since, amend.connections_since),
+        (1, 0),
+        "{amend:?}"
+    );
     assert_eq!(sent_kinds("amend"), [("amend".to_owned(), 1)]);
     assert_eq!(sent_kinds("cancel"), [("cancel".to_owned(), 1)]);
     assert_eq!(sent_kinds("batch"), [("batch".to_owned(), 2)]);
@@ -755,6 +829,14 @@ async fn the_program_runs_every_step_once_maps_each_to_the_lattice_and_writes_sc
         history.cancel_reason.as_deref(),
         Some("SYNTHETIC_DISCONNECT")
     );
+    // The disconnects' comparisons: the order gone, the position the fills'.
+    for name in ["cod-dropped", "cod-graceful"] {
+        let c = step(name).comparisons.last().unwrap();
+        assert!(
+            c.after.ends_with("after the disconnect") && c.orders_agreed && c.positions_agreed,
+            "{name}: {c:?}"
+        );
+    }
     let closed = step("cod-graceful").disconnect.as_ref().unwrap();
     assert!(
         closed.cancelled && closed.how.starts_with("graceful"),
@@ -836,7 +918,7 @@ async fn a_venue_that_keeps_orders_after_a_disconnect_is_recorded_and_the_next_c
     // Paradex keeps the orders: each later connection's resync shows the earlier one's order
     // resting and Safety-cancels it (one cancel-many each, decision 0080).
     let venue = new_venue(false, false);
-    let stub = stub_for(&venue, 1, 1).await;
+    let stub = stub_for(&venue, MAIN, 1, 1).await;
     let (evidence_dir, _e) = temp_dir("evidence-kept");
     let (lease_dir, _l) = temp_dir("lease-kept");
     let opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 1);
@@ -849,7 +931,11 @@ async fn a_venue_that_keeps_orders_after_a_disconnect_is_recorded_and_the_next_c
         let d = step(name).disconnect.as_ref().unwrap();
         assert!(!d.cancelled, "{name}: {d:?}");
         assert_eq!(d.resting_at_reconnect, Some(true), "{name}: {d:?}");
-        assert!(step(name).pass, "measured either way: {name}");
+        assert!(
+            step(name).pass,
+            "measured either way: {name}: {:?}",
+            step(name)
+        );
     }
     assert_eq!(
         methods(&stub, 1)
@@ -873,7 +959,7 @@ async fn a_venue_that_keeps_orders_after_a_disconnect_is_recorded_and_the_next_c
 #[tokio::test]
 async fn a_mainnet_url_or_chain_id_is_refused_before_any_connection() {
     let venue = new_venue(true, true);
-    let stub = stub_for(&venue, 0, 0).await;
+    let stub = stub_for(&venue, MAIN, 0, 0).await;
     let (evidence_dir, _e) = temp_dir("evidence-refused");
     let (lease_dir, _l) = temp_dir("lease-refused");
     let creds = secrets;
@@ -1014,4 +1100,122 @@ fn the_scrubber_replaces_account_values_and_the_check_finds_what_it_would_leave(
     assert!(evidence::scrub_sbe(&frame[..60]).is_none());
     assert_eq!(evidence::utc(0), "1970-01-01 00:00:00Z");
     assert_eq!(evidence::utc(1_760_227_200), "2025-10-12 00:00:00Z");
+}
+
+#[tokio::test]
+async fn an_order_that_fills_as_the_socket_drops_is_no_cancel_on_disconnect_and_fails_the_step() {
+    let venue = new_venue(false, true);
+    venue.lock().unwrap().fill_on_drop = true;
+    let stub = stub_for(&venue, MAIN, 0, 0).await;
+    let (evidence_dir, _e) = temp_dir("evidence-filled");
+    let (lease_dir, _l) = temp_dir("lease-filled");
+    let opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 2);
+    let (outcome, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+
+    let ev = &outcome.evidence;
+    let step = |name: &str| ev.steps.iter().find(|s| s.name == name).unwrap();
+    let dropped = step("cod-dropped");
+    let d = dropped.disconnect.as_ref().unwrap();
+    // Gone from GET /orders, but filled: not a cancel, and the step fails.
+    assert!(!d.cancelled, "{d:?}");
+    assert_eq!(d.history.as_ref().unwrap().filled, Some(true));
+    assert!(!dropped.pass, "{printed}");
+    let c = dropped.comparisons.last().unwrap();
+    assert!(
+        !c.positions_agreed,
+        "the fills the stream saw are flat, GET /positions is not: {c:?}"
+    );
+    assert!(!outcome.ok);
+    assert!(
+        printed.contains("FILLED before or during the disconnect"),
+        "{printed}"
+    );
+    // The next phases seed the filled position by hand and agree with it.
+    assert!(step("cod-graceful").pass, "{:?}", step("cod-graceful"));
+    assert!(step("stop").pass, "{:?}", step("stop"));
+}
+
+#[tokio::test]
+async fn a_book_with_no_ask_skips_only_the_pair_and_the_other_steps_pass() {
+    let venue = new_venue(true, true);
+    venue.lock().unwrap().one_sided = true;
+    // No batch and no cancel-many on the main connection.
+    let stub = stub_for(&venue, MAIN - 2, 0, 0).await;
+    let (evidence_dir, _e) = temp_dir("evidence-one-sided");
+    let (lease_dir, _l) = temp_dir("lease-one-sided");
+    let opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
+    let (outcome, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+
+    let ev = &outcome.evidence;
+    for s in &ev.steps {
+        match s.name.as_str() {
+            "batch" | "cancel-many" => assert!(
+                matches!(&s.ran, evidence::Ran::Skipped(why) if why.contains("no ask")),
+                "{s:?}"
+            ),
+            _ => assert!(s.pass, "{s:?}"),
+        }
+    }
+    assert!(outcome.ok, "{printed}");
+    let main = methods(&stub, 0);
+    assert!(
+        !main
+            .iter()
+            .any(|m| m == "order.create_batch" || m == "order.cancel_batch")
+    );
+}
+
+#[test]
+fn a_list_answer_without_results_is_no_empty_snapshot() {
+    assert_eq!(accept::parse_results(br#"{"results":[]}"#), Ok(Vec::new()));
+    assert!(accept::parse_results(b"{}").is_err());
+    assert!(accept::parse_results(br#"{"results":{}}"#).is_err());
+    assert!(accept::parse_results(b"<html>").is_err());
+}
+
+#[test]
+fn a_position_agrees_only_with_its_size_side_and_status() {
+    use evidence::RestPosition;
+    let d = |t: &str| Decimal::from_str(t).unwrap();
+    let pos = |side: &str, size: &str, status: &str| RestPosition {
+        side: side.to_owned(),
+        size: size.to_owned(),
+        status: status.to_owned(),
+    };
+    let agrees = |p: Option<&RestPosition>, s: &str| accept::position_mismatch(p, d(s)).is_none();
+    assert!(agrees(None, "0"));
+    assert!(!agrees(None, "0.1"));
+    assert!(agrees(Some(&pos("LONG", "0.1", "OPEN")), "0.1"));
+    assert!(agrees(Some(&pos("SHORT", "-0.1", "OPEN")), "-0.1"));
+    assert!(agrees(Some(&pos("LONG", "0", "CLOSED")), "0"));
+    assert!(
+        !agrees(Some(&pos("LONG", "-0.1", "OPEN")), "-0.1"),
+        "a short shown LONG"
+    );
+    assert!(
+        !agrees(Some(&pos("SHORT", "0.1", "OPEN")), "0.1"),
+        "a long shown SHORT"
+    );
+    assert!(
+        !agrees(Some(&pos("LONG", "0", "OPEN")), "0"),
+        "flat but OPEN"
+    );
+    assert!(
+        !agrees(Some(&pos("LONG", "0.1", "CLOSED")), "0.1"),
+        "sized but CLOSED"
+    );
+    assert!(!agrees(Some(&pos("LONG", "0.2", "OPEN")), "0.1"));
+    assert!(!agrees(Some(&pos("LONG", "x", "OPEN")), "0.1"));
+}
+
+#[test]
+fn an_output_not_written_fails_the_run() {
+    let mut ev = evidence::Evidence::default();
+    assert!(ev.ok());
+    ev.artifact_errors
+        .push("no fixtures written: synthetic".to_owned());
+    assert!(!ev.ok());
+    assert!(evidence::markdown(&ev).contains("Outputs not written (the run fails)"));
 }

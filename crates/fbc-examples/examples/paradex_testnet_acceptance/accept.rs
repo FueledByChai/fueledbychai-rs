@@ -232,6 +232,9 @@ pub async fn run(
         rest_bodies: Vec::new(),
         fmt: order_caps_fmt(),
         undecoded: false,
+        book_reads: 1,
+        connections: 0,
+        sampled: (0, 0, 0),
     };
     for name in [
         "place",
@@ -267,7 +270,7 @@ pub async fn run(
     } = run;
     drop(journal);
     if let Err(e) = writing.close() {
-        ev.notes
+        ev.artifact_errors
             .push(format!("the journal's writer ended with an error: {e}"));
     }
     let fixtures = dir.join("fixtures");
@@ -287,7 +290,7 @@ pub async fn run(
             ev.withheld = written.withheld;
             fixture_files = written.files;
         }
-        Err(e) => ev.notes.push(format!("no fixtures written: {e}")),
+        Err(e) => ev.artifact_errors.push(format!("no fixtures written: {e}")),
     }
     let report = dir.join("report.md");
     let json = dir.join("evidence.json");
@@ -517,6 +520,8 @@ enum PhaseKind {
 enum SocketEnd {
     Drop,
     Close,
+    /// A close whose session did not finish within 5 s: its socket was then dropped.
+    CloseTimedOut,
 }
 
 /// The order a disconnect should cancel, for [`Run::after_disconnect`].
@@ -527,6 +532,8 @@ struct CodOrder {
     how: SocketEnd,
     /// When the session ended.
     at: Instant,
+    /// The market's position in lots as the phase's stream last showed it.
+    lots: i64,
 }
 
 /// The run's state across its phases.
@@ -555,6 +562,12 @@ struct Run {
     fmt: ClientIdFormat,
     /// Whether a session could not decode a frame or answer: the run cannot say it saw all.
     undecoded: bool,
+    /// The order-book reads made, the connections opened, and what had been sent when the
+    /// last comparison was made (REST requests, WebSocket order methods, connections): the
+    /// per-IP limit check's counts.
+    book_reads: u64,
+    connections: u64,
+    sampled: (u64, u64, u64),
 }
 
 /// One phase's session, registry and link (module documentation).
@@ -679,6 +692,7 @@ impl Run {
             tr.step = self.t().step;
         }
         let built = self.build_session(creds);
+        self.connections += 1;
         let (link, wake, mut session, control) = match built {
             Ok(b) => b,
             Err(e) => {
@@ -715,16 +729,23 @@ impl Run {
                 }
                 end = &mut steps => end,
             };
+            let mut end = end;
             if end.0 == SocketEnd::Close && ended_first.is_none() {
-                // A graceful close: the control's drop sends the close frame.
+                // A graceful close: the control's drop sends the close frame. A session that
+                // does not finish in time has its socket dropped below, so the close is not
+                // recorded as a clean one.
                 drop(control.take());
-                let _ = tokio::time::timeout(Duration::from_secs(5), &mut running).await;
+                let closed = tokio::time::timeout(Duration::from_secs(5), &mut running).await;
+                if closed.is_err() {
+                    end.0 = SocketEnd::CloseTimedOut;
+                }
             }
             // A drop: the run's future, and with it the socket, is dropped here with no close
             // frame sent, as when a process dies.
             (end, ended_first)
         };
         let at = Instant::now();
+        let lots = link.borrow().registry().inventory(INST).0;
         let undecoded = session.counters().decode_errors;
         drop(session);
         drop(control);
@@ -759,6 +780,7 @@ impl Run {
             wire,
             how: end.0,
             at,
+            lots,
         })
     }
 
@@ -1101,11 +1123,22 @@ impl Run {
 
     /// The order on `side`, `--away-bps` behind a touch read now (and `extra_bps` more): its
     /// price and size, the size no more than the resting cap holds.
-    async fn priced(&self, side: OrderSide, extra_bps: u32) -> Result<Priced, String> {
+    async fn priced(&mut self, side: OrderSide, extra_bps: u32) -> Result<Priced, String> {
+        self.book_reads += 1;
         let book = touch(self.t(), &self.specs).await?;
+        self.priced_on(&book, side, extra_bps)
+    }
+
+    /// [`Run::priced`] on `book`.
+    fn priced_on(
+        &self,
+        book: &OrderbookSnapshot,
+        side: OrderSide,
+        extra_bps: u32,
+    ) -> Result<Priced, String> {
         let mut opts = with_side(self.t(), side);
         opts.away_bps += extra_bps;
-        let mut priced = trade::price(&opts, &book)?;
+        let mut priced = trade::price(&opts, book)?;
         if priced.qty > self.resting {
             // The resting cap in lots is the dearer side's: the order is cut to it, and must
             // still meet the market's minimum notional.
@@ -1176,6 +1209,19 @@ impl Run {
                 items,
                 outcomes,
             }),
+        }
+    }
+
+    /// Every outcome the session has reported so far for each request `step` sent: a
+    /// placement's final phase (0092) comes on its order event, after the reply's provisional
+    /// acceptance the step first recorded.
+    fn refresh_outcomes(&mut self, p: &Phase, step: &str) {
+        let rpcs: Vec<u64> = self.ev.step(step).sent.iter().map(|c| c.rpc).collect();
+        for rpc in rpcs {
+            let outcomes = p.outcomes(fbc_core::RpcId(rpc));
+            if let Some(c) = self.ev.step(step).sent.iter_mut().find(|c| c.rpc == rpc) {
+                c.outcomes = outcomes;
+            }
         }
     }
 
@@ -1317,6 +1363,7 @@ impl Run {
                     .compare(p, &format!("{step}: {label} resting"), &[cid])
                     .await;
                 let listed = c.orders_agreed;
+                self.refresh_outcomes(p, step);
                 let s = self.ev.step(step);
                 s.comparisons.push(c);
                 if !(rests && listed) {
@@ -1369,6 +1416,7 @@ impl Run {
                 c.positions_agreed
             ),
         );
+        self.refresh_outcomes(p, step);
         let s = self.ev.step(step);
         s.ran = Ran::Yes;
         s.orders.extend(traces);
@@ -1549,19 +1597,38 @@ impl Run {
     /// The batch of two: a buy below the bid and a sell above the ask. `Some(Some(ids))` when
     /// both rest, `Some(None)` when skipped (an empty side of the book), `None` when it failed.
     async fn batch(&mut self, p: &Phase) -> Option<Option<Vec<ClientOrderId>>> {
-        let (buy, sell) = match (
-            self.priced(OrderSide::Buy, 0).await,
-            self.priced(OrderSide::Sell, 0).await,
-        ) {
+        self.book_reads += 1;
+        let book = match touch(self.t(), &self.specs).await {
+            Ok(book) => book,
+            Err(e) => {
+                self.fail("batch", e);
+                return None;
+            }
+        };
+        // Only the venue's state skips the pair: a side of the book with nothing resting, so
+        // no order can rest behind it. Anything else (a read that failed, a size the caps or
+        // the minimum notional refuse) fails the step.
+        if book.bids.is_empty() || book.asks.is_empty() {
+            let why = format!(
+                "the order book has no {} resting, so no order rests behind that side",
+                if book.bids.is_empty() { "bid" } else { "ask" }
+            );
+            for step in ["batch", "cancel-many"] {
+                self.ev.step(step).ran = Ran::Skipped(why.clone());
+            }
+            self.lines
+                .line(format_args!("NOTE batch and cancel-many skipped: {why}"));
+            return Some(None);
+        }
+        let priced = (
+            self.priced_on(&book, OrderSide::Buy, 0),
+            self.priced_on(&book, OrderSide::Sell, 0),
+        );
+        let (buy, sell) = match priced {
             (Ok(b), Ok(s)) => (b, s),
             (b, s) => {
-                let why = b.err().or(s.err()).unwrap_or_default();
-                for step in ["batch", "cancel-many"] {
-                    self.ev.step(step).ran = Ran::Skipped(why.clone());
-                }
-                self.lines
-                    .line(format_args!("NOTE batch and cancel-many skipped: {why}"));
-                return Some(None);
+                self.fail("batch", b.err().or(s.err()).unwrap_or_default());
+                return None;
             }
         };
         let cids = match self.mint(2).await {
@@ -1755,41 +1822,71 @@ impl Run {
     }
 
     /// After a phase ended its socket with `cod` resting: GET /orders until it is gone or
-    /// `--cod-wait` passes, then its history.
+    /// `--cod-wait` passes, then its history (did it end cancelled with nothing filled?), then
+    /// GET /orders and GET /positions against what the phase's stream last showed (the order
+    /// gone if cancel-on-disconnect worked; the position the fills imply).
     async fn after_disconnect(&mut self, step: &str, cod: CodOrder) {
         let how = match cod.how {
             SocketEnd::Drop => "dropped (no close frame)",
             SocketEnd::Close => "graceful close (a close frame)",
+            SocketEnd::CloseTimedOut => {
+                "closed, but the session did not finish within 5 s and its socket was then \
+                 dropped: neither a clean graceful close nor a clean drop"
+            }
         };
         let wait = Duration::from_secs(self.opts.cod_wait_secs);
         let deadline = Instant::now() + wait;
         let mut gone_at = None;
         let mut errors = Vec::new();
+        // A read starts only before the wait has passed, and each takes at most the configured
+        // request timeout.
+        let mut first = true;
         loop {
-            match self.rest.get(open_orders_request(&self.t().rest_url)).await {
-                Ok(answer) if answer.status == 200 => {
-                    let listed = parse_results(&answer.body).iter().any(|o| {
-                        o.get("client_id").and_then(Value::as_str) == Some(cod.wire.as_str())
-                    });
-                    if !listed {
-                        gone_at = Some(Instant::now());
-                        self.rest_bodies
-                            .push((format!("orders-after-{step}"), answer.body));
-                        break;
+            if !std::mem::take(&mut first) && Instant::now() >= deadline {
+                break;
+            }
+            let by = Instant::now() + self.rest.timeout();
+            match self
+                .rest
+                .get(open_orders_request(&self.t().rest_url), by)
+                .await
+            {
+                Ok(answer) if answer.status == 200 => match parse_results(&answer.body) {
+                    Ok(rows) => {
+                        let listed = rows.iter().any(|o| {
+                            o.get("client_id").and_then(Value::as_str) == Some(cod.wire.as_str())
+                        });
+                        if !listed {
+                            gone_at = Some(Instant::now());
+                            self.rest_bodies
+                                .push((format!("orders-after-{step}"), answer.body));
+                            break;
+                        }
                     }
-                }
+                    Err(e) => errors.push(format!("GET /orders: {e}")),
+                },
                 Ok(answer) => errors.push(format!("GET /orders status {}", answer.status)),
                 Err(e) => errors.push(e),
-            }
-            if Instant::now() >= deadline {
-                break;
             }
             tokio::time::sleep(POLL).await;
         }
         let history = self
             .history_read(&cod.label, &cod.wire, &["CLOSED"], cod.at, wait)
             .await;
-        let cancelled = gone_at.is_some();
+        // Gone from GET /orders proves only that it no longer rests: cancelled by the
+        // disconnect means its history shows it CLOSED with nothing filled.
+        let filled = history.filled == Some(true);
+        let cancelled = gone_at.is_some() && history.listed && !filled;
+        let expected = vec![(cod.label.clone(), cod.wire.clone(), None)];
+        let c = self
+            .compare_rest(
+                &format!("{step}: after the disconnect"),
+                &expected,
+                cod.at,
+                cod.lots,
+                false,
+            )
+            .await;
         self.lines.step(
             step,
             format_args!(
@@ -1797,12 +1894,23 @@ impl Run {
                 cod.label,
                 if cancelled {
                     format!(
-                        "cancelled by Paradex (GET /orders stopped listing it after {} ms; cancel_reason {})",
+                        "cancelled by Paradex (GET /orders stopped listing it after {} ms; \
+                         history CLOSED, nothing filled, cancel_reason {})",
                         gone_at.map_or(0, |g| g.duration_since(cod.at).as_millis()),
                         history.cancel_reason.as_deref().unwrap_or("-")
                     )
+                } else if filled {
+                    "FILLED before or during the disconnect: the experiment says nothing of \
+                     cancel-on-disconnect"
+                        .to_owned()
+                } else if gone_at.is_some() {
+                    "gone from GET /orders, but its history never showed it CLOSED: not judged"
+                        .to_owned()
                 } else {
-                    format!("still listed after {} s: NOT cancelled on this disconnect", wait.as_secs())
+                    format!(
+                        "still listed after {} s: NOT cancelled on this disconnect",
+                        wait.as_secs()
+                    )
                 }
             ),
         );
@@ -1811,9 +1919,25 @@ impl Run {
         s.ran = Ran::Yes;
         s.orders.push(trace);
         // The step records what Paradex did; either answer is evidence, so it passes once it
-        // was measured: the order rested, the socket ended, and REST answered.
-        s.pass = cancelled || errors.is_empty();
+        // was measured cleanly: the socket ended as intended, the order neither filled nor
+        // went unexplained, every REST read answered, and the position is the fills'.
+        let measured = cancelled || (gone_at.is_none() && errors.is_empty());
+        s.pass = measured
+            && cod.how != SocketEnd::CloseTimedOut
+            && !filled
+            && c.positions_agreed
+            && history.error.is_none();
+        if filled {
+            s.notes.push(format!(
+                "{} filled: no cancel-on-disconnect verdict",
+                cod.label
+            ));
+        }
+        if cod.how == SocketEnd::CloseTimedOut {
+            s.notes.push(how.to_owned());
+        }
         s.notes.extend(errors);
+        s.comparisons.push(c);
         s.disconnect = Some(Disconnect {
             how: how.to_owned(),
             cancelled,
@@ -1869,51 +1993,56 @@ impl Run {
             ..History::default()
         };
         loop {
+            if h.reads > 0 && Instant::now() >= deadline {
+                return h;
+            }
             h.reads += 1;
-            match self
+            let by = Instant::now() + self.rest.timeout();
+            let read = self
                 .rest
-                .get(order_history_request(&self.t().rest_url, wire))
-                .await
-            {
-                Ok(answer) if answer.status == 200 => {
-                    let rows = parse_results(&answer.body);
-                    let row = rows
-                        .iter()
-                        .find(|o| o.get("client_id").and_then(Value::as_str) == Some(wire));
-                    if let Some(row) = row {
-                        let status = row
-                            .get("status")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_owned();
-                        h.status = Some(status.clone());
-                        h.cancel_reason = row
-                            .get("cancel_reason")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned);
-                        if wanted.contains(&status.as_str()) {
-                            h.listed = true;
-                            h.lag_ms = Some(since.elapsed().as_millis());
-                            self.rest_bodies.push((
-                                format!("orders-history-{}", label.replace(' ', "-")),
-                                answer.body,
-                            ));
-                            return h;
+                .get(order_history_request(&self.t().rest_url, wire), by)
+                .await;
+            match read {
+                Ok(answer) if answer.status == 200 => match parse_results(&answer.body) {
+                    Ok(rows) => {
+                        h.error = None;
+                        let row = rows
+                            .iter()
+                            .find(|o| o.get("client_id").and_then(Value::as_str) == Some(wire));
+                        if let Some(row) = row {
+                            let text = |k: &str| row.get(k).and_then(Value::as_str);
+                            let status = text("status").unwrap_or("").to_owned();
+                            h.status = Some(status.clone());
+                            h.cancel_reason = text("cancel_reason").map(str::to_owned);
+                            // Filled when what remains is less than its size.
+                            let num = |k: &str| text(k).and_then(|v| v.parse::<Decimal>().ok());
+                            h.filled = match (num("size"), num("remaining_size")) {
+                                (Some(size), Some(left)) => Some(left < size),
+                                _ => None,
+                            };
+                            if wanted.contains(&status.as_str()) {
+                                h.listed = true;
+                                h.lag_ms = Some(since.elapsed().as_millis());
+                                self.rest_bodies.push((
+                                    format!("orders-history-{}", label.replace(' ', "-")),
+                                    answer.body,
+                                ));
+                                return h;
+                            }
                         }
                     }
-                }
+                    Err(e) => h.error = Some(e),
+                },
                 Ok(answer) => h.error = Some(format!("status {}", answer.status)),
                 Err(e) => h.error = Some(e),
-            }
-            if Instant::now() >= deadline {
-                return h;
             }
             tokio::time::sleep(POLL).await;
         }
     }
 
     /// Reads GET /orders and GET /positions until they agree with what the stream shows of
-    /// `cids` (and the market's position), or `--rest-wait` passes.
+    /// `cids` (and the market's position), or `--rest-wait` passes. With no `cids` (the last
+    /// comparison), nothing at all may rest on the market.
     async fn compare(&mut self, p: &Phase, after: &str, cids: &[ClientOrderId]) -> Comparison {
         let tick = self.t().tick;
         let step = self.t().step;
@@ -1945,7 +2074,29 @@ impl Run {
             let lots = link.registry().inventory(INST).0;
             (expected, since.unwrap_or_else(Instant::now), lots)
         };
+        self.compare_rest(after, &expected, since, stream_lots, cids.is_empty())
+            .await
+    }
+
+    /// [`Run::compare`]'s reads: `expected` (each order's label, client id as sent, and its
+    /// price and total while it rests, `None` once ended) and the market's position in lots,
+    /// from the stream's last change at `since`; `empty`: nothing may rest on the market.
+    async fn compare_rest(
+        &mut self,
+        after: &str,
+        expected: &[Expected],
+        since: Instant,
+        stream_lots: i64,
+        empty: bool,
+    ) -> Comparison {
+        let step = self.t().step;
         let stream_position = (Decimal::from(stream_lots) * step).normalize();
+        // What was sent since the last comparison, for the per-IP limit check: the program's
+        // own REST requests (this reader's, logins included, and the order-book reads), the
+        // WebSocket order methods, and the connections opened (each a login and two reads).
+        let rest_now = self.rest.requests() + self.book_reads;
+        let ws_now: u64 = self.ev.steps.iter().map(|s| s.sent.len() as u64).sum();
+        let (rest_before, ws_before, conns_before) = self.sampled;
         let mut c = Comparison {
             after: after.to_owned(),
             expected: expected
@@ -1965,15 +2116,29 @@ impl Run {
                 })
                 .collect(),
             stream_position: stream_position.to_string(),
+            rest_since: rest_now - rest_before,
+            ws_since: ws_now - ws_before,
+            connections_since: self.connections - conns_before,
             ..Comparison::default()
         };
         let wait = Duration::from_secs(self.opts.rest_wait_secs);
         let deadline = Instant::now() + wait;
         let market = self.t().market.clone();
         loop {
+            if c.reads > 0 && Instant::now() >= deadline {
+                break;
+            }
             c.reads += 1;
-            let orders = self.rest.get(open_orders_request(&self.t().rest_url)).await;
-            let positions = self.rest.get(positions_request(&self.t().rest_url)).await;
+            let by = Instant::now() + self.rest.timeout();
+            let orders = self
+                .rest
+                .get(open_orders_request(&self.t().rest_url), by)
+                .await;
+            let by = Instant::now() + self.rest.timeout();
+            let positions = self
+                .rest
+                .get(positions_request(&self.t().rest_url), by)
+                .await;
             let (mut mismatches, mut agreed_orders, mut agreed_positions) =
                 (Vec::new(), false, false);
             match &orders {
@@ -1988,50 +2153,25 @@ impl Run {
                         self.rest_bodies
                             .push((format!("orders-{}", slug(after)), body.clone()));
                     }
-                    let rows = parse_results(body);
-                    let on_market: Vec<&Value> = rows
-                        .iter()
-                        .filter(|o| {
-                            o.get("market").and_then(Value::as_str) == Some(market.as_str())
-                        })
-                        .collect();
-                    for (label, wire, want) in &expected {
-                        let row = on_market.iter().find(|o| {
-                            o.get("client_id").and_then(Value::as_str) == Some(wire.as_str())
-                        });
-                        match (want, row) {
-                            (None, None) => {}
-                            (None, Some(_)) => mismatches
-                                .push(format!("{label}: ended on the stream, still listed")),
-                            (Some(_), None) => {
-                                mismatches.push(format!("{label}: open on the stream, not listed"))
+                    match parse_results(body) {
+                        Ok(rows) => {
+                            let on_market: Vec<&Value> = rows
+                                .iter()
+                                .filter(|o| {
+                                    o.get("market").and_then(Value::as_str) == Some(market.as_str())
+                                })
+                                .collect();
+                            mismatches.extend(order_mismatches(expected, &on_market));
+                            if empty && !on_market.is_empty() {
+                                mismatches.push(format!(
+                                    "{} orders still listed on the market",
+                                    on_market.len()
+                                ));
                             }
-                            (Some((px, qty)), Some(row)) => {
-                                let num = |k: &str| {
-                                    row.get(k)
-                                        .and_then(Value::as_str)
-                                        .and_then(|v| v.parse::<Decimal>().ok())
-                                };
-                                if num("price") != *px || num("size") != Some(*qty) {
-                                    mismatches.push(format!(
-                                        "{label}: listed at {} x {}, the stream shows {} x {}",
-                                        row.get("price").and_then(Value::as_str).unwrap_or("-"),
-                                        row.get("size").and_then(Value::as_str).unwrap_or("-"),
-                                        px.map_or("-".to_owned(), |p| p.normalize().to_string()),
-                                        qty.normalize()
-                                    ));
-                                }
-                            }
+                            agreed_orders = mismatches.is_empty();
                         }
+                        Err(e) => c.errors.push(format!("GET /orders: {e}")),
                     }
-                    // In the last comparison, nothing of ours or anyone's may rest on the market.
-                    if cids.is_empty() && !on_market.is_empty() {
-                        mismatches.push(format!(
-                            "{} orders still listed on the market",
-                            on_market.len()
-                        ));
-                    }
-                    agreed_orders = mismatches.is_empty();
                 }
                 Ok(other) => c
                     .errors
@@ -2046,27 +2186,25 @@ impl Run {
                         self.rest_bodies
                             .push((format!("positions-{}", slug(after)), body.clone()));
                     }
-                    let rows = parse_results(body);
-                    let row = rows
-                        .iter()
-                        .find(|o| o.get("market").and_then(Value::as_str) == Some(market.as_str()));
-                    let field = |o: &Value, k: &str| {
-                        o.get(k).and_then(Value::as_str).unwrap_or("").to_owned()
-                    };
-                    c.rest_position = row.map(|o| RestPosition {
-                        side: field(o, "side"),
-                        size: field(o, "size"),
-                        status: field(o, "status"),
-                    });
-                    let rest_size = row
-                        .and_then(|o| o.get("size").and_then(Value::as_str))
-                        .and_then(|s| s.parse::<Decimal>().ok())
-                        .unwrap_or(Decimal::ZERO);
-                    agreed_positions = rest_size == stream_position;
-                    if !agreed_positions {
-                        mismatches.push(format!(
-                            "position: GET /positions {rest_size}, the fills {stream_position}"
-                        ));
+                    match parse_results(body) {
+                        Ok(rows) => {
+                            let row = rows.iter().find(|o| {
+                                o.get("market").and_then(Value::as_str) == Some(market.as_str())
+                            });
+                            let field = |o: &Value, k: &str| {
+                                o.get(k).and_then(Value::as_str).unwrap_or("").to_owned()
+                            };
+                            c.rest_position = row.map(|o| RestPosition {
+                                side: field(o, "side"),
+                                size: field(o, "size"),
+                                status: field(o, "status"),
+                            });
+                            match position_mismatch(c.rest_position.as_ref(), stream_position) {
+                                None => agreed_positions = true,
+                                Some(why) => mismatches.push(why),
+                            }
+                        }
+                        Err(e) => c.errors.push(format!("GET /positions: {e}")),
                     }
                 }
                 Ok(other) => c
@@ -2082,17 +2220,93 @@ impl Run {
                 c.orders_agreed = true;
                 c.positions_agreed = true;
                 c.lag_ms = Some(since.elapsed().as_millis());
-                return c;
+                break;
             }
-            if Instant::now() >= deadline {
-                c.orders_agreed = agreed_orders;
-                c.positions_agreed = agreed_positions;
-                c.last_mismatches = mismatches;
-                return c;
-            }
+            // The last read's verdict stands when the wait passes.
+            c.orders_agreed = agreed_orders;
+            c.positions_agreed = agreed_positions;
+            c.last_mismatches = mismatches;
             tokio::time::sleep(POLL).await;
         }
+        self.sampled = (
+            self.rest.requests() + self.book_reads,
+            ws_now,
+            self.connections,
+        );
+        c
     }
+}
+
+/// One order a comparison expects: its label, client id as sent, and its price and total
+/// while it rests (`None` once it ended).
+type Expected = (String, String, Option<(Option<Decimal>, Decimal)>);
+
+/// What GET /orders' rows on the market show other than `expected`.
+fn order_mismatches(expected: &[Expected], on_market: &[&Value]) -> Vec<String> {
+    let mut mismatches = Vec::new();
+    for (label, wire, want) in expected {
+        let row = on_market
+            .iter()
+            .find(|o| o.get("client_id").and_then(Value::as_str) == Some(wire.as_str()));
+        match (want, row) {
+            (None, None) => {}
+            (None, Some(_)) => {
+                mismatches.push(format!("{label}: ended on the stream, still listed"))
+            }
+            (Some(_), None) => mismatches.push(format!("{label}: open on the stream, not listed")),
+            (Some((px, qty)), Some(row)) => {
+                let num = |k: &str| {
+                    row.get(k)
+                        .and_then(Value::as_str)
+                        .and_then(|v| v.parse::<Decimal>().ok())
+                };
+                if num("price") != *px || num("size") != Some(*qty) {
+                    mismatches.push(format!(
+                        "{label}: listed at {} x {}, the stream shows {} x {}",
+                        row.get("price").and_then(Value::as_str).unwrap_or("-"),
+                        row.get("size").and_then(Value::as_str).unwrap_or("-"),
+                        px.map_or("-".to_owned(), |p| p.normalize().to_string()),
+                        qty.normalize()
+                    ));
+                }
+            }
+        }
+    }
+    mismatches
+}
+
+/// Why GET /positions' row for the market (`None`: not listed) disagrees with `stream` (the
+/// position the fills imply, signed), or `None` when it agrees: a signed size equal to the
+/// stream's, LONG for a positive one and SHORT for a negative one, OPEN; and at size 0, not
+/// listed or CLOSED (FBC-0sc's (b)).
+pub fn position_mismatch(rest: Option<&RestPosition>, stream: Decimal) -> Option<String> {
+    let Some(p) = rest else {
+        return (!stream.is_zero())
+            .then(|| format!("position: GET /positions lists none, the fills {stream}"));
+    };
+    let Ok(size) = p.size.parse::<Decimal>() else {
+        return Some("position: GET /positions' size is not a decimal".to_owned());
+    };
+    if size != stream {
+        return Some(format!(
+            "position: GET /positions {size}, the fills {stream}"
+        ));
+    }
+    let (side, status) = (p.side.as_str(), p.status.as_str());
+    let shaped = if size.is_zero() {
+        status == "CLOSED"
+    } else {
+        status == "OPEN"
+            && side
+                == if size > Decimal::ZERO {
+                    "LONG"
+                } else {
+                    "SHORT"
+                }
+    };
+    (!shaped).then(|| {
+        format!("position: GET /positions shows size {size} as side {side:?} status {status:?}")
+    })
 }
 
 /// The wall clock now, as testnet_trade reads it.
@@ -2103,12 +2317,14 @@ fn trade_wall_now() -> fbc_core::WallNs {
     fbc_core::WallNs(i64::try_from(ns).unwrap_or(i64::MAX))
 }
 
-/// The `results` of a Paradex list answer.
-fn parse_results(body: &[u8]) -> Vec<Value> {
-    serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|v| v.get("results").and_then(Value::as_array).cloned())
-        .unwrap_or_default()
+/// The `results` of a Paradex list answer, or why the answer holds none: a 200 answer that is
+/// not JSON, or has no `results` list, is no empty snapshot.
+pub fn parse_results(body: &[u8]) -> Result<Vec<Value>, String> {
+    let v: Value = serde_json::from_slice(body).map_err(|_| "the answer is not JSON".to_owned())?;
+    v.get("results")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| "the answer has no results list".to_owned())
 }
 
 /// A list answer's top-level keys besides `results`.
