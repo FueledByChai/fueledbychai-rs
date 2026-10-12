@@ -176,6 +176,22 @@ fn e8(text: &str) -> i64 {
 /// it: our post-only limit order `cid` on `side` (1 BUY, 2 SELL) of `size` at `price`, venue id
 /// `vid`, CLOSED by USER_CANCELED with nothing filled. The account is 32 made-up bytes.
 fn order_closed(side: u8, seq: i64, vid: &str, cid: &str, price: &str, size: &str) -> Vec<u8> {
+    order_event(side, seq, vid, cid, price, size, size, "USER_CANCELED")
+}
+
+/// As [`order_closed`], with `open` of `size` still open and the cancel reason `reason` (empty
+/// and nothing open: filled).
+#[allow(clippy::too_many_arguments)]
+fn order_event(
+    side: u8,
+    seq: i64,
+    vid: &str,
+    cid: &str,
+    price: &str,
+    size: &str,
+    open: &str,
+    reason: &str,
+) -> Vec<u8> {
     let null = i64::MIN;
     let ts = 1_759_500_000_205_011i64;
     let mut f = Vec::new();
@@ -188,7 +204,7 @@ fn order_closed(side: u8, seq: i64, vid: &str, cid: &str, price: &str, size: &st
     f.extend(e8(price).to_le_bytes());
     f.extend(null.to_le_bytes()); // triggerPrice
     f.extend(e8(size).to_le_bytes()); // size
-    f.extend(e8(size).to_le_bytes()); // sizeOpen
+    f.extend(e8(open).to_le_bytes()); // sizeOpen
     f.extend(null.to_le_bytes()); // avgFillPrice
     f.extend(ts.to_le_bytes()); // createdAt
     f.extend(ts.to_le_bytes()); // updatedAt
@@ -197,7 +213,34 @@ fn order_closed(side: u8, seq: i64, vid: &str, cid: &str, price: &str, size: &st
     f.extend(ts.to_le_bytes()); // publishedAt
     f.extend([0u8, 0, 0, 0]); // stp, flags, requestStatus, requestType
     assert_eq!(f.len(), 8 + 128);
-    for s in [vid, cid, MARKET, "USER_CANCELED", "", ""] {
+    for s in [vid, cid, MARKET, reason, "", ""] {
+        f.push(u8::try_from(s.len()).unwrap());
+        f.extend(s.as_bytes());
+    }
+    f
+}
+
+/// A `FillEvent` (template 21) at version 1, as `fixtures/paradex/exec/README.md` describes it:
+/// our buy `cid` (venue id `vid`) made `size` at `price` for no fee, fill id `fill`.
+fn fill_event(seq: i64, fill: &str, vid: &str, cid: &str, price: &str, size: &str) -> Vec<u8> {
+    let ts = 1_759_500_000_204_011i64;
+    let mut f = Vec::new();
+    for v in [107u16, 21, 1, 1] {
+        f.extend(v.to_le_bytes());
+    }
+    f.extend(ts.to_le_bytes());
+    f.extend(seq.to_le_bytes());
+    f.extend([1u8, 1, 1]); // FILL, BUY, MAKER
+    f.extend(e8(price).to_le_bytes());
+    f.extend(e8(size).to_le_bytes());
+    f.extend(0i64.to_le_bytes()); // fee
+    f.extend(i64::MIN.to_le_bytes()); // realizedPnl: null
+    f.extend(ts.to_le_bytes()); // createdAt
+    f.extend(0xa0u8..=0xbf); // account, made up
+    f.extend(e8(price).to_le_bytes()); // underlyingPrice
+    f.extend(0i64.to_le_bytes()); // realizedFunding
+    assert_eq!(f.len(), 8 + 107);
+    for s in [fill, vid, cid, "9615262148007719001", MARKET] {
         f.push(u8::try_from(s.len()).unwrap());
         f.extend(s.as_bytes());
     }
@@ -239,6 +282,11 @@ struct Venue {
     position_after_first: Option<&'static str>,
     /// Answer the next single cancel ALREADY_CLOSED, with no order event.
     already_closed_once: bool,
+    /// Answer the next single cancel of a buy queued, then fill the buy whole (its fill event
+    /// sent twice, the second a duplicate) and close it filled: a fill racing the cancel.
+    fill_next_buy_cancel: bool,
+    /// Answer every batch cancel's second item ALREADY_CLOSED, its order's end sent first.
+    batch_second_already_closed: bool,
     /// Notified at this `GET /orderbook` read (from 1): the loop's cycle before it settled.
     signal: Option<(usize, Arc<Notify>)>,
     creates: usize,
@@ -388,7 +436,29 @@ fn responder(venue: &Shared, conn: usize) -> Responder {
                     })
                     .ok_or("a cancel of no order the stub holds")?;
                 let vid = v.orders[at].vid.clone();
-                if v.already_closed_once {
+                if v.fill_next_buy_cancel && v.orders[at].side == "BUY" {
+                    v.fill_next_buy_cancel = false;
+                    v.orders[at].open = false;
+                    let o = v.orders[at].clone();
+                    v.seq += 2;
+                    let fill = fill_event(
+                        5_000 + v.seq,
+                        "8615262148007719001",
+                        &o.vid,
+                        &o.cid,
+                        &o.price,
+                        &o.size,
+                    );
+                    let filled =
+                        order_event(1, 5_001 + v.seq, &o.vid, &o.cid, &o.price, &o.size, "0", "");
+                    let queued = ok(json!({"order_id": vid, "status": "QUEUED_FOR_CANCELLATION"}));
+                    vec![
+                        queued,
+                        Frame::Binary(fill.clone()),
+                        Frame::Binary(fill),
+                        Frame::Binary(filled),
+                    ]
+                } else if v.already_closed_once {
                     v.already_closed_once = false;
                     vec![ok(json!({"order_id": vid, "status": "ALREADY_CLOSED"}))]
                 } else {
@@ -400,18 +470,26 @@ fn responder(venue: &Shared, conn: usize) -> Responder {
                 let ids = params["order_ids"].as_array().cloned().unwrap_or_default();
                 let mut results = Vec::new();
                 let mut events = Vec::new();
-                for id in ids {
+                let mut first = Vec::new();
+                for (i, id) in ids.iter().enumerate() {
                     let vid = id.as_str().unwrap_or("");
                     let at = v
                         .orders
                         .iter()
                         .position(|o| o.vid == vid)
                         .ok_or("a batch cancel of no order the stub holds")?;
-                    let status = "QUEUED_FOR_CANCELLATION";
+                    let status = if v.batch_second_already_closed && i == 1 {
+                        // Its end is sent before the reply: it closed before the cancel came.
+                        first.push(closed(&mut v, at));
+                        "ALREADY_CLOSED"
+                    } else {
+                        events.push(closed(&mut v, at));
+                        "QUEUED_FOR_CANCELLATION"
+                    };
                     results.push(json!({"id": vid, "market": MARKET, "status": status}));
-                    events.push(closed(&mut v, at));
                 }
-                let mut frames = vec![ok(json!({ "results": results }))];
+                let mut frames = first;
+                frames.push(ok(json!({ "results": results })));
                 frames.extend(events);
                 frames
             }
@@ -614,6 +692,8 @@ async fn testnet_quote_requotes_by_cancel_and_replace_within_the_caps_against_th
         (6, 0, 0),
         "{printed}"
     );
+    // Nothing of the answered requests is kept, in the loop or the link.
+    assert_eq!(report.requests_held, 0, "{printed}");
 
     // No amend frame, ever: every change is a cancel and a place.
     let sent = methods(&venue, 0);
@@ -1055,6 +1135,70 @@ async fn an_earlier_runs_order_is_cancelled_before_the_first_place() {
         ["1759500000000088888"]
     );
     assert_eq!(report.cancelled, 3, "{printed}");
+}
+
+#[tokio::test]
+async fn a_fill_during_a_replace_requotes_from_the_position_it_left_never_past_the_usd_cap() {
+    // The market rose 29% since the first touch, so fbc-oms's caps in lots (from the first
+    // touch) admit more than the USD caps at the market. Cycle 2 replaces both quotes; the bid's
+    // cancel races a fill of all of it (12 lots; the venue sends the fill twice). Placing the
+    // bid again from the position the cycle read (flat) would admit 24 lots long, $19.2 at
+    // 80000, past the $16 inventory cap; the loop requotes from the position the fill left.
+    let venue = venue(vec![b0(), b0(), book(2, Some("80000.0"), Some("80000.2"))]);
+    lock(&venue).fill_next_buy_cancel = true;
+    // The opening six, two places, two replace cancels, the ask's new place, Stop's cancel.
+    let script = one_connection(&venue, 6 + 2 + 2 + 1 + 1);
+    let stub = StubServer::start(script, routes(&venue, login_ok()))
+        .await
+        .unwrap();
+    let mut opts = options(&stub, 3);
+    opts.order_usd = dec("8");
+    opts.inventory_cap_usd = dec("16");
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+
+    assert!(report.ok, "{printed}");
+    // 12 lots a quote; the caps admit 25 lots of inventory at the first touch.
+    assert!(printed.contains("QUOTE 12 lots"), "{printed}");
+    assert!(printed.contains("inventory 25 lots"), "{printed}");
+    let reqs = requests(&venue, 0);
+    let buys = reqs
+        .iter()
+        .filter(|r| r["method"] == "order.create" && r["params"]["side"] == "BUY")
+        .count();
+    assert_eq!(
+        buys, 1,
+        "the bid was placed again after the fill: {reqs:#?}\n{printed}"
+    );
+    assert!(
+        printed.contains("SKIP bid: a fill would take the position to 24 lots"),
+        "{printed}"
+    );
+    // The fill is counted once, its duplicate not at all; the inventory moved by it.
+    assert_eq!((report.fills, report.inventory), (1, 12), "{printed}");
+    assert_eq!(tagged(&printed, "FILL").len(), 1, "{printed}");
+}
+
+#[tokio::test]
+async fn a_stop_batch_cancel_with_an_item_refused_fails_the_run() {
+    // Stop's batch cancel of both quotes: the first item queued, the second ALREADY_CLOSED (its
+    // order ended just before). Every order ended, but not every Stop cancel was accepted.
+    let venue = venue(vec![b0()]);
+    lock(&venue).batch_second_already_closed = true;
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 2 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let opts = options(&stub, 1);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+
+    assert!(!report.ok, "{printed}");
+    assert_eq!(report.ended, "--cycles 1 reached", "{printed}");
+    assert!(printed.contains("Stop's cancel"), "{printed}");
+    assert!(printed.contains("DONE failed"), "{printed}");
 }
 
 fn strings(args: &[&str]) -> Vec<String> {

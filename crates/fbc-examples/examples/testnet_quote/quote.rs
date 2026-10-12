@@ -98,6 +98,9 @@ pub struct Report {
     pub fills: usize,
     /// The market's inventory at the end, in lots.
     pub inventory: i64,
+    /// The requests whose items the loop and the link still hold at the end (in flight, or
+    /// unanswered): what a long run keeps.
+    pub requests_held: usize,
 }
 
 /// The quote size and fbc-oms's caps, in lots, at the first touch.
@@ -510,7 +513,7 @@ pub async fn run(
         swept: 0,
         resync_due: false,
         trouble: None,
-        outcomes: HashMap::new(),
+        answers: HashMap::new(),
         submitted: HashSet::new(),
         ours: HashMap::new(),
         owned: Vec::new(),
@@ -588,12 +591,13 @@ enum Settled {
     Interrupted,
 }
 
-/// What each request of ours is, for its lines: a place or a cancel, its side and its order.
+/// What each request of ours is, for its lines and its answer: a place or a cancel, the side
+/// and order of its first item (none for an instrument cancel-all), and how many items it has.
 #[derive(Copy, Clone, Debug)]
 struct Request {
     place: bool,
-    side: Side,
-    cid: ClientOrderId,
+    first: Option<(Side, ClientOrderId)>,
+    items: usize,
 }
 
 /// The loop (module documentation).
@@ -631,8 +635,9 @@ struct Driver {
     resync_due: bool,
     /// The first thing that Stops the loop, as the notes showed it.
     trouble: Option<String>,
-    /// What came of each request of ours, each one sent or not.
-    outcomes: HashMap<RpcId, SubmitOutcome>,
+    /// The answers to each request of ours, item by item (`None`: the whole request's, a not
+    /// sent included), until [`Driver::answer`] has them all.
+    answers: HashMap<RpcId, Vec<(Option<u16>, SubmitOutcome)>>,
     submitted: HashSet<RpcId>,
     ours: HashMap<RpcId, Request>,
     /// The orders of ours on the market the run knows that have not ended (the resyncs' and the
@@ -657,13 +662,21 @@ impl Driver {
         leases: Leases,
         control: ExecControl,
     ) -> (bool, String) {
-        let (asked, why) = match self.quote(ns_lease, persisted, leases).await {
+        let (mut asked, mut why) = match self.quote(ns_lease, persisted, leases).await {
             Ok(why) => (true, why),
             Err(why) => (false, why),
         };
         self.absorb();
+        // Something unexpected noted as the loop ended still fails the run.
+        if let Some(late) = self.trouble.clone()
+            && asked
+        {
+            asked = false;
+            why = late;
+        }
         self.lines.line(format_args!("STOP {why}"));
         let stopped = self.stop().await;
+        self.compact();
         drop(control);
         (asked && stopped, why)
     }
@@ -682,6 +695,7 @@ impl Driver {
             cancelled: self.cancelled,
             fills: self.fills,
             inventory: reg.inventory(INST).0,
+            requests_held: link.requests_held().max(self.ours.len()),
         }
     }
 
@@ -771,10 +785,10 @@ impl Driver {
         match note {
             Note::Outcome {
                 rpc,
+                item,
                 outcome,
                 ours: true,
-                ..
-            } => self.on_outcome(rpc, outcome),
+            } => self.on_outcome(rpc, item, outcome),
             Note::Outcome {
                 outcome,
                 ours: false,
@@ -793,9 +807,8 @@ impl Driver {
                 self.submitted.insert(rpc);
                 if let Err(reason) = sent {
                     self.note(format_args!("request {} was not sent: {reason:?}", rpc.0));
-                    self.outcomes
-                        .entry(rpc)
-                        .or_insert(SubmitOutcome::NotSent(reason));
+                    let answers = self.answers.entry(rpc).or_default();
+                    answers.push((None, SubmitOutcome::NotSent(reason)));
                 }
             }
             Note::Order(Routed::Ours(cid, Applied::Amended)) => self.trouble(format!(
@@ -813,9 +826,16 @@ impl Driver {
                  id sequence {})",
                 cid.seq()
             )),
-            Note::Fill { seen, unexplained } => {
+            Note::Fill {
+                seen,
+                unexplained,
+                ours,
+            } => {
                 if unexplained {
                     self.trouble(format!("a fill not of our orders came in: {seen}"));
+                } else if !ours {
+                    // Held by the ledger (a duplicate, or before its watermark): not applied.
+                    self.note(format_args!("a fill not applied: {seen}"));
                 } else {
                     self.fills += 1;
                     let inventory = self.link.borrow().registry().inventory(INST).0;
@@ -895,15 +915,12 @@ impl Driver {
                 self.own(&cids);
                 for rpc in &rpcs {
                     let named = self.link.borrow().cids_of(*rpc);
-                    for cid in named {
-                        let side = self.side_of(cid);
-                        let request = Request {
-                            place: false,
-                            side,
-                            cid,
-                        };
-                        self.ours.insert(*rpc, request);
-                    }
+                    let request = Request {
+                        place: false,
+                        first: named.first().map(|cid| (self.side_of(*cid), *cid)),
+                        items: named.len().max(1),
+                    };
+                    self.ours.insert(*rpc, request);
                 }
                 let requests: Vec<String> = rpcs.iter().map(|r| r.0.to_string()).collect();
                 self.note(format_args!(
@@ -942,8 +959,10 @@ impl Driver {
             .map_or(Side::Buy, |r| r.placed().side)
     }
 
-    fn on_outcome(&mut self, rpc: RpcId, outcome: SubmitOutcome) {
-        let request = self.ours.get(&rpc).copied();
+    /// An answer to request `rpc` of ours (item `item`, or the whole request): kept for
+    /// [`Driver::answer`], an Unknown one a reason to Stop, the first printed, and any not
+    /// accepted noted.
+    fn on_outcome(&mut self, rpc: RpcId, item: Option<u16>, outcome: SubmitOutcome) {
         if outcome == SubmitOutcome::Unknown {
             self.trouble(format!(
                 "request {} came back Unknown: the loop does not drive the Unknown ladder (no \
@@ -951,35 +970,68 @@ impl Driver {
                 rpc.0
             ));
         }
-        let first = !self.outcomes.contains_key(&rpc);
-        self.outcomes.entry(rpc).or_insert_with(|| outcome.clone());
-        let Some(Request { place, side, cid }) = request else {
-            return;
+        let answers = self.answers.entry(rpc).or_default();
+        let first = answers.is_empty();
+        answers.push((item, outcome.clone()));
+        let request = self.ours.get(&rpc).copied();
+        let (place, named) = match request {
+            Some(Request {
+                place,
+                first: Some((side, cid)),
+                ..
+            }) => (place, format!("{} #{}", side_name(side), cid.seq())),
+            Some(Request { place, .. }) => (place, "every order of ours".to_owned()),
+            None => return,
         };
-        if !first {
-            return;
-        }
-        let side = side_name(side);
-        let seq = cid.seq();
         match (&outcome, place) {
-            (SubmitOutcome::Accepted { ack }, true) => {
-                let vid = self.vid_of(cid);
+            (SubmitOutcome::Accepted { ack }, true) if first => {
+                let vid = request
+                    .and_then(|r| r.first)
+                    .map_or_else(|| "none".to_owned(), |(_, cid)| self.vid_of(cid));
                 self.event(
                     "ACK",
-                    format_args!("{side} #{seq} accepted ({ack:?}), venue order id {vid}"),
+                    format_args!("{named} accepted ({ack:?}), venue order id {vid}"),
                 );
             }
-            (SubmitOutcome::Accepted { ack }, false) => self.event(
+            (SubmitOutcome::Accepted { ack }, false) if first => self.event(
                 "CANCEL-ACK",
-                format_args!("{side} #{seq} accepted ({ack:?}): queued for cancellation"),
+                format_args!("{named} accepted ({ack:?}): queued for cancellation"),
             ),
-            (other, true) => self.note(format_args!("the {side} place #{seq} came back {other:?}")),
-            (other, false) => {
-                self.note(format_args!(
-                    "the {side} cancel of #{seq} came back {other:?}"
-                ));
+            (SubmitOutcome::Accepted { .. }, _) => {}
+            (other, true) => self.note(format_args!("the place {named} came back {other:?}")),
+            (other, false) => self.note(format_args!(
+                "request {}'s cancel (item {}) came back {other:?}",
+                rpc.0,
+                item.map_or_else(|| "all".to_owned(), |i| i.to_string())
+            )),
+        }
+    }
+
+    /// What came of request `rpc` of ours once every item is answered: the whole request's
+    /// answer, or, item by item, the first not accepted, else accepted. `None` while an item is
+    /// unanswered, so a batch is never judged by its first item alone.
+    fn answer(&self, rpc: RpcId) -> Option<SubmitOutcome> {
+        let answers = self.answers.get(&rpc)?;
+        if let Some((_, whole)) = answers.iter().find(|(item, _)| item.is_none()) {
+            return Some(whole.clone());
+        }
+        let items = self.ours.get(&rpc).map_or(1, |r| r.items);
+        let mut by_item: Vec<(u16, &SubmitOutcome)> = Vec::new();
+        for (item, outcome) in answers {
+            if let Some(i) = item
+                && !by_item.iter().any(|(seen, _)| seen == i)
+            {
+                by_item.push((*i, outcome));
             }
         }
+        if by_item.len() < items {
+            return None;
+        }
+        by_item.sort_by_key(|(i, _)| *i);
+        let refused = by_item
+            .iter()
+            .find(|(_, o)| !matches!(o, SubmitOutcome::Accepted { .. }));
+        Some(refused.unwrap_or(&by_item[0]).1.clone())
     }
 
     /// The orders of ours that ended leave [`Driver::owned`] ([`Driver::prune_one`]).
@@ -1026,13 +1078,17 @@ impl Driver {
     /// Drops what the loop kept of the requests that were sent and answered: nothing waits on
     /// them any more (called between cycles), so the maps hold what is in flight.
     fn compact(&mut self) {
-        let (outcomes, submitted) = (&self.outcomes, &self.submitted);
-        let done = |rpc: &RpcId| outcomes.contains_key(rpc) && submitted.contains(rpc);
-        let gone: Vec<RpcId> = self.outcomes.keys().copied().filter(done).collect();
+        let gone: Vec<RpcId> = self
+            .answers
+            .keys()
+            .copied()
+            .filter(|rpc| self.submitted.contains(rpc) && self.answer(*rpc).is_some())
+            .collect();
         for rpc in gone {
-            self.outcomes.remove(&rpc);
+            self.answers.remove(&rpc);
             self.submitted.remove(&rpc);
             self.ours.remove(&rpc);
+            self.link.borrow_mut().release(rpc);
         }
     }
 
@@ -1185,10 +1241,7 @@ impl Driver {
                 &self.specs,
             )
             .await?;
-            let position = self.link.borrow().registry().inventory(INST);
-            let wanted = desired(&self.opts, self.qty, position, &book);
-            self.print_cycle(&book, &wanted);
-            match self.settle(wanted).await? {
+            match self.settle(book).await? {
                 Settled::Done => self.cycles += 1,
                 Settled::Reconnected | Settled::Interrupted => continue,
             }
@@ -1274,14 +1327,18 @@ impl Driver {
         }
     }
 
-    /// Drives the planner to `wanted`: a pass, its commands handed to the session, then the next
-    /// pass at the next wake, until a pass has nothing to send, hold or await. A side whose order
-    /// placed this cycle ended without a cancel of ours (a post-only order the venue would not
-    /// rest, a fill) is not placed again before the next cycle; a place fbc-oms's caps refuse
-    /// leaves its side out of the cycle.
-    async fn settle(&mut self, wanted: Wanted) -> Result<Settled, String> {
+    /// Drives the planner to the desired book at the touch `book`: a pass, its commands handed
+    /// to the session, then the next pass at the next wake, until a pass has nothing to send,
+    /// hold or await. Each pass judges the quotes again ([`desired`]) at the position as it is
+    /// then, and at a fresh touch once a fill moved it since the touch was read (Codex
+    /// r4243853260): a replacement is never placed on a position the cycle did not see. A side
+    /// whose order placed this cycle ended without a cancel of ours (a post-only order the venue
+    /// would not rest, a fill) is not placed again before the next cycle; a place fbc-oms's caps
+    /// refuse leaves its side out of the cycle.
+    async fn settle(&mut self, mut book: OrderbookSnapshot) -> Result<Settled, String> {
         let deadline = tokio::time::Instant::now() + self.timeout;
-        let mut book = wanted.book;
+        let mut read_at = self.link.borrow().registry().inventory(INST);
+        let mut left_out: Vec<Side> = Vec::new();
         let mut placed: Vec<(Side, ClientOrderId)> = Vec::new();
         loop {
             let wake = Rc::clone(&self.wake);
@@ -1311,19 +1368,41 @@ impl Driver {
                             cid.seq(),
                             r.state()
                         ));
-                        book.remove(*side, 0);
+                        left_out.push(*side);
                         false
                     }
                     None => true,
                 }
             });
+            let position = self.link.borrow().registry().inventory(INST);
+            if position != read_at {
+                let wait = self.timeout;
+                book = touch(
+                    &self.opts.rest_url,
+                    &self.opts.market,
+                    &self.opts.proxy,
+                    wait,
+                    &self.specs,
+                )
+                .await?;
+                read_at = position;
+            }
+            let mut wanted = desired(&self.opts, self.qty, position, &book);
+            for side in &left_out {
+                wanted.book.remove(*side, 0);
+                match side {
+                    Side::Buy => wanted.bid = None,
+                    Side::Sell => wanted.ask = None,
+                }
+            }
+            self.print_cycle(&book, &wanted);
             self.reserve().await?;
             let now = self.link.borrow().now().0;
             let plan = {
                 let mut link = self.link.borrow_mut();
                 let mint = self.mint.as_mut().ok_or("no client-id mint")?;
                 self.planner
-                    .plan(&book, link.reg(), &self.plan_caps, ACCT, mint, now)
+                    .plan(&wanted.book, link.reg(), &self.plan_caps, ACCT, mint, now)
                     .map_err(|e| format!("the planner refused the pass: {e}"))?
             };
             let mut refused_place = false;
@@ -1331,7 +1410,7 @@ impl Driver {
                 match &refused.why {
                     PlanRefusal::Place(e) => {
                         refused_place = true;
-                        book.remove(refused.side, refused.level);
+                        left_out.push(refused.side);
                         self.note(format_args!(
                             "fbc-oms refused the {} place: {e:?}; that side is left out of this \
                              cycle",
@@ -1428,7 +1507,12 @@ impl Driver {
             link.submit(&self.orders, auth)
                 .map_err(|e| format!("the session refused a command: {e}"))?
         };
-        self.ours.insert(rpc, Request { place, side, cid });
+        let request = Request {
+            place,
+            first: Some((side, cid)),
+            items: 1,
+        };
+        self.ours.insert(rpc, request);
         if place {
             self.own(&[cid]);
             self.event(
@@ -1591,15 +1675,12 @@ impl Driver {
             .iter()
             .map(|cid| format!("{} #{}", side_name(self.side_of(*cid)), cid.seq()))
             .collect();
-        if let Some(cid) = cids.first() {
-            let side = self.side_of(*cid);
-            let request = Request {
-                place: false,
-                side,
-                cid: *cid,
-            };
-            self.ours.insert(rpc, request);
-        }
+        let request = Request {
+            place: false,
+            first: cids.first().map(|cid| (self.side_of(*cid), *cid)),
+            items: cids.len().max(1),
+        };
+        self.ours.insert(rpc, request);
         let what = if named.is_empty() {
             "every order of ours on the market (an instrument cancel-all)".to_owned()
         } else {
@@ -1655,7 +1736,7 @@ impl Driver {
         let ended = self
             .wait_for(timeout, false, |d| {
                 rpcs.extend(d.cancel_due());
-                let answered = rpcs.iter().all(|r| d.outcomes.contains_key(r));
+                let answered = rpcs.iter().all(|r| d.answer(*r).is_some());
                 (answered && d.all_ended()).then_some(())
             })
             .await;
@@ -1667,7 +1748,7 @@ impl Driver {
             );
         }
         for rpc in &rpcs {
-            match self.outcomes.get(rpc) {
+            match self.answer(*rpc).as_ref() {
                 Some(SubmitOutcome::Accepted { .. }) => {}
                 Some(other) => {
                     ok = false;
