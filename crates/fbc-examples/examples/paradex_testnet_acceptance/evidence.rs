@@ -72,10 +72,15 @@ pub struct Comparison {
     pub expected: Vec<(String, String)>,
     /// Whether GET /orders agreed with the stream (every order the stream shows open listed
     /// at its price and size, every one it shows ended absent) at some read before the wait
-    /// passed, and at the first read.
+    /// passed.
     pub orders_agreed: bool,
-    pub first_read_agreed: bool,
-    /// From the stream's last change of the orders compared to the first read that agreed.
+    /// Whether GET /orders, and GET /positions, each agreed at the first read (question (a)
+    /// is of GET /orders alone).
+    pub first_read_orders_agreed: bool,
+    pub first_read_positions_agreed: bool,
+    /// From the stream's last change of the orders compared to the first read at which both
+    /// agreed. None for a disconnect's position-only comparison: it reads only after the
+    /// disconnect's own wait, so its time to agree is no lag behind the stream.
     pub lag_ms: Option<u128>,
     /// How many reads were made.
     pub reads: u32,
@@ -128,8 +133,12 @@ pub struct History {
 pub struct Disconnect {
     /// How the socket ended: `dropped (no close frame)` or `graceful close`.
     pub how: String,
-    /// Whether GET /orders stopped listing the order within the wait, and after how long.
+    /// Whether GET /orders stopped listing the order within the wait (and its history shows
+    /// it cancelled, nothing filled), and after how long.
     pub cancelled: bool,
+    /// Whether the last GET /orders answer read after the disconnect listed it: false when it
+    /// was gone, or no answer was read (then nothing was measured).
+    pub still_listed: bool,
     pub after_ms: Option<u128>,
     pub waited_s: u64,
     /// What the order's history said then.
@@ -559,8 +568,13 @@ pub fn answers(ev: &Evidence) -> Vec<(String, String)> {
         .collect();
     let of_orders: Vec<&&Comparison> = comparisons.iter().filter(|c| c.orders_compared).collect();
     let all_orders = !of_orders.is_empty() && of_orders.iter().all(|c| c.orders_agreed);
-    let first = of_orders.iter().filter(|c| c.first_read_agreed).count();
-    let max_lag = comparisons.iter().filter_map(|c| c.lag_ms).max();
+    let first = of_orders
+        .iter()
+        .filter(|c| c.first_read_orders_agreed)
+        .count();
+    // REST's lag behind the stream: of the comparisons of orders (a disconnect's position-only
+    // comparison has none, [`Comparison::lag_ms`]).
+    let max_lag = of_orders.iter().filter_map(|c| c.lag_ms).max();
     let positions = !comparisons.is_empty() && comparisons.iter().all(|c| c.positions_agreed);
     let sides: Vec<String> = comparisons
         .iter()
@@ -624,25 +638,39 @@ pub fn answers(ev: &Evidence) -> Vec<(String, String)> {
             .map_or_else(
                 || "not run".to_owned(),
                 |d| {
+                    let (verdict, listing, after) = if d.cancelled {
+                        (
+                            "Paradex cancelled the order",
+                            "stopped listing it",
+                            ms(d.after_ms),
+                        )
+                    } else if d.after_ms.is_some() {
+                        (
+                            "not judged: gone, but its history did not show it cancelled with \
+                             nothing filled",
+                            "stopped listing it",
+                            ms(d.after_ms),
+                        )
+                    } else if d.still_listed {
+                        (
+                            "the order was NOT cancelled",
+                            "still listed it",
+                            format!("{} s", d.waited_s),
+                        )
+                    } else {
+                        (
+                            "not measured: no GET /orders answer was read after the disconnect",
+                            "answered nothing",
+                            format!("{} s", d.waited_s),
+                        )
+                    };
                     format!(
                         "{}: {} (GET /orders {} after {}; history status {}, cancel_reason {}); \
                          still resting at the next connection's resync: {}",
                         d.how,
-                        if d.cancelled {
-                            "Paradex cancelled the order"
-                        } else {
-                            "the order was NOT cancelled"
-                        },
-                        if d.cancelled {
-                            "stopped listing it"
-                        } else {
-                            "still listed it"
-                        },
-                        if d.cancelled {
-                            ms(d.after_ms)
-                        } else {
-                            format!("{} s", d.waited_s)
-                        },
+                        verdict,
+                        listing,
+                        after,
                         d.history
                             .as_ref()
                             .and_then(|h| h.status.clone())
@@ -874,7 +902,7 @@ pub fn markdown(ev: &Evidence) -> String {
         if !s.comparisons.is_empty() {
             let _ = writeln!(
                 out,
-                "\n| REST vs stream after | Stream showed | GET /orders agreed | First read | Lag | Reads | Position (stream / REST) | Positions agreed |\n| --- | --- | --- | --- | --- | --- | --- | --- |"
+                "\n| REST vs stream after | Stream showed | GET /orders agreed | First read (orders / positions) | Lag | Reads | Position (stream / REST) | Positions agreed |\n| --- | --- | --- | --- | --- | --- | --- | --- |"
             );
             for c in &s.comparisons {
                 let expected: Vec<String> = c
@@ -888,11 +916,12 @@ pub fn markdown(ev: &Evidence) -> String {
                 );
                 let _ = writeln!(
                     out,
-                    "| {} | {} | {} | {} | {} | {} | {} / {} | {} |",
+                    "| {} | {} | {} | {} / {} | {} | {} | {} / {} | {} |",
                     c.after,
                     expected.join("; "),
                     yn(c.orders_agreed),
-                    yn(c.first_read_agreed),
+                    yn(c.first_read_orders_agreed),
+                    yn(c.first_read_positions_agreed),
                     ms(c.lag_ms),
                     c.reads,
                     c.stream_position,
@@ -934,11 +963,12 @@ pub fn markdown(ev: &Evidence) -> String {
         if let Some(d) = &s.disconnect {
             let _ = writeln!(
                 out,
-                "- disconnect: {}; cancelled by Paradex: {} (after {}, waited up to {} s); still resting at the next resync: {}",
+                "- disconnect: {}; cancelled by Paradex: {} (after {}, waited up to {} s); still listed by the last GET /orders read: {}; still resting at the next resync: {}",
                 d.how,
                 yn(d.cancelled),
                 ms(d.after_ms),
                 d.waited_s,
+                yn(d.still_listed),
                 d.resting_at_reconnect.map_or("-", yn)
             );
         }
@@ -1000,7 +1030,8 @@ pub fn to_json(ev: &Evidence) -> Value {
             "after": c.after,
             "expected": c.expected.iter().map(|(k, v)| json!({"order": k, "stream": v})).collect::<Vec<_>>(),
             "orders_agreed": c.orders_agreed,
-            "first_read_agreed": c.first_read_agreed,
+            "first_read_orders_agreed": c.first_read_orders_agreed,
+            "first_read_positions_agreed": c.first_read_positions_agreed,
             "lag_ms": c.lag_ms.map(|v| v as u64),
             "reads": c.reads,
             "first_mismatches": c.first_mismatches,
@@ -1037,7 +1068,7 @@ pub fn to_json(ev: &Evidence) -> Value {
                 "comparisons": s.comparisons.iter().map(comparison).collect::<Vec<_>>(),
                 "histories": s.histories.iter().map(history).collect::<Vec<_>>(),
                 "disconnect": s.disconnect.as_ref().map(|d| json!({
-                    "how": d.how, "cancelled": d.cancelled, "after_ms": d.after_ms.map(|v| v as u64),
+                    "how": d.how, "cancelled": d.cancelled, "still_listed": d.still_listed, "after_ms": d.after_ms.map(|v| v as u64),
                     "waited_s": d.waited_s, "history": d.history.as_ref().map(history),
                     "resting_at_reconnect": d.resting_at_reconnect,
                 })),
@@ -1090,8 +1121,14 @@ pub fn utc(secs: i64) -> String {
 }
 
 /// Runs this repository's scripts/privacy-check.sh over `dir` alone (its own patterns, and the
-/// local master key files it checks by default): `Ok` when it passed, or what it said (file and
-/// line only, never a value). `script` is the check's path.
+/// local master key files it checks by default): `Ok` when it passed having scanned every file
+/// under `dir`, or what it said (file and line only, never a value). `script` is the check's
+/// path.
+///
+/// The script lists a git work tree's files with git, which leaves out ignored ones: under a
+/// checkout's ignored target/ it would scan none and pass. So git is kept from looking above
+/// `dir` (it is then no work tree and every file is listed), and the count the script says it
+/// scanned must be the number of files under `dir`.
 pub fn privacy_check(script: &Path, dir: &Path) -> Result<(), String> {
     if !script.is_file() {
         return Err(format!(
@@ -1099,13 +1136,35 @@ pub fn privacy_check(script: &Path, dir: &Path) -> Result<(), String> {
             script.display()
         ));
     }
-    let out = std::process::Command::new("bash")
-        .arg(script)
-        .env("LOOP_ROOT", dir)
+    let dir = dir
+        .canonicalize()
+        .map_err(|e| format!("the fixtures directory: {e}"))?;
+    let files = count_files(&dir).map_err(|e| format!("the fixtures directory: {e}"))?;
+    let mut cmd = std::process::Command::new("bash");
+    cmd.arg(script)
+        .env("LOOP_ROOT", &dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE");
+    if let Some(parent) = dir.parent() {
+        cmd.env("GIT_CEILING_DIRECTORIES", parent);
+    }
+    let out = cmd
         .output()
         .map_err(|e| format!("the privacy check could not run: {e}"))?;
     if out.status.success() {
-        Ok(())
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let scanned = stdout.lines().find_map(|l| {
+            l.strip_prefix("privacy: clean (")
+                .and_then(|rest| rest.split_once(' '))
+                .and_then(|(n, _)| n.parse::<usize>().ok())
+        });
+        match scanned {
+            Some(n) if n == files => Ok(()),
+            Some(n) => Err(format!(
+                "the privacy check scanned {n} of the {files} fixture files"
+            )),
+            None => Err("the privacy check did not say how many files it scanned".to_owned()),
+        }
     } else {
         let said: Vec<String> = String::from_utf8_lossy(&out.stdout)
             .lines()
@@ -1117,4 +1176,18 @@ pub fn privacy_check(script: &Path, dir: &Path) -> Result<(), String> {
             said.join("; ")
         ))
     }
+}
+
+/// How many files are under `dir`, recursively.
+fn count_files(dir: &Path) -> std::io::Result<usize> {
+    let mut n = 0;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            n += count_files(&entry.path())?;
+        } else {
+            n += 1;
+        }
+    }
+    Ok(n)
 }

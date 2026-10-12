@@ -185,6 +185,9 @@ struct Venue {
     one_sided: bool,
     /// Whether an IOC fills instead of expiring (the touch moved under it).
     ioc_fills: bool,
+    /// Whether the first GET /positions once an order was placed answers a stale position
+    /// (REST lagging the fills), the reads after it the account's.
+    stale_position_once: bool,
 }
 
 impl Venue {
@@ -491,6 +494,14 @@ fn routes(venue: Arc<Mutex<Venue>>) -> HttpRouter {
                 }
                 let mut v = positions.lock().unwrap();
                 v.disconnects();
+                if v.stale_position_once && !v.orders.is_empty() {
+                    v.stale_position_once = false;
+                    let row = json!({
+                        "account": v.account, "market": MARKET, "side": "LONG",
+                        "size": "0.00017", "status": "OPEN", "average_entry_price": "60140.1",
+                    });
+                    return reply(200, json!({ "results": [row] }).to_string());
+                }
                 let rows: Vec<Value> = if v.position.is_zero() {
                     Vec::new()
                 } else {
@@ -619,6 +630,32 @@ fn privacy_check(dir: &Path) -> (bool, String) {
     (out.status.success(), text)
 }
 
+/// The WebSocket order methods the comparisons counted, over the whole run.
+fn ws_counted(ev: &evidence::Evidence) -> u64 {
+    ev.steps
+        .iter()
+        .flat_map(|s| &s.comparisons)
+        .map(|c| c.ws_since)
+        .sum()
+}
+
+/// The JSON-RPC `order.*` methods the stub received on every connection.
+fn order_methods(stub: &StubServer) -> u64 {
+    (0..stub.connections().len())
+        .flat_map(|c| methods(stub, c))
+        .filter(|m| m.starts_with("order."))
+        .count() as u64
+}
+
+/// The report's answer to the question starting `q`.
+fn answer(ev: &evidence::Evidence, q: &str) -> String {
+    evidence::answers(ev)
+        .into_iter()
+        .find(|(question, _)| question.starts_with(q))
+        .map(|(_, a)| a)
+        .unwrap()
+}
+
 fn new_venue(cod_on_drop: bool, cod_on_close: bool) -> Arc<Mutex<Venue>> {
     Arc::new(Mutex::new(Venue {
         orders: Vec::new(),
@@ -632,6 +669,7 @@ fn new_venue(cod_on_drop: bool, cod_on_close: bool) -> Arc<Mutex<Venue>> {
         position: Decimal::ZERO,
         one_sided: false,
         ioc_fills: false,
+        stale_position_once: false,
     }))
 }
 
@@ -741,12 +779,18 @@ async fn the_program_runs_every_step_once_maps_each_to_the_lattice_and_writes_sc
             "{name}: {outcomes:?}"
         );
     }
-    // The per-IP limit check's counts: what was sent before each comparison.
+    // The per-IP limit check's counts: what was sent before each comparison. The first
+    // counts the connection's cancel-on-disconnect arm as well as the place.
     let first = &step("place").comparisons[0];
     assert_eq!(
         (first.ws_since, first.connections_since),
-        (1, 1),
+        (2, 1),
         "{first:?}"
+    );
+    assert_eq!(
+        ws_counted(ev),
+        order_methods(&stub),
+        "every WebSocket order method the stub received is counted once"
     );
     assert!(
         first.rest_since >= 2,
@@ -864,6 +908,19 @@ async fn the_program_runs_every_step_once_maps_each_to_the_lattice_and_writes_sc
         report.contains("(a) GET /orders lists every order"),
         "{report}"
     );
+    let of_orders = ev
+        .steps
+        .iter()
+        .flat_map(|s| &s.comparisons)
+        .filter(|c| c.orders_compared)
+        .count();
+    assert!(
+        answer(ev, "(a)").contains(&format!(
+            "({of_orders} of {of_orders} agreed at the first read)"
+        )),
+        "{}",
+        answer(ev, "(a)")
+    );
     assert!(report.contains("SYNTHETIC_IOC_EXPIRED"), "{report}");
     // The amend's order event and its request_info, read from the journal.
     assert!(
@@ -963,6 +1020,118 @@ async fn a_venue_that_keeps_orders_after_a_disconnect_is_recorded_and_the_next_c
     assert!(step("stop").pass, "{printed}");
     let report = fs::read_to_string(&outcome.report).unwrap();
     assert!(report.contains("the order was NOT cancelled"), "{report}");
+    // (b) is REST's lag behind the stream: a disconnect's position-only comparison waits out
+    // --cod-wait (1 s here, the order still listed) before it reads, so it carries no lag.
+    let comparisons: Vec<&evidence::Comparison> =
+        ev.steps.iter().flat_map(|s| &s.comparisons).collect();
+    for c in comparisons.iter().filter(|c| !c.orders_compared) {
+        assert_eq!(c.lag_ms, None, "{c:?}");
+    }
+    let max = comparisons
+        .iter()
+        .filter(|c| c.orders_compared)
+        .filter_map(|c| c.lag_ms)
+        .max()
+        .unwrap();
+    assert_eq!(answer(ev, "(b)"), format!("at most {max} ms"));
+    // The Safety cancels at each reconnect and each connection's arm are counted too.
+    assert_eq!(ws_counted(ev), order_methods(&stub));
+}
+
+#[tokio::test]
+async fn a_position_read_that_lags_keeps_the_agreeing_answer_and_the_orders_first_read_counts() {
+    // GET /positions answers one stale position at the place's comparison; GET /orders agrees
+    // at once.
+    let venue = new_venue(true, true);
+    venue.lock().unwrap().stale_position_once = true;
+    let stub = stub_for(&venue, MAIN, 0, 0).await;
+    let (evidence_dir, _e) = temp_dir("evidence-lag");
+    let (lease_dir, _l) = temp_dir("lease-lag");
+    let opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
+    let (outcome, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(outcome.ok, "{printed}");
+
+    let ev = &outcome.evidence;
+    let place = &ev
+        .steps
+        .iter()
+        .find(|s| s.name == "place")
+        .unwrap()
+        .comparisons[0];
+    assert!(
+        place.first_read_orders_agreed && !place.first_read_positions_agreed,
+        "{place:?}"
+    );
+    assert!(
+        place.orders_agreed && place.positions_agreed && place.reads == 2,
+        "{place:?}"
+    );
+    // Answer (a) is of GET /orders alone: the lagging position does not take from it.
+    let of_orders = ev
+        .steps
+        .iter()
+        .flat_map(|s| &s.comparisons)
+        .filter(|c| c.orders_compared)
+        .count();
+    assert!(
+        answer(ev, "(a)").contains(&format!(
+            "({of_orders} of {of_orders} agreed at the first read)"
+        )),
+        "{}",
+        answer(ev, "(a)")
+    );
+    // The fixtures keep the stale first answer and the one that agreed.
+    let slug = "rest-positions-place";
+    let kept: Vec<&String> = outcome
+        .fixture_files
+        .iter()
+        .filter(|f| f.contains(slug))
+        .collect();
+    assert!(
+        kept.iter().any(|f| f.ends_with("-agreed.json"))
+            && kept.iter().any(|f| !f.ends_with("-agreed.json")),
+        "{:?}",
+        outcome.fixture_files
+    );
+    let agreed = kept.iter().find(|f| f.ends_with("-agreed.json")).unwrap();
+    let body = fs::read_to_string(outcome.fixtures.join(agreed)).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["results"],
+        json!([]),
+        "the agreeing answer: flat"
+    );
+}
+
+#[tokio::test]
+async fn a_disconnect_wait_with_no_orders_answer_is_not_measured_and_not_called_not_cancelled() {
+    // No --cod-wait: no GET /orders after the disconnect can answer within it.
+    let venue = new_venue(true, true);
+    let stub = stub_for(&venue, MAIN, 0, 0).await;
+    let (evidence_dir, _e) = temp_dir("evidence-unread");
+    let (lease_dir, _l) = temp_dir("lease-unread");
+    let opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 0);
+    let (outcome, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+
+    let ev = &outcome.evidence;
+    for name in ["cod-dropped", "cod-graceful"] {
+        let s = ev.steps.iter().find(|s| s.name == name).unwrap();
+        let d = s.disconnect.as_ref().unwrap();
+        assert!(!d.cancelled && !d.still_listed, "{name}: {d:?}");
+        assert!(!s.pass, "{name}: {s:?}");
+        assert!(
+            s.notes
+                .iter()
+                .any(|n| n.contains("no GET /orders answered")),
+            "{name}: {:?}",
+            s.notes
+        );
+    }
+    let report = fs::read_to_string(&outcome.report).unwrap();
+    assert!(!report.contains("NOT cancelled"), "{report}");
+    assert!(report.contains("not measured"), "{report}");
+    assert!(!outcome.ok, "{printed}");
 }
 
 #[tokio::test]
@@ -1280,6 +1449,47 @@ fn the_fixture_scan_finds_every_bearer_token_and_a_pem_header_and_the_check_runs
             .contains(&synthetic().0[2..].to_ascii_lowercase())
     );
     assert!(evidence::privacy_check(&dirty.join("no-such-script"), &clean).is_err());
+}
+
+#[test]
+fn the_privacy_check_scans_fixtures_written_under_a_git_ignored_directory() {
+    // An evidence directory inside a checkout's ignored target/: git lists none of its files,
+    // and the check must still scan every one.
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/privacy-check.sh");
+    let (repo, _r) = temp_dir("ignored-repo");
+    let init = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&repo)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .status()
+        .unwrap();
+    assert!(init.success());
+    fs::write(repo.join(".gitignore"), "target/\n").unwrap();
+    let fixtures = repo.join("target/run/fixtures");
+    fs::create_dir_all(&fixtures).unwrap();
+    fs::write(fixtures.join("a.json"), r#"{"account":"SCRUBBED"}"#).unwrap();
+    assert_eq!(evidence::privacy_check(&script, &fixtures), Ok(()));
+    fs::write(
+        fixtures.join("b.json"),
+        json!({"account": synthetic().0}).to_string(),
+    )
+    .unwrap();
+    let refused = evidence::privacy_check(&script, &fixtures).unwrap_err();
+    assert!(refused.contains("b.json"), "{refused}");
+}
+
+#[test]
+fn a_disconnect_is_measured_only_with_an_answer_that_listed_the_order_or_a_cancel() {
+    // (cancelled, still listed, a read failed, filled)
+    assert!(accept::disconnect_measured(true, false, false, false));
+    assert!(accept::disconnect_measured(false, true, false, false));
+    assert!(
+        !accept::disconnect_measured(false, false, false, false),
+        "no GET /orders answered within the wait: nothing measured"
+    );
+    assert!(!accept::disconnect_measured(false, true, true, false));
+    assert!(!accept::disconnect_measured(false, true, false, true));
 }
 
 #[test]

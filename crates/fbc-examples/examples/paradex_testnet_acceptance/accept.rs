@@ -235,6 +235,8 @@ pub async fn run(
         book_reads: 1,
         connections: 0,
         sampled: (0, 0, 0),
+        ws_ended: 0,
+        ws_live: None,
     };
     for name in [
         "place",
@@ -580,6 +582,10 @@ struct Run {
     book_reads: u64,
     connections: u64,
     sampled: (u64, u64, u64),
+    /// The WebSocket order methods of the phases that ended, and the running phase's link
+    /// ([`Run::ws_methods`]).
+    ws_ended: u64,
+    ws_live: Option<Rc<RefCell<Link>>>,
 }
 
 /// One phase's session, registry and link (module documentation).
@@ -717,6 +723,7 @@ impl Run {
                 return None;
             }
         };
+        self.ws_live = Some(Rc::clone(&link));
         let phase = Phase {
             link: Rc::clone(&link),
             wake,
@@ -761,6 +768,8 @@ impl Run {
         let undecoded = session.counters().decode_errors;
         drop(session);
         drop(control);
+        self.ws_ended += link_ws_methods(&link.borrow());
+        self.ws_live = None;
         drop(link);
         if let Some(why) = ended_first {
             let step = match kind {
@@ -1875,8 +1884,12 @@ impl Run {
         let wait = Duration::from_secs(self.opts.cod_wait_secs);
         let deadline = Instant::now() + wait;
         let mut gone_at = None;
+        // Whether an answer read after the disconnect listed the order: "not cancelled" is
+        // said only of an order seen listed, never of one no answer showed.
+        let mut still_listed = false;
         let mut errors = Vec::new();
-        // Every read is bounded by the wait; one the wait cut short is no error.
+        // Every read is bounded by the wait; one the wait cut short is no error once an answer
+        // was read, and the step's error when none was.
         let mut first = true;
         loop {
             if !std::mem::take(&mut first) && Instant::now() >= deadline {
@@ -1887,6 +1900,13 @@ impl Run {
                 .get(open_orders_request(&self.t().rest_url), deadline)
                 .await;
             if read.is_err() && Instant::now() >= deadline {
+                if !still_listed {
+                    errors.push(format!(
+                        "no GET /orders answered within --cod-wait ({} s): the disconnect was \
+                         not measured",
+                        wait.as_secs()
+                    ));
+                }
                 break;
             }
             match read {
@@ -1897,10 +1917,12 @@ impl Run {
                         });
                         if !listed {
                             gone_at = Some(Instant::now());
+                            still_listed = false;
                             self.rest_bodies
                                 .push((format!("orders-after-{step}"), answer.body));
                             break;
                         }
+                        still_listed = true;
                     }
                     Err(e) => errors.push(format!("GET /orders: {e}")),
                 },
@@ -1948,6 +1970,8 @@ impl Run {
                     "gone from GET /orders, but its history never showed it CLOSED with readable \
                      quantities: not judged"
                         .to_owned()
+                } else if !still_listed {
+                    "not measured: no GET /orders answer was read after the disconnect".to_owned()
                 } else {
                     format!(
                         "still listed after {} s: NOT cancelled on this disconnect",
@@ -1963,7 +1987,7 @@ impl Run {
         // The step records what Paradex did; either answer is evidence, so it passes once it
         // was measured cleanly: the socket ended as intended, the order neither filled nor
         // went unexplained, every REST read answered, and the position is the fills'.
-        let measured = cancelled || (gone_at.is_none() && errors.is_empty() && !filled);
+        let measured = disconnect_measured(cancelled, still_listed, !errors.is_empty(), filled);
         s.pass = measured
             && cod.how != SocketEnd::CloseTimedOut
             && !filled
@@ -1983,6 +2007,7 @@ impl Run {
         s.disconnect = Some(Disconnect {
             how: how.to_owned(),
             cancelled,
+            still_listed,
             after_ms: gone_at.map(|g| g.duration_since(cod.at).as_millis()),
             waited_s: wait.as_secs(),
             history: Some(history),
@@ -2164,6 +2189,9 @@ impl Run {
         let wait = Duration::from_secs(self.opts.rest_wait_secs);
         let deadline = Instant::now() + wait;
         let market = self.t().market.clone();
+        // The answers of the last round after the first, kept for the fixtures beside the first
+        // round's: the ones that agreed, or the last read when none did.
+        let (mut later_orders, mut later_positions) = (None::<Vec<u8>>, None::<Vec<u8>>);
         loop {
             if c.reads > 0 && Instant::now() >= deadline {
                 break;
@@ -2179,7 +2207,7 @@ impl Run {
                 // including this read (and any login it made), is counted against the
                 // rate-limit headers it carries.
                 let rest_now = self.rest.requests() + self.book_reads;
-                let ws_now: u64 = self.ev.steps.iter().map(|s| s.sent.len() as u64).sum();
+                let ws_now = self.ws_methods();
                 let (rest_before, ws_before, conns_before) = self.sampled;
                 c.rest_since = rest_now - rest_before;
                 c.ws_since = ws_now - ws_before;
@@ -2208,6 +2236,8 @@ impl Run {
                         c.page_keys = top_keys(body);
                         self.rest_bodies
                             .push((format!("orders-{}", slug(after)), body.clone()));
+                    } else {
+                        later_orders = Some(body.clone());
                     }
                     match parse_results(body) {
                         Ok(rows) => {
@@ -2241,6 +2271,8 @@ impl Run {
                     if c.reads == 1 {
                         self.rest_bodies
                             .push((format!("positions-{}", slug(after)), body.clone()));
+                    } else {
+                        later_positions = Some(body.clone());
                     }
                     match parse_results(body) {
                         Ok(rows) => {
@@ -2269,13 +2301,19 @@ impl Run {
                 Err(e) => c.errors.push(e.clone()),
             }
             if c.reads == 1 {
-                c.first_read_agreed = agreed_orders && agreed_positions;
+                // Each verdict on its own: question (a) is of GET /orders alone.
+                c.first_read_orders_agreed = agreed_orders;
+                c.first_read_positions_agreed = agreed_positions;
                 c.first_mismatches = mismatches.clone();
             }
             if agreed_orders && agreed_positions {
                 c.orders_agreed = true;
                 c.positions_agreed = true;
-                c.lag_ms = Some(since.elapsed().as_millis());
+                // A disconnect's position-only comparison reads only after the disconnect's
+                // own wait: its time to agree is no lag behind the stream, so it has none.
+                if c.orders_compared {
+                    c.lag_ms = Some(since.elapsed().as_millis());
+                }
                 break;
             }
             // The last read's verdict stands when the wait passes.
@@ -2284,8 +2322,62 @@ impl Run {
             c.last_mismatches = mismatches;
             tokio::time::sleep(POLL).await;
         }
+        let outcome = if c.orders_agreed && c.positions_agreed {
+            "agreed"
+        } else {
+            "last"
+        };
+        for (what, body) in [("orders", later_orders), ("positions", later_positions)] {
+            if let Some(body) = body {
+                self.rest_bodies
+                    .push((format!("{what}-{}-{outcome}", slug(after)), body));
+            }
+        }
         c
     }
+
+    /// The WebSocket order methods the run's sessions wrote so far: every request of ours
+    /// the session reported sent (the steps', the Stop cancels and the Safety cancels at a
+    /// reconnect) and each connection's own cancel-on-disconnect arm (the session's request
+    /// that the link notes as not ours, counted once its answer came; a phase whose arm
+    /// went unanswered stops at its opening).
+    fn ws_methods(&self) -> u64 {
+        self.ws_ended
+            + self
+                .ws_live
+                .as_ref()
+                .map_or(0, |link| link_ws_methods(&link.borrow()))
+    }
+}
+
+/// Whether a disconnect's cancel-on-disconnect was measured: the order `cancelled` by it, or
+/// `still_listed` by the last GET /orders answer read after it, with no read failed
+/// (`read_errors`) and nothing `filled`. No answer read is no "not cancelled".
+pub fn disconnect_measured(
+    cancelled: bool,
+    still_listed: bool,
+    read_errors: bool,
+    filled: bool,
+) -> bool {
+    cancelled || (still_listed && !read_errors && !filled)
+}
+
+/// [`Run::ws_methods`] of one phase's link.
+fn link_ws_methods(link: &Link) -> u64 {
+    let mut ours = 0u64;
+    let mut arms = std::collections::BTreeSet::new();
+    for note in link.notes() {
+        match note {
+            Note::Submitted { sent: Ok(()), .. } => ours += 1,
+            Note::Outcome {
+                rpc, ours: false, ..
+            } => {
+                arms.insert(rpc.0);
+            }
+            _ => {}
+        }
+    }
+    ours + arms.len() as u64
 }
 
 /// Whether an order gone (`gone`) from GET /orders after a disconnect was cancelled by it: its
