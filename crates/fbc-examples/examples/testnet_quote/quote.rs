@@ -589,6 +589,8 @@ enum Settled {
     Reconnected,
     /// The interrupt came.
     Interrupted,
+    /// `--duration` passed: nothing more is handed over (Codex r4243908421).
+    Ended,
 }
 
 /// What each request of ours is, for its lines and its answer: a place or a cancel, the side
@@ -1243,7 +1245,7 @@ impl Driver {
             .await?;
             match self.settle(book).await? {
                 Settled::Done => self.cycles += 1,
-                Settled::Reconnected | Settled::Interrupted => continue,
+                Settled::Reconnected | Settled::Interrupted | Settled::Ended => continue,
             }
             self.pause().await;
         }
@@ -1374,8 +1376,14 @@ impl Driver {
                     None => true,
                 }
             });
-            let position = self.link.borrow().registry().inventory(INST);
-            if position != read_at {
+            // The mark's write is this pass's last wait before the position is read: nothing
+            // awaited between that read and the commands' hand-over.
+            self.reserve().await?;
+            let inventory = |d: &Driver| d.link.borrow().registry().inventory(INST);
+            let mut position = inventory(self);
+            // A fresh touch for a moved position, read again until no fill moved it while the
+            // touch was being read (Codex r4243908416).
+            while position != read_at {
                 let wait = self.timeout;
                 book = touch(
                     &self.opts.rest_url,
@@ -1386,6 +1394,10 @@ impl Driver {
                 )
                 .await?;
                 read_at = position;
+                position = inventory(self);
+            }
+            if tokio::time::Instant::now() >= self.deadline {
+                return Ok(Settled::Ended);
             }
             let mut wanted = desired(&self.opts, self.qty, position, &book);
             for side in &left_out {
@@ -1396,7 +1408,6 @@ impl Driver {
                 }
             }
             self.print_cycle(&book, &wanted);
-            self.reserve().await?;
             let now = self.link.borrow().now().0;
             let plan = {
                 let mut link = self.link.borrow_mut();

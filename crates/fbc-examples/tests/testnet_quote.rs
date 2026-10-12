@@ -287,6 +287,8 @@ struct Venue {
     fill_next_buy_cancel: bool,
     /// Answer every batch cancel's second item ALREADY_CLOSED, its order's end sent first.
     batch_second_already_closed: bool,
+    /// Send a frame no codec decodes after the reply to this place (from 1).
+    garbage_after_create: Option<usize>,
     /// Notified at this `GET /orderbook` read (from 1): the loop's cycle before it settled.
     signal: Option<(usize, Arc<Notify>)>,
     creates: usize,
@@ -424,7 +426,11 @@ fn responder(venue: &Shared, conn: usize) -> Responder {
                 });
                 v.orders.push(held);
                 v.creates += 1;
-                vec![ok(json!({ "order": order }))]
+                let mut frames = vec![ok(json!({ "order": order }))];
+                if v.garbage_after_create == Some(v.creates) {
+                    frames.push(Frame::Binary(b"\xff".to_vec()));
+                }
+                frames
             }
             "order.cancel" => {
                 let at = v
@@ -1199,6 +1205,36 @@ async fn a_stop_batch_cancel_with_an_item_refused_fails_the_run() {
     assert_eq!(report.ended, "--cycles 1 reached", "{printed}");
     assert!(printed.contains("Stop's cancel"), "{printed}");
     assert!(printed.contains("DONE failed"), "{printed}");
+}
+
+#[tokio::test]
+async fn a_frame_the_codec_cannot_decode_stops_it_at_once() {
+    // After the second place's reply the venue sends a frame no codec decodes: it may have held
+    // a fill or an order event, so the loop Stops at once instead of quoting on (Codex
+    // r4243908424), and every order of ours is cancelled.
+    let venue = venue(vec![b0(), b0(), book(2, Some("62100.0"), Some("62100.3"))]);
+    lock(&venue).garbage_after_create = Some(2);
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 2 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let opts = options(&stub, 10);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+
+    assert!(!report.ok, "{printed}");
+    assert!(report.ended.contains("could not decode"), "{printed}");
+    // Cycle 1 may or may not have settled when the frame was read; nothing was placed after.
+    assert!(report.cycles <= 1, "{printed}");
+    assert_eq!((report.places_sent, report.cancelled), (2, 2), "{printed}");
+    let sent = methods(&venue, 0);
+    assert_eq!(
+        sent.iter().filter(|m| *m == "order.create").count(),
+        2,
+        "{sent:?}"
+    );
 }
 
 fn strings(args: &[&str]) -> Vec<String> {
