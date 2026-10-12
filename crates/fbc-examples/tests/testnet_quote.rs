@@ -247,6 +247,20 @@ fn fill_event(seq: i64, fill: &str, vid: &str, cid: &str, price: &str, size: &st
     f
 }
 
+/// A `PositionEvent` (template 22) at version 2: `fixtures/paradex/exec/position-long-v2`
+/// with its size set to `size` (long, absolute).
+fn position_event(size: &str) -> Vec<u8> {
+    let text = fs::read_to_string(fixture("paradex/exec/position-long-v2.sbe.txt")).unwrap();
+    let mut f: Vec<u8> = text
+        .lines()
+        .map(|line| line.split('#').next().unwrap())
+        .flat_map(str::split_whitespace)
+        .map(|byte| u8::from_str_radix(byte, 16).unwrap())
+        .collect();
+    f[8 + 17..8 + 25].copy_from_slice(&e8(size).to_le_bytes());
+    f
+}
+
 /// The account the REST answers name: the 32 made-up bytes the SBE frames carry, as hex.
 fn account() -> String {
     let hex: String = (0xa0u8..=0xbf).map(|b| format!("{b:02x}")).collect();
@@ -295,6 +309,9 @@ struct Venue {
     /// this reason: Paradex's risk check refusing it (`POST_ONLY_WOULD_CROSS`: the touch moved
     /// through the quote).
     close_create: Option<(usize, &'static str)>,
+    /// After the reply to this place (from 1), report the account's position long this size,
+    /// with no fill: the venue's position stream ahead of the fill, or a change not ours.
+    position_after_create: Option<(usize, &'static str)>,
     creates: usize,
     /// Every frame the stub sent, with the connection's number, for the wire-order checks.
     log: Vec<(usize, String)>,
@@ -431,6 +448,11 @@ fn responder(venue: &Shared, conn: usize) -> Responder {
                 v.orders.push(held);
                 v.creates += 1;
                 let mut frames = vec![ok(json!({ "order": order }))];
+                if let Some((n, size)) = v.position_after_create
+                    && n == v.creates
+                {
+                    frames.push(Frame::Binary(position_event(size)));
+                }
                 if let Some((n, reason)) = v.close_create
                     && n == v.creates
                 {
@@ -1314,6 +1336,106 @@ async fn an_asynchronous_reject_other_than_post_only_would_cross_stops_it() {
     assert!(report.ended.contains("NOT_ENOUGH_MARGIN"), "{printed}");
     assert_eq!(report.places_sent, 2, "{printed}");
     assert!(printed.contains("DONE failed"), "{printed}");
+}
+
+#[tokio::test]
+async fn an_order_book_older_than_one_already_read_stops_it_with_no_place_after() {
+    // Cycle 2's GET /orderbook answers seq 4 after seq 5 (a stale cache or replica) at a lower
+    // price: the loop Stops rather than quote from it (Codex r4244080123).
+    let venue = venue(vec![
+        book(5, Some("62000.2"), Some("62000.5")),
+        book(5, Some("62000.2"), Some("62000.5")),
+        book(4, Some("50000.0"), Some("50000.3")),
+    ]);
+    // The opening six, two places, Stop's cancel of both.
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 2 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let opts = options(&stub, 5);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+
+    assert!(!report.ok, "{printed}");
+    assert!(
+        report.ended.contains("answered seq 4 after seq 5"),
+        "{printed}"
+    );
+    assert_eq!((report.places_sent, report.cancelled), (2, 2), "{printed}");
+    let sent = methods(&venue, 0);
+    assert_eq!(
+        sent.iter().filter(|m| *m == "order.create").count(),
+        2,
+        "{sent:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_venue_position_the_inventory_does_not_hold_plans_nothing() {
+    // After cycle 1's second place the venue reports a long of 12 lots and no fill comes: the
+    // inventory stays flat. Cycle 2's touch moved, yet no pass plans (no replace) while they
+    // disagree; the book does not settle in time and the loop Stops, cancelling both quotes
+    // (Codex r4244080127).
+    let venue = venue(vec![b0(), b0(), book(2, Some("62100.0"), Some("62100.3"))]);
+    lock(&venue).position_after_create = Some((2, "0.00012"));
+    // The opening six, two places, Stop's cancel of both.
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 2 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let mut opts = options(&stub, 5);
+    opts.step_timeout_secs = 1;
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+
+    assert!(!report.ok, "{printed}");
+    assert!(
+        report
+            .ended
+            .contains("the venue's position (12 lots) and the inventory (0 lots) agreeing"),
+        "{printed}"
+    );
+    assert!(
+        printed.contains("nothing is planned until they agree"),
+        "{printed}"
+    );
+    let sent = methods(&venue, 0);
+    assert_eq!(
+        sent.iter().filter(|m| *m == "order.create").count(),
+        2,
+        "{sent:?}\n{printed}"
+    );
+    assert_eq!((report.places_sent, report.cancelled), (2, 2), "{printed}");
+}
+
+#[tokio::test]
+async fn a_client_id_high_water_mark_near_the_end_of_the_sequence_space_refuses_to_mint() {
+    // The kept mark is within RESERVE of u64::MAX: the loop refuses to mint, places nothing,
+    // and keeps the mark as it was, never a wrapped one (Codex r4244080134).
+    let venue = venue(vec![b0()]);
+    let stub = StubServer::start(one_connection(&venue, 6), routes(&venue, login_ok()))
+        .await
+        .unwrap();
+    let opts = options(&stub, 3);
+    let hwm = testnet::HighWater::at(&opts.lease_dir, Namespace::new(1));
+    let near = u64::MAX - 5;
+    hwm.write(near).unwrap();
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+
+    assert!(!report.ok, "{printed}");
+    assert!(
+        report
+            .ended
+            .contains("client-id sequence space is exhausted"),
+        "{printed}"
+    );
+    assert_eq!(report.places_sent, 0, "{printed}");
+    assert_eq!(hwm.read().unwrap(), near, "{printed}");
 }
 
 /// A TCP relay in front of the stub's HTTP port (`base`, its `http_url("/v1")`) that holds the
