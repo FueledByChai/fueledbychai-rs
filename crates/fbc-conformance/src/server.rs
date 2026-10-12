@@ -36,6 +36,26 @@ pub struct ConnRecord {
     pub received: Vec<Frame>,
     /// False once either side closed it or its upgrade failed.
     pub open: bool,
+    /// Whether the client sent a WebSocket close frame on it: a graceful close, which a client
+    /// that dropped its socket (a process that died, a dropped connection) never sends.
+    pub client_closed: bool,
+}
+
+/// A handle on the connections a running [`StubServer`] accepted
+/// ([`StubServer::connections_view`]), for a computed HTTP answer or a responder that answers
+/// as a venue would once a connection ended (FBC-xji8: a venue's cancel-on-disconnect). It can
+/// be cloned and sent between threads, and outlives no state: the records are the stub's.
+#[derive(Clone)]
+pub struct ConnectionsView {
+    conns: Shared<Vec<ConnRecord>>,
+}
+
+impl ConnectionsView {
+    /// Every connection the WebSocket endpoint accepted so far, in accept order, as
+    /// [`StubServer::connections`] gives them.
+    pub fn connections(&self) -> Vec<ConnRecord> {
+        lock(&self.conns).clone()
+    }
 }
 
 /// Why a script stopped before its end. `step` numbers the failing step from 0.
@@ -175,6 +195,14 @@ impl StubServer {
         lock(&self.conns).clone()
     }
 
+    /// A handle on the connections, for answers computed while the stub runs
+    /// ([`ConnectionsView`]).
+    pub fn connections_view(&self) -> ConnectionsView {
+        ConnectionsView {
+            conns: self.conns.clone(),
+        }
+    }
+
     /// The upgraded connections still open.
     pub fn live(&self) -> usize {
         let conns = lock(&self.conns);
@@ -227,6 +255,7 @@ async fn accept_ws(
                 upgraded: false,
                 received: Vec::new(),
                 open: true,
+                client_closed: false,
             });
             conns.len() - 1
         };
@@ -280,6 +309,10 @@ async fn serve_ws(
                         if let Some((_, sent)) = pinged.take_if(|_| ours) {
                             let _ = sent.send(true);
                         }
+                        continue;
+                    }
+                    Some(Ok(Message::Close(_))) => {
+                        record(&|c| c.client_closed = true);
                         continue;
                     }
                     Some(Ok(_)) => continue,

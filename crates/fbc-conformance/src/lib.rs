@@ -74,4 +74,4 @@ pub use script::{
     Frame, Responded, Responder, STORM_RECONNECTS, Step, WsScript, duplicate_acks, reconnect_storm,
     silence_after_ack,
 };
-pub use server::{ConnRecord, ScriptError, StubServer};
+pub use server::{ConnRecord, ConnectionsView, ScriptError, StubServer};

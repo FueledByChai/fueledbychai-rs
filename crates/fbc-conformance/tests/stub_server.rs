@@ -322,3 +322,32 @@ async fn dropping_the_stub_closes_a_connection_whose_push_waits_on_a_client_not_
     .await;
     assert!(closed.is_ok(), "the stub kept the connection open");
 }
+
+/// FBC-xji8: the record says whether the client closed a connection with a close frame (a
+/// graceful close) or dropped its socket with none, and the connections view a computed answer
+/// holds sees the same records as the stub, while it runs.
+#[tokio::test(start_paused = true)]
+async fn the_record_tells_a_graceful_close_from_a_dropped_socket_and_the_view_sees_it() {
+    let server = stub(vec![
+        Step::Accept,
+        Step::Read { conn: 0 },
+        Step::Accept,
+        Step::Read { conn: 1 },
+    ])
+    .await;
+    let view = server.connections_view();
+    let mut graceful = connector().websocket(&server.ws_url("/a")).await.unwrap();
+    graceful.send(Message::text("one")).await.unwrap();
+    graceful.close(None).await.unwrap();
+    while graceful.next().await.is_some() {}
+    let mut dropped = connector().websocket(&server.ws_url("/b")).await.unwrap();
+    dropped.send(Message::text("two")).await.unwrap();
+    drop(dropped);
+    server.finished().await.unwrap();
+    settle().await;
+    let seen = view.connections();
+    assert_eq!(seen, server.connections());
+    assert_eq!(seen.len(), 2);
+    assert!(!seen[0].open && seen[0].client_closed, "{:?}", seen[0]);
+    assert!(!seen[1].open && !seen[1].client_closed, "{:?}", seen[1]);
+}
