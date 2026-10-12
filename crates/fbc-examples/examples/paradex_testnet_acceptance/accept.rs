@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use fbc_core::{
     AccountKey, Channel, CidMatch, CidMint, ClientIdFormat, ClientOrderId, ConnKey, ConnState,
-    Envelope, ExecEvent, Lots, MarketLease, NewOrder, NonceBlock, NonceScope, NonceSource,
+    Envelope, ExecEvent, Lots, MarketLease, NewOrder, NonceBlock, NonceScope, NonceSource, OpKind,
     OrderKind, Secrets, Side, SignedLots, SpecTable, SubmitHandle, SubmitOutcome, Ticks, Tif,
     VenueFactory, VenueOrderSnapshot, encode_cid,
 };
@@ -139,7 +139,14 @@ pub async fn run(
     let factory = &ParadexFactory;
     let cfg = trade::config(t);
     let specs = trade::specs(factory, &cfg, t)?;
-    let book = touch(t, &specs).await?;
+    // One limiter for everything the run sends Paradex: the sessions of all three phases, the
+    // REST reader and the order-book reads.
+    let limiter = RateLimiter::new(
+        &factory.caps(&cfg).map_err(|e| e.to_string())?.limits,
+        SafetyReserve::percent(10).expect("a valid reserve"),
+    )
+    .map_err(|e| format!("{e:?}"))?;
+    let book = touch(t, &specs, &limiter).await?;
     let mine = trade::price(t, &book)?;
     let other_opts = with_side(t, opposite(t.side));
     let other = trade::price(&other_opts, &book).ok();
@@ -183,7 +190,12 @@ pub async fn run(
         .map_err(|e| format!("the client-id namespace's lease is held (another run?): {e:?}"))?;
     let hwm = HighWater::at(&t.lease_dir, ns);
     let persisted = hwm.read()?;
-    let rest = RestReader::new(&cfg, creds()?, Connector::new(t.proxy.clone()))?;
+    let rest = RestReader::new(
+        &cfg,
+        creds()?,
+        Connector::new(t.proxy.clone()),
+        limiter.clone(),
+    )?;
 
     // The journal: a queue the sessions record into, drained by a writer thread into
     // <evidence>/journal, its spans hashed under a key of this run's (never written).
@@ -233,10 +245,12 @@ pub async fn run(
         fmt: order_caps_fmt(),
         undecoded: false,
         book_reads: 1,
-        connections: 0,
         sampled: (0, 0, 0),
-        ws_ended: 0,
-        ws_live: None,
+        ended_counts: (0, 0),
+        live: None,
+        troubled: false,
+        clock: IngestClock::new(),
+        limiter,
     };
     for name in [
         "place",
@@ -394,7 +408,11 @@ impl Lines {
 }
 
 /// The market's REST order book (`GET /orderbook`), as testnet_trade reads it.
-async fn touch(opts: &Options, specs: &SpecTable) -> Result<OrderbookSnapshot, String> {
+async fn touch(
+    opts: &Options,
+    specs: &SpecTable,
+    limiter: &RateLimiter,
+) -> Result<OrderbookSnapshot, String> {
     let origin = opts
         .rest_url
         .trim_end_matches('/')
@@ -408,6 +426,14 @@ async fn touch(opts: &Options, specs: &SpecTable) -> Result<OrderbookSnapshot, S
         .map_err(|e| format!("GET /orderbook: {e}"))?;
     let connector = Connector::new(opts.proxy.clone());
     let wait = Duration::from_secs(opts.step_timeout_secs);
+    // A public GET: Paradex's per-IP limits count it.
+    crate::auth_rest::admit(
+        limiter,
+        OpKind::Rest,
+        Instant::now() + wait,
+        "GET /orderbook",
+    )
+    .await?;
     let response = tokio::time::timeout(wait, connector.http(request, 1 << 20))
         .await
         .map_err(|_| "GET /orderbook: no answer in time".to_owned())?
@@ -580,12 +606,20 @@ struct Run {
     /// last comparison was made (REST requests, WebSocket order methods, connections): the
     /// per-IP limit check's counts.
     book_reads: u64,
-    connections: u64,
     sampled: (u64, u64, u64),
-    /// The WebSocket order methods of the phases that ended, and the running phase's link
-    /// ([`Run::ws_methods`]).
-    ws_ended: u64,
-    ws_live: Option<Rc<RefCell<Link>>>,
+    /// The WebSocket order methods and connections of the phases that ended, and the running
+    /// phase's link ([`Run::session_totals`]).
+    ended_counts: (u64, u64),
+    live: Option<Rc<RefCell<Link>>>,
+    /// Whether a phase's link noted something that leaves the order truth incomplete
+    /// ([`link_problems`]).
+    troubled: bool,
+    /// The ingest clock every phase's session stamps with: one ingest sequence and one
+    /// monotonic origin for the run's one journal shard.
+    clock: IngestClock,
+    /// The limiter every phase's session and the REST reader charge: one count of what this
+    /// program sends Paradex.
+    limiter: RateLimiter,
 }
 
 /// One phase's session, registry and link (module documentation).
@@ -710,7 +744,6 @@ impl Run {
             tr.step = self.t().step;
         }
         let built = self.build_session(creds);
-        self.connections += 1;
         let (link, wake, mut session, control) = match built {
             Ok(b) => b,
             Err(e) => {
@@ -723,7 +756,7 @@ impl Run {
                 return None;
             }
         };
-        self.ws_live = Some(Rc::clone(&link));
+        self.live = Some(Rc::clone(&link));
         let phase = Phase {
             link: Rc::clone(&link),
             wake,
@@ -768,9 +801,30 @@ impl Run {
         let undecoded = session.counters().decode_errors;
         drop(session);
         drop(control);
-        self.ws_ended += link_ws_methods(&link.borrow());
-        self.ws_live = None;
+        let (ws, conns) = session_counts(link.borrow().notes());
+        self.ended_counts.0 += ws;
+        self.ended_counts.1 += conns;
+        self.live = None;
+        // What the link noted that leaves the run's order truth incomplete: the steps may all
+        // have passed, but the run cannot claim a clean result (as testnet_trade fails on
+        // them).
+        let problems = link_problems(link.borrow().notes());
         drop(link);
+        if !problems.is_empty() {
+            for what in &problems {
+                let note = format!("the {kind:?} phase: {what}");
+                self.lines.line(format_args!("NOTE {note}"));
+                self.ev.notes.push(note);
+            }
+            self.troubled = true;
+            let s = self.ev.step("stop");
+            s.notes.push(format!(
+                "the {kind:?} phase's link noted {} problems (the run's notes): the run cannot \
+                 say its order truth is complete",
+                problems.len()
+            ));
+            s.pass = false;
+        }
         if let Some(why) = ended_first {
             let step = match kind {
                 PhaseKind::Main => "place",
@@ -869,12 +923,6 @@ impl Run {
     /// The session's configuration, as testnet_trade's, the request ids shared by the phases.
     fn session_config(&self, creds: Secrets) -> Result<ExecSessionConfig, String> {
         let venue = &ParadexFactory;
-        let caps = venue.caps(&self.cfg).map_err(|e| e.to_string())?;
-        let limiter = RateLimiter::new(
-            &caps.limits,
-            SafetyReserve::percent(10).expect("a valid reserve"),
-        )
-        .map_err(|e| format!("{e:?}"))?;
         Ok(ExecSessionConfig {
             venue,
             cfg: self.cfg.clone(),
@@ -892,11 +940,12 @@ impl Run {
                 Duration::from_secs(10),
             )
             .expect("valid pacing"),
-            clock: IngestClock::new(),
+            clock: self.clock.clone(),
             nonces: Box::new(Counting(1)),
             nonce_source: NonceSourceId(u32::from(ACCT.get())),
-            conn: 0,
-            limiter,
+            // Each phase its own connection number in the run's one journal.
+            conn: u16::try_from(self.tracker.borrow().phase).unwrap_or(u16::MAX),
+            limiter: self.limiter.clone(),
             write_stall: WriteStall::new(Duration::from_secs(10)).expect("a non-zero window"),
             http_max_body: 1 << 20,
         })
@@ -939,7 +988,7 @@ impl Run {
                 let stopped = self.stop(&p, "stop").await;
                 let c = self.compare(&p, "stop", &[]).await;
                 let clean = c.orders_agreed && c.positions_agreed;
-                let undecoded = self.undecoded;
+                let undecoded = self.undecoded || self.troubled;
                 let s = self.ev.step("stop");
                 s.ran = Ran::Yes;
                 s.pass = stopped && clean && !undecoded;
@@ -1146,7 +1195,7 @@ impl Run {
     /// price and size, the size no more than the resting cap holds.
     async fn priced(&mut self, side: OrderSide, extra_bps: u32) -> Result<Priced, String> {
         self.book_reads += 1;
-        let book = touch(self.t(), &self.specs).await?;
+        let book = touch(self.t(), &self.specs, &self.limiter).await?;
         self.priced_on(&book, side, extra_bps)
     }
 
@@ -1642,7 +1691,7 @@ impl Run {
     /// both rest, `Some(None)` when skipped (an empty side of the book), `None` when it failed.
     async fn batch(&mut self, p: &Phase) -> Option<Option<Vec<ClientOrderId>>> {
         self.book_reads += 1;
-        let book = match touch(self.t(), &self.specs).await {
+        let book = match touch(self.t(), &self.specs, &self.limiter).await {
             Ok(book) => book,
             Err(e) => {
                 self.fail("batch", e);
@@ -2207,12 +2256,12 @@ impl Run {
                 // including this read (and any login it made), is counted against the
                 // rate-limit headers it carries.
                 let rest_now = self.rest.requests() + self.book_reads;
-                let ws_now = self.ws_methods();
+                let (ws_now, conns_now) = self.session_totals();
                 let (rest_before, ws_before, conns_before) = self.sampled;
                 c.rest_since = rest_now - rest_before;
                 c.ws_since = ws_now - ws_before;
-                c.connections_since = self.connections - conns_before;
-                self.sampled = (rest_now, ws_now, self.connections);
+                c.connections_since = conns_now - conns_before;
+                self.sampled = (rest_now, ws_now, conns_now);
             }
             let positions = self
                 .rest
@@ -2336,17 +2385,14 @@ impl Run {
         c
     }
 
-    /// The WebSocket order methods the run's sessions wrote so far: every request of ours
-    /// the session reported sent (the steps', the Stop cancels and the Safety cancels at a
-    /// reconnect) and each connection's own cancel-on-disconnect arm (the session's request
-    /// that the link notes as not ours, counted once its answer came; a phase whose arm
-    /// went unanswered stops at its opening).
-    fn ws_methods(&self) -> u64 {
-        self.ws_ended
-            + self
-                .ws_live
-                .as_ref()
-                .map_or(0, |link| link_ws_methods(&link.borrow()))
+    /// The WebSocket order methods the run's sessions wrote so far, and the connections they
+    /// opened ([`session_counts`] of every phase's link).
+    fn session_totals(&self) -> (u64, u64) {
+        let (ws, conns) = self
+            .live
+            .as_ref()
+            .map_or((0, 0), |link| session_counts(link.borrow().notes()));
+        (self.ended_counts.0 + ws, self.ended_counts.1 + conns)
     }
 }
 
@@ -2362,11 +2408,16 @@ pub fn disconnect_measured(
     cancelled || (still_listed && !read_errors && !filled)
 }
 
-/// [`Run::ws_methods`] of one phase's link.
-fn link_ws_methods(link: &Link) -> u64 {
-    let mut ours = 0u64;
+/// What one session's link `notes` say it sent, for the per-IP check: the WebSocket order
+/// methods (every request of ours the session reported sent: the steps', the Stop cancels and
+/// the Safety cancels at a reconnect; and each connection's own cancel-on-disconnect arm, the
+/// session's request the link notes as not ours, counted once its answer came) and the
+/// connections it opened (each epoch that authenticated, and each whose login was refused:
+/// every one made a login, and every authenticated one its two resync reads).
+pub fn session_counts(notes: &[Note]) -> (u64, u64) {
+    let (mut ours, mut conns) = (0u64, 0u64);
     let mut arms = std::collections::BTreeSet::new();
-    for note in link.notes() {
+    for note in notes {
         match note {
             Note::Submitted { sent: Ok(()), .. } => ours += 1,
             Note::Outcome {
@@ -2374,10 +2425,45 @@ fn link_ws_methods(link: &Link) -> u64 {
             } => {
                 arms.insert(rpc.0);
             }
+            Note::Conn(ConnState::Authenticated) | Note::LoginRefused(_) => conns += 1,
             _ => {}
         }
     }
-    ours + arms.len() as u64
+    (ours + arms.len() as u64, conns)
+}
+
+/// What a phase's link `notes` hold that leaves the run's order truth incomplete: a problem
+/// the link noted (a venue error after login, an asynchronous reject, an event or outcome the
+/// registry could not apply), an order in our namespace the registry does not hold (an order
+/// event's, or a resync's), a fill not of our orders, or a refused resync. Empty when none.
+pub fn link_problems(notes: &[Note]) -> Vec<String> {
+    let mut problems = Vec::new();
+    for note in notes {
+        match note {
+            Note::Problem(what) => problems.push(format!("the link noted a problem: {what}")),
+            Note::Orphan { cid, .. } => problems.push(format!(
+                "an order event of client id sequence {} in our namespace, which the registry \
+                 does not hold",
+                cid.seq()
+            )),
+            Note::Resynced { report, .. } => {
+                for (cid, _) in &report.untracked {
+                    problems.push(format!(
+                        "a resync showed client id sequence {} in our namespace, which the \
+                         registry does not hold",
+                        cid.seq()
+                    ));
+                }
+            }
+            Note::Fill {
+                seen,
+                unexplained: true,
+            } => problems.push(format!("a fill not of our orders: {seen}")),
+            Note::ResyncRefused(why) => problems.push(format!("a resync was refused: {why}")),
+            _ => {}
+        }
+    }
+    problems
 }
 
 /// Whether an order gone (`gone`) from GET /orders after a disconnect was cancelled by it: its

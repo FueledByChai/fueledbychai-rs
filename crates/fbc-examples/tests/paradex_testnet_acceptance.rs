@@ -188,6 +188,10 @@ struct Venue {
     /// Whether the first GET /positions once an order was placed answers a stale position
     /// (REST lagging the fills), the reads after it the account's.
     stale_position_once: bool,
+    /// A client id in our namespace that the program never minted: when set, the first
+    /// order.create also sends an order event of an order under it (one the registry does not
+    /// hold).
+    stray_cid: Option<String>,
 }
 
 impl Venue {
@@ -331,6 +335,14 @@ fn responder(venue: Arc<Mutex<Venue>>, conn: usize) -> Responder {
                     json!({"results": results})
                 };
                 frames.push(ok(reply));
+                if let Some(cid) = v.stray_cid.take() {
+                    let mut stray = created[0].clone();
+                    stray.cid = cid;
+                    stray.vid = "1759599999999999999".to_owned();
+                    stray.status = "OPEN";
+                    let seq = v.next_seq();
+                    frames.push(Frame::Binary(order_event(&stray, seq, 3, None)));
+                }
                 for mut o in created {
                     let seq = v.next_seq();
                     if o.tif == 2 && v.ioc_fills {
@@ -670,6 +682,7 @@ fn new_venue(cod_on_drop: bool, cod_on_close: bool) -> Arc<Mutex<Venue>> {
         one_sided: false,
         ioc_fills: false,
         stale_position_once: false,
+        stray_cid: None,
     }))
 }
 
@@ -932,6 +945,25 @@ async fn the_program_runs_every_step_once_maps_each_to_the_lattice_and_writes_sc
     );
     let json: Value = serde_json::from_str(&fs::read_to_string(&outcome.json).unwrap()).unwrap();
     assert_eq!(json["ok"], true);
+    // One journal for the three phases: each phase's connection its own, ingest order one
+    // sequence across them.
+    let reader =
+        fbc_journal::JournalReader::open(evidence_dir.join("run").join("journal"), 0).unwrap();
+    let stamps: Vec<fbc_core::Stamp> = reader
+        .entries()
+        .filter_map(|e| match e.unwrap().record {
+            fbc_journal::Record::Inbound { stamp, .. }
+            | fbc_journal::Record::InboundControl { stamp, .. } => Some(stamp),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        stamps.windows(2).all(|w| w[0].ingest_seq < w[1].ingest_seq),
+        "ingest order repeats across phases"
+    );
+    let mut conns: Vec<u16> = stamps.iter().map(|s| s.conn.conn).collect();
+    conns.dedup();
+    assert_eq!(conns.len(), 3, "one connection number per phase: {conns:?}");
     assert_eq!(json["steps"].as_array().unwrap().len(), 9);
 
     // The scrubbed fixtures: frames and answers, no token, no account value.
@@ -1100,6 +1132,45 @@ async fn a_position_read_that_lags_keeps_the_agreeing_answer_and_the_orders_firs
         serde_json::from_str::<Value>(&body).unwrap()["results"],
         json!([]),
         "the agreeing answer: flat"
+    );
+}
+
+#[tokio::test]
+async fn an_order_event_the_registry_cannot_place_fails_the_run_though_every_step_passed() {
+    // An order event of a client id in our namespace that this run never minted: the link
+    // notes it (an orphan), and the run must not claim a clean result.
+    use fbc_core::{AccountKey, CidMint, Namespace, NamespaceLease, WallNs, encode_cid};
+    let (stray_lease, _s) = temp_dir("lease-stray-mint");
+    let lease =
+        NamespaceLease::acquire(&stray_lease, AccountKey::new(1), Namespace::new(1)).unwrap();
+    let mut mint = CidMint::new(lease, u64::MAX / 2, 0, WallNs(1_000_000_000));
+    let fmt = fbc_venue_paradex::exec::exec_caps().order.client_id;
+    let stray = encode_cid(&fmt, mint.mint().unwrap()).unwrap().to_string();
+    let venue = new_venue(true, true);
+    venue.lock().unwrap().stray_cid = Some(stray);
+    let stub = stub_for(&venue, MAIN, 0, 0).await;
+    let (evidence_dir, _e) = temp_dir("evidence-stray");
+    let (lease_dir, _l) = temp_dir("lease-stray");
+    let opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
+    let (outcome, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+
+    assert!(!outcome.ok, "{printed}");
+    let stop = outcome
+        .evidence
+        .steps
+        .iter()
+        .find(|s| s.name == "stop")
+        .unwrap();
+    assert!(!stop.pass, "{stop:?}");
+    assert!(
+        outcome
+            .evidence
+            .notes
+            .iter()
+            .any(|n| n.contains("registry does not hold")),
+        "{:?}",
+        outcome.evidence.notes
     );
 }
 
@@ -1477,6 +1548,122 @@ fn the_privacy_check_scans_fixtures_written_under_a_git_ignored_directory() {
     .unwrap();
     let refused = evidence::privacy_check(&script, &fixtures).unwrap_err();
     assert!(refused.contains("b.json"), "{refused}");
+}
+
+#[test]
+fn a_session_counts_each_order_method_its_arm_and_every_connection_it_opened() {
+    use fbc_core::{ConnState, RpcId, SubmitOutcome};
+    use link::Note;
+    let accepted = || SubmitOutcome::Accepted {
+        ack: fbc_core::AckLevel::Final,
+    };
+    // Two epochs (a reconnect), each with its arm (answered twice: provisional, then final);
+    // one login refused in between; three requests of ours sent, one not sent.
+    let notes = vec![
+        Note::Conn(ConnState::Authenticated),
+        Note::Outcome {
+            rpc: RpcId(1),
+            item: None,
+            outcome: accepted(),
+            ours: false,
+        },
+        Note::Outcome {
+            rpc: RpcId(1),
+            item: None,
+            outcome: accepted(),
+            ours: false,
+        },
+        Note::Submitted {
+            rpc: RpcId(2),
+            sent: Ok(()),
+        },
+        Note::Submitted {
+            rpc: RpcId(3),
+            sent: Err(fbc_core::NotSentReason::Disconnected),
+        },
+        Note::LoginRefused("refused".to_owned()),
+        Note::Conn(ConnState::Authenticated),
+        Note::Outcome {
+            rpc: RpcId(4),
+            item: None,
+            outcome: accepted(),
+            ours: false,
+        },
+        Note::Submitted {
+            rpc: RpcId(5),
+            sent: Ok(()),
+        },
+        Note::Submitted {
+            rpc: RpcId(6),
+            sent: Ok(()),
+        },
+    ];
+    assert_eq!(accept::session_counts(&notes), (5, 3));
+}
+
+#[test]
+fn an_sbe_frame_holding_a_credential_as_bytes_is_withheld_before_it_is_written_as_hex() {
+    let mut frame = vec![0u8; 16];
+    frame.extend(format!("{} {}", "Bearer", "abcdefghij".repeat(3)).as_bytes());
+    let refused = evidence::sbe_fixture("c", &frame).unwrap_err();
+    assert!(refused.contains(&"a bearer token"), "{refused:?}");
+    let mut jwt = vec![1u8; 8];
+    jwt.extend(token().as_bytes());
+    assert!(evidence::sbe_fixture("c", &jwt).is_err());
+    let text = evidence::sbe_fixture("c", &[0x20, 0x00, 0x14, 0x00]).unwrap();
+    assert!(text.contains("20 00 14 00"), "{text}");
+}
+
+#[tokio::test]
+async fn a_rest_read_waits_for_the_shared_limiter_and_is_not_sent_without_room() {
+    use fbc_core::{LimitScope, OpKind, RateLimit, TagSet};
+    use fbc_runtime::{RateLimiter, SafetyReserve};
+    let venue = new_venue(true, true);
+    let stub = stub_for(&venue, 0, 0, 0).await;
+    let (lease_dir, _l) = temp_dir("lease-limit");
+    let (evidence_dir, _e) = temp_dir("evidence-limit");
+    let opts = options(&stub, &evidence_dir, &lease_dir, 1);
+    // One account read a minute, already spent by a session.
+    let limiter = RateLimiter::new(
+        &[RateLimit {
+            scope: LimitScope::Account,
+            ops: TagSet::of(&[OpKind::Query]),
+            per: Duration::from_secs(60),
+            units: 1,
+        }],
+        SafetyReserve::percent(0).unwrap(),
+    )
+    .unwrap();
+    let mut rest = auth_rest::RestReader::new(
+        &trade::config(&opts.trade),
+        secrets().unwrap(),
+        fbc_runtime::Connector::new(ProxyConfig::Direct),
+        limiter.clone(),
+    )
+    .unwrap();
+    let first = rest
+        .get(
+            fbc_venue_paradex::exec::open_orders_request(&opts.trade.rest_url),
+            std::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await;
+    assert_eq!(first.map(|a| a.status), Ok(200));
+    let refused = rest
+        .get(
+            fbc_venue_paradex::exec::open_orders_request(&opts.trade.rest_url),
+            std::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+    assert!(refused.contains("rate limit"), "{refused}");
+    // The login and the one read went out; the refused read did not.
+    let orders = stub
+        .http_requests()
+        .iter()
+        .filter(|r| r.contains("/v1/orders"))
+        .count();
+    assert_eq!(orders, 1, "{:?}", stub.http_requests());
+    assert_eq!(rest.requests(), 2);
 }
 
 #[test]
