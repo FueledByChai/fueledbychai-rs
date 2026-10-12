@@ -37,7 +37,9 @@
 //! ladder: no Paradex order query is wired here), an order or a fill not ours, an amend of ours,
 //! a problem the link noted, an asynchronous reject other than one of our own post-only places
 //! closed POST_ONLY_WOULD_CROSS (that side is left out of the cycle and placed again the next),
-//! a book that does not settle within the step timeout, and the session's end. Each is taken as
+//! an order book older than one already read, the client-id sequence space running out, a book
+//! that does not settle within the step timeout (a position the venue reports that the inventory
+//! does not hold holds every pass until they agree), and the session's end. Each is taken as
 //! it comes: a touch being read is not waited for ([`Driver::touch_unless_ended`]), and a pass
 //! reads the notes again after its waits, before it plans ([`Driver::halted`]).
 //!
@@ -524,6 +526,8 @@ pub async fn run(
         fills: 0,
         cycles: 0,
         last: None,
+        book_seq: book.seq_no,
+        venue_position: None,
     };
     // The interrupt sets a flag the driver reads at each wake, and wakes it.
     let watch = {
@@ -655,6 +659,12 @@ struct Driver {
     cycles: u64,
     /// The last cycle's quotes and skipped sides, to print a cycle only when they change.
     last: Option<(Option<Ticks>, Option<Ticks>, Vec<String>)>,
+    /// The highest `seq_no` of the order books read: an older one Stops the loop (Codex
+    /// r4244080123 on PR #149).
+    book_seq: u64,
+    /// The market's position as the venue's position stream last reported it, since the last
+    /// resync: no pass plans while it differs from the inventory (Codex r4244080127).
+    venue_position: Option<SignedLots>,
 }
 
 impl Driver {
@@ -850,12 +860,19 @@ impl Driver {
                     );
                 }
             }
-            Note::Position { inst, qty } => self.note(format_args!(
-                "the account's position in instrument {} is {} lots",
-                inst.get(),
-                qty.0
-            )),
+            Note::Position { inst, qty } => {
+                if inst == INST {
+                    self.venue_position = Some(qty);
+                }
+                self.note(format_args!(
+                    "the account's position in instrument {} is {} lots",
+                    inst.get(),
+                    qty.0
+                ));
+            }
             Note::Resynced { report, snapshot } => {
+                // The resync's position supersedes any reported before it.
+                self.venue_position = None;
                 self.resync_due = false;
                 let ours: Vec<ClientOrderId> = snapshot
                     .orders
@@ -1261,7 +1278,7 @@ impl Driver {
             self.compact();
             // Raced against the interrupt, a reason to Stop, a connection's end and
             // --duration, each taken at the top of the loop (Codex r4243989987).
-            let Some(book) = self.touch_unless_ended().await? else {
+            let Some(book) = self.touch_unless_ended(self.timeout).await? else {
                 continue;
             };
             match self.settle(book).await? {
@@ -1285,10 +1302,16 @@ impl Driver {
     /// ([`Driver::ending`]) before it answers, so neither Ctrl-C, a reason to Stop, a
     /// connection's end nor `--duration` waits up to `--step-timeout` for it while the quotes
     /// rest (Codex r4243989987 on PR #149).
-    async fn touch_unless_ended(&mut self) -> Result<Option<OrderbookSnapshot>, String> {
+    ///
+    /// The read waits at most `within`. A book older than one already read (a lower `seq_no`:
+    /// a stale cache or replica) is a reason to Stop, never quoted from (Codex r4244080123).
+    async fn touch_unless_ended(
+        &mut self,
+        within: Duration,
+    ) -> Result<Option<OrderbookSnapshot>, String> {
         let (rest_url, market) = (self.opts.rest_url.clone(), self.opts.market.clone());
         let (proxy, specs) = (self.opts.proxy.clone(), self.specs.clone());
-        let read = touch(&rest_url, &market, &proxy, self.timeout, &specs);
+        let read = touch(&rest_url, &market, &proxy, within, &specs);
         tokio::pin!(read);
         loop {
             let wake = Rc::clone(&self.wake);
@@ -1298,7 +1321,18 @@ impl Driver {
                 return Ok(None);
             }
             tokio::select! {
-                book = &mut read => return book.map(Some),
+                book = &mut read => {
+                    let book = book?;
+                    if book.seq_no < self.book_seq {
+                        return Err(format!(
+                            "GET /orderbook answered seq {} after seq {}: an order book older \
+                             than one already read is never quoted from",
+                            book.seq_no, self.book_seq
+                        ));
+                    }
+                    self.book_seq = book.seq_no;
+                    return Ok(Some(book));
+                }
                 () = woken => {}
                 () = tokio::time::sleep_until(self.deadline) => return Ok(None),
             }
@@ -1363,10 +1397,17 @@ impl Driver {
     /// held until the write ends even past the timeout.
     async fn reserve(&mut self) -> Result<(), String> {
         let high = self.mint.as_ref().map_or(0, CidMint::high_water);
-        if high + 2 <= self.reserved {
+        // Near u64::MAX no mark can be kept above the mint: refused, the mark kept unchanged,
+        // never wrapped (Codex r4244080134).
+        let (Some(next), Some(mark)) = (high.checked_add(2), high.checked_add(RESERVE)) else {
+            return Err(format!(
+                "the client-id sequence space is exhausted: no high-water mark {RESERVE} ids \
+                 above {high} can be kept, so nothing more is minted"
+            ));
+        };
+        if next <= self.reserved {
             return Ok(());
         }
-        let mark = high + RESERVE;
         let hwm = self.hwm.clone();
         let mint = self.mint.take();
         match off_thread_holding(self.timeout, mint, move || hwm.write(mark)).await {
@@ -1399,6 +1440,7 @@ impl Driver {
         let mut read_at = self.link.borrow().registry().inventory(INST);
         let mut left_out: Vec<Side> = Vec::new();
         let mut placed: Vec<(Side, ClientOrderId)> = Vec::new();
+        let mut holding = false;
         loop {
             let wake = Rc::clone(&self.wake);
             let woken = wake.notified();
@@ -1414,7 +1456,8 @@ impl Driver {
             // touch was being read (Codex r4243908416).
             let mut cut = false;
             while position != read_at {
-                let Some(fresh) = self.touch_unless_ended().await? else {
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let Some(fresh) = self.touch_unless_ended(left).await? else {
                     cut = true;
                     break;
                 };
@@ -1430,6 +1473,37 @@ impl Driver {
                 return Ok(ended);
             }
             if cut {
+                continue;
+            }
+            // The waits may have used the rest of the book's settling time (Codex r4244080131).
+            if tokio::time::Instant::now() >= deadline {
+                return Err(self.timed_out("settle", "the book settling"));
+            }
+            // A position the venue reported that the inventory does not hold yet (its fill not
+            // read yet, or a change not ours): nothing is planned until they agree, or Stop at
+            // the settling time (Codex r4244080127).
+            if let Some(venue) = self.venue_position.filter(|v| *v != position) {
+                if !holding {
+                    holding = true;
+                    self.note(format_args!(
+                        "the venue reports the position {} lots, the inventory holds {}: \
+                         nothing is planned until they agree",
+                        venue.0, position.0
+                    ));
+                }
+                tokio::select! {
+                    () = woken => {}
+                    () = tokio::time::sleep_until(deadline) => {
+                        return Err(self.timed_out(
+                            "settle",
+                            &format!(
+                                "the venue's position ({} lots) and the inventory ({} lots) \
+                                 agreeing",
+                                venue.0, position.0
+                            ),
+                        ));
+                    }
+                }
                 continue;
             }
             placed.retain(|(side, cid)| {
