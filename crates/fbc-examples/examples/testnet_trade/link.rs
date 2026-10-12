@@ -7,11 +7,13 @@
 //! - **Submitting.** [`Link::submit`] hands an fbc-oms [`Authorization`] to the session's
 //!   [`ExecOrders`] and remembers, under the request id it was given, the order each item of
 //!   the command names: a placement by its client id, a cancel by its client id (or the one the
-//!   registry holds for its venue id). An amend is refused here, not modelled yet: its
-//!   reservation is the registry's `amend_sent`, which needs the request id before the encode.
+//!   registry holds for its venue id), an amend by the order it names with its new price and
+//!   total (FBC-xji8's acceptance program amends once; testnet_trade never does).
 //! - **What became of a submission** ([`ExecHandler::on_submitted`]): sent, the placement's send
-//!   time ([`Registry::placement_sent`]) or the cancel in flight ([`Registry::cancel_sent`]) is
-//!   recorded; not sent, every item's order is told `NotSent` for its reason.
+//!   time ([`Registry::placement_sent`]), the cancel in flight ([`Registry::cancel_sent`]) or the
+//!   amend in flight ([`Registry::amend_sent`]) is recorded; not sent, every item's order is told
+//!   `NotSent` for its reason (an amend's after it is recorded in flight, as fbc-oms asks of an
+//!   amend a gateway took).
 //! - **Events.** A request's outcome goes to the order each of its items names
 //!   ([`Registry::on_outcome`]); an outcome naming a request not submitted here is the session's
 //!   own (its cancel-on-disconnect arm) and is only noted. An order event is applied under the
@@ -58,8 +60,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fbc_core::{
     AccountKey, CidMatch, ClientOrderId, ConnKey, ConnState, Envelope, ExecEvent, InstrumentId,
-    ItemRef, MonoNs, NotSentReason, OrderCaps, Reject, RpcId, SignedLots, SubmitHandle,
-    SubmitOutcome, VenueCommand, VenueOrderId, VenueOrderSnapshot, WallNs,
+    ItemRef, Lots, MonoNs, NotSentReason, OrderCaps, Reject, RpcId, SignedLots, SubmitHandle,
+    SubmitOutcome, Ticks, VenueCommand, VenueOrderId, VenueOrderSnapshot, WallNs,
 };
 use fbc_oms::{
     Admission, Authorization, FillLedger, FillRouted, FillTime, LadderConfig, OrderKey, OrderOp,
@@ -244,6 +246,12 @@ pub fn described(reject: &Reject) -> String {
 enum Item {
     Place(ClientOrderId),
     Cancel(ClientOrderId),
+    /// An amend of the order to a new price and total quantity.
+    Amend {
+        cid: ClientOrderId,
+        px: Ticks,
+        qty: Lots,
+    },
 }
 
 /// The registry, the fill ledger and what was submitted (module documentation).
@@ -344,8 +352,9 @@ impl Link {
         &self.notes
     }
 
-    /// How many places (requests whose items are placements) and cancels (every other request
-    /// submitted here: cancels, cancel-manys, cancel-alls) the session reported sent.
+    /// How many places (requests whose items are placements) and cancels (cancels,
+    /// cancel-manys, cancel-alls) submitted here the session reported sent; an amend is
+    /// neither.
     pub fn sent_counts(&self) -> (usize, usize) {
         let mut counts = (0, 0);
         for note in &self.notes {
@@ -355,6 +364,7 @@ impl Link {
             match self.sent.get(rpc).and_then(|items| items.first()) {
                 Some(Item::Place(_)) => counts.0 += 1,
                 Some(Item::Cancel(_)) | None if self.sent.contains_key(rpc) => counts.1 += 1,
+                Some(Item::Amend { .. }) => {}
                 _ => {}
             }
         }
@@ -436,8 +446,7 @@ impl Link {
     }
 
     /// Submits `auth` through `orders`, remembering the order each item names: its request id,
-    /// or why it was not submitted (nothing was then remembered). An amend is refused, not
-    /// modelled here.
+    /// or why it was not submitted (nothing was then remembered).
     pub fn submit(&mut self, orders: &ExecOrders, auth: Authorization) -> Result<RpcId, String> {
         let items = self.items_of(auth.command())?;
         let rpc = orders.submit(auth).map_err(|e| format!("{e:?}"))?;
@@ -462,6 +471,18 @@ impl Link {
             VenueCommand::Cancel(c) => Ok(vec![cancel_of(c)?]),
             VenueCommand::CancelMany(cs) => cs.iter().map(cancel_of).collect(),
             VenueCommand::CancelAll(_) => Ok(Vec::new()),
+            VenueCommand::Amend(a) => {
+                let cid = a
+                    .target
+                    .client()
+                    .or_else(|| a.target.venue().and_then(|v| self.reg.cid_of(v)))
+                    .ok_or_else(|| "an amend of no order the registry holds".to_owned())?;
+                Ok(vec![Item::Amend {
+                    cid,
+                    px: a.px,
+                    qty: a.qty,
+                }])
+            }
             other => Err(format!("not modelled by this glue: {}", kind(other))),
         }
     }
@@ -471,6 +492,7 @@ impl Link {
         match item {
             Item::Place(cid) => (cid, OrderOp::Place),
             Item::Cancel(cid) => (cid, OrderOp::Cancel(rpc)),
+            Item::Amend { cid, .. } => (cid, OrderOp::Amend(rpc)),
         }
     }
 
@@ -484,10 +506,18 @@ impl Link {
         let (mono, wall) = self.now();
         for (idx, item) in items.into_iter().enumerate() {
             let (cid, op) = Link::op(item, rpc);
+            // An amend the session took is in flight until its outcome resolves it, a not-sent
+            // one included (fbc-oms's `amend_not_submitted` is for one never handed over).
+            if let Item::Amend { px, qty, .. } = item
+                && let Err(e) = self.reg.amend_sent(cid, px, qty, rpc, mono)
+            {
+                self.problem(format!("request {}: {e:?}", rpc.0));
+            }
             let done = match &receipt {
                 Ok(_) => match item {
                     Item::Place(_) => self.reg.placement_sent(cid, mono, wall),
                     Item::Cancel(_) => self.reg.cancel_sent(cid, rpc, mono).map(|_| ()),
+                    Item::Amend { .. } => Ok(()),
                 },
                 Err(reason) => {
                     let item = ItemRef {

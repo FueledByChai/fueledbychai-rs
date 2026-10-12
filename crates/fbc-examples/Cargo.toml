@@ -1,6 +1,6 @@
 [package]
 name = "fbc-examples"
-description = "Sample programs the owner runs by hand, never CI: md_watch prints live Paradex and Binance USD-M touches and top-of-book through fbc-runtime; testnet_trade places and cancels one post-only order on Paradex testnet through fbc-oms. The library target is empty; each sample is an example target."
+description = "Sample programs the owner runs by hand, never CI: md_watch prints live Paradex and Binance USD-M touches and top-of-book through fbc-runtime; testnet_trade places and cancels one post-only order on Paradex testnet through fbc-oms; paradex_testnet_acceptance runs FBC-8xr's acceptance script on Paradex testnet and writes its evidence report. The library target is empty; each sample is an example target."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -31,3 +31,7 @@ path = "examples/md_watch/main.rs"
 [[example]]
 name = "testnet_trade"
 path = "examples/testnet_trade/main.rs"
+
+[[example]]
+name = "paradex_testnet_acceptance"
+path = "examples/paradex_testnet_acceptance/main.rs"

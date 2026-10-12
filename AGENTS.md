@@ -367,7 +367,16 @@ rather than guess.
     client-id namespace all required flags, cancelled, then Stop (`tests/testnet_trade.rs`,
     against a Paradex-shaped conformance stub). Its credentials come from environment variables
     through `src/auth.rs`, a review path included by path, not a module of the empty library
-    target.
+    target. And `examples/paradex_testnet_acceptance/` (FBC-xji8): FBC-8xr's owner-run
+    acceptance run on Paradex TESTNET, reusing testnet_trade's flags, guard, glue and helpers
+    by path: place, amend, cancel, batch create, cancel-many, an IOC expiry and
+    cancel-on-disconnect on a dropped socket and on a graceful close, each through an fbc-oms
+    authorization, in three phases (a fresh registry and session each); after every step its
+    own authenticated REST reads (`src/auth_rest.rs`, a review path) compare GET /orders and
+    GET /positions with the order stream; it writes `report.md`, `evidence.json`, its journal
+    and a scrubbed fixture slice for `fixtures/paradex/exec-recorded/`
+    (`tests/paradex_testnet_acceptance.rs`, against a stub model of the account; how the owner
+    runs it, from the deployment box too: `crates/fbc-examples/README.md`).
   - `crates/venues/fbc-venues` (the registry, the only crate with a normal dependency on a
     concrete venue; `crates/fbc-examples` reaches them only as dev-dependencies),
     `crates/venues/fbc-venue-binance-usdm` (market data only:
