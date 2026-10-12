@@ -94,6 +94,13 @@ pub struct Comparison {
     pub limits: Vec<(String, String)>,
     /// A read that failed.
     pub errors: Vec<String>,
+    /// What was sent since the comparison before it (the per-IP limit check, design §13.3):
+    /// this program's own REST requests (its reads, its logins and the order-book reads), the
+    /// WebSocket order methods, and the connections opened (each also makes a login and two
+    /// resync reads, and a login every refresh interval while it stays open).
+    pub rest_since: u64,
+    pub ws_since: u64,
+    pub connections_since: u64,
 }
 
 /// GET /orders-history?client_id= for one order.
@@ -108,6 +115,8 @@ pub struct History {
     pub reads: u32,
     pub status: Option<String>,
     pub cancel_reason: Option<String>,
+    /// Whether the history shows part of the order filled (`remaining_size` below `size`).
+    pub filled: Option<bool>,
     pub error: Option<String>,
 }
 
@@ -173,6 +182,8 @@ pub struct Evidence {
     pub frames: Vec<FrameRow>,
     /// Fixture files left out by the final privacy check.
     pub withheld: Vec<String>,
+    /// A required output that could not be written (the journal, the fixtures): the run fails.
+    pub artifact_errors: Vec<String>,
 }
 
 impl Evidence {
@@ -185,11 +196,14 @@ impl Evidence {
         self.steps.last_mut().expect("just pushed")
     }
 
-    /// True when every step ran (or was skipped by the venue's state) and passed.
+    /// True when every step ran (or was skipped by the venue's state) and passed, and every
+    /// required output was written.
     pub fn ok(&self) -> bool {
-        self.steps
-            .iter()
-            .all(|s| s.pass || matches!(s.ran, Ran::Skipped(_)))
+        self.artifact_errors.is_empty()
+            && self
+                .steps
+                .iter()
+                .all(|s| s.pass || matches!(s.ran, Ran::Skipped(_)))
     }
 }
 
@@ -670,12 +684,17 @@ pub fn answers(ev: &Evidence) -> Vec<(String, String)> {
     let limits: Vec<String> = comparisons
         .iter()
         .map(|c| {
-            if c.limits.is_empty() {
-                format!("{}: none", c.after)
+            let headers = if c.limits.is_empty() {
+                "no rate-limit header".to_owned()
             } else {
                 let l: Vec<String> = c.limits.iter().map(|(k, v)| format!("{k}={v}")).collect();
-                format!("{}: {}", c.after, l.join(" "))
-            }
+                l.join(" ")
+            };
+            format!(
+                "{}: {headers} (sent since the comparison before: {} REST requests of this \
+                 program's, {} WebSocket order methods, {} connections opened)",
+                c.after, c.rest_since, c.ws_since, c.connections_since
+            )
         })
         .collect();
     vec![
@@ -763,8 +782,11 @@ pub fn answers(ev: &Evidence) -> Vec<(String, String)> {
         (
             "design §13.3: does the per-IP limit count WebSocket order methods".to_owned(),
             format!(
-                "rate-limit headers on GET /orders after each step (run from the deployment box \
-                 to answer it): {}",
+                "judged only from the deployment box: a remaining count that fell by more than \
+                 every REST request sent between two samples (this program's, counted below, \
+                 plus each connection's login and two resync reads and a login every refresh \
+                 interval) counts the WebSocket order methods; the first GET /orders of each \
+                 comparison: {}",
                 limits.join("; ")
             ),
         ),
@@ -947,6 +969,12 @@ pub fn markdown(ev: &Evidence) -> String {
             let _ = writeln!(out, "- {n}");
         }
     }
+    if !ev.artifact_errors.is_empty() {
+        let _ = writeln!(out, "\n## Outputs not written (the run fails)\n");
+        for e in &ev.artifact_errors {
+            let _ = writeln!(out, "- {e}");
+        }
+    }
     if !ev.withheld.is_empty() {
         let _ = writeln!(out, "\n## Fixture files left out by the privacy check\n");
         for w in &ev.withheld {
@@ -974,13 +1002,16 @@ pub fn to_json(ev: &Evidence) -> Value {
             "page_keys": c.page_keys,
             "rate_limit_headers": c.limits.iter().map(|(k, v)| json!({"name": k, "value": v})).collect::<Vec<_>>(),
             "errors": c.errors,
+            "rest_requests_since": c.rest_since,
+            "ws_order_methods_since": c.ws_since,
+            "connections_since": c.connections_since,
         })
     };
     let history = |h: &History| {
         json!({
             "order": h.label, "wanted": h.wanted, "listed": h.listed,
             "lag_ms": h.lag_ms.map(|v| v as u64), "reads": h.reads, "status": h.status,
-            "cancel_reason": h.cancel_reason, "error": h.error,
+            "cancel_reason": h.cancel_reason, "filled": h.filled, "error": h.error,
         })
     };
     let steps: Vec<Value> = ev
@@ -1022,6 +1053,7 @@ pub fn to_json(ev: &Evidence) -> Value {
         })).collect::<Vec<_>>(),
         "notes": ev.notes,
         "fixtures_withheld": ev.withheld,
+        "outputs_not_written": ev.artifact_errors,
     })
 }
 

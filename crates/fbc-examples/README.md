@@ -89,11 +89,18 @@ from the address that will trade. Run the same command once on singapore8, with:
 - a fresh `--evidence-dir` on that machine;
 - a fresh `--namespace`, or the same lease directory as your other runs.
 
-The report's last answer lists, after every step, the rate-limit headers Paradex returned on
-the first GET /orders of each comparison. Between two such reads the run sends a known number of
-WebSocket order methods (the report's Sent column) and REST reads (each comparison's Reads). If
-the remaining count falls by more than the REST reads, the per-IP limit covers the WebSocket
-methods. If Paradex returns no such header, the run says so. In that case the question stays
-open, and the record names what would settle it.
+The report's last answer lists, for each comparison, the rate-limit headers Paradex returned on
+its first GET /orders. Beside them it lists what was sent since the comparison before:
+
+- this program's own REST requests: its reads, its logins and the order-book reads;
+- the WebSocket order methods;
+- the connections opened. Each connection also makes a login and two resync reads, and a login
+  every refresh interval (60 s) while it stays open.
+
+The per-IP limit covers WebSocket order methods only if the remaining count fell by more than
+every one of those REST requests. If it fell by no more than them, the run says nothing about the
+WebSocket methods. If Paradex returns no such header, the run says so. In either case the
+question stays open, and the record names what would settle it (for example, a dedicated burst
+of WebSocket methods with no REST request between two reads).
 
 Agents never run this program, against testnet or anything else, and never touch singapore8.
