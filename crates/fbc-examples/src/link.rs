@@ -102,8 +102,13 @@ pub enum Note {
     },
     /// A fill, where it went (or why the ledger did not apply it): `unexplained` unless it was
     /// counted on an order of ours, held by the resync's position, or one the ledger already
-    /// held (a duplicate, or a replay the starting position holds).
-    Fill { seen: String, unexplained: bool },
+    /// held (a duplicate, or a replay the starting position holds); `ours` when it was applied,
+    /// counted on an order of ours and the inventory.
+    Fill {
+        seen: String,
+        unexplained: bool,
+        ours: bool,
+    },
     /// The account's position in an instrument, as the venue's position stream reported it.
     Position { inst: InstrumentId, qty: SignedLots },
     /// A resync was applied: its report, and the positions and open orders it showed.
@@ -363,6 +368,20 @@ impl Link {
     pub fn sent_counts(&self) -> (usize, usize) {
         let (places, cancels) = self.counted(&self.notes);
         (self.forgotten.0 + places, self.forgotten.1 + cancels)
+    }
+
+    /// Forgets request `rpc`'s items, for a driver that has every answer to it it waits for and
+    /// whose notes [`Link::forget`] took (testnet_quote): the map of submitted requests then
+    /// holds those in flight, not the run's history. An answer to it that comes later is noted
+    /// as the session's own ([`Note::Outcome`] with `ours` false).
+    pub fn release(&mut self, rpc: RpcId) {
+        self.sent.remove(&rpc);
+        self.safety.retain(|_, r| *r != rpc);
+    }
+
+    /// How many submitted requests the link still holds the items of.
+    pub fn requests_held(&self) -> usize {
+        self.sent.len()
     }
 
     /// What [`Link::sent_counts`] counts in `notes`.
@@ -648,20 +667,25 @@ impl Link {
                     kind: env.exch_ts_kind,
                     aligned: WallNs(exch.0),
                 });
-                let (seen, unexplained) = match self.ledger.admit(&f, time, now) {
+                let (seen, unexplained, ours) = match self.ledger.admit(&f, time, now) {
                     Admission::Apply(accepted) => match self.reg.apply_fill(accepted) {
                         Ok(routed) => (
                             describe_fill(&routed),
                             !matches!(routed, FillRouted::Ours(..) | FillRouted::InSnapshot(_)),
+                            matches!(routed, FillRouted::Ours(..)),
                         ),
-                        Err(e) => (format!("refused by the registry: {e:?}"), true),
+                        Err(e) => (format!("refused by the registry: {e:?}"), true, false),
                     },
                     held @ (Admission::Duplicate | Admission::BeforeWatermark) => {
-                        (format!("not applied: {held:?}"), false)
+                        (format!("not applied: {held:?}"), false, false)
                     }
-                    other => (format!("not applied: {other:?}"), true),
+                    other => (format!("not applied: {other:?}"), true, false),
                 };
-                self.notes.push(Note::Fill { seen, unexplained });
+                self.notes.push(Note::Fill {
+                    seen,
+                    unexplained,
+                    ours,
+                });
             }
             ExecEvent::ResyncBegin { watermark } => {
                 let requested_at = self.authenticated_at.unwrap_or(now);

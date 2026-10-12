@@ -574,6 +574,7 @@ pub fn account_changes(
             Note::Fill {
                 seen,
                 unexplained: true,
+                ..
             } => changes.push(format!("a fill not of our orders came in: {seen}")),
             // The sample never amends: an amend of ours was another process's (Codex
             // r4226570452 on PR #114).
