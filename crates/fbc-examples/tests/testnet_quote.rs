@@ -1316,46 +1316,16 @@ async fn an_asynchronous_reject_other_than_post_only_would_cross_stops_it() {
     assert!(printed.contains("DONE failed"), "{printed}");
 }
 
-#[tokio::test]
-async fn the_interrupt_while_a_pass_reads_a_fresh_touch_places_nothing_after() {
-    // As in the fill-during-a-replace test, the bid's cancel races a fill of all of it, so the
-    // pass reads a fresh touch (GET /orderbook read 4); the interrupt comes during that read.
-    // The pass must take it before planning: nothing is placed after (Codex r4243989985).
-    let venue = venue(vec![b0(), b0(), book(2, Some("80000.0"), Some("80000.2"))]);
-    let signal = Arc::new(Notify::new());
-    {
-        let mut v = lock(&venue);
-        v.fill_next_buy_cancel = true;
-        v.signal = Some((4, Arc::clone(&signal)));
-    }
-    // The opening six, two places, two replace cancels; nothing rests for Stop to cancel.
-    let script = one_connection(&venue, 6 + 2 + 2);
-    let stub = StubServer::start(script, routes(&venue, login_ok()))
-        .await
-        .unwrap();
-    let mut opts = options(&stub, 3);
-    opts.order_usd = dec("8");
-    opts.inventory_cap_usd = dec("16");
-    let interrupt = async move { signal.notified().await };
-    let (report, printed) = run_until(&opts, interrupt).await;
-    stub.finished().await.unwrap();
-
-    assert_eq!(lock(&venue).book_reads, 4, "{printed}");
-    assert_eq!(report.ended, "interrupted (Ctrl-C)", "{printed}");
-    assert!(report.ok, "{printed}");
-    let sent = methods(&venue, 0);
-    assert_eq!(
-        sent.iter().filter(|m| *m == "order.create").count(),
-        2,
-        "placed after the interrupt: {sent:?}\n{printed}"
-    );
-    assert_eq!(report.places_sent, 2, "{printed}");
-}
-
-/// A TCP relay in front of the stub's HTTP port (`base`, its `http_url("/v1")`) that never
-/// forwards the `n`th `GET /v1/orderbook` request (from 1), telling `signal` as it holds it: a
-/// touch the venue does not answer. Its own base URL.
-async fn holding_relay(base: &str, n: usize, signal: Arc<Notify>) -> String {
+/// A TCP relay in front of the stub's HTTP port (`base`, its `http_url("/v1")`) that holds the
+/// `n`th `GET /v1/orderbook` request (from 1), telling `signal` as it holds it, until `release`
+/// is notified (never, with none): a touch the venue answers late or not at all. Its own base
+/// URL.
+async fn holding_relay(
+    base: &str,
+    n: usize,
+    signal: Arc<Notify>,
+    release: Option<Arc<Notify>>,
+) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let target = base
         .strip_prefix("http://")
@@ -1370,7 +1340,7 @@ async fn holding_relay(base: &str, n: usize, signal: Arc<Notify>) -> String {
             let Ok(server) = tokio::net::TcpStream::connect(&target).await else {
                 return;
             };
-            let (seen, signal) = (Arc::clone(&seen), Arc::clone(&signal));
+            let (seen, signal, release) = (Arc::clone(&seen), Arc::clone(&signal), release.clone());
             tokio::spawn(async move {
                 let (mut from_client, mut to_client) = client.into_split();
                 let (mut from_server, mut to_server) = server.into_split();
@@ -1386,7 +1356,10 @@ async fn holding_relay(base: &str, n: usize, signal: Arc<Notify>) -> String {
                             let at = seen.fetch_add(1, Ordering::SeqCst) + 1;
                             if at == n as u64 {
                                 signal.notify_one();
-                                std::future::pending::<()>().await;
+                                match &release {
+                                    Some(release) => release.notified().await,
+                                    None => std::future::pending::<()>().await,
+                                }
                             }
                         }
                         if to_server.write_all(read).await.is_err() {
@@ -1405,6 +1378,49 @@ async fn holding_relay(base: &str, n: usize, signal: Arc<Notify>) -> String {
 }
 
 #[tokio::test]
+async fn the_interrupt_while_a_pass_reads_a_fresh_touch_places_nothing_after() {
+    // As in the fill-during-a-replace test, the bid's cancel races a fill of all of it, so the
+    // pass reads a fresh touch (GET /orderbook read 4). The relay holds that read; the interrupt
+    // comes, and only then is the read answered. The pass must take the interrupt before it
+    // plans: nothing is placed after it (Codex r4243989985).
+    let venue = venue(vec![b0(), b0(), book(2, Some("80000.0"), Some("80000.2"))]);
+    lock(&venue).fill_next_buy_cancel = true;
+    // The opening six, two places, two replace cancels; nothing rests for Stop to cancel.
+    let script = one_connection(&venue, 6 + 2 + 2);
+    let stub = StubServer::start(script, routes(&venue, login_ok()))
+        .await
+        .unwrap();
+    let (signal, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let mut opts = options(&stub, 3);
+    opts.order_usd = dec("8");
+    opts.inventory_cap_usd = dec("16");
+    opts.rest_url = holding_relay(
+        &opts.rest_url,
+        4,
+        Arc::clone(&signal),
+        Some(Arc::clone(&release)),
+    )
+    .await;
+    // The read is answered as the interrupt is delivered, before the loop sees either.
+    let interrupt = async move {
+        signal.notified().await;
+        release.notify_one();
+    };
+    let (report, printed) = run_until(&opts, interrupt).await;
+    stub.finished().await.unwrap();
+
+    assert_eq!(report.ended, "interrupted (Ctrl-C)", "{printed}");
+    assert!(report.ok, "{printed}");
+    let sent = methods(&venue, 0);
+    assert_eq!(
+        sent.iter().filter(|m| *m == "order.create").count(),
+        2,
+        "placed after the interrupt: {sent:?}\n{printed}"
+    );
+    assert_eq!((report.places_sent, report.fills), (2, 1), "{printed}");
+}
+
+#[tokio::test]
 async fn the_interrupt_while_the_touch_is_unanswered_stops_it_at_once() {
     // Cycle 2's GET /orderbook is never answered; the interrupt comes as it is sent. The loop
     // Stops at once, cancelling the quotes cycle 1 left, instead of waiting out --step-timeout
@@ -1418,7 +1434,7 @@ async fn the_interrupt_while_the_touch_is_unanswered_stops_it_at_once() {
     .unwrap();
     let signal = Arc::new(Notify::new());
     let mut opts = options(&stub, 1_000);
-    opts.rest_url = holding_relay(&opts.rest_url, 3, Arc::clone(&signal)).await;
+    opts.rest_url = holding_relay(&opts.rest_url, 3, Arc::clone(&signal), None).await;
     opts.step_timeout_secs = 20;
     let interrupt = async move { signal.notified().await };
     let (report, printed) = run_until(&opts, interrupt).await;
