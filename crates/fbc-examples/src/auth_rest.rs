@@ -12,6 +12,12 @@
 //! `order_history_request`) with the token's header ([`SessionToken::header`]) through
 //! fbc-runtime's [`Connector`], so the run's SOCKS5 proxy applies.
 //!
+//! Every request, the login included, is first charged to the [`RateLimiter`] the run's
+//! order-entry sessions charge ([`admit`]): the login as `Rest` (Paradex's per-IP POST /auth
+//! limit), each account read as `Query` (its per-account GET limits), so these reads and the
+//! sessions' traffic share one count, and a read waits for room rather than spending the
+//! sessions' safety reserve or drawing a 429.
+//!
 //! Nothing here prints, logs or keeps a credential: a refused login is reported by its HTTP
 //! status alone, and an answer is handed back as its status, its body and only the response
 //! headers whose names speak of a rate limit ([`RestAnswer::limits`], for the per-IP check of
@@ -21,10 +27,11 @@
 use std::time::{Duration, Instant};
 
 use fbc_core::{
-    EncodeCtx, HttpMethod, HttpRequest, MonoNs, NonceBlock, Secrets, VenueConfig, WallNs,
+    ConnKey, EncodeCtx, HttpMethod, HttpRequest, MonoNs, NonceBlock, OpKind, RateCharge, Secrets,
+    TrafficClass, VenueConfig, Via, WallNs,
 };
-use fbc_runtime::Connector;
 use fbc_runtime::http::{Bytes, Method, Request};
+use fbc_runtime::{Connector, RateLimiter};
 use fbc_venue_paradex::auth::{Login, SessionToken, TIMEOUT};
 
 /// The tag the login goes out under: the program reads its answer itself, so any tag serves.
@@ -60,6 +67,8 @@ pub struct RestReader {
     origin: Instant,
     /// How many requests this reader sent, logins included ([`RestReader::requests`]).
     sent: u64,
+    /// The run's limiter ([`admit`]).
+    limiter: RateLimiter,
 }
 
 impl std::fmt::Debug for RestReader {
@@ -80,6 +89,7 @@ impl RestReader {
         cfg: &VenueConfig,
         creds: Secrets,
         connector: Connector,
+        limiter: RateLimiter,
     ) -> Result<RestReader, String> {
         let login = Login::new(cfg, creds).map_err(|e| format!("the REST login: {e}"))?;
         // `Login::new` has checked the value is a whole `<n>s` or `<n>ms`.
@@ -94,6 +104,7 @@ impl RestReader {
             token: None,
             origin: Instant::now(),
             sent: 0,
+            limiter,
         })
     }
 
@@ -211,6 +222,18 @@ impl RestReader {
         if wait.is_zero() {
             return Err(format!("{what}: not sent, the wait had passed"));
         }
+        // The login is Paradex's per-IP POST /auth; every other request is an account read.
+        let op = match req.method {
+            HttpMethod::Post => OpKind::Rest,
+            _ => OpKind::Query,
+        };
+        admit(&self.limiter, op, by, &what).await?;
+        let wait = self
+            .timeout
+            .min(by.saturating_duration_since(Instant::now()));
+        if wait.is_zero() {
+            return Err(format!("{what}: not sent, the wait had passed"));
+        }
         self.sent += 1;
         tokio::time::timeout(wait, self.connector.http(request, MAX_BODY))
             .await
@@ -235,6 +258,43 @@ fn duration(text: &str) -> Option<Duration> {
 fn path_of(url: &str) -> &str {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
     rest.find('/').map_or("/", |at| &rest[at..])
+}
+
+/// The connection key an HTTP request is charged under: Paradex declares no per-connection
+/// limit, and an HTTP request is on no connection.
+const NO_CONN: ConnKey = ConnKey {
+    conn: u16::MAX,
+    epoch: 0,
+};
+
+/// Charges one HTTP request of `op` (normal traffic) to `limiter`, waiting until its buckets
+/// have room, but never past `by`: refused naming `what` when they would have none by then.
+pub async fn admit(
+    limiter: &RateLimiter,
+    op: OpKind,
+    by: Instant,
+    what: &str,
+) -> Result<(), String> {
+    let request = fbc_runtime::Request {
+        charge: RateCharge::one(op, None),
+        via: Via::Http,
+        class: TrafficClass::Normal,
+    };
+    // The limiter keeps the runtime's (tokio's) clock.
+    let by = tokio::time::Instant::from_std(by);
+    loop {
+        match limiter.charge(tokio::time::Instant::now(), NO_CONN, &[request]) {
+            Ok(_) => return Ok(()),
+            Err(refused) => match refused.ready_at {
+                Some(at) if at <= by => tokio::time::sleep_until(at).await,
+                _ => {
+                    return Err(format!(
+                        "{what}: not sent, the rate limit has no room before the wait passes"
+                    ));
+                }
+            },
+        }
+    }
 }
 
 #[cfg(test)]

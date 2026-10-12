@@ -98,8 +98,13 @@ its first GET /orders. Beside them it lists what was sent since the comparison b
 - this program's own REST requests: its reads, its logins and the order-book reads;
 - the WebSocket order methods: the steps' requests, each connection's cancel-on-disconnect arm,
   the Safety cancels a reconnect sends and the Stop cancels;
-- the connections opened. Each connection also makes a login and two resync reads, and a login
-  every refresh interval (60 s) while it stays open.
+- the connections opened, a session's reconnects included, and each login refused. Each
+  connection also makes a login and two resync reads, and a login every refresh interval (60 s)
+  while it stays open.
+
+Every request the program sends, its own REST reads and logins and the order-book reads included,
+is charged to the same rate limiter as the order sessions. A read waits for room in that limiter,
+and if no room comes before the read's wait ends, it fails without being sent.
 
 The per-IP limit covers WebSocket order methods only if the remaining count fell by more than
 every one of those REST requests. If it fell by no more than them, the run says nothing about the

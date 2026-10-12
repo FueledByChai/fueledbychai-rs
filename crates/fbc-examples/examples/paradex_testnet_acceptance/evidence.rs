@@ -406,6 +406,19 @@ pub fn privacy_hits(text: &str) -> Vec<&'static str> {
     hits
 }
 
+/// A scrubbed SBE frame as its fixture text ([`hex_lines`]), or what its bytes hold that must
+/// never be published. The bytes are scanned as text before they are written as hex: written,
+/// an ASCII credential in a variable field (an order's `requestMessage`) is spaced hex digits
+/// that no pattern of the privacy check recognises.
+pub fn sbe_fixture(comment: &str, scrubbed: &[u8]) -> Result<String, Vec<&'static str>> {
+    let hits = privacy_hits(&String::from_utf8_lossy(scrubbed));
+    if hits.is_empty() {
+        Ok(hex_lines(comment, scrubbed))
+    } else {
+        Err(hits)
+    }
+}
+
 /// A frame written as the hand-built fixtures are: whitespace-separated hex bytes, sixteen to
 /// a line, after `#` comment lines.
 fn hex_lines(comment: &str, bytes: &[u8]) -> String {
@@ -475,10 +488,15 @@ pub fn write_fixtures(
                          frame (template {template}, version {version}), its account bytes \
                          replaced by a0..bf."
                     );
-                    files.insert(
-                        name(&format!("{kind}-v{version}"), "sbe.txt"),
-                        hex_lines(&comment, &scrubbed),
-                    );
+                    let file = name(&format!("{kind}-v{version}"), "sbe.txt");
+                    match sbe_fixture(&comment, &scrubbed) {
+                        Ok(text) => {
+                            files.insert(file, text);
+                        }
+                        Err(hits) => written
+                            .withheld
+                            .push(format!("{file}: its bytes hold {}", hits.join(", "))),
+                    }
                 }
                 _ => {
                     let Ok(mut v) = serde_json::from_slice::<Value>(&bytes.0) else {
@@ -526,7 +544,8 @@ pub fn write_fixtures(
          as the hand-built fixtures in fixtures/paradex/exec/ are (hex bytes, `#` comments); \
          `rest-*.json` are the acceptance program's own GET /orders, /positions and \
          /orders-history reads, scrubbed alike. Every file passed the privacy check's patterns \
-         before it was written.\n"
+         before it was written, an SBE frame's bytes scanned as text before they were written \
+         as hex.\n"
     );
     files.insert("README.md".to_owned(), readme);
     for (file, text) in files {
