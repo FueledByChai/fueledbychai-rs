@@ -97,11 +97,6 @@ impl RestReader {
         })
     }
 
-    /// The configured request timeout: what one request may take.
-    pub fn timeout(&self) -> Duration {
-        self.timeout
-    }
-
     /// How many requests this reader has sent, its logins included: what a rate-limit count
     /// moved by is judged against (design §13.3).
     pub fn requests(&self) -> u64 {
