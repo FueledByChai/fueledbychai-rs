@@ -47,9 +47,10 @@
 //! forgotten every cycle ([`Link::forget`]), so a long run keeps no growing note list.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -82,6 +83,10 @@ use crate::testnet::{
 /// How many client ids each kept high-water mark reserves ahead of the mint: the mark is written
 /// before the ids go out, and again only once the mint is within one pass (two places) of it.
 pub const RESERVE: u64 = 1_024;
+
+/// A high-water mark's write off the runtime's thread: whether it was kept, and the mint it
+/// held, once it ends within the step timeout.
+type MarkWrite = Pin<Box<dyn Future<Output = Option<(Result<(), String>, Option<CidMint>)>>>>;
 
 /// What a run did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -232,6 +237,45 @@ pub fn size(opts: &Options, book: &OrderbookSnapshot) -> Result<Sizing, String> 
         inventory: lots_for(opts.inventory_cap_usd),
         at,
     })
+}
+
+/// The requests [`Driver::compact`] released most recently. A place is released once its first
+/// answer (Paradex's `Accepted{Provisional}`) is in, and its `Accepted{Final}` (decision 0092)
+/// can come after, when the link no longer holds the request: remembered here, such an answer
+/// is told from one to the session's own request, its cancel-on-disconnect arm (RB-elg7-5 on
+/// PR #149). The oldest are forgotten past [`Released::KEPT`], so it stays small.
+#[derive(Debug, Default)]
+pub struct Released(VecDeque<RpcId>);
+
+/// Whose an answer to a request the link did not hold is ([`Released::answer`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unheld {
+    /// The session's own request: its cancel-on-disconnect arm.
+    Arm,
+    /// A later answer to a request of ours already released.
+    Late,
+}
+
+impl Released {
+    /// How many released requests are remembered: a late answer comes within a cycle or two.
+    pub const KEPT: usize = 256;
+
+    /// Remembers `rpc` as released, forgetting the oldest past [`Released::KEPT`].
+    pub fn release(&mut self, rpc: RpcId) {
+        if self.0.len() == Self::KEPT {
+            self.0.pop_front();
+        }
+        self.0.push_back(rpc);
+    }
+
+    /// Whose an answer to `rpc`, a request the link did not hold, is.
+    pub fn answer(&self, rpc: RpcId) -> Unheld {
+        if self.0.contains(&rpc) {
+            Unheld::Late
+        } else {
+            Unheld::Arm
+        }
+    }
 }
 
 /// One cycle's desired book, the quotes in it, and the sides left out and why.
@@ -511,6 +555,8 @@ pub async fn run(
         hwm,
         mint: None,
         reserved: 0,
+        writing: None,
+        released: Released::default(),
         authenticated: false,
         armed: 0,
         resynced: None,
@@ -632,6 +678,11 @@ struct Driver {
     mint: Option<CidMint>,
     /// The high-water mark kept: no id above it is minted before a higher one is kept.
     reserved: u64,
+    /// The mark's write still in flight when a cycle ended during it, holding the mint, and the
+    /// mark it keeps: the next pass waits for it and takes the mint back (Codex r4244206466).
+    writing: Option<(u64, MarkWrite)>,
+    /// The requests released most recently, so a later answer to one is not taken for an arm.
+    released: Released,
     /// A connection authenticated; arms the venue accepted; the latest resync applied: the
     /// highest of our client ids it showed, how many open orders, how many of them on the market
     /// not ours, and the market's position.
@@ -809,11 +860,22 @@ impl Driver {
                 ours: true,
             } => self.on_outcome(rpc, item, outcome),
             Note::Outcome {
+                rpc,
                 outcome,
                 ours: false,
                 ..
             } => {
-                if matches!(outcome, SubmitOutcome::Accepted { .. }) {
+                if self.released.answer(rpc) == Unheld::Late {
+                    // A place's Accepted{Final} after its provisional answer: the registry has
+                    // it from the order event. Anything else is printed (RB-elg7-5).
+                    if !matches!(outcome, SubmitOutcome::Accepted { .. }) {
+                        self.note(format_args!(
+                            "a later answer to request {}, released once its first answer \
+                             came: {outcome:?}",
+                            rpc.0
+                        ));
+                    }
+                } else if matches!(outcome, SubmitOutcome::Accepted { .. }) {
                     self.armed += 1;
                 } else {
                     self.note(format_args!(
@@ -1146,6 +1208,7 @@ impl Driver {
             self.submitted.remove(&rpc);
             self.ours.remove(&rpc);
             self.link.borrow_mut().release(rpc);
+            self.released.release(rpc);
         }
     }
 
@@ -1411,36 +1474,52 @@ impl Driver {
     /// Keeps a high-water mark [`RESERVE`] ids above the mint before a pass may mint past the one
     /// kept: written and synced off the runtime's thread, the mint (and its namespace lease)
     /// held until the write ends even past the timeout. The write is raced against what ends a
-    /// cycle ([`Driver::ending`], Codex r4244145961): `Ok(false)` when it came first, the mint
-    /// then dropped on the write's thread once the write ends (nothing is minted after).
+    /// cycle ([`Driver::ending`], Codex r4244145961): `Ok(false)` when it came first. The write
+    /// is then kept, holding the mint, and the next pass (after a reconnect's sweep) waits for
+    /// it and takes the mint back, so a connection's end never loses it and no second write of
+    /// the mark starts beside it (Codex r4244206466); when the run ends instead, the mint is
+    /// dropped on the write's thread once the write ends (nothing is minted after).
     async fn reserve(&mut self) -> Result<bool, String> {
-        let high = self.mint.as_ref().map_or(0, CidMint::high_water);
-        // Near u64::MAX no mark can be kept above the mint: refused, the mark kept unchanged,
-        // never wrapped (Codex r4244080134).
-        let (Some(next), Some(mark)) = (high.checked_add(2), high.checked_add(RESERVE)) else {
-            return Err(format!(
-                "the client-id sequence space is exhausted: no high-water mark {RESERVE} ids \
-                 above {high} can be kept, so nothing more is minted"
-            ));
+        let (mark, mut write) = match self.writing.take() {
+            Some(writing) => writing,
+            None => {
+                let high = self.mint.as_ref().map_or(0, CidMint::high_water);
+                // Near u64::MAX no mark can be kept above the mint: refused, the mark kept
+                // unchanged, never wrapped (Codex r4244080134).
+                let (Some(next), Some(mark)) = (high.checked_add(2), high.checked_add(RESERVE))
+                else {
+                    return Err(format!(
+                        "the client-id sequence space is exhausted: no high-water mark \
+                         {RESERVE} ids above {high} can be kept, so nothing more is minted"
+                    ));
+                };
+                if next <= self.reserved {
+                    return Ok(true);
+                }
+                let hwm = self.hwm.clone();
+                let mint = self.mint.take();
+                let write: MarkWrite =
+                    Box::pin(off_thread_holding(self.timeout, mint, move || {
+                        hwm.write(mark)
+                    }));
+                (mark, write)
+            }
         };
-        if next <= self.reserved {
-            return Ok(true);
-        }
-        let hwm = self.hwm.clone();
-        let mint = self.mint.take();
-        let write = off_thread_holding(self.timeout, mint, move || hwm.write(mark));
-        tokio::pin!(write);
         let written = loop {
             let wake = Rc::clone(&self.wake);
             let woken = wake.notified();
             self.absorb();
             if self.ending() {
+                self.writing = Some((mark, write));
                 return Ok(false);
             }
             tokio::select! {
                 written = &mut write => break written,
                 () = woken => {}
-                () = tokio::time::sleep_until(self.deadline) => return Ok(false),
+                () = tokio::time::sleep_until(self.deadline) => {
+                    self.writing = Some((mark, write));
+                    return Ok(false);
+                }
             }
         };
         match written {

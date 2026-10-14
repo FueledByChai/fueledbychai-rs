@@ -51,8 +51,8 @@ use fbc_conformance::{
     Frame, HttpReply, HttpRouter, PathPattern, Responder, Step, StubServer, WsScript,
 };
 use fbc_core::{
-    AccountKey, CidMint, Lots, Namespace, NamespaceLease, Secret, Secrets, Side, SignedLots, Ticks,
-    WallNs, encode_cid,
+    AccountKey, CidMint, Lots, Namespace, NamespaceLease, RpcId, Secret, Secrets, Side, SignedLots,
+    Ticks, WallNs, encode_cid,
 };
 use fbc_runtime::ProxyConfig;
 use fbc_runtime::http::Method;
@@ -1148,19 +1148,27 @@ async fn an_order_on_the_market_that_is_not_ours_refuses_the_run_before_start() 
 
 #[tokio::test]
 async fn the_duration_ends_the_loop() {
+    // Cycle 1's touch (GET /orderbook read 2) is never answered, so the frames sent do not
+    // depend on how much of the second the start took: whenever --duration passes, during the
+    // start or the touch, nothing was placed and Stop has nothing to cancel (RB-elg7-4 on PR
+    // #149). The run ends at --duration, not at --step-timeout's 10 s.
     let venue = venue(vec![b0()]);
-    let stub = StubServer::start(
-        one_connection(&venue, 6 + 2 + 1),
-        routes(&venue, login_ok()),
-    )
-    .await
-    .unwrap();
+    let stub = StubServer::start(one_connection(&venue, 6), routes(&venue, login_ok()))
+        .await
+        .unwrap();
     let mut opts = options(&stub, 1_000_000);
     opts.duration_secs = 1;
+    opts.rest_url = holding_relay(&opts.rest_url, 2, Arc::new(Notify::new()), None).await;
     let (report, printed) = run_against(&opts).await;
     stub.finished().await.unwrap();
     assert!(report.ok, "{printed}");
     assert_eq!(report.ended, "--duration 1 s reached", "{printed}");
+    assert!(!printed.contains("TIMEOUT"), "{printed}");
+    assert_eq!(
+        (report.places_sent, report.cancels_sent),
+        (0, 0),
+        "{printed}"
+    );
 }
 
 #[tokio::test]
@@ -1550,6 +1558,95 @@ async fn holding_relay(
     format!("http://{addr}/v1")
 }
 
+/// A WebSocket relay to the stub at `ws_url`: its first connection is cut (both sockets
+/// dropped, no close frame) once `cut` is notified; each later one is piped through, `again`
+/// notified as it is accepted.
+async fn cutting_relay(ws_url: &str, cut: Arc<Notify>, again: Arc<Notify>) -> String {
+    let target = ws_url
+        .strip_prefix("ws://")
+        .and_then(|s| s.strip_suffix("/v1"))
+        .unwrap()
+        .to_owned();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut first = true;
+        while let Ok((mut client, _)) = listener.accept().await {
+            let Ok(mut server) = tokio::net::TcpStream::connect(&target).await else {
+                return;
+            };
+            let was_first = std::mem::replace(&mut first, false);
+            if !was_first {
+                again.notify_one();
+            }
+            let cut = Arc::clone(&cut);
+            tokio::spawn(async move {
+                let pipe = tokio::io::copy_bidirectional(&mut client, &mut server);
+                if was_first {
+                    tokio::select! {
+                        _ = pipe => {}
+                        () = cut.notified() => {}
+                    }
+                } else {
+                    let _ = pipe.await;
+                }
+            });
+        }
+    });
+    format!("ws://{addr}/v1")
+}
+
+#[tokio::test]
+async fn a_connection_end_during_the_high_water_write_keeps_the_client_id_mint() {
+    // Cycle 1's first pass writes the client-id high-water mark. The write is held, and while
+    // it is in flight the relay cuts the order socket; once the session has reconnected the
+    // write is let go. Nothing was placed, so nothing of ours rests. The loop must keep the
+    // mint through the reconnect and quote, not Stop with "no client-id mint" (Codex
+    // r4244206466, RB-elg7-6 on PR #149).
+    let venue = venue(vec![b0()]);
+    // First connection: the opening six, then the cut. Second: the opening six, two places,
+    // Stop's cancel.
+    let mut steps = vec![Step::Accept];
+    steps.extend(answered(&venue, 0, 6));
+    steps.push(Step::Accept);
+    steps.extend(answered(&venue, 1, 6 + 2 + 1));
+    let stub = StubServer::start(WsScript::new(steps), routes(&venue, login_ok()))
+        .await
+        .unwrap();
+    let mut opts = options(&stub, 1);
+    let (cut, again) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    opts.ws_url = cutting_relay(&opts.ws_url, Arc::clone(&cut), Arc::clone(&again)).await;
+    let hold = testnet::held_writes::hold(&opts.lease_dir);
+    tokio::spawn(async move {
+        hold.entered().await;
+        cut.notify_one();
+        again.notified().await;
+        hold.release();
+    });
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+
+    assert!(report.ok, "{printed}");
+    assert_eq!(report.ended, "--cycles 1 reached", "{printed}");
+    assert!(printed.contains("RECONNECT"), "{printed}");
+    assert_eq!(
+        methods(&venue, 1)
+            .iter()
+            .filter(|m| *m == "order.create")
+            .count(),
+        2,
+        "{printed}"
+    );
+    // One write of the mark, the held one, kept: none started beside it.
+    let hwm = testnet::HighWater::at(&opts.lease_dir, Namespace::new(1));
+    let kept = format!(
+        "MARK client-id high-water mark {} kept",
+        hwm.read().unwrap()
+    );
+    assert_eq!(printed.matches("MARK client-id").count(), 1, "{printed}");
+    assert!(printed.contains(&kept), "{printed}");
+}
+
 #[tokio::test]
 async fn the_interrupt_while_a_pass_reads_a_fresh_touch_places_nothing_after() {
     // As in the fill-during-a-replace test, the bid's cancel races a fill of all of it, so the
@@ -1621,6 +1718,32 @@ async fn the_interrupt_while_the_touch_is_unanswered_stops_it_at_once() {
         (2, 1, 2),
         "{printed}"
     );
+}
+
+#[test]
+fn a_late_answer_to_a_released_request_is_told_from_the_sessions_own_arm() {
+    // compact() releases a place once its first answer (Paradex's Provisional) is in; its
+    // Accepted{Final} can come after, with the link no longer holding the request. The released
+    // requests are remembered, so that answer is not counted as a cancel-on-disconnect arm
+    // (RB-elg7-5 on PR #149); the oldest are forgotten past quote::Released::KEPT.
+    let mut released = quote::Released::default();
+    assert_eq!(released.answer(RpcId(1)), quote::Unheld::Arm);
+    for n in 1..=3 {
+        released.release(RpcId(n));
+    }
+    assert_eq!(released.answer(RpcId(2)), quote::Unheld::Late);
+    assert_eq!(released.answer(RpcId(4)), quote::Unheld::Arm);
+    let kept = u64::try_from(quote::Released::KEPT).unwrap();
+    for n in 4..=3 + kept {
+        released.release(RpcId(n));
+    }
+    assert_eq!(
+        released.answer(RpcId(3)),
+        quote::Unheld::Arm,
+        "the oldest are forgotten"
+    );
+    assert_eq!(released.answer(RpcId(4)), quote::Unheld::Late);
+    assert_eq!(released.answer(RpcId(3 + kept)), quote::Unheld::Late);
 }
 
 fn strings(args: &[&str]) -> Vec<String> {
