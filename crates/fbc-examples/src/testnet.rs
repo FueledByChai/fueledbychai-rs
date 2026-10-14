@@ -793,6 +793,8 @@ impl HighWater {
     pub fn write(&self, mark: u64) -> Result<(), String> {
         use std::io::Write as _;
         let tmp = self.path.with_extension("tmp");
+        #[cfg(test)]
+        held_writes::wait(&self.path);
         let durable = || -> std::io::Result<()> {
             // The new mark reaches the disk before it replaces the old, and the rename does
             // before the order goes out: a power loss leaves the old mark or the new, never none.
@@ -809,5 +811,70 @@ impl HighWater {
                 self.path.display()
             )
         })
+    }
+}
+
+/// Test-only: holds the next high-water mark written in a lease directory until the test
+/// releases it, so a test can end a connection while the write is in flight, an event and not
+/// a time (Codex r4244206466 on PR #149). Keyed by the directory, so tests running at once each
+/// hold only their own.
+#[cfg(test)]
+pub mod held_writes {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
+    #[derive(Default)]
+    struct Gate {
+        released: Mutex<bool>,
+        open: Condvar,
+        entered: tokio::sync::Notify,
+    }
+
+    fn held() -> &'static Mutex<HashMap<PathBuf, Arc<Gate>>> {
+        static HELD: OnceLock<Mutex<HashMap<PathBuf, Arc<Gate>>>> = OnceLock::new();
+        HELD.get_or_init(Mutex::default)
+    }
+
+    /// The hold of the next write in a directory.
+    pub struct Hold(Arc<Gate>);
+
+    /// Holds the next mark written in `dir` (only that one) until [`Hold::release`].
+    pub fn hold(dir: &Path) -> Hold {
+        let gate = Arc::new(Gate::default());
+        held()
+            .lock()
+            .unwrap()
+            .insert(dir.to_path_buf(), Arc::clone(&gate));
+        Hold(gate)
+    }
+
+    impl Hold {
+        /// Completes once the held write has started, and waits there.
+        pub async fn entered(&self) {
+            self.0.entered.notified().await;
+        }
+
+        /// Lets the held write go on.
+        pub fn release(&self) {
+            *self.0.released.lock().unwrap() = true;
+            self.0.open.notify_all();
+        }
+    }
+
+    /// Called by [`super::HighWater::write`] on its thread: waits while the write to `path` is
+    /// held.
+    pub(super) fn wait(path: &Path) {
+        let Some(gate) = path
+            .parent()
+            .and_then(|dir| held().lock().unwrap().remove(dir))
+        else {
+            return;
+        };
+        gate.entered.notify_one();
+        let mut released = gate.released.lock().unwrap();
+        while !*released {
+            released = gate.open.wait(released).unwrap();
+        }
     }
 }

@@ -238,9 +238,6 @@ pub fn shown(text: &str) -> String {
     }
 }
 
-/// A venue error as the run prints it: its code (when plain: letters, digits, '_' and '-', no
-/// part withheld; `<withheld>` otherwise) unless its text already names it, then its text,
-/// both through [`shown`].
 /// An asynchronous reject ([`Note::AsyncReject`]) as the samples print it: the operation, the
 /// kind, and the venue's reason as [`described`] shows it.
 pub fn async_reject(op: OpKind, reject: &Reject) -> String {
@@ -251,6 +248,9 @@ pub fn async_reject(op: OpKind, reject: &Reject) -> String {
     )
 }
 
+/// A venue error as the run prints it: its code (when plain: letters, digits, '_' and '-', no
+/// part withheld; `<withheld>` otherwise) unless its text already names it, then its text,
+/// both through [`shown`].
 pub fn described(reject: &Reject) -> String {
     let raw = shown(&reject.raw);
     let Some(code) = reject.venue_code.as_deref() else {
