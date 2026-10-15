@@ -21,7 +21,8 @@
 
 mod accept;
 mod accept_args;
-// testnet_trade's command line and guard, its glue and its helpers, reused as they are.
+// testnet_trade's command line and helpers, and the glue and testnet wiring the samples that
+// trade share (`src/link.rs`, `src/testnet.rs`), reused as they are.
 #[allow(dead_code)]
 #[path = "../testnet_trade/args.rs"]
 mod args;
@@ -31,8 +32,11 @@ mod auth;
 mod auth_rest;
 mod evidence;
 #[allow(dead_code)]
-#[path = "../testnet_trade/link.rs"]
+#[path = "../../src/link.rs"]
 mod link;
+#[allow(dead_code)]
+#[path = "../../src/testnet.rs"]
+mod testnet;
 #[allow(dead_code)]
 #[path = "../testnet_trade/trade.rs"]
 mod trade;
@@ -81,8 +85,8 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let (writer, printing) = trade::detached(io::stdout());
-    let out: trade::Out = Rc::new(RefCell::new(writer));
+    let (writer, printing) = testnet::detached(io::stdout());
+    let out: testnet::Out = Rc::new(RefCell::new(writer));
     let ran = runtime.block_on(accept::run(&opts, chain.as_deref(), &creds, out));
     drop(runtime);
     let _ = printing.join();

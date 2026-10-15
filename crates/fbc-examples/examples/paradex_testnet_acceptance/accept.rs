@@ -1,7 +1,7 @@
 //! paradex_testnet_acceptance's run: FBC-8xr's script on Paradex TESTNET through fbc-oms, in
 //! three phases, each one order-entry session (fbc-runtime's `ExecSession`) over a registry of
 //! its own declared an owner-assisted testnet run (decision 0067), its events routed into the
-//! registry by testnet_trade's [`Link`]:
+//! registry by the shared glue's [`Link`] (`src/link.rs`):
 //!
 //! 1. **main**: place, amend, cancel, batch create, cancel-many, an IOC that expires, then a
 //!    post-only order left resting and the socket DROPPED with no close frame (`cod-dropped`).
@@ -72,8 +72,9 @@ use crate::auth_rest::{RestAnswer, RestReader};
 use crate::evidence::{
     self, Comparison, Disconnect, Evidence, History, Ran, RestPosition, Sent, Trace,
 };
-use crate::link::{Link, LinkHandler, Note, shown};
-use crate::trade::{self, HighWater, INST, LOGIN_REFUSALS, Out, Priced, off_thread_holding};
+use crate::link::{Link, LinkHandler, Note, async_reject, shown};
+use crate::testnet::{HighWater, INST, LOGIN_REFUSALS, Out, off_thread_holding, snapshot_max};
+use crate::trade::{self, Priced};
 
 const ACCT: AccountKey = AccountKey::new(1);
 /// The lease files' venue and account labels, as testnet_trade's, so the two never trade the
@@ -526,8 +527,8 @@ impl Tracker {
     }
 }
 
-/// The session's handler: testnet_trade's [`LinkHandler`], then a sample of the orders the run
-/// follows, so every state each passes through is traced.
+/// The session's handler: the shared glue's [`LinkHandler`], then a sample of the orders the
+/// run follows, so every state each passes through is traced.
 struct Tap {
     inner: LinkHandler,
     tracker: Rc<RefCell<Tracker>>,
@@ -704,7 +705,7 @@ impl Phase {
                     item,
                     outcome,
                     ..
-                // A refusal's venue text goes through testnet_trade's `shown`, which withholds
+                // A refusal's venue text goes through the shared glue's `shown`, which withholds
                 // any word that could hold an echoed credential.
                 } if *r == rpc => Some(match item {
                     Some(i) => format!("item {i} {}", shown(&format!("{outcome:?}"))),
@@ -1178,7 +1179,7 @@ impl Run {
             }
         }
         if self.mint.is_none() {
-            let ours_max = trade::snapshot_max(&snapshot);
+            let ours_max = snapshot_max(&snapshot);
             let lease = self.ns_lease.take().ok_or("the namespace lease is gone")?;
             self.mint = Some(CidMint::new(
                 lease,
@@ -2706,7 +2707,14 @@ pub fn link_problems(notes: &[Note]) -> Vec<String> {
             Note::Fill {
                 seen,
                 unexplained: true,
+                ..
             } => problems.push(format!("a fill not of our orders: {seen}")),
+            // The shared link notes an asynchronous reject for its driver to judge (FBC-elg7);
+            // this run counts every one as a problem, as it did when the link noted it so.
+            Note::AsyncReject { op, reject, .. } => problems.push(format!(
+                "the link noted a problem: {}",
+                async_reject(*op, reject)
+            )),
             Note::ResyncRefused(why) => problems.push(format!("a resync was refused: {why}")),
             _ => {}
         }
