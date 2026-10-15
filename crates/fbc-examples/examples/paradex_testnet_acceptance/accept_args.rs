@@ -1,5 +1,5 @@
 //! paradex_testnet_acceptance's command line: testnet_trade's flags (`args.rs`, which also holds
-//! the testnet guard) and three of its own, parsed by hand (no argument-parsing dependency).
+//! the testnet guard) and four of its own, parsed by hand (no argument-parsing dependency).
 
 use std::path::PathBuf;
 
@@ -8,7 +8,8 @@ use crate::args::{self, Options, Parsed};
 /// The help text `--help` prints.
 pub const USAGE: &str = "\
 paradex_testnet_acceptance: FBC-8xr's acceptance run on Paradex TESTNET, through fbc-oms, one run
-of each command type on tiny post-only orders well away from the touch, writing an evidence
+of each command type on tiny post-only orders well away from the touch (with --allow-fill, also
+two small orders that take liquidity, each flattened at once), writing an evidence
 report the snapshot-trust decision (FBC-2f7w) cites. TESTNET ONLY: a mainnet URL or chain id is
 refused before anything connects. An owner-assisted testnet run: each phase's market position is
 seeded by hand from the venue's own REST position (decision 0067).
@@ -23,6 +24,15 @@ The steps, each sent once (a step whose order could not be built is reported, no
   cancel-many    those two orders in one cancel-many
   ioc            one IOC limit order on --side priced behind the touch, which can fill nothing:
                  Paradex expires it, and the reason it states is recorded
+  fill           --allow-fill only, on a book with both sides resting: one IOC of about
+                 --order-usd at the touch, which takes resting liquidity (never past the
+                 inventory cap), GET /positions compared with the fills, then a reduce-only IOC
+                 on the other side that flattens it, compared again
+  fill-partial   --allow-fill only, when the touch's level on --side's far side is smaller than
+                 the order: a GTC limit (not post-only) at that level fills in part and rests;
+                 it is amended once (its size sent as the total) to record whether Paradex reads
+                 order.modify's size as the total or the remainder (FBC-b0z9), then cancelled
+                 and what filled flattened with a reduce-only IOC; otherwise not exercised
   cod-dropped    one post-only order, then the order socket DROPPED with no close frame; the
                  account's open orders are read over REST until the order is gone or --cod-wait
                  passes (a reconnect then Safety-cancels it, decision 0080)
@@ -44,6 +54,9 @@ Its own options:
                             have cancelled, 1 to 300 (default 30)
   --rest-wait <SECONDS>     how long each REST comparison polls before it records that REST
                             never agreed with the stream, 1 to 120 (default 15)
+  --allow-fill              run the fill and fill-partial steps: orders that take resting
+                            liquidity on TESTNET (about --order-usd each, under the caps), each
+                            flattened with a reduce-only IOC; without it neither runs
 
 Every testnet_trade option, with the same meaning (--side, --away-bps and --order-usd shape each
 order; --hold is unused):
@@ -61,6 +74,8 @@ pub struct AcceptOptions {
     pub cod_wait_secs: u64,
     /// How long, in seconds, a comparison polls REST for agreement with the stream.
     pub rest_wait_secs: u64,
+    /// Whether the fill steps run (`--allow-fill`, FBC-6fnc): orders that take liquidity.
+    pub allow_fill: bool,
 }
 
 /// What the command line asked for.
@@ -76,6 +91,7 @@ pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<AcceptParsed, Str
     let mut evidence_dir = None;
     let mut cod_wait_secs = 30;
     let mut rest_wait_secs = 15;
+    let mut allow_fill = false;
     let mut rest = Vec::new();
     let mut argv = argv.into_iter();
     while let Some(arg) = argv.next() {
@@ -99,6 +115,7 @@ pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<AcceptParsed, Str
             }
             "--cod-wait" => cod_wait_secs = seconds("--cod-wait", &value()?, 300)?,
             "--rest-wait" => rest_wait_secs = seconds("--rest-wait", &value()?, 120)?,
+            "--allow-fill" => allow_fill = true,
             _ => rest.push(arg),
         }
     }
@@ -112,6 +129,7 @@ pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<AcceptParsed, Str
         evidence_dir,
         cod_wait_secs,
         rest_wait_secs,
+        allow_fill,
     })))
 }
 

@@ -15,8 +15,9 @@ program's flags.
 ## paradex_testnet_acceptance
 
 This program runs FBC-8xr's script on Paradex testnet through fbc-oms. Each command type runs
-once: place, amend, cancel, batch create, cancel-many, an IOC that expires, and
-cancel-on-disconnect twice (once on a dropped socket, once on a graceful close). Every order is
+once: place, amend, cancel, batch create, cancel-many, an IOC that expires, with
+`--allow-fill` the two fill steps, and cancel-on-disconnect twice (once on a dropped socket,
+once on a graceful close). Every order is
 tiny (`--order-usd`, at most the resting cap per side). Every order is post-only, except the
 IOC, which is priced where it cannot fill. Every order rests at least `--away-bps` behind a
 touch read just before the order is built.
@@ -27,11 +28,35 @@ GET /orders-history?client_id=.
 
 The program refuses any URL or chain id other than the testnet's before it connects. It uses
 the same flags, testnet guard, lease directory and client-id namespace as `testnet_trade`, plus
-three flags of its own:
+four flags of its own:
 
 - `--evidence-dir` (required)
 - `--cod-wait` (default 30 s)
 - `--rest-wait` (default 15 s)
+- `--allow-fill` (off by default): runs the two fill steps below
+
+### The fill steps (`--allow-fill`, FBC-6fnc)
+
+Testnet only, and only with `--allow-fill`. Each runs only when both sides of the book have
+resting liquidity, so what fills can always be flattened at once; otherwise it is skipped with
+the reason. No take is sent that could pass `--inventory-cap-usd`, and every order still goes
+through fbc-oms under the caps.
+
+- `fill`: one IOC of about `--order-usd` at the far touch (the ask for `--side buy`) takes
+  resting liquidity. GET /positions is compared with the fills before and after it. A
+  reduce-only IOC on the other side then flattens what filled (up to three, each priced where
+  the book's depth covers what is left), and the comparison runs again.
+- `fill-partial`: when the far touch's level is smaller than the order, a GTC limit that is not
+  post-only, at that level, fills in part and rests the rest. That order is amended once, away
+  from the touch, with its size sent as the total. The report records whether Paradex read
+  order.modify's size as the total or the remainder (FBC-b0z9). The order is then cancelled and
+  what filled is flattened. When no such level exists, the step is not exercised and the report
+  says why. Paradex declares an amend of a partly filled order refused (decision 0054); this run
+  admits it in its main phase only, and only when the larger reading (the whole size resting on
+  top of what filled) still fits the caps.
+
+The report lists every fill as received (fill id, side, fee and fee currency, realized P&L and
+funding) and every PositionEvent.
 
 ### Run it on your machine
 
@@ -48,7 +73,22 @@ cargo run -p fbc-examples --example paradex_testnet_acceptance -- \
 ```
 
 Read the tick, size step and minimum notional from the market's entry in
-`GET https://api.testnet.paradex.trade/v1/markets`.
+`GET https://api.testnet.paradex.trade/v1/markets`. A book price or size off that grid is
+reported as "not on the --tick (or --step) grid; check --tick and --step against GET /markets".
+
+With the fill steps, on HYPE-USD-PERP (tick 0.0001, size step 0.01, minimum notional 10). Its
+book is wide, so the resting cap in lots, taken at the dearer side's price, is too small for an
+$11 order at `--resting-cap-usd 11`; `--resting-cap-usd 40` lets each order stay about $11
+(the conversion is deferred, FBC-iaft):
+
+```text
+cargo run -p fbc-examples --example paradex_testnet_acceptance -- \
+    --evidence-dir "$HOME/fbc-acceptance/$(date -u +%Y%m%dT%H%M%SZ)" \
+    --sole-trader --namespace 4242 \
+    --market HYPE-USD-PERP --tick 0.0001 --step 0.01 --min-notional 10 \
+    --resting-cap-usd 40 --inventory-cap-usd 50 --order-usd 11 \
+    --side buy --away-bps 300 --allow-fill
+```
 
 Before you run it, check two things:
 

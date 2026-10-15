@@ -1,12 +1,12 @@
 //! paradex_testnet_acceptance: FBC-8xr's acceptance run on Paradex TESTNET (FBC-xji8). Through
-//! fbc-oms, one run of each command type (place, amend, cancel, batch create, cancel-many, an
-//! IOC expiry, cancel-on-disconnect on a dropped socket and on a graceful close) on tiny
-//! post-only orders well away from the touch, each step's GET /orders and GET /positions compared
-//! with the order stream, written up as an evidence report, a machine-readable evidence file and
-//! a scrubbed slice of the run's journal. TESTNET ONLY: a mainnet URL or chain id is refused
-//! before anything connects. An owner-run program: CI builds it, and its wiring is tested against
-//! the conformance stub (`tests/paradex_testnet_acceptance.rs`), but nothing runs it against a
-//! venue.
+//! fbc-oms, one run of each command type (place, amend, cancel, batch create, cancel-many, an IOC
+//! expiry, cancel-on-disconnect on a dropped socket and on a graceful close) on tiny post-only
+//! orders well away from the touch (with `--allow-fill`, also a take and a partly filled order's
+//! amend, each flattened at once), each step's GET /orders and GET /positions compared with the
+//! order stream, written up as an evidence report, a machine-readable evidence file and a scrubbed
+//! slice of the run's journal. TESTNET ONLY: a mainnet URL or chain id is refused before anything
+//! connects. An owner-run program: CI builds it, and its wiring is tested against the conformance
+//! stub (`tests/paradex_testnet_acceptance.rs`), but nothing runs it against a venue.
 //!
 //! ```text
 //! export PARADEX_ACCOUNT_ADDRESS=...   # the testnet account
