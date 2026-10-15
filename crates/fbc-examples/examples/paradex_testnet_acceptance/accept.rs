@@ -526,12 +526,16 @@ struct Tracker {
     /// Each fill event and PositionEvent as received (FBC-uiy, FBC-4zz).
     fills: Vec<FillRow>,
     positions: Vec<String>,
-    /// The last order event's number (counted from 1 over the run), total and cumulative
-    /// filled quantity, as the venue stated them, for each order of ours: what order.modify's
+    /// The last order event's number (counted from 1 over the run), total, cumulative filled
+    /// quantity and price, as the venue stated them, for each order of ours: what order.modify's
     /// size became (FBC-b0z9).
-    last_stated: Vec<(ClientOrderId, u64, Option<Lots>, Lots)>,
+    last_stated: Vec<(ClientOrderId, Stated)>,
     order_events: u64,
 }
+
+/// What an order event stated of an order: its number over the run, total, cumulative filled
+/// quantity and price ([`Tracker::stated`]).
+type Stated = (u64, Option<Lots>, Lots, Option<Ticks>);
 
 /// `m` in its units, as a decimal.
 fn money(m: &Money) -> String {
@@ -602,22 +606,22 @@ impl Tracker {
             ExecEvent::Order(u) => {
                 self.order_events += 1;
                 if let Some(CidMatch::Ours(cid)) = u.cid {
-                    self.last_stated.retain(|(c, ..)| *c != cid);
+                    self.last_stated.retain(|(c, _)| *c != cid);
                     self.last_stated
-                        .push((cid, self.order_events, u.qty, u.cum_filled));
+                        .push((cid, (self.order_events, u.qty, u.cum_filled, u.px)));
                 }
             }
             _ => {}
         }
     }
 
-    /// The last order event's number, total and filled quantity for `cid`
+    /// The last order event's number, total, filled quantity and price for `cid`
     /// ([`Tracker::last_stated`]).
-    fn stated(&self, cid: ClientOrderId) -> Option<(u64, Option<Lots>, Lots)> {
+    fn stated(&self, cid: ClientOrderId) -> Option<Stated> {
         self.last_stated
             .iter()
-            .find(|(c, ..)| *c == cid)
-            .map(|(_, n, total, cum)| (*n, *total, *cum))
+            .find(|(c, _)| *c == cid)
+            .map(|(_, stated)| *stated)
     }
 
     fn sample(&mut self, reg: &Registry) {
@@ -1880,6 +1884,65 @@ impl Run {
         Ok((level.px, lots, level.qty))
     }
 
+    /// After a placement of `label` that failed its step: a resting one is cancelled, and the
+    /// order must end with every fill its order events state before what filled is flattened
+    /// (Codex r4289239739). One whose outcome stays unresolved is never called flat: the step
+    /// says so and false stops the phase.
+    async fn settle_failed(
+        &mut self,
+        p: &Phase,
+        step: &str,
+        label: &str,
+        start: SignedLots,
+    ) -> bool {
+        let cid = {
+            let tr = self.tracker.borrow();
+            tr.orders
+                .iter()
+                .rev()
+                .find(|o| o.label == label && o.phase == tr.phase)
+                .map(|o| o.cid)
+        };
+        if let Some(cid) = cid {
+            if p.state(cid)
+                .is_some_and(|s| matches!(s, OrdState::Open | OrdState::PartiallyFilled))
+            {
+                self.cancel(p, step, &[cid]).await;
+            }
+            if !p.fills_settled(cid, OrdState::is_terminal).await {
+                let why = format!(
+                    "{label}'s outcome is unresolved (it did not end with its fills on the stream \
+                     within the step timeout): what it filled is NOT flattened; the phase stops, \
+                     check GET /positions and flatten by hand on testnet"
+                );
+                self.lines.line(format_args!("FAIL {step} {why}"));
+                self.fail(step, why);
+                self.ev.step(step).pass = false;
+                return false;
+            }
+        }
+        let flat = self.flatten(p, step, start).await.0;
+        self.ev.step(step).pass = false;
+        flat
+    }
+
+    /// Why a take on `side` from the market's inventory now could not be undone by a
+    /// reduce-only flatten: one that reduces or crosses a position the phase seeded (Codex
+    /// r4289239755). None when the position is flat or on the take's side.
+    fn reduces_seed(&self, p: &Phase, side: OrderSide) -> Option<String> {
+        let now = p.link.borrow().registry().inventory(INST).0;
+        let opens = match side {
+            OrderSide::Buy => now >= 0,
+            OrderSide::Sell => now <= 0,
+        };
+        (!opens).then(|| {
+            format!(
+                "the market holds a position of {now} lots that a take on --side would reduce: \
+                 a reduce-only flatten could not restore it, so none is taken"
+            )
+        })
+    }
+
     /// Why a take of `qty` on `side` could pass the inventory cap from the market's inventory
     /// now, if it could (the registry refuses it too; this says why before anything is sent).
     fn past_cap(&self, p: &Phase, side: OrderSide, qty: Lots) -> Option<String> {
@@ -1918,7 +1981,10 @@ impl Run {
                 return true;
             }
         };
-        if let Some(why) = self.past_cap(p, side, qty) {
+        if let Some(why) = self
+            .reduces_seed(p, side)
+            .or_else(|| self.past_cap(p, side, qty))
+        {
             self.ev.step(step).ran = Ran::Skipped(why.clone());
             self.lines.line(format_args!("NOTE fill skipped: {why}"));
             return true;
@@ -1939,8 +2005,7 @@ impl Run {
             Ok((cid, _)) => cid,
             Err(e) => {
                 self.fail(step, e);
-                // An IOC that was sent may still have filled: flatten whatever did.
-                return self.flatten(p, step, start).await.0;
+                return self.settle_failed(p, step, "T1 take", start).await;
             }
         };
         let ended = p.fills_settled(cid, OrdState::is_terminal).await;
@@ -2041,7 +2106,10 @@ impl Run {
             skip(self, why);
             return true;
         }
-        if let Some(why) = self.past_cap(p, side, qty) {
+        if let Some(why) = self
+            .reduces_seed(p, side)
+            .or_else(|| self.past_cap(p, side, qty))
+        {
             skip(self, why);
             return true;
         }
@@ -2059,12 +2127,15 @@ impl Run {
             Ok((cid, _)) => cid,
             Err(e) => {
                 self.fail(step, e);
-                return self.flatten(p, step, start).await.0;
+                return self.settle_failed(p, step, "P1 partial", start).await;
             }
         };
         let landed = p.fills_settled(cid, resting_or_ended).await;
         let partly = p.state(cid) == Some(OrdState::PartiallyFilled);
         let mut ok = landed;
+        // Whether the amend of a partly filled order was sent and read: only then can the step
+        // pass; otherwise it is skipped, not passed (Codex r4289239743).
+        let mut exercised = false;
         let filled = p.filled(cid);
         let reading = if partly {
             let c = self
@@ -2073,7 +2144,10 @@ impl Run {
             ok &= c.orders_agreed && c.positions_agreed;
             self.ev.step(step).comparisons.push(c);
             let (read, amended) = self.amend_partial(p, cid, filled).await;
-            ok &= amended;
+            if let Some(amended) = amended {
+                exercised = true;
+                ok &= amended;
+            }
             read
         } else {
             format!(
@@ -2085,7 +2159,7 @@ impl Run {
         };
         self.lines
             .step(step, format_args!("order.modify's size on P1: {reading}"));
-        self.ev.partial_amend = Some(reading);
+        self.ev.partial_amend = Some(reading.clone());
         if !p.state(cid).is_some_and(OrdState::is_terminal) {
             ok &= self.cancel(p, step, &[cid]).await;
         }
@@ -2105,7 +2179,13 @@ impl Run {
         s.orders
             .retain(|t| !traces.iter().any(|n| n.client_id == t.client_id));
         s.orders.extend(traces);
-        s.pass = ok && flat && flattened.orders_agreed && flattened.positions_agreed;
+        let clean = ok && flat && flattened.orders_agreed && flattened.positions_agreed;
+        s.pass = clean && exercised;
+        if clean && !exercised {
+            s.ran = Ran::Skipped(format!(
+                "{reading}; P1 was sent, cancelled and what filled flattened"
+            ));
+        }
         if !landed {
             s.notes.push(
                 "P1 neither rested nor ended with its fills on the stream within the step \
@@ -2120,13 +2200,14 @@ impl Run {
     /// Amends the partly filled order `cid` (`filled` lots filled) once: `--away-bps` behind
     /// the touch, so nothing more fills, its size sent as the total it already has. What the
     /// venue's next order event made of the size ([`modify_reading`]), and whether the amend
-    /// was answered and REST agreed after it.
+    /// was answered, its order event read and REST agreed after it; `None` when no amend was
+    /// sent because the caps could not hold its larger reading.
     async fn amend_partial(
         &mut self,
         p: &Phase,
         cid: ClientOrderId,
         filled: Lots,
-    ) -> (String, bool) {
+    ) -> (String, Option<bool>) {
         let step = "fill-partial";
         let side = self.t().side;
         let away = match self.priced(side, 0).await {
@@ -2138,7 +2219,7 @@ impl Run {
                     .push(format!("the amend was not priced: {e}"));
                 return (
                     "not exercised: the amend could not be priced".to_owned(),
-                    false,
+                    Some(false),
                 );
             }
         };
@@ -2148,20 +2229,23 @@ impl Run {
             .registry()
             .get(cid)
             .map_or(Lots::ZERO, |r| r.qty());
-        // Read as the remainder, the size sent would rest whole on top of what filled: sent
-        // only when that still fits the resting cap and the inventory cap.
-        let worst = total.get() + filled.get();
-        if total > self.resting || worst > self.inventory.get() {
+        // Read as the remainder, the size sent would rest whole on top of the market's
+        // position now (the seed and what filled): sent only when that still fits the resting
+        // cap and the inventory cap (Codex r4289239752).
+        let now = p.link.borrow().registry().inventory(INST).0;
+        let worst = (now + SignedLots::of(side_of(side), total).0).unsigned_abs();
+        if total > self.resting || worst > self.inventory.get().unsigned_abs() {
             return (
                 format!(
                     "not exercised: read as the remainder, the amend could rest {} lots on top \
-                     of {} filled, past the caps ({} resting, {} inventory)",
+                     of a position of {now} lots ({} of them filled by P1), past the caps ({} \
+                     resting, {} inventory)",
                     total.get(),
                     filled.get(),
                     self.resting.get(),
                     self.inventory.get()
                 ),
-                true,
+                None,
             );
         }
         let built = {
@@ -2183,7 +2267,10 @@ impl Run {
                     .step(step)
                     .notes
                     .push(format!("the amend was not built or submitted: {e}"));
-                return ("not exercised: the amend was not sent".to_owned(), false);
+                return (
+                    "not exercised: the amend was not sent".to_owned(),
+                    Some(false),
+                );
             }
         };
         let (tick, lot) = (self.t().tick, self.t().step);
@@ -2202,19 +2289,17 @@ impl Run {
         if !matches!(answer, Some(SubmitOutcome::Accepted { .. })) {
             return (
                 format!("not exercised: the amend came back {answer:?}"),
-                false,
+                Some(false),
             );
         }
-        // The venue's order event after the amend: a new statement of the order's total.
+        // The venue's order event that confirms the amend: a new statement of the order at the
+        // amended price. An event that ends the order at its old price says nothing of
+        // order.modify (Codex r4289239759).
         let tracker = Rc::clone(&self.tracker);
         let stated = p
-            .wait(|l| {
-                let moved = l
-                    .registry()
-                    .get(cid)
-                    .is_some_and(|r| !r.amend_unconfirmed() || r.state().is_terminal());
+            .wait(|_| {
                 let now = tracker.borrow().stated(cid)?;
-                (moved && now.0 > before).then_some((now.1, now.2))
+                (now.0 > before && now.3 == Some(away)).then_some((now.1, now.2))
             })
             .await;
         self.sent(p, step, "amend", rpc, 1);
@@ -2232,9 +2317,11 @@ impl Run {
             Some((None, _)) => {
                 "not read: the order event after the amend stated no size".to_owned()
             }
-            None => "not read: no order event after the amend within the step timeout".to_owned(),
+            None => {
+                "not read: no order event at the amended price within the step timeout".to_owned()
+            }
         };
-        (reading, agreed && stated.is_some())
+        (reading, Some(agreed && stated.is_some()))
     }
 
     /// Flattens what this step filled: reduce-only IOCs on the other side, each at the level of
