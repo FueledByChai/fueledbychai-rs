@@ -24,7 +24,9 @@
 //!
 //! After every step, [`Phase::compare`] reads GET /orders and GET /positions until they agree
 //! with what the order stream showed or `--rest-wait` passes, and a new order's
-//! GET /orders-history?client_id= until it lists it. Every state the registry holds each order
+//! GET /orders-history?client_id= until it lists it. A placement waits, by its order events, for
+//! its final phase (0092) before its step goes on; a GET /orders answer naming a further page is
+//! never agreement; the IOC step passes only with its history's cancel reason. Every state the registry holds each order
 //! in after each event is traced ([`Tap`]). The run's journal is written under the evidence
 //! directory and its scrubbed slice becomes the fixtures (`evidence.rs`).
 
@@ -36,9 +38,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fbc_core::{
-    AccountKey, Channel, CidMatch, CidMint, ClientIdFormat, ClientOrderId, ConnKey, ConnState,
-    Envelope, ExecEvent, HttpFailure, Lots, MarketLease, NewOrder, NonceBlock, NonceScope,
-    NonceSource, OpKind, OrderKind, Secrets, Side, SignedLots, SpecTable, SubmitHandle,
+    AccountKey, AckLevel, Channel, CidMatch, CidMint, ClientIdFormat, ClientOrderId, ConnKey,
+    ConnState, Envelope, ExecEvent, HttpFailure, Lots, MarketLease, NewOrder, NonceBlock,
+    NonceScope, NonceSource, OpKind, OrderKind, Secrets, Side, SignedLots, SpecTable, SubmitHandle,
     SubmitOutcome, Ticks, Tif, TrafficClass, VenueFactory, VenueOrderSnapshot, encode_cid,
 };
 use fbc_journal::{
@@ -642,6 +644,11 @@ struct Run {
     limiter: RateLimiter,
 }
 
+/// Why a placement accepted provisionally failed its step: no order event gave its final
+/// phase in time.
+const NO_FINAL: &str =
+    "the placement's final phase (decision 0092) did not come within the step timeout";
+
 /// One phase's session, registry and link (module documentation).
 struct Phase {
     link: Rc<RefCell<Link>>,
@@ -715,6 +722,32 @@ impl Phase {
     /// What became of request `rpc` once every item was answered, within the step timeout.
     async fn answered(&self, rpc: fbc_core::RpcId) -> Option<SubmitOutcome> {
         self.wait(|l| l.outcome_of(rpc)).await
+    }
+
+    /// Waits, by the order events, until each placement of request `rpc` (item `i` placing
+    /// `cids[i]`) has its final phase (0092): `Accepted` at `AckLevel::Final` noted for its
+    /// item, or its order ended (refused or withdrawn). The reply's provisional acceptance
+    /// already shows the order open, so its state alone does not say the final phase came (the
+    /// CI failure on c5f8479). True when every one did within the step timeout.
+    async fn settled(&self, rpc: fbc_core::RpcId, cids: &[ClientOrderId]) -> bool {
+        let fin = SubmitOutcome::Accepted {
+            ack: AckLevel::Final,
+        };
+        self.wait(|l| {
+            let done = cids.iter().enumerate().all(|(i, cid)| {
+                let item = u16::try_from(i).ok();
+                l.notes().iter().any(|n| {
+                    matches!(n, Note::Outcome { rpc: r, item: it, outcome, .. }
+                        if *r == rpc && *it == item && *outcome == fin)
+                }) || l
+                    .registry()
+                    .get(*cid)
+                    .is_some_and(|r| r.state().is_terminal())
+            });
+            done.then_some(())
+        })
+        .await
+        .is_some()
     }
 
     /// Waits until every order of `cids` satisfies `done`; true when they did in time.
@@ -1367,9 +1400,14 @@ impl Run {
             ),
         );
         let answer = p.answered(rpc).await;
+        let settled = match answer {
+            Some(SubmitOutcome::Accepted { .. }) => p.settled(rpc, &[cid]).await,
+            _ => false,
+        };
         self.sent(p, step, "place", rpc, 1);
         match answer {
-            Some(SubmitOutcome::Accepted { .. }) => Ok((cid, wire)),
+            Some(SubmitOutcome::Accepted { .. }) if settled => Ok((cid, wire)),
+            Some(SubmitOutcome::Accepted { .. }) => Err(NO_FINAL.to_owned()),
             Some(other) => Err(format!("the place came back {other:?}")),
             None => Err("no answer to the place within the step timeout".to_owned()),
         }
@@ -1458,6 +1496,13 @@ impl Run {
                 let ended = expired;
                 self.finish_step(p, "ioc", &[cid], ended).await;
                 self.history("ioc", cid, &["CLOSED"]).await;
+                // 0092's question is the reason: without it the step is no pass (Codex
+                // r4277685475).
+                let reason =
+                    crate::evidence::ioc_reason(self.ev.step("ioc").histories.last()).map(|_| ());
+                if let Err(why) = reason {
+                    self.fail("ioc", why);
+                }
             }
             // An IOC rests on nothing: one refused or unanswered is recorded, and the run goes
             // on (the registry's caps count an unanswered one until it is resolved).
@@ -1806,6 +1851,11 @@ impl Run {
         self.sent(p, "batch", "batch", rpc, 2);
         if !matches!(answer, Some(SubmitOutcome::Accepted { .. })) {
             self.fail("batch", format!("the batch came back {answer:?}"));
+            return None;
+        }
+        if !p.settled(rpc, &cids).await {
+            self.sent(p, "batch", "batch", rpc, 2);
+            self.fail("batch", NO_FINAL);
             return None;
         }
         let rest = p.until(&cids, resting_or_ended).await;
@@ -2384,6 +2434,16 @@ impl Run {
                                 })
                                 .collect();
                             mismatches.extend(order_mismatches(expected, &on_market));
+                            // Only the first page is read: a further one could list an order
+                            // the stream ended, so a cursor is never agreement (Codex
+                            // r4277685465; a dedicated testnet account holds a few orders).
+                            if further_page(body) {
+                                mismatches.push(
+                                    "GET /orders answered a further page (a non-null next \
+                                     cursor) the program does not read: no agreement"
+                                        .to_owned(),
+                                );
+                            }
                             if empty && !on_market.is_empty() {
                                 mismatches.push(format!(
                                     "{} orders still listed on the market",
@@ -2817,6 +2877,15 @@ fn top_keys(body: &[u8]) -> Vec<String> {
                 .map(|m| m.keys().filter(|k| *k != "results").cloned().collect())
         })
         .unwrap_or_default()
+}
+
+/// Whether a list answer names a further page: a non-null `next` cursor (Paradex's
+/// pagination key).
+fn further_page(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("next").cloned())
+        .is_some_and(|next| !next.is_null() && next != Value::String(String::new()))
 }
 
 /// `text` as a file name's part.
