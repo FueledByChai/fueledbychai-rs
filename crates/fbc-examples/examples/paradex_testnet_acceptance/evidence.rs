@@ -101,10 +101,13 @@ pub struct Comparison {
     pub errors: Vec<String>,
     /// What was sent since the comparison before it (the per-IP limit check, design §13.3):
     /// this program's own REST requests (its reads, its logins and the order-book reads), the
-    /// WebSocket order methods, and the connections opened (each also makes a login and two
-    /// resync reads, and a login every refresh interval while it stays open).
+    /// WebSocket order methods, the HTTP requests the order sessions asked for (their logins,
+    /// resync reads and token refreshes, as their journal records them) and how many of those
+    /// were never sent, and the connections the sessions opened.
     pub rest_since: u64,
     pub ws_since: u64,
+    pub session_rest_since: u64,
+    pub session_not_sent_since: u64,
     pub connections_since: u64,
     /// Whether any order was compared: a disconnect's comparison is of the position only (the
     /// stream saw nothing after the socket ended), and is left out of question (a).
@@ -136,9 +139,14 @@ pub struct Disconnect {
     /// Whether GET /orders stopped listing the order within the wait (and its history shows
     /// it cancelled, nothing filled), and after how long.
     pub cancelled: bool,
-    /// Whether the last GET /orders answer read after the disconnect listed it: false when it
-    /// was gone, or no answer was read (then nothing was measured).
+    /// Whether the last GET /orders read after the disconnect answered and listed it: false
+    /// when it was gone, or the last read failed or none answered (then nothing was measured).
     pub still_listed: bool,
+    /// When, from the socket's end, the last GET /orders answer that listed it was read.
+    pub last_listed_ms: Option<u128>,
+    /// Every GET /orders read of the wait, in order: when from the socket's end, and what it
+    /// answered (listed, gone, or why it failed).
+    pub reads: Vec<String>,
     pub after_ms: Option<u128>,
     pub waited_s: u64,
     /// What the order's history said then.
@@ -196,6 +204,9 @@ pub struct Evidence {
     pub withheld: Vec<String>,
     /// A required output that could not be written (the journal, the fixtures): the run fails.
     pub artifact_errors: Vec<String>,
+    /// The fill events the sessions' streams carried: with none, every position comparison
+    /// checked GET /positions against the position the resync seeded from REST.
+    pub fills: u64,
 }
 
 impl Evidence {
@@ -576,13 +587,16 @@ fn ms(lag: Option<u128>) -> String {
 /// `(question, answer)`.
 pub fn answers(ev: &Evidence) -> Vec<(String, String)> {
     let comparisons: Vec<&Comparison> = ev.steps.iter().flat_map(|s| &s.comparisons).collect();
-    let histories: Vec<&History> = ev
+    let histories: Vec<(&History, bool)> = ev
         .steps
         .iter()
         .flat_map(|s| {
-            s.histories
-                .iter()
-                .chain(s.disconnect.iter().flat_map(|d| &d.history))
+            s.histories.iter().map(|h| (h, false)).chain(
+                s.disconnect
+                    .iter()
+                    .flat_map(|d| &d.history)
+                    .map(|h| (h, true)),
+            )
         })
         .collect();
     let of_orders: Vec<&&Comparison> = comparisons.iter().filter(|c| c.orders_compared).collect();
@@ -592,8 +606,19 @@ pub fn answers(ev: &Evidence) -> Vec<(String, String)> {
         .filter(|c| c.first_read_orders_agreed)
         .count();
     // REST's lag behind the stream: of the comparisons of orders (a disconnect's position-only
-    // comparison has none, [`Comparison::lag_ms`]).
+    // comparison has none, [`Comparison::lag_ms`]). A comparison that never agreed bounds
+    // nothing: no "at most" is given then (Codex r4244249048).
     let max_lag = of_orders.iter().filter_map(|c| c.lag_ms).max();
+    let unagreed = of_orders.iter().filter(|c| c.lag_ms.is_none()).count();
+    let lag = if unagreed == 0 {
+        format!("at most {}", ms(max_lag))
+    } else {
+        format!(
+            "not established: {unagreed} of {} comparisons of orders never agreed within              --rest-wait (the largest lag of those that did: {})",
+            of_orders.len(),
+            ms(max_lag)
+        )
+    };
     let positions = !comparisons.is_empty() && comparisons.iter().all(|c| c.positions_agreed);
     let sides: Vec<String> = comparisons
         .iter()
@@ -606,17 +631,23 @@ pub fn answers(ev: &Evidence) -> Vec<(String, String)> {
         .collect();
     keys.sort();
     keys.dedup();
+    // A disconnect's history is timed from the socket's end, after the GET /orders wait: its
+    // time holds cancel-on-disconnect's latency and that wait, and is no history lag behind
+    // the stream (Reviewer B, RB8).
     let history_lags: Vec<String> = histories
         .iter()
-        .map(|h| {
+        .map(|(h, disconnect)| {
             format!(
                 "{} {}: {}",
                 h.label,
                 h.wanted,
-                if h.listed {
-                    format!("listed after {}", ms(h.lag_ms))
-                } else {
-                    "never listed so".to_owned()
+                match (h.listed, disconnect) {
+                    (true, false) => format!("listed after {}", ms(h.lag_ms)),
+                    (true, true) => format!(
+                        "listed {} after the socket ended (cancel-on-disconnect latency and                          the GET /orders wait included: not history lag)",
+                        ms(h.lag_ms)
+                    ),
+                    (false, _) => "never listed so".to_owned(),
                 }
             )
         })
@@ -673,13 +704,13 @@ pub fn answers(ev: &Evidence) -> Vec<(String, String)> {
                     } else if d.still_listed {
                         (
                             "the order was NOT cancelled",
-                            "still listed it",
-                            format!("{} s", d.waited_s),
+                            "still listed it at its last answer of the wait, read",
+                            ms(d.last_listed_ms),
                         )
                     } else {
                         (
-                            "not measured: no GET /orders answer was read after the disconnect",
-                            "answered nothing",
+                            "not measured: the last GET /orders read of the wait did not answer",
+                            "gave no last answer",
                             format!("{} s", d.waited_s),
                         )
                     };
@@ -748,8 +779,14 @@ pub fn answers(ev: &Evidence) -> Vec<(String, String)> {
             };
             format!(
                 "{}: {headers} (sent since the comparison before: {} REST requests of this \
-                 program's, {} WebSocket order methods, {} connections opened)",
-                c.after, c.rest_since, c.ws_since, c.connections_since
+                 program's, {} REST requests the order sessions asked for ({} of them never \
+                 sent), {} WebSocket order methods, {} connections opened)",
+                c.after,
+                c.rest_since,
+                c.session_rest_since,
+                c.session_not_sent_since,
+                c.ws_since,
+                c.connections_since
             )
         })
         .collect();
@@ -765,14 +802,21 @@ pub fn answers(ev: &Evidence) -> Vec<(String, String)> {
         ),
         (
             "(b) REST lag behind the stream".to_owned(),
-            format!("at most {}", ms(max_lag)),
+            lag,
         ),
         (
             "(c) GET /positions matches the fills (signed size, LONG/SHORT, CLOSED at 0)".to_owned(),
             format!(
-                "{}; positions seen: [{}]",
+                "{}; positions seen: [{}]{}",
                 if positions { "yes at every comparison" } else { "NO" },
-                sides.join("; ")
+                sides.join("; "),
+                // Each phase seeds its position from the resync's REST position: with no fill,
+                // REST was compared with REST (Reviewer B, RB9).
+                if ev.fills == 0 {
+                    "; no fill event arrived on the stream, so every comparison checked                      GET /positions against the position the resync seeded from REST: this is                      no evidence that GET /positions follows fills"
+                } else {
+                    ""
+                }
             ),
         ),
         (
@@ -839,10 +883,9 @@ pub fn answers(ev: &Evidence) -> Vec<(String, String)> {
             "design §13.3: does the per-IP limit count WebSocket order methods".to_owned(),
             format!(
                 "judged only from the deployment box: a remaining count that fell by more than \
-                 every REST request sent between two samples (this program's, counted below, \
-                 plus each connection's login and two resync reads and a login every refresh \
-                 interval) counts the WebSocket order methods; the first GET /orders of each \
-                 comparison: {}",
+                 every REST request sent between two samples (this program's and the order \
+                 sessions' logins, resync reads and token refreshes, both counted below) counts \
+                 the WebSocket order methods; the first GET /orders of each comparison: {}",
                 limits.join("; ")
             ),
         ),
@@ -982,13 +1025,14 @@ pub fn markdown(ev: &Evidence) -> String {
         if let Some(d) = &s.disconnect {
             let _ = writeln!(
                 out,
-                "- disconnect: {}; cancelled by Paradex: {} (after {}, waited up to {} s); still listed by the last GET /orders read: {}; still resting at the next resync: {}",
+                "- disconnect: {}; cancelled by Paradex: {} (after {}, waited up to {} s); still listed by the last GET /orders read: {}; still resting at the next resync: {}; GET /orders reads from the socket's end: {}",
                 d.how,
                 yn(d.cancelled),
                 ms(d.after_ms),
                 d.waited_s,
                 yn(d.still_listed),
-                d.resting_at_reconnect.map_or("-", yn)
+                d.resting_at_reconnect.map_or("-", yn),
+                d.reads.join("; ")
             );
         }
         for n in &s.notes {
@@ -1062,6 +1106,8 @@ pub fn to_json(ev: &Evidence) -> Value {
             "rate_limit_headers": c.limits.iter().map(|(k, v)| json!({"name": k, "value": v})).collect::<Vec<_>>(),
             "errors": c.errors,
             "rest_requests_since": c.rest_since,
+            "session_rest_requests_since": c.session_rest_since,
+            "session_rest_not_sent_since": c.session_not_sent_since,
             "ws_order_methods_since": c.ws_since,
             "connections_since": c.connections_since,
             "orders_compared": c.orders_compared,
@@ -1088,6 +1134,7 @@ pub fn to_json(ev: &Evidence) -> Value {
                 "histories": s.histories.iter().map(history).collect::<Vec<_>>(),
                 "disconnect": s.disconnect.as_ref().map(|d| json!({
                     "how": d.how, "cancelled": d.cancelled, "still_listed": d.still_listed, "after_ms": d.after_ms.map(|v| v as u64),
+                    "last_listed_ms": d.last_listed_ms.map(|v| v as u64), "reads": d.reads,
                     "waited_s": d.waited_s, "history": d.history.as_ref().map(history),
                     "resting_at_reconnect": d.resting_at_reconnect,
                 })),
@@ -1112,9 +1159,64 @@ pub fn to_json(ev: &Evidence) -> Value {
             "request_id": f.request_id, "request_message": f.request_message,
         })).collect::<Vec<_>>(),
         "notes": ev.notes,
+        "fill_events": ev.fills,
         "fixtures_withheld": ev.withheld,
         "outputs_not_written": ev.artifact_errors,
     })
+}
+
+/// The texts of `report.md` and `evidence.json`, each through the privacy check's patterns
+/// ([`privacy_hits`]) before it is written: notes and errors reach both, and the owner commits
+/// the report (Reviewer B, RB4). A file they find something in is withheld, a line naming what
+/// they found (never the value) written in its place, and the run fails
+/// ([`Evidence::artifact_errors`]).
+pub fn outputs(ev: &mut Evidence) -> Result<(String, String), String> {
+    let json_text = |ev: &Evidence| serde_json::to_string_pretty(&to_json(ev));
+    let found = |name: &str, text: &str| {
+        let hits = privacy_hits(text);
+        (!hits.is_empty()).then(|| {
+            format!(
+                "{name} held what the privacy check refuses ({}): withheld, a note written in \
+                 its place",
+                hits.join(", ")
+            )
+        })
+    };
+    let report = markdown(ev);
+    let json = json_text(ev).map_err(|e| e.to_string())?;
+    let refused: Vec<String> = [("report.md", &report), ("evidence.json", &json)]
+        .into_iter()
+        .filter_map(|(name, text)| found(name, text))
+        .collect();
+    if refused.is_empty() {
+        return Ok((report, json));
+    }
+    ev.artifact_errors.extend(refused.iter().cloned());
+    // Written again with the refusal in them; a file that still holds a hit is withheld.
+    let report = markdown(ev);
+    let json = json_text(ev).map_err(|e| e.to_string())?;
+    let withheld = |name: &str| {
+        format!(
+            "withheld: the privacy check's patterns found what may be a credential or an \
+             account value in {name}; nothing of it was written, and the run failed ({})",
+            refused.join("; ")
+        )
+    };
+    let report = if privacy_hits(&report).is_empty() {
+        report
+    } else {
+        format!(
+            "# Paradex testnet acceptance (FBC-8xr)\n\n{}\n",
+            withheld("report.md")
+        )
+    };
+    let json = if privacy_hits(&json).is_empty() {
+        json
+    } else {
+        serde_json::to_string_pretty(&json!({ "withheld": withheld("evidence.json") }))
+            .map_err(|e| e.to_string())?
+    };
+    Ok((report, json))
 }
 
 /// The UTC date and time of `secs` since the epoch, `YYYY-MM-DD HH:MM:SSZ`.

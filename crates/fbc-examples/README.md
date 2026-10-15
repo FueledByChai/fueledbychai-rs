@@ -64,12 +64,18 @@ resting.
 
 The exit status is 0 only when every step passed. A cancel-on-disconnect step passes once it
 has been measured, whatever Paradex did: the report records whether the order was cancelled.
-It is measured only when a GET /orders answer read after the disconnect showed the order gone
-or still listed. If none answered within `--cod-wait`, the step fails as not measured.
+It is measured only when a GET /orders answer read after the disconnect showed the order gone,
+or the last read of the wait answered and still listed it. Every read of the wait is recorded.
+If none answered within `--cod-wait`, or a read after a listing failed, the step fails as not
+measured: an early listing never stands for the whole wait.
 
 The evidence directory holds:
 
-- `report.md`: the answers to FBC-2f7w's questions (a) to (e); what cancel-on-disconnect did on
+- `report.md`: the answers to FBC-2f7w's questions (a) to (e) (with three limits the report
+  states: (b) gives no bound when any comparison never agreed; (c) is no evidence about fills
+  when no fill event arrived, since each phase seeds its position from REST; and (e)'s two
+  disconnect histories are timed from the socket's end, so they include cancel-on-disconnect's
+  latency and the GET /orders wait); what cancel-on-disconnect did on
   a dropped socket and on a graceful close (FBC-gkdz); the IOC's cancel reason (decision 0092);
   request_info persistence and the requestId echo (FBC-g3bw); and the items the run does not
   exercise. For each step it then gives what was sent, every outcome, each order's states in the
@@ -80,8 +86,10 @@ The evidence directory holds:
 - `fixtures/`: the scrubbed slice of the journal, with its README. Commit it as
   `fixtures/paradex/exec-recorded/`, together with `report.md`, in FBC-8xr's PR. Each file
   passed the privacy check's patterns before it was written, and the repository's
-  `scripts/privacy-check.sh` then scanned every file of the directory. Run it again after
-  copying.
+  `scripts/privacy-check.sh` then scanned every file of the directory. `report.md` and
+  `evidence.json` pass the same patterns before they are written: one they find something in is
+  withheld, a note naming what was found written in its place, and the run fails. Run the
+  check again after copying.
 
 ### Run it from the deployment box (design §13.3, the per-IP limit check)
 
@@ -96,18 +104,19 @@ The report's last answer lists, for each comparison, the rate-limit headers Para
 its first GET /orders. Beside them it lists what was sent since the comparison before:
 
 - this program's own REST requests: its reads, its logins and the order-book reads;
+- the REST requests the order sessions asked for (each login, resync read and token refresh),
+  counted from what their journal records them sending, and how many of those were never sent
+  (refused by the limiter or failed before a byte was written);
 - the WebSocket order methods: the steps' requests, each connection's cancel-on-disconnect arm,
   the Safety cancels a reconnect sends and the Stop cancels;
-- the connections opened, a session's reconnects included, and each login refused. Each
-  connection also makes a login and two resync reads, and a login every refresh interval (60 s)
-  while it stays open.
+- the connections the sessions opened, reconnects included.
 
 Every request the program sends, its own REST reads and logins and the order-book reads included,
 is charged to the same rate limiter as the order sessions. A read waits for room in that limiter,
 and if no room comes before the read's wait ends, it fails without being sent.
 
 The per-IP limit covers WebSocket order methods only if the remaining count fell by more than
-every one of those REST requests. If it fell by no more than them, the run says nothing about the
+every one of those REST requests, the program's and the sessions'. If it fell by no more than them, the run says nothing about the
 WebSocket methods. If Paradex returns no such header, the run says so. In either case the
 question stays open, and the record names what would settle it (for example, a dedicated burst
 of WebSocket methods with no REST request between two reads).

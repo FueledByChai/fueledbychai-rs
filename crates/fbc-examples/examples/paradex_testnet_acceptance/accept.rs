@@ -28,7 +28,7 @@
 //! in after each event is traced ([`Tap`]). The run's journal is written under the evidence
 //! directory and its scrubbed slice becomes the fixtures (`evidence.rs`).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -37,11 +37,14 @@ use std::time::{Duration, Instant};
 
 use fbc_core::{
     AccountKey, Channel, CidMatch, CidMint, ClientIdFormat, ClientOrderId, ConnKey, ConnState,
-    Envelope, ExecEvent, Lots, MarketLease, NewOrder, NonceBlock, NonceScope, NonceSource, OpKind,
-    OrderKind, Secrets, Side, SignedLots, SpecTable, SubmitHandle, SubmitOutcome, Ticks, Tif,
-    VenueFactory, VenueOrderSnapshot, encode_cid,
+    Envelope, ExecEvent, HttpFailure, Lots, MarketLease, NewOrder, NonceBlock, NonceScope,
+    NonceSource, OpKind, OrderKind, Secrets, Side, SignedLots, SpecTable, SubmitHandle,
+    SubmitOutcome, Ticks, Tif, TrafficClass, VenueFactory, VenueOrderSnapshot, encode_cid,
 };
-use fbc_journal::{JournalWriter, NonceSourceId, RedactionKey, SinkConfig, journal_queue};
+use fbc_journal::{
+    ControlEvent, JournalSink, JournalWriter, NonceSourceId, Record, RecordRef, Recorded,
+    RedactionKey, SinkConfig, journal_queue,
+};
 use fbc_oms::{
     CancelChoice, CancelEverything, FillLedger, LadderConfig, LeaseKeys, Leases, LedgerConfig,
     MarketCapsConfig, OrdState, PermittedCommand, PreTradeCaps, Registry, TestnetRun,
@@ -214,6 +217,10 @@ pub async fn run(
     let writing = drain
         .spawn(writer)
         .map_err(|e| format!("the journal: {e}"))?;
+    // Counted as the sessions offer their records: what they asked for over HTTP and the
+    // connections they opened, for the per-IP check (Codex r4244249042).
+    let sink = JournalCount::new(sink);
+    let sessions_sent = sink.counts();
     let journal = Journal::new(Rc::new(RefCell::new(sink)));
 
     let started = evidence::utc(wall_secs());
@@ -245,8 +252,9 @@ pub async fn run(
         fmt: order_caps_fmt(),
         undecoded: false,
         book_reads: 1,
-        sampled: (0, 0, 0),
-        ended_counts: (0, 0),
+        sampled: Sample::default(),
+        ended_ws: 0,
+        sessions_sent,
         live: None,
         troubled: false,
         clock: IngestClock::new(),
@@ -322,10 +330,9 @@ pub async fn run(
     }
     let report = dir.join("report.md");
     let json = dir.join("evidence.json");
-    fs::write(&report, evidence::markdown(&ev))
-        .map_err(|e| format!("{}: {e}", report.display()))?;
-    let text = serde_json::to_string_pretty(&evidence::to_json(&ev)).map_err(|e| e.to_string())?;
-    fs::write(&json, text).map_err(|e| format!("{}: {e}", json.display()))?;
+    let (report_text, json_text) = evidence::outputs(&mut ev)?;
+    fs::write(&report, report_text).map_err(|e| format!("{}: {e}", report.display()))?;
+    fs::write(&json, json_text).map_err(|e| format!("{}: {e}", json.display()))?;
     let ok = ev.ok();
     lines.line(format_args!(
         "DONE {} report {} evidence {} fixtures {} ({} files)",
@@ -465,6 +472,10 @@ struct Tracked {
     vid: Option<String>,
     /// Each state, with when the stream showed it.
     states: Vec<(String, Instant)>,
+    /// Its total as the registry last held it, in the market's units, and whether the stream
+    /// ended it.
+    qty: Option<Decimal>,
+    ended: bool,
 }
 
 /// The orders the run follows, sampled after every event the session hands the link.
@@ -487,6 +498,8 @@ impl Tracker {
                 |p| (Decimal::from(p.0) * tick).normalize().to_string(),
             );
             let qty = (Decimal::from(rec.qty().get()) * step).normalize();
+            o.qty = Some(qty);
+            o.ended = rec.state().is_terminal();
             let state = format!("{:?} @{px} x {qty}", rec.state());
             if o.states.last().is_none_or(|(s, _)| *s != state) {
                 o.states.push((state, Instant::now()));
@@ -560,8 +573,9 @@ enum PhaseKind {
 enum SocketEnd {
     Drop,
     Close,
-    /// A close whose session did not finish within 5 s: its socket was then dropped.
-    CloseTimedOut,
+    /// A close whose session did not finish cleanly: it ended with an error, or did not finish
+    /// within 5 s and its socket was then dropped.
+    CloseFailed,
 }
 
 /// The order a disconnect should cancel, for [`Run::after_disconnect`].
@@ -574,6 +588,10 @@ struct CodOrder {
     at: Instant,
     /// The market's position in lots as the phase's stream last showed it.
     lots: i64,
+    /// The order's total as the registry last held it, in the market's units.
+    qty: Option<Decimal>,
+    /// Why a close was not clean ([`SocketEnd::CloseFailed`]).
+    close_why: Option<String>,
 }
 
 /// The run's state across its phases.
@@ -602,15 +620,17 @@ struct Run {
     fmt: ClientIdFormat,
     /// Whether a session could not decode a frame or answer: the run cannot say it saw all.
     undecoded: bool,
-    /// The order-book reads made, the connections opened, and what had been sent when the
-    /// last comparison was made (REST requests, WebSocket order methods, connections): the
-    /// per-IP limit check's counts.
+    /// The order-book reads made, and what had been sent when the last comparison was made:
+    /// the per-IP limit check's counts.
     book_reads: u64,
-    sampled: (u64, u64, u64),
-    /// The WebSocket order methods and connections of the phases that ended, and the running
-    /// phase's link ([`Run::session_totals`]).
-    ended_counts: (u64, u64),
+    sampled: Sample,
+    /// The WebSocket order methods of the phases that ended, and the running phase's link
+    /// ([`Run::session_ws`]).
+    ended_ws: u64,
     live: Option<Rc<RefCell<Link>>>,
+    /// What the sessions asked for over HTTP and the connections they opened, as their journal
+    /// records them ([`JournalCount`]).
+    sessions_sent: Rc<Cell<SessionsSent>>,
     /// Whether a phase's link noted something that leaves the order truth incomplete
     /// ([`link_problems`]).
     troubled: bool,
@@ -765,6 +785,7 @@ impl Run {
             restored: 0,
         };
         let mut control = Some(control);
+        let mut close_why = None;
         let (end, ended_first) = {
             let running = session.run();
             tokio::pin!(running);
@@ -784,12 +805,16 @@ impl Run {
             let mut end = end;
             if end.0 == SocketEnd::Close && ended_first.is_none() {
                 // A graceful close: the control's drop sends the close frame. A session that
-                // does not finish in time has its socket dropped below, so the close is not
-                // recorded as a clean one.
+                // ends with an error, or does not finish in time (its socket is then dropped
+                // below), is not recorded as a clean close (Codex r4244249045).
                 drop(control.take());
-                let closed = tokio::time::timeout(Duration::from_secs(5), &mut running).await;
-                if closed.is_err() {
-                    end.0 = SocketEnd::CloseTimedOut;
+                let closed = tokio::time::timeout(Duration::from_secs(5), &mut running)
+                    .await
+                    .ok()
+                    .map(|r| r.map_err(|e| e.to_string()));
+                if let Err(why) = graceful_end(closed) {
+                    end.0 = SocketEnd::CloseFailed;
+                    close_why = Some(why);
                 }
             }
             // A drop: the run's future, and with it the socket, is dropped here with no close
@@ -798,12 +823,17 @@ impl Run {
         };
         let at = Instant::now();
         let lots = link.borrow().registry().inventory(INST).0;
+        // Every fill event the stream carried: with none, (c) compared REST with the seed.
+        self.ev.fills += link
+            .borrow()
+            .notes()
+            .iter()
+            .filter(|n| matches!(n, Note::Fill { .. }))
+            .count() as u64;
         let undecoded = session.counters().decode_errors;
         drop(session);
         drop(control);
-        let (ws, conns) = session_counts(link.borrow().notes());
-        self.ended_counts.0 += ws;
-        self.ended_counts.1 += conns;
+        self.ended_ws += session_counts(link.borrow().notes());
         self.live = None;
         // What the link noted that leaves the run's order truth incomplete: the steps may all
         // have passed, but the run cannot claim a clean result (as testnet_trade fails on
@@ -849,13 +879,16 @@ impl Run {
             );
             s.pass = false;
         }
+        let qty = |cid| self.tracker.borrow().get(cid).and_then(|o| o.qty);
         end.1.map(|(label, cid, wire)| CodOrder {
+            qty: qty(cid),
             label,
             cid,
             wire,
             how: end.0,
             at,
             lots,
+            close_why,
         })
     }
 
@@ -1240,6 +1273,8 @@ impl Run {
             phase,
             vid: None,
             states: Vec::new(),
+            qty: None,
+            ended: false,
         });
         wire
     }
@@ -1920,22 +1955,25 @@ impl Run {
     /// gone if cancel-on-disconnect worked; the position the fills imply).
     async fn after_disconnect(&mut self, step: &str, cod: CodOrder) {
         let how = match cod.how {
-            SocketEnd::Drop => "dropped (no close frame)",
-            SocketEnd::Close => {
-                "graceful close (the session's close frame; fbc-runtime does not yet report \
-                 whether the frame was written, FBC-q40h)"
-            }
-            SocketEnd::CloseTimedOut => {
-                "closed, but the session did not finish within 5 s and its socket was then \
-                 dropped: neither a clean graceful close nor a clean drop"
-            }
+            SocketEnd::Drop => "dropped (no close frame)".to_owned(),
+            SocketEnd::Close => "graceful close (the session's close frame; fbc-runtime does not \
+                                 yet report whether the frame was written, FBC-q40h)"
+                .to_owned(),
+            SocketEnd::CloseFailed => format!(
+                "closed, but the session did not finish cleanly ({}): neither a clean graceful \
+                 close nor a clean drop",
+                cod.close_why.as_deref().unwrap_or("-")
+            ),
         };
         let wait = Duration::from_secs(self.opts.cod_wait_secs);
         let deadline = Instant::now() + wait;
         let mut gone_at = None;
-        // Whether an answer read after the disconnect listed the order: "not cancelled" is
-        // said only of an order seen listed, never of one no answer showed.
+        // Whether the last read of the wait answered and listed the order: "not cancelled" is
+        // said only of an order its last answer listed. A failed read after a listing clears
+        // it, so an early listing never stands for the whole wait (Reviewer B, RB7).
         let mut still_listed = false;
+        let mut last_listed = None::<Instant>;
+        let mut reads = Vec::new();
         let mut errors = Vec::new();
         // Every read is bounded by the wait; one the wait cut short is no error once an answer
         // was read, and the step's error when none was.
@@ -1948,7 +1986,9 @@ impl Run {
                 .rest
                 .get(open_orders_request(&self.t().rest_url), deadline)
                 .await;
+            let from_end = cod.at.elapsed().as_millis();
             if read.is_err() && Instant::now() >= deadline {
+                reads.push(format!("+{from_end} ms: cut short by the wait"));
                 if !still_listed {
                     errors.push(format!(
                         "no GET /orders answered within --cod-wait ({} s): the disconnect was \
@@ -1958,30 +1998,49 @@ impl Run {
                 }
                 break;
             }
-            match read {
-                Ok(answer) if answer.status == 200 => match parse_results(&answer.body) {
-                    Ok(rows) => {
-                        let listed = rows.iter().any(|o| {
-                            o.get("client_id").and_then(Value::as_str) == Some(cod.wire.as_str())
-                        });
-                        if !listed {
-                            gone_at = Some(Instant::now());
-                            still_listed = false;
-                            self.rest_bodies
-                                .push((format!("orders-after-{step}"), answer.body));
-                            break;
+            let failed = match read {
+                Ok(answer) if answer.status == 200 => {
+                    match parse_results(&answer.body, ORDER_ROW) {
+                        Ok(rows) => {
+                            let listed = rows.iter().any(|o| {
+                                o.get("client_id").and_then(Value::as_str)
+                                    == Some(cod.wire.as_str())
+                            });
+                            if !listed {
+                                reads.push(format!("+{from_end} ms: gone"));
+                                gone_at = Some(Instant::now());
+                                still_listed = false;
+                                self.rest_bodies
+                                    .push((format!("orders-after-{step}"), answer.body));
+                                break;
+                            }
+                            reads.push(format!("+{from_end} ms: listed"));
+                            still_listed = true;
+                            last_listed = Some(Instant::now());
+                            None
                         }
-                        still_listed = true;
+                        Err(e) => Some(format!("GET /orders: {e}")),
                     }
-                    Err(e) => errors.push(format!("GET /orders: {e}")),
-                },
-                Ok(answer) => errors.push(format!("GET /orders status {}", answer.status)),
-                Err(e) => errors.push(e),
+                }
+                Ok(answer) => Some(format!("GET /orders status {}", answer.status)),
+                Err(e) => Some(e),
+            };
+            if let Some(why) = failed {
+                reads.push(format!("+{from_end} ms: {why}"));
+                errors.push(why);
+                still_listed = false;
             }
             tokio::time::sleep(POLL).await;
         }
+        if !still_listed && gone_at.is_none() && last_listed.is_some() {
+            errors.push(
+                "GET /orders listed the order, but a later read of the wait failed: whether \
+                 the disconnect cancelled it was not measured"
+                    .to_owned(),
+            );
+        }
         let history = self
-            .history_read(&cod.label, &cod.wire, &["CLOSED"], cod.at, wait)
+            .history_read(&cod.label, &cod.wire, cod.qty, &["CLOSED"], cod.at, wait)
             .await;
         // Gone from GET /orders proves only that it no longer rests: cancelled by the
         // disconnect means its history shows it CLOSED with quantities read and nothing filled.
@@ -2020,11 +2079,12 @@ impl Run {
                      quantities: not judged"
                         .to_owned()
                 } else if !still_listed {
-                    "not measured: no GET /orders answer was read after the disconnect".to_owned()
+                    "not measured: the last GET /orders read of the wait did not answer".to_owned()
                 } else {
                     format!(
-                        "still listed after {} s: NOT cancelled on this disconnect",
-                        wait.as_secs()
+                        "still listed by the wait's last answer, {} ms after the socket ended: \
+                         NOT cancelled on this disconnect",
+                        last_listed.map_or(0, |l| l.duration_since(cod.at).as_millis())
                     )
                 }
             ),
@@ -2038,7 +2098,7 @@ impl Run {
         // went unexplained, every REST read answered, and the position is the fills'.
         let measured = disconnect_measured(cancelled, still_listed, !errors.is_empty(), filled);
         s.pass = measured
-            && cod.how != SocketEnd::CloseTimedOut
+            && cod.how != SocketEnd::CloseFailed
             && !filled
             && c.positions_agreed
             && history.error.is_none();
@@ -2048,15 +2108,17 @@ impl Run {
                 cod.label
             ));
         }
-        if cod.how == SocketEnd::CloseTimedOut {
-            s.notes.push(how.to_owned());
+        if cod.how == SocketEnd::CloseFailed {
+            s.notes.push(how.clone());
         }
         s.notes.extend(errors);
         s.comparisons.push(c);
         s.disconnect = Some(Disconnect {
-            how: how.to_owned(),
+            how,
             cancelled,
             still_listed,
+            last_listed_ms: last_listed.map(|l| l.duration_since(cod.at).as_millis()),
+            reads,
             after_ms: gone_at.map(|g| g.duration_since(cod.at).as_millis()),
             waited_s: wait.as_secs(),
             history: Some(history),
@@ -2068,14 +2130,16 @@ impl Run {
     /// GET /orders-history?client_id= for our order `cid` (step `step`) until it lists the
     /// order with one of the `wanted` statuses, noted on the step.
     async fn history(&mut self, step: &str, cid: ClientOrderId, wanted: &[&str]) {
-        let (label, wire, since) = {
+        let (label, wire, since, qty) = {
             let tr = self.tracker.borrow();
             let Some(o) = tr.get(cid) else { return };
             let since = o.states.last().map_or_else(Instant::now, |(_, at)| *at);
-            (o.label.clone(), o.wire.clone(), since)
+            (o.label.clone(), o.wire.clone(), since, o.qty)
         };
         let wait = Duration::from_secs(self.opts.rest_wait_secs);
-        let h = self.history_read(&label, &wire, wanted, since, wait).await;
+        let h = self
+            .history_read(&label, &wire, qty, wanted, since, wait)
+            .await;
         self.lines.step(
             step,
             format_args!(
@@ -2098,6 +2162,7 @@ impl Run {
         &mut self,
         label: &str,
         wire: &str,
+        qty: Option<Decimal>,
         wanted: &[&str],
         since: Instant,
         wait: Duration,
@@ -2122,36 +2187,44 @@ impl Run {
             }
             h.reads += 1;
             match read {
-                Ok(answer) if answer.status == 200 => match parse_results(&answer.body) {
-                    Ok(rows) => {
-                        h.error = None;
-                        let row = rows
-                            .iter()
-                            .find(|o| o.get("client_id").and_then(Value::as_str) == Some(wire));
-                        if let Some(row) = row {
-                            let text = |k: &str| row.get(k).and_then(Value::as_str);
-                            let status = text("status").unwrap_or("").to_owned();
-                            h.status = Some(status.clone());
-                            h.cancel_reason = text("cancel_reason").map(str::to_owned);
-                            // Filled when what remains is less than its size.
-                            let num = |k: &str| text(k).and_then(|v| v.parse::<Decimal>().ok());
-                            h.filled = match (num("size"), num("remaining_size")) {
-                                (Some(size), Some(left)) => Some(left < size),
-                                _ => None,
-                            };
-                            if wanted.contains(&status.as_str()) {
-                                h.listed = true;
-                                h.lag_ms = Some(since.elapsed().as_millis());
-                                self.rest_bodies.push((
-                                    format!("orders-history-{}", label.replace(' ', "-")),
-                                    answer.body,
-                                ));
-                                return h;
+                Ok(answer) if answer.status == 200 => {
+                    match parse_results(&answer.body, ORDER_ROW) {
+                        Ok(rows) => {
+                            h.error = None;
+                            let row = rows
+                                .iter()
+                                .find(|o| o.get("client_id").and_then(Value::as_str) == Some(wire));
+                            if let Some(row) = row {
+                                let text = |k: &str| row.get(k).and_then(Value::as_str);
+                                let status = text("status").unwrap_or("").to_owned();
+                                h.status = Some(status.clone());
+                                h.cancel_reason = text("cancel_reason").map(str::to_owned);
+                                // Filled when what remains is less than its size; quantities no
+                                // order can have are refused, never read as nothing filled.
+                                let num = |k: &str| text(k).and_then(|v| v.parse::<Decimal>().ok());
+                                match history_filled(num("size"), num("remaining_size"), qty) {
+                                    Ok(filled) => h.filled = Some(filled),
+                                    Err(why) => {
+                                        h.filled = None;
+                                        h.error = Some(why);
+                                        tokio::time::sleep(POLL).await;
+                                        continue;
+                                    }
+                                }
+                                if wanted.contains(&status.as_str()) {
+                                    h.listed = true;
+                                    h.lag_ms = Some(since.elapsed().as_millis());
+                                    self.rest_bodies.push((
+                                        format!("orders-history-{}", label.replace(' ', "-")),
+                                        answer.body,
+                                    ));
+                                    return h;
+                                }
                             }
                         }
+                        Err(e) => h.error = Some(e),
                     }
-                    Err(e) => h.error = Some(e),
-                },
+                }
                 Ok(answer) => h.error = Some(format!("status {}", answer.status)),
                 Err(e) => h.error = Some(e),
             }
@@ -2189,6 +2262,15 @@ impl Run {
                     _ => continue,
                 };
                 expected.push((o.label.clone(), o.wire.clone(), want));
+            }
+            // Every order the stream ended earlier, in this phase or one before it, must stay
+            // absent: one a later answer lists again is a mismatch too (Codex r4244249052).
+            for o in tr
+                .orders
+                .iter()
+                .filter(|o| o.ended && !cids.contains(&o.cid))
+            {
+                expected.push((format!("{} (ended earlier)", o.label), o.wire.clone(), None));
             }
             let lots = link.registry().inventory(INST).0;
             (expected, since.unwrap_or_else(Instant::now), lots)
@@ -2255,13 +2337,18 @@ impl Run {
                 // The per-IP check's sample: everything sent since the last sample, up to and
                 // including this read (and any login it made), is counted against the
                 // rate-limit headers it carries.
-                let rest_now = self.rest.requests() + self.book_reads;
-                let (ws_now, conns_now) = self.session_totals();
-                let (rest_before, ws_before, conns_before) = self.sampled;
-                c.rest_since = rest_now - rest_before;
-                c.ws_since = ws_now - ws_before;
-                c.connections_since = conns_now - conns_before;
-                self.sampled = (rest_now, ws_now, conns_now);
+                let sessions = self.sessions_sent.get();
+                let now = Sample {
+                    rest: self.rest.requests() + self.book_reads,
+                    ws: self.session_ws(),
+                    sessions,
+                };
+                let before = std::mem::replace(&mut self.sampled, now);
+                c.rest_since = now.rest - before.rest;
+                c.ws_since = now.ws - before.ws;
+                c.session_rest_since = now.sessions.asked - before.sessions.asked;
+                c.session_not_sent_since = now.sessions.not_sent - before.sessions.not_sent;
+                c.connections_since = now.sessions.connections - before.sessions.connections;
             }
             let positions = self
                 .rest
@@ -2288,7 +2375,7 @@ impl Run {
                     } else {
                         later_orders = Some(body.clone());
                     }
-                    match parse_results(body) {
+                    match parse_results(body, ORDER_ROW) {
                         Ok(rows) => {
                             let on_market: Vec<&Value> = rows
                                 .iter()
@@ -2323,7 +2410,7 @@ impl Run {
                     } else {
                         later_positions = Some(body.clone());
                     }
-                    match parse_results(body) {
+                    match parse_results(body, POSITION_ROW) {
                         Ok(rows) => {
                             let row = rows.iter().find(|o| {
                                 o.get("market").and_then(Value::as_str) == Some(market.as_str())
@@ -2385,14 +2472,117 @@ impl Run {
         c
     }
 
-    /// The WebSocket order methods the run's sessions wrote so far, and the connections they
-    /// opened ([`session_counts`] of every phase's link).
-    fn session_totals(&self) -> (u64, u64) {
-        let (ws, conns) = self
+    /// The WebSocket order methods the run's sessions wrote so far ([`session_counts`] of
+    /// every phase's link).
+    fn session_ws(&self) -> u64 {
+        let ws = self
             .live
             .as_ref()
-            .map_or((0, 0), |link| session_counts(link.borrow().notes()));
-        (self.ended_counts.0 + ws, self.ended_counts.1 + conns)
+            .map_or(0, |link| session_counts(link.borrow().notes()));
+        self.ended_ws + ws
+    }
+}
+
+/// What had been sent at a per-IP sample: this program's own REST requests (the reader's,
+/// logins included, and the order-book reads), the sessions' WebSocket order methods, and what
+/// the sessions' journal records them sending.
+#[derive(Copy, Clone, Debug, Default)]
+struct Sample {
+    rest: u64,
+    ws: u64,
+    sessions: SessionsSent,
+}
+
+/// What the order sessions sent outside their WebSocket order methods, as their journal records
+/// it: the HTTP requests they `asked` for (each login, resync read and token refresh, whether
+/// or not its socket survived it), the ones of those `not_sent` (refused by the limiter or
+/// failed before a byte was written), and the `connections` they opened.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionsSent {
+    pub asked: u64,
+    pub not_sent: u64,
+    pub connections: u64,
+}
+
+/// A journal sink that counts what the sessions offer it ([`SessionsSent`]) and passes every
+/// record on to `inner`: the runtime journals each HTTP request as it starts and each result as
+/// it comes back, so the count is of what was sent, never of what the link's notes imply.
+pub struct JournalCount<S> {
+    inner: S,
+    counts: Rc<Cell<SessionsSent>>,
+}
+
+impl<S: JournalSink> JournalCount<S> {
+    pub fn new(inner: S) -> JournalCount<S> {
+        JournalCount {
+            inner,
+            counts: Rc::new(Cell::new(SessionsSent::default())),
+        }
+    }
+
+    /// The counts, shared.
+    pub fn counts(&self) -> Rc<Cell<SessionsSent>> {
+        Rc::clone(&self.counts)
+    }
+
+    /// The sink it passes records on to (the tests read it).
+    #[allow(dead_code)]
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
+
+    fn count(&self, record: RecordRef<'_>) {
+        let mut c = self.counts.get();
+        match record {
+            RecordRef::HttpRequest { .. } | RecordRef::Owned(Record::HttpRequest { .. }) => {
+                c.asked += 1;
+            }
+            RecordRef::HttpResult {
+                result: Err(HttpFailure::NotSent),
+                ..
+            }
+            | RecordRef::Owned(Record::HttpResult {
+                result: Err(HttpFailure::NotSent),
+                ..
+            }) => c.not_sent += 1,
+            RecordRef::Owned(Record::Control {
+                ev: ControlEvent::Opened(_),
+                ..
+            }) => c.connections += 1,
+            _ => {}
+        }
+        self.counts.set(c);
+    }
+}
+
+impl<S: JournalSink> JournalSink for JournalCount<S> {
+    fn record(&mut self, class: TrafficClass, now: fbc_core::WallNs, record: &Record) -> Recorded {
+        self.count(RecordRef::Owned(record));
+        self.inner.record(class, now, record)
+    }
+
+    fn record_ref(
+        &mut self,
+        class: TrafficClass,
+        now: fbc_core::WallNs,
+        record: RecordRef<'_>,
+    ) -> Recorded {
+        self.count(record);
+        self.inner.record_ref(class, now, record)
+    }
+
+    fn omit(&mut self, class: TrafficClass, now: fbc_core::WallNs) -> Recorded {
+        self.inner.omit(class, now)
+    }
+}
+
+/// Whether a graceful close was clean: `finished` is the session's result when it finished
+/// within the close's 5 s, `None` when it did not. Why not, when it was not.
+pub fn graceful_end(finished: Option<Result<(), String>>) -> Result<(), String> {
+    match finished {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(format!("the session ended with an error: {e}")),
+        None => Err("the session did not finish within 5 s; its socket was dropped".to_owned()),
     }
 }
 
@@ -2408,14 +2598,13 @@ pub fn disconnect_measured(
     cancelled || (still_listed && !read_errors && !filled)
 }
 
-/// What one session's link `notes` say it sent, for the per-IP check: the WebSocket order
-/// methods (every request of ours the session reported sent: the steps', the Stop cancels and
-/// the Safety cancels at a reconnect; and each connection's own cancel-on-disconnect arm, the
-/// session's request the link notes as not ours, counted once its answer came) and the
-/// connections it opened (each epoch that authenticated, and each whose login was refused:
-/// every one made a login, and every authenticated one its two resync reads).
-pub fn session_counts(notes: &[Note]) -> (u64, u64) {
-    let (mut ours, mut conns) = (0u64, 0u64);
+/// The WebSocket order methods one session's link `notes` say it sent, for the per-IP check:
+/// every request of ours the session reported sent (the steps', the Stop cancels and the
+/// Safety cancels at a reconnect) and each connection's own cancel-on-disconnect arm (the
+/// session's request the link notes as not ours, counted once its answer came). Its HTTP
+/// requests and connections are counted from its journal instead ([`JournalCount`]).
+pub fn session_counts(notes: &[Note]) -> u64 {
+    let mut ours = 0u64;
     let mut arms = std::collections::BTreeSet::new();
     for note in notes {
         match note {
@@ -2425,11 +2614,10 @@ pub fn session_counts(notes: &[Note]) -> (u64, u64) {
             } => {
                 arms.insert(rpc.0);
             }
-            Note::Conn(ConnState::Authenticated) | Note::LoginRefused(_) => conns += 1,
             _ => {}
         }
     }
-    (ours + arms.len() as u64, conns)
+    ours + arms.len() as u64
 }
 
 /// What a phase's link `notes` hold that leaves the run's order truth incomplete: a problem
@@ -2553,14 +2741,71 @@ fn trade_wall_now() -> fbc_core::WallNs {
     fbc_core::WallNs(i64::try_from(ns).unwrap_or(i64::MAX))
 }
 
-/// The `results` of a Paradex list answer, or why the answer holds none: a 200 answer that is
-/// not JSON, or has no `results` list, is no empty snapshot.
-pub fn parse_results(body: &[u8]) -> Result<Vec<Value>, String> {
+/// The fields every row of GET /orders and GET /orders-history must hold as strings.
+pub const ORDER_ROW: &[&str] = &[
+    "client_id",
+    "market",
+    "status",
+    "price",
+    "size",
+    "remaining_size",
+];
+/// The fields every row of GET /positions must hold as strings.
+pub const POSITION_ROW: &[&str] = &["market", "side", "size", "status"];
+
+/// The `results` of a Paradex list answer, each row an object holding every field of `row`
+/// as a string, or why the answer holds no snapshot: a 200 answer that is not JSON, has no
+/// `results` list, or has a row of another shape (`{}` is no absent order and no flat
+/// position, Codex r4244249050) is a failed read.
+pub fn parse_results(body: &[u8], row: &[&str]) -> Result<Vec<Value>, String> {
     let v: Value = serde_json::from_slice(body).map_err(|_| "the answer is not JSON".to_owned())?;
-    v.get("results")
+    let rows = v
+        .get("results")
         .and_then(Value::as_array)
         .cloned()
-        .ok_or_else(|| "the answer has no results list".to_owned())
+        .ok_or_else(|| "the answer has no results list".to_owned())?;
+    for (i, r) in rows.iter().enumerate() {
+        let missing: Vec<&str> = row
+            .iter()
+            .copied()
+            .filter(|k| r.get(*k).and_then(Value::as_str).is_none())
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "row {i} of the results has no {} as a string: a malformed answer",
+                missing.join(", ")
+            ));
+        }
+    }
+    Ok(rows)
+}
+
+/// Whether an order's history row shows part of it filled, from its `size` and
+/// `remaining_size`, or why the row is refused: quantities no order can have (a size not
+/// above zero, a remainder below zero or above the size, or a size other than the order's own
+/// total `qty`, when known) say nothing of what filled (Codex r4244249043).
+pub fn history_filled(
+    size: Option<Decimal>,
+    left: Option<Decimal>,
+    qty: Option<Decimal>,
+) -> Result<bool, String> {
+    let (Some(size), Some(left)) = (size, left) else {
+        return Err("the history row's size or remaining_size is not a decimal".to_owned());
+    };
+    if size <= Decimal::ZERO || left < Decimal::ZERO || left > size {
+        return Err(format!(
+            "the history row's quantities are impossible: size {size}, remaining_size {left}"
+        ));
+    }
+    if let Some(qty) = qty
+        && qty != size
+    {
+        return Err(format!(
+            "the history row's size {size} is not the order's total {}",
+            qty.normalize()
+        ));
+    }
+    Ok(left < size)
 }
 
 /// A list answer's top-level keys besides `results`.
