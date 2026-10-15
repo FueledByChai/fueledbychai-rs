@@ -9,6 +9,7 @@ program's flags.
 | --- | --- |
 | `md_watch` | Prints live Paradex and Binance USD-M touches and books through fbc-runtime. No orders, no credentials. |
 | `testnet_trade` | Paradex TESTNET only: places one post-only order well away from the touch through fbc-oms, cancels it, and Stops (FBC-x69b). |
+| `testnet_quote` | Paradex TESTNET only, a plumbing test, not a strategy: keeps one post-only order a side a fixed offset behind the touch through fbc-oms's execution planner, cancel-and-replace only, until Ctrl-C, `--duration` or `--cycles`, then Stops (FBC-elg7). |
 | `paradex_testnet_acceptance` | Paradex TESTNET only: FBC-8xr's acceptance run. It writes the evidence report that the snapshot-trust decision (FBC-2f7w) cites (FBC-xji8). |
 
 ## paradex_testnet_acceptance

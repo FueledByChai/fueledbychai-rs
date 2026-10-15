@@ -22,7 +22,8 @@ mod accept;
 #[allow(dead_code)]
 #[path = "../examples/paradex_testnet_acceptance/accept_args.rs"]
 mod accept_args;
-#[allow(dead_code)]
+// Its re-exports of the shared guard are for the samples' binaries; this test uses a part.
+#[allow(dead_code, unused_imports)]
 #[path = "../examples/testnet_trade/args.rs"]
 mod args;
 #[allow(dead_code)]
@@ -33,8 +34,11 @@ mod auth_rest;
 #[path = "../examples/paradex_testnet_acceptance/evidence.rs"]
 mod evidence;
 #[allow(dead_code)]
-#[path = "../examples/testnet_trade/link.rs"]
+#[path = "../src/link.rs"]
 mod link;
+#[allow(dead_code)]
+#[path = "../src/testnet.rs"]
+mod testnet;
 #[allow(dead_code)]
 #[path = "../examples/testnet_trade/trade.rs"]
 mod trade;
@@ -639,7 +643,7 @@ fn options(stub: &StubServer, evidence: &Path, lease: &Path, cod_wait: u64) -> A
 /// Runs the program against `opts`, bounded at 120 s: its outcome and what it printed.
 async fn run_against(opts: &AcceptOptions) -> (accept::Outcome, String) {
     let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
-    let out: trade::Out = buf.clone();
+    let out: testnet::Out = buf.clone();
     let creds = secrets;
     let run = accept::run(opts, None, &creds, out);
     let ran = tokio::time::timeout(Duration::from_secs(120), run).await;
@@ -1300,7 +1304,7 @@ async fn a_mainnet_url_or_chain_id_is_refused_before_any_connection() {
     let creds = secrets;
     let refused = |opts: AcceptOptions, chain: Option<&'static str>| {
         let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
-        let out: trade::Out = buf.clone();
+        let out: testnet::Out = buf.clone();
         async move { accept::run(&opts, chain, &creds, out).await.err() }
     };
     let mut mainnet = options(&stub, &evidence_dir.join("a"), &lease_dir, 10);
@@ -1688,6 +1692,32 @@ fn a_session_counts_each_order_method_and_its_arm() {
         },
     ];
     assert_eq!(accept::session_counts(&notes), 5);
+}
+
+#[test]
+fn an_asynchronous_reject_the_shared_link_notes_is_a_link_problem_of_the_run() {
+    // FBC-elg7 moved the glue to src/link.rs, which notes an asynchronous reject for its driver
+    // to judge (Note::AsyncReject) instead of as a problem: this run still counts every one.
+    use fbc_core::{Namespace, OpKind, OrderRef, Reject, RejectKind};
+    use link::Note;
+    let caps = fbc_venue_paradex::factory::caps();
+    let vid = fbc_core::dispatch(&caps, Namespace::new(1), |s| s.venue_order_id("V-9")).unwrap();
+    let reject = Reject {
+        kind: RejectKind::PostOnlyWouldCross,
+        venue_code: Some("POST_ONLY_WOULD_CROSS".into()),
+        raw: "POST_ONLY_WOULD_CROSS".into(),
+    };
+    let notes = vec![Note::AsyncReject {
+        target: OrderRef::Venue(vid),
+        op: OpKind::Place,
+        reject,
+    }];
+    let problems = accept::link_problems(&notes);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0].starts_with("the link noted a problem: asynchronous reject of a Place"),
+        "{problems:?}"
+    );
 }
 
 #[test]
