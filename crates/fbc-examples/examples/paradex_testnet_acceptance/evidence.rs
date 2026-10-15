@@ -247,6 +247,92 @@ pub struct FrameRow {
     pub request_message: Option<String>,
 }
 
+/// The cancel reason GET /orders-history gave the IOC (decision 0092's first question): a
+/// CLOSED row listed with a reason, or why it was not measured. The IOC step never passes
+/// without it (Codex r4277685475).
+pub fn ioc_reason(h: Option<&History>) -> Result<&str, String> {
+    let Some(h) = h else {
+        return Err("not measured: GET /orders-history was not read for the IOC".to_owned());
+    };
+    match h.cancel_reason.as_deref() {
+        Some(reason) if h.listed && h.status.as_deref() == Some("CLOSED") && !reason.is_empty() => {
+            Ok(reason)
+        }
+        _ if !h.listed => Err(format!(
+            "not measured: GET /orders-history never listed the IOC CLOSED ({} reads{})",
+            h.reads,
+            h.error
+                .as_deref()
+                .map_or_else(String::new, |e| format!(", last error: {e}"))
+        )),
+        _ => Err(
+            "not measured: GET /orders-history listed the IOC CLOSED with no cancel_reason"
+                .to_owned(),
+        ),
+    }
+}
+
+/// `requestType` MODIFY_ORDER in Paradex's schema.
+const MODIFY_ORDER: u8 = 1;
+
+/// FBC-g3bw's answer: the request_info the amended order's events carried, each matched to
+/// the amend (MODIFY_ORDER, and the requestId against our order.modify's JSON-RPC id); other
+/// orders' events carrying it are counted apart, never as the amend's (Codex r4277685488).
+fn request_info(ev: &Evidence) -> String {
+    let amend = ev.steps.iter().find(|s| s.name == "amend");
+    let amend_rpc = amend.and_then(|s| s.sent.first()).map(|s| s.rpc);
+    let amended: Vec<&str> = amend
+        .map(|s| s.orders.iter().map(|o| o.client_id.as_str()).collect())
+        .unwrap_or_default();
+    let carries = |f: &&FrameRow| {
+        f.request_type.is_some_and(|t| t != 0)
+            || f.request_id.as_deref().is_some_and(|r| !r.is_empty())
+    };
+    let (ours, others): (Vec<&FrameRow>, Vec<&FrameRow>) = ev
+        .frames
+        .iter()
+        .filter(carries)
+        .partition(|f| amended.contains(&f.client_id.as_str()));
+    let others = match others.len() {
+        0 => String::new(),
+        1 => "; 1 event of another order carried request_info (not the amend's)".to_owned(),
+        n => format!("; {n} events of other orders carried request_info (not the amend's)"),
+    };
+    let id = amend_rpc.map_or("-".to_owned(), |r| r.to_string());
+    if ours.is_empty() {
+        return format!("no OrderEvent of B1 carried request_info{others}");
+    }
+    let rows: Vec<String> = ours
+        .iter()
+        .map(|f| {
+            format!(
+                "{} sizeOpen {} requestStatus {:?} requestType {:?} (MODIFY_ORDER {}) requestId \
+                 {:?} (requestId is the amend's id {id}: {})",
+                f.status,
+                f.size_open,
+                f.request_status,
+                f.request_type,
+                if f.request_type == Some(MODIFY_ORDER) {
+                    "yes"
+                } else {
+                    "no"
+                },
+                f.request_id,
+                if amend_rpc.is_some() && f.request_id.as_deref() == Some(id.as_str()) {
+                    "yes"
+                } else {
+                    "no"
+                }
+            )
+        })
+        .collect();
+    format!(
+        "{} of B1's events carried it: [{}]; our order.modify JSON-RPC id was {id}{others}",
+        ours.len(),
+        rows.join("; "),
+    )
+}
+
 /// The block offset of each template's 32 `account` bytes (Paradex's schema, as the adapter's
 /// decoders read it): `OrderEvent` 76, `FillEvent` 59, `PositionEvent` 81.
 fn account_offset(template: u16) -> Option<usize> {
@@ -655,14 +741,10 @@ pub fn answers(ev: &Evidence) -> Vec<(String, String)> {
     let ioc = ev
         .steps
         .iter()
-        .find(|s| s.name == "ioc")
-        .and_then(|s| s.histories.first())
-        .map(|h| {
-            format!(
-                "GET /orders-history: status {}, cancel_reason {}",
-                h.status.as_deref().unwrap_or("-"),
-                h.cancel_reason.as_deref().unwrap_or("-")
-            )
+        .find(|s| s.name == "ioc" && s.ran == Ran::Yes)
+        .map(|s| match ioc_reason(s.histories.first()) {
+            Ok(reason) => format!("GET /orders-history: status CLOSED, cancel_reason {reason}"),
+            Err(why) => why,
         });
     let ioc_frame =
         ev.frames
@@ -734,40 +816,7 @@ pub fn answers(ev: &Evidence) -> Vec<(String, String)> {
                 },
             )
     };
-    // The amend's order events: request_info as received.
-    let amended: Vec<&FrameRow> = ev
-        .frames
-        .iter()
-        .filter(|f| {
-            f.request_type.is_some_and(|t| t != 0)
-                || f.request_id.as_deref().is_some_and(|r| !r.is_empty())
-        })
-        .collect();
-    let amend_rpc = ev
-        .steps
-        .iter()
-        .find(|s| s.name == "amend")
-        .and_then(|s| s.sent.first())
-        .map(|s| s.rpc);
-    let request_info = if amended.is_empty() {
-        "no OrderEvent carried request_info".to_owned()
-    } else {
-        let rows: Vec<String> = amended
-            .iter()
-            .map(|f| {
-                format!(
-                    "{} sizeOpen {} requestStatus {:?} requestType {:?} requestId {:?}",
-                    f.status, f.size_open, f.request_status, f.request_type, f.request_id
-                )
-            })
-            .collect();
-        format!(
-            "{} events carried it: [{}]; our order.modify JSON-RPC id was {}",
-            amended.len(),
-            rows.join("; "),
-            amend_rpc.map_or("-".to_owned(), |r| r.to_string())
-        )
-    };
+    let request_info = request_info(ev);
     let limits: Vec<String> = comparisons
         .iter()
         .map(|c| {

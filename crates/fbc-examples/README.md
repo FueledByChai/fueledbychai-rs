@@ -69,6 +69,13 @@ or the last read of the wait answered and still listed it. Every read of the wai
 If none answered within `--cod-wait`, or a read after a listing failed, the step fails as not
 measured: an early listing never stands for the whole wait.
 
+A placement is recorded only once its final phase came on an order event (decision 0092), the
+reply's provisional acceptance not enough; a step whose placement got none within
+`--step-timeout` fails. A GET /orders answer naming a further page (a non-null `next`) is never
+agreement: the program reads only the first page. The IOC step passes only when
+GET /orders-history listed the IOC CLOSED with a cancel reason; otherwise it fails, and the
+report's 0092 answer says not measured.
+
 The evidence directory holds:
 
 - `report.md`: the answers to FBC-2f7w's questions (a) to (e) (with three limits the report

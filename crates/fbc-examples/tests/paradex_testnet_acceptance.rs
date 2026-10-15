@@ -200,6 +200,16 @@ struct Venue {
     /// Whether GET /orders lists the first order the program cancelled again, as resting,
     /// once the batch was placed and while the main socket is open (Codex r4244249052).
     ghost_cancelled: bool,
+    /// Whether the first GTC placement's order events are held back: its reply accepts it
+    /// provisionally, and its final phase comes only before the answer to the next request
+    /// (the CI failure on c5f8479: the final phase later than the reply).
+    hold_place_final: bool,
+    /// Held order events, sent before the answer to the next request.
+    held: Vec<Frame>,
+    /// Whether GET /orders answers a further page's cursor (Codex r4277685465).
+    orders_cursor: bool,
+    /// Whether GET /orders-history never lists an IOC (Codex r4277685475).
+    ioc_history_hidden: bool,
 }
 
 impl Venue {
@@ -312,6 +322,7 @@ fn responder(venue: Arc<Mutex<Venue>>, conn: usize) -> Responder {
         let mut v = venue.lock().unwrap();
         let account = v.account.clone();
         let mut frames = Vec::new();
+        let held = std::mem::take(&mut v.held);
         match req["method"].as_str().unwrap_or("") {
             "auth" => {
                 v.disconnects();
@@ -374,7 +385,12 @@ fn responder(venue: Arc<Mutex<Venue>>, conn: usize) -> Responder {
                         frames.push(Frame::Binary(order_event(&o, seq, 4, None)));
                     } else {
                         o.status = "OPEN";
-                        frames.push(Frame::Binary(order_event(&o, seq, 3, None)));
+                        let event = Frame::Binary(order_event(&o, seq, 3, None));
+                        if std::mem::take(&mut v.hold_place_final) {
+                            v.held.push(event);
+                        } else {
+                            frames.push(event);
+                        }
                     }
                     v.orders.push(o);
                 }
@@ -431,7 +447,8 @@ fn responder(venue: Arc<Mutex<Venue>>, conn: usize) -> Responder {
             }
             other => return Err(format!("an unexpected method {other}")),
         }
-        Ok(frames)
+        // What was held goes first: the venue sends its order events in order.
+        Ok(held.into_iter().chain(frames).collect())
     })
 }
 
@@ -494,6 +511,12 @@ fn routes(venue: Arc<Mutex<Venue>>) -> HttpRouter {
                     open.push(row);
                 }
             }
+            if v.orders_cursor {
+                return reply(
+                    200,
+                    json!({ "next": "c2Vjb25kLXBhZ2U", "prev": null, "results": open }).to_string(),
+                );
+            }
             reply(200, json!({ "results": open }).to_string())
         })
         .route_fn(
@@ -518,7 +541,7 @@ fn routes(venue: Arc<Mutex<Venue>>) -> HttpRouter {
                 let rows: Vec<Value> = v
                     .orders
                     .iter()
-                    .filter(|o| o.cid == cid)
+                    .filter(|o| o.cid == cid && !(v.ioc_history_hidden && o.tif == 2))
                     .map(|o| o.json(&account))
                     .collect();
                 reply(
@@ -716,6 +739,10 @@ fn new_venue(cod_on_drop: bool, cod_on_close: bool) -> Arc<Mutex<Venue>> {
         stray_cid: None,
         late_then_failing: 0,
         ghost_cancelled: false,
+        hold_place_final: false,
+        held: Vec::new(),
+        orders_cursor: false,
+        ioc_history_hidden: false,
     }))
 }
 
@@ -824,6 +851,13 @@ async fn the_program_runs_every_step_once_maps_each_to_the_lattice_and_writes_sc
             outcomes.iter().any(|o| o.contains("Final")),
             "{name}: {outcomes:?}"
         );
+    }
+    let batch = &step("batch").sent[0].outcomes;
+    for item in [
+        "item 0 Accepted { ack: Final }",
+        "item 1 Accepted { ack: Final }",
+    ] {
+        assert!(batch.iter().any(|o| o == item), "{batch:?}");
     }
     // The per-IP limit check's counts: what was sent before each comparison. The first
     // counts the connection's cancel-on-disconnect arm as well as the place.
@@ -2104,4 +2138,193 @@ fn a_report_or_evidence_file_holding_a_credential_is_withheld_and_fails_the_run(
     );
     assert!(serde_json::from_str::<Value>(&json).is_ok());
     assert!(serde_json::from_str::<Value>(&json2).is_ok());
+}
+
+/// The order socket's script for a run that stops after the place: the main connection's
+/// opening, the place and Stop's cancel of B1 (one order.cancel_batch), then the stop phase's
+/// opening.
+async fn stub_stopping_after_place(venue: &Arc<Mutex<Venue>>) -> StubServer {
+    let mut steps = Vec::new();
+    for (conn, frames) in [(0, 6 + 2), (1, 6)] {
+        steps.push(Step::Accept);
+        let with = responder(Arc::clone(venue), conn);
+        steps.extend((0..frames).map(|_| Step::Respond {
+            conn,
+            with: with.clone(),
+        }));
+    }
+    let stub = StubServer::start(WsScript::new(steps), routes(Arc::clone(venue)))
+        .await
+        .unwrap();
+    let conns = Arc::clone(&venue.lock().unwrap().conns);
+    let _ = conns.set(stub.connections_view());
+    stub
+}
+
+#[tokio::test]
+async fn a_placement_is_recorded_only_with_its_final_phase_and_never_passes_without_it() {
+    // The CI failure on c5f8479: the reply's provisional acceptance already shows the order
+    // open, so the place step was recorded before the order event's final phase came. Here
+    // the final phase comes only before the answer to the next request (Stop's cancel): the
+    // step waits for it, by that event, no longer than the step timeout, and never passes
+    // without it.
+    let venue = new_venue(true, true);
+    venue.lock().unwrap().hold_place_final = true;
+    let stub = stub_stopping_after_place(&venue).await;
+    let (evidence_dir, _e) = temp_dir("evidence-final-late");
+    let (lease_dir, _l) = temp_dir("lease-final-late");
+    let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
+    opts.trade.step_timeout_secs = 1;
+    opts.rest_wait_secs = 1;
+    let (outcome, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+
+    let ev = &outcome.evidence;
+    let place = ev.steps.iter().find(|s| s.name == "place").unwrap();
+    assert!(!place.pass, "{place:?}\n{printed}");
+    assert!(
+        place.notes.iter().any(|n| n.contains("final phase")),
+        "{place:?}"
+    );
+    assert!(
+        place.sent[0].outcomes.iter().all(|o| !o.contains("Final")),
+        "{place:?}"
+    );
+    // Stop's cancel of B1 went out, and only then did the held final phase come.
+    let main = methods(&stub, 0);
+    assert!(
+        main.last().is_some_and(|m| m.starts_with("order.cancel")),
+        "{main:?}"
+    );
+    assert!(!outcome.ok, "{printed}");
+}
+
+#[tokio::test]
+async fn a_paginated_orders_answer_is_never_agreement() {
+    // Codex r4277685465: a further page could list an order the stream ended.
+    let venue = new_venue(true, true);
+    venue.lock().unwrap().orders_cursor = true;
+    let stub = stub_stopping_after_place(&venue).await;
+    let (evidence_dir, _e) = temp_dir("evidence-cursor");
+    let (lease_dir, _l) = temp_dir("lease-cursor");
+    let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
+    opts.rest_wait_secs = 1;
+    let (outcome, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+
+    let ev = &outcome.evidence;
+    let place = ev.steps.iter().find(|s| s.name == "place").unwrap();
+    assert!(!place.pass, "{place:?}\n{printed}");
+    let c = &place.comparisons[0];
+    assert!(!c.orders_agreed && !c.first_read_orders_agreed, "{c:?}");
+    assert!(
+        c.first_mismatches
+            .iter()
+            .any(|m| m.contains("further page")),
+        "{c:?}"
+    );
+    assert!(c.page_keys.contains(&"next".to_owned()), "{c:?}");
+    assert!(!outcome.ok, "{printed}");
+}
+
+#[tokio::test]
+async fn an_ioc_whose_history_gives_no_cancel_reason_is_not_measured_and_fails_its_step() {
+    // Codex r4277685475: 0092's question is the reason; without it the step is no pass.
+    let venue = new_venue(true, true);
+    venue.lock().unwrap().ioc_history_hidden = true;
+    let stub = stub_for(&venue, MAIN, 0, 0).await;
+    let (evidence_dir, _e) = temp_dir("evidence-ioc-hidden");
+    let (lease_dir, _l) = temp_dir("lease-ioc-hidden");
+    let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
+    opts.rest_wait_secs = 1;
+    let (outcome, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+
+    let ev = &outcome.evidence;
+    let ioc = ev.steps.iter().find(|s| s.name == "ioc").unwrap();
+    assert!(!ioc.pass, "{ioc:?}");
+    assert!(
+        ioc.notes.iter().any(|n| n.starts_with("not measured")),
+        "{ioc:?}"
+    );
+    let a = answer(ev, "0092 (1)");
+    assert!(a.starts_with("not measured"), "{a}");
+    assert!(!outcome.ok, "{printed}");
+}
+
+#[test]
+fn an_ioc_history_row_without_a_cancel_reason_is_not_measured() {
+    let closed = |reason: Option<&str>| evidence::History {
+        label: "IOC".to_owned(),
+        wanted: "CLOSED".to_owned(),
+        listed: true,
+        status: Some("CLOSED".to_owned()),
+        cancel_reason: reason.map(str::to_owned),
+        ..evidence::History::default()
+    };
+    assert_eq!(
+        evidence::ioc_reason(Some(&closed(Some("EXPIRED")))),
+        Ok("EXPIRED")
+    );
+    for h in [
+        closed(None),
+        closed(Some("")),
+        evidence::History {
+            listed: false,
+            ..closed(Some("EXPIRED"))
+        },
+    ] {
+        let why = evidence::ioc_reason(Some(&h)).unwrap_err();
+        assert!(why.starts_with("not measured"), "{why}");
+    }
+    assert!(evidence::ioc_reason(None).is_err());
+}
+
+#[test]
+fn request_info_is_reported_for_the_amended_order_alone_and_matched_to_the_amend() {
+    // Codex r4277685488.
+    let mut ev = evidence::Evidence::default();
+    ev.step("amend").sent.push(evidence::Sent {
+        kind: "amend".to_owned(),
+        rpc: 9,
+        items: 1,
+        outcomes: Vec::new(),
+    });
+    ev.step("amend").orders.push(evidence::Trace {
+        label: "B1".to_owned(),
+        client_id: "b1".to_owned(),
+        ..evidence::Trace::default()
+    });
+    let row = |cid: &str, rt: u8, rid: &str| evidence::FrameRow {
+        client_id: cid.to_owned(),
+        status: "OPEN".to_owned(),
+        request_status: Some(4),
+        request_type: Some(rt),
+        request_id: Some(rid.to_owned()),
+        ..evidence::FrameRow::default()
+    };
+    ev.frames = vec![row("other", 1, "9"), row("b1", 1, "9")];
+    let a = answer(&ev, "FBC-g3bw");
+    assert!(a.contains("1 of B1's events carried it"), "{a}");
+    assert!(
+        a.contains("MODIFY_ORDER yes") && a.contains("requestId is the amend's id 9: yes"),
+        "{a}"
+    );
+    assert!(
+        a.contains("1 event of another order carried request_info"),
+        "{a}"
+    );
+    ev.frames = vec![row("b1", 2, "req-9")];
+    let a = answer(&ev, "FBC-g3bw");
+    assert!(
+        a.contains("MODIFY_ORDER no") && a.contains("requestId is the amend's id 9: no"),
+        "{a}"
+    );
+    assert!(!a.contains("another order"), "{a}");
+    ev.frames = vec![row("other", 1, "9")];
+    let a = answer(&ev, "FBC-g3bw");
+    assert!(
+        a.starts_with("no OrderEvent of B1 carried request_info"),
+        "{a}"
+    );
 }
