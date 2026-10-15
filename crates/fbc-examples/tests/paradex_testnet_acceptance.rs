@@ -192,9 +192,25 @@ struct Venue {
     /// order.create also sends an order event of an order under it (one the registry does not
     /// hold).
     stray_cid: Option<String>,
+    /// Cancel-on-disconnect applied late and REST failing after it (Reviewer B, RB7): 1 arms
+    /// it; the first GET /orders once the main socket dropped then lists the dropped socket's
+    /// order as it stood (2), and every GET /orders after it answers 500 until an
+    /// orders-history read comes (3).
+    late_then_failing: u8,
+    /// Whether GET /orders lists the first order the program cancelled again, as resting,
+    /// once the batch was placed and while the main socket is open (Codex r4244249052).
+    ghost_cancelled: bool,
 }
 
 impl Venue {
+    /// Whether the main connection (the first) has ended.
+    fn main_ended(&self) -> bool {
+        self.conns
+            .get()
+            .and_then(|view| view.connections().first().map(|c| !c.open))
+            .unwrap_or(false)
+    }
+
     /// Closes the orders of every connection that ended, as cancel-on-disconnect says.
     fn disconnects(&mut self) {
         let Some(view) = self.conns.get() else { return };
@@ -458,14 +474,26 @@ fn routes(venue: Arc<Mutex<Venue>>) -> HttpRouter {
                 return reply(401, "{}");
             }
             let mut v = orders.lock().unwrap();
-            v.disconnects();
+            match v.late_then_failing {
+                1 if v.main_ended() => v.late_then_failing = 2,
+                2 => return reply(500, "{}"),
+                _ => v.disconnects(),
+            }
             let account = v.account.clone();
-            let open: Vec<Value> = v
+            let mut open: Vec<Value> = v
                 .orders
                 .iter()
                 .filter(|o| o.status != "CLOSED")
                 .map(|o| o.json(&account))
                 .collect();
+            if v.ghost_cancelled && v.orders.len() >= 3 && !v.main_ended() {
+                let ghost = v.orders.iter().find(|o| o.cancel_reason == "USER_CANCELED");
+                if let Some(o) = ghost {
+                    let mut row = o.json(&account);
+                    row["status"] = json!("OPEN");
+                    open.push(row);
+                }
+            }
             reply(200, json!({ "results": open }).to_string())
         })
         .route_fn(
@@ -476,6 +504,9 @@ fn routes(venue: Arc<Mutex<Venue>>) -> HttpRouter {
                     return reply(401, "{}");
                 }
                 let mut v = history.lock().unwrap();
+                if v.late_then_failing == 2 {
+                    v.late_then_failing = 3;
+                }
                 v.disconnects();
                 let account = v.account.clone();
                 let cid = req
@@ -683,6 +714,8 @@ fn new_venue(cod_on_drop: bool, cod_on_close: bool) -> Arc<Mutex<Venue>> {
         ioc_fills: false,
         stale_position_once: false,
         stray_cid: None,
+        late_then_failing: 0,
+        ghost_cancelled: false,
     }))
 }
 
@@ -808,6 +841,25 @@ async fn the_program_runs_every_step_once_maps_each_to_the_lattice_and_writes_sc
     assert!(
         first.rest_since >= 2,
         "the order-book reads at least: {first:?}"
+    );
+    // Every HTTP request the stub answered is counted once: the program's own, and the
+    // sessions' (logins and resync reads) as their journal records them. Only the stop
+    // comparison's GET /positions comes after the last sample.
+    assert!(
+        first.session_rest_since >= 3,
+        "the session's login and two resync reads: {first:?}"
+    );
+    let counted: u64 = ev
+        .steps
+        .iter()
+        .flat_map(|s| &s.comparisons)
+        .map(|c| c.rest_since + c.session_rest_since - c.session_not_sent_since)
+        .sum();
+    assert_eq!(
+        counted + 1,
+        stub.http_requests().len() as u64,
+        "{:?}",
+        stub.http_requests()
     );
     let amend = &step("amend").comparisons[0];
     assert_eq!(
@@ -1418,10 +1470,13 @@ async fn a_book_with_no_ask_skips_only_the_pair_and_the_other_steps_pass() {
 
 #[test]
 fn a_list_answer_without_results_is_no_empty_snapshot() {
-    assert_eq!(accept::parse_results(br#"{"results":[]}"#), Ok(Vec::new()));
-    assert!(accept::parse_results(b"{}").is_err());
-    assert!(accept::parse_results(br#"{"results":{}}"#).is_err());
-    assert!(accept::parse_results(b"<html>").is_err());
+    assert_eq!(
+        accept::parse_results(br#"{"results":[]}"#, accept::ORDER_ROW),
+        Ok(Vec::new())
+    );
+    assert!(accept::parse_results(b"{}", accept::ORDER_ROW).is_err());
+    assert!(accept::parse_results(br#"{"results":{}}"#, accept::ORDER_ROW).is_err());
+    assert!(accept::parse_results(b"<html>", accept::ORDER_ROW).is_err());
 }
 
 #[test]
@@ -1551,7 +1606,7 @@ fn the_privacy_check_scans_fixtures_written_under_a_git_ignored_directory() {
 }
 
 #[test]
-fn a_session_counts_each_order_method_its_arm_and_every_connection_it_opened() {
+fn a_session_counts_each_order_method_and_its_arm() {
     use fbc_core::{ConnState, RpcId, SubmitOutcome};
     use link::Note;
     let accepted = || SubmitOutcome::Accepted {
@@ -1598,7 +1653,110 @@ fn a_session_counts_each_order_method_its_arm_and_every_connection_it_opened() {
             sent: Ok(()),
         },
     ];
-    assert_eq!(accept::session_counts(&notes), (5, 3));
+    assert_eq!(accept::session_counts(&notes), 5);
+}
+
+#[test]
+fn the_sessions_http_requests_and_connections_are_counted_as_their_journal_records_them() {
+    // Codex r4244249042: what the sessions sent, not what their notes imply. A login whose
+    // socket dropped in flight was still asked for; a cached token asks for none.
+    use fbc_core::{
+        ConnKey, HttpFailure, HttpMethod, HttpRequest, HttpTag, MonoNs, Stamp, TrafficClass,
+        WallNs, WireSlice, WireUrl,
+    };
+    use fbc_journal::{ControlEvent, JournalSink, Record, RecordRef, Recorded};
+    #[derive(Default)]
+    struct Keep(usize);
+    impl JournalSink for Keep {
+        fn record(&mut self, _: TrafficClass, _: WallNs, _: &Record) -> Recorded {
+            self.0 += 1;
+            Recorded::Ok
+        }
+        fn omit(&mut self, _: TrafficClass, _: WallNs) -> Recorded {
+            Recorded::DroppedCounted
+        }
+    }
+    let mut sink = accept::JournalCount::new(Keep::default());
+    let counts = sink.counts();
+    let key = ConnKey { conn: 1, epoch: 1 };
+    let req = HttpRequest {
+        method: HttpMethod::Post,
+        url: WireUrl::plain("http://127.0.0.1:9/v1/auth"),
+        headers: Vec::new(),
+        body: WireSlice::plain(Vec::new()),
+    };
+    let ask = || RecordRef::HttpRequest {
+        at: MonoNs(1),
+        conn: key,
+        tag: HttpTag(1),
+        rpc: None,
+        req: &req,
+    };
+    let stamp = Stamp {
+        ingest_seq: 1,
+        kernel_rx: None,
+        recv_mono: MonoNs(2),
+        recv_wall: WallNs(2),
+        conn: key,
+    };
+    let (n, w) = (TrafficClass::Normal, WallNs(1));
+    let _ = sink.record(
+        n,
+        w,
+        &Record::Control {
+            at: MonoNs(1),
+            ev: ControlEvent::Opened(key),
+        },
+    );
+    // A login, a read, and one the limiter refused (never sent).
+    for _ in 0..3 {
+        let _ = sink.record_ref(n, w, ask());
+    }
+    let _ = sink.record_ref(
+        n,
+        w,
+        RecordRef::HttpResult {
+            stamp,
+            tag: HttpTag(1),
+            result: Err(HttpFailure::NotSent),
+        },
+    );
+    // A request lost in flight was sent.
+    let _ = sink.record_ref(
+        n,
+        w,
+        RecordRef::HttpResult {
+            stamp,
+            tag: HttpTag(1),
+            result: Err(HttpFailure::Lost),
+        },
+    );
+    let _ = sink.record(
+        n,
+        w,
+        &Record::Control {
+            at: MonoNs(3),
+            ev: ControlEvent::Closed(key),
+        },
+    );
+    let _ = sink.record(
+        n,
+        w,
+        &Record::Control {
+            at: MonoNs(4),
+            ev: ControlEvent::Opened(ConnKey { conn: 1, epoch: 2 }),
+        },
+    );
+    assert_eq!(
+        counts.get(),
+        accept::SessionsSent {
+            asked: 3,
+            not_sent: 1,
+            connections: 2
+        }
+    );
+    assert_eq!(sink.inner().0, 8, "every record goes on to the journal");
+    assert_eq!(sink.omit(n, w), Recorded::DroppedCounted);
 }
 
 #[test]
@@ -1707,4 +1865,243 @@ fn a_disconnect_is_credited_only_with_a_readable_unfilled_history() {
         false,
         &history(true, Some(false))
     ));
+}
+
+#[tokio::test]
+async fn a_listing_followed_by_failed_reads_is_not_measured_and_never_called_not_cancelled() {
+    // Reviewer B, RB7: the first GET /orders after the drop still lists B3 (Paradex has not
+    // applied cancel-on-disconnect yet), every later one within --cod-wait answers 500, and
+    // the history then shows B3 closed by the disconnect.
+    let venue = new_venue(true, true);
+    venue.lock().unwrap().late_then_failing = 1;
+    let stub = stub_for(&venue, MAIN, 0, 0).await;
+    let (evidence_dir, _e) = temp_dir("evidence-late");
+    let (lease_dir, _l) = temp_dir("lease-late");
+    let opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 2);
+    let (outcome, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+
+    let ev = &outcome.evidence;
+    let s = ev.steps.iter().find(|s| s.name == "cod-dropped").unwrap();
+    let d = s.disconnect.as_ref().unwrap();
+    assert!(!d.cancelled && !d.still_listed, "{d:?}");
+    assert!(!s.pass, "{s:?}");
+    // Every read is recorded: the one that listed it, then the ones that failed.
+    assert!(
+        d.reads.first().is_some_and(|r| r.contains("listed")),
+        "{d:?}"
+    );
+    assert!(
+        d.reads.iter().skip(1).all(|r| r.contains("status 500")),
+        "{d:?}"
+    );
+    let verdict = answer(ev, "cancel-on-disconnect, dropped");
+    assert!(!verdict.contains("NOT cancelled"), "{verdict}");
+    assert!(verdict.contains("not measured"), "{verdict}");
+    assert!(!outcome.ok, "{printed}");
+}
+
+#[tokio::test]
+async fn an_order_ended_earlier_that_a_later_listing_shows_again_is_a_mismatch() {
+    // Codex r4244249052: B1, cancelled at the cancel step, is listed again once the batch is
+    // placed; the batch's comparison must not agree.
+    let venue = new_venue(true, true);
+    venue.lock().unwrap().ghost_cancelled = true;
+    let stub = stub_for(&venue, MAIN, 0, 0).await;
+    let (evidence_dir, _e) = temp_dir("evidence-ghost");
+    let (lease_dir, _l) = temp_dir("lease-ghost");
+    let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 2);
+    opts.rest_wait_secs = 1;
+    let (outcome, printed) = run_against(&opts).await;
+    // The failed batch ends the main phase's steps early: the script is not played out.
+    drop(stub);
+
+    let ev = &outcome.evidence;
+    let step = |name: &str| ev.steps.iter().find(|s| s.name == name).unwrap();
+    assert!(step("cancel").pass, "{:?}", step("cancel"));
+    let batch = &step("batch").comparisons[0];
+    assert!(!batch.orders_agreed, "{batch:?}");
+    assert!(
+        batch
+            .last_mismatches
+            .iter()
+            .any(|m| m.starts_with("B1") && m.contains("ended on the stream, still listed")),
+        "{batch:?}"
+    );
+    assert!(!step("batch").pass);
+    assert!(answer(ev, "(a)").starts_with("NO"), "{}", answer(ev, "(a)"));
+    assert!(!outcome.ok, "{printed}");
+}
+
+#[test]
+fn a_list_row_without_its_fields_is_no_snapshot() {
+    use accept::{ORDER_ROW, POSITION_ROW};
+    // Codex r4244249050: {"results":[{}]} is no empty market and no flat position.
+    assert!(accept::parse_results(br#"{"results":[{}]}"#, ORDER_ROW).is_err());
+    assert!(accept::parse_results(br#"{"results":[{}]}"#, POSITION_ROW).is_err());
+    assert!(accept::parse_results(br#"{"results":[7]}"#, ORDER_ROW).is_err());
+    let order = json!({"client_id": "c", "market": MARKET, "status": "OPEN", "price": "1",
+        "size": "0.1", "remaining_size": "0.1"});
+    let mut numeric = order.clone();
+    numeric["size"] = json!(0.1);
+    let body = |row: &Value| json!({ "results": [row] }).to_string().into_bytes();
+    assert!(accept::parse_results(&body(&numeric), ORDER_ROW).is_err());
+    assert_eq!(
+        accept::parse_results(&body(&order), ORDER_ROW).map(|r| r.len()),
+        Ok(1)
+    );
+    let position = json!({"market": MARKET, "side": "LONG", "size": "0.1", "status": "OPEN"});
+    assert_eq!(
+        accept::parse_results(&body(&position), POSITION_ROW).map(|r| r.len()),
+        Ok(1)
+    );
+    assert!(accept::parse_results(&body(&position), ORDER_ROW).is_err());
+}
+
+#[test]
+fn impossible_history_quantities_are_refused_not_read_as_nothing_filled() {
+    // Codex r4244249043.
+    let d = |t: &str| Some(Decimal::from_str(t).unwrap());
+    let one = d("0.0002");
+    assert_eq!(
+        accept::history_filled(d("0.0002"), d("0.0002"), one),
+        Ok(false)
+    );
+    assert_eq!(
+        accept::history_filled(d("0.0002"), d("0.0001"), one),
+        Ok(true)
+    );
+    assert_eq!(accept::history_filled(d("0.0002"), d("0"), one), Ok(true));
+    for (size, left) in [
+        ("-0.0002", "-0.0002"),
+        ("0", "0"),
+        ("0.0002", "1"),
+        ("0.0002", "-0.0001"),
+    ] {
+        assert!(
+            accept::history_filled(d(size), d(left), one).is_err(),
+            "{size} {left}"
+        );
+    }
+    assert!(
+        accept::history_filled(d("0.0003"), d("0.0003"), one).is_err(),
+        "a size other than the order's"
+    );
+    assert!(accept::history_filled(None, d("0.0002"), one).is_err());
+    assert_eq!(
+        accept::history_filled(d("0.0003"), d("0.0003"), None),
+        Ok(false)
+    );
+}
+
+#[test]
+fn a_close_that_errored_or_did_not_finish_is_no_clean_graceful_close() {
+    // Codex r4244249045.
+    assert_eq!(accept::graceful_end(Some(Ok(()))), Ok(()));
+    let errored = accept::graceful_end(Some(Err("the journal failed".to_owned()))).unwrap_err();
+    assert!(errored.contains("the journal failed"), "{errored}");
+    assert!(accept::graceful_end(None).unwrap_err().contains("5 s"));
+}
+
+/// Evidence with one step holding `comparisons`.
+fn with_comparisons(comparisons: Vec<evidence::Comparison>) -> evidence::Evidence {
+    let mut ev = evidence::Evidence::default();
+    ev.step("place").comparisons = comparisons;
+    ev
+}
+
+#[test]
+fn no_lag_bound_is_given_when_a_comparison_never_agreed() {
+    // Codex r4244249048.
+    let agreed = evidence::Comparison {
+        orders_compared: true,
+        orders_agreed: true,
+        positions_agreed: true,
+        lag_ms: Some(50),
+        ..evidence::Comparison::default()
+    };
+    let stale = evidence::Comparison {
+        orders_compared: true,
+        lag_ms: None,
+        ..evidence::Comparison::default()
+    };
+    let ev = with_comparisons(vec![agreed.clone(), stale]);
+    let b = answer(&ev, "(b)");
+    assert!(!b.contains("at most"), "{b}");
+    assert!(b.contains("not established") && b.contains("1 of 2"), "{b}");
+    let ev = with_comparisons(vec![agreed]);
+    assert_eq!(answer(&ev, "(b)"), "at most 50 ms");
+}
+
+#[test]
+fn the_history_lag_of_a_disconnect_is_labelled_as_timed_from_the_socket_end() {
+    // Reviewer B, RB8.
+    let mut ev = evidence::Evidence::default();
+    ev.step("place").histories.push(evidence::History {
+        label: "B1".to_owned(),
+        wanted: "OPEN".to_owned(),
+        listed: true,
+        lag_ms: Some(30),
+        ..evidence::History::default()
+    });
+    ev.step("cod-dropped").disconnect = Some(evidence::Disconnect {
+        history: Some(evidence::History {
+            label: "B3".to_owned(),
+            wanted: "CLOSED".to_owned(),
+            listed: true,
+            lag_ms: Some(2_000),
+            ..evidence::History::default()
+        }),
+        ..evidence::Disconnect::default()
+    });
+    let e = answer(&ev, "(e)");
+    assert!(e.contains("B1 OPEN: listed after 30 ms;"), "{e}");
+    assert!(
+        e.contains("B3 CLOSED: listed 2000 ms after the socket ended")
+            && e.contains("cancel-on-disconnect latency"),
+        "{e}"
+    );
+}
+
+#[test]
+fn positions_with_no_fill_are_said_to_be_compared_with_the_seed_only() {
+    // Reviewer B, RB9.
+    let flat = evidence::Comparison {
+        positions_agreed: true,
+        ..evidence::Comparison::default()
+    };
+    let mut ev = with_comparisons(vec![flat]);
+    let c = answer(&ev, "(c)");
+    assert!(c.contains("no fill event arrived"), "{c}");
+    ev.fills = 1;
+    let c = answer(&ev, "(c)");
+    assert!(!c.contains("no fill event arrived"), "{c}");
+    assert!(c.starts_with("yes at every comparison"), "{c}");
+}
+
+#[test]
+fn a_report_or_evidence_file_holding_a_credential_is_withheld_and_fails_the_run() {
+    // Reviewer B, RB4: notes reach both files.
+    let mut ev = evidence::Evidence::default();
+    let (report, json) = evidence::outputs(&mut ev).unwrap();
+    assert!(report.contains("# Paradex testnet acceptance"), "{report}");
+    assert!(ev.ok());
+    let leaked = format!("{} {}", "Bearer", "abcdefghij".repeat(3));
+    ev.notes.push(format!("a session error echoed {leaked}"));
+    let (report, json2) = evidence::outputs(&mut ev).unwrap();
+    for text in [&report, &json2] {
+        assert!(!text.contains(&leaked), "{text}");
+        assert!(evidence::privacy_hits(text).is_empty(), "{text}");
+        assert!(text.contains("withheld"), "{text}");
+    }
+    assert!(!ev.ok());
+    assert!(
+        ev.artifact_errors
+            .iter()
+            .any(|e| e.contains("report.md") && e.contains("a bearer token")),
+        "{:?}",
+        ev.artifact_errors
+    );
+    assert!(serde_json::from_str::<Value>(&json).is_ok());
+    assert!(serde_json::from_str::<Value>(&json2).is_ok());
 }
