@@ -207,6 +207,31 @@ pub struct Evidence {
     /// The fill events the sessions' streams carried: with none, every position comparison
     /// checked GET /positions against the position the resync seeded from REST.
     pub fills: u64,
+    /// Each fill event as received, and each PositionEvent (FBC-uiy, FBC-4zz; the fill steps,
+    /// FBC-6fnc).
+    pub fill_rows: Vec<FillRow>,
+    pub position_events: Vec<String>,
+    /// What the amend of a partly filled order showed of order.modify's size (FBC-b0z9), or
+    /// why it was not exercised; `None` when the fill-partial step did not run.
+    pub partial_amend: Option<String>,
+}
+
+/// One fill event as the stream carried it: the order it was of (its label, or `not ours`),
+/// the fill key (`<fillType>:<fillId>`), the account's side, price and size in the market's
+/// units, maker or taker, the fee (positive paid) and its currency, and the realized P&L and
+/// funding it states (`-` when null).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FillRow {
+    pub order: String,
+    pub fill_id: String,
+    pub side: String,
+    pub price: String,
+    pub size: String,
+    pub liquidity: String,
+    pub fee: String,
+    pub fee_currency: String,
+    pub realized_pnl: String,
+    pub realized_funding: String,
 }
 
 impl Evidence {
@@ -817,6 +842,10 @@ pub fn answers(ev: &Evidence) -> Vec<(String, String)> {
             )
     };
     let request_info = request_info(ev);
+    let fill_ran = ev
+        .steps
+        .iter()
+        .any(|s| s.name == "fill" && s.ran == Ran::Yes);
     let limits: Vec<String> = comparisons
         .iter()
         .map(|c| {
@@ -892,7 +921,15 @@ pub fn answers(ev: &Evidence) -> Vec<(String, String)> {
         ),
         (
             "0092 (2): an IOC/MARKET risk refusal other than NOT_ENOUGH_MARGIN".to_owned(),
-            "not exercised: the program never sends an order that could take".to_owned(),
+            if fill_ran {
+                "not exercised: the fill steps' orders are sized within the caps, so none is \
+                 refused for risk"
+                    .to_owned()
+            } else {
+                "not exercised: without --allow-fill the program never sends an order that \
+                 could take"
+                    .to_owned()
+            },
         ),
         (
             "0092 (3): a GTC order closed unfilled by self-trade prevention".to_owned(),
@@ -904,9 +941,12 @@ pub fn answers(ev: &Evidence) -> Vec<(String, String)> {
         ),
         (
             "FBC-b0z9 / FBC-olg: order.modify size is the total; modify of a partly filled order".to_owned(),
-            "the amend sent the order's total; no partial fill arose (orders rest far from the \
-             touch), so total-versus-remaining is not distinguished by this run"
-                .to_owned(),
+            ev.partial_amend.clone().unwrap_or_else(|| {
+                "the amend sent the order's total; no partial fill arose (the fill-partial step \
+                 did not run: it needs --allow-fill), so total-versus-remaining is not \
+                 distinguished by this run"
+                    .to_owned()
+            }),
         ),
         (
             "FBC-olg: cancel by client id before the ack".to_owned(),
@@ -924,9 +964,33 @@ pub fn answers(ev: &Evidence) -> Vec<(String, String)> {
             "FBC-uiy / FBC-4zz: fill side, realizedFunding, feeCurrency, fill ids, funding without \
              fill ids, PositionEvent size and CLOSED"
                 .to_owned(),
-            "not exercised unless a fill arose (see the order traces): every order rests far \
-             from the touch"
-                .to_owned(),
+            if ev.fill_rows.is_empty() {
+                "not exercised: no fill event arrived (without --allow-fill every order rests far \
+                 from the touch)"
+                    .to_owned()
+            } else {
+                format!(
+                    "fills as received (the table below): [{}]; PositionEvents: [{}]",
+                    ev.fill_rows
+                        .iter()
+                        .map(|f| format!(
+                            "{} {} {} {} @ {} {} fee {} {} realizedPnl {} realizedFunding {}",
+                            f.order,
+                            f.fill_id,
+                            f.side,
+                            f.size,
+                            f.price,
+                            f.liquidity,
+                            f.fee,
+                            f.fee_currency,
+                            f.realized_pnl,
+                            f.realized_funding
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                    ev.position_events.join("; ")
+                )
+            },
         ),
         (
             "design §13.3: does the per-IP limit count WebSocket order methods".to_owned(),
@@ -1114,6 +1178,34 @@ pub fn markdown(ev: &Evidence) -> String {
             );
         }
     }
+    if !ev.fill_rows.is_empty() {
+        let _ = writeln!(
+            out,
+            "\n## Fills as received\n\n| Order | Fill | Side | Size | Price | Liquidity | Fee | Fee currency | Realized P&L | Realized funding |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+        );
+        for f in &ev.fill_rows {
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                f.order,
+                f.fill_id,
+                f.side,
+                f.size,
+                f.price,
+                f.liquidity,
+                f.fee,
+                f.fee_currency,
+                f.realized_pnl,
+                f.realized_funding
+            );
+        }
+    }
+    if !ev.position_events.is_empty() {
+        let _ = writeln!(out, "\n## Position events as received\n");
+        for e in &ev.position_events {
+            let _ = writeln!(out, "- {e}");
+        }
+    }
     if !ev.notes.is_empty() {
         let _ = writeln!(out, "\n## Notes\n");
         for n in &ev.notes {
@@ -1209,6 +1301,14 @@ pub fn to_json(ev: &Evidence) -> Value {
         })).collect::<Vec<_>>(),
         "notes": ev.notes,
         "fill_events": ev.fills,
+        "fills": ev.fill_rows.iter().map(|f| json!({
+            "order": f.order, "fill_id": f.fill_id, "side": f.side, "size": f.size,
+            "price": f.price, "liquidity": f.liquidity, "fee": f.fee,
+            "fee_currency": f.fee_currency, "realized_pnl": f.realized_pnl,
+            "realized_funding": f.realized_funding,
+        })).collect::<Vec<_>>(),
+        "position_events": ev.position_events,
+        "partial_amend": ev.partial_amend,
         "fixtures_withheld": ev.withheld,
         "outputs_not_written": ev.artifact_errors,
     })
