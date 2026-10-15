@@ -229,6 +229,13 @@ struct Venue {
     stale_position_from: Option<usize>,
     /// The largest absolute position the account ever held.
     max_position: Decimal,
+    /// Whether a take's frames (its fill, order event and position) are held until the next
+    /// request, so its placement never sees its final phase in time (Codex r4289239739).
+    hold_take: bool,
+    /// Whether an order.modify of a partly filled order (no other) is answered, then the order
+    /// fills its rest at its old price and closes before any event confirms the amend (Codex
+    /// r4289239759).
+    modify_fills: bool,
 }
 
 impl Venue {
@@ -512,9 +519,19 @@ fn responder(venue: Arc<Mutex<Venue>>, conn: usize) -> Responder {
                             }
                             4
                         };
-                        frames.push(Frame::Binary(order_event(&o, seq, status, None)));
                         let pseq = v.next_seq();
-                        frames.push(Frame::Binary(position_event(v.position, pseq)));
+                        let events = [
+                            Frame::Binary(order_event(&o, seq, status, None)),
+                            Frame::Binary(position_event(v.position, pseq)),
+                        ];
+                        if o.tif == 2 && std::mem::take(&mut v.hold_take) {
+                            // The fill event went in `frames` first: hold it with them.
+                            let fill = frames.pop().unwrap();
+                            v.held.push(fill);
+                            v.held.extend(events);
+                        } else {
+                            frames.extend(events);
+                        }
                     } else if o.tif == 2 && v.ioc_fills {
                         o.status = "CLOSED";
                         o.open = "0".to_owned();
@@ -543,6 +560,33 @@ fn responder(venue: Arc<Mutex<Venue>>, conn: usize) -> Responder {
                     }
                     v.orders.push(o);
                 }
+            }
+            "order.modify"
+                if v.modify_fills
+                    && v.orders
+                        .iter()
+                        .any(|o| params["id"] == o.vid.as_str() && o.open != o.size) =>
+            {
+                let vid = params["id"].as_str().unwrap_or("").to_owned();
+                let (seq, fseq, pseq) = (v.next_seq(), v.next_seq(), v.next_seq());
+                v.next_fill += 1;
+                let fill = v.next_fill;
+                let o = v
+                    .orders
+                    .iter_mut()
+                    .find(|o| o.vid == vid)
+                    .ok_or("no such order")?;
+                frames.push(ok(json!({"order": o.json(&account)})));
+                let left = o.open.clone();
+                o.open = "0".to_owned();
+                o.status = "CLOSED";
+                let o = o.clone();
+                frames.push(Frame::Binary(fill_event(
+                    &o, fill, fseq, &o.price, &left, None,
+                )));
+                frames.push(Frame::Binary(order_event(&o, seq, 4, None)));
+                v.position += Decimal::from_str(&left).unwrap();
+                frames.push(Frame::Binary(position_event(v.position, pseq)));
             }
             "order.modify" => {
                 let remainder = v.modify_as_remainder;
@@ -921,6 +965,8 @@ fn new_venue(cod_on_drop: bool, cod_on_close: bool) -> Arc<Mutex<Venue>> {
         modify_as_remainder: false,
         stale_position_from: None,
         max_position: Decimal::ZERO,
+        hold_take: false,
+        modify_fills: false,
     }))
 }
 
@@ -3039,4 +3085,160 @@ async fn an_order_book_off_the_tick_or_step_grid_names_the_flags_to_check() {
         assert!(!why.contains("Malformed"), "{why}");
         assert!(stub.connections().is_empty());
     }
+}
+
+#[tokio::test]
+async fn an_unresolved_take_is_settled_before_it_is_flattened_and_its_step_fails() {
+    // Codex r4289239739: the take's events come only after the next request, so its placement
+    // gets no final phase in time. The step fails, the take is cancelled and must end with its
+    // fill on the stream before anything is called flat; what it filled is then flattened.
+    let venue = new_venue(true, true);
+    venue.lock().unwrap().hold_take = true;
+    // To the IOC, then T1, its cancel and F1, then B3.
+    let stub = stub_frames(&venue, &[MAIN + 3, 7, 6]).await;
+    let (evidence_dir, _e) = temp_dir("evidence-take-unresolved");
+    let (lease_dir, _l) = temp_dir("lease-take-unresolved");
+    let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
+    opts.allow_fill = true;
+    opts.trade.step_timeout_secs = 1;
+    opts.rest_wait_secs = 1;
+    let (outcome, printed) = run_against(&opts).await;
+    let report = fs::read_to_string(&outcome.report).unwrap();
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("{e:?}\n{printed}\n{report}"));
+    let fill = outcome
+        .evidence
+        .steps
+        .iter()
+        .find(|s| s.name == "fill")
+        .unwrap();
+    assert!(!fill.pass, "{fill:?}");
+    let main = methods(&stub, 0);
+    let t1 = main.iter().position(|m| m == "order.create").unwrap();
+    assert!(
+        main.iter().skip(t1).any(|m| m == "order.cancel"),
+        "{main:?}"
+    );
+    assert!(
+        creates(&stub, 0)
+            .iter()
+            .any(|p| p["flags"] == json!(["REDUCE_ONLY"])),
+        "the take's fill was flattened: {printed}"
+    );
+    assert!(venue.lock().unwrap().position.is_zero(), "{printed}");
+    assert!(!outcome.ok, "{printed}");
+}
+
+#[tokio::test]
+async fn a_take_that_would_reduce_a_seeded_position_is_skipped() {
+    // Codex r4289239755: a short the resync seeded, and --side buy: a reduce-only flatten
+    // could not restore it, so no take is sent.
+    let venue = new_venue(true, true);
+    {
+        let mut v = venue.lock().unwrap();
+        v.position = Decimal::from_str("-0.0001").unwrap();
+        // A level smaller than the order: fill-partial too gets as far as the position.
+        v.ask_top.1 = Decimal::from_str("0.00005").unwrap();
+    }
+    let stub = stub_frames(&venue, &[MAIN, 7, 6]).await;
+    let (evidence_dir, _e) = temp_dir("evidence-take-reduces");
+    let (lease_dir, _l) = temp_dir("lease-take-reduces");
+    let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
+    opts.allow_fill = true;
+    let (outcome, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    for name in ["fill", "fill-partial"] {
+        let s = outcome
+            .evidence
+            .steps
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap();
+        assert!(
+            matches!(&s.ran, evidence::Ran::Skipped(why) if why.contains("would reduce")),
+            "{s:?}"
+        );
+    }
+    assert_eq!(
+        venue.lock().unwrap().position,
+        Decimal::from_str("-0.0001").unwrap()
+    );
+    assert!(outcome.ok, "{printed}");
+}
+
+#[tokio::test]
+async fn a_partial_amend_whose_remainder_reading_could_pass_the_cap_is_not_sent_and_not_passed() {
+    // Codex r4289239752 and r4289239743: a long of 60 lots the resync seeded, a cap of 78:
+    // P1 (17) fits, but once it filled 5, its amend read as the remainder could hold
+    // 65 + 17. No amend is sent, and the step is skipped as not exercised, never passed.
+    let venue = new_venue(true, true);
+    {
+        let mut v = venue.lock().unwrap();
+        v.position = Decimal::from_str("0.0006").unwrap();
+        v.ask_top.1 = Decimal::from_str("0.00005").unwrap();
+    }
+    // To the IOC, T1 and F1, P1, its cancel and F2, then B3.
+    let stub = stub_frames(&venue, &[MAIN + 5, 7, 6]).await;
+    let (evidence_dir, _e) = temp_dir("evidence-amend-cap");
+    let (lease_dir, _l) = temp_dir("lease-amend-cap");
+    let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
+    opts.allow_fill = true;
+    let (outcome, printed) = run_against(&opts).await;
+    let report = fs::read_to_string(&outcome.report).unwrap();
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("{e:?}\n{printed}\n{report}"));
+    let ev = &outcome.evidence;
+    let partial = ev.steps.iter().find(|s| s.name == "fill-partial").unwrap();
+    assert!(
+        matches!(&partial.ran, evidence::Ran::Skipped(why) if why.contains("past the caps")),
+        "{partial:?}"
+    );
+    assert!(!partial.pass);
+    assert_eq!(
+        methods(&stub, 0)
+            .iter()
+            .filter(|m| *m == "order.modify")
+            .count(),
+        1,
+        "B1's amend only"
+    );
+    assert_eq!(
+        venue.lock().unwrap().position,
+        Decimal::from_str("0.0006").unwrap()
+    );
+    assert!(outcome.ok, "{printed}");
+}
+
+#[tokio::test]
+async fn an_amend_whose_order_ends_at_its_old_price_is_not_read_as_a_modify() {
+    // Codex r4289239759: P1's amend is answered, then P1 fills its rest at its old price and
+    // closes before any event confirms the amend: that event says nothing of order.modify.
+    let venue = new_venue(true, true);
+    {
+        let mut v = venue.lock().unwrap();
+        v.ask_top.1 = Decimal::from_str("0.00005").unwrap();
+        v.modify_fills = true;
+    }
+    // To the IOC, T1 and F1, P1, its amend and F2 (P1 closed: no cancel), then B3.
+    let stub = stub_frames(&venue, &[MAIN + 5, 7, 6]).await;
+    let (evidence_dir, _e) = temp_dir("evidence-amend-old-price");
+    let (lease_dir, _l) = temp_dir("lease-amend-old-price");
+    let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
+    opts.allow_fill = true;
+    opts.trade.step_timeout_secs = 1;
+    opts.rest_wait_secs = 1;
+    let (outcome, printed) = run_against(&opts).await;
+    let report = fs::read_to_string(&outcome.report).unwrap();
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("{e:?}\n{printed}\n{report}"));
+    let ev = &outcome.evidence;
+    let partial = ev.steps.iter().find(|s| s.name == "fill-partial").unwrap();
+    assert!(!partial.pass, "{partial:?}");
+    let reading = ev.partial_amend.as_deref().unwrap();
+    assert!(reading.starts_with("not read"), "{reading}");
+    assert!(venue.lock().unwrap().position.is_zero(), "{printed}");
+    assert!(!outcome.ok, "{printed}");
 }
