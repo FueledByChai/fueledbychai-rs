@@ -561,6 +561,13 @@ impl ExecHandler for Tap {
         self.inner.on_unprotected(orders);
         self.sample();
     }
+
+    // The shared glue notes an undecodable frame or answer as a problem the moment it is read
+    // (Codex r4289270426); the phase's decode counter below stays as the backstop.
+    fn on_decode_error(&mut self, key: ConnKey) {
+        self.inner.on_decode_error(key);
+        self.sample();
+    }
 }
 
 /// The three phases (module documentation).
