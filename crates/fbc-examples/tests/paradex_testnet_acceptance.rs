@@ -3759,3 +3759,120 @@ fn a_take_past_an_i64_bound_is_refused_by_the_cap_check_not_wrapped() {
     let at_cap = fbc_core::SignedLots(-250);
     assert!(accept::past_cap(at_cap, OrderSide::Sell, qty, cap).is_some());
 }
+
+#[test]
+fn a_partial_amend_whose_worst_case_is_past_an_i64_bound_is_past_the_caps_not_wrapped() {
+    // Codex r4289888345: the amend's worst case adds the total sent to the position checked.
+    let lots = |n: i64| fbc_core::Lots::new(n).unwrap();
+    let near = fbc_core::SignedLots(i64::MAX - 1);
+    assert!(accept::amend_past_caps(
+        near,
+        OrderSide::Buy,
+        lots(5),
+        lots(250),
+        lots(250)
+    ));
+    let low = fbc_core::SignedLots(i64::MIN + 1);
+    assert!(accept::amend_past_caps(
+        low,
+        OrderSide::Sell,
+        lots(5),
+        lots(250),
+        lots(250)
+    ));
+    let flat = fbc_core::SignedLots(5);
+    assert!(!accept::amend_past_caps(
+        flat,
+        OrderSide::Buy,
+        lots(17),
+        lots(20),
+        lots(250)
+    ));
+    assert!(accept::amend_past_caps(
+        flat,
+        OrderSide::Buy,
+        lots(21),
+        lots(20),
+        lots(250)
+    ));
+    assert!(accept::amend_past_caps(
+        fbc_core::SignedLots(240),
+        OrderSide::Buy,
+        lots(17),
+        lots(20),
+        lots(250)
+    ));
+}
+
+#[tokio::test]
+async fn a_partly_filled_order_rest_disagrees_on_is_not_amended_and_stops_the_phase() {
+    // Codex r4289888356: GET /positions answers a position the stream does not show from P1
+    // (the seventh order) on. The comparison while P1 is partly filled never agrees: P1 is not
+    // amended, it is cancelled, nothing is flattened from it, and the phase stops.
+    let venue = new_venue(true, true);
+    {
+        let mut v = venue.lock().unwrap();
+        v.ask_top.1 = Decimal::from_str("0.00005").unwrap();
+        v.stale_position_from = Some(7);
+    }
+    // To the IOC, T1 and F1, P1 and its cancel.
+    let stub = stub_frames(&venue, &[MAIN + 3, 6]).await;
+    let (evidence_dir, _e) = temp_dir("evidence-partial-unagreed");
+    let (lease_dir, _l) = temp_dir("lease-partial-unagreed");
+    let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
+    opts.allow_fill = true;
+    opts.rest_wait_secs = 1;
+    let (outcome, printed) = run_against(&opts).await;
+    let report = fs::read_to_string(&outcome.report).unwrap();
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("{e:?}\n{printed}\n{report}"));
+    let partial = outcome
+        .evidence
+        .steps
+        .iter()
+        .find(|s| s.name == "fill-partial")
+        .unwrap();
+    assert!(
+        !partial.pass && partial.ran == evidence::Ran::Yes,
+        "{partial:?}"
+    );
+    assert!(
+        printed.contains("FAIL fill-partial") && printed.contains("flatten by hand"),
+        "{printed}"
+    );
+    let main = methods(&stub, 0);
+    assert_eq!(
+        main.iter().filter(|m| *m == "order.modify").count(),
+        1,
+        "the amend step's alone: {main:?}"
+    );
+    assert_eq!(
+        main.last().map(String::as_str),
+        Some("order.cancel"),
+        "{main:?}"
+    );
+    assert_eq!(
+        venue.lock().unwrap().position,
+        Decimal::from_str("0.00005").unwrap()
+    );
+    assert!(!outcome.ok, "{printed}");
+}
+
+#[test]
+fn only_p1s_amend_admits_an_order_that_filled_in_part() {
+    // Codex r4289888364: the phase's caps are Paradex's, which refuse the amend of a partly
+    // filled order; only P1's amend is judged under caps that admit it. (No stub can fill B1
+    // between the place step's Open check and its amend: that race is a live venue's, and the
+    // phase judges B1's amend under these caps.)
+    let paradex = fbc_venue_paradex::exec::exec_caps().order;
+    assert!(
+        !paradex.amend.as_ref().unwrap().when_partially_filled,
+        "{paradex:?}"
+    );
+    let p1 = accept::partial_amend_caps(&paradex);
+    assert!(p1.amend.as_ref().unwrap().when_partially_filled, "{p1:?}");
+    let mut without = paradex.clone();
+    without.amend = None;
+    assert!(accept::partial_amend_caps(&without).amend.is_none());
+}
