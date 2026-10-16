@@ -152,9 +152,9 @@ pub async fn run(
         "TESTNET {what}: REST host {rest_host} WS host {ws_host} chain {TESTNET_CHAIN}"
     ));
     lines.line(format_args!(
-        "OWNER-ASSISTED testnet run (decision 0067): Paradex's snapshot source is untrustworthy, \
-         so the market's position is seeded by hand from the venue's REST position; never done \
-         outside a declared testnet run"
+        "OWNER-ASSISTED testnet run (decision 0067): Paradex's snapshot source is trustworthy \
+         (decision 0094), so the resync seeds the market's position; a market it left unknown \
+         is seeded by hand from the venue's REST position, never outside a declared testnet run"
     ));
 
     let factory = &ParadexFactory;
@@ -243,7 +243,7 @@ pub async fn run(
     .map_err(|e| e.to_string())?;
     let ladder = LadderConfig::new(
         Duration::from_secs(5),
-        Duration::from_secs(1),
+        crate::testnet::SNAPSHOT_SETTLE,
         Duration::from_secs(60),
         2,
     )
@@ -1124,6 +1124,11 @@ impl Driver {
                      owner-assisted testnet run (decision 0067)",
                     position.0
                 ));
+            } else {
+                self.lines.line(format_args!(
+                    "SEED position {} lots seeded by the trustworthy resync (decision 0094)",
+                    reg.inventory(INST).0
+                ));
             }
             match reg.start(INST, leases) {
                 Ok(entry) => {
@@ -1448,8 +1453,8 @@ impl Driver {
     }
 
     /// Stop: the kill switch, then the cancel of everything of ours on the market (an
-    /// instrument cancel-all only under 0005's I7 guard, which Paradex's untrustworthy resync
-    /// never meets, so explicit cancels). Paradex takes no cancel by client id before the
+    /// instrument cancel-all under 0005's I7 guard, which Paradex's trustworthy resync can meet
+    /// (decision 0094), otherwise explicit cancels). Paradex takes no cancel by client id before the
     /// venue acknowledged the order, so an unacknowledged order's cancel waits for that
     /// acknowledgement, built the moment it lands ([`Registry::cancels_due`]), for at most the
     /// step timeout; one still waiting then is left to cancel-on-disconnect, which the socket's

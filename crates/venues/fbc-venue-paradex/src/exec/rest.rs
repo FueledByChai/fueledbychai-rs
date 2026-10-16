@@ -51,7 +51,7 @@
 //! answer cannot remove: an open order or position held in a market missing from the spec
 //! table refuses the whole resync (the session cannot place what it holds there); and the two
 //! reads are not one instant, so a fill can land between them (FBC-k7t7 makes that declared;
-//! Paradex's `snapshot_source` stays `Untrustworthy` meanwhile, 0054).
+//! Paradex's `snapshot_source` is `Trustworthy` since decision 0094, which names this residual).
 
 use core::time::Duration;
 use std::collections::BTreeSet;

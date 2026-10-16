@@ -411,6 +411,12 @@ pub fn positive(flag: &str, value: &str) -> Result<Decimal, String> {
 /// Where the lines go: standard output when run, a buffer under test.
 pub type Out = Rc<RefCell<dyn Write>>;
 
+/// How long after an order was sent a resync's watermark must be before the order's absence from
+/// it counts toward Lost (the ladder's `settle`): Paradex's snapshot is trustworthy (decision
+/// 0094), so an absence can end an order, and FBC-8xr's runs saw `GET /orders` lag the stream by
+/// up to 3480 ms. Well above that, so a lagging snapshot never ends an order still resting.
+pub const SNAPSHOT_SETTLE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The one market's instrument id and the account's number.
 pub const INST: InstrumentId = InstrumentId::new(1);
 pub const ACCT: AccountKey = AccountKey::new(1);

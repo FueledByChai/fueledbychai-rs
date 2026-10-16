@@ -22,8 +22,9 @@ pub const USAGE: &str = "\
 testnet_trade: places ONE post-only limit order of the size you give, well away from the touch
 on a Paradex TESTNET market through fbc-oms, waits for its acknowledgement, cancels it, waits
 for the cancel's acknowledgement, then Stops (kill switch + cancel all) and exits. TESTNET ONLY: a
-mainnet URL or chain id is refused before anything connects. An owner-assisted testnet run:
-the market's position is seeded by hand from the venue's own REST position (decision 0067).
+mainnet URL or chain id is refused before anything connects. An owner-assisted testnet run (decision 0067):
+the resync seeds the market's position (Paradex's snapshot is trustworthy, decision 0094), or,
+when it left it unknown, it is seeded by hand from the venue's own REST position.
 
 Usage: cargo run -p fbc-examples --example testnet_trade -- [OPTIONS]
 
@@ -105,7 +106,7 @@ Lines (each step with the milliseconds since the start):
   STEP login         the login answered and the order socket is authenticated
   STEP arm           Paradex accepted cancel-on-disconnect for the socket
   STEP resync        the REST resync of open orders and positions ended
-  SEED ...           the position seeded by hand from the resync's REST position
+  SEED ...           the position the resync seeded (or seeded by hand, if it did not)
   STEP start         the market was Started under its caps
   STEP place         the order was handed to the session
   STEP ack           Paradex answered the place (provisional: queued for its risk check)

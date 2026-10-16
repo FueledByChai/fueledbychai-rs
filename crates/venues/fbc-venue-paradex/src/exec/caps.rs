@@ -170,11 +170,15 @@ pub fn exec_caps() -> ExecCaps {
             // (non-sequential) ... changes on every order update").
             ordering_key: OrderingKey::VenueSeq,
             // Undocumented whether the open-orders snapshot is consistent with the order
-            // stream: declared untrustworthy (decision 0054, the owner's choice), so an
-            // absence from it never ends an order and a resync from it never seeds a
-            // position. A new record flips it, on FBC-8xr's testnet evidence, before any
-            // live Paradex session.
-            snapshot_source: SnapshotSource::Untrustworthy,
+            // stream: declared untrustworthy by 0054 (the owner's choice) until a new record
+            // decided it on testnet evidence. Decision 0094 (FBC-2f7w) does: in FBC-8xr's
+            // three runs `GET /orders` listed every order the stream acknowledged and omitted
+            // every one it ended at all 24 comparisons, within 3.5 s, with no pagination, so a
+            // resync from it seeds a position and an order's absence from it may end the
+            // order (Lost). `GET /positions` following fills was not exercised (no testnet
+            // order filled): 0094's condition verifies it in the first mainnet sessions with
+            // fills, a resync disagreeing with the inventory stopping the session.
+            snapshot_source: SnapshotSource::Trustworthy,
             // The schema's OrderEvent carries `timeInForce` (POST_ONLY, RPI) and `flags`
             // (REDUCE_ONLY).
             events_echo_flags: true,

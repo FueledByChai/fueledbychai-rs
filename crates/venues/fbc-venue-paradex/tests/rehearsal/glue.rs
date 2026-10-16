@@ -145,6 +145,9 @@ impl Glue {
             VenueCommand::PlaceBatch(orders) => orders.iter().map(|o| Item::Place(o.cid)).collect(),
             VenueCommand::Cancel(c) => vec![cancel_of(c)],
             VenueCommand::CancelMany(cs) => cs.iter().map(cancel_of).collect(),
+            // An instrument cancel-all names no order: each ends by its own order event (as
+            // fbc-examples' link takes it).
+            VenueCommand::CancelAll(_) => Vec::new(),
             other => panic!("not modelled by this glue: {other:?}"),
         }
     }

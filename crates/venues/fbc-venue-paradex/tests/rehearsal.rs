@@ -7,12 +7,12 @@
 //! (`rehearsal/capture.rs`) and everything the session sends and receives journaled (FBC-2pr's
 //! journal, credential spans kept only as keyed hashes, decision 0006).
 //!
-//! **The seed.** Paradex's snapshot source stays `Untrustworthy` (decision 0054; the owner's
-//! answer C to RB-olg-3), so a resync seeds no position and Start stays refused after it. The
-//! rehearsal runs as the owner-assisted testnet run will: the registry is built for a declared
-//! `TestnetRun::owner_assisted()` (decision 0067) and the market is seeded by hand from the
-//! position the first resync read over REST, once that resync has ended. The codec's caps are
-//! Paradex's own, unchanged.
+//! **The seed.** Paradex's snapshot source is `Trustworthy` (decision 0094, on FBC-8xr's testnet
+//! evidence), so the first resync seeds the market's position and Start is taken after it with no
+//! hand seed, by a registry not declared a testnet run: the rehearsal runs as a mainnet session
+//! now does. The kill switch's cancel everything is then an instrument cancel-all (0005's I7). The
+//! codec's caps are Paradex's own, unchanged. A hand seed (decision 0067) is used only for the
+//! second registry that shows the market lease refused, declared a testnet run.
 //!
 //! The values are the owner's first test values on BTC-USD-PERP at about 60000 on its 0.00001
 //! size step (a lot is about $0.60): $11 resting per side (18 lots) and $50 inventory (83 lots).
@@ -170,9 +170,20 @@ fn order_caps() -> OrderCaps {
     exec_caps().order
 }
 
-/// A registry declared an owner-assisted testnet run (decision 0067) under the owner's caps,
-/// its lease names given.
+/// A registry under the owner's caps, its lease names given, not declared a testnet run: a
+/// trustworthy resync seeds it (decision 0094).
 fn registry() -> Registry {
+    let limits = MarketCapsConfig {
+        inventory: Some(lots(INVENTORY_CAP)),
+        resting: Some(lots(RESTING_CAP)),
+    };
+    let caps = PreTradeCaps::new().with_market(INST, limits).unwrap();
+    let keys = LeaseKeys::new(VENUE, ACCOUNT_LABEL, &order_caps()).with_market(INST, symbol());
+    Registry::with_caps(caps).with_lease_keys(keys)
+}
+
+/// [`registry`] declared an owner-assisted testnet run (decision 0067), so a hand seed may arm.
+fn testnet_registry() -> Registry {
     let limits = MarketCapsConfig {
         inventory: Some(lots(INVENTORY_CAP)),
         resting: Some(lots(RESTING_CAP)),
@@ -637,7 +648,7 @@ async fn a_refused_login_reaches_the_consumer_with_its_status_and_paradexs_error
 }
 
 /// From a fresh start: no place or amend frame until Start; Start refused until the first
-/// resync has ended (and, the snapshot source untrustworthy, until the owner's hand seed); the
+/// resync has ended, which seeds the market (the snapshot source trustworthy, 0094); the
 /// arm accepted before the first order frame; an earlier run's order cancelled on the disarmed
 /// market before Start; a placed order acknowledged and filled moving the inventory once, its
 /// fill repeated; a place over the resting cap, a place or amend while Killed and any ordinary
@@ -716,15 +727,13 @@ async fn from_a_fresh_start_every_safety_rule_holds_against_the_stub() {
                     Some(Note::Resynced { report, snapshot }) => (report.clone(), snapshot.clone()),
                     _ => unreachable!(),
                 };
-            // The snapshot source is untrustworthy: the resync seeded nothing, so Start is
-            // still refused, and the planner builds nothing.
-            assert!(report.untrustworthy, "{report:?}");
-            assert!(report.seeded.is_empty(), "{report:?}");
-            assert!(!g.reg.position_known(INST));
-            assert_eq!(
-                g.reg.start(INST, Leases::none()),
-                Err(ArmRefusal::PositionUnknown(INST))
-            );
+            // The snapshot source is trustworthy (0094): the resync seeded the market flat
+            // from REST, with no hand seed; the market stays disarmed until Start, so the
+            // planner builds nothing.
+            assert!(!report.untrustworthy, "{report:?}");
+            assert_eq!(report.seeded, [(INST, SignedLots(0))], "{report:?}");
+            assert!(g.reg.position_known(INST));
+            assert!(!g.reg.entry(INST).armed());
             let (now, _) = g.now();
             let want = DesiredBook::new(INST).with(Side::Buy, 0, quote(599_900, 10, false));
             let plan = planner
@@ -750,18 +759,10 @@ async fn from_a_fresh_start_every_safety_rule_holds_against_the_stub() {
             "{before_start:?}"
         );
 
-        // The owner's hand seed, from the position the resync read (flat), then Start.
+        // Start, on the resync's seed: no hand seed, in a registry not declared a testnet run.
         {
             let mut g = glue.borrow_mut();
-            let flat = match g.notes.iter().find(|n| matches!(n, Note::Resynced { .. })) {
-                Some(Note::Resynced { snapshot, .. }) => snapshot
-                    .positions
-                    .iter()
-                    .find(|(i, _)| *i == INST)
-                    .map_or(SignedLots(0), |(_, q)| *q),
-                _ => unreachable!(),
-            };
-            g.reg.seed_position(INST, flat).unwrap();
+            assert_eq!(g.reg.inventory(INST), SignedLots(0));
             let entry = g.reg.start(INST, market_lease(&dir)).unwrap();
             assert_eq!(entry.state(), EntryState::Quoting);
         }
@@ -965,14 +966,18 @@ async fn from_a_fresh_start_every_safety_rule_holds_against_the_stub() {
                 .plan(&want, &mut g.reg, &caps, ACCT, &mut mint, now)
                 .unwrap();
             assert!(plan.commands.is_empty(), "{plan:?}");
-            let CancelEverything::Explicit { plan, .. } = g.reg.cancel_everything(INST, &caps)
+            // A trustworthy resync showed the account's open orders and none is foreign: the
+            // instrument cancel-all (0005's I7), nothing unanswered beside it.
+            let CancelEverything::CancelAll {
+                command,
+                unanswered,
+            } = g.reg.cancel_everything(INST, &caps)
             else {
-                panic!("no cancel-all under an untrustworthy snapshot (0005's I7)");
+                panic!("an instrument cancel-all under a trustworthy snapshot (0005's I7)");
             };
-            for cmd in plan.commands {
-                let auth = g.reg.authorize(ACCT, cmd).unwrap();
-                g.submit(&orders, auth);
-            }
+            assert!(unanswered.commands.is_empty(), "{unanswered:?}");
+            let auth = g.reg.authorize(ACCT, command).unwrap();
+            g.submit(&orders, auth);
         }
         until(&glue, "C cancelled", |g| is_terminal(g, c)).await;
         {
@@ -994,7 +999,7 @@ async fn from_a_fresh_start_every_safety_rule_holds_against_the_stub() {
         // On the second connection: the opening six, then only the kill switch's cancel of C.
         let conn1 = stub.methods(1);
         opening(&conn1[..6]);
-        assert_eq!(order_methods(&conn1), ["order.cancel_batch"], "{conn1:?}");
+        assert_eq!(order_methods(&conn1), ["order.cancel_all"], "{conn1:?}");
         {
             let g = glue.borrow();
             assert!(problems(&g).is_empty(), "{:?}", problems(&g));
@@ -1003,7 +1008,7 @@ async fn from_a_fresh_start_every_safety_rule_holds_against_the_stub() {
         // A second holder of the market lease cannot arm: the lease is held, and a registry
         // without it is refused.
         assert!(MarketLease::acquire(&dir, VENUE, ACCOUNT_LABEL, &symbol()).is_err());
-        let mut second = registry();
+        let mut second = testnet_registry();
         second.seed_position(INST, SignedLots(10)).unwrap();
         assert_eq!(
             second.start(INST, Leases::none()),
@@ -1043,7 +1048,7 @@ async fn from_a_fresh_start_every_safety_rule_holds_against_the_stub() {
 }
 
 /// After a restart: the venue shows a long position and nothing resting. Flatten is refused
-/// until the first resync has ended and the owner's seed; then it arms the market straight into
+/// until the first resync has ended, which seeds the position (0094); then it arms the market straight into
 /// Exit, and only reduce-only sells that never take the position past zero are written, even
 /// when the desired book asks for more.
 #[tokio::test]
@@ -1087,10 +1092,8 @@ async fn after_a_restart_flatten_writes_only_reduce_only_exits_that_never_cross_
             let mut g = glue.borrow_mut();
             let pos = match g.notes.iter().find(|n| matches!(n, Note::Resynced { .. })) {
                 Some(Note::Resynced { report, snapshot }) => {
-                    assert!(
-                        report.untrustworthy && report.seeded.is_empty(),
-                        "{report:?}"
-                    );
+                    assert!(!report.untrustworthy, "{report:?}");
+                    assert_eq!(report.seeded, [(INST, SignedLots(10))], "{report:?}");
                     snapshot
                         .positions
                         .iter()
@@ -1101,11 +1104,8 @@ async fn after_a_restart_flatten_writes_only_reduce_only_exits_that_never_cross_
                 _ => unreachable!(),
             };
             assert_eq!(pos, SignedLots(10));
-            assert_eq!(
-                g.reg.flatten(INST, Leases::none()),
-                Err(ArmRefusal::PositionUnknown(INST))
-            );
-            g.reg.seed_position(INST, pos).unwrap();
+            // Seeded by the resync: Flatten is taken with no hand seed.
+            assert_eq!(g.reg.inventory(INST), SignedLots(10));
             let entry = g.reg.flatten(INST, market_lease(&dir)).unwrap();
             assert_eq!(entry.state(), EntryState::Exit(ExitKind::Flatten));
 

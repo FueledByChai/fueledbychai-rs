@@ -403,7 +403,8 @@ rather than guess.
     captured public frames and sessions in `fixtures/paradex/md/` (the bare `deltas` and
     `interactive_deltas` channels, 0074); the REST `/orderbook` snapshot at depth 15
     (`src/md/rest.rs`); order entry's `ExecCaps` with each value cited and the undocumented ones
-    declared conservatively (`src/exec/`, 0054); the private `OrderEvent` at SBE 1:2 decoded
+    declared conservatively (`src/exec/`, 0054), the snapshot source trustworthy on FBC-8xr's
+    testnet evidence (0094); the private `OrderEvent` at SBE 1:2 decoded
     into order updates, a modify's SUCCESS an amend and its REJECTED an asynchronous reject,
     each reported once per order and request, a later event repeating it the order update alone
     (`ModifyRequests`, kept by the codec, 0086; bounded to each order's latest outcomes, 0091)
@@ -427,8 +428,8 @@ rather than guess.
     and the order-entry or read-only codec as `paradex.exec.mode` says, its order signer from
     `auth::order_signer` so no credential is read outside `src/auth` (`src/factory.rs`, 0072);
     the offline rehearsal (`tests/rehearsal.rs`, FBC-8mv): fbc-oms, the order-entry session and
-    this codec against the conformance stub, the market seeded by hand under a declared testnet
-    run (0067), every record the log facade emits read at TRACE; the named conformance suite
+    this codec against the conformance stub, the market seeded by the trustworthy resync with
+    no hand seed (0094), every record the log facade emits read at TRACE; the named conformance suite
     (`tests/conformance.rs`, FBC-6oj) on `ParadexFactory`, its fixtures in
     `fixtures/paradex/conformance/` and what they assume in `tests/conformance/setup.rs`; and, in
     `tests/oracle/` with `fbc-book` as a dev-dependency only, the

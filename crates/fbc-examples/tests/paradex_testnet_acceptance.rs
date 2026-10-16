@@ -719,6 +719,26 @@ fn responder(venue: Arc<Mutex<Venue>>, conn: usize) -> Responder {
                 }
                 frames.extend(events);
             }
+            "order.cancel_all" => {
+                // An instrument cancel-all, which fbc-oms builds under 0005's I7 guard now that
+                // Paradex's resync is trustworthy (decision 0094): `{"status":"ok"}`, then every
+                // order still open on the market CLOSED, each by its order event.
+                if params["market"] != MARKET {
+                    return Err(format!("a cancel-all not of the market: {params}"));
+                }
+                frames.push(ok(json!({"status": "ok"})));
+                for i in 0..v.orders.len() {
+                    if v.orders[i].status == "CLOSED" {
+                        continue;
+                    }
+                    let seq = v.next_seq();
+                    let o = &mut v.orders[i];
+                    o.status = "CLOSED";
+                    o.cancel_reason = "USER_CANCELED".to_owned();
+                    let o = o.clone();
+                    frames.push(Frame::Binary(order_event(&o, seq, 4, None)));
+                }
+            }
             other => return Err(format!("an unexpected method {other}")),
         }
         // What was held goes first: the venue sends its order events in order.
@@ -885,7 +905,10 @@ fn script(
     extra_stop: usize,
 ) -> WsScript {
     let mut steps = Vec::new();
-    for (conn, frames) in [(0, main), (1, 7 + extra_graceful), (2, 6 + extra_stop)] {
+    // The stop connection: the opening six, Stop's instrument cancel-all (fbc-oms builds one
+    // under 0005's I7 guard once Paradex's trustworthy resync showed the account's open
+    // orders, decision 0094), and what a test adds.
+    for (conn, frames) in [(0, main), (1, 7 + extra_graceful), (2, 7 + extra_stop)] {
         steps.push(Step::Accept);
         let with = responder(Arc::clone(venue), conn);
         steps.extend((0..frames).map(|_| Step::Respond {
@@ -1115,7 +1138,10 @@ async fn the_program_runs_every_step_once_maps_each_to_the_lattice_and_writes_sc
     );
     assert_eq!(graceful.len(), 7, "{graceful:?}");
     let stop = methods(&stub, 2);
-    assert_eq!(stop.len(), 6, "nothing left to cancel at Stop: {stop:?}");
+    // Nothing of ours is left, but Stop's cancel everything is the instrument cancel-all
+    // (0005's I7 under Paradex's trustworthy resync, decision 0094), sent all the same.
+    assert_eq!(stop.len(), 7, "{stop:?}");
+    assert_eq!(stop[6], "order.cancel_all", "{stop:?}");
     // The dropped socket sent no close frame; the graceful one did.
     let conns = stub.connections();
     assert_eq!(conns.len(), 3);
@@ -2715,7 +2741,7 @@ async fn the_fill_step_takes_flattens_and_compares_positions_with_the_fills() {
     // /positions is compared with the fills, a reduce-only IOC on the bid flattens it, and it
     // is compared again. The ask's level is larger than the order: no partial fill arises.
     let venue = new_venue(true, true);
-    let stub = stub_frames(&venue, &[MAIN + 2, 7, 6]).await;
+    let stub = stub_frames(&venue, &[MAIN + 2, 7, 7]).await;
     let (evidence_dir, _e) = temp_dir("evidence-fill");
     let (lease_dir, _l) = temp_dir("lease-fill");
     let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
@@ -2842,7 +2868,7 @@ async fn a_partly_filled_order_is_amended_and_what_the_venue_made_of_the_size_re
     venue.lock().unwrap().ask_top.1 = Decimal::from_str("0.00005").unwrap();
     // The main phase: the opening, the steps to the IOC, T1 and F1, then P1, its amend, its
     // cancel and F2, then B3.
-    let stub = stub_frames(&venue, &[MAIN + 6, 7, 6]).await;
+    let stub = stub_frames(&venue, &[MAIN + 6, 7, 7]).await;
     let (evidence_dir, _e) = temp_dir("evidence-partial");
     let (lease_dir, _l) = temp_dir("lease-partial");
     let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
@@ -2915,7 +2941,7 @@ fn what_a_venue_made_of_a_modify_size_is_read_as_the_total_the_remainder_or_neit
 async fn the_fill_steps_need_both_sides_of_the_book_and_send_nothing_that_takes_without_them() {
     let venue = new_venue(true, true);
     venue.lock().unwrap().one_sided = true;
-    let stub = stub_frames(&venue, &[MAIN - 2, 7, 6]).await;
+    let stub = stub_frames(&venue, &[MAIN - 2, 7, 7]).await;
     let (evidence_dir, _e) = temp_dir("evidence-fill-one-sided");
     let (lease_dir, _l) = temp_dir("lease-fill-one-sided");
     let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
@@ -3186,7 +3212,7 @@ async fn an_unresolved_take_is_settled_before_it_is_flattened_and_its_step_fails
     let venue = new_venue(true, true);
     venue.lock().unwrap().hold_take = true;
     // To the IOC, then T1, its cancel and F1, then B3.
-    let stub = stub_frames(&venue, &[MAIN + 3, 7, 6]).await;
+    let stub = stub_frames(&venue, &[MAIN + 3, 7, 7]).await;
     let (evidence_dir, _e) = temp_dir("evidence-take-unresolved");
     let (lease_dir, _l) = temp_dir("lease-take-unresolved");
     let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
@@ -3232,7 +3258,7 @@ async fn a_take_that_would_reduce_a_seeded_position_is_skipped() {
         // A level smaller than the order: fill-partial too gets as far as the position.
         v.ask_top.1 = Decimal::from_str("0.00005").unwrap();
     }
-    let stub = stub_frames(&venue, &[MAIN, 7, 6]).await;
+    let stub = stub_frames(&venue, &[MAIN, 7, 7]).await;
     let (evidence_dir, _e) = temp_dir("evidence-take-reduces");
     let (lease_dir, _l) = temp_dir("lease-take-reduces");
     let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
@@ -3270,7 +3296,7 @@ async fn a_partial_amend_whose_remainder_reading_could_pass_the_cap_is_not_sent_
         v.ask_top.1 = Decimal::from_str("0.00005").unwrap();
     }
     // To the IOC, T1 and F1, P1, its cancel and F2, then B3.
-    let stub = stub_frames(&venue, &[MAIN + 5, 7, 6]).await;
+    let stub = stub_frames(&venue, &[MAIN + 5, 7, 7]).await;
     let (evidence_dir, _e) = temp_dir("evidence-amend-cap");
     let (lease_dir, _l) = temp_dir("lease-amend-cap");
     let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
@@ -3313,7 +3339,7 @@ async fn an_amend_whose_order_ends_at_its_old_price_is_not_read_as_a_modify() {
         v.modify_fills = true;
     }
     // To the IOC, T1 and F1, P1, its amend and F2 (P1 closed: no cancel), then B3.
-    let stub = stub_frames(&venue, &[MAIN + 5, 7, 6]).await;
+    let stub = stub_frames(&venue, &[MAIN + 5, 7, 7]).await;
     let (evidence_dir, _e) = temp_dir("evidence-amend-old-price");
     let (lease_dir, _l) = temp_dir("lease-amend-old-price");
     let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
@@ -3481,7 +3507,7 @@ async fn a_partial_order_stating_open_before_its_fill_is_still_amended() {
         v.ask_top.1 = Decimal::from_str("0.00005").unwrap();
         v.open_before_fill = true;
     }
-    let stub = stub_frames(&venue, &[MAIN + 6, 7, 6]).await;
+    let stub = stub_frames(&venue, &[MAIN + 6, 7, 7]).await;
     let (evidence_dir, _e) = temp_dir("evidence-open-before-fill");
     let (lease_dir, _l) = temp_dir("lease-open-before-fill");
     let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
@@ -3619,7 +3645,7 @@ async fn a_take_refused_for_want_of_margin_is_recorded_as_its_own_case_not_a_ris
     // (2), which excludes that reason, is not observed.
     let venue = new_venue(true, true);
     venue.lock().unwrap().refuse_take = Some("NOT_ENOUGH_MARGIN");
-    let stub = stub_frames(&venue, &[MAIN + 1, 7, 6]).await;
+    let stub = stub_frames(&venue, &[MAIN + 1, 7, 7]).await;
     let (evidence_dir, _e) = temp_dir("evidence-take-margin");
     let (lease_dir, _l) = temp_dir("lease-take-margin");
     let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
@@ -3737,7 +3763,7 @@ async fn a_failed_book_read_during_the_flatten_fails_the_step_though_a_later_rea
     // F2 flattens what T1 took, and the step still fails for the read that failed.
     let venue = new_venue(true, true);
     venue.lock().unwrap().book_fail_after_take = true;
-    let stub = stub_frames(&venue, &[MAIN + 2, 7, 6]).await;
+    let stub = stub_frames(&venue, &[MAIN + 2, 7, 7]).await;
     let (evidence_dir, _e) = temp_dir("evidence-flatten-book-fails");
     let (lease_dir, _l) = temp_dir("lease-flatten-book-fails");
     let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
@@ -3863,9 +3889,11 @@ async fn a_partly_filled_order_rest_disagrees_on_is_not_amended_and_stops_the_ph
         1,
         "the amend step's alone: {main:?}"
     );
+    // P1's cancel, then the phase's Stop: the instrument cancel-all (0005's I7 under
+    // Paradex's trustworthy resync, decision 0094).
     assert_eq!(
-        main.last().map(String::as_str),
-        Some("order.cancel"),
+        main[main.len() - 2..],
+        ["order.cancel", "order.cancel_all"],
         "{main:?}"
     );
     assert_eq!(

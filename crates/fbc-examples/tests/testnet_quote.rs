@@ -9,11 +9,11 @@
 //!
 //! **The reconnect's cancel.** The ticket asks for an instrument cancel-all there. fbc-oms
 //! builds one only under 0005's I7 guard, which needs a trustworthy resync to have shown the
-//! account's open orders; Paradex's snapshot source is Untrustworthy (owner answer C to
-//! RB-olg-3), so fbc-oms refuses it (`CancelAllRefusal::NotViewed`) and the loop cancels each
-//! order of ours still open explicitly: those the resync shows through the session's Safety
-//! cancels (decision 0080), and any other the registry holds open (one the snapshot did not
-//! show) through its own. The loop takes the instrument cancel-all whenever fbc-oms builds one.
+//! account's open orders; Paradex's snapshot source is Trustworthy (decision 0094), so the
+//! loop's sweeps (at the start and after each reconnect) and Stop send the instrument
+//! cancel-all (`order.cancel_all` for the market), the orders the resync shows still
+//! Safety-cancelled by the session as the connection opens (decision 0080). The stub answers it
+//! `{"status":"ok"}` and closes every order of ours still open on the market.
 //!
 //! The stub is a small stateful venue ([`Venue`]): it answers the login, the order book the
 //! test scripts cycle by cycle, the resync's open orders (from what it holds) and positions over
@@ -299,8 +299,9 @@ struct Venue {
     /// Answer the next single cancel of a buy queued, then fill the buy whole (its fill event
     /// sent twice, the second a duplicate) and close it filled: a fill racing the cancel.
     fill_next_buy_cancel: bool,
-    /// Answer every batch cancel's second item ALREADY_CLOSED, its order's end sent first.
-    batch_second_already_closed: bool,
+    /// Answer every instrument cancel-all with Paradex's internal error
+    /// (`fixtures/paradex/exec/error-internal.json`), closing nothing.
+    refuse_cancel_all: bool,
     /// Send a frame no codec decodes after the reply to this place (from 1).
     garbage_after_create: Option<usize>,
     /// Notified at this `GET /orderbook` read (from 1): the loop's cycle before it settled.
@@ -533,27 +534,39 @@ fn responder(venue: &Shared, conn: usize) -> Responder {
                 let ids = params["order_ids"].as_array().cloned().unwrap_or_default();
                 let mut results = Vec::new();
                 let mut events = Vec::new();
-                let mut first = Vec::new();
-                for (i, id) in ids.iter().enumerate() {
+                for id in &ids {
                     let vid = id.as_str().unwrap_or("");
                     let at = v
                         .orders
                         .iter()
                         .position(|o| o.vid == vid)
                         .ok_or("a batch cancel of no order the stub holds")?;
-                    let status = if v.batch_second_already_closed && i == 1 {
-                        // Its end is sent before the reply: it closed before the cancel came.
-                        first.push(closed(&mut v, at));
-                        "ALREADY_CLOSED"
-                    } else {
-                        events.push(closed(&mut v, at));
-                        "QUEUED_FOR_CANCELLATION"
-                    };
+                    events.push(closed(&mut v, at));
+                    let status = "QUEUED_FOR_CANCELLATION";
                     results.push(json!({"id": vid, "market": MARKET, "status": status}));
                 }
-                let mut frames = first;
-                frames.push(ok(json!({ "results": results })));
+                let mut frames = vec![ok(json!({ "results": results }))];
                 frames.extend(events);
+                frames
+            }
+            "order.cancel_all" => {
+                // An instrument cancel-all, which fbc-oms builds under 0005's I7 guard now that
+                // Paradex's resync is trustworthy (decision 0094): `{"status":"ok"}`, then every
+                // order still open on the market CLOSED, each by its order event.
+                if params["market"] != MARKET {
+                    return Err(format!("a cancel-all not of the market: {params}"));
+                }
+                if v.refuse_cancel_all {
+                    let error = json!({"code": -32603, "message": "Internal error"});
+                    let reply = json!({"jsonrpc": "2.0", "error": error, "id": id});
+                    return Ok(vec![Frame::text(reply.to_string())]);
+                }
+                let mut frames = vec![ok(json!({"status": "ok"}))];
+                for at in 0..v.orders.len() {
+                    if v.orders[at].open {
+                        frames.push(closed(&mut v, at));
+                    }
+                }
                 frames
             }
             other => return Err(format!("an unexpected method {other}")),
@@ -731,10 +744,11 @@ async fn testnet_quote_requotes_by_cancel_and_replace_within_the_caps_against_th
         book(3, Some("61900.0"), Some("61900.4")),
     ];
     let venue = venue(books);
-    // The opening six (auth, four subscriptions, the arm), two places, two replaces of two
-    // cancels and two places each, and Stop's one batch cancel.
+    // The opening six (auth, four subscriptions, the arm), the start's sweep (an instrument
+    // cancel-all: Paradex's resync is trustworthy, decision 0094), two places, two replaces of
+    // two cancels and two places each, and Stop's instrument cancel-all.
     let stub = StubServer::start(
-        one_connection(&venue, 6 + 2 + 4 + 4 + 1),
+        one_connection(&venue, 6 + 1 + 2 + 4 + 4 + 1),
         routes(&venue, login_ok()),
     )
     .await
@@ -747,7 +761,7 @@ async fn testnet_quote_requotes_by_cancel_and_replace_within_the_caps_against_th
     assert_eq!(report.ended, "--cycles 4 reached", "{printed}");
     assert_eq!(
         (report.cycles, report.places_sent, report.cancels_sent),
-        (4, 6, 5),
+        (4, 6, 6),
         "{printed}"
     );
     assert_eq!(
@@ -764,8 +778,11 @@ async fn testnet_quote_requotes_by_cancel_and_replace_within_the_caps_against_th
     assert_eq!(count("order.modify"), 0, "{sent:?}");
     assert_eq!(count("order.create"), 6, "{sent:?}");
     assert_eq!(count("order.cancel"), 4, "{sent:?}");
-    assert_eq!(count("order.cancel_batch"), 1, "{sent:?}");
-    assert_eq!(count("order.cancel_all"), 0, "{sent:?}");
+    assert_eq!(count("order.cancel_batch"), 0, "{sent:?}");
+    // The start's sweep and Stop: the instrument cancel-all, first and last.
+    assert_eq!(count("order.cancel_all"), 2, "{sent:?}");
+    assert_eq!(sent[6], "order.cancel_all", "{sent:?}");
+    assert_eq!(sent.last().map(String::as_str), Some("order.cancel_all"));
 
     // Per side, on the wire: a place, then the cancel of that very order before the next place.
     let reqs = requests(&venue, 0);
@@ -792,6 +809,8 @@ async fn testnet_quote_requotes_by_cancel_and_replace_within_the_caps_against_th
                         }
                     }
                 }
+                // Every order of ours on the market (Stop's).
+                "order.cancel_all" => resting = None,
                 _ => {}
             }
         }
@@ -865,7 +884,7 @@ async fn testnet_quote_requotes_by_cancel_and_replace_within_the_caps_against_th
     assert_eq!(tagged(&printed, "CYCLE").len(), 3, "{printed}");
     assert!(
         printed.contains(
-            "SUMMARY cycles 4 orders placed 6 cancels sent 5 orders cancelled 6 fills 0 \
+            "SUMMARY cycles 4 orders placed 6 cancels sent 6 orders cancelled 6 fills 0 \
              inventory 0 lots"
         ),
         "{printed}"
@@ -886,11 +905,13 @@ async fn after_a_reconnect_every_order_of_ours_is_cancelled_before_any_place() {
     let venue = venue(vec![b0()]);
     // The resync after the reconnect shows the bid resting but not the ask (a lagging
     // snapshot): the session tells the bid unprotected and the link Safety-cancels it (decision
-    // 0080), and the loop's own sweep cancels the ask, which the registry still holds open.
+    // 0080), and the loop's own sweep cancels the ask, which the registry still holds open, by
+    // an instrument cancel-all (Paradex's resync is trustworthy, decision 0094).
     lock(&venue).hide_sells_after_first = true;
-    // First connection: the opening six and two places, then the stub closes it. Second: the
-    // opening six, the bid's Safety cancel, the ask's sweep cancel, two places, Stop's cancel.
-    let script = reconnecting(&venue, 6 + 2, 6 + 1 + 1 + 2 + 1);
+    // First connection: the opening six, the start's sweep (a cancel-all) and two places, then
+    // the stub closes it. Second: the opening six, the bid's Safety cancel, the sweep's
+    // cancel-all, two places, Stop's cancel-all.
+    let script = reconnecting(&venue, 6 + 1 + 2, 6 + 1 + 1 + 2 + 1);
     let stub = StubServer::start(script, routes(&venue, login_ok()))
         .await
         .unwrap();
@@ -904,21 +925,38 @@ async fn after_a_reconnect_every_order_of_ours_is_cancelled_before_any_place() {
         .iter()
         .position(|m| m == "order.create")
         .unwrap_or_else(|| panic!("nothing placed after the reconnect: {conn1:?}\n{printed}"));
-    // Before any place on the new connection, a cancel of each order of ours conn 0 left.
-    let cancelled: Vec<String> = requests(&venue, 1)[..first_place]
-        .iter()
-        .flat_map(cancelled_ids)
-        .collect();
-    let left: Vec<String> = lock(&venue).orders[..2]
-        .iter()
-        .map(|o| o.vid.clone())
-        .collect();
-    for vid in &left {
-        assert!(
-            cancelled.contains(vid),
-            "{vid} not cancelled first: {conn1:?}\n{printed}"
-        );
-    }
+    // Before any place on the new connection, a cancel of each order of ours conn 0 left: the
+    // bid's Safety cancel names it, and the sweep's instrument cancel-all takes the ask.
+    let before = &requests(&venue, 1)[..first_place];
+    let cancelled: Vec<String> = before.iter().flat_map(cancelled_ids).collect();
+    let (bid, ask) = {
+        let v = lock(&venue);
+        let of = |side: &str| {
+            v.orders[..2]
+                .iter()
+                .find(|o| o.side == side)
+                .unwrap()
+                .vid
+                .clone()
+        };
+        (of("BUY"), of("SELL"))
+    };
+    assert!(
+        cancelled.contains(&bid),
+        "the bid not cancelled first: {conn1:?}\n{printed}"
+    );
+    assert!(
+        !cancelled.contains(&ask),
+        "the ask is the sweep's: {conn1:?}\n{printed}"
+    );
+    assert_eq!(
+        before
+            .iter()
+            .filter(|r| r["method"] == "order.cancel_all")
+            .count(),
+        1,
+        "{conn1:?}\n{printed}"
+    );
     assert_eq!(
         conn1[..6].iter().filter(|m| m.contains("order.")).count(),
         1,
@@ -934,14 +972,13 @@ async fn after_a_reconnect_every_order_of_ours_is_cancelled_before_any_place() {
         0,
         "{conn1:?}"
     );
-    // The reconnect says how: explicit cancels, since fbc-oms builds no instrument cancel-all
-    // without a trustworthy resync (0005's I7).
+    // The reconnect says how: the instrument cancel-all fbc-oms builds once a trustworthy
+    // resync has shown the account's open orders (0005's I7; decision 0094).
     assert!(
-        printed.contains("RECONNECT every order of ours still open on the market is cancelled"),
-        "{printed}"
-    );
-    assert!(
-        printed.contains("no trustworthy resync has shown the account's open orders yet"),
+        printed.contains(
+            "RECONNECT every order of ours still open on the market is cancelled before any \
+             place: 1 cancels sent (an instrument cancel-all)"
+        ),
         "{printed}"
     );
     assert!(printed.contains("Safety cancel requests"), "{printed}");
@@ -953,9 +990,10 @@ async fn a_resync_position_mismatch_stops_it_with_no_place_after() {
     let venue = venue(vec![b0()]);
     // After the reconnect the venue reports a long position the inventory (flat) does not hold.
     lock(&venue).position_after_first = Some("0.001");
-    // Second connection: the opening six and the Safety cancel of both resting orders; then
-    // Stop, which finds both cancels in flight, and nothing more.
-    let script = reconnecting(&venue, 6 + 2, 6 + 1);
+    // First connection: the opening six, the start's sweep (an instrument cancel-all, decision
+    // 0094) and two places. Second: the opening six and the Safety cancel of both resting
+    // orders; then Stop's instrument cancel-all, and nothing more.
+    let script = reconnecting(&venue, 6 + 1 + 2, 6 + 1 + 1);
     let stub = StubServer::start(script, routes(&venue, login_ok()))
         .await
         .unwrap();
@@ -987,8 +1025,9 @@ async fn the_interrupt_stops_it_cancelling_every_order() {
     let signal = Arc::new(Notify::new());
     // The interrupt comes as cycle 2 reads the touch: cycle 1's two orders rest, acknowledged.
     lock(&venue).signal = Some((3, Arc::clone(&signal)));
+    // The opening six, the start's sweep, two places, Stop's: the instrument cancel-alls.
     let stub = StubServer::start(
-        one_connection(&venue, 6 + 2 + 1),
+        one_connection(&venue, 6 + 1 + 2 + 1),
         routes(&venue, login_ok()),
     )
     .await
@@ -1002,7 +1041,7 @@ async fn the_interrupt_stops_it_cancelling_every_order() {
     assert_eq!(report.ended, "interrupted (Ctrl-C)", "{printed}");
     assert_eq!(
         (report.places_sent, report.cancels_sent),
-        (2, 1),
+        (2, 2),
         "{printed}"
     );
     assert_eq!(report.cancelled, 2, "{printed}");
@@ -1015,9 +1054,10 @@ async fn a_cancel_that_comes_back_unknown_stops_it() {
     // Stops, places nothing more, and Stop cancels the bid again.
     let venue = venue(vec![b0(), b0(), book(2, Some("62100.0"), Some("62100.3"))]);
     lock(&venue).already_closed_once = true;
-    // The opening six, two places, the two replace cancels, and Stop's cancel of the bid.
+    // The opening six, the start's sweep (an instrument cancel-all, decision 0094), two places,
+    // the two replace cancels, and Stop's instrument cancel-all, which ends the bid.
     let stub = StubServer::start(
-        one_connection(&venue, 6 + 2 + 2 + 1),
+        one_connection(&venue, 6 + 1 + 2 + 2 + 1),
         routes(&venue, login_ok()),
     )
     .await
@@ -1036,8 +1076,11 @@ async fn a_cancel_that_comes_back_unknown_stops_it() {
         "{sent:?}"
     );
     let bid = lock(&venue).orders[0].vid.clone();
-    assert_eq!(cancelled_ids(&reqs[10]), [bid], "{sent:?}");
-    assert!(printed.contains("gone Unknown"), "{printed}");
+    assert_eq!(cancelled_ids(&reqs[9]), [bid], "{sent:?}");
+    assert_eq!(reqs[11]["method"], "order.cancel_all", "{sent:?}");
+    assert_eq!(reqs.len(), 12, "{sent:?}");
+    assert!(printed.contains("came back Unknown"), "{printed}");
+    assert!(printed.contains("went Unknown"), "{printed}");
     assert!(printed.contains("STEP stop"), "{printed}");
     // Every order of ours ended all the same.
     assert_eq!(report.cancelled, 2, "{printed}");
@@ -1150,12 +1193,17 @@ async fn an_order_on_the_market_that_is_not_ours_refuses_the_run_before_start() 
 async fn the_duration_ends_the_loop() {
     // Cycle 1's touch (GET /orderbook read 2) is never answered, so the frames sent do not
     // depend on how much of the second the start took: whenever --duration passes, during the
-    // start or the touch, nothing was placed and Stop has nothing to cancel (RB-elg7-4 on PR
-    // #149). The run ends at --duration, not at --step-timeout's 10 s.
+    // start or the touch, nothing was placed (RB-elg7-4 on PR #149). The start's sweep and Stop
+    // each send the instrument cancel-all (decision 0094): the start runs whatever the
+    // duration, which only the cycles watch. The run ends at --duration, not at
+    // --step-timeout's 10 s.
     let venue = venue(vec![b0()]);
-    let stub = StubServer::start(one_connection(&venue, 6), routes(&venue, login_ok()))
-        .await
-        .unwrap();
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
     let mut opts = options(&stub, 1_000_000);
     opts.duration_secs = 1;
     opts.rest_url = holding_relay(&opts.rest_url, 2, Arc::new(Notify::new()), None).await;
@@ -1166,7 +1214,7 @@ async fn the_duration_ends_the_loop() {
     assert!(!printed.contains("TIMEOUT"), "{printed}");
     assert_eq!(
         (report.places_sent, report.cancels_sent),
-        (0, 0),
+        (0, 2),
         "{printed}"
     );
 }
@@ -1189,8 +1237,10 @@ async fn an_earlier_runs_order_is_cancelled_before_the_first_place() {
         size: "0.00001".to_owned(),
         open: true,
     });
+    // The opening six, the Safety cancel, the start's sweep and Stop's instrument cancel-alls
+    // (decision 0094), and two places.
     let stub = StubServer::start(
-        one_connection(&venue, 6 + 1 + 2 + 1),
+        one_connection(&venue, 6 + 1 + 1 + 2 + 1),
         routes(&venue, login_ok()),
     )
     .await
@@ -1205,6 +1255,7 @@ async fn an_earlier_runs_order_is_cancelled_before_the_first_place() {
         cancelled_ids(&requests(&venue, 0)[6]),
         ["1759500000000088888"]
     );
+    assert_eq!(sent[7], "order.cancel_all", "{sent:?}");
     assert_eq!(report.cancelled, 3, "{printed}");
 }
 
@@ -1217,8 +1268,9 @@ async fn a_fill_during_a_replace_requotes_from_the_position_it_left_never_past_t
     // 80000, past the $16 inventory cap; the loop requotes from the position the fill left.
     let venue = venue(vec![b0(), b0(), book(2, Some("80000.0"), Some("80000.2"))]);
     lock(&venue).fill_next_buy_cancel = true;
-    // The opening six, two places, two replace cancels, the ask's new place, Stop's cancel.
-    let script = one_connection(&venue, 6 + 2 + 2 + 1 + 1);
+    // The opening six, the start's sweep (an instrument cancel-all, decision 0094), two places,
+    // two replace cancels, the ask's new place, Stop's cancel-all.
+    let script = one_connection(&venue, 6 + 1 + 2 + 2 + 1 + 1);
     let stub = StubServer::start(script, routes(&venue, login_ok()))
         .await
         .unwrap();
@@ -1251,13 +1303,15 @@ async fn a_fill_during_a_replace_requotes_from_the_position_it_left_never_past_t
 }
 
 #[tokio::test]
-async fn a_stop_batch_cancel_with_an_item_refused_fails_the_run() {
-    // Stop's batch cancel of both quotes: the first item queued, the second ALREADY_CLOSED (its
-    // order ended just before). Every order ended, but not every Stop cancel was accepted.
+async fn a_cancel_all_whose_fate_is_unknown_stops_it_and_fails_the_run() {
+    // Every instrument cancel-all is answered with an internal error (its fate unknown): the
+    // start's sweep (decision 0094) comes back Unknown, so the loop Stops before any place, and
+    // Stop's cancel-all comes back Unknown too: not every Stop cancel was accepted, and the run
+    // fails.
     let venue = venue(vec![b0()]);
-    lock(&venue).batch_second_already_closed = true;
+    lock(&venue).refuse_cancel_all = true;
     let stub = StubServer::start(
-        one_connection(&venue, 6 + 2 + 1),
+        one_connection(&venue, 6 + 1 + 1),
         routes(&venue, login_ok()),
     )
     .await
@@ -1267,9 +1321,17 @@ async fn a_stop_batch_cancel_with_an_item_refused_fails_the_run() {
     stub.finished().await.unwrap();
 
     assert!(!report.ok, "{printed}");
-    assert_eq!(report.ended, "--cycles 1 reached", "{printed}");
+    assert_eq!(report.places_sent, 0, "{printed}");
+    // Paradex's internal error leaves a request's fate unknown.
+    assert!(report.ended.contains("came back Unknown"), "{printed}");
     assert!(printed.contains("Stop's cancel"), "{printed}");
     assert!(printed.contains("DONE failed"), "{printed}");
+    let sent = methods(&venue, 0);
+    assert_eq!(
+        &sent[6..],
+        ["order.cancel_all", "order.cancel_all"],
+        "{sent:?}"
+    );
 }
 
 #[tokio::test]
@@ -1280,7 +1342,7 @@ async fn a_frame_the_codec_cannot_decode_stops_it_at_once() {
     let venue = venue(vec![b0(), b0(), book(2, Some("62100.0"), Some("62100.3"))]);
     lock(&venue).garbage_after_create = Some(2);
     let stub = StubServer::start(
-        one_connection(&venue, 6 + 2 + 1),
+        one_connection(&venue, 6 + 1 + 2 + 1),
         routes(&venue, login_ok()),
     )
     .await
@@ -1312,7 +1374,7 @@ async fn a_quote_the_venue_closes_post_only_would_cross_is_placed_again_next_cyc
     lock(&venue).close_create = Some((1, "POST_ONLY_WOULD_CROSS"));
     // The opening six, two places, cycle 2's place again, Stop's cancel.
     let stub = StubServer::start(
-        one_connection(&venue, 6 + 2 + 1 + 1),
+        one_connection(&venue, 6 + 1 + 2 + 1 + 1),
         routes(&venue, login_ok()),
     )
     .await
@@ -1342,7 +1404,7 @@ async fn an_asynchronous_reject_other_than_post_only_would_cross_stops_it() {
     lock(&venue).close_create = Some((1, "NOT_ENOUGH_MARGIN"));
     // The opening six, two places, Stop's cancel of the other quote.
     let stub = StubServer::start(
-        one_connection(&venue, 6 + 2 + 1),
+        one_connection(&venue, 6 + 1 + 2 + 1),
         routes(&venue, login_ok()),
     )
     .await
@@ -1369,7 +1431,7 @@ async fn an_order_book_older_than_one_already_read_stops_it_with_no_place_after(
     ]);
     // The opening six, two places, Stop's cancel of both.
     let stub = StubServer::start(
-        one_connection(&venue, 6 + 2 + 1),
+        one_connection(&venue, 6 + 1 + 2 + 1),
         routes(&venue, login_ok()),
     )
     .await
@@ -1402,7 +1464,7 @@ async fn a_venue_position_the_inventory_does_not_hold_plans_nothing() {
     lock(&venue).position_after_create = Some((2, "0.00012"));
     // The opening six, two places, Stop's cancel of both.
     let stub = StubServer::start(
-        one_connection(&venue, 6 + 2 + 1),
+        one_connection(&venue, 6 + 1 + 2 + 1),
         routes(&venue, login_ok()),
     )
     .await
@@ -1443,7 +1505,7 @@ async fn an_order_filled_on_its_update_before_its_fill_is_read_plans_nothing() {
     lock(&venue).filled_unsent_next_buy_cancel = true;
     // The opening six, two places, two replace cancels; nothing rests for Stop to cancel.
     let stub = StubServer::start(
-        one_connection(&venue, 6 + 2 + 2),
+        one_connection(&venue, 6 + 1 + 2 + 2),
         routes(&venue, login_ok()),
     )
     .await
@@ -1609,7 +1671,7 @@ async fn a_connection_end_during_the_high_water_write_keeps_the_client_id_mint()
     let mut steps = vec![Step::Accept];
     steps.extend(answered(&venue, 0, 6));
     steps.push(Step::Accept);
-    steps.extend(answered(&venue, 1, 6 + 2 + 1));
+    steps.extend(answered(&venue, 1, 6 + 1 + 2 + 1));
     let stub = StubServer::start(WsScript::new(steps), routes(&venue, login_ok()))
         .await
         .unwrap();
@@ -1655,8 +1717,9 @@ async fn the_interrupt_while_a_pass_reads_a_fresh_touch_places_nothing_after() {
     // plans: nothing is placed after it (Codex r4243989985).
     let venue = venue(vec![b0(), b0(), book(2, Some("80000.0"), Some("80000.2"))]);
     lock(&venue).fill_next_buy_cancel = true;
-    // The opening six, two places, two replace cancels; nothing rests for Stop to cancel.
-    let script = one_connection(&venue, 6 + 2 + 2);
+    // The opening six, the start's sweep, two places, two replace cancels, and Stop's
+    // instrument cancel-all (decision 0094), though nothing rests for it to cancel.
+    let script = one_connection(&venue, 6 + 1 + 2 + 2 + 1);
     let stub = StubServer::start(script, routes(&venue, login_ok()))
         .await
         .unwrap();
@@ -1697,7 +1760,7 @@ async fn the_interrupt_while_the_touch_is_unanswered_stops_it_at_once() {
     // for the answer (Codex r4243989987).
     let venue = venue(vec![b0()]);
     let stub = StubServer::start(
-        one_connection(&venue, 6 + 2 + 1),
+        one_connection(&venue, 6 + 1 + 2 + 1),
         routes(&venue, login_ok()),
     )
     .await
@@ -1715,7 +1778,7 @@ async fn the_interrupt_while_the_touch_is_unanswered_stops_it_at_once() {
     assert!(!printed.contains("TIMEOUT"), "{printed}");
     assert_eq!(
         (report.places_sent, report.cancels_sent, report.cancelled),
-        (2, 1, 2),
+        (2, 2, 2),
         "{printed}"
     );
 }
