@@ -1,6 +1,6 @@
 # 0094 — Paradex's open-order snapshot is trustworthy on FBC-8xr's testnet evidence, so a resync seeds its positions, with positions following fills to be verified in the first mainnet sessions that get fills, amending 0054
 
-Status: proposed
+Status: accepted
 Date: 2026-10-16
 
 ## Context
@@ -54,6 +54,14 @@ for the trust decision?"), quoted exactly:
 > orders evidence collected so far, and record 'positions follow fills' as a condition to
 > verify in the first mainnet sessions that get fills, with the kill switch ready if REST and
 > the stream disagree.")
+
+The owner accepted this record on 2026-10-16, to the question "Do you accept decision 0094
+(Paradex snapshots trustworthy, PR #155)?", choosing, quoted exactly:
+
+> "Accept; gate the loop (Recommended)" (option text: "One lane marks 0094 accepted in all 3
+> places and merges #155. Before the continuous loop (FBC-tyft) can run, it must have k7t7
+> (both REST reads taken as one start state) and a new position check after the first fill and
+> at Stop, which stops the run on a mismatch. FBC-i8lp lands before chaiwala-rs runs live.")
 
 ## Decision
 
@@ -154,11 +162,16 @@ within the step timeout. Where the rule already holds:
   resync, at most one order of the resting cap ($11). The fill's own `PositionEvent` then
   shows a position the inventory does not hold, which Stops `testnet_trade` at once and
   `testnet_quote` within the step timeout (the rule above); a consumer without that check
-  would quote on the miscount until a later resync's `Desync`. FBC-k7t7 closes it. For the
-  owner at acceptance (Codex r4295929715 on PR #155): whether FBC-k7t7 must land before the
-  first mainnet session that can fill (FBC-tyft's loop), or the flip waits for it; the
-  recommendation is the former, since `mainnet_smoke` (FBC-p0aa) rests one order far from the
-  touch and Stops on any fill it did not expect.
+  would quote on the miscount until a later resync's `Desync`. FBC-k7t7 closes it. The owner
+  answered at acceptance (Codex r4295929715 on PR #155) with the gating below.
+- **The owner's gating (2026-10-16).** Before FBC-tyft's continuous loop runs on mainnet, two
+  tickets must be landed: FBC-k7t7 (both REST reads taken as one start state) and the new
+  position check filed from this record, FBC-hpg6 (after the first fill and at Stop, the session reads
+  `GET /positions` and compares it with the registry's position; on a mismatch it re-reads
+  once after the step timeout, logs both readings, and Stops, kill switch + cancel all, if they
+  still disagree). FBC-i8lp (a venue declares its snapshot lag and a shorter `settle` is
+  refused) lands before chaiwala-rs runs live. The owner's `mainnet_smoke` (FBC-p0aa) is not
+  gated by them: it rests one post-only order far from the touch and cancels it.
 - Proof: `crates/venues/fbc-venue-paradex/tests/exec_caps.rs` (the value and this record's
   citations), `tests/factory_exec.rs`, `tests/rehearsal.rs` (a resync seeds the market in a
   registry not declared a testnet run, Start and Flatten take it with no hand seed, and the
