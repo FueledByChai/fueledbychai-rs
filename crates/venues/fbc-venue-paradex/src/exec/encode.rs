@@ -2,7 +2,7 @@
 //! 0002, 0004, 0014, 0018, 0054), from the full command, the spec table and the
 //! [`EncodeCtx`] only: the encoder holds no order registry and reads no clock.
 //!
-//! Each frame is `{"jsonrpc":"2.0","method":<method>,"params":{..},"id":<rpc>}`, the envelope
+//! Each frame is `{"jsonrpc":"2.0","method":<method>,"params":..,"id":<rpc>}`, the envelope
 //! the Java library's `ParadexOrderWebSocketClient.call` writes, with the params of
 //! docs.paradex.trade's WebSocket method pages (`ws/web-socket-channels/<method>/<method>`):
 //!
@@ -14,7 +14,11 @@
 //!   and `signature` from [`ParadexSigner`](crate::sign::ParadexSigner) over the same market,
 //!   side, type, size, price and timestamp; the Java library's `buildSignedPlaceOrderJson`
 //!   writes the same fields.
-//! - `order.create_batch`: `{"orders":[..]}`, each item as `order.create`'s params, each signed.
+//! - `order.create_batch`: the params are the bare JSON array of the items, each exactly
+//!   `order.create`'s params and signed, in the command's order (FBC-mu1o). The method page
+//!   and the OpenRPC specification name an `orders` member, but Paradex refused
+//!   `{"orders":[..]}` live on testnet ("json: cannot unmarshal object into Go value of type
+//!   []*requests.OrderRequest"); the array is what REST's `POST /orders/batch` takes.
 //! - `order.modify`: `id`, `market`, `price`, `side`, `signature` over the venue order id,
 //!   `signature_timestamp`, the total `size` (0054's `AmendQty::TotalIncludingFilled`) and
 //!   `type` LIMIT, as `buildSignedModifyOrderJson` writes them.
@@ -154,7 +158,7 @@ impl ParadexEncoder {
                 let inst = shared(orders.iter().map(|o| o.inst));
                 Request {
                     method: "order.create_batch",
-                    params: format!(r#"{{"orders":[{}]}}"#, items.join(",")),
+                    params: format!("[{}]", items.join(",")),
                     charge: RateCharge {
                         op: OpKind::Place,
                         inst,

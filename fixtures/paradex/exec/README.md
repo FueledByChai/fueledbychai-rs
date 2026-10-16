@@ -112,6 +112,7 @@ ids are the request ids the tests send under. Order ids are `1759500000000000001
 | `reply-create-bare-id.json` | `order.create` (id 12) answered with a bare `{"id":..}`, which the Java library's `extractOrderId` tolerates |
 | `reply-create-batch-mixed.json` | `order.create_batch` (id 13): the first item created as above, the second answered with an `error` message (no code: Unknown, 0069) |
 | `reply-create-batch-short.json` | `order.create_batch` (id 14) with one result for a two-item batch |
+| `reply-create-batch-orders-errors.json` | `order.create_batch` (id 13) in the shape docs.paradex.trade documents for the bare-array batch (REST `api/prod/orders/batch`, FBC-mu1o): `errors` with one `VALIDATION_ERROR` and `orders` with one order, the second client id's, id `...02`, so the first item is Unknown and the second created |
 | `reply-modify.json` | `order.modify` (id 15): the order OPEN at 61999.5 for 0.2 |
 | `reply-cancel.json` | `order.cancel` (id 16): `QUEUED_FOR_CANCELLATION` for the first order id |
 | `reply-cancel-batch.json` | `order.cancel_batch` (id 17): the three order ids QUEUED_FOR_CANCELLATION, ALREADY_CLOSED and NOT_FOUND (no `market`, as the page says) |

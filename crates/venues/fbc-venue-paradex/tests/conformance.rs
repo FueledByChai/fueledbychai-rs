@@ -64,7 +64,7 @@ fn each_signed_golden_carries_its_java_vectors_signature() {
             rpc(
                 "order.create_batch",
                 format!(
-                    r#"{{"orders":[{{"client_id":"{}","market":"ETH-USD-PERP","side":"BUY","signature_timestamp":1759400000130,"size":"2.5","type":"LIMIT","price":"2450.7","instruction":"GTC","signature":{}}}]}}"#,
+                    r#"[{{"client_id":"{}","market":"ETH-USD-PERP","side":"BUY","signature_timestamp":1759400000130,"size":"2.5","type":"LIMIT","price":"2450.7","instruction":"GTC","signature":{}}}]"#,
                     setup::uuid(2),
                     sig("edge_trailing_zeros")
                 ),

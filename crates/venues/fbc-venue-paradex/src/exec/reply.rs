@@ -12,7 +12,7 @@
 //! | Method | Result | Outcome per item |
 //! | --- | --- | --- |
 //! | `order.create` | `{"order":{..}}` (or a bare `{"id":..}`, as the Java library tolerates) | Accepted, provisional, under the order's `id` |
-//! | `order.create_batch` | `{"results":[..]}` in request order, each an `order` or an `error` message | per item: Accepted, provisional; or `Unknown` for an error (a message, no code) |
+//! | `order.create_batch` | `{"results":[..]}` in request order, each an `order` or an `error` message; or `{"orders":[..],"errors":[..]}` (FBC-mu1o) | per item: Accepted, provisional; or `Unknown` for an error (a message, no code) or an item no order names |
 //! | `order.modify` | `{"order":{..}}` | Accepted, provisional: the amend is final only on its order event (0054) |
 //! | `order.cancel` | `{"order_id":..,"status":"QUEUED_FOR_CANCELLATION"}` | Accepted, provisional: queued is not done |
 //! | `order.cancel_batch` | `{"results":[{"id","status"}..]}` in request order | QUEUED_FOR_CANCELLATION accepted, provisional; ALREADY_CLOSED and NOT_FOUND refused through [`REJECT_CODES`](super::REJECT_CODES) |
@@ -32,6 +32,16 @@
 //! is an [`ExecEvent::UncorrelatedError`] keeping its code. A frame with an id no request
 //! waits on (the auth frame's, a subscription's) or with neither id nor error (a channel
 //! message) is not this tracker's ([`ReplyRead::NotOurs`]).
+//!
+//! The method page documents `results` for the batch whose params are `{"orders":[..]}`, which
+//! Paradex refused live; for the bare array the encoder now sends (FBC-mu1o), the documented
+//! answer is REST's `POST /orders/batch` (docs.paradex.trade `api/prod/orders/batch`):
+//! `{"orders":[..],"errors":[{"error","message"}..]}`, the created orders and the errors in
+//! lists that state no item index. Which of the two the socket sends for the array is not yet
+//! observed live, so both are read. In the second, each order is matched to its item by its
+//! `client_id`, which every item sends: an order naming no client id, a client id of no item,
+//! or an item already answered is refused as malformed; an item no order names is `Unknown`,
+//! as an item error is, and the errors' content is not read (they name no item).
 //!
 //! A reply is read whole before anything is pushed, and a batch's item outcomes are pushed in
 //! one call (0014 item 3). A reply that names another order or client id than the request's,
@@ -320,6 +330,24 @@ fn answer(
             let vid = created(result, *cid, scope)?;
             one(Some(*cid), Some(vid), PROVISIONAL)
         }
+        Request::CreateBatch(cids) if result.get("results").is_none() => {
+            let vids = created_by_client(result, cids, scope)?;
+            (0u16..)
+                .zip(cids.iter().zip(vids))
+                .map(|(idx, (cid, vid))| {
+                    let outcome = match vid {
+                        Some(_) => PROVISIONAL,
+                        None => SubmitOutcome::Unknown,
+                    };
+                    let item = ItemRef {
+                        idx,
+                        cid: Some(*cid),
+                        vid,
+                    };
+                    (Some(item), outcome)
+                })
+                .collect()
+        }
         Request::CreateBatch(cids) => {
             let results = results(result, cids.len())?;
             let mut out = Vec::with_capacity(cids.len());
@@ -428,6 +456,48 @@ fn results(result: &Value, items: usize) -> Result<&Vec<Value>, DecodeError> {
         return Err(Malformed("more results than items"));
     }
     Ok(results)
+}
+
+/// The venue id each item's order states in a `{"orders":[..],"errors":[..]}` batch reply,
+/// matched by client id; `None` for an item no order names (module documentation).
+fn created_by_client(
+    result: &Value,
+    cids: &[ClientOrderId],
+    scope: &DecodeScope<'_>,
+) -> Result<Vec<Option<VenueOrderId>>, DecodeError> {
+    let list = |name, what| match member(result, name) {
+        None => Ok(&[][..]),
+        Some(value) => value.as_array().map(Vec::as_slice).ok_or(Malformed(what)),
+    };
+    if member(result, "orders").is_none() && member(result, "errors").is_none() {
+        return Err(Malformed("batch results"));
+    }
+    let orders = list("orders", "batch orders")?;
+    list("errors", "batch errors")?;
+    let orders: Vec<&Value> = orders.iter().filter(|o| !o.is_null()).collect();
+    if orders.len() > cids.len() {
+        return Err(Malformed("more results than items"));
+    }
+    let mut vids = vec![None; cids.len()];
+    for order in orders {
+        let wire = order
+            .get("client_id")
+            .and_then(Value::as_str)
+            .filter(|wire| !wire.is_empty())
+            .ok_or(Malformed("a batch order names no client id"))?;
+        let fbc_core::CidMatch::Ours(cid) = scope.client_order_id(wire) else {
+            return Err(Malformed("the reply names another client id"));
+        };
+        let idx = cids
+            .iter()
+            .position(|c| *c == cid)
+            .ok_or(Malformed("the reply names another client id"))?;
+        let vid = order_id(order, scope)?;
+        if vids[idx].replace(vid).is_some() {
+            return Err(Malformed("a batch item answered twice"));
+        }
+    }
+    Ok(vids)
 }
 
 /// A cancel_batch item's status as its outcome: QUEUED_FOR_CANCELLATION accepted, provisional;

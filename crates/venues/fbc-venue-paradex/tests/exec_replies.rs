@@ -9,6 +9,8 @@
 //! and an undocumented code are `Unknown`, as is the timeout of a request no reply answered,
 //! and an error frame with no id is an `UncorrelatedError`. FBC-cexu: a JSON null member
 //! (error, result, order, a batch item's error) is absent, and a refusal keeps `error.data`.
+//! FBC-mu1o: a create_batch reply of `{"orders":[..],"errors":[..]}` (the documented answer to
+//! the bare-array batch) matches each order to its item by client id.
 //!
 //! The frames are the hand-built ones in `fixtures/paradex/exec/` (SYNTHETIC).
 
@@ -291,6 +293,100 @@ fn a_batch_reply_with_more_results_than_items_or_an_item_neither_order_nor_error
         DecodeError::Malformed(_)
     ));
     assert_eq!(timed_out(&mut replies, 13), unknown_whole(13));
+}
+
+/// FBC-mu1o: the batch reply in the shape docs.paradex.trade documents for the bare-array
+/// batch (`api/prod/orders/batch`: `{"orders":[..],"errors":[..]}`), the form Paradex's socket
+/// takes since it refused `{"orders":[..]}` params. The created orders are matched to the items
+/// by client id, not position; an item no order names is Unknown, as an item error is (0069).
+#[test]
+fn a_batch_reply_of_orders_and_errors_matches_each_order_to_its_item_by_client_id() {
+    let mut replies = sent(13, VenueCommand::PlaceBatch(vec![order(0), order(1)]));
+    let events = answered(
+        &mut replies,
+        &fixture("reply-create-batch-orders-errors.json"),
+    );
+    assert_eq!(
+        events,
+        vec![
+            outcome(13, item(0, Some(cid(0)), None), SubmitOutcome::Unknown),
+            outcome(13, item(1, Some(cid(1)), Some(vid(OID2))), PROVISIONAL),
+        ]
+    );
+    // Answered: a late copy of the reply is not this tracker's.
+    let (late, events) = read(
+        &mut replies,
+        &fixture("reply-create-batch-orders-errors.json"),
+    );
+    assert_eq!((late, events), (Ok(ReplyRead::NotOurs), vec![]));
+
+    // Positional nulls and an absent `errors` read as absent; every item created.
+    let mut replies = sent(13, VenueCommand::PlaceBatch(vec![order(0), order(1)]));
+    let both = fixture("reply-create-batch-orders-errors.json").replace(
+        r#""errors":[{"error":"VALIDATION_ERROR","message":"synthetic: order rejected"}],"orders":["#,
+        r#""orders":[null,"#,
+    );
+    let first = fixture("reply-create.json");
+    let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+    let both = both.replace("[null,", &format!("[{},", first["result"]["order"]));
+    assert_eq!(
+        answered(&mut replies, &both),
+        vec![
+            outcome(13, item(0, Some(cid(0)), Some(vid(OID))), PROVISIONAL),
+            outcome(13, item(1, Some(cid(1)), Some(vid(OID2))), PROVISIONAL),
+        ]
+    );
+}
+
+#[test]
+fn a_batch_reply_of_orders_naming_no_foreign_or_a_repeated_client_id_is_refused() {
+    let text = fixture("reply-create-batch-orders-errors.json");
+    let cid1 = r#""client_id":"01000700-199b-81ab-8200-00099b9bf518""#;
+    // The second item's order answers a batch of the first item only.
+    let mut replies = sent(13, VenueCommand::PlaceBatch(vec![order(0)]));
+    assert_eq!(
+        refused(&mut replies, &text),
+        DecodeError::Malformed("the reply names another client id")
+    );
+    assert_eq!(timed_out(&mut replies, 13), unknown_whole(13));
+    // An order with no client id cannot be matched to an item.
+    let mut replies = sent(13, VenueCommand::PlaceBatch(vec![order(0), order(1)]));
+    let no_cid = text.replace(cid1, r#""client_id":"""#);
+    assert_eq!(
+        refused(&mut replies, &no_cid),
+        DecodeError::Malformed("a batch order names no client id")
+    );
+    // One item answered twice.
+    let order_json =
+        &text[text.find(r#"[{"account""#).unwrap() + 1..text.find("}]},").unwrap() + 1];
+    let twice = text.replace(order_json, &format!("{order_json},{order_json}"));
+    assert_eq!(
+        refused(&mut replies, &twice),
+        DecodeError::Malformed("a batch item answered twice")
+    );
+    // More orders than items.
+    let mut replies = sent(13, VenueCommand::PlaceBatch(vec![order(1)]));
+    assert_eq!(
+        refused(&mut replies, &twice),
+        DecodeError::Malformed("more results than items")
+    );
+    // Neither `results` nor `orders`/`errors` arrays.
+    let mut replies = sent(13, VenueCommand::PlaceBatch(vec![order(0), order(1)]));
+    let neither = text
+        .replace(r#""orders":["#, r#""ordrs":["#)
+        .replace(r#""errors":"#, r#""errs":"#);
+    assert_eq!(
+        refused(&mut replies, &neither),
+        DecodeError::Malformed("batch results")
+    );
+    let not_array = text.replace(
+        r#""errors":[{"error":"VALIDATION_ERROR","message":"synthetic: order rejected"}]"#,
+        r#""errors":{}"#,
+    );
+    assert_eq!(
+        refused(&mut replies, &not_array),
+        DecodeError::Malformed("batch errors")
+    );
 }
 
 #[test]
