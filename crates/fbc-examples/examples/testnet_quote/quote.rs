@@ -27,8 +27,8 @@
 //! accepted and the resync has ended, the loop cancels every other order of ours still open on
 //! the market and waits until all of them ended before it places ([`Driver::sweep`]): an
 //! instrument cancel-all when fbc-oms builds one under 0005's I7 guard, which needs a trustworthy
-//! resync, so on Paradex (snapshot source Untrustworthy, owner answer C) explicit cancels of each
-//! order of ours, never an account cancel-all.
+//! resync (Paradex's is, decision 0094), otherwise explicit cancels of each order of ours, never
+//! an account cancel-all.
 //!
 //! **Stop** (kill switch on, every order of ours on the market cancelled, the session closed):
 //! on the interrupt (Ctrl-C), at `--duration` or `--cycles`, and on anything the loop does not
@@ -421,9 +421,9 @@ pub async fn run(
         "TESTNET {what}: REST host {rest_host} WS host {ws_host} chain {TESTNET_CHAIN}"
     ));
     lines.line(format_args!(
-        "OWNER-ASSISTED testnet run (decision 0067): Paradex's snapshot source is untrustworthy, \
-         so the market's position is seeded by hand from the venue's REST position; never done \
-         outside a declared testnet run"
+        "OWNER-ASSISTED testnet run (decision 0067): Paradex's snapshot source is trustworthy \
+         (decision 0094), so the resync seeds the market's position; a market it left unknown \
+         is seeded by hand from the venue's REST position, never outside a declared testnet run"
     ));
     lines.line(format_args!(
         "PLUMBING TEST, not a strategy: fixed offsets of {} bps under the bid and {} bps over \
@@ -506,7 +506,7 @@ pub async fn run(
     .map_err(|e| e.to_string())?;
     let ladder = LadderConfig::new(
         Duration::from_secs(5),
-        Duration::from_secs(1),
+        crate::testnet::SNAPSHOT_SETTLE,
         Duration::from_secs(60),
         2,
     )
@@ -1271,8 +1271,8 @@ impl Driver {
         self.lines.step(
             "resync",
             format_args!(
-                "{open} open orders, position {} lots; the snapshot is untrustworthy, so it \
-                 seeded nothing",
+                "{open} open orders, position {} lots; the snapshot is trustworthy \
+                 (decision 0094)",
                 position.0
             ),
         );
@@ -1286,16 +1286,23 @@ impl Driver {
         {
             let mut link = self.link.borrow_mut();
             let reg = link.reg();
-            reg.seed_position(INST, position)
-                .map_err(|e| format!("the hand seed was refused: {e:?}"))?;
+            if reg.position_known(INST) {
+                self.lines.line(format_args!(
+                    "SEED position {} lots seeded by the trustworthy resync (decision 0094)",
+                    reg.inventory(INST).0
+                ));
+            } else {
+                reg.seed_position(INST, position)
+                    .map_err(|e| format!("the hand seed was refused: {e:?}"))?;
+                self.lines.line(format_args!(
+                    "SEED position {} lots seeded by hand from the resync's REST position: an \
+                     owner-assisted testnet run (decision 0067)",
+                    position.0
+                ));
+            }
             let entry = reg
                 .start(INST, leases)
                 .map_err(|e| format!("Start was refused: {e:?}"))?;
-            self.lines.line(format_args!(
-                "SEED position {} lots seeded by hand from the resync's REST position: an \
-                 owner-assisted testnet run (decision 0067)",
-                position.0
-            ));
             self.lines.step(
                 "start",
                 format_args!(

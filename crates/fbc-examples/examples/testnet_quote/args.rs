@@ -25,8 +25,9 @@ desired book -> fbc-oms's ExecutionPlanner -> fbc-oms's caps and authorizations 
 order-entry session -> Paradex testnet. Every change is a cancel and then a new place once the
 old order ended (cancel-and-replace, never an amend). It prices nothing from any model: the
 offsets are the flags'. TESTNET ONLY: a mainnet URL or chain id is refused before anything
-connects. An owner-assisted testnet run: the market's position is seeded by hand from the
-venue's own REST position after the first resync (decision 0067); a restart seeds again.
+connects. An owner-assisted testnet run (decision 0067): the first resync seeds the market's
+position (Paradex's snapshot is trustworthy, decision 0094), or, when it left it unknown, it is
+seeded by hand from the venue's own REST position; a restart seeds again.
 
 Usage: cargo run -p fbc-examples --example testnet_quote -- [OPTIONS]
 
@@ -114,7 +115,7 @@ Lines (each with the milliseconds since the start):
   PLUMBING TEST ...  a reminder: fixed offsets, no model
   QUOTE ...          the quote size in lots and the caps in lots, from the first touch
   STEP login|arm|resync|start   as testnet_trade prints them
-  SEED ...           the position seeded by hand from the first resync's REST position
+  SEED ...           the position the first resync seeded (or seeded by hand, if it did not)
   CYCLE n ...        a requote cycle that changed the book: the touch and the quotes
   SKIP side ...      a side left unquoted this cycle, and why
   PLACE side ...     a place handed to the session: its client id sequence, size and price

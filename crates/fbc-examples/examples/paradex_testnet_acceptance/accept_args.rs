@@ -11,8 +11,9 @@ paradex_testnet_acceptance: FBC-8xr's acceptance run on Paradex TESTNET, through
 of each command type on tiny post-only orders well away from the touch (with --allow-fill, also
 two small orders that take liquidity, each flattened at once), writing an evidence
 report the snapshot-trust decision (FBC-2f7w) cites. TESTNET ONLY: a mainnet URL or chain id is
-refused before anything connects. An owner-assisted testnet run: each phase's market position is
-seeded by hand from the venue's own REST position (decision 0067).
+refused before anything connects. An owner-assisted testnet run (decision 0067): each phase's
+resync seeds its market's position (Paradex's snapshot is trustworthy, decision 0094); one it left
+unknown is seeded by hand from the venue's own REST position.
 
 The steps, each sent once (a step whose order could not be built is reported, not retried):
   place          one post-only GTC limit order on --side, --away-bps behind the touch

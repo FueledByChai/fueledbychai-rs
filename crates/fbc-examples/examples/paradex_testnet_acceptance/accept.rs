@@ -14,8 +14,9 @@
 //!    market, and the last comparison.
 //!
 //! A registry per phase is a restart as the owner's runs have them: each phase logs in, arms
-//! cancel-on-disconnect, resyncs, seeds the market by hand from the resync's REST position and
-//! Starts it under the caps; nothing carries an earlier phase's orders but the venue. Between
+//! cancel-on-disconnect, resyncs (Paradex's resync is trustworthy and seeds the market, decision
+//! 0094; a market it left unknown is seeded by hand from its REST position) and Starts it under
+//! the caps; nothing carries an earlier phase's orders but the venue. Between
 //! the phases, the account's GET /orders is read over REST until the order the disconnect
 //! should have cancelled is gone, or `--cod-wait` passes, before any reconnect could cancel it.
 //!
@@ -145,8 +146,10 @@ pub async fn run(
         "TESTNET {what}: REST host {rest_host} WS host {ws_host} chain {TESTNET_CHAIN}"
     ));
     lines.line(format_args!(
-        "OWNER-ASSISTED testnet run (decision 0067): each phase's market position is seeded by \
-         hand from the venue's REST position; never done outside a declared testnet run"
+        "OWNER-ASSISTED testnet run (decision 0067): Paradex's snapshot source is trustworthy \
+         (decision 0094), so each phase's resync seeds its market's position; a market it left \
+         unknown is seeded by hand from the venue's REST position, never outside a declared \
+         testnet run"
     ));
 
     let factory = &ParadexFactory;
@@ -1213,7 +1216,7 @@ impl Run {
         .map_err(|e| e.to_string())?;
         let ladder = LadderConfig::new(
             Duration::from_secs(5),
-            Duration::from_secs(1),
+            crate::testnet::SNAPSHOT_SETTLE,
             Duration::from_secs(60),
             2,
         )
@@ -1457,20 +1460,24 @@ impl Run {
         };
         let mut link = p.link.borrow_mut();
         let reg = link.reg();
-        if !reg.position_known(INST) {
+        let seeded = if reg.position_known(INST) {
+            format!(
+                "position {} lots seeded by the trustworthy resync (decision 0094)",
+                reg.inventory(INST).0
+            )
+        } else {
             reg.seed_position(INST, position)
                 .map_err(|e| format!("the hand seed was refused: {e:?}"))?;
-        }
+            format!(
+                "position {} lots seeded by hand (decision 0067)",
+                position.0
+            )
+        };
         reg.start(INST, leases)
             .map_err(|e| format!("Start was refused: {e:?}"))?;
         drop(link);
-        self.lines.step(
-            "start",
-            format_args!(
-                "position {} lots seeded by hand (decision 0067); the market is Started",
-                position.0
-            ),
-        );
+        self.lines
+            .step("start", format_args!("{seeded}; the market is Started"));
         Ok(())
     }
 

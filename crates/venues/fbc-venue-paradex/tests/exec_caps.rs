@@ -182,7 +182,7 @@ fn every_order_and_fill_capability_is_the_value_the_record_states() {
     assert!(o.cid_echoed_on_events && o.events_echo_flags);
     assert_eq!(o.nonce_scope, NonceScope::None);
     assert_eq!(o.ordering_key, OrderingKey::VenueSeq);
-    assert_eq!(o.snapshot_source, SnapshotSource::Untrustworthy);
+    assert_eq!(o.snapshot_source, SnapshotSource::Trustworthy);
     assert_eq!(o.sign_cost_hint_us, 200);
     let f = &exec.fills;
     assert_eq!(f.source, FillSource::Native);
@@ -336,21 +336,133 @@ fn undocumented_item<'a>(text: &'a str, field: &str) -> &'a str {
 
 #[test]
 fn the_record_states_the_owners_choice_for_the_snapshot_and_that_it_governs_lost_and_the_seed() {
-    assert_eq!(
-        exec::exec_caps().order.snapshot_source,
-        SnapshotSource::Untrustworthy
-    );
+    // 0054's item stays as written (records are never edited in place): it named the evidence
+    // that would flip the value and the record that would.
     let text = record();
     let item = undocumented_item(&text, "snapshot_source");
     // One field decides both an order's Lost on absence and a resync's seed.
     assert!(item.contains("Lost"), "{item}");
     assert!(item.contains("seeds"), "{item}");
-    // The owner's choice, and the evidence that would flip it before any live session.
     assert!(item.contains("option C"), "{item}");
     assert!(item.contains("`GET /orders`"), "{item}");
     assert!(item.contains("`GET /positions`"), "{item}");
     assert!(item.contains("before any live Paradex session"), "{item}");
-    assert!(item.contains("FBC-xzp"), "{item}");
+}
+
+/// FBC-2f7w's record: the one whose slug says Paradex's open-order snapshot is trustworthy.
+fn trust_record() -> String {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../docs/decisions");
+    let mut found = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains("paradex-s-open-order-snapshot-is-trustworthy"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(found.len(), 1, "{found:?}");
+    fs::read_to_string(found.pop().unwrap()).unwrap()
+}
+
+/// The text of `text`'s section headed `heading`, up to the next `## ` heading.
+fn section<'a>(text: &'a str, heading: &str) -> &'a str {
+    let start = text
+        .find(&format!("\n{heading}\n"))
+        .unwrap_or_else(|| panic!("no section {heading}"));
+    let body = &text[start + heading.len() + 2..];
+    &body[..body.find("\n## ").unwrap_or(body.len())]
+}
+
+#[test]
+fn the_snapshot_is_declared_trustworthy_on_the_record_that_cites_each_testnet_run_and_answer() {
+    // FBC-2f7w: the owner's answer C to RB-olg-3 held the value Untrustworthy until a new record
+    // flipped it on FBC-8xr's evidence; this is that record, and the value follows it.
+    assert_eq!(
+        exec::exec_caps().order.snapshot_source,
+        SnapshotSource::Trustworthy
+    );
+    let text = trust_record();
+    assert!(
+        text.contains("amending 0054"),
+        "the title names the record it amends"
+    );
+    let evidence = fs::read_dir(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../fixtures/paradex/exec-recorded"),
+    )
+    .unwrap()
+    .map(|e| e.unwrap().file_name().into_string().unwrap())
+    .filter(|n| n.starts_with("20"))
+    .collect::<Vec<_>>();
+    assert_eq!(evidence.len(), 3, "{evidence:?}");
+    let context = section(&text, "## Context");
+    for run in &evidence {
+        // Each committed run is cited by its report.
+        let report = format!("fixtures/paradex/exec-recorded/{run}/report.md");
+        assert!(context.contains(&report), "{report} is not cited");
+    }
+    // Each of FBC-2f7w's questions is answered from the runs.
+    for (question, answer) in [
+        ("(a)", "24 of 24"),
+        ("(b)", "3480 ms"),
+        ("(c)", "not exercised"),
+        ("(d)", "no cursor"),
+        ("(e)", "2429 ms"),
+    ] {
+        let line = context
+            .lines()
+            .find(|l| l.contains(&format!("| {question}")))
+            .unwrap_or_else(|| panic!("{question} is not answered"));
+        assert!(line.contains(answer), "{question}: {line}");
+    }
+}
+
+#[test]
+fn the_trust_record_quotes_the_owner_and_holds_his_condition_with_the_stop_rule() {
+    let text = trust_record();
+    // The owner's answer, quoted exactly, in its own block (its lines joined).
+    let owner = section(&text, "### OWNER")
+        .lines()
+        .map(|l| l.trim_start_matches('>').trim())
+        .collect::<Vec<_>>()
+        .join(" ");
+    for quote in [
+        "\"Decide on current evidence\"",
+        "\"Write the trust decision (FBC-2f7w) on the orders evidence collected so far, and \
+         record 'positions follow fills' as a condition to verify in the first mainnet sessions \
+         that get fills, with the kill switch ready if REST and the stream disagree.\"",
+    ] {
+        assert!(owner.contains(quote), "{quote} not quoted: {owner}");
+    }
+    // The condition, and the rule that stops a session on any disagreement.
+    let decision = section(&text, "## Decision");
+    for needle in [
+        "`GET /positions`",
+        "first mainnet sessions",
+        "kill switch",
+        "cancel all",
+        "PositionCheck::Desync",
+        "resync_disagreements",
+    ] {
+        assert!(decision.contains(needle), "{needle} not in the Decision");
+    }
+    // What it enables, and what still guards mainnet.
+    let consequences = section(&text, "## Consequences");
+    for needle in [
+        "mainnet",
+        "trustworthy resync",
+        "$11",
+        "$50",
+        "cancel-on-disconnect",
+        "FBC-tyft",
+        "TestnetRun::owner_assisted()",
+        "cancel-all",
+    ] {
+        assert!(
+            consequences.contains(needle),
+            "{needle} not in the Consequences"
+        );
+    }
 }
 
 #[test]

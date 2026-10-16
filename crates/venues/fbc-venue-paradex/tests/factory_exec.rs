@@ -307,8 +307,8 @@ fn the_factory_declares_paradex_exec_caps_with_its_market_data() {
         exec.order.cancel_on_disconnect,
         CancelOnDisconnect::PerConnection { .. }
     ));
-    // The owner's answer C to RB-olg-3: no resync seeds a Paradex position until a new record.
-    assert_eq!(exec.order.snapshot_source, SnapshotSource::Untrustworthy);
+    // FBC-2f7w's record, on FBC-8xr's testnet evidence: a resync seeds a Paradex position.
+    assert_eq!(exec.order.snapshot_source, SnapshotSource::Trustworthy);
 }
 
 #[test]

@@ -501,6 +501,15 @@ fn respond_full(
                 frames.extend(events);
                 Ok(frames)
             }
+            "order.cancel_all" => {
+                // Stop's instrument cancel-all, which fbc-oms builds under 0005's I7 guard now
+                // that Paradex's resync is trustworthy (decision 0094): `{"status":"ok"}`, and no
+                // order event (an order the run still holds open stays so: Stop times out on it).
+                if params["market"] != MARKET {
+                    return Err(format!("a cancel-all not of the market: {params}"));
+                }
+                Ok(vec![ok(json!({"status": "ok"}))])
+            }
             other => Err(format!("an unexpected method {other}")),
         }
     }
@@ -559,11 +568,14 @@ fn restored_as(
 /// The script of a run that finds orders of ours an earlier run left on the market: the
 /// opening (auth, four subscriptions, the arm), then the Safety batch cancel of the restored
 /// orders sent as the connection opens (decision 0080), ended as `end` says. Nothing is placed
-/// beside them. With [`End::Refused`] they are not shown ended, so Stop's batch cancel of them
-/// follows, answered the same way.
+/// beside them. Stop then sends its instrument cancel-all (decision 0094), answered
+/// `{"status":"ok"}` with no order event: with [`End::Refused`] the restored orders are never
+/// shown ended.
 fn restored_script(placed: Arc<Mutex<Placed>>, restored: Vec<Restored>, end: End) -> WsScript {
     let with = responder_with(placed, Arc::new(restored), End::Canceled, end);
-    let frames = if matches!(end, End::Refused) { 8 } else { 7 };
+    // Then Stop's instrument cancel-all (0005's I7 under the trustworthy resync, decision
+    // 0094), which takes the place of Stop's batch cancel of orders not shown ended.
+    let frames = 8;
     let mut steps = vec![Step::Accept];
     steps.extend((0..frames).map(|_| Step::Respond {
         conn: 0,
@@ -572,12 +584,14 @@ fn restored_script(placed: Arc<Mutex<Placed>>, restored: Vec<Restored>, end: End
     WsScript::new(steps)
 }
 
-/// The order socket's script: one connection, eight frames answered (auth, four
-/// subscriptions, the arm, the place, the cancel).
+/// The order socket's script: one connection, nine frames answered (auth, four
+/// subscriptions, the arm, the place, the cancel, and Stop's instrument cancel-all, which
+/// fbc-oms builds under 0005's I7 guard once Paradex's trustworthy resync showed the account's
+/// open orders, decision 0094).
 fn script(placed: Arc<Mutex<Placed>>) -> WsScript {
     let with = responder(placed);
     let mut steps = vec![Step::Accept];
-    steps.extend((0..8).map(|_| Step::Respond {
+    steps.extend((0..9).map(|_| Step::Respond {
         conn: 0,
         with: with.clone(),
     }));
@@ -649,16 +663,19 @@ async fn testnet_trade_places_one_post_only_order_and_cancels_it_against_the_stu
     );
     assert_eq!(
         (report.places_sent, report.cancels_sent),
-        (1, 1),
+        (1, 2),
         "{printed}"
     );
-    // Exactly one place and one cancel reached the venue, and nothing else order-affecting.
+    // Exactly one place and one cancel reached the venue, then Stop's instrument cancel-all
+    // (decision 0094), and nothing else order-affecting.
     let sent = methods(&stub);
     let count = |m: &str| sent.iter().filter(|s| s.as_str() == m).count();
     assert_eq!(count("order.create"), 1, "{sent:?}");
     assert_eq!(count("order.cancel"), 1, "{sent:?}");
+    assert_eq!(count("order.cancel_all"), 1, "{sent:?}");
+    assert_eq!(sent.last().map(String::as_str), Some("order.cancel_all"));
     assert_eq!(
-        count("order.cancel_all") + count("order.cancel_batch") + count("order.modify"),
+        count("order.cancel_batch") + count("order.modify"),
         0,
         "{sent:?}"
     );
@@ -694,11 +711,11 @@ async fn testnet_trade_places_one_post_only_order_and_cancels_it_against_the_stu
     );
     assert!(printed.contains("OWNER-ASSISTED testnet run"), "{printed}");
     assert!(
-        printed.contains("SEED position 0 lots seeded by hand"),
+        printed.contains("SEED position 0 lots seeded by the trustworthy resync (decision 0094)"),
         "{printed}"
     );
     assert!(
-        printed.contains("DONE ok places sent 1 cancels sent 1"),
+        printed.contains("DONE ok places sent 1 cancels sent 2"),
         "{printed}"
     );
     // The touch was read twice: to price the order, and just before the place.
@@ -736,6 +753,7 @@ async fn an_unanswered_auth_frame_times_out_the_login_and_stops_with_nothing_pla
     );
     assert!(printed.contains("TIMEOUT login"), "{printed}");
     assert_eq!(steps(&printed), ["stop"], "{printed}");
+    // No resync showed the account's open orders: no cancel-all, nothing to cancel.
     assert!(printed.contains("cancel all: 0 cancels sent"), "{printed}");
     assert!(printed.contains("DONE failed"), "{printed}");
     // Reviewer B's RB114-16: whether the auth frame went out before the one-second step
@@ -784,20 +802,24 @@ async fn an_unanswered_place_times_out_and_stop_leaves_it_to_cancel_on_disconnec
         printed.contains("cancel-on-disconnect to cancel them"),
         "{printed}"
     );
-    assert!(printed.contains("cancel all: 0 cancels sent"), "{printed}");
+    assert!(
+        printed.contains("cancel all: 1 cancels sent (an instrument cancel-all)"),
+        "{printed}"
+    );
     assert_eq!(
         (report.places_sent, report.cancels_sent),
-        (1, 0),
+        (1, 1),
         "{printed}"
     );
     let sent = methods(&stub);
     assert_eq!(sent.iter().filter(|m| *m == "order.create").count(), 1);
-    assert!(
-        !sent
-            .iter()
-            .any(|m| m.starts_with("order.cancel_") && m != "order.cancel_on_disconnect")
-    );
-    assert!(!sent.iter().any(|m| m == "order.cancel"), "{sent:?}");
+    // Stop's instrument cancel-all (decision 0094) covers the unacknowledged order at the venue
+    // too; no cancel names it, since none can before its acknowledgement.
+    let cancels: Vec<&String> = sent
+        .iter()
+        .filter(|m| m.starts_with("order.cancel") && *m != "order.cancel_on_disconnect")
+        .collect();
+    assert_eq!(cancels, ["order.cancel_all"], "{sent:?}");
 }
 
 #[tokio::test]
@@ -1254,11 +1276,14 @@ async fn an_earlier_runs_orders_are_safety_cancelled_as_the_connection_opens_and
         "{printed}"
     );
     // Stop found them ended: its cancel-all sent nothing.
-    assert!(printed.contains("cancel all: 0 cancels sent"), "{printed}");
+    assert!(
+        printed.contains("cancel all: 1 cancels sent (an instrument cancel-all)"),
+        "{printed}"
+    );
     assert!(!printed.contains("did not end cancelled"), "{printed}");
     assert_eq!(
         (report.places_sent, report.cancels_sent),
-        (0, 1),
+        (0, 2),
         "{printed}"
     );
     let sent = methods(&stub);
@@ -1285,14 +1310,21 @@ async fn a_batch_cancel_with_an_item_refused_and_no_order_event_fails_the_stop()
     stub.finished().await.unwrap();
     // The Safety batch cancel's second item is refused and no order event reports either
     // ended, so the market stays held (decision 0080): nothing was placed, and Stop cancels
-    // them again. Its batch is not accepted on its first item alone.
+    // them again, by its instrument cancel-all (decision 0094). No order event reports them
+    // ended after it either, so the Stop fails.
     assert!(!report.ok, "{printed}");
     assert!(
         printed.contains("not shown ended within the step timeout, so Stop cancels them"),
         "{printed}"
     );
-    assert!(printed.contains("came back Rejected"), "{printed}");
-    assert!(printed.contains("TIMEOUT stop"), "{printed}");
+    assert!(
+        printed.contains("cancel all: 1 cancels sent (an instrument cancel-all)"),
+        "{printed}"
+    );
+    assert!(
+        printed.contains("an order of ours did not end cancelled"),
+        "{printed}"
+    );
     assert!(printed.contains("DONE failed"), "{printed}");
 }
 
@@ -1307,14 +1339,14 @@ async fn the_runs_order_resting_after_a_reconnect_is_safety_cancelled_at_once_as
     let placed = Arc::new(Mutex::new(Placed::default()));
     let with = responder(Arc::clone(&placed));
     // Auth, four subscriptions, the arm and the place; then, on the next connection, auth,
-    // four subscriptions, the arm and the Safety batch cancel.
+    // four subscriptions, the arm, the Safety batch cancel and Stop's instrument cancel-all.
     let mut script = vec![Step::Accept];
     script.extend((0..7).map(|_| Step::Respond {
         conn: 0,
         with: with.clone(),
     }));
     script.extend([Step::Close { conn: 0 }, Step::Accept]);
-    script.extend((0..7).map(|_| Step::Respond {
+    script.extend((0..8).map(|_| Step::Respond {
         conn: 1,
         with: with.clone(),
     }));
@@ -1396,7 +1428,7 @@ async fn the_runs_order_resting_after_a_reconnect_is_safety_cancelled_at_once_as
     );
     assert_eq!(
         (report.places_sent, report.cancels_sent),
-        (1, 1),
+        (1, 2),
         "{printed}"
     );
     let sent = methods(&stub);
@@ -1738,9 +1770,9 @@ async fn run_with_books(book: String, second: String) -> (trade::Report, String,
             reply(200, empty),
         );
     let with = responder(Arc::new(Mutex::new(Placed::default())));
-    // Auth, four subscriptions and the arm: nothing after them.
+    // Auth, four subscriptions and the arm, then only Stop's instrument cancel-all.
     let mut script = vec![Step::Accept];
-    script.extend((0..6).map(|_| Step::Respond {
+    script.extend((0..7).map(|_| Step::Respond {
         conn: 0,
         with: with.clone(),
     }));
@@ -1812,7 +1844,7 @@ async fn a_touch_that_moved_toward_the_order_before_the_place_stops_the_run_with
     );
     assert_eq!(
         (report.places_sent, report.cancels_sent),
-        (0, 0),
+        (0, 1),
         "{printed}"
     );
     assert!(!sent.iter().any(|m| m == "order.create"));
@@ -1944,7 +1976,10 @@ async fn an_earlier_runs_order_filled_in_part_before_the_run_and_safety_cancelle
     stub.finished().await.unwrap();
     assert!(!report.ok, "{printed}");
     assert!(printed.contains("(decision 0080)"), "{printed}");
-    assert!(printed.contains("cancel all: 0 cancels sent"), "{printed}");
+    assert!(
+        printed.contains("cancel all: 1 cancels sent (an instrument cancel-all)"),
+        "{printed}"
+    );
     assert!(!printed.contains("filled during the run"), "{printed}");
     assert!(!printed.contains("traded during the run"), "{printed}");
     assert!(!printed.contains("did not end cancelled"), "{printed}");
@@ -2015,20 +2050,25 @@ async fn a_moved_position_or_an_order_not_ours_seen_before_the_place_stops_the_r
     // Each arrives with the arm's reply, before the place: the venue reporting the account
     // long 0.15 when the REST position seeded it flat, and an order event showing another
     // system's order (a random UUID client id) open on the market.
-    for (frame, said) in [
+    // Stop's cancel everything: the instrument cancel-all (decision 0094) after the moved
+    // position; after the order not ours, none (0005's I7: an order not ours is in view) and
+    // nothing of ours to cancel.
+    for (frame, said, cancel_all) in [
         (
             sbe_fixture("position-long-v2.sbe.txt"),
             "the venue reported the account's position in instrument 1 as 15000 lots",
+            1,
         ),
         (
             sbe_fixture("order-foreign-cid-v1.sbe.txt"),
             "an order not ours is in view on the market",
+            0,
         ),
     ] {
         let with = responder_arm_extra(Arc::new(Mutex::new(Placed::default())), vec![frame]);
-        // Auth, four subscriptions and the arm: nothing after them.
+        // Auth, four subscriptions and the arm, then only Stop's cancel-all, if any.
         let mut script = vec![Step::Accept];
-        script.extend((0..6).map(|_| Step::Respond {
+        script.extend((0..6 + cancel_all).map(|_| Step::Respond {
             conn: 0,
             with: with.clone(),
         }));
@@ -2051,7 +2091,7 @@ async fn a_moved_position_or_an_order_not_ours_seen_before_the_place_stops_the_r
         );
         assert_eq!(
             (report.places_sent, report.cancels_sent),
-            (0, 0),
+            (0, cancel_all),
             "{printed}"
         );
         assert!(!methods(&stub).iter().any(|m| m == "order.create"));
@@ -2076,7 +2116,7 @@ fn printed_before(printed: &str, first: &str, then: &str) -> bool {
 
 #[tokio::test]
 async fn an_order_of_ours_the_registry_does_not_hold_refuses_the_place_or_fails_the_run() {
-    // An earlier run's order in our namespace that the (untrustworthy) resync did not show,
+    // An earlier run's order in our namespace that the resync did not show (a lagging snapshot),
     // reported open by an order event: the registry holds no record of it, so Stop would not
     // cancel it nor the run count its fills.
     let (orphans, _) = restored();
@@ -2218,6 +2258,61 @@ fn the_account_audit_counts_a_refused_resync_and_orders_of_ours_the_registry_doe
             .all(|f| f.contains("an order in our namespace that the registry does not hold")),
         "{found:?}"
     );
+}
+
+#[test]
+fn the_account_audit_counts_a_resync_that_disagrees_with_the_inventory() {
+    // Decision 0094's stop rule: GET /positions disagreeing with the position the stream's fills
+    // gave the inventory is a change of the account, which Stops the run (kill switch + cancel
+    // all) before anything else is placed. Paradex's resync now seeds the market, so this is the
+    // comparison a reconnect's resync makes in the first mainnet sessions with fills.
+    use fbc_core::{InstrumentId, MonoNs, SignedLots, WallNs};
+    use fbc_oms::{PositionCheck, Registry, ResyncReport, ResyncSnapshot};
+    let inst = InstrumentId::new(1);
+    let resynced = |checks| link::Note::Resynced {
+        report: ResyncReport {
+            checks,
+            ..ResyncReport::default()
+        },
+        snapshot: ResyncSnapshot {
+            watermark: WallNs(0),
+            requested_at: MonoNs(0),
+            orders: Vec::new(),
+            positions: Vec::new(),
+        },
+    };
+    let reg = Registry::new();
+    let start = Some(SignedLots(0));
+    let agrees = PositionCheck::Agrees {
+        inst,
+        position: SignedLots(0),
+    };
+    assert!(trade::account_changes(&[resynced(vec![agrees])], &reg, start, &[]).is_empty());
+    for check in [
+        PositionCheck::Desync {
+            inst,
+            venue: SignedLots(-3),
+            ledger: Some(SignedLots(0)),
+        },
+        PositionCheck::Unsettled(inst),
+        PositionCheck::Stale(inst),
+    ] {
+        let found = trade::account_changes(&[resynced(vec![check])], &reg, start, &[]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].starts_with("a resync found the position other than the registry's"),
+            "{found:?}"
+        );
+    }
+}
+
+#[test]
+fn a_lagging_snapshot_never_ends_an_order_the_samples_hold() {
+    // Decision 0094: Paradex's GET /orders lagged the stream by up to 3480 ms in FBC-8xr's runs;
+    // the samples' ladder counts an absence only from a snapshot 10 s after the order was sent.
+    let settle = testnet::SNAPSHOT_SETTLE;
+    assert!(settle.as_millis() > 3_480, "{settle:?}");
+    assert_eq!(settle, std::time::Duration::from_secs(10));
 }
 
 #[test]
@@ -2422,9 +2517,10 @@ async fn an_order_of_ours_resting_on_the_orders_side_refuses_the_place() {
         End::Canceled,
         End::Canceled,
     );
-    // Auth, four subscriptions, the arm and the Safety batch cancel of the restored orders.
+    // Auth, four subscriptions, the arm, the Safety batch cancel of the restored orders and
+    // Stop's instrument cancel-all.
     let mut script = vec![Step::Accept];
-    script.extend((0..7).map(|_| Step::Respond {
+    script.extend((0..8).map(|_| Step::Respond {
         conn: 0,
         with: with.clone(),
     }));
@@ -2442,10 +2538,13 @@ async fn an_order_of_ours_resting_on_the_orders_side_refuses_the_place() {
     );
     assert!(printed.contains("nothing placed"), "{printed}");
     // The one Safety batch cancel ended both restored orders; Stop sent none.
-    assert!(printed.contains("cancel all: 0 cancels sent"), "{printed}");
+    assert!(
+        printed.contains("cancel all: 1 cancels sent (an instrument cancel-all)"),
+        "{printed}"
+    );
     assert_eq!(
         (report.places_sent, report.cancels_sent),
-        (0, 1),
+        (0, 2),
         "{printed}"
     );
     assert!(!printed.contains("did not end cancelled"), "{printed}");
@@ -3147,8 +3246,9 @@ async fn the_namespace_lease_is_held_until_the_run_ends() {
         }
         inner(frame)
     });
+    // The opening six, the place, the cancel and Stop's instrument cancel-all.
     let mut script = vec![Step::Accept];
-    script.extend((0..8).map(|_| Step::Respond {
+    script.extend((0..9).map(|_| Step::Respond {
         conn: 0,
         with: with.clone(),
     }));
@@ -3308,7 +3408,7 @@ async fn a_connection_the_venue_closed_is_named_and_the_run_goes_on_on_the_next(
     let placed = Arc::new(Mutex::new(Placed::default()));
     let with = responder(Arc::clone(&placed));
     let mut script = vec![Step::Accept, Step::Close { conn: 0 }, Step::Accept];
-    script.extend((0..8).map(|_| Step::Respond {
+    script.extend((0..9).map(|_| Step::Respond {
         conn: 1,
         with: with.clone(),
     }));
@@ -3329,7 +3429,7 @@ async fn a_connection_the_venue_closed_is_named_and_the_run_goes_on_on_the_next(
     assert!(report.ok, "{printed}");
     assert_eq!(
         (report.places_sent, report.cancels_sent),
-        (1, 1),
+        (1, 2),
         "{printed}"
     );
 }
@@ -3477,7 +3577,7 @@ async fn a_buy_on_a_book_with_no_asks_places_and_cancels_as_on_a_full_book() {
     );
     assert_eq!(
         (report.places_sent, report.cancels_sent),
-        (1, 1),
+        (1, 2),
         "{printed}"
     );
 }

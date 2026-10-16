@@ -12,9 +12,9 @@
 //! [`exec_codec`](VenueFactory::exec_codec) builds, as [`EXEC_MODE`] says, the order-entry codec
 //! ([`exec::ParadexExec`], each request awaiting its reply for [`RPC_TIMEOUT`]) or the read-only
 //! one ([`exec::ReadOnlyExec`]), handing the consumer's `Secrets` to src/auth's functions and
-//! reading none of them here. The snapshot source stays `Untrustworthy` (decision 0054): no
-//! resync seeds a Paradex position, so every place and amend is refused until a market is
-//! seeded by hand for the owner-assisted testnet run.
+//! reading none of them here. The snapshot source is `Trustworthy` (decision 0094, amending
+//! 0054, on FBC-8xr's testnet evidence): the first trustworthy resync seeds each Paradex
+//! market's position, so a market arms after it with no hand seed.
 
 use core::time::Duration;
 use std::collections::{BTreeMap, BTreeSet};

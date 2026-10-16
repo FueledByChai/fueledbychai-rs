@@ -12,7 +12,8 @@
 //!   1:2, built here from Paradex's schema as `fixtures/paradex/exec/README.md` lays it out)
 //!   that the order's [`Fate`] says: resting (OPEN), or filled (OPEN, the `FillEvent`, the same
 //!   `FillEvent` again, then CLOSED with nothing open); `order.cancel` and
-//!   `order.cancel_batch` queued, then each order's CLOSED by `USER_CANCELED`. Any other method
+//!   `order.cancel_batch` queued, then each order's CLOSED by `USER_CANCELED`; `order.cancel_all`
+//!   for the market `{"status":"ok"}`, then each open order's CLOSED alike. Any other method
 //!   fails the script. The account in every SBE frame is 32 made-up bytes.
 
 use std::collections::{BTreeMap, VecDeque};
@@ -394,6 +395,22 @@ pub fn responder(book: Shared) -> Responder {
                 }
                 let mut frames = vec![ok(json!({ "results": results }))];
                 frames.extend(events);
+                Ok(frames)
+            }
+            "order.cancel_all" => {
+                if params["market"] != MARKET {
+                    return Err(format!("a cancel-all not of the market: {params}"));
+                }
+                let open: Vec<String> = book
+                    .orders
+                    .values()
+                    .filter(|o| o.open)
+                    .map(|o| o.vid.clone())
+                    .collect();
+                let mut frames = vec![ok(json!({"status": "ok"}))];
+                for vid in open {
+                    frames.extend(cancelled(&mut book, &vid));
+                }
                 Ok(frames)
             }
             other => Err(format!("an unexpected method {other}")),
