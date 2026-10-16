@@ -35,6 +35,7 @@
 //! directory and its scrubbed slice becomes the fixtures (`evidence.rs`).
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -75,9 +76,10 @@ use crate::args::{
 };
 use crate::auth_rest::{RestAnswer, RestReader};
 use crate::evidence::{
-    self, Comparison, Disconnect, Evidence, FillRow, History, Ran, RestPosition, Sent, Trace,
+    self, Comparison, Disconnect, Evidence, FillRow, History, Ran, Refusal, RestPosition, Sent,
+    Trace,
 };
-use crate::link::{Link, LinkHandler, Note, async_reject, shown};
+use crate::link::{Link, LinkHandler, Note, async_reject, described, shown};
 use crate::testnet::{HighWater, INST, LOGIN_REFUSALS, Out, off_thread_holding, snapshot_max};
 use crate::trade::{self, Priced};
 
@@ -265,6 +267,7 @@ pub async fn run(
         sessions_sent,
         live: None,
         troubled: false,
+        failed: BTreeSet::new(),
         clock: IngestClock::new(),
         limiter,
     };
@@ -782,6 +785,9 @@ struct Run {
     /// Whether a phase's link noted something that leaves the order truth incomplete
     /// ([`link_problems`]).
     troubled: bool,
+    /// The steps [`Run::fail`] failed: a later verdict of the step never passes it (Codex
+    /// r4289567002).
+    failed: BTreeSet<String>,
     /// The ingest clock every phase's session stamps with: one ingest sequence and one
     /// monotonic origin for the run's one journal shard.
     clock: IngestClock,
@@ -979,6 +985,7 @@ impl Run {
         let why = why.into();
         let ms = self.lines.t0.elapsed().as_millis();
         self.lines.line(format_args!("FAIL {step} +{ms}ms  {why}"));
+        self.failed.insert(step.to_owned());
         let s = self.ev.step(step);
         s.ran = Ran::Yes;
         s.pass = false;
@@ -1667,11 +1674,49 @@ impl Run {
             _ => false,
         };
         self.sent(p, step, "place", rpc, 1);
+        self.refused(p, step, label, rpc, cid, tif, answer.as_ref());
         match answer {
             Some(SubmitOutcome::Accepted { .. }) if settled => Ok((cid, wire)),
             Some(SubmitOutcome::Accepted { .. }) => Err(NO_FINAL.to_owned()),
             Some(other) => Err(format!("the place came back {other:?}")),
             None => Err("no answer to the place within the step timeout".to_owned()),
+        }
+    }
+
+    /// Records the venue's refusal of the placement `cid` (`label`, request `rpc`, `tif`): its
+    /// reply `answer` when that rejected it, or the asynchronous reject of the place the link
+    /// noted for the order after its provisional acceptance (Codex r4289566988).
+    #[allow(clippy::too_many_arguments)]
+    fn refused(
+        &mut self,
+        p: &Phase,
+        step: &str,
+        label: &str,
+        rpc: fbc_core::RpcId,
+        cid: ClientOrderId,
+        tif: Tif,
+        answer: Option<&SubmitOutcome>,
+    ) {
+        let reject = match answer {
+            Some(SubmitOutcome::Rejected(r)) => Some(r.clone()),
+            _ => p.link.borrow().notes().iter().find_map(|n| match n {
+                Note::AsyncReject {
+                    target,
+                    op: fbc_core::OpKind::Place,
+                    reject,
+                } if target.client() == Some(cid) => Some(reject.clone()),
+                _ => None,
+            }),
+        };
+        if let Some(r) = reject {
+            let refusal = Refusal {
+                order: label.to_owned(),
+                rpc: rpc.0,
+                immediate: tif == Tif::Ioc,
+                margin: margin_refusal(&r),
+                shown: format!("{:?}: {}", r.kind, described(&r)),
+            };
+            self.ev.step(step).refusals.push(refusal);
         }
     }
 
@@ -2020,6 +2065,17 @@ impl Run {
         let start = p.link.borrow().registry().inventory(INST);
         let before = self.compare(p, "fill: before the IOC", &[]).await;
         self.ev.step(step).comparisons.push(before.clone());
+        // REST showing an order or a position the stream does not leaves the market's
+        // inventory unknown: no take is added to it, and the phase stops (Codex r4289567009).
+        if !(before.orders_agreed && before.positions_agreed) {
+            self.fail(
+                step,
+                "GET /orders or GET /positions did not agree with the stream before the IOC \
+                 within the REST wait: the market's inventory is not known, so no take is \
+                 sent; the phase stops, check GET /positions on testnet",
+            );
+            return false;
+        }
         let order = Order {
             label: "T1 take",
             side,
@@ -2064,6 +2120,7 @@ impl Run {
         cids.extend(flats);
         let flattened = self.compare(p, "fill: after the flatten", &cids).await;
         let fills_seen = self.tracker.borrow().fills.len();
+        let failed = self.failed.contains(step);
         self.lines.step(
             step,
             format_args!(
@@ -2085,8 +2142,13 @@ impl Run {
         s.ran = Ran::Yes;
         s.orders.extend(traces);
         let agreed = |c: &Comparison| c.orders_agreed && c.positions_agreed;
-        s.pass =
-            filled > Lots::ZERO && agreed(&before) && agreed(&after) && flat && agreed(&flattened);
+        let rest_flat = agreed(&flattened);
+        s.pass = !failed
+            && filled > Lots::ZERO
+            && agreed(&before)
+            && agreed(&after)
+            && flat
+            && rest_flat;
         if filled == Lots::ZERO {
             s.notes.push(
                 "T1 took nothing (the touch moved before it landed): GET /positions following \
@@ -2100,7 +2162,23 @@ impl Run {
         }
         s.comparisons.push(after);
         s.comparisons.push(flattened);
-        flat
+        self.rest_not_flat(step, flat, rest_flat)
+    }
+
+    /// The phase goes on after a fill step's flatten only when the market's inventory is back
+    /// (`flat`) and REST agreed with the stream after it (`rest_flat`): REST showing an order
+    /// or a position the stream does not is an exposure no further order is added to (Codex
+    /// r4289567009). False stops the phase, the step failed with the line to check by hand.
+    fn rest_not_flat(&mut self, step: &str, flat: bool, rest_flat: bool) -> bool {
+        if flat && !rest_flat {
+            self.fail(
+                step,
+                "GET /orders or GET /positions did not agree with the stream after the flatten \
+                 within the REST wait: the phase stops, check GET /positions and flatten by \
+                 hand on testnet if it holds a position",
+            );
+        }
+        flat && rest_flat
     }
 
     /// The fill-partial step (`--allow-fill`, FBC-b0z9): when the far touch's level is smaller
@@ -2232,12 +2310,14 @@ impl Run {
             cids.iter().map(|c| tr.trace(*c)).collect()
         };
         self.refresh_outcomes(p, step);
+        let failed = self.failed.contains(step);
+        let rest_flat = flattened.orders_agreed && flattened.positions_agreed;
         let s = self.ev.step(step);
         s.ran = Ran::Yes;
         s.orders
             .retain(|t| !traces.iter().any(|n| n.client_id == t.client_id));
         s.orders.extend(traces);
-        let clean = ok && flat && flattened.orders_agreed && flattened.positions_agreed;
+        let clean = !failed && ok && flat && rest_flat;
         s.pass = clean && exercised;
         if clean && !exercised {
             s.ran = Ran::Skipped(format!(
@@ -2252,7 +2332,7 @@ impl Run {
             );
         }
         s.comparisons.push(flattened);
-        flat
+        self.rest_not_flat(step, flat, rest_flat)
     }
 
     /// Amends the partly filled order `cid` (`filled` lots filled) once: `--away-bps` behind
@@ -3550,6 +3630,15 @@ impl<S: JournalSink> JournalSink for JournalCount<S> {
     fn omit(&mut self, class: TrafficClass, now: fbc_core::WallNs) -> Recorded {
         self.inner.omit(class, now)
     }
+}
+
+/// Whether `r` refuses an order for want of margin: `RejectKind::Margin`, or Paradex's
+/// NOT_ENOUGH_MARGIN as its code or its cancel reason (decision 0092's own case).
+pub fn margin_refusal(r: &fbc_core::Reject) -> bool {
+    const MARGIN: &str = "NOT_ENOUGH_MARGIN";
+    r.kind == fbc_core::RejectKind::Margin
+        || r.venue_code.as_deref() == Some(MARGIN)
+        || r.raw.as_ref() == MARGIN
 }
 
 /// What a venue made of an order.modify that sent `sent` as the size of a partly filled order,
