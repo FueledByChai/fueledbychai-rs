@@ -68,7 +68,11 @@ The cancel reasons are the ones a source names: `USER_CANCELED` (the example of 
 `orders.{market_symbol}` channel in Paradex's AsyncAPI specification, and the Java library's
 `CancelReason`), `POST_ONLY_WOULD_CROSS` (the Java library's `CancelReason`, met in its
 production runs) and `NOT_ENOUGH_MARGIN` (the example of `cancel_reason` on the "Get order"
-REST page). No Paradex page lists every cancel reason.
+REST page). No Paradex page lists every cancel reason. Paradex testnet stated more (the
+recorded runs in `fixtures/paradex/exec-recorded/`, decision 0093): `user_cancel_ws` and
+`user_cancel_batch_ws` for our WebSocket cancels, `cancel_on_disconnect`, `REMAINING_IOC_CANCEL`
+for an IOC's unfilled rest, and the refusals `ORDER_SIZE_BELOW_MIN` and
+`EXCEEDS_PRICE_BAND: order price .. above upper band ..` (a code, then a message).
 
 The fill and trade ids, and every position and account amount, are made up. The tests
 (`crates/venues/fbc-venue-paradex/tests/exec_order_events.rs`, `exec_fill_events.rs` and
