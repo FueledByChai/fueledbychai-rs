@@ -150,6 +150,8 @@ struct VOrder {
     cancel_reason: String,
     /// The connection it was placed on.
     conn: usize,
+    /// Whether it was sent reduce-only.
+    reduce_only: bool,
 }
 
 impl VOrder {
@@ -236,6 +238,17 @@ struct Venue {
     /// fills its rest at its old price and closes before any event confirms the amend (Codex
     /// r4289239759).
     modify_fills: bool,
+    /// Whether the take's fill event (the first IOC not reduce-only that takes) is never sent,
+    /// its order event and position sent as usual (Codex r4289405166).
+    drop_take_fill: bool,
+    /// Whether the first reduce-only IOC's fill event is never sent (Codex r4289405169).
+    drop_flatten_fill: bool,
+    /// Whether the first cancel of a partly filled order finds it filled its rest first: the
+    /// order event says so, no fill event is sent (Reviewer A, RB-6fnc-1).
+    cancel_fills: bool,
+    /// Whether a GTC order that takes in part states OPEN, nothing filled, before its fill
+    /// (Reviewer B, RB-6fnc-2).
+    open_before_fill: bool,
 }
 
 impl Venue {
@@ -454,6 +467,9 @@ fn responder(venue: Arc<Mutex<Venue>>, conn: usize) -> Responder {
                         status: "NEW",
                         cancel_reason: String::new(),
                         conn,
+                        reduce_only: p["flags"]
+                            .as_array()
+                            .is_some_and(|f| f.iter().any(|f| f == "REDUCE_ONLY")),
                     };
                     created.push(o);
                 }
@@ -476,7 +492,7 @@ fn responder(venue: Arc<Mutex<Venue>>, conn: usize) -> Responder {
                     frames.push(Frame::Binary(order_event(&stray, seq, 3, None)));
                 }
                 for mut o in created {
-                    let seq = v.next_seq();
+                    let mut seq = v.next_seq();
                     let px = Decimal::from_str(&o.price).unwrap_or_default();
                     let (far_px, far_size) = if o.side == 1 { v.ask_top } else { v.bid_top };
                     let crosses = o.tif != 3
@@ -491,6 +507,12 @@ fn responder(venue: Arc<Mutex<Venue>>, conn: usize) -> Responder {
                         let size = Decimal::from_str(&o.size).unwrap();
                         let took = size.min(far_size);
                         let left = size - took;
+                        if o.tif == 1 && !left.is_zero() && std::mem::take(&mut v.open_before_fill)
+                        {
+                            o.status = "OPEN";
+                            frames.push(Frame::Binary(order_event(&o, seq, 3, None)));
+                            seq = v.next_seq();
+                        }
                         v.next_fill += 1;
                         let fill = v.next_fill;
                         let fseq = v.next_seq();
@@ -506,6 +528,14 @@ fn responder(venue: Arc<Mutex<Venue>>, conn: usize) -> Responder {
                             &took.to_string(),
                             pnl,
                         )));
+                        let dropped = if o.reduce_only {
+                            std::mem::take(&mut v.drop_flatten_fill)
+                        } else {
+                            o.tif == 2 && std::mem::take(&mut v.drop_take_fill)
+                        };
+                        if dropped {
+                            frames.pop();
+                        }
                         v.position += if o.side == 1 { took } else { -took };
                         v.max_position = v.max_position.max(v.position.abs());
                         o.open = left.to_string();
@@ -624,6 +654,7 @@ fn responder(venue: Arc<Mutex<Venue>>, conn: usize) -> Responder {
                 };
                 let mut events = Vec::new();
                 let mut results = Vec::new();
+                let mut cancel_fills = v.cancel_fills;
                 for vid in &ids {
                     let seq = v.next_seq();
                     let o = v
@@ -633,7 +664,18 @@ fn responder(venue: Arc<Mutex<Venue>>, conn: usize) -> Responder {
                         .ok_or("no such order")?;
                     o.status = "CLOSED";
                     o.cancel_reason = "USER_CANCELED".to_owned();
+                    let rest = (o.open != o.size && cancel_fills)
+                        .then(|| Decimal::from_str(&o.open).unwrap());
+                    if rest.is_some() {
+                        o.open = "0".to_owned();
+                        o.cancel_reason = String::new();
+                    }
                     let o = o.clone();
+                    if let Some(rest) = rest {
+                        cancel_fills = false;
+                        v.cancel_fills = false;
+                        v.position += if o.side == 1 { rest } else { -rest };
+                    }
                     results.push(
                         json!({"id": vid, "market": MARKET, "status": "QUEUED_FOR_CANCELLATION"}),
                     );
@@ -967,6 +1009,10 @@ fn new_venue(cod_on_drop: bool, cod_on_close: bool) -> Arc<Mutex<Venue>> {
         max_position: Decimal::ZERO,
         hold_take: false,
         modify_fills: false,
+        drop_take_fill: false,
+        drop_flatten_fill: false,
+        cancel_fills: false,
+        open_before_fill: false,
     }))
 }
 
@@ -1637,6 +1683,7 @@ fn the_scrubber_replaces_account_values_and_the_check_finds_what_it_would_leave(
         status: "CLOSED",
         cancel_reason: "USER_CANCELED".to_owned(),
         conn: 0,
+        reduce_only: false,
     };
     let frame = order_event(&o, 7, 4, Some((4, 1, "req-9")));
     let scrubbed = evidence::scrub_sbe(&frame).unwrap();
@@ -2942,6 +2989,7 @@ fn a_round_agrees_only_with_what_the_stream_shows_once_rest_answered() {
         expected: vec![("B1".to_owned(), "cid-1".to_owned(), b1)],
         lots,
         since: at,
+        changes: 0,
     };
     let d = |t: &str| Decimal::from_str(t).unwrap();
     let resting = want(Some((Some(d("60140.1")), d("0.00017"))), 0);
@@ -3241,4 +3289,260 @@ async fn an_amend_whose_order_ends_at_its_old_price_is_not_read_as_a_modify() {
     assert!(reading.starts_with("not read"), "{reading}");
     assert!(venue.lock().unwrap().position.is_zero(), "{printed}");
     assert!(!outcome.ok, "{printed}");
+}
+
+#[tokio::test]
+async fn a_take_whose_fill_never_arrives_is_not_flattened_and_stops_the_phase() {
+    // Codex r4289405166, Reviewer B RB-6fnc-1: T1's order event and position come, its fill
+    // never does. Its inventory is unknown, so nothing is flattened from it, the step fails
+    // with the line to flatten by hand, and the phase stops (no B3).
+    let venue = new_venue(true, true);
+    venue.lock().unwrap().drop_take_fill = true;
+    // To the IOC, then T1 alone; the phase stops, so the stop phase follows (no graceful).
+    let stub = stub_frames(&venue, &[MAIN, 6]).await;
+    let (evidence_dir, _e) = temp_dir("evidence-take-fill-lost");
+    let (lease_dir, _l) = temp_dir("lease-take-fill-lost");
+    let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
+    opts.allow_fill = true;
+    opts.trade.step_timeout_secs = 1;
+    opts.rest_wait_secs = 1;
+    let (outcome, printed) = run_against(&opts).await;
+    let report = fs::read_to_string(&outcome.report).unwrap();
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("{e:?}\n{printed}\n{report}"));
+    let fill = outcome
+        .evidence
+        .steps
+        .iter()
+        .find(|s| s.name == "fill")
+        .unwrap();
+    assert!(!fill.pass && fill.ran == evidence::Ran::Yes, "{fill:?}");
+    assert!(
+        printed.contains("FAIL fill T1's outcome is unresolved")
+            && printed.contains("flatten by hand"),
+        "{printed}"
+    );
+    let sent = creates(&stub, 0);
+    assert!(
+        sent.iter().all(|p| p["flags"] != json!(["REDUCE_ONLY"])),
+        "{sent:?}"
+    );
+    assert_eq!(
+        sent.last().map(|p| &p["price"]),
+        Some(&json!("62000.5")),
+        "nothing after T1: {sent:?}"
+    );
+    assert_eq!(
+        venue.lock().unwrap().position,
+        Decimal::from_str("0.00017").unwrap()
+    );
+    assert!(!outcome.ok, "{printed}");
+}
+
+#[tokio::test]
+async fn a_flatten_whose_fill_never_arrives_is_not_retried_and_stops_the_phase() {
+    // Codex r4289405169: F1's order event comes, its fill never does. No second IOC is sized
+    // from the stale inventory; the step fails with the line to flatten by hand, and the
+    // phase stops.
+    let venue = new_venue(true, true);
+    venue.lock().unwrap().drop_flatten_fill = true;
+    // To the IOC, T1 and F1.
+    let stub = stub_frames(&venue, &[MAIN + 1, 6]).await;
+    let (evidence_dir, _e) = temp_dir("evidence-flatten-fill-lost");
+    let (lease_dir, _l) = temp_dir("lease-flatten-fill-lost");
+    let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
+    opts.allow_fill = true;
+    opts.trade.step_timeout_secs = 1;
+    opts.rest_wait_secs = 1;
+    let (outcome, printed) = run_against(&opts).await;
+    let report = fs::read_to_string(&outcome.report).unwrap();
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("{e:?}\n{printed}\n{report}"));
+    let fill = outcome
+        .evidence
+        .steps
+        .iter()
+        .find(|s| s.name == "fill")
+        .unwrap();
+    assert!(!fill.pass, "{fill:?}");
+    assert!(
+        printed.contains("F1 flatten's outcome is unresolved"),
+        "{printed}"
+    );
+    let flattens = creates(&stub, 0)
+        .iter()
+        .filter(|p| p["flags"] == json!(["REDUCE_ONLY"]))
+        .count();
+    assert_eq!(flattens, 1, "{printed}");
+    assert!(venue.lock().unwrap().position.is_zero(), "{printed}");
+    assert!(!outcome.ok, "{printed}");
+}
+
+#[tokio::test]
+async fn a_partial_order_whose_last_fill_trails_its_cancel_is_not_flattened() {
+    // Reviewer A, RB-6fnc-1: P1's cancel finds it filled its rest; the order event says so
+    // and its fill never comes. What P1 filled is unknown, so nothing is flattened from it:
+    // the step fails with the line to flatten by hand and the phase stops (no F2, no B3).
+    let venue = new_venue(true, true);
+    {
+        let mut v = venue.lock().unwrap();
+        v.ask_top.1 = Decimal::from_str("0.00005").unwrap();
+        v.cancel_fills = true;
+    }
+    // To the IOC, T1 and F1, P1, its amend and its cancel.
+    let stub = stub_frames(&venue, &[MAIN + 4, 6]).await;
+    let (evidence_dir, _e) = temp_dir("evidence-partial-fill-trails");
+    let (lease_dir, _l) = temp_dir("lease-partial-fill-trails");
+    let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
+    opts.allow_fill = true;
+    opts.trade.step_timeout_secs = 1;
+    opts.rest_wait_secs = 1;
+    let (outcome, printed) = run_against(&opts).await;
+    let report = fs::read_to_string(&outcome.report).unwrap();
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("{e:?}\n{printed}\n{report}"));
+    let partial = outcome
+        .evidence
+        .steps
+        .iter()
+        .find(|s| s.name == "fill-partial")
+        .unwrap();
+    assert!(!partial.pass, "{partial:?}");
+    assert!(
+        printed.contains("P1's outcome is unresolved") && printed.contains("flatten by hand"),
+        "{printed}"
+    );
+    let flattens = creates(&stub, 0)
+        .iter()
+        .filter(|p| p["flags"] == json!(["REDUCE_ONLY"]))
+        .count();
+    assert_eq!(flattens, 1, "F1 only: {printed}");
+    assert_eq!(
+        venue.lock().unwrap().position,
+        Decimal::from_str("0.00017").unwrap()
+    );
+    assert!(!outcome.ok, "{printed}");
+}
+
+#[tokio::test]
+async fn a_partial_order_stating_open_before_its_fill_is_still_amended() {
+    // Reviewer B, RB-6fnc-2: P1's first order event states it OPEN with nothing filled, then
+    // its fill and the partly filled event come. The step waits for the fill, so the amend
+    // is exercised, not skipped.
+    let venue = new_venue(true, true);
+    {
+        let mut v = venue.lock().unwrap();
+        v.ask_top.1 = Decimal::from_str("0.00005").unwrap();
+        v.open_before_fill = true;
+    }
+    let stub = stub_frames(&venue, &[MAIN + 6, 7, 6]).await;
+    let (evidence_dir, _e) = temp_dir("evidence-open-before-fill");
+    let (lease_dir, _l) = temp_dir("lease-open-before-fill");
+    let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
+    opts.allow_fill = true;
+    let (outcome, printed) = run_against(&opts).await;
+    let report = fs::read_to_string(&outcome.report).unwrap();
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("{e:?}\n{printed}\n{report}"));
+    assert!(outcome.ok, "{printed}\n{report}");
+    let ev = &outcome.evidence;
+    let partial = ev.steps.iter().find(|s| s.name == "fill-partial").unwrap();
+    assert!(
+        partial.pass && partial.ran == evidence::Ran::Yes,
+        "{partial:?}"
+    );
+    assert!(
+        ev.partial_amend
+            .as_deref()
+            .unwrap()
+            .starts_with("the total"),
+        "{:?}",
+        ev.partial_amend
+    );
+    assert!(venue.lock().unwrap().position.is_zero());
+}
+
+#[test]
+fn a_round_whose_stream_moved_and_came_back_is_no_agreement() {
+    // Codex r4289405172: two fills that return the position to where it was while REST is
+    // read still change the stream: the round is no agreement.
+    let at = std::time::Instant::now();
+    let want = |changes: u64| accept::Want {
+        expected: Vec::new(),
+        lots: 0,
+        since: at,
+        changes,
+    };
+    let step = Decimal::from_str("0.00001").unwrap();
+    let still = accept::judge_round(
+        &want(4),
+        &want(4),
+        Some((&[], false)),
+        Some(None),
+        step,
+        true,
+    );
+    assert!(still.orders && still.positions, "{still:?}");
+    let moved = accept::judge_round(
+        &want(4),
+        &want(6),
+        Some((&[], false)),
+        Some(None),
+        step,
+        true,
+    );
+    assert!(!moved.orders && !moved.positions, "{moved:?}");
+    assert!(
+        moved
+            .mismatches
+            .iter()
+            .any(|m| m.contains("stream changed")),
+        "{moved:?}"
+    );
+}
+
+#[test]
+fn a_risk_refusal_is_answered_from_the_fill_steps_outcomes() {
+    // Codex r4289405174: 0092 (2) is answered from what the fill steps recorded, not from
+    // whether they ran.
+    let mut ev = evidence::Evidence::default();
+    let mut fill = evidence::Step::new("fill");
+    fill.ran = evidence::Ran::Yes;
+    fill.sent.push(evidence::Sent {
+        kind: "place".to_owned(),
+        rpc: 9,
+        items: 1,
+        outcomes: vec!["Accepted { ack: Final }".to_owned()],
+    });
+    ev.steps.push(fill);
+    let q = "0092 (2)";
+    assert!(
+        answer(&ev, q).starts_with("not observed"),
+        "{}",
+        answer(&ev, q)
+    );
+    ev.steps[0].sent[0].outcomes =
+        vec!["Rejected(Reject { kind: Risk, venue_code: None, raw: 12 bytes })".to_owned()];
+    let a = answer(&ev, q);
+    assert!(
+        a.starts_with("observed") && a.contains("fill request 9: Rejected"),
+        "{a}"
+    );
+}
+
+#[test]
+fn a_take_past_an_i64_bound_is_refused_by_the_cap_check_not_wrapped() {
+    // Codex r4289405179: the cap check adds the take to the position checked.
+    let cap = fbc_core::Lots::new(250).unwrap();
+    let qty = fbc_core::Lots::new(5).unwrap();
+    let near = fbc_core::SignedLots(i64::MAX - 1);
+    assert!(accept::past_cap(near, OrderSide::Buy, qty, cap).is_some());
+    let flat = fbc_core::SignedLots(0);
+    assert!(accept::past_cap(flat, OrderSide::Buy, qty, cap).is_none());
+    let at_cap = fbc_core::SignedLots(-250);
+    assert!(accept::past_cap(at_cap, OrderSide::Sell, qty, cap).is_some());
 }
