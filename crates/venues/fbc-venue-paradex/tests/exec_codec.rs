@@ -1466,6 +1466,43 @@ fn a_placement_we_cancel_before_its_risk_check_is_neither_final_nor_rejected() {
     assert_eq!(call.events, decoded(&open));
 }
 
+// FBC-8xr (decision 0093): the reasons Paradex testnet stated (fixtures/paradex/exec-recorded/):
+// an IOC refused outside the price band (its code then a message) or below the minimum
+// notional is refused, not expired; our own WebSocket cancels are neither.
+
+#[test]
+fn an_ioc_closed_unfilled_outside_the_price_band_or_below_the_minimum_is_rejected_asynchronously() {
+    for reason in [
+        "EXCEEDS_PRICE_BAND: order price 115.117 above upper band 97.97398419599999",
+        "ORDER_SIZE_BELOW_MIN",
+    ] {
+        let mut ioc = sbe("order-closed-margin-v2.sbe.txt");
+        ioc[8 + 19] = 2;
+        let ioc = with_reason(ioc, "NOT_ENOUGH_MARGIN", reason);
+        let mut codec = placed();
+        let call = frame(&mut codec, RawFrame::Binary(&ioc));
+        call.result.unwrap();
+        let mut expected = vec![place_refused(RejectKind::Other, reason)];
+        expected.extend(decoded(&ioc));
+        assert_eq!(call.events, expected, "{reason}");
+    }
+}
+
+#[test]
+fn a_placement_we_cancel_over_the_websocket_is_neither_final_nor_rejected() {
+    for reason in ["user_cancel_ws", "user_cancel_batch_ws"] {
+        let canceled = with_reason(
+            sbe("order-closed-post-only-v2.sbe.txt"),
+            "POST_ONLY_WOULD_CROSS",
+            reason,
+        );
+        let mut codec = placed();
+        let call = frame(&mut codec, RawFrame::Binary(&canceled));
+        call.result.unwrap();
+        assert_eq!(call.events, decoded(&canceled), "{reason}");
+    }
+}
+
 #[test]
 fn an_order_event_before_the_placements_reply_settles_it_when_the_reply_comes() {
     // OPEN first: the reply is the final acceptance at once.

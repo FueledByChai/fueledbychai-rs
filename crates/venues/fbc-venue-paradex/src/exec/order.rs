@@ -303,16 +303,24 @@ pub fn decode_order_event(
 
 /// The state of a CLOSED order: cancelled by `reason` when one is stated; filled when none is
 /// and nothing is open (`filled`); cancelled by the venue when none is stated and part is open.
-/// The reasons mapped are the ones a source names (`fixtures/paradex/exec/README.md`): no
-/// Paradex page lists them all, so any other is the venue's.
+/// The reasons mapped are the ones a source names (`fixtures/paradex/exec/README.md`, and the
+/// testnet runs in `fixtures/paradex/exec-recorded/`, decision 0093): no Paradex page lists
+/// them all, so any other is the venue's.
 pub(super) fn closed(reason: &str, filled: bool) -> VenueOrderState {
     match reason {
         "" if filled => VenueOrderState::Filled,
-        "USER_CANCELED" => VenueOrderState::Canceled(CancelReason::Requested),
+        r if OUR_CANCELS.contains(&r) => VenueOrderState::Canceled(CancelReason::Requested),
         "POST_ONLY_WOULD_CROSS" => VenueOrderState::Canceled(CancelReason::PostOnly),
+        "cancel_on_disconnect" => VenueOrderState::Canceled(CancelReason::Disconnect),
+        "REMAINING_IOC_CANCEL" => VenueOrderState::Canceled(CancelReason::Unfilled),
         _ => VenueOrderState::Canceled(CancelReason::Venue),
     }
 }
+
+/// The cancel reasons of our own cancels: `USER_CANCELED` (the AsyncAPI example) and the ones
+/// Paradex testnet states for an `order.cancel` and an `order.cancel_batch` sent over the
+/// WebSocket (decision 0093).
+const OUR_CANCELS: [&str; 3] = ["USER_CANCELED", "user_cancel_ws", "user_cancel_batch_ws"];
 
 /// The `requestStatus` of `msg`'s request_info when its `requestType` is MODIFY_ORDER: read
 /// only from a version-2 frame whose root block holds it.
@@ -350,14 +358,28 @@ pub(crate) enum Phase {
     /// than our own cancel: the venue refused the order after accepting it. An IOC or MARKET
     /// order is refused only for a reason in [`REFUSALS`].
     Refused(Box<str>),
-    /// CLOSED with nothing filled by our own cancel (USER_CANCELED): neither passed nor refused.
+    /// CLOSED with nothing filled by our own cancel ([`OUR_CANCELS`]): neither passed nor
+    /// refused.
     Withdrawn,
 }
 
-/// The cancel reasons a source names as the risk check's refusal of an order
-/// (`fixtures/paradex/exec/README.md`): the only ones taken as refusing an IOC or MARKET order
-/// closed with nothing filled, which otherwise expired past the risk check (decision 0092).
-const REFUSALS: [&str; 1] = ["NOT_ENOUGH_MARGIN"];
+/// The cancel reasons a source names as the venue's refusal of an order
+/// (`fixtures/paradex/exec/README.md`, and the testnet runs in
+/// `fixtures/paradex/exec-recorded/`): the only ones taken as refusing an IOC or MARKET order
+/// closed with nothing filled, which otherwise expired past the risk check (decisions 0092,
+/// 0093). A reason is matched by its code, the text before any `:` (testnet states
+/// `EXCEEDS_PRICE_BAND: order price .. above upper band ..`).
+const REFUSALS: [&str; 3] = [
+    "NOT_ENOUGH_MARGIN",
+    "EXCEEDS_PRICE_BAND",
+    "ORDER_SIZE_BELOW_MIN",
+];
+
+/// Whether `reason` is one of [`REFUSALS`], by its code.
+fn refusal(reason: &str) -> bool {
+    let code = reason.split_once(':').map_or(reason, |(code, _)| code);
+    REFUSALS.contains(&code)
+}
 
 /// What the `OrderEvent` `frame` shows of its order's placement; `None` for a frame that is not
 /// an `OrderEvent` or that [`decode_order_event`] refuses for its status, sizes or strings.
@@ -380,8 +402,8 @@ pub(crate) fn phase(frame: &[u8]) -> Option<Phase> {
         1 => Phase::Pending,
         3 => Phase::Passed,
         4 if filled => Phase::Passed,
-        4 if reason == "USER_CANCELED" => Phase::Withdrawn,
-        4 if immediate && !REFUSALS.contains(&reason) => Phase::Passed,
+        4 if OUR_CANCELS.contains(&reason) => Phase::Withdrawn,
+        4 if immediate && !refusal(reason) => Phase::Passed,
         4 => Phase::Refused(reason.into()),
         _ => return None,
     })

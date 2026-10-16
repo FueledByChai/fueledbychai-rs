@@ -1,0 +1,15 @@
+# Recorded from Paradex testnet 2026-10-16 by paradex_testnet_acceptance: an SBE frame (template 20, version 2), its account bytes replaced by a0..bf.
+80 00 14 00 01 00 02 00 38 68 c2 db f3 5d 06 00
+66 72 6f 6f 92 00 df 18 03 01 01 03 d0 d6 6c c3
+00 00 00 00 00 00 00 00 00 00 00 00 40 8a f7 01
+00 00 00 00 40 8a f7 01 00 00 00 00 00 00 00 00
+00 00 00 80 f0 f6 c1 db f3 5d 06 00 38 68 c2 db
+f3 5d 06 00 a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 aa ab
+ac ad ae af b0 b1 b2 b3 b4 b5 b6 b7 b8 b9 ba bb
+bc bd be bf 30 93 c2 db f3 5d 06 00 30 93 c2 db
+f3 5d 06 00 02 00 00 00 1c 31 37 39 32 31 35 31
+38 30 35 36 31 30 32 30 31 37 30 33 39 39 35 35
+39 30 30 30 30 24 30 31 31 30 39 32 30 30 2d 31
+61 31 34 2d 38 34 39 32 2d 39 37 30 36 2d 38 30
+30 36 65 32 63 61 37 61 32 63 0d 48 59 50 45 2d
+55 53 44 2d 50 45 52 50 00 00 00
