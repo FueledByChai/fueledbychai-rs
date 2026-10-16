@@ -258,6 +258,11 @@ struct Venue {
     /// for with nothing filled: the venue's refusal after its provisional acceptance (Codex
     /// r4289566988).
     refuse_take: Option<&'static str>,
+    /// Whether GET /positions answers a stale position once the order.modify of a partly
+    /// filled order was received, while the main socket is open (Codex r4290085861).
+    stale_position_after_modify: bool,
+    /// Set once the order.modify of a partly filled order was received.
+    modified: bool,
 }
 
 impl Venue {
@@ -662,6 +667,8 @@ fn responder(venue: Arc<Mutex<Venue>>, conn: usize) -> Responder {
                 o.size = size.to_string();
                 o.open = open.to_string();
                 let o = o.clone();
+                // Only a partly filled order's amend (P1's) arms the stale position.
+                v.modified |= !filled.is_zero();
                 frames.push(ok(json!({"order": o.json(&account)})));
                 let rid = format!("req-{}", id);
                 frames.push(Frame::Binary(order_event(&o, seq, 3, Some((4, 1, &rid)))));
@@ -838,7 +845,8 @@ fn routes(venue: Arc<Mutex<Venue>>) -> HttpRouter {
                 v.disconnects();
                 let stale_from = v
                     .stale_position_from
-                    .is_some_and(|n| v.orders.len() >= n && !v.main_ended());
+                    .is_some_and(|n| v.orders.len() >= n && !v.main_ended())
+                    || (v.stale_position_after_modify && v.modified && !v.main_ended());
                 if stale_from || (v.stale_position_once && !v.orders.is_empty()) {
                     v.stale_position_once = false;
                     let row = json!({
@@ -1044,6 +1052,8 @@ fn new_venue(cod_on_drop: bool, cod_on_close: bool) -> Arc<Mutex<Venue>> {
         book_fail_after_take: false,
         book_fail_next: false,
         refuse_take: None,
+        stale_position_after_modify: false,
+        modified: false,
     }))
 }
 
@@ -3158,7 +3168,9 @@ async fn an_order_book_off_the_tick_or_step_grid_names_the_flags_to_check() {
         let creds = secrets;
         let why = accept::run(&opts, None, &creds, out).await.unwrap_err();
         assert!(
-            why.contains(&format!("not on the {flag} grid")) && why.contains("GET /markets"),
+            why.contains(&format!("not on the {flag} grid"))
+                && why.contains("malformed")
+                && why.contains("GET /markets"),
             "{why}"
         );
         assert!(!why.contains("Malformed"), "{why}");
@@ -3542,7 +3554,11 @@ fn a_risk_refusal_is_answered_from_the_fill_steps_own_ioc_placements() {
     // recorded of their own IOC placements: never from a rejected amend or cancel, a refused
     // GTC order, or a NOT_ENOUGH_MARGIN refusal (its own case), and never from whether the
     // steps ran.
-    let mut ev = evidence::Evidence::default();
+    let mut ev = evidence::Evidence {
+        allow_fill: true,
+        fill_iocs: 3,
+        ..evidence::Evidence::default()
+    };
     let mut fill = evidence::Step::new("fill");
     fill.ran = evidence::Ran::Yes;
     let rejected = "Rejected(Reject { kind: Risk, venue_code: None, raw: <12 bytes> })";
@@ -3857,6 +3873,161 @@ async fn a_partly_filled_order_rest_disagrees_on_is_not_amended_and_stops_the_ph
         Decimal::from_str("0.00005").unwrap()
     );
     assert!(!outcome.ok, "{printed}");
+}
+
+#[tokio::test]
+async fn a_recovered_take_rest_disagrees_on_after_its_flatten_stops_the_phase() {
+    // Codex r4290028707, Reviewer B RB-6fnc-5: T1's placement gets no final phase in time
+    // (its events held), so the step fails; T1 is cancelled, ends with its fill and is
+    // flattened. GET /positions answers a position the stream does not show from T1 (the
+    // fifth order) on: the phase stops there, no P1 and no B3 sent.
+    let venue = new_venue(true, true);
+    {
+        let mut v = venue.lock().unwrap();
+        v.hold_take = true;
+        v.stale_position_from = Some(5);
+    }
+    // To the IOC, then T1, its cancel and F1.
+    let stub = stub_frames(&venue, &[MAIN + 2, 6]).await;
+    let (evidence_dir, _e) = temp_dir("evidence-recovered-unagreed");
+    let (lease_dir, _l) = temp_dir("lease-recovered-unagreed");
+    let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
+    opts.allow_fill = true;
+    opts.trade.step_timeout_secs = 1;
+    opts.rest_wait_secs = 1;
+    let (outcome, printed) = run_against(&opts).await;
+    let report = fs::read_to_string(&outcome.report).unwrap();
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("{e:?}\n{printed}\n{report}"));
+    let step = |name: &str| {
+        outcome
+            .evidence
+            .steps
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap()
+            .clone()
+    };
+    let fill = step("fill");
+    assert!(!fill.pass, "{fill:?}");
+    assert!(
+        printed.contains("FAIL fill") && printed.contains("after the flatten"),
+        "{printed}"
+    );
+    assert!(
+        fill.comparisons
+            .iter()
+            .any(|c| c.after == "fill: after the flatten" && !c.positions_agreed),
+        "{fill:?}"
+    );
+    assert_eq!(step("fill-partial").ran, evidence::Ran::NotRun);
+    assert_eq!(step("cod-dropped").ran, evidence::Ran::NotRun);
+    assert!(venue.lock().unwrap().position.is_zero(), "{printed}");
+    assert!(!outcome.ok, "{printed}");
+}
+
+#[tokio::test]
+async fn a_partly_filled_order_rest_disagrees_on_after_its_amend_is_not_flattened() {
+    // Codex r4290085861: GET /positions answers a position the stream does not show once P1's
+    // amend was sent. P1 is cancelled and ends with its fill; REST disagreeing then leaves
+    // what it filled unknown: nothing is flattened from it (no F2), and the phase stops with
+    // the line to flatten by hand.
+    let venue = new_venue(true, true);
+    {
+        let mut v = venue.lock().unwrap();
+        v.ask_top.1 = Decimal::from_str("0.00005").unwrap();
+        v.stale_position_after_modify = true;
+    }
+    // To the IOC, T1 and F1, P1, its amend and its cancel.
+    let stub = stub_frames(&venue, &[MAIN + 4, 6]).await;
+    let (evidence_dir, _e) = temp_dir("evidence-partial-after-amend");
+    let (lease_dir, _l) = temp_dir("lease-partial-after-amend");
+    let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
+    opts.allow_fill = true;
+    opts.rest_wait_secs = 1;
+    let (outcome, printed) = run_against(&opts).await;
+    let report = fs::read_to_string(&outcome.report).unwrap();
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("{e:?}\n{printed}\n{report}"));
+    let partial = outcome
+        .evidence
+        .steps
+        .iter()
+        .find(|s| s.name == "fill-partial")
+        .unwrap();
+    assert!(!partial.pass, "{partial:?}");
+    assert!(
+        printed.contains("FAIL fill-partial") && printed.contains("flatten by hand"),
+        "{printed}"
+    );
+    let reduce_only = creates(&stub, 0)
+        .iter()
+        .filter(|p| p["flags"] == json!(["REDUCE_ONLY"]))
+        .count();
+    assert_eq!(reduce_only, 1, "F1 alone: {printed}");
+    assert_eq!(
+        venue.lock().unwrap().position,
+        Decimal::from_str("0.00005").unwrap()
+    );
+    assert!(!outcome.ok, "{printed}");
+}
+
+#[test]
+fn a_flattens_book_depth_past_an_i64_bound_covers_the_size_not_wrapped() {
+    // Codex r4290028714: the flatten adds up the book's depth checked; a sum past i64::MAX
+    // covers any size.
+    let lvl = |px: i64, qty: i64| fbc_core::Lvl {
+        px: fbc_core::Ticks(px),
+        qty: fbc_core::Lots::new(qty).unwrap(),
+    };
+    let levels = [lvl(10, i64::MAX - 1), lvl(9, 5), lvl(8, 1)];
+    let max = fbc_core::Lots::new(i64::MAX).unwrap();
+    assert_eq!(accept::flatten_px(&levels, max), Some(fbc_core::Ticks(9)));
+    let small = fbc_core::Lots::new(3).unwrap();
+    assert_eq!(
+        accept::flatten_px(&levels, small),
+        Some(fbc_core::Ticks(10))
+    );
+    let shallow = [lvl(10, 1), lvl(9, 1)];
+    assert_eq!(
+        accept::flatten_px(&shallow, small),
+        Some(fbc_core::Ticks(9))
+    );
+    assert_eq!(accept::flatten_px(&[], small), None);
+}
+
+#[test]
+fn the_risk_answer_follows_the_ioc_placements_the_fill_steps_sent() {
+    // Codex r4290085864: 0092 (2) is answered from the IOC placements the fill steps sent
+    // and the flag, never from the fill step's status.
+    let q = "0092 (2)";
+    // --allow-fill given, the fill step skipped, fill-partial sending only its GTC order.
+    let mut ev = evidence::Evidence {
+        allow_fill: true,
+        ..evidence::Evidence::default()
+    };
+    let mut fill = evidence::Step::new("fill");
+    fill.ran = evidence::Ran::Skipped("a one-sided book".to_owned());
+    ev.steps.push(fill);
+    let a = answer(&ev, q);
+    assert!(
+        a.starts_with("not exercised") && a.contains("--allow-fill was given"),
+        "{a}"
+    );
+    // The fill step failed before its placement: still no IOC sent.
+    ev.steps[0].ran = evidence::Ran::Yes;
+    let a = answer(&ev, q);
+    assert!(a.starts_with("not exercised"), "{a}");
+    // Two IOCs sent, neither refused.
+    ev.fill_iocs = 2;
+    let a = answer(&ev, q);
+    assert!(a.starts_with("not observed") && a.contains("2 sent"), "{a}");
+    // Without the flag.
+    let ev = evidence::Evidence::default();
+    let a = answer(&ev, q);
+    assert!(a.contains("without --allow-fill"), "{a}");
 }
 
 #[test]

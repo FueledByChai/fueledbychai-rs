@@ -256,6 +256,7 @@ pub async fn run(
             target: what.to_owned(),
             market: t.market.clone(),
             caps: caps_text,
+            allow_fill: opts.allow_fill,
             ..Evidence::default()
         },
         rest_bodies: Vec::new(),
@@ -476,10 +477,13 @@ pub async fn touch(
 /// `--tick` and `--step` give is a wrong flag far more often than a malformed answer
 /// (FBC-6fnc: ETH run with BTC's grid read as `Malformed("bids: size")`).
 pub fn book_refused(e: &DecodeError, opts: &Options) -> String {
+    // The decoder names one error for a level's size (or price) that is off the grid, negative,
+    // not a string or not a number: the message says both (Codex r4290085870).
     let off = |side: &str, what: &str, flag: &str, grid: Decimal| {
         format!(
-            "GET /orderbook: a {side} {what} is not on the {flag} grid ({flag} {grid}); check \
-             --tick and --step against GET /markets (price_tick_size, order_size_increment)"
+            "GET /orderbook: a {side} {what} is malformed or not on the {flag} grid ({flag} \
+             {grid}); an off-grid one is the likelier: check --tick and --step against GET \
+             /markets (price_tick_size, order_size_increment)"
         )
     };
     match e {
@@ -984,6 +988,21 @@ pub fn amend_past_caps(
         .checked_add(SignedLots::of(side_of(side), total))
         .and_then(SignedLots::abs_lots);
     total > resting || worst.is_none_or(|w| w > inventory)
+}
+
+/// The price a flatten of `qty` is sent at on `levels` (the book's other side, from the touch
+/// out): the first level where the depth covers `qty`, else the last; `None` on an empty side.
+/// The depth is added up checked: a sum past `i64::MAX` covers any size (Codex r4290028714).
+pub fn flatten_px(levels: &[fbc_core::Lvl], qty: Lots) -> Option<Ticks> {
+    let mut depth = Some(0i64);
+    levels
+        .iter()
+        .find(|l| {
+            depth = depth.and_then(|d| d.checked_add(l.qty.get()));
+            depth.is_none_or(|d| d >= qty.get())
+        })
+        .or(levels.last())
+        .map(|l| l.px)
 }
 
 pub fn past_cap(now: SignedLots, side: OrderSide, qty: Lots, cap: Lots) -> Option<String> {
@@ -1661,6 +1680,10 @@ impl Run {
             .place(new)
             .map_err(|e| format!("{e:?}"))?;
         let rpc = p.submit(cmd)?;
+        // 0092 (2) is answered from the fill steps' IOC placements sent (Codex r4290085864).
+        if tif == Tif::Ioc && (step == "fill" || step == "fill-partial") {
+            self.ev.fill_iocs += 1;
+        }
         self.lines.step(
             step,
             format_args!(
@@ -1966,7 +1989,7 @@ impl Run {
     /// After a placement of `label` that failed its step: a resting one is cancelled, and the
     /// order must end with every fill its order events state before what filled is flattened
     /// (Codex r4289239739). One whose outcome stays unresolved is never called flat: the step
-    /// says so and false stops the phase.
+    /// says so and false stops the phase, as does REST disagreeing after the flatten.
     async fn settle_failed(
         &mut self,
         p: &Phase,
@@ -1990,9 +2013,24 @@ impl Run {
                 );
             }
         }
-        let flat = self.flatten(p, step, start).await.0;
-        self.ev.step(step).pass = false;
-        flat
+        let (flat, flats) = self.flatten(p, step, start).await;
+        if !flat {
+            self.ev.step(step).pass = false;
+            return false;
+        }
+        // REST is compared after the flatten as on the placed path: a fill or an order the
+        // stream missed is an exposure no further order is added to (Codex r4290028707;
+        // Reviewer B, RB-6fnc-5).
+        let mut cids: Vec<ClientOrderId> = self.labelled(label).into_iter().collect();
+        cids.extend(flats);
+        let flattened = self
+            .compare(p, &format!("{step}: after the flatten"), &cids)
+            .await;
+        let rest_flat = flattened.orders_agreed && flattened.positions_agreed;
+        let s = self.ev.step(step);
+        s.comparisons.push(flattened);
+        s.pass = false;
+        self.rest_not_flat(step, flat, rest_flat)
     }
 
     /// The client id of this phase's last order labelled `label`, if one was minted.
@@ -2332,6 +2370,24 @@ impl Run {
                  the step timeout)",
             );
         }
+        // Whatever P1 came to (filled whole, amended or not), what it filled is flattened only
+        // once REST agrees with the stream on it, as after T1 (Codex r4290085861).
+        let ended = self.compare(p, "fill-partial: P1 ended", &[cid]).await;
+        let agreed = ended.orders_agreed && ended.positions_agreed;
+        self.ev.step(step).comparisons.push(ended);
+        if !agreed {
+            let trace = self.tracker.borrow().trace(cid);
+            self.refresh_outcomes(p, step);
+            let s = self.ev.step(step);
+            s.ran = Ran::Yes;
+            s.orders.retain(|t| t.client_id != trace.client_id);
+            s.orders.push(trace);
+            return self.unresolved(
+                step,
+                "GET /orders or GET /positions did not agree with P1's fills within the REST \
+                 wait",
+            );
+        }
         let (flat, flats) = self.flatten(p, step, start).await;
         let mut cids = vec![cid];
         cids.extend(flats);
@@ -2535,16 +2591,7 @@ impl Run {
                 OrderSide::Sell => &book.bids,
                 OrderSide::Buy => &book.asks,
             };
-            let mut depth = 0i64;
-            let Some(px) = levels
-                .iter()
-                .find(|l| {
-                    depth += l.qty.get();
-                    depth >= qty.get()
-                })
-                .or(levels.last())
-                .map(|l| l.px)
-            else {
+            let Some(px) = flatten_px(levels, qty) else {
                 self.ev
                     .step(step)
                     .notes
