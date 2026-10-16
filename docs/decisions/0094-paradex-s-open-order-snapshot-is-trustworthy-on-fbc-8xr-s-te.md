@@ -142,14 +142,23 @@ within the step timeout. Where the rule already holds:
   on Paradex does not happen. The samples still declare the testnet run.
 - **The ladder's settle.** An order absent from a lagging `GET /orders` must not be Lost: the
   samples' `LadderConfig` `settle` is `testnet::SNAPSHOT_SETTLE` (10 s), above the 3480 ms lag
-  seen, and a consumer's must be too.
+  seen, and a consumer's must be too. Nothing enforces it for other consumers yet (Codex
+  r4295929734 on PR #155; FBC-i8lp makes a venue declare its snapshot lag and refuses a
+  shorter settle).
 - **Residual: two reads.** Paradex's resync is two REST requests, not one instant. A fill
   landing between `GET /orders` and `GET /positions` can be counted wrongly by the seed's
   shown-cumulative-fill rule (FBC-k7t7, open): at the seed only, since later resyncs compare
   and a miscount there is a `Desync`, which stops the session. At the seed nothing of ours is
   sent yet and orders from an earlier epoch were cancelled by cancel-on-disconnect (under
   640 ms in the runs above), so the case needs a fill of an earlier order racing the first
-  resync; FBC-k7t7 closes it.
+  resync, at most one order of the resting cap ($11). The fill's own `PositionEvent` then
+  shows a position the inventory does not hold, which Stops `testnet_trade` at once and
+  `testnet_quote` within the step timeout (the rule above); a consumer without that check
+  would quote on the miscount until a later resync's `Desync`. FBC-k7t7 closes it. For the
+  owner at acceptance (Codex r4295929715 on PR #155): whether FBC-k7t7 must land before the
+  first mainnet session that can fill (FBC-tyft's loop), or the flip waits for it; the
+  recommendation is the former, since `mainnet_smoke` (FBC-p0aa) rests one order far from the
+  touch and Stops on any fill it did not expect.
 - Proof: `crates/venues/fbc-venue-paradex/tests/exec_caps.rs` (the value and this record's
   citations), `tests/factory_exec.rs`, `tests/rehearsal.rs` (a resync seeds the market in a
   registry not declared a testnet run, Start and Flatten take it with no hand seed, and the
