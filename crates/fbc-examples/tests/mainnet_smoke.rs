@@ -8,16 +8,17 @@
 //! chain is refused before any order; Start is refused unless the resync was trustworthy; and no
 //! credential appears in what it prints.
 //!
-//! Paradex's adapter declares its snapshot source untrustworthy until FBC-2f7w's decision record
-//! flips it, so the run's full path is tested through [`Trusted`], a stand-in for the Paradex
-//! factory whose caps declare it trustworthy and that is Paradex's in everything else; with
-//! Paradex's own factory the run is refused before anything connects. The stub answers as in
+//! The run is tested through [`Declared`], a stand-in for the Paradex factory that is Paradex's in
+//! everything but the snapshot source its caps declare: [`TRUSTED`] for the full path, and
+//! [`UNTRUSTED`] for the refusals, so each test holds whatever Paradex's adapter declares
+//! (FBC-2f7w's decision record may flip it); `smoke::trusted` on Paradex's own factory is checked
+//! to agree with `ParadexFactory.caps()`. The stub answers as in
 //! `tests/testnet_trade.rs`, plus `GET /v1/system/config` and `GET /v1/markets/summary`, and
 //! the instrument cancel-all with `{"status":"ok"}`. The credentials are the synthetic account
 //! and key of `fixtures/paradex/signing`. The run is on real time, bounded at 60 s.
 
 // testnet_trade's options and its round trip, reused by path: only part of each is used here.
-#[allow(dead_code)]
+#[allow(dead_code, unused_imports)]
 #[path = "../examples/testnet_trade/args.rs"]
 mod args;
 #[path = "../src/auth_mainnet.rs"]
@@ -46,11 +47,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use fbc_conformance::{Frame, HttpReply, HttpRouter, PathPattern, Responder, Step, StubServer, WsScript};
+use fbc_conformance::{
+    Frame, HttpReply, HttpRouter, PathPattern, Responder, Step, StubServer, WsScript,
+};
 use fbc_core::{
     AccountSummary, AssetKey, ConfigError, EndpointPlan, ExecCodec, ExecEndpoint, FieldSpec,
-    HttpPlan, InstrumentSpecDraft, MdCodec, Secret, Secrets, SignedLots, SnapshotSource,
-    SpecTable, Subscription, SymbolError, VenueCaps, VenueConfig, VenueError, VenueFactory,
+    HttpPlan, InstrumentSpecDraft, MdCodec, Secret, Secrets, SignedLots, SnapshotSource, SpecTable,
+    Subscription, SymbolError, VenueCaps, VenueConfig, VenueError, VenueFactory,
 };
 use fbc_runtime::http::Method;
 use fbc_venue_paradex::ParadexFactory;
@@ -67,13 +70,17 @@ const MARKET: &str = "BTC-USD-PERP";
 /// The stub's mark: between the fixture book's best bid (62000.2) and ask (62000.5).
 const MARK: &str = "62000.3";
 
-/// Paradex's factory in everything but its caps, which declare the snapshot source
-/// trustworthy: what Paradex's will be once FBC-2f7w's record flips it.
-struct Trusted;
+/// Paradex's factory in everything but its caps, which declare the snapshot source given.
+struct Declared(SnapshotSource);
 
-static TRUSTED: Trusted = Trusted;
+/// Declares the snapshot source trustworthy: what Paradex's will be once FBC-2f7w's record flips
+/// it.
+static TRUSTED: Declared = Declared(SnapshotSource::Trustworthy);
 
-impl VenueFactory for Trusted {
+/// Declares the snapshot source untrustworthy, whatever Paradex's own adapter declares.
+static UNTRUSTED: Declared = Declared(SnapshotSource::Untrustworthy);
+
+impl VenueFactory for Declared {
     fn id(&self) -> &'static str {
         ParadexFactory.id()
     }
@@ -83,7 +90,7 @@ impl VenueFactory for Trusted {
     fn caps(&self, cfg: &VenueConfig) -> Result<VenueCaps, ConfigError> {
         let mut caps = ParadexFactory.caps(cfg)?;
         if let Some(exec) = caps.exec.as_mut() {
-            exec.order.snapshot_source = SnapshotSource::Trustworthy;
+            exec.order.snapshot_source = self.0;
         }
         Ok(caps)
     }
@@ -421,8 +428,8 @@ async fn run_on(
     let run = smoke::run(smoke, chain, secrets(), out, factory);
     let ran = tokio::time::timeout(Duration::from_secs(60), run).await;
     let printed = String::from_utf8(buf.borrow().clone()).unwrap();
-    let ran =
-        ran.unwrap_or_else(|_| panic!("mainnet_smoke did not finish in 60 s; it printed:\n{printed}"));
+    let ran = ran
+        .unwrap_or_else(|_| panic!("mainnet_smoke did not finish in 60 s; it printed:\n{printed}"));
     (ran, printed)
 }
 
@@ -435,7 +442,12 @@ fn sent(stub: &StubServer) -> Vec<(String, Value)> {
             Frame::Text(t) => serde_json::from_str::<Value>(t).ok(),
             Frame::Binary(_) => None,
         })
-        .map(|v| (v["method"].as_str().unwrap_or("").to_owned(), v["params"].clone()))
+        .map(|v| {
+            (
+                v["method"].as_str().unwrap_or("").to_owned(),
+                v["params"].clone(),
+            )
+        })
         .collect()
 }
 
@@ -494,10 +506,11 @@ async fn mainnet_smoke_places_one_post_only_order_cancels_it_and_stops_against_a
         "{printed}"
     );
     // One place and one cancel of it, plus Stop's cancel-all of the market (a trustworthy
-    // resync: never an account cancel-all), and nothing else order-affecting.
+    // resync: never an account cancel-all), and nothing else order-affecting. The report counts
+    // the cancel-all among the cancels sent.
     assert_eq!(
         (report.places_sent, report.cancels_sent),
-        (1, 1),
+        (1, 2),
         "{printed}"
     );
     let sent = sent(&stub);
@@ -505,7 +518,11 @@ async fn mainnet_smoke_places_one_post_only_order_cancels_it_and_stops_against_a
     assert_eq!(count("order.create"), 1, "{sent:?}");
     assert_eq!(count("order.cancel"), 1, "{sent:?}");
     assert_eq!(count("order.cancel_all"), 1, "{sent:?}");
-    assert_eq!(count("order.cancel_batch") + count("order.modify"), 0, "{sent:?}");
+    assert_eq!(
+        count("order.cancel_batch") + count("order.modify"),
+        0,
+        "{sent:?}"
+    );
     let (_, all) = sent.iter().find(|(m, _)| m == "order.cancel_all").unwrap();
     assert_eq!(all["market"], MARKET, "{sent:?}");
     let (_, create) = sent.iter().find(|(m, _)| m == "order.create").unwrap();
@@ -523,17 +540,17 @@ async fn mainnet_smoke_places_one_post_only_order_cancels_it_and_stops_against_a
         printed.contains("ORDER notional $11.1601 at the mark 62000.3"),
         "{printed}"
     );
-    assert!(printed.contains("MAINNET a loopback test stub"), "{printed}");
     assert!(
-        printed.contains("the snapshot is trustworthy"),
+        printed.contains("MAINNET a loopback test stub"),
         "{printed}"
     );
+    assert!(printed.contains("the snapshot is trustworthy"), "{printed}");
     assert!(printed.contains("an instrument cancel-all"), "{printed}");
     // Never a hand seed, never an owner-assisted testnet run.
     assert!(!printed.contains("SEED"), "{printed}");
     assert!(!printed.contains("OWNER-ASSISTED"), "{printed}");
     assert!(
-        printed.contains("DONE ok places sent 1 cancels sent 1"),
+        printed.contains("DONE ok places sent 1 cancels sent 2"),
         "{printed}"
     );
     // The chain and the mark were read before anything else.
@@ -548,25 +565,43 @@ async fn mainnet_smoke_places_one_post_only_order_cancels_it_and_stops_against_a
 }
 
 #[tokio::test]
-async fn paradexs_declared_untrustworthy_snapshot_source_refuses_the_run_before_anything_connects()
-{
-    // Paradex's own factory: its snapshot source stays untrustworthy until FBC-2f7w's record.
+async fn an_untrustworthy_snapshot_source_refuses_the_run_before_anything_connects() {
     let stub = StubServer::start(no_script(), routes()).await.unwrap();
     let smoke = smoke_on(&stub);
-    let (ran, printed) = run_on(&smoke, None, &ParadexFactory).await;
-    let err = ran.err().unwrap_or_else(|| panic!("the run was not refused:\n{printed}"));
+    let (ran, printed) = run_on(&smoke, None, &UNTRUSTED).await;
+    let err = ran
+        .err()
+        .unwrap_or_else(|| panic!("the run was not refused:\n{printed}"));
     assert!(err.contains("untrustworthy"), "{err}");
     assert!(err.contains("FBC-2f7w"), "{err}");
     assert!(err.contains("never seeded by hand"), "{err}");
-    assert!(stub.http_requests().is_empty(), "{:?}", stub.http_requests());
+    assert!(
+        stub.http_requests().is_empty(),
+        "{:?}",
+        stub.http_requests()
+    );
     assert!(stub.connections().is_empty());
     assert!(printed.is_empty(), "{printed}");
+    // Paradex's own factory is admitted exactly when its caps declare the snapshot trustworthy
+    // (Untrustworthy until FBC-2f7w's record flips it).
+    let cfg = smoke::config(&smoke.trade);
+    let declared = ParadexFactory
+        .caps(&cfg)
+        .unwrap()
+        .exec
+        .map(|exec| exec.order.snapshot_source);
+    assert_eq!(
+        smoke::trusted(&ParadexFactory, &cfg).is_ok(),
+        declared == Some(SnapshotSource::Trustworthy),
+        "{declared:?}"
+    );
 }
 
 #[tokio::test]
 async fn a_resync_that_is_not_trustworthy_refuses_start_with_nothing_placed() {
-    // The round trip run as mainnet_smoke runs it (never seeded by hand) on Paradex's own
-    // factory, past the run's up-front check: the resync seeds nothing, so Start is refused.
+    // The round trip run as mainnet_smoke runs it (never seeded by hand) on a venue declaring an
+    // untrustworthy snapshot, past the run's up-front check: the resync seeds nothing, so Start
+    // is refused.
     let placed = Arc::new(Mutex::new(Placed::default()));
     // auth, four subscriptions and the arm; Stop has nothing to cancel.
     let stub = StubServer::start(script(placed, 6), routes())
@@ -579,7 +614,7 @@ async fn a_resync_that_is_not_trustworthy_refuses_start_with_nothing_placed() {
         out,
         t0: Instant::now(),
     };
-    let net = smoke::network(&ParadexFactory, Decimal::from_str(MARK).unwrap());
+    let net = smoke::network(&UNTRUSTED, Decimal::from_str(MARK).unwrap());
     let cfg = smoke::config(&smoke.trade);
     let report = trade::run_on(&smoke.trade, &net, cfg, secrets(), lines)
         .await
@@ -587,12 +622,18 @@ async fn a_resync_that_is_not_trustworthy_refuses_start_with_nothing_placed() {
     stub.finished().await.unwrap();
     let printed = String::from_utf8(buf.borrow().clone()).unwrap();
     assert!(!report.ok, "{printed}");
-    assert_eq!(steps(&printed), ["login", "arm", "resync", "stop"], "{printed}");
+    assert_eq!(
+        steps(&printed),
+        ["login", "arm", "resync", "stop"],
+        "{printed}"
+    );
     assert!(printed.contains("Start refused"), "{printed}");
     assert!(printed.contains("never seeds one by hand"), "{printed}");
     assert_eq!((report.places_sent, report.cancels_sent), (0, 0));
     assert!(
-        sent(&stub).iter().all(|(m, _)| !m.starts_with("order.") || m == "order.cancel_on_disconnect"),
+        sent(&stub)
+            .iter()
+            .all(|(m, _)| !m.starts_with("order.") || m == "order.cancel_on_disconnect"),
         "{:?}",
         sent(&stub)
     );
@@ -618,7 +659,10 @@ async fn a_position_on_the_market_refuses_start_with_nothing_placed() {
     stub.finished().await.unwrap();
     let report = ran.unwrap();
     assert!(!report.ok, "{printed}");
-    assert!(printed.contains("Start refused: the account holds 2 lots"), "{printed}");
+    assert!(
+        printed.contains("Start refused: the account holds 2 lots"),
+        "{printed}"
+    );
     assert_eq!(report.places_sent, 0, "{printed}");
     assert!(!steps(&printed).contains(&"start".to_owned()), "{printed}");
 }
@@ -626,7 +670,10 @@ async fn a_position_on_the_market_refuses_start_with_nothing_placed() {
 #[tokio::test]
 async fn a_system_config_naming_another_chain_is_refused_before_any_order() {
     for (chain, shown) in [
-        ("PRIVATE_SN_PARACLEAR_TESTNET", "PRIVATE_SN_PARACLEAR_TESTNET"),
+        (
+            "PRIVATE_SN_PARACLEAR_TESTNET",
+            "PRIVATE_SN_PARACLEAR_TESTNET",
+        ),
         ("PRIVATE_SN_POTC_SEPOLIA", "PRIVATE_SN_POTC_SEPOLIA"),
         // Not shaped like a chain's name: never echoed.
         ("0xdeadbeef secret", "not shown"),
@@ -636,7 +683,9 @@ async fn a_system_config_naming_another_chain_is_refused_before_any_order() {
             .unwrap();
         let smoke = smoke_on(&stub);
         let (ran, printed) = run_on(&smoke, None, &TRUSTED).await;
-        let err = ran.err().unwrap_or_else(|| panic!("not refused:\n{printed}"));
+        let err = ran
+            .err()
+            .unwrap_or_else(|| panic!("not refused:\n{printed}"));
         assert!(err.contains("PRIVATE_SN_PARACLEAR_MAINNET"), "{err}");
         assert!(err.contains(shown), "{err}");
         assert!(!err.contains("deadbeef"), "{err}");
@@ -679,7 +728,9 @@ async fn an_order_below_the_minimum_notional_at_the_mark_is_refused_before_the_s
     .unwrap();
     let smoke = smoke_on(&stub);
     let (ran, printed) = run_on(&smoke, None, &TRUSTED).await;
-    let err = ran.err().unwrap_or_else(|| panic!("not refused:\n{printed}"));
+    let err = ran
+        .err()
+        .unwrap_or_else(|| panic!("not refused:\n{printed}"));
     assert!(err.contains("at the mark price 50000 is $9"), "{err}");
     assert!(err.contains("below the market's minimum $10"), "{err}");
     assert!(stub.connections().is_empty());
@@ -719,7 +770,10 @@ fn the_inventory_cap_is_converted_at_no_less_than_the_mark() {
     assert_eq!(priced.inventory.get(), 80);
     // No mark: unchanged.
     let same = trade::at_mark(opts, trade::price(opts, &book).unwrap(), None).unwrap();
-    assert_eq!((same.inventory, same.mark_notional), (priced.inventory, None));
+    assert_eq!(
+        (same.inventory, same.mark_notional),
+        (priced.inventory, None)
+    );
     // A mark above the ask: $50 at 70000 is 71 lots.
     let high = trade::at_mark(opts, priced, Some(Decimal::from(70_000))).unwrap();
     assert_eq!(high.inventory.get(), 71);
@@ -739,7 +793,10 @@ fn start_is_refused_unless_the_resync_was_trustworthy_and_the_account_flat() {
 
 #[tokio::test]
 async fn a_run_not_confirmed_mainnet_and_sole_trader_is_refused_before_anything_connects() {
-    for (flag, why) in [("--mainnet", "--mainnet is required"), ("--sole-trader", "--sole-trader is required")] {
+    for (flag, why) in [
+        ("--mainnet", "--mainnet is required"),
+        ("--sole-trader", "--sole-trader is required"),
+    ] {
         let args: Vec<&str> = ORDER_ARGS.iter().copied().filter(|a| *a != flag).collect();
         let err = smoke_args::parse(strings(&args)).err().unwrap();
         assert!(err.contains(why), "{err}");
@@ -784,17 +841,21 @@ fn the_command_line_defaults_to_mainnet_and_refuses_any_other_url() {
         ("--ws-url", "ws://ws.api.prod.paradex.trade/v1"),
         ("--rest-url", "https://evil.example/v1"),
     ] {
-        let err = parse_with(&[flag, url]).err().unwrap_or_else(|| panic!("{url}"));
+        let err = parse_with(&[flag, url])
+            .err()
+            .unwrap_or_else(|| panic!("{url}"));
         assert!(err.contains("mainnet"), "{err}");
         assert!(!err.contains(url), "{err}");
     }
     // A loopback stub on one URL only.
-    let err = parse_with(&["--rest-url", "http://127.0.0.1:9/v1"]).err().unwrap();
+    let err = parse_with(&["--rest-url", "http://127.0.0.1:9/v1"])
+        .err()
+        .unwrap();
     assert!(err.contains("both"), "{err}");
 }
 
-#[test]
-fn the_guard_admits_only_the_mainnet_chain_id() {
+#[tokio::test]
+async fn the_guard_admits_only_the_mainnet_chain_id() {
     let (rest, ws) = (smoke::MAINNET_REST, smoke::MAINNET_WS);
     assert_eq!(smoke::mainnet_guard(rest, ws, None), Ok(false));
     for chain in [
@@ -803,7 +864,11 @@ fn the_guard_admits_only_the_mainnet_chain_id() {
         &format!("0x{}", smoke::MAINNET_CHAIN_HEX),
         &format!("0X{}", smoke::MAINNET_CHAIN_HEX.to_ascii_uppercase()),
     ] {
-        assert_eq!(smoke::mainnet_guard(rest, ws, Some(chain)), Ok(false), "{chain}");
+        assert_eq!(
+            smoke::mainnet_guard(rest, ws, Some(chain)),
+            Ok(false),
+            "{chain}"
+        );
     }
     for chain in [
         "PRIVATE_SN_PARACLEAR_TESTNET",
@@ -825,27 +890,23 @@ fn the_guard_admits_only_the_mainnet_chain_id() {
         smoke::MAINNET_CHAIN_DECIMAL,
         "8458834024819506728615521019831122032732688838300957472069977523540"
     );
-    // A run with the testnet chain id set is refused before anything connects.
-    let Ok(Parsed::Smoke(smoke)) = parse_with(&[]) else {
-        panic!("parses");
-    };
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let out: testnet::Out = Rc::new(RefCell::new(Vec::<u8>::new()));
-    let ran = runtime.block_on(smoke::run(
-        &smoke,
-        Some("PRIVATE_SN_PARACLEAR_TESTNET"),
-        secrets(),
-        out,
-        &TRUSTED,
-    ));
+    // A run with the testnet chain id set is refused before anything connects: run against a
+    // loopback stub, which sees nothing.
+    let stub = StubServer::start(no_script(), routes()).await.unwrap();
+    let smoke = smoke_on(&stub);
+    let (ran, printed) = run_on(&smoke, Some("PRIVATE_SN_PARACLEAR_TESTNET"), &TRUSTED).await;
     assert!(ran.err().unwrap().contains("PARADEX_CHAIN_ID"));
+    assert!(printed.is_empty(), "{printed}");
+    assert!(
+        stub.http_requests().is_empty(),
+        "{:?}",
+        stub.http_requests()
+    );
+    assert!(stub.connections().is_empty());
 }
 
-#[test]
-fn the_caps_are_at_most_eleven_dollars_resting_and_fifty_inventory() {
+#[tokio::test]
+async fn the_caps_are_at_most_eleven_dollars_resting_and_fifty_inventory() {
     // Smaller caps are taken, larger refused, and the order is bounded by the resting cap.
     let set = |flag: &str, value: &str| -> Result<Parsed, String> {
         let mut args = strings(&ORDER_ARGS);
@@ -865,24 +926,35 @@ fn the_caps_are_at_most_eleven_dollars_resting_and_fifty_inventory() {
         panic!("a smaller cap parses");
     };
     assert_eq!(small.trade.inventory_cap_usd, Decimal::from(20));
-    assert!(matches!(set("--resting-cap-usd", "11"), Ok(Parsed::Smoke(_))));
-    // The run checks them again, before anything connects.
-    let Ok(Parsed::Smoke(mut big)) = set("--inventory-cap-usd", "20") else {
-        panic!("parses");
-    };
-    big.trade.inventory_cap_usd = Decimal::from(51);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let out: testnet::Out = Rc::new(RefCell::new(Vec::<u8>::new()));
-    let ran = runtime.block_on(smoke::run(&big, None, secrets(), out, &TRUSTED));
-    assert!(ran.err().unwrap().contains("at most $50"));
+    assert!(matches!(
+        set("--resting-cap-usd", "11"),
+        Ok(Parsed::Smoke(_))
+    ));
+    // The run checks them again, before anything connects: run against a loopback stub, which
+    // sees nothing.
+    let stub = StubServer::start(no_script(), routes()).await.unwrap();
+    for (resting, inventory, why) in [(12, 50, "at most $11"), (11, 51, "at most $50")] {
+        let mut big = smoke_on(&stub);
+        big.trade.resting_cap_usd = Decimal::from(resting);
+        big.trade.inventory_cap_usd = Decimal::from(inventory);
+        let (ran, printed) = run_on(&big, None, &TRUSTED).await;
+        let err = ran.err().unwrap();
+        assert!(err.contains(why), "{err}");
+        assert!(printed.is_empty(), "{printed}");
+    }
+    assert!(
+        stub.http_requests().is_empty(),
+        "{:?}",
+        stub.http_requests()
+    );
+    assert!(stub.connections().is_empty());
 }
 
 #[test]
 fn the_command_line_refuses_what_it_does_not_take_and_never_echoes_a_value() {
-    let secretish = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    // Shaped like a key (64 hex digits), built here so no key-shaped literal is in the source.
+    let secretish = format!("0x{}", "1234567890abcdef".repeat(4));
+    let secretish = secretish.as_str();
     for extra in [
         vec!["--side", secretish],
         vec!["--namespace", secretish],
@@ -897,7 +969,9 @@ fn the_command_line_refuses_what_it_does_not_take_and_never_echoes_a_value() {
         vec!["--unknown"],
         vec!["--rest-url"],
     ] {
-        let err = parse_with(&extra).err().unwrap_or_else(|| panic!("{extra:?}"));
+        let err = parse_with(&extra)
+            .err()
+            .unwrap_or_else(|| panic!("{extra:?}"));
         assert!(!err.contains("1234567890abcdef"), "{err}");
     }
     let err = parse_with(&["--key=0xabcdef"]).err().unwrap();
@@ -911,15 +985,24 @@ fn the_command_line_refuses_what_it_does_not_take_and_never_echoes_a_value() {
     }
     // Every optional flag parses.
     let Ok(Parsed::Smoke(smoke)) = parse_with(&[
-        "--hold", "5", "--socks5", "127.0.0.1:1080", "--lease-dir", "/tmp/fbc-smoke",
-        "--side", "sell",
+        "--hold",
+        "5",
+        "--socks5",
+        "127.0.0.1:1080",
+        "--lease-dir",
+        "/tmp/fbc-smoke",
+        "--side",
+        "sell",
     ]) else {
         panic!("the optional flags parse");
     };
     assert_eq!(smoke.trade.hold_secs, 5);
     assert_eq!(smoke.trade.side, args::OrderSide::Sell);
     assert_eq!(smoke.trade.lease_dir, PathBuf::from("/tmp/fbc-smoke"));
-    assert!(matches!(smoke.trade.proxy, fbc_runtime::ProxyConfig::Socks5 { .. }));
+    assert!(matches!(
+        smoke.trade.proxy,
+        fbc_runtime::ProxyConfig::Socks5 { .. }
+    ));
     // A SOCKS5 proxy with loopback stub URLs is refused.
     let err = parse_with(&[
         "--socks5",
@@ -936,8 +1019,14 @@ fn the_command_line_refuses_what_it_does_not_take_and_never_echoes_a_value() {
 
 #[test]
 fn help_names_the_environment_the_prerequisites_and_every_line() {
-    assert!(matches!(smoke_args::parse(strings(&["--help"])), Ok(Parsed::Help)));
-    assert!(matches!(smoke_args::parse(strings(&["-h"])), Ok(Parsed::Help)));
+    assert!(matches!(
+        smoke_args::parse(strings(&["--help"])),
+        Ok(Parsed::Help)
+    ));
+    assert!(matches!(
+        smoke_args::parse(strings(&["-h"])),
+        Ok(Parsed::Help)
+    ));
     for needed in [
         "PARADEX_MAINNET_ACCOUNT_ADDRESS",
         "PARADEX_MAINNET_PRIVATE_KEY",
@@ -988,7 +1077,9 @@ fn credentials_come_only_from_the_mainnet_variables_and_are_never_shown() {
             ("PARADEX_MAINNET_PRIVATE_KEY", key.as_str()),
         ],
     ] {
-        let err = auth_mainnet::paradex_mainnet_secrets(env(&pairs)).err().unwrap();
+        let err = auth_mainnet::paradex_mainnet_secrets(env(&pairs))
+            .err()
+            .unwrap();
         assert!(err.contains("PARADEX_MAINNET_ACCOUNT_ADDRESS"), "{err}");
         assert!(!err.contains(&account) && !err.contains(&key), "{err}");
     }
@@ -1030,7 +1121,10 @@ fn the_mainnet_network_never_seeds_by_hand_and_names_its_own_leases() {
     assert_eq!(net.label, "mainnet");
     assert_eq!(net.program, "mainnet_smoke");
     assert_eq!(net.mark, Some(Decimal::ONE));
-    assert!(net.refusal_causes.contains("PARADEX_MAINNET_ACCOUNT_ADDRESS"));
+    assert!(
+        net.refusal_causes
+            .contains("PARADEX_MAINNET_ACCOUNT_ADDRESS")
+    );
     // The session signs for mainnet's chain.
     let Ok(Parsed::Smoke(smoke)) = parse_with(&[]) else {
         panic!("parses");

@@ -107,7 +107,7 @@ async fn touch(opts: &Options, specs: &SpecTable) -> Result<OrderbookSnapshot, S
 
 /// The order-entry session's configuration under `opts` ([`crate::testnet::session_config`]).
 fn session_config(
-    venue: &'static ParadexFactory,
+    venue: &'static dyn VenueFactory,
     cfg: VenueConfig,
     creds: Secrets,
     specs: SpecTable,
@@ -123,6 +123,26 @@ pub struct Report {
     pub ok: bool,
     pub places_sent: usize,
     pub cancels_sent: usize,
+}
+
+/// Where a round trip trades, and how its market's position comes to be known.
+pub struct Network {
+    /// The venue (Paradex; under test, a stand-in that declares other caps).
+    pub factory: &'static dyn VenueFactory,
+    /// The account's name in the lease files: a label, never the address.
+    pub label: &'static str,
+    /// The program, as a held lease's refusal names it.
+    pub program: &'static str,
+    /// True: an owner-assisted testnet run, the market seeded by hand from the resync's REST
+    /// position (decision 0067). False: never seeded by hand; Start only once a trustworthy
+    /// resync seeded the market, and only flat (`mainnet_smoke`).
+    pub owner_assisted: bool,
+    /// The market's mark price, read before the run: Paradex judges an order's minimum notional
+    /// at it (the owner's 2026-10-16 testnet run), so the order must reach the minimum there,
+    /// and the inventory cap is converted at no less than it. `None`: not read (testnet_trade).
+    pub mark: Option<Decimal>,
+    /// The usual causes of a refused login, printed with the refusal.
+    pub refusal_causes: &'static str,
 }
 
 /// Runs testnet_trade: the guard first, before anything connects; then the touch, the order,
@@ -156,12 +176,32 @@ pub async fn run(
          (decision 0094), so the resync seeds the market's position; a market it left unknown \
          is seeded by hand from the venue's REST position, never outside a declared testnet run"
     ));
+    let net = Network {
+        factory: &ParadexFactory,
+        label: ACCOUNT_LABEL,
+        program: "testnet_trade",
+        owner_assisted: true,
+        mark: None,
+        refusal_causes: REFUSAL_CAUSES,
+    };
+    run_on(opts, &net, config(opts), creds, lines).await
+}
 
-    let factory = &ParadexFactory;
-    let cfg = config(opts);
+/// The round trip on `net` under the Paradex configuration `cfg` (its login signing for
+/// `net.chain`), once its guard passed and its first lines are printed: the touch, the order,
+/// the session and the driver ([`run`] for its other arguments).
+pub async fn run_on(
+    opts: &Options,
+    net: &Network,
+    cfg: VenueConfig,
+    creds: Secrets,
+    lines: Lines,
+) -> Result<Report, String> {
+    sole(opts)?;
+    let factory = net.factory;
     let specs = specs(factory, &cfg, opts)?;
     let book = touch(opts, &specs).await?;
-    let order = price(opts, &book)?;
+    let order = at_mark(opts, price(opts, &book)?, net.mark)?;
     lines.line(format_args!(
         "BBO bid {} ask {} (GET /orderbook seq {})",
         px_or_none(order.bid),
@@ -183,8 +223,16 @@ pub async fn run(
         order.resting.get(),
         order.inventory.get(),
     ));
+    if let (Some(mark), Some(at_mark)) = (net.mark, order.mark_notional) {
+        lines.line(format_args!(
+            "ORDER notional ${} at the mark {mark}, where Paradex judges the minimum ${}",
+            at_mark.round_dp(4),
+            opts.min_notional
+        ));
+    }
 
-    // The registry: caps, the testnet-run declaration (decision 0067), then the lease names.
+    // The registry: caps, the testnet-run declaration (decision 0067) when the run is one, then
+    // the lease names.
     let order_caps = factory
         .caps(&cfg)
         .map_err(|e| e.to_string())?
@@ -203,19 +251,24 @@ pub async fn run(
     let caps = PreTradeCaps::new()
         .with_market(INST, limits)
         .map_err(|e| format!("caps: {e:?}"))?;
-    let keys = LeaseKeys::new(VENUE, ACCOUNT_LABEL, &order_caps).with_market(INST, symbol.clone());
+    let keys = LeaseKeys::new(VENUE, net.label, &order_caps).with_market(INST, symbol.clone());
     let needs_account_lease = keys.nonce_scope() == NonceScope::PerAccountMonotonic;
-    let reg = Registry::with_caps(caps)
-        .for_testnet_run(TestnetRun::owner_assisted())
-        .with_lease_keys(keys);
+    let reg = Registry::with_caps(caps);
+    let reg = if net.owner_assisted {
+        reg.for_testnet_run(TestnetRun::owner_assisted())
+    } else {
+        reg
+    };
+    let reg = reg.with_lease_keys(keys);
 
     // The leases: the client-id namespace, the market (and the account where nonces need it).
     fs::create_dir_all(&opts.lease_dir)
         .map_err(|e| format!("--lease-dir {}: {e}", opts.lease_dir.display()))?;
     let held = |e: &dyn std::fmt::Debug| {
         format!(
-            "a lease in {} is held (another testnet_trade running?): {e:?}",
-            opts.lease_dir.display()
+            "a lease in {} is held (another {} running?): {e:?}",
+            opts.lease_dir.display(),
+            net.program
         )
     };
     let ns = Namespace::new(opts.namespace);
@@ -224,11 +277,11 @@ pub async fn run(
     // Read now, so a mark that cannot be read refuses the run before anything connects; the
     // mint is built after the resync, which also floors it (the highest of our ids it shows).
     let persisted = hwm.read()?;
-    let market = MarketLease::acquire(&opts.lease_dir, VENUE, ACCOUNT_LABEL, &symbol)
-        .map_err(|e| held(&e))?;
+    let market =
+        MarketLease::acquire(&opts.lease_dir, VENUE, net.label, &symbol).map_err(|e| held(&e))?;
     let mut leases = Leases::market(market);
     if needs_account_lease {
-        let acct = fbc_core::AccountLease::acquire(&opts.lease_dir, VENUE, ACCOUNT_LABEL)
+        let acct = fbc_core::AccountLease::acquire(&opts.lease_dir, VENUE, net.label)
             .map_err(|e| held(&e))?;
         leases = leases.with_account(acct);
     }
@@ -259,6 +312,7 @@ pub async fn run(
         specs: specs.clone(),
         first_seq: book.seq_no,
         inventory: order.inventory,
+        mark: net.mark,
     };
     let session_cfg = session_config(factory, cfg, creds, specs, opts)?;
     let (mut session, control) =
@@ -278,6 +332,8 @@ pub async fn run(
         owned: Vec::new(),
         recheck,
         mint: None,
+        owner_assisted: net.owner_assisted,
+        refusal_causes: net.refusal_causes,
     };
     let order = Planned {
         side: match opts.side {
@@ -335,6 +391,8 @@ pub struct Priced {
     pub qty: Lots,
     pub size: Decimal,
     pub notional: Decimal,
+    /// The notional at the mark price, when one was read.
+    pub mark_notional: Option<Decimal>,
     pub resting: Lots,
     pub inventory: Lots,
 }
@@ -449,9 +507,54 @@ pub fn price(opts: &Options, book: &OrderbookSnapshot) -> Result<Priced, String>
         qty,
         size,
         notional,
+        mark_notional: None,
         resting,
         inventory,
     })
+}
+
+/// `order` as [`price`] priced it, judged at the market's `mark` price when one was read: its
+/// notional at the mark must reach the market's minimum too (Paradex judges it there, and
+/// refuses an order below it only after the place was accepted), and the inventory cap is
+/// converted at no less than the mark ([`at_market`]). Unchanged when `mark` is `None`.
+pub fn at_mark(opts: &Options, order: Priced, mark: Option<Decimal>) -> Result<Priced, String> {
+    let Some(mark) = mark else {
+        return Ok(order);
+    };
+    let at_mark = order.size * mark;
+    if at_mark < opts.min_notional {
+        return Err(format!(
+            "the order's notional at the mark price {mark} is ${} ({} on the {} step), below \
+             the market's minimum ${}: Paradex judges the minimum at the mark and refuses the \
+             order after accepting it; refused (raise --order-usd within the resting cap, or \
+             bring --away-bps nearer)",
+            at_mark.round_dp(4),
+            order.size,
+            opts.step,
+            opts.min_notional
+        ));
+    }
+    let at = at_market(order.px, order.bid, order.ask, Some(mark));
+    let lots = (opts.inventory_cap_usd / (at * opts.step)).floor();
+    let inventory =
+        Lots::new(lots.to_i64().ok_or("an amount does not fit")?).ok_or("a negative amount")?;
+    Ok(Priced {
+        mark_notional: Some(at_mark),
+        inventory,
+        ..order
+    })
+}
+
+/// The price the inventory cap is converted at: [`inventory_price`] of the order's price and
+/// the touch, or the mark when it is higher.
+pub fn at_market(
+    px: Decimal,
+    bid: Option<Decimal>,
+    ask: Option<Decimal>,
+    mark: Option<Decimal>,
+) -> Decimal {
+    mark.into_iter()
+        .fold(inventory_price(px, bid, ask), Decimal::max)
 }
 
 /// What the touch's second read needs: the command line and the market's spec.
@@ -462,6 +565,8 @@ struct Recheck {
     first_seq: u64,
     /// The inventory cap in lots the registry holds, from the first read.
     inventory: Lots,
+    /// The mark price read before the run, if any ([`at_market`]).
+    mark: Option<Decimal>,
 }
 
 impl Recheck {
@@ -495,7 +600,7 @@ impl Recheck {
         // The inventory cap in lots at the fresh market: never fewer than the registry holds,
         // or its check would admit a position worth more than the cap now.
         let price = Decimal::from(px.0) * self.opts.tick;
-        let at = inventory_price(price, now.bid, now.ask);
+        let at = at_market(price, now.bid, now.ask, self.mark);
         let usd = self.opts.inventory_cap_usd;
         let lots = (usd / (at * self.opts.step)).floor().to_i64().unwrap_or(0);
         if lots < self.inventory.get() {
@@ -716,6 +821,40 @@ pub fn place_refusal(
     None
 }
 
+/// Why a run that is not an owner-assisted testnet run (`owner_assisted` false: never seeded by
+/// hand) must not Start on the resync it applied, or `None`: the resync was `untrustworthy`, so
+/// it seeded no position and nothing may seed one by hand (owner answer C to RB-olg-3: a
+/// mainnet market is armed only after a trustworthy resync; Paradex's snapshot source stays
+/// untrustworthy until FBC-2f7w's decision record flips it), or the account holds a `position`
+/// on the market (the smoke runs on a flat account). Always `None` for an owner-assisted run,
+/// which seeds by hand.
+pub fn start_refusal(
+    owner_assisted: bool,
+    untrustworthy: bool,
+    position: SignedLots,
+) -> Option<String> {
+    if owner_assisted {
+        return None;
+    }
+    if untrustworthy {
+        return Some(
+            "the resync's snapshot source is untrustworthy, so it seeded no position, and this \
+             run never seeds one by hand (only an owner-assisted testnet run may, decision \
+             0067); it runs once FBC-2f7w's decision record makes Paradex's snapshot source \
+             trustworthy"
+                .to_owned(),
+        );
+    }
+    if position.0 != 0 {
+        return Some(format!(
+            "the account holds {} lots on the market: the smoke runs on a flat account; close \
+             the position first",
+            position.0
+        ));
+    }
+    None
+}
+
 /// Those of `owned` (our orders on the market) resting on `side`, each with what of it rests
 /// ([`OrderRecord::resting`](fbc_oms::OrderRecord::resting)); one the registry does not hold
 /// is not among them.
@@ -783,6 +922,10 @@ struct Driver {
     /// the driver, when the run ends, Stop included (Reviewer B's RB114-7), so no other
     /// testnet_trade takes the namespace while this one trades.
     mint: Option<CidMint>,
+    /// [`Network::owner_assisted`].
+    owner_assisted: bool,
+    /// [`Network::refusal_causes`].
+    refusal_causes: &'static str,
 }
 
 impl Driver {
@@ -992,8 +1135,8 @@ impl Driver {
             Some(Ok(())) => {}
             Some(Err((n, why))) => {
                 self.note(format_args!(
-                    "login refused {n} times: {why}; stopping ({REFUSAL_CAUSES}; --help lists \
-                     them)"
+                    "login refused {n} times: {why}; stopping ({}; --help lists them)",
+                    self.refusal_causes
                 ));
                 return false;
             }
@@ -1110,10 +1253,24 @@ impl Driver {
             return false;
         }
 
+        if let Some(why) = start_refusal(self.owner_assisted, untrustworthy, position) {
+            self.note(format_args!("Start refused: {why}; nothing placed"));
+            return false;
+        }
         {
             let mut link = self.link.borrow_mut();
             let reg = link.reg();
             if !reg.position_known(INST) {
+                if !self.owner_assisted {
+                    // A trustworthy resync seeds every market the caps configure: this one
+                    // was not, so a fill it could not place is unsettled.
+                    drop(link);
+                    self.note(format_args!(
+                        "Start refused: the trustworthy resync did not seed the market (a fill \
+                         it could not place); nothing placed"
+                    ));
+                    return false;
+                }
                 if let Err(e) = reg.seed_position(INST, position) {
                     drop(link);
                     self.note(format_args!("the hand seed was refused: {e:?}"));
