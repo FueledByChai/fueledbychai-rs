@@ -59,7 +59,15 @@ Nothing is flattened from an inventory the stream has not settled. If an order o
 (the take, the partly filled order, or a flatten IOC) does not end with every fill its order
 events state within the step timeout, or GET /positions disagrees after the take, the step
 fails with `FAIL <step> ... flatten by hand on testnet`, no further IOC is sized, and the
-phase stops.
+phase stops. Nothing is added to an inventory REST and the stream disagree on either: when GET
+/orders or GET /positions never agrees with the stream before the take, no take is sent, and
+when either disagrees after a flatten, no further order is sent; the step fails and the phase
+stops. A step whose order-book read failed never passes, even when a later read flattened what
+filled.
+
+For decision 0092 (2) the report counts only the refusals of the fill steps' own IOC
+placements (the take and the flattens), never a rejected amend or cancel; a NOT_ENOUGH_MARGIN
+refusal is reported as its own case, not as that question's risk refusal.
 
 The report lists every fill as received (fill id, side, fee and fee currency, realized P&L and
 funding) and every PositionEvent.

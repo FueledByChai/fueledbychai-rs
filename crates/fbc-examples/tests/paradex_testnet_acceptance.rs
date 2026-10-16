@@ -249,6 +249,15 @@ struct Venue {
     /// Whether a GTC order that takes in part states OPEN, nothing filled, before its fill
     /// (Reviewer B, RB-6fnc-2).
     open_before_fill: bool,
+    /// Whether the GET /orderbook after the take (the first IOC not reduce-only that takes)
+    /// answers 500, the reads after it the book (Codex r4289567002).
+    book_fail_after_take: bool,
+    /// Set by `book_fail_after_take`: the next GET /orderbook answers 500.
+    book_fail_next: bool,
+    /// The cancel reason the take (the first IOC not reduce-only that would take) is closed
+    /// for with nothing filled: the venue's refusal after its provisional acceptance (Codex
+    /// r4289566988).
+    refuse_take: Option<&'static str>,
 }
 
 impl Venue {
@@ -501,7 +510,20 @@ fn responder(venue: Arc<Mutex<Venue>>, conn: usize) -> Responder {
                         } else {
                             px <= far_px
                         };
-                    if crosses && !(o.tif == 2 && v.ioc_fills) {
+                    let refused = (crosses && o.tif == 2 && !o.reduce_only)
+                        .then(|| v.refuse_take.take())
+                        .flatten();
+                    if let Some(reason) = refused {
+                        o.status = "CLOSED";
+                        o.cancel_reason = reason.to_owned();
+                        frames.push(Frame::Binary(order_event(&o, seq, 4, None)));
+                    } else if crosses && !(o.tif == 2 && v.ioc_fills) {
+                        if o.tif == 2
+                            && !o.reduce_only
+                            && std::mem::take(&mut v.book_fail_after_take)
+                        {
+                            v.book_fail_next = true;
+                        }
                         // It takes the far level, at most: a fill event, the order event and
                         // the position.
                         let size = Decimal::from_str(&o.size).unwrap();
@@ -723,16 +745,22 @@ fn routes(venue: Arc<Mutex<Venue>>) -> HttpRouter {
     let book = book.to_string();
     let (orders, history) = (Arc::clone(&venue), Arc::clone(&venue));
     let positions = Arc::clone(&venue);
+    let books = Arc::clone(&venue);
     HttpRouter::new()
         .route(
             Method::POST,
             PathPattern::exact("/v1/auth"),
             reply(200, format!(r#"{{"jwt_token":"{}"}}"#, token())),
         )
-        .route(
+        .route_fn(
             Method::GET,
             PathPattern::exact(&format!("/v1/orderbook/{MARKET}")),
-            reply(200, book),
+            move |_| {
+                if std::mem::take(&mut books.lock().unwrap().book_fail_next) {
+                    return reply(500, "{}");
+                }
+                reply(200, book.clone())
+            },
         )
         .route_fn(Method::GET, PathPattern::exact("/v1/orders"), move |req| {
             if !authorized(req) {
@@ -1013,6 +1041,9 @@ fn new_venue(cod_on_drop: bool, cod_on_close: bool) -> Arc<Mutex<Venue>> {
         drop_flatten_fill: false,
         cancel_fills: false,
         open_before_fill: false,
+        book_fail_after_take: false,
+        book_fail_next: false,
+        refuse_take: None,
     }))
 }
 
@@ -3506,32 +3537,214 @@ fn a_round_whose_stream_moved_and_came_back_is_no_agreement() {
 }
 
 #[test]
-fn a_risk_refusal_is_answered_from_the_fill_steps_outcomes() {
-    // Codex r4289405174: 0092 (2) is answered from what the fill steps recorded, not from
-    // whether they ran.
+fn a_risk_refusal_is_answered_from_the_fill_steps_own_ioc_placements() {
+    // Codex r4289405174, r4289566988: 0092 (2) is answered from the refusals the fill steps
+    // recorded of their own IOC placements: never from a rejected amend or cancel, a refused
+    // GTC order, or a NOT_ENOUGH_MARGIN refusal (its own case), and never from whether the
+    // steps ran.
     let mut ev = evidence::Evidence::default();
     let mut fill = evidence::Step::new("fill");
     fill.ran = evidence::Ran::Yes;
-    fill.sent.push(evidence::Sent {
-        kind: "place".to_owned(),
-        rpc: 9,
-        items: 1,
-        outcomes: vec!["Accepted { ack: Final }".to_owned()],
+    let rejected = "Rejected(Reject { kind: Risk, venue_code: None, raw: <12 bytes> })";
+    for (kind, rpc) in [("amend", 9), ("cancel", 10)] {
+        fill.sent.push(evidence::Sent {
+            kind: kind.to_owned(),
+            rpc,
+            items: 1,
+            outcomes: vec![rejected.to_owned()],
+        });
+    }
+    fill.refusals.push(evidence::Refusal {
+        order: "P1 partial".to_owned(),
+        rpc: 11,
+        immediate: false,
+        margin: false,
+        shown: "Other: SOME_REASON".to_owned(),
     });
     ev.steps.push(fill);
     let q = "0092 (2)";
-    assert!(
-        answer(&ev, q).starts_with("not observed"),
-        "{}",
-        answer(&ev, q)
-    );
-    ev.steps[0].sent[0].outcomes =
-        vec!["Rejected(Reject { kind: Risk, venue_code: None, raw: 12 bytes })".to_owned()];
+    let a = answer(&ev, q);
+    assert!(a.starts_with("not observed"), "{a}");
+    ev.steps[0].refusals.push(evidence::Refusal {
+        order: "T1 take".to_owned(),
+        rpc: 12,
+        immediate: true,
+        margin: true,
+        shown: "Other: NOT_ENOUGH_MARGIN".to_owned(),
+    });
     let a = answer(&ev, q);
     assert!(
-        a.starts_with("observed") && a.contains("fill request 9: Rejected"),
+        a.starts_with("not observed")
+            && a.contains("T1 take (request 12): Other: NOT_ENOUGH_MARGIN"),
         "{a}"
     );
+    ev.steps[0].refusals.push(evidence::Refusal {
+        order: "F1 flatten".to_owned(),
+        rpc: 13,
+        immediate: true,
+        margin: false,
+        shown: "Risk: <0 bytes>".to_owned(),
+    });
+    let a = answer(&ev, q);
+    assert!(
+        a.starts_with("observed")
+            && a.contains("fill F1 flatten (request 13): Risk")
+            && !a.contains("P1 partial")
+            && !a.contains("request 9")
+            && !a.contains("request 10"),
+        "{a}"
+    );
+}
+
+#[tokio::test]
+async fn a_take_refused_for_want_of_margin_is_recorded_as_its_own_case_not_a_risk_refusal() {
+    // Codex r4289566988: T1 is accepted provisionally, then closed NOT_ENOUGH_MARGIN with
+    // nothing filled. The fill step records the refusal as one for want of margin, and 0092
+    // (2), which excludes that reason, is not observed.
+    let venue = new_venue(true, true);
+    venue.lock().unwrap().refuse_take = Some("NOT_ENOUGH_MARGIN");
+    let stub = stub_frames(&venue, &[MAIN + 1, 7, 6]).await;
+    let (evidence_dir, _e) = temp_dir("evidence-take-margin");
+    let (lease_dir, _l) = temp_dir("lease-take-margin");
+    let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
+    opts.allow_fill = true;
+    let (outcome, printed) = run_against(&opts).await;
+    let report = fs::read_to_string(&outcome.report).unwrap();
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("{e:?}\n{printed}\n{report}"));
+    let ev = &outcome.evidence;
+    let fill = ev.steps.iter().find(|s| s.name == "fill").unwrap();
+    assert!(!fill.pass, "{fill:?}");
+    assert_eq!(fill.refusals.len(), 1, "{fill:?}");
+    let r = &fill.refusals[0];
+    assert!(
+        r.order == "T1 take" && r.immediate && r.margin && r.shown.contains("NOT_ENOUGH_MARGIN"),
+        "{r:?}"
+    );
+    let a = answer(ev, "0092 (2)");
+    assert!(
+        a.starts_with("not observed") && a.contains("NOT_ENOUGH_MARGIN"),
+        "{a}"
+    );
+    assert!(venue.lock().unwrap().position.is_zero(), "{printed}");
+}
+
+#[tokio::test]
+async fn a_take_is_not_sent_when_rest_never_agreed_on_the_position_before_it() {
+    // Codex r4289567009: GET /positions answers a position the stream does not show from the
+    // IOC step (the fourth order) on. The comparison before the take never agrees, so no take
+    // is sent: the fill step fails and the phase stops.
+    let venue = new_venue(true, true);
+    venue.lock().unwrap().stale_position_from = Some(4);
+    // To the IOC; nothing after it.
+    let stub = stub_frames(&venue, &[MAIN - 1, 6]).await;
+    let (evidence_dir, _e) = temp_dir("evidence-take-unagreed");
+    let (lease_dir, _l) = temp_dir("lease-take-unagreed");
+    let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
+    opts.allow_fill = true;
+    opts.rest_wait_secs = 1;
+    let (outcome, printed) = run_against(&opts).await;
+    let report = fs::read_to_string(&outcome.report).unwrap();
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("{e:?}\n{printed}\n{report}"));
+    let fill = outcome
+        .evidence
+        .steps
+        .iter()
+        .find(|s| s.name == "fill")
+        .unwrap();
+    assert!(!fill.pass && fill.ran == evidence::Ran::Yes, "{fill:?}");
+    assert!(
+        printed.contains("FAIL fill") && printed.contains("before the IOC"),
+        "{printed}"
+    );
+    assert!(
+        creates(&stub, 0).iter().all(|p| p["price"] != "62000.5"),
+        "no take: {printed}"
+    );
+    let cod = outcome
+        .evidence
+        .steps
+        .iter()
+        .find(|s| s.name == "cod-dropped")
+        .unwrap();
+    assert_eq!(cod.ran, evidence::Ran::NotRun, "{cod:?}");
+    assert!(venue.lock().unwrap().position.is_zero());
+    assert!(!outcome.ok, "{printed}");
+}
+
+#[tokio::test]
+async fn a_position_rest_disagrees_on_after_the_flatten_stops_the_phase() {
+    // Codex r4289567009: GET /positions answers T1's position from T1 (the fifth order) on,
+    // after the flatten too, while the stream is flat. The phase stops there: no further
+    // order (no P1, no B3) is sent onto an exposure REST shows and the stream does not.
+    let venue = new_venue(true, true);
+    venue.lock().unwrap().stale_position_from = Some(5);
+    // To the IOC, T1 and F1.
+    let stub = stub_frames(&venue, &[MAIN + 1, 6]).await;
+    let (evidence_dir, _e) = temp_dir("evidence-flatten-unagreed");
+    let (lease_dir, _l) = temp_dir("lease-flatten-unagreed");
+    let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
+    opts.allow_fill = true;
+    opts.rest_wait_secs = 1;
+    let (outcome, printed) = run_against(&opts).await;
+    let report = fs::read_to_string(&outcome.report).unwrap();
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("{e:?}\n{printed}\n{report}"));
+    let step = |name: &str| {
+        outcome
+            .evidence
+            .steps
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap()
+            .clone()
+    };
+    let fill = step("fill");
+    assert!(!fill.pass, "{fill:?}");
+    assert!(
+        printed.contains("FAIL fill") && printed.contains("after the flatten"),
+        "{printed}"
+    );
+    assert_eq!(step("fill-partial").ran, evidence::Ran::NotRun);
+    assert_eq!(step("cod-dropped").ran, evidence::Ran::NotRun);
+    assert!(venue.lock().unwrap().position.is_zero());
+    assert!(!outcome.ok, "{printed}");
+}
+
+#[tokio::test]
+async fn a_failed_book_read_during_the_flatten_fails_the_step_though_a_later_read_flattened() {
+    // Codex r4289567002: the flatten's first GET /orderbook answers 500, the second the book:
+    // F2 flattens what T1 took, and the step still fails for the read that failed.
+    let venue = new_venue(true, true);
+    venue.lock().unwrap().book_fail_after_take = true;
+    let stub = stub_frames(&venue, &[MAIN + 2, 7, 6]).await;
+    let (evidence_dir, _e) = temp_dir("evidence-flatten-book-fails");
+    let (lease_dir, _l) = temp_dir("lease-flatten-book-fails");
+    let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
+    opts.allow_fill = true;
+    let (outcome, printed) = run_against(&opts).await;
+    let report = fs::read_to_string(&outcome.report).unwrap();
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("{e:?}\n{printed}\n{report}"));
+    let fill = outcome
+        .evidence
+        .steps
+        .iter()
+        .find(|s| s.name == "fill")
+        .unwrap();
+    assert!(!fill.pass && fill.ran == evidence::Ran::Yes, "{fill:?}");
+    assert!(
+        fill.orders.iter().any(|t| t.label == "F2 flatten"),
+        "{fill:?}"
+    );
+    assert!(venue.lock().unwrap().position.is_zero(), "{printed}");
+    assert!(!outcome.ok, "{printed}");
+    assert!(!report.contains("every step passed"), "{report}");
 }
 
 #[test]

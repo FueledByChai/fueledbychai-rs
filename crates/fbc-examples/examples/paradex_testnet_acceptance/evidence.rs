@@ -45,6 +45,20 @@ pub struct Sent {
     pub outcomes: Vec<String>,
 }
 
+/// A placement of ours the venue refused, synchronously or after its provisional acceptance:
+/// its order's label, the request that placed it, whether the order was immediate (IOC: the
+/// fill steps' takes and flattens, which 0092 (2) asks about), whether the refusal was for want
+/// of margin (NOT_ENOUGH_MARGIN or `RejectKind::Margin`, a case of its own), and the refusal as
+/// the shared glue shows it (Codex r4289566988).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Refusal {
+    pub order: String,
+    pub rpc: u64,
+    pub immediate: bool,
+    pub margin: bool,
+    pub shown: String,
+}
+
 /// One order of ours: its label in the report, client id as sent, venue id, and each state the
 /// registry held it in after each event (the order lattice), with its price and total.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -167,6 +181,8 @@ pub struct Step {
     pub comparisons: Vec<Comparison>,
     pub histories: Vec<History>,
     pub disconnect: Option<Disconnect>,
+    /// The placements of this step the venue refused.
+    pub refusals: Vec<Refusal>,
     pub notes: Vec<String>,
 }
 
@@ -181,6 +197,7 @@ impl Step {
             comparisons: Vec::new(),
             histories: Vec::new(),
             disconnect: None,
+            refusals: Vec::new(),
             notes: Vec::new(),
         }
     }
@@ -694,36 +711,31 @@ fn ms(lag: Option<u128>) -> String {
     lag.map_or_else(|| "-".to_owned(), |ms| format!("{ms} ms"))
 }
 
-/// The report's answers to FBC-2f7w's five questions, FBC-8xr's items and decision 0092's, each
-/// `(question, answer)`.
-/// Each refusal the fill steps recorded, as their outcomes and orders show it: a request
-/// answered `Rejected`, and an order that ended rejected (0092 (2) is answered from these,
-/// never from whether the steps ran; Codex r4289405174).
-pub fn fill_refusals(ev: &Evidence) -> Vec<String> {
-    let mut out = Vec::new();
+/// The refusals the fill steps recorded of their own IOC placements (the takes and the
+/// flattens; 0092 (2) asks of an IOC or MARKET order): those for another reason than want of
+/// margin, then those for want of margin (NOT_ENOUGH_MARGIN, a case of its own). A rejected
+/// amend or cancel, or a refused GTC order, is neither (Codex r4289405174, r4289566988).
+pub fn fill_refusals(ev: &Evidence) -> (Vec<String>, Vec<String>) {
+    let (mut risk, mut margin) = (Vec::new(), Vec::new());
     for s in ev
         .steps
         .iter()
         .filter(|s| s.name == "fill" || s.name == "fill-partial")
     {
-        for c in &s.sent {
-            for o in c.outcomes.iter().filter(|o| o.contains("Rejected")) {
-                out.push(format!("{} request {}: {o}", s.name, c.rpc));
-            }
-        }
-        for t in &s.orders {
-            if let Some(last) = t
-                .states
-                .last()
-                .filter(|l| l.starts_with("Terminal(Rejected"))
-            {
-                out.push(format!("{} {}: {last}", s.name, t.label));
+        for r in s.refusals.iter().filter(|r| r.immediate) {
+            let shown = format!("{} {} (request {}): {}", s.name, r.order, r.rpc, r.shown);
+            if r.margin {
+                margin.push(shown);
+            } else {
+                risk.push(shown);
             }
         }
     }
-    out
+    (risk, margin)
 }
 
+/// The report's answers to FBC-2f7w's five questions, FBC-8xr's items and decision 0092's, each
+/// `(question, answer)`.
 pub fn answers(ev: &Evidence) -> Vec<(String, String)> {
     let comparisons: Vec<&Comparison> = ev.steps.iter().flat_map(|s| &s.comparisons).collect();
     let histories: Vec<(&History, bool)> = ev
@@ -874,7 +886,7 @@ pub fn answers(ev: &Evidence) -> Vec<(String, String)> {
         .steps
         .iter()
         .any(|s| s.name == "fill" && s.ran == Ran::Yes);
-    let refusals = fill_refusals(ev);
+    let (refusals, margins) = fill_refusals(ev);
     let limits: Vec<String> = comparisons
         .iter()
         .map(|c| {
@@ -952,13 +964,26 @@ pub fn answers(ev: &Evidence) -> Vec<(String, String)> {
             "0092 (2): an IOC/MARKET risk refusal other than NOT_ENOUGH_MARGIN".to_owned(),
             if !refusals.is_empty() {
                 format!(
-                    "observed: the fill steps' orders were refused: {} (a NOT_ENOUGH_MARGIN \
-                     refusal is not this question's)",
-                    refusals.join("; ")
+                    "observed: the fill steps' IOC placements were refused: {}{}",
+                    refusals.join("; "),
+                    if margins.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "; for want of margin (NOT_ENOUGH_MARGIN, not this question's): {}",
+                            margins.join("; ")
+                        )
+                    }
+                )
+            } else if !margins.is_empty() {
+                format!(
+                    "not observed: the fill steps' IOC placements were refused only for want of \
+                     margin (NOT_ENOUGH_MARGIN, not this question's): {}",
+                    margins.join("; ")
                 )
             } else if fill_ran {
-                "not observed: every order the fill steps sent was accepted, none refused for \
-                 risk (each is sized within the caps)"
+                "not observed: no IOC placement of the fill steps was refused (each is sized \
+                 within the caps)"
                     .to_owned()
             } else {
                 "not exercised: without --allow-fill the program never sends an order that \
@@ -1308,6 +1333,7 @@ pub fn to_json(ev: &Evidence) -> Value {
                 "orders": s.orders.iter().map(|o| json!({"order": o.label, "client_id": o.client_id, "venue_id": o.venue_id, "lattice": o.states})).collect::<Vec<_>>(),
                 "comparisons": s.comparisons.iter().map(comparison).collect::<Vec<_>>(),
                 "histories": s.histories.iter().map(history).collect::<Vec<_>>(),
+                "refusals": s.refusals.iter().map(|r| json!({"order": r.order, "rpc": r.rpc, "immediate": r.immediate, "margin": r.margin, "refusal": r.shown})).collect::<Vec<_>>(),
                 "disconnect": s.disconnect.as_ref().map(|d| json!({
                     "how": d.how, "cancelled": d.cancelled, "still_listed": d.still_listed, "after_ms": d.after_ms.map(|v| v as u64),
                     "last_listed_ms": d.last_listed_ms.map(|v| v as u64), "reads": d.reads,
