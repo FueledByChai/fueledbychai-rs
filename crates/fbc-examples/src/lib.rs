@@ -35,8 +35,8 @@
 //!   behind `--mainnet` and `--sole-trader`, caps of at most $11 resting per side and $50
 //!   inventory, mainnet's URLs and chain id (checked against `GET /system/config`), the order
 //!   sized to the minimum notional at the mark price. Its credentials come from mainnet-only
-//!   variables (`src/auth_mainnet.rs`, a review path). It refuses before anything connects
-//!   until FBC-2f7w's record makes Paradex's snapshot source trustworthy.
+//!   variables (`src/auth_mainnet.rs`, a review path). It Starts only after a trustworthy
+//!   resync seeded the market (Paradex's snapshot source is trustworthy, decision 0094).
 //!
 //! The samples that trade share, by path as well, `src/link.rs` (the ExecHandler-to-Registry
 //! glue) and `src/testnet.rs` (the testnet guard, the market's spec, the session's wiring, the

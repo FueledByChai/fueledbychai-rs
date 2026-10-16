@@ -29,10 +29,11 @@ Before you run it:
   - a SEPARATE Paradex mainnet account from the one the Java quoter trades (one quoter per
     account), funded small, with no open orders and no position on any market;
   - its Paradex (Starknet) address and its main L2 key, exported as below;
-  - FBC-2f7w's decision record accepted and on main: until it makes Paradex's snapshot source
-    trustworthy, the run refuses before anything connects, since a mainnet market is armed only
-    after a trustworthy resync and never seeded by hand (decision 0067 allows that only for an
-    owner-assisted testnet run).
+  - nothing else: Paradex's snapshot source is trustworthy (decision 0094, accepted by the
+    owner), so the resync seeds the market; a mainnet market is armed only after a trustworthy
+    resync and never seeded by hand (decision 0067 allows that only for an owner-assisted
+    testnet run), and a venue declaring its snapshot otherwise is refused before anything
+    connects.
 
 Usage: cargo run -p fbc-examples --example mainnet_smoke -- --mainnet --sole-trader [OPTIONS]
 
@@ -98,6 +99,7 @@ Lines (each step with the milliseconds since the start):
   STEP login         the login answered and the order socket is authenticated
   STEP arm           Paradex accepted cancel-on-disconnect for the socket
   STEP resync        the REST resync ended; it must be trustworthy and the account flat
+  SEED ...           the position the trustworthy resync seeded (never seeded by hand)
   STEP start         the market was Started under its caps
   BBO again ...      the touch read again just before the place
   STEP place         the order was handed to the session

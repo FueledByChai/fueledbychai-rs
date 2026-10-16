@@ -4,9 +4,9 @@
 //! cancel's acknowledgement, then Stop (kill switch + cancel all), each step timed out and
 //! printed. Refused without both `--mainnet` and `--sole-trader`, with any URL or chain id but
 //! mainnet's, with caps above $11 resting per side or $50 inventory, with a testnet credential
-//! variable set, and, until FBC-2f7w's record makes Paradex's snapshot source trustworthy,
-//! before anything connects (no hand seed on mainnet). An owner-run sample: CI builds it, and
-//! its wiring is tested against the conformance stub (`tests/mainnet_smoke.rs`).
+//! variable set, or on a venue whose snapshot source is not trustworthy (Paradex's is, decision
+//! 0094; no hand seed on mainnet), before anything connects. An owner-run sample: CI builds it,
+//! and its wiring is tested against the conformance stub (`tests/mainnet_smoke.rs`).
 //!
 //! ```text
 //! unset PARADEX_ACCOUNT_ADDRESS PARADEX_PRIVATE_KEY   # the testnet samples' variables
