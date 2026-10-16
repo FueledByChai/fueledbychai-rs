@@ -52,8 +52,9 @@ through fbc-oms under the caps.
   order.modify's size as the total or the remainder (FBC-b0z9). The order is then cancelled and
   what filled is flattened. When no such level exists, the step is not exercised and the report
   says why. Paradex declares an amend of a partly filled order refused (decision 0054); this run
-  admits it in its main phase only, and only when the larger reading (the whole size resting on
-  top of what filled) still fits the caps.
+  admits it for that one amend only (every other order, B1 included, is judged under Paradex's
+  caps), and only when the larger reading (the whole size resting on top of what filled) still
+  fits the caps.
 
 Nothing is flattened from an inventory the stream has not settled. If an order of a fill step
 (the take, the partly filled order, or a flatten IOC) does not end with every fill its order
@@ -61,8 +62,8 @@ events state within the step timeout, or GET /positions disagrees after the take
 fails with `FAIL <step> ... flatten by hand on testnet`, no further IOC is sized, and the
 phase stops. Nothing is added to an inventory REST and the stream disagree on either: when GET
 /orders or GET /positions never agrees with the stream before the take, no take is sent, and
-when either disagrees after a flatten, no further order is sent; the step fails and the phase
-stops. A step whose order-book read failed never passes, even when a later read flattened what
+when either disagrees while the partly filled order is partly filled (it is then cancelled,
+not amended) or after a flatten, no further order is sent; the step fails and the phase stops. A step whose order-book read failed never passes, even when a later read flattened what
 filled.
 
 For decision 0092 (2) the report counts only the refusals of the fill steps' own IOC

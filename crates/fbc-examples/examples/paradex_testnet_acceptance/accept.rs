@@ -956,6 +956,36 @@ struct Order<'a> {
 /// Why a take of `qty` on `side` from a position of `now` lots could pass the inventory cap
 /// of `cap` lots, if it could. Checked: a position the take would carry past an i64 bound is
 /// refused, never wrapped or a panic (Codex r4289405179).
+/// The order caps P1's amend alone is judged under (FBC-b0z9): the phase's (Paradex's), but
+/// admitting an amend of a partly filled order, so the fill-partial step can ask what Paradex
+/// makes of its size (Paradex leaves it undocumented and declares it refused, decision 0054).
+/// Every other command, B1's amend included, is judged under the phase's caps, so no other
+/// order that fills in part is amended (Codex r4289888364); [`Run::amend_partial`] sends P1's
+/// only when the larger reading still fits the caps ([`amend_past_caps`]).
+pub fn partial_amend_caps(caps: &fbc_core::OrderCaps) -> fbc_core::OrderCaps {
+    let mut caps = caps.clone();
+    if let Some(amend) = caps.amend.as_mut() {
+        amend.when_partially_filled = true;
+    }
+    caps
+}
+
+/// Whether an amend of `total` lots on `side`, read as the remainder, could rest the whole
+/// total on top of the position `now`: past the resting cap or the inventory cap, or a worst
+/// case no i64 holds (Codex r4289888345).
+pub fn amend_past_caps(
+    now: SignedLots,
+    side: OrderSide,
+    total: Lots,
+    resting: Lots,
+    inventory: Lots,
+) -> bool {
+    let worst = now
+        .checked_add(SignedLots::of(side_of(side), total))
+        .and_then(SignedLots::abs_lots);
+    total > resting || worst.is_none_or(|w| w > inventory)
+}
+
 pub fn past_cap(now: SignedLots, side: OrderSide, qty: Lots, cap: Lots) -> Option<String> {
     let after = now.checked_add(SignedLots::of(side_of(side), qty));
     let past = after.is_none_or(|a| a.0.unsigned_abs() > cap.get().unsigned_abs());
@@ -1001,7 +1031,7 @@ impl Run {
             tr.tick = self.t().tick;
             tr.step = self.t().step;
         }
-        let built = self.build_session(kind, creds);
+        let built = self.build_session(creds);
         let (link, wake, mut session, control) = match built {
             Ok(b) => b,
             Err(e) => {
@@ -1134,7 +1164,6 @@ impl Run {
     #[allow(clippy::type_complexity)]
     fn build_session(
         &mut self,
-        kind: PhaseKind,
         creds: Creds<'_>,
     ) -> Result<
         (
@@ -1173,7 +1202,7 @@ impl Run {
         let link = Rc::new(RefCell::new(Link::new(
             reg,
             ledger,
-            self.phase_caps(kind),
+            self.order_caps.clone(),
             ladder,
         )));
         let wake = Rc::new(Notify::new());
@@ -1190,23 +1219,6 @@ impl Run {
         session.set_journal(self.journal.clone());
         link.borrow_mut().attach(session.orders(), ACCT);
         Ok((link, wake, session, control))
-    }
-
-    /// The order caps a phase's registry judges commands under: Paradex's, but in the main
-    /// phase of a run with `--allow-fill`, an amend of a partly filled order is admitted, so
-    /// the fill-partial step can ask what Paradex makes of its size (FBC-b0z9; Paradex leaves
-    /// it undocumented and declares it refused, decision 0054). The one partly filled order of
-    /// the run is P1, and [`Run::amend_partial`] sends its amend only when the larger reading
-    /// still fits the caps: resting the whole total sent, on top of what filled.
-    fn phase_caps(&self, kind: PhaseKind) -> fbc_core::OrderCaps {
-        let mut caps = self.order_caps.clone();
-        if kind == PhaseKind::Main
-            && self.opts.allow_fill
-            && let Some(amend) = caps.amend.as_mut()
-        {
-            amend.when_partially_filled = true;
-        }
-        caps
     }
 
     /// The session's configuration, as testnet_trade's, the request ids shared by the phases.
@@ -2261,8 +2273,29 @@ impl Run {
             let c = self
                 .compare(p, "fill-partial: P1 partly filled", &[cid])
                 .await;
-            ok &= c.orders_agreed && c.positions_agreed;
+            let agreed = c.orders_agreed && c.positions_agreed;
             self.ev.step(step).comparisons.push(c);
+            // REST showing an order or a position the stream does not leaves the exposure
+            // unknown: P1 is not amended but cancelled, nothing is flattened from it, and the
+            // phase stops (Codex r4289888356).
+            if !agreed {
+                self.cancel(p, step, &[cid]).await;
+                let trace = self.tracker.borrow().trace(cid);
+                self.refresh_outcomes(p, step);
+                let s = self.ev.step(step);
+                s.ran = Ran::Yes;
+                s.orders.retain(|t| t.client_id != trace.client_id);
+                s.orders.push(trace);
+                self.ev.partial_amend = Some(
+                    "not exercised: REST did not agree with the stream while P1 was partly filled"
+                        .to_owned(),
+                );
+                return self.unresolved(
+                    step,
+                    "GET /orders or GET /positions did not agree with the stream while P1 was \
+                     partly filled within the REST wait: P1 is not amended but cancelled",
+                );
+            }
             let (read, amended) = self.amend_partial(p, cid, filled).await;
             if let Some(amended) = amended {
                 exercised = true;
@@ -2370,9 +2403,9 @@ impl Run {
         // Read as the remainder, the size sent would rest whole on top of the market's
         // position now (the seed and what filled): sent only when that still fits the resting
         // cap and the inventory cap (Codex r4289239752).
-        let now = p.link.borrow().registry().inventory(INST).0;
-        let worst = (now + SignedLots::of(side_of(side), total).0).unsigned_abs();
-        if total > self.resting || worst > self.inventory.get().unsigned_abs() {
+        let now = p.link.borrow().registry().inventory(INST);
+        if amend_past_caps(now, side, total, self.resting, self.inventory) {
+            let now = now.0;
             return (
                 format!(
                     "not exercised: read as the remainder, the amend could rest {} lots on top \
@@ -2388,7 +2421,7 @@ impl Run {
         }
         let built = {
             let mut link = p.link.borrow_mut();
-            let caps = link.caps().clone();
+            let caps = partial_amend_caps(link.caps());
             link.reg()
                 .live(cid)
                 .map_err(|e| format!("{e:?}"))
