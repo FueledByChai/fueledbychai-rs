@@ -231,6 +231,11 @@ pub struct Evidence {
     /// What the amend of a partly filled order showed of order.modify's size (FBC-b0z9), or
     /// why it was not exercised; `None` when the fill-partial step did not run.
     pub partial_amend: Option<String>,
+    /// Whether `--allow-fill` was given.
+    pub allow_fill: bool,
+    /// The IOC placements the fill steps submitted (the takes and the flattens): what 0092 (2)
+    /// is answered from (Codex r4290085864).
+    pub fill_iocs: usize,
 }
 
 /// One fill event as the stream carried it: the order it was of (its label, or `not ours`),
@@ -882,10 +887,6 @@ pub fn answers(ev: &Evidence) -> Vec<(String, String)> {
             )
     };
     let request_info = request_info(ev);
-    let fill_ran = ev
-        .steps
-        .iter()
-        .any(|s| s.name == "fill" && s.ran == Ran::Yes);
     let (refusals, margins) = fill_refusals(ev);
     let limits: Vec<String> = comparisons
         .iter()
@@ -981,9 +982,15 @@ pub fn answers(ev: &Evidence) -> Vec<(String, String)> {
                      margin (NOT_ENOUGH_MARGIN, not this question's): {}",
                     margins.join("; ")
                 )
-            } else if fill_ran {
-                "not observed: no IOC placement of the fill steps was refused (each is sized \
-                 within the caps)"
+            } else if ev.fill_iocs > 0 {
+                format!(
+                    "not observed: no IOC placement of the fill steps was refused ({} sent, each \
+                     sized within the caps)",
+                    ev.fill_iocs
+                )
+            } else if ev.allow_fill {
+                "not exercised: --allow-fill was given, but the fill steps sent no IOC (skipped, \
+                 or stopped before a placement)"
                     .to_owned()
             } else {
                 "not exercised: without --allow-fill the program never sends an order that \
