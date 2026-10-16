@@ -42,7 +42,6 @@ use fbc_runtime::{
     Connector, ExecSession, ExecSessionConfig, IngestClock, ProxyConfig, RateLimiter,
     ReconnectPacing, RpcIds, SafetyReserve, WriteStall,
 };
-use fbc_venue_paradex::ParadexFactory;
 use fbc_venue_paradex::auth::{CHAIN_ID, REFRESH, REST_URL, SIGNATURE_LIFETIME, TIMEOUT};
 use fbc_venue_paradex::factory::{EXEC_MODE, EXEC_URL, RPC_TIMEOUT};
 use fbc_venue_paradex::md::rest::{OrderbookSnapshot, decode_orderbook, orderbook_path};
@@ -109,14 +108,20 @@ pub fn default_lease_dir() -> Result<PathBuf, String> {
     lease_dir_under(std::env::var_os("HOME"))
 }
 
-/// `<home>/.fueledbychai/testnet_trade`: durable, so the client-id high-water mark kept there
+/// `<home>/.fueledbychai/testnet_trade` ([`lease_dir_named`]).
+pub fn lease_dir_under(home: Option<std::ffi::OsString>) -> Result<PathBuf, String> {
+    lease_dir_named(home, "testnet_trade")
+}
+
+/// `<home>/.fueledbychai/<name>`: durable, so the client-id high-water mark kept there
 /// outlives a reboot or a temporary-directory cleanup. Refused when `home` is unset, empty or
 /// relative: a relative one would put the leases under the directory the run starts in, so two
 /// runs started in different directories would not exclude each other (Codex r4226246468 on
-/// PR #114). Its value is never shown.
-pub fn lease_dir_under(home: Option<std::ffi::OsString>) -> Result<PathBuf, String> {
+/// PR #114). Its value is never shown. `mainnet_smoke` keeps its own (`mainnet_smoke`), so a
+/// mainnet run never shares a testnet sample's high-water mark.
+pub fn lease_dir_named(home: Option<std::ffi::OsString>, name: &str) -> Result<PathBuf, String> {
     match home.map(PathBuf::from) {
-        Some(home) if home.is_absolute() => Ok(home.join(".fueledbychai").join("testnet_trade")),
+        Some(home) if home.is_absolute() => Ok(home.join(".fueledbychai").join(name)),
         Some(home) if !home.as_os_str().is_empty() => Err(format!(
             "HOME is not an absolute path{UNSHOWN}: give --lease-dir, a directory kept across \
              reboots"
@@ -183,34 +188,53 @@ pub fn hosts(rest: &str, ws: &str) -> Result<(String, String), String> {
 /// URL's path is sent to the venue (the REST requests' paths, the WebSocket upgrade), so no
 /// other path is taken. A refusal names the flag and what is expected, never what was typed.
 pub fn testnet_urls(rest: &str, ws: &str) -> Result<Target, String> {
+    Ok(
+        match exact_or_stub(rest, ws, "testnet", TESTNET_REST, TESTNET_WS)? {
+            true => Target::LoopbackStub,
+            false => Target::Testnet,
+        },
+    )
+}
+
+/// The URL guard of one Paradex network `net` (`testnet`, `mainnet`): both URLs exactly its
+/// REST base `want_rest` and WebSocket `want_ws`, or both a loopback stub's with the path
+/// exactly `/v1` (true). Whatever sits in a URL's path is sent to the venue (the REST requests'
+/// paths, the WebSocket upgrade), so no other path is taken. A refusal names the flag and what
+/// is expected, never what was typed.
+pub fn exact_or_stub(
+    rest: &str,
+    ws: &str,
+    net: &str,
+    want_rest: &str,
+    want_ws: &str,
+) -> Result<bool, String> {
     let rest_url = split(rest, ["https://", "http://"], "--rest-url")?;
     let ws_url = split(ws, ["wss://", "ws://"], "--ws-url")?;
     match (rest_url.loopback(), ws_url.loopback()) {
         (true, true) => {
             rest_url.stub("--rest-url")?;
             ws_url.stub("--ws-url")?;
-            Ok(Target::LoopbackStub)
+            Ok(true)
         }
         (false, false) => {
-            if rest != TESTNET_REST {
+            if rest != want_rest {
                 return Err(format!(
-                    "--rest-url: not Paradex's testnet REST base, exactly {TESTNET_REST}, or a \
-                     loopback stub's; the sample is testnet only{SHOWN_NOT}"
+                    "--rest-url: not Paradex's {net} REST base, exactly {want_rest}, or a \
+                     loopback stub's; the sample is {net} only{SHOWN_NOT}"
                 ));
             }
-            if ws != TESTNET_WS {
+            if ws != want_ws {
                 return Err(format!(
-                    "--ws-url: not Paradex's testnet WebSocket, exactly {TESTNET_WS}, or a \
-                     loopback stub's; the sample is testnet only{SHOWN_NOT}"
+                    "--ws-url: not Paradex's {net} WebSocket, exactly {want_ws}, or a \
+                     loopback stub's; the sample is {net} only{SHOWN_NOT}"
                 ));
             }
-            Ok(Target::Testnet)
+            Ok(false)
         }
-        _ => Err(
+        _ => Err(format!(
             "--rest-url and --ws-url: one is a loopback stub and the other is not; give both \
-             testnet URLs or both a stub's"
-                .to_owned(),
-        ),
+             {net} URLs or both a stub's"
+        )),
     }
 }
 
@@ -521,13 +545,18 @@ pub fn wall_now() -> WallNs {
 /// The Paradex configuration: order entry on the WebSocket, the REST base for the login and
 /// the resync, the testnet chain id, and the timings.
 pub fn config(rest_url: &str, ws_url: &str) -> VenueConfig {
+    config_on(rest_url, ws_url, TESTNET_CHAIN)
+}
+
+/// As [`config`], the login signing for `chain` (`mainnet_smoke`: the mainnet's).
+pub fn config_on(rest_url: &str, ws_url: &str, chain: &str) -> VenueConfig {
     let mut cfg = VenueConfig::new();
     for (key, value) in [
         (EXEC_URL, ws_url),
         (EXEC_MODE, "orders"),
         (RPC_TIMEOUT, RPC_WAIT),
         (REST_URL, rest_url),
-        (CHAIN_ID, TESTNET_CHAIN),
+        (CHAIN_ID, chain),
         (SIGNATURE_LIFETIME, "600s"),
         (REFRESH, "60s"),
         (TIMEOUT, "5000ms"),
@@ -591,25 +620,46 @@ pub async fn touch(
     wait: Duration,
     specs: &SpecTable,
 ) -> Result<OrderbookSnapshot, String> {
+    let body = rest_get(
+        rest_url,
+        &orderbook_path(market),
+        "GET /orderbook",
+        proxy,
+        wait,
+    )
+    .await?;
+    decode_orderbook(&body, specs).map_err(|e| format!("GET /orderbook: {e:?}"))
+}
+
+/// The body of a successful unauthenticated `GET` of `path` (from `/v1`, with any query) on the
+/// REST base `rest_url`, within `wait`: refused naming `what` (`GET /orderbook`) on no answer in
+/// time, a transport error, or a status other than 2xx.
+pub async fn rest_get(
+    rest_url: &str,
+    path: &str,
+    what: &str,
+    proxy: &ProxyConfig,
+    wait: Duration,
+) -> Result<Bytes, String> {
     let origin = rest_url
         .trim_end_matches('/')
         .strip_suffix("/v1")
         .ok_or("--rest-url: not a base ending in /v1")?;
-    let url = format!("{origin}{}", orderbook_path(market));
+    let url = format!("{origin}{path}");
     let request = Request::builder()
         .method(Method::GET)
         .uri(&url)
         .body(Bytes::new())
-        .map_err(|e| format!("GET /orderbook: {e}"))?;
+        .map_err(|e| format!("{what}: {e}"))?;
     let connector = Connector::new(proxy.clone());
     let response = tokio::time::timeout(wait, connector.http(request, 1 << 20))
         .await
-        .map_err(|_| "GET /orderbook: no answer in time".to_owned())?
-        .map_err(|e| format!("GET /orderbook: {e}"))?;
+        .map_err(|_| format!("{what}: no answer in time"))?
+        .map_err(|e| format!("{what}: {e}"))?;
     if !response.status().is_success() {
-        return Err(format!("GET /orderbook: status {}", response.status()));
+        return Err(format!("{what}: status {}", response.status()));
     }
-    decode_orderbook(response.body(), specs).map_err(|e| format!("GET /orderbook: {e:?}"))
+    Ok(response.into_body())
 }
 
 /// A price, or `none` for a side with nothing resting.
@@ -641,7 +691,7 @@ impl NonceSource for Counting {
 /// attempts a minute, each given 10 s; normal traffic stopping at 90% of each declared limit; a
 /// write a peer stopped reading ends its connection after 10 s.
 pub fn session_config(
-    venue: &'static ParadexFactory,
+    venue: &'static dyn VenueFactory,
     cfg: VenueConfig,
     creds: Secrets,
     specs: SpecTable,

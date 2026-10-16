@@ -30,6 +30,13 @@
 //!   (cancel-and-replace only, the caps checked on every place), cancelling every order of ours
 //!   still open after each reconnect before it places, until Ctrl-C, `--duration` or
 //!   `--cycles`; then Stop and a summary.
+//! - `mainnet_smoke` (`examples/mainnet_smoke/`, FBC-p0aa): Paradex MAINNET, the owner's first
+//!   prod order: testnet_trade's round trip (its `trade.rs`, by path), never seeded by hand,
+//!   behind `--mainnet` and `--sole-trader`, caps of at most $11 resting per side and $50
+//!   inventory, mainnet's URLs and chain id (checked against `GET /system/config`), the order
+//!   sized to the minimum notional at the mark price. Its credentials come from mainnet-only
+//!   variables (`src/auth_mainnet.rs`, a review path). It refuses before anything connects
+//!   until FBC-2f7w's record makes Paradex's snapshot source trustworthy.
 //!
 //! The samples that trade share, by path as well, `src/link.rs` (the ExecHandler-to-Registry
 //! glue) and `src/testnet.rs` (the testnet guard, the market's spec, the session's wiring, the

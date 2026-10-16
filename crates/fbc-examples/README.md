@@ -11,6 +11,38 @@ program's flags.
 | `testnet_trade` | Paradex TESTNET only: places one post-only order well away from the touch through fbc-oms, cancels it, and Stops (FBC-x69b). |
 | `testnet_quote` | Paradex TESTNET only, a plumbing test, not a strategy: keeps one post-only order a side a fixed offset behind the touch through fbc-oms's execution planner, cancel-and-replace only, until Ctrl-C, `--duration` or `--cycles`, then Stops (FBC-elg7). |
 | `paradex_testnet_acceptance` | Paradex TESTNET only: FBC-8xr's acceptance run. It writes the evidence report that the snapshot-trust decision (FBC-2f7w) cites (FBC-xji8). |
+| `mainnet_smoke` | Paradex MAINNET, real money: testnet_trade's round trip (one post-only order of about $11 well away from the touch, its cancel, Stop) on a separate small account, behind `--mainnet` and `--sole-trader` (FBC-p0aa). It refuses before anything connects until FBC-2f7w's record makes Paradex's snapshot source trustworthy. See below. |
+
+## mainnet_smoke
+
+The owner's first Paradex mainnet order (owner answer "Library smoke first"). Run it only once
+FBC-2f7w's decision record is accepted and on main: until Paradex's adapter declares its snapshot
+source trustworthy, the program refuses before anything connects, because a mainnet market is
+armed only after a trustworthy resync and is never seeded by hand.
+
+Prerequisites:
+
+- A SEPARATE Paradex mainnet account from the one the Java quoter trades (one quoter per
+  account), funded small, with no open orders and no position on any market.
+- Its Paradex (Starknet) address and its main L2 (Stark) key, in the mainnet-only variables. The
+  testnet samples' variables must be unset: either one refuses the run.
+
+```text
+unset PARADEX_ACCOUNT_ADDRESS PARADEX_PRIVATE_KEY
+export PARADEX_MAINNET_ACCOUNT_ADDRESS=...   # the separate mainnet account
+export PARADEX_MAINNET_PRIVATE_KEY=...       # its main L2 key
+cargo run -p fbc-examples --example mainnet_smoke -- --mainnet --sole-trader --namespace <N> \
+    --market BTC-USD-PERP --tick <price_tick_size> --step <order_size_increment> \
+    --min-notional <min_notional> --resting-cap-usd 11 --inventory-cap-usd 50 --order-usd 11 \
+    --side buy --away-bps 300
+```
+
+Read the market's `price_tick_size`, `order_size_increment` and `min_notional` from
+`GET https://api.prod.paradex.trade/v1/markets`. The program checks that `GET /system/config`
+names `PRIVATE_SN_PARACLEAR_MAINNET`, reads the mark price from `GET /markets/summary`, and refuses
+an order whose size at the mark is below the minimum notional (Paradex judges it there). Caps above
+$11 resting per side or $50 inventory are refused. The $11 resting cap is judged at the order's own
+price (the notional a fill costs), not at the mark. `--help` lists every flag and output line.
 
 ## paradex_testnet_acceptance
 
