@@ -335,10 +335,9 @@ fn responder(venue: Arc<Mutex<Venue>>, conn: usize) -> Responder {
             "subscribe" => frames.push(ok(json!({}))),
             "order.cancel_on_disconnect" => frames.push(ok(json!({"enabled": true}))),
             "order.create" | "order.create_batch" => {
-                let items: Vec<Value> = match params.get("orders") {
-                    Some(Value::Array(items)) => items.clone(),
-                    _ => vec![params.clone()],
-                };
+                // A batch's params are the bare array of order requests (FBC-mu1o).
+                let batch = params.as_array();
+                let items: Vec<Value> = batch.cloned().unwrap_or_else(|| vec![params.clone()]);
                 let mut created = Vec::new();
                 for p in &items {
                     v.next_vid += 1;
@@ -356,7 +355,7 @@ fn responder(venue: Arc<Mutex<Venue>>, conn: usize) -> Responder {
                     };
                     created.push(o);
                 }
-                let reply = if items.len() == 1 && params.get("orders").is_none() {
+                let reply = if batch.is_none() {
                     json!({"order": created[0].json(&account)})
                 } else {
                     let results: Vec<Value> = created

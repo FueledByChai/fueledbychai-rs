@@ -343,7 +343,12 @@ fn answer(book: &mut Book, req: &Value, answers: &[Answer]) -> Responded {
             Answer::Silent => Ok(Vec::new()),
         },
         "order.create_batch" => {
-            let items = p["orders"].as_array().cloned().unwrap_or_default();
+            // FBC-mu1o: the params are the bare array of order requests; Paradex refuses an
+            // object ("cannot unmarshal object into Go value of type []*requests.OrderRequest").
+            let items = p
+                .as_array()
+                .cloned()
+                .ok_or("order.create_batch params are not an array")?;
             if items.len() != answers.len() {
                 return Err(format!("{} items, {} answers", items.len(), answers.len()));
             }

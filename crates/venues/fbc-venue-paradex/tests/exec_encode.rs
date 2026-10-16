@@ -435,6 +435,9 @@ fn a_post_only_or_rpi_market_order_is_unsupported_before_signing() {
 
 #[test]
 fn a_batch_is_order_create_batch_with_each_item_signed_and_charged_its_item_count() {
+    // FBC-mu1o: the params ARE the array of order.create params, in the commands' order;
+    // Paradex refused `{"orders":[..]}` live ("cannot unmarshal object into Go value of type
+    // []*requests.OrderRequest").
     let item = |seq: u64, side: Side, size: &str| {
         let sig = order_sig(side, ParadexOrderType::Limit, size, "62000.5");
         let side = match side {
@@ -449,7 +452,7 @@ fn a_batch_is_order_create_batch_with_each_item_signed_and_charged_its_item_coun
     let want = rpc_frame(
         "order.create_batch",
         &format!(
-            r#"{{"orders":[{},{}]}}"#,
+            "[{},{}]",
             item(4, Side::Buy, "0.005"),
             item(5, Side::Sell, "0.012")
         ),
