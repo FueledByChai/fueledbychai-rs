@@ -824,10 +824,10 @@ pub fn place_refusal(
 /// Why a run that is not an owner-assisted testnet run (`owner_assisted` false: never seeded by
 /// hand) must not Start on the resync it applied, or `None`: the resync was `untrustworthy`, so
 /// it seeded no position and nothing may seed one by hand (owner answer C to RB-olg-3: a
-/// mainnet market is armed only after a trustworthy resync; Paradex's snapshot source stays
-/// untrustworthy until FBC-2f7w's decision record flips it), or the account holds a `position`
-/// on the market (the smoke runs on a flat account). Always `None` for an owner-assisted run,
-/// which seeds by hand.
+/// mainnet market is armed only after a trustworthy resync; Paradex's snapshot source is
+/// trustworthy, decision 0094, so this guards a venue declaring otherwise), or the account
+/// holds a `position` on the market (the smoke runs on a flat account). Always `None` for an
+/// owner-assisted run, which seeds by hand.
 pub fn start_refusal(
     owner_assisted: bool,
     untrustworthy: bool,
@@ -840,8 +840,8 @@ pub fn start_refusal(
         return Some(
             "the resync's snapshot source is untrustworthy, so it seeded no position, and this \
              run never seeds one by hand (only an owner-assisted testnet run may, decision \
-             0067); it runs once FBC-2f7w's decision record makes Paradex's snapshot source \
-             trustworthy"
+             0067); it runs only on a venue whose snapshot source is trustworthy (Paradex's is, \
+             decision 0094)"
                 .to_owned(),
         );
     }

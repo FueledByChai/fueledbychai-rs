@@ -8,11 +8,10 @@
 //! chain is refused before any order; Start is refused unless the resync was trustworthy; and no
 //! credential appears in what it prints.
 //!
-//! The run is tested through [`Declared`], a stand-in for the Paradex factory that is Paradex's in
-//! everything but the snapshot source its caps declare: [`TRUSTED`] for the full path, and
-//! [`UNTRUSTED`] for the refusals, so each test holds whatever Paradex's adapter declares
-//! (FBC-2f7w's decision record may flip it); `smoke::trusted` on Paradex's own factory is checked
-//! to agree with `ParadexFactory.caps()`. The stub answers as in
+//! The full path runs on Paradex's own factory, whose caps declare the snapshot source
+//! trustworthy (decision 0094). The refusals of a venue declaring it otherwise run through
+//! [`UNTRUSTED`], a stand-in that is Paradex's factory in everything but the snapshot source its
+//! caps declare, so they stay proven whatever Paradex's adapter declares. The stub answers as in
 //! `tests/testnet_trade.rs`, plus `GET /v1/system/config` and `GET /v1/markets/summary`, and
 //! the instrument cancel-all with `{"status":"ok"}`. The credentials are the synthetic account
 //! and key of `fixtures/paradex/signing`. The run is on real time, bounded at 60 s.
@@ -72,10 +71,6 @@ const MARK: &str = "62000.3";
 
 /// Paradex's factory in everything but its caps, which declare the snapshot source given.
 struct Declared(SnapshotSource);
-
-/// Declares the snapshot source trustworthy: what Paradex's will be once FBC-2f7w's record flips
-/// it.
-static TRUSTED: Declared = Declared(SnapshotSource::Trustworthy);
 
 /// Declares the snapshot source untrustworthy, whatever Paradex's own adapter declares.
 static UNTRUSTED: Declared = Declared(SnapshotSource::Untrustworthy);
@@ -482,7 +477,7 @@ async fn mainnet_smoke_places_one_post_only_order_cancels_it_and_stops_against_a
         .await
         .unwrap();
     let smoke = smoke_on(&stub);
-    let (ran, printed) = run_on(&smoke, None, &TRUSTED).await;
+    let (ran, printed) = run_on(&smoke, None, &ParadexFactory).await;
     stub.finished().await.unwrap();
     let report = ran.unwrap_or_else(|e| panic!("refused: {e}; it printed:\n{printed}"));
 
@@ -546,8 +541,13 @@ async fn mainnet_smoke_places_one_post_only_order_cancels_it_and_stops_against_a
     );
     assert!(printed.contains("the snapshot is trustworthy"), "{printed}");
     assert!(printed.contains("an instrument cancel-all"), "{printed}");
-    // Never a hand seed, never an owner-assisted testnet run.
-    assert!(!printed.contains("SEED"), "{printed}");
+    // The resync seeded the market (decision 0094): never a hand seed, never an owner-assisted
+    // testnet run.
+    assert!(
+        printed.contains("SEED position 0 lots seeded by the trustworthy resync"),
+        "{printed}"
+    );
+    assert!(!printed.contains("seeded by hand"), "{printed}");
     assert!(!printed.contains("OWNER-ASSISTED"), "{printed}");
     assert!(
         printed.contains("DONE ok places sent 1 cancels sent 2"),
@@ -573,7 +573,7 @@ async fn an_untrustworthy_snapshot_source_refuses_the_run_before_anything_connec
         .err()
         .unwrap_or_else(|| panic!("the run was not refused:\n{printed}"));
     assert!(err.contains("untrustworthy"), "{err}");
-    assert!(err.contains("FBC-2f7w"), "{err}");
+    assert!(err.contains("decision 0094"), "{err}");
     assert!(err.contains("never seeded by hand"), "{err}");
     assert!(
         stub.http_requests().is_empty(),
@@ -582,19 +582,16 @@ async fn an_untrustworthy_snapshot_source_refuses_the_run_before_anything_connec
     );
     assert!(stub.connections().is_empty());
     assert!(printed.is_empty(), "{printed}");
-    // Paradex's own factory is admitted exactly when its caps declare the snapshot trustworthy
-    // (Untrustworthy until FBC-2f7w's record flips it).
+    // Paradex's own factory declares the snapshot trustworthy (decision 0094), so it is
+    // admitted.
     let cfg = smoke::config(&smoke.trade);
     let declared = ParadexFactory
         .caps(&cfg)
         .unwrap()
         .exec
         .map(|exec| exec.order.snapshot_source);
-    assert_eq!(
-        smoke::trusted(&ParadexFactory, &cfg).is_ok(),
-        declared == Some(SnapshotSource::Trustworthy),
-        "{declared:?}"
-    );
+    assert_eq!(declared, Some(SnapshotSource::Trustworthy));
+    assert_eq!(smoke::trusted(&ParadexFactory, &cfg), Ok(()));
 }
 
 #[tokio::test]
@@ -655,7 +652,7 @@ async fn a_position_on_the_market_refuses_start_with_nothing_placed() {
     .await
     .unwrap();
     let smoke = smoke_on(&stub);
-    let (ran, printed) = run_on(&smoke, None, &TRUSTED).await;
+    let (ran, printed) = run_on(&smoke, None, &ParadexFactory).await;
     stub.finished().await.unwrap();
     let report = ran.unwrap();
     assert!(!report.ok, "{printed}");
@@ -682,7 +679,7 @@ async fn a_system_config_naming_another_chain_is_refused_before_any_order() {
             .await
             .unwrap();
         let smoke = smoke_on(&stub);
-        let (ran, printed) = run_on(&smoke, None, &TRUSTED).await;
+        let (ran, printed) = run_on(&smoke, None, &ParadexFactory).await;
         let err = ran
             .err()
             .unwrap_or_else(|| panic!("not refused:\n{printed}"));
@@ -710,7 +707,7 @@ async fn a_system_config_naming_another_chain_is_refused_before_any_order() {
     .await
     .unwrap();
     let smoke = smoke_on(&stub);
-    let (ran, _) = run_on(&smoke, None, &TRUSTED).await;
+    let (ran, _) = run_on(&smoke, None, &ParadexFactory).await;
     let err = ran.err().unwrap();
     assert!(err.contains("GET /system/config: status 503"), "{err}");
     assert!(stub.connections().is_empty());
@@ -727,7 +724,7 @@ async fn an_order_below_the_minimum_notional_at_the_mark_is_refused_before_the_s
     .await
     .unwrap();
     let smoke = smoke_on(&stub);
-    let (ran, printed) = run_on(&smoke, None, &TRUSTED).await;
+    let (ran, printed) = run_on(&smoke, None, &ParadexFactory).await;
     let err = ran
         .err()
         .unwrap_or_else(|| panic!("not refused:\n{printed}"));
@@ -785,7 +782,7 @@ fn start_is_refused_unless_the_resync_was_trustworthy_and_the_account_flat() {
     // An owner-assisted testnet run seeds by hand: never refused here.
     assert_eq!(trade::start_refusal(true, true, SignedLots(5)), None);
     let untrusted = trade::start_refusal(false, true, SignedLots(0)).unwrap();
-    assert!(untrusted.contains("FBC-2f7w"), "{untrusted}");
+    assert!(untrusted.contains("decision 0094"), "{untrusted}");
     let held = trade::start_refusal(false, false, SignedLots(-3)).unwrap();
     assert!(held.contains("-3 lots"), "{held}");
     assert_eq!(trade::start_refusal(false, false, SignedLots(0)), None);
@@ -809,7 +806,7 @@ async fn a_run_not_confirmed_mainnet_and_sole_trader_is_refused_before_anything_
     ] {
         let mut smoke = smoke_on(&stub);
         unconfirm(&mut smoke);
-        let (ran, _) = run_on(&smoke, None, &TRUSTED).await;
+        let (ran, _) = run_on(&smoke, None, &ParadexFactory).await;
         assert!(ran.is_err());
     }
     assert!(stub.http_requests().is_empty());
@@ -894,7 +891,12 @@ async fn the_guard_admits_only_the_mainnet_chain_id() {
     // loopback stub, which sees nothing.
     let stub = StubServer::start(no_script(), routes()).await.unwrap();
     let smoke = smoke_on(&stub);
-    let (ran, printed) = run_on(&smoke, Some("PRIVATE_SN_PARACLEAR_TESTNET"), &TRUSTED).await;
+    let (ran, printed) = run_on(
+        &smoke,
+        Some("PRIVATE_SN_PARACLEAR_TESTNET"),
+        &ParadexFactory,
+    )
+    .await;
     assert!(ran.err().unwrap().contains("PARADEX_CHAIN_ID"));
     assert!(printed.is_empty(), "{printed}");
     assert!(
@@ -937,7 +939,7 @@ async fn the_caps_are_at_most_eleven_dollars_resting_and_fifty_inventory() {
         let mut big = smoke_on(&stub);
         big.trade.resting_cap_usd = Decimal::from(resting);
         big.trade.inventory_cap_usd = Decimal::from(inventory);
-        let (ran, printed) = run_on(&big, None, &TRUSTED).await;
+        let (ran, printed) = run_on(&big, None, &ParadexFactory).await;
         let err = ran.err().unwrap();
         assert!(err.contains(why), "{err}");
         assert!(printed.is_empty(), "{printed}");
@@ -1037,9 +1039,10 @@ fn help_names_the_environment_the_prerequisites_and_every_line() {
         "https://api.prod.paradex.trade/v1",
         "wss://ws.api.prod.paradex.trade/v1",
         "SEPARATE",
-        "FBC-2f7w",
+        "decision 0094",
         "STEP chain",
         "STEP mark",
+        "SEED",
         "STEP stop",
         "TIMEOUT",
         "DONE ok|failed",
@@ -1116,7 +1119,7 @@ fn credentials_come_only_from_the_mainnet_variables_and_are_never_shown() {
 
 #[test]
 fn the_mainnet_network_never_seeds_by_hand_and_names_its_own_leases() {
-    let net = smoke::network(&TRUSTED, Decimal::ONE);
+    let net = smoke::network(&ParadexFactory, Decimal::ONE);
     assert!(!net.owner_assisted);
     assert_eq!(net.label, "mainnet");
     assert_eq!(net.program, "mainnet_smoke");

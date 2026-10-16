@@ -6,9 +6,9 @@
 //! [`crate::smoke_args::confirmed`]); the URLs exactly mainnet's ([`MAINNET_REST`],
 //! [`MAINNET_WS`]) or both a loopback stub's; `PARADEX_CHAIN_ID`, when set, mainnet's; and the
 //! venue's declared snapshot source trustworthy ([`trusted`]). Paradex's adapter declares it
-//! untrustworthy until FBC-2f7w's decision record flips it, so until then the run stops here:
-//! a mainnet market is armed only after a trustworthy resync (owner answer C to RB-olg-3), and
-//! hand-seeding is for an owner-assisted testnet run only (decision 0067).
+//! trustworthy (decision 0094, accepted by the owner 2026-10-16); a venue declaring otherwise
+//! stops here: a mainnet market is armed only after a trustworthy resync (owner answer C to
+//! RB-olg-3), and hand-seeding is for an owner-assisted testnet run only (decision 0067).
 //!
 //! **Then, each step timed out**: `GET /system/config` must name [`MAINNET_CHAIN`], the chain the
 //! login signs for ([`decode_chain`]); `GET /markets/summary` gives the market's mark price
@@ -99,9 +99,8 @@ pub fn trusted(factory: &dyn VenueFactory, cfg: &VenueConfig) -> Result<(), Stri
     Err(format!(
         "Paradex's snapshot source is declared {declared}, not trustworthy, so no resync can \
          seed the market's position, and a mainnet market is never seeded by hand (only an \
-         owner-assisted testnet run may be, decision 0067): mainnet_smoke runs once FBC-2f7w's \
-         decision record, accepted by the owner, makes it Trustworthy and is on main; nothing \
-         connected"
+         owner-assisted testnet run may be, decision 0067): mainnet_smoke runs only on a venue \
+         declaring it Trustworthy (Paradex's adapter does, decision 0094); nothing connected"
     ))
 }
 
