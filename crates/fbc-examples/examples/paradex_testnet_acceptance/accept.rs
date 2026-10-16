@@ -531,6 +531,9 @@ struct Tracker {
     /// size became (FBC-b0z9).
     last_stated: Vec<(ClientOrderId, Stated)>,
     order_events: u64,
+    /// Every fill and order event of ours received, counted: a comparison's stream
+    /// generation ([`Want::changes`]).
+    changes: u64,
 }
 
 /// What an order event stated of an order: its number over the run, total, cumulative filled
@@ -552,6 +555,7 @@ impl Tracker {
         let (tick, step) = (self.tick, self.step);
         match ev {
             ExecEvent::Fill(f) => {
+                self.changes += 1;
                 let label = match f.cid {
                     Some(CidMatch::Ours(cid)) => self
                         .get(cid)
@@ -606,6 +610,7 @@ impl Tracker {
             ExecEvent::Order(u) => {
                 self.order_events += 1;
                 if let Some(CidMatch::Ours(cid)) = u.cid {
+                    self.changes += 1;
                     self.last_stated.retain(|(c, _)| *c != cid);
                     self.last_stated
                         .push((cid, (self.order_events, u.qty, u.cum_filled, u.px)));
@@ -940,6 +945,23 @@ struct Order<'a> {
     tif: Tif,
     post_only: bool,
     reduce_only: bool,
+}
+
+/// Why a take of `qty` on `side` from a position of `now` lots could pass the inventory cap
+/// of `cap` lots, if it could. Checked: a position the take would carry past an i64 bound is
+/// refused, never wrapped or a panic (Codex r4289405179).
+pub fn past_cap(now: SignedLots, side: OrderSide, qty: Lots, cap: Lots) -> Option<String> {
+    let after = now.checked_add(SignedLots::of(side_of(side), qty));
+    let past = after.is_none_or(|a| a.0.unsigned_abs() > cap.get().unsigned_abs());
+    past.then(|| {
+        format!(
+            "a take of {} lots from a position of {} lots could pass the inventory cap ({} \
+             lots): none is taken",
+            qty.get(),
+            now.0,
+            cap.get()
+        )
+    })
 }
 
 /// Whether an order rests, or has ended.
@@ -1895,35 +1917,49 @@ impl Run {
         label: &str,
         start: SignedLots,
     ) -> bool {
-        let cid = {
-            let tr = self.tracker.borrow();
-            tr.orders
-                .iter()
-                .rev()
-                .find(|o| o.label == label && o.phase == tr.phase)
-                .map(|o| o.cid)
-        };
-        if let Some(cid) = cid {
+        if let Some(cid) = self.labelled(label) {
             if p.state(cid)
                 .is_some_and(|s| matches!(s, OrdState::Open | OrdState::PartiallyFilled))
             {
                 self.cancel(p, step, &[cid]).await;
             }
             if !p.fills_settled(cid, OrdState::is_terminal).await {
-                let why = format!(
-                    "{label}'s outcome is unresolved (it did not end with its fills on the stream \
-                     within the step timeout): what it filled is NOT flattened; the phase stops, \
-                     check GET /positions and flatten by hand on testnet"
+                return self.unresolved(
+                    step,
+                    &format!(
+                        "{label}'s outcome is unresolved (it did not end with its fills on the \
+                         stream within the step timeout)"
+                    ),
                 );
-                self.lines.line(format_args!("FAIL {step} {why}"));
-                self.fail(step, why);
-                self.ev.step(step).pass = false;
-                return false;
             }
         }
         let flat = self.flatten(p, step, start).await.0;
         self.ev.step(step).pass = false;
         flat
+    }
+
+    /// The client id of this phase's last order labelled `label`, if one was minted.
+    fn labelled(&self, label: &str) -> Option<ClientOrderId> {
+        let tr = self.tracker.borrow();
+        tr.orders
+            .iter()
+            .rev()
+            .find(|o| o.label == label && o.phase == tr.phase)
+            .map(|o| o.cid)
+    }
+
+    /// Fails `step` as unresolved, `why`: what it filled is not flattened, never called flat,
+    /// and the phase stops (false) with the line to flatten by hand (Codex r4289405166,
+    /// r4289405169; Reviewer B, RB-6fnc-1).
+    fn unresolved(&mut self, step: &str, why: &str) -> bool {
+        let why = format!(
+            "{why}: what it filled is NOT flattened; the phase stops, check GET /positions and \
+             flatten by hand on testnet"
+        );
+        self.lines.line(format_args!("FAIL {step} {why}"));
+        self.fail(step, why);
+        self.ev.step(step).pass = false;
+        false
     }
 
     /// Why a take on `side` from the market's inventory now could not be undone by a
@@ -1946,16 +1982,8 @@ impl Run {
     /// Why a take of `qty` on `side` could pass the inventory cap from the market's inventory
     /// now, if it could (the registry refuses it too; this says why before anything is sent).
     fn past_cap(&self, p: &Phase, side: OrderSide, qty: Lots) -> Option<String> {
-        let now = p.link.borrow().registry().inventory(INST).0;
-        let after = now + SignedLots::of(side_of(side), qty).0;
-        (after.unsigned_abs() > self.inventory.get().unsigned_abs()).then(|| {
-            format!(
-                "a take of {} lots from a position of {now} lots could pass the inventory cap \
-                 ({} lots): none is taken",
-                qty.get(),
-                self.inventory.get()
-            )
-        })
+        let now = p.link.borrow().registry().inventory(INST);
+        past_cap(now, side, qty, self.inventory)
     }
 
     /// The fill step (`--allow-fill`, FBC-6fnc): one IOC of about `--order-usd` at the far
@@ -2012,6 +2040,25 @@ impl Run {
         let filled = p.filled(cid);
         let after = self.compare(p, "fill: after the IOC", &[cid]).await;
         self.history(step, cid, &["CLOSED"]).await;
+        // A take not ended with its fills, or a position REST does not show, leaves the
+        // inventory to flatten from unknown: nothing is flattened and the phase stops (Codex
+        // r4289405166; Reviewer B, RB-6fnc-1).
+        if !ended || !after.positions_agreed {
+            let why = if ended {
+                "GET /positions did not agree with T1's fills within the REST wait"
+            } else {
+                "T1 did not end with every fill its order events state on the stream within the \
+                 step timeout"
+            };
+            let trace = self.tracker.borrow().trace(cid);
+            self.refresh_outcomes(p, step);
+            let s = self.ev.step(step);
+            s.ran = Ran::Yes;
+            s.orders.push(trace);
+            s.comparisons.push(after);
+            s.notes.push(why.to_owned());
+            return self.unresolved(step, &format!("T1's outcome is unresolved ({why})"));
+        }
         let (flat, flats) = self.flatten(p, step, start).await;
         let mut cids = vec![cid];
         cids.extend(flats);
@@ -2038,20 +2085,9 @@ impl Run {
         s.ran = Ran::Yes;
         s.orders.extend(traces);
         let agreed = |c: &Comparison| c.orders_agreed && c.positions_agreed;
-        s.pass = ended
-            && filled > Lots::ZERO
-            && agreed(&before)
-            && agreed(&after)
-            && flat
-            && agreed(&flattened);
-        if !ended {
-            s.notes.push(
-                "T1 did not end with every fill its order events state on the stream within the \
-                 step timeout"
-                    .to_owned(),
-            );
-        }
-        if ended && filled == Lots::ZERO {
+        s.pass =
+            filled > Lots::ZERO && agreed(&before) && agreed(&after) && flat && agreed(&flattened);
+        if filled == Lots::ZERO {
             s.notes.push(
                 "T1 took nothing (the touch moved before it landed): GET /positions following \
                  fills was not exercised"
@@ -2131,6 +2167,12 @@ impl Run {
             }
         };
         let landed = p.fills_settled(cid, resting_or_ended).await;
+        // P1 is priced to take `level` lots: an OPEN event that came before its fill does not
+        // say it rests unfilled, so its fill is waited for (Reviewer B, RB-6fnc-2).
+        if landed && p.state(cid) == Some(OrdState::Open) {
+            p.fills_settled(cid, |s| s == OrdState::PartiallyFilled || s.is_terminal())
+                .await;
+        }
         let partly = p.state(cid) == Some(OrdState::PartiallyFilled);
         let mut ok = landed;
         // Whether the amend of a partly filled order was sent and read: only then can the step
@@ -2162,6 +2204,22 @@ impl Run {
         self.ev.partial_amend = Some(reading.clone());
         if !p.state(cid).is_some_and(OrdState::is_terminal) {
             ok &= self.cancel(p, step, &[cid]).await;
+        }
+        // What P1 filled is known only once it ended with every fill its order events state:
+        // otherwise nothing is flattened and the phase stops (Reviewer A; Reviewer B,
+        // RB-6fnc-1).
+        if !p.fills_settled(cid, OrdState::is_terminal).await {
+            let trace = self.tracker.borrow().trace(cid);
+            self.refresh_outcomes(p, step);
+            let s = self.ev.step(step);
+            s.ran = Ran::Yes;
+            s.orders.retain(|t| t.client_id != trace.client_id);
+            s.orders.push(trace);
+            return self.unresolved(
+                step,
+                "P1's outcome is unresolved (it did not end with its fills on the stream within \
+                 the step timeout)",
+            );
         }
         let (flat, flats) = self.flatten(p, step, start).await;
         let mut cids = vec![cid];
@@ -2334,8 +2392,21 @@ impl Run {
         target: SignedLots,
     ) -> (bool, Vec<ClientOrderId>) {
         let mut cids = Vec::new();
+        let left_of = |p: &Phase| {
+            p.link
+                .borrow()
+                .registry()
+                .inventory(INST)
+                .checked_sub(target)
+        };
         for attempt in 1..=3 {
-            let left = p.link.borrow().registry().inventory(INST).0 - target.0;
+            // Checked: a position near an i64 bound is no size to send (Codex r4289405179).
+            let Some((left, qty)) = left_of(p).and_then(|l| Some((l.0, l.abs_lots()?))) else {
+                return (
+                    self.unresolved(step, "the position less the target does not fit a size"),
+                    cids,
+                );
+            };
             if left == 0 {
                 return (true, cids);
             }
@@ -2344,7 +2415,6 @@ impl Run {
             } else {
                 OrderSide::Buy
             };
-            let qty = Lots::new(left.abs()).expect("a size");
             let Some(book) = self.book(step).await else {
                 continue;
             };
@@ -2378,19 +2448,30 @@ impl Run {
                 post_only: false,
                 reduce_only: true,
             };
-            match self.place_at(p, step, &order).await {
-                Ok((cid, _)) => {
-                    cids.push(cid);
-                    if !p.fills_settled(cid, OrdState::is_terminal).await {
-                        self.ev.step(step).notes.push(format!(
-                            "{label} did not end with its fills on the stream in time"
-                        ));
-                    }
+            let sent = match self.place_at(p, step, &order).await {
+                Ok((cid, _)) => Some(cid),
+                Err(e) => {
+                    self.ev.step(step).notes.push(format!("{label}: {e}"));
+                    // One the registry holds was sent, and may still fill.
+                    self.labelled(&label).filter(|c| p.state(*c).is_some())
                 }
-                Err(e) => self.ev.step(step).notes.push(format!("{label}: {e}")),
+            };
+            // The next IOC is sized from the inventory only once this one ended with its fills:
+            // one sized from a stale inventory could reduce past the target (Codex
+            // r4289405169).
+            if let Some(cid) = sent {
+                cids.push(cid);
+                if !p.fills_settled(cid, OrdState::is_terminal).await {
+                    let why = format!(
+                        "{label}'s outcome is unresolved (it did not end with its fills on the \
+                         stream within the step timeout)"
+                    );
+                    self.ev.step(step).notes.push(why.clone());
+                    return (self.unresolved(step, &why), cids);
+                }
             }
         }
-        let left = p.link.borrow().registry().inventory(INST).0 - target.0;
+        let left = left_of(p).map_or(i64::MAX, |l| l.0);
         if left != 0 {
             let why = format!(
                 "FLATTEN FAILED: {left} lots of this step's fills are still held on the market \
@@ -2956,6 +3037,7 @@ impl Run {
             expected: Vec::new(),
             lots,
             since: at,
+            changes: 0,
         };
         let position_wait = if gone_at.is_some() {
             Duration::from_secs(self.opts.rest_wait_secs)
@@ -3598,12 +3680,15 @@ pub struct Want {
     pub expected: Vec<Expected>,
     pub lots: i64,
     pub since: Instant,
+    /// The stream's generation: fills and order events of ours received, counted. Changes that
+    /// return the orders and position to where they were still move it (Codex r4289405172).
+    pub changes: u64,
 }
 
 impl Want {
-    /// Whether `other` shows the same orders and position.
+    /// Whether `other` shows the same orders and position, with no event between them.
     pub fn same(&self, other: &Want) -> bool {
-        self.expected == other.expected && self.lots == other.lots
+        self.expected == other.expected && self.lots == other.lots && self.changes == other.changes
     }
 
     /// Writes what it shows into `c`, the position in the market's units of `step`.
@@ -3671,6 +3756,7 @@ fn want_of(
         expected,
         lots: reg.inventory(INST).0,
         since: since.unwrap_or_else(Instant::now),
+        changes: tr.changes,
     }
 }
 

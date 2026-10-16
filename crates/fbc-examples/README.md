@@ -55,6 +55,12 @@ through fbc-oms under the caps.
   admits it in its main phase only, and only when the larger reading (the whole size resting on
   top of what filled) still fits the caps.
 
+Nothing is flattened from an inventory the stream has not settled. If an order of a fill step
+(the take, the partly filled order, or a flatten IOC) does not end with every fill its order
+events state within the step timeout, or GET /positions disagrees after the take, the step
+fails with `FAIL <step> ... flatten by hand on testnet`, no further IOC is sized, and the
+phase stops.
+
 The report lists every fill as received (fill id, side, fee and fee currency, realized P&L and
 funding) and every PositionEvent.
 

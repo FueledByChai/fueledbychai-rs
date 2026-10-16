@@ -696,6 +696,34 @@ fn ms(lag: Option<u128>) -> String {
 
 /// The report's answers to FBC-2f7w's five questions, FBC-8xr's items and decision 0092's, each
 /// `(question, answer)`.
+/// Each refusal the fill steps recorded, as their outcomes and orders show it: a request
+/// answered `Rejected`, and an order that ended rejected (0092 (2) is answered from these,
+/// never from whether the steps ran; Codex r4289405174).
+pub fn fill_refusals(ev: &Evidence) -> Vec<String> {
+    let mut out = Vec::new();
+    for s in ev
+        .steps
+        .iter()
+        .filter(|s| s.name == "fill" || s.name == "fill-partial")
+    {
+        for c in &s.sent {
+            for o in c.outcomes.iter().filter(|o| o.contains("Rejected")) {
+                out.push(format!("{} request {}: {o}", s.name, c.rpc));
+            }
+        }
+        for t in &s.orders {
+            if let Some(last) = t
+                .states
+                .last()
+                .filter(|l| l.starts_with("Terminal(Rejected"))
+            {
+                out.push(format!("{} {}: {last}", s.name, t.label));
+            }
+        }
+    }
+    out
+}
+
 pub fn answers(ev: &Evidence) -> Vec<(String, String)> {
     let comparisons: Vec<&Comparison> = ev.steps.iter().flat_map(|s| &s.comparisons).collect();
     let histories: Vec<(&History, bool)> = ev
@@ -846,6 +874,7 @@ pub fn answers(ev: &Evidence) -> Vec<(String, String)> {
         .steps
         .iter()
         .any(|s| s.name == "fill" && s.ran == Ran::Yes);
+    let refusals = fill_refusals(ev);
     let limits: Vec<String> = comparisons
         .iter()
         .map(|c| {
@@ -921,9 +950,15 @@ pub fn answers(ev: &Evidence) -> Vec<(String, String)> {
         ),
         (
             "0092 (2): an IOC/MARKET risk refusal other than NOT_ENOUGH_MARGIN".to_owned(),
-            if fill_ran {
-                "not exercised: the fill steps' orders are sized within the caps, so none is \
-                 refused for risk"
+            if !refusals.is_empty() {
+                format!(
+                    "observed: the fill steps' orders were refused: {} (a NOT_ENOUGH_MARGIN \
+                     refusal is not this question's)",
+                    refusals.join("; ")
+                )
+            } else if fill_ran {
+                "not observed: every order the fill steps sent was accepted, none refused for \
+                 risk (each is sized within the caps)"
                     .to_owned()
             } else {
                 "not exercised: without --allow-fill the program never sends an order that \
