@@ -438,6 +438,123 @@ impl Running<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exec_orders::{RpcIds, Shared};
+    use fbc_core::{AccountKey, ConnKey};
+    use std::cell::Cell;
+
+    /// What a scripted member does each time it is polled.
+    #[derive(Copy, Clone, Debug)]
+    enum Act {
+        /// Stamps an input and waits.
+        Stamp,
+        /// Waits.
+        Wait,
+        /// Takes the command waiting in the session and waits.
+        Take,
+        /// Ends.
+        End,
+        /// Fails.
+        Fail,
+    }
+
+    /// A member that does `acts`, one per poll, waking itself after each wait, and waits
+    /// forever once they run out.
+    fn scripted(clock: &IngestClock, shared: &Rc<Shared>, acts: &[Act]) -> Member<'static> {
+        let (clock, shared) = (clock.clone(), Rc::clone(shared));
+        let acts = acts.to_vec();
+        let next = Cell::new(0);
+        let run = poll_fn(move |cx| {
+            let act = acts.get(next.get()).copied();
+            next.set(next.get() + 1);
+            match act {
+                Some(Act::End) => return Poll::Ready(Ok(())),
+                Some(Act::Fail) => {
+                    return Poll::Ready(Err(ShardError::Md(SessionError::NoConnectionLeft)));
+                }
+                Some(Act::Stamp) => {
+                    clock.stamp(ConnKey { conn: 1, epoch: 0 }, None);
+                }
+                Some(Act::Take) => {
+                    shared.pop();
+                }
+                Some(Act::Wait) | None => {}
+            }
+            if act.is_some() {
+                cx.waker().wake_by_ref();
+            }
+            Poll::Pending
+        });
+        Member { run: Box::pin(run) }
+    }
+
+    /// What one scripted run showed: its result, the passes and the ladder commands handed back.
+    async fn scripted_run(acts: &[Act], planned: usize) -> (Result<(), ShardError>, u64, u64) {
+        let clock = IngestClock::new();
+        let shared = Shared::new(
+            AccountKey::new(2),
+            RpcIds::default(),
+            true,
+            false,
+            true,
+            clock.clone(),
+        );
+        let orders = ExecOrders {
+            shared: Rc::clone(&shared),
+        };
+        let mut host = ShardHost::new(clock.clone());
+        // The ladder's commands, each a control command for a session that never takes one by
+        // itself; a member taking one stands in for it.
+        let mut decide = |_: &[InstrumentId], ladder: &mut Ladder| {
+            for _ in 0..planned {
+                ladder.push_control(&orders, ControlCommand::FeeQuery);
+            }
+        };
+        let member = scripted(&clock, &shared, acts);
+        assert_eq!(format!("{member:?}"), "Member");
+        let ran = host.run(vec![member], &mut decide).await;
+        (ran, host.passes(), host.unsubmitted())
+    }
+
+    #[tokio::test]
+    async fn a_member_ending_or_failing_as_the_shard_drains_ends_the_run_before_any_pass() {
+        let (ran, passes, back) = scripted_run(&[Act::Stamp, Act::End], 1).await;
+        assert_eq!((ran, passes, back), (Ok(()), 0, 0));
+        let (ran, passes, _) = scripted_run(&[Act::Stamp, Act::Fail], 1).await;
+        assert_eq!(ran, Err(ShardError::Md(SessionError::NoConnectionLeft)));
+        assert_eq!(passes, 0);
+    }
+
+    /// The pass's ladder of two: the member ends or fails at the poll the host makes before the
+    /// first command's turn, after it was submitted, or between the two; every command not yet
+    /// submitted is handed back, through the decide pass's default `unsubmitted`.
+    #[tokio::test]
+    async fn the_runs_end_before_a_ladder_commands_turn_hands_it_back() {
+        use Act::{End, Fail, Stamp, Take, Wait};
+        // Polled: the wait for an input, the drain's round, then the ladder's.
+        let cases: [(&[Act], Result<(), ShardError>, u64); 5] = [
+            (&[Stamp, Wait, End], Ok(()), 2),
+            (
+                &[Stamp, Wait, Fail],
+                Err(ShardError::Md(SessionError::NoConnectionLeft)),
+                2,
+            ),
+            (&[Stamp, Wait, Wait, End], Ok(()), 1),
+            (
+                &[Stamp, Wait, Wait, Fail],
+                Err(ShardError::Md(SessionError::NoConnectionLeft)),
+                1,
+            ),
+            (&[Stamp, Wait, Wait, Take, End], Ok(()), 1),
+        ];
+        for (acts, want, back) in cases {
+            let shown = scripted_run(acts, 2).await;
+            assert_eq!(shown, (want, 1, back), "{acts:?}");
+        }
+        // Between the two, an error ends it too.
+        let acts = [Stamp, Wait, Wait, Take, Fail];
+        let (ran, _, back) = scripted_run(&acts, 2).await;
+        assert_eq!((ran.is_err(), back), (true, 1));
+    }
 
     #[test]
     fn an_instrument_marked_again_keeps_its_first_place_and_a_take_empties_the_marks() {
