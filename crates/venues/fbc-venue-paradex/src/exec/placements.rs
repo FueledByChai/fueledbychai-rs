@@ -9,9 +9,11 @@
 //! - **Refused** (CLOSED with nothing filled, for a reason other than our cancel): an
 //!   `ExecEvent::AsyncReject` of the placement (`OpKind::Place`) naming the order by our client
 //!   id and its venue id, pushed before the order update. Its kind is
-//!   `RejectKind::PostOnlyWouldCross` for `POST_ONLY_WOULD_CROSS` and `RejectKind::Other` for
-//!   any other reason; the reason is its `raw`, and it carries no `venue_code`: Paradex states
-//!   a cancel reason, not one of the codes `REJECT_CODES` keys on (0069). An IOC or MARKET
+//!   `RejectKind::PostOnlyWouldCross` for `POST_ONLY_WOULD_CROSS`, `RejectKind::MinNotional`
+//!   for `ORDER_SIZE_BELOW_MIN` (by its code, the text before any `:`, decision 0096) and
+//!   `RejectKind::Other` for any other reason; the reason is its `raw`, and it carries no
+//!   `venue_code`: Paradex states a cancel reason, not one of the codes `REJECT_CODES` keys on
+//!   (0069). An IOC or MARKET
 //!   order closed with nothing filled is refused only for NOT_ENOUGH_MARGIN,
 //!   EXCEEDS_PRICE_BAND or ORDER_SIZE_BELOW_MIN (by the code before any `:`, decision 0093);
 //!   for any other reason but our cancel it expired past the risk check, and is passed.
@@ -278,8 +280,12 @@ fn fin(rpc: RpcId, item: ItemRef) -> ExecEvent {
 /// documentation).
 fn refused(cid: ClientOrderId, item: &ItemRef, reason: &str) -> ExecEvent {
     let target = (item.vid.clone()).map_or(OrderRef::Client(cid), |vid| OrderRef::Both(cid, vid));
-    let kind = match reason {
-        "POST_ONLY_WOULD_CROSS" => RejectKind::PostOnlyWouldCross,
+    // A reason is a code, then `: ` and a message on testnet (decision 0093); 0096 reads
+    // ORDER_SIZE_BELOW_MIN by its code.
+    let code = reason.split_once(':').map_or(reason, |(code, _)| code);
+    let kind = match (reason, code) {
+        ("POST_ONLY_WOULD_CROSS", _) => RejectKind::PostOnlyWouldCross,
+        (_, "ORDER_SIZE_BELOW_MIN") => RejectKind::MinNotional,
         _ => RejectKind::Other,
     };
     let reject = Reject {

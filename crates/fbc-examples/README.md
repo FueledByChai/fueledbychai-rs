@@ -91,12 +91,14 @@ unset PARADEX_ACCOUNT_ADDRESS PARADEX_PRIVATE_KEY
 export PARADEX_MAINNET_ACCOUNT_ADDRESS=...   # the separate mainnet account
 export PARADEX_MAINNET_PRIVATE_KEY=...       # its main L2 key
 cargo run -p fbc-examples --example testnet_quote -- --mainnet --sole-trader --namespace <N> \
-    --market BTC-USD-PERP --tick 0.1 --step 0.00001 --min-notional 10 \
-    --resting-cap-usd 11 --inventory-cap-usd 50 --order-usd 11 \
-    --bid-bps 30 --ask-bps 30 --duration 600
+    --market <MARKET> --tick <price_tick_size> --step <order_size_increment> \
+    --min-notional <min_notional> --resting-cap-usd <USD> --inventory-cap-usd <USD> \
+    --order-usd <USD> --bid-bps <N> --ask-bps <N> --duration <SECONDS>
 ```
 
-`--help` lists every flag and output line.
+Read the market's `price_tick_size`, `order_size_increment` and `min_notional` from
+`GET https://api.prod.paradex.trade/v1/markets`; the caps, the size, the offsets and the duration
+are yours, within the limits above. `--help` lists every flag and output line.
 
 ## paradex_testnet_acceptance
 
