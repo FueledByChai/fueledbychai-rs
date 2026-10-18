@@ -175,7 +175,7 @@ fn shown_chain(chain: &str) -> &str {
 pub async fn run(
     smoke: &Smoke,
     chain: Option<&str>,
-    creds: crate::positions::Creds,
+    creds: (fbc_core::Secrets, fbc_core::Secrets),
     out: Out,
     factory: &'static dyn VenueFactory,
 ) -> Result<Report, String> {

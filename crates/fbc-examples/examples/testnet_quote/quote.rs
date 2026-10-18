@@ -67,7 +67,7 @@ use std::time::{Duration, Instant};
 
 use fbc_core::{
     Bps, Channel, CidMatch, CidMint, ClientOrderId, ConnState, Lots, MarketLease, Namespace,
-    NamespaceLease, NonceScope, OpKind, OrderCaps, OrderKindTag, RejectKind, RpcId, Side,
+    NamespaceLease, NonceScope, OpKind, OrderCaps, OrderKindTag, RejectKind, RpcId, Secrets, Side,
     SignedLots, SpecTable, SubmitOutcome, Ticks, Tif, TifTag, VenueFactory,
 };
 use fbc_oms::{
@@ -85,7 +85,7 @@ use tokio::sync::Notify;
 
 use crate::args::{Options, Target, direct_to_stub, hosts, sole, testnet_guard};
 use crate::link::{Link, LinkHandler, Note, async_reject};
-use crate::positions::{Creds, PositionCheck, Verdict, fills_in};
+use crate::positions::{PositionCheck, Verdict, fills_in};
 use crate::testnet::{
     ACCOUNT_LABEL, ACCT, HighWater, INST, Lines, Out, TESTNET_CHAIN, VENUE, config, drive_with,
     inventory_price, off_thread_holding, px_or_none, resync_disagreements, session_config,
@@ -409,12 +409,12 @@ pub fn cancel_and_replace(caps: &OrderCaps) -> OrderCaps {
 /// sizing, the registry, the session and the loop, until `interrupt` completes, `--duration` or
 /// `--cycles` is reached, or anything Stops it. `chain` is `PARADEX_CHAIN_ID` when set; `creds`
 /// the account's credentials, twice: the session's, handed to its codec unread, and the position
-/// check's own login's ([`Creds`]). An error is a refusal before the session started; once it
+/// check's own login's, each moved on unread (no type here holds them). An error is a refusal before the session started; once it
 /// started the outcome is in the [`Report`].
 pub async fn run(
     opts: &Options,
     chain: Option<&str>,
-    creds: Creds,
+    creds: (Secrets, Secrets),
     out: Out,
     interrupt: impl Future<Output = ()>,
 ) -> Result<Report, String> {
@@ -540,10 +540,11 @@ pub async fn run(
         link: Rc::clone(&link),
         wake: Rc::clone(&wake),
     };
+    let (session_creds, position_creds) = creds;
     let session_cfg = session_config(
         factory,
         cfg.clone(),
-        creds.session,
+        session_creds,
         specs.clone(),
         &opts.proxy,
         opts.namespace,
@@ -552,7 +553,7 @@ pub async fn run(
     // and the session's traffic share one count (FBC-hpg6).
     let positions = PositionCheck::new(
         &cfg,
-        creds.positions,
+        position_creds,
         Connector::new(opts.proxy.clone()),
         session_cfg.limiter.clone(),
         &opts.rest_url,
@@ -783,9 +784,10 @@ impl Driver {
             why = late;
         }
         self.lines.line(format_args!("STOP {why}"));
-        let stopped = self.stop().await;
-        // GET /positions against the registry once Stop's cancels are answered, every run.
-        if let Some(failed) = self.check_at_stop().await
+        // Stop, with GET /positions compared against the registry once Stop's cancels are
+        // answered, every run, before the market is disarmed and its leases released.
+        let (stopped, compared) = self.stop().await;
+        if let Some(failed) = compared
             && asked
         {
             asked = false;
@@ -2180,9 +2182,12 @@ impl Driver {
 
     /// Stop: the kill switch, then the cancel of every order of ours on the market
     /// ([`Driver::cancel_ours`]; those not yet acknowledged once they are), each answered, and
-    /// every order of ours ended, within the step timeout; then the market is disarmed. True when
-    /// every cancel was built, sent and accepted and every order of ours ended.
-    async fn stop(&mut self) -> bool {
+    /// every order of ours ended, within the step timeout; then the comparison at Stop
+    /// ([`Driver::check_at_stop`]) while the market's lease is held, and then the market is
+    /// disarmed and its leases released. True when every cancel was built, sent and accepted
+    /// and every order of ours ended; and why the run fails when the comparison's mismatch
+    /// persists.
+    async fn stop(&mut self) -> (bool, Option<String>) {
         self.link.borrow_mut().reg().kill(INST);
         // Stop's waits are not cut short by the interrupt: it is what started them.
         self.trouble = None;
@@ -2222,6 +2227,10 @@ impl Driver {
             ok = false;
             self.note(format_args!("during Stop: {why}"));
         }
+        // The comparison while the market's lease is still held, so no other process takes
+        // the market while the run compares against its registry (Codex r4305979062 on PR
+        // #157); then the market is disarmed and its leases released at once.
+        let compared = self.check_at_stop().await;
         self.link.borrow_mut().reg().disarm(INST);
         self.lines.step(
             "stop",
@@ -2231,7 +2240,7 @@ impl Driver {
                 rpcs.len()
             ),
         );
-        ok
+        (ok, compared)
     }
 }
 

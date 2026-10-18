@@ -80,9 +80,7 @@ fn main() -> ExitCode {
     // Read twice: once for the session's codec, once for the position check's own REST login
     // (a credential set is never copied).
     let read = || auth_mainnet::paradex_mainnet_secrets(|var| std::env::var(var).ok());
-    let creds = match read()
-        .and_then(|session| read().map(|positions| positions::Creds { session, positions }))
-    {
+    let creds = match read().and_then(|session| read().map(|positions| (session, positions))) {
         Ok(creds) => creds,
         Err(e) => {
             eprintln!("mainnet_smoke: {e}");

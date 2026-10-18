@@ -85,7 +85,7 @@ use crate::args::{
     Options, OrderSide, TESTNET_CHAIN, Target, direct_to_stub, hosts, sole, testnet_guard,
 };
 use crate::link::{Link, LinkHandler, Note, async_reject};
-use crate::positions::{Creds, PositionCheck, fill_seen, fills_in};
+use crate::positions::{PositionCheck, fill_seen, fills_in};
 use crate::testnet::{
     ACCOUNT_LABEL, ACCT, INST, LOGIN_REFUSALS, Lines, REFUSAL_CAUSES, VENUE, drive_with,
     px_or_none, wall_now,
@@ -158,12 +158,12 @@ pub struct Network {
 /// Runs testnet_trade: the guard first, before anything connects; then the touch, the order,
 /// the session and the driver. `chain` is `PARADEX_CHAIN_ID` when set; `creds` the account's
 /// credentials, twice: the session's, handed to its codec unread, and the position check's own
-/// login's ([`Creds`]). An error is a refusal before the session started; once it started the
+/// login's, each moved on unread (no type here holds them). An error is a refusal before the session started; once it started the
 /// outcome is in the [`Report`].
 pub async fn run(
     opts: &Options,
     chain: Option<&str>,
-    creds: Creds,
+    creds: (Secrets, Secrets),
     out: Out,
 ) -> Result<Report, String> {
     let target = testnet_guard(&opts.rest_url, &opts.ws_url, chain)?;
@@ -205,7 +205,7 @@ pub async fn run_on(
     opts: &Options,
     net: &Network,
     cfg: VenueConfig,
-    creds: Creds,
+    creds: (Secrets, Secrets),
     lines: Lines,
 ) -> Result<Report, String> {
     sole(opts)?;
@@ -327,12 +327,13 @@ pub async fn run_on(
         mark: net.mark,
     };
     let timeout = Duration::from_secs(opts.step_timeout_secs);
-    let session_cfg = session_config(factory, cfg.clone(), creds.session, specs.clone(), opts)?;
+    let (session_creds, position_creds) = creds;
+    let session_cfg = session_config(factory, cfg.clone(), session_creds, specs.clone(), opts)?;
     // The position check reads over REST through the limiter the session charges, so its reads
     // and the session's traffic share one count (FBC-hpg6).
     let positions = PositionCheck::new(
         &cfg,
-        creds.positions,
+        position_creds,
         Connector::new(opts.proxy.clone()),
         session_cfg.limiter.clone(),
         &opts.rest_url,
@@ -1172,9 +1173,9 @@ impl Driver {
             }
             None => false,
         };
-        let stopped = self.stop().await;
-        // GET /positions against the registry once Stop's cancels are answered, every run.
-        let positions = self.check_at_stop().await;
+        // Stop, with GET /positions compared against the registry once Stop's cancels are
+        // answered, every run, before the market is disarmed and its leases released.
+        let (stopped, positions) = self.stop().await;
         let unmoved = self.inventory_unmoved();
         let cancelled = self.owned_cancelled();
         let account = self.account_unmoved();
@@ -1753,10 +1754,12 @@ impl Driver {
     /// venue acknowledged the order, so an unacknowledged order's cancel waits for that
     /// acknowledgement, built the moment it lands ([`Registry::cancels_due`]), for at most the
     /// step timeout; one still waiting then is left to cancel-on-disconnect, which the socket's
-    /// close sets off. Then the market is disarmed and its leases released. True when every
-    /// order was cancelled or ended and every cancel was built, sent and accepted: a cancel
-    /// refused by the registry or not handed to the session fails it.
-    async fn stop(&mut self) -> bool {
+    /// close sets off. Then the comparison at Stop ([`Driver::check_at_stop`]) while the
+    /// market's lease is still held, and then the market is disarmed and its leases released.
+    /// True when every order was cancelled or ended and every cancel was built, sent and
+    /// accepted: a cancel refused by the registry or not handed to the session fails it; and
+    /// true unless the comparison's mismatch persists.
+    async fn stop(&mut self) -> (bool, bool) {
         let mut refusals = Vec::new();
         let (cmds, waiting, how) = {
             let mut link = self.link.borrow_mut();
@@ -1932,6 +1935,10 @@ impl Driver {
                 }
             }
         }
+        // The comparison while the market's lease is still held, so no other process takes
+        // the market while the run compares against its registry (Codex r4305979062 on PR
+        // #157); then the market is disarmed and its leases released at once.
+        let compared = self.check_at_stop().await;
         self.link.borrow_mut().reg().disarm(INST);
         self.lines.step(
             "stop",
@@ -1941,7 +1948,7 @@ impl Driver {
                 rpcs.len()
             ),
         );
-        accepted
+        (accepted, compared)
     }
 
     /// Authorizes and submits one of Stop's cancels, adding its request to `rpcs`: false when it

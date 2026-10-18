@@ -120,8 +120,9 @@ Lines (each step with the milliseconds since the start):
   POSITION re-read ...  on a mismatch, GET /positions read once more after --step-timeout:
                      agreeing, the run goes on (GET /positions lagged the fills); still
                      differing, the run Stops at once and fails: check the position by hand
-  POSITION at Stop: ...  the same comparison once Stop's cancels are answered, on every run;
-                     a mismatch the re-read confirms fails the run
+  POSITION at Stop: ...  the same comparison once Stop's cancels are answered, on every run,
+                     before STEP stop (the market still leased); a mismatch the re-read
+                     confirms fails the run
   TIMEOUT <step>     the step did not happen in time; the sample Stops
   HALT <step>        the step was not waited for: the position check after the first fill
                      failed (POSITION re-read ... STILL DIFFER); the run Stops
