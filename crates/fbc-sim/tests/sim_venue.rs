@@ -464,6 +464,25 @@ impl Venue {
         fx
     }
 
+    /// Asks the codec for a resync at `mono` with the host's wall clock reading `wall`, and
+    /// hands what it writes to the engine.
+    fn resync_with(&mut self, mono: u64, wall: WallNs) -> Effects {
+        let mut fx = Effects::new();
+        let ctx = EncodeCtx {
+            wall,
+            mono: MonoNs(mono),
+            nonces: NonceBlock::EMPTY,
+        };
+        self.codec.resync(&ctx, &mut fx);
+        for effect in fx.as_slice() {
+            let Effect::Send { frame, .. } = effect else {
+                panic!("the codec only writes frames: {effect:?}");
+            };
+            self.engine.on_order_frame(frame.bytes()).unwrap();
+        }
+        fx
+    }
+
     /// The engine's answer frames since the last call, each decoded whole, with its due time.
     fn frames(&mut self) -> Vec<(MonoNs, Vec<ExecEvent>)> {
         let mut out = Vec::new();
@@ -4364,6 +4383,61 @@ fn a_resync_answer_from_an_earlier_connection_is_dropped_and_the_next_one_still_
         v.decode(unasked.as_bytes()),
         Err(DecodeError::Malformed("no resync asked for"))
     );
+}
+
+#[test]
+fn a_resync_answer_from_an_earlier_connection_is_told_apart_by_connection_not_wall_clock() {
+    // Codex r4308961548 on PR #162: the wall clock may repeat or step back across a
+    // reconnect, so the old connection's answer is told apart by the connection its request
+    // was asked on, never by comparing wall times. Each case: the wall time the new
+    // connection opens at, and the new resync's, against the old resync's `old_wall`.
+    let old_wall = WallNs(WALL0 + 1_000 * MS as i64);
+    let cases = [
+        // The clock repeats: the new resync names the same wall time as the old one.
+        (old_wall, old_wall),
+        // The clock steps back across the reconnect.
+        (
+            WallNs(old_wall.0 - 500 * MS as i64),
+            WallNs(old_wall.0 - 400 * MS as i64),
+        ),
+    ];
+    for (open_wall, new_wall) in cases {
+        let mut v = per_connection(true, false);
+        v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+        v.protect(ARM, 1, T0);
+        let vid = v.rest(limit(cid(), Side::Buy, 199, 1), 2, T0 + 10 * MS);
+        let old = T0 + 20 * MS;
+        assert_eq!(v.resync_with(old, old_wall).as_slice().len(), 1);
+        v.tick(old + 6 * MS);
+        v.close(old + 7 * MS);
+        v.engine.open(MonoNs(old + 9 * MS)).unwrap();
+        let mut fx = Effects::new();
+        let ctx = EncodeCtx {
+            wall: open_wall,
+            mono: MonoNs(old + 9 * MS),
+            nonces: NonceBlock::EMPTY,
+        };
+        v.codec.on_open(STREAM, &ctx, &mut fx);
+        let stale = v.engine.take_answers();
+        assert_eq!(stale.len(), 2, "{stale:?}");
+        let again = old + 10 * MS;
+        assert_eq!(v.resync_with(again, new_wall).as_slice().len(), 1);
+        // The old answer, which still shows the order the close cancelled resting: dropped.
+        assert_eq!(v.decode(&stale[0].frame), Ok(Vec::new()), "{new_wall:?}");
+        let got = v.decode(&stale[1].frame).unwrap();
+        assert!(
+            matches!(&got[..], [(_, ExecEvent::Order(o))] if o.vid.as_ref() == Some(&vid)),
+            "{got:?}"
+        );
+        // The new one is still awaited, and reads with nothing resting.
+        v.tick(again + 10 * MS);
+        let got = v.frames();
+        let begin = ExecEvent::ResyncBegin {
+            watermark: new_wall,
+        };
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].1, [begin, ExecEvent::ResyncEnd], "{new_wall:?}");
+    }
 }
 
 #[test]
