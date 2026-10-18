@@ -263,6 +263,13 @@ fn a_registry_shows_whether_it_has_a_sink_and_applies_events_the_same_either_way
     );
 }
 
+#[test]
+fn a_registry_with_a_sink_can_still_move_and_be_shared_between_threads() {
+    fn send_sync<T: Send + Sync>() {}
+    send_sync::<Registry>();
+    send_sync::<Box<dyn AuditSink>>();
+}
+
 /// Fixed cases and seed, so the check and its coverage are the same on every run and machine
 /// (decision 0037); a failure names its minimal case.
 fn config(cases: u32, seed: u64) -> ProptestConfig {

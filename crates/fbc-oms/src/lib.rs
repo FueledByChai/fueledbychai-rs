@@ -166,6 +166,15 @@
 //! `tests/held.rs`). An amend's build token names its registry, so another registry's command
 //! releases nothing ([`Registry::amend_not_submitted`]).
 //!
+//! The audit sink (decision 0005's I8, library form; `tests/audit.rs`): every raw order event
+//! [`Registry::apply_update`] receives is handed to the consumer's [`AuditSink`]
+//! ([`Registry::set_audit_sink`]) in receive order, numbered, before any of it is applied, the
+//! ones then ignored as late, stale or for a superseded venue id and those routed to no order
+//! of ours included, and its verdict follows it before the next event is received
+//! ([`AuditEntry`]); a cancel's reason is the venue's, as the event states it. Writing it to
+//! the consumer's `order_audit` table, that table's schema and the legacy status names stay
+//! with the consumer (decision 0001).
+//!
 //! The execution planner (decision 0005's one planner, decisions 0065 and 0068;
 //! `tests/planner.rs`): the consumer's [`DesiredBook`], a [`DesiredQuote`] per side and level,
 //! defined here so strategy code produces it and this crate depends on no strategy (0001). The
@@ -181,6 +190,7 @@
 //! ([`HeldReason`]); a place or amend the market's state or a cap refuses is never built
 //! ([`PlanRefusal`]).
 
+mod audit;
 mod caps;
 mod entry;
 mod gateway;
@@ -200,6 +210,7 @@ mod sweep;
 #[path = "../tests/common/mod.rs"]
 mod common;
 
+pub use audit::{AuditEntry, AuditSink};
 pub use caps::{CapRefusal, CapsConfigError, MarketCaps, MarketCapsConfig, PreTradeCaps};
 pub use entry::{
     ArmRefusal, EntryState, ExitKind, ExitRefusal, LeaseKeys, Leases, MarketEntry, StateRefusal,

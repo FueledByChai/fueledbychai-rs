@@ -14,6 +14,7 @@ use fbc_core::{
     VenueCommand, VenueOrderId,
 };
 
+use crate::audit::{Audit, AuditSink};
 use crate::caps::{Adds, CapRefusal, Exposure, PreTradeCaps};
 use crate::entry::{Admits, Entries, StateRefusal, TestnetRun};
 use crate::grant::{Counters, Guard, IssueRefusal, Watch};
@@ -69,6 +70,9 @@ pub struct Registry {
     /// The orders whose place or batch command was dropped while it held them, which the
     /// registry ends not sent at its next mutating call (decision 0084).
     dropped: Arc<DroppedPlaces>,
+    /// The consumer's audit sink and how many raw order events the registry received
+    /// (decision 0005, I8; [`Registry::set_audit_sink`]).
+    audit: Audit,
 }
 
 /// One registry among every registry the process built: drawn fresh for each.
@@ -483,7 +487,34 @@ impl Registry {
     /// non-canonical client id names none of ours. An update of an order not ours (another
     /// namespace's, a non-canonical client id, or no client id and a venue id no order of ours
     /// had) moves that order into or out of view ([`Registry::foreign_in_view`]).
+    ///
+    /// Every update is a raw order event for the audit sink (decision 0005, I8;
+    /// [`Registry::set_audit_sink`]): it reaches the sink before any of it is applied, and the
+    /// verdict this returns follows it there, whatever it is (ignored late, stale or for a
+    /// superseded venue id, or routed to no order of ours). The consumer calls this in the
+    /// order it receives the events, so the sink holds them in receive order.
     pub fn apply_update(&mut self, u: &OrderUpdate, key: OrderKey) -> Routed {
+        let seq = self.audit.received(u, key);
+        let routed = self.route_update(u, key);
+        self.audit.verdict(seq, &routed);
+        routed
+    }
+
+    /// Sets the consumer's audit sink, handing back the one it replaces (decision 0005, I8):
+    /// from now on every raw order event [`Registry::apply_update`] receives is handed to it,
+    /// in receive order and before any of it is applied, as an
+    /// [`AuditEntry::Received`](crate::AuditEntry::Received), followed by its
+    /// [`AuditEntry::Verdict`](crate::AuditEntry::Verdict) before the next event is received.
+    /// Entries are numbered by every event the registry received, the ones before a sink was
+    /// set included, so a sink set late sees how many it missed. Writing them to the
+    /// consumer's `order_audit` table and backfilling gaps from the journal are the
+    /// consumer's (decision 0001). A registry with no sink applies events the same way.
+    pub fn set_audit_sink(&mut self, sink: Box<dyn AuditSink>) -> Option<Box<dyn AuditSink>> {
+        self.audit.set(sink)
+    }
+
+    /// [`Registry::apply_update`]'s routing and application, after its receipt is audited.
+    fn route_update(&mut self, u: &OrderUpdate, key: OrderKey) -> Routed {
         self.reap_dropped();
         let cid = match u.cid {
             Some(CidMatch::Foreign(ns)) => {
