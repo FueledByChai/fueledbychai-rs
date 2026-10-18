@@ -13,9 +13,10 @@ use fbc_core::{
     ClientIdFormat, ClientOrderId, ConnTopology, Encoding, ExecCaps, Fee, FeedSource, FillCaps,
     FillEvent, FillId, FillIdent, FillSource, FundingCaps, InstrumentId, Liquidity3, Lots,
     MatchingCaps, MdCaps, Namespace, NamespaceLease, NewOrder, NonceScope, OrderCaps, OrderKind,
-    OrderKindTag, OrderUpdate, OrderingKey, Readiness, RefKind, RejectKind, Side, SnapshotSource,
-    StpScope, Support, TagSet, TerminalReject, Ticks, Tif, TifTag, TradeCaps, VenueCaps,
-    VenueFeeSign, VenueOrderId, VenueOrderState, VenueSymbol, WallNs, dispatch_market_data,
+    OrderKindTag, OrderUpdate, OrderingKey, Readiness, RefKind, RejectKind, Side, SnapshotReads,
+    SnapshotSource, StpScope, Support, TagSet, TerminalReject, Ticks, Tif, TifTag, TradeCaps,
+    VenueCaps, VenueFeeSign, VenueOrderId, VenueOrderState, VenueSymbol, WallNs,
+    dispatch_market_data,
 };
 
 /// The namespace every test client id is minted in.
@@ -171,6 +172,7 @@ pub fn order_caps() -> OrderCaps {
         nonce_scope: NonceScope::PerAccountMonotonic,
         ordering_key: OrderingKey::VenueSeq,
         snapshot_source: SnapshotSource::Trustworthy,
+        snapshot_reads: SnapshotReads::OneInstant,
         events_echo_flags: false,
         sign_cost_hint_us: 0,
     }

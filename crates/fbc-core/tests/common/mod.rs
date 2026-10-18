@@ -11,9 +11,9 @@ use fbc_core::{
     CancelOnDisconnect, Channel, Charset, ClientIdFormat, ConnTopology, Continuity, Encoding,
     ExchTsKind, ExecCaps, Feature, FeedSource, FillCaps, FillSource, FundingCaps, LimitScope,
     MatchingCaps, MdCaps, NonceScope, OpKind, OrderCaps, OrderKindTag, OrderingKey,
-    QueueModelQuality, RateLimit, Readiness, RefKind, SeqDomain, SnapshotSource, SpeedBump,
-    SpeedBumpScope, StpScope, Support, TagSet, TifTag, TouchSourceCaps, TradeCaps, VenueCaps,
-    VenueFeeSign,
+    QueueModelQuality, RateLimit, Readiness, RefKind, SeqDomain, SnapshotReads, SnapshotSource,
+    SpeedBump, SpeedBumpScope, StpScope, Support, TagSet, TifTag, TouchSourceCaps, TradeCaps,
+    VenueCaps, VenueFeeSign,
 };
 
 /// A synthetic venue that declares every capability field.
@@ -71,6 +71,7 @@ pub fn synthetic_caps() -> VenueCaps {
                 nonce_scope: NonceScope::PerAccountMonotonic,
                 ordering_key: OrderingKey::VenueSeq,
                 snapshot_source: SnapshotSource::Trustworthy,
+                snapshot_reads: SnapshotReads::OneInstant,
                 events_echo_flags: false,
                 sign_cost_hint_us: 150,
             },

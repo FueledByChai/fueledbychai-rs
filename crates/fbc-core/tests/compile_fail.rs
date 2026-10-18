@@ -48,7 +48,9 @@ fn fee_seal_does_not_compile() {
 /// or `CancelBatch` that does not say which references it can name (0032), `VenueCaps` and
 /// `InstrumentSpec` have no `default()`, and a `VenueSymbol` cannot be built outside `fbc-core`
 /// (decision 0003, design §4.4, §4.5). Order capabilities without fill capabilities, and fill
-/// capabilities without an exec block, cannot be written (decision 0015).
+/// capabilities without an exec block, cannot be written (decision 0015). Order capabilities
+/// cannot be written without saying whether a resync reads the open orders and the positions at
+/// one instant, and `SnapshotReads` has no `default()` (decision 0095).
 #[test]
 fn caps_and_specs_declare_every_field() {
     let cases = trybuild::TestCases::new();
