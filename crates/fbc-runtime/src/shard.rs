@@ -496,6 +496,8 @@ mod tests {
         Wait,
         /// Takes the command waiting in the session and waits.
         Take,
+        /// Ends the session, which takes no more commands, and waits.
+        Close,
         /// Ends.
         End,
         /// Fails.
@@ -538,6 +540,7 @@ mod tests {
                         taken.borrow_mut().push((name, queued.rpc));
                     }
                 }
+                Some(Act::Close) => shared.end(),
                 Some(Act::Wait) | None => {}
             }
             if act.is_some() {
@@ -669,6 +672,10 @@ mod tests {
             let shown = scripted_run(acts, 2).await;
             assert_eq!(shown, (want, 1, back), "{acts:?}");
         }
+        // The session ends with the command still queued, the run going on: it is handed back
+        // too, and the next, whose session has ended, with it (Codex P1 r4309207253 on PR #164).
+        let acts = [Stamp, Wait, Wait, Act::Close, Wait, Wait, End];
+        assert_eq!(scripted_run(&acts, 2).await, (Ok(()), 1, 2));
         // Between the two, an error ends it too.
         let acts = [Stamp, Wait, Wait, Take, Fail];
         let (ran, _, back) = scripted_run(&acts, 2).await;
