@@ -348,9 +348,13 @@ struct Venue {
     /// Answer the `n`th single cancel (from 1) with this JSON-RPC error code, closing nothing.
     reject_cancel: Option<(usize, i64)>,
     cancels: usize,
-    /// When each place and each single cancel came.
+    /// When each place, each single cancel and each instrument cancel-all came.
     create_times: Vec<std::time::Instant>,
     cancel_times: Vec<std::time::Instant>,
+    cancel_all_times: Vec<std::time::Instant>,
+    /// Answer the `n`th instrument cancel-all (from 1) with this JSON-RPC error code, closing
+    /// nothing.
+    reject_cancel_all: Option<(usize, i64)>,
     /// Answer the next single cancel with the order's CLOSED event only, never the reply: the
     /// venue's order stream ahead of the cancel's reply, which then never comes.
     closed_without_reply_once: bool,
@@ -778,6 +782,14 @@ fn respond(venue: &Shared, conn: usize, frame: &Frame) -> Responded {
             // order still open on the market CLOSED, each by its order event.
             if params["market"] != MARKET {
                 return Err(format!("a cancel-all not of the market: {params}"));
+            }
+            v.cancel_all_times.push(std::time::Instant::now());
+            if let Some((n, code)) = v.reject_cancel_all
+                && n == v.cancel_all_times.len()
+            {
+                let error = json!({"code": code, "message": "order.cancel_all refused"});
+                let reply = json!({"jsonrpc": "2.0", "error": error, "id": id});
+                return Ok(vec![Frame::text(reply.to_string())]);
             }
             if v.refuse_cancel_all {
                 let error = json!({"code": -32603, "message": "Internal error"});
@@ -2786,16 +2798,19 @@ fn the_planner_never_gets_an_amend_and_the_shape_is_checked_against_the_caps() {
 // ---------------------------------------------------------------------------------------------
 
 /// Paradex's factory in everything but its caps: the snapshot source it declares, and, when
-/// given, the units of the per-IP `Rest` bucket of a minute (Paradex's 600, `POST /auth`'s).
+/// given, the units of the per-IP `Rest` bucket of a minute (Paradex's 600, `POST /auth`'s) and
+/// of the per-IP connection bucket of a minute (Paradex's 600).
 struct Declared {
     source: SnapshotSource,
     rest_per_minute: Option<u32>,
+    connects_per_minute: Option<u32>,
 }
 
 /// Declares the snapshot source untrustworthy, whatever Paradex's own adapter declares.
 static UNTRUSTED: Declared = Declared {
     source: SnapshotSource::Untrustworthy,
     rest_per_minute: None,
+    connects_per_minute: None,
 };
 
 /// Paradex's caps with the per-IP `Rest` bucket at 10 a minute (9 for normal traffic, its
@@ -2803,6 +2818,15 @@ static UNTRUSTED: Declared = Declared {
 static TEN_RESTS_A_MINUTE: Declared = Declared {
     source: SnapshotSource::Trustworthy,
     rest_per_minute: Some(10),
+    connects_per_minute: None,
+};
+
+/// Paradex's caps with the per-IP connection bucket at 8 a minute (all 8 for normal traffic:
+/// 10% of 8 rounds down to none kept).
+static EIGHT_CONNECTS_A_MINUTE: Declared = Declared {
+    source: SnapshotSource::Trustworthy,
+    rest_per_minute: None,
+    connects_per_minute: Some(8),
 };
 
 impl VenueFactory for Declared {
@@ -2817,11 +2841,15 @@ impl VenueFactory for Declared {
         if let Some(exec) = caps.exec.as_mut() {
             exec.order.snapshot_source = self.source;
         }
-        if let Some(units) = self.rest_per_minute {
-            let rest = TagSet::of(&[OpKind::Rest]);
+        for (units, op) in [
+            (self.rest_per_minute, OpKind::Rest),
+            (self.connects_per_minute, OpKind::Connect),
+        ] {
+            let Some(units) = units else { continue };
+            let only = TagSet::of(&[op]);
             for limit in &mut caps.limits {
                 if limit.scope == LimitScope::Ip
-                    && limit.ops == rest
+                    && limit.ops == only
                     && limit.per == Duration::from_secs(60)
                 {
                     limit.units = units;
@@ -3677,6 +3705,9 @@ async fn an_asynchronous_order_size_below_min_stops_it_as_a_sizing_error() {
     assert!(!report.ok, "{printed}");
     assert!(report.ended.starts_with("a sizing error"), "{printed}");
     assert!(report.ended.contains("ORDER_SIZE_BELOW_MIN"), "{printed}");
+    // The adapter reads the reason into the common kind (decision 0096): the loop branches on
+    // that, never on Paradex's text (Codex r4306449948 on PR #158).
+    assert!(report.ended.contains("MinNotional"), "{printed}");
     assert_eq!(creates(&venue, 0), 2, "{printed}");
     stopped(&printed);
 }
@@ -4095,4 +4126,91 @@ async fn the_last_cycle_stops_the_loop_without_waiting_the_interval() {
     assert!(report.ok, "{printed}");
     assert_eq!(report.ended, "--cycles 1 reached", "{printed}");
     assert_eq!(report.places_sent, 2, "{printed}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Codex's review of PR #158 (head 9fc846a).
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_stop_cancel_refused_for_its_rate_is_sent_again_after_its_retry_time() {
+    // Codex r4306449947 on PR #158: Stop's instrument cancel-all is refused RateLimited. Stop
+    // used to wait out its timeout for the refused request, leaving the quotes resting until the
+    // session's teardown; it sends the cancel again once the retry time passed, and the run ends
+    // ok with every order of ours cancelled.
+    let venue = venue(vec![b0()]);
+    lock(&venue).reject_cancel_all = Some((2, 42_901));
+    // The opening six, the start's sweep, two places, Stop's refused cancel-all and its retry.
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 1 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let opts = options(&stub, 1);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(report.ok, "{printed}");
+    assert_eq!(report.cancelled, 2, "{printed}");
+    let times = lock(&venue).cancel_all_times.clone();
+    assert_eq!(times.len(), 3, "{printed}");
+    let waited = times[2].duration_since(times[1]);
+    assert!(waited >= quote::RATE_LIMITED_WAIT, "{waited:?}\n{printed}");
+    assert!(printed.contains("PACE "), "{printed}");
+    stopped(&printed);
+}
+
+#[tokio::test]
+async fn a_sweep_cancel_refused_for_its_rate_is_sent_again_after_its_retry_time() {
+    // Codex r4306449947 on PR #158: after a reconnect the sweep's instrument cancel-all is
+    // refused RateLimited while the ask (which the lagging resync did not show) still rests. The
+    // sweep used to wait out its timeout and Stop; it sends the cancel again once the retry time
+    // passed, the ask ends, and the loop quotes on the new connection.
+    let venue = venue(vec![b0()]);
+    {
+        let mut v = lock(&venue);
+        v.hide_sells_after_first = true;
+        v.reject_cancel_all = Some((2, 42_901));
+    }
+    // First connection: the opening six, the start's sweep and two places. Second: the opening
+    // six, the bid's Safety cancel, the sweep's refused cancel-all and its retry, two places,
+    // Stop's cancel-all.
+    let script = reconnecting(&venue, 6 + 1 + 2, 6 + 1 + 1 + 1 + 2 + 1);
+    let stub = StubServer::start(script, routes(&venue, login_ok()))
+        .await
+        .unwrap();
+    let opts = options(&stub, 3);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(report.ok, "{printed}");
+    assert_eq!(creates(&venue, 1), 2, "{printed}");
+    let times = lock(&venue).cancel_all_times.clone();
+    assert!(times.len() >= 3, "{printed}");
+    let waited = times[2].duration_since(times[1]);
+    assert!(waited >= quote::RATE_LIMITED_WAIT, "{waited:?}\n{printed}");
+}
+
+#[tokio::test]
+async fn the_position_checks_charge_the_connections_they_open() {
+    // Codex r4306449950 on PR #158: the position check's REST reads (its login and GET
+    // /positions, each on a connection of its own) were charged as requests but not as the
+    // connections they open. On a venue declaring 8 connections a minute, every connection the
+    // run opens (each HTTP request's and the order socket's) is charged first, so the stub
+    // never sees more than 8, whatever the run then does.
+    let venue = mainnet_venue(vec![b0()]);
+    let stub = StubServer::start(one_connection(&venue, 6), routes(&venue, login_ok()))
+        .await
+        .unwrap();
+    let mut opts = mainnet_options(&stub, 3);
+    opts.step_timeout_secs = 1;
+    let (ran, printed) =
+        run_venue_until(&EIGHT_CONNECTS_A_MINUTE, &opts, std::future::pending()).await;
+    let opened = stub.http_requests().len() + stub.connections().len();
+    assert!(
+        opened <= 8,
+        "{opened} connections: {:?} and {} order sockets\n{ran:?}\n{printed}",
+        stub.http_requests(),
+        stub.connections().len()
+    );
+    assert!(printed.contains("STEP positions"), "{printed}");
 }

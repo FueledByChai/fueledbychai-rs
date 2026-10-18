@@ -1375,6 +1375,42 @@ fn a_placement_whose_order_event_shows_it_closed_with_nothing_filled_is_rejected
     }
 }
 
+#[test]
+fn an_order_closed_unfilled_order_size_below_min_is_an_asynchronous_min_notional_refusal() {
+    // Decision 0096: Paradex's ORDER_SIZE_BELOW_MIN (the owner's 2026-10-16 testnet run: the
+    // order's notional at the MARK below the market's minimum) is the common kind MinNotional,
+    // read by its code with or without a message after `: `, so a consumer branches on the kind,
+    // never on Paradex's text (Codex r4306449948 on PR #158). Another reason stays Other.
+    for reason in [
+        "ORDER_SIZE_BELOW_MIN",
+        "ORDER_SIZE_BELOW_MIN: order size 0.09 below min notional 10 at mark 81.73",
+    ] {
+        let bytes = with_reason(
+            sbe("order-closed-margin-v2.sbe.txt"),
+            "NOT_ENOUGH_MARGIN",
+            reason,
+        );
+        let mut codec = placed();
+        let call = frame(&mut codec, RawFrame::Binary(&bytes));
+        call.result.unwrap();
+        let mut expected = vec![place_refused(RejectKind::MinNotional, reason)];
+        expected.extend(decoded(&bytes));
+        assert_eq!(call.events, expected, "{reason}");
+    }
+    let bytes = with_reason(
+        sbe("order-closed-margin-v2.sbe.txt"),
+        "NOT_ENOUGH_MARGIN",
+        "ORDER_SIZE_BELOW_MINIMUM",
+    );
+    let mut codec = placed();
+    let call = frame(&mut codec, RawFrame::Binary(&bytes));
+    call.result.unwrap();
+    assert_eq!(
+        call.events[0],
+        place_refused(RejectKind::Other, "ORDER_SIZE_BELOW_MINIMUM")
+    );
+}
+
 /// Order event `bytes` with its first string `from` (non-empty, a cancel reason or venue id)
 /// stated as `to` instead.
 fn with_reason(mut bytes: Vec<u8>, from: &str, to: &str) -> Vec<u8> {
