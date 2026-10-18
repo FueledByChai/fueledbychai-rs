@@ -118,10 +118,10 @@
 //! command twice, and a reconnect never re-sends one (0005, 0013 rule 1). A deadline that falls
 //! due while a write waits on a stalled peer is handled once the write ends, within the
 //! write-stall window. Once the session has stopped, nothing more is reported. A command
-//! submitted while the shard handles an input, on this session or another sharing its
-//! [`IngestClock`], is attributed to that input when it is written (decision 0100); the session
-//! holds a submission, for [`ShardHost`](crate::ShardHost), from its submission until the turn
-//! that takes it has written it.
+//! submitted while a handler is handed an input's events, on this session or another sharing
+//! its [`IngestClock`], is attributed to that input when it is written (decision 0100); the
+//! session holds a submission, for [`ShardHost`](crate::ShardHost), from its submission until
+//! the turn that takes it has written it.
 //!
 //! An HTTP query's deadline runs from just before its request starts, and is cleared by the
 //! call to the codec's `on_http` for it, whatever the codec pushes, as well as by an event
@@ -786,8 +786,6 @@ impl<H: ExecHandler> ExecSession<H> {
             // arriving starve no timer, result or stop, and the stop is checked after every wake
             // below whichever branch won (DeepSeek DS-1).
             let rpc_due = self.rpcs.next_deadline();
-            // No input is being handled while the session waits for the next (decision 0100).
-            self.clock.handled();
             let wake = tokio::select! {
                 frame = next_frame(&mut ws) => Wake::Frame(frame),
                 _ = sleep_or_never(self.core.next_deadline()) => Wake::Timer,
@@ -1500,8 +1498,6 @@ impl<H: ExecHandler> Control for Between<'_, H> {
     /// True when there is something to report (at once when it already waits), false once the
     /// control dropped.
     async fn changed(&mut self) -> bool {
-        // No input is being handled while the session waits (decision 0100).
-        self.clock.handled();
         let (due, waiting) = (self.rpcs.next_deadline(), self.orders.waiting());
         // What waits is taken after a yield, so a handler that submits again from
         // `on_submitted` cannot hold the task (PR #87 Reviewer B B5).
@@ -1533,6 +1529,7 @@ impl<H: ExecHandler> Control for Between<'_, H> {
                 handler: &mut *self.handler,
                 stop: &self.stop,
                 stamp,
+                clock: self.clock,
             };
             self.codec.on_rpc_timeout(rpc, &mut sink);
         }
@@ -1545,12 +1542,16 @@ struct Late<'a, H> {
     handler: &'a mut H,
     stop: &'a watch::Receiver<()>,
     stamp: Stamp,
+    /// Names the deadline's firing as the input being handled while the handler hears it.
+    clock: &'a IngestClock,
 }
 
 impl<H: ExecHandler> ExecSink for Late<'_, H> {
     fn push(&mut self, meta: VenueMeta, ev: ExecEvent) {
         if self.stop.has_changed().is_ok() {
-            self.handler.on_exec(Envelope::new(self.stamp, meta, ev));
+            let (stamp, handler) = (self.stamp, &mut *self.handler);
+            let env = Envelope::new(stamp, meta, ev);
+            self.clock.attributing(stamp, || handler.on_exec(env));
         }
     }
 }
@@ -1704,14 +1705,18 @@ impl<H: ExecHandler> ExecSink for Sink<'_, H> {
             // What the event shows of the orders resting from an earlier epoch counts as it is
             // handed over too (FBC-nvxn).
             self.orders.gate.borrow_mut().observe(epoch, &ev);
-            self.handler.on_exec(Envelope::new(self.stamp, meta, ev));
+            // While the handler hears the event, what it submits is attributed to its input
+            // (decision 0100).
+            let (stamp, orders, handler) = (self.stamp, self.orders, &mut *self.handler);
+            let clock = orders.clock();
+            clock.attributing(stamp, || handler.on_exec(Envelope::new(stamp, meta, ev)));
             // The epoch just became placing with orders unprotected: the handler is told them
             // once, unless it stopped the session as it took the event.
-            let notice = self.orders.gate.borrow_mut().notice(epoch);
+            let notice = orders.gate.borrow_mut().notice(epoch);
             if let Some(unprotected) = notice
                 && self.stop.has_changed().is_ok()
             {
-                self.handler.on_unprotected(&unprotected);
+                clock.attributing(stamp, || handler.on_unprotected(&unprotected));
             }
         }
     }
