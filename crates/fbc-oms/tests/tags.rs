@@ -602,3 +602,196 @@ fn a_verdict_carries_neither_for_an_event_routed_to_no_order_or_an_order_the_pla
     assert_eq!(reg.get(direct).unwrap().tag(), None);
     assert_eq!(reg.get(direct).unwrap().removal(), None);
 }
+
+/// Bid level 1's order filled to `filled` lots while it rests: a fill as the venue reports it.
+fn filled(c: ClientOrderId, filled: i64) -> OrderUpdate {
+    OrderUpdate {
+        cum_filled: lots(filled),
+        ..update(c, Side::Buy, &venue_id(Side::Buy, 1), VenueOrderState::Open)
+    }
+}
+
+/// The book of `three_levels` with bid level 1 removed under its side's reason.
+fn bid1_removed() -> DesiredBook {
+    DesiredBook::new(INST)
+        .with(Side::Buy, 0, quote(10_000, 5, BID_TAG))
+        .with(Side::Sell, 0, quote(10_010, 5, ASK_TAG))
+        .with_removal(Side::Buy, Some(BID_GONE))
+}
+
+/// A cancel of `c` sent under `rpc`, answered with `outcome`.
+fn cancel_answered(reg: &mut Registry, c: ClientOrderId, rpc: RpcId, outcome: SubmitOutcome) {
+    let item = ItemRef {
+        idx: 0,
+        cid: None,
+        vid: Some(vid(&venue_id(Side::Buy, 1))),
+    };
+    reg.on_outcome(c, OrderOp::Cancel(rpc), &item, &outcome, LATER)
+        .unwrap();
+}
+
+#[test]
+fn a_removal_cancel_refused_leaves_no_reason_on_the_order_its_later_fills_or_its_amend() {
+    // RB163-1 on PR #163: a removal cancel the venue refuses ends no order. While it is in
+    // flight a fill races it under its reason; once refused, the order rests with no cancel
+    // and no reason, and its fills after, an amend under a new tag included, carry none.
+    let mut reg = quoting(WIDE, 0);
+    let sink = Verdicts::default();
+    reg.set_audit_sink(Box::new(sink.clone()));
+    let mut mint = mint();
+    let mut p = planner();
+    open_book(&mut p, &three_levels(), &mut reg, &amending(), &mut mint);
+    let bid1 = p.order_at(ACCT, INST, Side::Buy, 1).unwrap();
+    let plan = plan_and_send(
+        &mut p,
+        &bid1_removed(),
+        &mut reg,
+        &amending(),
+        &mut mint,
+        LATER,
+    );
+    assert_eq!(
+        shape(&plan),
+        vec![(
+            Stage::Cancel,
+            "cancel",
+            Side::Buy,
+            1,
+            BID1_TAG,
+            Some(BID_GONE)
+        )]
+    );
+    // Wanted again while the cancel is in flight: the order is held, its reason kept, and a
+    // fill racing the cancel carries it.
+    let again = plan_and_send(
+        &mut p,
+        &three_levels(),
+        &mut reg,
+        &amending(),
+        &mut mint,
+        LATER,
+    );
+    assert!(again.commands.is_empty(), "{:?}", shape(&again));
+    assert_eq!(reg.get(bid1).unwrap().removal(), Some(BID_GONE));
+    sink.take();
+    reg.apply_update(&filled(bid1, 1), key(20));
+    let race = sink.take();
+    assert_eq!(
+        (race[0].tag, race[0].removal),
+        (Some(BID1_TAG), Some(BID_GONE))
+    );
+
+    let refused = SubmitOutcome::Rejected(fbc_core::Reject {
+        kind: fbc_core::RejectKind::RateLimited { retry_after: None },
+        venue_code: None,
+        raw: "refused".into(),
+    });
+    cancel_answered(&mut reg, bid1, RpcId(1_000), refused);
+    assert_eq!(reg.get(bid1).unwrap().removal(), None);
+    reg.apply_update(&filled(bid1, 2), key(21));
+    let after = sink.take();
+    assert_eq!((after[0].tag, after[0].removal), (Some(BID1_TAG), None));
+
+    // Wanted again under a new tag at a new price: amended, and its fills carry the new tag
+    // and no reason.
+    let moved = three_levels().with(Side::Buy, 1, quote(9_985, 5, REPRICED_TAG));
+    let plan = plan_and_send(&mut p, &moved, &mut reg, &amending(), &mut mint, LATER);
+    assert_eq!(
+        shape(&plan),
+        vec![(Stage::Amend, "amend", Side::Buy, 1, REPRICED_TAG, None)]
+    );
+    reg.apply_update(&filled(bid1, 3), key(22));
+    let amended = sink.take();
+    assert_eq!(
+        (amended[0].tag, amended[0].removal),
+        (Some(REPRICED_TAG), None)
+    );
+}
+
+#[test]
+fn a_removal_cancel_not_sent_leaves_no_reason_on_the_order_or_its_later_fills() {
+    let mut reg = quoting(WIDE, 0);
+    let sink = Verdicts::default();
+    reg.set_audit_sink(Box::new(sink.clone()));
+    let mut mint = mint();
+    let mut p = planner();
+    open_book(&mut p, &three_levels(), &mut reg, &amending(), &mut mint);
+    let bid1 = p.order_at(ACCT, INST, Side::Buy, 1).unwrap();
+    plan_and_send(
+        &mut p,
+        &bid1_removed(),
+        &mut reg,
+        &amending(),
+        &mut mint,
+        LATER,
+    );
+    assert_eq!(reg.get(bid1).unwrap().removal(), Some(BID_GONE));
+    let not_sent = SubmitOutcome::NotSent(fbc_core::NotSentReason::Disconnected);
+    cancel_answered(&mut reg, bid1, RpcId(1_000), not_sent);
+    assert_eq!(reg.get(bid1).unwrap().removal(), None);
+    // Wanted again where it rests: nothing to build, and its fills carry no reason.
+    let again = plan_and_send(
+        &mut p,
+        &three_levels(),
+        &mut reg,
+        &amending(),
+        &mut mint,
+        LATER,
+    );
+    assert!(again.commands.is_empty(), "{:?}", shape(&again));
+    sink.take();
+    reg.apply_update(&filled(bid1, 1), key(20));
+    let seen = sink.take();
+    assert_eq!((seen[0].tag, seen[0].removal), (Some(BID1_TAG), None));
+}
+
+#[test]
+fn a_removal_cancel_dropped_unspent_leaves_no_reason_once_the_level_is_wanted_again() {
+    // A cancel built and never reported sent is no cancel (0065 rule 7): once a pass wants
+    // the level again where the order rests, the order keeps no reason, and its fills carry
+    // none.
+    let mut reg = quoting(WIDE, 0);
+    let sink = Verdicts::default();
+    reg.set_audit_sink(Box::new(sink.clone()));
+    let mut mint = mint();
+    let mut p = planner();
+    open_book(&mut p, &three_levels(), &mut reg, &amending(), &mut mint);
+    let bid1 = p.order_at(ACCT, INST, Side::Buy, 1).unwrap();
+    let plan = p
+        .plan(
+            &bid1_removed(),
+            &mut reg,
+            &amending(),
+            ACCT,
+            &mut mint,
+            LATER,
+        )
+        .unwrap();
+    assert_eq!(
+        shape(&plan),
+        vec![(
+            Stage::Cancel,
+            "cancel",
+            Side::Buy,
+            1,
+            BID1_TAG,
+            Some(BID_GONE)
+        )]
+    );
+    drop(plan);
+    assert_eq!(reg.get(bid1).unwrap().removal(), Some(BID_GONE));
+    let again = plan_and_send(
+        &mut p,
+        &three_levels(),
+        &mut reg,
+        &amending(),
+        &mut mint,
+        LATER,
+    );
+    assert!(again.commands.is_empty(), "{:?}", shape(&again));
+    assert_eq!(reg.get(bid1).unwrap().removal(), None);
+    sink.take();
+    reg.apply_update(&filled(bid1, 1), key(20));
+    let seen = sink.take();
+    assert_eq!((seen[0].tag, seen[0].removal), (Some(BID1_TAG), None));
+}
