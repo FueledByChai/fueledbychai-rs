@@ -19,10 +19,18 @@
 mod args;
 #[path = "../../src/auth.rs"]
 mod auth;
+// The position check's REST reads (a review path, used unchanged): it uses a part of it.
+#[allow(dead_code)]
+#[path = "../../src/auth_rest.rs"]
+mod auth_rest;
 // Shared by the samples that trade: each uses a part of it.
 #[allow(dead_code)]
 #[path = "../../src/link.rs"]
 mod link;
+// Shared by the samples that can fill: each uses a part of it.
+#[allow(dead_code)]
+#[path = "../../src/positions.rs"]
+mod positions;
 // Shared by the samples that trade: each uses a part of it.
 #[allow(dead_code)]
 #[path = "../../src/testnet.rs"]
@@ -55,7 +63,12 @@ fn main() -> ExitCode {
         eprintln!("testnet_trade: {e}");
         return ExitCode::from(2);
     }
-    let creds = match auth::paradex_secrets(|var| std::env::var(var).ok()) {
+    // Read twice: once for the session's codec, once for the position check's own REST login
+    // (a credential set is never copied).
+    let read = || auth::paradex_secrets(|var| std::env::var(var).ok());
+    let creds = match read()
+        .and_then(|session| read().map(|positions| positions::Creds { session, positions }))
+    {
         Ok(creds) => creds,
         Err(e) => {
             eprintln!("testnet_trade: {e}");

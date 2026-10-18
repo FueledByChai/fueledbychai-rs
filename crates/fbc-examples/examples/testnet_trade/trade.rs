@@ -45,12 +45,21 @@
 //! standard output never blocks the one-thread runtime the session, the timeouts and the
 //! cancels run on.
 //!
+//! **The position check** (FBC-hpg6, the owner's condition in decision 0094: positions follow
+//! fills). After the first fill the session sees, the run reads `GET /positions` and compares the
+//! market's size with the registry's position, exactly in lots ([`PositionCheck`]); a mismatch is
+//! read once more after the step timeout, both readings printed, and one the re-read clears lets
+//! the run go on, while one that persists Stops it at once (no step waits on, so nothing is
+//! placed after) and fails it, saying to check the position by hand. At Stop, once Stop's cancels
+//! are answered, the comparison runs again on every run, fills or not; a mismatch that persists
+//! there fails the run with both readings.
+//!
 //! **What is not built here.** No order query on the Unknown ladder yet (FBC-m8vm): an order
 //! whose acknowledgement times out is `Unknown`, and Stop's cancel of every order of ours on the
 //! market, by client id, is what ends it. No instrument discovery (FBC-l5o): the tick, size step
 //! and minimum notional come from the command line.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -65,7 +74,7 @@ use fbc_oms::{
     MarketCapsConfig, OrdState, PreTradeCaps, Registry, ResyncSnapshot, Routed, TerminalKind,
     TestnetRun,
 };
-use fbc_runtime::{ExecControl, ExecOrders, ExecSession};
+use fbc_runtime::{Connector, ExecControl, ExecOrders, ExecSession};
 use fbc_venue_paradex::ParadexFactory;
 use fbc_venue_paradex::md::rest::OrderbookSnapshot;
 use rust_decimal::Decimal;
@@ -76,6 +85,7 @@ use crate::args::{
     Options, OrderSide, TESTNET_CHAIN, Target, direct_to_stub, hosts, sole, testnet_guard,
 };
 use crate::link::{Link, LinkHandler, Note, async_reject};
+use crate::positions::{Creds, PositionCheck, fill_seen, fills_in};
 use crate::testnet::{
     ACCOUNT_LABEL, ACCT, INST, LOGIN_REFUSALS, Lines, REFUSAL_CAUSES, VENUE, drive_with,
     px_or_none, wall_now,
@@ -147,12 +157,13 @@ pub struct Network {
 
 /// Runs testnet_trade: the guard first, before anything connects; then the touch, the order,
 /// the session and the driver. `chain` is `PARADEX_CHAIN_ID` when set; `creds` the account's
-/// credentials, handed to the session's codec unread. An error is a refusal before the session
-/// started; once it started the outcome is in the [`Report`].
+/// credentials, twice: the session's, handed to its codec unread, and the position check's own
+/// login's ([`Creds`]). An error is a refusal before the session started; once it started the
+/// outcome is in the [`Report`].
 pub async fn run(
     opts: &Options,
     chain: Option<&str>,
-    creds: Secrets,
+    creds: Creds,
     out: Out,
 ) -> Result<Report, String> {
     let target = testnet_guard(&opts.rest_url, &opts.ws_url, chain)?;
@@ -194,7 +205,7 @@ pub async fn run_on(
     opts: &Options,
     net: &Network,
     cfg: VenueConfig,
-    creds: Secrets,
+    creds: Creds,
     lines: Lines,
 ) -> Result<Report, String> {
     sole(opts)?;
@@ -233,12 +244,13 @@ pub async fn run_on(
 
     // The registry: caps, the testnet-run declaration (decision 0067) when the run is one, then
     // the lease names.
-    let order_caps = factory
-        .caps(&cfg)
-        .map_err(|e| e.to_string())?
+    let venue_caps = factory.caps(&cfg).map_err(|e| e.to_string())?;
+    let order_caps = venue_caps
         .exec
+        .as_ref()
         .ok_or("Paradex declares no order entry")?
-        .order;
+        .order
+        .clone();
     let symbol = specs
         .get(INST)
         .expect("the one market")
@@ -314,7 +326,20 @@ pub async fn run_on(
         inventory: order.inventory,
         mark: net.mark,
     };
-    let session_cfg = session_config(factory, cfg, creds, specs, opts)?;
+    let timeout = Duration::from_secs(opts.step_timeout_secs);
+    let session_cfg = session_config(factory, cfg.clone(), creds.session, specs.clone(), opts)?;
+    // The position check reads over REST through the limiter the session charges, so its reads
+    // and the session's traffic share one count (FBC-hpg6).
+    let positions = PositionCheck::new(
+        &cfg,
+        creds.positions,
+        Connector::new(opts.proxy.clone()),
+        session_cfg.limiter.clone(),
+        &opts.rest_url,
+        specs,
+        venue_caps,
+        timeout,
+    )?;
     let (mut session, control) =
         ExecSession::new(session_cfg, handler).map_err(|e| format!("session: {e}"))?;
     // Where the link's Safety cancels of unprotected orders go (decision 0080).
@@ -324,7 +349,7 @@ pub async fn run_on(
         wake,
         orders: session.orders(),
         lines: lines.clone(),
-        timeout: Duration::from_secs(opts.step_timeout_secs),
+        timeout,
         hold: Duration::from_secs(opts.hold_secs),
         hwm,
         told: std::cell::Cell::new(0),
@@ -334,6 +359,10 @@ pub async fn run_on(
         mint: None,
         owner_assisted: net.owner_assisted,
         refusal_causes: net.refusal_causes,
+        positions: Cell::new(Some(positions)),
+        fill_checked: Cell::new(false),
+        halt: RefCell::new(None),
+        stopping: Cell::new(false),
     };
     let order = Planned {
         side: match opts.side {
@@ -926,6 +955,16 @@ struct Driver {
     owner_assisted: bool,
     /// [`Network::refusal_causes`].
     refusal_causes: &'static str,
+    /// The position check (module documentation), lent out while it reads.
+    positions: Cell<Option<PositionCheck>>,
+    /// Whether the check after the first fill has run.
+    fill_checked: Cell<bool>,
+    /// Why the run must Stop at once: a mismatch after the first fill that the re-read
+    /// confirmed. Every step's wait then ends, so nothing is placed after it.
+    halt: RefCell<Option<String>>,
+    /// Stop has begun: its waits are not cut short, and the check after the first fill is left
+    /// to Stop's own comparison.
+    stopping: Cell<bool>,
 }
 
 impl Driver {
@@ -934,17 +973,29 @@ impl Driver {
         self.wait_for(self.timeout, found).await
     }
 
-    /// Waits until `found` finds what it looks for in the link, or `within` passes.
+    /// Waits until `found` finds what it looks for in the link, or `within` passes. Outside
+    /// Stop, the first fill the session sees is checked against `GET /positions` first
+    /// ([`Driver::check_after_first_fill`]); a mismatch that persists ends the wait at once
+    /// (`None`, the run's halt set), so no step goes on to place.
     async fn wait_for<T>(
         &self,
         within: Duration,
         mut found: impl FnMut(&mut Link) -> Option<T>,
     ) -> Option<T> {
-        let deadline = tokio::time::Instant::now() + within;
+        let mut deadline = tokio::time::Instant::now() + within;
         loop {
             // Created before the check, so a wake between the check and the await is kept.
             let woken = self.wake.notified();
             self.tell();
+            if self.check_after_first_fill().await {
+                // The check's reads (and a re-read's wait) are not the step's: its time starts
+                // again, and what came in meanwhile is read first.
+                deadline = tokio::time::Instant::now() + within;
+                continue;
+            }
+            if self.halted() {
+                return None;
+            }
             if let Some(t) = found(&mut self.link.borrow_mut()) {
                 return Some(t);
             }
@@ -1006,8 +1057,83 @@ impl Driver {
         }
     }
 
+    /// Whether a persisting mismatch after the first fill halts the run's steps (never Stop's).
+    fn halted(&self) -> bool {
+        !self.stopping.get() && self.halt.borrow().is_some()
+    }
+
+    /// The check after the first fill (module documentation), once, outside Stop and once the
+    /// market's position is known: true when it ran. A mismatch the re-read confirms sets the
+    /// run's halt.
+    async fn check_after_first_fill(&self) -> bool {
+        if self.stopping.get() || self.fill_checked.get() {
+            return false;
+        }
+        let due = {
+            let link = self.link.borrow();
+            fill_seen(link.notes()) && link.registry().position_known(INST)
+        };
+        if !due {
+            return false;
+        }
+        self.fill_checked.set(true);
+        let Some(mut check) = self.positions.take() else {
+            return false;
+        };
+        let when = "after the first fill";
+        let verdict = check.check(when, &self.lines, self.registry_now()).await;
+        self.positions.set(Some(check));
+        if let Some(why) = verdict.failure(when) {
+            self.halt.replace(Some(why));
+        }
+        true
+    }
+
+    /// The registry's position on the market and the fills of ours applied, read when called.
+    fn registry_now(&self) -> impl Fn() -> (SignedLots, usize) + use<> {
+        let link = Rc::clone(&self.link);
+        move || {
+            let link = link.borrow();
+            (link.registry().inventory(INST), fills_in(link.notes()))
+        }
+    }
+
+    /// The comparison at Stop (module documentation), once Stop's cancels are answered: true
+    /// unless a mismatch persists. A market whose position no resync seeded has nothing to
+    /// compare.
+    async fn check_at_stop(&self) -> bool {
+        let when = "at Stop";
+        if !self.link.borrow().registry().position_known(INST) {
+            self.lines.line(format_args!(
+                "POSITION {when}: the registry holds no position on the market (no resync seeded \
+                 it): nothing to compare"
+            ));
+            return true;
+        }
+        let Some(mut check) = self.positions.take() else {
+            return true;
+        };
+        let verdict = check.check(when, &self.lines, self.registry_now()).await;
+        self.positions.set(Some(check));
+        match verdict.failure(when) {
+            Some(why) => {
+                self.note(format_args!("{why}"));
+                false
+            }
+            None => true,
+        }
+    }
+
     fn timed_out(&self, step: &str, what: &str) {
         let ms = self.lines.t0.elapsed().as_millis();
+        if self.halted() {
+            // The wait ended on the position check, not the step's time.
+            self.lines.line(format_args!(
+                "HALT {step} +{ms}ms  not waited for: the position check after the first fill \
+                 failed; stopping"
+            ));
+            return;
+        }
         self.lines.line(format_args!(
             "TIMEOUT {step} +{ms}ms  {what} did not happen within {} s; stopping",
             self.timeout.as_secs()
@@ -1038,12 +1164,22 @@ impl Driver {
         let ok = self.steps(order, ns_lease, persisted, leases).await;
         // What came in since the last wait (a connection's end, say) before Stop's lines.
         self.tell();
+        self.stopping.set(true);
+        let halted = match self.halt.borrow_mut().take() {
+            Some(why) => {
+                self.note(format_args!("{why}"));
+                true
+            }
+            None => false,
+        };
         let stopped = self.stop().await;
+        // GET /positions against the registry once Stop's cancels are answered, every run.
+        let positions = self.check_at_stop().await;
         let unmoved = self.inventory_unmoved();
         let cancelled = self.owned_cancelled();
         let account = self.account_unmoved();
         drop(control);
-        ok && stopped && unmoved && cancelled && account
+        ok && !halted && stopped && positions && unmoved && cancelled && account
     }
 
     /// True when every order of ours on the market ended cancelled: one still open, or ended
@@ -1583,9 +1719,11 @@ impl Driver {
             }
             None => {
                 self.timed_out("closed", "the order event reporting the order ended");
-                self.note(format_args!(
-                    "Stop's cancel of every order of ours on the market names it again"
-                ));
+                if !self.halted() {
+                    self.note(format_args!(
+                        "Stop's cancel of every order of ours on the market names it again"
+                    ));
+                }
                 false
             }
         }

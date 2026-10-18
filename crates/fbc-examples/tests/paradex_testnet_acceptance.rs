@@ -36,6 +36,10 @@ mod evidence;
 #[allow(dead_code)]
 #[path = "../src/link.rs"]
 mod link;
+// testnet_trade's round trip, reused by path, holds the position check: unused here.
+#[allow(dead_code)]
+#[path = "../src/positions.rs"]
+mod positions;
 #[allow(dead_code)]
 #[path = "../src/testnet.rs"]
 mod testnet;

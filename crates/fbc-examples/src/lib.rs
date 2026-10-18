@@ -40,4 +40,7 @@
 //!
 //! The samples that trade share, by path as well, `src/link.rs` (the ExecHandler-to-Registry
 //! glue) and `src/testnet.rs` (the testnet guard, the market's spec, the session's wiring, the
-//! client-id high-water mark); neither is a module of this library target.
+//! client-id high-water mark); `testnet_trade` (and so `mainnet_smoke`) and `testnet_quote` also
+//! share `src/positions.rs` (FBC-hpg6: `GET /positions` compared with the registry's position
+//! after the first fill and at Stop, a mismatch the re-read confirms Stopping the run), which
+//! reads through `src/auth_rest.rs`; none is a module of this library target.

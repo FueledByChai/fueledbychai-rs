@@ -114,15 +114,26 @@ Lines (each step with the milliseconds since the start):
   STEP cancel-ack    Paradex answered the cancel (provisional: queued for cancellation)
   STEP closed        the order event reporting the order cancelled, nothing of it filled
   STEP stop          kill switch on, cancel all sent for what is still open, session closed
+  POSITION after the first fill: ...  GET /positions read after the first fill the session
+                     sees, the market's size compared with the registry's position in lots
+                     (with the time since the start and the fills applied)
+  POSITION re-read ...  on a mismatch, GET /positions read once more after --step-timeout:
+                     agreeing, the run goes on (GET /positions lagged the fills); still
+                     differing, the run Stops at once and fails: check the position by hand
+  POSITION at Stop: ...  the same comparison once Stop's cancels are answered, on every run;
+                     a mismatch the re-read confirms fails the run
   TIMEOUT <step>     the step did not happen in time; the sample Stops
+  HALT <step>        the step was not waited for: the position check after the first fill
+                     failed (POSITION re-read ... STILL DIFFER); the run Stops
   NOTE ...           something worth knowing (an unexpected event, a refusal, why a
                      connection of the order socket ended)
   NOTE login refused N times: ...  the last refusal; the run stops
   DONE ok|failed     the outcome; ok only when every step happened, every order of ours
                      on the market ended cancelled with nothing filled during the run, every
                      Stop cancel was sent and accepted, the inventory did not move, no fill
-                     not of our orders or position change came in, and no order not ours
-                     came into view; the exit status is 0 only for ok
+                     not of our orders or position change came in, no order not ours came
+                     into view, and GET /positions agreed with the registry (POSITION); the
+                     exit status is 0 only for ok
 
 Ctrl-C aborts at once: the socket closes and Paradex's cancel-on-disconnect cancels the order.
 ";
