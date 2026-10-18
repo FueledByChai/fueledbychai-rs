@@ -283,8 +283,9 @@ pub struct Planned {
     /// The order the command is for.
     pub cid: ClientOrderId,
     /// The consumer's tag: a place's or an amend's is its level's [`DesiredQuote::tag`]; a
-    /// cancel's is the order's, from the last place or amend built for it (0098).
-    pub tag: u16,
+    /// cancel's is the order's, from the last place or amend built for it (0098), `None` for an
+    /// order the planner did not tag, so a cancel of one is still built (Stop included).
+    pub tag: Option<u16>,
     /// A cancel's removal reason: its side's [`DesiredBook::removal`] when the book no longer
     /// wants the level; `None` for a place, an amend, and a cancel of a level still wanted.
     pub removal: Option<u16>,
@@ -628,7 +629,6 @@ impl ExecutionPlanner {
                                 rec.set_removal(removal);
                                 rec.tag()
                             });
-                            let tag = tag.expect("the planner tags every order it places");
                             Ok((cid, cmd, tag, removal))
                         }
                         CancelChoice::AwaitAck => {
@@ -656,7 +656,7 @@ impl ExecutionPlanner {
                             slot.changed_at = now;
                         }
                         reg.with_record(cid, |rec| rec.set_tag(tag));
-                        (cid, cmd, tag, None)
+                        (cid, cmd, Some(tag), None)
                     }),
                 Action::Place(q) => mint
                     .mint()
@@ -677,7 +677,7 @@ impl ExecutionPlanner {
                             },
                         );
                         reg.with_record(cid, |rec| rec.set_tag(q.tag));
-                        (cid, cmd, q.tag, None)
+                        (cid, cmd, Some(q.tag), None)
                     }),
             };
             match built {
