@@ -43,7 +43,7 @@ mod quote;
 #[path = "../src/testnet.rs"]
 mod testnet;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
@@ -317,6 +317,13 @@ struct Venue {
     /// before [`Venue::position`] is answered again: `None` flat, `Some` a long of that size
     /// (FBC-hpg6: the position check's reads after the first fill and at Stop).
     positions_script: VecDeque<Option<&'static str>>,
+    /// Notified at this `GET /positions` read (from 1; the first is the resync's).
+    positions_signal: Option<(usize, Arc<Notify>)>,
+    /// How many `GET /orderbook` reads were answered when each `GET /positions` read came, and
+    /// when each place came: which touch a place was priced from, against the position check's
+    /// reads (RA157-2 / RB157-1 on PR #157).
+    books_at_positions: Vec<usize>,
+    books_at_create: Vec<usize>,
     /// Answer the next single cancel ALREADY_CLOSED, with no order event.
     already_closed_once: bool,
     /// Answer the next single cancel of a buy queued, then fill the buy whole (its fill event
@@ -402,6 +409,13 @@ fn routes(venue: &Shared, login: HttpReply) -> HttpRouter {
             move |_| {
                 let mut v = lock(&positions);
                 v.positions_reads += 1;
+                let books = v.book_reads;
+                v.books_at_positions.push(books);
+                if let Some((n, signal)) = &v.positions_signal
+                    && v.positions_reads == *n
+                {
+                    signal.notify_one();
+                }
                 let later = v.positions_reads > 1;
                 let scripted = if later {
                     v.positions_script.pop_front()
@@ -487,6 +501,8 @@ fn responder(venue: &Shared, conn: usize) -> Responder {
                 });
                 v.orders.push(held);
                 v.creates += 1;
+                let books = v.book_reads;
+                v.books_at_create.push(books);
                 let mut frames = vec![ok(json!({ "order": order }))];
                 if let Some((n, size)) = v.position_after_create
                     && n == v.creates
@@ -1354,11 +1370,26 @@ async fn fill_run(
     timeout: u64,
     frames: usize,
 ) -> (quote::Report, String, Vec<String>) {
+    let (report, printed, venue) =
+        fill_run_until(script, timeout, frames, None, std::future::pending()).await;
+    (report, printed, methods(&venue, 0))
+}
+
+/// [`fill_run`]'s run, with `signal` notified at that `GET /positions` read and the run
+/// interrupted when `interrupt` completes: its report, what it printed, and the stub venue.
+async fn fill_run_until(
+    script: Vec<Option<&'static str>>,
+    timeout: u64,
+    frames: usize,
+    signal: Option<(usize, Arc<Notify>)>,
+    interrupt: impl std::future::Future<Output = ()>,
+) -> (quote::Report, String, Shared) {
     let venue = venue(vec![b0(), b0(), book(2, Some("80000.0"), Some("80000.2"))]);
     {
         let mut v = lock(&venue);
         v.fill_next_buy_cancel = true;
         v.positions_script = script.into();
+        v.positions_signal = signal;
     }
     let stub = StubServer::start(one_connection(&venue, frames), routes(&venue, login_ok()))
         .await
@@ -1367,12 +1398,12 @@ async fn fill_run(
     opts.order_usd = dec("8");
     opts.inventory_cap_usd = dec("16");
     opts.step_timeout_secs = timeout;
-    let (report, printed) = run_against(&opts).await;
+    let (report, printed) = run_until(&opts, interrupt).await;
     tokio::time::timeout(Duration::from_secs(30), stub.finished())
         .await
         .unwrap_or_else(|_| panic!("the stub's script did not play to its end:\n{printed}"))
         .unwrap();
-    (report, printed, methods(&venue, 0))
+    (report, printed, venue)
 }
 
 /// The opening six, the start's sweep, two places, the two replace cancels (the bid's raced by
@@ -1507,6 +1538,99 @@ async fn a_mismatch_after_the_first_fill_that_persists_stops_it_with_no_place_af
     assert!(printed.contains("POSITION re-read at Stop: +"), "{printed}");
     assert!(printed.contains("DONE failed"), "{printed}");
     assert_eq!(report.inventory, 12, "{printed}");
+}
+
+#[tokio::test]
+async fn after_a_position_check_the_pass_reads_a_fresh_touch_before_it_places() {
+    // RA157-2 / RB157-1 on PR #157: the check after the first fill takes at least one REST
+    // read (and, on a mismatch, a re-read after the step timeout) while the touch the pass holds
+    // ages. The ask placed after the check must be priced from a GET /orderbook read after the
+    // check's last read, never from one read before it: both for a check that agrees at once
+    // and for a mismatch the re-read clears.
+    for (script, last_check_read) in [(Vec::new(), 1), (vec![None], 2)] {
+        let (report, printed, venue) =
+            fill_run_until(script, 2, GOES_ON, None, std::future::pending()).await;
+        assert!(report.ok, "{printed}");
+        let v = lock(&venue);
+        // The resync's read, the check's read(s), the Stop comparison's.
+        assert_eq!(
+            v.books_at_positions.len(),
+            last_check_read + 2,
+            "{:?}\n{printed}",
+            v.books_at_positions
+        );
+        assert_eq!(v.books_at_create.len(), 3, "{:?}", v.books_at_create);
+        let checked_at = v.books_at_positions[last_check_read];
+        let priced_at = v.books_at_create[2];
+        assert!(
+            priced_at > checked_at,
+            "the place after the check was priced from a touch read before it (books at the \
+             positions reads {:?}, at the places {:?}):\n{printed}",
+            v.books_at_positions,
+            v.books_at_create
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_interrupt_during_the_position_check_stops_it_at_once() {
+    // RA157-1 / RB157-2 on PR #157: the check after the first fill disagrees (GET /positions
+    // still flat), so its re-read is a step timeout (10 s) away; the interrupt comes as that
+    // first read is answered. The loop Stops at once, without waiting out the re-read, places
+    // nothing after the fill, and the Stop comparison (GET /positions now following the fill)
+    // agrees.
+    let signal = Arc::new(Notify::new());
+    let came: Rc<Cell<Option<std::time::Instant>>> = Rc::new(Cell::new(None));
+    let interrupt = {
+        let (signal, came) = (Arc::clone(&signal), Rc::clone(&came));
+        async move {
+            signal.notified().await;
+            came.set(Some(std::time::Instant::now()));
+        }
+    };
+    // The opening six, the start's sweep, two places, the two replace cancels and Stop's
+    // cancel-all: the ask is not placed again.
+    let (report, printed, venue) = fill_run_until(
+        vec![None],
+        10,
+        6 + 1 + 2 + 2 + 1,
+        Some((2, signal)),
+        interrupt,
+    )
+    .await;
+    let ended = std::time::Instant::now();
+    let came = came
+        .get()
+        .unwrap_or_else(|| panic!("no interrupt:\n{printed}"));
+    assert!(
+        ended.duration_since(came) < Duration::from_secs(4),
+        "the interrupt waited {:?} for the position check:\n{printed}",
+        ended.duration_since(came)
+    );
+    assert_eq!(report.ended, "interrupted (Ctrl-C)", "{printed}");
+    assert!(report.ok, "{printed}");
+    assert!(
+        !printed.contains("POSITION re-read after the first fill"),
+        "{printed}"
+    );
+    let sent = methods(&venue, 0);
+    assert_eq!(
+        sent.iter().filter(|m| *m == "order.create").count(),
+        2,
+        "placed after the interrupt: {sent:?}\n{printed}"
+    );
+    assert_eq!(sent.last().map(String::as_str), Some("order.cancel_all"));
+    let at_stop = printed
+        .find("POSITION at Stop: +")
+        .unwrap_or_else(|| panic!("no Stop comparison:\n{printed}"));
+    assert!(
+        printed[at_stop..]
+            .lines()
+            .next()
+            .unwrap()
+            .contains("GET /positions 12 lots, the registry 12 lots (1 fills applied): they agree"),
+        "{printed}"
+    );
 }
 
 #[tokio::test]
