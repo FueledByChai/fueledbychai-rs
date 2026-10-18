@@ -324,6 +324,10 @@ struct Venue {
     /// reads (RA157-2 / RB157-1 on PR #157).
     books_at_positions: Vec<usize>,
     books_at_create: Vec<usize>,
+    /// The lease directory whose market lease is tried at each `GET /positions` read, and
+    /// whether it was held then (Codex r4305979062 on PR #157).
+    lease_probe: Option<PathBuf>,
+    lease_held: Vec<bool>,
     /// Answer the next single cancel ALREADY_CLOSED, with no order event.
     already_closed_once: bool,
     /// Answer the next single cancel of a buy queued, then fill the buy whole (its fill event
@@ -362,6 +366,23 @@ fn reply(status: u16, body: impl Into<Vec<u8>>) -> HttpReply {
         status,
         body: body.into(),
     }
+}
+
+/// Whether a market lease in `dir` is held, by this process or another: each `market+` lock
+/// file tried without waiting (an advisory lock, as fbc-core's leases take it).
+fn market_lease_held(dir: &std::path::Path) -> bool {
+    fs::read_dir(dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with("market+"))
+        .any(|e| {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(e.path())
+                .unwrap();
+            matches!(file.try_lock(), Err(fs::TryLockError::WouldBlock))
+        })
 }
 
 /// The stub's HTTP answers, from `venue`.
@@ -411,6 +432,9 @@ fn routes(venue: &Shared, login: HttpReply) -> HttpRouter {
                 v.positions_reads += 1;
                 let books = v.book_reads;
                 v.books_at_positions.push(books);
+                if let Some(dir) = v.lease_probe.clone() {
+                    v.lease_held.push(market_lease_held(&dir));
+                }
                 if let Some((n, signal)) = &v.positions_signal
                     && v.positions_reads == *n
                 {
@@ -949,13 +973,13 @@ async fn testnet_quote_requotes_by_cancel_and_replace_within_the_caps_against_th
     );
     assert!(printed.contains("STEP stop"), "{printed}");
     // At Stop, once its cancels were answered, GET /positions is compared with the registry's
-    // position on every run, fills or not (FBC-hpg6), after the stop line.
+    // position on every run, fills or not (FBC-hpg6), before the stop line (the market still leased).
     let at_stop = "GET /positions 0 lots, the registry 0 lots (0 fills applied): they agree";
     let stop_line = printed.find("STEP stop").unwrap();
     let check = printed
         .find("POSITION at Stop: +")
         .unwrap_or_else(|| panic!("no Stop comparison:\n{printed}"));
-    assert!(check > stop_line, "{printed}");
+    assert!(check < stop_line, "{printed}");
     assert!(printed[check..].contains(at_stop), "{printed}");
     assert_eq!(printed.matches("POSITION ").count(), 1, "{printed}");
     // No credential, and not the session token, in what it printed or what the stack logged.
@@ -1685,6 +1709,42 @@ async fn the_duration_passing_during_the_position_check_ends_the_loop_at_once() 
 }
 
 #[tokio::test]
+async fn the_stop_comparison_runs_before_the_market_lease_is_released() {
+    // Codex r4305979062 on PR #157: Stop's comparison (here a mismatch the re-read clears, so
+    // two reads a step timeout apart) runs while the run still holds the market's lease, after
+    // Stop's cancels are answered and before the market is disarmed and its leases released;
+    // no other process can take the market while the run compares against its registry.
+    let venue = venue(vec![b0()]);
+    lock(&venue).positions_script = vec![Some("0.00012"), None].into();
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let mut opts = options(&stub, 1);
+    opts.step_timeout_secs = 2;
+    lock(&venue).lease_probe = Some(opts.lease_dir.clone());
+    let (report, printed) = run_against(&opts).await;
+    tokio::time::timeout(Duration::from_secs(30), stub.finished())
+        .await
+        .unwrap_or_else(|_| panic!("the stub's script did not play to its end:\n{printed}"))
+        .unwrap();
+    assert!(report.ok, "{printed}");
+    // The resync's read, Stop's read and its re-read: the lease held at each.
+    assert_eq!(lock(&venue).lease_held, vec![true; 3], "{printed}");
+    let cancel_ack = printed.rfind("\nCANCEL-ACK ").unwrap();
+    let first = printed.find("POSITION at Stop: +").unwrap();
+    let again = printed.find("POSITION re-read at Stop: +").unwrap();
+    let stop = printed.find("STEP stop").unwrap();
+    assert!(
+        cancel_ack < first && first < again && again < stop,
+        "{printed}"
+    );
+    assert!(printed[stop..].contains("leases released"), "{printed}");
+}
+
+#[tokio::test]
 async fn the_stop_comparison_fails_a_run_whose_mismatch_persists_and_passes_one_that_clears() {
     // No fill: one cycle, then Stop. GET /positions at Stop shows a long of 12 lots the
     // registry (flat) does not hold: a mismatch the re-read confirms fails the run with both
@@ -1714,7 +1774,7 @@ async fn the_stop_comparison_fails_a_run_whose_mismatch_persists_and_passes_one_
         let first = printed
             .find("POSITION at Stop: +")
             .unwrap_or_else(|| panic!("no Stop comparison:\n{printed}"));
-        assert!(stop < first, "{printed}");
+        assert!(first < stop, "{printed}");
         assert!(
             printed[first..].lines().next().unwrap().contains(
                 "GET /positions 12 lots, the registry 0 lots (0 fills applied): they DIFFER"

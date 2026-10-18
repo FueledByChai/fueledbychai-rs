@@ -192,6 +192,33 @@ fn routes_with(orders: String) -> HttpRouter {
 /// As [`routes`], the reads of `GET /positions` after the first (the resync's) answered `later`
 /// in turn, the last of them again after: each a long of that size, or flat for `""`.
 fn routes_positions(later: Vec<&'static str>) -> HttpRouter {
+    routes_probed(later, None)
+}
+
+/// Whether a market lease in `dir` is held, by this process or another: each `market+` lock
+/// file tried without waiting (an advisory lock, as fbc-core's leases take it).
+fn market_lease_held(dir: &std::path::Path) -> bool {
+    fs::read_dir(dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with("market+"))
+        .any(|e| {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(e.path())
+                .unwrap();
+            matches!(file.try_lock(), Err(fs::TryLockError::WouldBlock))
+        })
+}
+
+/// The leases a [`routes_probed`] stub found at each `GET /positions` read.
+type Probed = Arc<Mutex<Vec<bool>>>;
+
+/// As [`routes_positions`], and with `probe` (a lease directory and a list) whether the market
+/// lease in that directory was held at each `GET /positions` read (Codex r4305979062 on PR
+/// #157).
+fn routes_probed(later: Vec<&'static str>, probe: Option<(PathBuf, Probed)>) -> HttpRouter {
     let book = fs::read(fixture("paradex/rest/orderbook-btc-2002.json")).unwrap();
     let reads = Arc::new(AtomicU64::new(0));
     HttpRouter::new()
@@ -215,6 +242,9 @@ fn routes_positions(later: Vec<&'static str>) -> HttpRouter {
             PathPattern::exact("/v1/positions"),
             move |_| {
                 let n = reads.fetch_add(1, Ordering::SeqCst);
+                if let Some((dir, held)) = &probe {
+                    held.lock().unwrap().push(market_lease_held(dir));
+                }
                 let size = match n {
                     0 => "",
                     n => later[usize::try_from(n - 1).unwrap().min(later.len() - 1)],
@@ -789,12 +819,12 @@ async fn testnet_trade_places_one_post_only_order_and_cancels_it_against_the_stu
         "{printed}"
     );
     // At Stop, once its cancels were answered, GET /positions is compared with the registry's
-    // position on every run, fills or not (FBC-hpg6), after the stop line.
+    // position on every run, fills or not (FBC-hpg6), before the stop line (the market still leased).
     let stop_line = printed.find("STEP stop").unwrap();
     let check = printed
         .find("POSITION at Stop: +")
         .unwrap_or_else(|| panic!("no Stop comparison:\n{printed}"));
-    assert!(stop_line < check, "{printed}");
+    assert!(check < stop_line, "{printed}");
     assert!(
         printed[check..]
             .lines()
@@ -1753,6 +1783,35 @@ async fn a_mismatch_after_the_first_fill_that_persists_stops_the_run_and_fails_i
 }
 
 #[tokio::test]
+async fn the_stop_comparison_runs_before_the_market_lease_is_released() {
+    // Codex r4305979062 on PR #157: Stop's comparison (here a mismatch the re-read clears, so
+    // two reads a step timeout apart) runs while the run still holds the market's lease, after
+    // Stop's cancels are answered and before the market is disarmed and its leases released.
+    let placed = Arc::new(Mutex::new(Placed::default()));
+    let dir = lease_dir();
+    let held: Probed = Arc::default();
+    let stub = StubServer::start(
+        script(Arc::clone(&placed)),
+        routes_probed(vec!["0.00001", ""], Some((dir.clone(), Arc::clone(&held)))),
+    )
+    .await
+    .unwrap();
+    let mut opts = options(&stub, "10");
+    opts.lease_dir = dir;
+    opts.step_timeout_secs = 2;
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(report.ok, "{printed}");
+    // The resync's read, Stop's read and its re-read: the lease held at each.
+    assert_eq!(*held.lock().unwrap(), vec![true; 3], "{printed}");
+    let first = printed.find("POSITION at Stop: +").unwrap();
+    let again = printed.find("POSITION re-read at Stop: +").unwrap();
+    let stop = printed.find("STEP stop").unwrap();
+    assert!(first < again && again < stop, "{printed}");
+    assert!(printed[stop..].contains("leases released"), "{printed}");
+}
+
+#[tokio::test]
 async fn the_stop_comparison_fails_a_round_trip_whose_mismatch_persists() {
     // Every step happens and nothing fills, but GET /positions at Stop shows a lot long the
     // registry (flat) does not hold, again on the re-read: the run fails with both readings.
@@ -1773,7 +1832,7 @@ async fn the_stop_comparison_fails_a_round_trip_whose_mismatch_persists() {
     let first = printed
         .find("POSITION at Stop: +")
         .unwrap_or_else(|| panic!("no Stop comparison:\n{printed}"));
-    assert!(stop < first, "{printed}");
+    assert!(first < stop, "{printed}");
     assert!(
         printed[first..]
             .lines()
