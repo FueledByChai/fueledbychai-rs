@@ -586,6 +586,34 @@ mod tests {
         assert!(orders.idle());
     }
 
+    /// A command still waiting, or left waiting when the session ended, can be taken back by
+    /// its request id, once; one the session took cannot (decision 0100).
+    #[test]
+    fn a_waiting_command_is_withdrawn_by_its_request_id_before_and_after_the_session_ends() {
+        let shared = Shared::new(
+            AccountKey::new(2),
+            RpcIds::default(),
+            true,
+            false,
+            true,
+            IngestClock::new(),
+        );
+        let orders = ExecOrders {
+            shared: Rc::clone(&shared),
+        };
+        let fee = |orders: &ExecOrders| orders.submit_control(ControlCommand::FeeQuery).unwrap();
+        let (taken, waiting, left) = (fee(&orders), fee(&orders), fee(&orders));
+        assert_eq!(shared.pop().map(|q| q.rpc), Some(taken));
+        assert!(orders.withdraw(taken).is_none());
+        let back = orders.withdraw(waiting).map(|item| item.command().clone());
+        assert_eq!(back, Some(VenueCommand::FeeQuery));
+        assert!(orders.withdraw(waiting).is_none());
+        shared.end();
+        assert!(!shared.waiting() && orders.ended());
+        assert!(orders.withdraw(left).is_some());
+        assert!(orders.withdraw(left).is_none());
+    }
+
     #[test]
     #[should_panic(expected = "fewer than u64::MAX request ids")]
     fn request_ids_never_wrap() {

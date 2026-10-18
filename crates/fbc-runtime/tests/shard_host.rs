@@ -624,8 +624,8 @@ impl Decide for HandBack {
             return;
         }
         ladder.push_control(&self.ended, ControlCommand::FeeQuery);
-        ladder.push_control(&self.unrun, ControlCommand::RefreshDeadMan);
         ladder.push(&self.unrun, self.oms.place()).unwrap();
+        ladder.push_control(&self.unrun, ControlCommand::RefreshDeadMan);
         assert_eq!(ladder.len(), 3);
     }
 
@@ -735,8 +735,8 @@ async fn a_ladder_command_whose_session_ended_or_that_the_runs_end_left_is_hande
             back[..],
             [
                 Unsubmitted::Control(ControlCommand::FeeQuery),
-                Unsubmitted::Control(ControlCommand::RefreshDeadMan),
-                Unsubmitted::Authorized(_)
+                Unsubmitted::Authorized(_),
+                Unsubmitted::Control(ControlCommand::RefreshDeadMan)
             ]
         ),
         "{back:?}"
