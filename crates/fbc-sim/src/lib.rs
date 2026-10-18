@@ -47,6 +47,9 @@
 //!   [`SimEngine::close`]); a close loses the frames in flight on it, and the engine cancels
 //!   what the stood-in venue cancels when the connection drops (per connection, behind an
 //!   accepted arm) or its dead-man timer lapses unrefreshed (0097).
+//!   A venue that acknowledges in two phases gets each placement accepted provisionally, then
+//!   final once its `risk_reject_window` passes, or refused by a risk reject the consumer
+//!   configures inside it ([`SimEngine::risk_reject`], [`RiskRefusal`]; 0099).
 //!
 //! Every number SimVenue uses, its capabilities, latency, bracket and fee rates included, is in
 //! the consumer's [`SimConfig`]. Not here yet: hosting in the runtime (FBC-6mf) and replay
@@ -60,7 +63,7 @@ mod wire;
 
 pub use codec::SimCodec;
 pub use config::{SimConfig, SimLatency};
-pub use engine::{Answer, InjectedOrder, SimEngine, SimError};
+pub use engine::{Answer, InjectedOrder, RiskRefusal, SimEngine, SimError};
 pub use queue::{
     Bracket, NewOrder, OrderKey, QueueConfig, QueueError, QueueModel, QueuePos, SimFill, TradeView,
 };

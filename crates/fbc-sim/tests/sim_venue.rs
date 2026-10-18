@@ -5210,8 +5210,7 @@ fn rejected_state(kind: RejectKind) -> VenueOrderState {
 }
 
 #[test]
-fn a_two_phase_placement_is_accepted_provisionally_after_the_latency_then_final_after_its_window()
-{
+fn a_two_phase_placement_is_accepted_provisionally_after_the_latency_then_final_after_its_window() {
     let mut v = two_phase();
     v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
     let order = cid();
@@ -5227,7 +5226,10 @@ fn a_two_phase_placement_is_accepted_provisionally_after_the_latency_then_final_
     let answered = MonoNs(acted) + TO_CLIENT;
     assert!(got.iter().all(|(at, _)| *at == answered));
     let (rpc, idx, got_cid, vid, outcome) = placement_of(&got[0].1);
-    assert_eq!((rpc, idx, got_cid, &outcome), (1, 0, Some(order), &PROVISIONAL));
+    assert_eq!(
+        (rpc, idx, got_cid, &outcome),
+        (1, 0, Some(order), &PROVISIONAL)
+    );
     let vid = vid.unwrap();
     assert_eq!(state_of(&got[1].1), Some((VenueOrderState::Open, 0)));
     // It queues and fills inside the window as any resting order does.
@@ -5267,7 +5269,10 @@ fn a_risk_reject_configured_inside_the_window_ends_the_order_rejected() {
     let got = v.events();
     assert_eq!(got.len(), 1, "{got:?}");
     let (rpc, idx, got_cid, vid, outcome) = placement_of(&got[0].1);
-    assert_eq!((rpc, idx, got_cid, &outcome), (1, 0, Some(order), &PROVISIONAL));
+    assert_eq!(
+        (rpc, idx, got_cid, &outcome),
+        (1, 0, Some(order), &PROVISIONAL)
+    );
     let vid = vid.unwrap();
     assert_eq!(v.engine.queue_position(&vid), None);
     // A trade that would fill it, had it rested, fills nothing.
@@ -5346,7 +5351,10 @@ fn each_risk_refusal_is_reported_as_its_reject_kind() {
         assert_eq!(got.len(), 3, "{got:?}");
         assert_eq!(outcome_of(&got[0].1), Some((1, PROVISIONAL)));
         let (_, op, got_kind, got_code) = async_reject_of(&got[1].1);
-        assert_eq!((op, got_kind, got_code.as_deref()), (OpKind::Place, kind, Some(code)));
+        assert_eq!(
+            (op, got_kind, got_code.as_deref()),
+            (OpKind::Place, kind, Some(code))
+        );
         let o = order_of(&got[2].1);
         assert_eq!((o.state.clone(), o.px), (rejected_state(kind), None));
     }
@@ -5382,7 +5390,10 @@ fn a_risk_reject_is_taken_only_inside_the_window_and_for_an_id_the_venue_can_spe
         v.engine.risk_reject(cid(), past, RiskRefusal::Other),
         Err(SimError::OutsideRiskWindow)
     );
-    assert_eq!(v.engine.risk_reject(cid(), window, RiskRefusal::Other), Ok(()));
+    assert_eq!(
+        v.engine.risk_reject(cid(), window, RiskRefusal::Other),
+        Ok(())
+    );
     // A client id the stood-in venue's format cannot carry names no order it could hold.
     let mut narrow = two_phased(config(
         Bracket::Pessimistic,
@@ -5629,4 +5640,54 @@ fn the_codec_refuses_second_phase_answers_it_cannot_read() {
             "{frame}"
         );
     }
+}
+
+#[test]
+fn a_placement_held_for_a_risk_reject_that_breaks_the_venues_rules_is_refused_at_once() {
+    let mut v = two_phase();
+    v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+    let order = cid();
+    v.rest(limit(order, Side::Buy, 199, 1), 1, T0);
+    // The same client id again, configured to be refused by the risk check: refused at once,
+    // final, as any reused client id is, and nothing is held for the check.
+    v.engine
+        .risk_reject(order, Duration::from_millis(20), RiskRefusal::Margin)
+        .unwrap();
+    v.send(limit(order, Side::Buy, 198, 1), 2, T0 + 10 * MS);
+    v.tick(T0 + 15 * MS);
+    let got = v.events();
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(
+        refusal(&got[0].1),
+        (RejectKind::Other, "duplicate".to_owned())
+    );
+    v.tick(T0 + 15 * MS + 20 * MS);
+    let got = v.events();
+    // Only the first placement's final acceptance, due a window after it arrived.
+    assert!(got.is_empty(), "{got:?}");
+    v.tick(T0 + 5 * MS + WINDOW);
+    let got = v.events();
+    assert_eq!(outcome_of(&got[0].1), Some((1, ACCEPTED)), "{got:?}");
+}
+
+#[test]
+fn a_risk_reject_of_an_order_naming_no_client_id_of_ours_names_it_by_its_venue_id() {
+    let mut v = two_phase();
+    let ack = "ack|seq=0|ts=1|rpc=9|cid=foreign|vid=S7|ph=p";
+    let got = v.decode(ack.as_bytes()).unwrap();
+    let (rpc, idx, got_cid, _, outcome) = placement_of(&got[0].1);
+    assert_eq!((rpc, idx, got_cid, outcome), (9, 0, None, PROVISIONAL));
+    let risk = "risk|seq=1|ts=2|rpc=9|idx=0|code=risk\norder|cid=foreign|vid=S7|inst=1|side=B|\
+                state=rejected_risk|cum=0|px=199|qty=1|po=1|ro=0";
+    let got = v.decode(risk.as_bytes()).unwrap();
+    assert_eq!(got.len(), 2, "{got:?}");
+    let (target, op, kind, code) = async_reject_of(&got[0].1);
+    let OrderRef::Venue(vid) = target else {
+        panic!("{target:?}")
+    };
+    assert_eq!(
+        (vid.as_str(), op, kind, code.as_deref()),
+        ("S7", OpKind::Place, RejectKind::Other, Some("risk"))
+    );
+    assert_eq!(order_of(&got[1].1).state, rejected_state(RejectKind::Other));
 }
