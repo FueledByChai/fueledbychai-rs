@@ -228,8 +228,26 @@ fn order_event(
     open: &str,
     reason: &str,
 ) -> Vec<u8> {
+    order_event_at(ORDER_TS, side, seq, vid, cid, price, size, open, reason)
+}
+
+/// The venue time (µs) the stub's order events carry, but for another program's cancels.
+const ORDER_TS: i64 = 1_759_500_000_205_011;
+
+/// As [`order_event`], stamped `ts` (µs) by the venue.
+#[allow(clippy::too_many_arguments)]
+fn order_event_at(
+    ts: i64,
+    side: u8,
+    seq: i64,
+    vid: &str,
+    cid: &str,
+    price: &str,
+    size: &str,
+    open: &str,
+    reason: &str,
+) -> Vec<u8> {
     let null = i64::MIN;
-    let ts = 1_759_500_000_205_011i64;
     let mut f = Vec::new();
     for v in [128u16, 20, 1, 2] {
         f.extend(v.to_le_bytes());
@@ -837,13 +855,17 @@ fn respond(venue: &Shared, conn: usize, frame: &Frame) -> Responded {
 
 /// The order event closing the order `at` the stub holds by a user cancel the loop never sent
 /// (`user_cancel_ws`, which Paradex's codec reads as `Canceled(Requested)`, as it reads our own
-/// cancels' USER_CANCELED): another program on the account (FBC-aoh5).
+/// cancels' USER_CANCELED): another program on the account (FBC-aoh5). The venue stamps it 2 s
+/// per place after the stub's other order events: the cancels of one action (one reconcile, one
+/// cancel-all in the UI) share a venue time, and another action's is seconds later.
 fn user_cancelled(v: &mut Venue, at: usize) -> Frame {
     v.orders[at].open = false;
     v.seq += 1;
     let o = v.orders[at].clone();
     let side = if o.side == "BUY" { 1 } else { 2 };
-    Frame::Binary(order_event(
+    let ts = ORDER_TS + i64::try_from(v.creates).unwrap() * 2_000_000;
+    Frame::Binary(order_event_at(
+        ts,
         side,
         5_000 + v.seq,
         &o.vid,
@@ -4469,6 +4491,48 @@ async fn a_second_cancel_not_ours_on_a_later_cycle_within_30_s_stops_a_mainnet_r
     );
     assert!(printed.contains(" cancels not ours 3\n"), "{printed}");
     assert!(printed.contains("DONE failed (another program cancelled our orders"));
+    no_credential_in(&printed);
+}
+
+#[tokio::test]
+async fn a_later_cancel_not_ours_of_an_order_older_than_the_first_still_stops_a_mainnet_run() {
+    capture::install();
+    // RB-aoh5-1 / Codex r4308625185 on PR #159: another program cancels cycle 1's bid (the
+    // first: WARN); cycle 2 places the bid again and the other program then cancels cycle 1's
+    // ask, which rested unchanged since before the first: a second action on a later cycle
+    // within 30 s, whatever its order's age: Stop, the bid cancelled explicitly, nothing placed
+    // after, the run failed.
+    let venue = mainnet_venue(vec![b0()]);
+    lock(&venue).cotenant_after_create = vec![(2, Some("BUY")), (3, Some("SELL"))];
+    // The opening six, the start's sweep, two places, the bid's place again, Stop's batch
+    // cancel of it.
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 1 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let opts = mainnet_options(&stub, 4);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("the stub's script: {e:?}\n{printed}"));
+
+    assert!(!report.ok, "{printed}");
+    assert!(
+        report
+            .ended
+            .starts_with("another program cancelled our orders: one quoter per account"),
+        "{printed}"
+    );
+    assert_eq!(report.cancels_not_ours, 2, "{printed}");
+    assert_eq!(warned(&printed, true), 2, "{printed}");
+    stopped(&printed);
+    assert_eq!(creates(&venue, 0), 3, "nothing placed after:\n{printed}");
+    let last = requests(&venue, 0).last().cloned().unwrap();
+    assert_eq!(last["method"], "order.cancel_batch", "{printed}");
+    assert_eq!(cancelled_ids(&last), [vids_of(&venue, "BUY")[1].clone()]);
+    assert!(printed.contains(" cancels not ours 2\n"), "{printed}");
     no_credential_in(&printed);
 }
 
