@@ -24,10 +24,18 @@
 
 #[path = "../examples/testnet_quote/args.rs"]
 mod args;
+// The position check's REST reads (a review path, used unchanged): it uses a part of it.
+#[allow(dead_code)]
+#[path = "../src/auth_rest.rs"]
+mod auth_rest;
 // Shared by the samples that trade: each uses a part of it.
 #[allow(dead_code)]
 #[path = "../src/link.rs"]
 mod link;
+// Shared by the samples that can fill: each uses a part of it.
+#[allow(dead_code)]
+#[path = "../src/positions.rs"]
+mod positions;
 #[path = "../examples/testnet_quote/quote.rs"]
 mod quote;
 // Shared by the samples that trade: each uses a part of it.
@@ -36,7 +44,7 @@ mod quote;
 mod testnet;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -83,6 +91,14 @@ fn synthetic() -> (String, String) {
         }
     }
     (header["account"].clone(), header["key"].clone())
+}
+
+/// The synthetic credentials twice: the session's and the position check's own login.
+fn creds() -> positions::Creds {
+    positions::Creds {
+        session: secrets(),
+        positions: secrets(),
+    }
 }
 
 fn secrets() -> Secrets {
@@ -294,6 +310,13 @@ struct Venue {
     hide_sells_after_first: bool,
     /// From the second `GET /positions` on: this position (a size, long) instead of flat.
     position_after_first: Option<&'static str>,
+    /// The account's position on the market (long), moved by every fill the stub sends:
+    /// `GET /positions` answers it, so positions follow fills unless a test says otherwise.
+    position: Decimal,
+    /// The answers of the `GET /positions` reads after the first (the resync's), in turn,
+    /// before [`Venue::position`] is answered again: `None` flat, `Some` a long of that size
+    /// (FBC-hpg6: the position check's reads after the first fill and at Stop).
+    positions_script: VecDeque<Option<&'static str>>,
     /// Answer the next single cancel ALREADY_CLOSED, with no order event.
     already_closed_once: bool,
     /// Answer the next single cancel of a buy queued, then fill the buy whole (its fill event
@@ -379,7 +402,20 @@ fn routes(venue: &Shared, login: HttpReply) -> HttpRouter {
             move |_| {
                 let mut v = lock(&positions);
                 v.positions_reads += 1;
-                let size = v.position_after_first.filter(|_| v.positions_reads > 1);
+                let later = v.positions_reads > 1;
+                let scripted = if later {
+                    v.positions_script.pop_front()
+                } else {
+                    None
+                };
+                let size: Option<String> = match scripted {
+                    Some(answer) => answer.map(str::to_owned),
+                    None => v
+                        .position_after_first
+                        .filter(|_| later)
+                        .map(str::to_owned)
+                        .or_else(|| (!v.position.is_zero()).then(|| v.position.to_string())),
+                };
                 let body = match size {
                     None => r#"{"results":[]}"#.to_owned(),
                     Some(size) => json!({ "results": [{
@@ -495,6 +531,8 @@ fn responder(venue: &Shared, conn: usize) -> Responder {
                     v.fill_next_buy_cancel = false;
                     v.orders[at].open = false;
                     let o = v.orders[at].clone();
+                    // The fill moves the account's position (its duplicate does not).
+                    v.position += dec(&o.size);
                     v.seq += 2;
                     let fill = fill_event(
                         5_000 + v.seq,
@@ -624,7 +662,7 @@ async fn run_until(
 ) -> (quote::Report, String) {
     let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
     let out: testnet::Out = buf.clone();
-    let run = quote::run(opts, None, secrets(), out, interrupt);
+    let run = quote::run(opts, None, creds(), out, interrupt);
     let ran = tokio::time::timeout(Duration::from_secs(60), run).await;
     let printed = String::from_utf8(buf.borrow().clone()).unwrap();
     let report = ran
@@ -894,6 +932,16 @@ async fn testnet_quote_requotes_by_cancel_and_replace_within_the_caps_against_th
         "{printed}"
     );
     assert!(printed.contains("STEP stop"), "{printed}");
+    // At Stop, once its cancels were answered, GET /positions is compared with the registry's
+    // position on every run, fills or not (FBC-hpg6), after the stop line.
+    let at_stop = "GET /positions 0 lots, the registry 0 lots (0 fills applied): they agree";
+    let stop_line = printed.find("STEP stop").unwrap();
+    let check = printed
+        .find("POSITION at Stop: +")
+        .unwrap_or_else(|| panic!("no Stop comparison:\n{printed}"));
+    assert!(check > stop_line, "{printed}");
+    assert!(printed[check..].contains(at_stop), "{printed}");
+    assert_eq!(printed.matches("POSITION ").count(), 1, "{printed}");
     // No credential, and not the session token, in what it printed or what the stack logged.
     no_credential_in(&printed);
     no_credential_in(&capture::all());
@@ -1130,7 +1178,7 @@ async fn a_mainnet_url_or_chain_id_is_refused_before_any_connection() {
         let refused = quote::run(
             &opts,
             Some(chain),
-            secrets(),
+            creds(),
             out.clone(),
             std::future::pending(),
         )
@@ -1145,7 +1193,7 @@ async fn a_mainnet_url_or_chain_id_is_refused_before_any_connection() {
     let refused = quote::run(
         &mainnet,
         None,
-        secrets(),
+        creds(),
         out.clone(),
         std::future::pending(),
     )
@@ -1300,6 +1348,225 @@ async fn a_fill_during_a_replace_requotes_from_the_position_it_left_never_past_t
     // The fill is counted once, its duplicate not at all; the inventory moved by it.
     assert_eq!((report.fills, report.inventory), (1, 12), "{printed}");
     assert_eq!(tagged(&printed, "FILL").len(), 1, "{printed}");
+}
+
+/// [`a_fill_during_a_replace_requotes_from_the_position_it_left_never_past_the_usd_cap`]'s run
+/// (cycle 2's bid cancel races a fill of all of it, 12 lots) with the reads of `GET /positions`
+/// after the resync answered `script` in turn, then the position the fills left, and a step
+/// timeout of `timeout` seconds; the stub answers `frames` frames. Its report, what it printed,
+/// and the methods the session sent.
+async fn fill_run(
+    script: Vec<Option<&'static str>>,
+    timeout: u64,
+    frames: usize,
+) -> (quote::Report, String, Vec<String>) {
+    let venue = venue(vec![b0(), b0(), book(2, Some("80000.0"), Some("80000.2"))]);
+    {
+        let mut v = lock(&venue);
+        v.fill_next_buy_cancel = true;
+        v.positions_script = script.into();
+    }
+    let stub = StubServer::start(
+        one_connection(&venue, frames),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let mut opts = options(&stub, 3);
+    opts.order_usd = dec("8");
+    opts.inventory_cap_usd = dec("16");
+    opts.step_timeout_secs = timeout;
+    let (report, printed) = run_against(&opts).await;
+    tokio::time::timeout(Duration::from_secs(30), stub.finished())
+        .await
+        .unwrap_or_else(|_| panic!("the stub's script did not play to its end:\n{printed}"))
+        .unwrap();
+    (report, printed, methods(&venue, 0))
+}
+
+/// The opening six, the start's sweep, two places, the two replace cancels (the bid's raced by
+/// its fill), the ask's new place and Stop's cancel-all: the loop that goes on after the fill.
+const GOES_ON: usize = 6 + 1 + 2 + 2 + 1 + 1;
+
+#[tokio::test]
+async fn after_the_first_fill_get_positions_is_compared_with_the_registry_and_agreeing_goes_on() {
+    // GET /positions follows the fill (12 lots long): the check after it agrees at the first
+    // read, and the loop goes on to place the ask again; at Stop it agrees again.
+    let (report, printed, sent) = fill_run(Vec::new(), 10, GOES_ON).await;
+    assert!(report.ok, "{printed}");
+    assert_eq!((report.fills, report.inventory), (1, 12), "{printed}");
+    let after = printed
+        .find("POSITION after the first fill: +")
+        .unwrap_or_else(|| panic!("no check after the fill:\n{printed}"));
+    let agree = "GET /positions 12 lots, the registry 12 lots (1 fills applied): they agree";
+    assert!(printed[after..].starts_with("POSITION after the first fill: +"));
+    assert!(
+        printed[after..].lines().next().unwrap().contains(agree),
+        "{printed}"
+    );
+    // After the FILL line, before the ask's new place.
+    assert!(printed.find("\nFILL ").unwrap() < after, "{printed}");
+    let last_place = printed.rfind("\nPLACE ").unwrap();
+    assert!(after < last_place, "{printed}");
+    assert!(!printed.contains("DIFFER"), "{printed}");
+    assert!(
+        printed[printed.find("POSITION at Stop: +").unwrap()..].contains(agree),
+        "{printed}"
+    );
+    assert_eq!(
+        sent.iter().filter(|m| *m == "order.create").count(),
+        3,
+        "{sent:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_mismatch_after_the_first_fill_that_clears_on_the_re_read_is_printed_and_goes_on() {
+    // The first read after the fill still shows the account flat (GET /positions lagging the
+    // fill stream); the re-read, one step timeout later, shows the 12 lots: both readings are
+    // printed, with their times, and the loop goes on.
+    let (report, printed, sent) = fill_run(vec![None], 2, GOES_ON).await;
+    assert!(report.ok, "{printed}");
+    let first = printed
+        .find("POSITION after the first fill: +")
+        .unwrap_or_else(|| panic!("no check after the fill:\n{printed}"));
+    let line = printed[first..].lines().next().unwrap();
+    assert!(
+        line.contains("GET /positions 0 lots, the registry 12 lots (1 fills applied): they DIFFER"),
+        "{printed}"
+    );
+    assert!(line.contains("read once more in 2 s"), "{printed}");
+    let again = printed
+        .find("POSITION re-read after the first fill: +")
+        .unwrap_or_else(|| panic!("no re-read:\n{printed}"));
+    let line = printed[again..].lines().next().unwrap();
+    assert!(
+        line.contains("GET /positions 12 lots, the registry 12 lots (1 fills applied): they agree now"),
+        "{printed}"
+    );
+    // Both readings' times, the re-read at least the step timeout after the first.
+    let ms = |line: &str| -> u128 {
+        let at = line.find(": +").unwrap() + 3;
+        line[at..].split("ms").next().unwrap().parse().unwrap()
+    };
+    let (t1, t2) = (
+        ms(printed[first..].lines().next().unwrap()),
+        ms(printed[again..].lines().next().unwrap()),
+    );
+    assert!(t2 >= t1 + 2_000, "{t1} {t2}\n{printed}");
+    assert!(line.contains(&format!("first +{t1}ms GET /positions 0 lots")), "{printed}");
+    assert!(!printed.contains(positions::HAND_CHECK), "{printed}");
+    // The loop went on: the ask placed again after the re-read.
+    assert!(again < printed.rfind("\nPLACE ").unwrap(), "{printed}");
+    assert_eq!(
+        sent.iter().filter(|m| *m == "order.create").count(),
+        3,
+        "{sent:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_mismatch_after_the_first_fill_that_persists_stops_it_with_no_place_after() {
+    // GET /positions keeps showing the account flat after the 12-lot fill: the re-read still
+    // disagrees, so the loop Stops (kill switch on, every order of ours cancelled by the
+    // instrument cancel-all) and places nothing after the fill; the run fails, saying to check
+    // the position by hand. The Stop comparison disagrees as well.
+    let script = vec![None, None, None, None];
+    // The opening six, the start's sweep, two places, the two replace cancels and Stop's
+    // cancel-all: the ask is not placed again.
+    let (report, printed, sent) = fill_run(script, 2, 6 + 1 + 2 + 2 + 1).await;
+    assert!(!report.ok, "{printed}");
+    assert!(report.ended.contains(positions::HAND_CHECK), "{printed}");
+    assert!(
+        report.ended.contains("after the first fill"),
+        "{}\n{printed}",
+        report.ended
+    );
+    // Both readings, in the reason and on their lines.
+    assert_eq!(
+        report
+            .ended
+            .matches("GET /positions 0 lots, the registry 12 lots (1 fills applied)")
+            .count(),
+        2,
+        "{}",
+        report.ended
+    );
+    assert!(
+        printed.contains("POSITION re-read after the first fill: +"),
+        "{printed}"
+    );
+    assert!(printed.contains("they STILL DIFFER"), "{printed}");
+    // No place after the fill: only cycle 1's two.
+    assert_eq!(
+        sent.iter().filter(|m| *m == "order.create").count(),
+        2,
+        "{sent:?}\n{printed}"
+    );
+    let fill = printed.find("\nFILL ").unwrap();
+    assert!(!printed[fill..].contains("\nPLACE "), "{printed}");
+    // Stop: the kill switch and the instrument cancel-all, last on the wire.
+    assert_eq!(sent.last().map(String::as_str), Some("order.cancel_all"));
+    assert!(printed.contains("kill switch on"), "{printed}");
+    assert!(
+        printed.contains("POSITION re-read at Stop: +"),
+        "{printed}"
+    );
+    assert!(printed.contains("DONE failed"), "{printed}");
+    assert_eq!(report.inventory, 12, "{printed}");
+}
+
+#[tokio::test]
+async fn the_stop_comparison_fails_a_run_whose_mismatch_persists_and_passes_one_that_clears() {
+    // No fill: one cycle, then Stop. GET /positions at Stop shows a long of 12 lots the
+    // registry (flat) does not hold: a mismatch the re-read confirms fails the run with both
+    // readings; one the re-read clears passes it.
+    for (script, ok) in [
+        (vec![Some("0.00012"), Some("0.00012")], false),
+        (vec![Some("0.00012"), None], true),
+    ] {
+        let venue = venue(vec![b0()]);
+        lock(&venue).positions_script = script.into();
+        // The opening six, the start's sweep, two places, Stop's cancel-all.
+        let stub = StubServer::start(
+            one_connection(&venue, 6 + 1 + 2 + 1),
+            routes(&venue, login_ok()),
+        )
+        .await
+        .unwrap();
+        let mut opts = options(&stub, 1);
+        opts.step_timeout_secs = 2;
+        let (report, printed) = run_against(&opts).await;
+        tokio::time::timeout(Duration::from_secs(30), stub.finished())
+            .await
+            .unwrap_or_else(|_| panic!("the stub's script did not play to its end:\n{printed}"))
+            .unwrap();
+        assert_eq!(report.ok, ok, "{printed}");
+        let stop = printed.find("STEP stop").unwrap();
+        let first = printed
+            .find("POSITION at Stop: +")
+            .unwrap_or_else(|| panic!("no Stop comparison:\n{printed}"));
+        assert!(stop < first, "{printed}");
+        assert!(
+            printed[first..].lines().next().unwrap().contains(
+                "GET /positions 12 lots, the registry 0 lots (0 fills applied): they DIFFER"
+            ),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("POSITION re-read at Stop: +"),
+            "{printed}"
+        );
+        if ok {
+            assert!(printed.contains("they agree now"), "{printed}");
+            assert!(printed.contains("DONE ok"), "{printed}");
+        } else {
+            assert!(printed.contains("they STILL DIFFER"), "{printed}");
+            assert!(report.ended.contains(positions::HAND_CHECK), "{printed}");
+            assert!(report.ended.contains("at Stop"), "{printed}");
+            assert!(printed.contains("DONE failed"), "{printed}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -1989,6 +2256,11 @@ fn help_says_it_is_a_plumbing_test_not_a_strategy_and_names_every_line() {
         "RECONNECT",
         "SUMMARY",
         "DONE ok|failed",
+        // The position check (FBC-hpg6).
+        "POSITION after the first fill",
+        "POSITION re-read",
+        "POSITION at Stop",
+        "check the position by hand",
     ] {
         assert!(USAGE.contains(name), "{name}");
     }

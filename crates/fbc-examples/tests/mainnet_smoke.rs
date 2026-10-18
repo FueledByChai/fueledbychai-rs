@@ -22,9 +22,17 @@
 mod args;
 #[path = "../src/auth_mainnet.rs"]
 mod auth_mainnet;
+// The position check's REST reads (a review path, used unchanged): it uses a part of it.
+#[allow(dead_code)]
+#[path = "../src/auth_rest.rs"]
+mod auth_rest;
 #[allow(dead_code)]
 #[path = "../src/link.rs"]
 mod link;
+// Shared by the samples that can fill: each uses a part of it.
+#[allow(dead_code)]
+#[path = "../src/positions.rs"]
+mod positions;
 #[path = "../examples/mainnet_smoke/smoke.rs"]
 mod smoke;
 #[path = "../examples/mainnet_smoke/smoke_args.rs"]
@@ -146,6 +154,14 @@ fn synthetic() -> (String, String) {
         }
     }
     (header["account"].clone(), header["key"].clone())
+}
+
+/// The synthetic credentials twice: the session's and the position check's own login.
+fn creds() -> positions::Creds {
+    positions::Creds {
+        session: secrets(),
+        positions: secrets(),
+    }
 }
 
 fn secrets() -> Secrets {
@@ -420,7 +436,7 @@ async fn run_on(
 ) -> (Result<trade::Report, String>, String) {
     let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
     let out: testnet::Out = buf.clone();
-    let run = smoke::run(smoke, chain, secrets(), out, factory);
+    let run = smoke::run(smoke, chain, creds(), out, factory);
     let ran = tokio::time::timeout(Duration::from_secs(60), run).await;
     let printed = String::from_utf8(buf.borrow().clone()).unwrap();
     let ran = ran
@@ -553,6 +569,21 @@ async fn mainnet_smoke_places_one_post_only_order_cancels_it_and_stops_against_a
         printed.contains("DONE ok places sent 1 cancels sent 2"),
         "{printed}"
     );
+    // At Stop, once its cancels were answered, GET /positions is compared with the registry's
+    // position (FBC-hpg6, the owner's condition in decision 0094), fills or not.
+    let stop_line = printed.find("STEP stop").unwrap();
+    let check = printed
+        .find("POSITION at Stop: +")
+        .unwrap_or_else(|| panic!("no Stop comparison:\n{printed}"));
+    assert!(stop_line < check, "{printed}");
+    assert!(
+        printed[check..]
+            .lines()
+            .next()
+            .unwrap()
+            .contains("GET /positions 0 lots, the registry 0 lots (0 fills applied): they agree"),
+        "{printed}"
+    );
     // The chain and the mark were read before anything else.
     let requests = stub.http_requests();
     assert_eq!(requests[0], "GET /v1/system/config", "{requests:?}");
@@ -613,7 +644,7 @@ async fn a_resync_that_is_not_trustworthy_refuses_start_with_nothing_placed() {
     };
     let net = smoke::network(&UNTRUSTED, Decimal::from_str(MARK).unwrap());
     let cfg = smoke::config(&smoke.trade);
-    let report = trade::run_on(&smoke.trade, &net, cfg, secrets(), lines)
+    let report = trade::run_on(&smoke.trade, &net, cfg, creds(), lines)
         .await
         .unwrap();
     stub.finished().await.unwrap();
@@ -1046,6 +1077,11 @@ fn help_names_the_environment_the_prerequisites_and_every_line() {
         "STEP stop",
         "TIMEOUT",
         "DONE ok|failed",
+        // The position check (FBC-hpg6).
+        "POSITION after the first fill",
+        "POSITION re-read",
+        "POSITION at Stop",
+        "check the position by hand",
     ] {
         assert!(smoke_args::USAGE.contains(needed), "--help lacks {needed}");
     }

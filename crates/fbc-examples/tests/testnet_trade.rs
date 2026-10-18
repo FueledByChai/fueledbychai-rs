@@ -18,10 +18,18 @@
 mod args;
 #[path = "../src/auth.rs"]
 mod auth;
+// The position check's REST reads (a review path, used unchanged): it uses a part of it.
+#[allow(dead_code)]
+#[path = "../src/auth_rest.rs"]
+mod auth_rest;
 // Shared by the samples that trade: each uses a part of it.
 #[allow(dead_code)]
 #[path = "../src/link.rs"]
 mod link;
+// Shared by the samples that can fill: each uses a part of it.
+#[allow(dead_code)]
+#[path = "../src/positions.rs"]
+mod positions;
 // Shared by the samples that trade: each uses a part of it.
 #[allow(dead_code)]
 #[path = "../src/testnet.rs"]
@@ -74,6 +82,14 @@ fn synthetic() -> (String, String) {
         }
     }
     (header["account"].clone(), header["key"].clone())
+}
+
+/// The synthetic credentials twice: the session's and the position check's own login.
+fn creds() -> positions::Creds {
+    positions::Creds {
+        session: secrets(),
+        positions: secrets(),
+    }
 }
 
 fn secrets() -> Secrets {
@@ -171,6 +187,60 @@ fn routes_with(orders: String) -> HttpRouter {
             PathPattern::exact("/v1/positions"),
             reply(200, empty),
         )
+}
+
+/// As [`routes`], the reads of `GET /positions` after the first (the resync's) answered `later`
+/// in turn, the last of them again after: each a long of that size, or flat for `""`.
+fn routes_positions(later: Vec<&'static str>) -> HttpRouter {
+    let book = fs::read(fixture("paradex/rest/orderbook-btc-2002.json")).unwrap();
+    let reads = Arc::new(AtomicU64::new(0));
+    HttpRouter::new()
+        .route(
+            Method::POST,
+            PathPattern::exact("/v1/auth"),
+            reply(200, format!(r#"{{"jwt_token":"{TOKEN}"}}"#)),
+        )
+        .route(
+            Method::GET,
+            PathPattern::exact(&format!("/v1/orderbook/{MARKET}")),
+            reply(200, book),
+        )
+        .route(
+            Method::GET,
+            PathPattern::exact("/v1/orders"),
+            reply(200, r#"{"results":[]}"#),
+        )
+        .route_fn(
+            Method::GET,
+            PathPattern::exact("/v1/positions"),
+            move |_| {
+                let n = reads.fetch_add(1, Ordering::SeqCst);
+                let size = match n {
+                    0 => "",
+                    n => later[usize::try_from(n - 1).unwrap().min(later.len() - 1)],
+                };
+                reply(200, position_answer(size))
+            },
+        )
+}
+
+/// A `GET /positions` answer: a long of `size` on the market, Paradex-shaped (as
+/// `fixtures/paradex/rest` records it), or none for `""` (flat).
+fn position_answer(size: &str) -> String {
+    if size.is_empty() {
+        return r#"{"results":[]}"#.to_owned();
+    }
+    json!({ "results": [{
+        "account": "0xa0a1", "average_entry_price": "62000", "average_entry_price_usd": "62000",
+        "average_exit_price": "0", "cached_funding_index": "0", "closed_at": 0, "cost": "0",
+        "cost_usd": "0", "created_at": 1_759_622_300_000_i64, "id": "BTC-USD-PERP-position",
+        "last_fill_id": "fill-BTC-USD-PERP", "last_updated_at": 1_759_622_390_000_i64,
+        "leverage": "", "liquidation_price": "", "market": MARKET,
+        "realized_positional_funding_pnl": "0", "realized_positional_pnl": "0", "seq_no": 7,
+        "side": "LONG", "size": size, "status": "OPEN", "unrealized_funding_pnl": "0",
+        "unrealized_pnl": "0",
+    }]})
+    .to_string()
 }
 
 /// A decimal string as Paradex's SBE 10^-8 mantissa.
@@ -603,7 +673,7 @@ fn script(placed: Arc<Mutex<Placed>>) -> WsScript {
 async fn run_against(opts: &Options) -> (trade::Report, String) {
     let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
     let out: testnet::Out = buf.clone();
-    let run = trade::run(opts, None, secrets(), out);
+    let run = trade::run(opts, None, creds(), out);
     let ran = tokio::time::timeout(Duration::from_secs(60), run).await;
     let printed = String::from_utf8(buf.borrow().clone()).unwrap();
     let report = ran
@@ -718,6 +788,22 @@ async fn testnet_trade_places_one_post_only_order_and_cancels_it_against_the_stu
         printed.contains("DONE ok places sent 1 cancels sent 2"),
         "{printed}"
     );
+    // At Stop, once its cancels were answered, GET /positions is compared with the registry's
+    // position on every run, fills or not (FBC-hpg6), after the stop line.
+    let stop_line = printed.find("STEP stop").unwrap();
+    let check = printed
+        .find("POSITION at Stop: +")
+        .unwrap_or_else(|| panic!("no Stop comparison:\n{printed}"));
+    assert!(stop_line < check, "{printed}");
+    assert!(
+        printed[check..]
+            .lines()
+            .next()
+            .unwrap()
+            .contains("GET /positions 0 lots, the registry 0 lots (0 fills applied): they agree"),
+        "{printed}"
+    );
+    assert_eq!(printed.matches("POSITION ").count(), 1, "{printed}");
     // The touch was read twice: to price the order, and just before the place.
     assert!(printed.contains("BBO again bid 62000.2"), "{printed}");
     let book = format!("GET /v1/orderbook/{MARKET}?depth=15");
@@ -830,7 +916,7 @@ async fn a_mainnet_chain_id_or_url_is_refused_before_any_connection() {
     // The stub's own URLs, but the mainnet chain id.
     let opts = options(&stub, "10");
     let out: testnet::Out = Rc::new(RefCell::new(Vec::<u8>::new()));
-    let refused = trade::run(&opts, Some("PRIVATE_SN_PARACLEAR_MAINNET"), secrets(), out)
+    let refused = trade::run(&opts, Some("PRIVATE_SN_PARACLEAR_MAINNET"), creds(), out)
         .await
         .unwrap_err();
     assert!(refused.contains("not the testnet chain id"), "{refused}");
@@ -856,7 +942,7 @@ async fn a_mainnet_chain_id_or_url_is_refused_before_any_connection() {
         opts.rest_url = rest.to_owned();
         opts.ws_url = ws.to_owned();
         let out: testnet::Out = Rc::new(RefCell::new(Vec::<u8>::new()));
-        let refused = trade::run(&opts, None, secrets(), out).await.unwrap_err();
+        let refused = trade::run(&opts, None, creds(), out).await.unwrap_err();
         assert!(refused.starts_with(named), "{refused}");
         assert!(refused.contains("testnet only"), "{refused}");
     }
@@ -872,7 +958,7 @@ async fn an_order_below_the_minimum_notional_is_refused_before_the_session_conne
         .unwrap();
     let opts = options(&stub, "100");
     let out: testnet::Out = Rc::new(RefCell::new(Vec::<u8>::new()));
-    let refused = trade::run(&opts, None, secrets(), out).await.unwrap_err();
+    let refused = trade::run(&opts, None, creds(), out).await.unwrap_err();
     assert!(
         refused.contains("below the market's minimum $100"),
         "{refused}"
@@ -1096,6 +1182,11 @@ fn help_names_the_environment_the_flags_and_every_line() {
         "STEP stop",
         "TIMEOUT",
         "DONE",
+        // The position check (FBC-hpg6).
+        "POSITION after the first fill",
+        "POSITION re-read",
+        "POSITION at Stop",
+        "check the position by hand",
     ] {
         assert!(USAGE.contains(word), "--help does not mention {word}");
     }
@@ -1135,7 +1226,7 @@ async fn a_run_without_the_sole_trader_confirmation_or_through_a_proxy_to_a_stub
     let mut opts = options(&stub, "10");
     opts.sole_trader = false;
     let out: testnet::Out = Rc::new(RefCell::new(Vec::<u8>::new()));
-    let refused = trade::run(&opts, None, secrets(), out).await.unwrap_err();
+    let refused = trade::run(&opts, None, creds(), out).await.unwrap_err();
     assert!(
         refused.starts_with("--sole-trader is required"),
         "{refused}"
@@ -1147,7 +1238,7 @@ async fn a_run_without_the_sole_trader_confirmation_or_through_a_proxy_to_a_stub
         port: 9,
     };
     let out: testnet::Out = Rc::new(RefCell::new(Vec::<u8>::new()));
-    let refused = trade::run(&opts, None, secrets(), out).await.unwrap_err();
+    let refused = trade::run(&opts, None, creds(), out).await.unwrap_err();
     assert!(
         refused.starts_with("--socks5 with loopback stub URLs"),
         "{refused}"
@@ -1184,7 +1275,7 @@ async fn the_client_id_high_water_mark_is_read_before_minting_and_kept_after() {
     let mut opts = options(&stub, "10");
     opts.lease_dir = dir;
     let out: testnet::Out = Rc::new(RefCell::new(Vec::<u8>::new()));
-    let refused = trade::run(&opts, None, secrets(), out).await.unwrap_err();
+    let refused = trade::run(&opts, None, creds(), out).await.unwrap_err();
     assert!(refused.contains("not a high-water mark"), "{refused}");
     assert!(stub.connections().is_empty());
 }
@@ -1484,6 +1575,17 @@ fn the_snapshot_floor_is_the_highest_of_our_ids_it_shows() {
 /// Runs testnet_trade against a stub whose cancel of the placed order ends it as `end`, with
 /// no open order or position on the market: its report and what it printed.
 async fn run_with_placed_end(end: End) -> (trade::Report, String) {
+    run_with_placed_end_on(end, routes(), 10, 8).await
+}
+
+/// As [`run_with_placed_end`], the stub's HTTP answers `routes`, a step timeout of `timeout`
+/// seconds, and `frames` frames answered on the socket.
+async fn run_with_placed_end_on(
+    end: End,
+    routes: HttpRouter,
+    timeout: u64,
+    frames: usize,
+) -> (trade::Report, String) {
     let placed = Arc::new(Mutex::new(Placed::default()));
     let with = responder_with(
         Arc::clone(&placed),
@@ -1492,16 +1594,20 @@ async fn run_with_placed_end(end: End) -> (trade::Report, String) {
         End::Canceled,
     );
     let mut script = vec![Step::Accept];
-    script.extend((0..8).map(|_| Step::Respond {
+    script.extend((0..frames).map(|_| Step::Respond {
         conn: 0,
         with: with.clone(),
     }));
-    let stub = StubServer::start(WsScript::new(script), routes())
+    let stub = StubServer::start(WsScript::new(script), routes)
         .await
         .unwrap();
-    let opts = options(&stub, "10");
+    let mut opts = options(&stub, "10");
+    opts.step_timeout_secs = timeout;
     let ran = run_against(&opts).await;
-    stub.finished().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), stub.finished())
+        .await
+        .unwrap_or_else(|_| panic!("the stub's script did not play to its end:\n{}", ran.1))
+        .unwrap();
     ran
 }
 
@@ -1535,6 +1641,195 @@ async fn an_order_cancelled_after_a_partial_fill_fails_the_run() {
     );
     assert!(!printed.contains("STEP closed"), "{printed}");
     assert!(printed.contains("DONE failed"), "{printed}");
+}
+
+/// The partial fill's run (the placed order's cancel answered queued, its fill of one lot, the
+/// order CLOSED with the rest cancelled), GET /positions after the resync answering `later`
+/// ([`routes_positions`]), the step timeout `timeout` s; nine frames answered (the opening six,
+/// the place, the cancel, Stop's instrument cancel-all).
+async fn partial_fill_run(later: Vec<&'static str>, timeout: u64) -> (trade::Report, String) {
+    run_with_placed_end_on(End::PartlyFilled, routes_positions(later), timeout, 9).await
+}
+
+#[tokio::test]
+async fn after_the_first_fill_get_positions_is_compared_with_the_registry_and_agreeing_goes_on() {
+    // GET /positions follows the fill (one lot long): the check after it agrees, and the round
+    // trip goes on to its closed step, which the fill fails as before; Stop agrees again.
+    let (report, printed) = partial_fill_run(vec!["0.00001"], 10).await;
+    assert!(!report.ok, "{printed}");
+    let agree = "GET /positions 1 lots, the registry 1 lots (1 fills applied): they agree";
+    let after = printed
+        .find("POSITION after the first fill: +")
+        .unwrap_or_else(|| panic!("no check after the fill:\n{printed}"));
+    assert!(
+        printed[after..].lines().next().unwrap().contains(agree),
+        "{printed}"
+    );
+    assert!(printed.find("NOTE a fill: ours").unwrap() < after, "{printed}");
+    // The run went on to the closed step.
+    assert!(
+        printed.contains("the order was cancelled after 1 lots of it filled; inventory now 1 lots"),
+        "{printed}"
+    );
+    let at_stop = printed
+        .find("POSITION at Stop: +")
+        .unwrap_or_else(|| panic!("no Stop comparison:\n{printed}"));
+    assert!(
+        printed[at_stop..].lines().next().unwrap().contains(agree),
+        "{printed}"
+    );
+    assert!(!printed.contains("DIFFER"), "{printed}");
+    assert!(!printed.contains(positions::HAND_CHECK), "{printed}");
+}
+
+#[tokio::test]
+async fn a_mismatch_after_the_first_fill_that_clears_on_the_re_read_is_printed_and_goes_on() {
+    // The first read after the fill still shows the account flat (GET /positions lagging the
+    // fill stream); the re-read, one step timeout later, shows the lot: both readings printed
+    // with their times, and the round trip goes on to its closed step.
+    let (report, printed) = partial_fill_run(vec!["", "0.00001"], 2).await;
+    assert!(!report.ok, "{printed}");
+    let first = printed
+        .find("POSITION after the first fill: +")
+        .unwrap_or_else(|| panic!("no check after the fill:\n{printed}"));
+    assert!(
+        printed[first..].lines().next().unwrap().contains(
+            "GET /positions 0 lots, the registry 1 lots (1 fills applied): they DIFFER"
+        ),
+        "{printed}"
+    );
+    let again = printed
+        .find("POSITION re-read after the first fill: +")
+        .unwrap_or_else(|| panic!("no re-read:\n{printed}"));
+    assert!(
+        printed[again..].lines().next().unwrap().contains(
+            "GET /positions 1 lots, the registry 1 lots (1 fills applied): they agree now"
+        ),
+        "{printed}"
+    );
+    assert!(
+        printed[again..].contains("the order was cancelled after 1 lots of it filled"),
+        "{printed}"
+    );
+    assert!(!printed.contains(positions::HAND_CHECK), "{printed}");
+    assert!(!printed.contains("TIMEOUT"), "{printed}");
+}
+
+#[tokio::test]
+async fn a_mismatch_after_the_first_fill_that_persists_stops_the_run_and_fails_it() {
+    // GET /positions keeps showing the account flat after the one-lot fill: the re-read still
+    // disagrees, so the run Stops at once (kill switch on, the instrument cancel-all sent,
+    // nothing placed after) and fails, saying to check the position by hand.
+    let (report, printed) = partial_fill_run(vec![""], 2).await;
+    assert!(!report.ok, "{printed}");
+    assert!(
+        printed.contains("POSITION re-read after the first fill: +"),
+        "{printed}"
+    );
+    assert!(printed.contains("they STILL DIFFER"), "{printed}");
+    assert!(printed.contains(positions::HAND_CHECK), "{printed}");
+    // The run did not go on to the closed step: it Stopped.
+    assert!(
+        !printed.contains("the order was cancelled after 1 lots of it filled"),
+        "{printed}"
+    );
+    let halted = printed.find("they STILL DIFFER").unwrap();
+    let stop = printed.find("STEP stop").unwrap();
+    assert!(halted < stop, "{printed}");
+    assert!(printed[stop..].contains("kill switch on"), "{printed}");
+    assert!(printed[stop..].contains("an instrument cancel-all"), "{printed}");
+    assert!(!printed[halted..].contains("STEP place"), "{printed}");
+    assert!(!printed.contains("TIMEOUT"), "{printed}");
+    assert!(printed.contains("DONE failed places sent 1"), "{printed}");
+}
+
+#[tokio::test]
+async fn the_stop_comparison_fails_a_round_trip_whose_mismatch_persists() {
+    // Every step happens and nothing fills, but GET /positions at Stop shows a lot long the
+    // registry (flat) does not hold, again on the re-read: the run fails with both readings.
+    let placed = Arc::new(Mutex::new(Placed::default()));
+    let stub = StubServer::start(
+        script(Arc::clone(&placed)),
+        routes_positions(vec!["0.00001"]),
+    )
+    .await
+    .unwrap();
+    let mut opts = options(&stub, "10");
+    opts.step_timeout_secs = 2;
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(!report.ok, "{printed}");
+    assert!(printed.contains("STEP closed"), "{printed}");
+    let stop = printed.find("STEP stop").unwrap();
+    let first = printed
+        .find("POSITION at Stop: +")
+        .unwrap_or_else(|| panic!("no Stop comparison:\n{printed}"));
+    assert!(stop < first, "{printed}");
+    assert!(
+        printed[first..].lines().next().unwrap().contains(
+            "GET /positions 1 lots, the registry 0 lots (0 fills applied): they DIFFER"
+        ),
+        "{printed}"
+    );
+    assert!(printed.contains("POSITION re-read at Stop: +"), "{printed}");
+    assert!(printed.contains("they STILL DIFFER"), "{printed}");
+    // The reason names both readings and what to do.
+    let reason = printed
+        .lines()
+        .find(|l| l.starts_with("NOTE GET /positions disagreed"))
+        .unwrap_or_else(|| panic!("no reason:\n{printed}"));
+    assert_eq!(reason.matches("GET /positions 1 lots").count(), 2, "{reason}");
+    assert!(reason.contains(positions::HAND_CHECK), "{reason}");
+    assert!(printed.contains("DONE failed"), "{printed}");
+}
+
+#[test]
+fn the_market_position_is_read_from_get_positions_exactly_in_lots() {
+    // Through the Paradex adapter's own resync decoder: a LONG size positive, a SHORT one
+    // negative, a CLOSED position and an empty list flat, another market's ignored, and an
+    // answer the decoder refuses named, never shown.
+    let opts = Options {
+        market: MARKET.to_owned(),
+        tick: Decimal::from_str("0.1").unwrap(),
+        step: Decimal::from_str("0.00001").unwrap(),
+        min_notional: Decimal::from(10),
+        resting_cap_usd: Decimal::from(20),
+        inventory_cap_usd: Decimal::from(50),
+        order_usd: Decimal::from(11),
+        namespace: 1,
+        side: OrderSide::Buy,
+        away_bps: 300,
+        hold_secs: 0,
+        step_timeout_secs: 10,
+        rest_url: "http://127.0.0.1:9/v1".to_owned(),
+        ws_url: "ws://127.0.0.1:9/v1".to_owned(),
+        proxy: ProxyConfig::Direct,
+        lease_dir: std::env::temp_dir(),
+        sole_trader: true,
+    };
+    let cfg = trade::config(&opts);
+    let specs = trade::specs(&fbc_venue_paradex::ParadexFactory, &cfg, &opts).unwrap();
+    let caps = fbc_core::VenueFactory::caps(&fbc_venue_paradex::ParadexFactory, &cfg).unwrap();
+    let read = |body: &str| positions::market_position(body.as_bytes(), &caps, &specs);
+    let row = |market: &str, side: &str, size: &str, status: &str| {
+        json!({ "results": [{
+            "market": market, "side": side, "size": size, "status": status,
+            "average_entry_price": "62000",
+        }]})
+        .to_string()
+    };
+    use fbc_core::SignedLots;
+    assert_eq!(read(&position_answer("0.00013")), Ok(SignedLots(13)));
+    assert_eq!(read(&row(MARKET, "LONG", "0.00013", "OPEN")), Ok(SignedLots(13)));
+    assert_eq!(read(&row(MARKET, "SHORT", "-0.00013", "OPEN")), Ok(SignedLots(-13)));
+    assert_eq!(read(&row(MARKET, "SHORT", "0", "CLOSED")), Ok(SignedLots(0)));
+    assert_eq!(read(r#"{"results":[]}"#), Ok(SignedLots(0)));
+    // A position on a market the run does not trade is not this market's.
+    let other = read(&row("ETH-USD-PERP", "LONG", "0.01", "OPEN"));
+    assert!(other.is_err() || other == Ok(SignedLots(0)), "{other:?}");
+    let refused = read(&row(MARKET, "LONG", "-0.00013", "OPEN")).unwrap_err();
+    assert!(refused.contains("position side"), "{refused}");
+    assert!(!refused.contains("0.00013"), "{refused}");
 }
 
 #[tokio::test]
@@ -2868,7 +3163,7 @@ async fn the_testnet_line_names_the_hosts_never_the_urls() {
     opts.ws_url = stub.ws_url("/v1/SYNTHETIC-path-token-hunter2");
     let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
     let out: testnet::Out = buf.clone();
-    let refused = trade::run(&opts, None, secrets(), out).await.unwrap_err();
+    let refused = trade::run(&opts, None, creds(), out).await.unwrap_err();
     assert!(refused.starts_with("--ws-url"), "{refused}");
     assert!(!refused.contains("hunter2"), "{refused}");
     assert!(buf.borrow().is_empty());
@@ -2877,7 +3172,7 @@ async fn the_testnet_line_names_the_hosts_never_the_urls() {
     let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
     let out: testnet::Out = buf.clone();
     // Refused before the session connects (below the minimum notional), after the line.
-    let refused = trade::run(&opts, None, secrets(), out).await.unwrap_err();
+    let refused = trade::run(&opts, None, creds(), out).await.unwrap_err();
     let printed = String::from_utf8(buf.borrow().clone()).unwrap();
     assert!(
         printed.contains(&format!(
