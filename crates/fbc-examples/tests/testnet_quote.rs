@@ -24,6 +24,12 @@
 
 #[path = "../examples/testnet_quote/args.rs"]
 mod args;
+// The credentials (review paths, used unchanged): the testnet's and, with --mainnet, the
+// mainnet-only variables.
+#[path = "../src/auth.rs"]
+mod auth;
+#[path = "../src/auth_mainnet.rs"]
+mod auth_mainnet;
 // The position check's REST reads (a review path, used unchanged): it uses a part of it.
 #[allow(dead_code)]
 #[path = "../src/auth_rest.rs"]
@@ -32,6 +38,10 @@ mod auth_rest;
 #[allow(dead_code)]
 #[path = "../src/link.rs"]
 mod link;
+// Shared by the mainnet samples: each uses a part of it.
+#[allow(dead_code)]
+#[path = "../src/mainnet.rs"]
+mod mainnet;
 // Shared by the samples that can fill: each uses a part of it.
 #[allow(dead_code)]
 #[path = "../src/positions.rs"]
@@ -44,7 +54,7 @@ mod quote;
 mod testnet;
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -56,11 +66,14 @@ use std::time::Duration;
 
 use args::{Options, Parsed, USAGE};
 use fbc_conformance::{
-    Frame, HttpReply, HttpRouter, PathPattern, Responder, Step, StubServer, WsScript,
+    Frame, HttpReply, HttpRouter, PathPattern, Responded, Responder, Step, StubServer, WsScript,
 };
 use fbc_core::{
-    AccountKey, CidMint, Lots, Namespace, NamespaceLease, RpcId, Secret, Secrets, Side, SignedLots,
-    Ticks, WallNs, encode_cid,
+    AccountKey, AccountSummary, AssetKey, CidMint, ConfigError, EndpointPlan, ExecCodec,
+    ExecEndpoint, FieldSpec, HttpPlan, InstrumentSpecDraft, LimitScope, Lots, MdCodec, Namespace,
+    NamespaceLease, OpKind, RpcId, Secret, Secrets, Side, SignedLots, SnapshotSource, SpecTable,
+    Subscription, SymbolError, TagSet, Ticks, VenueCaps, VenueConfig, VenueError, VenueFactory,
+    WallNs, encode_cid,
 };
 use fbc_runtime::ProxyConfig;
 use fbc_runtime::http::Method;
@@ -158,6 +171,7 @@ fn options(stub: &StubServer, cycles: u64) -> Options {
         proxy: ProxyConfig::Direct,
         lease_dir: lease_dir(),
         sole_trader: true,
+        mainnet: false,
     }
 }
 
@@ -172,6 +186,14 @@ fn book(seq: u64, bid: Option<&str>, ask: Option<&str>) -> String {
         "bids": level(bid), "asks": level(ask),
     })
     .to_string()
+}
+
+/// The stub's mark price unless a test scripts others: between the first touch's best bid
+/// (62000.2) and ask (62000.5).
+const MARK: &str = "62000.3";
+
+fn mark() -> Decimal {
+    dec(MARK)
 }
 
 /// The first touch every test starts from: bid 62000.2, ask 62000.5.
@@ -298,9 +320,40 @@ struct Venue {
     orders: Vec<Held>,
     next_vid: u64,
     seq: i64,
-    /// The order books `GET /orderbook` answers in turn, the last one again after.
+    /// The order books `GET /orderbook` answers in turn, the last one again after, its `seq_no`
+    /// one higher each time (the venue's book moves on: Paradex's `seq_no` rises with every
+    /// change, and our fill changes it).
     books: Vec<String>,
     book_reads: usize,
+    /// The mark prices `GET /markets/summary` answers in turn, the last one again after
+    /// ([`MARK`] when none is scripted), how many it answered, and the mark it last answered
+    /// when each place came.
+    marks: Vec<&'static str>,
+    mark_reads: usize,
+    marks_at_create: Vec<Decimal>,
+    /// The chain `GET /system/config` names (mainnet's when `None`).
+    chain: Option<&'static str>,
+    /// `POST /auth` answered so far, and from which one (from 1) it is refused with a 401.
+    logins: usize,
+    login_refused_from: Option<usize>,
+    /// A position on another market (its symbol and size, long) that `GET /positions` lists
+    /// beside the market's.
+    elsewhere: Option<(&'static str, &'static str)>,
+    /// How many `GET /positions` reads answer the account's position before
+    /// [`Venue::positions_script`] and [`Venue::position_after_first`] apply (1 when 0: the
+    /// resync's; a mainnet run reads once more first, for the other markets).
+    unscripted: usize,
+    /// Answer the `n`th place (from 1) with this JSON-RPC error code, creating nothing.
+    reject_create: Option<(usize, i64)>,
+    /// Answer the `n`th single cancel (from 1) with this JSON-RPC error code, closing nothing.
+    reject_cancel: Option<(usize, i64)>,
+    cancels: usize,
+    /// When each place and each single cancel came.
+    create_times: Vec<std::time::Instant>,
+    cancel_times: Vec<std::time::Instant>,
+    /// Answer the next single cancel with the order's CLOSED event only, never the reply: the
+    /// venue's order stream ahead of the cancel's reply, which then never comes.
+    closed_without_reply_once: bool,
     orders_reads: usize,
     positions_reads: usize,
     /// From the second `GET /orders` on: hide the open sell orders (a lagging snapshot).
@@ -385,21 +438,72 @@ fn market_lease_held(dir: &std::path::Path) -> bool {
 /// The stub's HTTP answers, from `venue`.
 fn routes(venue: &Shared, login: HttpReply) -> HttpRouter {
     let (books, orders, positions) = (venue.clone(), venue.clone(), venue.clone());
+    let (logins, marks, chain) = (venue.clone(), venue.clone(), venue.clone());
     HttpRouter::new()
-        .route(Method::POST, PathPattern::exact("/v1/auth"), login)
+        .route_fn(Method::POST, PathPattern::exact("/v1/auth"), move |_| {
+            let mut v = lock(&logins);
+            v.logins += 1;
+            match v.login_refused_from {
+                Some(n) if v.logins >= n => {
+                    let body = json!({
+                        "error": "STARKNET_SIGNATURE_VERIFICATION_FAILED",
+                        "message": "verification failed on Curve",
+                    });
+                    reply(401, body.to_string())
+                }
+                _ => login.clone(),
+            }
+        })
+        .route_fn(
+            Method::GET,
+            PathPattern::exact("/v1/system/config"),
+            move |_| {
+                let v = lock(&chain);
+                let named = v.chain.unwrap_or("PRIVATE_SN_PARACLEAR_MAINNET");
+                let body = json!({
+                    "starknet_chain_id": named, "l1_chain_id": "1",
+                    "block_explorer_url": "https://example.invalid/", "environment": "stub",
+                });
+                reply(200, body.to_string())
+            },
+        )
+        .route_fn(
+            Method::GET,
+            PathPattern::exact("/v1/markets/summary"),
+            move |_| {
+                let mut v = lock(&marks);
+                let at = v.mark_reads.min(v.marks.len().saturating_sub(1));
+                v.mark_reads += 1;
+                let mark = v.marks.get(at).copied().unwrap_or(MARK);
+                let body = json!({"results": [{
+                    "symbol": MARKET, "mark_price": mark, "oracle_price": mark,
+                    "last_traded_price": mark, "bid": "62000.2", "ask": "62000.5",
+                    "funding_rate": "0.0001", "open_interest": "1", "volume_24h": "1",
+                    "created_at": 1_759_500_000_000u64,
+                }]});
+                reply(200, body.to_string())
+            },
+        )
         .route_fn(
             Method::GET,
             PathPattern::exact(&format!("/v1/orderbook/{MARKET}")),
             move |_| {
                 let mut v = lock(&books);
-                let at = v.book_reads.min(v.books.len() - 1);
+                let last = v.books.len() - 1;
+                let at = v.book_reads.min(last);
+                let past = v.book_reads.saturating_sub(last);
                 v.book_reads += 1;
                 if let Some((n, signal)) = &v.signal
                     && v.book_reads == *n
                 {
                     signal.notify_one();
                 }
-                reply(200, v.books[at].clone())
+                let mut book: Value = serde_json::from_str(&v.books[at]).unwrap();
+                if past > 0 {
+                    let seq = book["seq_no"].as_u64().unwrap();
+                    book["seq_no"] = json!(seq + u64::try_from(past).unwrap());
+                }
+                reply(200, book.to_string())
             },
         )
         .route_fn(Method::GET, PathPattern::exact("/v1/orders"), move |_| {
@@ -437,7 +541,7 @@ fn routes(venue: &Shared, login: HttpReply) -> HttpRouter {
                 {
                     signal.notify_one();
                 }
-                let later = v.positions_reads > 1;
+                let later = v.positions_reads > v.unscripted.max(1);
                 let scripted = if later {
                     v.positions_script.pop_front()
                 } else {
@@ -451,9 +555,22 @@ fn routes(venue: &Shared, login: HttpReply) -> HttpRouter {
                         .map(str::to_owned)
                         .or_else(|| (!v.position.is_zero()).then(|| v.position.to_string())),
                 };
-                let body = match size {
-                    None => r#"{"results":[]}"#.to_owned(),
-                    Some(size) => json!({ "results": [{
+                let other = v.elsewhere.map(|(market, size)| {
+                    json!({
+                        "account": account(), "average_entry_price": "3000",
+                        "average_entry_price_usd": "3000", "average_exit_price": "0",
+                        "cached_funding_index": "0", "closed_at": 0, "cost": "0",
+                        "cost_usd": "0", "created_at": 1_759_622_300_000_i64,
+                        "id": "other-position", "last_fill_id": "fill-other",
+                        "last_updated_at": 1_759_622_390_000_i64, "leverage": "",
+                        "liquidation_price": "", "market": market,
+                        "realized_positional_funding_pnl": "0", "realized_positional_pnl": "0",
+                        "seq_no": 3, "side": "LONG", "size": size, "status": "OPEN",
+                        "unrealized_funding_pnl": "0", "unrealized_pnl": "0",
+                    })
+                });
+                let ours = size.map(|size| {
+                    json!({
                         "account": account(),
                         "average_entry_price": "62000", "average_entry_price_usd": "62000",
                         "average_exit_price": "0", "cached_funding_index": "0", "closed_at": 0,
@@ -464,9 +581,10 @@ fn routes(venue: &Shared, login: HttpReply) -> HttpRouter {
                         "realized_positional_funding_pnl": "0", "realized_positional_pnl": "0",
                         "seq_no": 7, "side": "LONG", "size": size, "status": "OPEN",
                         "unrealized_funding_pnl": "0", "unrealized_pnl": "0",
-                    }]})
-                    .to_string(),
-                };
+                    })
+                });
+                let results: Vec<Value> = ours.into_iter().chain(other).collect();
+                let body = json!({ "results": results }).to_string();
                 reply(200, body)
             },
         )
@@ -475,179 +593,208 @@ fn routes(venue: &Shared, login: HttpReply) -> HttpRouter {
 /// The stub's answer to each JSON-RPC frame on connection `conn`, from `venue`.
 fn responder(venue: &Shared, conn: usize) -> Responder {
     let venue = venue.clone();
-    Responder::new(move |frame| {
-        let Frame::Text(text) = frame else {
-            return Err("a binary frame from the client".to_owned());
-        };
-        let req: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
-        let id = req["id"].clone();
-        let params = &req["params"];
-        let ok = |result: Value| {
-            Frame::text(json!({"jsonrpc": "2.0", "result": result, "id": id}).to_string())
-        };
-        let mut v = lock(&venue);
-        let method = req["method"].as_str().unwrap_or("").to_owned();
-        v.log.push((conn, text.clone()));
-        let closed = |v: &mut Venue, at: usize| {
-            v.orders[at].open = false;
-            v.seq += 1;
-            let o = v.orders[at].clone();
-            let side = if o.side == "BUY" { 1 } else { 2 };
-            Frame::Binary(order_closed(
-                side,
-                5_000 + v.seq,
-                &o.vid,
-                &o.cid,
-                &o.price,
-                &o.size,
-            ))
-        };
-        let frames = match method.as_str() {
-            "auth" | "subscribe" => vec![ok(json!({}))],
-            "order.cancel_on_disconnect" => vec![ok(json!({"enabled": true}))],
-            "order.create" => {
-                v.next_vid += 1;
-                let held = Held {
-                    vid: format!("17595000000000{:05}", v.next_vid),
-                    cid: params["client_id"].as_str().unwrap_or("").to_owned(),
-                    side: params["side"].as_str().unwrap_or("").to_owned(),
-                    price: params["price"].as_str().unwrap_or("").to_owned(),
-                    size: params["size"].as_str().unwrap_or("").to_owned(),
-                    open: true,
-                };
-                let order = json!({
-                    "id": held.vid, "client_id": held.cid, "market": MARKET, "side": held.side,
-                    "type": "LIMIT", "instruction": "POST_ONLY", "price": held.price,
-                    "size": held.size, "remaining_size": held.size, "status": "NEW",
-                });
-                v.orders.push(held);
-                v.creates += 1;
-                let books = v.book_reads;
-                v.books_at_create.push(books);
-                let mut frames = vec![ok(json!({ "order": order }))];
-                if let Some((n, size)) = v.position_after_create
-                    && n == v.creates
-                {
-                    frames.push(Frame::Binary(position_event(size)));
-                }
-                if let Some((n, reason)) = v.close_create
-                    && n == v.creates
-                {
-                    let at = v.orders.len() - 1;
-                    v.orders[at].open = false;
-                    v.seq += 1;
-                    let o = v.orders[at].clone();
-                    let side = if o.side == "BUY" { 1 } else { 2 };
-                    frames.push(Frame::Binary(order_event(
-                        side,
-                        5_000 + v.seq,
-                        &o.vid,
-                        &o.cid,
-                        &o.price,
-                        &o.size,
-                        &o.size,
-                        reason,
-                    )));
-                }
-                if v.garbage_after_create == Some(v.creates) {
-                    frames.push(Frame::Binary(b"\xff".to_vec()));
-                }
-                frames
+    Responder::new(move |frame| respond(&venue, conn, frame))
+}
+
+/// The stub's answer to the JSON-RPC frame `frame` on connection `conn`, from `venue`.
+fn respond(venue: &Shared, conn: usize, frame: &Frame) -> Responded {
+    let Frame::Text(text) = frame else {
+        return Err("a binary frame from the client".to_owned());
+    };
+    let req: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let id = req["id"].clone();
+    let params = &req["params"];
+    let ok = |result: Value| {
+        Frame::text(json!({"jsonrpc": "2.0", "result": result, "id": id}).to_string())
+    };
+    let mut v = lock(venue);
+    let method = req["method"].as_str().unwrap_or("").to_owned();
+    v.log.push((conn, text.clone()));
+    let closed = |v: &mut Venue, at: usize| {
+        v.orders[at].open = false;
+        v.seq += 1;
+        let o = v.orders[at].clone();
+        let side = if o.side == "BUY" { 1 } else { 2 };
+        Frame::Binary(order_closed(
+            side,
+            5_000 + v.seq,
+            &o.vid,
+            &o.cid,
+            &o.price,
+            &o.size,
+        ))
+    };
+    let frames = match method.as_str() {
+        "auth" | "subscribe" => vec![ok(json!({}))],
+        "order.cancel_on_disconnect" => vec![ok(json!({"enabled": true}))],
+        "order.create" => {
+            v.create_times.push(std::time::Instant::now());
+            let at = v
+                .mark_reads
+                .saturating_sub(1)
+                .min(v.marks.len().saturating_sub(1));
+            let served = dec(v.marks.get(at).copied().unwrap_or(MARK));
+            v.marks_at_create.push(served);
+            if let Some((n, code)) = v.reject_create
+                && n == v.create_times.len()
+            {
+                let error = json!({"code": code, "message": "order.create refused"});
+                let reply = json!({"jsonrpc": "2.0", "error": error, "id": id});
+                return Ok(vec![Frame::text(reply.to_string())]);
             }
-            "order.cancel" => {
+            v.next_vid += 1;
+            let held = Held {
+                vid: format!("17595000000000{:05}", v.next_vid),
+                cid: params["client_id"].as_str().unwrap_or("").to_owned(),
+                side: params["side"].as_str().unwrap_or("").to_owned(),
+                price: params["price"].as_str().unwrap_or("").to_owned(),
+                size: params["size"].as_str().unwrap_or("").to_owned(),
+                open: true,
+            };
+            let order = json!({
+                "id": held.vid, "client_id": held.cid, "market": MARKET, "side": held.side,
+                "type": "LIMIT", "instruction": "POST_ONLY", "price": held.price,
+                "size": held.size, "remaining_size": held.size, "status": "NEW",
+            });
+            v.orders.push(held);
+            v.creates += 1;
+            let books = v.book_reads;
+            v.books_at_create.push(books);
+            let mut frames = vec![ok(json!({ "order": order }))];
+            if let Some((n, size)) = v.position_after_create
+                && n == v.creates
+            {
+                frames.push(Frame::Binary(position_event(size)));
+            }
+            if let Some((n, reason)) = v.close_create
+                && n == v.creates
+            {
+                let at = v.orders.len() - 1;
+                v.orders[at].open = false;
+                v.seq += 1;
+                let o = v.orders[at].clone();
+                let side = if o.side == "BUY" { 1 } else { 2 };
+                frames.push(Frame::Binary(order_event(
+                    side,
+                    5_000 + v.seq,
+                    &o.vid,
+                    &o.cid,
+                    &o.price,
+                    &o.size,
+                    &o.size,
+                    reason,
+                )));
+            }
+            if v.garbage_after_create == Some(v.creates) {
+                frames.push(Frame::Binary(b"\xff".to_vec()));
+            }
+            frames
+        }
+        "order.cancel" => {
+            v.cancels += 1;
+            v.cancel_times.push(std::time::Instant::now());
+            if let Some((n, code)) = v.reject_cancel
+                && n == v.cancels
+            {
+                let error = json!({"code": code, "message": "order.cancel refused"});
+                let reply = json!({"jsonrpc": "2.0", "error": error, "id": id});
+                return Ok(vec![Frame::text(reply.to_string())]);
+            }
+            let at = v
+                .orders
+                .iter()
+                .position(|o| {
+                    params["id"].as_str() == Some(o.vid.as_str())
+                        || params["client_id"].as_str() == Some(o.cid.as_str())
+                })
+                .ok_or("a cancel of no order the stub holds")?;
+            let vid = v.orders[at].vid.clone();
+            if v.fill_next_buy_cancel && v.orders[at].side == "BUY" {
+                v.fill_next_buy_cancel = false;
+                v.orders[at].open = false;
+                let o = v.orders[at].clone();
+                // The fill moves the account's position (its duplicate does not).
+                v.position += dec(&o.size);
+                v.seq += 2;
+                let fill = fill_event(
+                    5_000 + v.seq,
+                    "8615262148007719001",
+                    &o.vid,
+                    &o.cid,
+                    &o.price,
+                    &o.size,
+                );
+                let filled =
+                    order_event(1, 5_001 + v.seq, &o.vid, &o.cid, &o.price, &o.size, "0", "");
+                let queued = ok(json!({"order_id": vid, "status": "QUEUED_FOR_CANCELLATION"}));
+                vec![
+                    queued,
+                    Frame::Binary(fill.clone()),
+                    Frame::Binary(fill),
+                    Frame::Binary(filled),
+                ]
+            } else if v.filled_unsent_next_buy_cancel && v.orders[at].side == "BUY" {
+                v.filled_unsent_next_buy_cancel = false;
+                v.orders[at].open = false;
+                let o = v.orders[at].clone();
+                v.seq += 1;
+                let filled =
+                    order_event(1, 5_000 + v.seq, &o.vid, &o.cid, &o.price, &o.size, "0", "");
+                let queued = ok(json!({"order_id": vid, "status": "QUEUED_FOR_CANCELLATION"}));
+                vec![queued, Frame::Binary(filled)]
+            } else if v.closed_without_reply_once {
+                v.closed_without_reply_once = false;
+                vec![closed(&mut v, at)]
+            } else if v.already_closed_once {
+                v.already_closed_once = false;
+                vec![ok(json!({"order_id": vid, "status": "ALREADY_CLOSED"}))]
+            } else {
+                let queued = ok(json!({"order_id": vid, "status": "QUEUED_FOR_CANCELLATION"}));
+                vec![queued, closed(&mut v, at)]
+            }
+        }
+        "order.cancel_batch" => {
+            let ids = params["order_ids"].as_array().cloned().unwrap_or_default();
+            let mut results = Vec::new();
+            let mut events = Vec::new();
+            for id in &ids {
+                let vid = id.as_str().unwrap_or("");
                 let at = v
                     .orders
                     .iter()
-                    .position(|o| {
-                        params["id"].as_str() == Some(o.vid.as_str())
-                            || params["client_id"].as_str() == Some(o.cid.as_str())
-                    })
-                    .ok_or("a cancel of no order the stub holds")?;
-                let vid = v.orders[at].vid.clone();
-                if v.fill_next_buy_cancel && v.orders[at].side == "BUY" {
-                    v.fill_next_buy_cancel = false;
-                    v.orders[at].open = false;
-                    let o = v.orders[at].clone();
-                    // The fill moves the account's position (its duplicate does not).
-                    v.position += dec(&o.size);
-                    v.seq += 2;
-                    let fill = fill_event(
-                        5_000 + v.seq,
-                        "8615262148007719001",
-                        &o.vid,
-                        &o.cid,
-                        &o.price,
-                        &o.size,
-                    );
-                    let filled =
-                        order_event(1, 5_001 + v.seq, &o.vid, &o.cid, &o.price, &o.size, "0", "");
-                    let queued = ok(json!({"order_id": vid, "status": "QUEUED_FOR_CANCELLATION"}));
-                    vec![
-                        queued,
-                        Frame::Binary(fill.clone()),
-                        Frame::Binary(fill),
-                        Frame::Binary(filled),
-                    ]
-                } else if v.filled_unsent_next_buy_cancel && v.orders[at].side == "BUY" {
-                    v.filled_unsent_next_buy_cancel = false;
-                    v.orders[at].open = false;
-                    let o = v.orders[at].clone();
-                    v.seq += 1;
-                    let filled =
-                        order_event(1, 5_000 + v.seq, &o.vid, &o.cid, &o.price, &o.size, "0", "");
-                    let queued = ok(json!({"order_id": vid, "status": "QUEUED_FOR_CANCELLATION"}));
-                    vec![queued, Frame::Binary(filled)]
-                } else if v.already_closed_once {
-                    v.already_closed_once = false;
-                    vec![ok(json!({"order_id": vid, "status": "ALREADY_CLOSED"}))]
-                } else {
-                    let queued = ok(json!({"order_id": vid, "status": "QUEUED_FOR_CANCELLATION"}));
-                    vec![queued, closed(&mut v, at)]
+                    .position(|o| o.vid == vid)
+                    .ok_or("a batch cancel of no order the stub holds")?;
+                events.push(closed(&mut v, at));
+                let status = "QUEUED_FOR_CANCELLATION";
+                results.push(json!({"id": vid, "market": MARKET, "status": status}));
+            }
+            let mut frames = vec![ok(json!({ "results": results }))];
+            frames.extend(events);
+            frames
+        }
+        "order.cancel_all" => {
+            // An instrument cancel-all, which fbc-oms builds under 0005's I7 guard now that
+            // Paradex's resync is trustworthy (decision 0094): `{"status":"ok"}`, then every
+            // order still open on the market CLOSED, each by its order event.
+            if params["market"] != MARKET {
+                return Err(format!("a cancel-all not of the market: {params}"));
+            }
+            if v.refuse_cancel_all {
+                let error = json!({"code": -32603, "message": "Internal error"});
+                let reply = json!({"jsonrpc": "2.0", "error": error, "id": id});
+                return Ok(vec![Frame::text(reply.to_string())]);
+            }
+            let mut frames = vec![ok(json!({"status": "ok"}))];
+            for at in 0..v.orders.len() {
+                if v.orders[at].open {
+                    frames.push(closed(&mut v, at));
                 }
             }
-            "order.cancel_batch" => {
-                let ids = params["order_ids"].as_array().cloned().unwrap_or_default();
-                let mut results = Vec::new();
-                let mut events = Vec::new();
-                for id in &ids {
-                    let vid = id.as_str().unwrap_or("");
-                    let at = v
-                        .orders
-                        .iter()
-                        .position(|o| o.vid == vid)
-                        .ok_or("a batch cancel of no order the stub holds")?;
-                    events.push(closed(&mut v, at));
-                    let status = "QUEUED_FOR_CANCELLATION";
-                    results.push(json!({"id": vid, "market": MARKET, "status": status}));
-                }
-                let mut frames = vec![ok(json!({ "results": results }))];
-                frames.extend(events);
-                frames
-            }
-            "order.cancel_all" => {
-                // An instrument cancel-all, which fbc-oms builds under 0005's I7 guard now that
-                // Paradex's resync is trustworthy (decision 0094): `{"status":"ok"}`, then every
-                // order still open on the market CLOSED, each by its order event.
-                if params["market"] != MARKET {
-                    return Err(format!("a cancel-all not of the market: {params}"));
-                }
-                if v.refuse_cancel_all {
-                    let error = json!({"code": -32603, "message": "Internal error"});
-                    let reply = json!({"jsonrpc": "2.0", "error": error, "id": id});
-                    return Ok(vec![Frame::text(reply.to_string())]);
-                }
-                let mut frames = vec![ok(json!({"status": "ok"}))];
-                for at in 0..v.orders.len() {
-                    if v.orders[at].open {
-                        frames.push(closed(&mut v, at));
-                    }
-                }
-                frames
-            }
-            other => return Err(format!("an unexpected method {other}")),
-        };
-        Ok(frames)
-    })
+            frames
+        }
+        other => return Err(format!("an unexpected method {other}")),
+    };
+    Ok(frames)
 }
 
 /// `n` answered frames on connection `conn`.
@@ -2058,6 +2205,18 @@ async fn holding_relay(
     signal: Arc<Notify>,
     release: Option<Arc<Notify>>,
 ) -> String {
+    holding_relay_on(base, b"GET /v1/orderbook", n, signal, release).await
+}
+
+/// As [`holding_relay`], holding the `n`th request whose bytes hold `needle` (a request line's
+/// start, `GET /v1/positions`).
+async fn holding_relay_on(
+    base: &str,
+    needle: &'static [u8],
+    n: usize,
+    signal: Arc<Notify>,
+    release: Option<Arc<Notify>>,
+) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let target = base
         .strip_prefix("http://")
@@ -2084,7 +2243,7 @@ async fn holding_relay(
                             Ok(k) => k,
                         };
                         let read = &buf[..k];
-                        if read.windows(17).any(|w| w == b"GET /v1/orderbook") {
+                        if read.windows(needle.len()).any(|w| w == needle) {
                             let at = seen.fetch_add(1, Ordering::SeqCst) + 1;
                             if at == n as u64 {
                                 signal.notify_one();
@@ -2518,7 +2677,7 @@ fn each_side_is_quoted_only_within_the_caps_and_behind_its_own_touch() {
     let opts = plain_options();
     let qty = Lots::new(16).unwrap();
     let full = snapshot(Some("62000.2"), Some("62000.5"));
-    let wanted = quote::desired(&opts, qty, SignedLots(0), &full);
+    let wanted = quote::desired(&opts, qty, SignedLots(0), &full, mark());
     assert_eq!(
         (wanted.bid, wanted.ask),
         (Some(Ticks(618_141)), Some(Ticks(621_866)))
@@ -2528,12 +2687,18 @@ fn each_side_is_quoted_only_within_the_caps_and_behind_its_own_touch() {
     assert!(wanted.book.quote(Side::Sell, 0).unwrap().post_only);
 
     // A one-sided book quotes the side that rests.
-    let bids_only = quote::desired(&opts, qty, SignedLots(0), &snapshot(Some("62000.2"), None));
+    let bids_only = quote::desired(
+        &opts,
+        qty,
+        SignedLots(0),
+        &snapshot(Some("62000.2"), None),
+        mark(),
+    );
     assert_eq!((bids_only.bid.is_some(), bids_only.ask), (true, None));
     assert!(bids_only.skipped[0].contains("ask: its book side is empty"));
 
     // A quote above the resting cap at its price, or below the minimum notional, is left out.
-    let big = quote::desired(&opts, Lots::new(18).unwrap(), SignedLots(0), &full);
+    let big = quote::desired(&opts, Lots::new(18).unwrap(), SignedLots(0), &full, mark());
     assert!(
         big.skipped
             .iter()
@@ -2541,7 +2706,7 @@ fn each_side_is_quoted_only_within_the_caps_and_behind_its_own_touch() {
         "{:?}",
         big.skipped
     );
-    let small = quote::desired(&opts, Lots::new(5).unwrap(), SignedLots(0), &full);
+    let small = quote::desired(&opts, Lots::new(5).unwrap(), SignedLots(0), &full, mark());
     assert!(
         small
             .skipped
@@ -2552,10 +2717,10 @@ fn each_side_is_quoted_only_within_the_caps_and_behind_its_own_touch() {
 
     // Long 70 lots: a bid fill would take the position to 86 lots, $53.5 at the ask quote,
     // past the $50 inventory cap; the ask, reducing it, is quoted.
-    let long = quote::desired(&opts, qty, SignedLots(70), &full);
+    let long = quote::desired(&opts, qty, SignedLots(70), &full, mark());
     assert_eq!((long.bid, long.ask.is_some()), (None, true));
     assert!(long.skipped[0].starts_with("bid: a fill would take the position to 86 lots"));
-    let short = quote::desired(&opts, qty, SignedLots(-70), &full);
+    let short = quote::desired(&opts, qty, SignedLots(-70), &full, mark());
     assert_eq!((short.bid.is_some(), short.ask), (true, None));
 
     // A bid so far down it would be priced at zero is refused, not quoted at zero.
@@ -2568,33 +2733,34 @@ fn each_side_is_quoted_only_within_the_caps_and_behind_its_own_touch() {
 #[test]
 fn the_quote_size_and_caps_come_from_the_first_touch() {
     let opts = plain_options();
-    let sizing = quote::size(&opts, &snapshot(Some("62000.2"), Some("62000.5"))).unwrap();
+    let sizing = quote::size(&opts, &snapshot(Some("62000.2"), Some("62000.5")), mark()).unwrap();
     assert_eq!(
         (
             sizing.qty.get(),
             sizing.resting.get(),
             sizing.inventory.get(),
-            sizing.at
+            sizing.at,
+            sizing.mark
         ),
-        (16, 17, 80, dec("62186.6"))
+        (16, 17, 80, dec("62186.6"), mark())
     );
     // No side to quote, no lot in the size, or a notional below the market's minimum: refused.
     assert!(
-        quote::size(&opts, &snapshot(None, None))
+        quote::size(&opts, &snapshot(None, None), mark())
             .unwrap_err()
             .contains("no side")
     );
     let mut tiny = opts.clone();
     tiny.order_usd = dec("0.1");
     assert!(
-        quote::size(&tiny, &snapshot(Some("62000.2"), None))
+        quote::size(&tiny, &snapshot(Some("62000.2"), None), mark())
             .unwrap_err()
             .contains("less than one size step")
     );
     let mut strict = opts.clone();
     strict.min_notional = dec("10");
     assert!(
-        quote::size(&strict, &snapshot(Some("62000.2"), Some("62000.5")))
+        quote::size(&strict, &snapshot(Some("62000.2"), Some("62000.5")), mark())
             .unwrap_err()
             .contains("below the market's minimum")
     );
@@ -2612,4 +2778,1321 @@ fn the_planner_never_gets_an_amend_and_the_shape_is_checked_against_the_caps() {
             .unwrap_err()
             .contains("post-only GTC limit")
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// FBC-tyft: the supervised MAINNET mode (--mainnet), and the nine Codex findings carried from
+// PR #149 (owner decision 2026-10-15), each a test that fails without its fix.
+// ---------------------------------------------------------------------------------------------
+
+/// Paradex's factory in everything but its caps: the snapshot source it declares, and, when
+/// given, the units of the per-IP `Rest` bucket of a minute (Paradex's 600, `POST /auth`'s).
+struct Declared {
+    source: SnapshotSource,
+    rest_per_minute: Option<u32>,
+}
+
+/// Declares the snapshot source untrustworthy, whatever Paradex's own adapter declares.
+static UNTRUSTED: Declared = Declared {
+    source: SnapshotSource::Untrustworthy,
+    rest_per_minute: None,
+};
+
+/// Paradex's caps with the per-IP `Rest` bucket at 10 a minute (9 for normal traffic, its
+/// safety reserve kept).
+static TEN_RESTS_A_MINUTE: Declared = Declared {
+    source: SnapshotSource::Trustworthy,
+    rest_per_minute: Some(10),
+};
+
+impl VenueFactory for Declared {
+    fn id(&self) -> &'static str {
+        fbc_venue_paradex::ParadexFactory.id()
+    }
+    fn config_schema(&self) -> &'static [FieldSpec] {
+        fbc_venue_paradex::ParadexFactory.config_schema()
+    }
+    fn caps(&self, cfg: &VenueConfig) -> Result<VenueCaps, ConfigError> {
+        let mut caps = fbc_venue_paradex::ParadexFactory.caps(cfg)?;
+        if let Some(exec) = caps.exec.as_mut() {
+            exec.order.snapshot_source = self.source;
+        }
+        if let Some(units) = self.rest_per_minute {
+            let rest = TagSet::of(&[OpKind::Rest]);
+            for limit in &mut caps.limits {
+                if limit.scope == LimitScope::Ip
+                    && limit.ops == rest
+                    && limit.per == Duration::from_secs(60)
+                {
+                    limit.units = units;
+                }
+            }
+        }
+        Ok(caps)
+    }
+    fn parse_fbc_common_symbol(&self, s: &str) -> Result<AssetKey, SymbolError> {
+        fbc_venue_paradex::ParadexFactory.parse_fbc_common_symbol(s)
+    }
+    fn discover(
+        &self,
+        cfg: &VenueConfig,
+    ) -> Result<HttpPlan<Vec<InstrumentSpecDraft>>, VenueError> {
+        fbc_venue_paradex::ParadexFactory.discover(cfg)
+    }
+    fn plan_md(
+        &self,
+        cfg: &VenueConfig,
+        specs: &SpecTable,
+        subs: &BTreeSet<Subscription>,
+    ) -> Result<Vec<EndpointPlan>, VenueError> {
+        fbc_venue_paradex::ParadexFactory.plan_md(cfg, specs, subs)
+    }
+    fn md_codec(&self, cfg: &VenueConfig, ep: &EndpointPlan) -> Box<dyn MdCodec> {
+        fbc_venue_paradex::ParadexFactory.md_codec(cfg, ep)
+    }
+    fn plan_exec(&self, cfg: &VenueConfig) -> Result<Vec<ExecEndpoint>, VenueError> {
+        fbc_venue_paradex::ParadexFactory.plan_exec(cfg)
+    }
+    fn exec_codec(
+        &self,
+        cfg: &VenueConfig,
+        creds: Secrets,
+    ) -> Option<Result<Box<dyn ExecCodec>, VenueError>> {
+        fbc_venue_paradex::ParadexFactory.exec_codec(cfg, creds)
+    }
+    fn test_connection(
+        &self,
+        cfg: &VenueConfig,
+        creds: Secrets,
+    ) -> Option<Result<HttpPlan<AccountSummary>, VenueError>> {
+        fbc_venue_paradex::ParadexFactory.test_connection(cfg, creds)
+    }
+}
+
+/// The owner's mainnet run on the stub: `--mainnet`, the caps $11 resting per side and $50
+/// inventory, quotes of $11 (17 lots at the first touch's ask quote, 62186.6) 30 bps behind the
+/// touch, the BTC market's $10 minimum notional, `--duration 60`, at most `cycles` cycles 100 ms
+/// apart.
+fn mainnet_options(stub: &StubServer, cycles: u64) -> Options {
+    let mut opts = options(stub, cycles);
+    opts.mainnet = true;
+    opts.min_notional = dec("10");
+    opts.order_usd = dec("11");
+    opts
+}
+
+/// A venue answering `books` in turn to a mainnet run, whose first two `GET /positions` reads
+/// (the other markets' check and the resync's) answer the account's position.
+fn mainnet_venue(books: Vec<String>) -> Shared {
+    let venue = venue(books);
+    lock(&venue).unscripted = 2;
+    venue
+}
+
+/// Runs testnet_quote on `factory` with `opts` until it ends or `interrupt` completes, bounded at
+/// 60 s: its report and what it printed.
+async fn run_venue_until(
+    factory: &'static dyn VenueFactory,
+    opts: &Options,
+    interrupt: impl std::future::Future<Output = ()>,
+) -> (Result<quote::Report, String>, String) {
+    let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let out: testnet::Out = buf.clone();
+    let run = quote::run_venue(factory, opts, None, creds(), out, interrupt);
+    let ran = tokio::time::timeout(Duration::from_secs(60), run).await;
+    let printed = String::from_utf8(buf.borrow().clone()).unwrap();
+    let ran = ran.unwrap_or_else(|_| panic!("testnet_quote did not finish in 60 s:\n{printed}"));
+    (ran, printed)
+}
+
+/// The places the session sent on connection `conn`.
+fn creates(venue: &Shared, conn: usize) -> usize {
+    methods(venue, conn)
+        .iter()
+        .filter(|m| *m == "order.create")
+        .count()
+}
+
+/// Stop as the run printed it: the kill switch and the cancel of everything of ours, nothing
+/// placed after the `STOP` line.
+fn stopped(printed: &str) {
+    let stop = printed
+        .find("\nSTOP ")
+        .unwrap_or_else(|| panic!("no STOP line:\n{printed}"));
+    assert!(!printed[stop..].contains("\nPLACE "), "{printed}");
+    let step = printed[stop..]
+        .find("STEP stop")
+        .unwrap_or_else(|| panic!("no STEP stop:\n{printed}"));
+    assert!(
+        printed[stop + step..].contains("kill switch on; cancel all:"),
+        "{printed}"
+    );
+}
+
+/// [`position_event`] naming the market `market` (12 characters, as BTC-USD-PERP).
+fn position_event_on(market: &str, size: &str) -> Vec<u8> {
+    let mut f = position_event(size);
+    assert_eq!(market.len(), 12);
+    f[8 + 154 + 1..8 + 154 + 13].copy_from_slice(market.as_bytes());
+    f
+}
+
+/// Every required flag of a mainnet run, valid.
+fn mainnet_argv() -> Vec<String> {
+    let mut argv = required();
+    argv.push("--mainnet".to_owned());
+    argv
+}
+
+#[tokio::test]
+async fn mainnet_mode_requotes_by_cancel_and_replace_within_the_caps_for_several_cycles() {
+    capture::install();
+    // As the testnet loop: cycle 1 quotes the first touch, the touch moves up for cycle 2 and
+    // down for cycle 3 (both sides replaced twice), cycle 4 changes nothing. On mainnet's guard,
+    // its chain check, the other markets' check and the trustworthy resync's seed.
+    let books = vec![
+        b0(),
+        b0(),
+        book(2, Some("62100.0"), Some("62100.3")),
+        book(3, Some("61900.0"), Some("61900.4")),
+    ];
+    let venue = mainnet_venue(books);
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 4 + 4 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let opts = mainnet_options(&stub, 4);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+
+    assert!(report.ok, "{printed}");
+    assert_eq!(report.ended, "--cycles 4 reached", "{printed}");
+    assert_eq!(
+        (report.cycles, report.places_sent, report.cancels_sent),
+        (4, 6, 6),
+        "{printed}"
+    );
+    assert_eq!(report.cancelled, 6, "{printed}");
+    // No amend frame, ever: every change a cancel and then a place; the start's sweep and Stop
+    // the instrument cancel-all, first and last.
+    let sent = methods(&venue, 0);
+    let count = |m: &str| sent.iter().filter(|s| s.as_str() == m).count();
+    assert_eq!(count("order.modify"), 0, "{sent:?}");
+    assert_eq!(
+        (count("order.create"), count("order.cancel")),
+        (6, 4),
+        "{sent:?}"
+    );
+    assert_eq!(count("order.cancel_all"), 2, "{sent:?}");
+    assert_eq!(sent[6], "order.cancel_all", "{sent:?}");
+    assert_eq!(sent.last().map(String::as_str), Some("order.cancel_all"));
+    // Per side on the wire: a place, then the cancel of that very order before the next place.
+    let reqs = requests(&venue, 0);
+    for side in ["BUY", "SELL"] {
+        let mut resting: Option<String> = None;
+        for req in &reqs {
+            match req["method"].as_str().unwrap() {
+                "order.create" if req["params"]["side"] == side => {
+                    assert!(resting.is_none(), "a place while {resting:?} rests");
+                    let cid = req["params"]["client_id"].as_str().unwrap();
+                    let v = lock(&venue);
+                    resting = Some(v.orders.iter().find(|o| o.cid == cid).unwrap().vid.clone());
+                }
+                "order.cancel" => {
+                    for id in cancelled_ids(req) {
+                        if side_of(&venue, &id) == side {
+                            assert_eq!(resting.as_deref(), Some(id.as_str()), "{reqs:#?}");
+                            resting = None;
+                        }
+                    }
+                }
+                "order.cancel_all" => resting = None,
+                _ => {}
+            }
+        }
+        assert!(resting.is_none(), "{side}: Stop left one resting");
+    }
+    // Per side, printed before Stop: each replace's cancel acknowledged and its order closed
+    // before the next place.
+    let before_stop = printed.split("\nSTOP ").next().unwrap();
+    for side in ["bid", "ask"] {
+        let tags: Vec<&str> = before_stop
+            .lines()
+            .filter(|l| l.split_whitespace().nth(2) == Some(side))
+            .map(|l| l.split_whitespace().next().unwrap())
+            .collect();
+        let replace = ["PLACE", "ACK", "CANCEL", "CANCEL-ACK", "CLOSED"];
+        let want: Vec<&str> = replace
+            .iter()
+            .chain(&replace)
+            .chain(&["PLACE", "ACK"])
+            .copied()
+            .collect();
+        assert_eq!(tags, want, "{side}:\n{printed}");
+    }
+    // Every place within the caps and at least the minimum at the mark it was judged by.
+    let v = lock(&venue);
+    for (req, mark) in reqs
+        .iter()
+        .filter(|r| r["method"] == "order.create")
+        .zip(&v.marks_at_create)
+    {
+        assert_eq!(req["params"]["instruction"], "POST_ONLY");
+        let px = dec(req["params"]["price"].as_str().unwrap());
+        let size = dec(req["params"]["size"].as_str().unwrap());
+        assert_eq!(size, dec("0.00017"), "{req}");
+        assert!(px * size <= dec("11"), "{req}");
+        assert!(size * *mark >= dec("10"), "{req} at the mark {mark}");
+        assert!(dec("62100.3") * size <= dec("50"), "{req}");
+    }
+    drop(v);
+    // Mainnet's chain is read first, before anything else.
+    let http = stub.http_requests();
+    assert_eq!(http[0], "GET /v1/system/config", "{http:?}");
+    for line in [
+        "MAINNET a loopback test stub, not Paradex: REST host 127.0.0.1 WS host 127.0.0.1 chain \
+         PRIVATE_SN_PARACLEAR_MAINNET",
+        "SUPERVISED mainnet run",
+        "STEP chain",
+        "STEP positions",
+        "SEED position 0 lots seeded by the trustworthy resync (decision 0094)",
+        "PLUMBING TEST, not a strategy",
+        "DONE ok (--cycles 4 reached)",
+    ] {
+        assert!(printed.contains(line), "{line}:\n{printed}");
+    }
+    assert!(!printed.contains("OWNER-ASSISTED"), "{printed}");
+    assert!(!printed.contains("seeded by hand from"), "{printed}");
+    stopped(&printed);
+    no_credential_in(&printed);
+    no_credential_in(&capture::all());
+}
+
+#[test]
+fn mainnet_mode_needs_both_mainnet_and_sole_trader_and_takes_only_mainnets_urls() {
+    let opts = parsed(mainnet_argv());
+    assert!(opts.mainnet);
+    assert_eq!(
+        (opts.rest_url.as_str(), opts.ws_url.as_str()),
+        (mainnet::MAINNET_REST, mainnet::MAINNET_WS)
+    );
+    assert_eq!(
+        (mainnet::MAINNET_REST, mainnet::MAINNET_WS),
+        (
+            "https://api.prod.paradex.trade/v1",
+            "wss://ws.api.prod.paradex.trade/v1"
+        )
+    );
+    assert!(
+        opts.lease_dir.ends_with(".fueledbychai/mainnet_smoke"),
+        "{:?}",
+        opts.lease_dir
+    );
+    // Without --sole-trader: refused.
+    let mut argv = mainnet_argv();
+    argv.retain(|a| a != "--sole-trader");
+    assert!(
+        args::parse(argv)
+            .unwrap_err()
+            .contains("--sole-trader is required")
+    );
+    // Without --mainnet, mainnet's URLs are the testnet guard's to refuse.
+    for (flag, url) in [
+        ("--rest-url", "https://api.prod.paradex.trade/v1"),
+        ("--ws-url", "wss://ws.api.prod.paradex.trade/v1"),
+    ] {
+        let mut argv = required();
+        argv.extend(strings(&[flag, url]));
+        let refused = args::parse(argv).unwrap_err();
+        assert!(refused.contains("testnet only"), "{refused}");
+    }
+    // With it, anything but mainnet's URLs exactly (or both a loopback stub's) is refused, the
+    // URL never shown.
+    for (flag, url) in [
+        ("--rest-url", "https://api.testnet.paradex.trade/v1"),
+        ("--ws-url", "wss://ws.api.testnet.paradex.trade/v1"),
+        ("--rest-url", "https://api.prod.paradex.trade/v2"),
+        ("--rest-url", "https://api.prod.paradex.trade/v1/"),
+        ("--ws-url", "ws://ws.api.prod.paradex.trade/v1"),
+        ("--rest-url", "https://evil.example/v1"),
+    ] {
+        let mut argv = mainnet_argv();
+        argv.extend(strings(&[flag, url]));
+        let refused = args::parse(argv).unwrap_err();
+        assert!(refused.contains("mainnet only"), "{url}: {refused}");
+        assert!(!refused.contains(url), "{refused}");
+    }
+    let mut argv = mainnet_argv();
+    argv.extend(strings(&["--rest-url", "http://127.0.0.1:9/v1"]));
+    assert!(args::parse(argv).unwrap_err().contains("both"));
+    // Both a loopback stub's: taken (the tests' stubs).
+    let mut argv = mainnet_argv();
+    argv.extend(strings(&[
+        "--rest-url",
+        "http://127.0.0.1:9/v1",
+        "--ws-url",
+        "ws://127.0.0.1:9/v1",
+    ]));
+    assert!(parsed(argv).mainnet);
+    // --help names the mode, its limits and its lines.
+    for name in [
+        "--mainnet",
+        "MAINNET MODE",
+        "PARADEX_MAINNET_ACCOUNT_ADDRESS",
+        "PARADEX_MAINNET_PRIVATE_KEY",
+        "PRIVATE_SN_PARACLEAR_MAINNET",
+        "https://api.prod.paradex.trade/v1",
+        "wss://ws.api.prod.paradex.trade/v1",
+        "at most 11",
+        "at most 50",
+        "at least 20",
+        "at most 3600",
+        "never seeded by hand",
+        "ORDER_SIZE_BELOW_MIN",
+        "STEP chain",
+        "STEP positions",
+        "SUPERVISED",
+        "PACE",
+    ] {
+        assert!(USAGE.contains(name), "--help lacks {name}");
+    }
+}
+
+#[tokio::test]
+async fn mainnet_mode_refuses_caps_offsets_and_a_duration_past_the_owners_limits_before_anything_connects()
+ {
+    let set = |flag: &str, value: &str| -> Result<Parsed, String> {
+        let mut argv = mainnet_argv();
+        let at = argv.iter().position(|a| a == flag).unwrap();
+        argv[at + 1] = value.to_owned();
+        args::parse(argv)
+    };
+    for (flag, value, why) in [
+        ("--resting-cap-usd", "11.01", "at most $11 per side"),
+        ("--inventory-cap-usd", "50.5", "at most $50"),
+        ("--bid-bps", "19", "at least 20 basis points"),
+        ("--ask-bps", "19", "at least 20 basis points"),
+        ("--duration", "3601", "at most 3600 s"),
+    ] {
+        let refused = set(flag, value).unwrap_err();
+        assert!(refused.contains(flag), "{flag}: {refused}");
+        assert!(refused.contains(why), "{flag}: {refused}");
+    }
+    // Smaller caps, offsets of 20 and an hour are taken.
+    for (flag, value) in [
+        ("--resting-cap-usd", "10.5"),
+        ("--inventory-cap-usd", "20"),
+        ("--bid-bps", "20"),
+        ("--ask-bps", "20"),
+        ("--duration", "3600"),
+    ] {
+        assert!(matches!(set(flag, value), Ok(Parsed::Quote(_))), "{flag}");
+    }
+    assert_eq!(
+        (args::MAINNET_OFFSET_MIN, args::MAINNET_DURATION_MAX),
+        (20, 3_600)
+    );
+    // --duration stays required.
+    let mut argv = mainnet_argv();
+    let at = argv.iter().position(|a| a == "--duration").unwrap();
+    argv.drain(at..at + 2);
+    assert!(
+        args::parse(argv)
+            .unwrap_err()
+            .contains("--duration is required")
+    );
+    // A testnet run has none of these limits.
+    let mut argv = required();
+    argv.extend(strings(&["--bid-bps", "1", "--duration", "86400"]));
+    assert!(matches!(args::parse(argv), Ok(Parsed::Quote(_))));
+    // Options built some other way are checked again by the run, before anything connects:
+    // against a loopback stub, which sees nothing.
+    let venue = mainnet_venue(vec![b0()]);
+    let stub = StubServer::start(WsScript::new(vec![]), routes(&venue, login_ok()))
+        .await
+        .unwrap();
+    type Break = (fn(&mut Options), &'static str);
+    let breaks: [Break; 7] = [
+        (|o| o.resting_cap_usd = dec("12"), "at most $11"),
+        (|o| o.inventory_cap_usd = dec("51"), "at most $50"),
+        (|o| o.bid_bps = 10, "at least 20"),
+        (|o| o.ask_bps = 5, "at least 20"),
+        (|o| o.duration_secs = 7_200, "at most 3600"),
+        (|o| o.sole_trader = false, "--sole-trader is required"),
+        (
+            |o| o.rest_url = "https://api.testnet.paradex.trade/v1".to_owned(),
+            "--rest-url and --ws-url",
+        ),
+    ];
+    for (break_it, why) in breaks {
+        let mut opts = mainnet_options(&stub, 1);
+        break_it(&mut opts);
+        let (ran, printed) = run_venue_until(
+            &fbc_venue_paradex::ParadexFactory,
+            &opts,
+            std::future::pending(),
+        )
+        .await;
+        let refused = ran
+            .err()
+            .unwrap_or_else(|| panic!("not refused:\n{printed}"));
+        assert!(refused.contains(why), "{why}: {refused}");
+        assert!(printed.is_empty(), "{printed}");
+    }
+    assert!(
+        stub.http_requests().is_empty(),
+        "{:?}",
+        stub.http_requests()
+    );
+    assert!(stub.connections().is_empty());
+}
+
+#[tokio::test]
+async fn mainnet_mode_checks_the_chain_id_before_anything_connects_and_at_start() {
+    // PARADEX_CHAIN_ID, when set, must be mainnet's: by name or as its felt.
+    let venue = mainnet_venue(vec![b0()]);
+    let stub = StubServer::start(WsScript::new(vec![]), routes(&venue, login_ok()))
+        .await
+        .unwrap();
+    let opts = mainnet_options(&stub, 1);
+    for chain in [
+        mainnet::MAINNET_CHAIN,
+        mainnet::MAINNET_CHAIN_DECIMAL,
+        &format!("0x{}", mainnet::MAINNET_CHAIN_HEX),
+    ] {
+        assert_eq!(quote::guard(&opts, Some(chain)), Ok(true), "{chain}");
+    }
+    for chain in [
+        "PRIVATE_SN_PARACLEAR_TESTNET",
+        testnet::TESTNET_CHAIN_DECIMAL,
+        "PRIVATE_SN_POTC_SEPOLIA",
+    ] {
+        let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
+        let out: testnet::Out = buf.clone();
+        let refused = quote::run(&opts, Some(chain), creds(), out, std::future::pending())
+            .await
+            .unwrap_err();
+        assert!(refused.contains("PARADEX_CHAIN_ID"), "{refused}");
+        assert!(
+            refused.contains("PRIVATE_SN_PARACLEAR_MAINNET"),
+            "{refused}"
+        );
+        assert!(!refused.contains(chain), "{refused}");
+        assert!(buf.borrow().is_empty());
+    }
+    assert!(stub.http_requests().is_empty());
+    assert!(stub.connections().is_empty());
+    // At start, GET /system/config must name mainnet's chain: another refuses the run before the
+    // order socket connects, and before anything but that read.
+    for (chain, shown) in [
+        (
+            "PRIVATE_SN_PARACLEAR_TESTNET",
+            "PRIVATE_SN_PARACLEAR_TESTNET",
+        ),
+        ("0xdeadbeef secret", "not shown"),
+    ] {
+        let venue = mainnet_venue(vec![b0()]);
+        lock(&venue).chain = Some(chain);
+        let stub = StubServer::start(WsScript::new(vec![]), routes(&venue, login_ok()))
+            .await
+            .unwrap();
+        let opts = mainnet_options(&stub, 1);
+        let (ran, printed) = run_venue_until(
+            &fbc_venue_paradex::ParadexFactory,
+            &opts,
+            std::future::pending(),
+        )
+        .await;
+        let refused = ran
+            .err()
+            .unwrap_or_else(|| panic!("not refused:\n{printed}"));
+        assert!(
+            refused.contains("PRIVATE_SN_PARACLEAR_MAINNET"),
+            "{refused}"
+        );
+        assert!(refused.contains(shown), "{refused}");
+        assert!(!refused.contains("deadbeef"), "{refused}");
+        assert_eq!(stub.http_requests(), ["GET /v1/system/config"]);
+        assert!(stub.connections().is_empty());
+    }
+}
+
+#[test]
+fn mainnet_mode_reads_only_the_mainnet_credentials_and_refuses_a_testnet_one() {
+    let (account, key) = synthetic();
+    let env = |pairs: &[(&str, &str)]| {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        move |var: &str| map.get(var).cloned()
+    };
+    let mainnet_vars = [
+        (auth_mainnet::ACCOUNT_VAR, account.as_str()),
+        (auth_mainnet::KEY_VAR, key.as_str()),
+    ];
+    let testnet_vars = [
+        (auth::ACCOUNT_VAR, account.as_str()),
+        (auth::KEY_VAR, key.as_str()),
+    ];
+    let mut mainnet = parsed(mainnet_argv());
+    let (session, check) = quote::credentials(&mainnet, env(&mainnet_vars)).unwrap();
+    for creds in [&session, &check] {
+        assert!(creds.get(ACCOUNT_ADDRESS).is_some() && creds.get(SIGNING_KEY).is_some());
+    }
+    // A testnet variable set beside them refuses the run; the testnet ones alone are never
+    // taken in their place; no value is ever shown.
+    for var in auth_mainnet::TESTNET_VARS {
+        let mut pairs = mainnet_vars.to_vec();
+        pairs.push((var, "0x1"));
+        let refused = quote::credentials(&mainnet, env(&pairs)).unwrap_err();
+        assert!(
+            refused.contains(var) && refused.contains("unset"),
+            "{refused}"
+        );
+        assert!(!refused.contains(&account) && !refused.contains(&key));
+    }
+    let refused = quote::credentials(&mainnet, env(&testnet_vars)).unwrap_err();
+    assert!(
+        refused.contains("PARADEX_MAINNET_ACCOUNT_ADDRESS"),
+        "{refused}"
+    );
+    assert!(!refused.contains(&account) && !refused.contains(&key));
+    // A testnet run reads the testnet variables, never the mainnet ones.
+    mainnet.mainnet = false;
+    let testnet = mainnet;
+    assert!(quote::credentials(&testnet, env(&testnet_vars)).is_ok());
+    let refused = quote::credentials(&testnet, env(&mainnet_vars)).unwrap_err();
+    assert!(refused.contains("PARADEX_ACCOUNT_ADDRESS"), "{refused}");
+}
+
+#[tokio::test]
+async fn an_untrustworthy_snapshot_source_refuses_mainnet_mode_before_anything_connects() {
+    let venue = mainnet_venue(vec![b0()]);
+    let stub = StubServer::start(WsScript::new(vec![]), routes(&venue, login_ok()))
+        .await
+        .unwrap();
+    let opts = mainnet_options(&stub, 1);
+    let (ran, printed) = run_venue_until(&UNTRUSTED, &opts, std::future::pending()).await;
+    let refused = ran
+        .err()
+        .unwrap_or_else(|| panic!("not refused:\n{printed}"));
+    assert!(refused.contains("untrustworthy"), "{refused}");
+    assert!(refused.contains("never seeded by hand"), "{refused}");
+    assert!(refused.contains("decision 0094"), "{refused}");
+    assert!(printed.is_empty(), "{printed}");
+    assert!(stub.http_requests().is_empty());
+    assert!(stub.connections().is_empty());
+}
+
+#[tokio::test]
+async fn a_resync_that_seeds_nothing_refuses_start_in_mainnet_mode_never_seeding_by_hand() {
+    // Past the run's up-front check, on a venue declaring its snapshot untrustworthy: the resync
+    // seeds nothing, and a mainnet market is never seeded by hand, so Start is refused and the
+    // run Stops with nothing placed. (A testnet run seeds such a market by hand, decision 0067.)
+    let venue = mainnet_venue(vec![b0()]);
+    // The opening six; Stop has nothing to cancel.
+    let stub = StubServer::start(one_connection(&venue, 6), routes(&venue, login_ok()))
+        .await
+        .unwrap();
+    let opts = mainnet_options(&stub, 1);
+    let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let out: testnet::Out = buf.clone();
+    let lines = testnet::Lines {
+        out,
+        t0: std::time::Instant::now(),
+    };
+    let report = quote::run_on(&UNTRUSTED, &opts, creds(), lines, std::future::pending())
+        .await
+        .unwrap();
+    stub.finished().await.unwrap();
+    let printed = String::from_utf8(buf.borrow().clone()).unwrap();
+    assert!(!report.ok, "{printed}");
+    assert!(report.ended.starts_with("Start refused"), "{printed}");
+    assert!(report.ended.contains("never seeded by hand"), "{printed}");
+    assert!(printed.contains("declared untrustworthy"), "{printed}");
+    assert!(!printed.contains("STEP start"), "{printed}");
+    assert!(!printed.contains("SEED "), "{printed}");
+    assert_eq!(report.places_sent, 0, "{printed}");
+    assert_eq!(creates(&venue, 0), 0);
+    stopped(&printed);
+}
+
+#[tokio::test]
+async fn mainnet_mode_stops_on_the_interrupt() {
+    let venue = mainnet_venue(vec![b0()]);
+    let signal = Arc::new(Notify::new());
+    // The interrupt comes as cycle 2 reads the touch: cycle 1's two orders rest.
+    lock(&venue).signal = Some((3, Arc::clone(&signal)));
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let opts = mainnet_options(&stub, 1_000);
+    let (report, printed) = run_until(&opts, async move { signal.notified().await }).await;
+    stub.finished().await.unwrap();
+    assert!(report.ok, "{printed}");
+    assert_eq!(report.ended, "interrupted (Ctrl-C)", "{printed}");
+    assert_eq!((report.places_sent, report.cancelled), (2, 2), "{printed}");
+    assert_eq!(
+        methods(&venue, 0).last().map(String::as_str),
+        Some("order.cancel_all")
+    );
+    stopped(&printed);
+}
+
+#[tokio::test]
+async fn mainnet_mode_stops_at_the_duration() {
+    // Cycle 1's touch is never answered: --duration (1 s) passes with nothing placed.
+    let venue = mainnet_venue(vec![b0()]);
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let mut opts = mainnet_options(&stub, 1_000_000);
+    opts.duration_secs = 1;
+    opts.rest_url = holding_relay(&opts.rest_url, 2, Arc::new(Notify::new()), None).await;
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(report.ok, "{printed}");
+    assert_eq!(report.ended, "--duration 1 s reached", "{printed}");
+    assert_eq!(report.places_sent, 0, "{printed}");
+    assert_eq!(
+        methods(&venue, 0).last().map(String::as_str),
+        Some("order.cancel_all")
+    );
+    stopped(&printed);
+}
+
+#[tokio::test]
+async fn mainnet_mode_stops_on_a_resync_mismatch_with_no_place_after() {
+    // After the reconnect the venue reports a long the inventory (flat) does not hold.
+    let venue = mainnet_venue(vec![b0()]);
+    lock(&venue).position_after_first = Some("0.001");
+    let script = reconnecting(&venue, 6 + 1 + 2, 6 + 1 + 1);
+    let stub = StubServer::start(script, routes(&venue, login_ok()))
+        .await
+        .unwrap();
+    let opts = mainnet_options(&stub, 50);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(!report.ok, "{printed}");
+    assert!(
+        report
+            .ended
+            .starts_with("a resync found the position other than the registry's"),
+        "{printed}"
+    );
+    assert_eq!(creates(&venue, 1), 0, "{printed}");
+    assert_eq!(report.cancelled, 2, "{printed}");
+    stopped(&printed);
+}
+
+#[tokio::test]
+async fn mainnet_mode_stops_on_an_order_of_ours_gone_unknown() {
+    // The bid's replace cancel is answered ALREADY_CLOSED (Unknown, FBC-rht4).
+    let venue = mainnet_venue(vec![b0(), b0(), book(2, Some("62100.0"), Some("62100.3"))]);
+    lock(&venue).already_closed_once = true;
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 2 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let opts = mainnet_options(&stub, 10);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(!report.ok, "{printed}");
+    assert!(report.ended.contains("came back Unknown"), "{printed}");
+    assert_eq!(creates(&venue, 0), 2, "{printed}");
+    assert_eq!(
+        methods(&venue, 0).last().map(String::as_str),
+        Some("order.cancel_all")
+    );
+    stopped(&printed);
+}
+
+#[tokio::test]
+async fn mainnet_mode_stops_on_a_refused_login() {
+    // The other markets' check logs in (POST /auth 1); the session's login (2 and on) is
+    // refused: the loop Stops at once, nothing sent on the order socket.
+    let venue = mainnet_venue(vec![b0()]);
+    lock(&venue).login_refused_from = Some(2);
+    let script = WsScript::new(vec![Step::Accept, Step::Accept, Step::Accept]);
+    let stub = StubServer::start(script, routes(&venue, login_ok()))
+        .await
+        .unwrap();
+    let mut opts = mainnet_options(&stub, 3);
+    opts.step_timeout_secs = 40;
+    let started = std::time::Instant::now();
+    let (report, printed) = run_against(&opts).await;
+    assert!(started.elapsed() < Duration::from_secs(30), "{printed}");
+    assert!(!report.ok, "{printed}");
+    assert!(report.ended.starts_with("a login was refused"), "{printed}");
+    assert_eq!((report.places_sent, report.cancels_sent), (0, 0));
+    assert!(methods(&venue, 0).is_empty());
+    stopped(&printed);
+    no_credential_in(&printed);
+}
+
+#[tokio::test]
+async fn mainnet_mode_stops_on_a_permanent_refusal() {
+    // The first place is refused with Paradex's method error (code 100, RejectKind::Other).
+    let venue = mainnet_venue(vec![b0()]);
+    lock(&venue).reject_create = Some((1, 100));
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let opts = mainnet_options(&stub, 5);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(!report.ok, "{printed}");
+    assert!(report.ended.contains("refused permanently"), "{printed}");
+    assert_eq!(creates(&venue, 0), 2, "{printed}");
+    stopped(&printed);
+}
+
+#[tokio::test]
+async fn mainnet_mode_stops_on_a_position_mismatch_that_persists() {
+    // Cycle 2's bid cancel races a fill of all of it (17 lots); GET /positions keeps showing the
+    // account flat: the check after the fill and its re-read disagree, so the loop Stops with
+    // nothing placed after the fill (FBC-hpg6).
+    let venue = mainnet_venue(vec![b0(), b0(), book(2, Some("62100.0"), Some("62100.3"))]);
+    {
+        let mut v = lock(&venue);
+        v.fill_next_buy_cancel = true;
+        v.positions_script = vec![None, None, None, None].into();
+    }
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 2 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let mut opts = mainnet_options(&stub, 3);
+    opts.step_timeout_secs = 2;
+    let (report, printed) = run_against(&opts).await;
+    tokio::time::timeout(Duration::from_secs(30), stub.finished())
+        .await
+        .unwrap_or_else(|_| panic!("the stub's script did not play to its end:\n{printed}"))
+        .unwrap();
+    assert!(!report.ok, "{printed}");
+    assert!(report.ended.contains(positions::HAND_CHECK), "{printed}");
+    assert!(report.ended.contains("after the first fill"), "{printed}");
+    assert_eq!(creates(&venue, 0), 2, "{printed}");
+    let fill = printed.find("\nFILL ").unwrap();
+    assert!(!printed[fill..].contains("\nPLACE "), "{printed}");
+    stopped(&printed);
+}
+
+#[tokio::test]
+async fn every_place_reaches_the_minimum_at_the_mark_and_a_side_below_it_is_left_out_never_sent() {
+    // The 2026-10-16 live finding: Paradex judges the minimum notional at the MARK. The mark
+    // falls to 58000 for cycle 2 (17 lots there are $9.86, under the $10 minimum): both sides
+    // are left out, printed, and their quotes cancelled; nothing below the minimum is sent.
+    let venue = mainnet_venue(vec![b0(), b0(), book(2, Some("62100.0"), Some("62100.3"))]);
+    lock(&venue).marks = vec![MARK, MARK, "58000"];
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 2 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let opts = mainnet_options(&stub, 2);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(report.ok, "{printed}");
+    assert_eq!(creates(&venue, 0), 2, "{printed}");
+    for side in ["bid", "ask"] {
+        let skipped = format!(
+            "SKIP {side}: its notional $9.86 at the mark 58000 is below the market's minimum $10"
+        );
+        assert!(printed.contains(&skipped), "{skipped}:\n{printed}");
+    }
+    assert!(printed.contains("mark 58000"), "{printed}");
+    let reqs = requests(&venue, 0);
+    let v = lock(&venue);
+    for (req, mark) in reqs
+        .iter()
+        .filter(|r| r["method"] == "order.create")
+        .zip(&v.marks_at_create)
+    {
+        let size = dec(req["params"]["size"].as_str().unwrap());
+        assert!(size * *mark >= dec("10"), "{req} at {mark}");
+    }
+    // The mark is read with every touch: once for the sizing and once a cycle.
+    assert_eq!(v.mark_reads, v.book_reads, "{printed}");
+}
+
+#[tokio::test]
+async fn a_quote_below_the_minimum_at_the_first_mark_refuses_the_run_before_the_order_socket_connects()
+ {
+    let venue = mainnet_venue(vec![b0()]);
+    lock(&venue).marks = vec!["58000"];
+    let stub = StubServer::start(WsScript::new(vec![]), routes(&venue, login_ok()))
+        .await
+        .unwrap();
+    let opts = mainnet_options(&stub, 1);
+    let (ran, printed) = run_venue_until(
+        &fbc_venue_paradex::ParadexFactory,
+        &opts,
+        std::future::pending(),
+    )
+    .await;
+    let refused = ran
+        .err()
+        .unwrap_or_else(|| panic!("not refused:\n{printed}"));
+    assert!(
+        refused
+            .contains("at the mark price 58000 is $9.86 (17 lots), below the market's minimum $10"),
+        "{refused}"
+    );
+    assert!(stub.connections().is_empty());
+}
+
+#[tokio::test]
+async fn an_asynchronous_order_size_below_min_stops_it_as_a_sizing_error() {
+    // Paradex's risk check closes cycle 1's first quote ORDER_SIZE_BELOW_MIN after accepting it:
+    // a sizing error, permanent, never a venue fault: the run Stops and fails.
+    let venue = mainnet_venue(vec![b0()]);
+    lock(&venue).close_create = Some((1, "ORDER_SIZE_BELOW_MIN"));
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let opts = mainnet_options(&stub, 5);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(!report.ok, "{printed}");
+    assert!(report.ended.starts_with("a sizing error"), "{printed}");
+    assert!(report.ended.contains("ORDER_SIZE_BELOW_MIN"), "{printed}");
+    assert_eq!(creates(&venue, 0), 2, "{printed}");
+    stopped(&printed);
+}
+
+#[tokio::test]
+async fn a_position_on_another_market_refuses_mainnet_mode_before_the_order_socket_connects() {
+    // Codex r4277631493 on PR #149: --sole-trader, yet the account holds a position elsewhere.
+    let venue = mainnet_venue(vec![b0()]);
+    lock(&venue).elsewhere = Some(("ETH-USD-PERP", "0.5"));
+    let stub = StubServer::start(WsScript::new(vec![]), routes(&venue, login_ok()))
+        .await
+        .unwrap();
+    let opts = mainnet_options(&stub, 1);
+    let (ran, printed) = run_venue_until(
+        &fbc_venue_paradex::ParadexFactory,
+        &opts,
+        std::future::pending(),
+    )
+    .await;
+    let refused = ran
+        .err()
+        .unwrap_or_else(|| panic!("not refused:\n{printed}"));
+    assert!(refused.contains("ETH-USD-PERP 0.5"), "{refused}");
+    assert!(refused.contains("--sole-trader"), "{refused}");
+    assert!(stub.connections().is_empty());
+    assert!(!printed.contains("STEP positions"), "{printed}");
+    // The answer is read for other markets only: the run's own, a flat one, and a name not
+    // shaped like a market are not listed or not shown.
+    let body = json!({"results": [
+        {"market": MARKET, "size": "0.001", "status": "OPEN"},
+        {"market": "SOL-USD-PERP", "size": "0", "status": "CLOSED"},
+        {"market": "0xSECRETVALUE-not-a-market", "size": "-2", "status": "OPEN"},
+    ]})
+    .to_string();
+    let listed = positions::other_markets(body.as_bytes(), MARKET).unwrap();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert!(!listed[0].contains("SECRETVALUE"), "{listed:?}");
+    assert!(positions::other_markets(b"not json", MARKET).is_err());
+}
+
+#[tokio::test]
+async fn a_position_event_on_another_market_stops_the_loop() {
+    // The same premise once the loop runs: the venue reports a position on another market (the
+    // adapter, knowing only the run's market, refuses the frame: a decode error), and the loop
+    // Stops with nothing placed after.
+    let venue = venue(vec![b0()]);
+    let mut steps = vec![Step::Accept];
+    steps.extend(answered(&venue, 0, 6 + 1 + 2));
+    steps.push(Step::Push {
+        conn: 0,
+        frame: Frame::Binary(position_event_on("ETH-USD-PERP", "0.5")),
+    });
+    steps.extend(answered(&venue, 0, 1));
+    let stub = StubServer::start(WsScript::new(steps), routes(&venue, login_ok()))
+        .await
+        .unwrap();
+    let opts = options(&stub, 1_000);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(!report.ok, "{printed}");
+    assert!(report.ended.contains("could not decode"), "{printed}");
+    assert_eq!(creates(&venue, 0), 2, "{printed}");
+    stopped(&printed);
+}
+
+#[tokio::test]
+async fn a_permanent_place_refusal_stops_it_and_fails_the_run() {
+    // Codex r4277631500 on PR #149: a place refused for good (Paradex's method error, code 100:
+    // RejectKind::Other) was only printed, and placed again every cycle, the run ending DONE
+    // ok. It Stops the loop now, fails the run, and is never sent again.
+    let venue = venue(vec![b0()]);
+    lock(&venue).reject_create = Some((1, 100));
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let opts = options(&stub, 5);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(!report.ok, "{printed}");
+    assert!(
+        report.ended.contains("refused permanently (Other"),
+        "{printed}"
+    );
+    assert!(printed.contains("DONE failed"), "{printed}");
+    assert_eq!(creates(&venue, 0), 2, "{printed}");
+    stopped(&printed);
+}
+
+#[tokio::test]
+async fn a_place_refused_for_its_rate_waits_its_retry_time_before_it_is_placed_again() {
+    // Codex r4277631500 on PR #149: RateLimited (Paradex's 42901, no retry time stated) is
+    // retried only after RATE_LIMITED_WAIT, never on the ordinary cycle interval.
+    let venue = venue(vec![b0()]);
+    lock(&venue).reject_create = Some((1, 42_901));
+    // The opening six, the start's sweep, the first pass's two places (one refused), the
+    // refused side's place after the wait, Stop's.
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 1 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let opts = options(&stub, 1);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(report.ok, "{printed}");
+    assert!(printed.contains("PACE "), "{printed}");
+    let times = lock(&venue).create_times.clone();
+    assert_eq!(times.len(), 3, "{printed}");
+    let waited = times[2].duration_since(times[0]);
+    assert!(waited >= quote::RATE_LIMITED_WAIT, "{waited:?}\n{printed}");
+    let first = requests(&venue, 0)
+        .into_iter()
+        .filter(|r| r["method"] == "order.create")
+        .map(|r| r["params"]["side"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        first[2], first[0],
+        "the refused side is the one placed again"
+    );
+}
+
+#[tokio::test]
+async fn a_position_reported_during_a_reconnects_resync_is_kept_until_the_inventory_agrees() {
+    // Codex r4277631505 on PR #149: on the second connection the venue's position stream reports
+    // a long of 16 lots before the resync's GET /positions answers (held by the relay until the
+    // client has read the event); the resync's snapshot shows the account flat, as the
+    // inventory is. The resync used to drop that report, and the loop quoted again from the
+    // inventory; the report is kept now, so nothing is planned while it differs and the book
+    // does not settle: Stop, with nothing placed on the second connection.
+    let venue = venue(vec![b0()]);
+    let release = Arc::new(Notify::new());
+    let mut steps = vec![Step::Accept];
+    steps.extend(answered(&venue, 0, 6 + 1 + 2));
+    steps.push(Step::Close { conn: 0 });
+    steps.push(Step::Accept);
+    steps.extend(answered(&venue, 1, 5));
+    steps.push(Step::Push {
+        conn: 1,
+        frame: Frame::Binary(position_event("0.00016")),
+    });
+    steps.push(Step::Barrier { conn: 1 });
+    let releasing = {
+        let (venue, release) = (venue.clone(), Arc::clone(&release));
+        Responder::new(move |frame| {
+            release.notify_one();
+            respond(&venue, 1, frame)
+        })
+    };
+    steps.push(Step::Respond {
+        conn: 1,
+        with: releasing,
+    });
+    // The Safety cancel of conn 0's two orders, the sweep's cancel-all, Stop's.
+    steps.extend(answered(&venue, 1, 1 + 1 + 1));
+    let stub = StubServer::start(WsScript::new(steps), routes(&venue, login_ok()))
+        .await
+        .unwrap();
+    let mut opts = options(&stub, 5);
+    opts.step_timeout_secs = 2;
+    opts.rest_url = holding_relay_on(
+        &opts.rest_url,
+        b"GET /v1/positions",
+        2,
+        Arc::new(Notify::new()),
+        Some(release),
+    )
+    .await;
+    let (report, printed) = run_against(&opts).await;
+    tokio::time::timeout(Duration::from_secs(30), stub.finished())
+        .await
+        .unwrap_or_else(|_| panic!("the stub's script did not play to its end:\n{printed}"))
+        .unwrap();
+    assert_eq!(
+        creates(&venue, 1),
+        0,
+        "quoted from a stale inventory:\n{printed}"
+    );
+    assert!(!report.ok, "{printed}");
+    assert!(
+        report
+            .ended
+            .contains("the venue's position (16 lots) and the inventory (0 lots) agreeing"),
+        "{printed}"
+    );
+    stopped(&printed);
+}
+
+#[tokio::test]
+async fn a_replace_is_placed_only_after_its_cancel_is_answered_even_once_its_order_ended() {
+    // Codex r4277631497 on PR #149: cycle 2's bid cancel is answered with the order's CLOSED
+    // event only (the order stream ahead of the reply), and the reply never comes. The bid's
+    // replacement used to be placed at once, before any CANCEL-ACK; no pass plans now until
+    // the cancel is answered: it comes back Unknown at the RPC timeout, and the loop Stops.
+    let venue = venue(vec![b0(), b0(), book(2, Some("62100.0"), Some("62100.3"))]);
+    lock(&venue).closed_without_reply_once = true;
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 2 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let opts = options(&stub, 5);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert_eq!(
+        creates(&venue, 0),
+        2,
+        "a replacement went out before its cancel was answered:\n{printed}"
+    );
+    assert!(!report.ok, "{printed}");
+    assert!(report.ended.contains("came back Unknown"), "{printed}");
+    let sent = methods(&venue, 0);
+    assert_eq!(
+        &sent[9..],
+        ["order.cancel", "order.cancel", "order.cancel_all"]
+    );
+    stopped(&printed);
+}
+
+#[tokio::test]
+async fn after_a_fill_a_pass_requotes_only_from_an_order_book_newer_than_the_one_it_held() {
+    // Codex r4289363354 on PR #149: cycle 2's bid cancel races a fill; the pass after it reads a
+    // fresh touch, and GET /orderbook answers seq 2 again (a stale cache), the book held. It is
+    // read again until seq 3; the ask's new place is priced from that, never the stale one.
+    let books = vec![
+        b0(),
+        b0(),
+        book(2, Some("80000.0"), Some("80000.2")),
+        book(2, Some("80000.0"), Some("80000.2")),
+        book(3, Some("80000.0"), Some("80000.2")),
+    ];
+    let venue = venue(books);
+    lock(&venue).fill_next_buy_cancel = true;
+    let stub = StubServer::start(one_connection(&venue, GOES_ON), routes(&venue, login_ok()))
+        .await
+        .unwrap();
+    let mut opts = options(&stub, 3);
+    opts.order_usd = dec("8");
+    opts.inventory_cap_usd = dec("16");
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(report.ok, "{printed}");
+    assert!(
+        printed.contains("answered seq 2 after the position moved, no newer than the book held"),
+        "{printed}"
+    );
+    // GET /orderbook read 4 is the stale answer: the ask's new place comes after a later read
+    // (5, seq 3, or one after the position check that follows the fill).
+    let v = lock(&venue);
+    assert_eq!(v.books_at_create.len(), 3, "{printed}");
+    assert!(
+        v.books_at_create[2] > 4,
+        "the ask was priced from the stale book ({:?}):\n{printed}",
+        v.books_at_create
+    );
+    let last_cycle = printed.rfind("\nCYCLE 2 ").unwrap();
+    assert!(
+        !printed[last_cycle..]
+            .starts_with("\nCYCLE 2 touch bid 80000.0 ask 80000.2 (GET /orderbook seq 2)"),
+        "{printed}"
+    );
+}
+
+#[tokio::test]
+async fn a_permanent_cancel_refusal_stops_it_never_sending_that_cancel_again() {
+    // Codex r4289363361 on PR #149: cycle 2's bid cancel is refused for good (code 100). The OMS
+    // clears the cancel's intent, and the next pass used to send it again and again; it Stops
+    // the loop now, the bid cancelled by Stop's instrument cancel-all.
+    let venue = venue(vec![b0(), b0(), book(2, Some("62100.0"), Some("62100.3"))]);
+    lock(&venue).reject_cancel = Some((1, 100));
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 2 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let opts = options(&stub, 5);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(!report.ok, "{printed}");
+    assert!(
+        report.ended.contains("refused permanently (Other"),
+        "{printed}"
+    );
+    let sent = methods(&venue, 0);
+    assert_eq!(
+        sent.iter().filter(|m| *m == "order.cancel").count(),
+        2,
+        "{sent:?}"
+    );
+    assert_eq!(sent.last().map(String::as_str), Some("order.cancel_all"));
+    assert_eq!(creates(&venue, 0), 2, "{printed}");
+    stopped(&printed);
+}
+
+#[tokio::test]
+async fn a_cancel_refused_for_its_rate_is_sent_again_only_after_its_retry_time() {
+    // Codex r4289363361 on PR #149: a replace cancel refused RateLimited (42901) is sent again
+    // only after RATE_LIMITED_WAIT, never at the next pass.
+    let venue = venue(vec![b0(), b0(), book(2, Some("62100.0"), Some("62100.3"))]);
+    lock(&venue).reject_cancel = Some((1, 42_901));
+    // The opening six, the start's sweep, two places, cycle 2's two cancels (the first refused),
+    // after the wait the refused one again and the two places, Stop's.
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 2 + 3 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let opts = options(&stub, 2);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(report.ok, "{printed}");
+    assert!(printed.contains("PACE "), "{printed}");
+    let v = lock(&venue);
+    assert_eq!(v.cancel_times.len(), 3, "{printed}");
+    let waited = v.cancel_times[2].duration_since(v.cancel_times[0]);
+    assert!(waited >= quote::RATE_LIMITED_WAIT, "{waited:?}\n{printed}");
+}
+
+#[tokio::test]
+async fn a_stalled_high_water_write_stops_it_at_the_settle_deadline() {
+    // Codex r4289363366 on PR #149: the write of the client-id high-water mark is bounded by the
+    // book's settling time, as every other wait of a pass is, not by a fresh step timeout of
+    // its own: the stalled write Stops the loop at the settle deadline, nothing placed.
+    let venue = venue(vec![b0()]);
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let mut opts = options(&stub, 1);
+    opts.step_timeout_secs = 2;
+    let hold = testnet::held_writes::hold(&opts.lease_dir);
+    let (report, printed) = run_against(&opts).await;
+    hold.release();
+    stub.finished().await.unwrap();
+    assert!(!report.ok, "{printed}");
+    assert_eq!(
+        report.ended, "the client-id high-water mark's write did not happen in time",
+        "{printed}"
+    );
+    assert!(printed.contains("TIMEOUT settle"), "{printed}");
+    assert_eq!(report.places_sent, 0, "{printed}");
+    stopped(&printed);
+}
+
+#[tokio::test]
+async fn every_rest_read_of_the_loop_is_charged_to_the_venues_rate_limit() {
+    // Codex r4289363370 on PR #149: the touch (and mark) reads went out uncounted, so a fast
+    // loop could pass Paradex's per-IP limits. On a venue declaring 10 Rest requests a minute
+    // (9 for normal traffic), the run sends at most 9 of them (its logins, every GET /orderbook
+    // and GET /markets/summary), and once the limit has no room within the step timeout it
+    // Stops, rather than read past it.
+    let venue = venue(vec![b0()]);
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let mut opts = options(&stub, 1_000);
+    opts.step_timeout_secs = 1;
+    let (ran, printed) = run_venue_until(&TEN_RESTS_A_MINUTE, &opts, std::future::pending()).await;
+    stub.finished().await.unwrap();
+    let report = ran.unwrap_or_else(|e| panic!("refused: {e}\n{printed}"));
+    let rest = stub
+        .http_requests()
+        .iter()
+        .filter(|r| {
+            [
+                "POST /v1/auth",
+                "GET /v1/orderbook",
+                "GET /v1/markets/summary",
+            ]
+            .iter()
+            .any(|p| r.starts_with(p))
+        })
+        .count();
+    assert!(
+        rest <= 9,
+        "{rest} Rest requests: {:?}",
+        stub.http_requests()
+    );
+    assert!(!report.ok, "{printed}");
+    assert!(report.ended.contains("rate limit"), "{printed}");
+    stopped(&printed);
+}
+
+#[tokio::test]
+async fn the_last_cycle_stops_the_loop_without_waiting_the_interval() {
+    // Codex r4289363377 on PR #149: --cycles 1 with the longest interval (60 s): the loop Stops
+    // as the cycle ends, its quotes never resting for the pause.
+    let venue = venue(vec![b0()]);
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let mut opts = options(&stub, 1);
+    opts.interval_ms = 60_000;
+    let started = std::time::Instant::now();
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}\n{printed}",
+        started.elapsed()
+    );
+    assert!(report.ok, "{printed}");
+    assert_eq!(report.ended, "--cycles 1 reached", "{printed}");
+    assert_eq!(report.places_sent, 2, "{printed}");
 }

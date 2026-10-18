@@ -29,6 +29,10 @@ mod auth_rest;
 #[allow(dead_code)]
 #[path = "../src/link.rs"]
 mod link;
+// Shared by the mainnet samples: each uses a part of it.
+#[allow(dead_code)]
+#[path = "../src/mainnet.rs"]
+mod mainnet;
 // Shared by the samples that can fill: each uses a part of it.
 #[allow(dead_code)]
 #[path = "../src/positions.rs"]
