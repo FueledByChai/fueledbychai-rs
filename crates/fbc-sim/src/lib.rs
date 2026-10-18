@@ -23,9 +23,10 @@
 //!
 //! - [`SimCodec`] is an [`ExecCodec`](fbc_core::ExecCodec), the boundary every venue's codec
 //!   implements (0014, unchanged): it writes each command the stood-in venue takes (place,
-//!   amend, cancel, their batches, an instrument cancel-all, a query) as a frame on the
-//!   simulated stream and decodes the answers into outcomes, order updates, fills and query
-//!   results through the [`DecodeScope`](fbc_core::DecodeScope) only.
+//!   amend, cancel, their batches, an instrument cancel-all, a query, a cancel-on-disconnect
+//!   arm or dead-man refresh) as a frame on the simulated stream and decodes the answers into
+//!   outcomes, order updates, fills and query results through the
+//!   [`DecodeScope`](fbc_core::DecodeScope) only.
 //! - [`SimEngine`] is a pure state machine: fed the shard's market-data envelopes (it holds its
 //!   own `fbc-book` books) and the codec's frames, it matches orders against the book and
 //!   through the queue model and answers with frames ([`Answer`]) due after the configured
@@ -42,6 +43,10 @@
 //!   A crossing order meets SimVenue's own resting orders as the stood-in venue's self-trade
 //!   prevention says, and what it takes from a displayed level stays taken until the book's
 //!   next event there (0051).
+//!   The host opens and closes the simulated stream ([`SimEngine::open`],
+//!   [`SimEngine::close`]); a close loses the frames in flight on it, and the engine cancels
+//!   what the stood-in venue cancels when the connection drops (per connection, behind an
+//!   accepted arm) or its dead-man timer lapses unrefreshed (0097).
 //!
 //! Every number SimVenue uses, its capabilities, latency, bracket and fee rates included, is in
 //! the consumer's [`SimConfig`]. Not here yet: hosting in the runtime (FBC-6mf) and replay
