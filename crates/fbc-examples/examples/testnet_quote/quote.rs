@@ -88,8 +88,10 @@
 //! loop just requoted). Paradex does not say who sent a user cancel; the [`Link`] notes an order
 //! of ours ended by one that no cancel of ours covers ([`Note::CancelNotOurs`]), and the loop
 //! applies the owner's rule ("Warn once, Stop on repeat") through [`CancelsNotOurs`]: those of
-//! one cycle are one event (two are one unless the second's order was placed after the first
-//! was seen: a requote cancelled again); the first prints a `WARN` line and the loop requotes; with
+//! one action of the other program's are one event (two are one when the venue stamped the
+//! second within [`EVENT_SPAN`] of the event's first and its order was placed before the event
+//! was seen; a requote cancelled again, or a cancel seconds later of any order, however old, is
+//! another); the first prints a `WARN` line and the loop requotes; with
 //! `--mainnet`, a second on a later cycle within [`Options::cancel_window`] (30 s) of the first
 //! Stops the run and fails it ("another program cancelled our orders: one quoter per account");
 //! past the window the next one starts a new window; a testnet run only warns. Once one was
@@ -109,9 +111,9 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use fbc_core::{
-    Bps, Channel, CidMatch, CidMint, ClientOrderId, ConnState, Lots, MarketLease, Namespace,
-    NamespaceLease, NonceScope, OpKind, OrderCaps, OrderKindTag, Reject, RejectKind, RpcId,
-    Secrets, Side, SignedLots, SpecTable, SubmitOutcome, Ticks, Tif, TifTag, VenueFactory,
+    Bps, Channel, CidMatch, CidMint, ClientOrderId, ConnState, ExchNs, Lots, MarketLease,
+    Namespace, NamespaceLease, NonceScope, OpKind, OrderCaps, OrderKindTag, Reject, RejectKind,
+    RpcId, Secrets, Side, SignedLots, SpecTable, SubmitOutcome, Ticks, Tif, TifTag, VenueFactory,
 };
 use fbc_oms::{
     Applied, CancelChoice, CancelEverything, DesiredBook, DesiredQuote, ExecutionPlanner,
@@ -185,11 +187,18 @@ pub struct Report {
     pub cancels_not_ours: usize,
 }
 
+/// How far after an event's first cancel not ours, by the venue's times, another is still the
+/// same event: one reconcile, or one cancel-all in the venue's UI, ends what rested at nearly one
+/// venue time, and a second action comes later (Java's orphan reconcile runs every 3 s; the
+/// loop's cycle is 1 s by default).
+pub const EVENT_SPAN: Duration = Duration::from_secs(1);
+
 /// What a cancel not ours is to the owner's rule ([`CancelsNotOurs::on_cancel`]).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum NotOurs {
-    /// Of an order placed before the event before it was seen: the same event (one reconcile,
-    /// or one cancel-all in the venue's UI, cancels what rested when it ran: both sides).
+    /// Of an order placed before the event before it was seen, stamped by the venue within
+    /// [`EVENT_SPAN`] of that event's first: the same event (one reconcile, or one cancel-all in
+    /// the venue's UI, cancels what rested when it ran: both sides).
     SameEvent,
     /// A new event with no other within the window before it: it starts the window (a WARN).
     First,
@@ -198,19 +207,41 @@ pub enum NotOurs {
 }
 
 /// The cancels not ours a run saw and the owner's window over them (module documentation): when
-/// the window's first event and the latest event were seen.
+/// the window's first event was seen, and the latest event.
 ///
-/// Two are one event unless the second's order was placed after the first was seen: a cancel
-/// not ours of a quote the loop placed after it saw one is another cancel, on a later cycle
-/// than the one it requoted after (the loop never places a side again in the cycle it was
-/// cancelled in), so the owner's "a second one on a later cycle" is judged by the order, not by
-/// when its order event happens to be read (between two cycles, or during the next).
+/// Two are one event only when the second's order was placed before the first was seen and the
+/// venue stamped the second within [`EVENT_SPAN`] of the event's first. The owner's "a second
+/// one on a later cycle" is so judged by the venue's times and the order, not by when an order
+/// event happens to be read (between two cycles, or during the next: one reconcile's events
+/// read apart stay one event): a cancel not ours of a quote the loop placed after it saw one is
+/// another action, as is one seconds later of an order that rested since before it (Codex
+/// r4308625185, RB-aoh5-1 on PR #159). An event the venue stamped no time on is judged by when
+/// it was seen instead.
 #[derive(Clone, Debug)]
 pub struct CancelsNotOurs {
     window: Duration,
     orders: usize,
     first: Option<tokio::time::Instant>,
-    latest: Option<tokio::time::Instant>,
+    latest: Option<Event>,
+}
+
+/// An event of cancels not ours: when it was seen, and the venue's time on its first cancel.
+#[derive(Copy, Clone, Debug)]
+struct Event {
+    seen: tokio::time::Instant,
+    at: Option<ExchNs>,
+}
+
+impl Event {
+    /// Whether a cancel stamped `at` by the venue, seen at `now`, is within [`EVENT_SPAN`] of
+    /// this event's first, by the venue's times when both have one.
+    fn spans(&self, at: Option<ExchNs>, now: tokio::time::Instant) -> bool {
+        let span = i128::try_from(EVENT_SPAN.as_nanos()).unwrap_or(i128::MAX);
+        match (self.at, at) {
+            (Some(first), Some(at)) => (i128::from(at.0) - i128::from(first.0)).abs() <= span,
+            _ => now.saturating_duration_since(self.seen) <= EVENT_SPAN,
+        }
+    }
 }
 
 impl CancelsNotOurs {
@@ -225,21 +256,24 @@ impl CancelsNotOurs {
     }
 
     /// One order of ours, placed by this run at `placed` (`None`: not placed by this run, an
-    /// earlier run's), ended by a cancel not ours seen at `now`: the same event as the one
-    /// before it unless its order was placed after that one was seen; then a repeat when within
-    /// the window of the window's first event, otherwise the first of a new window.
+    /// earlier run's), ended by a cancel not ours the venue stamped `at`, seen at `now`: the
+    /// same event as the one before it when its order was placed before that one was seen and
+    /// the venue stamped it within [`EVENT_SPAN`] of that one's first; otherwise a repeat when
+    /// within the window of the window's first event, or the first of a new window.
     pub fn on_cancel(
         &mut self,
         placed: Option<tokio::time::Instant>,
+        at: Option<ExchNs>,
         now: tokio::time::Instant,
     ) -> NotOurs {
         self.orders += 1;
         if let Some(latest) = self.latest
-            && placed.is_none_or(|placed| placed <= latest)
+            && placed.is_none_or(|placed| placed <= latest.seen)
+            && latest.spans(at, now)
         {
             return NotOurs::SameEvent;
         }
-        self.latest = Some(now);
+        self.latest = Some(Event { seen: now, at });
         match self.first {
             Some(first) if now.saturating_duration_since(first) <= self.window => NotOurs::Repeat,
             _ => {
@@ -1113,8 +1147,8 @@ struct Driver {
     /// ([`Driver::cancel_again`], Codex r4306449947 on PR #158).
     recancel_due: bool,
     /// The cancels not ours seen, under the owner's rule (module documentation, FBC-aoh5),
-    /// and when each order of ours the loop placed that has not ended was handed over (what
-    /// tells one event from the next, [`CancelsNotOurs`]).
+    /// and when each order of ours the loop placed that has not ended was handed over (with
+    /// the venue's times, what tells one event from the next, [`CancelsNotOurs`]).
     not_ours: CancelsNotOurs,
     placed_at: HashMap<ClientOrderId, tokio::time::Instant>,
 }
@@ -1601,16 +1635,16 @@ impl Driver {
                     ));
                 }
             }
-            Note::CancelNotOurs { cid, side } => self.cancel_not_ours(cid, side),
+            Note::CancelNotOurs { cid, side, at } => self.cancel_not_ours(cid, side, at),
             Note::Conn(ConnState::Authenticated) => self.authenticated = true,
             Note::Conn(_) => {}
         }
     }
 
-    /// Our order `cid` on `side` was ended by a cancel this program did not send (module
-    /// documentation, FBC-aoh5): the owner's rule applied, printed as a `WARN` line once per
-    /// event; with `--mainnet` a repeat is a reason to Stop.
-    fn cancel_not_ours(&mut self, cid: ClientOrderId, side: Side) {
+    /// Our order `cid` on `side` was ended by a cancel this program did not send, stamped `at`
+    /// by the venue (module documentation, FBC-aoh5): the owner's rule applied, printed as a
+    /// `WARN` line once per event; with `--mainnet` a repeat is a reason to Stop.
+    fn cancel_not_ours(&mut self, cid: ClientOrderId, side: Side, at: Option<ExchNs>) {
         let order = format!("the {} #{}", side_name(side), cid.seq());
         let window = self.not_ours.shown();
         let what = format!(
@@ -1618,10 +1652,13 @@ impl Driver {
              account, or the Paradex UI): one quoter per account"
         );
         let placed = self.placed_at.remove(&cid);
-        match self.not_ours.on_cancel(placed, tokio::time::Instant::now()) {
+        match self
+            .not_ours
+            .on_cancel(placed, at, tokio::time::Instant::now())
+        {
             NotOurs::SameEvent => self.note(format_args!(
                 "{order} ended by a user cancel this program did not send too: placed before the \
-                 last one was seen, the same event"
+                 last one was seen and cancelled with it, the same event"
             )),
             NotOurs::First if self.opts.mainnet => self.event(
                 "WARN",

@@ -56,13 +56,17 @@
 //!   the same account cancelled every order on its ticker it did not place). An order of ours
 //!   that an order event ends `Canceled(Requested)` (a user cancel: Paradex's USER_CANCELED,
 //!   user_cancel_ws or user_cancel_batch_ws, which do not say who sent it) while no cancel of
-//!   ours covers it is noted ([`Note::CancelNotOurs`]) after its [`Note::Order`]. A cancel of
-//!   ours covers an order from the moment it is submitted here, in flight or answered, whatever
-//!   its answer, until the session reports it not sent (nothing was written: Codex r4308561813
-//!   on PR #159): a cancel or cancel-many naming it (a replace's, a sweep's, Stop's, or a Safety
-//!   cancel of [`ExecHandler::on_unprotected`]), or a cancel-all of its market (or of the
-//!   account) submitted while the order was ours and not ended; the registry's own count of
-//!   cancels sent for it is read as well. Only the event that ends the order counts (a late
+//!   ours covers it is noted ([`Note::CancelNotOurs`], with the venue's time on the event) after
+//!   its [`Note::Order`]. A cancel of ours covers an order from the moment the session reports
+//!   it sent, in flight or answered, whatever its answer: a cancel or cancel-many naming it (a
+//!   replace's, a sweep's, Stop's, or a Safety cancel of [`ExecHandler::on_unprotected`]), or a
+//!   cancel-all of its market (or of the account) submitted while the order was ours and not
+//!   ended; the registry's own count of cancels sent for it is read as well. Submitted but not
+//!   yet reported sent, it is only pending and covers nothing: the session decodes a frame
+//!   waiting in a turn before it writes what was queued, so another program's cancel read then
+//!   is not ours (Codex r4308625182 on PR #159), and one reported not sent wrote nothing (Codex
+//!   r4308561813). The session reports a request sent before it writes its first byte, so the
+//!   venue's end of an order by our cancel always comes after its cover. Only the event that ends the order counts (a late
 //!   duplicate of it is not), so one order is noted at most once. Each driver decides what it
 //!   means.
 //! - **Notes.** Everything the driver may wait on is appended to [`Link::notes`], in order.
@@ -79,8 +83,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fbc_core::{
     AccountKey, CancelReason, CancelScope, CidMatch, ClientOrderId, ConnKey, ConnState, Envelope,
-    ExecEvent, InstrumentId, ItemRef, Lots, MonoNs, NotSentReason, OpKind, OrderCaps, OrderRef,
-    Reject, RpcId, Side, SignedLots, SubmitHandle, SubmitOutcome, Ticks, VenueCommand,
+    ExchNs, ExecEvent, InstrumentId, ItemRef, Lots, MonoNs, NotSentReason, OpKind, OrderCaps,
+    OrderRef, Reject, RpcId, Side, SignedLots, SubmitHandle, SubmitOutcome, Ticks, VenueCommand,
     VenueOrderId, VenueOrderSnapshot, WallNs,
 };
 use fbc_oms::{
@@ -162,8 +166,14 @@ pub enum Note {
     },
     /// Our order `cid` (on `side`) was just ended by a user cancel (`Canceled(Requested)`) that
     /// no cancel of ours covers (module documentation, FBC-aoh5): another program on the
-    /// account, or a person in the venue's UI. Noted right after its [`Note::Order`].
-    CancelNotOurs { cid: ClientOrderId, side: Side },
+    /// account, or a person in the venue's UI. Noted right after its [`Note::Order`], with the
+    /// venue's time on the event (`at`, `None` when it sent none): one action of the other
+    /// program's (a reconcile, a cancel-all) ends what it ends at nearly one venue time.
+    CancelNotOurs {
+        cid: ClientOrderId,
+        side: Side,
+        at: Option<ExchNs>,
+    },
 }
 
 /// Why a connection ended when the session reported no venue error with it: its codec
@@ -290,36 +300,48 @@ pub fn described(reject: &Reject) -> String {
 }
 
 /// Which orders of ours the cancels of ours submitted here cover (module documentation): each
-/// order with the requests that cover it. A request the session reports not sent covers
-/// nothing (no byte of it was written), so another's cancel of its orders is not taken for
-/// ours (Codex r4308561813 on PR #159).
+/// order with the requests that cover it, once the session reports each sent. A request
+/// submitted but not yet reported sent is pending and covers nothing: the session may decode
+/// another program's cancel of its order before it writes it (Codex r4308625182 on PR #159);
+/// one reported not sent never covers (no byte of it was written: Codex r4308561813).
 #[derive(Debug, Default)]
-pub struct Coverage(HashMap<ClientOrderId, HashSet<RpcId>>);
+pub struct Coverage {
+    covered: HashMap<ClientOrderId, HashSet<RpcId>>,
+    pending: HashMap<RpcId, Vec<ClientOrderId>>,
+}
 
 impl Coverage {
-    /// Request `rpc` cancels `cids` (a cancel-all: every live order of ours on its market).
-    pub fn cover(&mut self, rpc: RpcId, cids: impl IntoIterator<Item = ClientOrderId>) {
-        for cid in cids {
-            self.0.entry(cid).or_default().insert(rpc);
+    /// Request `rpc` was submitted to cancel `cids` (a cancel-all: every live order of ours on
+    /// its market then): pending until the session reports it sent.
+    pub fn submitted(&mut self, rpc: RpcId, cids: impl IntoIterator<Item = ClientOrderId>) {
+        self.pending.entry(rpc).or_default().extend(cids);
+    }
+
+    /// The session reported request `rpc` sent (`true`: it covers its orders from now on) or
+    /// not sent (`false`: it never covers them).
+    pub fn reported(&mut self, rpc: RpcId, sent: bool) {
+        let Some(cids) = self.pending.remove(&rpc) else {
+            return;
+        };
+        if sent {
+            for cid in cids {
+                self.covered.entry(cid).or_default().insert(rpc);
+            }
         }
     }
 
-    /// Request `rpc` was not sent: it covers nothing.
-    pub fn not_sent(&mut self, rpc: RpcId) {
-        self.0.retain(|_, rpcs| {
-            rpcs.remove(&rpc);
-            !rpcs.is_empty()
-        });
-    }
-
-    /// Whether a request of ours covers `cid`.
+    /// Whether a request of ours reported sent covers `cid`.
     pub fn covers(&self, cid: ClientOrderId) -> bool {
-        self.0.contains_key(&cid)
+        self.covered.contains_key(&cid)
     }
 
-    /// Keeps the orders `keep` takes (the live ones), forgetting the rest.
+    /// Keeps the orders `keep` takes (the live ones), forgetting the rest, pending or covered.
     pub fn retain(&mut self, keep: impl Fn(&ClientOrderId) -> bool) {
-        self.0.retain(|cid, _| keep(cid));
+        self.covered.retain(|cid, _| keep(cid));
+        self.pending.retain(|_, cids| {
+            cids.retain(|cid| keep(cid));
+            !cids.is_empty()
+        });
     }
 }
 
@@ -574,8 +596,8 @@ impl Link {
 
     /// Submits `auth` through `orders`, remembering the order each item names: its request id,
     /// or why it was not submitted (nothing was then remembered). A cancel covers the orders it
-    /// names, and a cancel-all every live order of ours on its market, from here on (module
-    /// documentation): the venue's end of one may come before the session reports it sent.
+    /// names, and a cancel-all every live order of ours on its market now, once the session
+    /// reports it sent (module documentation): until then it is pending.
     pub fn submit(&mut self, orders: &ExecOrders, auth: Authorization) -> Result<RpcId, String> {
         let items = self.items_of(auth.command())?;
         let scope = match auth.command() {
@@ -592,7 +614,7 @@ impl Link {
             Item::Cancel(cid) => Some(*cid),
             _ => None,
         });
-        self.covered.cover(rpc, named);
+        self.covered.submitted(rpc, named);
         if let Some(scope) = scope {
             self.prune_ended();
             let all: Vec<ClientOrderId> = self
@@ -604,7 +626,7 @@ impl Link {
                 })
                 .map(|(cid, _)| *cid)
                 .collect();
-            self.covered.cover(rpc, all);
+            self.covered.submitted(rpc, all);
         }
         self.live.extend(placed);
         self.sent.insert(rpc, items);
@@ -708,9 +730,7 @@ impl Link {
             }
         }
         let sent = receipt.map(|_| ());
-        if sent.is_err() {
-            self.covered.not_sent(rpc);
-        }
+        self.covered.reported(rpc, sent.is_ok());
         self.notes.push(Note::Submitted { rpc, sent });
     }
 
@@ -818,6 +838,7 @@ impl Link {
                             .map(|r| Note::CancelNotOurs {
                                 cid,
                                 side: r.placed().side,
+                                at: env.exch_ts,
                             })
                     }
                     _ => None,
