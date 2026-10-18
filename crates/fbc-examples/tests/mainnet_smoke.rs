@@ -335,6 +335,19 @@ fn e8(text: &str) -> i64 {
 /// post-only limit buy `cid` of `size` at `price`, venue id `vid`, CLOSED by USER_CANCELED with
 /// nothing filled. The account is 32 made-up bytes.
 fn order_closed(seq: i64, vid: &str, cid: &str, price: &str, size: &str) -> Vec<u8> {
+    order_closed_by(seq, vid, cid, price, size, "USER_CANCELED")
+}
+
+/// As [`order_closed`], closed for the cancel reason `reason` (`user_cancel_ws`: a cancel sent
+/// over another WebSocket, which Paradex's codec reads as a user cancel as it reads ours).
+fn order_closed_by(
+    seq: i64,
+    vid: &str,
+    cid: &str,
+    price: &str,
+    size: &str,
+    reason: &str,
+) -> Vec<u8> {
     let null = i64::MIN;
     let ts = 1_759_500_000_205_011i64;
     let mut f = Vec::new();
@@ -356,7 +369,7 @@ fn order_closed(seq: i64, vid: &str, cid: &str, price: &str, size: &str) -> Vec<
     f.extend(ts.to_le_bytes()); // publishedAt
     f.extend([0u8, 0, 0, 0]); // stp, flags, requestStatus, requestType
     assert_eq!(f.len(), 8 + 128);
-    for s in [vid, cid, MARKET, "USER_CANCELED", "", ""] {
+    for s in [vid, cid, MARKET, reason, "", ""] {
         f.push(u8::try_from(s.len()).unwrap());
         f.extend(s.as_bytes());
     }
@@ -375,6 +388,12 @@ struct Placed {
 /// empty result, the arm with `enabled: true`, the place with its order under [`VID`], the
 /// cancel queued and then the order event closing the order, the cancel-all with `ok`.
 fn responder(placed: Arc<Mutex<Placed>>) -> Responder {
+    responder_with(placed, false)
+}
+
+/// As [`responder`]; `cotenant`: another program on the account (FBC-aoh5) cancels the order
+/// right after the place's reply, by a user cancel the run never sent (`user_cancel_ws`).
+fn responder_with(placed: Arc<Mutex<Placed>>, cotenant: bool) -> Responder {
     Responder::new(move |frame: &Frame| {
         let Frame::Text(text) = frame else {
             return Err("a binary frame from the client".to_owned());
@@ -398,7 +417,13 @@ fn responder(placed: Arc<Mutex<Placed>>) -> Responder {
                     "type": "LIMIT", "instruction": "POST_ONLY", "price": p.price,
                     "size": p.size, "remaining_size": p.size, "status": "NEW",
                 });
-                Ok(vec![ok(json!({"order": order}))])
+                let mut frames = vec![ok(json!({"order": order}))];
+                if cotenant {
+                    let closed =
+                        order_closed_by(5_000, VID, &p.cid, &p.price, &p.size, "user_cancel_ws");
+                    frames.push(Frame::Binary(closed));
+                }
+                Ok(frames)
             }
             "order.cancel" => {
                 let p = placed.lock().unwrap();
@@ -414,7 +439,11 @@ fn responder(placed: Arc<Mutex<Placed>>) -> Responder {
 
 /// The order socket's script: one connection, `frames` frames answered.
 fn script(placed: Arc<Mutex<Placed>>, frames: usize) -> WsScript {
-    let with = responder(placed);
+    script_with(responder(placed), frames)
+}
+
+/// The order socket's script: one connection, `frames` frames answered by `with`.
+fn script_with(with: Responder, frames: usize) -> WsScript {
     let mut steps = vec![Step::Accept];
     steps.extend((0..frames).map(|_| Step::Respond {
         conn: 0,
@@ -1084,6 +1113,9 @@ fn help_names_the_environment_the_prerequisites_and_every_line() {
         "POSITION at Stop",
         "check the position by hand",
         "HALT",
+        // A cancel not ours (FBC-aoh5).
+        "WARN",
+        "a cancel of the order that this program did not send",
     ] {
         assert!(smoke_args::USAGE.contains(needed), "--help lacks {needed}");
     }
@@ -1175,4 +1207,41 @@ fn the_mainnet_network_never_seeds_by_hand_and_names_its_own_leases() {
         cfg.get(fbc_venue_paradex::auth::CHAIN_ID),
         Some(smoke::MAINNET_CHAIN)
     );
+}
+
+#[tokio::test]
+async fn an_order_ended_by_a_cancel_the_smoke_did_not_send_prints_the_warn_line() {
+    // FBC-aoh5: another program on the account (the owner's 2026-10-18 finding, a Java
+    // instance's orphan reconcile) cancels the smoke's order right after its acknowledgement.
+    // The smoke prints the WARN line naming it; its round trip did not happen, so it fails.
+    let placed = Arc::new(Mutex::new(Placed::default()));
+    // auth, four subscriptions, the arm, the place and Stop's cancel-all: no cancel of the order
+    // is built, it already ended.
+    let with = responder_with(Arc::clone(&placed), true);
+    let stub = StubServer::start(script_with(with, 8), routes())
+        .await
+        .unwrap();
+    let smoke = smoke_on(&stub);
+    let (ran, printed) = run_on(&smoke, None, &ParadexFactory).await;
+    stub.finished().await.unwrap();
+    let report = ran.unwrap_or_else(|e| panic!("refused: {e}; it printed:\n{printed}"));
+
+    assert!(!report.ok, "{printed}");
+    let warns: Vec<&str> = printed.lines().filter(|l| l.starts_with("WARN ")).collect();
+    assert_eq!(warns.len(), 1, "{printed}");
+    for part in [
+        "ended by a user cancel this program did not send",
+        "another program on the account, or the Paradex UI",
+        "one quoter per account",
+    ] {
+        assert!(warns[0].contains(part), "{part}:\n{printed}");
+    }
+    let sent = sent(&stub);
+    assert_eq!(
+        sent.iter().filter(|(m, _)| m == "order.cancel").count(),
+        0,
+        "{sent:?}"
+    );
+    assert!(printed.contains("DONE failed"), "{printed}");
+    no_credential_in(&printed);
 }
