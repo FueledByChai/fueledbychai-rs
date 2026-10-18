@@ -501,7 +501,7 @@ impl SimEngine {
             }
             Command::CancelAll(head, inst) => self.cancel_all(head.rpc, inst, at),
             Command::Query(q) => self.query(q, at),
-            Command::Resync(sent) => self.resync(sent.wall, at),
+            Command::Resync { sent, req } => self.resync(sent.wall, req, at),
             Command::Protect(head, on) => self.protect(head.rpc, on, at),
             Command::Refresh(head) => self.refresh(head.rpc, at),
         }
@@ -1327,13 +1327,15 @@ impl SimEngine {
         self.answer(at, reply);
     }
 
-    /// Answers a resync asked at `asked` (decision 0049), in one frame: the orders resting and
-    /// the positions the fills imply when the venue acts, its watermark the request's wall time.
-    fn resync(&mut self, asked: WallNs, at: At) {
+    /// Answers resync `req` asked at `asked` (decision 0049), in one frame: the orders resting
+    /// and the positions the fills imply when the venue acts, its watermark the request's wall
+    /// time, echoing its number.
+    fn resync(&mut self, asked: WallNs, req: u64, at: At) {
         let orders = self.live.iter();
         let orders = orders.map(|(&n, o)| order_event(o, &vid(n), SimState::Open, Some(o.px)));
         let reply = Reply::Resync {
             wm: asked,
+            req,
             orders: orders.collect(),
             positions: self.positions.iter().map(|(&i, p)| (i, p.lots)).collect(),
         };

@@ -232,8 +232,12 @@ pub(crate) enum Command {
     CancelAll(Head, InstrumentId),
     Query(Query),
     /// A resync (decision 0049): a read of the resting orders and positions, which names no
-    /// request id since it awaits no RPC deadline.
-    Resync(Sent),
+    /// request id since it awaits no RPC deadline. `req` is the codec's number for it, which
+    /// the answer echoes, so the codec tells an earlier connection's answer apart (0097).
+    Resync {
+        sent: Sent,
+        req: u64,
+    },
     /// Cancel-on-disconnect turned on (`true`) or off.
     Protect(Head, bool),
     /// A dead-man timer refreshed.
@@ -438,7 +442,7 @@ impl Command {
             | Command::CancelAll(head, _)
             | Command::Protect(head, _)
             | Command::Refresh(head) => head.sent,
-            Command::Resync(sent) => *sent,
+            Command::Resync { sent, .. } => *sent,
         }
     }
 
@@ -482,9 +486,10 @@ impl Command {
                 .target(&q.target)
                 .opt("qvid", q.vid.as_ref())
                 .opt("qcid", q.cid.as_ref()),
-            Command::Resync(sent) => Writer::new("resync")
+            Command::Resync { sent, req } => Writer::new("resync")
                 .field("mono", sent.mono.0)
-                .field("wall", sent.wall.0),
+                .field("wall", sent.wall.0)
+                .field("req", req),
             Command::Protect(head, on) => Writer::head("protect", *head).flag("on", *on),
             Command::Refresh(head) => Writer::head("refresh", *head),
         }
@@ -501,7 +506,11 @@ impl Command {
             }
         };
         if r.kind == "resync" {
-            return single(Command::Resync(r.sent()?));
+            let sent = r.sent()?;
+            return single(Command::Resync {
+                sent,
+                req: r.num("req")?,
+            });
         }
         let head = r.head()?;
         match r.kind {
@@ -654,11 +663,12 @@ pub(crate) enum Reply {
     Order(OrderEvent),
     Fill(FillRecord),
     /// A resync's whole answer, in one frame (decision 0049): `wm` is the wall time of the
-    /// request it answers, `orders` the resting orders, and `positions` the signed sum of the
+    /// request it answers and `req` that request's number, `orders` the resting orders, and `positions` the signed sum of the
     /// account's fills in each instrument it has a fill in, in lots, as an `i128` so a sum past
     /// an `i64` of lots is written as it is and the codec refuses it rather than wrap.
     Resync {
         wm: WallNs,
+        req: u64,
         orders: Vec<OrderEvent>,
         positions: Vec<(InstrumentId, i128)>,
     },
@@ -762,10 +772,11 @@ impl Reply {
                 .field("asset", f.asset.as_str()),
             Reply::Resync {
                 wm,
+                req,
                 orders,
                 positions,
             } => {
-                let w = head("resync").field("wm", wm.0);
+                let w = head("resync").field("wm", wm.0).field("req", req);
                 let w = orders.iter().fold(w, |w, o| w.line("order").event(o));
                 positions.iter().fold(w, |w, (inst, qty)| {
                     w.line("pos").field("inst", inst.get()).field("qty", qty)
@@ -854,6 +865,7 @@ impl Reply {
                 }
                 Ok(Reply::Resync {
                     wm: WallNs(r.num("wm")?),
+                    req: r.num("req")?,
                     orders,
                     positions,
                 })
