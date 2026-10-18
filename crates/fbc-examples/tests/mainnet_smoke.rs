@@ -575,7 +575,7 @@ async fn mainnet_smoke_places_one_post_only_order_cancels_it_and_stops_against_a
     let check = printed
         .find("POSITION at Stop: +")
         .unwrap_or_else(|| panic!("no Stop comparison:\n{printed}"));
-    assert!(stop_line < check, "{printed}");
+    assert!(check < stop_line, "{printed}");
     assert!(
         printed[check..]
             .lines()
