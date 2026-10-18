@@ -115,6 +115,9 @@ Lines (each step with the milliseconds since the start):
   TIMEOUT <step>     the step did not happen in time; the run Stops
   HALT <step>        the step was not waited for: the position check after the first fill
                      failed (POSITION re-read ... STILL DIFFER); the run Stops
+  WARN ...           a cancel of the order that this program did not send ended it (Paradex
+                     does not say who sent a user cancel): another program on the account, or
+                     you in the Paradex UI; one quoter per account (FBC-aoh5)
   NOTE ...           something worth knowing (a refusal with Paradex's status, code and
                      message, an unexpected event, why a connection ended)
   DONE ok|failed     the outcome; the exit status is 0 only for ok

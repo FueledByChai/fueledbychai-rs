@@ -1008,7 +1008,9 @@ impl Driver {
     }
 
     /// Prints a `NOTE` for each note not printed yet that the steps do not report themselves:
-    /// a refusal or problem, a fill, an order event of an order not ours, a connection's end.
+    /// a refusal or problem, a fill, an order event of an order not ours, a connection's end;
+    /// and a `WARN` line for an order of ours ended by a cancel the run did not send (FBC-aoh5:
+    /// another program on the account, or the Paradex UI; with one order, no repeat follows).
     fn tell(&self) {
         let link = self.link.borrow();
         let notes = &link.notes()[self.told.get()..];
@@ -1041,6 +1043,12 @@ impl Driver {
                 Note::EpochEnd { key, why } => self.note(format_args!(
                     "the order socket's connection {key:?} ended: {why}; the session reconnects, \
                      logs in and arms again"
+                )),
+                Note::CancelNotOurs { cid, .. } => self.lines.line(format_args!(
+                    "WARN our order (client id sequence {}) ended by a user cancel this program \
+                     did not send (another program on the account, or the Paradex UI): one \
+                     quoter per account",
+                    cid.seq()
                 )),
                 Note::Unprotected { told, rpcs, left } => {
                     let requests: Vec<String> = rpcs.iter().map(|r| r.0.to_string()).collect();

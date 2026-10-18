@@ -5,6 +5,7 @@
 //! mainnet's and the mainnet guard's ([`crate::mainnet`]), with its limits ([`mainnet_limits`]).
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use fbc_runtime::ProxyConfig;
 use rust_decimal::Decimal;
@@ -25,6 +26,11 @@ pub const MAINNET_DURATION_MAX: u64 = 3_600;
 /// The smallest offset from the touch a mainnet run quotes at, on either side, in basis points
 /// (the owner's "a wide offset (e.g. 20+ bps from the touch)").
 pub const MAINNET_OFFSET_MIN: u32 = 20;
+
+/// How long after a cancel not ours (a cancel of an order of ours that the run did not send,
+/// FBC-aoh5) a second one on a later cycle Stops a mainnet run: the owner's 30 s (2026-10-18,
+/// "Warn once, Stop on repeat"). No flag changes it; [`Options::cancel_window`] carries it.
+pub const CANCEL_NOT_OURS_WINDOW: Duration = Duration::from_secs(30);
 
 /// The help text `--help` prints.
 pub const USAGE: &str = "\
@@ -132,7 +138,21 @@ same loop, with these limits, each checked before anything connects:
   - GET /positions read once before the order socket connects: a position on any other market
     refuses the run (--sole-trader: no other process trades the account).
 A permanent refusal of a place or a cancel Stops the run and fails it, as an asynchronous
-ORDER_SIZE_BELOW_MIN does (a sizing error, not a venue fault).
+ORDER_SIZE_BELOW_MIN does (a sizing error, not a venue fault). A second cancel not ours on a
+later cycle within 30 s of the first Stops the run and fails it (CANCELS NOT OURS below).
+
+CANCELS NOT OURS. Paradex does not say who sent a user cancel, so a cancel of an order of ours
+that this program did not send (another program on the account, such as a Java quoter whose
+orphan reconcile cancels every order on its market it did not place, or you in the Paradex UI)
+reads as one of ours. The run counts one when an order of ours ends cancelled by a user while
+no cancel of ours covering it was sent (no replace's or side's cancel, no cancel-all, no
+start, reconnect or Stop sweep, in flight or answered); those of one cycle are one event. The
+first prints a WARN line and the loop requotes. With --mainnet, a second on a later cycle
+within 30 s of the first Stops the run and fails it ('another program cancelled our orders:
+one quoter per account'); after 30 s with no second the window starts again. Without
+--mainnet each only warns. Once one was seen, the run's cancels of everything (a reconnect's
+sweep, Stop) name our orders explicitly and never send an instrument cancel-all, which would
+cancel the other program's orders too. One quoter per account.
 
 Each cycle reads the touch (GET /orderbook) and the mark price (GET /markets/summary), both
 charged to the venue's rate limit with the session's traffic, and for each side whose touch
@@ -156,10 +176,11 @@ with the inventory or that the registry refuses, on a permanent refusal of a pla
 of ours, on a position on another market, on any order of ours going Unknown (it does
 not drive the Unknown ladder: no Paradex order query is wired here), on an order or fill not
 ours, an amend of ours, any problem the order socket reports, a book that does not settle
-within the step timeout, and when the order-entry session ends. After every reconnect, once
-cancel-on-disconnect is armed again and the resync has ended, every order of ours still open
-on the market is cancelled before anything is placed (Paradex's arm does not say it covers
-orders already open). A replace's cancel that races a fill may come back Unknown (Paradex
+within the step timeout, when the order-entry session ends, and with --mainnet on a second
+cancel not ours on a later cycle within 30 s of the first (CANCELS NOT OURS above). After
+every reconnect, once cancel-on-disconnect is armed again and the resync has ended, every
+order of ours still open on the market is cancelled before anything is placed (Paradex's arm
+does not say it covers orders already open). A replace's cancel that races a fill may come back Unknown (Paradex
 answers ALREADY_CLOSED, FBC-rht4), which Stops the run: the conservative end.
 
 Lines (each with the milliseconds since the start):
@@ -186,6 +207,10 @@ Lines (each with the milliseconds since the start):
   FILL ...           a fill of an order of ours
   RECONNECT ...      a new connection: every order of ours still open is cancelled first
   PACE ...           a request refused for its rate: nothing more is sent until its retry time
+  WARN ...           a cancel of an order of ours that this program did not send (CANCELS NOT
+                     OURS above): another program on the account, or the Paradex UI; one
+                     quoter per account; with --mainnet a second on a later cycle within 30 s
+                     Stops the run
   NOTE ...           something worth knowing
   STOP <why>         why the loop ended
   STEP stop          kill switch on, cancel all sent for what is still open, session closing
@@ -199,7 +224,9 @@ Lines (each with the milliseconds since the start):
   POSITION at Stop: ...  the same comparison once Stop's cancels are answered, on every run,
                      before STEP stop (the market still leased); a mismatch the re-read
                      confirms fails the run
-  SUMMARY ...        cycles, orders placed, cancels sent, orders cancelled, fills, inventory
+  SUMMARY ...        cycles, orders placed, cancels sent, orders cancelled, fills, inventory,
+                     cancels not ours (orders of ours ended by a cancel this program did not
+                     send)
   DONE ok|failed     ok only when the loop ended at --duration, --cycles or Ctrl-C, every
                      Stop cancel was accepted, every order of ours ended and GET /positions
                      agreed with the registry (POSITION); the exit status is 0 only for ok
@@ -235,6 +262,9 @@ pub struct Options {
     pub sole_trader: bool,
     /// `--mainnet`: the owner's confirmation that the run trades Paradex MAINNET (FBC-tyft).
     pub mainnet: bool,
+    /// How long after a cancel not ours a second one on a later cycle Stops a mainnet run:
+    /// [`CANCEL_NOT_OURS_WINDOW`], set by no flag (a test shortens it to show the window end).
+    pub cancel_window: Duration,
 }
 
 /// What the command line asked for.
@@ -356,6 +386,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         },
         sole_trader,
         mainnet,
+        cancel_window: CANCEL_NOT_OURS_WINDOW,
     };
     confirmed(&opts)?;
     Ok(Parsed::Quote(Box::new(opts)))
