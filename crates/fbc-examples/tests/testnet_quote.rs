@@ -1370,18 +1370,27 @@ async fn fill_run(
     timeout: u64,
     frames: usize,
 ) -> (quote::Report, String, Vec<String>) {
-    let (report, printed, venue) =
-        fill_run_until(script, timeout, frames, None, std::future::pending()).await;
+    let (report, printed, venue) = fill_run_until(
+        script,
+        timeout,
+        frames,
+        None,
+        |_| {},
+        std::future::pending(),
+    )
+    .await;
     (report, printed, methods(&venue, 0))
 }
 
-/// [`fill_run`]'s run, with `signal` notified at that `GET /positions` read and the run
-/// interrupted when `interrupt` completes: its report, what it printed, and the stub venue.
+/// [`fill_run`]'s run, with `signal` notified at that `GET /positions` read, the options
+/// changed by `tweak`, and the run interrupted when `interrupt` completes: its report, what it
+/// printed, and the stub venue.
 async fn fill_run_until(
     script: Vec<Option<&'static str>>,
     timeout: u64,
     frames: usize,
     signal: Option<(usize, Arc<Notify>)>,
+    tweak: impl FnOnce(&mut Options),
     interrupt: impl std::future::Future<Output = ()>,
 ) -> (quote::Report, String, Shared) {
     let venue = venue(vec![b0(), b0(), book(2, Some("80000.0"), Some("80000.2"))]);
@@ -1398,6 +1407,7 @@ async fn fill_run_until(
     opts.order_usd = dec("8");
     opts.inventory_cap_usd = dec("16");
     opts.step_timeout_secs = timeout;
+    tweak(&mut opts);
     let (report, printed) = run_until(&opts, interrupt).await;
     tokio::time::timeout(Duration::from_secs(30), stub.finished())
         .await
@@ -1549,7 +1559,7 @@ async fn after_a_position_check_the_pass_reads_a_fresh_touch_before_it_places() 
     // and for a mismatch the re-read clears.
     for (script, last_check_read) in [(Vec::new(), 1), (vec![None], 2)] {
         let (report, printed, venue) =
-            fill_run_until(script, 2, GOES_ON, None, std::future::pending()).await;
+            fill_run_until(script, 2, GOES_ON, None, |_| {}, std::future::pending()).await;
         assert!(report.ok, "{printed}");
         let v = lock(&venue);
         // The resync's read, the check's read(s), the Stop comparison's.
@@ -1595,6 +1605,7 @@ async fn the_interrupt_during_the_position_check_stops_it_at_once() {
         10,
         6 + 1 + 2 + 2 + 1,
         Some((2, signal)),
+        |_| {},
         interrupt,
     )
     .await;
@@ -1631,6 +1642,46 @@ async fn the_interrupt_during_the_position_check_stops_it_at_once() {
             .contains("GET /positions 12 lots, the registry 12 lots (1 fills applied): they agree"),
         "{printed}"
     );
+}
+
+#[tokio::test]
+async fn the_duration_passing_during_the_position_check_ends_the_loop_at_once() {
+    // RA157-1 / RB157-2 on PR #157: as the interrupt, --duration (1 s) passing while the check
+    // after the first fill waits for its re-read (a step timeout, 10 s, away) ends the loop at
+    // --duration, not after the re-read; nothing is placed after the fill, and the Stop
+    // comparison agrees.
+    let began = std::time::Instant::now();
+    let (report, printed, venue) = fill_run_until(
+        vec![None],
+        10,
+        6 + 1 + 2 + 2 + 1,
+        None,
+        |opts| opts.duration_secs = 1,
+        std::future::pending(),
+    )
+    .await;
+    assert!(
+        began.elapsed() < Duration::from_secs(5),
+        "the run took {:?}:\n{printed}",
+        began.elapsed()
+    );
+    assert_eq!(report.ended, "--duration 1 s reached", "{printed}");
+    assert!(report.ok, "{printed}");
+    assert!(
+        printed.contains("POSITION after the first fill: +"),
+        "{printed}"
+    );
+    assert!(
+        !printed.contains("POSITION re-read after the first fill"),
+        "{printed}"
+    );
+    let sent = methods(&venue, 0);
+    assert_eq!(
+        sent.iter().filter(|m| *m == "order.create").count(),
+        2,
+        "{sent:?}\n{printed}"
+    );
+    assert!(printed.contains("POSITION at Stop: +",), "{printed}");
 }
 
 #[tokio::test]
