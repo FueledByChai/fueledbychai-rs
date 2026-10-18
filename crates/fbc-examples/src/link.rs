@@ -58,7 +58,8 @@
 //!   user_cancel_ws or user_cancel_batch_ws, which do not say who sent it) while no cancel of
 //!   ours covers it is noted ([`Note::CancelNotOurs`]) after its [`Note::Order`]. A cancel of
 //!   ours covers an order from the moment it is submitted here, in flight or answered, whatever
-//!   its answer: a cancel or cancel-many naming it (a replace's, a sweep's, Stop's, or a Safety
+//!   its answer, until the session reports it not sent (nothing was written: Codex r4308561813
+//!   on PR #159): a cancel or cancel-many naming it (a replace's, a sweep's, Stop's, or a Safety
 //!   cancel of [`ExecHandler::on_unprotected`]), or a cancel-all of its market (or of the
 //!   account) submitted while the order was ours and not ended; the registry's own count of
 //!   cancels sent for it is read as well. Only the event that ends the order counts (a late
@@ -288,6 +289,40 @@ pub fn described(reject: &Reject) -> String {
     }
 }
 
+/// Which orders of ours the cancels of ours submitted here cover (module documentation): each
+/// order with the requests that cover it. A request the session reports not sent covers
+/// nothing (no byte of it was written), so another's cancel of its orders is not taken for
+/// ours (Codex r4308561813 on PR #159).
+#[derive(Debug, Default)]
+pub struct Coverage(HashMap<ClientOrderId, HashSet<RpcId>>);
+
+impl Coverage {
+    /// Request `rpc` cancels `cids` (a cancel-all: every live order of ours on its market).
+    pub fn cover(&mut self, rpc: RpcId, cids: impl IntoIterator<Item = ClientOrderId>) {
+        for cid in cids {
+            self.0.entry(cid).or_default().insert(rpc);
+        }
+    }
+
+    /// Request `rpc` was not sent: it covers nothing.
+    pub fn not_sent(&mut self, rpc: RpcId) {
+        self.0.retain(|_, rpcs| {
+            rpcs.remove(&rpc);
+            !rpcs.is_empty()
+        });
+    }
+
+    /// Whether a request of ours covers `cid`.
+    pub fn covers(&self, cid: ClientOrderId) -> bool {
+        self.0.contains_key(&cid)
+    }
+
+    /// Keeps the orders `keep` takes (the live ones), forgetting the rest.
+    pub fn retain(&mut self, keep: impl Fn(&ClientOrderId) -> bool) {
+        self.0.retain(|cid, _| keep(cid));
+    }
+}
+
 /// One item of a submitted command, as the registry knows it.
 #[derive(Copy, Clone, Debug)]
 enum Item {
@@ -331,7 +366,7 @@ pub struct Link {
     live: HashMap<ClientOrderId, InstrumentId>,
     /// The orders of ours a cancel of ours submitted here covers (module documentation): an
     /// order that ends `Canceled(Requested)` outside it was cancelled by someone else.
-    covered: HashSet<ClientOrderId>,
+    covered: Coverage,
 }
 
 impl Link {
@@ -356,7 +391,7 @@ impl Link {
             session: None,
             safety: HashMap::new(),
             live: HashMap::new(),
-            covered: HashSet::new(),
+            covered: Coverage::default(),
         }
     }
 
@@ -553,11 +588,11 @@ impl Link {
             _ => Vec::new(),
         };
         let rpc = orders.submit(auth).map_err(|e| format!("{e:?}"))?;
-        for item in &items {
-            if let Item::Cancel(cid) = item {
-                self.covered.insert(*cid);
-            }
-        }
+        let named = items.iter().filter_map(|item| match item {
+            Item::Cancel(cid) => Some(*cid),
+            _ => None,
+        });
+        self.covered.cover(rpc, named);
         if let Some(scope) = scope {
             self.prune_ended();
             let all: Vec<ClientOrderId> = self
@@ -569,7 +604,7 @@ impl Link {
                 })
                 .map(|(cid, _)| *cid)
                 .collect();
-            self.covered.extend(all);
+            self.covered.cover(rpc, all);
         }
         self.live.extend(placed);
         self.sent.insert(rpc, items);
@@ -588,7 +623,7 @@ impl Link {
 
     /// Whether a cancel of ours covers our order `cid` (module documentation).
     fn cancel_of_ours(&self, cid: ClientOrderId) -> bool {
-        self.covered.contains(&cid) || self.reg.get(cid).is_some_and(|r| r.cancels_sent() > 0)
+        self.covered.covers(cid) || self.reg.get(cid).is_some_and(|r| r.cancels_sent() > 0)
     }
 
     /// The items of `cmd`, each naming one of our orders.
@@ -673,6 +708,9 @@ impl Link {
             }
         }
         let sent = receipt.map(|_| ());
+        if sent.is_err() {
+            self.covered.not_sent(rpc);
+        }
         self.notes.push(Note::Submitted { rpc, sent });
     }
 
