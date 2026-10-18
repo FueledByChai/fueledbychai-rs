@@ -220,11 +220,12 @@ rather than guess.
     (yield to the runtime, poll every member, until a round stamps nothing), journals a `Cycle`
     record under Normal with the instruments the consumer marked through `Changed`, runs the
     consumer's `Decide` pass, and submits the `Ladder` of authorizations and control commands it
-    decides one at a time, each once its session holds nothing, with a yield and a poll of every
-    member between two, so what a handler submits meanwhile goes first and every remaining
-    command is re-checked at its encode; a submission is attributed to the input being handled
-    as it is submitted, on whichever session; a ladder command never submitted is handed back
-    (`Decide::unsubmitted`); a member's error ends the run (`tests/shard_host.rs`);
+    decides one at a time, each once every order-entry session holds nothing, with a yield and
+    a poll of every member between two, so what a handler submits meanwhile goes first and every
+    remaining command is re-checked at its encode; a submission made while a handler is handed
+    an input's events is attributed to that input, on whichever session; a ladder command never
+    submitted, or withdrawn untaken when the run ends, is handed back (`Decide::unsubmitted`); a
+    member's error ends the run (`tests/shard_host.rs`);
     `tests/common/toy.rs` is the toy market-data venue later runtime tests reuse.
   - `crates/fbc-book` (it depends on `fbc-core` only: one tick-indexed L2 book per
     instrument and `BookId`, built from book events the same live and in replay, with

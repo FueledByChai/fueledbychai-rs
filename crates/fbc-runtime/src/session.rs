@@ -367,6 +367,8 @@ pub struct MdSession<H> {
     rate_retry: Option<Instant>,
     /// The writes the handler issues while it handles an input.
     outbox: Outbox,
+    /// The shard clock, beside the core's, for what the core hands inputs to (decision 0100).
+    clock: IngestClock,
     handler: H,
 }
 
@@ -403,6 +405,7 @@ macro_rules! feed {
             caps: &$session.caps,
             specs: &$session.specs,
             decode_errors: &mut $session.counters.decode_errors,
+            clock: &$session.clock,
         }
     };
 }
@@ -433,6 +436,7 @@ impl<H: MdHandler> MdSession<H> {
             MdTransport::Poll { .. } => None,
         };
         let (stop_tx, stop) = watch::channel(());
+        let clock = config.clock.clone();
         let core = Core::new(CoreConfig {
             own: config.plan.stream,
             connector: config.connector,
@@ -465,6 +469,7 @@ impl<H: MdHandler> MdSession<H> {
             waiting: None,
             rate_retry: None,
             outbox,
+            clock,
             handler,
         };
         let control = MdControl {
@@ -604,8 +609,6 @@ impl<H: MdHandler> MdSession<H> {
             .await?
             && self.subscribe(&mut ws, codec.as_mut(), call).await?;
         while open {
-            // No input is being handled while the session waits for the next (decision 0100).
-            self.core.clock.handled();
             let wake = tokio::select! {
                 frame = next_frame(&mut ws) => Wake::Frame(frame),
                 _ = sleep_or_never(self.core.next_deadline()) => Wake::Timer,
@@ -734,6 +737,7 @@ impl<H: MdHandler> MdSession<H> {
             epochs: &mut self.core.epochs,
             out: &mut self.outbox,
             stamp,
+            clock: &self.clock,
         };
         for sub in wanted {
             let (inst, feed, h) = (sub.inst, sub.feed, FeedHealth::Stale);
@@ -760,6 +764,7 @@ impl<H: MdHandler> MdSession<H> {
             epochs: &mut self.core.epochs,
             out: &mut self.outbox,
             stamp,
+            clock: &self.clock,
         };
         if feed_frame(codec, &self.caps, &self.specs, raw, &mut sink, fx).is_err() {
             self.counters.decode_errors += 1;
@@ -902,6 +907,7 @@ struct Feed<'a, H> {
     caps: &'a VenueCaps,
     specs: &'a SpecTable,
     decode_errors: &'a mut u64,
+    clock: &'a IngestClock,
 }
 
 impl<H: MdHandler> EpochInputs for Feed<'_, H> {
@@ -915,6 +921,7 @@ impl<H: MdHandler> EpochInputs for Feed<'_, H> {
             epochs,
             out: &mut *self.outbox,
             stamp,
+            clock: self.clock,
         };
         feed_timer(&mut *self.codec, stamp, tag, &mut sink, fx);
         self.outbox.drain_into(fx);
@@ -926,6 +933,7 @@ impl<H: MdHandler> EpochInputs for Feed<'_, H> {
             epochs,
             out: &mut *self.outbox,
             stamp,
+            clock: self.clock,
         };
         let (codec, specs, caps) = (&mut *self.codec, self.specs, self.caps);
         let decoded = with_response(&done.result, |resp| {
@@ -1028,13 +1036,18 @@ struct Sink<'a, H> {
     epochs: &'a mut Epochs,
     out: &'a mut Outbox,
     stamp: Stamp,
+    /// Names the input as being handled while the handler hears its events, so an order-entry
+    /// command the handler submits is attributed to it (decision 0100).
+    clock: &'a IngestClock,
 }
 
 impl<H: MdHandler> MdSink for Sink<'_, H> {
     fn push(&mut self, meta: VenueMeta, ev: MdEvent) {
         if let Ok(Admit::Current) = self.epochs.admit(Input::Event, self.stamp.conn) {
             let env = Envelope::new(self.stamp, meta, ev);
-            self.handler.on_md_with(env, self.out);
+            let (handler, out) = (&mut *self.handler, &mut *self.out);
+            self.clock
+                .attributing(self.stamp, || handler.on_md_with(env, out));
         }
     }
 }

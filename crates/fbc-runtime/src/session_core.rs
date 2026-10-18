@@ -80,9 +80,9 @@ fn tick_to_wire(
 /// The stamp source the sessions of one shard thread share: one ingest sequence, so ingest
 /// order is shard-global, and one monotonic origin. Cloning it shares it.
 ///
-/// It also keeps the stamp of the input being handled, from its stamp until its session waits
-/// for the next input, so a command a handler submits then, on whichever session of the shard,
-/// is attributed to that input (decision 0100).
+/// It also names the input being handled while a session hands that input's events to its
+/// handler ([`IngestClock::attributing`]), so a command the handler submits then, on whichever
+/// session of the shard, is attributed to that input (decision 0100).
 #[derive(Clone, Debug)]
 pub struct IngestClock {
     next: Rc<Cell<u64>>,
@@ -112,15 +112,13 @@ impl IngestClock {
         let ingest_seq = self.next.get();
         self.next.set(ingest_seq.wrapping_add(1));
         let (recv_mono, recv_wall) = self.now();
-        let stamp = Stamp {
+        Stamp {
             ingest_seq,
             kernel_rx,
             recv_mono,
             recv_wall,
             conn,
-        };
-        self.handling.set(Some(stamp));
-        stamp
+        }
     }
 
     /// The ingest sequence the next input will be stamped with.
@@ -128,8 +126,8 @@ impl IngestClock {
         self.next.get()
     }
 
-    /// The stamp of the input being handled, if one is: a command submitted now is attributed
-    /// to it (decision 0100).
+    /// The stamp of the input whose events a handler is being handed, if one is: a command
+    /// submitted now is attributed to it (decision 0100).
     pub(crate) fn handling(&self) -> Option<Stamp> {
         self.handling.get()
     }
@@ -145,11 +143,6 @@ impl IngestClock {
         }
         let _restore = Restore(&self.handling, self.handling.replace(Some(stamp)));
         f()
-    }
-
-    /// No input is being handled: the session waits for the next, or the shard host decides.
-    pub(crate) fn handled(&self) {
-        self.handling.set(None);
     }
 
     /// Now, on the monotonic clock from the origin and on the wall clock.
@@ -363,8 +356,6 @@ impl Core {
         url: &str,
         ctl: &mut impl Control,
     ) -> Result<Option<WebSocket>, SessionError> {
-        // No input is being handled while the session waits to connect (decision 0100).
-        self.clock.handled();
         loop {
             let mut at = self.pacer.next_attempt(Instant::now());
             let mut waiting = true;

@@ -213,6 +213,19 @@ impl Shared {
         self.ended.get() || (!self.sending.get() && !self.waiting())
     }
 
+    /// Takes back the command submitted as request `rpc` while it still waits for the session's
+    /// turn: nothing of it reached the codec (decision 0100).
+    pub(crate) fn withdraw(&self, rpc: RpcId) -> Option<Submitted> {
+        let mut queue = self.queue.borrow_mut();
+        let at = queue.iter().position(|queued| queued.rpc == rpc)?;
+        queue.remove(at).map(|queued| queued.item)
+    }
+
+    /// The shard clock, which names the input whose events are being handed on.
+    pub(crate) fn clock(&self) -> &IngestClock {
+        &self.clock
+    }
+
     /// The epoch whose stream is authenticated, if one is.
     pub(crate) fn ready(&self) -> Option<u32> {
         self.ready.get()
@@ -265,6 +278,11 @@ impl ExecOrders {
     /// Whether the session has run or dropped, taking no more commands.
     pub(crate) fn ended(&self) -> bool {
         self.shared.ended.get()
+    }
+
+    /// Takes back request `rpc` while it still waits for the session's turn ([`Shared::withdraw`]).
+    pub(crate) fn withdraw(&self, rpc: RpcId) -> Option<Submitted> {
+        self.shared.withdraw(rpc)
     }
 
     /// Submits the order-affecting command fbc-oms authorized, spending the authorization: its

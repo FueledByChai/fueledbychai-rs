@@ -21,8 +21,9 @@
 //!
 //! **The ladder.** The decide pass pushes its commands onto a [`Ladder`]: each an fbc-oms
 //! [`Authorization`] for an order-entry session's [`ExecOrders`], or a [`ControlCommand`], in the
-//! order pushed. The host submits one, lets the members run until that session holds nothing
-//! (the command encoded, signed and written, or reported not sent), yields to the runtime and
+//! order pushed. The host submits one once every order-entry member's session holds nothing,
+//! lets the members run until they again hold nothing (the command encoded, signed and written,
+//! or reported not sent), yields to the runtime and
 //! polls every member once (the between-command poll: frames the kernel has delivered are read
 //! and handed to the handlers), and only then submits the next. A command a handler submits
 //! through `ExecOrders` meanwhile is therefore taken before the ladder's next one, and every
@@ -30,16 +31,17 @@
 //! kill switch a handler turns on between two commands leaves each remaining place, batch and
 //! amend `NotSent(StaleAuthorization)`, nothing written, while cancels still go out.
 //!
-//! **Attribution.** A command a handler submits while it handles an input is attributed to that
-//! input, whichever session took it (the clock keeps the stamp of the input being handled), for
-//! FBC-2y3's tick-to-wire; a ladder command is attributed to no input.
+//! **Attribution.** A command a handler submits while it is handed an input's events is
+//! attributed to that input, whichever session takes it (the clock names that input for the
+//! length of the call), for FBC-2y3's tick-to-wire; a ladder command is attributed to no input.
 //!
 //! **Ends.** A member that ends without an error is polled no more, and the run returns once
 //! every member has ended. A member's error ends the run at once and is returned, its other
 //! members' runs dropped (their connections close, which per-connection cancel-on-disconnect
 //! protects, 0058). A ladder command never submitted, because its session had ended or the run
-//! ended before its turn, is handed back to the consumer ([`Decide::unsubmitted`]) and counted
-//! ([`ShardHost::unsubmitted`]); nothing of it reached a session.
+//! ended before its turn, or submitted and withdrawn because the run ended before its session
+//! took it, is handed back to the consumer ([`Decide::unsubmitted`]) and counted
+//! ([`ShardHost::unsubmitted`]); nothing of it reached a codec.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -49,11 +51,11 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
-use fbc_core::{InstrumentId, TrafficClass};
+use fbc_core::{InstrumentId, RpcId, TrafficClass};
 use fbc_journal::Record;
 use fbc_oms::{Authorization, ControlCommand};
 
-use crate::exec_orders::ExecOrders;
+use crate::exec_orders::{ExecOrders, Submitted};
 use crate::exec_session::{ExecHandler, ExecSession, ExecSessionError};
 use crate::journal::Journal;
 use crate::md_venue::MdVenue;
@@ -166,15 +168,24 @@ struct Planned {
     command: Unsubmitted,
 }
 
+/// A ladder command submitted and not yet known taken: its request id, and the control command
+/// it was, kept to hand back should it be withdrawn.
+struct InFlight {
+    rpc: RpcId,
+    control: Option<ControlCommand>,
+}
+
 impl Planned {
     /// Submits the command to its session, which takes it: the ladder took only an authorization
     /// for the session's account, and the host submits only to a session that has not ended.
-    fn submit(self) {
-        let submitted = match self.command {
-            Unsubmitted::Authorized(auth) => self.orders.submit(auth),
-            Unsubmitted::Control(cmd) => self.orders.submit_control(cmd),
+    fn submit(self) -> Option<InFlight> {
+        let (submitted, control) = match self.command {
+            Unsubmitted::Authorized(auth) => (self.orders.submit(auth), None),
+            Unsubmitted::Control(cmd) => (self.orders.submit_control(cmd.clone()), Some(cmd)),
         };
         debug_assert!(submitted.is_ok(), "{submitted:?}");
+        let rpc = submitted.ok()?;
+        Some(InFlight { rpc, control })
     }
 }
 
@@ -310,12 +321,14 @@ impl ShardHost {
         members: Vec<Member<'_>>,
         decide: &mut D,
     ) -> Result<(), ShardError> {
-        let mut running = Running(members.into_iter().map(|m| Some(m.run)).collect());
+        let execs = members.iter().filter_map(|m| m.orders.clone()).collect();
+        let runs = members.into_iter().map(|m| Some(m.run)).collect();
+        let mut running = Running { runs, execs };
         // The next ingest sequence as the last pass began: an input stamped since calls for one.
         let mut decided = self.clock.next_seq();
         loop {
             let clock = &self.clock;
-            if !running.until(|| clock.next_seq() != decided).await? {
+            if !running.until(|_| clock.next_seq() != decided).await? {
                 return Ok(());
             }
             if !running.drain(clock).await? {
@@ -347,8 +360,10 @@ impl ShardHost {
     ) -> Result<bool, ShardError> {
         while let Some(planned) = ladder.planned.pop_front() {
             let orders = planned.orders.clone();
-            // What a handler submitted is taken first.
-            let idle = running.until(|| orders.idle()).await;
+            // What a handler submitted, on any order-entry session of the shard, is taken first
+            // (Codex P1 r4309119894 on PR #164).
+            let quiet = |execs: &[ExecOrders]| execs.iter().all(ExecOrders::idle) && orders.idle();
+            let idle = running.until(quiet).await;
             if !matches!(idle, Ok(true)) {
                 ladder.planned.push_front(planned);
                 return idle;
@@ -357,11 +372,23 @@ impl ShardHost {
                 self.hand_back(decide, planned);
                 continue;
             }
-            // A ladder command is attributed to no input.
-            self.clock.handled();
-            planned.submit();
-            if !running.until(|| orders.idle()).await? {
-                return Ok(false);
+            let Some(sent) = planned.submit() else {
+                continue;
+            };
+            let taken = running.until(quiet).await;
+            if !matches!(taken, Ok(true)) {
+                // The run ends before its session took it: it is taken back, nothing of it sent
+                // (Codex P1 r4309119897 on PR #164).
+                let item = orders.withdraw(sent.rpc);
+                let command = item.and_then(|item| match item {
+                    Submitted::Authorized(auth) => Some(Unsubmitted::Authorized(auth)),
+                    Submitted::Control(_) => sent.control.map(Unsubmitted::Control),
+                });
+                if let Some(command) = command {
+                    self.unsubmitted += 1;
+                    decide.unsubmitted(command);
+                }
+                return taken;
             }
             // Between two commands: what the kernel has delivered is read and handed on.
             tokio::task::yield_now().await;
@@ -390,8 +417,6 @@ impl ShardHost {
             };
             journal.record(TrafficClass::Normal, wall, &record);
         }
-        // What the decide pass submits itself is attributed to no input.
-        self.clock.handled();
         let mut ladder = Ladder::default();
         decide.decide(&instruments, &mut ladder);
         self.passes += 1;
@@ -399,13 +424,16 @@ impl ShardHost {
     }
 }
 
-/// The members still running.
-struct Running<'a>(Vec<Option<Run<'a>>>);
+/// The members still running, and the orders of every order-entry member.
+struct Running<'a> {
+    runs: Vec<Option<Run<'a>>>,
+    execs: Vec<ExecOrders>,
+}
 
 impl Running<'_> {
     /// Polls every member still running once: false once none is, or the first error.
     fn poll_all(&mut self, cx: &mut Context<'_>) -> Result<bool, ShardError> {
-        for slot in &mut self.0 {
+        for slot in &mut self.runs {
             if let Some(run) = slot
                 && let Poll::Ready(ended) = run.as_mut().poll(cx)
             {
@@ -413,16 +441,19 @@ impl Running<'_> {
                 ended?;
             }
         }
-        Ok(self.0.iter().any(Option::is_some))
+        Ok(self.runs.iter().any(Option::is_some))
     }
 
-    /// Polls the members until `done` holds after a round: true then, false once every member
-    /// has ended, or the first error.
-    async fn until(&mut self, mut done: impl FnMut() -> bool) -> Result<bool, ShardError> {
+    /// Polls the members until `done`, given the order-entry members' orders, holds after a
+    /// round: true then, false once every member has ended, or the first error.
+    async fn until(
+        &mut self,
+        mut done: impl FnMut(&[ExecOrders]) -> bool,
+    ) -> Result<bool, ShardError> {
         poll_fn(|cx| match self.poll_all(cx) {
             Err(e) => Poll::Ready(Err(e)),
             Ok(false) => Poll::Ready(Ok(false)),
-            Ok(true) if done() => Poll::Ready(Ok(true)),
+            Ok(true) if done(&self.execs) => Poll::Ready(Ok(true)),
             Ok(true) => Poll::Pending,
         })
         .await

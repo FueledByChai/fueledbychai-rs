@@ -33,7 +33,11 @@ caps again when it is authorized (0082), and releases a held place whose command
    sees an input taken: every input is stamped from it. The host spawns no task (design §5.1).
 2. **A pass.** Once an input has been stamped since the last pass, the host drains: it yields
    to the runtime, which polls the I/O and time drivers before it resumes the host, then polls
-   every member once, until such a round stamps no input. It then journals one
+   every member once, until such a round stamps no input. That a yield polls the drivers is the
+   pinned tokio's behaviour (0019 pins it exactly: `yield_now` hands the waker to the scheduler,
+   which wakes it only once it has run out of ready tasks and polled the driver), not a promise
+   of its documentation, so a test pins it (`tests/shard_host.rs`) and a tokio that stops doing
+   it fails there. It then journals one
    `Record::Cycle { last_ingest_seq, instruments }` under Normal (the last ingest sequence given,
    and the instruments the consumer marked changed through the host's `Changed` handle since the
    last pass, in the order first marked), and calls `Decide::decide(instruments, ladder)` once:
@@ -43,32 +47,37 @@ caps again when it is authorized (0082), and releases a held place whose command
    `Authorization` for an `ExecOrders` (refused there for another account, the authorization
    handed back) or a control command, in the order the consumer pushed them (the planner's
    cancels, reducing orders, amends, then adds). The host holds the ladder, not the session:
-   it submits one command, lets the members run until that session has taken it (encoded,
-   signed and written, or reported not sent) and holds nothing else of it, then polls between
-   commands (point 4), and only then submits the next.
+   it submits one command once every order-entry member's session, and the command's own,
+   holds nothing; lets the members run until they again hold nothing, so the command has been
+   taken (encoded, signed and written, or reported not sent); then polls between commands
+   (point 4), and only then submits the next.
 4. **Between two commands.** The host yields to the runtime and polls every member once: frames
    already read by the kernel are read, decoded and applied, and their events reach the
    consumer through the handlers it already has, `MdHandler::on_md` and `ExecHandler::on_exec`
    (0023, 0053). Nothing new reaches the consumer here; the per-event path is the handler.
 5. **What a handler submits goes first.** A handler submits through `ExecOrders` as before
-   (0057). Since the host submits the next ladder command only once that session holds nothing,
-   whatever a handler submitted meanwhile is taken first, after at most the one command whose
-   encode or write was in progress when it was submitted. A kill switch or any other state change
+   (0057). Since the host submits the next ladder command only once every order-entry session
+   of the shard holds nothing, whatever a handler submitted meanwhile, to any of them, is taken
+   first, after at most the one command whose encode or write was in progress when it was
+   submitted. A kill switch or any other state change
    a handler makes there refuses each remaining place, batch and amend at its encode
    (`NotSent(StaleAuthorization)`, nothing written, 0060, 0066), while cancels and the kill
    switch's cancel-all within 0005's I7 still go out.
-6. **Attribution (for FBC-2y3's measurement).** The shard clock keeps the stamp of the input
-   being handled, from its stamp until its session waits for the next input. A command submitted
-   then is attributed to that input, whichever session took it: its write's tick-to-wire runs
-   from that input's `kernel_rx` when the command is Safety traffic. Ladder commands come from
-   the decide pass and are attributed to no input. Reporting it on order entry is FBC-qfm's.
+6. **Attribution (for FBC-2y3's measurement).** The shard clock names an input as being handled
+   only while a session hands that input's events to its handler (`on_md`, `on_exec`,
+   `on_unprotected`); no other callback, nor a session waiting between an input's events and
+   its effects, names one. A command submitted while one is named is attributed to that input,
+   whichever session takes it: its write's tick-to-wire runs from that input's `kernel_rx` when
+   the command is Safety traffic. Ladder commands come from the decide pass and are attributed
+   to no input. Reporting it on order entry is FBC-qfm's.
 7. **Ends.** A member that ends without an error is polled no more; the run returns once every
    member has ended. A member's error ends the run at once and is returned, as `MdVenue::run`
    does for its endpoints; dropping the other runs closes their connections, which the venue's
    per-connection cancel-on-disconnect protects (0058). A ladder command never submitted,
    because its session had ended when its turn came or the run ended first, is handed back to
-   the consumer (`Decide::unsubmitted`, an authorization unspent) and counted: nothing of it
-   reached a session, so no `on_submitted` reports it. Withdrawing such an authorization in
+   the consumer (`Decide::unsubmitted`, an authorization unspent) and counted, and so is the one
+   the host had submitted when the run ended before its session took it, withdrawn from that
+   session's queue: nothing of either reached a codec, so no `on_submitted` reports it. Withdrawing such an authorization in
    fbc-oms is FBC-6ezy's.
 
 ## Alternatives
