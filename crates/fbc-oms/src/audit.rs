@@ -29,7 +29,7 @@ pub enum AuditEntry<'a> {
     /// received. For our order it carries the consumer's tag of the last place or amend the
     /// execution planner built for it and the removal reason of the last cancel it built for
     /// it ([`OrderRecord::tag`](crate::OrderRecord::tag),
-    /// [`OrderRecord::removal`](crate::OrderRecord::removal); decision 0065 rule 9): both
+    /// [`OrderRecord::removal`](crate::OrderRecord::removal); decision 0098): both
     /// `None` for an event routed to no order of ours, and for an order the planner did not
     /// place. fbc-oms gives them no meaning (decision 0001).
     Verdict {
