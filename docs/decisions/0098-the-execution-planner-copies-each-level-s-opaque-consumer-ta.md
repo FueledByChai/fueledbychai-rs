@@ -29,9 +29,10 @@ this repository's (0001).
    (`OrderRecord::tag`, `OrderRecord::removal`), and the audit sink's verdicts carry both
    (`AuditEntry::Verdict`), `None` for an event routed to no order of ours and for an order the
    planner did not place. A reason is kept only while its cancel may still end the order: a
-   cancel not sent or refused clears it, and so does a pass that wants the level again while
-   no cancel is in flight (a cancel built and never reported sent; 0065 rule 7), so the fills
-   of an order still resting carry none.
+   cancel not sent or refused clears it (one whose submit failed before it was reported sent
+   included, unless another cancel is in flight or its fate awaited), and so does a pass that
+   wants the level again while no cancel is in flight (a cancel built and never reported sent;
+   0065 rule 7), so the fills of an order still resting carry none.
 4. **Opaque.** fbc-oms gives the values no meaning and no check reads them (0001).
 
 ## Alternatives

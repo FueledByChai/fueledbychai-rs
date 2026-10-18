@@ -1101,6 +1101,15 @@ impl OrderRecord {
             }
             (_, SubmitOutcome::NotSent(_) | SubmitOutcome::Rejected(_)) => {
                 if !self.answers_intent(op) {
+                    // A cancel not sent or refused while no cancel is in flight or awaited (its
+                    // submit failed before it was reported sent, RB163-5 on PR #163) removed
+                    // nothing: the order keeps no removal reason (0098).
+                    if matches!(op, OrderOp::Cancel(_))
+                        && !matches!(self.intent, Intent::PendingCancel { .. })
+                        && !self.unanswered.iter().any(|(_, f)| *f == Fate::Cancel)
+                    {
+                        self.removal = None;
+                    }
                     // An earlier command's: the command in flight is still unanswered.
                     return OutcomeApplied::Unchanged;
                 }
