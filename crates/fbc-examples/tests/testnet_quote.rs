@@ -94,11 +94,8 @@ fn synthetic() -> (String, String) {
 }
 
 /// The synthetic credentials twice: the session's and the position check's own login.
-fn creds() -> positions::Creds {
-    positions::Creds {
-        session: secrets(),
-        positions: secrets(),
-    }
+fn creds() -> (Secrets, Secrets) {
+    (secrets(), secrets())
 }
 
 fn secrets() -> Secrets {

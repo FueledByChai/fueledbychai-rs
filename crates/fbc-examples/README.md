@@ -25,7 +25,8 @@ connects. Stop sends the kill switch and an instrument cancel-all of the market
 **Positions follow fills** (the owner's condition in decision 0094, FBC-hpg6). `testnet_trade`
 (so `mainnet_smoke`) and `testnet_quote` read `GET /positions` over REST, through the rate
 limiter the session charges, after the first fill the session sees and at Stop once Stop's
-cancels are answered (every run, fills or not), and compare the market's size with the registry's
+cancels are answered (every run, fills or not, while the market's lease is still held: before
+the market is disarmed and its leases released), and compare the market's size with the registry's
 position exactly in lots, printing a `POSITION` line. A mismatch is read once more after
 `--step-timeout`, both readings printed with their times, the venue's size, the registry's and
 the fills applied: a re-read that agrees goes on (`GET /positions` lagged the fills); one that

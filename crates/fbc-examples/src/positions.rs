@@ -42,14 +42,6 @@ use crate::testnet::{INST, Lines};
 /// What a run that Stops on a persisting mismatch says to do.
 pub const HAND_CHECK: &str = "check the position by hand";
 
-/// The account's credentials twice: once for the order-entry session's codec and once for the
-/// position check's own REST login. `Secrets` is not `Clone` (fbc-core), so a run is handed two
-/// sets, each read from the environment by the sample's `src/auth*` reader.
-pub struct Creds {
-    pub session: Secrets,
-    pub positions: Secrets,
-}
-
 /// One reading: when (milliseconds since the start), what `GET /positions` said of the market
 /// (in lots, or why it could not be read), and what the registry held as the answer landed:
 /// its position and how many fills of ours it had applied.

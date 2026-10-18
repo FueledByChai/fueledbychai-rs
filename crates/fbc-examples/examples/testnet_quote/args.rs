@@ -135,8 +135,9 @@ Lines (each with the milliseconds since the start):
                      agreeing, the loop goes on (GET /positions lagged the fills); still
                      differing, the loop Stops with nothing placed after and fails:
                      check the position by hand
-  POSITION at Stop: ...  the same comparison once Stop's cancels are answered, on every run;
-                     a mismatch the re-read confirms fails the run
+  POSITION at Stop: ...  the same comparison once Stop's cancels are answered, on every run,
+                     before STEP stop (the market still leased); a mismatch the re-read
+                     confirms fails the run
   SUMMARY ...        cycles, orders placed, cancels sent, orders cancelled, fills, inventory
   DONE ok|failed     ok only when the loop ended at --duration, --cycles or Ctrl-C, every
                      Stop cancel was accepted, every order of ours ended and GET /positions
