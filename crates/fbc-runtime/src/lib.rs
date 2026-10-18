@@ -82,6 +82,12 @@
 //! is per connection, and on every epoch arms it and resyncs before it places or amends
 //! (FBC-w19, decision 0058). Its journal comes with a later ticket.
 //!
+//! [`ShardHost`] is the shard host (FBC-ct0, decisions 0002, 0100): one loop over a shard's
+//! sessions, run as its [`Member`]s on one task, that drains every input they have ready, journals
+//! a `Cycle` record, runs the consumer's [`Decide`] pass and submits the [`Ladder`] it decides one
+//! command at a time, polling every session between two, so a command a handler submits
+//! meanwhile goes ahead of the ladder's remaining ones and waits for at most the one in progress.
+//!
 //! Not here yet: client certificates and certificate pinning.
 //! Apart from a codec's HTTP request (its own timeout) and a session's connection attempts and
 //! socket writes (the consumer's attempt deadline and write-stall window), no call here has a
@@ -104,6 +110,7 @@ mod reconcile;
 mod replay;
 mod session;
 mod session_core;
+mod shard;
 mod socks5;
 mod stall;
 mod target;
@@ -154,6 +161,7 @@ pub use session::{
     MdControl, MdCounters, MdHandler, MdSession, MdSessionConfig, Outbox, SessionError,
 };
 pub use session_core::{IngestClock, TickToWire};
+pub use shard::{Changed, Decide, Ladder, Member, ShardError, ShardHost};
 pub use stall::{WriteStall, WriteStallError};
 pub use tcp::Tcp;
 pub use transport::Transport;
