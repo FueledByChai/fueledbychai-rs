@@ -126,6 +126,8 @@ Lines (each step with the milliseconds since the start):
   TIMEOUT <step>     the step did not happen in time; the sample Stops
   HALT <step>        the step was not waited for: the position check after the first fill
                      failed (POSITION re-read ... STILL DIFFER); the run Stops
+  WARN ...           a cancel of the order that this program did not send ended it:
+                     another program on the account, or the Paradex UI; one quoter per account
   NOTE ...           something worth knowing (an unexpected event, a refusal, why a
                      connection of the order socket ended)
   NOTE login refused N times: ...  the last refusal; the run stops

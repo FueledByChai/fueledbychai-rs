@@ -52,6 +52,18 @@
 //!   was done.
 //! - **Undecodable input** ([`ExecHandler::on_decode_error`]): noted as a problem as it is
 //!   read, so a driver stops trading on what it may have missed.
+//! - **Cancels not ours** (FBC-aoh5, the owner's 2026-10-18 mainnet session: a Java instance on
+//!   the same account cancelled every order on its ticker it did not place). An order of ours
+//!   that an order event ends `Canceled(Requested)` (a user cancel: Paradex's USER_CANCELED,
+//!   user_cancel_ws or user_cancel_batch_ws, which do not say who sent it) while no cancel of
+//!   ours covers it is noted ([`Note::CancelNotOurs`]) after its [`Note::Order`]. A cancel of
+//!   ours covers an order from the moment it is submitted here, in flight or answered, whatever
+//!   its answer: a cancel or cancel-many naming it (a replace's, a sweep's, Stop's, or a Safety
+//!   cancel of [`ExecHandler::on_unprotected`]), or a cancel-all of its market (or of the
+//!   account) submitted while the order was ours and not ended; the registry's own count of
+//!   cancels sent for it is read as well. Only the event that ends the order counts (a late
+//!   duplicate of it is not), so one order is noted at most once. Each driver decides what it
+//!   means.
 //! - **Notes.** Everything the driver may wait on is appended to [`Link::notes`], in order.
 //!
 //! Times on the shard's monotonic clock are taken from each event's stamp; a submission's send
@@ -60,18 +72,19 @@
 //! time too (no clock-skew estimate yet), which only a replayed fill's admission reads.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fbc_core::{
-    AccountKey, CidMatch, ClientOrderId, ConnKey, ConnState, Envelope, ExecEvent, InstrumentId,
-    ItemRef, Lots, MonoNs, NotSentReason, OpKind, OrderCaps, OrderRef, Reject, RpcId, SignedLots,
-    SubmitHandle, SubmitOutcome, Ticks, VenueCommand, VenueOrderId, VenueOrderSnapshot, WallNs,
+    AccountKey, CancelReason, CancelScope, CidMatch, ClientOrderId, ConnKey, ConnState, Envelope,
+    ExecEvent, InstrumentId, ItemRef, Lots, MonoNs, NotSentReason, OpKind, OrderCaps, OrderRef,
+    Reject, RpcId, Side, SignedLots, SubmitHandle, SubmitOutcome, Ticks, VenueCommand,
+    VenueOrderId, VenueOrderSnapshot, WallNs,
 };
 use fbc_oms::{
-    Admission, Authorization, FillLedger, FillRouted, FillTime, LadderConfig, OrderKey, OrderOp,
-    Registry, ResyncReport, ResyncSnapshot, Routed,
+    Admission, Applied, Authorization, FillLedger, FillRouted, FillTime, LadderConfig, OrdState,
+    OrderKey, OrderOp, Registry, ResyncReport, ResyncSnapshot, Routed, TerminalKind,
 };
 use fbc_runtime::{ExecHandler, ExecOrders};
 use tokio::sync::Notify;
@@ -146,6 +159,10 @@ pub enum Note {
         rpcs: Vec<RpcId>,
         left: Vec<String>,
     },
+    /// Our order `cid` (on `side`) was just ended by a user cancel (`Canceled(Requested)`) that
+    /// no cancel of ours covers (module documentation, FBC-aoh5): another program on the
+    /// account, or a person in the venue's UI. Noted right after its [`Note::Order`].
+    CancelNotOurs { cid: ClientOrderId, side: Side },
 }
 
 /// Why a connection ended when the session reported no venue error with it: its codec
@@ -309,6 +326,12 @@ pub struct Link {
     session: Option<(ExecOrders, AccountKey)>,
     /// The Safety cancel request last submitted for each unprotected order.
     safety: HashMap<ClientOrderId, RpcId>,
+    /// The orders of ours that have not ended that the link knows (placed here, or shown by a
+    /// resync), with their market: what a cancel-all of ours covers.
+    live: HashMap<ClientOrderId, InstrumentId>,
+    /// The orders of ours a cancel of ours submitted here covers (module documentation): an
+    /// order that ends `Canceled(Requested)` outside it was cancelled by someone else.
+    covered: HashSet<ClientOrderId>,
 }
 
 impl Link {
@@ -332,6 +355,8 @@ impl Link {
             forgotten: (0, 0),
             session: None,
             safety: HashMap::new(),
+            live: HashMap::new(),
+            covered: HashSet::new(),
         }
     }
 
@@ -431,6 +456,7 @@ impl Link {
     pub fn forget(&mut self, upto: usize) -> Vec<Note> {
         let upto = upto.min(self.notes.len());
         let taken: Vec<Note> = self.notes.drain(..upto).collect();
+        self.prune_ended();
         let (places, cancels) = self.counted(&taken);
         self.forgotten.0 += places;
         self.forgotten.1 += cancels;
@@ -512,12 +538,57 @@ impl Link {
     }
 
     /// Submits `auth` through `orders`, remembering the order each item names: its request id,
-    /// or why it was not submitted (nothing was then remembered).
+    /// or why it was not submitted (nothing was then remembered). A cancel covers the orders it
+    /// names, and a cancel-all every live order of ours on its market, from here on (module
+    /// documentation): the venue's end of one may come before the session reports it sent.
     pub fn submit(&mut self, orders: &ExecOrders, auth: Authorization) -> Result<RpcId, String> {
         let items = self.items_of(auth.command())?;
+        let scope = match auth.command() {
+            VenueCommand::CancelAll(scope) => Some(*scope),
+            _ => None,
+        };
+        let placed: Vec<(ClientOrderId, InstrumentId)> = match auth.command() {
+            VenueCommand::Place(o) => vec![(o.cid, o.inst)],
+            VenueCommand::PlaceBatch(os) => os.iter().map(|o| (o.cid, o.inst)).collect(),
+            _ => Vec::new(),
+        };
         let rpc = orders.submit(auth).map_err(|e| format!("{e:?}"))?;
+        for item in &items {
+            if let Item::Cancel(cid) = item {
+                self.covered.insert(*cid);
+            }
+        }
+        if let Some(scope) = scope {
+            self.prune_ended();
+            let all: Vec<ClientOrderId> = self
+                .live
+                .iter()
+                .filter(|(_, inst)| match scope {
+                    CancelScope::Instrument(market) => **inst == market,
+                    CancelScope::Account => true,
+                })
+                .map(|(cid, _)| *cid)
+                .collect();
+            self.covered.extend(all);
+        }
+        self.live.extend(placed);
         self.sent.insert(rpc, items);
         Ok(rpc)
+    }
+
+    /// Forgets the orders of ours the registry holds ended (or not at all) from what a cancel
+    /// of ours covers and from the live orders: only the event that ends an order is judged, so
+    /// neither keeps the run's history.
+    fn prune_ended(&mut self) {
+        let reg = &self.reg;
+        let live = |cid: &ClientOrderId| reg.get(*cid).is_some_and(|r| !r.state().is_terminal());
+        self.live.retain(|cid, _| live(cid));
+        self.covered.retain(live);
+    }
+
+    /// Whether a cancel of ours covers our order `cid` (module documentation).
+    fn cancel_of_ours(&self, cid: ClientOrderId) -> bool {
+        self.covered.contains(&cid) || self.reg.get(cid).is_some_and(|r| r.cancels_sent() > 0)
     }
 
     /// The items of `cmd`, each naming one of our orders.
@@ -661,6 +732,11 @@ impl Link {
             return;
         };
         let key = OrderKey { venue, ingest };
+        for o in &snapshot.orders {
+            if let Some(CidMatch::Ours(cid)) = o.cid {
+                self.live.insert(cid, o.inst);
+            }
+        }
         match self.reg.resync(&self.ladder, &self.caps, &snapshot, key) {
             Ok(report) => self.notes.push(Note::Resynced { report, snapshot }),
             Err(e) => self.notes.push(Note::ResyncRefused(e.to_string())),
@@ -676,13 +752,46 @@ impl Link {
         match env.body {
             ExecEvent::Outcome { rpc, item, outcome } => self.on_outcome(rpc, item, outcome, now),
             ExecEvent::Order(u) => {
-                let note = match (self.reg.apply_update(&u, key), u.cid) {
+                // Our order this event names, and whether it had not ended before it.
+                let named = match u.cid {
+                    Some(CidMatch::Ours(cid)) => Some(cid),
+                    _ => u.vid.as_ref().and_then(|v| self.reg.cid_of(v)),
+                };
+                let was_live = named
+                    .and_then(|cid| self.reg.get(cid))
+                    .is_some_and(|r| !r.state().is_terminal());
+                let routed = self.reg.apply_update(&u, key);
+                let not_ours = match routed {
+                    Routed::Ours(cid, Applied::Advanced)
+                        if was_live
+                            && named == Some(cid)
+                            && u.state
+                                == fbc_core::VenueOrderState::Canceled(CancelReason::Requested)
+                            && !self.cancel_of_ours(cid) =>
+                    {
+                        self.reg
+                            .get(cid)
+                            .filter(|r| {
+                                r.state()
+                                    == OrdState::Terminal(TerminalKind::Canceled(
+                                        CancelReason::Requested,
+                                    ))
+                            })
+                            .map(|r| Note::CancelNotOurs {
+                                cid,
+                                side: r.placed().side,
+                            })
+                    }
+                    _ => None,
+                };
+                let note = match (routed, u.cid) {
                     (Routed::Untracked, Some(CidMatch::Ours(cid))) => {
                         Note::Orphan { cid, vid: u.vid }
                     }
                     (routed, _) => Note::Order(routed),
                 };
                 self.notes.push(note);
+                self.notes.extend(not_ours);
             }
             ExecEvent::Fill(f) => {
                 let time = env.exch_ts.map(|exch| FillTime {
@@ -773,6 +882,7 @@ impl Link {
                 _ => None,
             })
             .collect();
+        self.live.extend(told.iter().copied());
         let (open, ended): (Vec<ClientOrderId>, Vec<ClientOrderId>) = told
             .iter()
             .map(|(cid, _)| *cid)

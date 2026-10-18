@@ -83,6 +83,20 @@
 //! At Stop, once Stop's cancels are answered, the comparison runs again on every run, fills or
 //! not; a mismatch that persists there fails the run with both readings.
 //!
+//! **Cancels not ours** (FBC-aoh5, the owner's 2026-10-18 mainnet session: a Java instance on
+//! the same account cancelled every order on its ticker it did not place, every 3 s, and the
+//! loop just requoted). Paradex does not say who sent a user cancel; the [`Link`] notes an order
+//! of ours ended by one that no cancel of ours covers ([`Note::CancelNotOurs`]), and the loop
+//! applies the owner's rule ("Warn once, Stop on repeat") through [`CancelsNotOurs`]: those of
+//! one cycle are one event (two are one unless the second's order was placed after the first
+//! was seen: a requote cancelled again); the first prints a `WARN` line and the loop requotes; with
+//! `--mainnet`, a second on a later cycle within [`Options::cancel_window`] (30 s) of the first
+//! Stops the run and fails it ("another program cancelled our orders: one quoter per account");
+//! past the window the next one starts a new window; a testnet run only warns. Once one was
+//! seen, another program may be on the account, so the run's cancels of everything (a
+//! reconnect's sweep, Stop) name our orders explicitly and never send an instrument cancel-all,
+//! which would cancel its orders too ([`Driver::cancel_ours`]). The summary counts them.
+//!
 //! **Memory.** The link's notes are read once each ([`Driver::absorb`]) and those read are
 //! forgotten every cycle ([`Link::forget`]), so a long run keeps no growing note list.
 
@@ -167,6 +181,92 @@ pub struct Report {
     /// The requests whose items the loop and the link still hold at the end (in flight, or
     /// unanswered): what a long run keeps.
     pub requests_held: usize,
+    /// Orders of ours ended by a cancel this program did not send (FBC-aoh5).
+    pub cancels_not_ours: usize,
+}
+
+/// What a cancel not ours is to the owner's rule ([`CancelsNotOurs::on_cancel`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum NotOurs {
+    /// Of an order placed before the event before it was seen: the same event (one reconcile,
+    /// or one cancel-all in the venue's UI, cancels what rested when it ran: both sides).
+    SameEvent,
+    /// A new event with no other within the window before it: it starts the window (a WARN).
+    First,
+    /// A new event within the window of the window's first: a mainnet run Stops.
+    Repeat,
+}
+
+/// The cancels not ours a run saw and the owner's window over them (module documentation): when
+/// the window's first event and the latest event were seen.
+///
+/// Two are one event unless the second's order was placed after the first was seen: a cancel
+/// not ours of a quote the loop placed after it saw one is another cancel, on a later cycle
+/// than the one it requoted after (the loop never places a side again in the cycle it was
+/// cancelled in), so the owner's "a second one on a later cycle" is judged by the order, not by
+/// when its order event happens to be read (between two cycles, or during the next).
+#[derive(Clone, Debug)]
+pub struct CancelsNotOurs {
+    window: Duration,
+    orders: usize,
+    first: Option<tokio::time::Instant>,
+    latest: Option<tokio::time::Instant>,
+}
+
+impl CancelsNotOurs {
+    /// None seen yet; a second within `window` of the first is a repeat.
+    pub fn new(window: Duration) -> CancelsNotOurs {
+        CancelsNotOurs {
+            window,
+            orders: 0,
+            first: None,
+            latest: None,
+        }
+    }
+
+    /// One order of ours, placed by this run at `placed` (`None`: not placed by this run, an
+    /// earlier run's), ended by a cancel not ours seen at `now`: the same event as the one
+    /// before it unless its order was placed after that one was seen; then a repeat when within
+    /// the window of the window's first event, otherwise the first of a new window.
+    pub fn on_cancel(
+        &mut self,
+        placed: Option<tokio::time::Instant>,
+        now: tokio::time::Instant,
+    ) -> NotOurs {
+        self.orders += 1;
+        if let Some(latest) = self.latest
+            && placed.is_none_or(|placed| placed <= latest)
+        {
+            return NotOurs::SameEvent;
+        }
+        self.latest = Some(now);
+        match self.first {
+            Some(first) if now.saturating_duration_since(first) <= self.window => NotOurs::Repeat,
+            _ => {
+                self.first = Some(now);
+                NotOurs::First
+            }
+        }
+    }
+
+    /// How many orders of ours cancels not ours ended.
+    pub fn orders(&self) -> usize {
+        self.orders
+    }
+
+    /// Whether any was seen: another program may be on the account.
+    pub fn seen(&self) -> bool {
+        self.orders > 0
+    }
+
+    /// The window as the lines print it.
+    fn shown(&self) -> String {
+        if self.window.subsec_nanos() == 0 {
+            format!("{} s", self.window.as_secs())
+        } else {
+            format!("{} ms", self.window.as_millis())
+        }
+    }
 }
 
 /// The quote size and fbc-oms's caps, in lots, at the first touch and mark.
@@ -840,6 +940,8 @@ pub async fn run_on(
         fill_checked: false,
         retry_at: None,
         recancel_due: false,
+        not_ours: CancelsNotOurs::new(opts.cancel_window),
+        placed_at: HashMap::new(),
     };
     // The interrupt sets a flag the driver reads at each wake, and wakes it.
     let watch = {
@@ -884,13 +986,14 @@ pub async fn run_on(
     let report = driver.report(ok, ended);
     lines.line(format_args!(
         "SUMMARY cycles {} orders placed {} cancels sent {} orders cancelled {} fills {} \
-         inventory {} lots",
+         inventory {} lots cancels not ours {}",
         report.cycles,
         report.places_sent,
         report.cancels_sent,
         report.cancelled,
         report.fills,
-        report.inventory
+        report.inventory,
+        report.cancels_not_ours
     ));
     lines.line(format_args!(
         "DONE {} ({})",
@@ -1009,6 +1112,11 @@ struct Driver {
     /// or Stop sends the cancel of everything of ours again once its retry time passed
     /// ([`Driver::cancel_again`], Codex r4306449947 on PR #158).
     recancel_due: bool,
+    /// The cancels not ours seen, under the owner's rule (module documentation, FBC-aoh5),
+    /// and when each order of ours the loop placed that has not ended was handed over (what
+    /// tells one event from the next, [`CancelsNotOurs`]).
+    not_ours: CancelsNotOurs,
+    placed_at: HashMap<ClientOrderId, tokio::time::Instant>,
 }
 
 impl Driver {
@@ -1158,6 +1266,7 @@ impl Driver {
             fills: self.fills.get(),
             inventory: reg.inventory(INST).0,
             requests_held: link.requests_held().max(self.ours.len()),
+            cancels_not_ours: self.not_ours.orders(),
         }
     }
 
@@ -1492,8 +1601,60 @@ impl Driver {
                     ));
                 }
             }
+            Note::CancelNotOurs { cid, side } => self.cancel_not_ours(cid, side),
             Note::Conn(ConnState::Authenticated) => self.authenticated = true,
             Note::Conn(_) => {}
+        }
+    }
+
+    /// Our order `cid` on `side` was ended by a cancel this program did not send (module
+    /// documentation, FBC-aoh5): the owner's rule applied, printed as a `WARN` line once per
+    /// event; with `--mainnet` a repeat is a reason to Stop.
+    fn cancel_not_ours(&mut self, cid: ClientOrderId, side: Side) {
+        let order = format!("the {} #{}", side_name(side), cid.seq());
+        let window = self.not_ours.shown();
+        let what = format!(
+            "{order} ended by a user cancel this program did not send (another program on the \
+             account, or the Paradex UI): one quoter per account"
+        );
+        let placed = self.placed_at.remove(&cid);
+        match self.not_ours.on_cancel(placed, tokio::time::Instant::now()) {
+            NotOurs::SameEvent => self.note(format_args!(
+                "{order} ended by a user cancel this program did not send too: placed before the \
+                 last one was seen, the same event"
+            )),
+            NotOurs::First if self.opts.mainnet => self.event(
+                "WARN",
+                format_args!(
+                    "{what}; a second on a later cycle within {window} Stops the run; the loop \
+                     requotes, and cancels everything of ours explicitly from now on (never an \
+                     instrument cancel-all)"
+                ),
+            ),
+            NotOurs::First => self.event(
+                "WARN",
+                format_args!(
+                    "{what}; testnet mode only warns; the loop requotes, and cancels everything \
+                     of ours explicitly from now on (never an instrument cancel-all)"
+                ),
+            ),
+            NotOurs::Repeat if self.opts.mainnet => {
+                self.event(
+                    "WARN",
+                    format_args!("{what}; the second on a later cycle within {window}: Stop"),
+                );
+                self.trouble(format!(
+                    "another program cancelled our orders: one quoter per account (a second \
+                     cancel this program did not send on a later cycle within {window}, of \
+                     {order}); stop the other program or give each its own account"
+                ));
+            }
+            NotOurs::Repeat => self.event(
+                "WARN",
+                format_args!(
+                    "{what}; a second on a later cycle within {window}: testnet mode only warns"
+                ),
+            ),
         }
     }
 
@@ -1715,6 +1876,9 @@ impl Driver {
             self.link.borrow_mut().release(rpc);
             self.released.release(rpc);
         }
+        // Only the orders not ended need their placing time (FBC-aoh5).
+        let owned = &self.owned;
+        self.placed_at.retain(|cid, _| owned.contains(cid));
     }
 
     /// The venue order id of `cid`, or `none`.
@@ -2441,6 +2605,7 @@ impl Driver {
         self.ours.insert(rpc, request);
         if place {
             self.own(&[cid]);
+            self.placed_at.insert(cid, tokio::time::Instant::now());
             self.event(
                 "PLACE",
                 format_args!(
@@ -2543,23 +2708,36 @@ impl Driver {
     }
 
     /// The cancels of every order of ours still open on the market that has none in flight,
-    /// handed to the session: an instrument cancel-all when fbc-oms builds one (0005's I7),
-    /// otherwise explicit cancels. The requests, and how it was done.
+    /// handed to the session: an instrument cancel-all when fbc-oms builds one (0005's I7) and
+    /// no cancel not ours was seen, otherwise explicit cancels: once one was seen another
+    /// program may be on the account, and Paradex's instrument cancel-all would cancel its
+    /// orders too (FBC-aoh5). The requests, and how it was done.
     fn cancel_ours(&mut self) -> Result<(Vec<RpcId>, String), String> {
+        let not_ours = self.not_ours.seen();
         let (cmds, how) = {
             let mut link = self.link.borrow_mut();
             let caps = self.caps.clone();
             let reg = link.reg();
-            match reg.cancel_everything(INST, &caps) {
-                CancelEverything::CancelAll {
+            let everything = (!not_ours).then(|| reg.cancel_everything(INST, &caps));
+            let all = match everything {
+                Some(CancelEverything::CancelAll {
                     command,
                     unanswered,
-                } => {
+                }) => {
                     let mut cmds = vec![command];
                     cmds.extend(unanswered.commands);
-                    (cmds, "an instrument cancel-all".to_owned())
+                    Ok((cmds, "an instrument cancel-all".to_owned()))
                 }
-                CancelEverything::Explicit { why, .. } => {
+                Some(CancelEverything::Explicit { why, .. }) => Err(why.to_string()),
+                None => Err(
+                    "another program cancelled our orders (a cancel this program did \
+                             not send), and an instrument cancel-all would cancel its orders too"
+                        .to_owned(),
+                ),
+            };
+            match all {
+                Ok(all) => all,
+                Err(why) => {
                     let open: Vec<ClientOrderId> = self
                         .owned
                         .iter()

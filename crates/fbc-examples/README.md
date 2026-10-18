@@ -59,6 +59,12 @@ an order whose size at the mark is below the minimum notional (Paradex judges it
 $11 resting per side or $50 inventory are refused. The $11 resting cap is judged at the order's own
 price (the notional a fill costs), not at the mark. `--help` lists every flag and output line.
 
+**A cancel not ours** (FBC-aoh5). Paradex does not say who sent a user cancel. When the order
+ends cancelled by one that the program did not send (another program on the account, such as a
+Java quoter's orphan reconcile, or you in the Paradex UI), it prints a `WARN` line saying so:
+one quoter per account. The round trip did not happen, so the run fails (no repeat is possible
+with one order).
+
 ## testnet_quote --mainnet
 
 The fixed-offset loop on Paradex MAINNET, real money (FBC-tyft; owner answer "Yes, small and
@@ -82,9 +88,26 @@ amend frame is ever sent.
 It Stops (kill switch + instrument cancel-all, nothing placed after) on Ctrl-C, at `--duration`
 or `--cycles`, on a resync mismatch, an order of ours gone Unknown, a refused login, a permanent
 refusal of a place or a cancel (or an asynchronous `ORDER_SIZE_BELOW_MIN`, a sizing error), a
-position on another market, and a `GET /positions` mismatch the re-read confirms. A request
-refused for its rate waits the venue's retry time (2 s when Paradex states none). `DONE ok` only
-when the loop ended as asked and Stop did all it must.
+position on another market, a `GET /positions` mismatch the re-read confirms, and a repeated
+cancel not ours (below). A request refused for its rate waits the venue's retry time (2 s when
+Paradex states none). `DONE ok` only when the loop ended as asked and Stop did all it must.
+
+**Cancels not ours** (FBC-aoh5; owner answer "Warn once, Stop on repeat", 2026-10-18). The
+owner's first supervised session found a Java chaiwala instance on the same account cancelling
+every order on its ticker it did not place, every 3 s, while the loop just requoted: Paradex does
+not say who sent a user cancel, and the Java instance was flat with no orders at the start, so
+neither the resync nor `--sole-trader` could see it. The loop now counts a cancel not ours when
+an order of ours ends cancelled by a user while no cancel of ours covering it was sent (no
+replace's or side's cancel, no cancel-all, no start, reconnect or Stop sweep, in flight or
+answered). Those of one reconcile are one event (two are one unless the second's order was
+placed after the first was seen). The first prints a `WARN` line (another program on the
+account, or the Paradex UI; one quoter per account) and the loop requotes. A second on a later
+cycle within 30 s of the first Stops the run and fails it ("another program cancelled our
+orders: one quoter per account"), which catches a 3 s reconcile within about 6 s; after 30 s
+with no second the window starts again. Once one was seen, the reconnect sweeps and Stop cancel
+our orders explicitly and never send an instrument cancel-all, which would cancel the other
+program's orders too. Without `--mainnet` each only warns. `SUMMARY` ends with `cancels not
+ours N`, the orders of ours they ended.
 
 ```text
 unset PARADEX_ACCOUNT_ADDRESS PARADEX_PRIVATE_KEY
