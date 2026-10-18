@@ -22,7 +22,7 @@
 
 use std::time::{Duration, Instant};
 
-use fbc_core::{Secrets, SnapshotSource, VenueConfig, VenueFactory};
+use fbc_core::{SnapshotSource, VenueConfig, VenueFactory};
 use rust_decimal::Decimal;
 
 use crate::args::Options;
@@ -169,12 +169,13 @@ fn shown_chain(chain: &str) -> &str {
 /// Runs mainnet_smoke on `factory` (Paradex's; a stand-in under test): every guard first, before
 /// anything connects (module documentation); then the chain and the mark, each within the step
 /// timeout; then the round trip. `chain` is `PARADEX_CHAIN_ID` when set; `creds` the mainnet
-/// account's credentials, handed to the session's codec unread. An error is a refusal before
+/// account's credentials, twice: the session's, handed to its codec unread, and the position
+/// check's own login's. An error is a refusal before
 /// the session started; once it started the outcome is in the [`Report`].
 pub async fn run(
     smoke: &Smoke,
     chain: Option<&str>,
-    creds: Secrets,
+    creds: crate::positions::Creds,
     out: Out,
     factory: &'static dyn VenueFactory,
 ) -> Result<Report, String> {

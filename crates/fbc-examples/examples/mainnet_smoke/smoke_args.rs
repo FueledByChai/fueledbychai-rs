@@ -109,7 +109,17 @@ Lines (each step with the milliseconds since the start):
   STEP closed        the order event reporting the order cancelled, nothing of it filled
   STEP stop          kill switch on, cancel all sent (an instrument cancel-all of the market),
                      session closed
+  POSITION after the first fill: ...  GET /positions read after the first fill the session
+                     sees, the market's size compared with the registry's position in lots
+                     (with the time since the start and the fills applied)
+  POSITION re-read ...  on a mismatch, GET /positions read once more after --step-timeout:
+                     agreeing, the run goes on (GET /positions lagged the fills); still
+                     differing, the run Stops at once and fails: check the position by hand
+  POSITION at Stop: ...  the same comparison once Stop's cancels are answered, on every run;
+                     a mismatch the re-read confirms fails the run
   TIMEOUT <step>     the step did not happen in time; the run Stops
+  HALT <step>        the step was not waited for: the position check after the first fill
+                     failed (POSITION re-read ... STILL DIFFER); the run Stops
   NOTE ...           something worth knowing (a refusal with Paradex's status, code and
                      message, an unexpected event, why a connection ended)
   DONE ok|failed     the outcome; the exit status is 0 only for ok

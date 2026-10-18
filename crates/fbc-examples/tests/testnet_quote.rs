@@ -1190,15 +1190,9 @@ async fn a_mainnet_url_or_chain_id_is_refused_before_any_connection() {
     let mut mainnet = opts.clone();
     mainnet.rest_url = "https://api.prod.paradex.trade/v1".to_owned();
     mainnet.ws_url = "wss://ws.api.prod.paradex.trade/v1".to_owned();
-    let refused = quote::run(
-        &mainnet,
-        None,
-        creds(),
-        out.clone(),
-        std::future::pending(),
-    )
-    .await
-    .unwrap_err();
+    let refused = quote::run(&mainnet, None, creds(), out.clone(), std::future::pending())
+        .await
+        .unwrap_err();
     assert!(refused.contains("testnet only"), "{refused}");
     assert!(stub.connections().is_empty());
     assert!(
@@ -1366,12 +1360,9 @@ async fn fill_run(
         v.fill_next_buy_cancel = true;
         v.positions_script = script.into();
     }
-    let stub = StubServer::start(
-        one_connection(&venue, frames),
-        routes(&venue, login_ok()),
-    )
-    .await
-    .unwrap();
+    let stub = StubServer::start(one_connection(&venue, frames), routes(&venue, login_ok()))
+        .await
+        .unwrap();
     let mut opts = options(&stub, 3);
     opts.order_usd = dec("8");
     opts.inventory_cap_usd = dec("16");
@@ -1441,7 +1432,9 @@ async fn a_mismatch_after_the_first_fill_that_clears_on_the_re_read_is_printed_a
         .unwrap_or_else(|| panic!("no re-read:\n{printed}"));
     let line = printed[again..].lines().next().unwrap();
     assert!(
-        line.contains("GET /positions 12 lots, the registry 12 lots (1 fills applied): they agree now"),
+        line.contains(
+            "GET /positions 12 lots, the registry 12 lots (1 fills applied): they agree now"
+        ),
         "{printed}"
     );
     // Both readings' times, the re-read at least the step timeout after the first.
@@ -1454,7 +1447,10 @@ async fn a_mismatch_after_the_first_fill_that_clears_on_the_re_read_is_printed_a
         ms(printed[again..].lines().next().unwrap()),
     );
     assert!(t2 >= t1 + 2_000, "{t1} {t2}\n{printed}");
-    assert!(line.contains(&format!("first +{t1}ms GET /positions 0 lots")), "{printed}");
+    assert!(
+        line.contains(&format!("first +{t1}ms GET /positions 0 lots")),
+        "{printed}"
+    );
     assert!(!printed.contains(positions::HAND_CHECK), "{printed}");
     // The loop went on: the ask placed again after the re-read.
     assert!(again < printed.rfind("\nPLACE ").unwrap(), "{printed}");
@@ -1508,10 +1504,7 @@ async fn a_mismatch_after_the_first_fill_that_persists_stops_it_with_no_place_af
     // Stop: the kill switch and the instrument cancel-all, last on the wire.
     assert_eq!(sent.last().map(String::as_str), Some("order.cancel_all"));
     assert!(printed.contains("kill switch on"), "{printed}");
-    assert!(
-        printed.contains("POSITION re-read at Stop: +"),
-        "{printed}"
-    );
+    assert!(printed.contains("POSITION re-read at Stop: +"), "{printed}");
     assert!(printed.contains("DONE failed"), "{printed}");
     assert_eq!(report.inventory, 12, "{printed}");
 }
@@ -1553,10 +1546,7 @@ async fn the_stop_comparison_fails_a_run_whose_mismatch_persists_and_passes_one_
             ),
             "{printed}"
         );
-        assert!(
-            printed.contains("POSITION re-read at Stop: +"),
-            "{printed}"
-        );
+        assert!(printed.contains("POSITION re-read at Stop: +"), "{printed}");
         if ok {
             assert!(printed.contains("they agree now"), "{printed}");
             assert!(printed.contains("DONE ok"), "{printed}");

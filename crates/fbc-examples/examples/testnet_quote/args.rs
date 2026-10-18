@@ -128,10 +128,19 @@ Lines (each with the milliseconds since the start):
   NOTE ...           something worth knowing
   STOP <why>         why the loop ended
   STEP stop          kill switch on, cancel all sent for what is still open, session closing
+  POSITION after the first fill: ...  GET /positions read before the next plan after the
+                     first fill, the market's size compared with the registry's position in
+                     lots (with the time since the start and the fills applied)
+  POSITION re-read ...  on a mismatch, GET /positions read once more after --step-timeout:
+                     agreeing, the loop goes on (GET /positions lagged the fills); still
+                     differing, the loop Stops with nothing placed after and fails:
+                     check the position by hand
+  POSITION at Stop: ...  the same comparison once Stop's cancels are answered, on every run;
+                     a mismatch the re-read confirms fails the run
   SUMMARY ...        cycles, orders placed, cancels sent, orders cancelled, fills, inventory
   DONE ok|failed     ok only when the loop ended at --duration, --cycles or Ctrl-C, every
-                     Stop cancel was accepted and every order of ours ended; the exit status
-                     is 0 only for ok
+                     Stop cancel was accepted, every order of ours ended and GET /positions
+                     agreed with the registry (POSITION); the exit status is 0 only for ok
 ";
 
 /// What to quote and how.

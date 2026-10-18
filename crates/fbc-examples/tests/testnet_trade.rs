@@ -1187,6 +1187,7 @@ fn help_names_the_environment_the_flags_and_every_line() {
         "POSITION re-read",
         "POSITION at Stop",
         "check the position by hand",
+        "HALT",
     ] {
         assert!(USAGE.contains(word), "--help does not mention {word}");
     }
@@ -1627,8 +1628,8 @@ async fn an_order_that_fills_instead_of_cancelling_fails_the_run() {
 async fn an_order_cancelled_after_a_partial_fill_fails_the_run() {
     // Paradex ends a post-only order whose remainder was cancelled after a maker fill CLOSED
     // by USER_CANCELED with less than its size open: a trade happened, so the round trip did
-    // not.
-    let (report, printed) = run_with_placed_end(End::PartlyFilled).await;
+    // not. GET /positions follows the fill (FBC-hpg6's check after it agrees).
+    let (report, printed) = partial_fill_run(vec!["0.00001"], 10).await;
     assert!(!report.ok, "{printed}");
     assert!(
         printed.contains("the order was cancelled after 1 lots of it filled; inventory now 1 lots"),
@@ -1665,7 +1666,10 @@ async fn after_the_first_fill_get_positions_is_compared_with_the_registry_and_ag
         printed[after..].lines().next().unwrap().contains(agree),
         "{printed}"
     );
-    assert!(printed.find("NOTE a fill: ours").unwrap() < after, "{printed}");
+    assert!(
+        printed.find("NOTE a fill: ours").unwrap() < after,
+        "{printed}"
+    );
     // The run went on to the closed step.
     assert!(
         printed.contains("the order was cancelled after 1 lots of it filled; inventory now 1 lots"),
@@ -1693,9 +1697,11 @@ async fn a_mismatch_after_the_first_fill_that_clears_on_the_re_read_is_printed_a
         .find("POSITION after the first fill: +")
         .unwrap_or_else(|| panic!("no check after the fill:\n{printed}"));
     assert!(
-        printed[first..].lines().next().unwrap().contains(
-            "GET /positions 0 lots, the registry 1 lots (1 fills applied): they DIFFER"
-        ),
+        printed[first..]
+            .lines()
+            .next()
+            .unwrap()
+            .contains("GET /positions 0 lots, the registry 1 lots (1 fills applied): they DIFFER"),
         "{printed}"
     );
     let again = printed
@@ -1737,7 +1743,10 @@ async fn a_mismatch_after_the_first_fill_that_persists_stops_the_run_and_fails_i
     let stop = printed.find("STEP stop").unwrap();
     assert!(halted < stop, "{printed}");
     assert!(printed[stop..].contains("kill switch on"), "{printed}");
-    assert!(printed[stop..].contains("an instrument cancel-all"), "{printed}");
+    assert!(
+        printed[stop..].contains("an instrument cancel-all"),
+        "{printed}"
+    );
     assert!(!printed[halted..].contains("STEP place"), "{printed}");
     assert!(!printed.contains("TIMEOUT"), "{printed}");
     assert!(printed.contains("DONE failed places sent 1"), "{printed}");
@@ -1766,9 +1775,11 @@ async fn the_stop_comparison_fails_a_round_trip_whose_mismatch_persists() {
         .unwrap_or_else(|| panic!("no Stop comparison:\n{printed}"));
     assert!(stop < first, "{printed}");
     assert!(
-        printed[first..].lines().next().unwrap().contains(
-            "GET /positions 1 lots, the registry 0 lots (0 fills applied): they DIFFER"
-        ),
+        printed[first..]
+            .lines()
+            .next()
+            .unwrap()
+            .contains("GET /positions 1 lots, the registry 0 lots (0 fills applied): they DIFFER"),
         "{printed}"
     );
     assert!(printed.contains("POSITION re-read at Stop: +"), "{printed}");
@@ -1778,7 +1789,11 @@ async fn the_stop_comparison_fails_a_round_trip_whose_mismatch_persists() {
         .lines()
         .find(|l| l.starts_with("NOTE GET /positions disagreed"))
         .unwrap_or_else(|| panic!("no reason:\n{printed}"));
-    assert_eq!(reason.matches("GET /positions 1 lots").count(), 2, "{reason}");
+    assert_eq!(
+        reason.matches("GET /positions 1 lots").count(),
+        2,
+        "{reason}"
+    );
     assert!(reason.contains(positions::HAND_CHECK), "{reason}");
     assert!(printed.contains("DONE failed"), "{printed}");
 }
@@ -1820,9 +1835,18 @@ fn the_market_position_is_read_from_get_positions_exactly_in_lots() {
     };
     use fbc_core::SignedLots;
     assert_eq!(read(&position_answer("0.00013")), Ok(SignedLots(13)));
-    assert_eq!(read(&row(MARKET, "LONG", "0.00013", "OPEN")), Ok(SignedLots(13)));
-    assert_eq!(read(&row(MARKET, "SHORT", "-0.00013", "OPEN")), Ok(SignedLots(-13)));
-    assert_eq!(read(&row(MARKET, "SHORT", "0", "CLOSED")), Ok(SignedLots(0)));
+    assert_eq!(
+        read(&row(MARKET, "LONG", "0.00013", "OPEN")),
+        Ok(SignedLots(13))
+    );
+    assert_eq!(
+        read(&row(MARKET, "SHORT", "-0.00013", "OPEN")),
+        Ok(SignedLots(-13))
+    );
+    assert_eq!(
+        read(&row(MARKET, "SHORT", "0", "CLOSED")),
+        Ok(SignedLots(0))
+    );
     assert_eq!(read(r#"{"results":[]}"#), Ok(SignedLots(0)));
     // A position on a market the run does not trade is not this market's.
     let other = read(&row("ETH-USD-PERP", "LONG", "0.01", "OPEN"));

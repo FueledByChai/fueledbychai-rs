@@ -43,6 +43,16 @@
 //! it comes: a touch being read is not waited for ([`Driver::touch_unless_ended`]), and a pass
 //! reads the notes again after its waits, before it plans ([`Driver::halted`]).
 //!
+//! **The position check** (FBC-hpg6, the owner's condition in decision 0094: positions follow
+//! fills). After the first fill the loop sees, the next pass reads `GET /positions` before it
+//! plans and compares the market's size with the registry's position, exactly in lots
+//! ([`PositionCheck`]); a mismatch is read once more after the step timeout, both readings
+//! printed. One the re-read clears lets the loop go on; one that persists Stops it (the kill
+//! switch and the cancel of everything of ours), with nothing planned or placed after the fill,
+//! and fails the run, saying to check the position by hand. At Stop, once Stop's cancels are answered, the comparison runs
+//! again on every run, fills or not; a mismatch that persists there fails the run with both
+//! readings.
+//!
 //! **Memory.** The link's notes are read once each ([`Driver::absorb`]) and those read are
 //! forgotten every cycle ([`Link::forget`]), so a long run keeps no growing note list.
 
@@ -56,7 +66,7 @@ use std::time::{Duration, Instant};
 
 use fbc_core::{
     Bps, Channel, CidMatch, CidMint, ClientOrderId, ConnState, Lots, MarketLease, Namespace,
-    NamespaceLease, NonceScope, OpKind, OrderCaps, OrderKindTag, RejectKind, RpcId, Secrets, Side,
+    NamespaceLease, NonceScope, OpKind, OrderCaps, OrderKindTag, RejectKind, RpcId, Side,
     SignedLots, SpecTable, SubmitOutcome, Ticks, Tif, TifTag, VenueFactory,
 };
 use fbc_oms::{
@@ -65,7 +75,7 @@ use fbc_oms::{
     PermittedCommand, PlanRefusal, PlannerConfig, PreTradeCaps, Registry, Routed, Stage,
     TestnetRun,
 };
-use fbc_runtime::{ExecControl, ExecOrders, ExecSession};
+use fbc_runtime::{Connector, ExecControl, ExecOrders, ExecSession};
 use fbc_venue_paradex::ParadexFactory;
 use fbc_venue_paradex::md::rest::OrderbookSnapshot;
 use rust_decimal::Decimal;
@@ -74,6 +84,7 @@ use tokio::sync::Notify;
 
 use crate::args::{Options, Target, direct_to_stub, hosts, sole, testnet_guard};
 use crate::link::{Link, LinkHandler, Note, async_reject};
+use crate::positions::{Creds, PositionCheck, fills_in};
 use crate::testnet::{
     ACCOUNT_LABEL, ACCT, HighWater, INST, Lines, Out, TESTNET_CHAIN, VENUE, config, drive_with,
     inventory_price, off_thread_holding, px_or_none, resync_disagreements, session_config,
@@ -396,12 +407,13 @@ pub fn cancel_and_replace(caps: &OrderCaps) -> OrderCaps {
 /// Runs testnet_quote: the guard first, before anything connects; then the first touch and the
 /// sizing, the registry, the session and the loop, until `interrupt` completes, `--duration` or
 /// `--cycles` is reached, or anything Stops it. `chain` is `PARADEX_CHAIN_ID` when set; `creds`
-/// the account's credentials, handed to the session's codec unread. An error is a refusal before
-/// the session started; once it started the outcome is in the [`Report`].
+/// the account's credentials, twice: the session's, handed to its codec unread, and the position
+/// check's own login's ([`Creds`]). An error is a refusal before the session started; once it
+/// started the outcome is in the [`Report`].
 pub async fn run(
     opts: &Options,
     chain: Option<&str>,
-    creds: Secrets,
+    creds: Creds,
     out: Out,
     interrupt: impl Future<Output = ()>,
 ) -> Result<Report, String> {
@@ -450,12 +462,13 @@ pub async fn run(
         px_or_none(ask)
     ));
 
-    let order_caps = factory
-        .caps(&cfg)
-        .map_err(|e| e.to_string())?
+    let venue_caps = factory.caps(&cfg).map_err(|e| e.to_string())?;
+    let order_caps = venue_caps
         .exec
+        .as_ref()
         .ok_or("Paradex declares no order entry")?
-        .order;
+        .order
+        .clone();
     shape_admitted(&order_caps)?;
     let symbol = specs
         .get(INST)
@@ -528,11 +541,23 @@ pub async fn run(
     };
     let session_cfg = session_config(
         factory,
-        cfg,
-        creds,
+        cfg.clone(),
+        creds.session,
         specs.clone(),
         &opts.proxy,
         opts.namespace,
+    )?;
+    // The position check reads over REST through the limiter the session charges, so its reads
+    // and the session's traffic share one count (FBC-hpg6).
+    let positions = PositionCheck::new(
+        &cfg,
+        creds.positions,
+        Connector::new(opts.proxy.clone()),
+        session_cfg.limiter.clone(),
+        &opts.rest_url,
+        specs.clone(),
+        venue_caps,
+        wait,
     )?;
     let (mut session, control) =
         ExecSession::new(session_cfg, handler).map_err(|e| format!("session: {e}"))?;
@@ -575,6 +600,9 @@ pub async fn run(
         book_seq: book.seq_no,
         venue_position: None,
         unfilled: Vec::new(),
+        positions: Some(positions),
+        fill_check_due: false,
+        fill_checked: false,
     };
     // The interrupt sets a flag the driver reads at each wake, and wakes it.
     let watch = {
@@ -720,6 +748,13 @@ struct Driver {
     /// Orders of ours that ended with fills the venue reported on an order update that the
     /// fill stream has not brought yet: no pass plans until it has (Codex r4244145969).
     unfilled: Vec<ClientOrderId>,
+    /// The position check (module documentation), lent out while it reads.
+    positions: Option<PositionCheck>,
+    /// A fill was seen and the check after the first fill has not run: no pass plans until it
+    /// has.
+    fill_check_due: bool,
+    /// The check after the first fill has run (or was passed over at Stop).
+    fill_checked: bool,
 }
 
 impl Driver {
@@ -746,9 +781,73 @@ impl Driver {
         }
         self.lines.line(format_args!("STOP {why}"));
         let stopped = self.stop().await;
+        // GET /positions against the registry once Stop's cancels are answered, every run.
+        if let Some(failed) = self.check_at_stop().await
+            && asked
+        {
+            asked = false;
+            why = failed;
+        }
         self.compact();
         drop(control);
         (asked && stopped, why)
+    }
+
+    /// The registry's position on the market and the fills of ours applied (those read and
+    /// those still in the link's notes), read when called.
+    fn registry_now(&self) -> impl Fn() -> (SignedLots, usize) + use<> {
+        let (link, read) = (Rc::clone(&self.link), self.fills);
+        move || {
+            let link = link.borrow();
+            let fills = read + fills_in(link.notes());
+            (link.registry().inventory(INST), fills)
+        }
+    }
+
+    /// The check after the first fill (module documentation), when one is due: true when it
+    /// ran. A mismatch the re-read confirms is a reason to Stop. One due on a market whose
+    /// position is not known (never, once the loop Started) is left to the Stop comparison.
+    async fn check_after_first_fill(&mut self) -> bool {
+        if !self.fill_check_due {
+            return false;
+        }
+        self.fill_check_due = false;
+        self.fill_checked = true;
+        if !self.link.borrow().registry().position_known(INST) {
+            return false;
+        }
+        let Some(mut check) = self.positions.take() else {
+            return false;
+        };
+        let when = "after the first fill";
+        let verdict = check.check(when, &self.lines, self.registry_now()).await;
+        self.positions = Some(check);
+        if let Some(why) = verdict.failure(when) {
+            self.trouble(why);
+        }
+        true
+    }
+
+    /// The comparison at Stop (module documentation): why the run fails when a mismatch
+    /// persists, `None` otherwise. A market whose position no resync seeded has nothing to
+    /// compare.
+    async fn check_at_stop(&mut self) -> Option<String> {
+        // A fill seen too late for its own check is compared here.
+        self.fill_check_due = false;
+        let when = "at Stop";
+        if !self.link.borrow().registry().position_known(INST) {
+            self.lines.line(format_args!(
+                "POSITION {when}: the registry holds no position on the market (no resync seeded \
+                 it): nothing to compare"
+            ));
+            return None;
+        }
+        let mut check = self.positions.take()?;
+        let verdict = check.check(when, &self.lines, self.registry_now()).await;
+        self.positions = Some(check);
+        let failed = verdict.failure(when)?;
+        self.note(format_args!("{failed}"));
+        Some(failed)
     }
 
     /// The report of the run.
@@ -912,6 +1011,10 @@ impl Driver {
                 unexplained,
                 ours,
             } => {
+                // The first fill seen: GET /positions is compared before the next plan.
+                if !self.fill_checked {
+                    self.fill_check_due = true;
+                }
                 if unexplained {
                     self.trouble(format!("a fill not of our orders came in: {seen}"));
                 } else if !ours {
@@ -1559,13 +1662,19 @@ impl Driver {
         mut book: OrderbookSnapshot,
         mut read_at: SignedLots,
     ) -> Result<Settled, String> {
-        let deadline = tokio::time::Instant::now() + self.timeout;
+        let mut deadline = tokio::time::Instant::now() + self.timeout;
         let mut left_out: Vec<Side> = Vec::new();
         let mut placed: Vec<(Side, ClientOrderId)> = Vec::new();
         let mut holding = false;
         loop {
             let wake = Rc::clone(&self.wake);
             let woken = wake.notified();
+            // After the first fill, GET /positions against the registry before anything is
+            // planned (FBC-hpg6): its reads (and a re-read's wait) are not the book's settling
+            // time, which starts again.
+            if self.check_after_first_fill().await {
+                deadline = tokio::time::Instant::now() + self.timeout;
+            }
             if let Some(ended) = self.halted()? {
                 return Ok(ended);
             }
@@ -1593,7 +1702,9 @@ impl Driver {
             if let Some(ended) = self.halted()? {
                 return Ok(ended);
             }
-            if cut {
+            // A fill read during those waits: its position check comes first, at the top of the
+            // pass, before anything is planned.
+            if cut || self.fill_check_due {
                 continue;
             }
             // The waits may have used the rest of the book's settling time (Codex r4244080131).

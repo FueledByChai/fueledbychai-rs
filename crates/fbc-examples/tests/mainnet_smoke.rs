@@ -1082,6 +1082,7 @@ fn help_names_the_environment_the_prerequisites_and_every_line() {
         "POSITION re-read",
         "POSITION at Stop",
         "check the position by hand",
+        "HALT",
     ] {
         assert!(smoke_args::USAGE.contains(needed), "--help lacks {needed}");
     }

@@ -22,6 +22,18 @@ resync and is never seeded by hand, so a venue declaring otherwise is refused be
 connects. Stop sends the kill switch and an instrument cancel-all of the market
 (`order.cancel_all`), never an account cancel-all.
 
+**Positions follow fills** (the owner's condition in decision 0094, FBC-hpg6). `testnet_trade`
+(so `mainnet_smoke`) and `testnet_quote` read `GET /positions` over REST, through the rate
+limiter the session charges, after the first fill the session sees and at Stop once Stop's
+cancels are answered (every run, fills or not), and compare the market's size with the registry's
+position exactly in lots, printing a `POSITION` line. A mismatch is read once more after
+`--step-timeout`, both readings printed with their times, the venue's size, the registry's and
+the fills applied: a re-read that agrees goes on (`GET /positions` lagged the fills); one that
+still disagrees Stops the run (kill switch + cancel all, nothing placed after) and fails it with
+"check the position by hand". The check logs in over REST on its own (`src/auth_rest.rs`, the
+acceptance program's reader), so the run makes one more `POST /auth` and reads its credentials
+from the environment twice.
+
 Prerequisites:
 
 - A SEPARATE Paradex mainnet account from the one the Java quoter trades (one quoter per
