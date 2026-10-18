@@ -21,9 +21,10 @@
 //! run). Every read of the touch reads the mark with it (`GET /markets/summary`,
 //! [`touch_and_mark`]), so the mark a pass judges by is never older than its touch, at least
 //! once per cycle; a side whose size at the mark is below the minimum is left out and printed,
-//! never sent ([`desired`]), and an asynchronous `ORDER_SIZE_BELOW_MIN` is a sizing error that
-//! Stops the run. The inventory cap is judged at no less than the mark. Both reads are charged
-//! to the session's rate limiter ([`crate::testnet::admit_reads`]).
+//! never sent ([`desired`]), and an asynchronous `ORDER_SIZE_BELOW_MIN` (the adapter's
+//! `RejectKind::MinNotional`, decision 0096) is a sizing error that Stops the run. The inventory
+//! cap is judged at no less than the mark. Both reads are charged to the session's rate limiter
+//! ([`crate::testnet::admit_reads`]).
 //!
 //! **Refusals of ours.** A place or cancel the venue refuses for its rate (`RateLimited`)
 //! paces the loop: nothing more is planned until its retry time, or [`RATE_LIMITED_WAIT`] when
@@ -837,6 +838,7 @@ pub async fn run_on(
         fill_check_due: false,
         fill_checked: false,
         retry_at: None,
+        recancel_due: false,
     };
     // The interrupt sets a flag the driver reads at each wake, and wakes it.
     let watch = {
@@ -1002,6 +1004,10 @@ struct Driver {
     /// Until when nothing is planned: a request of ours refused for its rate (`RateLimited`)
     /// waits its retry time, or [`RATE_LIMITED_WAIT`] (Codex r4277631500, r4289363361).
     retry_at: Option<tokio::time::Instant>,
+    /// A cancel of ours was refused for its rate since the last cancel of everything: a sweep
+    /// or Stop sends the cancel of everything of ours again once its retry time passed
+    /// ([`Driver::cancel_again`], Codex r4306449947 on PR #158).
+    recancel_due: bool,
 }
 
 impl Driver {
@@ -1175,9 +1181,17 @@ impl Driver {
             if interruptible && self.interrupted.get() {
                 return None;
             }
+            // A refusal for its rate's retry time is a wake too: what waits for it (a sweep's or
+            // Stop's cancel sent again) is read then, whether or not anything else comes.
+            let retry = self
+                .retry_at
+                .filter(|at| *at > tokio::time::Instant::now() && *at < deadline);
             tokio::select! {
                 () = woken => {}
-                () = tokio::time::sleep_until(deadline) => return None,
+                // Past the deadline when there is no retry time to wake at: nothing found.
+                () = tokio::time::sleep_until(retry.unwrap_or(deadline)) => {
+                    retry?;
+                }
             }
         }
     }
@@ -1428,9 +1442,10 @@ impl Driver {
                         ));
                     }
                     // Paradex judges the minimum notional at the mark and refuses an order
-                    // below it after accepting it: a sizing error, never a venue fault (the
-                    // owner's 2026-10-16 testnet run), and permanent.
-                    _ if below_min(&reject) => self.trouble(format!(
+                    // below it after accepting it (ORDER_SIZE_BELOW_MIN, which its adapter
+                    // reads as MinNotional, decision 0096): a sizing error, never a venue
+                    // fault (the owner's 2026-10-16 testnet run), and permanent.
+                    _ if reject.kind == RejectKind::MinNotional => self.trouble(format!(
                         "a sizing error: {what}: Paradex judged the order's notional at the mark \
                          price below the market's minimum, though every place is sized at the \
                          mark read with its touch; check --min-notional and --order-usd against \
@@ -1562,7 +1577,12 @@ impl Driver {
             format!("the cancel of {named}")
         };
         match reject.kind {
-            RejectKind::RateLimited { retry_after } => self.pace(&what, retry_after),
+            RejectKind::RateLimited { retry_after } => {
+                self.pace(&what, retry_after);
+                // A sweep or Stop sends it again once the retry time passed; a cycle's planner
+                // builds it again itself (Codex r4306449947 on PR #158).
+                self.recancel_due |= !place;
+            }
             RejectKind::PostOnlyWouldCross if place => {}
             RejectKind::AlreadyTerminal(_) | RejectKind::NotFound if !place => {}
             kind => self.trouble(format!(
@@ -2459,6 +2479,8 @@ impl Driver {
     /// and the session takes places on the market, before anything is placed (module
     /// documentation).
     async fn sweep(&mut self, label: &str) -> Result<(), String> {
+        // The sweep's cancel covers every cancel refused for its rate before it.
+        self.recancel_due = false;
         let (rpcs, how) = self.cancel_ours()?;
         self.lines.line(format_args!(
             "{label} every order of ours still open on the market is cancelled before any place: \
@@ -2473,6 +2495,7 @@ impl Driver {
                     return Some(());
                 }
                 d.cancel_due();
+                d.cancel_again();
                 (d.all_ended() && orders.may_place_on(INST)).then_some(())
             })
             .await;
@@ -2482,6 +2505,31 @@ impl Driver {
             "the end of every order of ours on the market",
         )?;
         Ok(())
+    }
+
+    /// The cancel of everything of ours sent again ([`Driver::cancel_ours`]) once a cancel was
+    /// refused for its rate during a sweep or Stop and its retry time passed: what they wait for
+    /// is sent again, not waited out while the quotes rest (Codex r4306449947 on PR #158). The
+    /// requests sent.
+    fn cancel_again(&mut self) -> Vec<RpcId> {
+        if !self.recancel_due || self.paced() {
+            return Vec::new();
+        }
+        self.recancel_due = false;
+        match self.cancel_ours() {
+            Ok((rpcs, how)) => {
+                self.note(format_args!(
+                    "a cancel refused for its rate, sent again after its retry time: {} cancels \
+                     sent ({how})",
+                    rpcs.len()
+                ));
+                rpcs
+            }
+            Err(why) => {
+                self.trouble(why);
+                Vec::new()
+            }
+        }
     }
 
     /// Whether every order of ours the run knows ended ([`Driver::prune`] then holds none).
@@ -2633,6 +2681,8 @@ impl Driver {
         self.link.borrow_mut().reg().kill(INST);
         // Stop's waits are not cut short by the interrupt: it is what started them.
         self.trouble = None;
+        // Stop's cancel covers every cancel refused for its rate before it.
+        self.recancel_due = false;
         let (mut rpcs, how, mut ok) = match self.cancel_ours() {
             Ok((rpcs, how)) => (rpcs, how, true),
             Err(why) => {
@@ -2644,6 +2694,7 @@ impl Driver {
         let ended = self
             .wait_for(timeout, false, |d| {
                 rpcs.extend(d.cancel_due());
+                rpcs.extend(d.cancel_again());
                 let answered = rpcs.iter().all(|r| d.answer(*r).is_some());
                 (answered && d.all_ended()).then_some(())
             })
@@ -2658,6 +2709,10 @@ impl Driver {
         for rpc in &rpcs {
             match self.answer(*rpc).as_ref() {
                 Some(SubmitOutcome::Accepted { .. }) => {}
+                // Refused for its rate and sent again, and every order of ours ended: paced, not
+                // failed (Codex r4306449947 on PR #158).
+                Some(SubmitOutcome::Rejected(r))
+                    if matches!(r.kind, RejectKind::RateLimited { .. }) && ended.is_some() => {}
                 Some(other) => {
                     ok = false;
                     self.note(format_args!("Stop's cancel {} came back {other:?}", rpc.0));
@@ -2684,17 +2739,6 @@ impl Driver {
         );
         (ok, compared)
     }
-}
-
-/// Whether `reject` is Paradex's asynchronous `ORDER_SIZE_BELOW_MIN` (its reason's code, the text
-/// before any `:`, as the adapter reads it): the order's notional at the mark below the market's
-/// minimum.
-fn below_min(reject: &Reject) -> bool {
-    let code = reject
-        .raw
-        .split_once(':')
-        .map_or(&*reject.raw, |(code, _)| code);
-    code.trim() == "ORDER_SIZE_BELOW_MIN"
 }
 
 /// `bid` for a buy, `ask` for a sell.

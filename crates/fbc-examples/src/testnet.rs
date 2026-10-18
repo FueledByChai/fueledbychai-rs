@@ -708,13 +708,29 @@ pub async fn admit_reads(
     by: tokio::time::Instant,
     what: &str,
 ) -> Result<(), String> {
-    let one = |op| fbc_runtime::Request {
-        charge: fbc_core::RateCharge::one(op, None),
-        via: fbc_core::Via::Http,
-        class: fbc_core::TrafficClass::Normal,
-    };
-    let requests: Vec<fbc_runtime::Request> = (0..reads)
-        .flat_map(|_| [one(fbc_core::OpKind::Rest), one(fbc_core::OpKind::Connect)])
+    let ops: Vec<fbc_core::OpKind> = (0..reads)
+        .flat_map(|_| [fbc_core::OpKind::Rest, fbc_core::OpKind::Connect])
+        .collect();
+    admit_ops(limiter, &ops, by, what).await
+}
+
+/// Charges `ops` (one request each, normal traffic, over HTTP) to `limiter` together, all or
+/// none, waiting until the buckets have room but never past `by`: refused naming `what` when
+/// they would have none by then ([`admit_reads`]; the position check's connections, Codex
+/// r4306449950 on PR #158).
+pub async fn admit_ops(
+    limiter: &RateLimiter,
+    ops: &[fbc_core::OpKind],
+    by: tokio::time::Instant,
+    what: &str,
+) -> Result<(), String> {
+    let requests: Vec<fbc_runtime::Request> = ops
+        .iter()
+        .map(|op| fbc_runtime::Request {
+            charge: fbc_core::RateCharge::one(*op, None),
+            via: fbc_core::Via::Http,
+            class: fbc_core::TrafficClass::Normal,
+        })
         .collect();
     loop {
         match limiter.charge(tokio::time::Instant::now(), NO_CONN, &requests) {

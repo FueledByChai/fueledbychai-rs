@@ -1508,9 +1508,14 @@ fn a_placement_we_cancel_before_its_risk_check_is_neither_final_nor_rejected() {
 
 #[test]
 fn an_ioc_closed_unfilled_outside_the_price_band_or_below_the_minimum_is_rejected_asynchronously() {
-    for reason in [
-        "EXCEEDS_PRICE_BAND: order price 115.117 above upper band 97.97398419599999",
-        "ORDER_SIZE_BELOW_MIN",
+    // ORDER_SIZE_BELOW_MIN is the common MinNotional kind (decision 0096); the price band stays
+    // Other (0092).
+    for (reason, kind) in [
+        (
+            "EXCEEDS_PRICE_BAND: order price 115.117 above upper band 97.97398419599999",
+            RejectKind::Other,
+        ),
+        ("ORDER_SIZE_BELOW_MIN", RejectKind::MinNotional),
     ] {
         let mut ioc = sbe("order-closed-margin-v2.sbe.txt");
         ioc[8 + 19] = 2;
@@ -1518,7 +1523,7 @@ fn an_ioc_closed_unfilled_outside_the_price_band_or_below_the_minimum_is_rejecte
         let mut codec = placed();
         let call = frame(&mut codec, RawFrame::Binary(&ioc));
         call.result.unwrap();
-        let mut expected = vec![place_refused(RejectKind::Other, reason)];
+        let mut expected = vec![place_refused(kind, reason)];
         expected.extend(decoded(&ioc));
         assert_eq!(call.events, expected, "{reason}");
     }

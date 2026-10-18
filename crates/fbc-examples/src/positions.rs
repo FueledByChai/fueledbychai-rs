@@ -184,6 +184,9 @@ pub fn other_markets(body: &[u8], market: &str) -> Result<Vec<String>, String> {
 /// documentation).
 pub struct PositionCheck {
     rest: RestReader,
+    /// The limiter the reader charges each request to, for the connections they open
+    /// ([`PositionCheck::admit_connections`]).
+    limiter: RateLimiter,
     rest_url: String,
     specs: SpecTable,
     caps: VenueCaps,
@@ -209,10 +212,11 @@ impl PositionCheck {
         caps: VenueCaps,
         wait: Duration,
     ) -> Result<PositionCheck, String> {
-        let rest = RestReader::new(cfg, creds, connector, limiter)
+        let rest = RestReader::new(cfg, creds, connector, limiter.clone())
             .map_err(|e| format!("the position check: {e}"))?;
         Ok(PositionCheck {
             rest,
+            limiter,
             rest_url: rest_url.to_owned(),
             specs,
             caps,
@@ -224,6 +228,7 @@ impl PositionCheck {
     /// lists them now ([`other_markets`]), or why they could not be read.
     pub async fn elsewhere(&mut self) -> Result<Vec<String>, String> {
         let by = Instant::now() + self.wait;
+        self.admit_connections(by).await?;
         let answer = self.rest.get(positions_request(&self.rest_url), by).await?;
         let market = self
             .specs
@@ -243,6 +248,7 @@ impl PositionCheck {
     /// The market's size as `GET /positions` states it now, or why it could not be read.
     pub async fn venue_position(&mut self) -> Result<SignedLots, String> {
         let by = Instant::now() + self.wait;
+        self.admit_connections(by).await?;
         let answer = self.rest.get(positions_request(&self.rest_url), by).await?;
         match answer {
             RestAnswer {
@@ -250,6 +256,17 @@ impl PositionCheck {
             } => market_position(&body, &self.caps, &self.specs),
             RestAnswer { status, .. } => Err(format!("status {status}")),
         }
+    }
+
+    /// Charges the connections a read opens to the limiter (`Connect`), before the reader sends
+    /// it: each of the reader's requests (its login, when its token is stale, and the GET) opens
+    /// one, and the reader charges only the request, so both are charged here, the login's
+    /// whether or not it comes (Codex r4306449950 on PR #158). `src/auth_rest.rs`, a review
+    /// path, is used unchanged.
+    async fn admit_connections(&self, by: Instant) -> Result<(), String> {
+        let by = tokio::time::Instant::from_std(by);
+        let connects = [fbc_core::OpKind::Connect, fbc_core::OpKind::Connect];
+        crate::testnet::admit_ops(&self.limiter, &connects, by, "GET /positions").await
     }
 
     /// One reading: `GET /positions`, then `registry` (the registry's position and the fills
