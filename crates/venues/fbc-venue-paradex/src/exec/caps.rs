@@ -23,8 +23,8 @@ use core::time::Duration;
 use fbc_core::{
     AckModel, AmendAck, AmendCaps, AmendQty, Batch, CancelBatch, CancelOnDisconnect, Channel,
     ClientIdFormat, ExecCaps, Feature, FillCaps, FillSource, LimitScope, NonceScope, OpKind,
-    OrderCaps, OrderKindTag, OrderingKey, RateLimit, RefKind, SnapshotSource, Support, TagSet,
-    TifTag, VenueFeeSign,
+    OrderCaps, OrderKindTag, OrderingKey, RateLimit, RefKind, SnapshotReads, SnapshotSource,
+    Support, TagSet, TifTag, VenueFeeSign,
 };
 
 /// The order methods Paradex counts against its order rate limits: `order.create` and
@@ -179,6 +179,12 @@ pub fn exec_caps() -> ExecCaps {
             // order filled): 0094's condition verifies it in the first mainnet sessions with
             // fills, a resync disagreeing with the inventory stopping the session.
             snapshot_source: SnapshotSource::Trustworthy,
+            // A resync is `GET /orders` and `GET /positions`, two requests sent in one round
+            // (`resync_requests`), each answered at its own instant: a fill can land between
+            // them. Declared `Separate` (decision 0095, FBC-k7t7), so the seed places a fill only
+            // by its arrival before the request (or a matching-engine time, which Paradex's
+            // fills do not carry), never by its order's shown cumulative fill or absence.
+            snapshot_reads: SnapshotReads::Separate,
             // The schema's OrderEvent carries `timeInForce` (POST_ONLY, RPI) and `flags`
             // (REDUCE_ONLY).
             events_echo_flags: true,
