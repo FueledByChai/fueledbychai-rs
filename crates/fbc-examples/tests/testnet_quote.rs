@@ -4677,6 +4677,15 @@ async fn a_mainnet_interval_at_which_a_co_tenants_cancels_fall_outside_the_windo
         stub.http_requests()
     );
     assert!(stub.connections().is_empty());
+    // Two thirds of the window is taken: the scaled co-tenant is Stopped on its second event.
+    assert_eq!(
+        args::mainnet_interval_max(Duration::from_millis(300)),
+        Duration::from_millis(200)
+    );
+    assert_eq!(
+        args::mainnet_interval_max(args::CANCEL_NOT_OURS_WINDOW),
+        Duration::from_secs(20)
+    );
 }
 
 #[tokio::test]
