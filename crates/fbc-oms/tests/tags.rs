@@ -155,7 +155,10 @@ fn shape(plan: &Plan) -> Vec<Shape> {
                 VenueCommand::Cancel(_) => "cancel",
                 other => panic!("the planner built {other:?}"),
             };
-            (p.stage, kind, p.side, p.level, p.tag, p.removal)
+            let tag = p
+                .tag
+                .expect("the planner tagged every order in these tests");
+            (p.stage, kind, p.side, p.level, tag, p.removal)
         })
         .collect()
 }
@@ -254,7 +257,7 @@ fn each_place_and_amend_carries_its_levels_tag_and_the_order_keeps_it() {
     );
     for c in &opened.commands {
         let rec = reg.get(c.cid).unwrap();
-        assert_eq!(rec.tag(), Some(c.tag));
+        assert_eq!(rec.tag(), c.tag);
         assert_eq!(rec.removal(), None);
     }
 

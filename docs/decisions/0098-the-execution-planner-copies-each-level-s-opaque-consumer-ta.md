@@ -23,7 +23,8 @@ this repository's (0001).
    for a level the book no longer wants, absent or wanted at quantity zero
    (`Planned::removal`), the reason the pass that builds the cancel states. A cancel of a level
    still wanted (a replace, a cancel carried through after its acknowledgement, Exit's on the
-   side that adds; 0065 rules 4, 5 and 8) carries none. A cancel's tag is the order's.
+   side that adds; 0065 rules 4, 5 and 8) carries none. A cancel's tag is the order's, `None`
+   for an order the planner did not tag, whose cancel is still built.
 3. **Kept on the order, carried by the verdicts.** The registry keeps on each order the tag of
    the last place or amend and the reason of the last cancel the planner built for it
    (`OrderRecord::tag`, `OrderRecord::removal`), and the audit sink's verdicts carry both
