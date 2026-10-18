@@ -4378,7 +4378,7 @@ fn a_resync_answer_from_an_earlier_connection_is_dropped_and_the_next_one_still_
     assert_eq!(got.len(), 1, "{got:?}");
     assert_eq!(got[0].1, [begin, ExecEvent::ResyncEnd]);
     // An answer naming a request after the open that nobody asked for is still refused.
-    let unasked = format!("resync|seq=9|wm={}", WALL0 + (again + MS) as i64);
+    let unasked = format!("resync|seq=9|wm={}|req=9", WALL0 + (again + MS) as i64);
     assert_eq!(
         v.decode(unasked.as_bytes()),
         Err(DecodeError::Malformed("no resync asked for"))
@@ -4466,20 +4466,23 @@ fn a_resync_says_only_what_the_stood_in_venue_echoes() {
 fn the_codec_refuses_a_resync_answer_it_did_not_ask_for_or_cannot_read() {
     let mut v = Venue::new(Bracket::Middle);
     let wm = WALL0 + T0 as i64;
-    let begin = format!("resync|seq=1|wm={wm}");
+    let begin = format!("resync|seq=1|wm={wm}|req=0");
     assert_eq!(
         v.decode(begin.as_bytes()),
         Err(DecodeError::Malformed("no resync asked for"))
     );
     v.resync(T0);
-    let other = format!("resync|seq=1|wm={}", wm + 1);
+    let other = format!("resync|seq=1|wm={}|req=0", wm + 1);
+    let renumbered = format!("resync|seq=1|wm={wm}|req=1");
     let wide = format!("{begin}\npos|inst=1|qty={}", i128::from(i64::MAX) + 1);
     let order = "order|cid=c|vid=S1|inst=1|side=B|state=open|cum=0|px=1|qty=1|po=0|ro=0";
     let empty_vid = format!("{begin}\n{}", order.replace("vid=S1", "vid="));
     for (frame, what) in [
         (other.as_str(), "resync for another request"),
+        (renumbered.as_str(), "resync for another request"),
+        (&format!("resync|seq=1|wm={wm}"), "req"),
         (wide.as_str(), "qty"),
-        ("resync|seq=1", "wm"),
+        ("resync|seq=1|req=0", "wm"),
         (&format!("{begin}\npos|inst=1|qty=x"), "qty"),
         (&format!("{begin}\nfill|inst=1"), "item"),
         (
@@ -4534,7 +4537,9 @@ fn the_engine_refuses_a_resync_frame_it_cannot_read() {
     for (frame, what) in [
         ("resync|mono=1", "wall"),
         ("resync|wall=1", "mono"),
-        ("resync|mono=1|wall=1\nitem", "item"),
+        ("resync|mono=1|wall=1", "req"),
+        ("resync|mono=1|wall=1|req=x", "req"),
+        ("resync|mono=1|wall=1|req=0\nitem", "item"),
     ] {
         assert_eq!(
             v.engine.on_order_frame(frame.as_bytes()),
