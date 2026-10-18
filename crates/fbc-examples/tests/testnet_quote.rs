@@ -4655,3 +4655,29 @@ fn cancels_not_ours_of_orders_placed_before_the_last_one_are_one_event_and_a_req
     assert_eq!(seen.on_cancel(Some(t0 + s(41)), t0 + s(62)), NotOurs::First);
     assert_eq!(seen.orders(), 4);
 }
+
+#[test]
+fn a_cancel_of_ours_the_session_reports_not_sent_no_longer_covers_its_orders() {
+    // Codex r4308561813 on PR #159: a cancel submitted but reported NotSent wrote nothing, so it
+    // must stop covering its orders, or another program's cancel of one of them would be taken
+    // for ours; one another request of ours still covers stays covered.
+    let lease =
+        NamespaceLease::acquire(&lease_dir(), AccountKey::new(1), Namespace::new(1)).unwrap();
+    let mut mint = CidMint::new(lease, 0, 0, WallNs(1_000_000_000));
+    let mut cid = || mint.mint().unwrap();
+    let (a, b) = (cid(), cid());
+    let mut covered = link::Coverage::default();
+    covered.cover(RpcId(1), [a]);
+    covered.cover(RpcId(2), [a, b]);
+    assert!(covered.covers(a) && covered.covers(b));
+    // Request 2 never written: b is no longer covered, a still is (request 1).
+    covered.not_sent(RpcId(2));
+    assert!(covered.covers(a));
+    assert!(!covered.covers(b));
+    covered.not_sent(RpcId(1));
+    assert!(!covered.covers(a));
+    // Forgotten once ended.
+    covered.cover(RpcId(3), [a, b]);
+    covered.retain(|c| *c == b);
+    assert!(!covered.covers(a) && covered.covers(b));
+}
