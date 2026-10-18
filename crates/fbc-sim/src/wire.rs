@@ -1,8 +1,9 @@
 //! The frames on SimVenue's simulated order-entry stream (decision 0046): what [`SimCodec`]
 //! writes for each command and what [`SimEngine`] answers, in text: one record per line,
 //! `kind|key=value|...`, and one line per frame except for a batch, whose items follow its
-//! header line, and a query's answer, whose order follows it. Both ends build and read them
-//! here, so the format has one source.
+//! header line, and a query's answer and a risk reject, whose order follows it. A provisional
+//! acceptance carries `ph=p` (decision 0099). Both ends build and read them here, so the format
+//! has one source.
 //!
 //! [`SimCodec`]: crate::SimCodec
 //! [`SimEngine`]: crate::SimEngine
@@ -14,6 +15,8 @@ use fbc_core::{
     AssetSym, CancelReason, InstrumentId, Liquidity, Lots, MonoNs, NotAmendable, RejectKind, Side,
     TerminalHint, Ticks, TifTag, WallNs,
 };
+
+use crate::engine::RiskRefusal;
 
 /// A field a frame lacks or cannot be read as.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -188,13 +191,51 @@ const STATES: &[(&str, SimState)] = &[
     ("unfilled", SimState::Canceled(CancelReason::Unfilled)),
     ("venue", SimState::Canceled(CancelReason::Venue)),
     ("self_trade", SimState::Canceled(CancelReason::SelfTrade)),
+    (
+        "rejected_post_only",
+        SimState::Rejected(RiskRefusal::PostOnlyWouldCross),
+    ),
+    (
+        "rejected_min_notional",
+        SimState::Rejected(RiskRefusal::MinNotional),
+    ),
+    ("rejected_margin", SimState::Rejected(RiskRefusal::Margin)),
+    ("rejected_risk", SimState::Rejected(RiskRefusal::Other)),
 ];
+
+/// A two-phase venue's risk-check refusals, by their names on the wire, which are the venue
+/// codes the codec reports.
+const RISKS: &[(&str, RiskRefusal)] = &[
+    ("post_only", RiskRefusal::PostOnlyWouldCross),
+    ("min_notional", RiskRefusal::MinNotional),
+    ("margin", RiskRefusal::Margin),
+    ("risk", RiskRefusal::Other),
+];
+
+impl RiskRefusal {
+    /// The reject kind it maps to: each one ends the order it refuses.
+    pub(crate) fn kind(self) -> RejectKind {
+        match self {
+            RiskRefusal::PostOnlyWouldCross => RejectKind::PostOnlyWouldCross,
+            RiskRefusal::MinNotional => RejectKind::MinNotional,
+            RiskRefusal::Margin => RejectKind::Margin,
+            RiskRefusal::Other => RejectKind::Other,
+        }
+    }
+
+    /// Its name on the wire, which is the venue code the codec reports.
+    pub(crate) fn code(self) -> &'static str {
+        let found = RISKS.iter().find(|(_, r)| *r == self);
+        found.map_or("", |(name, _)| *name)
+    }
+}
 
 const REFUSALS: &[(&str, Refusal)] = &[
     ("post_only", Refusal::PostOnlyWouldCross),
     ("not_found", Refusal::NotFound),
     ("filled", Refusal::Terminal(TerminalHint::Filled)),
     ("canceled", Refusal::Terminal(TerminalHint::Canceled)),
+    ("rejected", Refusal::Terminal(TerminalHint::Rejected)),
     ("duplicate", Refusal::DuplicateClientId),
     ("no_book", Refusal::NoBook),
     ("no_fee", Refusal::NoFee),
@@ -561,6 +602,9 @@ pub(crate) enum SimState {
     Amended,
     Filled,
     Canceled(CancelReason),
+    /// Refused by a two-phase venue's risk check after its provisional acceptance, so it never
+    /// rested.
+    Rejected(RiskRefusal),
 }
 
 /// Why the simulated venue refused a command.
@@ -613,10 +657,15 @@ impl Refusal {
 }
 
 /// What became of one item of a request: accepted, naming the order it placed, amended or
-/// cancelled, or refused.
+/// cancelled, provisionally where a two-phase venue still checks a placement's risk, or
+/// refused.
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub(crate) enum ItemResult {
-    Accepted { cid: String, vid: String },
+    Accepted {
+        cid: String,
+        vid: String,
+        provisional: bool,
+    },
     Rejected(Refusal),
 }
 
@@ -633,11 +682,29 @@ pub(crate) struct Stamp {
 /// An answer frame, engine to codec. Every one carries the engine's [`Stamp`].
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub(crate) enum Reply {
-    /// A command accepted, naming the order it placed or cancelled.
+    /// A command accepted, naming the order it placed or cancelled; provisionally where a
+    /// two-phase venue still checks a placement's risk.
     Accepted {
         rpc: u64,
         cid: String,
         vid: String,
+        provisional: bool,
+    },
+    /// Item `idx` of placement request `rpc`, provisionally accepted, passed the two-phase
+    /// venue's risk check: its final acceptance (decision 0099).
+    Final {
+        rpc: u64,
+        idx: u16,
+        cid: String,
+        vid: String,
+    },
+    /// Item `idx` of placement request `rpc`, provisionally accepted, refused by the two-phase
+    /// venue's risk check, with the order as it ended (decision 0099).
+    RiskReject {
+        rpc: u64,
+        idx: u16,
+        refusal: RiskRefusal,
+        order: OrderEvent,
     },
     Rejected {
         rpc: u64,
@@ -715,25 +782,73 @@ impl Writer {
         let w = Writer::new(kind).field("seq", stamp.seq);
         w.opt("ts", stamp.ts.map(|ts| ts.0))
     }
+
+    /// An acceptance's phase: `ph=p` where it is provisional, nothing where it is final.
+    fn phase(self, provisional: bool) -> Writer {
+        if provisional {
+            self.field("ph", "p")
+        } else {
+            self
+        }
+    }
+}
+
+impl Record<'_> {
+    /// Whether an acceptance is provisional: refused for a phase it never writes.
+    fn provisional(&self) -> Result<bool, WireError> {
+        match self.opt("ph") {
+            None => Ok(false),
+            Some("p") => Ok(true),
+            Some(_) => Err(WireError("ph")),
+        }
+    }
 }
 
 impl Reply {
     pub(crate) fn encode(&self, stamp: Stamp) -> Vec<u8> {
         let head = |kind| Writer::stamped(kind, stamp);
         match self {
-            Reply::Accepted { rpc, cid, vid } => head("ack")
+            Reply::Accepted {
+                rpc,
+                cid,
+                vid,
+                provisional,
+            } => head("ack")
                 .field("rpc", rpc)
                 .field("cid", cid)
+                .field("vid", vid)
+                .phase(*provisional),
+            Reply::Final { rpc, idx, cid, vid } => head("final")
+                .field("rpc", rpc)
+                .field("idx", idx)
+                .field("cid", cid)
                 .field("vid", vid),
+            Reply::RiskReject {
+                rpc,
+                idx,
+                refusal,
+                order,
+            } => head("risk")
+                .field("rpc", rpc)
+                .field("idx", idx)
+                .name("code", RISKS, *refusal)
+                .line("order")
+                .event(order),
             Reply::Rejected { rpc, refusal } => head("reject")
                 .field("rpc", rpc)
                 .name("code", REFUSALS, *refusal),
             Reply::Items { rpc, items } => {
                 let w = head("items").field("rpc", rpc);
                 items.iter().fold(w, |w, item| match item {
-                    ItemResult::Accepted { cid, vid } => {
-                        w.line("ack").field("cid", cid).field("vid", vid)
-                    }
+                    ItemResult::Accepted {
+                        cid,
+                        vid,
+                        provisional,
+                    } => w
+                        .line("ack")
+                        .field("cid", cid)
+                        .field("vid", vid)
+                        .phase(*provisional),
                     ItemResult::Rejected(refusal) => {
                         w.line("reject").name("code", REFUSALS, *refusal)
                     }
@@ -805,7 +920,26 @@ impl Reply {
                 rpc: r.num("rpc")?,
                 cid: r.str("cid")?.to_owned(),
                 vid: r.str("vid")?.to_owned(),
+                provisional: r.provisional()?,
             }),
+            "final" => single(Reply::Final {
+                rpc: r.num("rpc")?,
+                idx: r.num("idx")?,
+                cid: r.str("cid")?.to_owned(),
+                vid: r.str("vid")?.to_owned(),
+            }),
+            "risk" => {
+                let mut order = items(lines, "order", Record::event)?;
+                if order.len() != 1 {
+                    return Err(WireError("item"));
+                }
+                Ok(Reply::RiskReject {
+                    rpc: r.num("rpc")?,
+                    idx: r.num("idx")?,
+                    refusal: r.named("code", RISKS)?,
+                    order: order.remove(0),
+                })
+            }
             "reject" => single(Reply::Rejected {
                 rpc: r.num("rpc")?,
                 refusal: r.named("code", REFUSALS)?,
@@ -815,6 +949,7 @@ impl Reply {
                     "ack" => Ok(ItemResult::Accepted {
                         cid: i.str("cid")?.to_owned(),
                         vid: i.str("vid")?.to_owned(),
+                        provisional: i.provisional()?,
                     }),
                     "reject" => Ok(ItemResult::Rejected(i.named("code", REFUSALS)?)),
                     _ => Err(WireError("item")),

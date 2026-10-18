@@ -3,6 +3,7 @@
 
 use core::num::NonZeroU32;
 use core::time::Duration;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use fbc_core::{
@@ -13,11 +14,12 @@ use fbc_core::{
     ItemRef, Liquidity, Liquidity3, MatchingCaps, Money, NotSentReason, OpKind, OrderCaps,
     OrderKindTag, OrderRef, OrderUpdate, OrderingKey, PathStamps, QueryAnswer, RateCharge,
     RawFrame, Reject, RpcCall, RpcId, SignedLots, SpecTable, StreamId, SubmitOutcome, Support,
-    TifTag, TimerTag, TrafficClass, VenueCommand, VenueMeta, VenueOrderSnapshot, VenueOrderState,
-    WallNs, WireSlice, encode_cid,
+    TerminalReject, TifTag, TimerTag, TrafficClass, VenueCommand, VenueMeta, VenueOrderSnapshot,
+    VenueOrderState, WallNs, WireSlice, encode_cid,
 };
 
 use crate::config::SimConfig;
+use crate::engine::RiskRefusal;
 use crate::wire::{
     Amend, Cancel, Command, Head, ItemResult, OrderEvent, Place, Query, Refusal, Reply, Sent,
     SimState, Stamp, Target, WireError,
@@ -37,10 +39,19 @@ use crate::wire::{
 /// flag or reference, amends, batches (or one longer than their `max_items`; an empty one is
 /// unencodable), an instrument cancel-all, queries; and never sends an account-wide cancel-all
 /// (owner decision A). It refuses RPI orders, which the engine cannot fill yet (FBC-njk,
-/// decision 0046), amends for a venue that gives the amended order a new venue id (FBC-kodq),
-/// and placements and amends for a venue whose events the engine cannot say yet: two-phase
-/// acknowledgement (FBC-zr1), a venue with a speed bump (FBC-7y8), or one whose fills replay on
-/// reconnect (FBC-3q6). Cancels and queries still go.
+/// decision 0046), amends for a venue that gives the amended order a new venue id (FBC-kodq)
+/// or acknowledges in two phases (FBC-kbwj), and placements and amends for a venue whose
+/// events the engine cannot say yet: a venue with a speed bump (FBC-7y8), or one whose fills
+/// replay on reconnect (FBC-3q6). Cancels and queries still go.
+///
+/// A venue that acknowledges in two phases (`AckModel::TwoPhase`) is placed through
+/// (decision 0099): a placement's acceptance is decoded at the level the engine gives it,
+/// `Provisional`, and the codec awaits its second phase, by request and item, until the
+/// engine's final acceptance (`Accepted` at `Final` for that request and item) or risk reject
+/// (`ExecEvent::AsyncReject` of the placement, naming the order by our client id and its venue
+/// id, before the order update that ends it rejected). Like Paradex's codec (0092), it awaits
+/// nothing across a reconnect: each open forgets what it awaited, and a second phase it does
+/// not await reports nothing, the order update of a risk reject aside.
 ///
 /// A venue that cancels on disconnect (FBC-fji) is placed through like any other: the engine
 /// ends what the venue would when the simulated stream closes or a dead-man timer lapses. The
@@ -79,6 +90,11 @@ pub struct SimCodec {
     /// The number of the first resync asked on the current connection: an answer to one
     /// numbered below it was asked on an earlier connection.
     connection_first: u64,
+    /// Whether the stood-in venue acknowledges in two phases.
+    two_phase: bool,
+    /// The placements, by request and item, accepted provisionally on this connection and
+    /// awaiting their second phase.
+    awaiting: BTreeSet<(u64, u16)>,
 }
 
 impl SimCodec {
@@ -95,6 +111,8 @@ impl SimCodec {
             resync_at: None,
             resyncs: 0,
             connection_first: 0,
+            two_phase: config.exec.order.ack != AckModel::SinglePhase,
+            awaiting: BTreeSet::new(),
         }
     }
 
@@ -181,7 +199,11 @@ impl SimCodec {
     /// order's venue id (FBC-kodq), with the order's full values after it and the quantity the
     /// venue's wire carries.
     fn amend(&self, a: &AmendOrder, head: Head, specs: &SpecTable) -> Result<Amend, NotSentReason> {
-        let caps = self.caps.amend.filter(|caps| caps.keeps_venue_id);
+        // Not for a venue that may settle an amend in two phases either (FBC-kbwj).
+        let caps = self
+            .caps
+            .amend
+            .filter(|caps| caps.keeps_venue_id && !self.two_phase);
         let caps = caps.ok_or(NotSentReason::Unsupported)?;
         let kind = OrderKindTag::Limit;
         self.offered(kind, a.tif, a.channel, a.post_only, a.reduce_only)?;
@@ -314,13 +336,21 @@ impl SimCodec {
         scope: &DecodeScope<'_>,
     ) -> Result<ExecEvent, DecodeError> {
         let (item, outcome) = match result {
-            ItemResult::Accepted { cid, vid } => {
+            ItemResult::Accepted {
+                cid,
+                vid,
+                provisional,
+            } => {
                 let item = ItemRef {
                     idx,
                     cid: ours(scope, &cid),
                     vid: Some(scope.venue_order_id(&vid)?),
                 };
-                let ack = AckLevel::Final;
+                let ack = if provisional {
+                    AckLevel::Provisional
+                } else {
+                    AckLevel::Final
+                };
                 (item, SubmitOutcome::Accepted { ack })
             }
             ItemResult::Rejected(refusal) => {
@@ -356,6 +386,7 @@ impl SimCodec {
                 SimState::Amended => VenueOrderState::Amended { new_vid: None },
                 SimState::Filled => VenueOrderState::Filled,
                 SimState::Canceled(reason) => VenueOrderState::Canceled(reason),
+                SimState::Rejected(refusal) => VenueOrderState::Rejected(terminal(refusal)?),
             },
             px: o.px,
             qty: o.qty,
@@ -363,6 +394,80 @@ impl SimCodec {
             post_only: flags.then_some(o.post_only),
             reduce_only: flags.then_some(o.reduce_only),
         })
+    }
+
+    /// An order event as the order update it reports.
+    fn update(&self, o: OrderEvent, scope: &DecodeScope<'_>) -> Result<ExecEvent, DecodeError> {
+        let o = self.snapshot(o, scope)?;
+        Ok(ExecEvent::Order(OrderUpdate {
+            cid: o.cid,
+            vid: Some(o.vid),
+            inst: o.inst,
+            side: o.side,
+            state: o.state,
+            cum_filled: o.cum_filled,
+            px: o.px,
+            qty: Some(o.qty),
+            post_only: o.post_only,
+            reduce_only: o.reduce_only,
+        }))
+    }
+
+    /// Item `idx` of request `rpc`'s final acceptance, naming the order it placed, where the
+    /// codec awaits it (decision 0099).
+    fn final_ack(
+        &mut self,
+        (rpc, idx): (u64, u16),
+        cid: &str,
+        vid: &str,
+        scope: &DecodeScope<'_>,
+    ) -> Result<Vec<ExecEvent>, DecodeError> {
+        let vid = scope.venue_order_id(vid)?;
+        if !self.awaiting.remove(&(rpc, idx)) {
+            return Ok(Vec::new());
+        }
+        let item = ItemRef {
+            idx,
+            cid: ours(scope, cid),
+            vid: Some(vid),
+        };
+        let ack = AckLevel::Final;
+        Ok(vec![ExecEvent::Outcome {
+            rpc: RpcId(rpc),
+            item: Some(item),
+            outcome: SubmitOutcome::Accepted { ack },
+        }])
+    }
+
+    /// Item `idx` of request `rpc` refused by the venue's risk check (decision 0099): its
+    /// asynchronous reject, where the codec awaits it, then the order update that ends the
+    /// order rejected.
+    fn risk_reject(
+        &mut self,
+        (rpc, idx): (u64, u16),
+        refusal: RiskRefusal,
+        order: OrderEvent,
+        scope: &DecodeScope<'_>,
+    ) -> Result<Vec<ExecEvent>, DecodeError> {
+        let vid = scope.venue_order_id(&order.vid)?;
+        let target = match ours(scope, &order.cid) {
+            Some(cid) => OrderRef::Both(cid, vid),
+            None => OrderRef::Venue(vid),
+        };
+        let update = self.update(order, scope)?;
+        let mut events = Vec::new();
+        if self.awaiting.remove(&(rpc, idx)) {
+            let code = refusal.code();
+            let reject = Reject {
+                kind: refusal.kind(),
+                venue_code: Some(code.into()),
+                raw: Arc::from(code),
+            };
+            let op = OpKind::Place;
+            events.push(ExecEvent::AsyncReject { target, op, reject });
+        }
+        events.push(update);
+        Ok(events)
     }
 
     /// What an answer says of its order, as the stood-in venue orders its events (decision
@@ -471,16 +576,20 @@ fn shared(mut insts: impl Iterator<Item = InstrumentId>) -> Option<InstrumentId>
 }
 
 /// Whether the engine answers as the venue `exec` and `matching` describe: it delays no
-/// command past its latency (Codex r4184245574; FBC-7y8), it acknowledges in one phase
-/// (Codex r4182678509; FBC-zr1), and never replays a fill on reconnect (Codex r4184546713;
-/// FBC-3q6). Every ordering key, realized values on fills and fills derived from order status
-/// (FBC-938, decision 0050), and every cancel-on-disconnect (Codex r4184778435; FBC-fji), it
-/// answers as the venue would. Placements for any other venue are refused rather than
-/// answered with events unlike its own.
+/// command past its latency (Codex r4184245574; FBC-7y8) and never replays a fill on
+/// reconnect (Codex r4184546713; FBC-3q6). Every ordering key, realized values on fills and
+/// fills derived from order status (FBC-938, decision 0050), every cancel-on-disconnect (Codex
+/// r4184778435; FBC-fji, decision 0097) and both acknowledgement models (Codex r4182678509;
+/// FBC-zr1, decision 0099) it answers as the venue would. Placements for any other venue are
+/// refused rather than answered with events unlike its own.
 fn modelled(exec: &ExecCaps, matching: &MatchingCaps) -> bool {
-    matching.speed_bump.is_none()
-        && exec.order.ack == AckModel::SinglePhase
-        && !exec.fills.replays_fills_on_reconnect
+    matching.speed_bump.is_none() && !exec.fills.replays_fills_on_reconnect
+}
+
+/// A risk refusal as the order-ending refusal an order update carries; every one ends its
+/// order.
+fn terminal(refusal: RiskRefusal) -> Result<TerminalReject, DecodeError> {
+    TerminalReject::new(refusal.kind()).ok_or(DecodeError::Malformed("rejected"))
 }
 
 /// An amount of `asset` a fill carries, where the stood-in venue's fills `report` it.
@@ -510,9 +619,13 @@ impl ExecCodec for SimCodec {
     /// The simulated stream needs no authentication. A resync unanswered when the last
     /// connection closed was lost with it, or its answer is from that connection: forgotten,
     /// so the new epoch's resync asks again (PR #162 Reviewer A, B1).
+    /// The placements awaiting their second phase are forgotten too, as Paradex's codec drops
+    /// every placement it holds on a new connection (decision 0092): the resync reads what
+    /// rests then.
     fn on_open(&mut self, _stream: StreamId, _ctx: &EncodeCtx, _fx: &mut Effects) {
         self.resync_at = None;
         self.connection_first = self.resyncs;
+        self.awaiting.clear();
     }
 
     fn encode(
@@ -561,8 +674,17 @@ impl ExecCodec for SimCodec {
         let (stamp, reply) = Reply::decode(f.bytes()).map_err(malformed)?;
         let meta = self.meta(stamp)?;
         let events = match reply {
-            Reply::Accepted { rpc, cid, vid } => {
-                let result = ItemResult::Accepted { cid, vid };
+            Reply::Accepted {
+                rpc,
+                cid,
+                vid,
+                provisional,
+            } => {
+                let result = ItemResult::Accepted {
+                    cid,
+                    vid,
+                    provisional,
+                };
                 vec![SimCodec::outcome(rpc, 0, result, scope)?]
             }
             Reply::Rejected { rpc, refusal } => {
@@ -578,6 +700,13 @@ impl ExecCodec for SimCodec {
                 let items = items.into_iter().enumerate().map(outcome);
                 items.collect::<Result<_, _>>()?
             }
+            Reply::Final { rpc, idx, cid, vid } => self.final_ack((rpc, idx), &cid, &vid, scope)?,
+            Reply::RiskReject {
+                rpc,
+                idx,
+                refusal,
+                order,
+            } => self.risk_reject((rpc, idx), refusal, order, scope)?,
             Reply::Done { rpc } => vec![ExecEvent::Outcome {
                 rpc: RpcId(rpc),
                 item: None,
@@ -591,21 +720,7 @@ impl ExecCodec for SimCodec {
                 cid,
                 found,
             } => vec![self.query_answer(rpc, (vid, cid), found, scope)?],
-            Reply::Order(o) => {
-                let o = self.snapshot(o, scope)?;
-                vec![ExecEvent::Order(OrderUpdate {
-                    cid: o.cid,
-                    vid: Some(o.vid),
-                    inst: o.inst,
-                    side: o.side,
-                    state: o.state,
-                    cum_filled: o.cum_filled,
-                    px: o.px,
-                    qty: Some(o.qty),
-                    post_only: o.post_only,
-                    reduce_only: o.reduce_only,
-                })]
-            }
+            Reply::Order(o) => vec![self.update(o, scope)?],
             Reply::Fill(fill) => vec![ExecEvent::Fill(FillEvent {
                 // Only what the stood-in venue reports (Codex r4182448147): without fill ids
                 // a fill is keyed by its order and cumulative quantity. With them it names both,
@@ -646,6 +761,20 @@ impl ExecCodec for SimCodec {
                 positions,
             } => self.resync_answer(wm, req, orders, positions, scope)?,
         };
+        // Decoded whole: only now does a provisional acceptance await its second phase.
+        for event in &events {
+            if let ExecEvent::Outcome {
+                rpc,
+                item: Some(item),
+                outcome:
+                    SubmitOutcome::Accepted {
+                        ack: AckLevel::Provisional,
+                    },
+            } = event
+            {
+                self.awaiting.insert((rpc.0, item.idx));
+            }
+        }
         for event in events {
             sink.push(meta, event);
         }

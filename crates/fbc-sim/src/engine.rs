@@ -8,10 +8,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use fbc_book::{BookError, Books, L2Book};
 use fbc_core::{
-    AccountKey, Aggressor, AmendCaps, AmendQty, AssetSym, BookId, BookSide, CancelOnDisconnect,
-    CancelReason, Channel, Envelope, FeeBook, FeeKey, FillSource, InstrumentId, Liquidity, Lots,
-    MdEvent, MonoNs, NotAmendable, Side, SpecTable, StpScope, TerminalHint, Ticks, TifTag,
-    VenueFeeSign, VenueOrderId, WallNs,
+    AccountKey, AckModel, Aggressor, AmendCaps, AmendQty, AssetSym, BookId, BookSide,
+    CancelOnDisconnect, CancelReason, Channel, ClientIdFormat, ClientOrderId, Envelope, FeeBook,
+    FeeKey, FillSource, InstrumentId, Liquidity, Lots, MdEvent, MonoNs, NotAmendable, Side,
+    SpecTable, StpScope, TerminalHint, Ticks, TifTag, VenueFeeSign, VenueOrderId, WallNs,
+    encode_cid,
 };
 
 use crate::config::{SimConfig, SimLatency};
@@ -51,6 +52,12 @@ pub enum SimError {
     StreamClosed,
     /// An open while the simulated stream is open.
     StreamOpen,
+    /// A risk reject for a venue that acknowledges in one phase, or due after its
+    /// `risk_reject_window`; nothing was configured.
+    OutsideRiskWindow,
+    /// A risk reject naming a client id the stood-in venue's format cannot carry; nothing was
+    /// configured.
+    ClientId,
 }
 
 impl fmt::Display for SimError {
@@ -65,6 +72,12 @@ impl fmt::Display for SimError {
             SimError::NotInjected(key) => write!(f, "order {} is not injected", key.0),
             SimError::StreamClosed => f.write_str("the simulated order-entry stream is closed"),
             SimError::StreamOpen => f.write_str("the simulated order-entry stream is already open"),
+            SimError::OutsideRiskWindow => {
+                f.write_str("a risk reject outside the stood-in venue's risk window")
+            }
+            SimError::ClientId => {
+                f.write_str("a client id the stood-in venue's format cannot carry")
+            }
         }
     }
 }
@@ -81,6 +94,46 @@ pub struct InjectedOrder {
     pub side: Side,
     pub px: Ticks,
     pub qty: Lots,
+}
+
+/// What a two-phase venue's risk check refuses a placement it accepted provisionally for
+/// ([`SimEngine::risk_reject`]; decision 0099): each ends the order, which never rests.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum RiskRefusal {
+    /// A post-only order that would cross (`RejectKind::PostOnlyWouldCross`).
+    PostOnlyWouldCross,
+    /// Below the venue's minimum notional (`RejectKind::MinNotional`).
+    MinNotional,
+    /// Not enough margin (`RejectKind::Margin`).
+    Margin,
+    /// Any other refusal (`RejectKind::Other`).
+    Other,
+}
+
+/// A placement a two-phase venue accepted provisionally and holds for its risk check, which
+/// will refuse it: never resting, never matched, and its price `None` for a market order.
+#[derive(Clone, Debug)]
+struct Held {
+    order: Resting,
+    px: Option<Ticks>,
+}
+
+/// What a two-phase venue says of item `idx` of placement request `rpc` once its risk check
+/// is done (decision 0099), at `wall`.
+#[derive(Clone, Debug)]
+struct Settle {
+    wall: WallNs,
+    rpc: u64,
+    idx: u16,
+    phase: Phase,
+}
+
+#[derive(Clone, Debug)]
+enum Phase {
+    /// Passed: its final acceptance, naming the order it placed.
+    Final { cid: String, vid: String },
+    /// Refused: order `n`, held since, ends rejected.
+    Reject { n: u64, refusal: RiskRefusal },
 }
 
 /// An injected order the engine holds, and how much of it the engine's book has not shown yet
@@ -130,6 +183,7 @@ impl Ended {
     fn hint(&self) -> TerminalHint {
         match self.state {
             SimState::Filled => TerminalHint::Filled,
+            SimState::Rejected(_) => TerminalHint::Rejected,
             _ => TerminalHint::Canceled,
         }
     }
@@ -168,8 +222,13 @@ impl Item {
 
     fn accepted(cid: String, n: u64, events: Vec<Reply>) -> Item {
         let vid = vid(n);
+        let provisional = false;
         Item {
-            result: ItemResult::Accepted { cid, vid },
+            result: ItemResult::Accepted {
+                cid,
+                vid,
+                provisional,
+            },
             events,
         }
     }
@@ -207,6 +266,16 @@ impl Item {
 ///   level; injected orders are met only as the size the book shows of them.
 /// - A batch of places is each item placed in turn, at the same instant, and answered with
 ///   one outcome per item in one frame, before the items' fills and order events.
+/// - Where the stood-in venue acknowledges in two phases (`AckModel::TwoPhase`; decision 0099),
+///   each placement it accepts is accepted `Provisional`, matched and resting as above, and its
+///   final acceptance (naming its request, item and order) is answered once the venue's
+///   `risk_reject_window` has passed since it arrived. One whose client id the consumer
+///   configured a risk reject for ([`risk_reject`](SimEngine::risk_reject)) is accepted
+///   provisionally, unless the venue's rules refuse it at once, and held unmatched, never
+///   resting; at the configured instant it is refused (the reject, then its order event ending
+///   it `Rejected`) unless cancelled first, and never accepted final. A query and a resync show
+///   a held order open as placed, and every cancel ends it. Amends and cancels are answered in
+///   one phase. A venue that acknowledges in one phase answers every acceptance final.
 /// - An amend changes a resting order's price, size and flags as the stood-in venue's
 ///   [`AmendCaps`] allow (an instrument, side or time in force it would change, or a field
 ///   they do not amend, is `NotAmendable(Unsupported)`; a partially filled order where they do
@@ -292,6 +361,20 @@ pub struct SimEngine {
     injected: BTreeMap<u64, Injected>,
     injected_fills: Vec<SimFill>,
     in_flight: BTreeMap<(MonoNs, u64), (WallNs, Command)>,
+    /// A two-phase venue's `risk_reject_window`; `None` for a venue that acknowledges in one
+    /// phase.
+    risk_window: Option<Duration>,
+    /// The stood-in venue's client id format, which spells a risk reject's client id.
+    client_id: ClientIdFormat,
+    /// The risk rejects the consumer configured, by our wire client id: how long after its
+    /// arrival the placement is refused, and why.
+    risk_rejects: BTreeMap<String, (Duration, RiskRefusal)>,
+    /// The placements held for a risk check that will refuse them, by order number.
+    held: BTreeMap<u64, Held>,
+    /// Each placement's second phase, by when it is due and the order it was scheduled in.
+    settles: BTreeMap<(MonoNs, u64), Settle>,
+    /// How many second phases were scheduled.
+    settled: u64,
     /// What the stood-in venue cancels when the simulated stream closes or its timer lapses.
     cancel_on_disconnect: CancelOnDisconnect,
     /// Whether the simulated stream is open.
@@ -344,6 +427,15 @@ impl SimEngine {
             injected: BTreeMap::new(),
             injected_fills: Vec::new(),
             in_flight: BTreeMap::new(),
+            risk_window: match config.exec.order.ack {
+                AckModel::SinglePhase => None,
+                AckModel::TwoPhase { risk_reject_window } => Some(risk_reject_window),
+            },
+            client_id: config.exec.order.client_id,
+            risk_rejects: BTreeMap::new(),
+            held: BTreeMap::new(),
+            settles: BTreeMap::new(),
+            settled: 0,
             cancel_on_disconnect: config.exec.order.cancel_on_disconnect,
             open: false,
             protected: false,
@@ -414,26 +506,89 @@ impl SimEngine {
         }
     }
 
-    /// Acts on every command that arrived by `now`, a stamp the host read (decision 0046), and
-    /// lapses a dead-man timer due by then, after the commands that arrived by its instant.
+    /// Acts on every command that arrived by `now`, a stamp the host read (decision 0046),
+    /// gives each placement's second phase due by then (decision 0099), and lapses a dead-man
+    /// timer due by then, in time order: at one instant, the commands that arrived by it
+    /// first, then the second phases, then the lapse.
     pub fn advance(&mut self, now: MonoNs) {
         loop {
-            let next = self.in_flight.keys().next().map(|&(mono, _)| mono);
-            let lapse = self.dead_man.filter(|due| due.mono <= now);
-            if let Some(due) = lapse.filter(|due| next.is_none_or(|mono| mono > due.mono)) {
-                self.lapse(due);
-                continue;
-            }
-            let Some(entry) = self.in_flight.first_entry() else {
+            let due_by = |mono: MonoNs| (mono <= now).then_some(mono);
+            let command = self.in_flight.keys().next().and_then(|&(m, _)| due_by(m));
+            let settle = self.settles.keys().next().and_then(|&(m, _)| due_by(m));
+            let lapse = self.dead_man.and_then(|due| due_by(due.mono));
+            let Some(first) = [command, settle, lapse].into_iter().flatten().min() else {
                 break;
             };
-            let (mono, _) = *entry.key();
-            if mono > now {
-                break;
+            if command == Some(first) {
+                if let Some(((mono, _), (wall, command))) = self.in_flight.pop_first() {
+                    self.act(command, At { mono, wall });
+                }
+            } else if settle == Some(first) {
+                if let Some(((mono, _), s)) = self.settles.pop_first() {
+                    let wall = s.wall;
+                    self.settle(s, At { mono, wall });
+                }
+            } else if let Some(due) = self.dead_man {
+                self.lapse(due);
             }
-            let (wall, command) = entry.remove();
-            self.act(command, At { mono, wall });
         }
+    }
+
+    /// Configures the stood-in venue's risk check to refuse, as `refusal`, the placement whose
+    /// client id is `cid` (decision 0099): when it arrives, the venue accepts it
+    /// provisionally, holds it unmatched and never resting, and `after` its arrival refuses it
+    /// (an asynchronous reject of the placement, then the order ended rejected), unless it was
+    /// cancelled first. It is taken by the next placement naming `cid` to arrive, and a later
+    /// call for the same `cid` replaces it. Refused, configuring nothing, for a venue that
+    /// acknowledges in one phase or an `after` past its `risk_reject_window`
+    /// ([`SimError::OutsideRiskWindow`]), and for a client id its format cannot carry
+    /// ([`SimError::ClientId`]).
+    pub fn risk_reject(
+        &mut self,
+        cid: ClientOrderId,
+        after: Duration,
+        refusal: RiskRefusal,
+    ) -> Result<(), SimError> {
+        let window = self.risk_window.ok_or(SimError::OutsideRiskWindow)?;
+        if after > window {
+            return Err(SimError::OutsideRiskWindow);
+        }
+        let wire = encode_cid(&self.client_id, cid).map_err(|_| SimError::ClientId)?;
+        self.risk_rejects.insert(wire.to_string(), (after, refusal));
+        Ok(())
+    }
+
+    /// A placement's second phase, due at `at` (decision 0099).
+    fn settle(&mut self, s: Settle, at: At) {
+        let reply = match s.phase {
+            Phase::Final { cid, vid } => Reply::Final {
+                rpc: s.rpc,
+                idx: s.idx,
+                cid,
+                vid,
+            },
+            Phase::Reject { n, refusal } => {
+                // Cancelled while it was held: there is nothing left to refuse.
+                let Some(held) = self.held.remove(&n) else {
+                    return;
+                };
+                let (state, px) = (SimState::Rejected(refusal), held.px);
+                let order = order_event(&held.order, &vid(n), state, px);
+                let ended = Ended {
+                    order: held.order,
+                    px,
+                    state,
+                };
+                self.ended.insert(n, ended);
+                Reply::RiskReject {
+                    rpc: s.rpc,
+                    idx: s.idx,
+                    refusal,
+                    order,
+                }
+            }
+        };
+        self.answer(at, reply);
     }
 
     /// The simulated stream opens at `now`, a stamp the host read: what was due by then acts
@@ -479,11 +634,16 @@ impl SimEngine {
         match command {
             Command::Place(p) => {
                 let rpc = p.rpc;
-                let item = self.place(p, at);
+                let item = self.place(p, 0, at);
                 self.answer_item(rpc, item, at);
             }
             Command::Batch(head, places) => {
-                let items = places.into_iter().map(|p| self.place(p, at)).collect();
+                let items = places.into_iter().enumerate().map(|(idx, p)| {
+                    // A batch the codec writes holds at most a u16 of items.
+                    let idx = u16::try_from(idx).unwrap_or(u16::MAX);
+                    self.place(p, idx, at)
+                });
+                let items = items.collect();
                 self.answer_items(head.rpc, items, at);
             }
             Command::Amend(a) => {
@@ -518,7 +678,8 @@ impl SimEngine {
                 covers_open_orders, ..
             } => {
                 self.protected = on;
-                for order in self.live.values_mut() {
+                let held = self.held.values_mut().map(|h| &mut h.order);
+                for order in self.live.values_mut().chain(held) {
                     // Off, it covers nothing; on, the orders open now only where the venue
                     // says an arm covers them.
                     order.guarded = on && (order.guarded || covers_open_orders);
@@ -554,15 +715,28 @@ impl SimEngine {
         self.end_all(at, SimState::Canceled(CancelReason::Venue), |_| true);
     }
 
-    /// Ends, as `state`, every resting order SimVenue placed that `covered` takes, each
-    /// answered at `at` in the order the venue placed them.
+    /// Ends, as `state`, every resting order SimVenue placed that `covered` takes, and every
+    /// placement held for its risk check that it takes, each answered at `at` in the order the
+    /// venue placed them.
     fn end_all(&mut self, at: At, state: SimState, covered: impl Fn(&Resting) -> bool) {
         let (ended, rest): (BTreeMap<_, _>, _) = core::mem::take(&mut self.live)
             .into_iter()
             .partition(|(_, o)| covered(o));
         self.live = rest;
-        for (n, order) in ended {
-            let event = self.end(n, order, state);
+        let (held, rest): (BTreeMap<_, _>, _) = core::mem::take(&mut self.held)
+            .into_iter()
+            .partition(|(_, h)| covered(&h.order));
+        self.held = rest;
+        let mut ended: BTreeMap<u64, (Resting, Option<Ticks>)> = ended
+            .into_iter()
+            .map(|(n, o)| {
+                let px = Some(o.px);
+                (n, (o, px))
+            })
+            .collect();
+        ended.extend(held.into_iter().map(|(n, h)| (n, (h.order, h.px))));
+        for (n, (order, px)) in ended {
+            let event = self.end_at(n, order, px, state);
             self.answer(at, event);
         }
     }
@@ -671,7 +845,16 @@ impl SimEngine {
     /// A single command's outcome, then its events.
     fn answer_item(&mut self, rpc: u64, item: Item, at: At) {
         let reply = match item.result {
-            ItemResult::Accepted { cid, vid } => Reply::Accepted { rpc, cid, vid },
+            ItemResult::Accepted {
+                cid,
+                vid,
+                provisional,
+            } => Reply::Accepted {
+                rpc,
+                cid,
+                vid,
+                provisional,
+            },
             ItemResult::Rejected(refusal) => Reply::Rejected { rpc, refusal },
         };
         self.answer(at, reply);
@@ -797,7 +980,80 @@ impl SimEngine {
         }
     }
 
-    fn place(&mut self, p: Place, at: At) -> Item {
+    /// Placement `p`, item `idx` of its request, arrived at `at`. A two-phase venue accepts it
+    /// provisionally (decision 0099): one its risk check is configured to refuse is held for
+    /// that refusal; any other is placed now, and its final acceptance is due once the
+    /// venue's `risk_reject_window` has passed. Its refusals are given at once in either
+    /// phase model.
+    fn place(&mut self, p: Place, idx: u16, at: At) -> Item {
+        let Some(window) = self.risk_window else {
+            return self.place_now(p, at);
+        };
+        let (rpc, risk) = (p.rpc, self.risk_rejects.remove(&p.cid));
+        let mut item = match risk {
+            Some((after, refusal)) => self.hold(p, (rpc, idx), due(at, after), refusal),
+            None => self.place_now(p, at),
+        };
+        if let ItemResult::Accepted {
+            cid,
+            vid,
+            provisional,
+        } = &mut item.result
+        {
+            *provisional = true;
+            if risk.is_none() {
+                let (cid, vid) = (cid.clone(), vid.clone());
+                self.settle_at(due(at, window), (rpc, idx), Phase::Final { cid, vid });
+            }
+        }
+        item
+    }
+
+    /// Schedules item `item.1` of request `item.0`'s second phase, `phase`, at `when`.
+    fn settle_at(&mut self, when: At, item: (u64, u16), phase: Phase) {
+        let settle = Settle {
+            wall: when.wall,
+            rpc: item.0,
+            idx: item.1,
+            phase,
+        };
+        self.settles.insert((when.mono, self.settled), settle);
+        self.settled += 1;
+    }
+
+    /// Holds placement `p`, item `item`, for a risk check that refuses it as `refusal` at
+    /// `when`: refused at once as any placement is where it breaks the venue's rules, and
+    /// otherwise accepted without matching or resting.
+    fn hold(&mut self, p: Place, item: (u64, u16), when: At, refusal: RiskRefusal) -> Item {
+        if let Err(refusal) = self.check_place(&p) {
+            return Item::refused(refusal);
+        }
+        let n = self.orders;
+        self.orders += 1;
+        self.by_cid.insert(p.cid.clone(), n);
+        let order = self.resting(&p);
+        self.held.insert(n, Held { order, px: p.px });
+        self.settle_at(when, item, Phase::Reject { n, refusal });
+        Item::accepted(p.cid, n, Vec::new())
+    }
+
+    /// The order placement `p` places, as the venue holds it before any fill.
+    fn resting(&self, p: &Place) -> Resting {
+        Resting {
+            cid: p.cid.clone(),
+            inst: p.inst,
+            side: p.side,
+            px: p.px.unwrap_or(Ticks(0)),
+            qty: p.qty,
+            cum: Lots::ZERO,
+            post_only: p.post_only,
+            reduce_only: p.reduce_only,
+            guarded: self.protected,
+        }
+    }
+
+    /// Placement `p`, arrived at `at`, matched and resting or ended now.
+    fn place_now(&mut self, p: Place, at: At) -> Item {
         let key = OrderKey(self.orders);
         let m = Match {
             inst: p.inst,
@@ -1044,17 +1300,7 @@ impl SimEngine {
         let n = self.orders;
         self.orders += 1;
         self.by_cid.insert(p.cid.clone(), n);
-        let order = Resting {
-            cid: p.cid.clone(),
-            inst: p.inst,
-            side: p.side,
-            px: p.px.unwrap_or(Ticks(0)),
-            qty: p.qty,
-            cum: Lots::ZERO,
-            post_only: p.post_only,
-            reduce_only: p.reduce_only,
-            guarded: self.protected,
-        };
+        let order = self.resting(&p);
         let events = self.commit(n, order, p.px, taken);
         Item::accepted(p.cid, n, events)
     }
@@ -1289,14 +1535,18 @@ impl SimEngine {
         Ok((amended, taken?))
     }
 
+    /// Ends the order `target` names: resting, or held for its risk check, which it withdraws
+    /// before the check refuses it.
     fn cancel(&mut self, target: &Target) -> Item {
         let n = self.lookup(target);
-        let found = n.and_then(|n| self.live.remove(&n).map(|o| (n, o)));
-        let Some((n, order)) = found else {
+        let live = |e: &mut SimEngine, n| e.live.remove(&n).map(|o| (Some(o.px), o));
+        let held = |e: &mut SimEngine, n| e.held.remove(&n).map(|h| (h.px, h.order));
+        let found = n.and_then(|n| live(self, n).or_else(|| held(self, n)).map(|o| (n, o)));
+        let Some((n, (px, order))) = found else {
             return Item::refused(self.missing(n));
         };
         let cid = order.cid.clone();
-        let event = self.end(n, order, SimState::Canceled(CancelReason::Requested));
+        let event = self.end_at(n, order, px, SimState::Canceled(CancelReason::Requested));
         Item::accepted(cid, n, vec![event])
     }
 
@@ -1314,6 +1564,11 @@ impl SimEngine {
             let o = self.live.get(&n)?;
             Some(order_event(o, &vid(n), SimState::Open, Some(o.px)))
         });
+        // One held for its risk check is the venue's, open as placed.
+        let held = n.and_then(|n| {
+            let h = self.held.get(&n)?;
+            Some(order_event(&h.order, &vid(n), SimState::Open, h.px))
+        });
         let ended = n.and_then(|n| {
             let e = self.ended.get(&n)?;
             Some(order_event(&e.order, &vid(n), e.state, e.px))
@@ -1322,7 +1577,7 @@ impl SimEngine {
             rpc: q.head.rpc,
             vid: q.vid,
             cid: q.cid,
-            found: live.or(ended),
+            found: live.or(held).or(ended),
         };
         self.answer(at, reply);
     }
@@ -1331,12 +1586,16 @@ impl SimEngine {
     /// and the positions the fills imply when the venue acts, its watermark the request's wall
     /// time, echoing its number.
     fn resync(&mut self, asked: WallNs, req: u64, at: At) {
-        let orders = self.live.iter();
-        let orders = orders.map(|(&n, o)| order_event(o, &vid(n), SimState::Open, Some(o.px)));
+        let live = self.live.iter();
+        let live = live.map(|(&n, o)| (n, order_event(o, &vid(n), SimState::Open, Some(o.px))));
+        // The placements held for their risk check are the venue's too, open as placed.
+        let held = self.held.iter();
+        let held = held.map(|(&n, h)| (n, order_event(&h.order, &vid(n), SimState::Open, h.px)));
+        let orders: BTreeMap<u64, OrderEvent> = live.chain(held).collect();
         let reply = Reply::Resync {
             wm: asked,
             req,
-            orders: orders.collect(),
+            orders: orders.into_values().collect(),
             positions: self.positions.iter().map(|(&i, p)| (i, p.lots)).collect(),
         };
         self.answer(at, reply);
@@ -1345,10 +1604,15 @@ impl SimEngine {
     /// Takes resting order `n` out of its queue and records it as `state` ended it: its order
     /// event.
     fn end(&mut self, n: u64, order: Resting, state: SimState) -> Reply {
+        let px = Some(order.px);
+        self.end_at(n, order, px, state)
+    }
+
+    /// As [`end`](SimEngine::end), for order `n` at price `px` (`None` for a market order).
+    fn end_at(&mut self, n: u64, order: Resting, px: Option<Ticks>, state: SimState) -> Reply {
         if let Some(queue) = self.queues.get_mut(&order.inst) {
             queue.remove(OrderKey(n));
         }
-        let px = Some(order.px);
         let event = Reply::Order(order_event(&order, &vid(n), state, px));
         self.ended.insert(n, Ended { order, px, state });
         event
