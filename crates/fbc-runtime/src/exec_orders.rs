@@ -538,9 +538,11 @@ mod tests {
         assert!(orders.idle());
         // A frame of another session of the shard, being handled.
         let frame = clock.stamp(ConnKey { conn: 9, epoch: 1 }, None);
-        orders.submit_control(ControlCommand::FeeQuery).unwrap();
+        clock.attributing(frame, || {
+            orders.submit_control(ControlCommand::FeeQuery).unwrap()
+        });
         assert!(!orders.idle());
-        clock.handled();
+        // Once its events were handed on, a submission names no input.
         orders.submit_control(ControlCommand::FeeQuery).unwrap();
         let (first, second) = (shared.pop().unwrap(), shared.pop().unwrap());
         assert_eq!((first.origin, second.origin), (Some(frame), None));

@@ -86,6 +86,8 @@ type Run<'a> = Pin<Box<dyn Future<Output = Result<(), ShardError>> + 'a>>;
 /// One session of the shard, whose run the host drives ([`ShardHost::run`]).
 pub struct Member<'a> {
     run: Run<'a>,
+    /// An order-entry member's orders: the host waits for what its handlers submitted there.
+    orders: Option<ExecOrders>,
 }
 
 impl fmt::Debug for Member<'_> {
@@ -98,19 +100,31 @@ impl<'a> Member<'a> {
     /// A market-data session: its [`MdSession::run`].
     pub fn md<H: MdHandler + 'a>(session: &'a mut MdSession<H>) -> Member<'a> {
         let run = async move { session.run().await.map_err(ShardError::Md) };
-        Member { run: Box::pin(run) }
+        let orders = None;
+        Member {
+            run: Box::pin(run),
+            orders,
+        }
     }
 
     /// A venue's market data: its [`MdVenue::run`].
     pub fn md_venue<H: MdHandler + 'static>(venue: &'a mut MdVenue<H>) -> Member<'a> {
         let run = async move { venue.run().await.map_err(ShardError::Md) };
-        Member { run: Box::pin(run) }
+        let orders = None;
+        Member {
+            run: Box::pin(run),
+            orders,
+        }
     }
 
     /// An order-entry session: its [`ExecSession::run`].
     pub fn exec<H: ExecHandler + 'a>(session: &'a mut ExecSession<H>) -> Member<'a> {
+        let orders = Some(session.orders());
         let run = async move { session.run().await.map_err(ShardError::Exec) };
-        Member { run: Box::pin(run) }
+        Member {
+            run: Box::pin(run),
+            orders,
+        }
     }
 }
 
@@ -439,7 +453,7 @@ impl Running<'_> {
 mod tests {
     use super::*;
     use crate::exec_orders::{RpcIds, Shared};
-    use fbc_core::{AccountKey, ConnKey};
+    use fbc_core::{AccountKey, ConnKey, RpcId};
     use std::cell::Cell;
 
     /// What a scripted member does each time it is polled.
@@ -460,7 +474,21 @@ mod tests {
     /// A member that does `acts`, one per poll, waking itself after each wait, and waits
     /// forever once they run out.
     fn scripted(clock: &IngestClock, shared: &Rc<Shared>, acts: &[Act]) -> Member<'static> {
-        let (clock, shared) = (clock.clone(), Rc::clone(shared));
+        scripted_as("", &Taken::default(), clock, shared, acts)
+    }
+
+    /// The commands scripted members took, by member name, in order.
+    type Taken = Rc<RefCell<Vec<(&'static str, RpcId)>>>;
+
+    /// [`scripted`], named `name`, logging each command it takes in `taken`.
+    fn scripted_as(
+        name: &'static str,
+        taken: &Taken,
+        clock: &IngestClock,
+        shared: &Rc<Shared>,
+        acts: &[Act],
+    ) -> Member<'static> {
+        let (clock, shared, taken) = (clock.clone(), Rc::clone(shared), Rc::clone(taken));
         let acts = acts.to_vec();
         let next = Cell::new(0);
         let run = poll_fn(move |cx| {
@@ -475,7 +503,9 @@ mod tests {
                     clock.stamp(ConnKey { conn: 1, epoch: 0 }, None);
                 }
                 Some(Act::Take) => {
-                    shared.pop();
+                    if let Some(queued) = shared.pop() {
+                        taken.borrow_mut().push((name, queued.rpc));
+                    }
                 }
                 Some(Act::Wait) | None => {}
             }
@@ -484,7 +514,63 @@ mod tests {
             }
             Poll::Pending
         });
-        Member { run: Box::pin(run) }
+        let orders = None;
+        Member {
+            run: Box::pin(run),
+            orders,
+        }
+    }
+
+    /// The orders of a session for account `acct` that stamps from `clock`.
+    fn session_orders(acct: u16, clock: &IngestClock) -> (Rc<Shared>, ExecOrders) {
+        let ids = RpcIds::default();
+        let shared = Shared::new(AccountKey::new(acct), ids, true, false, true, clock.clone());
+        let orders = ExecOrders {
+            shared: Rc::clone(&shared),
+        };
+        (shared, orders)
+    }
+
+    /// Codex P1 r4309119894 on PR #164: a command a handler left waiting on one order-entry
+    /// session goes out before the ladder's next command on another, so a protective cancel
+    /// waits behind at most the one command in progress whichever session it is for.
+    #[tokio::test]
+    async fn a_command_waiting_on_one_session_goes_before_the_ladders_next_on_another() {
+        use Act::{Stamp, Take, Wait};
+        let clock = IngestClock::new();
+        let (a_shared, a) = session_orders(2, &clock);
+        let (b_shared, b) = session_orders(3, &clock);
+        let taken = Taken::default();
+        // Session A takes what waits on it only at its fifth poll: the wait for an input, the
+        // drain's round, then the ladder's. B takes at once.
+        let a_acts = [Stamp, Wait, Wait, Wait, Take];
+        let mut a_member = scripted_as("A", &taken, &clock, &a_shared, &a_acts);
+        a_member.orders = Some(a.clone());
+        let mut b_member = scripted_as("B", &taken, &clock, &b_shared, &[Take; 8]);
+        b_member.orders = Some(b.clone());
+        let mut host = ShardHost::new(clock.clone());
+        let handler = Rc::new(Cell::new(None));
+        let sent = Rc::clone(&handler);
+        let mut decide = |_: &[InstrumentId], ladder: &mut Ladder| {
+            if sent.get().is_none() {
+                // As a handler would: a cancel submitted straight to A.
+                sent.set(Some(a.submit_control(ControlCommand::FeeQuery).unwrap()));
+                ladder.push_control(&b, ControlCommand::FeeQuery);
+            }
+        };
+        let members = vec![a_member, b_member];
+        let run = host.run(members, &mut decide);
+        let mut run = Box::pin(run);
+        // Until both commands were taken.
+        let mut polls = 0;
+        while taken.borrow().len() < 2 {
+            assert!(futures_util::FutureExt::now_or_never(&mut run).is_none());
+            tokio::task::yield_now().await;
+            polls += 1;
+            assert!(polls < 1_000, "{:?}", taken.borrow());
+        }
+        let order: Vec<_> = taken.borrow().iter().map(|(name, _)| *name).collect();
+        assert_eq!(order, ["A", "B"]);
     }
 
     /// What one scripted run showed: its result, the passes and the ladder commands handed back.
@@ -538,11 +624,13 @@ mod tests {
                 Err(ShardError::Md(SessionError::NoConnectionLeft)),
                 2,
             ),
-            (&[Stamp, Wait, Wait, End], Ok(()), 1),
+            // A command submitted that its session had not taken when the run ended is
+            // withdrawn and handed back too (Codex P1 r4309119897 on PR #164).
+            (&[Stamp, Wait, Wait, End], Ok(()), 2),
             (
                 &[Stamp, Wait, Wait, Fail],
                 Err(ShardError::Md(SessionError::NoConnectionLeft)),
-                1,
+                2,
             ),
             (&[Stamp, Wait, Wait, Take, End], Ok(()), 1),
         ];
