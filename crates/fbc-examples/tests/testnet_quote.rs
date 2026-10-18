@@ -172,6 +172,7 @@ fn options(stub: &StubServer, cycles: u64) -> Options {
         lease_dir: lease_dir(),
         sole_trader: true,
         mainnet: false,
+        cancel_window: args::CANCEL_NOT_OURS_WINDOW,
     }
 }
 
@@ -405,6 +406,15 @@ struct Venue {
     /// order update, its fill event not sent (the fill stream behind the order stream).
     filled_unsent_next_buy_cancel: bool,
     creates: usize,
+    /// Another program on the account (FBC-aoh5: the owner's 2026-10-18 mainnet session, where
+    /// a Java instance's orphan reconcile cancelled every order on its ticker it did not place):
+    /// right after the reply to each of these places (from 1), every order of ours the stub
+    /// holds open, of the side named (BUY or SELL; both when `None`), is closed by a user cancel
+    /// the loop never sent (`user_cancel_ws`).
+    cotenant_after_create: Vec<(usize, Option<&'static str>)>,
+    /// Answer every instrument cancel-all with the order events closing the orders first, and
+    /// its `{"status":"ok"}` after them: the order stream ahead of the cancel-all's reply.
+    cancel_all_closes_first: bool,
     /// Every frame the stub sent, with the connection's number, for the wire-order checks.
     log: Vec<(usize, String)>,
 }
@@ -692,6 +702,19 @@ fn respond(venue: &Shared, conn: usize, frame: &Frame) -> Responded {
             if v.garbage_after_create == Some(v.creates) {
                 frames.push(Frame::Binary(b"\xff".to_vec()));
             }
+            let creates = v.creates;
+            if let Some((_, side)) = v
+                .cotenant_after_create
+                .iter()
+                .copied()
+                .find(|(n, _)| *n == creates)
+            {
+                for at in 0..v.orders.len() {
+                    if v.orders[at].open && side.is_none_or(|s| v.orders[at].side == s) {
+                        frames.push(user_cancelled(&mut v, at));
+                    }
+                }
+            }
             frames
         }
         "order.cancel" => {
@@ -802,11 +825,34 @@ fn respond(venue: &Shared, conn: usize, frame: &Frame) -> Responded {
                     frames.push(closed(&mut v, at));
                 }
             }
+            if v.cancel_all_closes_first {
+                frames.rotate_left(1);
+            }
             frames
         }
         other => return Err(format!("an unexpected method {other}")),
     };
     Ok(frames)
+}
+
+/// The order event closing the order `at` the stub holds by a user cancel the loop never sent
+/// (`user_cancel_ws`, which Paradex's codec reads as `Canceled(Requested)`, as it reads our own
+/// cancels' USER_CANCELED): another program on the account (FBC-aoh5).
+fn user_cancelled(v: &mut Venue, at: usize) -> Frame {
+    v.orders[at].open = false;
+    v.seq += 1;
+    let o = v.orders[at].clone();
+    let side = if o.side == "BUY" { 1 } else { 2 };
+    Frame::Binary(order_event(
+        side,
+        5_000 + v.seq,
+        &o.vid,
+        &o.cid,
+        &o.price,
+        &o.size,
+        &o.size,
+        "user_cancel_ws",
+    ))
 }
 
 /// `n` answered frames on connection `conn`.
@@ -1005,6 +1051,11 @@ async fn testnet_quote_requotes_by_cancel_and_replace_within_the_caps_against_th
     );
     // Nothing of the answered requests is kept, in the loop or the link.
     assert_eq!(report.requests_held, 0, "{printed}");
+    // Every order ended by a cancel of ours (the replaces' and Stop's instrument cancel-all,
+    // whose order events say USER_CANCELED as another program's would): none is counted as a
+    // cancel not ours (FBC-aoh5).
+    assert_eq!(report.cancels_not_ours, 0, "{printed}");
+    assert!(!printed.contains("\nWARN"), "{printed}");
 
     // No amend frame, ever: every change is a cancel and a place.
     let sent = methods(&venue, 0);
@@ -1119,7 +1170,7 @@ async fn testnet_quote_requotes_by_cancel_and_replace_within_the_caps_against_th
     assert!(
         printed.contains(
             "SUMMARY cycles 4 orders placed 6 cancels sent 6 orders cancelled 6 fills 0 \
-             inventory 0 lots"
+             inventory 0 lots cancels not ours 0"
         ),
         "{printed}"
     );
@@ -1226,6 +1277,9 @@ async fn after_a_reconnect_every_order_of_ours_is_cancelled_before_any_place() {
         "{printed}"
     );
     assert!(printed.contains("Safety cancel requests"), "{printed}");
+    // The Safety cancel, the reconnect's sweep and Stop are ours: no cancel not ours counted.
+    assert_eq!(report.cancels_not_ours, 0, "{printed}");
+    assert!(!printed.contains("\nWARN"), "{printed}");
     no_credential_in(&printed);
 }
 
@@ -1495,6 +1549,10 @@ async fn an_earlier_runs_order_is_cancelled_before_the_first_place() {
     );
     assert_eq!(sent[7], "order.cancel_all", "{sent:?}");
     assert_eq!(report.cancelled, 3, "{printed}");
+    // The earlier run's order ended by our Safety cancel at the start, before the start's
+    // sweep: ours, never a cancel not ours (FBC-aoh5).
+    assert_eq!(report.cancels_not_ours, 0, "{printed}");
+    assert!(!printed.contains("\nWARN"), "{printed}");
 }
 
 #[tokio::test]
@@ -2518,6 +2576,8 @@ fn the_command_line_takes_every_required_flag_and_defaults_to_testnet() {
     assert_eq!(opts.rest_url, args::TESTNET_REST);
     assert_eq!(opts.ws_url, args::TESTNET_WS);
     assert_eq!(opts.namespace, 7);
+    // No flag sets the owner's 30 s window for a cancel not ours (FBC-aoh5).
+    assert_eq!(opts.cancel_window, Duration::from_secs(30));
     assert!(
         opts.lease_dir.ends_with(".fueledbychai/testnet_trade"),
         "{:?}",
@@ -2654,6 +2714,12 @@ fn help_says_it_is_a_plumbing_test_not_a_strategy_and_names_every_line() {
         "POSITION re-read",
         "POSITION at Stop",
         "check the position by hand",
+        // A cancel not ours (FBC-aoh5).
+        "WARN",
+        "a cancel of an order of ours that this program did not send",
+        "one quoter per account",
+        "within 30 s",
+        "cancels not ours",
     ] {
         assert!(USAGE.contains(name), "{name}");
     }
@@ -3928,6 +3994,10 @@ async fn a_replace_is_placed_only_after_its_cancel_is_answered_even_once_its_ord
         &sent[9..],
         ["order.cancel", "order.cancel", "order.cancel_all"]
     );
+    // The bid ended (USER_CANCELED) while its cancel's reply was still in flight: ours, never
+    // a cancel not ours (FBC-aoh5).
+    assert_eq!(report.cancels_not_ours, 0, "{printed}");
+    assert!(!printed.contains("\nWARN"), "{printed}");
     stopped(&printed);
 }
 
@@ -4213,4 +4283,375 @@ async fn the_position_checks_charge_the_connections_they_open() {
         stub.connections().len()
     );
     assert!(printed.contains("STEP positions"), "{printed}");
+}
+
+// FBC-aoh5: a cancel of an order of ours that the run never sent (the owner's 2026-10-18 mainnet
+// session: a Java instance on the same account cancelled every order on its ticker it did not
+// place, every 3 s). The owner's decision: WARN once and requote; a second on a later cycle
+// within 30 s Stops a mainnet run (explicit cancels of ours, never an instrument cancel-all,
+// which would cancel the other program's orders too) and fails it; a testnet run only warns.
+
+/// The touch one cycle moves to and back from, so every cycle replaces both quotes: its `seq_no`
+/// `seq`.
+fn up(seq: u64) -> String {
+    book(seq, Some("62100.0"), Some("62100.3"))
+}
+
+/// The first touch again, under `seq_no` `seq`.
+fn base(seq: u64) -> String {
+    book(seq, Some("62000.2"), Some("62000.5"))
+}
+
+/// The first read and cycle 1 at the first touch, then the touch moving every cycle to cycle
+/// `cycles`, and the same touch after.
+fn alternating(cycles: u64) -> Vec<String> {
+    let mut books = vec![b0(), b0()];
+    for c in 2..=cycles {
+        books.push(if c % 2 == 0 { up(c) } else { base(c) });
+    }
+    books
+}
+
+/// The index of the first request the session sent on connection 0 after the co-tenant's first
+/// cancel: the request right after the reply to place `n` (from 1) that it followed.
+fn after_create(venue: &Shared, n: usize) -> usize {
+    let sent = methods(venue, 0);
+    let mut seen = 0;
+    for (at, m) in sent.iter().enumerate() {
+        if m == "order.create" {
+            seen += 1;
+            if seen == n {
+                return at + 1;
+            }
+        }
+    }
+    panic!("no place {n}: {sent:?}")
+}
+
+/// The venue ids of the orders the stub holds of `side` (BUY or SELL), in the order placed.
+fn vids_of(venue: &Shared, side: &str) -> Vec<String> {
+    let v = lock(venue);
+    v.orders
+        .iter()
+        .filter(|o| o.side == side)
+        .map(|o| o.vid.clone())
+        .collect()
+}
+
+/// The `WARN` lines, the first one's text checked: it names what it may be, the owner's rule and,
+/// on mainnet, the Stop on a repeat.
+fn warned(printed: &str, mainnet: bool) -> usize {
+    let warns = tagged(printed, "WARN");
+    let first = warns
+        .first()
+        .unwrap_or_else(|| panic!("no WARN line:\n{printed}"));
+    for part in [
+        "ended by a user cancel this program did not send",
+        "another program on the account, or the Paradex UI",
+        "one quoter per account",
+    ] {
+        assert!(first.contains(part), "{part}:\n{printed}");
+    }
+    let rule = if mainnet {
+        "a second on a later cycle within 30 s Stops the run"
+    } else {
+        "testnet mode only warns"
+    };
+    assert!(first.contains(rule), "{rule}:\n{printed}");
+    warns.len()
+}
+
+#[tokio::test]
+async fn a_one_off_cancel_not_ours_warns_once_and_the_mainnet_loop_requotes_and_ends_done_ok() {
+    capture::install();
+    // Cycle 1's two quotes are cancelled by another program right after the ask's place (one
+    // event: one reconcile cancels both sides); cycle 2 places both again; cycles 3 and 4 send
+    // nothing. Stop then cancels the two resting quotes explicitly, by a batch cancel naming
+    // them: another program is on the account, so never the instrument cancel-all.
+    let venue = mainnet_venue(vec![b0()]);
+    lock(&venue).cotenant_after_create = vec![(2, None)];
+    // The opening six, the start's sweep, two places, two places again, Stop's batch cancel.
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 2 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let opts = mainnet_options(&stub, 4);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("the stub's script: {e:?}\n{printed}"));
+
+    assert!(report.ok, "{printed}");
+    assert_eq!(report.ended, "--cycles 4 reached", "{printed}");
+    assert_eq!(report.cancels_not_ours, 2, "{printed}");
+    assert_eq!(warned(&printed, true), 1, "one event, one WARN:\n{printed}");
+    assert_eq!(creates(&venue, 0), 4, "{printed}");
+    let sent = methods(&venue, 0);
+    let after = after_create(&venue, 2);
+    // The start's sweep is the only instrument cancel-all, before the co-tenant's cancel.
+    assert_eq!(sent[6], "order.cancel_all", "{sent:?}");
+    assert!(
+        !sent[after..].iter().any(|m| m == "order.cancel_all"),
+        "an instrument cancel-all after the cancel not ours: {sent:?}"
+    );
+    // Stop's cancel names both resting quotes, explicitly.
+    let last = requests(&venue, 0).last().cloned().unwrap();
+    assert_eq!(last["method"], "order.cancel_batch", "{sent:?}");
+    let mut named = cancelled_ids(&last);
+    named.sort();
+    let mut resting = vec![
+        vids_of(&venue, "BUY")[1].clone(),
+        vids_of(&venue, "SELL")[1].clone(),
+    ];
+    resting.sort();
+    assert_eq!(named, resting, "{sent:?}");
+    assert!(
+        printed.contains("no instrument cancel-all: another program cancelled our orders"),
+        "{printed}"
+    );
+    assert!(printed.contains(" cancels not ours 2\n"), "{printed}");
+    assert!(
+        printed.contains("DONE ok (--cycles 4 reached)"),
+        "{printed}"
+    );
+    no_credential_in(&printed);
+}
+
+#[tokio::test]
+async fn a_second_cancel_not_ours_on_a_later_cycle_within_30_s_stops_a_mainnet_run_explicitly() {
+    capture::install();
+    // Cycle 1's quotes are cancelled by another program (the first event: WARN); cycle 2 places
+    // both again and the other program cancels the bid (the second, on a later cycle within
+    // 30 s): Stop, the ask cancelled explicitly, nothing placed after, the run failed.
+    let venue = mainnet_venue(vec![b0()]);
+    lock(&venue).cotenant_after_create = vec![(2, None), (4, Some("BUY"))];
+    // The opening six, the start's sweep, two places, two places again, Stop's batch cancel of
+    // the ask.
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 2 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let opts = mainnet_options(&stub, 50);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("the stub's script: {e:?}\n{printed}"));
+
+    assert!(!report.ok, "{printed}");
+    assert!(
+        report
+            .ended
+            .starts_with("another program cancelled our orders: one quoter per account"),
+        "{printed}"
+    );
+    assert_eq!(report.cancels_not_ours, 3, "{printed}");
+    assert_eq!(warned(&printed, true), 2, "{printed}");
+    stopped(&printed);
+    assert_eq!(creates(&venue, 0), 4, "nothing placed after:\n{printed}");
+    let sent = methods(&venue, 0);
+    let after = after_create(&venue, 2);
+    assert_eq!(sent[6], "order.cancel_all", "{sent:?}");
+    assert!(
+        !sent[after..].iter().any(|m| m == "order.cancel_all"),
+        "an instrument cancel-all after the cancel not ours: {sent:?}"
+    );
+    // Stop's one cancel names the ask still resting, explicitly.
+    let last = requests(&venue, 0).last().cloned().unwrap();
+    assert_eq!(last["method"], "order.cancel_batch", "{sent:?}");
+    assert_eq!(cancelled_ids(&last), [vids_of(&venue, "SELL")[1].clone()]);
+    assert!(
+        printed.contains("no instrument cancel-all: another program cancelled our orders"),
+        "{printed}"
+    );
+    assert!(printed.contains(" cancels not ours 3\n"), "{printed}");
+    assert!(printed.contains("DONE failed (another program cancelled our orders"));
+    no_credential_in(&printed);
+}
+
+#[tokio::test]
+async fn a_co_tenant_cancelling_our_orders_every_three_cycles_is_stopped_within_two_events() {
+    capture::install();
+    // Java's orphan reconcile on a 3-cycle period: every order of ours resting is cancelled
+    // after cycle 1's places and again after cycle 4's (the touch moves every cycle, so each
+    // cycle replaces both quotes). The second event Stops the run, with nothing of ours left to
+    // cancel and no instrument cancel-all.
+    let venue = mainnet_venue(alternating(10));
+    lock(&venue).cotenant_after_create = vec![(2, None), (8, None), (14, None)];
+    // The opening six, the start's sweep; cycle 1 two places, cycle 2 two places (both ended),
+    // cycles 3 and 4 two cancels and two places each; Stop has nothing open to cancel.
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 2 + 4 + 4),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let opts = mainnet_options(&stub, 50);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("the stub's script: {e:?}\n{printed}"));
+
+    assert!(!report.ok, "{printed}");
+    assert!(
+        report
+            .ended
+            .starts_with("another program cancelled our orders: one quoter per account"),
+        "{printed}"
+    );
+    assert_eq!(report.cycles, 3, "{printed}");
+    assert_eq!(report.cancels_not_ours, 4, "{printed}");
+    assert_eq!(warned(&printed, true), 2, "{printed}");
+    stopped(&printed);
+    assert_eq!(creates(&venue, 0), 8, "{printed}");
+    let sent = methods(&venue, 0);
+    assert_eq!(
+        sent.iter().filter(|m| *m == "order.cancel_all").count(),
+        1,
+        "only the start's sweep: {sent:?}"
+    );
+    no_credential_in(&printed);
+}
+
+#[tokio::test]
+async fn a_cancel_not_ours_after_the_window_only_warns_again() {
+    capture::install();
+    // The window shortened to 300 ms for the test (the owner's is 30 s): cycle 1's quotes and
+    // cycle 7's are cancelled by another program, at least six 100 ms pauses apart, so the
+    // second starts a new window: a WARN, never a Stop. Cycle 8 places both again.
+    let venue = mainnet_venue(alternating(8));
+    lock(&venue).cotenant_after_create = vec![(2, None), (14, None)];
+    // The opening six, the start's sweep; cycle 1 two places, cycle 2 two places, cycles 3 to 7
+    // two cancels and two places each, cycle 8 two places; Stop's batch cancel.
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 2 + 4 * 5 + 2 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let mut opts = mainnet_options(&stub, 8);
+    opts.cancel_window = Duration::from_millis(300);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("the stub's script: {e:?}\n{printed}"));
+
+    assert!(report.ok, "{printed}");
+    assert_eq!(report.ended, "--cycles 8 reached", "{printed}");
+    assert_eq!(report.cancels_not_ours, 4, "{printed}");
+    assert_eq!(tagged(&printed, "WARN").len(), 2, "{printed}");
+    assert!(
+        !printed.contains("another program cancelled our orders:"),
+        "{printed}"
+    );
+    let sent = methods(&venue, 0);
+    assert_eq!(
+        sent.iter().filter(|m| *m == "order.cancel_all").count(),
+        1,
+        "only the start's sweep: {sent:?}"
+    );
+    assert_eq!(sent.last().map(String::as_str), Some("order.cancel_batch"));
+    assert!(
+        printed.contains("DONE ok (--cycles 8 reached)"),
+        "{printed}"
+    );
+}
+
+#[tokio::test]
+async fn in_testnet_mode_a_repeated_cancel_not_ours_only_warns() {
+    capture::install();
+    // As the mainnet repeat: cycle 1's quotes, then cycle 2's bid, cancelled by another
+    // program. On testnet both only warn; cycle 3 places the bid again and the run ends at
+    // --cycles, Stop's cancels explicit all the same.
+    let venue = venue(vec![b0()]);
+    lock(&venue).cotenant_after_create = vec![(2, None), (4, Some("BUY"))];
+    // The opening six, the start's sweep, two places, two places again, the bid's place, Stop's
+    // batch cancel.
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 2 + 1 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let opts = options(&stub, 4);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("the stub's script: {e:?}\n{printed}"));
+
+    assert!(report.ok, "{printed}");
+    assert_eq!(report.ended, "--cycles 4 reached", "{printed}");
+    assert_eq!(report.cancels_not_ours, 3, "{printed}");
+    assert_eq!(warned(&printed, false), 2, "{printed}");
+    assert_eq!(creates(&venue, 0), 5, "{printed}");
+    let sent = methods(&venue, 0);
+    assert_eq!(
+        sent.iter().filter(|m| *m == "order.cancel_all").count(),
+        1,
+        "only the start's sweep: {sent:?}"
+    );
+    assert_eq!(sent.last().map(String::as_str), Some("order.cancel_batch"));
+    assert!(printed.contains(" cancels not ours 3\n"), "{printed}");
+}
+
+#[tokio::test]
+async fn our_own_cancel_all_whose_order_events_come_before_its_reply_is_never_counted() {
+    // Stop's instrument cancel-all is answered with the order events closing both quotes first
+    // (USER_CANCELED, as another program's cancel would read) and its reply after: ours, in
+    // flight, never a cancel not ours.
+    let venue = mainnet_venue(vec![b0()]);
+    lock(&venue).cancel_all_closes_first = true;
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let opts = mainnet_options(&stub, 2);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("the stub's script: {e:?}\n{printed}"));
+    assert!(report.ok, "{printed}");
+    assert_eq!(report.cancelled, 2, "{printed}");
+    assert_eq!(report.cancels_not_ours, 0, "{printed}");
+    assert!(!printed.contains("\nWARN"), "{printed}");
+    assert!(printed.contains(" cancels not ours 0\n"), "{printed}");
+    let sent = methods(&venue, 0);
+    assert_eq!(sent.last().map(String::as_str), Some("order.cancel_all"));
+}
+
+#[test]
+fn cancels_not_ours_of_orders_placed_before_the_last_one_are_one_event_and_a_requotes_repeats_it() {
+    use quote::{CancelsNotOurs, NotOurs};
+    let t0 = tokio::time::Instant::now();
+    let s = Duration::from_secs;
+    let mut seen = CancelsNotOurs::new(args::CANCEL_NOT_OURS_WINDOW);
+    assert_eq!(args::CANCEL_NOT_OURS_WINDOW, s(30));
+    // Both sides, placed before it was seen, of one reconcile: one event; an earlier run's
+    // order (placed by no one this run) as well.
+    assert_eq!(seen.on_cancel(Some(t0), t0 + s(1)), NotOurs::First);
+    assert_eq!(seen.on_cancel(Some(t0), t0 + s(1)), NotOurs::SameEvent);
+    assert_eq!(seen.on_cancel(None, t0 + s(2)), NotOurs::SameEvent);
+    // A requote placed after it, cancelled within 30 s of the first: the repeat; its other side
+    // the same event as it.
+    assert_eq!(seen.on_cancel(Some(t0 + s(2)), t0 + s(31)), NotOurs::Repeat);
+    assert_eq!(
+        seen.on_cancel(Some(t0 + s(3)), t0 + s(31)),
+        NotOurs::SameEvent
+    );
+    assert_eq!(seen.orders(), 5);
+    // Past 30 s from the window's first event, a new window.
+    let mut seen = CancelsNotOurs::new(s(30));
+    assert_eq!(seen.on_cancel(None, t0), NotOurs::First);
+    assert_eq!(seen.on_cancel(Some(t0 + s(1)), t0 + s(31)), NotOurs::First);
+    assert_eq!(
+        seen.on_cancel(Some(t0 + s(32)), t0 + s(40)),
+        NotOurs::Repeat
+    );
+    assert_eq!(seen.on_cancel(Some(t0 + s(41)), t0 + s(62)), NotOurs::First);
+    assert_eq!(seen.orders(), 4);
 }
