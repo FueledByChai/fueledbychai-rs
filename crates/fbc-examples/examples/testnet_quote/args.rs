@@ -146,8 +146,10 @@ that this program did not send (another program on the account, such as a Java q
 orphan reconcile cancels every order on its market it did not place, or you in the Paradex UI)
 reads as one of ours. The run counts one when an order of ours ends cancelled by a user while
 no cancel of ours covering it was sent (no replace's or side's cancel, no cancel-all, no
-start, reconnect or Stop sweep, in flight or answered); those of one cycle are one event. The
-first prints a WARN line and the loop requotes. With --mainnet, a second on a later cycle
+start, reconnect or Stop sweep, in flight or answered). Those of one action (one reconcile, one
+cancel-all in the UI) are one event: Paradex stamps them within 1 s of each other, and a cancel
+seconds later, of any order however old, or of a quote placed after it, is another (so both
+quotes cancelled by hand one at a time, seconds apart, are two). The first prints a WARN line and the loop requotes. With --mainnet, a second on a later cycle
 within 30 s of the first Stops the run and fails it ('another program cancelled our orders:
 one quoter per account'); after 30 s with no second the window starts again. Without
 --mainnet each only warns. Once one was seen, the run's cancels of everything (a reconnect's

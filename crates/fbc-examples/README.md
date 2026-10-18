@@ -99,8 +99,11 @@ not say who sent a user cancel, and the Java instance was flat with no orders at
 neither the resync nor `--sole-trader` could see it. The loop now counts a cancel not ours when
 an order of ours ends cancelled by a user while no cancel of ours covering it was sent (no
 replace's or side's cancel, no cancel-all, no start, reconnect or Stop sweep, in flight or
-answered). Those of one reconcile are one event (two are one unless the second's order was
-placed after the first was seen). The first prints a `WARN` line (another program on the
+answered). Those of one action of the other program's (one reconcile, one cancel-all in the UI)
+are one event: two are one when Paradex stamped the second within 1 s of the event's first and
+its order was placed before the event was seen; a cancel seconds later, of any order however old,
+or of a quote placed after the event, is another (so both quotes cancelled by hand one at a
+time, seconds apart, are two: on mainnet that Stops the run). The first prints a `WARN` line (another program on the
 account, or the Paradex UI; one quoter per account) and the loop requotes. A second on a later
 cycle within 30 s of the first Stops the run and fails it ("another program cancelled our
 orders: one quoter per account"), which catches a 3 s reconcile within about 6 s; after 30 s

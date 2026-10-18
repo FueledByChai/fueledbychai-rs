@@ -69,7 +69,7 @@ use fbc_conformance::{
     Frame, HttpReply, HttpRouter, PathPattern, Responded, Responder, Step, StubServer, WsScript,
 };
 use fbc_core::{
-    AccountKey, AccountSummary, AssetKey, CidMint, ConfigError, EndpointPlan, ExecCodec,
+    AccountKey, AccountSummary, AssetKey, CidMint, ConfigError, EndpointPlan, ExchNs, ExecCodec,
     ExecEndpoint, FieldSpec, HttpPlan, InstrumentSpecDraft, LimitScope, Lots, MdCodec, Namespace,
     NamespaceLease, OpKind, RpcId, Secret, Secrets, Side, SignedLots, SnapshotSource, SpecTable,
     Subscription, SymbolError, TagSet, Ticks, VenueCaps, VenueConfig, VenueError, VenueFactory,
@@ -4689,59 +4689,110 @@ async fn our_own_cancel_all_whose_order_events_come_before_its_reply_is_never_co
 }
 
 #[test]
-fn cancels_not_ours_of_orders_placed_before_the_last_one_are_one_event_and_a_requotes_repeats_it() {
-    use quote::{CancelsNotOurs, NotOurs};
+fn cancels_not_ours_of_one_action_are_one_event_and_a_later_action_repeats_it() {
+    use quote::{CancelsNotOurs, EVENT_SPAN, NotOurs};
     let t0 = tokio::time::Instant::now();
     let s = Duration::from_secs;
+    // The venue's time on a cancel, `secs` after the first action's.
+    let at = |secs: i64| Some(ExchNs(1_759_500_000_000_000_000 + secs * 1_000_000_000));
+    assert_eq!(EVENT_SPAN, s(1));
     let mut seen = CancelsNotOurs::new(args::CANCEL_NOT_OURS_WINDOW);
     assert_eq!(args::CANCEL_NOT_OURS_WINDOW, s(30));
-    // Both sides, placed before it was seen, of one reconcile: one event; an earlier run's
-    // order (placed by no one this run) as well.
-    assert_eq!(seen.on_cancel(Some(t0), t0 + s(1)), NotOurs::First);
-    assert_eq!(seen.on_cancel(Some(t0), t0 + s(1)), NotOurs::SameEvent);
-    assert_eq!(seen.on_cancel(None, t0 + s(2)), NotOurs::SameEvent);
-    // A requote placed after it, cancelled within 30 s of the first: the repeat; its other side
-    // the same event as it.
-    assert_eq!(seen.on_cancel(Some(t0 + s(2)), t0 + s(31)), NotOurs::Repeat);
+    // Both sides, placed before it was seen, of one reconcile: one event, even read 1.5 s apart
+    // (split across a cycle); an earlier run's order (placed by no one this run) as well.
+    assert_eq!(seen.on_cancel(Some(t0), at(0), t0 + s(1)), NotOurs::First);
+    let read_later = t0 + Duration::from_millis(2_500);
     assert_eq!(
-        seen.on_cancel(Some(t0 + s(3)), t0 + s(31)),
+        seen.on_cancel(Some(t0), at(0), read_later),
         NotOurs::SameEvent
     );
-    assert_eq!(seen.orders(), 5);
-    // Past 30 s from the window's first event, a new window.
-    let mut seen = CancelsNotOurs::new(s(30));
-    assert_eq!(seen.on_cancel(None, t0), NotOurs::First);
-    assert_eq!(seen.on_cancel(Some(t0 + s(1)), t0 + s(31)), NotOurs::First);
+    assert_eq!(seen.on_cancel(None, at(0), t0 + s(2)), NotOurs::SameEvent);
+    // RB-aoh5-1 / Codex r4308625185: an order resting since before the first, cancelled by a
+    // later action (the venue's time 10 s on) within 30 s: the repeat.
     assert_eq!(
-        seen.on_cancel(Some(t0 + s(32)), t0 + s(40)),
+        seen.on_cancel(Some(t0), at(10), t0 + s(11)),
         NotOurs::Repeat
     );
-    assert_eq!(seen.on_cancel(Some(t0 + s(41)), t0 + s(62)), NotOurs::First);
-    assert_eq!(seen.orders(), 4);
+    // A requote placed after it, cancelled within 30 s of the first: the repeat again; its
+    // other side, placed before and cancelled with it, the same event as it.
+    assert_eq!(
+        seen.on_cancel(Some(t0 + s(12)), at(20), t0 + s(21)),
+        NotOurs::Repeat
+    );
+    assert_eq!(
+        seen.on_cancel(Some(t0 + s(3)), at(20), t0 + s(21)),
+        NotOurs::SameEvent
+    );
+    assert_eq!(seen.orders(), 6);
+
+    // Past 30 s from the window's first event, a new window: a requote's, and RB-aoh5-2's
+    // order resting unchanged since before the first, cancelled 10 minutes on.
+    let mut seen = CancelsNotOurs::new(s(30));
+    assert_eq!(seen.on_cancel(None, at(0), t0), NotOurs::First);
+    assert_eq!(
+        seen.on_cancel(Some(t0 + s(1)), at(31), t0 + s(31)),
+        NotOurs::First
+    );
+    assert_eq!(
+        seen.on_cancel(Some(t0 + s(32)), at(40), t0 + s(40)),
+        NotOurs::Repeat
+    );
+    assert_eq!(
+        seen.on_cancel(Some(t0 + s(41)), at(62), t0 + s(62)),
+        NotOurs::First
+    );
+    let mut seen = CancelsNotOurs::new(s(30));
+    assert_eq!(seen.on_cancel(Some(t0), at(1), t0 + s(1)), NotOurs::First);
+    assert_eq!(
+        seen.on_cancel(Some(t0), at(600), t0 + s(600)),
+        NotOurs::First
+    );
+
+    // With no venue time, when each was seen: within the span one event, later another.
+    let mut seen = CancelsNotOurs::new(s(30));
+    assert_eq!(seen.on_cancel(Some(t0), None, t0 + s(1)), NotOurs::First);
+    assert_eq!(
+        seen.on_cancel(Some(t0), None, t0 + Duration::from_millis(1_900)),
+        NotOurs::SameEvent
+    );
+    assert_eq!(seen.on_cancel(Some(t0), None, t0 + s(5)), NotOurs::Repeat);
 }
 
 #[test]
-fn a_cancel_of_ours_the_session_reports_not_sent_no_longer_covers_its_orders() {
-    // Codex r4308561813 on PR #159: a cancel submitted but reported NotSent wrote nothing, so it
-    // must stop covering its orders, or another program's cancel of one of them would be taken
-    // for ours; one another request of ours still covers stays covered.
+fn a_cancel_of_ours_covers_its_orders_only_once_the_session_reports_it_sent() {
+    // Codex r4308625182 / RB-aoh5-3 on PR #159: the session decodes a frame waiting in its turn
+    // before it writes what was queued, so a cancel of ours submitted but not yet reported sent
+    // covers nothing (another program's cancel read then is not ours); reported sent, it covers
+    // its orders; reported not sent (Codex r4308561813), it never does. One another request of
+    // ours still covers stays covered.
     let lease =
         NamespaceLease::acquire(&lease_dir(), AccountKey::new(1), Namespace::new(1)).unwrap();
     let mut mint = CidMint::new(lease, 0, 0, WallNs(1_000_000_000));
     let mut cid = || mint.mint().unwrap();
-    let (a, b) = (cid(), cid());
+    let (a, b, c) = (cid(), cid(), cid());
     let mut covered = link::Coverage::default();
-    covered.cover(RpcId(1), [a]);
-    covered.cover(RpcId(2), [a, b]);
-    assert!(covered.covers(a) && covered.covers(b));
-    // Request 2 never written: b is no longer covered, a still is (request 1).
-    covered.not_sent(RpcId(2));
+    covered.submitted(RpcId(1), [a]);
+    covered.submitted(RpcId(2), [a, b]);
+    assert!(!covered.covers(a) && !covered.covers(b), "pending: not yet");
+    covered.reported(RpcId(1), true);
     assert!(covered.covers(a));
     assert!(!covered.covers(b));
-    covered.not_sent(RpcId(1));
-    assert!(!covered.covers(a));
-    // Forgotten once ended.
-    covered.cover(RpcId(3), [a, b]);
-    covered.retain(|c| *c == b);
-    assert!(!covered.covers(a) && covered.covers(b));
+    // Request 2 never written: b never covered, a still is (request 1).
+    covered.reported(RpcId(2), false);
+    assert!(covered.covers(a));
+    assert!(!covered.covers(b));
+    // A report of no request pending changes nothing.
+    covered.reported(RpcId(2), true);
+    assert!(!covered.covers(b));
+    // Forgotten once ended, pending or covered.
+    covered.submitted(RpcId(3), [b, c]);
+    covered.reported(RpcId(3), true);
+    covered.submitted(RpcId(4), [a, c]);
+    covered.retain(|x| *x == b);
+    assert!(!covered.covers(a) && covered.covers(b) && !covered.covers(c));
+    covered.reported(RpcId(4), true);
+    assert!(
+        !covered.covers(a) && !covered.covers(c),
+        "ended while pending"
+    );
 }
