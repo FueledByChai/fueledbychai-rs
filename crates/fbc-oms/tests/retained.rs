@@ -400,6 +400,7 @@ fn a_planner_refuses_a_registry_an_authorization_bound_to_another_account() {
             post_only: true,
             reduce_only: false,
             reducing: false,
+            tag: 0,
         },
     );
     assert_eq!(

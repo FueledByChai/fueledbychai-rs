@@ -22,13 +22,13 @@ use common::{cid, lease_dir, lots, order_caps, placement, vid};
 use fbc_core::{
     AccountKey, AckLevel, AmendAck, AmendCaps, AmendQty, Bps, CancelReason, Channel, CidMatch,
     CidMint, ClientOrderId, InstrumentId, ItemRef, MonoNs, Namespace, NamespaceLease, OrderCaps,
-    OrderUpdate, RefKind, RpcId, Side, SignedLots, SubmitOutcome, TagSet, Ticks, Tif,
-    VenueCommand, VenueOrderState, WallNs,
+    OrderUpdate, RefKind, RpcId, Side, SignedLots, SubmitOutcome, TagSet, Ticks, Tif, VenueCommand,
+    VenueOrderState, WallNs,
 };
 use fbc_oms::{
     Applied, AuditEntry, AuditSink, CapRefusal, DesiredBook, DesiredQuote, ExecutionPlanner,
-    LadderConfig, MarketCapsConfig, OmsError, OrderKey, OrderOp, Plan, PlanRefusal,
-    PlannerConfig, PreTradeCaps, Registry, ResyncSnapshot, Routed, Stage,
+    LadderConfig, MarketCapsConfig, OmsError, OrderKey, OrderOp, Plan, PlanRefusal, PlannerConfig,
+    PreTradeCaps, Registry, ResyncSnapshot, Routed, Stage,
 };
 
 const INST: InstrumentId = InstrumentId::new(1);
@@ -114,8 +114,16 @@ fn quoting(resting: i64, pos: i64) -> Registry {
         1,
     )
     .unwrap();
-    reg.resync(&ladder, &amending(), &snap, OrderKey { venue: None, ingest: 0 })
-        .unwrap();
+    reg.resync(
+        &ladder,
+        &amending(),
+        &snap,
+        OrderKey {
+            venue: None,
+            ingest: 0,
+        },
+    )
+    .unwrap();
     start(&mut reg, INST);
     reg
 }
@@ -303,7 +311,10 @@ fn a_replace_cancels_under_the_orders_tag_with_no_reason_and_places_under_the_le
         shape(&plan),
         vec![(Stage::Add, "place", Side::Buy, 0, REPRICED_TAG, None)]
     );
-    assert_eq!(reg.get(plan.commands[0].cid).unwrap().tag(), Some(REPRICED_TAG));
+    assert_eq!(
+        reg.get(plan.commands[0].cid).unwrap().tag(),
+        Some(REPRICED_TAG)
+    );
 }
 
 #[test]
@@ -327,8 +338,22 @@ fn each_cancel_of_a_removed_level_carries_its_sides_reason() {
     assert_eq!(
         shape(&plan),
         vec![
-            (Stage::Cancel, "cancel", Side::Buy, 1, BID1_TAG, Some(BID_GONE)),
-            (Stage::Cancel, "cancel", Side::Sell, 0, ASK_TAG, Some(ASK_GONE)),
+            (
+                Stage::Cancel,
+                "cancel",
+                Side::Buy,
+                1,
+                BID1_TAG,
+                Some(BID_GONE)
+            ),
+            (
+                Stage::Cancel,
+                "cancel",
+                Side::Sell,
+                0,
+                ASK_TAG,
+                Some(ASK_GONE)
+            ),
         ]
     );
     assert_eq!(plan.commands[0].cid, bid1);
@@ -382,7 +407,14 @@ fn a_cancel_waiting_for_the_acknowledgement_carries_the_reason_of_the_pass_that_
     let plan = plan_and_send(&mut p, &later, &mut reg, &caps, &mut mint, LATER);
     assert_eq!(
         shape(&plan),
-        vec![(Stage::Cancel, "cancel", Side::Buy, 0, BID_TAG, Some(ASK_GONE))]
+        vec![(
+            Stage::Cancel,
+            "cancel",
+            Side::Buy,
+            0,
+            BID_TAG,
+            Some(ASK_GONE)
+        )]
     );
     assert_eq!(reg.get(bid).unwrap().removal(), Some(ASK_GONE));
 }
@@ -418,7 +450,14 @@ fn a_place_a_cap_refuses_is_never_built_and_tags_nothing() {
     let desired = DesiredBook::new(INST)
         .with(Side::Buy, 0, quote(10_000, RESTING + 1, BID_TAG))
         .with(Side::Sell, 0, quote(10_010, RESTING, ASK_TAG));
-    let plan = plan_and_send(&mut p, &desired, &mut reg, &amending(), &mut mint, MonoNs(0));
+    let plan = plan_and_send(
+        &mut p,
+        &desired,
+        &mut reg,
+        &amending(),
+        &mut mint,
+        MonoNs(0),
+    );
     assert_eq!(
         shape(&plan),
         vec![(Stage::Add, "place", Side::Sell, 0, ASK_TAG, None)]
@@ -479,9 +518,7 @@ fn the_audit_sinks_verdicts_carry_the_orders_tag_and_its_cancels_removal_reason(
     let opened = open_book(&mut p, &three_levels(), &mut reg, &amending(), &mut mint);
     let bid1 = opened.commands[1].cid;
     let ask = opened.commands[2].cid;
-    let open = |c, side, level| {
-        update(c, side, &venue_id(side, level), VenueOrderState::Open)
-    };
+    let open = |c, side, level| update(c, side, &venue_id(side, level), VenueOrderState::Open);
     assert_eq!(
         reg.apply_update(&open(bid1, Side::Buy, 1), key(10)),
         Routed::Ours(bid1, Applied::Advanced)

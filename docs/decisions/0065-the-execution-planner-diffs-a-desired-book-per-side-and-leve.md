@@ -72,6 +72,19 @@ authorization (0045, 0060) already exist; the planner must go through them, neve
    side are planned as in any state, each place and amend judged by Exit's admission; one
    placed there before Exit that is unmarked, or larger than the position, is left as it is
    for now (FBC-mfcm).
+9. **Consumer tags and removal reasons (FBC-s6fp).** Each `DesiredQuote` carries the
+   consumer's tag (a `u16`) and each side of a `DesiredBook` an optional removal reason (a
+   `u16`). The planner copies a level's tag onto every place and amend it builds for that level
+   (`Planned::tag`), and the side's reason onto every cancel it builds for a level the book no
+   longer wants, absent or wanted at quantity zero (`Planned::removal`), the reason given by the
+   pass that builds the cancel; a cancel of a level still wanted (a replace, a cancel carried
+   through after its acknowledgement, Exit's on the side that adds) carries none, and a cancel's
+   tag is the order's. The registry keeps on each order the tag of the last place or amend and
+   the reason of the last cancel the planner built for it (`OrderRecord::tag`,
+   `OrderRecord::removal`), and the audit sink's verdicts carry both (`AuditEntry::Verdict`;
+   0005's I8), `None` for an event routed to no order of ours or to an order the planner did not
+   place. fbc-oms gives the values no meaning (0001): what a tag or reason names is the
+   consumer's, so a race-fill analysis can split its cancels by reason.
 
 ## Alternatives
 
@@ -87,6 +100,8 @@ authorization (0045, 0060) already exist; the planner must go through them, neve
 - In Exit, leave an order on the adding side to the consumer (an empty book side) or refuse
   its amend and leave it resting: rejected. It can fill and grow the position the owner asked
   to exit, and 0063 assigns its cancel to the planner.
+- Tags and removal reasons as strings or enums fbc-oms defines: rejected. Their meaning is the
+  consumer's (0001), and a `u16` keeps a planned command and an audit verdict `Copy`-sized.
 - Let the planner manage every order on the market, including ones it did not place: rejected.
   Orphans are 0005's I7 and the resync's (0055); the consumer's own orders are the consumer's.
 
