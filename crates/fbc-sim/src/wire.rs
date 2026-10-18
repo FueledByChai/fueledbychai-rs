@@ -200,6 +200,7 @@ const REFUSALS: &[(&str, Refusal)] = &[
     ("no_fee", Refusal::NoFee),
     ("invalid_qty", Refusal::InvalidQty),
     ("invalid_px", Refusal::InvalidPrice),
+    ("no_protection", Refusal::NoProtection),
     (
         "not_amendable",
         Refusal::NotAmendable(NotAmendable::Unsupported),
@@ -233,6 +234,10 @@ pub(crate) enum Command {
     /// A resync (decision 0049): a read of the resting orders and positions, which names no
     /// request id since it awaits no RPC deadline.
     Resync(Sent),
+    /// Cancel-on-disconnect turned on (`true`) or off.
+    Protect(Head, bool),
+    /// A dead-man timer refreshed.
+    Refresh(Head),
 }
 
 /// What every command frame starts with: its request and when it left the client.
@@ -430,7 +435,9 @@ impl Command {
             | Command::Query(Query { head, .. })
             | Command::Batch(head, _)
             | Command::Cancels(head, _)
-            | Command::CancelAll(head, _) => head.sent,
+            | Command::CancelAll(head, _)
+            | Command::Protect(head, _)
+            | Command::Refresh(head) => head.sent,
             Command::Resync(sent) => *sent,
         }
     }
@@ -478,6 +485,8 @@ impl Command {
             Command::Resync(sent) => Writer::new("resync")
                 .field("mono", sent.mono.0)
                 .field("wall", sent.wall.0),
+            Command::Protect(head, on) => Writer::head("protect", *head).flag("on", *on),
+            Command::Refresh(head) => Writer::head("refresh", *head),
         }
         .finish()
     }
@@ -528,6 +537,8 @@ impl Command {
                 vid: r.opt("qvid").map(str::to_owned),
                 cid: r.opt("qcid").map(str::to_owned),
             })),
+            "protect" => single(Command::Protect(head, r.flag("on")?)),
+            "refresh" => single(Command::Refresh(head)),
             _ => Err(WireError("kind")),
         }
     }
@@ -562,6 +573,10 @@ pub(crate) enum Refusal {
     InvalidPrice,
     /// An amend the stood-in venue's amend capabilities do not allow.
     NotAmendable(NotAmendable),
+    /// A protection command the stood-in venue does not take (cancel-on-disconnect on a venue
+    /// with none, a dead-man refresh on one with no dead-man timer), or a refresh with no timer
+    /// running.
+    NoProtection,
 }
 
 impl Refusal {
@@ -574,7 +589,10 @@ impl Refusal {
             Refusal::InvalidQty => RejectKind::InvalidQty,
             Refusal::InvalidPrice => RejectKind::InvalidPrice,
             Refusal::NotAmendable(why) => RejectKind::NotAmendable(why),
-            Refusal::DuplicateClientId | Refusal::NoBook | Refusal::NoFee => RejectKind::Other,
+            Refusal::DuplicateClientId
+            | Refusal::NoBook
+            | Refusal::NoFee
+            | Refusal::NoProtection => RejectKind::Other,
         }
     }
 
@@ -621,7 +639,7 @@ pub(crate) enum Reply {
         rpc: u64,
         items: Vec<ItemResult>,
     },
-    /// A request of no items accepted whole: a cancel-all.
+    /// A request of no items accepted whole: a cancel-all, or a protection command.
     Done {
         rpc: u64,
     },

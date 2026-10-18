@@ -39,9 +39,15 @@ use crate::wire::{
 /// (owner decision A). It refuses RPI orders, which the engine cannot fill yet (FBC-njk,
 /// decision 0046), amends for a venue that gives the amended order a new venue id (FBC-kodq),
 /// and placements and amends for a venue whose events the engine cannot say yet: two-phase
-/// acknowledgement (FBC-zr1), a venue with a speed bump (FBC-7y8), one whose fills replay on
-/// reconnect (FBC-3q6), or one that cancels orders on a disconnect, which the simulated stream
-/// never has (FBC-fji). Cancels and queries still go.
+/// acknowledgement (FBC-zr1), a venue with a speed bump (FBC-7y8), or one whose fills replay on
+/// reconnect (FBC-3q6). Cancels and queries still go.
+///
+/// A venue that cancels on disconnect (FBC-fji) is placed through like any other: the engine
+/// ends what the venue would when the simulated stream closes or a dead-man timer lapses. The
+/// codec writes `ArmCancelOnDisconnect` for a venue whose `cancel_on_disconnect` is
+/// `PerConnection` or `DeadMan`, and `RefreshDeadMan` for a `DeadMan` one, each a control frame
+/// naming no instrument, answered as one outcome for the whole request; it refuses them
+/// (`Unsupported`) for any other.
 ///
 /// Each event is ordered as the stood-in venue's [`OrderingKey`] says (decision 0050): by the
 /// engine's sequence number, by the instant the venue acted as its timestamp or block time, or
@@ -58,6 +64,8 @@ pub struct SimCodec {
     caps: OrderCaps,
     fills: FillCaps,
     ordering: OrderingKey,
+    /// What the stood-in venue cancels on a disconnect: which protection commands it takes.
+    cancel_on_disconnect: CancelOnDisconnect,
     stream: StreamId,
     rpc_timeout: Duration,
     /// The wall time of the resync asked for and not answered yet.
@@ -72,6 +80,7 @@ impl SimCodec {
             caps: config.exec.order.clone(),
             fills: config.exec.fills,
             ordering: config.exec.order.ordering_key,
+            cancel_on_disconnect: config.exec.order.cancel_on_disconnect,
             stream: config.stream,
             rpc_timeout: config.rpc_timeout,
             resync_at: None,
@@ -262,6 +271,20 @@ impl SimCodec {
                 };
                 (Command::Query(query), OpKind::Query, Some(q.inst), 1)
             }
+            // A control frame of the venue's session, naming no instrument.
+            VenueCommand::ArmCancelOnDisconnect(on)
+                if self.cancel_on_disconnect != CancelOnDisconnect::None =>
+            {
+                (Command::Protect(head, *on), OpKind::Control, None, 1)
+            }
+            VenueCommand::RefreshDeadMan
+                if matches!(
+                    self.cancel_on_disconnect,
+                    CancelOnDisconnect::DeadMan { .. }
+                ) =>
+            {
+                (Command::Refresh(head), OpKind::Control, None, 1)
+            }
             _ => return Err(Unsupported),
         })
     }
@@ -436,16 +459,15 @@ fn shared(mut insts: impl Iterator<Item = InstrumentId>) -> Option<InstrumentId>
 
 /// Whether the engine answers as the venue `exec` and `matching` describe: it delays no
 /// command past its latency (Codex r4184245574; FBC-7y8), it acknowledges in one phase
-/// (Codex r4182678509; FBC-zr1), never replays a fill on reconnect (Codex r4184546713;
-/// FBC-3q6), and leaves orders resting across a disconnect, which the simulated stream has no
-/// notion of (Codex r4184778435; FBC-fji). Every ordering key, realized values on fills and
-/// fills derived from order status it answers as the venue would (FBC-938, decision 0050).
-/// Placements for any other venue are refused rather than answered with events unlike its own.
+/// (Codex r4182678509; FBC-zr1), and never replays a fill on reconnect (Codex r4184546713;
+/// FBC-3q6). Every ordering key, realized values on fills and fills derived from order status
+/// (FBC-938, decision 0050), and every cancel-on-disconnect (Codex r4184778435; FBC-fji), it
+/// answers as the venue would. Placements for any other venue are refused rather than
+/// answered with events unlike its own.
 fn modelled(exec: &ExecCaps, matching: &MatchingCaps) -> bool {
     matching.speed_bump.is_none()
         && exec.order.ack == AckModel::SinglePhase
         && !exec.fills.replays_fills_on_reconnect
-        && exec.order.cancel_on_disconnect == CancelOnDisconnect::None
 }
 
 /// An amount of `asset` a fill carries, where the stood-in venue's fills `report` it.

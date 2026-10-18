@@ -8,10 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use fbc_book::{BookError, Books, L2Book};
 use fbc_core::{
-    AccountKey, Aggressor, AmendCaps, AmendQty, AssetSym, BookId, BookSide, CancelReason, Channel,
-    Envelope, FeeBook, FeeKey, FillSource, InstrumentId, Liquidity, Lots, MdEvent, MonoNs,
-    NotAmendable, Side, SpecTable, StpScope, TerminalHint, Ticks, TifTag, VenueFeeSign,
-    VenueOrderId, WallNs,
+    AccountKey, Aggressor, AmendCaps, AmendQty, AssetSym, BookId, BookSide, CancelOnDisconnect,
+    CancelReason, Channel, Envelope, FeeBook, FeeKey, FillSource, InstrumentId, Liquidity, Lots,
+    MdEvent, MonoNs, NotAmendable, Side, SpecTable, StpScope, TerminalHint, Ticks, TifTag,
+    VenueFeeSign, VenueOrderId, WallNs,
 };
 
 use crate::config::{SimConfig, SimLatency};
@@ -46,6 +46,11 @@ pub enum SimError {
     Queue(QueueError),
     /// A withdrawal naming no order the engine holds as injected.
     NotInjected(OrderKey),
+    /// An order-entry frame, or a close, while the simulated stream is closed; nothing was
+    /// scheduled.
+    StreamClosed,
+    /// An open while the simulated stream is open.
+    StreamOpen,
 }
 
 impl fmt::Display for SimError {
@@ -58,6 +63,8 @@ impl fmt::Display for SimError {
             }
             SimError::Queue(e) => write!(f, "injected order: {e}"),
             SimError::NotInjected(key) => write!(f, "order {} is not injected", key.0),
+            SimError::StreamClosed => f.write_str("the simulated order-entry stream is closed"),
+            SimError::StreamOpen => f.write_str("the simulated order-entry stream is already open"),
         }
     }
 }
@@ -104,6 +111,10 @@ struct Resting {
     cum: Lots,
     post_only: bool,
     reduce_only: bool,
+    /// Whether a per-connection venue cancels it when the simulated stream closes: it was
+    /// placed while the protection was on, or was open when an arm the venue says covers the
+    /// orders already open was accepted (FBC-fji).
+    guarded: bool,
 }
 
 /// An order the venue ended, as a query reports it: its last values, its price (`None` for a
@@ -247,6 +258,22 @@ impl Item {
 ///   (`no_fee`); a resting order a trade would fill without a rate is cancelled by the venue
 ///   instead, and the trade's size it would have taken goes to the orders behind it. An
 ///   injected order's fills need no fee.
+/// - The simulated stream is closed until the host [opens](SimEngine::open) it, and takes no
+///   frame while closed. A [close](SimEngine::close) loses every frame still in flight on it:
+///   it never reaches the venue and is never answered. Where the stood-in venue cancels per
+///   connection, an accepted `ArmCancelOnDisconnect(true)` protects the orders placed after it
+///   (and, where the venue says an arm covers the orders already open, those open then), and
+///   the close cancels each of them (`Venue`), answered `to_client` after it; turning it off
+///   leaves every order resting. Where the protection lapses with the connection
+///   (`rearm_on_reconnect`), nothing placed on the next is protected until it is asked for
+///   again; otherwise it covers every later connection until turned off. A dead-man venue's
+///   arm starts a timer of its `max_ttl` (the longest it accepts, since `RefreshDeadMan` names
+///   no length), each `RefreshDeadMan` restarts it, and turning it off stops it; unrefreshed
+///   for that long it lapses, after every command that arrived by then and before anything
+///   stamped after it, and the venue cancels every order SimVenue holds (`Venue`). A close
+///   alone cancels nothing there. A protection command the venue does not take, or a refresh
+///   with no timer running, is refused (`no_protection`). Injected orders are another
+///   process's, and never end on SimVenue's protection.
 #[derive(Clone, Debug)]
 pub struct SimEngine {
     fee_sign: VenueFeeSign,
@@ -265,6 +292,14 @@ pub struct SimEngine {
     injected: BTreeMap<u64, Injected>,
     injected_fills: Vec<SimFill>,
     in_flight: BTreeMap<(MonoNs, u64), (WallNs, Command)>,
+    /// What the stood-in venue cancels when the simulated stream closes or its timer lapses.
+    cancel_on_disconnect: CancelOnDisconnect,
+    /// Whether the simulated stream is open.
+    open: bool,
+    /// Whether a per-connection venue protects the orders placed now.
+    protected: bool,
+    /// When a dead-man venue's timer lapses, while it runs.
+    dead_man: Option<At>,
     /// Public size a level lost to trades printed at it, and to injected orders withdrawn from
     /// it, since it last changed, by (instrument, bid side, price).
     traded: BTreeMap<(InstrumentId, bool, Ticks), Lots>,
@@ -309,6 +344,10 @@ impl SimEngine {
             injected: BTreeMap::new(),
             injected_fills: Vec::new(),
             in_flight: BTreeMap::new(),
+            cancel_on_disconnect: config.exec.order.cancel_on_disconnect,
+            open: false,
+            protected: false,
+            dead_man: None,
             traded: BTreeMap::new(),
             depleted: BTreeMap::new(),
             prevents_self_trade: config.matching.stp_scope != StpScope::None,
@@ -323,10 +362,14 @@ impl SimEngine {
     }
 
     /// A frame the codec wrote: the command acts at its encode time plus
-    /// [`SimLatency::to_venue`]. Refused, scheduling nothing, when it cannot be read.
+    /// [`SimLatency::to_venue`]. Refused, scheduling nothing, when it cannot be read, or while
+    /// the simulated stream is closed.
     pub fn on_order_frame(&mut self, frame: &[u8]) -> Result<(), SimError> {
         let command =
             Command::decode(frame).map_err(|WireError(what)| SimError::Malformed(what))?;
+        if !self.open {
+            return Err(SimError::StreamClosed);
+        }
         let sent = command.sent();
         let mono = sent.mono + self.latency.to_venue;
         let wall = after(sent.wall, self.latency.to_venue);
@@ -371,42 +414,156 @@ impl SimEngine {
         }
     }
 
-    /// Acts on every command that arrived by `now`, a stamp the host read (decision 0046).
+    /// Acts on every command that arrived by `now`, a stamp the host read (decision 0046), and
+    /// lapses a dead-man timer due by then, after the commands that arrived by its instant.
     pub fn advance(&mut self, now: MonoNs) {
-        while let Some(entry) = self.in_flight.first_entry() {
+        loop {
+            let next = self.in_flight.keys().next().map(|&(mono, _)| mono);
+            let lapse = self.dead_man.filter(|due| due.mono <= now);
+            if let Some(due) = lapse.filter(|due| next.is_none_or(|mono| mono > due.mono)) {
+                self.lapse(due);
+                continue;
+            }
+            let Some(entry) = self.in_flight.first_entry() else {
+                break;
+            };
             let (mono, _) = *entry.key();
             if mono > now {
                 break;
             }
             let (wall, command) = entry.remove();
-            let at = At { mono, wall };
-            match command {
-                Command::Place(p) => {
-                    let rpc = p.rpc;
-                    let item = self.place(p, at);
-                    self.answer_item(rpc, item, at);
-                }
-                Command::Batch(head, places) => {
-                    let items = places.into_iter().map(|p| self.place(p, at)).collect();
-                    self.answer_items(head.rpc, items, at);
-                }
-                Command::Amend(a) => {
-                    let rpc = a.head.rpc;
-                    let item = self.amend(a, at);
-                    self.answer_item(rpc, item, at);
-                }
-                Command::Cancel(c) => {
-                    let item = self.cancel(&c.target);
-                    self.answer_item(c.rpc, item, at);
-                }
-                Command::Cancels(head, targets) => {
-                    let items = targets.iter().map(|t| self.cancel(t)).collect();
-                    self.answer_items(head.rpc, items, at);
-                }
-                Command::CancelAll(head, inst) => self.cancel_all(head.rpc, inst, at),
-                Command::Query(q) => self.query(q, at),
-                Command::Resync(sent) => self.resync(sent.wall, at),
+            self.act(command, At { mono, wall });
+        }
+    }
+
+    /// The simulated stream opens at `now`, a stamp the host read: what was due by then acts
+    /// first, and the engine takes frames again. Refused while it is open.
+    pub fn open(&mut self, now: MonoNs) -> Result<(), SimError> {
+        if self.open {
+            return Err(SimError::StreamOpen);
+        }
+        self.advance(now);
+        self.open = true;
+        Ok(())
+    }
+
+    /// The simulated stream closes at `now` (`wall` on the host's wall clock): the commands
+    /// that arrived by then act first, and every frame still in flight on it is lost. Where
+    /// the stood-in venue cancels per connection, every order its protection covers is
+    /// cancelled by the venue, and a protection that lapses with the connection ends. Refused
+    /// while it is closed.
+    pub fn close(&mut self, now: MonoNs, wall: WallNs) -> Result<(), SimError> {
+        if !self.open {
+            return Err(SimError::StreamClosed);
+        }
+        self.advance(now);
+        self.open = false;
+        // Every frame in flight was written on this connection: the engine takes none while
+        // the stream is closed, and the last close lost those of the connection before.
+        self.in_flight.clear();
+        if let CancelOnDisconnect::PerConnection {
+            rearm_on_reconnect, ..
+        } = self.cancel_on_disconnect
+        {
+            let at = At { mono: now, wall };
+            self.end_all(at, SimState::Canceled(CancelReason::Venue), |o| o.guarded);
+            if rearm_on_reconnect {
+                self.protected = false;
             }
+        }
+        Ok(())
+    }
+
+    /// Acts on `command`, arrived at `at`.
+    fn act(&mut self, command: Command, at: At) {
+        match command {
+            Command::Place(p) => {
+                let rpc = p.rpc;
+                let item = self.place(p, at);
+                self.answer_item(rpc, item, at);
+            }
+            Command::Batch(head, places) => {
+                let items = places.into_iter().map(|p| self.place(p, at)).collect();
+                self.answer_items(head.rpc, items, at);
+            }
+            Command::Amend(a) => {
+                let rpc = a.head.rpc;
+                let item = self.amend(a, at);
+                self.answer_item(rpc, item, at);
+            }
+            Command::Cancel(c) => {
+                let item = self.cancel(&c.target);
+                self.answer_item(c.rpc, item, at);
+            }
+            Command::Cancels(head, targets) => {
+                let items = targets.iter().map(|t| self.cancel(t)).collect();
+                self.answer_items(head.rpc, items, at);
+            }
+            Command::CancelAll(head, inst) => self.cancel_all(head.rpc, inst, at),
+            Command::Query(q) => self.query(q, at),
+            Command::Resync(sent) => self.resync(sent.wall, at),
+            Command::Protect(head, on) => self.protect(head.rpc, on, at),
+            Command::Refresh(head) => self.refresh(head.rpc, at),
+        }
+    }
+
+    /// Turns the stood-in venue's cancel-on-disconnect on or off, as request `rpc`.
+    fn protect(&mut self, rpc: u64, on: bool, at: At) {
+        let reply = match self.cancel_on_disconnect {
+            CancelOnDisconnect::None => Reply::Rejected {
+                rpc,
+                refusal: Refusal::NoProtection,
+            },
+            CancelOnDisconnect::PerConnection {
+                covers_open_orders, ..
+            } => {
+                self.protected = on;
+                for order in self.live.values_mut() {
+                    // Off, it covers nothing; on, the orders open now only where the venue
+                    // says an arm covers them.
+                    order.guarded = on && (order.guarded || covers_open_orders);
+                }
+                Reply::Done { rpc }
+            }
+            CancelOnDisconnect::DeadMan { max_ttl } => {
+                self.dead_man = on.then(|| due(at, max_ttl));
+                Reply::Done { rpc }
+            }
+        };
+        self.answer(at, reply);
+    }
+
+    /// Restarts a dead-man venue's running timer, as request `rpc`.
+    fn refresh(&mut self, rpc: u64, at: At) {
+        let reply = match (self.cancel_on_disconnect, self.dead_man) {
+            (CancelOnDisconnect::DeadMan { max_ttl }, Some(_)) => {
+                self.dead_man = Some(due(at, max_ttl));
+                Reply::Done { rpc }
+            }
+            _ => Reply::Rejected {
+                rpc,
+                refusal: Refusal::NoProtection,
+            },
+        };
+        self.answer(at, reply);
+    }
+
+    /// A dead-man venue's timer lapsed at `at`: the venue cancels every order SimVenue holds.
+    fn lapse(&mut self, at: At) {
+        self.dead_man = None;
+        self.end_all(at, SimState::Canceled(CancelReason::Venue), |_| true);
+    }
+
+    /// Ends, as `state`, every resting order SimVenue placed that `covered` takes, each
+    /// answered at `at` in the order the venue placed them.
+    fn end_all(&mut self, at: At, state: SimState, covered: impl Fn(&Resting) -> bool) {
+        let (ended, rest): (BTreeMap<_, _>, _) = core::mem::take(&mut self.live)
+            .into_iter()
+            .partition(|(_, o)| covered(o));
+        self.live = rest;
+        for (n, order) in ended {
+            let event = self.end(n, order, state);
+            self.answer(at, event);
         }
     }
 
@@ -896,6 +1053,7 @@ impl SimEngine {
             cum: Lots::ZERO,
             post_only: p.post_only,
             reduce_only: p.reduce_only,
+            guarded: self.protected,
         };
         let events = self.commit(n, order, p.px, taken);
         Item::accepted(p.cid, n, events)
@@ -1145,15 +1303,9 @@ impl SimEngine {
     /// Ends every resting order SimVenue placed on `inst`, and nothing else (an instrument
     /// cancel-all is never widened to the account, and injected orders are not SimVenue's).
     fn cancel_all(&mut self, rpc: u64, inst: InstrumentId, at: At) {
-        let (covered, rest): (BTreeMap<_, _>, _) = core::mem::take(&mut self.live)
-            .into_iter()
-            .partition(|(_, o)| o.inst == inst);
-        self.live = rest;
         self.answer(at, Reply::Done { rpc });
-        for (n, order) in covered {
-            let event = self.end(n, order, SimState::Canceled(CancelReason::Requested));
-            self.answer(at, event);
-        }
+        let state = SimState::Canceled(CancelReason::Requested);
+        self.end_all(at, state, |o| o.inst == inst);
     }
 
     fn query(&mut self, q: Query, at: At) {
@@ -1609,6 +1761,14 @@ fn order_event(order: &Resting, vid: &str, state: SimState, px: Option<Ticks>) -
 }
 
 /// `wall` plus `d`, saturating.
+/// The instant `ttl` after `at`, on both clocks.
+fn due(at: At, ttl: Duration) -> At {
+    At {
+        mono: at.mono + ttl,
+        wall: after(at.wall, ttl),
+    }
+}
+
 fn after(wall: WallNs, d: Duration) -> WallNs {
     let nanos = i64::try_from(d.as_nanos()).unwrap_or(i64::MAX);
     WallNs(wall.0.saturating_add(nanos))
