@@ -311,7 +311,16 @@ impl Venue {
     /// The venue with its simulated stream open, as the host opens it before writing a frame.
     fn opened(mut self) -> Venue {
         self.engine.open(MonoNs(0)).unwrap();
+        self.codec_opened(0);
         self
+    }
+
+    /// The codec told its stream opened at `mono`, as the runtime tells it on every epoch: the
+    /// simulated stream asks no authentication, so it writes nothing.
+    fn codec_opened(&mut self, mono: u64) {
+        let mut fx = Effects::new();
+        self.codec.on_open(STREAM, &Venue::ctx(mono), &mut fx);
+        assert!(fx.is_empty(), "{fx:?}");
     }
 
     fn ctx(mono: u64) -> EncodeCtx {
@@ -2384,9 +2393,10 @@ impl Venue {
         self.engine.close(MonoNs(mono), wall).unwrap();
     }
 
-    /// The simulated stream opens again at `mono`.
+    /// The simulated stream opens again at `mono`, and the codec is told so on the new epoch.
     fn open(&mut self, mono: u64) {
         self.engine.open(MonoNs(mono)).unwrap();
+        self.codec_opened(mono);
     }
 
     /// Sends a protection command `cmd` as `rpc` at `at`, lets it act, and checks the venue
@@ -4274,6 +4284,86 @@ fn a_resync_with_nothing_resting_or_filled_is_its_begin_and_end_and_one_at_a_tim
     assert_eq!(v.resync(again).as_slice().len(), 1);
     v.tick(again + 10 * MS);
     assert_eq!(v.frames()[0].1, [begin(again), ExecEvent::ResyncEnd]);
+}
+
+#[test]
+fn a_resync_lost_at_a_close_is_asked_again_on_the_next_connection() {
+    // Reviewer A and B1 on PR #162: a resync frame still in flight when its stream closes
+    // never reaches the venue, so its answer never comes; the next connection's resync must
+    // still be asked, or the session stays gated after that reconnect.
+    for venue in [
+        Venue::new(Bracket::Middle),
+        per_connection(true, false),
+        dead_man(),
+    ] {
+        let mut v = venue;
+        assert_eq!(v.resync(T0).as_slice().len(), 1);
+        v.close(T0 + MS);
+        v.open(T0 + 2 * MS);
+        v.tick(T0 + 10 * MS);
+        assert!(v.frames().is_empty());
+        let again = T0 + 20 * MS;
+        assert_eq!(v.resync(again).as_slice().len(), 1);
+        v.tick(again + 10 * MS);
+        let got = v.frames();
+        let begin = ExecEvent::ResyncBegin {
+            watermark: WallNs(WALL0 + again as i64),
+        };
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].1, [begin, ExecEvent::ResyncEnd]);
+    }
+}
+
+#[test]
+fn a_resync_answer_from_an_earlier_connection_is_dropped_and_the_next_one_still_reads() {
+    // A resync that reached the venue before the close is answered after it, and the host
+    // delivers that answer on the next connection (0097). Its snapshot predates the close, as
+    // a real stream would have lost it: the codec drops it, reporting nothing and no error,
+    // and the resync asked on the new connection is still the one it waits for.
+    let mut v = per_connection(true, false);
+    v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+    v.protect(ARM, 1, T0);
+    let vid = v.rest(limit(cid(), Side::Buy, 199, 1), 2, T0 + 10 * MS);
+    let old = T0 + 20 * MS;
+    assert_eq!(v.resync(old).as_slice().len(), 1);
+    // The resync acts at old + 5 ms, its answer due at old + 8 ms; the close comes between.
+    v.tick(old + 6 * MS);
+    v.close(old + 7 * MS);
+    v.open(old + 9 * MS);
+    let stale = v.engine.take_answers();
+    // The resync's answer, then the venue's cancel at the close.
+    assert_eq!(stale.len(), 2, "{stale:?}");
+    // Delivered before the new connection asks: dropped.
+    assert_eq!(v.decode(&stale[0].frame), Ok(Vec::new()));
+    let got = v.decode(&stale[1].frame).unwrap();
+    assert!(
+        matches!(
+            &got[..],
+            [(_, ExecEvent::Order(o))] if o.vid.as_ref() == Some(&vid)
+                && o.state == VenueOrderState::Canceled(CancelReason::Venue)
+        ),
+        "{got:?}"
+    );
+    // Delivered after it asks: dropped too, and the new one still reads.
+    let again = old + 10 * MS;
+    assert_eq!(v.resync(again).as_slice().len(), 1);
+    assert_eq!(v.decode(&stale[0].frame), Ok(Vec::new()));
+    // While it is unanswered another call asks nothing.
+    assert!(v.resync(again + MS).is_empty());
+    v.tick(again + 10 * MS);
+    let got = v.frames();
+    let begin = ExecEvent::ResyncBegin {
+        watermark: WallNs(WALL0 + again as i64),
+    };
+    // The order the venue cancelled is not resting.
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].1, [begin, ExecEvent::ResyncEnd]);
+    // An answer naming a request after the open that nobody asked for is still refused.
+    let unasked = format!("resync|seq=9|wm={}", WALL0 + (again + MS) as i64);
+    assert_eq!(
+        v.decode(unasked.as_bytes()),
+        Err(DecodeError::Malformed("no resync asked for"))
+    );
 }
 
 #[test]
