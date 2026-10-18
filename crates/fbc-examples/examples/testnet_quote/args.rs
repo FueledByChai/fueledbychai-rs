@@ -32,6 +32,16 @@ pub const MAINNET_OFFSET_MIN: u32 = 20;
 /// "Warn once, Stop on repeat"). No flag changes it; [`Options::cancel_window`] carries it.
 pub const CANCEL_NOT_OURS_WINDOW: Duration = Duration::from_secs(30);
 
+/// The longest `--interval-ms` a mainnet run takes with the cancel-not-ours window `window`:
+/// two thirds of it (20000 ms of the owner's 30 s; RB-aoh5-7 on PR #159). The loop requotes a
+/// side another program cancelled only on the next cycle, so a co-tenant cancelling every quote
+/// makes one event per cycle, an interval plus the cycle's reads plus its own period (Java's
+/// 3 s reconcile) apart: at a longer interval each event would fall past the window and only
+/// warn. The other third is left for the reads and the reconcile.
+pub fn mainnet_interval_max(window: Duration) -> Duration {
+    window * 2 / 3
+}
+
 /// The help text `--help` prints.
 pub const USAGE: &str = "\
 testnet_quote: a PLUMBING TEST, NOT A STRATEGY. On one Paradex TESTNET market it keeps one
@@ -97,7 +107,8 @@ Options:
                             (MAINNET MODE below); without it the run is testnet only
   --cycles <N>              Stop after N requote cycles, 1 to 1000000 (default: none, the
                             duration alone ends the run)
-  --interval-ms <MS>        the pause between requote cycles, 100 to 60000 (default 1000)
+  --interval-ms <MS>        the pause between requote cycles, 100 to 60000 (default 1000;
+                            at most 20000 with --mainnet)
   --step-timeout <SECONDS>  how long each awaited step (the login, the arm, the resync, a
                             book settling, a Stop cancel) may take before the run Stops, 1 to
                             120 (default 15)
@@ -132,6 +143,9 @@ same loop, with these limits, each checked before anything connects:
   - --resting-cap-usd at most 11 and --inventory-cap-usd at most 50 (smaller are taken);
   - --bid-bps and --ask-bps at least 20;
   - --duration at most 3600 (one hour);
+  - --interval-ms at most 20000, two thirds of the 30 s window for a cancel not ours (below):
+    the loop requotes a cancelled side on the next cycle, so a longer pause would put each of
+    a co-tenant's cancels past the window of the one before, and it would never Stop;
   - the venue's snapshot source trustworthy (Paradex's is, decision 0094): the resync seeds
     the market's position, and a mainnet market is never seeded by hand, so a resync that
     seeds nothing refuses Start;
@@ -418,7 +432,8 @@ pub fn confirmed(opts: &Options) -> Result<bool, String> {
 
 /// With `--mainnet`, the owner's limits for a supervised mainnet session (FBC-tyft): caps of at
 /// most $11 resting per side and $50 inventory ([`within_mainnet_caps`]), offsets of at least
-/// [`MAINNET_OFFSET_MIN`] basis points on both sides, and a `--duration` of at most
+/// [`MAINNET_OFFSET_MIN`] basis points on both sides, an `--interval-ms` of at most
+/// [`mainnet_interval_max`] of the window, and a `--duration` of at most
 /// [`MAINNET_DURATION_MAX`] seconds. A testnet run has none of them.
 pub fn mainnet_limits(opts: &Options) -> Result<(), String> {
     if !opts.mainnet {
@@ -432,6 +447,16 @@ pub fn mainnet_limits(opts: &Options) -> Result<(), String> {
                  points from the touch on mainnet"
             ));
         }
+    }
+    let interval_max = mainnet_interval_max(opts.cancel_window).as_millis();
+    if u128::from(opts.interval_ms) > interval_max {
+        return Err(format!(
+            "--interval-ms {} is above the mainnet maximum: at most {interval_max} ms on \
+             mainnet, so another program cancelling every quote is Stopped on its second \
+             cancel within the {} ms window",
+            opts.interval_ms,
+            opts.cancel_window.as_millis()
+        ));
     }
     if opts.duration_secs > MAINNET_DURATION_MAX {
         return Err(format!(
