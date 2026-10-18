@@ -134,6 +134,19 @@ impl IngestClock {
         self.handling.get()
     }
 
+    /// Calls `f` with the input stamped `stamp` named as the one being handled, then names the
+    /// one named before again, even when `f` panics.
+    pub(crate) fn attributing<R>(&self, stamp: Stamp, f: impl FnOnce() -> R) -> R {
+        struct Restore<'a>(&'a Cell<Option<Stamp>>, Option<Stamp>);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.1);
+            }
+        }
+        let _restore = Restore(&self.handling, self.handling.replace(Some(stamp)));
+        f()
+    }
+
     /// No input is being handled: the session waits for the next, or the shard host decides.
     pub(crate) fn handled(&self) {
         self.handling.set(None);
@@ -1161,16 +1174,22 @@ mod tests {
     }
 
     #[test]
-    fn a_clock_keeps_the_stamp_of_the_input_being_handled_until_it_is_handled() {
+    /// Decision 0100, Codex P2 r4309119905 on PR #164: the clock names an input as handled only
+    /// while a handler is called with its events, whichever clone the call goes through; a
+    /// stamp alone, or a session waiting between an input's events and its effects, names none.
+    fn a_clock_names_the_input_being_handled_only_while_its_events_are_handed_on() {
         let clock = IngestClock::new();
         let shared = clock.clone();
         let conn = ConnKey { conn: 1, epoch: 0 };
         assert_eq!((clock.handling(), clock.next_seq()), (None, 0));
         let first = clock.stamp(conn, None);
-        assert_eq!((shared.handling(), shared.next_seq()), (Some(first), 1));
+        assert_eq!((shared.handling(), shared.next_seq()), (None, 1));
         let second = shared.stamp(conn, Some(KernelRxNs(5)));
-        assert_eq!(clock.handling(), Some(second));
-        shared.handled();
+        let seen = clock.attributing(first, || {
+            let inner = shared.attributing(second, || clock.handling());
+            (inner, shared.handling())
+        });
+        assert_eq!(seen, (Some(second), Some(first)));
         assert_eq!((clock.handling(), clock.next_seq()), (None, 2));
     }
 

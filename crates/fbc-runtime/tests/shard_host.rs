@@ -721,7 +721,8 @@ async fn a_ladder_command_whose_session_ended_or_that_the_runs_end_left_is_hande
         assert!(decided());
         assert!(watch.borrow().contains(&vec![InstrumentId::new(1)]));
         assert_eq!(back.borrow().len(), 1);
-        // Every member ends: the rest of the ladder goes back.
+        // Every member ends: the rest of the ladder goes back, and so does the command the
+        // session never took, withdrawn from it (Codex P1 r4309119897 on PR #164).
         drop(md_control);
         peer
     };
@@ -734,14 +735,39 @@ async fn a_ladder_command_whose_session_ended_or_that_the_runs_end_left_is_hande
             back[..],
             [
                 Unsubmitted::Control(ControlCommand::FeeQuery),
+                Unsubmitted::Control(ControlCommand::RefreshDeadMan),
                 Unsubmitted::Authorized(_)
             ]
         ),
         "{back:?}"
     );
-    assert_eq!(host.unsubmitted(), 2);
+    assert_eq!(host.unsubmitted(), 3);
     assert_eq!(
         u64::try_from(decide.passes.borrow().len()).unwrap(),
         host.passes()
     );
+}
+
+/// Codex P1 r4309119903 on PR #164: the host's drain and its poll between two commands yield to
+/// the runtime so that its I/O driver is polled before the host resumes. tokio is pinned exactly
+/// (decision 0019), and its `yield_now` hands the task's waker to the scheduler, which wakes it
+/// only once it has run out of ready tasks and polled the driver; this pins that, so a tokio
+/// that stops doing it fails here rather than leaving a delivered frame unread between commands.
+#[tokio::test]
+async fn one_yield_to_the_runtime_polls_the_io_driver_before_the_task_resumes() {
+    use std::io::ErrorKind::WouldBlock;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    peer.set_nodelay(true).unwrap();
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut buf = [0u8; 8];
+    // Nothing to read: tokio holds the stream not readable.
+    assert_eq!(stream.try_read(&mut buf).unwrap_err().kind(), WouldBlock);
+    let mut delivered = Delivered::new();
+    peer.write_all(b"frame").unwrap();
+    delivered.pass();
+    // Delivered to the socket, but unseen until the driver is polled.
+    assert_eq!(stream.try_read(&mut buf).unwrap_err().kind(), WouldBlock);
+    tokio::task::yield_now().await;
+    assert_eq!(stream.try_read(&mut buf).unwrap(), 5);
 }
