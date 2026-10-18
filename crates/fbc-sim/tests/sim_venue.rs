@@ -25,6 +25,13 @@
 //! as the stood-in venue's STP scope says, and a second crossing order before the next book
 //! update (or a later item of one batch) finds only what the first left at each displayed
 //! level (decision 0051).
+//!
+//! FBC-fji's done line: a venue that cancels on disconnect is placed through the codec, not
+//! refused. Per connection, the stream's close cancels (CancelReason::Venue) the orders placed
+//! on it behind its protection, which no later trade then fills; where the protection lapses
+//! with the connection, nothing placed on the next one is protected until it is asked for
+//! again. A dead-man venue cancels every order once its timer lapses unrefreshed, and none
+//! while it is refreshed in time.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
@@ -298,6 +305,13 @@ impl Venue {
             ingest: 0,
             frames: Vec::new(),
         }
+        .opened()
+    }
+
+    /// The venue with its simulated stream open, as the host opens it before writing a frame.
+    fn opened(mut self) -> Venue {
+        self.engine.open(MonoNs(0)).unwrap();
+        self
     }
 
     fn ctx(mono: u64) -> EncodeCtx {
@@ -2093,6 +2107,7 @@ fn an_engine_without_the_instruments_spec_places_nothing() {
     let mut bare = config(Bracket::Optimistic, VenueFeeSign::PositiveIsRebate, fees());
     bare.specs = SpecTable::new();
     v.engine = SimEngine::new(&bare);
+    v.engine.open(MonoNs(0)).unwrap();
     v.snapshot(T0, &[(199, 6)], &[(201, 5)]);
     v.send(limit(cid(), Side::Buy, 199, 2), 1, T0);
     v.tick(T0 + 5 * MS);
@@ -2336,32 +2351,471 @@ fn a_zero_size_trade_through_a_level_explains_nothing_there() {
     );
 }
 
-#[test]
-fn a_venue_that_cancels_on_disconnect_is_not_stood_in_for_yet() {
-    // Codex r4184778435: the simulated stream has no disconnect, so nothing would cancel what
-    // a venue cancels when its connection drops or its dead-man timer lapses; such a venue
-    // gets no placement rather than orders that outlive a disconnect it would end them on
-    // (FBC-fji models the lifecycle). Cancels still go.
-    for on_disconnect in [
-        CancelOnDisconnect::PerConnection {
-            rearm_on_reconnect: false,
-            covers_open_orders: false,
-        },
-        CancelOnDisconnect::PerConnection {
-            rearm_on_reconnect: true,
-            covers_open_orders: false,
-        },
-        CancelOnDisconnect::DeadMan {
-            max_ttl: Duration::from_secs(5),
-        },
-    ] {
-        let mut config = config(Bracket::Optimistic, VenueFeeSign::PositiveIsCost, fees());
-        config.exec.order.cancel_on_disconnect = on_disconnect;
-        let mut v = Venue::with(config);
-        let refused = v.encode(&limit(cid(), Side::Buy, 199, 1), 1, T0);
-        assert_eq!(refused.err(), Some(NotSentReason::Unsupported));
-        assert!(v.encode(&cancel(OrderRef::Client(cid())), 2, T0).is_ok());
+/// A venue standing in for one that cancels on disconnect as `on_disconnect` says.
+fn protected(on_disconnect: CancelOnDisconnect) -> Venue {
+    let mut config = config(Bracket::Optimistic, VenueFeeSign::PositiveIsCost, fees());
+    config.exec.order.cancel_on_disconnect = on_disconnect;
+    Venue::with(config)
+}
+
+fn per_connection(rearm_on_reconnect: bool, covers_open_orders: bool) -> Venue {
+    protected(CancelOnDisconnect::PerConnection {
+        rearm_on_reconnect,
+        covers_open_orders,
+    })
+}
+
+/// The dead-man venue's longest timer, which SimVenue's timer runs from each arm or refresh.
+const TTL: u64 = 100 * MS;
+
+fn dead_man() -> Venue {
+    protected(CancelOnDisconnect::DeadMan {
+        max_ttl: Duration::from_nanos(TTL),
+    })
+}
+
+const ARM: VenueCommand = VenueCommand::ArmCancelOnDisconnect(true);
+const DISARM: VenueCommand = VenueCommand::ArmCancelOnDisconnect(false);
+
+impl Venue {
+    /// The simulated stream closes at `mono`.
+    fn close(&mut self, mono: u64) {
+        let wall = WallNs(WALL0 + mono as i64);
+        self.engine.close(MonoNs(mono), wall).unwrap();
     }
+
+    /// The simulated stream opens again at `mono`.
+    fn open(&mut self, mono: u64) {
+        self.engine.open(MonoNs(mono)).unwrap();
+    }
+
+    /// Sends a protection command `cmd` as `rpc` at `at`, lets it act, and checks the venue
+    /// accepted it as a whole request: one outcome, naming no item.
+    fn protect(&mut self, cmd: VenueCommand, rpc: u64, at: u64) {
+        self.send(cmd, rpc, at);
+        self.tick(at + 5 * MS);
+        let got = self.events();
+        let [
+            (
+                _,
+                ExecEvent::Outcome {
+                    rpc: got_rpc,
+                    item: None,
+                    outcome,
+                },
+            ),
+        ] = got.as_slice()
+        else {
+            panic!("{got:?}")
+        };
+        assert_eq!((got_rpc.0, outcome), (rpc, &ACCEPTED));
+    }
+}
+
+/// The venue ids and client ids of the orders the events show ended by the venue.
+fn venue_canceled(got: &[(MonoNs, ExecEvent)]) -> Vec<(VenueOrderId, Option<CidMatch>)> {
+    let ended = got.iter().filter_map(|(_, ev)| match ev {
+        ExecEvent::Order(o) if o.state == VenueOrderState::Canceled(CancelReason::Venue) => {
+            Some((o.vid.clone().unwrap(), o.cid))
+        }
+        _ => None,
+    });
+    ended.collect()
+}
+
+#[test]
+fn a_per_connection_venue_cancels_what_was_placed_on_its_connection_when_the_stream_closes() {
+    // FBC-fji's done line: the order is placed through the codec, not refused, behind the
+    // protection the connection asked for; the stream's close ends it (Canceled by the venue),
+    // answered after the latency to the client, and a later trade through its price fills
+    // nothing.
+    let mut v = per_connection(true, false);
+    v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+    v.protect(ARM, 1, T0);
+    let order = cid();
+    let vid = v.rest(limit(order, Side::Buy, 199, 2), 2, T0 + 10 * MS);
+    let closed = T0 + 20 * MS;
+    v.close(closed);
+    let got = v.events();
+    assert_eq!(
+        venue_canceled(&got),
+        [(vid.clone(), Some(CidMatch::Ours(order)))],
+        "{got:?}"
+    );
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].0, MonoNs(closed) + TO_CLIENT);
+    assert_eq!(v.engine.queue_position(&vid), None);
+    // A sell of ten through 199 would have filled it behind the five ahead.
+    v.trade(closed + MS, Aggressor::Seller, 199, 10);
+    v.trade(closed + 2 * MS, Aggressor::Seller, 198, 10);
+    let got = v.events();
+    assert!(got.is_empty(), "{got:?}");
+    // Asked about on the next connection, the venue has it as cancelled.
+    v.open(closed + 10 * MS);
+    v.send(cancel(OrderRef::Client(order)), 3, closed + 10 * MS);
+    v.tick(closed + 15 * MS);
+    let got = v.events();
+    assert_eq!(
+        rejected(&got[0].1),
+        Some(RejectKind::AlreadyTerminal(TerminalHint::Canceled)),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn a_rearm_on_reconnect_venue_protects_nothing_after_a_reconnect_until_it_is_asked_again() {
+    // FBC-fji's done line: the arm lapses with its connection. An order placed on the next
+    // connection before an arm outlives that connection's close, and still fills; once the
+    // protection is asked for again, the order placed after it is cancelled at the close.
+    let mut v = per_connection(true, false);
+    v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+    v.protect(ARM, 1, T0);
+    v.close(T0 + 10 * MS);
+    assert!(v.events().is_empty());
+    v.open(T0 + 20 * MS);
+    let bare = cid();
+    let bare_vid = v.rest(limit(bare, Side::Buy, 199, 1), 2, T0 + 21 * MS);
+    v.close(T0 + 30 * MS);
+    let got = v.events();
+    assert!(got.is_empty(), "{got:?}");
+    assert!(v.engine.queue_position(&bare_vid).is_some());
+    v.open(T0 + 40 * MS);
+    v.protect(ARM, 3, T0 + 41 * MS);
+    let armed = cid();
+    let armed_vid = v.rest(limit(armed, Side::Buy, 199, 1), 4, T0 + 47 * MS);
+    v.close(T0 + 60 * MS);
+    let got = v.events();
+    assert_eq!(
+        venue_canceled(&got),
+        [(armed_vid, Some(CidMatch::Ours(armed)))],
+        "{got:?}"
+    );
+    // The order placed before this connection's arm still rests: five ahead, then it fills.
+    v.trade(T0 + 61 * MS, Aggressor::Seller, 199, 6);
+    let got = v.events();
+    let fills: Vec<_> = got.iter().filter_map(|(_, ev)| fill_of(ev)).collect();
+    assert_eq!(fills.len(), 1, "{got:?}");
+    assert_eq!((fills[0].0, fills[0].1), (199, 1));
+    assert_eq!(
+        states(&got),
+        [(VenueOrderState::Filled, 1)],
+        "the order placed unprotected fills: {got:?}"
+    );
+}
+
+#[test]
+fn a_venue_whose_protection_outlives_its_connection_covers_later_connections_once_armed() {
+    // `rearm_on_reconnect: false`: one accepted arm protects the orders placed on every later
+    // connection, with no arm asked for there.
+    let mut v = per_connection(false, false);
+    v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+    v.protect(ARM, 1, T0);
+    v.close(T0 + 10 * MS);
+    v.open(T0 + 20 * MS);
+    let order = cid();
+    let vid = v.rest(limit(order, Side::Buy, 199, 1), 2, T0 + 21 * MS);
+    v.close(T0 + 30 * MS);
+    let got = v.events();
+    assert_eq!(
+        venue_canceled(&got),
+        [(vid, Some(CidMatch::Ours(order)))],
+        "{got:?}"
+    );
+    // Turned off, it protects nothing more: an order placed then outlives the close.
+    v.open(T0 + 40 * MS);
+    v.protect(DISARM, 3, T0 + 41 * MS);
+    let after = v.rest(limit(cid(), Side::Buy, 199, 1), 4, T0 + 47 * MS);
+    v.close(T0 + 60 * MS);
+    assert!(v.events().is_empty());
+    assert!(v.engine.queue_position(&after).is_some());
+}
+
+#[test]
+fn an_arm_covers_the_orders_already_open_only_where_the_venue_says_it_does() {
+    // `covers_open_orders`: an order placed before the arm on the same connection is cancelled
+    // at its close only where the venue declares that an arm covers the orders already open.
+    for covers in [false, true] {
+        let mut v = per_connection(true, covers);
+        v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+        let early = v.rest(limit(cid(), Side::Buy, 199, 1), 1, T0);
+        v.protect(ARM, 2, T0 + 10 * MS);
+        let late = v.rest(limit(cid(), Side::Buy, 199, 1), 3, T0 + 20 * MS);
+        v.close(T0 + 30 * MS);
+        let got = v.events();
+        let ended: Vec<_> = venue_canceled(&got)
+            .into_iter()
+            .map(|(vid, _)| vid)
+            .collect();
+        let expected = if covers {
+            vec![early.clone(), late.clone()]
+        } else {
+            vec![late.clone()]
+        };
+        assert_eq!(ended, expected, "covers {covers}: {got:?}");
+        assert_eq!(v.engine.queue_position(&early).is_some(), !covers);
+    }
+}
+
+#[test]
+fn a_per_connection_venue_with_its_protection_turned_off_cancels_nothing_at_the_close() {
+    let mut v = per_connection(true, false);
+    v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+    v.protect(ARM, 1, T0);
+    let vid = v.rest(limit(cid(), Side::Buy, 199, 1), 2, T0 + 10 * MS);
+    v.protect(DISARM, 3, T0 + 20 * MS);
+    v.close(T0 + 30 * MS);
+    assert!(v.events().is_empty());
+    assert!(v.engine.queue_position(&vid).is_some());
+}
+
+#[test]
+fn a_dead_man_venue_cancels_every_order_once_its_timer_lapses_unrefreshed() {
+    // FBC-fji's done line: refreshed in time, the timer cancels nothing, well past its first
+    // deadline; once refreshes stop (here the stream closes, which by itself cancels nothing),
+    // every order SimVenue holds is cancelled by the venue at the instant the timer lapses,
+    // and a later trade fills none of them.
+    let mut v = dead_man();
+    v.snapshot(T0, &[(199, 5), (198, 5)], &[(201, 5), (202, 5)]);
+    // Placed before the arm: the timer covers everything.
+    let first = v.rest(limit(cid(), Side::Buy, 199, 1), 1, T0);
+    v.protect(ARM, 2, T0 + 10 * MS);
+    let second = v.rest(limit(cid(), Side::Sell, 202, 1), 3, T0 + 20 * MS);
+    // Armed on arrival at T0 + 15 ms: refreshes sent every 50 ms each arrive 5 ms later, so
+    // the timer never runs 100 ms unrefreshed.
+    let mut rpc = 10;
+    let mut at = T0 + 60 * MS;
+    while at <= T0 + 360 * MS {
+        v.protect(VenueCommand::RefreshDeadMan, rpc, at);
+        rpc += 1;
+        at += 50 * MS;
+    }
+    let last = at - 50 * MS + 5 * MS;
+    assert!(
+        last > T0 + 15 * MS + 3 * TTL,
+        "refreshed well past the first deadline"
+    );
+    v.close(last + MS);
+    v.tick(last + TTL - MS);
+    let got = v.events();
+    assert!(got.is_empty(), "{got:?}");
+    assert!(v.engine.queue_position(&first).is_some());
+    assert!(v.engine.queue_position(&second).is_some());
+    // Unrefreshed for the timer's length: both are cancelled at the lapse.
+    v.tick(last + TTL + 10 * MS);
+    let got = v.events();
+    let ended: Vec<_> = venue_canceled(&got)
+        .into_iter()
+        .map(|(vid, _)| vid)
+        .collect();
+    assert_eq!(ended, [first.clone(), second.clone()], "{got:?}");
+    assert!(
+        got.iter()
+            .all(|(due, _)| *due == MonoNs(last + TTL) + TO_CLIENT)
+    );
+    v.trade(last + TTL + 11 * MS, Aggressor::Seller, 198, 20);
+    v.trade(last + TTL + 12 * MS, Aggressor::Buyer, 202, 20);
+    let got = v.events();
+    assert!(got.is_empty(), "{got:?}");
+}
+
+#[test]
+fn a_dead_man_timer_lapses_before_a_trade_stamped_after_it() {
+    // The lapse acts at its instant, before any envelope stamped after it: a trade after the
+    // deadline finds the order gone.
+    let mut v = dead_man();
+    v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+    v.protect(ARM, 1, T0);
+    let vid = v.rest(limit(cid(), Side::Buy, 199, 1), 2, T0 + 10 * MS);
+    let lapse = T0 + 5 * MS + TTL;
+    v.trade(lapse + MS, Aggressor::Seller, 199, 10);
+    let got = v.events();
+    assert_eq!(
+        venue_canceled(&got)
+            .into_iter()
+            .map(|(v, _)| v)
+            .collect::<Vec<_>>(),
+        [vid],
+        "{got:?}"
+    );
+    assert!(got.iter().all(|(_, ev)| fill_of(ev).is_none()), "{got:?}");
+}
+
+#[test]
+fn a_dead_man_timer_turned_off_or_never_armed_cancels_nothing() {
+    let mut v = dead_man();
+    v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+    let vid = v.rest(limit(cid(), Side::Buy, 199, 1), 1, T0);
+    // A refresh with no timer running is refused, and arms nothing.
+    v.send(VenueCommand::RefreshDeadMan, 2, T0 + 10 * MS);
+    v.tick(T0 + 15 * MS);
+    let got = v.events();
+    let [
+        (
+            _,
+            ExecEvent::Outcome {
+                outcome: SubmitOutcome::Rejected(r),
+                ..
+            },
+        ),
+    ] = got.as_slice()
+    else {
+        panic!("{got:?}")
+    };
+    assert_eq!(
+        (r.kind, r.venue_code.as_deref()),
+        (RejectKind::Other, Some("no_protection"))
+    );
+    v.tick(T0 + 15 * MS + 2 * TTL);
+    assert!(v.events().is_empty());
+    // Armed, then turned off before it lapses.
+    v.protect(ARM, 3, T0 + 300 * MS);
+    v.protect(DISARM, 4, T0 + 350 * MS);
+    v.tick(T0 + 300 * MS + 3 * TTL);
+    assert!(v.events().is_empty());
+    assert!(v.engine.queue_position(&vid).is_some());
+}
+
+#[test]
+fn a_frame_still_in_flight_when_its_stream_closes_never_reaches_the_venue() {
+    // A command acts `to_venue` after it was written; one whose connection closes first is
+    // lost with it, unanswered, so the runtime's deadline reports it Unknown.
+    for venue in [
+        Venue::new(Bracket::Middle),
+        per_connection(true, false),
+        dead_man(),
+    ] {
+        let mut v = venue;
+        v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+        v.send(limit(cid(), Side::Buy, 199, 1), 1, T0);
+        v.close(T0 + 2 * MS);
+        v.open(T0 + 3 * MS);
+        v.tick(T0 + 10 * MS);
+        let got = v.events();
+        assert!(got.is_empty(), "{got:?}");
+        // One that arrived before the close acted.
+        v.send(limit(cid(), Side::Buy, 199, 1), 2, T0 + 20 * MS);
+        v.close(T0 + 25 * MS);
+        let got = v.events();
+        assert_eq!(outcome_of(&got[0].1), Some((2, ACCEPTED)), "{got:?}");
+    }
+}
+
+#[test]
+fn the_codec_sends_protection_commands_only_to_a_venue_that_takes_them() {
+    // Placements now go to every one of these venues (Codex r4184778435 on PR #58), and each
+    // takes the protection commands its caps declare, as control frames naming no
+    // instrument; the rest are refused, nothing written.
+    let cases = [
+        (Venue::new(Bracket::Middle), false, false),
+        (per_connection(true, false), true, false),
+        (per_connection(false, true), true, false),
+        (dead_man(), true, true),
+    ];
+    for (mut v, protection, refresh) in cases {
+        assert!(v.encode(&limit(cid(), Side::Buy, 199, 1), 1, T0).is_ok());
+        for (cmd, takes) in [(ARM, protection), (DISARM, protection)]
+            .into_iter()
+            .chain([(VenueCommand::RefreshDeadMan, refresh)])
+        {
+            let sent = v.encode(&cmd, 2, T0);
+            if !takes {
+                assert_eq!(sent.err(), Some(NotSentReason::Unsupported), "{cmd:?}");
+                continue;
+            }
+            let fx = sent.unwrap();
+            assert!(fx.carry_request(RpcId(2), cmd.traffic_class()));
+            let [
+                Effect::Send {
+                    stream,
+                    class,
+                    charge,
+                    ..
+                },
+            ] = fx.as_slice()
+            else {
+                panic!("{fx:?}")
+            };
+            assert_eq!(*stream, STREAM);
+            assert_eq!(*class, cmd.traffic_class());
+            assert_eq!(*charge, RateCharge::one(OpKind::Control, None));
+        }
+    }
+}
+
+#[test]
+fn the_engine_refuses_protection_the_stood_in_venue_does_not_take() {
+    // A frame the codec never writes for these venues: the engine answers it refused, and
+    // nothing is armed.
+    for (mut v, frame) in [
+        (
+            Venue::new(Bracket::Middle),
+            format!("protect|rpc=1|mono={T0}|wall=0|on=1"),
+        ),
+        (
+            per_connection(true, false),
+            format!("refresh|rpc=1|mono={T0}|wall=0"),
+        ),
+    ] {
+        v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+        v.engine.on_order_frame(frame.as_bytes()).unwrap();
+        v.tick(T0 + 5 * MS);
+        let got = v.events();
+        assert_eq!(rejected(&got[0].1), Some(RejectKind::Other), "{got:?}");
+        let vid = v.rest(limit(cid(), Side::Buy, 199, 1), 2, T0 + 10 * MS);
+        v.close(T0 + 20 * MS);
+        assert!(v.events().is_empty());
+        assert!(v.engine.queue_position(&vid).is_some());
+    }
+    let mut v = per_connection(true, false);
+    for (frame, what) in [
+        ("protect|rpc=1|mono=1|wall=1", "on"),
+        ("protect|rpc=1|mono=1|wall=1|on=2", "on"),
+        ("refresh|rpc=1|mono=1|wall=1\nitem|x=1", "item"),
+    ] {
+        let refused = v.engine.on_order_frame(frame.as_bytes());
+        assert_eq!(refused, Err(SimError::Malformed(what)), "{frame}");
+    }
+}
+
+#[test]
+fn the_engine_takes_frames_only_while_its_stream_is_open() {
+    let mut v = per_connection(true, false);
+    v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+    // Already open: a second open is refused.
+    assert_eq!(v.engine.open(MonoNs(T0)), Err(SimError::StreamOpen));
+    v.close(T0 + MS);
+    let wall = WallNs(WALL0);
+    assert_eq!(
+        v.engine.close(MonoNs(T0 + 2 * MS), wall),
+        Err(SimError::StreamClosed)
+    );
+    let frame = format!("protect|rpc=1|mono={T0}|wall=0|on=1");
+    assert_eq!(
+        v.engine.on_order_frame(frame.as_bytes()),
+        Err(SimError::StreamClosed)
+    );
+    // An unreadable frame is still refused as one.
+    assert_eq!(
+        v.engine.on_order_frame(b"hello|rpc=1|mono=1|wall=1"),
+        Err(SimError::Malformed("kind"))
+    );
+    v.tick(T0 + 10 * MS);
+    assert!(v.events().is_empty());
+    // A fresh engine's stream is closed until the host opens it.
+    let fresh = config(Bracket::Middle, VenueFeeSign::PositiveIsCost, fees());
+    let mut engine = SimEngine::new(&fresh);
+    assert_eq!(
+        engine.on_order_frame(frame.as_bytes()),
+        Err(SimError::StreamClosed)
+    );
+    assert_eq!(
+        SimError::StreamClosed.to_string(),
+        "the simulated order-entry stream is closed"
+    );
+    assert_eq!(
+        SimError::StreamOpen.to_string(),
+        "the simulated order-entry stream is already open"
+    );
 }
 
 #[test]
