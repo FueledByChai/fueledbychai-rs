@@ -1,0 +1,5 @@
+error[E0599]: no variant, associated function, or constant named `default` found for enum `SnapshotReads` in the current scope
+ --> tests/ui_caps/snapshot_reads_default.rs:5:28
+  |
+5 |     let _ = SnapshotReads::default();
+  |                            ^^^^^^^ variant, associated function, or constant not found in `SnapshotReads`

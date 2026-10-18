@@ -15,8 +15,8 @@ use fbc_core::{
     AccountKey, AckModel, AmendAck, AmendQty, AssetSym, CancelOnDisconnect, CancelOrder, Channel,
     ChosenRef, CidMatch, CidMint, ClientIdFormat, ClientOrderId, Feature, FillSource, InstrumentId,
     LimitScope, Money, Namespace, NamespaceLease, NonceScope, OpKind, OrderKindTag, OrderRef,
-    OrderingKey, RateCharge, RefKind, Side, SnapshotSource, Support, TagSet, TifTag, VenueCaps,
-    VenueFeeSign, Via, WallNs, dispatch,
+    OrderingKey, RateCharge, RefKind, Side, SnapshotReads, SnapshotSource, Support, TagSet, TifTag,
+    VenueCaps, VenueFeeSign, Via, WallNs, dispatch,
 };
 use fbc_venue_paradex::exec::{self, ORDER_SBE_SCHEMA_VERSION};
 use fbc_venue_paradex::factory::{caps, market_data_caps};
@@ -183,6 +183,7 @@ fn every_order_and_fill_capability_is_the_value_the_record_states() {
     assert_eq!(o.nonce_scope, NonceScope::None);
     assert_eq!(o.ordering_key, OrderingKey::VenueSeq);
     assert_eq!(o.snapshot_source, SnapshotSource::Trustworthy);
+    assert_eq!(o.snapshot_reads, SnapshotReads::Separate);
     assert_eq!(o.sign_cost_hint_us, 200);
     let f = &exec.fills;
     assert_eq!(f.source, FillSource::Native);
@@ -481,4 +482,55 @@ fn the_record_does_not_call_the_amend_size_the_do_less_value_and_bounds_its_fail
     assert!(item.contains("one in-flight fill"), "{item}");
     assert!(item.contains("before any\n  live Paradex amend"), "{item}");
     assert!(!text.contains("no amend depends on it"));
+}
+
+/// FBC-k7t7's record: the one whose slug says a venue declares how its resync reads the account.
+fn reads_record() -> String {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../docs/decisions");
+    let mut found = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains("a-venue-declares-whether-its-resync-reads"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(found.len(), 1, "{found:?}");
+    fs::read_to_string(found.pop().unwrap()).unwrap()
+}
+
+/// FBC-k7t7: Paradex's resync is `GET /orders` and `GET /positions`, two requests sent in one
+/// round (`resync_requests`), so it declares two reads, and the record that adds the
+/// declaration says so: a fill landing between them is placed only by its arrival or time.
+#[test]
+fn the_resync_is_declared_two_reads_on_the_record_that_adds_the_declaration() {
+    assert_eq!(
+        exec::exec_caps().order.snapshot_reads,
+        SnapshotReads::Separate
+    );
+    let fx = exec::resync_requests(
+        "https://api.testnet.paradex.trade/v1",
+        &[],
+        Duration::from_secs(5),
+        exec::ResyncTags {
+            orders: fbc_core::HttpTag(1),
+            positions: fbc_core::HttpTag(2),
+        },
+    );
+    assert_eq!(fx.len(), 2, "two requests, not one read");
+    let text = reads_record();
+    assert!(
+        text.contains("augmenting 0055"),
+        "the title names the record it augments"
+    );
+    let decision = section(&text, "## Decision");
+    for needle in [
+        "Paradex",
+        "`GET /orders`",
+        "`GET /positions`",
+        "`SnapshotReads::Separate`",
+    ] {
+        assert!(decision.contains(needle), "{needle} is not in the decision");
+    }
 }

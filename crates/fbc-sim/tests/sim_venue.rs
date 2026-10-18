@@ -42,10 +42,11 @@ use fbc_core::{
     Namespace, NamespaceLease, NewOrder, NonceBlock, NonceScope, NotAmendable, NotSentReason,
     OpKind, OrderCaps, OrderKind, OrderKindTag, OrderRef, OrderUpdate, OrderingKey, PathStamps,
     PriceGrid, QueryOrder, RateCharge, RawFrame, Readiness, RefKind, RejectKind, RpcCall, RpcId,
-    Side, SignedLots, SizeStep, SnapshotSource, SpecTable, SpeedBump, SpeedBumpScope, Stamp,
-    StpScope, StreamId, SubmitOutcome, Support, TagSet, TerminalHint, Ticks, Tif, TifTag, TimerTag,
-    TradeCaps, TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueCommand, VenueFeeSign,
-    VenueId, VenueMeta, VenueOrderId, VenueOrderState, WallNs, dispatch,
+    Side, SignedLots, SizeStep, SnapshotReads, SnapshotSource, SpecTable, SpeedBump,
+    SpeedBumpScope, Stamp, StpScope, StreamId, SubmitOutcome, Support, TagSet, TerminalHint, Ticks,
+    Tif, TifTag, TimerTag, TradeCaps, TradingStatus, TrafficClass, UnderlyingId, VenueCaps,
+    VenueCommand, VenueFeeSign, VenueId, VenueMeta, VenueOrderId, VenueOrderState, WallNs,
+    dispatch,
 };
 use fbc_sim::{
     Answer, Bracket, InjectedOrder, OrderKey, QueueConfig, QueueError, SimCodec, SimConfig,
@@ -119,6 +120,8 @@ fn caps(fee_sign: VenueFeeSign) -> VenueCaps {
                 nonce_scope: NonceScope::None,
                 ordering_key: OrderingKey::VenueSeq,
                 snapshot_source: SnapshotSource::None,
+                // A resync is answered in one frame (decision 0049).
+                snapshot_reads: SnapshotReads::OneInstant,
                 events_echo_flags: true,
                 sign_cost_hint_us: 0,
             },

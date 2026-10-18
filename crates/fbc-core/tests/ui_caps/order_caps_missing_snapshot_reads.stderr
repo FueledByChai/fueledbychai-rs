@@ -1,0 +1,5 @@
+error[E0063]: missing field `snapshot_reads` in initializer of `OrderCaps`
+  --> tests/ui_caps/order_caps_missing_snapshot_reads.rs:12:13
+   |
+12 |     let _ = OrderCaps {
+   |             ^^^^^^^^^ missing `snapshot_reads`

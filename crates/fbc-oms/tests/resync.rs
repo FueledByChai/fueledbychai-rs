@@ -13,7 +13,8 @@ use common::{cid, fill, fill_id, lots, order_caps, placement, update, vid};
 use fbc_core::{
     CidMatch, ClientOrderId, ExchNs, ExchTsKind, FillEvent, FillIdent, InstrumentId, ItemRef,
     MonoNs, Namespace, NewOrder, OrderCaps, Reject, RejectKind, RpcId, Side, SignedLots,
-    SnapshotSource, SubmitOutcome, Ticks, VenueOrderSnapshot, VenueOrderState, WallNs,
+    SnapshotReads, SnapshotSource, SubmitOutcome, Ticks, VenueOrderSnapshot, VenueOrderState,
+    WallNs,
 };
 use fbc_oms::{
     Admission, ArmRefusal, CapRefusal, EntryState, FillLedger, FillRouted, FillTime, LadderConfig,
@@ -1107,4 +1108,317 @@ fn our_open_orders_on_a_market_left_unseeded_are_registered_and_cancellable() {
         &snapshot_at(3_000, 3_000, vec![shown(orphan, "o", 5, 0)], &[]),
     );
     assert_eq!(report.untracked, vec![(orphan, vid("o"))]);
+}
+
+/// A trustworthy source whose resync reads the account as `reads` declares (decision 0095).
+fn resync_reads(reg: &mut Registry, reads: SnapshotReads, snap: &ResyncSnapshot) -> ResyncReport {
+    let caps = OrderCaps {
+        snapshot_reads: reads,
+        ..caps(SnapshotSource::Trustworthy)
+    };
+    reg.resync(&cfg(), &caps, snap, key(1)).unwrap()
+}
+
+/// The instants, on the matching engine's clock and after the request at `W`, the venue read
+/// the open orders and the positions at.
+#[derive(Copy, Clone, Debug)]
+struct Reads {
+    orders: i64,
+    positions: i64,
+}
+
+/// A fill landing around a resync, as a venue reading the account at `reads` would show it.
+/// An earlier run's buy `a` (venue id "a") of `qty` lots was filled 6 at the request, the
+/// position 6. The fill takes it to 10 at `exec` (after the request): its event reports the
+/// cumulative fill when `cum` is set and the matching-engine time when `timed` is, and reaches
+/// us after the request was sent, before the answer when `before` is set, after it otherwise.
+/// Every fill of it is in the true position, 10, once all of them counted.
+#[derive(Copy, Clone, Debug)]
+struct Straddle {
+    reads: Reads,
+    qty: i64,
+    exec: i64,
+    cum: bool,
+    timed: bool,
+    before: bool,
+}
+
+impl Straddle {
+    /// What the venue's two reads show: the order filled 10 (gone when that fills it) if the
+    /// fill came before the orders were read, 6 otherwise; the position 10 if it came before
+    /// the positions were read, 6 otherwise.
+    fn snapshot(&self, a: ClientOrderId) -> ResyncSnapshot {
+        let orders = if self.exec < self.reads.orders {
+            if self.qty == 10 {
+                vec![]
+            } else {
+                vec![shown(a, "a", self.qty, 10)]
+            }
+        } else {
+            vec![shown(a, "a", self.qty, 6)]
+        };
+        let pos = if self.exec < self.reads.positions {
+            10
+        } else {
+            6
+        };
+        snapshot(orders, &[(INST, pos)])
+    }
+
+    fn fill(&self, a: ClientOrderId) -> FillEvent {
+        order_fill(a, "a", "x", 4, self.cum.then_some(10))
+    }
+
+    fn time(&self) -> Option<FillTime> {
+        if self.timed { exec(self.exec) } else { None }
+    }
+
+    /// Applies the fill and the resync in the order they reach us, returning the registry,
+    /// the ledger and the resync's report.
+    fn run(&self, reads: SnapshotReads, a: ClientOrderId) -> (Registry, FillLedger, ResyncReport) {
+        let mut reg = registry();
+        let mut l = ledger();
+        let (f, snap) = (self.fill(a), self.snapshot(a));
+        let report = if self.before {
+            apply(&mut reg, &mut l, &f, self.time(), 1_100);
+            resync_reads(&mut reg, reads, &snap)
+        } else {
+            let report = resync_reads(&mut reg, reads, &snap);
+            let routed = apply(&mut reg, &mut l, &f, self.time(), 1_100);
+            assert_eq!(routed, FillRouted::Unsettled(a), "{self:?}");
+            report
+        };
+        (reg, l, report)
+    }
+}
+
+/// Every straddle of a fill around two reads in `reads`, at `execs`.
+fn straddles(reads: &[Reads], execs: &[i64], cums: &[bool]) -> Vec<Straddle> {
+    let mut all = Vec::new();
+    for &reads in reads {
+        for &qty in &[20, 10] {
+            for &exec in execs {
+                for &cum in cums {
+                    for timed in [true, false] {
+                        for before in [true, false] {
+                            all.push(Straddle {
+                                reads,
+                                qty,
+                                exec,
+                                cum,
+                                timed,
+                                before,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    all
+}
+
+/// Reviewer B's RB80-2 on PR #80 (FBC-k7t7): a venue whose resync reads the open orders and
+/// the positions in two requests, in either order, can have a fill land between them, shown in
+/// the order's cumulative fill and not in the position, or the reverse. Declared as two reads,
+/// neither the order's shown cumulative fill nor its absence places the fill: only the fill's
+/// arrival before the request or its matching-engine time by the watermark would, and here
+/// neither does, so the market is left unknown, never seeded short (the fill never counted)
+/// or long (counted twice), until a resync requested after the fill arrived seeds it.
+#[test]
+fn a_snapshot_of_two_reads_never_places_a_fill_by_its_orders_shown_cumulative_fill() {
+    let positions_first = Reads {
+        positions: 2_000,
+        orders: 3_000,
+    };
+    let orders_first = Reads {
+        orders: 2_000,
+        positions: 3_000,
+    };
+    // Before both reads, between them and after both.
+    let execs = [1_500, 2_500, 3_500];
+    for s in straddles(&[positions_first, orders_first], &execs, &[true, false]) {
+        let a = cid();
+        let (mut reg, mut l, report) = s.run(SnapshotReads::Separate, a);
+        // Never a wrong position: unknown, and nothing built on it.
+        assert_eq!(reg.position(INST), None, "{s:?}");
+        let fill = s.fill(a);
+        if s.before {
+            // Not seeded: the fill is held for the next resync.
+            assert!(report.seeded.is_empty(), "{s:?}");
+            assert_eq!(report.unsettled, vec![(INST, fill.key())], "{s:?}");
+            assert_eq!(place(&mut reg, placement(cid(), 100, 1)), Err(held()));
+            // A resync requested after it arrived holds it by its arrival: the true position.
+            let mut later = s.snapshot(a);
+            later.watermark = WallNs(4_000);
+            later.requested_at = MonoNs(4_000);
+            later.orders = if s.qty == 10 {
+                vec![]
+            } else {
+                vec![shown(a, "a", s.qty, 10)]
+            };
+            later.positions = vec![(INST, SignedLots(10))];
+            let report = resync_reads(&mut reg, SnapshotReads::Separate, &later);
+            assert_eq!(report.seeded, vec![(INST, SignedLots(10))], "{s:?}");
+            assert_eq!(reg.position(INST), Some(SignedLots(10)), "{s:?}");
+            if s.qty == 20 {
+                assert_eq!(reg.get(a).unwrap().cum_fills(), lots(10), "{s:?}");
+            }
+        } else {
+            // Seeded from the snapshot, then the fill nothing places makes it unknown for the
+            // rest of the process: a later resync compares nothing and seeds nothing.
+            assert_eq!(report.seeded.len(), 1, "{s:?}");
+            let later = snapshot_at(4_000, 4_000, vec![], &[(INST, 10)]);
+            let report = resync_reads(&mut reg, SnapshotReads::Separate, &later);
+            assert!(report.seeded.is_empty(), "{s:?}");
+            assert_eq!(report.checks, vec![PositionCheck::Unsettled(INST)], "{s:?}");
+            assert_eq!(reg.position(INST), None, "{s:?}");
+        }
+        // Delivered again, the ledger holds it: never counted twice.
+        assert!(matches!(
+            l.admit(&fill, s.time(), MonoNs(5_000)),
+            Admission::Duplicate
+        ));
+    }
+}
+
+/// A venue declaring one read keeps today's placement (decision 0055's rules): a fill before
+/// or after the one instant is counted once, whether it arrives before or after the answer.
+/// The same two-read histories declared as one read are what the declaration guards against:
+/// counted never (positions read first) or twice (orders read first).
+#[test]
+fn a_venue_declaring_one_read_keeps_the_seeds_placement() {
+    let one = Reads {
+        orders: 2_000,
+        positions: 2_000,
+    };
+    for s in straddles(&[one], &[1_500, 2_500], &[true]) {
+        let a = cid();
+        let mut reg = registry();
+        let mut l = ledger();
+        let (f, snap) = (s.fill(a), s.snapshot(a));
+        if s.before {
+            apply(&mut reg, &mut l, &f, s.time(), 1_100);
+            let report = resync_reads(&mut reg, SnapshotReads::OneInstant, &snap);
+            assert_eq!(report.seeded, vec![(INST, SignedLots(10))], "{s:?}");
+        } else {
+            resync_reads(&mut reg, SnapshotReads::OneInstant, &snap);
+            let routed = apply(&mut reg, &mut l, &f, s.time(), 1_100);
+            let expected = if s.exec < one.orders {
+                FillRouted::InSnapshot(a)
+            } else {
+                match routed {
+                    FillRouted::Ours(c, _) if c == a => routed.clone(),
+                    _ => panic!("{s:?}: {routed:?}"),
+                }
+            };
+            assert_eq!(routed, expected, "{s:?}");
+        }
+        assert_eq!(reg.position(INST), Some(SignedLots(10)), "{s:?}");
+        if let Some(rec) = reg.get(a) {
+            assert_eq!(rec.cum_fills(), lots(10), "{s:?}");
+        }
+    }
+
+    // Two reads declared as one: the order's shown cumulative fill places the fill.
+    for (reads, seeded) in [
+        // Positions read first: the order shows the fill, the position does not; held as in
+        // the snapshot, it is never counted.
+        (
+            Reads {
+                positions: 2_000,
+                orders: 3_000,
+            },
+            6,
+        ),
+        // Orders read first: the position shows the fill, the order does not; counted after
+        // the snapshot, it is counted twice.
+        (
+            Reads {
+                orders: 2_000,
+                positions: 3_000,
+            },
+            14,
+        ),
+    ] {
+        let s = Straddle {
+            reads,
+            qty: 20,
+            exec: 2_500,
+            cum: true,
+            timed: true,
+            before: true,
+        };
+        let a = cid();
+        let mut reg = registry();
+        let mut l = ledger();
+        apply(&mut reg, &mut l, &s.fill(a), s.time(), 1_100);
+        let report = resync_reads(&mut reg, SnapshotReads::OneInstant, &s.snapshot(a));
+        assert_eq!(report.seeded, vec![(INST, SignedLots(seeded))], "{s:?}");
+    }
+}
+
+/// On a snapshot of two reads a fill is still placed by its arrival before the request or its
+/// matching-engine time by the watermark (both reads came after the request, so it is in
+/// both), a fill of an order placed after the seed counts, and a flat account with no fill in
+/// flight seeds and Starts.
+#[test]
+fn a_snapshot_of_two_reads_still_places_a_fill_by_its_arrival_or_time() {
+    let two = SnapshotReads::Separate;
+    // Flat, nothing in flight: seeded, and the owner's Start then admits a place.
+    let mut reg = registry();
+    let report = resync_reads(&mut reg, two, &snapshot(vec![], &[(INST, 0)]));
+    assert_eq!(report.seeded, vec![(INST, SignedLots(0))]);
+    assert!(report.unsettled.is_empty() && !report.untrustworthy);
+    place(&mut reg, placement(cid(), 100, 1)).unwrap();
+    // An order placed after the seed counts its fills on the inventory.
+    let mut l = ledger();
+    let b = cid();
+    place(&mut reg, placement(b, 100, 5)).unwrap();
+    assert!(matches!(
+        apply(&mut reg, &mut l, &order_fill(b, "b", "y", 5, Some(5)), None, 1_100),
+        FillRouted::Ours(c, _) if c == b
+    ));
+    assert_eq!(reg.position(INST), Some(SignedLots(5)));
+
+    for shows in [true, false] {
+        let a = cid();
+        // The order filled 10 by the request, the fill of 4 among them; ended when `shows` is
+        // not set.
+        let orders = || {
+            if shows {
+                vec![shown(a, "a", 20, 10)]
+            } else {
+                vec![]
+            }
+        };
+        let snap = snapshot(orders(), &[(INST, 10)]);
+        let f = order_fill(a, "a", "x", 4, Some(10));
+        // Arrived before the request was sent, whatever its time: held.
+        let mut reg = registry();
+        let mut l = ledger();
+        apply(&mut reg, &mut l, &f, None, 900);
+        let report = resync_reads(&mut reg, two, &snap);
+        assert_eq!(report.seeded, vec![(INST, SignedLots(10))], "shows {shows}");
+        assert_eq!(reg.position(INST), Some(SignedLots(10)));
+        if shows {
+            assert_eq!(reg.get(a).unwrap().cum_fills(), lots(10));
+        }
+        // Executed by the watermark, arriving after the answer: held.
+        let mut reg = registry();
+        let mut l = ledger();
+        resync_reads(&mut reg, two, &snap);
+        assert_eq!(
+            apply(&mut reg, &mut l, &f, exec(W), 1_100),
+            FillRouted::InSnapshot(a),
+            "shows {shows}"
+        );
+        assert_eq!(reg.position(INST), Some(SignedLots(10)));
+        // Executed by the watermark, arriving before the answer: held.
+        let mut reg = registry();
+        let mut l = ledger();
+        apply(&mut reg, &mut l, &f, exec(900), 1_100);
+        let report = resync_reads(&mut reg, two, &snap);
+        assert_eq!(report.seeded, vec![(INST, SignedLots(10))], "shows {shows}");
+    }
 }
