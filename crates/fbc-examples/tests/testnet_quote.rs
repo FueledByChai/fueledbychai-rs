@@ -3281,8 +3281,11 @@ async fn mainnet_mode_refuses_caps_offsets_and_a_duration_past_the_owners_limits
  {
     let set = |flag: &str, value: &str| -> Result<Parsed, String> {
         let mut argv = mainnet_argv();
-        let at = argv.iter().position(|a| a == flag).unwrap();
-        argv[at + 1] = value.to_owned();
+        match argv.iter().position(|a| a == flag) {
+            Some(at) => argv[at + 1] = value.to_owned(),
+            // An optional flag (--interval-ms) is added.
+            None => argv.extend([flag.to_owned(), value.to_owned()]),
+        }
         args::parse(argv)
     };
     for (flag, value, why) in [
@@ -3291,6 +3294,7 @@ async fn mainnet_mode_refuses_caps_offsets_and_a_duration_past_the_owners_limits
         ("--bid-bps", "19", "at least 20 basis points"),
         ("--ask-bps", "19", "at least 20 basis points"),
         ("--duration", "3601", "at most 3600 s"),
+        ("--interval-ms", "20001", "at most 20000 ms"),
     ] {
         let refused = set(flag, value).unwrap_err();
         assert!(refused.contains(flag), "{flag}: {refused}");
@@ -3303,6 +3307,7 @@ async fn mainnet_mode_refuses_caps_offsets_and_a_duration_past_the_owners_limits
         ("--bid-bps", "20"),
         ("--ask-bps", "20"),
         ("--duration", "3600"),
+        ("--interval-ms", "20000"),
     ] {
         assert!(matches!(set(flag, value), Ok(Parsed::Quote(_))), "{flag}");
     }
@@ -3321,7 +3326,14 @@ async fn mainnet_mode_refuses_caps_offsets_and_a_duration_past_the_owners_limits
     );
     // A testnet run has none of these limits.
     let mut argv = required();
-    argv.extend(strings(&["--bid-bps", "1", "--duration", "86400"]));
+    argv.extend(strings(&[
+        "--bid-bps",
+        "1",
+        "--duration",
+        "86400",
+        "--interval-ms",
+        "60000",
+    ]));
     assert!(matches!(args::parse(argv), Ok(Parsed::Quote(_))));
     // Options built some other way are checked again by the run, before anything connects:
     // against a loopback stub, which sees nothing.
@@ -3330,8 +3342,9 @@ async fn mainnet_mode_refuses_caps_offsets_and_a_duration_past_the_owners_limits
         .await
         .unwrap();
     type Break = (fn(&mut Options), &'static str);
-    let breaks: [Break; 7] = [
+    let breaks: [Break; 8] = [
         (|o| o.resting_cap_usd = dec("12"), "at most $11"),
+        (|o| o.interval_ms = 20_001, "at most 20000 ms"),
         (|o| o.inventory_cap_usd = dec("51"), "at most $50"),
         (|o| o.bid_bps = 10, "at least 20"),
         (|o| o.ask_bps = 5, "at least 20"),
@@ -4622,6 +4635,48 @@ async fn a_cancel_not_ours_after_the_window_only_warns_again() {
         printed.contains("DONE ok (--cycles 8 reached)"),
         "{printed}"
     );
+}
+
+#[tokio::test]
+async fn a_mainnet_interval_at_which_a_co_tenants_cancels_fall_outside_the_window_is_refused() {
+    // RB-aoh5-7 on PR #159, scaled: the window shortened to 300 ms, the interval 400 ms. Another
+    // program cancels both quotes after every cycle's places; the loop requotes a side only on
+    // the next cycle, so each event comes more than the window after the one before and every
+    // event would be a first one (a WARN each cycle, DONE ok, never a Stop). A mainnet run at
+    // such an interval is refused before anything connects: the interval may be at most two
+    // thirds of the window (20000 ms of the owner's 30 s), which leaves a third for the cycle's
+    // reads and a 3 s reconcile.
+    let venue = mainnet_venue(vec![b0()]);
+    lock(&venue).cotenant_after_create = vec![(2, None), (4, None), (6, None)];
+    // Were it run: the opening six, the start's sweep, cycles 1 to 4 two places each, Stop's
+    // batch cancel.
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 * 4 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let mut opts = mainnet_options(&stub, 4);
+    opts.cancel_window = Duration::from_millis(300);
+    opts.interval_ms = 400;
+    let (ran, printed) = run_venue_until(
+        &fbc_venue_paradex::ParadexFactory,
+        &opts,
+        std::future::pending(),
+    )
+    .await;
+    let refused = ran
+        .err()
+        .unwrap_or_else(|| panic!("not refused:\n{printed}"));
+    assert!(refused.contains("--interval-ms 400"), "{refused}");
+    assert!(refused.contains("at most 200 ms"), "{refused}");
+    assert!(printed.is_empty(), "{printed}");
+    assert!(
+        stub.http_requests().is_empty(),
+        "{:?}",
+        stub.http_requests()
+    );
+    assert!(stub.connections().is_empty());
 }
 
 #[tokio::test]
