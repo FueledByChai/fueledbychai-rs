@@ -392,7 +392,9 @@ fn responder(placed: Arc<Mutex<Placed>>) -> Responder {
 }
 
 /// As [`responder`]; `cotenant`: another program on the account (FBC-aoh5) cancels the order
-/// right after the place's reply, by a user cancel the run never sent (`user_cancel_ws`).
+/// as it rests, by a user cancel the run never sent (`user_cancel_ws`): its order event comes
+/// before the place's reply, so no cancel of the run's can be in flight (Paradex takes none
+/// before the acknowledgement).
 fn responder_with(placed: Arc<Mutex<Placed>>, cotenant: bool) -> Responder {
     Responder::new(move |frame: &Frame| {
         let Frame::Text(text) = frame else {
@@ -417,12 +419,13 @@ fn responder_with(placed: Arc<Mutex<Placed>>, cotenant: bool) -> Responder {
                     "type": "LIMIT", "instruction": "POST_ONLY", "price": p.price,
                     "size": p.size, "remaining_size": p.size, "status": "NEW",
                 });
-                let mut frames = vec![ok(json!({"order": order}))];
+                let mut frames = Vec::new();
                 if cotenant {
                     let closed =
                         order_closed_by(5_000, VID, &p.cid, &p.price, &p.size, "user_cancel_ws");
                     frames.push(Frame::Binary(closed));
                 }
+                frames.push(ok(json!({"order": order})));
                 Ok(frames)
             }
             "order.cancel" => {
@@ -1212,7 +1215,8 @@ fn the_mainnet_network_never_seeds_by_hand_and_names_its_own_leases() {
 #[tokio::test]
 async fn an_order_ended_by_a_cancel_the_smoke_did_not_send_prints_the_warn_line() {
     // FBC-aoh5: another program on the account (the owner's 2026-10-18 finding, a Java
-    // instance's orphan reconcile) cancels the smoke's order right after its acknowledgement.
+    // instance's orphan reconcile) cancels the smoke's order as it rests, before its
+    // acknowledgement reaches the run.
     // The smoke prints the WARN line naming it; its round trip did not happen, so it fails.
     let placed = Arc::new(Mutex::new(Placed::default()));
     // auth, four subscriptions, the arm, the place and Stop's cancel-all: no cancel of the order
