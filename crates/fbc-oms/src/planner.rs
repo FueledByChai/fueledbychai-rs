@@ -488,6 +488,9 @@ impl ExecutionPlanner {
         });
 
         let mut actions: Vec<(Stage, Level, Action)> = Vec::new();
+        // Orders whose level is wanted again with no cancel in flight: a removal cancel built
+        // for them and never reported sent ended nothing, so they keep no reason (0098).
+        let mut kept: Vec<ClientOrderId> = Vec::new();
         let levels: BTreeSet<Level> = slots.keys().chain(desired.levels.keys()).copied().collect();
         for at in levels {
             let want = desired.levels.get(&at).filter(|q| q.qty > Lots::ZERO);
@@ -531,8 +534,7 @@ impl ExecutionPlanner {
                 } else {
                     slot.cancels_sent = rec.cancels_sent();
                     // The book no longer wants the level: the side's reason goes with the
-                    // cancel; a level still wanted (a replace, or Exit's) has none (0065
-                    // rule 9).
+                    // cancel; a level still wanted (a replace, or Exit's) has none (0098).
                     let removal = want.map_or(desired.removal(at.side()), |_| None);
                     let cancel = Action::Cancel {
                         cid: slot.cid,
@@ -542,6 +544,9 @@ impl ExecutionPlanner {
                 }
                 continue;
             };
+            if rec.removal().is_some() && !matches!(rec.intent(), Intent::PendingCancel { .. }) {
+                kept.push(slot.cid);
+            }
             // A cancel decided for the order and waiting for its acknowledgement is carried
             // through: the level is replaced once the order is terminal, never left resting at
             // the price the cancel was decided against.
@@ -598,6 +603,10 @@ impl ExecutionPlanner {
                     actions.push((Stage::Cancel, at, cancel));
                 }
             }
+        }
+
+        for cid in kept {
+            reg.with_record(cid, |rec| rec.set_removal(None));
         }
 
         // Built in 0005's order, so each is judged with the earlier ones counted.
