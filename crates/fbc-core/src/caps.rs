@@ -105,6 +105,10 @@ pub struct OrderCaps {
     pub ordering_key: OrderingKey,
     /// Whether the venue's open-order snapshot can be trusted on resync.
     pub snapshot_source: SnapshotSource,
+    /// Whether a resync reads the open orders and the positions at one instant, or in separate
+    /// reads a fill can land between (decision 0095). The seed places a fill by its order's
+    /// shown cumulative fill, or by the order's absence, only on one read.
+    pub snapshot_reads: SnapshotReads,
     /// Order events carry the order's flags (post-only, reduce-only) back.
     pub events_echo_flags: bool,
     /// The expected cost of signing one order, in microseconds.
@@ -618,6 +622,20 @@ pub enum SnapshotSource {
     None,
 }
 
+/// How a venue's resync reads the account: its open orders and its positions at one instant,
+/// or in separate reads (decision 0095). There is no default: each venue states it, since a
+/// resync's seed compares an order's shown cumulative fill with the position read beside it,
+/// which is sound only when both were read at one instant.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum SnapshotReads {
+    /// One read of the account at one instant (one request answering both, or a snapshot
+    /// riding the fills' ordered stream): a fill is in both halves or in neither.
+    OneInstant,
+    /// Separate reads (two requests, in either order or at once): a fill can land between
+    /// them, in the open orders' cumulative fills and not in the positions, or the reverse.
+    Separate,
+}
+
 /// A tag a [`TagSet`] can hold: a fieldless enum with fewer than 32 variants.
 pub trait CapTag: Copy + Eq + fmt::Debug + 'static {
     /// Every variant, in declaration order.
@@ -882,6 +900,7 @@ pub(crate) mod testing {
                     nonce_scope: NonceScope::None,
                     ordering_key: OrderingKey::None,
                     snapshot_source: SnapshotSource::None,
+                    snapshot_reads: SnapshotReads::OneInstant,
                     events_echo_flags: false,
                     sign_cost_hint_us: 0,
                 },

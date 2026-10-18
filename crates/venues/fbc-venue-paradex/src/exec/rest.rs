@@ -50,8 +50,9 @@
 //! position held and `ResyncEnd`, or into a refusal and no event at all. Two caveats the
 //! answer cannot remove: an open order or position held in a market missing from the spec
 //! table refuses the whole resync (the session cannot place what it holds there); and the two
-//! reads are not one instant, so a fill can land between them (FBC-k7t7 makes that declared;
-//! Paradex's `snapshot_source` is `Trustworthy` since decision 0094, which names this residual).
+//! reads are not one instant, so a fill can land between them: Paradex declares
+//! `snapshot_reads` `Separate` (decision 0095), and the seed places a fill only by its arrival
+//! before the request, never by an order's shown cumulative fill or absence.
 
 use core::time::Duration;
 use std::collections::BTreeSet;

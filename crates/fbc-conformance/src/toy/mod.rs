@@ -46,9 +46,9 @@ use fbc_core::{
     DecodeScope, Encoding, ExecCaps, Feature, FeedSource, FillCaps, FillSource, FundingCaps,
     FundingSpec, InstrumentId, InstrumentKind, InstrumentSpec, LimitScope, Lots, MatchingCaps,
     MdCaps, Namespace, NonceScope, OpKind, OrderCaps, OrderKindTag, OrderingKey, PriceGrid,
-    QueueModelQuality, RateLimit, Readiness, RefKind, SizeStep, SnapshotSource, SpecTable,
-    StpScope, StreamId, Support, TagSet, TifTag, TimerTag, TradeCaps, TradingStatus, UnderlyingId,
-    VenueCaps, VenueFeeSign, VenueId, WallNs, dispatch,
+    QueueModelQuality, RateLimit, Readiness, RefKind, SizeStep, SnapshotReads, SnapshotSource,
+    SpecTable, StpScope, StreamId, Support, TagSet, TifTag, TimerTag, TradeCaps, TradingStatus,
+    UnderlyingId, VenueCaps, VenueFeeSign, VenueId, WallNs, dispatch,
 };
 use rust_decimal::Decimal;
 
@@ -200,6 +200,9 @@ pub fn caps_for(fill_ids: FillIds) -> VenueCaps {
                 nonce_scope: NonceScope::PerAccountMonotonic,
                 ordering_key: OrderingKey::VenueSeq,
                 snapshot_source: SnapshotSource::Trustworthy,
+                // One answer holds the open orders and the positions, in frames or from one
+                // REST request (`<base>/resync`): one read of the account.
+                snapshot_reads: SnapshotReads::OneInstant,
                 events_echo_flags: true,
                 sign_cost_hint_us: 0,
             },

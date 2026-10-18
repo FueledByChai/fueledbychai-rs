@@ -41,8 +41,8 @@ pub use caps::{
     CancelOnDisconnect, CapTag, ConnTopology, Continuity, Encoding, ExecCaps, Feature, FeedSource,
     FillCaps, FillSource, FundingCaps, LimitScope, MatchingCaps, MdCaps, NonceScope, OpKind,
     OrderCaps, OrderKindTag, OrderingKey, QueueModelQuality, RateCharge, RateLimit, Readiness,
-    RefKind, SeqDomain, SnapshotSource, SpeedBump, SpeedBumpScope, StpScope, Support, TagSet,
-    TifTag, TouchSourceCaps, TradeCaps, VenueCaps, Via,
+    RefKind, SeqDomain, SnapshotReads, SnapshotSource, SpeedBump, SpeedBumpScope, StpScope,
+    Support, TagSet, TifTag, TouchSourceCaps, TradeCaps, VenueCaps, Via,
 };
 
 pub use cid::{Charset, ClientIdFormat, MAX_WIRE_LEN, WireCid, decode_cid, encode_cid};
