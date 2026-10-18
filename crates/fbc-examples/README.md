@@ -9,7 +9,7 @@ program's flags.
 | --- | --- |
 | `md_watch` | Prints live Paradex and Binance USD-M touches and books through fbc-runtime. No orders, no credentials. |
 | `testnet_trade` | Paradex TESTNET only: places one post-only order well away from the touch through fbc-oms, cancels it, and Stops (FBC-x69b). |
-| `testnet_quote` | Paradex TESTNET only, a plumbing test, not a strategy: keeps one post-only order a side a fixed offset behind the touch through fbc-oms's execution planner, cancel-and-replace only, until Ctrl-C, `--duration` or `--cycles`, then Stops (FBC-elg7). |
+| `testnet_quote` | A plumbing test, not a strategy: keeps one post-only order a side a fixed offset behind the touch through fbc-oms's execution planner, cancel-and-replace only, until Ctrl-C, `--duration` or `--cycles`, then Stops (FBC-elg7). Paradex TESTNET, or with `--mainnet` a supervised short session on Paradex MAINNET (FBC-tyft). See below. |
 | `paradex_testnet_acceptance` | Paradex TESTNET only: FBC-8xr's acceptance run. It writes the evidence report that the snapshot-trust decision (FBC-2f7w) cites (FBC-xji8). |
 | `mainnet_smoke` | Paradex MAINNET, real money: testnet_trade's round trip (one post-only order of about $11 well away from the touch, its cancel, Stop) on a separate small account, behind `--mainnet` and `--sole-trader` (FBC-p0aa). It Starts only after a trustworthy resync seeded the market (Paradex's snapshot source is trustworthy, decision 0094) and the account is flat. See below. |
 
@@ -58,6 +58,45 @@ names `PRIVATE_SN_PARACLEAR_MAINNET`, reads the mark price from `GET /markets/su
 an order whose size at the mark is below the minimum notional (Paradex judges it there). Caps above
 $11 resting per side or $50 inventory are refused. The $11 resting cap is judged at the order's own
 price (the notional a fill costs), not at the mark. `--help` lists every flag and output line.
+
+## testnet_quote --mainnet
+
+The fixed-offset loop on Paradex MAINNET, real money (FBC-tyft; owner answer "Yes, small and
+supervised"): a short session the owner runs and watches, on the same SEPARATE small mainnet
+account as `mainnet_smoke` (its variables, its lease directory `$HOME/.fueledbychai/mainnet_smoke`).
+A plumbing test of requoting, reconnects and Stop on prod before any model; it prices nothing
+from a model.
+
+Refused before anything connects unless both `--mainnet` and `--sole-trader` are given, the URLs
+are exactly mainnet's, `PARADEX_CHAIN_ID` (when set) is mainnet's, the caps are at most $11
+resting per side and $50 inventory (smaller are taken), both `--bid-bps` and `--ask-bps` are at
+least 20, `--duration` is at most 3600 s (one hour; `MAINNET_DURATION_MAX` in
+`examples/testnet_quote/args.rs`), and the venue declares its snapshot trustworthy. Then, before
+the order socket connects, `GET /system/config` must name `PRIVATE_SN_PARACLEAR_MAINNET` and
+`GET /positions` must show no position on any other market. The resync must seed the market (never
+by hand on mainnet). Every cycle reads the touch and the mark price together, both charged to the
+session's rate limiter, and leaves out (and prints) a side whose size at the mark is below the
+minimum notional. Every change is a cancel, acknowledged and ended, before the next place: no
+amend frame is ever sent.
+
+It Stops (kill switch + instrument cancel-all, nothing placed after) on Ctrl-C, at `--duration`
+or `--cycles`, on a resync mismatch, an order of ours gone Unknown, a refused login, a permanent
+refusal of a place or a cancel (or an asynchronous `ORDER_SIZE_BELOW_MIN`, a sizing error), a
+position on another market, and a `GET /positions` mismatch the re-read confirms. A request
+refused for its rate waits the venue's retry time (2 s when Paradex states none). `DONE ok` only
+when the loop ended as asked and Stop did all it must.
+
+```text
+unset PARADEX_ACCOUNT_ADDRESS PARADEX_PRIVATE_KEY
+export PARADEX_MAINNET_ACCOUNT_ADDRESS=...   # the separate mainnet account
+export PARADEX_MAINNET_PRIVATE_KEY=...       # its main L2 key
+cargo run -p fbc-examples --example testnet_quote -- --mainnet --sole-trader --namespace <N> \
+    --market BTC-USD-PERP --tick 0.1 --step 0.00001 --min-notional 10 \
+    --resting-cap-usd 11 --inventory-cap-usd 50 --order-usd 11 \
+    --bid-bps 30 --ask-bps 30 --duration 600
+```
+
+`--help` lists every flag and output line.
 
 ## paradex_testnet_acceptance
 

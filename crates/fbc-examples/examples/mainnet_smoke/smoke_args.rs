@@ -4,19 +4,13 @@
 //! ([`crate::testnet`]); the URL guard is mainnet's ([`crate::smoke::mainnet_guard`]).
 
 use fbc_runtime::ProxyConfig;
-use rust_decimal::Decimal;
 
 pub use crate::args::{Options, OrderSide};
-use crate::smoke::{MAINNET_REST, MAINNET_WS, mainnet_urls};
+use crate::mainnet::{LEASE_DIR_NAME, MAINNET_REST, MAINNET_WS, mainnet_urls, within_mainnet_caps};
 use crate::testnet::{
     Target, UNSHOWN, absolute, bounded, direct_to_stub, flag_name, lease_dir_named, positive,
     socks5, symbol,
 };
-
-/// The largest resting cap per side and inventory cap, in USD, a run takes (the owner's caps
-/// for the smoke); smaller ones are taken.
-pub const RESTING_CAP_MAX: Decimal = Decimal::from_parts(11, 0, 0, false, 0);
-pub const INVENTORY_CAP_MAX: Decimal = Decimal::from_parts(50, 0, 0, false, 0);
 
 /// The help text `--help` prints.
 pub const USAGE: &str = "\
@@ -246,7 +240,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         proxy,
         lease_dir: match lease_dir {
             Some(dir) => dir,
-            None => lease_dir_named(std::env::var_os("HOME"), "mainnet_smoke")?,
+            None => lease_dir_named(std::env::var_os("HOME"), LEASE_DIR_NAME)?,
         },
         sole_trader,
     };
@@ -259,8 +253,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
 }
 
 /// Refuses a run the owner has not confirmed with both `--mainnet` and `--sole-trader`, or
-/// whose caps exceed the smoke's ([`RESTING_CAP_MAX`], [`INVENTORY_CAP_MAX`]), or whose order
-/// exceeds its resting cap.
+/// whose caps exceed the mainnet caps ([`within_mainnet_caps`]: $11 resting per side, $50
+/// inventory), or whose order exceeds its resting cap.
 pub fn confirmed(smoke: &Smoke) -> Result<(), String> {
     let opts = &smoke.trade;
     if !smoke.mainnet {
@@ -270,17 +264,6 @@ pub fn confirmed(smoke: &Smoke) -> Result<(), String> {
         );
     }
     crate::args::sole(opts)?;
-    if opts.resting_cap_usd > RESTING_CAP_MAX {
-        return Err(format!(
-            "--resting-cap-usd {} is above the smoke's cap: at most ${RESTING_CAP_MAX} per side",
-            opts.resting_cap_usd
-        ));
-    }
-    if opts.inventory_cap_usd > INVENTORY_CAP_MAX {
-        return Err(format!(
-            "--inventory-cap-usd {} is above the smoke's cap: at most ${INVENTORY_CAP_MAX}",
-            opts.inventory_cap_usd
-        ));
-    }
+    within_mainnet_caps(opts.resting_cap_usd, opts.inventory_cap_usd)?;
     crate::args::within_cap(opts)
 }

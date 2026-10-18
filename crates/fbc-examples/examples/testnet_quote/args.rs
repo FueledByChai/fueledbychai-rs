@@ -1,20 +1,30 @@
 //! testnet_quote's command line, parsed by hand (no argument-parsing dependency). The testnet
 //! guard it checks (the REST and WebSocket URLs and the chain id must name Paradex's testnet or,
 //! for the URLs, a loopback test stub, checked before anything connects) and the value parsers
-//! are the samples' shared ones ([`crate::testnet`]).
+//! are the samples' shared ones ([`crate::testnet`]); with `--mainnet` (FBC-tyft) the URLs are
+//! mainnet's and the mainnet guard's ([`crate::mainnet`]), with its limits ([`mainnet_limits`]).
 
 use std::path::PathBuf;
 
 use fbc_runtime::ProxyConfig;
 use rust_decimal::Decimal;
 
+use crate::mainnet::{LEASE_DIR_NAME, MAINNET_REST, MAINNET_WS, mainnet_urls, within_mainnet_caps};
 pub use crate::testnet::{
     CHAIN_VAR, TESTNET_REST, TESTNET_WS, Target, direct_to_stub, hosts, testnet_guard,
 };
 use crate::testnet::{
-    UNSHOWN, absolute, bounded, default_lease_dir, flag_name, positive, socks5, symbol,
-    testnet_urls,
+    UNSHOWN, absolute, bounded, default_lease_dir, flag_name, lease_dir_named, positive, socks5,
+    symbol, testnet_urls,
 };
+
+/// The longest `--duration` a mainnet run takes, in seconds (one hour): a supervised session is
+/// short, and the owner watches it. Change it here.
+pub const MAINNET_DURATION_MAX: u64 = 3_600;
+
+/// The smallest offset from the touch a mainnet run quotes at, on either side, in basis points
+/// (the owner's "a wide offset (e.g. 20+ bps from the touch)").
+pub const MAINNET_OFFSET_MIN: u32 = 20;
 
 /// The help text `--help` prints.
 pub const USAGE: &str = "\
@@ -24,12 +34,15 @@ touch, and requotes them as the touch moves: Paradex's touch (GET /orderbook) ->
 desired book -> fbc-oms's ExecutionPlanner -> fbc-oms's caps and authorizations -> the
 order-entry session -> Paradex testnet. Every change is a cancel and then a new place once the
 old order ended (cancel-and-replace, never an amend). It prices nothing from any model: the
-offsets are the flags'. TESTNET ONLY: a mainnet URL or chain id is refused before anything
-connects. An owner-assisted testnet run (decision 0067): the first resync seeds the market's
-position (Paradex's snapshot is trustworthy, decision 0094), or, when it left it unknown, it is
-seeded by hand from the venue's own REST position; a restart seeds again.
+offsets are the flags'. TESTNET ONLY without --mainnet: a mainnet URL or chain id is refused
+before anything connects. An owner-assisted testnet run (decision 0067): the first resync seeds the
+market's position (Paradex's snapshot is trustworthy, decision 0094), or, when it left it
+unknown, it is seeded by hand from the venue's own REST position; a restart seeds again.
+With --mainnet (and --sole-trader) it runs the same loop on Paradex MAINNET, real money: a
+short session you run and watch (MAINNET MODE below).
 
 Usage: cargo run -p fbc-examples --example testnet_quote -- [OPTIONS]
+       cargo run -p fbc-examples --example testnet_quote -- --mainnet --sole-trader [OPTIONS]
 
 Environment (read once at start; no value is ever printed):
   PARADEX_ACCOUNT_ADDRESS   the testnet account's Starknet address (0x and hex digits)
@@ -39,6 +52,10 @@ Environment (read once at start; no value is ever printed):
                             PRIVATE_SN_PARACLEAR_TESTNET (the starknet_chain_id of GET
                             https://api.testnet.paradex.trade/v1/system/config), by name or as
                             its felt in decimal (as the Java library writes it) or 0x hex
+  With --mainnet, PARADEX_MAINNET_ACCOUNT_ADDRESS and PARADEX_MAINNET_PRIVATE_KEY instead (the
+  separate mainnet account and its main key), PARADEX_ACCOUNT_ADDRESS and PARADEX_PRIVATE_KEY
+  must NOT be set (either refuses the run), and PARADEX_CHAIN_ID, when set, must be mainnet's,
+  PRIVATE_SN_PARACLEAR_MAINNET.
 
 Required confirmation and namespace:
   --sole-trader             you confirm that no other process, Java or Rust, trades this
@@ -63,26 +80,35 @@ The quotes (required; no defaults):
                             touch, floored onto the size step: a fixed number of lots for the
                             whole run; at most --resting-cap-usd
   --bid-bps <N>             how far below the best bid the bid rests, 1 to 2000 basis points
+                            (at least 20 with --mainnet)
   --ask-bps <N>             how far above the best ask the ask rests, 1 to 2000 basis points
-  --duration <SECONDS>      how long the loop runs before it Stops, 1 to 86400
+                            (at least 20 with --mainnet)
+  --duration <SECONDS>      how long the loop runs before it Stops, 1 to 86400 (at most 3600
+                            with --mainnet)
 
 Options:
+  --mainnet                 you confirm this run trades Paradex MAINNET with real money
+                            (MAINNET MODE below); without it the run is testnet only
   --cycles <N>              Stop after N requote cycles, 1 to 1000000 (default: none, the
                             duration alone ends the run)
   --interval-ms <MS>        the pause between requote cycles, 100 to 60000 (default 1000)
   --step-timeout <SECONDS>  how long each awaited step (the login, the arm, the resync, a
                             book settling, a Stop cancel) may take before the run Stops, 1 to
                             120 (default 15)
-  --rest-url <URL>          REST base: https://api.testnet.paradex.trade/v1 (the default)
-                            or a loopback stub's
+  --rest-url <URL>          REST base: https://api.testnet.paradex.trade/v1 (the default;
+                            with --mainnet https://api.prod.paradex.trade/v1) or a loopback
+                            stub's
   --ws-url <URL>            order-entry WebSocket: wss://ws.api.testnet.paradex.trade/v1
-                            (the default) or a loopback stub's
+                            (the default; with --mainnet wss://ws.api.prod.paradex.trade/v1)
+                            or a loopback stub's
   --socks5 <HOST:PORT>      connect through this SOCKS5 proxy (default: directly); refused
                             with loopback stub URLs, which the proxy would resolve on its host
   --lease-dir <DIR>         an absolute path where the market, account and client-id leases
                             are taken and the client-id high-water mark is kept (default:
                             $HOME/.fueledbychai/testnet_trade, shared with testnet_trade so the
-                            two samples never trade one market or namespace at once)
+                            two samples never trade one market or namespace at once; with
+                            --mainnet $HOME/.fueledbychai/mainnet_smoke, shared with
+                            mainnet_smoke)
   -h, --help                print this help
 
 The URLs must be exactly Paradex's testnet ones (above), or both a loopback stub's (host an
@@ -90,17 +116,44 @@ address in 127.0.0.0/8 or [::1], never a name; any port; the path exactly /v1). 
 mainnet included, is refused, as is any chain id but PRIVATE_SN_PARACLEAR_TESTNET. A flag's
 value goes in the next argument, never after '='.
 
-Each cycle reads the touch, and for each side whose touch rests prices the quote behind it
-(floored for the bid, ceiled for the ask, onto the tick; refused unless strictly behind the
-touch). A side is left unquoted (and its order cancelled) when its book side is empty, when
-the quote's notional at its price would exceed --resting-cap-usd or fall below
---min-notional, or when a fill of it would take the position past --inventory-cap-usd at the
-highest of the quote prices and the touch. fbc-oms checks the same caps in lots, converted at
-the first touch, on every place.
+MAINNET MODE (--mainnet; refused without both --mainnet and --sole-trader). A supervised
+plumbing test on a SEPARATE small mainnet account (not the one the Java quoter trades): the
+same loop, with these limits, each checked before anything connects:
+  - the URLs exactly https://api.prod.paradex.trade/v1 and wss://ws.api.prod.paradex.trade/v1
+    (or both a loopback stub's), PARADEX_CHAIN_ID, when set, mainnet's, and at start GET
+    /system/config must name PRIVATE_SN_PARACLEAR_MAINNET, the chain the login signs for;
+  - the mainnet-only credential variables (above);
+  - --resting-cap-usd at most 11 and --inventory-cap-usd at most 50 (smaller are taken);
+  - --bid-bps and --ask-bps at least 20;
+  - --duration at most 3600 (one hour);
+  - the venue's snapshot source trustworthy (Paradex's is, decision 0094): the resync seeds
+    the market's position, and a mainnet market is never seeded by hand, so a resync that
+    seeds nothing refuses Start;
+  - GET /positions read once before the order socket connects: a position on any other market
+    refuses the run (--sole-trader: no other process trades the account).
+A permanent refusal of a place or a cancel Stops the run and fails it, as an asynchronous
+ORDER_SIZE_BELOW_MIN does (a sizing error, not a venue fault).
+
+Each cycle reads the touch (GET /orderbook) and the mark price (GET /markets/summary), both
+charged to the venue's rate limit with the session's traffic, and for each side whose touch
+rests prices the quote behind it (floored for the bid, ceiled for the ask, onto the tick;
+refused unless strictly behind the touch). A side is left unquoted (and its order cancelled)
+when its book side is empty, when the quote's notional at its price would exceed
+--resting-cap-usd or fall below --min-notional, when its notional at the MARK price would fall
+below --min-notional (Paradex judges the minimum at the mark and refuses an order below it only
+after accepting it), or when a fill of it would take the position past --inventory-cap-usd at
+the highest of the quote prices, the touch and the mark. fbc-oms checks the same caps in lots,
+converted at the first touch (the inventory cap at no less than the mark), on every place. A
+pass after a fill moved the position reads a touch newer than the one it held (a higher
+seq_no). A request the venue refuses for its rate (RateLimited) waits the venue's retry time,
+or 2 s when it states none (Paradex states none), before anything more is sent; any other
+refusal of a place or a cancel of ours (but a post-only place that would cross, which leaves
+its side out of the cycle) Stops the run and fails it.
 
 It Stops (kill switch on, every order of ours on the market cancelled, the session closed) on
 Ctrl-C, at --duration or --cycles, on a refused login, on a resync whose position disagrees
-with the inventory or that the registry refuses, on any order of ours going Unknown (it does
+with the inventory or that the registry refuses, on a permanent refusal of a place or a cancel
+of ours, on a position on another market, on any order of ours going Unknown (it does
 not drive the Unknown ladder: no Paradex order query is wired here), on an order or fill not
 ours, an amend of ours, any problem the order socket reports, a book that does not settle
 within the step timeout, and when the order-entry session ends. After every reconnect, once
@@ -111,12 +164,19 @@ answers ALREADY_CLOSED, FBC-rht4), which Stops the run: the conservative end.
 
 Lines (each with the milliseconds since the start):
   TESTNET ...        the hosts the guard accepted (never the URLs)
+  MAINNET ...        with --mainnet, the same: Paradex MAINNET, real money
   OWNER-ASSISTED ... this is a declared owner-assisted testnet run (decision 0067)
+  SUPERVISED ...     with --mainnet: a supervised mainnet run, never seeded by hand, its caps
+                     and its duration
   PLUMBING TEST ...  a reminder: fixed offsets, no model
-  QUOTE ...          the quote size in lots and the caps in lots, from the first touch
+  STEP chain         with --mainnet: GET /system/config names PRIVATE_SN_PARACLEAR_MAINNET
+  QUOTE ...          the quote size in lots and the caps in lots, from the first touch and
+                     the first mark
+  STEP positions     with --mainnet: GET /positions shows no position on another market
   STEP login|arm|resync|start   as testnet_trade prints them
-  SEED ...           the position the first resync seeded (or seeded by hand, if it did not)
-  CYCLE n ...        a requote cycle that changed the book: the touch and the quotes
+  SEED ...           the position the first resync seeded (or, on testnet only, seeded by
+                     hand, if it did not)
+  CYCLE n ...        a requote cycle that changed the book: the touch, the mark and the quotes
   SKIP side ...      a side left unquoted this cycle, and why
   PLACE side ...     a place handed to the session: its client id sequence, size and price
   CANCEL side ...    a cancel handed to the session (a replace, a side pulled, a reconnect's
@@ -125,6 +185,7 @@ Lines (each with the milliseconds since the start):
   CLOSED ...         the order event ending an order of ours, and what of it filled
   FILL ...           a fill of an order of ours
   RECONNECT ...      a new connection: every order of ours still open is cancelled first
+  PACE ...           a request refused for its rate: nothing more is sent until its retry time
   NOTE ...           something worth knowing
   STOP <why>         why the loop ended
   STEP stop          kill switch on, cancel all sent for what is still open, session closing
@@ -172,6 +233,8 @@ pub struct Options {
     pub lease_dir: PathBuf,
     /// The owner's confirmation that no other process trades the account.
     pub sole_trader: bool,
+    /// `--mainnet`: the owner's confirmation that the run trades Paradex MAINNET (FBC-tyft).
+    pub mainnet: bool,
 }
 
 /// What the command line asked for.
@@ -193,11 +256,10 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     let mut cycles = None;
     let mut interval_ms = 1_000;
     let mut step_timeout_secs = 15;
-    let mut rest_url = TESTNET_REST.to_owned();
-    let mut ws_url = TESTNET_WS.to_owned();
+    let (mut rest_url, mut ws_url) = (None, None);
     let mut proxy = ProxyConfig::Direct;
     let mut lease_dir = None;
-    let mut sole_trader = false;
+    let (mut sole_trader, mut mainnet) = (false, false);
     let mut args = args.into_iter();
     // The position of the argument read last, from 1: a refusal names it, not what was typed.
     let mut at = 0usize;
@@ -208,6 +270,10 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         }
         if flag == "--sole-trader" {
             sole_trader = true;
+            continue;
+        }
+        if flag == "--mainnet" {
+            mainnet = true;
             continue;
         }
         // A value that starts with `--` is the next flag: the value was left out.
@@ -239,8 +305,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             "--cycles" => cycles = Some(bounded(&flag, &value()?, 1, 1_000_000)?),
             "--interval-ms" => interval_ms = bounded(&flag, &value()?, 100, 60_000)?,
             "--step-timeout" => step_timeout_secs = bounded(&flag, &value()?, 1, 120)?,
-            "--rest-url" => rest_url = value()?,
-            "--ws-url" => ws_url = value()?,
+            "--rest-url" => rest_url = Some(value()?),
+            "--ws-url" => ws_url = Some(value()?),
             "--socks5" => proxy = socks5(&value()?)?,
             "--lease-dir" => lease_dir = Some(absolute(&value()?)?),
             // A flag (shaped like one) is named, by its part before any '=' only: what follows
@@ -279,20 +345,69 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         cycles,
         interval_ms,
         step_timeout_secs,
-        rest_url,
-        ws_url,
+        rest_url: rest_url
+            .unwrap_or_else(|| if mainnet { MAINNET_REST } else { TESTNET_REST }.to_owned()),
+        ws_url: ws_url.unwrap_or_else(|| if mainnet { MAINNET_WS } else { TESTNET_WS }.to_owned()),
         proxy,
         lease_dir: match lease_dir {
             Some(dir) => dir,
+            None if mainnet => lease_dir_named(std::env::var_os("HOME"), LEASE_DIR_NAME)?,
             None => default_lease_dir()?,
         },
         sole_trader,
+        mainnet,
     };
-    let target = testnet_urls(&opts.rest_url, &opts.ws_url)?;
-    direct_to_stub(target, &opts.proxy)?;
-    sole(&opts)?;
-    within_cap(&opts)?;
+    confirmed(&opts)?;
     Ok(Parsed::Quote(Box::new(opts)))
+}
+
+/// Every check of `opts` made before anything connects, here and again by the run: the URLs
+/// (the testnet's, or with `--mainnet` mainnet's; or both a loopback stub's, then no SOCKS5
+/// proxy), `--sole-trader`, the quote within the resting cap, and with `--mainnet` its limits
+/// ([`mainnet_limits`]). Whether the URLs are a loopback stub's.
+pub fn confirmed(opts: &Options) -> Result<bool, String> {
+    let stub = if opts.mainnet {
+        mainnet_urls(&opts.rest_url, &opts.ws_url)?
+    } else {
+        testnet_urls(&opts.rest_url, &opts.ws_url)? == Target::LoopbackStub
+    };
+    let target = if stub {
+        Target::LoopbackStub
+    } else {
+        Target::Testnet
+    };
+    direct_to_stub(target, &opts.proxy)?;
+    sole(opts)?;
+    within_cap(opts)?;
+    mainnet_limits(opts)?;
+    Ok(stub)
+}
+
+/// With `--mainnet`, the owner's limits for a supervised mainnet session (FBC-tyft): caps of at
+/// most $11 resting per side and $50 inventory ([`within_mainnet_caps`]), offsets of at least
+/// [`MAINNET_OFFSET_MIN`] basis points on both sides, and a `--duration` of at most
+/// [`MAINNET_DURATION_MAX`] seconds. A testnet run has none of them.
+pub fn mainnet_limits(opts: &Options) -> Result<(), String> {
+    if !opts.mainnet {
+        return Ok(());
+    }
+    within_mainnet_caps(opts.resting_cap_usd, opts.inventory_cap_usd)?;
+    for (flag, bps) in [("--bid-bps", opts.bid_bps), ("--ask-bps", opts.ask_bps)] {
+        if bps < MAINNET_OFFSET_MIN {
+            return Err(format!(
+                "{flag} {bps} is under the mainnet minimum: at least {MAINNET_OFFSET_MIN} basis \
+                 points from the touch on mainnet"
+            ));
+        }
+    }
+    if opts.duration_secs > MAINNET_DURATION_MAX {
+        return Err(format!(
+            "--duration {} is above the mainnet maximum: at most {MAINNET_DURATION_MAX} s (one \
+             hour) on mainnet, a supervised session",
+            opts.duration_secs
+        ));
+    }
+    Ok(())
 }
 
 /// Refuses a run the owner has not confirmed is the account's only trader (`--sole-trader`).

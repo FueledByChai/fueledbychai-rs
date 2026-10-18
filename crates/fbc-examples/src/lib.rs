@@ -29,7 +29,11 @@
 //!   of basis points behind the touch and requotes them through fbc-oms's `ExecutionPlanner`
 //!   (cancel-and-replace only, the caps checked on every place), cancelling every order of ours
 //!   still open after each reconnect before it places, until Ctrl-C, `--duration` or
-//!   `--cycles`; then Stop and a summary.
+//!   `--cycles`; then Stop and a summary. With `--mainnet` (FBC-tyft), the same loop on Paradex
+//!   MAINNET for a short supervised session behind `--mainnet` and `--sole-trader`: mainnet's
+//!   guard (`src/mainnet.rs`, shared with `mainnet_smoke`), its credentials
+//!   (`src/auth_mainnet.rs`), caps of at most $11 resting per side and $50 inventory, offsets of
+//!   at least 20 bps, at most an hour, never seeded by hand.
 //! - `mainnet_smoke` (`examples/mainnet_smoke/`, FBC-p0aa): Paradex MAINNET, the owner's first
 //!   prod order: testnet_trade's round trip (its `trade.rs`, by path), never seeded by hand,
 //!   behind `--mainnet` and `--sole-trader`, caps of at most $11 resting per side and $50
@@ -40,7 +44,8 @@
 //!
 //! The samples that trade share, by path as well, `src/link.rs` (the ExecHandler-to-Registry
 //! glue) and `src/testnet.rs` (the testnet guard, the market's spec, the session's wiring, the
-//! client-id high-water mark); `testnet_trade` (and so `mainnet_smoke`) and `testnet_quote` also
+//! client-id high-water mark, the touch and mark reads); the mainnet ones `src/mainnet.rs` (the
+//! mainnet guard); `testnet_trade` (and so `mainnet_smoke`) and `testnet_quote` also
 //! share `src/positions.rs` (FBC-hpg6: `GET /positions` compared with the registry's position
 //! after the first fill and at Stop, a mismatch the re-read confirms Stopping the run), which
 //! reads through `src/auth_rest.rs`; none is a module of this library target.

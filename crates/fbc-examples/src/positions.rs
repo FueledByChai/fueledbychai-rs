@@ -24,6 +24,12 @@
 //! nothing placed after) and fails it, saying to check the position by hand ([`HAND_CHECK`]).
 //! What Stops it is each sample's: this module reads, compares and prints.
 //!
+//! **Other markets** ([`PositionCheck::elsewhere`], `testnet_quote --mainnet`, FBC-tyft): before
+//! the order socket connects, one `GET /positions` read lists the account's open positions on
+//! every market but the run's ([`other_markets`]); one there breaks `--sole-trader`'s premise,
+//! and the run is refused (Codex r4277631493 on PR #149). The adapter's decoder is not used for
+//! it: it knows only the run's market, and refuses an answer naming another.
+//!
 //! Nothing here prints, logs or keeps a credential: the reader's errors name the request and
 //! its status only, and an answer's body is decoded, never shown.
 
@@ -139,6 +145,41 @@ pub fn market_position(
         .unwrap_or(SignedLots(0)))
 }
 
+/// The open positions of a nonzero size on markets other than `market` that a `GET /positions`
+/// answer `body` lists, each as `<market> <size>` (the market named only when shaped like a
+/// Paradex perpetual, [`crate::testnet::symbol`], the size a decimal), or why the answer is
+/// refused (naming the part, never the body).
+pub fn other_markets(body: &[u8], market: &str) -> Result<Vec<String>, String> {
+    let answer: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| "GET /positions: not a JSON answer".to_owned())?;
+    let results = answer["results"]
+        .as_array()
+        .ok_or("GET /positions: no results list")?;
+    let mut held = Vec::new();
+    for position in results {
+        let name = position["market"]
+            .as_str()
+            .ok_or("GET /positions: a position with no market")?;
+        if name == market {
+            continue;
+        }
+        let size = position["size"]
+            .as_str()
+            .and_then(|s| s.parse::<rust_decimal::Decimal>().ok())
+            .ok_or("GET /positions: a position with no decimal size")?;
+        if size.is_zero() {
+            continue;
+        }
+        let shown = if crate::testnet::symbol(name).is_ok() {
+            name
+        } else {
+            "(a market not shown: not shaped like a Paradex perpetual)"
+        };
+        held.push(format!("{shown} {size}"));
+    }
+    Ok(held)
+}
+
 /// Reads `GET /positions` and compares the market's size with the registry's (module
 /// documentation).
 pub struct PositionCheck {
@@ -177,6 +218,26 @@ impl PositionCheck {
             caps,
             wait,
         })
+    }
+
+    /// The account's open positions on every market but the check's own, as `GET /positions`
+    /// lists them now ([`other_markets`]), or why they could not be read.
+    pub async fn elsewhere(&mut self) -> Result<Vec<String>, String> {
+        let by = Instant::now() + self.wait;
+        let answer = self.rest.get(positions_request(&self.rest_url), by).await?;
+        let market = self
+            .specs
+            .get(INST)
+            .ok_or("the market is not in the spec table")?
+            .venue_symbol
+            .as_wire()
+            .to_owned();
+        match answer {
+            RestAnswer {
+                status: 200, body, ..
+            } => other_markets(&body, &market),
+            RestAnswer { status, .. } => Err(format!("GET /positions: status {status}")),
+        }
     }
 
     /// The market's size as `GET /positions` states it now, or why it could not be read.
