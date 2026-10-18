@@ -47,11 +47,12 @@
 //! fills). After the first fill the loop sees, the next pass reads `GET /positions` before it
 //! plans and compares the market's size with the registry's position, exactly in lots
 //! ([`PositionCheck`]); a mismatch is read once more after the step timeout, both readings
-//! printed. One the re-read clears lets the loop go on; one that persists Stops it (the kill
-//! switch and the cancel of everything of ours), with nothing planned or placed after the fill,
-//! and fails the run, saying to check the position by hand. At Stop, once Stop's cancels are answered, the comparison runs
-//! again on every run, fills or not; a mismatch that persists there fails the run with both
-//! readings.
+//! printed. The check is raced against what ends a cycle, as a touch is, and the pass after it
+//! reads a fresh touch before it plans. One the re-read clears lets the loop go on; one that
+//! persists Stops it (the kill switch and the cancel of everything of ours), with nothing
+//! planned or placed after the fill, and fails the run, saying to check the position by hand.
+//! At Stop, once Stop's cancels are answered, the comparison runs again on every run, fills or
+//! not; a mismatch that persists there fails the run with both readings.
 //!
 //! **Memory.** The link's notes are read once each ([`Driver::absorb`]) and those read are
 //! forgotten every cycle ([`Link::forget`]), so a long run keeps no growing note list.
@@ -84,7 +85,7 @@ use tokio::sync::Notify;
 
 use crate::args::{Options, Target, direct_to_stub, hosts, sole, testnet_guard};
 use crate::link::{Link, LinkHandler, Note, async_reject};
-use crate::positions::{Creds, PositionCheck, fills_in};
+use crate::positions::{Creds, PositionCheck, Verdict, fills_in};
 use crate::testnet::{
     ACCOUNT_LABEL, ACCT, HighWater, INST, Lines, Out, TESTNET_CHAIN, VENUE, config, drive_with,
     inventory_price, off_thread_holding, px_or_none, resync_disagreements, session_config,
@@ -594,7 +595,7 @@ pub async fn run(
         ours: HashMap::new(),
         owned: Vec::new(),
         cancelled: 0,
-        fills: 0,
+        fills: Rc::new(Cell::new(0)),
         cycles: 0,
         last: None,
         book_seq: book.seq_no,
@@ -735,7 +736,9 @@ struct Driver {
     owned: Vec<ClientOrderId>,
     /// Orders of ours that ended cancelled.
     cancelled: usize,
-    fills: usize,
+    /// Fills of ours read from the notes: shared with the position check's registry reading,
+    /// which may land after more notes were read ([`Driver::registry_now`]).
+    fills: Rc<Cell<usize>>,
     cycles: u64,
     /// The last cycle's quotes and skipped sides, to print a cycle only when they change.
     last: Option<(Option<Ticks>, Option<Ticks>, Vec<String>)>,
@@ -796,10 +799,10 @@ impl Driver {
     /// The registry's position on the market and the fills of ours applied (those read and
     /// those still in the link's notes), read when called.
     fn registry_now(&self) -> impl Fn() -> (SignedLots, usize) + use<> {
-        let (link, read) = (Rc::clone(&self.link), self.fills);
+        let (link, read) = (Rc::clone(&self.link), Rc::clone(&self.fills));
         move || {
             let link = link.borrow();
-            let fills = read + fills_in(link.notes());
+            let fills = read.get() + fills_in(link.notes());
             (link.registry().inventory(INST), fills)
         }
     }
@@ -807,6 +810,13 @@ impl Driver {
     /// The check after the first fill (module documentation), when one is due: true when it
     /// ran. A mismatch the re-read confirms is a reason to Stop. One due on a market whose
     /// position is not known (never, once the loop Started) is left to the Stop comparison.
+    ///
+    /// The check is raced against what ends a cycle ([`Driver::ending`]: the interrupt, a
+    /// reason to Stop, a connection's end, `--duration`), read as the notes come, so none of
+    /// them waits for its reads or its re-read's wait (up to three step timeouts) while the
+    /// quotes rest (RA157-1 / RB157-2 on PR #157, the rule of Codex r4243989987 on PR #149).
+    /// A check cut short is due again: the Stop comparison takes it, or the next pass after a
+    /// reconnect's sweep.
     async fn check_after_first_fill(&mut self) -> bool {
         if !self.fill_check_due {
             return false;
@@ -820,12 +830,43 @@ impl Driver {
             return false;
         };
         let when = "after the first fill";
-        let verdict = check.check(when, &self.lines, self.registry_now()).await;
+        let verdict = self.check_unless_ended(&mut check, when).await;
         self.positions = Some(check);
+        let Some(verdict) = verdict else {
+            self.fill_check_due = true;
+            return false;
+        };
         if let Some(why) = verdict.failure(when) {
             self.trouble(why);
         }
         true
+    }
+
+    /// `check` `when`, or `None` once the cycle must end before it comes to a verdict
+    /// ([`Driver::ending`], as [`Driver::touch_unless_ended`] reads the touch); the check is
+    /// then dropped, its read or its re-read's wait abandoned.
+    async fn check_unless_ended(
+        &mut self,
+        check: &mut PositionCheck,
+        when: &str,
+    ) -> Option<Verdict> {
+        let lines = self.lines.clone();
+        let checking = check.check(when, &lines, self.registry_now());
+        tokio::pin!(checking);
+        loop {
+            let wake = Rc::clone(&self.wake);
+            // Created before the check, so a wake between the check and the await is kept.
+            let woken = wake.notified();
+            self.absorb();
+            if self.ending() {
+                return None;
+            }
+            tokio::select! {
+                verdict = &mut checking => return Some(verdict),
+                () = woken => {}
+                () = tokio::time::sleep_until(self.deadline) => return None,
+            }
+        }
     }
 
     /// The comparison at Stop (module documentation): why the run fails when a mismatch
@@ -862,7 +903,7 @@ impl Driver {
             places_sent,
             cancels_sent,
             cancelled: self.cancelled,
-            fills: self.fills,
+            fills: self.fills.get(),
             inventory: reg.inventory(INST).0,
             requests_held: link.requests_held().max(self.ours.len()),
         }
@@ -1021,7 +1062,7 @@ impl Driver {
                     // Held by the ledger (a duplicate, or before its watermark): not applied.
                     self.note(format_args!("a fill not applied: {seen}"));
                 } else {
-                    self.fills += 1;
+                    self.fills.set(self.fills.get() + 1);
                     let inventory = self.link.borrow().registry().inventory(INST).0;
                     self.event(
                         "FILL",
@@ -1666,14 +1707,20 @@ impl Driver {
         let mut left_out: Vec<Side> = Vec::new();
         let mut placed: Vec<(Side, ClientOrderId)> = Vec::new();
         let mut holding = false;
+        // A check ran since the touch was read: the touch is read again before anything is
+        // planned.
+        let mut aged = false;
         loop {
             let wake = Rc::clone(&self.wake);
             let woken = wake.notified();
             // After the first fill, GET /positions against the registry before anything is
             // planned (FBC-hpg6): its reads (and a re-read's wait) are not the book's settling
-            // time, which starts again.
+            // time, which starts again, and the touch held is as old as the check, so the pass
+            // reads a fresh one before it plans (RA157-2 / RB157-1 on PR #157): no quote is
+            // priced from a book read before the check.
             if self.check_after_first_fill().await {
                 deadline = tokio::time::Instant::now() + self.timeout;
+                aged = true;
             }
             if let Some(ended) = self.halted()? {
                 return Ok(ended);
@@ -1684,14 +1731,15 @@ impl Driver {
             let inventory = |d: &Driver| d.link.borrow().registry().inventory(INST);
             let mut position = inventory(self);
             // A fresh touch for a moved position, read again until no fill moved it while the
-            // touch was being read (Codex r4243908416).
-            while !cut && position != read_at {
+            // touch was being read (Codex r4243908416), and one after a position check.
+            while !cut && (aged || position != read_at) {
                 let left = deadline.saturating_duration_since(tokio::time::Instant::now());
                 let Some(fresh) = self.touch_unless_ended(left).await? else {
                     cut = true;
                     break;
                 };
                 book = fresh;
+                aged = false;
                 read_at = position;
                 position = inventory(self);
             }
