@@ -37,9 +37,9 @@ use fbc_core::{
 use fbc_journal::{JournalSink, Record, Recorded};
 use fbc_oms::ControlCommand;
 use fbc_runtime::{
-    Changed, Connector, ExecHandler, ExecOrders, ExecSession, ExecSessionError, IngestClock,
-    Journal, Ladder, Liveness, MdSession, MdSessionConfig, MdVenue, MdVenueConfig, Member,
-    ProxyConfig, ReconnectPacing, ShardError, ShardHost, WriteStall,
+    Changed, Connector, Decide, ExecHandler, ExecOrders, ExecSession, ExecSessionError,
+    IngestClock, Journal, Ladder, Liveness, MdSession, MdSessionConfig, MdVenue, MdVenueConfig,
+    Member, ProxyConfig, ReconnectPacing, ShardError, ShardHost, Unsubmitted, WriteStall,
 };
 
 /// The price of the toy's trade the market-data server sends with its upgrade answer.
@@ -606,10 +606,39 @@ async fn a_members_error_ends_the_run_at_once_and_a_run_ends_once_every_member_h
     assert_eq!(host.passes(), 0);
 }
 
-/// A ladder command whose session has ended is refused there and counted, and the run goes on;
-/// an authorization for another account than the session's is handed back unplanned.
+/// What a decide pass of the hand-back test decided and was handed back.
+struct HandBack {
+    passes: Rc<RefCell<Vec<Vec<InstrumentId>>>>,
+    unsubmitted: Rc<RefCell<Vec<Unsubmitted>>>,
+    oms: Oms,
+    /// The orders of a session that has run and ended.
+    ended: ExecOrders,
+    /// The orders of a session that never runs: what is submitted to it stays there.
+    unrun: ExecOrders,
+}
+
+impl Decide for HandBack {
+    fn decide(&mut self, instruments: &[InstrumentId], ladder: &mut Ladder) {
+        self.passes.borrow_mut().push(instruments.to_vec());
+        if instruments.is_empty() {
+            return;
+        }
+        ladder.push_control(&self.ended, ControlCommand::FeeQuery);
+        ladder.push_control(&self.unrun, ControlCommand::RefreshDeadMan);
+        ladder.push(&self.unrun, self.oms.place()).unwrap();
+        assert_eq!(ladder.len(), 3);
+    }
+
+    fn unsubmitted(&mut self, command: Unsubmitted) {
+        self.unsubmitted.borrow_mut().push(command);
+    }
+}
+
+/// A ladder command whose session has ended when its turn comes, and every command the run's
+/// end leaves, are handed back unsubmitted, an authorization unspent, and counted; an
+/// authorization for another account than the session's is never planned.
 #[tokio::test]
-async fn a_ladder_command_for_an_ended_session_is_refused_and_counted_and_another_accounts_is_handed_back()
+async fn a_ladder_command_whose_session_ended_or_that_the_runs_end_left_is_handed_back_and_another_accounts_is_never_planned()
  {
     let clock = IngestClock::new();
     let mut host = ShardHost::new(clock.clone());
@@ -623,12 +652,14 @@ async fn a_ladder_command_for_an_ended_session_is_refused_and_counted_and_anothe
     let (mut ended, control) = ExecSession::new(config, |_| {}).unwrap();
     drop(control);
     ended.run().await.unwrap();
-    let orders = ended.orders();
+    // One that is never run, for the account the registry authorizes for.
+    let (unrun, _unrun_control) =
+        ExecSession::new(session_config(&server.url(), &reserved), |_| {}).unwrap();
 
     // Another account's authorization is handed back, nothing planned.
     let mut oms = Oms::armed();
     let mut ladder = Ladder::default();
-    let refused = ladder.push(&orders, oms.place());
+    let refused = ladder.push(&ended.orders(), oms.place());
     assert!(refused.is_err_and(|auth| auth.account() == armed_oms::ACCT));
     assert!(ladder.is_empty());
 
@@ -666,21 +697,21 @@ async fn a_ladder_command_for_an_ended_session_is_refused_and_counted_and_anothe
     let (mut md, md_control) = MdVenue::new(venue_config, handler).unwrap();
     md_control.set_desired(vec![toy::sub(1)]).unwrap();
 
-    let passes = Rc::new(RefCell::new(Vec::new()));
-    let seen = Rc::clone(&passes);
-    let mut decide = move |instruments: &[InstrumentId], ladder: &mut Ladder| {
-        seen.borrow_mut().push(instruments.to_vec());
-        if !instruments.is_empty() {
-            ladder.push_control(&orders, ControlCommand::FeeQuery);
-            assert_eq!(ladder.len(), 1);
-        }
+    let mut decide = HandBack {
+        passes: Rc::default(),
+        unsubmitted: Rc::default(),
+        oms,
+        ended: ended.orders(),
+        unrun: unrun.orders(),
     };
-    let watch = Rc::clone(&passes);
+    let (watch, back) = (Rc::clone(&decide.passes), Rc::clone(&decide.unsubmitted));
     let script = async move {
         let mut peer = md_server.accept().await;
         assert!(peer.recv().await.starts_with("hello|"));
         peer.send(&trade(FIRST_PX, 1));
-        let decided = || watch.borrow().iter().any(|p| !p.is_empty());
+        // The pass decides, the ended session's command is handed back at once and the next is
+        // submitted to the session that never runs, which keeps it: the run waits on it.
+        let decided = || !back.borrow().is_empty();
         for _ in 0..10_000 {
             if decided() {
                 break;
@@ -688,13 +719,29 @@ async fn a_ladder_command_for_an_ended_session_is_refused_and_counted_and_anothe
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         assert!(decided());
+        assert!(watch.borrow().contains(&vec![InstrumentId::new(1)]));
+        assert_eq!(back.borrow().len(), 1);
+        // Every member ends: the rest of the ladder goes back.
         drop(md_control);
         peer
     };
     let members = vec![Member::md_venue(&mut md)];
     let (ran, _peer) = tokio::join!(host.run(members, &mut decide), script);
     ran.unwrap();
-    assert_eq!(host.refused(), 1);
-    assert!(passes.borrow().contains(&vec![InstrumentId::new(1)]));
-    assert_eq!(u64::try_from(passes.borrow().len()).unwrap(), host.passes());
+    let back = decide.unsubmitted.borrow();
+    assert!(
+        matches!(
+            back[..],
+            [
+                Unsubmitted::Control(ControlCommand::FeeQuery),
+                Unsubmitted::Authorized(_)
+            ]
+        ),
+        "{back:?}"
+    );
+    assert_eq!(host.unsubmitted(), 2);
+    assert_eq!(
+        u64::try_from(decide.passes.borrow().len()).unwrap(),
+        host.passes()
+    );
 }

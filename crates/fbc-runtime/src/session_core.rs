@@ -79,10 +79,15 @@ fn tick_to_wire(
 
 /// The stamp source the sessions of one shard thread share: one ingest sequence, so ingest
 /// order is shard-global, and one monotonic origin. Cloning it shares it.
+///
+/// It also keeps the stamp of the input being handled, from its stamp until its session waits
+/// for the next input, so a command a handler submits then, on whichever session of the shard,
+/// is attributed to that input (decision 0100).
 #[derive(Clone, Debug)]
 pub struct IngestClock {
     next: Rc<Cell<u64>>,
     origin: Instant,
+    handling: Rc<Cell<Option<Stamp>>>,
 }
 
 impl Default for IngestClock {
@@ -97,6 +102,7 @@ impl IngestClock {
         IngestClock {
             next: Rc::new(Cell::new(0)),
             origin: Instant::now(),
+            handling: Rc::new(Cell::new(None)),
         }
     }
 
@@ -106,13 +112,31 @@ impl IngestClock {
         let ingest_seq = self.next.get();
         self.next.set(ingest_seq.wrapping_add(1));
         let (recv_mono, recv_wall) = self.now();
-        Stamp {
+        let stamp = Stamp {
             ingest_seq,
             kernel_rx,
             recv_mono,
             recv_wall,
             conn,
-        }
+        };
+        self.handling.set(Some(stamp));
+        stamp
+    }
+
+    /// The ingest sequence the next input will be stamped with.
+    pub(crate) fn next_seq(&self) -> u64 {
+        self.next.get()
+    }
+
+    /// The stamp of the input being handled, if one is: a command submitted now is attributed
+    /// to it (decision 0100).
+    pub(crate) fn handling(&self) -> Option<Stamp> {
+        self.handling.get()
+    }
+
+    /// No input is being handled: the session waits for the next, or the shard host decides.
+    pub(crate) fn handled(&self) {
+        self.handling.set(None);
     }
 
     /// Now, on the monotonic clock from the origin and on the wall clock.
@@ -326,6 +350,8 @@ impl Core {
         url: &str,
         ctl: &mut impl Control,
     ) -> Result<Option<WebSocket>, SessionError> {
+        // No input is being handled while the session waits to connect (decision 0100).
+        self.clock.handled();
         loop {
             let mut at = self.pacer.next_attempt(Instant::now());
             let mut waiting = true;
@@ -565,16 +591,17 @@ impl Core {
         self.run_effects(ws, inputs, effects).await
     }
 
-    /// Executes `fx` as [`Self::execute`] does, attributed to no input, every frame and HTTP
-    /// request in it already charged with the connection each request opens ([`http_of`]), so
-    /// none is charged again (PR #90 Reviewer B B7).
+    /// Executes `fx` as [`Self::execute`] does, attributed to the input stamped `origin`, every
+    /// frame and HTTP request in it already charged with the connection each request opens
+    /// ([`http_of`]), so none is charged again (PR #90 Reviewer B B7).
     pub(crate) async fn execute_all_charged(
         &mut self,
         ws: &mut Option<WebSocket>,
         inputs: &mut dyn EpochInputs,
         mut fx: Effects,
+        origin: Option<Stamp>,
     ) -> Result<bool, SessionError> {
-        let effects = fx.take().into_iter().map(|e| (e, true, None)).collect();
+        let effects = fx.take().into_iter().map(|e| (e, true, origin)).collect();
         self.run_effects(ws, inputs, effects).await
     }
 
@@ -1131,6 +1158,20 @@ mod tests {
         let timer = tick_to_wire(own, safety, Some(clock.stamp(conn, None)), WallNs(1_250));
         let unattributed = tick_to_wire(own, safety, None, WallNs(1_250));
         assert_eq!((normal, timer, unattributed), (None, None, None));
+    }
+
+    #[test]
+    fn a_clock_keeps_the_stamp_of_the_input_being_handled_until_it_is_handled() {
+        let clock = IngestClock::new();
+        let shared = clock.clone();
+        let conn = ConnKey { conn: 1, epoch: 0 };
+        assert_eq!((clock.handling(), clock.next_seq()), (None, 0));
+        let first = clock.stamp(conn, None);
+        assert_eq!((shared.handling(), shared.next_seq()), (Some(first), 1));
+        let second = shared.stamp(conn, Some(KernelRxNs(5)));
+        assert_eq!(clock.handling(), Some(second));
+        shared.handled();
+        assert_eq!((clock.handling(), clock.next_seq()), (None, 2));
     }
 
     #[test]

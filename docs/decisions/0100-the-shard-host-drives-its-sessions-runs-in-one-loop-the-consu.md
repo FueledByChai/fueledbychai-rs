@@ -65,9 +65,11 @@ caps again when it is authorized (0082), and releases a held place whose command
 7. **Ends.** A member that ends without an error is polled no more; the run returns once every
    member has ended. A member's error ends the run at once and is returned, as `MdVenue::run`
    does for its endpoints; dropping the other runs closes their connections, which the venue's
-   per-connection cancel-on-disconnect protects (0058). A ladder command whose session has
-   ended is refused `Ended` there, as any submission to an ended session is (0057); the consumer
-   holds it unresolved until the venue is read again (0013 rule 1; handing it back is FBC-6ezy).
+   per-connection cancel-on-disconnect protects (0058). A ladder command never submitted,
+   because its session had ended when its turn came or the run ended first, is handed back to
+   the consumer (`Decide::unsubmitted`, an authorization unspent) and counted: nothing of it
+   reached a session, so no `on_submitted` reports it. Withdrawing such an authorization in
+   fbc-oms is FBC-6ezy's.
 
 ## Alternatives
 
@@ -85,12 +87,18 @@ caps again when it is authorized (0082), and releases a held place whose command
 - A decide pass that returns its ladder lazily, the host asking for the next command after each
   poll: rejected. The consumer can already react between commands through its handlers, and a
   ladder decided whole is what replay re-decides from one Cycle record.
+- Journal the `Cycle` record under Safety: rejected. A pass's inputs are mostly market data,
+  journaled under Normal and dropped first under pressure; a Cycle kept while its inputs were
+  dropped would not let replay decide where the live shard did, and the sink's `Degraded`
+  marker already tells replay the span is incomplete (0006).
 - A between-command callback beside the handlers: rejected. The events of the frames read there
   are the per-event path's, already the handler's; a second callback would be a second path for
   the same inputs.
 
 ## Consequences
 
+- Each ladder command reaches the consumer once: through `on_submitted` once its session took
+  it (as 0057 has it), or through `Decide::unsubmitted`.
 - A consumer builds its sessions with one `IngestClock`, gives the host the same one, marks the
   instruments its handlers saw change through `ShardHost::changed()`, and pushes the commands of
   each decide pass onto the `Ladder` it is given instead of submitting them itself. A command it

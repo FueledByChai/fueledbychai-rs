@@ -25,12 +25,13 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use fbc_core::{AccountKey, InstrumentId, RpcCall, RpcId, VenueCommand, VenueOrderSnapshot};
+use fbc_core::{AccountKey, InstrumentId, RpcCall, RpcId, Stamp, VenueCommand, VenueOrderSnapshot};
 use fbc_oms::{Authorization, ControlCommand};
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use crate::exec_gate::Gate;
+use crate::session_core::IngestClock;
 
 /// Why [`ExecOrders`] took no command. Nothing of it reached the session.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
@@ -78,6 +79,9 @@ pub(crate) struct Queued {
     /// The epoch whose stream was authenticated when it was submitted, if one was: it is sent
     /// only on that epoch.
     pub(crate) epoch: Option<u32>,
+    /// The input being handled on the shard when it was submitted, if one was, which its write
+    /// is attributed to (decision 0100).
+    pub(crate) origin: Option<Stamp>,
 }
 
 /// The request ids one account's order-entry sessions give, counted up across them: the
@@ -124,19 +128,26 @@ pub(crate) struct Shared {
     /// resync (FBC-w19, decision 0058).
     pub(crate) gate: RefCell<Gate>,
     ended: Cell<bool>,
+    /// Whether the session is taking the commands of a turn: one popped may still be encoding or
+    /// writing (decision 0100).
+    sending: Cell<bool>,
+    /// The shard clock, whose input being handled a submission is attributed to.
+    clock: IngestClock,
 }
 
 impl Shared {
     /// What the session for `acct` shares with its orders, its request ids from `ids`, its
     /// venue's protection per connection, re-armed on each when `rearm` and covering the
     /// orders already open when `covers_open`, its venue's amends keeping the venue id (or
-    /// none taken) when `one_id`.
+    /// none taken) when `one_id`, each submission attributed to the input `clock` says is being
+    /// handled.
     pub(crate) fn new(
         acct: AccountKey,
         ids: RpcIds,
         rearm: bool,
         covers_open: bool,
         one_id: bool,
+        clock: IngestClock,
     ) -> Rc<Shared> {
         Rc::new(Shared {
             acct,
@@ -146,6 +157,8 @@ impl Shared {
             ready: Cell::new(None),
             gate: RefCell::new(Gate::new(rearm, covers_open, one_id)),
             ended: Cell::new(false),
+            sending: Cell::new(false),
+            clock,
         })
     }
 
@@ -161,9 +174,14 @@ impl Shared {
         }
         let rpc = self.ids.next();
         let epoch = self.ready.get();
-        self.queue
-            .borrow_mut()
-            .push_back(Queued { rpc, item, epoch });
+        let origin = self.clock.handling();
+        let queued = Queued {
+            rpc,
+            item,
+            epoch,
+            origin,
+        };
+        self.queue.borrow_mut().push_back(queued);
         self.wake.notify_one();
         Ok(rpc)
     }
@@ -182,6 +200,17 @@ impl Shared {
     /// it runs waits for the next.
     pub(crate) fn waiting_now(&self) -> std::iter::RepeatN<()> {
         std::iter::repeat_n((), self.queue.borrow().len())
+    }
+
+    /// The session is taking a turn's commands (`true`), or has finished it.
+    pub(crate) fn set_sending(&self, sending: bool) {
+        self.sending.set(sending);
+    }
+
+    /// Whether the session holds no command: none waits, and none popped is still encoding or
+    /// writing; or it has ended.
+    pub(crate) fn idle(&self) -> bool {
+        self.ended.get() || (!self.sending.get() && !self.waiting())
     }
 
     /// The epoch whose stream is authenticated, if one is.
@@ -226,6 +255,16 @@ impl ExecOrders {
     /// The account the session trades.
     pub fn account(&self) -> AccountKey {
         self.shared.acct
+    }
+
+    /// Whether the session holds no command submitted through it (decision 0100).
+    pub(crate) fn idle(&self) -> bool {
+        self.shared.idle()
+    }
+
+    /// Whether the session has run or dropped, taking no more commands.
+    pub(crate) fn ended(&self) -> bool {
+        self.shared.ended.get()
     }
 
     /// Submits the order-affecting command fbc-oms authorized, spending the authorization: its
@@ -454,14 +493,66 @@ mod tests {
     fn request_ids_count_up_across_the_sessions_sharing_them_from_where_they_start() {
         let ids = RpcIds::default();
         let (first, second) = (
-            Shared::new(AccountKey::new(2), ids.clone(), true, false, true),
-            Shared::new(AccountKey::new(2), ids, true, false, true),
+            Shared::new(
+                AccountKey::new(2),
+                ids.clone(),
+                true,
+                false,
+                true,
+                IngestClock::new(),
+            ),
+            Shared::new(
+                AccountKey::new(2),
+                ids,
+                true,
+                false,
+                true,
+                IngestClock::new(),
+            ),
         );
         let fee = || Submitted::Control(VenueCommand::FeeQuery);
         assert_eq!(first.push(fee()), Ok(RpcId(1)));
         assert_eq!(second.push(fee()), Ok(RpcId(2)));
         assert_eq!(RpcIds::after(RpcId(41)).next(), RpcId(42));
         assert!(format!("{:?}", RpcIds::default()).starts_with("RpcIds"));
+    }
+
+    /// Decision 0100: a submission is attributed to the input the shard is handling as it is
+    /// submitted, on whichever session that input came, and to none once it was handled; the
+    /// session holds a command from its submission until its turn ends.
+    #[test]
+    fn a_submission_is_attributed_to_the_input_being_handled_and_held_until_its_turn_ends() {
+        use fbc_core::ConnKey;
+        let clock = IngestClock::new();
+        let shared = Shared::new(
+            AccountKey::new(2),
+            RpcIds::default(),
+            true,
+            false,
+            true,
+            clock.clone(),
+        );
+        let orders = ExecOrders {
+            shared: Rc::clone(&shared),
+        };
+        assert!(orders.idle());
+        // A frame of another session of the shard, being handled.
+        let frame = clock.stamp(ConnKey { conn: 9, epoch: 1 }, None);
+        orders.submit_control(ControlCommand::FeeQuery).unwrap();
+        assert!(!orders.idle());
+        clock.handled();
+        orders.submit_control(ControlCommand::FeeQuery).unwrap();
+        let (first, second) = (shared.pop().unwrap(), shared.pop().unwrap());
+        assert_eq!((first.origin, second.origin), (Some(frame), None));
+        // Popped, but its turn still going: held until the turn ends.
+        shared.set_sending(true);
+        assert!(!orders.idle());
+        shared.set_sending(false);
+        assert!(orders.idle());
+        // An ended session holds nothing.
+        shared.set_sending(true);
+        shared.end();
+        assert!(orders.idle());
     }
 
     #[test]
@@ -472,7 +563,14 @@ mod tests {
 
     #[test]
     fn orders_give_increasing_request_ids_and_none_once_ended() {
-        let shared = Shared::new(AccountKey::new(2), RpcIds::default(), true, false, true);
+        let shared = Shared::new(
+            AccountKey::new(2),
+            RpcIds::default(),
+            true,
+            false,
+            true,
+            IngestClock::new(),
+        );
         let orders = ExecOrders {
             shared: Rc::clone(&shared),
         };
