@@ -496,7 +496,7 @@ impl Registry {
     pub fn apply_update(&mut self, u: &OrderUpdate, key: OrderKey) -> Routed {
         let seq = self.audit.received(u, key);
         let routed = self.route_update(u, key);
-        // The consumer's tag and removal reason of the order it went to (0065 rule 9).
+        // The consumer's tag and removal reason of the order it went to (0098).
         let rec = match &routed {
             Routed::Ours(cid, _) => self.orders.get(cid),
             _ => None,

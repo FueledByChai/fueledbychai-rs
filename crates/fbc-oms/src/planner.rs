@@ -34,7 +34,7 @@
 //! reason: every place and amend built for a level carries its tag, every cancel of a level no
 //! longer wanted (absent, or at quantity zero) its side's reason as the pass that builds it
 //! states it, a cancel of a level still wanted none, and the order keeps both for the audit
-//! sink's verdicts. fbc-oms gives them no meaning (0001; 0065 rule 9).
+//! sink's verdicts. fbc-oms gives them no meaning (0001; 0098).
 //!
 //! The commands come out in 0005's order: cancels, then reducing orders (places and amends
 //! that reduce), then amends, then adds, each group in side (bids first) and level order, and
@@ -90,7 +90,7 @@ pub struct DesiredQuote {
     /// The consumer's opaque tag for the level's order (its origin, say): copied onto every
     /// place and amend the planner builds for the level ([`Planned::tag`]), kept on the order
     /// ([`OrderRecord::tag`]) and carried by the audit sink's verdicts. fbc-oms gives it no
-    /// meaning (0001; 0065 rule 9).
+    /// meaning (0001; 0098).
     pub tag: u16,
 }
 
@@ -133,7 +133,7 @@ impl DesiredBook {
     /// no longer wants (absent, or wanted at quantity zero; [`Planned::removal`]), kept on the
     /// order ([`OrderRecord::removal`]) and carried by the audit sink's verdicts. A cancel the
     /// planner builds for a level still wanted (a replace, or Exit's on the side that adds)
-    /// carries none. fbc-oms gives it no meaning (0001; 0065 rule 9).
+    /// carries none. fbc-oms gives it no meaning (0001; 0098).
     pub fn set_removal(&mut self, side: Side, reason: Option<u16>) {
         self.removal[usize::from(Level::new(side, 0).side)] = reason;
     }
@@ -283,7 +283,7 @@ pub struct Planned {
     /// The order the command is for.
     pub cid: ClientOrderId,
     /// The consumer's tag: a place's or an amend's is its level's [`DesiredQuote::tag`]; a
-    /// cancel's is the order's, from the last place or amend built for it (0065 rule 9).
+    /// cancel's is the order's, from the last place or amend built for it (0098).
     pub tag: u16,
     /// A cancel's removal reason: its side's [`DesiredBook::removal`] when the book no longer
     /// wants the level; `None` for a place, an amend, and a cancel of a level still wanted.
@@ -610,7 +610,7 @@ impl ExecutionPlanner {
                 why,
             };
             // Each built command's order keeps the consumer's tag and removal reason the
-            // command carries (0065 rule 9).
+            // command carries (0098).
             let built = match action {
                 Action::Cancel { cid, removal } => match reg.cancellable(cid) {
                     Ok(permit) => match permit.cancel(caps) {

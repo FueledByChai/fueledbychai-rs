@@ -194,7 +194,7 @@
 //! and each side an optional removal reason ([`DesiredBook::removal`]): every place and amend
 //! built for a level carries its tag, every cancel of a level the book no longer wants its
 //! side's reason ([`Planned`]), and the order keeps both for the audit sink's verdicts;
-//! fbc-oms gives them no meaning (decisions 0001, 0065 rule 9; `tests/tags.rs`).
+//! fbc-oms gives them no meaning (decisions 0001, 0098; `tests/tags.rs`).
 
 mod audit;
 mod caps;

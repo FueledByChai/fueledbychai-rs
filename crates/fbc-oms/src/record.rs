@@ -302,7 +302,7 @@ pub struct OrderRecord {
     /// force and channel are not known, so it is never amended.
     from_snapshot: bool,
     /// The consumer's tag of the last place or amend the execution planner built for the order
-    /// (its level's, decision 0065 rule 9); `None` for an order the planner did not place.
+    /// (its level's, decision 0098); `None` for an order the planner did not place.
     tag: Option<u16>,
     /// The consumer's removal reason of the last cancel the execution planner built for the
     /// order (its side's, when the book no longer wanted its level).
@@ -411,7 +411,7 @@ impl OrderRecord {
 
     /// The consumer's opaque removal reason of the last cancel the execution planner built for
     /// the order: its side's [`DesiredBook::removal`](crate::DesiredBook::removal) when the
-    /// book no longer wanted its level, otherwise `None` (decision 0065 rule 9). fbc-oms gives
+    /// book no longer wanted its level, otherwise `None` (decision 0098). fbc-oms gives
     /// it no meaning (decision 0001).
     pub fn removal(&self) -> Option<u16> {
         self.removal

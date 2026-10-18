@@ -1,4 +1,4 @@
-//! Consumer tags and removal reasons (FBC-s6fp; decisions 0001, 0005, 0065 rule 9): each level
+//! Consumer tags and removal reasons (FBC-s6fp; decisions 0001, 0005, 0098): each level
 //! of a desired book carries an opaque consumer tag and each side an optional removal reason.
 //! The planner copies a level's tag onto every place and amend it builds for that level, and
 //! the side's reason onto every cancel it builds for a level the book no longer wants; the
