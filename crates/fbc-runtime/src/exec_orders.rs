@@ -120,6 +120,9 @@ pub(crate) struct Shared {
     /// Where request ids are given from.
     ids: RpcIds,
     queue: RefCell<VecDeque<Queued>>,
+    /// What still waited when the session ended, never to be sent: kept so the shard host can
+    /// take back a ladder command of its own (decision 0100).
+    left: RefCell<Vec<Queued>>,
     /// Wakes the session when a command is submitted.
     pub(crate) wake: Notify,
     /// The epoch whose stream the codec reported authenticated, while it lasts.
@@ -153,6 +156,7 @@ impl Shared {
             acct,
             ids,
             queue: RefCell::default(),
+            left: RefCell::default(),
             wake: Notify::new(),
             ready: Cell::new(None),
             gate: RefCell::new(Gate::new(rearm, covers_open, one_id)),
@@ -214,11 +218,16 @@ impl Shared {
     }
 
     /// Takes back the command submitted as request `rpc` while it still waits for the session's
-    /// turn: nothing of it reached the codec (decision 0100).
+    /// turn, or was left waiting when the session ended: nothing of it reached the codec
+    /// (decision 0100; Codex P1 r4309207253 on PR #164).
     pub(crate) fn withdraw(&self, rpc: RpcId) -> Option<Submitted> {
         let mut queue = self.queue.borrow_mut();
-        let at = queue.iter().position(|queued| queued.rpc == rpc)?;
-        queue.remove(at).map(|queued| queued.item)
+        if let Some(at) = queue.iter().position(|queued| queued.rpc == rpc) {
+            return queue.remove(at).map(|queued| queued.item);
+        }
+        let mut left = self.left.borrow_mut();
+        let at = left.iter().position(|queued| queued.rpc == rpc)?;
+        Some(left.swap_remove(at).item)
     }
 
     /// The shard clock, which names the input whose events are being handed on.
@@ -235,11 +244,13 @@ impl Shared {
         self.ready.set(epoch);
     }
 
-    /// The session has run or dropped: no more commands, and none still waiting is sent.
+    /// The session has run or dropped: no more commands, and none still waiting is sent; those
+    /// are kept only for [`Shared::withdraw`].
     pub(crate) fn end(&self) {
         self.ended.set(true);
         self.ready.set(None);
-        self.queue.borrow_mut().clear();
+        let unsent = std::mem::take(&mut *self.queue.borrow_mut());
+        self.left.borrow_mut().extend(unsent);
     }
 }
 

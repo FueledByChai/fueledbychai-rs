@@ -76,8 +76,9 @@ caps again when it is authorized (0082), and releases a held place whose command
    per-connection cancel-on-disconnect protects (0058). A ladder command never submitted,
    because its session had ended when its turn came or the run ended first, is handed back to
    the consumer (`Decide::unsubmitted`, an authorization unspent) and counted, and so is the one
-   the host had submitted when the run ended before its session took it, withdrawn from that
-   session's queue: nothing of either reached a codec, so no `on_submitted` reports it. Withdrawing such an authorization in
+   the host had submitted when the run, or that session, ended before the session took it,
+   withdrawn from that session's queue: nothing of either reached a codec, so no `on_submitted`
+   reports it. Withdrawing such an authorization in
    fbc-oms is FBC-6ezy's.
 
 ## Alternatives

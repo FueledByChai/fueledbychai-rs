@@ -376,9 +376,9 @@ impl ShardHost {
                 continue;
             };
             let taken = running.until(quiet).await;
-            if !matches!(taken, Ok(true)) {
-                // The run ends before its session took it: it is taken back, nothing of it sent
-                // (Codex P1 r4309119897 on PR #164).
+            if !matches!(taken, Ok(true)) || orders.ended() {
+                // The run, or its session, ends before the session took it: it is taken back,
+                // nothing of it sent (Codex P1 r4309119897, r4309207253 on PR #164).
                 let item = orders.withdraw(sent.rpc);
                 let command = item.and_then(|item| match item {
                     Submitted::Authorized(auth) => Some(Unsubmitted::Authorized(auth)),
@@ -388,7 +388,9 @@ impl ShardHost {
                     self.unsubmitted += 1;
                     decide.unsubmitted(command);
                 }
-                return taken;
+                if !matches!(taken, Ok(true)) {
+                    return taken;
+                }
             }
             // Between two commands: what the kernel has delivered is read and handed on.
             tokio::task::yield_now().await;
