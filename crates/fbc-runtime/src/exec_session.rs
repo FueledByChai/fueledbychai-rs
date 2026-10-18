@@ -117,7 +117,11 @@
 //! after bytes may have left thus reports `Unknown` too. The session never encodes or writes a
 //! command twice, and a reconnect never re-sends one (0005, 0013 rule 1). A deadline that falls
 //! due while a write waits on a stalled peer is handled once the write ends, within the
-//! write-stall window. Once the session has stopped, nothing more is reported.
+//! write-stall window. Once the session has stopped, nothing more is reported. A command
+//! submitted while the shard handles an input, on this session or another sharing its
+//! [`IngestClock`], is attributed to that input when it is written (decision 0100); the session
+//! holds a submission, for [`ShardHost`](crate::ShardHost), from its submission until the turn
+//! that takes it has written it.
 //!
 //! An HTTP query's deadline runs from just before its request starts, and is cleared by the
 //! call to the codec's `on_http` for it, whatever the codec pushes, as well as by an event
@@ -594,7 +598,14 @@ impl<H: ExecHandler> ExecSession<H> {
             arm_failures: 0,
             unready_refusals: 0,
             unprotected_refusals: 0,
-            orders: Shared::new(config.acct, config.rpc_ids, rearm, covers_open, one_id),
+            orders: Shared::new(
+                config.acct,
+                config.rpc_ids,
+                rearm,
+                covers_open,
+                one_id,
+                clock.clone(),
+            ),
             rpcs: Rpcs::default(),
             clock,
             stop,
@@ -775,6 +786,8 @@ impl<H: ExecHandler> ExecSession<H> {
             // arriving starve no timer, result or stop, and the stop is checked after every wake
             // below whichever branch won (DeepSeek DS-1).
             let rpc_due = self.rpcs.next_deadline();
+            // No input is being handled while the session waits for the next (decision 0100).
+            self.clock.handled();
             let wake = tokio::select! {
                 frame = next_frame(&mut ws) => Wake::Frame(frame),
                 _ = sleep_or_never(self.core.next_deadline()) => Wake::Timer,
@@ -932,7 +945,7 @@ impl<H: ExecHandler> ExecSession<H> {
         effects.into_iter().for_each(|e| fx.push(e));
         let open = self
             .core
-            .execute_all_charged(ws, &mut feed!(self), fx)
+            .execute_all_charged(ws, &mut feed!(self), fx, None)
             .await?;
         self.faulted()?;
         Ok(open)
@@ -963,16 +976,18 @@ impl<H: ExecHandler> ExecSession<H> {
     }
 
     /// Executes an encode's effects `fx`, every frame and HTTP request in them, with the
-    /// connection each request opens, charged already ([`Self::encode`]), attributed to no
-    /// input. False when the epoch ended.
+    /// connection each request opens, charged already ([`Self::encode`]), attributed to the
+    /// input stamped `origin`: the one being handled on the shard when the command was
+    /// submitted, if one was (decision 0100). False when the epoch ended.
     async fn execute_charged(
         &mut self,
         ws: &mut Option<WebSocket>,
         fx: Effects,
+        origin: Option<Stamp>,
     ) -> Result<bool, ExecSessionError> {
         let open = self
             .core
-            .execute_all_charged(ws, &mut feed!(self), fx)
+            .execute_all_charged(ws, &mut feed!(self), fx, origin)
             .await?;
         self.faulted()?;
         Ok(open)
@@ -1056,12 +1071,19 @@ impl<H: ExecHandler> ExecSession<H> {
     ) -> Result<bool, ExecSessionError> {
         let mut open = true;
         let mut turn = self.orders.waiting_now();
+        // Held until the turn's last command is written, so the shard host submits its next
+        // ladder command only once this one is out (decision 0100).
+        self.orders.set_sending(true);
+        let mut sent = Ok(true);
         while open
             && !self.stopped()
             && let Some(queued) = turn.next().and_then(|()| self.orders.pop())
         {
-            open = self.send(ws, key, queued).await?;
+            sent = self.send(ws, key, queued).await;
+            open = *sent.as_ref().unwrap_or(&false);
         }
+        self.orders.set_sending(false);
+        sent?;
         if open && self.orders.waiting() {
             tokio::task::yield_now().await;
         }
@@ -1076,7 +1098,12 @@ impl<H: ExecHandler> ExecSession<H> {
         key: ConnKey,
         queued: Queued,
     ) -> Result<bool, ExecSessionError> {
-        let Queued { rpc, item, epoch } = queued;
+        let Queued {
+            rpc,
+            item,
+            epoch,
+            origin,
+        } = queued;
         let not_sent = |reason| SubmitHandle {
             rpc,
             receipt: Err(reason),
@@ -1117,7 +1144,7 @@ impl<H: ExecHandler> ExecSession<H> {
             Ok((receipt, fx)) => {
                 let receipt = Ok(receipt);
                 self.handler.on_submitted(SubmitHandle { rpc, receipt });
-                self.execute_charged(ws, fx).await
+                self.execute_charged(ws, fx, origin).await
             }
             Err(unsent) => {
                 self.handler.on_submitted(not_sent(unsent.reason()));
@@ -1228,7 +1255,7 @@ impl<H: ExecHandler> ExecSession<H> {
         match self.encode(&cmd, cmd.traffic_class(), false, rpc, key)? {
             Ok((_, fx)) => {
                 self.orders.gate.borrow_mut().arm_sent(key.epoch, rpc);
-                self.execute_charged(ws, fx).await
+                self.execute_charged(ws, fx, None).await
             }
             Err(Unsent::Budget(Refused { ready_at: None })) => Err(ExecSessionError::ArmNeverFits),
             Err(unsent) => {
@@ -1473,6 +1500,8 @@ impl<H: ExecHandler> Control for Between<'_, H> {
     /// True when there is something to report (at once when it already waits), false once the
     /// control dropped.
     async fn changed(&mut self) -> bool {
+        // No input is being handled while the session waits (decision 0100).
+        self.clock.handled();
         let (due, waiting) = (self.rpcs.next_deadline(), self.orders.waiting());
         // What waits is taken after a yield, so a handler that submits again from
         // `on_submitted` cannot hold the task (PR #87 Reviewer B B5).

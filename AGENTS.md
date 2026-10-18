@@ -215,6 +215,16 @@ rather than guess.
     it journals what it sends and receives as a market-data session does, each epoch's opening
     and closing, each nonce it reserves and each context it gives its codec, what its stream
     brings under Safety (0078), and each request deadline it fires at its stamp (0090);
+    `ShardHost` is the shard host (0100): one loop driving a shard's session runs as its
+    `Member`s on one task, sharing one `IngestClock`, that drains every input they have ready
+    (yield to the runtime, poll every member, until a round stamps nothing), journals a `Cycle`
+    record under Normal with the instruments the consumer marked through `Changed`, runs the
+    consumer's `Decide` pass, and submits the `Ladder` of authorizations and control commands it
+    decides one at a time, each once its session holds nothing, with a yield and a poll of every
+    member between two, so what a handler submits meanwhile goes first and every remaining
+    command is re-checked at its encode; a submission is attributed to the input being handled
+    as it is submitted, on whichever session; a ladder command never submitted is handed back
+    (`Decide::unsubmitted`); a member's error ends the run (`tests/shard_host.rs`);
     `tests/common/toy.rs` is the toy market-data venue later runtime tests reuse.
   - `crates/fbc-book` (it depends on `fbc-core` only: one tick-indexed L2 book per
     instrument and `BookId`, built from book events the same live and in replay, with

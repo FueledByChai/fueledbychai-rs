@@ -604,6 +604,8 @@ impl<H: MdHandler> MdSession<H> {
             .await?
             && self.subscribe(&mut ws, codec.as_mut(), call).await?;
         while open {
+            // No input is being handled while the session waits for the next (decision 0100).
+            self.core.clock.handled();
             let wake = tokio::select! {
                 frame = next_frame(&mut ws) => Wake::Frame(frame),
                 _ = sleep_or_never(self.core.next_deadline()) => Wake::Timer,

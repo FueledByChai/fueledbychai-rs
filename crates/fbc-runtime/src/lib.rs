@@ -161,7 +161,7 @@ pub use session::{
     MdControl, MdCounters, MdHandler, MdSession, MdSessionConfig, Outbox, SessionError,
 };
 pub use session_core::{IngestClock, TickToWire};
-pub use shard::{Changed, Decide, Ladder, Member, ShardError, ShardHost};
+pub use shard::{Changed, Decide, Ladder, Member, ShardError, ShardHost, Unsubmitted};
 pub use stall::{WriteStall, WriteStallError};
 pub use tcp::Tcp;
 pub use transport::Transport;
