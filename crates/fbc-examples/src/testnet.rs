@@ -662,6 +662,99 @@ pub async fn rest_get(
     Ok(response.into_body())
 }
 
+/// The path (from `/v1`) of `market`'s `GET /markets/summary`, whose `mark_price` is where
+/// Paradex judges an order's minimum notional ([`decode_mark`]).
+pub fn mark_path(market: &str) -> String {
+    format!("/v1/markets/summary?market={market}")
+}
+
+/// The mark price of `market` in a `GET /markets/summary?market=` answer
+/// (`{"results":[{"symbol", "mark_price", ..}]}`): a positive decimal, or refused.
+pub fn decode_mark(body: &[u8], market: &str) -> Result<Decimal, String> {
+    let summary: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|_| "GET /markets/summary: not a JSON answer".to_owned())?;
+    let mark = summary["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|s| s["symbol"].as_str() == Some(market))
+        .ok_or("GET /markets/summary: no summary of the market")?["mark_price"]
+        .as_str()
+        .and_then(|m| m.parse::<Decimal>().ok())
+        .ok_or("GET /markets/summary: the market's summary has no decimal mark_price")?;
+    if mark <= Decimal::ZERO {
+        return Err("GET /markets/summary: the market's mark price is not positive".to_owned());
+    }
+    Ok(mark)
+}
+
+/// The connection key an HTTP request is charged under: Paradex declares no per-connection
+/// limit, and an HTTP request is on no connection.
+const NO_CONN: fbc_core::ConnKey = fbc_core::ConnKey {
+    conn: u16::MAX,
+    epoch: 0,
+};
+
+/// Charges `reads` unauthenticated REST reads (`GET /orderbook`, `GET /markets/summary`,
+/// `GET /system/config`) to `limiter`, the run's order-entry session's, as normal traffic: each
+/// as `Rest` (Paradex's per-IP request buckets, as discovery's public `GET /markets` charges)
+/// with the connection it opens (`Connect`, the per-IP connection buckets), all together or
+/// none. Waits until the buckets have room, but never past `by`: refused naming `what` when
+/// they would have none by then. So these reads and the session's traffic share one count, and
+/// a read never spends the session's safety reserve (Codex r4289363370 on PR #149).
+pub async fn admit_reads(
+    limiter: &RateLimiter,
+    reads: usize,
+    by: tokio::time::Instant,
+    what: &str,
+) -> Result<(), String> {
+    let one = |op| fbc_runtime::Request {
+        charge: fbc_core::RateCharge::one(op, None),
+        via: fbc_core::Via::Http,
+        class: fbc_core::TrafficClass::Normal,
+    };
+    let requests: Vec<fbc_runtime::Request> = (0..reads)
+        .flat_map(|_| [one(fbc_core::OpKind::Rest), one(fbc_core::OpKind::Connect)])
+        .collect();
+    loop {
+        match limiter.charge(tokio::time::Instant::now(), NO_CONN, &requests) {
+            Ok(_) => return Ok(()),
+            Err(refused) => match refused.ready_at {
+                Some(at) if at <= by => tokio::time::sleep_until(at).await,
+                _ => {
+                    return Err(format!(
+                        "{what}: not sent, the venue's rate limit has no room for it before the \
+                         step timeout passes"
+                    ));
+                }
+            },
+        }
+    }
+}
+
+/// The market's touch (`GET /orderbook`, [`touch`]) and mark price (`GET /markets/summary`,
+/// [`decode_mark`]), read together within `within`, both charged to `limiter` first
+/// ([`admit_reads`]).
+pub async fn touch_and_mark(
+    rest_url: &str,
+    market: &str,
+    proxy: &ProxyConfig,
+    within: Duration,
+    specs: &SpecTable,
+    limiter: &RateLimiter,
+) -> Result<(OrderbookSnapshot, Decimal), String> {
+    let by = tokio::time::Instant::now() + within;
+    admit_reads(limiter, 2, by, "GET /orderbook and GET /markets/summary").await?;
+    let left = by.saturating_duration_since(tokio::time::Instant::now());
+    let book = touch(rest_url, market, proxy, left, specs);
+    let mark = async {
+        let path = mark_path(market);
+        let body = rest_get(rest_url, &path, "GET /markets/summary", proxy, left).await?;
+        decode_mark(&body, market)
+    };
+    tokio::try_join!(book, mark)
+}
+
 /// A price, or `none` for a side with nothing resting.
 pub fn px_or_none(px: Option<Decimal>) -> String {
     px.map_or_else(|| "none".to_owned(), |px| px.to_string())

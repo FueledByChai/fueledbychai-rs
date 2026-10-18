@@ -383,8 +383,14 @@ rather than guess.
     requoted through fbc-oms's `ExecutionPlanner` given Paradex's caps with no amend
     (cancel-and-replace only), every order of ours still open cancelled after each reconnect
     before any place, Stop on Ctrl-C, `--duration`, `--cycles`, a resync mismatch, any Unknown
-    order or a refused login (`tests/testnet_quote.rs`). The samples that trade share
-    `src/link.rs` (the glue) and `src/testnet.rs` (guard and wiring), included by path.
+    order, a refused login or a permanent refusal of a place or cancel, every touch read with
+    the mark price and charged to the session's rate limiter (`tests/testnet_quote.rs`); with
+    `--mainnet` (FBC-tyft) a supervised Paradex MAINNET session behind `--mainnet` and
+    `--sole-trader`: mainnet's URLs and chain, the mainnet-only credentials, caps of at most $11
+    resting per side and $50 inventory, offsets of at least 20 bps, `--duration` of at most an
+    hour, never seeded by hand. The samples that trade share `src/link.rs` (the glue) and
+    `src/testnet.rs` (guard and wiring), and the mainnet ones `src/mainnet.rs` (the mainnet
+    guard), included by path.
   - `crates/venues/fbc-venues` (the registry, the only crate with a normal dependency on a
     concrete venue; `crates/fbc-examples` reaches them only as dev-dependencies),
     `crates/venues/fbc-venue-binance-usdm` (market data only:

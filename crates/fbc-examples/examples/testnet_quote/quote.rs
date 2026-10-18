@@ -1,7 +1,35 @@
 //! testnet_quote's loop: a PLUMBING TEST, NOT A STRATEGY. One market, one post-only order of a
 //! fixed size on each side, a fixed offset behind the touch, requoted as the touch moves, through
 //! fbc-oms's [`ExecutionPlanner`] and caps and fbc-runtime's order-entry session on Paradex
-//! TESTNET. The offsets are the command line's: nothing here prices from a model.
+//! TESTNET, or with `--mainnet` on Paradex MAINNET (below). The offsets are the command line's:
+//! nothing here prices from a model.
+//!
+//! **Mainnet mode** (`--mainnet`, FBC-tyft: the owner's "small and supervised" sessions). The
+//! same loop, refused before anything connects unless both `--mainnet` and `--sole-trader` are
+//! given, the URLs are exactly mainnet's (or both a loopback stub's), `PARADEX_CHAIN_ID` (when
+//! set) is mainnet's, the caps are at most $11 resting per side and $50 inventory, both offsets
+//! are at least 20 bps and `--duration` at most an hour ([`crate::args::mainnet_limits`]); the
+//! credentials are the mainnet-only variables (`src/auth_mainnet.rs`, [`credentials`]); the
+//! venue must declare its snapshot trustworthy ([`crate::mainnet::trusted`]). Then, before the
+//! order socket connects, `GET /system/config` must name the mainnet chain and `GET /positions`
+//! must show no position on another market (`--sole-trader`). The resync must seed the market:
+//! nothing is ever seeded by hand on mainnet, so one that seeds nothing refuses Start. A
+//! permanent refusal of a place or a cancel Stops the run and fails it (a person is watching).
+//!
+//! **The mark.** Paradex judges an order's minimum notional at the MARK price, and refuses one
+//! below it only after accepting it (`ORDER_SIZE_BELOW_MIN`, the owner's 2026-10-16 testnet
+//! run). Every read of the touch reads the mark with it (`GET /markets/summary`,
+//! [`touch_and_mark`]), so the mark a pass judges by is never older than its touch, at least
+//! once per cycle; a side whose size at the mark is below the minimum is left out and printed,
+//! never sent ([`desired`]), and an asynchronous `ORDER_SIZE_BELOW_MIN` is a sizing error that
+//! Stops the run. The inventory cap is judged at no less than the mark. Both reads are charged
+//! to the session's rate limiter ([`crate::testnet::admit_reads`]).
+//!
+//! **Refusals of ours.** A place or cancel the venue refuses for its rate (`RateLimited`)
+//! paces the loop: nothing more is planned until its retry time, or [`RATE_LIMITED_WAIT`] when
+//! the venue states none. A post-only place that would cross leaves its side out of the cycle.
+//! Any other refusal of a place or a cancel of ours is permanent and Stops the run, failing it
+//! (Codex r4277631500, r4289363361 on PR #149): nothing is placed or cancelled again in a loop.
 //!
 //! **One cycle.** The touch is read over REST (`GET /orderbook`); each side whose book side rests
 //! gets a [`DesiredQuote`] behind it ([`desired`]), and the planner closes the difference
@@ -67,8 +95,8 @@ use std::time::{Duration, Instant};
 
 use fbc_core::{
     Bps, Channel, CidMatch, CidMint, ClientOrderId, ConnState, Lots, MarketLease, Namespace,
-    NamespaceLease, NonceScope, OpKind, OrderCaps, OrderKindTag, RejectKind, RpcId, Secrets, Side,
-    SignedLots, SpecTable, SubmitOutcome, Ticks, Tif, TifTag, VenueFactory,
+    NamespaceLease, NonceScope, OpKind, OrderCaps, OrderKindTag, Reject, RejectKind, RpcId,
+    Secrets, Side, SignedLots, SpecTable, SubmitOutcome, Ticks, Tif, TifTag, VenueFactory,
 };
 use fbc_oms::{
     Applied, CancelChoice, CancelEverything, DesiredBook, DesiredQuote, ExecutionPlanner,
@@ -76,21 +104,36 @@ use fbc_oms::{
     PermittedCommand, PlanRefusal, PlannerConfig, PreTradeCaps, Registry, Routed, Stage,
     TestnetRun,
 };
-use fbc_runtime::{Connector, ExecControl, ExecOrders, ExecSession};
+use fbc_runtime::{Connector, ExecControl, ExecOrders, ExecSession, RateLimiter};
 use fbc_venue_paradex::ParadexFactory;
 use fbc_venue_paradex::md::rest::OrderbookSnapshot;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use tokio::sync::Notify;
 
-use crate::args::{Options, Target, direct_to_stub, hosts, sole, testnet_guard};
-use crate::link::{Link, LinkHandler, Note, async_reject};
+use crate::args::{Options, confirmed, hosts, testnet_guard};
+use crate::link::{Link, LinkHandler, Note, async_reject, described};
+use crate::mainnet::{MAINNET_CHAIN, chain_refusal, decode_chain, mainnet_guard, trusted};
 use crate::positions::{PositionCheck, Verdict, fills_in};
 use crate::testnet::{
-    ACCOUNT_LABEL, ACCT, HighWater, INST, Lines, Out, TESTNET_CHAIN, VENUE, config, drive_with,
-    inventory_price, off_thread_holding, px_or_none, resync_disagreements, session_config,
-    snapshot_max, specs, touch, wall_now,
+    ACCOUNT_LABEL, ACCT, HighWater, INST, Lines, Out, TESTNET_CHAIN, VENUE, admit_reads, config,
+    drive_with, inventory_price, off_thread_holding, px_or_none, rest_get, resync_disagreements,
+    session_config, snapshot_max, specs, touch_and_mark, wall_now,
 };
+
+/// The program the refusals name.
+pub const PROGRAM: &str = "testnet_quote";
+
+/// How long a request of ours the venue refused for its rate (`RateLimited`) holds the loop
+/// when the venue states no retry time (Paradex states none for its code 42901): twice the
+/// window of its tightest limit (the per-account order limit's one second). Nothing more is
+/// planned before it passes.
+pub const RATE_LIMITED_WAIT: Duration = Duration::from_secs(2);
+
+/// How long a pass waits before reading the touch again when `GET /orderbook` answered a book no
+/// newer than the one it held after a fill moved the position (a stale cache or replica, Codex
+/// r4289363354 on PR #149): within the book's settling time.
+pub const STALE_BOOK_PAUSE: Duration = Duration::from_millis(100);
 
 /// How many client ids each kept high-water mark reserves ahead of the mint: the mark is written
 /// before the ids go out, and again only once the mint is within one pass (two places) of it.
@@ -125,16 +168,19 @@ pub struct Report {
     pub requests_held: usize,
 }
 
-/// The quote size and fbc-oms's caps, in lots, at the first touch.
+/// The quote size and fbc-oms's caps, in lots, at the first touch and mark.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Sizing {
     /// Each quote's size.
     pub qty: Lots,
-    /// The resting cap per side and the inventory cap.
+    /// The resting cap per side (at `at`) and the inventory cap (at no less than the mark).
     pub resting: Lots,
     pub inventory: Lots,
-    /// The price they were converted at: the highest of the quote prices and the touch.
+    /// The price the size and the resting cap were converted at: the highest of the quote
+    /// prices and the touch.
     pub at: Decimal,
+    /// The mark price read with the first touch.
+    pub mark: Decimal,
 }
 
 /// A side's quote price behind the touch, or why there is none.
@@ -203,10 +249,11 @@ fn market_px(opts: &Options, book: &OrderbookSnapshot, quotes: &[&Behind]) -> Op
     Some(inventory_price(top, bid, ask))
 }
 
-/// The quote size and the caps in lots at the first touch `book` ([`Sizing`]), or why the run
-/// cannot quote: no side of the book rests, no lot in `--order-usd`, or a quote's notional below
-/// the market's minimum at the lowest quote price.
-pub fn size(opts: &Options, book: &OrderbookSnapshot) -> Result<Sizing, String> {
+/// The quote size and the caps in lots at the first touch `book` and `mark` ([`Sizing`]), or why
+/// the run cannot quote: no side of the book rests, no lot in `--order-usd`, or a quote's
+/// notional below the market's minimum at the lowest quote price or at the mark (where Paradex
+/// judges it).
+pub fn size(opts: &Options, book: &OrderbookSnapshot, mark: Decimal) -> Result<Sizing, String> {
     let (bid, ask) = quote_prices(opts, book);
     if bid.is_err() && ask.is_err() {
         return Err(format!(
@@ -216,10 +263,11 @@ pub fn size(opts: &Options, book: &OrderbookSnapshot) -> Result<Sizing, String> 
         ));
     }
     let at = market_px(opts, book, &[&bid, &ask]).ok_or("no price to size the quotes at")?;
-    let lots_for = |usd: Decimal| -> Lots {
-        let n = (usd / (at * opts.step)).floor().to_i64().unwrap_or(0);
+    let lots_at = |usd: Decimal, px: Decimal| -> Lots {
+        let n = (usd / (px * opts.step)).floor().to_i64().unwrap_or(0);
         Lots::new(n).unwrap_or(Lots::ZERO)
     };
+    let lots_for = |usd: Decimal| lots_at(usd, at);
     let qty = lots_for(opts.order_usd);
     if qty == Lots::ZERO {
         return Err(format!(
@@ -243,11 +291,23 @@ pub fn size(opts: &Options, book: &OrderbookSnapshot) -> Result<Sizing, String> 
             opts.min_notional
         ));
     }
+    let at_mark = Decimal::from(qty.get()) * opts.step * mark;
+    if at_mark < opts.min_notional {
+        return Err(format!(
+            "a quote's notional at the mark price {mark} is ${} ({} lots), below the market's \
+             minimum ${}: Paradex judges the minimum at the mark and refuses the order after \
+             accepting it; raise --order-usd",
+            at_mark.round_dp(4).normalize(),
+            qty.get(),
+            opts.min_notional
+        ));
+    }
     Ok(Sizing {
         qty,
         resting: lots_for(opts.resting_cap_usd),
-        inventory: lots_for(opts.inventory_cap_usd),
+        inventory: lots_at(opts.inventory_cap_usd, at.max(mark)),
         at,
+        mark,
     })
 }
 
@@ -299,19 +359,23 @@ pub struct Wanted {
     pub skipped: Vec<String>,
 }
 
-/// The desired book for the touch `book` with the position at `position` ([`quote_prices`]),
-/// each quote `qty` lots: a side is left out when it has no price behind the touch, when its
-/// notional at its price would exceed `--resting-cap-usd` or fall below `--min-notional`, or
-/// when a fill of it would take the position past `--inventory-cap-usd` at the highest of the
-/// quote prices and the touch.
+/// The desired book for the touch `book` and the mark price `mark` with the position at
+/// `position` ([`quote_prices`]), each quote `qty` lots: a side is left out when it has no price
+/// behind the touch, when its notional at its price would exceed `--resting-cap-usd` or fall
+/// below `--min-notional`, when its notional at the mark would fall below `--min-notional`
+/// (where Paradex judges it, refusing the order only after accepting it), or when a fill of it
+/// would take the position past `--inventory-cap-usd` at the highest of the quote prices, the
+/// touch and the mark.
 pub fn desired(
     opts: &Options,
     qty: Lots,
     position: SignedLots,
     book: &OrderbookSnapshot,
+    mark: Decimal,
 ) -> Wanted {
     let (bid, ask) = quote_prices(opts, book);
-    let mkt = market_px(opts, book, &[&bid, &ask]);
+    let mkt = market_px(opts, book, &[&bid, &ask]).map(|px| px.max(mark));
+    let at_mark = Decimal::from(qty.get()) * opts.step * mark;
     let mut wanted = Wanted {
         book: DesiredBook::new(INST),
         bid: None,
@@ -343,6 +407,13 @@ pub fn desired(
             Some(format!(
                 "its notional ${} at {price} is below the market's minimum ${}",
                 notional.round_dp(4),
+                opts.min_notional
+            ))
+        } else if at_mark < opts.min_notional {
+            Some(format!(
+                "its notional ${} at the mark {mark} is below the market's minimum ${} \
+                 (Paradex judges the minimum at the mark)",
+                at_mark.round_dp(4).normalize(),
                 opts.min_notional
             ))
         } else if worth > opts.inventory_cap_usd {
@@ -405,12 +476,55 @@ pub fn cancel_and_replace(caps: &OrderCaps) -> OrderCaps {
     }
 }
 
-/// Runs testnet_quote: the guard first, before anything connects; then the first touch and the
-/// sizing, the registry, the session and the loop, until `interrupt` completes, `--duration` or
-/// `--cycles` is reached, or anything Stops it. `chain` is `PARADEX_CHAIN_ID` when set; `creds`
-/// the account's credentials, twice: the session's, handed to its codec unread, and the position
-/// check's own login's, each moved on unread (no type here holds them). An error is a refusal before the session started; once it
-/// started the outcome is in the [`Report`].
+/// The guard, run before anything connects (by `main` before it reads the credentials, and
+/// again by [`run_venue`]): every check of the command line ([`confirmed`]), and the chain id
+/// (`PARADEX_CHAIN_ID` when set, `chain`) the testnet's, or with `--mainnet` mainnet's. Whether
+/// the URLs are a loopback stub's.
+pub fn guard(opts: &Options, chain: Option<&str>) -> Result<bool, String> {
+    let stub = confirmed(opts)?;
+    if opts.mainnet {
+        mainnet_guard(&opts.rest_url, &opts.ws_url, chain, PROGRAM)?;
+    } else {
+        testnet_guard(&opts.rest_url, &opts.ws_url, chain)?;
+    }
+    Ok(stub)
+}
+
+/// The account's credentials from `lookup` (the process environment when run; a map under
+/// test), read twice: the session's and the position check's own login's (a credential set is
+/// never copied). The testnet samples' variables (`src/auth.rs`), or with `--mainnet` the
+/// mainnet-only ones (`src/auth_mainnet.rs`, which refuses a run whose environment holds a
+/// testnet one). Refused naming variables, never a value.
+pub fn credentials(
+    opts: &Options,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<(Secrets, Secrets), String> {
+    let read = || {
+        if opts.mainnet {
+            crate::auth_mainnet::paradex_mainnet_secrets(&lookup).map_err(|e| {
+                format!(
+                    "{e} (testnet_quote --mainnet reads the same mainnet variables as \
+                     mainnet_smoke)"
+                )
+            })
+        } else {
+            crate::auth::paradex_secrets(&lookup)
+        }
+    };
+    Ok((read()?, read()?))
+}
+
+/// The Paradex configuration for `opts`: the login signing for the testnet's chain, or with
+/// `--mainnet` mainnet's.
+pub fn venue_config(opts: &Options) -> fbc_core::VenueConfig {
+    if opts.mainnet {
+        crate::mainnet::config(&opts.rest_url, &opts.ws_url)
+    } else {
+        config(&opts.rest_url, &opts.ws_url)
+    }
+}
+
+/// Runs testnet_quote on Paradex ([`run_venue`]).
 pub async fn run(
     opts: &Options,
     chain: Option<&str>,
@@ -418,51 +532,90 @@ pub async fn run(
     out: Out,
     interrupt: impl Future<Output = ()>,
 ) -> Result<Report, String> {
-    let target = testnet_guard(&opts.rest_url, &opts.ws_url, chain)?;
-    direct_to_stub(target, &opts.proxy)?;
-    sole(opts)?;
+    run_venue(&ParadexFactory, opts, chain, creds, out, interrupt).await
+}
+
+/// Runs testnet_quote on `factory` (Paradex's; a stand-in under test): the guard first, before
+/// anything connects ([`guard`]; with `--mainnet` also the venue's snapshot source trustworthy,
+/// [`trusted`]); then the loop ([`run_on`]) until `interrupt` completes, `--duration` or
+/// `--cycles` is reached, or anything Stops it. `chain` is `PARADEX_CHAIN_ID` when set; `creds`
+/// the account's credentials, twice ([`credentials`]): the session's, handed to its codec
+/// unread, and the position check's own login's, each moved on unread (no type here holds
+/// them). An error is a refusal before the session started; once it started the outcome is in
+/// the [`Report`].
+pub async fn run_venue(
+    factory: &'static dyn VenueFactory,
+    opts: &Options,
+    chain: Option<&str>,
+    creds: (Secrets, Secrets),
+    out: Out,
+    interrupt: impl Future<Output = ()>,
+) -> Result<Report, String> {
+    let stub = guard(opts, chain)?;
+    let cfg = venue_config(opts);
+    if opts.mainnet {
+        trusted(factory, &cfg, PROGRAM)?;
+    }
     let lines = Lines {
         out,
         t0: Instant::now(),
     };
-    let what = match target {
-        Target::Testnet => "Paradex testnet",
-        Target::LoopbackStub => "a loopback test stub, not Paradex",
-    };
     let (rest_host, ws_host) = hosts(&opts.rest_url, &opts.ws_url)?;
-    lines.line(format_args!(
-        "TESTNET {what}: REST host {rest_host} WS host {ws_host} chain {TESTNET_CHAIN}"
-    ));
-    lines.line(format_args!(
-        "OWNER-ASSISTED testnet run (decision 0067): Paradex's snapshot source is trustworthy \
-         (decision 0094), so the resync seeds the market's position; a market it left unknown \
-         is seeded by hand from the venue's REST position, never outside a declared testnet run"
-    ));
+    if opts.mainnet {
+        let what = if stub {
+            "a loopback test stub, not Paradex"
+        } else {
+            "Paradex MAINNET, real money"
+        };
+        lines.line(format_args!(
+            "MAINNET {what}: REST host {rest_host} WS host {ws_host} chain {MAINNET_CHAIN}"
+        ));
+        lines.line(format_args!(
+            "SUPERVISED mainnet run: never seeded by hand (the trustworthy resync seeds the \
+             market, decision 0094); caps ${} resting per side, ${} inventory; --duration {} s",
+            opts.resting_cap_usd, opts.inventory_cap_usd, opts.duration_secs
+        ));
+    } else {
+        let what = if stub {
+            "a loopback test stub, not Paradex"
+        } else {
+            "Paradex testnet"
+        };
+        lines.line(format_args!(
+            "TESTNET {what}: REST host {rest_host} WS host {ws_host} chain {TESTNET_CHAIN}"
+        ));
+        lines.line(format_args!(
+            "OWNER-ASSISTED testnet run (decision 0067): Paradex's snapshot source is \
+             trustworthy (decision 0094), so the resync seeds the market's position; a market \
+             it left unknown is seeded by hand from the venue's REST position, never outside a \
+             declared testnet run"
+        ));
+    }
     lines.line(format_args!(
         "PLUMBING TEST, not a strategy: fixed offsets of {} bps under the bid and {} bps over \
          the ask, no model",
         opts.bid_bps, opts.ask_bps
     ));
+    run_on(factory, opts, creds, lines, interrupt).await
+}
 
-    let factory = &ParadexFactory;
-    let cfg = config(&opts.rest_url, &opts.ws_url);
+/// The loop on `factory` once [`run_venue`]'s guard passed and its first lines are printed
+/// ([`run_venue`] for its arguments): the command line is checked again ([`confirmed`]); the
+/// venue's declared snapshot source is not (a test runs a venue declaring it untrustworthy past
+/// [`run_venue`]'s check, to show that a mainnet resync seeding nothing refuses Start). Then the
+/// chain (with `--mainnet`), the first touch and mark and the sizing, the registry, the leases,
+/// the other markets' positions (with `--mainnet`), the session and the loop.
+pub async fn run_on(
+    factory: &'static dyn VenueFactory,
+    opts: &Options,
+    creds: (Secrets, Secrets),
+    lines: Lines,
+    interrupt: impl Future<Output = ()>,
+) -> Result<Report, String> {
+    confirmed(opts)?;
+    let cfg = venue_config(opts);
     let specs = specs(factory, &cfg, &opts.market, opts.tick, opts.step)?;
     let wait = Duration::from_secs(opts.step_timeout_secs);
-    let book = touch(&opts.rest_url, &opts.market, &opts.proxy, wait, &specs).await?;
-    let sizing = size(opts, &book)?;
-    let (bid, ask) = touch_px(opts, &book);
-    lines.line(format_args!(
-        "QUOTE {} lots ({} at the size step) per side; caps at {}: resting {} lots per side, \
-         inventory {} lots (first touch: bid {} ask {})",
-        sizing.qty.get(),
-        Decimal::from(sizing.qty.get()) * opts.step,
-        sizing.at,
-        sizing.resting.get(),
-        sizing.inventory.get(),
-        px_or_none(bid),
-        px_or_none(ask)
-    ));
-
     let venue_caps = factory.caps(&cfg).map_err(|e| e.to_string())?;
     let order_caps = venue_caps
         .exec
@@ -471,6 +624,64 @@ pub async fn run(
         .order
         .clone();
     shape_admitted(&order_caps)?;
+    let (session_creds, position_creds) = creds;
+    let session_cfg = session_config(
+        factory,
+        cfg.clone(),
+        session_creds,
+        specs.clone(),
+        &opts.proxy,
+        opts.namespace,
+    )?;
+    // Every REST read of the run is charged to the limiter the session charges, so they and
+    // the session's traffic share one count (Codex r4289363370 on PR #149; FBC-hpg6).
+    let limiter = session_cfg.limiter.clone();
+    if opts.mainnet {
+        let by = tokio::time::Instant::now() + wait;
+        admit_reads(&limiter, 1, by, "GET /system/config").await?;
+        let left = by.saturating_duration_since(tokio::time::Instant::now());
+        let body = rest_get(
+            &opts.rest_url,
+            "/v1/system/config",
+            "GET /system/config",
+            &opts.proxy,
+            left,
+        )
+        .await?;
+        if let Some(refused) = chain_refusal(&decode_chain(&body)?) {
+            return Err(refused);
+        }
+        lines.step(
+            "chain",
+            format_args!("GET /system/config names {MAINNET_CHAIN}, the chain the login signs for"),
+        );
+    }
+    let (book, mark) = touch_and_mark(
+        &opts.rest_url,
+        &opts.market,
+        &opts.proxy,
+        wait,
+        &specs,
+        &limiter,
+    )
+    .await?;
+    let sizing = size(opts, &book, mark)?;
+    let (bid, ask) = touch_px(opts, &book);
+    lines.line(format_args!(
+        "QUOTE {} lots ({} at the size step) per side; caps at {}: resting {} lots per side, \
+         inventory {} lots (first touch: bid {} ask {}; mark {}, where Paradex judges the \
+         minimum ${})",
+        sizing.qty.get(),
+        Decimal::from(sizing.qty.get()) * opts.step,
+        sizing.at,
+        sizing.resting.get(),
+        sizing.inventory.get(),
+        px_or_none(bid),
+        px_or_none(ask),
+        sizing.mark,
+        opts.min_notional
+    ));
+
     let symbol = specs
         .get(INST)
         .ok_or("the market is not in the spec table")?
@@ -483,11 +694,22 @@ pub async fn run(
     let caps = PreTradeCaps::new()
         .with_market(INST, limits)
         .map_err(|e| format!("caps: {e:?}"))?;
-    let keys = LeaseKeys::new(VENUE, ACCOUNT_LABEL, &order_caps).with_market(INST, symbol.clone());
+    let label = if opts.mainnet {
+        crate::mainnet::LABEL
+    } else {
+        ACCOUNT_LABEL
+    };
+    let keys = LeaseKeys::new(VENUE, label, &order_caps).with_market(INST, symbol.clone());
     let needs_account_lease = keys.nonce_scope() == NonceScope::PerAccountMonotonic;
-    let reg = Registry::with_caps(caps)
-        .for_testnet_run(TestnetRun::owner_assisted())
-        .with_lease_keys(keys);
+    let reg = Registry::with_caps(caps);
+    // Only a testnet run is a declared owner-assisted run (decision 0067); a mainnet market is
+    // seeded by its trustworthy resync or not at all.
+    let reg = if opts.mainnet {
+        reg
+    } else {
+        reg.for_testnet_run(TestnetRun::owner_assisted())
+    };
+    let reg = reg.with_lease_keys(keys);
 
     fs::create_dir_all(&opts.lease_dir)
         .map_err(|e| format!("--lease-dir {}: {e}", opts.lease_dir.display()))?;
@@ -501,12 +723,12 @@ pub async fn run(
     let ns_lease = NamespaceLease::acquire(&opts.lease_dir, ACCT, ns).map_err(|e| held(&e))?;
     let hwm = HighWater::at(&opts.lease_dir, ns);
     let persisted = hwm.read()?;
-    let market = MarketLease::acquire(&opts.lease_dir, VENUE, ACCOUNT_LABEL, &symbol)
-        .map_err(|e| held(&e))?;
+    let market =
+        MarketLease::acquire(&opts.lease_dir, VENUE, label, &symbol).map_err(|e| held(&e))?;
     let mut leases = Leases::market(market);
     if needs_account_lease {
-        let acct = fbc_core::AccountLease::acquire(&opts.lease_dir, VENUE, ACCOUNT_LABEL)
-            .map_err(|e| held(&e))?;
+        let acct =
+            fbc_core::AccountLease::acquire(&opts.lease_dir, VENUE, label).map_err(|e| held(&e))?;
         leases = leases.with_account(acct);
     }
 
@@ -540,27 +762,35 @@ pub async fn run(
         link: Rc::clone(&link),
         wake: Rc::clone(&wake),
     };
-    let (session_creds, position_creds) = creds;
-    let session_cfg = session_config(
-        factory,
-        cfg.clone(),
-        session_creds,
-        specs.clone(),
-        &opts.proxy,
-        opts.namespace,
-    )?;
     // The position check reads over REST through the limiter the session charges, so its reads
     // and the session's traffic share one count (FBC-hpg6).
-    let positions = PositionCheck::new(
+    let mut positions = PositionCheck::new(
         &cfg,
         position_creds,
         Connector::new(opts.proxy.clone()),
-        session_cfg.limiter.clone(),
+        limiter.clone(),
         &opts.rest_url,
         specs.clone(),
         venue_caps,
         wait,
     )?;
+    if opts.mainnet {
+        // The account's positions on every other market, before the order socket connects: one
+        // there breaks --sole-trader's premise (Codex r4277631493 on PR #149).
+        let elsewhere = positions.elsewhere().await?;
+        if !elsewhere.is_empty() {
+            return Err(format!(
+                "GET /positions shows the account holding a position on another market ({}): \
+                 --sole-trader says no other process trades this account, and this run trades \
+                 one market only; close it first; refused before the order socket connected",
+                elsewhere.join(", ")
+            ));
+        }
+        lines.step(
+            "positions",
+            format_args!("GET /positions shows no position on another market"),
+        );
+    }
     let (mut session, control) =
         ExecSession::new(session_cfg, handler).map_err(|e| format!("session: {e}"))?;
     link.borrow_mut().attach(session.orders(), ACCT);
@@ -579,6 +809,7 @@ pub async fn run(
         planner,
         plan_caps,
         caps: order_caps,
+        limiter,
         hwm,
         mint: None,
         reserved: 0,
@@ -605,6 +836,7 @@ pub async fn run(
         positions: Some(positions),
         fill_check_due: false,
         fill_checked: false,
+        retry_at: None,
     };
     // The interrupt sets a flag the driver reads at each wake, and wakes it.
     let watch = {
@@ -675,6 +907,9 @@ enum Settled {
     Interrupted,
     /// `--duration` passed: nothing more is handed over (Codex r4243908421).
     Ended,
+    /// A request of ours was refused for its rate: nothing is planned before its retry time
+    /// ([`Driver::retry_at`]).
+    Paced,
 }
 
 /// What each request of ours is, for its lines and its answer: a place or a cancel, the side
@@ -703,6 +938,8 @@ struct Driver {
     plan_caps: OrderCaps,
     /// The venue's caps.
     caps: OrderCaps,
+    /// The session's rate limiter, which every REST read of the loop is charged to.
+    limiter: RateLimiter,
     hwm: HighWater,
     /// The client-id mint, holding the namespace lease, once the first resync floored it.
     mint: Option<CidMint>,
@@ -746,9 +983,12 @@ struct Driver {
     /// The highest `seq_no` of the order books read: an older one Stops the loop (Codex
     /// r4244080123 on PR #149).
     book_seq: u64,
-    /// The market's position as the venue's position stream last reported it, since the last
-    /// resync: no pass plans while it differs from the inventory (Codex r4244080127).
-    venue_position: Option<SignedLots>,
+    /// The market's position as the venue's position stream last reported it, and the
+    /// connection it came on (the count of connections ended before it, [`Driver::epochs`]): no
+    /// pass plans while it differs from the inventory (Codex r4244080127). A resync supersedes
+    /// one reported on an earlier connection, never one reported on its own, which may be newer
+    /// than its snapshot (Codex r4277631505 on PR #149).
+    venue_position: Option<(SignedLots, usize)>,
     /// Orders of ours that ended with fills the venue reported on an order update that the
     /// fill stream has not brought yet: no pass plans until it has (Codex r4244145969).
     unfilled: Vec<ClientOrderId>,
@@ -759,6 +999,9 @@ struct Driver {
     fill_check_due: bool,
     /// The check after the first fill has run (or was passed over at Stop).
     fill_checked: bool,
+    /// Until when nothing is planned: a request of ours refused for its rate (`RateLimited`)
+    /// waits its retry time, or [`RATE_LIMITED_WAIT`] (Codex r4277631500, r4289363361).
+    retry_at: Option<tokio::time::Instant>,
 }
 
 impl Driver {
@@ -1074,7 +1317,17 @@ impl Driver {
             }
             Note::Position { inst, qty } => {
                 if inst == INST {
-                    self.venue_position = Some(qty);
+                    self.venue_position = Some((qty, self.epochs));
+                } else if qty.0 != 0 {
+                    // --sole-trader: a position on another market is another trader's (Codex
+                    // r4277631493 on PR #149). (With one market in the spec table the adapter
+                    // refuses such a frame first, a decode error that Stops the loop too.)
+                    self.trouble(format!(
+                        "the venue reported a position of {} lots on another market (instrument \
+                         {}): --sole-trader says no other process trades this account",
+                        qty.0,
+                        inst.get()
+                    ));
                 }
                 self.note(format_args!(
                     "the account's position in instrument {} is {} lots",
@@ -1083,9 +1336,30 @@ impl Driver {
                 ));
             }
             Note::Resynced { report, snapshot } => {
-                // The resync's position supersedes any reported before it.
-                self.venue_position = None;
+                // The resync's position supersedes one the position stream reported on an
+                // earlier connection, never one reported on this one, before or during the
+                // resync: it may be newer than the snapshot's read, so it is kept until the
+                // inventory agrees with it (Codex r4277631505 on PR #149).
+                if self
+                    .venue_position
+                    .is_some_and(|(_, epoch)| epoch != self.epochs)
+                {
+                    self.venue_position = None;
+                }
                 self.resync_due = false;
+                if let Some((inst, qty)) = snapshot
+                    .positions
+                    .iter()
+                    .find(|(inst, qty)| *inst != INST && qty.0 != 0)
+                {
+                    // --sole-trader (Codex r4277631493 on PR #149).
+                    self.trouble(format!(
+                        "a resync showed a position of {} lots on another market (instrument \
+                         {}): --sole-trader says no other process trades this account",
+                        qty.0,
+                        inst.get()
+                    ));
+                }
                 let ours: Vec<ClientOrderId> = snapshot
                     .orders
                     .iter()
@@ -1153,6 +1427,15 @@ impl Driver {
                             cid.seq()
                         ));
                     }
+                    // Paradex judges the minimum notional at the mark and refuses an order
+                    // below it after accepting it: a sizing error, never a venue fault (the
+                    // owner's 2026-10-16 testnet run), and permanent.
+                    _ if below_min(&reject) => self.trouble(format!(
+                        "a sizing error: {what}: Paradex judged the order's notional at the mark \
+                         price below the market's minimum, though every place is sized at the \
+                         mark read with its touch; check --min-notional and --order-usd against \
+                         GET /markets; nothing more is placed"
+                    )),
                     _ => self.trouble(format!("the link noted a problem: {what}")),
                 }
             }
@@ -1239,6 +1522,9 @@ impl Driver {
             Some(Request { place, .. }) => (place, "every order of ours".to_owned()),
             None => return,
         };
+        if let SubmitOutcome::Rejected(reject) = &outcome {
+            self.refused(place, &named, reject);
+        }
         match (&outcome, place) {
             (SubmitOutcome::Accepted { ack }, true) if first => {
                 let vid = request
@@ -1261,6 +1547,58 @@ impl Driver {
                 item.map_or_else(|| "all".to_owned(), |i| i.to_string())
             )),
         }
+    }
+
+    /// A refusal of a place (`place`) or a cancel of ours, `named`: one for its rate paces the
+    /// loop ([`Driver::pace`]); a post-only place that would cross leaves its side out of the
+    /// cycle (its order ended); a cancel of an order that already ended, or that the venue does
+    /// not know (the registry then holds it Unknown, which Stops the loop), awaits that end; any
+    /// other is permanent, and Stops the loop, failing the run: nothing is sent again in a loop
+    /// (Codex r4277631500, r4289363361 on PR #149).
+    fn refused(&mut self, place: bool, named: &str, reject: &Reject) {
+        let what = if place {
+            format!("the place {named}")
+        } else {
+            format!("the cancel of {named}")
+        };
+        match reject.kind {
+            RejectKind::RateLimited { retry_after } => self.pace(&what, retry_after),
+            RejectKind::PostOnlyWouldCross if place => {}
+            RejectKind::AlreadyTerminal(_) | RejectKind::NotFound if !place => {}
+            kind => self.trouble(format!(
+                "{what} was refused permanently ({kind:?}: {}): no retry mends it, so nothing \
+                 more is sent{}",
+                described(reject),
+                if kind == RejectKind::MinNotional {
+                    "; a sizing error: check --min-notional and --order-usd against GET /markets"
+                } else {
+                    ""
+                }
+            )),
+        }
+    }
+
+    /// Nothing is planned until `retry_after` from now (or [`RATE_LIMITED_WAIT`] when the venue
+    /// states none): `what` was refused for its rate.
+    fn pace(&mut self, what: &str, retry_after: Option<Duration>) {
+        let wait = retry_after.unwrap_or(RATE_LIMITED_WAIT);
+        let until = tokio::time::Instant::now() + wait;
+        self.retry_at = Some(self.retry_at.map_or(until, |at| at.max(until)));
+        self.event(
+            "PACE",
+            format_args!(
+                "{what} was refused for its rate: nothing more is planned for {} ms (the venue's \
+                 retry time, or {} ms when it states none)",
+                wait.as_millis(),
+                RATE_LIMITED_WAIT.as_millis()
+            ),
+        );
+    }
+
+    /// Whether a refusal for its rate holds the loop now ([`Driver::retry_at`]).
+    fn paced(&self) -> bool {
+        self.retry_at
+            .is_some_and(|at| tokio::time::Instant::now() < at)
     }
 
     /// What came of request `rpc` of ours once every item is answered: the whole request's
@@ -1414,13 +1752,14 @@ impl Driver {
         let Some((ours_max, open, not_ours, position)) = resynced else {
             return Err(self.trouble.clone().unwrap_or_default());
         };
+        let source = match self.caps.snapshot_source {
+            fbc_core::SnapshotSource::Trustworthy => "the snapshot is trustworthy (decision 0094)",
+            fbc_core::SnapshotSource::Untrustworthy => "the snapshot is declared untrustworthy",
+            fbc_core::SnapshotSource::None => "the venue declares no snapshot",
+        };
         self.lines.step(
             "resync",
-            format_args!(
-                "{open} open orders, position {} lots; the snapshot is trustworthy \
-                 (decision 0094)",
-                position.0
-            ),
+            format_args!("{open} open orders, position {} lots; {source}", position.0),
         );
         if not_ours > 0 {
             return Err(format!(
@@ -1437,6 +1776,15 @@ impl Driver {
                     "SEED position {} lots seeded by the trustworthy resync (decision 0094)",
                     reg.inventory(INST).0
                 ));
+            } else if self.opts.mainnet {
+                // A mainnet market is armed only after a trustworthy resync seeded it, never by
+                // hand (owner answer C to RB-olg-3; decision 0067 is for testnet runs only).
+                return Err(
+                    "Start refused: the resync seeded no position (the venue's snapshot source is \
+                     not trustworthy), and a mainnet market is never seeded by hand (only an \
+                     owner-assisted testnet run may be, decision 0067); nothing placed"
+                        .to_owned(),
+                );
             } else {
                 reg.seed_position(INST, position)
                     .map_err(|e| format!("the hand seed was refused: {e:?}"))?;
@@ -1504,18 +1852,31 @@ impl Driver {
                 self.reconnect().await?;
                 continue;
             }
+            if self.paced() {
+                // A refusal for its rate: nothing is read or planned before its retry time.
+                let until = self.retry_at.unwrap_or_else(tokio::time::Instant::now);
+                self.pause_until(until).await;
+                continue;
+            }
             self.compact();
             // The inventory before the touch is read: a fill while it is in flight makes the
             // first pass read the touch again (Codex r4244145956).
             let read_at = self.link.borrow().registry().inventory(INST);
             // Raced against the interrupt, a reason to Stop, a connection's end and
             // --duration, each taken at the top of the loop (Codex r4243989987).
-            let Some(book) = self.touch_unless_ended(self.timeout).await? else {
+            let Some((book, mark)) = self.touch_unless_ended(self.timeout).await? else {
                 continue;
             };
-            match self.settle(book, read_at).await? {
+            match self.settle(book, mark, read_at).await? {
                 Settled::Done => self.cycles += 1,
-                Settled::Reconnected | Settled::Interrupted | Settled::Ended => continue,
+                Settled::Reconnected | Settled::Interrupted | Settled::Ended | Settled::Paced => {
+                    continue;
+                }
+            }
+            // The last cycle asked for ends the loop at once: its quotes never rest for the
+            // pause (Codex r4289363377 on PR #149).
+            if self.opts.cycles.is_some_and(|n| self.cycles >= n) {
+                return Ok(format!("--cycles {} reached", self.cycles));
             }
             self.pause().await;
         }
@@ -1530,20 +1891,23 @@ impl Driver {
             || tokio::time::Instant::now() >= self.deadline
     }
 
-    /// The touch (`GET /orderbook`), read as the notes come: `None` once the cycle must end
-    /// ([`Driver::ending`]) before it answers, so neither Ctrl-C, a reason to Stop, a
-    /// connection's end nor `--duration` waits up to `--step-timeout` for it while the quotes
-    /// rest (Codex r4243989987 on PR #149).
+    /// The touch (`GET /orderbook`) and the mark price (`GET /markets/summary`), read together
+    /// and charged to the session's rate limiter ([`touch_and_mark`]), as the notes come: `None`
+    /// once the cycle must end ([`Driver::ending`]) before they answer, so neither Ctrl-C, a
+    /// reason to Stop, a connection's end nor `--duration` waits up to `--step-timeout` for them
+    /// while the quotes rest (Codex r4243989987 on PR #149).
     ///
-    /// The read waits at most `within`. A book older than one already read (a lower `seq_no`:
-    /// a stale cache or replica) is a reason to Stop, never quoted from (Codex r4244080123).
+    /// The reads wait at most `within`, the wait for the rate limit's room included. A book older
+    /// than one already read (a lower `seq_no`: a stale cache or replica) is a reason to Stop,
+    /// never quoted from (Codex r4244080123).
     async fn touch_unless_ended(
         &mut self,
         within: Duration,
-    ) -> Result<Option<OrderbookSnapshot>, String> {
+    ) -> Result<Option<(OrderbookSnapshot, Decimal)>, String> {
         let (rest_url, market) = (self.opts.rest_url.clone(), self.opts.market.clone());
         let (proxy, specs) = (self.opts.proxy.clone(), self.specs.clone());
-        let read = touch(&rest_url, &market, &proxy, within, &specs);
+        let limiter = self.limiter.clone();
+        let read = touch_and_mark(&rest_url, &market, &proxy, within, &specs, &limiter);
         tokio::pin!(read);
         loop {
             let wake = Rc::clone(&self.wake);
@@ -1553,8 +1917,8 @@ impl Driver {
                 return Ok(None);
             }
             tokio::select! {
-                book = &mut read => {
-                    let book = book?;
+                read = &mut read => {
+                    let (book, mark) = read?;
                     if book.seq_no < self.book_seq {
                         return Err(format!(
                             "GET /orderbook answered seq {} after seq {}: an order book older \
@@ -1563,7 +1927,7 @@ impl Driver {
                         ));
                     }
                     self.book_seq = book.seq_no;
-                    return Ok(Some(book));
+                    return Ok(Some((book, mark)));
                 }
                 () = woken => {}
                 () = tokio::time::sleep_until(self.deadline) => return Ok(None),
@@ -1572,7 +1936,7 @@ impl Driver {
     }
 
     /// Prints the cycle when its quotes or skipped sides differ from the last cycle's.
-    fn print_cycle(&mut self, book: &OrderbookSnapshot, wanted: &Wanted) {
+    fn print_cycle(&mut self, book: &OrderbookSnapshot, mark: Decimal, wanted: &Wanted) {
         let now = (wanted.bid, wanted.ask, wanted.skipped.clone());
         if self.last.as_ref() == Some(&now) {
             return;
@@ -1585,11 +1949,12 @@ impl Driver {
             )
         };
         self.lines.line(format_args!(
-            "CYCLE {} touch bid {} ask {} (GET /orderbook seq {}): bid {}, ask {}",
+            "CYCLE {} touch bid {} ask {} (GET /orderbook seq {}), mark {}: bid {}, ask {}",
             self.cycles + 1,
             px_or_none(bid),
             px_or_none(ask),
             book.seq_no,
+            mark,
             quote(wanted.bid),
             quote(wanted.ask)
         ));
@@ -1599,13 +1964,16 @@ impl Driver {
         self.last = Some(now);
     }
 
-    /// The pause between cycles: the interval, ended early by the interrupt, `--duration`, a
-    /// reason to Stop or a connection's end, read as the notes come.
+    /// The pause between cycles: the interval ([`Driver::pause_until`]).
     async fn pause(&mut self) {
-        let until = std::cmp::min(
-            tokio::time::Instant::now() + Duration::from_millis(self.opts.interval_ms),
-            self.deadline,
-        );
+        let until = tokio::time::Instant::now() + Duration::from_millis(self.opts.interval_ms);
+        self.pause_until(until).await;
+    }
+
+    /// Waits until `until` (never past `--duration`), ended early by the interrupt, `--duration`,
+    /// a reason to Stop or a connection's end, read as the notes come.
+    async fn pause_until(&mut self, until: tokio::time::Instant) {
+        let until = std::cmp::min(until, self.deadline);
         loop {
             let wake = Rc::clone(&self.wake);
             let woken = wake.notified();
@@ -1632,7 +2000,12 @@ impl Driver {
     /// it and takes the mint back, so a connection's end never loses it and no second write of
     /// the mark starts beside it (Codex r4244206466); when the run ends instead, the mint is
     /// dropped on the write's thread once the write ends (nothing is minted after).
-    async fn reserve(&mut self) -> Result<bool, String> {
+    ///
+    /// The wait for the write is bounded by the book's settling time, `settle` (the pass's
+    /// deadline), as every other wait of a pass is: a write that stalls past it Stops the loop
+    /// then, never a whole step timeout after a late pass started it (Codex r4289363366 on PR
+    /// #149); the write is kept, holding the mint, as when a cycle ends during it.
+    async fn reserve(&mut self, settle: tokio::time::Instant) -> Result<bool, String> {
         let (mark, mut write) = match self.writing.take() {
             Some(writing) => writing,
             None => {
@@ -1651,10 +2024,11 @@ impl Driver {
                 }
                 let hwm = self.hwm.clone();
                 let mint = self.mint.take();
+                // The write's own bound is past every deadline that cuts its wait short (the
+                // settling time, --duration): the wait below decides.
+                let bound = self.timeout.saturating_mul(2);
                 let write: MarkWrite =
-                    Box::pin(off_thread_holding(self.timeout, mint, move || {
-                        hwm.write(mark)
-                    }));
+                    Box::pin(off_thread_holding(bound, mint, move || hwm.write(mark)));
                 (mark, write)
             }
         };
@@ -1667,12 +2041,17 @@ impl Driver {
                 return Ok(false);
             }
             tokio::select! {
-                written = &mut write => break written,
-                () = woken => {}
+                biased;
                 () = tokio::time::sleep_until(self.deadline) => {
                     self.writing = Some((mark, write));
                     return Ok(false);
                 }
+                () = tokio::time::sleep_until(settle) => {
+                    self.writing = Some((mark, write));
+                    return Err(self.timed_out("settle", "the client-id high-water mark's write"));
+                }
+                written = &mut write => break written,
+                () = woken => {}
             }
         };
         match written {
@@ -1700,9 +2079,17 @@ impl Driver {
     /// whose order placed this cycle ended without a cancel of ours (a post-only order the venue
     /// would not rest, a fill) is not placed again before the next cycle; a place fbc-oms's caps
     /// refuse leaves its side out of the cycle.
+    ///
+    /// The fresh touch read after a fill moved the position must be a newer book than the one
+    /// held (a higher `seq_no`): one no newer is read again, never quoted from (Codex
+    /// r4289363354 on PR #149). No pass plans while a cancel of ours is unanswered, even once
+    /// its order ended (the venue's order event can come before the cancel's reply), so a
+    /// replacement is placed only after its cancel's acknowledgement (Codex r4277631497). The
+    /// mark read with each touch judges the quotes with it (`mark`).
     async fn settle(
         &mut self,
         mut book: OrderbookSnapshot,
+        mut mark: Decimal,
         mut read_at: SignedLots,
     ) -> Result<Settled, String> {
         let mut deadline = tokio::time::Instant::now() + self.timeout;
@@ -1729,18 +2116,42 @@ impl Driver {
             }
             // The mark's write and a fresh touch for a moved position are this pass's waits;
             // the notes are read again after them, before anything is planned (below).
-            let mut cut = !self.reserve().await?;
+            let mut cut = !self.reserve(deadline).await?;
             let inventory = |d: &Driver| d.link.borrow().registry().inventory(INST);
             let mut position = inventory(self);
             // A fresh touch for a moved position, read again until no fill moved it while the
             // touch was being read (Codex r4243908416), and one after a position check.
             while !cut && (aged || position != read_at) {
+                // The position moved since the book held was read: only a newer book shows the
+                // market after the move (Codex r4289363354 on PR #149).
+                let moved = position != read_at;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(self.timed_out(
+                        "settle",
+                        "an order book newer than the one held when the position moved",
+                    ));
+                }
                 let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-                let Some(fresh) = self.touch_unless_ended(left).await? else {
+                let Some((fresh, fresh_mark)) = self.touch_unless_ended(left).await? else {
                     cut = true;
                     break;
                 };
+                if moved && fresh.seq_no <= book.seq_no {
+                    self.note(format_args!(
+                        "GET /orderbook answered seq {} after the position moved, no newer than \
+                         the book held (seq {}): read again, never quoted from",
+                        fresh.seq_no, book.seq_no
+                    ));
+                    let until =
+                        std::cmp::min(tokio::time::Instant::now() + STALE_BOOK_PAUSE, deadline);
+                    self.pause_until(until).await;
+                    if self.ending() {
+                        cut = true;
+                    }
+                    continue;
+                }
                 book = fresh;
+                mark = fresh_mark;
                 aged = false;
                 read_at = position;
                 position = inventory(self);
@@ -1780,6 +2191,21 @@ impl Driver {
                 }
                 continue;
             }
+            // An order's end can come before its cancel's reply: nothing is planned until every
+            // cancel of ours is answered, so no replacement goes out before its cancel's
+            // acknowledgement (Codex r4277631497 on PR #149).
+            if let Some(rpc) = self.cancel_unanswered() {
+                tokio::select! {
+                    () = woken => {}
+                    () = tokio::time::sleep_until(deadline) => {
+                        return Err(self.timed_out(
+                            "settle",
+                            &format!("the answer to cancel request {}", rpc.0),
+                        ));
+                    }
+                }
+                continue;
+            }
             placed.retain(|(side, cid)| {
                 let link = self.link.borrow();
                 let ended = link
@@ -1801,7 +2227,7 @@ impl Driver {
                     None => true,
                 }
             });
-            let mut wanted = desired(&self.opts, self.qty, position, &book);
+            let mut wanted = desired(&self.opts, self.qty, position, &book, mark);
             for side in &left_out {
                 wanted.book.remove(*side, 0);
                 match side {
@@ -1809,7 +2235,7 @@ impl Driver {
                     Side::Sell => wanted.ask = None,
                 }
             }
-            self.print_cycle(&book, &wanted);
+            self.print_cycle(&book, mark, &wanted);
             let now = self.link.borrow().now().0;
             let plan = {
                 let mut link = self.link.borrow_mut();
@@ -1887,7 +2313,8 @@ impl Driver {
     /// other than `position`, or fills of an order of ours that the fill stream has not
     /// brought (its cumulative fill on an order update above the fills read).
     fn unreconciled(&mut self, position: SignedLots) -> Option<String> {
-        if let Some(venue) = self.venue_position.filter(|v| *v != position) {
+        let venue = self.venue_position.map(|(qty, _)| qty);
+        if let Some(venue) = venue.filter(|v| *v != position) {
             return Some(format!(
                 "the venue's position ({} lots) and the inventory ({} lots)",
                 venue.0, position.0
@@ -1915,7 +2342,7 @@ impl Driver {
 
     /// Reads the notes and says whether a pass must not plan: `Err` for a reason to Stop, or
     /// how the cycle ends (the interrupt, a connection's end or a session that takes no place,
-    /// `--duration`).
+    /// `--duration`, a refusal for its rate whose retry time has not come).
     fn halted(&mut self) -> Result<Option<Settled>, String> {
         self.absorb();
         if let Some(why) = &self.trouble {
@@ -1930,7 +2357,22 @@ impl Driver {
         if tokio::time::Instant::now() >= self.deadline {
             return Ok(Some(Settled::Ended));
         }
+        if self.paced() {
+            return Ok(Some(Settled::Paced));
+        }
         Ok(None)
+    }
+
+    /// A cancel request of ours naming an order with no answer yet (one not sent included), if
+    /// any: a replace's or a side's cancel, or a Safety cancel the session's link sent. An
+    /// instrument cancel-all names none: a sweep's is sent before any place, and its order ends
+    /// are what the sweep waits for.
+    fn cancel_unanswered(&self) -> Option<RpcId> {
+        self.ours
+            .iter()
+            .filter(|(_, request)| !request.place && request.first.is_some())
+            .map(|(rpc, _)| *rpc)
+            .find(|rpc| self.answer(*rpc).is_none())
     }
 
     fn timed_out(&self, step: &str, what: &str) -> String {
@@ -2242,6 +2684,17 @@ impl Driver {
         );
         (ok, compared)
     }
+}
+
+/// Whether `reject` is Paradex's asynchronous `ORDER_SIZE_BELOW_MIN` (its reason's code, the text
+/// before any `:`, as the adapter reads it): the order's notional at the mark below the market's
+/// minimum.
+fn below_min(reject: &Reject) -> bool {
+    let code = reject
+        .raw
+        .split_once(':')
+        .map_or(&*reject.raw, |(code, _)| code);
+    code.trim() == "ORDER_SIZE_BELOW_MIN"
 }
 
 /// `bid` for a buy, `ask` for a sell.
