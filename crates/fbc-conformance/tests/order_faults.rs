@@ -19,7 +19,8 @@
 //! - **A fill before its order's events.** The order's fill arrives before the placement's
 //!   acknowledgement and its first update: inventory moves once, by that fill (a second delivery
 //!   of it is a duplicate), and the filled quantity is max(cum_venue, cum_fills), never their
-//!   sum (I3), whether the update's cumulative count equals the fills seen or exceeds them.
+//!   sum (I3), whether the update's cumulative count equals the fills seen, exceeds them, or
+//!   (the fill stating no count) falls below them, a NEW's 0 included.
 //!
 //! The toy is single-phase, so 0092's final phase from a placement's order event does not
 //! apply; our cancel's CANCELED is `Canceled(Requested)`, as 0093 has Paradex's be. Every
@@ -286,12 +287,17 @@ fn an_equal_key_partial_fill_and_cancel_end_alike_in_both_arrival_orders() {
 // A fill before its order's events.
 // ---------------------------------------------------------------------------------------------
 
-/// The script: the placement is answered with a fill of 5 lots first, then its acceptance, then
-/// the order's first update stating `cum` filled, then the same fill delivered again.
-fn fill_before_order_events(cum: i64) -> Script {
+/// The script: the placement is answered with a fill of 5 lots first (stating `fill_cum` filled
+/// after it, or no cumulative count, as a venue that names its fills may send), then its
+/// acceptance, then the order's first update stating `cum` filled (the venue's NEW when 0), then
+/// the same fill delivered again.
+fn fill_before_order_events(fill_cum: Option<i64>, cum: i64) -> Script {
     let place = answer("place", move |frame| {
         let (rpc, cid) = (field(frame, "rpc")?, field(frame, "cid")?);
-        let first = fill(&cid, "F-1", 5, 5, 1);
+        let first = match fill_cum {
+            Some(after) => fill(&cid, "F-1", 5, after, 1),
+            None => fill(&cid, "F-1", 5, 5, 1).replace("|cum=5|", "|"),
+        };
         Ok(vec![
             first.clone(),
             accepted(&rpc, Some(VID)),
@@ -302,8 +308,8 @@ fn fill_before_order_events(cum: i64) -> Script {
     Script::default().reply(place)
 }
 
-fn played_fill_first(cum: i64) -> Played<ClientOrderId> {
-    play(fill_before_order_events(cum), async |run| {
+fn played_fill_first(fill_cum: Option<i64>, cum: i64) -> Played<ClientOrderId> {
+    play(fill_before_order_events(fill_cum, cum), async |run| {
         run.started().await;
         let (cid, _) = run.place();
         run.replied().await;
@@ -313,25 +319,35 @@ fn played_fill_first(cum: i64) -> Played<ClientOrderId> {
 
 #[test]
 fn a_fill_before_its_orders_events_moves_inventory_once_and_fills_at_the_larger_count() {
-    for cum in [5, 8] {
-        let p = played_fill_first(cum);
+    // (the fill's cumulative count, the first update's): the update's count equal to the fills
+    // seen or above them, and, with a fill that states no count, a NEW (cum 0) or an update
+    // below the fills seen, where the fills are the larger count.
+    for (fill_cum, cum) in [(Some(5), 5), (Some(5), 8), (None, 0), (None, 3)] {
+        let case = format!("fill cum {fill_cum:?}, update cum {cum}");
+        let p = played_fill_first(fill_cum, cum);
         let cid = p.out;
         let o = Outcome::of(&p.st.reg, cid);
-        let (five, venue) = (Lots::new(5).unwrap(), Lots::new(cum).unwrap());
-        assert_eq!(o.state, OrdState::PartiallyFilled, "cum {cum}");
-        assert_eq!((o.cum_fills, o.cum_venue), (five, venue), "cum {cum}");
+        let five = Lots::new(5).unwrap();
+        let venue = Lots::new(fill_cum.unwrap_or(0).max(cum)).unwrap();
+        assert_eq!(o.state, OrdState::PartiallyFilled, "{case}");
+        assert_eq!((o.cum_fills, o.cum_venue), (five, venue), "{case}");
         // max(cum_venue, cum_fills), never their sum.
-        assert_eq!(o.filled, venue.max(five), "cum {cum}");
-        assert_eq!(o.resting, Lots::new(25 - cum).unwrap(), "cum {cum}");
+        let filled = venue.max(five);
+        assert_eq!(o.filled, filled, "{case}");
+        assert_eq!(
+            Some(o.resting),
+            Lots::new(25).unwrap().checked_sub(filled),
+            "{case}"
+        );
         // Only the fill moves the inventory, once.
-        assert_eq!(o.inventory, SignedLots(5), "cum {cum}");
+        assert_eq!(o.inventory, SignedLots(5), "{case}");
         let [fill, update, again] = &p.st.seen[..] else {
-            panic!("cum {cum}: {:?}", p.st.seen);
+            panic!("{case}: {:?}", p.st.seen);
         };
-        assert!(counted(fill, cid, FillApplied::Live), "cum {cum}: {fill:?}");
+        assert!(counted(fill, cid, FillApplied::Live), "{case}: {fill:?}");
         let advanced = Seen::Order(Routed::Ours(cid, Applied::Advanced));
-        assert_eq!(update, &advanced, "cum {cum}");
-        assert_eq!(again, &Seen::Duplicate, "cum {cum}");
-        assert_eq!(written(&p, cid), 1, "cum {cum}");
+        assert_eq!(update, &advanced, "{case}");
+        assert_eq!(again, &Seen::Duplicate, "{case}");
+        assert_eq!(written(&p, cid), 1, "{case}");
     }
 }
