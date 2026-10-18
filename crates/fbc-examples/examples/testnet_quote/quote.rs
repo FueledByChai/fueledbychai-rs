@@ -440,6 +440,7 @@ pub fn desired(
             post_only: true,
             reduce_only: false,
             reducing: false,
+            tag: 0,
         };
         wanted.book.set(side, 0, quote);
         match side {

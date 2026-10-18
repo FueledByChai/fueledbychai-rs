@@ -30,6 +30,12 @@
 //!   while the position is flat or unknown) is cancelled, wanted or not: Exit builds nothing
 //!   there, so the planner never leaves it resting nor tries to amend it (0063).
 //!
+//! Each level's quote carries the consumer's opaque tag and each side an optional removal
+//! reason: every place and amend built for a level carries its tag, every cancel of a level no
+//! longer wanted (absent, or at quantity zero) its side's reason as the pass that builds it
+//! states it, a cancel of a level still wanted none, and the order keeps both for the audit
+//! sink's verdicts. fbc-oms gives them no meaning (0001; 0065 rule 9).
+//!
 //! The commands come out in 0005's order: cancels, then reducing orders (places and amends
 //! that reduce), then amends, then adds, each group in side (bids first) and level order, and
 //! are built in that order, so each is judged with the earlier ones counted. A place or amend
@@ -81,6 +87,11 @@ pub struct DesiredQuote {
     /// as on [`NewOrder::reducing`]: it orders the command among the reducing ones and exempts
     /// it from no check (0013 rule 2).
     pub reducing: bool,
+    /// The consumer's opaque tag for the level's order (its origin, say): copied onto every
+    /// place and amend the planner builds for the level ([`Planned::tag`]), kept on the order
+    /// ([`OrderRecord::tag`]) and carried by the audit sink's verdicts. fbc-oms gives it no
+    /// meaning (0001; 0065 rule 9).
+    pub tag: u16,
 }
 
 impl DesiredQuote {
@@ -97,6 +108,8 @@ impl DesiredQuote {
 pub struct DesiredBook {
     market: InstrumentId,
     levels: BTreeMap<Level, DesiredQuote>,
+    /// Each side's removal reason, bids first.
+    removal: [Option<u16>; 2],
 }
 
 impl DesiredBook {
@@ -105,7 +118,29 @@ impl DesiredBook {
         DesiredBook {
             market,
             levels: BTreeMap::new(),
+            removal: [None; 2],
         }
+    }
+
+    /// The book with `reason` as `side`'s removal reason, replacing any there.
+    pub fn with_removal(mut self, side: Side, reason: Option<u16>) -> DesiredBook {
+        self.set_removal(side, reason);
+        self
+    }
+
+    /// Sets `side`'s removal reason, the consumer's opaque reason its levels no longer wanted
+    /// went away: copied onto every cancel the planner builds for a level of `side` the book
+    /// no longer wants (absent, or wanted at quantity zero; [`Planned::removal`]), kept on the
+    /// order ([`OrderRecord::removal`]) and carried by the audit sink's verdicts. A cancel the
+    /// planner builds for a level still wanted (a replace, or Exit's on the side that adds)
+    /// carries none. fbc-oms gives it no meaning (0001; 0065 rule 9).
+    pub fn set_removal(&mut self, side: Side, reason: Option<u16>) {
+        self.removal[usize::from(Level::new(side, 0).side)] = reason;
+    }
+
+    /// `side`'s removal reason.
+    pub fn removal(&self, side: Side) -> Option<u16> {
+        self.removal[usize::from(Level::new(side, 0).side)]
     }
 
     /// The book with `quote` at `level` of `side`, replacing any quote there.
@@ -247,6 +282,12 @@ pub struct Planned {
     pub level: u16,
     /// The order the command is for.
     pub cid: ClientOrderId,
+    /// The consumer's tag: a place's or an amend's is its level's [`DesiredQuote::tag`]; a
+    /// cancel's is the order's, from the last place or amend built for it (0065 rule 9).
+    pub tag: u16,
+    /// A cancel's removal reason: its side's [`DesiredBook::removal`] when the book no longer
+    /// wants the level; `None` for a place, an amend, and a cancel of a level still wanted.
+    pub removal: Option<u16>,
     /// The authorization to submit it under.
     pub auth: Authorization,
 }
@@ -356,12 +397,17 @@ struct Slot {
 
 /// What a pass decided for a level, before anything is built.
 enum Action {
-    Cancel(ClientOrderId),
+    /// A cancel, with the side's removal reason when the book no longer wants the level.
+    Cancel {
+        cid: ClientOrderId,
+        removal: Option<u16>,
+    },
     Amend {
         cid: ClientOrderId,
         px: Ticks,
         total: Lots,
         reducing: bool,
+        tag: u16,
     },
     Place(DesiredQuote),
 }
@@ -484,7 +530,15 @@ impl ExecutionPlanner {
                     }
                 } else {
                     slot.cancels_sent = rec.cancels_sent();
-                    actions.push((Stage::Cancel, at, Action::Cancel(slot.cid)));
+                    // The book no longer wants the level: the side's reason goes with the
+                    // cancel; a level still wanted (a replace, or Exit's) has none (0065
+                    // rule 9).
+                    let removal = want.map_or(desired.removal(at.side()), |_| None);
+                    let cancel = Action::Cancel {
+                        cid: slot.cid,
+                        removal,
+                    };
+                    actions.push((Stage::Cancel, at, cancel));
                 }
                 continue;
             };
@@ -494,7 +548,11 @@ impl ExecutionPlanner {
             if rec.cancel_awaits_ack() {
                 slot.replacing = true;
                 slot.cancels_sent = rec.cancels_sent();
-                actions.push((Stage::Cancel, at, Action::Cancel(slot.cid)));
+                let cancel = Action::Cancel {
+                    cid: slot.cid,
+                    removal: None,
+                };
+                actions.push((Stage::Cancel, at, cancel));
                 continue;
             }
             if let Some(why) = unsettled(rec) {
@@ -526,13 +584,18 @@ impl ExecutionPlanner {
                         px: q.px,
                         total,
                         reducing: q.reducing,
+                        tag: q.tag,
                     };
                     actions.push((stage, at, amend));
                 }
                 None => {
                     slot.replacing = true;
                     slot.cancels_sent = rec.cancels_sent();
-                    actions.push((Stage::Cancel, at, Action::Cancel(slot.cid)));
+                    let cancel = Action::Cancel {
+                        cid: slot.cid,
+                        removal: None,
+                    };
+                    actions.push((Stage::Cancel, at, cancel));
                 }
             }
         }
@@ -546,10 +609,19 @@ impl ExecutionPlanner {
                 level: at.level,
                 why,
             };
+            // Each built command's order keeps the consumer's tag and removal reason the
+            // command carries (0065 rule 9).
             let built = match action {
-                Action::Cancel(cid) => match reg.cancellable(cid) {
+                Action::Cancel { cid, removal } => match reg.cancellable(cid) {
                     Ok(permit) => match permit.cancel(caps) {
-                        CancelChoice::Send(cmd) => Ok((cid, cmd)),
+                        CancelChoice::Send(cmd) => {
+                            let tag = reg.with_record(cid, |rec| {
+                                rec.set_removal(removal);
+                                rec.tag()
+                            });
+                            let tag = tag.expect("the planner tags every order it places");
+                            Ok((cid, cmd, tag, removal))
+                        }
                         CancelChoice::AwaitAck => {
                             plan.awaiting_ack.push(cid);
                             continue;
@@ -562,6 +634,7 @@ impl ExecutionPlanner {
                     px,
                     total,
                     reducing,
+                    tag,
                 } => reg
                     .live(cid)
                     .map_err(PlanRefusal::Permit)
@@ -573,7 +646,8 @@ impl ExecutionPlanner {
                         if let Some(slot) = slots.get_mut(&at) {
                             slot.changed_at = now;
                         }
-                        (cid, cmd)
+                        reg.with_record(cid, |rec| rec.set_tag(tag));
+                        (cid, cmd, tag, None)
                     }),
                 Action::Place(q) => mint
                     .mint()
@@ -593,15 +667,18 @@ impl ExecutionPlanner {
                                 cancels_sent: 0,
                             },
                         );
-                        (cid, cmd)
+                        reg.with_record(cid, |rec| rec.set_tag(q.tag));
+                        (cid, cmd, q.tag, None)
                     }),
             };
             match built {
-                Ok((cid, cmd)) => plan.commands.push(Planned {
+                Ok((cid, cmd, tag, removal)) => plan.commands.push(Planned {
                     stage,
                     side,
                     level: at.level,
                     cid,
+                    tag,
+                    removal,
                     auth: authorize(reg, acct, cmd),
                 }),
                 Err(why) => plan.refused.push(refuse(why)),

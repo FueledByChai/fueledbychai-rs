@@ -139,6 +139,7 @@ fn quote(px: i64, qty: i64) -> DesiredQuote {
         post_only: true,
         reduce_only: false,
         reducing: false,
+        tag: 0,
     }
 }
 

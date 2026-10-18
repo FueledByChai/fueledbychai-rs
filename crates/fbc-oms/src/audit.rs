@@ -26,8 +26,18 @@ pub enum AuditEntry<'a> {
     /// What the registry did with the event `seq`: where it routed it and, for our order,
     /// what the order did with it ([`Applied`](crate::Applied)), an ignored late, stale or
     /// superseded one included. It follows that event's `Received` before the next event is
-    /// received.
-    Verdict { seq: u64, routed: &'a Routed },
+    /// received. For our order it carries the consumer's tag of the last place or amend the
+    /// execution planner built for it and the removal reason of the last cancel it built for
+    /// it ([`OrderRecord::tag`](crate::OrderRecord::tag),
+    /// [`OrderRecord::removal`](crate::OrderRecord::removal); decision 0065 rule 9): both
+    /// `None` for an event routed to no order of ours, and for an order the planner did not
+    /// place. fbc-oms gives them no meaning (decision 0001).
+    Verdict {
+        seq: u64,
+        routed: &'a Routed,
+        tag: Option<u16>,
+        removal: Option<u16>,
+    },
 }
 
 /// The consumer's audit sink: it is handed every [`AuditEntry`] in the order the registry
@@ -74,10 +84,22 @@ impl Audit {
         seq
     }
 
-    /// Records the verdict on the event `seq`.
-    pub(crate) fn verdict(&mut self, seq: u64, routed: &Routed) {
+    /// Records the verdict on the event `seq`, with the consumer's tag and removal reason of
+    /// the order it was routed to.
+    pub(crate) fn verdict(
+        &mut self,
+        seq: u64,
+        routed: &Routed,
+        tag: Option<u16>,
+        removal: Option<u16>,
+    ) {
         if let Some(sink) = self.sink.as_mut() {
-            sink.record(AuditEntry::Verdict { seq, routed });
+            sink.record(AuditEntry::Verdict {
+                seq,
+                routed,
+                tag,
+                removal,
+            });
         }
     }
 }

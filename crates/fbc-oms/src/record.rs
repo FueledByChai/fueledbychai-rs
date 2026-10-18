@@ -301,6 +301,12 @@ pub struct OrderRecord {
     /// Registered from a resync's snapshot (an earlier run's order): its placement's time in
     /// force and channel are not known, so it is never amended.
     from_snapshot: bool,
+    /// The consumer's tag of the last place or amend the execution planner built for the order
+    /// (its level's, decision 0065 rule 9); `None` for an order the planner did not place.
+    tag: Option<u16>,
+    /// The consumer's removal reason of the last cancel the execution planner built for the
+    /// order (its side's, when the book no longer wanted its level).
+    removal: Option<u16>,
 }
 
 impl OrderRecord {
@@ -347,6 +353,8 @@ impl OrderRecord {
             query_rpc: None,
             ladder_cause: None,
             from_snapshot: false,
+            tag: None,
+            removal: None,
         }
     }
 
@@ -391,6 +399,32 @@ impl OrderRecord {
     pub(crate) fn set_cum_fills(&mut self, cum: Lots) {
         self.cum_fills = cum;
         self.complete_if_covered();
+    }
+
+    /// The consumer's opaque tag of the last place or amend the execution planner built for
+    /// the order: its level's [`DesiredQuote::tag`](crate::DesiredQuote::tag) (decision 0065
+    /// rule 9). `None` for an order the planner did not place. fbc-oms gives it no meaning
+    /// (decision 0001).
+    pub fn tag(&self) -> Option<u16> {
+        self.tag
+    }
+
+    /// The consumer's opaque removal reason of the last cancel the execution planner built for
+    /// the order: its side's [`DesiredBook::removal`](crate::DesiredBook::removal) when the
+    /// book no longer wanted its level, otherwise `None` (decision 0065 rule 9). fbc-oms gives
+    /// it no meaning (decision 0001).
+    pub fn removal(&self) -> Option<u16> {
+        self.removal
+    }
+
+    /// Records the tag of a place or amend the planner built for the order.
+    pub(crate) fn set_tag(&mut self, tag: u16) {
+        self.tag = Some(tag);
+    }
+
+    /// Records the removal reason of a cancel the planner built for the order.
+    pub(crate) fn set_removal(&mut self, removal: Option<u16>) {
+        self.removal = removal;
     }
 
     /// Our id for the order.

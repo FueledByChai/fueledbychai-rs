@@ -316,6 +316,7 @@ fn a_planner_pass_quotes_a_side_a_dropped_place_had_filled() {
             post_only: true,
             reduce_only: false,
             reducing: false,
+            tag: 0,
         },
     );
     let plan = p

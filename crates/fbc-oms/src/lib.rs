@@ -171,7 +171,9 @@
 //! ([`Registry::set_audit_sink`]) in receive order, numbered, before any of it is applied, the
 //! ones then ignored as late, stale or for a superseded venue id and those routed to no order
 //! of ours included, and its verdict follows it before the next event is received
-//! ([`AuditEntry`]); a cancel's reason is the venue's, as the event states it. Writing it to
+//! ([`AuditEntry`]); a cancel's reason is the venue's, as the event states it, and a verdict
+//! on our order carries the consumer's tag and removal reason the execution planner gave it
+//! ([`OrderRecord::tag`], [`OrderRecord::removal`]; `tests/tags.rs`). Writing it to
 //! the consumer's `order_audit` table, that table's schema and the legacy status names stay
 //! with the consumer (decision 0001).
 //!
@@ -188,7 +190,11 @@
 //! for the order's terminal state before the new one is placed; a level whose order is
 //! PendingNew or Unknown, or has a command in flight, is occupied until it settles
 //! ([`HeldReason`]); a place or amend the market's state or a cap refuses is never built
-//! ([`PlanRefusal`]).
+//! ([`PlanRefusal`]). Each level carries the consumer's opaque tag ([`DesiredQuote::tag`])
+//! and each side an optional removal reason ([`DesiredBook::removal`]): every place and amend
+//! built for a level carries its tag, every cancel of a level the book no longer wants its
+//! side's reason ([`Planned`]), and the order keeps both for the audit sink's verdicts;
+//! fbc-oms gives them no meaning (decisions 0001, 0065 rule 9; `tests/tags.rs`).
 
 mod audit;
 mod caps;

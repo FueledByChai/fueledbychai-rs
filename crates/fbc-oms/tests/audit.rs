@@ -35,7 +35,7 @@ impl AuditSink for Recording {
     fn record(&mut self, entry: AuditEntry<'_>) {
         let seen = match entry {
             AuditEntry::Received { seq, update, key } => Seen::Received(seq, update.clone(), key),
-            AuditEntry::Verdict { seq, routed } => Seen::Verdict(seq, routed.clone()),
+            AuditEntry::Verdict { seq, routed, .. } => Seen::Verdict(seq, routed.clone()),
         };
         self.0.lock().unwrap().push(seen);
     }
