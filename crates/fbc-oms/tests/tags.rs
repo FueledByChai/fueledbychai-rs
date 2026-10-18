@@ -795,3 +795,78 @@ fn a_removal_cancel_dropped_unspent_leaves_no_reason_once_the_level_is_wanted_ag
     let seen = sink.take();
     assert_eq!((seen[0].tag, seen[0].removal), (Some(BID1_TAG), None));
 }
+
+#[test]
+fn a_removal_cancel_whose_submit_fails_before_it_is_sent_leaves_no_reason_on_the_orders_end() {
+    // RB163-5 on PR #163: a gateway whose submit fails reports the cancel not sent without
+    // ever reporting it sent (fbc-examples link.rs). No cancel is in flight, so the order
+    // keeps no reason, and the venue's later cancel (cancel-on-disconnect, Stop) carries none.
+    let mut reg = quoting(WIDE, 0);
+    let sink = Verdicts::default();
+    reg.set_audit_sink(Box::new(sink.clone()));
+    let mut mint = mint();
+    let mut p = planner();
+    open_book(&mut p, &three_levels(), &mut reg, &amending(), &mut mint);
+    let bid1 = p.order_at(ACCT, INST, Side::Buy, 1).unwrap();
+    let plan = p
+        .plan(
+            &bid1_removed(),
+            &mut reg,
+            &amending(),
+            ACCT,
+            &mut mint,
+            LATER,
+        )
+        .unwrap();
+    assert_eq!(
+        shape(&plan),
+        vec![(
+            Stage::Cancel,
+            "cancel",
+            Side::Buy,
+            1,
+            BID1_TAG,
+            Some(BID_GONE)
+        )]
+    );
+    drop(plan);
+    assert_eq!(reg.get(bid1).unwrap().removal(), Some(BID_GONE));
+    let not_sent = SubmitOutcome::NotSent(fbc_core::NotSentReason::Disconnected);
+    cancel_answered(&mut reg, bid1, RpcId(1_000), not_sent);
+    assert_eq!(reg.get(bid1).unwrap().removal(), None);
+    sink.take();
+    reg.apply_update(
+        &update(
+            bid1,
+            Side::Buy,
+            &venue_id(Side::Buy, 1),
+            VenueOrderState::Canceled(fbc_core::CancelReason::Disconnect),
+        ),
+        key(20),
+    );
+    let ended = sink.take();
+    assert_eq!((ended[0].tag, ended[0].removal), (Some(BID1_TAG), None));
+}
+
+#[test]
+fn a_removal_cancel_whose_submit_fails_keeps_the_reason_of_a_cancel_still_in_flight() {
+    // The other side of RB163-5: an earlier removal cancel is in flight when a later one's
+    // submit fails; the cancel in flight may still end the order, so its reason is kept.
+    let mut reg = quoting(WIDE, 0);
+    let mut mint = mint();
+    let mut p = planner();
+    open_book(&mut p, &three_levels(), &mut reg, &amending(), &mut mint);
+    let bid1 = p.order_at(ACCT, INST, Side::Buy, 1).unwrap();
+    plan_and_send(
+        &mut p,
+        &bid1_removed(),
+        &mut reg,
+        &amending(),
+        &mut mint,
+        LATER,
+    );
+    assert_eq!(reg.get(bid1).unwrap().removal(), Some(BID_GONE));
+    let not_sent = SubmitOutcome::NotSent(fbc_core::NotSentReason::Disconnected);
+    cancel_answered(&mut reg, bid1, RpcId(2_000), not_sent);
+    assert_eq!(reg.get(bid1).unwrap().removal(), Some(BID_GONE));
+}
