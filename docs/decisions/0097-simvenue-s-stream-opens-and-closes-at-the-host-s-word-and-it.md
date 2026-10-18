@@ -26,6 +26,13 @@ SimVenue for Paradex (FBC-6mf) cannot place through it until the engine models t
 - **A close loses what is in flight.** Every frame written on the closing connection that has
   not yet arrived at the venue never acts and is never answered, so the runtime's deadline
   reports it `Unknown` (0005), for every venue.
+- **A resync lost at a close is asked again** (augmenting 0049, whose stream never lost a
+  frame). `SimCodec::on_open` forgets a resync still unanswered, so the new epoch's resync
+  writes its frame. An answer to a resync asked before the stream last opened, which the
+  engine answered after the close and the host delivers on the next connection, is dropped,
+  reporting nothing and no decode error: its snapshot predates the close and the venue's
+  cancellations at it, and a real stream would have lost it. The resync asked on the new
+  connection is still the one awaited (PR #162 Reviewer A, B1).
 - **Per connection.** The codec writes `ArmCancelOnDisconnect(on)` as a control frame naming
   no instrument, answered as one outcome for the whole request. An accepted arm protects every
   order placed after it, and also the orders open then where the venue declares

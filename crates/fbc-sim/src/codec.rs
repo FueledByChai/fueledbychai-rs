@@ -56,7 +56,9 @@ use crate::wire::{
 /// gets none from the engine, only order updates carrying them.
 ///
 /// A resync (decision 0049) is one frame asking the engine for its resting orders and
-/// positions, one at a time, whose one-frame answer it decodes into the `Resync*` events.
+/// positions, one at a time, whose one-frame answer it decodes into the `Resync*` events. A
+/// close loses a resync still in flight (0097), so each open forgets the one unanswered, and
+/// an answer to one asked before the open, delivered on the next connection, is dropped.
 #[derive(Clone, Debug)]
 pub struct SimCodec {
     /// Whether the engine can say what the stood-in venue's events say ([`modelled`]).
@@ -70,6 +72,9 @@ pub struct SimCodec {
     rpc_timeout: Duration,
     /// The wall time of the resync asked for and not answered yet.
     resync_at: Option<WallNs>,
+    /// The wall time the stream last opened: a resync answer naming an earlier request was
+    /// asked on a connection before it.
+    opened_at: Option<WallNs>,
 }
 
 impl SimCodec {
@@ -84,6 +89,7 @@ impl SimCodec {
             stream: config.stream,
             rpc_timeout: config.rpc_timeout,
             resync_at: None,
+            opened_at: None,
         }
     }
 
@@ -378,7 +384,10 @@ impl SimCodec {
     }
 
     /// A resync's answer, decoded whole: only the one asked for, named by its watermark, the
-    /// request's wall time; a position past an `i64` of lots is refused, never wrapped.
+    /// request's wall time; a position past an `i64` of lots is refused, never wrapped. One
+    /// asked before the stream last opened was asked on an earlier connection: its snapshot
+    /// predates the close, which a real stream would have lost with it, so it is dropped,
+    /// reporting nothing.
     fn resync_answer(
         &mut self,
         wm: WallNs,
@@ -387,11 +396,10 @@ impl SimCodec {
         scope: &DecodeScope<'_>,
     ) -> Result<Vec<ExecEvent>, DecodeError> {
         match self.resync_at {
+            Some(asked) if asked == wm => {}
+            _ if self.opened_at.is_some_and(|opened| wm < opened) => return Ok(Vec::new()),
             None => return Err(DecodeError::Malformed("no resync asked for")),
-            Some(asked) if asked != wm => {
-                return Err(DecodeError::Malformed("resync for another request"));
-            }
-            Some(_) => {}
+            Some(_) => return Err(DecodeError::Malformed("resync for another request")),
         }
         let mut events = vec![ExecEvent::ResyncBegin { watermark: wm }];
         for o in orders {
@@ -494,8 +502,13 @@ impl ExecCodec for SimCodec {
         0
     }
 
-    /// The simulated stream needs no authentication.
-    fn on_open(&mut self, _stream: StreamId, _ctx: &EncodeCtx, _fx: &mut Effects) {}
+    /// The simulated stream needs no authentication. A resync unanswered when the last
+    /// connection closed was lost with it, or its answer is from that connection: forgotten,
+    /// so the new epoch's resync asks again (PR #162 Reviewer A, B1).
+    fn on_open(&mut self, _stream: StreamId, ctx: &EncodeCtx, _fx: &mut Effects) {
+        self.resync_at = None;
+        self.opened_at = Some(ctx.wall);
+    }
 
     fn encode(
         &mut self,
@@ -658,8 +671,9 @@ impl ExecCodec for SimCodec {
 
     /// Asks the engine for its resting orders and positions (decision 0049): one frame,
     /// stamped with the call's time, whose wall time is the answer's watermark. A read, so it
-    /// awaits no RPC deadline; the simulated stream never loses a frame, so the answer always
-    /// comes, and while one is unanswered another call asks nothing.
+    /// awaits no RPC deadline; while one is unanswered another call asks nothing. The stream
+    /// loses it, or its answer reaches the next connection, only across a close (0097), and
+    /// the next open forgets it.
     fn resync(&mut self, ctx: &EncodeCtx, fx: &mut Effects) {
         if self.resync_at.is_some() {
             return;
