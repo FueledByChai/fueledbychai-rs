@@ -32,6 +32,12 @@
 //! with the connection, nothing placed on the next one is protected until it is asked for
 //! again. A dead-man venue cancels every order once its timer lapses unrefreshed, and none
 //! while it is refreshed in time.
+//!
+//! FBC-zr1's done line: a placement for a venue that acknowledges in two phases is answered
+//! Accepted Provisional after the latency, then Accepted Final once its `risk_reject_window`
+//! has passed; a risk reject the consumer configures inside the window ends the order
+//! Rejected, with an asynchronous reject of the placement and no final acceptance; and a
+//! single-phase venue's placement is answered Final as before, with nothing after it.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
@@ -56,8 +62,8 @@ use fbc_core::{
     dispatch,
 };
 use fbc_sim::{
-    Answer, Bracket, InjectedOrder, OrderKey, QueueConfig, QueueError, SimCodec, SimConfig,
-    SimEngine, SimError, SimFill, SimLatency,
+    Answer, Bracket, InjectedOrder, OrderKey, QueueConfig, QueueError, RiskRefusal, SimCodec,
+    SimConfig, SimEngine, SimError, SimFill, SimLatency,
 };
 use rust_decimal::Decimal;
 
@@ -1990,21 +1996,6 @@ fn order_events_say_only_what_the_stood_in_venue_echoes() {
         (&o.cid, o.post_only, o.reduce_only),
         (&Some(CidMatch::Ours(order)), Some(false), Some(false))
     );
-}
-
-#[test]
-fn a_two_phase_venue_is_not_stood_in_for_yet() {
-    // Codex r4182678509: the engine accepts in one phase, so for a venue that acknowledges in
-    // two the codec sends no placement rather than report a provisional acceptance as final
-    // (FBC-zr1 models both phases). A cancel, which the ack model does not govern, still goes.
-    let mut two = config(Bracket::Optimistic, VenueFeeSign::PositiveIsCost, fees());
-    two.exec.order.ack = AckModel::TwoPhase {
-        risk_reject_window: Duration::from_millis(50),
-    };
-    let mut v = Venue::with(two);
-    let refused = v.encode(&limit(cid(), Side::Buy, 199, 1), 1, T0);
-    assert_eq!(refused.err(), Some(NotSentReason::Unsupported));
-    assert!(v.encode(&cancel(OrderRef::Client(cid())), 2, T0).is_ok());
 }
 
 #[test]
@@ -5148,4 +5139,494 @@ fn a_crossing_order_meets_our_orders_at_one_price_in_their_arrival_order() {
     let pos = v.engine.queue_position(&second).unwrap();
     assert_eq!((pos.remaining, pos.ahead), (lots(1), lots(0)));
     assert_eq!(v.engine.queue_position(&first), None);
+}
+
+// FBC-zr1: a venue that acknowledges in two phases (decision 0099).
+
+/// The stood-in venue's risk window: how long after its provisional acceptance a placement
+/// can still be refused.
+const WINDOW: u64 = 50 * MS;
+
+const PROVISIONAL: SubmitOutcome = SubmitOutcome::Accepted {
+    ack: AckLevel::Provisional,
+};
+
+/// `config` standing in for a venue that acknowledges in two phases, with a window of
+/// [`WINDOW`].
+fn two_phased(mut config: SimConfig) -> SimConfig {
+    config.exec.order.ack = AckModel::TwoPhase {
+        risk_reject_window: Duration::from_nanos(WINDOW),
+    };
+    config
+}
+
+fn two_phase() -> Venue {
+    Venue::with(two_phased(config(
+        Bracket::Pessimistic,
+        VenueFeeSign::PositiveIsCost,
+        fees(),
+    )))
+}
+
+/// The rich venue (batches, cancel-all, queries) acknowledging in two phases.
+fn two_phase_rich() -> Venue {
+    Venue::with(two_phased(rich_config(Bracket::Pessimistic)))
+}
+
+/// What a decoded event says of a placement's outcome: its rpc, item index, client and venue
+/// ids and outcome.
+fn placement_of(
+    ev: &ExecEvent,
+) -> (
+    u64,
+    u16,
+    Option<ClientOrderId>,
+    Option<VenueOrderId>,
+    SubmitOutcome,
+) {
+    let ExecEvent::Outcome {
+        rpc,
+        item: Some(item),
+        outcome,
+    } = ev
+    else {
+        panic!("{ev:?}")
+    };
+    (rpc.0, item.idx, item.cid, item.vid.clone(), outcome.clone())
+}
+
+/// What a decoded asynchronous reject says: the order it names, its operation, and its kind
+/// and venue code.
+fn async_reject_of(ev: &ExecEvent) -> (OrderRef, OpKind, RejectKind, Option<String>) {
+    let ExecEvent::AsyncReject { target, op, reject } = ev else {
+        panic!("{ev:?}")
+    };
+    let code = reject.venue_code.as_deref().map(str::to_owned);
+    (target.clone(), *op, reject.kind, code)
+}
+
+fn rejected_state(kind: RejectKind) -> VenueOrderState {
+    VenueOrderState::Rejected(fbc_core::TerminalReject::new(kind).unwrap())
+}
+
+#[test]
+fn a_two_phase_placement_is_accepted_provisionally_after_the_latency_then_final_after_its_window()
+{
+    let mut v = two_phase();
+    v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+    let order = cid();
+    let sent = T0 + MS;
+    v.send(limit(order, Side::Buy, 199, 2), 1, sent);
+    v.tick(sent + 4 * MS);
+    assert!(v.events().is_empty());
+    // Provisionally accepted when it reaches the venue, and resting at once.
+    let acted = sent + 5 * MS;
+    v.tick(acted);
+    let got = v.events();
+    assert_eq!(got.len(), 2, "{got:?}");
+    let answered = MonoNs(acted) + TO_CLIENT;
+    assert!(got.iter().all(|(at, _)| *at == answered));
+    let (rpc, idx, got_cid, vid, outcome) = placement_of(&got[0].1);
+    assert_eq!((rpc, idx, got_cid, &outcome), (1, 0, Some(order), &PROVISIONAL));
+    let vid = vid.unwrap();
+    assert_eq!(state_of(&got[1].1), Some((VenueOrderState::Open, 0)));
+    // It queues and fills inside the window as any resting order does.
+    v.trade(acted + 10 * MS, Aggressor::Seller, 199, 7);
+    let got = v.events();
+    assert_eq!(fill_of(&got[0].1).map(|f| f.1), Some(2), "{got:?}");
+    assert_eq!(state_of(&got[1].1), Some((VenueOrderState::Filled, 2)));
+    // Final once the window has passed since it was accepted, and not before.
+    v.tick(acted + WINDOW - 1);
+    assert!(v.events().is_empty());
+    v.tick(acted + WINDOW);
+    let got = v.events();
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].0, MonoNs(acted + WINDOW) + TO_CLIENT);
+    assert_eq!(
+        placement_of(&got[0].1),
+        (1, 0, Some(order), Some(vid), ACCEPTED)
+    );
+    // Nothing more, however long the venue runs.
+    v.tick(acted + 100 * WINDOW);
+    assert!(v.events().is_empty());
+}
+
+#[test]
+fn a_risk_reject_configured_inside_the_window_ends_the_order_rejected() {
+    let mut v = two_phase();
+    v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+    let order = cid();
+    let after = Duration::from_millis(20);
+    v.engine
+        .risk_reject(order, after, RiskRefusal::Margin)
+        .unwrap();
+    v.send(limit(order, Side::Buy, 199, 2), 1, T0);
+    let acted = T0 + 5 * MS;
+    v.tick(acted);
+    // Provisionally accepted, and held for the risk check: no order event, nothing resting.
+    let got = v.events();
+    assert_eq!(got.len(), 1, "{got:?}");
+    let (rpc, idx, got_cid, vid, outcome) = placement_of(&got[0].1);
+    assert_eq!((rpc, idx, got_cid, &outcome), (1, 0, Some(order), &PROVISIONAL));
+    let vid = vid.unwrap();
+    assert_eq!(v.engine.queue_position(&vid), None);
+    // A trade that would fill it, had it rested, fills nothing.
+    v.trade(acted + 5 * MS, Aggressor::Seller, 199, 10);
+    assert!(v.events().is_empty());
+    v.tick(acted + 20 * MS - 1);
+    assert!(v.events().is_empty());
+    // Refused at its configured instant: the asynchronous reject of the placement, then the
+    // order ended rejected.
+    v.tick(acted + 20 * MS);
+    let got = v.events();
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert!(
+        got.iter()
+            .all(|(at, _)| *at == MonoNs(acted + 20 * MS) + TO_CLIENT)
+    );
+    assert_eq!(
+        async_reject_of(&got[0].1),
+        (
+            OrderRef::Both(order, vid.clone()),
+            OpKind::Place,
+            RejectKind::Margin,
+            Some("margin".to_owned())
+        )
+    );
+    let o = order_of(&got[1].1);
+    assert_eq!(
+        (o.cid, o.vid.as_ref(), o.state.clone(), o.cum_filled),
+        (
+            Some(CidMatch::Ours(order)),
+            Some(&vid),
+            rejected_state(RejectKind::Margin),
+            lots(0)
+        )
+    );
+    // No final acceptance follows, and the venue knows it ended rejected.
+    v.tick(acted + 2 * WINDOW);
+    assert!(v.events().is_empty());
+    v.send(cancel(OrderRef::Client(order)), 2, acted + 2 * WINDOW);
+    v.tick(acted + 2 * WINDOW + 5 * MS);
+    let got = v.events();
+    assert_eq!(
+        rejected(&got[0].1),
+        Some(RejectKind::AlreadyTerminal(TerminalHint::Rejected))
+    );
+}
+
+#[test]
+fn each_risk_refusal_is_reported_as_its_reject_kind() {
+    let kinds = [
+        (
+            RiskRefusal::PostOnlyWouldCross,
+            RejectKind::PostOnlyWouldCross,
+            "post_only",
+        ),
+        (
+            RiskRefusal::MinNotional,
+            RejectKind::MinNotional,
+            "min_notional",
+        ),
+        (RiskRefusal::Margin, RejectKind::Margin, "margin"),
+        (RiskRefusal::Other, RejectKind::Other, "risk"),
+    ];
+    for (refusal, kind, code) in kinds {
+        let mut v = two_phase();
+        v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+        let order = cid();
+        // A market order too: refused at once, as the window opens.
+        v.engine
+            .risk_reject(order, Duration::ZERO, refusal)
+            .unwrap();
+        let market = place(order, Side::Buy, OrderKind::Market, 1, TifTag::Ioc, false);
+        v.send(market, 1, T0);
+        v.tick(T0 + 5 * MS);
+        let got = v.events();
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(outcome_of(&got[0].1), Some((1, PROVISIONAL)));
+        let (_, op, got_kind, got_code) = async_reject_of(&got[1].1);
+        assert_eq!((op, got_kind, got_code.as_deref()), (OpKind::Place, kind, Some(code)));
+        let o = order_of(&got[2].1);
+        assert_eq!((o.state.clone(), o.px), (rejected_state(kind), None));
+    }
+}
+
+#[test]
+fn a_single_phase_venue_answers_a_placement_final_as_before_and_takes_no_risk_reject() {
+    let mut v = Venue::new(Bracket::Pessimistic);
+    v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+    let order = cid();
+    assert_eq!(
+        v.engine
+            .risk_reject(order, Duration::ZERO, RiskRefusal::Margin),
+        Err(SimError::OutsideRiskWindow)
+    );
+    v.send(limit(order, Side::Buy, 199, 2), 1, T0);
+    v.tick(T0 + 5 * MS);
+    let got = v.events();
+    assert_eq!(got.len(), 2, "{got:?}");
+    let (rpc, idx, got_cid, _, outcome) = placement_of(&got[0].1);
+    assert_eq!((rpc, idx, got_cid, outcome), (1, 0, Some(order), ACCEPTED));
+    assert_eq!(state_of(&got[1].1), Some((VenueOrderState::Open, 0)));
+    v.tick(T0 + 100 * WINDOW);
+    assert!(v.events().is_empty());
+}
+
+#[test]
+fn a_risk_reject_is_taken_only_inside_the_window_and_for_an_id_the_venue_can_spell() {
+    let mut v = two_phase();
+    let window = Duration::from_nanos(WINDOW);
+    let past = window + Duration::from_nanos(1);
+    assert_eq!(
+        v.engine.risk_reject(cid(), past, RiskRefusal::Other),
+        Err(SimError::OutsideRiskWindow)
+    );
+    assert_eq!(v.engine.risk_reject(cid(), window, RiskRefusal::Other), Ok(()));
+    // A client id the stood-in venue's format cannot carry names no order it could hold.
+    let mut narrow = two_phased(config(
+        Bracket::Pessimistic,
+        VenueFeeSign::PositiveIsCost,
+        fees(),
+    ));
+    narrow.exec.order.client_id = ClientIdFormat::Numeric { max_digits: 1 };
+    let mut engine = SimEngine::new(&narrow);
+    assert_eq!(
+        engine.risk_reject(cid(), window, RiskRefusal::Other),
+        Err(SimError::ClientId)
+    );
+    for err in [SimError::OutsideRiskWindow, SimError::ClientId] {
+        assert!(!err.to_string().is_empty());
+    }
+}
+
+#[test]
+fn a_cancel_during_the_risk_check_withdraws_the_placement() {
+    let mut v = two_phase();
+    v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+    let order = cid();
+    v.engine
+        .risk_reject(order, Duration::from_millis(20), RiskRefusal::Margin)
+        .unwrap();
+    v.send(limit(order, Side::Buy, 199, 2), 1, T0);
+    v.tick(T0 + 5 * MS);
+    assert_eq!(v.events().len(), 1);
+    v.send(cancel(OrderRef::Client(order)), 2, T0 + 6 * MS);
+    v.tick(T0 + 11 * MS);
+    let got = v.events();
+    assert_eq!(outcome_of(&got[0].1), Some((2, ACCEPTED)), "{got:?}");
+    assert_eq!(
+        state_of(&got[1].1),
+        Some((VenueOrderState::Canceled(CancelReason::Requested), 0))
+    );
+    assert_eq!(order_of(&got[1].1).px, Some(Ticks(199)));
+    // Withdrawn: neither its refusal nor a final acceptance follows.
+    v.tick(T0 + 5 * MS + 2 * WINDOW);
+    assert!(v.events().is_empty());
+}
+
+#[test]
+fn a_two_phase_batch_is_answered_provisionally_per_item_then_each_item_settles() {
+    let mut v = two_phase_rich();
+    v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+    let (rests, refused, crosses) = (cid(), cid(), cid());
+    v.engine
+        .risk_reject(refused, Duration::from_millis(20), RiskRefusal::MinNotional)
+        .unwrap();
+    let batch = VenueCommand::PlaceBatch(vec![
+        new_order(limit(rests, Side::Buy, 199, 1)),
+        new_order(limit(refused, Side::Buy, 198, 1)),
+        new_order(limit(crosses, Side::Buy, 201, 1)),
+    ]);
+    v.send(batch, 1, T0);
+    let acted = T0 + 5 * MS;
+    v.tick(acted);
+    let frames = v.frames();
+    let items: Vec<_> = frames[0].1.iter().map(placement_of).collect();
+    assert_eq!(items.len(), 3, "{frames:?}");
+    assert_eq!(
+        (items[0].1, items[0].2, &items[0].4),
+        (0, Some(rests), &PROVISIONAL)
+    );
+    assert_eq!(
+        (items[1].1, items[1].2, &items[1].4),
+        (1, Some(refused), &PROVISIONAL)
+    );
+    // A post-only order that would cross is refused at once, as on a single-phase venue.
+    assert_eq!(items[2].1, 2);
+    assert_eq!(refusal(&frames[0].1[2]).0, RejectKind::PostOnlyWouldCross);
+    // Only the order that passed rests.
+    let rest: Vec<_> = frames[1..].iter().flat_map(|f| f.1.clone()).collect();
+    assert_eq!(rest.len(), 1, "{rest:?}");
+    assert_eq!(state_of(&rest[0]), Some((VenueOrderState::Open, 0)));
+    v.tick(acted + 20 * MS);
+    let got = v.events();
+    assert_eq!(got.len(), 2, "{got:?}");
+    let (target, ..) = async_reject_of(&got[0].1);
+    assert_eq!(target, OrderRef::Both(refused, items[1].3.clone().unwrap()));
+    assert_eq!(
+        state_of(&got[1].1),
+        Some((rejected_state(RejectKind::MinNotional), 0))
+    );
+    v.tick(acted + WINDOW);
+    let got = v.events();
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(
+        placement_of(&got[0].1),
+        (1, 0, Some(rests), items[0].3.clone(), ACCEPTED)
+    );
+}
+
+#[test]
+fn an_order_held_for_its_risk_check_is_queried_resynced_and_cancelled_as_one_the_venue_holds() {
+    let mut v = two_phase_rich();
+    v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+    let order = cid();
+    v.engine
+        .risk_reject(order, Duration::from_millis(40), RiskRefusal::Margin)
+        .unwrap();
+    v.send(limit(order, Side::Buy, 198, 2), 1, T0);
+    v.tick(T0 + 5 * MS);
+    let (_, _, _, vid, _) = placement_of(&v.events()[0].1);
+    let vid = vid.unwrap();
+    // A query finds it open, as placed.
+    let query = VenueCommand::Query(QueryOrder {
+        target: OrderRef::Venue(vid.clone()),
+        inst: INST,
+        placement_nonce: None,
+    });
+    v.send(query, 2, T0 + 6 * MS);
+    v.tick(T0 + 11 * MS);
+    let got = v.events();
+    let ExecEvent::QueryResult(answer) = &got[0].1 else {
+        panic!("{got:?}")
+    };
+    let found = answer.found().unwrap();
+    assert_eq!(
+        (&found.vid, found.state.clone(), found.px, found.qty),
+        (&vid, VenueOrderState::Open, Some(Ticks(198)), lots(2))
+    );
+    // A resync lists it among the orders the venue holds.
+    v.resync(T0 + 12 * MS);
+    v.tick(T0 + 17 * MS);
+    let got = v.events();
+    let listed: Vec<_> = got
+        .iter()
+        .filter_map(|(_, ev)| resync_order_of(ev))
+        .collect();
+    assert_eq!(listed, [(vid.clone(), Side::Buy, 198, 2, 0)], "{got:?}");
+    // An instrument cancel-all ends it, and its refusal never follows.
+    let all = VenueCommand::CancelAll(CancelScope::Instrument(INST));
+    v.send(all, 3, T0 + 18 * MS);
+    v.tick(T0 + 23 * MS);
+    let got = v.events();
+    assert_eq!(
+        states(&got),
+        [(VenueOrderState::Canceled(CancelReason::Requested), 0)],
+        "{got:?}"
+    );
+    v.tick(T0 + 5 * MS + 2 * WINDOW);
+    assert!(v.events().is_empty());
+}
+
+#[test]
+fn a_close_cancels_a_protected_order_held_for_its_risk_check() {
+    let mut config = two_phased(config(
+        Bracket::Pessimistic,
+        VenueFeeSign::PositiveIsCost,
+        fees(),
+    ));
+    config.exec.order.cancel_on_disconnect = CancelOnDisconnect::PerConnection {
+        rearm_on_reconnect: true,
+        covers_open_orders: false,
+    };
+    let mut v = Venue::with(config);
+    v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+    v.protect(ARM, 1, T0);
+    let order = cid();
+    v.engine
+        .risk_reject(order, Duration::from_millis(40), RiskRefusal::Margin)
+        .unwrap();
+    v.send(limit(order, Side::Buy, 199, 2), 2, T0 + 10 * MS);
+    v.tick(T0 + 15 * MS);
+    assert_eq!(v.events().len(), 1);
+    v.close(T0 + 20 * MS);
+    let got = v.events();
+    assert_eq!(
+        states(&got),
+        [(VenueOrderState::Canceled(CancelReason::Venue), 0)],
+        "{got:?}"
+    );
+    v.open(T0 + 21 * MS);
+    v.tick(T0 + 15 * MS + 2 * WINDOW);
+    assert!(v.events().is_empty());
+}
+
+#[test]
+fn a_second_phase_answered_after_a_reconnect_settles_nothing_but_the_order() {
+    // The venue settles a placement whether or not its connection lasts, and the host delivers
+    // the answer on the next connection (0097); the codec awaits no placement across a
+    // reconnect, as Paradex's drops every placement it holds (0092), so only the order's own
+    // state is reported.
+    let mut v = two_phase();
+    v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+    let (passes, refused) = (cid(), cid());
+    v.engine
+        .risk_reject(refused, Duration::from_millis(20), RiskRefusal::Margin)
+        .unwrap();
+    v.send(limit(passes, Side::Buy, 199, 1), 1, T0);
+    v.send(limit(refused, Side::Buy, 198, 1), 2, T0);
+    v.tick(T0 + 5 * MS);
+    assert_eq!(v.events().len(), 3);
+    v.close(T0 + 10 * MS);
+    v.open(T0 + 11 * MS);
+    v.tick(T0 + 5 * MS + WINDOW);
+    let frames = v.frames();
+    assert_eq!(frames.len(), 2, "{frames:?}");
+    // The refused order's frame: its order event alone.
+    assert_eq!(frames[0].1.len(), 1, "{frames:?}");
+    assert_eq!(
+        state_of(&frames[0].1[0]),
+        Some((rejected_state(RejectKind::Margin), 0))
+    );
+    // The passed placement's final acceptance: nothing.
+    assert!(frames[1].1.is_empty(), "{frames:?}");
+}
+
+#[test]
+fn the_codec_places_for_a_two_phase_venue_but_sends_no_amend() {
+    // The engine models a two-phase venue's placements; its amends, which such a venue may also
+    // settle in two phases, are refused rather than answered final (FBC-kbwj).
+    let mut v = two_phase_rich();
+    v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+    let order = cid();
+    let vid = v.rest(limit(order, Side::Buy, 199, 2), 1, T0);
+    let change = VenueCommand::Amend(amend(OrderRef::Both(order, vid), Side::Buy, 198, 2, 0));
+    assert_eq!(
+        v.encode(&change, 2, T0 + 10 * MS).err(),
+        Some(NotSentReason::Unsupported)
+    );
+    assert!(v.encode(&cancel(OrderRef::Client(order)), 3, T0).is_ok());
+}
+
+#[test]
+fn the_codec_refuses_second_phase_answers_it_cannot_read() {
+    let mut v = two_phase();
+    let frames = [
+        // An acceptance whose phase is neither.
+        "ack|seq=0|ts=1|rpc=1|cid=x|vid=S0|ph=q",
+        // A final acceptance without its venue id, or its item.
+        "final|seq=0|ts=1|rpc=1|idx=0|cid=x",
+        "final|seq=0|ts=1|rpc=1|cid=x|vid=S0",
+        // A risk reject without its order, with another record, or with no refusal it names.
+        "risk|seq=0|ts=1|rpc=1|idx=0|code=margin",
+        "risk|seq=0|ts=1|rpc=1|idx=0|code=margin\nfill|fid=F0",
+        "risk|seq=0|ts=1|rpc=1|idx=0|code=not_found\norder|cid=x|vid=S0|inst=1|side=B|state=rejected_margin|cum=0|px=199|qty=1|po=1|ro=0",
+    ];
+    for frame in frames {
+        assert!(
+            matches!(v.decode(frame.as_bytes()), Err(DecodeError::Malformed(_))),
+            "{frame}"
+        );
+    }
 }
