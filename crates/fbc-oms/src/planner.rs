@@ -623,7 +623,8 @@ pub struct Plan {
 /// What a pass emits, in order (decision 0111): each command charged against the pass's rate
 /// view as it is built, then authorized; under [`Batching::Declared`], consecutive places of one
 /// stage held until their batch is full or the run ends, and the cancels of the pass's cancel
-/// stage that the venue's cancel-many can name held until theirs is.
+/// stage that the venue's cancel-many can name held until theirs is or a command that goes
+/// alone follows them.
 struct Out<'a> {
     plan: Plan,
     caps: &'a OrderCaps,
@@ -689,20 +690,6 @@ impl<'a> Out<'a> {
         self.flush(reg, acct);
         self.rates.charge(cmd.command(), self.market);
         self.push(reg, acct, stage, item, Vec::new(), cmd);
-    }
-
-    /// Emits the single cancel `cmd` of the pass's cancel stage, after the places held; the
-    /// cancel-many items held stay held, as the order among cancels changes nothing.
-    fn single_cancel(
-        &mut self,
-        reg: &mut Registry,
-        acct: AccountKey,
-        item: BatchItem,
-        cmd: PermittedCommand,
-    ) {
-        self.flush_places(reg, acct);
-        self.rates.charge(cmd.command(), self.market);
-        self.push(reg, acct, Stage::Cancel, item, Vec::new(), cmd);
     }
 
     /// Emits the place `cmd` of `stage`, or holds it for a batch: a batch holds places of one
@@ -1504,10 +1491,10 @@ impl ExecutionPlanner {
                         removal,
                         downgrades,
                     };
+                    // A command that goes alone, a cancel the cancel-many cannot name
+                    // included, follows everything held, so the output keeps 0005's order.
                     if batchable {
                         out.place(reg, acct, stage, item, cmd);
-                    } else if stage == Stage::Cancel {
-                        out.single_cancel(reg, acct, item, cmd);
                     } else {
                         out.emit(reg, acct, stage, item, cmd);
                     }

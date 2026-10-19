@@ -977,6 +977,51 @@ fn a_normal_amend_stops_at_the_floor() {
 }
 
 #[test]
+fn a_reducing_amend_goes_out_at_the_floor() {
+    // Long 10, a reduce-only ask resting: moving it is a reducing amend, never withheld, even
+    // with no room left above the floor.
+    let caps = OrderCaps {
+        amend: Some(fbc_core::AmendCaps {
+            refs: TagSet::of(&[RefKind::Venue]),
+            price: true,
+            qty: true,
+            flags: false,
+            when_partially_filled: true,
+            reject_keeps_original: true,
+            keeps_venue_id: true,
+            ack: fbc_core::AmendAck::ReplacedEvent,
+            qty_semantics: fbc_core::AmendQty::TotalIncludingFilled,
+            keeps_priority: None,
+        }),
+        ..batching()
+    };
+    let mut reg = quoting(10);
+    let mut p = planner();
+    let mut m = mint();
+    let ask = |px| DesiredBook::new(INST).with(Side::Sell, 0, exit(quote(px, 1, 0)));
+    let open = p
+        .plan(
+            &ask(10_010),
+            &mut reg,
+            &declared(&caps),
+            ACCT,
+            &mut m,
+            MonoNs(0),
+        )
+        .unwrap();
+    ack_all(&mut reg, &open);
+    let venue = PlanVenue {
+        rates: RateView::new(vec![per_ip(1_500, 150)]),
+        ..declared(&caps)
+    };
+    let plan = p
+        .plan(&ask(10_005), &mut reg, &venue, ACCT, &mut m, MonoNs(2))
+        .unwrap();
+    assert_eq!(kinds(&plan), vec![("amend", 1)]);
+    assert!(plan.refused.is_empty(), "{:?}", refusals(&plan));
+}
+
+#[test]
 fn a_rate_scope_reads_its_room_from_its_limit_and_the_consumers_floor() {
     let scope = per_ip(1_400, 150);
     assert_eq!(scope.left, 100);
