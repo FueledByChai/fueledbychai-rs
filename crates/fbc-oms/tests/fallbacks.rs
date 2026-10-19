@@ -297,6 +297,15 @@ fn fill_of(
     }
 }
 
+/// The levels whose reducer waits for an emulated order's cancel this pass.
+fn waiting(plan: &Plan) -> Vec<(Side, u16)> {
+    plan.refused
+        .iter()
+        .filter(|r| r.why == PlanRefusal::AwaitsEmulatedCancel)
+        .map(|r| (r.side, r.level))
+        .collect()
+}
+
 /// The emulated reduce-only order's shape: post-only, without the venue flag, classified
 /// reducing.
 fn assert_emulated(o: &NewOrder, qty: i64) {
@@ -834,9 +843,12 @@ fn an_emulated_order_s_own_fills_never_overshoot() {
 }
 
 #[test]
-fn an_emulated_order_left_overshooting_by_a_reducer_placed_in_the_same_pass_is_cancelled_in_it() {
-    // Long 10, an emulated exit of 8 resting at level 1; a reduce-only ask of 5 comes at level
-    // 0. Once it is built, 8 would overshoot the 5 left: the pass cancels it after its builds.
+fn a_reducer_that_would_leave_an_emulated_order_overshooting_waits_for_its_cancel() {
+    // Codex r4309822832: long 10, an emulated exit of 8 resting at level 1; a reduce-only ask
+    // of 5 comes at level 0. Placed now, both could fill and take the position to -3, the
+    // emulated order having no venue flag to stop it: the pass cancels the emulated order and
+    // builds the reducer only once that order is terminal, then the emulated level again at
+    // what is left.
     let mut reg = quoting(10);
     let mut mint = mint();
     let mut p = planner();
@@ -848,14 +860,173 @@ fn an_emulated_order_left_overshooting_by_a_reducer_placed_in_the_same_pass_is_c
     ack(&mut reg, emulated, "v1");
     let next = first.with(Side::Sell, 0, reduce_only(limit(10_010, 5)));
     let pass = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER);
+    assert_eq!(shape(&pass), vec![(Stage::Cancel, "cancel", Side::Sell, 1)]);
+    assert_eq!(pass.commands[0].cid, emulated);
+    assert_eq!(waiting(&pass), vec![(Side::Sell, 0)]);
+    // The cancel in flight still counts: the reducer waits.
+    let again = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER2);
+    assert!(again.commands.is_empty(), "{:?}", shape(&again));
+    assert_eq!(waiting(&again), vec![(Side::Sell, 0)]);
+    cancelled(&mut reg, emulated, Side::Sell, "v1", 2);
+    let after = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER3);
     assert_eq!(
-        shape(&pass),
+        shape(&after),
         vec![
             (Stage::Reducing, "place", Side::Sell, 0),
-            (Stage::Cancel, "cancel", Side::Sell, 1),
+            (Stage::Reducing, "place", Side::Sell, 1),
         ]
     );
-    assert_eq!(pass.commands[1].cid, emulated);
+    assert!(placed(&after.commands[0]).reduce_only);
+    assert_emulated(placed(&after.commands[1]), 5);
+}
+
+#[test]
+fn a_reducer_amend_that_would_leave_an_emulated_order_overshooting_waits_for_its_cancel() {
+    // Long 10: a reduce-only ask of 2 at level 0 and an emulated exit of 8 at level 1 rest. The
+    // ask grows to 10 by amend: amended now, both could fill. The pass cancels the emulated
+    // order and amends the ask only once it is terminal.
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = amending(conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]));
+    let exit = maker_exit(10_020, 8, ReduceFallback::EmulateReduceOnly);
+    let first = book()
+        .with(Side::Sell, 0, reduce_only(limit(10_010, 2)))
+        .with(Side::Sell, 1, exit.clone());
+    let plan = plan_and_send(&mut p, &first, &mut reg, &caps, &mut mint, MonoNs(0));
+    assert_eq!(
+        shape(&plan),
+        vec![
+            (Stage::Reducing, "place", Side::Sell, 0),
+            (Stage::Reducing, "place", Side::Sell, 1),
+        ]
+    );
+    let (native, emulated) = (plan.commands[0].cid, plan.commands[1].cid);
+    assert_emulated(placed(&plan.commands[1]), 8);
+    ack(&mut reg, native, "v0");
+    ack(&mut reg, emulated, "v1");
+    let grown = book()
+        .with(Side::Sell, 0, reduce_only(limit(10_010, 10)))
+        .with(Side::Sell, 1, exit);
+    let pass = plan_and_send(&mut p, &grown, &mut reg, &caps, &mut mint, LATER);
+    assert_eq!(shape(&pass), vec![(Stage::Cancel, "cancel", Side::Sell, 1)]);
+    assert_eq!(pass.commands[0].cid, emulated);
+    assert_eq!(waiting(&pass), vec![(Side::Sell, 0)]);
+    cancelled(&mut reg, emulated, Side::Sell, "v1", 2);
+    let after = plan_and_send(&mut p, &grown, &mut reg, &caps, &mut mint, LATER2);
+    assert_eq!(shape(&after), vec![(Stage::Reducing, "amend", Side::Sell, 0)]);
+    assert_eq!(after.commands[0].cid, native);
+    assert_eq!(
+        after
+            .refused
+            .iter()
+            .map(|r| (r.side, r.level, r.why.clone()))
+            .collect::<Vec<_>>(),
+        vec![(Side::Sell, 1, PlanRefusal::NoRoomToReduce)]
+    );
+}
+
+#[test]
+fn a_synthetic_ioc_that_would_leave_an_emulated_order_overshooting_waits_for_its_cancel() {
+    // Long 10, an emulated exit of 8 resting; a reduce-only IOC of 5 the venue takes only as a
+    // synthetic IOC: it waits for the emulated order's cancel like any reducer.
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = conflicting(&[
+        (Feature::PostOnly, Feature::ReduceOnly),
+        (Feature::Ioc, Feature::ReduceOnly),
+    ]);
+    let first = book().with(
+        Side::Sell,
+        1,
+        maker_exit(10_020, 8, ReduceFallback::EmulateReduceOnly),
+    );
+    let plan = plan_and_send(&mut p, &first, &mut reg, &caps, &mut mint, MonoNs(0));
+    let emulated = plan.commands[0].cid;
+    ack(&mut reg, emulated, "v1");
+    let ioc = DesiredQuote {
+        tif: Tif::Ioc,
+        ..reduce_only(limit(9_990, 5))
+    };
+    let next = first.with(Side::Sell, 0, ioc);
+    let pass = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER);
+    assert_eq!(shape(&pass), vec![(Stage::Cancel, "cancel", Side::Sell, 1)]);
+    assert_eq!(pass.commands[0].cid, emulated);
+    assert_eq!(waiting(&pass), vec![(Side::Sell, 0)]);
+}
+
+#[test]
+fn a_reducer_at_a_farther_level_is_counted_before_an_emulated_place_is_sized() {
+    // Reviewer B (revb_t4): long 10, nothing resting; an emulated exit of 10 at level 0 and a
+    // reduce-only ask of 10 at level 1. The reducer is built first, so the emulated exit has
+    // nothing left and is refused: never 20 lots of reducing asks on a long of 10.
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]);
+    let desired = book()
+        .with(
+            Side::Sell,
+            0,
+            maker_exit(10_010, 10, ReduceFallback::EmulateReduceOnly),
+        )
+        .with(Side::Sell, 1, reduce_only(limit(10_020, 10)));
+    let plan = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, MonoNs(0));
+    assert_eq!(
+        shape(&plan),
+        vec![(Stage::Reducing, "place", Side::Sell, 1)]
+    );
+    assert!(placed(&plan.commands[0]).reduce_only);
+    assert_eq!(plan.refused.len(), 1);
+    assert_eq!(
+        (plan.refused[0].level, plan.refused[0].why.clone()),
+        (0, PlanRefusal::NoRoomToReduce)
+    );
+}
+
+#[test]
+fn a_resting_order_promoted_to_emulated_counts_against_a_second_emulated_level() {
+    // Codex r4309822831: an unclassified post-only ask of 10 rests on a long of 10; its quote
+    // becomes an emulated exit of the same wire shape, and a second emulated exit of 10 comes
+    // at level 1. The promoted order now reduces the position, so level 1 has nothing left.
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]);
+    let plain = DesiredQuote {
+        post_only: true,
+        ..limit(10_010, 10)
+    };
+    let plan = plan_and_send(
+        &mut p,
+        &book().with(Side::Sell, 0, plain),
+        &mut reg,
+        &caps,
+        &mut mint,
+        MonoNs(0),
+    );
+    let c = plan.commands[0].cid;
+    ack(&mut reg, c, "v0");
+    let next = book()
+        .with(
+            Side::Sell,
+            0,
+            maker_exit(10_010, 10, ReduceFallback::EmulateReduceOnly),
+        )
+        .with(
+            Side::Sell,
+            1,
+            maker_exit(10_020, 10, ReduceFallback::EmulateReduceOnly),
+        );
+    let pass = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER);
+    assert!(pass.commands.is_empty(), "{:?}", shape(&pass));
+    assert!(reg.get(c).unwrap().reduces());
+    assert_eq!(pass.refused.len(), 1);
+    assert_eq!(
+        (pass.refused[0].level, pass.refused[0].why.clone()),
+        (1, PlanRefusal::NoRoomToReduce)
+    );
 }
 
 #[test]
@@ -938,39 +1109,52 @@ fn the_check_after_a_fill_is_refused_through_another_registry_and_ignores_other_
 }
 
 #[test]
-fn an_emulated_amend_left_nothing_by_an_earlier_build_is_not_built_and_its_order_is_cancelled() {
-    // Long 10, an emulated exit of 3 resting at level 1 asked to grow to 6, and a reduce-only
-    // ask of 10 coming at level 0: built first, it leaves nothing, so the amend is not built
-    // and the emulated order is cancelled after the builds.
-    let mut reg = quoting(10);
-    let mut mint = mint();
-    let mut p = planner();
-    let caps = amending(conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]));
-    let first = book().with(
-        Side::Sell,
-        1,
-        maker_exit(10_020, 3, ReduceFallback::EmulateReduceOnly),
-    );
-    let plan = plan_and_send(&mut p, &first, &mut reg, &caps, &mut mint, MonoNs(0));
-    let emulated = plan.commands[0].cid;
-    ack(&mut reg, emulated, "v1");
-    let next = book()
-        .with(Side::Sell, 0, reduce_only(limit(10_010, 10)))
-        .with(
+fn an_emulated_amend_a_reducer_would_leave_overshooting_is_not_built_and_its_order_is_cancelled() {
+    // Long 10, an emulated exit of 3 resting asked to grow to 6, and a reduce-only ask of 10
+    // coming at the other level: the emulated order is cancelled and its amend not built, and
+    // the reducer waits for that cancel, whichever level is nearer (Reviewer B, revb_t3).
+    for (native_at, emulated_at) in [(0, 1), (1, 0)] {
+        let mut reg = quoting(10);
+        let mut mint = mint();
+        let mut p = planner();
+        let caps = amending(conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]));
+        let first = book().with(
             Side::Sell,
-            1,
-            maker_exit(10_020, 6, ReduceFallback::EmulateReduceOnly),
+            emulated_at,
+            maker_exit(10_020, 3, ReduceFallback::EmulateReduceOnly),
         );
-    let pass = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER);
-    assert_eq!(
-        shape(&pass),
-        vec![
-            (Stage::Reducing, "place", Side::Sell, 0),
-            (Stage::Cancel, "cancel", Side::Sell, 1),
-        ]
-    );
-    assert_eq!(pass.commands[1].cid, emulated);
-    assert!(pass.refused.is_empty());
+        let plan = plan_and_send(&mut p, &first, &mut reg, &caps, &mut mint, MonoNs(0));
+        let emulated = plan.commands[0].cid;
+        ack(&mut reg, emulated, "v1");
+        let next = book()
+            .with(Side::Sell, native_at, reduce_only(limit(10_010, 10)))
+            .with(
+                Side::Sell,
+                emulated_at,
+                maker_exit(10_020, 6, ReduceFallback::EmulateReduceOnly),
+            );
+        let pass = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER);
+        assert_eq!(
+            shape(&pass),
+            vec![(Stage::Cancel, "cancel", Side::Sell, emulated_at)]
+        );
+        assert_eq!(pass.commands[0].cid, emulated);
+        assert_eq!(waiting(&pass), vec![(Side::Sell, native_at)]);
+        cancelled(&mut reg, emulated, Side::Sell, "v1", 2);
+        let after = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER2);
+        assert_eq!(
+            shape(&after),
+            vec![(Stage::Reducing, "place", Side::Sell, native_at)]
+        );
+        assert_eq!(
+            after
+                .refused
+                .iter()
+                .map(|r| (r.level, r.why.clone()))
+                .collect::<Vec<_>>(),
+            vec![(emulated_at, PlanRefusal::NoRoomToReduce)]
+        );
+    }
 }
 
 #[test]
