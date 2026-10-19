@@ -109,6 +109,7 @@
 //! deadline of its own; the caller bounds one with its own timer.
 
 mod books;
+mod bounds;
 mod connector;
 mod epoch;
 mod error;
@@ -157,6 +158,7 @@ const _: () = assert!(
 );
 
 pub use books::{BookHandler, BookKeeper, MdBooks, TradingBookConflict, TradingBooks};
+pub use bounds::{BoundError, InFlight, ReservedBound};
 pub use connector::{Connector, ProxyConfig};
 pub use epoch::{Admit, EpochError, Epochs, Input};
 pub use error::{Cause, NetError, Step};
