@@ -28,7 +28,8 @@ use fbc_core::{
     AccountKey, AckLevel, AmendAck, AmendCaps, AmendQty, Bps, CancelReason, Channel, CidMatch,
     CidMint, ClientOrderId, ExchNs, ExchTsKind, Feature, FillIdent, InstrumentId, ItemRef, MonoNs,
     Namespace, NamespaceLease, NewOrder, OrderCaps, OrderKind, OrderUpdate, RefKind, RpcId, Side,
-    SignedLots, SubmitOutcome, TagSet, Ticks, Tif, VenueCommand, VenueOrderState, WallNs,
+    SignedLots, SubmitOutcome, TagSet, Ticks, Tif, VenueCommand, VenueOrderSnapshot,
+    VenueOrderState, WallNs,
 };
 use fbc_oms::{
     Admission, AmendRefusal, CapRefusal, DesiredBook, DesiredQuote, Downgrade, ExecutionPlanner,
@@ -1840,4 +1841,117 @@ fn a_reducer_judged_with_the_emulated_order_ended_still_counts_the_side_s_other_
         )]
     );
     assert!(!reg.get(emulated).unwrap().state().is_terminal());
+}
+
+/// A trustworthy resync at 5 000 showing, beside nothing else, an order of ours the registry
+/// does not hold: a sell of `qty` at 10 030, registered as an orphan (decision 0107), so the
+/// adding side is suppressed and only what reduces the position within its size is built.
+fn sell_orphan(reg: &mut Registry, pos: i64, qty: i64) {
+    let o = common::cid();
+    let snap = ResyncSnapshot {
+        watermark: WallNs(5_000),
+        requested_at: MonoNs(5_000),
+        orders: vec![VenueOrderSnapshot {
+            cid: Some(CidMatch::Ours(o)),
+            vid: vid("orphan"),
+            inst: INST,
+            side: Side::Sell,
+            state: VenueOrderState::Open,
+            px: Some(Ticks(10_030)),
+            qty: lots(qty),
+            cum_filled: lots(0),
+            post_only: None,
+            reduce_only: None,
+        }],
+        positions: vec![(INST, SignedLots(pos))],
+    };
+    let report = reg
+        .resync(&ladder_cfg(), &order_caps(), &snap, key(5_000))
+        .unwrap();
+    assert_eq!(report.orphans, vec![INST], "{report:?}");
+    assert_eq!(reg.orphans(INST), vec![o]);
+}
+
+#[test]
+fn during_an_orphan_cooldown_a_reducer_refused_anyway_cancels_no_emulated_order_it_waits_for() {
+    // Reviewer A on PR #171, at the rebase onto FBC-01w's planner: long 10, an emulated exit of
+    // 8 rests at level 1, and an orphan sell of 8 suppresses the adding side. A reduce-only ask
+    // of 5 at level 0 would wait for the emulated order's cancel, but even with that order
+    // ended the orphan and the ask would sell 13 against a position of 10: the suppression
+    // refuses the ask, so the pass cancels nothing for it (decision 0107).
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]);
+    let exit = maker_exit(10_020, 8, ReduceFallback::EmulateReduceOnly);
+    let first = book().with(Side::Sell, 1, exit);
+    let plan = plan_and_send(&mut p, &first, &mut reg, &caps, &mut mint, MonoNs(0));
+    let emulated = plan.commands[0].cid;
+    ack(&mut reg, emulated, "v1");
+    sell_orphan(&mut reg, 10, 8);
+    let next = first.with(Side::Sell, 0, reduce_only(limit(10_010, 5)));
+    let pass = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER);
+    assert!(
+        pass.commands.iter().all(|c| c.cid != emulated),
+        "{:?}",
+        shape(&pass)
+    );
+    assert!(waiting(&pass).is_empty(), "{:?}", pass.refused);
+    assert!(
+        refusals(&pass).contains(&(
+            Side::Sell,
+            0,
+            PlanRefusal::Place(OmsError::OrphanCooldown {
+                inst: INST,
+                side: Side::Sell,
+            })
+        )),
+        "{:?}",
+        pass.refused
+    );
+}
+
+#[test]
+fn during_an_orphan_cooldown_a_reducer_amend_refused_anyway_cancels_no_emulated_order_it_waits_for()
+{
+    // Reviewer A on PR #171, at the rebase onto FBC-01w's planner: long 10, a reduce-only ask
+    // of 2 at level 0 and an emulated exit of 8 at level 1 rest, then an orphan sell of 8
+    // suppresses the adding side. The ask grows to 10 by amend: even with the emulated order
+    // ended, the orphan and the ask would sell 18 against a position of 10, so the suppression
+    // refuses the amend and the pass cancels nothing for it (decision 0107).
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = amending(conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]));
+    let exit = maker_exit(10_020, 8, ReduceFallback::EmulateReduceOnly);
+    let first = book()
+        .with(Side::Sell, 0, reduce_only(limit(10_010, 2)))
+        .with(Side::Sell, 1, exit.clone());
+    let plan = plan_and_send(&mut p, &first, &mut reg, &caps, &mut mint, MonoNs(0));
+    let (native, emulated) = (plan.commands[0].cid, plan.commands[1].cid);
+    ack(&mut reg, native, "v0");
+    ack(&mut reg, emulated, "v1");
+    sell_orphan(&mut reg, 10, 8);
+    let grown = book()
+        .with(Side::Sell, 0, reduce_only(limit(10_010, 10)))
+        .with(Side::Sell, 1, exit);
+    let pass = plan_and_send(&mut p, &grown, &mut reg, &caps, &mut mint, LATER);
+    assert!(
+        pass.commands.iter().all(|c| c.cid != emulated),
+        "{:?}",
+        shape(&pass)
+    );
+    assert!(waiting(&pass).is_empty(), "{:?}", pass.refused);
+    assert!(
+        refusals(&pass).contains(&(
+            Side::Sell,
+            0,
+            PlanRefusal::Amend(AmendRefusal::OrphanCooldown {
+                inst: INST,
+                side: Side::Sell,
+            })
+        )),
+        "{:?}",
+        pass.refused
+    );
 }
