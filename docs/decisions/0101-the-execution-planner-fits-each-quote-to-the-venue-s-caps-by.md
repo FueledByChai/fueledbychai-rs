@@ -53,15 +53,22 @@ builds on the synthetic IOC.
    side), less the fills on that side the venue reported on order updates that the inventory
    does not hold yet, less what our other orders that reduce it on that side may have resting
    (`OrderRecord::resting`, a cancel in flight counted until terminal). An order reduces it
-   when placed reduce-only or classified reducing, or once an amend classified reducing was
-   built for it (`OrderRecord::reduces`). A place is sized to it
-   when built, the commands before it in the pass counted, and refused
-   (`PlanRefusal::NoRoomToReduce`) when nothing is left; an amend grows the order only to it.
-   An order resting more than is left is cancelled at once, whatever its age or the book: at
-   the pass's start (in 0005's order, with the other cancels), after the pass's builds when an
-   earlier build left it overshooting, and by `ExecutionPlanner::on_fill`, which the consumer
-   calls after every fill on the market and which builds only those cancels. The level, if
-   still wanted, is placed again at the smaller size once the order is terminal.
+   when placed reduce-only or classified reducing, once an amend classified reducing was
+   built for it, or once the planner took it as an emulated order (`OrderRecord::reduces`).
+   Among a pass's reducing commands, those the venue flag or the consumer bounds are built
+   before the emulated ones, whatever their levels. A place is sized to what is left when
+   built, those commands counted, and refused (`PlanRefusal::NoRoomToReduce`) when nothing is
+   left; an amend grows the order only to it. An order resting more than is left is cancelled
+   at once, whatever its age or the book: at the pass's start (in 0005's order, with the other
+   cancels), and by `ExecutionPlanner::on_fill`, which the consumer calls after every fill on
+   the market and which builds only those cancels. The level, if still wanted, is placed
+   again at the smaller size once the order is terminal.
+7. **A reducer never joins an emulated order it would leave overshooting.** A reducing place
+   or amend (a synthetic IOC's included) whose worst case would leave an emulated order on its
+   side resting more than is left to reduce is not built: the emulated order is cancelled in
+   its place, and the reducer is refused `PlanRefusal::AwaitsEmulatedCancel` at every pass
+   until that order is terminal, as a replace waits under 0065. Both could otherwise fill
+   before the cancel lands and take the position past zero.
 
 ## Alternatives
 
@@ -76,6 +83,9 @@ builds on the synthetic IOC.
   (cancel-and-replace only).
 - Count only the emulated orders' own sum, not every reducer: rejected. A venue-flagged
   reducer can fill first and leave the emulated order crossing zero.
+- Clip the reducer to what the emulated order leaves, or build it and cancel the emulated
+  order after it: rejected. Clipping starves a force-close or other exit the consumer sized,
+  and cancelling after authorizes both orders at once; waiting costs one cancel round trip.
 - Re-check emulated orders only in `plan`: rejected. A fill between passes could leave an
   order able to cross zero until the next pass; `on_fill` makes the check per fill.
 
@@ -88,6 +98,8 @@ builds on the synthetic IOC.
   the other until it is terminal: safe, at the cost of queue time.
 - On a venue that cancels only after the acknowledgement, a synthetic IOC can rest until its
   acknowledgement arrives and the next pass builds its cancel.
+- A reducer added beside a resting emulated order it would leave overshooting, a force-close
+  cross among them, goes out one cancel round trip later.
 
 ## What would show this was wrong
 

@@ -308,10 +308,10 @@ pub struct OrderRecord {
     /// order (its side's, when the book no longer wanted its level), while that cancel may
     /// still end it.
     removal: Option<u16>,
-    /// An amend classified reducing was built for the order ([`Live::amend`](crate::Live::amend)):
-    /// from then on it counts as an order that reduces the position, whatever its placement
-    /// said ([`Self::reduces`]).
-    amended_reducing: bool,
+    /// An amend classified reducing was built for the order ([`Live::amend`](crate::Live::amend)),
+    /// or the planner took it as an emulated reduce-only order: from then on it counts as an
+    /// order that reduces the position, whatever its placement said ([`Self::reduces`]).
+    counted_reducing: bool,
 }
 
 impl OrderRecord {
@@ -360,7 +360,7 @@ impl OrderRecord {
             from_snapshot: false,
             tag: None,
             removal: None,
-            amended_reducing: false,
+            counted_reducing: false,
         }
     }
 
@@ -425,16 +425,18 @@ impl OrderRecord {
     }
 
     /// Whether the order may reduce the position by the OMS's account: placed reduce-only or
-    /// classified reducing ([`NewOrder::reduces`]), or amended with the reducing
-    /// classification since, which stays counted even if that amend never applies. An emulated
-    /// reduce-only order is sized against every such order on its side (decision 0100).
+    /// classified reducing ([`NewOrder::reduces`]), amended with the reducing classification
+    /// since, which stays counted even if that amend never applies, or taken by the planner as
+    /// an emulated reduce-only order. An emulated reduce-only order is sized against every such
+    /// order on its side (decision 0100).
     pub fn reduces(&self) -> bool {
-        self.placed.reduces() || self.amended_reducing
+        self.placed.reduces() || self.counted_reducing
     }
 
-    /// Records that an amend classified reducing was built for the order.
-    pub(crate) fn set_amended_reducing(&mut self) {
-        self.amended_reducing = true;
+    /// Records that the order reduces the position from now on: an amend classified reducing
+    /// was built for it, or the planner took it as an emulated reduce-only order.
+    pub(crate) fn set_counted_reducing(&mut self) {
+        self.counted_reducing = true;
     }
 
     /// Records the tag of a place or amend the planner built for the order.

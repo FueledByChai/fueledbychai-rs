@@ -434,9 +434,11 @@ pub struct Refused {
 /// What one [`ExecutionPlanner::plan`] pass built.
 #[derive(Debug, Default)]
 pub struct Plan {
-    /// The commands, in 0005's order: cancels, reducing orders, amends, adds; a synthetic IOC's
-    /// cancel follows its place, and the cancels of emulated reduce-only orders the pass's
-    /// builds left resting more than is left to reduce come last (0100).
+    /// The commands, in 0005's order: cancels, reducing orders (those the venue or the consumer
+    /// bounds before the emulated reduce-only ones), amends, adds; a synthetic IOC's cancel
+    /// follows its place, and the cancel of an emulated reduce-only order a reducer would leave
+    /// resting more than is left to reduce comes where that reducer would have been built, the
+    /// reducer waiting ([`PlanRefusal::AwaitsEmulatedCancel`]; 0100).
     pub commands: Vec<Planned>,
     /// The orders whose cancel waits for their acknowledgement: tried again at every later pass
     /// until it is built, whether or not the level is wanted again.
@@ -502,6 +504,17 @@ enum Action {
         downgrades: Vec<Downgrade>,
     },
     Place(Fitted),
+}
+
+impl Action {
+    /// Whether the action places or amends an emulated reduce-only order.
+    fn emulated(&self) -> bool {
+        match self {
+            Action::Cancel { .. } => false,
+            Action::Amend { emulated, .. } => emulated.is_some(),
+            Action::Place(f) => f.mode.emulated,
+        }
+    }
 }
 
 /// The planner (decision 0005's one planner; 0065): the orders it placed, by account, market,
@@ -602,6 +615,18 @@ impl ExecutionPlanner {
                 }
                 continue;
             };
+            // An order standing in for a quote that is now a synthetic IOC or an emulated
+            // reduce-only order of the same wire shape takes that mode: cancelled at once as
+            // an IOC, or protected from overshoot from now on, and then counted as an order
+            // reducing the position, so other emulated orders are sized with it. A mode is
+            // never dropped while the order rests (0100).
+            if let Some(f) = &fitted {
+                slot.mode.synth_ioc |= f.mode.synth_ioc;
+                slot.mode.emulated |= f.mode.emulated;
+                if f.mode.emulated {
+                    reg.with_record(slot.cid, OrderRecord::set_counted_reducing);
+                }
+            }
             let rec = reg
                 .get(slot.cid)
                 .expect("terminal and unknown orders were freed");
@@ -620,14 +645,6 @@ impl ExecutionPlanner {
                 cid: slot.cid,
                 why,
             };
-            // An order standing in for a quote that is now a synthetic IOC or an emulated
-            // reduce-only order of the same wire shape takes that mode: cancelled at once as
-            // an IOC, or protected from overshoot from now on. A mode is never dropped while
-            // the order rests (0100).
-            if let Some(f) = &fitted {
-                slot.mode.synth_ioc |= f.mode.synth_ioc;
-                slot.mode.emulated |= f.mode.emulated;
-            }
             // In Exit, an order on a side that does not reduce the position is cancelled
             // whatever the book wants there: Exit builds nothing on that side (0063).
             let adds_in_exit = exit_reduces.is_some_and(|reduces| reduces != Some(at.side()));
@@ -743,8 +760,10 @@ impl ExecutionPlanner {
             reg.with_record(cid, |rec| rec.set_removal(None));
         }
 
-        // Built in 0005's order, so each is judged with the earlier ones counted.
-        actions.sort_by_key(|(stage, at, _)| (*stage, *at));
+        // Built in 0005's order, so each is judged with the earlier ones counted; among the
+        // reducing commands, those the venue or the consumer bounds come before the emulated
+        // ones, so an emulated order is sized and grown with every other reducer counted.
+        actions.sort_by_key(|(stage, at, action)| (*stage, action.emulated(), *at));
         // The orders a cancel was decided for this pass, which the overshoot check skips.
         let mut cancelling: Vec<ClientOrderId> = Vec::new();
         for (stage, at, action) in actions {
@@ -780,22 +799,55 @@ impl ExecutionPlanner {
                 Action::Amend {
                     cid,
                     px,
-                    mut total,
+                    total,
                     reducing,
                     tag,
                     emulated,
                     downgrades,
                 } => {
                     // An emulated order grows only to what is left to reduce once the
-                    // commands before it are counted; with nothing left, the overshoot check
-                    // after the builds decides.
-                    if let Some(want) = emulated {
-                        let room = reduce_room(reg, market, side, Some(cid));
-                        let rests = want.min(room);
-                        let filled = reg.get(cid).map_or(Lots::ZERO, OrderRecord::filled);
-                        match filled.checked_add(rests) {
-                            Some(clipped) if rests > Lots::ZERO => total = clipped,
-                            _ => continue,
+                    // commands before it are counted, and is not amended with nothing left
+                    // (the overshoot checks decide) or when a reducer's wait cancelled it
+                    // this pass.
+                    let clipped = match emulated {
+                        Some(want) => {
+                            let rests = want.min(reduce_room(reg, market, side, Some(cid)));
+                            let filled = reg.get(cid).map_or(Lots::ZERO, OrderRecord::filled);
+                            filled.checked_add(rests).filter(|_| rests > Lots::ZERO)
+                        }
+                        None => Some(total),
+                    };
+                    let Some(total) = clipped.filter(|_| !cancelling.contains(&cid)) else {
+                        continue;
+                    };
+                    // A reducer that grows waits for the cancel of each emulated order its
+                    // growth would leave overshooting.
+                    if emulated.is_none() {
+                        let grows = reg.get(cid).map_or(Lots::ZERO, |rec| {
+                            let counted = if reducing || rec.reduces() {
+                                total.checked_sub(rec.filled()).unwrap_or(Lots::ZERO)
+                            } else {
+                                Lots::ZERO
+                            };
+                            let before = if rec.reduces() {
+                                rec.resting()
+                            } else {
+                                Lots::ZERO
+                            };
+                            counted.checked_sub(before).unwrap_or(Lots::ZERO)
+                        });
+                        if waits_for_emulated(
+                            slots,
+                            reg,
+                            caps,
+                            acct,
+                            (market, side),
+                            grows,
+                            &mut cancelling,
+                            &mut plan,
+                        ) {
+                            plan.refused.push(refuse(PlanRefusal::AwaitsEmulatedCancel));
+                            continue;
                         }
                     }
                     reg.live(cid)
@@ -817,6 +869,24 @@ impl ExecutionPlanner {
                     mode,
                     downgrades,
                 }) => {
+                    // A reducer waits for the cancel of each emulated order it would leave
+                    // overshooting.
+                    if !mode.emulated
+                        && quote.reduces()
+                        && waits_for_emulated(
+                            slots,
+                            reg,
+                            caps,
+                            acct,
+                            (market, side),
+                            quote.qty,
+                            &mut cancelling,
+                            &mut plan,
+                        )
+                    {
+                        plan.refused.push(refuse(PlanRefusal::AwaitsEmulatedCancel));
+                        continue;
+                    }
                     // An emulated order is sized to what is left to reduce, the commands
                     // before it counted.
                     if mode.emulated {
@@ -870,8 +940,8 @@ impl ExecutionPlanner {
                 Err(why) => plan.refused.push(refuse(why)),
             }
         }
-        // Built last, the cancels of emulated orders the commands before them left resting
-        // more than is left to reduce (a reducer placed at a nearer level, say).
+        // Built last, the cancels of any emulated order the pass's builds still left resting
+        // more than is left to reduce; none should be, as a reducer that would waits above.
         overshoot_cancels(slots, reg, caps, acct, market, &cancelling, &mut plan);
         Ok(plan)
     }
@@ -1067,6 +1137,55 @@ fn cancel_now(
             why: PlanRefusal::Permit(why),
         }),
     }
+}
+
+/// Whether a reducer about to rest `grows` more on `side` of `market` must wait: it would leave
+/// an emulated reduce-only order in `slots` on that side, not yet terminal, resting more than is
+/// left to reduce, so both could fill and take the position past zero, the emulated order
+/// having no venue flag to stop it. Builds into `plan` the cancel of each such order not already
+/// cancelling (listed in `cancelling` or with a cancel in flight), whose level then waits for
+/// its terminal state; the reducer is built by the first pass after (decision 0100).
+#[allow(clippy::too_many_arguments)]
+fn waits_for_emulated(
+    slots: &mut BTreeMap<Level, Slot>,
+    reg: &mut Registry,
+    caps: &OrderCaps,
+    acct: AccountKey,
+    (market, side): (InstrumentId, Side),
+    grows: Lots,
+    cancelling: &mut Vec<ClientOrderId>,
+    plan: &mut Plan,
+) -> bool {
+    if grows == Lots::ZERO {
+        return false;
+    }
+    let mut waits = false;
+    for (&at, slot) in slots.iter_mut() {
+        // What is left for the emulated order once the reducer rests `grows` more.
+        let left = |rec: &OrderRecord| {
+            reduce_room(reg, market, side, Some(rec.cid()))
+                .checked_sub(grows)
+                .unwrap_or(Lots::ZERO)
+        };
+        let Some(rec) = reg
+            .get(slot.cid)
+            .filter(|rec| slot.mode.emulated && at.side() == side && !rec.state().is_terminal())
+            .filter(|rec| rec.resting() > left(rec))
+        else {
+            continue;
+        };
+        waits = true;
+        let in_flight =
+            matches!(rec.intent(), Intent::PendingCancel { .. }) || rec.cancel_awaits_ack();
+        if in_flight || cancelling.contains(&slot.cid) {
+            continue;
+        }
+        slot.replacing = true;
+        slot.cancels_sent = rec.cancels_sent();
+        cancelling.push(slot.cid);
+        cancel_now(reg, caps, acct, at, slot.cid, plan);
+    }
+    waits
 }
 
 /// Builds into `plan` the cancel of each emulated reduce-only order in `slots` that rests more

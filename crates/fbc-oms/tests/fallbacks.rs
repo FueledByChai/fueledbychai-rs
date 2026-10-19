@@ -914,7 +914,10 @@ fn a_reducer_amend_that_would_leave_an_emulated_order_overshooting_waits_for_its
     assert_eq!(waiting(&pass), vec![(Side::Sell, 0)]);
     cancelled(&mut reg, emulated, Side::Sell, "v1", 2);
     let after = plan_and_send(&mut p, &grown, &mut reg, &caps, &mut mint, LATER2);
-    assert_eq!(shape(&after), vec![(Stage::Reducing, "amend", Side::Sell, 0)]);
+    assert_eq!(
+        shape(&after),
+        vec![(Stage::Reducing, "amend", Side::Sell, 0)]
+    );
     assert_eq!(after.commands[0].cid, native);
     assert_eq!(
         after
