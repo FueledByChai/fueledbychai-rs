@@ -77,7 +77,7 @@ pub struct Registry {
     audit: Audit,
     /// The orphans resyncs registered, the markets whose adding side they suppress, and our
     /// client ids live events showed while the registry did not hold them (0005's I7,
-    /// decision 0101; [`Registry::cancel_orphans`]).
+    /// decision 0106; [`Registry::cancel_orphans`]).
     pub(crate) orphans: Orphans,
 }
 
@@ -189,7 +189,7 @@ pub enum OmsError {
     /// A fill moved the market's inventory before its position was seeded.
     PositionMoved(InstrumentId),
     /// The market's adding side is suppressed for an orphan cooldown (0005's I7, decision
-    /// 0101) and the place or batch item is on `side`, which does not reduce the known,
+    /// 0106) and the place or batch item is on `side`, which does not reduce the known,
     /// non-zero position within its size: it was never built.
     OrphanCooldown { inst: InstrumentId, side: Side },
 }
@@ -529,7 +529,7 @@ impl Registry {
 
     /// The guard of a place, a batch or an amend built now on `market`: its state generation,
     /// checked again at submit (decision 0060), and, in Exit or while an orphan cooldown
-    /// suppresses its adding side, its position revision (0066, 0101).
+    /// suppresses its adding side, its position revision (0066, 0106).
     fn state_guard(&mut self, market: InstrumentId) -> Guard {
         let position = self.sized_position_watch(market);
         Guard::state(self.entries.watch(market), position)
@@ -537,7 +537,7 @@ impl Registry {
 
     /// `market`'s position revision now, watched for a command about to be built under it,
     /// while its admission is judged against the position: in Exit (decision 0066) and while
-    /// an orphan cooldown suppresses the adding side (decision 0101; Reviewer B's RB840-2 on
+    /// an orphan cooldown suppresses the adding side (decision 0106; Reviewer B's RB840-2 on
     /// PR #171). Such a command is refused at submit once a fill or a resync moved the
     /// inventory since. `None` otherwise, when the position does not size the build.
     fn sized_position_watch(&mut self, market: InstrumentId) -> Option<Watch> {
@@ -555,7 +555,7 @@ impl Registry {
     }
 
     /// The one pre-trade path of a place and a batch item: the market's state first (decision
-    /// 0012), then an orphan cooldown's suppression of the adding side (decision 0101), then,
+    /// 0012), then an orphan cooldown's suppression of the adding side (decision 0106), then,
     /// in Exit, Exit's admission, then both caps (0013 rule 2).
     fn admit_placement(&self, order: &NewOrder) -> Result<(), OmsError> {
         let admits = self.entries.admits(order.inst).map_err(OmsError::State)?;
@@ -805,7 +805,7 @@ impl Registry {
         accepted.commit();
         self.set_inventory(fill.inst, inventory);
         if cid.is_none() && matches!(placement, Placement::InSnapshot { .. }) {
-            // Counted on the inventory if a later snapshot shows its order open (0101).
+            // Counted on the inventory if a later snapshot shows its order open (0106).
             self.untracked_in_snapshot(fill.inst, &placed, signed);
         }
         self.fill_counted(fill.inst, fill.key(), placed, signed, placement);
@@ -969,7 +969,7 @@ impl Registry {
     /// with what the command's orders may add and have resting as their records count them
     /// now, must stay within both caps ([`IssueRefusal::Capped`]), and, while an orphan
     /// cooldown suppresses the market's adding side, reduce the known, non-zero position
-    /// within its size as at build ([`IssueRefusal::OrphanCooldown`]; decision 0101, Reviewer
+    /// within its size as at build ([`IssueRefusal::OrphanCooldown`]; decision 0106, Reviewer
     /// B's RB840-2 on PR #171). Cancels and cancel-alls pass, as they pass at build.
     pub(crate) fn rejudge(&self, cmd: &PermittedCommand) -> Result<(), IssueRefusal> {
         let cids = match (cmd.command(), cmd.built()) {

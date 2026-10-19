@@ -1,4 +1,4 @@
-//! Orphans (0005's I7; decision 0101): open orders under our namespace that the registry does
+//! Orphans (0005's I7; decision 0106): open orders under our namespace that the registry does
 //! not hold, found by a resync on a market a resync (or a hand seed) already seeded: the
 //! library side of the fix for the Hibachi orphan blowout.
 //!
