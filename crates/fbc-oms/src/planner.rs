@@ -831,18 +831,12 @@ impl ExecutionPlanner {
                     // amend over a cancel not yet settled would let both fill. One that
                     // shrinks lowers what may fill and never waits (Codex r4310495940).
                     if emulated.is_none() {
-                        let grows = reg.get(cid).and_then(|rec| {
-                            if !(reducing || rec.reduces()) {
-                                return None;
-                            }
+                        // An order amended as reducing was counted a reducer when its quote
+                        // was read above, so the other orders' room already counts what it
+                        // rests: only its growth past that is new.
+                        let grows = reg.get(cid).filter(|rec| rec.reduces()).and_then(|rec| {
                             let rests = total.checked_sub(rec.filled()).unwrap_or(Lots::ZERO);
-                            // What the other orders' room already counts of it.
-                            let before = if rec.reduces() {
-                                rec.resting()
-                            } else {
-                                Lots::ZERO
-                            };
-                            rests.checked_sub(before)
+                            rests.checked_sub(rec.resting())
                         });
                         let overshot = grows.map_or_else(Vec::new, |grows| {
                             overshot_by(slots, reg, (market, side), grows)
