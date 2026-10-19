@@ -55,7 +55,19 @@
 //! are built in that order, so each is judged with the earlier ones counted. A place or amend
 //! the market's state or a cap refuses is never built and is reported ([`Refused`]); the
 //! planner never falls back from a refused amend to a cancel, and nothing it emits bypasses a
-//! check. Batching, venue modes and the rate-scope safety floor are not here (FBC-hht).
+//! check.
+//!
+//! Each pass takes the venue's facts as the consumer states them ([`PlanVenue`]; decision
+//! 0111): no place or amend is built for a market whose trading status, account mode or market
+//! mode refuses it ([`PlanRefusal::Status`], [`PlanRefusal::VenueMode`]), while cancels are
+//! built in every mode; a normal command (a place that does not reduce, an amend neither
+//! reducing nor reduce-only) is withheld once charging it would leave a rate scope of the
+//! consumer's [`RateView`](crate::RateView) below its floor ([`PlanRefusal::RateFloor`]),
+//! while cancels and reducing orders are never withheld, every command built charged against
+//! the view as it is built; and under [`Batching::Declared`] consecutive places of one stage
+//! go in batches of at most the venue's `batch_place` size, never a reducing order with an
+//! add, and the pass's cancels that the venue's cancel-many can name in cancel-manys of at most
+//! its `batch_cancel` size ([`Planned::more_items`]).
 //!
 //! Each wanted quote is first fitted to the venue's [`OrderCaps`], from the caps alone, never
 //! the venue's name (design §4.10 steps 3 and 4; 0106): RPI on a venue without it goes on the
@@ -86,12 +98,13 @@ use std::fmt;
 use std::time::Duration;
 
 use fbc_core::{
-    AccountKey, Bps, Channel, CidMint, ClientOrderId, Feature, IdError, InstrumentId, Lots, MonoNs,
-    NewOrder, OrderCaps, OrderKind, RefKind, Side, Ticks, Tif, TradingStatus, VenueMode,
+    AccountKey, Bps, CancelBatch, CancelOrder, Channel, CidMint, ClientOrderId, Feature, IdError,
+    InstrumentId, Lots, MonoNs, NewOrder, OpKind, OrderCaps, OrderKind, RefKind, Side, Ticks, Tif,
+    TradingStatus, VenueCommand, VenueMode,
 };
 
 use crate::entry::EntryState;
-use crate::gates::PlanVenue;
+use crate::gates::{Batching, PlanVenue, RateView, venue_refusal};
 use crate::grant::Authorization;
 use crate::permit::{self, AmendRefusal, CancelChoice, PermitRefusal, PermittedCommand};
 use crate::record::{Intent, OrdState, OrderRecord, TerminalKind};
@@ -452,7 +465,8 @@ pub struct Planned {
     /// applied them: a place's and an amend's; empty for a cancel and for a quote sent as asked.
     pub downgrades: Vec<Downgrade>,
     /// A batch's orders after its first, in the batch's order; empty for a command of one
-    /// order.
+    /// order. Each is reported as a single command's order is: a cancel-many item's send with
+    /// [`Registry::cancel_sent`], a batch item's outcome with [`Registry::on_outcome`].
     pub more_items: Vec<BatchItem>,
     /// The authorization to submit it under.
     pub auth: Authorization,
@@ -606,6 +620,215 @@ pub struct Plan {
     pub refused: Vec<Refused>,
 }
 
+/// What a pass emits, in order (decision 0111): each command charged against the pass's rate
+/// view as it is built, then authorized; under [`Batching::Declared`], consecutive places of one
+/// stage held until their batch is full or the run ends, and the cancels of the pass's cancel
+/// stage that the venue's cancel-many can name held until theirs is.
+struct Out<'a> {
+    plan: Plan,
+    caps: &'a OrderCaps,
+    market: InstrumentId,
+    /// The pass's rate view, each scope's room less what the pass built so far.
+    rates: RateView,
+    /// The most places one batch carries, when the planner batches places (more than one).
+    place_batch: Option<usize>,
+    /// The venue's cancel-many, when the planner batches cancels (more than one an item).
+    cancel_batch: Option<CancelBatch>,
+    /// The places built and not yet emitted, of one stage and one guard.
+    places: Vec<(Stage, BatchItem, PermittedCommand)>,
+    /// The cancel-many items built and not yet emitted.
+    cancels: Vec<(BatchItem, CancelOrder)>,
+}
+
+impl<'a> Out<'a> {
+    /// What a pass under `venue` on `market` emits.
+    fn new(venue: &PlanVenue<'a>, market: InstrumentId) -> Out<'a> {
+        let declared = venue.batching == Batching::Declared;
+        let caps = venue.caps;
+        Out {
+            plan: Plan::default(),
+            caps,
+            market,
+            rates: venue.rates.clone(),
+            place_batch: caps
+                .batch_place
+                .map(|b| usize::from(b.max_items))
+                .filter(|&n| declared && n > 1),
+            cancel_batch: caps
+                .batch_cancel
+                .filter(|b| declared && b.max_items > 1 && !b.refs.is_empty()),
+            places: Vec::new(),
+            cancels: Vec::new(),
+        }
+    }
+
+    /// What a pass emitting only single commands on `market` under `caps` emits, no rate scope
+    /// tracked: [`ExecutionPlanner::on_fill`]'s cancels.
+    fn single(caps: &'a OrderCaps, market: InstrumentId) -> Out<'a> {
+        Out {
+            plan: Plan::default(),
+            caps,
+            market,
+            rates: RateView::new(Vec::new()),
+            place_batch: None,
+            cancel_batch: None,
+            places: Vec::new(),
+            cancels: Vec::new(),
+        }
+    }
+
+    /// Emits `cmd` alone, after everything held.
+    fn emit(
+        &mut self,
+        reg: &mut Registry,
+        acct: AccountKey,
+        stage: Stage,
+        item: BatchItem,
+        cmd: PermittedCommand,
+    ) {
+        self.flush(reg, acct);
+        self.rates.charge(cmd.command(), self.market);
+        self.push(reg, acct, stage, item, Vec::new(), cmd);
+    }
+
+    /// Emits the single cancel `cmd` of the pass's cancel stage, after the places held; the
+    /// cancel-many items held stay held, as the order among cancels changes nothing.
+    fn single_cancel(
+        &mut self,
+        reg: &mut Registry,
+        acct: AccountKey,
+        item: BatchItem,
+        cmd: PermittedCommand,
+    ) {
+        self.flush_places(reg, acct);
+        self.rates.charge(cmd.command(), self.market);
+        self.push(reg, acct, Stage::Cancel, item, Vec::new(), cmd);
+    }
+
+    /// Emits the place `cmd` of `stage`, or holds it for a batch: a batch holds places of one
+    /// stage, so of one traffic class (a reducing order never shares one with an add), built
+    /// under one guard, at most the venue's batch size.
+    fn place(
+        &mut self,
+        reg: &mut Registry,
+        acct: AccountKey,
+        stage: Stage,
+        item: BatchItem,
+        cmd: PermittedCommand,
+    ) {
+        let Some(max) = self.place_batch else {
+            return self.emit(reg, acct, stage, item, cmd);
+        };
+        self.flush_cancels(reg, acct);
+        let joins = self.places.last().is_none_or(|(held, _, last)| {
+            *held == stage && self.places.len() < max && last.guard() == cmd.guard()
+        });
+        if !joins {
+            self.flush_places(reg, acct);
+        }
+        self.rates.charge(cmd.command(), self.market);
+        self.places.push((stage, item, cmd));
+    }
+
+    /// Holds `cancel`, a cancel-many item of the pass's cancel stage, emitting the cancel-many
+    /// once it is full.
+    fn cancel_item(
+        &mut self,
+        reg: &mut Registry,
+        acct: AccountKey,
+        item: BatchItem,
+        cancel: CancelOrder,
+    ) {
+        self.flush_places(reg, acct);
+        self.rates.charge_units(OpKind::Cancel, self.market, 1);
+        self.cancels.push((item, cancel));
+        let full = self
+            .cancel_batch
+            .is_some_and(|b| self.cancels.len() >= usize::from(b.max_items));
+        if full {
+            self.flush_cancels(reg, acct);
+        }
+    }
+
+    /// Emits everything held.
+    fn flush(&mut self, reg: &mut Registry, acct: AccountKey) {
+        self.flush_places(reg, acct);
+        self.flush_cancels(reg, acct);
+    }
+
+    /// Emits the places held: one alone as a place, more as one batch.
+    fn flush_places(&mut self, reg: &mut Registry, acct: AccountKey) {
+        let mut held = std::mem::take(&mut self.places).into_iter();
+        let Some((stage, first, cmd)) = held.next() else {
+            return;
+        };
+        let (more, cmds): (Vec<BatchItem>, Vec<PermittedCommand>) =
+            held.map(|(_, item, cmd)| (item, cmd)).unzip();
+        if more.is_empty() {
+            return self.push(reg, acct, stage, first, more, cmd);
+        }
+        let batch = reg.merge_places(std::iter::once(cmd).chain(cmds).collect());
+        self.push(reg, acct, stage, first, more, batch);
+    }
+
+    /// Emits the cancel-many items held: one alone as a single cancel where the venue's single
+    /// cancel can name it, more as one cancel-many.
+    fn flush_cancels(&mut self, reg: &mut Registry, acct: AccountKey) {
+        let mut held = std::mem::take(&mut self.cancels).into_iter();
+        let Some((first, cancel)) = held.next() else {
+            return;
+        };
+        let (more, mut cancels): (Vec<BatchItem>, Vec<CancelOrder>) = held.unzip();
+        let single = more
+            .is_empty()
+            .then(|| reg.get(first.cid))
+            .flatten()
+            .and_then(|rec| permit::cancel_of(rec, self.caps, self.caps.cancel_refs));
+        let cmd = match single {
+            Some(single) => VenueCommand::Cancel(single),
+            None => {
+                cancels.insert(0, cancel);
+                VenueCommand::CancelMany(cancels)
+            }
+        };
+        let cmd = PermittedCommand::cancel(cmd, reg.instance());
+        self.push(reg, acct, Stage::Cancel, first, more, cmd);
+    }
+
+    /// Authorizes `cmd` and adds it to the plan.
+    fn push(
+        &mut self,
+        reg: &mut Registry,
+        acct: AccountKey,
+        stage: Stage,
+        first: BatchItem,
+        more_items: Vec<BatchItem>,
+        cmd: PermittedCommand,
+    ) {
+        let BatchItem {
+            side,
+            level,
+            crossing,
+            cid,
+            tag,
+            removal,
+            downgrades,
+        } = first;
+        self.plan.commands.push(Planned {
+            stage,
+            side,
+            level,
+            crossing,
+            cid,
+            tag,
+            removal,
+            downgrades,
+            more_items,
+            auth: authorize(reg, acct, cmd),
+        });
+    }
+}
+
 /// The order the planner holds at a level.
 #[derive(Copy, Clone, Debug)]
 struct Slot {
@@ -743,7 +966,9 @@ impl ExecutionPlanner {
     /// One pass over `desired`'s market at `now`: decides each level, then builds, in 0005's
     /// order, each command through `reg` (places with client ids from `mint`, amends from
     /// [`Live`](crate::Live) permits, cancels from [`Cancellable`](crate::Cancellable) ones,
-    /// all under the venue's `caps`) and authorizes it for `acct`.
+    /// all under the venue's caps, `venue.caps`) and authorizes it for `acct`, gated by
+    /// `venue`'s trading status, venue modes and rate view and batched as `venue.batching`
+    /// says (decision 0111).
     ///
     /// `reg` is `acct`'s registry: the planner holds each account's orders apart, so a pass for
     /// one account never frees another's levels, and binds `acct` to `reg` at its first pass.
@@ -766,7 +991,7 @@ impl ExecutionPlanner {
         let market = desired.market;
         let config = self.config;
         let slots = self.slots.entry((acct, market)).or_default();
-        let mut plan = Plan::default();
+        let mut out = Out::new(venue, market);
         // An order seen terminal frees its level.
         free_terminal(slots, reg, &mut self.fired, (acct, market));
 
@@ -815,7 +1040,7 @@ impl ExecutionPlanner {
                 let last = self.fired.get(&(acct, market, at)).copied();
                 let fitted = match (fitted, last) {
                     (Some(f), Some(last)) if f.attempt.is_some_and(|a| a < last.attempt) => {
-                        plan.refused.push(Refused {
+                        out.plan.refused.push(Refused {
                             side: at.side(),
                             level: at.level,
                             crossing: at.crossing,
@@ -888,7 +1113,7 @@ impl ExecutionPlanner {
                 }
                 if matches!(rec.intent(), Intent::PendingCancel { .. }) {
                     if slot.replacing {
-                        plan.held.push(hold(HeldReason::Replacing));
+                        out.plan.held.push(hold(HeldReason::Replacing));
                     }
                 } else {
                     slot.cancels_sent = rec.cancels_sent();
@@ -937,13 +1162,13 @@ impl ExecutionPlanner {
                 continue;
             }
             if let Some(why) = unsettled(rec) {
-                plan.held.push(hold(why));
+                out.plan.held.push(hold(why));
                 continue;
             }
             // A live crossing order ends by itself (an IOC) or by its cancel (a synthetic
             // one, above): never amended or replaced (0110).
             if at.crossing {
-                plan.held.push(hold(HeldReason::Crossing));
+                out.plan.held.push(hold(HeldReason::Crossing));
                 continue;
             }
             if !config.differs(rec, q) {
@@ -951,7 +1176,7 @@ impl ExecutionPlanner {
             }
             let age = u128::from(now.0.saturating_sub(slot.changed_at.0));
             if age < config.min_age.as_nanos() {
-                plan.held.push(hold(HeldReason::Young));
+                out.plan.held.push(hold(HeldReason::Young));
                 continue;
             }
             let total = rec.filled().checked_add(q.qty).filter(|&total| {
@@ -1011,26 +1236,53 @@ impl ExecutionPlanner {
                 why,
             };
             // Each built command's order keeps the consumer's tag and removal reason the
-            // command carries (0098). A synthetic IOC's place is followed by its cancel.
+            // command carries (0098). A synthetic IOC's place is followed by its cancel; any
+            // other place may join a batch (decision 0111).
             let mut synth_ioc = false;
+            let mut batchable = false;
             let built = match action {
                 Action::Cancel { cid, removal } => {
                     cancelling.push(cid);
-                    match reg.cancellable(cid) {
-                        Ok(permit) => match permit.cancel(caps) {
-                            CancelChoice::Send(cmd) => {
-                                let tag = reg.with_record(cid, |rec| {
-                                    rec.set_removal(removal);
-                                    rec.tag()
-                                });
-                                Ok((cid, cmd, tag, removal, Vec::new()))
-                            }
-                            CancelChoice::AwaitAck => {
-                                plan.awaiting_ack.push(cid);
-                                continue;
-                            }
-                        },
-                        Err(why) => Err(PlanRefusal::Permit(why)),
+                    let mut permit = match reg.cancellable(cid) {
+                        Ok(permit) => permit,
+                        Err(why) => {
+                            out.plan.refused.push(refuse(PlanRefusal::Permit(why)));
+                            continue;
+                        }
+                    };
+                    // An item the venue's cancel-many can name joins one; any other goes as a
+                    // single cancel (decision 0111).
+                    if let Some(batch) = out.cancel_batch
+                        && let Some(cancel) = permit.batch_item(caps, batch.refs)
+                    {
+                        let tag = reg.with_record(cid, |rec| {
+                            rec.set_removal(removal);
+                            rec.tag()
+                        });
+                        let item = BatchItem {
+                            side,
+                            level: at.level,
+                            crossing: at.crossing,
+                            cid,
+                            tag,
+                            removal,
+                            downgrades: Vec::new(),
+                        };
+                        out.cancel_item(reg, acct, item, cancel);
+                        continue;
+                    }
+                    match permit.cancel(caps) {
+                        CancelChoice::Send(cmd) => {
+                            let tag = reg.with_record(cid, |rec| {
+                                rec.set_removal(removal);
+                                rec.tag()
+                            });
+                            Ok((cid, cmd, tag, removal, Vec::new()))
+                        }
+                        CancelChoice::AwaitAck => {
+                            out.plan.awaiting_ack.push(cid);
+                            continue;
+                        }
                     }
                 }
                 Action::Amend {
@@ -1057,6 +1309,18 @@ impl ExecutionPlanner {
                     let Some(total) = clipped.filter(|_| !cancelling.contains(&cid)) else {
                         continue;
                     };
+                    // Nothing the market's trading status or a venue mode refuses is built: an
+                    // amend keeps the order's flags as placed (decision 0111).
+                    let Some(flags) = reg
+                        .get(cid)
+                        .map(|rec| (rec.placed().post_only, rec.placed().reduce_only))
+                    else {
+                        continue;
+                    };
+                    if let Some(why) = venue_refusal(venue, flags.0, flags.1) {
+                        out.plan.refused.push(refuse(why));
+                        continue;
+                    }
                     // A reducer amended without shrinking, a price-only amend included,
                     // waits for the cancel of each emulated order it would leave
                     // overshooting: one the amend makes a reducer, or one counted as a
@@ -1086,15 +1350,25 @@ impl ExecutionPlanner {
                                 &ending,
                             ) {
                                 Ok(()) => {
-                                    let cancels = (&mut cancelling, &mut plan);
+                                    let cancels = (&mut cancelling, &mut out);
                                     cancel_overshot(slots, reg, caps, acct, &overshot, cancels);
                                     PlanRefusal::AwaitsEmulatedCancel
                                 }
                                 Err(why) => why,
                             };
-                            plan.refused.push(refuse(why));
+                            out.plan.refused.push(refuse(why));
                             continue;
                         }
+                    }
+                    // A normal amend stops at a rate scope's safety floor; a reducing one, safety
+                    // traffic as the venue command classes it, goes out (decision 0111).
+                    if !(reducing || flags.1)
+                        && let Some(scope) = out.rates.floor_hit(OpKind::Amend, market, 1)
+                    {
+                        out.plan
+                            .refused
+                            .push(refuse(PlanRefusal::RateFloor { scope }));
+                        continue;
                     }
                     reg.live(cid)
                         .map_err(PlanRefusal::Permit)
@@ -1116,24 +1390,31 @@ impl ExecutionPlanner {
                     downgrades,
                     attempt,
                 }) => {
+                    // Nothing the market's trading status or a venue mode refuses is built
+                    // (decision 0111).
+                    if let Some(why) = venue_refusal(venue, quote.post_only, quote.reduce_only) {
+                        out.plan.refused.push(refuse(why));
+                        continue;
+                    }
                     // A synthetic IOC needs a good-till-cancelled limit and a cancel that can
                     // name the order once acknowledged; without either its limit could rest
                     // and fill later (Codex r4317142581).
                     if mode.synth_ioc && !synthesizes_ioc(caps) {
-                        plan.refused.push(refuse(PlanRefusal::NoSyntheticIoc));
+                        out.plan.refused.push(refuse(PlanRefusal::NoSyntheticIoc));
                         continue;
                     }
                     // A crossing intent is sent only with the venue's reduce-only flag, and is
                     // sized to what is left to reduce, the commands before it counted (0110).
                     if attempt.is_some() {
                         if !caps.reduce_only {
-                            plan.refused
+                            out.plan
+                                .refused
                                 .push(refuse(PlanRefusal::ReduceOnlyUnsupported));
                             continue;
                         }
                         quote.qty = quote.qty.min(crossing_room(slots, reg, market, side));
                         if quote.qty == Lots::ZERO {
-                            plan.refused.push(refuse(PlanRefusal::NoRoomToReduce));
+                            out.plan.refused.push(refuse(PlanRefusal::NoRoomToReduce));
                             continue;
                         }
                     }
@@ -1152,13 +1433,13 @@ impl ExecutionPlanner {
                             .admits_place_once_ended(market, side, quote.qty, true, &ending)
                         {
                             Ok(()) => {
-                                let cancels = (&mut cancelling, &mut plan);
+                                let cancels = (&mut cancelling, &mut out);
                                 cancel_overshot(slots, reg, caps, acct, &overshot, cancels);
                                 PlanRefusal::AwaitsEmulatedCancel
                             }
                             Err(why) => PlanRefusal::Place(why),
                         };
-                        plan.refused.push(refuse(why));
+                        out.plan.refused.push(refuse(why));
                         continue;
                     }
                     // An emulated order is sized to what is left to reduce, the commands
@@ -1166,11 +1447,22 @@ impl ExecutionPlanner {
                     if mode.emulated {
                         quote.qty = quote.qty.min(reduce_room(reg, market, side, None));
                         if quote.qty == Lots::ZERO {
-                            plan.refused.push(refuse(PlanRefusal::NoRoomToReduce));
+                            out.plan.refused.push(refuse(PlanRefusal::NoRoomToReduce));
                             continue;
                         }
                     }
+                    // A normal place stops at a rate scope's safety floor; a reducing one,
+                    // safety traffic as the venue command classes it, goes out (decision 0111).
+                    if !quote.reduces()
+                        && let Some(scope) = out.rates.floor_hit(OpKind::Place, market, 1)
+                    {
+                        out.plan
+                            .refused
+                            .push(refuse(PlanRefusal::RateFloor { scope }));
+                        continue;
+                    }
                     synth_ioc = mode.synth_ioc;
+                    batchable = !synth_ioc;
                     mint.mint()
                         .map_err(PlanRefusal::Mint)
                         .and_then(|cid| {
@@ -1203,8 +1495,7 @@ impl ExecutionPlanner {
             };
             match built {
                 Ok((cid, cmd, tag, removal, downgrades)) => {
-                    plan.commands.push(Planned {
-                        stage,
+                    let item = BatchItem {
                         side,
                         level: at.level,
                         crossing: at.crossing,
@@ -1212,21 +1503,27 @@ impl ExecutionPlanner {
                         tag,
                         removal,
                         downgrades,
-                        more_items: Vec::new(),
-                        auth: authorize(reg, acct, cmd),
-                    });
+                    };
+                    if batchable {
+                        out.place(reg, acct, stage, item, cmd);
+                    } else if stage == Stage::Cancel {
+                        out.single_cancel(reg, acct, item, cmd);
+                    } else {
+                        out.emit(reg, acct, stage, item, cmd);
+                    }
                     if synth_ioc {
                         cancelling.push(cid);
-                        cancel_now(reg, caps, acct, at, cid, &mut plan);
+                        cancel_now(reg, caps, acct, at, cid, &mut out);
                     }
                 }
-                Err(why) => plan.refused.push(refuse(why)),
+                Err(why) => out.plan.refused.push(refuse(why)),
             }
         }
+        out.flush(reg, acct);
         // Built last, the cancels of any emulated order the pass's builds still left resting
         // more than is left to reduce; none should be, as a reducer that would waits above.
-        overshoot_cancels(slots, reg, caps, acct, market, &cancelling, &mut plan);
-        Ok(plan)
+        overshoot_cancels(slots, reg, caps, acct, market, &cancelling, &mut out);
+        Ok(out.plan)
     }
 
     /// The check to run after every fill on `market` for `acct`, and after every order update
@@ -1253,12 +1550,12 @@ impl ExecutionPlanner {
     ) -> Result<Plan, PlanError> {
         reg.reap_dropped();
         self.bind(acct, reg)?;
-        let mut plan = Plan::default();
+        let mut out = Out::single(caps, market);
         if let Some(slots) = self.slots.get_mut(&(acct, market)) {
             free_terminal(slots, reg, &mut self.fired, (acct, market));
-            overshoot_cancels(slots, reg, caps, acct, market, &[], &mut plan);
+            overshoot_cancels(slots, reg, caps, acct, market, &[], &mut out);
         }
-        Ok(plan)
+        Ok(out.plan)
     }
 
     /// Binds `acct` to the registry `reg` at its first pass; refuses another registry for
@@ -1450,7 +1747,7 @@ fn cancel_now(
     acct: AccountKey,
     at: Level,
     cid: ClientOrderId,
-    plan: &mut Plan,
+    out: &mut Out<'_>,
 ) {
     let (side, level) = (at.side(), at.level);
     match reg.cancellable(cid) {
@@ -1460,8 +1757,7 @@ fn cancel_now(
                     rec.set_removal(None);
                     rec.tag()
                 });
-                plan.commands.push(Planned {
-                    stage: Stage::Cancel,
+                let item = BatchItem {
                     side,
                     level,
                     crossing: at.crossing,
@@ -1469,13 +1765,12 @@ fn cancel_now(
                     tag,
                     removal: None,
                     downgrades: Vec::new(),
-                    more_items: Vec::new(),
-                    auth: authorize(reg, acct, cmd),
-                });
+                };
+                out.emit(reg, acct, Stage::Cancel, item, cmd);
             }
-            CancelChoice::AwaitAck => plan.awaiting_ack.push(cid),
+            CancelChoice::AwaitAck => out.plan.awaiting_ack.push(cid),
         },
-        Err(why) => plan.refused.push(Refused {
+        Err(why) => out.plan.refused.push(Refused {
             side,
             level,
             crossing: at.crossing,
@@ -1521,7 +1816,7 @@ fn cancel_overshot(
     caps: &OrderCaps,
     acct: AccountKey,
     overshot: &[(Level, ClientOrderId)],
-    (cancelling, plan): (&mut Vec<ClientOrderId>, &mut Plan),
+    (cancelling, out): (&mut Vec<ClientOrderId>, &mut Out<'_>),
 ) {
     for &(at, cid) in overshot {
         let in_flight = reg.get(cid).is_some_and(|rec| {
@@ -1535,7 +1830,7 @@ fn cancel_overshot(
             slot.cancels_sent = reg.get(cid).map_or(0, OrderRecord::cancels_sent);
         }
         cancelling.push(cid);
-        cancel_now(reg, caps, acct, at, cid, plan);
+        cancel_now(reg, caps, acct, at, cid, out);
     }
 }
 
@@ -1549,7 +1844,7 @@ fn overshoot_cancels(
     acct: AccountKey,
     market: InstrumentId,
     skip: &[ClientOrderId],
-    plan: &mut Plan,
+    out: &mut Out<'_>,
 ) {
     for (&at, slot) in slots.iter_mut() {
         if !slot.mode.emulated || skip.contains(&slot.cid) {
@@ -1568,7 +1863,7 @@ fn overshoot_cancels(
         }
         slot.replacing = true;
         slot.cancels_sent = rec.cancels_sent();
-        cancel_now(reg, caps, acct, at, slot.cid, plan);
+        cancel_now(reg, caps, acct, at, slot.cid, out);
     }
 }
 

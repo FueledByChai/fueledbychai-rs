@@ -533,6 +533,32 @@ impl Registry {
         Ok(plan)
     }
 
+    /// One batch of the places `places`, each a single place this registry built and still
+    /// holding its order, under one guard, in the order given (decision 0111): the batch holds
+    /// their orders, as each place did, and is judged again at its authorization with every
+    /// item counted, as [`Registry::place_batch`]'s is. The execution planner builds each place
+    /// with the earlier ones counted, then batches them.
+    pub(crate) fn merge_places(&self, places: Vec<PermittedCommand>) -> PermittedCommand {
+        let mut orders = Vec::with_capacity(places.len());
+        let mut guard = None;
+        for place in places {
+            debug_assert_eq!(place.origin(), self.instance);
+            let (cmd, built_under) = place.into_parts();
+            match cmd {
+                VenueCommand::Place(order) => orders.push(order),
+                other => unreachable!("only places are batched, not {other:?}"),
+            }
+            debug_assert!(guard.as_ref().is_none_or(|g| *g == built_under));
+            guard.get_or_insert(built_under);
+        }
+        PermittedCommand::holding(
+            VenueCommand::PlaceBatch(orders),
+            guard.unwrap_or_default(),
+            self.instance,
+            &self.dropped,
+        )
+    }
+
     /// The guard of a place, a batch or an amend built now on `market`: its state generation,
     /// checked again at submit (decision 0060), and, in Exit or while an orphan cooldown
     /// suppresses its adding side, its position revision (0066, 0108).
