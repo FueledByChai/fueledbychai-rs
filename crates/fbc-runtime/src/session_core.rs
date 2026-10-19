@@ -45,6 +45,9 @@ use crate::ratelimit::{RateLimiter, Request};
 use crate::session::SessionError;
 use crate::ws::{Message, WebSocket};
 
+/// A WebSocket error.
+pub(crate) type WsError = tokio_tungstenite::tungstenite::Error;
+
 /// The tick-to-wire of one Safety-class write (design §5.3, decision 0031): from the kernel
 /// receive time of the frame it is attributed to until the write completed, both on the
 /// realtime clock.
@@ -152,6 +155,12 @@ impl IngestClock {
         f()
     }
 
+    /// The instant `mono` names on the monotonic clock from the origin; `None` past the end of
+    /// the clock.
+    pub(crate) fn instant(&self, mono: MonoNs) -> Option<Instant> {
+        self.origin.checked_add(Duration::from_nanos(mono.0))
+    }
+
     /// Now, on the monotonic clock from the origin and on the wall clock.
     pub(crate) fn now(&self) -> (MonoNs, WallNs) {
         let mono = Instant::now().duration_since(self.origin).as_nanos();
@@ -168,6 +177,56 @@ impl IngestClock {
 /// What names the credentials in an input of an epoch: its codec's `redact_inbound`
 /// (decision 0028).
 pub(crate) type Redact<'a> = &'a dyn Fn(Inbound<'_>) -> InboundSpans;
+
+/// What an epoch writes and reads on: a [`WebSocket`], or an order-entry session's in-process
+/// stream (FBC-6mf, decision 0104).
+pub(crate) trait Wire {
+    /// Writes `message`; done once it has been taken.
+    async fn send(&mut self, message: Message) -> Result<(), WsError>;
+    /// The next message read; `None` once the connection has closed.
+    async fn next(&mut self) -> Option<Result<Message, WsError>>;
+    /// Closes the connection now, without waiting on a peer that stopped reading.
+    fn close_now(&mut self);
+    /// The kernel receive time of the last packet read beneath the last message, if any.
+    fn kernel_rx(&self) -> Option<KernelRxNs>;
+}
+
+impl Wire for WebSocket {
+    async fn send(&mut self, message: Message) -> Result<(), WsError> {
+        SinkExt::send(self, message).await
+    }
+
+    async fn next(&mut self) -> Option<Result<Message, WsError>> {
+        StreamExt::next(self).await
+    }
+
+    fn close_now(&mut self) {
+        let _ = self.close(None).now_or_never();
+    }
+
+    fn kernel_rx(&self) -> Option<KernelRxNs> {
+        self.get_ref().kernel_rx()
+    }
+}
+
+/// How a session opens its connection, as [`Core::connect`] asks it to: the WebSocket at a URL
+/// through the consumer's connector, or an order-entry session's in-process stream (decision
+/// 0104). `None` when the attempt failed.
+pub(crate) trait Dial {
+    type Wire: Wire;
+    async fn dial(&mut self, connector: &Connector) -> Option<Self::Wire>;
+}
+
+/// The WebSocket at a URL.
+pub(crate) struct WsDial<'a>(pub(crate) &'a str);
+
+impl Dial for WsDial<'_> {
+    type Wire = WebSocket;
+
+    async fn dial(&mut self, connector: &Connector) -> Option<WebSocket> {
+        connector.websocket(self.0).await.ok()
+    }
+}
 
 /// Where the core hands what a current epoch's codec and handler take while the core runs:
 /// the session's codec, inside the venue's decode scope, and its handler.
@@ -363,6 +422,15 @@ impl Core {
         url: &str,
         ctl: &mut impl Control,
     ) -> Result<Option<WebSocket>, SessionError> {
+        self.connect_with(&mut WsDial(url), ctl).await
+    }
+
+    /// [`Self::connect`], each attempt opening what `dial` opens.
+    pub(crate) async fn connect_with<D: Dial>(
+        &mut self,
+        dial: &mut D,
+        ctl: &mut impl Control,
+    ) -> Result<Option<D::Wire>, SessionError> {
         loop {
             let mut at = self.pacer.next_attempt(Instant::now());
             let mut waiting = true;
@@ -406,7 +474,7 @@ impl Core {
             let deadline = Instant::now().checked_add(self.pacer.deadline());
             let opened = {
                 let connector = self.connector.clone();
-                let connect = connector.websocket(url);
+                let connect = dial.dial(&connector);
                 tokio::pin!(connect);
                 loop {
                     let timer = self.next_deadline();
@@ -418,7 +486,7 @@ impl Core {
                             }
                             ctl.apply();
                         }
-                        opened = &mut connect => break opened.ok(),
+                        opened = &mut connect => break opened,
                         _ = sleep_or_never(deadline) => break None,
                         _ = sleep_or_never(timer) => {
                             let _ = self.take_timer()?;
@@ -447,7 +515,7 @@ impl Core {
     /// and attributed to no input; false when the epoch ended.
     pub(crate) async fn keep_alive(
         &mut self,
-        ws: &mut Option<WebSocket>,
+        ws: &mut Option<impl Wire>,
         inputs: &mut dyn EpochInputs,
         keepalive: &Keepalive,
     ) -> Result<bool, SessionError> {
@@ -541,7 +609,7 @@ impl Core {
     /// epoch's into `inputs`. The next due timer wakes the session again at once.
     pub(crate) async fn fire(
         &mut self,
-        ws: &mut Option<WebSocket>,
+        ws: &mut Option<impl Wire>,
         inputs: &mut dyn EpochInputs,
     ) -> Result<bool, SessionError> {
         let mut open = true;
@@ -558,7 +626,7 @@ impl Core {
     /// its effects executed; false when the epoch ended.
     pub(crate) async fn take_http(
         &mut self,
-        ws: &mut Option<WebSocket>,
+        ws: &mut Option<impl Wire>,
         inputs: &mut dyn EpochInputs,
         done: Answered,
     ) -> Result<bool, SessionError> {
@@ -585,7 +653,7 @@ impl Core {
     /// receive time.
     pub(crate) async fn execute(
         &mut self,
-        ws: &mut Option<WebSocket>,
+        ws: &mut Option<impl Wire>,
         inputs: &mut dyn EpochInputs,
         mut fx: Effects,
         charged: bool,
@@ -607,7 +675,7 @@ impl Core {
     /// ([`http_of`]), so none is charged again (PR #90 Reviewer B B7).
     pub(crate) async fn execute_all_charged(
         &mut self,
-        ws: &mut Option<WebSocket>,
+        ws: &mut Option<impl Wire>,
         inputs: &mut dyn EpochInputs,
         mut fx: Effects,
         origin: Option<Stamp>,
@@ -623,7 +691,7 @@ impl Core {
     /// (FBC-bnl).
     async fn run_effects(
         &mut self,
-        ws: &mut Option<WebSocket>,
+        ws: &mut Option<impl Wire>,
         inputs: &mut dyn EpochInputs,
         mut effects: VecDeque<(Effect, bool, Option<Stamp>)>,
     ) -> Result<bool, SessionError> {
@@ -716,7 +784,7 @@ impl Core {
     /// result or firing is taken while the write waits.
     async fn write(
         &mut self,
-        ws: &mut WebSocket,
+        ws: &mut impl Wire,
         inputs: &mut dyn EpochInputs,
         message: Message,
         effects: &mut VecDeque<(Effect, bool, Option<Stamp>)>,
@@ -1104,9 +1172,9 @@ fn start_http(
 /// Sends a close frame on connection `key` if the buckets admit it, charged as a control
 /// frame (Codex r4179720976), and the socket takes it now, without waiting on a peer that
 /// stopped reading; the socket closes when it is dropped either way.
-pub(crate) fn close(ws: &mut WebSocket, rates: &RateLimiter, key: ConnKey) {
+pub(crate) fn close(ws: &mut impl Wire, rates: &RateLimiter, key: ConnKey) {
     if rates.charge(Instant::now(), key, &[CONTROL]).is_ok() {
-        let _ = ws.close(None).now_or_never();
+        ws.close_now();
     }
 }
 
@@ -1127,7 +1195,7 @@ fn ws_control(message: &Message) -> Option<WsControl> {
 
 /// The next message on the socket; a poll endpoint has none, ever.
 pub(crate) async fn next_frame(
-    ws: &mut Option<WebSocket>,
+    ws: &mut Option<impl Wire>,
 ) -> Option<Result<Message, tokio_tungstenite::tungstenite::Error>> {
     match ws {
         Some(ws) => ws.next().await,
@@ -1323,7 +1391,7 @@ mod tests {
         let mut fx = Effects::new();
         fx.push(timer());
         let open = core
-            .execute(&mut None, &mut Nothing(false), fx, false, None)
+            .execute(&mut None::<WebSocket>, &mut Nothing(false), fx, false, None)
             .await;
         assert_eq!((open, core.next_deadline().is_some()), (Ok(true), true));
         // No market-data request awaits an answer: a frame of one is nothing to the inputs.
@@ -1334,19 +1402,19 @@ mod tests {
         Nothing(false).sent_rpc(call);
         // Nor is one asked as an HTTP request.
         Nothing(false).asked_rpc(call, 0);
-        let fired = core.fire(&mut None, &mut Nothing(false)).await;
+        let fired = core.fire(&mut None::<WebSocket>, &mut Nothing(false)).await;
         assert_eq!((fired, core.next_deadline()), (Ok(true), None));
         let mut fx = Effects::new();
         fx.push(timer());
         let open = core
-            .execute(&mut None, &mut Nothing(true), fx, false, None)
+            .execute(&mut None::<WebSocket>, &mut Nothing(true), fx, false, None)
             .await;
         assert_eq!((open, core.next_deadline()), (Ok(false), None));
         drop(tx);
         let mut fx = Effects::new();
         fx.push(timer());
         let open = core
-            .execute(&mut None, &mut Nothing(false), fx, false, None)
+            .execute(&mut None::<WebSocket>, &mut Nothing(false), fx, false, None)
             .await;
         assert_eq!((open, core.next_deadline()), (Ok(false), None));
     }

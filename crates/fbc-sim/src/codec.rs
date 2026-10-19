@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use fbc_core::{
     AckLevel, AmendOrder, AssetSym, CancelOnDisconnect, CancelOrder, CancelScope, Channel,
-    ChosenRef, CidMatch, CtxCall, DecodeError, DecodeScope, Effect, Effects, EncodeCtx,
+    ChosenRef, CidMatch, ConnState, CtxCall, DecodeError, DecodeScope, Effect, Effects, EncodeCtx,
     EncodeReceipt, ExchNs, ExchTsKind, ExecCaps, ExecCodec, ExecEvent, ExecSink, Feature, FillCaps,
     FillEvent, FillIdent, HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans, InstrumentId,
     ItemRef, Liquidity, Liquidity3, MatchingCaps, Money, NotSentReason, OpKind, OrderCaps,
@@ -68,6 +68,10 @@ use crate::wire::{
 /// by nothing. A fill carries the realized P&L and funding the engine reports only where the
 /// venue's [`FillCaps`] say its fills do; a venue whose fills are derived from order status
 /// gets none from the engine, only order updates carrying them.
+///
+/// Hosted by the runtime (decision 0104), it reports the `ready` frame its peer greets each
+/// opened stream with as the stream authenticated, naming no venue order: the simulated venue
+/// asks no login, and an order-entry session arms and resyncs only once its codec says so.
 ///
 /// A resync (decision 0049) is one frame asking the engine for its resting orders and
 /// positions, one at a time, whose one-frame answer it decodes into the `Resync*` events. A
@@ -668,7 +672,11 @@ impl ExecCodec for SimCodec {
         _fx: &mut Effects,
     ) -> Result<(), DecodeError> {
         let (stamp, reply) = Reply::decode(f.bytes()).map_err(malformed)?;
-        let meta = self.meta(stamp)?;
+        // A connection state, which no venue orders: its stamp is not read.
+        let meta = match reply {
+            Reply::Ready => VenueMeta::NONE,
+            _ => self.meta(stamp)?,
+        };
         let mut settled_by_event = false;
         let events = match reply {
             Reply::Accepted {
@@ -735,6 +743,11 @@ impl ExecCodec for SimCodec {
                 found,
             } => vec![self.query_answer(rpc, (vid, cid), found, scope)?],
             Reply::Order(o) => vec![self.update(o, scope)?],
+            // The hosted stream is open and takes commands (decision 0104).
+            Reply::Ready => vec![ExecEvent::Conn {
+                stream: self.stream,
+                state: ConnState::Authenticated,
+            }],
             Reply::Fill(fill) => vec![ExecEvent::Fill(FillEvent {
                 // Only what the stood-in venue reports (Codex r4182448147): without fill ids
                 // a fill is keyed by its order and cumulative quantity. With them it names both,

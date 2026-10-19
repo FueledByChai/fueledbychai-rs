@@ -53,20 +53,31 @@
 //!   are accepted provisionally, as Paradex's modify reply is, and settled by the amended
 //!   order's event (0102), so a SimVenue built from Paradex's declared caps places, amends,
 //!   cancels and fills (FBC-2zxk).
+//!   Each end of a market-data connection epoch invalidates the engine's books it fed until
+//!   their next snapshot, as the runtime's are ([`SimEngine::end_epoch`]; decision 0039).
+//!
+//! Hosted by the runtime (FBC-6mf, decision 0104), [`SimPeer`] is the venue end of an
+//! in-process order-entry stream ([`fbc_runtime::OrderEntryPeer`]) over one engine: an
+//! ordinary `ExecSession` built with `ExecSession::in_process` and a [`SimCodec`] writes to it
+//! in place of a real venue's socket, the shard's `PeerFeed` hands it the market data, and it
+//! gives the engine's answers at their due times, greeting each opened stream with a frame the
+//! codec reports as the stream authenticated, since the simulated venue asks no login. Three
+//! brackets are three sessions, each with its own peer, simulated account and fbc-oms.
 //!
 //! Every number SimVenue uses, its capabilities, latency, bracket and fee rates included, is in
-//! the consumer's [`SimConfig`]. Not here yet: hosting in the runtime (FBC-6mf) and replay
-//! (FBC-w9g).
+//! the consumer's [`SimConfig`]. Not here yet: replay (FBC-w9g).
 
 mod codec;
 mod config;
 mod engine;
+mod peer;
 mod queue;
 mod wire;
 
 pub use codec::SimCodec;
 pub use config::{SimConfig, SimLatency};
 pub use engine::{Answer, InjectedOrder, RiskRefusal, SimEngine, SimError};
+pub use peer::{PeerCounters, SimPeer};
 pub use queue::{
     Bracket, NewOrder, OrderKey, QueueConfig, QueueError, QueueModel, QueuePos, SimFill, TradeView,
 };
