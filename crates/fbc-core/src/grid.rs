@@ -384,6 +384,15 @@ mod tests {
         text.parse().unwrap()
     }
 
+    /// FBC-066n (coverage floor): a decimal with a fraction, or one past an `i64`, is no whole
+    /// number of ticks.
+    #[test]
+    fn only_a_whole_decimal_that_fits_is_an_i64() {
+        assert_eq!(to_i64(dec("42")), Some(42));
+        assert_eq!(to_i64(dec("1.5")), None);
+        assert_eq!(to_i64(dec("1e20")), None);
+    }
+
     fn px(text: &str) -> PxExact {
         text.parse().unwrap()
     }
