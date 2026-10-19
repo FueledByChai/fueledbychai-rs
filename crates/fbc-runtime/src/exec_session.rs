@@ -1138,7 +1138,23 @@ impl<H: ExecHandler> ExecSession<H> {
                 .on_submitted(not_sent(NotSentReason::StaleAuthorization));
             return Ok(true);
         }
-        match self.encode(cmd, budget_class(&item), over_http(&item), rpc, key)? {
+        let encoded = self.encode(cmd, budget_class(&item), over_http(&item), rpc, key);
+        let encoded = match encoded {
+            Ok(encoded) => encoded,
+            // The session ends with nothing of it encoded or reported (0057); the shard host
+            // takes back its own ladder command (decision 0100; Codex P1 r4309350872 on PR #164).
+            Err(e) => {
+                let queued = Queued {
+                    rpc,
+                    item,
+                    epoch,
+                    origin,
+                };
+                self.orders.unsent(queued);
+                return Err(e);
+            }
+        };
+        match encoded {
             Ok((receipt, fx)) => {
                 let receipt = Ok(receipt);
                 self.handler.on_submitted(SubmitHandle { rpc, receipt });

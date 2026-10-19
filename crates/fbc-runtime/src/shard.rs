@@ -12,7 +12,8 @@
 //!
 //! **A pass.** Once an input has been stamped since the last pass, the host drains: it yields
 //! to the runtime, which polls its I/O and time drivers before resuming the host, then polls
-//! every member once, until such a round stamps no input. It then journals
+//! every member once (again while such a round ends with the task's coop budget spent, since
+//! the members share one task poll's budget), until such a round stamps no input. It then journals
 //! [`Record::Cycle`](fbc_journal::Record::Cycle) under Normal, with the last ingest sequence the
 //! clock gave and the instruments the consumer marked through [`ShardHost::changed`] since the
 //! last pass, in the order first marked, and calls [`Decide::decide`] with those instruments
@@ -24,8 +25,9 @@
 //! order pushed. The host submits one once every order-entry member's session holds nothing,
 //! lets the members run until they again hold nothing (the command encoded, signed and written,
 //! or reported not sent), yields to the runtime and
-//! polls every member once (the between-command poll: frames the kernel has delivered are read
-//! and handed to the handlers), and only then submits the next. A command a handler submits
+//! polls every member once, again while the round ends with the coop budget spent (the
+//! between-command poll: frames the kernel has delivered are read and handed to the handlers),
+//! and only then submits the next. A command a handler submits
 //! through `ExecOrders` meanwhile is therefore taken before the ladder's next one, and every
 //! ladder command is re-checked at its encode (`Authorization::check_at_submit`, 0060, 0066): a
 //! kill switch a handler turns on between two commands leaves each remaining place, batch and
@@ -38,10 +40,13 @@
 //! **Ends.** A member that ends without an error is polled no more, and the run returns once
 //! every member has ended. A member's error ends the run at once and is returned, its other
 //! members' runs dropped (their connections close, which per-connection cancel-on-disconnect
-//! protects, 0058). A ladder command never submitted, because its session had ended or the run
-//! ended before its turn, or submitted and withdrawn because the run ended before its session
-//! took it, is handed back to the consumer ([`Decide::unsubmitted`]) and counted
-//! ([`ShardHost::unsubmitted`]); nothing of it reached a codec.
+//! protects, 0058) and their orders ended, so nothing submitted to them afterwards is taken;
+//! the run's return or drop ends them too. A ladder command never submitted, because its
+//! session had ended or the run ended before its turn, or submitted and withdrawn because the
+//! run or its session ended before the session encoded it (a session failing after taking it,
+//! as on a short nonce reservation, included), is handed back to the consumer
+//! ([`Decide::unsubmitted`]) and counted ([`ShardHost::unsubmitted`]); nothing of it reached a
+//! codec.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -185,6 +190,8 @@ impl Planned {
         };
         debug_assert!(submitted.is_ok(), "{submitted:?}");
         let rpc = submitted.ok()?;
+        // The session keeps it for the host to take back, should it end before encoding it.
+        self.orders.keep(rpc);
         Some(InFlight { rpc, control })
     }
 }
@@ -248,8 +255,10 @@ pub trait Decide {
     fn decide(&mut self, instruments: &[InstrumentId], ladder: &mut Ladder);
 
     /// A ladder command the host never submitted: its session had ended when its turn came, or
-    /// the run ended first (every member ended, or one failed). Nothing of it reached a session,
-    /// so no `on_submitted` reports it; an authorization comes back unspent. Nothing by default.
+    /// the run ended first (every member ended, or one failed); or one it submitted and took
+    /// back, its session or the run ending before the session encoded it. Nothing of it reached
+    /// a codec, so no `on_submitted` reports it; an authorization comes back unspent. Nothing by
+    /// default.
     fn unsubmitted(&mut self, command: Unsubmitted) {
         let _ = command;
     }
@@ -393,8 +402,7 @@ impl ShardHost {
                 }
             }
             // Between two commands: what the kernel has delivered is read and handed on.
-            tokio::task::yield_now().await;
-            if !running.once().await? {
+            if !running.round().await? {
                 return Ok(false);
             }
         }
@@ -433,17 +441,32 @@ struct Running<'a> {
 }
 
 impl Running<'_> {
-    /// Polls every member still running once: false once none is, or the first error.
+    /// Polls every member still running once: false once none is, or the first error, every
+    /// other member's run dropped then ([`Running::abort`]).
     fn poll_all(&mut self, cx: &mut Context<'_>) -> Result<bool, ShardError> {
         for slot in &mut self.runs {
             if let Some(run) = slot
                 && let Poll::Ready(ended) = run.as_mut().poll(cx)
             {
                 *slot = None;
-                ended?;
+                if let Err(e) = ended {
+                    self.abort();
+                    return Err(e);
+                }
             }
         }
         Ok(self.runs.iter().any(Option::is_some))
+    }
+
+    /// Drops every member's run and ends every order-entry member's orders: a session runs
+    /// once, so one whose run is dropped never sends what waits in it, and its orders take no
+    /// more (Codex P1 r4309350874, Reviewer B RB-ct0-3 on PR #164). What the host keeps for
+    /// withdrawal stays withdrawable.
+    fn abort(&mut self) {
+        self.runs.clear();
+        for orders in &self.execs {
+            orders.end();
+        }
     }
 
     /// Polls the members until `done`, given the order-entry members' orders, holds after a
@@ -466,19 +489,44 @@ impl Running<'_> {
         poll_fn(|cx| Poll::Ready(self.poll_all(cx))).await
     }
 
-    /// Yields to the runtime and polls every member once, until such a round stamps no input
-    /// from `clock`: false once none is running, or the first error.
+    /// A round: yields to the runtime, which polls its I/O and time drivers, then polls every
+    /// member once, and again while a round ends with the task's coop budget spent. The members
+    /// share the budget of the one task poll, so a member with a backlog can spend it and leave
+    /// a later member's resource reporting nothing ready though its frame was delivered; a
+    /// round that ends with budget left denied no member a ready operation (Reviewer B RB-ct0-1
+    /// on PR #164). False once none is running, or the first error.
+    async fn round(&mut self) -> Result<bool, ShardError> {
+        loop {
+            tokio::task::yield_now().await;
+            if !self.once().await? {
+                return Ok(false);
+            }
+            if tokio::task::coop::has_budget_remaining() {
+                return Ok(true);
+            }
+        }
+    }
+
+    /// Rounds ([`Running::round`]) until one stamps no input from `clock`: false once none is
+    /// running, or the first error.
     async fn drain(&mut self, clock: &IngestClock) -> Result<bool, ShardError> {
         loop {
             let before = clock.next_seq();
-            tokio::task::yield_now().await;
-            if !self.once().await? {
+            if !self.round().await? {
                 return Ok(false);
             }
             if clock.next_seq() == before {
                 return Ok(true);
             }
         }
+    }
+}
+
+/// A run that returns, or is dropped, drops what is left of its members' runs and ends their
+/// orders ([`Running::abort`]).
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        self.abort();
     }
 }
 

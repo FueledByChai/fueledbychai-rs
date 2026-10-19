@@ -33,7 +33,11 @@ caps again when it is authorized (0082), and releases a held place whose command
    sees an input taken: every input is stamped from it. The host spawns no task (design §5.1).
 2. **A pass.** Once an input has been stamped since the last pass, the host drains: it yields
    to the runtime, which polls the I/O and time drivers before it resumes the host, then polls
-   every member once, until such a round stamps no input. That a yield polls the drivers is the
+   every member once, until such a round stamps no input. The members are polled in one task
+   poll and share its coop budget, so a member with a backlog can spend it and leave a later
+   member's socket reporting nothing ready though a frame was delivered: a round that ends
+   with the budget spent is followed by another (`tokio::task::coop::has_budget_remaining`),
+   and only a round that ends with budget left counts. That a yield polls the drivers is the
    pinned tokio's behaviour (0019 pins it exactly: `yield_now` hands the waker to the scheduler,
    which wakes it only once it has run out of ready tasks and polled the driver), not a promise
    of its documentation, so a test pins it (`tests/shard_host.rs`) and a tokio that stops doing
@@ -51,7 +55,8 @@ caps again when it is authorized (0082), and releases a held place whose command
    holds nothing; lets the members run until they again hold nothing, so the command has been
    taken (encoded, signed and written, or reported not sent); then polls between commands
    (point 4), and only then submits the next.
-4. **Between two commands.** The host yields to the runtime and polls every member once: frames
+4. **Between two commands.** The host yields to the runtime and polls every member once, again
+   while the round ends with the coop budget spent (point 2): frames
    already read by the kernel are read, decoded and applied, and their events reach the
    consumer through the handlers it already has, `MdHandler::on_md` and `ExecHandler::on_exec`
    (0023, 0053). Nothing new reaches the consumer here; the per-event path is the handler.
@@ -73,12 +78,18 @@ caps again when it is authorized (0082), and releases a held place whose command
 7. **Ends.** A member that ends without an error is polled no more; the run returns once every
    member has ended. A member's error ends the run at once and is returned, as `MdVenue::run`
    does for its endpoints; dropping the other runs closes their connections, which the venue's
-   per-connection cancel-on-disconnect protects (0058). A ladder command never submitted,
+   per-connection cancel-on-disconnect protects (0058), and ends their sessions' orders, since
+   a session runs once and one whose run was dropped never sends what waits in it: a
+   submission to them afterwards is refused (`SubmitRefusal::Ended`). The run's return, or the
+   consumer dropping it, ends them too. A ladder command never submitted,
    because its session had ended when its turn came or the run ended first, is handed back to
    the consumer (`Decide::unsubmitted`, an authorization unspent) and counted, and so is the one
-   the host had submitted when the run, or that session, ended before the session took it,
-   withdrawn from that session's queue: nothing of either reached a codec, so no `on_submitted`
-   reports it. Withdrawing such an authorization in
+   the host had submitted when the run, or that session, ended before the session encoded it,
+   withdrawn from that session: still queued, or taken and never encoded because the session
+   failed first (a nonce source reserving another count, which 0057 has end the session with
+   nothing reported). Nothing of either reached a codec, so no `on_submitted` reports it. The
+   session keeps only that one command once it ends; any other still waiting is dropped, as
+   0057 has it. Withdrawing such an authorization in
    fbc-oms is FBC-6ezy's.
 
 ## Alternatives
@@ -126,7 +137,7 @@ caps again when it is authorized (0082), and releases a held place whose command
 - A ladder command encoded while a command a handler submitted earlier waits in its session's
   queue, or a protective cancel waiting behind more than one command in progress.
 - A frame the kernel had delivered before a command's encode began, read only after the next
-  command's encode.
+  command's encode, including behind a member that spent the task's coop budget.
 - A pass whose Cycle record names an ingest sequence that had not been handed to the handlers,
   or a decide pass with no Cycle record.
 - A consumer that needs its decide pass to run while a ladder is still going out, which would
