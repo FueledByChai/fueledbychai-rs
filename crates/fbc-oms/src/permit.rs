@@ -232,6 +232,11 @@ impl PermittedCommand {
     pub(crate) fn built(&self) -> Option<(ClientOrderId, u64)> {
         self.built
     }
+
+    /// What its authorization is checked against at submit.
+    pub(crate) fn guard(&self) -> &Guard {
+        &self.guard
+    }
 }
 
 /// The client ids of the orders a place or a batch of places opens; none for any other command.

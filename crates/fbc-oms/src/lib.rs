@@ -208,7 +208,12 @@
 //! and each side an optional removal reason ([`DesiredBook::removal`]): every place and amend
 //! built for a level carries its tag, every cancel of a level the book no longer wants its
 //! side's reason ([`Planned`]), and the order keeps both for the audit sink's verdicts;
-//! fbc-oms gives them no meaning (decisions 0001, 0098; `tests/tags.rs`).
+//! fbc-oms gives them no meaning (decisions 0001, 0098; `tests/tags.rs`). Each pass takes the
+//! venue's facts as the consumer states them, with no default ([`PlanVenue`]; decision 0111;
+//! `tests/gates.rs`): nothing the market's trading status or a venue mode refuses is built,
+//! cancels excepted; normal commands stop at each rate scope's safety floor ([`RateView`]),
+//! cancels and reducing orders never; and under [`Batching::Declared`] places and cancels go
+//! in batches within the venue's declared sizes and references.
 
 mod audit;
 mod caps;

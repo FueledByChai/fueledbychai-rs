@@ -103,24 +103,24 @@ impl RateView {
 
     /// Charges `cmd`, built for `market`, against every scope that counts it.
     pub(crate) fn charge(&mut self, cmd: &VenueCommand, market: InstrumentId) {
-        let Some(op) = op_of(cmd) else {
-            return;
-        };
-        let weight = weight_of(cmd);
+        self.charge_units(op_of(cmd), market, weight_of(cmd));
+    }
+
+    /// Charges `weight` units of `op` on `market` against every scope that counts it.
+    pub(crate) fn charge_units(&mut self, op: OpKind, market: InstrumentId, weight: u32) {
         for s in self.scopes.iter_mut().filter(|s| s.counts(op, market)) {
             s.left = s.left.saturating_sub(weight);
         }
     }
 }
 
-/// The operation a venue counts `cmd` as; `None` for a command the planner never builds.
-pub(crate) fn op_of(cmd: &VenueCommand) -> Option<OpKind> {
+/// The operation a venue counts `cmd` as: a place or a batch of places, an amend, or (the
+/// only other commands the planner builds) a cancel or a cancel-many.
+fn op_of(cmd: &VenueCommand) -> OpKind {
     match cmd {
-        VenueCommand::Place(_) | VenueCommand::PlaceBatch(_) => Some(OpKind::Place),
-        VenueCommand::Amend(_) => Some(OpKind::Amend),
-        VenueCommand::Cancel(_) | VenueCommand::CancelMany(_) => Some(OpKind::Cancel),
-        VenueCommand::CancelAll(_) => Some(OpKind::CancelAll),
-        _ => None,
+        VenueCommand::Place(_) | VenueCommand::PlaceBatch(_) => OpKind::Place,
+        VenueCommand::Amend(_) => OpKind::Amend,
+        _ => OpKind::Cancel,
     }
 }
 

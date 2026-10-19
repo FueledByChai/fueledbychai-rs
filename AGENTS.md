@@ -334,8 +334,13 @@ rather than guess.
     at each pass and by `ExecutionPlanner::on_fill` (0106; `tests/fallbacks.rs`), each side's
     price-capped `CrossingIntent` planned as one reduce-only order at its cap (IOC where the
     caps take it, else a synthetic IOC), sized so the position never crosses zero, through
-    every state and cap, once per consumer attempt (0110; `tests/crossing.rs`); still
-    planned: batching, venue modes and the safety floor; 0005, 0013), `crates/fbc-journal` (0006; it depends on
+    every state and cap, once per consumer attempt (0110; `tests/crossing.rs`), and each pass
+    taking the consumer's `PlanVenue` (the caps, account and market venue modes, trading
+    status, a `RateView` of each rate scope's room and floor, and a `Batching` choice): no
+    place or amend a status or mode refuses, cancels in every mode, normal commands withheld at
+    each scope's floor while cancels and reducing orders go out, and under
+    `Batching::Declared` places of one stage and cancels batched within the venue's declared
+    sizes and references (0111; `src/gates.rs`, `tests/gates.rs`); 0005, 0013), `crates/fbc-journal` (0006; it depends on
     `fbc-core`, and `hmac` and `sha2` for its keyed hashes and `zstd` for its closed segments, only: the records the runtime writes, length-prefixed in a hand-written
     little-endian format with a version, a writer of one subdirectory per UTC day with segments
     named `<shard>-<seq>.fbcj` and time from the caller, rolled at every UTC hour, each closed

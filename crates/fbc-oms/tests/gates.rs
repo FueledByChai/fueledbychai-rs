@@ -511,7 +511,8 @@ fn nothing_is_built_that_the_trading_status_or_a_venue_mode_refuses() {
     let reduce_only = vec![(Side::Sell, 0)];
     let none: Vec<(Side, u16)> = vec![];
     type Case = (TradingStatus, VenueMode, VenueMode);
-    let cases: Vec<(Case, Vec<(Side, u16)>, Option<PlanRefusal>)> = vec![
+    type Expect = (Case, Vec<(Side, u16)>, Option<PlanRefusal>);
+    let cases: Vec<Expect> = vec![
         (
             (TradingStatus::Trading, VenueMode::Normal, VenueMode::Normal),
             all.clone(),
@@ -956,4 +957,79 @@ fn a_rate_scope_reads_its_room_from_its_limit_and_the_consumers_floor() {
     assert_eq!(per_ip(9_999, 1).left, 0);
     let view = RateView::new(vec![scope]);
     assert_eq!(view.scopes(), &[scope]);
+}
+
+#[test]
+fn a_batch_carries_its_places_guard_to_submit() {
+    // A batch is checked at submit as each of its places was: once the market's state changed
+    // (the kill switch), it is stale and is never sent.
+    let caps = batching();
+    let mut reg = quoting(0);
+    let plan = planner()
+        .plan(
+            &bids(3),
+            &mut reg,
+            &declared(&caps),
+            ACCT,
+            &mut mint(),
+            MonoNs(0),
+        )
+        .unwrap();
+    assert_eq!(kinds(&plan), vec![("batch", 3)]);
+    let batch = &plan.commands[0].auth;
+    assert!(batch.check_at_submit().is_ok());
+    reg.kill(INST);
+    assert!(batch.check_at_submit().is_err());
+}
+
+#[test]
+fn a_cancel_left_alone_in_its_batch_goes_as_a_single_cancel_where_one_can_name_it() {
+    // Three acknowledged bids pulled, cancel-manys of two: a cancel-many of two, then the
+    // third alone as a single cancel.
+    let caps = batches_of(2);
+    let venue = declared(&caps);
+    let mut reg = quoting(0);
+    let mut p = planner();
+    let mut m = mint();
+    let open = p
+        .plan(&bids(3), &mut reg, &venue, ACCT, &mut m, MonoNs(0))
+        .unwrap();
+    ack_all(&mut reg, &open);
+    let plan = p
+        .plan(
+            &DesiredBook::new(INST),
+            &mut reg,
+            &venue,
+            ACCT,
+            &mut m,
+            MonoNs(2),
+        )
+        .unwrap();
+    assert_eq!(kinds(&plan), vec![("cancel-many", 2), ("cancel", 1)]);
+
+    // A venue whose single cancel names only a placement nonce, which these orders lack: the
+    // one left goes as a cancel-many of one, which names its venue id.
+    let caps = OrderCaps {
+        cancel_refs: TagSet::of(&[RefKind::PlacementNonce]),
+        ..batches_of(2)
+    };
+    let venue = declared(&caps);
+    let mut reg = quoting(0);
+    let mut p = planner();
+    let mut m = mint();
+    let open = p
+        .plan(&bids(1), &mut reg, &venue, ACCT, &mut m, MonoNs(0))
+        .unwrap();
+    ack_all(&mut reg, &open);
+    let plan = p
+        .plan(
+            &DesiredBook::new(INST),
+            &mut reg,
+            &venue,
+            ACCT,
+            &mut m,
+            MonoNs(2),
+        )
+        .unwrap();
+    assert_eq!(kinds(&plan), vec![("cancel-many", 1)]);
 }
