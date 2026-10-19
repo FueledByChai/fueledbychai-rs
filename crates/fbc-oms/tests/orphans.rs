@@ -20,9 +20,9 @@ use common::{canceled, cid, fill, fill_id, lots, order_caps, placement, update, 
 use fbc_core::{
     AmendAck, AmendCaps, AmendQty, CancelBatch, CancelScope, CidMatch, ClientOrderId, ExchNs,
     ExchTsKind, FillIdent, InstrumentId, ItemRef, MonoNs, Namespace, NewOrder, OrderCaps,
-    OrderKind, OrderRef, RefKind, RpcId, Side, SignedLots, SnapshotReads, SnapshotSource,
-    SubmitOutcome, Support, TagSet, Ticks, VenueCommand, VenueOrderSnapshot, VenueOrderState,
-    WallNs,
+    OrderKind, OrderRef, RefKind, Reject, RejectKind, RpcId, Side, SignedLots, SnapshotReads,
+    SnapshotSource, SubmitOutcome, Support, TagSet, TerminalHint, Ticks, VenueCommand,
+    VenueOrderSnapshot, VenueOrderState, WallNs,
 };
 use fbc_oms::{
     Admission, AmendRefusal, CancelAllRefusal, CapRefusal, Cooldown, EntryState, FillLedger,
@@ -1611,4 +1611,149 @@ fn an_orphan_whose_venue_id_the_seed_showed_has_a_later_fill_naming_only_its_cli
     let routed = reg.apply_fill(accepted).unwrap();
     assert!(matches!(routed, FillRouted::Ours(..)), "{routed:?}");
     assert_eq!(reg.position(INST), Some(SignedLots(2)));
+}
+
+/// A named registry seeded flat at 1 000 holding our buy of 5, sent at 1 500 with no answer
+/// and ended Lost by the trustworthy snapshot at 2 000 that did not show it (the Unknown
+/// ladder's settle and one absence): its client id.
+fn ended_lost() -> (Registry, ClientOrderId) {
+    let mut reg = seeded(0);
+    arm::start(&mut reg, INST);
+    let order = buy(5);
+    let c = order.cid;
+    place(&mut reg, order).unwrap();
+    reg.placement_sent(c, MonoNs(1_500), WallNs(1_500)).unwrap();
+    reg.on_outcome(
+        c,
+        OrderOp::Place,
+        &ItemRef {
+            idx: 0,
+            cid: Some(c),
+            vid: None,
+        },
+        &SubmitOutcome::Unknown,
+        MonoNs(1_600),
+    )
+    .unwrap();
+    let report = resync_at(&mut reg, SnapshotSource::Trustworthy, 2_000, vec![], 0);
+    assert_eq!(report.ladder.lost, vec![c], "{report:?}");
+    (reg, c)
+}
+
+/// The venue's refusal of the cancel of `c` sent under `rpc` at `now`: it already ended.
+fn cancel_refused_closed(reg: &mut Registry, c: ClientOrderId, v: &str, rpc: u64, now: u64) {
+    reg.cancel_sent(c, RpcId(rpc), MonoNs(now)).unwrap();
+    reg.on_outcome(
+        c,
+        OrderOp::Cancel(RpcId(rpc)),
+        &ItemRef {
+            idx: 0,
+            cid: Some(c),
+            vid: Some(vid(v)),
+        },
+        &SubmitOutcome::Rejected(Reject {
+            kind: RejectKind::AlreadyTerminal(TerminalHint::Canceled),
+            venue_code: None,
+            raw: "ALREADY_CLOSED".into(),
+        }),
+        MonoNs(now + 10),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_lost_order_the_venue_reported_ended_is_not_registered_again_from_a_lagging_snapshot() {
+    // Reviewer B's RB840-11 on PR #171: the ladder ended our buy Lost; the venue's own
+    // Canceled update for it then arrives, too late to apply. A lagging snapshot at 3 000 still
+    // shows it open: the venue said it ended, so it is no orphan. Nothing is registered, it
+    // counts on neither cap, and the adding side is not suppressed.
+    let (mut reg, c) = ended_lost();
+    let mut ended = update(Some(c), canceled(), 0);
+    ended.vid = Some(vid("l"));
+    reg.apply_update(&ended, key(2_500));
+    let report = resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        3_000,
+        vec![ours(c, "l", Side::Buy)],
+        0,
+    );
+    assert!(report.orphans.is_empty(), "{report:?}");
+    assert!(reg.orphans(INST).is_empty());
+    assert_eq!(
+        reg.get(c).unwrap().state(),
+        OrdState::Terminal(TerminalKind::Lost)
+    );
+    assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(0)));
+    place(&mut reg, buy(1)).unwrap();
+}
+
+#[test]
+fn an_orphans_cancel_refused_as_already_ended_puts_it_on_the_ladder_so_a_trustworthy_absence_ends_it()
+ {
+    // Reviewer B's RB840-11 on PR #171: an orphan, here the Lost buy a lagging snapshot shows
+    // open, has its cancel refused because the venue already ended it. It was registered from a
+    // snapshot, so no terminal event of it may come: it goes on the Unknown ladder, and the
+    // trustworthy snapshot at 4 000 that does not show it ends it Lost. Its market holds no
+    // orphan from then on, and a later lagging snapshot showing it open again under the id the
+    // venue said ended registers nothing.
+    let (mut reg, c) = ended_lost();
+    resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        3_000,
+        vec![ours(c, "l", Side::Buy)],
+        0,
+    );
+    assert_eq!(reg.orphans(INST), vec![c]);
+    let plan = reg.cancel_orphans(INST, &cfg(), &venue(), MonoNs(3_100));
+    assert_explicit(&plan, &["l"], None);
+    cancel_refused_closed(&mut reg, c, "l", 9, 3_200);
+    assert!(
+        reg.get(c).unwrap().unknown_since().is_some(),
+        "on the ladder"
+    );
+    assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(5)));
+
+    let report = resync_at(&mut reg, SnapshotSource::Trustworthy, 4_000, vec![], 0);
+    assert_eq!(report.ladder.lost, vec![c], "{report:?}");
+    assert!(report.orphans.is_empty(), "{report:?}");
+    assert!(reg.orphans(INST).is_empty());
+    assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(0)));
+
+    let report = resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        5_000,
+        vec![ours(c, "l", Side::Buy)],
+        0,
+    );
+    assert!(report.orphans.is_empty(), "{report:?}");
+    assert!(reg.get(c).unwrap().state().is_terminal());
+    let until = 3_100 + u64::try_from(COOLDOWN.as_nanos()).unwrap();
+    assert_eq!(reg.end_orphan_cooldowns(MonoNs(until)), vec![INST]);
+    place(&mut reg, buy(1)).unwrap();
+}
+
+#[test]
+fn a_first_registered_orphans_cancel_refused_as_already_ended_puts_it_on_the_ladder() {
+    // Reviewer B's RB840-11 on PR #171, for an orphan the registry never held: its cancel is
+    // refused as already ended, so it goes on the Unknown ladder and the next trustworthy
+    // snapshot not showing it ends it Lost.
+    let mut reg = seeded(0);
+    let o = cid();
+    resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        2_000,
+        vec![ours(o, "o", Side::Buy)],
+        0,
+    );
+    assert_eq!(reg.orphans(INST), vec![o]);
+    reg.cancel_orphans(INST, &cfg(), &venue(), MonoNs(2_100));
+    cancel_refused_closed(&mut reg, o, "o", 4, 2_200);
+    let report = resync_at(&mut reg, SnapshotSource::Trustworthy, 3_000, vec![], 0);
+    assert_eq!(report.ladder.lost, vec![o], "{report:?}");
+    assert!(report.orphans.is_empty(), "{report:?}");
+    assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(0)));
 }
