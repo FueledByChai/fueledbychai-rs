@@ -42,17 +42,17 @@ use fbc_core::{
     AccountKey, AckLevel, Bps, Channel, CidMint, ClientOrderId, ConnState, InstrumentId, Lots,
     MarketLease, Namespace, NamespaceLease, NewOrder, NonceBlock, NonceSource, OrderCaps,
     OrderKind, Secret, Secrets, Side, SignedLots, SizeStep, SpecTable, SubmitOutcome, Ticks, Tif,
-    VenueConfig, VenueFactory, VenueSymbol, encode_cid,
+    TradingStatus, VenueConfig, VenueFactory, VenueMode, VenueSymbol, encode_cid,
 };
 use fbc_journal::{
     JournalWriter, NonceSourceId, RedactionKey, SinkConfig, WriterThread, journal_queue,
 };
 use fbc_oms::{
-    AmendRefusal, ArmRefusal, CancelChoice, CancelEverything, CapRefusal, DesiredBook,
+    AmendRefusal, ArmRefusal, Batching, CancelChoice, CancelEverything, CapRefusal, DesiredBook,
     DesiredQuote, EntryState, ExecutionPlanner, ExitKind, ExitRefusal, FillLedger, LadderConfig,
-    LeaseKeys, Leases, LedgerConfig, MarketCapsConfig, OmsError, OrdState, PlanRefusal,
-    PlannerConfig, PositionCheck, PreTradeCaps, ReduceFallback, Registry, Stage, StateRefusal,
-    TestnetRun,
+    LeaseKeys, Leases, LedgerConfig, MarketCapsConfig, OmsError, OrdState, PlanRefusal, PlanVenue,
+    PlannerConfig, PositionCheck, PreTradeCaps, RateView, ReduceFallback, Registry, Stage,
+    StateRefusal, TestnetRun,
 };
 use fbc_runtime::{
     Connector, ExecControl, ExecOrders, ExecSession, ExecSessionConfig, IngestClock, Journal,
@@ -492,6 +492,19 @@ fn planner() -> ExecutionPlanner {
     ExecutionPlanner::new(PlannerConfig::new(Bps(1.0), lots(1), Duration::ZERO).unwrap())
 }
 
+/// A pass on `caps` with the account and the market in Normal mode, trading, no rate scope
+/// tracked and one order per command (decision 0111): the rehearsal judges none of them.
+fn one_by_one(caps: &OrderCaps) -> PlanVenue<'_> {
+    PlanVenue {
+        caps,
+        account_mode: VenueMode::Normal,
+        market_mode: VenueMode::Normal,
+        status: TradingStatus::Trading,
+        rates: RateView::new(Vec::new()),
+        batching: Batching::One,
+    }
+}
+
 /// The order-affecting methods among `methods`.
 fn order_methods(methods: &[String]) -> Vec<String> {
     methods
@@ -742,7 +755,7 @@ async fn from_a_fresh_start_every_safety_rule_holds_against_the_stub() {
             let (now, _) = g.now();
             let want = DesiredBook::new(INST).with(Side::Buy, 0, quote(599_900, 10, false));
             let plan = planner
-                .plan(&want, &mut g.reg, &caps, ACCT, &mut mint, now)
+                .plan(&want, &mut g.reg, &one_by_one(&caps), ACCT, &mut mint, now)
                 .unwrap();
             assert!(plan.commands.is_empty(), "{plan:?}");
             // The earlier run's order is ours and resting: it is cancelled before Start, on the
@@ -780,7 +793,7 @@ async fn from_a_fresh_start_every_safety_rule_holds_against_the_stub() {
             let (now, _) = g.now();
             let want = DesiredBook::new(INST).with(Side::Buy, 0, quote(599_900, 10, false));
             let mut plan = planner
-                .plan(&want, &mut g.reg, &caps, ACCT, &mut mint, now)
+                .plan(&want, &mut g.reg, &one_by_one(&caps), ACCT, &mut mint, now)
                 .unwrap();
             assert!(plan.refused.is_empty(), "{plan:?}");
             assert_eq!(plan.commands.len(), 1, "{plan:?}");
@@ -846,7 +859,7 @@ async fn from_a_fresh_start_every_safety_rule_holds_against_the_stub() {
                 quote(599_700, RESTING_CAP - 5 + 1, false),
             );
             let plan = planner
-                .plan(&want, &mut g.reg, &caps, ACCT, &mut mint, now)
+                .plan(&want, &mut g.reg, &one_by_one(&caps), ACCT, &mut mint, now)
                 .unwrap();
             assert!(plan.commands.is_empty(), "{plan:?}");
             assert!(
@@ -968,7 +981,7 @@ async fn from_a_fresh_start_every_safety_rule_holds_against_the_stub() {
             let (now, _) = g.now();
             let want = DesiredBook::new(INST).with(Side::Buy, 1, quote(599_600, 1, false));
             let plan = planner
-                .plan(&want, &mut g.reg, &caps, ACCT, &mut mint, now)
+                .plan(&want, &mut g.reg, &one_by_one(&caps), ACCT, &mut mint, now)
                 .unwrap();
             assert!(plan.commands.is_empty(), "{plan:?}");
             // A trustworthy resync showed the account's open orders and none is foreign: the
@@ -997,7 +1010,7 @@ async fn from_a_fresh_start_every_safety_rule_holds_against_the_stub() {
             let (now, _) = g.now();
             let want = DesiredBook::new(INST).with(Side::Buy, 1, quote(599_600, 1, false));
             let plan = planner
-                .plan(&want, &mut g.reg, &caps, ACCT, &mut mint, now)
+                .plan(&want, &mut g.reg, &one_by_one(&caps), ACCT, &mut mint, now)
                 .unwrap();
             assert!(plan.commands.is_empty(), "{plan:?}");
         }
@@ -1122,7 +1135,7 @@ async fn after_a_restart_flatten_writes_only_reduce_only_exits_that_never_cross_
                 .with(Side::Sell, 0, quote(600_100, 15, true))
                 .with(Side::Sell, 1, quote(600_200, 5, false));
             let plan = planner
-                .plan(&want, &mut g.reg, &caps, ACCT, &mut mint, now)
+                .plan(&want, &mut g.reg, &one_by_one(&caps), ACCT, &mut mint, now)
                 .unwrap();
             assert!(plan.commands.is_empty(), "{plan:?}");
             assert_eq!(plan.refused.len(), 3, "{plan:?}");
@@ -1143,7 +1156,7 @@ async fn after_a_restart_flatten_writes_only_reduce_only_exits_that_never_cross_
             lock(&book).fates.push_back(Fate::Rest);
             let want = DesiredBook::new(INST).with(Side::Sell, 0, quote(600_100, 10, true));
             let mut plan = planner
-                .plan(&want, &mut g.reg, &caps, ACCT, &mut mint, now)
+                .plan(&want, &mut g.reg, &one_by_one(&caps), ACCT, &mut mint, now)
                 .unwrap();
             assert!(plan.refused.is_empty(), "{plan:?}");
             assert_eq!(plan.commands.len(), 1, "{plan:?}");
@@ -1161,7 +1174,7 @@ async fn after_a_restart_flatten_writes_only_reduce_only_exits_that_never_cross_
                 .with(Side::Sell, 0, quote(600_100, 10, true))
                 .with(Side::Sell, 1, quote(600_200, 1, true));
             let plan = planner
-                .plan(&want, &mut g.reg, &caps, ACCT, &mut mint, now)
+                .plan(&want, &mut g.reg, &one_by_one(&caps), ACCT, &mut mint, now)
                 .unwrap();
             assert!(plan.commands.is_empty(), "{plan:?}");
             assert!(

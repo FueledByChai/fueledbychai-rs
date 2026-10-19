@@ -21,6 +21,8 @@
 #[path = "common/arm.rs"]
 mod arm;
 mod common;
+#[path = "common/venue.rs"]
+mod venue;
 
 use std::time::Duration;
 
@@ -406,8 +408,15 @@ fn a_planner_refuses_a_registry_an_authorization_bound_to_another_account() {
         },
     );
     assert_eq!(
-        p.plan(&book, &mut reg, &amending(), ACCT, &mut mint, MonoNs(0))
-            .unwrap_err(),
+        p.plan(
+            &book,
+            &mut reg,
+            &venue::of(&amending()),
+            ACCT,
+            &mut mint,
+            MonoNs(0)
+        )
+        .unwrap_err(),
         PlanError::OtherAccount {
             acct: ACCT,
             bound: OTHER_ACCT

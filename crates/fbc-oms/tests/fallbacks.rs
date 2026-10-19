@@ -18,6 +18,8 @@
 #[path = "common/arm.rs"]
 mod arm;
 mod common;
+#[path = "common/venue.rs"]
+mod venue;
 
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
@@ -209,7 +211,9 @@ fn plan_and_send(
     mint: &mut CidMint,
     now: MonoNs,
 ) -> Plan {
-    let plan = planner.plan(desired, reg, caps, ACCT, mint, now).unwrap();
+    let plan = planner
+        .plan(desired, reg, &venue::of(caps), ACCT, mint, now)
+        .unwrap();
     send(reg, &plan.commands, now);
     plan
 }
