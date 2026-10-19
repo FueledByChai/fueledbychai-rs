@@ -19,15 +19,17 @@ use std::time::Duration;
 use common::{canceled, cid, fill, fill_id, lots, order_caps, placement, update, vid};
 use fbc_core::{
     AmendAck, AmendCaps, AmendQty, CancelBatch, CancelScope, CidMatch, ClientOrderId, ExchNs,
-    ExchTsKind, FillIdent, InstrumentId, MonoNs, Namespace, NewOrder, OrderCaps, OrderKind,
-    OrderRef, RefKind, RpcId, Side, SignedLots, SnapshotReads, SnapshotSource, Support, TagSet,
-    Ticks, VenueCommand, VenueOrderSnapshot, VenueOrderState, WallNs,
+    ExchTsKind, FillIdent, InstrumentId, ItemRef, MonoNs, Namespace, NewOrder, OrderCaps,
+    OrderKind, OrderRef, RefKind, RpcId, Side, SignedLots, SnapshotReads, SnapshotSource,
+    SubmitOutcome, Support, TagSet, Ticks, VenueCommand, VenueOrderSnapshot, VenueOrderState,
+    WallNs,
 };
 use fbc_oms::{
-    Admission, AmendRefusal, CancelAllRefusal, Cooldown, EntryState, FillLedger, FillRouted,
-    FillTime, IssueRefusal, LadderConfig, LedgerConfig, MarketCapsConfig, OmsError, OrdState,
-    OrderKey, OrphanCancels, OrphanConfig, OrphanConfigError, OrphanPlan, PositionCheck,
-    PreTradeCaps, Registry, ResyncReport, ResyncSnapshot, Routed, StaleAuthorization,
+    Admission, AmendRefusal, CancelAllRefusal, CapRefusal, Cooldown, EntryState, FillLedger,
+    FillRouted, FillTime, IssueRefusal, LadderConfig, LedgerConfig, MarketCapsConfig, OmsError,
+    OrdState, OrderKey, OrderOp, OrphanCancels, OrphanConfig, OrphanConfigError, OrphanPlan,
+    PositionCheck, PreTradeCaps, Registry, ResyncReport, ResyncSnapshot, Routed,
+    StaleAuthorization, TerminalKind,
 };
 
 const INST: InstrumentId = InstrumentId::new(1);
@@ -1293,4 +1295,92 @@ fn the_resync_that_registers_an_orphan_compares_the_position_with_its_earlier_fi
         }),
         "{report:?}"
     );
+}
+
+#[test]
+fn an_order_of_ours_the_ladder_ended_lost_that_a_later_snapshot_shows_open_is_an_orphan() {
+    // Reviewer B's RB840-8 on PR #171: a buy of 5 sent with no answer goes Unknown; a
+    // trustworthy snapshot at 2 000 that does not show it, past the settle, ends it Lost. The
+    // snapshot lagged (decision 0094 measured Paradex's open orders up to 3.5 s behind the
+    // stream): the one at 3 000 shows it open. It is an orphan: counted on both caps, the
+    // adding side suppressed, and cancelled by explicit reference.
+    let mut reg = seeded(0);
+    arm::start(&mut reg, INST);
+    let order = buy(5);
+    let c = order.cid;
+    place(&mut reg, order).unwrap();
+    reg.placement_sent(c, MonoNs(1_500), WallNs(1_500)).unwrap();
+    reg.on_outcome(
+        c,
+        OrderOp::Place,
+        &ItemRef {
+            idx: 0,
+            cid: Some(c),
+            vid: None,
+        },
+        &SubmitOutcome::Unknown,
+        MonoNs(1_600),
+    )
+    .unwrap();
+    let report = resync_at(&mut reg, SnapshotSource::Trustworthy, 2_000, vec![], 0);
+    assert_eq!(report.ladder.lost, vec![c], "{report:?}");
+    assert_eq!(
+        reg.get(c).unwrap().state(),
+        OrdState::Terminal(TerminalKind::Lost)
+    );
+    assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(0)));
+
+    let report = resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        3_000,
+        vec![ours(c, "l", Side::Buy)],
+        0,
+    );
+    assert_eq!(report.untracked, vec![(c, vid("l"))], "{report:?}");
+    assert_eq!(report.orphans, vec![INST]);
+    assert_eq!(reg.orphans(INST), vec![c]);
+    assert!(!reg.get(c).unwrap().state().is_terminal());
+    assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(5)));
+    assert_eq!(place(&mut reg, buy(1)), Err(suppressed(Side::Buy)));
+    let plan = reg.cancel_orphans(INST, &cfg(), &venue(), MonoNs(3_100));
+    assert_explicit(&plan, &["l"], None);
+    // After the cooldown the inventory cap still counts it: a buy of 46 would take the worst
+    // case to 51 against the 50-lot cap.
+    let until = 3_100 + u64::try_from(COOLDOWN.as_nanos()).unwrap();
+    assert_eq!(reg.end_orphan_cooldowns(MonoNs(until)), vec![INST]);
+    assert_eq!(
+        place(&mut reg, buy(46)),
+        Err(OmsError::Capped(CapRefusal::InventoryCap {
+            inst: INST,
+            side: Side::Buy,
+            worst: Some(lots(51)),
+            cap: lots(CAP),
+        }))
+    );
+    place(&mut reg, buy(45)).unwrap();
+}
+
+#[test]
+fn an_orphans_earlier_fills_that_overflow_the_inventory_leave_its_position_unknown() {
+    // Reviewer A on PR #171: seeded long i64::MAX lots, a fill of our order o the registry does
+    // not hold arrives after the seed's request, untimed: the seed holds it only because it did
+    // not show o. A snapshot showing o open registers it, and counting the fill would overflow
+    // the inventory: the market's position is unknown from then on.
+    let mut reg = seeded(i64::MAX);
+    let mut l = ledger();
+    let o = cid();
+    let routed = fill_at(&mut reg, &mut l, o, "o", Side::Buy, 1, 1, None, 1_500);
+    assert_eq!(routed, FillRouted::InSnapshot(o));
+    let mut shown = ours(o, "o", Side::Buy);
+    shown.cum_filled = lots(1);
+    resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        2_000,
+        vec![shown],
+        i64::MAX,
+    );
+    assert_eq!(reg.orphans(INST), vec![o]);
+    assert_eq!(reg.position(INST), None);
 }
