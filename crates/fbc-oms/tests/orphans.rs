@@ -1757,3 +1757,57 @@ fn a_first_registered_orphans_cancel_refused_as_already_ended_puts_it_on_the_lad
     assert!(report.orphans.is_empty(), "{report:?}");
     assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(0)));
 }
+
+#[test]
+fn a_place_authorized_during_the_cooldown_is_refused_at_submit_once_a_resync_shows_an_orphan_grown()
+{
+    // Codex's r4317002497 on PR #171: long 20, an orphan sell of 5 suppresses the adding side
+    // and a sell of 15 is authorized within the position's size. The next resync shows the
+    // orphan grown to 8 (the first snapshot lagged an earlier run's amend): with the sell it
+    // would take the position past zero, so the authorization is refused at submit.
+    let mut reg = seeded(20);
+    arm::start(&mut reg, INST);
+    let o = cid();
+    let shown = |qty: i64| VenueOrderSnapshot {
+        qty: lots(qty),
+        ..ours(o, "o", Side::Sell)
+    };
+    resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        2_000,
+        vec![shown(5)],
+        20,
+    );
+    assert_eq!(reg.orphans(INST), vec![o]);
+    let cmd = reg.place(sell(15)).unwrap();
+    let auth = reg.authorize(arm::TEST_ACCT, cmd).unwrap();
+    assert_eq!(auth.check_at_submit(), Ok(()));
+    resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        3_000,
+        vec![shown(8)],
+        20,
+    );
+    assert_eq!(reg.resting_on(INST, Side::Sell), Some(lots(23)));
+    assert!(matches!(
+        auth.check_at_submit(),
+        Err(StaleAuthorization::StateChanged { market: INST, .. })
+    ));
+}
+
+#[test]
+fn ending_the_cooldowns_reaps_a_dropped_place_first() {
+    // Codex's r4317002504 on PR #171: a place built and dropped unspent is released by the
+    // next mutating call, ending the orphan cooldowns included.
+    let mut reg = seeded(0);
+    arm::start(&mut reg, INST);
+    let order = buy(5);
+    let c = order.cid;
+    let cmd = reg.place(order).unwrap();
+    drop(cmd);
+    reg.end_orphan_cooldowns(MonoNs(1));
+    assert!(reg.get(c).unwrap().state().is_terminal());
+    assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(0)));
+}
