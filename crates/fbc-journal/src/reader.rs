@@ -27,7 +27,8 @@ use crate::writer::{COMPRESSED_EXT, Listed, list_segments, with_ext};
 ///
 /// It reads segments of every format version from [`OLDEST_READABLE`] to [`VERSION`]: a
 /// version 2 segment, written before the `Nonce`, `EncodeCtx` and `Cycle` kinds existed,
-/// reads back as it was written.
+/// reads back as it was written. A segment of a newer version is refused at its header,
+/// naming its version ([`JournalError::UnsupportedVersion`]), rather than part way through.
 ///
 /// As an iterator it returns records with their redaction spans blanked
 /// ([`Record::blanked`]); [`entries`](JournalReader::entries) returns each with the keyed

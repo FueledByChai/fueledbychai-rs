@@ -308,8 +308,11 @@ rather than guess.
     records arrived in format version 3, and the keyed hashes of the credential spans a codec
     names in inbound frames and responses (`redact_inbound`, 0028) in version 4, the kind
     each outbound frame was sent as and the control frames received in version 5, the
-    stale-authorization reason in version 6, and a request deadline's firing in version 7
-    (0090), whose reader still reads version 2 to 6 journals), `crates/fbc-sim` (simulated venue and queue-position
+    stale-authorization reason in version 6, a request deadline's firing in version 7
+    (0090), and the consumer's own records in version 8 (`Record::Consumer`: its inputs and
+    annotations as opaque bytes with a kind and an input flag, written through the sink in the
+    shard's total order under the class the consumer picks, passed over by decoder replay;
+    0101), whose reader still reads version 2 to 7 journals), `crates/fbc-sim` (simulated venue and queue-position
     fill-model code, never calibrations; it depends on `fbc-core` and `fbc-book` only: so far
     `QueueModel`, each modelled order's place in its level's queue under a `Bracket`
     (Pessimistic, Middle, Optimistic) from a `QueueConfig` with no `Default`, queued on arrival

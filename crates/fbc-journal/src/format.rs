@@ -41,8 +41,14 @@
 //! Version 7 (FBC-0hfl, decision 0090) adds the `RpcTimeout` kind and changes nothing else: a
 //! request deadline an order-entry session fired into its codec's `on_rpc_timeout`, at the
 //! stamp its events carry, and the request it names. A version 2 to 6 segment holding it is
-//! malformed, and a reader of version 6 refuses a version 7 segment at its header. The reader
-//! reads versions 2 to 7, so a journal written before reads back unchanged.
+//! malformed, and a reader of version 6 refuses a version 7 segment at its header.
+//!
+//! Version 8 (FBC-hxkm, decision 0101) adds the `Consumer` kind and changes nothing else: one of
+//! the consumer's own inputs or annotations, its monotonic time (`u64`), the consumer's kind
+//! (`u16`), an input flag byte (0 an annotation, 1 an input) and its bytes, written verbatim.
+//! A version 2 to 7 segment holding it is malformed, and a reader of version 7 refuses a
+//! version 8 segment at its header, naming the version. The reader reads versions 2 to 8, so a
+//! journal written before reads back unchanged.
 
 use core::ops::Range;
 
@@ -67,8 +73,8 @@ pub const MAGIC: [u8; 4] = *b"FBCJ";
 /// response bodies and response header names (FBC-7lm); version 5 keeps the kind an outbound
 /// frame was sent as (FBC-q7b) and adds the `InboundControl` kind (FBC-drf); version 6 adds the
 /// `StaleAuthorization` reason a write result may be not sent for (FBC-j5bw); version 7 adds the
-/// `RpcTimeout` kind (FBC-0hfl).
-pub const VERSION: u16 = 7;
+/// `RpcTimeout` kind (FBC-0hfl); version 8 adds the `Consumer` kind (FBC-hxkm).
+pub const VERSION: u16 = 8;
 /// The oldest format version this crate reads: version 1 is refused (0024).
 pub const OLDEST_READABLE: u16 = 2;
 /// The most bytes one record may redact, its spans and secret header values together.
@@ -450,9 +456,17 @@ fn encode_body(
             e.stamp(stamp);
             e.u64(rpc.0);
         }
-        Record::Consumer { .. } => {
-            let _ = CONSUMER;
-            return Err(JournalError::Unencodable("consumer record"));
+        Record::Consumer {
+            at,
+            kind,
+            input,
+            bytes,
+        } => {
+            e.u8(CONSUMER);
+            e.u64(at.0);
+            e.u16(*kind);
+            e.u8(u8::from(*input));
+            e.bytes(&bytes.0)?;
         }
     }
     e.within()
@@ -965,6 +979,7 @@ pub(crate) fn decode_version(body: &[u8], version: u16) -> Result<(Record, Vec<S
     if (kind >= NONCE && version < 3)
         || (kind >= INBOUND_CONTROL && version < 5)
         || (kind >= RPC_TIMEOUT && version < 7)
+        || (kind >= CONSUMER && version < 8)
     {
         return Err("record kind");
     }
@@ -1116,6 +1131,16 @@ pub(crate) fn decode_version(body: &[u8], version: u16) -> Result<(Record, Vec<S
         RPC_TIMEOUT => Record::RpcTimeout {
             stamp: d.stamp()?,
             rpc: RpcId(d.u64()?),
+        },
+        CONSUMER => Record::Consumer {
+            at: MonoNs(d.u64()?),
+            kind: d.u16()?,
+            input: match d.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err("consumer input flag"),
+            },
+            bytes: Opaque(d.bytes()?.to_vec()),
         },
         _ => return Err("record kind"),
     };

@@ -9,7 +9,9 @@
 //!   headers, timer firings, control records (connections opened and closed, subscription
 //!   calls), markers (a session's start with the consumer's header, `Degraded`,
 //!   `Recovered`), the nonces each source reserved, the context (wall and monotonic time,
-//!   nonces) each encode was given, and decide-cycle boundaries.
+//!   nonces) each encode was given, and decide-cycle boundaries; and the consumer's own
+//!   records, its inputs and annotations as opaque bytes (`Record::Consumer`, decision 0101),
+//!   which it writes through the same sink in the shard's total order.
 //! - [`JournalWriter`], which writes one shard's records into a directory the consumer
 //!   supplies, one subdirectory per UTC day (`YYYYMMDD`), segments named
 //!   `<shard>-<seq>.fbcj`, rolled at every UTC hour; each segment it closes is compressed with
@@ -42,7 +44,9 @@
 //! record built with [`Record::inbound`] or [`HttpResponseRec::from`] marks nothing, for a codec
 //! whose input holds no credential. The runtime offers each inbound frame and response borrowed
 //! ([`RecordRef::Inbound`], [`ResponseRef`]) with the spans its codec's `redact_inbound` named
-//! (FBC-s69), and the journal refuses borrowed spans or header marks that do not fit them.
+//! (FBC-s69), and the journal refuses borrowed spans or header marks that do not fit them. A
+//! consumer record's bytes are written whole, with no span: the consumer puts no credential in
+//! them (decision 0101).
 
 mod error;
 pub mod format;
