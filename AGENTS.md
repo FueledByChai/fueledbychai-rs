@@ -185,7 +185,7 @@ rather than guess.
     the consumer's `SafetyReserve`, refusals and 429/418 counted by scope (0030);
     `MdReplay` feeds one session's journal back to the venue's decoders through the same calls,
     with the recorded stamps, effects not executed (decoder replay; the caller supplies the
-    `VenueConfig` and `SpecTable`), and runs closed-loop as a shard member (0106,
+    `VenueConfig` and `SpecTable`), and runs closed-loop as a shard member (0107,
     `Member::md_replay` with a `ClosedLoop`): each record it feeds waits for its recorded instant
     on an `IngestClock::replayed` (no wall clock read; the consumer's runtime paused, so time is
     virtual), each input restamped with the shard's next ingest sequence and its recorded
@@ -377,7 +377,7 @@ rather than guess.
     `tests/replayed.rs`); and a closed-loop replay of a toy market-data journal through the shard
     host, a SimVenue session per bracket answering the consumer's fill-dependent commands at
     their replayed instants plus the latency, identical commands, outcomes, fills and `Cycle`
-    records on every run with no clock read (FBC-066n, 0106, `tests/closed_loop.rs`);
+    records on every run with no clock read (FBC-066n, 0107, `tests/closed_loop.rs`);
     still planned: amends, batches, queries and injected
     orders, FBC-nv2), `crates/fbc-conformance` (the adapter conformance kit,
     0025; it depends on `fbc-runtime`, `fbc-oms`, `fbc-journal` and `fbc-core`, never on a

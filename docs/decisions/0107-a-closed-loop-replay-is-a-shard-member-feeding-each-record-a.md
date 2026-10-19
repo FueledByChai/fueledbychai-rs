@@ -1,4 +1,4 @@
-# 0106 — A closed-loop replay is a shard member feeding each record at its recorded instant on a replayed clock the paused runtime moves, restamped into the shard's ingest order, augmenting 0006, 0056, 0100, 0103 and 0104
+# 0107 — A closed-loop replay is a shard member feeding each record at its recorded instant on a replayed clock the paused runtime moves, restamped into the shard's ingest order, augmenting 0006, 0056, 0100, 0103 and 0104
 
 Status: accepted
 Date: 2026-10-19

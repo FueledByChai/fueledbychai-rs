@@ -1343,7 +1343,7 @@ async fn a_request_asked_for_while_a_write_waits_after_the_stop_is_never_started
 // ---------------------------------------------------------------------------------------------
 // Frames that keep arriving starve nothing (DeepSeek DS-1): each turn the session polls the
 // ways it can wake from the one after the last turn's first (a rotation, so a closed-loop
-// replay is the same on every run, decision 0106 item 6), and the control's drop is checked
+// replay is the same on every run, decision 0107 item 6), and the control's drop is checked
 // after every wake, whichever way woke it.
 // ---------------------------------------------------------------------------------------------
 

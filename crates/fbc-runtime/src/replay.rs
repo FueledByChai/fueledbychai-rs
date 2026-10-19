@@ -47,7 +47,7 @@
 //! Records the sink dropped leave a `Degraded` marker, counted as a gap: a replay across one
 //! is not exact.
 //!
-//! **Closed loop** (FBC-066n, decision 0106). A replay can also run as a member of a shard host
+//! **Closed loop** (FBC-066n, decision 0107). A replay can also run as a member of a shard host
 //! ([`Member::md_replay`](crate::Member::md_replay)) with a [`ClosedLoop`]: each record it feeds
 //! waits for its recorded instant on the shard's replayed clock
 //! ([`IngestClock::replayed`], on a paused runtime, so the wait is virtual), and each input is
