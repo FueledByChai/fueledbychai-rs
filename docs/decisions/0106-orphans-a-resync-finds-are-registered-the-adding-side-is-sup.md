@@ -39,7 +39,9 @@ and how an orphan is held while its cancel is out (FBC-840, BT-402).
    later snapshot showing it open proves it was live after the seed read the account, so the
    seed holds a fill of it only when the fill arrived before the seed was requested or executed
    at or before the seed's watermark; every other fill of it, on either read mode (0095), moves
-   the inventory (Reviewer B's RB840-1 on PR #171: placed as the seed's own unshown order, its
+   the inventory (unless the seed showed it, under its venue id without our client id: what the
+   seed showed then places its fills, as for an order the seed held, so a fill the seeded
+   position holds is not counted again; Codex's r4316124604) (Reviewer B's RB840-1 on PR #171: placed as the seed's own unshown order, its
    fills moved the record and not the inventory, or left a separate-reads market unsettled).
    The fills of it applied before it was registered, which a one-read seed held only because it
    did not show the order (0055's rule 3, not by their arrival or time), move the inventory as
@@ -58,7 +60,8 @@ and how an orphan is held while its cancel is out (FBC-840, BT-402).
    up to 3480 ms) that a trustworthy, non-stale snapshot shows open, under a venue id no other
    order of ours holds and no amend of it replaced, is an orphan too: it is in `untracked` and
    registered again from the snapshot with the fills counted on it and the venue ids an amend
-   replaced, every other id the registry knows it by (its earlier current one, one a fill
+   replaced and the largest cumulative fill the venue reported (Codex's r4316124597), every
+   other id the registry knows it by (its earlier current one, one a fill
    taught) now replaced by the one shown (Codex's r4315681141 and r4315910340: a delayed update
    naming only such an id would otherwise end it), so it counts on both caps, suppresses the
    adding side

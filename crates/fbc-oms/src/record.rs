@@ -409,8 +409,9 @@ impl OrderRecord {
 
     /// Takes on what `ended`, the record this one replaces as a resync registers it again
     /// from its snapshot under the venue id `live`, counted and knew (Reviewer B's RB840-8,
-    /// Codex's r4315681141 and r4315910340 on PR #171): the fills counted on it, which the
-    /// inventory already holds, the venue ids an amend replaced, and every other id `indexed`
+    /// Codex's r4315681141, r4315910340 and r4316124597 on PR #171): the fills counted on it,
+    /// which the inventory already holds, the largest cumulative fill the venue reported (a
+    /// lagging snapshot may show less), the venue ids an amend replaced, and every other id `indexed`
     /// names it by (its current one, one a fill taught), each now replaced by `live`, so a
     /// delayed update naming only one of them does not reach this order. `live` is no id an
     /// amend of it replaced.
@@ -426,6 +427,7 @@ impl OrderRecord {
                 self.replaced.push((old, live.clone()));
             }
         }
+        self.cum_venue = self.cum_venue.max(ended.cum_venue);
         self.set_cum_fills(ended.cum_fills());
     }
 

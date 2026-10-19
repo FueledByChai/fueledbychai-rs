@@ -293,7 +293,8 @@ struct SeedRef {
     /// The orphans a later resync registered on the market from its snapshot (0005's I7,
     /// decision 0106): shown open after the seed read the account, so the seed holds a fill of
     /// one only when it arrived before the seed was requested or executed at or before its
-    /// watermark (Reviewer B's RB840-1 on PR #171).
+    /// watermark (Reviewer B's RB840-1 on PR #171). One the seed showed without our client id
+    /// is in `known` instead (Codex's r4316124604).
     later: HashSet<ClientOrderId>,
     /// Fills of our orders the registry did not hold that the seed holds only because it did
     /// not show their order (rule 3), not by their arrival or time: when each arrived, its
@@ -425,12 +426,14 @@ impl Registry {
         }
     }
 
-    /// Registers `cid`, an orphan on `inst`, against the market's seed: the seed holds a later
-    /// fill of it only by the fill's arrival or time (Reviewer B's RB840-1 on PR #171), and
+    /// Registers `cid`, an orphan on `inst` under `vid`, against the market's seed: the seed
+    /// holds a later fill of it only by the fill's arrival or time (Reviewer B's RB840-1 on PR
+    /// #171), unless the seed showed it, by `cid` or `vid`, when what it showed places them as
+    /// for an order the seed held (Codex's r4316124604); and
     /// the fills of it the seed held only because it did not show it move the inventory now,
     /// once (Codex's r4310559340). Should they overflow the inventory, the market's position
     /// is unknown from now on. On a market seeded by hand every fill counted already.
-    fn seed_orphan(&mut self, inst: InstrumentId, cid: ClientOrderId) {
+    fn seed_orphan(&mut self, inst: InstrumentId, cid: ClientOrderId, vid: &VenueOrderId) {
         let Some(MarketState::Seeded(Seed {
             reference: Some(r),
             log,
@@ -439,7 +442,13 @@ impl Registry {
         else {
             return;
         };
-        r.later.insert(cid);
+        if r.shown.contains_key(&cid) || r.shown_vids.contains_key(vid) {
+            // The seed showed it, without our client id: what it showed places its fills, as
+            // for an order the seed held (Codex's r4316124604 on PR #171).
+            r.known.insert(cid);
+        } else {
+            r.later.insert(cid);
+        }
         let fills = r.absent_only.remove(&cid).unwrap_or_default();
         if fills.is_empty() {
             return;
@@ -658,7 +667,7 @@ impl Registry {
             self.with_record(*cid, |rec| rec.apply_update(&u, key));
             if !lost {
                 // Shown open after the seed: its fills are placed by their arrival and time.
-                self.seed_orphan(o.inst, *cid);
+                self.seed_orphan(o.inst, *cid, &o.vid);
             }
             self.orphans.add(o.inst, *cid);
             registered.insert(o.inst);
