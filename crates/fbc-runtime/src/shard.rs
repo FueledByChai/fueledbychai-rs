@@ -821,12 +821,13 @@ mod tests {
             sender.push(TrafficClass::Safety, 1, b"Stop".to_vec()),
             Err(InputRefusal::Closed)
         );
-        timers.arm(
+        let armed = timers.arm(
             std::time::Duration::ZERO,
             TrafficClass::Normal,
             2,
             Vec::new(),
         );
+        assert_eq!(armed, Err(crate::ArmRefusal::Ended));
         assert_eq!((timers.not_armed(), timers.pending()), (1, 0));
         // A run of the inputs dropped before its first poll ends them too.
         let (mut inputs, sender) = ConsumerInputs::new(

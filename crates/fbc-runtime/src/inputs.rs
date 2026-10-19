@@ -107,6 +107,29 @@ impl fmt::Display for InputRefusal {
 
 impl std::error::Error for InputRefusal {}
 
+/// Why an arm armed no timer: nothing of it will fire (Reviewer B's B1 on PR #172).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ArmRefusal {
+    /// The inputs that fire these timers have ended (their run returned or was dropped), and no
+    /// new [`ConsumerInputs`] has taken the timers since.
+    Ended,
+    /// The delay lies past the end of the clock.
+    PastClock,
+}
+
+impl fmt::Display for ArmRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ArmRefusal::Ended => f.write_str("the inputs that fire these timers have ended"),
+            ArmRefusal::PastClock => {
+                f.write_str("the timer's delay lies past the end of the clock")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ArmRefusal {}
+
 /// An input as pushed, on its way through the ring.
 struct Pushed {
     class: TrafficClass,
@@ -223,7 +246,14 @@ impl ConsumerTimers {
     /// Arms a timer that fires `after` from now as an input of the consumer's `kind`, holding
     /// `bytes`, journaled under `class`. Counted and not armed when these timers are inert, when
     /// the inputs that fire them have ended, or when `after` lies past the end of the clock.
-    pub fn arm(&self, after: Duration, class: TrafficClass, kind: u16, bytes: Vec<u8>) {
+    #[must_use = "a refused arm fires nothing"]
+    pub fn arm(
+        &self,
+        after: Duration,
+        class: TrafficClass,
+        kind: u16,
+        bytes: Vec<u8>,
+    ) -> Result<(), ArmRefusal> {
         let deadline = Instant::now().checked_add(after);
         let waker = {
             let mut st = self.state.borrow_mut();
@@ -245,6 +275,7 @@ impl ConsumerTimers {
         if let Some(waker) = waker {
             waker.wake();
         }
+        Ok(())
     }
 
     /// Every arm so far, armed or not.
@@ -319,6 +350,8 @@ pub const MAX_INPUT_CAPACITY: usize = tokio::sync::Semaphore::MAX_PERMITS;
 pub enum InputsError {
     /// The capacity is 0 or above [`MAX_INPUT_CAPACITY`].
     Capacity(usize),
+    /// The timers are fired by other inputs that have not ended.
+    TimersInUse,
 }
 
 impl fmt::Display for InputsError {
@@ -328,6 +361,9 @@ impl fmt::Display for InputsError {
                 f,
                 "an input ring of capacity {n}: it must hold between 1 and {MAX_INPUT_CAPACITY}"
             ),
+            InputsError::TimersInUse => {
+                f.write_str("the consumer's timers are fired by other inputs that have not ended")
+            }
         }
     }
 }
@@ -341,6 +377,8 @@ pub struct InputCounters {
     pub pushed: u64,
     /// Timer firings handed on.
     pub fired: u64,
+    /// Pushed inputs the ring still held when the inputs ended, never handed on.
+    pub unhandled: u64,
 }
 
 /// The shard's side of the consumer's inputs: the ring's receiving end and the timers it fires,
@@ -646,11 +684,13 @@ mod tests {
             inputs.counters(),
             InputCounters {
                 pushed: 2,
-                fired: 0
+                fired: 0,
+                unhandled: 0
             }
         );
-        // Ended: the timers arm nothing.
-        timers.arm(Duration::ZERO, TrafficClass::Normal, 1, Vec::new());
+        // Ended: the timers arm nothing, and say so.
+        let armed = timers.arm(Duration::ZERO, TrafficClass::Normal, 1, Vec::new());
+        assert_eq!(armed, Err(ArmRefusal::Ended));
         assert_eq!(
             (timers.arms(), timers.not_armed(), timers.pending()),
             (1, 1, 0)
@@ -664,7 +704,9 @@ mod tests {
     async fn a_dropped_run_ends_the_inputs() {
         let (timers, seen) = (ConsumerTimers::new(), Seen::default());
         let (mut inputs, sender) = inputs(1, &timers, &seen);
-        timers.arm(Duration::from_secs(5), TrafficClass::Normal, 7, Vec::new());
+        timers
+            .arm(Duration::from_secs(5), TrafficClass::Normal, 7, Vec::new())
+            .unwrap();
         assert_eq!(timers.pending(), 1);
         assert!(inputs.run().now_or_never().is_none());
         assert_eq!(timers.pending(), 0);
@@ -673,7 +715,8 @@ mod tests {
             Err(InputRefusal::Closed)
         );
         assert_eq!(sender.refused(), 0);
-        timers.arm(Duration::ZERO, TrafficClass::Normal, 7, Vec::new());
+        let armed = timers.arm(Duration::ZERO, TrafficClass::Normal, 7, Vec::new());
+        assert_eq!(armed, Err(ArmRefusal::Ended));
         assert_eq!(
             (timers.arms(), timers.not_armed(), timers.pending()),
             (2, 1, 0)
@@ -708,10 +751,17 @@ mod tests {
         let (mut inputs, sender) = inputs(1, &timers, &seen);
         drop(sender);
         let secs = Duration::from_secs;
-        timers.arm(secs(2), TrafficClass::Normal, 20, Vec::new());
-        timers.arm(secs(1), TrafficClass::Normal, 10, Vec::new());
-        timers.arm(secs(2), TrafficClass::Safety, 21, b"x".to_vec());
-        timers.arm(Duration::MAX, TrafficClass::Normal, 99, Vec::new());
+        timers
+            .arm(secs(2), TrafficClass::Normal, 20, Vec::new())
+            .unwrap();
+        timers
+            .arm(secs(1), TrafficClass::Normal, 10, Vec::new())
+            .unwrap();
+        timers
+            .arm(secs(2), TrafficClass::Safety, 21, b"x".to_vec())
+            .unwrap();
+        let past = timers.arm(Duration::MAX, TrafficClass::Normal, 99, Vec::new());
+        assert_eq!(past, Err(ArmRefusal::PastClock));
         assert_eq!(
             (timers.arms(), timers.not_armed(), timers.pending()),
             (4, 1, 3)
@@ -724,8 +774,10 @@ mod tests {
         let seqs: Vec<u64> = seen.borrow().iter().map(|i| i.ingest_seq).collect();
         assert_eq!(seqs, [0, 1, 2]);
 
+        // An inert arm is taken (the live firing comes back from the journal) and arms nothing.
         let inert = ConsumerTimers::inert();
-        inert.arm(Duration::ZERO, TrafficClass::Normal, 1, Vec::new());
+        let armed = inert.arm(Duration::ZERO, TrafficClass::Normal, 1, Vec::new());
+        assert_eq!(armed, Ok(()));
         assert_eq!(
             (inert.arms(), inert.not_armed(), inert.pending()),
             (1, 1, 0)
@@ -744,7 +796,10 @@ mod tests {
         let handler = move |input: ConsumerInput| {
             count.set(count.get() + 1);
             if !halt.get() {
-                re_arm.arm(Duration::ZERO, TrafficClass::Normal, input.kind, Vec::new());
+                let kind = input.kind;
+                re_arm
+                    .arm(Duration::ZERO, TrafficClass::Normal, kind, Vec::new())
+                    .unwrap();
             }
         };
         let config = ConsumerInputsConfig {
@@ -753,7 +808,9 @@ mod tests {
             timers: timers.clone(),
         };
         let (mut inputs, sender) = ConsumerInputs::new(config, handler).unwrap();
-        timers.arm(Duration::ZERO, TrafficClass::Normal, 1, Vec::new());
+        timers
+            .arm(Duration::ZERO, TrafficClass::Normal, 1, Vec::new())
+            .unwrap();
         let other = async {
             tokio::task::yield_now().await;
             stop.set(true);
@@ -773,7 +830,9 @@ mod tests {
         let (mut inputs, sender) = inputs(1, &timers, &seen);
         drop(sender);
         for kind in 0..300 {
-            timers.arm(Duration::ZERO, TrafficClass::Normal, kind, Vec::new());
+            timers
+                .arm(Duration::ZERO, TrafficClass::Normal, kind, Vec::new())
+                .unwrap();
         }
         let mut run = std::pin::pin!(inputs.run());
         let first = poll_fn(|cx| Poll::Ready(run.as_mut().poll(cx))).await;
@@ -792,23 +851,133 @@ mod tests {
         let armer = timers.clone();
         let other = async move {
             tokio::task::yield_now().await;
-            armer.arm(
-                Duration::from_millis(30),
-                TrafficClass::Normal,
-                5,
-                Vec::new(),
-            );
+            armer
+                .arm(
+                    Duration::from_millis(30),
+                    TrafficClass::Normal,
+                    5,
+                    Vec::new(),
+                )
+                .unwrap();
             tokio::time::sleep(Duration::from_millis(10)).await;
             // An earlier one armed while the run sleeps toward the first is taken first.
-            armer.arm(
-                Duration::from_millis(5),
-                TrafficClass::Normal,
-                4,
-                Vec::new(),
-            );
+            armer
+                .arm(
+                    Duration::from_millis(5),
+                    TrafficClass::Normal,
+                    4,
+                    Vec::new(),
+                )
+                .unwrap();
             drop(sender);
         };
         tokio::join!(inputs.run(), other);
         assert_eq!(kinds(&seen), [4, 5]);
+    }
+
+    /// Reviewer B's B1 on PR #172: an arm that arms nothing says why, so a consumer never loses
+    /// a timer (a force-close escalation, a resume hold) without knowing: once the inputs have
+    /// ended, and for a delay past the end of the clock.
+    #[tokio::test(start_paused = true)]
+    async fn an_arm_that_arms_nothing_is_refused_by_name() {
+        let (timers, seen) = (ConsumerTimers::new(), Seen::default());
+        let (mut inputs, sender) = inputs(1, &timers, &seen);
+        let past = timers.arm(Duration::MAX, TrafficClass::Normal, 1, Vec::new());
+        assert_eq!(past, Err(ArmRefusal::PastClock));
+        drop(sender);
+        inputs.run().await;
+        let ended = timers.arm(Duration::ZERO, TrafficClass::Safety, 2, Vec::new());
+        assert_eq!(ended, Err(ArmRefusal::Ended));
+        assert_eq!(
+            (timers.arms(), timers.not_armed(), timers.pending()),
+            (2, 2, 0)
+        );
+        assert_eq!(
+            ArmRefusal::Ended.to_string(),
+            "the inputs that fire these timers have ended"
+        );
+        assert_eq!(
+            ArmRefusal::PastClock.to_string(),
+            "the timer's delay lies past the end of the clock"
+        );
+    }
+
+    /// Reviewer B's B1 on PR #172: a shard restarted with new inputs on the timers its handlers
+    /// hold fires them again, and the ended inputs, dropped later, end nothing of the new.
+    #[tokio::test(start_paused = true)]
+    async fn new_inputs_on_the_timers_of_ended_ones_fire_them_again() {
+        let (timers, seen) = (ConsumerTimers::new(), Seen::default());
+        let (mut first, sender) = inputs(1, &timers, &seen);
+        drop(sender);
+        first.run().await;
+        let (mut second, sender) = inputs(1, &timers, &seen);
+        drop(first);
+        timers
+            .arm(Duration::from_secs(1), TrafficClass::Normal, 3, Vec::new())
+            .unwrap();
+        drop(sender);
+        second.run().await;
+        assert_eq!(kinds(&seen), [3]);
+        assert_eq!(second.counters().fired, 1);
+    }
+
+    /// Two inputs never fire one set of timers: new inputs on timers whose inputs have not ended
+    /// are refused by name, and once those are dropped unrun the timers are free again.
+    #[test]
+    fn timers_other_inputs_still_fire_are_refused_by_name() {
+        let (timers, seen) = (ConsumerTimers::new(), Seen::default());
+        let (first, _sender) = inputs(1, &timers, &seen);
+        let config = ConsumerInputsConfig {
+            clock: IngestClock::new(),
+            capacity: 1,
+            timers: timers.clone(),
+        };
+        let e = ConsumerInputs::new(config, |_: ConsumerInput| {}).unwrap_err();
+        assert_eq!(e, InputsError::TimersInUse);
+        assert_eq!(
+            e.to_string(),
+            "the consumer's timers are fired by other inputs that have not ended"
+        );
+        drop(first);
+        let config = ConsumerInputsConfig {
+            clock: IngestClock::new(),
+            capacity: 1,
+            timers: timers.clone(),
+        };
+        assert!(ConsumerInputs::new(config, |_: ConsumerInput| {}).is_ok());
+    }
+
+    /// Reviewer B's B2 on PR #172: inputs that ended stay ended. What the ring held when they
+    /// ended is counted and never handed on, and a second run, as a consumer re-running its
+    /// shard on them would make, returns at once handing nothing, even once new inputs have
+    /// taken the timers.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_run_hands_on_nothing_and_what_the_ring_held_is_counted() {
+        let (timers, seen) = (ConsumerTimers::new(), Seen::default());
+        let (mut inputs, sender) = inputs(2, &timers, &seen);
+        sender
+            .push(TrafficClass::Safety, 1, b"Start".to_vec())
+            .unwrap();
+        drop(inputs.run());
+        assert_eq!(inputs.counters().unhandled, 1);
+        assert_eq!(
+            sender.push(TrafficClass::Safety, 2, b"Stop".to_vec()),
+            Err(InputRefusal::Closed)
+        );
+        let (_fresh, _fresh_sender) = self::inputs(1, &timers, &seen);
+        timers
+            .arm(Duration::ZERO, TrafficClass::Normal, 3, Vec::new())
+            .unwrap();
+        assert_eq!(inputs.run().now_or_never(), Some(()));
+        assert!(seen.borrow().is_empty());
+        assert_eq!(timers.pending(), 1);
+        assert_eq!(
+            inputs.counters(),
+            InputCounters {
+                pushed: 0,
+                fired: 0,
+                unhandled: 1
+            }
+        );
     }
 }
