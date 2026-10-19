@@ -839,6 +839,10 @@ pub fn session_config(
         limiter,
         write_stall: WriteStall::new(Duration::from_secs(10)).expect("a non-zero window"),
         http_max_body: 1 << 20,
+        outbound: fbc_runtime::ReservedBound::new(16, 16).expect("a valid bound"),
+        in_flight: fbc_runtime::InFlight::new(
+            fbc_runtime::ReservedBound::new(16, 16).expect("a valid bound"),
+        ),
     })
 }
 

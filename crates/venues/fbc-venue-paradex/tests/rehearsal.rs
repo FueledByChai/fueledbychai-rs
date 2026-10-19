@@ -300,6 +300,8 @@ fn wire(stub: &Stub, reg: Registry) -> Wired {
         limiter: RateLimiter::new(&caps.limits, SafetyReserve::percent(10).unwrap()).unwrap(),
         write_stall: WriteStall::new(Duration::from_secs(10)).unwrap(),
         http_max_body: 1 << 20,
+        outbound: fbc_runtime::ReservedBound::new(64, 64).unwrap(),
+        in_flight: fbc_runtime::InFlight::new(fbc_runtime::ReservedBound::new(64, 64).unwrap()),
     };
     let (mut session, control) =
         ExecSession::new(session_cfg, GlueHandler(Rc::clone(&glue))).unwrap();

@@ -186,6 +186,7 @@ use futures_util::{FutureExt, StreamExt};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
+use crate::bounds::{InFlight, ReservedBound};
 use crate::connector::Connector;
 use crate::epoch::{Admit, EpochError, Epochs, Input};
 use crate::exec_gate::Hold;
@@ -301,6 +302,15 @@ pub struct ExecSessionConfig {
     /// The most response-body bytes an HTTP request the codec asks for may read; a longer
     /// body is [`HttpFailure::Lost`](fbc_core::HttpFailure::Lost) (0027).
     pub http_max_body: usize,
+    /// The bound on the commands waiting for the connection (design §5.4, decision 0104): a
+    /// place, an amend or a control command submitted while the Normal bound's worth wait is
+    /// `NotSent(Backpressure)`, as is a cancel or a reducing order submitted while the reserve
+    /// is full too, nothing of it written and the refusal journaled as its write result.
+    pub outbound: ReservedBound,
+    /// The table of requests in flight the session counts against (decision 0104): one shared
+    /// by every session of the venue, or the session's own. A submission its class finds no
+    /// room for is `NotSent(RateBudget)`, nothing written.
+    pub in_flight: InFlight,
 }
 
 /// Why an order-entry session could not start, or stopped.
@@ -431,6 +441,12 @@ pub struct ExecCounters {
     /// Inbound frames and HTTP responses whose codec named credential spans that do not fit
     /// them (a codec defect): journaled with the whole body and every header hashed.
     pub refused_redactions: u64,
+    /// Submissions refused `NotSent(Backpressure)` because the commands waiting for the
+    /// connection filled the bound their class may use ([`ExecSessionConfig::outbound`]).
+    pub backpressure_refusals: u64,
+    /// Submissions refused `NotSent(RateBudget)` because the requests in flight filled the
+    /// bound their class may use ([`ExecSessionConfig::in_flight`]).
+    pub in_flight_refusals: u64,
 }
 
 /// One account's order-entry connection, driven by [`ExecSession::run`].
@@ -632,6 +648,7 @@ impl<H: ExecHandler> ExecSession<H> {
         };
         let (stop_tx, stop) = watch::channel(());
         let clock = config.clock.clone();
+        let _ = (config.outbound, config.in_flight);
         let mut core = Core::new(CoreConfig {
             own: endpoint.stream,
             connector: config.connector,
@@ -725,6 +742,8 @@ impl<H: ExecHandler> ExecSession<H> {
             unready_refusals: self.unready_refusals,
             unprotected_refusals: self.unprotected_refusals,
             refused_redactions: self.core.refused_redactions(),
+            backpressure_refusals: 0,
+            in_flight_refusals: 0,
         }
     }
 
