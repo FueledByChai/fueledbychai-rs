@@ -120,9 +120,12 @@ pub(crate) struct Shared {
     /// Where request ids are given from.
     ids: RpcIds,
     queue: RefCell<VecDeque<Queued>>,
-    /// What still waited when the session ended, never to be sent: kept so the shard host can
-    /// take back a ladder command of its own (decision 0100).
-    left: RefCell<Vec<Queued>>,
+    /// The request the shard host submitted from its ladder and may take back ([`Shared::keep`]).
+    kept: Cell<Option<RpcId>>,
+    /// That request, never to be sent, when it still waited as the session ended or was popped
+    /// and never encoded: kept so the host can take it back (decision 0100). No other command
+    /// is kept once the session ends (Codex P2 r4309350878 on PR #164).
+    left: RefCell<Option<Queued>>,
     /// Wakes the session when a command is submitted.
     pub(crate) wake: Notify,
     /// The epoch whose stream the codec reported authenticated, while it lasts.
@@ -156,6 +159,7 @@ impl Shared {
             acct,
             ids,
             queue: RefCell::default(),
+            kept: Cell::new(None),
             left: RefCell::default(),
             wake: Notify::new(),
             ready: Cell::new(None),
@@ -218,21 +222,35 @@ impl Shared {
     }
 
     /// Takes back the command submitted as request `rpc` while it still waits for the session's
-    /// turn, or was left waiting when the session ended: nothing of it reached the codec
-    /// (decision 0100; Codex P1 r4309207253 on PR #164).
+    /// turn, or, when it is the request [kept](Shared::keep), was left waiting when the session
+    /// ended or popped and never encoded: nothing of it reached the codec (decision 0100; Codex
+    /// P1 r4309207253, r4309350872 on PR #164).
     pub(crate) fn withdraw(&self, rpc: RpcId) -> Option<Submitted> {
         let mut queue = self.queue.borrow_mut();
         if let Some(at) = queue.iter().position(|queued| queued.rpc == rpc) {
             return queue.remove(at).map(|queued| queued.item);
         }
         let mut left = self.left.borrow_mut();
-        let at = left.iter().position(|queued| queued.rpc == rpc)?;
-        Some(left.swap_remove(at).item)
+        let found = left.as_ref().is_some_and(|queued| queued.rpc == rpc);
+        found
+            .then(|| left.take())
+            .flatten()
+            .map(|queued| queued.item)
     }
 
-    /// Keeps `queued`, popped and never encoded, for withdrawal (stub).
+    /// Request `rpc` is the shard host's to take back should the session end before encoding it
+    /// ([`Shared::withdraw`]); it replaces the request kept before, which the host is done with.
+    pub(crate) fn keep(&self, rpc: RpcId) {
+        self.kept.set(Some(rpc));
+    }
+
+    /// Keeps `queued`, popped and never encoded or reported because the session failed first,
+    /// for withdrawal when it is the request [kept](Shared::keep); any other is dropped, as
+    /// decision 0057 has it (Codex P1 r4309350872 on PR #164).
     pub(crate) fn unsent(&self, queued: Queued) {
-        let _ = queued;
+        if self.kept.get() == Some(queued.rpc) {
+            *self.left.borrow_mut() = Some(queued);
+        }
     }
 
     /// The shard clock, which names the input whose events are being handed on.
@@ -249,13 +267,17 @@ impl Shared {
         self.ready.set(epoch);
     }
 
-    /// The session has run or dropped: no more commands, and none still waiting is sent; those
-    /// are kept only for [`Shared::withdraw`].
+    /// The session has run or dropped, or its run was dropped: no more commands, none still
+    /// waiting is sent, and none is in progress; of those waiting only the request
+    /// [kept](Shared::keep) is kept, for [`Shared::withdraw`].
     pub(crate) fn end(&self) {
         self.ended.set(true);
         self.ready.set(None);
+        self.sending.set(false);
         let unsent = std::mem::take(&mut *self.queue.borrow_mut());
-        self.left.borrow_mut().extend(unsent);
+        for queued in unsent {
+            self.unsent(queued);
+        }
     }
 }
 
@@ -296,9 +318,14 @@ impl ExecOrders {
         self.shared.ended.get()
     }
 
-    /// Keeps request `rpc` for withdrawal (stub).
+    /// Keeps request `rpc` for withdrawal ([`Shared::keep`]).
     pub(crate) fn keep(&self, rpc: RpcId) {
-        let _ = rpc;
+        self.shared.keep(rpc);
+    }
+
+    /// The session's run was dropped, so it never sends what waits ([`Shared::end`]).
+    pub(crate) fn end(&self) {
+        self.shared.end();
     }
 
     /// Takes back request `rpc` while it still waits for the session's turn ([`Shared::withdraw`]).
