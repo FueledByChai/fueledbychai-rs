@@ -9,14 +9,19 @@
 //! position, and the last of those replies is what fbc-oms is compared with at the end.
 //!
 //! Each of the 341 connections opens alike: the authentication acknowledged, the session's
-//! cancel-on-disconnect arm accepted, and a resync stating the venue's book. From the second
-//! connection on (the owner's Start follows the first resync), the moment the epoch
-//! authenticates, before the arm is answered, the consumer submits a place and, where the last
-//! epoch left an order resting that fbc-oms may amend, an amend of it: the session refuses both
-//! `NotSent(Disconnected)` with nothing written. The order the last epoch left resting
-//! survives the stub's close (a server close, which 0080 says the venue's cancel-on-disconnect
-//! may not cover), so the resync shows it, the session tells the consumer it is unprotected, and
-//! the consumer cancels it before the epoch places. Then each epoch does one thing, in a cycle
+//! cancel-on-disconnect arm accepted, and a resync stating the venue's book. On the even
+//! connections the arm is answered first; on the odd ones the stub holds the arm's answer and
+//! sends it after the resync's end, so each of the two settles first on some epoch. From the
+//! second connection on (the owner's Start follows the first resync), the consumer submits a
+//! place and, where the last epoch left an order resting that fbc-oms may amend, an amend of it
+//! twice before the epoch is ready: the moment it authenticates, with neither settled, and the
+//! moment the first of the arm's acceptance and the resync's end reaches it, with the other
+//! still pending. The session refuses each `NotSent(Disconnected)` with nothing written, so a
+//! gate that waited for only one of the two would write the second pair (Reviewer A RA-e5p-1,
+//! Reviewer B RB-e5p-2 on PR #166). The order the last epoch left resting survives the stub's
+//! close (a server close, which 0080 says the venue's cancel-on-disconnect may not cover), so
+//! the resync shows it, the session tells the consumer it is unprotected, and the consumer
+//! cancels it before the epoch places. Then each epoch does one thing, in a cycle
 //! of five, and the stub closes the connection:
 //!
 //! - a place, accepted and resting;
@@ -31,8 +36,11 @@
 //! before left (the amended one) goes out and is left unanswered: the order still rests, as
 //! the last resync says, and its market is held. Reconnects are paced at a 6 s floor and five
 //! attempts per 60 s, so every unanswered request's 5 s deadline passes while the session
-//! waits, and the clock moves only there: the test moves it to each next attempt the pacing
-//! allows once the epoch has ended, and nothing else moves it.
+//! waits, and the clock moves only there: once the epoch has ended the test moves it to one
+//! tick (1 ms) before the next attempt the pacing allows, shows no attempt has started there,
+//! then moves it the last tick; nothing else moves it. A pacer that would reconnect any sooner
+//! fires inside the first move, so its connection is seen before the last tick (Reviewer B
+//! RB-e5p-1 on PR #166).
 
 mod order_entry;
 
@@ -81,6 +89,9 @@ const FILLED: i64 = 5;
 const CAP: i64 = 1_000;
 /// How long, by the wall clock, a wait lasts before the test fails.
 const WATCHDOG: Duration = Duration::from_secs(60);
+/// The paused clock's timer resolution: the clock is first moved this short of each attempt the
+/// pacing allows.
+const TICK: Duration = Duration::from_millis(1);
 
 fn secs(n: u64) -> Duration {
     Duration::from_secs(n)
@@ -130,6 +141,12 @@ fn kind(e: usize) -> Kind {
     }
 }
 
+/// Whether epoch `e`'s resync ends before its arm is accepted: on the odd epochs, so each of
+/// the two settles first on some epoch of every kind.
+fn resync_first(e: usize) -> bool {
+    e % 2 == 1
+}
+
 /// Whether an order of ours rests at the venue as epoch `e` opens: the one epoch `e - 1` left.
 fn rests_into(e: usize) -> bool {
     e > 0 && kind(e - 1) != Kind::LostInFlight
@@ -163,6 +180,9 @@ struct Venue {
     vids: u64,
     /// What the last resync reply stated.
     last_stated: Option<Stated>,
+    /// The request id of an arm the stub has read and holds its answer to, for the resync's
+    /// reply to answer after its end.
+    held_arm: Option<String>,
 }
 
 impl Venue {
@@ -215,8 +235,21 @@ fn resync(book: &Book) -> Responder {
         }
         out.push(format!("rspos|sym={SYMBOL_A}|qty={}", v.now.position));
         out.push("rsend".into());
+        // An arm held until now is answered after the resync's end.
+        if let Some(rpc) = v.held_arm.take() {
+            out.push(format!("item|rpc={rpc}|i=0|res=ok"));
+        }
         v.last_stated = Some(v.now.clone());
         Ok(out)
+    })
+}
+
+/// The arm read and its answer held for the resync's reply, which sends it after its end.
+fn held_arm(book: &Book) -> Responder {
+    let book = book.clone();
+    answer("cod", move |r| {
+        lock(&book).held_arm = Some(field(r, "rpc")?);
+        Ok(Vec::new())
     })
 }
 
@@ -339,7 +372,10 @@ fn storm(book: &Book) -> Storm {
     for e in 0..=LAST {
         s.steps.push(Step::Accept);
         s.respond(e, auth.clone());
-        s.respond(e, arm.clone());
+        match resync_first(e) {
+            true => s.respond(e, held_arm(book)),
+            false => s.respond(e, arm.clone()),
+        }
         s.respond(e, resync(book));
         s.barrier(e);
         if rests_into(e) {
@@ -402,6 +438,16 @@ enum Mark {
     NotSent(Op, RpcId, NotSentReason),
 }
 
+/// When an early submission was made: before the epoch was ready to place.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Probe {
+    /// As the epoch authenticated, the arm unanswered and the resync not asked.
+    Authenticated,
+    /// As the first of the arm's acceptance and the resync's end reached the glue, the other
+    /// still pending.
+    Settling,
+}
+
 /// A submission: the order and the command.
 #[derive(Copy, Clone, Debug)]
 struct Sub {
@@ -433,8 +479,10 @@ struct State {
     lost: Vec<ClientOrderId>,
     /// Every order the scenario placed, in order (not the early ones).
     placed: Vec<ClientOrderId>,
-    /// Every early submission: its request and command.
-    early: Vec<(RpcId, Op)>,
+    /// Every early submission: its request, command and when it was made.
+    early: Vec<(RpcId, Op, Probe)>,
+    /// How many of the arm's acceptance and the resync's end the epoch has seen.
+    settled: usize,
     /// The orders the session reported unprotected, by epoch.
     told: Vec<(u32, Vec<ClientOrderId>)>,
 }
@@ -445,18 +493,44 @@ impl State {
     }
 
     /// Authorizes `cmd` and submits it to the session.
-    fn submit(&mut self, cid: ClientOrderId, op: Op, cmd: PermittedCommand, early: bool) -> RpcId {
+    fn submit(
+        &mut self,
+        cid: ClientOrderId,
+        op: Op,
+        cmd: PermittedCommand,
+        early: Option<Probe>,
+    ) -> RpcId {
         let auth = self.reg.authorize(ACCT, cmd).unwrap();
         let rpc = self.orders.as_ref().unwrap().submit(auth).unwrap();
         self.sent.insert(rpc, Sub { cid, op });
-        if early {
-            self.early.push((rpc, op));
+        if let Some(at) = early {
+            self.early.push((rpc, op, at));
         }
         rpc
     }
 
+    /// Once the owner's Start was given, a place and an amend of the order the last epoch left
+    /// (where the registry may amend it), submitted before the epoch is ready, at `at`.
+    fn probe(&mut self, at: Probe) {
+        if self.started {
+            if let Some(&cid) = self.placed.last() {
+                self.amend(cid, EARLY_PX, Some(at));
+            }
+            self.place(Some(at));
+        }
+    }
+
+    /// The arm's acceptance or the resync's end reached the glue: the first of the two is
+    /// probed, the other still pending.
+    fn settled(&mut self) {
+        self.settled += 1;
+        if self.settled == 1 {
+            self.probe(Probe::Settling);
+        }
+    }
+
     /// The place, built and authorized by the registry, submitted.
-    fn place(&mut self, early: bool) -> ClientOrderId {
+    fn place(&mut self, early: Option<Probe>) -> ClientOrderId {
         let cid = self.mint.mint().unwrap();
         let cmd = self.reg.place(buy(cid)).unwrap();
         self.submit(cid, Op::Place, cmd, early);
@@ -465,7 +539,7 @@ impl State {
 
     /// The amend of `cid` to `px`, built and authorized by the registry and submitted; `None`
     /// where the registry gives the order no amend permit.
-    fn amend(&mut self, cid: ClientOrderId, px: i64, early: bool) -> Option<RpcId> {
+    fn amend(&mut self, cid: ClientOrderId, px: i64, early: Option<Probe>) -> Option<RpcId> {
         let qty = Lots::new(QTY).unwrap();
         let live = self.reg.live(cid).ok()?;
         let cmd = live.amend(&self.caps, Ticks(px), qty, false).unwrap();
@@ -487,15 +561,10 @@ impl State {
                 ..
             } => {
                 self.authenticated_at = Some(now);
+                self.settled = 0;
                 self.mark(Mark::Authenticated);
-                // Before the arm is answered: a place, and an amend of the order the last
-                // epoch left where the registry may amend it.
-                if self.started {
-                    if let Some(&cid) = self.placed.last() {
-                        self.amend(cid, EARLY_PX, true);
-                    }
-                    self.place(true);
-                }
+                // Before the arm is answered or the resync asked.
+                self.probe(Probe::Authenticated);
             }
             ExecEvent::ResyncBegin { watermark } => {
                 self.collecting = Some(ResyncSnapshot {
@@ -518,6 +587,7 @@ impl State {
                 self.lost.extend(report.ladder.lost);
                 self.resynced += 1;
                 self.mark(Mark::ResyncApplied);
+                self.settled();
             }
             ExecEvent::Outcome { rpc, item, outcome } => match self.sent.get(&rpc).copied() {
                 Some(sub) => {
@@ -538,6 +608,7 @@ impl State {
                     };
                     assert_eq!(outcome, accepted, "the arm's outcome");
                     self.mark(Mark::ArmAccepted(rpc));
+                    self.settled();
                 }
             },
             ExecEvent::Order(u) => {
@@ -618,7 +689,7 @@ impl State {
             let CancelChoice::Send(cmd) = permit.cancel(&caps) else {
                 panic!("the registry holds {cid:?} ended");
             };
-            self.submit(cid, Op::Cancel, cmd, false);
+            self.submit(cid, Op::Cancel, cmd, None);
             told.push(cid);
         }
         self.told.push((self.epoch, told));
@@ -697,14 +768,40 @@ impl Run<'_> {
 
     fn place(&mut self) -> ClientOrderId {
         let mut st = self.st.borrow_mut();
-        let cid = st.place(false);
+        let cid = st.place(None);
         st.placed.push(cid);
         cid
     }
 
     fn amend(&mut self, cid: ClientOrderId) {
-        let sent = self.st.borrow_mut().amend(cid, AMENDED_PX, false);
+        let sent = self.st.borrow_mut().amend(cid, AMENDED_PX, None);
         assert!(sent.is_some(), "no amend permit for {cid:?}");
+    }
+}
+
+/// A loopback listener of the test's own, outside the stub: a connection to it, written after
+/// any connect the session started, is accepted once the runtime has polled the listeners the
+/// kernel had queued connections for by then, the stub's included.
+struct Settle(tokio::net::TcpListener);
+
+impl Settle {
+    async fn new() -> Settle {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0));
+        Settle(listener.await.unwrap())
+    }
+
+    /// A connection to the listener, written and accepted; then one yield, so a task the same
+    /// poll woke (the stub's accept) has run. It first yields once: the session runs in the
+    /// same task as the scenario (`tokio::join!`), which polls it as the scenario waits, so a
+    /// pacer timer the last move fired has started its connect before this one is written.
+    async fn round_trip(&self) {
+        tokio::task::yield_now().await;
+        let addr = self.0.local_addr().unwrap();
+        let (written, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(addr), self.0.accept());
+        written.unwrap();
+        accepted.unwrap();
+        tokio::task::yield_now().await;
     }
 }
 
@@ -767,6 +864,7 @@ fn play_storm() -> Played {
         lost: Vec::new(),
         placed: Vec::new(),
         early: Vec::new(),
+        settled: 0,
         told: Vec::new(),
     }));
     let book = Book::default();
@@ -802,6 +900,7 @@ fn play_storm() -> Played {
         };
         let (mut session, control) = ExecSession::new(config, Glue(st.clone())).unwrap();
         st.borrow_mut().orders = Some(session.orders());
+        let settle = Settle::new().await;
         let mut run = Run {
             st: st.clone(),
             orders: session.orders(),
@@ -841,8 +940,23 @@ fn play_storm() -> Played {
                     let first = server.connections()[0].accepted_at;
                     let next = first + start_of(e + 1);
                     let now = tokio::time::Instant::now();
-                    assert!(next > now, "epoch {e}: the next attempt is due at once");
-                    tokio::time::advance(next - now).await;
+                    assert!(
+                        next > now + TICK,
+                        "epoch {e}: the next attempt is due at once"
+                    );
+                    // One tick short of the attempt the pacing allows: a pacer due any sooner
+                    // fires in this move and starts its connect before `advance` returns; the
+                    // loopback round trip, written after it, is accepted only once the stub's
+                    // listener has had its connection, so it is counted here (RB-e5p-1).
+                    tokio::time::advance(next - TICK - now).await;
+                    settle.round_trip().await;
+                    let conns = server.connections().len();
+                    assert_eq!(
+                        conns,
+                        e + 1,
+                        "epoch {e}: an attempt before the pacing allows"
+                    );
+                    tokio::time::advance(TICK).await;
                 }
             }
             run.until("played to its end", |r| r.server.played() >= end)
@@ -985,8 +1099,10 @@ fn the_340_reconnect_storm_resends_nothing_and_arms_and_resyncs_before_every_ord
     assert_eq!(cancelled.len(), rests);
 
     // On every epoch the arm was accepted, under the request the stub read, and the resync
-    // applied, each once, before any place or amend was written; the place and the amend
-    // submitted the moment the epoch authenticated were refused, nothing written.
+    // applied, each once and in the order the script answered them, before any place or amend
+    // was written. The place and the amend submitted as the epoch authenticated, and again as
+    // the first of the two settled with the other pending, were refused, nothing written.
+    let mut early = 0;
     for (e, conn) in p.conns.iter().enumerate() {
         let of_epoch: Vec<Mark> = marks
             .iter()
@@ -1008,30 +1124,41 @@ fn the_340_reconnect_storm_resends_nothing_and_arms_and_resyncs_before_every_ord
         assert_eq!(authenticated.len(), 1, "epoch {e}: {of_epoch:?}");
         assert_eq!(armed.len(), 1, "epoch {e}: {of_epoch:?}");
         assert_eq!(resynced.len(), 1, "epoch {e}: {of_epoch:?}");
-        let ready = armed[0].max(resynced[0]);
+        let (armed, resynced) = (armed[0], resynced[0]);
+        assert_eq!(resynced < armed, resync_first(e), "epoch {e}: {of_epoch:?}");
+        let (first, ready) = (armed.min(resynced), armed.max(resynced));
         let adds = at(&|m| matches!(m, Mark::Written(op, _) if op.adds()));
         assert!(adds.iter().all(|&i| i > ready), "epoch {e}: {of_epoch:?}");
         let refused = at(&|m| matches!(m, Mark::NotSent(..)));
-        assert!(
-            refused
-                .iter()
-                .all(|&i| authenticated[0] < i && i < armed[0]),
+        let between = |lo: usize, hi: usize| refused.iter().filter(|&&i| lo < i && i < hi).count();
+        // From epoch 1 (after the owner's Start) a place each time, and an amend where the last
+        // epoch left an order the registry may amend: one resting, not one Unknown the resync
+        // has yet to resolve.
+        let started = usize::from(e > 0);
+        let resting =
+            e > 0 && matches!(kind(e - 1), Kind::Rests | Kind::PartFilled | Kind::Amended);
+        let resolved = resync_first(e) && rests_into(e);
+        let at_auth = started + usize::from(resting);
+        let settling = started + usize::from(resting || resolved);
+        assert_eq!(
+            between(authenticated[0], first),
+            at_auth,
             "epoch {e}: {of_epoch:?}"
         );
-        // From epoch 1 (after the owner's Start) a place, and an amend where the last epoch
-        // left an order the registry may amend.
-        let amendable =
-            e > 0 && matches!(kind(e - 1), Kind::Rests | Kind::PartFilled | Kind::Amended);
-        let early = usize::from(e > 0) + usize::from(amendable);
-        assert_eq!(refused.len(), early, "epoch {e}: {of_epoch:?}");
+        assert_eq!(between(first, ready), settling, "epoch {e}: {of_epoch:?}");
+        assert_eq!(refused.len(), at_auth + settling, "epoch {e}: {of_epoch:?}");
+        early += at_auth + settling;
     }
-    let early_rpcs: HashSet<RpcId> = p.st.early.iter().map(|(rpc, _)| *rpc).collect();
-    for (rpc, op) in &p.st.early {
+    let early_rpcs: HashSet<RpcId> = p.st.early.iter().map(|(rpc, ..)| *rpc).collect();
+    for (rpc, op, _) in &p.st.early {
         let refused = Mark::NotSent(*op, *rpc, NotSentReason::Disconnected);
         assert!(marks.iter().any(|(_, m)| *m == refused), "{rpc:?} {op:?}");
     }
     assert!(rpcs.is_disjoint(&early_rpcs));
-    assert_eq!(p.st.early.len(), LAST + 3 * LAST / 5);
+    assert_eq!(p.st.early.len(), early);
+    let probes = |at: Probe| p.st.early.iter().filter(|(.., t)| *t == at).count();
+    assert_eq!(probes(Probe::Authenticated), LAST + 3 * LAST / 5);
+    assert_eq!(probes(Probe::Settling), LAST + 3 * LAST / 5 + LAST / 10);
     assert_eq!(c.unready_refusals, p.st.early.len() as u64);
 
     // Every resync agreed with the inventory, and each order the venue never got was Lost.
@@ -1068,7 +1195,7 @@ fn the_340_reconnect_storm_resends_nothing_and_arms_and_resyncs_before_every_ord
         assert_eq!(p.st.reg.get(cid).unwrap().state(), want, "epoch {e}");
     }
     let disconnected = OrdState::Terminal(TerminalKind::NotSent(NotSentReason::Disconnected));
-    for (rpc, op) in &p.st.early {
+    for (rpc, op, _) in &p.st.early {
         if *op == Op::Place {
             let cid = p.st.sent[rpc].cid;
             assert_eq!(p.st.reg.get(cid).unwrap().state(), disconnected);
