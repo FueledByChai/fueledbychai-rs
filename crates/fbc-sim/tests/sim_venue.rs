@@ -38,6 +38,9 @@
 //! has passed; a risk reject the consumer configures inside the window ends the order
 //! Rejected, with an asynchronous reject of the placement and no final acceptance; and a
 //! single-phase venue's placement is answered Final as before, with nothing after it.
+//!
+//! FBC-2zxk adds a two-phase venue's amend, sent and answered provisionally, then settled by
+//! the amended order's event (decision 0100); its done line is tests/paradex_stand_in.rs.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
@@ -5605,19 +5608,106 @@ fn a_second_phase_answered_after_a_reconnect_settles_nothing_but_the_order() {
 }
 
 #[test]
-fn the_codec_places_for_a_two_phase_venue_but_sends_no_amend() {
-    // The engine models a two-phase venue's placements; its amends, which such a venue may also
-    // settle in two phases, are refused rather than answered final (FBC-kbwj).
+fn a_two_phase_venues_amend_is_answered_provisionally_and_settled_by_its_amended_event() {
+    // FBC-2zxk: a two-phase venue's amend is sent, answered provisionally (as Paradex's
+    // order.modify reply is), and settled by the amended order's event that follows it at the
+    // same instant, with no second phase of its own.
     let mut v = two_phase_rich();
-    v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+    v.snapshot(T0, &[(199, 5), (198, 4)], &[(201, 5)]);
     let order = cid();
     let vid = v.rest(limit(order, Side::Buy, 199, 2), 1, T0);
-    let change = VenueCommand::Amend(amend(OrderRef::Both(order, vid), Side::Buy, 198, 2, 0));
+    let change = VenueCommand::Amend(amend(
+        OrderRef::Both(order, vid.clone()),
+        Side::Buy,
+        198,
+        3,
+        0,
+    ));
+    v.send(change, 2, T0 + 10 * MS);
+    v.tick(T0 + 15 * MS);
+    let got = v.events();
+    assert_eq!(got.len(), 2, "{got:?}");
+    let due = MonoNs(T0 + 15 * MS) + TO_CLIENT;
+    assert!(got.iter().all(|(at, _)| *at == due), "{got:?}");
     assert_eq!(
-        v.encode(&change, 2, T0 + 10 * MS).err(),
-        Some(NotSentReason::Unsupported)
+        placement_of(&got[0].1),
+        (2, 0, Some(order), Some(vid.clone()), PROVISIONAL)
     );
-    assert!(v.encode(&cancel(OrderRef::Client(order)), 3, T0).is_ok());
+    let amended = order_of(&got[1].1);
+    assert_eq!(
+        (amended.state.clone(), amended.vid.as_ref()),
+        (VenueOrderState::Amended { new_vid: None }, Some(&vid))
+    );
+    assert_eq!((amended.px, amended.qty), (Some(Ticks(198)), Some(lots(3))));
+    // The codec awaits no second phase of an amend: a final answer naming it reports nothing,
+    // so nothing is held for it on the connection.
+    let stray = format!("final|seq=99|ts=1|rpc=2|idx=0|cid=x|vid={}", vid.as_str());
+    assert!(v.decode(stray.as_bytes()).unwrap().is_empty());
+    // The placement's own second phase still comes, once its window has passed.
+    v.tick(T0 + 5 * MS + WINDOW);
+    let got = v.events();
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(outcome_of(&got[0].1), Some((1, ACCEPTED)));
+    // An amend the venue refuses is refused at once, as on a single-phase venue.
+    let none = VenueCommand::Amend(amend(OrderRef::Venue(vid.clone()), Side::Sell, 198, 3, 0));
+    v.send(none, 3, T0 + 6 * MS + WINDOW);
+    v.tick(T0 + 11 * MS + WINDOW);
+    let got = v.events();
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(
+        rejected(&got[0].1),
+        Some(RejectKind::NotAmendable(NotAmendable::Unsupported))
+    );
+    assert!(v.encode(&cancel(OrderRef::Client(order)), 4, T0).is_ok());
+}
+
+#[test]
+fn an_amend_of_a_placement_held_for_its_risk_check_is_refused_and_the_check_still_refuses_it() {
+    // A held placement never rests (decision 0099), so there is nothing to amend; it is
+    // refused as not amendable, never as unknown to the venue, and stays held for its check.
+    let mut v = two_phase_rich();
+    v.snapshot(T0, &[(199, 5), (198, 4)], &[(201, 5)]);
+    let order = cid();
+    v.engine
+        .risk_reject(order, Duration::from_millis(20), RiskRefusal::Margin)
+        .unwrap();
+    let vid = v.rest(limit(order, Side::Buy, 199, 2), 1, T0);
+    let change = VenueCommand::Amend(amend(
+        OrderRef::Both(order, vid.clone()),
+        Side::Buy,
+        198,
+        2,
+        0,
+    ));
+    v.send(change, 2, T0 + 6 * MS);
+    v.tick(T0 + 11 * MS);
+    let got = v.events();
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(
+        refusal(&got[0].1),
+        (
+            RejectKind::NotAmendable(NotAmendable::Unsupported),
+            "not_amendable".to_owned()
+        )
+    );
+    v.tick(T0 + 25 * MS);
+    let got = v.events();
+    assert_eq!(got.len(), 2, "{got:?}");
+    let (target, op, kind, _) = async_reject_of(&got[0].1);
+    assert_eq!(
+        (target, op, kind),
+        (
+            OrderRef::Both(order, vid),
+            OpKind::Place,
+            RejectKind::Margin
+        )
+    );
+    assert_eq!(
+        state_of(&got[1].1),
+        Some((rejected_state(RejectKind::Margin), 0))
+    );
+    let held = order_of(&got[1].1);
+    assert_eq!((held.px, held.qty), (Some(Ticks(199)), Some(lots(2))));
 }
 
 #[test]
