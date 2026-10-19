@@ -56,8 +56,10 @@ and how an orphan is held while its cancel is out (FBC-840, BT-402).
    A trustworthy resync forgets the live sightings. An order of ours the registry holds as
    ended Lost (the Unknown ladder ended it on snapshots that lagged it past the settle, 0094's
    up to 3480 ms) that a trustworthy, non-stale snapshot shows open, under a venue id no other
-   order of ours holds, is an orphan too: it is in `untracked` and registered again from the
-   snapshot with the fills counted on it, so it counts on both caps, suppresses the adding side
+   order of ours holds and no amend of it replaced, is an orphan too: it is in `untracked` and
+   registered again from the snapshot with the fills counted on it and the venue ids an amend
+   replaced (Codex's r4315681141: a delayed update naming only a replaced id would otherwise
+   end it), so it counts on both caps, suppresses the adding side
    and is cancelled like any other (Reviewer B's RB840-8 on PR #171: held as ended, it counted
    on neither cap and nothing cancelled it). Its fills were routed to it while it was held, so
    none moves the inventory again. A source that is not trustworthy confirms none: a live event

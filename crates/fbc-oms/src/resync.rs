@@ -643,9 +643,10 @@ impl Registry {
             }
             let mut rec = OrderRecord::seeded_from(*cid, o, snap.requested_at, snap.watermark);
             if let Some(ended) = self.orders.get(cid) {
-                // Ended Lost, its fills were counted on it and on the inventory already
-                // (Reviewer B's RB840-8 on PR #171).
-                rec.set_cum_fills(ended.cum_fills());
+                // Ended Lost: its fills were counted on it and on the inventory already, and
+                // the ids an amend replaced stay replaced (Reviewer B's RB840-8, Codex's
+                // r4315681141 on PR #171).
+                rec.carry_over(ended);
             }
             self.orders.insert(*cid, rec);
             let u = update_of(o);
@@ -687,14 +688,15 @@ impl Registry {
     /// Whether `o`, a snapshot order under our client id `cid`, shows open an order the registry
     /// holds as ended Lost (Reviewer B's RB840-8 on PR #171): the Unknown ladder ended it on
     /// snapshots that lagged it, so it rests at the venue while it counts on neither cap. Only
-    /// one whose venue id names no other order of ours is one; it is an orphan like any other.
+    /// one whose venue id names no other order of ours, and is no id an amend of it replaced
+    /// (Codex's r4315681141 on PR #171), is one; it is an orphan like any other.
     fn lost_shown_open(&self, cid: ClientOrderId, o: &VenueOrderSnapshot) -> bool {
         o.state == VenueOrderState::Open
             && self.held_order(o) == Some(cid)
             && self
                 .orders
                 .get(&cid)
-                .is_some_and(|rec| is_lost(rec.state()))
+                .is_some_and(|rec| is_lost(rec.state()) && !rec.is_superseded(&o.vid))
     }
 
     /// The order of ours the registry holds that a snapshot order names: by our client id, or

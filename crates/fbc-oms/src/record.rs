@@ -407,6 +407,15 @@ impl OrderRecord {
         self.complete_if_covered();
     }
 
+    /// Takes on what `ended`, the record this one replaces as a resync registers it again
+    /// from its snapshot, counted and knew (Reviewer B's RB840-8, Codex's r4315681141 on PR
+    /// #171): the fills counted on it, which the inventory already holds, and the venue ids an
+    /// amend replaced, so a delayed update naming only one of them does not reach this order.
+    pub(crate) fn carry_over(&mut self, ended: &OrderRecord) {
+        self.replaced.clone_from(&ended.replaced);
+        self.set_cum_fills(ended.cum_fills());
+    }
+
     /// The consumer's opaque tag of the last place or amend the execution planner built for
     /// the order: its level's [`DesiredQuote::tag`](crate::DesiredQuote::tag) (decision 0098).
     /// `None` for an order the planner did not place. fbc-oms gives it no meaning
