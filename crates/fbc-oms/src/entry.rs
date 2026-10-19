@@ -105,7 +105,7 @@ impl MarketEntry {
     }
 
     /// How many times the market's armed flag or state changed, or an orphan cooldown began
-    /// suppressing its adding side or an orphan was registered on it (decision 0106).
+    /// suppressing its adding side or an orphan was registered on it (decision 0107).
     pub fn generation(&self) -> StateGeneration {
         self.generation
     }
@@ -545,7 +545,7 @@ impl Entries {
     }
 
     /// Advances `market`'s state generation without changing its state: an orphan cooldown
-    /// began suppressing its adding side, or an orphan was registered on it (decision 0106), so
+    /// began suppressing its adding side, or an orphan was registered on it (decision 0107), so
     /// a place or amend built before is refused at submit.
     pub(crate) fn touch(&mut self, market: InstrumentId) {
         self.generations.advance(market);

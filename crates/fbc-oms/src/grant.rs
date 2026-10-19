@@ -61,7 +61,7 @@ use crate::{CapRefusal, PermittedCommand, Registry};
 
 /// How many times a market's state has changed: the kill switch, an arming call, a disarm or
 /// any other move of its order-entry state (0012), or an orphan cooldown beginning to suppress
-/// its adding side or an orphan registered on it (decision 0106). An [`Authorization`] carries the value its market had when
+/// its adding side or an orphan registered on it (decision 0107). An [`Authorization`] carries the value its market had when
 /// its command was built.
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub struct StateGeneration(u64);
@@ -172,7 +172,7 @@ pub(crate) struct Guard {
     pub(crate) state: Option<Watch>,
     /// How many times the market's inventory moved, at build: a place, a batch or an amend
     /// built in Exit, which Exit sized against the position then (decision 0066), or while an
-    /// orphan cooldown suppressed the market's adding side, which sized it too (decision 0106).
+    /// orphan cooldown suppressed the market's adding side, which sized it too (decision 0107).
     pub(crate) position: Option<Watch>,
     /// How many times the registry's hold of the market's exclusive lease changed, at build:
     /// an instrument cancel-all.
@@ -221,7 +221,7 @@ pub enum IssueRefusal {
     Capped(CapRefusal),
     /// Judged again as it is authorized, the place, batch item or amend on `side` no longer
     /// reduces the known, non-zero position within its size while an orphan cooldown
-    /// suppresses the market's adding side (0005's I7, decision 0106): a fill or a resync moved
+    /// suppresses the market's adding side (0005's I7, decision 0107): a fill or a resync moved
     /// the position since its build, or the cooldown began since. What it reserved is released.
     OrphanCooldown { inst: InstrumentId, side: Side },
     /// The order `cid` no longer holds what the command's build reserved: it ended since, or,
@@ -300,7 +300,7 @@ pub enum StaleAuthorization {
     ExclusiveLeaseChanged(InstrumentId),
     /// A place, a batch or an amend built in Exit, which Exit sized against the market's
     /// position then (decision 0066), or while an orphan cooldown suppressed the market's
-    /// adding side, which sized it too (decision 0106), and a fill or a resync moved the
+    /// adding side, which sized it too (decision 0107), and a fill or a resync moved the
     /// market's inventory since: sent, it could take the position across zero.
     PositionMoved(InstrumentId),
 }
@@ -434,7 +434,7 @@ impl Authorization {
     /// ([`StaleAuthorization::StateChanged`]), and one built in Exit, or while an orphan
     /// cooldown suppressed its market's adding side, also once a fill or a resync moved its
     /// market's inventory since ([`StaleAuthorization::PositionMoved`], decisions 0066 and
-    /// 0106); an instrument cancel-all once the registry's
+    /// 0107); an instrument cancel-all once the registry's
     /// hold of its market's exclusive lease changed since
     /// ([`StaleAuthorization::ExclusiveLeaseChanged`]) or an order not ours was seen on its
     /// market since ([`StaleAuthorization::ForeignSeen`]), and not for any other change of
