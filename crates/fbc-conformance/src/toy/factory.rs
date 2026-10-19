@@ -238,3 +238,31 @@ impl VenueFactory for ToyFactory {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The schema the factory declares is each URL key it reads, in order, followed by that
+    /// URL's credential spans' key, every key account-scoped and of no unit, every spans' key
+    /// sharing one description: the pairs built here at run time from the same keys match it.
+    #[test]
+    fn the_schema_is_each_url_key_the_factory_reads_then_its_spans_key() {
+        let schema = ToyFactory.config_schema();
+        let keys = [EXEC_URL, MD_URL, ANCHOR_URL, REST_URL];
+        assert_eq!(schema.len(), 2 * keys.len());
+        for (pair, key) in schema.chunks(2).zip(keys) {
+            assert_eq!(pair, url_fields(key, pair[0].doc));
+            assert!(!pair[0].doc.is_empty(), "{pair:?}");
+        }
+        let spans_docs: BTreeSet<&str> = schema.iter().skip(1).step_by(2).map(|f| f.doc).collect();
+        assert_eq!(spans_docs.len(), 1, "{spans_docs:?}");
+        assert!(
+            schema
+                .iter()
+                .all(|f| f.scope == ConfigScope::Account && f.unit == FieldUnit::Dimensionless)
+        );
+        let keys: BTreeSet<&str> = schema.iter().map(|f| f.key).collect();
+        assert_eq!(keys.len(), schema.len(), "no key is declared twice");
+    }
+}

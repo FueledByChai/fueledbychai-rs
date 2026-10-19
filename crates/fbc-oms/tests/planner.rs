@@ -415,6 +415,38 @@ fn a_change_amends_where_the_venues_order_caps_allow_it() {
 }
 
 #[test]
+fn an_order_resting_at_price_zero_is_left_while_unmoved_and_amended_by_any_move() {
+    // A market that quotes through zero (a spread or a calendar): a move off a price of zero
+    // ticks has no measure in basis points of it, so any move is past the threshold, and an
+    // unmoved quote is still left as it is.
+    let mut reg = quoting(WIDE, 0);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = amending();
+    let opened = open_book(
+        &mut p,
+        &book().with(Side::Buy, 0, quote(0, 5)),
+        &mut reg,
+        &caps,
+        &mut mint,
+    );
+    let c = opened.commands[0].cid;
+    let unmoved = book().with(Side::Buy, 0, quote(0, 5));
+    let left = plan_and_send(&mut p, &unmoved, &mut reg, &caps, &mut mint, LATER);
+    assert!(left.commands.is_empty(), "{:?}", shape(&left));
+    assert!(left.held.is_empty() && left.refused.is_empty());
+    // One tick off zero, far under the 2 bps threshold at the tests' prices around 10 000.
+    let moved = book().with(Side::Buy, 0, quote(1, 5));
+    let plan = plan_and_send(&mut p, &moved, &mut reg, &caps, &mut mint, LATER);
+    assert_eq!(shape(&plan), vec![(Stage::Amend, "amend", Side::Buy, 0)]);
+    assert_eq!(plan.commands[0].cid, c);
+    match plan.commands[0].auth.command() {
+        VenueCommand::Amend(a) => assert_eq!((a.px, a.qty), (Ticks(1), lots(5))),
+        other => panic!("expected an amend, got {other:?}"),
+    }
+}
+
+#[test]
 fn a_change_the_venue_cannot_amend_is_a_cancel_then_a_place_once_the_old_order_is_terminal() {
     let no_price = OrderCaps {
         amend: amending().amend.map(|a| AmendCaps { price: false, ..a }),
