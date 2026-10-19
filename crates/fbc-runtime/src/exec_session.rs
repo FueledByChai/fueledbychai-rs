@@ -130,7 +130,7 @@
 //! dropped, and the query is handed to `on_rpc_timeout` once at its deadline, on a later epoch
 //! or while the session waits to reconnect, and never requested again (decision 0081).
 //!
-//! **Bounds with a Safety reserve (FBC-hwn, design §5.4, decision 0104).** The commands waiting
+//! **Bounds with a Safety reserve (FBC-hwn, design §5.4, decision 0105).** The commands waiting
 //! for the session's turn are bounded by the consumer's [`ExecSessionConfig::outbound`]: Normal
 //! traffic (a place, an amend, every control command) is taken while fewer than its Normal
 //! bound wait, Safety traffic (a cancel, a cancel-many, an instrument cancel-all, a reducing
@@ -323,13 +323,13 @@ pub struct ExecSessionConfig {
     /// The most response-body bytes an HTTP request the codec asks for may read; a longer
     /// body is [`HttpFailure::Lost`](fbc_core::HttpFailure::Lost) (0027).
     pub http_max_body: usize,
-    /// The bound on the commands waiting for the connection (design §5.4, decision 0104): a
+    /// The bound on the commands waiting for the connection (design §5.4, decision 0105): a
     /// place, an amend or a control command submitted while the Normal bound's worth wait is
     /// refused at once, `SubmitRefusal::Backpressure` (not sent, `NotSent(Backpressure)`), as is
     /// a cancel or a reducing order submitted while the reserve is full too, nothing of it kept
     /// or written and the refusal journaled as its write result.
     pub outbound: ReservedBound,
-    /// The table of requests in flight the session counts against (decision 0104): one shared
+    /// The table of requests in flight the session counts against (decision 0105): one shared
     /// by every session of the venue, or the session's own. A submission its class finds no
     /// room for is `NotSent(RateBudget)`, nothing written.
     pub in_flight: InFlight,
@@ -740,7 +740,7 @@ impl<H: ExecHandler> ExecSession<H> {
     pub fn set_journal(&mut self, journal: Journal) {
         self.end_left_epoch();
         self.rec.journal = Some(journal.clone());
-        // A submission refused for want of room is journaled where it is refused (0104).
+        // A submission refused for want of room is journaled where it is refused (0105).
         self.orders.set_journal(journal.clone());
         self.core.journal = Some(journal);
     }
@@ -794,14 +794,14 @@ impl<H: ExecHandler> ExecSession<H> {
         let ran = {
             // Dropped with the run's future too: a run dropped mid-epoch gives back the places
             // its requests hold in the consumer's table, which the session, kept, never reports
-            // again (decision 0104; Codex P1 r4312949559 on PR #174).
+            // again (decision 0105; Codex P1 r4312949559 on PR #174).
             let _give_back = self.rpcs.give_back_on_drop();
             self.run_epochs().await
         };
         self.core.http.clear();
         self.orders.end();
         // Nothing more is reported: the requests still in flight give back their places in the
-        // consumer's table (decision 0104).
+        // consumer's table (decision 0105).
         self.rpcs.clear();
         ran
     }
@@ -810,7 +810,7 @@ impl<H: ExecHandler> ExecSession<H> {
     async fn run_epochs(&mut self) -> Result<(), ExecSessionError> {
         loop {
             // A submission refused for want of room is journaled under the epoch the session is
-            // in, or waits to open (0104).
+            // in, or waits to open (0105).
             self.orders.set_conn(self.core.current());
             // While it waits to connect, the session still reports each deadline that falls
             // due, and each command submitted, under the epoch it waits to open.
@@ -899,7 +899,7 @@ impl<H: ExecHandler> ExecSession<H> {
         }
         // An epoch that dropped is followed by the one the session waits to open: what the
         // handler submits as it is told of the end, and is refused, is journaled under that
-        // one, not the epoch journaled closed (0104; Codex P2 r4312949575 on PR #174).
+        // one, not the epoch journaled closed (0105; Codex P2 r4312949575 on PR #174).
         if matches!(end, Ok(End::Dropped))
             && let Some(epoch) = key.epoch.checked_add(1)
         {
@@ -1278,7 +1278,7 @@ impl<H: ExecHandler> ExecSession<H> {
         }
         // A place in the consumer's table of requests in flight, before any nonce is reserved:
         // Normal traffic stops at its Normal bound, a cancel or a reducing order at the whole
-        // (decision 0104). A refusal is `NotSent(RateBudget)`, nothing reserved or written.
+        // (decision 0105). A refusal is `NotSent(RateBudget)`, nothing reserved or written.
         let class = item.class();
         if !self.rpcs.admit(rpc, class) {
             self.in_flight_refusals += 1;
