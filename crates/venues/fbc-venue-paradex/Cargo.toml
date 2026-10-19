@@ -26,7 +26,9 @@ serde_json.workspace = true
 # order-entry ones on fbc-runtime's session and fbc-oms against the stub. fbc-sim is test-only:
 # the SimVenue stand-in (tests/sim_stand_in.rs, FBC-2zxk) builds a SimVenue from this crate's
 # declared caps; fbc-sim never depends on a venue crate. scripts/check-deps.sh does not count
-# dev-dependencies.
+# dev-dependencies. tokio's net, tokio-tungstenite and futures-util are test-only too: the
+# clustered-move benchmark (tests/clustered_move.rs, FBC-vgm) serves its reference market data
+# from a WebSocket server of its own on another thread.
 [dev-dependencies]
 fbc-book = { path = "../../fbc-book" }
 fbc-conformance = { path = "../../fbc-conformance" }
@@ -34,7 +36,9 @@ fbc-journal = { path = "../../fbc-journal" }
 fbc-oms = { path = "../../fbc-oms" }
 fbc-runtime = { path = "../../fbc-runtime" }
 fbc-sim = { path = "../../fbc-sim" }
+futures-util = { workspace = true, features = ["sink", "std"] }
 log = { workspace = true, features = ["std"] }
 starknet-core.workspace = true
-tokio = { workspace = true, features = ["rt", "macros", "time", "sync"] }
+tokio = { workspace = true, features = ["rt", "macros", "net", "time", "sync"] }
+tokio-tungstenite.workspace = true
 zstd.workspace = true
