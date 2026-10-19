@@ -35,8 +35,12 @@ and how an orphan is held while its cancel is out (FBC-840, BT-402).
    while the registry did not hold it, and no terminal event withdrew since. The rest stay in
    `untracked`, still not held, and nothing is done with them. Acting registers the order as an
    order from the snapshot (as 0055 registers an earlier run's): never amended, counted against
-   both pre-trade caps as it rests, its fills placed against the seed exactly as they were before
-   it was registered, and cancelled by the kill switch's cancel everything too. An order not ours
+   both pre-trade caps as it rests, and cancelled by the kill switch's cancel everything too. A
+   later snapshot showing it open proves it was live after the seed read the account, so the
+   seed holds a fill of it only when the fill arrived before the seed was requested or executed
+   at or before the seed's watermark; every other fill of it, on either read mode (0095), moves
+   the inventory (Reviewer B's RB840-1 on PR #171: placed as the seed's own unshown order, its
+   fills moved the record and not the inventory, or left a separate-reads market unsettled). An order not ours
    (another namespace's, a non-canonical client id, or one nothing attributes) is never an orphan.
    A trustworthy resync forgets the live sightings.
 2. **The adding side.** A side adds when an order on it would grow the position's size: while a
@@ -45,7 +49,11 @@ and how an orphan is held while its cancel is out (FBC-840, BT-402).
    position by, the order included, stays within the position's size (Exit's sizing in 0012,
    without its reduce-only requirement). A flat market, or one whose position is unknown, builds
    none. The refusal comes after the market's state and before Exit's admission and the caps
-   (`OmsError::OrphanCooldown`, `AmendRefusal::OrphanCooldown`). Cancels are never suppressed.
+   (`OmsError::OrphanCooldown`, `AmendRefusal::OrphanCooldown`). Since the position sizes the
+   build, it is judged again as the command is authorized (`IssueRefusal::OrphanCooldown`), and
+   a command built while the cooldown lasts watches the position as an Exit command does
+   (0066): it is refused at submit once a fill or a resync moved the inventory since its build
+   (Reviewer B's RB840-2 on PR #171). Cancels are never suppressed.
 3. **The cooldown.** A market is suppressed from the resync that finds orphans on it, and again
    from every resync while any orphan of it is not terminal (`ResyncReport::orphans` names
    those markets). The cooldown then waits (`Cooldown::Pending`) until the consumer's

@@ -146,7 +146,8 @@
 //! fill also showed), and each market holding any that is not
 //! terminal is named ([`ResyncReport::orphans`]) and its adding side suppressed: a place, batch
 //! item or amend is built only on the side that reduces the known, non-zero position, within its
-//! size ([`OmsError::OrphanCooldown`], [`AmendRefusal::OrphanCooldown`]), until the cooldown the
+//! size ([`OmsError::OrphanCooldown`], [`AmendRefusal::OrphanCooldown`]; judged again at
+//! authorization, [`IssueRefusal::OrphanCooldown`]), until the cooldown the
 //! consumer's [`Registry::cancel_orphans`] starts runs out ([`Registry::end_orphan_cooldowns`],
 //! [`OrphanConfig`], no default). Their cancels go out in every market state by explicit
 //! reference in a cancel-many, repeated on each resync, and above the consumer's level limit as
@@ -161,8 +162,8 @@
 //! and the gateway runs [`Authorization::check_at_submit`] immediately before encoding: a
 //! place, a batch or an amend whose market changed state since (the kill switch, a disarm, an
 //! arming call, lease names given again) is refused with nothing written, and one built in
-//! Exit also once a fill or a seed moved its market's inventory since (its position revision,
-//! decision 0066); an instrument cancel-all only once 0005's I7 guard it was built under
+//! Exit, or during an orphan cooldown, also once a fill or a seed moved its market's inventory
+//! since (its position revision, decisions 0066 and 0101); an instrument cancel-all only once 0005's I7 guard it was built under
 //! moved (the registry's hold of the market's exclusive lease changed, or an order not ours
 //! was seen on the market), never for the kill switch alone; and a cancel or a cancel-many
 //! always goes through.

@@ -7,8 +7,10 @@
 //! a live order event or fill under its client id also showed while the registry did not hold
 //! it, and no terminal event withdrew since; the rest stay in `untracked` only. Acting registers it as an order from the snapshot
 //! ([`OrderRecord::from_snapshot`](crate::OrderRecord::from_snapshot)): never amended, counted
-//! against both pre-trade caps as it rests, its fills placed against the seed as they were
-//! before it was registered, and cancelled by the kill switch's cancel everything too. An order
+//! against both pre-trade caps as it rests, and cancelled by the kill switch's cancel everything
+//! too. Shown open after the seed, the seed holds a fill of it only by the fill's arrival before
+//! the seed's request or its matching-engine time at or before the seed's watermark; any other
+//! moves the inventory, on either read mode (`src/resync.rs`). An order
 //! not ours (another namespace's, a non-canonical client id, or one nothing attributes) is
 //! never one (I4).
 //!
@@ -21,7 +23,11 @@
 //! ([`Cooldown::Until`], `now` plus the consumer's [`OrphanConfig::cooldown`]), and it ends
 //! only when the consumer's [`Registry::end_orphan_cooldowns`] is given a time at or past it.
 //! A suppression beginning advances the market's state generation, so a place or amend
-//! authorized before it is refused at submit. Cancels are never suppressed.
+//! authorized before it is refused at submit. The position sizes the build, so the suppression
+//! is judged again at authorization ([`IssueRefusal::OrphanCooldown`](crate::IssueRefusal)),
+//! and a command built during the cooldown is refused at submit once the inventory moved since
+//! its build ([`StaleAuthorization::PositionMoved`](crate::StaleAuthorization)), as an Exit
+//! command is (0066). Cancels are never suppressed.
 //!
 //! **Cancelled.** [`Registry::cancel_orphans`] builds, in every market state, the cancels of
 //! the market's orphans that are not terminal, by explicit reference in a cancel-many
