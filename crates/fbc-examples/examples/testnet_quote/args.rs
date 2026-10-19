@@ -168,9 +168,10 @@ quotes cancelled by hand one at a time, seconds apart, are two). The first print
 and the loop requotes. With --mainnet, a second on a later cycle within 30 s of the first
 Stops the run and fails it ('another program cancelled our orders: one quoter per account'),
 as does one of the loop's requote (the first order placed on a side after the one before,
-a place refused or never rested aside) within 30 s of placing it, however long the cycle took; after 30 s with no second the window
-starts again. A cancel of ours the venue refuses no longer covers its order from the refusal
-on. Without
+a place refused or never rested aside), or of a replace of it, within 30 s of placing the
+requote, however long the cycle took; after 30 s with no second the window starts again. A
+cancel of ours the venue refuses does not cover its order, even when the order's cancel event
+came before the refusal. Without
 --mainnet each only warns. Once one was seen, the run's cancels of everything (a reconnect's
 sweep, Stop) name our orders explicitly and never send an instrument cancel-all, which would
 cancel the other program's orders too. One quoter per account.

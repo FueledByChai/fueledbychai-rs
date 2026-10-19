@@ -113,11 +113,12 @@ cycle within 30 s of the first Stops the run and fails it ("another program canc
 orders: one quoter per account"), which catches a 3 s reconcile within about 6 s; so does one
 that cancels the loop's requote (the first order placed on a side after the event before; a
 place refused, not sent or that would cross never rested, so the next place on its side is the
-requote: RB-aoh5-10) within 30 s of that requote's place, however long the cycle that placed it took (its reads, settle and
+requote: RB-aoh5-10), or a replace of it the loop made, within 30 s of that requote's place, however long the cycle that placed it took (its reads, settle and
 rate-limit waits do not count: Codex r4309154208 on PR #159); after 30 s with no second the
 window starts again. A cancel of ours that Paradex refuses (for its rate, say) stops covering its
 order at the refusal, so another program's cancel of it while ours waits is counted (Codex
-r4309154204). Once one was seen, the reconnect sweeps and Stop cancel
+r4309154204); when the order's cancel event comes before the refusal, it is counted at the
+refusal (Codex r4310042612). Once one was seen, the reconnect sweeps and Stop cancel
 our orders explicitly and never send an instrument cancel-all, which would cancel the other
 program's orders too. Without `--mainnet` each only warns. `SUMMARY` ends with `cancels not
 ours N`, the orders of ours they ended.
