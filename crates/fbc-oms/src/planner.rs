@@ -91,7 +91,7 @@ use fbc_core::{
 use crate::entry::EntryState;
 use crate::grant::Authorization;
 use crate::permit::{self, AmendRefusal, CancelChoice, PermitRefusal, PermittedCommand};
-use crate::record::{Intent, OrdState, OrderRecord};
+use crate::record::{Intent, OrdState, OrderRecord, TerminalKind};
 use crate::registry::{Instance, OmsError, Registry};
 
 /// The [`Planned::level`], [`Held::level`] and [`Refused::level`] of a side's crossing intent's
@@ -694,7 +694,7 @@ impl ExecutionPlanner {
         let slots = self.slots.entry((acct, market)).or_default();
         let mut plan = Plan::default();
         // An order seen terminal frees its level.
-        slots.retain(|_, slot| reg.get(slot.cid).is_some_and(|r| !r.state().is_terminal()));
+        free_terminal(slots, reg, &mut self.fired, (acct, market));
 
         // In Exit, the side that reduces the known position; none while it is flat or unknown,
         // when every order adds to it (0063).
@@ -1157,7 +1157,7 @@ impl ExecutionPlanner {
         self.bind(acct, reg)?;
         let mut plan = Plan::default();
         if let Some(slots) = self.slots.get_mut(&(acct, market)) {
-            slots.retain(|_, slot| reg.get(slot.cid).is_some_and(|r| !r.state().is_terminal()));
+            free_terminal(slots, reg, &mut self.fired, (acct, market));
             overshoot_cancels(slots, reg, caps, acct, market, &[], &mut plan);
         }
         Ok(plan)
@@ -1463,6 +1463,24 @@ fn overshoot_cancels(
         slot.cancels_sent = rec.cancels_sent();
         cancel_now(reg, caps, acct, at, slot.cid, plan);
     }
+}
+
+/// Frees each level of `slots` whose order `reg` shows terminal (or no longer holds). A
+/// crossing order that ended never sent reached no venue, so its attempt is forgotten and
+/// planned again (decision 0107).
+fn free_terminal(
+    slots: &mut BTreeMap<Level, Slot>,
+    reg: &Registry,
+    fired: &mut HashMap<(AccountKey, InstrumentId, Level), u64>,
+    (acct, market): (AccountKey, InstrumentId),
+) {
+    slots.retain(|&at, slot| {
+        let state = reg.get(slot.cid).map(OrderRecord::state);
+        if at.crossing && matches!(state, Some(OrdState::Terminal(TerminalKind::NotSent(_)))) {
+            fired.remove(&(acct, market, at));
+        }
+        state.is_some_and(|state| !state.is_terminal())
+    });
 }
 
 /// Why a resting order cannot be changed now, if it cannot.
