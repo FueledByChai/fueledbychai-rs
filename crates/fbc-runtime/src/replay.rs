@@ -636,7 +636,9 @@ impl<H: MdHandler> MdSink for Deliver<'_, H> {
     }
 }
 
-/// The recorded instant a journal record carries, on the shard's monotonic clock.
+/// The recorded instant a journal record carries, on the shard's monotonic clock: every kind
+/// but the untimed ones is named, so a kind added later is placed here (an encode context's is
+/// the time it gave the codec, Codex P2 r4316220952 on PR #178).
 fn recorded_at(record: &Record) -> Option<MonoNs> {
     match record {
         Record::Inbound { stamp, .. }
@@ -649,7 +651,8 @@ fn recorded_at(record: &Record) -> Option<MonoNs> {
         | Record::WriteResult { at, .. }
         | Record::HttpRequest { at, .. }
         | Record::Consumer { at, .. } => Some(*at),
-        _ => None,
+        Record::EncodeCtx { ctx, .. } => Some(ctx.mono),
+        Record::Marker(_) | Record::Nonce { .. } | Record::Cycle { .. } => None,
     }
 }
 
