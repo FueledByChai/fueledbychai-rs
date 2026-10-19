@@ -36,9 +36,12 @@ item count.
    or a consumer's reducing classification is not what the venue checks). An amend is judged by
    the flags its order was placed with. Cancels are built in every mode and status, as they are
    in every market state (0012): a stale mode never holds back a cancel, and a cancel a halted
-   venue refuses costs at worst a reject. The check comes before the market's state and the
-   caps, and before an emulated order's overshoot cancels, so a refused command changes
-   nothing.
+   venue refuses costs at worst a reject. The check is made as the place or amend is built,
+   before the market's state, the caps and a reducer's wait for an emulated order's cancel, so
+   a refused place or amend builds nothing and cancels nothing on its account. The cancels a
+   level's decision calls for whatever the new quote (a replace, Exit's, an emulated order's
+   overshoot once its quote counts it reducing, a level no longer wanted) are cancels, and go
+   out in every mode; the quote that would replace the order is then refused when built.
 3. **The safety floor.** A `RateView` lists `RateScope`s, each a bucket's operations
    (`RateLimit::ops`), the one instrument a per-pair bucket counts (`None` for a shared
    bucket), its units left in the window, and the consumer's floor for it (`RateScope::of`
