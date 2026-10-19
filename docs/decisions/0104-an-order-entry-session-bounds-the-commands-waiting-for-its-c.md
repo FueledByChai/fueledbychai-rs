@@ -30,17 +30,20 @@ states no retry time for its rate-limit code 42901, so the samples wait their ow
 2. **The outbound queue, per connection.** `ExecSessionConfig::outbound` bounds the commands
    submitted through the session's `ExecOrders` and not yet taken by a turn. One submitted past
    the bound its class may use is refused as it is submitted:
-   `ExecOrders::submit` (or `submit_control`) returns `SubmitRefusal::Backpressure`, the
-   runtime's form of `NotSent(Backpressure)`, with no request id given and nothing of it kept, so
-   nothing grows past the bound however many are submitted while a write waits (Codex P1
-   r4312640254 on PR #174). The refusal is journaled at once as
-   `Record::WriteResult { rpc: None, result: NotSent(Backpressure) }` under its class, on the
-   epoch the session is in or waits to open, and counted in
+   `ExecOrders::submit` (or `submit_control`) returns `SubmitRefusal::Backpressure { rpc }`, the
+   runtime's form of `NotSent(Backpressure)`, naming the request id it was given and keeping
+   nothing of it, so nothing grows past the bound however many are submitted while a write waits
+   (Codex P1 r4312640254 on PR #174). The refusal is journaled at once as
+   `Record::WriteResult { rpc: Some(rpc), result: NotSent(Backpressure) }` under its class, on
+   the epoch the session is in or waits to open (once an epoch that dropped is journaled closed,
+   the one it waits to open; Codex P2 r4312949575), and counted in
    `ExecCounters::backpressure_refusals`. Nothing of it reaches the codec, a nonce source or a
-   socket. The authorization is dropped unspent. The OMS keeps the intent: the consumer settles
-   what fbc-oms holds for the command as for any command not sent (a place or a batch item by
-   `NotSent(Backpressure)` through `Registry::on_outcome`, an amend by
-   `Registry::amend_not_submitted`; a cancel left nothing pending) and plans again. The shard
+   socket, and its authorization is dropped. The OMS keeps the intent: the consumer settles it
+   exactly as an `on_submitted` receipt for `rpc` not sent for `Backpressure` (a place or a
+   batch item by `NotSent(Backpressure)` through `Registry::on_outcome`; an amend by
+   `Registry::amend_sent` under `rpc` and then that outcome, which releases the reservation its
+   build made, since `Registry::amend_not_submitted` needs the command the authorization spent;
+   a cancel left nothing pending) and plans again (Codex P1 r4312949568). The shard
    host submits a ladder command only once every session holds nothing, so with a Normal bound
    of at least one its own commands always fit.
 3. **The table of requests in flight, per venue or per connection.** `InFlight::new(bound)`,
@@ -55,9 +58,10 @@ states no retry time for its rate-limit code 42901, so the samples wait their ow
    deadline's `on_rpc_timeout`; one encoded and never written (the codec's refusal, the
    buckets', an epoch that ends first) is given back at once. The session's own requests (its
    cancel-on-disconnect arm, 0058) are counted without being refused, since refusing the arm
-   would fail the epoch. A session's run that ends, or a session dropped, gives back every
-   place its requests held: nothing more is reported for them, and a table shared with later
-   sessions must not leak.
+   would fail the epoch. A session's run that ends, a run whose future is dropped (the guard
+   that gives the places back lives in the run's future; Codex P1 r4312949559), or a session
+   dropped, gives back every place its requests held: nothing more is reported for them, and a
+   table shared with other or later sessions must not leak.
 
 ## Alternatives
 
@@ -72,8 +76,12 @@ states no retry time for its rate-limit code 42901, so the samples wait their ow
   push into a full ring (0103).
 - **Hand the authorization back with the refusal.** The consumer could then submit it again
   unchanged. But a refusal that carries the command changes the error type of every submission,
-  and fbc-oms holds the place as issued either way, so the consumer still settles it or submits
-  again. A rebuilt command is checked again like any other.
+  and fbc-oms has no call that settles an authorization: an amend's reservation is released by
+  `amend_not_submitted`, which needs the command the authorization spent, or by an outcome under
+  a request id. A request id settles every kind of command the way a not-sent receipt does.
+- **A refusal naming no request id.** PR #174's second head did this. An amend so refused left
+  fbc-oms's reservation of it impossible to settle, so its order took no other amend until it
+  ended (Codex P1 r4312949568).
 - **Let Safety traffic past the whole outbound bound, as the journal's reserve does.** The
   journal never blocks and drops what it cannot keep; an outbound queue that a burst of cancels
   could grow without limit is the defect the bound exists to close. The consumer sizes the
