@@ -542,7 +542,6 @@ version = "0.0.1"
 dependencies = [
  "fbc-book",
  "fbc-core",
- "fbc-venue-paradex",
  "rust_decimal",
  "trybuild",
 ]
@@ -571,6 +570,7 @@ dependencies = [
  "fbc-journal",
  "fbc-oms",
  "fbc-runtime",
+ "fbc-sim",
  "log",
  "rust_decimal",
  "serde_json",

@@ -40,7 +40,8 @@
 //! single-phase venue's placement is answered Final as before, with nothing after it.
 //!
 //! FBC-2zxk adds a two-phase venue's amend, sent and answered provisionally, then settled by
-//! the amended order's event (decision 0102); its done line is tests/paradex_stand_in.rs.
+//! the amended order's event (decision 0102); its done line is fbc-venue-paradex's
+//! tests/sim_stand_in.rs.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};

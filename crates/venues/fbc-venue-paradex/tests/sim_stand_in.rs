@@ -2,8 +2,9 @@
 //! `MatchingCaps` (decision 0054's caps, as `fbc_venue_paradex::factory::caps` declares them)
 //! acknowledges a post-only place and fills it through the queue model, with realized P&L as
 //! Paradex reports it; an amend and a cancel are answered; and no command is refused as
-//! `Unsupported`. Driven through the codec and engine only, as `sim_venue.rs` drives them, with
-//! no runtime and no socket. The instrument, its book and the account's rates are synthetic.
+//! `Unsupported`. Driven through the codec and engine only, as fbc-sim's `sim_venue.rs` drives
+//! them, with no runtime and no socket. The instrument, its book and the account's rates are
+//! synthetic.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};

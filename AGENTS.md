@@ -456,7 +456,10 @@ rather than guess.
     this codec against the conformance stub, the market seeded by the trustworthy resync with
     no hand seed (0094), every record the log facade emits read at TRACE; the named conformance suite
     (`tests/conformance.rs`, FBC-6oj) on `ParadexFactory`, its fixtures in
-    `fixtures/paradex/conformance/` and what they assume in `tests/conformance/setup.rs`; and, in
+    `fixtures/paradex/conformance/` and what they assume in `tests/conformance/setup.rs`; the
+    SimVenue stand-in (`tests/sim_stand_in.rs`, FBC-2zxk, `fbc-sim` as a dev-dependency so
+    `fbc-sim` names no venue): a SimVenue built from `caps()` places, amends, cancels and fills
+    (0102); and, in
     `tests/oracle/` with `fbc-book` as a dev-dependency only, the
     BT-401 book and bbo-touch agreement checks), later `crates/venues/fbc-venue-hibachi`
     (0016).
