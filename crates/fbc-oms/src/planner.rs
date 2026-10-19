@@ -44,7 +44,7 @@
 //! check. Batching, venue modes and the rate-scope safety floor are not here (FBC-hht).
 //!
 //! Each wanted quote is first fitted to the venue's [`OrderCaps`], from the caps alone, never
-//! the venue's name (design §4.10 steps 3 and 4; 0101): RPI on a venue without it goes on the
+//! the venue's name (design §4.10 steps 3 and 4; 0106): RPI on a venue without it goes on the
 //! public book; a reduce-only quote whose flags the venue refuses together falls back,
 //! (Rpi, ReduceOnly) to the public book, (Ioc, ReduceOnly) to a synthetic IOC (a
 //! good-till-cancelled limit at the quote's price, cancelled at once, its cancel following its
@@ -390,7 +390,7 @@ pub enum PlanRefusal {
     /// A place or amend that reduces the position would leave an emulated reduce-only order
     /// resting on its side more than is left to reduce, so both could fill and take the
     /// position past zero: the emulated order is cancelled, and the command is built by the
-    /// first pass after that order is terminal (decision 0101). Only a command the market's
+    /// first pass after that order is terminal (decision 0106). Only a command the market's
     /// state and both caps would admit with that order ended waits so; one refused anyway is
     /// refused for its own reason, and the emulated order rests.
     AwaitsEmulatedCancel,
@@ -440,7 +440,7 @@ pub struct Plan {
     /// bounds before the emulated reduce-only ones), amends, adds; a synthetic IOC's cancel
     /// follows its place, and the cancel of an emulated reduce-only order a reducer would leave
     /// resting more than is left to reduce comes where that reducer would have been built, the
-    /// reducer waiting ([`PlanRefusal::AwaitsEmulatedCancel`]; 0101).
+    /// reducer waiting ([`PlanRefusal::AwaitsEmulatedCancel`]; 0106).
     pub commands: Vec<Planned>,
     /// The orders whose cancel waits for their acknowledgement: tried again at every later pass
     /// until it is built, whether or not the level is wanted again.
@@ -622,7 +622,7 @@ impl ExecutionPlanner {
             // an IOC, or protected from overshoot from now on. A mode is never dropped while
             // the order rests. An order whose quote reduces the position (an emulated one's
             // included) counts from then on as an order reducing it, though no amend records
-            // the classification, so emulated orders are sized with it (0101).
+            // the classification, so emulated orders are sized with it (0106).
             if let Some(f) = &fitted {
                 slot.mode.synth_ioc |= f.mode.synth_ioc;
                 slot.mode.emulated |= f.mode.emulated;
@@ -1170,7 +1170,7 @@ fn cancel_now(
 /// room already counts) would leave resting more than is left to reduce, so both could fill
 /// and take the position past zero, the emulated order having no venue flag to stop it. The
 /// reducer waits for their cancel ([`cancel_overshot`]) when it is admitted with them ended,
-/// and is built by the first pass after they are terminal (decision 0101).
+/// and is built by the first pass after they are terminal (decision 0106).
 fn overshot_by(
     slots: &BTreeMap<Level, Slot>,
     reg: &Registry,
