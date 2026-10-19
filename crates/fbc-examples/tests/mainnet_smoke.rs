@@ -202,7 +202,7 @@ fn strings(args: &[&str]) -> Vec<String> {
     args.iter().map(|a| (*a).to_owned()).collect()
 }
 
-/// The market, the caps at their largest and the order, as the owner types them.
+/// The market, the caps and the order, as the owner typed them for the first mainnet order.
 const ORDER_ARGS: [&str; 24] = [
     "--mainnet",
     "--sole-trader",
@@ -972,40 +972,54 @@ async fn the_guard_admits_only_the_mainnet_chain_id() {
 }
 
 #[tokio::test]
-async fn the_caps_are_at_most_eleven_dollars_resting_and_fifty_inventory() {
-    // Smaller caps are taken, larger refused, and the order is bounded by the resting cap.
+async fn the_caps_are_required_and_positive_with_no_ceiling() {
+    // Owner 2026-10-19 (FBC-thks): the caps are yours, required, with no default and no
+    // ceiling. A missing or non-positive cap is refused; any positive one is taken; the order is
+    // still bounded by the resting cap.
     let set = |flag: &str, value: &str| -> Result<Parsed, String> {
         let mut args = strings(&ORDER_ARGS);
         let at = args.iter().position(|a| a == flag).unwrap();
         args[at + 1] = value.to_owned();
         smoke_args::parse(args)
     };
-    assert!(set("--resting-cap-usd", "11.01").is_err());
-    assert!(set("--inventory-cap-usd", "50.5").is_err());
-    let err = set("--resting-cap-usd", "12").err().unwrap();
-    assert!(err.contains("at most $11"), "{err}");
-    let err = set("--inventory-cap-usd", "51").err().unwrap();
-    assert!(err.contains("at most $50"), "{err}");
+    for flag in ["--resting-cap-usd", "--inventory-cap-usd"] {
+        let mut args = strings(&ORDER_ARGS);
+        let at = args.iter().position(|a| a == flag).unwrap();
+        args.drain(at..at + 2);
+        let err = smoke_args::parse(args).err().unwrap();
+        assert!(err.contains(&format!("{flag} is required")), "{err}");
+        for bad in ["0", "-5", "0.0"] {
+            let err = set(flag, bad).err().unwrap_or_else(|| panic!("{flag} {bad}"));
+            assert!(err.contains(flag), "{err}");
+            assert!(err.contains("positive"), "{err}");
+        }
+    }
     let err = set("--order-usd", "11.5").err().unwrap();
     assert!(err.contains("--resting-cap-usd"), "{err}");
-    let Ok(Parsed::Smoke(small)) = set("--inventory-cap-usd", "20") else {
-        panic!("a smaller cap parses");
+    // The owner's old $11/$50 are no ceiling: far larger caps are taken.
+    let Ok(Parsed::Smoke(big)) = set("--resting-cap-usd", "5000") else {
+        panic!("a $5000 resting cap parses");
     };
-    assert_eq!(small.trade.inventory_cap_usd, Decimal::from(20));
-    assert!(matches!(
-        set("--resting-cap-usd", "11"),
-        Ok(Parsed::Smoke(_))
-    ));
-    // The run checks them again, before anything connects: run against a loopback stub, which
-    // sees nothing.
+    assert_eq!(big.trade.resting_cap_usd, Decimal::from(5_000));
+    let Ok(Parsed::Smoke(big)) = set("--inventory-cap-usd", "20000") else {
+        panic!("a $20000 inventory cap parses");
+    };
+    assert_eq!(big.trade.inventory_cap_usd, Decimal::from(20_000));
+    // The run checks them again, before anything connects: non-positive caps built some other
+    // way are refused, against a loopback stub, which sees nothing.
     let stub = StubServer::start(no_script(), routes()).await.unwrap();
-    for (resting, inventory, why) in [(12, 50, "at most $11"), (11, 51, "at most $50")] {
-        let mut big = smoke_on(&stub);
-        big.trade.resting_cap_usd = Decimal::from(resting);
-        big.trade.inventory_cap_usd = Decimal::from(inventory);
-        let (ran, printed) = run_on(&big, None, &ParadexFactory).await;
+    for (resting, inventory, flag) in [
+        (Decimal::ZERO, Decimal::from(50), "--resting-cap-usd"),
+        (Decimal::from(11), Decimal::ZERO, "--inventory-cap-usd"),
+        (Decimal::from(-1), Decimal::from(50), "--resting-cap-usd"),
+        (Decimal::from(11), Decimal::from(-1), "--inventory-cap-usd"),
+    ] {
+        let mut bad = smoke_on(&stub);
+        bad.trade.resting_cap_usd = resting;
+        bad.trade.inventory_cap_usd = inventory;
+        let (ran, printed) = run_on(&bad, None, &ParadexFactory).await;
         let err = ran.err().unwrap();
-        assert!(err.contains(why), "{err}");
+        assert!(err.contains(flag) && err.contains("positive"), "{err}");
         assert!(printed.is_empty(), "{printed}");
     }
     assert!(
@@ -1014,6 +1028,42 @@ async fn the_caps_are_at_most_eleven_dollars_resting_and_fifty_inventory() {
         stub.http_requests()
     );
     assert!(stub.connections().is_empty());
+}
+
+#[tokio::test]
+async fn large_caps_are_taken_and_printed_before_anything_connects() {
+    // $5000 resting per side and $20000 inventory: the round trip runs as at the owner's old
+    // caps, and the CAPS line is printed before the first request.
+    let placed = Arc::new(Mutex::new(Placed::default()));
+    let stub = StubServer::start(script(Arc::clone(&placed), 9), routes())
+        .await
+        .unwrap();
+    let mut smoke = smoke_on(&stub);
+    smoke.trade.resting_cap_usd = Decimal::from(5_000);
+    smoke.trade.inventory_cap_usd = Decimal::from(20_000);
+    let (ran, printed) = run_on(&smoke, None, &ParadexFactory).await;
+    // Refused, the stub's script is never played out: fail here, before waiting on it.
+    let report = ran.unwrap_or_else(|e| panic!("refused: {e}; it printed:\n{printed}"));
+    stub.finished().await.unwrap();
+    assert!(report.ok, "{printed}");
+    let caps = "CAPS $5000 resting per side, $20000 inventory";
+    let at = printed
+        .find(caps)
+        .unwrap_or_else(|| panic!("no {caps}:\n{printed}"));
+    // Printed second, after the MAINNET line, before the chain read's STEP.
+    assert!(printed.lines().nth(1).unwrap().starts_with(caps), "{printed}");
+    assert!(at < printed.find("STEP chain").unwrap(), "{printed}");
+    // The caps in lots at the first touch: 5000 / 62000.2 and 20000 / 62000.5 on the step.
+    assert!(
+        printed.contains("caps: resting 8064 lots per side, inventory 32257 lots"),
+        "{printed}"
+    );
+    assert_eq!(
+        (report.places_sent, report.cancels_sent),
+        (1, 2),
+        "{printed}"
+    );
+    no_credential_in(&printed);
 }
 
 #[test]
@@ -1104,6 +1154,9 @@ fn help_names_the_environment_the_prerequisites_and_every_line() {
         "wss://ws.api.prod.paradex.trade/v1",
         "SEPARATE",
         "decision 0094",
+        // The caps: yours, required, no default and no ceiling (FBC-thks), printed first.
+        "no ceiling",
+        "CAPS",
         "STEP chain",
         "STEP mark",
         "SEED",

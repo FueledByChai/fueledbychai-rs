@@ -3069,8 +3069,7 @@ impl VenueFactory for Declared {
     }
 }
 
-/// The owner's mainnet run on the stub: `--mainnet`, the caps $11 resting per side and $50
-/// inventory, quotes of $11 (17 lots at the first touch's ask quote, 62186.6) 30 bps behind the
+/// A mainnet run on the stub: `--mainnet`, caps of $11 resting per side and $50 inventory, quotes of $11 (17 lots at the first touch's ask quote, 62186.6) 30 bps behind the
 /// touch, the BTC market's $10 minimum notional, `--duration 60`, at most `cycles` cycles 100 ms
 /// apart.
 fn mainnet_options(stub: &StubServer, cycles: u64) -> Options {
@@ -3345,8 +3344,7 @@ fn mainnet_mode_needs_both_mainnet_and_sole_trader_and_takes_only_mainnets_urls(
         "PRIVATE_SN_PARACLEAR_MAINNET",
         "https://api.prod.paradex.trade/v1",
         "wss://ws.api.prod.paradex.trade/v1",
-        "at most 11",
-        "at most 50",
+        "no ceiling",
         "at least 20",
         "at most 3600",
         "never seeded by hand",
@@ -3361,7 +3359,7 @@ fn mainnet_mode_needs_both_mainnet_and_sole_trader_and_takes_only_mainnets_urls(
 }
 
 #[tokio::test]
-async fn mainnet_mode_refuses_caps_offsets_and_a_duration_past_the_owners_limits_before_anything_connects()
+async fn mainnet_mode_refuses_non_positive_caps_offsets_and_a_duration_past_the_owners_limits_before_anything_connects()
  {
     let set = |flag: &str, value: &str| -> Result<Parsed, String> {
         let mut argv = mainnet_argv();
@@ -3373,8 +3371,8 @@ async fn mainnet_mode_refuses_caps_offsets_and_a_duration_past_the_owners_limits
         args::parse(argv)
     };
     for (flag, value, why) in [
-        ("--resting-cap-usd", "11.01", "at most $11 per side"),
-        ("--inventory-cap-usd", "50.5", "at most $50"),
+        ("--resting-cap-usd", "0", "positive"),
+        ("--inventory-cap-usd", "-50", "positive"),
         ("--bid-bps", "19", "at least 20 basis points"),
         ("--ask-bps", "19", "at least 20 basis points"),
         ("--duration", "3601", "at most 3600 s"),
@@ -3384,10 +3382,13 @@ async fn mainnet_mode_refuses_caps_offsets_and_a_duration_past_the_owners_limits
         assert!(refused.contains(flag), "{flag}: {refused}");
         assert!(refused.contains(why), "{flag}: {refused}");
     }
-    // Smaller caps, offsets of 20 and an hour are taken.
+    // Any positive caps (no ceiling, owner 2026-10-19: FBC-thks), offsets of 20 and an hour are
+    // taken.
     for (flag, value) in [
         ("--resting-cap-usd", "10.5"),
         ("--inventory-cap-usd", "20"),
+        ("--resting-cap-usd", "5000"),
+        ("--inventory-cap-usd", "20000"),
         ("--bid-bps", "20"),
         ("--ask-bps", "20"),
         ("--duration", "3600"),
@@ -3399,15 +3400,14 @@ async fn mainnet_mode_refuses_caps_offsets_and_a_duration_past_the_owners_limits
         (args::MAINNET_OFFSET_MIN, args::MAINNET_DURATION_MAX),
         (20, 3_600)
     );
-    // --duration stays required.
-    let mut argv = mainnet_argv();
-    let at = argv.iter().position(|a| a == "--duration").unwrap();
-    argv.drain(at..at + 2);
-    assert!(
-        args::parse(argv)
-            .unwrap_err()
-            .contains("--duration is required")
-    );
+    // --duration and both caps stay required, with no default.
+    for flag in ["--duration", "--resting-cap-usd", "--inventory-cap-usd"] {
+        let mut argv = mainnet_argv();
+        let at = argv.iter().position(|a| a == flag).unwrap();
+        argv.drain(at..at + 2);
+        let refused = args::parse(argv).unwrap_err();
+        assert!(refused.contains(&format!("{flag} is required")), "{refused}");
+    }
     // A testnet run has none of these limits.
     let mut argv = required();
     argv.extend(strings(&[
@@ -3426,10 +3426,11 @@ async fn mainnet_mode_refuses_caps_offsets_and_a_duration_past_the_owners_limits
         .await
         .unwrap();
     type Break = (fn(&mut Options), &'static str);
-    let breaks: [Break; 8] = [
-        (|o| o.resting_cap_usd = dec("12"), "at most $11"),
+    let breaks: [Break; 9] = [
+        (|o| o.resting_cap_usd = dec("0"), "--resting-cap-usd 0 is not positive"),
         (|o| o.interval_ms = 20_001, "at most 20000 ms"),
-        (|o| o.inventory_cap_usd = dec("51"), "at most $50"),
+        (|o| o.inventory_cap_usd = dec("0"), "--inventory-cap-usd 0 is not positive"),
+        (|o| o.inventory_cap_usd = dec("-1"), "--inventory-cap-usd -1 is not positive"),
         (|o| o.bid_bps = 10, "at least 20"),
         (|o| o.ask_bps = 5, "at least 20"),
         (|o| o.duration_secs = 7_200, "at most 3600"),
@@ -3460,6 +3461,40 @@ async fn mainnet_mode_refuses_caps_offsets_and_a_duration_past_the_owners_limits
         stub.http_requests()
     );
     assert!(stub.connections().is_empty());
+}
+
+#[tokio::test]
+async fn mainnet_mode_takes_large_caps_and_prints_them_before_anything_connects() {
+    // No ceiling (owner 2026-10-19, FBC-thks): $5000 resting per side and $20000 inventory
+    // run one requote cycle, and the SUPERVISED line names them before the first request.
+    let venue = mainnet_venue(vec![b0()]);
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let mut opts = mainnet_options(&stub, 1);
+    opts.resting_cap_usd = dec("5000");
+    opts.inventory_cap_usd = dec("20000");
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(report.ok, "{printed}");
+    assert_eq!(report.ended, "--cycles 1 reached", "{printed}");
+    assert_eq!(report.places_sent, 2, "{printed}");
+    let caps = "caps $5000 resting per side, $20000 inventory";
+    let supervised = printed
+        .lines()
+        .position(|l| l.starts_with("SUPERVISED mainnet run") && l.contains(caps))
+        .unwrap_or_else(|| panic!("no SUPERVISED line with {caps}:\n{printed}"));
+    let chain = printed
+        .lines()
+        .position(|l| l.starts_with("STEP chain"))
+        .unwrap_or_else(|| panic!("no STEP chain:\n{printed}"));
+    assert!(supervised < chain, "{printed}");
+    assert_eq!(stub.http_requests()[0], "GET /v1/system/config");
+    stopped(&printed);
+    no_credential_in(&printed);
 }
 
 #[tokio::test]
