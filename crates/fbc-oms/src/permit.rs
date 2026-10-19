@@ -446,7 +446,7 @@ impl<'r> Live<'r> {
         let cid = rec.cid();
         let build = self.rec.set_amend_built(qty, wire);
         if reducing {
-            self.rec.set_amended_reducing();
+            self.rec.set_counted_reducing();
         }
         Ok(PermittedCommand {
             cmd: VenueCommand::Amend(amend),
