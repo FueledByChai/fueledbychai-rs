@@ -140,6 +140,19 @@
 //! fill moves the inventory once in every state, Killed included; a foreign one is flagged and
 //! moves nothing.
 //!
+//! Orphans (0005's I7, decision 0101; `tests/orphans.rs`): open orders under our namespace that
+//! the registry does not hold, which a resync finds on a market seeded before it, are
+//! registered from the snapshot (from an untrustworthy source only those a live order event or
+//! fill also showed), and each market holding any that is not
+//! terminal is named ([`ResyncReport::orphans`]) and its adding side suppressed: a place, batch
+//! item or amend is built only on the side that reduces the known, non-zero position, within its
+//! size ([`OmsError::OrphanCooldown`], [`AmendRefusal::OrphanCooldown`]), until the cooldown the
+//! consumer's [`Registry::cancel_orphans`] starts runs out ([`Registry::end_orphan_cooldowns`],
+//! [`OrphanConfig`], no default). Their cancels go out in every market state by explicit
+//! reference in a cancel-many, repeated on each resync, and above the consumer's level limit as
+//! an instrument cancel-all only under the kill switch's guard ([`OrphanCancels`]); no order
+//! not ours is ever one, and no account cancel-all is built.
+//!
 //! Authorizations and their check at submit (decisions 0045, 0060 and 0066;
 //! `tests/authorization.rs`, `tests/exit_submit.rs`):
 //! [`Registry::authorize`] issues the [`Authorization`] for a command this crate built, so a
@@ -203,6 +216,7 @@ mod gateway;
 mod grant;
 mod ladder;
 mod ledger;
+mod orphans;
 mod permit;
 mod planner;
 mod record;
@@ -229,6 +243,7 @@ pub use ledger::{
     AcceptedFill, Admission, FillLedger, FillTime, Horizon, LedgerConfig, LedgerConfigError,
     ReplayCounts,
 };
+pub use orphans::{Cooldown, OrphanCancels, OrphanConfig, OrphanConfigError, OrphanPlan};
 pub use permit::{
     AmendRefusal, CancelChoice, CancelPlan, Cancellable, Live, PermitRefusal, PermittedCommand,
     PlacePlan,

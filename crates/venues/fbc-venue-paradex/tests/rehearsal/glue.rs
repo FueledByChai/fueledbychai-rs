@@ -23,8 +23,9 @@ use fbc_runtime::{ExecHandler, ExecOrders};
 use tokio::sync::Notify;
 
 /// Something the session reported, as the glue saw it. Every field shows in a failing test's
-/// notes, read or not.
-#[allow(dead_code)]
+/// notes, read or not. A resync's report is the largest note; the notes are test records, kept
+/// whole rather than boxed (FBC-840 grew the report by the markets holding orphans).
+#[allow(dead_code, clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Note {
     /// The stream's state changed.

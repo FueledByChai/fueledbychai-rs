@@ -19,8 +19,9 @@
 //! An account cancel-all is never built (0005's I7 admits only the instrument one). Each resync
 //! names the markets in Killed ([`ResyncReport::cancel_everything`](crate::ResyncReport)), whose
 //! cancel everything the consumer builds again, so the explicit cancels repeat on each resync
-//! as 0012 says. Our own-namespace orders the registry does not hold (0005's I7 orphans, on a
-//! market a resync already seeded) are FBC-840's; an instrument cancel-all reaches them.
+//! as 0012 says. Our own-namespace orders the registry did not hold (0005's I7 orphans, on a
+//! market a resync already seeded) are registered by the resync that acts on them
+//! (`src/orphans.rs`, decision 0101), so the explicit cancels reach them too.
 //!
 //! **In view.** An order not ours (another namespace's, a non-canonical client id, or one
 //! nothing attributes: no client id and a venue id no order of ours had) is in view on its
@@ -191,37 +192,12 @@ impl Registry {
         caps: &OrderCaps,
     ) -> CancelEverything {
         self.reap_dropped();
-        let why = if caps.cancel_all_instrument != Support::Native {
-            Some(CancelAllRefusal::Unsupported)
-        } else if !self.entries.holds_exclusive(market) {
-            Some(CancelAllRefusal::NoExclusiveLease)
-        } else if !self.foreign.viewed {
-            Some(CancelAllRefusal::NotViewed)
-        } else if self.foreign.in_view(market) {
-            Some(CancelAllRefusal::ForeignInView)
-        } else {
-            None
-        };
-        match why {
+        match self.cancel_all_refusal(market, caps) {
             None => {
-                let unanswered = self.ours_on(market, |state| {
-                    matches!(state, OrdState::PendingNew | OrdState::Unknown)
-                });
-                // Checked at submit against I7's inputs as they are now: the registry's hold
-                // of the market's exclusive lease and the foreign orders seen. Either moving
-                // may undo the guard it was built under; a change of state that leaves both
-                // (the kill switch, its lift) must not hold it back (0060; RB94-1).
-                let guard = Guard::exclusive(
-                    self.entries.watch_exclusive(market),
-                    self.foreign.watch(market),
-                );
+                let (command, unanswered) = self.instrument_cancel_all(market, caps);
                 CancelEverything::CancelAll {
-                    command: PermittedCommand::guarded(
-                        VenueCommand::CancelAll(CancelScope::Instrument(market)),
-                        guard,
-                        self.instance(),
-                    ),
-                    unanswered: self.cancel_many(&unanswered, caps),
+                    command,
+                    unanswered,
                 }
             }
             Some(why) => {
@@ -232,6 +208,55 @@ impl Registry {
                 }
             }
         }
+    }
+
+    /// The first of 0005's I7 conditions for an instrument cancel-all of `market` that fails,
+    /// in [`CancelAllRefusal`]'s order; `None` when one may be built.
+    pub(crate) fn cancel_all_refusal(
+        &self,
+        market: InstrumentId,
+        caps: &OrderCaps,
+    ) -> Option<CancelAllRefusal> {
+        if caps.cancel_all_instrument != Support::Native {
+            Some(CancelAllRefusal::Unsupported)
+        } else if !self.entries.holds_exclusive(market) {
+            Some(CancelAllRefusal::NoExclusiveLease)
+        } else if !self.foreign.viewed {
+            Some(CancelAllRefusal::NotViewed)
+        } else if self.foreign.in_view(market) {
+            Some(CancelAllRefusal::ForeignInView)
+        } else {
+            None
+        }
+    }
+
+    /// The instrument cancel-all of `market`, once [`Registry::cancel_all_refusal`] found
+    /// nothing against it, with the explicit cancels of our PendingNew and Unknown orders on
+    /// it, which it can miss.
+    pub(crate) fn instrument_cancel_all(
+        &mut self,
+        market: InstrumentId,
+        caps: &OrderCaps,
+    ) -> (PermittedCommand, CancelPlan) {
+        let unanswered = self.ours_on(market, |state| {
+            matches!(state, OrdState::PendingNew | OrdState::Unknown)
+        });
+        // Checked at submit against I7's inputs as they are now: the registry's hold of the
+        // market's exclusive lease and the foreign orders seen. Either moving may undo the
+        // guard it was built under; a change of state that leaves both (the kill switch, its
+        // lift) must not hold it back (0060; RB94-1).
+        let guard = Guard::exclusive(
+            self.entries.watch_exclusive(market),
+            self.foreign.watch(market),
+        );
+        (
+            PermittedCommand::guarded(
+                VenueCommand::CancelAll(CancelScope::Instrument(market)),
+                guard,
+                self.instance(),
+            ),
+            self.cancel_many(&unanswered, caps),
+        )
     }
 
     /// Our orders on `market` whose state `keep` takes, in client id order.

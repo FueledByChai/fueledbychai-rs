@@ -552,7 +552,8 @@ fn a_foreign_order_leaves_the_view_only_when_the_venue_ends_it() {
         VenueOrderState::Open,
     );
     reg.apply_update(&orphan, key(5));
-    let shown_orphan = shown_theirs(INST, Some(CidMatch::Ours(cid())), "v-orphan-2");
+    let orphan_cid = cid();
+    let shown_orphan = shown_theirs(INST, Some(CidMatch::Ours(orphan_cid)), "v-orphan-2");
     resync_from(
         &mut reg,
         SnapshotSource::Trustworthy,
@@ -560,6 +561,18 @@ fn a_foreign_order_leaves_the_view_only_when_the_venue_ends_it() {
         vec![shown_orphan],
     );
     clear(&mut reg, "own orphans");
+    // The resync registered it as an orphan (decision 0101), so the explicit cancels below
+    // would reach it too; the venue ends it here, leaving our two orders.
+    assert_eq!(reg.orphans(INST), vec![orphan_cid]);
+    reg.apply_update(
+        &theirs(
+            Some(CidMatch::Ours(orphan_cid)),
+            Some("v-orphan-2"),
+            VenueOrderState::Canceled(CancelReason::Requested),
+        ),
+        key(6),
+    );
+    assert!(reg.orphans(INST).is_empty());
 
     // Another engine's order on the other market leaves this market's view clear.
     let elsewhere = OrderUpdate {
