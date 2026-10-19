@@ -1,4 +1,4 @@
-# 0106 — A closed-loop replay is a shard member feeding each record at its recorded instant on a replayed clock the paused runtime moves, restamped into the shard's ingest order, augmenting 0006, 0100, 0103 and 0104
+# 0106 — A closed-loop replay is a shard member feeding each record at its recorded instant on a replayed clock the paused runtime moves, restamped into the shard's ingest order, augmenting 0006, 0056, 0100, 0103 and 0104
 
 Status: accepted
 Date: 2026-10-19
@@ -71,6 +71,13 @@ journal at their ingest positions (0103).
    millisecond are taken in the order the host polls its members. A journal whose instants and
    latencies are whole milliseconds replays at its instants exactly; one recorded live replays
    each command's latency up to a millisecond long. Either way two runs are identical.
+6. **An order-entry session's turn is deterministic.** 0056's unbiased `select!` polled what
+   can wake an epoch's turn (its frames, timers, HTTP results, submitted commands, request
+   deadlines and stop) from a random one, so a command a replayed input submitted inline and an
+   answer due on the same tick were taken in a random order, and two runs differed in their
+   order-entry journals (Reviewer B's RB-066n-1 on PR #178). The turn now polls them from the
+   one after the last turn's first, a rotation kept per session: no way to wake starves another,
+   as 0056 requires, and the order is the same on every run.
 
 ## Alternatives
 
