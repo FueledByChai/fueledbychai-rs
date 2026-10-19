@@ -50,7 +50,7 @@ use fbc_runtime::{
     Connector, ExecControl, ExecHandler, ExecOrders, ExecSession, ExecSessionConfig,
     InProcessStream, IngestClock, Ladder, Liveness, MdControl, MdHandler, MdSession,
     MdSessionConfig, Member, OrderEntryPeer, PeerFeed, ProxyConfig, RateLimiter, ReconnectPacing,
-    RpcIds, SafetyReserve, ShardHost, WriteStall,
+    RpcIds, SafetyReserve, ShardHost, SubmitRefusal, WriteStall,
 };
 use fbc_sim::{Bracket, PeerCounters, QueueConfig, SimCodec, SimConfig, SimLatency, SimPeer};
 use futures_util::{SinkExt, StreamExt};
@@ -649,6 +649,15 @@ async fn three_brackets_on_one_shard_fill_optimistic_then_middle_then_pessimisti
         let ready = world.book && world.oms.iter().all(|o| o.armed);
         if ready && !world.placed {
             world.placed = true;
+            // A session takes only its own account's authorizations, as the ladder does.
+            let stray = world.oms[1].place();
+            let refused = orders[0].submit(stray);
+            assert!(
+                matches!(refused, Err(SubmitRefusal::OtherAccount)),
+                "{refused:?}"
+            );
+            let stray = world.oms[1].place();
+            assert!(ladder.push(&orders[0], stray).is_err());
             for (i, orders) in orders.iter().enumerate() {
                 let auth = world.oms[i].place();
                 ladder.push(orders, auth).unwrap();
@@ -1289,4 +1298,119 @@ async fn an_epoch_whose_arm_fails_closes_its_stream_and_the_next_opens_it_again(
     assert!(authenticated >= 3, "{authenticated}");
     let epochs: Vec<u32> = ends.borrow().iter().map(|k| k.epoch).collect();
     assert!(epochs.windows(2).all(|w| w[0] < w[1]), "{epochs:?}");
+}
+
+#[test]
+fn a_greeting_due_before_an_answer_goes_first() {
+    use fbc_core::{Effect, Effects, EncodeCtx, ExecCodec};
+    let peer = Rc::new(RefCell::new(SimPeer::new(&sim_config(0))));
+    let mut p = peer.borrow_mut();
+    let mut codec = SimCodec::new(&sim_config(0));
+    // Open at 0, its greeting due at 3; a resync asked at 0 acts at 5 and is answered at 8.
+    p.open(MonoNs(0), WallNs(0));
+    let mut fx = Effects::new();
+    let ctx = EncodeCtx {
+        wall: WallNs(0),
+        mono: MonoNs(0),
+        nonces: NonceBlock::EMPTY,
+    };
+    codec.resync(&ctx, &mut fx);
+    let Some(Effect::Send { frame, .. }) = fx.as_slice().first() else {
+        panic!("{fx:?}");
+    };
+    p.on_frame(frame.bytes());
+    let due = p.take_due(MonoNs(10 * MS));
+    assert_eq!(due.len(), 2);
+    assert!(due[0].starts_with(b"ready"));
+    assert!(due[1].starts_with(b"resync"));
+}
+
+/// A SimPeer that also answers, once, with a frame that is not UTF-8.
+struct Noisy(SimPeer, bool);
+
+impl OrderEntryPeer for Noisy {
+    fn open(&mut self, mono: MonoNs, wall: WallNs) {
+        self.0.open(mono, wall);
+    }
+
+    fn close(&mut self, mono: MonoNs, wall: WallNs) {
+        self.0.close(mono, wall);
+    }
+
+    fn on_frame(&mut self, frame: &[u8]) {
+        self.0.on_frame(frame);
+    }
+
+    fn on_market(&mut self, env: &Envelope<MdEvent>) {
+        self.0.on_market(env);
+    }
+
+    fn on_market_epoch_end(&mut self, key: ConnKey) {
+        self.0.on_market_epoch_end(key);
+    }
+
+    fn next_due(&self) -> Option<MonoNs> {
+        self.0.next_due()
+    }
+
+    fn take_due(&mut self, now: MonoNs) -> Vec<Vec<u8>> {
+        let mut due = self.0.take_due(now);
+        if !due.is_empty() && !std::mem::replace(&mut self.1, true) {
+            due.push(vec![0xff, 0xfe]);
+        }
+        due
+    }
+}
+
+/// The decode errors a session's handler was told of.
+struct Undecoded(Shared, Rc<RefCell<Vec<ConnKey>>>);
+
+impl ExecHandler for Undecoded {
+    fn on_exec(&mut self, env: Envelope<ExecEvent>) {
+        ExecLog(Rc::clone(&self.0), 0).on_exec(env);
+    }
+
+    fn on_decode_error(&mut self, key: ConnKey) {
+        self.1.borrow_mut().push(key);
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_frame_that_is_not_utf8_is_read_as_binary_and_journaled_so() {
+    let clock = IngestClock::new();
+    let world = solo_world();
+    let peer = Rc::new(RefCell::new(Noisy(SimPeer::new(&sim_config(0)), false)));
+    let stream = InProcessStream::new(Rc::clone(&peer));
+    let config = exec_config(0, "ws://127.0.0.1:9/never", &clock, 2);
+    let codec = Box::new(SimCodec::new(&sim_config(0)));
+    let errors = Rc::new(RefCell::new(Vec::new()));
+    let handler = Undecoded(Rc::clone(&world), Rc::clone(&errors));
+    let (mut session, control) = ExecSession::in_process(config, codec, stream, handler).unwrap();
+    let journal = Rc::new(RefCell::new(Records::default()));
+    session.set_journal(fbc_runtime::Journal::new(Rc::clone(&journal)));
+    let run = session.run();
+    let drive = async {
+        for _ in 0..10_000 {
+            if !errors.borrow().is_empty() {
+                break;
+            }
+            tokio::time::sleep(ms(1)).await;
+        }
+        drop(control);
+    };
+    let (ran, ()) = tokio::join!(run, drive);
+    ran.unwrap();
+    // The greeting, then the binary frame, which the codec cannot read.
+    assert_eq!(errors.borrow().len(), 1);
+    assert_eq!(session.counters().decode_errors, 1);
+    let binary = journal.borrow().0.iter().any(|(_, r)| {
+        matches!(
+            r,
+            fbc_journal::Record::Inbound {
+                opcode: fbc_journal::Opcode::Binary,
+                ..
+            }
+        )
+    });
+    assert!(binary);
 }
