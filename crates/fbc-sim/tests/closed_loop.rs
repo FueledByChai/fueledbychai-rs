@@ -1327,6 +1327,14 @@ async fn replay_alone(
     clock: IngestClock,
     records: Vec<Result<Record, JournalError>>,
 ) -> Result<(), ShardError> {
+    alone(clock, records).await.0
+}
+
+/// [`replay_alone`]: how the run ended, the replay, and what its handler saw.
+async fn alone(
+    clock: IngestClock,
+    records: Vec<Result<Record, JournalError>>,
+) -> (Result<(), ShardError>, MdReplay<MdLog>, Shared) {
     let config = MdReplayConfig {
         venue: toy::ToyVenue::leak(),
         cfg: VenueConfig::new(),
@@ -1340,7 +1348,8 @@ async fn replay_alone(
         specs: toy::specs(),
         conn: MD.conn,
     };
-    let mut md = MdReplay::new(config, MdLog(solo(), None)).unwrap();
+    let world = solo();
+    let mut md = MdReplay::new(config, MdLog(Rc::clone(&world), None)).unwrap();
     let mut host = ShardHost::new(clock.clone());
     let closed = ClosedLoop {
         clock,
@@ -1349,8 +1358,10 @@ async fn replay_alone(
         stops: Vec::new(),
     };
     let mut decide = |_: &[InstrumentId], _: &mut Ladder| {};
-    host.run(vec![Member::md_replay(&mut md, closed)], &mut decide)
-        .await
+    let ran = host
+        .run(vec![Member::md_replay(&mut md, closed)], &mut decide)
+        .await;
+    (ran, md, world)
 }
 
 fn solo() -> Shared {
@@ -1412,5 +1423,93 @@ async fn a_damaged_text_frame_stops_the_replay_and_the_run() {
     assert_eq!(
         ran,
         Err(ShardError::Replay(ReplayFailure::NotUtf8 { ingest_seq: 7 }))
+    );
+}
+
+/// A closed-loop replay feeds its connection's timer firings and HTTP results at their
+/// recorded instants too, each restamped into the shard's ingest order; once it has played, the
+/// same replay fed on its own stamps with the recorded stamps again.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_closed_loop_replay_feeds_timers_and_http_results_and_then_lets_go_of_the_shard() {
+    let stamp = |seq: u64, ms: u64| Stamp {
+        ingest_seq: seq,
+        kernel_rx: None,
+        recv_mono: at(ms),
+        recv_wall: WallNs(WALL0 + i64::try_from(ms * MS).unwrap()),
+        conn: MD,
+    };
+    let records = vec![
+        Ok(opened()),
+        Ok(Record::Timer {
+            stamp: stamp(40, 2),
+            tag: fbc_core::TimerTag(1),
+        }),
+        Ok(Record::HttpResult {
+            stamp: stamp(41, 3),
+            tag: fbc_core::HttpTag(1),
+            result: Err(fbc_core::HttpFailure::Lost),
+        }),
+        Ok(Record::inbound(
+            stamp(42, 4),
+            RawFrame::Text(&trade(BID, 1, 1)),
+        )),
+    ];
+    let (ran, mut md, world) = alone(IngestClock::replayed(WallNs(WALL0)), records).await;
+    assert_eq!(ran, Ok(()));
+    let counters = md.counters();
+    assert_eq!((counters.timers, counters.http, counters.frames), (1, 1, 1));
+    // The trade took the shard's third ingest sequence, at its recorded instant.
+    let trades = |world: &Shared| -> Vec<Stamp> {
+        world
+            .borrow()
+            .seen
+            .iter()
+            .filter_map(|s| match s {
+                Seen::Md(stamp, MdEvent::Trade { .. }) => Some(*stamp),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        trades(&world),
+        [Stamp {
+            ingest_seq: 2,
+            ..stamp(42, 4)
+        }]
+    );
+    md.feed(&Record::inbound(
+        stamp(43, 5),
+        RawFrame::Text(&trade(BID, 1, 2)),
+    ))
+    .unwrap();
+    assert_eq!(trades(&world)[1], stamp(43, 5));
+}
+
+/// What stops a closed-loop replay says why; its configuration shows no records or controls.
+#[test]
+fn what_stops_a_closed_loop_replay_says_why() {
+    let said = [
+        ReplayFailure::LiveClock,
+        ReplayFailure::Journal("cut short".to_owned()),
+        ReplayFailure::NotUtf8 { ingest_seq: 7 },
+    ]
+    .map(|failure| ShardError::Replay(failure).to_string());
+    assert_eq!(
+        said,
+        [
+            "a closed-loop replay stopped: a closed-loop replay needs a replayed clock, not a live one",
+            "a closed-loop replay stopped: the journal cannot be read: cut short",
+            "a closed-loop replay stopped: the text frame of ingest sequence 7 is not UTF-8",
+        ]
+    );
+    let closed = ClosedLoop {
+        clock: IngestClock::new(),
+        records: Vec::<Result<Record, JournalError>>::new(),
+        settle: ms(5),
+        stops: Vec::new(),
+    };
+    assert_eq!(
+        format!("{closed:?}"),
+        "ClosedLoop { settle: 5ms, stops: 0, .. }"
     );
 }

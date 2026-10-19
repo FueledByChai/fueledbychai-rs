@@ -322,10 +322,10 @@ impl<H: MdHandler> MdReplay<H> {
                 last = last.max(at);
                 until(clock, at).await;
             }
-            self.feed(&record).map_err(|e| match e {
-                ReplayError::NotUtf8 { ingest_seq } => ReplayFailure::NotUtf8 { ingest_seq },
-                other => ReplayFailure::Journal(other.to_string()),
-            })?;
+            // A record refused is a damaged text frame: the only refusal of a feed.
+            if let Err(ReplayError::NotUtf8 { ingest_seq }) = self.feed(&record) {
+                return Err(ReplayFailure::NotUtf8 { ingest_seq });
+            }
         }
         self.finish();
         Ok(last)
