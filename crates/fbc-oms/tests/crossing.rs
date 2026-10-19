@@ -767,6 +767,63 @@ fn a_crossing_intent_is_refused_by_the_resting_cap_and_the_inventory_cap() {
 }
 
 #[test]
+fn a_position_past_the_inventory_cap_by_more_than_the_resting_cap_admits_no_crossing() {
+    // Decision 0108's consequence (Reviewer B on PR #180): with no other order on the side, a
+    // reducing sell of q on a long P passes the inventory cap only if P - q <= cap and the
+    // resting cap only if q <= resting, so a cross exists only while P <= cap + resting.
+    let caps = ioc_venue(&[]);
+    let mut mint = mint();
+    // Long 61 under caps of 50 and 11: the cross of 11 is built.
+    let mut reg = quoting_resting(61, 11);
+    let mut p = planner();
+    let desired = book().with_crossing(Side::Sell, cross(9_900, 11, 1));
+    let plan = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, MonoNs(0));
+    assert_eq!(
+        shape(&plan),
+        vec![(Stage::Reducing, "place", Side::Sell, CROSSING_LEVEL, true)]
+    );
+    // Long 62: a cross of 11 leaves a worst case of 51, past the inventory cap, and one of 12
+    // (or the whole 62) is past the resting cap, in Quoting and in Exit alike.
+    let refusal = |qty: i64| {
+        if qty <= 11 {
+            CapRefusal::InventoryCap {
+                inst: INST,
+                side: Side::Sell,
+                worst: Some(lots(62 - qty)),
+                cap: lots(CAP),
+            }
+        } else {
+            CapRefusal::RestingCap {
+                inst: INST,
+                side: Side::Sell,
+                resting: Some(lots(qty)),
+                cap: lots(11),
+            }
+        }
+    };
+    for exit in [false, true] {
+        for qty in [11, 12, 62] {
+            let mut reg = quoting_resting(62, 11);
+            if exit {
+                flatten(&mut reg);
+            }
+            let mut p = planner();
+            let desired = book().with_crossing(Side::Sell, cross(9_900, qty, 1));
+            let plan = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, MonoNs(0));
+            assert!(plan.commands.is_empty(), "{:?}", shape(&plan));
+            assert_eq!(
+                refused_crossing(&plan),
+                vec![(
+                    Side::Sell,
+                    PlanRefusal::Place(OmsError::Capped(refusal(qty)))
+                )],
+                "exit {exit}, qty {qty}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_crossing_intent_on_a_venue_without_reduce_only_is_never_sent() {
     let caps = OrderCaps {
         reduce_only: false,
