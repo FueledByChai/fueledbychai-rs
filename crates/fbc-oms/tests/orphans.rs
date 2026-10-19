@@ -1188,3 +1188,109 @@ fn a_place_authorized_during_the_cooldown_is_refused_at_submit_once_another_orph
         Err(StaleAuthorization::StateChanged { market: INST, .. })
     ));
 }
+
+/// A named registry under the caps whose first trustworthy resync, at 2 000, seeded `INST` at
+/// `pos` and `OTHER` flat, showing no order.
+fn seeded_at_2000(pos: i64) -> Registry {
+    let mut reg = arm::named(Registry::with_caps(caps()));
+    let report = resync_at(&mut reg, SnapshotSource::Trustworthy, 2_000, vec![], pos);
+    assert_eq!(report.seeded.len(), 2, "{report:?}");
+    assert_eq!(reg.position(INST), Some(SignedLots(pos)));
+    reg
+}
+
+#[test]
+fn a_snapshot_requested_before_the_seed_registers_no_orphan_and_counts_no_fill_again() {
+    // Codex's r4310661297 on PR #171: the seed, requested at 2 000, holds the venue's long 2,
+    // which includes an untimed fill of our order x that it did not show; the fill arrives at
+    // 2 500. A snapshot requested at 1 000 and answered late still shows x open: it was read
+    // before the seed, so it proves nothing about the seed, and x's fill is not counted again.
+    let mut reg = seeded_at_2000(2);
+    let mut l = ledger();
+    let x = cid();
+    let routed = fill_at(&mut reg, &mut l, x, "x", Side::Buy, 2, 2, None, 2_500);
+    assert_eq!(routed, FillRouted::InSnapshot(x));
+    let report = resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        1_000,
+        vec![ours(x, "x", Side::Buy)],
+        0,
+    );
+    assert!(
+        report.checks.contains(&PositionCheck::Stale(INST)),
+        "{report:?}"
+    );
+    assert!(report.orphans.is_empty(), "{report:?}");
+    assert!(reg.get(x).is_none(), "not registered from a stale snapshot");
+    assert!(reg.orphans(INST).is_empty());
+    assert_eq!(reg.position(INST), Some(SignedLots(2)));
+    // A later snapshot, x ended, agrees with the venue's long 2.
+    let report = resync_at(&mut reg, SnapshotSource::Trustworthy, 3_000, vec![], 2);
+    assert_eq!(reg.position(INST), Some(SignedLots(2)));
+    assert!(
+        report.checks.contains(&PositionCheck::Agrees {
+            inst: INST,
+            position: SignedLots(2)
+        }),
+        "{report:?}"
+    );
+}
+
+#[test]
+fn a_snapshot_requested_before_the_seed_keeps_the_fills_an_orphan_took_before_it_was_registered() {
+    // Codex's r4310661297 on PR #171: the seed at 2 000 does not show x (it reached the venue
+    // after the read); x fills 2, untimed, arriving at 2 500, which the seed holds only because
+    // it did not show x. A snapshot requested at 1 000 not showing x proves nothing, so the fill
+    // is kept; the snapshot at 3 000 shows x open and the venue's long 2: x is registered and
+    // its fill counted.
+    let mut reg = seeded_at_2000(0);
+    let mut l = ledger();
+    let x = cid();
+    let routed = fill_at(&mut reg, &mut l, x, "x", Side::Buy, 2, 2, None, 2_500);
+    assert_eq!(routed, FillRouted::InSnapshot(x));
+    let report = resync_at(&mut reg, SnapshotSource::Trustworthy, 1_000, vec![], 0);
+    assert!(
+        report.checks.contains(&PositionCheck::Stale(INST)),
+        "{report:?}"
+    );
+    let mut shown = ours(x, "x", Side::Buy);
+    shown.cum_filled = lots(2);
+    resync_at(&mut reg, SnapshotSource::Trustworthy, 3_000, vec![shown], 2);
+    assert_eq!(reg.orphans(INST), vec![x]);
+    assert_eq!(reg.position(INST), Some(SignedLots(2)));
+}
+
+#[test]
+fn the_resync_that_registers_an_orphan_compares_the_position_with_its_earlier_fills_counted() {
+    // Codex's r4310661291 on PR #171: a fill of our order o after the seed, which the seed holds
+    // only because it did not show o, is counted as the snapshot at 2 000 shows o open; the same
+    // resync compares the venue's long 2 with the inventory that counts it, and agrees.
+    let mut reg = seeded(0);
+    let mut l = ledger();
+    let o = cid();
+    let routed = fill_at(
+        &mut reg,
+        &mut l,
+        o,
+        "o",
+        Side::Buy,
+        2,
+        2,
+        Some(1_400),
+        1_500,
+    );
+    assert_eq!(routed, FillRouted::InSnapshot(o));
+    let mut shown = ours(o, "o", Side::Buy);
+    shown.cum_filled = lots(2);
+    let report = resync_at(&mut reg, SnapshotSource::Trustworthy, 2_000, vec![shown], 2);
+    assert_eq!(reg.orphans(INST), vec![o]);
+    assert_eq!(reg.position(INST), Some(SignedLots(2)));
+    assert!(
+        report.checks.contains(&PositionCheck::Agrees {
+            inst: INST,
+            position: SignedLots(2)
+        }),
+        "{report:?}"
+    );
+}
