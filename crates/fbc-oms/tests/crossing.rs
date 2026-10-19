@@ -961,3 +961,113 @@ fn a_crossing_order_never_sent_leaves_its_attempt_to_be_planned_again() {
         assert_ne!(again.commands[0].cid, c);
     }
 }
+
+#[test]
+fn a_crossing_attempt_already_built_or_older_than_the_last_built_is_never_planned_again() {
+    // Codex r4317142569: attempts 1, 2, then 1 again, each order terminal before the next: the
+    // last is never planned, as an attempt not past the last one built is stale; a NotSent
+    // order frees its own attempt only, never an older one.
+    let caps = ioc_venue(&[]);
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let mut now = 0;
+    let mut cross_once = |attempt: u64, p: &mut ExecutionPlanner, reg: &mut Registry| {
+        now += 1_000_000_000;
+        let desired = book().with_crossing(Side::Sell, cross(9_900, 2, attempt));
+        plan_and_send(p, &desired, reg, &caps, &mut mint, MonoNs(now))
+    };
+    for (n, attempt) in [1, 2].into_iter().enumerate() {
+        let plan = cross_once(attempt, &mut p, &mut reg);
+        assert_eq!(plan.commands.len(), 1, "attempt {attempt}");
+        let c = plan.commands[0].cid;
+        let v = format!("v{attempt}");
+        ack(&mut reg, c, &v);
+        ended(&mut reg, c, Side::Sell, &v, expired(), 10 + n as u64);
+    }
+    let stale = cross_once(1, &mut p, &mut reg);
+    assert!(stale.commands.is_empty(), "{:?}", shape(&stale));
+    assert_eq!(
+        refused_crossing(&stale),
+        vec![(Side::Sell, PlanRefusal::StaleAttempt { last: 2 })]
+    );
+    // The last attempt built, standing, is silent: nothing more to do for it.
+    let same = cross_once(2, &mut p, &mut reg);
+    assert!(same.commands.is_empty() && same.refused.is_empty());
+    // Attempt 3 is built and never sent: 3 is planned again, 1 and 2 still are not.
+    let plan = cross_once(3, &mut p, &mut reg);
+    let c = plan.commands[0].cid;
+    drop(plan);
+    let item = ItemRef {
+        idx: 0,
+        cid: Some(c),
+        vid: None,
+    };
+    let not_sent = SubmitOutcome::NotSent(fbc_core::NotSentReason::RateBudget);
+    reg.on_outcome(c, OrderOp::Place, &item, &not_sent, MonoNs(1))
+        .unwrap();
+    for older in [1, 2] {
+        let stale = cross_once(older, &mut p, &mut reg);
+        assert!(stale.commands.is_empty(), "{older}: {:?}", shape(&stale));
+        assert_eq!(
+            refused_crossing(&stale),
+            vec![(Side::Sell, PlanRefusal::StaleAttempt { last: 3 })]
+        );
+    }
+    let again = cross_once(3, &mut p, &mut reg);
+    assert_eq!(
+        shape(&again),
+        vec![(Stage::Reducing, "place", Side::Sell, CROSSING_LEVEL, true)]
+    );
+}
+
+#[test]
+fn a_crossing_intent_is_never_sent_where_the_venue_can_neither_take_nor_emulate_an_ioc() {
+    // Codex r4317142581: a synthetic IOC needs a GTC limit and a cancel that can name the
+    // order once acknowledged (its venue id or our client id). Without either, the limit could
+    // rest and fill later, so nothing is built.
+    let no_gtc = OrderCaps {
+        tifs: TagSet::of(&[Tif::Fok]),
+        ..order_caps()
+    };
+    let no_cancel_ref = OrderCaps {
+        cancel_refs: TagSet::of(&[]),
+        ..order_caps()
+    };
+    let nonce_only_conflicting = OrderCaps {
+        cancel_refs: TagSet::of(&[RefKind::PlacementNonce]),
+        ..ioc_venue(&[(Feature::Ioc, Feature::ReduceOnly)])
+    };
+    for caps in [no_gtc, no_cancel_ref, nonce_only_conflicting] {
+        let mut reg = quoting(10);
+        let mut mint = mint();
+        let mut p = planner();
+        let desired = book().with_crossing(Side::Sell, cross(9_900, 10, 1));
+        let plan = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, MonoNs(0));
+        assert!(plan.commands.is_empty(), "{caps:?}: {:?}", shape(&plan));
+        assert_eq!(
+            refused_crossing(&plan),
+            vec![(Side::Sell, PlanRefusal::NoSyntheticIoc)]
+        );
+        assert!(reg.is_empty());
+        // A reduce-only IOC quote at a level the venue would take only as a synthetic IOC is
+        // refused the same way.
+        let level = book().with(
+            Side::Sell,
+            0,
+            DesiredQuote {
+                tif: Tif::Ioc,
+                ..reduce_only(limit(9_900, 4))
+            },
+        );
+        let caps = OrderCaps {
+            tifs: TagSet::of(&caps.tifs.iter().chain([Tif::Ioc]).collect::<Vec<_>>()),
+            flag_conflicts: vec![(Feature::Ioc, Feature::ReduceOnly)],
+            ..caps
+        };
+        let plan = plan_and_send(&mut p, &level, &mut reg, &caps, &mut mint, LATER);
+        assert!(plan.commands.is_empty(), "{caps:?}: {:?}", shape(&plan));
+        assert_eq!(plan.refused.len(), 1);
+        assert_eq!(plan.refused[0].why, PlanRefusal::NoSyntheticIoc);
+    }
+}

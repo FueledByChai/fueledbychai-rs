@@ -476,6 +476,17 @@ pub enum PlanRefusal {
     /// The venue takes no reduce-only order ([`OrderCaps::reduce_only`]): a crossing intent is
     /// never sent without the flag (decision 0107).
     ReduceOnlyUnsupported,
+    /// The venue takes no reduce-only IOC and cannot emulate one: it has no good-till-cancelled
+    /// limit, or no single cancel that can name the order once acknowledged (by venue id or
+    /// client id), so the synthetic IOC's limit could rest and fill later (decision 0107).
+    NoSyntheticIoc,
+    /// A crossing attempt older than the last one built for the side
+    /// ([`CrossingIntent::attempt`]): attempts only increase, so a stale one is never planned
+    /// (decision 0107).
+    StaleAttempt {
+        /// The last attempt an order was built for.
+        last: u64,
+    },
     /// A place or amend that reduces the position would leave an emulated reduce-only order
     /// resting on its side more than is left to reduce, so both could fill and take the
     /// position past zero: the emulated order is cancelled, and the command is built by the
