@@ -767,10 +767,12 @@ mod tests {
     type Log = Rc<RefCell<Vec<&'static str>>>;
 
     /// A member that reads every message waiting on `rx`, each a ready operation that spends
-    /// the task's coop budget, logging `name` and stamping an input for each when it has one.
+    /// the task's coop budget, logging `name` and stamping an input for each when it has one;
+    /// with `refill`, it then sends itself more than a budget's worth again, never running dry.
     fn reader(
         mut rx: tokio::sync::mpsc::UnboundedReceiver<()>,
         named: Option<(&'static str, &Log, &IngestClock)>,
+        refill: Option<tokio::sync::mpsc::UnboundedSender<()>>,
     ) -> Member<'static> {
         let named = named.map(|(name, log, clock)| (name, Rc::clone(log), clock.clone()));
         let run = poll_fn(move |cx| {
@@ -778,6 +780,11 @@ mod tests {
                 if let Some((name, log, clock)) = &named {
                     log.borrow_mut().push(name);
                     clock.stamp(ConnKey { conn: 2, epoch: 0 }, None);
+                }
+            }
+            if let Some(tx) = &refill {
+                while rx.len() < 512 {
+                    tx.send(()).unwrap();
                 }
             }
             Poll::Pending
@@ -802,6 +809,7 @@ mod tests {
         reference: usize,
         planned: usize,
         until: usize,
+        firehose: bool,
     ) -> Vec<&'static str> {
         let clock = IngestClock::new();
         let log = Log::default();
@@ -813,6 +821,7 @@ mod tests {
         for _ in 0..reference {
             ref_tx.send(()).unwrap();
         }
+        let refill = firehose.then(|| busy_tx.clone());
         let (shared, orders) = session_orders(2, &clock);
         let (exec_log, exec_clock) = (Rc::clone(&log), clock.clone());
         let mut first = true;
@@ -837,8 +846,8 @@ mod tests {
             orders: Some(orders.clone()),
         };
         let members = vec![
-            reader(busy_rx, None),
-            reader(ref_rx, Some(("ref", &log, &clock))),
+            reader(busy_rx, None, refill),
+            reader(ref_rx, Some(("ref", &log, &clock)), None),
             exec,
         ];
         let (pass_log, mut decided) = (Rc::clone(&log), false);
@@ -871,7 +880,7 @@ mod tests {
     #[tokio::test]
     async fn a_busy_member_spending_the_coop_budget_leaves_no_delivered_frame_unread_between_two_commands()
      {
-        let log = budgeted(0, 0, 2, 4).await;
+        let log = budgeted(0, 0, 2, 4, false).await;
         assert_eq!(log[..4], ["pass", "cmd", "ref", "cmd"]);
     }
 
@@ -879,8 +888,67 @@ mod tests {
     /// an input waiting behind a busy member's backlog is taken before the pass (point 2).
     #[tokio::test]
     async fn a_busy_member_spending_the_coop_budget_leaves_no_ready_input_out_of_the_pass() {
-        let log = budgeted(BACKLOG, 1, 0, 2).await;
+        let log = budgeted(BACKLOG, 1, 0, 2, false).await;
         assert_eq!(log[..2], ["ref", "pass"]);
+    }
+
+    /// Codex P1 r4309505785 on PR #164: a member that spends every fresh coop budget it is
+    /// given, first in the shard, starves no later member: the next poll starts at the first
+    /// member the budget ran out before, and a round ends once every member has had a poll that
+    /// left budget, or one with the budget fresh. The pass still comes, and so do the ladder's
+    /// commands, the reference message read between them.
+    #[tokio::test]
+    async fn a_member_that_always_spends_the_coop_budget_starves_no_later_member() {
+        let log = budgeted(0, 1, 0, 2, true).await;
+        assert_eq!(log[..2], ["ref", "pass"]);
+        let log = budgeted(0, 0, 2, 4, true).await;
+        assert_eq!(log[..4], ["pass", "cmd", "ref", "cmd"]);
+    }
+
+    /// Codex P1 r4309505789 on PR #164: a consumer that drops the run while a ladder goes out
+    /// is handed back the command its session had not taken and every one not yet submitted.
+    #[tokio::test]
+    async fn dropping_the_run_while_a_ladder_goes_out_hands_back_what_was_not_taken() {
+        #[derive(Default)]
+        struct Back(Rc<Cell<usize>>, bool);
+        impl Decide for Back {
+            fn decide(&mut self, _: &[InstrumentId], ladder: &mut Ladder) {
+                let _ = (self, ladder);
+            }
+            fn unsubmitted(&mut self, _: Unsubmitted) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let clock = IngestClock::new();
+        let (shared, orders) = session_orders(2, &clock);
+        let mut exec = scripted(&clock, &shared, &[Act::Stamp]);
+        exec.orders = Some(orders.clone());
+        let back = Rc::new(Cell::new(0));
+        struct Plan(Back, ExecOrders);
+        impl Decide for Plan {
+            fn decide(&mut self, _: &[InstrumentId], ladder: &mut Ladder) {
+                if !std::mem::replace(&mut self.0.1, true) {
+                    ladder.push_control(&self.1, ControlCommand::FeeQuery);
+                    ladder.push_control(&self.1, ControlCommand::RefreshDeadMan);
+                }
+            }
+            fn unsubmitted(&mut self, command: Unsubmitted) {
+                self.0.unsubmitted(command);
+            }
+        }
+        let mut decide = Plan(Back(Rc::clone(&back), false), orders.clone());
+        let mut host = ShardHost::new(clock.clone());
+        let mut run = Box::pin(host.run(vec![exec], &mut decide));
+        let mut polls = 0;
+        while !shared.waiting() {
+            assert!(futures_util::FutureExt::now_or_never(&mut run).is_none());
+            tokio::task::yield_now().await;
+            polls += 1;
+            assert!(polls < 1_000);
+        }
+        drop(run);
+        assert_eq!(back.get(), 2);
+        assert_eq!(host.unsubmitted(), 2);
     }
 
     #[test]
