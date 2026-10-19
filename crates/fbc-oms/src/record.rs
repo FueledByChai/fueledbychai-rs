@@ -315,7 +315,7 @@ pub struct OrderRecord {
     /// The venue ids the venue itself said ended: a terminal update naming one arrived, or a
     /// cancel naming one was refused because the order had already ended (Reviewer B's
     /// RB840-11 on PR #171). A snapshot showing the order open under one of them lags the
-    /// venue, so it is no orphan (decision 0107).
+    /// venue, so it is no orphan (decision 0108).
     venue_ended: Vec<VenueOrderId>,
 }
 

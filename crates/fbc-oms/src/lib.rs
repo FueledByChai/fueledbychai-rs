@@ -140,7 +140,7 @@
 //! fill moves the inventory once in every state, Killed included; a foreign one is flagged and
 //! moves nothing.
 //!
-//! Orphans (0005's I7, decision 0107; `tests/orphans.rs`): open orders under our namespace that
+//! Orphans (0005's I7, decision 0108; `tests/orphans.rs`): open orders under our namespace that
 //! the registry does not hold, which a resync finds on a market seeded before it, are
 //! registered from the snapshot (from an untrustworthy source only those a live order event or
 //! fill also showed), and each market holding any that is not
@@ -163,7 +163,7 @@
 //! place, a batch or an amend whose market changed state since (the kill switch, a disarm, an
 //! arming call, lease names given again) is refused with nothing written, and one built in
 //! Exit, or during an orphan cooldown, also once a fill or a seed moved its market's inventory
-//! since (its position revision, decisions 0066 and 0107); an instrument cancel-all only once 0005's I7 guard it was built under
+//! since (its position revision, decisions 0066 and 0108); an instrument cancel-all only once 0005's I7 guard it was built under
 //! moved (the registry's hold of the market's exclusive lease changed, or an order not ours
 //! was seen on the market), never for the kill switch alone; and a cancel or a cancel-many
 //! always goes through.
