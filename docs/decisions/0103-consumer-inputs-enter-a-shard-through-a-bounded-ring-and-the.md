@@ -46,19 +46,27 @@ shard's `IngestClock`.
    kind. Timers fire by deadline, a tie in the order armed. A run fires only timers armed before
    its current poll began, so a handler that re-arms with no delay yields to the rest of the
    shard between firings, and each firing is charged to the task's coop budget as the ring's
-   inputs are, so a backlog of due timers yields to the shard's other members. An arm is counted, and arms nothing, when the timers are inert, when
-   their inputs have ended, or when the delay lies past the end of the clock (0023's rule for
-   such waits). The run ends once every sender has dropped and no timer is pending; its end, or
+   inputs are, so a backlog of due timers yields to the shard's other members. An arm that arms
+   nothing is refused by name and counted: once their inputs have ended (`ArmRefusal::Ended`),
+   or for a delay past the end of the clock (`ArmRefusal::PastClock`, 0023's rule for such
+   waits), so a consumer never loses a timer, such as a force-close escalation, without knowing.
+   Inert timers take every arm and arm nothing (counted). One inputs fire a set of timers at a
+   time (`InputsError::TimersInUse`); new inputs, as a restarted shard makes, may take the
+   timers of ended ones, and the ended ones end nothing of them.
+5. **The end.** The run ends once every sender has dropped and no timer is pending. Its end, or
    its drop (before its first poll included, as when the host drops it for another member's
-   error), closes the ring and drops what was armed.
-5. **Format version 9 keeps the sequence on the record.** 0101's kind 14 gains `ingest_seq`:
+   error), ends the inputs for good: the ring refuses every push, what it still held is counted
+   (`InputCounters::unhandled`) and never handed on, what was armed is dropped, every later arm
+   is refused, and a second run returns at once handing nothing. A consumer whose handlers arm
+   timers for the shard's whole life keeps a sender for it.
+6. **Format version 9 keeps the sequence on the record.** 0101's kind 14 gains `ingest_seq`:
    flag byte 2 is an input the shard stamped, followed by the sequence (`u64`), then the bytes;
    0 (an annotation) and 1 (an input the consumer journaled itself) are written as version 8
    wrote them. An annotation with a sequence cannot be written (`JournalError::Unencodable`).
    A version 8 segment holding flag 2 is malformed, and a reader of version 8 refuses a version
    9 segment at its header, naming the version. The reader reads versions 2 to 9;
    `fixtures/journal/v8` holds a version 8 journal that shows it.
-6. **Replay hands them back in place and arms nothing.** `MdReplay::set_inputs` gives a replay
+7. **Replay hands them back in place and arms nothing.** `MdReplay::set_inputs` gives a replay
    the consumer's input handler: each input with an ingest sequence goes back to it at its place
    in the journal, between the records it was written between, with its recorded sequence,
    time, kind and bytes, and is counted (`MdReplayCounters::inputs`). An annotation, an input
@@ -94,6 +102,9 @@ shard's `IngestClock`.
   by its fields names `ingest_seq`.
 - A consumer that wants Stop to wait for nothing sizes the ring for its bursts and checks the
   push's answer; `InputSender::refused` counts what it lost.
+- A consumer checks every arm's answer: a refused timer, such as a force-close escalation, is
+  the consumer's to replace (escalate at once, or alarm). A consumer re-running a shard after a
+  member's error makes new inputs and hands their sender to its operator's thread.
 
 ## What would show this was wrong
 
@@ -102,3 +113,4 @@ shard's `IngestClock`.
 - A push that blocked the pushing thread or the shard, or a full ring that took a push.
 - A replay that fires a consumer timer, or a firing missing from the journal of the shard that
   took it.
+- An arm that fires nothing and was not refused, or an input handed on after its inputs ended.
