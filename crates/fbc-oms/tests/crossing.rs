@@ -28,15 +28,15 @@ use arm::{leases, start};
 use common::{fill, fill_id, lease_dir, lots, order_caps, rejected, vid};
 use fbc_core::{
     AccountKey, AckLevel, Bps, CancelReason, Channel, CidMatch, CidMint, ClientOrderId, ExchNs,
-    ExchTsKind, Feature, FillIdent, InstrumentId, ItemRef, MonoNs, Namespace,
-    NamespaceLease, NewOrder, OrderCaps, OrderKind, OrderUpdate, RefKind, RejectKind, RpcId, Side,
-    SignedLots, SubmitOutcome, TagSet, Ticks, Tif, VenueCommand, VenueOrderState, WallNs,
+    ExchTsKind, Feature, FillIdent, InstrumentId, ItemRef, MonoNs, Namespace, NamespaceLease,
+    NewOrder, OrderCaps, OrderKind, OrderUpdate, RefKind, RejectKind, RpcId, Side, SignedLots,
+    SubmitOutcome, TagSet, Ticks, Tif, VenueCommand, VenueOrderState, WallNs,
 };
 use fbc_oms::{
     Admission, CROSSING_LEVEL, CapRefusal, CrossingIntent, DesiredBook, DesiredQuote, Downgrade,
-    ExecutionPlanner, ExitRefusal, FillLedger, FillTime, HeldReason, LadderConfig,
-    LedgerConfig, MarketCapsConfig, OmsError, OrderKey, OrderOp, Plan, PlanRefusal, Planned,
-    PlannerConfig, PreTradeCaps, ReduceFallback, Registry, ResyncSnapshot, Stage, StateRefusal,
+    ExecutionPlanner, ExitRefusal, FillLedger, FillTime, HeldReason, LadderConfig, LedgerConfig,
+    MarketCapsConfig, OmsError, OrderKey, OrderOp, Plan, PlanRefusal, Planned, PlannerConfig,
+    PreTradeCaps, ReduceFallback, Registry, ResyncSnapshot, Stage, StateRefusal,
 };
 
 const INST: InstrumentId = InstrumentId::new(1);
@@ -245,7 +245,14 @@ fn ack(reg: &mut Registry, c: ClientOrderId, v: &str) {
 }
 
 /// Ends our order `c` on `side` (venue id `v`) in `state`, under the ordering key `n`.
-fn ended(reg: &mut Registry, c: ClientOrderId, side: Side, v: &str, state: VenueOrderState, n: u64) {
+fn ended(
+    reg: &mut Registry,
+    c: ClientOrderId,
+    side: Side,
+    v: &str,
+    state: VenueOrderState,
+    n: u64,
+) {
     let u = OrderUpdate {
         cid: Some(CidMatch::Ours(c)),
         vid: Some(vid(v)),
@@ -351,7 +358,11 @@ fn a_crossing_intent_is_one_reduce_only_ioc_at_its_cap_where_the_caps_declare_io
     let moved = book().with_crossing(Side::Sell, cross(9_890, 10, 1));
     let again = plan_and_send(&mut p, &moved, &mut reg, &caps, &mut mint, LATER);
     assert!(again.commands.is_empty(), "{:?}", shape(&again));
-    let held: Vec<_> = again.held.iter().map(|h| (h.side, h.crossing, h.cid)).collect();
+    let held: Vec<_> = again
+        .held
+        .iter()
+        .map(|h| (h.side, h.crossing, h.cid))
+        .collect();
     assert_eq!(held, vec![(Side::Sell, true, c)]);
     ack(&mut reg, c, "v1");
     let acked = plan_and_send(&mut p, &moved, &mut reg, &caps, &mut mint, LATER2);
@@ -421,7 +432,14 @@ fn a_synthetic_crossing_on_a_venue_cancelling_after_the_ack_is_cancelled_once_ac
     );
     assert_eq!(next.commands[0].cid, c);
     // Terminal, the same attempt is not crossed again.
-    ended(&mut reg, c, Side::Sell, "v1", VenueOrderState::Canceled(CancelReason::Requested), 2);
+    ended(
+        &mut reg,
+        c,
+        Side::Sell,
+        "v1",
+        VenueOrderState::Canceled(CancelReason::Requested),
+        2,
+    );
     let after = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, LATER2);
     assert!(after.commands.is_empty(), "{:?}", shape(&after));
 }
@@ -589,7 +607,14 @@ fn a_crossing_intent_is_refused_in_killed_and_cancel_only() {
             StateRefusal::CancelOnly(INST)
         };
         let desired = book().with_crossing(Side::Sell, cross(9_900, 10, 1));
-        let plan = plan_and_send(&mut p, &desired, &mut reg, &ioc_venue(&[]), &mut mint, LATER);
+        let plan = plan_and_send(
+            &mut p,
+            &desired,
+            &mut reg,
+            &ioc_venue(&[]),
+            &mut mint,
+            LATER,
+        );
         assert!(plan.commands.is_empty(), "{:?}", shape(&plan));
         assert_eq!(
             refused_crossing(&plan),
@@ -859,22 +884,80 @@ fn a_crossing_intent_beside_an_emulated_exit_waits_for_its_cancel_and_is_not_cli
     let first = book().with(Side::Sell, 0, maker);
     let plan = plan_and_send(&mut p, &first, &mut reg, &caps, &mut mint, MonoNs(0));
     let emulated = plan.commands[0].cid;
-    assert_eq!(plan.commands[0].downgrades, vec![Downgrade::EmulatedReduceOnly]);
+    assert_eq!(
+        plan.commands[0].downgrades,
+        vec![Downgrade::EmulatedReduceOnly]
+    );
     ack(&mut reg, emulated, "e1");
     // The consumer escalates: the maker exit goes, the crossing comes.
     let escalate = book().with_crossing(Side::Sell, cross(9_900, 10, 1));
     let plan = plan_and_send(&mut p, &escalate, &mut reg, &caps, &mut mint, LATER);
-    assert_eq!(shape(&plan), vec![(Stage::Cancel, "cancel", Side::Sell, 0, false)]);
+    assert_eq!(
+        shape(&plan),
+        vec![(Stage::Cancel, "cancel", Side::Sell, 0, false)]
+    );
     assert_eq!(plan.commands[0].cid, emulated);
     assert_eq!(
         refused_crossing(&plan),
         vec![(Side::Sell, PlanRefusal::AwaitsEmulatedCancel)]
     );
-    ended(&mut reg, emulated, Side::Sell, "e1", VenueOrderState::Canceled(CancelReason::Requested), 2);
+    ended(
+        &mut reg,
+        emulated,
+        Side::Sell,
+        "e1",
+        VenueOrderState::Canceled(CancelReason::Requested),
+        2,
+    );
     let plan = plan_and_send(&mut p, &escalate, &mut reg, &caps, &mut mint, LATER2);
     assert_eq!(
         shape(&plan),
         vec![(Stage::Reducing, "place", Side::Sell, CROSSING_LEVEL, true)]
     );
     assert_crossing(placed(&plan.commands[0]), Side::Sell, 9_900, 10, Tif::Ioc);
+}
+
+#[test]
+fn a_crossing_order_never_sent_leaves_its_attempt_to_be_planned_again() {
+    // A place built and then not sent (the stream down, the rate budget spent) reached no
+    // venue: the same attempt is planned again once the order is terminal, by a pass or after
+    // an `on_fill` check freed it.
+    for via_on_fill in [false, true] {
+        let caps = ioc_venue(&[]);
+        let mut reg = quoting(10);
+        let mut mint = mint();
+        let mut p = planner();
+        let desired = book().with_crossing(Side::Sell, cross(9_900, 10, 1));
+        let plan = p
+            .plan(&desired, &mut reg, &caps, ACCT, &mut mint, MonoNs(0))
+            .unwrap();
+        let mut commands = plan.commands;
+        let c = commands[0].cid;
+        drop(commands.pop());
+        let item = ItemRef {
+            idx: 0,
+            cid: Some(c),
+            vid: None,
+        };
+        let not_sent = SubmitOutcome::NotSent(fbc_core::NotSentReason::Disconnected);
+        reg.on_outcome(c, OrderOp::Place, &item, &not_sent, MonoNs(1))
+            .unwrap();
+        assert!(reg.get(c).unwrap().state().is_terminal());
+        if via_on_fill {
+            assert!(
+                p.on_fill(&mut reg, &caps, ACCT, INST)
+                    .unwrap()
+                    .commands
+                    .is_empty()
+            );
+            assert_eq!(p.crossing_order(ACCT, INST, Side::Sell), None);
+        }
+        let again = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, LATER);
+        assert_eq!(
+            shape(&again),
+            vec![(Stage::Reducing, "place", Side::Sell, CROSSING_LEVEL, true)],
+            "via on_fill: {via_on_fill}"
+        );
+        assert_ne!(again.commands[0].cid, c);
+    }
 }
