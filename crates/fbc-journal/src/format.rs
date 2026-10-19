@@ -461,6 +461,7 @@ fn encode_body(
             kind,
             input,
             bytes,
+            ..
         } => {
             e.u8(CONSUMER);
             e.u64(at.0);
@@ -1140,6 +1141,7 @@ pub(crate) fn decode_version(body: &[u8], version: u16) -> Result<(Record, Vec<S
                 1 => true,
                 _ => return Err("consumer input flag"),
             },
+            ingest_seq: None,
             bytes: Opaque(d.bytes()?.to_vec()),
         },
         _ => return Err("record kind"),
@@ -2013,7 +2015,6 @@ mod tests {
     /// cannot hold one, refuses it as a kind it does not have.
     #[test]
     fn a_consumer_record_round_trips_and_is_refused_before_version_8() {
-        assert_eq!(VERSION, 8);
         let bytes = vec![0xff, 0, b'x', 0xc3];
         for (kind, input) in [
             (0, false),
@@ -2025,6 +2026,7 @@ mod tests {
                 at: MonoNs(u64::MAX - 3),
                 kind,
                 input,
+                ingest_seq: None,
                 bytes: Opaque(bytes.clone()),
             };
             assert_eq!(record.blanked(), record);
@@ -2045,9 +2047,68 @@ mod tests {
             at: MonoNs(0),
             kind: 9,
             input: false,
+            ingest_seq: None,
             bytes: Opaque(Vec::new()),
         };
         assert_eq!(round_trip(&empty), empty);
+    }
+
+    /// FBC-hvqi: an input the shard stamped round-trips with its ingest sequence, which format
+    /// version 9 holds after the flag (2); a version 8 segment, which has none, refuses that
+    /// flag; an annotation, which no shard stamps, cannot be written with one, leaving the buffer
+    /// as it was.
+    #[test]
+    fn a_stamped_consumer_input_round_trips_with_its_ingest_sequence_from_version_9() {
+        assert_eq!(VERSION, 9);
+        let bytes = b"Stop".to_vec();
+        for seq in [0, 41, u64::MAX] {
+            let record = Record::Consumer {
+                at: MonoNs(7),
+                kind: 3,
+                input: true,
+                ingest_seq: Some(seq),
+                bytes: Opaque(bytes.clone()),
+            };
+            let mut body = Vec::new();
+            encode(&record, &key(), &mut body).unwrap();
+            // The kind byte, the time, the consumer's kind, the flag, the sequence, the bytes.
+            assert_eq!(body.len(), 1 + 8 + 2 + 1 + 8 + 4 + bytes.len());
+            assert_eq!(body[11], 2);
+            assert_eq!(body[12..20], seq.to_le_bytes());
+            assert_eq!(decode(&body).unwrap(), (record.clone(), Vec::new()));
+            assert_eq!(decode_version(&body, 8), Err("consumer input flag"));
+            assert_eq!(round_trip(&record), record);
+        }
+        // Inputs the consumer journaled itself, and annotations, are written as version 8 wrote
+        // them.
+        for input in [false, true] {
+            let record = Record::Consumer {
+                at: MonoNs(7),
+                kind: 3,
+                input,
+                ingest_seq: None,
+                bytes: Opaque(bytes.clone()),
+            };
+            let mut body = Vec::new();
+            encode(&record, &key(), &mut body).unwrap();
+            assert_eq!(body.len(), 1 + 8 + 2 + 1 + 4 + bytes.len());
+            assert_eq!(decode_version(&body, 8), decode(&body));
+        }
+        let annotated = Record::Consumer {
+            at: MonoNs(7),
+            kind: 3,
+            input: false,
+            ingest_seq: Some(1),
+            bytes: Opaque(bytes),
+        };
+        let mut out = vec![9];
+        assert!(matches!(
+            encode(&annotated, &key(), &mut out),
+            Err(JournalError::Unencodable(
+                "an annotation with an ingest sequence"
+            ))
+        ));
+        assert_eq!(out, [9]);
     }
 
     #[test]
@@ -2056,6 +2117,7 @@ mod tests {
             at: MonoNs(5),
             kind: 2,
             input: true,
+            ingest_seq: None,
             bytes: Opaque(b"Start".to_vec()),
         };
         let mut good = Vec::new();
@@ -2066,9 +2128,14 @@ mod tests {
             body
         };
         let cases: Vec<(Vec<u8>, Bad)> = vec![
-            // An input flag that is neither 0 nor 1.
-            (with_flag(2), "consumer input flag"),
+            // An input flag that is neither 0, 1 nor 2.
+            (with_flag(3), "consumer input flag"),
             (with_flag(0xff), "consumer input flag"),
+            // A stamped input cut short in its sequence.
+            (
+                [&with_flag(2)[..12], &[0; 7][..]].concat(),
+                "record ends early",
+            ),
             // Cut short in the time, the kind, the flag and the bytes, and a length past them.
             (good[..5].to_vec(), "record ends early"),
             (good[..10].to_vec(), "record ends early"),
@@ -2093,6 +2160,7 @@ mod tests {
             at: MonoNs(1),
             kind: 1,
             input: true,
+            ingest_seq: None,
             bytes: Opaque(b"operator Stop".to_vec()),
         };
         let mut body = Vec::new();
@@ -2767,12 +2835,16 @@ mod tests {
                     stamp: self.stamp(),
                     rpc: RpcId(self.next()),
                 },
-                10 => Record::Consumer {
-                    at: MonoNs(self.next()),
-                    kind: self.next() as u16,
-                    input: self.flip(),
-                    bytes: Opaque(self.any_bytes()),
-                },
+                10 => {
+                    let input = self.flip();
+                    Record::Consumer {
+                        at: MonoNs(self.next()),
+                        kind: self.next() as u16,
+                        input,
+                        ingest_seq: (input && self.flip()).then(|| self.next()),
+                        bytes: Opaque(self.any_bytes()),
+                    }
+                }
                 8 => Record::InboundControl {
                     stamp: self.stamp(),
                     frame: match self.below(4) {

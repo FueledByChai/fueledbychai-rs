@@ -68,6 +68,7 @@ use fbc_oms::{Authorization, ControlCommand};
 
 use crate::exec_orders::{ExecOrders, Submitted};
 use crate::exec_session::{ExecHandler, ExecSession, ExecSessionError};
+use crate::inputs::{ConsumerInputs, InputHandler};
 use crate::journal::Journal;
 use crate::md_venue::MdVenue;
 use crate::session::{MdHandler, MdSession, SessionError};
@@ -123,6 +124,19 @@ impl<'a> Member<'a> {
     /// A venue's market data: its [`MdVenue::run`].
     pub fn md_venue<H: MdHandler + 'static>(venue: &'a mut MdVenue<H>) -> Member<'a> {
         let run = async move { venue.run().await.map_err(ShardError::Md) };
+        let orders = None;
+        Member {
+            run: Box::pin(run),
+            orders,
+        }
+    }
+
+    /// The consumer's own inputs: [`ConsumerInputs::run`], which never fails.
+    pub fn inputs<H: InputHandler + 'a>(inputs: &'a mut ConsumerInputs<H>) -> Member<'a> {
+        let run = async move {
+            inputs.run().await;
+            Ok(())
+        };
         let orders = None;
         Member {
             run: Box::pin(run),

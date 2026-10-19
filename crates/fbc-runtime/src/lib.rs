@@ -88,6 +88,14 @@
 //! command at a time, polling every session between two, so a command a handler submits
 //! meanwhile goes ahead of the ladder's remaining ones and waits for at most the one in progress.
 //!
+//! [`ConsumerInputs`] carries the consumer's own inputs into the shard (FBC-hvqi, decision
+//! 0102): a bounded ring its other threads push operator commands and reloads into, which
+//! refuses and counts a push when full and never blocks, and the timers its handlers arm
+//! ([`ConsumerTimers`]). Each input and each firing is stamped with the shard's next ingest
+//! sequence, journaled as an input consumer record and then handed to the consumer's
+//! [`InputHandler`]; decoder replay hands them back at the same ingest positions and arms no
+//! live timer.
+//!
 //! Not here yet: client certificates and certificate pinning.
 //! Apart from a codec's HTTP request (its own timeout) and a session's connection attempts and
 //! socket writes (the consumer's attempt deadline and write-stall window), no call here has a
@@ -101,6 +109,7 @@ mod exec_gate;
 mod exec_orders;
 mod exec_session;
 pub mod http;
+mod inputs;
 mod journal;
 mod liveness;
 mod md_venue;
@@ -146,6 +155,10 @@ pub use error::{Cause, NetError, Step};
 pub use exec_orders::{ExecOrders, RpcIds, SubmitRefusal};
 pub use exec_session::{
     ExecControl, ExecCounters, ExecHandler, ExecSession, ExecSessionConfig, ExecSessionError,
+};
+pub use inputs::{
+    ConsumerInput, ConsumerInputs, ConsumerInputsConfig, ConsumerTimers, InputCounters,
+    InputHandler, InputRefusal, InputSender, InputsError, MAX_CAPACITY,
 };
 pub use journal::Journal;
 pub use liveness::{Liveness, LivenessError};

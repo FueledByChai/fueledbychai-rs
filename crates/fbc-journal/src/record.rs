@@ -444,6 +444,11 @@ pub enum Record {
     /// input, which a replay hands back to the consumer at its place, rather than an
     /// annotation, which a replay passes over as it does an outbound frame.
     ///
+    /// `ingest_seq` is the ingest sequence the shard stamped an input with as it took it
+    /// (fbc-runtime's consumer inputs, FBC-hvqi), which a replay hands it back at; `None` for an
+    /// input the consumer journaled itself, which no shard stamped, and always for an
+    /// annotation (the writer refuses an annotation with one). Format version 8 has none.
+    ///
     /// The library never reads `bytes`: nothing about the consumer's strategy enters this
     /// repository (decision 0001). They are written verbatim, with no redaction span, so the
     /// consumer puts no credential in them; `Debug` shows them by length only.
@@ -451,6 +456,7 @@ pub enum Record {
         at: MonoNs,
         kind: u16,
         input: bool,
+        ingest_seq: Option<u64>,
         bytes: Opaque,
     },
 }

@@ -54,6 +54,7 @@ fn consumer(at: u64, kind: u16, input: bool, bytes: &[u8]) -> Record {
         at: MonoNs(at),
         kind,
         input,
+        ingest_seq: None,
         bytes: Opaque(bytes.to_vec()),
     }
 }
