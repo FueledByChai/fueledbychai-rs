@@ -1451,3 +1451,53 @@ fn a_lost_order_shown_open_again_keeps_the_venue_ids_an_amend_replaced() {
     assert_eq!(reg.orphans(INST), vec![c]);
     assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(5)));
 }
+
+#[test]
+fn a_lost_order_shown_open_again_under_another_venue_id_takes_its_earlier_ids_as_replaced() {
+    // Codex's r4315910340 on PR #171: our buy, open as `a`, with a fill naming `t`, goes on
+    // the ladder with an unanswered cancel and ends Lost; a later snapshot shows it open as
+    // `b` (an amend's update was missed). Registered again, its earlier ids `a` and `t` count
+    // as replaced by `b`: a delayed cancel naming only one of them does not end it.
+    let mut reg = seeded(0);
+    let mut l = ledger();
+    arm::start(&mut reg, INST);
+    let order = buy(5);
+    let c = order.cid;
+    place(&mut reg, order).unwrap();
+    reg.placement_sent(c, MonoNs(1_100), WallNs(1_100)).unwrap();
+    let mut open = update(Some(c), VenueOrderState::Open, 0);
+    open.vid = Some(vid("a"));
+    reg.apply_update(&open, key(1_200));
+    let routed = fill_at(&mut reg, &mut l, c, "t", Side::Buy, 1, 1, None, 1_250);
+    assert!(matches!(routed, FillRouted::Ours(..)), "{routed:?}");
+    reg.cancel_sent(c, RpcId(7), MonoNs(1_400)).unwrap();
+    reg.on_outcome(
+        c,
+        OrderOp::Cancel(RpcId(7)),
+        &ItemRef {
+            idx: 0,
+            cid: Some(c),
+            vid: None,
+        },
+        &SubmitOutcome::Unknown,
+        MonoNs(1_500),
+    )
+    .unwrap();
+    let report = resync_at(&mut reg, SnapshotSource::Trustworthy, 2_000, vec![], 1);
+    assert_eq!(report.ladder.lost, vec![c], "{report:?}");
+    let mut shown = ours(c, "b", Side::Buy);
+    shown.cum_filled = lots(1);
+    resync_at(&mut reg, SnapshotSource::Trustworthy, 3_000, vec![shown], 1);
+    assert_eq!(reg.orphans(INST), vec![c]);
+    assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(4)));
+
+    for (n, old) in [(3_500, "a"), (3_600, "t")] {
+        let mut late = update(None, canceled(), 1);
+        late.vid = Some(vid(old));
+        reg.apply_update(&late, key(n));
+        assert!(!reg.get(c).unwrap().state().is_terminal(), "{old}");
+    }
+    assert_eq!(reg.orphans(INST), vec![c]);
+    assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(4)));
+    assert_eq!(reg.position(INST), Some(SignedLots(1)));
+}
