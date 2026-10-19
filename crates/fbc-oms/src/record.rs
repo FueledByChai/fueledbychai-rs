@@ -312,6 +312,11 @@ pub struct OrderRecord {
     /// or the planner kept it for a quote that reduces the position: from then on it counts as
     /// an order that reduces the position, whatever its placement said ([`Self::reduces`]).
     counted_reducing: bool,
+    /// The venue ids the venue itself said ended: a terminal update naming one arrived, or a
+    /// cancel naming one was refused because the order had already ended (Reviewer B's
+    /// RB840-11 on PR #171). A snapshot showing the order open under one of them lags the
+    /// venue, so it is no orphan (decision 0107).
+    venue_ended: Vec<VenueOrderId>,
 }
 
 impl OrderRecord {
@@ -361,6 +366,7 @@ impl OrderRecord {
             tag: None,
             removal: None,
             counted_reducing: false,
+            venue_ended: Vec::new(),
         }
     }
 
@@ -429,6 +435,24 @@ impl OrderRecord {
         }
         self.cum_venue = self.cum_venue.max(ended.cum_venue);
         self.set_cum_fills(ended.cum_fills());
+        self.venue_ended.clone_from(&ended.venue_ended);
+    }
+
+    /// Whether the venue itself said the order ended under `vid`: a terminal update naming it,
+    /// or a cancel naming it refused because the order had already ended (Reviewer B's
+    /// RB840-11 on PR #171).
+    pub(crate) fn venue_ended(&self, vid: &VenueOrderId) -> bool {
+        self.venue_ended.contains(vid)
+    }
+
+    /// Records that the venue said the order ended under `vid`, or under its current venue id
+    /// when `vid` is `None`; nothing when neither is known.
+    fn note_venue_ended(&mut self, vid: Option<&VenueOrderId>) {
+        if let Some(v) = vid.or(self.vid.as_ref())
+            && !self.venue_ended.contains(v)
+        {
+            self.venue_ended.push(v.clone());
+        }
     }
 
     /// The consumer's opaque tag of the last place or amend the execution planner built for
@@ -935,6 +959,11 @@ impl OrderRecord {
     /// fills alone then cover every total the venue may hold.
     pub fn apply_update(&mut self, u: &OrderUpdate, key: OrderKey) -> Applied {
         if self.state.is_terminal() {
+            if terminal_kind(&u.state).is_some() {
+                // The venue's own ending of an order the registry ended already (Lost, say):
+                // a snapshot showing it open under this id later lags the venue (RB840-11).
+                self.note_venue_ended(u.vid.as_ref());
+            }
             return Applied::IgnoredLate;
         }
         if u.vid.as_ref().is_some_and(|v| self.is_superseded(v)) {
@@ -1061,7 +1090,8 @@ impl OrderRecord {
     /// says it does not know the order (`NotFound`), which, like no answer, moves a PendingNew
     /// order to Unknown. An amend or cancel not sent or refused leaves the order as it was
     /// with nothing in flight, except a cancel refused because the order already ended, which
-    /// waits for the order's terminal event, and an outcome naming another request than the
+    /// waits for the order's terminal event (on an order registered from a snapshot, whose
+    /// terminal event may have come before it was, it goes on the Unknown ladder instead), and an outcome naming another request than the
     /// command in flight's, which leaves that command in flight; unanswered or not known to the venue, it is left
     /// to the Unknown ladder, its fate awaited ([`Self::fate_unanswered`]). The ladder's
     /// tombstone cancel, accepted for good, ends the order Canceled, and refused because the
@@ -1073,6 +1103,12 @@ impl OrderRecord {
         outcome: &SubmitOutcome,
         now: MonoNs,
     ) -> OutcomeApplied {
+        let closed = matches!(outcome, SubmitOutcome::Rejected(r)
+            if matches!(r.kind, RejectKind::AlreadyTerminal(_)));
+        if closed && matches!(op, OrderOp::Cancel(_)) {
+            // The venue says the order it names ended (Reviewer B's RB840-11 on PR #171).
+            self.note_venue_ended(vid);
+        }
         if self.state.is_terminal() {
             return OutcomeApplied::Unchanged;
         }
@@ -1146,6 +1182,12 @@ impl OrderRecord {
             (OrderOp::Cancel(_), SubmitOutcome::Rejected(r))
                 if matches!(r.kind, RejectKind::AlreadyTerminal(_)) =>
             {
+                if self.from_snapshot {
+                    // Registered from a snapshot, its terminal event may have come before it
+                    // was, so none may come now: the Unknown ladder settles it, a trustworthy
+                    // absence ending it Lost (Reviewer B's RB840-11 on PR #171).
+                    return self.await_ladder(op, now);
+                }
                 OutcomeApplied::Unchanged
             }
             (_, SubmitOutcome::Rejected(r)) if r.kind == RejectKind::NotFound => {

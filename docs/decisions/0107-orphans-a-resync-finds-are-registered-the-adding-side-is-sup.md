@@ -59,7 +59,9 @@ and how an orphan is held while its cancel is out (FBC-840, BT-402).
    A trustworthy resync forgets the live sightings. An order of ours the registry holds as
    ended Lost (the Unknown ladder ended it on snapshots that lagged it past the settle, 0094's
    up to 3480 ms) that a trustworthy, non-stale snapshot shows open, under a venue id no other
-   order of ours holds and no amend of it replaced, is an orphan too: it is in `untracked` and
+   order of ours holds, no amend of it replaced and the venue itself did not say ended (a
+   terminal update naming it arrived after the ladder ended the order, or a cancel naming it was
+   refused as already ended: the snapshot lags the venue, Reviewer B's RB840-11), is an orphan too: it is in `untracked` and
    registered again from the snapshot with the fills counted on it and the venue ids an amend
    replaced and the largest cumulative fill the venue reported (Codex's r4316124597), every
    other id the registry knows it by (its earlier current one, one a fill
@@ -99,7 +101,11 @@ and how an orphan is held while its cancel is out (FBC-840, BT-402).
    which a snapshot's foreign order puts there; with it, the explicit cancels of our PendingNew
    and Unknown orders, which it can miss. Otherwise it says which condition failed and builds the
    explicit cancels. The consumer builds them again for each market a resync names, so the
-   explicit cancels repeat on each resync until the orphans end.
+   explicit cancels repeat on each resync until the orphans end. An order registered from a
+   snapshot whose cancel the venue refuses as already ended goes on the Unknown ladder, since its
+   terminal event may have come before it was registered: a trustworthy snapshot not showing it
+   ends it Lost (Reviewer B's RB840-11 on PR #171; any other order's terminal event still settles
+   such a refusal).
 5. **The consumer's numbers.** `OrphanConfig` holds the cooldown and the level limit, with no
    defaults; zero is refused for either.
 

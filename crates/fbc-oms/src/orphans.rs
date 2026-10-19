@@ -14,7 +14,9 @@
 //! one-read seed held only for not showing it move the inventory as it is registered
 //! (`src/resync.rs`). An order of ours the registry holds as ended Lost that a trustworthy
 //! snapshot shows open is one too: registered again with the fills counted on it, so it rests
-//! on both caps (Reviewer B's RB840-8 on PR #171). An order
+//! on both caps (Reviewer B's RB840-8 on PR #171), unless the venue itself said it ended under
+//! the id shown (Reviewer B's RB840-11). An orphan whose cancel the venue refuses as already
+//! ended goes on the Unknown ladder, which a trustworthy absence ends Lost. An order
 //! not ours (another namespace's, a non-canonical client id, or one nothing attributes) is
 //! never one (I4).
 //!
