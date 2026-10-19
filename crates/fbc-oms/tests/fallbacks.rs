@@ -1018,3 +1018,116 @@ fn fills_the_venue_reported_before_their_fill_events_count_against_an_emulated_o
     );
     assert_eq!(pass.commands[0].cid, emulated);
 }
+
+#[test]
+fn a_resting_order_whose_quote_becomes_a_synthetic_ioc_of_the_same_shape_is_cancelled() {
+    // Codex r4309743199: a GTC reduce-only ask rests; the quote becomes an IOC with reduce-only
+    // at the same price, which the venue takes only as a synthetic IOC of the same wire shape.
+    // The resting order is cancelled as an IOC's would be, never kept.
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = conflicting(&[(Feature::Ioc, Feature::ReduceOnly)]);
+    let resting = reduce_only(limit(9_990, 4));
+    let plan = plan_and_send(
+        &mut p,
+        &book().with(Side::Sell, 0, resting.clone()),
+        &mut reg,
+        &caps,
+        &mut mint,
+        MonoNs(0),
+    );
+    let c = plan.commands[0].cid;
+    assert!(plan.commands[0].downgrades.is_empty());
+    ack(&mut reg, c, "v0");
+    let ioc = book().with(
+        Side::Sell,
+        0,
+        DesiredQuote {
+            tif: Tif::Ioc,
+            ..resting
+        },
+    );
+    let pass = plan_and_send(&mut p, &ioc, &mut reg, &caps, &mut mint, MonoNs(1));
+    assert_eq!(shape(&pass), vec![(Stage::Cancel, "cancel", Side::Sell, 0)]);
+    assert_eq!(pass.commands[0].cid, c);
+}
+
+#[test]
+fn a_resting_order_whose_quote_becomes_emulated_reduce_only_of_the_same_shape_is_protected() {
+    // Codex r4309743199: a post-only ask classified reducing rests without the venue flag; the
+    // quote becomes an emulated reduce-only exit of the same wire shape. The order is kept,
+    // and from then on cancelled on overshoot.
+    let mut reg = quoting(10);
+    let mut l = ledger();
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]);
+    let classified = DesiredQuote {
+        post_only: true,
+        reducing: true,
+        ..limit(10_010, 10)
+    };
+    let first = book()
+        .with(Side::Sell, 0, classified)
+        .with(Side::Sell, 1, limit(10_020, 4));
+    let plan = plan_and_send(&mut p, &first, &mut reg, &caps, &mut mint, MonoNs(0));
+    let (exit, plain) = (plan.commands[0].cid, plan.commands[1].cid);
+    assert!(plan.commands[0].downgrades.is_empty());
+    ack(&mut reg, exit, "v0");
+    ack(&mut reg, plain, "v1");
+    let emulated = book()
+        .with(
+            Side::Sell,
+            0,
+            maker_exit(10_010, 10, ReduceFallback::EmulateReduceOnly),
+        )
+        .with(Side::Sell, 1, limit(10_020, 4));
+    let kept = plan_and_send(&mut p, &emulated, &mut reg, &caps, &mut mint, MonoNs(1));
+    assert!(kept.commands.is_empty(), "{:?}", shape(&kept));
+    // The plain ask fills 4: long 6, and the exit of 10 would cross zero.
+    fill_of(&mut reg, &mut l, plain, Side::Sell, 4, "f1");
+    let cancels = p.on_fill(&mut reg, &caps, ACCT, INST).unwrap().commands;
+    assert_eq!(cancels.len(), 1);
+    assert_eq!(cancels[0].cid, exit);
+}
+
+#[test]
+fn an_order_amended_as_reducing_counts_against_an_emulated_order() {
+    // Codex r4309743205: a post-only ask placed unclassified is amended with the reducing
+    // classification; it then reduces the position like any reducer, so an emulated exit placed
+    // after it gets only what is left.
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = amending(conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]));
+    let ask = |px, reducing| DesiredQuote {
+        post_only: true,
+        reducing,
+        ..limit(px, 4)
+    };
+    let plan = plan_and_send(
+        &mut p,
+        &book().with(Side::Sell, 0, ask(10_010, false)),
+        &mut reg,
+        &caps,
+        &mut mint,
+        MonoNs(0),
+    );
+    let c = plan.commands[0].cid;
+    ack(&mut reg, c, "v0");
+    let next = book().with(Side::Sell, 0, ask(10_020, true)).with(
+        Side::Sell,
+        1,
+        maker_exit(10_030, 20, ReduceFallback::EmulateReduceOnly),
+    );
+    let pass = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER);
+    assert_eq!(
+        shape(&pass),
+        vec![
+            (Stage::Reducing, "amend", Side::Sell, 0),
+            (Stage::Reducing, "place", Side::Sell, 1),
+        ]
+    );
+    assert_emulated(placed(&pass.commands[1]), 6);
+}
