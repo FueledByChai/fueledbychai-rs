@@ -35,9 +35,13 @@ caps again when it is authorized (0082), and releases a held place whose command
    to the runtime, which polls the I/O and time drivers before it resumes the host, then polls
    every member once, until such a round stamps no input. The members are polled in one task
    poll and share its coop budget, so a member with a backlog can spend it and leave a later
-   member's socket reporting nothing ready though a frame was delivered: a round that ends
-   with the budget spent is followed by another (`tokio::task::coop::has_budget_remaining`),
-   and only a round that ends with budget left counts. That a yield polls the drivers is the
+   member's socket reporting nothing ready though a frame was delivered. So when the budget
+   runs out (`tokio::task::coop::has_budget_remaining`), the next poll of every member starts
+   at the first member it ran out before (after the first member polled, when that one spent
+   it), and a round is repeated until every member still running has had a poll that left
+   budget, so it read all it had ready, or one that began the task poll, its budget whole, so
+   a member that never runs dry has had its share and starves no other and ends no round
+   late. That a yield polls the drivers is the
    pinned tokio's behaviour (0019 pins it exactly: `yield_now` hands the waker to the scheduler,
    which wakes it only once it has run out of ready tasks and polled the driver), not a promise
    of its documentation, so a test pins it (`tests/shard_host.rs`) and a tokio that stops doing
@@ -89,7 +93,9 @@ caps again when it is authorized (0082), and releases a held place whose command
    failed first (a nonce source reserving another count, which 0057 has end the session with
    nothing reported). Nothing of either reached a codec, so no `on_submitted` reports it. The
    session keeps only that one command once it ends; any other still waiting is dropped, as
-   0057 has it. Withdrawing such an authorization in
+   0057 has it. A consumer that drops the run while a ladder goes out is handed back the same:
+   the command submitted and not taken, and every one not yet submitted, after the members'
+   orders were ended (not as a panic unwinds). Withdrawing such an authorization in
    fbc-oms is FBC-6ezy's.
 
 ## Alternatives
