@@ -58,10 +58,13 @@
 //!   user_cancel_ws or user_cancel_batch_ws, which do not say who sent it) while no cancel of
 //!   ours covers it is noted ([`Note::CancelNotOurs`], with the venue's time on the event) after
 //!   its [`Note::Order`]. A cancel of ours covers an order from the moment the session reports
-//!   it sent, in flight or answered, whatever its answer: a cancel or cancel-many naming it (a
-//!   replace's, a sweep's, Stop's, or a Safety cancel of [`ExecHandler::on_unprotected`]), or a
-//!   cancel-all of its market (or of the account) submitted while the order was ours and not
-//!   ended; the registry's own count of cancels sent for it is read as well. Submitted but not
+//!   it sent, in flight or answered, until the venue refuses it for that order (or it turns
+//!   out not sent after all): a cancel or cancel-many naming it (a replace's, a sweep's, Stop's,
+//!   or a Safety cancel of [`ExecHandler::on_unprotected`]), or a cancel-all of its market (or
+//!   of the account) submitted while the order was ours and not ended. A refused one (a cancel
+//!   refused for its rate, waiting to be sent again) covers nothing from its refusal on, so
+//!   another program's cancel of the order, still live, is not ours (Codex r4309154204 on PR
+//!   #159); an Unknown one still may land, and still covers. Submitted but not
 //!   yet reported sent, it is only pending and covers nothing: the session decodes a frame
 //!   waiting in a turn before it writes what was queued, so another program's cancel read then
 //!   is not ours (Codex r4308625182 on PR #159), and one reported not sent wrote nothing (Codex
@@ -326,6 +329,33 @@ impl Coverage {
         if sent {
             for cid in cids {
                 self.covered.entry(cid).or_default().insert(rpc);
+            }
+        }
+    }
+
+    /// The venue refused request `rpc`, or it was not sent after all (its write failed), for
+    /// order `cid` (`None`: for every order it covers): it no longer covers it, so another
+    /// program's cancel of that order, still live, while ours waits to be sent again is not ours
+    /// (Codex r4309154204 / RB-aoh5-4 on PR #159). Another request of ours may still cover it.
+    pub fn refused(&mut self, rpc: RpcId, cid: Option<ClientOrderId>) {
+        let uncover = |rpcs: &mut HashSet<RpcId>| {
+            rpcs.remove(&rpc);
+            !rpcs.is_empty()
+        };
+        match cid {
+            Some(cid) => {
+                if let Some(rpcs) = self.covered.get_mut(&cid)
+                    && !uncover(rpcs)
+                {
+                    self.covered.remove(&cid);
+                }
+                if let Some(cids) = self.pending.get_mut(&rpc) {
+                    cids.retain(|c| *c != cid);
+                }
+            }
+            None => {
+                self.covered.retain(|_, rpcs| uncover(rpcs));
+                self.pending.remove(&rpc);
             }
         }
     }
@@ -643,9 +673,11 @@ impl Link {
         self.covered.retain(live);
     }
 
-    /// Whether a cancel of ours covers our order `cid` (module documentation).
+    /// Whether a cancel of ours covers our order `cid` (module documentation): only one
+    /// reported sent and not refused. The registry's lifetime count of cancels sent is not read:
+    /// it stays past a refusal (Codex r4309154204 on PR #159).
     fn cancel_of_ours(&self, cid: ClientOrderId) -> bool {
-        self.covered.covers(cid) || self.reg.get(cid).is_some_and(|r| r.cancels_sent() > 0)
+        self.covered.covers(cid)
     }
 
     /// The items of `cmd`, each naming one of our orders.
@@ -770,6 +802,26 @@ impl Link {
                 })
                 .collect(),
         };
+        // A refused cancel of ours, or one not sent after all, stops covering what it names (a
+        // cancel-all's item: the order it states; the whole request: every order it covers).
+        if matches!(
+            outcome,
+            SubmitOutcome::Rejected(_) | SubmitOutcome::NotSent(_)
+        ) {
+            match &item {
+                None => self.covered.refused(rpc, None),
+                Some(named) => match items.get(usize::from(named.idx)) {
+                    Some(Item::Cancel(cid)) => self.covered.refused(rpc, Some(*cid)),
+                    Some(_) => {}
+                    None if items.is_empty() => {
+                        if let Some(cid) = named.cid {
+                            self.covered.refused(rpc, Some(cid));
+                        }
+                    }
+                    None => {}
+                },
+            }
+        }
         for (it, named) in targets {
             let (cid, op) = Link::op(it, rpc);
             if let Err(e) = self.reg.on_outcome(cid, op, &named, &outcome, now) {
