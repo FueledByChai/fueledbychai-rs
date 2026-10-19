@@ -119,7 +119,10 @@
 //! due while a write waits on a stalled peer is handled once the write ends, within the
 //! write-stall window. Once the session has stopped, nothing more is reported. A command
 //! submitted while a handler is handed an input's events, on this session or another sharing
-//! its [`IngestClock`], is attributed to that input when it is written (decision 0100); the
+//! its [`IngestClock`], is attributed to that input when it is written (decision 0100), and
+//! once a Safety one is written, a cancel or a reducing order, its tick-to-wire from that
+//! input's kernel receive time, when it has one, is handed to
+//! [`ExecHandler::on_tick_to_wire`] (FBC-qfm, as decision 0031 for market data); the
 //! session holds a submission, for [`ShardHost`](crate::ShardHost), from its submission until
 //! the turn that takes it has written it.
 //!
@@ -279,6 +282,21 @@ pub trait ExecHandler {
     /// default.
     fn on_decode_error(&mut self, key: ConnKey) {
         let _ = key;
+    }
+
+    /// The tick-to-wire of a Safety-class write on the session's stream (design §5.3, decisions
+    /// 0031, 0100; FBC-qfm): called once its write is done, when the input it is attributed to
+    /// is a frame with a kernel receive time. A command is attributed to the input whose events
+    /// a handler was being handed when it was submitted, on this session or another sharing its
+    /// [`IngestClock`], so a protective cancel the market-data handler submits on a frame is
+    /// reported here against that frame's `kernel_rx`; the codec's own Safety frames are
+    /// attributed to the input they answer. Nothing is reported where the input has no
+    /// `kernel_rx` (off Linux, a timer firing, an HTTP result, a consumer input, a command
+    /// submitted outside any handler), for a Normal write or for one that failed or stalled.
+    /// The runtime keeps no samples: the consumer aggregates them for its latency gates.
+    /// Nothing by default.
+    fn on_tick_to_wire(&mut self, sample: TickToWire) {
+        let _ = sample;
     }
 }
 
@@ -1714,7 +1732,7 @@ impl<H: ExecHandler> ExecSink for Late<'_, H> {
 /// even when the control drops before it is handed on, from another thread or as the codec
 /// redacts it, and replay, which feeds an open epoch's inputs, feeds the codec what it was
 /// handed live (Codex P1 r4215753453 on PR #115). Its effects are not executed after the stop,
-/// nor its events handed on. Tick-to-wire on order entry is FBC-qfm's.
+/// nor its events handed on. A Safety write's tick-to-wire reaches the handler (FBC-qfm).
 struct Feed<'a, H> {
     codec: &'a mut dyn ExecCodec,
     handler: &'a mut H,
@@ -1792,7 +1810,10 @@ impl<H: ExecHandler> EpochInputs for Feed<'_, H> {
         }
     }
 
-    fn on_tick_to_wire(&mut self, _: TickToWire) {}
+    /// Handed to the handler as the write completes (FBC-qfm).
+    fn on_tick_to_wire(&mut self, sample: TickToWire) {
+        self.handler.on_tick_to_wire(sample);
+    }
 
     fn sent_rpc(&mut self, call: RpcCall) {
         self.rpcs.sent(call, Instant::now());
@@ -1999,5 +2020,19 @@ mod tests {
             reason: "test",
         };
         assert!(!carried(&[frame, reconnect], false));
+    }
+
+    #[test]
+    fn an_exec_handler_by_default_ignores_a_tick_to_wire() {
+        let mut seen = Vec::new();
+        let mut handler = |env: Envelope<ExecEvent>| seen.push(env.stamp.ingest_seq);
+        let clock = IngestClock::new();
+        let frame = clock.stamp(ConnKey { conn: 1, epoch: 0 }, Some(KernelRxNs(1_000)));
+        handler.on_tick_to_wire(TickToWire {
+            stream: StreamId(1),
+            frame,
+            nanos: 250,
+        });
+        assert!(seen.is_empty());
     }
 }
