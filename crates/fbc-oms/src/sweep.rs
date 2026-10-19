@@ -21,7 +21,7 @@
 //! cancel everything the consumer builds again, so the explicit cancels repeat on each resync
 //! as 0012 says. Our own-namespace orders the registry did not hold (0005's I7 orphans, on a
 //! market a resync already seeded) are registered by the resync that acts on them
-//! (`src/orphans.rs`, decision 0101), so the explicit cancels reach them too.
+//! (`src/orphans.rs`, decision 0106), so the explicit cancels reach them too.
 //!
 //! **In view.** An order not ours (another namespace's, a non-canonical client id, or one
 //! nothing attributes: no client id and a venue id no order of ours had) is in view on its

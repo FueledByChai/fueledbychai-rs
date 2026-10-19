@@ -27,7 +27,7 @@
 //!    hold, or one a resync registered from its snapshot, was there (0013's
 //!    cancel-on-disconnect ends an earlier run's orders in flight).
 //!
-//! An orphan a later resync registered from its snapshot (0005's I7, decision 0101) was open
+//! An orphan a later resync registered from its snapshot (0005's I7, decision 0106) was open
 //! after the seed read the account, so on either read mode the seed holds a fill of it only by
 //! rule 1 or its matching-engine time at or before the watermark; any other fill of it comes
 //! after the seed and moves the inventory. The fills of it applied before it was registered
@@ -60,7 +60,7 @@
 //! difference is reported ([`PositionCheck::Desync`]). Every resync reconciles the orders the
 //! registry holds as order updates (the snapshot's cumulative fill raises `cum_venue` only),
 //! the Unknown ladder's included ([`Registry::on_resync`]), and acts on the orphans it finds on a
-//! seeded market (0005's I7, decision 0101; `src/orphans.rs`).
+//! seeded market (0005's I7, decision 0106; `src/orphans.rs`).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -166,7 +166,7 @@ pub struct ResyncReport {
     pub checks: Vec<PositionCheck>,
     /// Open orders under our namespace on a market seeded before it that the registry did not
     /// hold (0005's I7 orphans), in client id order. The resync registers each it acts on
-    /// (decision 0101; [`Registry::cancel_orphans`](crate::Registry::cancel_orphans)): every
+    /// (decision 0106; [`Registry::cancel_orphans`](crate::Registry::cancel_orphans)): every
     /// open one from a trustworthy snapshot source, from any other only those a live order
     /// event or fill under its client id also showed while the registry did not hold them, and
     /// none whose client id or venue id another order of ours holds, nor any on a market the
@@ -175,7 +175,7 @@ pub struct ResyncReport {
     /// by its client id after the resync was not acted on.
     pub untracked: Vec<(ClientOrderId, VenueOrderId)>,
     /// The markets holding orphans that are not terminal after it, in id order (0005's I7,
-    /// decision 0101): each one's adding side is suppressed until the cooldown the consumer's
+    /// decision 0106): each one's adding side is suppressed until the cooldown the consumer's
     /// cancel of its orphans starts runs out, and its orphans are cancelled again
     /// ([`Registry::cancel_orphans`](crate::Registry::cancel_orphans)), on each resync.
     pub orphans: Vec<InstrumentId>,
@@ -289,7 +289,7 @@ struct SeedRef {
     /// after it.
     known: HashSet<ClientOrderId>,
     /// The orphans a later resync registered on the market from its snapshot (0005's I7,
-    /// decision 0101): shown open after the seed read the account, so the seed holds a fill of
+    /// decision 0106): shown open after the seed read the account, so the seed holds a fill of
     /// one only when it arrived before the seed was requested or executed at or before its
     /// watermark (Reviewer B's RB840-1 on PR #171).
     later: HashSet<ClientOrderId>,
@@ -331,7 +331,7 @@ impl SeedRef {
         let before_watermark = f.exec.is_some_and(|t| t <= self.watermark);
         if self.later.contains(&f.cid) {
             // Open after the seed's read, on either read mode: only its arrival or its time
-            // places a fill of it before; any other came after (decision 0101).
+            // places a fill of it before; any other came after (decision 0106).
             return if f.arrived <= self.requested_at || before_watermark {
                 Placement::InSnapshot { shown: false }
             } else {
@@ -404,7 +404,7 @@ impl Registry {
     /// Keeps `f`, a fill of our order the registry does not hold, which moved the inventory
     /// by `signed` had the seed not held it, when the seed holds it only because it did not
     /// show the order ([`SeedRef::by_absence_only`]): a later snapshot showing the order open
-    /// counts it on the inventory as the orphan is registered (decision 0101).
+    /// counts it on the inventory as the orphan is registered (decision 0106).
     pub(crate) fn untracked_in_snapshot(
         &mut self,
         inst: InstrumentId,
@@ -612,7 +612,7 @@ impl Registry {
             .collect()
     }
 
-    /// Acts on the orphans the resync found (0005's I7, decision 0101): registers each open one
+    /// Acts on the orphans the resync found (0005's I7, decision 0106): registers each open one
     /// from a trustworthy source, or from any other one a live account event also showed,
     /// unless its client id or venue id is another order's of ours or the snapshot is `stale`
     /// for its market ([`Registry::stale_markets`]); then suppresses the adding side of every

@@ -1,4 +1,4 @@
-# 0101 — Orphans a resync finds are registered; the adding side is suppressed from the resync until the cooldown the consumer's cancel of them starts runs out; they are cancelled by explicit reference, escalating to an instrument cancel-all only under the kill switch's guard, augmenting 0005 and 0055
+# 0106 — Orphans a resync finds are registered; the adding side is suppressed from the resync until the cooldown the consumer's cancel of them starts runs out; they are cancelled by explicit reference, escalating to an instrument cancel-all only under the kill switch's guard, augmenting 0005 and 0055
 
 Status: accepted
 Date: 2026-10-18

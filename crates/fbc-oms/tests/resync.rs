@@ -825,7 +825,7 @@ fn every_resync_reconciles_the_orders_the_registry_holds() {
     assert_eq!(reg.inventory(INST), SignedLots(0));
     assert!(report.untracked.is_empty());
     // An open order of ours the registry does not hold, on a seeded market, is reported for
-    // 0005's I7 and registered as an orphan (decision 0101, tests/orphans.rs); one whose venue
+    // 0005's I7 and registered as an orphan (decision 0106, tests/orphans.rs); one whose venue
     // id another order of ours holds is neither.
     let (orphan, clash) = (cid(), cid());
     let report = resync(

@@ -561,7 +561,7 @@ fn a_foreign_order_leaves_the_view_only_when_the_venue_ends_it() {
         vec![shown_orphan],
     );
     clear(&mut reg, "own orphans");
-    // The resync registered it as an orphan (decision 0101), so the explicit cancels below
+    // The resync registered it as an orphan (decision 0106), so the explicit cancels below
     // would reach it too; the venue ends it here, leaving our two orders.
     assert_eq!(reg.orphans(INST), vec![orphan_cid]);
     reg.apply_update(
