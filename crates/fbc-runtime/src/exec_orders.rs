@@ -55,11 +55,16 @@ pub enum SubmitRefusal {
     Ended,
     /// Not sent, `NotSent(Backpressure)`: the commands already waiting for the connection fill
     /// the bound its class may use (design §5.4, decision 0104). Nothing of it reached the
-    /// session and no request id was given; the refusal is journaled as a write result. The
-    /// authorization was dropped unspent: the consumer settles what fbc-oms holds for it as for
-    /// any command not sent (a place or batch item by `NotSent(Backpressure)` through
-    /// `Registry::on_outcome`, an amend by `Registry::amend_not_submitted`) and plans again.
-    Backpressure,
+    /// session; it was given request id `rpc`, under which the refusal is journaled as a write
+    /// result, and which no other submission is given. The consumer settles it exactly as an
+    /// [`ExecHandler::on_submitted`](crate::ExecHandler::on_submitted) receipt for `rpc` not
+    /// sent for `Backpressure`: a place or a batch item by `NotSent(Backpressure)` through
+    /// `Registry::on_outcome`, an amend by `Registry::amend_sent` under `rpc` and then that
+    /// outcome (Codex P1 r4312949568 on PR #174), and plans again. Its authorization was spent.
+    Backpressure {
+        /// The request id the refused submission was given.
+        rpc: RpcId,
+    },
 }
 
 impl fmt::Display for SubmitRefusal {
@@ -67,7 +72,7 @@ impl fmt::Display for SubmitRefusal {
         f.write_str(match self {
             SubmitRefusal::OtherAccount => "the authorization is for another account",
             SubmitRefusal::Ended => "the order-entry session has ended",
-            SubmitRefusal::Backpressure => {
+            SubmitRefusal::Backpressure { .. } => {
                 "the commands waiting for the connection fill the bound its class may use"
             }
         })
@@ -231,21 +236,21 @@ impl Shared {
     /// Gives `item` the next request id and queues it for the session's next turn, if the
     /// commands waiting leave room for its class (decision 0104): a Normal one while fewer than
     /// the bound's Normal part wait, a Safety one while fewer than the whole bound do. Otherwise
-    /// it is refused, [`SubmitRefusal::Backpressure`], with no request id given and nothing of
-    /// it kept (an authorization is dropped unspent), the refusal counted and journaled as a
-    /// write result under its class.
+    /// it is refused, [`SubmitRefusal::Backpressure`] naming the request id it was given, with
+    /// nothing of it kept (an authorization is dropped, spent), the refusal counted and
+    /// journaled as a write result under its class and that id.
     fn push(&self, item: Submitted) -> Result<RpcId, SubmitRefusal> {
         if self.ended.get() {
             return Err(SubmitRefusal::Ended);
         }
         let class = item.class();
+        let rpc = self.ids.next();
         let waiting = u64::try_from(self.queue.borrow().len()).unwrap_or(u64::MAX);
         if !self.bound.admits(waiting, class) {
             self.backpressured.set(self.backpressured.get() + 1);
-            self.journal_refusal(class);
-            return Err(SubmitRefusal::Backpressure);
+            self.journal_refusal(class, rpc);
+            return Err(SubmitRefusal::Backpressure { rpc });
         }
-        let rpc = self.ids.next();
         let epoch = self.ready.get();
         let origin = self.clock.handling();
         let queued = Queued {
@@ -259,16 +264,15 @@ impl Shared {
         Ok(rpc)
     }
 
-    /// Journals a submission of `class` refused for want of room as its write result, on the
-    /// epoch the session is in or waits to open, at the shard clock's time; it names no request,
-    /// since none was given.
-    fn journal_refusal(&self, class: TrafficClass) {
+    /// Journals submission `rpc` of `class`, refused for want of room, as its write result, on
+    /// the epoch the session is in or waits to open, at the shard clock's time.
+    fn journal_refusal(&self, class: TrafficClass, rpc: RpcId) {
         if let Some(journal) = &*self.journal.borrow() {
             let (at, wall) = self.clock.now();
             let record = Record::WriteResult {
                 at,
                 conn: self.conn.get(),
-                rpc: None,
+                rpc: Some(rpc),
                 result: WriteRes::NotSent(NotSentReason::Backpressure),
             };
             journal.record(class, wall, &record);
@@ -496,10 +500,37 @@ pub(crate) struct Rpcs {
     /// The requests asked as HTTP requests whose epoch has not ended: the epoch that asked and
     /// the deadline, which stands once that epoch ends (decision 0081).
     held: HashMap<RpcId, (u32, Option<Instant>)>,
+    /// The places the requests hold in the consumer's table, shared with the guard a run holds
+    /// ([`Rpcs::give_back_on_drop`]).
+    places: Rc<Places>,
+}
+
+/// The requests holding a place in the consumer's table of requests in flight: each live one,
+/// and one admitted and not yet written.
+struct Places {
     /// The table of requests in flight the session counts against.
     table: InFlight,
-    /// The requests holding a place in it: each live one, and one admitted and not yet written.
-    places: HashSet<RpcId>,
+    held: RefCell<HashSet<RpcId>>,
+}
+
+impl Places {
+    /// Gives back every place held.
+    fn give_back_all(&self) {
+        for _ in self.held.borrow_mut().drain() {
+            self.table.release();
+        }
+    }
+}
+
+/// Held by a session's run, in its future: dropped, as the run ends or its future is dropped
+/// mid-epoch, it gives back every place the session's requests hold, since nothing more is
+/// reported for them (decision 0104; Codex P1 r4312949559 on PR #174).
+pub(crate) struct GiveBack(Rc<Places>);
+
+impl Drop for GiveBack {
+    fn drop(&mut self) {
+        self.0.give_back_all();
+    }
 }
 
 impl Rpcs {
@@ -509,18 +540,26 @@ impl Rpcs {
             due: BinaryHeap::new(),
             live: HashSet::new(),
             held: HashMap::new(),
-            table,
-            places: HashSet::new(),
+            places: Rc::new(Places {
+                table,
+                held: RefCell::default(),
+            }),
         }
+    }
+
+    /// A guard that gives back every place the requests hold once it drops, for the run to hold
+    /// while it may be dropped mid-epoch.
+    pub(crate) fn give_back_on_drop(&self) -> GiveBack {
+        GiveBack(Rc::clone(&self.places))
     }
 
     /// Admits submitted request `rpc` of `class` into the table of requests in flight, if the
     /// table has room for its class: true when it took a place, which it holds until it is
     /// answered or times out, or, never written, until [`Self::unsent`] (decision 0104).
     pub(crate) fn admit(&mut self, rpc: RpcId, class: TrafficClass) -> bool {
-        let taken = self.table.try_take(class);
+        let taken = self.places.table.try_take(class);
         if taken {
-            self.places.insert(rpc);
+            self.places.held.borrow_mut().insert(rpc);
         }
         taken
     }
@@ -536,15 +575,15 @@ impl Rpcs {
     /// Request `rpc` went live: it holds a place, taken now, past the bound, when it was not
     /// admitted (a request the session writes of its own).
     fn hold(&mut self, rpc: RpcId) {
-        if self.places.insert(rpc) {
-            self.table.take();
+        if self.places.held.borrow_mut().insert(rpc) {
+            self.places.table.take();
         }
     }
 
     /// Gives back the place request `rpc` holds, if it holds one.
     fn give_back(&mut self, rpc: RpcId) {
-        if self.places.remove(&rpc) {
-            self.table.release();
+        if self.places.held.borrow_mut().remove(&rpc) {
+            self.places.table.release();
         }
     }
 
@@ -554,9 +593,7 @@ impl Rpcs {
         self.due.clear();
         self.live.clear();
         self.held.clear();
-        for _ in self.places.drain() {
-            self.table.release();
-        }
+        self.places.give_back_all();
     }
 
     /// Request `call` is written at `now`: its deadline is `call.timeout` from then. A request
@@ -888,9 +925,9 @@ mod tests {
         assert_eq!(back, Some(VenueCommand::FeeQuery));
     }
 
-    /// Decision 0104: past the Normal bound, a Normal submission is refused at once, given no
-    /// request id and kept nowhere, and journaled as a write result under the epoch the session
-    /// is in; a turn taking a command makes room again.
+    /// Decision 0104: past the Normal bound, a Normal submission is refused at once, naming the
+    /// request id it was given, kept nowhere, and journaled as a write result under that id and
+    /// the epoch the session is in; a turn taking a command makes room again.
     #[test]
     fn a_submission_past_the_bound_its_class_may_use_is_refused_and_journaled() {
         use fbc_core::WallNs;
@@ -921,24 +958,26 @@ mod tests {
         let fee = || orders.submit_control(ControlCommand::FeeQuery);
         // Refused before a journal is set: counted, nothing recorded.
         let taken = fee().unwrap();
-        assert_eq!(fee(), Err(SubmitRefusal::Backpressure));
+        let first = RpcId(taken.0 + 1);
+        assert_eq!(fee(), Err(SubmitRefusal::Backpressure { rpc: first }));
         let sink = Rc::new(RefCell::new(Kept::default()));
         shared.set_journal(Journal::new(Rc::clone(&sink)));
         let conn = ConnKey { conn: 3, epoch: 2 };
         shared.set_conn(conn);
         // A control command is Normal traffic: the reserve is not its to use.
-        assert_eq!(fee(), Err(SubmitRefusal::Backpressure));
+        let second = RpcId(first.0 + 1);
+        assert_eq!(fee(), Err(SubmitRefusal::Backpressure { rpc: second }));
         assert_eq!(shared.backpressured(), 2);
         let refused = WriteRes::NotSent(NotSentReason::Backpressure);
-        let journaled = |record: &Record| matches!(record, Record::WriteResult { conn: c, rpc: None, result, .. } if *c == conn && *result == refused);
+        let journaled = |record: &Record| matches!(record, Record::WriteResult { conn: c, rpc: Some(r), result, .. } if *c == conn && *r == second && *result == refused);
         let records = &sink.borrow().0;
         assert_eq!(records.len(), 1);
         assert!(records[0].0 == TrafficClass::Normal && journaled(&records[0].1));
         // Room again once a turn took the command; the next id follows the last one given.
         assert_eq!(queued(shared.pop()).rpc, taken);
-        assert_eq!(fee(), Ok(RpcId(taken.0 + 1)));
+        assert_eq!(fee(), Ok(RpcId(second.0 + 1)));
         assert_eq!(
-            SubmitRefusal::Backpressure.to_string(),
+            SubmitRefusal::Backpressure { rpc: first }.to_string(),
             "the commands waiting for the connection fill the bound its class may use"
         );
     }

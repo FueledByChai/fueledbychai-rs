@@ -3,8 +3,8 @@
 //! configured Normal bound plus a reserve only Safety traffic (a cancel, a reducing order) may
 //! use. With the conformance toy and a peer that stopped reading, a place submitted past the
 //! connection's Normal bound is refused at once, `SubmitRefusal::Backpressure` (not sent,
-//! `NotSent(Backpressure)`), nothing of it kept or written and the refusal journaled as its
-//! write result, while a cancel uses the reserve and goes out once the peer reads again; and a place submitted past the configured in-flight bound is
+//! `NotSent(Backpressure)`) naming its request id, nothing of it kept or written and the refusal
+//! journaled as its write result under that id, while a cancel uses the reserve and goes out once the peer reads again; and a place submitted past the configured in-flight bound is
 //! `NotSent(RateBudget)`, nothing written, while a cancel still goes out.
 //!
 //! Every order command is one fbc-oms built and authorized (`armed_oms`); the clock is paused
@@ -632,7 +632,11 @@ async fn an_amend_refused_for_backpressure_names_its_request_and_settles_as_one_
     assert_eq!(pending, PermitRefusal::IntentPending(amendable));
 
     let (px, qty) = (Ticks(130_855), Lots::new(10).unwrap());
-    assert!(oms.reg.amend_sent(amendable, px, qty, rpc, MonoNs(2_000)).unwrap());
+    assert!(
+        oms.reg
+            .amend_sent(amendable, px, qty, rpc, MonoNs(2_000))
+            .unwrap()
+    );
     let item = ItemRef {
         idx: 0,
         cid: Some(amendable),
@@ -640,7 +644,9 @@ async fn an_amend_refused_for_backpressure_names_its_request_and_settles_as_one_
     };
     let not_sent = SubmitOutcome::NotSent(NotSentReason::Backpressure);
     let op = OrderOp::Amend(rpc);
-    let settled = oms.reg.on_outcome(amendable, op, &item, &not_sent, MonoNs(2_000));
+    let settled = oms
+        .reg
+        .on_outcome(amendable, op, &item, &not_sent, MonoNs(2_000));
     settled.unwrap();
     // Settled, the order is amended again.
     drop(oms.amend());
@@ -657,8 +663,7 @@ async fn an_amend_refused_for_backpressure_names_its_request_and_settles_as_one_
 /// PR #174): another session sharing the table, here a run that ended on error and dropped by
 /// a shard host, finds the table as it was. A later run of the session is `Ended`.
 #[tokio::test(start_paused = true)]
-async fn a_run_dropped_with_a_request_in_flight_gives_its_place_back_while_the_session_is_kept()
- {
+async fn a_run_dropped_with_a_request_in_flight_gives_its_place_back_while_the_session_is_kept() {
     let thaw = freeze();
     let mut server = ScriptedWs::start().await;
     let journal = Rc::new(RefCell::new(Kept::default()));
@@ -764,17 +769,24 @@ async fn a_refusal_made_as_a_dropped_epoch_ends_is_journaled_under_the_epoch_wai
     let submitted = submitted.borrow();
     assert!(submitted[0].is_ok(), "{submitted:?}");
     let refused = backpressured(submitted[1]);
-    let closed = journal.borrow().0.iter().find_map(|(_, record)| match record {
-        Record::Control {
-            ev: fbc_journal::ControlEvent::Closed(key),
-            ..
-        } => Some(*key),
-        _ => None,
-    });
+    let closed = journal
+        .borrow()
+        .0
+        .iter()
+        .find_map(|(_, record)| match record {
+            Record::Control {
+                ev: fbc_journal::ControlEvent::Closed(key),
+                ..
+            } => Some(*key),
+            _ => None,
+        });
     let closed = closed.expect("the dropped epoch was journaled closed");
     let waiting = ConnKey {
         conn: closed.conn,
         epoch: closed.epoch + 1,
     };
-    assert_eq!(refusals(&journal), [(TrafficClass::Normal, waiting, refused)]);
+    assert_eq!(
+        refusals(&journal),
+        [(TrafficClass::Normal, waiting, refused)]
+    );
 }

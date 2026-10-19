@@ -136,9 +136,10 @@
 //! bound wait, Safety traffic (a cancel, a cancel-many, an instrument cancel-all, a reducing
 //! order) while fewer than the whole bound do. One submitted past that is refused at once,
 //! [`SubmitRefusal::Backpressure`](crate::SubmitRefusal::Backpressure) (not sent,
-//! `NotSent(Backpressure)`): no request id is given, nothing of it is kept (an authorization is
-//! dropped unspent, for the consumer to settle and plan again), the refusal is journaled as a
-//! `WriteResult` under its class on the epoch the session is in or waits to open, and counted
+//! `NotSent(Backpressure)`), naming the request id it was given, nothing of it kept (an
+//! authorization is dropped, the consumer settling it as a not-sent receipt for that id and
+//! planning again; Codex P1 r4312949568 on PR #174), the refusal journaled as a `WriteResult`
+//! under its class and that id on the epoch the session is in or waits to open, and counted
 //! ([`ExecCounters::backpressure_refusals`]). So a peer that stops reading holds a write, and
 //! the handlers of the shard's other members submitting meanwhile, to the bound, and nothing
 //! grows past it (Codex P1 r4312640254 on PR #174). The
@@ -148,7 +149,7 @@
 //! its encode, after the authorization's re-check and before a nonce is reserved, nothing
 //! written, counted ([`ExecCounters::in_flight_refusals`]). A place is given back when its
 //! request is answered, handed to `on_http` or timed out, when an encoded request is not
-//! written, and for every request still in flight once the run ends.
+//! written, and for every request still in flight once the run ends or its future is dropped.
 //!
 //! **Cancel-on-disconnect and the resync, every epoch (FBC-w19, decision 0058).** A session
 //! takes only a venue whose cancel-on-disconnect is per connection: one declaring `None` or
@@ -790,7 +791,13 @@ impl<H: ExecHandler> ExecSession<H> {
         if std::mem::replace(&mut self.ran, true) {
             return Err(ExecSessionError::Ended);
         }
-        let ran = self.run_epochs().await;
+        let ran = {
+            // Dropped with the run's future too: a run dropped mid-epoch gives back the places
+            // its requests hold in the consumer's table, which the session, kept, never reports
+            // again (decision 0104; Codex P1 r4312949559 on PR #174).
+            let _give_back = self.rpcs.give_back_on_drop();
+            self.run_epochs().await
+        };
         self.core.http.clear();
         self.orders.end();
         // Nothing more is reported: the requests still in flight give back their places in the
@@ -889,6 +896,14 @@ impl<H: ExecHandler> ExecSession<H> {
         self.core.rates.closed(key);
         if !self.was_closed_early(key) {
             self.core.control(|| ControlEvent::Closed(key));
+        }
+        // An epoch that dropped is followed by the one the session waits to open: what the
+        // handler submits as it is told of the end, and is refused, is journaled under that
+        // one, not the epoch journaled closed (0104; Codex P2 r4312949575 on PR #174).
+        if matches!(end, Ok(End::Dropped))
+            && let Some(epoch) = key.epoch.checked_add(1)
+        {
+            self.orders.set_conn(ConnKey { epoch, ..key });
         }
         self.handler.on_epoch_end(key);
         end
