@@ -631,8 +631,8 @@ impl Registry {
     /// from a trustworthy source, or from any other one a live account event also showed,
     /// unless its client id or venue id is another order's of ours or the snapshot is `stale`
     /// for its market ([`Registry::stale_markets`]); then suppresses the adding side of every
-    /// market holding orphans that are not terminal, advancing the state generation of each it
-    /// newly suppresses or registers an orphan on, and names those markets.
+    /// market holding orphans that are not terminal, advancing the state generation of each,
+    /// and names those markets.
     fn act_on_orphans(
         &mut self,
         snap: &ResyncSnapshot,
@@ -641,7 +641,6 @@ impl Registry {
         stale: &HashSet<InstrumentId>,
         report: &mut ResyncReport,
     ) {
-        let mut registered: HashSet<InstrumentId> = HashSet::new();
         for (cid, vid) in &report.untracked {
             let o = ours[cid];
             let lost = self.lost_shown_open(*cid, o);
@@ -674,7 +673,6 @@ impl Registry {
                 self.seed_orphan(o.inst, *cid, &o.vid);
             }
             self.orphans.add(o.inst, *cid);
-            registered.insert(o.inst);
         }
         if !report.untrustworthy {
             self.orphans.forget_live();
@@ -695,11 +693,12 @@ impl Registry {
         }
         report.orphans = self.orphan_markets();
         for &market in &report.orphans {
-            // A suppression beginning, or an orphan registered on the market, voids what was
-            // authorized before (Codex's r4310559351 on PR #171): the orphan counts now.
-            if self.orphans.suppress(market) || registered.contains(&market) {
-                self.entries.touch(market);
-            }
+            // Every resync of a market holding orphans voids what was authorized before: a
+            // suppression beginning, an orphan registered (Codex's r4310559351 on PR #171), or
+            // an orphan the snapshot shows grown (Codex's r4317002497) changes what the
+            // suppression and the caps admit.
+            self.orphans.suppress(market);
+            self.entries.touch(market);
         }
     }
 

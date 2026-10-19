@@ -28,8 +28,9 @@
 //! ([`Cooldown::Pending`]) until the consumer's [`Registry::cancel_orphans`] at `now` starts it
 //! ([`Cooldown::Until`], `now` plus the consumer's [`OrphanConfig::cooldown`]), and it ends
 //! only when the consumer's [`Registry::end_orphan_cooldowns`] is given a time at or past it.
-//! A suppression beginning, and each orphan registered, advances the market's state
-//! generation, so a place or amend authorized before it is refused at submit. The position sizes the build, so the suppression
+//! Each resync of a market holding orphans advances its state generation (a suppression
+//! beginning, an orphan registered or one shown grown changes what is admitted), so a place or
+//! amend authorized before it is refused at submit. The position sizes the build, so the suppression
 //! is judged again at authorization ([`IssueRefusal::OrphanCooldown`](crate::IssueRefusal)),
 //! and a command built during the cooldown is refused at submit once the inventory moved since
 //! its build ([`StaleAuthorization::PositionMoved`](crate::StaleAuthorization)), as an Exit
@@ -208,9 +209,9 @@ impl Orphans {
     }
 
     /// Suppresses `market`'s adding side until the consumer's next cancel of its orphans
-    /// starts the cooldown; true when it was not suppressed before.
-    pub(crate) fn suppress(&mut self, market: InstrumentId) -> bool {
-        self.cooldowns.insert(market, Cooldown::Pending).is_none()
+    /// starts the cooldown.
+    pub(crate) fn suppress(&mut self, market: InstrumentId) {
+        self.cooldowns.insert(market, Cooldown::Pending);
     }
 
     pub(crate) fn cooldown(&self, market: InstrumentId) -> Option<Cooldown> {
@@ -256,6 +257,7 @@ impl Registry {
     /// monotonic clock, and names those markets, in id order: their adding side is no longer
     /// suppressed. A cooldown still waiting for the cancel of its orphans never ends here.
     pub fn end_orphan_cooldowns(&mut self, now: MonoNs) -> Vec<InstrumentId> {
+        self.reap_dropped();
         let mut ended: Vec<InstrumentId> = self
             .orphans
             .cooldowns
