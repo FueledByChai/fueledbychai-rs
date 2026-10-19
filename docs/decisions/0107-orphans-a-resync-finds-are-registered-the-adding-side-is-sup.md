@@ -88,10 +88,11 @@ and how an orphan is held while its cancel is out (FBC-840, BT-402).
    those markets). The cooldown then waits (`Cooldown::Pending`) until the consumer's
    `Registry::cancel_orphans` at its `now` starts it, to `now` plus the consumer's cooldown or
    later if it already ran later (`Cooldown::Until`), and it ends only when the consumer's
-   `Registry::end_orphan_cooldowns` is given a time at or past it. A suppression beginning, and
-   any resync registering an orphan on the market, advances the market's state generation, so a
-   place or amend authorized before it is refused at submit (0060; Codex's r4310559351 on PR
-   #171: an orphan registered during a cooldown counts against what was authorized in it).
+   `Registry::end_orphan_cooldowns` is given a time at or past it. Every resync of a market
+   holding orphans that are not terminal advances the market's state generation, so a place or
+   amend authorized before it is refused at submit (0060; Codex's r4310559351 on PR #171: an
+   orphan registered during a cooldown counts against what was authorized in it; Codex's
+   r4317002497: so does an orphan a later snapshot shows grown).
 4. **The cancels.** `Registry::cancel_orphans` builds, in every market state, the cancels of the
    market's orphans that are not terminal by explicit reference (`Registry::cancel_many`), those
    with a cancel in flight included. When they number more than the consumer's level limit it
