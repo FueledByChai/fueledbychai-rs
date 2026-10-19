@@ -22,7 +22,8 @@
 //! ([`OrderEntryPeer::take_due`]) and reads each frame as it reads one off a socket, stamped from
 //! the shard's [`IngestClock`](crate::IngestClock) and journaled at that stamp before the codec
 //! decodes it. A frame is text when it is UTF-8 and binary otherwise, as the session writes
-//! them. An envelope the feed hands the peer can make an answer due sooner, so the feed wakes
+//! them. Frames the peer gave together and the session had not read when its epoch ended wait
+//! with the stream, and the next epoch reads them first. An envelope the feed hands the peer can make an answer due sooner, so the feed wakes
 //! the session to look again.
 //!
 //! Nothing here opens a socket: the stream is a shared handle ([`InProcessStream`]) on one
@@ -84,6 +85,9 @@ pub struct InProcessStream {
 
 struct Shared {
     peer: Rc<RefCell<dyn OrderEntryPeer>>,
+    /// The frames the peer gave and no session has read yet, in order: kept with the stream,
+    /// so those still unread when an epoch ends reach the next (Codex r4313036604 on PR #175).
+    due: RefCell<VecDeque<Vec<u8>>>,
     /// Woken when the feed handed the peer something that may bring an answer sooner.
     wake: Notify,
 }
@@ -102,6 +106,7 @@ impl InProcessStream {
         InProcessStream {
             shared: Rc::new(Shared {
                 peer,
+                due: RefCell::new(VecDeque::new()),
                 wake: Notify::new(),
             }),
         }
@@ -192,7 +197,6 @@ impl Link {
         Link::Peer(PeerEnd {
             stream: stream.clone(),
             clock: clock.clone(),
-            due: VecDeque::new(),
             open: true,
         })
     }
@@ -232,13 +236,11 @@ impl Wire for Link {
     }
 }
 
-/// The session's end of an open in-process stream: the frames the peer gave and the session
-/// has not read yet, in order. Dropped while open, it closes the stream, as a dropped socket
-/// closes its connection.
+/// The session's end of an open in-process stream. Dropped while open, it closes the stream,
+/// as a dropped socket closes its connection.
 pub(crate) struct PeerEnd {
     stream: InProcessStream,
     clock: IngestClock,
-    due: VecDeque<Vec<u8>>,
     open: bool,
 }
 
@@ -252,20 +254,23 @@ impl PeerEnd {
         }
     }
 
-    /// The next frame the peer answers with, once it is due. Cancelled, it loses nothing: a
-    /// frame taken from the peer waits here until it is read.
+    /// The next frame the peer answers with, once it is due. Cancelled, or its epoch ended, it
+    /// loses nothing: a frame taken from the peer waits with the stream until a session reads
+    /// it.
     async fn next(&mut self) -> Message {
+        let shared = &self.stream.shared;
         loop {
-            if let Some(frame) = self.due.pop_front() {
+            let frame = shared.due.borrow_mut().pop_front();
+            if let Some(frame) = frame {
                 return match String::from_utf8(frame) {
                     Ok(text) => Message::text(text),
                     Err(e) => Message::binary(e.into_bytes()),
                 };
             }
             let (now, _) = self.clock.now();
-            let shared = &self.stream.shared;
-            self.due.extend(shared.peer.borrow_mut().take_due(now));
-            if !self.due.is_empty() {
+            let given = shared.peer.borrow_mut().take_due(now);
+            if !given.is_empty() {
+                shared.due.borrow_mut().extend(given);
                 continue;
             }
             // A peer that says something is due by now, having just been given now, would have
