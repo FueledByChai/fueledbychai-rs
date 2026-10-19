@@ -1318,3 +1318,46 @@ fn an_order_amended_as_reducing_counts_against_an_emulated_order() {
     );
     assert_emulated(placed(&pass.commands[1]), 6);
 }
+
+#[test]
+fn a_resting_order_whose_quote_becomes_reducing_counts_against_an_emulated_order() {
+    // Codex r4309991135: long 10, an unclassified ask of 8 rests; its quote is now classified
+    // reducing with nothing else changed, so no amend records it, and an emulated exit of 5
+    // comes at level 1. The ask now reduces the position, so the exit gets only the 2 left.
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]);
+    let ask = limit(10_010, 8);
+    let plan = plan_and_send(
+        &mut p,
+        &book().with(Side::Sell, 0, ask.clone()),
+        &mut reg,
+        &caps,
+        &mut mint,
+        MonoNs(0),
+    );
+    let c = plan.commands[0].cid;
+    ack(&mut reg, c, "v0");
+    let next = book()
+        .with(
+            Side::Sell,
+            0,
+            DesiredQuote {
+                reducing: true,
+                ..ask
+            },
+        )
+        .with(
+            Side::Sell,
+            1,
+            maker_exit(10_020, 5, ReduceFallback::EmulateReduceOnly),
+        );
+    let pass = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER);
+    assert_eq!(
+        shape(&pass),
+        vec![(Stage::Reducing, "place", Side::Sell, 1)]
+    );
+    assert!(reg.get(c).unwrap().reduces());
+    assert_emulated(placed(&pass.commands[0]), 2);
+}
