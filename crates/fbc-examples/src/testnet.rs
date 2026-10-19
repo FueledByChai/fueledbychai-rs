@@ -800,7 +800,7 @@ impl NonceSource for Counting {
 /// attempts a minute, each given 10 s; normal traffic stopping at 90% of each declared limit; a
 /// write a peer stopped reading ends its connection after 10 s; 16 commands waiting for the
 /// connection and 16 requests in flight for places, amends and queries, each with 16 more for
-/// cancels and reducing orders (decision 0104).
+/// cancels and reducing orders (decision 0105).
 pub fn session_config(
     venue: &'static dyn VenueFactory,
     cfg: VenueConfig,

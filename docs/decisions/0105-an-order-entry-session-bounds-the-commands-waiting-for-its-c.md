@@ -1,4 +1,4 @@
-# 0104 — An order-entry session bounds the commands waiting for its connection and its requests in flight by the consumer's Normal bound plus a Safety reserve, refusing past them NotSent(Backpressure) and NotSent(RateBudget), augmenting 0053, 0057 and 0073
+# 0105 — An order-entry session bounds the commands waiting for its connection and its requests in flight by the consumer's Normal bound plus a Safety reserve, refusing past them NotSent(Backpressure) and NotSent(RateBudget), augmenting 0053, 0057 and 0073
 
 Status: accepted
 Date: 2026-10-19

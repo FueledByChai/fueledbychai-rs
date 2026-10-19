@@ -1,5 +1,5 @@
 //! The bounds an order-entry session keeps on what it holds, each with a reserve for Safety
-//! traffic (FBC-hwn, design §5.4, decision 0104).
+//! traffic (FBC-hwn, design §5.4, decision 0105).
 //!
 //! A [`ReservedBound`] is a number of Normal entries plus a reserve only Safety traffic (a
 //! cancel, a reducing order) may use, both from the consumer's configuration with no default
@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use fbc_core::TrafficClass;
 
 /// A bound of `normal` entries for Normal traffic plus `reserve` more that only Safety traffic
-/// may use, from the consumer's configuration (decision 0104).
+/// may use, from the consumer's configuration (decision 0105).
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct ReservedBound {
     normal: u32,
@@ -84,7 +84,7 @@ impl ReservedBound {
 
 /// A table of the order-entry requests in flight: written (or asked over HTTP) and neither
 /// answered nor timed out, bounded by a [`ReservedBound`] (design §5.4's RPC table, decision
-/// 0104). Clones share one count, so a consumer that hands a clone to every session of one
+/// 0105). Clones share one count, so a consumer that hands a clone to every session of one
 /// venue bounds the venue's requests together, and one that builds one per session bounds each
 /// connection apart. A session admits a submitted command only while the table has room for its
 /// class, and otherwise reports it `NotSent(RateBudget)` with nothing written; every other

@@ -1,4 +1,4 @@
-//! FBC-hwn's done line (design §5.4, decision 0104): an order-entry session bounds the commands
+//! FBC-hwn's done line (design §5.4, decision 0105): an order-entry session bounds the commands
 //! waiting for its connection and the requests it has in flight, each by the consumer's
 //! configured Normal bound plus a reserve only Safety traffic (a cancel, a reducing order) may
 //! use. With the conformance toy and a peer that stopped reading, a place submitted past the

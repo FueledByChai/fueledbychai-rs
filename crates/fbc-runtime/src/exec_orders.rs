@@ -12,7 +12,7 @@
 //!
 //! The commands waiting are bounded by the consumer's [`ReservedBound`], a Normal bound plus a
 //! reserve for Safety traffic; one submitted past it is refused as it is submitted,
-//! [`SubmitRefusal::Backpressure`], nothing of it kept (decision 0104).
+//! [`SubmitRefusal::Backpressure`], nothing of it kept (decision 0105).
 //!
 //! [`Rpcs`] holds each written request's deadline until the first event that answers it
 //! ([`ExecEvent::answers`](fbc_core::ExecEvent::answers)); one still unanswered at its deadline
@@ -22,7 +22,7 @@
 //! until then its result always comes back to `on_http` (FBC-m8vm, decision 0081).
 //! It also holds each such request's place in the consumer's [`InFlight`] table, taken when a
 //! submitted command is admitted at its encode and given back when the request is settled, not
-//! written, or the session ends (decision 0104).
+//! written, or the session ends (decision 0105).
 
 use std::cell::{Cell, RefCell};
 use std::cmp::Reverse;
@@ -54,7 +54,7 @@ pub enum SubmitRefusal {
     /// The session has run, or was dropped: it takes no more commands.
     Ended,
     /// Not sent, `NotSent(Backpressure)`: the commands already waiting for the connection fill
-    /// the bound its class may use (design §5.4, decision 0104). Nothing of it reached the
+    /// the bound its class may use (design §5.4, decision 0105). Nothing of it reached the
     /// session; it was given request id `rpc`, under which the refusal is journaled as a write
     /// result, and which no other submission is given. The consumer settles it exactly as an
     /// [`ExecHandler::on_submitted`](crate::ExecHandler::on_submitted) receipt for `rpc` not
@@ -100,7 +100,7 @@ impl Submitted {
     }
 
     /// The traffic class its frames are charged as (decision 0073) and the session's bounds
-    /// admit it under (decision 0104): an authorized order command's own
+    /// admit it under (decision 0105): an authorized order command's own
     /// ([`VenueCommand::traffic_class`]), so cancels and reducing orders may use the safety
     /// reserves; every control command normal traffic, whatever its label. The consumer submits
     /// control commands without authorization or count (the Unknown ladder's order queries, an
@@ -164,7 +164,7 @@ pub(crate) struct Shared {
     ids: RpcIds,
     queue: RefCell<VecDeque<Queued>>,
     /// The bound on the commands waiting, Safety traffic having a reserve beyond its Normal
-    /// part (decision 0104).
+    /// part (decision 0105).
     bound: ReservedBound,
     /// The submissions refused for want of room in the queue.
     backpressured: Cell<u64>,
@@ -234,7 +234,7 @@ impl Shared {
     }
 
     /// Gives `item` the next request id and queues it for the session's next turn, if the
-    /// commands waiting leave room for its class (decision 0104): a Normal one while fewer than
+    /// commands waiting leave room for its class (decision 0105): a Normal one while fewer than
     /// the bound's Normal part wait, a Safety one while fewer than the whole bound do. Otherwise
     /// it is refused, [`SubmitRefusal::Backpressure`] naming the request id it was given, with
     /// nothing of it kept (an authorization is dropped, spent), the refusal counted and
@@ -390,7 +390,7 @@ impl Shared {
 /// it used, or not sent and why. A sent request is never written again: one the venue leaves
 /// unanswered is reported `Unknown` at its deadline (decision 0057). A submission the commands
 /// already waiting leave no room for, under the consumer's outbound bound for its class, is
-/// refused at once, [`SubmitRefusal::Backpressure`], nothing of it kept (decision 0104).
+/// refused at once, [`SubmitRefusal::Backpressure`], nothing of it kept (decision 0105).
 #[derive(Clone)]
 pub struct ExecOrders {
     pub(crate) shared: Rc<Shared>,
@@ -492,7 +492,7 @@ impl ExecOrders {
 }
 
 /// The deadlines of the requests a session wrote, each until the first event that answers it,
-/// and the places they hold in the consumer's table of requests in flight (decision 0104).
+/// and the places they hold in the consumer's table of requests in flight (decision 0105).
 pub(crate) struct Rpcs {
     due: BinaryHeap<Reverse<(Instant, RpcId)>>,
     /// The requests written and neither answered nor timed out.
@@ -524,7 +524,7 @@ impl Places {
 
 /// Held by a session's run, in its future: dropped, as the run ends or its future is dropped
 /// mid-epoch, it gives back every place the session's requests hold, since nothing more is
-/// reported for them (decision 0104; Codex P1 r4312949559 on PR #174).
+/// reported for them (decision 0105; Codex P1 r4312949559 on PR #174).
 pub(crate) struct GiveBack(Rc<Places>);
 
 impl Drop for GiveBack {
@@ -555,7 +555,7 @@ impl Rpcs {
 
     /// Admits submitted request `rpc` of `class` into the table of requests in flight, if the
     /// table has room for its class: true when it took a place, which it holds until it is
-    /// answered or times out, or, never written, until [`Self::unsent`] (decision 0104).
+    /// answered or times out, or, never written, until [`Self::unsent`] (decision 0105).
     pub(crate) fn admit(&mut self, rpc: RpcId, class: TrafficClass) -> bool {
         let taken = self.places.table.try_take(class);
         if taken {
@@ -925,7 +925,7 @@ mod tests {
         assert_eq!(back, Some(VenueCommand::FeeQuery));
     }
 
-    /// Decision 0104: past the Normal bound, a Normal submission is refused at once, naming the
+    /// Decision 0105: past the Normal bound, a Normal submission is refused at once, naming the
     /// request id it was given, kept nowhere, and journaled as a write result under that id and
     /// the epoch the session is in; a turn taking a command makes room again.
     #[test]
@@ -982,7 +982,7 @@ mod tests {
         );
     }
 
-    /// Decision 0104: an admitted request holds its place in the table until it is answered,
+    /// Decision 0105: an admitted request holds its place in the table until it is answered,
     /// times out or goes unwritten; a request the session writes of its own takes one past the
     /// bound; an HTTP query holds one too; and the end of the session gives back every place.
     #[test]

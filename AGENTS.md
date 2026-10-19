@@ -211,7 +211,7 @@ rather than guess.
     as its write result under `rpc` and settled by the consumer as a not-sent receipt for it,
     and a command past its class's room in the consumer's `InFlight` table of requests in
     flight, shared per venue or per connection, `NotSent(RateBudget)`, its places given back
-    when a run ends or its future is dropped, 0104), an
+    when a run ends or its future is dropped, 0105), an
     authorization kept until its command is encoded, request ids from the account's `RpcIds`
     shared by its sessions, and each unanswered request handed to `on_rpc_timeout` once at its
     deadline, across a reconnect too, never written again (an HTTP query's deadline standing
