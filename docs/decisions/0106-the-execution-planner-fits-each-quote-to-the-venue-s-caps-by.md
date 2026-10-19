@@ -59,7 +59,8 @@ builds on the synthetic IOC.
    built for it, or once the planner kept it for a quote that reduces the position, an
    emulated one's included (`OrderRecord::reduces`).
    Among a pass's reducing commands, those the venue flag or the consumer bounds are built
-   before the emulated ones, whatever their levels. A place is sized to what is left when
+   before the emulated ones, whatever their levels; an amend of an order that reduces it is
+   one of them whatever its quote now asks. A place is sized to what is left when
    built, those commands counted, and refused (`PlanRefusal::NoRoomToReduce`) when nothing is
    left; an amend grows the order only to it. An order resting more than is left is cancelled
    at once, whatever its age or the book: at the pass's start (in 0005's order, with the other

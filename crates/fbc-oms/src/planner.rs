@@ -734,7 +734,10 @@ impl ExecutionPlanner {
             });
             match total {
                 Some(total) => {
-                    let reducing = q.reducing || rec.placed().reduce_only;
+                    // An order counted a reducer is amended among the reducers whatever its
+                    // quote now asks, so it is built before the emulated orders sized against
+                    // it (Reviewer B B13).
+                    let reducing = q.reducing || rec.reduces();
                     let stage = if reducing {
                         Stage::Reducing
                     } else {
