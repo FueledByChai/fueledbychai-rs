@@ -46,7 +46,13 @@
 //! run or its session ended before the session encoded it (a session failing after taking it,
 //! as on a short nonce reservation, included), is handed back to the consumer
 //! ([`Decide::unsubmitted`]) and counted ([`ShardHost::unsubmitted`]); nothing of it reached a
-//! codec.
+//! codec. A consumer that drops the run while a ladder goes out is handed back the same.
+//!
+//! **Fairness.** The members share the coop budget of the task poll they are polled in. When it
+//! runs out, the next poll of every member starts at the first member it ran out before, so a
+//! member that spends every budget it is given starves no other; the drain's and the
+//! between-command rounds go on until every member has had a poll that left budget, or one
+//! with the budget whole.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -330,77 +336,106 @@ impl ShardHost {
         members: Vec<Member<'_>>,
         decide: &mut D,
     ) -> Result<(), ShardError> {
+        let ShardHost {
+            clock,
+            changed,
+            journal,
+            passes,
+            unsubmitted,
+        } = self;
+        // Declared before the members' runs, so it drops after them: what it hands back on a
+        // drop meets orders already ended.
+        let mut climb = Climb {
+            decide,
+            unsubmitted,
+            ladder: Ladder::default(),
+            sent: None,
+        };
         let execs = members.iter().filter_map(|m| m.orders.clone()).collect();
         let runs = members.into_iter().map(|m| Some(m.run)).collect();
-        let mut running = Running { runs, execs };
+        let mut running = Running {
+            runs,
+            execs,
+            start: 0,
+        };
         // The next ingest sequence as the last pass began: an input stamped since calls for one.
-        let mut decided = self.clock.next_seq();
+        let mut decided = clock.next_seq();
         loop {
-            let clock = &self.clock;
+            let clock = &*clock;
             if !running.until(|_| clock.next_seq() != decided).await? {
                 return Ok(());
             }
             if !running.drain(clock).await? {
                 return Ok(());
             }
-            decided = self.clock.next_seq();
-            let mut ladder = self.pass(decide, decided);
-            let climbed = self.climb(&mut running, &mut ladder, decide).await;
+            decided = clock.next_seq();
+            let instruments = changed.take();
+            if let Some(journal) = &*journal {
+                let (_, wall) = clock.now();
+                let record = Record::Cycle {
+                    last_ingest_seq: decided.wrapping_sub(1),
+                    instruments: instruments.clone(),
+                };
+                journal.record(TrafficClass::Normal, wall, &record);
+            }
+            climb.decide.decide(&instruments, &mut climb.ladder);
+            *passes += 1;
+            let climbed = climb.climb(&mut running).await;
             // What the run's end left of the ladder goes back to the consumer.
             if !matches!(climbed, Ok(true)) {
-                for planned in ladder.planned.drain(..) {
-                    self.hand_back(decide, planned);
-                }
+                climb.give_back();
             }
             if !climbed? {
                 return Ok(());
             }
         }
     }
+}
 
-    /// Submits `ladder`'s commands one at a time, each once its session holds nothing, polling
+/// The ladder of the pass going out, and the command of it submitted and not yet known taken:
+/// what is left of it goes back to the consumer however the run ends, the consumer dropping the
+/// run included (Codex P1 r4309505789 on PR #164).
+struct Climb<'d, D: Decide + ?Sized> {
+    decide: &'d mut D,
+    unsubmitted: &'d mut u64,
+    ladder: Ladder,
+    /// The command submitted, with its session's orders, until the session took it.
+    sent: Option<(ExecOrders, InFlight)>,
+}
+
+impl<D: Decide + ?Sized> Climb<'_, D> {
+    /// Submits the ladder's commands one at a time, each once its session holds nothing, polling
     /// every member between two: true once every one was taken, false (with what is left still
-    /// in `ladder`) once every member has ended, or the first error.
-    async fn climb<D: Decide + ?Sized>(
-        &mut self,
-        running: &mut Running<'_>,
-        ladder: &mut Ladder,
-        decide: &mut D,
-    ) -> Result<bool, ShardError> {
-        while let Some(planned) = ladder.planned.pop_front() {
+    /// in the ladder) once every member has ended, or the first error.
+    async fn climb(&mut self, running: &mut Running<'_>) -> Result<bool, ShardError> {
+        while let Some(planned) = self.ladder.planned.pop_front() {
             let orders = planned.orders.clone();
             // What a handler submitted, on any order-entry session of the shard, is taken first
             // (Codex P1 r4309119894 on PR #164).
             let quiet = |execs: &[ExecOrders]| execs.iter().all(ExecOrders::idle) && orders.idle();
             let idle = running.until(quiet).await;
             if !matches!(idle, Ok(true)) {
-                ladder.planned.push_front(planned);
+                self.ladder.planned.push_front(planned);
                 return idle;
             }
             if orders.ended() {
-                self.hand_back(decide, planned);
+                self.hand_back(planned.command);
                 continue;
             }
             let Some(sent) = planned.submit() else {
                 continue;
             };
+            self.sent = Some((orders.clone(), sent));
             let taken = running.until(quiet).await;
             if !matches!(taken, Ok(true)) || orders.ended() {
                 // The run, or its session, ends before the session took it: it is taken back,
                 // nothing of it sent (Codex P1 r4309119897, r4309207253 on PR #164).
-                let item = orders.withdraw(sent.rpc);
-                let command = item.and_then(|item| match item {
-                    Submitted::Authorized(auth) => Some(Unsubmitted::Authorized(auth)),
-                    Submitted::Control(_) => sent.control.map(Unsubmitted::Control),
-                });
-                if let Some(command) = command {
-                    self.unsubmitted += 1;
-                    decide.unsubmitted(command);
-                }
+                self.withdraw();
                 if !matches!(taken, Ok(true)) {
                     return taken;
                 }
             }
+            self.sent = None;
             // Between two commands: what the kernel has delivered is read and handed on.
             if !running.round().await? {
                 return Ok(false);
@@ -409,28 +444,43 @@ impl ShardHost {
         Ok(true)
     }
 
-    /// Hands `planned` back to the consumer, never submitted.
-    fn hand_back<D: Decide + ?Sized>(&mut self, decide: &mut D, planned: Planned) {
-        self.unsubmitted += 1;
-        decide.unsubmitted(planned.command);
+    /// Takes back the command submitted, if its session has not taken it, and hands it back.
+    fn withdraw(&mut self) {
+        let Some((orders, sent)) = self.sent.take() else {
+            return;
+        };
+        let item = orders.withdraw(sent.rpc);
+        let command = item.and_then(|item| match item {
+            Submitted::Authorized(auth) => Some(Unsubmitted::Authorized(auth)),
+            Submitted::Control(_) => sent.control.map(Unsubmitted::Control),
+        });
+        if let Some(command) = command {
+            self.hand_back(command);
+        }
     }
 
-    /// Journals the pass whose last input is the one before ingest sequence `next`, and runs the
-    /// decide pass for the instruments marked since the last: its ladder.
-    fn pass<D: Decide + ?Sized>(&mut self, decide: &mut D, next: u64) -> Ladder {
-        let instruments = self.changed.take();
-        if let Some(journal) = &self.journal {
-            let (_, wall) = self.clock.now();
-            let record = Record::Cycle {
-                last_ingest_seq: next.wrapping_sub(1),
-                instruments: instruments.clone(),
-            };
-            journal.record(TrafficClass::Normal, wall, &record);
+    /// Hands back the command submitted and not taken, and every one not yet submitted.
+    fn give_back(&mut self) {
+        self.withdraw();
+        while let Some(planned) = self.ladder.planned.pop_front() {
+            self.hand_back(planned.command);
         }
-        let mut ladder = Ladder::default();
-        decide.decide(&instruments, &mut ladder);
-        self.passes += 1;
-        ladder
+    }
+
+    /// Hands `command` back to the consumer, never sent.
+    fn hand_back(&mut self, command: Unsubmitted) {
+        *self.unsubmitted += 1;
+        self.decide.unsubmitted(command);
+    }
+}
+
+/// A run the consumer drops hands back what is left of its ladder; not as a panic unwinds,
+/// since the consumer's callback may have panicked itself.
+impl<D: Decide + ?Sized> Drop for Climb<'_, D> {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            self.give_back();
+        }
     }
 }
 
@@ -438,22 +488,53 @@ impl ShardHost {
 struct Running<'a> {
     runs: Vec<Option<Run<'a>>>,
     execs: Vec<ExecOrders>,
+    /// The member the next poll of every member starts at ([`Running::poll_all`]).
+    start: usize,
 }
 
 impl Running<'_> {
-    /// Polls every member still running once: false once none is, or the first error, every
-    /// other member's run dropped then ([`Running::abort`]).
-    fn poll_all(&mut self, cx: &mut Context<'_>) -> Result<bool, ShardError> {
-        for slot in &mut self.runs {
-            if let Some(run) = slot
-                && let Poll::Ready(ended) = run.as_mut().poll(cx)
+    /// Polls every member still running once, from the one at `start`: false once none is, or
+    /// the first error, every other member's run dropped then ([`Running::abort`]).
+    ///
+    /// The members share the task poll's coop budget. When it runs out, the next poll starts
+    /// at the first member polled with none left, or, when the first member polled spent it,
+    /// at the member after that one, so a member that spends every budget it is given starves
+    /// no other (Codex P1 r4309505785 on PR #164). `served` marks each member whose poll left
+    /// budget, or that was polled first, its budget the poll's whole one.
+    fn poll_all(
+        &mut self,
+        cx: &mut Context<'_>,
+        mut served: Option<&mut [bool]>,
+    ) -> Result<bool, ShardError> {
+        let n = self.runs.len();
+        let mut first = true;
+        let mut next = None;
+        for k in 0..n {
+            let at = (self.start + k) % n;
+            let Some(run) = &mut self.runs[at] else {
+                continue;
+            };
+            let polled = run.as_mut().poll(cx);
+            let left = tokio::task::coop::has_budget_remaining();
+            if let Some(served) = served.as_deref_mut()
+                && (left || first)
             {
-                *slot = None;
+                served[at] = true;
+            }
+            if !left && next.is_none() {
+                next = Some(if first { (at + 1) % n } else { at });
+            }
+            first = false;
+            if let Poll::Ready(ended) = polled {
+                self.runs[at] = None;
                 if let Err(e) = ended {
                     self.abort();
                     return Err(e);
                 }
             }
+        }
+        if let Some(next) = next {
+            self.start = next;
         }
         Ok(self.runs.iter().any(Option::is_some))
     }
@@ -475,7 +556,7 @@ impl Running<'_> {
         &mut self,
         mut done: impl FnMut(&[ExecOrders]) -> bool,
     ) -> Result<bool, ShardError> {
-        poll_fn(|cx| match self.poll_all(cx) {
+        poll_fn(|cx| match self.poll_all(cx, None) {
             Err(e) => Poll::Ready(Err(e)),
             Ok(false) => Poll::Ready(Ok(false)),
             Ok(true) if done(&self.execs) => Poll::Ready(Ok(true)),
@@ -484,24 +565,27 @@ impl Running<'_> {
         .await
     }
 
-    /// Polls every member once: false once none is running, or the first error.
-    async fn once(&mut self) -> Result<bool, ShardError> {
-        poll_fn(|cx| Poll::Ready(self.poll_all(cx))).await
-    }
-
     /// A round: yields to the runtime, which polls its I/O and time drivers, then polls every
-    /// member once, and again while a round ends with the task's coop budget spent. The members
-    /// share the budget of the one task poll, so a member with a backlog can spend it and leave
-    /// a later member's resource reporting nothing ready though its frame was delivered; a
-    /// round that ends with budget left denied no member a ready operation (Reviewer B RB-ct0-1
-    /// on PR #164). False once none is running, or the first error.
+    /// member once, and again until every member still running has had a poll that left coop
+    /// budget, or one that began the task poll, its budget whole. The members share the budget
+    /// of the one task poll, so a member with a backlog can spend it and leave a later member's
+    /// resource reporting nothing ready though its frame was delivered; a member whose poll
+    /// left budget read all it had ready (Reviewer B RB-ct0-1 on PR #164), and one given a
+    /// whole budget had its share, so a member that never runs dry ends no round late (Codex
+    /// P1 r4309505785). False once none is running, or the first error.
     async fn round(&mut self) -> Result<bool, ShardError> {
+        let mut served = vec![false; self.runs.len()];
         loop {
             tokio::task::yield_now().await;
-            if !self.once().await? {
+            let polled = poll_fn(|cx| Poll::Ready(self.poll_all(cx, Some(&mut served))));
+            if !polled.await? {
                 return Ok(false);
             }
-            if tokio::task::coop::has_budget_remaining() {
+            let runs = self.runs.iter().zip(&served);
+            if runs
+                .into_iter()
+                .all(|(run, served)| run.is_none() || *served)
+            {
                 return Ok(true);
             }
         }
@@ -909,14 +993,17 @@ mod tests {
     /// is handed back the command its session had not taken and every one not yet submitted.
     #[tokio::test]
     async fn dropping_the_run_while_a_ladder_goes_out_hands_back_what_was_not_taken() {
-        #[derive(Default)]
-        struct Back(Rc<Cell<usize>>, bool);
-        impl Decide for Back {
+        /// Plans two commands on its first pass, counting what it is handed back.
+        struct Plan(ExecOrders, bool, Rc<Cell<usize>>);
+        impl Decide for Plan {
             fn decide(&mut self, _: &[InstrumentId], ladder: &mut Ladder) {
-                let _ = (self, ladder);
+                if !std::mem::replace(&mut self.1, true) {
+                    ladder.push_control(&self.0, ControlCommand::FeeQuery);
+                    ladder.push_control(&self.0, ControlCommand::RefreshDeadMan);
+                }
             }
             fn unsubmitted(&mut self, _: Unsubmitted) {
-                self.0.set(self.0.get() + 1);
+                self.2.set(self.2.get() + 1);
             }
         }
         let clock = IngestClock::new();
@@ -924,19 +1011,7 @@ mod tests {
         let mut exec = scripted(&clock, &shared, &[Act::Stamp]);
         exec.orders = Some(orders.clone());
         let back = Rc::new(Cell::new(0));
-        struct Plan(Back, ExecOrders);
-        impl Decide for Plan {
-            fn decide(&mut self, _: &[InstrumentId], ladder: &mut Ladder) {
-                if !std::mem::replace(&mut self.0.1, true) {
-                    ladder.push_control(&self.1, ControlCommand::FeeQuery);
-                    ladder.push_control(&self.1, ControlCommand::RefreshDeadMan);
-                }
-            }
-            fn unsubmitted(&mut self, command: Unsubmitted) {
-                self.0.unsubmitted(command);
-            }
-        }
-        let mut decide = Plan(Back(Rc::clone(&back), false), orders.clone());
+        let mut decide = Plan(orders.clone(), false, Rc::clone(&back));
         let mut host = ShardHost::new(clock.clone());
         let mut run = Box::pin(host.run(vec![exec], &mut decide));
         let mut polls = 0;
