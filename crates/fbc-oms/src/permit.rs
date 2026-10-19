@@ -445,6 +445,9 @@ impl<'r> Live<'r> {
             .map_err(AmendRefusal::Capped)?;
         let cid = rec.cid();
         let build = self.rec.set_amend_built(qty, wire);
+        if reducing {
+            self.rec.set_amended_reducing();
+        }
         Ok(PermittedCommand {
             cmd: VenueCommand::Amend(amend),
             origin: self.origin,
