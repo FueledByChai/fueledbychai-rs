@@ -41,8 +41,20 @@
 //! are built in that order, so each is judged with the earlier ones counted. A place or amend
 //! the market's state or a cap refuses is never built and is reported ([`Refused`]); the
 //! planner never falls back from a refused amend to a cancel, and nothing it emits bypasses a
-//! check. Batching, venue modes, the rate-scope safety floor and flag-conflict fallbacks are
-//! not here (FBC-hht, FBC-01w).
+//! check. Batching, venue modes and the rate-scope safety floor are not here (FBC-hht).
+//!
+//! Each wanted quote is first fitted to the venue's [`OrderCaps`], from the caps alone, never
+//! the venue's name (design §4.10 steps 3 and 4; 0100): RPI on a venue without it goes on the
+//! public book; a reduce-only quote whose flags the venue refuses together falls back,
+//! (Rpi, ReduceOnly) to the public book, (Ioc, ReduceOnly) to a synthetic IOC (a
+//! good-till-cancelled limit at the quote's price, cancelled at once, its cancel following its
+//! place in the same pass where the venue takes it before the acknowledgement), and
+//! (PostOnly, ReduceOnly) by the quote's [`ReduceFallback`]. Each change is reported on the
+//! places and amends built from the quote ([`Planned::downgrades`]). An emulated reduce-only
+//! order never rests more than is left to reduce (the position less the other orders reducing
+//! it on its side): it is sized to that when built, and cancelled at once when it would rest
+//! more, at a pass's start, after its builds, and by [`ExecutionPlanner::on_fill`], which the
+//! consumer runs after every fill.
 //!
 //! The planner reads the registry for every order's state, so the consumer reports what it
 //! sends before the next pass, as for any command: a place's outcome, an amend's
@@ -60,7 +72,7 @@ use std::fmt;
 use std::time::Duration;
 
 use fbc_core::{
-    AccountKey, Bps, Channel, CidMint, ClientOrderId, IdError, InstrumentId, Lots, MonoNs,
+    AccountKey, Bps, Channel, CidMint, ClientOrderId, Feature, IdError, InstrumentId, Lots, MonoNs,
     NewOrder, OrderCaps, OrderKind, Side, Ticks, Tif,
 };
 
@@ -417,7 +429,9 @@ pub struct Refused {
 /// What one [`ExecutionPlanner::plan`] pass built.
 #[derive(Debug, Default)]
 pub struct Plan {
-    /// The commands, in 0005's order: cancels, reducing orders, amends, adds.
+    /// The commands, in 0005's order: cancels, reducing orders, amends, adds; a synthetic IOC's
+    /// cancel follows its place, and the cancels of emulated reduce-only orders the pass's
+    /// builds left resting more than is left to reduce come last (0100).
     pub commands: Vec<Planned>,
     /// The orders whose cancel waits for their acknowledgement: tried again at every later pass
     /// until it is built, whether or not the level is wanted again.
@@ -441,6 +455,27 @@ struct Slot {
     /// count past it with no cancel in flight means that cancel was sent and answered without
     /// ending the order (not sent, or refused), so the replace is over.
     cancels_sent: u64,
+    /// How the order stands in for a quote the venue did not take as asked.
+    mode: Mode,
+}
+
+/// How an order the planner placed stands in for a downgraded quote (design §4.10 step 4).
+#[derive(Copy, Clone, Default, Eq, PartialEq, Debug)]
+struct Mode {
+    /// A synthetic IOC ([`Downgrade::SynthIoc`]): cancelled at once, whatever the book wants.
+    synth_ioc: bool,
+    /// An emulated reduce-only order ([`Downgrade::EmulatedReduceOnly`]): it never rests more
+    /// than is left to reduce, and is cancelled when it would.
+    emulated: bool,
+}
+
+/// A quote as the venue's caps take it: the quote changed by each fallback, how its order
+/// stands in for it, and the downgrades applied, in order.
+#[derive(Clone, Debug)]
+struct Fitted {
+    quote: DesiredQuote,
+    mode: Mode,
+    downgrades: Vec<Downgrade>,
 }
 
 /// What a pass decided for a level, before anything is built.
@@ -456,8 +491,12 @@ enum Action {
         total: Lots,
         reducing: bool,
         tag: u16,
+        /// For an emulated reduce-only order, the quantity it should rest, clipped again when
+        /// the amend is built to what is left to reduce then.
+        emulated: Option<Lots>,
+        downgrades: Vec<Downgrade>,
     },
-    Place(DesiredQuote),
+    Place(Fitted),
 }
 
 /// The planner (decision 0005's one planner; 0065): the orders it placed, by account, market,
@@ -541,15 +580,20 @@ impl ExecutionPlanner {
         let mut kept: Vec<ClientOrderId> = Vec::new();
         let levels: BTreeSet<Level> = slots.keys().chain(desired.levels.keys()).copied().collect();
         for at in levels {
-            let want = desired.levels.get(&at).filter(|q| q.qty > Lots::ZERO);
+            // The quote as the venue's caps take it (design §4.10 steps 3 and 4).
+            let fitted = desired
+                .levels
+                .get(&at)
+                .filter(|q| q.qty > Lots::ZERO)
+                .map(|q| fit(q, caps));
             let Some(slot) = slots.get_mut(&at) else {
-                if let Some(q) = want {
-                    let stage = if q.reduces() {
+                if let Some(f) = fitted {
+                    let stage = if f.quote.reduces() {
                         Stage::Reducing
                     } else {
                         Stage::Add
                     };
-                    actions.push((stage, at, Action::Place(q.clone())));
+                    actions.push((stage, at, Action::Place(f)));
                 }
                 continue;
             };
@@ -574,7 +618,21 @@ impl ExecutionPlanner {
             // In Exit, an order on a side that does not reduce the position is cancelled
             // whatever the book wants there: Exit builds nothing on that side (0063).
             let adds_in_exit = exit_reduces.is_some_and(|reduces| reduces != Some(at.side()));
-            let Some(q) = want.filter(|_| !slot.replacing && !adds_in_exit) else {
+            // An emulated reduce-only order rests at most what is left to reduce; one resting
+            // more would take the position past zero, and is cancelled at once, whatever its
+            // age or the book (FBC-01w).
+            let room = slot
+                .mode
+                .emulated
+                .then(|| reduce_room(reg, market, at.side(), Some(slot.cid)));
+            let overshoots = room.is_some_and(|room| rec.resting() > room);
+            // A synthetic IOC is cancelled at once, whatever the book wants (FBC-01w).
+            let Some(f) = fitted.as_ref().filter(|_| {
+                !slot.replacing && !adds_in_exit && !slot.mode.synth_ioc && !overshoots
+            }) else {
+                if overshoots && fitted.is_some() {
+                    slot.replacing = true;
+                }
                 if matches!(rec.intent(), Intent::PendingCancel { .. }) {
                     if slot.replacing {
                         plan.held.push(hold(HeldReason::Replacing));
@@ -582,8 +640,9 @@ impl ExecutionPlanner {
                 } else {
                     slot.cancels_sent = rec.cancels_sent();
                     // The book no longer wants the level: the side's reason goes with the
-                    // cancel; a level still wanted (a replace, or Exit's) has none (0098).
-                    let removal = want.map_or(desired.removal(at.side()), |_| None);
+                    // cancel; a level still wanted (a replace, Exit's, an overshoot or a
+                    // synthetic IOC's) has none (0098).
+                    let removal = fitted.as_ref().map_or(desired.removal(at.side()), |_| None);
                     let cancel = Action::Cancel {
                         cid: slot.cid,
                         removal,
@@ -591,6 +650,18 @@ impl ExecutionPlanner {
                     actions.push((Stage::Cancel, at, cancel));
                 }
                 continue;
+            };
+            // An emulated order is compared with the quote clipped to what is left to reduce.
+            let clipped;
+            let q = match room {
+                Some(room) if f.mode.emulated && f.quote.qty > room => {
+                    clipped = DesiredQuote {
+                        qty: room,
+                        ..f.quote.clone()
+                    };
+                    &clipped
+                }
+                _ => &f.quote,
             };
             if rec.removal().is_some() && !matches!(rec.intent(), Intent::PendingCancel { .. }) {
                 kept.push(slot.cid);
@@ -638,6 +709,8 @@ impl ExecutionPlanner {
                         total,
                         reducing: q.reducing,
                         tag: q.tag,
+                        emulated: f.mode.emulated.then_some(f.quote.qty),
+                        downgrades: f.downgrades.clone(),
                     };
                     actions.push((stage, at, amend));
                 }
@@ -659,6 +732,8 @@ impl ExecutionPlanner {
 
         // Built in 0005's order, so each is judged with the earlier ones counted.
         actions.sort_by_key(|(stage, at, _)| (*stage, *at));
+        // The orders a cancel was decided for this pass, which the overshoot check skips.
+        let mut cancelling: Vec<ClientOrderId> = Vec::new();
         for (stage, at, action) in actions {
             let side = at.side();
             let refuse = |why| Refused {
@@ -667,93 +742,156 @@ impl ExecutionPlanner {
                 why,
             };
             // Each built command's order keeps the consumer's tag and removal reason the
-            // command carries (0098).
+            // command carries (0098). A synthetic IOC's place is followed by its cancel.
+            let mut synth_ioc = false;
             let built = match action {
-                Action::Cancel { cid, removal } => match reg.cancellable(cid) {
-                    Ok(permit) => match permit.cancel(caps) {
-                        CancelChoice::Send(cmd) => {
-                            let tag = reg.with_record(cid, |rec| {
-                                rec.set_removal(removal);
-                                rec.tag()
-                            });
-                            Ok((cid, cmd, tag, removal))
-                        }
-                        CancelChoice::AwaitAck => {
-                            plan.awaiting_ack.push(cid);
-                            continue;
-                        }
-                    },
-                    Err(why) => Err(PlanRefusal::Permit(why)),
-                },
+                Action::Cancel { cid, removal } => {
+                    cancelling.push(cid);
+                    match reg.cancellable(cid) {
+                        Ok(permit) => match permit.cancel(caps) {
+                            CancelChoice::Send(cmd) => {
+                                let tag = reg.with_record(cid, |rec| {
+                                    rec.set_removal(removal);
+                                    rec.tag()
+                                });
+                                Ok((cid, cmd, tag, removal, Vec::new()))
+                            }
+                            CancelChoice::AwaitAck => {
+                                plan.awaiting_ack.push(cid);
+                                continue;
+                            }
+                        },
+                        Err(why) => Err(PlanRefusal::Permit(why)),
+                    }
+                }
                 Action::Amend {
                     cid,
                     px,
-                    total,
+                    mut total,
                     reducing,
                     tag,
-                } => reg
-                    .live(cid)
-                    .map_err(PlanRefusal::Permit)
-                    .and_then(|live| {
-                        live.amend(caps, px, total, reducing)
-                            .map_err(PlanRefusal::Amend)
-                    })
-                    .map(|cmd| {
-                        if let Some(slot) = slots.get_mut(&at) {
-                            slot.changed_at = now;
+                    emulated,
+                    downgrades,
+                } => {
+                    // An emulated order grows only to what is left to reduce once the
+                    // commands before it are counted; with nothing left, the overshoot check
+                    // after the builds decides.
+                    if let Some(want) = emulated {
+                        let room = reduce_room(reg, market, side, Some(cid));
+                        let rests = want.min(room);
+                        let filled = reg.get(cid).map_or(Lots::ZERO, OrderRecord::filled);
+                        match filled.checked_add(rests) {
+                            Some(clipped) if rests > Lots::ZERO => total = clipped,
+                            _ => continue,
                         }
-                        reg.with_record(cid, |rec| rec.set_tag(tag));
-                        (cid, cmd, Some(tag), None)
-                    }),
-                Action::Place(q) => mint
-                    .mint()
-                    .map_err(PlanRefusal::Mint)
-                    .and_then(|cid| {
-                        reg.place(new_order(market, side, cid, &q))
-                            .map_err(PlanRefusal::Place)
-                            .map(|cmd| (cid, cmd))
-                    })
-                    .map(|(cid, cmd)| {
-                        slots.insert(
-                            at,
-                            Slot {
-                                cid,
-                                changed_at: now,
-                                replacing: false,
-                                cancels_sent: 0,
-                            },
-                        );
-                        reg.with_record(cid, |rec| rec.set_tag(q.tag));
-                        (cid, cmd, Some(q.tag), None)
-                    }),
+                    }
+                    reg.live(cid)
+                        .map_err(PlanRefusal::Permit)
+                        .and_then(|live| {
+                            live.amend(caps, px, total, reducing)
+                                .map_err(PlanRefusal::Amend)
+                        })
+                        .map(|cmd| {
+                            if let Some(slot) = slots.get_mut(&at) {
+                                slot.changed_at = now;
+                            }
+                            reg.with_record(cid, |rec| rec.set_tag(tag));
+                            (cid, cmd, Some(tag), None, downgrades)
+                        })
+                }
+                Action::Place(Fitted {
+                    mut quote,
+                    mode,
+                    downgrades,
+                }) => {
+                    // An emulated order is sized to what is left to reduce, the commands
+                    // before it counted.
+                    if mode.emulated {
+                        quote.qty = quote.qty.min(reduce_room(reg, market, side, None));
+                        if quote.qty == Lots::ZERO {
+                            plan.refused.push(refuse(PlanRefusal::NoRoomToReduce));
+                            continue;
+                        }
+                    }
+                    synth_ioc = mode.synth_ioc;
+                    mint.mint()
+                        .map_err(PlanRefusal::Mint)
+                        .and_then(|cid| {
+                            reg.place(new_order(market, side, cid, &quote))
+                                .map_err(PlanRefusal::Place)
+                                .map(|cmd| (cid, cmd))
+                        })
+                        .map(|(cid, cmd)| {
+                            slots.insert(
+                                at,
+                                Slot {
+                                    cid,
+                                    changed_at: now,
+                                    replacing: false,
+                                    cancels_sent: 0,
+                                    mode,
+                                },
+                            );
+                            reg.with_record(cid, |rec| rec.set_tag(quote.tag));
+                            (cid, cmd, Some(quote.tag), None, downgrades)
+                        })
+                }
             };
             match built {
-                Ok((cid, cmd, tag, removal)) => plan.commands.push(Planned {
-                    stage,
-                    side,
-                    level: at.level,
-                    cid,
-                    tag,
-                    removal,
-                    downgrades: Vec::new(),
-                    auth: authorize(reg, acct, cmd),
-                }),
+                Ok((cid, cmd, tag, removal, downgrades)) => {
+                    plan.commands.push(Planned {
+                        stage,
+                        side,
+                        level: at.level,
+                        cid,
+                        tag,
+                        removal,
+                        downgrades,
+                        auth: authorize(reg, acct, cmd),
+                    });
+                    if synth_ioc {
+                        cancelling.push(cid);
+                        cancel_now(reg, caps, acct, at, cid, &mut plan);
+                    }
+                }
                 Err(why) => plan.refused.push(refuse(why)),
             }
         }
+        // Built last, the cancels of emulated orders the commands before them left resting
+        // more than is left to reduce (a reducer placed at a nearer level, say).
+        overshoot_cancels(slots, reg, caps, acct, market, &cancelling, &mut plan);
         Ok(plan)
     }
 
-    /// The check after a fill (stub).
+    /// The check to run after every fill on `market` for `acct` (design §4.10 step 4): the
+    /// cancel of each emulated reduce-only order the planner holds there that now rests more
+    /// than is left to reduce, so it never takes the position past zero. What is left is the
+    /// position's size on the side the order reduces (none while the position is flat,
+    /// unknown or on the order's side), less the fills on that side the venue reported on
+    /// order updates that the inventory does not hold yet, less what the other orders reducing
+    /// it on that side may have resting, a cancel in flight included until it is terminal. An order with a
+    /// cancel in flight or waiting for its acknowledgement is skipped; a cancel that waits for
+    /// the acknowledgement is listed in [`Plan::awaiting_ack`] and carried through by the
+    /// next [`Self::plan`] pass, which runs the same check. Nothing is placed or amended, and
+    /// the level, if still wanted, is placed again at the smaller size once the order is
+    /// terminal. Refused as a pass is ([`PlanError`]) through a registry other than the
+    /// account's; like every mutating call on `reg`, it first releases the places whose
+    /// commands were dropped unspent (decision 0084).
     pub fn on_fill(
         &mut self,
         reg: &mut Registry,
         caps: &OrderCaps,
         acct: AccountKey,
         market: InstrumentId,
-    ) -> Result<Vec<Planned>, PlanError> {
-        let _ = (reg, caps, acct, market);
-        Ok(Vec::new())
+    ) -> Result<Plan, PlanError> {
+        reg.reap_dropped();
+        self.bind(acct, reg)?;
+        let mut plan = Plan::default();
+        if let Some(slots) = self.slots.get_mut(&(acct, market)) {
+            slots.retain(|_, slot| reg.get(slot.cid).is_some_and(|r| !r.state().is_terminal()));
+            overshoot_cancels(slots, reg, caps, acct, market, &[], &mut plan);
+        }
+        Ok(plan)
     }
 
     /// Binds `acct` to the registry `reg` at its first pass; refuses another registry for
@@ -794,6 +932,160 @@ impl PlannerConfig {
         let resting = rec.qty().checked_sub(rec.filled()).unwrap_or(Lots::ZERO);
         let qty_moved = resting != q.qty && lots_apart(resting, q.qty) >= self.qty;
         px_moved || qty_moved
+    }
+}
+
+/// `q` as the venue's `caps` take it (design §4.10 steps 3 and 4), from the caps alone: RPI on
+/// a venue without it goes on the public book; then, for a reduce-only quote, each pair the
+/// venue refuses together (in either order) falls back: (Rpi, ReduceOnly) to the public book,
+/// (Ioc, ReduceOnly) to a good-till-cancelled limit at the quote's price cancelled at once, and
+/// (PostOnly, ReduceOnly) by the quote's [`ReduceFallback`]. An order moved off the RPI channel,
+/// which only rests, stays post-only where the venue has post-only, so it never takes.
+fn fit(q: &DesiredQuote, caps: &OrderCaps) -> Fitted {
+    let refused = |a: Feature, b: Feature| {
+        caps.flag_conflicts
+            .iter()
+            .any(|&(x, y)| (x, y) == (a, b) || (x, y) == (b, a))
+    };
+    let mut quote = q.clone();
+    let mut mode = Mode::default();
+    let mut downgrades = Vec::new();
+    let mut go_public = |quote: &mut DesiredQuote, why| {
+        quote.channel = Channel::Public;
+        quote.post_only |= caps.post_only;
+        downgrades.push(why);
+    };
+    if quote.channel == Channel::Rpi && !caps.channels.contains(Channel::Rpi) {
+        go_public(&mut quote, Downgrade::RpiUnsupported);
+    }
+    if quote.reduce_only {
+        if quote.channel == Channel::Rpi && refused(Feature::Rpi, Feature::ReduceOnly) {
+            go_public(&mut quote, Downgrade::RpiReduceOnly);
+        }
+        if quote.tif == Tif::Ioc && refused(Feature::Ioc, Feature::ReduceOnly) {
+            quote.tif = Tif::Gtc;
+            mode.synth_ioc = true;
+            downgrades.push(Downgrade::SynthIoc);
+        }
+        if quote.post_only && refused(Feature::PostOnly, Feature::ReduceOnly) {
+            match q.reduce_fallback {
+                ReduceFallback::EmulateReduceOnly => {
+                    quote.reduce_only = false;
+                    quote.reducing = true;
+                    mode.emulated = true;
+                    downgrades.push(Downgrade::EmulatedReduceOnly);
+                }
+                ReduceFallback::KeepReduceOnly => {
+                    quote.post_only = false;
+                    downgrades.push(Downgrade::DroppedPostOnly);
+                }
+            }
+        }
+    }
+    Fitted {
+        quote,
+        mode,
+        downgrades,
+    }
+}
+
+/// What is left for an emulated reduce-only order on `side` of `market` to reduce: the
+/// position's size when `side` reduces it (none while it is flat, unknown or on `side`), less
+/// the fills on `side` the venue reported on order updates that the inventory does not hold
+/// yet (they reduced it already), less what our other orders reducing it on `side` (all but
+/// `except`) may have resting; zero when they cover it or a sum does not fit a lot count.
+fn reduce_room(
+    reg: &Registry,
+    market: InstrumentId,
+    side: Side,
+    except: Option<ClientOrderId>,
+) -> Lots {
+    let reducible = reg.position(market).and_then(|pos| {
+        let reduces = match side {
+            Side::Sell => pos.0 > 0,
+            Side::Buy => pos.0 < 0,
+        };
+        reduces.then(|| pos.abs_lots()).flatten()
+    });
+    let except = except.as_slice();
+    reducible
+        .zip(reg.unaccounted_fills_on(market, side))
+        .and_then(|(size, unaccounted)| size.checked_sub(unaccounted))
+        .zip(reg.reducers_resting_on(market, side, except))
+        .and_then(|(size, others)| size.checked_sub(others))
+        .unwrap_or(Lots::ZERO)
+}
+
+/// Builds the cancel of our order `cid` at `at` into `plan`, at once: sent, waiting for the
+/// acknowledgement, or refused its permit. It carries no removal reason: the level may still
+/// be wanted.
+fn cancel_now(
+    reg: &mut Registry,
+    caps: &OrderCaps,
+    acct: AccountKey,
+    at: Level,
+    cid: ClientOrderId,
+    plan: &mut Plan,
+) {
+    let (side, level) = (at.side(), at.level);
+    match reg.cancellable(cid) {
+        Ok(permit) => match permit.cancel(caps) {
+            CancelChoice::Send(cmd) => {
+                let tag = reg.with_record(cid, |rec| {
+                    rec.set_removal(None);
+                    rec.tag()
+                });
+                plan.commands.push(Planned {
+                    stage: Stage::Cancel,
+                    side,
+                    level,
+                    cid,
+                    tag,
+                    removal: None,
+                    downgrades: Vec::new(),
+                    auth: authorize(reg, acct, cmd),
+                });
+            }
+            CancelChoice::AwaitAck => plan.awaiting_ack.push(cid),
+        },
+        Err(why) => plan.refused.push(Refused {
+            side,
+            level,
+            why: PlanRefusal::Permit(why),
+        }),
+    }
+}
+
+/// Builds into `plan` the cancel of each emulated reduce-only order in `slots` that rests more
+/// than is left to reduce, but those in `skip` and those whose cancel is in flight or waits
+/// for the acknowledgement; the level waits for the order's terminal state.
+fn overshoot_cancels(
+    slots: &mut BTreeMap<Level, Slot>,
+    reg: &mut Registry,
+    caps: &OrderCaps,
+    acct: AccountKey,
+    market: InstrumentId,
+    skip: &[ClientOrderId],
+    plan: &mut Plan,
+) {
+    for (&at, slot) in slots.iter_mut() {
+        if !slot.mode.emulated || skip.contains(&slot.cid) {
+            continue;
+        }
+        let Some(rec) = reg.get(slot.cid) else {
+            continue;
+        };
+        let cancelling =
+            matches!(rec.intent(), Intent::PendingCancel { .. }) || rec.cancel_awaits_ack();
+        if rec.state().is_terminal()
+            || cancelling
+            || rec.resting() <= reduce_room(reg, market, at.side(), Some(slot.cid))
+        {
+            continue;
+        }
+        slot.replacing = true;
+        slot.cancels_sent = rec.cancels_sent();
+        cancel_now(reg, caps, acct, at, slot.cid, plan);
     }
 }
 
