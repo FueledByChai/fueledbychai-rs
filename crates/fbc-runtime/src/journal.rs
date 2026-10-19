@@ -86,6 +86,10 @@ mod tests {
         shared.record(TrafficClass::Safety, WallNs(2), &marker);
         let classes: Vec<_> = sink.borrow().0.iter().map(|(c, _)| *c).collect();
         assert_eq!(classes, [TrafficClass::Normal, TrafficClass::Safety]);
+        assert_eq!(
+            sink.borrow_mut().omit(TrafficClass::Normal, WallNs(3)),
+            Recorded::DroppedCounted
+        );
         assert_eq!(format!("{journal:?}"), "Journal");
     }
 }
