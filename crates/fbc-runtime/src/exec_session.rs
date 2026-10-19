@@ -951,7 +951,7 @@ impl<H: ExecHandler> ExecSession<H> {
             // the last turn's first, so frames that keep arriving starve no timer, result or
             // stop (DeepSeek DS-1), and the stop is checked after every wake below whichever
             // won. A rotation rather than tokio's random start, so two closed-loop replays of
-            // one journal take what is ready on one tick in the same order (decision 0106 item
+            // one journal take what is ready on one tick in the same order (decision 0107 item
             // 6; Reviewer B's RB-066n-1 on PR #178).
             let rpc_due = self.rpcs.next_deadline();
             let first = self.turn;

@@ -7,7 +7,7 @@
 //! The host drives the runs of the shard's sessions as its [`Member`]s
 //! ([`MdSession::run`], [`MdVenue::run`], [`ExecSession::run`], the consumer's own inputs'
 //! [`ConsumerInputs::run`], FBC-hvqi, and a closed-loop replay's market data, FBC-066n,
-//! decision 0106) on the one task that awaits [`ShardHost::run`], polling each itself, and spawns no task. Every session and the host share
+//! decision 0107) on the one task that awaits [`ShardHost::run`], polling each itself, and spawns no task. Every session and the host share
 //! one [`IngestClock`]: every input a session takes is stamped from it, which is how the host
 //! sees one taken.
 //!
