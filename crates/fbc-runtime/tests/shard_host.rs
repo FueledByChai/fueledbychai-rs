@@ -771,3 +771,117 @@ async fn one_yield_to_the_runtime_polls_the_io_driver_before_the_task_resumes() 
     tokio::task::yield_now().await;
     assert_eq!(stream.try_read(&mut buf).unwrap(), 5);
 }
+
+/// A nonce source that reserves none once `short` is set, and counts up from 0 until then.
+struct ShortOnce {
+    next: u64,
+    short: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl fbc_core::NonceSource for ShortOnce {
+    fn reserve(&mut self, len: u16) -> fbc_core::NonceBlock {
+        if self.short.load(std::sync::atomic::Ordering::Relaxed) {
+            return fbc_core::NonceBlock::EMPTY;
+        }
+        let block = fbc_core::NonceBlock::consecutive(self.next, len).unwrap();
+        self.next += u64::from(len);
+        block
+    }
+}
+
+/// A decide pass that, once its session takes places, plans one place and makes the session's
+/// nonce source short, keeping what it is handed back.
+struct ShortPlace {
+    orders: ExecOrders,
+    oms: Oms,
+    short: Arc<std::sync::atomic::AtomicBool>,
+    planned: bool,
+    unsubmitted: Vec<Unsubmitted>,
+}
+
+impl Decide for ShortPlace {
+    fn decide(&mut self, _: &[InstrumentId], ladder: &mut Ladder) {
+        if self.planned || !self.orders.may_place() {
+            return;
+        }
+        self.planned = true;
+        self.short.store(true, std::sync::atomic::Ordering::Relaxed);
+        ladder.push(&self.orders, self.oms.place()).unwrap();
+    }
+
+    fn unsubmitted(&mut self, command: Unsubmitted) {
+        self.unsubmitted.push(command);
+    }
+}
+
+/// Codex P1 r4309350872 on PR #164: a ladder command its session took and then failed to
+/// encode, its nonce source reserving another count, which ends the session with nothing
+/// reported (0057), is handed back to the consumer: it reaches the consumer once.
+#[tokio::test(start_paused = true)]
+async fn a_ladder_command_whose_session_fails_before_reporting_it_is_handed_back() {
+    let (thaw, frozen) = std::sync::mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || frozen.recv());
+    let clock = IngestClock::new();
+    let mut host = ShardHost::new(clock.clone());
+    let mut server = ScriptedWs::start().await;
+    let reserved = Reserved::default();
+    let mut config = session_config(&server.url(), &reserved);
+    config.clock = clock.clone();
+    let short = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    config.nonces = Box::new(ShortOnce {
+        next: 0,
+        short: Arc::clone(&short),
+    });
+    let log: Rc<RefCell<(Vec<ExecEvent>, Vec<SubmitHandle>)>> = Rc::default();
+    struct Log(Rc<RefCell<(Vec<ExecEvent>, Vec<SubmitHandle>)>>);
+    impl ExecHandler for Log {
+        fn on_exec(&mut self, env: Envelope<ExecEvent>) {
+            self.0.borrow_mut().0.push(env.body);
+        }
+        fn on_submitted(&mut self, handle: SubmitHandle) {
+            self.0.borrow_mut().1.push(handle);
+        }
+    }
+    let (mut exec, _control) = ExecSession::new(config, Log(Rc::clone(&log))).unwrap();
+    let mut decide = ShortPlace {
+        orders: exec.orders(),
+        oms: Oms::armed(),
+        short,
+        planned: false,
+        unsubmitted: Vec::new(),
+    };
+    let watch = Rc::clone(&log);
+    let script = async move {
+        let mut peer = server.accept().await;
+        assert!(peer.recv().await.starts_with("auth|ts="));
+        peer.send("auth|ok=1|token=toy-session-token");
+        assert_eq!(peer.recv().await, "cod|rpc=1|on=1");
+        let wm = watermark(&peer.recv().await);
+        peer.send("item|rpc=1|i=0|res=ok");
+        peer.send(&format!("rsbegin|wm={wm}"));
+        peer.send("rsend");
+        settle(|| watch.borrow().0.contains(&ExecEvent::ResyncEnd)).await;
+        // The session ends, having written nothing more.
+        assert_eq!(peer.next().await, None);
+    };
+    let members = vec![Member::exec(&mut exec)];
+    let (ran, ()) = tokio::join!(host.run(members, &mut decide), script);
+    drop(thaw);
+    assert!(
+        matches!(
+            ran,
+            Err(ShardError::Exec(ExecSessionError::Nonces {
+                reserved: 0,
+                ..
+            }))
+        ),
+        "{ran:?}"
+    );
+    assert!(log.borrow().1.is_empty(), "{:?}", log.borrow().1);
+    assert!(
+        matches!(decide.unsubmitted[..], [Unsubmitted::Authorized(_)]),
+        "{:?}",
+        decide.unsubmitted
+    );
+    assert_eq!(host.unsubmitted(), 1);
+}
