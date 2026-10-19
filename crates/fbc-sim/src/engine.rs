@@ -275,8 +275,12 @@ impl Item {
 ///   matching's included), and held unmatched, never resting; at the configured instant it is
 ///   refused (the reject, then its order event ending it `Rejected`), or, cancelled first,
 ///   answered as withdrawn, and never accepted final. A query and a resync show
-///   a held order open as placed, and every cancel ends it. Amends and cancels are answered in
-///   one phase. A venue that acknowledges in one phase answers every acceptance final.
+///   a held order open as placed, and every cancel ends it; an amend of it is refused
+///   `NotAmendable(Unsupported)` and leaves it held. An accepted amend is answered
+///   `Provisional`, as Paradex's modify reply is, and settled by the amended order's event that
+///   follows it, with no second phase of its own (decision 0102); a refused one, at once.
+///   Cancels are answered in one phase. A venue that acknowledges in one phase answers every
+///   acceptance final.
 /// - An amend changes a resting order's price, size and flags as the stood-in venue's
 ///   [`AmendCaps`] allow (an instrument, side or time in force it would change, or a field
 ///   they do not amend, is `NotAmendable(Unsupported)`; a partially filled order where they do
@@ -653,7 +657,7 @@ impl SimEngine {
             Command::Amend(a) => {
                 let rpc = a.head.rpc;
                 let item = self.amend(a, at);
-                self.answer_item(rpc, item, at);
+                self.answer_amend(rpc, item, at);
             }
             Command::Cancel(c) => {
                 let item = self.cancel(&c.target);
@@ -864,6 +868,21 @@ impl SimEngine {
         self.answer(at, reply);
         for event in item.events {
             self.answer(at, event);
+        }
+    }
+
+    /// An amend's outcome, then its events. A two-phase venue accepts it provisionally, as
+    /// Paradex's modify reply does, and the amended order's event that follows settles it, with
+    /// no second phase of its own (decision 0102); a single-phase venue accepts it final.
+    fn answer_amend(&mut self, rpc: u64, item: Item, at: At) {
+        match item.result {
+            ItemResult::Accepted { cid, vid, .. } if self.risk_window.is_some() => {
+                self.answer(at, Reply::Amended { rpc, cid, vid });
+                for event in item.events {
+                    self.answer(at, event);
+                }
+            }
+            _ => self.answer_item(rpc, item, at),
         }
     }
 
@@ -1428,6 +1447,11 @@ impl SimEngine {
 
     fn amend(&mut self, a: Amend, at: At) -> Item {
         let n = self.lookup(&a.target);
+        // A placement held for its risk check never rests, so it has nothing to amend; it
+        // stays held, neither ended nor unknown to the venue (decision 0102).
+        if n.is_some_and(|n| self.held.contains_key(&n)) {
+            return Item::refused(Refusal::NotAmendable(NotAmendable::Unsupported));
+        }
         let found = n.and_then(|n| self.live.get(&n).map(|o| (n, o.clone())));
         let Some((n, order)) = found else {
             return Item::refused(self.missing(n));

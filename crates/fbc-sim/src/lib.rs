@@ -49,7 +49,10 @@
 //!   accepted arm) or its dead-man timer lapses unrefreshed (0097).
 //!   A venue that acknowledges in two phases gets each placement accepted provisionally, then
 //!   final once its `risk_reject_window` passes, or refused by a risk reject the consumer
-//!   configures inside it ([`SimEngine::risk_reject`], [`RiskRefusal`]; 0099).
+//!   configures inside it ([`SimEngine::risk_reject`], [`RiskRefusal`]; 0099). Its amends
+//!   are accepted provisionally, as Paradex's modify reply is, and settled by the amended
+//!   order's event (0102), so a SimVenue built from Paradex's declared caps places, amends,
+//!   cancels and fills (FBC-2zxk).
 //!
 //! Every number SimVenue uses, its capabilities, latency, bracket and fee rates included, is in
 //! the consumer's [`SimConfig`]. Not here yet: hosting in the runtime (FBC-6mf) and replay
