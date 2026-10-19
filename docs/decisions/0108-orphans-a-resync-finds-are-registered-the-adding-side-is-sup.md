@@ -45,14 +45,17 @@ and how an orphan is held while its cancel is out (FBC-840, BT-402).
    one is; Codex's r4316124604 and r4316366360) (Reviewer B's RB840-1 on PR #171: placed as the seed's own unshown order, its
    fills moved the record and not the inventory, or left a separate-reads market unsettled).
    The fills of it applied before it was registered, which a one-read seed held only because it
-   did not show the order (0055's rule 3, not by their arrival or time), move the inventory as
-   it is registered, once (Codex's r4310559340); a trustworthy resync not showing such an order
+   did not show the order (0055's rule 3, not by their arrival or time), are placed again as
+   it is registered: those after the seed move the inventory, once (Codex's r4310559340), and
+   those what the seed showed of its venue id holds stay held, one nothing places leaving the
+   position unknown (Codex's r4317320917); a trustworthy resync not showing such an order
    open drops what was kept for it. A snapshot requested before a resync that already compared
    the market (its check is `PositionCheck::Stale`), or not after the seed's own request, may
    have been read before the seed, so it is no evidence on that market: nothing is registered
    there from it and nothing kept is dropped (Codex's r4310661297 on PR #171: a late answer
    showing an order the seed's position already held registered it and counted its fill
-   twice). The orphans are acted on before each market's position is compared, so the resync
+   twice), nor does it change what a registered orphan there rests: only the fill it reports
+   counts (Codex's r4317320908: a smaller quantity it showed lowered the orphan's exposure). The orphans are acted on before each market's position is compared, so the resync
    that registers one compares the venue's position with the fills it counts (Codex's
    r4310661291). An order not ours
    (another namespace's, a non-canonical client id, or one nothing attributes) is never an orphan.

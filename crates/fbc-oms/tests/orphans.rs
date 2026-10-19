@@ -1889,3 +1889,43 @@ fn an_orphan_adopting_a_venue_id_the_seed_showed_places_its_retained_fills_again
     assert_eq!(reg.orphans(INST), vec![o]);
     assert_eq!(reg.position(INST), Some(SignedLots(2)));
 }
+
+#[test]
+fn an_orphan_adopting_a_venue_id_the_seed_showed_with_a_retained_fill_nothing_places_leaves_the_position_unknown()
+ {
+    // Codex's r4317320917 on PR #171: as above, but the retained fill states no cumulative fill
+    // and no time. What the seed showed of `v` cannot place it, so once a snapshot shows `v`
+    // under o the market's position is unknown, as for any fill nothing places.
+    let mut reg = arm::named(Registry::with_caps(caps()));
+    let mut unnamed = not_ours(None, "v");
+    unnamed.cum_filled = lots(1);
+    resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        1_000,
+        vec![unnamed],
+        1,
+    );
+    let o = cid();
+    let mut l = ledger();
+    let f = fill(
+        Some(o),
+        FillIdent::Venue {
+            fill: fill_id("v-x"),
+            vid: None,
+            cum_after: None,
+        },
+        Side::Buy,
+        1,
+        false,
+    );
+    let Admission::Apply(accepted) = l.admit(&f, None, MonoNs(1_500)) else {
+        panic!("a new fill is admitted");
+    };
+    assert_eq!(reg.apply_fill(accepted).unwrap(), FillRouted::InSnapshot(o));
+    let mut shown = ours(o, "v", Side::Buy);
+    shown.cum_filled = lots(2);
+    resync_at(&mut reg, SnapshotSource::Trustworthy, 2_000, vec![shown], 2);
+    assert_eq!(reg.orphans(INST), vec![o]);
+    assert_eq!(reg.position(INST), None);
+}

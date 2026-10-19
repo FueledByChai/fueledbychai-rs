@@ -297,11 +297,12 @@ struct SeedRef {
     /// is in `known` instead (Codex's r4316124604).
     later: HashSet<ClientOrderId>,
     /// Fills of our orders the registry did not hold that the seed holds only because it did
-    /// not show their order (rule 3), not by their arrival or time: when each arrived, its
-    /// matching-engine time and what it moved. A later snapshot showing the order open proves
-    /// them after the seed, so registering it as an orphan counts them on the inventory
-    /// (Codex's r4310559340 on PR #171); a trustworthy resync not showing it open drops them.
-    absent_only: HashMap<ClientOrderId, Vec<(MonoNs, Option<WallNs>, i128)>>,
+    /// not show their order (rule 3), not by their arrival or time: each as it was placed, and
+    /// what it moved. Registering the order as an orphan, once a later snapshot shows it open,
+    /// places them again: those after the seed move the inventory (Codex's r4310559340 on PR
+    /// #171), those what the seed showed of its venue id holds do not (Codex's r4317320917); a
+    /// trustworthy resync not showing it open drops them.
+    absent_only: HashMap<ClientOrderId, Vec<(Placed, i128)>>,
 }
 
 /// Where a fill stands against a seed.
@@ -422,7 +423,7 @@ impl Registry {
             r.absent_only
                 .entry(f.cid)
                 .or_default()
-                .push((f.arrived, f.exec, i128::from(signed.0)));
+                .push((f.clone(), i128::from(signed.0)));
         }
     }
 
@@ -430,8 +431,10 @@ impl Registry {
     /// holds a later fill of it only by the fill's arrival or time (Reviewer B's RB840-1 on PR
     /// #171), unless the seed showed it, by `cid` or `vid`, when what it showed places them as
     /// for an order the seed held (Codex's r4316124604); and
-    /// the fills of it the seed held only because it did not show it move the inventory now,
-    /// once (Codex's r4310559340). Should they overflow the inventory, the market's position
+    /// the fills of it the seed held only because it did not show it are placed again so: those
+    /// after the seed move the inventory now, once (Codex's r4310559340), those what the seed
+    /// showed of `vid` holds stay held (Codex's r4317320917), and one nothing places leaves the
+    /// position unknown. Should they overflow the inventory, the market's position
     /// is unknown from now on. On a market seeded by hand every fill counted already.
     fn seed_orphan(&mut self, inst: InstrumentId, cid: ClientOrderId, vid: &VenueOrderId) {
         let Some(MarketState::Seeded(Seed {
@@ -453,12 +456,29 @@ impl Registry {
         } else {
             r.later.insert(cid);
         }
-        let fills = r.absent_only.remove(&cid).unwrap_or_default();
-        if fills.is_empty() {
+        // Each fill the seed held only for not showing the order is placed again, now that the
+        // seed's view of it is known: one shown after the seed moves the inventory, one what the
+        // seed showed of its venue id holds stays held (Codex's r4317320917 on PR #171), and
+        // one nothing places leaves the position unknown.
+        let mut moved: i128 = 0;
+        let mut unsettled = false;
+        for (f, signed) in r.absent_only.remove(&cid).unwrap_or_default() {
+            match r.place(&f) {
+                Placement::After => {
+                    moved += signed;
+                    log.push((f.arrived, f.exec, signed));
+                }
+                Placement::InSnapshot { .. } => {}
+                Placement::Unsettled => unsettled = true,
+            }
+        }
+        if unsettled {
+            self.markets.insert(inst, MarketState::Unsettled);
             return;
         }
-        let moved: i128 = fills.iter().map(|(_, _, signed)| signed).sum();
-        log.extend(fills);
+        if moved == 0 {
+            return;
+        }
         let now = i128::from(self.inventory(inst).0) + moved;
         match i64::try_from(now) {
             Ok(pos) => self.set_inventory(inst, SignedLots(pos)),
@@ -549,10 +569,18 @@ impl Registry {
             .map(|(cid, _)| *cid)
             .collect();
         report.ladder = self.on_resync(cfg, caps, snap.watermark, &snap.orders, key);
+        let stale = self.stale_markets(snap);
         for o in &snap.orders {
             if let Some(cid) = self.held_order(o)
                 && !ladder.contains(&cid)
             {
+                if stale.contains(&o.inst) && self.orphans.holds(o.inst, cid) {
+                    // A snapshot that may have been read before the one that registered the
+                    // orphan, or last showed it, says nothing of what it rests now: only the
+                    // fill it reports counts (Codex's r4317320908 on PR #171).
+                    self.with_record(cid, |rec| rec.count_venue_fill(o.cum_filled));
+                    continue;
+                }
                 let u = update_of(o);
                 self.with_record(cid, |rec| rec.apply_update(&u, key));
             }
@@ -571,7 +599,6 @@ impl Registry {
         report.untracked.sort_by_key(|(cid, _)| *cid);
         // The orphans first, so each market's check counts the fills an orphan it registers
         // took before (Codex's r4310661291 on PR #171).
-        let stale = self.stale_markets(snap);
         self.act_on_orphans(snap, &ours, key, &stale, &mut report);
 
         let mut checked: Vec<InstrumentId> = self

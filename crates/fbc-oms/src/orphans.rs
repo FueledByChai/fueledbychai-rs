@@ -202,6 +202,13 @@ impl Orphans {
         self.live.clear();
     }
 
+    /// Whether `cid` is an orphan registered on `market`.
+    pub(crate) fn holds(&self, market: InstrumentId, cid: ClientOrderId) -> bool {
+        self.by_market
+            .get(&market)
+            .is_some_and(|m| m.contains(&cid))
+    }
+
     /// Registers the orphan `cid` on `market`.
     pub(crate) fn add(&mut self, market: InstrumentId, cid: ClientOrderId) {
         self.live.remove(&cid);
