@@ -1414,3 +1414,40 @@ async fn a_frame_that_is_not_utf8_is_read_as_binary_and_journaled_so() {
     });
     assert!(binary);
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn frames_due_together_and_unread_when_their_epoch_ends_reach_the_next_epoch() {
+    // Codex r4313036604 on PR #175: the greeting and a frame after it fall due together; the
+    // greeting's epoch ends on a failed arm before the second is read, which the next epoch
+    // reads first (here a frame that is not UTF-8, which the codec cannot decode).
+    let mut unprotected = sim_config(0);
+    unprotected.exec.order.cancel_on_disconnect = CancelOnDisconnect::None;
+    let clock = IngestClock::new();
+    let world = solo_world();
+    let peer = Rc::new(RefCell::new(Noisy(SimPeer::new(&unprotected), false)));
+    let stream = InProcessStream::new(Rc::clone(&peer));
+    let config = exec_config(0, "ws://127.0.0.1:9/never", &clock, 2);
+    let codec = Box::new(SimCodec::new(&unprotected));
+    let errors = Rc::new(RefCell::new(Vec::new()));
+    let handler = Undecoded(Rc::clone(&world), Rc::clone(&errors));
+    let (mut session, control) = ExecSession::in_process(config, codec, stream, handler).unwrap();
+    let run = session.run();
+    let drive = async {
+        for _ in 0..10_000 {
+            if !errors.borrow().is_empty() {
+                break;
+            }
+            tokio::time::sleep(ms(1)).await;
+        }
+        drop(control);
+    };
+    let (ran, ()) = tokio::join!(run, drive);
+    ran.unwrap();
+    let greeted = world.borrow().seen.iter().find_map(|s| match s {
+        Seen::Exec(_, stamp, ExecEvent::Conn { .. }) => Some(stamp.conn.epoch),
+        _ => None,
+    });
+    let epochs: Vec<u32> = errors.borrow().iter().map(|key| key.epoch).collect();
+    assert_eq!(greeted, Some(0));
+    assert_eq!(epochs, [1], "read once, on the epoch after the greeting's");
+}
