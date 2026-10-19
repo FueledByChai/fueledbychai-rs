@@ -693,8 +693,9 @@ async fn a_clustered_move_during_a_ladder_has_every_protective_cancel_written_af
         waited += in_progress;
         nanos.push(tick.nanos);
     }
-    // The frames arrived while the ladder was being signed: some cancel waited for a signature.
-    assert!(waited > 0, "no cancel waited for a signature in progress");
+    // How many cancels waited for a signature is reported, not asserted: whether a burst lands
+    // inside a signature or in the poll between two is the scheduler's (Codex r4315689623 on
+    // PR #179).
     // No sample is for a write attributed to another market-data frame.
     let md_ticks = reported
         .ticks
