@@ -1,4 +1,4 @@
-# 0108 — The execution planner plans a side's price-capped crossing intent as one reduce-only order at its cap, sized so the position never crosses zero, once per consumer attempt, augmenting 0065 and 0106
+# 0110 — The execution planner plans a side's price-capped crossing intent as one reduce-only order at its cap, sized so the position never crosses zero, once per consumer attempt, augmenting 0065 and 0106
 
 Status: accepted
 Date: 2026-10-19
