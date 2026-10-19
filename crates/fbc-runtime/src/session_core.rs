@@ -86,6 +86,11 @@ fn tick_to_wire(
 /// It also names the input being handled while a session hands that input's events to its
 /// handler ([`IngestClock::attributing`]), so a command the handler submits then, on whichever
 /// session of the shard, is attributed to that input (decision 0100).
+///
+/// A closed-loop replay's clock ([`IngestClock::replayed`], FBC-066n) reads no wall clock: its
+/// monotonic time is the runtime's, which the replay runs paused, so it moves only to the next
+/// timer due, and its wall time is the last replayed record's recorded wall time plus the
+/// monotonic time since that record's.
 #[derive(Clone, Debug)]
 pub struct IngestClock {
     next: Rc<Cell<u64>>,
@@ -95,13 +100,24 @@ pub struct IngestClock {
     replayed: Option<Rc<Cell<Replayed>>>,
 }
 
-/// What a closed-loop replay's clock reads its wall time from (FBC-066n): the last stamp a
-/// replayed record set, on both clocks, and the latest monotonic reading it stamped.
+/// What a closed-loop replay's clock reads its wall time from (FBC-066n): the instant of the
+/// last record replayed, on both clocks (at first, the origin and the consumer's wall time
+/// there), and the latest monotonic time an input was stamped with, which no later stamp goes
+/// behind.
 #[derive(Copy, Clone, Debug)]
 struct Replayed {
     mono: MonoNs,
     wall: WallNs,
     last: MonoNs,
+}
+
+impl Replayed {
+    /// The wall time at `mono`: the anchor's, moved on by as much as `mono` lies past it.
+    fn wall_at(&self, mono: MonoNs) -> WallNs {
+        let since = i128::from(mono.0) - i128::from(self.mono.0);
+        let wall = i128::from(self.wall.0).saturating_add(since);
+        WallNs(i64::try_from(wall).unwrap_or(if since < 0 { i64::MIN } else { i64::MAX }))
+    }
 }
 
 impl Default for IngestClock {
@@ -141,6 +157,62 @@ impl IngestClock {
         self.replayed.is_some()
     }
 
+    /// Stamps a replayed record's input, recorded as `recorded`, with the next ingest sequence
+    /// (FBC-066n): its kernel receive time, connection and recorded instant on both clocks,
+    /// which become the clock's wall-time anchor, moved on to the latest instant stamped when
+    /// it lies behind it, so ingest order never goes back in time. A live clock's stamp keeps
+    /// its recorded times too, anchoring nothing.
+    pub(crate) fn restamp(&self, recorded: Stamp) -> Stamp {
+        let ingest_seq = self.take_seq();
+        let (recv_mono, recv_wall) = match &self.replayed {
+            Some(replayed) => {
+                let mono = recorded.recv_mono.max(replayed.get().last);
+                let recorded_at = Replayed {
+                    mono: recorded.recv_mono,
+                    wall: recorded.recv_wall,
+                    last: mono,
+                };
+                let wall = recorded_at.wall_at(mono);
+                replayed.set(Replayed {
+                    mono,
+                    wall,
+                    last: mono,
+                });
+                (mono, wall)
+            }
+            None => (recorded.recv_mono, recorded.recv_wall),
+        };
+        Stamp {
+            ingest_seq,
+            recv_mono,
+            recv_wall,
+            ..recorded
+        }
+    }
+
+    /// Takes the next ingest sequence for a replayed consumer input recorded at `at`
+    /// (FBC-066n), with its instant: `at`, or the latest instant stamped when `at` lies behind
+    /// it.
+    pub(crate) fn retick(&self, at: MonoNs) -> (u64, MonoNs) {
+        let ingest_seq = self.take_seq();
+        let at = match &self.replayed {
+            Some(replayed) => {
+                let mut anchor = replayed.get();
+                anchor.last = anchor.last.max(at);
+                replayed.set(anchor);
+                anchor.last
+            }
+            None => at,
+        };
+        (ingest_seq, at)
+    }
+
+    fn take_seq(&self) -> u64 {
+        let ingest_seq = self.next.get();
+        self.next.set(ingest_seq.wrapping_add(1));
+        ingest_seq
+    }
+
     /// Stamps an input of `conn` arriving now, whose last packet the kernel received at
     /// `kernel_rx` when it knows.
     pub(crate) fn stamp(&self, conn: ConnKey, kernel_rx: Option<KernelRxNs>) -> Stamp {
@@ -157,9 +229,13 @@ impl IngestClock {
     /// Takes the next ingest sequence for an input of no connection (a consumer input, FBC-hvqi),
     /// with now on both clocks.
     pub(crate) fn tick(&self) -> (u64, MonoNs, WallNs) {
-        let ingest_seq = self.next.get();
-        self.next.set(ingest_seq.wrapping_add(1));
+        let ingest_seq = self.take_seq();
         let (mono, wall) = self.now();
+        if let Some(replayed) = &self.replayed {
+            let mut anchor = replayed.get();
+            anchor.last = anchor.last.max(mono);
+            replayed.set(anchor);
+        }
         (ingest_seq, mono, wall)
     }
 
@@ -193,16 +269,21 @@ impl IngestClock {
         self.origin.checked_add(Duration::from_nanos(mono.0))
     }
 
-    /// Now, on the monotonic clock from the origin and on the wall clock.
+    /// Now, on the monotonic clock from the origin and on the wall clock; a replayed clock
+    /// reads its wall time from its anchor, and never reads earlier than the latest instant it
+    /// stamped.
     pub(crate) fn now(&self) -> (MonoNs, WallNs) {
         let mono = Instant::now().duration_since(self.origin).as_nanos();
+        let mono = MonoNs(u64::try_from(mono).unwrap_or(u64::MAX));
+        if let Some(replayed) = &self.replayed {
+            let anchor = replayed.get();
+            let mono = mono.max(anchor.last);
+            return (mono, anchor.wall_at(mono));
+        }
         let wall = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
-        (
-            MonoNs(u64::try_from(mono).unwrap_or(u64::MAX)),
-            WallNs(i64::try_from(wall).unwrap_or(i64::MAX)),
-        )
+        (mono, WallNs(i64::try_from(wall).unwrap_or(i64::MAX)))
     }
 }
 
@@ -1289,6 +1370,93 @@ mod tests {
         });
         assert_eq!(seen, (Some(second), Some(first)));
         assert_eq!((clock.handling(), clock.next_seq()), (None, 2));
+    }
+
+    /// FBC-066n: a replayed clock reads no wall clock. Its wall time is the origin's, then the
+    /// last replayed record's, moved on by the monotonic time since; a replayed input keeps its
+    /// recorded instant unless an input was stamped later, when it takes that one, so ingest
+    /// order never goes back in time.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_replayed_clock_reads_its_wall_time_from_the_last_replayed_record() {
+        const MS: u64 = 1_000_000;
+        let clock = IngestClock::replayed(WallNs(7_000 * MS as i64));
+        assert!(clock.is_replayed() && !IngestClock::new().is_replayed());
+        assert_eq!(clock.now(), (MonoNs(0), WallNs(7_000 * MS as i64)));
+        tokio::time::advance(Duration::from_millis(2)).await;
+        assert_eq!(clock.now(), (MonoNs(2 * MS), WallNs(7_002 * MS as i64)));
+        let conn = ConnKey { conn: 1, epoch: 3 };
+        let recorded = |mono: u64, wall: i64| Stamp {
+            ingest_seq: 99,
+            kernel_rx: Some(KernelRxNs(5)),
+            recv_mono: MonoNs(mono),
+            recv_wall: WallNs(wall),
+            conn,
+        };
+        // A record's own instant, on both clocks: the anchor from now on.
+        let first = clock.restamp(recorded(MS, 9_000));
+        assert_eq!(
+            first,
+            Stamp {
+                ingest_seq: 0,
+                ..recorded(MS, 9_000)
+            }
+        );
+        assert_eq!(clock.now(), (MonoNs(2 * MS), WallNs(9_000 + MS as i64)));
+        // An input stamped now, at 2 ms: a record of 1.5 ms after it takes 2 ms.
+        let live = clock.stamp(conn, None);
+        assert_eq!((live.ingest_seq, live.recv_mono), (1, MonoNs(2 * MS)));
+        let late = clock.restamp(recorded(3 * MS / 2, 20_000));
+        assert_eq!(late.ingest_seq, 2);
+        assert_eq!(
+            (late.recv_mono, late.recv_wall),
+            (MonoNs(2 * MS), WallNs(20_000 + MS as i64 / 2))
+        );
+        // A consumer input keeps its instant, or takes the latest one stamped.
+        assert_eq!(clock.retick(MonoNs(MS)), (3, MonoNs(2 * MS)));
+        assert_eq!(clock.retick(MonoNs(5 * MS)), (4, MonoNs(5 * MS)));
+        // Nothing reads earlier than the latest instant stamped.
+        assert_eq!(clock.now().0, MonoNs(5 * MS));
+        assert_eq!(clock.tick().1, MonoNs(5 * MS));
+    }
+
+    /// A live clock's replayed input keeps its recorded times, anchoring nothing.
+    #[test]
+    fn a_live_clock_restamps_a_replayed_input_with_its_recorded_times() {
+        let clock = IngestClock::new();
+        let recorded = Stamp {
+            ingest_seq: 99,
+            kernel_rx: None,
+            recv_mono: MonoNs(3),
+            recv_wall: WallNs(4),
+            conn: ConnKey { conn: 1, epoch: 0 },
+        };
+        let stamped = clock.restamp(recorded);
+        assert_eq!(
+            stamped,
+            Stamp {
+                ingest_seq: 0,
+                ..recorded
+            }
+        );
+        assert_eq!(clock.retick(MonoNs(2)), (1, MonoNs(2)));
+    }
+
+    #[test]
+    fn a_replayed_wall_time_saturates_at_the_ends_of_the_clock() {
+        let anchor = |mono: u64, wall: i64| Replayed {
+            mono: MonoNs(mono),
+            wall: WallNs(wall),
+            last: MonoNs(mono),
+        };
+        assert_eq!(
+            anchor(u64::MAX, i64::MIN + 5).wall_at(MonoNs(0)),
+            WallNs(i64::MIN)
+        );
+        assert_eq!(
+            anchor(0, i64::MAX - 5).wall_at(MonoNs(u64::MAX)),
+            WallNs(i64::MAX)
+        );
+        assert_eq!(anchor(10, 100).wall_at(MonoNs(4)), WallNs(94));
     }
 
     #[test]

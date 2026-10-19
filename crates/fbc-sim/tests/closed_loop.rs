@@ -54,10 +54,10 @@ use fbc_oms::{
     PreTradeCaps, Registry, ResyncSnapshot,
 };
 use fbc_runtime::{
-    ClosedLoop, Connector, ConsumerInput, ConsumerTimers, ExecControl, ExecHandler, ExecOrders,
-    ExecSession, ExecSessionConfig, InProcessStream, IngestClock, Journal, Ladder, MdHandler,
-    MdReplay, MdReplayConfig, Member, PeerFeed, ProxyConfig, RateLimiter, ReconnectPacing,
-    ReplayFailure, RpcIds, SafetyReserve, ShardError, ShardHost, WriteStall,
+    Changed, ClosedLoop, Connector, ConsumerInput, ConsumerTimers, ExecControl, ExecHandler,
+    ExecOrders, ExecSession, ExecSessionConfig, InProcessStream, IngestClock, Journal, Ladder,
+    MdHandler, MdReplay, MdReplayConfig, Member, PeerFeed, ProxyConfig, RateLimiter,
+    ReconnectPacing, ReplayFailure, RpcIds, SafetyReserve, ShardError, ShardHost, WriteStall,
 };
 use fbc_sim::{Bracket, PeerCounters, QueueConfig, SimCodec, SimConfig, SimLatency, SimPeer};
 
@@ -456,6 +456,30 @@ fn journal(root: &Path) {
             },
         };
         write(ms, record);
+        if ms == 10_000 {
+            // What the live shard wrote besides that the replay passes over: its order-entry session's
+            // frame, on another connection, and the consumer's own annotation.
+            write(
+                10_001,
+                Record::Outbound {
+                    at: at(10_001),
+                    conn: ConnKey { conn: 9, epoch: 1 },
+                    rpc: None,
+                    opcode: fbc_journal::Opcode::Text,
+                    frame: fbc_core::WireSlice::plain(b"live order entry".to_vec()),
+                },
+            );
+            write(
+                10_002,
+                Record::Consumer {
+                    at: at(10_002),
+                    kind: 77,
+                    input: false,
+                    ingest_seq: None,
+                    bytes: Opaque(b"note".to_vec()),
+                },
+            );
+        }
     }
     write(
         3_601_000,
@@ -723,11 +747,15 @@ impl World {
     }
 }
 
-/// The consumer's market-data handler, behind the brackets' peers.
-struct MdLog(Shared);
+/// The consumer's market-data handler, behind the brackets' peers: it marks the instrument of
+/// every event changed, for the next decide pass.
+struct MdLog(Shared, Option<Changed>);
 
 impl MdHandler for MdLog {
     fn on_md(&mut self, env: Envelope<MdEvent>) {
+        if let Some(changed) = &self.1 {
+            changed.mark(INST);
+        }
         self.0.borrow_mut().seen.push(Seen::Md(env.stamp, env.body));
     }
 }
@@ -999,11 +1027,10 @@ async fn closed_loop(root: &Path) -> Run {
         specs: toy::specs(),
         conn: MD.conn,
     };
-    let feed = PeerFeed::new(streams, MdLog(Rc::clone(&world)));
+    let mut host = ShardHost::new(clock.clone());
+    let feed = PeerFeed::new(streams, MdLog(Rc::clone(&world), Some(host.changed())));
     let mut md = MdReplay::new(config, feed).unwrap();
     md.set_inputs(Inputs(Rc::clone(&world)));
-
-    let mut host = ShardHost::new(clock.clone());
     host.set_journal(Journal::new(Rc::clone(&journaled)));
     let mut decide = Decider(Rc::clone(&world));
     let closed = ClosedLoop {
@@ -1016,20 +1043,23 @@ async fn closed_loop(root: &Path) -> Run {
     members.extend(sessions.iter_mut().map(Member::exec));
     host.run(members, &mut decide).await.unwrap();
     let passes = host.passes();
-    drop(sessions);
-    drop(md);
+    drop((sessions, md, decide, host));
 
     let world = Rc::try_unwrap(world).ok().unwrap().into_inner();
-    let journal = Rc::try_unwrap(journaled).ok().unwrap().into_inner().0;
     assert!(world.oms.iter().all(|o| o.laddered.is_empty()));
+    let timers_not_armed = world.timers.not_armed();
+    let (seen, submitted) = (world.seen, world.submitted);
+    // The sessions' orders, which the registries' brackets held, journal too.
+    drop(world.oms);
+    let journal = Rc::try_unwrap(journaled).ok().unwrap().into_inner().0;
     let _ = std::fs::remove_dir_all(&leases);
     Run {
-        seen: world.seen,
-        submitted: world.submitted,
+        seen,
+        submitted,
         journal,
         counters: peers.iter().map(|p| p.borrow().counters()).collect(),
         passes,
-        timers_not_armed: world.timers.not_armed(),
+        timers_not_armed,
     }
 }
 
@@ -1130,6 +1160,22 @@ async fn a_closed_loop_replay_through_the_shard_host_gives_the_same_commands_fil
     // A Cycle record per decide pass, each naming the last ingest sequence the pass covered.
     let cycles = first.cycles();
     assert_eq!(u64::try_from(cycles.len()).unwrap(), first.passes);
+    // A pass after market data decides for its instrument; one after the venues' answers alone
+    // for none.
+    assert!(cycles.iter().any(|c| c.1 == [INST]), "{cycles:?}");
+    assert!(cycles.iter().any(|c| c.1.is_empty()), "{cycles:?}");
+    let decided: Vec<Vec<InstrumentId>> = first
+        .seen
+        .iter()
+        .filter_map(|s| match s {
+            Seen::Decide(instruments) => Some(instruments.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        decided,
+        cycles.iter().map(|c| c.1.clone()).collect::<Vec<_>>()
+    );
     assert!(cycles.windows(2).all(|w| w[0].0 < w[1].0), "{cycles:?}");
     let passes = first
         .seen
@@ -1228,6 +1274,42 @@ async fn a_closed_loop_replay_through_the_shard_host_gives_the_same_commands_fil
             .collect()
     };
     assert_ne!(shape(0), shape(2));
+    let (buy, sell) = (Side::Buy, Side::Sell);
+    // Pessimistic and Middle each bought both lots in one fill, offered them, bid again once
+    // both were sold and offered the second buy; Optimistic bought its first lots one at a
+    // time and offered each as it came.
+    let whole = vec![(buy, 2), (sell, 2), (buy, 2), (sell, 2)];
+    assert_eq!(shape(0), whole);
+    assert_eq!(shape(1), whole);
+    assert_eq!(
+        shape(2),
+        [(buy, 2), (sell, 1), (sell, 1), (buy, 2), (sell, 2)]
+    );
+    for i in 0..BRACKETS.len() {
+        // The second buy went out in the decide pass after the fill that left the bracket
+        // flat, at that fill's replayed instant.
+        let flat = first
+            .fills(i)
+            .into_iter()
+            .rfind(|f| f.1 == Side::Sell)
+            .unwrap();
+        let rebid = first
+            .commands(i)
+            .into_iter()
+            .filter(|c| {
+                matches!(
+                    c.cmd,
+                    Cmd::Place {
+                        side: Side::Buy,
+                        ..
+                    }
+                )
+            })
+            .nth(1)
+            .unwrap();
+        assert_eq!(rebid.handling, None);
+        assert_eq!(first.written(i, rebid.rpc), flat.0.recv_mono, "{i}");
+    }
     let first_fill = |i: usize| first.fills(i)[0].0.ingest_seq;
     let (pess, mid, opt) = (first_fill(0), first_fill(1), first_fill(2));
     assert!(opt < mid && mid < pess, "{opt} {mid} {pess}");
@@ -1258,7 +1340,7 @@ async fn replay_alone(
         specs: toy::specs(),
         conn: MD.conn,
     };
-    let mut md = MdReplay::new(config, MdLog(solo())).unwrap();
+    let mut md = MdReplay::new(config, MdLog(solo(), None)).unwrap();
     let mut host = ShardHost::new(clock.clone());
     let closed = ClosedLoop {
         clock,

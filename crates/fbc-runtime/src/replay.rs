@@ -46,13 +46,22 @@
 //! replay feeds it to none.
 //! Records the sink dropped leave a `Degraded` marker, counted as a gap: a replay across one
 //! is not exact.
+//!
+//! **Closed loop** (FBC-066n, decision 0106). A replay can also run as a member of a shard host
+//! ([`Member::md_replay`](crate::Member::md_replay)) with a [`ClosedLoop`]: each record it feeds
+//! waits for its recorded instant on the shard's replayed clock
+//! ([`IngestClock::replayed`], on a paused runtime, so the wait is virtual), and each input is
+//! stamped with the shard's next ingest sequence, keeping its recorded instant, so the consumer's
+//! handlers, decide passes and order-entry sessions (SimVenue's, per bracket) run among the
+//! records as they run live. Once the records end it waits the `settle` time and ends the
+//! sessions.
 
 use std::fmt;
 
 use fbc_core::{
     ConfigError, ConnKey, Effects, EndpointPlan, Envelope, HttpFailure, HttpResponse, HttpTag,
-    MdCodec, MdEvent, MdSink, RawFrame, SpecTable, Stamp, Subscription, VenueCaps, VenueConfig,
-    VenueFactory, VenueMeta,
+    MdCodec, MdEvent, MdSink, MonoNs, RawFrame, SpecTable, Stamp, Subscription, VenueCaps,
+    VenueConfig, VenueFactory, VenueMeta,
 };
 use fbc_journal::{ControlEvent, HttpResponseRec, JournalError, Marker, Opcode, Record};
 
@@ -201,6 +210,9 @@ pub struct MdReplay<H> {
     counters: MdReplayCounters,
     handler: H,
     inputs: Option<Box<dyn InputHandler>>,
+    /// The shard's replayed clock while a closed-loop replay plays ([`MdReplay::play`]): every
+    /// input takes its next ingest sequence.
+    shard: Option<IngestClock>,
 }
 
 /// The open epoch: its codec once built, and until then the HTTP results that came back
@@ -232,6 +244,7 @@ impl<H: MdHandler> MdReplay<H> {
             counters: MdReplayCounters::default(),
             handler,
             inputs: None,
+            shard: None,
         })
     }
 
@@ -260,12 +273,92 @@ impl<H: MdHandler> MdReplay<H> {
     }
 
     /// Drives the closed-loop replay of `closed` on a shard ([`Member::md_replay`](crate::Member::md_replay)).
+    ///
+    /// Each record this replay feeds waits for its recorded instant on the shard's replayed
+    /// clock (the runtime's, paused, so the wait moves it to the earliest of that instant and
+    /// every other timer of the shard due before it), then is fed as [`MdReplay::feed`] feeds
+    /// it, each input stamped with the shard's next ingest sequence. Once the records end,
+    /// the replay waits `settle` past the last instant and drops the order-entry sessions'
+    /// controls. A live clock, a record the journal cannot read and a damaged text frame each
+    /// stop it with nothing more fed, the controls dropped all the same.
     pub(crate) async fn play<I>(&mut self, closed: ClosedLoop<I>) -> Result<(), ReplayFailure>
     where
         I: IntoIterator<Item = Result<Record, JournalError>>,
     {
-        drop(closed);
+        let ClosedLoop {
+            clock,
+            records,
+            settle,
+            stops,
+        } = closed;
+        if !clock.is_replayed() {
+            return Err(ReplayFailure::LiveClock);
+        }
+        self.shard = Some(clock.clone());
+        let played = self.play_records(&clock, records).await;
+        // Fed on its own afterwards, the replay stamps with the recorded stamps again.
+        self.shard = None;
+        let last = played?;
+        let settled = u64::try_from(settle.as_nanos()).unwrap_or(u64::MAX);
+        until(&clock, MonoNs(last.0.saturating_add(settled))).await;
+        drop(stops);
         Ok(())
+    }
+
+    /// Feeds `records`, each at its recorded instant on `clock`, then finishes: the latest
+    /// instant fed.
+    async fn play_records<I>(
+        &mut self,
+        clock: &IngestClock,
+        records: I,
+    ) -> Result<MonoNs, ReplayFailure>
+    where
+        I: IntoIterator<Item = Result<Record, JournalError>>,
+    {
+        let mut last = MonoNs(0);
+        for record in records {
+            let record = record.map_err(|e| ReplayFailure::Journal(e.to_string()))?;
+            if let Some(at) = self.due(&record) {
+                last = last.max(at);
+                until(clock, at).await;
+            }
+            self.feed(&record).map_err(|e| match e {
+                ReplayError::NotUtf8 { ingest_seq } => ReplayFailure::NotUtf8 { ingest_seq },
+                other => ReplayFailure::Journal(other.to_string()),
+            })?;
+        }
+        self.finish();
+        Ok(last)
+    }
+
+    /// The recorded instant of `record` when this replay feeds it: an input or control record
+    /// of its connection, or a consumer input the shard stamped while an input handler is set.
+    fn due(&self, record: &Record) -> Option<MonoNs> {
+        match record {
+            Record::Inbound { stamp, .. }
+            | Record::Timer { stamp, .. }
+            | Record::HttpResult { stamp, .. }
+                if self.owns(stamp.conn) =>
+            {
+                Some(stamp.recv_mono)
+            }
+            Record::Control { at, ev } if self.owns(control_conn(ev)) => Some(*at),
+            Record::Consumer {
+                at,
+                input: true,
+                ingest_seq: Some(_),
+                ..
+            } if self.inputs.is_some() => Some(*at),
+            _ => None,
+        }
+    }
+
+    /// The stamp of a replayed input recorded as `recorded`: the shard's next ingest sequence
+    /// in a closed-loop replay, the recorded one otherwise.
+    fn stamp(&self, recorded: Stamp) -> Stamp {
+        self.shard
+            .as_ref()
+            .map_or(recorded, |clock| clock.restamp(recorded))
     }
 
     /// Feeds one record; records of other connections and outputs are skipped.
@@ -289,12 +382,14 @@ impl<H: MdHandler> MdReplay<H> {
                     }
                     Opcode::Binary => RawFrame::Binary(&bytes.0),
                 };
+                let stamp = &self.stamp(*stamp);
                 if self.ready(stamp.conn)
                     && let Some(codec) = self.open.as_mut().and_then(|e| e.codec.as_deref_mut())
                 {
                     let mut sink = Deliver {
                         handler: &mut self.handler,
                         stamp: *stamp,
+                        shard: self.shard.as_ref(),
                     };
                     let fed = feed_frame(codec, &self.caps, &self.specs, raw, &mut sink, &mut fx());
                     self.counters.frames += 1;
@@ -302,19 +397,22 @@ impl<H: MdHandler> MdReplay<H> {
                 }
             }
             Record::Timer { stamp, tag } if self.owns(stamp.conn) => {
+                let stamp = &self.stamp(*stamp);
                 if self.ready(stamp.conn)
                     && let Some(codec) = self.open.as_mut().and_then(|e| e.codec.as_deref_mut())
                 {
                     let mut sink = Deliver {
                         handler: &mut self.handler,
                         stamp: *stamp,
+                        shard: self.shard.as_ref(),
                     };
                     feed_timer(codec, *stamp, *tag, &mut sink, &mut fx());
                     self.counters.timers += 1;
                 }
             }
             Record::HttpResult { stamp, tag, result } if self.owns(stamp.conn) => {
-                let held = (*stamp, *tag, result.clone());
+                let stamp = self.stamp(*stamp);
+                let held = (stamp, *tag, result.clone());
                 match &mut self.open {
                     // Before the epoch's opening call: held until its codec is built.
                     Some(epoch) if epoch.key == stamp.conn && epoch.codec.is_none() => {
@@ -325,7 +423,12 @@ impl<H: MdHandler> MdReplay<H> {
                 }
             }
             // An input the shard stamped goes back to the consumer at its place (FBC-hvqi).
-            Record::Consumer { .. } => hand_back(&mut self.inputs, &mut self.counters, record),
+            Record::Consumer { .. } => hand_back(
+                &mut self.inputs,
+                &mut self.counters,
+                self.shard.as_ref(),
+                record,
+            ),
             _ => {}
         }
         Ok(())
@@ -420,6 +523,7 @@ impl<H: MdHandler> MdReplay<H> {
             let mut sink = Deliver {
                 handler: &mut self.handler,
                 stamp,
+                shard: self.shard.as_ref(),
             };
             let (caps, specs) = (&self.caps, &self.specs);
             let fed = match &result {
@@ -434,12 +538,15 @@ impl<H: MdHandler> MdReplay<H> {
     }
 }
 
-/// Hands a consumer input the shard stamped back to `inputs`, counted. The consumer's
-/// annotations and the inputs it journaled itself are no codec's input (decision 0101) and
-/// nothing the shard handed on: passed over, as is every input with no input handler set.
+/// Hands a consumer input the shard stamped back to `inputs`, counted, with the shard's next
+/// ingest sequence in a closed-loop replay (`shard`) and its recorded one otherwise. The
+/// consumer's annotations and the inputs it journaled itself are no codec's input (decision
+/// 0101) and nothing the shard handed on: passed over, as is every input with no input handler
+/// set.
 fn hand_back(
     inputs: &mut Option<Box<dyn InputHandler>>,
     counters: &mut MdReplayCounters,
+    shard: Option<&IngestClock>,
     record: &Record,
 ) {
     if let (
@@ -453,9 +560,10 @@ fn hand_back(
         },
     ) = (inputs, record)
     {
+        let (ingest_seq, at) = shard.map_or((*ingest_seq, *at), |clock| clock.retick(*at));
         inputs.on_input(ConsumerInput {
-            ingest_seq: *ingest_seq,
-            at: *at,
+            ingest_seq,
+            at,
             kind: *kind,
             bytes: bytes.0.clone(),
         });
@@ -483,15 +591,40 @@ fn with_response<R>(rec: &HttpResponseRec, f: impl FnOnce(HttpResponse<'_>) -> R
     })
 }
 
-/// Stamps each event a replayed codec pushes with its input's recorded stamp and hands it to
-/// the handler: the codec is always the open epoch's, so every event passes.
+/// Stamps each event a replayed codec pushes with its input's stamp and hands it to the
+/// handler: the codec is always the open epoch's, so every event passes. In a closed-loop
+/// replay the shard's clock names the input as being handled meanwhile, as a live session's
+/// does (decision 0100), so what the handler submits is attributed to it.
 struct Deliver<'a, H> {
     handler: &'a mut H,
     stamp: Stamp,
+    shard: Option<&'a IngestClock>,
 }
 
 impl<H: MdHandler> MdSink for Deliver<'_, H> {
     fn push(&mut self, meta: VenueMeta, ev: MdEvent) {
-        self.handler.on_md(Envelope::new(self.stamp, meta, ev));
+        let env = Envelope::new(self.stamp, meta, ev);
+        match self.shard {
+            Some(clock) => clock.attributing(self.stamp, || self.handler.on_md(env)),
+            None => self.handler.on_md(env),
+        }
+    }
+}
+
+/// The connection a control record names.
+fn control_conn(ev: &ControlEvent) -> ConnKey {
+    match ev {
+        ControlEvent::Opened(key) | ControlEvent::Closed(key) => *key,
+        ControlEvent::Subscribe { conn, .. } => *conn,
+    }
+}
+
+/// Waits until `at` on the replayed clock `clock`: at once when it is not later than now or
+/// lies past the end of the clock.
+async fn until(clock: &IngestClock, at: MonoNs) {
+    if let Some(when) = clock.instant(at)
+        && when > tokio::time::Instant::now()
+    {
+        tokio::time::sleep_until(when).await;
     }
 }
