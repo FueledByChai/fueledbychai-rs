@@ -12,7 +12,9 @@
 //! the seed's request or its matching-engine time at or before the seed's watermark; any other
 //! moves the inventory, on either read mode, and those applied before it was registered that a
 //! one-read seed held only for not showing it move the inventory as it is registered
-//! (`src/resync.rs`). An order
+//! (`src/resync.rs`). An order of ours the registry holds as ended Lost that a trustworthy
+//! snapshot shows open is one too: registered again with the fills counted on it, so it rests
+//! on both caps (Reviewer B's RB840-8 on PR #171). An order
 //! not ours (another namespace's, a non-canonical client id, or one nothing attributes) is
 //! never one (I4).
 //!

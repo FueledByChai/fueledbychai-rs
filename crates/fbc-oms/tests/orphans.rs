@@ -1329,6 +1329,17 @@ fn an_order_of_ours_the_ladder_ended_lost_that_a_later_snapshot_shows_open_is_an
         OrdState::Terminal(TerminalKind::Lost)
     );
     assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(0)));
+    // A source that is not trustworthy confirms nothing: reported, not acted on.
+    let report = resync_at(
+        &mut reg,
+        SnapshotSource::Untrustworthy,
+        2_500,
+        vec![ours(c, "l", Side::Buy)],
+        0,
+    );
+    assert_eq!(report.untracked, vec![(c, vid("l"))], "{report:?}");
+    assert!(report.orphans.is_empty(), "{report:?}");
+    assert!(reg.get(c).unwrap().state().is_terminal());
 
     let report = resync_at(
         &mut reg,
