@@ -204,6 +204,8 @@ pub fn caps_for(fill_ids: FillIds) -> VenueCaps {
                 // One answer holds the open orders and the positions, in frames or from one
                 // REST request (`<base>/resync`): one read of the account.
                 snapshot_reads: SnapshotReads::OneInstant,
+                // The toy answers its resync from its own state, in frames or one request: it never lags.
+                snapshot_lag_bound: Duration::ZERO,
                 events_echo_flags: true,
                 sign_cost_hint_us: 0,
             },
