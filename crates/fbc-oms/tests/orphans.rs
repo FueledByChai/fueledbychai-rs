@@ -1,0 +1,731 @@
+//! Orphans (0005's I7; FBC-840): a resync that finds open orders under our namespace that the
+//! registry does not hold, on a market a resync already seeded, registers them, suppresses the
+//! market's adding side for the consumer's cooldown and cancels them by explicit reference in
+//! a cancel-many, in every market state, a disarmed market included. Above the consumer's level
+//! limit it escalates to an instrument cancel-all, only while the registry holds the market's
+//! exclusive lease and no order not ours is in view (the snapshot's included); otherwise the
+//! explicit cancels repeat on each resync. No foreign-namespace order is ever cancelled. From an
+//! untrustworthy snapshot source it acts only on the orders a live account event also showed.
+//!
+//! The values are the owner's first test values: a $50 inventory cap on a synthetic market
+//! where one lot is worth $1, so 50 lots; the resting cap is set past any order here.
+
+#[path = "common/arm.rs"]
+mod arm;
+mod common;
+
+use std::time::Duration;
+
+use common::{canceled, cid, fill, fill_id, lots, order_caps, placement, update, vid};
+use fbc_core::{
+    AmendAck, AmendCaps, AmendQty, CancelBatch, CancelScope, CidMatch, ClientOrderId, FillIdent,
+    InstrumentId, MonoNs, Namespace, NewOrder, OrderCaps, OrderKind, OrderRef, RefKind, RpcId,
+    Side, SignedLots, SnapshotSource, Support, TagSet, Ticks, VenueCommand, VenueOrderSnapshot,
+    VenueOrderState, WallNs,
+};
+use fbc_oms::{
+    Admission, AmendRefusal, CancelAllRefusal, Cooldown, EntryState, FillLedger, FillRouted,
+    LadderConfig, LedgerConfig, MarketCapsConfig, OmsError, OrdState, OrderKey, OrphanCancels,
+    OrphanConfig, OrphanConfigError, OrphanPlan, PreTradeCaps, Registry, ResyncReport,
+    ResyncSnapshot, Routed, StaleAuthorization,
+};
+
+const INST: InstrumentId = InstrumentId::new(1);
+const OTHER: InstrumentId = InstrumentId::new(2);
+/// The owner's first inventory cap, in lots of $1.
+const CAP: i64 = 50;
+/// Another engine's namespace on the account (FBC-aoh5: a Java instance shares the account).
+const THEIRS: Namespace = Namespace::new(8);
+/// The consumer's cooldown in these tests: 5 s.
+const COOLDOWN: Duration = Duration::from_secs(5);
+/// The consumer's level limit in these tests.
+const LIMIT: u32 = 3;
+
+fn caps() -> PreTradeCaps {
+    [INST, OTHER]
+        .into_iter()
+        .try_fold(PreTradeCaps::new(), |caps, m| {
+            caps.with_market(
+                m,
+                MarketCapsConfig {
+                    inventory: Some(lots(CAP)),
+                    resting: Some(lots(1_000_000)),
+                },
+            )
+        })
+        .unwrap()
+}
+
+/// A venue that cancels one instrument's orders, or the whole account's, in one request, and
+/// batches cancels by venue id, with a trustworthy snapshot: the account cancel-all is declared
+/// so that never building one is the OMS's choice, not the venue's.
+fn venue() -> OrderCaps {
+    OrderCaps {
+        cancel_all_account: Support::Native,
+        cancel_all_instrument: Support::Native,
+        batch_cancel: Some(CancelBatch {
+            max_items: 10,
+            refs: TagSet::of(&[RefKind::Venue]),
+        }),
+        snapshot_source: SnapshotSource::Trustworthy,
+        ..order_caps()
+    }
+}
+
+/// [`venue`] whose snapshot source is `source`.
+fn venue_from(source: SnapshotSource) -> OrderCaps {
+    OrderCaps {
+        snapshot_source: source,
+        ..venue()
+    }
+}
+
+fn cfg() -> OrphanConfig {
+    OrphanConfig::new(COOLDOWN, LIMIT).unwrap()
+}
+
+fn ladder_cfg() -> LadderConfig {
+    LadderConfig::new(
+        Duration::from_secs(1),
+        Duration::ZERO,
+        Duration::from_secs(10),
+        1,
+    )
+    .unwrap()
+}
+
+fn key(ingest: u64) -> OrderKey {
+    OrderKey {
+        venue: None,
+        ingest,
+    }
+}
+
+/// A resync requested at `at` (on both clocks) of `orders`, positions `pos`, from `source`.
+fn resync_at(
+    reg: &mut Registry,
+    source: SnapshotSource,
+    at: u64,
+    orders: Vec<VenueOrderSnapshot>,
+    pos: i64,
+) -> ResyncReport {
+    let snap = ResyncSnapshot {
+        watermark: WallNs(i64::try_from(at).unwrap()),
+        requested_at: MonoNs(at),
+        orders,
+        positions: vec![(INST, SignedLots(pos))],
+    };
+    reg.resync(&ladder_cfg(), &venue_from(source), &snap, key(at))
+        .unwrap()
+}
+
+/// A named registry under the caps whose first trustworthy resync, at 1 000, seeded `INST` at
+/// `pos` and `OTHER` flat, showing no order: disarmed, in Cancel-only.
+fn seeded(pos: i64) -> Registry {
+    let mut reg = arm::named(Registry::with_caps(caps()));
+    let report = resync_at(&mut reg, SnapshotSource::Trustworthy, 1_000, vec![], pos);
+    assert_eq!(report.seeded.len(), 2, "{report:?}");
+    assert!(report.orphans.is_empty());
+    assert_eq!(reg.position(INST), Some(SignedLots(pos)));
+    reg
+}
+
+/// Our order `c` as a snapshot shows it, open on `INST` under `v`: 5 lots on `side`.
+fn ours(c: ClientOrderId, v: &str, side: Side) -> VenueOrderSnapshot {
+    VenueOrderSnapshot {
+        cid: Some(CidMatch::Ours(c)),
+        vid: vid(v),
+        inst: INST,
+        side,
+        state: VenueOrderState::Open,
+        px: Some(Ticks(100)),
+        qty: lots(5),
+        cum_filled: lots(0),
+        post_only: None,
+        reduce_only: None,
+    }
+}
+
+/// An order not ours as a snapshot shows it on `INST`, under `cid` (`None`: no client id).
+fn not_ours(cid: Option<CidMatch>, v: &str) -> VenueOrderSnapshot {
+    VenueOrderSnapshot {
+        cid,
+        ..ours(common::cid(), v, Side::Buy)
+    }
+}
+
+fn sell(qty: i64) -> NewOrder {
+    NewOrder {
+        side: Side::Sell,
+        kind: OrderKind::Limit { px: Ticks(101) },
+        ..placement(cid(), 101, qty)
+    }
+}
+
+fn buy(qty: i64) -> NewOrder {
+    placement(cid(), 100, qty)
+}
+
+/// Builds and authorizes the place of `order`, or says why it was refused.
+fn place(reg: &mut Registry, order: NewOrder) -> Result<(), OmsError> {
+    reg.place(order).map(|cmd| arm::issue(reg, cmd))
+}
+
+fn suppressed(side: Side) -> OmsError {
+    OmsError::OrphanCooldown { inst: INST, side }
+}
+
+/// The venue ids a cancel-many names, in order; every item is on `INST`.
+fn cancelled(cmd: &VenueCommand) -> Vec<String> {
+    let VenueCommand::CancelMany(items) = cmd else {
+        panic!("expected a cancel-many, got {cmd:?}");
+    };
+    items
+        .iter()
+        .map(|i| {
+            assert_eq!(i.inst, INST);
+            match &i.target {
+                OrderRef::Venue(v) | OrderRef::Both(_, v) => v.as_str().to_owned(),
+                OrderRef::Client(c) => panic!("named by client id alone: {c:?}"),
+            }
+        })
+        .collect()
+}
+
+/// The explicit cancels `plan` built: one cancel-many naming `vids` by reference, nothing
+/// refused or waiting, with `escalation` as the reason no cancel-all was built.
+fn assert_explicit(plan: &OrphanPlan, vids: &[&str], escalation: Option<CancelAllRefusal>) {
+    let OrphanCancels::Explicit {
+        plan: cancels,
+        escalation: given,
+    } = &plan.cancels
+    else {
+        panic!("expected explicit cancels, got {plan:?}");
+    };
+    assert_eq!(*given, escalation, "{plan:?}");
+    assert!(cancels.refused.is_empty(), "{cancels:?}");
+    assert!(cancels.awaiting_ack.is_empty(), "{cancels:?}");
+    assert_eq!(cancels.commands.len(), 1, "one cancel-many: {cancels:?}");
+    assert_eq!(cancelled(cancels.commands[0].command()), vids);
+}
+
+fn ledger() -> FillLedger {
+    FillLedger::new(
+        LedgerConfig {
+            max_age: Duration::from_secs(3600),
+            max_entries: 10_000,
+        },
+        WallNs(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn the_consumer_states_a_cooldown_and_a_level_limit() {
+    assert_eq!(
+        OrphanConfig::new(Duration::ZERO, LIMIT),
+        Err(OrphanConfigError::ZeroCooldown)
+    );
+    assert_eq!(
+        OrphanConfig::new(COOLDOWN, 0),
+        Err(OrphanConfigError::ZeroLevelLimit)
+    );
+    let cfg = cfg();
+    assert_eq!((cfg.cooldown(), cfg.level_limit()), (COOLDOWN, LIMIT));
+    for e in [
+        OrphanConfigError::ZeroCooldown,
+        OrphanConfigError::ZeroLevelLimit,
+    ] {
+        assert!(!e.to_string().is_empty());
+    }
+}
+
+#[test]
+fn an_orphan_suppresses_the_adding_side_for_the_configured_cooldown() {
+    let mut reg = seeded(0);
+    arm::start(&mut reg, INST);
+    place(&mut reg, buy(5)).unwrap();
+    let before = reg.entry(INST).generation();
+    // A place built and authorized before the resync, not yet sent.
+    let cmd = reg.place(buy(1)).unwrap();
+    let waiting = reg.authorize(arm::TEST_ACCT, cmd).unwrap();
+    assert_eq!(reg.orphan_cooldown(INST), None);
+
+    let o = cid();
+    let report = resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        2_000,
+        vec![ours(o, "o", Side::Buy)],
+        0,
+    );
+    assert_eq!(report.untracked, vec![(o, vid("o"))]);
+    assert_eq!(report.orphans, vec![INST]);
+    assert!(report.unconfirmed.is_empty());
+    // Registered, from the snapshot, counting as it rests.
+    let rec = reg.get(o).unwrap();
+    assert!(rec.from_snapshot());
+    assert_eq!(rec.state(), OrdState::Open);
+    assert_eq!(reg.orphans(INST), vec![o]);
+    assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(5 + 1 + 5)));
+
+    // From the resync on, until the consumer's cancel of the orphans starts the cooldown: the
+    // market is flat, so both sides add to its position.
+    assert_eq!(reg.orphan_cooldown(INST), Some(Cooldown::Pending));
+    assert_eq!(place(&mut reg, buy(1)), Err(suppressed(Side::Buy)));
+    assert_eq!(place(&mut reg, sell(1)), Err(suppressed(Side::Sell)));
+    assert_eq!(reg.end_orphan_cooldowns(MonoNs(u64::MAX)), vec![]);
+    // The market's state generation moved, so what was authorized before is not sent.
+    assert_ne!(reg.entry(INST).generation(), before);
+    assert_eq!(reg.entry(INST).state(), EntryState::Quoting);
+    assert!(matches!(
+        waiting.check_at_submit(),
+        Err(StaleAuthorization::StateChanged { market: INST, .. })
+    ));
+    // The other market is untouched.
+    assert_eq!(reg.orphan_cooldown(OTHER), None);
+
+    let now = MonoNs(10_000);
+    let plan = reg.cancel_orphans(INST, &cfg(), &venue(), now);
+    let until = MonoNs(10_000 + 5_000_000_000);
+    assert_eq!(plan.cooldown, Some(Cooldown::Until(until)));
+    assert_eq!(reg.orphan_cooldown(INST), Some(Cooldown::Until(until)));
+    assert_eq!(reg.end_orphan_cooldowns(MonoNs(until.0 - 1)), vec![]);
+    assert_eq!(place(&mut reg, buy(1)), Err(suppressed(Side::Buy)));
+    assert!(!suppressed(Side::Buy).to_string().is_empty());
+
+    assert_eq!(reg.end_orphan_cooldowns(until), vec![INST]);
+    assert_eq!(reg.orphan_cooldown(INST), None);
+    place(&mut reg, buy(1)).unwrap();
+    place(&mut reg, sell(1)).unwrap();
+}
+
+#[test]
+fn during_the_cooldown_only_the_side_that_reduces_the_position_takes_orders_never_past_zero() {
+    // Long 20: buys add, sells reduce.
+    let mut reg = seeded(20);
+    arm::start(&mut reg, INST);
+    let o = cid();
+    resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        2_000,
+        vec![ours(o, "o", Side::Buy)],
+        20,
+    );
+    assert_eq!(place(&mut reg, buy(1)), Err(suppressed(Side::Buy)));
+    place(&mut reg, sell(15)).unwrap();
+    // 15 + 6 sold would take long 20 past zero: refused; 15 + 5 is flat.
+    assert_eq!(place(&mut reg, sell(6)), Err(suppressed(Side::Sell)));
+    place(&mut reg, sell(5)).unwrap();
+    // A batch item is judged the same way, the earlier items counted.
+    let plan = reg.place_batch(vec![buy(1)]).unwrap();
+    assert_eq!(plan.refused, vec![(plan.refused[0].0, suppressed(Side::Buy))]);
+    assert!(plan.command.is_none());
+}
+
+#[test]
+fn during_the_cooldown_an_amend_on_the_adding_side_is_refused() {
+    let amending = OrderCaps {
+        amend: Some(AmendCaps {
+            refs: TagSet::of(&[RefKind::Venue]),
+            price: true,
+            qty: true,
+            flags: false,
+            when_partially_filled: true,
+            reject_keeps_original: true,
+            keeps_venue_id: true,
+            ack: AmendAck::ReplacedEvent,
+            qty_semantics: AmendQty::TotalIncludingFilled,
+            keeps_priority: None,
+        }),
+        ..venue()
+    };
+    let mut reg = seeded(20);
+    arm::start(&mut reg, INST);
+    let (b, s) = (buy(5), sell(5));
+    let (bc, sc) = (b.cid, s.cid);
+    place(&mut reg, b).unwrap();
+    place(&mut reg, s).unwrap();
+    // Both acknowledged and resting, as the trustworthy resync showing the orphan shows them.
+    let o = cid();
+    let mut shown_b = ours(bc, "b", Side::Buy);
+    shown_b.px = Some(Ticks(100));
+    let mut shown_s = ours(sc, "s", Side::Sell);
+    shown_s.px = Some(Ticks(101));
+    resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        2_000,
+        vec![shown_b, shown_s, ours(o, "o", Side::Buy)],
+        20,
+    );
+    assert_eq!(reg.orphans(INST), vec![o]);
+    let refused = reg
+        .live(bc)
+        .unwrap()
+        .amend(&amending, Ticks(99), lots(5), false)
+        .unwrap_err();
+    assert_eq!(
+        refused,
+        AmendRefusal::OrphanCooldown {
+            inst: INST,
+            side: Side::Buy
+        }
+    );
+    // On the side that reduces the long position, within it: built.
+    reg.live(sc)
+        .unwrap()
+        .amend(&amending, Ticks(102), lots(5), false)
+        .unwrap();
+}
+
+#[test]
+fn the_orphans_are_cancelled_by_explicit_reference_in_one_cancel_many_also_on_a_disarmed_market()
+{
+    // Never armed since the restart: disarmed, in Cancel-only.
+    let mut reg = seeded(0);
+    let (a, b, c) = (cid(), cid(), cid());
+    let report = resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        2_000,
+        vec![
+            ours(c, "c", Side::Sell),
+            ours(a, "a", Side::Buy),
+            ours(b, "b", Side::Buy),
+        ],
+        0,
+    );
+    assert_eq!(reg.entry(INST).state(), EntryState::CancelOnly);
+    assert!(!reg.entry(INST).armed());
+    assert_eq!(report.orphans, vec![INST]);
+    assert_eq!(reg.orphans(INST), vec![a, b, c]);
+    let plan = reg.cancel_orphans(INST, &cfg(), &venue(), MonoNs(3_000));
+    assert_eq!(plan.market, INST);
+    assert_eq!(plan.orphans, vec![a, b, c]);
+    // At the level limit: explicit, no escalation asked.
+    assert_explicit(&plan, &["a", "b", "c"], None);
+
+    // In Killed too.
+    let mut reg = seeded(0);
+    arm::start(&mut reg, INST);
+    reg.kill(INST);
+    let d = cid();
+    resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        2_000,
+        vec![ours(d, "d", Side::Buy)],
+        0,
+    );
+    let plan = reg.cancel_orphans(INST, &cfg(), &venue(), MonoNs(3_000));
+    assert_explicit(&plan, &["d"], None);
+    // Each cancel is authorized like any other cancel.
+    let OrphanCancels::Explicit { plan: cancels, .. } = plan.cancels else {
+        unreachable!()
+    };
+    for cmd in cancels.commands {
+        arm::issue(&mut reg, cmd);
+    }
+}
+
+#[test]
+fn above_the_level_limit_an_instrument_cancel_all_is_built_only_under_the_exclusive_lease_with_nothing_foreign_in_the_snapshot()
+ {
+    let four = || -> Vec<ClientOrderId> { (0..4).map(|_| cid()).collect() };
+    let shown = |cids: &[ClientOrderId]| -> Vec<VenueOrderSnapshot> {
+        cids.iter()
+            .enumerate()
+            .map(|(i, &c)| ours(c, &format!("o{i}"), Side::Buy))
+            .collect()
+    };
+    let names = ["o0", "o1", "o2", "o3"];
+
+    // Armed (the exclusive lease held), a trustworthy view, nothing not ours: the cancel-all,
+    // with the explicit cancel of our order the venue may not hold yet.
+    let mut reg = seeded(0);
+    arm::start(&mut reg, INST);
+    let pending = buy(1);
+    let pending_cid = pending.cid;
+    place(&mut reg, pending).unwrap();
+    let orphans = four();
+    resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        2_000,
+        shown(&orphans),
+        0,
+    );
+    let plan = reg.cancel_orphans(INST, &cfg(), &venue(), MonoNs(3_000));
+    assert_eq!(plan.orphans, orphans);
+    let OrphanCancels::CancelAll {
+        command,
+        unanswered,
+    } = plan.cancels
+    else {
+        panic!("expected a cancel-all, got {plan:?}");
+    };
+    assert_eq!(
+        command.command(),
+        &VenueCommand::CancelAll(CancelScope::Instrument(INST))
+    );
+    assert!(unanswered.awaiting_ack.contains(&pending_cid) || !unanswered.commands.is_empty());
+    arm::issue(&mut reg, command);
+
+    // Disarmed: the exclusive lease is not held.
+    let mut reg = seeded(0);
+    let orphans = four();
+    resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        2_000,
+        shown(&orphans),
+        0,
+    );
+    let plan = reg.cancel_orphans(INST, &cfg(), &venue(), MonoNs(3_000));
+    assert_explicit(&plan, &names, Some(CancelAllRefusal::NoExclusiveLease));
+
+    // Armed, but another engine's order is in the snapshot.
+    let mut reg = seeded(0);
+    arm::start(&mut reg, INST);
+    let orphans = four();
+    let mut orders = shown(&orphans);
+    orders.push(not_ours(Some(CidMatch::Foreign(THEIRS)), "theirs"));
+    resync_at(&mut reg, SnapshotSource::Trustworthy, 2_000, orders, 0);
+    let plan = reg.cancel_orphans(INST, &cfg(), &venue(), MonoNs(3_000));
+    assert_explicit(&plan, &names, Some(CancelAllRefusal::ForeignInView));
+
+    // A venue with no instrument cancel-all.
+    let mut reg = seeded(0);
+    arm::start(&mut reg, INST);
+    let orphans = four();
+    resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        2_000,
+        shown(&orphans),
+        0,
+    );
+    let without = OrderCaps {
+        cancel_all_instrument: Support::Unsupported,
+        ..venue()
+    };
+    let plan = reg.cancel_orphans(INST, &cfg(), &without, MonoNs(3_000));
+    assert_explicit(&plan, &names, Some(CancelAllRefusal::Unsupported));
+
+    // At the limit, armed, nothing foreign: explicit.
+    let mut reg = seeded(0);
+    arm::start(&mut reg, INST);
+    let three: Vec<ClientOrderId> = (0..3).map(|_| cid()).collect();
+    resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        2_000,
+        shown(&three),
+        0,
+    );
+    let plan = reg.cancel_orphans(INST, &cfg(), &venue(), MonoNs(3_000));
+    assert_explicit(&plan, &names[..3], None);
+}
+
+#[test]
+fn the_explicit_cancels_repeat_on_each_resync_until_the_orphans_end() {
+    let mut reg = seeded(0);
+    let (a, b) = (cid(), cid());
+    let orders = || vec![ours(a, "a", Side::Buy), ours(b, "b", Side::Buy)];
+    resync_at(&mut reg, SnapshotSource::Trustworthy, 2_000, orders(), 0);
+    let plan = reg.cancel_orphans(INST, &cfg(), &venue(), MonoNs(3_000));
+    assert_explicit(&plan, &["a", "b"], None);
+    reg.cancel_sent(a, RpcId(1), MonoNs(3_000)).unwrap();
+    reg.cancel_sent(b, RpcId(1), MonoNs(3_000)).unwrap();
+
+    // The next resync still shows them: the market is named again, its cooldown waits for the
+    // cancel again, and the cancels are built again, those in flight included.
+    let report = resync_at(&mut reg, SnapshotSource::Trustworthy, 4_000, orders(), 0);
+    assert!(report.untracked.is_empty(), "registered: {report:?}");
+    assert_eq!(report.orphans, vec![INST]);
+    assert_eq!(reg.orphan_cooldown(INST), Some(Cooldown::Pending));
+    let plan = reg.cancel_orphans(INST, &cfg(), &venue(), MonoNs(5_000));
+    assert_explicit(&plan, &["a", "b"], None);
+    assert_eq!(
+        plan.cooldown,
+        Some(Cooldown::Until(MonoNs(5_000 + 5_000_000_000)))
+    );
+
+    // One ends: only the other is cancelled again.
+    let mut ended = update(Some(a), canceled(), 0);
+    ended.vid = Some(vid("a"));
+    reg.apply_update(&ended, key(4_500));
+    let report = resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        6_000,
+        vec![ours(b, "b", Side::Buy)],
+        0,
+    );
+    assert_eq!(report.orphans, vec![INST]);
+    let plan = reg.cancel_orphans(INST, &cfg(), &venue(), MonoNs(7_000));
+    assert_explicit(&plan, &["b"], None);
+
+    // Both ended: nothing is named, nothing built, and the cooldown runs out.
+    let mut ended = update(Some(b), canceled(), 0);
+    ended.vid = Some(vid("b"));
+    reg.apply_update(&ended, key(7_500));
+    let report = resync_at(&mut reg, SnapshotSource::Trustworthy, 8_000, vec![], 0);
+    assert!(report.orphans.is_empty());
+    assert!(reg.orphans(INST).is_empty());
+    let plan = reg.cancel_orphans(INST, &cfg(), &venue(), MonoNs(9_000));
+    assert!(plan.orphans.is_empty());
+    let OrphanCancels::Explicit {
+        plan: cancels,
+        escalation: None,
+    } = &plan.cancels
+    else {
+        panic!("{plan:?}");
+    };
+    assert!(cancels.commands.is_empty());
+    assert_eq!(
+        reg.end_orphan_cooldowns(MonoNs(7_000 + 5_000_000_000)),
+        vec![INST]
+    );
+    assert_eq!(reg.orphan_cooldown(INST), None);
+}
+
+#[test]
+fn no_foreign_namespace_order_is_ever_cancelled() {
+    let mut reg = seeded(0);
+    arm::start(&mut reg, INST);
+    let orphans: Vec<ClientOrderId> = (0..5).map(|_| cid()).collect();
+    let mut orders: Vec<VenueOrderSnapshot> = orphans
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| ours(c, &format!("o{i}"), Side::Buy))
+        .collect();
+    orders.push(not_ours(Some(CidMatch::Foreign(THEIRS)), "theirs"));
+    orders.push(not_ours(Some(CidMatch::Unparseable), "java"));
+    orders.push(not_ours(None, "nameless"));
+    let report = resync_at(&mut reg, SnapshotSource::Trustworthy, 2_000, orders, 0);
+    assert_eq!(report.orphans, vec![INST]);
+    assert_eq!(reg.orphans(INST), orphans);
+    assert!(reg.cid_of(&vid("theirs")).is_none());
+    assert!(reg.cid_of(&vid("java")).is_none());
+    assert!(reg.cid_of(&vid("nameless")).is_none());
+    // Above the limit, armed: the orders not ours keep it explicit, and name none of them.
+    let plan = reg.cancel_orphans(INST, &cfg(), &venue(), MonoNs(3_000));
+    assert_explicit(
+        &plan,
+        &["o0", "o1", "o2", "o3", "o4"],
+        Some(CancelAllRefusal::ForeignInView),
+    );
+    // An event under another namespace's client id never makes an orphan either.
+    let mut theirs = update(None, VenueOrderState::Open, 0);
+    theirs.cid = Some(CidMatch::Foreign(THEIRS));
+    theirs.vid = Some(vid("theirs-2"));
+    assert_eq!(reg.apply_update(&theirs, key(3_500)), Routed::Foreign(THEIRS));
+    let report = resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        4_000,
+        vec![not_ours(Some(CidMatch::Foreign(THEIRS)), "theirs-2")],
+        0,
+    );
+    assert!(report.untracked.is_empty());
+    assert!(reg.cid_of(&vid("theirs-2")).is_none());
+}
+
+#[test]
+fn from_an_untrustworthy_source_only_the_orders_a_live_account_event_also_shows_are_acted_on() {
+    // A market seeded by hand (tests and an owner-assisted testnet run only; decision 0067),
+    // whose venue's snapshot source is not trustworthy, never armed.
+    let mut reg = arm::named(Registry::with_caps(caps()));
+    reg.seed_position(INST, SignedLots(0)).unwrap();
+    let (a, b, c) = (cid(), cid(), cid());
+    // A live order event shows `a` open; a live one shows `c` open and then cancelled.
+    let mut live_a = update(Some(a), VenueOrderState::Open, 0);
+    live_a.vid = Some(vid("a"));
+    assert_eq!(reg.apply_update(&live_a, key(10)), Routed::Untracked);
+    let mut live_c = update(Some(c), VenueOrderState::Open, 0);
+    live_c.vid = Some(vid("c"));
+    reg.apply_update(&live_c, key(11));
+    let mut ended_c = update(Some(c), canceled(), 0);
+    ended_c.vid = Some(vid("c"));
+    reg.apply_update(&ended_c, key(12));
+
+    let shown = || {
+        vec![
+            ours(a, "a", Side::Buy),
+            ours(b, "b", Side::Buy),
+            ours(c, "c", Side::Buy),
+        ]
+    };
+    let report = resync_at(&mut reg, SnapshotSource::Untrustworthy, 2_000, shown(), 0);
+    assert!(report.untrustworthy);
+    assert_eq!(
+        report.untracked,
+        vec![(a, vid("a")), (b, vid("b")), (c, vid("c"))]
+    );
+    assert_eq!(report.unconfirmed, vec![(b, vid("b")), (c, vid("c"))]);
+    assert_eq!(report.orphans, vec![INST]);
+    assert_eq!(reg.orphans(INST), vec![a]);
+    assert!(reg.get(b).is_none() && reg.get(c).is_none());
+    let plan = reg.cancel_orphans(INST, &cfg(), &venue_from(SnapshotSource::Untrustworthy), MonoNs(3_000));
+    assert_explicit(&plan, &["a"], None);
+
+    // A live fill of `b` then shows it: the next resync acts on it.
+    let mut l = ledger();
+    let f = fill(
+        Some(b),
+        FillIdent::Venue {
+            fill: fill_id("fb"),
+            vid: Some(vid("b")),
+            cum_after: Some(lots(1)),
+        },
+        Side::Buy,
+        1,
+        false,
+    );
+    let Admission::Apply(accepted) = l.admit(&f, None, MonoNs(3_500)) else {
+        panic!("a new fill is admitted");
+    };
+    assert_eq!(
+        reg.apply_fill(accepted).unwrap(),
+        FillRouted::OursUntracked(b)
+    );
+    let report = resync_at(&mut reg, SnapshotSource::Untrustworthy, 4_000, shown(), 0);
+    assert_eq!(report.unconfirmed, vec![(c, vid("c"))]);
+    assert_eq!(reg.orphans(INST), vec![a, b]);
+
+    // A market whose only candidates are unconfirmed is neither named nor suppressed.
+    let mut reg = arm::named(Registry::with_caps(caps()));
+    reg.seed_position(INST, SignedLots(0)).unwrap();
+    let report = resync_at(
+        &mut reg,
+        SnapshotSource::Untrustworthy,
+        2_000,
+        vec![ours(cid(), "x", Side::Buy)],
+        0,
+    );
+    assert_eq!(report.unconfirmed.len(), 1);
+    assert!(report.orphans.is_empty());
+    assert_eq!(reg.orphan_cooldown(INST), None);
+}
+
+#[test]
+fn an_order_a_first_resync_registers_on_a_market_it_seeds_is_no_orphan() {
+    // An earlier run's order the seed registers (decision 0055) is not 0005's I7 orphan: the
+    // kill switch's cancel everything reaches it, and nothing is suppressed.
+    let mut reg = arm::named(Registry::with_caps(caps()));
+    let e = cid();
+    let report = resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        1_000,
+        vec![ours(e, "e", Side::Buy)],
+        0,
+    );
+    assert_eq!(report.registered, vec![e]);
+    assert!(report.orphans.is_empty());
+    assert!(reg.orphans(INST).is_empty());
+    assert_eq!(reg.orphan_cooldown(INST), None);
+}
