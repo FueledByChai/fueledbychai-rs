@@ -130,6 +130,23 @@
 //! dropped, and the query is handed to `on_rpc_timeout` once at its deadline, on a later epoch
 //! or while the session waits to reconnect, and never requested again (decision 0081).
 //!
+//! **Bounds with a Safety reserve (FBC-hwn, design §5.4, decision 0104).** The commands waiting
+//! for the session's turn are bounded by the consumer's [`ExecSessionConfig::outbound`]: Normal
+//! traffic (a place, an amend, every control command) is taken while fewer than its Normal
+//! bound wait, Safety traffic (a cancel, a cancel-many, an instrument cancel-all, a reducing
+//! order) while fewer than the whole bound do. One submitted past that keeps nothing (an
+//! authorization is dropped unspent): it is reported `NotSent(Backpressure)` on the next turn,
+//! in submission order, journaled just before as its `WriteResult` under its class, and
+//! counted ([`ExecCounters::backpressure_refusals`]). So a peer that stops reading holds a
+//! write, and the handlers of the shard's other members submitting meanwhile, to the bound. The
+//! requests in flight (written or asked and neither answered nor timed out) are counted in the
+//! consumer's [`InFlight`] table ([`ExecSessionConfig::in_flight`]), shared by the sessions it
+//! is handed to: a submitted command its class finds no room for is `NotSent(RateBudget)` at
+//! its encode, after the authorization's re-check and before a nonce is reserved, nothing
+//! written, counted ([`ExecCounters::in_flight_refusals`]). A place is given back when its
+//! request is answered, handed to `on_http` or timed out, when an encoded request is not
+//! written, and for every request still in flight once the run ends.
+//!
 //! **Cancel-on-disconnect and the resync, every epoch (FBC-w19, decision 0058).** A session
 //! takes only a venue whose cancel-on-disconnect is per connection: one declaring `None` or
 //! `DeadMan` is refused when it is built ([`ExecSessionError::CancelOnDisconnect`]). Once the
@@ -181,7 +198,7 @@ use fbc_core::{
     SpecTable, Stamp, StreamId, SubmitHandle, TimerTag, TrafficClass, VenueCaps, VenueCommand,
     VenueConfig, VenueError, VenueFactory, VenueMeta, VenueOrderSnapshot, WallNs, dispatch,
 };
-use fbc_journal::{ControlEvent, NonceSourceId, Record};
+use fbc_journal::{ControlEvent, NonceSourceId, Record, WriteRes};
 use futures_util::{FutureExt, StreamExt};
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -190,7 +207,7 @@ use crate::bounds::{InFlight, ReservedBound};
 use crate::connector::Connector;
 use crate::epoch::{Admit, EpochError, Epochs, Input};
 use crate::exec_gate::Hold;
-use crate::exec_orders::{ExecOrders, Queued, RpcIds, Rpcs, Shared, Submitted};
+use crate::exec_orders::{ExecOrders, Queued, Refusal, RpcIds, Rpcs, Shared, Submitted, Waiting};
 use crate::in_process::{InProcessStream, Link};
 use crate::journal::Journal;
 use crate::pacing::ReconnectPacing;
@@ -472,6 +489,8 @@ pub struct ExecSession<H: ExecHandler> {
     unready_refusals: u64,
     /// Places and amends refused on a market an order rests unprotected on.
     unprotected_refusals: u64,
+    /// Submissions refused for want of room in the table of requests in flight.
+    in_flight_refusals: u64,
     /// What [`ExecOrders`] and the session share: the commands waiting, the authenticated
     /// epoch.
     orders: Rc<Shared>,
@@ -648,7 +667,6 @@ impl<H: ExecHandler> ExecSession<H> {
         };
         let (stop_tx, stop) = watch::channel(());
         let clock = config.clock.clone();
-        let _ = (config.outbound, config.in_flight);
         let mut core = Core::new(CoreConfig {
             own: endpoint.stream,
             connector: config.connector,
@@ -681,6 +699,7 @@ impl<H: ExecHandler> ExecSession<H> {
             arm_failures: 0,
             unready_refusals: 0,
             unprotected_refusals: 0,
+            in_flight_refusals: 0,
             orders: Shared::new(
                 config.acct,
                 config.rpc_ids,
@@ -688,8 +707,9 @@ impl<H: ExecHandler> ExecSession<H> {
                 covers_open,
                 one_id,
                 clock.clone(),
+                config.outbound,
             ),
-            rpcs: Rpcs::default(),
+            rpcs: Rpcs::new(config.in_flight),
             clock,
             stop,
             fault: None,
@@ -742,8 +762,8 @@ impl<H: ExecHandler> ExecSession<H> {
             unready_refusals: self.unready_refusals,
             unprotected_refusals: self.unprotected_refusals,
             refused_redactions: self.core.refused_redactions(),
-            backpressure_refusals: 0,
-            in_flight_refusals: 0,
+            backpressure_refusals: self.orders.backpressured(),
+            in_flight_refusals: self.in_flight_refusals,
         }
     }
 
@@ -766,6 +786,9 @@ impl<H: ExecHandler> ExecSession<H> {
         let ran = self.run_epochs().await;
         self.core.http.clear();
         self.orders.end();
+        // Nothing more is reported: the requests still in flight give back their places in the
+        // consumer's table (decision 0104).
+        self.rpcs.clear();
         ran
     }
 
@@ -1165,8 +1188,15 @@ impl<H: ExecHandler> ExecSession<H> {
         let mut sent = Ok(true);
         while open
             && !self.stopped()
-            && let Some(queued) = turn.next().and_then(|()| self.orders.pop())
+            && let Some(waiting) = turn.next().and_then(|()| self.orders.pop())
         {
+            let queued = match waiting {
+                Waiting::Command(queued) => queued,
+                Waiting::Refused(refusal) => {
+                    refuse(&self.rec, &self.core.clock, key, refusal, &mut self.handler);
+                    continue;
+                }
+            };
             sent = self.send(ws, key, queued).await;
             open = *sent.as_ref().unwrap_or(&false);
         }
@@ -1228,12 +1258,23 @@ impl<H: ExecHandler> ExecSession<H> {
                 .on_submitted(not_sent(NotSentReason::StaleAuthorization));
             return Ok(true);
         }
-        let encoded = self.encode(cmd, budget_class(&item), over_http(&item), rpc, key);
+        // A place in the consumer's table of requests in flight, before any nonce is reserved:
+        // Normal traffic stops at its Normal bound, a cancel or a reducing order at the whole
+        // (decision 0104). A refusal is `NotSent(RateBudget)`, nothing reserved or written.
+        let class = item.class();
+        if !self.rpcs.admit(rpc, class) {
+            self.in_flight_refusals += 1;
+            self.handler
+                .on_submitted(not_sent(NotSentReason::RateBudget));
+            return Ok(true);
+        }
+        let encoded = self.encode(cmd, class, over_http(&item), rpc, key);
         let encoded = match encoded {
             Ok(encoded) => encoded,
             // The session ends with nothing of it encoded or reported (0057); the shard host
             // takes back its own ladder command (decision 0100; Codex P1 r4309350872 on PR #164).
             Err(e) => {
+                self.rpcs.unsent(rpc);
                 let queued = Queued {
                     rpc,
                     item,
@@ -1248,9 +1289,13 @@ impl<H: ExecHandler> ExecSession<H> {
             Ok((receipt, fx)) => {
                 let receipt = Ok(receipt);
                 self.handler.on_submitted(SubmitHandle { rpc, receipt });
-                self.execute_charged(ws, fx, origin).await
+                let open = self.execute_charged(ws, fx, origin).await;
+                // A request the epoch ended before writing gives its place back.
+                self.rpcs.unsent(rpc);
+                open
             }
             Err(unsent) => {
+                self.rpcs.unsent(rpc);
                 self.handler.on_submitted(not_sent(unsent.reason()));
                 Ok(true)
             }
@@ -1439,6 +1484,30 @@ impl Recorder {
         }
     }
 
+    /// Request `rpc`, refused for `reason` with nothing of it written, as its write result on
+    /// epoch `conn`, under `class`, at `clock`'s time (decision 0104).
+    fn not_sent(
+        &self,
+        class: TrafficClass,
+        clock: &IngestClock,
+        conn: ConnKey,
+        rpc: RpcId,
+        reason: NotSentReason,
+    ) {
+        if let Some(journal) = &self.journal {
+            let (at, wall) = clock.now();
+            let result = WriteRes::NotSent(reason);
+            let rpc = Some(rpc);
+            let record = Record::WriteResult {
+                at,
+                conn,
+                rpc,
+                result,
+            };
+            journal.record(class, wall, &record);
+        }
+    }
+
     /// The context `ctx` given to a call, under `class`, filed under `wall`; `rpc` names an
     /// encode's request.
     fn ctx(&self, class: TrafficClass, wall: WallNs, rpc: Option<RpcId>, ctx: &EncodeCtx) {
@@ -1447,6 +1516,22 @@ impl Recorder {
             journal.record(class, wall, &Record::EncodeCtx { rpc, ctx });
         }
     }
+}
+
+/// Reports `refusal`, a submission the commands waiting for epoch `key`'s connection had no room
+/// for, to `handler` as not sent, journaled first through `rec` as its write result under its
+/// class, at `clock`'s time (design §5.4, decision 0104).
+fn refuse<H: ExecHandler>(
+    rec: &Recorder,
+    clock: &IngestClock,
+    key: ConnKey,
+    refusal: Refusal,
+    handler: &mut H,
+) {
+    let Refusal { rpc, class, reason } = refusal;
+    rec.not_sent(class, clock, key, rpc, reason);
+    let receipt = Err(reason);
+    handler.on_submitted(SubmitHandle { rpc, receipt });
 }
 
 /// Why a request was not sent, nothing of it written: the codec's reason, or the buckets'
@@ -1463,21 +1548,6 @@ impl Unsent {
             Unsent::Codec(reason) => *reason,
             Unsent::Budget(_) => NotSentReason::RateBudget,
         }
-    }
-}
-
-/// The traffic class a submitted command's frames are charged as (decision 0073): an
-/// authorized order command's own ([`VenueCommand::traffic_class`]), so cancels and reducing
-/// orders may use the safety reserve; every control command normal traffic, whatever its
-/// label. The consumer submits control commands without authorization or count (the Unknown
-/// ladder's order queries, an arm, a dead-man refresh, the fee query), so they stop at each
-/// bucket's safety floor and never drain what cancels and reducing orders need (design §4.10
-/// step 7; Reviewer B RB-e8i-1 on PR #113). The session's own arm, one per epoch, is charged
-/// its label in `arm`.
-fn budget_class(item: &Submitted) -> TrafficClass {
-    match item {
-        Submitted::Authorized(auth) => auth.command().traffic_class(),
-        Submitted::Control(_) => TrafficClass::Normal,
     }
 }
 
@@ -1617,11 +1687,18 @@ impl<H: ExecHandler> Control for Between<'_, H> {
         // turn's.
         let mut turn = self.orders.waiting_now();
         while !self.stopped()
-            && let Some(queued) = turn.next().and_then(|()| self.orders.pop())
+            && let Some(waiting) = turn.next().and_then(|()| self.orders.pop())
         {
-            let receipt = Err(NotSentReason::Disconnected);
-            let rpc = queued.rpc;
-            self.handler.on_submitted(SubmitHandle { rpc, receipt });
+            match waiting {
+                Waiting::Command(queued) => {
+                    let receipt = Err(NotSentReason::Disconnected);
+                    let rpc = queued.rpc;
+                    self.handler.on_submitted(SubmitHandle { rpc, receipt });
+                }
+                Waiting::Refused(refusal) => {
+                    refuse(self.rec, self.clock, self.key, refusal, &mut *self.handler);
+                }
+            }
         }
         // Once the control has dropped, the sink hands the handler nothing.
         for rpc in self.rpcs.take_due(Instant::now()) {
@@ -1944,6 +2021,12 @@ mod tests {
         assert!(!carried(&[http(five), http(five)], true));
         assert!(!carried(&[frame.clone(), http(five)], true));
         assert!(!carried(&[http(Duration::MAX)], true));
-        assert!(carried(&[frame, timer], false));
+        assert!(carried(&[frame.clone(), timer], false));
+        // A reconnect would leave the request's outcome unreported.
+        let reconnect = Effect::Reconnect {
+            stream: own,
+            reason: "test",
+        };
+        assert!(!carried(&[frame, reconnect], false));
     }
 }

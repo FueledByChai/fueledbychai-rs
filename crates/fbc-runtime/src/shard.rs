@@ -635,7 +635,8 @@ impl Drop for Running<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exec_orders::{RpcIds, Shared};
+    use crate::bounds::ReservedBound;
+    use crate::exec_orders::{RpcIds, Shared, Waiting};
     use fbc_core::{AccountKey, ConnKey, RpcId};
     use std::cell::Cell;
 
@@ -688,7 +689,7 @@ mod tests {
                     clock.stamp(ConnKey { conn: 1, epoch: 0 }, None);
                 }
                 Some(Act::Take) => {
-                    if let Some(queued) = shared.pop() {
+                    if let Some(Waiting::Command(queued)) = shared.pop() {
                         taken.borrow_mut().push((name, queued.rpc));
                     }
                 }
@@ -710,7 +711,9 @@ mod tests {
     /// The orders of a session for account `acct` that stamps from `clock`.
     fn session_orders(acct: u16, clock: &IngestClock) -> (Rc<Shared>, ExecOrders) {
         let ids = RpcIds::default();
-        let shared = Shared::new(AccountKey::new(acct), ids, true, false, true, clock.clone());
+        let bound = ReservedBound::new(64, 64).unwrap();
+        let (acct, clock) = (AccountKey::new(acct), clock.clone());
+        let shared = Shared::new(acct, ids, true, false, true, clock, bound);
         let orders = ExecOrders {
             shared: Rc::clone(&shared),
         };
@@ -769,6 +772,7 @@ mod tests {
             false,
             true,
             clock.clone(),
+            ReservedBound::new(64, 64).unwrap(),
         );
         let orders = ExecOrders {
             shared: Rc::clone(&shared),
