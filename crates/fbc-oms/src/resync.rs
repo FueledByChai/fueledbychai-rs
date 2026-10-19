@@ -27,6 +27,11 @@
 //!    hold, or one a resync registered from its snapshot, was there (0013's
 //!    cancel-on-disconnect ends an earlier run's orders in flight).
 //!
+//! An orphan a later resync registered from its snapshot (0005's I7, decision 0101) was open
+//! after the seed read the account, so on either read mode the seed holds a fill of it only by
+//! rule 1 or its matching-engine time at or before the watermark; any other fill of it comes
+//! after the seed and moves the inventory.
+//!
 //! Rules 2 and 3 judge a fill by the open orders and trust the position read beside them, so
 //! they need the snapshot's open orders and positions read at one instant. The venue declares
 //! it (`OrderCaps::snapshot_reads`, decision 0095): on [`SnapshotReads::Separate`] a fill can
@@ -276,6 +281,11 @@ struct SeedRef {
     /// The orders the registry held on the market when it was seeded: any other was placed
     /// after it.
     known: HashSet<ClientOrderId>,
+    /// The orphans a later resync registered on the market from its snapshot (0005's I7,
+    /// decision 0101): shown open after the seed read the account, so the seed holds a fill of
+    /// one only when it arrived before the seed was requested or executed at or before its
+    /// watermark (Reviewer B's RB840-1 on PR #171).
+    later: HashSet<ClientOrderId>,
 }
 
 /// Where a fill stands against a seed.
@@ -293,6 +303,15 @@ pub(crate) enum Placement {
 impl SeedRef {
     fn place(&self, f: &Placed) -> Placement {
         let before_watermark = f.exec.is_some_and(|t| t <= self.watermark);
+        if self.later.contains(&f.cid) {
+            // Open after the seed's read, on either read mode: only its arrival or its time
+            // places a fill of it before; any other came after (decision 0101).
+            return if f.arrived <= self.requested_at || before_watermark {
+                Placement::InSnapshot { shown: false }
+            } else {
+                Placement::After
+            };
+        }
         let shown = self
             .shown
             .get(&f.cid)
@@ -349,7 +368,9 @@ impl Registry {
         match self.markets.get(&inst) {
             Some(MarketState::Seeded(Seed {
                 reference: Some(r), ..
-            })) if !registered || r.known.contains(&f.cid) => r.place(f),
+            })) if !registered || r.known.contains(&f.cid) || r.later.contains(&f.cid) => {
+                r.place(f)
+            }
             _ => Placement::After,
         }
     }
@@ -516,12 +537,14 @@ impl Registry {
             );
             let u = update_of(o);
             self.with_record(*cid, |rec| rec.apply_update(&u, key));
-            // Its fills are placed against the seed as they were before it was registered.
+            // Shown open after the seed, so the seed holds a fill of it only by the fill's
+            // arrival or time (Reviewer B's RB840-1); on a market seeded by hand, every fill
+            // counts already.
             if let Some(MarketState::Seeded(Seed {
                 reference: Some(r), ..
             })) = self.markets.get_mut(&o.inst)
             {
-                r.known.insert(*cid);
+                r.later.insert(*cid);
             }
             self.orphans.add(o.inst, *cid);
         }
@@ -629,6 +652,7 @@ impl Registry {
                 shown: HashMap::new(),
                 shown_vids: HashMap::new(),
                 known: HashSet::new(),
+                later: HashSet::new(),
             };
             // Our orders it shows: one the registry holds by its id (an order shown under our
             // client id and another order's venue id by neither), or one to register.

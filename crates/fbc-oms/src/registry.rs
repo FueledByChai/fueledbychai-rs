@@ -528,18 +528,22 @@ impl Registry {
     }
 
     /// The guard of a place, a batch or an amend built now on `market`: its state generation,
-    /// checked again at submit (decision 0060), and, in Exit, its position revision (0066).
+    /// checked again at submit (decision 0060), and, in Exit or while an orphan cooldown
+    /// suppresses its adding side, its position revision (0066, 0101).
     fn state_guard(&mut self, market: InstrumentId) -> Guard {
-        let position = self.exit_position_watch(market);
+        let position = self.sized_position_watch(market);
         Guard::state(self.entries.watch(market), position)
     }
 
     /// `market`'s position revision now, watched for a command about to be built under it,
-    /// while the market is in Exit, whose admission is judged against the position: an Exit
-    /// command is refused at submit once a fill or a resync moved the inventory since
-    /// (decision 0066). `None` in any other state, whose builds the position does not size.
-    fn exit_position_watch(&mut self, market: InstrumentId) -> Option<Watch> {
-        (self.entries.admits(market) == Ok(Admits::ExitOnly)).then(|| self.positions.watch(market))
+    /// while its admission is judged against the position: in Exit (decision 0066) and while
+    /// an orphan cooldown suppresses the adding side (decision 0101; Reviewer B's RB840-2 on
+    /// PR #171). Such a command is refused at submit once a fill or a resync moved the
+    /// inventory since. `None` otherwise, when the position does not size the build.
+    fn sized_position_watch(&mut self, market: InstrumentId) -> Option<Watch> {
+        (self.entries.admits(market) == Ok(Admits::ExitOnly)
+            || self.orphans.cooldown(market).is_some())
+        .then(|| self.positions.watch(market))
     }
 
     /// Sets the inventory on `inst` to `pos`, advancing the market's position revision when it
@@ -959,8 +963,10 @@ impl Registry {
     /// the build its order holds ([`IssueRefusal::Released`]); then, on each side the
     /// command's orders take, the position and our other orders on the side as they are now,
     /// with what the command's orders may add and have resting as their records count them
-    /// now, must stay within both caps ([`IssueRefusal::Capped`]). Cancels and cancel-alls
-    /// pass, as they pass at build.
+    /// now, must stay within both caps ([`IssueRefusal::Capped`]), and, while an orphan
+    /// cooldown suppresses the market's adding side, reduce the known, non-zero position
+    /// within its size as at build ([`IssueRefusal::OrphanCooldown`]; decision 0101, Reviewer
+    /// B's RB840-2 on PR #171). Cancels and cancel-alls pass, as they pass at build.
     pub(crate) fn rejudge(&self, cmd: &PermittedCommand) -> Result<(), IssueRefusal> {
         let cids = match (cmd.command(), cmd.built()) {
             (VenueCommand::Amend(_), Some((cid, build))) => {
@@ -1000,9 +1006,12 @@ impl Registry {
                 exposure: sum(OrderRecord::exposure),
                 resting: sum(OrderRecord::resting),
             };
-            self.exposure(first.placed().inst, side, &cids)
-                .admit(adds)
-                .map_err(IssueRefusal::Capped)?;
+            let inst = first.placed().inst;
+            let exposure = self.exposure(inst, side, &cids);
+            if self.orphan_suppressed(&exposure, adds.exposure) {
+                return Err(IssueRefusal::OrphanCooldown { inst, side });
+            }
+            exposure.admit(adds).map_err(IssueRefusal::Capped)?;
         }
         Ok(())
     }

@@ -171,7 +171,8 @@ pub(crate) struct Guard {
     /// The market's state generation at build: a place, a batch or an amend.
     pub(crate) state: Option<Watch>,
     /// How many times the market's inventory moved, at build: a place, a batch or an amend
-    /// built in Exit, which Exit sized against the position then (decision 0066).
+    /// built in Exit, which Exit sized against the position then (decision 0066), or while an
+    /// orphan cooldown suppressed the market's adding side, which sized it too (decision 0101).
     pub(crate) position: Option<Watch>,
     /// How many times the registry's hold of the market's exclusive lease changed, at build:
     /// an instrument cancel-all.
@@ -298,8 +299,9 @@ pub enum StaleAuthorization {
     /// since), or lease names given again cover its held leases differently (0005's I7).
     ExclusiveLeaseChanged(InstrumentId),
     /// A place, a batch or an amend built in Exit, which Exit sized against the market's
-    /// position then, and a fill or a resync moved the market's inventory since: sent, it
-    /// could take the position across zero (decision 0066).
+    /// position then (decision 0066), or while an orphan cooldown suppressed the market's
+    /// adding side, which sized it too (decision 0101), and a fill or a resync moved the
+    /// market's inventory since: sent, it could take the position across zero.
     PositionMoved(InstrumentId),
 }
 
@@ -325,7 +327,7 @@ impl fmt::Display for StaleAuthorization {
             ),
             StaleAuthorization::PositionMoved(market) => write!(
                 f,
-                "the position on market {} moved since the exit command was built",
+                "the position on market {} moved since the position-sized command was built",
                 market.get()
             ),
         }
@@ -429,9 +431,10 @@ impl Authorization {
     /// The check at submit (decision 0060), which the gateway runs immediately before it
     /// encodes the command, writing nothing when it refuses: a place, a batch or an amend whose
     /// market changed state since the command was built is refused
-    /// ([`StaleAuthorization::StateChanged`]), and one built in Exit also once a fill or a
-    /// resync moved its market's inventory since ([`StaleAuthorization::PositionMoved`],
-    /// decision 0066); an instrument cancel-all once the registry's
+    /// ([`StaleAuthorization::StateChanged`]), and one built in Exit, or while an orphan
+    /// cooldown suppressed its market's adding side, also once a fill or a resync moved its
+    /// market's inventory since ([`StaleAuthorization::PositionMoved`], decisions 0066 and
+    /// 0101); an instrument cancel-all once the registry's
     /// hold of its market's exclusive lease changed since
     /// ([`StaleAuthorization::ExclusiveLeaseChanged`]) or an order not ours was seen on its
     /// market since ([`StaleAuthorization::ForeignSeen`]), and not for any other change of
@@ -900,7 +903,7 @@ mod tests {
         );
         assert_eq!(
             StaleAuthorization::PositionMoved(btc).to_string(),
-            "the position on market 1 moved since the exit command was built"
+            "the position on market 1 moved since the position-sized command was built"
         );
         for (refusal, text) in [
             (
