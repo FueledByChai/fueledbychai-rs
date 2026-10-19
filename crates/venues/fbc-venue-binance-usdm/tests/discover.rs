@@ -382,7 +382,7 @@ fn a_value_stated_but_invalid_is_malformed_and_named() {
         let tick = json!({"filterType": "PRICE_FILTER", "tickSize": "0.5"});
         filters(m).push(tick);
     });
-    assert_eq!(discover(&twice), malformed("filters: PRICE_FILTER twice"));
+    assert_eq!(discover(&twice), malformed("filters: a filterType twice"));
     // A symbol the decode scope refuses is refused as the scope says.
     let empty = with_btc(|m| drop(m.insert("symbol".into(), "".into())));
     let refused = Err(PlanError::Decode(DecodeError::IdRefused(IdError::Empty)));

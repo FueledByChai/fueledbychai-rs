@@ -18,12 +18,14 @@ pub const KEY_DEPTH_LEVELS: &str = "binance_usdm.depth_levels";
 /// The partial-depth stream's update speed: `100ms`, `250ms` or `500ms`.
 pub const KEY_DEPTH_SPEED: &str = "binance_usdm.depth_speed";
 /// The REST base URL, an origin such as `https://fapi.binance.com` (scheme, host and optional
-/// port, nothing more); the diff-depth book's snapshot is `GET /fapi/v1/depth` on it.
+/// port, nothing more); the diff-depth book's snapshot is `GET /fapi/v1/depth` on it, and
+/// discovery `GET /fapi/v1/exchangeInfo`.
 pub const KEY_REST_BASE_URL: &str = "binance_usdm.rest_base_url";
 /// The levels per side a diff-depth snapshot asks for (`limit`): 5, 10, 20, 50, 100, 500 or
 /// 1000, the values Binance accepts; its weight follows [`rest_depth_weight`](crate::rest_depth_weight).
 pub const KEY_SNAPSHOT_LIMIT: &str = "binance_usdm.depth_snapshot_limit";
-/// How long a diff-depth snapshot request waits for its response, in milliseconds (`5000ms`).
+/// How long a diff-depth snapshot request waits for its response, in milliseconds (`5000ms`);
+/// discovery's `GET /fapi/v1/exchangeInfo` waits as long.
 pub const KEY_SNAPSHOT_TIMEOUT: &str = "binance_usdm.depth_snapshot_timeout";
 /// How long after a failed or refused diff-depth snapshot request the codec asks again, in
 /// milliseconds (`2000ms`).
@@ -54,7 +56,8 @@ pub(crate) const SCHEMA: &[FieldSpec] = &[
         scope: ConfigScope::Process,
         unit: FieldUnit::Dimensionless,
         doc: "REST base URL, an origin (http:// or https://, host and optional port, e.g. \
-              https://fapi.binance.com); the diff-depth snapshot is GET /fapi/v1/depth on it",
+              https://fapi.binance.com); the diff-depth snapshot is GET /fapi/v1/depth on it, \
+              discovery GET /fapi/v1/exchangeInfo",
     },
     FieldSpec {
         key: KEY_SNAPSHOT_LIMIT,
@@ -67,8 +70,8 @@ pub(crate) const SCHEMA: &[FieldSpec] = &[
         key: KEY_SNAPSHOT_TIMEOUT,
         scope: ConfigScope::Process,
         unit: FieldUnit::Duration,
-        doc: "how long a diff-depth snapshot request waits for its response, in whole \
-              milliseconds (e.g. 5000ms)",
+        doc: "how long a diff-depth snapshot request, and discovery's GET \
+              /fapi/v1/exchangeInfo, waits for its response, in whole milliseconds (e.g. 5000ms)",
     },
     FieldSpec {
         key: KEY_SNAPSHOT_RETRY,
@@ -167,6 +170,26 @@ fn is_host_port(authority: &str) -> bool {
     host_ok && port_ok
 }
 
+/// The REST base URL, an `http://` or `https://` origin, without a trailing slash.
+pub(crate) fn rest_base(cfg: &VenueConfig) -> Result<&str, ConfigError> {
+    let value = cfg
+        .get(KEY_REST_BASE_URL)
+        .ok_or(ConfigError::Missing(KEY_REST_BASE_URL))?;
+    origin(value, ["https", "http"]).ok_or(ConfigError::Invalid {
+        key: KEY_REST_BASE_URL,
+        reason: "not an http:// or https:// origin (scheme://host[:port])",
+    })
+}
+
+/// The duration under `key`, a positive whole number of milliseconds written `<n>ms`.
+pub(crate) fn duration(cfg: &VenueConfig, key: &'static str) -> Result<Duration, ConfigError> {
+    let value = cfg.get(key).ok_or(ConfigError::Missing(key))?;
+    millis(value).ok_or(ConfigError::Invalid {
+        key,
+        reason: "not a positive whole number of milliseconds (<n>ms)",
+    })
+}
+
 impl Settings {
     pub fn read(cfg: &VenueConfig) -> Result<Settings, ConfigError> {
         let get = |key| cfg.get(key).ok_or(ConfigError::Missing(key));
@@ -207,23 +230,13 @@ impl Settings {
             (_, 250) => "depth20",
             (_, _) => "depth20@500ms",
         };
-        let rest =
-            origin(get(KEY_REST_BASE_URL)?, ["https", "http"]).ok_or(ConfigError::Invalid {
-                key: KEY_REST_BASE_URL,
-                reason: "not an http:// or https:// origin (scheme://host[:port])",
-            })?;
+        let rest = rest_base(cfg)?;
         let limit = get(KEY_SNAPSHOT_LIMIT)?.parse::<u16>().ok();
         let weighed = limit.and_then(|l| Some((l, rest_depth_weight(l)?)));
         let (limit, weight) = weighed.ok_or(ConfigError::Invalid {
             key: KEY_SNAPSHOT_LIMIT,
             reason: "not 5, 10, 20, 50, 100, 500 or 1000",
         })?;
-        let duration = |key| {
-            millis(get(key)?).ok_or(ConfigError::Invalid {
-                key,
-                reason: "not a positive whole number of milliseconds (<n>ms)",
-            })
-        };
         Ok(Settings {
             base_url: base.to_owned(),
             depth: DepthChannel {
@@ -235,8 +248,8 @@ impl Settings {
                 base_url: rest.to_owned(),
                 limit,
                 weight,
-                timeout: duration(KEY_SNAPSHOT_TIMEOUT)?,
-                retry: duration(KEY_SNAPSHOT_RETRY)?,
+                timeout: duration(cfg, KEY_SNAPSHOT_TIMEOUT)?,
+                retry: duration(cfg, KEY_SNAPSHOT_RETRY)?,
             },
         })
     }

@@ -20,12 +20,18 @@
 //!   and keeps the diff-depth book ([`BOOK_DIFF`]) anchored on a REST snapshot as Binance
 //!   documents, detecting gaps, duplicates and events out of order (`diff.rs`).
 //!
+//! - [`discover`](VenueFactory::discover): one `GET /fapi/v1/exchangeInfo` under the REST base,
+//!   read into an instrument draft per `PERPETUAL` symbol from its filters, and
+//!   [`parse_fbc_common_symbol`](VenueFactory::parse_fbc_common_symbol), FBC's rule that
+//!   `X/USDT` is `XUSDT` ([`discover`](crate::discover)).
+//!
 //! Trades, funding, mark, index and statistics are not decoded and are declared
 //! [`FeedSource::None`](fbc_core::FeedSource).
 
 mod caps;
 mod config;
 mod diff;
+pub mod discover;
 mod md;
 
 use std::collections::BTreeSet;
@@ -79,17 +85,19 @@ impl VenueFactory for BinanceUsdm {
         Settings::read(cfg).map(|settings| caps::caps(&settings))
     }
 
-    /// None yet: Binance's FBC rule (`X/USDT` is `XUSDT`) is FBC-fwf.
-    fn parse_fbc_common_symbol(&self, _s: &str) -> Result<AssetKey, SymbolError> {
-        Err(SymbolError::NoRule)
+    /// FBC's Java-era rule: `X/USDT` is `XUSDT` ([`discover`](crate::discover), FBC-fwf).
+    fn parse_fbc_common_symbol(&self, s: &str) -> Result<AssetKey, SymbolError> {
+        discover::parse_fbc_common_symbol(s)
     }
 
-    /// None yet: discovery from `GET /fapi/v1/exchangeInfo` is FBC-fwf.
+    /// One `GET /fapi/v1/exchangeInfo` under the REST base, read into a draft per `PERPETUAL`
+    /// symbol ([`discover`](crate::discover), FBC-fwf). Only the REST base URL and the REST
+    /// timeout are read.
     fn discover(
         &self,
-        _cfg: &VenueConfig,
+        cfg: &VenueConfig,
     ) -> Result<HttpPlan<Vec<InstrumentSpecDraft>>, VenueError> {
-        Err(VenueError::NoDiscovery)
+        discover::plan(cfg)
     }
 
     /// One endpoint per [`caps::MAX_STREAMS`] subscriptions, in the order of `subs`, every one
