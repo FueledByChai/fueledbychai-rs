@@ -334,6 +334,8 @@ fn exec_config(i: usize, url: &str, clock: &IngestClock, conn: u16) -> ExecSessi
         limiter: RateLimiter::new(&[], SafetyReserve::percent(0).unwrap()).unwrap(),
         write_stall: WriteStall::new(Duration::from_secs(3_600)).unwrap(),
         http_max_body: 1024,
+        outbound: fbc_runtime::ReservedBound::new(64, 64).unwrap(),
+        in_flight: fbc_runtime::InFlight::new(fbc_runtime::ReservedBound::new(64, 64).unwrap()),
     }
 }
 
