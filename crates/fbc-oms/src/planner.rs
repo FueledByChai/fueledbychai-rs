@@ -617,13 +617,14 @@ impl ExecutionPlanner {
             };
             // An order standing in for a quote that is now a synthetic IOC or an emulated
             // reduce-only order of the same wire shape takes that mode: cancelled at once as
-            // an IOC, or protected from overshoot from now on, and then counted as an order
-            // reducing the position, so other emulated orders are sized with it. A mode is
-            // never dropped while the order rests (0100).
+            // an IOC, or protected from overshoot from now on. A mode is never dropped while
+            // the order rests. An order whose quote reduces the position (an emulated one's
+            // included) counts from then on as an order reducing it, though no amend records
+            // the classification, so emulated orders are sized with it (0100).
             if let Some(f) = &fitted {
                 slot.mode.synth_ioc |= f.mode.synth_ioc;
                 slot.mode.emulated |= f.mode.emulated;
-                if f.mode.emulated {
+                if f.quote.reduces() {
                     reg.with_record(slot.cid, OrderRecord::set_counted_reducing);
                 }
             }
