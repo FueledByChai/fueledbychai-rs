@@ -684,6 +684,157 @@ mod tests {
         assert_eq!((ran.is_err(), back), (true, 1));
     }
 
+    /// Codex P1 r4309350874 and Reviewer B RB-ct0-3 on PR #164: a member's error ends the
+    /// orders of every order-entry member whose run the host drops, and so does dropping the
+    /// host's run, so nothing submitted to them afterwards is taken and never sent.
+    #[tokio::test]
+    async fn a_members_error_or_the_runs_drop_ends_the_orders_of_every_order_entry_member_dropped()
+    {
+        let clock = IngestClock::new();
+        let (shared, orders) = session_orders(2, &clock);
+        let mut exec = scripted(&clock, &shared, &[Act::Wait]);
+        exec.orders = Some(orders.clone());
+        orders.submit_control(ControlCommand::FeeQuery).unwrap();
+        let failing = scripted(&clock, &shared, &[Act::Stamp, Act::Fail]);
+        let mut host = ShardHost::new(clock.clone());
+        let mut decide = |_: &[InstrumentId], _: &mut Ladder| {};
+        let ran = host.run(vec![exec, failing], &mut decide).await;
+        assert!(ran.is_err());
+        let refused = orders.submit_control(ControlCommand::FeeQuery);
+        assert_eq!(refused, Err(crate::SubmitRefusal::Ended));
+        assert!(orders.idle() && !shared.waiting());
+
+        // The consumer drops the run while the member still runs.
+        let (shared, orders) = session_orders(2, &clock);
+        let mut exec = scripted(&clock, &shared, &[Act::Wait]);
+        exec.orders = Some(orders.clone());
+        let mut run = Box::pin(host.run(vec![exec], &mut decide));
+        assert!(futures_util::FutureExt::now_or_never(&mut run).is_none());
+        drop(run);
+        let refused = orders.submit_control(ControlCommand::FeeQuery);
+        assert_eq!(refused, Err(crate::SubmitRefusal::Ended));
+    }
+
+    /// What the members of the coop-budget tests and their decide pass did, in order.
+    type Log = Rc<RefCell<Vec<&'static str>>>;
+
+    /// A member that reads every message waiting on `rx`, each a ready operation that spends
+    /// the task's coop budget, logging `name` and stamping an input for each when it has one.
+    fn reader(
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+        named: Option<(&'static str, &Log, &IngestClock)>,
+    ) -> Member<'static> {
+        let named = named.map(|(name, log, clock)| (name, Rc::clone(log), clock.clone()));
+        let run = poll_fn(move |cx| {
+            while let Poll::Ready(Some(())) = rx.poll_recv(cx) {
+                if let Some((name, log, clock)) = &named {
+                    log.borrow_mut().push(name);
+                    clock.stamp(ConnKey { conn: 2, epoch: 0 }, None);
+                }
+            }
+            Poll::Pending
+        });
+        let orders = None;
+        Member {
+            run: Box::pin(run),
+            orders,
+        }
+    }
+
+    /// A busy member's backlog: more messages than one task poll's coop budget reads.
+    const BACKLOG: usize = 4096;
+
+    /// Runs a shard of a busy member, a reference member and an order-entry member (in that
+    /// order), with `busy` and `reference` messages waiting at the start; the order-entry member
+    /// stamps an input at its first poll and takes each command at once, and on its first take
+    /// fills the busy member's backlog and delivers one reference message. The first decide pass
+    /// plans `planned` commands. What happened, once the log has `until` entries.
+    async fn budgeted(
+        busy: usize,
+        reference: usize,
+        planned: usize,
+        until: usize,
+    ) -> Vec<&'static str> {
+        let clock = IngestClock::new();
+        let log = Log::default();
+        let (busy_tx, busy_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ref_tx, ref_rx) = tokio::sync::mpsc::unbounded_channel();
+        for _ in 0..busy {
+            busy_tx.send(()).unwrap();
+        }
+        for _ in 0..reference {
+            ref_tx.send(()).unwrap();
+        }
+        let (shared, orders) = session_orders(2, &clock);
+        let (exec_log, exec_clock) = (Rc::clone(&log), clock.clone());
+        let mut first = true;
+        let run = poll_fn(move |_| {
+            if std::mem::take(&mut first) {
+                exec_clock.stamp(ConnKey { conn: 1, epoch: 0 }, None);
+            }
+            if shared.pop().is_some() {
+                let mut log = exec_log.borrow_mut();
+                if !log.contains(&"cmd") {
+                    for _ in 0..BACKLOG {
+                        busy_tx.send(()).unwrap();
+                    }
+                    ref_tx.send(()).unwrap();
+                }
+                log.push("cmd");
+            }
+            Poll::Pending
+        });
+        let exec = Member {
+            run: Box::pin(run),
+            orders: Some(orders.clone()),
+        };
+        let members = vec![
+            reader(busy_rx, None),
+            reader(ref_rx, Some(("ref", &log, &clock))),
+            exec,
+        ];
+        let (pass_log, mut decided) = (Rc::clone(&log), false);
+        let mut decide = move |_: &[InstrumentId], ladder: &mut Ladder| {
+            pass_log.borrow_mut().push("pass");
+            if !std::mem::replace(&mut decided, true) {
+                for _ in 0..planned {
+                    ladder.push_control(&orders, ControlCommand::FeeQuery);
+                }
+            }
+        };
+        let mut host = ShardHost::new(clock.clone());
+        let mut run = Box::pin(host.run(members, &mut decide));
+        let mut polls = 0;
+        while log.borrow().len() < until {
+            assert!(futures_util::FutureExt::now_or_never(&mut run).is_none());
+            tokio::task::yield_now().await;
+            polls += 1;
+            assert!(polls < 10_000, "{:?}", log.borrow());
+        }
+        drop(run);
+        log.borrow().clone()
+    }
+
+    /// Reviewer B RB-ct0-1 on PR #164: the members polled in one task poll share tokio's coop
+    /// budget, so a busy member early in the shard can spend it all and leave a later member's
+    /// delivered frame unread in a round. The host's round between two ladder commands goes on
+    /// until a round leaves budget, so the reference message delivered as the first command was
+    /// taken is read before the second is submitted (decision 0100, point 4).
+    #[tokio::test]
+    async fn a_busy_member_spending_the_coop_budget_leaves_no_delivered_frame_unread_between_two_commands()
+     {
+        let log = budgeted(0, 0, 2, 4).await;
+        assert_eq!(log[..4], ["pass", "cmd", "ref", "cmd"]);
+    }
+
+    /// Reviewer B RB-ct0-1 on PR #164: the drain goes on while a round spent the coop budget, so
+    /// an input waiting behind a busy member's backlog is taken before the pass (point 2).
+    #[tokio::test]
+    async fn a_busy_member_spending_the_coop_budget_leaves_no_ready_input_out_of_the_pass() {
+        let log = budgeted(BACKLOG, 1, 0, 2).await;
+        assert_eq!(log[..2], ["ref", "pass"]);
+    }
+
     #[test]
     fn an_instrument_marked_again_keeps_its_first_place_and_a_take_empties_the_marks() {
         let changed = Changed::default();

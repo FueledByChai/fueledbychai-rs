@@ -230,6 +230,11 @@ impl Shared {
         Some(left.swap_remove(at).item)
     }
 
+    /// Keeps `queued`, popped and never encoded, for withdrawal (stub).
+    pub(crate) fn unsent(&self, queued: Queued) {
+        let _ = queued;
+    }
+
     /// The shard clock, which names the input whose events are being handed on.
     pub(crate) fn clock(&self) -> &IngestClock {
         &self.clock
@@ -289,6 +294,11 @@ impl ExecOrders {
     /// Whether the session has run or dropped, taking no more commands.
     pub(crate) fn ended(&self) -> bool {
         self.shared.ended.get()
+    }
+
+    /// Keeps request `rpc` for withdrawal (stub).
+    pub(crate) fn keep(&self, rpc: RpcId) {
+        let _ = rpc;
     }
 
     /// Takes back request `rpc` while it still waits for the session's turn ([`Shared::withdraw`]).
@@ -608,10 +618,57 @@ mod tests {
         let back = orders.withdraw(waiting).map(|item| item.command().clone());
         assert_eq!(back, Some(VenueCommand::FeeQuery));
         assert!(orders.withdraw(waiting).is_none());
+        orders.keep(left);
         shared.end();
         assert!(!shared.waiting() && orders.ended());
         assert!(orders.withdraw(left).is_some());
         assert!(orders.withdraw(left).is_none());
+    }
+
+    /// Codex P2 r4309350878 on PR #164: an ended session keeps only the command the shard host
+    /// keeps for withdrawal, and none of the others still waiting; Codex P1 r4309350872: one the
+    /// session popped and could not encode is kept as well when it is that command.
+    #[test]
+    fn an_ended_session_keeps_only_the_command_kept_for_withdrawal_waiting_or_popped_unsent() {
+        let shared = Shared::new(
+            AccountKey::new(2),
+            RpcIds::default(),
+            true,
+            false,
+            true,
+            IngestClock::new(),
+        );
+        let orders = ExecOrders {
+            shared: Rc::clone(&shared),
+        };
+        let fee = |orders: &ExecOrders| orders.submit_control(ControlCommand::FeeQuery).unwrap();
+        let (first, kept, last) = (fee(&orders), fee(&orders), fee(&orders));
+        orders.keep(kept);
+        shared.end();
+        assert!(orders.withdraw(first).is_none());
+        assert!(orders.withdraw(last).is_none());
+        assert!(orders.withdraw(kept).is_some());
+
+        // Popped, then not encoded: kept only when it is the command kept.
+        let shared = Shared::new(
+            AccountKey::new(2),
+            RpcIds::default(),
+            true,
+            false,
+            true,
+            IngestClock::new(),
+        );
+        let orders = ExecOrders {
+            shared: Rc::clone(&shared),
+        };
+        let (other, kept) = (fee(&orders), fee(&orders));
+        orders.keep(kept);
+        shared.unsent(shared.pop().unwrap());
+        shared.unsent(shared.pop().unwrap());
+        shared.end();
+        assert!(orders.withdraw(other).is_none());
+        let back = orders.withdraw(kept).map(|item| item.command().clone());
+        assert_eq!(back, Some(VenueCommand::FeeQuery));
     }
 
     #[test]
