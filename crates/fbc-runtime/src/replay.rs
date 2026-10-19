@@ -278,7 +278,8 @@ impl<H: MdHandler> MdReplay<H> {
     /// clock (the runtime's, paused, so the wait moves it to the earliest of that instant and
     /// every other timer of the shard due before it), then is fed as [`MdReplay::feed`] feeds
     /// it, each input stamped with the shard's next ingest sequence. Once the records end,
-    /// the replay waits `settle` past the last instant and drops the order-entry sessions'
+    /// the replay waits `settle` past the journal's last recorded instant, lets the shard read
+    /// what is due then and decide on every input, and drops the order-entry sessions'
     /// controls. A live clock, a record the journal cannot read and a damaged text frame each
     /// stop it with nothing more fed, the controls dropped all the same.
     pub(crate) async fn play<I>(&mut self, closed: ClosedLoop<I>) -> Result<(), ReplayFailure>
@@ -294,19 +295,29 @@ impl<H: MdHandler> MdReplay<H> {
         if !clock.is_replayed() {
             return Err(ReplayFailure::LiveClock);
         }
-        self.shard = Some(clock.clone());
-        let played = self.play_records(&clock, records).await;
-        // Fed on its own afterwards, the replay stamps with the recorded stamps again.
-        self.shard = None;
-        let last = played?;
+        let last = self.play_records(&clock, records).await?;
         let settled = u64::try_from(settle.as_nanos()).unwrap_or(u64::MAX);
         until(&clock, MonoNs(last.0.saturating_add(settled))).await;
+        // What is due at the settle instant is read, and decided on, before the end (Codex P2
+        // r4315555356 on PR #178).
+        drained(&clock).await;
         drop(stops);
         Ok(())
     }
 
+    /// Calls `f` with the shard's clock set for it to stamp with, and clears it before
+    /// returning: no await lies between, so a replay whose run is dropped while it waits stamps
+    /// with the recorded stamps again when fed on its own (Codex P2 r4315555339 on PR #178).
+    fn on_shard<R>(&mut self, clock: &IngestClock, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.shard = Some(clock.clone());
+        let r = f(self);
+        self.shard = None;
+        r
+    }
+
     /// Feeds `records`, each at its recorded instant on `clock`, then finishes: the latest
-    /// instant fed.
+    /// instant the journal records, of a record fed or passed over (Codex P2 r4315555312 on PR
+    /// #178).
     async fn play_records<I>(
         &mut self,
         clock: &IngestClock,
@@ -318,16 +329,18 @@ impl<H: MdHandler> MdReplay<H> {
         let mut last = MonoNs(0);
         for record in records {
             let record = record.map_err(|e| ReplayFailure::Journal(e.to_string()))?;
+            last = last.max(recorded_at(&record).unwrap_or(last));
             if let Some(at) = self.due(&record) {
-                last = last.max(at);
                 until(clock, at).await;
             }
             // A record refused is a damaged text frame: the only refusal of a feed.
-            if let Err(ReplayError::NotUtf8 { ingest_seq }) = self.feed(&record) {
+            if let Err(ReplayError::NotUtf8 { ingest_seq }) =
+                self.on_shard(clock, |replay| replay.feed(&record))
+            {
                 return Err(ReplayFailure::NotUtf8 { ingest_seq });
             }
         }
-        self.finish();
+        self.on_shard(clock, MdReplay::finish);
         Ok(last)
     }
 
@@ -336,6 +349,7 @@ impl<H: MdHandler> MdReplay<H> {
     fn due(&self, record: &Record) -> Option<MonoNs> {
         match record {
             Record::Inbound { stamp, .. }
+            | Record::InboundControl { stamp, .. }
             | Record::Timer { stamp, .. }
             | Record::HttpResult { stamp, .. }
                 if self.owns(stamp.conn) =>
@@ -410,16 +424,26 @@ impl<H: MdHandler> MdReplay<H> {
                     self.counters.timers += 1;
                 }
             }
+            // A ping, pong or close reaches no codec, but the live session stamped it: in a
+            // closed-loop replay it takes its place in the ingest order (Codex P2 r4315555320 on
+            // PR #178).
+            Record::InboundControl { stamp, .. } if self.owns(stamp.conn) => {
+                self.stamp(*stamp);
+            }
             Record::HttpResult { stamp, tag, result } if self.owns(stamp.conn) => {
-                let stamp = self.stamp(*stamp);
-                let held = (stamp, *tag, result.clone());
+                // Stamped as it is answered, so its sequence and its events reach the shard
+                // together (Codex P2 r4315555331 on PR #178).
+                let held = (*stamp, *tag, result.clone());
                 match &mut self.open {
                     // Before the epoch's opening call: held until its codec is built.
                     Some(epoch) if epoch.key == stamp.conn && epoch.codec.is_none() => {
                         epoch.held.push(held);
                     }
                     Some(epoch) if epoch.key == stamp.conn => self.answer(held),
-                    _ => self.counters.stale += 1,
+                    _ => {
+                        self.stamp(*stamp);
+                        self.counters.stale += 1;
+                    }
                 }
             }
             // An input the shard stamped goes back to the consumer at its place (FBC-hvqi).
@@ -517,8 +541,9 @@ impl<H: MdHandler> MdReplay<H> {
         true
     }
 
-    /// Hands an HTTP result of the open epoch to its codec, which is built.
-    fn answer(&mut self, (stamp, tag, result): Held) {
+    /// Hands an HTTP result of the open epoch to its codec, which is built, stamped now.
+    fn answer(&mut self, (recorded, tag, result): Held) {
+        let stamp = self.stamp(recorded);
         if let Some(codec) = self.open.as_mut().and_then(|e| e.codec.as_deref_mut()) {
             let mut sink = Deliver {
                 handler: &mut self.handler,
@@ -608,6 +633,34 @@ impl<H: MdHandler> MdSink for Deliver<'_, H> {
             Some(clock) => clock.attributing(self.stamp, || self.handler.on_md(env)),
             None => self.handler.on_md(env),
         }
+    }
+}
+
+/// The recorded instant a journal record carries, on the shard's monotonic clock.
+fn recorded_at(record: &Record) -> Option<MonoNs> {
+    match record {
+        Record::Inbound { stamp, .. }
+        | Record::InboundControl { stamp, .. }
+        | Record::HttpResult { stamp, .. }
+        | Record::Timer { stamp, .. }
+        | Record::RpcTimeout { stamp, .. } => Some(stamp.recv_mono),
+        Record::Control { at, .. }
+        | Record::Outbound { at, .. }
+        | Record::WriteResult { at, .. }
+        | Record::HttpRequest { at, .. }
+        | Record::Consumer { at, .. } => Some(*at),
+        _ => None,
+    }
+}
+
+/// Waits until the shard has read what was due as it woke and decided on every input stamped
+/// so far: it yields once, so every other member woken at the same instant is polled, then until
+/// its host has run a decide pass, and taken that pass's ladder, since the last input was
+/// stamped.
+async fn drained(clock: &IngestClock) {
+    tokio::task::yield_now().await;
+    while clock.undecided() {
+        tokio::task::yield_now().await;
     }
 }
 

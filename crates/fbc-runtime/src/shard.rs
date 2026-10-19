@@ -397,6 +397,8 @@ impl ShardHost {
         };
         // The next ingest sequence as the last pass began: an input stamped since calls for one.
         let mut decided = clock.next_seq();
+        // What was stamped before the run is no pass's to decide.
+        clock.decided(decided);
         loop {
             let clock = &*clock;
             if !running.until(|_| clock.next_seq() != decided).await? {
@@ -425,6 +427,7 @@ impl ShardHost {
             if !climbed? {
                 return Ok(());
             }
+            clock.decided(decided);
         }
     }
 }
