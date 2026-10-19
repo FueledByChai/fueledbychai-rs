@@ -196,7 +196,10 @@
 //! One thread drives a session (design §5.1): [`ExecSession::run`] spawns no task.
 
 use std::fmt;
+use std::future::{Future, poll_fn};
+use std::pin::pin;
 use std::rc::Rc;
+use std::task::Poll;
 
 use fbc_core::{
     AccountKey, CancelOnDisconnect, ConnKey, ConnState, CtxCall, Effect, Effects, EncodeCtx,
@@ -535,6 +538,8 @@ pub struct ExecSession<H: ExecHandler> {
     closed_early: Option<ConnKey>,
     /// Whether [`ExecSession::run`] was called.
     ran: bool,
+    /// Which way an epoch's next turn polls first, of [`WAKES`].
+    turn: u8,
     handler: H,
 }
 
@@ -592,6 +597,9 @@ enum End {
 }
 
 /// What woke a connected epoch.
+/// How many ways an epoch's turn can wake: [`Wake`]'s variants.
+const WAKES: u8 = 6;
+
 enum Wake {
     Frame(Option<Result<Message, tokio_tungstenite::tungstenite::Error>>),
     Timer,
@@ -739,6 +747,7 @@ impl<H: ExecHandler> ExecSession<H> {
             in_epoch: None,
             closed_early: None,
             ran: false,
+            turn: 0,
             handler,
         };
         session.orders.set_conn(session.core.current());
@@ -938,17 +947,50 @@ impl<H: ExecHandler> ExecSession<H> {
             self.execute_together(&mut ws, key, fx, never).await?
         };
         while open {
-            // Unbiased: each turn polls the branches from a random one, so frames that keep
-            // arriving starve no timer, result or stop, and the stop is checked after every wake
-            // below whichever branch won (DeepSeek DS-1).
+            // Fair and deterministic: each turn polls the ways it can wake from the one after
+            // the last turn's first, so frames that keep arriving starve no timer, result or
+            // stop (DeepSeek DS-1), and the stop is checked after every wake below whichever
+            // won. A rotation rather than tokio's random start, so two closed-loop replays of
+            // one journal take what is ready on one tick in the same order (decision 0106 item
+            // 6; Reviewer B's RB-066n-1 on PR #178).
             let rpc_due = self.rpcs.next_deadline();
-            let wake = tokio::select! {
-                frame = next_frame(&mut ws) => Wake::Frame(frame),
-                _ = sleep_or_never(self.core.next_deadline()) => Wake::Timer,
-                Some(done) = self.core.http.next() => Wake::Http(done),
-                _ = self.orders.wake.notified() => Wake::Orders,
-                _ = sleep_or_never(rpc_due) => Wake::Rpc,
-                _ = self.core.stop.changed() => Wake::Stop,
+            let first = self.turn;
+            self.turn = (first + 1) % WAKES;
+            let wake = {
+                let timer_at = self.core.next_deadline();
+                let mut frame = pin!(next_frame(&mut ws));
+                let mut timer = pin!(sleep_or_never(timer_at));
+                let mut orders = pin!(self.orders.wake.notified());
+                let mut rpc = pin!(sleep_or_never(rpc_due));
+                let mut stop = pin!(self.core.stop.changed());
+                let http = &mut self.core.http;
+                // No result waits: none can be added while the turn waits.
+                let mut no_http = false;
+                poll_fn(|cx| {
+                    for n in 0..WAKES {
+                        let wake = match (first + n) % WAKES {
+                            0 => frame.as_mut().poll(cx).map(Wake::Frame),
+                            1 => timer.as_mut().poll(cx).map(|()| Wake::Timer),
+                            2 if !no_http => match http.poll_next_unpin(cx) {
+                                Poll::Ready(Some(done)) => Poll::Ready(Wake::Http(done)),
+                                Poll::Ready(None) => {
+                                    no_http = true;
+                                    Poll::Pending
+                                }
+                                Poll::Pending => Poll::Pending,
+                            },
+                            3 => orders.as_mut().poll(cx).map(|()| Wake::Orders),
+                            4 => rpc.as_mut().poll(cx).map(|()| Wake::Rpc),
+                            5 => stop.as_mut().poll(cx).map(|_| Wake::Stop),
+                            _ => Poll::Pending,
+                        };
+                        if wake.is_ready() {
+                            return wake;
+                        }
+                    }
+                    Poll::Pending
+                })
+                .await
             };
             // The kernel receive time of the last packet read beneath the frame, if any.
             let rx = ws.as_ref().and_then(Wire::kernel_rx);
