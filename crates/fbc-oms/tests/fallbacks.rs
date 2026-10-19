@@ -1395,9 +1395,11 @@ fn an_emulated_order_whose_quote_becomes_ordinary_stays_within_what_is_left_to_r
         post_only: true,
         ..limit(10_020, 10)
     };
-    let next = book()
-        .with(Side::Sell, 0, ordinary.clone())
-        .with(Side::Sell, 1, reduce_only(limit(10_030, 5)));
+    let next = book().with(Side::Sell, 0, ordinary.clone()).with(
+        Side::Sell,
+        1,
+        reduce_only(limit(10_030, 5)),
+    );
     let pass = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER);
     assert_eq!(shape(&pass), vec![(Stage::Amend, "amend", Side::Sell, 0)]);
     assert_eq!(pass.commands[0].cid, emulated);
@@ -1405,13 +1407,7 @@ fn an_emulated_order_whose_quote_becomes_ordinary_stays_within_what_is_left_to_r
         VenueCommand::Amend(a) => assert_eq!(a.qty, lots(5)),
         other => panic!("expected an amend, got {other:?}"),
     }
-    // At the price asked, the order is what the quote allows: kept.
+    // Its amend in flight, nothing more is built: no cancel, no second amend.
     let again = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER2);
-    assert!(
-        again.commands.iter().all(|c| c.cid != emulated
-            || !matches!(c.auth.command(), VenueCommand::Amend(_) | VenueCommand::Cancel(_))
-            || false),
-        "{:?}",
-        shape(&again)
-    );
+    assert!(again.commands.is_empty(), "{:?}", shape(&again));
 }

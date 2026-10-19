@@ -682,10 +682,11 @@ impl ExecutionPlanner {
                 }
                 continue;
             };
-            // An emulated order is compared with the quote clipped to what is left to reduce.
+            // An emulated order, whatever its quote now asks (the mode is never dropped while
+            // it rests), is compared with the quote clipped to what is left to reduce.
             let clipped;
             let q = match room {
-                Some(room) if f.mode.emulated && f.quote.qty > room => {
+                Some(room) if f.quote.qty > room => {
                     clipped = DesiredQuote {
                         qty: room,
                         ..f.quote.clone()
@@ -740,7 +741,7 @@ impl ExecutionPlanner {
                         total,
                         reducing: q.reducing,
                         tag: q.tag,
-                        emulated: f.mode.emulated.then_some(f.quote.qty),
+                        emulated: slot.mode.emulated.then_some(f.quote.qty),
                         downgrades: f.downgrades.clone(),
                     };
                     actions.push((stage, at, amend));

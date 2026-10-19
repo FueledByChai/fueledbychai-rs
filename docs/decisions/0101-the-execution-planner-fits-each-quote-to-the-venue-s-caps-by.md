@@ -34,7 +34,8 @@ builds on the synthetic IOC.
    level is compared with, so an order placed from it is kept by later passes of the same
    quote. An order whose quote becomes a synthetic IOC or an emulated reduce-only order of the
    same wire shape takes that mode (cancelled at once, or protected from overshoot from then
-   on); a mode is never dropped while the order rests.
+   on); a mode is never dropped while the order rests, so an emulated order whose quote is
+   now ordinary is still kept and amended within what is left to reduce.
 3. **Each downgrade is reported on its command.** `Planned::downgrades` lists the
    `Downgrade`s (`RpiUnsupported`, `RpiReduceOnly`, `SynthIoc`, `EmulatedReduceOnly`,
    `DroppedPostOnly`) in the order applied, on every place and amend built from a fitted
