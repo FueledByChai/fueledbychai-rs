@@ -556,6 +556,14 @@ impl OrderRecord {
         )
     }
 
+    /// What [`Self::exposure`] will be once the order is terminal with no further fill: the
+    /// fills the venue reported on its order updates that the ledger has not counted yet.
+    pub(crate) fn exposure_once_ended(&self) -> Lots {
+        self.cum_venue
+            .checked_sub(self.cum_fills)
+            .unwrap_or(Lots::ZERO)
+    }
+
     /// What [`Self::exposure`] would be once an amend to the total `qty` is built: the larger
     /// of the order's total now and the amend's, until it is acknowledged; for an amend whose
     /// wire carries the remaining quantity `wire`, the exposure now plus that quantity.
