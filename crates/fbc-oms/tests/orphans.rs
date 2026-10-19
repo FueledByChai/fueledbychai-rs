@@ -26,8 +26,8 @@ use fbc_core::{
 use fbc_oms::{
     Admission, AmendRefusal, CancelAllRefusal, Cooldown, EntryState, FillLedger, FillRouted,
     FillTime, IssueRefusal, LadderConfig, LedgerConfig, MarketCapsConfig, OmsError, OrdState,
-    OrderKey, OrphanCancels, OrphanConfig, OrphanConfigError, OrphanPlan, PreTradeCaps, Registry,
-    ResyncReport, ResyncSnapshot, Routed, StaleAuthorization,
+    OrderKey, OrphanCancels, OrphanConfig, OrphanConfigError, OrphanPlan, PositionCheck,
+    PreTradeCaps, Registry, ResyncReport, ResyncSnapshot, Routed, StaleAuthorization,
 };
 
 const INST: InstrumentId = InstrumentId::new(1);
@@ -1093,4 +1093,98 @@ fn during_the_cooldown_an_amend_built_before_a_fill_moved_the_position_is_refuse
         auth.check_at_submit(),
         Err(StaleAuthorization::PositionMoved(INST))
     );
+}
+
+#[test]
+fn an_orphans_fills_before_it_was_registered_move_the_inventory_once_a_snapshot_shows_it_open() {
+    // Codex's r4310559340 on PR #171: a fill of our order the registry does not hold, after a
+    // seed that did not show it, is placed in the seed (an earlier run's order, 0055's rule 3);
+    // a later snapshot showing it open proves it came after, so registering the orphan counts
+    // it on the inventory, once.
+    let mut reg = seeded(0);
+    let mut l = ledger();
+    let (o, p) = (cid(), cid());
+    let routed = fill_at(
+        &mut reg,
+        &mut l,
+        o,
+        "o",
+        Side::Buy,
+        2,
+        2,
+        Some(1_400),
+        1_500,
+    );
+    assert_eq!(routed, FillRouted::InSnapshot(o));
+    // Executed at or before the seed's watermark: the seed holds it.
+    let routed = fill_at(&mut reg, &mut l, p, "p", Side::Buy, 1, 1, Some(900), 1_600);
+    assert_eq!(routed, FillRouted::InSnapshot(p));
+    assert_eq!(reg.position(INST), Some(SignedLots(0)));
+
+    let mut shown_o = ours(o, "o", Side::Buy);
+    shown_o.cum_filled = lots(2);
+    let mut shown_p = ours(p, "p", Side::Buy);
+    shown_p.cum_filled = lots(1);
+    resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        2_000,
+        vec![shown_o.clone(), shown_p.clone()],
+        3,
+    );
+    let mut both = vec![o, p];
+    both.sort();
+    assert_eq!(reg.orphans(INST), both);
+    assert_eq!(reg.position(INST), Some(SignedLots(2)));
+    // Shown again, it is counted no second time, and the next check agrees with the venue's.
+    let report = resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        3_000,
+        vec![shown_o, shown_p],
+        2,
+    );
+    assert_eq!(reg.position(INST), Some(SignedLots(2)));
+    assert!(
+        report.checks.contains(&PositionCheck::Agrees {
+            inst: INST,
+            position: SignedLots(2)
+        }),
+        "{report:?}"
+    );
+}
+
+#[test]
+fn a_place_authorized_during_the_cooldown_is_refused_at_submit_once_another_orphan_is_registered() {
+    // Codex's r4310559351 on PR #171: long 20, a sell of 20 authorized inside the cooldown;
+    // a later resync registers a sell orphan of 5 on the market, which with the sell would
+    // take the position past zero.
+    let mut reg = seeded(20);
+    arm::start(&mut reg, INST);
+    let first = cid();
+    resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        2_000,
+        vec![ours(first, "first", Side::Buy)],
+        20,
+    );
+    assert_eq!(reg.orphan_cooldown(INST), Some(Cooldown::Pending));
+    let cmd = reg.place(sell(20)).unwrap();
+    let auth = reg.authorize(arm::TEST_ACCT, cmd).unwrap();
+    assert_eq!(auth.check_at_submit(), Ok(()));
+    resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        3_000,
+        vec![
+            ours(first, "first", Side::Buy),
+            ours(cid(), "second", Side::Sell),
+        ],
+        20,
+    );
+    assert!(matches!(
+        auth.check_at_submit(),
+        Err(StaleAuthorization::StateChanged { market: INST, .. })
+    ));
 }
