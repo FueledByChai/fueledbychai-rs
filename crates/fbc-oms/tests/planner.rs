@@ -32,8 +32,8 @@ use fbc_oms::{
     Admission, AmendRefusal, CapRefusal, DesiredBook, DesiredQuote, ExecutionPlanner, ExitRefusal,
     FillLedger, FillRouted, FillTime, HeldReason, Intent, LadderConfig, LedgerConfig,
     MarketCapsConfig, OmsError, OrdState, OrderKey, OrderOp, Plan, PlanError, PlanRefusal,
-    PlannerConfig, PlannerConfigError, PreTradeCaps, Refused, Registry, ResyncSnapshot, Stage,
-    StateRefusal,
+    PlannerConfig, PlannerConfigError, PreTradeCaps, ReduceFallback, Refused, Registry,
+    ResyncSnapshot, Stage, StateRefusal,
 };
 
 const INST: InstrumentId = InstrumentId::new(1);
@@ -140,6 +140,7 @@ fn quote(px: i64, qty: i64) -> DesiredQuote {
         reduce_only: false,
         reducing: false,
         tag: 0,
+        reduce_fallback: ReduceFallback::KeepReduceOnly,
     }
 }
 

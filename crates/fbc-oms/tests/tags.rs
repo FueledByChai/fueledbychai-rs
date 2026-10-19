@@ -28,7 +28,7 @@ use fbc_core::{
 use fbc_oms::{
     Applied, AuditEntry, AuditSink, CapRefusal, DesiredBook, DesiredQuote, ExecutionPlanner,
     LadderConfig, MarketCapsConfig, OmsError, OrderKey, OrderOp, Plan, PlanRefusal, PlannerConfig,
-    PreTradeCaps, Registry, ResyncSnapshot, Routed, Stage,
+    PreTradeCaps, ReduceFallback, Registry, ResyncSnapshot, Routed, Stage,
 };
 
 const INST: InstrumentId = InstrumentId::new(1);
@@ -139,6 +139,7 @@ fn quote(px: i64, qty: i64, tag: u16) -> DesiredQuote {
         reduce_only: false,
         reducing: false,
         tag,
+        reduce_fallback: ReduceFallback::KeepReduceOnly,
     }
 }
 

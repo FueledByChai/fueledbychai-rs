@@ -51,7 +51,8 @@ use fbc_oms::{
     AmendRefusal, ArmRefusal, CancelChoice, CancelEverything, CapRefusal, DesiredBook,
     DesiredQuote, EntryState, ExecutionPlanner, ExitKind, ExitRefusal, FillLedger, LadderConfig,
     LeaseKeys, Leases, LedgerConfig, MarketCapsConfig, OmsError, OrdState, PlanRefusal,
-    PlannerConfig, PositionCheck, PreTradeCaps, Registry, Stage, StateRefusal, TestnetRun,
+    PlannerConfig, PositionCheck, PreTradeCaps, ReduceFallback, Registry, Stage, StateRefusal,
+    TestnetRun,
 };
 use fbc_runtime::{
     Connector, ExecControl, ExecOrders, ExecSession, ExecSessionConfig, IngestClock, Journal,
@@ -483,6 +484,7 @@ fn quote(px: i64, qty: i64, reducing: bool) -> DesiredQuote {
         reduce_only: reducing,
         reducing,
         tag: 0,
+        reduce_fallback: ReduceFallback::KeepReduceOnly,
     }
 }
 

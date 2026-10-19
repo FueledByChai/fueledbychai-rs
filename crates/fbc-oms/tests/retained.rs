@@ -34,7 +34,8 @@ use fbc_core::{
 use fbc_oms::{
     CancelChoice, CapRefusal, DesiredBook, DesiredQuote, ExecutionPlanner, FillLedger, FillRouted,
     IssueRefusal, LedgerConfig, MarketCapsConfig, OmsError, OrdState, OrderKey, OrderOp,
-    PermittedCommand, PlanError, PlannerConfig, PreTradeCaps, Registry, TerminalKind, TestnetRun,
+    PermittedCommand, PlanError, PlannerConfig, PreTradeCaps, ReduceFallback, Registry,
+    TerminalKind, TestnetRun,
 };
 
 const INST: InstrumentId = InstrumentId::new(1);
@@ -401,6 +402,7 @@ fn a_planner_refuses_a_registry_an_authorization_bound_to_another_account() {
             reduce_only: false,
             reducing: false,
             tag: 0,
+            reduce_fallback: ReduceFallback::KeepReduceOnly,
         },
     );
     assert_eq!(

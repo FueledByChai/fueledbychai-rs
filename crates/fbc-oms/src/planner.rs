@@ -92,6 +92,46 @@ pub struct DesiredQuote {
     /// ([`OrderRecord::tag`]) and carried by the audit sink's verdicts. fbc-oms gives it no
     /// meaning (0001; 0098).
     pub tag: u16,
+    /// What a post-only, reduce-only quote becomes on a venue that refuses the two flags
+    /// together ([`ReduceFallback`]); unused where the venue takes them together. No default:
+    /// the consumer chooses per quote (a maker exit keeps the flag, inventory relief emulates
+    /// it; design §4.10).
+    pub reduce_fallback: ReduceFallback,
+}
+
+/// What a quote that is both post-only and reduce-only becomes on a venue whose
+/// [`OrderCaps::flag_conflicts`] pair the two (design §4.10 step 4).
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum ReduceFallback {
+    /// Post-only without the venue's reduce-only flag, classified reducing and sized by the
+    /// OMS at most the position less the other orders resting that reduce it on the same
+    /// side; re-checked after every fill and every pass, and cancelled at once when it would
+    /// overshoot ([`Downgrade::EmulatedReduceOnly`]).
+    EmulateReduceOnly,
+    /// Reduce-only without post-only, at the quote's price: a taker fill is acceptable (a
+    /// force-close or a disaster stop; [`Downgrade::DroppedPostOnly`]).
+    KeepReduceOnly,
+}
+
+/// A change the planner made to a quote the venue's [`OrderCaps`] do not take as asked
+/// (design §4.10 steps 3 and 4), reported on each place and amend built from that quote
+/// ([`Planned::downgrades`]). Chosen from the caps alone, never from the venue's name.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum Downgrade {
+    /// The RPI channel was asked for on a venue without it: the order goes on the public book.
+    RpiUnsupported,
+    /// The venue refuses RPI with reduce-only: the order goes on the public book, still
+    /// reduce-only.
+    RpiReduceOnly,
+    /// The venue refuses IOC with reduce-only: a good-till-cancelled reduce-only limit at the
+    /// quote's price (its cap), cancelled at once.
+    SynthIoc,
+    /// The venue refuses post-only with reduce-only and the quote asked to emulate it
+    /// ([`ReduceFallback::EmulateReduceOnly`]).
+    EmulatedReduceOnly,
+    /// The venue refuses post-only with reduce-only and the quote asked to keep reduce-only
+    /// ([`ReduceFallback::KeepReduceOnly`]).
+    DroppedPostOnly,
 }
 
 impl DesiredQuote {
@@ -289,6 +329,9 @@ pub struct Planned {
     /// A cancel's removal reason: its side's [`DesiredBook::removal`] when the book no longer
     /// wants the level; `None` for a place, an amend, and a cancel of a level still wanted.
     pub removal: Option<u16>,
+    /// What the planner changed in the level's quote to suit the venue's caps, in the order it
+    /// applied them: a place's and an amend's; empty for a cancel and for a quote sent as asked.
+    pub downgrades: Vec<Downgrade>,
     /// The authorization to submit it under.
     pub auth: Authorization,
 }
@@ -328,6 +371,10 @@ pub enum PlanRefusal {
     Permit(PermitRefusal),
     /// No client id could be minted.
     Mint(IdError),
+    /// An emulated reduce-only quote ([`ReduceFallback::EmulateReduceOnly`]) has nothing to
+    /// reduce: the position is flat, unknown or on the quote's side, or the other orders
+    /// reducing it on that side already cover it.
+    NoRoomToReduce,
 }
 
 /// Why a whole [`ExecutionPlanner::plan`] pass was refused, nothing built or freed: the
@@ -688,12 +735,25 @@ impl ExecutionPlanner {
                     cid,
                     tag,
                     removal,
+                    downgrades: Vec::new(),
                     auth: authorize(reg, acct, cmd),
                 }),
                 Err(why) => plan.refused.push(refuse(why)),
             }
         }
         Ok(plan)
+    }
+
+    /// The check after a fill (stub).
+    pub fn on_fill(
+        &mut self,
+        reg: &mut Registry,
+        caps: &OrderCaps,
+        acct: AccountKey,
+        market: InstrumentId,
+    ) -> Result<Vec<Planned>, PlanError> {
+        let _ = (reg, caps, acct, market);
+        Ok(Vec::new())
     }
 
     /// Binds `acct` to the registry `reg` at its first pass; refuses another registry for

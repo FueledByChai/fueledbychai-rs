@@ -35,7 +35,7 @@ use fbc_core::{
 use fbc_oms::{
     CancelChoice, CapRefusal, DesiredBook, DesiredQuote, ExecutionPlanner, IssueRefusal,
     MarketCapsConfig, OmsError, OrdState, OrderOp, OutcomeApplied, PermittedCommand, PlanError,
-    PlannerConfig, PreTradeCaps, Registry, TerminalKind, TestnetRun,
+    PlannerConfig, PreTradeCaps, ReduceFallback, Registry, TerminalKind, TestnetRun,
 };
 
 const INST: InstrumentId = InstrumentId::new(1);
@@ -317,6 +317,7 @@ fn a_planner_pass_quotes_a_side_a_dropped_place_had_filled() {
             reduce_only: false,
             reducing: false,
             tag: 0,
+            reduce_fallback: ReduceFallback::KeepReduceOnly,
         },
     );
     let plan = p

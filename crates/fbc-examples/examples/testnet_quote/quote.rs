@@ -121,8 +121,8 @@ use fbc_core::{
 use fbc_oms::{
     Applied, CancelChoice, CancelEverything, DesiredBook, DesiredQuote, ExecutionPlanner,
     FillLedger, Intent, LadderConfig, LeaseKeys, Leases, LedgerConfig, MarketCapsConfig, OrdState,
-    PermittedCommand, PlanRefusal, PlannerConfig, PreTradeCaps, Registry, Routed, Stage,
-    TestnetRun,
+    PermittedCommand, PlanRefusal, PlannerConfig, PreTradeCaps, ReduceFallback, Registry, Routed,
+    Stage, TestnetRun,
 };
 use fbc_runtime::{Connector, ExecControl, ExecOrders, ExecSession, RateLimiter};
 use fbc_venue_paradex::ParadexFactory;
@@ -672,6 +672,7 @@ pub fn desired(
             reduce_only: false,
             reducing: false,
             tag: 0,
+            reduce_fallback: ReduceFallback::KeepReduceOnly,
         };
         wanted.book.set(side, 0, quote);
         match side {
