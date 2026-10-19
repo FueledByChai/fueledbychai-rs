@@ -1033,3 +1033,71 @@ fn a_cancel_left_alone_in_its_batch_goes_as_a_single_cancel_where_one_can_name_i
         .unwrap();
     assert_eq!(kinds(&plan), vec![("cancel-many", 1)]);
 }
+
+#[test]
+fn a_cancel_a_quote_change_calls_for_goes_out_though_a_venue_mode_refuses_the_new_quote() {
+    // Long 10, an ordinary ask of 15 resting. The book now wants it as an emulated reduce-only
+    // quote (the venue refuses post-only with reduce-only), so it counts as reducing and rests
+    // more than is left to reduce: it is cancelled at once (0106), a cancel no venue mode
+    // gates (0012, 0111), though the market's Reduce-only mode refuses the quote that replaces
+    // it, which is never built (Codex r4319820327 on PR #182).
+    let caps = OrderCaps {
+        flag_conflicts: vec![(fbc_core::Feature::PostOnly, fbc_core::Feature::ReduceOnly)],
+        ..batching()
+    };
+    let mut reg = quoting(10);
+    let mut p = planner();
+    let mut m = mint();
+    let open = p
+        .plan(
+            &DesiredBook::new(INST).with(Side::Sell, 0, quote(10_010, 15, 0)),
+            &mut reg,
+            &declared(&caps),
+            ACCT,
+            &mut m,
+            MonoNs(0),
+        )
+        .unwrap();
+    ack_all(&mut reg, &open);
+    let emulated = DesiredQuote {
+        reduce_only: true,
+        reducing: true,
+        reduce_fallback: ReduceFallback::EmulateReduceOnly,
+        ..quote(10_010, 15, 0)
+    };
+    let venue = PlanVenue {
+        market_mode: VenueMode::ReduceOnly,
+        ..declared(&caps)
+    };
+    let book = DesiredBook::new(INST).with(Side::Sell, 0, emulated);
+    let plan = p
+        .plan(&book, &mut reg, &venue, ACCT, &mut m, MonoNs(2))
+        .unwrap();
+    assert_eq!(kinds(&plan), vec![("cancel", 1)]);
+    assert_eq!(plan.commands[0].cid, open.commands[0].cid);
+    assert!(plan.refused.is_empty(), "{:?}", plan.refused);
+    // Once it is terminal, the emulated quote (no venue reduce-only flag) is refused by the
+    // mode and nothing is placed.
+    let c = open.commands[0].cid;
+    let ended = fbc_core::OrderUpdate {
+        cid: Some(fbc_core::CidMatch::Ours(c)),
+        vid: Some(vid("v-Sell-0")),
+        inst: INST,
+        side: Side::Sell,
+        state: fbc_core::VenueOrderState::Canceled(fbc_core::CancelReason::Requested),
+        cum_filled: lots(0),
+        px: None,
+        qty: None,
+        post_only: None,
+        reduce_only: None,
+    };
+    reg.apply_update(&ended, key(9));
+    let plan = p
+        .plan(&book, &mut reg, &venue, ACCT, &mut m, MonoNs(3))
+        .unwrap();
+    assert!(plan.commands.is_empty(), "{:?}", kinds(&plan));
+    assert_eq!(
+        refusals(&plan),
+        vec![(Side::Sell, 0, PlanRefusal::VenueMode(VenueMode::ReduceOnly))]
+    );
+}
