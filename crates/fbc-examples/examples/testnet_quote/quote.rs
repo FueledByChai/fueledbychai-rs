@@ -94,7 +94,7 @@
 //! another); the first prints a `WARN` line and the loop requotes; with
 //! `--mainnet`, a second on a later cycle within [`Options::cancel_window`] (30 s) of the first,
 //! or one of the loop's requote (the first order it placed on a side after the event before,
-//! a place that never rested aside: RB-aoh5-10) within the window of that requote's place, however long the cycle that placed it (Codex
+//! a place that never rested aside: RB-aoh5-10), or of a replace of it, within the window of that requote's place, however long the cycle that placed it (Codex
 //! r4309154208 on PR #159), Stops the run and fails it ("another program cancelled our orders:
 //! one quoter per account"); past the window the next one starts a new window; a testnet run
 //! only warns. Once one was
@@ -225,13 +225,14 @@ pub enum NotOurs {
 /// A new event is a repeat when it comes within the window of the window's first event, or when
 /// it cancels the loop's requote of a side (the first order of ours placed on that side after
 /// the latest event was seen, a place refused, not sent or that would cross aside: it never
-/// rested, [`Self::unrested`]) within the window of that requote's place. The second is measured
+/// rested, [`Self::unrested`]), or a replace of it, within the window of that requote's place. The second is measured
 /// from our place, not from the event before: the loop requotes a side another program
 /// cancelled only on the next cycle, and its reads, settle waits and rate-limit waits can make
 /// that cycle longer than the window, so by the first measure alone a co-tenant cancelling every
-/// requote would only warn each cycle (Codex r4309154208, RB-aoh5-9 on PR #159). One that
-/// cancels a requote long after its place, or a later order (a replace of it), is judged by the
-/// first measure.
+/// requote would only warn each cycle (Codex r4309154208, RB-aoh5-9 on PR #159). A replace of
+/// the requote is timed from the requote's place too, so the loop replacing its requote before
+/// another program acts keeps the rule (Codex r4310042604). One that cancels a requote or its
+/// replace more than the window after the requote's place is judged by the first measure.
 #[derive(Clone, Debug)]
 pub struct CancelsNotOurs {
     window: Duration,
@@ -240,9 +241,20 @@ pub struct CancelsNotOurs {
     latest: Option<Event>,
     /// When each order of ours not ended was placed by this run.
     placed: HashMap<ClientOrderId, tokio::time::Instant>,
-    /// The loop's requote of each side (bid, ask) since the latest event: the first order
-    /// placed on it after that event was seen that did not end unrested, and when.
-    requotes: [Option<(ClientOrderId, tokio::time::Instant)>; 2],
+    /// The loop's requote of each side (bid, ask) since the latest event ([`Requote`]).
+    requotes: [Option<Requote>; 2],
+}
+
+/// The loop's requote of a side since the latest event: the first order of ours placed on it
+/// after that event was seen that did not end unrested ([`CancelsNotOurs::unrested`]), timed
+/// from its place, and every order placed on the side since, not ended: our replaces of it
+/// (Codex r4310042604 on PR #159), so the loop replacing its requote before another program
+/// acts does not take the requote rule away, and a fill of it does not either.
+#[derive(Clone, Debug)]
+struct Requote {
+    since: tokio::time::Instant,
+    founder: ClientOrderId,
+    chain: Vec<ClientOrderId>,
 }
 
 /// The index of `side` in [`CancelsNotOurs::requotes`].
@@ -281,29 +293,42 @@ impl CancelsNotOurs {
             first: None,
             latest: None,
             placed: HashMap::new(),
-            requotes: [None; 2],
+            requotes: [None, None],
         }
     }
 
     /// This run placed our order `cid` on `side` at `now`: the loop's requote of that side when
-    /// it is the first placed on it since the latest event.
+    /// it is the first placed on it since the latest event, otherwise a replace of it, judged
+    /// from the requote's place ([`Requote`]).
     pub fn placed(&mut self, cid: ClientOrderId, side: Side, now: tokio::time::Instant) {
         self.placed.insert(cid, now);
-        let requote = &mut self.requotes[side_index(side)];
-        if self.latest.is_some() && requote.is_none() {
-            *requote = Some((cid, now));
+        if self.latest.is_none() {
+            return;
+        }
+        match &mut self.requotes[side_index(side)] {
+            Some(requote) => requote.chain.push(cid),
+            slot @ None => {
+                *slot = Some(Requote {
+                    since: now,
+                    founder: cid,
+                    chain: vec![cid],
+                });
+            }
         }
     }
 
     /// Our place `cid` ended without resting: refused (for its rate, or a post-only place that
     /// would cross), or never sent. It held its side's requote only as the first place after
     /// the latest event, and another program cannot cancel it, so the side's requote is the next
-    /// order placed on it: the one that rests (RB-aoh5-10 on PR #159). Our own replace of a
-    /// requote that rested frees nothing: that replace is judged by the window's first event.
+    /// order placed on it: the one that rests (RB-aoh5-10 on PR #159). A replace of a requote
+    /// that rested frees nothing: the requote stays timed from its place.
     pub fn unrested(&mut self, cid: ClientOrderId) {
         for slot in &mut self.requotes {
-            if slot.is_some_and(|(requote, _)| requote == cid) {
-                *slot = None;
+            if let Some(requote) = slot {
+                requote.chain.retain(|c| *c != cid);
+                if requote.founder == cid && requote.chain.is_empty() {
+                    *slot = None;
+                }
             }
         }
     }
@@ -311,6 +336,9 @@ impl CancelsNotOurs {
     /// Keeps the placing times of the orders `keep` takes (those not ended).
     pub fn retain(&mut self, keep: impl Fn(&ClientOrderId) -> bool) {
         self.placed.retain(|cid, _| keep(cid));
+        for requote in self.requotes.iter_mut().flatten() {
+            requote.chain.retain(|cid| keep(cid));
+        }
     }
 
     /// Our order `cid` on `side` (placed by this run, [`Self::placed`], or an earlier run's),
@@ -334,11 +362,14 @@ impl CancelsNotOurs {
         {
             return NotOurs::SameEvent;
         }
-        let requote = self.requotes[side_index(side)].is_some_and(|(requote, placed)| {
-            requote == cid && now.saturating_duration_since(placed) <= self.window
-        });
+        let requote = self.requotes[side_index(side)]
+            .as_ref()
+            .is_some_and(|requote| {
+                requote.chain.contains(&cid)
+                    && now.saturating_duration_since(requote.since) <= self.window
+            });
         self.latest = Some(Event { seen: now, at });
-        self.requotes = [None; 2];
+        self.requotes = [None, None];
         match self.first {
             _ if requote => NotOurs::Repeat,
             Some(first) if now.saturating_duration_since(first) <= self.window => NotOurs::Repeat,

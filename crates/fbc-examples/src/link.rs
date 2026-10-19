@@ -64,7 +64,11 @@
 //!   of the account) submitted while the order was ours and not ended. A refused one (a cancel
 //!   refused for its rate, waiting to be sent again) covers nothing from its refusal on, so
 //!   another program's cancel of the order, still live, is not ours (Codex r4309154204 on PR
-//!   #159); an Unknown one still may land, and still covers. Submitted but not
+//!   #159); an Unknown one still may land, and still covers. An order a user cancel ends while
+//!   only requests of ours not yet answered cover it is held until they are: one accepted, the
+//!   cancel was ours; all refused (the venue answering `AlreadyTerminal`, `NotFound` or for its
+//!   rate after another program's cancel, its order event read first), it is noted then, after
+//!   the refusal's [`Note::Outcome`] (Codex r4310042612 on PR #159). Submitted but not
 //!   yet reported sent, it is only pending and covers nothing: the session decodes a frame
 //!   waiting in a turn before it writes what was queued, so another program's cancel read then
 //!   is not ours (Codex r4308625182 on PR #159), and one reported not sent wrote nothing (Codex
@@ -307,10 +311,36 @@ pub fn described(reject: &Reject) -> String {
 /// submitted but not yet reported sent is pending and covers nothing: the session may decode
 /// another program's cancel of its order before it writes it (Codex r4308625182 on PR #159);
 /// one reported not sent never covers (no byte of it was written: Codex r4308561813).
+///
+/// An order that ends `Canceled(Requested)` while only requests not yet answered cover it is
+/// held ([`Coverage::hold`]) until they are: the venue may refuse ours after another program's
+/// cancel ended the order (`AlreadyTerminal`, `NotFound`, or for its rate), its order event read
+/// first. One accepted makes the cancel ours; all refused, the cancel was not ours, and
+/// [`Coverage::refused`] hands the held order back to be noted then (Codex r4310042612 on PR
+/// #159).
 #[derive(Debug, Default)]
 pub struct Coverage {
-    covered: HashMap<ClientOrderId, HashSet<RpcId>>,
+    /// Each order covered, with the requests covering it and whether each was accepted.
+    covered: HashMap<ClientOrderId, HashMap<RpcId, bool>>,
     pending: HashMap<RpcId, Vec<ClientOrderId>>,
+    held: HashMap<ClientOrderId, Held>,
+}
+
+/// An order of ours ended by a user cancel while only unanswered requests of ours covered it
+/// ([`Coverage::hold`]): those requests, and the order's side and the venue's time on its end.
+#[derive(Debug)]
+struct Held {
+    rpcs: HashSet<RpcId>,
+    side: Side,
+    at: Option<ExchNs>,
+}
+
+/// A held order whose every covering request was refused: a cancel not ours after all.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Released {
+    pub cid: ClientOrderId,
+    pub side: Side,
+    pub at: Option<ExchNs>,
 }
 
 impl Coverage {
@@ -328,17 +358,63 @@ impl Coverage {
         };
         if sent {
             for cid in cids {
-                self.covered.entry(cid).or_default().insert(rpc);
+                self.covered.entry(cid).or_default().insert(rpc, false);
             }
         }
+    }
+
+    /// The venue accepted request `rpc` for order `cid` (`None`: for every order it covers): a
+    /// cancel of ours, so an order it covers that a user cancel ends was cancelled by us, and a
+    /// held one is ours ([`Coverage::hold`]).
+    pub fn accepted(&mut self, rpc: RpcId, cid: Option<ClientOrderId>) {
+        for (covered, rpcs) in &mut self.covered {
+            if cid.is_none_or(|c| c == *covered)
+                && let Some(accepted) = rpcs.get_mut(&rpc)
+            {
+                *accepted = true;
+            }
+        }
+        self.held
+            .retain(|held, h| !(cid.is_none_or(|c| c == *held) && h.rpcs.contains(&rpc)));
+    }
+
+    /// Our order `cid` on `side` was ended by a user cancel the venue stamped `at` while a
+    /// request of ours covers it: `true` when none of them was accepted yet, so the order is
+    /// held until they are answered ([`Coverage::accepted`], [`Coverage::refused`]); `false`
+    /// when one was accepted (the cancel was ours) or none covers it.
+    pub fn hold(&mut self, cid: ClientOrderId, side: Side, at: Option<ExchNs>) -> bool {
+        let Some(rpcs) = self.covered.get(&cid) else {
+            return false;
+        };
+        if rpcs.values().any(|accepted| *accepted) {
+            return false;
+        }
+        let rpcs = rpcs.keys().copied().collect();
+        self.held.insert(cid, Held { rpcs, side, at });
+        true
     }
 
     /// The venue refused request `rpc`, or it was not sent after all (its write failed), for
     /// order `cid` (`None`: for every order it covers): it no longer covers it, so another
     /// program's cancel of that order, still live, while ours waits to be sent again is not ours
     /// (Codex r4309154204 / RB-aoh5-4 on PR #159). Another request of ours may still cover it.
-    pub fn refused(&mut self, rpc: RpcId, cid: Option<ClientOrderId>) {
-        let uncover = |rpcs: &mut HashSet<RpcId>| {
+    /// The orders held ([`Coverage::hold`]) that no request of ours covers any more: ended by a
+    /// cancel not ours, read before the refusal (Codex r4310042612).
+    pub fn refused(&mut self, rpc: RpcId, cid: Option<ClientOrderId>) -> Vec<Released> {
+        let mut released = Vec::new();
+        self.held.retain(|held, h| {
+            if cid.is_none_or(|c| c == *held) && h.rpcs.remove(&rpc) && h.rpcs.is_empty() {
+                released.push(Released {
+                    cid: *held,
+                    side: h.side,
+                    at: h.at,
+                });
+                return false;
+            }
+            true
+        });
+        released.sort_by_key(|r| r.cid);
+        let uncover = |rpcs: &mut HashMap<RpcId, bool>| {
             rpcs.remove(&rpc);
             !rpcs.is_empty()
         };
@@ -358,6 +434,7 @@ impl Coverage {
                 self.pending.remove(&rpc);
             }
         }
+        released
     }
 
     /// Whether a request of ours reported sent covers `cid`.
@@ -365,7 +442,8 @@ impl Coverage {
         self.covered.contains_key(&cid)
     }
 
-    /// Keeps the orders `keep` takes (the live ones), forgetting the rest, pending or covered.
+    /// Keeps the orders `keep` takes (the live ones), forgetting the rest, pending or covered;
+    /// the held ones, ended, stay until their requests are answered.
     pub fn retain(&mut self, keep: impl Fn(&ClientOrderId) -> bool) {
         self.covered.retain(|cid, _| keep(cid));
         self.pending.retain(|_, cids| {
@@ -804,22 +882,24 @@ impl Link {
         };
         // A refused cancel of ours, or one not sent after all, stops covering what it names (a
         // cancel-all's item: the order it states; the whole request: every order it covers).
-        if matches!(
-            outcome,
-            SubmitOutcome::Rejected(_) | SubmitOutcome::NotSent(_)
-        ) {
-            match &item {
-                None => self.covered.refused(rpc, None),
-                Some(named) => match items.get(usize::from(named.idx)) {
-                    Some(Item::Cancel(cid)) => self.covered.refused(rpc, Some(*cid)),
-                    Some(_) => {}
-                    None if items.is_empty() => {
-                        if let Some(cid) = named.cid {
-                            self.covered.refused(rpc, Some(cid));
-                        }
-                    }
-                    None => {}
-                },
+        // An accepted one makes an order it covers that a user cancel ended, held, ours.
+        let scope = match &item {
+            None => Some(None),
+            Some(named) => match items.get(usize::from(named.idx)) {
+                Some(Item::Cancel(cid)) => Some(Some(*cid)),
+                Some(_) => None,
+                None if items.is_empty() => named.cid.map(Some),
+                None => None,
+            },
+        };
+        let mut released = Vec::new();
+        if let Some(cid) = scope {
+            match &outcome {
+                SubmitOutcome::Rejected(_) | SubmitOutcome::NotSent(_) => {
+                    released = self.covered.refused(rpc, cid);
+                }
+                SubmitOutcome::Accepted { .. } => self.covered.accepted(rpc, cid),
+                _ => {}
             }
         }
         for (it, named) in targets {
@@ -834,6 +914,14 @@ impl Link {
             outcome,
             ours: true,
         });
+        // Orders a user cancel ended while only this refused request covered them: a cancel
+        // not ours, its order event read before the refusal (Codex r4310042612 on PR #159).
+        self.notes
+            .extend(released.into_iter().map(|r| Note::CancelNotOurs {
+                cid: r.cid,
+                side: r.side,
+                at: r.at,
+            }));
     }
 
     fn on_resync_end(&mut self, ingest: u64, venue: Option<u64>) {
@@ -876,10 +964,10 @@ impl Link {
                         if was_live
                             && named == Some(cid)
                             && u.state
-                                == fbc_core::VenueOrderState::Canceled(CancelReason::Requested)
-                            && !self.cancel_of_ours(cid) =>
+                                == fbc_core::VenueOrderState::Canceled(CancelReason::Requested) =>
                     {
-                        self.reg
+                        let side = self
+                            .reg
                             .get(cid)
                             .filter(|r| {
                                 r.state()
@@ -887,11 +975,21 @@ impl Link {
                                         CancelReason::Requested,
                                     ))
                             })
-                            .map(|r| Note::CancelNotOurs {
+                            .map(|r| r.placed().side);
+                        match side {
+                            Some(side) if !self.cancel_of_ours(cid) => Some(Note::CancelNotOurs {
                                 cid,
-                                side: r.placed().side,
+                                side,
                                 at: env.exch_ts,
-                            })
+                            }),
+                            // Covered only by requests not yet answered: held until they are,
+                            // noted if all are refused (Codex r4310042612 on PR #159).
+                            Some(side) => {
+                                self.covered.hold(cid, side, env.exch_ts);
+                                None
+                            }
+                            None => None,
+                        }
                     }
                     _ => None,
                 };
