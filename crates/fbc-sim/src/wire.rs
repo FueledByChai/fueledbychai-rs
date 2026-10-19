@@ -744,6 +744,10 @@ pub(crate) enum Reply {
     },
     Order(OrderEvent),
     Fill(FillRecord),
+    /// The stream is ready to take commands, as a hosted stream says it as it opens (decision
+    /// 0104): the simulated venue asks no login. The engine never writes it, so its stamp says
+    /// nothing.
+    Ready,
     /// A resync's whole answer, in one frame (decision 0049): `wm` is the wall time of the
     /// request it answers and `req` that request's number, `orders` the resting orders, and `positions` the signed sum of the
     /// account's fills in each instrument it has a fill in, in lots, as an `i128` so a sum past
@@ -820,6 +824,11 @@ impl Record<'_> {
 }
 
 impl Reply {
+    /// The frame [`Reply::Ready`] is, which the engine never stamps.
+    pub(crate) fn ready() -> Vec<u8> {
+        Reply::Ready.encode(Stamp { seq: 0, ts: None })
+    }
+
     pub(crate) fn encode(&self, stamp: Stamp) -> Vec<u8> {
         let head = |kind| Writer::stamped(kind, stamp);
         match self {
@@ -891,6 +900,7 @@ impl Reply {
                 }
             }
             Reply::Order(o) => head("order").event(o),
+            Reply::Ready => head("ready"),
             Reply::Fill(f) => head("fill")
                 .field("fid", &f.fid)
                 .field("cid", &f.cid)
@@ -1003,6 +1013,7 @@ impl Reply {
                 })
             }
             "order" => single(Reply::Order(r.event()?)),
+            "ready" => single(Reply::Ready),
             "fill" => single(Reply::Fill(FillRecord {
                 fid: r.str("fid")?.to_owned(),
                 cid: r.str("cid")?.to_owned(),

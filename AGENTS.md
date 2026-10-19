@@ -237,7 +237,16 @@ rather than guess.
     under its class and then hands it to the `InputHandler`; `MdReplay::set_inputs` hands each
     back at its place, the replay's handlers arming through `ConsumerTimers::inert`
     (`tests/consumer_inputs.rs`);
-    `tests/common/toy.rs` is the toy market-data venue later runtime tests reuse.
+    `ExecSession::in_process` runs an order-entry session over an `InProcessStream` in place of
+    the venue's planned WebSocket, with a codec of the consumer's (0104): no socket opens, the
+    stream's `OrderEntryPeer` is told its opening and closing, each frame the codec writes and,
+    through a `PeerFeed` in front of the consumer's market-data handler, the shard's envelopes in
+    ingest order and each market-data epoch's end, and its answers are read at their due
+    instants on the shard clock, stamped and journaled as a socket's; the session core is
+    generic over what an epoch writes and reads on (`Wire`) and how an attempt opens it
+    (`Dial`) (SimVenue's peer is tested in `fbc-sim`'s `tests/hosted.rs`);
+    `tests/common/toy.rs` is the toy market-data venue later runtime tests reuse (and
+    `fbc-sim`'s, by path).
   - `crates/fbc-book` (it depends on `fbc-core` only: one tick-indexed L2 book per
     instrument and `BookId`, built from book events the same live and in replay, with
     snapshots, deltas, windows and gap invalidation, touch, top-n, one level's size where it is
@@ -323,8 +332,9 @@ rather than guess.
     shard's total order under the class the consumer picks; 0101), and the ingest sequence of a
     consumer input the shard stamped in version 9 (0103), whose reader still reads version 2 to
     8 journals), `crates/fbc-sim` (simulated venue and queue-position
-    fill-model code, never calibrations; it depends on `fbc-core` and `fbc-book` only: so far
-    `QueueModel`, each modelled order's place in its level's queue under a `Bracket`
+    fill-model code, never calibrations; it depends on `fbc-core`, `fbc-book` and
+    `fbc-runtime` (for the in-process stream's peer, 0104; the runtime never depends on it): so
+    far `QueueModel`, each modelled order's place in its level's queue under a `Bracket`
     (Pessimistic, Middle, Optimistic) from a `QueueConfig` with no `Default`, queued on arrival
     behind its level on the public book less every modelled public order, an RPI order also
     behind public size that joins later, advanced by level cancels per bracket and filled by
@@ -338,7 +348,11 @@ rather than guess.
     P&L and funding on fills where it declares them and derived fills as order updates, 0050;
     crossing orders meeting SimVenue's own resting orders under the stood-in venue's
     `stp_scope` and depleting the displayed levels they take until the book's next event
-    there, 0051;
+    there, 0051; `SimPeer`, the venue end of the runtime's in-process order-entry stream over
+    one engine, greeting each opened stream with a frame the codec reports as authenticated,
+    counting what the engine refuses, and gapping the engine's books on each market-data
+    epoch's end (`SimEngine::end_epoch`), one per bracket, 0104 (`tests/hosted.rs`, with
+    `fbc-oms` and the runtime's toy market-data venue by path);
     still planned: amends, batches, queries and injected
     orders, FBC-nv2), `crates/fbc-conformance` (the adapter conformance kit,
     0025; it depends on `fbc-runtime`, `fbc-oms`, `fbc-journal` and `fbc-core`, never on a

@@ -9,10 +9,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use fbc_book::{BookError, Books, L2Book};
 use fbc_core::{
     AccountKey, AckModel, Aggressor, AmendCaps, AmendQty, AssetSym, BookId, BookSide,
-    CancelOnDisconnect, CancelReason, Channel, ClientIdFormat, ClientOrderId, Envelope, FeeBook,
-    FeeKey, FillSource, InstrumentId, Liquidity, Lots, MdEvent, MonoNs, NotAmendable, Side,
-    SpecTable, StpScope, TerminalHint, Ticks, TifTag, VenueFeeSign, VenueOrderId, WallNs,
-    encode_cid,
+    CancelOnDisconnect, CancelReason, Channel, ClientIdFormat, ClientOrderId, ConnKey, Envelope,
+    FeeBook, FeeKey, Feed, FeedHealth, FillSource, InstrumentId, Liquidity, Lots, MdEvent, MonoNs,
+    NotAmendable, Side, SpecTable, StpScope, TerminalHint, Ticks, TifTag, VenueFeeSign,
+    VenueOrderId, WallNs, encode_cid,
 };
 
 use crate::config::{SimConfig, SimLatency};
@@ -405,6 +405,8 @@ pub struct SimEngine {
     /// Whether the stood-in venue sends fills of their own; otherwise its order updates carry
     /// them (decision 0050).
     native_fills: bool,
+    /// The market-data connection epoch of the last event about each book (decision 0039).
+    fed: BTreeMap<(InstrumentId, BookId), ConnKey>,
     out: Vec<Answer>,
     frames: u64,
     orders: u64,
@@ -450,6 +452,7 @@ impl SimEngine {
             prevents_self_trade: config.matching.stp_scope != StpScope::None,
             positions: BTreeMap::new(),
             native_fills: config.exec.fills.source == FillSource::Native,
+            fed: BTreeMap::new(),
             out: Vec::new(),
             frames: 0,
             orders: 0,
@@ -480,6 +483,9 @@ impl SimEngine {
     /// fills resting orders. Refused when the book refuses the event.
     pub fn on_market(&mut self, env: &Envelope<MdEvent>) -> Result<(), SimError> {
         self.advance(env.stamp.recv_mono);
+        if let Some(book) = book_of(&env.body) {
+            self.fed.insert(book, env.stamp.conn);
+        }
         let at = At {
             mono: env.stamp.recv_mono,
             wall: env.stamp.recv_wall,
@@ -537,6 +543,37 @@ impl SimEngine {
                 self.lapse(due);
             }
         }
+    }
+
+    /// The earliest instant at which [`advance`](SimEngine::advance) would act: a command
+    /// arriving at the venue, a placement's second phase, or a dead-man timer's lapse. `None`
+    /// while nothing waits on time; once `advance` has run to `now`, `None` or later than it.
+    pub fn next_due(&self) -> Option<MonoNs> {
+        let command = self.in_flight.keys().next().map(|&(mono, _)| mono);
+        let settle = self.settles.keys().next().map(|&(mono, _)| mono);
+        let lapse = self.dead_man.map(|due| due.mono);
+        [command, settle, lapse].into_iter().flatten().min()
+    }
+
+    /// Market-data connection epoch `ended` ended, as the runtime's books are told (FBC-crh,
+    /// decision 0039): every book of the engine's last fed by it, or by an earlier epoch of its
+    /// connection, is invalidated as a gap until its next complete snapshot, so no order
+    /// crosses or rests on it meanwhile (each is refused as one its book cannot place). A book
+    /// another connection, or a later epoch, fed last is untouched. Returns how many books it
+    /// invalidated.
+    pub fn end_epoch(&mut self, ended: ConnKey) -> usize {
+        let mut invalidated = 0;
+        for (&(inst, book), &from) in &self.fed {
+            let exists = self.books.get(inst, book).is_some();
+            if exists && from.conn == ended.conn && from.epoch <= ended.epoch {
+                let h = FeedHealth::Gap;
+                let feed = Feed::Book(book);
+                // A gap on a book that exists is never refused.
+                let _ = self.books.apply(&MdEvent::Health { inst, feed, h });
+                invalidated += 1;
+            }
+        }
+        invalidated
     }
 
     /// Configures the stood-in venue's risk check to refuse, as `refusal`, the placement whose
@@ -2089,4 +2126,20 @@ fn due(at: At, ttl: Duration) -> At {
 fn after(wall: WallNs, d: Duration) -> WallNs {
     let nanos = i64::try_from(d.as_nanos()).unwrap_or(i64::MAX);
     WallNs(wall.0.saturating_add(nanos))
+}
+
+/// The book an event is about, if it is about one.
+fn book_of(ev: &MdEvent) -> Option<(InstrumentId, BookId)> {
+    match *ev {
+        MdEvent::BookSnapshotBegin { inst, book, .. }
+        | MdEvent::BookSnapshotEnd { inst, book }
+        | MdEvent::Level { inst, book, .. }
+        | MdEvent::Window { inst, book, .. }
+        | MdEvent::Health {
+            inst,
+            feed: Feed::Book(book),
+            ..
+        } => Some((inst, book)),
+        _ => None,
+    }
 }

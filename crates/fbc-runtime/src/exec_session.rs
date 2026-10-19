@@ -164,6 +164,11 @@
 //! its market is `NotSent(Disconnected)`, counted ([`ExecCounters::unprotected_refusals`]), with
 //! no nonce reserved and nothing written ([`ExecOrders::may_place_on`]). Other markets place.
 //!
+//! **An in-process stream (FBC-6mf, decision 0104).** [`ExecSession::in_process`] builds the
+//! same session over an [`InProcessStream`] with a codec of the consumer's: each epoch opens the
+//! stream in place of the planned URL, writes go to its peer, and the peer's answers are read
+//! at their due instants as frames off a socket are; everything above is unchanged.
+//!
 //! One thread drives a session (design §5.1): [`ExecSession::run`] spawns no task.
 
 use std::fmt;
@@ -185,6 +190,7 @@ use crate::connector::Connector;
 use crate::epoch::{Admit, EpochError, Epochs, Input};
 use crate::exec_gate::Hold;
 use crate::exec_orders::{ExecOrders, Queued, RpcIds, Rpcs, Shared, Submitted};
+use crate::in_process::{InProcessStream, Link};
 use crate::journal::Journal;
 use crate::pacing::ReconnectPacing;
 use crate::ratelimit::{RateError, RateLimiter, Refused, Request};
@@ -193,8 +199,9 @@ use crate::session_core::{
     Answered, Control, Core, CoreConfig, EpochInputs, IngestClock, TickToWire, close, frame_of,
     http_of, next_frame, sleep_or_never, with_response,
 };
+use crate::session_core::{Dial, Wire};
 use crate::stall::WriteStall;
-use crate::ws::{self, Message, WebSocket};
+use crate::ws::{self, Message};
 
 /// Where the consumer receives an order-entry session's events: called once per event, in
 /// ingest order, on the thread that drives the session, before the next frame is read
@@ -434,6 +441,8 @@ pub struct ExecSession<H: ExecHandler> {
     codec: Box<dyn ExecCodec>,
     stream: StreamId,
     url: String,
+    /// The in-process stream the session opens in place of `url` (decision 0104).
+    in_process: Option<InProcessStream>,
     caps: VenueCaps,
     ns: Namespace,
     specs: SpecTable,
@@ -492,6 +501,32 @@ impl<H: ExecHandler> Drop for ExecSession<H> {
     }
 }
 
+/// Where a session's order entry goes: the venue's planned WebSocket, or an in-process stream
+/// with a codec of the consumer's (decision 0104).
+enum Entry {
+    Socket,
+    InProcess(Box<dyn ExecCodec>, InProcessStream),
+}
+
+/// How each connection attempt opens the session's connection: its in-process stream when it
+/// has one, which opens at once, or the WebSocket at its URL.
+struct ExecDial<'a> {
+    url: &'a str,
+    in_process: Option<&'a InProcessStream>,
+    clock: &'a IngestClock,
+}
+
+impl Dial for ExecDial<'_> {
+    type Wire = Link;
+
+    async fn dial(&mut self, connector: &Connector) -> Option<Link> {
+        match self.in_process {
+            Some(stream) => Some(Link::open(stream, self.clock)),
+            None => connector.websocket(self.url).await.ok().map(Link::Socket),
+        }
+    }
+}
+
 /// How a connected epoch ended.
 enum End {
     Stop,
@@ -541,6 +576,31 @@ impl<H: ExecHandler> ExecSession<H> {
         config: ExecSessionConfig,
         handler: H,
     ) -> Result<(ExecSession<H>, ExecControl), ExecSessionError> {
+        ExecSession::build(config, Entry::Socket, handler)
+    }
+
+    /// A session over the in-process stream `stream` in place of the venue's planned
+    /// order-entry connection (FBC-6mf, decision 0104), with `codec` as its one codec in place
+    /// of the venue's: a simulated venue's, for one that stands in for it. Everything else is
+    /// as [`ExecSession::new`] builds it, from the venue's caps and plan: the planned endpoint
+    /// names the stream the session's frames go on, which `codec` must write on, but its URL is
+    /// never opened, and `config.creds` are dropped unread. An HTTP request the codec asks for
+    /// still goes through `config.connector`. Refused when the venue takes no orders or plans
+    /// other than one order-entry connection.
+    pub fn in_process(
+        config: ExecSessionConfig,
+        codec: Box<dyn ExecCodec>,
+        stream: InProcessStream,
+        handler: H,
+    ) -> Result<(ExecSession<H>, ExecControl), ExecSessionError> {
+        ExecSession::build(config, Entry::InProcess(codec, stream), handler)
+    }
+
+    fn build(
+        config: ExecSessionConfig,
+        entry: Entry,
+        handler: H,
+    ) -> Result<(ExecSession<H>, ExecControl), ExecSessionError> {
         let (venue, cfg) = (config.venue, &config.cfg);
         let caps = venue.caps(cfg).map_err(SessionError::Config)?;
         let Some(exec) = &caps.exec else {
@@ -561,10 +621,15 @@ impl<H: ExecHandler> ExecSession<H> {
             (Some(endpoint), 0) => endpoint,
             (last, n) => return Err(ExecSessionError::Endpoints(n + usize::from(last.is_some()))),
         };
-        ws::check_url(endpoint.url.as_str()).map_err(SessionError::Url)?;
-        let codec = venue.exec_codec(cfg, config.creds);
-        let codec = codec.ok_or(ExecSessionError::NoOrderEntry)?;
-        let codec = codec.map_err(ExecSessionError::Venue)?;
+        let (codec, in_process) = match entry {
+            Entry::Socket => {
+                ws::check_url(endpoint.url.as_str()).map_err(SessionError::Url)?;
+                let codec = venue.exec_codec(cfg, config.creds);
+                let codec = codec.ok_or(ExecSessionError::NoOrderEntry)?;
+                (codec.map_err(ExecSessionError::Venue)?, None)
+            }
+            Entry::InProcess(codec, stream) => (codec, Some(stream)),
+        };
         let (stop_tx, stop) = watch::channel(());
         let clock = config.clock.clone();
         let mut core = Core::new(CoreConfig {
@@ -589,6 +654,7 @@ impl<H: ExecHandler> ExecSession<H> {
             codec,
             stream: endpoint.stream,
             url: endpoint.url.as_str().to_owned(),
+            in_process,
             caps,
             ns: config.ns,
             specs: config.specs,
@@ -699,7 +765,12 @@ impl<H: ExecHandler> ExecSession<H> {
                 rec: &self.rec,
                 key: self.core.current(),
             };
-            let Some(ws) = self.core.connect(&self.url, &mut ctl).await? else {
+            let mut dial = ExecDial {
+                url: &self.url,
+                in_process: self.in_process.as_ref(),
+                clock: &self.clock,
+            };
+            let Some(ws) = self.core.connect_with(&mut dial, &mut ctl).await? else {
                 return Ok(());
             };
             let key = self.current();
@@ -753,7 +824,7 @@ impl<H: ExecHandler> ExecSession<H> {
 
     /// One epoch on the open socket `ws`, until it drops or the session stops; the handler is
     /// told it ended either way.
-    async fn connected(&mut self, ws: WebSocket) -> Result<End, ExecSessionError> {
+    async fn connected(&mut self, ws: Link) -> Result<End, ExecSessionError> {
         let key = self.current();
         self.core.control(|| ControlEvent::Opened(key));
         let end = self.epoch(ws, key).await;
@@ -772,7 +843,7 @@ impl<H: ExecHandler> ExecSession<H> {
     }
 
     /// The epoch `key`, opened on `ws`.
-    async fn epoch(&mut self, ws: WebSocket, key: ConnKey) -> Result<End, ExecSessionError> {
+    async fn epoch(&mut self, ws: Link, key: ConnKey) -> Result<End, ExecSessionError> {
         let mut ws = Some(ws);
         // A control that dropped as the connection opened stops the session before the codec
         // is told of it, so nothing is reserved or sent.
@@ -795,7 +866,7 @@ impl<H: ExecHandler> ExecSession<H> {
                 _ = self.core.stop.changed() => Wake::Stop,
             };
             // The kernel receive time of the last packet read beneath the frame, if any.
-            let rx = ws.as_ref().and_then(|ws| ws.get_ref().kernel_rx());
+            let rx = ws.as_ref().and_then(Wire::kernel_rx);
             open = match wake {
                 // What woke as the control dropped is stamped, so it keeps its place in ingest
                 // order, but reaches no codec; so does a frame waiting then. The epoch is
@@ -905,7 +976,7 @@ impl<H: ExecHandler> ExecSession<H> {
     /// cannot make) stays charged. False when the epoch ended.
     async fn execute_together(
         &mut self,
-        ws: &mut Option<WebSocket>,
+        ws: &mut Option<Link>,
         key: ConnKey,
         mut fx: Effects,
         never: ExecSessionError,
@@ -960,7 +1031,7 @@ impl<H: ExecHandler> ExecSession<H> {
     /// ends the session. False when the epoch ended.
     async fn execute(
         &mut self,
-        ws: &mut Option<WebSocket>,
+        ws: &mut Option<Link>,
         fx: Effects,
         charged: bool,
         origin: Option<Stamp>,
@@ -979,7 +1050,7 @@ impl<H: ExecHandler> ExecSession<H> {
     /// submitted, if one was (decision 0100). False when the epoch ended.
     async fn execute_charged(
         &mut self,
-        ws: &mut Option<WebSocket>,
+        ws: &mut Option<Link>,
         fx: Effects,
         origin: Option<Stamp>,
     ) -> Result<bool, ExecSessionError> {
@@ -994,7 +1065,7 @@ impl<H: ExecHandler> ExecSession<H> {
     /// Fires the earliest timer, which is due: an ended epoch's into nothing (dropped and
     /// counted), the current epoch's into the codec's `on_timer`, and its effects executed.
     /// False when the epoch ended.
-    async fn fire(&mut self, ws: &mut Option<WebSocket>) -> Result<bool, ExecSessionError> {
+    async fn fire(&mut self, ws: &mut Option<Link>) -> Result<bool, ExecSessionError> {
         let Some((stamp, tag)) = self.core.take_timer()? else {
             return Ok(true);
         };
@@ -1009,7 +1080,7 @@ impl<H: ExecHandler> ExecSession<H> {
     /// False when the epoch ended.
     async fn answer(
         &mut self,
-        ws: &mut Option<WebSocket>,
+        ws: &mut Option<Link>,
         done: Answered,
     ) -> Result<bool, ExecSessionError> {
         let codec = &self.codec;
@@ -1027,7 +1098,7 @@ impl<H: ExecHandler> ExecSession<H> {
     /// each keeps its place in ingest order; none reaches the codec.
     fn take_stopped(
         &mut self,
-        ws: &mut Option<WebSocket>,
+        ws: &mut Option<Link>,
         key: ConnKey,
         rx: Option<KernelRxNs>,
         wake: Wake,
@@ -1064,7 +1135,7 @@ impl<H: ExecHandler> ExecSession<H> {
     /// Reviewer B B5). False when the epoch ended.
     async fn send_queued(
         &mut self,
-        ws: &mut Option<WebSocket>,
+        ws: &mut Option<Link>,
         key: ConnKey,
     ) -> Result<bool, ExecSessionError> {
         let mut open = true;
@@ -1092,7 +1163,7 @@ impl<H: ExecHandler> ExecSession<H> {
     /// of it (the module docs say how). False when the epoch ended.
     async fn send(
         &mut self,
-        ws: &mut Option<WebSocket>,
+        ws: &mut Option<Link>,
         key: ConnKey,
         queued: Queued,
     ) -> Result<bool, ExecSessionError> {
@@ -1232,7 +1303,7 @@ impl<H: ExecHandler> ExecSession<H> {
     /// codec's resync, as each is due (decision 0058). False when the epoch ended.
     async fn prepare(
         &mut self,
-        ws: &mut Option<WebSocket>,
+        ws: &mut Option<Link>,
         key: ConnKey,
     ) -> Result<bool, ExecSessionError> {
         let epoch = key.epoch;
@@ -1258,11 +1329,7 @@ impl<H: ExecHandler> ExecSession<H> {
     /// would admit it, as for `on_open` and the resync; frames that can never fit end the
     /// session with [`ExecSessionError::ArmNeverFits`] (PR #90 Reviewer B B3). False when the
     /// epoch ended.
-    async fn arm(
-        &mut self,
-        ws: &mut Option<WebSocket>,
-        key: ConnKey,
-    ) -> Result<bool, ExecSessionError> {
+    async fn arm(&mut self, ws: &mut Option<Link>, key: ConnKey) -> Result<bool, ExecSessionError> {
         let rpc = self.orders.next_rpc();
         let cmd = VenueCommand::ArmCancelOnDisconnect(true);
         // The session's own arm, one per epoch, may use the safety reserve (decision 0073).
@@ -1286,7 +1353,7 @@ impl<H: ExecHandler> ExecSession<H> {
     /// charged together. False when the epoch ended.
     async fn resync(
         &mut self,
-        ws: &mut Option<WebSocket>,
+        ws: &mut Option<Link>,
         key: ConnKey,
     ) -> Result<bool, ExecSessionError> {
         let (call, rec, clock) = (CtxCall::Resync, &self.rec, &self.clock);

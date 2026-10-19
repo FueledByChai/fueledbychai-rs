@@ -770,13 +770,26 @@ struct Hand {
     seq: u64,
 }
 
-/// Every envelope the consumer's handler was handed.
+/// Every envelope the consumer's handler was handed, the epoch ends and the tick-to-wire
+/// samples it was told.
 #[derive(Default)]
-struct Kept(Vec<Envelope<MdEvent>>);
+struct Kept(
+    Vec<Envelope<MdEvent>>,
+    Vec<ConnKey>,
+    Vec<fbc_runtime::TickToWire>,
+);
 
 impl MdHandler for Kept {
     fn on_md(&mut self, env: Envelope<MdEvent>) {
         self.0.push(env);
+    }
+
+    fn on_epoch_end(&mut self, key: ConnKey) {
+        self.1.push(key);
+    }
+
+    fn on_tick_to_wire(&mut self, sample: fbc_runtime::TickToWire) {
+        self.2.push(sample);
     }
 }
 
@@ -784,6 +797,7 @@ impl Hand {
     fn new() -> Hand {
         let peer = Rc::new(RefCell::new(SimPeer::new(&sim_config(2))));
         let stream = InProcessStream::new(Rc::clone(&peer));
+        assert_eq!(format!("{stream:?}"), "InProcessStream");
         Hand {
             peer,
             feed: PeerFeed::new(vec![stream], Kept::default()),
@@ -955,8 +969,17 @@ fn a_dropped_market_data_connection_invalidates_the_engines_books_until_the_next
     hand.cross(&mut codec, 4, 41 * MS);
     let again = hand.answers(&mut codec, 49 * MS);
     assert!(filled(&again), "{again:?}");
-    // The consumer's handler saw every envelope the feed was handed.
+    // The consumer's handler saw every envelope and epoch end the feed was handed, and what
+    // else its session tells it.
     assert_eq!(hand.feed.handler().0.len(), 9);
+    assert_eq!(hand.feed.handler().1, [other, first]);
+    let sample = fbc_runtime::TickToWire {
+        stream: toy::STREAM,
+        frame: hand.feed.handler().0[0].stamp,
+        nanos: 7,
+    };
+    hand.feed.on_tick_to_wire(sample);
+    assert_eq!(hand.feed.handler().2, [sample]);
     assert_eq!(hand.peer.borrow().counters(), PeerCounters::default());
 }
 

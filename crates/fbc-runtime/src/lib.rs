@@ -88,6 +88,13 @@
 //! command at a time, polling every session between two, so a command a handler submits
 //! meanwhile goes ahead of the ladder's remaining ones and waits for at most the one in progress.
 //!
+//! [`ExecSession::in_process`] runs an order-entry session over an [`InProcessStream`] in place
+//! of the venue's planned WebSocket (FBC-6mf, decision 0104): no socket opens, and the stream's
+//! [`OrderEntryPeer`] (SimVenue's, in `fbc-sim`) receives the frames the codec writes and,
+//! through a [`PeerFeed`] in front of the consumer's market-data handler, the shard's envelopes
+//! in ingest order, and answers with frames the session reads at their due instants, stamped and
+//! journaled like any other.
+//!
 //! [`ConsumerInputs`] carries the consumer's own inputs into the shard (FBC-hvqi, decision
 //! 0103): a bounded ring its other threads push operator commands and reloads into, which
 //! refuses and counts a push when full and never blocks, and the timers its handlers arm
@@ -109,6 +116,7 @@ mod exec_gate;
 mod exec_orders;
 mod exec_session;
 pub mod http;
+mod in_process;
 mod inputs;
 mod journal;
 mod liveness;
@@ -156,6 +164,7 @@ pub use exec_orders::{ExecOrders, RpcIds, SubmitRefusal};
 pub use exec_session::{
     ExecControl, ExecCounters, ExecHandler, ExecSession, ExecSessionConfig, ExecSessionError,
 };
+pub use in_process::{InProcessStream, OrderEntryPeer, PeerFeed};
 pub use inputs::{
     ArmRefusal, ConsumerInput, ConsumerInputs, ConsumerInputsConfig, ConsumerTimers, InputCounters,
     InputHandler, InputRefusal, InputSender, InputsError, MAX_INPUT_CAPACITY,
