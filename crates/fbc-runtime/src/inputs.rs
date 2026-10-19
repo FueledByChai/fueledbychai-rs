@@ -343,6 +343,12 @@ pub struct InputCounters {
 /// The shard's side of the consumer's inputs: the ring's receiving end and the timers it fires,
 /// driven by [`ConsumerInputs::run`] (the module docs say how).
 pub struct ConsumerInputs<H> {
+    ring: Ring,
+    handler: H,
+}
+
+/// What a [`ConsumerInputs`] holds besides its handler, run without knowing its type.
+struct Ring {
     clock: IngestClock,
     rx: mpsc::Receiver<Pushed>,
     /// Whether every sender has dropped, the ring emptied.
@@ -350,22 +356,13 @@ pub struct ConsumerInputs<H> {
     timers: ConsumerTimers,
     journal: Option<Journal>,
     counters: InputCounters,
-    handler: H,
 }
 
 impl<H> fmt::Debug for ConsumerInputs<H> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConsumerInputs")
-            .field("counters", &self.counters)
+            .field("counters", &self.ring.counters)
             .finish_non_exhaustive()
-    }
-}
-
-impl<H> ConsumerInputs<H> {
-    /// Ends the inputs: the ring refuses every push from now on, and the timers arm nothing.
-    fn end(&mut self) {
-        self.rx.close();
-        self.timers.end();
     }
 }
 
@@ -375,6 +372,30 @@ impl<H: InputHandler> ConsumerInputs<H> {
         config: ConsumerInputsConfig,
         handler: H,
     ) -> Result<(ConsumerInputs<H>, InputSender), InputsError> {
+        let (ring, sender) = Ring::new(config)?;
+        Ok((ConsumerInputs { ring, handler }, sender))
+    }
+
+    /// Journals every input into `journal` from now on (0006).
+    pub fn set_journal(&mut self, journal: Journal) {
+        self.ring.journal = Some(journal);
+    }
+
+    pub fn counters(&self) -> InputCounters {
+        self.ring.counters
+    }
+
+    /// Takes every input as it comes, stamped, journaled and handed to the handler, until every
+    /// sender has dropped and no timer is pending. Once it returns, or is dropped, the ring
+    /// refuses every push and the timers arm nothing.
+    pub async fn run(&mut self) {
+        let ConsumerInputs { ring, handler } = self;
+        ring.run(handler).await;
+    }
+}
+
+impl Ring {
+    fn new(config: ConsumerInputsConfig) -> Result<(Ring, InputSender), InputsError> {
         let ConsumerInputsConfig {
             clock,
             capacity,
@@ -384,57 +405,56 @@ impl<H: InputHandler> ConsumerInputs<H> {
             return Err(InputsError::Capacity(capacity));
         }
         let (tx, rx) = mpsc::channel(capacity);
-        let inputs = ConsumerInputs {
+        let ring = Ring {
             clock,
             rx,
             closed: false,
             timers,
             journal: None,
             counters: InputCounters::default(),
-            handler,
         };
         let sender = InputSender {
             tx,
             refused: Arc::new(AtomicU64::new(0)),
         };
-        Ok((inputs, sender))
+        Ok((ring, sender))
     }
 
-    /// Journals every input into `journal` from now on (0006).
-    pub fn set_journal(&mut self, journal: Journal) {
-        self.journal = Some(journal);
-    }
-
-    pub fn counters(&self) -> InputCounters {
-        self.counters
-    }
-
-    /// Takes every input as it comes, stamped, journaled and handed to the handler, until every
-    /// sender has dropped and no timer is pending. Once it returns, or is dropped, the ring
-    /// refuses every push and the timers arm nothing.
-    pub async fn run(&mut self) {
+    /// [`ConsumerInputs::run`], handing each input to `handler`.
+    async fn run(&mut self, handler: &mut dyn InputHandler) {
         let ending = Ending(self);
         let mut sleep = None;
-        let inputs = &mut *ending.0;
-        poll_fn(|cx| inputs.poll_run(cx, &mut sleep)).await;
+        let ring = &mut *ending.0;
+        poll_fn(|cx| ring.poll_run(handler, cx, &mut sleep)).await;
+    }
+
+    /// Ends the inputs: the ring refuses every push from now on, and the timers arm nothing.
+    fn end(&mut self) {
+        self.rx.close();
+        self.timers.end();
     }
 
     /// Takes what is ready: a timer due that was armed before this poll began (so a handler
     /// that re-arms at once yields between firings), else what waits in the ring, until neither
     /// is; ready once the ring has closed and no timer is pending.
-    fn poll_run(&mut self, cx: &mut Context<'_>, sleep: &mut Option<Pin<Box<Sleep>>>) -> Poll<()> {
+    fn poll_run(
+        &mut self,
+        handler: &mut dyn InputHandler,
+        cx: &mut Context<'_>,
+        sleep: &mut Option<Pin<Box<Sleep>>>,
+    ) -> Poll<()> {
         let horizon = self.timers.horizon();
         loop {
             if let Some(fired) = self.timers.take_due(Instant::now(), horizon) {
                 self.counters.fired += 1;
-                self.take(fired);
+                self.take(handler, fired);
                 continue;
             }
             if !self.closed {
                 match self.rx.poll_recv(cx) {
                     Poll::Ready(Some(pushed)) => {
                         self.counters.pushed += 1;
-                        self.take(pushed);
+                        self.take(handler, pushed);
                         continue;
                     }
                     Poll::Ready(None) => self.closed = true,
@@ -455,8 +475,8 @@ impl<H: InputHandler> ConsumerInputs<H> {
     }
 
     /// Stamps `input` with the next ingest sequence, journals it as an input consumer record
-    /// under its class, then hands it to the handler.
-    fn take(&mut self, input: Pushed) {
+    /// under its class, then hands it to `handler`.
+    fn take(&mut self, handler: &mut dyn InputHandler, input: Pushed) {
         let Pushed { class, kind, bytes } = input;
         let (ingest_seq, at, wall) = self.clock.tick();
         if let Some(journal) = &self.journal {
@@ -470,7 +490,7 @@ impl<H: InputHandler> ConsumerInputs<H> {
             };
             journal.record(class, wall, &record);
         }
-        self.handler.on_input(ConsumerInput {
+        handler.on_input(ConsumerInput {
             ingest_seq,
             at,
             kind,
@@ -492,10 +512,10 @@ fn wait_until(
     wait.as_mut().poll(cx)
 }
 
-/// A run that returns, or is dropped, ends the inputs ([`ConsumerInputs::end`]).
-struct Ending<'a, H>(&'a mut ConsumerInputs<H>);
+/// A run that returns, or is dropped, ends the inputs ([`Ring::end`]).
+struct Ending<'a>(&'a mut Ring);
 
-impl<H> Drop for Ending<'_, H> {
+impl Drop for Ending<'_> {
     fn drop(&mut self) {
         self.0.end();
     }
@@ -595,7 +615,7 @@ mod tests {
     async fn the_run_hands_on_what_was_pushed_in_order_and_ends_once_every_sender_dropped() {
         let (timers, seen) = (ConsumerTimers::new(), Seen::default());
         let (mut inputs, sender) = inputs(4, &timers, &seen);
-        let clock = inputs.clock.clone();
+        let clock = inputs.ring.clock.clone();
         clock.tick();
         let other = sender.clone();
         sender
