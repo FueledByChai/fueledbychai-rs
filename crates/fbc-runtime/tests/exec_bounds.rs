@@ -36,7 +36,7 @@ use fbc_core::{
     WireSlice,
 };
 use fbc_journal::{JournalSink, Record, Recorded, WriteRes};
-use fbc_oms::{Authorization, CancelChoice, OrderOp};
+use fbc_oms::{Authorization, CancelChoice, OrderOp, PermitRefusal};
 use fbc_runtime::{
     ExecHandler, ExecOrders, ExecSession, InFlight, Journal, ReservedBound, SubmitRefusal,
 };
@@ -347,20 +347,29 @@ async fn written(peer: &mut Peer, kind: &str, rpc: RpcId) {
     assert!(frame.starts_with(&head), "{frame} is not {head}");
 }
 
-/// The write results the session journaled for refusals, which name no request (the frames the
-/// codec writes of its own name none either, but were written): each with its class and epoch.
-fn refusals(journal: &Rc<RefCell<Kept>>) -> Vec<(TrafficClass, ConnKey, WriteRes)> {
+/// The write results the session journaled for submissions refused for want of room in the
+/// queue, each naming the request id the refusal gave (Codex P1 r4312949568 on PR #174): each
+/// with its class, epoch and request.
+fn refusals(journal: &Rc<RefCell<Kept>>) -> Vec<(TrafficClass, ConnKey, RpcId)> {
     let journal = journal.borrow();
     let results = journal.0.iter().filter_map(|(class, record)| match record {
         Record::WriteResult {
-            rpc: None,
+            rpc,
             conn,
-            result: result @ WriteRes::NotSent(_),
+            result: WriteRes::NotSent(NotSentReason::Backpressure),
             ..
-        } => Some((*class, *conn, *result)),
+        } => Some((*class, *conn, rpc.expect("a refusal names its request"))),
         _ => None,
     });
     results.collect()
+}
+
+/// The request id a submission refused for want of room in the queue was given.
+fn backpressured(refused: Result<RpcId, SubmitRefusal>) -> RpcId {
+    match refused {
+        Err(SubmitRefusal::Backpressure { rpc }) => rpc,
+        other => panic!("{other:?} is not refused for backpressure"),
+    }
 }
 
 /// Whether the session journaled an outbound frame for request `rpc`.
@@ -421,10 +430,9 @@ async fn a_normal_command_past_the_outbound_bound_is_not_sent_backpressure_while
         let (first, second) = (oms.place(), oms.place());
         let first = orders.submit(first).unwrap();
         let second = orders.submit(second).unwrap();
-        let backpressure = Err(SubmitRefusal::Backpressure);
-        assert_eq!(orders.submit(oms.place()), backpressure);
+        let refused_place = backpressured(orders.submit(oms.place()));
         let cancelled = orders.submit(oms.cancel()).unwrap();
-        assert_eq!(orders.submit(cancel(&mut oms, other)), backpressure);
+        let refused_cancel = backpressured(orders.submit(cancel(&mut oms, other)));
         churn().await;
         // The write still waits: no command has had its turn.
         assert!(handles.borrow().is_empty(), "{:?}", handles.borrow());
@@ -440,19 +448,20 @@ async fn a_normal_command_past_the_outbound_bound_is_not_sent_backpressure_while
         churn().await;
         assert!(peer.quiet());
         drop(control);
+        (refused_place, refused_cancel)
     };
-    let (run, ()) = tokio::join!(session.run(), script);
+    let (run, (refused_place, refused_cancel)) = tokio::join!(session.run(), script);
     run.unwrap();
     drop(thaw);
     let epoch = session_epoch(&journal);
-    // Each refusal journaled once as its write result, under its class, on the epoch it was
-    // refused in; neither refused command was written or reported.
-    let refused = WriteRes::NotSent(NotSentReason::Backpressure);
+    // Each refusal journaled once as its write result, under its class and request id, on the
+    // epoch it was refused in; neither refused command was written or reported.
     let journaled = [
-        (TrafficClass::Normal, epoch, refused),
-        (TrafficClass::Safety, epoch, refused),
+        (TrafficClass::Normal, epoch, refused_place),
+        (TrafficClass::Safety, epoch, refused_cancel),
     ];
     assert_eq!(refusals(&journal), journaled);
+    assert!(!wrote(&journal, refused_place) && !wrote(&journal, refused_cancel));
     assert_eq!(handles.borrow().len(), 3);
     assert_eq!(session.counters().backpressure_refusals, 2);
     assert_eq!(session.counters().in_flight_refusals, 0);
@@ -559,21 +568,17 @@ async fn a_submission_past_the_bound_while_the_session_connects_is_refused_and_j
         let handles = watch;
         let fees = || fbc_oms::ControlCommand::FeeQuery;
         let queried = orders.submit_control(fees()).unwrap();
-        let past = orders.submit_control(fees());
-        assert_eq!(past, Err(SubmitRefusal::Backpressure));
+        let past = backpressured(orders.submit_control(fees()));
         let disconnected = Err(NotSentReason::Disconnected);
         assert_eq!(outcome(&handles, queried).await, disconnected);
         drop(control);
+        past
     };
-    let (run, ()) = tokio::join!(session.run(), script);
+    let (run, past) = tokio::join!(session.run(), script);
     run.unwrap();
     drop(thaw);
-    let refused = WriteRes::NotSent(NotSentReason::Backpressure);
     let waiting = ConnKey { conn: 6, epoch: 0 };
-    assert_eq!(
-        refusals(&journal),
-        [(TrafficClass::Normal, waiting, refused)]
-    );
+    assert_eq!(refusals(&journal), [(TrafficClass::Normal, waiting, past)]);
     assert_eq!(handles.borrow().len(), 1);
     assert_eq!(session.counters().backpressure_refusals, 1);
 }
@@ -599,4 +604,177 @@ async fn an_authorization_for_another_account_takes_no_place_in_the_queue() {
             .is_ok()
     );
     assert_eq!(session.counters().backpressure_refusals, 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review round 2 on PR #174.
+// ---------------------------------------------------------------------------------------------
+
+/// An amend refused for want of room in the queue names the request id it was given (Codex P1
+/// r4312949568 on PR #174), so fbc-oms's reservation of it is settled as for any amend not
+/// sent: `Registry::amend_sent` under that id, then `on_outcome` with `NotSent(Backpressure)`.
+/// Until then the order takes no other amend; after it, it does. The refusal is journaled under
+/// that id, and nothing of it is written or reported.
+#[tokio::test(start_paused = true)]
+async fn an_amend_refused_for_backpressure_names_its_request_and_settles_as_one_not_sent() {
+    let journal = Rc::new(RefCell::new(Kept::default()));
+    let in_flight = InFlight::new(bound(64, 64));
+    let (session, _control, orders, handles, _) =
+        session("ws://127.0.0.1:9/", bound(1, 0), &in_flight, &journal);
+    let mut oms = Oms::armed();
+    let amendable = oms.amendable;
+    orders
+        .submit_control(fbc_oms::ControlCommand::FeeQuery)
+        .unwrap();
+    let rpc = backpressured(orders.submit(oms.amend()));
+    // The amend built holds its order until it is settled.
+    let pending = oms.reg.live(amendable).map(|_| ()).unwrap_err();
+    assert_eq!(pending, PermitRefusal::IntentPending(amendable));
+
+    let (px, qty) = (Ticks(130_855), Lots::new(10).unwrap());
+    assert!(oms.reg.amend_sent(amendable, px, qty, rpc, MonoNs(2_000)).unwrap());
+    let item = ItemRef {
+        idx: 0,
+        cid: Some(amendable),
+        vid: None,
+    };
+    let not_sent = SubmitOutcome::NotSent(NotSentReason::Backpressure);
+    let op = OrderOp::Amend(rpc);
+    let settled = oms.reg.on_outcome(amendable, op, &item, &not_sent, MonoNs(2_000));
+    settled.unwrap();
+    // Settled, the order is amended again.
+    drop(oms.amend());
+
+    let waiting = session.current();
+    assert_eq!(refusals(&journal), [(TrafficClass::Normal, waiting, rpc)]);
+    assert!(!wrote(&journal, rpc));
+    assert!(handles.borrow().is_empty());
+    assert_eq!(session.counters().backpressure_refusals, 1);
+}
+
+/// A run dropped while a request it wrote is still in flight gives that request's place back
+/// to the consumer's table as it drops, though the session is kept (Codex P1 r4312949559 on
+/// PR #174): another session sharing the table, here a run that ended on error and dropped by
+/// a shard host, finds the table as it was. A later run of the session is `Ended`.
+#[tokio::test(start_paused = true)]
+async fn a_run_dropped_with_a_request_in_flight_gives_its_place_back_while_the_session_is_kept()
+ {
+    let thaw = freeze();
+    let mut server = ScriptedWs::start().await;
+    let journal = Rc::new(RefCell::new(Kept::default()));
+    let in_flight = InFlight::new(bound(2, 1));
+    let (mut session, control, orders, handles, events) =
+        session(&server.url(), bound(64, 64), &in_flight, &journal);
+    let mut oms = Oms::armed();
+    let table = in_flight.clone();
+    let script = async move {
+        let mut peer = server.accept().await;
+        armed_and_resynced(&mut peer, &orders, &events).await;
+        let placed = orders.submit(oms.place()).unwrap();
+        written(&mut peer, "place", placed).await;
+        assert_eq!(outcome(&handles, placed).await, Ok(()));
+        assert_eq!(table.held(), 1);
+        peer
+    };
+    let peer = {
+        let run = session.run();
+        tokio::pin!(run);
+        tokio::select! {
+            biased;
+            ran = &mut run => panic!("the run ended first: {ran:?}"),
+            peer = script => peer,
+        }
+    };
+    // The run is dropped, the place unanswered: its place is the table's again.
+    assert_eq!(in_flight.held(), 0);
+    let again = session.run().await;
+    assert!(
+        matches!(again, Err(fbc_runtime::ExecSessionError::Ended)),
+        "{again:?}"
+    );
+    assert_eq!(in_flight.held(), 0);
+    drop((peer, control, thaw));
+}
+
+/// What a handler keeps, and, as each epoch ends, two fee queries it submits through the
+/// session's orders, once it is given them.
+struct SubmitsAtEnd {
+    keep: Keep,
+    orders: Rc<RefCell<Option<ExecOrders>>>,
+    submitted: Rc<RefCell<Vec<Result<RpcId, SubmitRefusal>>>>,
+}
+
+impl ExecHandler for SubmitsAtEnd {
+    fn on_exec(&mut self, env: Envelope<ExecEvent>) {
+        self.keep.on_exec(env);
+    }
+
+    fn on_submitted(&mut self, handle: SubmitHandle) {
+        self.keep.on_submitted(handle);
+    }
+
+    fn on_epoch_end(&mut self, _: ConnKey) {
+        if let Some(orders) = &*self.orders.borrow() {
+            let mut submitted = self.submitted.borrow_mut();
+            for _ in 0..2 {
+                submitted.push(orders.submit_control(fbc_oms::ControlCommand::FeeQuery));
+            }
+        }
+    }
+}
+
+/// A submission refused while the handler is told an epoch that dropped has ended is journaled
+/// under the epoch the session then waits to open, not the one journaled closed before it
+/// (Codex P2 r4312949575 on PR #174): with room for one Normal command, the first fee query
+/// waits and the second is refused.
+#[tokio::test(start_paused = true)]
+async fn a_refusal_made_as_a_dropped_epoch_ends_is_journaled_under_the_epoch_waiting_to_open() {
+    let thaw = freeze();
+    let mut server = ScriptedWs::start().await;
+    let journal = Rc::new(RefCell::new(Kept::default()));
+    let mut config = session_config(&server.url(), &Reserved::default());
+    config.venue = &STALLING;
+    config.outbound = bound(1, 0);
+    let (handles, events) = (Handles::default(), Events::default());
+    let given = Rc::new(RefCell::new(None));
+    let submitted = Rc::new(RefCell::new(Vec::new()));
+    let handler = SubmitsAtEnd {
+        keep: Keep {
+            handles: Rc::clone(&handles),
+            events: Rc::clone(&events),
+        },
+        orders: Rc::clone(&given),
+        submitted: Rc::clone(&submitted),
+    };
+    let (mut session, control) = ExecSession::new(config, handler).unwrap();
+    session.set_journal(Journal::new(Rc::clone(&journal)));
+    let orders = session.orders();
+    *given.borrow_mut() = Some(orders.clone());
+    let ended = Rc::clone(&submitted);
+    let script = async move {
+        let mut peer = server.accept().await;
+        armed_and_resynced(&mut peer, &orders, &events).await;
+        drop(peer);
+        settle(|| ended.borrow().len() == 2).await;
+        drop(control);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    drop(thaw);
+    let submitted = submitted.borrow();
+    assert!(submitted[0].is_ok(), "{submitted:?}");
+    let refused = backpressured(submitted[1]);
+    let closed = journal.borrow().0.iter().find_map(|(_, record)| match record {
+        Record::Control {
+            ev: fbc_journal::ControlEvent::Closed(key),
+            ..
+        } => Some(*key),
+        _ => None,
+    });
+    let closed = closed.expect("the dropped epoch was journaled closed");
+    let waiting = ConnKey {
+        conn: closed.conn,
+        epoch: closed.epoch + 1,
+    };
+    assert_eq!(refusals(&journal), [(TrafficClass::Normal, waiting, refused)]);
 }
