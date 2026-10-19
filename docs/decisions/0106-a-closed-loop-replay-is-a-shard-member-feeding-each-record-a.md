@@ -56,7 +56,8 @@ journal at their ingest positions (0103).
    timers arm through `ConsumerTimers::inert`: each firing the live shard took comes back from
    the journal (0103).
 4. **The end.** Once the records end, the member waits `settle` past the last instant the
-   journal records, of a record fed or passed over (Codex P2 r4315555312), so the answers due by
+   journal records, of a record fed or passed over, an encode context's included (Codex P2
+   r4315555312, r4316220952), so the answers due by
    then are read; yields once, so every member woken at that instant is polled; waits until the
    host has run a decide pass, and taken its ladder, since the last input was stamped (the host
    marks the shard clock after each pass), so what was due at the settle instant is read and
