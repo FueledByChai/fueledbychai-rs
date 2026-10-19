@@ -1558,6 +1558,28 @@ fn passes_and_md(world: &Shared) -> Vec<Option<u64>> {
         .collect()
 }
 
+/// Codex P2 r4316220952 on PR #178: an order-entry encode context the journal ends with is a
+/// recorded instant too, at the time it gave the codec.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn the_settle_time_runs_from_an_encode_context_the_journal_ends_with() {
+    let start = tokio::time::Instant::now();
+    let records = vec![
+        Ok(opened()),
+        Ok(Record::EncodeCtx {
+            rpc: Some(RpcId(4)),
+            ctx: fbc_core::EncodeCtx {
+                wall: WallNs(WALL0 + 50 * 1_000_000),
+                mono: at(50),
+                nonces: fbc_core::NonceBlock::EMPTY,
+            },
+        }),
+    ];
+    let clock = IngestClock::replayed(WallNs(WALL0));
+    let (ran, _, _) = alone(clock, records, ms(5)).await;
+    assert_eq!(ran, Ok(()));
+    assert!(start.elapsed() >= ms(55), "{:?}", start.elapsed());
+}
+
 /// Codex P2 r4315555312 on PR #178: the settle time runs from the last recorded instant of the
 /// journal, a record the replay passes over included.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
