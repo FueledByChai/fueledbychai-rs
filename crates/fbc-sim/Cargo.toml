@@ -12,9 +12,6 @@ publish = false
 fbc-core = { path = "../fbc-core" }
 fbc-book = { path = "../fbc-book" }
 
-# fbc-venue-paradex is test-only: tests/paradex_stand_in.rs builds SimVenue from Paradex's
-# declared caps (FBC-2zxk). scripts/check-deps.sh does not count dev-dependencies.
 [dev-dependencies]
-fbc-venue-paradex = { path = "../venues/fbc-venue-paradex" }
 rust_decimal.workspace = true
 trybuild.workspace = true

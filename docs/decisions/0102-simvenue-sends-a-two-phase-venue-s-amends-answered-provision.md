@@ -48,7 +48,8 @@ amends sent for a two-phase venue that path becomes reachable.
 ## Consequences
 
 - A SimVenue built from Paradex's caps places, amends, cancels, queries, arms cancel-on-disconnect
-  and fills through the codec; FBC-2zxk's test shows it (`tests/paradex_stand_in.rs`).
+  and fills through the codec; FBC-2zxk's test shows it (fbc-venue-paradex's
+  `tests/sim_stand_in.rs`; fbc-sim depends on no venue crate).
 - A consumer over a two-phase SimVenue sees amends as Paradex shows them: provisional, then the
   amended update. Cancels are still answered final at once (FBC-kbwj), and the engine's own
   refusals stay synchronous (FBC-fsqn).
