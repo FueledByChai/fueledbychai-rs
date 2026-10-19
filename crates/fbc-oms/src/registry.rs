@@ -20,6 +20,7 @@ use crate::entry::{Admits, Entries, StateRefusal, TestnetRun};
 use crate::grant::{Counters, Guard, IssueRefusal, Watch};
 use crate::ladder;
 use crate::ledger::AcceptedFill;
+use crate::orphans::Orphans;
 use crate::permit::{
     self, CancelChoice, CancelPlan, Cancellable, DroppedPlaces, Live, PermitRefusal,
     PermittedCommand, PlacePlan, places_of,
@@ -74,6 +75,10 @@ pub struct Registry {
     /// The consumer's audit sink and how many raw order events the registry received
     /// (decision 0005, I8; [`Registry::set_audit_sink`]).
     audit: Audit,
+    /// The orphans resyncs registered, the markets whose adding side they suppress, and our
+    /// client ids live events showed while the registry did not hold them (0005's I7,
+    /// decision 0101; [`Registry::cancel_orphans`]).
+    pub(crate) orphans: Orphans,
 }
 
 /// One registry among every registry the process built: drawn fresh for each.
@@ -183,6 +188,10 @@ pub enum OmsError {
     AccountBound { acct: AccountKey, bound: AccountKey },
     /// A fill moved the market's inventory before its position was seeded.
     PositionMoved(InstrumentId),
+    /// The market's adding side is suppressed for an orphan cooldown (0005's I7, decision
+    /// 0101) and the place or batch item is on `side`, which does not reduce the known,
+    /// non-zero position within its size: it was never built.
+    OrphanCooldown { inst: InstrumentId, side: Side },
 }
 
 impl fmt::Display for OmsError {
@@ -230,6 +239,11 @@ impl fmt::Display for OmsError {
             OmsError::PositionMoved(inst) => write!(
                 f,
                 "a fill moved the inventory on {inst:?} before its position was seeded"
+            ),
+            OmsError::OrphanCooldown { inst, side } => write!(
+                f,
+                "the adding side of {inst:?} is suppressed for an orphan cooldown, and a \
+                 {side:?} order does not reduce its position within its size"
             ),
         }
     }
@@ -387,12 +401,11 @@ impl Registry {
         ending: &[ClientOrderId],
     ) -> Result<(), OmsError> {
         let admits = self.entries.admits(inst).map_err(OmsError::State)?;
-        judge_place(
-            admits,
-            &self.exposure_ending(inst, side, &[], ending),
-            qty,
-            marked,
-        )
+        let exposure = self.exposure_ending(inst, side, &[], ending);
+        if self.orphan_suppressed(&exposure, Adds::placing(qty).exposure) {
+            return Err(OmsError::OrphanCooldown { inst, side });
+        }
+        judge_place(admits, &exposure, qty, marked)
     }
 
     /// Whether our order `cid` would get a Live permit and its amend to `px` and the total
@@ -413,7 +426,8 @@ impl Registry {
         let placed = rec.placed();
         let exposure = self.exposure_ending(placed.inst, placed.side, &[cid], ending);
         let state = self.entries.admits(placed.inst);
-        permit::judge_amend(rec, caps, state, &exposure, px, qty, reducing)
+        let suppressed = self.orphans.cooldown(placed.inst).is_some();
+        permit::judge_amend(rec, caps, (state, suppressed), &exposure, (px, qty, reducing))
             .map(|_| ())
             .map_err(PlanRefusal::Amend)
     }
@@ -537,13 +551,20 @@ impl Registry {
     }
 
     /// The one pre-trade path of a place and a batch item: the market's state first (decision
-    /// 0012), then, in Exit, Exit's admission, then both caps (0013 rule 2).
+    /// 0012), then an orphan cooldown's suppression of the adding side (decision 0101), then,
+    /// in Exit, Exit's admission, then both caps (0013 rule 2).
     fn admit_placement(&self, order: &NewOrder) -> Result<(), OmsError> {
         let admits = self.entries.admits(order.inst).map_err(OmsError::State)?;
         if self.orders.contains_key(&order.cid) {
             return Err(OmsError::DuplicateCid(order.cid));
         }
         let exposure = self.exposure(order.inst, order.side, &[]);
+        if self.orphan_suppressed(&exposure, Adds::placing(order.qty).exposure) {
+            return Err(OmsError::OrphanCooldown {
+                inst: order.inst,
+                side: order.side,
+            });
+        }
         judge_place(admits, &exposure, order.qty, order.reduces())
     }
 
@@ -639,8 +660,11 @@ impl Registry {
             Some(CidMatch::Ours(_)) | None => match u.vid.as_ref().and_then(|v| self.cid_of(v)) {
                 Some(cid) => cid,
                 None => {
-                    if u.cid.is_none() {
-                        self.foreign.update(u);
+                    match u.cid {
+                        // Ours, not held: a live sighting an untrustworthy snapshot's orphan
+                        // needs (0005's I7).
+                        Some(CidMatch::Ours(cid)) => self.orphans.seen_event(cid, &u.state),
+                        _ => self.foreign.update(u),
                     }
                     return Routed::Untracked;
                 }
@@ -789,7 +813,11 @@ impl Registry {
                 }
                 FillRouted::Ours(cid, applied)
             }
-            _ => FillRouted::OursUntracked(ours),
+            _ => {
+                // A live sighting an untrustworthy snapshot's orphan needs (0005's I7).
+                self.orphans.seen_fill(ours);
+                FillRouted::OursUntracked(ours)
+            }
         };
         Ok(match placement {
             Placement::After => routed,
@@ -1034,13 +1062,14 @@ impl Registry {
             .placed();
         let exposure = self.exposure(placed.inst, placed.side, &[cid]);
         let state = self.entries.admits(placed.inst);
+        let suppressed = self.orphans.cooldown(placed.inst).is_some();
         let guard = self.state_guard(placed.inst);
         let origin = self.instance;
         let rec = self
             .orders
             .get_mut(&cid)
             .expect("the order was found above");
-        Live::check(rec, origin, state, guard, exposure)
+        Live::check(rec, origin, state, suppressed, guard, exposure)
     }
 
     /// The permit to cancel our order `cid`: it is not terminal (PendingNew, Unknown and an

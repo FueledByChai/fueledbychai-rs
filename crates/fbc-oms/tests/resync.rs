@@ -825,7 +825,8 @@ fn every_resync_reconciles_the_orders_the_registry_holds() {
     assert_eq!(reg.inventory(INST), SignedLots(0));
     assert!(report.untracked.is_empty());
     // An open order of ours the registry does not hold, on a seeded market, is reported for
-    // 0005's I7, not registered; one whose venue id another order of ours holds neither.
+    // 0005's I7 and registered as an orphan (decision 0101, tests/orphans.rs); one whose venue
+    // id another order of ours holds is neither.
     let (orphan, clash) = (cid(), cid());
     let report = resync(
         &mut reg,
@@ -837,7 +838,8 @@ fn every_resync_reconciles_the_orders_the_registry_holds() {
         ),
     );
     assert_eq!(report.untracked, vec![(orphan, vid("o"))]);
-    assert!(reg.get(orphan).is_none() && reg.get(clash).is_none());
+    assert!(reg.get(orphan).is_some_and(|rec| rec.from_snapshot()));
+    assert!(reg.get(clash).is_none());
     // At the seed, an order whose venue id another order holds is not registered either.
     let mut reg = registry();
     let b = cid();

@@ -60,8 +60,9 @@ use fbc_core::{AccountKey, CancelScope, ClientOrderId, InstrumentId, VenueComman
 use crate::{CapRefusal, PermittedCommand, Registry};
 
 /// How many times a market's state has changed: the kill switch, an arming call, a disarm or
-/// any other move of its order-entry state (0012). An [`Authorization`] carries the value its
-/// market had when its command was built.
+/// any other move of its order-entry state (0012), or an orphan cooldown beginning to suppress
+/// its adding side (decision 0101). An [`Authorization`] carries the value its market had when
+/// its command was built.
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub struct StateGeneration(u64);
 

@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use fbc_core::{
     AmendOrder, AmendQty, CancelOrder, ChosenRef, ClientOrderId, InstrumentId, Lots, Namespace,
-    OrderCaps, OrderKind, OrderRef, TagSet, Ticks, VenueCommand,
+    OrderCaps, OrderKind, OrderRef, Side, TagSet, Ticks, VenueCommand,
 };
 
 use crate::caps::{Adds, CapRefusal, Exposure};
@@ -111,6 +111,10 @@ pub enum AmendRefusal {
     /// order's side past the inventory cap, or what the side has resting past the resting
     /// cap, or its market has no caps configured.
     Capped(CapRefusal),
+    /// An orphan cooldown suppresses the market's adding side (0005's I7, decision 0101) and
+    /// the order is on `side`, which, at what it may fill once amended, does not reduce the
+    /// known, non-zero position within its size.
+    OrphanCooldown { inst: InstrumentId, side: Side },
 }
 
 /// A venue command this crate built: an amend, a cancel or a cancel-many of one market from a
@@ -343,6 +347,9 @@ pub struct Live<'r> {
     /// What the market's state admits, read when the permit was given: nothing changes it
     /// while the permit holds the registry.
     state: Result<Admits, StateRefusal>,
+    /// An orphan cooldown suppressed the market's adding side when the permit was given
+    /// (decision 0101).
+    suppressed: bool,
     /// The market's state generation then, and in Exit its position revision, which the
     /// amend's authorization is checked against at submit (decisions 0060, 0066).
     guard: Guard,
@@ -354,6 +361,7 @@ impl<'r> Live<'r> {
         rec: &'r mut OrderRecord,
         origin: Instance,
         state: Result<Admits, StateRefusal>,
+        suppressed: bool,
         guard: Guard,
         exposure: Exposure,
     ) -> Result<Live<'r>, PermitRefusal> {
@@ -362,6 +370,7 @@ impl<'r> Live<'r> {
             rec,
             origin,
             state,
+            suppressed,
             guard,
             exposure,
         })
@@ -390,6 +399,11 @@ impl<'r> Live<'r> {
     /// the side's orders, this one at what it may fill once amended, within the position's size
     /// ([`ExitRefusal`](crate::ExitRefusal)).
     ///
+    /// While an orphan cooldown suppresses the market's adding side (decision 0101), refused
+    /// before Exit's admission and either cap unless the order is on the side that reduces the
+    /// known, non-zero position and the side's orders, this one at what it may fill once
+    /// amended, stay within the position's size ([`AmendRefusal::OrphanCooldown`]).
+    ///
     /// Refused, never built, when the amend would take the worst case on the order's side past
     /// its market's inventory cap (0005's I6), or what the side has resting past its resting
     /// cap (0052), the order counted at the larger of its resting quantity now and the
@@ -416,11 +430,9 @@ impl<'r> Live<'r> {
         let (amend, wire) = judge_amend(
             &*self.rec,
             caps,
-            self.state,
+            (self.state, self.suppressed),
             &self.exposure,
-            px,
-            qty,
-            reducing,
+            (px, qty, reducing),
         )?;
         let cid = self.rec.cid();
         let build = self.rec.set_amend_built(qty, wire);
@@ -463,20 +475,29 @@ pub(crate) fn live_refusal(rec: &OrderRecord) -> Result<(), PermitRefusal> {
 
 /// Everything [`Live::amend`] judges, changing nothing: the amend of `rec` to `px` and the
 /// total `qty` with its wire quantity, as the venue's `caps` shape it, refused when the market's
-/// `state` builds no such amend or the amend would take `exposure` (the side's position and our
-/// other orders on it) past either pre-trade cap.
+/// `state` builds no such amend, an orphan cooldown suppresses the market's adding side
+/// (`suppressed`) and the amend does not reduce the position within its size (decision 0101),
+/// or the amend would take `exposure` (the side's position and our other orders on it) past
+/// either pre-trade cap.
 pub(crate) fn judge_amend(
     rec: &OrderRecord,
     caps: &OrderCaps,
-    state: Result<Admits, StateRefusal>,
+    (state, suppressed): (Result<Admits, StateRefusal>, bool),
     exposure: &Exposure,
-    px: Ticks,
-    qty: Lots,
-    reducing: bool,
+    (px, qty, reducing): (Ticks, Lots, bool),
 ) -> Result<(AmendOrder, Option<Lots>), AmendRefusal> {
     let admits = state.map_err(AmendRefusal::State)?;
     let (amend, wire) = amend_shape(rec, caps, px, qty, reducing)?;
     let adds = rec.exposure_if_amended(qty, wire);
+    // While an orphan cooldown suppresses the adding side, only an amend on the side that
+    // reduces the position, within its size, is built (decision 0101).
+    if suppressed && exposure.admit_exit(true, adds).is_err() {
+        let placed = rec.placed();
+        return Err(AmendRefusal::OrphanCooldown {
+            inst: placed.inst,
+            side: placed.side,
+        });
+    }
     admits
         .judge(exposure, reducing || rec.placed().reduce_only, adds)
         .map_err(AmendRefusal::State)?;

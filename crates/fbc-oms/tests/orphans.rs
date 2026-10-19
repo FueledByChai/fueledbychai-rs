@@ -261,7 +261,6 @@ fn an_orphan_suppresses_the_adding_side_for_the_configured_cooldown() {
     );
     assert_eq!(report.untracked, vec![(o, vid("o"))]);
     assert_eq!(report.orphans, vec![INST]);
-    assert!(report.unconfirmed.is_empty());
     // Registered, from the snapshot, counting as it rests.
     let rec = reg.get(o).unwrap();
     assert!(rec.from_snapshot());
@@ -290,6 +289,9 @@ fn an_orphan_suppresses_the_adding_side_for_the_configured_cooldown() {
     let until = MonoNs(10_000 + 5_000_000_000);
     assert_eq!(plan.cooldown, Some(Cooldown::Until(until)));
     assert_eq!(reg.orphan_cooldown(INST), Some(Cooldown::Until(until)));
+    // A call at an earlier time never shortens it.
+    let again = reg.cancel_orphans(INST, &cfg(), &venue(), MonoNs(9_000));
+    assert_eq!(again.cooldown, Some(Cooldown::Until(until)));
     assert_eq!(reg.end_orphan_cooldowns(MonoNs(until.0 - 1)), vec![]);
     assert_eq!(place(&mut reg, buy(1)), Err(suppressed(Side::Buy)));
     assert!(!suppressed(Side::Buy).to_string().is_empty());
@@ -320,7 +322,10 @@ fn during_the_cooldown_only_the_side_that_reduces_the_position_takes_orders_neve
     place(&mut reg, sell(5)).unwrap();
     // A batch item is judged the same way, the earlier items counted.
     let plan = reg.place_batch(vec![buy(1)]).unwrap();
-    assert_eq!(plan.refused, vec![(plan.refused[0].0, suppressed(Side::Buy))]);
+    assert_eq!(
+        plan.refused,
+        vec![(plan.refused[0].0, suppressed(Side::Buy))]
+    );
     assert!(plan.command.is_none());
 }
 
@@ -381,8 +386,7 @@ fn during_the_cooldown_an_amend_on_the_adding_side_is_refused() {
 }
 
 #[test]
-fn the_orphans_are_cancelled_by_explicit_reference_in_one_cancel_many_also_on_a_disarmed_market()
-{
+fn the_orphans_are_cancelled_by_explicit_reference_in_one_cancel_many_also_on_a_disarmed_market() {
     // Never armed since the restart: disarmed, in Cancel-only.
     let mut reg = seeded(0);
     let (a, b, c) = (cid(), cid(), cid());
@@ -622,7 +626,10 @@ fn no_foreign_namespace_order_is_ever_cancelled() {
     let mut theirs = update(None, VenueOrderState::Open, 0);
     theirs.cid = Some(CidMatch::Foreign(THEIRS));
     theirs.vid = Some(vid("theirs-2"));
-    assert_eq!(reg.apply_update(&theirs, key(3_500)), Routed::Foreign(THEIRS));
+    assert_eq!(
+        reg.apply_update(&theirs, key(3_500)),
+        Routed::Foreign(THEIRS)
+    );
     let report = resync_at(
         &mut reg,
         SnapshotSource::Trustworthy,
@@ -645,7 +652,7 @@ fn from_an_untrustworthy_source_only_the_orders_a_live_account_event_also_shows_
     let mut live_a = update(Some(a), VenueOrderState::Open, 0);
     live_a.vid = Some(vid("a"));
     assert_eq!(reg.apply_update(&live_a, key(10)), Routed::Untracked);
-    let mut live_c = update(Some(c), VenueOrderState::Open, 0);
+    let mut live_c = update(Some(c), VenueOrderState::Amended { new_vid: None }, 0);
     live_c.vid = Some(vid("c"));
     reg.apply_update(&live_c, key(11));
     let mut ended_c = update(Some(c), canceled(), 0);
@@ -665,11 +672,16 @@ fn from_an_untrustworthy_source_only_the_orders_a_live_account_event_also_shows_
         report.untracked,
         vec![(a, vid("a")), (b, vid("b")), (c, vid("c"))]
     );
-    assert_eq!(report.unconfirmed, vec![(b, vid("b")), (c, vid("c"))]);
+    // `b` and `c` (whose cancel withdrew its sighting) are not acted on: still not held.
     assert_eq!(report.orphans, vec![INST]);
     assert_eq!(reg.orphans(INST), vec![a]);
     assert!(reg.get(b).is_none() && reg.get(c).is_none());
-    let plan = reg.cancel_orphans(INST, &cfg(), &venue_from(SnapshotSource::Untrustworthy), MonoNs(3_000));
+    let plan = reg.cancel_orphans(
+        INST,
+        &cfg(),
+        &venue_from(SnapshotSource::Untrustworthy),
+        MonoNs(3_000),
+    );
     assert_explicit(&plan, &["a"], None);
 
     // A live fill of `b` then shows it: the next resync acts on it.
@@ -693,7 +705,8 @@ fn from_an_untrustworthy_source_only_the_orders_a_live_account_event_also_shows_
         FillRouted::OursUntracked(b)
     );
     let report = resync_at(&mut reg, SnapshotSource::Untrustworthy, 4_000, shown(), 0);
-    assert_eq!(report.unconfirmed, vec![(c, vid("c"))]);
+    assert_eq!(report.untracked, vec![(b, vid("b")), (c, vid("c"))]);
+    assert!(reg.get(c).is_none());
     assert_eq!(reg.orphans(INST), vec![a, b]);
 
     // A market whose only candidates are unconfirmed is neither named nor suppressed.
@@ -706,7 +719,8 @@ fn from_an_untrustworthy_source_only_the_orders_a_live_account_event_also_shows_
         vec![ours(cid(), "x", Side::Buy)],
         0,
     );
-    assert_eq!(report.unconfirmed.len(), 1);
+    assert_eq!(report.untracked.len(), 1);
+    assert!(reg.get(report.untracked[0].0).is_none());
     assert!(report.orphans.is_empty());
     assert_eq!(reg.orphan_cooldown(INST), None);
 }
@@ -727,5 +741,41 @@ fn an_order_a_first_resync_registers_on_a_market_it_seeds_is_no_orphan() {
     assert_eq!(report.registered, vec![e]);
     assert!(report.orphans.is_empty());
     assert!(reg.orphans(INST).is_empty());
+    assert_eq!(reg.orphan_cooldown(INST), None);
+}
+
+#[test]
+fn an_untracked_order_whose_ids_another_order_of_ours_holds_or_that_is_not_open_is_not_acted_on() {
+    let mut reg = seeded(0);
+    arm::start(&mut reg, INST);
+    let (x, y) = (buy(5), buy(5));
+    let (xc, yc) = (x.cid, y.cid);
+    place(&mut reg, x).unwrap();
+    place(&mut reg, y).unwrap();
+    resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        2_000,
+        vec![ours(xc, "x", Side::Buy), ours(yc, "y", Side::Buy)],
+        0,
+    );
+    // Our `x`'s client id shown with `y`'s venue id: reported, not registered, no orphan.
+    // An order of ours shown filled is not open: reported, not acted on either.
+    let gone = cid();
+    let mut filled = ours(gone, "gone", Side::Buy);
+    filled.state = VenueOrderState::Filled;
+    let report = resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        3_000,
+        vec![ours(xc, "y", Side::Buy), filled],
+        0,
+    );
+    let mut expected = vec![(xc, vid("y")), (gone, vid("gone"))];
+    expected.sort_by_key(|(c, _)| *c);
+    assert_eq!(report.untracked, expected);
+    assert!(report.orphans.is_empty());
+    assert!(reg.get(gone).is_none());
+    assert_eq!(reg.cid_of(&vid("y")), Some(yc));
     assert_eq!(reg.orphan_cooldown(INST), None);
 }
