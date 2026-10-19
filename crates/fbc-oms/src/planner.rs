@@ -174,8 +174,9 @@ pub enum Downgrade {
     /// The venue refuses RPI with reduce-only: the order goes on the public book, still
     /// reduce-only.
     RpiReduceOnly,
-    /// The venue refuses IOC with reduce-only: a good-till-cancelled reduce-only limit at the
-    /// quote's price (its cap), cancelled at once.
+    /// The venue refuses IOC with reduce-only, or, for a crossing intent ([`CrossingIntent`]),
+    /// takes no IOC: a good-till-cancelled reduce-only limit at the quote's price (its cap),
+    /// cancelled at once.
     SynthIoc,
     /// The venue refuses post-only with reduce-only and the quote asked to emulate it
     /// ([`ReduceFallback::EmulateReduceOnly`]).
