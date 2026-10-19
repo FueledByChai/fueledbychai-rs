@@ -10,12 +10,19 @@
 //! the session's next turn on its thread, which encodes it and tells the handler what became of
 //! it ([`ExecHandler::on_submitted`](crate::ExecHandler::on_submitted)).
 //!
+//! The commands waiting are bounded by the consumer's [`ReservedBound`], a Normal bound plus a
+//! reserve for Safety traffic; one submitted past it waits only as a refusal to report
+//! (decision 0104).
+//!
 //! [`Rpcs`] holds each written request's deadline until the first event that answers it
 //! ([`ExecEvent::answers`](fbc_core::ExecEvent::answers)); one still unanswered at its deadline
 //! is handed to the codec's `on_rpc_timeout`, once, which reports it `Unknown` (0005, 0014
 //! item 3). A request asked as an HTTP request is also cleared by the call to the codec's
 //! `on_http` for it, and its deadline stands only once the epoch that asked has ended, since
 //! until then its result always comes back to `on_http` (FBC-m8vm, decision 0081).
+//! It also holds each such request's place in the consumer's [`InFlight`] table, taken when a
+//! submitted command is admitted at its encode and given back when the request is settled, not
+//! written, or the session ends (decision 0104).
 
 use std::cell::{Cell, RefCell};
 use std::cmp::Reverse;
@@ -25,11 +32,15 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use fbc_core::{AccountKey, InstrumentId, RpcCall, RpcId, Stamp, VenueCommand, VenueOrderSnapshot};
+use fbc_core::{
+    AccountKey, InstrumentId, NotSentReason, RpcCall, RpcId, Stamp, TrafficClass, VenueCommand,
+    VenueOrderSnapshot,
+};
 use fbc_oms::{Authorization, ControlCommand};
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
+use crate::bounds::{InFlight, ReservedBound};
 use crate::exec_gate::Gate;
 use crate::session_core::IngestClock;
 
@@ -70,6 +81,21 @@ impl Submitted {
             Submitted::Control(cmd) => cmd,
         }
     }
+
+    /// The traffic class its frames are charged as (decision 0073) and the session's bounds
+    /// admit it under (decision 0104): an authorized order command's own
+    /// ([`VenueCommand::traffic_class`]), so cancels and reducing orders may use the safety
+    /// reserves; every control command normal traffic, whatever its label. The consumer submits
+    /// control commands without authorization or count (the Unknown ladder's order queries, an
+    /// arm, a dead-man refresh, the fee query), so they stop at each Normal bound and never
+    /// take what cancels and reducing orders need (design §4.10 step 7; Reviewer B RB-e8i-1 on
+    /// PR #113). The session's own arm, one per epoch, is charged its label.
+    pub(crate) fn class(&self) -> TrafficClass {
+        match self {
+            Submitted::Authorized(auth) => auth.command().traffic_class(),
+            Submitted::Control(_) => TrafficClass::Normal,
+        }
+    }
 }
 
 /// A command waiting for the session's next turn.
@@ -82,6 +108,25 @@ pub(crate) struct Queued {
     /// The input being handled on the shard when it was submitted, if one was, which its write
     /// is attributed to (decision 0100).
     pub(crate) origin: Option<Stamp>,
+}
+
+/// A submission refused as it was submitted, nothing of it kept: the commands waiting for the
+/// connection filled the bound its class may use (decision 0104). The session reports it
+/// `NotSent` for `reason` on its next turn, in submission order, and journals that as its write
+/// result.
+pub(crate) struct Refusal {
+    pub(crate) rpc: RpcId,
+    pub(crate) class: TrafficClass,
+    pub(crate) reason: NotSentReason,
+}
+
+/// What waits for the session's next turn, in submission order. A command is held inline, not
+/// boxed: every submission would otherwise allocate on the order path, for the sake of the
+/// refusals, which only an overflow makes.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Waiting {
+    Command(Queued),
+    Refused(Refusal),
 }
 
 /// The request ids one account's order-entry sessions give, counted up across them: the
@@ -119,7 +164,14 @@ pub(crate) struct Shared {
     acct: AccountKey,
     /// Where request ids are given from.
     ids: RpcIds,
-    queue: RefCell<VecDeque<Queued>>,
+    queue: RefCell<VecDeque<Waiting>>,
+    /// The bound on the commands waiting, Safety traffic having a reserve beyond its Normal
+    /// part (decision 0104).
+    bound: ReservedBound,
+    /// The commands waiting, the refusals behind them left out.
+    commands: Cell<u64>,
+    /// The submissions refused for want of room in the queue.
+    backpressured: Cell<u64>,
     /// The request the shard host submitted from its ladder and may take back ([`Shared::keep`]).
     kept: Cell<Option<RpcId>>,
     /// That request, never to be sent, when it still waited as the session ended or was popped
@@ -146,7 +198,7 @@ impl Shared {
     /// venue's protection per connection, re-armed on each when `rearm` and covering the
     /// orders already open when `covers_open`, its venue's amends keeping the venue id (or
     /// none taken) when `one_id`, each submission attributed to the input `clock` says is being
-    /// handled.
+    /// handled, and the commands waiting bounded by `bound`.
     pub(crate) fn new(
         acct: AccountKey,
         ids: RpcIds,
@@ -154,11 +206,15 @@ impl Shared {
         covers_open: bool,
         one_id: bool,
         clock: IngestClock,
+        bound: ReservedBound,
     ) -> Rc<Shared> {
         Rc::new(Shared {
             acct,
             ids,
             queue: RefCell::default(),
+            bound,
+            commands: Cell::new(0),
+            backpressured: Cell::new(0),
             kept: Cell::new(None),
             left: RefCell::default(),
             wake: Notify::new(),
@@ -175,28 +231,47 @@ impl Shared {
         self.ids.next()
     }
 
-    /// Gives `item` the next request id and queues it for the session's next turn.
+    /// Gives `item` the next request id and queues it for the session's next turn, if the
+    /// commands waiting leave room for its class (decision 0104): a Normal one while fewer than
+    /// the bound's Normal part wait, a Safety one while fewer than the whole bound do. Otherwise
+    /// nothing of it is kept (an authorization is dropped unspent) and its refusal waits in its
+    /// place, to be reported `NotSent(Backpressure)` on that turn.
     fn push(&self, item: Submitted) -> Result<RpcId, SubmitRefusal> {
         if self.ended.get() {
             return Err(SubmitRefusal::Ended);
         }
         let rpc = self.ids.next();
-        let epoch = self.ready.get();
-        let origin = self.clock.handling();
-        let queued = Queued {
-            rpc,
-            item,
-            epoch,
-            origin,
+        let class = item.class();
+        let waiting = if self.bound.admits(self.commands.get(), class) {
+            self.commands.set(self.commands.get() + 1);
+            Waiting::Command(Queued {
+                rpc,
+                item,
+                epoch: self.ready.get(),
+                origin: self.clock.handling(),
+            })
+        } else {
+            self.backpressured.set(self.backpressured.get() + 1);
+            let reason = NotSentReason::Backpressure;
+            Waiting::Refused(Refusal { rpc, class, reason })
         };
-        self.queue.borrow_mut().push_back(queued);
+        self.queue.borrow_mut().push_back(waiting);
         self.wake.notify_one();
         Ok(rpc)
     }
 
-    /// The command submitted first of those waiting.
-    pub(crate) fn pop(&self) -> Option<Queued> {
-        self.queue.borrow_mut().pop_front()
+    /// What was submitted first of what waits: a command, or a refusal to report.
+    pub(crate) fn pop(&self) -> Option<Waiting> {
+        let next = self.queue.borrow_mut().pop_front();
+        if let Some(Waiting::Command(_)) = next {
+            self.commands.set(self.commands.get() - 1);
+        }
+        next
+    }
+
+    /// The submissions refused because the commands waiting filled their bound.
+    pub(crate) fn backpressured(&self) -> u64 {
+        self.backpressured.get()
     }
 
     /// Whether a command waits.
@@ -222,13 +297,16 @@ impl Shared {
     }
 
     /// Takes back the command submitted as request `rpc` while it still waits for the session's
-    /// turn, or, when it is the request [kept](Shared::keep), was left waiting when the session
+    /// turn (one refused as it was submitted kept nothing to take back), or, when it is the request [kept](Shared::keep), was left waiting when the session
     /// ended or popped and never encoded: nothing of it reached the codec (decision 0100; Codex
     /// P1 r4309207253, r4309350872 on PR #164).
     pub(crate) fn withdraw(&self, rpc: RpcId) -> Option<Submitted> {
         let mut queue = self.queue.borrow_mut();
-        if let Some(at) = queue.iter().position(|queued| queued.rpc == rpc) {
-            return queue.remove(at).map(|queued| queued.item);
+        let named = |waiting: &Waiting| matches!(waiting, Waiting::Command(q) if q.rpc == rpc);
+        let found = queue.iter().position(named).and_then(|at| queue.remove(at));
+        if let Some(Waiting::Command(queued)) = found {
+            self.commands.set(self.commands.get() - 1);
+            return Some(queued.item);
         }
         let mut left = self.left.borrow_mut();
         let found = left.as_ref().is_some_and(|queued| queued.rpc == rpc);
@@ -275,8 +353,11 @@ impl Shared {
         self.ready.set(None);
         self.sending.set(false);
         let unsent = std::mem::take(&mut *self.queue.borrow_mut());
-        for queued in unsent {
-            self.unsent(queued);
+        self.commands.set(0);
+        for waiting in unsent {
+            if let Waiting::Command(queued) = waiting {
+                self.unsent(queued);
+            }
         }
     }
 }
@@ -288,7 +369,9 @@ impl Shared {
 /// source, and tells the handler what became of it
 /// ([`ExecHandler::on_submitted`](crate::ExecHandler::on_submitted)): sent, with the nonces
 /// it used, or not sent and why. A sent request is never written again: one the venue leaves
-/// unanswered is reported `Unknown` at its deadline (decision 0057).
+/// unanswered is reported `Unknown` at its deadline (decision 0057). A submission the commands
+/// already waiting leave no room for, under the consumer's outbound bound for its class, keeps
+/// nothing and is reported `NotSent(Backpressure)` on that turn (decision 0104).
 #[derive(Clone)]
 pub struct ExecOrders {
     pub(crate) shared: Rc<Shared>,
@@ -389,8 +472,8 @@ impl ExecOrders {
     }
 }
 
-/// The deadlines of the requests a session wrote, each until the first event that answers it.
-#[derive(Default)]
+/// The deadlines of the requests a session wrote, each until the first event that answers it,
+/// and the places they hold in the consumer's table of requests in flight (decision 0104).
 pub(crate) struct Rpcs {
     due: BinaryHeap<Reverse<(Instant, RpcId)>>,
     /// The requests written and neither answered nor timed out.
@@ -398,18 +481,79 @@ pub(crate) struct Rpcs {
     /// The requests asked as HTTP requests whose epoch has not ended: the epoch that asked and
     /// the deadline, which stands once that epoch ends (decision 0081).
     held: HashMap<RpcId, (u32, Option<Instant>)>,
+    /// The table of requests in flight the session counts against.
+    table: InFlight,
+    /// The requests holding a place in it: each live one, and one admitted and not yet written.
+    places: HashSet<RpcId>,
 }
 
 impl Rpcs {
+    /// No request yet, the places counted in `table`.
+    pub(crate) fn new(table: InFlight) -> Rpcs {
+        Rpcs {
+            due: BinaryHeap::new(),
+            live: HashSet::new(),
+            held: HashMap::new(),
+            table,
+            places: HashSet::new(),
+        }
+    }
+
+    /// Admits submitted request `rpc` of `class` into the table of requests in flight, if the
+    /// table has room for its class: true when it took a place, which it holds until it is
+    /// answered or times out, or, never written, until [`Self::unsent`] (decision 0104).
+    pub(crate) fn admit(&mut self, rpc: RpcId, class: TrafficClass) -> bool {
+        let taken = self.table.try_take(class);
+        if taken {
+            self.places.insert(rpc);
+        }
+        taken
+    }
+
+    /// Request `rpc`, admitted, may have gone unwritten: unless it is live, its place is given
+    /// back.
+    pub(crate) fn unsent(&mut self, rpc: RpcId) {
+        if !self.live.contains(&rpc) {
+            self.give_back(rpc);
+        }
+    }
+
+    /// Request `rpc` went live: it holds a place, taken now, past the bound, when it was not
+    /// admitted (a request the session writes of its own).
+    fn hold(&mut self, rpc: RpcId) {
+        if self.places.insert(rpc) {
+            self.table.take();
+        }
+    }
+
+    /// Gives back the place request `rpc` holds, if it holds one.
+    fn give_back(&mut self, rpc: RpcId) {
+        if self.places.remove(&rpc) {
+            self.table.release();
+        }
+    }
+
+    /// The session has ended: no request it wrote is reported any more, and every place one
+    /// holds is given back.
+    pub(crate) fn clear(&mut self) {
+        self.due.clear();
+        self.live.clear();
+        self.held.clear();
+        for _ in self.places.drain() {
+            self.table.release();
+        }
+    }
+
     /// Request `call` is written at `now`: its deadline is `call.timeout` from then. A request
     /// already waiting keeps the deadline of its first frame; one whose deadline is past the end
     /// of the clock never falls due, which is why the session refuses to send one (PR #87
     /// Reviewer B B9).
     pub(crate) fn sent(&mut self, call: RpcCall, now: Instant) {
-        if self.live.insert(call.id)
-            && let Some(at) = now.checked_add(call.timeout)
-        {
-            self.due.push(Reverse((at, call.id)));
+        if self.live.insert(call.id) {
+            self.hold(call.id);
+            if let Some(at) = now.checked_add(call.timeout) {
+                self.due.push(Reverse((at, call.id)));
+            }
         }
     }
 
@@ -419,6 +563,7 @@ impl Rpcs {
     /// codec's `on_http` (decision 0081). A request already waiting keeps its first deadline.
     pub(crate) fn asked(&mut self, call: RpcCall, epoch: u32, now: Instant) {
         if self.live.insert(call.id) {
+            self.hold(call.id);
             let at = now.checked_add(call.timeout);
             self.held.insert(call.id, (epoch, at));
         }
@@ -445,6 +590,7 @@ impl Rpcs {
     pub(crate) fn answered(&mut self, rpc: RpcId) {
         self.live.remove(&rpc);
         self.held.remove(&rpc);
+        self.give_back(rpc);
     }
 
     /// When the earliest deadline falls due; it may be an answered request's, which falls due
@@ -462,6 +608,7 @@ impl Rpcs {
         {
             self.due.pop();
             if self.live.remove(&rpc) {
+                self.give_back(rpc);
                 due.push(rpc);
             }
         }
@@ -469,10 +616,36 @@ impl Rpcs {
     }
 }
 
+/// A session dropped, its run dropped with it, gives back the places its requests held.
+impl Drop for Rpcs {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// A table no test here fills.
+    fn table() -> InFlight {
+        InFlight::new(ReservedBound::new(64, 64).unwrap())
+    }
+
+    /// A queue no test here fills.
+    fn roomy() -> ReservedBound {
+        ReservedBound::new(64, 64).unwrap()
+    }
+
+    /// The command that waited first.
+    fn queued(waiting: Option<Waiting>) -> Queued {
+        let mut command = None;
+        if let Some(Waiting::Command(queued)) = waiting {
+            command = Some(queued);
+        }
+        command.expect("a command waits")
+    }
 
     fn call(id: u64, ms: u64) -> RpcCall {
         RpcCall {
@@ -485,7 +658,7 @@ mod tests {
     fn a_deadline_falls_due_once_unless_answered_first() {
         let now = Instant::now();
         let ms = Duration::from_millis;
-        let mut rpcs = Rpcs::default();
+        let mut rpcs = Rpcs::new(table());
         rpcs.sent(call(1, 20), now);
         rpcs.sent(call(2, 10), now);
         // A second frame of request 1 keeps its first deadline.
@@ -504,7 +677,7 @@ mod tests {
     fn an_http_requests_deadline_stands_only_once_its_epoch_ended_and_never_once_handed_over() {
         let now = Instant::now();
         let ms = Duration::from_millis;
-        let mut rpcs = Rpcs::default();
+        let mut rpcs = Rpcs::new(table());
         // Asked on epoch 0: two still out, one handed over, one of epoch 1.
         rpcs.asked(call(1, 10), 0, now);
         rpcs.asked(call(2, 20), 0, now);
@@ -534,7 +707,7 @@ mod tests {
 
     #[test]
     fn a_deadline_past_the_end_of_the_clock_never_falls_due() {
-        let mut rpcs = Rpcs::default();
+        let mut rpcs = Rpcs::new(table());
         let never = RpcCall {
             id: RpcId(1),
             timeout: Duration::MAX,
@@ -566,6 +739,7 @@ mod tests {
                 false,
                 true,
                 IngestClock::new(),
+                roomy(),
             ),
             Shared::new(
                 AccountKey::new(2),
@@ -574,6 +748,7 @@ mod tests {
                 false,
                 true,
                 IngestClock::new(),
+                roomy(),
             ),
         );
         let fee = || Submitted::Control(VenueCommand::FeeQuery);
@@ -597,6 +772,7 @@ mod tests {
             false,
             true,
             clock.clone(),
+            roomy(),
         );
         let orders = ExecOrders {
             shared: Rc::clone(&shared),
@@ -610,7 +786,7 @@ mod tests {
         assert!(!orders.idle());
         // Once its events were handed on, a submission names no input.
         orders.submit_control(ControlCommand::FeeQuery).unwrap();
-        let (first, second) = (shared.pop().unwrap(), shared.pop().unwrap());
+        let (first, second) = (queued(shared.pop()), queued(shared.pop()));
         assert_eq!((first.origin, second.origin), (Some(frame), None));
         // Popped, but its turn still going: held until the turn ends.
         shared.set_sending(true);
@@ -634,13 +810,14 @@ mod tests {
             false,
             true,
             IngestClock::new(),
+            roomy(),
         );
         let orders = ExecOrders {
             shared: Rc::clone(&shared),
         };
         let fee = |orders: &ExecOrders| orders.submit_control(ControlCommand::FeeQuery).unwrap();
         let (taken, waiting, left) = (fee(&orders), fee(&orders), fee(&orders));
-        assert_eq!(shared.pop().map(|q| q.rpc), Some(taken));
+        assert_eq!(queued(shared.pop()).rpc, taken);
         assert!(orders.withdraw(taken).is_none());
         let back = orders.withdraw(waiting).map(|item| item.command().clone());
         assert_eq!(back, Some(VenueCommand::FeeQuery));
@@ -664,6 +841,7 @@ mod tests {
             false,
             true,
             IngestClock::new(),
+            roomy(),
         );
         let orders = ExecOrders {
             shared: Rc::clone(&shared),
@@ -684,18 +862,105 @@ mod tests {
             false,
             true,
             IngestClock::new(),
+            roomy(),
         );
         let orders = ExecOrders {
             shared: Rc::clone(&shared),
         };
         let (other, kept) = (fee(&orders), fee(&orders));
         orders.keep(kept);
-        shared.unsent(shared.pop().unwrap());
-        shared.unsent(shared.pop().unwrap());
+        shared.unsent(queued(shared.pop()));
+        shared.unsent(queued(shared.pop()));
         shared.end();
         assert!(orders.withdraw(other).is_none());
         let back = orders.withdraw(kept).map(|item| item.command().clone());
         assert_eq!(back, Some(VenueCommand::FeeQuery));
+    }
+
+    /// Decision 0104: past the Normal bound, a Normal submission keeps nothing and waits only as
+    /// its refusal, in submission order, and cannot be withdrawn; a turn taking a command makes
+    /// room again, and an ended session drops what waits.
+    #[test]
+    fn a_submission_past_the_bound_its_class_may_use_waits_only_as_its_refusal() {
+        let shared = Shared::new(
+            AccountKey::new(2),
+            RpcIds::default(),
+            true,
+            false,
+            true,
+            IngestClock::new(),
+            ReservedBound::new(1, 1).unwrap(),
+        );
+        let orders = ExecOrders {
+            shared: Rc::clone(&shared),
+        };
+        let fee = |orders: &ExecOrders| orders.submit_control(ControlCommand::FeeQuery).unwrap();
+        let (taken, refused) = (fee(&orders), fee(&orders));
+        // A control command is Normal traffic: the reserve is not its to use.
+        assert_eq!(shared.backpressured(), 1);
+        assert!(orders.withdraw(refused).is_none());
+        assert_eq!(queued(shared.pop()).rpc, taken);
+        // The refusal waits behind the command.
+        let backpressure = NotSentReason::Backpressure;
+        let refusal = |r: &Refusal| (r.rpc, r.class, r.reason);
+        let named = (refused, TrafficClass::Normal, backpressure);
+        assert!(matches!(shared.pop(), Some(Waiting::Refused(r)) if refusal(&r) == named));
+        // Room again once the turn took the command.
+        let again = fee(&orders);
+        let past = fee(&orders);
+        assert_eq!(shared.backpressured(), 2);
+        assert!(orders.withdraw(again).is_some());
+        let room = fee(&orders);
+        assert!(orders.withdraw(room).is_some());
+        orders.keep(past);
+        shared.end();
+        assert!(!shared.waiting());
+        assert!(orders.withdraw(past).is_none());
+    }
+
+    /// Decision 0104: an admitted request holds its place in the table until it is answered,
+    /// times out or goes unwritten; a request the session writes of its own takes one past the
+    /// bound; an HTTP query holds one too; and the end of the session gives back every place.
+    #[test]
+    fn a_request_holds_its_place_in_flight_until_it_is_settled_unwritten_or_the_session_ends() {
+        let now = Instant::now();
+        let ms = Duration::from_millis;
+        let table = InFlight::new(ReservedBound::new(1, 1).unwrap());
+        let mut rpcs = Rpcs::new(table.clone());
+        let (normal, safety) = (TrafficClass::Normal, TrafficClass::Safety);
+        assert!(rpcs.admit(RpcId(1), normal));
+        assert!(!rpcs.admit(RpcId(2), normal));
+        assert!(rpcs.admit(RpcId(3), safety));
+        assert!(!rpcs.admit(RpcId(4), safety));
+        // Written: its place is the one it took; a second frame takes none.
+        rpcs.sent(call(1, 10), now);
+        rpcs.sent(call(1, 10), now);
+        rpcs.unsent(RpcId(1));
+        assert_eq!(table.held(), 2);
+        // Never written: given back.
+        rpcs.unsent(RpcId(3));
+        assert_eq!(table.held(), 1);
+        // The session's own request, past the bound.
+        rpcs.sent(call(5, 20), now);
+        assert_eq!(table.held(), 2);
+        // An answer, then a deadline, give theirs back.
+        rpcs.answered(RpcId(1));
+        assert_eq!(table.held(), 1);
+        assert_eq!(rpcs.take_due(now + ms(25)), [RpcId(5)]);
+        assert_eq!(table.held(), 0);
+        // An HTTP query holds one, and the end gives back every place still held.
+        rpcs.asked(call(6, 10), 0, now);
+        assert!(rpcs.admit(RpcId(7), safety));
+        assert_eq!(table.held(), 2);
+        rpcs.clear();
+        assert_eq!(table.held(), 0);
+        assert_eq!(rpcs.next_deadline(), None);
+        // A session dropped gives back its places too.
+        let mut dropped = Rpcs::new(table.clone());
+        dropped.sent(call(8, 10), now);
+        assert_eq!(table.held(), 1);
+        drop(dropped);
+        assert_eq!(table.held(), 0);
     }
 
     #[test]
@@ -713,6 +978,7 @@ mod tests {
             false,
             true,
             IngestClock::new(),
+            roomy(),
         );
         let orders = ExecOrders {
             shared: Rc::clone(&shared),
@@ -727,9 +993,9 @@ mod tests {
         let second = orders.submit_control(ControlCommand::RefreshDeadMan);
         assert_eq!((first, second), (Ok(RpcId(1)), Ok(RpcId(2))));
         assert!(shared.waiting());
-        let queued = shared.pop().unwrap();
-        assert_eq!((queued.rpc, queued.epoch), (RpcId(1), Some(3)));
-        assert_eq!(queued.item.command(), &VenueCommand::FeeQuery);
+        let first = queued(shared.pop());
+        assert_eq!((first.rpc, first.epoch), (RpcId(1), Some(3)));
+        assert_eq!(first.item.command(), &VenueCommand::FeeQuery);
         shared.end();
         assert!(!shared.waiting());
         assert_eq!(shared.ready(), None);

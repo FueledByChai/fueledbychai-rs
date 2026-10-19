@@ -229,11 +229,11 @@ impl ExecCodec for Big {
 // Helpers.
 // ---------------------------------------------------------------------------------------------
 
-/// A session of the stalling toy at `server`, its outbound queue bounded by `outbound` and its
+/// A session of the stalling toy at `url`, its outbound queue bounded by `outbound` and its
 /// requests in flight by `in_flight`, journaling into `journal`; its orders and what its
 /// handler keeps.
 fn session(
-    server: &ScriptedWs,
+    url: &str,
     outbound: ReservedBound,
     in_flight: &InFlight,
     journal: &Rc<RefCell<Kept>>,
@@ -244,7 +244,7 @@ fn session(
     Handles,
     Events,
 ) {
-    let mut config = session_config(&server.url(), &Reserved::default());
+    let mut config = session_config(url, &Reserved::default());
     config.venue = &STALLING;
     config.outbound = outbound;
     config.in_flight = in_flight.clone();
@@ -387,7 +387,7 @@ async fn a_normal_command_past_the_outbound_bound_is_not_sent_backpressure_while
     let journal = Rc::new(RefCell::new(Kept::default()));
     let in_flight = InFlight::new(bound(64, 64));
     let (mut session, control, orders, handles, events) =
-        session(&server, bound(2, 1), &in_flight, &journal);
+        session(&server.url(), bound(2, 1), &in_flight, &journal);
     let mut oms = Oms::armed();
     let watch = Rc::clone(&handles);
     let script = async move {
@@ -453,8 +453,9 @@ async fn a_normal_command_past_the_outbound_bound_is_not_sent_backpressure_while
 /// out unanswered and fill the Normal bound; a third place and an order query (a control
 /// command, normal traffic) are `NotSent(RateBudget)` with nothing written, while a cancel
 /// still goes out, from the reserve; a second cancel, the reserve full too, is refused. Once the
-/// venue answers the first place, a place goes out again. When the session ends, the requests it
-/// still had in flight are given back to the table.
+/// venue answers the first place, the cancel and the second place still fill the Normal bound,
+/// so a place is refused; once it answers the second, a place goes out again. When the session
+/// ends, the requests it still had in flight are given back to the table.
 #[tokio::test(start_paused = true)]
 async fn a_normal_request_past_the_in_flight_bound_is_not_sent_rate_budget_while_a_cancel_still_goes_out()
  {
@@ -463,7 +464,7 @@ async fn a_normal_request_past_the_in_flight_bound_is_not_sent_rate_budget_while
     let journal = Rc::new(RefCell::new(Kept::default()));
     let in_flight = InFlight::new(bound(2, 1));
     let (mut session, control, orders, handles, events) =
-        session(&server, bound(64, 64), &in_flight, &journal);
+        session(&server.url(), bound(64, 64), &in_flight, &journal);
     let mut oms = Oms::armed();
     let table = in_flight.clone();
     let watch = Rc::clone(&handles);
@@ -499,15 +500,20 @@ async fn a_normal_request_past_the_in_flight_bound_is_not_sent_rate_budget_while
         churn().await;
         assert!(peer.quiet());
 
-        // An answer gives its place back: a place goes out again.
+        // Answers give their places back: with the cancel alone in flight, a place goes out
+        // again.
         peer.send(&format!("item|rpc={}|i=0|res=ok", first.0));
         settle(|| table.held() == 2).await;
+        let held = orders.submit(oms.place()).unwrap();
+        assert_eq!(outcome(&handles, held).await, budget);
+        peer.send(&format!("item|rpc={}|i=0|res=ok", second.0));
+        settle(|| table.held() == 1).await;
         let again = orders.submit(oms.place()).unwrap();
         written(&mut peer, "place", again).await;
         assert_eq!(outcome(&handles, again).await, Ok(()));
-        assert_eq!(table.held(), 3);
+        assert_eq!(table.held(), 2);
         drop(control);
-        [past, queried, full]
+        [past, queried, full, held]
     };
     let (run, refused) = tokio::join!(session.run(), script);
     run.unwrap();
@@ -515,8 +521,71 @@ async fn a_normal_request_past_the_in_flight_bound_is_not_sent_rate_budget_while
     for rpc in refused {
         assert!(!wrote(&journal, rpc));
     }
-    assert_eq!(session.counters().in_flight_refusals, 3);
+    assert_eq!(session.counters().in_flight_refusals, 4);
     assert_eq!(session.counters().backpressure_refusals, 0);
     // The session ended: what it still had in flight is the table's again.
     assert_eq!(in_flight.held(), 0);
+}
+
+/// While the session waits for its connection to open, a fee query fills the Normal bound of a
+/// queue with no reserve and a second is refused. The first is `NotSent(Disconnected)`, as a
+/// command submitted with no authenticated epoch is (0057), and the second
+/// `NotSent(Backpressure)`, its refusal journaled as its write result under Normal, neither
+/// written.
+#[tokio::test(start_paused = true)]
+async fn a_refusal_waiting_while_the_session_connects_is_reported_backpressure_and_journaled() {
+    let thaw = freeze();
+    let (addr, _accepts) = common::hanging().await;
+    let journal = Rc::new(RefCell::new(Kept::default()));
+    let in_flight = InFlight::new(bound(64, 64));
+    let url = format!("ws://{addr}/");
+    let (mut session, control, orders, handles, _) =
+        session(&url, bound(1, 0), &in_flight, &journal);
+    let watch = Rc::clone(&handles);
+    let script = async move {
+        let handles = watch;
+        let fees = || fbc_oms::ControlCommand::FeeQuery;
+        let queried = orders.submit_control(fees()).unwrap();
+        let past = orders.submit_control(fees()).unwrap();
+        let disconnected = Err(NotSentReason::Disconnected);
+        assert_eq!(outcome(&handles, queried).await, disconnected);
+        let backpressure = Err(NotSentReason::Backpressure);
+        assert_eq!(outcome(&handles, past).await, backpressure);
+        drop(control);
+        (queried, past)
+    };
+    let (run, (queried, past)) = tokio::join!(session.run(), script);
+    run.unwrap();
+    drop(thaw);
+    let refused = WriteRes::NotSent(NotSentReason::Backpressure);
+    assert_eq!(
+        write_results(&journal, past),
+        [(TrafficClass::Normal, refused)]
+    );
+    assert!(write_results(&journal, queried).is_empty());
+    assert_eq!(handles.borrow().len(), 2);
+    assert_eq!(session.counters().backpressure_refusals, 1);
+}
+
+/// An authorization for another account than the session's is refused as it is submitted
+/// (0057) and takes no place in the queue: with room for one Normal command, a fee query
+/// submitted next still waits as a command, not as a refusal.
+#[tokio::test(start_paused = true)]
+async fn an_authorization_for_another_account_takes_no_place_in_the_queue() {
+    let mut config = session_config("ws://127.0.0.1:9/", &Reserved::default());
+    config.acct = fbc_core::AccountKey::new(9);
+    config.outbound = bound(1, 0);
+    let (handles, events) = (Handles::default(), Events::default());
+    let keep = Keep { handles, events };
+    let (session, _control) = ExecSession::new(config, keep).unwrap();
+    let orders = session.orders();
+    let mut oms = Oms::armed();
+    let refused = orders.submit(oms.place());
+    assert_eq!(refused, Err(fbc_runtime::SubmitRefusal::OtherAccount));
+    assert!(
+        orders
+            .submit_control(fbc_oms::ControlCommand::FeeQuery)
+            .is_ok()
+    );
+    assert_eq!(session.counters().backpressure_refusals, 0);
 }
