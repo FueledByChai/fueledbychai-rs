@@ -408,10 +408,10 @@ fn cancels_go_in_cancel_manys_of_at_most_the_declared_size_naming_only_its_refer
     assert_eq!(kinds(&plan), vec![("cancel-many", 2), ("cancel-many", 2)]);
 }
 
-#[test]
-fn a_cancel_whose_order_the_batch_cannot_name_goes_alone() {
-    // A venue whose single cancel takes a client id before the acknowledgement while its
-    // cancel-many takes venue ids only: the order not acknowledged is cancelled alone.
+/// A pass cancelling the `levels` bids of a venue whose single cancel takes a client id
+/// before the acknowledgement while its cancel-many takes venue ids only, every bid but
+/// `unacked` acknowledged; with the client id of the bid not acknowledged.
+fn cancel_all_but_one_acked(levels: u16, unacked: u16) -> (Plan, ClientOrderId) {
     let mut reg = quoting(0);
     let caps = OrderCaps {
         cancel_before_ack: true,
@@ -421,13 +421,13 @@ fn a_cancel_whose_order_the_batch_cannot_name_goes_alone() {
     let mut p = planner();
     let mut m = mint();
     let placed = p
-        .plan(&bids(3), &mut reg, &venue, ACCT, &mut m, MonoNs(0))
+        .plan(&bids(levels), &mut reg, &venue, ACCT, &mut m, MonoNs(0))
         .unwrap();
-    let mut unacked = None;
+    let mut not_acked = None;
     for planned in &placed.commands {
         for (cid, side, level) in items(planned) {
-            if level == 1 {
-                unacked = Some(cid);
+            if level == unacked {
+                not_acked = Some(cid);
                 continue;
             }
             let item = ItemRef {
@@ -452,13 +452,21 @@ fn a_cancel_whose_order_the_batch_cannot_name_goes_alone() {
             MonoNs(2),
         )
         .unwrap();
+    (plan, not_acked.unwrap())
+}
+
+#[test]
+fn a_cancel_whose_order_the_batch_cannot_name_goes_alone() {
+    // The order not acknowledged, last in level order, is cancelled alone; the two before it
+    // go in one cancel-many.
+    let (plan, unacked) = cancel_all_but_one_acked(3, 2);
     let singles: Vec<ClientOrderId> = plan
         .commands
         .iter()
         .filter(|c| matches!(c.auth.command(), VenueCommand::Cancel(_)))
         .map(|c| c.cid)
         .collect();
-    assert_eq!(singles, vec![unacked.unwrap()]);
+    assert_eq!(singles, vec![unacked]);
     let many: Vec<usize> = plan
         .commands
         .iter()
@@ -468,6 +476,28 @@ fn a_cancel_whose_order_the_batch_cannot_name_goes_alone() {
         })
         .collect();
     assert_eq!(many, vec![2]);
+}
+
+#[test]
+fn a_cancel_that_goes_alone_keeps_the_cancels_in_level_order() {
+    // Acknowledged levels 0 and 2 around an unacknowledged level 1 (Codex r4319919316 on
+    // PR #182): the cancel held for a cancel-many goes out before the single cancel after it,
+    // so the cancels come out in side and level order, as 0005 orders them.
+    let (plan, unacked) = cancel_all_but_one_acked(3, 1);
+    let levels: Vec<u16> = plan
+        .commands
+        .iter()
+        .flat_map(|c| items(c).into_iter().map(|(_, _, level)| level))
+        .collect();
+    assert_eq!(levels, vec![0, 1, 2]);
+    let alone = plan
+        .commands
+        .iter()
+        .find(|c| c.level == 1)
+        .expect("level 1 is cancelled");
+    assert_eq!(alone.cid, unacked);
+    assert!(alone.more_items.is_empty());
+    assert!(matches!(alone.auth.command(), VenueCommand::Cancel(_)));
 }
 
 /// A book on a long position of 10: a post-only bid (adds), a bid that is not post-only
