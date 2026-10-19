@@ -292,9 +292,9 @@ impl PeerEnd {
 impl Drop for PeerEnd {
     fn drop(&mut self) {
         // A peer borrowed as a panic unwinds is left as it is: a second panic would abort.
-        if std::thread::panicking() && self.stream.shared.peer.try_borrow_mut().is_err() {
-            return;
+        let borrowed = self.stream.shared.peer.try_borrow_mut().is_err();
+        if !(std::thread::panicking() && borrowed) {
+            self.close();
         }
-        self.close();
     }
 }
