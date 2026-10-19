@@ -32,7 +32,7 @@ use fbc_core::{
 };
 use fbc_oms::{
     Admission, AmendRefusal, CapRefusal, DesiredBook, DesiredQuote, Downgrade, ExecutionPlanner,
-    FillLedger, FillTime, LadderConfig, LedgerConfig, MarketCapsConfig, OmsError, OrderKey,
+    FillLedger, FillTime, LadderConfig, Leases, LedgerConfig, MarketCapsConfig, OmsError, OrderKey,
     OrderOp, Plan, PlanError, PlanRefusal, Planned, PlannerConfig, PreTradeCaps, ReduceFallback,
     Registry, ResyncSnapshot, Stage,
 };
@@ -1368,6 +1368,42 @@ fn a_resting_order_whose_quote_becomes_reducing_counts_against_an_emulated_order
     assert_emulated(placed(&pass.commands[0]), 2);
 }
 
+#[test]
+fn in_exit_an_emulated_order_whose_quote_becomes_ordinary_is_still_amended_as_a_reducer() {
+    // Codex r4315460452: long 10 in Flatten, an emulated exit of 5 rests. Its quote becomes an
+    // ordinary post-only ask of 5 at a new price: the order keeps its emulated mode, so it
+    // still cannot take the position past zero, and its amend is a reducer's, which Exit
+    // admits, never an ordinary amend Exit refuses.
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = amending(conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]));
+    let first = book().with(
+        Side::Sell,
+        0,
+        maker_exit(10_010, 5, ReduceFallback::EmulateReduceOnly),
+    );
+    let plan = plan_and_send(&mut p, &first, &mut reg, &caps, &mut mint, MonoNs(0));
+    let emulated = plan.commands[0].cid;
+    assert_emulated(placed(&plan.commands[0]), 5);
+    ack(&mut reg, emulated, "v0");
+    Registry::flatten(&mut reg, INST, Leases::none()).unwrap();
+    let next = book().with(Side::Sell, 0, post_only_ask(10_020, 5, false));
+    let pass = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER);
+    assert!(pass.refused.is_empty(), "{:?}", pass.refused);
+    assert_eq!(
+        shape(&pass),
+        vec![(Stage::Reducing, "amend", Side::Sell, 0)]
+    );
+    assert_eq!(pass.commands[0].cid, emulated);
+    match pass.commands[0].auth.command() {
+        VenueCommand::Amend(a) => {
+            assert_eq!((a.px, a.qty, a.reducing), (Ticks(10_020), lots(5), true));
+        }
+        other => panic!("expected an amend, got {other:?}"),
+    }
+}
+
 /// A post-only ask of `qty` at `px` without the venue flag, classified reducing or not.
 fn post_only_ask(px: i64, qty: i64, reducing: bool) -> DesiredQuote {
     DesiredQuote {
@@ -1563,10 +1599,15 @@ fn an_emulated_order_whose_quote_becomes_ordinary_stays_within_what_is_left_to_r
         reduce_only(limit(10_030, 5)),
     );
     let pass = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER);
-    assert_eq!(shape(&pass), vec![(Stage::Amend, "amend", Side::Sell, 0)]);
+    // Still emulated, it is still a reducer (Codex r4315460452): built among the reducers and
+    // classified reducing.
+    assert_eq!(
+        shape(&pass),
+        vec![(Stage::Reducing, "amend", Side::Sell, 0)]
+    );
     assert_eq!(pass.commands[0].cid, emulated);
     match pass.commands[0].auth.command() {
-        VenueCommand::Amend(a) => assert_eq!(a.qty, lots(5)),
+        VenueCommand::Amend(a) => assert_eq!((a.qty, a.reducing), (lots(5), true)),
         other => panic!("expected an amend, got {other:?}"),
     }
     // Its amend in flight, nothing more is built: no cancel, no second amend.
