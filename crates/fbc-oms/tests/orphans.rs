@@ -1395,3 +1395,59 @@ fn an_orphans_earlier_fills_that_overflow_the_inventory_leave_its_position_unkno
     assert_eq!(reg.orphans(INST), vec![o]);
     assert_eq!(reg.position(INST), None);
 }
+
+#[test]
+fn a_lost_order_shown_open_again_keeps_the_venue_ids_an_amend_replaced() {
+    // Codex's r4315681141 on PR #171: our buy, open as `a` and amended onto `b`, goes on the
+    // ladder with an unanswered cancel and ends Lost; a later snapshot shows it open as `b`.
+    // Registered again, it still knows `a` was replaced: a delayed cancel naming only `a` does
+    // not end it, so it stays an orphan, counted on both caps.
+    let mut reg = seeded(0);
+    arm::start(&mut reg, INST);
+    let order = buy(5);
+    let c = order.cid;
+    place(&mut reg, order).unwrap();
+    reg.placement_sent(c, MonoNs(1_100), WallNs(1_100)).unwrap();
+    let mut open = update(Some(c), VenueOrderState::Open, 0);
+    open.vid = Some(vid("a"));
+    reg.apply_update(&open, key(1_200));
+    let mut amended = update(
+        None,
+        VenueOrderState::Amended {
+            new_vid: Some(vid("b")),
+        },
+        0,
+    );
+    amended.vid = Some(vid("a"));
+    reg.apply_update(&amended, key(1_300));
+    reg.cancel_sent(c, RpcId(7), MonoNs(1_400)).unwrap();
+    reg.on_outcome(
+        c,
+        OrderOp::Cancel(RpcId(7)),
+        &ItemRef {
+            idx: 0,
+            cid: Some(c),
+            vid: None,
+        },
+        &SubmitOutcome::Unknown,
+        MonoNs(1_500),
+    )
+    .unwrap();
+    let report = resync_at(&mut reg, SnapshotSource::Trustworthy, 2_000, vec![], 0);
+    assert_eq!(report.ladder.lost, vec![c], "{report:?}");
+    resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        3_000,
+        vec![ours(c, "b", Side::Buy)],
+        0,
+    );
+    assert_eq!(reg.orphans(INST), vec![c]);
+
+    let mut late = update(None, canceled(), 0);
+    late.vid = Some(vid("a"));
+    reg.apply_update(&late, key(3_500));
+    assert!(!reg.get(c).unwrap().state().is_terminal());
+    assert_eq!(reg.orphans(INST), vec![c]);
+    assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(5)));
+}
