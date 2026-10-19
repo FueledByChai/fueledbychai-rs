@@ -620,6 +620,133 @@ fn an_order_that_genuinely_reduces_the_position_is_admitted_by_the_formula() {
     assert_eq!(reg.place(reduce_only(sell(1))), Err(capped(Side::Sell, 51)));
 }
 
+// ---- past the inventory cap: the venue's reduce-only flag (FBC-ugto) ----
+
+/// `order` classified reducing by the OMS but without the venue's reduce-only flag, as an
+/// emulated reduce-only order goes out (FBC-01w).
+fn emulated(order: NewOrder) -> NewOrder {
+    NewOrder {
+        reducing: true,
+        ..order
+    }
+}
+
+#[test]
+fn past_the_inventory_cap_a_venue_reduce_only_place_that_shrinks_the_worst_case_is_built() {
+    // The owner's answer of 2026-10-19 ("Exempt venue reduce-only"): long 62 under an inventory
+    // cap of 50 and a resting cap of 11 (test inputs only), an offer of 11 leaves a worst case
+    // of 51. With the venue's reduce-only flag it is built, and authorized; without it, an
+    // ordinary or an emulated reducer is refused as before.
+    let mut reg = registry(CAP, L0);
+    let mut l = ledger();
+    position(&mut reg, &mut l, Side::Buy, 62, "p");
+    assert_eq!(reg.place(sell(L0)), Err(capped(Side::Sell, 51)));
+    assert_eq!(reg.place(emulated(sell(L0))), Err(capped(Side::Sell, 51)));
+    let flagged = reduce_only(sell(L0));
+    let c = flagged.cid;
+    arm::place_issued(&mut reg, flagged);
+    assert_eq!(reg.get(c).unwrap().state(), OrdState::PendingNew);
+    // The resting cap still applies: the side has its 11 resting.
+    assert_eq!(
+        reg.place(reduce_only(sell(1))),
+        Err(resting_capped(Side::Sell, 12))
+    );
+    // A bid grows the buy side's worst case: refused, flagged or not.
+    assert_eq!(reg.place(buy(1)), Err(capped(Side::Buy, 63)));
+    assert_eq!(reg.place(reduce_only(buy(1))), Err(capped(Side::Buy, 63)));
+    // The same short.
+    let mut reg = registry(CAP, L0);
+    position(&mut reg, &mut l, Side::Sell, 62, "q");
+    assert_eq!(reg.place(emulated(buy(L0))), Err(capped(Side::Buy, 51)));
+    arm::place_issued(&mut reg, reduce_only(buy(L0)));
+    assert_eq!(reg.place(reduce_only(sell(1))), Err(capped(Side::Sell, 63)));
+}
+
+#[test]
+fn past_the_inventory_cap_a_venue_reduce_only_order_that_would_grow_the_worst_case_is_refused() {
+    // Long 60 with 110 offered: the sell side's worst case is |60 - 110| = 50, at the cap. A
+    // reduce-only offer of 1 more would take it to 51, growing it: refused (the flag exempts
+    // only an order that strictly shrinks the worst case).
+    let mut reg = registry(CAP, WIDE);
+    let mut l = ledger();
+    position(&mut reg, &mut l, Side::Buy, 60, "p");
+    arm::place_issued(&mut reg, sell(30));
+    arm::place_issued(&mut reg, sell(80));
+    assert_eq!(reg.place(reduce_only(sell(1))), Err(capped(Side::Sell, 51)));
+    // Long 120 with those 110 offered: |120 - 110| = 10, within the cap, every flagged offer
+    // judged by the formula; past 50 more, refused.
+    position(&mut reg, &mut l, Side::Buy, 60, "p2");
+    arm::place_issued(&mut reg, reduce_only(sell(L0)));
+    assert_eq!(
+        reg.place(reduce_only(sell(50))),
+        Err(capped(Side::Sell, 51))
+    );
+}
+
+#[test]
+fn past_the_inventory_cap_a_venue_reduce_only_amend_or_batch_item_that_shrinks_the_worst_case_is_built()
+ {
+    let venue = amending(true);
+    let mut l = ledger();
+    // Offers of 5 rest while flat, one flagged reduce-only; fills then take the position to
+    // 72 long, so the sell side's worst case is 62, past the cap.
+    let mut reg = registry(CAP, WIDE);
+    let plain = open(&mut reg, sell(5), "a");
+    let flagged = open(&mut reg, reduce_only(sell(5)), "b");
+    position(&mut reg, &mut l, Side::Buy, 72, "p");
+    // Raising either to 11: the worst case falls to |72 - 5 - 11| = 56, still past the cap.
+    // The ordinary one, classified reducing or not, is refused; the flagged one is built.
+    for reducing in [false, true] {
+        assert_eq!(
+            amend(&mut reg, &venue, plain, L0, reducing),
+            Err(AmendRefusal::Capped(breach(Side::Sell, Some(56), CAP)))
+        );
+    }
+    amend(&mut reg, &venue, flagged, L0, true).unwrap();
+    // Batch items are judged the same way, each with the earlier ones admitted counted: long
+    // 80, a flagged offer of 11 leaves 69, a second 58, both past the cap; an emulated one is
+    // refused, and so is a bid; the batch is authorized, judged again whole.
+    let mut reg = registry(CAP, WIDE);
+    position(&mut reg, &mut l, Side::Buy, 80, "q");
+    let items = vec![
+        emulated(sell(L0)),
+        reduce_only(sell(L0)),
+        reduce_only(buy(1)),
+        reduce_only(sell(L0)),
+    ];
+    let cids: Vec<ClientOrderId> = items.iter().map(|o| o.cid).collect();
+    let plan = reg.place_batch(items.clone()).unwrap();
+    assert_eq!(
+        plan.refused,
+        vec![
+            (cids[0], capped(Side::Sell, 69)),
+            (cids[2], capped(Side::Buy, 81)),
+        ]
+    );
+    assert_eq!(
+        plan.command.as_ref().unwrap().command(),
+        &VenueCommand::PlaceBatch(vec![items[1].clone(), items[3].clone()])
+    );
+    arm::issue(&mut reg, plan.command.unwrap());
+    assert_eq!(reg.resting_on(INST, Side::Sell), Some(lots(22)));
+}
+
+#[test]
+fn a_venue_reduce_only_place_that_no_longer_shrinks_the_worst_case_is_refused_at_authorization() {
+    // Built at long 62 (worst case 51 with it), the flagged offer is judged again as it is
+    // authorized: fills since took the position to 58 short, so the offer would take the worst
+    // case from 58 to 69. It no longer shrinks it: refused.
+    let mut reg = registry(CAP, L0);
+    let mut l = ledger();
+    position(&mut reg, &mut l, Side::Buy, 62, "p");
+    let cmd = reg.place(reduce_only(sell(L0))).unwrap();
+    position(&mut reg, &mut l, Side::Sell, 120, "q");
+    assert_eq!(
+        reg.authorize(arm::TEST_ACCT, cmd).unwrap_err(),
+        fbc_oms::IssueRefusal::Capped(breach(Side::Sell, Some(69), CAP))
+    );
+}
+
 // ---- cancels ----
 
 #[test]

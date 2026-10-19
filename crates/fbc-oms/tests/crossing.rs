@@ -9,13 +9,15 @@
 //!   orders resting that reduce it on its side); nothing is planned while the position is flat,
 //!   unknown or on the intent's side.
 //! - It is refused in Killed and Cancel-only, admitted in Exit and Quoting through FBC-7gl's
-//!   admission, and both caps still apply.
+//!   admission, and both caps still apply; carrying the venue's reduce-only flag, it passes the
+//!   inventory cap while it strictly shrinks the side's worst case, even past the cap
+//!   (FBC-ugto), and the resting cap still bounds each cross.
 //! - At most one order is planned per attempt: an order that ended (filled, expired, or
 //!   refused by the venue, a price band's or a minimum notional's refusal included) is not
 //!   crossed again until the consumer names a new attempt.
 //!
-//! The values are the owner's first test values: a $50 inventory cap on a synthetic market
-//! where one lot is worth $1, so 50 lots, and a wide resting cap unless a test judges it.
+//! The cap values are test inputs only: an inventory cap of 50 lots on a synthetic market, and
+//! a wide resting cap unless a test judges it.
 
 #[path = "common/arm.rs"]
 mod arm;
@@ -43,7 +45,7 @@ use fbc_oms::{
 
 const INST: InstrumentId = InstrumentId::new(1);
 const ACCT: AccountKey = AccountKey::new(1);
-/// The owner's first inventory cap, in lots of $1.
+/// The tests' inventory cap, in lots.
 const CAP: i64 = 50;
 /// A resting cap past any order of these tests.
 const WIDE: i64 = 1_000_000;
@@ -770,59 +772,160 @@ fn a_crossing_intent_is_refused_by_the_resting_cap_and_the_inventory_cap() {
     );
 }
 
-#[test]
-fn a_position_past_the_inventory_cap_by_more_than_the_resting_cap_admits_no_crossing() {
-    // Decision 0110's consequence (Reviewer B on PR #180): with no other order on the side, a
-    // reducing sell of q on a long P passes the inventory cap only if P - q <= cap and the
-    // resting cap only if q <= resting, so a cross exists only while P <= cap + resting.
-    let caps = ioc_venue(&[]);
-    let mut mint = mint();
-    // Long 61 under caps of 50 and 11: the cross of 11 is built.
-    let mut reg = quoting_resting(61, 11);
-    let mut p = planner();
-    let desired = book().with_crossing(Side::Sell, cross(9_900, 11, 1));
-    let plan = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, MonoNs(0));
-    assert_eq!(
-        shape(&plan),
-        vec![(Stage::Reducing, "place", Side::Sell, CROSSING_LEVEL, true)]
-    );
-    // Long 62: a cross of 11 leaves a worst case of 51, past the inventory cap, and one of 12
-    // (or the whole 62) is past the resting cap, in Quoting and in Exit alike.
-    let refusal = |qty: i64| {
-        if qty <= 11 {
-            CapRefusal::InventoryCap {
-                inst: INST,
-                side: Side::Sell,
-                worst: Some(lots(62 - qty)),
-                cap: lots(CAP),
-            }
-        } else {
-            CapRefusal::RestingCap {
-                inst: INST,
-                side: Side::Sell,
-                resting: Some(lots(qty)),
-                cap: lots(11),
-            }
+/// The state a test judges a market in: Quoting by Start, or Exit by Flatten or Wind-down.
+#[derive(Copy, Clone, Debug)]
+enum Mode {
+    Quoting,
+    Flatten,
+    WindDown,
+}
+
+const MODES: [Mode; 3] = [Mode::Quoting, Mode::Flatten, Mode::WindDown];
+
+/// Moves the Quoting market `INST` to `mode`.
+fn enter(reg: &mut Registry, mode: Mode) {
+    match mode {
+        Mode::Quoting => {}
+        Mode::Flatten => flatten(reg),
+        Mode::WindDown => {
+            reg.disarm(INST);
+            let given = leases(reg, INST);
+            reg.wind_down(INST, given).unwrap();
         }
-    };
-    for exit in [false, true] {
-        for qty in [11, 12, 62] {
-            let mut reg = quoting_resting(62, 11);
-            if exit {
-                flatten(&mut reg);
-            }
-            let mut p = planner();
-            let desired = book().with_crossing(Side::Sell, cross(9_900, qty, 1));
-            let plan = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, MonoNs(0));
-            assert!(plan.commands.is_empty(), "{:?}", shape(&plan));
+    }
+}
+
+#[test]
+fn a_position_past_the_inventory_cap_by_more_than_the_resting_cap_is_crossed_in_resting_cap_steps()
+{
+    // FBC-ugto, the owner's answer of 2026-10-19 ("Exempt venue reduce-only"): a venue-flagged
+    // reduce-only order that strictly shrinks the side's worst case passes the inventory cap
+    // even when the worst case stays past it; the resting cap still applies. Long 62 under an
+    // inventory cap of 50 and a resting cap of 11 (test inputs only): a cross of 11 leaves a
+    // worst case of 51, past the inventory cap, and is built; the position comes down 62 ->
+    // 51 -> 40, in Quoting and in Exit by Flatten or Wind-down alike.
+    let caps = ioc_venue(&[]);
+    for mode in MODES {
+        let mut reg = quoting_resting(62, 11);
+        enter(&mut reg, mode);
+        let mut mint = mint();
+        let mut p = planner();
+        let mut l = ledger();
+        // A cross past the resting cap is still refused by it, whatever its size.
+        for (attempt, qty) in [(1, 12), (2, 62)] {
+            let desired = book().with_crossing(Side::Sell, cross(9_900, qty, attempt));
+            let now = MonoNs(attempt);
+            let plan = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, now);
+            assert!(plan.commands.is_empty(), "{mode:?}: {:?}", shape(&plan));
             assert_eq!(
                 refused_crossing(&plan),
                 vec![(
                     Side::Sell,
-                    PlanRefusal::Place(OmsError::Capped(refusal(qty)))
+                    PlanRefusal::Place(OmsError::Capped(CapRefusal::RestingCap {
+                        inst: INST,
+                        side: Side::Sell,
+                        resting: Some(lots(qty)),
+                        cap: lots(11),
+                    }))
                 )],
-                "exit {exit}, qty {qty}"
+                "{mode:?}, qty {qty}"
             );
+        }
+        // Crosses of 11, each authorized (judged against both caps again) and filled.
+        for (attempt, now, left) in [(3, LATER, 51), (4, LATER2, 40)] {
+            let desired = book().with_crossing(Side::Sell, cross(9_900, 11, attempt));
+            let plan = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, now);
+            assert_eq!(
+                shape(&plan),
+                vec![(Stage::Reducing, "place", Side::Sell, CROSSING_LEVEL, true)],
+                "{mode:?}, attempt {attempt}"
+            );
+            assert_crossing(placed(&plan.commands[0]), Side::Sell, 9_900, 11, Tif::Ioc);
+            let c = plan.commands[0].cid;
+            let v = format!("v{attempt}");
+            ack(&mut reg, c, &v);
+            fill_of(&mut reg, &mut l, c, Side::Sell, 11, &format!("f{attempt}"));
+            ended(
+                &mut reg,
+                c,
+                Side::Sell,
+                &v,
+                VenueOrderState::Filled,
+                attempt,
+            );
+            assert_eq!(reg.position(INST), Some(SignedLots(left)), "{mode:?}");
+        }
+    }
+}
+
+#[test]
+fn past_the_inventory_cap_an_emulated_reducer_and_an_order_that_grows_the_worst_case_stay_refused()
+{
+    // The exemption is the venue's reduce-only flag's alone (FBC-ugto): an emulated reduce-only
+    // order, which goes out without the flag (FBC-01w), passes the inventory cap only by the
+    // formula, and so does any order that would grow the side's worst case.
+    let venue = ioc_venue(&[(Feature::PostOnly, Feature::ReduceOnly)]);
+    let maker = DesiredQuote {
+        post_only: true,
+        reduce_fallback: ReduceFallback::EmulateReduceOnly,
+        ..reduce_only(limit(10_020, 11))
+    };
+    let worst = |side, worst| {
+        PlanRefusal::Place(OmsError::Capped(CapRefusal::InventoryCap {
+            inst: INST,
+            side,
+            worst: Some(lots(worst)),
+            cap: lots(CAP),
+        }))
+    };
+    for mode in MODES {
+        let mut reg = quoting_resting(62, 11);
+        enter(&mut reg, mode);
+        let mut mint = mint();
+        let mut p = planner();
+        let desired = book().with(Side::Sell, 0, maker.clone());
+        let plan = plan_and_send(&mut p, &desired, &mut reg, &venue, &mut mint, MonoNs(0));
+        assert!(plan.commands.is_empty(), "{mode:?}: {:?}", shape(&plan));
+        let refused: Vec<_> = plan
+            .refused
+            .iter()
+            .map(|r| (r.side, r.why.clone()))
+            .collect();
+        assert_eq!(
+            refused,
+            vec![(Side::Sell, worst(Side::Sell, 51))],
+            "{mode:?}"
+        );
+        assert!(reg.is_empty());
+    }
+    // A buy on the long grows the buy side's worst case: refused by the inventory cap in
+    // Quoting, the venue's reduce-only flag making no difference, and by Exit's admission in
+    // Exit.
+    let caps = ioc_venue(&[]);
+    for bid in [limit(9_990, 1), reduce_only(limit(9_990, 1))] {
+        for mode in MODES {
+            let mut reg = quoting_resting(62, 11);
+            enter(&mut reg, mode);
+            let mut mint = mint();
+            let mut p = planner();
+            let desired = book().with(Side::Buy, 0, bid.clone());
+            let plan = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, MonoNs(0));
+            assert!(plan.commands.is_empty(), "{mode:?}: {:?}", shape(&plan));
+            let why = match mode {
+                Mode::Quoting => worst(Side::Buy, 63),
+                Mode::Flatten | Mode::WindDown => PlanRefusal::Place(OmsError::State(
+                    StateRefusal::Exit(ExitRefusal::Increasing {
+                        inst: INST,
+                        side: Side::Buy,
+                    }),
+                )),
+            };
+            let refused: Vec<_> = plan
+                .refused
+                .iter()
+                .map(|r| (r.side, r.why.clone()))
+                .collect();
+            assert_eq!(refused, vec![(Side::Buy, why)], "{mode:?} {bid:?}");
         }
     }
 }
