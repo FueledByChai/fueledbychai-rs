@@ -192,9 +192,9 @@ fn discovery_refuses_a_configuration_it_cannot_send_by_the_key_at_fault() {
 fn the_documented_answer_decodes_into_one_draft_per_perpetual_in_the_decode_scope() {
     let drafts = discover(&exchange_info()).unwrap();
     // The delivery contract, the TradFi perpetual and the settling symbol whose contractType is
-    // empty are not PERPETUALs: none is a draft. 1000000MOGUSDT is a PERPETUAL whose base asset
-    // is longer than an asset symbol holds: passed over, not a refusal of every other symbol
-    // (Codex r4311120955).
+    // empty are not PERPETUALs: none is a draft. 1000000MOGUSDT and 币安人生USDT are PERPETUALs
+    // whose base asset an asset symbol cannot hold (longer than eight bytes; not ASCII): each is
+    // passed over, not a refusal of every other symbol (Codex r4311120955, Reviewer B RB-1).
     assert_eq!(
         symbols(&drafts),
         ["BTCUSDT", "ETHUSDT", "BTCUSDC", "OLDUSDT"]
@@ -364,8 +364,6 @@ fn a_value_stated_but_invalid_is_malformed_and_named() {
         ("status", "PAUSED".into(), "status"),
         ("status", 1.into(), "status"),
         ("symbol", 7.into(), "symbol"),
-        ("baseAsset", "BT C".into(), "baseAsset"),
-        ("baseAsset", "BTC\u{e9}".into(), "baseAsset"),
         ("quoteAsset", "".into(), "quoteAsset"),
         ("marginAsset", 1.into(), "marginAsset"),
         ("filters", json!({}), "filters"),
@@ -491,19 +489,26 @@ fn a_java_era_x_usdt_ticker_names_the_xusdt_perpetual_and_no_other_form_is_read(
 
 #[test]
 fn a_perpetual_whose_asset_names_do_not_fit_an_asset_symbol_is_passed_over_alone() {
-    // Binance lists multiplier-prefixed perpetuals (1000000MOGUSDT, base 1000000MOG): the core's
-    // asset symbol holds at most eight bytes, so such a perpetual cannot be keyed. It is passed
-    // over before its filters are read; every other symbol is still discovered (Codex
-    // r4311120955).
+    // Binance lists multiplier-prefixed perpetuals (1000000MOGUSDT, base 1000000MOG) and ones
+    // named in other scripts (币安人生USDT, base 币安人生): the core's asset symbol holds at most
+    // eight bytes of printable ASCII, so such a perpetual cannot be keyed. It is passed over
+    // before its symbol and filters are read; every other symbol is still discovered (Codex
+    // r4311120955, Reviewer B RB-1). An empty name, or one that is not a string, is still
+    // malformed.
     let expected = ["BTCUSDT", "ETHUSDT", "BTCUSDC", "OLDUSDT"];
     for field in ["baseAsset", "quoteAsset", "marginAsset"] {
-        let long = with_btc(|m| {
-            m.insert(field.into(), "1MBABYDOGE".into());
-            filters(m).clear();
-        });
-        let drafts = discover(&long).unwrap();
-        assert_eq!(symbols(&drafts), expected[1..], "{field}");
+        for name in ["1MBABYDOGE", "币安人生", "BTC\u{e9}", "BT C", "\u{7f}"] {
+            let unkeyable = with_btc(|m| {
+                m.insert(field.into(), name.into());
+                m.insert("symbol".into(), "".into());
+                filters(m).clear();
+            });
+            let drafts = discover(&unkeyable).unwrap();
+            assert_eq!(symbols(&drafts), expected[1..], "{field}={name:?}");
+        }
     }
-    let mog = with_symbol(7, |m| drop(m.insert("filters".into(), json!(7))));
-    assert_eq!(symbols(&discover(&mog).unwrap()), expected);
+    for n in [7, 8] {
+        let listed = with_symbol(n, |m| drop(m.insert("filters".into(), json!(7))));
+        assert_eq!(symbols(&discover(&listed).unwrap()), expected, "symbol {n}");
+    }
 }
