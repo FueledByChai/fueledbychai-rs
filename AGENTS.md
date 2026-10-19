@@ -496,7 +496,12 @@ rather than guess.
     `fixtures/paradex/conformance/` and what they assume in `tests/conformance/setup.rs`; the
     SimVenue stand-in (`tests/sim_stand_in.rs`, FBC-2zxk, `fbc-sim` as a dev-dependency so
     `fbc-sim` names no venue): a SimVenue built from `caps()` places, amends, cancels and fills
-    (0102); and, in
+    (0102); the clustered-move benchmark (`tests/clustered_move.rs`, FBC-vgm, design §5.3):
+    fbc-runtime's shard host runs Paradex market data from a reference server of the test's own
+    (tokio's `net`, `tokio-tungstenite` and `futures-util` as dev-dependencies) beside this
+    codec's order entry against the conformance stub, each protective cancel written after at
+    most one signature in progress, and on Linux reports their kernel-receive-to-write-done p99
+    (0100); and, in
     `tests/oracle/` with `fbc-book` as a dev-dependency only, the
     BT-401 book and bbo-touch agreement checks), later `crates/venues/fbc-venue-hibachi`
     (0016).

@@ -7,7 +7,7 @@
 //! session takes places ([`ExecOrders::may_place`]) as it is handed the event that made it.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -71,6 +71,9 @@ pub struct Glue {
     caps: OrderCaps,
     ladder: LadderConfig,
     sent: HashMap<RpcId, Vec<Item>>,
+    /// The items of the commands planned on a shard host's ladder ([`Glue::planned`]), in the
+    /// order pushed, not yet reported submitted.
+    planned: VecDeque<Vec<Item>>,
     collecting: Option<ResyncSnapshot>,
     authenticated_at: Option<MonoNs>,
     origin: Instant,
@@ -91,6 +94,7 @@ impl Glue {
             caps,
             ladder,
             sent: HashMap::new(),
+            planned: VecDeque::new(),
             collecting: None,
             authenticated_at: None,
             origin: Instant::now(),
@@ -132,6 +136,16 @@ impl Glue {
         rpc
     }
 
+    /// Remembers the orders `auth` names, as it is pushed onto a shard host's ladder: the host
+    /// submits the ladder's commands in the order pushed, so a submission reported for a request
+    /// [`Glue::submit`] did not name is the next of these (decision 0100). Only the
+    /// clustered-move benchmark (`tests/clustered_move.rs`) uses it, not the rehearsal.
+    #[allow(dead_code)]
+    pub fn planned(&mut self, auth: &Authorization) {
+        let items = self.items_of(auth.command());
+        self.planned.push_back(items);
+    }
+
     fn items_of(&self, cmd: &VenueCommand) -> Vec<Item> {
         let cancel_of = |c: &fbc_core::CancelOrder| {
             let cid = c
@@ -170,7 +184,16 @@ impl Glue {
 
     fn on_submitted(&mut self, handle: SubmitHandle) {
         let SubmitHandle { rpc, receipt } = handle;
-        let items = self.sent.get(&rpc).cloned().unwrap_or_default();
+        let items = match self.sent.get(&rpc) {
+            Some(items) => items.clone(),
+            None => match self.planned.pop_front() {
+                Some(items) => {
+                    self.sent.insert(rpc, items.clone());
+                    items
+                }
+                None => Vec::new(),
+            },
+        };
         let (mono, wall) = self.now();
         for (idx, item) in items.into_iter().enumerate() {
             let (cid, op) = Glue::op(item, rpc);

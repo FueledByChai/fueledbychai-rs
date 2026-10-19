@@ -72,6 +72,12 @@ pub struct Book {
     /// and `{signature}` stand for the login's own headers, as a venue echoing them would
     /// write them (FBC-3f8z); once none is left, a login gives [`TOKEN`].
     pub refused_logins: VecDeque<(u16, String)>,
+    /// How many orders the stub has been asked to create.
+    pub creates: u64,
+    /// Called with [`Book::creates`] each time the stub is asked to create an order, once it has
+    /// built its answer and before it sends it: how a test makes something happen elsewhere when
+    /// the venue reads a place (the clustered-move benchmark sends its reference frames then).
+    pub on_create: Option<Box<dyn FnMut(u64) + Send>>,
 }
 
 impl Book {
@@ -339,6 +345,11 @@ pub fn responder(book: Shared) -> Responder {
                 let mut frames = vec![ok(json!({ "order": echo }))];
                 let seq = book.seq();
                 frames.push(Frame::Binary(order_event(&order, seq, 3, &order.size, "")));
+                book.creates += 1;
+                let created = book.creates;
+                if let Some(hook) = book.on_create.as_mut() {
+                    hook(created);
+                }
                 if fate == Fate::Fill {
                     book.fill_seq += 1;
                     let fill_id = format!("86152621480077{:05}", book.fill_seq);
