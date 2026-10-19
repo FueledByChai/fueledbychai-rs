@@ -78,8 +78,9 @@ are exactly mainnet's, `PARADEX_CHAIN_ID` (when set) is mainnet's, the caps are 
 resting per side and $50 inventory (smaller are taken), both `--bid-bps` and `--ask-bps` are at
 least 20, `--duration` is at most 3600 s (one hour; `MAINNET_DURATION_MAX` in
 `examples/testnet_quote/args.rs`), `--interval-ms` is at most 20000 (two thirds of the 30 s
-window for a cancel not ours, `mainnet_interval_max`: at a longer pause each of a co-tenant's
-cancels would fall past the window of the one before and the run would never Stop), and the venue
+window for a cancel not ours, `mainnet_interval_max`: a conservative bound kept beside the
+requote rule below, which Stops a co-tenant cancelling every requote however long a cycle
+takes), and the venue
 declares its snapshot trustworthy. Then, before
 the order socket connects, `GET /system/config` must name `PRIVATE_SN_PARACLEAR_MAINNET` and
 `GET /positions` must show no position on any other market. The resync must seed the market (never
@@ -109,8 +110,13 @@ or of a quote placed after the event, is another (so both quotes cancelled by ha
 time, seconds apart, are two: on mainnet that Stops the run). The first prints a `WARN` line (another program on the
 account, or the Paradex UI; one quoter per account) and the loop requotes. A second on a later
 cycle within 30 s of the first Stops the run and fails it ("another program cancelled our
-orders: one quoter per account"), which catches a 3 s reconcile within about 6 s; after 30 s
-with no second the window starts again. Once one was seen, the reconnect sweeps and Stop cancel
+orders: one quoter per account"), which catches a 3 s reconcile within about 6 s; so does one
+that cancels the loop's requote (the first order placed on a side after the event before) within
+30 s of that requote's place, however long the cycle that placed it took (its reads, settle and
+rate-limit waits do not count: Codex r4309154208 on PR #159); after 30 s with no second the
+window starts again. A cancel of ours that Paradex refuses (for its rate, say) stops covering its
+order at the refusal, so another program's cancel of it while ours waits is counted (Codex
+r4309154204). Once one was seen, the reconnect sweeps and Stop cancel
 our orders explicitly and never send an instrument cancel-all, which would cancel the other
 program's orders too. Without `--mainnet` each only warns. `SUMMARY` ends with `cancels not
 ours N`, the orders of ours they ended.

@@ -92,9 +92,12 @@
 //! second within [`EVENT_SPAN`] of the event's first and its order was placed before the event
 //! was seen; a requote cancelled again, or a cancel seconds later of any order, however old, is
 //! another); the first prints a `WARN` line and the loop requotes; with
-//! `--mainnet`, a second on a later cycle within [`Options::cancel_window`] (30 s) of the first
-//! Stops the run and fails it ("another program cancelled our orders: one quoter per account");
-//! past the window the next one starts a new window; a testnet run only warns. Once one was
+//! `--mainnet`, a second on a later cycle within [`Options::cancel_window`] (30 s) of the first,
+//! or one of the loop's requote (the first order it placed on a side after the event before)
+//! within the window of that requote's place, however long the cycle that placed it (Codex
+//! r4309154208 on PR #159), Stops the run and fails it ("another program cancelled our orders:
+//! one quoter per account"); past the window the next one starts a new window; a testnet run
+//! only warns. Once one was
 //! seen, another program may be on the account, so the run's cancels of everything (a
 //! reconnect's sweep, Stop) name our orders explicitly and never send an instrument cancel-all,
 //! which would cancel its orders too ([`Driver::cancel_ours`]). The summary counts them.
@@ -202,7 +205,8 @@ pub enum NotOurs {
     SameEvent,
     /// A new event with no other within the window before it: it starts the window (a WARN).
     First,
-    /// A new event within the window of the window's first: a mainnet run Stops.
+    /// A new event within the window of the window's first, or of the loop's requote within
+    /// the window of its place: a mainnet run Stops.
     Repeat,
 }
 
@@ -217,12 +221,35 @@ pub enum NotOurs {
 /// another action, as is one seconds later of an order that rested since before it (Codex
 /// r4308625185, RB-aoh5-1 on PR #159). An event the venue stamped no time on is judged by when
 /// it was seen instead.
+///
+/// A new event is a repeat when it comes within the window of the window's first event, or when
+/// it cancels the loop's requote of a side (the first order of ours placed on that side after
+/// the latest event was seen) within the window of that requote's place. The second is measured
+/// from our place, not from the event before: the loop requotes a side another program
+/// cancelled only on the next cycle, and its reads, settle waits and rate-limit waits can make
+/// that cycle longer than the window, so by the first measure alone a co-tenant cancelling every
+/// requote would only warn each cycle (Codex r4309154208, RB-aoh5-9 on PR #159). One that
+/// cancels a requote long after its place, or a later order (a replace of it), is judged by the
+/// first measure.
 #[derive(Clone, Debug)]
 pub struct CancelsNotOurs {
     window: Duration,
     orders: usize,
     first: Option<tokio::time::Instant>,
     latest: Option<Event>,
+    /// When each order of ours not ended was placed by this run.
+    placed: HashMap<ClientOrderId, tokio::time::Instant>,
+    /// The loop's requote of each side (bid, ask) since the latest event: the first order
+    /// placed on it after that event was seen, and when.
+    requotes: [Option<(ClientOrderId, tokio::time::Instant)>; 2],
+}
+
+/// The index of `side` in [`CancelsNotOurs::requotes`].
+fn side_index(side: Side) -> usize {
+    match side {
+        Side::Buy => 0,
+        Side::Sell => 1,
+    }
 }
 
 /// An event of cancels not ours: when it was seen, and the venue's time on its first cancel.
@@ -252,29 +279,54 @@ impl CancelsNotOurs {
             orders: 0,
             first: None,
             latest: None,
+            placed: HashMap::new(),
+            requotes: [None; 2],
         }
     }
 
-    /// One order of ours, placed by this run at `placed` (`None`: not placed by this run, an
-    /// earlier run's), ended by a cancel not ours the venue stamped `at`, seen at `now`: the
-    /// same event as the one before it when its order was placed before that one was seen and
-    /// the venue stamped it within [`EVENT_SPAN`] of that one's first; otherwise a repeat when
-    /// within the window of the window's first event, or the first of a new window.
+    /// This run placed our order `cid` on `side` at `now`: the loop's requote of that side when
+    /// it is the first placed on it since the latest event.
+    pub fn placed(&mut self, cid: ClientOrderId, side: Side, now: tokio::time::Instant) {
+        self.placed.insert(cid, now);
+        let requote = &mut self.requotes[side_index(side)];
+        if self.latest.is_some() && requote.is_none() {
+            *requote = Some((cid, now));
+        }
+    }
+
+    /// Keeps the placing times of the orders `keep` takes (those not ended).
+    pub fn retain(&mut self, keep: impl Fn(&ClientOrderId) -> bool) {
+        self.placed.retain(|cid, _| keep(cid));
+    }
+
+    /// Our order `cid` on `side` (placed by this run, [`Self::placed`], or an earlier run's),
+    /// ended by a cancel not ours the venue stamped `at`, seen at `now`: the same event as the
+    /// one before it when its order was placed before that one was seen and the venue stamped
+    /// it within [`EVENT_SPAN`] of that one's first; otherwise a repeat when within the window
+    /// of the window's first event or of its place as the loop's requote of `side` (type
+    /// documentation), or the first of a new window.
     pub fn on_cancel(
         &mut self,
-        placed: Option<tokio::time::Instant>,
+        cid: ClientOrderId,
+        side: Side,
         at: Option<ExchNs>,
         now: tokio::time::Instant,
     ) -> NotOurs {
         self.orders += 1;
+        let placed = self.placed.remove(&cid);
         if let Some(latest) = self.latest
             && placed.is_none_or(|placed| placed <= latest.seen)
             && latest.spans(at, now)
         {
             return NotOurs::SameEvent;
         }
+        let requote = self.requotes[side_index(side)].is_some_and(|(requote, placed)| {
+            requote == cid && now.saturating_duration_since(placed) <= self.window
+        });
         self.latest = Some(Event { seen: now, at });
+        self.requotes = [None; 2];
         match self.first {
+            _ if requote => NotOurs::Repeat,
             Some(first) if now.saturating_duration_since(first) <= self.window => NotOurs::Repeat,
             _ => {
                 self.first = Some(now);
@@ -975,7 +1027,6 @@ pub async fn run_on(
         retry_at: None,
         recancel_due: false,
         not_ours: CancelsNotOurs::new(opts.cancel_window),
-        placed_at: HashMap::new(),
     };
     // The interrupt sets a flag the driver reads at each wake, and wakes it.
     let watch = {
@@ -1147,10 +1198,10 @@ struct Driver {
     /// ([`Driver::cancel_again`], Codex r4306449947 on PR #158).
     recancel_due: bool,
     /// The cancels not ours seen, under the owner's rule (module documentation, FBC-aoh5),
-    /// and when each order of ours the loop placed that has not ended was handed over (with
-    /// the venue's times, what tells one event from the next, [`CancelsNotOurs`]).
+    /// with when each order of ours the loop placed that has not ended was handed over (with
+    /// the venue's times, what tells one event from the next, and each side's requote since
+    /// the latest event, [`CancelsNotOurs`]).
     not_ours: CancelsNotOurs,
-    placed_at: HashMap<ClientOrderId, tokio::time::Instant>,
 }
 
 impl Driver {
@@ -1651,10 +1702,9 @@ impl Driver {
             "{order} ended by a user cancel this program did not send (another program on the \
              account, or the Paradex UI): one quoter per account"
         );
-        let placed = self.placed_at.remove(&cid);
         match self
             .not_ours
-            .on_cancel(placed, at, tokio::time::Instant::now())
+            .on_cancel(cid, side, at, tokio::time::Instant::now())
         {
             NotOurs::SameEvent => self.note(format_args!(
                 "{order} ended by a user cancel this program did not send too: placed before the \
@@ -1663,9 +1713,10 @@ impl Driver {
             NotOurs::First if self.opts.mainnet => self.event(
                 "WARN",
                 format_args!(
-                    "{what}; a second on a later cycle within {window} Stops the run; the loop \
-                     requotes, and cancels everything of ours explicitly from now on (never an \
-                     instrument cancel-all)"
+                    "{what}; a second on a later cycle within {window} Stops the run, as does \
+                     one of the loop's requote within {window} of its place; the loop requotes, \
+                     and cancels everything of ours explicitly from now on (never an instrument \
+                     cancel-all)"
                 ),
             ),
             NotOurs::First => self.event(
@@ -1678,18 +1729,22 @@ impl Driver {
             NotOurs::Repeat if self.opts.mainnet => {
                 self.event(
                     "WARN",
-                    format_args!("{what}; the second on a later cycle within {window}: Stop"),
+                    format_args!(
+                        "{what}; the second on a later cycle within {window} (of the first, or of \
+                         placing the requote it cancelled): Stop"
+                    ),
                 );
                 self.trouble(format!(
                     "another program cancelled our orders: one quoter per account (a second \
-                     cancel this program did not send on a later cycle within {window}, of \
-                     {order}); stop the other program or give each its own account"
+                     cancel this program did not send on a later cycle within {window} of the \
+                     first or of placing the requote it cancelled, of {order}); stop the other program or give each its own account"
                 ));
             }
             NotOurs::Repeat => self.event(
                 "WARN",
                 format_args!(
-                    "{what}; a second on a later cycle within {window}: testnet mode only warns"
+                    "{what}; a second on a later cycle within {window} (of the first, or of \
+                     placing the requote it cancelled): testnet mode only warns"
                 ),
             ),
         }
@@ -1915,7 +1970,7 @@ impl Driver {
         }
         // Only the orders not ended need their placing time (FBC-aoh5).
         let owned = &self.owned;
-        self.placed_at.retain(|cid, _| owned.contains(cid));
+        self.not_ours.retain(|cid| owned.contains(cid));
     }
 
     /// The venue order id of `cid`, or `none`.
@@ -2642,7 +2697,7 @@ impl Driver {
         self.ours.insert(rpc, request);
         if place {
             self.own(&[cid]);
-            self.placed_at.insert(cid, tokio::time::Instant::now());
+            self.not_ours.placed(cid, side, tokio::time::Instant::now());
             self.event(
                 "PLACE",
                 format_args!(

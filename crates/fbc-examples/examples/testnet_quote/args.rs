@@ -35,9 +35,10 @@ pub const CANCEL_NOT_OURS_WINDOW: Duration = Duration::from_secs(30);
 /// The longest `--interval-ms` a mainnet run takes with the cancel-not-ours window `window`:
 /// two thirds of it (20000 ms of the owner's 30 s; RB-aoh5-7 on PR #159). The loop requotes a
 /// side another program cancelled only on the next cycle, so a co-tenant cancelling every quote
-/// makes one event per cycle, an interval plus the cycle's reads plus its own period (Java's
-/// 3 s reconcile) apart: at a longer interval each event would fall past the window and only
-/// warn. The other third is left for the reads and the reconcile.
+/// makes one event per cycle. The pause alone does not bound a cycle (its reads, settle and
+/// rate-limit waits add to it), so the Stop does not rest on this bound: a cancel of the
+/// loop's requote within the window of its place is the repeat however long the cycle
+/// (`quote::CancelsNotOurs`, Codex r4309154208). This bound is kept as a conservative limit.
 pub fn mainnet_interval_max(window: Duration) -> Duration {
     window * 2 / 3
 }
@@ -144,8 +145,8 @@ same loop, with these limits, each checked before anything connects:
   - --bid-bps and --ask-bps at least 20;
   - --duration at most 3600 (one hour);
   - --interval-ms at most 20000, two thirds of the 30 s window for a cancel not ours (below):
-    the loop requotes a cancelled side on the next cycle, so a longer pause would put each of
-    a co-tenant's cancels past the window of the one before, and it would never Stop;
+    a conservative bound beside the requote rule, which Stops a co-tenant cancelling every
+    requote however long a cycle takes;
   - the venue's snapshot source trustworthy (Paradex's is, decision 0094): the resync seeds
     the market's position, and a mainnet market is never seeded by hand, so a resync that
     seeds nothing refuses Start;
@@ -163,9 +164,13 @@ no cancel of ours covering it was sent (no replace's or side's cancel, no cancel
 start, reconnect or Stop sweep, in flight or answered). Those of one action (one reconcile, one
 cancel-all in the UI) are one event: Paradex stamps them within 1 s of each other, and a cancel
 seconds later, of any order however old, or of a quote placed after it, is another (so both
-quotes cancelled by hand one at a time, seconds apart, are two). The first prints a WARN line and the loop requotes. With --mainnet, a second on a later cycle
-within 30 s of the first Stops the run and fails it ('another program cancelled our orders:
-one quoter per account'); after 30 s with no second the window starts again. Without
+quotes cancelled by hand one at a time, seconds apart, are two). The first prints a WARN line
+and the loop requotes. With --mainnet, a second on a later cycle within 30 s of the first
+Stops the run and fails it ('another program cancelled our orders: one quoter per account'),
+as does one of the loop's requote (the first order placed on a side after the one before)
+within 30 s of placing it, however long the cycle took; after 30 s with no second the window
+starts again. A cancel of ours the venue refuses no longer covers its order from the refusal
+on. Without
 --mainnet each only warns. Once one was seen, the run's cancels of everything (a reconnect's
 sweep, Stop) name our orders explicitly and never send an instrument cancel-all, which would
 cancel the other program's orders too. One quoter per account.

@@ -1328,6 +1328,59 @@ async fn after_a_reconnect_every_order_of_ours_is_cancelled_before_any_place() {
 }
 
 #[tokio::test]
+async fn after_a_cancel_not_ours_a_reconnects_sweep_cancels_ours_explicitly_never_a_cancel_all() {
+    capture::install();
+    // RB-aoh5-5 on PR #159: another program cancels cycle 1's bid (a WARN), then the stub closes
+    // the order socket. The resync after the reconnect does not show the ask (a lagging
+    // snapshot), which the registry still holds open: the reconnect's sweep cancels it by name,
+    // never by an instrument cancel-all, which would cancel the other program's orders too.
+    let venue = venue(vec![b0()]);
+    {
+        let mut v = lock(&venue);
+        v.cotenant_after_create = vec![(2, Some("BUY"))];
+        v.hide_sells_after_first = true;
+    }
+    // First connection: the opening six, the start's sweep (a cancel-all), two places, then the
+    // stub closes it. Second: the opening six, the sweep's cancel of the ask, two places,
+    // Stop's batch cancel.
+    let script = reconnecting(&venue, 6 + 1 + 2, 6 + 1 + 2 + 1);
+    let stub = StubServer::start(script, routes(&venue, login_ok()))
+        .await
+        .unwrap();
+    let opts = options(&stub, 3);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("the stub's script: {e:?}\n{printed}"));
+
+    assert!(report.ok, "{printed}");
+    assert_eq!(report.cancels_not_ours, 1, "{printed}");
+    assert_eq!(warned(&printed, false), 1, "{printed}");
+    let conn1 = methods(&venue, 1);
+    assert!(
+        !conn1.iter().any(|m| m == "order.cancel_all"),
+        "an instrument cancel-all after the cancel not ours: {conn1:?}\n{printed}"
+    );
+    let first_place = conn1
+        .iter()
+        .position(|m| m == "order.create")
+        .unwrap_or_else(|| panic!("nothing placed after the reconnect: {conn1:?}\n{printed}"));
+    let before: Vec<String> = requests(&venue, 1)[..first_place]
+        .iter()
+        .flat_map(cancelled_ids)
+        .collect();
+    let ask = vids_of(&venue, "SELL")[0].clone();
+    assert_eq!(before, [ask], "{conn1:?}\n{printed}");
+    let reconnect = tagged(&printed, "RECONNECT");
+    assert_eq!(reconnect.len(), 1, "{printed}");
+    assert!(
+        reconnect[0].contains("no instrument cancel-all: another program cancelled our orders"),
+        "{printed}"
+    );
+    no_credential_in(&printed);
+}
+
+#[tokio::test]
 async fn a_resync_position_mismatch_stops_it_with_no_place_after() {
     let venue = venue(vec![b0()]);
     // After the reconnect the venue reports a long position the inventory (flat) does not hold.
@@ -4410,7 +4463,8 @@ fn warned(printed: &str, mainnet: bool) -> usize {
         assert!(first.contains(part), "{part}:\n{printed}");
     }
     let rule = if mainnet {
-        "a second on a later cycle within 30 s Stops the run"
+        "a second on a later cycle within 30 s Stops the run, as does one of the loop's requote \
+         within 30 s of its place"
     } else {
         "testnet mode only warns"
     };
@@ -4699,7 +4753,9 @@ async fn a_mainnet_interval_at_which_a_co_tenants_cancels_fall_outside_the_windo
         stub.http_requests()
     );
     assert!(stub.connections().is_empty());
-    // Two thirds of the window is taken: the scaled co-tenant is Stopped on its second event.
+    // Two thirds of the window is taken; at it the co-tenant is Stopped on its second event,
+    // however long the cycle (RB-aoh5-8:
+    // `at_the_largest_mainnet_interval_a_co_tenant_cancelling_every_requote_is_stopped_...`).
     assert_eq!(
         args::mainnet_interval_max(Duration::from_millis(300)),
         Duration::from_millis(200)
@@ -4751,7 +4807,12 @@ async fn at_the_largest_mainnet_interval_a_co_tenant_cancelling_every_requote_is
             .starts_with("another program cancelled our orders: one quoter per account"),
         "{printed}"
     );
-    assert_eq!(warned(&printed, true), 2, "{printed}");
+    let warns = tagged(&printed, "WARN");
+    assert_eq!(warns.len(), 2, "{printed}");
+    assert!(
+        warns[1].contains("placing the requote it cancelled): Stop"),
+        "{printed}"
+    );
     stopped(&printed);
     assert_eq!(creates(&venue, 0), 4, "nothing placed after:\n{printed}");
     let sent = methods(&venue, 0);
@@ -4873,67 +4934,113 @@ fn cancels_not_ours_of_one_action_are_one_event_and_a_later_action_repeats_it() 
     let s = Duration::from_secs;
     // The venue's time on a cancel, `secs` after the first action's.
     let at = |secs: i64| Some(ExchNs(1_759_500_000_000_000_000 + secs * 1_000_000_000));
+    let lease =
+        NamespaceLease::acquire(&lease_dir(), AccountKey::new(1), Namespace::new(1)).unwrap();
+    let mut mint = CidMint::new(lease, 0, 0, WallNs(1_000_000_000));
+    let mut cid = || mint.mint().unwrap();
+    let (buy, sell) = (Side::Buy, Side::Sell);
     assert_eq!(EVENT_SPAN, s(1));
     let mut seen = CancelsNotOurs::new(args::CANCEL_NOT_OURS_WINDOW);
     assert_eq!(args::CANCEL_NOT_OURS_WINDOW, s(30));
     // Both sides, placed before it was seen, of one reconcile: one event, even read 1.5 s apart
     // (split across a cycle); an earlier run's order (placed by no one this run) as well.
-    assert_eq!(seen.on_cancel(Some(t0), at(0), t0 + s(1)), NotOurs::First);
+    let (b1, a1, a0, old) = (cid(), cid(), cid(), cid());
+    for (order, side) in [(b1, buy), (a1, sell), (a0, sell)] {
+        seen.placed(order, side, t0);
+    }
+    assert_eq!(seen.on_cancel(b1, buy, at(0), t0 + s(1)), NotOurs::First);
     let read_later = t0 + Duration::from_millis(2_500);
     assert_eq!(
-        seen.on_cancel(Some(t0), at(0), read_later),
+        seen.on_cancel(a1, sell, at(0), read_later),
         NotOurs::SameEvent
     );
-    assert_eq!(seen.on_cancel(None, at(0), t0 + s(2)), NotOurs::SameEvent);
+    assert_eq!(
+        seen.on_cancel(old, buy, at(0), t0 + s(2)),
+        NotOurs::SameEvent
+    );
     // RB-aoh5-1 / Codex r4308625185: an order resting since before the first, cancelled by a
     // later action (the venue's time 10 s on) within 30 s: the repeat.
     assert_eq!(
-        seen.on_cancel(Some(t0), at(10), t0 + s(11)),
+        seen.on_cancel(a0, sell, at(10), t0 + s(11)),
         NotOurs::Repeat
     );
-    // A requote placed after it, cancelled within 30 s of the first: the repeat again; its
-    // other side, placed before and cancelled with it, the same event as it.
+    // A requote placed after it, cancelled within 30 s: the repeat again; its other side,
+    // placed before and cancelled with it, the same event as it.
+    let (b2, a2) = (cid(), cid());
+    seen.placed(b2, buy, t0 + s(12));
+    seen.placed(a2, sell, t0 + s(13));
+    assert_eq!(seen.on_cancel(b2, buy, at(20), t0 + s(21)), NotOurs::Repeat);
     assert_eq!(
-        seen.on_cancel(Some(t0 + s(12)), at(20), t0 + s(21)),
-        NotOurs::Repeat
-    );
-    assert_eq!(
-        seen.on_cancel(Some(t0 + s(3)), at(20), t0 + s(21)),
+        seen.on_cancel(a2, sell, at(20), t0 + s(21)),
         NotOurs::SameEvent
     );
     assert_eq!(seen.orders(), 6);
 
-    // Past 30 s from the window's first event, a new window: a requote's, and RB-aoh5-2's
-    // order resting unchanged since before the first, cancelled 10 minutes on.
+    // Codex r4309154208 / RB-aoh5-9: a cycle longer than the window. The loop's requotes of
+    // both sides are placed 40 s after the first event and cancelled 3 s later by another
+    // program's next reconcile: the repeat however long the cycle, the other side the same event.
     let mut seen = CancelsNotOurs::new(s(30));
-    assert_eq!(seen.on_cancel(None, at(0), t0), NotOurs::First);
+    let (b1, a1) = (cid(), cid());
+    seen.placed(b1, buy, t0);
+    seen.placed(a1, sell, t0);
+    assert_eq!(seen.on_cancel(b1, buy, at(0), t0), NotOurs::First);
+    assert_eq!(seen.on_cancel(a1, sell, at(0), t0), NotOurs::SameEvent);
+    let (b2, a2) = (cid(), cid());
+    seen.placed(b2, buy, t0 + s(40));
+    seen.placed(a2, sell, t0 + s(40));
+    assert_eq!(seen.on_cancel(b2, buy, at(43), t0 + s(43)), NotOurs::Repeat);
     assert_eq!(
-        seen.on_cancel(Some(t0 + s(1)), at(31), t0 + s(31)),
+        seen.on_cancel(a2, sell, at(43), t0 + s(43)),
+        NotOurs::SameEvent
+    );
+
+    // Past 30 s from the window's first event, a new window: a requote cancelled more than
+    // 30 s after its place; a later requote within 30 s of its place; a replace of a requote
+    // (not the first placed on its side since the event) judged by the window's first only.
+    let mut seen = CancelsNotOurs::new(s(30));
+    assert_eq!(seen.on_cancel(old, buy, at(0), t0), NotOurs::First);
+    let late = cid();
+    seen.placed(late, buy, t0 + s(1));
+    assert_eq!(
+        seen.on_cancel(late, buy, at(32), t0 + s(32)),
         NotOurs::First
     );
+    let requote = cid();
+    seen.placed(requote, buy, t0 + s(33));
     assert_eq!(
-        seen.on_cancel(Some(t0 + s(32)), at(40), t0 + s(40)),
+        seen.on_cancel(requote, buy, at(40), t0 + s(40)),
         NotOurs::Repeat
     );
+    let (requote, replace) = (cid(), cid());
+    seen.placed(requote, buy, t0 + s(41));
+    seen.placed(replace, buy, t0 + s(50));
     assert_eq!(
-        seen.on_cancel(Some(t0 + s(41)), at(62), t0 + s(62)),
+        seen.on_cancel(replace, buy, at(63), t0 + s(63)),
         NotOurs::First
     );
+    // RB-aoh5-2: an order resting unchanged since before the first, cancelled 10 minutes on.
     let mut seen = CancelsNotOurs::new(s(30));
-    assert_eq!(seen.on_cancel(Some(t0), at(1), t0 + s(1)), NotOurs::First);
+    let (c1, c2) = (cid(), cid());
+    seen.placed(c1, buy, t0);
+    seen.placed(c2, sell, t0);
+    assert_eq!(seen.on_cancel(c1, buy, at(1), t0 + s(1)), NotOurs::First);
     assert_eq!(
-        seen.on_cancel(Some(t0), at(600), t0 + s(600)),
+        seen.on_cancel(c2, sell, at(600), t0 + s(600)),
         NotOurs::First
     );
 
     // With no venue time, when each was seen: within the span one event, later another.
     let mut seen = CancelsNotOurs::new(s(30));
-    assert_eq!(seen.on_cancel(Some(t0), None, t0 + s(1)), NotOurs::First);
+    let (d1, d2, d3) = (cid(), cid(), cid());
+    for order in [d1, d2, d3] {
+        seen.placed(order, buy, t0);
+    }
+    assert_eq!(seen.on_cancel(d1, buy, None, t0 + s(1)), NotOurs::First);
     assert_eq!(
-        seen.on_cancel(Some(t0), None, t0 + Duration::from_millis(1_900)),
+        seen.on_cancel(d2, buy, None, t0 + Duration::from_millis(1_900)),
         NotOurs::SameEvent
     );
-    assert_eq!(seen.on_cancel(Some(t0), None, t0 + s(5)), NotOurs::Repeat);
+    assert_eq!(seen.on_cancel(d3, buy, None, t0 + s(5)), NotOurs::Repeat);
 }
 
 #[test]
@@ -4973,4 +5080,27 @@ fn a_cancel_of_ours_covers_its_orders_only_once_the_session_reports_it_sent() {
         !covered.covers(a) && !covered.covers(c),
         "ended while pending"
     );
+
+    // Codex r4309154204 / RB-aoh5-4: a cancel the venue refused (for its rate, say) no longer
+    // covers the order it named, while another request of ours still does; a whole request
+    // refused covers nothing it covered; a refusal while pending leaves nothing to cover.
+    let mut covered = link::Coverage::default();
+    covered.submitted(RpcId(5), [a, b]);
+    covered.submitted(RpcId(6), [b]);
+    covered.reported(RpcId(5), true);
+    covered.reported(RpcId(6), true);
+    covered.refused(RpcId(5), Some(a));
+    assert!(!covered.covers(a), "refused for a");
+    covered.refused(RpcId(5), Some(b));
+    assert!(covered.covers(b), "request 6 still covers b");
+    covered.refused(RpcId(6), None);
+    assert!(!covered.covers(b));
+    covered.submitted(RpcId(7), [a, c]);
+    covered.submitted(RpcId(8), [c]);
+    covered.reported(RpcId(8), true);
+    covered.refused(RpcId(7), Some(a));
+    covered.reported(RpcId(7), true);
+    assert!(!covered.covers(a) && covered.covers(c));
+    covered.refused(RpcId(7), None);
+    assert!(covered.covers(c), "request 8 still covers c");
 }
