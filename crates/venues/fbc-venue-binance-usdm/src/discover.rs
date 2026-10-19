@@ -22,10 +22,11 @@
 //!   [`TradingStatus::Halted`]; `DELIVERED` and `CLOSE` [`TradingStatus::Delisted`]. Another value
 //!   is malformed: nothing is read as trading that Binance does not say is.
 //! - `symbol` through the decode scope; `baseAsset` and `quoteAsset` (the key, as written:
-//!   `BTC`, `USDT`) and `marginAsset` (the settlement asset). A perpetual with an asset name
-//!   longer than an [`AssetSym`] holds (eight bytes; Binance lists `1000000MOGUSDT`, base
-//!   `1000000MOG`) cannot be keyed, so it alone is passed over before its symbol and filters are
-//!   read: the consumer finds it not listed, and every other symbol is still discovered.
+//!   `BTC`, `USDT`) and `marginAsset` (the settlement asset). A perpetual with an asset name an
+//!   [`AssetSym`] cannot hold (more than eight bytes, or not printable ASCII; Binance lists
+//!   `1000000MOGUSDT`, base `1000000MOG`, and `币安人生USDT`, base `币安人生`) cannot be keyed,
+//!   so it alone is passed over before its symbol and filters are read: the consumer finds it
+//!   not listed, and every other symbol is still discovered. An empty asset name is malformed.
 //! - `PRICE_FILTER` `tickSize` is the fixed price grid ("disabled on value 0" is no grid, so 0 is
 //!   malformed). `LOT_SIZE` `stepSize` is the size step; its `minQty`, a quantity is valid only
 //!   at `minQty` plus whole steps, is the smallest order in whole steps (one off the step grid is
@@ -157,7 +158,7 @@ fn draft(
     let quote = asset_sym(m, "quoteAsset")?;
     let settle_ccy = asset_sym(m, "marginAsset")?;
     // An asset name the core cannot hold: this perpetual alone is passed over (Codex
-    // r4311120955).
+    // r4311120955, Reviewer B RB-1).
     let (Some(base), Some(quote), Some(settle_ccy)) = (base, quote, settle_ccy) else {
         return Ok(None);
     };
@@ -274,16 +275,15 @@ fn text<'a>(m: &'a Map<String, Value>, key: &'static str) -> Result<&'a str, Pla
     Ok(required(m, key)?.as_str().ok_or(malformed(key))?)
 }
 
-/// A required asset as written, or `None` for a name of printable ASCII longer than an
-/// [`AssetSym`] holds (eight bytes): a name Binance lists (`1000000MOG`) that the core cannot
-/// key. An empty name, or one that is not printable ASCII, is malformed.
+/// A required asset as written, or `None` for a stated name an [`AssetSym`] cannot hold (more
+/// than eight bytes, or not printable ASCII): a name Binance lists (`1000000MOG`, `币安人生`)
+/// that the core cannot key. An empty name, or one that is not a string, is malformed.
 fn asset_sym(m: &Map<String, Value>, key: &'static str) -> Result<Option<AssetSym>, PlanError> {
     let name = text(m, key)?;
-    match AssetSym::new(name) {
-        Some(sym) => Ok(Some(sym)),
-        None if name.len() > 8 && name.bytes().all(|b| b.is_ascii_graphic()) => Ok(None),
-        None => Err(malformed(key).into()),
+    if name.is_empty() {
+        return Err(malformed(key).into());
     }
+    Ok(AssetSym::new(name))
 }
 
 /// A filter's required decimal string, exactly as written and not negative, named `name`.
