@@ -8,7 +8,8 @@
 //! for a stale authorization (FBC-j5bw, decision 0062), and one in format version 6
 //! (`fixtures/journal/v6`), before a request deadline's firing was a record (FBC-0hfl), and one
 //! in format version 7 (`fixtures/journal/v7`), before the consumer's own records (FBC-hxkm,
-//! decision 0101).
+//! decision 0101), and one in format version 8 (`fixtures/journal/v8`), before a consumer input
+//! carried the ingest sequence the shard stamped it with (FBC-hvqi).
 //!
 //! Every secret here is synthetic, and each is assembled at run time so no credential-shaped
 //! literal sits in the source.
@@ -356,6 +357,34 @@ fn v7_records() -> Vec<(WallNs, Record)> {
     out
 }
 
+/// What `fixtures/journal/v8` holds: the version 7 records with, after the request deadline's
+/// firing, the consumer's own records version 8 added, an annotation and an input, neither with
+/// an ingest sequence (version 8 has none), all written by the version 8 writer (its README says
+/// how).
+fn v8_records() -> Vec<(WallNs, Record)> {
+    let mut out = v7_records();
+    let at = 1 + out
+        .iter()
+        .position(|(_, r)| matches!(r, Record::RpcTimeout { .. }))
+        .unwrap();
+    let annotation = Record::Consumer {
+        at: MonoNs(95),
+        kind: 7,
+        input: false,
+        ingest_seq: None,
+        bytes: Opaque(b"decide summary".to_vec()),
+    };
+    let input = Record::Consumer {
+        at: MonoNs(96),
+        kind: 1,
+        input: true,
+        ingest_seq: None,
+        bytes: Opaque(vec![0xff, 0x00, 0xc3]),
+    };
+    out.splice(at..at, [(NOON, annotation), (NOON, input)]);
+    out
+}
+
 /// A frame written at `at` as `opcode`, with its credential span.
 fn binary_outbound(at: u64, bytes: Vec<u8>, span: std::ops::Range<u32>, opcode: Opcode) -> Record {
     Record::Outbound {
@@ -416,6 +445,13 @@ fn a_journal_written_before_the_rpc_timeout_kind_reads_back_unchanged() {
 #[test]
 fn a_journal_written_before_the_consumer_kind_reads_back_unchanged() {
     reads_back_unchanged("v7", 7, v7_records());
+}
+
+/// FBC-hvqi: a journal written in format version 8, before a consumer input carried the ingest
+/// sequence the shard stamped it with, reads back unchanged, its consumer records with none.
+#[test]
+fn a_journal_written_before_stamped_consumer_inputs_reads_back_unchanged() {
+    reads_back_unchanged("v8", 8, v8_records());
 }
 
 /// FBC-q7b's done line: a binary frame whose only bytes that are not UTF-8 lie inside its

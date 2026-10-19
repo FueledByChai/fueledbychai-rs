@@ -213,6 +213,7 @@ fn consumer(at: u64, kind: u16, input: bool, bytes: &[u8]) -> Record {
         at: MonoNs(at),
         kind,
         input,
+        ingest_seq: None,
         bytes: Opaque(bytes.to_vec()),
     }
 }
@@ -623,6 +624,7 @@ fn an_ended_epochs_inputs_and_other_connections_records_reach_no_codec() {
             decode_errors: 0,
             refused_subscribes: 0,
             gaps: 1,
+            inputs: 0,
         }
     );
 }

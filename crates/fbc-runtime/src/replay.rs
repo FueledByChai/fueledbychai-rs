@@ -50,6 +50,7 @@ use fbc_core::{
 };
 use fbc_journal::{ControlEvent, HttpResponseRec, JournalError, Marker, Opcode, Record};
 
+use crate::inputs::InputHandler;
 use crate::session::{MdHandler, feed_frame, feed_http, feed_timer};
 
 /// What a replay needs, all from the consumer: what the session ran with.
@@ -83,6 +84,9 @@ pub struct MdReplayCounters {
     pub refused_subscribes: u64,
     /// `Degraded` markers: places where the journal dropped records.
     pub gaps: u64,
+    /// Consumer inputs the shard stamped, handed back to the input handler at their place
+    /// ([`MdReplay::set_inputs`]).
+    pub inputs: u64,
 }
 
 /// Why a replay could not start, or stopped.
@@ -132,6 +136,7 @@ pub struct MdReplay<H> {
     open: Option<Epoch>,
     counters: MdReplayCounters,
     handler: H,
+    inputs: Option<Box<dyn InputHandler>>,
 }
 
 /// The open epoch: its codec once built, and until then the HTTP results that came back
@@ -162,7 +167,15 @@ impl<H: MdHandler> MdReplay<H> {
             open: None,
             counters: MdReplayCounters::default(),
             handler,
+            inputs: None,
         })
+    }
+
+    /// Hands each consumer input the shard stamped back to `handler` at its place in the
+    /// journal, with its recorded ingest sequence, time, kind and bytes (FBC-hvqi). Set it on
+    /// one replay of a shard's journal: every session's replay reads the same inputs.
+    pub fn set_inputs<I: InputHandler + 'static>(&mut self, handler: I) {
+        self.inputs = Some(Box::new(handler));
     }
 
     pub fn counters(&self) -> MdReplayCounters {
