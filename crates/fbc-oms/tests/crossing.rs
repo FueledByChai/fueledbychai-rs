@@ -768,7 +768,7 @@ fn a_crossing_intent_is_refused_by_the_resting_cap_and_the_inventory_cap() {
 
 #[test]
 fn a_position_past_the_inventory_cap_by_more_than_the_resting_cap_admits_no_crossing() {
-    // Decision 0108's consequence (Reviewer B on PR #180): with no other order on the side, a
+    // Decision 0110's consequence (Reviewer B on PR #180): with no other order on the side, a
     // reducing sell of q on a long P passes the inventory cap only if P - q <= cap and the
     // resting cap only if q <= resting, so a cross exists only while P <= cap + resting.
     let caps = ioc_venue(&[]);
