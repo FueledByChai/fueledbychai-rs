@@ -366,6 +366,10 @@ struct Venue {
     reject_create: Option<(usize, i64)>,
     /// Answer the `n`th single cancel (from 1) with this JSON-RPC error code, closing nothing.
     reject_cancel: Option<(usize, i64)>,
+    /// Right after refusing a single cancel ([`Venue::reject_cancel`]), close its order, still
+    /// open, by a user cancel the loop never sent: another program's cancel while ours waits to
+    /// be sent again (Codex r4309154204 on PR #159).
+    cotenant_after_refused_cancel: bool,
     cancels: usize,
     /// When each place, each single cancel and each instrument cancel-all came.
     create_times: Vec<std::time::Instant>,
@@ -430,6 +434,10 @@ struct Venue {
     /// holds open, of the side named (BUY or SELL; both when `None`), is closed by a user cancel
     /// the loop never sent (`user_cancel_ws`).
     cotenant_after_create: Vec<(usize, Option<&'static str>)>,
+    /// How long each `GET /orderbook` read takes to answer: a cycle whose reads take longer than
+    /// the cancel-not-ours window (Codex r4309154208 on PR #159). The stub's handler blocks for
+    /// it, so the whole test runtime waits, as a slow venue would make the loop.
+    book_delay: Option<Duration>,
     /// Answer every instrument cancel-all with the order events closing the orders first, and
     /// its `{"status":"ok"}` after them: the order stream ahead of the cancel-all's reply.
     cancel_all_closes_first: bool,
@@ -520,6 +528,10 @@ fn routes(venue: &Shared, login: HttpReply) -> HttpRouter {
             Method::GET,
             PathPattern::exact(&format!("/v1/orderbook/{MARKET}")),
             move |_| {
+                let delay = lock(&books).book_delay;
+                if let Some(delay) = delay {
+                    std::thread::sleep(delay);
+                }
                 let mut v = lock(&books);
                 let last = v.books.len() - 1;
                 let at = v.book_reads.min(last);
@@ -743,7 +755,17 @@ fn respond(venue: &Shared, conn: usize, frame: &Frame) -> Responded {
             {
                 let error = json!({"code": code, "message": "order.cancel refused"});
                 let reply = json!({"jsonrpc": "2.0", "error": error, "id": id});
-                return Ok(vec![Frame::text(reply.to_string())]);
+                let mut frames = vec![Frame::text(reply.to_string())];
+                if v.cotenant_after_refused_cancel
+                    && let Some(at) = v.orders.iter().position(|o| {
+                        o.open
+                            && (params["id"].as_str() == Some(o.vid.as_str())
+                                || params["client_id"].as_str() == Some(o.cid.as_str()))
+                    })
+                {
+                    frames.push(user_cancelled(&mut v, at));
+                }
+                return Ok(frames);
             }
             let at = v
                 .orders
@@ -4686,6 +4708,98 @@ async fn a_mainnet_interval_at_which_a_co_tenants_cancels_fall_outside_the_windo
         args::mainnet_interval_max(args::CANCEL_NOT_OURS_WINDOW),
         Duration::from_secs(20)
     );
+}
+
+#[tokio::test]
+async fn at_the_largest_mainnet_interval_a_co_tenant_cancelling_every_requote_is_stopped_however_long_its_cycle()
+ {
+    capture::install();
+    // Codex r4309154208 / RB-aoh5-8 / RB-aoh5-9 on PR #159, scaled: the window shortened to
+    // 1 s, the loop run at the largest interval a mainnet run takes with it (two thirds: 666 ms),
+    // and every touch read taking 1.1 s, so each cycle is longer than the window. Another
+    // program cancels both quotes right after every cycle's places. Its cancel of the loop's
+    // requote is the repeat however long the cycle that placed it: the second event Stops the
+    // run, with nothing of ours left to cancel and nothing placed after.
+    let venue = mainnet_venue(vec![b0()]);
+    {
+        let mut v = lock(&venue);
+        v.cotenant_after_create = vec![(2, None), (4, None), (6, None)];
+        v.book_delay = Some(Duration::from_millis(1_100));
+    }
+    // The opening six, the start's sweep, cycle 1 two places, cycle 2 two places; Stop has
+    // nothing open to cancel.
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 2),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let mut opts = mainnet_options(&stub, 4);
+    opts.cancel_window = Duration::from_secs(1);
+    opts.interval_ms =
+        u64::try_from(args::mainnet_interval_max(opts.cancel_window).as_millis()).unwrap();
+    assert_eq!(opts.interval_ms, 666);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("the stub's script: {e:?}\n{printed}"));
+
+    assert!(!report.ok, "{printed}");
+    assert!(
+        report
+            .ended
+            .starts_with("another program cancelled our orders: one quoter per account"),
+        "{printed}"
+    );
+    assert_eq!(warned(&printed, true), 2, "{printed}");
+    stopped(&printed);
+    assert_eq!(creates(&venue, 0), 4, "nothing placed after:\n{printed}");
+    let sent = methods(&venue, 0);
+    assert_eq!(
+        sent.iter().filter(|m| *m == "order.cancel_all").count(),
+        1,
+        "only the start's sweep: {sent:?}"
+    );
+    no_credential_in(&printed);
+}
+
+#[tokio::test]
+async fn a_cancel_of_ours_refused_for_its_rate_stops_covering_its_order_so_anothers_cancel_is_seen()
+{
+    capture::install();
+    // Codex r4309154204 / RB-aoh5-4 on PR #159: cycle 2's first replace cancel is refused
+    // RateLimited (42901), and another program then cancels that order, still open, while ours
+    // waits its retry time. The refused cancel no longer covers it: a cancel not ours, a WARN;
+    // the loop never sends the refused cancel again (the order ended), places both quotes, and
+    // Stop cancels them explicitly.
+    let venue = venue(vec![b0(), b0(), book(2, Some("62100.0"), Some("62100.3"))]);
+    {
+        let mut v = lock(&venue);
+        v.reject_cancel = Some((1, 42_901));
+        v.cotenant_after_refused_cancel = true;
+    }
+    // The opening six, the start's sweep, two places, cycle 2's two cancels (the first refused),
+    // the two places, Stop's batch cancel.
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 2 + 2 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let opts = options(&stub, 2);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("the stub's script: {e:?}\n{printed}"));
+
+    assert!(report.ok, "{printed}");
+    assert_eq!(report.cancels_not_ours, 1, "{printed}");
+    assert_eq!(warned(&printed, false), 1, "{printed}");
+    assert!(printed.contains(" cancels not ours 1\n"), "{printed}");
+    assert_eq!(lock(&venue).cancel_times.len(), 2, "{printed}");
+    assert_eq!(creates(&venue, 0), 4, "{printed}");
+    let sent = methods(&venue, 0);
+    assert_eq!(sent.last().map(String::as_str), Some("order.cancel_batch"));
 }
 
 #[tokio::test]
