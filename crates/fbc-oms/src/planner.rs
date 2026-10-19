@@ -824,23 +824,29 @@ impl ExecutionPlanner {
                     let Some(total) = clipped.filter(|_| !cancelling.contains(&cid)) else {
                         continue;
                     };
-                    // A reducer that grows waits for the cancel of each emulated order its
-                    // growth would leave overshooting.
+                    // A reducer amended without shrinking, a price-only amend included,
+                    // waits for the cancel of each emulated order it would leave
+                    // overshooting: one the amend makes a reducer, or one counted as a
+                    // reducer since a pass that could not amend it, is a new reducer, and an
+                    // amend over a cancel not yet settled would let both fill. One that
+                    // shrinks lowers what may fill and never waits (Codex r4310495940).
                     if emulated.is_none() {
-                        let grows = reg.get(cid).map_or(Lots::ZERO, |rec| {
-                            let counted = if reducing || rec.reduces() {
-                                total.checked_sub(rec.filled()).unwrap_or(Lots::ZERO)
-                            } else {
-                                Lots::ZERO
-                            };
+                        let grows = reg.get(cid).and_then(|rec| {
+                            if !(reducing || rec.reduces()) {
+                                return None;
+                            }
+                            let rests = total.checked_sub(rec.filled()).unwrap_or(Lots::ZERO);
+                            // What the other orders' room already counts of it.
                             let before = if rec.reduces() {
                                 rec.resting()
                             } else {
                                 Lots::ZERO
                             };
-                            counted.checked_sub(before).unwrap_or(Lots::ZERO)
+                            rests.checked_sub(before)
                         });
-                        let overshot = overshot_by(slots, reg, (market, side), grows);
+                        let overshot = grows.map_or_else(Vec::new, |grows| {
+                            overshot_by(slots, reg, (market, side), grows)
+                        });
                         if !overshot.is_empty() {
                             // Judged first with those orders ended: one refused anyway reports
                             // its own refusal and cancels nothing.
@@ -1160,19 +1166,17 @@ fn cancel_now(
 }
 
 /// The emulated reduce-only orders in `slots` on `side` of `market`, not yet terminal, that a
-/// reducer about to rest `grows` more would leave resting more than is left to reduce, so both
-/// could fill and take the position past zero, the emulated order having no venue flag to stop
-/// it. The reducer waits for their cancel ([`cancel_overshot`]) when it is admitted with them
-/// ended, and is built by the first pass after they are terminal (decision 0101).
+/// reducer about to rest `grows` more (none for one amended at its size, whose resting the
+/// room already counts) would leave resting more than is left to reduce, so both could fill
+/// and take the position past zero, the emulated order having no venue flag to stop it. The
+/// reducer waits for their cancel ([`cancel_overshot`]) when it is admitted with them ended,
+/// and is built by the first pass after they are terminal (decision 0101).
 fn overshot_by(
     slots: &BTreeMap<Level, Slot>,
     reg: &Registry,
     (market, side): (InstrumentId, Side),
     grows: Lots,
 ) -> Vec<(Level, ClientOrderId)> {
-    if grows == Lots::ZERO {
-        return Vec::new();
-    }
     slots
         .iter()
         .filter(|(at, slot)| slot.mode.emulated && at.side() == side)
