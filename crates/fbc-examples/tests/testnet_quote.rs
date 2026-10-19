@@ -4825,6 +4825,99 @@ async fn at_the_largest_mainnet_interval_a_co_tenant_cancelling_every_requote_is
 }
 
 #[tokio::test]
+async fn at_the_largest_mainnet_interval_a_requote_refused_for_its_rate_leaves_the_next_place_the_requote()
+ {
+    // RB-aoh5-10 on PR #159, scaled as the test above: another program cancels both quotes
+    // after cycle 1's places (the first event, a WARN). Cycle 2's first requote place, the bid,
+    // is refused for its rate (42901), so it never rests; the bid is placed again after the
+    // retry time, and that place, the one that rests, is the side's requote: another program's
+    // cancel of it right after its place Stops the run, though the cycle that placed it took
+    // longer than the window since the first event. A refused place used to keep the requote
+    // slot, so that cancel was judged a new first event and only warned.
+    let printed = an_unrested_requote_place(|v| {
+        v.reject_create = Some((3, 42_901));
+        // Creates count only the places the stub took: cycle 1's two, cycle 2's ask, the bid.
+        v.cotenant_after_create = vec![(2, None), (4, Some("BUY"))];
+    })
+    .await;
+    assert!(printed.contains("PACE "), "{printed}");
+}
+
+#[tokio::test]
+async fn at_the_largest_mainnet_interval_a_requote_that_would_cross_leaves_the_next_place_the_requote()
+ {
+    // RB-aoh5-10 on PR #159, as the test above with cycle 2's bid closed POST_ONLY_WOULD_CROSS
+    // by the venue's risk check after its reply (an asynchronous reject): it never rested, its
+    // side is left out of the cycle, and the next cycle's bid is the requote whose cancel Stops.
+    let printed = an_unrested_requote_place(|v| {
+        v.close_create = Some((3, "POST_ONLY_WOULD_CROSS"));
+        v.cotenant_after_create = vec![(2, None), (5, Some("BUY"))];
+    })
+    .await;
+    assert!(printed.contains("POST_ONLY_WOULD_CROSS"), "{printed}");
+}
+
+/// [`at_the_largest_mainnet_interval_a_requote_refused_for_its_rate_leaves_the_next_place_the_requote`]
+/// and its post-only twin: the window 1 s, the loop at the largest mainnet interval with it,
+/// every touch read 1.1 s, `script` making cycle 2's bid place end without resting. The run
+/// Stops on the second event (the cancel of the bid placed after it), with five places sent
+/// and only the ask left for Stop to cancel. What was printed.
+async fn an_unrested_requote_place(script: impl FnOnce(&mut Venue)) -> String {
+    capture::install();
+    let venue = mainnet_venue(vec![b0()]);
+    {
+        let mut v = lock(&venue);
+        script(&mut v);
+        v.book_delay = Some(Duration::from_millis(1_100));
+    }
+    // The opening six, the start's sweep, cycle 1 two places, cycle 2 two places (the bid
+    // never rested), the bid placed again; Stop's cancel of the ask.
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 2 + 1 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let mut opts = mainnet_options(&stub, 4);
+    opts.cancel_window = Duration::from_secs(1);
+    opts.interval_ms =
+        u64::try_from(args::mainnet_interval_max(opts.cancel_window).as_millis()).unwrap();
+    let (report, printed) = run_against(&opts).await;
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("the stub's script: {e:?}\n{printed}"));
+
+    assert!(!report.ok, "{printed}");
+    assert!(
+        report
+            .ended
+            .starts_with("another program cancelled our orders: one quoter per account"),
+        "{printed}"
+    );
+    let warns = tagged(&printed, "WARN");
+    assert_eq!(warns.len(), 2, "{printed}");
+    assert!(warns[1].contains("the bid #"), "{printed}");
+    assert!(
+        warns[1].contains("placing the requote it cancelled): Stop"),
+        "{printed}"
+    );
+    stopped(&printed);
+    let sides = requests(&venue, 0)
+        .into_iter()
+        .filter(|r| r["method"] == "order.create")
+        .map(|r| r["params"]["side"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(sides.len(), 5, "nothing placed after:\n{printed}");
+    assert_eq!(
+        sides[2], "BUY",
+        "cycle 2's unrested place is the bid: {sides:?}"
+    );
+    assert_eq!(sides[4], "BUY", "its side placed again: {sides:?}");
+    no_credential_in(&printed);
+    printed
+}
+
+#[tokio::test]
 async fn a_cancel_of_ours_refused_for_its_rate_stops_covering_its_order_so_anothers_cancel_is_seen()
 {
     capture::install();
@@ -4992,6 +5085,33 @@ fn cancels_not_ours_of_one_action_are_one_event_and_a_later_action_repeats_it() 
     assert_eq!(
         seen.on_cancel(a2, sell, at(43), t0 + s(43)),
         NotOurs::SameEvent
+    );
+
+    // RB-aoh5-10: a requote place that never rested (refused for its rate, a post-only place
+    // that would cross, or not sent) frees its side's slot, so the place after it, the one that
+    // rests, is the requote: its cancel 3 s after its place is the repeat, 43 s from the first.
+    let mut seen = CancelsNotOurs::new(s(30));
+    let (b1, refused, b2) = (cid(), cid(), cid());
+    seen.placed(b1, buy, t0);
+    assert_eq!(seen.on_cancel(b1, buy, at(0), t0), NotOurs::First);
+    seen.placed(refused, buy, t0 + s(25));
+    seen.unrested(refused);
+    seen.retain(|c| *c != refused);
+    seen.placed(b2, buy, t0 + s(40));
+    assert_eq!(seen.on_cancel(b2, buy, at(43), t0 + s(43)), NotOurs::Repeat);
+    // An order not the side's requote that ended unrested frees nothing: the requote that
+    // rested stays the requote, and the later place is still a replace of it.
+    let mut seen = CancelsNotOurs::new(s(30));
+    let (b1, requote, other, replace) = (cid(), cid(), cid(), cid());
+    seen.placed(b1, buy, t0);
+    assert_eq!(seen.on_cancel(b1, buy, at(0), t0), NotOurs::First);
+    seen.placed(requote, buy, t0 + s(40));
+    seen.placed(other, sell, t0 + s(40));
+    seen.unrested(other);
+    seen.placed(replace, buy, t0 + s(45));
+    assert_eq!(
+        seen.on_cancel(replace, buy, at(50), t0 + s(50)),
+        NotOurs::First
     );
 
     // Past 30 s from the window's first event, a new window: a requote cancelled more than
