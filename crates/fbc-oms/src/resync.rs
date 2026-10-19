@@ -32,7 +32,10 @@
 //! rule 1 or its matching-engine time at or before the watermark; any other fill of it comes
 //! after the seed and moves the inventory. The fills of it applied before it was registered
 //! that rule 3 alone placed in a one-read seed (not shown, its time after the watermark) move
-//! the inventory as it is registered, once.
+//! the inventory as it is registered, once. A snapshot requested before a resync that already
+//! compared the market, or not after the seed's request, may have been read before the seed, so
+//! it registers no orphan there and drops nothing kept; the orphans are acted on before the
+//! positions are compared.
 //!
 //! Rules 2 and 3 judge a fill by the open orders and trust the position read beside them, so
 //! they need the snapshot's open orders and positions read at one instant. The venue declares
@@ -166,8 +169,10 @@ pub struct ResyncReport {
     /// (decision 0101; [`Registry::cancel_orphans`](crate::Registry::cancel_orphans)): every
     /// open one from a trustworthy snapshot source, from any other only those a live order
     /// event or fill under its client id also showed while the registry did not hold them, and
-    /// none whose client id or venue id another order of ours holds. One the registry still
-    /// does not hold by its client id after the resync was not acted on.
+    /// none whose client id or venue id another order of ours holds, nor any on a market the
+    /// snapshot was requested before a resync that compared it, or not after its seed's
+    /// request (it may have been read before the seed). One the registry still does not hold
+    /// by its client id after the resync was not acted on.
     pub untracked: Vec<(ClientOrderId, VenueOrderId)>,
     /// The markets holding orphans that are not terminal after it, in id order (0005's I7,
     /// decision 0101): each one's adding side is suppressed until the cooldown the consumer's
@@ -538,17 +543,6 @@ impl Registry {
             }
         }
 
-        let mut checked: Vec<InstrumentId> = self
-            .markets
-            .iter()
-            .filter(|(_, s)| !matches!(s, MarketState::Unseeded(_)))
-            .map(|(inst, _)| *inst)
-            .collect();
-        checked.sort();
-        for inst in checked {
-            let venue = positions.get(&inst).copied().unwrap_or(SignedLots(0));
-            report.checks.push(self.check(inst, snap, venue));
-        }
         for (&cid, o) in &ours {
             if self.held_order(o).is_none()
                 && matches!(
@@ -560,7 +554,22 @@ impl Registry {
             }
         }
         report.untracked.sort_by_key(|(cid, _)| *cid);
-        self.act_on_orphans(snap, &ours, key, &mut report);
+        // The orphans first, so each market's check counts the fills an orphan it registers
+        // took before (Codex's r4310661291 on PR #171).
+        let stale = self.stale_markets(snap);
+        self.act_on_orphans(snap, &ours, key, &stale, &mut report);
+
+        let mut checked: Vec<InstrumentId> = self
+            .markets
+            .iter()
+            .filter(|(_, s)| !matches!(s, MarketState::Unseeded(_)))
+            .map(|(inst, _)| *inst)
+            .collect();
+        checked.sort();
+        for inst in checked {
+            let venue = positions.get(&inst).copied().unwrap_or(SignedLots(0));
+            report.checks.push(self.check(inst, snap, venue));
+        }
 
         // The orders not ours it shows open come into view, from any source; only a
         // trustworthy one shows the account's open orders (FBC-gzm).
@@ -581,22 +590,47 @@ impl Registry {
         Ok(report)
     }
 
+    /// The seeded markets `snap` is no evidence of orphans on (Codex's r4310661297 on PR #171):
+    /// requested before a resync the registry already compared the market with (its check is
+    /// [`PositionCheck::Stale`]), or not after the seed's own request. The venue may have read
+    /// the account before the seed did, so an order it shows open, or does not show, says
+    /// nothing of what the seed held.
+    fn stale_markets(&self, snap: &ResyncSnapshot) -> HashSet<InstrumentId> {
+        self.markets
+            .iter()
+            .filter(|(_, state)| match state {
+                MarketState::Seeded(seed) => {
+                    snap.requested_at < seed.folded_to
+                        || seed
+                            .reference
+                            .as_ref()
+                            .is_some_and(|r| snap.requested_at <= r.requested_at)
+                }
+                _ => false,
+            })
+            .map(|(inst, _)| *inst)
+            .collect()
+    }
+
     /// Acts on the orphans the resync found (0005's I7, decision 0101): registers each open one
     /// from a trustworthy source, or from any other one a live account event also showed,
-    /// unless its client id or venue id is another order's of ours; then suppresses the adding
-    /// side of every market holding orphans that are not terminal, advancing the state
-    /// generation of each it newly suppresses or registers an orphan on, and names those markets.
+    /// unless its client id or venue id is another order's of ours or the snapshot is `stale`
+    /// for its market ([`Registry::stale_markets`]); then suppresses the adding side of every
+    /// market holding orphans that are not terminal, advancing the state generation of each it
+    /// newly suppresses or registers an orphan on, and names those markets.
     fn act_on_orphans(
         &mut self,
         snap: &ResyncSnapshot,
         ours: &HashMap<ClientOrderId, &VenueOrderSnapshot>,
         key: OrderKey,
+        stale: &HashSet<InstrumentId>,
         report: &mut ResyncReport,
     ) {
         let mut registered: HashSet<InstrumentId> = HashSet::new();
         for (cid, vid) in &report.untracked {
             let o = ours[cid];
             if o.state != VenueOrderState::Open
+                || stale.contains(&o.inst)
                 || self.orders.contains_key(cid)
                 || self.cid_of(vid).is_some()
             {
@@ -618,11 +652,13 @@ impl Registry {
         }
         if !report.untrustworthy {
             self.orphans.forget_live();
-            // An order a trustworthy snapshot does not show open is no orphan to come.
-            for state in self.markets.values_mut() {
+            // An order a trustworthy snapshot read after the seed does not show open is no
+            // orphan to come.
+            for (inst, state) in &mut self.markets {
                 if let MarketState::Seeded(Seed {
                     reference: Some(r), ..
                 }) = state
+                    && !stale.contains(inst)
                 {
                     r.absent_only.retain(|cid, _| {
                         ours.get(cid)
