@@ -18,16 +18,16 @@ use std::time::Duration;
 
 use common::{canceled, cid, fill, fill_id, lots, order_caps, placement, update, vid};
 use fbc_core::{
-    AmendAck, AmendCaps, AmendQty, CancelBatch, CancelScope, CidMatch, ClientOrderId, FillIdent,
-    InstrumentId, MonoNs, Namespace, NewOrder, OrderCaps, OrderKind, OrderRef, RefKind, RpcId,
-    Side, SignedLots, SnapshotSource, Support, TagSet, Ticks, VenueCommand, VenueOrderSnapshot,
-    VenueOrderState, WallNs,
+    AmendAck, AmendCaps, AmendQty, CancelBatch, CancelScope, CidMatch, ClientOrderId, ExchNs,
+    ExchTsKind, FillIdent, InstrumentId, MonoNs, Namespace, NewOrder, OrderCaps, OrderKind,
+    OrderRef, RefKind, RpcId, Side, SignedLots, SnapshotReads, SnapshotSource, Support, TagSet,
+    Ticks, VenueCommand, VenueOrderSnapshot, VenueOrderState, WallNs,
 };
 use fbc_oms::{
     Admission, AmendRefusal, CancelAllRefusal, Cooldown, EntryState, FillLedger, FillRouted,
-    LadderConfig, LedgerConfig, MarketCapsConfig, OmsError, OrdState, OrderKey, OrphanCancels,
-    OrphanConfig, OrphanConfigError, OrphanPlan, PreTradeCaps, Registry, ResyncReport,
-    ResyncSnapshot, Routed, StaleAuthorization,
+    FillTime, IssueRefusal, LadderConfig, LedgerConfig, MarketCapsConfig, OmsError, OrdState,
+    OrderKey, OrphanCancels, OrphanConfig, OrphanConfigError, OrphanPlan, PreTradeCaps, Registry,
+    ResyncReport, ResyncSnapshot, Routed, StaleAuthorization,
 };
 
 const INST: InstrumentId = InstrumentId::new(1);
@@ -109,21 +109,46 @@ fn resync_at(
     orders: Vec<VenueOrderSnapshot>,
     pos: i64,
 ) -> ResyncReport {
+    resync_on(reg, &venue_from(source), at, orders, pos)
+}
+
+/// A resync requested at `at` (on both clocks) of `orders`, positions `pos`, on a venue whose
+/// order caps are `venue`.
+fn resync_on(
+    reg: &mut Registry,
+    venue: &OrderCaps,
+    at: u64,
+    orders: Vec<VenueOrderSnapshot>,
+    pos: i64,
+) -> ResyncReport {
     let snap = ResyncSnapshot {
         watermark: WallNs(i64::try_from(at).unwrap()),
         requested_at: MonoNs(at),
         orders,
         positions: vec![(INST, SignedLots(pos))],
     };
-    reg.resync(&ladder_cfg(), &venue_from(source), &snap, key(at))
-        .unwrap()
+    reg.resync(&ladder_cfg(), venue, &snap, key(at)).unwrap()
+}
+
+/// [`venue`] whose resync reads the open orders and the positions separately (decision 0095),
+/// as Paradex's does.
+fn separate() -> OrderCaps {
+    OrderCaps {
+        snapshot_reads: SnapshotReads::Separate,
+        ..venue()
+    }
 }
 
 /// A named registry under the caps whose first trustworthy resync, at 1 000, seeded `INST` at
 /// `pos` and `OTHER` flat, showing no order: disarmed, in Cancel-only.
 fn seeded(pos: i64) -> Registry {
+    seeded_on(&venue(), pos)
+}
+
+/// [`seeded`], on a venue whose order caps are `venue`.
+fn seeded_on(venue: &OrderCaps, pos: i64) -> Registry {
     let mut reg = arm::named(Registry::with_caps(caps()));
-    let report = resync_at(&mut reg, SnapshotSource::Trustworthy, 1_000, vec![], pos);
+    let report = resync_on(&mut reg, venue, 1_000, vec![], pos);
     assert_eq!(report.seeded.len(), 2, "{report:?}");
     assert!(report.orphans.is_empty());
     assert_eq!(reg.position(INST), Some(SignedLots(pos)));
@@ -207,6 +232,55 @@ fn assert_explicit(plan: &OrphanPlan, vids: &[&str], escalation: Option<CancelAl
     assert!(cancels.awaiting_ack.is_empty(), "{cancels:?}");
     assert_eq!(cancels.commands.len(), 1, "one cancel-many: {cancels:?}");
     assert_eq!(cancelled(cancels.commands[0].command()), vids);
+}
+
+/// A live fill of our order `c` under `v`, its `qty` lots on `side` taking it to `cum` filled,
+/// executed at `exec` on the venue's matching engine (`None`: no such time), arriving at
+/// `arrived`, applied through `l`.
+#[allow(clippy::too_many_arguments)]
+fn fill_at(
+    reg: &mut Registry,
+    l: &mut FillLedger,
+    c: ClientOrderId,
+    v: &str,
+    side: Side,
+    qty: i64,
+    cum: i64,
+    exec: Option<i64>,
+    arrived: u64,
+) -> FillRouted {
+    let f = fill(
+        Some(c),
+        FillIdent::Venue {
+            fill: fill_id(&format!("{v}-{cum}")),
+            vid: Some(vid(v)),
+            cum_after: Some(lots(cum)),
+        },
+        side,
+        qty,
+        false,
+    );
+    let time = exec.map(|at| FillTime {
+        exch: ExchNs(at),
+        kind: ExchTsKind::MatchingEngine,
+        aligned: WallNs(at),
+    });
+    let Admission::Apply(accepted) = l.admit(&f, time, MonoNs(arrived)) else {
+        panic!("a new fill is admitted");
+    };
+    reg.apply_fill(accepted).unwrap()
+}
+
+/// Places our sell `order`, authorizes it and has the venue cancel it under `v`: a later fill
+/// of it moves the position, and nothing of it counts on the side any more.
+fn cancelled_sell(reg: &mut Registry, order: NewOrder, v: &str) -> ClientOrderId {
+    let c = order.cid;
+    place(reg, order).unwrap();
+    let mut ended = update(Some(c), canceled(), 0);
+    ended.vid = Some(vid(v));
+    reg.apply_update(&ended, key(1_500));
+    assert!(reg.get(c).unwrap().state().is_terminal());
+    c
 }
 
 fn ledger() -> FillLedger {
@@ -778,4 +852,245 @@ fn an_untracked_order_whose_ids_another_order_of_ours_holds_or_that_is_not_open_
     assert!(reg.get(gone).is_none());
     assert_eq!(reg.cid_of(&vid("y")), Some(yc));
     assert_eq!(reg.orphan_cooldown(INST), None);
+}
+
+#[test]
+fn a_registered_orphans_later_fills_move_the_inventory_on_either_read_mode() {
+    // Reviewer B's RB840-1 on PR #171: a later snapshot showing it open proves the orphan was
+    // live after the seed, so the seed holds none of its fills but those its time places at
+    // or before the seed's watermark (or that arrived before the seed was requested).
+    for venue in [venue(), separate()] {
+        let mut reg = seeded_on(&venue, 0);
+        let mut l = ledger();
+        let (o, p) = (cid(), cid());
+        let report = resync_on(
+            &mut reg,
+            &venue,
+            2_000,
+            vec![ours(o, "o", Side::Buy), ours(p, "p", Side::Buy)],
+            0,
+        );
+        let mut both = vec![o, p];
+        both.sort();
+        assert_eq!(reg.orphans(INST), both, "{report:?}");
+        // After the seed: counted on the order and on the inventory.
+        let routed = fill_at(
+            &mut reg,
+            &mut l,
+            o,
+            "o",
+            Side::Buy,
+            2,
+            2,
+            Some(2_500),
+            3_000,
+        );
+        assert!(
+            matches!(routed, FillRouted::Ours(c, _) if c == o),
+            "{routed:?}"
+        );
+        assert_eq!(reg.position(INST), Some(SignedLots(2)), "{venue:?}");
+        // With no matching-engine time: after the seed too.
+        let routed = fill_at(&mut reg, &mut l, o, "o", Side::Buy, 3, 5, None, 3_100);
+        assert!(
+            matches!(routed, FillRouted::Ours(c, _) if c == o),
+            "{routed:?}"
+        );
+        assert_eq!(reg.position(INST), Some(SignedLots(5)));
+        assert!(reg.get(o).unwrap().state().is_terminal());
+        // Executed at or before the seed's watermark: the seeded position holds it.
+        let routed = fill_at(&mut reg, &mut l, p, "p", Side::Buy, 1, 1, Some(900), 3_200);
+        assert_eq!(routed, FillRouted::InSnapshot(p));
+        assert_eq!(reg.position(INST), Some(SignedLots(5)));
+    }
+}
+
+#[test]
+fn a_registered_orphans_fill_counts_against_the_reducing_side_during_the_cooldown() {
+    // Reviewer B's RB840-1: long 20, a sell orphan of 5 fills; the position is 15, so a sell of
+    // 16 would cross zero.
+    let mut reg = seeded(20);
+    arm::start(&mut reg, INST);
+    let mut l = ledger();
+    let o = cid();
+    resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        2_000,
+        vec![ours(o, "o", Side::Sell)],
+        20,
+    );
+    fill_at(
+        &mut reg,
+        &mut l,
+        o,
+        "o",
+        Side::Sell,
+        5,
+        5,
+        Some(2_500),
+        3_000,
+    );
+    assert_eq!(reg.position(INST), Some(SignedLots(15)));
+    assert_eq!(place(&mut reg, sell(16)), Err(suppressed(Side::Sell)));
+    place(&mut reg, sell(15)).unwrap();
+}
+
+#[test]
+fn during_the_cooldown_a_place_built_before_a_fill_moved_the_position_is_refused_at_authorization_and_at_submit()
+ {
+    // Reviewer B's RB840-2 on PR #171: long 20, a sell of 20 is built inside the cooldown, then
+    // a late fill of a cancelled sell moves the position to 17 under it.
+    let setup = || {
+        let mut reg = seeded(20);
+        arm::start(&mut reg, INST);
+        let late = cancelled_sell(&mut reg, sell(3), "late");
+        resync_at(
+            &mut reg,
+            SnapshotSource::Trustworthy,
+            2_000,
+            vec![ours(cid(), "o", Side::Buy)],
+            20,
+        );
+        assert_eq!(reg.orphan_cooldown(INST), Some(Cooldown::Pending));
+        let cmd = reg.place(sell(20)).unwrap();
+        (reg, late, cmd)
+    };
+
+    // Moved before its authorization: refused there, and what it reserved released.
+    let (mut reg, late, cmd) = setup();
+    let mut l = ledger();
+    fill_at(
+        &mut reg,
+        &mut l,
+        late,
+        "late",
+        Side::Sell,
+        3,
+        3,
+        Some(2_500),
+        3_000,
+    );
+    assert_eq!(reg.position(INST), Some(SignedLots(17)));
+    let refused = reg.authorize(arm::TEST_ACCT, cmd).unwrap_err();
+    assert_eq!(
+        refused,
+        IssueRefusal::OrphanCooldown {
+            inst: INST,
+            side: Side::Sell
+        }
+    );
+    assert!(!refused.to_string().is_empty());
+    assert_eq!(place(&mut reg, sell(20)), Err(suppressed(Side::Sell)));
+    place(&mut reg, sell(17)).unwrap();
+
+    // Moved after its authorization: refused at submit.
+    let (mut reg, late, cmd) = setup();
+    let mut l = ledger();
+    let auth = reg.authorize(arm::TEST_ACCT, cmd).unwrap();
+    assert_eq!(auth.check_at_submit(), Ok(()));
+    fill_at(
+        &mut reg,
+        &mut l,
+        late,
+        "late",
+        Side::Sell,
+        3,
+        3,
+        Some(2_500),
+        3_000,
+    );
+    assert_eq!(
+        auth.check_at_submit(),
+        Err(StaleAuthorization::PositionMoved(INST))
+    );
+}
+
+#[test]
+fn during_the_cooldown_an_amend_built_before_a_fill_moved_the_position_is_refused_at_authorization_and_at_submit()
+ {
+    let amending = OrderCaps {
+        amend: Some(AmendCaps {
+            refs: TagSet::of(&[RefKind::Venue]),
+            price: true,
+            qty: true,
+            flags: false,
+            when_partially_filled: true,
+            reject_keeps_original: true,
+            keeps_venue_id: true,
+            ack: AmendAck::ReplacedEvent,
+            qty_semantics: AmendQty::TotalIncludingFilled,
+            keeps_priority: None,
+        }),
+        ..venue()
+    };
+    let mut reg = seeded(20);
+    arm::start(&mut reg, INST);
+    let mut l = ledger();
+    let (first, second) = (
+        cancelled_sell(&mut reg, sell(3), "first"),
+        cancelled_sell(&mut reg, sell(2), "second"),
+    );
+    let s = sell(5);
+    let sc = s.cid;
+    place(&mut reg, s).unwrap();
+    let mut shown_s = ours(sc, "s", Side::Sell);
+    shown_s.px = Some(Ticks(101));
+    resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        2_000,
+        vec![shown_s, ours(cid(), "o", Side::Buy)],
+        20,
+    );
+    assert_eq!(reg.orphan_cooldown(INST), Some(Cooldown::Pending));
+
+    // Built to 20 against long 20; a fill moves it to 17 before its authorization.
+    let cmd = reg
+        .live(sc)
+        .unwrap()
+        .amend(&amending, Ticks(102), lots(20), false)
+        .unwrap();
+    fill_at(
+        &mut reg,
+        &mut l,
+        first,
+        "first",
+        Side::Sell,
+        3,
+        3,
+        Some(2_500),
+        3_000,
+    );
+    assert_eq!(
+        reg.authorize(arm::TEST_ACCT, cmd).unwrap_err(),
+        IssueRefusal::OrphanCooldown {
+            inst: INST,
+            side: Side::Sell
+        }
+    );
+
+    // Built to 17, authorized, and a fill moves it to 15 before it is sent.
+    let cmd = reg
+        .live(sc)
+        .unwrap()
+        .amend(&amending, Ticks(102), lots(17), false)
+        .unwrap();
+    let auth = reg.authorize(arm::TEST_ACCT, cmd).unwrap();
+    fill_at(
+        &mut reg,
+        &mut l,
+        second,
+        "second",
+        Side::Sell,
+        2,
+        2,
+        Some(2_600),
+        3_100,
+    );
+    assert_eq!(reg.position(INST), Some(SignedLots(15)));
+    assert_eq!(
+        auth.check_at_submit(),
+        Err(StaleAuthorization::PositionMoved(INST))
+    );
 }
