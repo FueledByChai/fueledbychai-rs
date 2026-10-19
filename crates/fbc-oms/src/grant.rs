@@ -55,7 +55,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use fbc_core::{AccountKey, CancelScope, ClientOrderId, InstrumentId, VenueCommand};
+use fbc_core::{AccountKey, CancelScope, ClientOrderId, InstrumentId, Side, VenueCommand};
 
 use crate::{CapRefusal, PermittedCommand, Registry};
 
@@ -218,6 +218,11 @@ pub enum IssueRefusal {
     /// with the position and our orders as they are now: a fill or another order moved them
     /// since its build (decision 0082). What it reserved is released.
     Capped(CapRefusal),
+    /// Judged again as it is authorized, the place, batch item or amend on `side` no longer
+    /// reduces the known, non-zero position within its size while an orphan cooldown
+    /// suppresses the market's adding side (0005's I7, decision 0101): a fill or a resync moved
+    /// the position since its build, or the cooldown began since. What it reserved is released.
+    OrphanCooldown { inst: InstrumentId, side: Side },
     /// The order `cid` no longer holds what the command's build reserved: it ended since, or,
     /// for an amend, a later command was reported sent over the build (decision 0082). Nothing
     /// of the command is sent; what any other of its orders reserved is released.
@@ -253,6 +258,13 @@ impl fmt::Display for IssueRefusal {
                 return write!(
                     f,
                     "{cid:?} no longer holds what the command's build reserved"
+                );
+            }
+            IssueRefusal::OrphanCooldown { inst, side } => {
+                return write!(
+                    f,
+                    "the adding side of {inst:?} is suppressed for an orphan cooldown, and the \
+                     {side:?} order no longer reduces its position within its size"
                 );
             }
             IssueRefusal::NotOrderAffecting => "the command affects no order",
