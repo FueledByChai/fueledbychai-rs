@@ -137,6 +137,8 @@ fn resync_on(
 fn separate() -> OrderCaps {
     OrderCaps {
         snapshot_reads: SnapshotReads::Separate,
+        // A synthetic snapshot, answered from the stub's own state: it never lags.
+        snapshot_lag_bound: Duration::ZERO,
         ..venue()
     }
 }

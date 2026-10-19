@@ -50,7 +50,8 @@ fn fee_seal_does_not_compile() {
 /// (decision 0003, design §4.4, §4.5). Order capabilities without fill capabilities, and fill
 /// capabilities without an exec block, cannot be written (decision 0015). Order capabilities
 /// cannot be written without saying whether a resync reads the open orders and the positions at
-/// one instant, and `SnapshotReads` has no `default()` (decision 0095).
+/// one instant, and `SnapshotReads` has no `default()` (decision 0095), nor without saying how
+/// long the venue's open-order snapshot may lag its order stream (FBC-i8lp).
 #[test]
 fn caps_and_specs_declare_every_field() {
     let cases = trybuild::TestCases::new();

@@ -139,6 +139,8 @@ fn caps(fee_sign: VenueFeeSign) -> VenueCaps {
                 snapshot_source: SnapshotSource::None,
                 // A resync is answered in one frame (decision 0049).
                 snapshot_reads: SnapshotReads::OneInstant,
+                // A synthetic snapshot, answered from the stub's own state: it never lags.
+                snapshot_lag_bound: Duration::ZERO,
                 events_echo_flags: true,
                 sign_cost_hint_us: 0,
             },

@@ -173,6 +173,8 @@ pub fn order_caps() -> OrderCaps {
         ordering_key: OrderingKey::VenueSeq,
         snapshot_source: SnapshotSource::Trustworthy,
         snapshot_reads: SnapshotReads::OneInstant,
+        // A synthetic snapshot, answered from the stub's own state: it never lags.
+        snapshot_lag_bound: Duration::ZERO,
         events_echo_flags: false,
         sign_cost_hint_us: 0,
     }
