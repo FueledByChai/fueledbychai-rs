@@ -295,6 +295,37 @@ impl Registry {
         self.sum_on(inst, side, &[], OrderRecord::resting)
     }
 
+    /// What our orders on `inst` and `side` that reduce the position (the venue's reduce-only
+    /// flag or the consumer's reducing classification), but those in `except`, may have
+    /// resting, each at its [`OrderRecord::resting`]; `None` when the sum does not fit a lot
+    /// count. The planner sizes an emulated reduce-only order by it (FBC-01w).
+    pub(crate) fn reducers_resting_on(
+        &self,
+        inst: InstrumentId,
+        side: Side,
+        except: &[ClientOrderId],
+    ) -> Option<Lots> {
+        self.sum_on(inst, side, except, |rec| {
+            if rec.placed().reduces() {
+                rec.resting()
+            } else {
+                Lots::ZERO
+            }
+        })
+    }
+
+    /// The fills the venue reported on the order updates of our orders on `inst` and `side`
+    /// that the ledger has not counted yet (each order's `cum_venue` past its `cum_fills`,
+    /// terminal orders included): executions the inventory does not hold until their fill
+    /// events arrive. `None` when the sum does not fit a lot count.
+    pub(crate) fn unaccounted_fills_on(&self, inst: InstrumentId, side: Side) -> Option<Lots> {
+        self.sum_on(inst, side, &[], |rec| {
+            rec.cum_venue()
+                .checked_sub(rec.cum_fills())
+                .unwrap_or(Lots::ZERO)
+        })
+    }
+
     /// The sum of `each` over our orders on `inst` and `side` but those in `except`; `None`
     /// when it does not fit a lot count.
     fn sum_on(

@@ -327,6 +327,28 @@ fn an_rpi_quote_on_a_venue_without_rpi_goes_on_the_public_book_and_says_so() {
     ack(&mut reg, plan.commands[0].cid, "v1");
     let again = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, LATER);
     assert!(again.commands.is_empty(), "{:?}", shape(&again));
+    // An RPI order only rests: moved to the public book it stays post-only, so it never takes.
+    let mut reg2 = quoting(0);
+    let mut p2 = planner();
+    let resting_only = book().with(
+        Side::Buy,
+        0,
+        DesiredQuote {
+            channel: Channel::Rpi,
+            ..limit(10_000, 3)
+        },
+    );
+    let plan = plan_and_send(
+        &mut p2,
+        &resting_only,
+        &mut reg2,
+        &caps,
+        &mut mint,
+        MonoNs(0),
+    );
+    let o = placed(&plan.commands[0]);
+    assert!(o.channel == Channel::Public && o.post_only);
+    assert_eq!(plan.commands[0].downgrades, vec![Downgrade::RpiUnsupported]);
     // The same quote on a venue with RPI is sent as asked, with no downgrade.
     let mut reg = quoting(0);
     let mut p = planner();
@@ -718,11 +740,16 @@ fn an_emulated_order_is_cancelled_on_the_fill_that_makes_it_overshoot_then_repla
     ack(&mut reg, emulated, "v0");
     ack(&mut reg, plain, "v1");
     // Nothing overshoots before the fill.
-    assert!(p.on_fill(&mut reg, &caps, ACCT, INST).unwrap().is_empty());
+    assert!(
+        p.on_fill(&mut reg, &caps, ACCT, INST)
+            .unwrap()
+            .commands
+            .is_empty()
+    );
     // The plain ask fills 4: long 6, and the emulated exit of 10 would cross zero.
     fill_of(&mut reg, &mut l, plain, Side::Sell, 4, "f1");
     assert_eq!(reg.position(INST), Some(SignedLots(6)));
-    let cancels = p.on_fill(&mut reg, &caps, ACCT, INST).unwrap();
+    let cancels = p.on_fill(&mut reg, &caps, ACCT, INST).unwrap().commands;
     assert_eq!(cancels.len(), 1);
     assert_eq!(cancels[0].cid, emulated);
     assert_eq!(cancels[0].stage, Stage::Cancel);
@@ -735,7 +762,12 @@ fn an_emulated_order_is_cancelled_on_the_fill_that_makes_it_overshoot_then_repla
         "{:?}",
         shape(&waiting)
     );
-    assert!(p.on_fill(&mut reg, &caps, ACCT, INST).unwrap().is_empty());
+    assert!(
+        p.on_fill(&mut reg, &caps, ACCT, INST)
+            .unwrap()
+            .commands
+            .is_empty()
+    );
     // Cancelled, the level is placed again at the 6 left.
     cancelled(&mut reg, emulated, Side::Sell, "v0", 2);
     let resized = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, LATER2);
@@ -791,7 +823,12 @@ fn an_emulated_order_s_own_fills_never_overshoot() {
     // It fills 4 of its 10: long 6 and 6 resting, which is what is left.
     fill_of(&mut reg, &mut l, emulated, Side::Sell, 4, "f1");
     assert_eq!(reg.position(INST), Some(SignedLots(6)));
-    assert!(p.on_fill(&mut reg, &caps, ACCT, INST).unwrap().is_empty());
+    assert!(
+        p.on_fill(&mut reg, &caps, ACCT, INST)
+            .unwrap()
+            .commands
+            .is_empty()
+    );
     let pass = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, LATER);
     assert!(pass.commands.is_empty(), "{:?}", shape(&pass));
 }
@@ -871,7 +908,12 @@ fn the_check_after_a_fill_is_refused_through_another_registry_and_ignores_other_
     let mut p = planner();
     let caps = conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]);
     // No pass yet: nothing to check.
-    assert!(p.on_fill(&mut reg, &caps, ACCT, INST).unwrap().is_empty());
+    assert!(
+        p.on_fill(&mut reg, &caps, ACCT, INST)
+            .unwrap()
+            .commands
+            .is_empty()
+    );
     // A plain reduce-only ask and a kept-reduce-only exit are the venue's to bound, not the
     // check's: long 10 with 10 + 10 resting, nothing is cancelled.
     let desired = book()
@@ -882,10 +924,97 @@ fn the_check_after_a_fill_is_refused_through_another_registry_and_ignores_other_
             maker_exit(10_020, 10, ReduceFallback::KeepReduceOnly),
         );
     plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, MonoNs(0));
-    assert!(p.on_fill(&mut reg, &caps, ACCT, INST).unwrap().is_empty());
+    assert!(
+        p.on_fill(&mut reg, &caps, ACCT, INST)
+            .unwrap()
+            .commands
+            .is_empty()
+    );
     let mut other = quoting(10);
     assert_eq!(
         p.on_fill(&mut other, &caps, ACCT, INST).err(),
         Some(PlanError::OtherRegistry { acct: ACCT })
     );
+}
+
+#[test]
+fn an_emulated_amend_left_nothing_by_an_earlier_build_is_not_built_and_its_order_is_cancelled() {
+    // Long 10, an emulated exit of 3 resting at level 1 asked to grow to 6, and a reduce-only
+    // ask of 10 coming at level 0: built first, it leaves nothing, so the amend is not built
+    // and the emulated order is cancelled after the builds.
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = amending(conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]));
+    let first = book().with(
+        Side::Sell,
+        1,
+        maker_exit(10_020, 3, ReduceFallback::EmulateReduceOnly),
+    );
+    let plan = plan_and_send(&mut p, &first, &mut reg, &caps, &mut mint, MonoNs(0));
+    let emulated = plan.commands[0].cid;
+    ack(&mut reg, emulated, "v1");
+    let next = book()
+        .with(Side::Sell, 0, reduce_only(limit(10_010, 10)))
+        .with(
+            Side::Sell,
+            1,
+            maker_exit(10_020, 6, ReduceFallback::EmulateReduceOnly),
+        );
+    let pass = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER);
+    assert_eq!(
+        shape(&pass),
+        vec![
+            (Stage::Reducing, "place", Side::Sell, 0),
+            (Stage::Cancel, "cancel", Side::Sell, 1),
+        ]
+    );
+    assert_eq!(pass.commands[1].cid, emulated);
+    assert!(pass.refused.is_empty());
+}
+
+#[test]
+fn fills_the_venue_reported_before_their_fill_events_count_against_an_emulated_order() {
+    // Long 10: an emulated exit of 10 and a plain ask of 4. The venue reports the plain ask
+    // filled on an order update before the fill event arrives: the position is 6 in truth,
+    // though the inventory still holds 10, so the emulated exit is cancelled.
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]);
+    let desired = book()
+        .with(
+            Side::Sell,
+            0,
+            maker_exit(10_010, 10, ReduceFallback::EmulateReduceOnly),
+        )
+        .with(Side::Sell, 1, limit(10_020, 4));
+    let plan = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, MonoNs(0));
+    let (emulated, plain) = (plan.commands[0].cid, plan.commands[1].cid);
+    ack(&mut reg, emulated, "v0");
+    ack(&mut reg, plain, "v1");
+    let u = OrderUpdate {
+        cid: Some(CidMatch::Ours(plain)),
+        vid: Some(vid("v1")),
+        inst: INST,
+        side: Side::Sell,
+        state: VenueOrderState::Filled,
+        cum_filled: lots(4),
+        px: None,
+        qty: None,
+        post_only: None,
+        reduce_only: None,
+    };
+    reg.apply_update(&u, key(2));
+    assert_eq!(reg.position(INST), Some(SignedLots(10)));
+    // The filled ask's level is placed again; the emulated exit is cancelled first.
+    let pass = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, MonoNs(1));
+    assert_eq!(
+        shape(&pass),
+        vec![
+            (Stage::Cancel, "cancel", Side::Sell, 0),
+            (Stage::Add, "place", Side::Sell, 1),
+        ]
+    );
+    assert_eq!(pass.commands[0].cid, emulated);
 }
