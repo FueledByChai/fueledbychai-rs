@@ -111,7 +111,7 @@ pub enum AmendRefusal {
     /// order's side past the inventory cap, or what the side has resting past the resting
     /// cap, or its market has no caps configured.
     Capped(CapRefusal),
-    /// An orphan cooldown suppresses the market's adding side (0005's I7, decision 0106) and
+    /// An orphan cooldown suppresses the market's adding side (0005's I7, decision 0107) and
     /// the order is on `side`, which, at what it may fill once amended, does not reduce the
     /// known, non-zero position within its size.
     OrphanCooldown { inst: InstrumentId, side: Side },
@@ -348,7 +348,7 @@ pub struct Live<'r> {
     /// while the permit holds the registry.
     state: Result<Admits, StateRefusal>,
     /// An orphan cooldown suppressed the market's adding side when the permit was given
-    /// (decision 0106).
+    /// (decision 0107).
     suppressed: bool,
     /// The market's state generation then, and in Exit its position revision, which the
     /// amend's authorization is checked against at submit (decisions 0060, 0066).
@@ -399,7 +399,7 @@ impl<'r> Live<'r> {
     /// the side's orders, this one at what it may fill once amended, within the position's size
     /// ([`ExitRefusal`](crate::ExitRefusal)).
     ///
-    /// While an orphan cooldown suppresses the market's adding side (decision 0106), refused
+    /// While an orphan cooldown suppresses the market's adding side (decision 0107), refused
     /// before Exit's admission and either cap unless the order is on the side that reduces the
     /// known, non-zero position and the side's orders, this one at what it may fill once
     /// amended, stay within the position's size ([`AmendRefusal::OrphanCooldown`]).
@@ -476,7 +476,7 @@ pub(crate) fn live_refusal(rec: &OrderRecord) -> Result<(), PermitRefusal> {
 /// Everything [`Live::amend`] judges, changing nothing: the amend of `rec` to `px` and the
 /// total `qty` with its wire quantity, as the venue's `caps` shape it, refused when the market's
 /// `state` builds no such amend, an orphan cooldown suppresses the market's adding side
-/// (`suppressed`) and the amend does not reduce the position within its size (decision 0106),
+/// (`suppressed`) and the amend does not reduce the position within its size (decision 0107),
 /// or the amend would take `exposure` (the side's position and our other orders on it) past
 /// either pre-trade cap.
 pub(crate) fn judge_amend(
@@ -490,7 +490,7 @@ pub(crate) fn judge_amend(
     let (amend, wire) = amend_shape(rec, caps, px, qty, reducing)?;
     let adds = rec.exposure_if_amended(qty, wire);
     // While an orphan cooldown suppresses the adding side, only an amend on the side that
-    // reduces the position, within its size, is built (decision 0106).
+    // reduces the position, within its size, is built (decision 0107).
     if suppressed && exposure.admit_exit(true, adds).is_err() {
         let placed = rec.placed();
         return Err(AmendRefusal::OrphanCooldown {
