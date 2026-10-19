@@ -428,7 +428,7 @@ impl OrderRecord {
     /// classified reducing ([`NewOrder::reduces`]), amended with the reducing classification
     /// since, which stays counted even if that amend never applies, or kept by the planner for
     /// a quote that reduces it (an emulated reduce-only one's included). An emulated
-    /// reduce-only order is sized against every such order on its side (decision 0101).
+    /// reduce-only order is sized against every such order on its side (decision 0106).
     pub fn reduces(&self) -> bool {
         self.placed.reduces() || self.counted_reducing
     }
