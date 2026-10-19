@@ -29,7 +29,8 @@
 //!    fill counts, since its price and total would confirm the amend while the record kept
 //!    the retired id, and a tombstone by client id follows. With a [`SnapshotSource::Trustworthy`] source, an order absent from
 //!    the configured number of snapshots in a row, each with a watermark at least its sent
-//!    time plus the settle time, ends [`TerminalKind::Lost`] and is counted
+//!    time plus the settle time (or the venue's snapshot lag bound when longer:
+//!    [`LadderConfig::absence_settle`], decision 0109), ends [`TerminalKind::Lost`] and is counted
 //!    ([`Registry::lost`]). An order whose sent time was never recorded
 //!    ([`Registry::placement_sent`]), or whose venue id an unconfirmed amend may have replaced
 //!    on a venue whose amend gives a new id, is never found absent: a snapshot may show it
@@ -108,7 +109,8 @@ impl std::error::Error for LadderConfigError {}
 impl LadderConfig {
     /// The ladder's numbers: how long a command may stay in flight before it escalates
     /// (`intent_timeout`), how long after an order was sent a snapshot's watermark must be for
-    /// its absence to count (`settle`), how long an order stays on the ladder before a
+    /// its absence to count (`settle`; never shorter, in effect, than the venue's snapshot lag
+    /// bound: [`LadderConfig::absence_settle`]), how long an order stays on the ladder before a
     /// tombstone cancel (`max_unknown`), and how many such snapshots in a row must miss it
     /// before it is lost (`absent_snapshots`). Refused when one of them would make the ladder
     /// act at once.
@@ -154,6 +156,15 @@ impl LadderConfig {
     /// How many trustworthy snapshots in a row must miss an order before it is lost.
     pub fn absent_snapshots(&self) -> u8 {
         self.absent_snapshots
+    }
+
+    /// How long after an order was sent a snapshot's watermark must be for its absence to count
+    /// on the venue `caps` describe: the settle time, or the venue's declared snapshot lag
+    /// bound when that is longer (`OrderCaps::snapshot_lag_bound`, decision 0109). A snapshot
+    /// within the bound may not yet show an order the venue holds, so no settle shorter than
+    /// it, zero included, ends a resting order Lost early.
+    pub fn absence_settle(&self, caps: &OrderCaps) -> Duration {
+        self.settle.max(caps.snapshot_lag_bound)
     }
 }
 
@@ -365,9 +376,10 @@ impl Registry {
     /// only counted as shown; so is one it shows resting under another venue id than the
     /// record's while an unconfirmed amend may have replaced the record's on a venue whose
     /// amend gives a new id, its cumulative fill counted too. With a [`SnapshotSource::Trustworthy`] source, an order on the ladder the
-    /// snapshot does not show, sent at least the settle time before the watermark,
-    /// counts one absence, and the configured number in a row ends it Lost, counted; a
-    /// snapshot showing it starts the count again. An order with no recorded sent time, or
+    /// snapshot does not show, sent at least the settle time before the watermark (or the
+    /// venue's snapshot lag bound when that is longer: [`LadderConfig::absence_settle`],
+    /// decision 0109), counts one absence, and the configured number in a row ends it Lost,
+    /// counted; a snapshot showing it starts the count again. An order with no recorded sent time, or
     /// whose venue id an unconfirmed amend may have replaced, never counts as absent.
     pub fn on_resync(
         &mut self,
@@ -431,7 +443,8 @@ impl Registry {
                 continue;
             }
             let settled = rec.sent_at().is_some_and(|(_, sent)| {
-                let settle = i64::try_from(cfg.settle.as_nanos()).unwrap_or(i64::MAX);
+                let settle = cfg.absence_settle(caps);
+                let settle = i64::try_from(settle.as_nanos()).unwrap_or(i64::MAX);
                 watermark >= WallNs(sent.0.saturating_add(settle))
             });
             if caps.snapshot_source == SnapshotSource::Trustworthy

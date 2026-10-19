@@ -298,7 +298,8 @@ rather than guess.
     `tests/ladder.rs`), run on the consumer's timer with its `LadderConfig`: a command past the
     intent timeout escalates, an order on the ladder is queried once by a declared reference,
     resolved by the answer or a resync, Lost after the configured trustworthy snapshots past its
-    sent time plus the settle time, tombstone-cancelled by client id after the maximum, and
+    sent time plus the settle time (never less than the venue's declared snapshot lag bound,
+    decision 0109), tombstone-cancelled by client id after the maximum, and
     never placed or amended again; resyncs (0055; `src/resync.rs`, `tests/resync.rs`): the
     first seeds each market's position once and registers our open orders it shows, the
     position unknown until then, a fill straddling the snapshot counted once, later ones

@@ -185,6 +185,14 @@ pub fn exec_caps() -> ExecCaps {
             // by its arrival before the request (or a matching-engine time, which Paradex's
             // fills do not carry), never by its order's shown cumulative fill or absence.
             snapshot_reads: SnapshotReads::Separate,
+            // Undocumented how long `GET /orders` may lag the order stream. FBC-8xr's three
+            // testnet runs (`fixtures/paradex/exec-recorded/`, decision 0094's answer (b)) saw
+            // it reflect the stream at most 1705 ms, 1698 ms and 3480 ms after it: at most
+            // 3480 ms. Declared 6 s, more than half again that, for the send's own latency and
+            // the runs' few samples, and below the samples' 10 s settle (decision 0109): no
+            // absence of an order from a snapshot requested within 6 s of its send counts
+            // toward Lost, whatever the consumer's settle.
+            snapshot_lag_bound: Duration::from_secs(6),
             // The schema's OrderEvent carries `timeInForce` (POST_ONLY, RPI) and `flags`
             // (REDUCE_ONLY).
             events_echo_flags: true,

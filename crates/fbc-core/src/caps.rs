@@ -109,6 +109,14 @@ pub struct OrderCaps {
     /// reads a fill can land between (decision 0095). The seed places a fill by its order's
     /// shown cumulative fill, or by the order's absence, only on one read.
     pub snapshot_reads: SnapshotReads,
+    /// How long the venue's open-order snapshot may lag its order stream (decision 0109): an
+    /// order sent less than this before a snapshot's watermark may be missing from it though
+    /// the venue holds it. The Unknown ladder counts no absence of an order from a snapshot
+    /// within this bound of the order's send, whatever the consumer's settle time, so no
+    /// resting order is ended Lost early and its resting exposure freed. Read only from a
+    /// trustworthy source, the only one whose absences count; a venue cites its measured lag,
+    /// with margin. Zero for a snapshot answered from the venue's own state at once.
+    pub snapshot_lag_bound: Duration,
     /// Order events carry the order's flags (post-only, reduce-only) back.
     pub events_echo_flags: bool,
     /// The expected cost of signing one order, in microseconds.
@@ -901,6 +909,7 @@ pub(crate) mod testing {
                     ordering_key: OrderingKey::None,
                     snapshot_source: SnapshotSource::None,
                     snapshot_reads: SnapshotReads::OneInstant,
+                    snapshot_lag_bound: Duration::ZERO,
                     events_echo_flags: false,
                     sign_cost_hint_us: 0,
                 },
