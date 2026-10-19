@@ -61,8 +61,11 @@
 //! Every connection reads through a [`Tcp`] stream that, on Linux, turns on `SO_TIMESTAMPNS` and
 //! keeps the kernel receive time of what it reads, beneath TLS and WebSocket, so each frame's
 //! stamp carries its `kernel_rx`; a session reports each Safety-class write attributed to a
-//! frame with one as a [`TickToWire`], to its handler (FBC-2y3, decision 0031). Elsewhere
-//! `kernel_rx` is `None` and nothing is reported.
+//! frame with one as a [`TickToWire`], to its handler (FBC-2y3, decision 0031). An order-entry
+//! session reports its own the same way, to [`ExecHandler::on_tick_to_wire`], a protective
+//! cancel the market-data handler of the same shard submits while handling a frame measured
+//! from that frame's `kernel_rx` (FBC-qfm, decision 0100). Elsewhere `kernel_rx` is `None` and
+//! nothing is reported.
 //!
 //! A socket endpoint stays alive by itself (FBC-djl, decision 0033): its codec's keepalive goes
 //! out at the declared interval, its connection rotates to the next epoch the consumer's

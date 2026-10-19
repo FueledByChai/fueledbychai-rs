@@ -217,7 +217,10 @@ rather than guess.
     deadline, across a reconnect too, never written again (an HTTP query's deadline standing
     only once the epoch that asked has ended, and cleared by the `on_http` call for it, 0081)
     (0057; compile-fail cases in
-    `tests/ui_submit/`) (its tests include the conformance toy by path); with a `Journal` set,
+    `tests/ui_submit/`) (its tests include the conformance toy by path); each Safety write it
+    makes attributed to an input with a `kernel_rx`, a cancel a market-data handler of the shard
+    submits on a frame included, reported to `ExecHandler::on_tick_to_wire` as a `TickToWire`
+    (FBC-qfm, `tests/protective_cancel_tick_to_wire.rs`); with a `Journal` set,
     it journals what it sends and receives as a market-data session does, each epoch's opening
     and closing, each nonce it reserves and each context it gives its codec, what its stream
     brings under Safety (0078), and each request deadline it fires at its stamp (0090);

@@ -135,6 +135,7 @@ struct Shown {
     /// The frames the order-entry peer heard after the epoch took places.
     heard: Vec<String>,
     /// The wall clock before the shard started.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     start: WallNs,
 }
 
