@@ -11,6 +11,11 @@
 //! Start. A script's own steps follow; each reply a test waits on ends in a
 //! [`Step::Barrier`], whose pong says the session has handed every frame before it to the
 //! glue, so a test waits on events, never on a count of scheduler turns (FBC-pn85).
+//!
+//! A script may also close its connection ([`Script::close_with`]) and take the session's
+//! reconnect ([`Script::reopen`]), whose opening is answered the same way on the new connection;
+//! the scenario moves the paused clock past the reconnect pacing ([`Run::reopened`]). A run may
+//! journal into a sink the test holds ([`play_journaled`], FBC-xx0).
 
 #![allow(dead_code)]
 
@@ -23,11 +28,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fbc_conformance::toy::{self, EXEC_URL_KEY, INST_A, OWN_NS, SYMBOL_A, TOY_TOKEN, ToyFactory};
-use fbc_conformance::{Frame, HttpRouter, Responded, Responder, Step, StubServer, WsScript};
+use fbc_conformance::{
+    ConnRecord, Frame, HttpRouter, Responded, Responder, Step, StubServer, WsScript,
+};
 use fbc_core::{
-    AccountKey, AccountLease, Channel, CidMint, ClientOrderId, ConnState, Envelope, ExecEvent,
-    ItemRef, Lots, MarketLease, MonoNs, NamespaceLease, NewOrder, NonceBlock, NonceSource,
-    OrderCaps, OrderKind, RpcId, Secrets, Side, SubmitHandle, Ticks, Tif, VenueConfig,
+    AccountKey, AccountLease, Channel, CidMint, ClientOrderId, ConnKey, ConnState, Envelope,
+    ExecEvent, ItemRef, Lots, MarketLease, MonoNs, NamespaceLease, NewOrder, NonceBlock,
+    NonceSource, OrderCaps, OrderKind, RpcId, Secrets, Side, SubmitHandle, Ticks, Tif, VenueConfig,
     VenueFactory, WallNs,
 };
 use fbc_oms::{
@@ -36,8 +43,8 @@ use fbc_oms::{
     ResyncSnapshot, Routed,
 };
 use fbc_runtime::{
-    Connector, ExecHandler, ExecOrders, ExecSession, ExecSessionConfig, IngestClock, ProxyConfig,
-    RateLimiter, ReconnectPacing, RpcIds, SafetyReserve, WriteStall,
+    Connector, ExecCounters, ExecHandler, ExecOrders, ExecSession, ExecSessionConfig, IngestClock,
+    Journal, ProxyConfig, RateLimiter, ReconnectPacing, RpcIds, SafetyReserve, WriteStall,
 };
 
 /// The account the session trades and fbc-oms authorizes for.
@@ -49,6 +56,8 @@ const CAP: i64 = 1_000;
 /// How long, by the wall clock, a wait lasts before the test fails: far longer than a loaded
 /// host takes, so only a script the session never answers fails it.
 const WATCHDOG: Duration = Duration::from_secs(60);
+/// The reconnect pacing's ceiling: once an epoch has ended, the next attempt starts within it.
+pub const PACING_CEILING: Duration = Duration::from_millis(100);
 
 /// The value of `key` in a toy record `kind|key=value|...` (the first line of a request).
 pub fn field(frame: &Frame, key: &str) -> Result<String, String> {
@@ -83,11 +92,11 @@ fn text(frame: &Frame) -> Result<&str, String> {
     }
 }
 
-/// The opening, answered as the toy's setup answers it, the resync showing the account flat on
-/// [`INST_A`] with nothing resting; then a barrier, so the glue has applied the resync once it
-/// has passed.
-fn opening() -> Vec<Step> {
-    let respond = |with| Step::Respond { conn: 0, with };
+/// The opening of connection `conn`, answered as the toy's setup answers it, the resync showing
+/// the account flat on [`INST_A`] with nothing resting; then a barrier, so the glue has applied
+/// the resync once it has passed.
+fn opening(conn: usize) -> Vec<Step> {
+    let respond = |with| Step::Respond { conn, with };
     vec![
         Step::Accept,
         respond(answer("auth", |_| {
@@ -103,24 +112,72 @@ fn opening() -> Vec<Step> {
                 "rsend".into(),
             ])
         })),
-        Step::Barrier { conn: 0 },
+        Step::Barrier { conn },
     ]
 }
 
 /// A script's steps after the opening: each reply it is given is answered from the request it
-/// reads and followed by a barrier, whose position a test waits on.
+/// reads and followed by a barrier, whose position a test waits on. Its steps act on the
+/// connection last opened.
 #[derive(Default)]
 pub struct Script {
     steps: Vec<Step>,
-    /// How many of its steps have played once each barrier has passed, in order.
+    /// How many of its steps have played once each wait point has passed, in order: each
+    /// barrier, and each request read and left unanswered.
     barriers: Vec<usize>,
+    /// The connection its steps act on.
+    conn: usize,
 }
 
 impl Script {
     /// The script, its next request answered by `with`.
     pub fn reply(mut self, with: Responder) -> Script {
-        self.steps.push(Step::Respond { conn: 0, with });
-        self.steps.push(Step::Barrier { conn: 0 });
+        let conn = self.conn;
+        self.steps.push(Step::Respond { conn, with });
+        self.barrier()
+    }
+
+    /// The script, `frames` pushed unasked, in order, then a barrier.
+    pub fn push(mut self, frames: impl IntoIterator<Item = String>) -> Script {
+        let conn = self.conn;
+        let push = |text| Step::Push {
+            conn,
+            frame: Frame::Text(text),
+        };
+        self.steps.extend(frames.into_iter().map(push));
+        self.barrier()
+    }
+
+    /// The script, its next request read and left unanswered: a wait point once read.
+    pub fn read(mut self) -> Script {
+        self.steps.push(Step::Read { conn: self.conn });
+        self.barriers.push(self.steps.len());
+        self
+    }
+
+    /// The script, closing its connection with a close frame carrying `code` and `reason`.
+    pub fn close_with(mut self, code: u16, reason: &str) -> Script {
+        self.steps.push(Step::CloseWith {
+            conn: self.conn,
+            code,
+            reason: reason.into(),
+        });
+        self
+    }
+
+    /// The script, taking the session's next connection and answering its opening as the first
+    /// was answered; its later steps act on that connection. A wait point once the opening's
+    /// resync has been applied.
+    pub fn reopen(mut self) -> Script {
+        self.conn += 1;
+        self.steps.push(Step::Accept);
+        self.steps.extend(opening(self.conn).into_iter().skip(1));
+        self.barriers.push(self.steps.len());
+        self
+    }
+
+    fn barrier(mut self) -> Script {
+        self.steps.push(Step::Barrier { conn: self.conn });
         self.barriers.push(self.steps.len());
         self
     }
@@ -171,6 +228,12 @@ pub struct State {
     last: MonoNs,
     /// How many resyncs the registry applied.
     pub resynced: usize,
+    /// How many times the session reported its connection authenticated.
+    pub authenticated: usize,
+    /// The epochs the session reported ended, in order.
+    pub ended: Vec<ConnKey>,
+    /// Every event the session reported, in order.
+    pub events: Vec<ExecEvent>,
     /// Every order update and fill, where it went, in the order reported.
     pub seen: Vec<Seen>,
 }
@@ -181,6 +244,7 @@ impl State {
     fn on_event(&mut self, env: Envelope<ExecEvent>) {
         let now = env.stamp.recv_mono;
         self.last = now;
+        self.events.push(env.body.clone());
         let key = OrderKey {
             venue: env.venue_seq,
             ingest: env.stamp.ingest_seq,
@@ -189,7 +253,10 @@ impl State {
             ExecEvent::Conn {
                 state: ConnState::Authenticated,
                 ..
-            } => self.authenticated_at = Some(now),
+            } => {
+                self.authenticated_at = Some(now);
+                self.authenticated += 1;
+            }
             ExecEvent::ResyncBegin { watermark } => {
                 self.collecting = Some(ResyncSnapshot {
                     watermark,
@@ -280,6 +347,10 @@ impl ExecHandler for Glue {
     fn on_submitted(&mut self, handle: SubmitHandle) {
         self.0.borrow_mut().on_submitted(handle);
     }
+
+    fn on_epoch_end(&mut self, key: ConnKey) {
+        self.0.borrow_mut().ended.push(key);
+    }
 }
 
 /// A directory of the test's own for its leases, removed when dropped.
@@ -332,7 +403,7 @@ pub struct Run<'a> {
 impl Run<'_> {
     /// Lets the session and the stub run, without moving the clock, until `done` holds; the test
     /// fails, naming `what`, once the watchdog's wall-clock time has passed.
-    async fn until(&self, what: &str, done: impl Fn(&Run<'_>) -> bool) {
+    pub async fn until(&self, what: &str, done: impl Fn(&Run<'_>) -> bool) {
         let give_up = Instant::now() + WATCHDOG;
         while !done(self) {
             assert!(Instant::now() < give_up, "never {what}");
@@ -388,20 +459,51 @@ impl Run<'_> {
         self.waited += 1;
         self.until("replied", |r| r.server.played() >= at).await;
     }
+
+    /// Waits until the session has reported its `ended`th epoch ended, moves the paused clock
+    /// past the reconnect pacing, and waits until the script's [`Script::reopen`] has answered
+    /// the next connection's opening and that epoch takes places, its resync applied.
+    pub async fn reopened(&mut self, ended: usize) {
+        self.until("the epoch ended", |r| r.st.borrow().ended.len() >= ended)
+            .await;
+        tokio::time::advance(PACING_CEILING).await;
+        self.replied().await;
+        self.until("ready again", |r| {
+            r.orders.may_place() && r.st.borrow().resynced == ended + 1
+        })
+        .await;
+    }
+
+    /// The connections the stub accepted so far.
+    pub fn connections(&self) -> Vec<ConnRecord> {
+        self.server.connections()
+    }
 }
 
-/// What a run of a script left: the registry and the glue's record, and every frame the stub
-/// received.
+/// What a run of a script left: the registry and the glue's record, every frame the stub
+/// received, every connection it accepted, and the session's counters.
 pub struct Played<T> {
     pub out: T,
     pub st: State,
     pub received: Vec<Frame>,
+    pub conns: Vec<ConnRecord>,
+    pub counters: ExecCounters,
 }
 
 /// Plays `script` after the opening against fbc-runtime's order-entry session for the toy,
-/// with `scenario` driving it, on a paused clock nothing moves: no deadline passes. The run
-/// ends once the scenario has waited for every reply and the script has played to its end.
+/// with `scenario` driving it, on a paused clock nothing moves but the scenario: no deadline
+/// passes unless it says. The run ends once the scenario has waited for every reply and the
+/// script has played to its end.
 pub fn play<T>(script: Script, scenario: impl AsyncFnOnce(&mut Run<'_>) -> T) -> Played<T> {
+    play_journaled(script, None, scenario)
+}
+
+/// [`play`], the session journaling into `journal` when one is given, from before it connects.
+pub fn play_journaled<T>(
+    script: Script,
+    journal: Option<Journal>,
+    scenario: impl AsyncFnOnce(&mut Run<'_>) -> T,
+) -> Played<T> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .start_paused(true)
@@ -437,11 +539,14 @@ pub fn play<T>(script: Script, scenario: impl AsyncFnOnce(&mut Run<'_>) -> T) ->
         authenticated_at: None,
         last: MonoNs(0),
         resynced: 0,
+        authenticated: 0,
+        ended: Vec::new(),
+        events: Vec::new(),
         seen: Vec::new(),
     }));
     let lease = NamespaceLease::acquire(&dir.0, ACCT, OWN_NS).unwrap();
     let mint = CidMint::new(lease, 0, 0, WallNs(1));
-    let mut steps = opening();
+    let mut steps = opening(0);
     let opened = steps.len();
     steps.extend(script.steps);
     let end = steps.len();
@@ -457,7 +562,7 @@ pub fn play<T>(script: Script, scenario: impl AsyncFnOnce(&mut Run<'_>) -> T) ->
         cfg.insert(EXEC_URL_KEY, &server.ws_url("/exec"));
         let pacing = ReconnectPacing::new(
             Duration::from_millis(10),
-            Duration::from_millis(100),
+            PACING_CEILING,
             100,
             Duration::from_secs(60),
             Duration::from_secs(5),
@@ -482,6 +587,9 @@ pub fn play<T>(script: Script, scenario: impl AsyncFnOnce(&mut Run<'_>) -> T) ->
             http_max_body: 1 << 20,
         };
         let (mut session, control) = ExecSession::new(config, Glue(st.clone())).unwrap();
+        if let Some(journal) = journal {
+            session.set_journal(journal);
+        }
         let mut run = Run {
             st: st.clone(),
             orders: session.orders(),
@@ -501,16 +609,22 @@ pub fn play<T>(script: Script, scenario: impl AsyncFnOnce(&mut Run<'_>) -> T) ->
         let (ran, out) = tokio::join!(session.run(), driven);
         drop(thaw);
         ran.unwrap();
+        let counters = session.counters();
+        // The session's journal, if any, is let go before the test reads it back.
+        drop(session);
         server.finished().await.unwrap();
-        let received = server.connections().into_iter().flat_map(|c| c.received);
-        (out, received.collect())
+        (out, server.connections(), counters)
     });
     drop(rt);
     let st = Rc::into_inner(st).unwrap().into_inner();
+    let (out, conns, counters) = out;
+    let received = conns.iter().flat_map(|c| c.received.clone()).collect();
     Played {
-        out: out.0,
+        out,
         st,
-        received: out.1,
+        received,
+        conns,
+        counters,
     }
 }
 
