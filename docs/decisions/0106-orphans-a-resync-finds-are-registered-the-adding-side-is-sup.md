@@ -40,8 +40,9 @@ and how an orphan is held while its cancel is out (FBC-840, BT-402).
    seed holds a fill of it only when the fill arrived before the seed was requested or executed
    at or before the seed's watermark; every other fill of it, on either read mode (0095), moves
    the inventory (unless the seed showed it, under its venue id without our client id: what the
-   seed showed then places its fills, as for an order the seed held, so a fill the seeded
-   position holds is not counted again; Codex's r4316124604) (Reviewer B's RB840-1 on PR #171: placed as the seed's own unshown order, its
+   seed showed then places its fills, as for an order the seed held, a fill naming only our
+   client id included, so a fill the seeded position holds is not counted again and a later
+   one is; Codex's r4316124604 and r4316366360) (Reviewer B's RB840-1 on PR #171: placed as the seed's own unshown order, its
    fills moved the record and not the inventory, or left a separate-reads market unsettled).
    The fills of it applied before it was registered, which a one-read seed held only because it
    did not show the order (0055's rule 3, not by their arrival or time), move the inventory as
