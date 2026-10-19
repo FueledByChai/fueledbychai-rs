@@ -22,6 +22,16 @@
 //! [`Live::amend`](crate::Live::amend)), reducing and reduce-only ones included. Cancels are
 //! never capped.
 //!
+//! One case passes the inventory cap past it (decision 0112, FBC-ugto, the owner's answer of
+//! 2026-10-19): an order carrying the venue's reduce-only flag
+//! ([`NewOrder::reduce_only`](fbc_core::NewOrder), which a codec sends only where the venue's
+//! `OrderCaps` declare one and refuses otherwise) whose admission leaves the side's worst case
+//! strictly smaller than it is without the order. The venue keeps such an order from taking the
+//! position past zero, so a position already past the cap (orphan or race fills) comes down in
+//! steps the resting cap bounds. An order the OMS only classifies reducing (an emulated
+//! reduce-only order, FBC-01w) is not exempt, nor is a flagged order that does not shrink the
+//! worst case; the resting cap, the market's state and every other check still apply.
+//!
 //! Quantities are in the market's lots: the consumer converts a notional cap at the price it
 //! chooses. Both caps are required configuration with no default in code: a market's
 //! configuration missing either is refused ([`CapsConfigError`]), and a market the
@@ -304,19 +314,29 @@ impl Exposure {
 
     /// Whether the order `new` brings keeps the side within both of the market's caps: the
     /// inventory cap (0005's I6), `|pos + Σ resting same side + new| ≤ cap`, then the resting
-    /// cap, `Σ resting same side + new ≤ cap`. Nothing is exempt: a reducing order passes only
-    /// by what the formulas give it.
-    pub(crate) fn admit(&self, new: Adds) -> Result<(), CapRefusal> {
+    /// cap, `Σ resting same side + new ≤ cap`. A reducing order passes the inventory cap by what
+    /// the formula gives it, with one exemption (decision 0112): an order carrying the venue's
+    /// reduce-only flag (`venue_reduce_only`; for a batch judged again at authorization, every
+    /// one of its orders on the side) passes it whenever it leaves the worst case strictly
+    /// smaller than the side's worst case without it, even past the cap. The resting cap has
+    /// no exemption.
+    pub(crate) fn admit(&self, new: Adds, venue_reduce_only: bool) -> Result<(), CapRefusal> {
         let (inst, side) = (self.inst, self.side);
         let caps = self.cap.ok_or(CapRefusal::NoCap(inst))?;
         let pos = self.pos.ok_or(CapRefusal::PositionUnknown(inst))?;
-        let worst = self
-            .others
-            .and_then(|others| others.checked_add(new.exposure))
-            .and_then(|total| pos.checked_add(SignedLots::of(side, total)))
-            .and_then(SignedLots::abs_lots);
+        let worst_with = |adds: Lots| {
+            self.others
+                .and_then(|others| others.checked_add(adds))
+                .and_then(|total| pos.checked_add(SignedLots::of(side, total)))
+                .and_then(SignedLots::abs_lots)
+        };
+        let worst = worst_with(new.exposure);
+        // A venue-flagged reduce-only order that strictly shrinks the worst case (FBC-ugto).
+        let shrinks = |worst: Lots| {
+            venue_reduce_only && worst_with(Lots::ZERO).is_some_and(|before| worst < before)
+        };
         match worst {
-            Some(worst) if worst <= caps.inventory => {}
+            Some(worst) if worst <= caps.inventory || shrinks(worst) => {}
             worst => {
                 return Err(CapRefusal::InventoryCap {
                     inst,
@@ -338,5 +358,69 @@ impl Exposure {
                 cap: caps.resting,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const INST: InstrumentId = InstrumentId::new(1);
+
+    fn lots(n: i64) -> Lots {
+        Lots::new(n).unwrap()
+    }
+
+    /// The sell side of a long `pos` under an inventory cap of 50 and a resting cap of 11 (test
+    /// inputs), our other sells counting `others` (`None`: past a lot count), none resting.
+    fn sells(pos: i64, others: Option<i64>) -> Exposure {
+        Exposure {
+            inst: INST,
+            side: Side::Sell,
+            cap: Some(MarketCaps {
+                inventory: lots(50),
+                resting: lots(11),
+            }),
+            pos: Some(SignedLots(pos)),
+            others: others.map(lots),
+            others_resting: Some(Lots::ZERO),
+        }
+    }
+
+    fn over(worst: Option<i64>) -> Result<(), CapRefusal> {
+        Err(CapRefusal::InventoryCap {
+            inst: INST,
+            side: Side::Sell,
+            worst: worst.map(lots),
+            cap: lots(50),
+        })
+    }
+
+    #[test]
+    fn only_a_venue_reduce_only_order_that_strictly_shrinks_the_worst_case_passes_past_the_cap() {
+        let e = sells(62, Some(0));
+        assert_eq!(e.admit(Adds::placing(lots(11)), true), Ok(()));
+        assert_eq!(e.admit(Adds::placing(lots(11)), false), over(Some(51)));
+        // Nothing added leaves the worst case as it is: not strictly smaller.
+        assert_eq!(e.admit(Adds::placing(Lots::ZERO), true), over(Some(62)));
+        // Others already take the worst case past zero to 58: 11 more grows it to 69.
+        let past_zero = sells(62, Some(120));
+        assert_eq!(
+            past_zero.admit(Adds::placing(lots(11)), true),
+            over(Some(69))
+        );
+        // A worst case that does not fit a lot count shrinks nothing.
+        let unknown = sells(62, None);
+        assert_eq!(unknown.admit(Adds::placing(lots(11)), true), over(None));
+        // The resting cap still applies.
+        assert_eq!(
+            e.admit(Adds::placing(lots(12)), true),
+            Err(CapRefusal::RestingCap {
+                inst: INST,
+                side: Side::Sell,
+                resting: Some(lots(12)),
+                cap: lots(11),
+            })
+        );
     }
 }

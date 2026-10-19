@@ -3,16 +3,16 @@
 //! place, amend, replace or batch item is built whose admission would take
 //! `|pos + Σ resting same side + new|` past the inventory cap, or `Σ resting same side + new`
 //! past the resting cap, the consumer configured for its market, reducing and reduce-only ones
-//! included. Resting counts PendingNew and Unknown orders fully, a partly filled order's
+//! included; the one exemption is an order carrying the venue's reduce-only flag that strictly
+//! shrinks its side's worst case, which passes the inventory cap even past it (FBC-ugto). Resting counts PendingNew and Unknown orders fully, a partly filled order's
 //! remainder until it is terminal, an amend in flight at the larger of its old and new
 //! quantity, and earlier items of the same batch; an order that genuinely reduces the position
 //! is admitted by I6 itself, and the resting cap bounds the ladder I6 lets rest on the
 //! reducing side; cancels and cancel-many are built whatever the caps' state; a market with
 //! no caps configured admits nothing; and a configuration missing either cap is refused.
 //!
-//! The values are the owner's first test values: an inventory cap of $50 and one $11 L0 order
-//! per side, on a synthetic market where one lot is worth $1 at the test price, so 50 and 11
-//! lots. The tests of the inventory cap alone rest several orders a side, so they set the
+//! The cap values are test inputs only: an inventory cap of 50 lots and one L0 order of 11 lots
+//! per side, on a synthetic market. The tests of the inventory cap alone rest several orders a side, so they set the
 //! resting cap past any order (`WIDE`); the resting cap's own tests use the first
 //! configuration whole.
 
@@ -38,7 +38,7 @@ use proptest::test_runner::{Config as ProptestConfig, RngSeed};
 
 const INST: InstrumentId = InstrumentId::new(1);
 const OTHER: InstrumentId = InstrumentId::new(2);
-/// The owner's first test values, in lots of $1: a $50 inventory cap and an $11 L0 order.
+/// The tests' inputs, in lots: an inventory cap of 50 and an L0 order of 11.
 const CAP: i64 = 50;
 const L0: i64 = 11;
 
