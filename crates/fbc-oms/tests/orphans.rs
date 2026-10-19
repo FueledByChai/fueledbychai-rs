@@ -1811,3 +1811,81 @@ fn ending_the_cooldowns_reaps_a_dropped_place_first() {
     assert!(reg.get(c).unwrap().state().is_terminal());
     assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(0)));
 }
+
+#[test]
+fn a_snapshot_requested_before_the_resync_that_registered_an_orphan_does_not_shrink_it() {
+    // Codex's r4317320908 on PR #171: the resync requested at 3 000 registers an orphan sell of
+    // 8. One requested at 2 000, delivered after it, still shows the orphan at 5: it may have
+    // been read before the venue grew it, so it does not lower what the orphan rests, and the
+    // reducing side stays sized against all 8.
+    let mut reg = seeded(10);
+    arm::start(&mut reg, INST);
+    let o = cid();
+    let shown = |qty: i64| VenueOrderSnapshot {
+        qty: lots(qty),
+        ..ours(o, "o", Side::Sell)
+    };
+    resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        3_000,
+        vec![shown(8)],
+        10,
+    );
+    assert_eq!(reg.orphans(INST), vec![o]);
+    let late = ResyncSnapshot {
+        watermark: WallNs(2_000),
+        requested_at: MonoNs(2_000),
+        orders: vec![shown(5)],
+        positions: vec![(INST, SignedLots(10))],
+    };
+    reg.resync(&ladder_cfg(), &venue(), &late, key(4_000))
+        .unwrap();
+    assert_eq!(reg.resting_on(INST, Side::Sell), Some(lots(8)));
+    assert_eq!(place(&mut reg, sell(5)), Err(suppressed(Side::Sell)));
+}
+
+#[test]
+fn an_orphan_adopting_a_venue_id_the_seed_showed_places_its_retained_fills_against_what_the_seed_showed()
+ {
+    // Codex's r4317320917 on PR #171: the seed at 1 000 shows `v` with no client id, 1 filled,
+    // the venue long 1. Two untimed fills of our o naming no venue id arrive after the seed's
+    // request, at a cumulative 1 and 2: the seed holds both, only because it showed no order
+    // o. A later snapshot shows `v` under o: what the seed showed of `v` (1 filled) holds the
+    // first, so only the second moves the inventory.
+    let mut reg = arm::named(Registry::with_caps(caps()));
+    let mut unnamed = not_ours(None, "v");
+    unnamed.cum_filled = lots(1);
+    resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        1_000,
+        vec![unnamed],
+        1,
+    );
+    let o = cid();
+    let mut l = ledger();
+    for (cum, at) in [(1, 1_500), (2, 1_600)] {
+        let f = fill(
+            Some(o),
+            FillIdent::Venue {
+                fill: fill_id(&format!("v-{cum}")),
+                vid: None,
+                cum_after: Some(lots(cum)),
+            },
+            Side::Buy,
+            1,
+            false,
+        );
+        let Admission::Apply(accepted) = l.admit(&f, None, MonoNs(at)) else {
+            panic!("a new fill is admitted");
+        };
+        assert_eq!(reg.apply_fill(accepted).unwrap(), FillRouted::InSnapshot(o));
+    }
+    assert_eq!(reg.position(INST), Some(SignedLots(1)));
+    let mut shown = ours(o, "v", Side::Buy);
+    shown.cum_filled = lots(2);
+    resync_at(&mut reg, SnapshotSource::Trustworthy, 2_000, vec![shown], 2);
+    assert_eq!(reg.orphans(INST), vec![o]);
+    assert_eq!(reg.position(INST), Some(SignedLots(2)));
+}
