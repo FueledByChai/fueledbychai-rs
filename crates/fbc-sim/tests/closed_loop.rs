@@ -414,6 +414,16 @@ fn day() -> Vec<(u64, Took)> {
 /// subscription, every frame and input stamped in turn, and its closing. A journal that `whole`
 /// is false of ends with the wind-down's firing.
 fn journal(root: &Path, whole: bool) {
+    let day = day()
+        .into_iter()
+        .filter(|(ms, _)| whole || *ms <= WIND_DOWN_AT)
+        .collect();
+    journal_of(root, day, whole.then_some(3_601_000));
+}
+
+/// The journal of `day` under `root`, as [`journal`] writes it, the connection closed at
+/// `closed_at` (ms) if at all.
+fn journal_of(root: &Path, day: Vec<(u64, Took)>, closed_at: Option<u64>) {
     let mut writer = JournalWriter::create(root, SHARD, key()).unwrap();
     let wall = |ms: u64| WallNs(WALL0 + i64::try_from(ms * MS).unwrap());
     let mut write = |ms: u64, record: Record| writer.append(wall(ms), &record).unwrap();
@@ -435,10 +445,7 @@ fn journal(root: &Path, whole: bool) {
             },
         },
     );
-    let day = day()
-        .into_iter()
-        .filter(|(ms, _)| whole || *ms <= WIND_DOWN_AT);
-    for (seq, (ms, took)) in day.enumerate() {
+    for (seq, (ms, took)) in day.into_iter().enumerate() {
         let seq = u64::try_from(seq).unwrap();
         let record = match took {
             Took::Frame(text) => {
@@ -485,11 +492,11 @@ fn journal(root: &Path, whole: bool) {
             );
         }
     }
-    if whole {
+    if let Some(ms) = closed_at {
         write(
-            3_601_000,
+            ms,
             Record::Control {
-                at: at(3_601_000),
+                at: at(ms),
                 ev: ControlEvent::Closed(MD),
             },
         );
@@ -1719,5 +1726,51 @@ async fn answers_due_as_the_replay_settles_are_read_and_decided_on_before_the_se
         "{:?}",
         &run.seen[last_exec..]
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// RB-066n-1 (Reviewer B on PR #178): the wind-down is fed on the very tick SimVenue's answers
+/// to the Start's buys fall due, so each order-entry session has an inline submit and an answer
+/// waiting on the same turn. Which it takes first is the session's own choice, the same on every
+/// run, so the order-entry journals and what the consumer saw are the same on every run.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_submit_on_the_tick_an_answer_falls_due_replays_the_same_on_every_run() {
+    let answered = START_AT + 8;
+    assert_eq!(ms(answered - START_AT), TO_VENUE + TO_CLIENT);
+    let frame = |ms: u64, text: String| (ms, Took::Frame(text));
+    let day = vec![
+        frame(1_001, book_record("begin", 1, "|epoch=1")),
+        frame(1_002, level("bid", BID, 6, 2)),
+        frame(1_003, level("ask", ASK, 5, 3)),
+        frame(1_004, book_record("end", 4, "")),
+        (START_AT, Took::Input(START, b"start")),
+        (answered, Took::Input(WIND_DOWN, b"wind-down")),
+        frame(3_000, trade(BID, 4, 10)),
+    ];
+    let root = fresh_dir("collision");
+    journal_of(&root, day, Some(4_000));
+    let first = closed_loop(&root, Duration::from_secs(1)).await;
+    // The wind-down cancelled something on every bracket, so the collision was there.
+    for i in 0..BRACKETS.len() {
+        assert!(
+            first
+                .commands(i)
+                .iter()
+                .any(|c| matches!(c.cmd, Cmd::Cancel { .. })),
+            "bracket {i}"
+        );
+    }
+    for run in 0..24 {
+        let next = closed_loop(&root, Duration::from_secs(1)).await;
+        let differs = next
+            .journal
+            .iter()
+            .zip(&first.journal)
+            .position(|(a, b)| a != b);
+        assert_eq!(differs, None, "run {run}: the journals part at that record");
+        assert_eq!(next.journal.len(), first.journal.len(), "run {run}");
+        assert_eq!(next.seen, first.seen, "run {run}");
+        assert_eq!(next.submitted, first.submitted, "run {run}");
+    }
     let _ = std::fs::remove_dir_all(&root);
 }
