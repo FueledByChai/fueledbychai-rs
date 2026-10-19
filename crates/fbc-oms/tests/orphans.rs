@@ -1501,3 +1501,73 @@ fn a_lost_order_shown_open_again_under_another_venue_id_takes_its_earlier_ids_as
     assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(4)));
     assert_eq!(reg.position(INST), Some(SignedLots(1)));
 }
+
+#[test]
+fn a_lost_order_shown_open_again_by_a_lagging_snapshot_keeps_the_fill_the_venue_reported() {
+    // Codex's r4316124597 on PR #171: our buy of 5, open as `l` with the venue reporting 2
+    // filled, goes on the ladder with an unanswered cancel and ends Lost; a later snapshot,
+    // lagging, shows it open with nothing filled. Registered again, it keeps the 2 the venue
+    // reported: 3 rest.
+    let mut reg = seeded(0);
+    arm::start(&mut reg, INST);
+    let order = buy(5);
+    let c = order.cid;
+    place(&mut reg, order).unwrap();
+    reg.placement_sent(c, MonoNs(1_100), WallNs(1_100)).unwrap();
+    let mut open = update(Some(c), VenueOrderState::Open, 2);
+    open.vid = Some(vid("l"));
+    reg.apply_update(&open, key(1_200));
+    reg.cancel_sent(c, RpcId(7), MonoNs(1_400)).unwrap();
+    reg.on_outcome(
+        c,
+        OrderOp::Cancel(RpcId(7)),
+        &ItemRef {
+            idx: 0,
+            cid: Some(c),
+            vid: None,
+        },
+        &SubmitOutcome::Unknown,
+        MonoNs(1_500),
+    )
+    .unwrap();
+    let report = resync_at(&mut reg, SnapshotSource::Trustworthy, 2_000, vec![], 0);
+    assert_eq!(report.ladder.lost, vec![c], "{report:?}");
+    resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        3_000,
+        vec![ours(c, "l", Side::Buy)],
+        0,
+    );
+    assert_eq!(reg.orphans(INST), vec![c]);
+    assert_eq!(reg.get(c).unwrap().filled(), lots(2));
+    assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(3)));
+}
+
+#[test]
+fn an_orphan_whose_venue_id_the_seed_showed_has_its_fills_placed_by_what_the_seed_showed() {
+    // Codex's r4316124604 on PR #171: the seed at 1 000 shows an order `v` with no client id,
+    // 1 filled, and the venue's long 1. A later snapshot shows `v` under our client id o:
+    // an orphan. A delayed, untimed fill of o naming `v` at a cumulative 1 is one the seed's
+    // position already holds (0055's rule 2): it is not counted again.
+    let mut reg = arm::named(Registry::with_caps(caps()));
+    let mut unnamed = not_ours(None, "v");
+    unnamed.cum_filled = lots(1);
+    let report = resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        1_000,
+        vec![unnamed],
+        1,
+    );
+    assert_eq!(report.seeded.len(), 2, "{report:?}");
+    let o = cid();
+    let mut shown = ours(o, "v", Side::Buy);
+    shown.cum_filled = lots(1);
+    resync_at(&mut reg, SnapshotSource::Trustworthy, 2_000, vec![shown], 1);
+    assert_eq!(reg.orphans(INST), vec![o]);
+    let mut l = ledger();
+    let routed = fill_at(&mut reg, &mut l, o, "v", Side::Buy, 1, 1, None, 2_500);
+    assert_eq!(routed, FillRouted::InSnapshot(o));
+    assert_eq!(reg.position(INST), Some(SignedLots(1)));
+}
