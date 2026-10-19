@@ -40,7 +40,7 @@
 //! single-phase venue's placement is answered Final as before, with nothing after it.
 //!
 //! FBC-2zxk adds a two-phase venue's amend, sent and answered provisionally, then settled by
-//! the amended order's event (decision 0100); its done line is tests/paradex_stand_in.rs.
+//! the amended order's event (decision 0102); its done line is tests/paradex_stand_in.rs.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
@@ -3354,8 +3354,7 @@ fn the_codec_sends_an_amend_only_as_the_stood_in_venue_takes_it() {
         change(&mut a);
         assert_eq!(refused(&mut narrow, a), Some(NotSentReason::Unsupported));
     }
-    // A venue that gives an amended order a new venue id, or whose events the engine cannot
-    // say (a two-phase venue).
+    // A venue that gives an amended order a new venue id.
     let mut new_id = rich(Bracket::Middle, |o| {
         o.amend = Some(AmendCaps {
             keeps_venue_id: false,
@@ -3366,15 +3365,13 @@ fn the_codec_sends_an_amend_only_as_the_stood_in_venue_takes_it() {
         refused(&mut new_id, by_venue()),
         Some(NotSentReason::Unsupported)
     );
+    // A two-phase venue's amend is sent (decision 0102).
     let mut two_phase = rich(Bracket::Middle, |o| {
         o.ack = AckModel::TwoPhase {
             risk_reject_window: Duration::from_millis(1),
         };
     });
-    assert_eq!(
-        refused(&mut two_phase, by_venue()),
-        Some(NotSentReason::Unsupported)
-    );
+    assert_eq!(refused(&mut two_phase, by_venue()), None);
     // Features the venue refuses together.
     let mut conflicted = rich(Bracket::Middle, |o| {
         o.flag_conflicts = vec![(Feature::PostOnly, Feature::ReduceOnly)];
@@ -5719,6 +5716,12 @@ fn the_codec_refuses_second_phase_answers_it_cannot_read() {
         // A final acceptance without its venue id, or its item.
         "final|seq=0|ts=1|rpc=1|idx=0|cid=x",
         "final|seq=0|ts=1|rpc=1|cid=x|vid=S0",
+        // An amend's provisional acceptance without its rpc, client or venue id, or with an
+        // item (decision 0102).
+        "amended|seq=0|ts=1|cid=x|vid=S0",
+        "amended|seq=0|ts=1|rpc=1|vid=S0",
+        "amended|seq=0|ts=1|rpc=1|cid=x",
+        "amended|seq=0|ts=1|rpc=1|cid=x|vid=S0\nack|cid=x|vid=S0",
         // A risk reject without its order, with another record, or with no refusal it names.
         "risk|seq=0|ts=1|rpc=1|idx=0|code=margin",
         "risk|seq=0|ts=1|rpc=1|idx=0|code=margin\nfill|fid=F0",

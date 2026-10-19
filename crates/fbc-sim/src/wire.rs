@@ -2,8 +2,9 @@
 //! writes for each command and what [`SimEngine`] answers, in text: one record per line,
 //! `kind|key=value|...`, and one line per frame except for a batch, whose items follow its
 //! header line, and a query's answer and a risk reject, whose order follows it. A provisional
-//! acceptance carries `ph=p` (decision 0099). Both ends build and read them here, so the format
-//! has one source.
+//! acceptance carries `ph=p` (decision 0099); a two-phase venue's amend is accepted as
+//! `amended`, provisional and awaiting nothing (decision 0102). Both ends build and read them
+//! here, so the format has one source.
 //!
 //! [`SimCodec`]: crate::SimCodec
 //! [`SimEngine`]: crate::SimEngine
@@ -698,6 +699,14 @@ pub(crate) enum Reply {
         cid: String,
         vid: String,
     },
+    /// Amend request `rpc` accepted provisionally by a two-phase venue, naming the order it
+    /// amends: the amended order's event, which follows it, settles it, and no second phase of
+    /// its own comes (decision 0102).
+    Amended {
+        rpc: u64,
+        cid: String,
+        vid: String,
+    },
     /// Item `idx` of placement request `rpc`, provisionally accepted and held for a risk check
     /// that would refuse it, was cancelled first: settled with nothing more (decision 0099).
     Withdrawn {
@@ -829,6 +838,10 @@ impl Reply {
                 .field("idx", idx)
                 .field("cid", cid)
                 .field("vid", vid),
+            Reply::Amended { rpc, cid, vid } => head("amended")
+                .field("rpc", rpc)
+                .field("cid", cid)
+                .field("vid", vid),
             Reply::Withdrawn { rpc, idx } => head("withdrawn").field("rpc", rpc).field("idx", idx),
             Reply::RiskReject {
                 rpc,
@@ -932,6 +945,11 @@ impl Reply {
             "final" => single(Reply::Final {
                 rpc: r.num("rpc")?,
                 idx: r.num("idx")?,
+                cid: r.str("cid")?.to_owned(),
+                vid: r.str("vid")?.to_owned(),
+            }),
+            "amended" => single(Reply::Amended {
+                rpc: r.num("rpc")?,
                 cid: r.str("cid")?.to_owned(),
                 vid: r.str("vid")?.to_owned(),
             }),

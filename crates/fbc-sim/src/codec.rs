@@ -7,8 +7,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use fbc_core::{
-    AckLevel, AckModel, AmendOrder, AssetSym, CancelOnDisconnect, CancelOrder, CancelScope,
-    Channel, ChosenRef, CidMatch, CtxCall, DecodeError, DecodeScope, Effect, Effects, EncodeCtx,
+    AckLevel, AmendOrder, AssetSym, CancelOnDisconnect, CancelOrder, CancelScope, Channel,
+    ChosenRef, CidMatch, CtxCall, DecodeError, DecodeScope, Effect, Effects, EncodeCtx,
     EncodeReceipt, ExchNs, ExchTsKind, ExecCaps, ExecCodec, ExecEvent, ExecSink, Feature, FillCaps,
     FillEvent, FillIdent, HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans, InstrumentId,
     ItemRef, Liquidity, Liquidity3, MatchingCaps, Money, NotSentReason, OpKind, OrderCaps,
@@ -39,8 +39,8 @@ use crate::wire::{
 /// flag or reference, amends, batches (or one longer than their `max_items`; an empty one is
 /// unencodable), an instrument cancel-all, queries; and never sends an account-wide cancel-all
 /// (owner decision A). It refuses RPI orders, which the engine cannot fill yet (FBC-njk,
-/// decision 0046), amends for a venue that gives the amended order a new venue id (FBC-kodq)
-/// or acknowledges in two phases (FBC-kbwj), and placements and amends for a venue whose
+/// decision 0046), amends for a venue that gives the amended order a new venue id (FBC-kodq),
+/// and placements and amends for a venue whose
 /// events the engine cannot say yet: a venue with a speed bump (FBC-7y8), or one whose fills
 /// replay on reconnect (FBC-3q6). Cancels and queries still go.
 ///
@@ -52,7 +52,9 @@ use crate::wire::{
 /// id, before the order update that ends it rejected), or word that the placement was
 /// withdrawn before its check, which reports nothing. Like Paradex's codec (0092), it awaits
 /// nothing across a reconnect: each open forgets what it awaited, and a second phase it does
-/// not await reports nothing, the order update of a risk reject aside.
+/// not await reports nothing, the order update of a risk reject aside. Its amends are sent too
+/// (decision 0102): an accepted one is decoded `Provisional`, as Paradex's modify reply is,
+/// and awaits nothing, since the amended order's event that follows settles it.
 ///
 /// A venue that cancels on disconnect (FBC-fji) is placed through like any other: the engine
 /// ends what the venue would when the simulated stream closes or a dead-man timer lapses. The
@@ -91,8 +93,6 @@ pub struct SimCodec {
     /// The number of the first resync asked on the current connection: an answer to one
     /// numbered below it was asked on an earlier connection.
     connection_first: u64,
-    /// Whether the stood-in venue acknowledges in two phases.
-    two_phase: bool,
     /// The placements, by request and item, accepted provisionally on this connection and
     /// awaiting their second phase.
     awaiting: BTreeSet<(u64, u16)>,
@@ -112,7 +112,6 @@ impl SimCodec {
             resync_at: None,
             resyncs: 0,
             connection_first: 0,
-            two_phase: config.exec.order.ack != AckModel::SinglePhase,
             awaiting: BTreeSet::new(),
         }
     }
@@ -200,11 +199,7 @@ impl SimCodec {
     /// order's venue id (FBC-kodq), with the order's full values after it and the quantity the
     /// venue's wire carries.
     fn amend(&self, a: &AmendOrder, head: Head, specs: &SpecTable) -> Result<Amend, NotSentReason> {
-        // Not for a venue that may settle an amend in two phases either (FBC-kbwj).
-        let caps = self
-            .caps
-            .amend
-            .filter(|caps| caps.keeps_venue_id && !self.two_phase);
+        let caps = self.caps.amend.filter(|caps| caps.keeps_venue_id);
         let caps = caps.ok_or(NotSentReason::Unsupported)?;
         let kind = OrderKindTag::Limit;
         self.offered(kind, a.tif, a.channel, a.post_only, a.reduce_only)?;
@@ -674,6 +669,7 @@ impl ExecCodec for SimCodec {
     ) -> Result<(), DecodeError> {
         let (stamp, reply) = Reply::decode(f.bytes()).map_err(malformed)?;
         let meta = self.meta(stamp)?;
+        let mut settled_by_event = false;
         let events = match reply {
             Reply::Accepted {
                 rpc,
@@ -700,6 +696,17 @@ impl ExecCodec for SimCodec {
                 };
                 let items = items.into_iter().enumerate().map(outcome);
                 items.collect::<Result<_, _>>()?
+            }
+            // Provisional, settled by the amended order's event: awaited by nothing (0102).
+            Reply::Amended { rpc, cid, vid } => {
+                let provisional = true;
+                let result = ItemResult::Accepted {
+                    cid,
+                    vid,
+                    provisional,
+                };
+                settled_by_event = true;
+                vec![SimCodec::outcome(rpc, 0, result, scope)?]
             }
             Reply::Final { rpc, idx, cid, vid } => self.final_ack((rpc, idx), &cid, &vid, scope)?,
             // Withdrawn before its risk check: settled, reporting nothing more, as Paradex's
@@ -768,8 +775,9 @@ impl ExecCodec for SimCodec {
                 positions,
             } => self.resync_answer(wm, req, orders, positions, scope)?,
         };
-        // Decoded whole: only now does a provisional acceptance await its second phase.
-        for event in &events {
+        // Decoded whole: only now does a provisional acceptance of a placement await its second
+        // phase.
+        for event in events.iter().filter(|_| !settled_by_event) {
             if let ExecEvent::Outcome {
                 rpc,
                 item: Some(item),
