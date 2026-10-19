@@ -370,6 +370,10 @@ struct Venue {
     /// open, by a user cancel the loop never sent: another program's cancel while ours waits to
     /// be sent again (Codex r4309154204 on PR #159).
     cotenant_after_refused_cancel: bool,
+    /// As [`Venue::cotenant_after_refused_cancel`], with the user cancel's order event sent
+    /// before the refusal: another program's cancel racing ours, read first (Codex r4310042612
+    /// on PR #159).
+    cotenant_before_refused_cancel: bool,
     cancels: usize,
     /// When each place, each single cancel and each instrument cancel-all came.
     create_times: Vec<std::time::Instant>,
@@ -756,14 +760,19 @@ fn respond(venue: &Shared, conn: usize, frame: &Frame) -> Responded {
                 let error = json!({"code": code, "message": "order.cancel refused"});
                 let reply = json!({"jsonrpc": "2.0", "error": error, "id": id});
                 let mut frames = vec![Frame::text(reply.to_string())];
-                if v.cotenant_after_refused_cancel
+                if (v.cotenant_after_refused_cancel || v.cotenant_before_refused_cancel)
                     && let Some(at) = v.orders.iter().position(|o| {
                         o.open
                             && (params["id"].as_str() == Some(o.vid.as_str())
                                 || params["client_id"].as_str() == Some(o.cid.as_str()))
                     })
                 {
-                    frames.push(user_cancelled(&mut v, at));
+                    let cancelled = user_cancelled(&mut v, at);
+                    if v.cotenant_before_refused_cancel {
+                        frames.insert(0, cancelled);
+                    } else {
+                        frames.push(cancelled);
+                    }
                 }
                 return Ok(frames);
             }
@@ -4655,7 +4664,9 @@ async fn a_co_tenant_cancelling_our_orders_every_three_cycles_is_stopped_within_
             .starts_with("another program cancelled our orders: one quoter per account"),
         "{printed}"
     );
-    assert_eq!(report.cycles, 3, "{printed}");
+    // Cycle 4 counts when its last place's reply is read before the other program's cancels
+    // that follow it (separate frames): 3 or 4, the Stop the same.
+    assert!(matches!(report.cycles, 3 | 4), "{printed}");
     assert_eq!(report.cancels_not_ours, 4, "{printed}");
     assert_eq!(warned(&printed, true), 2, "{printed}");
     stopped(&printed);
@@ -4957,6 +4968,96 @@ async fn a_cancel_of_ours_refused_for_its_rate_stops_covering_its_order_so_anoth
 }
 
 #[tokio::test]
+async fn anothers_cancel_read_before_the_refusal_of_ours_is_counted_at_the_refusal() {
+    capture::install();
+    // Codex r4310042612 on PR #159: as the test above, with another program's cancel of the
+    // order read before the venue's refusal of ours (42901). The order ended while our cancel,
+    // sent and unanswered, covered it: held, then counted at the refusal, a WARN.
+    let venue = venue(vec![b0(), b0(), book(2, Some("62100.0"), Some("62100.3"))]);
+    {
+        let mut v = lock(&venue);
+        v.reject_cancel = Some((1, 42_901));
+        v.cotenant_before_refused_cancel = true;
+    }
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 2 + 2 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let opts = options(&stub, 2);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("the stub's script: {e:?}\n{printed}"));
+
+    assert!(report.ok, "{printed}");
+    assert_eq!(report.cancels_not_ours, 1, "{printed}");
+    assert_eq!(warned(&printed, false), 1, "{printed}");
+    let refused = printed.find("PACE ").expect("the refusal paced the loop");
+    let warn = printed.find("\nWARN ").expect("a WARN line");
+    assert!(warn > refused, "counted at the refusal:\n{printed}");
+    assert_eq!(lock(&venue).cancel_times.len(), 2, "{printed}");
+    assert_eq!(creates(&venue, 0), 4, "{printed}");
+    let sent = methods(&venue, 0);
+    assert_eq!(sent.last().map(String::as_str), Some("order.cancel_batch"));
+}
+
+#[tokio::test]
+async fn a_co_tenant_cancelling_the_loops_replace_of_its_requote_is_stopped() {
+    capture::install();
+    // Codex r4310042604 on PR #159, scaled: the window 3 s, the loop at the largest mainnet
+    // interval with it (2 s). Another program cancels both quotes after cycle 1's places (the
+    // first event); cycle 2 places the requotes; the touch moves at cycle 3, more than 3 s after
+    // the first event, and the loop replaces both itself; the other program then cancels both
+    // replaces. A replace of the requote is judged from the requote's place, 2 s before: the
+    // repeat, Stop. It used to be judged by the window's first event alone: a new first, a WARN.
+    // The start's read of the touch, cycle 1's, cycle 2's, then the touch moved.
+    let moved = book(2, Some("62100.0"), Some("62100.3"));
+    let venue = mainnet_venue(vec![b0(), b0(), b0(), moved]);
+    lock(&venue).cotenant_after_create = vec![(2, None), (6, None)];
+    // The opening six, the start's sweep, cycle 1 two places, cycle 2 two places, cycle 3 two
+    // cancels and two places; Stop has nothing open to cancel.
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 2 + 4),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let mut opts = mainnet_options(&stub, 4);
+    opts.cancel_window = Duration::from_secs(3);
+    opts.interval_ms =
+        u64::try_from(args::mainnet_interval_max(opts.cancel_window).as_millis()).unwrap();
+    assert_eq!(opts.interval_ms, 2_000);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("the stub's script: {e:?}\n{printed}"));
+
+    assert!(!report.ok, "{printed}");
+    assert!(
+        report
+            .ended
+            .starts_with("another program cancelled our orders: one quoter per account"),
+        "{printed}"
+    );
+    let warns = tagged(&printed, "WARN");
+    assert_eq!(warns.len(), 2, "{printed}");
+    assert!(
+        warns[1].contains("placing the requote it cancelled): Stop"),
+        "{printed}"
+    );
+    stopped(&printed);
+    assert_eq!(creates(&venue, 0), 6, "nothing placed after:\n{printed}");
+    let times = lock(&venue).create_times.clone();
+    assert!(
+        times[5].duration_since(times[0]) > Duration::from_secs(3),
+        "the replaces came more than the window after the first event:\n{printed}"
+    );
+    no_credential_in(&printed);
+}
+
+#[tokio::test]
 async fn in_testnet_mode_a_repeated_cancel_not_ours_only_warns() {
     capture::install();
     // As the mainnet repeat: cycle 1's quotes, then cycle 2's bid, cancelled by another
@@ -5099,18 +5200,22 @@ fn cancels_not_ours_of_one_action_are_one_event_and_a_later_action_repeats_it() 
     seen.retain(|c| *c != refused);
     seen.placed(b2, buy, t0 + s(40));
     assert_eq!(seen.on_cancel(b2, buy, at(43), t0 + s(43)), NotOurs::Repeat);
-    // An order not the side's requote that ended unrested frees nothing: the requote that
-    // rested stays the requote, and the later place is still a replace of it.
+    // A replace that ended unrested frees nothing, nor does the other side's: the requote
+    // that rested stays timed from its place (40 s), so a replace cancelled 32 s after it is
+    // a new first (from the unrested replace's place it would be the repeat).
     let mut seen = CancelsNotOurs::new(s(30));
-    let (b1, requote, other, replace) = (cid(), cid(), cid(), cid());
+    let (b1, requote, refused, other, replace) = (cid(), cid(), cid(), cid(), cid());
     seen.placed(b1, buy, t0);
     assert_eq!(seen.on_cancel(b1, buy, at(0), t0), NotOurs::First);
     seen.placed(requote, buy, t0 + s(40));
     seen.placed(other, sell, t0 + s(40));
     seen.unrested(other);
-    seen.placed(replace, buy, t0 + s(45));
+    seen.retain(|c| *c != requote);
+    seen.placed(refused, buy, t0 + s(55));
+    seen.unrested(refused);
+    seen.placed(replace, buy, t0 + s(60));
     assert_eq!(
-        seen.on_cancel(replace, buy, at(50), t0 + s(50)),
+        seen.on_cancel(replace, buy, at(72), t0 + s(72)),
         NotOurs::First
     );
 
@@ -5131,12 +5236,33 @@ fn cancels_not_ours_of_one_action_are_one_event_and_a_later_action_repeats_it() 
         seen.on_cancel(requote, buy, at(40), t0 + s(40)),
         NotOurs::Repeat
     );
+    // Codex r4310042604: a replace of the requote is timed from the requote's place: within
+    // 30 s of it the repeat, past it a new first.
     let (requote, replace) = (cid(), cid());
     seen.placed(requote, buy, t0 + s(41));
     seen.placed(replace, buy, t0 + s(50));
+    seen.retain(|c| *c != requote);
     assert_eq!(
         seen.on_cancel(replace, buy, at(63), t0 + s(63)),
+        NotOurs::Repeat
+    );
+    let (requote, replace) = (cid(), cid());
+    seen.placed(requote, buy, t0 + s(64));
+    seen.placed(replace, buy, t0 + s(80));
+    seen.retain(|c| *c != requote);
+    assert_eq!(
+        seen.on_cancel(replace, buy, at(95), t0 + s(95)),
         NotOurs::First
+    );
+    // A requote that filled: the next order on its side is its replace, timed from its place
+    // (past 30 s from the window's first event, 95 s).
+    let (requote, next) = (cid(), cid());
+    seen.placed(requote, sell, t0 + s(126));
+    seen.retain(|c| *c != requote);
+    seen.placed(next, sell, t0 + s(140));
+    assert_eq!(
+        seen.on_cancel(next, sell, at(150), t0 + s(150)),
+        NotOurs::Repeat
     );
     // RB-aoh5-2: an order resting unchanged since before the first, cancelled 10 minutes on.
     let mut seen = CancelsNotOurs::new(s(30));
@@ -5223,4 +5349,42 @@ fn a_cancel_of_ours_covers_its_orders_only_once_the_session_reports_it_sent() {
     assert!(!covered.covers(a) && covered.covers(c));
     covered.refused(RpcId(7), None);
     assert!(covered.covers(c), "request 8 still covers c");
+
+    // Codex r4310042612: an order a user cancel ended while only unanswered requests of ours
+    // covered it is held. Every one refused: released, a cancel not ours; one accepted: ours.
+    let (buy, sell) = (Side::Buy, Side::Sell);
+    let mut covered = link::Coverage::default();
+    covered.submitted(RpcId(9), [a]);
+    covered.submitted(RpcId(10), [a, b]);
+    covered.reported(RpcId(9), true);
+    covered.reported(RpcId(10), true);
+    assert!(covered.hold(a, buy, Some(ExchNs(7))));
+    covered.retain(|_| false);
+    assert!(
+        covered.refused(RpcId(9), Some(a)).is_empty(),
+        "10 still covers a"
+    );
+    assert_eq!(
+        covered.refused(RpcId(10), None),
+        vec![link::Released {
+            cid: a,
+            side: buy,
+            at: Some(ExchNs(7))
+        }]
+    );
+    assert!(covered.refused(RpcId(10), None).is_empty(), "released once");
+    covered.submitted(RpcId(11), [b]);
+    covered.reported(RpcId(11), true);
+    assert!(covered.hold(b, sell, None));
+    covered.accepted(RpcId(11), Some(b));
+    assert!(
+        covered.refused(RpcId(11), Some(b)).is_empty(),
+        "accepted: ours"
+    );
+    // Accepted before the order's end: ours, nothing held.
+    covered.submitted(RpcId(12), [c]);
+    covered.reported(RpcId(12), true);
+    covered.accepted(RpcId(12), None);
+    assert!(!covered.hold(c, buy, None));
+    assert!(!covered.hold(a, buy, None), "covered by nothing");
 }
