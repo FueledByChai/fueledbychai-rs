@@ -44,7 +44,14 @@ and how an orphan is held while its cancel is out (FBC-840, BT-402).
    The fills of it applied before it was registered, which a one-read seed held only because it
    did not show the order (0055's rule 3, not by their arrival or time), move the inventory as
    it is registered, once (Codex's r4310559340); a trustworthy resync not showing such an order
-   open drops what was kept for it. An order not ours
+   open drops what was kept for it. A snapshot requested before a resync that already compared
+   the market (its check is `PositionCheck::Stale`), or not after the seed's own request, may
+   have been read before the seed, so it is no evidence on that market: nothing is registered
+   there from it and nothing kept is dropped (Codex's r4310661297 on PR #171: a late answer
+   showing an order the seed's position already held registered it and counted its fill
+   twice). The orphans are acted on before each market's position is compared, so the resync
+   that registers one compares the venue's position with the fills it counts (Codex's
+   r4310661291). An order not ours
    (another namespace's, a non-canonical client id, or one nothing attributes) is never an orphan.
    A trustworthy resync forgets the live sightings.
 2. **The adding side.** A side adds when an order on it would grow the position's size: while a
@@ -111,6 +118,9 @@ and how an orphan is held while its cancel is out (FBC-840, BT-402).
 - A market whose orphans keep coming back (a lagging snapshot showing an order the venue already
   ended is held, never an orphan; an order the venue ended and a snapshot still shows open is
   cancelled again and resolved by the Unknown ladder) stays suppressed while they do.
+- The evidence rule orders snapshots by their request, as the position check does: it relies on
+  a session keeping one resync in flight (as the venue sessions do), so a snapshot requested
+  after the seed's request was read after the seed's answer.
 - With a Java instance on the account (FBC-aoh5), its orders are in view, so the escalation never
   happens there and the orphans go out as explicit cancels.
 
