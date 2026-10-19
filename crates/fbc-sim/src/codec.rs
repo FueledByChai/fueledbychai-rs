@@ -47,9 +47,10 @@ use crate::wire::{
 /// A venue that acknowledges in two phases (`AckModel::TwoPhase`) is placed through
 /// (decision 0099): a placement's acceptance is decoded at the level the engine gives it,
 /// `Provisional`, and the codec awaits its second phase, by request and item, until the
-/// engine's final acceptance (`Accepted` at `Final` for that request and item) or risk reject
+/// engine's final acceptance (`Accepted` at `Final` for that request and item), risk reject
 /// (`ExecEvent::AsyncReject` of the placement, naming the order by our client id and its venue
-/// id, before the order update that ends it rejected). Like Paradex's codec (0092), it awaits
+/// id, before the order update that ends it rejected), or word that the placement was
+/// withdrawn before its check, which reports nothing. Like Paradex's codec (0092), it awaits
 /// nothing across a reconnect: each open forgets what it awaited, and a second phase it does
 /// not await reports nothing, the order update of a risk reject aside.
 ///
@@ -701,6 +702,12 @@ impl ExecCodec for SimCodec {
                 items.collect::<Result<_, _>>()?
             }
             Reply::Final { rpc, idx, cid, vid } => self.final_ack((rpc, idx), &cid, &vid, scope)?,
+            // Withdrawn before its risk check: settled, reporting nothing more, as Paradex's
+            // withdrawn placement (0093); its order update already said it ended.
+            Reply::Withdrawn { rpc, idx } => {
+                self.awaiting.remove(&(rpc, idx));
+                Vec::new()
+            }
             Reply::RiskReject {
                 rpc,
                 idx,

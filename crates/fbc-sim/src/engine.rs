@@ -271,9 +271,10 @@ impl Item {
 ///   final acceptance (naming its request, item and order) is answered once the venue's
 ///   `risk_reject_window` has passed since it arrived. One whose client id the consumer
 ///   configured a risk reject for ([`risk_reject`](SimEngine::risk_reject)) is accepted
-///   provisionally, unless the venue's rules refuse it at once, and held unmatched, never
-///   resting; at the configured instant it is refused (the reject, then its order event ending
-///   it `Rejected`) unless cancelled first, and never accepted final. A query and a resync show
+///   provisionally, unless a rule refuses it at once as it refuses an ordinary placement (its
+///   matching's included), and held unmatched, never resting; at the configured instant it is
+///   refused (the reject, then its order event ending it `Rejected`), or, cancelled first,
+///   answered as withdrawn, and never accepted final. A query and a resync show
 ///   a held order open as placed, and every cancel ends it. Amends and cancels are answered in
 ///   one phase. A venue that acknowledges in one phase answers every acceptance final.
 /// - An amend changes a resting order's price, size and flags as the stood-in venue's
@@ -568,8 +569,11 @@ impl SimEngine {
                 vid,
             },
             Phase::Reject { n, refusal } => {
-                // Cancelled while it was held: there is nothing left to refuse.
+                // Cancelled while it was held: nothing is left to refuse, and the placement is
+                // settled as withdrawn, so the codec awaits it no longer (Codex r4309341215).
                 let Some(held) = self.held.remove(&n) else {
+                    let (rpc, idx) = (s.rpc, s.idx);
+                    self.answer(at, Reply::Withdrawn { rpc, idx });
                     return;
                 };
                 let (state, px) = (SimState::Rejected(refusal), held.px);
@@ -991,7 +995,7 @@ impl SimEngine {
         };
         let (rpc, risk) = (p.rpc, self.risk_rejects.remove(&p.cid));
         let mut item = match risk {
-            Some((after, refusal)) => self.hold(p, (rpc, idx), due(at, after), refusal),
+            Some((after, refusal)) => self.hold(p, (rpc, idx), at, after, refusal),
             None => self.place_now(p, at),
         };
         if let ItemResult::Accepted {
@@ -1021,13 +1025,32 @@ impl SimEngine {
         self.settled += 1;
     }
 
-    /// Holds placement `p`, item `item`, for a risk check that refuses it as `refusal` at
-    /// `when`: refused at once as any placement is where it breaks the venue's rules, and
-    /// otherwise accepted without matching or resting.
-    fn hold(&mut self, p: Place, item: (u64, u16), when: At, refusal: RiskRefusal) -> Item {
-        if let Err(refusal) = self.check_place(&p) {
+    /// Holds placement `p`, item `item`, arrived at `at`, for a risk check that refuses it as
+    /// `refusal` `after` then: refused at once where any rule refuses an ordinary placement,
+    /// those its matching judges included (a post-only cross, a level the book does not know,
+    /// a fill no rate charges; Codex r4309341209), and otherwise accepted without matching or
+    /// resting.
+    fn hold(
+        &mut self,
+        p: Place,
+        item: (u64, u16),
+        at: At,
+        after: Duration,
+        refusal: RiskRefusal,
+    ) -> Item {
+        // Matched as a dry run: its queue is put back, whatever matching did to it.
+        let queue = self.queues.get(&p.inst).cloned();
+        let judged = self
+            .check_place(&p)
+            .and_then(|()| self.match_order(&matched(&p), OrderKey(self.orders), at));
+        match queue {
+            Some(queue) => self.queues.insert(p.inst, queue),
+            None => self.queues.remove(&p.inst),
+        };
+        if let Err(refusal) = judged {
             return Item::refused(refusal);
         }
+        let when = due(at, after);
         let n = self.orders;
         self.orders += 1;
         self.by_cid.insert(p.cid.clone(), n);
@@ -1055,17 +1078,9 @@ impl SimEngine {
     /// Placement `p`, arrived at `at`, matched and resting or ended now.
     fn place_now(&mut self, p: Place, at: At) -> Item {
         let key = OrderKey(self.orders);
-        let m = Match {
-            inst: p.inst,
-            side: p.side,
-            px: p.px,
-            qty: p.qty,
-            tif: p.tif,
-            post_only: p.post_only,
-        };
         let taken = self
             .check_place(&p)
-            .and_then(|()| self.match_order(&m, key, at));
+            .and_then(|()| self.match_order(&matched(&p), key, at));
         match taken {
             Ok(taken) => self.commit_place(p, taken),
             Err(refusal) => Item::refused(refusal),
@@ -2005,6 +2020,18 @@ const MAX_LOTS: Lots = match Lots::new(i64::MAX) {
     Some(lots) => lots,
     None => Lots::ZERO,
 };
+
+/// What placement `p` matches as.
+fn matched(p: &Place) -> Match {
+    Match {
+        inst: p.inst,
+        side: p.side,
+        px: p.px,
+        qty: p.qty,
+        tif: p.tif,
+        post_only: p.post_only,
+    }
+}
 
 /// The venue's id for its `n`th order.
 fn vid(n: u64) -> String {

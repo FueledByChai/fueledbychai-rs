@@ -5439,7 +5439,7 @@ fn a_cancel_during_the_risk_check_withdraws_the_placement() {
 #[test]
 fn a_two_phase_batch_is_answered_provisionally_per_item_then_each_item_settles() {
     let mut v = two_phase_rich();
-    v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+    v.snapshot(T0, &[(199, 5), (198, 5)], &[(201, 5)]);
     let (rests, refused, crosses) = (cid(), cid(), cid());
     v.engine
         .risk_reject(refused, Duration::from_millis(20), RiskRefusal::MinNotional)
@@ -5491,7 +5491,7 @@ fn a_two_phase_batch_is_answered_provisionally_per_item_then_each_item_settles()
 #[test]
 fn an_order_held_for_its_risk_check_is_queried_resynced_and_cancelled_as_one_the_venue_holds() {
     let mut v = two_phase_rich();
-    v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+    v.snapshot(T0, &[(199, 5), (198, 5)], &[(201, 5)]);
     let order = cid();
     v.engine
         .risk_reject(order, Duration::from_millis(40), RiskRefusal::Margin)
@@ -5580,7 +5580,7 @@ fn a_second_phase_answered_after_a_reconnect_settles_nothing_but_the_order() {
     // reconnect, as Paradex's drops every placement it holds (0092), so only the order's own
     // state is reported.
     let mut v = two_phase();
-    v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+    v.snapshot(T0, &[(199, 5), (198, 5)], &[(201, 5)]);
     let (passes, refused) = (cid(), cid());
     v.engine
         .risk_reject(refused, Duration::from_millis(20), RiskRefusal::Margin)

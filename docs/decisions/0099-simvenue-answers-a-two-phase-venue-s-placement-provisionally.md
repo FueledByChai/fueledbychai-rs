@@ -30,12 +30,16 @@ caps and the consumer.
 - **A risk reject is the consumer's.** `SimEngine::risk_reject(cid, after, refusal)` configures the
   venue's risk check to refuse the next placement naming `cid`, `after` its arrival, as a
   `RiskRefusal` (`PostOnlyWouldCross`, `MinNotional`, `Margin` or `Other`, each an order-ending
-  `RejectKind`). Such a placement, if it passes the venue's ordinary rules, is accepted
-  provisionally and held: never matched, never resting, open to a query and a resync; at its
+  `RejectKind`). Such a placement, unless a rule refuses it at once as it refuses an ordinary one
+  (its matching's included: a post-only cross, a level the book does not know, a fill no rate
+  charges; Codex r4309341209 on PR #165), is accepted provisionally and held: never matched, never resting, open to a query and a resync; at its
   instant the engine answers an `AsyncReject` of the placement (`OpKind::Place`, our client id and
   its venue id), then the order update that ends it `Rejected`, and no final acceptance. A cancel
   (or cancel-all, or the venue's cancel at a disconnect or a lapsed dead-man timer) before then
-  ends it `Canceled` and nothing is refused, as Paradex's withdrawal (0093). Refused for a
+  ends it `Canceled` and nothing is refused, as Paradex's withdrawal (0093); at the instant the
+  check would have refused it the engine answers that the placement was withdrawn, which reports
+  nothing, so every provisional acceptance gets exactly one second-phase answer (Codex
+  r4309341215). Refused for a
   `SinglePhase` venue or an `after` past the window (`OutsideRiskWindow`), and for a client id the
   venue's format cannot carry (`ClientId`).
 - **Ordered in time.** Each second phase is due at its instant; at one instant the commands that
@@ -45,7 +49,8 @@ caps and the consumer.
 - **The codec awaits by request and item.** `SimCodec` decodes `Provisional` and `Final` as the
   engine gives them, and from a provisional acceptance awaits its second phase by request and
   item. Like Paradex's codec (0092), it awaits nothing across a reconnect: each open forgets what it
-  awaited, and a second phase it does not await reports nothing, the order update of a risk
+  awaited; a withdrawal ends the wait and reports nothing; and a second phase it does not await
+  reports nothing, the order update of a risk
   reject aside, which always reports the order's state. It places for a `TwoPhase` venue; it still
   refuses amends for one (FBC-kbwj), and the engine's own refusals stay synchronous `Rejected`
   outcomes (FBC-fsqn).
