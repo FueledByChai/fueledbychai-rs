@@ -53,7 +53,15 @@ and how an orphan is held while its cancel is out (FBC-840, BT-402).
    that registers one compares the venue's position with the fills it counts (Codex's
    r4310661291). An order not ours
    (another namespace's, a non-canonical client id, or one nothing attributes) is never an orphan.
-   A trustworthy resync forgets the live sightings.
+   A trustworthy resync forgets the live sightings. An order of ours the registry holds as
+   ended Lost (the Unknown ladder ended it on snapshots that lagged it past the settle, 0094's
+   up to 3480 ms) that a trustworthy, non-stale snapshot shows open, under a venue id no other
+   order of ours holds, is an orphan too: it is in `untracked` and registered again from the
+   snapshot with the fills counted on it, so it counts on both caps, suppresses the adding side
+   and is cancelled like any other (Reviewer B's RB840-8 on PR #171: held as ended, it counted
+   on neither cap and nothing cancelled it). Its fills were routed to it while it was held, so
+   none moves the inventory again. A source that is not trustworthy confirms none: a live event
+   under its client id reaches the held record, not the sightings.
 2. **The adding side.** A side adds when an order on it would grow the position's size: while a
    market's adding side is suppressed, a place, a batch item or an amend is built only on the side
    that reduces a known, non-zero position, and only when what the side may still move the

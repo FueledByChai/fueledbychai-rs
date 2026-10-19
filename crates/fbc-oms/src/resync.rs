@@ -71,7 +71,7 @@ use fbc_core::{
     WallNs,
 };
 
-use crate::ladder::{LadderConfig, ResyncApplied, update_of};
+use crate::ladder::{LadderConfig, ResyncApplied, is_lost, update_of};
 use crate::ledger::FillTime;
 use crate::record::{OrderKey, OrderRecord};
 use crate::registry::Registry;
@@ -165,14 +165,16 @@ pub struct ResyncReport {
     /// Each market seeded before it, compared.
     pub checks: Vec<PositionCheck>,
     /// Open orders under our namespace on a market seeded before it that the registry did not
-    /// hold (0005's I7 orphans), in client id order. The resync registers each it acts on
+    /// hold, or held as ended Lost (0005's I7 orphans; Reviewer B's RB840-8 on PR #171), in
+    /// client id order. The resync registers each it acts on
     /// (decision 0106; [`Registry::cancel_orphans`](crate::Registry::cancel_orphans)): every
     /// open one from a trustworthy snapshot source, from any other only those a live order
     /// event or fill under its client id also showed while the registry did not hold them, and
-    /// none whose client id or venue id another order of ours holds, nor any on a market the
+    /// none whose client id or venue id another order of ours holds (one held as ended Lost is
+    /// acted on, from a trustworthy source), nor any on a market the
     /// snapshot was requested before a resync that compared it, or not after its seed's
     /// request (it may have been read before the seed). One the registry still does not hold
-    /// by its client id after the resync was not acted on.
+    /// by its client id after the resync, or still holds as ended, was not acted on.
     pub untracked: Vec<(ClientOrderId, VenueOrderId)>,
     /// The markets holding orphans that are not terminal after it, in id order (0005's I7,
     /// decision 0106): each one's adding side is suppressed until the cooldown the consumer's
@@ -544,7 +546,7 @@ impl Registry {
         }
 
         for (&cid, o) in &ours {
-            if self.held_order(o).is_none()
+            if (self.held_order(o).is_none() || self.lost_shown_open(cid, o))
                 && matches!(
                     self.markets.get(&o.inst),
                     Some(MarketState::Seeded(_) | MarketState::Unsettled)
@@ -629,24 +631,29 @@ impl Registry {
         let mut registered: HashSet<InstrumentId> = HashSet::new();
         for (cid, vid) in &report.untracked {
             let o = ours[cid];
+            let lost = self.lost_shown_open(*cid, o);
             if o.state != VenueOrderState::Open
                 || stale.contains(&o.inst)
-                || self.orders.contains_key(cid)
-                || self.cid_of(vid).is_some()
+                || (!lost && (self.orders.contains_key(cid) || self.cid_of(vid).is_some()))
             {
                 continue;
             }
             if report.untrustworthy && !self.orphans.seen_live(*cid) {
                 continue;
             }
-            self.orders.insert(
-                *cid,
-                OrderRecord::seeded_from(*cid, o, snap.requested_at, snap.watermark),
-            );
+            let mut rec = OrderRecord::seeded_from(*cid, o, snap.requested_at, snap.watermark);
+            if let Some(ended) = self.orders.get(cid) {
+                // Ended Lost, its fills were counted on it and on the inventory already
+                // (Reviewer B's RB840-8 on PR #171).
+                rec.set_cum_fills(ended.cum_fills());
+            }
+            self.orders.insert(*cid, rec);
             let u = update_of(o);
             self.with_record(*cid, |rec| rec.apply_update(&u, key));
-            // Shown open after the seed: its fills are placed by their arrival and time.
-            self.seed_orphan(o.inst, *cid);
+            if !lost {
+                // Shown open after the seed: its fills are placed by their arrival and time.
+                self.seed_orphan(o.inst, *cid);
+            }
             self.orphans.add(o.inst, *cid);
             registered.insert(o.inst);
         }
@@ -675,6 +682,19 @@ impl Registry {
                 self.entries.touch(market);
             }
         }
+    }
+
+    /// Whether `o`, a snapshot order under our client id `cid`, shows open an order the registry
+    /// holds as ended Lost (Reviewer B's RB840-8 on PR #171): the Unknown ladder ended it on
+    /// snapshots that lagged it, so it rests at the venue while it counts on neither cap. Only
+    /// one whose venue id names no other order of ours is one; it is an orphan like any other.
+    fn lost_shown_open(&self, cid: ClientOrderId, o: &VenueOrderSnapshot) -> bool {
+        o.state == VenueOrderState::Open
+            && self.held_order(o) == Some(cid)
+            && self
+                .orders
+                .get(&cid)
+                .is_some_and(|rec| is_lost(rec.state()))
     }
 
     /// The order of ours the registry holds that a snapshot order names: by our client id, or
