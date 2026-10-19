@@ -31,7 +31,11 @@ a cross the venue keeps refusing would be sent at every pass.
    has IOC, falling back as 0106 rule 2 does where the venue refuses IOC with reduce-only, and
    a good-till-cancelled limit at the cap cancelled at once (`Downgrade::SynthIoc`, 0106 rule
    4) where the venue has no IOC. A venue without reduce-only (`OrderCaps::reduce_only` false)
-   gets no crossing order (`PlanRefusal::ReduceOnlyUnsupported`).
+   gets no crossing order (`PlanRefusal::ReduceOnlyUnsupported`). A synthetic IOC, a
+   crossing's or a level quote's (augmenting 0106 rule 4), is built only where the venue takes
+   GTC limits and its single cancel can name the order once acknowledged (venue id or client
+   id); otherwise its limit could rest and fill later, and nothing is built
+   (`PlanRefusal::NoSyntheticIoc`).
 3. **Sized so the position never crosses zero.** When built, the order is at most `qty` and at
    most what is left to reduce: the position's size on the side it reduces (nothing while the
    position is flat, unknown or on the intent's side), less the fills on that side reported on
@@ -45,14 +49,16 @@ a cross the venue keeps refusing would be sent at every pass.
 5. **Never amended or replaced while live; one order per attempt.** A live crossing order is
    held (`HeldReason::Crossing`); an IOC ends by itself and a synthetic one is cancelled at
    once. Withdrawing the intent cancels a live order with the side's removal reason, as a
-   level no longer wanted. The planner builds at most one order per `attempt`: once an order
-   was built for an attempt, that attempt is not planned again, so a cross that ends unfilled
+   level no longer wanted. The planner builds at most one order per `attempt`, and attempts
+   only increase: once an order was built for an attempt, neither it nor an older attempt is
+   planned again (an older one is refused `PlanRefusal::StaleAttempt`, so a consumer's stale
+   or cycled counter never sends an extra cross), so a cross that ends unfilled
    or refused by the venue (price band, minimum notional, margin) is not resent at every pass;
    the consumer names a new attempt to cross again, planned once the previous order is
    terminal. An attempt refused before anything was built (state, cap, nothing left) sent
    nothing and is planned at a later pass, and an order that ended never sent
    (`TerminalKind::NotSent`, a stale authorization at submit included) reached no venue, so its
-   attempt is planned again.
+   attempt, the last one built, is planned again; older ones still are not.
 
 ## Alternatives
 
@@ -67,6 +73,9 @@ a cross the venue keeps refusing would be sent at every pass.
   bounds the rest; in Exit, Exit's admission counts every order on the side and refuses a cross
   beside an ordinary order that would cross zero.
 - Clip by emulated reduce-only orders too: rejected by 0106 (it starves a force-close).
+- Remember every attempt built instead of requiring them to increase: rejected. It grows
+  without bound on a 24/7 consumer, and an increasing counter is what a timer-paced consumer
+  has anyway.
 - Clip to the resting cap instead of refusing: rejected. The ticket keeps every cap applied as
   the cap's refusal; a consumer sizes its cross within the cap.
 
@@ -80,7 +89,9 @@ a cross the venue keeps refusing would be sent at every pass.
   $11 resting cap per side a $50 position is crossed in attempts of at most $11.
 - The consumer bumps `attempt` to cross again after an attempt ends with the position not
   flat: after a partial fill, an unfilled IOC, or a venue refusal.
-- The planner keeps the last attempt built per account, market and side for its lifetime.
+- The planner keeps the last attempt built per account, market and side for its lifetime; a
+  consumer counts attempts up from any start within one planner's life (a new process starts a
+  new planner).
 
 ## What would show this was wrong
 
