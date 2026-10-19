@@ -30,7 +30,9 @@
 //! An orphan a later resync registered from its snapshot (0005's I7, decision 0101) was open
 //! after the seed read the account, so on either read mode the seed holds a fill of it only by
 //! rule 1 or its matching-engine time at or before the watermark; any other fill of it comes
-//! after the seed and moves the inventory.
+//! after the seed and moves the inventory. The fills of it applied before it was registered
+//! that rule 3 alone placed in a one-read seed (not shown, its time after the watermark) move
+//! the inventory as it is registered, once.
 //!
 //! Rules 2 and 3 judge a fill by the open orders and trust the position read beside them, so
 //! they need the snapshot's open orders and positions read at one instant. The venue declares
@@ -286,6 +288,12 @@ struct SeedRef {
     /// one only when it arrived before the seed was requested or executed at or before its
     /// watermark (Reviewer B's RB840-1 on PR #171).
     later: HashSet<ClientOrderId>,
+    /// Fills of our orders the registry did not hold that the seed holds only because it did
+    /// not show their order (rule 3), not by their arrival or time: when each arrived, its
+    /// matching-engine time and what it moved. A later snapshot showing the order open proves
+    /// them after the seed, so registering it as an orphan counts them on the inventory
+    /// (Codex's r4310559340 on PR #171); a trustworthy resync not showing it open drops them.
+    absent_only: HashMap<ClientOrderId, Vec<(MonoNs, Option<WallNs>, i128)>>,
 }
 
 /// Where a fill stands against a seed.
@@ -301,6 +309,19 @@ pub(crate) enum Placement {
 }
 
 impl SeedRef {
+    /// Whether the seed holds `f`, a fill it placed in the snapshot, only because it did not
+    /// show the fill's order: neither its arrival, its time nor a shown fill count places it.
+    fn by_absence_only(&self, f: &Placed) -> bool {
+        self.reads == SnapshotReads::OneInstant
+            && f.arrived > self.requested_at
+            && !f.exec.is_some_and(|t| t <= self.watermark)
+            && !self.shown.contains_key(&f.cid)
+            && !f
+                .vid
+                .as_ref()
+                .is_some_and(|v| self.shown_vids.contains_key(v))
+    }
+
     fn place(&self, f: &Placed) -> Placement {
         let before_watermark = f.exec.is_some_and(|t| t <= self.watermark);
         if self.later.contains(&f.cid) {
@@ -372,6 +393,58 @@ impl Registry {
                 r.place(f)
             }
             _ => Placement::After,
+        }
+    }
+
+    /// Keeps `f`, a fill of our order the registry does not hold, which moved the inventory
+    /// by `signed` had the seed not held it, when the seed holds it only because it did not
+    /// show the order ([`SeedRef::by_absence_only`]): a later snapshot showing the order open
+    /// counts it on the inventory as the orphan is registered (decision 0101).
+    pub(crate) fn untracked_in_snapshot(
+        &mut self,
+        inst: InstrumentId,
+        f: &Placed,
+        signed: SignedLots,
+    ) {
+        if let Some(MarketState::Seeded(Seed {
+            reference: Some(r), ..
+        })) = self.markets.get_mut(&inst)
+            && r.by_absence_only(f)
+        {
+            r.absent_only
+                .entry(f.cid)
+                .or_default()
+                .push((f.arrived, f.exec, i128::from(signed.0)));
+        }
+    }
+
+    /// Registers `cid`, an orphan on `inst`, against the market's seed: the seed holds a later
+    /// fill of it only by the fill's arrival or time (Reviewer B's RB840-1 on PR #171), and
+    /// the fills of it the seed held only because it did not show it move the inventory now,
+    /// once (Codex's r4310559340). Should they overflow the inventory, the market's position
+    /// is unknown from now on. On a market seeded by hand every fill counted already.
+    fn seed_orphan(&mut self, inst: InstrumentId, cid: ClientOrderId) {
+        let Some(MarketState::Seeded(Seed {
+            reference: Some(r),
+            log,
+            ..
+        })) = self.markets.get_mut(&inst)
+        else {
+            return;
+        };
+        r.later.insert(cid);
+        let fills = r.absent_only.remove(&cid).unwrap_or_default();
+        if fills.is_empty() {
+            return;
+        }
+        let moved: i128 = fills.iter().map(|(_, _, signed)| signed).sum();
+        log.extend(fills);
+        let now = i128::from(self.inventory(inst).0) + moved;
+        match i64::try_from(now) {
+            Ok(pos) => self.set_inventory(inst, SignedLots(pos)),
+            Err(_) => {
+                self.markets.insert(inst, MarketState::Unsettled);
+            }
         }
     }
 
@@ -512,7 +585,7 @@ impl Registry {
     /// from a trustworthy source, or from any other one a live account event also showed,
     /// unless its client id or venue id is another order's of ours; then suppresses the adding
     /// side of every market holding orphans that are not terminal, advancing the state
-    /// generation of each it newly suppresses, and names those markets.
+    /// generation of each it newly suppresses or registers an orphan on, and names those markets.
     fn act_on_orphans(
         &mut self,
         snap: &ResyncSnapshot,
@@ -520,6 +593,7 @@ impl Registry {
         key: OrderKey,
         report: &mut ResyncReport,
     ) {
+        let mut registered: HashSet<InstrumentId> = HashSet::new();
         for (cid, vid) in &report.untracked {
             let o = ours[cid];
             if o.state != VenueOrderState::Open
@@ -537,23 +611,31 @@ impl Registry {
             );
             let u = update_of(o);
             self.with_record(*cid, |rec| rec.apply_update(&u, key));
-            // Shown open after the seed, so the seed holds a fill of it only by the fill's
-            // arrival or time (Reviewer B's RB840-1); on a market seeded by hand, every fill
-            // counts already.
-            if let Some(MarketState::Seeded(Seed {
-                reference: Some(r), ..
-            })) = self.markets.get_mut(&o.inst)
-            {
-                r.later.insert(*cid);
-            }
+            // Shown open after the seed: its fills are placed by their arrival and time.
+            self.seed_orphan(o.inst, *cid);
             self.orphans.add(o.inst, *cid);
+            registered.insert(o.inst);
         }
         if !report.untrustworthy {
             self.orphans.forget_live();
+            // An order a trustworthy snapshot does not show open is no orphan to come.
+            for state in self.markets.values_mut() {
+                if let MarketState::Seeded(Seed {
+                    reference: Some(r), ..
+                }) = state
+                {
+                    r.absent_only.retain(|cid, _| {
+                        ours.get(cid)
+                            .is_some_and(|o| o.state == VenueOrderState::Open)
+                    });
+                }
+            }
         }
         report.orphans = self.orphan_markets();
         for &market in &report.orphans {
-            if self.orphans.suppress(market) {
+            // A suppression beginning, or an orphan registered on the market, voids what was
+            // authorized before (Codex's r4310559351 on PR #171): the orphan counts now.
+            if self.orphans.suppress(market) || registered.contains(&market) {
                 self.entries.touch(market);
             }
         }
@@ -653,6 +735,7 @@ impl Registry {
                 shown_vids: HashMap::new(),
                 known: HashSet::new(),
                 later: HashSet::new(),
+                absent_only: HashMap::new(),
             };
             // Our orders it shows: one the registry holds by its id (an order shown under our
             // client id and another order's venue id by neither), or one to register.
