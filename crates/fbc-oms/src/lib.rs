@@ -250,8 +250,9 @@ pub use permit::{
     PlacePlan,
 };
 pub use planner::{
-    DesiredBook, DesiredQuote, Downgrade, ExecutionPlanner, Held, HeldReason, Plan, PlanError,
-    PlanRefusal, Planned, PlannerConfig, PlannerConfigError, ReduceFallback, Refused, Stage,
+    CROSSING_LEVEL, CrossingIntent, DesiredBook, DesiredQuote, Downgrade, ExecutionPlanner, Held,
+    HeldReason, Plan, PlanError, PlanRefusal, Planned, PlannerConfig, PlannerConfigError,
+    ReduceFallback, Refused, Stage,
 };
 pub use record::{
     Applied, FillApplied, Intent, LadderStep, OrdState, OrderKey, OrderOp, OrderRecord,

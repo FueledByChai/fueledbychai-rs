@@ -30,6 +30,18 @@
 //!   while the position is flat or unknown) is cancelled, wanted or not: Exit builds nothing
 //!   there, so the planner never leaves it resting nor tries to amend it (0063).
 //!
+//! Each side may also carry a [`CrossingIntent`], a reduce-only exit that crosses at a price
+//! cap (a disaster stop, a news flatten window, the operator's Flatten), at no level: it is
+//! planned as one reduce-only order priced at its cap, immediate-or-cancel where the venue's
+//! [`OrderCaps`] take IOC with reduce-only and otherwise a good-till-cancelled limit at the cap
+//! and its cancel (the synthetic IOC below); sized at most the position less the other orders
+//! reducing it on its side, so the position never crosses zero, and planned not at all while
+//! nothing is left to reduce; built through the same one pre-trade path, so refused in Killed
+//! and Cancel-only and judged by Exit's admission and both caps; never amended or replaced while
+//! it is live; and at most one order per [`CrossingIntent::attempt`], so an order the venue
+//! refuses or leaves unfilled is not sent again until the consumer names a new attempt
+//! (decision 0107).
+//!
 //! Each level's quote carries the consumer's opaque tag and each side an optional removal
 //! reason: every place and amend built for a level carries its tag, every cancel of a level no
 //! longer wanted (absent, or at quantity zero) its side's reason as the pass that builds it
@@ -81,6 +93,33 @@ use crate::grant::Authorization;
 use crate::permit::{self, AmendRefusal, CancelChoice, PermitRefusal, PermittedCommand};
 use crate::record::{Intent, OrdState, OrderRecord};
 use crate::registry::{Instance, OmsError, Registry};
+
+/// The [`Planned::level`], [`Held::level`] and [`Refused::level`] of a side's crossing intent's
+/// order, which is at no level of the book ([`Planned::crossing`]).
+pub const CROSSING_LEVEL: u16 = u16::MAX;
+
+/// A side's price-capped reduce-only crossing exit (decision 0107): a disaster stop, a news
+/// flatten window or the operator's Flatten. The side is the order's: a sell crossing reduces a
+/// long. Planned as one reduce-only order priced at `cap`, immediate-or-cancel where the venue
+/// takes IOC with reduce-only and otherwise a good-till-cancelled limit at `cap` followed by its
+/// cancel ([`Downgrade::SynthIoc`]), sized at most `qty` and at most the position less the other
+/// orders reducing it on the side, so the position never crosses zero.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct CrossingIntent {
+    /// The worst price the order may trade at: a sell's lowest, a buy's highest. The order's
+    /// limit price.
+    pub cap: Ticks,
+    /// The most to trade; zero means no intent.
+    pub qty: Lots,
+    /// The consumer's opaque tag, as [`DesiredQuote::tag`].
+    pub tag: u16,
+    /// The consumer's attempt: at most one order is planned per attempt, so an order that
+    /// ended (filled, its unfilled rest expired, or refused by the venue) is not crossed again
+    /// until the consumer names another attempt, which is planned once the previous order is
+    /// terminal. An attempt refused before anything was built (by the market's state, a cap,
+    /// or with nothing left to reduce) sent nothing, and is planned again at a later pass.
+    pub attempt: u64,
+}
 
 /// What the consumer wants resting at one level of one side.
 #[derive(Clone, Eq, PartialEq, Debug)]
@@ -162,6 +201,8 @@ pub struct DesiredBook {
     levels: BTreeMap<Level, DesiredQuote>,
     /// Each side's removal reason, bids first.
     removal: [Option<u16>; 2],
+    /// Each side's crossing intent, bids first.
+    crossing: [Option<CrossingIntent>; 2],
 }
 
 impl DesiredBook {
@@ -171,6 +212,7 @@ impl DesiredBook {
             market,
             levels: BTreeMap::new(),
             removal: [None; 2],
+            crossing: [None; 2],
         }
     }
 
@@ -211,6 +253,24 @@ impl DesiredBook {
         self.levels.remove(&Level::new(side, level));
     }
 
+    /// The book with `intent` as `side`'s crossing intent, replacing any there.
+    pub fn with_crossing(mut self, side: Side, intent: CrossingIntent) -> DesiredBook {
+        self.set_crossing(side, Some(intent));
+        self
+    }
+
+    /// Sets `side`'s crossing intent (decision 0107), replacing any there; `None` withdraws
+    /// it, so a crossing order of the side still live is cancelled with the side's removal
+    /// reason, as a level no longer wanted is.
+    pub fn set_crossing(&mut self, side: Side, intent: Option<CrossingIntent>) {
+        self.crossing[usize::from(Level::new(side, 0).side)] = intent;
+    }
+
+    /// `side`'s crossing intent.
+    pub fn crossing(&self, side: Side) -> Option<&CrossingIntent> {
+        self.crossing[usize::from(Level::new(side, 0).side)].as_ref()
+    }
+
     /// The market.
     pub fn market(&self) -> InstrumentId {
         self.market
@@ -222,11 +282,14 @@ impl DesiredBook {
     }
 }
 
-/// One level of one side: bids before asks, then by level.
+/// One level of one side, or its crossing intent's order: bids before asks, then the levels,
+/// then the crossing intent's.
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 struct Level {
     /// 0 for bids, 1 for asks.
     side: u8,
+    /// The side's crossing intent's order, at [`CROSSING_LEVEL`].
+    crossing: bool,
     level: u16,
 }
 
@@ -236,7 +299,20 @@ impl Level {
             Side::Buy => 0,
             Side::Sell => 1,
         };
-        Level { side, level }
+        Level {
+            side,
+            crossing: false,
+            level,
+        }
+    }
+
+    /// `side`'s crossing intent's order.
+    fn crossing(side: Side) -> Level {
+        Level {
+            crossing: true,
+            level: CROSSING_LEVEL,
+            ..Level::new(side, 0)
+        }
     }
 
     fn side(self) -> Side {
@@ -331,7 +407,10 @@ pub enum Stage {
 pub struct Planned {
     pub stage: Stage,
     pub side: Side,
+    /// The level, or [`CROSSING_LEVEL`] for the crossing intent's order.
     pub level: u16,
+    /// The command is for the side's crossing intent's order ([`CrossingIntent`]), at no level.
+    pub crossing: bool,
     /// The order the command is for.
     pub cid: ClientOrderId,
     /// The consumer's tag: a place's or an amend's is its level's [`DesiredQuote::tag`]; a
@@ -361,13 +440,19 @@ pub enum HeldReason {
     Young,
     /// The order is being replaced: the new one is placed once it is terminal.
     Replacing,
+    /// The crossing intent's order is live: it is never amended or replaced, and the next
+    /// attempt is planned once it is terminal (decision 0107).
+    Crossing,
 }
 
 /// A level whose order the planner left as it is this pass.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct Held {
     pub side: Side,
+    /// The level, or [`CROSSING_LEVEL`] for the crossing intent's order.
     pub level: u16,
+    /// The crossing intent's order ([`CrossingIntent`]).
+    pub crossing: bool,
     pub cid: ClientOrderId,
     pub why: HeldReason,
 }
@@ -383,10 +468,13 @@ pub enum PlanRefusal {
     Permit(PermitRefusal),
     /// No client id could be minted.
     Mint(IdError),
-    /// An emulated reduce-only quote ([`ReduceFallback::EmulateReduceOnly`]) has nothing to
-    /// reduce: the position is flat, unknown or on the quote's side, or the other orders
-    /// reducing it on that side already cover it.
+    /// An emulated reduce-only quote ([`ReduceFallback::EmulateReduceOnly`]) or a crossing
+    /// intent ([`CrossingIntent`]) has nothing to reduce: the position is flat, unknown or on
+    /// its side, or the other orders reducing it on that side already cover it.
     NoRoomToReduce,
+    /// The venue takes no reduce-only order ([`OrderCaps::reduce_only`]): a crossing intent is
+    /// never sent without the flag (decision 0107).
+    ReduceOnlyUnsupported,
     /// A place or amend that reduces the position would leave an emulated reduce-only order
     /// resting on its side more than is left to reduce, so both could fill and take the
     /// position past zero: the emulated order is cancelled, and the command is built by the
@@ -429,7 +517,10 @@ impl std::error::Error for PlanError {}
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub struct Refused {
     pub side: Side,
+    /// The level, or [`CROSSING_LEVEL`] for the crossing intent.
     pub level: u16,
+    /// The crossing intent ([`CrossingIntent`]).
+    pub crossing: bool,
     pub why: PlanRefusal,
 }
 
@@ -485,6 +576,9 @@ struct Fitted {
     quote: DesiredQuote,
     mode: Mode,
     downgrades: Vec<Downgrade>,
+    /// A crossing intent's attempt: the place is sized to what is left to reduce when built,
+    /// and the attempt recorded once it is.
+    attempt: Option<u64>,
 }
 
 /// What a pass decided for a level, before anything is built.
@@ -528,6 +622,9 @@ pub struct ExecutionPlanner {
     slots: HashMap<(AccountKey, InstrumentId), BTreeMap<Level, Slot>>,
     /// Each account's registry, bound at the account's first pass.
     bound: HashMap<AccountKey, Instance>,
+    /// The last crossing attempt an order was built for, by account, market and side
+    /// (decision 0107).
+    fired: HashMap<(AccountKey, InstrumentId, Level), u64>,
 }
 
 impl ExecutionPlanner {
@@ -537,6 +634,7 @@ impl ExecutionPlanner {
             config,
             slots: HashMap::new(),
             bound: HashMap::new(),
+            fired: HashMap::new(),
         }
     }
 
@@ -552,6 +650,20 @@ impl ExecutionPlanner {
         self.slots
             .get(&(acct, market))?
             .get(&Level::new(side, level))
+            .map(|s| s.cid)
+    }
+
+    /// The order the planner holds for `acct` for `side`'s crossing intent on `market`, until
+    /// it is seen terminal (decision 0107).
+    pub fn crossing_order(
+        &self,
+        acct: AccountKey,
+        market: InstrumentId,
+        side: Side,
+    ) -> Option<ClientOrderId> {
+        self.slots
+            .get(&(acct, market))?
+            .get(&Level::crossing(side))
             .map(|s| s.cid)
     }
 
@@ -598,16 +710,37 @@ impl ExecutionPlanner {
         // Orders whose level is wanted again with no cancel in flight: a removal cancel built
         // for them and never reported sent ended nothing, so they keep no reason (0098).
         let mut kept: Vec<ClientOrderId> = Vec::new();
-        let levels: BTreeSet<Level> = slots.keys().chain(desired.levels.keys()).copied().collect();
+        let crossings = [Side::Buy, Side::Sell]
+            .into_iter()
+            .filter(|&side| desired.crossing(side).is_some())
+            .map(Level::crossing);
+        let levels: BTreeSet<Level> = slots
+            .keys()
+            .chain(desired.levels.keys())
+            .copied()
+            .chain(crossings)
+            .collect();
         for at in levels {
-            // The quote as the venue's caps take it (design §4.10 steps 3 and 4).
-            let fitted = desired
-                .levels
-                .get(&at)
-                .filter(|q| q.qty > Lots::ZERO)
-                .map(|q| fit(q, caps));
+            // The quote as the venue's caps take it (design §4.10 steps 3 and 4), or the
+            // crossing intent's order (0107).
+            let fitted = if at.crossing {
+                desired
+                    .crossing(at.side())
+                    .filter(|c| c.qty > Lots::ZERO)
+                    .map(|c| fit_crossing(c, caps))
+            } else {
+                desired
+                    .levels
+                    .get(&at)
+                    .filter(|q| q.qty > Lots::ZERO)
+                    .map(|q| fit(q, caps))
+            };
             let Some(slot) = slots.get_mut(&at) else {
-                if let Some(f) = fitted {
+                // A crossing attempt an order was built for is never planned again (0107).
+                let fired = |f: &Fitted| {
+                    f.attempt.is_some() && self.fired.get(&(acct, market, at)).copied() == f.attempt
+                };
+                if let Some(f) = fitted.filter(|f| !fired(f)) {
                     let stage = if f.quote.reduces() {
                         Stage::Reducing
                     } else {
@@ -645,6 +778,7 @@ impl ExecutionPlanner {
             let hold = |why| Held {
                 side: at.side(),
                 level: at.level,
+                crossing: at.crossing,
                 cid: slot.cid,
                 why,
             };
@@ -720,6 +854,12 @@ impl ExecutionPlanner {
                 plan.held.push(hold(why));
                 continue;
             }
+            // A live crossing order ends by itself (an IOC) or by its cancel (a synthetic
+            // one, above): never amended or replaced (0107).
+            if at.crossing {
+                plan.held.push(hold(HeldReason::Crossing));
+                continue;
+            }
             if !config.differs(rec, q) {
                 continue;
             }
@@ -781,6 +921,7 @@ impl ExecutionPlanner {
             let refuse = |why| Refused {
                 side,
                 level: at.level,
+                crossing: at.crossing,
                 why,
             };
             // Each built command's order keeps the consumer's tag and removal reason the
@@ -887,7 +1028,22 @@ impl ExecutionPlanner {
                     mut quote,
                     mode,
                     downgrades,
+                    attempt,
                 }) => {
+                    // A crossing intent is sent only with the venue's reduce-only flag, and is
+                    // sized to what is left to reduce, the commands before it counted (0107).
+                    if attempt.is_some() {
+                        if !caps.reduce_only {
+                            plan.refused
+                                .push(refuse(PlanRefusal::ReduceOnlyUnsupported));
+                            continue;
+                        }
+                        quote.qty = quote.qty.min(crossing_room(slots, reg, market, side));
+                        if quote.qty == Lots::ZERO {
+                            plan.refused.push(refuse(PlanRefusal::NoRoomToReduce));
+                            continue;
+                        }
+                    }
                     // A reducer waits for the cancel of each emulated order it would leave
                     // overshooting, once judged admitted with those orders ended: one refused
                     // anyway reports its own refusal and cancels nothing.
@@ -941,6 +1097,9 @@ impl ExecutionPlanner {
                                 },
                             );
                             reg.with_record(cid, |rec| rec.set_tag(quote.tag));
+                            if let Some(attempt) = attempt {
+                                self.fired.insert((acct, market, at), attempt);
+                            }
                             (cid, cmd, Some(quote.tag), None, downgrades)
                         })
                 }
@@ -951,6 +1110,7 @@ impl ExecutionPlanner {
                         stage,
                         side,
                         level: at.level,
+                        crossing: at.crossing,
                         cid,
                         tag,
                         removal,
@@ -1095,7 +1255,53 @@ fn fit(q: &DesiredQuote, caps: &OrderCaps) -> Fitted {
         quote,
         mode,
         downgrades,
+        attempt: None,
     }
+}
+
+/// The order a crossing intent asks for, as the venue's `caps` take it (decision 0107): a
+/// reduce-only limit at the cap on the public book, never post-only, classified reducing;
+/// immediate-or-cancel where the venue takes IOC, falling back as any reduce-only IOC quote
+/// does where the venue refuses the two together, and otherwise a good-till-cancelled limit
+/// cancelled at once ([`Downgrade::SynthIoc`]).
+fn fit_crossing(c: &CrossingIntent, caps: &OrderCaps) -> Fitted {
+    let ioc = caps.tifs.contains(Tif::Ioc);
+    let quote = DesiredQuote {
+        px: c.cap,
+        qty: c.qty,
+        tif: if ioc { Tif::Ioc } else { Tif::Gtc },
+        channel: Channel::Public,
+        post_only: false,
+        reduce_only: true,
+        reducing: true,
+        tag: c.tag,
+        reduce_fallback: ReduceFallback::KeepReduceOnly,
+    };
+    let mut fitted = fit(&quote, caps);
+    if !ioc {
+        fitted.mode.synth_ioc = true;
+        fitted.downgrades.push(Downgrade::SynthIoc);
+    }
+    fitted.attempt = Some(c.attempt);
+    fitted
+}
+
+/// What is left for a crossing intent on `side` of `market` to reduce (decision 0107): as
+/// [`reduce_room`] with no order excepted, but for the emulated reduce-only orders in `slots`,
+/// which a crossing order is never clipped by: it waits for their cancel instead, as any
+/// reducer that would leave one overshooting does (0106 rule 7).
+fn crossing_room(
+    slots: &BTreeMap<Level, Slot>,
+    reg: &Registry,
+    market: InstrumentId,
+    side: Side,
+) -> Lots {
+    let emulated: Vec<ClientOrderId> = slots
+        .iter()
+        .filter(|(at, slot)| slot.mode.emulated && at.side() == side)
+        .map(|(_, slot)| slot.cid)
+        .collect();
+    room_except(reg, market, side, &emulated)
 }
 
 /// What is left for an emulated reduce-only order on `side` of `market` to reduce: the
@@ -1109,6 +1315,11 @@ fn reduce_room(
     side: Side,
     except: Option<ClientOrderId>,
 ) -> Lots {
+    room_except(reg, market, side, except.as_slice())
+}
+
+/// [`reduce_room`] but for every order in `except`.
+fn room_except(reg: &Registry, market: InstrumentId, side: Side, except: &[ClientOrderId]) -> Lots {
     let reducible = reg.position(market).and_then(|pos| {
         let reduces = match side {
             Side::Sell => pos.0 > 0,
@@ -1116,7 +1327,6 @@ fn reduce_room(
         };
         reduces.then(|| pos.abs_lots()).flatten()
     });
-    let except = except.as_slice();
     reducible
         .zip(reg.unaccounted_fills_on(market, side))
         .and_then(|(size, unaccounted)| size.checked_sub(unaccounted))
@@ -1148,6 +1358,7 @@ fn cancel_now(
                     stage: Stage::Cancel,
                     side,
                     level,
+                    crossing: at.crossing,
                     cid,
                     tag,
                     removal: None,
@@ -1160,6 +1371,7 @@ fn cancel_now(
         Err(why) => plan.refused.push(Refused {
             side,
             level,
+            crossing: at.crossing,
             why: PlanRefusal::Permit(why),
         }),
     }
