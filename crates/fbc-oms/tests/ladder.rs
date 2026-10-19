@@ -21,7 +21,7 @@ use fbc_core::{InstrumentId, RefKind};
 use fbc_oms::{
     ControlCommand, Intent, LadderConfig, LadderConfigError, LadderPlan, LadderResolution,
     LadderStep, OmsError, OrdState, OrderKey, OrderOp, OutcomeApplied, PermitRefusal, Registry,
-    ResyncApplied, TerminalKind,
+    ResyncApplied, ResyncSnapshot, TerminalKind,
 };
 
 const INST: InstrumentId = InstrumentId::new(1);
@@ -523,6 +523,139 @@ fn a_snapshot_showing_an_order_on_the_ladder_resolves_it_as_its_update_would() {
     assert!(applied.lost.is_empty());
     assert_eq!(reg.get(by_cid).unwrap().resting(), lots(8));
     assert_eq!(reg.get(by_cid).unwrap().ladder_step(), None);
+}
+
+// ---- the venue's snapshot lag (FBC-i8lp) ----
+
+/// A trustworthy venue whose open-order snapshot may lag its order stream by up to `bound`.
+fn lagging(bound: Duration) -> OrderCaps {
+    OrderCaps {
+        snapshot_lag_bound: bound,
+        ..caps()
+    }
+}
+
+/// The consumer's numbers with `settle` and `absent` snapshots to declare an order lost.
+fn settling(settle: Duration, absent: u8) -> LadderConfig {
+    LadderConfig::new(ms(100), settle, ms(1_000), absent).unwrap()
+}
+
+/// The watermarks within `bound` of a send at wall 1000 ms: the send itself, every 7 ms
+/// after it, and the last nanosecond before the bound.
+fn within(bound: Duration) -> Vec<WallNs> {
+    let last = WallNs(wall(1_000).0 + i64::try_from(bound.as_nanos()).unwrap() - 1);
+    let mut marks: Vec<WallNs> = (0..)
+        .map(|n| WallNs(wall(1_000).0 + n * 7_000_000))
+        .take_while(|w| *w < last)
+        .collect();
+    marks.push(last);
+    marks
+}
+
+#[test]
+fn an_order_absent_from_snapshots_within_the_venues_lag_bound_of_its_send_is_never_lost_whatever_the_settle()
+ {
+    let bound = ms(500);
+    let venue = lagging(bound);
+    let none: &[VenueOrderSnapshot] = &[];
+    // Every settle below the bound, zero included, with one absence enough to end it: the
+    // venue's bound, not the consumer's settle, decides when an absence may count.
+    for settle in [Duration::ZERO, Duration::from_nanos(1), ms(50), ms(499)] {
+        for absent in [1, 2] {
+            let cfg = settling(settle, absent);
+            assert_eq!(cfg.absence_settle(&venue), bound, "{settle:?}");
+            let mut reg = Registry::new();
+            let c = unknown(&mut reg);
+            let other = cancel_unanswered(&mut reg, "g1");
+            for (n, w) in within(bound).into_iter().enumerate() {
+                let applied = reg.on_resync(&cfg, &venue, w, none, key(n as u64));
+                assert_eq!(applied, ResyncApplied::default(), "{settle:?} at {w:?}");
+            }
+            for order in [c, other] {
+                let rec = reg.get(order).unwrap();
+                assert_eq!(rec.absent_snapshots(), 0, "{settle:?}");
+                assert!(!rec.state().is_terminal(), "{settle:?}");
+            }
+            assert_eq!(reg.lost(), 0, "{settle:?}");
+            // From the bound on, each absence counts, and `absent` of them end it Lost.
+            for n in 0..absent {
+                let w = WallNs(wall(1_500).0 + i64::from(n));
+                let applied = reg.on_resync(&cfg, &venue, w, none, key(1_000 + u64::from(n)));
+                if n + 1 < absent {
+                    assert!(applied.lost.is_empty(), "{settle:?}");
+                } else {
+                    assert_eq!(applied.lost, vec![c, other], "{settle:?}");
+                }
+            }
+            for order in [c, other] {
+                let rec = reg.get(order).unwrap();
+                assert_eq!(rec.state(), OrdState::Terminal(TerminalKind::Lost));
+                assert_eq!(rec.resting(), lots(0));
+            }
+            assert_eq!(reg.lost(), 2, "{settle:?}");
+        }
+    }
+}
+
+#[test]
+fn a_resync_within_the_venues_lag_bound_of_an_orders_send_never_ends_it_lost_and_one_past_it_does()
+{
+    // Registry::resync applies the ladder's orders as on_resync does: the same floor holds.
+    let bound = ms(500);
+    let venue = lagging(bound);
+    let cfg = settling(Duration::ZERO, 1);
+    let mut reg = Registry::new();
+    let c = unknown(&mut reg);
+    let resync = |w: WallNs, n: u64| ResyncSnapshot {
+        watermark: w,
+        requested_at: at(10 + n),
+        orders: Vec::new(),
+        positions: Vec::new(),
+    };
+    for (n, w) in within(bound).into_iter().enumerate() {
+        let report = reg.resync(&cfg, &venue, &resync(w, n as u64), key(n as u64));
+        assert!(report.unwrap().ladder.lost.is_empty(), "at {w:?}");
+    }
+    assert_eq!(reg.get(c).unwrap().state(), OrdState::Unknown);
+    assert_eq!(reg.lost(), 0);
+    let report = reg.resync(&cfg, &venue, &resync(wall(1_500), 999), key(999));
+    assert_eq!(report.unwrap().ladder.lost, vec![c]);
+    assert_eq!(
+        reg.get(c).unwrap().state(),
+        OrdState::Terminal(TerminalKind::Lost)
+    );
+    assert_eq!(reg.lost(), 1);
+}
+
+#[test]
+fn a_settle_above_the_venues_lag_bound_still_governs_and_a_zero_bound_leaves_the_settle_alone() {
+    let none: &[VenueOrderSnapshot] = &[];
+    // The consumer's settle longer than the bound: absences count from the settle.
+    let venue = lagging(ms(500));
+    let cfg = settling(ms(800), 1);
+    assert_eq!(cfg.absence_settle(&venue), ms(800));
+    let mut reg = Registry::new();
+    let c = unknown(&mut reg);
+    for (n, w) in within(ms(800)).into_iter().enumerate() {
+        reg.on_resync(&cfg, &venue, w, none, key(n as u64));
+    }
+    assert_eq!(reg.get(c).unwrap().state(), OrdState::Unknown);
+    let applied = reg.on_resync(&cfg, &venue, wall(1_800), none, key(999));
+    assert_eq!(applied.lost, vec![c]);
+
+    // A venue declaring a snapshot that never lags: the consumer's settle alone, as before.
+    let venue = lagging(Duration::ZERO);
+    let cfg = settling(ms(50), 1);
+    assert_eq!(cfg.absence_settle(&venue), ms(50));
+    let mut reg = Registry::new();
+    let c = unknown(&mut reg);
+    assert!(
+        reg.on_resync(&cfg, &venue, wall(1_049), none, key(1))
+            .lost
+            .is_empty()
+    );
+    let applied = reg.on_resync(&cfg, &venue, wall(1_050), none, key(2));
+    assert_eq!(applied.lost, vec![c]);
 }
 
 #[test]

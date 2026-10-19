@@ -34,6 +34,7 @@ fn main() {
         nonce_scope: NonceScope::None,
         ordering_key: OrderingKey::VenueSeq,
         snapshot_source: SnapshotSource::Trustworthy,
+        snapshot_lag_bound: Duration::ZERO,
         events_echo_flags: true,
         sign_cost_hint_us: 0,
     };

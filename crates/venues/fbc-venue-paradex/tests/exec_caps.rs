@@ -534,3 +534,97 @@ fn the_resync_is_declared_two_reads_on_the_record_that_adds_the_declaration() {
         assert!(decision.contains(needle), "{needle} is not in the decision");
     }
 }
+
+/// FBC-i8lp's record: the one whose slug says a venue declares how long its open-order snapshot
+/// may lag, and its number as cited.
+fn lag_record() -> (String, String) {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../docs/decisions");
+    let mut found = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains("open-order-snapshot-may-lag"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(found.len(), 1, "{found:?}");
+    let path = found.pop().unwrap();
+    let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+    (name[..4].to_owned(), fs::read_to_string(path).unwrap())
+}
+
+/// The REST lag behind the stream each committed testnet run measured, in milliseconds: the
+/// "(b) REST lag behind the stream | at most N ms" line of its `report.md`.
+fn recorded_lags() -> Vec<(String, u64)> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../fixtures/paradex/exec-recorded");
+    let mut runs = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.starts_with("20"))
+        .collect::<Vec<_>>();
+    runs.sort();
+    runs.into_iter()
+        .map(|run| {
+            let report = fs::read_to_string(dir.join(&run).join("report.md")).unwrap();
+            let line = report
+                .lines()
+                .find(|l| l.starts_with("| (b) REST lag behind the stream |"))
+                .unwrap_or_else(|| panic!("{run} states no REST lag"));
+            let ms = line
+                .split("at most ")
+                .nth(1)
+                .and_then(|rest| rest.split(" ms").next())
+                .and_then(|n| n.trim().parse().ok())
+                .unwrap_or_else(|| panic!("{run}: {line}"));
+            (run, ms)
+        })
+        .collect()
+}
+
+#[test]
+fn paradex_declares_its_snapshot_lag_bound_with_margin_over_every_recorded_lag_and_below_the_samples_settle()
+ {
+    // FBC-i8lp: Paradex's GET /orders lagged the stream by at most 3480 ms over FBC-8xr's three
+    // testnet runs (decision 0094's answer (b)); the bound the venue declares is that, with
+    // margin, so no order on the Unknown ladder is Lost while GET /orders may not yet show it.
+    let bound = exec::exec_caps().order.snapshot_lag_bound;
+    let lags = recorded_lags();
+    assert_eq!(lags.len(), 3, "{lags:?}");
+    let max = lags.iter().map(|(_, ms)| *ms).max().unwrap();
+    assert_eq!(max, 3_480, "{lags:?}");
+    assert_eq!(bound, Duration::from_secs(6));
+    // At least half again the largest lag seen, for the send's own latency and the runs' few
+    // samples.
+    assert!(bound >= Duration::from_millis(max * 3 / 2), "{bound:?}");
+    // Below the samples' `testnet::SNAPSHOT_SETTLE` (10 s), so their settle still decides.
+    assert!(bound < Duration::from_secs(10), "{bound:?}");
+
+    // The value cites the recorded runs and the record that declares it.
+    let (number, text) = lag_record();
+    let source =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/exec/caps.rs")).unwrap();
+    let declared = source
+        .split("snapshot_lag_bound:")
+        .next()
+        .and_then(|before| before.rsplit("snapshot_reads:").next())
+        .expect("the declaration follows snapshot_reads");
+    assert!(
+        declared.contains("fixtures/paradex/exec-recorded/"),
+        "{declared}"
+    );
+    assert!(
+        declared.contains(&format!("decision {number}")),
+        "{declared}"
+    );
+    assert!(declared.contains("3480 ms"), "{declared}");
+    let context = section(&text, "## Context");
+    for (run, ms) in &lags {
+        let report = format!("fixtures/paradex/exec-recorded/{run}/report.md");
+        assert!(context.contains(&report), "{report} is not cited");
+        assert!(context.contains(&format!("{ms} ms")), "{run}: {ms} ms");
+    }
+    let decision = section(&text, "## Decision");
+    assert!(decision.contains("6 s"), "{decision}");
+    assert!(decision.contains("`snapshot_lag_bound`"), "{decision}");
+}
