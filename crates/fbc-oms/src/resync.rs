@@ -444,8 +444,12 @@ impl Registry {
         };
         if r.shown.contains_key(&cid) || r.shown_vids.contains_key(vid) {
             // The seed showed it, without our client id: what it showed places its fills, as
-            // for an order the seed held (Codex's r4316124604 on PR #171).
+            // for an order the seed held (Codex's r4316124604 on PR #171), a fill naming only
+            // our client id included (Codex's r4316366360).
             r.known.insert(cid);
+            if let Some(&cum) = r.shown_vids.get(vid) {
+                r.shown.entry(cid).or_insert(cum);
+            }
         } else {
             r.later.insert(cid);
         }
