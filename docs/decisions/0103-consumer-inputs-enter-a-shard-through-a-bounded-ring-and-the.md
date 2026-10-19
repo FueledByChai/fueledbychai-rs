@@ -45,10 +45,12 @@ shard's `IngestClock`.
    handler with the kind and bytes it was armed with; the consumer tells it from a push by the
    kind. Timers fire by deadline, a tie in the order armed. A run fires only timers armed before
    its current poll began, so a handler that re-arms with no delay yields to the rest of the
-   shard between firings. An arm is counted, and arms nothing, when the timers are inert, when
+   shard between firings, and each firing is charged to the task's coop budget as the ring's
+   inputs are, so a backlog of due timers yields to the shard's other members. An arm is counted, and arms nothing, when the timers are inert, when
    their inputs have ended, or when the delay lies past the end of the clock (0023's rule for
    such waits). The run ends once every sender has dropped and no timer is pending; its end, or
-   its drop, closes the ring and drops what was armed.
+   its drop (before its first poll included, as when the host drops it for another member's
+   error), closes the ring and drops what was armed.
 5. **Format version 9 keeps the sequence on the record.** 0101's kind 14 gains `ingest_seq`:
    flag byte 2 is an input the shard stamped, followed by the sequence (`u64`), then the bytes;
    0 (an annotation) and 1 (an input the consumer journaled itself) are written as version 8

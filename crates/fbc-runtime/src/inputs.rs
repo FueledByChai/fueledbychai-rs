@@ -267,16 +267,19 @@ impl ConsumerTimers {
         self.state.borrow().next
     }
 
-    /// Takes the first timer due at `now` that was armed before `horizon`.
-    fn take_due(&self, now: Instant, horizon: u64) -> Option<Pushed> {
-        let mut st = self.state.borrow_mut();
-        let key = st
-            .due
+    /// The first timer due at `now` that was armed before `horizon`.
+    fn first_due(&self, now: Instant, horizon: u64) -> Option<(Instant, u64)> {
+        let st = self.state.borrow();
+        st.due
             .keys()
             .take_while(|(deadline, _)| *deadline <= now)
             .find(|(_, order)| *order < horizon)
-            .copied()?;
-        st.due.remove(&key)
+            .copied()
+    }
+
+    /// Takes the timer armed at `key`.
+    fn remove(&self, key: (Instant, u64)) -> Option<Pushed> {
+        self.state.borrow_mut().due.remove(&key)
     }
 
     /// The earliest timer's deadline, and whether it was armed before `horizon`, once the run
@@ -387,10 +390,13 @@ impl<H: InputHandler> ConsumerInputs<H> {
 
     /// Takes every input as it comes, stamped, journaled and handed to the handler, until every
     /// sender has dropped and no timer is pending. Once it returns, or is dropped, the ring
-    /// refuses every push and the timers arm nothing.
-    pub async fn run(&mut self) {
+    /// refuses every push and the timers arm nothing, a run dropped before its first poll
+    /// included (Codex P1 r4311000152 on PR #172).
+    pub fn run(&mut self) -> impl Future<Output = ()> + '_ {
         let ConsumerInputs { ring, handler } = self;
-        ring.run(handler).await;
+        // Made before the future is, so dropping it unpolled ends the inputs too.
+        let ending = Ending(ring);
+        ending.run(handler)
     }
 }
 
@@ -420,14 +426,6 @@ impl Ring {
         Ok((ring, sender))
     }
 
-    /// [`ConsumerInputs::run`], handing each input to `handler`.
-    async fn run(&mut self, handler: &mut dyn InputHandler) {
-        let ending = Ending(self);
-        let mut sleep = None;
-        let ring = &mut *ending.0;
-        poll_fn(|cx| ring.poll_run(handler, cx, &mut sleep)).await;
-    }
-
     /// Ends the inputs: the ring refuses every push from now on, and the timers arm nothing.
     fn end(&mut self) {
         self.rx.close();
@@ -445,9 +443,15 @@ impl Ring {
     ) -> Poll<()> {
         let horizon = self.timers.horizon();
         loop {
-            if let Some(fired) = self.timers.take_due(Instant::now(), horizon) {
-                self.counters.fired += 1;
-                self.take(handler, fired);
+            if let Some(key) = self.timers.first_due(Instant::now(), horizon) {
+                // Charged to the task's coop budget as the ring's inputs are, so a backlog of
+                // due timers yields to the shard's other members (Codex P1 r4311000162 on PR
+                // #172).
+                std::task::ready!(tokio::task::coop::poll_proceed(cx)).made_progress();
+                if let Some(fired) = self.timers.remove(key) {
+                    self.counters.fired += 1;
+                    self.take(handler, fired);
+                }
                 continue;
             }
             if !self.closed {
@@ -518,6 +522,14 @@ struct Ending<'a>(&'a mut Ring);
 impl Drop for Ending<'_> {
     fn drop(&mut self) {
         self.0.end();
+    }
+}
+
+impl Ending<'_> {
+    /// [`ConsumerInputs::run`], handing each input to `handler`.
+    async fn run(self, handler: &mut dyn InputHandler) {
+        let mut sleep = None;
+        poll_fn(|cx| self.0.poll_run(handler, cx, &mut sleep)).await;
     }
 }
 

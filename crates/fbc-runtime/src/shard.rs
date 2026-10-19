@@ -134,8 +134,11 @@ impl<'a> Member<'a> {
 
     /// The consumer's own inputs: [`ConsumerInputs::run`], which never fails.
     pub fn inputs<H: InputHandler + 'a>(inputs: &'a mut ConsumerInputs<H>) -> Member<'a> {
+        // Called now, not on the first poll: a member dropped unpolled ends the inputs too
+        // (Codex P1 r4311000152 on PR #172).
+        let run = inputs.run();
         let run = async move {
-            inputs.run().await;
+            run.await;
             Ok(())
         };
         let orders = None;
