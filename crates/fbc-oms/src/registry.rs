@@ -427,9 +427,15 @@ impl Registry {
         let exposure = self.exposure_ending(placed.inst, placed.side, &[cid], ending);
         let state = self.entries.admits(placed.inst);
         let suppressed = self.orphans.cooldown(placed.inst).is_some();
-        permit::judge_amend(rec, caps, (state, suppressed), &exposure, (px, qty, reducing))
-            .map(|_| ())
-            .map_err(PlanRefusal::Amend)
+        permit::judge_amend(
+            rec,
+            caps,
+            (state, suppressed),
+            &exposure,
+            (px, qty, reducing),
+        )
+        .map(|_| ())
+        .map_err(PlanRefusal::Amend)
     }
 
     /// What `inst` and `side` hold before an order is judged against the pre-trade caps: the
