@@ -154,7 +154,8 @@ impl InputHandler for Operator {
         }
         if input.kind == START {
             let wake = b"wake".to_vec();
-            self.timers.arm(ms(20), TrafficClass::Normal, WAKE, wake);
+            let armed = self.timers.arm(ms(20), TrafficClass::Normal, WAKE, wake);
+            armed.expect("the inputs' run takes the wake while the session runs");
         }
         self.steps.borrow_mut().push(Step::Input(input));
     }

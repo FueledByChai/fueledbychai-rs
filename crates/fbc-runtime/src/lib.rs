@@ -157,7 +157,7 @@ pub use exec_session::{
     ExecControl, ExecCounters, ExecHandler, ExecSession, ExecSessionConfig, ExecSessionError,
 };
 pub use inputs::{
-    ConsumerInput, ConsumerInputs, ConsumerInputsConfig, ConsumerTimers, InputCounters,
+    ArmRefusal, ConsumerInput, ConsumerInputs, ConsumerInputsConfig, ConsumerTimers, InputCounters,
     InputHandler, InputRefusal, InputSender, InputsError, MAX_INPUT_CAPACITY,
 };
 pub use journal::Journal;
