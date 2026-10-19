@@ -96,6 +96,9 @@ pub struct IngestClock {
     next: Rc<Cell<u64>>,
     origin: Instant,
     handling: Rc<Cell<Option<Stamp>>>,
+    /// The next ingest sequence as the shard host's last decide pass began, set once that
+    /// pass's ladder was taken: every input before it has been decided on (FBC-066n).
+    decided: Rc<Cell<u64>>,
     /// A closed-loop replay's clock reads no wall clock ([`IngestClock::replayed`]).
     replayed: Option<Rc<Cell<Replayed>>>,
 }
@@ -133,6 +136,7 @@ impl IngestClock {
             next: Rc::new(Cell::new(0)),
             origin: Instant::now(),
             handling: Rc::new(Cell::new(None)),
+            decided: Rc::new(Cell::new(0)),
             replayed: None,
         }
     }
@@ -242,6 +246,17 @@ impl IngestClock {
     /// The ingest sequence the next input will be stamped with.
     pub(crate) fn next_seq(&self) -> u64 {
         self.next.get()
+    }
+
+    /// The shard host decided on every input before `next`: its pass began with `next` the
+    /// next ingest sequence, and that pass's ladder has been taken.
+    pub(crate) fn decided(&self, next: u64) {
+        self.decided.set(next);
+    }
+
+    /// Whether an input has been stamped that no decide pass has covered yet.
+    pub(crate) fn undecided(&self) -> bool {
+        self.decided.get() != self.next.get()
     }
 
     /// The stamp of the input whose events a handler is being handed, if one is: a command

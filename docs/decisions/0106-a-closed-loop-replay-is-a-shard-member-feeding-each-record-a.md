@@ -32,12 +32,18 @@ journal at their ingest positions (0103).
    already stamped, so ingest order never goes back in time.
 2. **The member.** `Member::md_replay(replay, ClosedLoop { clock, records, settle, stops })`
    drives an `MdReplay` as one of the shard's members. Each record it feeds (an input or control
-   record of its connection, and a consumer input the shard stamped while an input handler is
-   set) first waits for its recorded instant on the replayed clock, so every answer a session's
+   record of its connection, a ping, pong or close frame its live session stamped included, and
+   a consumer input the shard stamped while an input handler is set) first waits for its
+   recorded instant on the replayed clock, so every answer a session's
    peer has due before it is read first, the session's own sleep being the earlier timer. The
    record is then fed as `MdReplay::feed` feeds it, with each input restamped: the shard's next
    ingest sequence, its recorded instant on both clocks (moved on only as item 1 says), its
-   kernel receive time and connection. Its events reach the handler with the clock naming the
+   kernel receive time and connection. A ping, pong or close reaches no codec but takes its
+   sequence as live, and an HTTP result held until its epoch's codec is built takes its sequence
+   as it is answered, so a sequence and its events always reach the shard together (Codex P2
+   r4315555320, r4315555331 on PR #178). The clock is set for the replay only for the length of
+   each synchronous feed, so a replay whose run is dropped mid-play stamps with the recorded
+   stamps again when fed on its own (Codex P2 r4315555339). Its events reach the handler with the clock naming the
    input as handled (0100 item 6), and a consumer input goes back to the input handler with the
    next ingest sequence at its recorded time (0103). The host sees these inputs as it sees any
    member's: it drains, journals a `Cycle` record, runs the decide pass and submits its ladder,
@@ -49,8 +55,12 @@ journal at their ingest positions (0103).
    its configured latency, and the session reads the answer at that instant. The consumer's
    timers arm through `ConsumerTimers::inert`: each firing the live shard took comes back from
    the journal (0103).
-4. **The end.** Once the records end, the member waits `settle` past the last record's instant,
-   so the answers due by then are read, then drops `stops`, the order-entry sessions' controls,
+4. **The end.** Once the records end, the member waits `settle` past the last instant the
+   journal records, of a record fed or passed over (Codex P2 r4315555312), so the answers due by
+   then are read; yields once, so every member woken at that instant is polled; waits until the
+   host has run a decide pass, and taken its ladder, since the last input was stamped (the host
+   marks the shard clock after each pass), so what was due at the settle instant is read and
+   decided on (Codex P2 r4315555356); then drops `stops`, the order-entry sessions' controls,
    which ends them and the host's run with them. A live clock (`ReplayFailure::LiveClock`), a
    record the journal cannot read (`ReplayFailure::Journal`) and a damaged text frame
    (`ReplayFailure::NotUtf8`, naming the record's recorded ingest sequence) each end the member
