@@ -35,7 +35,9 @@ runtime must never depend on it (design §3).
    shard's clock and journaled at that stamp before it is decoded, 0006, 0078), and fbc-oms's
    authorization re-checked at each encode. The session sleeps until the peer's earliest due
    instant, and reads each frame the peer gives as it reads one off a socket: text when it is
-   UTF-8, binary otherwise, as it writes them. An epoch's end closes the stream, and so does a
+   UTF-8, binary otherwise, as it writes them. Frames the peer gave and the session had not
+   read when an epoch ended wait with the stream, and the next epoch reads them first (Codex
+   r4313036604 on PR #175). An epoch's end closes the stream, and so does a
    run dropped with its epoch open, as a dropped socket closes its connection. The session core
    is generic over what it writes and reads on (`Wire`) and how a connection attempt opens it
    (`Dial`); the market-data session still runs on its WebSocket.
