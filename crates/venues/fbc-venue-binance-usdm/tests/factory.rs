@@ -38,11 +38,12 @@ fn the_factory_declares_market_data_only_with_no_exec_codec_or_endpoint() {
     assert!(BinanceUsdm.exec_codec(&cfg, Secrets::new()).is_none());
     assert!(BinanceUsdm.test_connection(&cfg, Secrets::new()).is_none());
     assert_eq!(BinanceUsdm.plan_exec(&cfg), Ok(Vec::new()));
-    // Discovery and the Java-era ticker rule are not built yet (FBC-fwf): both say so.
+    // Discovery and the Java-era ticker rule are built (FBC-fwf, tests/discover.rs): neither
+    // answers that it has none.
     let ticker = BinanceUsdm.parse_fbc_common_symbol("BTC/USDT");
-    assert_eq!(ticker, Err(SymbolError::NoRule));
+    assert_ne!(ticker, Err(SymbolError::NoRule));
     let discovered = BinanceUsdm.discover(&cfg).err();
-    assert_eq!(discovered, Some(VenueError::NoDiscovery));
+    assert_eq!(discovered, None);
     assert_eq!(BinanceUsdm.id(), "BINANCE_FUTURES");
     // Never promoted past recording: it is the reference feed, not a traded venue.
     assert_eq!(caps.readiness_ceiling, Readiness::Record);
