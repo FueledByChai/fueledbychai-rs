@@ -435,6 +435,24 @@ pub enum Record {
         last_ingest_seq: u64,
         instruments: Vec<InstrumentId>,
     },
+    /// A record of the consumer's own (FBC-hxkm, decision 0101): one of its inputs (an
+    /// operator command, a calendar or configuration reload, a configuration hash) or an
+    /// annotation (a decide pass's summary), written through the shard's
+    /// [`JournalSink`](crate::JournalSink) where it happened in the shard's total order, under
+    /// the traffic class the consumer picks. `at` is the consumer's monotonic time for it;
+    /// `kind` is the consumer's own number for what `bytes` holds; `input` says it is an
+    /// input, which a replay hands back to the consumer at its place, rather than an
+    /// annotation, which a replay passes over as it does an outbound frame.
+    ///
+    /// The library never reads `bytes`: nothing about the consumer's strategy enters this
+    /// repository (decision 0001). They are written verbatim, with no redaction span, so the
+    /// consumer puts no credential in them; `Debug` shows them by length only.
+    Consumer {
+        at: MonoNs,
+        kind: u16,
+        input: bool,
+        bytes: Opaque,
+    },
 }
 
 impl Record {

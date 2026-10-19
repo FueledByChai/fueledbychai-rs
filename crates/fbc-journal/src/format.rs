@@ -92,6 +92,8 @@ const CYCLE: u8 = 11;
 const INBOUND_CONTROL: u8 = 12;
 // Version 7.
 const RPC_TIMEOUT: u8 = 13;
+// Version 8.
+const CONSUMER: u8 = 14;
 
 // Field-less enums are a byte: the value's place in its table. Encoding matches exhaustively,
 // so a new variant fails to compile until it has a byte; decoding indexes the table.
@@ -447,6 +449,10 @@ fn encode_body(
             e.u8(RPC_TIMEOUT);
             e.stamp(stamp);
             e.u64(rpc.0);
+        }
+        Record::Consumer { .. } => {
+            let _ = CONSUMER;
+            return Err(JournalError::Unencodable("consumer record"));
         }
     }
     e.within()
@@ -1955,7 +1961,6 @@ mod tests {
     /// it as a kind it does not have.
     #[test]
     fn an_rpc_timeout_round_trips_and_is_refused_before_version_7() {
-        assert_eq!(VERSION, 7);
         let record = Record::RpcTimeout {
             stamp: stamp(),
             rpc: RpcId(u64::MAX - 1),
@@ -1976,6 +1981,108 @@ mod tests {
         let mut long = body.clone();
         long.push(0);
         assert_eq!(decode(&long), Err("bytes after the record"));
+    }
+
+    /// FBC-hxkm (decision 0101): a consumer record round-trips with its time, kind, input flag
+    /// and bytes as written, nothing in it redacted; a segment of version 7 or earlier, which
+    /// cannot hold one, refuses it as a kind it does not have.
+    #[test]
+    fn a_consumer_record_round_trips_and_is_refused_before_version_8() {
+        assert_eq!(VERSION, 8);
+        let bytes = vec![0xff, 0, b'x', 0xc3];
+        for (kind, input) in [
+            (0, false),
+            (1, true),
+            (u16::MAX, true),
+            (u16::MAX - 1, false),
+        ] {
+            let record = Record::Consumer {
+                at: MonoNs(u64::MAX - 3),
+                kind,
+                input,
+                bytes: Opaque(bytes.clone()),
+            };
+            assert_eq!(record.blanked(), record);
+            assert!(record.digests(&key()).is_empty());
+            let mut body = Vec::new();
+            encode(&record, &key(), &mut body).unwrap();
+            // The kind byte, the time, the consumer's kind, the flag and the bytes: no more.
+            assert_eq!(body.len(), 1 + 8 + 2 + 1 + 4 + bytes.len());
+            assert_eq!(body[0], CONSUMER);
+            assert_eq!(body[11], u8::from(input));
+            assert_eq!(decode(&body).unwrap(), (record.clone(), Vec::new()));
+            for version in OLDEST_READABLE..8 {
+                assert_eq!(decode_version(&body, version), Err("record kind"));
+            }
+        }
+        // No bytes at all.
+        let empty = Record::Consumer {
+            at: MonoNs(0),
+            kind: 9,
+            input: false,
+            bytes: Opaque(Vec::new()),
+        };
+        assert_eq!(round_trip(&empty), empty);
+    }
+
+    #[test]
+    fn a_damaged_consumer_record_is_refused_with_what_was_wrong() {
+        let record = Record::Consumer {
+            at: MonoNs(5),
+            kind: 2,
+            input: true,
+            bytes: Opaque(b"Start".to_vec()),
+        };
+        let mut good = Vec::new();
+        encode(&record, &key(), &mut good).unwrap();
+        let with_flag = |flag: u8| {
+            let mut body = good.clone();
+            body[11] = flag;
+            body
+        };
+        let cases: Vec<(Vec<u8>, Bad)> = vec![
+            // An input flag that is neither 0 nor 1.
+            (with_flag(2), "consumer input flag"),
+            (with_flag(0xff), "consumer input flag"),
+            // Cut short in the time, the kind, the flag and the bytes, and a length past them.
+            (good[..5].to_vec(), "record ends early"),
+            (good[..10].to_vec(), "record ends early"),
+            (good[..11].to_vec(), "record ends early"),
+            (good[..good.len() - 1].to_vec(), "record ends early"),
+            (
+                [&good[..12], &words(&[u32::MAX])[..], b"Start"].concat(),
+                "record ends early",
+            ),
+            ([good.clone(), vec![0]].concat(), "bytes after the record"),
+        ];
+        for (body, want) in cases {
+            assert_eq!(decode(&body), Err(want), "{body:?}");
+        }
+    }
+
+    /// A consumer record's bytes take room like any payload's: one too large for the room left
+    /// is refused, leaving the buffer as it was, and its `Debug` shows them by length only.
+    #[test]
+    fn a_consumer_record_is_sized_by_its_bytes_and_shows_them_by_length() {
+        let record = Record::Consumer {
+            at: MonoNs(1),
+            kind: 1,
+            input: true,
+            bytes: Opaque(b"operator Stop".to_vec()),
+        };
+        let mut body = Vec::new();
+        encode(&record, &key(), &mut body).unwrap();
+        let mut short = vec![7];
+        assert!(matches!(
+            encode_within(&record, &key(), &mut short, body.len() - 1),
+            Err(JournalError::TooLarge)
+        ));
+        assert_eq!(short, [7]);
+        let shown = format!("{record:?}");
+        assert!(
+            !shown.contains("Stop") && shown.contains("len: 13"),
+            "{shown}"
+        );
     }
 
     /// FBC-drf: a control frame's payload is too large for the room left like any record's,
@@ -2585,7 +2692,7 @@ mod tests {
 
         /// One owned record of a kind no [`RecordRef`] borrows.
         fn owned(&mut self) -> Record {
-            match self.below(11) {
+            match self.below(12) {
                 0 => Record::Outbound {
                     at: MonoNs(self.next()),
                     conn: conn(),
@@ -2634,6 +2741,12 @@ mod tests {
                 9 => Record::RpcTimeout {
                     stamp: self.stamp(),
                     rpc: RpcId(self.next()),
+                },
+                10 => Record::Consumer {
+                    at: MonoNs(self.next()),
+                    kind: self.next() as u16,
+                    input: self.flip(),
+                    bytes: Opaque(self.any_bytes()),
                 },
                 8 => Record::InboundControl {
                     stamp: self.stamp(),
