@@ -358,7 +358,11 @@ rather than guess.
     one engine, greeting each opened stream with a frame the codec reports as authenticated,
     counting what the engine refuses, and gapping the engine's books on each market-data
     epoch's end (`SimEngine::end_epoch`), one per bracket, 0104 (`tests/hosted.rs`, with
-    `fbc-oms` and the runtime's toy market-data venue by path);
+    `fbc-oms` and the runtime's toy market-data venue by path); a journaled toy market-data
+    day replayed through decoder replay into a fresh peer per bracket, with a fixed command
+    script authorized through `fbc-oms` at journal positions, to the same outcomes, order
+    updates and fills on every run, latency measured in the recorded stamps (FBC-w9g,
+    `tests/replayed.rs`);
     still planned: amends, batches, queries and injected
     orders, FBC-nv2), `crates/fbc-conformance` (the adapter conformance kit,
     0025; it depends on `fbc-runtime`, `fbc-oms`, `fbc-journal` and `fbc-core`, never on a

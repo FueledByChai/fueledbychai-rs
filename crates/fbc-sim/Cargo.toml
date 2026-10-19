@@ -17,7 +17,9 @@ fbc-runtime = { path = "../fbc-runtime" }
 
 [dev-dependencies]
 # The hosted test (tests/hosted.rs) arms each bracket's order entry through fbc-oms and runs the
-# runtime's toy market-data venue, included by path, over a WebSocket of its own on 127.0.0.1.
+# runtime's toy market-data venue, included by path, over a WebSocket of its own on 127.0.0.1;
+# the replayed test (tests/replayed.rs) journals that venue's session with fbc-journal and
+# replays it through SimVenue.
 fbc-oms = { path = "../fbc-oms" }
 fbc-journal = { path = "../fbc-journal" }
 tokio = { workspace = true, features = ["rt", "net", "io-util", "macros", "sync", "time", "test-util"] }
