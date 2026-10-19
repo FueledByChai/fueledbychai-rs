@@ -1561,6 +1561,58 @@ fn a_reducer_classified_while_too_young_to_amend_still_waits_for_the_emulated_ca
 }
 
 #[test]
+fn a_counted_reducer_grown_by_an_unclassified_quote_is_built_before_the_emulated_place() {
+    // Reviewer B B13: long 10, an ask of 3 placed classified reducing at level 1 and an
+    // emulated exit at level 0, sized to the 7 left. The ask's quote turns unclassified and
+    // grows to 5: the ask is still counted a reducer, so its growth waits for the exit's cancel.
+    // Once the exit is terminal, the ask's amend is built among the reducers, before the
+    // emulated place, which is sized with it counted: never an emulated place sized against the
+    // ask's old resting, then cancelled by the ask's growth, pass after pass.
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = amending(conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]));
+    let exit = maker_exit(10_010, 10, ReduceFallback::EmulateReduceOnly);
+    let first = book().with(Side::Sell, 0, exit.clone()).with(
+        Side::Sell,
+        1,
+        post_only_ask(10_030, 3, true),
+    );
+    let plan = plan_and_send(&mut p, &first, &mut reg, &caps, &mut mint, MonoNs(0));
+    let emulated = at_level(&plan, Side::Sell, 0).cid;
+    let ask = at_level(&plan, Side::Sell, 1).cid;
+    assert_emulated(placed(at_level(&plan, Side::Sell, 0)), 7);
+    ack(&mut reg, emulated, "v0");
+    ack(&mut reg, ask, "v1");
+    let next =
+        book()
+            .with(Side::Sell, 0, exit)
+            .with(Side::Sell, 1, post_only_ask(10_030, 5, false));
+    let pass = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER);
+    assert_eq!(shape(&pass), vec![(Stage::Cancel, "cancel", Side::Sell, 0)]);
+    assert_eq!(pass.commands[0].cid, emulated);
+    assert_eq!(waiting(&pass), vec![(Side::Sell, 1)]);
+    cancelled(&mut reg, emulated, Side::Sell, "v0", 2);
+    let after = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER2);
+    assert!(after.refused.is_empty(), "{:?}", refusals(&after));
+    assert_eq!(
+        shape(&after),
+        vec![
+            (Stage::Reducing, "amend", Side::Sell, 1),
+            (Stage::Reducing, "place", Side::Sell, 0),
+        ]
+    );
+    assert_eq!(after.commands[0].cid, ask);
+    assert_eq!(amended_total(&after.commands[0]), lots(5));
+    assert_emulated(placed(&after.commands[1]), 5);
+    let replaced = after.commands[1].cid;
+    ack(&mut reg, replaced, "v2");
+    // Nothing churns: the ask's amend in flight, the replacement exit rests untouched.
+    let settled = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER3);
+    assert!(settled.commands.is_empty(), "{:?}", shape(&settled));
+}
+
+#[test]
 fn an_emulated_order_whose_quote_becomes_ordinary_stays_within_what_is_left_to_reduce() {
     // Codex r4310102183: long 10, an emulated exit of 5 and a reduce-only ask of 5 rest. The
     // exit's quote becomes an ordinary post-only ask of 10 with the same wire flags, at a new
