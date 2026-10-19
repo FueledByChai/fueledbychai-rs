@@ -20,6 +20,8 @@
 #[path = "common/arm.rs"]
 mod arm;
 mod common;
+#[path = "common/venue.rs"]
+mod venue;
 
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
@@ -220,7 +222,9 @@ fn plan_and_send(
     mint: &mut CidMint,
     now: MonoNs,
 ) -> Plan {
-    let plan = planner.plan(desired, reg, caps, ACCT, mint, now).unwrap();
+    let plan = planner
+        .plan(desired, reg, &venue::of(caps), ACCT, mint, now)
+        .unwrap();
     for (n, p) in plan.commands.iter().enumerate() {
         if let VenueCommand::Cancel(_) = p.auth.command() {
             let rpc = RpcId(1_000 + now.0 + n as u64);
@@ -986,7 +990,14 @@ fn a_crossing_order_never_sent_leaves_its_attempt_to_be_planned_again() {
         let mut p = planner();
         let desired = book().with_crossing(Side::Sell, cross(9_900, 10, 1));
         let plan = p
-            .plan(&desired, &mut reg, &caps, ACCT, &mut mint, MonoNs(0))
+            .plan(
+                &desired,
+                &mut reg,
+                &venue::of(&caps),
+                ACCT,
+                &mut mint,
+                MonoNs(0),
+            )
             .unwrap();
         let mut commands = plan.commands;
         let c = commands[0].cid;

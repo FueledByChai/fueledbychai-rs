@@ -15,6 +15,8 @@
 #[path = "common/arm.rs"]
 mod arm;
 mod common;
+#[path = "common/venue.rs"]
+mod venue;
 
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
@@ -228,7 +230,9 @@ fn plan_and_send(
     mint: &mut CidMint,
     now: MonoNs,
 ) -> Plan {
-    let plan = planner.plan(desired, reg, caps, ACCT, mint, now).unwrap();
+    let plan = planner
+        .plan(desired, reg, &venue::of(caps), ACCT, mint, now)
+        .unwrap();
     for (n, p) in plan.commands.iter().enumerate() {
         let rpc = RpcId(1_000 + n as u64);
         match p.auth.command() {
@@ -304,7 +308,14 @@ fn the_plan_comes_out_cancels_then_reducing_orders_then_amends_then_adds() {
         .with(Side::Sell, 0, reducing(quote(10_010, 2)))
         .with(Side::Sell, 1, reducing(quote(10_015, 3)));
     let plan = p
-        .plan(&next, &mut reg, &amending(), ACCT, &mut mint, LATER)
+        .plan(
+            &next,
+            &mut reg,
+            &venue::of(&amending()),
+            ACCT,
+            &mut mint,
+            LATER,
+        )
         .unwrap();
     assert_eq!(
         shape(&plan),
@@ -404,7 +415,7 @@ fn a_change_amends_where_the_venues_order_caps_allow_it() {
         .plan(
             &book().with(Side::Buy, 0, quote(10_010, 8)),
             &mut reg,
-            &amending(),
+            &venue::of(&amending()),
             ACCT,
             &mut mint,
             LATER,
@@ -675,7 +686,14 @@ fn nothing_is_placed_at_a_level_whose_order_is_pending_new_or_unknown_until_it_i
         let moved = book().with(Side::Buy, 0, quote(10_010, 7));
         // PendingNew: occupied, however long the wait.
         let plan = p
-            .plan(&moved, &mut reg, &amending(), ACCT, &mut mint, LATER)
+            .plan(
+                &moved,
+                &mut reg,
+                &venue::of(&amending()),
+                ACCT,
+                &mut mint,
+                LATER,
+            )
             .unwrap();
         assert!(plan.commands.is_empty());
         assert_eq!(
@@ -691,7 +709,14 @@ fn nothing_is_placed_at_a_level_whose_order_is_pending_new_or_unknown_until_it_i
             reg.on_outcome(c, OrderOp::Place, &item, &SubmitOutcome::Unknown, MonoNs(2))
                 .unwrap();
             let plan = p
-                .plan(&moved, &mut reg, &amending(), ACCT, &mut mint, LATER)
+                .plan(
+                    &moved,
+                    &mut reg,
+                    &venue::of(&amending()),
+                    ACCT,
+                    &mut mint,
+                    LATER,
+                )
                 .unwrap();
             assert!(plan.commands.is_empty());
             assert_eq!(
@@ -703,7 +728,14 @@ fn nothing_is_placed_at_a_level_whose_order_is_pending_new_or_unknown_until_it_i
         // Terminal (the venue ended it): the level is free and the quote is placed.
         cancelled(&mut reg, c, Side::Buy, "v-pending", 10);
         let plan = p
-            .plan(&moved, &mut reg, &amending(), ACCT, &mut mint, LATER)
+            .plan(
+                &moved,
+                &mut reg,
+                &venue::of(&amending()),
+                ACCT,
+                &mut mint,
+                LATER,
+            )
             .unwrap();
         assert_eq!(shape(&plan), vec![(Stage::Add, "place", Side::Buy, 0)]);
         assert_ne!(plan.commands[0].cid, c);
@@ -752,7 +784,7 @@ fn an_order_on_the_unknown_ladder_holds_its_level() {
         .plan(
             &book().with(Side::Buy, 0, quote(10_020, 5)),
             &mut reg,
-            &amending(),
+            &venue::of(&amending()),
             ACCT,
             &mut mint,
             LATER,
@@ -787,9 +819,16 @@ fn a_level_no_longer_wanted_is_cancelled_once_and_its_order_awaits_its_acknowled
     // A quantity of zero is no order at the level, the same as none.
     let zero = book().with(Side::Buy, 0, quote(10_000, 0));
     assert_eq!(
-        p.plan(&zero, &mut reg, &amending(), ACCT, &mut mint, LATER)
-            .unwrap()
-            .awaiting_ack,
+        p.plan(
+            &zero,
+            &mut reg,
+            &venue::of(&amending()),
+            ACCT,
+            &mut mint,
+            LATER
+        )
+        .unwrap()
+        .awaiting_ack,
         vec![c]
     );
     // Acknowledged: the cancel is built, and once sent not built again.
@@ -801,10 +840,17 @@ fn a_level_no_longer_wanted_is_cancelled_once_and_its_order_awaits_its_acknowled
     // Terminal: the planner forgets the level.
     cancelled(&mut reg, c, Side::Buy, "v-Buy-0", 10);
     assert!(
-        p.plan(&empty, &mut reg, &amending(), ACCT, &mut mint, LATER)
-            .unwrap()
-            .commands
-            .is_empty()
+        p.plan(
+            &empty,
+            &mut reg,
+            &venue::of(&amending()),
+            ACCT,
+            &mut mint,
+            LATER
+        )
+        .unwrap()
+        .commands
+        .is_empty()
     );
     assert_eq!(p.order_at(ACCT, INST, Side::Buy, 0), None);
 }
@@ -885,7 +931,7 @@ fn a_level_whose_replaced_amend_is_unconfirmed_is_held_until_it_settles(refused:
         .plan(
             &book().with(Side::Buy, 0, quote(10_004, 5)),
             &mut reg,
-            &amending(),
+            &venue::of(&amending()),
             ACCT,
             &mut mint,
             LATER,
@@ -898,7 +944,14 @@ fn a_level_whose_replaced_amend_is_unconfirmed_is_held_until_it_settles(refused:
     );
     // Pulled while the amend is in flight: a cancel, sent, then refused or never sent.
     let pulled = p
-        .plan(&book(), &mut reg, &amending(), ACCT, &mut mint, LATER)
+        .plan(
+            &book(),
+            &mut reg,
+            &venue::of(&amending()),
+            ACCT,
+            &mut mint,
+            LATER,
+        )
         .unwrap();
     assert_eq!(
         shape(&pulled),
@@ -922,7 +975,7 @@ fn a_level_whose_replaced_amend_is_unconfirmed_is_held_until_it_settles(refused:
             .plan(
                 &book().with(Side::Buy, 0, quote(px, 5)),
                 &mut reg,
-                &amending(),
+                &venue::of(&amending()),
                 ACCT,
                 &mut mint,
                 then,
@@ -938,7 +991,14 @@ fn a_level_whose_replaced_amend_is_unconfirmed_is_held_until_it_settles(refused:
     reg.apply_update(&stated, ordered(1, 3));
     let moved = book().with(Side::Buy, 0, quote(10_020, 5));
     let still = p
-        .plan(&moved, &mut reg, &amending(), ACCT, &mut mint, then)
+        .plan(
+            &moved,
+            &mut reg,
+            &venue::of(&amending()),
+            ACCT,
+            &mut mint,
+            then,
+        )
         .unwrap();
     assert!(still.commands.is_empty());
     assert_eq!(held(&still), vec![(Side::Buy, 0, HeldReason::InFlight)]);
@@ -946,7 +1006,14 @@ fn a_level_whose_replaced_amend_is_unconfirmed_is_held_until_it_settles(refused:
     reg.apply_update(&stated, ordered(2, 4));
     assert!(!reg.get(c).unwrap().amend_unconfirmed());
     let settled = p
-        .plan(&moved, &mut reg, &amending(), ACCT, &mut mint, then)
+        .plan(
+            &moved,
+            &mut reg,
+            &venue::of(&amending()),
+            ACCT,
+            &mut mint,
+            then,
+        )
         .unwrap();
     assert_eq!(shape(&settled), vec![(Stage::Amend, "amend", Side::Buy, 0)]);
     assert!(settled.held.is_empty());
@@ -1017,7 +1084,14 @@ fn a_refused_replace_cancel_leaves_the_order_to_be_planned_afresh(refused: Submi
         },
     );
     let replace = p
-        .plan(&ioc, &mut reg, &amending(), ACCT, &mut mint, LATER)
+        .plan(
+            &ioc,
+            &mut reg,
+            &venue::of(&amending()),
+            ACCT,
+            &mut mint,
+            LATER,
+        )
         .unwrap();
     assert_eq!(
         shape(&replace),
@@ -1025,7 +1099,14 @@ fn a_refused_replace_cancel_leaves_the_order_to_be_planned_afresh(refused: Submi
     );
     // Not reported sent: built again at the next pass, whatever the level wants.
     let unreported = p
-        .plan(&same, &mut reg, &amending(), ACCT, &mut mint, LATER)
+        .plan(
+            &same,
+            &mut reg,
+            &venue::of(&amending()),
+            ACCT,
+            &mut mint,
+            LATER,
+        )
         .unwrap();
     assert_eq!(
         shape(&unreported),
@@ -1065,7 +1146,14 @@ fn a_refused_carried_through_cancel_leaves_the_order_to_be_planned_afresh(refuse
     assert_eq!(pulled.awaiting_ack, vec![c]);
     ack(&mut reg, c, "v-Buy-0");
     let carried = p
-        .plan(&same, &mut reg, &amending(), ACCT, &mut mint, LATER)
+        .plan(
+            &same,
+            &mut reg,
+            &venue::of(&amending()),
+            ACCT,
+            &mut mint,
+            LATER,
+        )
         .unwrap();
     assert_eq!(
         shape(&carried),
@@ -1130,7 +1218,14 @@ fn an_order_is_changed_only_past_a_threshold_and_once_it_is_the_minimum_age() {
     // 1 tick (1 bp) and 1 lot: under both thresholds, kept, however old.
     let small = book().with(Side::Buy, 0, quote(10_001, 6));
     let plan = p
-        .plan(&small, &mut reg, &amending(), ACCT, &mut mint, LATER)
+        .plan(
+            &small,
+            &mut reg,
+            &venue::of(&amending()),
+            ACCT,
+            &mut mint,
+            LATER,
+        )
         .unwrap();
     assert!(plan.commands.is_empty() && plan.held.is_empty());
     // 2 ticks (2 bp), or 2 lots: changed, but not before the minimum age.
@@ -1140,7 +1235,14 @@ fn an_order_is_changed_only_past_a_threshold_and_once_it_is_the_minimum_age() {
         book().with(Side::Buy, 0, quote(10_000, 3)),
     ] {
         let plan = p
-            .plan(&desired, &mut reg, &amending(), ACCT, &mut mint, young)
+            .plan(
+                &desired,
+                &mut reg,
+                &venue::of(&amending()),
+                ACCT,
+                &mut mint,
+                young,
+            )
             .unwrap();
         assert!(plan.commands.is_empty());
         assert_eq!(held(&plan), vec![(Side::Buy, 0, HeldReason::Young)]);
@@ -1185,7 +1287,14 @@ fn a_market_in_cancel_only_or_killed_gets_no_place_or_amend_but_gets_its_cancels
             .with(Side::Buy, 2, quote(9_980, 5))
             .with(Side::Sell, 0, reducing(quote(10_010, 5)));
         let plan = p
-            .plan(&desired, &mut reg, &amending(), ACCT, &mut mint, LATER)
+            .plan(
+                &desired,
+                &mut reg,
+                &venue::of(&amending()),
+                ACCT,
+                &mut mint,
+                LATER,
+            )
             .unwrap();
         assert_eq!(shape(&plan), vec![(Stage::Cancel, "cancel", Side::Buy, 1)]);
         assert_eq!(
@@ -1213,7 +1322,14 @@ fn a_market_in_exit_gets_only_its_exit_orders() {
             .with(Side::Buy, 0, quote(9_990, 5))
             .with(Side::Sell, 0, reducing(quote(10_010, 5)));
     let plan = p
-        .plan(&desired, &mut reg, &amending(), ACCT, &mut mint, LATER)
+        .plan(
+            &desired,
+            &mut reg,
+            &venue::of(&amending()),
+            ACCT,
+            &mut mint,
+            LATER,
+        )
         .unwrap();
     assert_eq!(
         shape(&plan),
@@ -1247,7 +1363,14 @@ fn a_short_market_in_exit_gets_only_its_reducing_bids_and_a_level_wanting_nothin
         .with(Side::Buy, 1, quote(9_980, 0))
         .with(Side::Sell, 0, quote(10_010, 5));
     let plan = p
-        .plan(&desired, &mut reg, &amending(), ACCT, &mut mint, LATER)
+        .plan(
+            &desired,
+            &mut reg,
+            &venue::of(&amending()),
+            ACCT,
+            &mut mint,
+            LATER,
+        )
         .unwrap();
     assert_eq!(shape(&plan), vec![(Stage::Reducing, "place", Side::Buy, 0)]);
     assert_eq!(
@@ -1301,7 +1424,14 @@ fn a_market_in_exit_has_its_order_on_the_side_that_adds_to_the_position_cancelle
         // Once it is terminal, the desired bid is refused as any order adding in Exit is.
         cancelled(&mut reg, bid, Side::Buy, &venue_id(Side::Buy, 0), 10);
         let plan = p
-            .plan(desired, &mut reg, &amending(), ACCT, &mut mint, LATER)
+            .plan(
+                desired,
+                &mut reg,
+                &venue::of(&amending()),
+                ACCT,
+                &mut mint,
+                LATER,
+            )
             .unwrap();
         assert!(plan.commands.is_empty());
         assert_eq!(
@@ -1432,7 +1562,14 @@ fn an_item_over_a_cap_is_never_built() {
         quote(10_010, CAP + 1),
     );
     let plan = p
-        .plan(&over, &mut reg, &amending(), ACCT, &mut mint, MonoNs(0))
+        .plan(
+            &over,
+            &mut reg,
+            &venue::of(&amending()),
+            ACCT,
+            &mut mint,
+            MonoNs(0),
+        )
         .unwrap();
     assert!(plan.commands.is_empty());
     let why: Vec<_> = refused(&plan)
@@ -1454,7 +1591,7 @@ fn an_item_over_a_cap_is_never_built() {
         .plan(
             &book().with(Side::Buy, 0, quote(10_000, RESTING + 1)),
             &mut reg,
-            &amending(),
+            &venue::of(&amending()),
             ACCT,
             &mut mint,
             LATER,
@@ -1511,7 +1648,7 @@ fn a_planner_config_takes_a_finite_non_negative_price_threshold() {
         .plan(
             &book().with(Side::Buy, 0, quote(10_001, 5)),
             &mut reg,
-            &amending(),
+            &venue::of(&amending()),
             ACCT,
             &mut mint,
             MonoNs(0),
@@ -1541,7 +1678,7 @@ fn open_book_for(
     mint: &mut CidMint,
 ) -> Vec<ClientOrderId> {
     let plan = planner
-        .plan(desired, reg, &amending(), acct, mint, MonoNs(0))
+        .plan(desired, reg, &venue::of(&amending()), acct, mint, MonoNs(0))
         .unwrap();
     assert!(refused(&plan).is_empty());
     plan.commands
@@ -1582,7 +1719,14 @@ fn one_planner_keeps_each_accounts_orders_on_the_same_market() {
 
     // B again: its orders too.
     let plan = p
-        .plan(&quoted, &mut b, &amending(), OTHER, &mut mint_b, LATER)
+        .plan(
+            &quoted,
+            &mut b,
+            &venue::of(&amending()),
+            OTHER,
+            &mut mint_b,
+            LATER,
+        )
         .unwrap();
     assert!(plan.commands.is_empty());
 
@@ -1595,7 +1739,14 @@ fn one_planner_keeps_each_accounts_orders_on_the_same_market() {
 
     // B in between, then Exit on A (flat, so its ask adds): A's ask is cancelled.
     let plan = p
-        .plan(&quoted, &mut b, &amending(), OTHER, &mut mint_b, LATER)
+        .plan(
+            &quoted,
+            &mut b,
+            &venue::of(&amending()),
+            OTHER,
+            &mut mint_b,
+            LATER,
+        )
         .unwrap();
     assert!(plan.commands.is_empty());
     flatten(&mut a);
@@ -1624,7 +1775,14 @@ fn a_planner_refuses_an_account_through_a_second_registry() {
         .with(Side::Sell, 0, quote(10_010, 5));
     let ours = open_book_for(&mut p, &quoted, &mut first, ACCT, &mut mint);
     let refused = p
-        .plan(&quoted, &mut second, &amending(), ACCT, &mut mint, LATER)
+        .plan(
+            &quoted,
+            &mut second,
+            &venue::of(&amending()),
+            ACCT,
+            &mut mint,
+            LATER,
+        )
         .unwrap_err();
     assert_eq!(refused, PlanError::OtherRegistry { acct: ACCT });
     assert!(refused.to_string().contains("another registry"));
@@ -1662,7 +1820,14 @@ fn a_planner_refuses_an_account_planned_through_another_accounts_registry() {
     cancelled(&mut a, ours[0], Side::Buy, &venue_id(Side::Buy, 0), 10);
     // B through A's registry: refused, nothing built or freed.
     let refused = p
-        .plan(&bid, &mut a, &amending(), OTHER, &mut mint_b, LATER)
+        .plan(
+            &bid,
+            &mut a,
+            &venue::of(&amending()),
+            OTHER,
+            &mut mint_b,
+            LATER,
+        )
         .unwrap_err();
     assert_eq!(
         refused,
@@ -1672,7 +1837,14 @@ fn a_planner_refuses_an_account_planned_through_another_accounts_registry() {
     assert_eq!(p.order_at(OTHER, INST, Side::Buy, 0), Some(theirs[0]));
     // B through its own registry: its order is still diffed, nothing placed over it.
     let plan = p
-        .plan(&bid, &mut b, &amending(), OTHER, &mut mint_b, LATER)
+        .plan(
+            &bid,
+            &mut b,
+            &venue::of(&amending()),
+            OTHER,
+            &mut mint_b,
+            LATER,
+        )
         .unwrap();
     assert!(plan.commands.is_empty(), "{:?}", plan.commands);
     assert_eq!(b.resting_on(INST, Side::Buy), Some(lots(5)));
@@ -1689,7 +1861,14 @@ fn a_planner_refuses_a_registry_bound_to_another_account() {
     let bid = book().with(Side::Buy, 0, quote(10_000, 5));
     open_book_for(&mut p, &bid, &mut a, ACCT, &mut mint);
     let refused = p
-        .plan(&bid, &mut a, &amending(), OTHER, &mut mint, LATER)
+        .plan(
+            &bid,
+            &mut a,
+            &venue::of(&amending()),
+            OTHER,
+            &mut mint,
+            LATER,
+        )
         .unwrap_err();
     assert_eq!(
         refused,
@@ -1703,7 +1882,14 @@ fn a_planner_refuses_a_registry_bound_to_another_account() {
     // OTHER is still unbound: its own registry is accepted.
     let mut b = quoting(WIDE, 0);
     let plan = p
-        .plan(&bid, &mut b, &amending(), OTHER, &mut mint, LATER)
+        .plan(
+            &bid,
+            &mut b,
+            &venue::of(&amending()),
+            OTHER,
+            &mut mint,
+            LATER,
+        )
         .unwrap();
     assert_eq!(plan.commands.len(), 1);
 }

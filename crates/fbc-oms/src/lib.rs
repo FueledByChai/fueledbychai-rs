@@ -213,6 +213,7 @@
 mod audit;
 mod caps;
 mod entry;
+mod gates;
 mod gateway;
 mod grant;
 mod ladder;
@@ -237,6 +238,7 @@ pub use entry::{
     ArmRefusal, EntryState, ExitKind, ExitRefusal, LeaseKeys, Leases, MarketEntry, StateRefusal,
     TestnetRun,
 };
+pub use gates::{Batching, PlanVenue, RateScope, RateView};
 pub use gateway::{ControlCommand, ManagedGateway, OrderGateway};
 pub use grant::{Authorization, IssueRefusal, StaleAuthorization, StateGeneration};
 pub use ladder::{LadderConfig, LadderConfigError, LadderPlan, LadderResolution, ResyncApplied};
@@ -250,9 +252,9 @@ pub use permit::{
     PlacePlan,
 };
 pub use planner::{
-    CROSSING_LEVEL, CrossingIntent, DesiredBook, DesiredQuote, Downgrade, ExecutionPlanner, Held,
-    HeldReason, Plan, PlanError, PlanRefusal, Planned, PlannerConfig, PlannerConfigError,
-    ReduceFallback, Refused, Stage,
+    BatchItem, CROSSING_LEVEL, CrossingIntent, DesiredBook, DesiredQuote, Downgrade,
+    ExecutionPlanner, Held, HeldReason, Plan, PlanError, PlanRefusal, Planned, PlannerConfig,
+    PlannerConfigError, ReduceFallback, Refused, Stage,
 };
 pub use record::{
     Applied, FillApplied, Intent, LadderStep, OrdState, OrderKey, OrderOp, OrderRecord,

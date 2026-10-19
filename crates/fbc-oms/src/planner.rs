@@ -87,10 +87,11 @@ use std::time::Duration;
 
 use fbc_core::{
     AccountKey, Bps, Channel, CidMint, ClientOrderId, Feature, IdError, InstrumentId, Lots, MonoNs,
-    NewOrder, OrderCaps, OrderKind, RefKind, Side, Ticks, Tif,
+    NewOrder, OrderCaps, OrderKind, RefKind, Side, Ticks, Tif, TradingStatus, VenueMode,
 };
 
 use crate::entry::EntryState;
+use crate::gates::PlanVenue;
 use crate::grant::Authorization;
 use crate::permit::{self, AmendRefusal, CancelChoice, PermitRefusal, PermittedCommand};
 use crate::record::{Intent, OrdState, OrderRecord, TerminalKind};
@@ -407,7 +408,29 @@ pub enum Stage {
     Add,
 }
 
-/// One command the planner built, authorized.
+/// A further order of a batch command ([`Planned::more_items`]), described as [`Planned`]
+/// describes its first.
+#[derive(Clone, Eq, PartialEq, Debug)]
+pub struct BatchItem {
+    pub side: Side,
+    /// The level, or [`CROSSING_LEVEL`] for the crossing intent's order.
+    pub level: u16,
+    /// The item is for the side's crossing intent's order.
+    pub crossing: bool,
+    /// The order the item is for.
+    pub cid: ClientOrderId,
+    /// The consumer's tag, as [`Planned::tag`].
+    pub tag: Option<u16>,
+    /// A cancel's removal reason, as [`Planned::removal`].
+    pub removal: Option<u16>,
+    /// What the planner changed in the level's quote, as [`Planned::downgrades`].
+    pub downgrades: Vec<Downgrade>,
+}
+
+/// One command the planner built, authorized: a single place, amend or cancel, or, under
+/// [`Batching::Declared`](crate::Batching::Declared), a batch of places or a cancel-many. Its
+/// fields describe the command's first order; a batch's further orders are its
+/// [`Planned::more_items`], in the batch's order.
 #[derive(Debug)]
 pub struct Planned {
     pub stage: Stage,
@@ -428,8 +451,20 @@ pub struct Planned {
     /// What the planner changed in the level's quote to suit the venue's caps, in the order it
     /// applied them: a place's and an amend's; empty for a cancel and for a quote sent as asked.
     pub downgrades: Vec<Downgrade>,
+    /// A batch's orders after its first, in the batch's order; empty for a command of one
+    /// order.
+    pub more_items: Vec<BatchItem>,
     /// The authorization to submit it under.
     pub auth: Authorization,
+}
+
+impl Planned {
+    /// The client ids of the command's orders, in its order.
+    pub fn cids(&self) -> Vec<ClientOrderId> {
+        std::iter::once(self.cid)
+            .chain(self.more_items.iter().map(|i| i.cid))
+            .collect()
+    }
 }
 
 /// Why a level's order was left as it is.
@@ -498,6 +533,19 @@ pub enum PlanRefusal {
     /// state and both caps would admit with that order ended waits so; one refused anyway is
     /// refused for its own reason, and the emulated order rests.
     AwaitsEmulatedCancel,
+    /// The market's trading status refuses the place or amend ([`PlanVenue::status`]): never
+    /// built (decision 0111).
+    Status(TradingStatus),
+    /// The account's or the market's venue mode refuses the place or amend
+    /// ([`PlanVenue::account_mode`], [`PlanVenue::market_mode`]): never built (decision 0111).
+    VenueMode(VenueMode),
+    /// A normal command withheld at a rate scope's safety floor: charging it would leave the
+    /// scope, the `scope`th of the pass's [`RateView`](crate::RateView), with less than its
+    /// floor. Never built; cancels and reducing orders are never withheld so (decision 0111).
+    RateFloor {
+        /// The scope's index in the view.
+        scope: usize,
+    },
 }
 
 /// Why a whole [`ExecutionPlanner::plan`] pass was refused, nothing built or freed: the
@@ -707,11 +755,12 @@ impl ExecutionPlanner {
         &mut self,
         desired: &DesiredBook,
         reg: &mut Registry,
-        caps: &OrderCaps,
+        venue: &PlanVenue<'_>,
         acct: AccountKey,
         mint: &mut CidMint,
         now: MonoNs,
     ) -> Result<Plan, PlanError> {
+        let caps = venue.caps;
         reg.reap_dropped();
         self.bind(acct, reg)?;
         let market = desired.market;
@@ -1163,6 +1212,7 @@ impl ExecutionPlanner {
                         tag,
                         removal,
                         downgrades,
+                        more_items: Vec::new(),
                         auth: authorize(reg, acct, cmd),
                     });
                     if synth_ioc {
@@ -1419,6 +1469,7 @@ fn cancel_now(
                     tag,
                     removal: None,
                     downgrades: Vec::new(),
+                    more_items: Vec::new(),
                     auth: authorize(reg, acct, cmd),
                 });
             }

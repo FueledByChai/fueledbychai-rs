@@ -23,6 +23,8 @@
 #[path = "common/arm.rs"]
 mod arm;
 mod common;
+#[path = "common/venue.rs"]
+mod venue;
 
 use std::time::Duration;
 
@@ -321,7 +323,14 @@ fn a_planner_pass_quotes_a_side_a_dropped_place_had_filled() {
         },
     );
     let plan = p
-        .plan(&book, &mut reg, &order_caps(), ACCT, &mut mint, MonoNs(0))
+        .plan(
+            &book,
+            &mut reg,
+            &venue::of(&order_caps()),
+            ACCT,
+            &mut mint,
+            MonoNs(0),
+        )
         .unwrap();
     assert!(plan.refused.is_empty(), "{:?}", plan.refused);
     assert_eq!(plan.commands.len(), 1);
@@ -339,13 +348,27 @@ fn a_refused_planner_pass_still_releases_a_place_dropped_before() {
         PlannerConfig::new(Bps(2.0), lots(2), Duration::from_millis(100)).unwrap(),
     );
     let book = DesiredBook::new(INST);
-    p.plan(&book, &mut bound, &order_caps(), ACCT, &mut mint, MonoNs(0))
-        .unwrap();
+    p.plan(
+        &book,
+        &mut bound,
+        &venue::of(&order_caps()),
+        ACCT,
+        &mut mint,
+        MonoNs(0),
+    )
+    .unwrap();
     let order = buy(RESTING);
     let c = order.cid;
     drop(other.place(order).unwrap());
     assert!(matches!(
-        p.plan(&book, &mut other, &order_caps(), ACCT, &mut mint, MonoNs(1)),
+        p.plan(
+            &book,
+            &mut other,
+            &venue::of(&order_caps()),
+            ACCT,
+            &mut mint,
+            MonoNs(1)
+        ),
         Err(PlanError::OtherRegistry { .. })
     ));
     assert_eq!(other.get(c).unwrap().state(), released());

@@ -12,6 +12,8 @@
 #[path = "common/arm.rs"]
 mod arm;
 mod common;
+#[path = "common/venue.rs"]
+mod venue;
 
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
@@ -201,7 +203,9 @@ fn plan_and_send(
     mint: &mut CidMint,
     now: MonoNs,
 ) -> Plan {
-    let plan = p.plan(desired, reg, caps, ACCT, mint, now).unwrap();
+    let plan = p
+        .plan(desired, reg, &venue::of(caps), ACCT, mint, now)
+        .unwrap();
     for (n, c) in plan.commands.iter().enumerate() {
         let rpc = RpcId(1_000 + n as u64);
         match c.auth.command() {
@@ -765,7 +769,7 @@ fn a_removal_cancel_dropped_unspent_leaves_no_reason_once_the_level_is_wanted_ag
         .plan(
             &bid1_removed(),
             &mut reg,
-            &amending(),
+            &venue::of(&amending()),
             ACCT,
             &mut mint,
             LATER,
@@ -816,7 +820,7 @@ fn a_removal_cancel_whose_submit_fails_before_it_is_sent_leaves_no_reason_on_the
         .plan(
             &bid1_removed(),
             &mut reg,
-            &amending(),
+            &venue::of(&amending()),
             ACCT,
             &mut mint,
             LATER,

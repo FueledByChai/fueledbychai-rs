@@ -116,13 +116,14 @@ use std::time::{Duration, Instant};
 use fbc_core::{
     Bps, Channel, CidMatch, CidMint, ClientOrderId, ConnState, ExchNs, Lots, MarketLease,
     Namespace, NamespaceLease, NonceScope, OpKind, OrderCaps, OrderKindTag, Reject, RejectKind,
-    RpcId, Secrets, Side, SignedLots, SpecTable, SubmitOutcome, Ticks, Tif, TifTag, VenueFactory,
+    RpcId, Secrets, Side, SignedLots, SpecTable, SubmitOutcome, Ticks, Tif, TifTag, TradingStatus,
+    VenueFactory, VenueMode,
 };
 use fbc_oms::{
-    Applied, CancelChoice, CancelEverything, DesiredBook, DesiredQuote, ExecutionPlanner,
+    Applied, Batching, CancelChoice, CancelEverything, DesiredBook, DesiredQuote, ExecutionPlanner,
     FillLedger, Intent, LadderConfig, LeaseKeys, Leases, LedgerConfig, MarketCapsConfig, OrdState,
-    PermittedCommand, PlanRefusal, PlannerConfig, PreTradeCaps, ReduceFallback, Registry, Routed,
-    Stage, TestnetRun,
+    PermittedCommand, PlanRefusal, PlanVenue, PlannerConfig, PreTradeCaps, RateView,
+    ReduceFallback, Registry, Routed, Stage, TestnetRun,
 };
 use fbc_runtime::{Connector, ExecControl, ExecOrders, ExecSession, RateLimiter};
 use fbc_venue_paradex::ParadexFactory;
@@ -2584,8 +2585,19 @@ impl Driver {
             let plan = {
                 let mut link = self.link.borrow_mut();
                 let mint = self.mint.as_mut().ok_or("no client-id mint")?;
+                // This program reads no venue mode and no limiter room, and sends one order
+                // per command: the venue refuses what its mode refuses, and the runtime's
+                // limiter holds normal traffic at its reserve (decision 0111).
+                let venue = PlanVenue {
+                    caps: &self.plan_caps,
+                    account_mode: VenueMode::Normal,
+                    market_mode: VenueMode::Normal,
+                    status: TradingStatus::Trading,
+                    rates: RateView::new(Vec::new()),
+                    batching: Batching::One,
+                };
                 self.planner
-                    .plan(&wanted.book, link.reg(), &self.plan_caps, ACCT, mint, now)
+                    .plan(&wanted.book, link.reg(), &venue, ACCT, mint, now)
                     .map_err(|e| format!("the planner refused the pass: {e}"))?
             };
             let mut refused_place = false;
