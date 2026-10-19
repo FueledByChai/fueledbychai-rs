@@ -21,8 +21,9 @@ use fbc_core::{
     WireSlice, WireUrl,
 };
 use fbc_journal::{
-    ControlEvent, HeaderRec, HttpResponseRec, JournalError, JournalReader, JournalWriter, Marker,
-    Opaque, Opcode, Record, RedactionKey, SinkConfig, WriteRes, journal_queue,
+    ControlEvent, HeaderRec, HttpResponseRec, JournalError, JournalReader, JournalSink,
+    JournalWriter, Marker, Opaque, Opcode, Record, Recorded, RedactionKey, SinkConfig, WriteRes,
+    journal_queue,
 };
 use fbc_runtime::{
     Connector, IngestClock, Journal, Liveness, MdReplay, MdReplayConfig, MdReplayCounters,
@@ -197,6 +198,194 @@ async fn a_journaled_session_replays_to_the_same_envelopes_every_time() {
         }
     );
     fs::remove_dir_all(&root).unwrap();
+}
+
+/// Now on the wall clock, as the session files its records.
+fn wall_now() -> WallNs {
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    WallNs(i64::try_from(since.as_nanos()).unwrap())
+}
+
+fn consumer(at: u64, kind: u16, input: bool, bytes: &[u8]) -> Record {
+    Record::Consumer {
+        at: MonoNs(at),
+        kind,
+        input,
+        bytes: Opaque(bytes.to_vec()),
+    }
+}
+
+/// FBC-hxkm's done line, the replay's part (decision 0101): the consumer journals its own
+/// records through the shard's sink between a live toy session's steps, in the shard's total
+/// order; each reads back between the session's records it was written between, and decoder
+/// replay of that journal passes over every one whose input flag is false (and, until the
+/// consumer-inputs ticket hands them back, every input too), so it replays to the live
+/// envelopes with the counts a journal without them replays to.
+#[tokio::test]
+async fn consumer_records_journaled_between_a_sessions_records_are_passed_over_by_replay() {
+    let root = fresh_dir("md_replay_consumer");
+    let config = SinkConfig {
+        budget_bytes: 1 << 20,
+        soft_limit_pct: 85,
+    };
+    let (sink, drain) = journal_queue(config, key()).unwrap();
+    let writer = drain
+        .spawn(JournalWriter::create(&root, SHARD, key()).unwrap())
+        .unwrap();
+    let sink = Rc::new(RefCell::new(sink));
+    let (mut ws, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
+    let seen = Seen::default();
+    let venue = ToyVenue::leak();
+    let (mut session, control) = MdSession::new(session(venue, &ws.url()), keep(&seen)).unwrap();
+    session.set_journal(Journal::new(sink.clone()));
+    let snap = http.url("/snap");
+    let watch = seen.clone();
+    let consumer_sink = sink.clone();
+    // The consumer's own records, offered under the class it picks, between the session's
+    // steps on the shard's thread.
+    let offer = move |class, record: &Record| {
+        let recorded = consumer_sink.borrow_mut().record(class, wall_now(), record);
+        assert_eq!(recorded, Recorded::Ok);
+    };
+    let summary = consumer(1, 7, false, b"decide summary");
+    let start = consumer(2, 1, true, b"Start");
+    let hash = consumer(3, 3, false, &[0xff, 0x00, 0xc3]);
+    let offered = [summary.clone(), start.clone(), hash.clone()];
+    let script = async move {
+        let mut first = ws.accept().await;
+        assert_eq!(first.recv().await, "hello|codec=0|plan=1");
+        assert_eq!(first.recv().await, "sub|add=A");
+        first.send("trade|sym=A|px=100|qty=1|seq=1");
+        first.send("arm|sym=A|ms=20");
+        until(|| watch.borrow().len() == 2).await;
+        offer(TrafficClass::Normal, &summary);
+        first.send(&format!("get|tag=1|ms=5000|url={snap}"));
+        let body = "trade|sym=A|px=102|qty=2|seq=2\ntrade|sym=A|px=103|qty=1|seq=3";
+        http.request().await.answer("HTTP/1.1 200 OK", body).await;
+        until(|| watch.borrow().len() == 4).await;
+        offer(TrafficClass::Safety, &start);
+        first.send("bye");
+        assert_eq!(first.next().await, None);
+        let mut second = ws.accept().await;
+        assert_eq!(second.recv().await, "hello|codec=1|plan=1");
+        assert_eq!(second.recv().await, "sub|add=A");
+        second.send("trade|sym=A|px=104|qty=3|seq=4");
+        until(|| watch.borrow().len() == 5).await;
+        offer(TrafficClass::Normal, &hash);
+        drop(control);
+        assert_eq!(second.next().await, None);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    writer.close().unwrap();
+    let live = seen.take();
+    assert_eq!(live.len(), 5);
+
+    // Each consumer record lies between the session's records it was offered between.
+    let read: Vec<Record> = JournalReader::open(&root, SHARD)
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let at = |want: &dyn Fn(&Record) -> bool| {
+        let found: Vec<usize> = (0..read.len()).filter(|&i| want(&read[i])).collect();
+        let [i] = found[..] else {
+            panic!("one such record: {found:?} in {read:#?}");
+        };
+        i
+    };
+    let inbound = |text: &'static str| move |r: &Record| matches!(r, Record::Inbound { bytes, .. } if bytes.0.starts_with(text.as_bytes()));
+    let consumer_at = |c: &Record| at(&|r: &Record| r == c);
+    let timer = at(&|r: &Record| matches!(r, Record::Timer { .. }));
+    let get = at(&inbound("get|tag=1"));
+    let answered = at(&|r: &Record| {
+        matches!(
+            r,
+            Record::HttpResult {
+                tag: HttpTag(1),
+                ..
+            }
+        )
+    });
+    let bye = at(&inbound("bye"));
+    let last = at(&inbound("trade|sym=A|px=104"));
+    let closed = at(
+        &|r: &Record| matches!(r, Record::Control { ev: ControlEvent::Closed(k), .. } if *k == conn(1)),
+    );
+    let [summary, start, hash] = offered;
+    assert!(
+        timer < consumer_at(&summary) && consumer_at(&summary) < get,
+        "{read:#?}"
+    );
+    assert!(
+        answered < consumer_at(&start) && consumer_at(&start) < bye,
+        "{read:#?}"
+    );
+    assert!(
+        last < consumer_at(&hash) && consumer_at(&hash) < closed,
+        "{read:#?}"
+    );
+
+    // Replay passes over them: the live envelopes, every time, and the counts of the same
+    // journal with no consumer record in it.
+    let (replayed, counters, _) = replay(&root);
+    assert_eq!(replayed, live);
+    let without: Vec<Record> = read
+        .iter()
+        .filter(|r| !matches!(r, Record::Consumer { .. }))
+        .cloned()
+        .collect();
+    assert_eq!(without.len(), read.len() - 3);
+    let (bare, bare_counters, _) = replay_records(without);
+    assert_eq!(bare, live);
+    assert_eq!(counters, bare_counters);
+    assert_eq!(
+        counters,
+        MdReplayCounters {
+            epochs: 2,
+            frames: 5,
+            http: 1,
+            timers: 1,
+            ..MdReplayCounters::default()
+        }
+    );
+    fs::remove_dir_all(&root).unwrap();
+}
+
+/// Consumer records anywhere in an epoch, before its opening subscription or between a held
+/// result and it, change nothing a replay does: the codec is built for the opening call's
+/// subscriptions and answers what came before it, as without them.
+#[test]
+fn consumer_records_change_nothing_about_where_an_epochs_codec_is_built() {
+    let records = |with: bool| {
+        let c = |input| with.then(|| consumer(9, 4, input, b"x"));
+        [
+            c(true),
+            Some(opened(0)),
+            c(false),
+            Some(result(1, 0, 7, &trade(1))),
+            c(true),
+            Some(subscribe(0, &[1, 2], &[])),
+            c(false),
+            Some(frame(2, 0, &trade(2))),
+            c(true),
+            Some(closed(0)),
+            c(false),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<Record>>()
+    };
+    assert_eq!(records(true).len(), 11);
+    let (seen, counters, venue) = replay_records(records(true));
+    let (bare, bare_counters, bare_venue) = replay_records(records(false));
+    assert_eq!(seqs(&seen), [Some(1), Some(2)]);
+    assert_eq!(seen, bare);
+    assert_eq!(counters, bare_counters);
+    assert_eq!(venue.plans(), [vec![1, 2]]);
+    assert_eq!(venue.plans(), bare_venue.plans());
+    assert_eq!(venue.http_log(), bare_venue.http_log());
 }
 
 fn conn(epoch: u32) -> ConnKey {

@@ -35,6 +35,9 @@ use crate::writer::{COMPRESSED_EXT, Listed, list_segments, with_ext};
 pub struct JournalReader {
     segments: VecDeque<Listed>,
     open: Option<Open>,
+    /// The newest format version it reads: [`VERSION`]. A segment of a newer one is refused at
+    /// its header, naming its version.
+    newest: u16,
 }
 
 /// The segment being read.
@@ -69,10 +72,16 @@ impl Open {
 impl JournalReader {
     /// A reader of `shard`'s segments under `root`, listed now.
     pub fn open(root: impl AsRef<Path>, shard: u16) -> Result<JournalReader, JournalError> {
-        let segments = list_segments(root.as_ref(), shard)?.into_iter().collect();
+        JournalReader::open_reading(root.as_ref(), shard, VERSION)
+    }
+
+    /// A reader of `shard`'s segments under `root` that reads format versions up to `newest`.
+    fn open_reading(root: &Path, shard: u16, newest: u16) -> Result<JournalReader, JournalError> {
+        let segments = list_segments(root, shard)?.into_iter().collect();
         Ok(JournalReader {
             segments,
             open: None,
+            newest,
         })
     }
 
@@ -130,7 +139,7 @@ impl JournalReader {
                     });
                 }
                 let version = u16::from_le_bytes([head[4], head[5]]);
-                if !(OLDEST_READABLE..=VERSION).contains(&version) {
+                if !(OLDEST_READABLE..=self.newest).contains(&version) {
                     return Err(JournalError::UnsupportedVersion {
                         segment: open.path.clone(),
                         version,
@@ -228,4 +237,53 @@ fn read_full(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
         }
     }
     Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{JournalWriter, Opaque, RedactionKey};
+    use fbc_core::{MonoNs, WallNs};
+    use std::sync::Arc;
+
+    /// FBC-hxkm's done line: a reader of the previous format version, 7, refuses a journal of
+    /// the version consumer records arrived in at its segment's header, naming that version,
+    /// rather than part way through at the first consumer record; the reader of the current
+    /// version reads the same journal whole.
+    #[test]
+    fn a_reader_of_the_previous_version_refuses_the_new_one_naming_it() {
+        assert_eq!(VERSION, 8);
+        // Unit tests get no CARGO_TARGET_TMPDIR: a directory of this process's own.
+        let root = std::env::temp_dir().join(format!(
+            "fbc-journal-reader-previous-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let key = Arc::new(RedactionKey::new(&[1; 32]).unwrap());
+        let mut writer = JournalWriter::create(&root, 1, key).unwrap();
+        let record = Record::Consumer {
+            at: MonoNs(1),
+            kind: 1,
+            input: true,
+            bytes: Opaque(b"Start".to_vec()),
+        };
+        writer.append(WallNs(0), &record).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        let current: Vec<_> = JournalReader::open(&root, 1).unwrap().collect();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].as_ref().unwrap(), &record);
+
+        let previous: Vec<_> = JournalReader::open_reading(&root, 1, VERSION - 1)
+            .unwrap()
+            .collect();
+        let [Err(e @ JournalError::UnsupportedVersion { segment, version })] = &previous[..] else {
+            panic!("{previous:?}");
+        };
+        assert_eq!(*version, 8);
+        assert_eq!(*segment, root.join("19700101/1-000000.fbcj"));
+        let said = e.to_string();
+        assert!(said.contains("journal format version 8,"), "{said}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }

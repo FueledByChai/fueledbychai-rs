@@ -6,7 +6,9 @@
 //! (`fixtures/journal/v4`), before outbound frames kept the kind they were sent as (FBC-q7b),
 //! and one in format version 5 (`fixtures/journal/v5`), before a write result could be not sent
 //! for a stale authorization (FBC-j5bw, decision 0062), and one in format version 6
-//! (`fixtures/journal/v6`), before a request deadline's firing was a record (FBC-0hfl).
+//! (`fixtures/journal/v6`), before a request deadline's firing was a record (FBC-0hfl), and one
+//! in format version 7 (`fixtures/journal/v7`), before the consumer's own records (FBC-hxkm,
+//! decision 0101).
 //!
 //! Every secret here is synthetic, and each is assembled at run time so no credential-shaped
 //! literal sits in the source.
@@ -329,6 +331,31 @@ fn v6_records() -> Vec<(WallNs, Record)> {
     out
 }
 
+/// What `fixtures/journal/v7` holds: the version 6 records with, after the stale-authorization
+/// write result, a request deadline's firing, the kind version 7 added, all written by the
+/// version 7 writer (its README says how).
+fn v7_records() -> Vec<(WallNs, Record)> {
+    let mut out = v6_records();
+    let at = 1 + out
+        .iter()
+        .position(|(_, r)| {
+            matches!(
+                r,
+                Record::WriteResult {
+                    result: WriteRes::NotSent(NotSentReason::StaleAuthorization),
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    let timeout = Record::RpcTimeout {
+        stamp: stamp(6, NOON),
+        rpc: RpcId(11),
+    };
+    out.insert(at, (NOON, timeout));
+    out
+}
+
 /// A frame written at `at` as `opcode`, with its credential span.
 fn binary_outbound(at: u64, bytes: Vec<u8>, span: std::ops::Range<u32>, opcode: Opcode) -> Record {
     Record::Outbound {
@@ -382,6 +409,13 @@ fn a_journal_written_before_the_stale_authorization_reason_reads_back_unchanged(
 #[test]
 fn a_journal_written_before_the_rpc_timeout_kind_reads_back_unchanged() {
     reads_back_unchanged("v6", 6, v6_records());
+}
+
+/// FBC-hxkm: a journal written in format version 7, before the consumer record's kind, reads
+/// back unchanged, its request deadline's firing included.
+#[test]
+fn a_journal_written_before_the_consumer_kind_reads_back_unchanged() {
+    reads_back_unchanged("v7", 7, v7_records());
 }
 
 /// FBC-q7b's done line: a binary frame whose only bytes that are not UTF-8 lie inside its
