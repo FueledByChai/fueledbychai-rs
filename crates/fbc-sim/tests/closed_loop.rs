@@ -411,8 +411,9 @@ fn day() -> Vec<(u64, Took)> {
 }
 
 /// The day's journal under `root`, as the live shard wrote it: the connection's opening and
-/// subscription, every frame and input stamped in turn, and its closing.
-fn journal(root: &Path) {
+/// subscription, every frame and input stamped in turn, and its closing. A journal that `whole`
+/// is false of ends with the wind-down's firing.
+fn journal(root: &Path, whole: bool) {
     let mut writer = JournalWriter::create(root, SHARD, key()).unwrap();
     let wall = |ms: u64| WallNs(WALL0 + i64::try_from(ms * MS).unwrap());
     let mut write = |ms: u64, record: Record| writer.append(wall(ms), &record).unwrap();
@@ -434,7 +435,10 @@ fn journal(root: &Path) {
             },
         },
     );
-    for (seq, (ms, took)) in day().into_iter().enumerate() {
+    let day = day()
+        .into_iter()
+        .filter(|(ms, _)| whole || *ms <= WIND_DOWN_AT);
+    for (seq, (ms, took)) in day.enumerate() {
         let seq = u64::try_from(seq).unwrap();
         let record = match took {
             Took::Frame(text) => {
@@ -457,8 +461,8 @@ fn journal(root: &Path) {
         };
         write(ms, record);
         if ms == 10_000 {
-            // What the live shard wrote besides that the replay passes over: its order-entry session's
-            // frame, on another connection, and the consumer's own annotation.
+            // What the live shard wrote besides that the replay passes over: its order-entry
+            // session's frame, on another connection, and the consumer's own annotation.
             write(
                 10_001,
                 Record::Outbound {
@@ -481,13 +485,15 @@ fn journal(root: &Path) {
             );
         }
     }
-    write(
-        3_601_000,
-        Record::Control {
-            at: at(3_601_000),
-            ev: ControlEvent::Closed(MD),
-        },
-    );
+    if whole {
+        write(
+            3_601_000,
+            Record::Control {
+                at: at(3_601_000),
+                ev: ControlEvent::Closed(MD),
+            },
+        );
+    }
     writer.flush().unwrap();
 }
 
@@ -981,7 +987,7 @@ fn records(root: &Path) -> impl Iterator<Item = Result<Record, JournalError>> {
 
 /// Replays the journal at `root` closed-loop through the shard host, with a fresh SimVenue per
 /// bracket and a fresh registry, client-id mint and leases per bracket.
-async fn closed_loop(root: &Path) -> Run {
+async fn closed_loop(root: &Path, settle: Duration) -> Run {
     let leases = fresh_dir("leases");
     let clock = IngestClock::replayed(WallNs(WALL0));
     let world: Shared = Rc::new(RefCell::new(World {
@@ -1036,7 +1042,7 @@ async fn closed_loop(root: &Path) -> Run {
     let closed = ClosedLoop {
         clock: clock.clone(),
         records: records(root),
-        settle: Duration::from_secs(1),
+        settle,
         stops,
     };
     let mut members = vec![Member::md_replay(&mut md, closed)];
@@ -1071,10 +1077,10 @@ async fn closed_loop(root: &Path) -> Run {
 async fn a_closed_loop_replay_through_the_shard_host_gives_the_same_commands_fills_and_cycles_on_every_run()
  {
     let root = fresh_dir("journal");
-    journal(&root);
+    journal(&root, true);
     let real = std::time::Instant::now();
-    let first = closed_loop(&root).await;
-    let second = closed_loop(&root).await;
+    let first = closed_loop(&root, Duration::from_secs(1)).await;
+    let second = closed_loop(&root, Duration::from_secs(1)).await;
     // An hour of journal, replayed twice in virtual time: nothing slept on a real clock.
     assert!(
         real.elapsed() < Duration::from_secs(120),
@@ -1327,13 +1333,14 @@ async fn replay_alone(
     clock: IngestClock,
     records: Vec<Result<Record, JournalError>>,
 ) -> Result<(), ShardError> {
-    alone(clock, records).await.0
+    alone(clock, records, Duration::ZERO).await.0
 }
 
 /// [`replay_alone`]: how the run ended, the replay, and what its handler saw.
 async fn alone(
     clock: IngestClock,
     records: Vec<Result<Record, JournalError>>,
+    settle: Duration,
 ) -> (Result<(), ShardError>, MdReplay<MdLog>, Shared) {
     let config = MdReplayConfig {
         venue: toy::ToyVenue::leak(),
@@ -1354,10 +1361,14 @@ async fn alone(
     let closed = ClosedLoop {
         clock,
         records,
-        settle: Duration::ZERO,
+        settle,
         stops: Vec::new(),
     };
-    let mut decide = |_: &[InstrumentId], _: &mut Ladder| {};
+    let decided = Rc::clone(&world);
+    let mut decide = move |instruments: &[InstrumentId], _: &mut Ladder| {
+        let pass = Seen::Decide(instruments.to_vec());
+        decided.borrow_mut().seen.push(pass);
+    };
     let ran = host
         .run(vec![Member::md_replay(&mut md, closed)], &mut decide)
         .await;
@@ -1454,7 +1465,8 @@ async fn a_closed_loop_replay_feeds_timers_and_http_results_and_then_lets_go_of_
             RawFrame::Text(&trade(BID, 1, 1)),
         )),
     ];
-    let (ran, mut md, world) = alone(IngestClock::replayed(WallNs(WALL0)), records).await;
+    let clock = IngestClock::replayed(WallNs(WALL0));
+    let (ran, mut md, world) = alone(clock, records, Duration::ZERO).await;
     assert_eq!(ran, Ok(()));
     let counters = md.counters();
     assert_eq!((counters.timers, counters.http, counters.frames), (1, 1, 1));
@@ -1512,4 +1524,200 @@ fn what_stops_a_closed_loop_replay_says_why() {
         format!("{closed:?}"),
         "ClosedLoop { settle: 5ms, stops: 0, .. }"
     );
+}
+
+/// The stamp of a record of the replayed connection, recorded at `ms` as ingest sequence `seq`.
+fn md_stamp(seq: u64, ms: u64) -> Stamp {
+    Stamp {
+        ingest_seq: seq,
+        kernel_rx: None,
+        recv_mono: at(ms),
+        recv_wall: WallNs(WALL0 + i64::try_from(ms * MS).unwrap()),
+        conn: MD,
+    }
+}
+
+/// What reached the solo world: its market data's stamps and its decide passes, in order.
+fn passes_and_md(world: &Shared) -> Vec<Option<u64>> {
+    world
+        .borrow()
+        .seen
+        .iter()
+        .filter_map(|s| match s {
+            Seen::Md(stamp, _) => Some(Some(stamp.ingest_seq)),
+            Seen::Decide(_) => Some(None),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Codex P2 r4315555312 on PR #178: the settle time runs from the last recorded instant of the
+/// journal, a record the replay passes over included.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn the_settle_time_runs_from_the_journals_last_recorded_instant() {
+    let start = tokio::time::Instant::now();
+    let records = vec![
+        Ok(opened()),
+        Ok(Record::Outbound {
+            at: at(50),
+            conn: ConnKey { conn: 9, epoch: 1 },
+            rpc: None,
+            opcode: fbc_journal::Opcode::Text,
+            frame: fbc_core::WireSlice::plain(b"live order entry".to_vec()),
+        }),
+    ];
+    let clock = IngestClock::replayed(WallNs(WALL0));
+    let (ran, _, _) = alone(clock, records, ms(5)).await;
+    assert_eq!(ran, Ok(()));
+    assert!(start.elapsed() >= ms(55), "{:?}", start.elapsed());
+}
+
+/// Codex P2 r4315555320 on PR #178: a ping the live session stamped takes its place in the
+/// shard's ingest order, and calls for a decide pass, though no codec is handed it.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_ping_the_live_session_stamped_takes_its_place_in_the_ingest_order() {
+    let records = vec![
+        Ok(opened()),
+        Ok(Record::InboundControl {
+            stamp: md_stamp(30, 3),
+            frame: fbc_journal::WsControl::Ping(Opaque(b"hb".to_vec())),
+        }),
+        Ok(Record::inbound(
+            md_stamp(31, 4),
+            RawFrame::Text(&trade(BID, 1, 1)),
+        )),
+    ];
+    let clock = IngestClock::replayed(WallNs(WALL0));
+    let (ran, _, world) = alone(clock, records, Duration::ZERO).await;
+    assert_eq!(ran, Ok(()));
+    assert_eq!(passes_and_md(&world), [None, Some(1), None]);
+}
+
+/// Codex P2 r4315555331 on PR #178: an HTTP result held until its epoch's codec is built takes
+/// its ingest sequence as its events are handed on, so the pass after it decides on them.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_held_http_result_takes_its_ingest_sequence_as_its_events_are_handed_on() {
+    let answered = Record::HttpResult {
+        stamp: md_stamp(20, 2),
+        tag: fbc_core::HttpTag(1),
+        result: Ok(fbc_journal::HttpResponseRec {
+            status: 200,
+            headers: vec![],
+            body: Opaque(trade(BID, 1, 1).into_bytes()),
+            body_redact: Vec::new(),
+        }),
+    };
+    let subscribed = Record::Control {
+        at: at(5),
+        ev: ControlEvent::Subscribe {
+            conn: MD,
+            add: vec![toy::sub(1)],
+            remove: vec![],
+        },
+    };
+    let records = vec![
+        Ok(opened()),
+        Ok(answered),
+        Ok(subscribed),
+        Ok(Record::inbound(
+            md_stamp(21, 6),
+            RawFrame::Text(&trade(BID, 1, 2)),
+        )),
+    ];
+    let clock = IngestClock::replayed(WallNs(WALL0));
+    let (ran, _, world) = alone(clock, records, Duration::ZERO).await;
+    assert_eq!(ran, Ok(()));
+    assert_eq!(passes_and_md(&world), [Some(0), None, Some(1), None]);
+}
+
+/// Codex P2 r4315555339 on PR #178: a replay whose run is dropped while it waits for a record
+/// stamps with the recorded stamps again when fed on its own.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_replay_dropped_while_it_waits_stamps_with_the_recorded_stamps_again() {
+    let config = MdReplayConfig {
+        venue: toy::ToyVenue::leak(),
+        cfg: VenueConfig::new(),
+        plan: EndpointPlan {
+            stream: toy::STREAM,
+            transport: MdTransport::Socket {
+                url: WireUrl::plain("ws://127.0.0.1:9/replayed"),
+            },
+            subs: vec![toy::sub(1)],
+        },
+        specs: toy::specs(),
+        conn: MD.conn,
+    };
+    let world = solo();
+    let mut md = MdReplay::new(config, MdLog(Rc::clone(&world), None)).unwrap();
+    let clock = IngestClock::replayed(WallNs(WALL0));
+    let mut host = ShardHost::new(clock.clone());
+    let records: Vec<Result<Record, JournalError>> = vec![
+        Ok(opened()),
+        Ok(Record::inbound(
+            md_stamp(40, 2),
+            RawFrame::Text(&trade(BID, 1, 1)),
+        )),
+        Ok(Record::inbound(
+            md_stamp(41, 100),
+            RawFrame::Text(&trade(BID, 1, 2)),
+        )),
+    ];
+    let closed = ClosedLoop {
+        clock,
+        records,
+        settle: Duration::ZERO,
+        stops: Vec::new(),
+    };
+    let mut decide = |_: &[InstrumentId], _: &mut Ladder| {};
+    tokio::select! {
+        ran = host.run(vec![Member::md_replay(&mut md, closed)], &mut decide) => {
+            panic!("the run ended first: {ran:?}")
+        }
+        () = tokio::time::sleep(ms(50)) => {}
+    }
+    md.feed(&Record::inbound(
+        md_stamp(42, 120),
+        RawFrame::Text(&trade(BID, 1, 3)),
+    ))
+    .unwrap();
+    let seqs: Vec<u64> = passes_and_md(&world).into_iter().flatten().collect();
+    assert_eq!(seqs, [0, 42]);
+}
+
+/// Codex P2 r4315555356 on PR #178: answers due exactly as the replay settles are read, and
+/// decided on, before the replay ends the sessions.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn answers_due_as_the_replay_settles_are_read_and_decided_on_before_the_sessions_end() {
+    let root = fresh_dir("journal");
+    journal(&root, false);
+    // The wind-down's cancels are answered exactly the latency after the journal's last record.
+    let run = closed_loop(&root, TO_VENUE + TO_CLIENT).await;
+    for i in 0..BRACKETS.len() {
+        for cancel in run
+            .commands(i)
+            .into_iter()
+            .filter(|c| matches!(c.cmd, Cmd::Cancel { .. }))
+        {
+            let (answered, outcome) = run.outcome(i, cancel.rpc);
+            assert_eq!(answered.recv_mono, at(WIND_DOWN_AT) + TO_VENUE + TO_CLIENT);
+            assert!(
+                matches!(outcome, SubmitOutcome::Accepted { .. }),
+                "{outcome:?}"
+            );
+        }
+    }
+    // A decide pass came after the last of them.
+    let last_exec = run
+        .seen
+        .iter()
+        .rposition(|s| matches!(s, Seen::Exec(..)))
+        .unwrap();
+    assert!(
+        run.seen[last_exec..]
+            .iter()
+            .any(|s| matches!(s, Seen::Decide(_))),
+        "{:?}",
+        &run.seen[last_exec..]
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
