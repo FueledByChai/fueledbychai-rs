@@ -31,9 +31,10 @@ use fbc_core::{
     SignedLots, SubmitOutcome, TagSet, Ticks, Tif, VenueCommand, VenueOrderState, WallNs,
 };
 use fbc_oms::{
-    Admission, DesiredBook, DesiredQuote, Downgrade, ExecutionPlanner, FillLedger, FillTime,
-    LadderConfig, LedgerConfig, MarketCapsConfig, OrderKey, OrderOp, Plan, PlanError, PlanRefusal,
-    Planned, PlannerConfig, PreTradeCaps, ReduceFallback, Registry, ResyncSnapshot, Stage,
+    Admission, AmendRefusal, CapRefusal, DesiredBook, DesiredQuote, Downgrade, ExecutionPlanner,
+    FillLedger, FillTime, LadderConfig, LedgerConfig, MarketCapsConfig, OmsError, OrderKey,
+    OrderOp, Plan, PlanError, PlanRefusal, Planned, PlannerConfig, PreTradeCaps, ReduceFallback,
+    Registry, ResyncSnapshot, Stage,
 };
 
 const INST: InstrumentId = InstrumentId::new(1);
@@ -103,12 +104,17 @@ fn ladder_cfg() -> LadderConfig {
 /// A named registry under the inventory cap and a wide resting cap on `INST`, whose first
 /// trustworthy resync showed no order and seeded `INST` at `pos`, armed and Quoting.
 fn quoting(pos: i64) -> Registry {
+    quoting_resting(pos, WIDE)
+}
+
+/// [`quoting`] under the resting cap `resting` per side.
+fn quoting_resting(pos: i64, resting: i64) -> Registry {
     let caps = PreTradeCaps::new()
         .with_market(
             INST,
             MarketCapsConfig {
                 inventory: Some(lots(CAP)),
-                resting: Some(lots(WIDE)),
+                resting: Some(lots(resting)),
             },
         )
         .unwrap();
@@ -1410,4 +1416,132 @@ fn an_emulated_order_whose_quote_becomes_ordinary_stays_within_what_is_left_to_r
     // Its amend in flight, nothing more is built: no cancel, no second amend.
     let again = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER2);
     assert!(again.commands.is_empty(), "{:?}", shape(&again));
+}
+
+/// Each refused level and why, in the order refused.
+fn refusals(plan: &Plan) -> Vec<(Side, u16, PlanRefusal)> {
+    plan.refused
+        .iter()
+        .map(|r| (r.side, r.level, r.why.clone()))
+        .collect()
+}
+
+/// The resting-cap refusal on the sell side of `INST`, `resting` against the cap of 12.
+fn resting_capped(resting: i64) -> CapRefusal {
+    CapRefusal::RestingCap {
+        inst: INST,
+        side: Side::Sell,
+        resting: Some(lots(resting)),
+        cap: lots(12),
+    }
+}
+
+#[test]
+fn a_reducer_refused_for_its_own_cap_leaves_the_emulated_order_resting() {
+    // Reviewer B B8: long 10 under a resting cap of 12 per side; a reduce-only ask of 15 at
+    // level 0 and an emulated exit of 10 at level 1. The ask is refused by the resting cap on
+    // its own, the emulated order counted or not: cancelling the emulated order for it would
+    // only see it placed again the next pass, and cancelled again the one after, forever. The
+    // ask reports its own refusal and the emulated order rests.
+    let mut reg = quoting_resting(10, 12);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]);
+    let desired = book()
+        .with(Side::Sell, 0, reduce_only(limit(10_010, 15)))
+        .with(
+            Side::Sell,
+            1,
+            maker_exit(10_020, 10, ReduceFallback::EmulateReduceOnly),
+        );
+    let plan = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, MonoNs(0));
+    assert_eq!(
+        shape(&plan),
+        vec![(Stage::Reducing, "place", Side::Sell, 1)]
+    );
+    let emulated = plan.commands[0].cid;
+    assert_emulated(placed(&plan.commands[0]), 10);
+    ack(&mut reg, emulated, "v1");
+    for now in [LATER, LATER2, LATER3] {
+        let pass = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, now);
+        assert!(pass.commands.is_empty(), "{:?}", shape(&pass));
+        assert_eq!(
+            refusals(&pass),
+            vec![(
+                Side::Sell,
+                0,
+                PlanRefusal::Place(OmsError::Capped(resting_capped(15)))
+            )]
+        );
+        assert!(!reg.get(emulated).unwrap().state().is_terminal());
+    }
+}
+
+#[test]
+fn a_reducer_the_resting_cap_admits_once_the_emulated_order_ends_waits_for_its_cancel() {
+    // Reviewer B B8, the other way: long 10 under a resting cap of 12 per side, an emulated
+    // exit of 10 resting at level 1; a reduce-only ask of 5 at level 0 is refused with the
+    // emulated order resting (15 > 12) but admitted once it ends. The emulated order is
+    // cancelled for it, and the ask built once that order is terminal, then the emulated
+    // level again at what is left.
+    let mut reg = quoting_resting(10, 12);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]);
+    let exit = maker_exit(10_020, 10, ReduceFallback::EmulateReduceOnly);
+    let first = book().with(Side::Sell, 1, exit);
+    let plan = plan_and_send(&mut p, &first, &mut reg, &caps, &mut mint, MonoNs(0));
+    let emulated = plan.commands[0].cid;
+    ack(&mut reg, emulated, "v1");
+    let next = first.with(Side::Sell, 0, reduce_only(limit(10_010, 5)));
+    let pass = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER);
+    assert_eq!(shape(&pass), vec![(Stage::Cancel, "cancel", Side::Sell, 1)]);
+    assert_eq!(pass.commands[0].cid, emulated);
+    assert_eq!(waiting(&pass), vec![(Side::Sell, 0)]);
+    cancelled(&mut reg, emulated, Side::Sell, "v1", 2);
+    let after = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER2);
+    assert_eq!(
+        shape(&after),
+        vec![
+            (Stage::Reducing, "place", Side::Sell, 0),
+            (Stage::Reducing, "place", Side::Sell, 1),
+        ]
+    );
+    assert_emulated(placed(&after.commands[1]), 5);
+}
+
+#[test]
+fn a_reducer_amend_refused_for_its_own_cap_leaves_the_emulated_order_resting() {
+    // Reviewer B B8 for an amend: long 10 under a resting cap of 12 per side, a reduce-only
+    // ask of 2 at level 0 and an emulated exit of 8 at level 1 rest. The ask grows to 14 by
+    // amend, which the resting cap refuses on its own: the amend reports its own refusal and
+    // the emulated order rests.
+    let mut reg = quoting_resting(10, 12);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = amending(conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]));
+    let exit = maker_exit(10_020, 8, ReduceFallback::EmulateReduceOnly);
+    let first = book()
+        .with(Side::Sell, 0, reduce_only(limit(10_010, 2)))
+        .with(Side::Sell, 1, exit.clone());
+    let plan = plan_and_send(&mut p, &first, &mut reg, &caps, &mut mint, MonoNs(0));
+    let (native, emulated) = (plan.commands[0].cid, plan.commands[1].cid);
+    ack(&mut reg, native, "v0");
+    ack(&mut reg, emulated, "v1");
+    let grown = book()
+        .with(Side::Sell, 0, reduce_only(limit(10_010, 14)))
+        .with(Side::Sell, 1, exit);
+    for now in [LATER, LATER2] {
+        let pass = plan_and_send(&mut p, &grown, &mut reg, &caps, &mut mint, now);
+        assert!(pass.commands.is_empty(), "{:?}", shape(&pass));
+        assert_eq!(
+            refusals(&pass),
+            vec![(
+                Side::Sell,
+                0,
+                PlanRefusal::Amend(AmendRefusal::Capped(resting_capped(14)))
+            )]
+        );
+        assert!(!reg.get(emulated).unwrap().state().is_terminal());
+    }
 }
