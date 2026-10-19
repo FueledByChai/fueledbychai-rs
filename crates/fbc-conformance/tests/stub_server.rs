@@ -69,6 +69,31 @@ async fn a_script_reads_pushes_and_closes_and_records_every_data_frame() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_close_with_a_code_reaches_the_client_with_its_code_and_reason() {
+    // FBC-xx0: a venue closing an idle connection says why, as Paradex's 4031 does.
+    let server = stub(vec![
+        Step::Accept,
+        Step::CloseWith {
+            conn: 0,
+            code: 4031,
+            reason: "no active subscriptions".into(),
+        },
+    ])
+    .await;
+    let mut ws = connector().websocket(&server.ws_url("/oe")).await.unwrap();
+    let Some(Ok(Message::Close(Some(close)))) = ws.next().await else {
+        panic!("a close frame with a body");
+    };
+    assert_eq!(u16::from(close.code), 4031);
+    assert_eq!(close.reason.as_str(), "no active subscriptions");
+    server.finished().await.unwrap();
+    while ws.next().await.is_some() {}
+    settle().await;
+    let conns = server.connections();
+    assert!(conns[0].upgraded && !conns[0].open);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_silent_connection_stays_open_reading_nothing_until_the_stub_is_dropped() {
     let server = stub(vec![
         Step::Accept,
@@ -218,6 +243,28 @@ async fn closing_a_connection_the_client_already_closed_fails_the_script() {
     let err = server.finished().await.unwrap_err();
     assert_eq!(err, ScriptError::Closed { step: 3, conn: 0 });
     assert_eq!(server.live(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn closing_with_a_code_a_connection_the_client_already_closed_fails_the_script() {
+    let server = stub(vec![
+        Step::Accept,
+        Step::Accept,
+        Step::Read { conn: 1 },
+        Step::CloseWith {
+            conn: 0,
+            code: 4031,
+            reason: String::new(),
+        },
+    ])
+    .await;
+    let first = connector().websocket(&server.ws_url("/oe")).await.unwrap();
+    let mut second = connector().websocket(&server.ws_url("/oe")).await.unwrap();
+    drop(first);
+    settle().await;
+    second.send(Message::text("go")).await.unwrap();
+    let err = server.finished().await.unwrap_err();
+    assert_eq!(err, ScriptError::Closed { step: 3, conn: 0 });
 }
 
 #[tokio::test(start_paused = true)]

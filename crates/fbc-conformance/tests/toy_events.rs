@@ -363,6 +363,34 @@ fn a_reject_is_mapped_by_the_toys_code_table() {
 }
 
 #[test]
+fn an_error_naming_no_request_is_an_uncorrelated_error_answering_nothing() {
+    // FBC-xx0: an error frame with no id, as Paradex sends one, is mapped by the same code
+    // table and names no request, so no deadline is cleared and no outcome is resolved by it.
+    for (code, kind) in REJECT_CODES
+        .iter()
+        .copied()
+        .chain([("9999", RejectKind::Other)])
+    {
+        let (meta, ev) = decoded(&format!("error|code={code}|msg=no luck"));
+        assert_eq!(meta, VenueMeta::NONE);
+        let reject = Reject {
+            kind,
+            venue_code: Some(code.into()),
+            raw: "no luck".into(),
+        };
+        assert_eq!(ev, ExecEvent::UncorrelatedError(reject));
+        assert_eq!(ev.answers(), None);
+    }
+    // Without a message it keeps an empty one; without a code it is refused.
+    let (_, ev) = decoded("error|code=1005");
+    let ExecEvent::UncorrelatedError(reject) = ev else {
+        panic!("an uncorrelated error");
+    };
+    assert_eq!(&*reject.raw, "");
+    refused("error|msg=x", DecodeError::Malformed("code"));
+}
+
+#[test]
 fn a_fill_is_keyed_by_the_venue_fill_id() {
     let fills = toy::caps().exec.unwrap().fills;
     assert!(fills.fill_id && fills.realized_pnl && fills.realized_funding);
