@@ -93,8 +93,8 @@
 //! was seen; a requote cancelled again, or a cancel seconds later of any order, however old, is
 //! another); the first prints a `WARN` line and the loop requotes; with
 //! `--mainnet`, a second on a later cycle within [`Options::cancel_window`] (30 s) of the first,
-//! or one of the loop's requote (the first order it placed on a side after the event before)
-//! within the window of that requote's place, however long the cycle that placed it (Codex
+//! or one of the loop's requote (the first order it placed on a side after the event before,
+//! a place that never rested aside: RB-aoh5-10) within the window of that requote's place, however long the cycle that placed it (Codex
 //! r4309154208 on PR #159), Stops the run and fails it ("another program cancelled our orders:
 //! one quoter per account"); past the window the next one starts a new window; a testnet run
 //! only warns. Once one was
@@ -224,7 +224,8 @@ pub enum NotOurs {
 ///
 /// A new event is a repeat when it comes within the window of the window's first event, or when
 /// it cancels the loop's requote of a side (the first order of ours placed on that side after
-/// the latest event was seen) within the window of that requote's place. The second is measured
+/// the latest event was seen, a place refused, not sent or that would cross aside: it never
+/// rested, [`Self::unrested`]) within the window of that requote's place. The second is measured
 /// from our place, not from the event before: the loop requotes a side another program
 /// cancelled only on the next cycle, and its reads, settle waits and rate-limit waits can make
 /// that cycle longer than the window, so by the first measure alone a co-tenant cancelling every
@@ -240,7 +241,7 @@ pub struct CancelsNotOurs {
     /// When each order of ours not ended was placed by this run.
     placed: HashMap<ClientOrderId, tokio::time::Instant>,
     /// The loop's requote of each side (bid, ask) since the latest event: the first order
-    /// placed on it after that event was seen, and when.
+    /// placed on it after that event was seen that did not end unrested, and when.
     requotes: [Option<(ClientOrderId, tokio::time::Instant)>; 2],
 }
 
@@ -291,6 +292,19 @@ impl CancelsNotOurs {
         let requote = &mut self.requotes[side_index(side)];
         if self.latest.is_some() && requote.is_none() {
             *requote = Some((cid, now));
+        }
+    }
+
+    /// Our place `cid` ended without resting: refused (for its rate, or a post-only place that
+    /// would cross), or never sent. It held its side's requote only as the first place after
+    /// the latest event, and another program cannot cancel it, so the side's requote is the next
+    /// order placed on it: the one that rests (RB-aoh5-10 on PR #159). Our own replace of a
+    /// requote that rested frees nothing: that replace is judged by the window's first event.
+    pub fn unrested(&mut self, cid: ClientOrderId) {
+        for slot in &mut self.requotes {
+            if slot.is_some_and(|(requote, _)| requote == cid) {
+                *slot = None;
+            }
         }
     }
 
@@ -1482,6 +1496,7 @@ impl Driver {
                 self.submitted.insert(rpc);
                 if let Err(reason) = sent {
                     self.note(format_args!("request {} was not sent: {reason:?}", rpc.0));
+                    self.unrested(rpc);
                     let answers = self.answers.entry(rpc).or_default();
                     answers.push((None, SubmitOutcome::NotSent(reason)));
                 }
@@ -1629,6 +1644,7 @@ impl Driver {
                     Some(cid)
                         if op == OpKind::Place && reject.kind == RejectKind::PostOnlyWouldCross =>
                     {
+                        self.not_ours.unrested(cid);
                         self.note(format_args!(
                             "the {} #{} was not rested: {what}; its side is left out of this \
                              cycle and placed again the next",
@@ -1750,6 +1766,19 @@ impl Driver {
         }
     }
 
+    /// Our place request `rpc` came back refused or was not sent: its order never rested
+    /// ([`CancelsNotOurs::unrested`]). A cancel request frees nothing.
+    fn unrested(&mut self, rpc: RpcId) {
+        if let Some(Request {
+            place: true,
+            first: Some((_, cid)),
+            ..
+        }) = self.ours.get(&rpc).copied()
+        {
+            self.not_ours.unrested(cid);
+        }
+    }
+
     /// Adds `cids` to the orders of ours the run knows.
     fn own(&mut self, cids: &[ClientOrderId]) {
         for cid in cids {
@@ -1793,6 +1822,12 @@ impl Driver {
         };
         if let SubmitOutcome::Rejected(reject) = &outcome {
             self.refused(place, &named, reject);
+        }
+        if matches!(
+            outcome,
+            SubmitOutcome::Rejected(_) | SubmitOutcome::NotSent(_)
+        ) {
+            self.unrested(rpc);
         }
         match (&outcome, place) {
             (SubmitOutcome::Accepted { ack }, true) if first => {
