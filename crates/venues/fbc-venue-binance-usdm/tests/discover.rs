@@ -192,7 +192,9 @@ fn discovery_refuses_a_configuration_it_cannot_send_by_the_key_at_fault() {
 fn the_documented_answer_decodes_into_one_draft_per_perpetual_in_the_decode_scope() {
     let drafts = discover(&exchange_info()).unwrap();
     // The delivery contract, the TradFi perpetual and the settling symbol whose contractType is
-    // empty are not PERPETUALs: none is a draft.
+    // empty are not PERPETUALs: none is a draft. 1000000MOGUSDT is a PERPETUAL whose base asset
+    // is longer than an asset symbol holds: passed over, not a refusal of every other symbol
+    // (Codex r4311120955).
     assert_eq!(
         symbols(&drafts),
         ["BTCUSDT", "ETHUSDT", "BTCUSDC", "OLDUSDT"]
@@ -362,7 +364,8 @@ fn a_value_stated_but_invalid_is_malformed_and_named() {
         ("status", "PAUSED".into(), "status"),
         ("status", 1.into(), "status"),
         ("symbol", 7.into(), "symbol"),
-        ("baseAsset", "TOOLONGBASE".into(), "baseAsset"),
+        ("baseAsset", "BT C".into(), "baseAsset"),
+        ("baseAsset", "BTC\u{e9}".into(), "baseAsset"),
         ("quoteAsset", "".into(), "quoteAsset"),
         ("marginAsset", 1.into(), "marginAsset"),
         ("filters", json!({}), "filters"),
@@ -484,4 +487,23 @@ fn a_java_era_x_usdt_ticker_names_the_xusdt_perpetual_and_no_other_form_is_read(
     ] {
         assert_eq!(rule(other), Err(SymbolError::NotCommonForm), "{other}");
     }
+}
+
+#[test]
+fn a_perpetual_whose_asset_names_do_not_fit_an_asset_symbol_is_passed_over_alone() {
+    // Binance lists multiplier-prefixed perpetuals (1000000MOGUSDT, base 1000000MOG): the core's
+    // asset symbol holds at most eight bytes, so such a perpetual cannot be keyed. It is passed
+    // over before its filters are read; every other symbol is still discovered (Codex
+    // r4311120955).
+    let expected = ["BTCUSDT", "ETHUSDT", "BTCUSDC", "OLDUSDT"];
+    for field in ["baseAsset", "quoteAsset", "marginAsset"] {
+        let long = with_btc(|m| {
+            m.insert(field.into(), "1MBABYDOGE".into());
+            filters(m).clear();
+        });
+        let drafts = discover(&long).unwrap();
+        assert_eq!(symbols(&drafts), expected[1..], "{field}");
+    }
+    let mog = with_symbol(7, |m| drop(m.insert("filters".into(), json!(7))));
+    assert_eq!(symbols(&discover(&mog).unwrap()), expected);
 }
