@@ -35,7 +35,8 @@ builds on the synthetic IOC.
    quote. An order whose quote becomes a synthetic IOC or an emulated reduce-only order of the
    same wire shape takes that mode (cancelled at once, or protected from overshoot from then
    on); a mode is never dropped while the order rests, so an emulated order whose quote is
-   now ordinary is still kept and amended within what is left to reduce.
+   now ordinary is still kept and amended within what is left to reduce, as the reducer it
+   still is: among the reducing commands and classified reducing, so Exit admits the amend.
 3. **Each downgrade is reported on its command.** `Planned::downgrades` lists the
    `Downgrade`s (`RpiUnsupported`, `RpiReduceOnly`, `SynthIoc`, `EmulatedReduceOnly`,
    `DroppedPostOnly`) in the order applied, on every place and amend built from a fitted
