@@ -111,8 +111,9 @@ time, seconds apart, are two: on mainnet that Stops the run). The first prints a
 account, or the Paradex UI; one quoter per account) and the loop requotes. A second on a later
 cycle within 30 s of the first Stops the run and fails it ("another program cancelled our
 orders: one quoter per account"), which catches a 3 s reconcile within about 6 s; so does one
-that cancels the loop's requote (the first order placed on a side after the event before) within
-30 s of that requote's place, however long the cycle that placed it took (its reads, settle and
+that cancels the loop's requote (the first order placed on a side after the event before; a
+place refused, not sent or that would cross never rested, so the next place on its side is the
+requote: RB-aoh5-10) within 30 s of that requote's place, however long the cycle that placed it took (its reads, settle and
 rate-limit waits do not count: Codex r4309154208 on PR #159); after 30 s with no second the
 window starts again. A cancel of ours that Paradex refuses (for its rate, say) stops covering its
 order at the refusal, so another program's cancel of it while ours waits is counted (Codex
