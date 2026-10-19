@@ -793,6 +793,53 @@ mod tests {
         assert_eq!(passes, 0);
     }
 
+    /// Codex P1 r4311000152 on PR #172: the consumer's inputs, dropped unpolled because a member
+    /// polled before them failed at once, are ended all the same: the ring refuses every push
+    /// after the run and the timers arm nothing, so nothing reports taken what no shard reads.
+    #[tokio::test]
+    async fn inputs_a_failing_member_drops_before_their_first_poll_are_ended() {
+        use crate::inputs::{ConsumerInputs, ConsumerInputsConfig, ConsumerTimers, InputRefusal};
+        let clock = IngestClock::new();
+        let (shared, _orders) = session_orders(1, &clock);
+        let timers = ConsumerTimers::new();
+        let config = ConsumerInputsConfig {
+            clock: clock.clone(),
+            capacity: 4,
+            timers: timers.clone(),
+        };
+        let (mut inputs, sender) = ConsumerInputs::new(config, |_: _| {}).unwrap();
+        let mut host = ShardHost::new(clock.clone());
+        let mut decide = |_: &[InstrumentId], _: &mut Ladder| {};
+        let failing = scripted(&clock, &shared, &[Act::Fail]);
+        let members = vec![failing, Member::inputs(&mut inputs)];
+        let ran = host.run(members, &mut decide).await;
+        assert_eq!(ran, Err(ShardError::Md(SessionError::NoConnectionLeft)));
+        assert_eq!(
+            sender.push(TrafficClass::Safety, 1, b"Stop".to_vec()),
+            Err(InputRefusal::Closed)
+        );
+        timers.arm(
+            std::time::Duration::ZERO,
+            TrafficClass::Normal,
+            2,
+            Vec::new(),
+        );
+        assert_eq!((timers.not_armed(), timers.pending()), (1, 0));
+        // A run of the inputs dropped before its first poll ends them too.
+        let (mut inputs, sender) = ConsumerInputs::new(
+            ConsumerInputsConfig {
+                clock: clock.clone(),
+                capacity: 4,
+                timers: ConsumerTimers::new(),
+            },
+            |_: _| {},
+        )
+        .unwrap();
+        drop(inputs.run());
+        let refused = sender.push(TrafficClass::Safety, 1, Vec::new());
+        assert_eq!(refused, Err(InputRefusal::Closed));
+    }
+
     /// The pass's ladder of two: the member ends or fails at the poll the host makes before the
     /// first command's turn, after it was submitted, or between the two; every command not yet
     /// submitted is handed back, through the decide pass's default `unsubmitted`.

@@ -752,6 +752,26 @@ mod tests {
         assert_eq!(timers.pending(), 0);
     }
 
+    /// Codex P1 r4311000162 on PR #172: a backlog of timers due at once is charged to the task's
+    /// coop budget like the ring's inputs, so one poll of the run takes only part of it and the
+    /// shard host's other members are polled before the rest.
+    #[tokio::test(start_paused = true)]
+    async fn a_backlog_of_due_timers_is_taken_within_the_tasks_coop_budget() {
+        let (timers, seen) = (ConsumerTimers::new(), Seen::default());
+        let (mut inputs, sender) = inputs(1, &timers, &seen);
+        drop(sender);
+        for kind in 0..300 {
+            timers.arm(Duration::ZERO, TrafficClass::Normal, kind, Vec::new());
+        }
+        let mut run = std::pin::pin!(inputs.run());
+        let first = poll_fn(|cx| Poll::Ready(run.as_mut().poll(cx))).await;
+        assert!(first.is_pending());
+        let taken = seen.borrow().len();
+        assert!(taken > 0 && taken < 300, "{taken} in one poll");
+        run.await;
+        assert_eq!(kinds(&seen), (0..300).collect::<Vec<u16>>());
+    }
+
     /// A timer armed while the run waits on an empty ring wakes it, so it fires at its deadline.
     #[tokio::test(start_paused = true)]
     async fn arming_a_timer_wakes_a_waiting_run() {
