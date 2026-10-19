@@ -374,14 +374,14 @@ fn wrote(journal: &Rc<RefCell<Kept>>, rpc: RpcId) -> bool {
 /// The epoch the journal last recorded opened.
 fn session_epoch(journal: &Rc<RefCell<Kept>>) -> ConnKey {
     let journal = journal.borrow();
-    let opened = journal.0.iter().filter_map(|(_, record)| match record {
+    let mut opened = journal.0.iter().filter_map(|(_, record)| match record {
         Record::Control {
             ev: fbc_journal::ControlEvent::Opened(key),
             ..
         } => Some(*key),
         _ => None,
     });
-    opened.last().unwrap()
+    opened.next_back().unwrap()
 }
 
 const BIG_KB: usize = 65_536;

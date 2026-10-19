@@ -207,8 +207,8 @@ rather than guess.
     reducing orders, the session's own cancel-on-disconnect arm and the resync may use it,
     0073; the commands waiting for the connection past the consumer's `outbound`
     `ReservedBound` (a Normal bound plus a reserve only cancels and reducing orders use)
-    `NotSent(Backpressure)`, nothing kept, reported on the next turn and journaled as its
-    write result, and a command past its class's room in the consumer's `InFlight` table of
+    refused at once, `SubmitRefusal::Backpressure`, nothing kept and the refusal journaled as
+    its write result, and a command past its class's room in the consumer's `InFlight` table of
     requests in flight, shared per venue or per connection, `NotSent(RateBudget)`, 0104), an
     authorization kept until its command is encoded, request ids from the account's `RpcIds`
     shared by its sessions, and each unanswered request handed to `on_rpc_timeout` once at its

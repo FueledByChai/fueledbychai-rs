@@ -11,8 +11,8 @@
 //! it ([`ExecHandler::on_submitted`](crate::ExecHandler::on_submitted)).
 //!
 //! The commands waiting are bounded by the consumer's [`ReservedBound`], a Normal bound plus a
-//! reserve for Safety traffic; one submitted past it waits only as a refusal to report
-//! (decision 0104).
+//! reserve for Safety traffic; one submitted past it is refused as it is submitted,
+//! [`SubmitRefusal::Backpressure`], nothing of it kept (decision 0104).
 //!
 //! [`Rpcs`] holds each written request's deadline until the first event that answers it
 //! ([`ExecEvent::answers`](fbc_core::ExecEvent::answers)); one still unanswered at its deadline
@@ -33,15 +33,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fbc_core::{
-    AccountKey, InstrumentId, NotSentReason, RpcCall, RpcId, Stamp, TrafficClass, VenueCommand,
-    VenueOrderSnapshot,
+    AccountKey, ConnKey, InstrumentId, NotSentReason, RpcCall, RpcId, Stamp, TrafficClass,
+    VenueCommand, VenueOrderSnapshot,
 };
+use fbc_journal::{Record, WriteRes};
 use fbc_oms::{Authorization, ControlCommand};
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use crate::bounds::{InFlight, ReservedBound};
 use crate::exec_gate::Gate;
+use crate::journal::Journal;
 use crate::session_core::IngestClock;
 
 /// Why [`ExecOrders`] took no command. Nothing of it reached the session.
@@ -51,6 +53,13 @@ pub enum SubmitRefusal {
     OtherAccount,
     /// The session has run, or was dropped: it takes no more commands.
     Ended,
+    /// Not sent, `NotSent(Backpressure)`: the commands already waiting for the connection fill
+    /// the bound its class may use (design §5.4, decision 0104). Nothing of it reached the
+    /// session and no request id was given; the refusal is journaled as a write result. The
+    /// authorization was dropped unspent: the consumer settles what fbc-oms holds for it as for
+    /// any command not sent (a place or batch item by `NotSent(Backpressure)` through
+    /// `Registry::on_outcome`, an amend by `Registry::amend_not_submitted`) and plans again.
+    Backpressure,
 }
 
 impl fmt::Display for SubmitRefusal {
@@ -58,6 +67,9 @@ impl fmt::Display for SubmitRefusal {
         f.write_str(match self {
             SubmitRefusal::OtherAccount => "the authorization is for another account",
             SubmitRefusal::Ended => "the order-entry session has ended",
+            SubmitRefusal::Backpressure => {
+                "the commands waiting for the connection fill the bound its class may use"
+            }
         })
     }
 }
@@ -110,25 +122,6 @@ pub(crate) struct Queued {
     pub(crate) origin: Option<Stamp>,
 }
 
-/// A submission refused as it was submitted, nothing of it kept: the commands waiting for the
-/// connection filled the bound its class may use (decision 0104). The session reports it
-/// `NotSent` for `reason` on its next turn, in submission order, and journals that as its write
-/// result.
-pub(crate) struct Refusal {
-    pub(crate) rpc: RpcId,
-    pub(crate) class: TrafficClass,
-    pub(crate) reason: NotSentReason,
-}
-
-/// What waits for the session's next turn, in submission order. A command is held inline, not
-/// boxed: every submission would otherwise allocate on the order path, for the sake of the
-/// refusals, which only an overflow makes.
-#[allow(clippy::large_enum_variant)]
-pub(crate) enum Waiting {
-    Command(Queued),
-    Refused(Refusal),
-}
-
 /// The request ids one account's order-entry sessions give, counted up across them: the
 /// consumer builds one per account and hands a clone to each session it builds for the account
 /// ([`ExecSessionConfig::rpc_ids`](crate::ExecSessionConfig::rpc_ids)), so an answer or an
@@ -164,14 +157,17 @@ pub(crate) struct Shared {
     acct: AccountKey,
     /// Where request ids are given from.
     ids: RpcIds,
-    queue: RefCell<VecDeque<Waiting>>,
+    queue: RefCell<VecDeque<Queued>>,
     /// The bound on the commands waiting, Safety traffic having a reserve beyond its Normal
     /// part (decision 0104).
     bound: ReservedBound,
-    /// The commands waiting, the refusals behind them left out.
-    commands: Cell<u64>,
     /// The submissions refused for want of room in the queue.
     backpressured: Cell<u64>,
+    /// Where such a refusal is journaled as a write result, once the consumer sets a journal.
+    journal: RefCell<Option<Journal>>,
+    /// The connection epoch the session is in, or waits to open: the one a refusal is journaled
+    /// under.
+    conn: Cell<ConnKey>,
     /// The request the shard host submitted from its ladder and may take back ([`Shared::keep`]).
     kept: Cell<Option<RpcId>>,
     /// That request, never to be sent, when it still waited as the session ended or was popped
@@ -213,8 +209,9 @@ impl Shared {
             ids,
             queue: RefCell::default(),
             bound,
-            commands: Cell::new(0),
             backpressured: Cell::new(0),
+            journal: RefCell::new(None),
+            conn: Cell::new(ConnKey { conn: 0, epoch: 0 }),
             kept: Cell::new(None),
             left: RefCell::default(),
             wake: Notify::new(),
@@ -234,39 +231,63 @@ impl Shared {
     /// Gives `item` the next request id and queues it for the session's next turn, if the
     /// commands waiting leave room for its class (decision 0104): a Normal one while fewer than
     /// the bound's Normal part wait, a Safety one while fewer than the whole bound do. Otherwise
-    /// nothing of it is kept (an authorization is dropped unspent) and its refusal waits in its
-    /// place, to be reported `NotSent(Backpressure)` on that turn.
+    /// it is refused, [`SubmitRefusal::Backpressure`], with no request id given and nothing of
+    /// it kept (an authorization is dropped unspent), the refusal counted and journaled as a
+    /// write result under its class.
     fn push(&self, item: Submitted) -> Result<RpcId, SubmitRefusal> {
         if self.ended.get() {
             return Err(SubmitRefusal::Ended);
         }
-        let rpc = self.ids.next();
         let class = item.class();
-        let waiting = if self.bound.admits(self.commands.get(), class) {
-            self.commands.set(self.commands.get() + 1);
-            Waiting::Command(Queued {
-                rpc,
-                item,
-                epoch: self.ready.get(),
-                origin: self.clock.handling(),
-            })
-        } else {
+        let waiting = u64::try_from(self.queue.borrow().len()).unwrap_or(u64::MAX);
+        if !self.bound.admits(waiting, class) {
             self.backpressured.set(self.backpressured.get() + 1);
-            let reason = NotSentReason::Backpressure;
-            Waiting::Refused(Refusal { rpc, class, reason })
+            self.journal_refusal(class);
+            return Err(SubmitRefusal::Backpressure);
+        }
+        let rpc = self.ids.next();
+        let epoch = self.ready.get();
+        let origin = self.clock.handling();
+        let queued = Queued {
+            rpc,
+            item,
+            epoch,
+            origin,
         };
-        self.queue.borrow_mut().push_back(waiting);
+        self.queue.borrow_mut().push_back(queued);
         self.wake.notify_one();
         Ok(rpc)
     }
 
-    /// What was submitted first of what waits: a command, or a refusal to report.
-    pub(crate) fn pop(&self) -> Option<Waiting> {
-        let next = self.queue.borrow_mut().pop_front();
-        if let Some(Waiting::Command(_)) = next {
-            self.commands.set(self.commands.get() - 1);
+    /// Journals a submission of `class` refused for want of room as its write result, on the
+    /// epoch the session is in or waits to open, at the shard clock's time; it names no request,
+    /// since none was given.
+    fn journal_refusal(&self, class: TrafficClass) {
+        if let Some(journal) = &*self.journal.borrow() {
+            let (at, wall) = self.clock.now();
+            let record = Record::WriteResult {
+                at,
+                conn: self.conn.get(),
+                rpc: None,
+                result: WriteRes::NotSent(NotSentReason::Backpressure),
+            };
+            journal.record(class, wall, &record);
         }
-        next
+    }
+
+    /// The journal a refusal is recorded in from now on.
+    pub(crate) fn set_journal(&self, journal: Journal) {
+        *self.journal.borrow_mut() = Some(journal);
+    }
+
+    /// The connection epoch the session is in, or waits to open, from now on.
+    pub(crate) fn set_conn(&self, conn: ConnKey) {
+        self.conn.set(conn);
+    }
+
+    /// The command submitted first of those waiting.
+    pub(crate) fn pop(&self) -> Option<Queued> {
+        self.queue.borrow_mut().pop_front()
     }
 
     /// The submissions refused because the commands waiting filled their bound.
@@ -297,16 +318,13 @@ impl Shared {
     }
 
     /// Takes back the command submitted as request `rpc` while it still waits for the session's
-    /// turn (one refused as it was submitted kept nothing to take back), or, when it is the request [kept](Shared::keep), was left waiting when the session
+    /// turn, or, when it is the request [kept](Shared::keep), was left waiting when the session
     /// ended or popped and never encoded: nothing of it reached the codec (decision 0100; Codex
     /// P1 r4309207253, r4309350872 on PR #164).
     pub(crate) fn withdraw(&self, rpc: RpcId) -> Option<Submitted> {
         let mut queue = self.queue.borrow_mut();
-        let named = |waiting: &Waiting| matches!(waiting, Waiting::Command(q) if q.rpc == rpc);
-        let found = queue.iter().position(named).and_then(|at| queue.remove(at));
-        if let Some(Waiting::Command(queued)) = found {
-            self.commands.set(self.commands.get() - 1);
-            return Some(queued.item);
+        if let Some(at) = queue.iter().position(|queued| queued.rpc == rpc) {
+            return queue.remove(at).map(|queued| queued.item);
         }
         let mut left = self.left.borrow_mut();
         let found = left.as_ref().is_some_and(|queued| queued.rpc == rpc);
@@ -353,11 +371,8 @@ impl Shared {
         self.ready.set(None);
         self.sending.set(false);
         let unsent = std::mem::take(&mut *self.queue.borrow_mut());
-        self.commands.set(0);
-        for waiting in unsent {
-            if let Waiting::Command(queued) = waiting {
-                self.unsent(queued);
-            }
+        for queued in unsent {
+            self.unsent(queued);
         }
     }
 }
@@ -370,8 +385,8 @@ impl Shared {
 /// ([`ExecHandler::on_submitted`](crate::ExecHandler::on_submitted)): sent, with the nonces
 /// it used, or not sent and why. A sent request is never written again: one the venue leaves
 /// unanswered is reported `Unknown` at its deadline (decision 0057). A submission the commands
-/// already waiting leave no room for, under the consumer's outbound bound for its class, keeps
-/// nothing and is reported `NotSent(Backpressure)` on that turn (decision 0104).
+/// already waiting leave no room for, under the consumer's outbound bound for its class, is
+/// refused at once, [`SubmitRefusal::Backpressure`], nothing of it kept (decision 0104).
 #[derive(Clone)]
 pub struct ExecOrders {
     pub(crate) shared: Rc<Shared>,
@@ -639,12 +654,8 @@ mod tests {
     }
 
     /// The command that waited first.
-    fn queued(waiting: Option<Waiting>) -> Queued {
-        let mut command = None;
-        if let Some(Waiting::Command(queued)) = waiting {
-            command = Some(queued);
-        }
-        command.expect("a command waits")
+    fn queued(waiting: Option<Queued>) -> Queued {
+        waiting.expect("a command waits")
     }
 
     fn call(id: u64, ms: u64) -> RpcCall {
@@ -877,11 +888,24 @@ mod tests {
         assert_eq!(back, Some(VenueCommand::FeeQuery));
     }
 
-    /// Decision 0104: past the Normal bound, a Normal submission keeps nothing and waits only as
-    /// its refusal, in submission order, and cannot be withdrawn; a turn taking a command makes
-    /// room again, and an ended session drops what waits.
+    /// Decision 0104: past the Normal bound, a Normal submission is refused at once, given no
+    /// request id and kept nowhere, and journaled as a write result under the epoch the session
+    /// is in; a turn taking a command makes room again.
     #[test]
-    fn a_submission_past_the_bound_its_class_may_use_waits_only_as_its_refusal() {
+    fn a_submission_past_the_bound_its_class_may_use_is_refused_and_journaled() {
+        use fbc_core::WallNs;
+        use fbc_journal::{JournalSink, Recorded};
+        #[derive(Default)]
+        struct Kept(Vec<(TrafficClass, Record)>);
+        impl JournalSink for Kept {
+            fn record(&mut self, class: TrafficClass, _: WallNs, record: &Record) -> Recorded {
+                self.0.push((class, record.clone()));
+                Recorded::Ok
+            }
+            fn omit(&mut self, _: TrafficClass, _: WallNs) -> Recorded {
+                Recorded::Ok
+            }
+        }
         let shared = Shared::new(
             AccountKey::new(2),
             RpcIds::default(),
@@ -894,28 +918,29 @@ mod tests {
         let orders = ExecOrders {
             shared: Rc::clone(&shared),
         };
-        let fee = |orders: &ExecOrders| orders.submit_control(ControlCommand::FeeQuery).unwrap();
-        let (taken, refused) = (fee(&orders), fee(&orders));
+        let fee = || orders.submit_control(ControlCommand::FeeQuery);
+        // Refused before a journal is set: counted, nothing recorded.
+        let taken = fee().unwrap();
+        assert_eq!(fee(), Err(SubmitRefusal::Backpressure));
+        let sink = Rc::new(RefCell::new(Kept::default()));
+        shared.set_journal(Journal::new(Rc::clone(&sink)));
+        let conn = ConnKey { conn: 3, epoch: 2 };
+        shared.set_conn(conn);
         // A control command is Normal traffic: the reserve is not its to use.
-        assert_eq!(shared.backpressured(), 1);
-        assert!(orders.withdraw(refused).is_none());
-        assert_eq!(queued(shared.pop()).rpc, taken);
-        // The refusal waits behind the command.
-        let backpressure = NotSentReason::Backpressure;
-        let refusal = |r: &Refusal| (r.rpc, r.class, r.reason);
-        let named = (refused, TrafficClass::Normal, backpressure);
-        assert!(matches!(shared.pop(), Some(Waiting::Refused(r)) if refusal(&r) == named));
-        // Room again once the turn took the command.
-        let again = fee(&orders);
-        let past = fee(&orders);
+        assert_eq!(fee(), Err(SubmitRefusal::Backpressure));
         assert_eq!(shared.backpressured(), 2);
-        assert!(orders.withdraw(again).is_some());
-        let room = fee(&orders);
-        assert!(orders.withdraw(room).is_some());
-        orders.keep(past);
-        shared.end();
-        assert!(!shared.waiting());
-        assert!(orders.withdraw(past).is_none());
+        let refused = WriteRes::NotSent(NotSentReason::Backpressure);
+        let journaled = |record: &Record| matches!(record, Record::WriteResult { conn: c, rpc: None, result, .. } if *c == conn && *result == refused);
+        let records = &sink.borrow().0;
+        assert_eq!(records.len(), 1);
+        assert!(records[0].0 == TrafficClass::Normal && journaled(&records[0].1));
+        // Room again once a turn took the command; the next id follows the last one given.
+        assert_eq!(queued(shared.pop()).rpc, taken);
+        assert_eq!(fee(), Ok(RpcId(taken.0 + 1)));
+        assert_eq!(
+            SubmitRefusal::Backpressure.to_string(),
+            "the commands waiting for the connection fill the bound its class may use"
+        );
     }
 
     /// Decision 0104: an admitted request holds its place in the table until it is answered,

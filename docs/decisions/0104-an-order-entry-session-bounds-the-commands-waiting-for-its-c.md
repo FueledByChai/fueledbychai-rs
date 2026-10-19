@@ -29,17 +29,20 @@ states no retry time for its rate-limit code 42901, so the samples wait their ow
    reducing order are Safety), every control command Normal.
 2. **The outbound queue, per connection.** `ExecSessionConfig::outbound` bounds the commands
    submitted through the session's `ExecOrders` and not yet taken by a turn. One submitted past
-   the bound its class may use is given its request id as before, but nothing of it is kept
-   (an authorization is dropped unspent, which fbc-oms's held-place rule releases, 0084): its
-   refusal waits in its place and is reported to `ExecHandler::on_submitted` as
-   `NotSent(Backpressure)` on the session's next turn, in submission order, connected or
-   waiting to reconnect, and journaled just before as
-   `Record::WriteResult { rpc, result: NotSent(Backpressure) }` under its class on the epoch
-   the turn runs on. Nothing of it reaches the codec, a nonce source or a socket. The OMS keeps
-   the intent: the planner sees the order not sent and plans it again. Counted in
-   `ExecCounters::backpressure_refusals`. A refused command is not one the shard host can take
-   back (`ExecOrders::withdraw` finds none); the host submits a ladder command only once every
-   session holds nothing, so with a Normal bound of at least one its own commands always fit.
+   the bound its class may use is refused as it is submitted:
+   `ExecOrders::submit` (or `submit_control`) returns `SubmitRefusal::Backpressure`, the
+   runtime's form of `NotSent(Backpressure)`, with no request id given and nothing of it kept, so
+   nothing grows past the bound however many are submitted while a write waits (Codex P1
+   r4312640254 on PR #174). The refusal is journaled at once as
+   `Record::WriteResult { rpc: None, result: NotSent(Backpressure) }` under its class, on the
+   epoch the session is in or waits to open, and counted in
+   `ExecCounters::backpressure_refusals`. Nothing of it reaches the codec, a nonce source or a
+   socket. The authorization is dropped unspent. The OMS keeps the intent: the consumer settles
+   what fbc-oms holds for the command as for any command not sent (a place or a batch item by
+   `NotSent(Backpressure)` through `Registry::on_outcome`, an amend by
+   `Registry::amend_not_submitted`; a cancel left nothing pending) and plans again. The shard
+   host submits a ladder command only once every session holds nothing, so with a Normal bound
+   of at least one its own commands always fit.
 3. **The table of requests in flight, per venue or per connection.** `InFlight::new(bound)`,
    given as `ExecSessionConfig::in_flight`, counts the requests written (or asked as an HTTP
    request, 0081) and neither answered nor timed out. Clones share one count, so the consumer
@@ -60,13 +63,17 @@ states no retry time for its rate-limit code 42901, so the samples wait their ow
 
 - **The design's numbers as defaults.** Refused by 0009 and the ticket: a consumer submitting a
   ladder of many levels at once needs another bound than a single-quote sample.
-- **Refuse at submit with a `SubmitRefusal`.** `ExecOrders::submit` would return the refusal
-  at once, but the consumer's fbc-oms glue learns what became of a command only through
-  `on_submitted`, and `NotSent(Backpressure)` is already a `SubmitOutcome` fbc-oms applies
-  (`place_not_submitted`). Reporting it there keeps one path for every not-sent reason.
-- **Keep the refused command in the queue until its turn.** The authorization would be held
-  longer for nothing, and the queue would hold what it refused; a refusal keeps only its id and
-  class.
+- **Report the refusal through `on_submitted` on the next turn.** That keeps one path for every
+  not-sent reason, and PR #174 first did it. But the record of each refusal waits in the queue
+  until the turn, and while a write waits on a stalled peer the turn does not come, so the
+  refusals grow without limit. That is the growth the bound exists to prevent (Codex P1
+  r4312640254). A second bound on the refusals would need its own overflow policy, which could
+  only be this one. Refusing as it is submitted is also how the consumer-input ring refuses a
+  push into a full ring (0103).
+- **Hand the authorization back with the refusal.** The consumer could then submit it again
+  unchanged. But a refusal that carries the command changes the error type of every submission,
+  and fbc-oms holds the place as issued either way, so the consumer still settles it or submits
+  again. A rebuilt command is checked again like any other.
 - **Let Safety traffic past the whole outbound bound, as the journal's reserve does.** The
   journal never blocks and drops what it cannot keep; an outbound queue that a burst of cancels
   could grow without limit is the defect the bound exists to close. The consumer sizes the
@@ -77,7 +84,10 @@ states no retry time for its rate-limit code 42901, so the samples wait their ow
 ## Consequences
 
 - Every `ExecSessionConfig` states both bounds; the owner-run samples state 16 Normal and 16
-  more for Safety for each (`fbc-examples`), the tests their own.
+  more for Safety for each (`fbc-examples`), the tests their own. The samples' glue treats a
+  refused submission as a problem, as it treats `SubmitRefusal::OtherAccount` and `Ended`.
+- A consumer's glue handles `SubmitRefusal::Backpressure` beside `on_submitted`'s not-sent
+  receipts: two paths, so that the queue's memory stays bounded.
 - A refusal is never retried by the runtime: the consumer re-plans (0005, 0013 rule 1), after
   its own wait where the venue states none (PR #158).
 - The conformance order-entry checks build sessions with ample bounds, so their results do not
