@@ -1,4 +1,4 @@
-//! FBC-hvqi's done line (decisions 0006, 0023, 0101, 0102): during a toy market-data session on
+//! FBC-hvqi's done line (decisions 0006, 0023, 0101, 0103): during a toy market-data session on
 //! the shard host, consumer inputs pushed from another thread and a timer the input handler
 //! arms each reach the handler stamped with the shard's next ingest sequence, among the
 //! session's frames, and journaled as an input consumer record before the handler sees them;
@@ -343,6 +343,20 @@ async fn consumer_inputs_and_a_handler_timer_are_stamped_journaled_then_handled_
                 .iter()
                 .any(|s| matches!(s, Step::Md(_)))
     );
+    // Each input called for a decide pass, as a frame does: a Cycle record after it covers it.
+    for (i, record) in read.iter().enumerate() {
+        if let Record::Consumer {
+            ingest_seq: Some(seq),
+            ..
+        } = record
+        {
+            let covered = read[i..].iter().any(
+                |r| matches!(r, Record::Cycle { last_ingest_seq, .. } if last_ingest_seq >= seq),
+            );
+            assert!(covered, "input {seq} in {read:#?}");
+        }
+    }
+    assert!(host.passes() >= 1);
 
     // Replay hands the same inputs and the firing back at the same positions, through timers
     // that arm nothing.

@@ -11,7 +11,8 @@
 //!   `Recovered`), the nonces each source reserved, the context (wall and monotonic time,
 //!   nonces) each encode was given, and decide-cycle boundaries; and the consumer's own
 //!   records, its inputs and annotations as opaque bytes (`Record::Consumer`, decision 0101),
-//!   which it writes through the same sink in the shard's total order.
+//!   which it writes through the same sink in the shard's total order, an input the shard
+//!   stamped with its ingest sequence (decision 0103).
 //! - [`JournalWriter`], which writes one shard's records into a directory the consumer
 //!   supplies, one subdirectory per UTC day (`YYYYMMDD`), segments named
 //!   `<shard>-<seq>.fbcj`, rolled at every UTC hour; each segment it closes is compressed with

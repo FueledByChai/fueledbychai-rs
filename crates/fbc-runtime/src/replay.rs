@@ -23,8 +23,14 @@
 //! is BT-402's. A ping, pong or close frame the session received reached no codec live, so its
 //! record (FBC-drf, decision 0041) is fed to none either. A consumer's own record (FBC-hxkm,
 //! decision 0101) reaches no codec: one whose input flag is false is the consumer's annotation,
-//! passed over as an outbound frame is, and an input is passed over too until the
-//! consumer-inputs ticket (FBC-hvqi) hands it back to the handler at its place. The caller supplies what the session ran with: the [`VenueConfig`], the
+//! passed over as an outbound frame is. A consumer input the shard stamped (FBC-hvqi, decision
+//! 0103) is handed back to the input handler set with [`MdReplay::set_inputs`] at its place,
+//! with its recorded ingest sequence, time, kind and bytes, as live; with none set, or for an
+//! input the consumer journaled itself (no ingest sequence), it is passed over. A replay arms
+//! no timer: the consumer's handlers arm through [`ConsumerTimers::inert`](crate::ConsumerTimers::inert),
+//! and each firing the live shard took comes back from the journal.
+//!
+//! The caller supplies what the session ran with: the [`VenueConfig`], the
 //! [`SpecTable`] and the endpoint's plan. Whether the journal's `SessionStart` header carries
 //! them is the consumer's choice (design §9).
 //!
@@ -50,7 +56,7 @@ use fbc_core::{
 };
 use fbc_journal::{ControlEvent, HttpResponseRec, JournalError, Marker, Opcode, Record};
 
-use crate::inputs::InputHandler;
+use crate::inputs::{ConsumerInput, InputHandler};
 use crate::session::{MdHandler, feed_frame, feed_http, feed_timer};
 
 /// What a replay needs, all from the consumer: what the session ran with.
@@ -251,7 +257,26 @@ impl<H: MdHandler> MdReplay<H> {
                     _ => self.counters.stale += 1,
                 }
             }
-            // The consumer's own: no codec's input (decision 0101).
+            // An input the shard stamped goes back to the consumer at its place (FBC-hvqi).
+            Record::Consumer {
+                at,
+                kind,
+                input: true,
+                ingest_seq: Some(ingest_seq),
+                bytes,
+            } => {
+                if let Some(inputs) = &mut self.inputs {
+                    inputs.on_input(ConsumerInput {
+                        ingest_seq: *ingest_seq,
+                        at: *at,
+                        kind: *kind,
+                        bytes: bytes.0.clone(),
+                    });
+                    self.counters.inputs += 1;
+                }
+            }
+            // The consumer's annotations and the inputs it journaled itself: no codec's input
+            // (decision 0101), and nothing the shard handed on.
             Record::Consumer { .. } => {}
             _ => {}
         }

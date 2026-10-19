@@ -322,7 +322,7 @@ fn a_segment_of_an_earlier_version_holding_a_consumer_record_is_malformed() {
     drop(writer);
     let path = root.join("20261003/1-000000.fbcj");
     assert_eq!(version_at(&path), VERSION);
-    assert_eq!(VERSION, 8);
+    assert_eq!(VERSION, 9);
     // Read as written, then relabelled as each earlier version: no writer of those wrote one,
     // so the segment is damaged, not newer. The record before it reads as it did.
     let back: Vec<_> = JournalReader::open(&root, 1).unwrap().collect();
@@ -344,9 +344,48 @@ fn a_segment_of_an_earlier_version_holding_a_consumer_record_is_malformed() {
     }
 }
 
+/// FBC-hvqi: a consumer input the shard stamped, which version 9 added, makes a segment
+/// relabelled as version 8 damaged at that record, the records before it read as they were.
+#[test]
+fn a_version_8_segment_holding_a_stamped_consumer_input_is_malformed() {
+    let root = fresh_dir("stamped_in_v8");
+    let mut writer = JournalWriter::create(&root, 1, key()).unwrap();
+    let unstamped = consumer(1, 1, true, b"Start");
+    let stamped = Record::Consumer {
+        at: MonoNs(2),
+        kind: 1,
+        input: true,
+        ingest_seq: Some(7),
+        bytes: Opaque(b"Stop".to_vec()),
+    };
+    writer.append(NOON, &unstamped).unwrap();
+    writer.append(NOON, &stamped).unwrap();
+    drop(writer);
+    let path = root.join("20261003/1-000000.fbcj");
+    let back: Vec<_> = JournalReader::open(&root, 1).unwrap().collect();
+    assert!(
+        matches!(&back[..], [Ok(a), Ok(b)] if *a == unstamped && *b == stamped),
+        "{back:?}"
+    );
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[4..6].copy_from_slice(&8u16.to_le_bytes());
+    fs::write(&path, &bytes).unwrap();
+    let back: Vec<_> = JournalReader::open(&root, 1).unwrap().collect();
+    assert_eq!(back.len(), 2, "{back:?}");
+    assert!(matches!(&back[0], Ok(r) if *r == unstamped), "{back:?}");
+    match &back[1] {
+        Err(JournalError::Malformed { segment, what }) => {
+            assert_eq!(*what, "consumer input flag");
+            assert_eq!(*segment, path);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
 /// A reader refuses a segment of a version newer than its own at the segment's header, naming
-/// the version: the check a reader of version 7 makes of a version 8 segment, made here by the
-/// version 8 reader of a version 9 one (the version 7 reader itself is in `src/reader.rs`).
+/// the version: the check a reader of the previous version makes of a current one, made here by
+/// the current reader of the next one (the previous version's reader itself is in
+/// `src/reader.rs`).
 #[test]
 fn a_reader_refuses_a_newer_version_at_the_header_naming_it() {
     let root = fresh_dir("consumer_newer");

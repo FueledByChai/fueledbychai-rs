@@ -221,9 +221,9 @@ fn consumer(at: u64, kind: u16, input: bool, bytes: &[u8]) -> Record {
 /// FBC-hxkm's done line, the replay's part (decision 0101): the consumer journals its own
 /// records through the shard's sink between a live toy session's steps, in the shard's total
 /// order; each reads back between the session's records it was written between, and decoder
-/// replay of that journal passes over every one whose input flag is false (and, until the
-/// consumer-inputs ticket hands them back, every input too), so it replays to the live
-/// envelopes with the counts a journal without them replays to.
+/// replay of that journal passes over every one whose input flag is false (and every input the
+/// consumer journaled itself, which no shard stamped: FBC-hvqi hands back only those it did), so
+/// it replays to the live envelopes with the counts a journal without them replays to.
 #[tokio::test]
 async fn consumer_records_journaled_between_a_sessions_records_are_passed_over_by_replay() {
     let root = fresh_dir("md_replay_consumer");
@@ -387,6 +387,68 @@ fn consumer_records_change_nothing_about_where_an_epochs_codec_is_built() {
     assert_eq!(venue.plans(), [vec![1, 2]]);
     assert_eq!(venue.plans(), bare_venue.plans());
     assert_eq!(venue.http_log(), bare_venue.http_log());
+}
+
+/// FBC-hvqi: a replay hands each consumer input the shard stamped back to the input handler at
+/// its place among the session's events, with its recorded sequence, time, kind and bytes; it
+/// passes over annotations and the inputs the consumer journaled itself, and with no input
+/// handler set it passes over every input, the events unchanged.
+#[test]
+fn a_replay_hands_back_only_stamped_inputs_and_only_to_an_input_handler() {
+    let stamped = |seq: u64, kind: u16| Record::Consumer {
+        at: MonoNs(seq * 10),
+        kind,
+        input: true,
+        ingest_seq: Some(seq),
+        bytes: Opaque(vec![kind as u8; 3]),
+    };
+    let records = vec![
+        opened(0),
+        stamped(1, 1),
+        frame(2, 0, &trade(2)),
+        consumer(25, 2, true, b"journaled by the consumer"),
+        consumer(26, 3, false, b"annotation"),
+        stamped(3, 4),
+        frame(4, 0, &trade(4)),
+        closed(0),
+        stamped(5, 5),
+    ];
+    // What reached the consumer, in order: an event's ingest sequence, or an input's.
+    let told: Rc<RefCell<Vec<(bool, u64)>>> = Rc::default();
+    let venue = ToyVenue::leak();
+    let md = told.clone();
+    let mut replay = MdReplay::new(replay_config(venue), move |env: Envelope<MdEvent>| {
+        md.borrow_mut().push((false, env.stamp.ingest_seq));
+    })
+    .unwrap();
+    let (inputs, handed) = (told.clone(), Rc::new(RefCell::new(Vec::new())));
+    let kept = handed.clone();
+    replay.set_inputs(move |input: fbc_runtime::ConsumerInput| {
+        inputs.borrow_mut().push((true, input.ingest_seq));
+        kept.borrow_mut().push(input);
+    });
+    replay.run(records.clone().into_iter().map(Ok)).unwrap();
+    assert_eq!(
+        *told.borrow(),
+        [(true, 1), (false, 2), (true, 3), (false, 4), (true, 5)]
+    );
+    assert_eq!(replay.counters().inputs, 3);
+    let last = handed.borrow()[2].clone();
+    assert_eq!(
+        (last.ingest_seq, last.at, last.kind, last.bytes),
+        (5, MonoNs(50), 5, vec![5; 3])
+    );
+
+    let (bare, counters, _) = replay_records(records);
+    assert_eq!(seqs(&bare).len(), 2);
+    assert_eq!(counters.inputs, 0);
+    assert_eq!(
+        counters,
+        MdReplayCounters {
+            inputs: 0,
+            ..replay.counters()
+        }
+    );
 }
 
 fn conn(epoch: u32) -> ConnKey {

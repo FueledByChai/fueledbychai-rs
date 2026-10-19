@@ -47,8 +47,14 @@
 //! the consumer's own inputs or annotations, its monotonic time (`u64`), the consumer's kind
 //! (`u16`), an input flag byte (0 an annotation, 1 an input) and its bytes, written verbatim.
 //! A version 2 to 7 segment holding it is malformed, and a reader of version 7 refuses a
-//! version 8 segment at its header, naming the version. The reader reads versions 2 to 8, so a
-//! journal written before reads back unchanged.
+//! version 8 segment at its header, naming the version.
+//!
+//! Version 9 (FBC-hvqi, decision 0103) gives a consumer input the shard stamped its ingest
+//! sequence and changes nothing else: its flag byte is 2, followed by the sequence (`u64`), then
+//! its bytes; an annotation and an input the consumer journaled itself are written as version 8
+//! wrote them (flag 0 and 1). A version 8 segment holding flag 2 is malformed, and a reader of
+//! version 8 refuses a version 9 segment at its header, naming the version. The reader reads
+//! versions 2 to 9, so a journal written before reads back unchanged.
 
 use core::ops::Range;
 
@@ -73,8 +79,9 @@ pub const MAGIC: [u8; 4] = *b"FBCJ";
 /// response bodies and response header names (FBC-7lm); version 5 keeps the kind an outbound
 /// frame was sent as (FBC-q7b) and adds the `InboundControl` kind (FBC-drf); version 6 adds the
 /// `StaleAuthorization` reason a write result may be not sent for (FBC-j5bw); version 7 adds the
-/// `RpcTimeout` kind (FBC-0hfl); version 8 adds the `Consumer` kind (FBC-hxkm).
-pub const VERSION: u16 = 8;
+/// `RpcTimeout` kind (FBC-0hfl); version 8 adds the `Consumer` kind (FBC-hxkm); version 9 adds
+/// the ingest sequence of a consumer input the shard stamped (FBC-hvqi).
+pub const VERSION: u16 = 9;
 /// The oldest format version this crate reads: version 1 is refused (0024).
 pub const OLDEST_READABLE: u16 = 2;
 /// The most bytes one record may redact, its spans and secret header values together.
@@ -460,13 +467,26 @@ fn encode_body(
             at,
             kind,
             input,
+            ingest_seq,
             bytes,
-            ..
         } => {
             e.u8(CONSUMER);
             e.u64(at.0);
             e.u16(*kind);
-            e.u8(u8::from(*input));
+            match (input, ingest_seq) {
+                (false, None) => e.u8(0),
+                (true, None) => e.u8(1),
+                // Version 9: an input the shard stamped, with its ingest sequence.
+                (true, Some(seq)) => {
+                    e.u8(2);
+                    e.u64(*seq);
+                }
+                (false, Some(_)) => {
+                    return Err(JournalError::Unencodable(
+                        "an annotation with an ingest sequence",
+                    ));
+                }
+            }
             e.bytes(&bytes.0)?;
         }
     }
@@ -1133,17 +1153,23 @@ pub(crate) fn decode_version(body: &[u8], version: u16) -> Result<(Record, Vec<S
             stamp: d.stamp()?,
             rpc: RpcId(d.u64()?),
         },
-        CONSUMER => Record::Consumer {
-            at: MonoNs(d.u64()?),
-            kind: d.u16()?,
-            input: match d.u8()? {
-                0 => false,
-                1 => true,
+        CONSUMER => {
+            let at = MonoNs(d.u64()?);
+            let kind = d.u16()?;
+            let (input, ingest_seq) = match d.u8()? {
+                0 => (false, None),
+                1 => (true, None),
+                2 if version >= 9 => (true, Some(d.u64()?)),
                 _ => return Err("consumer input flag"),
-            },
-            ingest_seq: None,
-            bytes: Opaque(d.bytes()?.to_vec()),
-        },
+            };
+            Record::Consumer {
+                at,
+                kind,
+                input,
+                ingest_seq,
+                bytes: Opaque(d.bytes()?.to_vec()),
+            }
+        }
         _ => return Err("record kind"),
     };
     if d.at != body.len() {

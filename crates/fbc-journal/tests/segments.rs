@@ -230,7 +230,8 @@ fn each_damaged_segment_is_reported_once_and_reading_goes_on() {
     let mut bad_magic = good.clone();
     bad_magic[0] = b'X';
     let mut bad_version = good.clone();
-    bad_version[4] = 9;
+    // A version no reader of this crate knows: the next one.
+    bad_version[4..6].copy_from_slice(&(VERSION + 1).to_le_bytes());
     let root = damaged(
         "damaged",
         &[
@@ -263,8 +264,9 @@ fn each_damaged_segment_is_reported_once_and_reading_goes_on() {
             format!("{:?}", timer(2)),
             format!("{} is not a journal segment", s(1)),
             format!(
-                "{} is in journal format version 9, which this reader does not know",
-                s(2)
+                "{} is in journal format version {}, which this reader does not know",
+                s(2),
+                VERSION + 1
             ),
             format!("{} ends inside a record", s(3)),
             format!("{:?}", timer(1)),

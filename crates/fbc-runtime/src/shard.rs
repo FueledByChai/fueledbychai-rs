@@ -5,7 +5,8 @@
 //! for at most the one command in progress and goes ahead of the rest (design §5.1-§5.2).
 //!
 //! The host drives the runs of the shard's sessions as its [`Member`]s
-//! ([`MdSession::run`], [`MdVenue::run`], [`ExecSession::run`]) on the one task that awaits
+//! ([`MdSession::run`], [`MdVenue::run`], [`ExecSession::run`], and the consumer's own inputs'
+//! [`ConsumerInputs::run`], FBC-hvqi) on the one task that awaits
 //! [`ShardHost::run`], polling each itself, and spawns no task. Every session and the host share
 //! one [`IngestClock`]: every input a session takes is stamped from it, which is how the host
 //! sees one taken.
