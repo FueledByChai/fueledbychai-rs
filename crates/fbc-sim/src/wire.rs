@@ -698,6 +698,12 @@ pub(crate) enum Reply {
         cid: String,
         vid: String,
     },
+    /// Item `idx` of placement request `rpc`, provisionally accepted and held for a risk check
+    /// that would refuse it, was cancelled first: settled with nothing more (decision 0099).
+    Withdrawn {
+        rpc: u64,
+        idx: u16,
+    },
     /// Item `idx` of placement request `rpc`, provisionally accepted, refused by the two-phase
     /// venue's risk check, with the order as it ended (decision 0099).
     RiskReject {
@@ -823,6 +829,7 @@ impl Reply {
                 .field("idx", idx)
                 .field("cid", cid)
                 .field("vid", vid),
+            Reply::Withdrawn { rpc, idx } => head("withdrawn").field("rpc", rpc).field("idx", idx),
             Reply::RiskReject {
                 rpc,
                 idx,
@@ -927,6 +934,10 @@ impl Reply {
                 idx: r.num("idx")?,
                 cid: r.str("cid")?.to_owned(),
                 vid: r.str("vid")?.to_owned(),
+            }),
+            "withdrawn" => single(Reply::Withdrawn {
+                rpc: r.num("rpc")?,
+                idx: r.num("idx")?,
             }),
             "risk" => {
                 let mut order = items(lines, "order", Record::event)?;
