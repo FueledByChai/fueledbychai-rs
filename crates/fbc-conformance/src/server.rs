@@ -15,6 +15,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 
 use fbc_runtime::http::Method;
 
@@ -219,7 +220,8 @@ impl StubServer {
 /// What the player asks a connection's task to do.
 enum Cmd {
     Push(Frame, oneshot::Sender<bool>),
-    Close(oneshot::Sender<bool>),
+    /// Close, with the frame's code and reason when it has them.
+    Close(Option<CloseFrame>, oneshot::Sender<bool>),
     Silent(oneshot::Sender<bool>),
     /// Ping the client; answered true once its pong to that ping arrives.
     Ping(oneshot::Sender<bool>),
@@ -335,9 +337,9 @@ async fn serve_ws(
                     };
                     let _ = sent.send(ok);
                 }
-                Some(Cmd::Close(sent)) => {
+                Some(Cmd::Close(frame, sent)) => {
                     let ok = tokio::select! {
-                        r = ws.close(None) => r.is_ok(),
+                        r = ws.close(frame) => r.is_ok(),
                         _ = stop.changed() => break,
                     };
                     let _ = sent.send(ok);
@@ -413,7 +415,17 @@ async fn play(
             // A close the socket did not take was not forced by the stub (Codex r4177464414).
             Step::Close { conn } => {
                 let (handle, closed) = handle(&mut conns, step, conn)?;
-                if !done(handle, Cmd::Close).await {
+                if !done(handle, |sent| Cmd::Close(None, sent)).await {
+                    return Err(closed);
+                }
+            }
+            Step::CloseWith { conn, code, reason } => {
+                let (handle, closed) = handle(&mut conns, step, conn)?;
+                let frame = CloseFrame {
+                    code: code.into(),
+                    reason: reason.into(),
+                };
+                if !done(handle, |sent| Cmd::Close(Some(frame), sent)).await {
                     return Err(closed);
                 }
             }

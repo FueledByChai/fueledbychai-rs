@@ -11,7 +11,8 @@
 //! anything, and [`ToySigner`] signs places, amends and cancels seeing only the reference the
 //! request carries; and the order and fill events (FBC-7ce): [`ToyExec`] decodes order updates,
 //! fills, request rejects (through [`REJECT_CODES`]) and venue modes through the
-//! [`DecodeScope`] it is lent; and the answers (FBC-sal): order queries by venue id or placement
+//! [`DecodeScope`] it is lent, and (FBC-xx0) an error naming no request as an
+//! `UncorrelatedError`; and the answers (FBC-sal): order queries by venue id or placement
 //! nonce answered with the query's rpc, a request's items answered in separate frames held and
 //! pushed in one call, a resync answered in frames and pushed whole at its end, and an
 //! authentication with [`TOY_TOKEN`] acknowledged; and its books (FBC-u1d): [`ToyMd`] keeps two

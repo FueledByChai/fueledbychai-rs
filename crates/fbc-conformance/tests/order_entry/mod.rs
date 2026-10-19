@@ -460,13 +460,27 @@ impl Run<'_> {
         self.until("replied", |r| r.server.played() >= at).await;
     }
 
-    /// Waits until the session has reported its `ended`th epoch ended, moves the paused clock
-    /// past the reconnect pacing, and waits until the script's [`Script::reopen`] has answered
-    /// the next connection's opening and that epoch takes places, its resync applied.
+    /// Waits until the session has reported its `ended`th epoch ended, moves the paused clock a
+    /// millisecond at a time until the session's next connection reaches the stub (within the
+    /// pacing's ceiling, or the test fails), and waits until the script's [`Script::reopen`] has
+    /// answered its opening and that epoch takes places, its resync applied. The clock moves in
+    /// steps because the session arms its pacing wait after it reports the epoch ended: a move
+    /// made before that would pass under it.
     pub async fn reopened(&mut self, ended: usize) {
         self.until("the epoch ended", |r| r.st.borrow().ended.len() >= ended)
             .await;
-        tokio::time::advance(PACING_CEILING).await;
+        let before = self.server.connections().len();
+        let tick = Duration::from_millis(1);
+        let mut moved = Duration::ZERO;
+        while self.server.connections().len() == before {
+            assert!(
+                moved < PACING_CEILING,
+                "no reconnect within the pacing's ceiling"
+            );
+            tokio::time::advance(tick).await;
+            moved += tick;
+            tokio::task::yield_now().await;
+        }
         self.replied().await;
         self.until("ready again", |r| {
             r.orders.may_place() && r.st.borrow().resynced == ended + 1

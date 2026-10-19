@@ -30,10 +30,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use fbc_conformance::Frame;
-use fbc_conformance::toy::{self, SYMBOL_A, reject_kind};
-use fbc_core::{
-    CancelReason, ClientOrderId, ExecEvent, Lots, Reject, SubmitOutcome, TrafficClass, encode_cid,
-};
+use fbc_conformance::toy::{SYMBOL_A, reject_kind};
+use fbc_core::{CancelReason, ClientOrderId, ExecEvent, Lots, Reject, SubmitOutcome, TrafficClass};
 use fbc_journal::{
     CloseRec, Entry, JournalReader, JournalWriter, Marker, QueueSink, Record, RedactionKey,
     SinkConfig, WsControl, journal_queue,
@@ -87,12 +85,6 @@ fn kinds(frames: &[Frame]) -> Vec<&str> {
     frames.iter().map(kind).collect()
 }
 
-/// `cid` as the toy's wire spells it.
-fn wire(cid: ClientOrderId) -> String {
-    let caps = toy::caps().exec.unwrap().order;
-    encode_cid(&caps.client_id, cid).unwrap().to_string()
-}
-
 /// What the stub learnt of the placement it read: its request id and our client id.
 #[derive(Clone, Default)]
 struct Placed(Arc<Mutex<Option<(String, String)>>>);
@@ -110,18 +102,21 @@ impl Placed {
     }
 }
 
-/// A placement answered as accepted and resting.
-fn place_rests() -> fbc_conformance::Responder {
-    answer("place", |frame| {
-        let (rpc, cid) = (field(frame, "rpc")?, field(frame, "cid")?);
+/// A placement answered as accepted and resting, noted in `placed`.
+fn place_rests(placed: &Placed) -> fbc_conformance::Responder {
+    let placed = placed.clone();
+    answer("place", move |frame| {
+        let (rpc, cid) = placed.read(frame)?;
         Ok(vec![accepted(&rpc), order(&cid, "open", 1)])
     })
 }
 
-/// A cancel answered as accepted, its order then reported cancelled as requested.
-fn cancel_ends(seq: u64) -> fbc_conformance::Responder {
+/// A cancel of the order `placed` notes (by its venue id once it is acknowledged) answered as
+/// accepted, the order then reported cancelled as requested under sequence `seq`.
+fn cancel_ends(placed: &Placed, seq: u64) -> fbc_conformance::Responder {
+    let placed = placed.clone();
     answer("cancel", move |frame| {
-        let (rpc, cid) = (field(frame, "rpc")?, field(frame, "cid")?);
+        let (rpc, (_, cid)) = (field(frame, "rpc")?, placed.get()?);
         Ok(vec![
             format!("item|rpc={rpc}|i=0|res=ok"),
             order(&cid, "canceled|why=requested", seq),
@@ -255,9 +250,10 @@ fn an_idle_close_with_a_venue_code_reconnects_authenticates_resyncs_and_writes_n
     // On the first connection a placement rests and our cancel ends it, so nothing rests and the
     // connection is idle; the stub then closes it with Paradex's idle code. The second
     // connection's opening is answered as the first's was: authenticated, armed, resynced flat.
+    let placed = Placed::default();
     let script = Script::default()
-        .reply(place_rests())
-        .reply(cancel_ends(2))
+        .reply(place_rests(&placed))
+        .reply(cancel_ends(&placed, 2))
         .close_with(IDLE_CODE, IDLE_REASON)
         .reopen();
     let dir = LeaseDir::new();
@@ -295,8 +291,6 @@ fn an_idle_close_with_a_venue_code_reconnects_authenticates_resyncs_and_writes_n
         ["auth", "cod", "resync", "place", "cancel"]
     );
     assert_eq!(kinds(&p.conns[1].received), ["auth", "cod", "resync"]);
-    let carries = |f: &&Frame| matches!(f, Frame::Text(t) if t.contains(&wire(cid)));
-    assert_eq!(p.received.iter().filter(carries).count(), 2);
     assert_eq!(p.st.authenticated, 2);
     assert_eq!(p.st.resynced, 2);
     // The close ended the first epoch, and the stop the second.
@@ -349,10 +343,10 @@ fn a_stalled_journal_writer_spends_the_reserve_a_cancel_still_goes_out_and_degra
     // unanswered. Once the writer resumes and has emptied the queue, a second placement is
     // answered: the first record it offers finds room again.
     let script = Script::default()
-        .reply(place_rests())
+        .reply(place_rests(&Placed::default()))
         .push((0..FILLERS).map(|n| id_less_error(&format!("f{n}"))))
         .read()
-        .reply(place_rests());
+        .reply(place_rests(&Placed::default()));
     let dir = LeaseDir::new();
     let (queue, drain) = journal_queue(
         SinkConfig {
