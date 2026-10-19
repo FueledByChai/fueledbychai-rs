@@ -112,7 +112,7 @@ const BOUND: Duration = Duration::from_secs(120);
 fn bursts_after(created: u64) -> bool {
     created
         .checked_sub(TARGETS + 1)
-        .is_some_and(|at| at % LADDER % 2 == 0)
+        .is_some_and(|at| (at % LADDER).is_multiple_of(2))
 }
 
 fn lots(n: i64) -> Lots {
@@ -648,10 +648,10 @@ fn percentile(sorted: &[i64], p: usize) -> i64 {
 /// harness's capture, and the job summary when the CI step gives one.
 fn report(line: &str) {
     let _ = writeln!(std::io::stderr(), "{line}");
-    if let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY") {
-        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
-            let _ = writeln!(f, "{line}\n");
-        }
+    if let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY")
+        && let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path)
+    {
+        let _ = writeln!(f, "{line}\n");
     }
 }
 
