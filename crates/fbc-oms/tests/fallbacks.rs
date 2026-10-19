@@ -1545,3 +1545,50 @@ fn a_reducer_amend_refused_for_its_own_cap_leaves_the_emulated_order_resting() {
         assert!(!reg.get(emulated).unwrap().state().is_terminal());
     }
 }
+
+#[test]
+fn a_reducer_judged_with_the_emulated_order_ended_still_counts_the_side_s_other_orders() {
+    // Reviewer B B8: long 10 under a resting cap of 12 per side; an emulated exit of 4 at
+    // level 1 and a plain post-only ask of 8 at level 2 rest (12). A reduce-only ask of 7 at
+    // level 0 would leave the emulated order overshooting (3 left for its 4), but with that
+    // order ended it still rests 15 beside the plain ask: it is refused for its own cap, and
+    // the emulated order rests.
+    let mut reg = quoting_resting(10, 12);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]);
+    let plain = DesiredQuote {
+        post_only: true,
+        ..limit(10_030, 8)
+    };
+    let first = book()
+        .with(
+            Side::Sell,
+            1,
+            maker_exit(10_020, 4, ReduceFallback::EmulateReduceOnly),
+        )
+        .with(Side::Sell, 2, plain);
+    let plan = plan_and_send(&mut p, &first, &mut reg, &caps, &mut mint, MonoNs(0));
+    assert_eq!(
+        shape(&plan),
+        vec![
+            (Stage::Reducing, "place", Side::Sell, 1),
+            (Stage::Add, "place", Side::Sell, 2),
+        ]
+    );
+    let (emulated, ask) = (plan.commands[0].cid, plan.commands[1].cid);
+    ack(&mut reg, emulated, "v1");
+    ack(&mut reg, ask, "v2");
+    let next = first.with(Side::Sell, 0, reduce_only(limit(10_010, 7)));
+    let pass = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER);
+    assert!(pass.commands.is_empty(), "{:?}", shape(&pass));
+    assert_eq!(
+        refusals(&pass),
+        vec![(
+            Side::Sell,
+            0,
+            PlanRefusal::Place(OmsError::Capped(resting_capped(15)))
+        )]
+    );
+    assert!(!reg.get(emulated).unwrap().state().is_terminal());
+}
