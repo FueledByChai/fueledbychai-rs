@@ -685,17 +685,20 @@ impl ExecutionPlanner {
                 continue;
             };
             // An emulated order, whatever its quote now asks (the mode is never dropped while
-            // it rests), is compared with the quote clipped to what is left to reduce.
+            // it rests), is compared with the quote clipped to what is left to reduce, and is
+            // amended as the reducer it still is: among the reducers, classified reducing, so
+            // Exit admits it (Codex r4315460452).
             let clipped;
             let q = match room {
-                Some(room) if f.quote.qty > room => {
+                Some(room) => {
                     clipped = DesiredQuote {
-                        qty: room,
+                        qty: f.quote.qty.min(room),
+                        reducing: true,
                         ..f.quote.clone()
                     };
                     &clipped
                 }
-                _ => &f.quote,
+                None => &f.quote,
             };
             if rec.removal().is_some() && !matches!(rec.intent(), Intent::PendingCancel { .. }) {
                 kept.push(slot.cid);
