@@ -63,14 +63,18 @@ builds on the synthetic IOC.
    left; an amend grows the order only to it. An order resting more than is left is cancelled
    at once, whatever its age or the book: at the pass's start (in 0005's order, with the other
    cancels), and by `ExecutionPlanner::on_fill`, which the consumer calls after every fill on
-   the market and which builds only those cancels. The level, if still wanted, is placed
+   the market, and every order update there that reports a fill (the room already counts
+   those fills before their fill events), and which builds only those cancels. The level, if still wanted, is placed
    again at the smaller size once the order is terminal.
 7. **A reducer never joins an emulated order it would leave overshooting.** A reducing place
    or amend (a synthetic IOC's included) whose worst case would leave an emulated order on its
    side resting more than is left to reduce is not built: the emulated order is cancelled in
    its place, and the reducer is refused `PlanRefusal::AwaitsEmulatedCancel` at every pass
    until that order is terminal, as a replace waits under 0065. Both could otherwise fill
-   before the cancel lands and take the position past zero.
+   before the cancel lands and take the position past zero. The emulated order is cancelled
+   only when the market's state and both caps would admit the reducer with that order ended;
+   a reducer refused anyway (by the resting cap, say) reports its own refusal and the
+   emulated order rests, so no order is placed and cancelled by turns.
 
 ## Alternatives
 
@@ -94,14 +98,19 @@ builds on the synthetic IOC.
 ## Consequences
 
 - Every `DesiredQuote` names a `reduce_fallback`; the consumer journals `Planned::downgrades`.
-- A consumer that emulates reduce-only calls `on_fill` after each fill on the market and
-  submits what it returns, as it does a pass's commands.
+- A consumer that emulates reduce-only calls `on_fill` after each fill on the market, and each
+  order update reporting one, and submits what it returns, as it does a pass's commands.
+- An order's emulated mode and reducing classification stay while it rests: one whose quote
+  later turns ordinary is still clipped and cancelled on overshoot, and still counts against
+  other emulated levels. Safe, at the cost of an extra cancel and replace.
 - Two emulated orders on one side can both be cancelled by one overshoot, since each counts
   the other until it is terminal: safe, at the cost of queue time.
 - On a venue that cancels only after the acknowledgement, a synthetic IOC can rest until its
   acknowledgement arrives and the next pass builds its cancel.
 - A reducer added beside a resting emulated order it would leave overshooting, a force-close
-  cross among them, goes out one cancel round trip later.
+  cross among them, goes out one cancel round trip later, and waits for as long as that order
+  cannot reach a terminal state (while it is Unknown until a resync, say): safe, but a
+  force-close waits with it.
 
 ## What would show this was wrong
 

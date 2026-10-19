@@ -24,6 +24,7 @@ use crate::permit::{
     self, CancelChoice, CancelPlan, Cancellable, DroppedPlaces, Live, PermitRefusal,
     PermittedCommand, PlacePlan, places_of,
 };
+use crate::planner::PlanRefusal;
 use crate::record::{Applied, FillApplied, OrderKey, OrderOp, OrderRecord, OutcomeApplied};
 use crate::resync::{MarketState, Placed, Placement, Seed};
 use crate::sweep::ForeignView;
@@ -334,7 +335,7 @@ impl Registry {
         inst: InstrumentId,
         side: Side,
         except: &[ClientOrderId],
-        each: fn(&OrderRecord) -> Lots,
+        each: impl Fn(&OrderRecord) -> Lots,
     ) -> Option<Lots> {
         self.orders
             .values()
@@ -343,6 +344,78 @@ impl Registry {
                 placed.inst == inst && placed.side == side && !except.contains(&placed.cid)
             })
             .try_fold(Lots::ZERO, |sum, rec| sum.checked_add(each(rec)))
+    }
+
+    /// [`Self::exposure`] with each of our orders in `ending` counted as it will be once
+    /// terminal with no further fill: nothing resting, and only the fills the venue reported on
+    /// its order updates that the inventory does not hold yet
+    /// ([`OrderRecord::exposure_once_ended`]).
+    fn exposure_ending(
+        &self,
+        inst: InstrumentId,
+        side: Side,
+        except: &[ClientOrderId],
+        ending: &[ClientOrderId],
+    ) -> Exposure {
+        let ends = |rec: &OrderRecord| ending.contains(&rec.cid());
+        Exposure {
+            others: self.sum_on(inst, side, except, |rec| {
+                if ends(rec) {
+                    rec.exposure_once_ended()
+                } else {
+                    rec.exposure()
+                }
+            }),
+            others_resting: self.sum_on(inst, side, except, |rec| {
+                if ends(rec) { Lots::ZERO } else { rec.resting() }
+            }),
+            ..self.exposure(inst, side, except)
+        }
+    }
+
+    /// Whether the market's state and the pre-trade caps would admit the place of `qty` on
+    /// `side` of `inst` (reduce-only or classified reducing when `marked`) once each of our
+    /// orders in `ending` is terminal with no further fill, judged as [`Self::place`] judges
+    /// it; nothing is built or registered. The planner asks it before cancelling the emulated
+    /// orders a reducer waits for, so a reducer refused anyway cancels nothing (FBC-01w).
+    pub(crate) fn admits_place_once_ended(
+        &self,
+        inst: InstrumentId,
+        side: Side,
+        qty: Lots,
+        marked: bool,
+        ending: &[ClientOrderId],
+    ) -> Result<(), OmsError> {
+        let admits = self.entries.admits(inst).map_err(OmsError::State)?;
+        judge_place(
+            admits,
+            &self.exposure_ending(inst, side, &[], ending),
+            qty,
+            marked,
+        )
+    }
+
+    /// Whether our order `cid` would get a Live permit and its amend to `px` and the total
+    /// `qty` be built ([`Registry::live`], [`Live::amend`](crate::Live::amend)) once each of
+    /// our orders in `ending` is terminal with no further fill; nothing is built. The planner
+    /// asks it before cancelling the emulated orders a reducer waits for (FBC-01w).
+    pub(crate) fn admits_amend_once_ended(
+        &self,
+        cid: ClientOrderId,
+        caps: &OrderCaps,
+        (px, qty, reducing): (Ticks, Lots, bool),
+        ending: &[ClientOrderId],
+    ) -> Result<(), PlanRefusal> {
+        let rec = self.orders.get(&cid).ok_or(PermitRefusal::UnknownCid(cid));
+        let rec = rec
+            .and_then(|rec| permit::live_refusal(rec).map(|()| rec))
+            .map_err(PlanRefusal::Permit)?;
+        let placed = rec.placed();
+        let exposure = self.exposure_ending(placed.inst, placed.side, &[cid], ending);
+        let state = self.entries.admits(placed.inst);
+        permit::judge_amend(rec, caps, state, &exposure, px, qty, reducing)
+            .map(|_| ())
+            .map_err(PlanRefusal::Amend)
     }
 
     /// What `inst` and `side` hold before an order is judged against the pre-trade caps: the
@@ -471,11 +544,7 @@ impl Registry {
             return Err(OmsError::DuplicateCid(order.cid));
         }
         let exposure = self.exposure(order.inst, order.side, &[]);
-        let adds = Adds::placing(order.qty);
-        admits
-            .judge(&exposure, order.reduces(), adds.exposure)
-            .map_err(OmsError::State)?;
-        exposure.admit(adds).map_err(OmsError::Capped)
+        judge_place(admits, &exposure, order.qty, order.reduces())
     }
 
     /// Registers a placement about to be sent, PendingNew, without building its command (an
@@ -1108,4 +1177,19 @@ impl Registry {
         }
         out
     }
+}
+
+/// Whether a place of `qty` on `exposure`'s side (reduce-only or classified reducing when
+/// `marked`) is admitted by the market's state, `admits`, then by both pre-trade caps.
+fn judge_place(
+    admits: Admits,
+    exposure: &Exposure,
+    qty: Lots,
+    marked: bool,
+) -> Result<(), OmsError> {
+    let adds = Adds::placing(qty);
+    admits
+        .judge(exposure, marked, adds.exposure)
+        .map_err(OmsError::State)?;
+    exposure.admit(adds).map_err(OmsError::Capped)
 }

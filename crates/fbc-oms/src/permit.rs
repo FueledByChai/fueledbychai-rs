@@ -357,23 +357,7 @@ impl<'r> Live<'r> {
         guard: Guard,
         exposure: Exposure,
     ) -> Result<Live<'r>, PermitRefusal> {
-        let cid = rec.cid();
-        match rec.state() {
-            OrdState::Terminal(_) => return Err(PermitRefusal::Terminal(cid)),
-            state @ (OrdState::PendingNew | OrdState::Unknown) => {
-                return Err(PermitRefusal::NotResting(cid, state));
-            }
-            OrdState::Open | OrdState::PartiallyFilled => {}
-        }
-        if rec.intent() != Intent::None || rec.cancel_awaits_ack() || rec.amend_built().is_some() {
-            return Err(PermitRefusal::IntentPending(cid));
-        }
-        if rec.unknown_since().is_some() {
-            return Err(PermitRefusal::OnLadder(cid));
-        }
-        if rec.from_snapshot() {
-            return Err(PermitRefusal::FromSnapshot(cid));
-        }
+        live_refusal(rec)?;
         Ok(Live {
             rec,
             origin,
@@ -429,21 +413,16 @@ impl<'r> Live<'r> {
         qty: Lots,
         reducing: bool,
     ) -> Result<PermittedCommand, AmendRefusal> {
-        let admits = self.state.map_err(AmendRefusal::State)?;
-        let rec = &*self.rec;
-        let placed = rec.placed();
-        let (amend, wire) = amend_shape(rec, caps, px, qty, reducing)?;
-        let exposure = rec.exposure_if_amended(qty, wire);
-        admits
-            .judge(&self.exposure, reducing || placed.reduce_only, exposure)
-            .map_err(AmendRefusal::State)?;
-        self.exposure
-            .admit(Adds {
-                exposure,
-                resting: rec.resting_if_amended(qty, wire),
-            })
-            .map_err(AmendRefusal::Capped)?;
-        let cid = rec.cid();
+        let (amend, wire) = judge_amend(
+            &*self.rec,
+            caps,
+            self.state,
+            &self.exposure,
+            px,
+            qty,
+            reducing,
+        )?;
+        let cid = self.rec.cid();
         let build = self.rec.set_amend_built(qty, wire);
         if reducing {
             self.rec.set_counted_reducing();
@@ -456,6 +435,58 @@ impl<'r> Live<'r> {
             hold: Hold::default(),
         })
     }
+}
+
+/// Why our order `rec` gets no [`Live`] permit, if it gets none: it is terminal, PendingNew or
+/// Unknown, has a command in flight, an amend built or a cancel waiting for its
+/// acknowledgement, is on the unknown-order ladder, or was learnt from a snapshot.
+pub(crate) fn live_refusal(rec: &OrderRecord) -> Result<(), PermitRefusal> {
+    let cid = rec.cid();
+    match rec.state() {
+        OrdState::Terminal(_) => return Err(PermitRefusal::Terminal(cid)),
+        state @ (OrdState::PendingNew | OrdState::Unknown) => {
+            return Err(PermitRefusal::NotResting(cid, state));
+        }
+        OrdState::Open | OrdState::PartiallyFilled => {}
+    }
+    if rec.intent() != Intent::None || rec.cancel_awaits_ack() || rec.amend_built().is_some() {
+        return Err(PermitRefusal::IntentPending(cid));
+    }
+    if rec.unknown_since().is_some() {
+        return Err(PermitRefusal::OnLadder(cid));
+    }
+    if rec.from_snapshot() {
+        return Err(PermitRefusal::FromSnapshot(cid));
+    }
+    Ok(())
+}
+
+/// Everything [`Live::amend`] judges, changing nothing: the amend of `rec` to `px` and the
+/// total `qty` with its wire quantity, as the venue's `caps` shape it, refused when the market's
+/// `state` builds no such amend or the amend would take `exposure` (the side's position and our
+/// other orders on it) past either pre-trade cap.
+pub(crate) fn judge_amend(
+    rec: &OrderRecord,
+    caps: &OrderCaps,
+    state: Result<Admits, StateRefusal>,
+    exposure: &Exposure,
+    px: Ticks,
+    qty: Lots,
+    reducing: bool,
+) -> Result<(AmendOrder, Option<Lots>), AmendRefusal> {
+    let admits = state.map_err(AmendRefusal::State)?;
+    let (amend, wire) = amend_shape(rec, caps, px, qty, reducing)?;
+    let adds = rec.exposure_if_amended(qty, wire);
+    admits
+        .judge(exposure, reducing || rec.placed().reduce_only, adds)
+        .map_err(AmendRefusal::State)?;
+    exposure
+        .admit(Adds {
+            exposure: adds,
+            resting: rec.resting_if_amended(qty, wire),
+        })
+        .map_err(AmendRefusal::Capped)?;
+    Ok((amend, wire))
 }
 
 /// The amend of `rec` to `px` and the total `qty` the venue's caps admit, with the quantity its

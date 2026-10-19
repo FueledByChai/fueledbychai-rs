@@ -54,7 +54,7 @@
 //! order never rests more than is left to reduce (the position less the other orders reducing
 //! it on its side): it is sized to that when built, and cancelled at once when it would rest
 //! more, at a pass's start, after its builds, and by [`ExecutionPlanner::on_fill`], which the
-//! consumer runs after every fill.
+//! consumer runs after every fill and every order update that reports one.
 //!
 //! The planner reads the registry for every order's state, so the consumer reports what it
 //! sends before the next pass, as for any command: a place's outcome, an amend's
@@ -117,8 +117,8 @@ pub struct DesiredQuote {
 pub enum ReduceFallback {
     /// Post-only without the venue's reduce-only flag, classified reducing and sized by the
     /// OMS at most the position less the other orders resting that reduce it on the same
-    /// side; re-checked after every fill and every pass, and cancelled at once when it would
-    /// overshoot ([`Downgrade::EmulatedReduceOnly`]).
+    /// side; re-checked after every fill (or order update reporting one) and every pass, and
+    /// cancelled at once when it would overshoot ([`Downgrade::EmulatedReduceOnly`]).
     EmulateReduceOnly,
     /// Reduce-only without post-only, at the quote's price: a taker fill is acceptable (a
     /// force-close or a disaster stop; [`Downgrade::DroppedPostOnly`]).
@@ -390,7 +390,9 @@ pub enum PlanRefusal {
     /// A place or amend that reduces the position would leave an emulated reduce-only order
     /// resting on its side more than is left to reduce, so both could fill and take the
     /// position past zero: the emulated order is cancelled, and the command is built by the
-    /// first pass after that order is terminal (decision 0100).
+    /// first pass after that order is terminal (decision 0100). Only a command the market's
+    /// state and both caps would admit with that order ended waits so; one refused anyway is
+    /// refused for its own reason, and the emulated order rests.
     AwaitsEmulatedCancel,
 }
 
@@ -838,17 +840,26 @@ impl ExecutionPlanner {
                             };
                             counted.checked_sub(before).unwrap_or(Lots::ZERO)
                         });
-                        if waits_for_emulated(
-                            slots,
-                            reg,
-                            caps,
-                            acct,
-                            (market, side),
-                            grows,
-                            &mut cancelling,
-                            &mut plan,
-                        ) {
-                            plan.refused.push(refuse(PlanRefusal::AwaitsEmulatedCancel));
+                        let overshot = overshot_by(slots, reg, (market, side), grows);
+                        if !overshot.is_empty() {
+                            // Judged first with those orders ended: one refused anyway reports
+                            // its own refusal and cancels nothing.
+                            let ending: Vec<ClientOrderId> =
+                                overshot.iter().map(|&(_, cid)| cid).collect();
+                            let why = match reg.admits_amend_once_ended(
+                                cid,
+                                caps,
+                                (px, total, reducing),
+                                &ending,
+                            ) {
+                                Ok(()) => {
+                                    let cancels = (&mut cancelling, &mut plan);
+                                    cancel_overshot(slots, reg, caps, acct, &overshot, cancels);
+                                    PlanRefusal::AwaitsEmulatedCancel
+                                }
+                                Err(why) => why,
+                            };
+                            plan.refused.push(refuse(why));
                             continue;
                         }
                     }
@@ -872,21 +883,27 @@ impl ExecutionPlanner {
                     downgrades,
                 }) => {
                     // A reducer waits for the cancel of each emulated order it would leave
-                    // overshooting.
-                    if !mode.emulated
-                        && quote.reduces()
-                        && waits_for_emulated(
-                            slots,
-                            reg,
-                            caps,
-                            acct,
-                            (market, side),
-                            quote.qty,
-                            &mut cancelling,
-                            &mut plan,
-                        )
-                    {
-                        plan.refused.push(refuse(PlanRefusal::AwaitsEmulatedCancel));
+                    // overshooting, once judged admitted with those orders ended: one refused
+                    // anyway reports its own refusal and cancels nothing.
+                    let overshot = if !mode.emulated && quote.reduces() {
+                        overshot_by(slots, reg, (market, side), quote.qty)
+                    } else {
+                        Vec::new()
+                    };
+                    if !overshot.is_empty() {
+                        let ending: Vec<ClientOrderId> =
+                            overshot.iter().map(|&(_, cid)| cid).collect();
+                        let why = match reg
+                            .admits_place_once_ended(market, side, quote.qty, true, &ending)
+                        {
+                            Ok(()) => {
+                                let cancels = (&mut cancelling, &mut plan);
+                                cancel_overshot(slots, reg, caps, acct, &overshot, cancels);
+                                PlanRefusal::AwaitsEmulatedCancel
+                            }
+                            Err(why) => PlanRefusal::Place(why),
+                        };
+                        plan.refused.push(refuse(why));
                         continue;
                     }
                     // An emulated order is sized to what is left to reduce, the commands
@@ -948,7 +965,8 @@ impl ExecutionPlanner {
         Ok(plan)
     }
 
-    /// The check to run after every fill on `market` for `acct` (design §4.10 step 4): the
+    /// The check to run after every fill on `market` for `acct`, and after every order update
+    /// there that reports a fill before its fill event (design §4.10 step 4): the
     /// cancel of each emulated reduce-only order the planner holds there that now rests more
     /// than is left to reduce, so it never takes the position past zero. What is left is the
     /// position's size on the side the order reduces (none while the position is flat,
@@ -1141,53 +1159,61 @@ fn cancel_now(
     }
 }
 
-/// Whether a reducer about to rest `grows` more on `side` of `market` must wait: it would leave
-/// an emulated reduce-only order in `slots` on that side, not yet terminal, resting more than is
-/// left to reduce, so both could fill and take the position past zero, the emulated order
-/// having no venue flag to stop it. Builds into `plan` the cancel of each such order not already
-/// cancelling (listed in `cancelling` or with a cancel in flight), whose level then waits for
-/// its terminal state; the reducer is built by the first pass after (decision 0100).
-#[allow(clippy::too_many_arguments)]
-fn waits_for_emulated(
+/// The emulated reduce-only orders in `slots` on `side` of `market`, not yet terminal, that a
+/// reducer about to rest `grows` more would leave resting more than is left to reduce, so both
+/// could fill and take the position past zero, the emulated order having no venue flag to stop
+/// it. The reducer waits for their cancel ([`cancel_overshot`]) when it is admitted with them
+/// ended, and is built by the first pass after they are terminal (decision 0100).
+fn overshot_by(
+    slots: &BTreeMap<Level, Slot>,
+    reg: &Registry,
+    (market, side): (InstrumentId, Side),
+    grows: Lots,
+) -> Vec<(Level, ClientOrderId)> {
+    if grows == Lots::ZERO {
+        return Vec::new();
+    }
+    slots
+        .iter()
+        .filter(|(at, slot)| slot.mode.emulated && at.side() == side)
+        .filter(|(_, slot)| {
+            reg.get(slot.cid).is_some_and(|rec| {
+                // What is left for the emulated order once the reducer rests `grows` more.
+                let left = reduce_room(reg, market, side, Some(rec.cid()))
+                    .checked_sub(grows)
+                    .unwrap_or(Lots::ZERO);
+                !rec.state().is_terminal() && rec.resting() > left
+            })
+        })
+        .map(|(&at, slot)| (at, slot.cid))
+        .collect()
+}
+
+/// Builds into `plan` the cancel of each of the emulated orders `overshot` a reducer waits for
+/// that is not already cancelling (listed in `cancelling`, which it joins, or with a cancel in
+/// flight or waiting for its acknowledgement); its level then waits for its terminal state.
+fn cancel_overshot(
     slots: &mut BTreeMap<Level, Slot>,
     reg: &mut Registry,
     caps: &OrderCaps,
     acct: AccountKey,
-    (market, side): (InstrumentId, Side),
-    grows: Lots,
-    cancelling: &mut Vec<ClientOrderId>,
-    plan: &mut Plan,
-) -> bool {
-    if grows == Lots::ZERO {
-        return false;
-    }
-    let mut waits = false;
-    for (&at, slot) in slots.iter_mut() {
-        // What is left for the emulated order once the reducer rests `grows` more.
-        let left = |rec: &OrderRecord| {
-            reduce_room(reg, market, side, Some(rec.cid()))
-                .checked_sub(grows)
-                .unwrap_or(Lots::ZERO)
-        };
-        let Some(rec) = reg
-            .get(slot.cid)
-            .filter(|rec| slot.mode.emulated && at.side() == side && !rec.state().is_terminal())
-            .filter(|rec| rec.resting() > left(rec))
-        else {
-            continue;
-        };
-        waits = true;
-        let in_flight =
-            matches!(rec.intent(), Intent::PendingCancel { .. }) || rec.cancel_awaits_ack();
-        if in_flight || cancelling.contains(&slot.cid) {
+    overshot: &[(Level, ClientOrderId)],
+    (cancelling, plan): (&mut Vec<ClientOrderId>, &mut Plan),
+) {
+    for &(at, cid) in overshot {
+        let in_flight = reg.get(cid).is_some_and(|rec| {
+            matches!(rec.intent(), Intent::PendingCancel { .. }) || rec.cancel_awaits_ack()
+        });
+        if in_flight || cancelling.contains(&cid) {
             continue;
         }
-        slot.replacing = true;
-        slot.cancels_sent = rec.cancels_sent();
-        cancelling.push(slot.cid);
-        cancel_now(reg, caps, acct, at, slot.cid, plan);
+        if let Some(slot) = slots.get_mut(&at) {
+            slot.replacing = true;
+            slot.cancels_sent = reg.get(cid).map_or(0, OrderRecord::cancels_sent);
+        }
+        cancelling.push(cid);
+        cancel_now(reg, caps, acct, at, cid, plan);
     }
-    waits
 }
 
 /// Builds into `plan` the cancel of each emulated reduce-only order in `slots` that rests more
