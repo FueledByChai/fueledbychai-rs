@@ -405,11 +405,6 @@ impl<H: InputHandler> ConsumerInputs<H> {
         self.journal = Some(journal);
     }
 
-    /// The timers these inputs fire.
-    pub fn timers(&self) -> ConsumerTimers {
-        self.timers.clone()
-    }
-
     pub fn counters(&self) -> InputCounters {
         self.counters
     }
@@ -449,16 +444,7 @@ impl<H: InputHandler> ConsumerInputs<H> {
             match self.timers.earliest(cx.waker(), horizon) {
                 None if self.closed => return Poll::Ready(()),
                 None => return Poll::Pending,
-                Some((deadline, true)) => {
-                    let wait =
-                        sleep.get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
-                    if wait.deadline() != deadline {
-                        wait.as_mut().reset(deadline);
-                    }
-                    if wait.as_mut().poll(cx).is_pending() {
-                        return Poll::Pending;
-                    }
-                }
+                Some((deadline, true)) => std::task::ready!(wait_until(sleep, deadline, cx)),
                 // The earliest was armed during this poll: the next poll takes it.
                 Some((_, false)) => {
                     cx.waker().wake_by_ref();
@@ -491,6 +477,19 @@ impl<H: InputHandler> ConsumerInputs<H> {
             bytes,
         });
     }
+}
+
+/// Waits, in `sleep`, until `deadline`: ready once it has passed.
+fn wait_until(
+    sleep: &mut Option<Pin<Box<Sleep>>>,
+    deadline: Instant,
+    cx: &mut Context<'_>,
+) -> Poll<()> {
+    let wait = sleep.get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
+    if wait.deadline() != deadline {
+        wait.as_mut().reset(deadline);
+    }
+    wait.as_mut().poll(cx)
 }
 
 /// A run that returns, or is dropped, ends the inputs ([`ConsumerInputs::end`]).
@@ -543,10 +542,7 @@ mod tests {
                 capacity,
                 timers: ConsumerTimers::new(),
             };
-            let made = ConsumerInputs::new(config, |_: ConsumerInput| {});
-            let Err(e) = made else {
-                panic!("capacity {capacity} accepted");
-            };
+            let e = ConsumerInputs::new(config, |_: ConsumerInput| {}).unwrap_err();
             assert_eq!(e, InputsError::Capacity(capacity));
             let said = e.to_string();
             assert!(said.contains(&format!("capacity {capacity}:")), "{said}");
