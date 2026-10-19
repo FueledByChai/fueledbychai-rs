@@ -54,7 +54,8 @@ builds on the synthetic IOC.
    does not hold yet, less what our other orders that reduce it on that side may have resting
    (`OrderRecord::resting`, a cancel in flight counted until terminal). An order reduces it
    when placed reduce-only or classified reducing, once an amend classified reducing was
-   built for it, or once the planner took it as an emulated order (`OrderRecord::reduces`).
+   built for it, or once the planner kept it for a quote that reduces the position, an
+   emulated one's included (`OrderRecord::reduces`).
    Among a pass's reducing commands, those the venue flag or the consumer bounds are built
    before the emulated ones, whatever their levels. A place is sized to what is left when
    built, those commands counted, and refused (`PlanRefusal::NoRoomToReduce`) when nothing is
