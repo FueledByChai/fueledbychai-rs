@@ -597,6 +597,14 @@ impl Registry {
         self.by_vid.get(vid).copied()
     }
 
+    /// Every venue id the registry knows the order `cid` by.
+    pub(crate) fn vids_of(&self, cid: ClientOrderId) -> impl Iterator<Item = &VenueOrderId> {
+        self.by_vid
+            .iter()
+            .filter(move |(_, held)| **held == cid)
+            .map(|(vid, _)| vid)
+    }
+
     /// How many orders are registered.
     pub fn len(&self) -> usize {
         self.orders.len()

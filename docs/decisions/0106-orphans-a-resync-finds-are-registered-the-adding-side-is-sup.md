@@ -58,8 +58,10 @@ and how an orphan is held while its cancel is out (FBC-840, BT-402).
    up to 3480 ms) that a trustworthy, non-stale snapshot shows open, under a venue id no other
    order of ours holds and no amend of it replaced, is an orphan too: it is in `untracked` and
    registered again from the snapshot with the fills counted on it and the venue ids an amend
-   replaced (Codex's r4315681141: a delayed update naming only a replaced id would otherwise
-   end it), so it counts on both caps, suppresses the adding side
+   replaced, every other id the registry knows it by (its earlier current one, one a fill
+   taught) now replaced by the one shown (Codex's r4315681141 and r4315910340: a delayed update
+   naming only such an id would otherwise end it), so it counts on both caps, suppresses the
+   adding side
    and is cancelled like any other (Reviewer B's RB840-8 on PR #171: held as ended, it counted
    on neither cap and nothing cancelled it). Its fills were routed to it while it was held, so
    none moves the inventory again. A source that is not trustworthy confirms none: a live event
