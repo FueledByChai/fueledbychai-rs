@@ -234,8 +234,8 @@ pub use permit::{
     PlacePlan,
 };
 pub use planner::{
-    DesiredBook, DesiredQuote, ExecutionPlanner, Held, HeldReason, Plan, PlanError, PlanRefusal,
-    Planned, PlannerConfig, PlannerConfigError, Refused, Stage,
+    DesiredBook, DesiredQuote, Downgrade, ExecutionPlanner, Held, HeldReason, Plan, PlanError,
+    PlanRefusal, Planned, PlannerConfig, PlannerConfigError, ReduceFallback, Refused, Stage,
 };
 pub use record::{
     Applied, FillApplied, Intent, LadderStep, OrdState, OrderKey, OrderOp, OrderRecord,

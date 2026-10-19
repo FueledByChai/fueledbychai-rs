@@ -1,0 +1,891 @@
+//! The planner's generic fallbacks (FBC-01w; design §4.10 steps 3 and 4; decisions 0003, 0005,
+//! 0013): a quote the venue's `OrderCaps` do not take as asked is changed by a rule chosen from
+//! the caps alone, never from the venue's name, and each change is reported on the command
+//! built from it ([`Planned::downgrades`]):
+//!
+//! - RPI asked for on a venue without the RPI channel goes on the public book;
+//! - (Rpi, ReduceOnly) refused together: the public book, still reduce-only;
+//! - (Ioc, ReduceOnly) refused together: a good-till-cancelled reduce-only limit at the quote's
+//!   price (its cap), then its cancel at once;
+//! - (PostOnly, ReduceOnly) refused together: the quote's fallback, either post-only without
+//!   the flag, classified reducing and sized at most the position less the other orders
+//!   resting that reduce it on its side, re-checked after every fill and cancelled on
+//!   overshoot (emulated reduce-only), or reduce-only without post-only at the quote's price.
+//!
+//! The values are the owner's first test values: a $50 inventory cap on a synthetic market
+//! where one lot is worth $1, so 50 lots, and a wide resting cap (no test here judges it).
+
+#[path = "common/arm.rs"]
+mod arm;
+mod common;
+
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::time::Duration;
+
+use arm::start;
+use common::{fill, fill_id, lease_dir, lots, order_caps, vid};
+use fbc_core::{
+    AccountKey, AckLevel, AmendAck, AmendCaps, AmendQty, Bps, CancelReason, Channel, CidMatch,
+    CidMint, ClientOrderId, ExchNs, ExchTsKind, Feature, FillIdent, InstrumentId, ItemRef, MonoNs,
+    Namespace, NamespaceLease, NewOrder, OrderCaps, OrderKind, OrderUpdate, RefKind, RpcId, Side,
+    SignedLots, SubmitOutcome, TagSet, Ticks, Tif, VenueCommand, VenueOrderState, WallNs,
+};
+use fbc_oms::{
+    Admission, DesiredBook, DesiredQuote, Downgrade, ExecutionPlanner, FillLedger, FillTime,
+    LadderConfig, LedgerConfig, MarketCapsConfig, OrderKey, OrderOp, Plan, PlanError, PlanRefusal,
+    Planned, PlannerConfig, PreTradeCaps, ReduceFallback, Registry, ResyncSnapshot, Stage,
+};
+
+const INST: InstrumentId = InstrumentId::new(1);
+const ACCT: AccountKey = AccountKey::new(1);
+/// The owner's first inventory cap, in lots of $1.
+const CAP: i64 = 50;
+/// A resting cap past any order of these tests.
+const WIDE: i64 = 1_000_000;
+const MIN_AGE: Duration = Duration::from_millis(100);
+/// An instant past the minimum age of anything placed at `MonoNs(0)`.
+const LATER: MonoNs = MonoNs(1_000_000_000);
+const LATER2: MonoNs = MonoNs(2_000_000_000);
+const LATER3: MonoNs = MonoNs(3_000_000_000);
+
+fn mint() -> CidMint {
+    static NEXT: AtomicU16 = AtomicU16::new(500);
+    let ns = Namespace::new(NEXT.fetch_add(1, Ordering::Relaxed));
+    let lease = NamespaceLease::acquire(&lease_dir(), AccountKey::new(2), ns).unwrap();
+    CidMint::new(lease, 0, 0, WallNs(0))
+}
+
+fn planner() -> ExecutionPlanner {
+    ExecutionPlanner::new(PlannerConfig::new(Bps(2.0), lots(2), MIN_AGE).unwrap())
+}
+
+/// A venue taking GTC and IOC limits on the public book and the RPI channel, post-only and
+/// reduce-only, that refuses each of `conflicts` together; no amend, cancels by venue id once
+/// acknowledged.
+fn conflicting(conflicts: &[(Feature, Feature)]) -> OrderCaps {
+    OrderCaps {
+        tifs: TagSet::of(&[Tif::Gtc, Tif::Ioc]),
+        channels: TagSet::of(&[Channel::Public, Channel::Rpi]),
+        flag_conflicts: conflicts.to_vec(),
+        ..order_caps()
+    }
+}
+
+/// `caps` with an amend of price and total by venue id, partly filled orders included.
+fn amending(caps: OrderCaps) -> OrderCaps {
+    OrderCaps {
+        amend: Some(AmendCaps {
+            refs: TagSet::of(&[RefKind::Venue]),
+            price: true,
+            qty: true,
+            flags: false,
+            when_partially_filled: true,
+            reject_keeps_original: true,
+            keeps_venue_id: true,
+            ack: AmendAck::ReplacedEvent,
+            qty_semantics: AmendQty::TotalIncludingFilled,
+            keeps_priority: None,
+        }),
+        ..caps
+    }
+}
+
+fn ladder_cfg() -> LadderConfig {
+    LadderConfig::new(
+        Duration::from_secs(1),
+        Duration::ZERO,
+        Duration::from_secs(10),
+        1,
+    )
+    .unwrap()
+}
+
+/// A named registry under the inventory cap and a wide resting cap on `INST`, whose first
+/// trustworthy resync showed no order and seeded `INST` at `pos`, armed and Quoting.
+fn quoting(pos: i64) -> Registry {
+    let caps = PreTradeCaps::new()
+        .with_market(
+            INST,
+            MarketCapsConfig {
+                inventory: Some(lots(CAP)),
+                resting: Some(lots(WIDE)),
+            },
+        )
+        .unwrap();
+    let mut reg = arm::named(Registry::with_caps(caps));
+    let snap = ResyncSnapshot {
+        watermark: WallNs(1_000),
+        requested_at: MonoNs(1_000),
+        orders: vec![],
+        positions: vec![(INST, SignedLots(pos))],
+    };
+    reg.resync(&ladder_cfg(), &order_caps(), &snap, key(1))
+        .unwrap();
+    start(&mut reg, INST);
+    reg
+}
+
+fn key(n: u64) -> OrderKey {
+    OrderKey {
+        venue: None,
+        ingest: n,
+    }
+}
+
+/// A GTC limit on the public book of `qty` at `px`, neither post-only nor reduce-only.
+fn limit(px: i64, qty: i64) -> DesiredQuote {
+    DesiredQuote {
+        px: Ticks(px),
+        qty: lots(qty),
+        tif: Tif::Gtc,
+        channel: Channel::Public,
+        post_only: false,
+        reduce_only: false,
+        reducing: false,
+        tag: 0,
+        reduce_fallback: ReduceFallback::KeepReduceOnly,
+    }
+}
+
+/// `q` reduce-only and classified reducing.
+fn reduce_only(q: DesiredQuote) -> DesiredQuote {
+    DesiredQuote {
+        reduce_only: true,
+        reducing: true,
+        ..q
+    }
+}
+
+/// A post-only, reduce-only maker exit of `qty` at `px` with the fallback `fallback`.
+fn maker_exit(px: i64, qty: i64, fallback: ReduceFallback) -> DesiredQuote {
+    DesiredQuote {
+        post_only: true,
+        reduce_fallback: fallback,
+        ..reduce_only(limit(px, qty))
+    }
+}
+
+fn book() -> DesiredBook {
+    DesiredBook::new(INST)
+}
+
+/// The place `p` carries.
+fn placed(p: &Planned) -> &NewOrder {
+    match p.auth.command() {
+        VenueCommand::Place(o) => o,
+        other => panic!("expected a place, got {other:?}"),
+    }
+}
+
+/// Each command's stage, kind, side and level, in the order planned.
+fn shape(plan: &Plan) -> Vec<(Stage, &'static str, Side, u16)> {
+    plan.commands
+        .iter()
+        .map(|p| {
+            let kind = match p.auth.command() {
+                VenueCommand::Place(_) => "place",
+                VenueCommand::Amend(_) => "amend",
+                VenueCommand::Cancel(_) => "cancel",
+                other => panic!("the planner built {other:?}"),
+            };
+            (p.stage, kind, p.side, p.level)
+        })
+        .collect()
+}
+
+/// Plans `desired` and reports every cancel and amend sent, as a gateway would.
+fn plan_and_send(
+    planner: &mut ExecutionPlanner,
+    desired: &DesiredBook,
+    reg: &mut Registry,
+    caps: &OrderCaps,
+    mint: &mut CidMint,
+    now: MonoNs,
+) -> Plan {
+    let plan = planner.plan(desired, reg, caps, ACCT, mint, now).unwrap();
+    send(reg, &plan.commands, now);
+    plan
+}
+
+/// Reports each of `commands` sent: each cancel and amend under a request of its own.
+fn send(reg: &mut Registry, commands: &[Planned], now: MonoNs) {
+    for (n, p) in commands.iter().enumerate() {
+        let rpc = RpcId(1_000 + now.0 + n as u64);
+        match p.auth.command() {
+            VenueCommand::Cancel(_) => assert!(reg.cancel_sent(p.cid, rpc, now).unwrap()),
+            VenueCommand::Amend(a) => {
+                assert!(reg.amend_sent(p.cid, a.px, a.qty, rpc, now).unwrap())
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Acknowledges the placement of `c` under the venue id `v`: Open.
+fn ack(reg: &mut Registry, c: ClientOrderId, v: &str) {
+    let item = ItemRef {
+        idx: 0,
+        cid: None,
+        vid: Some(vid(v)),
+    };
+    let accepted = SubmitOutcome::Accepted {
+        ack: AckLevel::Final,
+    };
+    reg.on_outcome(c, OrderOp::Place, &item, &accepted, MonoNs(1))
+        .unwrap();
+}
+
+/// Ends our order `c` on `side` (venue id `v`) cancelled, under the ordering key `n`.
+fn cancelled(reg: &mut Registry, c: ClientOrderId, side: Side, v: &str, n: u64) {
+    let u = OrderUpdate {
+        cid: Some(CidMatch::Ours(c)),
+        vid: Some(vid(v)),
+        inst: INST,
+        side,
+        state: VenueOrderState::Canceled(CancelReason::Requested),
+        cum_filled: reg.get(c).unwrap().filled(),
+        px: None,
+        qty: None,
+        post_only: None,
+        reduce_only: None,
+    };
+    reg.apply_update(&u, key(n));
+    assert!(reg.get(c).unwrap().state().is_terminal());
+}
+
+fn ledger() -> FillLedger {
+    FillLedger::new(
+        LedgerConfig {
+            max_age: Duration::from_secs(3600),
+            max_entries: 1_000,
+        },
+        WallNs(0),
+    )
+    .unwrap()
+}
+
+/// Applies a fill of `qty` on `side` of our order `c`, named `fid`.
+fn fill_of(
+    reg: &mut Registry,
+    l: &mut FillLedger,
+    c: ClientOrderId,
+    side: Side,
+    qty: i64,
+    fid: &str,
+) {
+    let f = fill(
+        Some(c),
+        FillIdent::Venue {
+            fill: fill_id(fid),
+            vid: None,
+            cum_after: None,
+        },
+        side,
+        qty,
+        false,
+    );
+    let time = Some(FillTime {
+        exch: ExchNs(1_500),
+        kind: ExchTsKind::MatchingEngine,
+        aligned: WallNs(1_500),
+    });
+    match l.admit(&f, time, MonoNs(1_100)) {
+        Admission::Apply(a) => {
+            reg.apply_fill(a).unwrap();
+        }
+        other => panic!("expected the fill accepted, got {other:?}"),
+    }
+}
+
+/// The emulated reduce-only order's shape: post-only, without the venue flag, classified
+/// reducing.
+fn assert_emulated(o: &NewOrder, qty: i64) {
+    assert!(o.post_only && !o.reduce_only && o.reducing, "{o:?}");
+    assert_eq!(o.qty, lots(qty));
+}
+
+#[test]
+fn an_rpi_quote_on_a_venue_without_rpi_goes_on_the_public_book_and_says_so() {
+    let mut reg = quoting(0);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = order_caps();
+    assert!(!caps.channels.contains(Channel::Rpi));
+    let rpi = DesiredQuote {
+        channel: Channel::Rpi,
+        post_only: true,
+        ..limit(10_000, 3)
+    };
+    let desired = book().with(Side::Buy, 0, rpi);
+    let plan = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, MonoNs(0));
+    assert_eq!(shape(&plan), vec![(Stage::Add, "place", Side::Buy, 0)]);
+    let o = placed(&plan.commands[0]);
+    assert_eq!(o.channel, Channel::Public);
+    assert!(o.post_only);
+    assert_eq!(plan.commands[0].downgrades, vec![Downgrade::RpiUnsupported]);
+    // The order rests as the venue took it: a later pass of the same quote keeps it.
+    ack(&mut reg, plan.commands[0].cid, "v1");
+    let again = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, LATER);
+    assert!(again.commands.is_empty(), "{:?}", shape(&again));
+    // The same quote on a venue with RPI is sent as asked, with no downgrade.
+    let mut reg = quoting(0);
+    let mut p = planner();
+    let rpi_venue = conflicting(&[]);
+    let plan = plan_and_send(&mut p, &desired, &mut reg, &rpi_venue, &mut mint, MonoNs(0));
+    assert_eq!(placed(&plan.commands[0]).channel, Channel::Rpi);
+    assert!(plan.commands[0].downgrades.is_empty());
+}
+
+#[test]
+fn an_rpi_reduce_only_quote_where_the_venue_refuses_both_goes_public_still_reduce_only() {
+    // Long 10: asks reduce.
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = conflicting(&[(Feature::Rpi, Feature::ReduceOnly)]);
+    let exit = DesiredQuote {
+        channel: Channel::Rpi,
+        post_only: true,
+        ..reduce_only(limit(10_010, 4))
+    };
+    let desired = book().with(Side::Sell, 0, exit);
+    let plan = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, MonoNs(0));
+    assert_eq!(
+        shape(&plan),
+        vec![(Stage::Reducing, "place", Side::Sell, 0)]
+    );
+    let o = placed(&plan.commands[0]);
+    assert_eq!(o.channel, Channel::Public);
+    assert!(o.reduce_only && o.post_only);
+    assert_eq!(o.kind, OrderKind::Limit { px: Ticks(10_010) });
+    assert_eq!(plan.commands[0].downgrades, vec![Downgrade::RpiReduceOnly]);
+    ack(&mut reg, plan.commands[0].cid, "v1");
+    let again = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, LATER);
+    assert!(again.commands.is_empty(), "{:?}", shape(&again));
+    // The pair listed the other way round is the same conflict.
+    let mut reg = quoting(10);
+    let mut p = planner();
+    let flipped = conflicting(&[(Feature::ReduceOnly, Feature::Rpi)]);
+    let plan = plan_and_send(&mut p, &desired, &mut reg, &flipped, &mut mint, MonoNs(0));
+    assert_eq!(placed(&plan.commands[0]).channel, Channel::Public);
+    assert_eq!(plan.commands[0].downgrades, vec![Downgrade::RpiReduceOnly]);
+}
+
+#[test]
+fn several_downgrades_of_one_quote_are_reported_in_the_order_applied() {
+    // A venue with neither RPI nor post-only with reduce-only: the RPI maker exit first goes
+    // public, then follows its fallback.
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = OrderCaps {
+        flag_conflicts: vec![(Feature::PostOnly, Feature::ReduceOnly)],
+        ..order_caps()
+    };
+    let exit = DesiredQuote {
+        channel: Channel::Rpi,
+        ..maker_exit(10_010, 4, ReduceFallback::KeepReduceOnly)
+    };
+    let plan = plan_and_send(
+        &mut p,
+        &book().with(Side::Sell, 0, exit),
+        &mut reg,
+        &caps,
+        &mut mint,
+        MonoNs(0),
+    );
+    let o = placed(&plan.commands[0]);
+    assert_eq!(o.channel, Channel::Public);
+    assert!(o.reduce_only && !o.post_only);
+    assert_eq!(
+        plan.commands[0].downgrades,
+        vec![Downgrade::RpiUnsupported, Downgrade::DroppedPostOnly]
+    );
+}
+
+#[test]
+fn an_ioc_reduce_only_quote_where_the_venue_refuses_both_is_a_capped_limit_cancelled_at_once() {
+    // A venue that takes a cancel by client id before the acknowledgement: the cancel follows
+    // its place in the same pass.
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = OrderCaps {
+        cancel_refs: TagSet::of(&[RefKind::Venue, RefKind::Client]),
+        cancel_before_ack: true,
+        ..conflicting(&[(Feature::Ioc, Feature::ReduceOnly)])
+    };
+    let cross = DesiredQuote {
+        tif: Tif::Ioc,
+        ..reduce_only(limit(9_990, 4))
+    };
+    let desired = book().with(Side::Sell, 0, cross);
+    let plan = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, MonoNs(0));
+    assert_eq!(
+        shape(&plan),
+        vec![
+            (Stage::Reducing, "place", Side::Sell, 0),
+            (Stage::Cancel, "cancel", Side::Sell, 0),
+        ]
+    );
+    let o = placed(&plan.commands[0]);
+    assert_eq!(o.tif, Tif::Gtc);
+    assert!(o.reduce_only && o.reducing && !o.post_only);
+    // Capped: a limit at the quote's price, never a market order.
+    assert_eq!(o.kind, OrderKind::Limit { px: Ticks(9_990) });
+    assert_eq!(o.qty, lots(4));
+    assert_eq!(plan.commands[0].downgrades, vec![Downgrade::SynthIoc]);
+    assert_eq!(plan.commands[1].cid, plan.commands[0].cid);
+    assert!(plan.commands[1].downgrades.is_empty());
+    assert!(plan.awaiting_ack.is_empty());
+}
+
+#[test]
+fn a_synthetic_ioc_on_a_venue_that_cancels_after_the_ack_is_cancelled_once_acknowledged() {
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = conflicting(&[(Feature::Ioc, Feature::ReduceOnly)]);
+    assert!(!caps.cancel_before_ack);
+    let cross = DesiredQuote {
+        tif: Tif::Ioc,
+        ..reduce_only(limit(9_990, 4))
+    };
+    let desired = book().with(Side::Sell, 0, cross);
+    let plan = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, MonoNs(0));
+    assert_eq!(
+        shape(&plan),
+        vec![(Stage::Reducing, "place", Side::Sell, 0)]
+    );
+    let c = plan.commands[0].cid;
+    assert_eq!(plan.commands[0].downgrades, vec![Downgrade::SynthIoc]);
+    // Its cancel waits for the acknowledgement.
+    assert_eq!(plan.awaiting_ack, vec![c]);
+    assert!(reg.get(c).unwrap().cancel_awaits_ack());
+    // Unacknowledged, a later pass places nothing more and still waits.
+    let waiting = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, LATER);
+    assert!(waiting.commands.is_empty(), "{:?}", shape(&waiting));
+    assert_eq!(waiting.awaiting_ack, vec![c]);
+    // Acknowledged, it is cancelled at the next pass though the level is still wanted.
+    ack(&mut reg, c, "v1");
+    let cancel = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, LATER);
+    assert_eq!(
+        shape(&cancel),
+        vec![(Stage::Cancel, "cancel", Side::Sell, 0)]
+    );
+    assert_eq!(cancel.commands[0].cid, c);
+    // In flight, nothing is sent again.
+    let flight = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, LATER2);
+    assert!(flight.commands.is_empty(), "{:?}", shape(&flight));
+    // Once it is terminal, the level still wanted is crossed again, as an IOC would be.
+    cancelled(&mut reg, c, Side::Sell, "v1", 2);
+    let next = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, LATER3);
+    assert_eq!(
+        shape(&next),
+        vec![(Stage::Reducing, "place", Side::Sell, 0)]
+    );
+    assert_ne!(next.commands[0].cid, c);
+    assert_eq!(next.commands[0].downgrades, vec![Downgrade::SynthIoc]);
+}
+
+#[test]
+fn a_synthetic_ioc_no_longer_wanted_is_still_cancelled_and_never_amended() {
+    // A venue that amends: a synthetic IOC whose quote moves is cancelled, never amended to
+    // rest at a new price.
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = amending(conflicting(&[(Feature::Ioc, Feature::ReduceOnly)]));
+    let cross = |px| DesiredQuote {
+        tif: Tif::Ioc,
+        ..reduce_only(limit(px, 4))
+    };
+    let plan = plan_and_send(
+        &mut p,
+        &book().with(Side::Sell, 0, cross(9_990)),
+        &mut reg,
+        &caps,
+        &mut mint,
+        MonoNs(0),
+    );
+    let c = plan.commands[0].cid;
+    ack(&mut reg, c, "v1");
+    let moved = plan_and_send(
+        &mut p,
+        &book().with(Side::Sell, 0, cross(9_980)),
+        &mut reg,
+        &caps,
+        &mut mint,
+        LATER,
+    );
+    assert_eq!(
+        shape(&moved),
+        vec![(Stage::Cancel, "cancel", Side::Sell, 0)]
+    );
+    assert_eq!(moved.commands[0].cid, c);
+}
+
+#[test]
+fn a_reduce_only_ioc_on_a_venue_that_takes_both_is_sent_as_asked() {
+    // Paradex's declared conflicts (decision 0054's caps): IOC with reduce-only and post-only
+    // with reduce-only are both taken, so nothing changes; an IOC the venue refuses later
+    // (decision 0093) ends the order like any refusal.
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = conflicting(&[
+        (Feature::PostOnly, Feature::Ioc),
+        (Feature::Ioc, Feature::Rpi),
+        (Feature::Rpi, Feature::ReduceOnly),
+    ]);
+    let cross = DesiredQuote {
+        tif: Tif::Ioc,
+        ..reduce_only(limit(9_990, 4))
+    };
+    let exit = maker_exit(10_010, 3, ReduceFallback::EmulateReduceOnly);
+    let desired = book().with(Side::Sell, 0, cross).with(Side::Sell, 1, exit);
+    let plan = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, MonoNs(0));
+    assert_eq!(
+        shape(&plan),
+        vec![
+            (Stage::Reducing, "place", Side::Sell, 0),
+            (Stage::Reducing, "place", Side::Sell, 1),
+        ]
+    );
+    let ioc = placed(&plan.commands[0]);
+    assert!(ioc.tif == Tif::Ioc && ioc.reduce_only);
+    let maker = placed(&plan.commands[1]);
+    assert!(maker.post_only && maker.reduce_only);
+    assert!(plan.commands.iter().all(|c| c.downgrades.is_empty()));
+    assert!(plan.awaiting_ack.is_empty());
+}
+
+#[test]
+fn a_post_only_reduce_only_quote_kept_reduce_only_drops_post_only_at_its_price() {
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]);
+    let desired = book().with(
+        Side::Sell,
+        0,
+        maker_exit(10_010, 4, ReduceFallback::KeepReduceOnly),
+    );
+    let plan = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, MonoNs(0));
+    assert_eq!(
+        shape(&plan),
+        vec![(Stage::Reducing, "place", Side::Sell, 0)]
+    );
+    let o = placed(&plan.commands[0]);
+    assert!(o.reduce_only && !o.post_only && o.tif == Tif::Gtc);
+    assert_eq!(o.kind, OrderKind::Limit { px: Ticks(10_010) });
+    assert_eq!(o.qty, lots(4));
+    assert_eq!(
+        plan.commands[0].downgrades,
+        vec![Downgrade::DroppedPostOnly]
+    );
+    ack(&mut reg, plan.commands[0].cid, "v1");
+    let again = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, LATER);
+    assert!(again.commands.is_empty(), "{:?}", shape(&again));
+}
+
+#[test]
+fn an_emulated_reduce_only_quote_is_post_only_without_the_flag_sized_to_what_is_left_to_reduce() {
+    // Long 10: a reduce-only ask of 3 at level 0, and at level 1 an emulated maker exit
+    // wanting 20, which gets the 7 left.
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]);
+    let desired = book()
+        .with(Side::Sell, 0, reduce_only(limit(10_010, 3)))
+        .with(
+            Side::Sell,
+            1,
+            maker_exit(10_020, 20, ReduceFallback::EmulateReduceOnly),
+        );
+    let plan = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, MonoNs(0));
+    assert_eq!(
+        shape(&plan),
+        vec![
+            (Stage::Reducing, "place", Side::Sell, 0),
+            (Stage::Reducing, "place", Side::Sell, 1),
+        ]
+    );
+    assert!(plan.commands[0].downgrades.is_empty());
+    assert_emulated(placed(&plan.commands[1]), 7);
+    assert_eq!(
+        plan.commands[1].downgrades,
+        vec![Downgrade::EmulatedReduceOnly]
+    );
+    // Resting at the most it may, it is kept as it is by a later pass.
+    ack(&mut reg, plan.commands[0].cid, "v0");
+    ack(&mut reg, plan.commands[1].cid, "v1");
+    let again = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, LATER);
+    assert!(again.commands.is_empty(), "{:?}", shape(&again));
+    assert!(again.refused.is_empty());
+}
+
+#[test]
+fn two_emulated_levels_share_what_is_left_to_reduce() {
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]);
+    let desired = book()
+        .with(
+            Side::Sell,
+            0,
+            maker_exit(10_010, 6, ReduceFallback::EmulateReduceOnly),
+        )
+        .with(
+            Side::Sell,
+            1,
+            maker_exit(10_020, 6, ReduceFallback::EmulateReduceOnly),
+        );
+    let plan = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, MonoNs(0));
+    assert_emulated(placed(&plan.commands[0]), 6);
+    assert_emulated(placed(&plan.commands[1]), 4);
+}
+
+#[test]
+fn an_emulated_quote_with_nothing_to_reduce_is_refused() {
+    let caps = conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]);
+    let bid = maker_exit(9_990, 3, ReduceFallback::EmulateReduceOnly);
+    let ask = maker_exit(10_010, 3, ReduceFallback::EmulateReduceOnly);
+    // Flat: neither side reduces. Long: the bid adds.
+    for (pos, desired, refused) in [
+        (
+            0,
+            book()
+                .with(Side::Buy, 0, bid.clone())
+                .with(Side::Sell, 0, ask.clone()),
+            vec![Side::Buy, Side::Sell],
+        ),
+        (5, book().with(Side::Buy, 0, bid.clone()), vec![Side::Buy]),
+    ] {
+        let mut reg = quoting(pos);
+        let mut mint = mint();
+        let mut p = planner();
+        let plan = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, MonoNs(0));
+        assert!(plan.commands.is_empty(), "{:?}", shape(&plan));
+        let why: Vec<(Side, PlanRefusal)> = plan
+            .refused
+            .iter()
+            .map(|r| (r.side, r.why.clone()))
+            .collect();
+        let want: Vec<(Side, PlanRefusal)> = refused
+            .into_iter()
+            .map(|s| (s, PlanRefusal::NoRoomToReduce))
+            .collect();
+        assert_eq!(why, want);
+    }
+    // Long 5 with a reduce-only ask of 5 resting: nothing is left for the emulated one.
+    let mut reg = quoting(5);
+    let mut mint = mint();
+    let mut p = planner();
+    let full = book()
+        .with(Side::Sell, 0, reduce_only(limit(10_010, 5)))
+        .with(Side::Sell, 1, ask);
+    let plan = plan_and_send(&mut p, &full, &mut reg, &caps, &mut mint, MonoNs(0));
+    assert_eq!(
+        shape(&plan),
+        vec![(Stage::Reducing, "place", Side::Sell, 0)]
+    );
+    assert_eq!(plan.refused.len(), 1);
+    assert_eq!(plan.refused[0].level, 1);
+    assert_eq!(plan.refused[0].why, PlanRefusal::NoRoomToReduce);
+}
+
+#[test]
+fn an_emulated_order_is_cancelled_on_the_fill_that_makes_it_overshoot_then_replaced_smaller() {
+    // Long 10: an emulated exit of 10 at level 0 and a plain ask of 4 at level 1.
+    let mut reg = quoting(10);
+    let mut l = ledger();
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]);
+    let desired = book()
+        .with(
+            Side::Sell,
+            0,
+            maker_exit(10_010, 10, ReduceFallback::EmulateReduceOnly),
+        )
+        .with(Side::Sell, 1, limit(10_020, 4));
+    let plan = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, MonoNs(0));
+    let (emulated, plain) = (plan.commands[0].cid, plan.commands[1].cid);
+    assert_emulated(placed(&plan.commands[0]), 10);
+    ack(&mut reg, emulated, "v0");
+    ack(&mut reg, plain, "v1");
+    // Nothing overshoots before the fill.
+    assert!(p.on_fill(&mut reg, &caps, ACCT, INST).unwrap().is_empty());
+    // The plain ask fills 4: long 6, and the emulated exit of 10 would cross zero.
+    fill_of(&mut reg, &mut l, plain, Side::Sell, 4, "f1");
+    assert_eq!(reg.position(INST), Some(SignedLots(6)));
+    let cancels = p.on_fill(&mut reg, &caps, ACCT, INST).unwrap();
+    assert_eq!(cancels.len(), 1);
+    assert_eq!(cancels[0].cid, emulated);
+    assert_eq!(cancels[0].stage, Stage::Cancel);
+    assert!(matches!(cancels[0].auth.command(), VenueCommand::Cancel(_)));
+    send(&mut reg, &cancels, LATER);
+    // In flight, the level waits for the order's end.
+    let waiting = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, LATER);
+    assert!(
+        waiting.commands.iter().all(|c| c.cid != emulated),
+        "{:?}",
+        shape(&waiting)
+    );
+    assert!(p.on_fill(&mut reg, &caps, ACCT, INST).unwrap().is_empty());
+    // Cancelled, the level is placed again at the 6 left.
+    cancelled(&mut reg, emulated, Side::Sell, "v0", 2);
+    let resized = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, LATER2);
+    let again: Vec<&Planned> = resized.commands.iter().filter(|c| c.level == 0).collect();
+    assert_eq!(again.len(), 1);
+    assert_emulated(placed(again[0]), 6);
+    assert_eq!(again[0].downgrades, vec![Downgrade::EmulatedReduceOnly]);
+}
+
+#[test]
+fn a_pass_cancels_an_emulated_order_a_fill_left_overshooting_before_anything_else() {
+    // The same overshoot, found by the next pass when no check ran after the fill: its cancel
+    // comes first.
+    let mut reg = quoting(10);
+    let mut l = ledger();
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]);
+    let desired = book()
+        .with(
+            Side::Sell,
+            0,
+            maker_exit(10_010, 10, ReduceFallback::EmulateReduceOnly),
+        )
+        .with(Side::Sell, 1, limit(10_020, 4));
+    let plan = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, MonoNs(0));
+    let (emulated, plain) = (plan.commands[0].cid, plan.commands[1].cid);
+    ack(&mut reg, emulated, "v0");
+    ack(&mut reg, plain, "v1");
+    fill_of(&mut reg, &mut l, plain, Side::Sell, 4, "f1");
+    // Even younger than the minimum age.
+    let pass = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, MonoNs(1));
+    assert_eq!(pass.commands[0].stage, Stage::Cancel);
+    assert_eq!(pass.commands[0].cid, emulated);
+    assert!(pass.commands[0].removal.is_none());
+}
+
+#[test]
+fn an_emulated_order_s_own_fills_never_overshoot() {
+    let mut reg = quoting(10);
+    let mut l = ledger();
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]);
+    let desired = book().with(
+        Side::Sell,
+        0,
+        maker_exit(10_010, 10, ReduceFallback::EmulateReduceOnly),
+    );
+    let plan = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, MonoNs(0));
+    let emulated = plan.commands[0].cid;
+    ack(&mut reg, emulated, "v0");
+    // It fills 4 of its 10: long 6 and 6 resting, which is what is left.
+    fill_of(&mut reg, &mut l, emulated, Side::Sell, 4, "f1");
+    assert_eq!(reg.position(INST), Some(SignedLots(6)));
+    assert!(p.on_fill(&mut reg, &caps, ACCT, INST).unwrap().is_empty());
+    let pass = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, LATER);
+    assert!(pass.commands.is_empty(), "{:?}", shape(&pass));
+}
+
+#[test]
+fn an_emulated_order_left_overshooting_by_a_reducer_placed_in_the_same_pass_is_cancelled_in_it() {
+    // Long 10, an emulated exit of 8 resting at level 1; a reduce-only ask of 5 comes at level
+    // 0. Once it is built, 8 would overshoot the 5 left: the pass cancels it after its builds.
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]);
+    let exit = maker_exit(10_020, 8, ReduceFallback::EmulateReduceOnly);
+    let first = book().with(Side::Sell, 1, exit.clone());
+    let plan = plan_and_send(&mut p, &first, &mut reg, &caps, &mut mint, MonoNs(0));
+    let emulated = plan.commands[0].cid;
+    ack(&mut reg, emulated, "v1");
+    let next = first.with(Side::Sell, 0, reduce_only(limit(10_010, 5)));
+    let pass = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER);
+    assert_eq!(
+        shape(&pass),
+        vec![
+            (Stage::Reducing, "place", Side::Sell, 0),
+            (Stage::Cancel, "cancel", Side::Sell, 1),
+        ]
+    );
+    assert_eq!(pass.commands[1].cid, emulated);
+}
+
+#[test]
+fn an_emulated_order_grows_by_amend_only_to_what_is_left_to_reduce() {
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = amending(conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]));
+    let plan = plan_and_send(
+        &mut p,
+        &book().with(
+            Side::Sell,
+            0,
+            maker_exit(10_010, 4, ReduceFallback::EmulateReduceOnly),
+        ),
+        &mut reg,
+        &caps,
+        &mut mint,
+        MonoNs(0),
+    );
+    let emulated = plan.commands[0].cid;
+    ack(&mut reg, emulated, "v0");
+    let grow = book().with(
+        Side::Sell,
+        0,
+        maker_exit(10_010, 20, ReduceFallback::EmulateReduceOnly),
+    );
+    let pass = plan_and_send(&mut p, &grow, &mut reg, &caps, &mut mint, LATER);
+    assert_eq!(
+        shape(&pass),
+        vec![(Stage::Reducing, "amend", Side::Sell, 0)]
+    );
+    match pass.commands[0].auth.command() {
+        VenueCommand::Amend(a) => {
+            assert_eq!(a.qty, lots(10));
+            assert!(a.post_only && !a.reduce_only && a.reducing);
+        }
+        other => panic!("expected an amend, got {other:?}"),
+    }
+    assert_eq!(
+        pass.commands[0].downgrades,
+        vec![Downgrade::EmulatedReduceOnly]
+    );
+}
+
+#[test]
+fn the_check_after_a_fill_is_refused_through_another_registry_and_ignores_other_orders() {
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]);
+    // No pass yet: nothing to check.
+    assert!(p.on_fill(&mut reg, &caps, ACCT, INST).unwrap().is_empty());
+    // A plain reduce-only ask and a kept-reduce-only exit are the venue's to bound, not the
+    // check's: long 10 with 10 + 10 resting, nothing is cancelled.
+    let desired = book()
+        .with(Side::Sell, 0, reduce_only(limit(10_010, 10)))
+        .with(
+            Side::Sell,
+            1,
+            maker_exit(10_020, 10, ReduceFallback::KeepReduceOnly),
+        );
+    plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, MonoNs(0));
+    assert!(p.on_fill(&mut reg, &caps, ACCT, INST).unwrap().is_empty());
+    let mut other = quoting(10);
+    assert_eq!(
+        p.on_fill(&mut other, &caps, ACCT, INST).err(),
+        Some(PlanError::OtherRegistry { acct: ACCT })
+    );
+}
