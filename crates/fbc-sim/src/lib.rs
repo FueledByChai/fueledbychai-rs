@@ -64,8 +64,15 @@
 //! codec reports as the stream authenticated, since the simulated venue asks no login. Three
 //! brackets are three sessions, each with its own peer, simulated account and fbc-oms.
 //!
+//! A recorded market-data day replays through it to the same fills on every run (FBC-w9g):
+//! fbc-runtime's decoder replay hands the journal's envelopes to a fresh peer per bracket
+//! through the same `PeerFeed`, and a fixed command script, authorized through fbc-oms, is
+//! encoded at the recorded stamps of the inputs it follows, so its latency is measured in them
+//! and no clock is read (`tests/replayed.rs`). A closed-loop replay through the session itself
+//! is FBC-066n's.
+//!
 //! Every number SimVenue uses, its capabilities, latency, bracket and fee rates included, is in
-//! the consumer's [`SimConfig`]. Not here yet: replay (FBC-w9g).
+//! the consumer's [`SimConfig`].
 
 mod codec;
 mod config;
