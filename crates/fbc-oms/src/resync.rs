@@ -644,9 +644,14 @@ impl Registry {
             let mut rec = OrderRecord::seeded_from(*cid, o, snap.requested_at, snap.watermark);
             if let Some(ended) = self.orders.get(cid) {
                 // Ended Lost: its fills were counted on it and on the inventory already, and
-                // the ids an amend replaced stay replaced (Reviewer B's RB840-8, Codex's
-                // r4315681141 on PR #171).
-                rec.carry_over(ended);
+                // every other id it is indexed by is replaced by the one shown (Reviewer B's
+                // RB840-8, Codex's r4315681141 and r4315910340 on PR #171).
+                let indexed: Vec<VenueOrderId> = ended
+                    .known_vids()
+                    .cloned()
+                    .chain(self.vids_of(*cid).cloned())
+                    .collect();
+                rec.carry_over(ended, &o.vid, indexed);
             }
             self.orders.insert(*cid, rec);
             let u = update_of(o);

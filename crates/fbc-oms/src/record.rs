@@ -408,11 +408,24 @@ impl OrderRecord {
     }
 
     /// Takes on what `ended`, the record this one replaces as a resync registers it again
-    /// from its snapshot, counted and knew (Reviewer B's RB840-8, Codex's r4315681141 on PR
-    /// #171): the fills counted on it, which the inventory already holds, and the venue ids an
-    /// amend replaced, so a delayed update naming only one of them does not reach this order.
-    pub(crate) fn carry_over(&mut self, ended: &OrderRecord) {
+    /// from its snapshot under the venue id `live`, counted and knew (Reviewer B's RB840-8,
+    /// Codex's r4315681141 and r4315910340 on PR #171): the fills counted on it, which the
+    /// inventory already holds, the venue ids an amend replaced, and every other id `indexed`
+    /// names it by (its current one, one a fill taught), each now replaced by `live`, so a
+    /// delayed update naming only one of them does not reach this order. `live` is no id an
+    /// amend of it replaced.
+    pub(crate) fn carry_over(
+        &mut self,
+        ended: &OrderRecord,
+        live: &VenueOrderId,
+        indexed: impl IntoIterator<Item = VenueOrderId>,
+    ) {
         self.replaced.clone_from(&ended.replaced);
+        for old in indexed {
+            if &old != live && !self.is_superseded(&old) {
+                self.replaced.push((old, live.clone()));
+            }
+        }
         self.set_cum_fills(ended.cum_fills());
     }
 
