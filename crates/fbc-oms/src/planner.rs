@@ -615,6 +615,14 @@ impl ExecutionPlanner {
                 cid: slot.cid,
                 why,
             };
+            // An order standing in for a quote that is now a synthetic IOC or an emulated
+            // reduce-only order of the same wire shape takes that mode: cancelled at once as
+            // an IOC, or protected from overshoot from now on. A mode is never dropped while
+            // the order rests (0100).
+            if let Some(f) = &fitted {
+                slot.mode.synth_ioc |= f.mode.synth_ioc;
+                slot.mode.emulated |= f.mode.emulated;
+            }
             // In Exit, an order on a side that does not reduce the position is cancelled
             // whatever the book wants there: Exit builds nothing on that side (0063).
             let adds_in_exit = exit_reduces.is_some_and(|reduces| reduces != Some(at.side()));

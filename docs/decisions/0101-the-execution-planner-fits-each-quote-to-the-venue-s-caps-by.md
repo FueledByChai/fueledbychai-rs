@@ -32,7 +32,9 @@ builds on the synthetic IOC.
    ReduceOnly) by the quote's fallback. An order moved off the RPI channel stays post-only
    where the venue has post-only, since an RPI order only rests. The fitted quote is what the
    level is compared with, so an order placed from it is kept by later passes of the same
-   quote.
+   quote. An order whose quote becomes a synthetic IOC or an emulated reduce-only order of the
+   same wire shape takes that mode (cancelled at once, or protected from overshoot from then
+   on); a mode is never dropped while the order rests.
 3. **Each downgrade is reported on its command.** `Planned::downgrades` lists the
    `Downgrade`s (`RpiUnsupported`, `RpiReduceOnly`, `SynthIoc`, `EmulatedReduceOnly`,
    `DroppedPostOnly`) in the order applied, on every place and amend built from a fitted
@@ -50,7 +52,9 @@ builds on the synthetic IOC.
    side the order reduces (nothing while the position is flat, unknown or on the order's
    side), less the fills on that side the venue reported on order updates that the inventory
    does not hold yet, less what our other orders that reduce it on that side may have resting
-   (`OrderRecord::resting`, a cancel in flight counted until terminal). A place is sized to it
+   (`OrderRecord::resting`, a cancel in flight counted until terminal). An order reduces it
+   when placed reduce-only or classified reducing, or once an amend classified reducing was
+   built for it (`OrderRecord::reduces`). A place is sized to it
    when built, the commands before it in the pass counted, and refused
    (`PlanRefusal::NoRoomToReduce`) when nothing is left; an amend grows the order only to it.
    An order resting more than is left is cancelled at once, whatever its age or the book: at

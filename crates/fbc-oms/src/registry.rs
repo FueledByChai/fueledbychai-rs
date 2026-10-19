@@ -296,7 +296,8 @@ impl Registry {
     }
 
     /// What our orders on `inst` and `side` that reduce the position (the venue's reduce-only
-    /// flag or the consumer's reducing classification), but those in `except`, may have
+    /// flag or the consumer's reducing classification, at placement or on an amend since;
+    /// [`OrderRecord::reduces`]), but those in `except`, may have
     /// resting, each at its [`OrderRecord::resting`]; `None` when the sum does not fit a lot
     /// count. The planner sizes an emulated reduce-only order by it (FBC-01w).
     pub(crate) fn reducers_resting_on(
@@ -306,7 +307,7 @@ impl Registry {
         except: &[ClientOrderId],
     ) -> Option<Lots> {
         self.sum_on(inst, side, except, |rec| {
-            if rec.placed().reduces() {
+            if rec.reduces() {
                 rec.resting()
             } else {
                 Lots::ZERO
