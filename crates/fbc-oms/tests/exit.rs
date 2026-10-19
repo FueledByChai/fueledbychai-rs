@@ -526,12 +526,17 @@ fn exit_amends_only_exit_orders_on_the_reducing_side_never_crossing_zero() {
 
 #[test]
 fn exit_still_refuses_every_order_a_cap_refuses() {
-    // The inventory cap (0005's I6): a position already past it, 60 of 50, is exited only by
-    // an order that brings the worst case back within it.
+    // The inventory cap (0005's I6): a position already past it, 60 of 50, is exited by an
+    // exit classified reducing only when it brings the worst case back within it; one carrying
+    // the venue's reduce-only flag passes while it shrinks the worst case (decision 0112).
     let mut reg = seeded_under(CAP, WIDE, 60);
     into_exit(&mut reg, INST, exits()[0]);
+    let classified = NewOrder {
+        reduce_only: false,
+        ..exit_of(Side::Sell, 5)
+    };
     assert_eq!(
-        reg.place(exit_of(Side::Sell, 5)),
+        reg.place(classified),
         Err(OmsError::Capped(CapRefusal::InventoryCap {
             inst: INST,
             side: Side::Sell,
@@ -539,6 +544,7 @@ fn exit_still_refuses_every_order_a_cap_refuses() {
             cap: lots(CAP),
         }))
     );
+    arm::place_issued(&mut reg, exit_of(Side::Sell, 5));
     arm::place_issued(&mut reg, exit_of(Side::Sell, 10));
 
     // The resting cap, on places, batch items and amends.

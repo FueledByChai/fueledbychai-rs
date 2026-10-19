@@ -388,7 +388,8 @@ impl Registry {
     }
 
     /// Whether the market's state and the pre-trade caps would admit the place of `qty` on
-    /// `side` of `inst` (reduce-only or classified reducing when `marked`) once each of our
+    /// `side` of `inst` (reduce-only or classified reducing when `marked`; carrying the venue's
+    /// reduce-only flag when `reduce_only`) once each of our
     /// orders in `ending` is terminal with no further fill, judged as [`Self::place`] judges
     /// it; nothing is built or registered. The planner asks it before cancelling the emulated
     /// orders a reducer waits for, so a reducer refused anyway cancels nothing (FBC-01w).
@@ -397,7 +398,7 @@ impl Registry {
         inst: InstrumentId,
         side: Side,
         qty: Lots,
-        marked: bool,
+        (marked, reduce_only): (bool, bool),
         ending: &[ClientOrderId],
     ) -> Result<(), OmsError> {
         let admits = self.entries.admits(inst).map_err(OmsError::State)?;
@@ -405,7 +406,7 @@ impl Registry {
         if self.orphan_suppressed(&exposure, Adds::placing(qty).exposure) {
             return Err(OmsError::OrphanCooldown { inst, side });
         }
-        judge_place(admits, &exposure, qty, marked)
+        judge_place(admits, &exposure, qty, (marked, reduce_only))
     }
 
     /// Whether our order `cid` would get a Live permit and its amend to `px` and the total
@@ -460,8 +461,10 @@ impl Registry {
     /// ([`OmsError::State`]); refused, never built and never
     /// registered, when it would take the worst case on its side past the inventory cap, or
     /// what its side has resting past the resting cap, or its market has no caps
-    /// ([`OmsError::Capped`]), reducing and reduce-only orders included,
-    /// or when an order is already registered under its client id. A place built and then not
+    /// ([`OmsError::Capped`]), reducing and reduce-only orders included (an order carrying the
+    /// venue's reduce-only flag passes the inventory cap whenever it strictly shrinks the
+    /// side's worst case; decision 0112), or when an order is already registered under its
+    /// client id. A place built and then not
     /// sent is reported as such ([`Registry::on_outcome`]), which ends the order.
     ///
     /// The command is held until it is authorized ([`Registry::authorize`], which judges it
@@ -601,7 +604,12 @@ impl Registry {
                 side: order.side,
             });
         }
-        judge_place(admits, &exposure, order.qty, order.reduces())
+        judge_place(
+            admits,
+            &exposure,
+            order.qty,
+            (order.reduces(), order.reduce_only),
+        )
     }
 
     /// Registers a placement about to be sent, PendingNew, without building its command (an
@@ -1055,7 +1063,12 @@ impl Registry {
             if self.orphan_suppressed(&exposure, adds.exposure) {
                 return Err(IssueRefusal::OrphanCooldown { inst, side });
             }
-            exposure.admit(adds).map_err(IssueRefusal::Capped)?;
+            // The venue's reduce-only exemption holds for the side only when every order of
+            // the command on it carries the flag (decision 0112).
+            let flagged = ours.iter().all(|r| r.placed().reduce_only);
+            exposure
+                .admit(adds, flagged)
+                .map_err(IssueRefusal::Capped)?;
         }
         Ok(())
     }
@@ -1262,16 +1275,17 @@ impl Registry {
 }
 
 /// Whether a place of `qty` on `exposure`'s side (reduce-only or classified reducing when
-/// `marked`) is admitted by the market's state, `admits`, then by both pre-trade caps.
+/// `marked`; carrying the venue's reduce-only flag when `reduce_only`) is admitted by the
+/// market's state, `admits`, then by both pre-trade caps.
 fn judge_place(
     admits: Admits,
     exposure: &Exposure,
     qty: Lots,
-    marked: bool,
+    (marked, reduce_only): (bool, bool),
 ) -> Result<(), OmsError> {
     let adds = Adds::placing(qty);
     admits
         .judge(exposure, marked, adds.exposure)
         .map_err(OmsError::State)?;
-    exposure.admit(adds).map_err(OmsError::Capped)
+    exposure.admit(adds, reduce_only).map_err(OmsError::Capped)
 }

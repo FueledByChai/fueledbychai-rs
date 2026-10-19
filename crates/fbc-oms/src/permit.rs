@@ -410,7 +410,9 @@ impl<'r> Live<'r> {
     /// amended, stay within the position's size ([`AmendRefusal::OrphanCooldown`]).
     ///
     /// Refused, never built, when the amend would take the worst case on the order's side past
-    /// its market's inventory cap (0005's I6), or what the side has resting past its resting
+    /// its market's inventory cap (0005's I6; an order placed with the venue's reduce-only flag
+    /// passes it whenever the amended order strictly shrinks the side's worst case, decision
+    /// 0112), or what the side has resting past its resting
     /// cap (0052), the order counted at the larger of its resting quantity now and the
     /// amend's, as it is while the amend is in flight, or when its market has no caps
     /// configured ([`AmendRefusal::Capped`]). A replace (an amend on a venue whose amend gives
@@ -506,11 +508,15 @@ pub(crate) fn judge_amend(
     admits
         .judge(exposure, reducing || rec.placed().reduce_only, adds)
         .map_err(AmendRefusal::State)?;
+    // The amend keeps the placement's venue reduce-only flag (decision 0112).
     exposure
-        .admit(Adds {
-            exposure: adds,
-            resting: rec.resting_if_amended(qty, wire),
-        })
+        .admit(
+            Adds {
+                exposure: adds,
+                resting: rec.resting_if_amended(qty, wire),
+            },
+            rec.placed().reduce_only,
+        )
         .map_err(AmendRefusal::Capped)?;
     Ok((amend, wire))
 }

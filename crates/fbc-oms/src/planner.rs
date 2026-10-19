@@ -1416,9 +1416,13 @@ impl ExecutionPlanner {
                     if !overshot.is_empty() {
                         let ending: Vec<ClientOrderId> =
                             overshot.iter().map(|&(_, cid)| cid).collect();
-                        let why = match reg
-                            .admits_place_once_ended(market, side, quote.qty, true, &ending)
-                        {
+                        let why = match reg.admits_place_once_ended(
+                            market,
+                            side,
+                            quote.qty,
+                            (true, quote.reduce_only),
+                            &ending,
+                        ) {
                             Ok(()) => {
                                 let cancels = (&mut cancelling, &mut out);
                                 cancel_overshot(slots, reg, caps, acct, &overshot, cancels);

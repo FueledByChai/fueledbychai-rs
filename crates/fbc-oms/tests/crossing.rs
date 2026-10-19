@@ -859,6 +859,52 @@ fn a_position_past_the_inventory_cap_by_more_than_the_resting_cap_is_crossed_in_
 }
 
 #[test]
+fn past_the_inventory_cap_a_crossing_beside_an_emulated_exit_still_waits_for_its_cancel() {
+    // Long 62 under an inventory cap of 50 and a wide resting cap (test inputs): an emulated
+    // maker exit of 60 rests (worst case 2). The cross of 11 would leave it overshooting, so it
+    // is judged as if that order had ended: a worst case of 51, past the cap but shrinking,
+    // with the venue's flag, so it waits for the emulated order's cancel (decision 0106 rule
+    // 7) rather than being refused by the inventory cap, then crosses.
+    let caps = ioc_venue(&[(Feature::PostOnly, Feature::ReduceOnly)]);
+    let mut reg = quoting(62);
+    let mut mint = mint();
+    let mut p = planner();
+    let maker = DesiredQuote {
+        post_only: true,
+        reduce_fallback: ReduceFallback::EmulateReduceOnly,
+        ..reduce_only(limit(10_020, 60))
+    };
+    let first = book().with(Side::Sell, 0, maker);
+    let plan = plan_and_send(&mut p, &first, &mut reg, &caps, &mut mint, MonoNs(0));
+    let emulated = plan.commands[0].cid;
+    assert_eq!(
+        plan.commands[0].downgrades,
+        vec![Downgrade::EmulatedReduceOnly]
+    );
+    ack(&mut reg, emulated, "e1");
+    let escalate = book().with_crossing(Side::Sell, cross(9_900, 11, 1));
+    let plan = plan_and_send(&mut p, &escalate, &mut reg, &caps, &mut mint, LATER);
+    assert_eq!(
+        refused_crossing(&plan),
+        vec![(Side::Sell, PlanRefusal::AwaitsEmulatedCancel)]
+    );
+    ended(
+        &mut reg,
+        emulated,
+        Side::Sell,
+        "e1",
+        VenueOrderState::Canceled(CancelReason::Requested),
+        2,
+    );
+    let plan = plan_and_send(&mut p, &escalate, &mut reg, &caps, &mut mint, LATER2);
+    assert_eq!(
+        shape(&plan),
+        vec![(Stage::Reducing, "place", Side::Sell, CROSSING_LEVEL, true)]
+    );
+    assert_crossing(placed(&plan.commands[0]), Side::Sell, 9_900, 11, Tif::Ioc);
+}
+
+#[test]
 fn past_the_inventory_cap_an_emulated_reducer_and_an_order_that_grows_the_worst_case_stay_refused()
 {
     // The exemption is the venue's reduce-only flag's alone (FBC-ugto): an emulated reduce-only
