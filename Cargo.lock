@@ -577,6 +577,7 @@ dependencies = [
  "fbc-oms",
  "fbc-runtime",
  "fbc-sim",
+ "futures-util",
  "log",
  "rust_decimal",
  "serde_json",
@@ -584,6 +585,7 @@ dependencies = [
  "starknet-core",
  "starknet-crypto",
  "tokio",
+ "tokio-tungstenite",
  "zeroize",
  "zstd",
 ]
