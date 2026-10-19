@@ -38,9 +38,11 @@
 //! reducing it on its side, so the position never crosses zero, and planned not at all while
 //! nothing is left to reduce; built through the same one pre-trade path, so refused in Killed
 //! and Cancel-only and judged by Exit's admission and both caps; never amended or replaced while
-//! it is live; and at most one order per [`CrossingIntent::attempt`], so an order the venue
-//! refuses or leaves unfilled is not sent again until the consumer names a new attempt
-//! (decision 0107).
+//! it is live; and at most one order per [`CrossingIntent::attempt`], attempts only
+//! increasing, so an order the venue refuses or leaves unfilled is not sent again until the
+//! consumer names a later attempt (decision 0107). A synthetic IOC, a crossing's or a level
+//! quote's, is built only where the venue takes good-till-cancelled limits and can cancel the
+//! order by venue or client id once acknowledged ([`PlanRefusal::NoSyntheticIoc`]).
 //!
 //! Each level's quote carries the consumer's opaque tag and each side an optional removal
 //! reason: every place and amend built for a level carries its tag, every cancel of a level no
@@ -85,7 +87,7 @@ use std::time::Duration;
 
 use fbc_core::{
     AccountKey, Bps, Channel, CidMint, ClientOrderId, Feature, IdError, InstrumentId, Lots, MonoNs,
-    NewOrder, OrderCaps, OrderKind, Side, Ticks, Tif,
+    NewOrder, OrderCaps, OrderKind, RefKind, Side, Ticks, Tif,
 };
 
 use crate::entry::EntryState;
@@ -113,11 +115,13 @@ pub struct CrossingIntent {
     pub qty: Lots,
     /// The consumer's opaque tag, as [`DesiredQuote::tag`].
     pub tag: u16,
-    /// The consumer's attempt: at most one order is planned per attempt, so an order that
-    /// ended (filled, its unfilled rest expired, or refused by the venue) is not crossed again
-    /// until the consumer names another attempt, which is planned once the previous order is
-    /// terminal. An attempt refused before anything was built (by the market's state, a cap,
-    /// or with nothing left to reduce) sent nothing, and is planned again at a later pass.
+    /// The consumer's attempt, counted up: at most one order is planned per attempt, so an
+    /// order that ended (filled, its unfilled rest expired, or refused by the venue) is not
+    /// crossed again until the consumer names a later attempt, which is planned once the
+    /// previous order is terminal; an attempt older than the last one built is never planned
+    /// ([`PlanRefusal::StaleAttempt`]). An attempt refused before anything was built (by the
+    /// market's state, a cap, or with nothing left to reduce) sent nothing, and is planned
+    /// again at a later pass, as is one whose order ended never sent.
     pub attempt: u64,
 }
 
@@ -636,7 +640,16 @@ pub struct ExecutionPlanner {
     bound: HashMap<AccountKey, Instance>,
     /// The last crossing attempt an order was built for, by account, market and side
     /// (decision 0107).
-    fired: HashMap<(AccountKey, InstrumentId, Level), u64>,
+    fired: HashMap<(AccountKey, InstrumentId, Level), Fired>,
+}
+
+/// The last crossing attempt an order was built for on one side (decision 0107).
+#[derive(Copy, Clone, Debug)]
+struct Fired {
+    attempt: u64,
+    /// The order may have reached the venue; false once it ended never sent, so the attempt
+    /// is planned again.
+    spent: bool,
 }
 
 impl ExecutionPlanner {
@@ -748,11 +761,23 @@ impl ExecutionPlanner {
                     .map(|q| fit(q, caps))
             };
             let Some(slot) = slots.get_mut(&at) else {
-                // A crossing attempt an order was built for is never planned again (0107).
-                let fired = |f: &Fitted| {
-                    f.attempt.is_some() && self.fired.get(&(acct, market, at)).copied() == f.attempt
+                // A crossing attempt an order was built for is never planned again, nor one
+                // older than it (0107): attempts only increase.
+                let last = self.fired.get(&(acct, market, at)).copied();
+                let fitted = match (fitted, last) {
+                    (Some(f), Some(last)) if f.attempt.is_some_and(|a| a < last.attempt) => {
+                        plan.refused.push(Refused {
+                            side: at.side(),
+                            level: at.level,
+                            crossing: at.crossing,
+                            why: PlanRefusal::StaleAttempt { last: last.attempt },
+                        });
+                        None
+                    }
+                    (Some(f), Some(last)) if f.attempt == Some(last.attempt) && last.spent => None,
+                    (fitted, _) => fitted,
                 };
-                if let Some(f) = fitted.filter(|f| !fired(f)) {
+                if let Some(f) = fitted {
                     let stage = if f.quote.reduces() {
                         Stage::Reducing
                     } else {
@@ -1042,6 +1067,13 @@ impl ExecutionPlanner {
                     downgrades,
                     attempt,
                 }) => {
+                    // A synthetic IOC needs a good-till-cancelled limit and a cancel that can
+                    // name the order once acknowledged; without either its limit could rest
+                    // and fill later (Codex r4317142581).
+                    if mode.synth_ioc && !synthesizes_ioc(caps) {
+                        plan.refused.push(refuse(PlanRefusal::NoSyntheticIoc));
+                        continue;
+                    }
                     // A crossing intent is sent only with the venue's reduce-only flag, and is
                     // sized to what is left to reduce, the commands before it counted (0107).
                     if attempt.is_some() {
@@ -1110,7 +1142,11 @@ impl ExecutionPlanner {
                             );
                             reg.with_record(cid, |rec| rec.set_tag(quote.tag));
                             if let Some(attempt) = attempt {
-                                self.fired.insert((acct, market, at), attempt);
+                                let spent = Fired {
+                                    attempt,
+                                    spent: true,
+                                };
+                                self.fired.insert((acct, market, at), spent);
                             }
                             (cid, cmd, Some(quote.tag), None, downgrades)
                         })
@@ -1298,6 +1334,14 @@ fn fit_crossing(c: &CrossingIntent, caps: &OrderCaps) -> Fitted {
     fitted
 }
 
+/// Whether the venue can stand in for an IOC with a good-till-cancelled limit cancelled at once:
+/// it takes GTC limits, and its single cancel can name the order once acknowledged, by venue
+/// id or client id (a placement nonce alone is not counted on).
+fn synthesizes_ioc(caps: &OrderCaps) -> bool {
+    caps.tifs.contains(Tif::Gtc)
+        && (caps.cancel_refs.contains(RefKind::Venue) || caps.cancel_refs.contains(RefKind::Client))
+}
+
 /// What is left for a crossing intent on `side` of `market` to reduce (decision 0107): as
 /// [`reduce_room`] with no order excepted, but for the emulated reduce-only orders in `slots`,
 /// which a crossing order is never clipped by: it waits for their cancel instead, as any
@@ -1478,18 +1522,21 @@ fn overshoot_cancels(
 }
 
 /// Frees each level of `slots` whose order `reg` shows terminal (or no longer holds). A
-/// crossing order that ended never sent reached no venue, so its attempt is forgotten and
-/// planned again (decision 0107).
+/// crossing order that ended never sent reached no venue, so its attempt, the last one built
+/// for its side, is planned again; older ones still are not (decision 0107).
 fn free_terminal(
     slots: &mut BTreeMap<Level, Slot>,
     reg: &Registry,
-    fired: &mut HashMap<(AccountKey, InstrumentId, Level), u64>,
+    fired: &mut HashMap<(AccountKey, InstrumentId, Level), Fired>,
     (acct, market): (AccountKey, InstrumentId),
 ) {
     slots.retain(|&at, slot| {
         let state = reg.get(slot.cid).map(OrderRecord::state);
-        if at.crossing && matches!(state, Some(OrdState::Terminal(TerminalKind::NotSent(_)))) {
-            fired.remove(&(acct, market, at));
+        if at.crossing
+            && matches!(state, Some(OrdState::Terminal(TerminalKind::NotSent(_))))
+            && let Some(fired) = fired.get_mut(&(acct, market, at))
+        {
+            fired.spent = false;
         }
         state.is_some_and(|state| !state.is_terminal())
     });
