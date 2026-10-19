@@ -1368,6 +1368,162 @@ fn a_resting_order_whose_quote_becomes_reducing_counts_against_an_emulated_order
     assert_emulated(placed(&pass.commands[0]), 2);
 }
 
+/// A post-only ask of `qty` at `px` without the venue flag, classified reducing or not.
+fn post_only_ask(px: i64, qty: i64, reducing: bool) -> DesiredQuote {
+    DesiredQuote {
+        post_only: true,
+        reducing,
+        ..limit(px, qty)
+    }
+}
+
+/// The command `plan` built at `level` of `side`.
+fn at_level(plan: &Plan, side: Side, level: u16) -> &Planned {
+    plan.commands
+        .iter()
+        .find(|c| c.side == side && c.level == level)
+        .unwrap_or_else(|| panic!("nothing built at {side:?} {level}: {:?}", shape(plan)))
+}
+
+/// The total an amend `p` carries.
+fn amended_total(p: &Planned) -> fbc_core::Lots {
+    match p.auth.command() {
+        VenueCommand::Amend(a) => a.qty,
+        other => panic!("expected an amend, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_price_only_amend_that_makes_a_farther_order_a_reducer_waits_for_the_emulated_cancel() {
+    // Codex r4310495940: long 10, an emulated exit of 6 at level 0 and an unclassified ask of 5
+    // at level 1 rest. The ask's quote is now classified reducing at a new price, its size
+    // unchanged: amended now, it would be authorized before the emulated order's cancel has
+    // settled, and both could fill and take the position to -1. It waits like any new reducer.
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = amending(conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]));
+    let exit = maker_exit(10_010, 6, ReduceFallback::EmulateReduceOnly);
+    let first = book().with(Side::Sell, 0, exit.clone()).with(
+        Side::Sell,
+        1,
+        post_only_ask(10_030, 5, false),
+    );
+    let plan = plan_and_send(&mut p, &first, &mut reg, &caps, &mut mint, MonoNs(0));
+    let emulated = at_level(&plan, Side::Sell, 0).cid;
+    let ask = at_level(&plan, Side::Sell, 1).cid;
+    assert_emulated(placed(at_level(&plan, Side::Sell, 0)), 6);
+    ack(&mut reg, emulated, "v0");
+    ack(&mut reg, ask, "v1");
+    let next = book()
+        .with(Side::Sell, 0, exit)
+        .with(Side::Sell, 1, post_only_ask(10_040, 5, true));
+    let pass = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER);
+    assert_eq!(shape(&pass), vec![(Stage::Cancel, "cancel", Side::Sell, 0)]);
+    assert_eq!(pass.commands[0].cid, emulated);
+    assert_eq!(waiting(&pass), vec![(Side::Sell, 1)]);
+    // The cancel in flight still counts: the reducer waits.
+    let again = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER2);
+    assert!(again.commands.is_empty(), "{:?}", shape(&again));
+    assert_eq!(waiting(&again), vec![(Side::Sell, 1)]);
+    cancelled(&mut reg, emulated, Side::Sell, "v0", 2);
+    let after = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER3);
+    assert_eq!(
+        shape(&after),
+        vec![
+            (Stage::Reducing, "amend", Side::Sell, 1),
+            (Stage::Reducing, "place", Side::Sell, 0),
+        ]
+    );
+    assert_eq!(after.commands[0].cid, ask);
+    assert_eq!(amended_total(&after.commands[0]), lots(5));
+    assert_emulated(placed(&after.commands[1]), 5);
+}
+
+#[test]
+fn a_price_only_amend_that_makes_a_nearer_order_a_reducer_waits_for_the_emulated_cancel() {
+    // The same at the other order of levels: the unclassified ask of 5 rests at level 0, the
+    // emulated exit of 6 at level 1. The exit's cancel is built first; the ask's amend still
+    // waits until the exit is terminal, never authorized beside a cancel not yet settled.
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = amending(conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]));
+    let exit = maker_exit(10_030, 6, ReduceFallback::EmulateReduceOnly);
+    let first = book()
+        .with(Side::Sell, 0, post_only_ask(10_010, 5, false))
+        .with(Side::Sell, 1, exit.clone());
+    let plan = plan_and_send(&mut p, &first, &mut reg, &caps, &mut mint, MonoNs(0));
+    let ask = at_level(&plan, Side::Sell, 0).cid;
+    let emulated = at_level(&plan, Side::Sell, 1).cid;
+    assert_emulated(placed(at_level(&plan, Side::Sell, 1)), 6);
+    ack(&mut reg, ask, "v0");
+    ack(&mut reg, emulated, "v1");
+    let next = book()
+        .with(Side::Sell, 0, post_only_ask(10_020, 5, true))
+        .with(Side::Sell, 1, exit);
+    let pass = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER);
+    assert_eq!(shape(&pass), vec![(Stage::Cancel, "cancel", Side::Sell, 1)]);
+    assert_eq!(pass.commands[0].cid, emulated);
+    assert_eq!(waiting(&pass), vec![(Side::Sell, 0)]);
+    cancelled(&mut reg, emulated, Side::Sell, "v1", 2);
+    let after = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER2);
+    assert_eq!(
+        shape(&after),
+        vec![
+            (Stage::Reducing, "amend", Side::Sell, 0),
+            (Stage::Reducing, "place", Side::Sell, 1),
+        ]
+    );
+    assert_eq!(after.commands[0].cid, ask);
+    assert_emulated(placed(&after.commands[1]), 5);
+}
+
+#[test]
+fn a_reducer_classified_while_too_young_to_amend_still_waits_for_the_emulated_cancel() {
+    // Long 10, the emulated exit of 6 at level 0 and the unclassified ask of 5 at level 1. The
+    // ask's quote turns reducing at a new price while the ask is too young to amend: the pass
+    // counts it and cancels the exit, which now overshoots. The next pass may amend the ask,
+    // but the exit's cancel is still in flight: the ask, a reducer since the pass before but
+    // never amended as one, waits all the same.
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = amending(conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]));
+    let exit = maker_exit(10_010, 6, ReduceFallback::EmulateReduceOnly);
+    let first = book().with(Side::Sell, 0, exit.clone()).with(
+        Side::Sell,
+        1,
+        post_only_ask(10_030, 5, false),
+    );
+    let plan = plan_and_send(&mut p, &first, &mut reg, &caps, &mut mint, MonoNs(0));
+    let emulated = at_level(&plan, Side::Sell, 0).cid;
+    let ask = at_level(&plan, Side::Sell, 1).cid;
+    ack(&mut reg, emulated, "v0");
+    ack(&mut reg, ask, "v1");
+    let next = book()
+        .with(Side::Sell, 0, exit)
+        .with(Side::Sell, 1, post_only_ask(10_040, 5, true));
+    let young = MonoNs(10_000_000);
+    let pass = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, young);
+    assert_eq!(shape(&pass), vec![(Stage::Cancel, "cancel", Side::Sell, 0)]);
+    assert_eq!(pass.commands[0].cid, emulated);
+    let again = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER);
+    assert!(again.commands.is_empty(), "{:?}", shape(&again));
+    assert_eq!(waiting(&again), vec![(Side::Sell, 1)]);
+    cancelled(&mut reg, emulated, Side::Sell, "v0", 2);
+    let after = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER2);
+    assert_eq!(
+        shape(&after),
+        vec![
+            (Stage::Reducing, "amend", Side::Sell, 1),
+            (Stage::Reducing, "place", Side::Sell, 0),
+        ]
+    );
+    assert_eq!(after.commands[0].cid, ask);
+    assert_emulated(placed(&after.commands[1]), 5);
+}
+
 #[test]
 fn an_emulated_order_whose_quote_becomes_ordinary_stays_within_what_is_left_to_reduce() {
     // Codex r4310102183: long 10, an emulated exit of 5 and a reduce-only ask of 5 rest. The
