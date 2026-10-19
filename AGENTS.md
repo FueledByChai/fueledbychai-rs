@@ -331,7 +331,10 @@ rather than guess.
     generic fallbacks reported as `Planned::downgrades` (RPI to public, a synthetic IOC
     cancelled at once, emulated or kept reduce-only per the quote's `ReduceFallback`), an
     emulated reduce-only order kept within what is left to reduce and cancelled on overshoot
-    at each pass and by `ExecutionPlanner::on_fill` (0106; `tests/fallbacks.rs`); still
+    at each pass and by `ExecutionPlanner::on_fill` (0106; `tests/fallbacks.rs`), each side's
+    price-capped `CrossingIntent` planned as one reduce-only order at its cap (IOC where the
+    caps take it, else a synthetic IOC), sized so the position never crosses zero, through
+    every state and cap, once per consumer attempt (0107; `tests/crossing.rs`); still
     planned: batching, venue modes and the safety floor; 0005, 0013), `crates/fbc-journal` (0006; it depends on
     `fbc-core`, and `hmac` and `sha2` for its keyed hashes and `zstd` for its closed segments, only: the records the runtime writes, length-prefixed in a hand-written
     little-endian format with a version, a writer of one subdirectory per UTC day with segments
