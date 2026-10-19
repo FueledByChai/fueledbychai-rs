@@ -283,10 +283,10 @@ impl ExecHandler for Glue {
 }
 
 /// A directory of the test's own for its leases, removed when dropped.
-struct LeaseDir(PathBuf);
+pub struct LeaseDir(pub PathBuf);
 
 impl LeaseDir {
-    fn new() -> LeaseDir {
+    pub fn new() -> LeaseDir {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let k = NEXT.fetch_add(1, Ordering::Relaxed);
         let name = format!("fbc-conformance-faults-{}-{k}", std::process::id());
@@ -295,7 +295,7 @@ impl LeaseDir {
         LeaseDir(dir)
     }
 
-    fn account(&self) -> String {
+    pub fn account(&self) -> String {
         self.0.file_name().unwrap().to_string_lossy().into_owned()
     }
 }
@@ -307,7 +307,7 @@ impl Drop for LeaseDir {
 }
 
 /// Nonces counted up from 1.
-struct Counting(u64);
+pub struct Counting(pub u64);
 
 impl NonceSource for Counting {
     fn reserve(&mut self, len: u16) -> NonceBlock {
