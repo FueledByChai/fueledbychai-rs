@@ -74,7 +74,10 @@ builds on the synthetic IOC.
    before the cancel lands and take the position past zero. The emulated order is cancelled
    only when the market's state and both caps would admit the reducer with that order ended;
    a reducer refused anyway (by the resting cap, say) reports its own refusal and the
-   emulated order rests, so no order is placed and cancelled by turns.
+   emulated order rests, so no order is placed and cancelled by turns. A reducer's amend that
+   does not shrink it, a price-only one included, is judged so: an order its quote made a
+   reducer this pass or an earlier one is a new reducer whatever its size; only an amend that
+   shrinks the order, lowering what may fill, never waits.
 
 ## Alternatives
 
