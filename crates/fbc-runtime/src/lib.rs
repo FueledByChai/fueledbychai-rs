@@ -183,7 +183,9 @@ pub use ratelimit::{
     ScopeCounts,
 };
 pub use reconcile::{ReconcileError, Reconciler, SubscribeCall};
-pub use replay::{MdReplay, MdReplayConfig, MdReplayCounters, ReplayError};
+pub use replay::{
+    ClosedLoop, MdReplay, MdReplayConfig, MdReplayCounters, ReplayError, ReplayFailure,
+};
 pub use session::{
     MdControl, MdCounters, MdHandler, MdSession, MdSessionConfig, Outbox, SessionError,
 };

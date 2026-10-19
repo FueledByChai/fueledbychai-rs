@@ -91,6 +91,17 @@ pub struct IngestClock {
     next: Rc<Cell<u64>>,
     origin: Instant,
     handling: Rc<Cell<Option<Stamp>>>,
+    /// A closed-loop replay's clock reads no wall clock ([`IngestClock::replayed`]).
+    replayed: Option<Rc<Cell<Replayed>>>,
+}
+
+/// What a closed-loop replay's clock reads its wall time from (FBC-066n): the last stamp a
+/// replayed record set, on both clocks, and the latest monotonic reading it stamped.
+#[derive(Copy, Clone, Debug)]
+struct Replayed {
+    mono: MonoNs,
+    wall: WallNs,
+    last: MonoNs,
 }
 
 impl Default for IngestClock {
@@ -106,7 +117,28 @@ impl IngestClock {
             next: Rc::new(Cell::new(0)),
             origin: Instant::now(),
             handling: Rc::new(Cell::new(None)),
+            replayed: None,
         }
+    }
+
+    /// A closed-loop replay's clock (FBC-066n): its sequence starts at 0 and its monotonic
+    /// origin is now, on the runtime's clock, which a closed-loop replay pauses; `wall` is the
+    /// wall time at that origin.
+    pub fn replayed(wall: WallNs) -> IngestClock {
+        let anchor = Replayed {
+            mono: MonoNs(0),
+            wall,
+            last: MonoNs(0),
+        };
+        IngestClock {
+            replayed: Some(Rc::new(Cell::new(anchor))),
+            ..IngestClock::new()
+        }
+    }
+
+    /// Whether this is a closed-loop replay's clock ([`IngestClock::replayed`]).
+    pub fn is_replayed(&self) -> bool {
+        self.replayed.is_some()
     }
 
     /// Stamps an input of `conn` arriving now, whose last packet the kernel received at
