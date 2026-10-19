@@ -5691,3 +5691,87 @@ fn a_risk_reject_of_an_order_naming_no_client_id_of_ours_names_it_by_its_venue_i
     );
     assert_eq!(order_of(&got[1].1).state, rejected_state(RejectKind::Other));
 }
+
+#[test]
+fn a_placement_held_for_a_risk_reject_is_refused_at_once_by_every_rule_an_ordinary_one_is() {
+    // Codex r4309341209 on PR #165: the venue's matching-time rules refuse it before the risk
+    // check would, as they refuse an ordinary placement: a post-only order that would cross, a
+    // resting order where the book does not know its level, and a cross no fee rate charges.
+    let mut no_fee = FeeBook::new();
+    let (key, entry) = rate(INST, Liquidity::Maker, MAKER_BPS, FeeSource::ConfigOverride);
+    no_fee.insert(key, entry);
+    let base = || {
+        two_phased(config(
+            Bracket::Pessimistic,
+            VenueFeeSign::PositiveIsCost,
+            fees(),
+        ))
+    };
+    let uncharged = two_phased(config(
+        Bracket::Pessimistic,
+        VenueFeeSign::PositiveIsCost,
+        no_fee,
+    ));
+    let cases = [
+        (
+            base(),
+            limit(cid(), Side::Buy, 201, 1),
+            RejectKind::PostOnlyWouldCross,
+            "post_only",
+        ),
+        (
+            base(),
+            limit(cid(), Side::Buy, 150, 1),
+            RejectKind::Other,
+            "no_book",
+        ),
+        (
+            uncharged,
+            ioc(Side::Buy, 201, 1),
+            RejectKind::Other,
+            "no_fee",
+        ),
+    ];
+    for (config, cmd, kind, code) in cases {
+        let mut v = Venue::with(config);
+        v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+        let VenueCommand::Place(o) = &cmd else {
+            unreachable!()
+        };
+        v.engine
+            .risk_reject(o.cid, Duration::from_millis(20), RiskRefusal::Margin)
+            .unwrap();
+        v.send(cmd, 1, T0);
+        v.tick(T0 + 5 * MS);
+        let got = v.events();
+        assert_eq!(got.len(), 1, "{code}: {got:?}");
+        assert_eq!(refusal(&got[0].1), (kind, code.to_owned()));
+        // Nothing was held for the check, so nothing follows.
+        v.tick(T0 + 5 * MS + 2 * WINDOW);
+        assert!(v.events().is_empty(), "{code}");
+    }
+}
+
+#[test]
+fn a_withdrawn_placement_is_settled_on_the_wire_so_the_codec_awaits_it_no_longer() {
+    // Codex r4309341215 on PR #165: a placement withdrawn before its risk check still gets a
+    // second-phase frame, at the instant the check would have refused it, which reports
+    // nothing; every provisional acceptance the codec awaits is so settled once.
+    let mut v = two_phase();
+    v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+    let order = cid();
+    v.engine
+        .risk_reject(order, Duration::from_millis(20), RiskRefusal::Margin)
+        .unwrap();
+    v.send(limit(order, Side::Buy, 199, 2), 1, T0);
+    v.tick(T0 + 5 * MS);
+    assert_eq!(v.frames().len(), 1);
+    v.send(cancel(OrderRef::Client(order)), 2, T0 + 6 * MS);
+    v.tick(T0 + 11 * MS);
+    assert_eq!(v.frames().len(), 2);
+    v.tick(T0 + 25 * MS);
+    let frames = v.frames();
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    assert_eq!(frames[0].0, MonoNs(T0 + 25 * MS) + TO_CLIENT);
+    assert!(frames[0].1.is_empty(), "{frames:?}");
+}
