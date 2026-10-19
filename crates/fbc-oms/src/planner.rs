@@ -387,6 +387,11 @@ pub enum PlanRefusal {
     /// reduce: the position is flat, unknown or on the quote's side, or the other orders
     /// reducing it on that side already cover it.
     NoRoomToReduce,
+    /// A place or amend that reduces the position would leave an emulated reduce-only order
+    /// resting on its side more than is left to reduce, so both could fill and take the
+    /// position past zero: the emulated order is cancelled, and the command is built by the
+    /// first pass after that order is terminal (decision 0100).
+    AwaitsEmulatedCancel,
 }
 
 /// Why a whole [`ExecutionPlanner::plan`] pass was refused, nothing built or freed: the
