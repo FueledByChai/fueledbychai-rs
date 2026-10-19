@@ -1571,3 +1571,44 @@ fn an_orphan_whose_venue_id_the_seed_showed_has_its_fills_placed_by_what_the_see
     assert_eq!(routed, FillRouted::InSnapshot(o));
     assert_eq!(reg.position(INST), Some(SignedLots(1)));
 }
+
+#[test]
+fn an_orphan_whose_venue_id_the_seed_showed_has_a_later_fill_naming_only_its_client_id_counted() {
+    // Codex's r4316366360 on PR #171: as above, the seed showed `v`, 1 filled, with no client
+    // id, and a later snapshot shows it under our client id o. A fill of o naming no venue id,
+    // at a cumulative 2, came after the seed: what the seed showed of `v` places it, so it
+    // moves the inventory.
+    let mut reg = arm::named(Registry::with_caps(caps()));
+    let mut unnamed = not_ours(None, "v");
+    unnamed.cum_filled = lots(1);
+    resync_at(
+        &mut reg,
+        SnapshotSource::Trustworthy,
+        1_000,
+        vec![unnamed],
+        1,
+    );
+    let o = cid();
+    let mut shown = ours(o, "v", Side::Buy);
+    shown.cum_filled = lots(1);
+    resync_at(&mut reg, SnapshotSource::Trustworthy, 2_000, vec![shown], 1);
+    assert_eq!(reg.orphans(INST), vec![o]);
+    let mut l = ledger();
+    let f = fill(
+        Some(o),
+        FillIdent::Venue {
+            fill: fill_id("v-2"),
+            vid: None,
+            cum_after: Some(lots(2)),
+        },
+        Side::Buy,
+        1,
+        false,
+    );
+    let Admission::Apply(accepted) = l.admit(&f, None, MonoNs(2_500)) else {
+        panic!("a new fill is admitted");
+    };
+    let routed = reg.apply_fill(accepted).unwrap();
+    assert!(matches!(routed, FillRouted::Ours(..)), "{routed:?}");
+    assert_eq!(reg.position(INST), Some(SignedLots(2)));
+}
