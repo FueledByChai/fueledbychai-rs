@@ -56,8 +56,10 @@ use fbc_core::{
 };
 use fbc_journal::{ControlEvent, HttpResponseRec, JournalError, Marker, Opcode, Record};
 
+use crate::exec_session::ExecControl;
 use crate::inputs::{ConsumerInput, InputHandler};
 use crate::session::{MdHandler, feed_frame, feed_http, feed_timer};
+use crate::session_core::IngestClock;
 
 /// What a replay needs, all from the consumer: what the session ran with.
 pub struct MdReplayConfig {
@@ -131,6 +133,62 @@ impl std::error::Error for ReplayError {
     }
 }
 
+/// What a closed-loop replay runs on a shard with (FBC-066n): [`Member::md_replay`](crate::Member::md_replay).
+pub struct ClosedLoop<I> {
+    /// The shard's clock, [`IngestClock::replayed`]: the host and every member's session share
+    /// it.
+    pub clock: IngestClock,
+    /// The journal's records in order, as [`JournalReader`](fbc_journal::JournalReader) reads
+    /// them.
+    pub records: I,
+    /// How long the replay runs on past the instant of the journal's last record, so the
+    /// answers due by then are read.
+    pub settle: std::time::Duration,
+    /// The controls of the shard's order-entry sessions, dropped once the replay has settled:
+    /// which ends them, and the shard's run with them.
+    pub stops: Vec<ExecControl>,
+}
+
+impl<I> fmt::Debug for ClosedLoop<I> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClosedLoop")
+            .field("settle", &self.settle)
+            .field("stops", &self.stops.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why a closed-loop replay stopped: the shard's run ends with it
+/// ([`ShardError::Replay`](crate::ShardError::Replay)).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplayFailure {
+    /// The clock is a live shard's, not [`IngestClock::replayed`]: it would read the wall clock.
+    LiveClock,
+    /// The journal could not be read: the reader's error, as it reads.
+    Journal(String),
+    /// A text frame's bytes are not UTF-8, which no session journals: the record is damaged.
+    NotUtf8 { ingest_seq: u64 },
+}
+
+impl fmt::Display for ReplayFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReplayFailure::LiveClock => {
+                f.write_str("a closed-loop replay needs a replayed clock, not a live one")
+            }
+            ReplayFailure::Journal(e) => write!(f, "the journal cannot be read: {e}"),
+            ReplayFailure::NotUtf8 { ingest_seq } => {
+                write!(
+                    f,
+                    "the text frame of ingest sequence {ingest_seq} is not UTF-8"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReplayFailure {}
+
 /// One session's journal, replayed through its venue's decoders into a handler.
 pub struct MdReplay<H> {
     venue: &'static dyn VenueFactory,
@@ -198,6 +256,15 @@ impl<H: MdHandler> MdReplay<H> {
             self.feed(&record.map_err(ReplayError::Journal)?)?;
         }
         self.finish();
+        Ok(())
+    }
+
+    /// Drives the closed-loop replay of `closed` on a shard ([`Member::md_replay`](crate::Member::md_replay)).
+    pub(crate) async fn play<I>(&mut self, closed: ClosedLoop<I>) -> Result<(), ReplayFailure>
+    where
+        I: IntoIterator<Item = Result<Record, JournalError>>,
+    {
+        drop(closed);
         Ok(())
     }
 

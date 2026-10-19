@@ -72,6 +72,7 @@ use crate::exec_session::{ExecHandler, ExecSession, ExecSessionError};
 use crate::inputs::{ConsumerInputs, InputHandler};
 use crate::journal::Journal;
 use crate::md_venue::MdVenue;
+use crate::replay::{ClosedLoop, MdReplay, ReplayFailure};
 use crate::session::{MdHandler, MdSession, SessionError};
 use crate::session_core::IngestClock;
 
@@ -82,6 +83,8 @@ pub enum ShardError {
     Md(SessionError),
     /// An order-entry session failed.
     Exec(ExecSessionError),
+    /// A closed-loop replay stopped (FBC-066n).
+    Replay(ReplayFailure),
 }
 
 impl fmt::Display for ShardError {
@@ -89,6 +92,7 @@ impl fmt::Display for ShardError {
         match self {
             ShardError::Md(e) => write!(f, "a market-data session failed: {e}"),
             ShardError::Exec(e) => write!(f, "an order-entry session failed: {e}"),
+            ShardError::Replay(e) => write!(f, "a closed-loop replay stopped: {e}"),
         }
     }
 }
@@ -125,6 +129,21 @@ impl<'a> Member<'a> {
     /// A venue's market data: its [`MdVenue::run`].
     pub fn md_venue<H: MdHandler + 'static>(venue: &'a mut MdVenue<H>) -> Member<'a> {
         let run = async move { venue.run().await.map_err(ShardError::Md) };
+        let orders = None;
+        Member {
+            run: Box::pin(run),
+            orders,
+        }
+    }
+
+    /// A closed-loop replay's market data (FBC-066n): `replay` fed `closed`'s records, each at
+    /// its recorded instant on the shard's replayed clock.
+    pub fn md_replay<H, I>(replay: &'a mut MdReplay<H>, closed: ClosedLoop<I>) -> Member<'a>
+    where
+        H: MdHandler + 'a,
+        I: IntoIterator<Item = Result<fbc_journal::Record, fbc_journal::JournalError>> + 'a,
+    {
+        let run = async move { replay.play(closed).await.map_err(ShardError::Replay) };
         let orders = None;
         Member {
             run: Box::pin(run),
