@@ -41,7 +41,10 @@ item count.
    a refused place or amend builds nothing and cancels nothing on its account. The cancels a
    level's decision calls for whatever the new quote (a replace, Exit's, an emulated order's
    overshoot once its quote counts it reducing, a level no longer wanted) are cancels, and go
-   out in every mode; the quote that would replace the order is then refused when built.
+   out in every mode; the quote that would replace the order is then refused when built. An
+   amend refused here, or at the floor (rule 3), leaves its order resting as it was, at its old
+   price, where a replace has already cancelled it; the planner never falls back from a
+   refused amend to a cancel (0065).
 3. **The safety floor.** A `RateView` lists `RateScope`s, each a bucket's operations
    (`RateLimit::ops`), the one instrument a per-pair bucket counts (`None` for a shared
    bucket), its units left in the window, and the consumer's floor for it (`RateScope::of`
@@ -66,7 +69,8 @@ item count.
    synthetic IOC's place is never batched: its cancel follows it. The pass's cancels whose
    order the venue's cancel-many can name by a reference it declares (`batch_cancel.refs`) go
    in cancel-manys of at most `batch_cancel.max_items`; any other goes as a single cancel, or
-   waits for its acknowledgement as before. A run of one goes as a single command (a cancel-many
+   waits for its acknowledgement as before, after the cancels held before it, so the cancels
+   too keep 0005's side and level order. A run of one goes as a single command (a cancel-many
    of one only where the single cancel cannot name the order). A batch with a size below two
    batches nothing. A batch's `Planned` describes its first order and lists the others in
    `Planned::more_items`; the consumer reports each item's outcome, and each cancel-many item's
