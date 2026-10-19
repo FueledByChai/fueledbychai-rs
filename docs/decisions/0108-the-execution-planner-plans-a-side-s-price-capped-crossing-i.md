@@ -87,6 +87,15 @@ a cross the venue keeps refusing would be sent at every pass.
   cancelled by the planner and the cross waits for it.
 - A cross larger than the resting cap is refused (`CapRefusal::RestingCap`): under the owner's
   $11 resting cap per side a $50 position is crossed in attempts of at most $11.
+- Crossing in steps works only while the position is within the inventory cap plus the resting
+  cap. A reducing order of q on a position P passes the inventory cap only if P - q is within
+  it and the resting cap only if q (with our other orders resting on the side) is within it,
+  so with nothing else on the side a cross exists only while P <= inventory cap + resting cap.
+  Past that, no reducing order of any size is admitted on the side, in Quoting, Exit or
+  Flatten: under the owner's $50 and $11 caps, a long or short past $61 (orphan or race fills)
+  cannot be crossed by this library and is flattened on the venue. Whether a reducer should
+  pass the inventory cap there is an owner question (FBC-ugto); this record does not change
+  the caps.
 - The consumer bumps `attempt` to cross again after an attempt ends with the position not
   flat: after a partial fill, an unfilled IOC, or a venue refusal.
 - The planner keeps the last attempt built per account, market and side for its lifetime; a
