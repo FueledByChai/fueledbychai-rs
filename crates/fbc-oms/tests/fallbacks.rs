@@ -1844,7 +1844,7 @@ fn a_reducer_judged_with_the_emulated_order_ended_still_counts_the_side_s_other_
 }
 
 /// A trustworthy resync at 5 000 showing, beside nothing else, an order of ours the registry
-/// does not hold: a sell of `qty` at 10 030, registered as an orphan (decision 0107), so the
+/// does not hold: a sell of `qty` at 10 030, registered as an orphan (decision 0108), so the
 /// adding side is suppressed and only what reduces the position within its size is built.
 fn sell_orphan(reg: &mut Registry, pos: i64, qty: i64) {
     let o = common::cid();
@@ -1878,7 +1878,7 @@ fn during_an_orphan_cooldown_a_reducer_refused_anyway_cancels_no_emulated_order_
     // 8 rests at level 1, and an orphan sell of 8 suppresses the adding side. A reduce-only ask
     // of 5 at level 0 would wait for the emulated order's cancel, but even with that order
     // ended the orphan and the ask would sell 13 against a position of 10: the suppression
-    // refuses the ask, so the pass cancels nothing for it (decision 0107).
+    // refuses the ask, so the pass cancels nothing for it (decision 0108).
     let mut reg = quoting(10);
     let mut mint = mint();
     let mut p = planner();
@@ -1918,7 +1918,7 @@ fn during_an_orphan_cooldown_a_reducer_amend_refused_anyway_cancels_no_emulated_
     // of 2 at level 0 and an emulated exit of 8 at level 1 rest, then an orphan sell of 8
     // suppresses the adding side. The ask grows to 10 by amend: even with the emulated order
     // ended, the orphan and the ask would sell 18 against a position of 10, so the suppression
-    // refuses the amend and the pass cancels nothing for it (decision 0107).
+    // refuses the amend and the pass cancels nothing for it (decision 0108).
     let mut reg = quoting(10);
     let mut mint = mint();
     let mut p = planner();
