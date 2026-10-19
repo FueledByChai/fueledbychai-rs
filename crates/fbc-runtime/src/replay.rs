@@ -258,26 +258,7 @@ impl<H: MdHandler> MdReplay<H> {
                 }
             }
             // An input the shard stamped goes back to the consumer at its place (FBC-hvqi).
-            Record::Consumer {
-                at,
-                kind,
-                input: true,
-                ingest_seq: Some(ingest_seq),
-                bytes,
-            } => {
-                if let Some(inputs) = &mut self.inputs {
-                    inputs.on_input(ConsumerInput {
-                        ingest_seq: *ingest_seq,
-                        at: *at,
-                        kind: *kind,
-                        bytes: bytes.0.clone(),
-                    });
-                    self.counters.inputs += 1;
-                }
-            }
-            // The consumer's annotations and the inputs it journaled itself: no codec's input
-            // (decision 0101), and nothing the shard handed on.
-            Record::Consumer { .. } => {}
+            Record::Consumer { .. } => hand_back(&mut self.inputs, &mut self.counters, record),
             _ => {}
         }
         Ok(())
@@ -383,6 +364,35 @@ impl<H: MdHandler> MdReplay<H> {
             self.counters.http += 1;
             self.counters.decode_errors += u64::from(fed.is_err());
         }
+    }
+}
+
+/// Hands a consumer input the shard stamped back to `inputs`, counted. The consumer's
+/// annotations and the inputs it journaled itself are no codec's input (decision 0101) and
+/// nothing the shard handed on: passed over, as is every input with no input handler set.
+fn hand_back(
+    inputs: &mut Option<Box<dyn InputHandler>>,
+    counters: &mut MdReplayCounters,
+    record: &Record,
+) {
+    if let (
+        Some(inputs),
+        Record::Consumer {
+            at,
+            kind,
+            input: true,
+            ingest_seq: Some(ingest_seq),
+            bytes,
+        },
+    ) = (inputs, record)
+    {
+        inputs.on_input(ConsumerInput {
+            ingest_seq: *ingest_seq,
+            at: *at,
+            kind: *kind,
+            bytes: bytes.0.clone(),
+        });
+        counters.inputs += 1;
     }
 }
 
