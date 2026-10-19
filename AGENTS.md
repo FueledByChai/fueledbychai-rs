@@ -334,7 +334,7 @@ rather than guess.
     at each pass and by `ExecutionPlanner::on_fill` (0106; `tests/fallbacks.rs`), each side's
     price-capped `CrossingIntent` planned as one reduce-only order at its cap (IOC where the
     caps take it, else a synthetic IOC), sized so the position never crosses zero, through
-    every state and cap, once per consumer attempt (0107; `tests/crossing.rs`); still
+    every state and cap, once per consumer attempt (0108; `tests/crossing.rs`); still
     planned: batching, venue modes and the safety floor; 0005, 0013), `crates/fbc-journal` (0006; it depends on
     `fbc-core`, and `hmac` and `sha2` for its keyed hashes and `zstd` for its closed segments, only: the records the runtime writes, length-prefixed in a hand-written
     little-endian format with a version, a writer of one subdirectory per UTC day with segments

@@ -40,7 +40,7 @@
 //! and Cancel-only and judged by Exit's admission and both caps; never amended or replaced while
 //! it is live; and at most one order per [`CrossingIntent::attempt`], attempts only
 //! increasing, so an order the venue refuses or leaves unfilled is not sent again until the
-//! consumer names a later attempt (decision 0107). A synthetic IOC, a crossing's or a level
+//! consumer names a later attempt (decision 0108). A synthetic IOC, a crossing's or a level
 //! quote's, is built only where the venue takes good-till-cancelled limits and can cancel the
 //! order by venue or client id once acknowledged ([`PlanRefusal::NoSyntheticIoc`]).
 //!
@@ -100,7 +100,7 @@ use crate::registry::{Instance, OmsError, Registry};
 /// order, which is at no level of the book ([`Planned::crossing`]).
 pub const CROSSING_LEVEL: u16 = u16::MAX;
 
-/// A side's price-capped reduce-only crossing exit (decision 0107): a disaster stop, a news
+/// A side's price-capped reduce-only crossing exit (decision 0108): a disaster stop, a news
 /// flatten window or the operator's Flatten. The side is the order's: a sell crossing reduces a
 /// long. Planned as one reduce-only order priced at `cap`, immediate-or-cancel where the venue
 /// takes IOC with reduce-only and otherwise a good-till-cancelled limit at `cap` followed by its
@@ -264,7 +264,7 @@ impl DesiredBook {
         self
     }
 
-    /// Sets `side`'s crossing intent (decision 0107), replacing any there; `None` withdraws
+    /// Sets `side`'s crossing intent (decision 0108), replacing any there; `None` withdraws
     /// it, so a crossing order of the side still live is cancelled with the side's removal
     /// reason, as a level no longer wanted is.
     pub fn set_crossing(&mut self, side: Side, intent: Option<CrossingIntent>) {
@@ -446,7 +446,7 @@ pub enum HeldReason {
     /// The order is being replaced: the new one is placed once it is terminal.
     Replacing,
     /// The crossing intent's order is live: it is never amended or replaced, and the next
-    /// attempt is planned once it is terminal (decision 0107).
+    /// attempt is planned once it is terminal (decision 0108).
     Crossing,
 }
 
@@ -478,15 +478,15 @@ pub enum PlanRefusal {
     /// its side, or the other orders reducing it on that side already cover it.
     NoRoomToReduce,
     /// The venue takes no reduce-only order ([`OrderCaps::reduce_only`]): a crossing intent is
-    /// never sent without the flag (decision 0107).
+    /// never sent without the flag (decision 0108).
     ReduceOnlyUnsupported,
     /// The venue takes no reduce-only IOC and cannot emulate one: it has no good-till-cancelled
     /// limit, or no single cancel that can name the order once acknowledged (by venue id or
-    /// client id), so the synthetic IOC's limit could rest and fill later (decision 0107).
+    /// client id), so the synthetic IOC's limit could rest and fill later (decision 0108).
     NoSyntheticIoc,
     /// A crossing attempt older than the last one built for the side
     /// ([`CrossingIntent::attempt`]): attempts only increase, so a stale one is never planned
-    /// (decision 0107).
+    /// (decision 0108).
     StaleAttempt {
         /// The last attempt an order was built for.
         last: u64,
@@ -639,11 +639,11 @@ pub struct ExecutionPlanner {
     /// Each account's registry, bound at the account's first pass.
     bound: HashMap<AccountKey, Instance>,
     /// The last crossing attempt an order was built for, by account, market and side
-    /// (decision 0107).
+    /// (decision 0108).
     fired: HashMap<(AccountKey, InstrumentId, Level), Fired>,
 }
 
-/// The last crossing attempt an order was built for on one side (decision 0107).
+/// The last crossing attempt an order was built for on one side (decision 0108).
 #[derive(Copy, Clone, Debug)]
 struct Fired {
     attempt: u64,
@@ -679,7 +679,7 @@ impl ExecutionPlanner {
     }
 
     /// The order the planner holds for `acct` for `side`'s crossing intent on `market`, until
-    /// it is seen terminal (decision 0107).
+    /// it is seen terminal (decision 0108).
     pub fn crossing_order(
         &self,
         acct: AccountKey,
@@ -747,7 +747,7 @@ impl ExecutionPlanner {
             .collect();
         for at in levels {
             // The quote as the venue's caps take it (design §4.10 steps 3 and 4), or the
-            // crossing intent's order (0107).
+            // crossing intent's order (0108).
             let fitted = if at.crossing {
                 desired
                     .crossing(at.side())
@@ -762,7 +762,7 @@ impl ExecutionPlanner {
             };
             let Some(slot) = slots.get_mut(&at) else {
                 // A crossing attempt an order was built for is never planned again, nor one
-                // older than it (0107): attempts only increase.
+                // older than it (0108): attempts only increase.
                 let last = self.fired.get(&(acct, market, at)).copied();
                 let fitted = match (fitted, last) {
                     (Some(f), Some(last)) if f.attempt.is_some_and(|a| a < last.attempt) => {
@@ -892,7 +892,7 @@ impl ExecutionPlanner {
                 continue;
             }
             // A live crossing order ends by itself (an IOC) or by its cancel (a synthetic
-            // one, above): never amended or replaced (0107).
+            // one, above): never amended or replaced (0108).
             if at.crossing {
                 plan.held.push(hold(HeldReason::Crossing));
                 continue;
@@ -1075,7 +1075,7 @@ impl ExecutionPlanner {
                         continue;
                     }
                     // A crossing intent is sent only with the venue's reduce-only flag, and is
-                    // sized to what is left to reduce, the commands before it counted (0107).
+                    // sized to what is left to reduce, the commands before it counted (0108).
                     if attempt.is_some() {
                         if !caps.reduce_only {
                             plan.refused
@@ -1307,7 +1307,7 @@ fn fit(q: &DesiredQuote, caps: &OrderCaps) -> Fitted {
     }
 }
 
-/// The order a crossing intent asks for, as the venue's `caps` take it (decision 0107): a
+/// The order a crossing intent asks for, as the venue's `caps` take it (decision 0108): a
 /// reduce-only limit at the cap on the public book, never post-only, classified reducing;
 /// immediate-or-cancel where the venue takes IOC, falling back as any reduce-only IOC quote
 /// does where the venue refuses the two together, and otherwise a good-till-cancelled limit
@@ -1342,7 +1342,7 @@ fn synthesizes_ioc(caps: &OrderCaps) -> bool {
         && (caps.cancel_refs.contains(RefKind::Venue) || caps.cancel_refs.contains(RefKind::Client))
 }
 
-/// What is left for a crossing intent on `side` of `market` to reduce (decision 0107): as
+/// What is left for a crossing intent on `side` of `market` to reduce (decision 0108): as
 /// [`reduce_room`] with no order excepted, but for the emulated reduce-only orders in `slots`,
 /// which a crossing order is never clipped by: it waits for their cancel instead, as any
 /// reducer that would leave one overshooting does (0106 rule 7).
@@ -1523,7 +1523,7 @@ fn overshoot_cancels(
 
 /// Frees each level of `slots` whose order `reg` shows terminal (or no longer holds). A
 /// crossing order that ended never sent reached no venue, so its attempt, the last one built
-/// for its side, is planned again; older ones still are not (decision 0107).
+/// for its side, is planned again; older ones still are not (decision 0108).
 fn free_terminal(
     slots: &mut BTreeMap<Level, Slot>,
     reg: &Registry,
