@@ -21,7 +21,10 @@
 //! Effects a codec asks for are not executed, and the outbound frames, write results and HTTP
 //! requests the journal holds are outputs, not fed to anything: exact replay of outbound bytes
 //! is BT-402's. A ping, pong or close frame the session received reached no codec live, so its
-//! record (FBC-drf, decision 0041) is fed to none either. The caller supplies what the session ran with: the [`VenueConfig`], the
+//! record (FBC-drf, decision 0041) is fed to none either. A consumer's own record (FBC-hxkm,
+//! decision 0101) reaches no codec: one whose input flag is false is the consumer's annotation,
+//! passed over as an outbound frame is, and an input is passed over too until the
+//! consumer-inputs ticket (FBC-hvqi) hands it back to the handler at its place. The caller supplies what the session ran with: the [`VenueConfig`], the
 //! [`SpecTable`] and the endpoint's plan. Whether the journal's `SessionStart` header carries
 //! them is the consumer's choice (design §9).
 //!
@@ -235,6 +238,8 @@ impl<H: MdHandler> MdReplay<H> {
                     _ => self.counters.stale += 1,
                 }
             }
+            // The consumer's own: no codec's input (decision 0101).
+            Record::Consumer { .. } => {}
             _ => {}
         }
         Ok(())
