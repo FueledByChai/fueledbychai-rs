@@ -109,9 +109,7 @@ impl IngestClock {
     /// Stamps an input of `conn` arriving now, whose last packet the kernel received at
     /// `kernel_rx` when it knows.
     pub(crate) fn stamp(&self, conn: ConnKey, kernel_rx: Option<KernelRxNs>) -> Stamp {
-        let ingest_seq = self.next.get();
-        self.next.set(ingest_seq.wrapping_add(1));
-        let (recv_mono, recv_wall) = self.now();
+        let (ingest_seq, recv_mono, recv_wall) = self.tick();
         Stamp {
             ingest_seq,
             kernel_rx,
@@ -119,6 +117,15 @@ impl IngestClock {
             recv_wall,
             conn,
         }
+    }
+
+    /// Takes the next ingest sequence for an input of no connection (a consumer input, FBC-hvqi),
+    /// with now on both clocks.
+    pub(crate) fn tick(&self) -> (u64, MonoNs, WallNs) {
+        let ingest_seq = self.next.get();
+        self.next.set(ingest_seq.wrapping_add(1));
+        let (mono, wall) = self.now();
+        (ingest_seq, mono, wall)
     }
 
     /// The ingest sequence the next input will be stamped with.

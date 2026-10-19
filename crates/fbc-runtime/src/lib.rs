@@ -89,7 +89,7 @@
 //! meanwhile goes ahead of the ladder's remaining ones and waits for at most the one in progress.
 //!
 //! [`ConsumerInputs`] carries the consumer's own inputs into the shard (FBC-hvqi, decision
-//! 0102): a bounded ring its other threads push operator commands and reloads into, which
+//! 0103): a bounded ring its other threads push operator commands and reloads into, which
 //! refuses and counts a push when full and never blocks, and the timers its handlers arm
 //! ([`ConsumerTimers`]). Each input and each firing is stamped with the shard's next ingest
 //! sequence, journaled as an input consumer record and then handed to the consumer's
@@ -158,7 +158,7 @@ pub use exec_session::{
 };
 pub use inputs::{
     ConsumerInput, ConsumerInputs, ConsumerInputsConfig, ConsumerTimers, InputCounters,
-    InputHandler, InputRefusal, InputSender, InputsError, MAX_CAPACITY,
+    InputHandler, InputRefusal, InputSender, InputsError, MAX_INPUT_CAPACITY,
 };
 pub use journal::Journal;
 pub use liveness::{Liveness, LivenessError};
