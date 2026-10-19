@@ -1361,3 +1361,57 @@ fn a_resting_order_whose_quote_becomes_reducing_counts_against_an_emulated_order
     assert!(reg.get(c).unwrap().reduces());
     assert_emulated(placed(&pass.commands[0]), 2);
 }
+
+#[test]
+fn an_emulated_order_whose_quote_becomes_ordinary_stays_within_what_is_left_to_reduce() {
+    // Codex r4310102183: long 10, an emulated exit of 5 and a reduce-only ask of 5 rest. The
+    // exit's quote becomes an ordinary post-only ask of 10 with the same wire flags, at a new
+    // price: the order keeps its emulated mode, so its amend is clipped to the 5 left and no
+    // cancel follows; never an unflagged 10 beside the other reducer.
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = amending(conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]));
+    let first = book()
+        .with(
+            Side::Sell,
+            0,
+            maker_exit(10_010, 5, ReduceFallback::EmulateReduceOnly),
+        )
+        .with(Side::Sell, 1, reduce_only(limit(10_030, 5)));
+    let plan = plan_and_send(&mut p, &first, &mut reg, &caps, &mut mint, MonoNs(0));
+    assert_eq!(
+        shape(&plan),
+        vec![
+            (Stage::Reducing, "place", Side::Sell, 1),
+            (Stage::Reducing, "place", Side::Sell, 0),
+        ]
+    );
+    let (native, emulated) = (plan.commands[0].cid, plan.commands[1].cid);
+    assert_emulated(placed(&plan.commands[1]), 5);
+    ack(&mut reg, native, "v1");
+    ack(&mut reg, emulated, "v0");
+    let ordinary = DesiredQuote {
+        post_only: true,
+        ..limit(10_020, 10)
+    };
+    let next = book()
+        .with(Side::Sell, 0, ordinary.clone())
+        .with(Side::Sell, 1, reduce_only(limit(10_030, 5)));
+    let pass = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER);
+    assert_eq!(shape(&pass), vec![(Stage::Amend, "amend", Side::Sell, 0)]);
+    assert_eq!(pass.commands[0].cid, emulated);
+    match pass.commands[0].auth.command() {
+        VenueCommand::Amend(a) => assert_eq!(a.qty, lots(5)),
+        other => panic!("expected an amend, got {other:?}"),
+    }
+    // At the price asked, the order is what the quote allows: kept.
+    let again = plan_and_send(&mut p, &next, &mut reg, &caps, &mut mint, LATER2);
+    assert!(
+        again.commands.iter().all(|c| c.cid != emulated
+            || !matches!(c.auth.command(), VenueCommand::Amend(_) | VenueCommand::Cancel(_))
+            || false),
+        "{:?}",
+        shape(&again)
+    );
+}
