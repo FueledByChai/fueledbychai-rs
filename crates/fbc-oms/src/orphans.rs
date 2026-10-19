@@ -10,7 +10,9 @@
 //! against both pre-trade caps as it rests, and cancelled by the kill switch's cancel everything
 //! too. Shown open after the seed, the seed holds a fill of it only by the fill's arrival before
 //! the seed's request or its matching-engine time at or before the seed's watermark; any other
-//! moves the inventory, on either read mode (`src/resync.rs`). An order
+//! moves the inventory, on either read mode, and those applied before it was registered that a
+//! one-read seed held only for not showing it move the inventory as it is registered
+//! (`src/resync.rs`). An order
 //! not ours (another namespace's, a non-canonical client id, or one nothing attributes) is
 //! never one (I4).
 //!
@@ -22,8 +24,8 @@
 //! ([`Cooldown::Pending`]) until the consumer's [`Registry::cancel_orphans`] at `now` starts it
 //! ([`Cooldown::Until`], `now` plus the consumer's [`OrphanConfig::cooldown`]), and it ends
 //! only when the consumer's [`Registry::end_orphan_cooldowns`] is given a time at or past it.
-//! A suppression beginning advances the market's state generation, so a place or amend
-//! authorized before it is refused at submit. The position sizes the build, so the suppression
+//! A suppression beginning, and each orphan registered, advances the market's state
+//! generation, so a place or amend authorized before it is refused at submit. The position sizes the build, so the suppression
 //! is judged again at authorization ([`IssueRefusal::OrphanCooldown`](crate::IssueRefusal)),
 //! and a command built during the cooldown is refused at submit once the inventory moved since
 //! its build ([`StaleAuthorization::PositionMoved`](crate::StaleAuthorization)), as an Exit

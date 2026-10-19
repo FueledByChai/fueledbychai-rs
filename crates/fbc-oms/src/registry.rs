@@ -804,6 +804,10 @@ impl Registry {
         };
         accepted.commit();
         self.set_inventory(fill.inst, inventory);
+        if cid.is_none() && matches!(placement, Placement::InSnapshot { .. }) {
+            // Counted on the inventory if a later snapshot shows its order open (0101).
+            self.untracked_in_snapshot(fill.inst, &placed, signed);
+        }
         self.fill_counted(fill.inst, fill.key(), placed, signed, placement);
         let routed = match (cid, cum) {
             (Some(cid), Some(cum)) => {

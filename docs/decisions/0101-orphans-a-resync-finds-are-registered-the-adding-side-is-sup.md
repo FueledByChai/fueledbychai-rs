@@ -40,7 +40,11 @@ and how an orphan is held while its cancel is out (FBC-840, BT-402).
    seed holds a fill of it only when the fill arrived before the seed was requested or executed
    at or before the seed's watermark; every other fill of it, on either read mode (0095), moves
    the inventory (Reviewer B's RB840-1 on PR #171: placed as the seed's own unshown order, its
-   fills moved the record and not the inventory, or left a separate-reads market unsettled). An order not ours
+   fills moved the record and not the inventory, or left a separate-reads market unsettled).
+   The fills of it applied before it was registered, which a one-read seed held only because it
+   did not show the order (0055's rule 3, not by their arrival or time), move the inventory as
+   it is registered, once (Codex's r4310559340); a trustworthy resync not showing such an order
+   open drops what was kept for it. An order not ours
    (another namespace's, a non-canonical client id, or one nothing attributes) is never an orphan.
    A trustworthy resync forgets the live sightings.
 2. **The adding side.** A side adds when an order on it would grow the position's size: while a
@@ -59,9 +63,10 @@ and how an orphan is held while its cancel is out (FBC-840, BT-402).
    those markets). The cooldown then waits (`Cooldown::Pending`) until the consumer's
    `Registry::cancel_orphans` at its `now` starts it, to `now` plus the consumer's cooldown or
    later if it already ran later (`Cooldown::Until`), and it ends only when the consumer's
-   `Registry::end_orphan_cooldowns` is given a time at or past it. A suppression beginning
-   advances the market's state generation, so a place or amend authorized before it is refused at
-   submit (0060).
+   `Registry::end_orphan_cooldowns` is given a time at or past it. A suppression beginning, and
+   any resync registering an orphan on the market, advances the market's state generation, so a
+   place or amend authorized before it is refused at submit (0060; Codex's r4310559351 on PR
+   #171: an orphan registered during a cooldown counts against what was authorized in it).
 4. **The cancels.** `Registry::cancel_orphans` builds, in every market state, the cancels of the
    market's orphans that are not terminal by explicit reference (`Registry::cancel_many`), those
    with a cancel in flight included. When they number more than the consumer's level limit it
@@ -92,8 +97,8 @@ and how an orphan is held while its cancel is out (FBC-840, BT-402).
   count against no cap while it rests, which is the blowout's mechanism.
 - Seed the registered orphan's fill count from the snapshot: rejected. A fill in flight would
   then count twice in the fill count and once in the inventory, and the order's exposure would
-  read low. The fills before it was registered (which the inventory already holds) keep counting
-  in its exposure instead: conservative.
+  read low. The fills before it was registered (which the inventory holds once it is registered)
+  keep counting in its exposure instead: conservative.
 - Act on an untrustworthy snapshot's orphan when a later snapshot shows it again: rejected. Two
   reads of the same stale source are not two sources.
 
