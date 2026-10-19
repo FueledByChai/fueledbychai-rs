@@ -636,7 +636,7 @@ impl Drop for Running<'_> {
 mod tests {
     use super::*;
     use crate::bounds::ReservedBound;
-    use crate::exec_orders::{RpcIds, Shared, Waiting};
+    use crate::exec_orders::{RpcIds, Shared};
     use fbc_core::{AccountKey, ConnKey, RpcId};
     use std::cell::Cell;
 
@@ -689,7 +689,7 @@ mod tests {
                     clock.stamp(ConnKey { conn: 1, epoch: 0 }, None);
                 }
                 Some(Act::Take) => {
-                    if let Some(Waiting::Command(queued)) = shared.pop() {
+                    if let Some(queued) = shared.pop() {
                         taken.borrow_mut().push((name, queued.rpc));
                     }
                 }

@@ -134,11 +134,14 @@
 //! for the session's turn are bounded by the consumer's [`ExecSessionConfig::outbound`]: Normal
 //! traffic (a place, an amend, every control command) is taken while fewer than its Normal
 //! bound wait, Safety traffic (a cancel, a cancel-many, an instrument cancel-all, a reducing
-//! order) while fewer than the whole bound do. One submitted past that keeps nothing (an
-//! authorization is dropped unspent): it is reported `NotSent(Backpressure)` on the next turn,
-//! in submission order, journaled just before as its `WriteResult` under its class, and
-//! counted ([`ExecCounters::backpressure_refusals`]). So a peer that stops reading holds a
-//! write, and the handlers of the shard's other members submitting meanwhile, to the bound. The
+//! order) while fewer than the whole bound do. One submitted past that is refused at once,
+//! [`SubmitRefusal::Backpressure`](crate::SubmitRefusal::Backpressure) (not sent,
+//! `NotSent(Backpressure)`): no request id is given, nothing of it is kept (an authorization is
+//! dropped unspent, for the consumer to settle and plan again), the refusal is journaled as a
+//! `WriteResult` under its class on the epoch the session is in or waits to open, and counted
+//! ([`ExecCounters::backpressure_refusals`]). So a peer that stops reading holds a write, and
+//! the handlers of the shard's other members submitting meanwhile, to the bound, and nothing
+//! grows past it (Codex P1 r4312640254 on PR #174). The
 //! requests in flight (written or asked and neither answered nor timed out) are counted in the
 //! consumer's [`InFlight`] table ([`ExecSessionConfig::in_flight`]), shared by the sessions it
 //! is handed to: a submitted command its class finds no room for is `NotSent(RateBudget)` at
@@ -198,7 +201,7 @@ use fbc_core::{
     SpecTable, Stamp, StreamId, SubmitHandle, TimerTag, TrafficClass, VenueCaps, VenueCommand,
     VenueConfig, VenueError, VenueFactory, VenueMeta, VenueOrderSnapshot, WallNs, dispatch,
 };
-use fbc_journal::{ControlEvent, NonceSourceId, Record, WriteRes};
+use fbc_journal::{ControlEvent, NonceSourceId, Record};
 use futures_util::{FutureExt, StreamExt};
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -207,7 +210,7 @@ use crate::bounds::{InFlight, ReservedBound};
 use crate::connector::Connector;
 use crate::epoch::{Admit, EpochError, Epochs, Input};
 use crate::exec_gate::Hold;
-use crate::exec_orders::{ExecOrders, Queued, Refusal, RpcIds, Rpcs, Shared, Submitted, Waiting};
+use crate::exec_orders::{ExecOrders, Queued, RpcIds, Rpcs, Shared, Submitted};
 use crate::in_process::{InProcessStream, Link};
 use crate::journal::Journal;
 use crate::pacing::ReconnectPacing;
@@ -321,8 +324,9 @@ pub struct ExecSessionConfig {
     pub http_max_body: usize,
     /// The bound on the commands waiting for the connection (design §5.4, decision 0104): a
     /// place, an amend or a control command submitted while the Normal bound's worth wait is
-    /// `NotSent(Backpressure)`, as is a cancel or a reducing order submitted while the reserve
-    /// is full too, nothing of it written and the refusal journaled as its write result.
+    /// refused at once, `SubmitRefusal::Backpressure` (not sent, `NotSent(Backpressure)`), as is
+    /// a cancel or a reducing order submitted while the reserve is full too, nothing of it kept
+    /// or written and the refusal journaled as its write result.
     pub outbound: ReservedBound,
     /// The table of requests in flight the session counts against (decision 0104): one shared
     /// by every session of the venue, or the session's own. A submission its class finds no
@@ -718,6 +722,7 @@ impl<H: ExecHandler> ExecSession<H> {
             ran: false,
             handler,
         };
+        session.orders.set_conn(session.core.current());
         Ok((session, ExecControl { _stop: stop_tx }))
     }
 
@@ -734,6 +739,8 @@ impl<H: ExecHandler> ExecSession<H> {
     pub fn set_journal(&mut self, journal: Journal) {
         self.end_left_epoch();
         self.rec.journal = Some(journal.clone());
+        // A submission refused for want of room is journaled where it is refused (0104).
+        self.orders.set_journal(journal.clone());
         self.core.journal = Some(journal);
     }
 
@@ -795,6 +802,9 @@ impl<H: ExecHandler> ExecSession<H> {
     /// Opens epoch after epoch, as paced, until the session stops or fails.
     async fn run_epochs(&mut self) -> Result<(), ExecSessionError> {
         loop {
+            // A submission refused for want of room is journaled under the epoch the session is
+            // in, or waits to open (0104).
+            self.orders.set_conn(self.core.current());
             // While it waits to connect, the session still reports each deadline that falls
             // due, and each command submitted, under the epoch it waits to open.
             let mut ctl = Between {
@@ -1188,15 +1198,8 @@ impl<H: ExecHandler> ExecSession<H> {
         let mut sent = Ok(true);
         while open
             && !self.stopped()
-            && let Some(waiting) = turn.next().and_then(|()| self.orders.pop())
+            && let Some(queued) = turn.next().and_then(|()| self.orders.pop())
         {
-            let queued = match waiting {
-                Waiting::Command(queued) => queued,
-                Waiting::Refused(refusal) => {
-                    refuse(&self.rec, &self.core.clock, key, refusal, &mut self.handler);
-                    continue;
-                }
-            };
             sent = self.send(ws, key, queued).await;
             open = *sent.as_ref().unwrap_or(&false);
         }
@@ -1484,30 +1487,6 @@ impl Recorder {
         }
     }
 
-    /// Request `rpc`, refused for `reason` with nothing of it written, as its write result on
-    /// epoch `conn`, under `class`, at `clock`'s time (decision 0104).
-    fn not_sent(
-        &self,
-        class: TrafficClass,
-        clock: &IngestClock,
-        conn: ConnKey,
-        rpc: RpcId,
-        reason: NotSentReason,
-    ) {
-        if let Some(journal) = &self.journal {
-            let (at, wall) = clock.now();
-            let result = WriteRes::NotSent(reason);
-            let rpc = Some(rpc);
-            let record = Record::WriteResult {
-                at,
-                conn,
-                rpc,
-                result,
-            };
-            journal.record(class, wall, &record);
-        }
-    }
-
     /// The context `ctx` given to a call, under `class`, filed under `wall`; `rpc` names an
     /// encode's request.
     fn ctx(&self, class: TrafficClass, wall: WallNs, rpc: Option<RpcId>, ctx: &EncodeCtx) {
@@ -1516,22 +1495,6 @@ impl Recorder {
             journal.record(class, wall, &Record::EncodeCtx { rpc, ctx });
         }
     }
-}
-
-/// Reports `refusal`, a submission the commands waiting for epoch `key`'s connection had no room
-/// for, to `handler` as not sent, journaled first through `rec` as its write result under its
-/// class, at `clock`'s time (design §5.4, decision 0104).
-fn refuse<H: ExecHandler>(
-    rec: &Recorder,
-    clock: &IngestClock,
-    key: ConnKey,
-    refusal: Refusal,
-    handler: &mut H,
-) {
-    let Refusal { rpc, class, reason } = refusal;
-    rec.not_sent(class, clock, key, rpc, reason);
-    let receipt = Err(reason);
-    handler.on_submitted(SubmitHandle { rpc, receipt });
 }
 
 /// Why a request was not sent, nothing of it written: the codec's reason, or the buckets'
@@ -1687,18 +1650,11 @@ impl<H: ExecHandler> Control for Between<'_, H> {
         // turn's.
         let mut turn = self.orders.waiting_now();
         while !self.stopped()
-            && let Some(waiting) = turn.next().and_then(|()| self.orders.pop())
+            && let Some(queued) = turn.next().and_then(|()| self.orders.pop())
         {
-            match waiting {
-                Waiting::Command(queued) => {
-                    let receipt = Err(NotSentReason::Disconnected);
-                    let rpc = queued.rpc;
-                    self.handler.on_submitted(SubmitHandle { rpc, receipt });
-                }
-                Waiting::Refused(refusal) => {
-                    refuse(self.rec, self.clock, self.key, refusal, &mut *self.handler);
-                }
-            }
+            let receipt = Err(NotSentReason::Disconnected);
+            let rpc = queued.rpc;
+            self.handler.on_submitted(SubmitHandle { rpc, receipt });
         }
         // Once the control has dropped, the sink hands the handler nothing.
         for rpc in self.rpcs.take_due(Instant::now()) {
