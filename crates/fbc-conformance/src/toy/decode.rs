@@ -89,6 +89,9 @@ pub(super) fn event(
             ExecEvent::Fill(fill(r, fills, scope, specs)?),
         ),
         "reject" => (r.meta(false)?, reject(r)?),
+        // An error naming no request (FBC-xx0), as Paradex sends one: `code`, and `msg` when
+        // it has one.
+        "error" => (r.meta(false)?, ExecEvent::UncorrelatedError(refusal(r)?)),
         "mode" => (r.meta(false)?, mode(r, specs)?),
         _ => return Err(Malformed("kind")),
     })

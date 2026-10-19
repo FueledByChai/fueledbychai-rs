@@ -39,6 +39,14 @@ pub enum Step {
     Push { conn: usize, frame: Frame },
     /// Send `conn` a close frame; the stub keeps recording until the client's close reply.
     Close { conn: usize },
+    /// Send `conn` a close frame carrying `code` and `reason`, as a venue closing a connection
+    /// says why (Paradex closes an idle order connection with 4031, "no active
+    /// subscriptions"); otherwise as [`Step::Close`].
+    CloseWith {
+        conn: usize,
+        code: u16,
+        reason: String,
+    },
     /// Stop reading from and writing to `conn`, holding it open until the stub is dropped.
     Silent { conn: usize },
     /// Send `conn` a ping and wait for the client's pong to it: an event, never a time, that
