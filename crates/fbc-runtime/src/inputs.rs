@@ -23,7 +23,11 @@
 //! - **Timers.** A handler arms a timer through [`ConsumerTimers::arm`], on the shard's thread:
 //!   after its delay, the run takes its firing as it takes a pushed input, stamped, journaled
 //!   and handed to the handler with the kind and bytes it was armed with. A firing is an input
-//!   like any other; the handler tells one from a pushed input by the kind it gave it.
+//!   like any other; the handler tells one from a pushed input by the kind it gave it. An arm
+//!   that arms nothing says why ([`ArmRefusal`]).
+//! - **The end.** The run ends once every sender has dropped and no timer is pending; once it
+//!   returns, or is dropped, the inputs have ended for good, and a restarted shard makes new
+//!   ones, which may take the same timers.
 //! - **Replay.** A replay hands each journaled input back at its place, with its recorded
 //!   sequence ([`MdReplay::set_inputs`](crate::MdReplay::set_inputs)); its handlers arm through
 //!   an inert [`ConsumerTimers::inert`], which arms no live timer, since every firing the live
@@ -203,8 +207,12 @@ impl Default for ConsumerTimers {
 struct Timers {
     /// Whether an arm arms a timer (false for a replay's).
     live: bool,
-    /// Whether the inputs that fire them have ended.
+    /// Whether the inputs that fire them have ended, and no new ones have taken them since.
     ended: bool,
+    /// Whether inputs that have not ended fire them (one at a time).
+    bound: bool,
+    /// Counts the inputs that have taken them, so inputs that ended end nothing of later ones.
+    generation: u64,
     /// The order the next timer is armed in, which breaks a tie of deadlines.
     next: u64,
     /// The timers armed and not yet fired, by deadline then order armed.
@@ -216,8 +224,8 @@ struct Timers {
 }
 
 impl ConsumerTimers {
-    /// Live timers, to give the [`ConsumerInputs`] that fires them (one) and the handlers that
-    /// arm them.
+    /// Live timers, to give the [`ConsumerInputs`] that fires them (one at a time: new inputs may
+    /// take them once those have ended, as a restarted shard's do) and the handlers that arm them.
     pub fn new() -> ConsumerTimers {
         ConsumerTimers::with(true)
     }
@@ -232,6 +240,8 @@ impl ConsumerTimers {
         let state = Timers {
             live,
             ended: false,
+            bound: false,
+            generation: 0,
             next: 0,
             due: BTreeMap::new(),
             waker: None,
@@ -244,8 +254,11 @@ impl ConsumerTimers {
     }
 
     /// Arms a timer that fires `after` from now as an input of the consumer's `kind`, holding
-    /// `bytes`, journaled under `class`. Counted and not armed when these timers are inert, when
-    /// the inputs that fire them have ended, or when `after` lies past the end of the clock.
+    /// `bytes`, journaled under `class`. Refused, counted and not armed when the inputs that
+    /// fire these timers have ended ([`ArmRefusal::Ended`]) or `after` lies past the end of the
+    /// clock ([`ArmRefusal::PastClock`]), so a lost timer is never silent (Reviewer B's B1 on PR
+    /// #172). Inert timers take every arm and arm nothing (counted), as the live shard's firing
+    /// comes back from the journal.
     #[must_use = "a refused arm fires nothing"]
     pub fn arm(
         &self,
@@ -258,19 +271,24 @@ impl ConsumerTimers {
         let waker = {
             let mut st = self.state.borrow_mut();
             st.arms += 1;
-            match deadline {
-                Some(deadline) if st.live && !st.ended => {
-                    let order = st.next;
-                    st.next += 1;
-                    let fired = Pushed { class, kind, bytes };
-                    st.due.insert((deadline, order), fired);
-                    st.waker.take()
-                }
-                _ => {
+            let refused = match deadline {
+                _ if st.ended => Err(ArmRefusal::Ended),
+                None => Err(ArmRefusal::PastClock),
+                Some(deadline) => Ok(deadline),
+            };
+            let deadline = match refused {
+                Ok(deadline) if st.live => deadline,
+                refused => {
                     st.not_armed += 1;
-                    None
+                    // Inert timers take every arm: the live firing comes back from the journal.
+                    return if st.live { refused.map(drop) } else { Ok(()) };
                 }
-            }
+            };
+            let order = st.next;
+            st.next += 1;
+            let fired = Pushed { class, kind, bytes };
+            st.due.insert((deadline, order), fired);
+            st.waker.take()
         };
         if let Some(waker) = waker {
             waker.wake();
@@ -322,9 +340,26 @@ impl ConsumerTimers {
         Some((deadline, order < horizon))
     }
 
-    /// The inputs that fire these timers ended: what is armed never fires and nothing more is.
-    fn end(&self) {
-        if let Ok(mut st) = self.state.try_borrow_mut() {
+    /// New inputs take these timers, and their generation: refused while other inputs that have
+    /// not ended fire them.
+    fn bind(&self) -> Option<u64> {
+        let mut st = self.state.borrow_mut();
+        if st.bound {
+            return None;
+        }
+        st.bound = true;
+        st.ended = false;
+        st.generation += 1;
+        Some(st.generation)
+    }
+
+    /// The inputs of `generation` that fire these timers ended: what is armed never fires and
+    /// nothing more is, until new inputs take them. Inputs of an earlier generation end nothing.
+    fn end(&self, generation: u64) {
+        if let Ok(mut st) = self.state.try_borrow_mut()
+            && st.generation == generation
+        {
+            st.bound = false;
             st.ended = true;
             st.due.clear();
             st.waker = None;
@@ -395,8 +430,19 @@ struct Ring {
     /// Whether every sender has dropped, the ring emptied.
     closed: bool,
     timers: ConsumerTimers,
+    /// The timers' generation these inputs took.
+    generation: u64,
+    /// Whether these inputs have ended, for good.
+    ended: bool,
     journal: Option<Journal>,
     counters: InputCounters,
+}
+
+/// Inputs dropped unrun end too, so new ones may take their timers.
+impl Drop for Ring {
+    fn drop(&mut self) {
+        self.end();
+    }
 }
 
 impl<H> fmt::Debug for ConsumerInputs<H> {
@@ -427,9 +473,14 @@ impl<H: InputHandler> ConsumerInputs<H> {
     }
 
     /// Takes every input as it comes, stamped, journaled and handed to the handler, until every
-    /// sender has dropped and no timer is pending. Once it returns, or is dropped, the ring
-    /// refuses every push and the timers arm nothing, a run dropped before its first poll
-    /// included (Codex P1 r4311000152 on PR #172).
+    /// sender has dropped and no timer is pending. Once it returns, or is dropped, the inputs
+    /// have ended for good, a run dropped before its first poll included (Codex P1 r4311000152
+    /// on PR #172): the ring refuses every push, what it still held is counted
+    /// ([`InputCounters::unhandled`]) and never handed on, the timers refuse every arm
+    /// ([`ArmRefusal::Ended`]) until new inputs take them, and a second run returns at once
+    /// handing nothing (Reviewer B's B2 on PR #172). A consumer whose handlers arm timers for
+    /// the shard's whole life keeps a sender for it; a restarted shard makes new inputs, which
+    /// may take the same timers.
     pub fn run(&mut self) -> impl Future<Output = ()> + '_ {
         let ConsumerInputs { ring, handler } = self;
         // Made before the future is, so dropping it unpolled ends the inputs too.
@@ -448,12 +499,15 @@ impl Ring {
         if capacity == 0 || capacity > MAX_INPUT_CAPACITY {
             return Err(InputsError::Capacity(capacity));
         }
+        let generation = timers.bind().ok_or(InputsError::TimersInUse)?;
         let (tx, rx) = mpsc::channel(capacity);
         let ring = Ring {
             clock,
             rx,
             closed: false,
             timers,
+            generation,
+            ended: false,
             journal: None,
             counters: InputCounters::default(),
         };
@@ -464,10 +518,19 @@ impl Ring {
         Ok((ring, sender))
     }
 
-    /// Ends the inputs: the ring refuses every push from now on, and the timers arm nothing.
+    /// Ends the inputs for good: the ring refuses every push from now on and what it still held
+    /// is counted and dropped, never handed on; the timers arm nothing until new inputs take
+    /// them (Reviewer B's B2 on PR #172).
     fn end(&mut self) {
+        if self.ended {
+            return;
+        }
+        self.ended = true;
         self.rx.close();
-        self.timers.end();
+        while self.rx.try_recv().is_ok() {
+            self.counters.unhandled += 1;
+        }
+        self.timers.end(self.generation);
     }
 
     /// Takes what is ready: a timer due that was armed before this poll began (so a handler
@@ -479,6 +542,10 @@ impl Ring {
         cx: &mut Context<'_>,
         sleep: &mut Option<Pin<Box<Sleep>>>,
     ) -> Poll<()> {
+        if self.ended {
+            // A second run of inputs that ended hands on nothing (Reviewer B's B2 on PR #172).
+            return Poll::Ready(());
+        }
         let horizon = self.timers.horizon();
         loop {
             if let Some(key) = self.timers.first_due(Instant::now(), horizon) {
