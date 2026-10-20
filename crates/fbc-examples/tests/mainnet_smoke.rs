@@ -1112,7 +1112,9 @@ fn a_cap_in_lots_is_floored_and_one_past_a_lot_count_is_the_largest() {
     // Past what a lot count holds, or a decimal once divided: the largest lot count.
     assert_eq!(lots(d("1e20"), d("1"), d("1")), i64::MAX);
     assert_eq!(lots(Decimal::MAX, d("0.5"), d("0.00001")), i64::MAX);
-    assert_eq!(lots(Decimal::MAX, Decimal::MAX, d("2")), i64::MAX);
+    // A lot whose cost does not fit a decimal costs more than any cap: no lot, never the
+    // largest count (Codex r4320317907 on PR #184).
+    assert_eq!(lots(Decimal::MAX, Decimal::MAX, d("2")), 0);
     // A cap, a price or a step that is not positive: no lot.
     assert_eq!(lots(Decimal::ZERO, d("1"), d("1")), 0);
     assert_eq!(lots(d("-5"), d("1"), d("1")), 0);
