@@ -35,8 +35,9 @@ This augments 0014 (the venue boundary) and 0029 (the handshake); it supersedes 
    has it. A session over an in-process stream (0104) opens no socket and reads none.
 3. **Refusals name the key or the header, never the value.** A key the endpoint names that
    the credentials lack is `VenueError::Config(ConfigError::Missing(key))`, as 0043 has it for
-   a codec; a value no header can carry (a line break, a NUL) is `ConfigError::Invalid` under
-   that key, which also refuses a value that would smuggle a second header into the request; a
+   a codec; an empty value, or one no header can carry (a line break, a NUL), is
+   `ConfigError::Invalid` under that key, which also refuses a value that would smuggle a
+   second header into the request; a
    name that is not a header name, one the handshake sets itself (`Host`, `Connection`,
    `Upgrade`, any `Sec-WebSocket-` header) or one that frames a body (`Content-Length`,
    `Transfer-Encoding`), or a header named twice on one endpoint, is a venue defect,

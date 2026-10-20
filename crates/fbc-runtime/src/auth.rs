@@ -49,7 +49,7 @@ impl HandshakeHeaders {
     /// The headers `ep` names, their values read from `creds`. Refused when `ep` names a header
     /// no handshake can carry, or names one twice ([`ExecSessionError::HandshakeHeader`]), when
     /// `creds` lack a key it names ([`ConfigError::Missing`]), or when a value is not one a
-    /// header can carry, such as one holding a line break ([`ConfigError::Invalid`]); none of
+    /// header can carry, empty or holding a line break ([`ConfigError::Invalid`]); none of
     /// these carries a value.
     pub(crate) fn for_endpoint(
         ep: &ExecEndpoint,
@@ -71,8 +71,9 @@ impl HandshakeHeaders {
                 .get(secret)
                 .ok_or(VenueError::Config(ConfigError::Missing(secret)))
                 .map_err(ExecSessionError::Venue)?;
-            if HeaderValue::from_str(value.expose()).is_err() {
-                let reason = "not a value an HTTP header can carry";
+            // An empty value would send the header bare, as if the venue took no key.
+            if value.expose().is_empty() || HeaderValue::from_str(value.expose()).is_err() {
+                let reason = "empty, or not a value an HTTP header can carry";
                 let invalid = ConfigError::Invalid {
                     key: secret,
                     reason,
@@ -190,8 +191,12 @@ mod tests {
     }
 
     #[test]
-    fn a_value_with_a_line_break_is_refused_by_its_key() {
-        for bad in [format!("{}\r\nX: 1", value()), format!("{}\0", value())] {
+    fn an_empty_value_or_one_with_a_line_break_is_refused_by_its_key() {
+        for bad in [
+            format!("{}\r\nX: 1", value()),
+            format!("{}\0", value()),
+            String::new(),
+        ] {
             let err = HandshakeHeaders::for_endpoint(&endpoint(&["X-Key"]), &creds(bad));
             let err = err.err().unwrap();
             assert!(
