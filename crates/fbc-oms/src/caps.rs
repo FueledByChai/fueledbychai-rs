@@ -332,8 +332,15 @@ impl Exposure {
         };
         let worst = worst_with(new.exposure);
         // A venue-flagged reduce-only order that strictly shrinks the worst case (FBC-ugto).
+        // The worst case without it is compared in i128, so a position of i64::MIN lots, whose
+        // size no lot count holds, is compared without wrapping (Codex on PR #183).
         let shrinks = |worst: Lots| {
-            venue_reduce_only && worst_with(Lots::ZERO).is_some_and(|before| worst < before)
+            venue_reduce_only
+                && self.others.is_some_and(|others| {
+                    let before =
+                        i128::from(pos.0) + i128::from(side.sign()) * i128::from(others.get());
+                    i128::from(worst.get()) < before.abs()
+                })
         };
         match worst {
             Some(worst) if worst <= caps.inventory || shrinks(worst) => {}
