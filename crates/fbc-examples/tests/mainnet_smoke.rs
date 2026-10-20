@@ -1072,6 +1072,36 @@ async fn large_caps_are_taken_and_printed_before_anything_connects() {
     no_credential_in(&printed);
 }
 
+#[tokio::test]
+async fn a_cap_too_large_for_a_lot_count_is_taken_as_the_largest_lot_count() {
+    // No ceiling (FBC-thks; Codex r4320205456 on PR #184): the largest cap a decimal holds, far
+    // past what a lot count holds at this price and step, is taken as i64::MAX lots, so the run
+    // goes on as at any large cap instead of refusing after its first requests.
+    let placed = Arc::new(Mutex::new(Placed::default()));
+    let stub = StubServer::start(script(Arc::clone(&placed), 9), routes())
+        .await
+        .unwrap();
+    let mut smoke = smoke_on(&stub);
+    smoke.trade.resting_cap_usd = Decimal::MAX;
+    smoke.trade.inventory_cap_usd = Decimal::MAX;
+    let (ran, printed) = run_on(&smoke, None, &ParadexFactory).await;
+    let report = ran.unwrap_or_else(|e| panic!("refused: {e}; it printed:\n{printed}"));
+    stub.finished().await.unwrap();
+    assert!(report.ok, "{printed}");
+    let most = i64::MAX;
+    assert!(
+        printed.contains(&format!(
+            "caps: resting {most} lots per side, inventory {most} lots"
+        )),
+        "{printed}"
+    );
+    assert_eq!(
+        (report.places_sent, report.cancels_sent),
+        (1, 2),
+        "{printed}"
+    );
+}
+
 #[test]
 fn the_command_line_refuses_what_it_does_not_take_and_never_echoes_a_value() {
     // Shaped like a key (64 hex digits), built here so no key-shaped literal is in the source.

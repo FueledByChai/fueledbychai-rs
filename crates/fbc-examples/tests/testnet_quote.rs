@@ -3510,6 +3510,34 @@ async fn mainnet_mode_takes_large_caps_and_prints_them_before_anything_connects(
 }
 
 #[tokio::test]
+async fn a_cap_too_large_for_a_lot_count_is_taken_as_the_largest_lot_count_not_zero() {
+    // No ceiling (FBC-thks; Codex r4320205456 on PR #184): the largest cap a decimal holds is
+    // taken as i64::MAX lots, never as a zero cap that would leave every quote out.
+    let venue = mainnet_venue(vec![b0()]);
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let mut opts = mainnet_options(&stub, 1);
+    opts.resting_cap_usd = Decimal::MAX;
+    opts.inventory_cap_usd = Decimal::MAX;
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(report.ok, "{printed}");
+    assert_eq!(report.places_sent, 2, "{printed}");
+    let most = i64::MAX;
+    assert!(
+        printed.contains(&format!(
+            "resting {most} lots per side, inventory {most} lots"
+        )),
+        "{printed}"
+    );
+    stopped(&printed);
+}
+
+#[tokio::test]
 async fn mainnet_mode_checks_the_chain_id_before_anything_connects_and_at_start() {
     // PARADEX_CHAIN_ID, when set, must be mainnet's: by name or as its felt.
     let venue = mainnet_venue(vec![b0()]);
