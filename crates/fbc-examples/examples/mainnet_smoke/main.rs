@@ -3,8 +3,8 @@
 //! of about $11 well away from the touch through fbc-oms, its acknowledgement, its cancel, the
 //! cancel's acknowledgement, then Stop (kill switch + cancel all), each step timed out and
 //! printed. Refused without both `--mainnet` and `--sole-trader`, with any URL or chain id but
-//! mainnet's, with caps above $11 resting per side or $50 inventory, with a testnet credential
-//! variable set, or on a venue whose snapshot source is not trustworthy (Paradex's is, decision
+//! mainnet's, with a missing or non-positive cap (the caps are yours: no ceiling), with a
+//! testnet credential variable set, or on a venue whose snapshot source is not trustworthy (Paradex's is, decision
 //! 0094; no hand seed on mainnet), before anything connects. An owner-run sample: CI builds it,
 //! and its wiring is tested against the conformance stub (`tests/mainnet_smoke.rs`).
 //!
@@ -15,7 +15,7 @@
 //! cargo run -p fbc-examples --example mainnet_smoke -- --mainnet --sole-trader \
 //!     --namespace <N> --market BTC-USD-PERP --tick <price_tick_size> \
 //!     --step <order_size_increment> --min-notional <min_notional> \
-//!     --resting-cap-usd 11 --inventory-cap-usd 50 --order-usd 11 \
+//!     --resting-cap-usd <USD> --inventory-cap-usd <USD> --order-usd <USD> \
 //!     --side buy --away-bps 300
 //! cargo run -p fbc-examples --example mainnet_smoke -- --help
 //! ```

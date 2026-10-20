@@ -2,9 +2,9 @@
 //! Paradex MAINNET, never seeded by hand.
 //!
 //! **Before anything connects** ([`run`]): both confirmations (`--mainnet`, `--sole-trader`) and
-//! the smoke's caps (at most $11 resting per side and $50 inventory,
-//! [`crate::smoke_args::confirmed`]); the URLs exactly mainnet's ([`MAINNET_REST`],
-//! [`MAINNET_WS`]) or both a loopback stub's; `PARADEX_CHAIN_ID`, when set, mainnet's; and the
+//! the smoke's caps (yours, positive, with no ceiling, [`crate::smoke_args::confirmed`]; both
+//! printed, the `CAPS` line, before the first request); the URLs exactly mainnet's
+//! ([`MAINNET_REST`], [`MAINNET_WS`]) or both a loopback stub's; `PARADEX_CHAIN_ID`, when set, mainnet's; and the
 //! venue's declared snapshot source trustworthy ([`trusted`]). Paradex's adapter declares it
 //! trustworthy (decision 0094, accepted by the owner 2026-10-16); a venue declaring otherwise
 //! stops here: a mainnet market is armed only after a trustworthy resync (owner answer C to
@@ -106,6 +106,10 @@ pub async fn run(
     let (rest_host, ws_host) = hosts(&opts.rest_url, &opts.ws_url)?;
     lines.line(format_args!(
         "MAINNET {what}: REST host {rest_host} WS host {ws_host} chain {MAINNET_CHAIN}"
+    ));
+    lines.line(format_args!(
+        "CAPS ${} resting per side, ${} inventory (yours: no default, no ceiling)",
+        opts.resting_cap_usd, opts.inventory_cap_usd
     ));
     let wait = Duration::from_secs(opts.step_timeout_secs);
     let body = rest_get(

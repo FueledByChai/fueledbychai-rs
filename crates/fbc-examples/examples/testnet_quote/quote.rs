@@ -7,7 +7,7 @@
 //! **Mainnet mode** (`--mainnet`, FBC-tyft: the owner's "small and supervised" sessions). The
 //! same loop, refused before anything connects unless both `--mainnet` and `--sole-trader` are
 //! given, the URLs are exactly mainnet's (or both a loopback stub's), `PARADEX_CHAIN_ID` (when
-//! set) is mainnet's, the caps are at most $11 resting per side and $50 inventory, both offsets
+//! set) is mainnet's, both caps are given and positive (yours, with no ceiling), both offsets
 //! are at least 20 bps and `--duration` at most an hour ([`crate::args::mainnet_limits`]); the
 //! credentials are the mainnet-only variables (`src/auth_mainnet.rs`, [`credentials`]); the
 //! venue must declare its snapshot trustworthy ([`crate::mainnet::trusted`]). Then, before the

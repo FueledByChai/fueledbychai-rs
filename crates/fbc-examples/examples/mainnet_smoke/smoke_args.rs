@@ -6,7 +6,7 @@
 use fbc_runtime::ProxyConfig;
 
 pub use crate::args::{Options, OrderSide};
-use crate::mainnet::{LEASE_DIR_NAME, MAINNET_REST, MAINNET_WS, mainnet_urls, within_mainnet_caps};
+use crate::mainnet::{LEASE_DIR_NAME, MAINNET_REST, MAINNET_WS, mainnet_caps, mainnet_urls};
 use crate::testnet::{
     Target, UNSHOWN, absolute, bounded, direct_to_stub, flag_name, lease_dir_named, positive,
     socks5, symbol,
@@ -53,10 +53,10 @@ The market (required; read them from GET https://api.prod.paradex.trade/v1/marke
   --step <DEC>              its order_size_increment
   --min-notional <USD>      its min_notional (Paradex judges it at the MARK price)
 
-The caps (required; in USD, no defaults):
-  --resting-cap-usd <USD>   the resting cap per side, at most 11, judged at the order's own
-                            price (the notional a fill costs), not at the mark
-  --inventory-cap-usd <USD> the inventory cap, at most 50
+The caps (required; yours, in USD, positive, no defaults and no ceiling):
+  --resting-cap-usd <USD>   the resting cap per side, judged at the order's own price (the
+                            notional a fill costs), not at the mark
+  --inventory-cap-usd <USD> the inventory cap
 
 The order (required; no defaults):
   --order-usd <USD>         the order's size in USD at its price, floored onto the size step;
@@ -86,6 +86,7 @@ argument, never after '='.
 
 Lines (each step with the milliseconds since the start):
   MAINNET ...        the hosts the guard accepted (never the URLs)
+  CAPS ...           the caps the run takes, printed before anything connects
   STEP chain         GET /system/config names PRIVATE_SN_PARACLEAR_MAINNET (else refused)
   STEP mark          the market's mark price from GET /markets/summary
   BBO ...            the touch read from GET /orderbook before the order is priced
@@ -256,8 +257,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
 }
 
 /// Refuses a run the owner has not confirmed with both `--mainnet` and `--sole-trader`, or
-/// whose caps exceed the mainnet caps ([`within_mainnet_caps`]: $11 resting per side, $50
-/// inventory), or whose order exceeds its resting cap.
+/// whose caps are not positive ([`mainnet_caps`]: the caps are yours, with no default and no
+/// ceiling, owner 2026-10-19, FBC-thks), or whose order exceeds its resting cap.
 pub fn confirmed(smoke: &Smoke) -> Result<(), String> {
     let opts = &smoke.trade;
     if !smoke.mainnet {
@@ -267,6 +268,6 @@ pub fn confirmed(smoke: &Smoke) -> Result<(), String> {
         );
     }
     crate::args::sole(opts)?;
-    within_mainnet_caps(opts.resting_cap_usd, opts.inventory_cap_usd)?;
+    mainnet_caps(opts.resting_cap_usd, opts.inventory_cap_usd)?;
     crate::args::within_cap(opts)
 }

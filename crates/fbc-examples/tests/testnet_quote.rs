@@ -3406,7 +3406,10 @@ async fn mainnet_mode_refuses_non_positive_caps_offsets_and_a_duration_past_the_
         let at = argv.iter().position(|a| a == flag).unwrap();
         argv.drain(at..at + 2);
         let refused = args::parse(argv).unwrap_err();
-        assert!(refused.contains(&format!("{flag} is required")), "{refused}");
+        assert!(
+            refused.contains(&format!("{flag} is required")),
+            "{refused}"
+        );
     }
     // A testnet run has none of these limits.
     let mut argv = required();
@@ -3427,10 +3430,19 @@ async fn mainnet_mode_refuses_non_positive_caps_offsets_and_a_duration_past_the_
         .unwrap();
     type Break = (fn(&mut Options), &'static str);
     let breaks: [Break; 9] = [
-        (|o| o.resting_cap_usd = dec("0"), "--resting-cap-usd 0 is not positive"),
+        (
+            |o| o.resting_cap_usd = dec("0"),
+            "--resting-cap-usd 0 is not positive",
+        ),
         (|o| o.interval_ms = 20_001, "at most 20000 ms"),
-        (|o| o.inventory_cap_usd = dec("0"), "--inventory-cap-usd 0 is not positive"),
-        (|o| o.inventory_cap_usd = dec("-1"), "--inventory-cap-usd -1 is not positive"),
+        (
+            |o| o.inventory_cap_usd = dec("0"),
+            "--inventory-cap-usd 0 is not positive",
+        ),
+        (
+            |o| o.inventory_cap_usd = dec("-1"),
+            "--inventory-cap-usd -1 is not positive",
+        ),
         (|o| o.bid_bps = 10, "at least 20"),
         (|o| o.ask_bps = 5, "at least 20"),
         (|o| o.duration_secs = 7_200, "at most 3600"),

@@ -32,13 +32,13 @@
 //!   `--cycles`; then Stop and a summary. With `--mainnet` (FBC-tyft), the same loop on Paradex
 //!   MAINNET for a short supervised session behind `--mainnet` and `--sole-trader`: mainnet's
 //!   guard (`src/mainnet.rs`, shared with `mainnet_smoke`), its credentials
-//!   (`src/auth_mainnet.rs`), caps of at most $11 resting per side and $50 inventory, offsets of
-//!   at least 20 bps, at most an hour, never seeded by hand.
+//!   (`src/auth_mainnet.rs`), the operator's own positive caps (required, no default, no
+//!   ceiling), offsets of at least 20 bps, at most an hour, never seeded by hand.
 //! - `mainnet_smoke` (`examples/mainnet_smoke/`, FBC-p0aa): Paradex MAINNET, the owner's first
 //!   prod order: testnet_trade's round trip (its `trade.rs`, by path), never seeded by hand,
-//!   behind `--mainnet` and `--sole-trader`, caps of at most $11 resting per side and $50
-//!   inventory, mainnet's URLs and chain id (checked against `GET /system/config`), the order
-//!   sized to the minimum notional at the mark price. Its credentials come from mainnet-only
+//!   behind `--mainnet` and `--sole-trader`, the operator's own positive caps (required, no
+//!   default, no ceiling), mainnet's URLs and chain id (checked against `GET /system/config`),
+//!   the order sized to the minimum notional at the mark price. Its credentials come from mainnet-only
 //!   variables (`src/auth_mainnet.rs`, a review path). It Starts only after a trustworthy
 //!   resync seeded the market (Paradex's snapshot source is trustworthy, decision 0094).
 //!

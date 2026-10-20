@@ -989,7 +989,9 @@ async fn the_caps_are_required_and_positive_with_no_ceiling() {
         let err = smoke_args::parse(args).err().unwrap();
         assert!(err.contains(&format!("{flag} is required")), "{err}");
         for bad in ["0", "-5", "0.0"] {
-            let err = set(flag, bad).err().unwrap_or_else(|| panic!("{flag} {bad}"));
+            let err = set(flag, bad)
+                .err()
+                .unwrap_or_else(|| panic!("{flag} {bad}"));
             assert!(err.contains(flag), "{err}");
             assert!(err.contains("positive"), "{err}");
         }
@@ -1051,11 +1053,15 @@ async fn large_caps_are_taken_and_printed_before_anything_connects() {
         .find(caps)
         .unwrap_or_else(|| panic!("no {caps}:\n{printed}"));
     // Printed second, after the MAINNET line, before the chain read's STEP.
-    assert!(printed.lines().nth(1).unwrap().starts_with(caps), "{printed}");
-    assert!(at < printed.find("STEP chain").unwrap(), "{printed}");
-    // The caps in lots at the first touch: 5000 / 62000.2 and 20000 / 62000.5 on the step.
     assert!(
-        printed.contains("caps: resting 8064 lots per side, inventory 32257 lots"),
+        printed.lines().nth(1).unwrap().starts_with(caps),
+        "{printed}"
+    );
+    assert!(at < printed.find("STEP chain").unwrap(), "{printed}");
+    // The caps in lots on the 0.00001 step: $5000 at the order's own price of 60140.1 and
+    // $20000 at the dearest of it, the touch and the mark (62000.5).
+    assert!(
+        printed.contains("caps: resting 8313 lots per side, inventory 32257 lots"),
         "{printed}"
     );
     assert_eq!(

@@ -6,8 +6,8 @@
 //! `--mainnet`: a mainnet URL or chain id is refused before anything connects. With `--mainnet`
 //! (and `--sole-trader`, FBC-tyft) the same loop on Paradex MAINNET, real money: a short
 //! session the owner runs and watches, on the separate mainnet account, within the owner's
-//! limits ($11 resting per side, $50 inventory, offsets of at least 20 bps, at most an hour),
-//! never seeded by hand. An owner-run sample: CI builds it, and its wiring is tested against the
+//! limits (offsets of at least 20 bps, at most an hour; the caps are the operator's own,
+//! positive, with no ceiling), never seeded by hand. An owner-run sample: CI builds it, and its wiring is tested against the
 //! conformance stub (`tests/testnet_quote.rs`), but nothing runs it against a venue.
 //!
 //! ```text
@@ -15,7 +15,7 @@
 //! export PARADEX_PRIVATE_KEY=...       # its main Stark key
 //! cargo run -p fbc-examples --example testnet_quote -- --sole-trader --namespace <N> \
 //!     --market BTC-USD-PERP --tick <price_tick_size> --step <order_size_increment> \
-//!     --min-notional <min_notional> --resting-cap-usd 11 --inventory-cap-usd 50 \
+//!     --min-notional <min_notional> --resting-cap-usd <USD> --inventory-cap-usd <USD> \
 //!     --order-usd <USD> --bid-bps <N> --ask-bps <N> --duration <SECONDS>
 //! cargo run -p fbc-examples --example testnet_quote -- --help
 //!
