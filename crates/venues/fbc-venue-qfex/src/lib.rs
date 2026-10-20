@@ -1,9 +1,11 @@
-//! QFEX public market data. Order entry is deliberately unavailable (decision 0117).
+//! QFEX public market data and instrument discovery. Order entry is deliberately unavailable
+//! (decision 0117).
 //!
 //! The public WebSocket and its `bbo`, `level2`, and `trade` messages are documented at
 //! <https://docs.qfex.com/websocket/main> and the corresponding MDS channel pages.
 
 mod caps;
+pub mod discover;
 mod md;
 
 use std::collections::BTreeSet;
@@ -20,17 +22,35 @@ use md::{QfexMd, channel};
 
 /// The public MDS WebSocket URL, e.g. `wss://mds.qfex.com`.
 pub const KEY_MDS_URL: &str = "qfex.mds_url";
+/// The public REST origin used for `GET /refdata`, e.g. `https://api.qfex.com`.
+pub const KEY_REST_URL: &str = "qfex.rest_url";
+/// The public reference-data request timeout, e.g. `5000ms`.
+pub const KEY_REST_TIMEOUT: &str = "qfex.rest_timeout";
 /// The `bbo` channel's touch source.
 pub const TOUCH_BBO: TouchSourceId = TouchSourceId(0);
 /// The `level2` channel's 20-level windowed book.
 pub const BOOK_LEVEL2: BookId = BookId(0);
 
-const SCHEMA: &[FieldSpec] = &[FieldSpec {
-    key: KEY_MDS_URL,
-    scope: ConfigScope::Process,
-    unit: FieldUnit::Dimensionless,
-    doc: "public MDS WebSocket URL (ws:// or wss:// with host and optional port)",
-}];
+const SCHEMA: &[FieldSpec] = &[
+    FieldSpec {
+        key: KEY_MDS_URL,
+        scope: ConfigScope::Process,
+        unit: FieldUnit::Dimensionless,
+        doc: "public MDS WebSocket URL (ws:// or wss:// with host and optional port)",
+    },
+    FieldSpec {
+        key: KEY_REST_URL,
+        scope: ConfigScope::Process,
+        unit: FieldUnit::Dimensionless,
+        doc: "public REST origin (https://, or http:// loopback for a test stub)",
+    },
+    FieldSpec {
+        key: KEY_REST_TIMEOUT,
+        scope: ConfigScope::Process,
+        unit: FieldUnit::Duration,
+        doc: "positive public REST request timeout as <n>ms or <n>s",
+    },
+];
 
 fn mds_url(cfg: &VenueConfig) -> Result<&str, ConfigError> {
     let url = cfg
@@ -50,7 +70,7 @@ fn mds_url(cfg: &VenueConfig) -> Result<&str, ConfigError> {
 }
 
 /// WebSocket origin authority: DNS name, IPv4, or bracketed IPv6, with an optional valid port.
-fn valid_host_port(authority: &str) -> bool {
+pub(crate) fn valid_host_port(authority: &str) -> bool {
     let (host_ok, port) = match authority.strip_prefix('[') {
         Some(rest) => {
             let Some((host, after)) = rest.split_once(']') else {
@@ -117,15 +137,15 @@ impl VenueFactory for Qfex {
         Ok(caps::caps())
     }
 
-    fn parse_fbc_common_symbol(&self, _s: &str) -> Result<AssetKey, SymbolError> {
-        Err(SymbolError::NoRule)
+    fn parse_fbc_common_symbol(&self, s: &str) -> Result<AssetKey, SymbolError> {
+        discover::parse_fbc_common_symbol(s)
     }
 
     fn discover(
         &self,
-        _cfg: &VenueConfig,
+        cfg: &VenueConfig,
     ) -> Result<HttpPlan<Vec<InstrumentSpecDraft>>, VenueError> {
-        Err(VenueError::NoDiscovery)
+        discover::plan(cfg)
     }
 
     fn plan_md(

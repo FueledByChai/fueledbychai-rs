@@ -23,8 +23,8 @@
 //!   is malformed: nothing is read as trading that Binance does not say is.
 //! - `symbol` through the decode scope; `baseAsset` and `quoteAsset` (the key, as written:
 //!   `BTC`, `USDT`) and `marginAsset` (the settlement asset). A perpetual with an asset name an
-//!   [`AssetSym`] cannot hold (more than eight bytes, or not printable ASCII; Binance lists
-//!   `1000000MOGUSDT`, base `1000000MOG`, and `币安人生USDT`, base `币安人生`) cannot be keyed,
+//!   [`AssetSym`] cannot hold (more than sixteen bytes, or not printable ASCII; Binance lists
+//!   `币安人生USDT`, base `币安人生`) cannot be keyed,
 //!   so it alone is passed over before its symbol and filters are read: the consumer finds it
 //!   not listed, and every other symbol is still discovered. An empty asset name is malformed.
 //! - `PRICE_FILTER` `tickSize` is the fixed price grid ("disabled on value 0" is no grid, so 0 is
@@ -276,7 +276,7 @@ fn text<'a>(m: &'a Map<String, Value>, key: &'static str) -> Result<&'a str, Pla
 }
 
 /// A required asset as written, or `None` for a stated name an [`AssetSym`] cannot hold (more
-/// than eight bytes, or not printable ASCII): a name Binance lists (`1000000MOG`, `币安人生`)
+/// than sixteen bytes, or not printable ASCII): a name Binance lists (`币安人生`)
 /// that the core cannot key. An empty name, or one that is not a string, is malformed.
 fn asset_sym(m: &Map<String, Value>, key: &'static str) -> Result<Option<AssetSym>, PlanError> {
     let name = text(m, key)?;

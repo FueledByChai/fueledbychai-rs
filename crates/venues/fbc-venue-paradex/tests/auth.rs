@@ -979,7 +979,7 @@ fn test_connection_refuses_an_account_answer_without_its_account_or_with_a_malfo
         malformed("account_value")
     );
     assert_eq!(
-        read(br#"{"account":"0x1","account_value":"1","settlement_asset":"TOOLONGASSET"}"#),
+        read(br#"{"account":"0x1","account_value":"1","settlement_asset":"ABCDEFGHIJKLMNOPQ"}"#),
         malformed("settlement_asset")
     );
     // Equity below a nanounit is truncated toward zero.
