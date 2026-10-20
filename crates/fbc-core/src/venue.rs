@@ -238,7 +238,8 @@ pub enum MdTransport {
 }
 
 /// One order-entry connection the runtime opens for an account session; when it is open the
-/// runtime calls [`ExecCodec::on_open`] with its stream.
+/// runtime calls [`ExecCodec::on_open`] with its stream. An account session drives every one
+/// [`VenueFactory::plan_exec`] plans, each on its own epochs (decision 0115).
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub struct ExecEndpoint {
     pub stream: StreamId,
@@ -563,7 +564,9 @@ pub trait VenueFactory: Sync + 'static {
     /// A market-data codec for `ep`: for a socket, one connection epoch of it.
     fn md_codec(&self, cfg: &VenueConfig, ep: &EndpointPlan) -> Box<dyn MdCodec>;
     /// The order-entry connections to open under `cfg`; empty for a venue whose order entry is
-    /// HTTP only, or that has none.
+    /// HTTP only, or that has none. The first carries the orders (commands, the
+    /// cancel-on-disconnect arm, the resync); any others carry what the venue sends apart, such
+    /// as an account stream, each on a stream of its own (decision 0115).
     fn plan_exec(&self, cfg: &VenueConfig) -> Result<Vec<ExecEndpoint>, VenueError>;
     /// An order-entry codec for the account `creds` reach, or `None` for a market-data-only
     /// venue, which drops them unread. It writes client ids in the format its capabilities

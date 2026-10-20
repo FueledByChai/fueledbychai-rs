@@ -497,9 +497,9 @@ pub(crate) struct Rpcs {
     due: BinaryHeap<Reverse<(Instant, RpcId)>>,
     /// The requests written and neither answered nor timed out.
     live: HashSet<RpcId>,
-    /// The requests asked as HTTP requests whose epoch has not ended: the epoch that asked and
-    /// the deadline, which stands once that epoch ends (decision 0081).
-    held: HashMap<RpcId, (u32, Option<Instant>)>,
+    /// The requests asked as HTTP requests whose epoch has not ended: the connection epoch that
+    /// asked and the deadline, which stands once that epoch ends (decision 0081).
+    held: HashMap<RpcId, (ConnKey, Option<Instant>)>,
     /// The places the requests hold in the consumer's table, shared with the guard a run holds
     /// ([`Rpcs::give_back_on_drop`]).
     places: Rc<Places>,
@@ -609,25 +609,27 @@ impl Rpcs {
         }
     }
 
-    /// Request `call` is asked as an HTTP request of epoch `epoch` at `now`: its deadline is
-    /// `call.timeout` from then, standing only once that epoch has ended ([`Self::ended`]),
-    /// since until then its result, or the failure that stands for one, always reaches the
-    /// codec's `on_http` (decision 0081). A request already waiting keeps its first deadline.
-    pub(crate) fn asked(&mut self, call: RpcCall, epoch: u32, now: Instant) {
+    /// Request `call` is asked as an HTTP request of connection epoch `key` at `now`: its
+    /// deadline is `call.timeout` from then, standing only once that epoch has ended
+    /// ([`Self::ended`]), since until then its result, or the failure that stands for one, always
+    /// reaches the codec's `on_http` (decision 0081). A request already waiting keeps its first
+    /// deadline.
+    pub(crate) fn asked(&mut self, call: RpcCall, key: ConnKey, now: Instant) {
         if self.live.insert(call.id) {
             self.hold(call.id);
             let at = now.checked_add(call.timeout);
-            self.held.insert(call.id, (epoch, at));
+            self.held.insert(call.id, (key, at));
         }
     }
 
-    /// Epoch `epoch` ended: the deadlines of the HTTP requests it asked stand, since a result
-    /// coming back now is dropped and never reaches the codec.
-    pub(crate) fn ended(&mut self, epoch: u32) {
+    /// Connection epoch `key` ended: the deadlines of the HTTP requests it asked stand, since a
+    /// result coming back now is dropped and never reaches the codec. Another connection's
+    /// epoch of the same number is another epoch (FBC-tnsf).
+    pub(crate) fn ended(&mut self, key: ConnKey) {
         let ended: Vec<RpcId> = self
             .held
             .iter()
-            .filter(|(_, (asked, _))| *asked == epoch)
+            .filter(|(_, (asked, _))| *asked == key)
             .map(|(rpc, _)| *rpc)
             .collect();
         for rpc in ended {
@@ -702,6 +704,11 @@ mod tests {
         }
     }
 
+    /// Epoch `epoch` of connection 1.
+    fn on(epoch: u32) -> ConnKey {
+        ConnKey { conn: 1, epoch }
+    }
+
     #[test]
     fn a_deadline_falls_due_once_unless_answered_first() {
         let now = Instant::now();
@@ -727,18 +734,18 @@ mod tests {
         let ms = Duration::from_millis;
         let mut rpcs = Rpcs::new(table());
         // Asked on epoch 0: two still out, one handed over, one of epoch 1.
-        rpcs.asked(call(1, 10), 0, now);
-        rpcs.asked(call(2, 20), 0, now);
-        rpcs.asked(call(3, 10), 0, now);
-        rpcs.asked(call(4, 10), 1, now);
+        rpcs.asked(call(1, 10), on(0), now);
+        rpcs.asked(call(2, 20), on(0), now);
+        rpcs.asked(call(3, 10), on(0), now);
+        rpcs.asked(call(4, 10), on(1), now);
         // A second ask of request 1 keeps its first deadline; a frame of it sets none.
-        rpcs.asked(call(1, 5), 0, now);
+        rpcs.asked(call(1, 5), on(0), now);
         rpcs.sent(call(1, 5), now);
         rpcs.answered(RpcId(3));
         // While epoch 0 lasts, nothing falls due.
         assert_eq!(rpcs.next_deadline(), None);
         assert!(rpcs.take_due(now + ms(60)).is_empty());
-        rpcs.ended(0);
+        rpcs.ended(on(0));
         assert_eq!(rpcs.next_deadline(), Some(now + ms(10)));
         assert_eq!(rpcs.take_due(now + ms(25)), [RpcId(1), RpcId(2)]);
         // Epoch 1's still waits, and one whose deadline the clock cannot hold never falls due.
@@ -746,9 +753,12 @@ mod tests {
             id: RpcId(5),
             timeout: Duration::MAX,
         };
-        rpcs.asked(never, 1, now);
+        rpcs.asked(never, on(1), now);
         assert!(rpcs.take_due(now + ms(60)).is_empty());
-        rpcs.ended(1);
+        // Epoch 1 of another connection is another epoch (FBC-tnsf).
+        rpcs.ended(ConnKey { conn: 2, epoch: 1 });
+        assert!(rpcs.take_due(now + ms(60)).is_empty());
+        rpcs.ended(on(1));
         assert_eq!(rpcs.take_due(now + ms(60)), [RpcId(4)]);
         assert_eq!(rpcs.next_deadline(), None);
     }
@@ -1013,7 +1023,7 @@ mod tests {
         assert_eq!(rpcs.take_due(now + ms(25)), [RpcId(5)]);
         assert_eq!(table.held(), 0);
         // An HTTP query holds one, and the end gives back every place still held.
-        rpcs.asked(call(6, 10), 0, now);
+        rpcs.asked(call(6, 10), on(0), now);
         assert!(rpcs.admit(RpcId(7), safety));
         assert_eq!(table.held(), 2);
         rpcs.clear();

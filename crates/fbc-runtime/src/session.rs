@@ -891,7 +891,7 @@ impl Control for Desired<'_> {
         self.desired.changed().await.is_ok()
     }
 
-    fn apply(&mut self) {
+    async fn apply(&mut self) {
         let subs = self.desired.borrow_and_update().clone();
         let _ = self.rec.set_desired(subs);
     }

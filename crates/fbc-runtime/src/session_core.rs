@@ -374,11 +374,11 @@ pub(crate) trait EpochInputs {
     fn sent_rpc(&mut self, call: RpcCall) {
         let _ = call;
     }
-    /// An HTTP request of order-entry request `call` for the codec of `epoch` is about to start,
-    /// so the request's deadline runs from now, standing once that epoch has ended (FBC-m8vm,
-    /// decision 0081). Nothing, by default: no market-data request awaits an answer.
-    fn asked_rpc(&mut self, call: RpcCall, epoch: u32) {
-        let _ = (call, epoch);
+    /// An HTTP request of order-entry request `call` for the codec of epoch `key` is about to
+    /// start, so the request's deadline runs from now, standing once that epoch has ended
+    /// (FBC-m8vm, decision 0081). Nothing, by default: no market-data request awaits an answer.
+    fn asked_rpc(&mut self, call: RpcCall, key: ConnKey) {
+        let _ = (call, key);
     }
     /// Whether an input handed on while a write waited ended the session, so the core executes
     /// none of the rest of the batch. Never, by default.
@@ -392,7 +392,7 @@ pub(crate) trait Control {
     /// Waits until the control changes: true, or false once it dropped.
     async fn changed(&mut self) -> bool;
     /// Takes the control's latest state in.
-    fn apply(&mut self);
+    async fn apply(&mut self);
 }
 
 /// What a session counted in its core.
@@ -438,6 +438,14 @@ pub(crate) struct Core {
     /// whose inputs carry the acks and fills 0006 reserves room for and cannot be told apart
     /// before they are decoded, and whose epochs replay places them in (decision 0078).
     pub(crate) inbound: TrafficClass,
+    /// The streams of the other connections the session drives beside this one (an order-entry
+    /// session's other planned endpoints, FBC-tnsf): a frame or reconnect naming one of them is
+    /// not refused but handed back in [`Core::spilled`], with the input it is attributed to, for
+    /// the session to execute on that stream's own connection. None on a market-data session.
+    pub(crate) siblings: Vec<StreamId>,
+    /// The frames and reconnects for a sibling stream the core took, in order, waiting for the
+    /// session to execute them on their own connection.
+    pub(crate) spilled: VecDeque<(Effect, Option<Stamp>)>,
 }
 
 /// An HTTP request in flight.
@@ -495,6 +503,8 @@ impl Core {
             rates: config.rates,
             journal: None,
             inbound: TrafficClass::Normal,
+            siblings: Vec::new(),
+            spilled: VecDeque::new(),
         }
     }
 
@@ -591,7 +601,7 @@ impl Core {
                     }
                     Idle::Http => {}
                     Idle::Control(false) => return Ok(None),
-                    Idle::Control(true) => ctl.apply(),
+                    Idle::Control(true) => ctl.apply().await,
                 }
             }
             self.pacer.attempted(Instant::now());
@@ -612,7 +622,7 @@ impl Core {
                             if !r {
                                 return Ok(None);
                             }
-                            ctl.apply();
+                            ctl.apply().await;
                         }
                         opened = &mut connect => break opened,
                         _ = sleep_or_never(deadline) => break None,
@@ -888,6 +898,12 @@ impl Core {
                     open = false;
                 }
                 (ask @ Effect::Http { .. }, _) => self.ask(inputs, epoch, ask, charged),
+                // Another connection's, which the session executes there (FBC-tnsf).
+                (other @ (Effect::Send { .. } | Effect::Reconnect { .. }), _)
+                    if stream_of(&other).is_some_and(|s| self.siblings.contains(&s)) =>
+                {
+                    self.spilled.push_back((other, origin));
+                }
                 (Effect::Send { .. } | Effect::Reconnect { .. }, _) => {
                     self.counters.refused_effects += 1;
                 }
@@ -983,6 +999,10 @@ impl Core {
         // The timeout runs from the ask, so journaling the request counts against it (Codex
         // r4178197281).
         let now = Instant::now();
+        let key = ConnKey {
+            epoch,
+            ..self.current()
+        };
         if let Effect::Http {
             rpc: Some(id),
             timeout,
@@ -993,12 +1013,8 @@ impl Core {
                 id: *id,
                 timeout: *timeout,
             };
-            inputs.asked_rpc(call, epoch);
+            inputs.asked_rpc(call, key);
         }
-        let key = ConnKey {
-            epoch,
-            ..self.current()
-        };
         if let Effect::Http {
             tag,
             req,
@@ -1176,6 +1192,14 @@ fn inbound_spans(redact: Option<Redact<'_>>, input: Inbound<'_>) -> (InboundSpan
         InboundSpans::response(marks.collect(), body),
         named.is_some(),
     )
+}
+
+/// The stream a frame or a reconnect names; `None` for a timer or an HTTP request.
+pub(crate) fn stream_of(effect: &Effect) -> Option<StreamId> {
+    match effect {
+        Effect::Send { stream, .. } | Effect::Reconnect { stream, .. } => Some(*stream),
+        Effect::Timer { .. } | Effect::Http { .. } => None,
+    }
 }
 
 /// Whether `effect` asks a socket endpoint of stream `own` to reconnect, which ends its epoch.
@@ -1530,6 +1554,22 @@ mod tests {
 
     /// FBC-drf: a control message is journaled with its payload, or its close code and reason;
     /// a data frame is none, nor is a raw frame, which the WebSocket layer never reads.
+    /// FBC-tnsf: only a frame or a reconnect names a stream another connection may take.
+    #[test]
+    fn a_frame_or_reconnect_names_its_stream_and_a_timer_or_request_none() {
+        let stream = StreamId(2);
+        let reconnect = Effect::Reconnect {
+            stream,
+            reason: "test",
+        };
+        let timer = Effect::Timer {
+            tag: TimerTag(1),
+            after: Duration::ZERO,
+        };
+        assert_eq!(stream_of(&reconnect), Some(stream));
+        assert_eq!(stream_of(&timer), None);
+    }
+
     #[test]
     fn a_control_message_is_recorded_with_what_it_carries() {
         use tokio_tungstenite::tungstenite::protocol::CloseFrame;
@@ -1616,7 +1656,7 @@ mod tests {
         };
         Nothing(false).sent_rpc(call);
         // Nor is one asked as an HTTP request.
-        Nothing(false).asked_rpc(call, 0);
+        Nothing(false).asked_rpc(call, ConnKey { conn: 1, epoch: 0 });
         let fired = core.fire(&mut None::<WebSocket>, &mut Nothing(false)).await;
         assert_eq!((fired, core.next_deadline()), (Ok(true), None));
         let mut fx = Effects::new();
