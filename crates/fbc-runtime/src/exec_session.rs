@@ -594,8 +594,8 @@ pub struct ExecSession<H: ExecHandler> {
     ran: bool,
     /// Which way an epoch's next turn polls first, of [`WAKES`] (one more with legs).
     turn: u8,
-    /// The connection number of the order connection, whose events alone move its readiness
-    /// (decisions 0058, 0115).
+    /// The connection number of the order connection, whose events alone authenticate its
+    /// epochs (decisions 0058, 0115).
     conn: u16,
     /// The endpoints planned after the first (FBC-tnsf, decision 0115).
     legs: Legs,
