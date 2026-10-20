@@ -199,10 +199,19 @@ impl QfexMd {
             });
             return Ok(());
         }
-        let request = err
-            .get("incoming_message")
-            .and_then(Value::as_object)
-            .ok_or(DecodeError::Malformed("incoming_message"))?;
+        let request = match err.get("incoming_message") {
+            Some(Value::Object(request)) => request,
+            None | Some(Value::Null) => {
+                // Without an echo, the rejected feed is unknown. A decode error alone
+                // only increments a counter, leaving a settled feed silent on this epoch.
+                fx.push(Effect::Reconnect {
+                    stream: self.stream,
+                    reason: "unattributed QFEX error",
+                });
+                return Ok(());
+            }
+            _ => return Err(DecodeError::Malformed("incoming_message")),
+        };
         if string(request, "type")? != "subscribe" {
             return Err(DecodeError::Malformed("incoming_message"));
         }

@@ -362,6 +362,39 @@ fn transient_subscription_errors_reconnect_without_permanently_refusing_feed() {
 }
 
 #[test]
+fn permanent_subscription_error_without_echo_reconnects_instead_of_silencing_feed() {
+    for incoming in [None, Some(Value::Null)] {
+        let mut codec = subscribed();
+        let mut error = json!({"err": {"error_code": "InvalidParameter"}});
+        if let Some(incoming) = incoming {
+            error["err"]["incoming_message"] = incoming;
+        }
+        let mut sink = Sink::default();
+        let mut fx = Effects::new();
+        let caps = Qfex.caps(&cfg()).unwrap();
+        let result = dispatch_market_data(&caps, |scope| {
+            codec.on_frame(
+                RawFrame::Text(&error.to_string()),
+                scope,
+                &specs(),
+                &mut sink,
+                &mut fx,
+            )
+        });
+        assert_eq!(result, Ok(()), "{error}");
+        assert!(sink.0.is_empty(), "{error}");
+        assert_eq!(
+            fx.as_slice(),
+            &[Effect::Reconnect {
+                stream: fbc_core::StreamId(0),
+                reason: "unattributed QFEX error",
+            }],
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn factory_refuses_bad_endpoints_and_unavailable_feeds_before_planning() {
     assert_eq!(Qfex.config_schema()[0].key, KEY_MDS_URL);
     assert_eq!(
@@ -533,9 +566,6 @@ fn malformed_subscription_errors_never_change_feed_state() {
     let base = json!({"err": {"error_code": "InvalidParameter",
         "incoming_message": {"type": "subscribe", "channels": ["trade"], "symbols": ["AAPL-USD"]}}});
     let mut cases = vec![json!({"err": null}), json!({"err": {}})];
-    let mut bad = base.clone();
-    bad["err"]["incoming_message"] = Value::Null;
-    cases.push(bad);
     let mut bad = base.clone();
     bad["err"]["incoming_message"]["type"] = json!("unsubscribe");
     cases.push(bad);
