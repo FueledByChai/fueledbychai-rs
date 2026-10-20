@@ -61,6 +61,7 @@ impl QfexMd {
     fn decode_item(
         &mut self,
         value: &Value,
+        scope: &DecodeScope<'_>,
         specs: &SpecTable,
         sink: &mut dyn MdSink,
         fx: &mut Effects,
@@ -86,11 +87,11 @@ impl QfexMd {
                 if nested.contains_key("contents") {
                     return Err(DecodeError::Malformed("contents"));
                 }
-                self.decode(&nested, specs, sink)?;
+                self.decode(&nested, scope, specs, sink)?;
             }
             Ok(())
         } else {
-            self.decode(data, specs, sink)
+            self.decode(data, scope, specs, sink)
         }
     }
 
@@ -120,6 +121,7 @@ impl QfexMd {
     fn decode(
         &mut self,
         data: &Map<String, Value>,
+        scope: &DecodeScope<'_>,
         specs: &SpecTable,
         sink: &mut dyn MdSink,
     ) -> Result<(), DecodeError> {
@@ -205,12 +207,14 @@ impl QfexMd {
                     "BUY" | "SELL" => (),
                     _ => return Err(DecodeError::Malformed("side")),
                 }
-                // The documented trade_id is a UUID; the normalized event accepts u64 only.
+                let id = scope
+                    .trade_id_uuid(string(data, "trade_id")?)
+                    .map_err(|_| DecodeError::Malformed("trade_id"))?;
                 sink.push(
                     meta,
                     MdEvent::Trade {
                         inst: spec.id,
-                        id: None,
+                        id: Some(id),
                         aggressor: Aggressor::Unknown,
                         px,
                         qty,
@@ -353,7 +357,7 @@ impl MdCodec for QfexMd {
     fn on_frame(
         &mut self,
         f: RawFrame<'_>,
-        _scope: &DecodeScope<'_>,
+        scope: &DecodeScope<'_>,
         specs: &SpecTable,
         sink: &mut dyn MdSink,
         fx: &mut Effects,
@@ -367,17 +371,17 @@ impl MdCodec for QfexMd {
             .as_object()
             .is_some_and(|data| !data.contains_key("contents"))
         {
-            return self.decode_item(&value, specs, sink, fx);
+            return self.decode_item(&value, scope, specs, sink, fx);
         }
         // A malformed member invalidates the whole frame, including earlier members.
         let mut staged = self.clone();
         let mut events = BufferedEvents::default();
         let mut effects = Effects::new();
         let result = match &value {
-            Value::Array(items) => items
-                .iter()
-                .try_for_each(|item| staged.decode_item(item, specs, &mut events, &mut effects)),
-            _ => staged.decode_item(&value, specs, &mut events, &mut effects),
+            Value::Array(items) => items.iter().try_for_each(|item| {
+                staged.decode_item(item, scope, specs, &mut events, &mut effects)
+            }),
+            _ => staged.decode_item(&value, scope, specs, &mut events, &mut effects),
         };
         result?;
         for effect in effects.take() {

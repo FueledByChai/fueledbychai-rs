@@ -1,0 +1,15 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+ --> tests/ui_ids/trade_id_literal.rs:4:13
+  |
+4 |     let _ = TradeId(42);
+  |             ^^^^^^^
+  |
+note: constructor is not visible here due to private fields
+ --> src/ids.rs
+  |
+  | pub struct TradeId(TradeIdRepr);
+  |                    ^^^^^^^^^^^ private field
+help: you might have meant to use the `from_numeric` associated function
+  |
+4 |     let _ = TradeId::from_numeric(42);
+  |                    ++++++++++++++

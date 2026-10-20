@@ -1,5 +1,5 @@
-//! The decode scope: the only constructor of [`VenueOrderId`], [`FillId`], [`VenueSymbol`] and
-//! [`Fee`] (decision 0004, design §4.2, §4.3, §4.4).
+//! The decode scope: the only constructor of [`VenueOrderId`], [`FillId`], [`TradeId`],
+//! [`VenueSymbol`] and [`Fee`] (decisions 0004 and 0119, design §4.2, §4.3, §4.4).
 //!
 //! A [`DecodeScope`] cannot be built outside this crate. The core's [`dispatch`] (and, for
 //! market data, [`dispatch_market_data`]) makes one and lends it to a codec callback for the
@@ -16,7 +16,7 @@
 use crate::caps::VenueCaps;
 use crate::cid::decode_cid;
 use crate::fee::{Fee, FeeError};
-use crate::ids::{CidMatch, FillId, IdError, Namespace, VenueOrderId, VenueSymbol};
+use crate::ids::{CidMatch, FillId, IdError, Namespace, TradeId, VenueOrderId, VenueSymbol};
 use crate::units::AssetSym;
 
 /// What a codec callback decodes ids with. Lent by [`dispatch`] and [`dispatch_market_data`];
@@ -43,6 +43,16 @@ impl DecodeScope<'_> {
     /// [`MAX_VENUE_ID_LEN`](crate::MAX_VENUE_ID_LEN) bytes.
     pub fn fill_id(&self, wire: &str) -> Result<FillId, IdError> {
         FillId::from_wire(wire)
+    }
+
+    /// A numeric public trade id, kept distinct from UUID trade ids.
+    pub fn trade_id_numeric(&self, value: u64) -> TradeId {
+        TradeId::from_numeric(value)
+    }
+
+    /// A public trade UUID in canonical 8-4-4-4-12 wire form, case-insensitive.
+    pub fn trade_id_uuid(&self, wire: &str) -> Result<TradeId, IdError> {
+        TradeId::from_uuid_wire(wire)
     }
 
     /// An instrument's symbol as the venue spells it: refused when empty or longer than
