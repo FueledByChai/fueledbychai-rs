@@ -1835,7 +1835,7 @@ async fn on_open_frames_that_can_never_fit_together_end_the_session() {
 }
 
 #[test]
-fn a_session_needs_a_venue_that_takes_orders_on_one_connection_it_can_open() {
+fn a_session_needs_a_venue_that_takes_orders_on_connections_it_can_open() {
     let refused = |key: &str, value: &str| {
         let (mut config, _) = setup(ExecToy::leak(), "ws://127.0.0.1:1/exec", quick());
         config.cfg.insert(key, value);
@@ -1851,7 +1851,10 @@ fn a_session_needs_a_venue_that_takes_orders_on_one_connection_it_can_open() {
     );
     assert_eq!(refused(CAPS, "md-only"), ExecSessionError::NoOrderEntry);
     assert_eq!(refused(ENDPOINTS, "0"), ExecSessionError::Endpoints(0));
-    assert_eq!(refused(ENDPOINTS, "2"), ExecSessionError::Endpoints(2));
+    // Several are driven together (FBC-tnsf, tests/exec_endpoints.rs).
+    let (mut config, _) = setup(ExecToy::leak(), "ws://127.0.0.1:1/exec", quick());
+    config.cfg.insert(ENDPOINTS, "2");
+    assert!(ExecSession::new(config, |_| {}).is_ok());
     let err = refused(URL, "http://127.0.0.1:1/");
     assert!(
         matches!(&err, ExecSessionError::Session(SessionError::Url(e)) if e.step() == Step::Url)
