@@ -3538,6 +3538,29 @@ async fn a_cap_too_large_for_a_lot_count_is_taken_as_the_largest_lot_count_not_z
 }
 
 #[tokio::test]
+async fn a_quote_size_too_large_for_a_lot_count_is_refused_before_the_session_connects() {
+    // The caps have no ceiling, but the quote is a size: one past a lot count is refused.
+    let venue = mainnet_venue(vec![b0()]);
+    let stub = StubServer::start(WsScript::new(vec![]), routes(&venue, login_ok()))
+        .await
+        .unwrap();
+    let mut opts = mainnet_options(&stub, 1);
+    opts.resting_cap_usd = Decimal::MAX;
+    opts.order_usd = Decimal::MAX;
+    let (ran, printed) = run_venue_until(
+        &fbc_venue_paradex::ParadexFactory,
+        &opts,
+        std::future::pending(),
+    )
+    .await;
+    let refused = ran
+        .err()
+        .unwrap_or_else(|| panic!("not refused:\n{printed}"));
+    assert!(refused.contains("does not fit a lot count"), "{refused}");
+    assert!(stub.connections().is_empty());
+}
+
+#[tokio::test]
 async fn mainnet_mode_checks_the_chain_id_before_anything_connects_and_at_start() {
     // PARADEX_CHAIN_ID, when set, must be mainnet's: by name or as its felt.
     let venue = mainnet_venue(vec![b0()]);

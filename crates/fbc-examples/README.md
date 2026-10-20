@@ -57,8 +57,8 @@ Read the market's `price_tick_size`, `order_size_increment` and `min_notional` f
 names `PRIVATE_SN_PARACLEAR_MAINNET`, reads the mark price from `GET /markets/summary`, and refuses
 an order whose size at the mark is below the minimum notional (Paradex judges it there). The caps
 are yours: `--resting-cap-usd` and `--inventory-cap-usd` are required, with no defaults and no
-ceiling (owner 2026-10-19, FBC-thks), and each must be positive; the run prints both (the `CAPS`
-line) before anything connects. The resting cap is judged at the order's own price (the notional
+ceiling (owner 2026-10-19, FBC-thks, decision 0113), and each must be positive; the run prints
+both (the `CAPS` line) before anything connects. The resting cap is judged at the order's own price (the notional
 a fill costs), not at the mark. `--help` lists every flag and output line.
 
 **A cancel not ours** (FBC-aoh5). Paradex does not say who sent a user cancel. When the order
@@ -78,9 +78,8 @@ from a model.
 Refused before anything connects unless both `--mainnet` and `--sole-trader` are given, the URLs
 are exactly mainnet's, `PARADEX_CHAIN_ID` (when set) is mainnet's, both caps are given and positive
 (`--resting-cap-usd` and `--inventory-cap-usd` are yours: required, no defaults, no ceiling,
-owner 2026-10-19, FBC-thks; the `SUPERVISED` line prints them before anything connects), both
-`--bid-bps` and `--ask-bps` are at
-least 20, `--duration` is at most 3600 s (one hour; `MAINNET_DURATION_MAX` in
+owner 2026-10-19, FBC-thks, decision 0113; the `SUPERVISED` line prints them before anything
+connects), both `--bid-bps` and `--ask-bps` are at least 20, `--duration` is at most 3600 s (one hour; `MAINNET_DURATION_MAX` in
 `examples/testnet_quote/args.rs`), `--interval-ms` is at most 20000 (two thirds of the 30 s
 window for a cancel not ours, `mainnet_interval_max`: a conservative bound kept beside the
 requote rule below, which Stops a co-tenant cancelling every requote however long a cycle
