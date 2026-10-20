@@ -486,6 +486,8 @@ async fn script_ws<S: AsyncRead + AsyncWrite + Unpin>(
     let config = WebSocketConfig::default()
         .max_message_size(None)
         .max_frame_size(None);
+    // tungstenite's callback type fixes the error variant's size.
+    #[allow(clippy::result_large_err)]
     let record = move |request: &Request, response: Response| {
         let headers = request.headers().iter().map(|(name, value)| {
             let value = String::from_utf8_lossy(value.as_bytes()).into_owned();

@@ -111,6 +111,7 @@
 //! socket writes (the consumer's attempt deadline and write-stall window), no call here has a
 //! deadline of its own; the caller bounds one with its own timer.
 
+mod auth;
 mod books;
 mod bounds;
 mod connector;

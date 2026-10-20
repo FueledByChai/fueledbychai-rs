@@ -9,6 +9,7 @@
 
 use std::future::{Future, poll_fn};
 use std::pin::{Pin, pin};
+use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use fbc_core::{
@@ -19,6 +20,7 @@ use futures_util::{FutureExt, StreamExt};
 use tokio::time::Instant;
 
 use super::{ExecHandler, ExecSessionError, Feed, Sink, context, together};
+use crate::auth::HandshakeHeaders;
 use crate::in_process::Link;
 use crate::journal::Journal;
 use crate::session_core::{
@@ -49,6 +51,9 @@ pub(super) struct Leg {
     pub(super) core: Core,
     stream: StreamId,
     url: String,
+    /// The credential headers every attempt's upgrade carries (decision 0116), shared with the
+    /// attempt under way.
+    headers: Rc<HandshakeHeaders>,
     state: State,
     /// The open connection, while the leg is [`State::Open`].
     ws: Option<Link>,
@@ -94,11 +99,12 @@ pub(super) struct Primary<'a> {
 }
 
 impl Leg {
-    pub(super) fn new(core: Core, stream: StreamId, url: String) -> Leg {
+    pub(super) fn new(core: Core, stream: StreamId, url: String, headers: HandshakeHeaders) -> Leg {
         Leg {
             core,
             stream,
             url,
+            headers: Rc::new(headers),
             state: State::Waiting(None),
             ws: None,
             turn: 0,
@@ -161,7 +167,11 @@ impl Leg {
         self.core.counters.attempts += 1;
         let deadline = now.checked_add(self.core.pacer.deadline());
         let (connector, url) = (self.core.connector.clone(), self.url.clone());
-        let dial = async move { connector.websocket(&url).await.ok().map(Link::Socket) };
+        let headers = Rc::clone(&self.headers);
+        let dial = async move {
+            let ws = connector.websocket_with(&url, &headers).await;
+            ws.ok().map(Link::Socket)
+        };
         self.state = State::Dialing(Box::pin(dial), deadline);
     }
 
