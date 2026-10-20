@@ -2105,7 +2105,7 @@ async fn a_wall_clock_sources_nonces_are_journaled_and_each_encode_replays_byte_
     // A restart: a source resumed from the journal's last nonce, its clock a second behind it,
     // issues only nonces above every one journaled.
     let records: Vec<Record> = run.entries.iter().map(|e| e.record.clone()).collect();
-    let last = fbc_runtime::last_nonce(&records, SOURCE).unwrap();
+    let last = fbc_runtime::last_nonce(&records, SOURCE).unwrap().unwrap();
     assert_eq!(last, WALL_US + 4);
     let behind = StubWall::at_us(WALL_US - 1_000_000);
     let mut resumed = fbc_runtime::WallClockNonces::resuming(behind, NONCE_WINDOW, last).unwrap();

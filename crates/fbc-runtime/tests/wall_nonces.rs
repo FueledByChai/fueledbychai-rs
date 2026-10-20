@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fbc_core::{NonceBlock, NonceRefused, NonceSource, WallNs};
-use fbc_journal::{NonceSourceId, Record};
-use fbc_runtime::{WallClock, WallClockNonces, ZeroWindow, last_nonce};
+use fbc_journal::{Marker, NonceSourceId, Record};
+use fbc_runtime::{JournalGap, WallClock, WallClockNonces, ZeroWindow, last_nonce};
 
 /// A wall time, in microseconds since the Unix epoch, 2026-10-14T17:46:40Z.
 const T_US: u64 = 1_792_000_000_000_000;
@@ -134,10 +134,10 @@ fn a_source_resumed_from_a_journals_last_nonce_never_reissues_one() {
             value: T_US + 41,
         },
     ];
-    let last = last_nonce(&records, mine).unwrap();
+    let last = last_nonce(&records, mine).unwrap().unwrap();
     assert_eq!(last, T_US + 41);
-    assert_eq!(last_nonce(&records, NonceSourceId(9)), None);
-    assert_eq!(last_nonce(&[], mine), None);
+    assert_eq!(last_nonce(&records, NonceSourceId(9)), Ok(None));
+    assert_eq!(last_nonce(&[], mine), Ok(None));
 
     // The clock reads before the journal's last nonce, within the window.
     let clock = Stub::at_us(T_US + 3);
@@ -298,4 +298,52 @@ fn the_system_wall_clock_reads_the_realtime_clock() {
     let mut nonces = WallClockNonces::new(fbc_runtime::SystemWallClock, WINDOW).unwrap();
     let nonce = ok(nonces.try_reserve(1))[0];
     assert!(nonce > written_us, "{nonce}");
+}
+
+/// Codex P2 r4321805846 on PR #187: a journal that dropped records (a `Degraded` marker, even
+/// one later `Recovered`) may have lost the last nonce sent, so it names no last nonce to resume
+/// after: `last_nonce` refuses it, naming the gap, rather than return the largest that survived.
+/// A consumer then resumes after a bound of its own: its clock plus the window is past every
+/// nonce the source could have issued, and the resumed source refuses until the clock has
+/// moved a window on.
+#[test]
+fn a_journal_that_dropped_records_names_no_last_nonce() {
+    let mine = NonceSourceId(7);
+    let nonce = |value| Record::Nonce {
+        source: mine,
+        value,
+    };
+    let gap = Marker::Degraded {
+        from_seq: 12,
+        dropped: 3,
+    };
+    let records = [
+        nonce(T_US + 40),
+        Record::Marker(gap),
+        Record::Marker(Marker::Recovered),
+        nonce(T_US + 41),
+    ];
+    let refused = last_nonce(&records, mine);
+    assert_eq!(
+        refused,
+        Err(JournalGap {
+            from_seq: 12,
+            dropped: 3
+        })
+    );
+    assert_eq!(
+        refused.unwrap_err().to_string(),
+        "the journal dropped 3 records from sequence 12, so its last nonce may be lost"
+    );
+    // A gap refuses whatever source is asked for.
+    assert!(last_nonce(&records, NonceSourceId(9)).is_err());
+
+    // Resuming after the clock plus the window: refused until the clock has moved past it.
+    let window_us = u64::try_from(WINDOW.as_micros()).unwrap();
+    let clock = Stub::at_us(T_US);
+    let bound = T_US + window_us;
+    let mut resumed = WallClockNonces::resuming(clock.clone(), WINDOW, bound).unwrap();
+    assert!(resumed.try_reserve(1).is_err());
+    clock.set_us(T_US + 1);
+    assert_eq!(ok(resumed.try_reserve(1)), [bound + 1]);
 }
