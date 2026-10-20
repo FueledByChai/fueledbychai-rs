@@ -233,7 +233,7 @@ rather than guess.
     `ExecSessionError::NonceRefused`, nothing reserved or written;
     `WallClockNonces` is the production nonce source for a venue whose nonce is a wall-clock
     timestamp (Hibachi): `max(clock, last + 1)` microseconds over an injected `WallClock`,
-    resumed after a journal's `last_nonce`, refusing a block further ahead of its clock than
+    resumed after a journal's `last_nonce` (refused, `JournalGap`, for records holding a gap), refusing a block further ahead of its clock than
     the caller's window, which has no default (FBC-3bq4, 0114, `tests/wall_nonces.rs`);
     `ShardHost` is the shard host (0100): one loop driving a shard's session runs as its
     `Member`s on one task, sharing one `IngestClock`, that drains every input they have ready

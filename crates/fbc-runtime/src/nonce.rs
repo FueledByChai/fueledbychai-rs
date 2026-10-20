@@ -21,7 +21,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fbc_core::{NonceBlock, NonceRefused, NonceSource, WallNs};
-use fbc_journal::{NonceSourceId, Record};
+use fbc_journal::{Marker, NonceSourceId, Record};
 
 /// A wall clock: nanoseconds since the Unix epoch.
 pub trait WallClock: Send {
@@ -143,14 +143,53 @@ impl<C: WallClock> NonceSource for WallClockNonces<C> {
 
 /// The last nonce `records`, an earlier journal's records in journal order, hold for source
 /// `source`: the largest, so a source resumed after it ([`WallClockNonces::resuming`]) never
-/// reissues one. `None` when they hold none.
+/// reissues one. `Ok(None)` when they hold none.
+///
+/// A journal that dropped records (a `Degraded` marker, recovered or not) may have lost the
+/// last nonce sent, since a dropped Safety record's request is sent all the same (0006): it is
+/// refused, [`JournalGap`], naming the first gap, rather than answered with the largest that
+/// survived (Codex P2 r4321805846 on PR #187). A consumer then resumes after a bound of its
+/// own: its clock plus the window is past every nonce a source within the window issued, and
+/// the resumed source refuses until the clock has moved a window on. Records queued but never
+/// written when a process dies leave no marker; a source's nonces track its clock, so a restart
+/// whose clock has moved on past them is unaffected.
 pub fn last_nonce<'a>(
     records: impl IntoIterator<Item = &'a Record>,
     source: NonceSourceId,
-) -> Option<u64> {
-    let mine = |r: &Record| match r {
-        Record::Nonce { source: s, value } if *s == source => Some(*value),
-        _ => None,
-    };
-    records.into_iter().filter_map(mine).max()
+) -> Result<Option<u64>, JournalGap> {
+    let mut last = None;
+    for record in records {
+        match record {
+            Record::Nonce { source: s, value } if *s == source => {
+                last = last.max(Some(*value));
+            }
+            Record::Marker(Marker::Degraded { from_seq, dropped }) => {
+                let (from_seq, dropped) = (*from_seq, *dropped);
+                return Err(JournalGap { from_seq, dropped });
+            }
+            _ => {}
+        }
+    }
+    Ok(last)
 }
+
+/// A journal's records hold a gap, `dropped` records from sequence `from_seq`, so they name
+/// no last nonce to resume after ([`last_nonce`]).
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct JournalGap {
+    pub from_seq: u64,
+    pub dropped: u64,
+}
+
+impl std::fmt::Display for JournalGap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let JournalGap { from_seq, dropped } = self;
+        write!(
+            f,
+            "the journal dropped {dropped} records from sequence {from_seq}, so its last nonce \
+             may be lost"
+        )
+    }
+}
+
+impl std::error::Error for JournalGap {}

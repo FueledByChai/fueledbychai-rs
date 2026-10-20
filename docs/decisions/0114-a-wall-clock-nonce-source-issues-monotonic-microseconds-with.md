@@ -26,7 +26,10 @@ return a short block, which the session reports as a defect.
 2. **Restart.** A source is built with no history (`new`) or resumed after the last nonce an
    earlier journal holds for its source number (`resuming`, with `last_nonce` reading it from
    the records), so a restart never reissues a nonce, whatever its clock reads. Nothing else is
-   persisted: the session's journal is the record.
+   persisted: the session's journal is the record. Records holding a gap (a `Degraded`
+   marker) may have lost the last nonce sent, so `last_nonce` refuses them (`JournalGap`), and
+   the consumer resumes after a bound of its own, such as its clock plus the window, which the
+   source refuses until the clock has moved a window on.
 3. **The window is the caller's.** The source refuses, reserving nothing, a block whose last
    nonce would lie further ahead of its clock than the window its caller gives
    (`NonceRefused::OutsideWindow`), since the venue would refuse it; it also refuses a clock
