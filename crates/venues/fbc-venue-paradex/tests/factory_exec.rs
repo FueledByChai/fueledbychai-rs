@@ -316,6 +316,7 @@ fn plan_exec_gives_one_order_entry_endpoint_from_the_configuration_on_sbe_1_2() 
     let expected = vec![ExecEndpoint {
         stream: EXEC_STREAM,
         url: WireUrl::plain(format!("{WS}?sbeSchemaId=1&sbeSchemaVersion=2")),
+        handshake: Vec::new(),
     }];
     for mode in ["orders", "read-only"] {
         assert_eq!(ParadexFactory.plan_exec(&cfg(mode)), Ok(expected.clone()));

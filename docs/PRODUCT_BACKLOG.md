@@ -1,6 +1,6 @@
 # Product backlog
 
-The stories fueledbychai-rs builds first, in the venue order of decision 0116 (which
+The stories fueledbychai-rs builds first, in the venue order of decision 0117 (which
 supersedes 0016). Stories are intent with acceptance criteria; the tickets that build them live
 in Beads and name the story they serve (`story:BT-nnn`). The decisions they rest on are in
 `docs/decisions/`; "design §n" is a section of the approved architecture design (0001). The
@@ -226,7 +226,7 @@ private trading path is enabled.
 
 - `fbc-venue-qfex` plans the public MDS WebSocket, sends documented subscriptions and decodes
   BBO, the pulsed level2 window and public trades into exact normalized events. Its factory
-  declares `exec: None` and `Readiness::Record` (0116).
+  declares `exec: None` and `Readiness::Record` (0117).
 - Hand-built fixtures from QFEX's published schemas prove timestamps, exact price and size
   conversion, malformed-frame atomicity, and subscription validation.
 - Instrument discovery and private order entry are separate tickets; only private-path evidence

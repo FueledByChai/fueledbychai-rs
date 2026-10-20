@@ -1,4 +1,4 @@
-//! QFEX public market data. Order entry is deliberately unavailable (decision 0116).
+//! QFEX public market data. Order entry is deliberately unavailable (decision 0117).
 //!
 //! The public WebSocket and its `bbo`, `level2`, and `trade` messages are documented at
 //! <https://docs.qfex.com/websocket/main> and the corresponding MDS channel pages.

@@ -35,7 +35,7 @@ pub mod time;
 pub mod units;
 pub mod venue;
 
-pub use auth::{Secret, Secrets};
+pub use auth::{HandshakeHeader, Secret, Secrets};
 pub use caps::{
     AckModel, AmendAck, AmendCaps, AmendQty, Batch, BookCaps, Cadence, CancelBatch,
     CancelOnDisconnect, CapTag, ConnTopology, Continuity, Encoding, ExecCaps, Feature, FeedSource,

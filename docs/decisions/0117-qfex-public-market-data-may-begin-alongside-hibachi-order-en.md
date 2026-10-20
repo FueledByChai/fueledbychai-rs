@@ -1,4 +1,4 @@
-# 0116 — QFEX public market data may begin alongside Hibachi; order entry remains separately gated
+# 0117 — QFEX public market data may begin alongside Hibachi; order entry remains separately gated
 
 Status: accepted, supersedes 0016
 Date: 2026-10-20

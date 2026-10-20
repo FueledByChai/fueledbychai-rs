@@ -187,6 +187,7 @@ impl VenueFactory for ExecToy {
         let endpoint = |i: u16| ExecEndpoint {
             stream: StreamId(EXEC_STREAM.0 + i),
             url: WireUrl::plain(url),
+            handshake: Vec::new(),
         };
         Ok((0..n).map(endpoint).collect())
     }

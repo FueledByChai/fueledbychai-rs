@@ -250,6 +250,7 @@ mod legs;
 
 use legs::{Leg, LegWake, Legs, Primary};
 
+use crate::auth::HandshakeHeaders;
 use crate::bounds::{InFlight, ReservedBound};
 use crate::connector::Connector;
 use crate::epoch::{Admit, EpochError, Epochs, Input};
@@ -432,6 +433,19 @@ pub enum ExecSessionError {
     /// The frames the codec's cancel-on-disconnect arm asks for weigh more than the venue's
     /// buckets ever admit, so no epoch could take places (PR #90 Reviewer B B3).
     ArmNeverFits,
+    /// The venue named a credential header on the planned endpoint of `stream` that no opening
+    /// handshake can carry: not a header name, one the handshake sets itself (`Host`,
+    /// `Connection`, `Upgrade`, a `Sec-WebSocket-` header, or one that frames a body), or one
+    /// it names twice on that endpoint (decision 0116). A venue defect: nothing is opened.
+    HandshakeHeader {
+        stream: StreamId,
+        name: &'static str,
+    },
+    /// The planned endpoint of `stream` names a credential header but its URL is plain `ws://`
+    /// to a host other than this machine's loopback (`127.0.0.0/8`, `::1`, `localhost`), or
+    /// plain `ws://` through a SOCKS5 proxy, so the key would cross the network in cleartext
+    /// (decision 0116). Nothing is opened; the URL is not shown.
+    CleartextHandshake { stream: StreamId },
     /// The session has run: it runs once, and a new one is built to run again.
     Ended,
 }
@@ -459,6 +473,18 @@ impl fmt::Display for ExecSessionError {
             ExecSessionError::NonceRefused(why) => {
                 write!(f, "the nonce source refused a reservation: {why}")
             }
+            ExecSessionError::HandshakeHeader { stream, name } => write!(
+                f,
+                "the venue named header {name} for the opening handshake on stream {}, which \
+                 the handshake cannot carry",
+                stream.0
+            ),
+            ExecSessionError::CleartextHandshake { stream } => write!(
+                f,
+                "the planned endpoint on stream {} carries a credential header over plain ws:// \
+                 off this machine; give a wss:// URL",
+                stream.0
+            ),
             ExecSessionError::Ended => f.write_str("the session has run; it runs once"),
             ExecSessionError::OpenNeverFits => f.write_str(
                 "the frames on_open asks for weigh more together than the buckets ever admit",
@@ -556,6 +582,8 @@ pub struct ExecSession<H: ExecHandler> {
     codec: Box<dyn ExecCodec>,
     stream: StreamId,
     url: String,
+    /// The order connection's credential headers (decision 0116).
+    headers: HandshakeHeaders,
     /// The in-process stream the session opens in place of `url` (decision 0104).
     in_process: Option<InProcessStream>,
     caps: VenueCaps,
@@ -637,6 +665,8 @@ enum Entry {
 /// has one, which opens at once, or the WebSocket at its URL.
 struct ExecDial<'a> {
     url: &'a str,
+    /// The credential headers the upgrade carries (decision 0116).
+    headers: &'a HandshakeHeaders,
     in_process: Option<&'a InProcessStream>,
     clock: &'a IngestClock,
 }
@@ -647,7 +677,10 @@ impl Dial for ExecDial<'_> {
     async fn dial(&mut self, connector: &Connector) -> Option<Link> {
         match self.in_process {
             Some(stream) => Some(Link::open(stream, self.clock)),
-            None => connector.websocket(self.url).await.ok().map(Link::Socket),
+            None => {
+                let ws = connector.websocket_with(self.url, self.headers).await;
+                ws.ok().map(Link::Socket)
+            }
         }
     }
 }
@@ -737,6 +770,7 @@ impl<H: ExecHandler> ExecSession<H> {
             codec,
             stream,
             url,
+            headers,
             in_process,
             caps,
             ns,
@@ -756,6 +790,7 @@ impl<H: ExecHandler> ExecSession<H> {
             codec,
             stream,
             url,
+            headers,
             in_process,
             caps,
             ns,
@@ -926,6 +961,7 @@ impl<H: ExecHandler> ExecSession<H> {
             };
             let mut dial = ExecDial {
                 url: &self.url,
+                headers: &self.headers,
                 in_process: self.in_process.as_ref(),
                 clock: &self.clock,
             };
@@ -1615,6 +1651,7 @@ struct Parts {
     codec: Box<dyn ExecCodec>,
     stream: StreamId,
     url: String,
+    headers: HandshakeHeaders,
     in_process: Option<InProcessStream>,
     caps: VenueCaps,
     ns: Namespace,
@@ -1660,16 +1697,25 @@ fn parts(config: ExecSessionConfig, entry: Entry) -> Result<Parts, ExecSessionEr
         return Err(ExecSessionError::SharedStream(streams[at]));
     }
     let siblings = |own: StreamId| streams.iter().copied().filter(|s| *s != own).collect();
-    let (codec, in_process) = match entry {
+    // Each endpoint's credential headers, read before the credentials go to the codec
+    // (decision 0116); an in-process stream opens no socket, so it has none.
+    let (codec, in_process, mut headers) = match entry {
         Entry::Socket => {
+            let mut headers = Vec::with_capacity(plan.len());
             for ep in &plan {
                 ws::check_url(ep.url.as_str()).map_err(SessionError::Url)?;
+                let proxy = config.connector.proxy();
+                headers.push(HandshakeHeaders::for_endpoint(ep, &config.creds, proxy)?);
             }
             let codec = venue.exec_codec(cfg, config.creds);
             let codec = codec.ok_or(ExecSessionError::NoOrderEntry)?;
-            (codec.map_err(ExecSessionError::Venue)?, None)
+            (codec.map_err(ExecSessionError::Venue)?, None, headers)
         }
-        Entry::InProcess(codec, stream) => (codec, Some(stream)),
+        Entry::InProcess(codec, stream) => (codec, Some(stream), Vec::new()),
+    };
+    let mut headers_of = |i: usize| {
+        let slot = headers.get_mut(i);
+        slot.map_or_else(HandshakeHeaders::none, std::mem::take)
     };
     let (stop_tx, stop) = watch::channel(());
     let clock = config.clock.clone();
@@ -1699,7 +1745,8 @@ fn parts(config: ExecSessionConfig, entry: Entry) -> Result<Parts, ExecSessionEr
     let mut legs = Vec::new();
     for (i, ep) in plan.iter().enumerate().skip(1) {
         let core = core_of(i, ep.stream)?;
-        legs.push(Leg::new(core, ep.stream, ep.url.as_str().to_owned()));
+        let url = ep.url.as_str().to_owned();
+        legs.push(Leg::new(core, ep.stream, url, headers_of(i)));
     }
     let rec = Recorder {
         journal: None,
@@ -1710,6 +1757,7 @@ fn parts(config: ExecSessionConfig, entry: Entry) -> Result<Parts, ExecSessionEr
         codec,
         stream: endpoint.stream,
         url: endpoint.url.as_str().to_owned(),
+        headers: headers_of(0),
         in_process,
         caps,
         ns: config.ns,

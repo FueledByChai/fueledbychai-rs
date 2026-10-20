@@ -864,6 +864,7 @@ impl VenueFactory for ToyFactory {
         Ok(vec![ExecEndpoint {
             stream: EXEC_STREAM,
             url,
+            handshake: Vec::new(),
         }])
     }
 
@@ -1768,7 +1769,11 @@ fn the_factory_plans_and_builds_codecs_whose_only_output_is_effects() {
     let stream = EXEC_STREAM;
     assert_eq!(
         factory.plan_exec(&cfg),
-        Ok(vec![ExecEndpoint { stream, url }])
+        Ok(vec![ExecEndpoint {
+            stream,
+            url,
+            handshake: Vec::new()
+        }])
     );
     let mut exec = exec_codec();
     assert_eq!(exec.nonces_for(CtxCall::Open(EXEC_STREAM)), 0);

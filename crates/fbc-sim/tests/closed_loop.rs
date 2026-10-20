@@ -249,6 +249,7 @@ impl VenueFactory for Stood {
         Ok(vec![ExecEndpoint {
             stream: STREAM,
             url: WireUrl::plain(cfg.get(URL).unwrap()),
+            handshake: Vec::new(),
         }])
     }
 

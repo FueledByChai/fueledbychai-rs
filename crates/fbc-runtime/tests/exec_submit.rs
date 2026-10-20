@@ -143,6 +143,7 @@ impl VenueFactory for SubmitToy {
         Ok(vec![ExecEndpoint {
             stream: exec_toy::EXEC_STREAM,
             url: WireUrl::plain(url),
+            handshake: Vec::new(),
         }])
     }
 
