@@ -4,9 +4,9 @@ use fbc_core::{
     Aggressor, AssetSym, BookSide, Cadence, DecodeError, Effect, Effects, ExchNs, ExchTsKind, Feed,
     FeedHealth, FundingSpec, HttpFailure, HttpTag, Inbound, InboundSpans, InstrumentId,
     InstrumentKind, InstrumentSpec, Lots, Lvl, MdCodec, MdEvent, MdSink, MdTransport, MonoNs,
-    PriceGrid, RawFrame, Readiness, Secrets, SizeStep, SpecTable, Subscription, SymbolError, Ticks,
-    TimerTag, TradingStatus, UnderlyingId, VenueConfig, VenueError, VenueFactory, VenueId,
-    VenueMeta, WallNs, dispatch_market_data,
+    PriceGrid, RawFrame, Readiness, Secrets, SizeStep, SpecTable, Subscription, Ticks, TimerTag,
+    TradingStatus, UnderlyingId, VenueConfig, VenueError, VenueFactory, VenueId, VenueMeta, WallNs,
+    dispatch_market_data,
 };
 use fbc_venue_qfex::{BOOK_LEVEL2, KEY_MDS_URL, Qfex, TOUCH_BBO};
 use rust_decimal::Decimal;
@@ -470,11 +470,15 @@ fn factory_refuses_bad_endpoints_and_unavailable_feeds_before_planning() {
     assert_eq!(Qfex.config_schema()[0].key, KEY_MDS_URL);
     assert_eq!(
         Qfex.parse_fbc_common_symbol("AAPL/USD"),
-        Err(SymbolError::NoRule)
+        Ok(fbc_core::AssetKey {
+            base: AssetSym::new("AAPL").unwrap(),
+            quote: AssetSym::new("USD").unwrap(),
+            kind: InstrumentKind::Perpetual,
+        })
     );
     assert!(matches!(
         Qfex.discover(&cfg()),
-        Err(VenueError::NoDiscovery)
+        Err(VenueError::Config(fbc_core::ConfigError::Missing(_)))
     ));
     assert!(Qfex.caps(&VenueConfig::new()).is_err());
     for url in [

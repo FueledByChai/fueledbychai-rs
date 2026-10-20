@@ -371,12 +371,12 @@ fn an_account_frame_the_decoder_cannot_read_whole_is_refused_with_nothing_pushed
         assert!(bad(with_block(&v1, len)), "{len}");
     }
     // The settlement asset missing, empty, running past the frame, not UTF-8, or no asset
-    // symbol (longer than eight bytes).
+    // symbol (longer than sixteen bytes).
     assert!(bad(with_vars(&v1, &[])));
     assert!(bad(with_vars(&v1, &[b""])));
     assert!(bad(v1[..v1.len() - 1].to_vec()));
     assert!(bad(with_vars(&v1, &[b"USD\xff"])));
-    assert!(bad(with_vars(&v1, &[b"NOTANASSET"])));
+    assert!(bad(with_vars(&v1, &[b"ABCDEFGHIJKLMNOPQ"])));
 }
 
 /// `bytes` with its header's template id set to `template`.

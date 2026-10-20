@@ -1987,7 +1987,7 @@ fn a_market_missing_a_required_field_is_refused_by_name() {
         ("tick=0.5", "tick=x", "tick"),
         ("step=0.001", "step=0", "step"),
         ("min=1", "min=-1", "min"),
-        ("base=TOY", "base=TOOLONGBASE", "base"),
+        ("base=TOY", "base=ABCDEFGHIJKLMNOPQ", "base"),
         ("status=trading", "status=open", "status"),
         ("market|", "other|", "kind"),
     ] {

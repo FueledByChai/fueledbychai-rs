@@ -59,7 +59,7 @@ impl AssetKey {
 /// Why a Java-era ticker could not be read as an asset key.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum SymbolError {
-    /// Not in FBC's common form, `BASE/QUOTE`, with both assets of one to eight printable ASCII
+    /// Not in FBC's common form, `BASE/QUOTE`, with both assets of one to sixteen printable ASCII
     /// characters.
     NotCommonForm,
     /// In the common form, but the venue's FBC rule maps it to no instrument (Paradex reads only
@@ -378,7 +378,7 @@ mod tests {
             "BTC/",
             "/USDT",
             "A/B/C",
-            "BTC/TOOLONGQUOTE",
+            "BTC/TOOLONGQUOTEEXTRA",
             "B TC/USD",
             "",
         ] {
