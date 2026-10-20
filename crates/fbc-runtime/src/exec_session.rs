@@ -432,6 +432,14 @@ pub enum ExecSessionError {
     /// The frames the codec's cancel-on-disconnect arm asks for weigh more than the venue's
     /// buckets ever admit, so no epoch could take places (PR #90 Reviewer B B3).
     ArmNeverFits,
+    /// The venue named a credential header on the planned endpoint of `stream` that no opening
+    /// handshake can carry: not a header name, one the handshake sets itself (`Host`,
+    /// `Connection`, `Upgrade`, a `Sec-WebSocket-` header, or one that frames a body), or one
+    /// it names twice on that endpoint (decision 0116). A venue defect: nothing is opened.
+    HandshakeHeader {
+        stream: StreamId,
+        name: &'static str,
+    },
     /// The session has run: it runs once, and a new one is built to run again.
     Ended,
 }
@@ -459,6 +467,12 @@ impl fmt::Display for ExecSessionError {
             ExecSessionError::NonceRefused(why) => {
                 write!(f, "the nonce source refused a reservation: {why}")
             }
+            ExecSessionError::HandshakeHeader { stream, name } => write!(
+                f,
+                "the venue named header {name} for the opening handshake on stream {}, which \
+                 the handshake cannot carry",
+                stream.0
+            ),
             ExecSessionError::Ended => f.write_str("the session has run; it runs once"),
             ExecSessionError::OpenNeverFits => f.write_str(
                 "the frames on_open asks for weigh more together than the buckets ever admit",

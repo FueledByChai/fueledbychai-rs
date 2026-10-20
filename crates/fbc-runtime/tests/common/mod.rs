@@ -25,6 +25,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 
 use tls::TlsServer;
@@ -383,10 +384,28 @@ pub fn heard_binary(bytes: &[u8]) -> String {
 }
 
 /// One accepted connection: the text frames (and pings) the client sent, in order, each with
-/// the (tokio) instant the server read it, and a way to answer.
+/// the (tokio) instant the server read it, the opening handshake's request ([`Peer::upgrade`]),
+/// and a way to answer.
 pub struct Peer {
     from_client: mpsc::UnboundedReceiver<(Instant, String)>,
     to_client: mpsc::UnboundedSender<Out>,
+    upgrade: Option<oneshot::Receiver<Upgrade>>,
+}
+
+/// The opening handshake's request as the server read it: its request target (path and query)
+/// and every header line, names in lower case, in the order sent (FBC-j8a4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Upgrade {
+    pub target: String,
+    pub headers: Vec<(String, String)>,
+}
+
+impl Upgrade {
+    /// The values of every header line named `name` (lower case).
+    pub fn values(&self, name: &str) -> Vec<&str> {
+        let named = self.headers.iter().filter(|(n, _)| n == name);
+        named.map(|(_, v)| v.as_str()).collect()
+    }
 }
 
 impl ScriptedWs {
@@ -411,17 +430,19 @@ impl ScriptedWs {
                 stream.set_nodelay(true).unwrap();
                 let (heard, from_client) = mpsc::unbounded_channel();
                 let (to_client, out) = mpsc::unbounded_channel();
+                let (seen, upgrade) = oneshot::channel();
                 let _ = tx.send(Peer {
                     from_client,
                     to_client,
+                    upgrade: Some(upgrade),
                 });
                 let tls = tls.clone();
                 tokio::spawn(async move {
                     match tls {
-                        None => script_ws(stream, heard, out).await,
+                        None => script_ws(stream, heard, out, seen).await,
                         Some(tls) => {
                             if let Some(stream) = tls.accept(stream).await {
-                                script_ws(stream, heard, out).await;
+                                script_ws(stream, heard, out, seen).await;
                             }
                         }
                     }
@@ -452,19 +473,31 @@ impl ScriptedWs {
     }
 }
 
-/// Plays one scripted connection: reports each text or binary frame the client sends on `heard`
-/// and does what the test asks on `out`.
+/// Plays one scripted connection: reports its opening handshake's request on `seen`, each text
+/// or binary frame the client sends on `heard`, and does what the test asks on `out`.
 async fn script_ws<S: AsyncRead + AsyncWrite + Unpin>(
     stream: S,
     heard: mpsc::UnboundedSender<(Instant, String)>,
     mut out: mpsc::UnboundedReceiver<Out>,
+    seen: oneshot::Sender<Upgrade>,
 ) {
     // No size limit: a test may stall the reads under a frame larger than the socket buffers
     // hold, then resume them.
     let config = WebSocketConfig::default()
         .max_message_size(None)
         .max_frame_size(None);
-    let ws = tokio_tungstenite::accept_async_with_config(stream, Some(config));
+    let record = move |request: &Request, response: Response| {
+        let headers = request.headers().iter().map(|(name, value)| {
+            let value = String::from_utf8_lossy(value.as_bytes()).into_owned();
+            (name.as_str().to_owned(), value)
+        });
+        let _ = seen.send(Upgrade {
+            target: request.uri().to_string(),
+            headers: headers.collect(),
+        });
+        Ok(response)
+    };
+    let ws = tokio_tungstenite::accept_hdr_async_with_config(stream, record, Some(config));
     let mut ws = ws.await.unwrap();
     loop {
         tokio::select! {
@@ -513,6 +546,12 @@ async fn script_ws<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 impl Peer {
+    /// The opening handshake's request this connection was upgraded with; once per peer.
+    pub async fn upgrade(&mut self) -> Upgrade {
+        let seen = self.upgrade.take().expect("the upgrade is read once");
+        seen.await.expect("the connection was upgraded")
+    }
+
     /// The next text frame from the client, or `None` once the connection closed.
     pub async fn next(&mut self) -> Option<String> {
         self.next_at().await.map(|(_, text)| text)
