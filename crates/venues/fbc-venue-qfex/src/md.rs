@@ -258,8 +258,18 @@ impl QfexMd {
             }
             _ => return Err(DecodeError::Malformed("incoming_message")),
         };
-        if string(request, "type")? != "subscribe" {
-            return Err(DecodeError::Malformed("incoming_message"));
+        match string(request, "type")? {
+            "unsubscribe" => {
+                // Our active set already removed the feed. A rejected wire removal leaves
+                // the venue sending it, so start a fresh epoch with the desired set.
+                fx.push(Effect::Reconnect {
+                    stream: self.stream,
+                    reason: "rejected QFEX unsubscribe",
+                });
+                return Ok(());
+            }
+            "subscribe" => (),
+            _ => return Err(DecodeError::Malformed("incoming_message")),
         }
         let channels = request
             .get("channels")
@@ -369,10 +379,10 @@ impl MdCodec for QfexMd {
                 .try_for_each(|item| staged.decode_item(item, specs, &mut events, &mut effects)),
             _ => staged.decode_item(&value, specs, &mut events, &mut effects),
         };
+        result?;
         for effect in effects.take() {
             fx.push(effect);
         }
-        result?;
         *self = staged;
         for (meta, event) in events.0 {
             sink.push(meta, event);

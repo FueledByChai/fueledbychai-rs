@@ -38,7 +38,8 @@ fn mds_url(cfg: &VenueConfig) -> Result<&str, ConfigError> {
         .ok_or(ConfigError::Missing(KEY_MDS_URL))?;
     let authority = url
         .strip_prefix("ws://")
-        .or_else(|| url.strip_prefix("wss://"));
+        .or_else(|| url.strip_prefix("wss://"))
+        .map(|authority| authority.strip_suffix('/').unwrap_or(authority));
     if !authority.is_some_and(valid_host_port) {
         return Err(ConfigError::Invalid {
             key: KEY_MDS_URL,
