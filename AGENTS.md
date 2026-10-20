@@ -129,7 +129,8 @@ rather than guess.
   `crates/venues/fbc-venue-paradex` with its signer (`src/sign`), SBE market data (`src/md`: bbo,
   trades and the order book), its order-entry capabilities (`src/exec`, 0054) and its factory
   (`src/factory.rs`, market data and order entry, 0072),
-  and `crates/venues/fbc-venue-binance-usdm` with its market-data-only factory and codec,
+  `crates/venues/fbc-venue-binance-usdm` with its market-data-only factory and codec,
+  and `crates/venues/fbc-venue-qfex` with its read-only public MDS factory and codec (0117),
   and `crates/fbc-examples` with the owner-run samples; the
   rest are planned. Members are the `crates/fbc-*` and
   `crates/venues/fbc-*` globs, and `fixtures/` is excluded from the workspace:

@@ -1,0 +1,15 @@
+[package]
+name = "fbc-venue-qfex"
+description = "QFEX public market-data adapter; order entry is not enabled."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+fbc-core = { path = "../../fbc-core" }
+rust_decimal.workspace = true
+serde_json.workspace = true
+time.workspace = true

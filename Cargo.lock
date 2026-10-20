@@ -591,6 +591,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fbc-venue-qfex"
+version = "0.0.1"
+dependencies = [
+ "fbc-core",
+ "rust_decimal",
+ "serde_json",
+ "time",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"

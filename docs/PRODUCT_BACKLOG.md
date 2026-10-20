@@ -1,7 +1,7 @@
 # Product backlog
 
-The stories fueledbychai-rs builds first, in the venue order of decision 0016 (which
-supersedes 0007). Stories are intent with acceptance criteria; the tickets that build them live
+The stories fueledbychai-rs builds first, in the venue order of decision 0117 (which
+supersedes 0016). Stories are intent with acceptance criteria; the tickets that build them live
 in Beads and name the story they serve (`story:BT-nnn`). The decisions they rest on are in
 `docs/decisions/`; "design §n" is a section of the approved architecture design (0001). The
 user throughout is a trading program built on this library, written and run by the owner.
@@ -212,3 +212,22 @@ ordering fixes are proven against the failures that hurt the Java stack.
   subscription, and a journal-consumer stall (design §6).
 - The toy venue from BT-102 passes the suite, and a deliberately broken toy (an absent
   capability that still sends bytes) fails `caps_truthful`.
+
+## Epic G: QFEX
+
+### BT-701 — QFEX public market data before order entry
+
+**Status:** Proposed  
+**User story:** As a trading program evaluating QFEX, I want its public touch, depth and
+trades normalized through the same runtime, so I can record and replay the venue before any
+private trading path is enabled.
+
+**Acceptance criteria:**
+
+- `fbc-venue-qfex` plans the public MDS WebSocket, sends documented subscriptions and decodes
+  BBO, the pulsed level2 window and public trades into exact normalized events. Its factory
+  declares `exec: None` and `Readiness::Record` (0117).
+- Hand-built fixtures from QFEX's published schemas prove timestamps, exact price and size
+  conversion, malformed-frame atomicity, and subscription validation.
+- Instrument discovery and private order entry are separate tickets; only private-path evidence
+  can lift the recording ceiling.
