@@ -6,6 +6,10 @@ with one crate per venue. The Rust counterpart of
 
 First venues: Paradex, then Hibachi; Binance USD-M futures for reference market data.
 
+Releases: [CHANGELOG.md](CHANGELOG.md) lists what each tag shipped, by crate, ticket and pull
+request, and the API changes a consumer meets when it moves its pin (v0.0.7: "Pin bump from
+v0.0.6").
+
 Status: scaffolding. The Cargo workspace exists with ten crates:
 
 | Crate | Status |
