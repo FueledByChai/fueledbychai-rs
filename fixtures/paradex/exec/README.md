@@ -53,6 +53,7 @@ Every frame is for BTC-USD-PERP. The client id `01000700-199b-81ab-8200-00054d0a
 | `fill-longer-block-v2.sbe.txt` | The taker fill with a 124-byte block: 8 bytes past the known fields, skipped |
 | `fill-liquidation-v2.sbe.txt` | LIQUIDATION at version 2: 0.15 sold at 61000.0, realizedPnl -150; it carries one of our client ids, which a venue-initiated fill does not match |
 | `fill-transfer-null-seq-v2.sbe.txt` | UNWIND_TRANSFER at version 2: a null `seq`, no order id or client id, liquidity NON_REPRESENTABLE |
+| `fill-settle-off-grid-v2.sbe.txt` | SETTLE_MARKET at version 2: a buy of 0.05 at 61234.56789012, off the 0.1 tick, a null `seq`, no order id or client id, no fee, liquidity NON_REPRESENTABLE; a venue-initiated fill's price is kept exactly (decision 0120) |
 | `fill-short-block.sbe.txt` | A version-2 header declaring a 116-byte block, the frame ending 43 bytes into it |
 | `position-long-v2.sbe.txt` | PositionEvent at version 2: long (BUY) 0.15 at an average entry of 61234.56789012, off the 0.1 tick |
 | `position-short-v1.sbe.txt` | PositionEvent at version 1: short (SELL) 0.05 at an average entry of 62000.05 |

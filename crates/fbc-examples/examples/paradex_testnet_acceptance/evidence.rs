@@ -238,7 +238,8 @@ pub struct Evidence {
     pub fill_iocs: usize,
 }
 
-/// One fill event as the stream carried it: the order it was of (its label, or `not ours`),
+/// One fill event as the stream carried it: the order it was of (its label, `not ours`, or
+/// `venue: <kind>` for a change the venue made itself, decision 0120),
 /// the fill key (`<fillType>:<fillId>`), the account's side, price and size in the market's
 /// units, maker or taker, the fee (positive paid) and its currency, and the realized P&L and
 /// funding it states (`-` when null).

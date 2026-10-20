@@ -6,8 +6,10 @@
 //! names, the venue's realized P&L (a null one `None`) and realized funding, and our client id
 //! as the frame states them; a position transfer's null `seq` is no venue sequence; a
 //! venue-initiated fill (LIQUIDATION, UNWIND_TRANSFER, SETTLE_MARKET, BLOCK_TRADE) is pushed
-//! with no client-id match; and a frame shorter than its declared block, or refused for any
-//! other reason, pushes nothing.
+//! as the venue's, with no client-id match and its price exactly as the venue states it, on the
+//! grid or off it (FBC-5uk, decisions 0004, 0120), while the account's own FILL and RPI stay on
+//! the grid; and a frame shorter than its declared block, or refused for any other reason,
+//! pushes nothing.
 //!
 //! The frames are the hand-built ones in `fixtures/paradex/exec/` (SYNTHETIC: their account is
 //! 32 made-up bytes).
@@ -20,8 +22,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use fbc_core::{
     AccountKey, AssetSym, CidMatch, CidMint, ClientOrderId, DecodeError, ExchNs, ExchTsKind,
-    ExecEvent, ExecSink, Fee, FillEvent, FillId, FillIdent, Liquidity3, Lots, Money, Namespace,
-    NamespaceLease, Side, Ticks, VenueMeta, VenueOrderId, WallNs, dispatch,
+    ExecEvent, ExecSink, Fee, FillEvent, FillId, FillIdent, FillOrigin, Liquidity3, Lots, Money,
+    Namespace, NamespaceLease, PxExact, Side, Ticks, VenueFillKind, VenueMeta, VenueOrderId,
+    WallNs, dispatch,
 };
 use fbc_venue_paradex::exec::{TEMPLATE_FILL, decode_fill_event};
 use fbc_venue_paradex::factory::caps;
@@ -227,10 +230,12 @@ fn a_version_1_maker_fill_decodes_with_our_client_id_a_rebate_and_no_realized_pn
                 // FillEvent states no remaining size, so no cumulative quantity.
                 cum_after: None,
             },
-            cid: Some(CidMatch::Ours(first)),
+            origin: FillOrigin::Order {
+                cid: Some(CidMatch::Ours(first)),
+                px: PX,
+            },
             inst: BTC,
             side: Side::Buy,
-            px: PX,
             // 0.05 in lots of 0.001.
             qty: lots(50),
             liquidity: Liquidity3::Maker,
@@ -257,10 +262,12 @@ fn a_version_2_taker_fill_carries_its_fee_in_the_named_asset_realized_pnl_and_fu
             vid: Some(vid("1759500000000000002")),
             cum_after: None,
         },
-        cid: Some(CidMatch::Ours(second)),
+        origin: FillOrigin::Order {
+            cid: Some(CidMatch::Ours(second)),
+            px: PX,
+        },
         inst: BTC,
         side: Side::Sell,
-        px: PX,
         qty: lots(50),
         liquidity: Liquidity3::Taker,
         // fee 0.62 USDC, "positive = paid": a cost.
@@ -301,7 +308,7 @@ fn an_rpi_fill_is_the_accounts_own_execution_and_its_fee_asset_is_the_one_named(
     let [first, _] = ours();
     let (meta_got, fill) = one_fill(&frame("fill-rpi-v2.sbe.txt"));
     assert_eq!(meta_got, meta(6003));
-    assert_eq!(fill.cid, Some(CidMatch::Ours(first)));
+    assert_eq!(fill.cid(), Some(CidMatch::Ours(first)));
     assert_eq!(fill.liquidity, Liquidity3::Maker);
     // fee 0.015 DIME.
     assert_eq!(fill.fee, fee(15_000_000, "DIME"));
@@ -342,11 +349,14 @@ fn a_liquidation_is_pushed_with_no_client_id_match() {
                 vid: Some(vid("1759500000000000009")),
                 cum_after: None,
             },
-            cid: None,
+            // LIQUIDATION: venue-initiated, at 61000.0 as the venue states it.
+            origin: FillOrigin::Venue {
+                kind: VenueFillKind::Liquidation,
+                px: PxExact::new(6_100_000_000_000, -8),
+            },
             inst: BTC,
             side: Side::Sell,
-            // 61000.0, 0.15.
-            px: Ticks(610_000),
+            // 0.15.
             qty: lots(150),
             liquidity: Liquidity3::Taker,
             fee: fee(45_750_000, "USDC"),
@@ -356,14 +366,21 @@ fn a_liquidation_is_pushed_with_no_client_id_match() {
         }
     );
     // SETTLE_MARKET and BLOCK_TRADE are venue-initiated too.
-    for fill_type in [4, 6] {
-        let other = with_byte(liquidation.clone(), 16, fill_type);
-        assert_eq!(one_fill(&other).1.cid, None, "{fill_type}");
+    for (fill_type, kind) in [
+        (4, VenueFillKind::Settlement),
+        (6, VenueFillKind::BlockTrade),
+    ] {
+        let other = one_fill(&with_byte(liquidation.clone(), 16, fill_type)).1;
+        assert_eq!(
+            (other.cid(), other.venue_kind()),
+            (None, Some(kind)),
+            "{fill_type}"
+        );
     }
     // The same frame as a FILL is the account's own execution: its client id is matched.
     let [first, _] = ours();
     let own = with_byte(liquidation, 16, 1);
-    assert_eq!(one_fill(&own).1.cid, Some(CidMatch::Ours(first)));
+    assert_eq!(one_fill(&own).1.cid(), Some(CidMatch::Ours(first)));
 }
 
 #[test]
@@ -386,11 +403,14 @@ fn a_position_transfer_with_a_null_seq_decodes_with_no_venue_sequence() {
                 vid: None,
                 cum_after: None,
             },
-            // UNWIND_TRANSFER: venue-initiated, no client-id match (and none sent).
-            cid: None,
+            // UNWIND_TRANSFER: venue-initiated, no client-id match (and none sent), at
+            // 62000.0 as the venue states it.
+            origin: FillOrigin::Venue {
+                kind: VenueFillKind::Transfer,
+                px: PxExact::new(6_200_000_000_000, -8),
+            },
             inst: BTC,
             side: Side::Buy,
-            px: PX,
             qty: lots(50),
             // NON_REPRESENTABLE: the venue does not say.
             liquidity: Liquidity3::Unknown,
@@ -403,6 +423,158 @@ fn a_position_transfer_with_a_null_seq_decodes_with_no_venue_sequence() {
     // A null seq is no venue sequence at version 1 too.
     let v1 = with_i64(frame("fill-maker-v1.sbe.txt"), 8, i64::MIN);
     assert_eq!(one_fill(&v1).0.venue_seq, None);
+}
+
+/// The fill types the venue initiates, as the `fillType` byte spells them, and the kind each is.
+const VENUE_TYPES: [(u8, VenueFillKind); 4] = [
+    (2, VenueFillKind::Liquidation),
+    (3, VenueFillKind::Transfer),
+    (4, VenueFillKind::Settlement),
+    (6, VenueFillKind::BlockTrade),
+];
+
+/// 61234.56789012 as the venue states it: off the specs' 0.1 tick.
+const OFF_GRID: PxExact = PxExact::new(6_123_456_789_012, -8);
+
+#[test]
+fn each_fill_type_names_its_origin() {
+    let [first, _] = ours();
+    let liquidation = frame("fill-liquidation-v2.sbe.txt");
+    // FILL and RPI are the account's own executions: the client id is matched and the price is
+    // on the grid, 61000.0 on the 0.1 tick.
+    for fill_type in [1, 5] {
+        let (_, fill) = one_fill(&with_byte(liquidation.clone(), 16, fill_type));
+        assert_eq!(
+            fill.origin,
+            FillOrigin::Order {
+                cid: Some(CidMatch::Ours(first)),
+                px: Ticks(610_000),
+            },
+            "{fill_type}"
+        );
+        assert_eq!(
+            (fill.venue_kind(), fill.order_px()),
+            (None, Some(Ticks(610_000)))
+        );
+    }
+    // The venue's: the kind it is, no client id whatever the frame carries, and the price as
+    // the venue states it.
+    for (fill_type, kind) in VENUE_TYPES {
+        let (_, fill) = one_fill(&with_byte(liquidation.clone(), 16, fill_type));
+        assert_eq!(
+            fill.origin,
+            FillOrigin::Venue {
+                kind,
+                px: PxExact::new(6_100_000_000_000, -8),
+            },
+            "{fill_type}"
+        );
+        assert_eq!(
+            (fill.cid(), fill.venue_kind(), fill.order_px()),
+            (None, Some(kind), None),
+            "{fill_type}"
+        );
+    }
+}
+
+#[test]
+fn an_off_grid_settlement_price_reaches_the_fill_exactly() {
+    let (meta_got, fill) = one_fill(&frame("fill-settle-off-grid-v2.sbe.txt"));
+    assert_eq!(
+        meta_got,
+        VenueMeta {
+            exch_ts: Some(ExchNs(1_759_500_000_310_000 * 1_000)),
+            exch_ts_kind: ExchTsKind::Publish,
+            venue_seq: None,
+        }
+    );
+    assert_eq!(
+        fill,
+        FillEvent {
+            // No order id: a settlement names no order.
+            ident: FillIdent::Venue {
+                fill: fid("SETTLE_MARKET:8615262148007718007"),
+                vid: None,
+                cum_after: None,
+            },
+            // SETTLE_MARKET: venue-initiated, at 61234.56789012 exactly, never rounded to the
+            // 0.1 tick (decision 0004).
+            origin: FillOrigin::Venue {
+                kind: VenueFillKind::Settlement,
+                px: OFF_GRID,
+            },
+            inst: BTC,
+            side: Side::Buy,
+            qty: lots(50),
+            // NON_REPRESENTABLE: the venue does not say.
+            liquidity: Liquidity3::Unknown,
+            fee: fee(0, "USDC"),
+            realized_pnl: Some(usd_nanos(-350_000_000)),
+            realized_funding: Some(usd_nanos(-10_000_000)),
+            replay: false,
+        }
+    );
+    assert_eq!(fill.cid(), None);
+    assert_eq!(fill.order_px(), None);
+    // It really is off the grid: no tick index holds it.
+    let specs = md::specs();
+    let grid = &specs.get(BTC).unwrap().price_grid;
+    assert_eq!(grid.ticks_exact(OFF_GRID), None);
+    // Every venue-initiated type keeps an off-grid price exactly.
+    let settle = frame("fill-settle-off-grid-v2.sbe.txt");
+    for (fill_type, kind) in VENUE_TYPES {
+        let (_, fill) = one_fill(&with_byte(settle.clone(), 16, fill_type));
+        assert_eq!(
+            fill.origin,
+            FillOrigin::Venue { kind, px: OFF_GRID },
+            "{fill_type}"
+        );
+    }
+    // A zero or negative price is carried as stated, not refused: the OMS reads no fill's price,
+    // and refusing the frame would lose the position change (an option settles at zero).
+    for mantissa in [0, -6_123_456_789_012] {
+        let (_, fill) = one_fill(&with_i64(settle.clone(), 19, mantissa));
+        assert_eq!(
+            fill.origin,
+            FillOrigin::Venue {
+                kind: VenueFillKind::Settlement,
+                px: PxExact::new(mantissa, -8),
+            },
+            "{mantissa}"
+        );
+    }
+}
+
+#[test]
+fn an_own_fill_off_the_grid_is_still_refused_with_nothing_pushed() {
+    // The settlement frame as a FILL or an RPI fill: an execution of an order, whose price is
+    // on the instrument's grid or the frame is misread.
+    let settle = frame("fill-settle-off-grid-v2.sbe.txt");
+    for fill_type in [1, 5] {
+        assert_eq!(
+            refused(&with_byte(settle.clone(), 16, fill_type)),
+            DecodeError::Malformed("price off the instrument's grid"),
+            "{fill_type}"
+        );
+    }
+}
+
+#[test]
+fn a_venue_fill_with_a_null_price_or_an_off_step_size_is_refused_with_nothing_pushed() {
+    let settle = frame("fill-settle-off-grid-v2.sbe.txt");
+    let null_price = with_i64(settle.clone(), 19, i64::MIN);
+    for (fill_type, _) in VENUE_TYPES {
+        assert_eq!(
+            refused(&with_byte(null_price.clone(), 16, fill_type)),
+            DecodeError::Malformed("null price"),
+            "{fill_type}"
+        );
+    }
+    // The size is still held to the instrument's size step: 0.05000001 is off the 0.001 step.
+    assert_eq!(
+        refused(&with_i64(settle, 27, 5_000_001)),
+        DecodeError::Malformed("size off the instrument's size step")
+    );
 }
 
 #[test]

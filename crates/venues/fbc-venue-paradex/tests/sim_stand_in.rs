@@ -474,11 +474,16 @@ fn simvenue_from_paradexs_caps_fills_a_post_only_place_with_paradexs_realized_pn
     assert_eq!(got.len(), 2, "{got:?}");
     let opening = fill(&got[0].1);
     assert_eq!(
-        (opening.side, opening.px, opening.qty, opening.liquidity),
-        (Side::Buy, Ticks(199), lots(2), Liquidity3::Maker)
+        (
+            opening.side,
+            opening.order_px(),
+            opening.qty,
+            opening.liquidity
+        ),
+        (Side::Buy, Some(Ticks(199)), lots(2), Liquidity3::Maker)
     );
     assert_eq!(opening.vid(), Some(&buy));
-    assert_eq!(opening.cid, Some(CidMatch::Ours(buyer)));
+    assert_eq!(opening.cid(), Some(CidMatch::Ours(buyer)));
     // Paradex's fee sign: positive is paid (0054), so a maker fee is a cost here.
     assert_eq!(
         (opening.fee.cost().nanos, opening.fee.cost().asset),
@@ -513,8 +518,8 @@ fn simvenue_from_paradexs_caps_fills_a_post_only_place_with_paradexs_realized_pn
     assert_eq!(got.len(), 2, "{got:?}");
     let closing = fill(&got[0].1);
     assert_eq!(
-        (closing.side, closing.px, closing.qty, closing.vid()),
-        (Side::Sell, Ticks(201), lots(2), Some(&sell))
+        (closing.side, closing.order_px(), closing.qty, closing.vid()),
+        (Side::Sell, Some(Ticks(201)), lots(2), Some(&sell))
     );
     let gain = notional(201, 2) - notional(199, 2);
     assert!(gain > 0);

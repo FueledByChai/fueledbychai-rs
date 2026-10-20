@@ -25,10 +25,10 @@ use core::str::FromStr;
 
 use fbc_core::{
     AssetSym, CancelReason, DecodeError, DecodeScope, ExchNs, ExchTsKind, ExecEvent, FillCaps,
-    FillEvent, FillIdent, InstrumentSpec, Liquidity3, Lots, ModeScope, Money, NotAmendable,
-    OrderUpdate, PxExact, RawFrame, Reject, RejectKind, RpcId, Side, SignedLots, SpecTable,
-    SubmitOutcome, TerminalHint, TerminalReject, Ticks, VenueMeta, VenueMode, VenueOrderSnapshot,
-    VenueOrderState,
+    FillEvent, FillIdent, FillOrigin, InstrumentSpec, Liquidity3, Lots, ModeScope, Money,
+    NotAmendable, OrderUpdate, PxExact, RawFrame, Reject, RejectKind, RpcId, Side, SignedLots,
+    SpecTable, SubmitOutcome, TerminalHint, TerminalReject, Ticks, VenueMeta, VenueMode,
+    VenueOrderSnapshot, VenueOrderState,
 };
 
 use DecodeError::Malformed;
@@ -177,10 +177,12 @@ fn fill(
     let fee_asset = AssetSym::new(r.get("fa")?).ok_or(Malformed("fa"))?;
     let fill = FillEvent {
         ident,
-        cid: Some(scope.client_order_id(r.get("cid")?)),
+        origin: FillOrigin::Order {
+            cid: Some(scope.client_order_id(r.get("cid")?)),
+            px: Ticks(r.num("px")?),
+        },
         inst: spec.id,
         side: r.side()?,
-        px: Ticks(r.num("px")?),
         qty,
         liquidity: match r.get("liq")? {
             "M" => Liquidity3::Maker,

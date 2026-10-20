@@ -54,9 +54,23 @@
 //! shows already counts the cumulative fill it showed), never on the inventory
 //! ([`FillRouted::InSnapshot`](crate::FillRouted::InSnapshot)).
 //!
+//! **A change the venue made itself** (a liquidation, a transfer, a settlement or a block trade;
+//! decision 0120) belongs to no order of ours, so no order the snapshot shows, or leaves out,
+//! places it: on either read mode the seed holds it only by its arrival before the request
+//! (rule 1) or its time at or before the watermark, its matching-engine time or its publish
+//! time, an upper bound on its execution. Before the seed, one neither places leaves the market
+//! unseeded, as above. After a snapshot seed it counts on the inventory, never leaving the
+//! position unknown, and a later resync folds it by its arrival or that time
+//! ([`FillRouted::Venue`](crate::FillRouted::Venue)). One the seed's read already held, timed
+//! after the watermark or not timed, and delivered after the seed is then counted twice: a fill
+//! in flight while the seed was taken, which may have executed before the request since a
+//! publish time bounds the execution only from above. That is the residual decision 0120
+//! accepts, which the next resync reports ([`PositionCheck::Desync`]).
+//!
 //! **Later resyncs** never seed or overwrite the inventory: each seeded market's position is
 //! compared with the inventory as of the snapshot's watermark (the fills that arrived before the
-//! request, and those after it with a matching-engine time at or before the watermark), and a
+//! request, and those after it with a matching-engine time, or for a venue's own fill a publish
+//! time, at or before the watermark), and a
 //! difference is reported ([`PositionCheck::Desync`]). Every resync reconciles the orders the
 //! registry holds as order updates (the snapshot's cumulative fill raises `cum_venue` only),
 //! the Unknown ladder's included ([`Registry::on_resync`]), and acts on the orphans it finds on a
@@ -205,8 +219,56 @@ pub(crate) enum MarketState {
 #[derive(Debug)]
 pub(crate) struct Held {
     pub(crate) key: FillKey,
-    pub(crate) fill: Placed,
+    pub(crate) fill: Placing,
     pub(crate) signed: SignedLots,
+}
+
+/// What places a fill against a seed: an order's execution by its order, or a change the venue
+/// made itself by its arrival and time alone (decision 0120).
+#[derive(Debug)]
+pub(crate) enum Placing {
+    Order(Placed),
+    Venue(VenuePlaced),
+}
+
+impl Placing {
+    /// When it arrived.
+    fn arrived(&self) -> MonoNs {
+        match self {
+            Placing::Order(f) => f.arrived,
+            Placing::Venue(v) => v.arrived,
+        }
+    }
+
+    /// The latest instant on the local wall clock it can have executed at, when known: an
+    /// order's matching-engine time, or a venue fill's matching-engine or publish time.
+    fn by(&self) -> Option<WallNs> {
+        match self {
+            Placing::Order(f) => f.exec,
+            Placing::Venue(v) => v.by,
+        }
+    }
+}
+
+/// What places a change the venue made itself against a seed (decision 0120): when it arrived,
+/// and the latest instant it can have executed at, its matching-engine time or its publish time
+/// (an upper bound on its execution, as the fill ledger holds it), on the local wall clock. No
+/// order shows it or leaves it out, so nothing else places it.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct VenuePlaced {
+    pub(crate) arrived: MonoNs,
+    pub(crate) by: Option<WallNs>,
+}
+
+impl VenuePlaced {
+    pub(crate) fn of(time: Option<FillTime>, arrived: MonoNs) -> VenuePlaced {
+        VenuePlaced {
+            arrived,
+            by: time
+                .filter(|t| matches!(t.kind, ExchTsKind::MatchingEngine | ExchTsKind::Publish))
+                .map(|t| t.aligned),
+        }
+    }
 }
 
 /// What places a fill against a seed: its order (our client id, and the venue id it names),
@@ -318,6 +380,14 @@ pub(crate) enum Placement {
 }
 
 impl SeedRef {
+    /// Whether the seed holds `v`, a change the venue made itself (decision 0120): it arrived
+    /// at or before the request, or its time (a matching-engine time, or a publish time
+    /// bounding its execution from above) is at or before the watermark. Only those place it,
+    /// on either read mode: no order the snapshot shows, or leaves out, says anything of it.
+    fn holds_venue(&self, v: &VenuePlaced) -> bool {
+        v.arrived <= self.requested_at || v.by.is_some_and(|t| t <= self.watermark)
+    }
+
     /// Whether the seed holds `f`, a fill it placed in the snapshot, only because it did not
     /// show the fill's order: neither its arrival, its time nor a shown fill count places it.
     fn by_absence_only(&self, f: &Placed) -> bool {
@@ -401,6 +471,22 @@ impl Registry {
             })) if !registered || r.known.contains(&f.cid) || r.later.contains(&f.cid) => {
                 r.place(f)
             }
+            _ => Placement::After,
+        }
+    }
+
+    /// Where a change the venue made itself on `inst` stands (decision 0120): in the snapshot
+    /// that seeded the market when the seed holds it by its arrival or time
+    /// ([`SeedRef::holds_venue`]); otherwise after it, so it counts on the inventory, never
+    /// leaving the position unknown (the owner's decision of 2026-10-20). A fill the seed's
+    /// read already held, timed after the watermark or not timed, and delivered after the seed
+    /// is then counted twice (decision 0120's residual), which the next resync's check reports
+    /// ([`PositionCheck::Desync`]). On a market seeded by hand, not seeded or unsettled, after.
+    pub(crate) fn venue_placement(&self, inst: InstrumentId, v: &VenuePlaced) -> Placement {
+        match self.markets.get(&inst) {
+            Some(MarketState::Seeded(Seed {
+                reference: Some(r), ..
+            })) if r.holds_venue(v) => Placement::InSnapshot { shown: false },
             _ => Placement::After,
         }
     }
@@ -489,12 +575,14 @@ impl Registry {
     }
 
     /// Records a fill of `inst` counted as `placement` says, moving the inventory by `signed`
-    /// unless the seed holds it.
+    /// unless the seed holds it: before the seed, held for the seed to place; after it, logged
+    /// with its arrival and the latest instant it can have executed at, for a later resync to
+    /// fold.
     pub(crate) fn fill_counted(
         &mut self,
         inst: InstrumentId,
         key: FillKey,
-        f: Placed,
+        f: Placing,
         signed: SignedLots,
         placement: Placement,
     ) {
@@ -510,7 +598,7 @@ impl Registry {
             }),
             (state, Placement::Unsettled) => *state = MarketState::Unsettled,
             (MarketState::Seeded(seed), Placement::After) => {
-                seed.log.push((f.arrived, f.exec, i128::from(signed.0)));
+                seed.log.push((f.arrived(), f.by(), i128::from(signed.0)));
             }
             _ => {}
         }
@@ -860,7 +948,17 @@ impl Registry {
                 _ => &[],
             };
             for h in held {
-                match reference.place(&h.fill) {
+                let f = match &h.fill {
+                    Placing::Order(f) => f,
+                    // Only its arrival or its time places a venue fill in the snapshot, and no
+                    // order shows one to be after it (decision 0120).
+                    Placing::Venue(v) if reference.holds_venue(v) => continue,
+                    Placing::Venue(_) => {
+                        report.unsettled.push((inst, h.key.clone()));
+                        continue 'market;
+                    }
+                };
+                match reference.place(f) {
                     Placement::Unsettled => {
                         report.unsettled.push((inst, h.key.clone()));
                         continue 'market;
@@ -868,8 +966,8 @@ impl Registry {
                     Placement::InSnapshot { .. } => {}
                     Placement::After => {
                         pos += i128::from(h.signed.0);
-                        folded_to = folded_to.max(h.fill.arrived);
-                        *after.entry(h.fill.cid).or_insert(0) += i128::from(h.fill.qty.get());
+                        folded_to = folded_to.max(f.arrived);
+                        *after.entry(f.cid).or_insert(0) += i128::from(f.qty.get());
                     }
                 }
             }

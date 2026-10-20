@@ -604,6 +604,16 @@ pub(crate) fn price(spec: &InstrumentSpec, mantissa: i64) -> Result<Ticks, Decod
         .ok_or(off)
 }
 
+/// A `Price8` mantissa exactly as the venue states it, on the instrument's grid or off it, never
+/// rounded (decision 0004): the price of a fill the venue made itself (decision 0120). Refused
+/// only when null; a zero or negative price is carried as stated.
+pub(crate) fn exact_price(mantissa: i64) -> Result<PxExact, DecodeError> {
+    if mantissa == NULL_I64 {
+        return Err(DecodeError::Malformed("null price"));
+    }
+    Ok(PxExact::new(mantissa, EXP))
+}
+
 /// A `Qty8` mantissa as lots of the instrument's size step; refused off the step, negative or
 /// null.
 pub(crate) fn lots(spec: &InstrumentSpec, mantissa: i64) -> Result<Lots, DecodeError> {

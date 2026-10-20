@@ -11,11 +11,12 @@
 //! `orderId`, `clientOrderId`, `tradeId`, `market`, and at version 2 `feeCurrency`.
 //!
 //! What a fill states:
-//! - `fillType` FILL and RPI are the account's own executions, their client id read through
-//!   [`DecodeScope::client_order_id`] (an empty one is none). LIQUIDATION, UNWIND_TRANSFER,
-//!   SETTLE_MARKET and BLOCK_TRADE are the venue's: pushed with no client-id match whatever
-//!   client id the frame carries. How the OMS counts them is FBC-5uk's. Any other type is
-//!   refused.
+//! - `fillType` FILL and RPI are the account's own executions, [`FillOrigin::Order`], their
+//!   client id read through [`DecodeScope::client_order_id`] (an empty one is none).
+//!   LIQUIDATION, UNWIND_TRANSFER, SETTLE_MARKET and BLOCK_TRADE are the venue's,
+//!   [`FillOrigin::Venue`] of the [`VenueFillKind`] each is, with no client-id match whatever
+//!   client id the frame carries; the OMS counts them on the inventory and on no order
+//!   (decision 0120). Any other type is refused.
 //! - The fill id, keyed as `<fillType>:<fillId>` (for example `FILL:8615262148007718001`) for
 //!   every type: Paradex states a fill id "Unique string ID of fill per FillType" (AsyncAPI
 //!   `ResponsesFillResult.id`), so the id alone could merge a FILL and a LIQUIDATION into one
@@ -24,9 +25,11 @@
 //!   long for the core once prefixed (Paradex's are 19 digits). The order id (none when empty,
 //!   as a position transfer's may be) through the scope; FillEvent states no remaining size,
 //!   so no cumulative quantity after the fill.
-//! - `side` the account's side, as the Java library reads it; `price` and `size` on the
-//!   instrument's grid and size step; `liquidity` MAKER or TAKER, NON_REPRESENTABLE the venue
-//!   not saying.
+//! - `side` the account's side, as the Java library reads it; `size` on the instrument's size
+//!   step; `price` on the instrument's grid for the account's own fill (an off-grid one is a
+//!   misread frame, refused), and for the venue's exactly as stated, on the grid or off it,
+//!   never rounded (decisions 0004, 0120), refused only when null; `liquidity` MAKER or TAKER,
+//!   NON_REPRESENTABLE the venue not saying.
 //! - The fee through [`DecodeScope::fee`] under the declared sign ("positive = paid, negative =
 //!   rebate"), in `feeCurrency`; a frame that names none (version 1, which predates the field,
 //!   or an empty one) has it in the instrument's settlement currency.
@@ -42,11 +45,11 @@
 
 use fbc_core::{
     AssetSym, DecodeError, DecodeScope, ExchTsKind, ExecEvent, ExecSink, FillEvent, FillIdent,
-    Liquidity3, Money, Side, SpecTable, VenueMeta,
+    FillOrigin, Liquidity3, Money, Side, SpecTable, VenueFillKind, VenueMeta,
 };
 
 use crate::md::sbe::{Block, Message, NULL_I64};
-use crate::md::{lots, market, micros, price, required, seq};
+use crate::md::{exact_price, lots, market, micros, price, required, seq};
 
 /// `FillEvent`'s template id.
 pub const TEMPLATE_FILL: u16 = 21;
@@ -89,15 +92,15 @@ pub fn decode_fill_event(
         NULL_I64 => None,
         n => Some(seq(n)?),
     };
-    let (fill_type, own) = match block.u8_at(16) {
+    let (fill_type, venue) = match block.u8_at(16) {
         // FILL and RPI: the account's own executions.
-        Some(1) => ("FILL", true),
-        Some(5) => ("RPI", true),
+        Some(1) => ("FILL", None),
+        Some(5) => ("RPI", None),
         // LIQUIDATION, UNWIND_TRANSFER, SETTLE_MARKET, BLOCK_TRADE: the venue's.
-        Some(2) => ("LIQUIDATION", false),
-        Some(3) => ("UNWIND_TRANSFER", false),
-        Some(4) => ("SETTLE_MARKET", false),
-        Some(6) => ("BLOCK_TRADE", false),
+        Some(2) => ("LIQUIDATION", Some(VenueFillKind::Liquidation)),
+        Some(3) => ("UNWIND_TRANSFER", Some(VenueFillKind::Transfer)),
+        Some(4) => ("SETTLE_MARKET", Some(VenueFillKind::Settlement)),
+        Some(6) => ("BLOCK_TRADE", Some(VenueFillKind::BlockTrade)),
         _ => return Err(DecodeError::Malformed("fill type")),
     };
     let side = match block.u8_at(17) {
@@ -112,7 +115,21 @@ pub fn decode_fill_event(
         Some(254) => Liquidity3::Unknown,
         _ => return Err(DecodeError::Malformed("fill liquidity")),
     };
-    let px = price(spec, required(&block, 19, "fill price")?)?;
+    let px = required(&block, 19, "fill price")?;
+    let origin = match venue {
+        // The account's own execution: its client id matched, its price on the grid, so an
+        // off-grid one is a misread frame and refused.
+        None => FillOrigin::Order {
+            cid: (!client_id.is_empty()).then(|| scope.client_order_id(client_id)),
+            px: price(spec, px)?,
+        },
+        // The venue's: no client id matched, whatever the frame carries, and the price exactly
+        // as the venue states it, on the grid or off it (decisions 0004, 0120).
+        Some(kind) => FillOrigin::Venue {
+            kind,
+            px: exact_price(px)?,
+        },
+    };
     let qty = lots(spec, required(&block, 27, "fill size")?)?;
     let fee_raw = value8(&block, 35, "fill fee")?.ok_or(DecodeError::Malformed("fill fee"))?;
     let realized_pnl = value8(&block, 43, "fill realized pnl")?;
@@ -134,7 +151,6 @@ pub fn decode_fill_event(
     } else {
         Some(scope.venue_order_id(order_id)?)
     };
-    let cid = (own && !client_id.is_empty()).then(|| scope.client_order_id(client_id));
     let pnl = |nanos: i128| Money::new(nanos, spec.settle_ccy);
     let event = FillEvent {
         ident: FillIdent::Venue {
@@ -142,10 +158,9 @@ pub fn decode_fill_event(
             vid,
             cum_after: None,
         },
-        cid,
+        origin,
         inst: spec.id,
         side,
-        px,
         qty,
         liquidity,
         fee,

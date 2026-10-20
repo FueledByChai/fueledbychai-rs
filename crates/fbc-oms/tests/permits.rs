@@ -15,9 +15,9 @@ use std::time::Duration;
 use common::{cid, fill, ident, lots, order_caps, placement, update, vid};
 use fbc_core::{
     AckLevel, AmendAck, AmendCaps, AmendOrder, AmendQty, CancelBatch, CancelOrder, CidMatch,
-    ClientOrderId, InstrumentId, ItemRef, MonoNs, Namespace, OrderCaps, OrderKind, OrderRef,
-    RefKind, RpcId, Side, SignedLots, SubmitOutcome, TagSet, Ticks, VenueCommand, VenueOrderId,
-    VenueOrderState, WallNs,
+    ClientOrderId, FillOrigin, InstrumentId, ItemRef, MonoNs, Namespace, OrderCaps, OrderKind,
+    OrderRef, RefKind, RpcId, Side, SignedLots, SubmitOutcome, TagSet, Ticks, VenueCommand,
+    VenueOrderId, VenueOrderState, WallNs,
 };
 use fbc_oms::{
     Admission, AmendRefusal, CancelChoice, FillLedger, FillRouted, LedgerConfig, MarketCapsConfig,
@@ -464,7 +464,10 @@ fn a_foreign_namespace_order_is_never_cancelled_individually_and_its_fill_moves_
         (CidMatch::Unparseable, FillRouted::NotCanonical),
     ] {
         let mut f = fill(None, ident(&format!("f-{routed:?}")), Side::Buy, 3, false);
-        f.cid = Some(cid_match);
+        f.origin = FillOrigin::Order {
+            cid: Some(cid_match),
+            px: Ticks(100),
+        };
         let Admission::Apply(accepted) = ledger.admit(&f, None, MonoNs(1)) else {
             panic!("a new fill is admitted")
         };

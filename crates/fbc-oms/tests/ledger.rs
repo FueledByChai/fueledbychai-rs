@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use common::{cid, fill, ident, lots, placement, update};
 use fbc_core::{
-    AckLevel, CidMatch, ClientOrderId, ExchNs, ExchTsKind, FillEvent, FillIdent, InstrumentId,
-    ItemRef, Lots, MonoNs, Namespace, Side, SignedLots, SubmitOutcome, VenueOrderState, WallNs,
+    AckLevel, CidMatch, ClientOrderId, ExchNs, ExchTsKind, FillEvent, FillIdent, FillOrigin,
+    InstrumentId, ItemRef, Lots, MonoNs, Namespace, Side, SignedLots, SubmitOutcome, Ticks,
+    VenueOrderState, WallNs,
 };
 use fbc_oms::{
     AcceptedFill, Admission, Applied, FillApplied, FillLedger, FillRouted, FillTime, Horizon,
@@ -854,13 +855,19 @@ fn a_delayed_amend_of_an_unseen_older_venue_id_leaves_the_current_one() {
 fn foreign_non_canonical_and_unattributed_fills_are_flagged_not_counted_and_not_kept() {
     let (mut l, mut reg) = session();
     let mut foreign = untracked("f1", 5, false);
-    foreign.cid = Some(CidMatch::Foreign(Namespace::new(9)));
+    foreign.origin = FillOrigin::Order {
+        cid: Some(CidMatch::Foreign(Namespace::new(9))),
+        px: Ticks(100),
+    };
     assert_eq!(
         reg.apply_fill(accepted(l.admit(&foreign, None, MonoNs(0)))),
         Ok(FillRouted::Foreign(Namespace::new(9)))
     );
     let mut other = untracked("f2", 5, false);
-    other.cid = Some(CidMatch::Unparseable);
+    other.origin = FillOrigin::Order {
+        cid: Some(CidMatch::Unparseable),
+        px: Ticks(100),
+    };
     assert_eq!(
         reg.apply_fill(accepted(l.admit(&other, None, MonoNs(0)))),
         Ok(FillRouted::NotCanonical)
@@ -935,7 +942,10 @@ fn flagged_fills_never_move_the_horizon() {
     let mut reg = Registry::new();
     // A foreign fill with no usable time, then one of ours: nothing ours was forgotten.
     let mut foreign = untracked("f1", 5, false);
-    foreign.cid = Some(CidMatch::Foreign(Namespace::new(9)));
+    foreign.origin = FillOrigin::Order {
+        cid: Some(CidMatch::Foreign(Namespace::new(9))),
+        px: Ticks(100),
+    };
     reg.apply_fill(accepted(l.admit(&foreign, None, MonoNs(0))))
         .unwrap();
     reg.apply_fill(accepted(l.admit(

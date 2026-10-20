@@ -10,12 +10,12 @@ use fbc_core::{
     AckLevel, AmendOrder, AssetSym, CancelOnDisconnect, CancelOrder, CancelScope, Channel,
     ChosenRef, CidMatch, ConnState, CtxCall, DecodeError, DecodeScope, Effect, Effects, EncodeCtx,
     EncodeReceipt, ExchNs, ExchTsKind, ExecCaps, ExecCodec, ExecEvent, ExecSink, Feature, FillCaps,
-    FillEvent, FillIdent, HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans, InstrumentId,
-    ItemRef, Liquidity, Liquidity3, MatchingCaps, Money, NotSentReason, OpKind, OrderCaps,
-    OrderKindTag, OrderRef, OrderUpdate, OrderingKey, PathStamps, QueryAnswer, RateCharge,
-    RawFrame, Reject, RpcCall, RpcId, SignedLots, SpecTable, StreamId, SubmitOutcome, Support,
-    TerminalReject, TifTag, TimerTag, TrafficClass, VenueCommand, VenueMeta, VenueOrderSnapshot,
-    VenueOrderState, WallNs, WireSlice, encode_cid,
+    FillEvent, FillIdent, FillOrigin, HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans,
+    InstrumentId, ItemRef, Liquidity, Liquidity3, MatchingCaps, Money, NotSentReason, OpKind,
+    OrderCaps, OrderKindTag, OrderRef, OrderUpdate, OrderingKey, PathStamps, QueryAnswer,
+    RateCharge, RawFrame, Reject, RpcCall, RpcId, SignedLots, SpecTable, StreamId, SubmitOutcome,
+    Support, TerminalReject, TifTag, TimerTag, TrafficClass, VenueCommand, VenueMeta,
+    VenueOrderSnapshot, VenueOrderState, WallNs, WireSlice, encode_cid,
 };
 
 use crate::config::SimConfig;
@@ -764,10 +764,12 @@ impl ExecCodec for SimCodec {
                         cum_after: fill.cum,
                     }
                 },
-                cid: self.echoed_cid(scope, &fill.cid),
+                origin: FillOrigin::Order {
+                    cid: self.echoed_cid(scope, &fill.cid),
+                    px: fill.px,
+                },
                 inst: fill.inst,
                 side: fill.side,
-                px: fill.px,
                 qty: fill.qty,
                 // Codex r4182448157: a venue without the flag does not say.
                 liquidity: match (self.fills.liquidity_flag, fill.liquidity) {

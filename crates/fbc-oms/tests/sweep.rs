@@ -25,9 +25,10 @@ use arm::{lease_keys, start};
 use common::{cid, fill, ident, lots, order_caps, placement, vid};
 use fbc_core::{
     AckLevel, CancelBatch, CancelReason, CancelScope, CidMatch, ClientOrderId, FillEvent,
-    InstrumentId, ItemRef, MonoNs, Namespace, NewOrder, NonceScope, OrderCaps, OrderKind, OrderRef,
-    OrderUpdate, RefKind, RpcId, Side, SignedLots, SnapshotSource, SubmitOutcome, Support, TagSet,
-    Ticks, VenueCommand, VenueOrderSnapshot, VenueOrderState, WallNs,
+    FillOrigin, InstrumentId, ItemRef, MonoNs, Namespace, NewOrder, NonceScope, OrderCaps,
+    OrderKind, OrderRef, OrderUpdate, RefKind, RpcId, Side, SignedLots, SnapshotSource,
+    SubmitOutcome, Support, TagSet, Ticks, VenueCommand, VenueOrderSnapshot, VenueOrderState,
+    WallNs,
 };
 use fbc_oms::{
     Admission, CancelAllRefusal, CancelEverything, CancelPlan, EntryState, FillLedger, FillRouted,
@@ -240,7 +241,10 @@ fn deliver(reg: &mut Registry, l: &mut FillLedger, f: &FillEvent) -> Option<Fill
 /// A fill of `qty` on `INST` for another engine's order (`who`), named `fid`.
 fn foreign_fill(who: CidMatch, v: Option<&str>, qty: i64, fid: &str) -> FillEvent {
     FillEvent {
-        cid: Some(who),
+        origin: FillOrigin::Order {
+            cid: Some(who),
+            px: Ticks(100),
+        },
         ident: fbc_core::FillIdent::Venue {
             fill: common::fill_id(fid),
             vid: v.map(vid),

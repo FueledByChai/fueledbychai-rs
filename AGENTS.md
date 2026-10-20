@@ -138,6 +138,10 @@ rather than guess.
     the canonical client-id codec, `Fee`/`FeeBook`, `InstrumentSpec`, `VenueCaps`, events,
     commands, the codec and factory traits, `DecodeScope` and `EncodeCtx` (0003, 0004), and
     `PathStamps`, whose marks reach the runtime's `PathRecorder` and give back no time (0034).
+    A `FillEvent` states its `origin: FillOrigin` once: an order's execution (`Order`, its
+    client id and grid price) or a change the venue made itself (`Venue`, a `VenueFillKind`:
+    liquidation, transfer, settlement or block trade, with no client id and the exact
+    `PxExact` price the venue states; 0120).
     `VenueCaps` keeps order and fill capabilities together in `exec: Option<ExecCaps>`,
     `None` for a market-data-only venue, which declares no fill source or fee sign (0015).
     Every codec names the credentials in what it receives (`redact_inbound`, `InboundSpans`;
@@ -322,7 +326,11 @@ rather than guess.
     cancel-all only under the held market lease after a trustworthy resync with no order not
     ours in view, otherwise our orders cancelled by explicit reference, named again on each
     resync while Killed, never an account cancel-all, and own fills counted once in every state
-    while foreign ones are flagged; Exit's admission (0012, 0063; `tests/exit.rs`): only reduce-only or
+    while foreign ones are flagged; venue-initiated fills (0120; `tests/venue_fills.rs`): a
+    `Venue`-origin fill counted once on the inventory through the `FillLedger` in every state
+    (`FillRouted::Venue`), on no order, putting nothing in view and arming nothing, placed
+    against the seed only by its arrival or time and counted after a snapshot seed unless
+    they place it there; Exit's admission (0012, 0063; `tests/exit.rs`): only reduce-only or
     reducing-classified orders on the side that reduces the position, the position plus that
     side's orders never crossing zero, every cap still applied, nothing once flat; the
     `ExecutionPlanner` (0005, 0065, 0068; `src/planner.rs`, `tests/planner.rs`): the
@@ -501,7 +509,10 @@ rather than guess.
     each reported once per order and request, a later event repeating it the order update alone
     (`ModifyRequests`, kept by the codec, 0086; bounded to each order's latest outcomes, 0091)
     (`src/exec/order.rs`, held to the hand-built
-    frames in `fixtures/paradex/exec/`); the REST
+    frames in `fixtures/paradex/exec/`); the private `FillEvent` decoded into fills keyed
+    `<fillType>:<fillId>`, FILL and RPI an order's execution at its grid price and
+    LIQUIDATION, UNWIND_TRANSFER, SETTLE_MARKET and BLOCK_TRADE the venue's own at the exact
+    price it states, off the grid included (`src/exec/fill.rs`, 0120); the REST
     resync (`GET /orders`, `GET /positions`) and the order query by client id
     (`GET /orders-history`), as requests carrying only the caller's headers and as plans, their
     answers decoded whole into the `Resync*` events and a `QueryResult` (`src/exec/rest.rs`, held

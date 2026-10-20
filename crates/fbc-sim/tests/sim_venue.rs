@@ -568,7 +568,12 @@ fn cancel(target: OrderRef) -> VenueCommand {
 /// The fill's quantity, liquidity and fee cost in nanos, from a decoded event.
 fn fill_of(ev: &ExecEvent) -> Option<(i64, i64, Liquidity3, i128)> {
     match ev {
-        ExecEvent::Fill(f) => Some((f.px.0, f.qty.get(), f.liquidity, f.fee.cost().nanos)),
+        ExecEvent::Fill(f) => Some((
+            f.order_px().unwrap().0,
+            f.qty.get(),
+            f.liquidity,
+            f.fee.cost().nanos,
+        )),
         _ => None,
     }
 }
@@ -671,7 +676,7 @@ fn a_placed_order_is_accepted_after_the_latency_and_filled_through_the_queue_by_
         panic!()
     };
     assert_eq!(
-        (fill.vid(), fill.cum_after(), fill.cid),
+        (fill.vid(), fill.cum_after(), fill.cid()),
         (Some(&vid), Some(lots(1)), Some(CidMatch::Ours(order)))
     );
     assert_eq!(fill.fee.cost().asset, usdc());
@@ -1208,13 +1213,13 @@ fn a_trade_without_an_aggressor_is_classified_against_the_touch() {
     let ExecEvent::Fill(f) = &got[0].1 else {
         panic!()
     };
-    assert_eq!((f.side, f.px), (Side::Sell, Ticks(201)));
+    assert_eq!((f.side, f.order_px()), (Side::Sell, Some(Ticks(201))));
     v.trade(T0 + 8 * MS, Aggressor::Unknown, 199, 2);
     let got = v.answers();
     let ExecEvent::Fill(f) = &got[0].1 else {
         panic!()
     };
-    assert_eq!((f.side, f.px), (Side::Buy, Ticks(199)));
+    assert_eq!((f.side, f.order_px()), (Side::Buy, Some(Ticks(199))));
     // A trade the venue names a buyer for fills the offer's rest.
     v.trade(T0 + 8 * MS, Aggressor::Buyer, 201, 1);
     let got = v.answers();
@@ -1975,7 +1980,12 @@ fn order_events_say_only_what_the_stood_in_venue_echoes() {
     let ExecEvent::Fill(f) = &got[1].1 else {
         panic!("{got:?}")
     };
-    assert_eq!(f.cid, None);
+    // An execution of the order that echoes no client id, never a change the venue made
+    // itself, which fbc-oms would count on the inventory unflagged (decision 0120).
+    assert!(
+        matches!(f.origin, fbc_core::FillOrigin::Order { cid: None, .. }),
+        "{f:?}"
+    );
     let ExecEvent::Order(o) = &got[2].1 else {
         panic!("{got:?}")
     };
@@ -1994,7 +2004,7 @@ fn order_events_say_only_what_the_stood_in_venue_echoes() {
     let ExecEvent::Fill(f) = &got[1].1 else {
         panic!("{got:?}")
     };
-    assert_eq!(f.cid, Some(CidMatch::Ours(order)));
+    assert_eq!(f.cid(), Some(CidMatch::Ours(order)));
     let ExecEvent::Order(o) = &got[2].1 else {
         panic!("{got:?}")
     };

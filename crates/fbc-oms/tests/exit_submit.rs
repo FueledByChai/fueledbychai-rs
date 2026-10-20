@@ -26,9 +26,9 @@ use std::time::Duration;
 use arm::{leases, named, start};
 use common::{cid, fill, ident, lots, order_caps, placement, vid};
 use fbc_core::{
-    AccountKey, AckLevel, AmendAck, AmendCaps, AmendQty, CidMatch, ClientOrderId, InstrumentId,
-    ItemRef, MonoNs, Namespace, NewOrder, OrderCaps, OrderKind, RefKind, Side, SignedLots,
-    SubmitOutcome, TagSet, Ticks, WallNs,
+    AccountKey, AckLevel, AmendAck, AmendCaps, AmendQty, CidMatch, ClientOrderId, FillOrigin,
+    InstrumentId, ItemRef, MonoNs, Namespace, NewOrder, OrderCaps, OrderKind, RefKind, Side,
+    SignedLots, SubmitOutcome, TagSet, Ticks, WallNs,
 };
 use fbc_oms::{
     Admission, Authorization, CancelChoice, FillLedger, FillRouted, LadderConfig, Leases,
@@ -188,7 +188,10 @@ fn apply_at(
     let mut f = fill(Some(cid), ident(fid), side, qty, false);
     f.inst = inst;
     if foreign {
-        f.cid = Some(CidMatch::Foreign(Namespace::new(99)));
+        f.origin = FillOrigin::Order {
+            cid: Some(CidMatch::Foreign(Namespace::new(99))),
+            px: Ticks(100),
+        };
     }
     match l.admit(&f, None, at) {
         Admission::Apply(a) => reg.apply_fill(a).unwrap(),

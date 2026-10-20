@@ -21,10 +21,11 @@ use fbc_conformance::toy::{self, ToyExec, ToyFactory, ToySigner};
 use fbc_core::{
     AccountSummary, AssetKey, CidMatch, ClientIdFormat, ConfigError, CtxCall, DecodeError,
     DecodeScope, Effect, Effects, EncodeCtx, EncodeReceipt, EndpointPlan, ExecCodec, ExecEndpoint,
-    ExecEvent, ExecSink, FieldSpec, HttpFailure, HttpPlan, HttpResponse, HttpTag, Inbound,
-    InboundSpans, InstrumentSpecDraft, MdCodec, NotSentReason, OrderKind, PathStamps, PriceGrid,
-    RawFrame, RpcId, Secrets, SpecTable, StreamId, Subscription, SymbolError, TagSet, Ticks,
-    TimerTag, VenueCaps, VenueCommand, VenueConfig, VenueError, VenueFactory, VenueMeta, WallNs,
+    ExecEvent, ExecSink, FieldSpec, FillEvent, FillOrigin, HttpFailure, HttpPlan, HttpResponse,
+    HttpTag, Inbound, InboundSpans, InstrumentSpecDraft, MdCodec, NotSentReason, OrderKind,
+    PathStamps, PriceGrid, RawFrame, RpcId, Secrets, SpecTable, StreamId, Subscription,
+    SymbolError, TagSet, Ticks, TimerTag, VenueCaps, VenueCommand, VenueConfig, VenueError,
+    VenueFactory, VenueMeta, WallNs,
 };
 use rust_decimal::Decimal;
 use toy_setup::{FIXTURES, assumed};
@@ -174,7 +175,10 @@ impl ExecSink for LoseIds<'_> {
         let cid = match &mut ev {
             ExecEvent::ResyncOrder(snap) => Some(&mut snap.cid),
             ExecEvent::Order(update) => Some(&mut update.cid),
-            ExecEvent::Fill(fill) => Some(&mut fill.cid),
+            ExecEvent::Fill(FillEvent {
+                origin: FillOrigin::Order { cid, .. },
+                ..
+            }) => Some(cid),
             _ => None,
         };
         if let Some(cid) = cid {

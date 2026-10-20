@@ -25,19 +25,19 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use arm::start;
-use common::{fill, fill_id, lease_dir, lots, order_caps, vid};
+use common::{fill, fill_id, lease_dir, lots, no_fee, order_caps, venue_fill, vid};
 use fbc_core::{
     AccountKey, AckLevel, AmendAck, AmendCaps, AmendQty, Bps, CancelReason, Channel, CidMatch,
     CidMint, ClientOrderId, ExchNs, ExchTsKind, Feature, FillIdent, InstrumentId, ItemRef, MonoNs,
-    Namespace, NamespaceLease, NewOrder, OrderCaps, OrderKind, OrderUpdate, RefKind, RpcId, Side,
-    SignedLots, SubmitOutcome, TagSet, Ticks, Tif, VenueCommand, VenueOrderSnapshot,
-    VenueOrderState, WallNs,
+    Namespace, NamespaceLease, NewOrder, OrderCaps, OrderKind, OrderUpdate, PxExact, RefKind,
+    RpcId, Side, SignedLots, SubmitOutcome, TagSet, Ticks, Tif, VenueCommand, VenueFillKind,
+    VenueOrderSnapshot, VenueOrderState, WallNs,
 };
 use fbc_oms::{
     Admission, AmendRefusal, CapRefusal, DesiredBook, DesiredQuote, Downgrade, ExecutionPlanner,
-    FillLedger, FillTime, LadderConfig, Leases, LedgerConfig, MarketCapsConfig, OmsError, OrderKey,
-    OrderOp, Plan, PlanError, PlanRefusal, Planned, PlannerConfig, PreTradeCaps, ReduceFallback,
-    Registry, ResyncSnapshot, Stage,
+    FillLedger, FillRouted, FillTime, LadderConfig, Leases, LedgerConfig, MarketCapsConfig,
+    OmsError, OrderKey, OrderOp, Plan, PlanError, PlanRefusal, Planned, PlannerConfig,
+    PreTradeCaps, ReduceFallback, Registry, ResyncSnapshot, Stage,
 };
 
 const INST: InstrumentId = InstrumentId::new(1);
@@ -795,6 +795,67 @@ fn an_emulated_order_is_cancelled_on_the_fill_that_makes_it_overshoot_then_repla
     assert_eq!(again.len(), 1);
     assert_emulated(placed(again[0]), 6);
     assert_eq!(again[0].downgrades, vec![Downgrade::EmulatedReduceOnly]);
+}
+
+/// A venue-initiated fill (decision 0120) is a fill like any other for the check after a fill:
+/// a liquidation that shrinks the position leaves an emulated reduce-only order resting more
+/// than is left to reduce, and the check cancels it; the order counted none of it.
+#[test]
+fn after_a_liquidation_the_check_cancels_an_emulated_order_it_left_overshooting() {
+    // Long 10: an emulated exit of 10 at level 0.
+    let mut reg = quoting(10);
+    let mut l = ledger();
+    let mut mint = mint();
+    let mut p = planner();
+    let caps = conflicting(&[(Feature::PostOnly, Feature::ReduceOnly)]);
+    let desired = book().with(
+        Side::Sell,
+        0,
+        maker_exit(10_010, 10, ReduceFallback::EmulateReduceOnly),
+    );
+    let plan = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, MonoNs(0));
+    let emulated = plan.commands[0].cid;
+    assert_emulated(placed(&plan.commands[0]), 10);
+    ack(&mut reg, emulated, "v0");
+    assert!(
+        p.on_fill(&mut reg, &caps, ACCT, INST)
+            .unwrap()
+            .commands
+            .is_empty()
+    );
+    // The venue liquidates 4 of the long, after the seed: 6 left, and the emulated exit of 10
+    // would take the position past zero.
+    let liq = venue_fill(
+        VenueFillKind::Liquidation,
+        "LIQUIDATION:1",
+        None,
+        Side::Sell,
+        4,
+        PxExact::new(10_010, 0),
+        no_fee(),
+    );
+    let time = Some(FillTime {
+        exch: ExchNs(1_500),
+        kind: ExchTsKind::MatchingEngine,
+        aligned: WallNs(1_500),
+    });
+    match l.admit(&liq, time, MonoNs(1_100)) {
+        Admission::Apply(a) => assert_eq!(
+            reg.apply_fill(a).unwrap(),
+            FillRouted::Venue {
+                kind: VenueFillKind::Liquidation,
+                in_snapshot: false,
+            }
+        ),
+        other => panic!("expected the fill accepted, got {other:?}"),
+    }
+    assert_eq!(reg.position(INST), Some(SignedLots(6)));
+    let cancels = p.on_fill(&mut reg, &caps, ACCT, INST).unwrap().commands;
+    assert_eq!(cancels.len(), 1);
+    assert_eq!(cancels[0].cid, emulated);
+    assert_eq!(cancels[0].stage, Stage::Cancel);
+    assert!(matches!(cancels[0].auth.command(), VenueCommand::Cancel(_)));
+    assert_eq!(reg.get(emulated).unwrap().cum_fills(), lots(0));
 }
 
 #[test]

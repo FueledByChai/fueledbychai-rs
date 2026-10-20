@@ -45,10 +45,10 @@ use std::time::{Duration, Instant};
 
 use fbc_core::{
     AccountKey, AckLevel, Channel, CidMatch, CidMint, ClientIdFormat, ClientOrderId, ConnKey,
-    ConnState, DecodeError, Envelope, ExecEvent, FillIdent, HttpFailure, Liquidity3, Lots,
-    MarketLease, Money, NewOrder, NonceBlock, NonceScope, NonceSource, OpKind, OrderKind, Secrets,
-    Side, SignedLots, SpecTable, SubmitHandle, SubmitOutcome, Ticks, Tif, TrafficClass,
-    VenueFactory, VenueOrderSnapshot, encode_cid,
+    ConnState, DecodeError, Envelope, ExecEvent, FillIdent, FillOrigin, HttpFailure, Liquidity3,
+    Lots, MarketLease, Money, NewOrder, NonceBlock, NonceScope, NonceSource, OpKind, OrderKind,
+    Secrets, Side, SignedLots, SpecTable, SubmitHandle, SubmitOutcome, Ticks, Tif, TrafficClass,
+    VenueFactory, VenueFillKind, VenueOrderSnapshot, encode_cid,
 };
 use fbc_journal::{
     ControlEvent, JournalSink, JournalWriter, NonceSourceId, Record, RecordRef, Recorded,
@@ -550,6 +550,22 @@ struct Tracker {
 /// quantity and price ([`Tracker::stated`]).
 type Stated = (u64, Option<Lots>, Lots, Option<Ticks>);
 
+/// A fill's price as the evidence writes it, in the market's units: an order fill's ticks at
+/// `tick`, and a change the venue made itself exactly as the venue states it, on the grid or off
+/// it (decisions 0004 and 0120).
+pub fn fill_price(origin: &FillOrigin, tick: Decimal) -> String {
+    match origin {
+        FillOrigin::Order { px, .. } => (Decimal::from(px.0) * tick).normalize().to_string(),
+        FillOrigin::Venue { px, .. } => px.normalized().to_string(),
+    }
+}
+
+/// The evidence's label for a change the venue made itself, by its kind (decision 0120): told
+/// apart from an order fill not ours, another namespace's or another system's.
+pub fn venue_fill_label(kind: VenueFillKind) -> String {
+    format!("venue: {kind:?}")
+}
+
 /// `m` in its units, as a decimal.
 fn money(m: &Money) -> String {
     format!(
@@ -566,11 +582,15 @@ impl Tracker {
         match ev {
             ExecEvent::Fill(f) => {
                 self.changes += 1;
-                let label = match f.cid {
-                    Some(CidMatch::Ours(cid)) => self
+                let label = match f.origin {
+                    FillOrigin::Venue { kind, .. } => venue_fill_label(kind),
+                    FillOrigin::Order {
+                        cid: Some(CidMatch::Ours(cid)),
+                        ..
+                    } => self
                         .get(cid)
                         .map_or_else(|| "ours, not followed".to_owned(), |o| o.label.clone()),
-                    _ => "not ours".to_owned(),
+                    FillOrigin::Order { .. } => "not ours".to_owned(),
                 };
                 let fill_id = match &f.ident {
                     FillIdent::Venue { fill, .. } => fill.as_str().to_owned(),
@@ -583,7 +603,7 @@ impl Tracker {
                     order: label,
                     fill_id,
                     side: format!("{:?}", f.side),
-                    price: (Decimal::from(f.px.0) * tick).normalize().to_string(),
+                    price: fill_price(&f.origin, tick),
                     size: (Decimal::from(f.qty.get()) * step).normalize().to_string(),
                     liquidity: match f.liquidity {
                         Liquidity3::Maker => "maker",

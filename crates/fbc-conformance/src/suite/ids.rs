@@ -200,7 +200,7 @@ fn ours(event: &ExecEvent) -> Option<(ClientOrderId, bool)> {
     let (cid, resting) = match event {
         ExecEvent::ResyncOrder(snap) => (snap.cid, snap.state == VenueOrderState::Open),
         ExecEvent::Order(update) => (update.cid, false),
-        ExecEvent::Fill(fill) => (fill.cid, false),
+        ExecEvent::Fill(fill) => (fill.cid(), false),
         _ => return None,
     };
     match cid {
