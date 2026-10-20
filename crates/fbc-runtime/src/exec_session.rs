@@ -442,9 +442,9 @@ pub enum ExecSessionError {
         name: &'static str,
     },
     /// The planned endpoint of `stream` names a credential header but its URL is plain `ws://`
-    /// to a host other than this machine's loopback (`127.0.0.0/8`, `::1`, `localhost`), so the
-    /// key would cross the network in cleartext (decision 0116). Nothing is opened; the URL is
-    /// not shown.
+    /// to a host other than this machine's loopback (`127.0.0.0/8`, `::1`, `localhost`), or
+    /// plain `ws://` through a SOCKS5 proxy, so the key would cross the network in cleartext
+    /// (decision 0116). Nothing is opened; the URL is not shown.
     CleartextHandshake { stream: StreamId },
     /// The session has run: it runs once, and a new one is built to run again.
     Ended,
@@ -482,7 +482,7 @@ impl fmt::Display for ExecSessionError {
             ExecSessionError::CleartextHandshake { stream } => write!(
                 f,
                 "the planned endpoint on stream {} carries a credential header over plain ws:// \
-                 to a host that is not loopback; give a wss:// URL",
+                 off this machine; give a wss:// URL",
                 stream.0
             ),
             ExecSessionError::Ended => f.write_str("the session has run; it runs once"),
@@ -1704,7 +1704,8 @@ fn parts(config: ExecSessionConfig, entry: Entry) -> Result<Parts, ExecSessionEr
             let mut headers = Vec::with_capacity(plan.len());
             for ep in &plan {
                 ws::check_url(ep.url.as_str()).map_err(SessionError::Url)?;
-                headers.push(HandshakeHeaders::for_endpoint(ep, &config.creds)?);
+                let proxy = config.connector.proxy();
+                headers.push(HandshakeHeaders::for_endpoint(ep, &config.creds, proxy)?);
             }
             let codec = venue.exec_codec(cfg, config.creds);
             let codec = codec.ok_or(ExecSessionError::NoOrderEntry)?;

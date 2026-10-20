@@ -4,7 +4,9 @@
 //!
 //! A venue names them in its [`ExecEndpoint`]s ([`HandshakeHeader`]: a header and the
 //! [`Secrets`] key whose value it carries). As a session is built, before the credentials are
-//! handed to the venue's codec, [`HandshakeHeaders::for_endpoint`] checks each name and copies
+//! handed to the venue's codec, [`HandshakeHeaders::for_endpoint`] refuses an endpoint whose
+//! headers would cross the network in the clear (plain `ws://` off this machine, or through a
+//! SOCKS5 proxy), checks each name and copies
 //! each value into a [`Secret`] of the runtime's own, zeroed when the session drops; the codec
 //! still gets the whole set. Every connection attempt to that endpoint, a reconnect's and one
 //! through a SOCKS5 proxy included, then adds them to its upgrade request
@@ -16,12 +18,15 @@
 //! writes the request into are not zeroed after the write (FBC-96h, deferred).
 
 use core::fmt;
+use core::net::IpAddr;
 
 use fbc_core::{ConfigError, ExecEndpoint, HandshakeHeader, Secret, Secrets, VenueError};
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::http::request::Builder;
 
+use crate::connector::ProxyConfig;
 use crate::exec_session::ExecSessionError;
+use crate::target;
 
 /// The headers an opening handshake sets itself, or that would frame a body it does not have:
 /// a venue may not name one (decision 0116).
@@ -46,15 +51,21 @@ impl HandshakeHeaders {
         HandshakeHeaders::default()
     }
 
-    /// The headers `ep` names, their values read from `creds`. Refused when `ep` names a header
-    /// no handshake can carry, or names one twice ([`ExecSessionError::HandshakeHeader`]), when
+    /// The headers `ep` names, their values read from `creds`. Refused when `ep` names any but
+    /// its URL is plain `ws://` to a host not loopback, or through `proxy`
+    /// ([`ExecSessionError::CleartextHandshake`]), when it names a header no handshake can
+    /// carry, or names one twice ([`ExecSessionError::HandshakeHeader`]), when
     /// `creds` lack a key it names ([`ConfigError::Missing`]), or when a value is not one a
     /// header can carry, empty or holding a line break ([`ConfigError::Invalid`]); none of
     /// these carries a value.
     pub(crate) fn for_endpoint(
         ep: &ExecEndpoint,
         creds: &Secrets,
+        proxy: &ProxyConfig,
     ) -> Result<HandshakeHeaders, ExecSessionError> {
+        if !ep.handshake.is_empty() && !private_wire(ep.url.as_str(), proxy) {
+            return Err(ExecSessionError::CleartextHandshake { stream: ep.stream });
+        }
         let mut headers: Vec<(HeaderName, Secret)> = Vec::with_capacity(ep.handshake.len());
         for &HandshakeHeader { name, secret } in &ep.handshake {
             let refused = ExecSessionError::HandshakeHeader {
@@ -103,6 +114,20 @@ impl HandshakeHeaders {
     }
 }
 
+/// Whether a handshake to `url` under `proxy` keeps its headers off the network in the clear:
+/// `wss://`, or plain `ws://` only directly to this machine's loopback (`127.0.0.0/8`, `::1`,
+/// `localhost`), a test stub's, as Paradex's factory has it for its order socket (decision
+/// 0116). Through a SOCKS5 proxy a loopback name is the proxy host's, reached over the tunnel,
+/// so plain `ws://` is refused there. A URL that does not parse is no such URL.
+fn private_wire(url: &str, proxy: &ProxyConfig) -> bool {
+    let Ok(to) = target::parse(url).and_then(|uri| target::target(&uri, "ws", "wss")) else {
+        return false;
+    };
+    let loopback = to.host.eq_ignore_ascii_case("localhost")
+        || to.host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    to.tls || (loopback && matches!(proxy, ProxyConfig::Direct))
+}
+
 /// No header can carry a line feed.
 const UNSENDABLE: &[u8] = b"\n";
 
@@ -123,6 +148,7 @@ mod tests {
     use hyper::Request;
 
     const KEY: &str = "toy.key";
+    const DIRECT: ProxyConfig = ProxyConfig::Direct;
 
     fn value() -> String {
         format!("SYNTH{}-auth-unit", "apikey")
@@ -152,7 +178,8 @@ mod tests {
     #[test]
     fn the_headers_go_on_the_request_as_they_are_and_marked_sensitive() {
         let headers =
-            HandshakeHeaders::for_endpoint(&endpoint(&["Authorization"]), &creds(value())).unwrap();
+            HandshakeHeaders::for_endpoint(&endpoint(&["Authorization"]), &creds(value()), &DIRECT)
+                .unwrap();
         let request = headers.add_to(Request::get("/")).body(()).unwrap();
         let sent = request.headers().get_all("authorization");
         let sent: Vec<&HeaderValue> = sent.iter().collect();
@@ -168,7 +195,8 @@ mod tests {
 
     #[test]
     fn an_endpoint_naming_none_adds_nothing() {
-        let headers = HandshakeHeaders::for_endpoint(&endpoint(&[]), &Secrets::new()).unwrap();
+        let headers =
+            HandshakeHeaders::for_endpoint(&endpoint(&[]), &Secrets::new(), &DIRECT).unwrap();
         let request = headers.add_to(Request::get("/")).body(()).unwrap();
         assert!(request.headers().is_empty());
     }
@@ -185,7 +213,7 @@ mod tests {
             "Content-Length",
             "Transfer-Encoding",
         ] {
-            let err = HandshakeHeaders::for_endpoint(&endpoint(&[name]), &creds(value()));
+            let err = HandshakeHeaders::for_endpoint(&endpoint(&[name]), &creds(value()), &DIRECT);
             let want = ExecSessionError::HandshakeHeader {
                 stream: StreamId(3),
                 name,
@@ -201,7 +229,7 @@ mod tests {
             format!("{}\0", value()),
             String::new(),
         ] {
-            let err = HandshakeHeaders::for_endpoint(&endpoint(&["X-Key"]), &creds(bad));
+            let err = HandshakeHeaders::for_endpoint(&endpoint(&["X-Key"]), &creds(bad), &DIRECT);
             let err = err.err().unwrap();
             assert!(
                 matches!(
@@ -227,7 +255,11 @@ mod tests {
             "ws://localhost.example/",
             "ws://127.0.0.1@toy.invalid/",
         ] {
-            let err = HandshakeHeaders::for_endpoint(&at(url, &["Authorization"]), &creds(value()));
+            let err = HandshakeHeaders::for_endpoint(
+                &at(url, &["Authorization"]),
+                &creds(value()),
+                &DIRECT,
+            );
             let err = err.err();
             let want = ExecSessionError::CleartextHandshake {
                 stream: StreamId(3),
@@ -247,12 +279,33 @@ mod tests {
             "ws://localhost:9/",
             "ws://LOCALHOST/",
         ] {
-            let headers =
-                HandshakeHeaders::for_endpoint(&at(url, &["Authorization"]), &creds(value()));
+            let headers = HandshakeHeaders::for_endpoint(
+                &at(url, &["Authorization"]),
+                &creds(value()),
+                &DIRECT,
+            );
             assert!(headers.is_ok(), "{url}");
         }
+        // Through a proxy, a loopback name is the proxy host's: only wss:// keeps it private.
+        let socks = ProxyConfig::Socks5 {
+            host: "127.0.0.1".into(),
+            port: 1080,
+        };
+        for (url, ok) in [
+            ("ws://127.0.0.1:9/", false),
+            ("ws://localhost:9/", false),
+            ("wss://toy.invalid/", true),
+        ] {
+            let got = HandshakeHeaders::for_endpoint(
+                &at(url, &["Authorization"]),
+                &creds(value()),
+                &socks,
+            );
+            assert_eq!(got.is_ok(), ok, "{url}");
+        }
         // An endpoint naming no header sends no credential, whatever its scheme.
-        let none = HandshakeHeaders::for_endpoint(&at("ws://toy.invalid/", &[]), &Secrets::new());
+        let none =
+            HandshakeHeaders::for_endpoint(&at("ws://toy.invalid/", &[]), &Secrets::new(), &DIRECT);
         assert!(none.is_ok());
     }
 

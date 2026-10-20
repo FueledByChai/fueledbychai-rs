@@ -41,8 +41,14 @@ This augments 0014 (the venue boundary) and 0029 (the handshake); it supersedes 
    name that is not a header name, one the handshake sets itself (`Host`, `Connection`,
    `Upgrade`, any `Sec-WebSocket-` header) or one that frames a body (`Content-Length`,
    `Transfer-Encoding`), or a header named twice on one endpoint, is a venue defect,
-   `ExecSessionError::HandshakeHeader { stream, name }`. Each refuses the session before
-   anything is opened.
+   `ExecSessionError::HandshakeHeader { stream, name }`. An endpoint that names any header
+   but whose URL is plain `ws://` to a host other than this machine's loopback
+   (`127.0.0.0/8`, `::1`, `localhost`), or plain `ws://` through the consumer's SOCKS5 proxy
+   (where a loopback name is the proxy host's, reached over the tunnel), is
+   `ExecSessionError::CleartextHandshake { stream }`: the key would cross the network in the
+   clear, so it goes only inside `wss://`, as Paradex's factory already refuses `ws://` but to
+   a loopback test stub for its order socket. It names the stream, never the URL. Each refuses
+   the session before anything is opened.
 4. **Sent on every connection.** Every connection attempt to the endpoint, a reconnect's and
    one through the consumer's SOCKS5 proxy included, and every endpoint 0115 plans after the
    first, adds the headers to its upgrade request, each value marked sensitive (`HeaderValue::set_sensitive`), so the request's `Debug` shows

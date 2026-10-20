@@ -661,8 +661,7 @@ async fn a_header_the_runtime_sets_itself_or_one_named_twice_is_refused_as_a_ven
 }
 
 #[tokio::test]
-async fn a_credential_header_over_plain_ws_to_a_host_not_loopback_is_refused_before_anything_opens()
-{
+async fn a_credential_header_over_plain_ws_off_this_machine_is_refused_before_anything_opens() {
     let local = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let proxy = Socks5Stub::start(&[("trade.invalid", local)], Answer::Relay).await;
     let socks = || {
@@ -672,6 +671,7 @@ async fn a_credential_header_over_plain_ws_to_a_host_not_loopback_is_refused_bef
         })
     };
     // Either endpoint, directly or through the proxy: the key would cross the wire in the clear.
+    // Through the proxy a loopback name is the proxy host's own, reached over its tunnel.
     for (trade, account, connector, stream) in [
         (
             "ws://trade.invalid:9/a",
@@ -682,6 +682,18 @@ async fn a_credential_header_over_plain_ws_to_a_host_not_loopback_is_refused_bef
         ("ws://127.0.0.1:9/a", "ws://10.0.0.1:9/b", direct(), ACCOUNT),
         (
             "ws://trade.invalid:9/a",
+            "wss://account.invalid:9/b",
+            socks(),
+            EXEC_STREAM,
+        ),
+        (
+            "wss://trade.invalid:9/a",
+            "ws://127.0.0.1:9/b",
+            socks(),
+            ACCOUNT,
+        ),
+        (
+            "ws://localhost:9/a",
             "wss://account.invalid:9/b",
             socks(),
             EXEC_STREAM,
