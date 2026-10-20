@@ -155,18 +155,17 @@ impl QfexMd {
                 if qty == Lots::ZERO {
                     return Err(DecodeError::Malformed("size"));
                 }
-                let aggressor = match string(data, "side")?.to_ascii_uppercase().as_str() {
-                    "BUY" => Aggressor::Buyer,
-                    "SELL" => Aggressor::Seller,
+                match string(data, "side")?.to_ascii_uppercase().as_str() {
+                    "BUY" | "SELL" => (),
                     _ => return Err(DecodeError::Malformed("side")),
-                };
+                }
                 // The documented trade_id is a UUID; the normalized event accepts u64 only.
                 sink.push(
                     meta,
                     MdEvent::Trade {
                         inst: spec.id,
                         id: None,
-                        aggressor,
+                        aggressor: Aggressor::Unknown,
                         px,
                         qty,
                     },
@@ -182,6 +181,7 @@ impl QfexMd {
         data: &Map<String, Value>,
         specs: &SpecTable,
         sink: &mut dyn MdSink,
+        fx: &mut Effects,
     ) -> Result<(), DecodeError> {
         // QFEX's error envelope echoes the rejected request. Only a rejected subscribe has
         // subscription meaning; the human-readable error text is never needed here.
@@ -189,7 +189,7 @@ impl QfexMd {
             .get("err")
             .and_then(Value::as_object)
             .ok_or(DecodeError::Malformed("err"))?;
-        string(err, "error_code")?;
+        let code = string(err, "error_code")?;
         let request = err
             .get("incoming_message")
             .and_then(Value::as_object)
@@ -226,6 +226,15 @@ impl QfexMd {
         }
         if refused.is_empty() || refused.iter().any(|sub| !self.active.contains(sub)) {
             return Err(DecodeError::Malformed("incoming_message"));
+        }
+        if matches!(code, "RateLimited" | "ServerError") {
+            // A new epoch gets a fresh codec and resubscribes through the runtime's
+            // reconnect pacing. Retrying on this socket would need an unknown backoff.
+            fx.push(Effect::Reconnect {
+                stream: self.stream,
+                reason: "transient QFEX subscription error",
+            });
+            return Ok(());
         }
         for sub in refused {
             self.active.remove(&sub);
@@ -282,7 +291,7 @@ impl MdCodec for QfexMd {
         _scope: &DecodeScope<'_>,
         specs: &SpecTable,
         sink: &mut dyn MdSink,
-        _fx: &mut Effects,
+        fx: &mut Effects,
     ) -> Result<(), DecodeError> {
         let RawFrame::Text(text) = f else {
             return Err(DecodeError::Malformed("binary frame"));
@@ -291,7 +300,7 @@ impl MdCodec for QfexMd {
             serde_json::from_str(text).map_err(|_| DecodeError::Malformed("JSON"))?;
         let data = value.as_object().ok_or(DecodeError::Malformed("object"))?;
         if data.contains_key("err") {
-            self.on_error(data, specs, sink)
+            self.on_error(data, specs, sink, fx)
         } else {
             self.decode(data, specs, sink)
         }

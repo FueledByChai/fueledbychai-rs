@@ -7,6 +7,7 @@ mod caps;
 mod md;
 
 use std::collections::BTreeSet;
+use std::net::Ipv6Addr;
 
 use fbc_core::{
     AccountSummary, AssetKey, BookId, ConfigError, ConfigScope, EndpointPlan, ExecCodec,
@@ -35,18 +36,47 @@ fn mds_url(cfg: &VenueConfig) -> Result<&str, ConfigError> {
     let url = cfg
         .get(KEY_MDS_URL)
         .ok_or(ConfigError::Missing(KEY_MDS_URL))?;
-    let valid_scheme = url.starts_with("ws://") || url.starts_with("wss://");
-    let authority = url.split_once("://").map(|(_, rest)| rest).unwrap_or("");
-    let valid_authority = !authority.is_empty()
-        && !authority.contains(['/', '?', '#', '@', ' '])
-        && !authority.starts_with(':');
-    if !valid_scheme || !valid_authority {
+    let authority = url
+        .strip_prefix("ws://")
+        .or_else(|| url.strip_prefix("wss://"));
+    if !authority.is_some_and(valid_host_port) {
         return Err(ConfigError::Invalid {
             key: KEY_MDS_URL,
             reason: "expected a WebSocket origin",
         });
     }
     Ok(url)
+}
+
+/// WebSocket origin authority: DNS name, IPv4, or bracketed IPv6, with an optional valid port.
+fn valid_host_port(authority: &str) -> bool {
+    let (host_ok, port) = match authority.strip_prefix('[') {
+        Some(rest) => {
+            let Some((host, after)) = rest.split_once(']') else {
+                return false;
+            };
+            let port = match after {
+                "" => None,
+                _ => match after.strip_prefix(':') {
+                    Some(port) => Some(port),
+                    None => return false,
+                },
+            };
+            (host.parse::<Ipv6Addr>().is_ok(), port)
+        }
+        None => {
+            let (host, port) = match authority.split_once(':') {
+                Some((host, port)) => (host, Some(port)),
+                None => (authority, None),
+            };
+            let name = |c: char| c.is_ascii_alphanumeric() || c == '.' || c == '-';
+            (!host.is_empty() && host.chars().all(name), port)
+        }
+    };
+    host_ok
+        && port.is_none_or(|p| {
+            p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok_and(|n| n > 0)
+        })
 }
 
 /// A read-only QFEX venue factory.

@@ -122,6 +122,7 @@ fn public_factory_plans_one_read_only_mds_connection() {
     assert_eq!(Qfex.id(), "QFEX");
     assert_eq!(caps.exec, None);
     assert_eq!(caps.readiness_ceiling, Readiness::Record);
+    assert!(!caps.md.trades.aggressor);
     assert_eq!(caps.md.books[0].max_depth, 20);
     assert!(Qfex.plan_exec(&cfg()).unwrap().is_empty());
     assert!(Qfex.exec_codec(&cfg(), Secrets::new()).is_none());
@@ -233,7 +234,7 @@ fn documented_bbo_depth_and_trade_frames_decode_exactly() {
         MdEvent::Trade {
             inst: AAPL,
             id: None,
-            aggressor: Aggressor::Seller,
+            aggressor: Aggressor::Unknown,
             px: Ticks(40_023),
             qty: Lots::new(523_512_000).unwrap()
         }
@@ -318,6 +319,41 @@ fn a_rejected_subscription_reports_health_without_retry_or_duplicate_subscribe()
 }
 
 #[test]
+fn transient_subscription_errors_reconnect_without_permanently_refusing_feed() {
+    for code in ["RateLimited", "ServerError"] {
+        let mut codec = subscribed();
+        let error = json!({"err": {"error_code": code,
+            "incoming_message": {"type": "subscribe", "channels": ["trade"],
+                "symbols": ["AAPL-USD"]}}});
+        let mut sink = Sink::default();
+        let mut fx = Effects::new();
+        let caps = Qfex.caps(&cfg()).unwrap();
+        let result = dispatch_market_data(&caps, |scope| {
+            codec.on_frame(
+                RawFrame::Text(&error.to_string()),
+                scope,
+                &specs(),
+                &mut sink,
+                &mut fx,
+            )
+        });
+        assert_eq!(result, Ok(()), "{code}");
+        assert!(sink.0.is_empty(), "{code}");
+        assert_eq!(
+            fx.as_slice(),
+            &[Effect::Reconnect {
+                stream: fbc_core::StreamId(0),
+                reason: "transient QFEX subscription error",
+            }],
+            "{code}"
+        );
+        let (result, sink) = decode(codec.as_mut(), frame("trade"));
+        assert_eq!(result, Ok(()), "{code}");
+        assert_eq!(sink.0.len(), 1, "{code}");
+    }
+}
+
+#[test]
 fn factory_refuses_bad_endpoints_and_unavailable_feeds_before_planning() {
     assert_eq!(Qfex.config_schema()[0].key, KEY_MDS_URL);
     assert_eq!(
@@ -335,6 +371,11 @@ fn factory_refuses_bad_endpoints_and_unavailable_feeds_before_planning() {
         "wss://mds.qfex.com/path",
         "wss://user@mds.qfex.com",
         "wss://mds.qfex.com?x=1",
+        "wss://[::1",
+        "wss://mds.qfex.com:70000",
+        "wss://mds.qfex.com:0",
+        "wss://mds.qfex.com:",
+        "ws://::1",
     ] {
         let mut bad = cfg();
         bad.insert(KEY_MDS_URL, url);
@@ -348,6 +389,9 @@ fn factory_refuses_bad_endpoints_and_unavailable_feeds_before_planning() {
             .unwrap()
             .is_empty()
     );
+    let mut local = cfg();
+    local.insert(KEY_MDS_URL, "ws://[::1]:9000");
+    assert!(Qfex.caps(&local).is_ok());
     let unknown = Subscription {
         inst: InstrumentId::new(99),
         feed: Feed::Trades,
@@ -464,7 +508,7 @@ fn malformed_public_messages_are_atomic_and_a_valid_empty_book_replaces_the_old_
     assert!(matches!(
         sink.0[0].1,
         MdEvent::Trade {
-            aggressor: Aggressor::Buyer,
+            aggressor: Aggressor::Unknown,
             ..
         }
     ));
