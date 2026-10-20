@@ -784,6 +784,28 @@ pub fn inventory_price(px: Decimal, bid: Option<Decimal>, ask: Option<Decimal>) 
     [bid, ask].into_iter().flatten().fold(px, Decimal::max)
 }
 
+/// A cap of `usd` in lots of `step` at `price`, floored. The caps are the operator's own, with
+/// no ceiling (FBC-thks, decision 0113), so a cap past what a lot count holds (or a decimal
+/// holds, once divided) is the largest lot count, never zero and never a panic (Codex
+/// r4320205456 on PR #184); fbc-oms's checked arithmetic then bounds every order as at any large cap. A price or
+/// step that is not positive, or a cap that is not, gives no lot.
+pub fn cap_lots(usd: Decimal, price: Decimal, step: Decimal) -> Lots {
+    use rust_decimal::prelude::ToPrimitive;
+    let per_lot = match price.checked_mul(step) {
+        Some(per) if per > Decimal::ZERO => per,
+        Some(_) => return Lots::ZERO,
+        None => return Lots::new(i64::MAX).unwrap_or(Lots::ZERO),
+    };
+    if usd <= Decimal::ZERO {
+        return Lots::ZERO;
+    }
+    let lots = usd
+        .checked_div(per_lot)
+        .and_then(|n| n.floor().to_i64())
+        .unwrap_or(i64::MAX);
+    Lots::new(lots).unwrap_or(Lots::ZERO)
+}
+
 /// Nonces counted up from 1: Paradex asks for none, but the session reserves one per item and
 /// per arm as the contract says.
 pub struct Counting(pub u64);

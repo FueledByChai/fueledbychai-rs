@@ -137,9 +137,9 @@ use crate::link::{Link, LinkHandler, Note, async_reject, described};
 use crate::mainnet::{MAINNET_CHAIN, chain_refusal, decode_chain, mainnet_guard, trusted};
 use crate::positions::{PositionCheck, Verdict, fills_in};
 use crate::testnet::{
-    ACCOUNT_LABEL, ACCT, HighWater, INST, Lines, Out, TESTNET_CHAIN, VENUE, admit_reads, config,
-    drive_with, inventory_price, off_thread_holding, px_or_none, rest_get, resync_disagreements,
-    session_config, snapshot_max, specs, touch_and_mark, wall_now,
+    ACCOUNT_LABEL, ACCT, HighWater, INST, Lines, Out, TESTNET_CHAIN, VENUE, admit_reads, cap_lots,
+    config, drive_with, inventory_price, off_thread_holding, px_or_none, rest_get,
+    resync_disagreements, session_config, snapshot_max, specs, touch_and_mark, wall_now,
 };
 
 /// The program the refusals name.
@@ -496,12 +496,18 @@ pub fn size(opts: &Options, book: &OrderbookSnapshot, mark: Decimal) -> Result<S
         ));
     }
     let at = market_px(opts, book, &[&bid, &ask]).ok_or("no price to size the quotes at")?;
-    let lots_at = |usd: Decimal, px: Decimal| -> Lots {
-        let n = (usd / (px * opts.step)).floor().to_i64().unwrap_or(0);
-        Lots::new(n).unwrap_or(Lots::ZERO)
-    };
-    let lots_for = |usd: Decimal| lots_at(usd, at);
-    let qty = lots_for(opts.order_usd);
+    // The quote's size: one past what a lot count holds is refused, never taken.
+    let qty = opts
+        .order_usd
+        .checked_div(at * opts.step)
+        .and_then(|n| n.floor().to_i64())
+        .ok_or_else(|| {
+            format!(
+                "--order-usd ${} at {at} does not fit a lot count",
+                opts.order_usd
+            )
+        })
+        .map(|n| Lots::new(n).unwrap_or(Lots::ZERO))?;
     if qty == Lots::ZERO {
         return Err(format!(
             "--order-usd ${} at {at} is less than one size step ({}); refused",
@@ -537,8 +543,9 @@ pub fn size(opts: &Options, book: &OrderbookSnapshot, mark: Decimal) -> Result<S
     }
     Ok(Sizing {
         qty,
-        resting: lots_for(opts.resting_cap_usd),
-        inventory: lots_at(opts.inventory_cap_usd, at.max(mark)),
+        // The caps have no ceiling: one past a lot count is the largest ([`cap_lots`]).
+        resting: cap_lots(opts.resting_cap_usd, at, opts.step),
+        inventory: cap_lots(opts.inventory_cap_usd, at.max(mark), opts.step),
         at,
         mark,
     })
@@ -2587,7 +2594,7 @@ impl Driver {
                 let mint = self.mint.as_mut().ok_or("no client-id mint")?;
                 // This program reads no venue mode and no limiter room, and sends one order
                 // per command: the venue refuses what its mode refuses, and the runtime's
-                // limiter holds normal traffic at its reserve (decision 0111).
+                // limiter holds normal traffic at its reserve (decision 0113).
                 let venue = PlanVenue {
                     caps: &self.plan_caps,
                     account_mode: VenueMode::Normal,

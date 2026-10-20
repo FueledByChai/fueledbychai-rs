@@ -91,8 +91,8 @@ use crate::testnet::{
     px_or_none, wall_now,
 };
 use crate::testnet::{
-    HighWater, Out, inventory_price, latest_resync, off_thread_holding, resync_disagreements,
-    snapshot_max,
+    HighWater, Out, cap_lots, inventory_price, latest_resync, off_thread_holding,
+    resync_disagreements, snapshot_max,
 };
 
 /// The Paradex configuration for `opts`' URLs ([`crate::testnet::config`]).
@@ -501,7 +501,10 @@ pub fn price(opts: &Options, book: &OrderbookSnapshot) -> Result<Priced, String>
     let ticks = away;
     let px = Decimal::from(ticks.0) * opts.tick;
     let lots_for = |usd: Decimal, at: Decimal| -> Result<Lots, String> {
-        let n = (usd / (at * opts.step)).floor();
+        let n = usd
+            .checked_div(at * opts.step)
+            .ok_or("an amount does not fit")?
+            .floor();
         Lots::new(n.to_i64().ok_or("an amount does not fit")?)
             .ok_or_else(|| "a negative amount".to_owned())
     };
@@ -510,8 +513,13 @@ pub fn price(opts: &Options, book: &OrderbookSnapshot) -> Result<Priced, String>
     // The resting cap at the order's price, where it rests; the inventory cap at the highest
     // of that, the bid and the ask, so a position is never worth more than the cap at the
     // market.
-    let resting = lots_for(opts.resting_cap_usd, px)?;
-    let inventory = lots_for(opts.inventory_cap_usd, inventory_price(px, bid, ask))?;
+    // The caps have no ceiling: one past a lot count is the largest ([`cap_lots`]).
+    let resting = cap_lots(opts.resting_cap_usd, px, opts.step);
+    let inventory = cap_lots(
+        opts.inventory_cap_usd,
+        inventory_price(px, bid, ask),
+        opts.step,
+    );
     let size = Decimal::from(qty.get()) * opts.step;
     let notional = size * px;
     if qty.get() == 0 {
@@ -565,9 +573,7 @@ pub fn at_mark(opts: &Options, order: Priced, mark: Option<Decimal>) -> Result<P
         ));
     }
     let at = at_market(order.px, order.bid, order.ask, Some(mark));
-    let lots = (opts.inventory_cap_usd / (at * opts.step)).floor();
-    let inventory =
-        Lots::new(lots.to_i64().ok_or("an amount does not fit")?).ok_or("a negative amount")?;
+    let inventory = cap_lots(opts.inventory_cap_usd, at, opts.step);
     Ok(Priced {
         mark_notional: Some(at_mark),
         inventory,
@@ -632,7 +638,7 @@ impl Recheck {
         let price = Decimal::from(px.0) * self.opts.tick;
         let at = at_market(price, now.bid, now.ask, self.mark);
         let usd = self.opts.inventory_cap_usd;
-        let lots = (usd / (at * self.opts.step)).floor().to_i64().unwrap_or(0);
+        let lots = cap_lots(usd, at, self.opts.step).get();
         if lots < self.inventory.get() {
             return Err(format!(
                 "the inventory cap of ${usd} is now {lots} lots at {at}, the highest of the \

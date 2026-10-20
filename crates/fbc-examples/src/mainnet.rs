@@ -12,8 +12,8 @@
 //!   `GET /system/config` must name it ([`decode_chain`], [`chain_refusal`]), the chain the
 //!   login signs for.
 //! - **The caps** ([`mainnet_caps`]): the operator's own, required with no default and no
-//!   ceiling (owner 2026-10-19, FBC-thks), and positive; each run prints both before anything
-//!   connects.
+//!   ceiling (owner 2026-10-19, FBC-thks, decision 0113), and positive; each run prints both
+//!   before anything connects.
 //! - **The snapshot** ([`trusted`]): the venue must declare its open-order snapshot
 //!   trustworthy, so a resync seeds the market's position: a mainnet market is armed only after
 //!   a trustworthy resync and never seeded by hand (owner answer C to RB-olg-3; hand-seeding is
@@ -97,8 +97,9 @@ pub fn mainnet_guard(
 
 /// Refuses a resting cap per side or an inventory cap, in USD, that is not positive. The caps
 /// are the operator's own, required with no default and no ceiling (owner 2026-10-19,
-/// FBC-thks): any positive ones are taken. The command line refuses a non-positive one as it
-/// parses; this checks options built some other way again, before anything connects.
+/// FBC-thks, decision 0113): any positive ones are taken. The command line refuses a
+/// non-positive one as it parses; this checks options built some other way again, before
+/// anything connects.
 pub fn mainnet_caps(resting: Decimal, inventory: Decimal) -> Result<(), String> {
     for (flag, cap) in [
         ("--resting-cap-usd", resting),

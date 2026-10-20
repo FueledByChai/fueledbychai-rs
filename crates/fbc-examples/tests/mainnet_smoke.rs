@@ -1103,6 +1103,39 @@ async fn a_cap_too_large_for_a_lot_count_is_taken_as_the_largest_lot_count() {
 }
 
 #[test]
+fn a_cap_in_lots_is_floored_and_one_past_a_lot_count_is_the_largest() {
+    let d = |s: &str| Decimal::from_str(s).unwrap();
+    let lots =
+        |usd: Decimal, price: Decimal, step: Decimal| testnet::cap_lots(usd, price, step).get();
+    // $5000 at 60140.1 on the 0.00001 step: 8313.9 lots, floored.
+    assert_eq!(lots(d("5000"), d("60140.1"), d("0.00001")), 8_313);
+    // Past what a lot count holds, or a decimal once divided: the largest lot count.
+    assert_eq!(lots(d("1e20"), d("1"), d("1")), i64::MAX);
+    assert_eq!(lots(Decimal::MAX, d("0.5"), d("0.00001")), i64::MAX);
+    assert_eq!(lots(Decimal::MAX, Decimal::MAX, d("2")), i64::MAX);
+    // A cap, a price or a step that is not positive: no lot.
+    assert_eq!(lots(Decimal::ZERO, d("1"), d("1")), 0);
+    assert_eq!(lots(d("-5"), d("1"), d("1")), 0);
+    assert_eq!(lots(d("5"), Decimal::ZERO, d("1")), 0);
+    assert_eq!(lots(d("5"), d("1"), d("-1")), 0);
+}
+
+#[tokio::test]
+async fn an_order_too_large_for_a_lot_count_is_refused_before_the_session_connects() {
+    // The caps have no ceiling, but the order is a size: one past a lot count is refused.
+    let stub = StubServer::start(no_script(), routes()).await.unwrap();
+    let mut smoke = smoke_on(&stub);
+    smoke.trade.resting_cap_usd = Decimal::MAX;
+    smoke.trade.order_usd = Decimal::MAX;
+    let (ran, printed) = run_on(&smoke, None, &ParadexFactory).await;
+    let err = ran
+        .err()
+        .unwrap_or_else(|| panic!("not refused:\n{printed}"));
+    assert!(err.contains("does not fit"), "{err}");
+    assert!(stub.connections().is_empty());
+}
+
+#[test]
 fn the_command_line_refuses_what_it_does_not_take_and_never_echoes_a_value() {
     // Shaped like a key (64 hex digits), built here so no key-shaped literal is in the source.
     let secretish = format!("0x{}", "1234567890abcdef".repeat(4));
