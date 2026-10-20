@@ -412,6 +412,23 @@ mod tests {
         // A worst case that does not fit a lot count shrinks nothing.
         let unknown = sells(62, None);
         assert_eq!(unknown.admit(Adds::placing(lots(11)), true), over(None));
+        // A short of i64::MIN lots, whose size no lot count holds, still shrinks by a flagged
+        // bid (Codex on PR #183): the worst case before is compared without wrapping.
+        let deepest = Exposure {
+            side: Side::Buy,
+            pos: Some(SignedLots(i64::MIN)),
+            ..e
+        };
+        assert_eq!(deepest.admit(Adds::placing(lots(11)), true), Ok(()));
+        assert_eq!(
+            deepest.admit(Adds::placing(lots(11)), false),
+            Err(CapRefusal::InventoryCap {
+                inst: INST,
+                side: Side::Buy,
+                worst: Some(lots(i64::MAX - 10)),
+                cap: lots(50),
+            })
+        );
         // The resting cap still applies.
         assert_eq!(
             e.admit(Adds::placing(lots(12)), true),
