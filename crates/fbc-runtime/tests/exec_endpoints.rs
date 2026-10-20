@@ -39,10 +39,11 @@ use fbc_core::{
     WireSlice, WireUrl,
 };
 use fbc_journal::{ControlEvent, JournalSink, Record, RecordRef, Recorded};
+use fbc_oms::ControlCommand;
 use fbc_runtime::{
-    Connector, ExecControl, ExecHandler, ExecSession, ExecSessionConfig, ExecSessionError,
-    InProcessStream, IngestClock, Input, Journal, OrderEntryPeer, ProxyConfig, RateLimiter,
-    ReconnectPacing, SafetyReserve, SessionError, WriteStall,
+    Connector, ExecControl, ExecHandler, ExecOrders, ExecSession, ExecSessionConfig,
+    ExecSessionError, InProcessStream, IngestClock, Input, Journal, OrderEntryPeer, ProxyConfig,
+    RateLimiter, ReconnectPacing, SafetyReserve, SessionError, WriteStall,
 };
 use futures_util::StreamExt;
 use tokio::net::TcpListener;
@@ -184,7 +185,8 @@ impl VenueFactory for Two {
 /// either stream: `relay|to=<n>` asks to send `said|from=<stream>` on stream `n`; `bye|to=<n>`
 /// asks to reconnect stream `n`; `arm|ms=<t>` sets a timer, tagged with the stream it came
 /// on, which sends `rang|on=<stream>` there; `bin|to=<n>` asks to send the binary frame
-/// `ff <stream>` on stream `n`; `ask|path=<p>` asks for a GET of `p` under the
+/// `ff <stream>` on stream `n`; `both|kb=<n>` asks to send an `n` KiB frame on the account
+/// stream, then to reconnect its own; `ask|path=<p>` asks for a GET of `p` under the
 /// configured base URL, tagged with its stream, whose result pushes an account `Halted` mode
 /// and sends `got|on=<stream>` there; `ready` pushes the order stream authenticated, wherever
 /// it is read.
@@ -275,6 +277,18 @@ impl ExecCodec for Split {
             RawFrame::Text(text) if text.starts_with("relay|") => {
                 fx.push(send(to(text), format!("said|from={}", stream.0)));
             }
+            RawFrame::Text(text) if text.starts_with("both|") => {
+                let kb: usize = field(text, "kb").parse().unwrap();
+                fx.push(Effect::Send {
+                    stream: ACCOUNT,
+                    frame: WireSlice::plain(vec![b'x'; kb * 1024]),
+                    rpc: None,
+                    class: TrafficClass::Normal,
+                    charge: RateCharge::one(OpKind::Control, None),
+                });
+                let reason = "both";
+                fx.push(Effect::Reconnect { stream, reason });
+            }
             RawFrame::Text(text) if text.starts_with("bin|") => {
                 fx.push(Effect::Send {
                     stream: to(text),
@@ -355,7 +369,11 @@ impl ExecCodec for Split {
         self.inner.resync(ctx, fx);
     }
 
+    /// Panics on a frame `boom`, as a codec defect would.
     fn redact_inbound(&self, input: Inbound<'_>) -> InboundSpans {
+        if let Inbound::Frame(RawFrame::Text("boom")) = input {
+            panic!("the codec failed");
+        }
         self.inner.redact_inbound(input)
     }
 }
@@ -1246,4 +1264,201 @@ fn a_session_refuses_endpoints_it_cannot_tell_apart_number_or_open() {
     let codec = Box::new(ToyExec::new(Box::new(ToySigner)));
     let err = ExecSession::in_process(config("ws://127.0.0.1:1/a"), codec, stream, |_| {});
     assert_eq!(err.err().unwrap(), ExecSessionError::Endpoints(2));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Codex's review of PR #188.
+// ---------------------------------------------------------------------------------------------
+
+/// A journal sink another thread reads: the records offered, as `Kept` keeps them.
+#[derive(Clone, Default)]
+struct Shared(Arc<Mutex<Vec<Record>>>);
+
+impl JournalSink for Shared {
+    fn record(&mut self, _: TrafficClass, _: WallNs, record: &Record) -> Recorded {
+        self.0.lock().unwrap().push(record.clone());
+        Recorded::Ok
+    }
+
+    fn record_ref(&mut self, _: TrafficClass, _: WallNs, record: RecordRef<'_>) -> Recorded {
+        self.0.lock().unwrap().push(record.to_record());
+        Recorded::Ok
+    }
+
+    fn omit(&mut self, _: TrafficClass, _: WallNs) -> Recorded {
+        Recorded::Ok
+    }
+}
+
+/// Codex P2 r4323792811: a codec that panics as the run's end stamps the frame waiting on the
+/// account stream leaves that epoch journaled closed once, not again as the session drops while
+/// unwinding.
+#[tokio::test]
+async fn a_codec_panicking_as_a_stop_stamps_an_account_frame_journals_its_epoch_closed_once() {
+    let (mut trade, mut account) = (ScriptedWs::start().await, ScriptedWs::start().await);
+    let (trade_url, account_url) = (trade.url(), account.url());
+    let records = Shared::default();
+    let journal = records.clone();
+    let venue = Two::leak();
+    let driver = thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (config, _) = setup(venue, &trade_url, &account_url, floor(10));
+        let log = Log::default();
+        let handler = Keep::new(&log);
+        let slot = Rc::clone(&handler.control);
+        let (mut session, control) = ExecSession::new(config, handler).unwrap();
+        session.set_journal(Journal::new(Rc::new(RefCell::new(journal))));
+        *slot.borrow_mut() = Some(control);
+        rt.block_on(session.run())
+    });
+    let mut t = trade.accept().await;
+    let mut a = account.accept().await;
+    let _ = (t.recv().await, a.recv().await);
+    // The handler stops the session on the first; the second waits behind it.
+    a.send_all(["mode|m=reduceonly".to_owned(), "boom".to_owned()]);
+    let joined = tokio::task::spawn_blocking(move || driver.join());
+    assert!(joined.await.unwrap().is_err());
+    let records = records.0.lock().unwrap();
+    let closed = records.iter().filter(
+        |r| matches!(r, Record::Control { ev: ControlEvent::Closed(k), .. } if *k == acct(0)),
+    );
+    assert_eq!(closed.count(), 1, "{records:?}");
+}
+
+/// A handler that notes, for each event, whether the session took places then.
+struct Placing {
+    orders: Rc<RefCell<Option<ExecOrders>>>,
+    seen: Rc<RefCell<Vec<(ExecEvent, bool)>>>,
+}
+
+impl ExecHandler for Placing {
+    fn on_exec(&mut self, env: Envelope<ExecEvent>) {
+        let placing = self.orders.borrow().as_ref().unwrap().may_place();
+        self.seen.borrow_mut().push((env.body, placing));
+    }
+}
+
+/// Codex P2 r4323792819: once the order connection's epoch ends in a batch that also wrote to
+/// the account stream, an event heard while that write waits finds the session taking no
+/// places.
+#[tokio::test]
+async fn an_event_heard_while_a_routed_write_waits_after_the_order_epoch_closed_takes_no_places() {
+    let (mut trade, mut account) = (ScriptedWs::start().await, ScriptedWs::start().await);
+    let mut http = ScriptedHttp::start().await;
+    let venue = Two::leak();
+    let (mut config, _) = setup(venue, &trade.url(), &account.url(), floor(10));
+    config.cfg.insert(HTTP, &http.url(""));
+    let (orders, seen) = (Rc::default(), Rc::default());
+    let handler = Placing {
+        orders: Rc::clone(&orders),
+        seen: Rc::clone(&seen),
+    };
+    let (mut session, control) = ExecSession::new(config, handler).unwrap();
+    *orders.borrow_mut() = Some(session.orders());
+    let watch = Rc::clone(&seen);
+    let script = async move {
+        let mut t = trade.accept().await;
+        let mut a = account.accept().await;
+        let _ = (t.recv().await, a.recv().await);
+        // The order connection armed and resynced: it takes places.
+        t.send(AUTH_ACK);
+        let armed = t.recv().await;
+        let rpc = field(&armed, "rpc").to_owned();
+        let resync = t.recv().await;
+        let wm = resync.strip_prefix("resync|ts=").unwrap().to_owned();
+        t.send(&format!("item|rpc={rpc}|i=0|res=ok"));
+        t.send_all([format!("rsbegin|wm={wm}"), "rsend".to_owned()]);
+        until(|| watch.borrow().len() == 4).await;
+        assert!(watch.borrow().iter().any(|(_, placing)| *placing));
+        // An account request out; the account stream stops reading.
+        a.send("ask|path=/x");
+        let asked = http.request().await;
+        let release = a.hold();
+        // One batch writes 64 MiB to the account stream, which waits, and ends the order
+        // connection's epoch.
+        t.send("both|kb=65536");
+        assert_eq!(t.next().await, None);
+        asked.answer("HTTP/1.1 200 OK", "now").await;
+        until(|| watch.borrow().len() == 5).await;
+        drop(control);
+        release
+    };
+    let (run, release) = tokio::join!(session.run(), script);
+    drop(release);
+    run.unwrap();
+    let seen = seen.borrow();
+    assert_eq!(seen[4], (mode(VenueMode::Halted), false), "{seen:?}");
+}
+
+/// A handler that submits a fee query again each time one is not sent, from the order
+/// connection's first end until it hears an account event.
+struct Resubmitting {
+    orders: Rc<RefCell<Option<ExecOrders>>>,
+    on: bool,
+    log: Log,
+}
+
+impl Resubmitting {
+    fn submit(&self) {
+        let orders = self.orders.borrow();
+        let _ = orders
+            .as_ref()
+            .unwrap()
+            .submit_control(ControlCommand::FeeQuery);
+    }
+}
+
+impl ExecHandler for Resubmitting {
+    fn on_exec(&mut self, env: Envelope<ExecEvent>) {
+        self.on = false;
+        self.log.borrow_mut().push(Heard::Event(Box::new(env)));
+    }
+
+    fn on_epoch_end(&mut self, key: ConnKey) {
+        if key == self::key(0) {
+            self.on = true;
+            self.submit();
+        }
+    }
+
+    fn on_submitted(&mut self, handle: fbc_core::SubmitHandle) {
+        if self.on && handle.receipt.is_err() {
+            self.submit();
+        }
+    }
+}
+
+/// Codex P2 r4323792829: while the order connection waits to reconnect, a handler that submits
+/// again from every refusal does not starve the account stream.
+#[tokio::test]
+async fn commands_submitted_without_end_while_the_order_connection_is_down_starve_no_account_frame()
+{
+    let (mut trade, mut account) = (ScriptedWs::start().await, ScriptedWs::start().await);
+    let venue = Two::leak();
+    let (config, _) = setup(venue, &trade.url(), &account.url(), floor(60_000));
+    let (orders, log) = (Rc::default(), Log::default());
+    let handler = Resubmitting {
+        orders: Rc::clone(&orders),
+        on: false,
+        log: Rc::clone(&log),
+    };
+    let (mut session, control) = ExecSession::new(config, handler).unwrap();
+    *orders.borrow_mut() = Some(session.orders());
+    let watch = Rc::clone(&log);
+    let script = async move {
+        let mut t = trade.accept().await;
+        let mut a = account.accept().await;
+        let _ = (t.recv().await, a.recv().await);
+        t.drop_conn();
+        a.send("mode|m=halted");
+        until(|| events(&watch).len() == 1).await;
+        drop(control);
+        assert_eq!(a.next().await, None);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    assert_eq!(events(&log)[0].stamp.conn, acct(0));
 }
