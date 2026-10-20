@@ -50,9 +50,9 @@ pub use codec::{
     AmendRef, AmendWire, CancelRef, CancelWire, CtxCall, DecodeError, Effect, Effects, EncodeCtx,
     EncodeReceipt, ExecCodec, ExecSink, Feed, Header, HeaderMark, HttpFailure, HttpMethod,
     HttpRequest, HttpResponse, HttpTag, Inbound, InboundSpans, Keepalive, KeepaliveKind,
-    MAX_SIG_LEN, MdCodec, MdSink, NonceBlock, NonceSource, OrderSigner, PlaceWire, RawFrame,
-    RedactError, RpcCall, Sig, SignError, SpecTable, Subscription, TimerTag, TrafficClass,
-    WireSlice, WireUrl, check_redactions,
+    MAX_SIG_LEN, MdCodec, MdSink, NonceBlock, NonceRefused, NonceSource, OrderSigner, PlaceWire,
+    RawFrame, RedactError, RpcCall, Sig, SignError, SpecTable, Subscription, TimerTag,
+    TrafficClass, WireSlice, WireUrl, check_redactions,
 };
 pub use command::{
     AckLevel, AmendOrder, CancelOrder, CancelScope, ChosenRef, NewOrder, NotAmendable,

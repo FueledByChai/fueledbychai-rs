@@ -1,4 +1,4 @@
-//! FBC-3bq4's done line, the source's half (decisions 0006, 0007, 0054): `WallClockNonces`, the
+//! FBC-3bq4's done line, the source's half (decision 0114): `WallClockNonces`, the
 //! production `NonceSource` for a venue whose nonce is a wall-clock timestamp near server time
 //! (Hibachi: microseconds, unique per account, within a documented window of server time),
 //! issues monotonic wall-clock microseconds over a clock the caller injects: a block's nonces
@@ -18,7 +18,7 @@ use fbc_core::{NonceBlock, NonceRefused, NonceSource, WallNs};
 use fbc_journal::{NonceSourceId, Record};
 use fbc_runtime::{WallClock, WallClockNonces, ZeroWindow, last_nonce};
 
-/// A wall time, in microseconds since the Unix epoch, near 2026-10-19.
+/// A wall time, in microseconds since the Unix epoch, 2026-10-14T17:46:40Z.
 const T_US: u64 = 1_792_000_000_000_000;
 /// Hibachi's documented window, as a consumer would pass it.
 const WINDOW: Duration = Duration::from_secs(15);
@@ -283,4 +283,19 @@ fn an_empty_reservation_reads_no_clock() {
     let mut nonces = source(&clock);
     assert!(ok(nonces.try_reserve(0)).is_empty());
     assert_eq!(nonces.last(), None);
+}
+
+/// The system clock reads after 2026-09-14, a month before this file was written, and a source
+/// over it issues a nonce past that many microseconds since the epoch.
+#[test]
+fn the_system_wall_clock_reads_the_realtime_clock() {
+    let written_us: u64 = T_US - 30 * 86_400 * 1_000_000;
+    let now = fbc_runtime::SystemWallClock.now();
+    assert!(
+        now.0 > i64::try_from(written_us).unwrap() * 1_000,
+        "{now:?}"
+    );
+    let mut nonces = WallClockNonces::new(fbc_runtime::SystemWallClock, WINDOW).unwrap();
+    let nonce = ok(nonces.try_reserve(1))[0];
+    assert!(nonce > written_us, "{nonce}");
 }

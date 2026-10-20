@@ -1940,7 +1940,7 @@ async fn deadline_fired(name: &str, connected: bool) -> Run {
 // FBC-3bq4: the production wall-clock nonce source in a session.
 // ---------------------------------------------------------------------------------------------
 
-/// A wall time, in microseconds since the Unix epoch, near 2026-10-19.
+/// A wall time, in microseconds since the Unix epoch, 2026-10-14T17:46:40Z.
 const WALL_US: u64 = 1_792_000_000_000_000;
 /// Hibachi's documented nonce window, as a consumer would pass it.
 const NONCE_WINDOW: Duration = Duration::from_secs(15);

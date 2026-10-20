@@ -228,7 +228,13 @@ rather than guess.
     (FBC-qfm, `tests/protective_cancel_tick_to_wire.rs`); with a `Journal` set,
     it journals what it sends and receives as a market-data session does, each epoch's opening
     and closing, each nonce it reserves and each context it gives its codec, what its stream
-    brings under Safety (0078), and each request deadline it fires at its stamp (0090);
+    brings under Safety (0078), and each request deadline it fires at its stamp (0090); it
+    reserves through `NonceSource::try_reserve`, and a source's refusal ends it with
+    `ExecSessionError::NonceRefused`, nothing reserved or written;
+    `WallClockNonces` is the production nonce source for a venue whose nonce is a wall-clock
+    timestamp (Hibachi): `max(clock, last + 1)` microseconds over an injected `WallClock`,
+    resumed after a journal's `last_nonce`, refusing a block further ahead of its clock than
+    the caller's window, which has no default (FBC-3bq4, 0114, `tests/wall_nonces.rs`);
     `ShardHost` is the shard host (0100): one loop driving a shard's session runs as its
     `Member`s on one task, sharing one `IngestClock`, that drains every input they have ready
     (yield to the runtime, poll every member, again while a round spent the task's coop
