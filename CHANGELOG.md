@@ -3,9 +3,9 @@
 What shipped, by release: the commits that carry a ticket id between two tags, with the
 ticket text read from Beads (scripts/release-notes.sh --archive).
 
-## v0.0.7 — 2026-10-19 (v0.0.6..89b939f)
+## v0.0.7 — 2026-10-19 (v0.0.6..250540d)
 
-66 tickets, PRs #95 to #182, decision records 0078 to 0111. This release is the library's
+67 tickets, PRs #95 to #183, decision records 0078 to 0112. This release is the library's
 stages 1 and 2 on the way to a consumer's model trading live on Paradex: fbc-oms's
 price-capped crossing exits, level tags and removal reasons, the audit sink and orphan
 handling; order-entry robustness (bounded queues, reconnect storm, snapshot-lag settle,
@@ -110,6 +110,14 @@ over one needs the new arms.
   order event goes to the sink in receive order, numbered, before it is applied, ignored ones
   included, and its verdict follows. Installing a sink is optional. The consumer owns its
   `order_audit` table and that table's schema (0001).
+- **The inventory cap past its limit** (FBC-ugto, PR #183, decision 0112), with no API
+  change: an order that carries the venue's reduce-only flag and strictly shrinks its side's
+  worst case now passes the inventory cap, even when the position is still past the cap.
+  Before, a position past the inventory cap plus the resting cap admitted no reducing order,
+  so Flatten and the crossing exit could not bring it down. The resting cap still applies,
+  so such a position comes down in orders the resting cap bounds. An order the OMS only
+  classifies as reducing (`reducing` without the venue's flag) still passes only within the
+  cap.
 - **Unknown-ladder fixes** with no API change: FBC-e90m (PR #131), FBC-k2w9 (PR #132) and
   FBC-tjey (PR #146).
 
@@ -269,6 +277,7 @@ Each ticket is listed under the crate it mainly changed.
 | fbc-oms | FBC-840 | #171 | Orphans: adding side suppressed, cancelled by explicit reference | 0108 |
 | fbc-oms | FBC-7aw4 | #180 | Price-capped reduce-only crossing intent, never crossing zero | 0110 |
 | fbc-oms | FBC-hht | #182 | Declared batches, venue-mode and status gates, rate safety floor | 0111 |
+| fbc-oms | FBC-ugto | #183 | A venue-flagged reduce-only order that shrinks the worst case passes the inventory cap past it | 0112 |
 | fbc-runtime | FBC-2pr | #115 | The order-entry session journals what it sends and receives, credential spans hashed | 0078 |
 | fbc-runtime | FBC-nvxn | #127 | Orders from an earlier epoch are unprotected until an arm covers them | 0080 |
 | fbc-runtime | FBC-m8vm | #130 | HTTP-carried order Query and FeeQuery through the order-entry session | 0081 |
@@ -392,6 +401,7 @@ The generated list: each ticket's first commit, date and title.
 - **FBC-i8lp** fbc-core/fbc-oms: a venue declares how long its open-order snapshot may lag its order stream, and the Unknown ladder's settle below it is refused — 2026-10-19 · d121e5d (failing tests for a venue's declared snapshot lag bound (an order absent from snapshots within the bound of its send is never Lost whatever the ladder's settle, one past it is; a longer settle still governs; no default; Paradex declares its bound over the recorded lags))
 - **FBC-7aw4** fbc-oms: a price-capped reduce-only crossing intent in the DesiredBook, never crossing zero, every cap and state still applied — 2026-10-19 · 3236806 (failing tests for the DesiredBook's price-capped reduce-only crossing intent)
 - **FBC-hht** fbc-oms: the planner batches within the declared sizes, gates on venue modes and instrument status, and stops Normal traffic at the safety floor — 2026-10-19 · ba93639 (failing tests: the planner batches within the declared sizes, gates on venue modes and status, and stops normal traffic at the safety floor)
+- **FBC-ugto** fbc-oms owner question: a position past the inventory cap by more than the resting cap admits no reducing order, so Flatten and the disaster stop cannot cross it — 2026-10-19 · 1513a52 (failing tests: past the inventory cap a venue reduce-only order that shrinks the worst case is built, in resting-cap steps)
 
 ### Archived tickets: the text of each ticket, from Beads
 
@@ -1081,4 +1091,10 @@ Error paths are tested too, so the workspace stays above the coverage floor (cov
 Serves BT-402. Decisions: 0003, 0005, 0009, 0018.
 
 **Done when:** Done when tests in crates/fbc-oms/tests/ show the planner batching within the declared batch sizes and references, emitting no order for a market in a venue mode or instrument status that refuses it, and withholding Normal commands once a rate scope reaches its safety floor while cancels and reducing orders still go out.
+
+#### FBC-ugto fbc-oms owner question: a position past the inventory cap by more than the resting cap admits no reducing order, so Flatten and the disaster stop cannot cross it — 2026-10-19 · 1513a52
+
+Found by Reviewer B on PR #180 (FBC-7aw4, the price-capped crossing intent). The inventory cap (I6, decision 0005) admits a reducing sell of q on a long P only if |P - q - others| <= cap, and the gross per-side resting cap (decision 0013 rule 2) admits it only if q + others resting <= resting cap; nothing is exempt. So with nothing else on the side a reducing order exists only while P <= inventory cap + resting cap. Past that, no reducing order of any size is admitted, in Quoting, Exit or Flatten. Under the owner's mainnet caps ($50 inventory, $11 resting per side) a position past $61 (orphan or race fills, as in the 2026-06-25 SOL-Hibachi blowout) cannot be flattened by fbc-oms: test a_position_past_the_inventory_cap_by_more_than_the_resting_cap_admits_no_crossing in crates/fbc-oms/tests/crossing.rs (long 62: cross 11 refused InventoryCap worst 51, cross 12 or 62 refused RestingCap, the same in Exit).
+
+**Done when:** Done when the owner has chosen how a reducer is judged past cap + resting, and, if the rule changes, tests in crates/fbc-oms/tests/ show a long of 62 under caps 50/11 crossed by a reduce-only order while every order that raises the side's worst case is still refused.
 
