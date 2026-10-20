@@ -3,9 +3,9 @@
 What shipped, by release: the commits that carry a ticket id between two tags, with the
 ticket text read from Beads (scripts/release-notes.sh --archive).
 
-## v0.0.7 — 2026-10-19 (v0.0.6..250540d)
+## v0.0.7 — 2026-10-19 (v0.0.6..f5dc5c5)
 
-67 tickets, PRs #95 to #183, decision records 0078 to 0112. This release is the library's
+68 tickets, PRs #95 to #184, decision records 0078 to 0113. This release is the library's
 stages 1 and 2 on the way to a consumer's model trading live on Paradex: fbc-oms's
 price-capped crossing exits, level tags and removal reasons, the audit sink and orphan
 handling; order-entry robustness (bounded queues, reconnect storm, snapshot-lag settle,
@@ -102,6 +102,10 @@ over one needs the new arms.
   `OrphanConfig::new(cooldown, level_limit)` has no default. The cancels go by explicit
   reference in a cancel-many (`OrphanPlan`, `OrphanCancels`). They escalate to an instrument
   cancel-all only under the kill switch's guard, and never to an account cancel-all.
+- **Changed signature: `Registry::authorize(&mut self, acct, cmd)`** takes `&mut self` where
+  it took `&self` (FBC-0d9k, PR #133, decision 0082): authorizing judges the command against
+  the caps again, binds the registry's account and releases what a refused command reserved,
+  so code that authorizes through a `&Registry` no longer compiles.
 - **Changed signature: `Registry::on_query_answer(caps, answer, key)`** takes the venue's
   `&OrderCaps` (FBC-wua8, PR #134). The ladder uses it for amend-gives-new-id venues and for
   `snapshot_lag_bound` (FBC-i8lp; `LadderConfig::absence_settle(caps)`).
@@ -167,6 +171,12 @@ over one needs the new arms.
 - **Tick-to-wire on order entry** (FBC-qfm, PR #177): `ExecHandler::on_tick_to_wire` (default
   method) reports each Safety write. A cancel that a market-data handler submits on a frame
   is measured from that frame's kernel receive time (Linux).
+- **Undecodable input** (FBC-elg7, PR #149): `ExecHandler::on_decode_error(key)` (default
+  method, a no-op) is called for each frame or HTTP answer of epoch `key` the codec could
+  not decode, as it is read and before the next input; it is also counted in
+  `ExecCounters::decode_errors`. Such an input may have held a fill, a position or an order
+  event the consumer never sees. The default compiles silently, so a live consumer that
+  trades on what it heard should override it to stop (or stop and resync) there.
 - **Build guard** (FBC-8mv, PR #119, decision 0079): a build that links fbc-runtime with the
   `log` crate's `release_max_level_trace` feature fails to compile, because tungstenite logs
   each frame, the session token included, at TRACE.
@@ -235,6 +245,11 @@ over one needs the new arms.
   PR #158, decision 0096).
 - **`order.create_batch` sends a bare JSON array** (FBC-mu1o, PR #152). In v0.0.6 the batch
   was sent in a form that Paradex refused live on testnet.
+- **Changed signature: `exec::decode_order_event(frame, scope, specs, seen: &mut
+  ModifyRequests, sink)`** takes a new required `seen` argument between `specs` and `sink`
+  (FBC-g3bw, PR #139, decision 0086). It holds the modify requests already reported, so a
+  modify's `request_info` is news once; keep one `ModifyRequests` per order-entry codec,
+  across its frames and connections.
 - **New API:** the `discover` module (FBC-l5o, PR #125: `markets_url`, `markets_request`,
   `plan`, `decode_markets`, `parse_fbc_common_symbol`, `MARKETS_PATH`, `MARKETS_TAG`,
   `REQUIRED`); `ModifyRequests` and `MODIFY_OUTCOMES_HELD` (FBC-g3bw, PR #139, decision 0086;
@@ -256,6 +271,11 @@ over one needs the new arms.
 
 - New: `testnet_trade`, `testnet_quote` (with a supervised `--mainnet` mode),
   `paradex_testnet_acceptance` and `mainnet_smoke`. No library API.
+- The mainnet test programs (`mainnet_smoke`, `testnet_quote --mainnet`) no longer cap
+  `--resting-cap-usd` and `--inventory-cap-usd` at $11 and $50 (FBC-thks, PR #184,
+  decision 0113). Both flags stay required, with no default, and must be positive; the run
+  prints both before anything connects. The 20 bps minimum offset and the 3600 s maximum
+  `--duration` still hold.
 
 ### By crate
 
@@ -323,13 +343,14 @@ Each ticket is listed under the crate it mainly changed.
 | fbc-venue-paradex | FBC-vgm | #179 | Clustered-move protective-cancel p99 benchmark (Linux) | |
 | fbc-venue-binance-usdm | FBC-fwf | #173 | Discovery and `parse_fbc_common_symbol` | |
 | fbc-examples | FBC-x69b | #114 | `testnet_trade` | |
-| fbc-examples | FBC-elg7 | #149 | `testnet_quote` | |
+| fbc-examples + fbc-runtime | FBC-elg7 | #149 | `testnet_quote`; `ExecHandler::on_decode_error` | |
 | fbc-examples | FBC-xji8 | #150 | `paradex_testnet_acceptance` | |
 | fbc-examples | FBC-6fnc | #151 | The acceptance program's testnet fill step | |
 | fbc-examples | FBC-p0aa | #154 | `mainnet_smoke` | |
 | fbc-examples | FBC-hpg6 | #157 | Positions follow fills, checked against GET /positions | |
 | fbc-examples | FBC-tyft | #158 | `testnet_quote --mainnet`; Paradex `ORDER_SIZE_BELOW_MIN` as MinNotional | 0096 |
 | fbc-examples | FBC-aoh5 | #159 | A cancel of ours that we did not send warns once and Stops on a repeat | |
+| fbc-examples | FBC-thks | #184 | The mainnet test programs' caps are required and positive, with no $11/$50 ceiling | 0113 |
 
 ### Every ticket, in landing order (scripts/release-notes.sh)
 
@@ -402,6 +423,7 @@ The generated list: each ticket's first commit, date and title.
 - **FBC-7aw4** fbc-oms: a price-capped reduce-only crossing intent in the DesiredBook, never crossing zero, every cap and state still applied — 2026-10-19 · 3236806 (failing tests for the DesiredBook's price-capped reduce-only crossing intent)
 - **FBC-hht** fbc-oms: the planner batches within the declared sizes, gates on venue modes and instrument status, and stops Normal traffic at the safety floor — 2026-10-19 · ba93639 (failing tests: the planner batches within the declared sizes, gates on venue modes and status, and stops normal traffic at the safety floor)
 - **FBC-ugto** fbc-oms owner question: a position past the inventory cap by more than the resting cap admits no reducing order, so Flatten and the disaster stop cannot cross it — 2026-10-19 · 1513a52 (failing tests: past the inventory cap a venue reduce-only order that shrinks the worst case is built, in resting-cap steps)
+- **FBC-thks** Mainnet test programs: no hard-coded $11/$50 cap ceilings; the cap flags stay required with no defaults (owner 2026-10-19) — 2026-10-19 · ee3857d (failing tests: the mainnet test programs' caps are required and positive with no ceiling, and a large cap is taken and printed before anything connects)
 
 ### Archived tickets: the text of each ticket, from Beads
 
@@ -1098,3 +1120,8 @@ Found by Reviewer B on PR #180 (FBC-7aw4, the price-capped crossing intent). The
 
 **Done when:** Done when the owner has chosen how a reducer is judged past cap + resting, and, if the rule changes, tests in crates/fbc-oms/tests/ show a long of 62 under caps 50/11 crossed by a reduce-only order while every order that raises the side's worst case is still refused.
 
+#### FBC-thks Mainnet test programs: no hard-coded $11/$50 cap ceilings; the cap flags stay required with no defaults (owner 2026-10-19) — 2026-10-19 · ee3857d
+
+OWNER ANSWERS 2026-10-19 (to the coordinator), quoted exactly: to "The fbc-examples mainnet test programs hard-code $11/$50 as ceilings. What should they do?" he answered "no ceiling" (the recommended option had read: "--resting-cap-usd and --inventory-cap-usd stay required, with no defaults, and the run prints them before connecting. The hard-coded ceilings go. These are hand-run plumbing tests."). Context, owner 2026-10-19 (quoted exactly): "why are we setting limits in the FBC library? the $11 resting order and $50 inventory were relics from when we were trading small test positions with chaiwala". The fbc-oms cap MECHANISM (inventory cap I6 + per-side resting cap, consumer-supplied values, no defaults) stays; only fixed VALUES go. This supersedes the owner's 2026-10-18 answer on Codex r4306524743 (PR #158, 'Keep them in code') for the two cap ceilings only; the 20 bps minimum offset and the 3600 s maximum --duration in mainnet mode are NOT part of this question and stay. Scope: crates/fbc-examples/src/mainnet.rs RESTING_CAP_MAX and INVENTORY_CAP_MAX and every use of them (mainnet_smoke, testnet_quote --mainnet), their refusal tests, --help, the README and the FBC-tyft/FBC-p0aa notes.
+
+**Done when:** Done when the mainnet test programs take any --resting-cap-usd and --inventory-cap-usd (still required, no defaults, positive), print both caps before anything connects, no longer refuse values above $11/$50 (the ceiling constants and their refusals are removed, the tests that asserted them replaced by tests that a missing or non-positive cap is refused and a large one is taken and printed), the 20 bps offset and 3600 s duration limits still hold, --help and the README say so, and scripts/check.sh passes.
