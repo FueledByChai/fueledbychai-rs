@@ -15,8 +15,9 @@ use crate::testnet::{
 /// The help text `--help` prints.
 pub const USAGE: &str = "\
 mainnet_smoke: the owner's first Paradex MAINNET order. Places ONE post-only limit order of
-about $11, well away from the touch, through fbc-oms, waits for its acknowledgement, cancels
-it, waits for the cancel's acknowledgement, then Stops (kill switch + cancel all) and exits.
+--order-usd (yours), well away from the touch, through fbc-oms, waits for its
+acknowledgement, cancels it, waits for the cancel's acknowledgement, then Stops (kill switch +
+cancel all) and exits.
 MAINNET ONLY, and REAL MONEY: refused without both --mainnet and --sole-trader.
 
 Before you run it:

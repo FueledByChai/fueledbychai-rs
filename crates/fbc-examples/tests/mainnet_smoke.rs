@@ -1244,6 +1244,12 @@ fn help_names_the_environment_the_prerequisites_and_every_line() {
     ] {
         assert!(smoke_args::USAGE.contains(needed), "--help lacks {needed}");
     }
+    // The order's size is the operator's --order-usd, not a fixed $11 (Codex r4320368156).
+    assert!(
+        !smoke_args::USAGE.contains("about $11"),
+        "{}",
+        smoke_args::USAGE
+    );
 }
 
 #[test]

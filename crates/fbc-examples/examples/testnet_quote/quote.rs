@@ -2594,7 +2594,7 @@ impl Driver {
                 let mint = self.mint.as_mut().ok_or("no client-id mint")?;
                 // This program reads no venue mode and no limiter room, and sends one order
                 // per command: the venue refuses what its mode refuses, and the runtime's
-                // limiter holds normal traffic at its reserve (decision 0113).
+                // limiter holds normal traffic at its reserve (decision 0111).
                 let venue = PlanVenue {
                     caps: &self.plan_caps,
                     account_mode: VenueMode::Normal,
