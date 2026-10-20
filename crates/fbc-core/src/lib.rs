@@ -71,7 +71,7 @@ pub use fee::{
 pub use grid::{GridError, PriceGrid};
 pub use ids::{
     AccountKey, CidMatch, ClientOrderId, FillId, IdError, InstrumentId, MAX_VENUE_ID_LEN,
-    Namespace, OrderRef, UnderlyingId, VenueId, VenueOrderId, VenueSymbol,
+    Namespace, OrderRef, TradeId, UnderlyingId, VenueId, VenueOrderId, VenueSymbol,
 };
 pub use instrument::{
     FundingSpec, InstrumentKind, InstrumentSpec, QtyError, QuantizeError, SizeStep, TradingStatus,

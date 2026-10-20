@@ -45,8 +45,8 @@ pub(crate) fn caps() -> VenueCaps {
                 // The public trade's side is documented as BUY/SELL, without saying
                 // whether it names the taker or the resting order.
                 aggressor: false,
-                // QFEX sends UUID trade ids; MdEvent::Trade has an optional u64 id.
-                trade_id: false,
+                // The public trade UUID is retained in the normalized TradeId.
+                trade_id: true,
             },
             funding: FundingCaps {
                 source: FeedSource::None,

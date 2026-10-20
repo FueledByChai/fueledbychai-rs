@@ -14,7 +14,8 @@
 //! rejects, incremental fills, positions, balances, funding payments, venue mode and
 //! connection state, the resync sequence, query results, fee rates and errors that name no
 //! order. Venue order ids, fill ids and fees inside them exist only because a codec built them
-//! through [`DecodeScope`](crate::DecodeScope) (decision 0004).
+//! through [`DecodeScope`](crate::DecodeScope) (decision 0004). Public trade IDs are distinct
+//! numeric or UUID values built there too (0119).
 //!
 //! # Signs
 //!
@@ -31,7 +32,7 @@ use crate::caps::OpKind;
 use crate::codec::Feed;
 use crate::command::{Reject, SubmitOutcome, TerminalReject};
 use crate::fee::{Fee, FeeRate};
-use crate::ids::{CidMatch, ClientOrderId, FillId, InstrumentId, OrderRef, VenueOrderId};
+use crate::ids::{CidMatch, ClientOrderId, FillId, InstrumentId, OrderRef, TradeId, VenueOrderId};
 use crate::time::{ExchNs, ExchTsKind, Stamp, WallNs};
 use crate::units::{
     Aggressor, BookSide, Channel, Liquidity, Lots, Money, PxExact, Side, SignedLots, Ticks,
@@ -168,8 +169,8 @@ pub enum MdEvent {
     /// A public trade.
     Trade {
         inst: InstrumentId,
-        /// The venue's trade id, when it sends one.
-        id: Option<u64>,
+        /// The venue's numeric or UUID trade id, when it sends one (0119).
+        id: Option<TradeId>,
         aggressor: Aggressor,
         px: Ticks,
         qty: Lots,

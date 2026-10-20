@@ -1,13 +1,14 @@
-//! Order and fill ids as distinct, sealed types (decision 0004, design §4.3).
+//! Order, fill and public trade ids as distinct, sealed types (decisions 0004 and 0119,
+//! design §4.3).
 //!
 //! A venue id handed to a call that wants a client id is a compile error, because
-//! [`ClientOrderId`], [`VenueOrderId`] and [`FillId`] are different types, and none of them can
+//! [`ClientOrderId`], [`VenueOrderId`], [`FillId`] and [`TradeId`] are different types, and none can
 //! be built outside this crate:
 //!
 //! - a [`ClientOrderId`] comes only from [`CidMint::mint`](crate::CidMint::mint), which needs a
 //!   held [`NamespaceLease`](crate::NamespaceLease), or from decoding one of our own wire ids
 //!   ([`decode_cid`](crate::decode_cid));
-//! - a [`VenueOrderId`] or a [`FillId`] comes only from a
+//! - a [`VenueOrderId`], [`FillId`] or [`TradeId`] comes only from a
 //!   [`DecodeScope`](crate::DecodeScope), which the core's dispatch lends to codec callbacks.
 //!
 //! `trybuild` compile-fail tests (`tests/ui_ids/`) prove each seal.
@@ -190,6 +191,77 @@ impl FillId {
     }
 }
 
+/// A public trade's venue identity. Numeric ids and UUIDs remain distinct even when their
+/// numerical values coincide. Built by a codec through [`DecodeScope`](crate::DecodeScope).
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct TradeId(TradeIdRepr);
+
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+enum TradeIdRepr {
+    Numeric(u64),
+    Uuid(u128),
+}
+
+impl TradeId {
+    pub(crate) const fn from_numeric(value: u64) -> TradeId {
+        TradeId(TradeIdRepr::Numeric(value))
+    }
+
+    pub(crate) fn from_uuid_wire(wire: &str) -> Result<TradeId, IdError> {
+        let bytes = wire.as_bytes();
+        if bytes.len() != 36 || [8, 13, 18, 23].iter().any(|&i| bytes[i] != b'-') {
+            return Err(IdError::InvalidFormat);
+        }
+        let mut value = 0_u128;
+        for (i, &byte) in bytes.iter().enumerate() {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                continue;
+            }
+            let nibble = match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => byte - b'a' + 10,
+                b'A'..=b'F' => byte - b'A' + 10,
+                _ => return Err(IdError::InvalidFormat),
+            };
+            value = (value << 4) | u128::from(nibble);
+        }
+        Ok(TradeId(TradeIdRepr::Uuid(value)))
+    }
+
+    /// The number when this venue supplied a numeric trade id.
+    pub const fn as_numeric(self) -> Option<u64> {
+        match self.0 {
+            TradeIdRepr::Numeric(n) => Some(n),
+            TradeIdRepr::Uuid(_) => None,
+        }
+    }
+
+    /// The UUID's 128 bits when this venue supplied a UUID trade id.
+    pub const fn as_uuid(self) -> Option<u128> {
+        match self.0 {
+            TradeIdRepr::Numeric(_) => None,
+            TradeIdRepr::Uuid(n) => Some(n),
+        }
+    }
+}
+
+impl fmt::Display for TradeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            TradeIdRepr::Numeric(n) => write!(f, "{n}"),
+            TradeIdRepr::Uuid(n) => write!(
+                f,
+                "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+                n >> 96,
+                (n >> 80) & 0xffff,
+                (n >> 64) & 0xffff,
+                (n >> 48) & 0xffff,
+                n & 0xffff_ffff_ffff
+            ),
+        }
+    }
+}
+
 fn check_venue_id(wire: &str) -> Result<(), IdError> {
     if wire.is_empty() {
         Err(IdError::Empty)
@@ -263,6 +335,8 @@ pub enum IdError {
         /// The longest accepted.
         max: usize,
     },
+    /// A formatted id, such as a UUID, does not match its required wire shape.
+    InvalidFormat,
     /// The namespace has issued its last sequence number.
     Exhausted,
 }
@@ -281,6 +355,7 @@ impl fmt::Display for IdError {
                     "the venue id is {len} bytes long; at most {max} are accepted"
                 )
             }
+            IdError::InvalidFormat => f.write_str("the venue id has an invalid format"),
             IdError::Exhausted => f.write_str("the namespace has no sequence numbers left"),
         }
     }
@@ -338,6 +413,36 @@ mod tests {
                 scope.venue_symbol(&over),
                 Err(IdError::TooLong { len: 97, .. })
             ));
+        });
+    }
+
+    #[test]
+    fn public_trade_ids_preserve_numeric_and_uuid_identity() {
+        in_scope(|scope| {
+            let number = scope.trade_id_numeric(42);
+            assert_eq!(number.as_numeric(), Some(42));
+            assert_eq!(number.as_uuid(), None);
+            assert_eq!(number.to_string(), "42");
+
+            let lower = scope
+                .trade_id_uuid("54c9558b-38a2-4421-a70e-4001a77905e8")
+                .unwrap();
+            let upper = scope
+                .trade_id_uuid("54C9558B-38A2-4421-A70E-4001A77905E8")
+                .unwrap();
+            assert_eq!(lower, upper);
+            assert_eq!(lower.as_numeric(), None);
+            assert!(lower.as_uuid().is_some());
+            assert_eq!(lower.to_string(), "54c9558b-38a2-4421-a70e-4001a77905e8");
+            assert_ne!(lower, number);
+            for invalid in [
+                "",
+                "54c9558b38a24421a70e4001a77905e8",
+                "54c9558b-38a2-4421-a70e-4001a77905eg",
+                "54c9558b_38a2-4421-a70e-4001a77905e8",
+            ] {
+                assert_eq!(scope.trade_id_uuid(invalid), Err(IdError::InvalidFormat));
+            }
         });
     }
 
