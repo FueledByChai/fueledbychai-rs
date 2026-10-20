@@ -192,12 +192,11 @@ fn discovery_refuses_a_configuration_it_cannot_send_by_the_key_at_fault() {
 fn the_documented_answer_decodes_into_one_draft_per_perpetual_in_the_decode_scope() {
     let drafts = discover(&exchange_info()).unwrap();
     // The delivery contract, the TradFi perpetual and the settling symbol whose contractType is
-    // empty are not PERPETUALs: none is a draft. 1000000MOGUSDT and 币安人生USDT are PERPETUALs
-    // whose base asset an asset symbol cannot hold (longer than eight bytes; not ASCII): each is
-    // passed over, not a refusal of every other symbol (Codex r4311120955, Reviewer B RB-1).
+    // empty are not PERPETUALs: none is a draft. 1000000MOG now fits the sixteen-byte asset
+    // symbol (decision 0118); 币安人生 remains unkeyable because it is not ASCII.
     assert_eq!(
         symbols(&drafts),
-        ["BTCUSDT", "ETHUSDT", "BTCUSDC", "OLDUSDT"]
+        ["BTCUSDT", "ETHUSDT", "BTCUSDC", "OLDUSDT", "1000000MOGUSDT"]
     );
     let caps = BinanceUsdm.caps(&config()).unwrap();
     let venue_symbol = dispatch_market_data(&caps, |scope| scope.venue_symbol("BTCUSDT"));
@@ -292,7 +291,7 @@ fn a_perpetual_missing_a_required_filter_or_field_refuses_the_whole_answer_by_na
     let quarter = with_symbol(3, |m| {
         filters(m).retain(|f| f["filterType"] != "PRICE_FILTER")
     });
-    assert_eq!(symbols(&discover(&quarter).unwrap()).len(), 4);
+    assert_eq!(symbols(&discover(&quarter).unwrap()).len(), 5);
 }
 
 #[test]
@@ -489,15 +488,20 @@ fn a_java_era_x_usdt_ticker_names_the_xusdt_perpetual_and_no_other_form_is_read(
 
 #[test]
 fn a_perpetual_whose_asset_names_do_not_fit_an_asset_symbol_is_passed_over_alone() {
-    // Binance lists multiplier-prefixed perpetuals (1000000MOGUSDT, base 1000000MOG) and ones
-    // named in other scripts (币安人生USDT, base 币安人生): the core's asset symbol holds at most
-    // eight bytes of printable ASCII, so such a perpetual cannot be keyed. It is passed over
+    // The core's asset symbol holds at most sixteen bytes of printable ASCII. A longer or
+    // non-ASCII name cannot be keyed. It is passed over
     // before its symbol and filters are read; every other symbol is still discovered (Codex
     // r4311120955, Reviewer B RB-1). An empty name, or one that is not a string, is still
     // malformed.
-    let expected = ["BTCUSDT", "ETHUSDT", "BTCUSDC", "OLDUSDT"];
+    let expected = ["BTCUSDT", "ETHUSDT", "BTCUSDC", "OLDUSDT", "1000000MOGUSDT"];
     for field in ["baseAsset", "quoteAsset", "marginAsset"] {
-        for name in ["1MBABYDOGE", "币安人生", "BTC\u{e9}", "BT C", "\u{7f}"] {
+        for name in [
+            "ABCDEFGHIJKLMNOPQ",
+            "币安人生",
+            "BTC\u{e9}",
+            "BT C",
+            "\u{7f}",
+        ] {
             let unkeyable = with_btc(|m| {
                 m.insert(field.into(), name.into());
                 m.insert("symbol".into(), "".into());
@@ -507,8 +511,6 @@ fn a_perpetual_whose_asset_names_do_not_fit_an_asset_symbol_is_passed_over_alone
             assert_eq!(symbols(&drafts), expected[1..], "{field}={name:?}");
         }
     }
-    for n in [7, 8] {
-        let listed = with_symbol(n, |m| drop(m.insert("filters".into(), json!(7))));
-        assert_eq!(symbols(&discover(&listed).unwrap()), expected, "symbol {n}");
-    }
+    let listed = with_symbol(8, |m| drop(m.insert("filters".into(), json!(7))));
+    assert_eq!(symbols(&discover(&listed).unwrap()), expected);
 }

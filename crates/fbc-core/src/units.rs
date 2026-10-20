@@ -285,24 +285,24 @@ impl fmt::Display for PxExact {
     }
 }
 
-/// An asset symbol of at most eight ASCII bytes, such as `USDC`.
+/// An asset symbol of at most sixteen ASCII bytes, such as `USDC` or `ANTHROPIC` (0118).
 #[derive(Copy, Clone, Eq, PartialEq, Hash)]
-pub struct AssetSym([u8; 8]);
+pub struct AssetSym([u8; 16]);
 
 impl AssetSym {
-    /// The symbol, or `None` when it is empty, longer than eight bytes or not printable ASCII.
+    /// The symbol, or `None` when it is empty, longer than sixteen bytes or not printable ASCII.
     pub fn new(symbol: &str) -> Option<AssetSym> {
         let bytes = symbol.as_bytes();
-        if bytes.is_empty() || bytes.len() > 8 || !bytes.iter().all(|b| b.is_ascii_graphic()) {
+        if bytes.is_empty() || bytes.len() > 16 || !bytes.iter().all(|b| b.is_ascii_graphic()) {
             return None;
         }
-        let mut sym = [0u8; 8];
+        let mut sym = [0u8; 16];
         sym[..bytes.len()].copy_from_slice(bytes);
         Some(AssetSym(sym))
     }
 
     pub fn as_str(&self) -> &str {
-        let len = self.0.iter().position(|b| *b == 0).unwrap_or(8);
+        let len = self.0.iter().position(|b| *b == 0).unwrap_or(16);
         core::str::from_utf8(&self.0[..len]).unwrap_or_default()
     }
 }
@@ -561,12 +561,17 @@ mod tests {
     fn asset_symbols_are_short_printable_ascii() {
         assert_eq!(AssetSym::new("USDC").unwrap().as_str(), "USDC");
         assert_eq!(AssetSym::new("ABCDEFGH").unwrap().as_str(), "ABCDEFGH");
+        assert_eq!(AssetSym::new("ANTHROPIC").unwrap().as_str(), "ANTHROPIC");
+        assert_eq!(
+            AssetSym::new("ABCDEFGHIJKLMNOP").unwrap().as_str(),
+            "ABCDEFGHIJKLMNOP"
+        );
         assert_eq!(
             format!("{:?}", AssetSym::new("ETH").unwrap()),
             "AssetSym(ETH)"
         );
         assert_eq!(AssetSym::new(""), None);
-        assert_eq!(AssetSym::new("ABCDEFGHI"), None);
+        assert_eq!(AssetSym::new("ABCDEFGHIJKLMNOPQ"), None);
         assert_eq!(AssetSym::new("US DC"), None);
     }
 

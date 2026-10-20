@@ -265,7 +265,7 @@ fn a_value_stated_but_invalid_is_malformed_and_named() {
         ("asset_kind", "SWAP".into(), "asset_kind"),
         ("trading_mode", "AUCTION".into(), "trading_mode"),
         ("symbol", 7.into(), "symbol"),
-        ("base_currency", "TOOLONGBASE".into(), "base_currency"),
+        ("base_currency", "ABCDEFGHIJKLMNOPQ".into(), "base_currency"),
         ("quote_currency", "".into(), "quote_currency"),
         ("settlement_currency", 1.into(), "settlement_currency"),
         ("price_tick_size", "0".into(), "price_tick_size"),

@@ -470,14 +470,17 @@ fn a_frame_the_decoder_cannot_read_whole_is_refused_with_nothing_pushed() {
         refused(&with_vars(&v1, &[fill_id, oid, "", "t", "SOL-USD-PERP"])),
         DecodeError::UnknownInstrument
     );
-    // A fee currency running past the frame, not UTF-8, or no asset symbol (longer than eight
+    // A fee currency running past the frame, not UTF-8, or no asset symbol (longer than sixteen
     // bytes).
     assert!(malformed(v2[..v2.len() - 2].to_vec()));
     let mut bad = v2.clone();
     let last = bad.len() - 1;
     bad[last] = 0xff;
     assert!(malformed(bad));
-    assert!(malformed(with_vars(&v2, &taker_vars(Some("NOTANASSET")))));
+    assert!(malformed(with_vars(
+        &v2,
+        &taker_vars(Some("ABCDEFGHIJKLMNOPQ"))
+    )));
 }
 
 #[test]
