@@ -163,6 +163,23 @@ fn array_and_contents_envelopes_decode_in_order_and_reject_partial_frames() {
     let (result, events) = decode(codec.as_mut(), &json!([level2, bad_trade]).to_string());
     assert_eq!(result, Err(DecodeError::Malformed("size")));
     assert!(events.0.is_empty());
+    let transient = json!({"err": {"error_code": "RateLimited"}});
+    let mut effects = Effects::new();
+    let mut sink = Sink::default();
+    let bad_batch = json!([transient, bad_trade]);
+    let caps = Qfex.caps(&cfg()).unwrap();
+    let result = dispatch_market_data(&caps, |scope| {
+        codec.on_frame(
+            RawFrame::Text(&bad_batch.to_string()),
+            scope,
+            &specs(),
+            &mut sink,
+            &mut effects,
+        )
+    });
+    assert_eq!(result, Err(DecodeError::Malformed("size")));
+    assert!(sink.0.is_empty());
+    assert!(effects.as_slice().is_empty());
     let (result, after) = decode(codec.as_mut(), frame("level2"));
     result.unwrap();
     let (result, fresh) = decode(subscribed().as_mut(), frame("level2"));
@@ -495,6 +512,15 @@ fn factory_refuses_bad_endpoints_and_unavailable_feeds_before_planning() {
     assert!(Qfex.caps(&local).is_ok());
     local.insert(KEY_MDS_URL, "ws://127.0.0.1:9000");
     assert!(Qfex.caps(&local).is_ok());
+    local.insert(KEY_MDS_URL, "wss://mds.qfex.com/");
+    assert!(Qfex.caps(&local).is_ok());
+    let planned = Qfex
+        .plan_md(&local, &specs(), &BTreeSet::from([sub(Feed::Trades)]))
+        .unwrap();
+    assert!(matches!(&planned[0].transport, MdTransport::Socket { url }
+        if url == "wss://mds.qfex.com/"));
+    local.insert(KEY_MDS_URL, "wss://mds.qfex.io/");
+    assert!(Qfex.caps(&local).is_ok());
     let unknown = Subscription {
         inst: InstrumentId::new(99),
         feed: Feed::Trades,
@@ -636,13 +662,50 @@ fn off_step_quantity_that_division_rounds_to_whole_lots_is_rejected() {
 }
 
 #[test]
+fn rejected_unsubscribe_reconnects_to_reconcile_the_removed_feed() {
+    let mut codec = subscribed();
+    let mut sent = Effects::new();
+    codec
+        .subscribe(&[], &[sub(Feed::Trades)], &specs(), &mut sent)
+        .unwrap();
+    assert!(sent.as_slice().iter().any(|effect| {
+        matches!(effect, Effect::Send { frame, .. }
+            if serde_json::from_slice::<Value>(frame.bytes()).unwrap()["type"] == "unsubscribe")
+    }));
+    let error = json!({"err": {"error_code": "InvalidParameter",
+        "incoming_message": {"type": "unsubscribe", "channels": ["trade"],
+            "symbols": ["AAPL-USD"]}}});
+    let mut effects = Effects::new();
+    let mut sink = Sink::default();
+    let caps = Qfex.caps(&cfg()).unwrap();
+    let result = dispatch_market_data(&caps, |scope| {
+        codec.on_frame(
+            RawFrame::Text(&error.to_string()),
+            scope,
+            &specs(),
+            &mut sink,
+            &mut effects,
+        )
+    });
+    assert_eq!(result, Ok(()));
+    assert!(sink.0.is_empty());
+    assert_eq!(
+        effects.as_slice(),
+        &[Effect::Reconnect {
+            stream: fbc_core::StreamId(0),
+            reason: "rejected QFEX unsubscribe",
+        }]
+    );
+}
+
+#[test]
 fn malformed_subscription_errors_never_change_feed_state() {
     let mut codec = subscribed();
     let base = json!({"err": {"error_code": "InvalidParameter",
         "incoming_message": {"type": "subscribe", "channels": ["trade"], "symbols": ["AAPL-USD"]}}});
     let mut cases = vec![json!({"err": null}), json!({"err": {}})];
     let mut bad = base.clone();
-    bad["err"]["incoming_message"]["type"] = json!("unsubscribe");
+    bad["err"]["incoming_message"]["type"] = json!("ping");
     cases.push(bad);
     let mut bad = base.clone();
     bad["err"]["incoming_message"]["channels"] = Value::Null;
